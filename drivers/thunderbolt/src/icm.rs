@@ -364,11 +364,18 @@ mod tests {
         // bit, and a block of undocumented middle bits, and vary
         // only ICM_EN. The verdict must track bit 0 alone —
         // NVM_AUTH_DONE in particular sets on native hosts too.
+        // One middle bit (16) stays clear in the sweep block:
+        // with literally every other bit set, the ICM_EN case
+        // would compose to `u32::MAX` — the all-ones pattern
+        // `classify` reserves for a function that is not
+        // answering (module docs, settle rule), so it can never
+        // settle as a firmware status at all. Holding one bit
+        // clear keeps this sweep about ICM_EN alone.
         let others = FW_STS_NVM_AUTH_DONE
             | FW_STS_CIO_RESET_REQ
             | FW_STS_ICM_EN_CPU
             | FW_STS_ICM_EN_INVERT
-            | 0x3fff_fff8;
+            | (0x3fff_fff8 & !(1 << 16));
         if classify(&[Some(others), Some(others)]).mode != CmMode::Native {
             return TestResult::Fail("thunderbolt: non-ICM_EN bits swayed the verdict");
         }

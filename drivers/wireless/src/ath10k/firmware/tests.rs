@@ -66,6 +66,8 @@ struct Target {
     sequence: Vec<(u32, u32, u32)>,
     codeswap: Option<SwapMemory>,
     board_ext: u32,
+    eeprom: Option<Vec<u8>>,
+    eeprom_queries: Vec<usize>,
 }
 #[derive(Debug)]
 struct SwapMemory(Vec<u8>);
@@ -84,6 +86,10 @@ impl super::super::dma::Memory for SwapMemory {
     }
 }
 impl Transport for Target {
+    async fn calibration_eeprom(&mut self, length: usize) -> Result<Option<Vec<u8>>, BmiError> {
+        self.eeprom_queries.push(length);
+        Ok(self.eeprom.clone())
+    }
     fn prepare_codeswap(&mut self, bytes: &[u8]) -> Result<(u32, [u8; 208]), BmiError> {
         if self.codeswap.is_some() {
             return Err(BmiError::BadResponse);
@@ -269,6 +275,100 @@ fn smoke_ath10k_rom_boot_downloads_selected_bdf_otp_and_firmware() -> TestResult
 kernel_test_in!(
     "drivers/wireless/ath10k/firmware",
     smoke_ath10k_rom_boot_downloads_selected_bdf_otp_and_firmware
+);
+
+fn smoke_ath10k_qca9887_eeprom_calibration_replaces_board_data_and_skips_otp() -> TestResult {
+    let p = match Profile::select(0x50, 0x4100016d) {
+        Some(p) if p.board == 7168 && p.calibration == 2116 && p.board_tail == 0 => p,
+        _ => return TestResult::Fail("QCA9887 hw1.0 profile/calibration length"),
+    };
+    let eeprom = super::super::eeprom::tests::calibration();
+    let image = Image::parse(image(0, 1, 1), 6).unwrap();
+    let id = Identity {
+        device: 0x50,
+        ..identity()
+    };
+    // (EEPROM answer, board-ext address, expect EEPROM bytes, expect query)
+    for (answer, ext, uses_eeprom, queried) in [
+        (Some(eeprom.clone()), 0, true, true),
+        (None, 0, false, true), // Invalid/absent: Linux fallback.
+        (Some(eeprom.clone()), 0x8000, false, false), // Ext region rejects 2116.
+    ] {
+        let mut files = Store::default();
+        files
+            .0
+            .insert(format!("{}/board.bin", p.directory), vec![0x77; p.board]);
+        let mut bmi = Bmi::new(Target {
+            eeprom: answer,
+            board_ext: ext,
+            ..Target::default()
+        });
+        if !matches!(
+            ready(prepare(&mut bmi, &mut files, p, id, "", &image)),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("QCA9887 calibration orchestration failed");
+        }
+        let t = &bmi.transport;
+        let board: Vec<u8> = t
+            .writes
+            .iter()
+            .filter(|(at, _)| (0x430000..0x430000 + p.board as u32).contains(at))
+            .flat_map(|(_, bytes)| bytes.iter().copied())
+            .collect();
+        let flag = t
+            .writes
+            .iter()
+            .any(|(at, bytes)| *at == HI + 0x58 && bytes[..] == [1, 0, 0, 0]);
+        let expected_board = if uses_eeprom {
+            eeprom.clone()
+        } else {
+            vec![0x77; p.board]
+        };
+        let expected_runs: &[(u32, u32)] = if uses_eeprom {
+            &[(0x1234, 0x10)]
+        } else {
+            &[(0x1234, 0x10), (0x1234, 0)]
+        };
+        if board != expected_board
+            || !flag
+            || t.executions != expected_runs
+            || t.eeprom_queries != if queried { vec![2116] } else { vec![] }
+            || t.downloads.last() != Some(&vec![0x99; 4])
+            || t.commands.contains(&1)
+        {
+            return TestResult::Fail("EEPROM board-data/OTP-skip/fallback differs from Linux");
+        }
+    }
+    // Other chips never consult the QCA9887-only source.
+    let mut files = Store::default();
+    files.0.insert(
+        format!("{}/board.bin", profile().directory),
+        vec![0x77; 7168],
+    );
+    let mut bmi = Bmi::new(Target {
+        eeprom: Some(eeprom),
+        ..Target::default()
+    });
+    if !matches!(
+        ready(prepare(
+            &mut bmi,
+            &mut files,
+            profile(),
+            identity(),
+            "",
+            &image
+        )),
+        Some(Ok(_))
+    ) || !bmi.transport.eeprom_queries.is_empty()
+    {
+        return TestResult::Fail("QCA988X consulted the QCA9887 EEPROM source");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/firmware",
+    smoke_ath10k_qca9887_eeprom_calibration_replaces_board_data_and_skips_otp
 );
 
 fn smoke_ath10k_failed_calibration_never_downloads_or_activates_firmware() -> TestResult {

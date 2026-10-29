@@ -1864,3 +1864,178 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2/reconnect",
     smoke_gen2_wpa2_native_history_capacity_keeps_rekey_and_floor_proofs_bounded
 );
+
+fn history_key(group: bool, id: u8, peer: [u8; 6]) -> NativeKey {
+    NativeKey {
+        material: Zeroizing::new([7; 16]),
+        id,
+        group,
+        slot: if group { id + 1 } else { 0 },
+        rsc: 3,
+        api: 3,
+        peer,
+        tx_pn: 0,
+        tx_base: 0,
+        restored: None,
+    }
+}
+fn history_entry(group: bool, id: u8, peer: [u8; 6], retired: bool) -> KeyHistory {
+    let mut floors = [10; 17];
+    floors[5] = 900;
+    KeyHistory {
+        digest: [1; 32],
+        peer,
+        group,
+        id,
+        floors,
+        tx_floor: 4242,
+        retired,
+    }
+}
+fn smoke_gen2_key_history_restore_policy_cross_peer_index_and_ptk_reuse() -> TestResult {
+    const A: [u8; 6] = [2, 4, 6, 8, 10, 12];
+    const B: [u8; 6] = [2, 4, 6, 8, 10, 14];
+    // Cross-peer and cross-index GTK restore after an initial exchange keep
+    // the maximum committed floor and never lower a higher fresh RSC.
+    for (peer, id) in [(A, 1), (B, 1), (A, 2), (B, 3)] {
+        let mut key = history_key(true, id, peer);
+        if restore_retired(&history_entry(true, 1, A, true), &mut key, true).is_err()
+            || key.rsc != 900
+            || key.tx_pn != 0
+            || key.restored.is_some()
+        {
+            return TestResult::Fail("retired GTK cross-peer/index restore differs");
+        }
+    }
+    let mut high = history_key(true, 1, A);
+    high.rsc = 5000;
+    if restore_retired(&history_entry(true, 1, A, true), &mut high, true).is_err()
+        || high.rsc != 5000
+    {
+        return TestResult::Fail("GTK restore lowered a fresh RSC");
+    }
+    // A group rekey may not reinstall retired material; a live entry and a
+    // role change are never reused.
+    if restore_retired(
+        &history_entry(true, 1, A, true),
+        &mut history_key(true, 1, A),
+        false,
+    )
+    .is_ok()
+        || restore_retired(
+            &history_entry(true, 1, A, false),
+            &mut history_key(true, 1, A),
+            true,
+        )
+        .is_ok()
+        || restore_retired(
+            &history_entry(false, 0, A, true),
+            &mut history_key(true, 1, A),
+            true,
+        )
+        .is_ok()
+        || restore_retired(
+            &history_entry(true, 1, A, true),
+            &mut history_key(false, 0, A),
+            true,
+        )
+        .is_ok()
+    {
+        return TestResult::Fail("unsafe retired key reuse accepted");
+    }
+    // Same-peer PTK reuse restores per-TID RX floors and starts TX above
+    // every PN the old installation may have used.
+    let mut ptk = history_key(false, 0, A);
+    if restore_retired(&history_entry(false, 0, A, true), &mut ptk, true).is_err()
+        || ptk.tx_pn != 4243
+        || ptk.rsc != 900
+        || ptk.restored.map(|f| f[5]) != Some(900)
+    {
+        return TestResult::Fail("same-peer PTK reuse floors differ");
+    }
+    let body = key_command(&ptk, false, false);
+    if body[68..76] != 4243u64.to_le_bytes() {
+        return TestResult::Fail("reused PTK transmit_seq_cnt not programmed");
+    }
+    if key_command(&history_key(false, 0, A), false, false)[68..76] != [0; 8]
+        || key_command(&history_key(true, 1, A), false, false)[68..76] != [0; 8]
+        || key_command(&ptk, true, false)[68..76] != [0; 8]
+    {
+        return TestResult::Fail("fresh/group/remove key carried a TX PN");
+    }
+    // A PTK is per peer: cross-peer reuse and an exhausted TX floor fail.
+    if restore_retired(
+        &history_entry(false, 0, A, true),
+        &mut history_key(false, 0, B),
+        true,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("cross-peer PTK reuse accepted");
+    }
+    let mut exhausted = history_entry(false, 0, A, true);
+    exhausted.tx_floor = 0xffff_ffff_fffe;
+    if restore_retired(&exhausted, &mut history_key(false, 0, A), true).is_ok() {
+        return TestResult::Fail("PTK reuse at TX PN exhaustion accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/reconnect",
+    smoke_gen2_key_history_restore_policy_cross_peer_index_and_ptk_reuse
+);
+
+fn smoke_gen2_key_history_ledger_crosses_native_owners_of_one_radio() -> TestResult {
+    // Unique fixture identities: no RAM owner adopts a ledger by default.
+    const RADIO: [u8; 6] = [0x02, 0xfe, 0xed, 0, 0, 1];
+    const OTHER: [u8; 6] = [0x02, 0xfe, 0xed, 0, 0, 2];
+    {
+        let mut first = Context::default();
+        first.adopt_ledger(RADIO);
+        first.history.push(history_entry(true, 1, RADIO, true));
+        let mut live = history_entry(false, 0, RADIO, false);
+        live.digest = [2; 32];
+        first.history.push(live);
+    }
+    // Another radio never sees this ledger.
+    let mut other = Context::default();
+    other.adopt_ledger(OTHER);
+    if !other.history.is_empty() {
+        return TestResult::Fail("ledger crossed to another radio");
+    }
+    let mut second = Context::default();
+    // An entry the new owner already holds merges: floors rise and it is
+    // reusable only if both copies were retired.
+    let mut own = history_entry(true, 1, RADIO, false);
+    own.floors = [2000; 17];
+    own.tx_floor = 1;
+    second.history.push(own);
+    second.adopt_ledger(RADIO);
+    let merged = second.history.iter().find(|h| h.digest == [1; 32]);
+    let live = second.history.iter().find(|h| h.digest == [2; 32]);
+    if second.history.len() != 2
+        || !merged.is_some_and(|h| h.floors[5] == 2000 && h.tx_floor == 4242 && !h.retired)
+        || !live.is_some_and(|h| !h.retired && h.tx_floor == 4242)
+    {
+        return TestResult::Fail("adopted ledger lost a floor or reuse proof");
+    }
+    // Adoption is one-shot; a dropped owner hands the ledger back intact.
+    drop(second);
+    let mut third = Context::default();
+    third.adopt_ledger(RADIO);
+    third.adopt_ledger(RADIO);
+    if third.history.len() != 2 {
+        return TestResult::Fail("ledger not returned by dropped owner");
+    }
+    // Leave no fixture ledger behind.
+    third.ledger = None;
+    other.ledger = None;
+    LEDGERS
+        .lock()
+        .retain(|(mac, _)| *mac != RADIO && *mac != OTHER);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/reconnect",
+    smoke_gen2_key_history_ledger_crosses_native_owners_of_one_radio
+);

@@ -90,6 +90,56 @@ kernel_test_in!(
     navi22_power_selects_board_source_and_preserves_sku_fields
 );
 
+fn navi22_rx6750xt_power_table_retains_board_policy() -> TestResult {
+    // Metadata read from MSI RX 6750 XT 1002:73df / 1462:3985 rev c0,
+    // VBIOS 113-MSITV398MH.310, via Linux's pp_table. Its 2470-byte
+    // 16.0 / 0x81 table uses payload version 6 rather than the firmware
+    // default SKU's version 1. Both use Linux's 1668-byte PPTable_t.
+    const FEATURES: u64 = 0x0010_376b_a37f_fdff;
+    let mut sku = table();
+    put32(&mut sku, DRIVER_BYTES, 6);
+    sku[DRIVER_BYTES + 4..DRIVER_BYTES + 12].copy_from_slice(&FEATURES.to_le_bytes());
+    let identity = Identity {
+        revision: 0xc0,
+        subsystem_vendor: 0x1462,
+        subsystem_device: 0x3985,
+    };
+    for id in [0, 1] {
+        let mut vbios = bios(id);
+        vbios[0x400..].copy_from_slice(&sku);
+        let prepared = prepare(&vbios, Some(&sku), identity).unwrap();
+        let payload = prepared.bytes();
+        if payload[..BOARD_START] != sku[DRIVER_BYTES..DRIVER_BYTES + BOARD_START]
+            || payload[BOARD_START..BOARD_END] != vbios[0x204..0x328]
+            || payload[BOARD_END..] != sku[DRIVER_BYTES + BOARD_END..]
+            || prepared.info().oem_quirk
+            || prepared.boot_policy().unwrap().allowed() != FEATURES & BOOT_ALLOWED
+        {
+            return TestResult::Fail("RX 6750 XT SKU or board power policy changed");
+        }
+        // Supporting this revision must not remove the protection checks.
+        for required in [1, 24, 25, 31, 32, 33] {
+            let mut unprotected = payload.to_vec();
+            unprotected[4..12].copy_from_slice(&(FEATURES & !(1 << required)).to_le_bytes());
+            if boot_policy(&unprotected).is_ok() {
+                return TestResult::Fail("RX 6750 XT accepted without required protection");
+            }
+        }
+    }
+    for version in [0, 2, 7, u32::MAX] {
+        let mut unknown = sku.clone();
+        put32(&mut unknown, DRIVER_BYTES, version);
+        if validate_table(&unknown).is_ok() {
+            return TestResult::Fail("unknown Navi22 power-table version accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/power-navi22",
+    navi22_rx6750xt_power_table_retains_board_policy
+);
+
 fn navi22_power_bounds_and_revisions_fail_closed() -> TestResult {
     let template = table();
     for len in 0..template.len() {
@@ -306,4 +356,28 @@ fn rdna2_power_tables_preserve_profile_and_board_overlay() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/rdna2",
     rdna2_power_tables_preserve_profile_and_board_overlay
+);
+
+fn navi22_vcn_smu_pg_option_allows_only_the_board_mm_dpm_pg() -> TestResult {
+    const MM_DPM_PG: u64 = 1 << 22;
+    let board = 0x3767_a37f_fdff_u64; // RX 6750 XT PMFW feature mask
+    crate::amdgpu_power_navi22::set_vcn_smu_pg(true);
+    let on = BootPolicy::from_features(board).unwrap();
+    let absent = BootPolicy::from_features(board & !MM_DPM_PG).unwrap();
+    crate::amdgpu_power_navi22::set_vcn_smu_pg(false);
+    let off = BootPolicy::from_features(board).unwrap();
+    // The option adds MM_DPM_PG alone, and only where the board has it;
+    // its running bit is then no hazard.
+    if on.allowed() != off.allowed() | MM_DPM_PG
+        || absent.allowed() & MM_DPM_PG != 0
+        || !on.validate_enabled(on.allowed())
+        || off.validate_enabled(off.allowed() | MM_DPM_PG)
+    {
+        return TestResult::Fail("amdgpu.rdna2_vcn_smu_pg policy");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/power-navi22",
+    navi22_vcn_smu_pg_option_allows_only_the_board_mm_dpm_pg
 );

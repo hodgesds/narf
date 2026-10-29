@@ -25,6 +25,15 @@ applications above NARF.
 
 ## 3. Public interface
 
+Blocking poll/ppoll and select/pselect distinguish providers with a durable
+readiness arm or broadcast notification from silent legacy providers (such
+as serial ttys). A set containing a silent provider sleeps to a recheck no
+later than 10 ms, clamped by any earlier provider deadline or application
+timeout. This is a scheduler wake deadline only: the application's absolute
+timeout survives syscall re-execution unchanged. Fully notifying sets keep
+their event-driven wait, including infinite waits without periodic retries.
+An empty or negative-only set waits only for its timeout or a signal.
+
 Device ioctl dispatch passes an `IoctlContext` with guarded process-memory
 copies, the open description's O_NONBLOCK state, retained descriptor lookup
 and the caller's thread-group ID to FileOps. The syscall layer also owns the
@@ -730,10 +739,27 @@ consumed pages; only a mergeable tail accepts the write's page remainder.
 `tee` duplicates page references and clears the destination merge flag.
 `splice` moves whole buffers or shares a partial buffer reference, preserving
 packet flags and leaving append rights with only the source of a split.
-Both operations acquire per-pipe sleepable mutexes in address order. Payload
+Ordinary writes own page metadata inline. Tee and partial splice allocate
+shared-reference metadata only when a unique page first becomes shared;
+allocation failure leaves that source page intact and reports `ENOMEM` if no
+prefix was transferred. Whole-buffer splice moves ownership without promotion.
+Scalar and vector pipe writes guarded-copy directly into raw owned RAM. Fresh
+full pages skip pre-zeroing; they become readable only after every byte was
+initialized. Faulted incomplete pages are discarded, while earlier complete
+page buffers remain committed. Partial pages retain initialized backing and
+the user-copy trap fixups, packet atomicity, and error ordering are preserved.
+Scalar/vector syscalls resolve the concrete pipe endpoint once from the retained
+file reference and reuse it across capacity waits. Scalar pipe dispatch follows
+the common access/range/zero-count checks and precedes socket-family probes.
+Two-pipe operations acquire their sleepable mutexes in address order. Payload
+ownership first tries the mutex directly, then a single bounded optimistic
+wait before normal sleepable acquisition. Optimistic admission defers to queued
+waiters and never trusts the queue's busy hint as proof of ownership. Payload
 copies and allocations hold no pipe IRQ spinlock. Poll, FIONREAD, and endpoint
 closure use atomic queue snapshots; a per-pipe short publication lock orders
-readiness updates. Descriptor-table locks are released before pipe resizing
+readiness updates. First readiness activation and the inactive-publication
+decision use that same publication lock, so neither can miss the other's
+completed queue state. Descriptor-table locks are released before pipe resizing
 or transfers can wait. `splice` and `tee` flags use the low unsigned 32 bits.
 
 Linux `vmsplice(2)` preserves the kernel entry-point's observable validation
@@ -941,7 +967,7 @@ descriptor close; a peer parked in an infinite poll/epoll wait wakes to
 Connected unnamed AF_UNIX peers, including `socketpair(2)` endpoints, report a
 minimal `sockaddr_un` containing only `sa_family` from `getpeername(2)`;
 truncated output still reports the full address length.
-`open(2)`/`openat(2)` reject an empty pathname with `ENOENT` before cwd
+`open(2)`/`openat(2)`/`execve(2)` reject an empty pathname with `ENOENT` before cwd
 normalization; an empty path never aliases the current directory. Linux path
 and descriptor failures return their specific errno rather than a bare `-1`:
 in particular `openat(2)` reports `EFAULT`, `EMFILE`, and mapped filesystem
@@ -949,6 +975,11 @@ errors. Descriptor allocation precedes path lookup and creation, so `EMFILE`
 publishes neither a file descriptor nor an `O_CREAT` inode. `newfstatat(2)`
 distinguishes `EFAULT`, `ENOENT`, `EBADF`,
 `ENOTDIR`, and invalid flag `EINVAL`.
+`execve(2)`/`execveat(2)` reject directory images (including the installed-root
+mount itself) and other non-regular images with `EACCES`. Executable lookup
+preserves `ENOENT`, `ENOTDIR`, `ELOOP` and mapped filesystem errors; a directory
+reported as `InvalidPath` by the file-only resolver must not become `EIO`.
+`execveat(2)` retains its explicit `AT_EMPTY_PATH` descriptor semantics.
 The chmod/chown syscall families resolve relative `*at` paths through a real
 directory fd, reject invalid flags and dirfd shapes with Linux errnos, and
 follow the final symlink unless `AT_SYMLINK_NOFOLLOW` selects the link inode.
@@ -1756,6 +1787,19 @@ active pid namespace; a write requires `CAP_SYS_ADMIN` or
 checked before parsing) and a value in `[0, pid_max]` (`EINVAL`), and sets the
 cursor to `value + 1`. It is published in every build. `pid_max` is one global
 value shared by all namespaces (Linux 6.14+ keeps it per namespace).
+
+Userspace core dumps honor `RLIMIT_CORE` and emit ELF64 metadata with
+`PT_NOTE` data immediately after the ELF header, before the VMA program-header
+table. Metadata is written as one sequential buffer (retrying short writes),
+so a partial dump preserves process identity and raw register notes before a
+large table or memory payload. A nonempty write returning zero is a failure.
+`NT_PRSTATUS` currently contains the architecture's raw `user_regs_struct`,
+not Linux's full `elf_prstatus`; `NT_PRPSINFO` and optional `NT_AUXV` accompany
+it. Full Linux `NT_PRSTATUS`, `NT_SIGINFO`, and `NT_FILE` remain unsupported.
+Before optional core-file I/O, a fatal-path kernel record reports pid/tid,
+executable, signal, instruction/stack pointers and diagnostic registers even
+when `RLIMIT_CORE` disables the file. Ordinary traps and syscalls do not emit
+that record.
 
 ## 4. Invariants & safety properties
 

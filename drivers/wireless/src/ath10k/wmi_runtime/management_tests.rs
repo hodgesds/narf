@@ -206,3 +206,48 @@ kernel_test_in!(
     "drivers/wireless/ath10k/wmi-runtime",
     smoke_ath10k_wmi_management_epoch_revocation_retains_copied_payload
 );
+
+fn smoke_ath10k_management_admits_only_sae_and_protected_robust_frames() -> TestResult {
+    let (own, bssid) = ([2, 3, 4, 5, 6, 7], [2, 8, 9, 10, 11, 12]);
+    let frame = |subtype: u8, flags: u8, body: &[u8]| {
+        let mut f = auth()[..24].to_vec();
+        f[0] = subtype;
+        f[1] = flags;
+        f.extend_from_slice(body);
+        f
+    };
+    // SAE Commit (status 0 or 126 H2E) and Confirm; group 19 bodies.
+    let admitted = [
+        frame(0xb0, 0, &[3, 0, 1, 0, 0, 0, 19, 0]),
+        frame(0xb0, 0, &[3, 0, 1, 0, 126, 0, 19, 0]),
+        frame(0xb0, 0, &[3, 0, 2, 0, 0, 0, 1, 0]),
+        frame(0xc0, 0x40, &[0; 18]),
+        frame(0xa0, 0x40, &[0; 18]),
+        frame(0xd0, 0x40, &[0; 20]),
+    ];
+    for f in &admitted {
+        if validate(f, own, bssid).is_err() {
+            return TestResult::Fail("SAE or protected robust frame refused");
+        }
+    }
+    let refused = [
+        // Confirm with a nonzero status, transaction 3, protected auth.
+        frame(0xb0, 0, &[3, 0, 2, 0, 1, 0, 1, 0]),
+        frame(0xb0, 0, &[3, 0, 3, 0, 0, 0, 1, 0]),
+        frame(0xb0, 0x40, &[3, 0, 1, 0, 0, 0, 19, 0]),
+        // Unprotected robust frames, wrong protected lengths, other flags.
+        frame(0xc0, 0, &[3, 0]),
+        frame(0xd0, 0, &[8, 1, 0, 0]),
+        frame(0xc0, 0x40, &[0; 17]),
+        frame(0xd0, 0x40, &[0; 22]),
+        frame(0xc0, 0x48, &[0; 18]),
+    ];
+    if refused.iter().any(|f| validate(f, own, bssid).is_ok()) {
+        return TestResult::Fail("unprotected or malformed robust frame admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/pmf",
+    smoke_ath10k_management_admits_only_sae_and_protected_robust_frames
+);

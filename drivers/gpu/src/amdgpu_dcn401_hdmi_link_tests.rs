@@ -43,6 +43,8 @@ pub(in crate::amdgpu_dcn401_otg::tests) struct Firmware {
     pub(in crate::amdgpu_dcn401_otg::tests) event: Arc<AtomicU8>,
     pub(in crate::amdgpu_dcn401_otg::tests) writes: Arc<AtomicUsize>,
     pub(in crate::amdgpu_dcn401_otg::tests) fail: Option<(usize, dmub::Error)>,
+    /// Each PHY PLL power-down with the number of commands before it.
+    pub(in crate::amdgpu_dcn401_otg::tests) power_downs: Vec<(Path, usize)>,
 }
 impl Firmware {
     fn issue(&mut self, c: Command, event: u8) -> Result<(), dmub::Error> {
@@ -79,6 +81,10 @@ impl crate::amdgpu_dcn401_otg::hdmi_link::Firmware for Firmware {
     }
     async fn disable(&mut self, path: Path) -> Result<(), dmub::Error> {
         self.issue(Command::Disable(path), DISABLED)
+    }
+    async fn power_down(&mut self, path: Path) -> Result<(), dmub::Error> {
+        self.power_downs.push((path, self.commands.len()));
+        Ok(())
     }
 }
 /// Firmware-owned transmitter effects and the frontend clock/FIFO handshakes.
@@ -257,6 +263,7 @@ fn fixture_req(
         event: event.clone(),
         writes: writes.clone(),
         fail: None,
+        power_downs: Vec::new(),
     };
     let engine = Engine {
         io: TmdsIo {
@@ -302,6 +309,10 @@ fn dcn401_hdmi_link_programs_native_order_registers_and_commands() -> TestResult
             ]
         {
             return TestResult::Fail("firmware commands");
+        }
+        // The PHY PLL is powered down before it is programmed.
+        if fw.power_downs != [(path(p), 0)] {
+            return TestResult::Fail("PLL not programmed from off");
         }
         // PHY PLL first, before any register write; the stream setup follows
         // the link encoder setup; the transmitter comes last.
@@ -480,6 +491,8 @@ fn dcn401_hdmi_video_mutes_stops_and_the_link_stops_and_restarts() -> TestResult
     if e.status.state != State::HdmiLinkStopped
         || !e.status.state.reusable()
         || fw.commands.last().map(|c| c.0) != Some(Command::Disable(path(p)))
+        // dce110_clock_source_power_down follows the disabled transmitter.
+        || fw.power_downs.last() != Some(&(path(p), fw.commands.len()))
         || r(&e, dio(p, 0x20bd)) & 1 != 0
         || r(&e, dio(p, 0x20bc)) & 0x7f00 != 0
         || r(&e, dio(stream, 0x2094)) & 0x2c10 != 0

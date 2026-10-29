@@ -4,16 +4,14 @@
 
 ENTRY(_start)
 
-/* 32 MiB. Modern UEFI firmware on x86_64 (OVMF on QEMU, real-world
- * EDK2 builds, Lenovo / Dell / HP firmware) can reserve low memory for
- * code, ACPI tables, BootServices data, and SMM communication buffers.
- * Secure Boot OVMF with SMM reserves through 26 MiB. Loading the kernel
- * above that line keeps the .data + .bss
- * LOAD segment (~38 MiB once the 32-MiB static heap arena is
- * accounted for) inside contiguous EfiConventionalMemory. The PVH
- * direct-boot path (QEMU `-kernel`) honours the same ELF p_paddr,
- * so this works for both protocols. */
-KERNEL_LOAD_BASE = 0x2000000;
+/* 256 MiB. Keep the complete image, including .bss, clear of low UEFI
+ * reservations. The Gigabyte B650I AORUS ULTRA reserves
+ * [0x099ff000, 0x0a000000): a production image starting at 32 MiB now
+ * extends into that range, so Limine cannot load its final PT_LOAD.
+ * Secure Boot OVMF also reserves memory below 26 MiB. The PVH direct-boot
+ * path (QEMU `-kernel`) honours the same ELF p_paddr. This is still a fixed
+ * load address, not a guarantee for every firmware memory map. */
+KERNEL_LOAD_BASE = 0x10000000;
 KERNEL_VIRT_BASE = 0xFFFFFFFF80000000;
 
 /* VA span reserved for the kernel image. The module text window begins

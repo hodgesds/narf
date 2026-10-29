@@ -8,10 +8,7 @@ use crate::{
     amdgpu_vram::{Pool, Reservation},
 };
 use alloc::vec::Vec;
-use core::{
-    ops::Range,
-    sync::atomic::{fence, Ordering},
-};
+use core::sync::atomic::{fence, Ordering};
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 // linux-ctx: hdr=dcn,dmub seg=2
@@ -81,11 +78,15 @@ pub struct Prepared {
     bytes: Vec<u8>,
     version: u32,
     psp_version: u32,
+    signed_size: u64,
+    instruction_size: u64,
 }
 impl Prepared {
     pub fn new(image: &[u8], vbios: &[u8], psp_version: u32) -> Result<Self, Error> {
         let image = fw::Image::parse(image).map_err(Error::Firmware)?;
         let version = image.metadata().version;
+        let signed_size = image.signed_instructions().len() as u64;
+        let instruction_size = image.instructions().len() as u64;
         let prepared = image.prepare_dcn30(vbios).map_err(Error::Firmware)?;
         let layout = prepared.layout();
         let mut bytes = Vec::new();
@@ -99,6 +100,8 @@ impl Prepared {
             bytes,
             version,
             psp_version,
+            signed_size,
+            instruction_size,
         })
     }
 }
@@ -360,12 +363,16 @@ impl<I: Io> Engine<I> {
         }
         self.access(|io| hold_reset(io, base))
     }
-    async fn start(&mut self, tmr: Range<u64>, fb: Aperture) -> Result<Status, Error> {
+    async fn start(
+        &mut self,
+        memory: impl Into<crate::amdgpu_psp_ring::DmubMemory>,
+        fb: Aperture,
+    ) -> Result<Status, Error> {
         if self.state != State::Reset {
             return Err(Error::Busy);
         }
         self.state = State::Starting;
-        let result = self.start_inner(tmr, fb).await;
+        let result = self.start_inner(memory.into(), fb).await;
         self.state = if result.is_ok() {
             State::Running
         } else {
@@ -376,10 +383,30 @@ impl<I: Io> Engine<I> {
         }
         result
     }
-    async fn start_inner(&mut self, tmr: Range<u64>, fb: Aperture) -> Result<Status, Error> {
+    async fn start_inner(
+        &mut self,
+        mut memory: crate::amdgpu_psp_ring::DmubMemory,
+        fb: Aperture,
+    ) -> Result<Status, Error> {
         let l = self.layout;
         let address = self.memory.address();
         let shape = self.prepared.layout;
+        if let Some((image, _)) = &memory.reported {
+            // The PSP request includes signature packaging, while its reply
+            // identifies executable instructions. Linux removes the PSP
+            // header/footer before sizing DMUB_WINDOW_0_INST_CONST.
+            if image.end.checked_sub(image.start) != Some(self.prepared.signed_size) {
+                return Err(Error::Invalid);
+            }
+        }
+        let opaque_authorized = memory.authorize_opaque();
+        if let Some((image, _)) = &mut memory.reported {
+            image.end = image
+                .start
+                .checked_add(self.prepared.instruction_size)
+                .ok_or(Error::Invalid)?;
+        }
+        let tmr = &memory.tmr;
         if !self.access(|io| is_reset(io, l.dcn))? {
             self.reset().await?;
         }
@@ -406,20 +433,39 @@ impl<I: Io> Engine<I> {
             {
                 return Err(Error::Invalid);
             }
-            let physical = (tmr.start - fb + offset)..(tmr.end - fb + offset);
-            // Validate PSP's authenticated instruction and stack windows, but
-            // preserve them verbatim. They use GPU-physical VRAM addresses.
-            for index in 0..2 {
-                // linux-lit: 0x1a5=mmDMCUB_REGION3_CW0_BASE_ADDRESS
-                let base = read(io, l.dcn, 0x1a5 + index)? & MASK;
-                // linux-lit: 0x1ad=mmDMCUB_REGION3_CW0_TOP_ADDRESS
-                let top = read(io, l.dcn, 0x1ad + index)?;
-                // linux-lit: 0x1b5=mmDMCUB_REGION3_CW0_OFFSET
+            // Decode both complete windows before reserving either. PSP may
+            // have replaced the pre-allocation inventory during LOAD_IP_FW.
+            // Preserve the secure registers verbatim, as dmub_dcn30 does.
+            let mut secure = [[0; 4]; 2];
+            for (index, window) in secure.iter_mut().enumerate() {
+                let index = index as u32;
+                // linux-lit: 0x1a5=mmDMCUB_REGION3_CW0_BASE_ADDRESS; 0x1ad=mmDMCUB_REGION3_CW0_TOP_ADDRESS
+                // linux-lit: 0x1b5=mmDMCUB_REGION3_CW0_OFFSET; 0x1b6=mmDMCUB_REGION3_CW0_OFFSET_HIGH
                 // linux-lit: 2=mmDMCUB_REGION3_CW1_OFFSET - mmDMCUB_REGION3_CW0_OFFSET
-                let low = read(io, l.dcn, 0x1b5 + index * 2)?;
-                // linux-lit: 0x1b6=mmDMCUB_REGION3_CW0_OFFSET_HIGH
-                // linux-lit: 2=mmDMCUB_REGION3_CW1_OFFSET - mmDMCUB_REGION3_CW0_OFFSET
-                let high = read(io, l.dcn, 0x1b6 + index * 2)?;
+                for (value, reg) in window.iter_mut().zip([
+                    0x1a5 + index,
+                    0x1ad + index,
+                    0x1b5 + index * 2,
+                    0x1b6 + index * 2,
+                ]) {
+                    *value = read(io, l.dcn, reg)?;
+                }
+            }
+            if secure == [[0; 4]; 2] {
+                // A running Linux DMUB on Navi22 exposes exactly this zero
+                // readback. Trust the completed PSP load, as dm_dmub_hw_init
+                // does, while retaining the full authenticated image claim.
+                // Mixed/partial windows still take the strict decoder below.
+                return if opaque_authorized {
+                    Ok(place)
+                } else {
+                    Err(Error::Invalid)
+                };
+            }
+            let mut windows = [0..0, 0..0];
+            for (index, [raw_base, top, low, high]) in secure.into_iter().enumerate() {
+                let index = index as u32;
+                let base = raw_base & MASK;
                 // linux-lit: 0xffffff00=DMCUB_REGION3_CW0_OFFSET__DMCUB_REGION3_CW0_OFFSET_MASK
                 // linux-lit: 0xffff=DMCUB_REGION3_CW0_OFFSET_HIGH__DMCUB_REGION3_CW0_OFFSET_HIGH_MASK
                 let start = u64::from(low & 0xffffff00) | (u64::from(high & 0xffff) << 32);
@@ -427,16 +473,39 @@ impl<I: Io> Engine<I> {
                     .checked_sub(base)
                     .and_then(|n| n.checked_add(1))
                     .ok_or(Error::Invalid)?;
+                let gpu_start = start
+                    .checked_sub(offset)
+                    .and_then(|v| v.checked_add(fb))
+                    .ok_or(Error::Invalid)?;
+                let gpu_end = gpu_start
+                    .checked_add(u64::from(size))
+                    .ok_or(Error::Invalid)?;
                 // linux-lit: 31=DMCUB_REGION3_CW0_TOP_ADDRESS__DMCUB_REGION3_CW0_ENABLE__SHIFT
                 if top & (1 << 31) == 0
                     || base != index << 24
-                    || start < physical.start
-                    || start
-                        .checked_add(u64::from(size))
-                        .is_none_or(|v| v > physical.end)
+                    || gpu_start < fb
+                    || gpu_end > end
                 {
+                    use core::fmt::Write;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: DMCUB CW{index} invalid: base {base:#x}, top {top:#x}, physical {start:#x}, GPU {gpu_start:#x}..{gpu_end:#x}; PSP image {:#x?}, inherited {:?}",
+                        memory.reported.as_ref().map(|(range, _)| range),
+                        memory.inherited,
+                    );
                     return Err(Error::Invalid);
                 }
+                windows[index as usize] = gpu_start..gpu_end;
+            }
+            if !memory.authorize(&windows) {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: DMCUB windows {windows:#x?} outside owned memory; TMR {tmr:#x?}, PSP image {:#x?}, inherited {:?}",
+                    memory.reported.as_ref().map(|(range, _)| range),
+                    memory.inherited,
+                );
+                return Err(Error::Invalid);
             }
             Ok(place)
         })?;
@@ -741,11 +810,11 @@ impl Dmub {
     /// ready. The exclusive constructor contract still holds. No replay/reset
     /// after failure or cancellation without independent recovery.
     pub async unsafe fn start(&mut self, psp: &Psp) -> Result<Status, Error> {
-        let tmr = psp.dmub_tmr().map_err(|_| Error::Invalid)?;
+        let memory = psp.dmub_memory().map_err(|_| Error::Invalid)?;
         let (base, offset) = psp.fb_location();
         let end = base.checked_add(self.vram_size).ok_or(Error::Invalid)?;
         self.engine
-            .start(tmr, Aperture { base, end, offset })
+            .start(memory, Aperture { base, end, offset })
             .await?;
         if let Err(error) = self.engine.initialize_mailbox().await {
             self.engine.state = State::Failed;

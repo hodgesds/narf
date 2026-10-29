@@ -73,7 +73,16 @@ such controllers; it never starts, resets, or speaks to the ICM firmware.
 - Each peer advertising the Thunderbolt networking service gets a
   netdev named `tbnet<domain>-<n>` registered with the net registry,
   carrying Ethernet frames over ThunderboltIP data frames once the
-  mutual login completes (see §8 for the data-transport binding).
+  mutual login completes and the data transport is bound (§4).
+- The tbnet data transport is bound per peer through the control
+  channel (`XdChannel::bind_data_link`): an NHI data-ring pair
+  (`dataring::DataRingPair`, frame mode, 256 descriptors of 4 KiB)
+  at HopIDs allocated per direction from the channel's
+  `HopAllocator`, plus the two host-router Hops entries of the
+  in-router DMA path. `release_data_link` disconnects the paths and
+  drops the transport when the session ends or the peer leaves the
+  topology; CM exit disconnects every bound path
+  (`Control::release_all_data_links`).
 - `register_initcalls()` registers PCI discovery at Device and starts one
   task per natively managed controller at Late. MSI-X wakes the task, with bounded timed
   polling when MSI-X is unavailable. No config transaction holds a spinlock
@@ -87,6 +96,23 @@ such controllers; it never starts, resets, or speaks to the ICM firmware.
   controller, before ring 0 and — when no controller is native — before the
   `_OSC` request is made at all. Stood-down controllers get no ring, no
   config traffic, and no device-PM registration.
+- `retimer::scan_link(ctl, route, port)` enumerates the USB4 retimers on a
+  trained link over the sideband channel: a Broadcast RT Transaction
+  (`ENUMERATE_RE-TIMERS`, USB4 v2.0 §8.3.2.3.2) assigns one-based indices,
+  then each index's Vendor/Product/Firmware identity, last/cable status,
+  authentication status and Link Configuration register are read back
+  through the USB4 Port Capability (`PORT_CS_1`/`PORT_CS_2`, Table 8-13).
+  Topology scan runs it for every link-up lane-0 port and publishes the
+  chain as `Port::retimers`; an enumeration or agreement fault is
+  published as the typed `Port::retimer_fault`, never folded into the
+  empty-chain state. `retimer::sb_read`/`sb_write`/`port_op` are the raw
+  sideband and Port Operation primitives underneath.
+- `retimer::nvm_sector_size`, `nvm_write`, `nvm_read` and
+  `nvm_authenticate` are the retimer firmware-update surface (64-byte
+  Data-register blocks, offset staged in Metadata, authenticate restarts
+  the retimer and unassigns its index; the outcome is read with
+  `retimer::auth_status` after re-enumeration). Writes and
+  authentication are refused for cable retimers.
 
 The implementation supports USB4 routers with buffer-allocation parameters,
 USB3 tunneling between parent/child routers, PCIe tunnelling between an
@@ -147,7 +173,7 @@ when its activation completes and removed when its teardown completes, so
 accounting never charges a half-programmed tunnel and never misses a live
 one.
 
-The CM does not request XDomain control. PCIe tunnelling is gated on the
+PCIe tunnelling is gated on the
 PCIe bit of the `_OSC` grant at both layers: without it, router
 configuration never sets ROUTER_CS_5 PTO and `reconcile` never programs a
 PCIe path; with it, a device router's PTO is set only when its parent
@@ -188,7 +214,29 @@ up only once both directions have logged in, after which Ethernet
 frames cross fragmented into 4 KiB data frames and are reassembled
 under the reference validation rules (strict index order, first
 fragment's count and id, any failure discarding the packet in
-progress). Suspend composition: a logged-in XDomain link vetoes
+progress). The data transport follows the session exactly: when the
+mutual login completes, the engine binds one through the control
+channel — the channel allocates a per-direction HopID pair, starts
+and primes the NHI frame-mode data rings (TX `RING_FLAG_FRAME`; RX
+`RING_FLAG_FRAME | RING_FLAG_E2E` with the frame-start/end PDF
+masks), and only then approves the in-router DMA paths (the NHI
+adapter entry at the TX ring HopID forwarding to the lane adapter
+at the peer's announced transmit path; the lane entry at the
+announced local path `0xf` forwarding to the NHI adapter at the RX
+ring HopID, charged the buffer-allocation class credit) — paths
+last, so no frame can arrive at an unprimed ring. Data-path
+entries, like tunnel entries, are never replaced while enabled; an
+occupied entry, an out-of-range announced path, or an exhausted
+credit pool refuses the binding, and a failed binding leaves the
+login standing with the link down, retried on the next CM pass.
+The published link is up only while a transport is bound; when the
+session ends or the peer leaves the topology, the paths are
+disconnected (hop drain before the saved entries are restored)
+before the transport drops and its rings stop. Frames submitted
+to a stopped or full data ring are refused and counted, never
+posted. Because binding follows the login state, the suspend veto
+on a logged-in link covers its live data rings with no separate
+accounting. Suspend composition: a logged-in XDomain link vetoes
 suspend outright — it is not quiesced the way live tunnels are, and
 the veto is checked before any tunnel quiesce is latched; after resume
 the engine re-reads peer properties and re-logs in, which is the
@@ -206,6 +254,27 @@ status will not settle or cannot be read is stood down from rather than
 fought over. Detection is per controller — one firmware-managed controller
 neither blocks nor is endangered by a native CM on another.
 
+Retimer sideband access is bounded at every layer: one `PORT_CS_1`
+transaction waits at most 500 ms for Pending to clear, a Port Operation
+at most 500 ms (1000 ms for an NVM block write) to complete, and at most
+six retimers are probed per link. A retimer conversation that fails —
+no response mid-chain, a refused or structurally wrong reply, an
+operation completing `ERR `/`!CMD`/garbage — is a typed
+`retimer::Error` in the published snapshot, not a hang, a panic or a
+silent empty chain. Lane bonding is verified, not assumed: every
+retimer's Phase 3 Link Configuration decision nibble must equal the
+router port's own, and a non-empty chain must end in a retimer that
+reports itself last; a disagreement is
+`Error::BondingDisagreement`/`ChainNotTerminated`, never a silent
+downgrade to a single-lane assumption. The first `SET_INBOUND_SBTX` to
+a retimer is allowed exactly one No Response retry (the Re-Timer
+Specification does not require an RT response to it); all other No
+Response outcomes are terminal. NVM writes stage the full 64-byte Data
+register per block with zero padding — a block write programs the whole
+register — and `NVM_AUTH_WRITE` is issued as a raw opcode write with no
+completion poll, because authentication restarts the retimer and
+unassigns its index.
+
 ## 5. Architecture notes
 
 The transport is shared across x86_64 and aarch64 and uses the bus/DMA/IRQ
@@ -216,8 +285,16 @@ W1C for the TX/RX ring-zero bits. Physical AMD hardware remains unvalidated.
 
 `bus`, `io`, `interrupts`, `capabilities`, `aml`, `scheduler`, `time`, `power`.
 Register fields and protocol behavior were checked against local Linux
-`/usr/src/linux/drivers/thunderbolt/{pci,nhi,ctl,usb4,path,tunnel,switch,cap}.c`,
-`nhi_regs.h`, `tb_regs.h`, `tb_msgs.h`, and `drivers/acpi/bus.c`.
+`/usr/src/linux/drivers/thunderbolt/{pci,nhi,ctl,usb4,path,tunnel,switch,cap,xdomain,tb}.c`,
+`nhi_regs.h`, `tb_regs.h`, `tb_msgs.h`, `drivers/net/thunderbolt/main.c`
+(the ThunderboltIP data plane: ring parameters, PDF masks, path
+approval ordering), and `drivers/acpi/bus.c`. Retimer
+sideband registers, `PORT_CS_1` fields and Port Operation FourCCs follow
+the USB4 Specification v2.0 (June 2023) Table 4-18, Table 8-13 and
+Table 8-64 (§4.1.1.2, §4.1.1.3, §8.3.2), cross-checked against Linux
+`sb_regs.h`, `usb4.c` and `retimer.c`; retimer-specific operations
+(`SET_INBOUND_SBTX`, the NVM operations) are defined by the USB4
+Re-Timer Specification.
 
 ## 7. Stage assignment
 
@@ -233,14 +310,17 @@ link bonding and retimer policy.
 Legacy ICM is closed by detect-and-defer (§3): firmware-managed hosts are
 stood aside from, and implementing the ICM protocol itself — or adopting
 the firmware's tunnels — is out of scope by design, not pending work.
-XDomain remainders: the NHI data-ring binding for the ThunderboltIP
-netdev — `drivers/thunderbolt/src/ring.rs` implements only ring 0, so
-no production `DataLink` exists yet; the binding is a TX ring with
-`RING_FLAG_FRAME` and an RX ring with `RING_FLAG_FRAME |
-RING_FLAG_E2E`, frame-start/end PDF masks, HopID `0xf`
-(`TBNET_LOCAL_PATH`), plus the in-router XDomain path programming
-that approves the peer's transmit path — until it lands, logins
-complete but the netdev reports link down and no frames flow. The
+XDomain remainders: data-ring completion harvesting is polled from
+the CM pass cadence — no data ring gets its own MSI-X vector yet
+and the descriptor INTERRUPT bit is never set, so receive latency
+is bounded by the pump interval rather than by an interrupt; the
+RX descriptor CRC-error and buffer-overrun flag bits are not
+modelled (reassembly validation is the content check); and the
+DMA path's buffer-allocation credit uses the class the crate's
+tunnel model charges host-originated data paths, where the
+reference CM programs XDomain DMA tunnels through the same
+`tb_path` machinery (a silicon pass should confirm the class
+against the router's parameter table). The
 local XDomain UUID is a deterministic derivation from the domain and
 router identity (enumeration surfaces no firmware UUID); it is a
 stable placeholder, not a provisioned identity.
@@ -248,8 +328,36 @@ DP remainders: UHBR (128b/132b) tunnel envelopes, Gen 4 asymmetric link
 transitions, and renegotiating the programmed REMOTE_CAP envelope itself
 in response to allocation changes (today the source re-trains within the
 granted envelope).
+Retimer remainders: no caller yet supplies a firmware image to the NVM
+surface (image provenance and update policy are unbuilt); enumeration
+covers trained links only, so the link-down path (router offline mode
+plus `SET_INBOUND_SBTX` orchestration before training) is engine-only;
+lane margining Port Operations are not implemented; and `reconcile`
+does not yet hard-gate tunnel programming on a port's `retimer_fault` —
+the fault is published typed state that consumers must check.
 PCIe remainders: a pre-activation wait for the PCIe adapters' LTSSM
 Detect state, and a runtime PCI rescan of the NHI's companion bridge so
 tunnelled devices enumerate without a reboot (the CM publishes tunnels;
 registering newly appeared PCI devices is a bus-subsystem surface).
 AMD source encoder setup, firmware loading and link training belong to GPU.
+Composed-fixture boundary (issue #1098, `dock_tests`, seam #1188):
+the end-to-end dock scenario composes every stage this CM owns —
+ICM gate, enumeration with retimer chains, the retimer NVM path,
+USB3 + DP + PCIe tunnels under the full `_OSC` grant, the
+device-PM suspend/replay cycle, XDomain discovery/login/Ethernet,
+and the logged-in-link suspend veto — plus the two cross-crate
+stages through test-only optional deps (kernel-test feature) on
+the crates that own them, which change no production dependency
+of the CM: the USB PD contract is negotiated live by two
+production `TcpmPort`s over a fixture cable (stage P; the
+detach/reattach proof lives in drivers/usbpd's own back-to-back
+test, with the detach-reset fix #1193), and the USB class-device
+cascade runs from the published USB3 tunnel through the
+production hub walkers and class-registry matching (stage 3b).
+One hop remains a named boundary, not a driven stage: USB4
+alt-mode entry (EnterUSB, #1194) — no production code carries a
+port from "explicit contract live" to "USB4 alt mode entered",
+so the fixture derives link training from the live contract
+explicitly; probe execution itself (control/bulk transfers)
+stays the USB programme's xHCI-bound surface, as does the
+interface-triple dispatch inside drivers/usb's `match_entry`.

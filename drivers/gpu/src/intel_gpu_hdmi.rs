@@ -833,10 +833,10 @@ pub mod tests {
 
     use super::*;
     use crate::intel_gpu_ddi::DDI_BUF_CTL_OFFSET;
-    use crate::intel_gpu_gmbus::{GMBUS2_ACTIVE, GMBUS2_HW_RDY, GMBUS2_NACK};
+    use crate::intel_gpu_gmbus::{GMBUS2_ACTIVE, GMBUS2_HW_RDY, GMBUS2_SATOER};
     use crate::intel_gpu_modeset::PixelFormat;
     use crate::intel_gpu_pipes::{Pipe as PipeIdx, PIPECONF_OFFSET, TRANS_DDI_FUNC_CTL_OFFSET};
-    use crate::intel_gpu_pll::{dpll_cfgcr1, DPLL_CFGCR0_DPLL0};
+    use crate::intel_gpu_pll::{dpll_cfgcr1, DPLL_CFGCR0_DPLL1};
     use alloc::collections::{BTreeMap, VecDeque};
     use alloc::vec::Vec;
     use core::cell::RefCell;
@@ -946,7 +946,7 @@ pub mod tests {
 
         fn gmbus2(&self) -> u32 {
             if self.nack {
-                return GMBUS2_NACK | GMBUS2_ACTIVE;
+                return GMBUS2_SATOER | GMBUS2_ACTIVE;
             }
             if self.reading && !self.read_queue.is_empty() {
                 return GMBUS2_HW_RDY | GMBUS2_ACTIVE;
@@ -1016,7 +1016,8 @@ pub mod tests {
     // ── The MMIO register model ─────────────────────────────────
 
     const PWR_WELL_CTL2: u64 = 0x4_5404;
-    const DPLL0_ENABLE: u64 = 0x4_6010;
+    /// DPLL0/1/2_ENABLE: combo DDIs A/B/C each lock their own PLL.
+    const DPLL_ENABLES: [u64; 3] = [0x4_6010, 0x4_6014, 0x4_6018];
     const PLL_POWER_STATE: u32 = 1 << 26;
     const PLL_LOCK: u32 = 1 << 30;
 
@@ -1073,8 +1074,17 @@ pub mod tests {
             if off == PWR_WELL_CTL2 {
                 return v | ((v & 0xAAAA_AAAA) >> 1);
             }
-            if off == DPLL0_ENABLE {
+            if DPLL_ENABLES.contains(&off) {
                 return v | PLL_POWER_STATE | PLL_LOCK;
+            }
+            // DBUF slices grant power when requested.
+            {
+                use crate::intel_gpu_wm::{
+                    DBUF_CTL_S1, DBUF_CTL_S2, DBUF_POWER_REQUEST, DBUF_POWER_STATE,
+                };
+                if (off == DBUF_CTL_S1 || off == DBUF_CTL_S2) && v & DBUF_POWER_REQUEST != 0 {
+                    return v | DBUF_POWER_STATE;
+                }
             }
             let pipeconf_offs = [
                 PipeIdx::A.base() + PIPECONF_OFFSET,
@@ -1353,9 +1363,10 @@ pub mod tests {
         }
         // The base-block read ran the GMBUS codec's own
         // program for DDI B / 128 bytes, byte-for-byte:
-        // SW_CLR_INT|SW_RDY|ENT|STO|count 128|slave 0x50|read.
+        // SW_RDY|CYCLE_WAIT|count 128|slave 0x50|read.
         let sink = mmio.sink.borrow();
-        if sink.programs.first() != Some(&0xE880_00A1) {
+        let codec = build_edid_read(PinPair::DdiB, 128).map(|p| p.gmbus1);
+        if codec != Ok(0x4280_00A1) || sink.programs.first() != codec.as_ref().ok() {
             return TestResult::Fail("first GMBUS program must be the codec EDID read");
         }
         // A <=340 Mcsc mode must not touch SCDC at all.
@@ -1382,12 +1393,16 @@ pub mod tests {
         {
             return TestResult::Fail("HDMI modeset must not program DP M/N");
         }
-        // The WRPLL rows for 148.5 MHz (19.2 MHz family):
-        // CFGCR0 = int 0x173 | frac 0x2000, CFGCR1 = 0xE87.
-        if mmio.writes_to(DPLL_CFGCR0_DPLL0) != alloc::vec![0x0080_0173] {
+        // The WRPLL rows for 148.5 MHz in the fixture's
+        // DSSM-strapped 19.2 MHz family (see HdmiSinkMmio::new):
+        // CFGCR0 = int 0x1D0 | frac 0x0800, CFGCR1 = 0xE87 —
+        // the rows `smoke_hdmi_wrpll_rows` pins for this family
+        // (the 0x173/0x2000 pair this assertion previously
+        // carried is the 24 MHz family's row).
+        if mmio.writes_to(DPLL_CFGCR0_DPLL1) != alloc::vec![0x0020_01D0] {
             return TestResult::Fail("CFGCR0 must carry the 148.5 MHz WRPLL solution");
         }
-        if mmio.writes_to(dpll_cfgcr1(DPLL_CFGCR0_DPLL0)) != alloc::vec![0xE87] {
+        if mmio.writes_to(dpll_cfgcr1(DPLL_CFGCR0_DPLL1)) != alloc::vec![0xE87] {
             return TestResult::Fail("CFGCR1 must carry the 148.5 MHz WRPLL dividers");
         }
         // DIP: AVI bank dwords pinned (hole at byte 3), CTL
@@ -1483,10 +1498,10 @@ pub mod tests {
         }
         // WRPLL for 594 MHz: CFGCR0 int 0x1D0 frac 0x0800,
         // CFGCR1 0x44B.
-        if mmio.writes_to(DPLL_CFGCR0_DPLL0) != alloc::vec![0x0020_01D0] {
+        if mmio.writes_to(DPLL_CFGCR0_DPLL1) != alloc::vec![0x0020_01D0] {
             return TestResult::Fail("CFGCR0 must carry the 594 MHz WRPLL solution");
         }
-        if mmio.writes_to(dpll_cfgcr1(DPLL_CFGCR0_DPLL0)) != alloc::vec![0x44B] {
+        if mmio.writes_to(dpll_cfgcr1(DPLL_CFGCR0_DPLL1)) != alloc::vec![0x44B] {
             return TestResult::Fail("CFGCR1 must carry the 594 MHz WRPLL dividers");
         }
         clear_display_audio(sink_id_for(Ddi::B));

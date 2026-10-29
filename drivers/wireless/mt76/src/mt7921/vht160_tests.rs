@@ -97,7 +97,7 @@ fn native() -> Result<(), &'static str> {
                 if !request
                     .1
                     .windows(14)
-                    .any(|ie| ie == [191, 12, 116, 1, 0, 0, 250, 255, 0, 0, 250, 255, 0, 0])
+                    .any(|ie| ie == [191, 12, 244, 1, 0, 0, 250, 255, 0, 0, 250, 255, 0, 0x20])
                 {
                     return Err("local actual-chip160 capability encoding");
                 }

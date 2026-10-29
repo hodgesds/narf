@@ -218,14 +218,12 @@ impl TtyPort {
 
     /// A userspace write to the tty.
     ///
+    /// Terminal output must not enter the kernel log: log readers such as
+    /// `dmesg --follow` can print to this same tty.
+    ///
     /// Returns the count the CALLER supplied: a `\n` that OPOST expanded to
     /// CR-NL still consumed one byte of their buffer.
     pub fn write_user(&self, bytes: &[u8]) -> usize {
-        // The kernel log keeps the ORIGINAL text, so the persistent boot log
-        // (`narf.bootlog=`) holds what userspace printed on the console too.
-        if let Ok(s) = core::str::from_utf8(bytes) {
-            narf_console::klog::record(s);
-        }
         self.opost_out(bytes);
         bytes.len()
     }
@@ -751,6 +749,45 @@ fn smoke_console_userspace_write_honours_opost() -> narf_kernel_test::TestResult
 narf_kernel_test::kernel_test_in!(
     "filesystem/console",
     smoke_console_userspace_write_honours_opost
+);
+
+/// A log consumer must be able to print the record it just read and still
+/// reach EAGAIN. Capturing tty writes back into printk creates an unbounded
+/// read/print cycle with another timestamp prepended on every iteration.
+fn smoke_console_log_replay_does_not_generate_kernel_records() -> narf_kernel_test::TestResult {
+    use narf_console::klog::{self, KmsgRead};
+    use narf_kernel_test::TestResult;
+    let prior = narf_console::take_fb_hook();
+    narf_console::set_fb_hook(capture_hook);
+    let mut passed = true;
+    for kind in [PortKind::Vt, PortKind::Serial] {
+        let tty = TtyPort::new(kind);
+        klog::emit(klog::LOG_KERN, 6, b"narf-tty-kmsg-replay-regression");
+        let mut cursor = klog::next_seq() - 1;
+        let mut record = [0u8; klog::PRINTK_MESSAGE_MAX];
+        let read = klog::kmsg_read(&mut cursor, &mut record);
+        let before = klog::next_seq();
+        let n = match read {
+            KmsgRead::Record(n) => n,
+            _ => {
+                passed = false;
+                break;
+            }
+        };
+        let written = tty.write_user(&record[..n]);
+        let after = klog::next_seq();
+        let end = klog::kmsg_read(&mut cursor, &mut record);
+        passed &= written == n && before == after && end == KmsgRead::Empty;
+    }
+    narf_console::restore_fb_hook(prior);
+    if !passed {
+        return TestResult::Fail("printing a kernel log record to a tty generated another record");
+    }
+    TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "filesystem/console",
+    smoke_console_log_replay_does_not_generate_kernel_records
 );
 
 /// `ttyS0` and the VT are separate ttys: a write to the serial tty never

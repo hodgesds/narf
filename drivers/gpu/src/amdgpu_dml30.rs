@@ -412,6 +412,9 @@ pub struct Stream {
     pub config: Config,
     pub dsc: Option<Dsc>,
     pub phy_khz: u32,
+    /// The least ODM combine the caller drives this stream with. Mode
+    /// support may still choose more, and still checks the result.
+    pub odm: Odm,
 }
 impl Stream {
     /// An uncompressed 8-bpc TMDS stream: the PHY runs at the pixel clock.
@@ -420,6 +423,7 @@ impl Stream {
             phy_khz: config.timing.pixel_clock_khz,
             config,
             dsc: None,
+            odm: Odm::None,
         }
     }
 }
@@ -801,6 +805,34 @@ pub fn plan(config: &Config, soc: &Soc) -> Result<Plan, Error> {
     })
 }
 
+/// One stream's plan on at least `odm`'s pipes: [`plan`]'s first-pipe
+/// view, and the plane with every ODM slice for the caller that drives
+/// them.
+pub fn plan_odm(config: &Config, soc: &Soc, odm: Odm) -> Result<(Plan, PlanePlan), Error> {
+    let stream = Stream {
+        odm,
+        ..Stream::tmds(*config)
+    };
+    let joint = plan_joint(&[stream], soc)?;
+    let plane = *joint.planes.first().ok_or(Error::Invalid)?;
+    let pipe = plane.pipes[0].ok_or(Error::Invalid)?;
+    Ok((
+        Plan {
+            prefetch_mode: joint.prefetch_mode,
+            geometry: plane.geometry,
+            clocks: joint.clocks,
+            watermarks: joint.watermarks,
+            prefetch: plane.prefetch,
+            registers: pipe.registers,
+            hubbub: joint.hubbub,
+            dram_clock_change: joint.dram_clock_change,
+            urgent_bandwidth_thousandths: joint.urgent_bandwidth_thousandths,
+            cursor: pipe.cursor,
+        },
+        plane,
+    ))
+}
+
 /// The voltage-level search of `dcn30_internal_validate_bw`
 /// (`dcn20_validate_apply_pipe_split_flags` aside): the lowest of `states`
 /// (ascending, as [`Soc::states`] lists them) whose joint plan is
@@ -865,7 +897,7 @@ pub fn plan_joint(streams: &[Stream], soc: &Soc) -> Result<JointPlan, Error> {
         if required(2) > max_dispclk_down {
             return Err(Error::Unsupported);
         }
-        odm[k] = if required(1) > max_dispclk_down {
+        odm[k] = if required(1) > max_dispclk_down || s.odm == Odm::TwoToOne {
             Odm::TwoToOne
         } else {
             Odm::None

@@ -7,6 +7,12 @@ fn navi22() -> bool {
     crate::amdgpu_navi22_kms::active()
 }
 
+/// The DCN30 linear-primary card, whose GEM frames are copied rather than
+/// scanned out with DCN401's modifier/plane machinery.
+pub(crate) fn linear_gem_card(card: &crate::drm::card::Card) -> bool {
+    card.driver_name == "amdgpu" && card.native_atomic && !card.gfx12_modifiers
+}
+
 pub fn crtc_display(crtc_id: u32) -> Option<u8> {
     if navi22() {
         crate::amdgpu_navi22_kms::crtc_display(crtc_id)
@@ -49,9 +55,11 @@ pub fn request_display_mode(display: u8, mode: Option<&DrmModeModeInfo>) -> bool
         crate::amdgpu_navi48_platform::request_display_mode(display, mode)
     }
 }
-/// CRTC "VRR_ENABLED". Only Navi48 attaches the property; Navi22 ignores it.
+/// CRTC "VRR_ENABLED" on native AMD display owners.
 pub fn request_vrr_enabled(display: u8, enabled: bool) {
-    if !navi22() {
+    if navi22() {
+        crate::amdgpu_navi22_kms::request_vrr_enabled(display, enabled)
+    } else {
         crate::amdgpu_navi48_platform::request_vrr_enabled(display, enabled)
     }
 }
@@ -115,6 +123,26 @@ pub fn present_frame(
         )
     }
 }
+/// Present a linear 8888 dumb-buffer frame whose rows outside `damage`
+/// are unchanged since that buffer's previous frame (DIRTYFB). False when
+/// the display cannot present natively now.
+pub fn present_damaged(
+    display: u8,
+    frame: crate::amdgpu_navi48_platform::PlaneFrame,
+    damage: core::ops::Range<u32>,
+) -> bool {
+    if navi22() {
+        crate::amdgpu_navi22_platform::present_damaged(display, Some(frame), None, Some(damage))
+    } else {
+        crate::amdgpu_navi48_platform::present_damaged(
+            display,
+            Some(frame),
+            core::array::from_fn(|_| None),
+            None,
+            Some(damage),
+        )
+    }
+}
 /// DRM's planes on display `display`'s CRTC (Navi48 only: Navi22 exposes
 /// no overlays or plane placement).
 pub fn request_display_planes(display: u8, setup: crate::amdgpu_navi48_boot::PlaneSetup) -> bool {
@@ -143,7 +171,14 @@ pub fn present_planes(
         crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
     ticket: Option<u64>,
 ) -> bool {
-    !navi22() && crate::amdgpu_navi48_platform::present_planes(display, primary, overlays, ticket)
+    if navi22() {
+        if overlays.iter().any(Option::is_some) {
+            return false;
+        }
+        crate::amdgpu_navi22_platform::present_plane(display, primary, ticket)
+    } else {
+        crate::amdgpu_navi48_platform::present_planes(display, primary, overlays, ticket)
+    }
 }
 /// The display the console runs on.
 pub fn console_pipe() -> u8 {
@@ -174,22 +209,30 @@ pub fn request_crtc_color(display: u8, request: CrtcColorRequest) {
         crate::amdgpu_navi48_platform::request_crtc_color(display, request)
     }
 }
-/// Connector Colorspace / HDR_OUTPUT_METADATA. Only Navi48 attaches them.
+/// Connector Colorspace / HDR_OUTPUT_METADATA on native HDMI outputs.
 pub fn request_connector_color(request: ConnectorColorRequest) {
-    if !navi22() {
+    if navi22() {
+        crate::amdgpu_navi22_kms::request_connector_color(request)
+    } else {
         crate::amdgpu_navi48_platform::request_connector_color(request)
     }
 }
-/// Connector "max bpc" (max_requested_bpc). Only Navi48 attaches it.
+/// Connector "max bpc" (max_requested_bpc).
 pub fn request_connector_max_bpc(connector: u32, bpc: u8) {
-    if !navi22() {
+    if navi22() {
+        crate::amdgpu_navi22_kms::request_connector_max_bpc(connector, bpc)
+    } else {
         crate::amdgpu_navi48_platform::request_connector_max_bpc(connector, bpc)
     }
 }
 /// Whether connector `connector`'s stream can signal `colorspace` and, with
-/// `hdr`, HDR metadata (Navi48; Navi22 attaches neither property).
+/// `hdr`, HDR metadata (including Navi22's native HDMI connectors).
 pub fn connector_color_supported(connector: u32, colorspace: u32, hdr: bool) -> bool {
-    navi22() || crate::amdgpu_navi48_platform::connector_color_supported(connector, colorspace, hdr)
+    if navi22() {
+        crate::amdgpu_navi22_kms::connector_color_supported(connector, colorspace, hdr)
+    } else {
+        crate::amdgpu_navi48_platform::connector_color_supported(connector, colorspace, hdr)
+    }
 }
 /// One prospective native HDMI output in an atomic check. The plane
 /// setup and exact mode are carried by value; checking never stages state.
@@ -213,8 +256,14 @@ pub struct OutputRoute {
     pub planes: Option<(u32, crate::amdgpu_navi48_boot::PlaneSetup)>,
 }
 pub fn output_formats_supported(requests: &[OutputFormatRequest], routes: &[OutputRoute]) -> bool {
-    requests.is_empty()
-        || !navi22() && crate::amdgpu_navi48_platform::output_formats_supported(requests, routes)
+    if requests.is_empty() {
+        return true;
+    }
+    if navi22() {
+        crate::amdgpu_navi22_kms::output_formats_supported(requests, routes)
+    } else {
+        crate::amdgpu_navi48_platform::output_formats_supported(requests, routes)
+    }
 }
 /// Whether an HDR_OUTPUT_METADATA blob builds an HDR infoframe
 /// (amdgpu_dm_fill_hdr_info_packet succeeds).

@@ -19,19 +19,23 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 // both Linux offset and mask headers. Generation differences stay explicit.
 // linux-ctx: hdr=dcn seg=2
 const DCSURF_SURFACE_CONFIG: u64 = 0x05e5; // linux: mmHUBP0_DCSURF_SURFACE_CONFIG
+const DCSURF_ADDR_CONFIG: u64 = 0x05e6; // linux: mmHUBP0_DCSURF_ADDR_CONFIG
 const DCSURF_TILING_CONFIG: u64 = 0x05e7; // linux: mmHUBP0_DCSURF_TILING_CONFIG
 const DCSURF_PRI_VIEWPORT_START: u64 = 0x05e9; // linux: mmHUBP0_DCSURF_PRI_VIEWPORT_START
 const DCSURF_PRI_VIEWPORT_DIMENSION: u64 = 0x05ea; // linux: mmHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION
 const DCHUBP_REQ_SIZE_CONFIG: u64 = 0x05f1; // linux: mmHUBP0_DCHUBP_REQ_SIZE_CONFIG
 const DCHUBP_REQ_SIZE_CONFIG_C: u64 = 0x05f2; // linux: mmHUBP0_DCHUBP_REQ_SIZE_CONFIG_C
 const DCHUBP_CNTL: u64 = 0x05f3; // linux: mmHUBP0_DCHUBP_CNTL
-                                 // HUBPREQ block, same stride.
+const HUBPREQ_DEBUG: u64 = 0x05f7; // linux: mmHUBP0_HUBPREQ_DEBUG
+                                   // HUBPREQ block, same stride.
 const DCSURF_SURFACE_PITCH: u64 = 0x0607; // linux: mmHUBPREQ0_DCSURF_SURFACE_PITCH
                                           // linux: mmHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS
 const DCSURF_PRIMARY_SURFACE_ADDRESS: u64 = 0x060a;
 // linux: mmHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH
 const DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH: u64 = 0x060b;
 const DCSURF_SURFACE_CONTROL: u64 = 0x061a; // linux: mmHUBPREQ0_DCSURF_SURFACE_CONTROL
+const VMID_SETTINGS_0: u64 = 0x0609; // linux: mmHUBPREQ0_VMID_SETTINGS_0
+const DCSURF_FLIP_CONTROL: u64 = 0x061b; // linux: mmHUBPREQ0_DCSURF_FLIP_CONTROL
 const DCN_EXPANSION_MODE: u64 = 0x0629; // linux: mmHUBPREQ0_DCN_EXPANSION_MODE
 const DCN_TTU_QOS_WM: u64 = 0x062a; // linux: mmHUBPREQ0_DCN_TTU_QOS_WM
 const DCN_GLOBAL_TTU_CNTL: u64 = 0x062b; // linux: mmHUBPREQ0_DCN_GLOBAL_TTU_CNTL
@@ -187,6 +191,37 @@ struct Engine<I: Io> {
     blank_stalls: u32,
 }
 impl<I: Io> Engine<I> {
+    /// hubp3_init plus the device-derived part of hubp3_program_tiling.
+    /// Called after power/clock enable and before programming a surface.
+    fn initialize(&mut self, gb_addr_config: u32) -> Result<(), Error> {
+        if !self.profile.is_dcn30() {
+            return Err(Error::Unsupported);
+        }
+        if !self.blanked {
+            return Err(Error::Busy);
+        }
+        if gb_addr_config == u32::MAX {
+            return Err(Error::DeviceGone);
+        }
+        // GC10 GB_ADDR_CONFIG fields are log2 codes. Admit the same
+        // 256-byte interleave as the RDNA2 topology path; other sizes
+        // need separate validation. Repack into HUBP's field positions.
+        let interleave = (gb_addr_config >> 3) & 7;
+        if interleave != 0 {
+            return Err(Error::Unsupported);
+        }
+        let geometry = (gb_addr_config & 7)
+            | (interleave << 6)
+            | (((gb_addr_config >> 6) & 3) << 12)
+            | (((gb_addr_config >> 8) & 7) << 16);
+        // DEDCN21-133: align DPTE and metadata row starts across flips.
+        // linux: n/a (literal 1 << 26 in dcn30_hubp.c:hubp3_init)
+        self.set(HUBPREQ_DEBUG, 1 << 26)?;
+        // linux-lit: 0x1000=HUBP0_DCHUBP_CNTL__HUBP_TTU_DISABLE_MASK
+        self.update(DCHUBP_CNTL, 0x1000, 0)?;
+        // linux-lit: 0x730c7=HUBP0_DCSURF_ADDR_CONFIG__NUM_PIPES_MASK | HUBP0_DCSURF_ADDR_CONFIG__PIPE_INTERLEAVE_MASK | HUBP0_DCSURF_ADDR_CONFIG__MAX_COMPRESSED_FRAGS_MASK | HUBP0_DCSURF_ADDR_CONFIG__NUM_PKRS_MASK
+        self.update(DCSURF_ADDR_CONFIG, 0x730c7, geometry)
+    }
     fn reg(&self, reg: u64) -> u64 {
         reg + self.instance as u64 * STRIDE
     }
@@ -315,9 +350,12 @@ impl<I: Io> Engine<I> {
             return Err(Error::Invalid);
         }
         if surface.pitch == 0
+            || surface.pitch > 0x4000
             || surface.pitch < surface.viewport_width
             || surface.viewport_width == 0
             || surface.viewport_height == 0
+            || surface.viewport_width > 0x3fff
+            || surface.viewport_height > 0x3fff
         {
             return Err(Error::Invalid);
         }
@@ -328,11 +366,14 @@ impl<I: Io> Engine<I> {
         {
             return Err(Error::Invalid);
         }
-        // linux-lit: 0x7f=HUBP0_DCSURF_SURFACE_CONFIG__SURFACE_PIXEL_FORMAT_MASK
-        self.update(DCSURF_SURFACE_CONFIG, 0x7f, pixel_format(surface.format))?;
+        // hubp2_program_rotation and hubp3_program_surface_config: one
+        // unrotated RGB plane, without a separate alpha plane. The GOP or
+        // a previous modeset need not have left those fields at reset.
+        // linux-lit: 0xf7f=HUBP0_DCSURF_SURFACE_CONFIG__SURFACE_PIXEL_FORMAT_MASK | HUBP0_DCSURF_SURFACE_CONFIG__ROTATION_ANGLE_MASK | HUBP0_DCSURF_SURFACE_CONFIG__H_MIRROR_EN_MASK | HUBP0_DCSURF_SURFACE_CONFIG__ALPHA_PLANE_EN_MASK
+        self.update(DCSURF_SURFACE_CONFIG, 0xf7f, pixel_format(surface.format))?;
         // Linear, with no meta surface and no pipe alignment to inherit.
-        // linux-lit: 0x1f=HUBP0_DCSURF_TILING_CONFIG__SW_MODE_MASK
-        self.update(DCSURF_TILING_CONFIG, 0x1f, SW_MODE_LINEAR)?;
+        // linux-lit: 0xa1f=HUBP0_DCSURF_TILING_CONFIG__SW_MODE_MASK | HUBP0_DCSURF_TILING_CONFIG__META_LINEAR_MASK | HUBP0_DCSURF_TILING_CONFIG__PIPE_ALIGNED_MASK
+        self.update(DCSURF_TILING_CONFIG, 0xa1f, SW_MODE_LINEAR)?;
         // The pitch register holds one less, and there is no meta pitch.
         self.set(DCSURF_SURFACE_PITCH, surface.pitch - 1)?;
         self.set(DCSURF_PRI_VIEWPORT_START, x)?;
@@ -342,8 +383,15 @@ impl<I: Io> Engine<I> {
             surface.viewport_width | surface.viewport_height << 16,
         )?;
         // Not a trusted-memory surface, and no DCC to decompress.
-        // linux-lit: 0x3=HUBPREQ0_DCSURF_SURFACE_CONTROL__PRIMARY_SURFACE_TMZ_MASK | HUBPREQ0_DCSURF_SURFACE_CONTROL__PRIMARY_SURFACE_DCC_EN_MASK
-        self.update(DCSURF_SURFACE_CONTROL, 0x3, 0)?;
+        // linux-lit: 0x10003=HUBPREQ0_DCSURF_SURFACE_CONTROL__PRIMARY_SURFACE_TMZ_MASK | HUBPREQ0_DCSURF_SURFACE_CONTROL__PRIMARY_SURFACE_DCC_EN_MASK | HUBPREQ0_DCSURF_SURFACE_CONTROL__PRIMARY_META_SURFACE_TMZ_MASK
+        self.update(DCSURF_SURFACE_CONTROL, 0x10003, 0)?;
+        // Initial activation needs the same VMID/stereo setup as later
+        // hubp3_program_surface_flip_and_addr calls. No previous surface
+        // update lock or VUPDATE skip count belongs to this new owner.
+        // linux-lit: 0xf=HUBPREQ0_VMID_SETTINGS_0__VMID_MASK
+        self.update(VMID_SETTINGS_0, 0xf, 0)?;
+        // linux-lit: 0x130f3=HUBPREQ0_DCSURF_FLIP_CONTROL__SURFACE_UPDATE_LOCK_MASK | HUBPREQ0_DCSURF_FLIP_CONTROL__SURFACE_FLIP_TYPE_MASK | HUBPREQ0_DCSURF_FLIP_CONTROL__SURFACE_FLIP_VUPDATE_SKIP_NUM_MASK | HUBPREQ0_DCSURF_FLIP_CONTROL__SURFACE_FLIP_MODE_FOR_STEREOSYNC_MASK | HUBPREQ0_DCSURF_FLIP_CONTROL__SURFACE_FLIP_IN_STEREOSYNC_MASK
+        self.update(DCSURF_FLIP_CONTROL, 0x130f3, 0)?;
         self.set(
             DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH,
             (surface.address >> 32) as u32,
@@ -407,6 +455,12 @@ impl<I: Io> Engine<I> {
 #[derive(Debug)]
 pub struct Hubp(Engine<Mmio>);
 impl Hubp {
+    /// Initialize a newly powered, blank DCN30 pipe using this GPU's GC10
+    /// GB_ADDR_CONFIG. The caller has enabled the HUBP clock and excluded
+    /// other display/reset writers; the current owner has no live fetch.
+    pub fn initialize(&mut self, gb_addr_config: u32) -> Result<(), Error> {
+        self.0.initialize(gb_addr_config)
+    }
     /// # Safety
     /// Caller exclusively owns this HUBP instance for the object's lifetime,
     /// holds matching PCI authority and a permanent register mapping, and must

@@ -44,7 +44,7 @@ use alloc::vec::Vec;
 
 use crate::descriptor::{Field, FieldFlags, FieldKind, ReportDescriptor};
 use crate::report::{array_active_usages, extract, ReportError};
-use crate::usage::{consumer, generic_desktop, keyboard};
+use crate::usage::{consumer, generic_desktop, keyboard, led};
 
 /// Standard boot-keyboard modifier bit positions (HID Usage Tables
 /// 1.4 §10, usages 0xE0..=0xE7). Bit N in the modifier byte
@@ -137,6 +137,112 @@ pub fn detect(d: &ReportDescriptor) -> Option<KeyboardProfile> {
         modifiers,
         keys,
     })
+}
+
+/// The keyboard's LED Output report layout, resolved from the
+/// descriptor's LED-page (0x08) Output field(s).
+///
+/// A keyboard's lock indicators are an *Output* report: the boot
+/// descriptor (HID 1.11 §B.1) declares five 1-bit Variable items on
+/// the LED page (Num Lock, Caps Lock, Scroll Lock, Compose, Kana)
+/// followed by constant padding. Bit positions are within the
+/// report *body* — the bytes after the optional Report ID prefix —
+/// matching how [`Field::bit_offset`] is counted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedOutputProfile {
+    /// Report ID of the Output report carrying the LEDs (`0` when
+    /// the descriptor declares no Report IDs).
+    pub report_id: u8,
+    /// Body bit position of the Num Lock LED, if declared.
+    pub num_bit: Option<u32>,
+    /// Body bit position of the Caps Lock LED, if declared.
+    pub caps_bit: Option<u32>,
+    /// Body bit position of the Scroll Lock LED, if declared.
+    pub scroll_bit: Option<u32>,
+    /// Total Output-report body length in bytes for this report ID
+    /// (variable items + constant padding), excluding the Report ID
+    /// prefix byte.
+    pub body_len: usize,
+}
+
+/// Probe a parsed descriptor for a keyboard LED Output field: a
+/// Variable, non-constant Output item on the LED usage page.
+/// Returns `None` when the device declares no LED outputs (the
+/// transport then tracks LED state in the input core only).
+pub fn detect_led_output(d: &ReportDescriptor) -> Option<LedOutputProfile> {
+    let field = d.fields.iter().find(|f| {
+        f.kind == FieldKind::Output
+            && f.usage_page == led::PAGE
+            && f.flags.contains(FieldFlags::VARIABLE)
+            && !f.flags.contains(FieldFlags::CONSTANT)
+    })?;
+    let report_id = field.report_id;
+
+    // Body length: the far end of every Output field (padding
+    // included) that shares this report ID.
+    let total_bits = d
+        .fields
+        .iter()
+        .filter(|f| f.kind == FieldKind::Output && f.report_id == report_id)
+        .map(|f| f.bit_offset + f.report_size * f.report_count)
+        .max()
+        .unwrap_or(0);
+    if total_bits == 0 {
+        return None;
+    }
+
+    // Bit position of one LED usage within its field: element `i`
+    // of a Variable field sits at `bit_offset + i * report_size`,
+    // and element order follows the field's usage list (explicit
+    // usages, else the Usage Min..=Max range).
+    let bit_for = |want: u16| -> Option<u32> {
+        for f in d.fields.iter().filter(|f| {
+            f.kind == FieldKind::Output
+                && f.report_id == report_id
+                && f.usage_page == led::PAGE
+                && !f.flags.contains(FieldFlags::CONSTANT)
+        }) {
+            for i in 0..f.report_count {
+                let usage = if (i as usize) < f.usages.len() {
+                    f.usages[i as usize].1
+                } else if let Some((_, lo)) = f.usage_min {
+                    lo + i as u16
+                } else {
+                    continue;
+                };
+                if usage == want {
+                    return Some(f.bit_offset + i * f.report_size);
+                }
+            }
+        }
+        None
+    };
+
+    Some(LedOutputProfile {
+        report_id,
+        num_bit: bit_for(led::NUM_LOCK),
+        caps_bit: bit_for(led::CAPS_LOCK),
+        scroll_bit: bit_for(led::SCROLL_LOCK),
+        body_len: (total_bits as usize).div_ceil(8),
+    })
+}
+
+/// Encode an LED Output report body (no Report ID prefix — the
+/// transport adds it) with the three lock indicators set per the
+/// arguments. Undeclared LEDs and all other bits stay zero.
+pub fn encode_led_output(p: &LedOutputProfile, num: bool, caps: bool, scroll: bool) -> Vec<u8> {
+    let mut body = alloc::vec![0u8; p.body_len];
+    for (bit, on) in [(p.num_bit, num), (p.caps_bit, caps), (p.scroll_bit, scroll)] {
+        if on {
+            if let Some(b) = bit {
+                let idx = (b / 8) as usize;
+                if idx < body.len() {
+                    body[idx] |= 1 << (b % 8);
+                }
+            }
+        }
+    }
+    body
 }
 
 /// `true` when `f`'s local usage range (or explicit usage list)

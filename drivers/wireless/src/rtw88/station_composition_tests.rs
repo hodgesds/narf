@@ -97,10 +97,15 @@ pub(in crate::rtw88) struct Peer {
     pub(in crate::rtw88) data_sequence: u16,
     pub(in crate::rtw88) reorder_downlink: bool,
     pub(in crate::rtw88) uplink: Vec<Vec<u8>>,
+    /// Admit QoS DATA on every TID (N2xQ); each uplink's TID is recorded.
+    pub(in crate::rtw88) any_tid: bool,
+    pub(in crate::rtw88) tids: Vec<u8>,
     pub(in crate::rtw88) hold_m4: bool,
     pub(in crate::rtw88) m2_data: Option<Vec<u8>>,
     pub(in crate::rtw88) m2_original: Option<Vec<u8>>,
     pub(in crate::rtw88) hold_data: bool,
+    /// Actual software-scan Probe Request DMA bytes, in publication order.
+    pub(in crate::rtw88) probes: Vec<Vec<u8>>,
 }
 impl Peer {
     pub(in crate::rtw88) fn new(protected: bool) -> Self {
@@ -145,10 +150,13 @@ impl Peer {
             data_sequence: 0,
             reorder_downlink: false,
             uplink: Vec::new(),
+            any_tid: false,
+            tids: Vec::new(),
             hold_m4: false,
             m2_data: None,
             m2_original: None,
             hold_data: false,
+            probes: Vec::new(),
         }
     }
     pub(in crate::rtw88) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -188,6 +196,24 @@ impl Peer {
         &mut self,
         frame: &[u8],
     ) -> Result<(Vec<Vec<u8>>, bool), &'static str> {
+        if frame.first() == Some(&0x40) {
+            // An AP answers a wildcard or matching-SSID probe with its
+            // beacon body as a unicast Probe Response to the probe SA.
+            self.probes.push(frame.to_vec());
+            if frame.len() < 26 || frame[24] != 0 || frame[4..10] != [255; 6] {
+                return Err("native probe request header/SSID element");
+            }
+            let ssid = frame
+                .get(26..26 + usize::from(frame[25]))
+                .ok_or("native probe SSID extent")?;
+            if !ssid.is_empty() && ssid != SSID {
+                return Ok((Vec::new(), false));
+            }
+            let mut response = self.ap.beacon();
+            response[0] = 0x50;
+            response[4..10].copy_from_slice(&frame[10..16]);
+            return Ok((vec![response], false));
+        }
         if frame.len() == 20 && frame[..2] == [0x84, 0] {
             let ssn = u16::from_le_bytes([frame[18], frame[19]]);
             if frame[4..10] != AP
@@ -359,7 +385,9 @@ impl Peer {
         if frame.len() < header
             || !matches!(frame[0], 8 | 0x88)
             || frame[0] == 0x88 && !self.qos
-            || header == 26 && frame[24..26] != [0, 0]
+            || header == 26
+                && frame[24..26] != [0, 0]
+                && !(self.any_tid && frame[24] & 0xf8 == 0 && frame[25] == 0)
             || frame[1] & 3 != 1
             || (frame[1] & 0x40 != 0) != self.ap.protected()
         {
@@ -379,7 +407,7 @@ impl Peer {
                 &Ccm,
                 &frame[..header],
                 key,
-                0,
+                if header == 26 { frame[24] & 15 } else { 0 },
                 false,
                 &mut self.replay,
                 &mut body,
@@ -394,6 +422,9 @@ impl Peer {
         ethernet.extend_from_slice(&body[6..]);
         if self.qos && header == 24 && ethernet.get(12..14) != Some(&[0x88, 0x8e]) {
             return Err("native WMM non-QoS data is not private EAPOL");
+        }
+        if header == 26 {
+            self.tids.push(frame[24]);
         }
         self.uplink.push(ethernet.clone());
         let replies = match self.server.receive(&ethernet) {
@@ -566,6 +597,10 @@ impl Harness {
         let mut retained = self.lifecycle.retained.try_lock().unwrap();
         operation(&mut retained.as_mut().unwrap().io)
     }
+    fn lifecycle_reclaimable(&self) -> bool {
+        let retained = self.lifecycle.retained.try_lock().unwrap();
+        retained.as_ref().unwrap().dma_reclaimable()
+    }
     fn pump(&self) {
         for _ in 0..16 {
             self.device.drain();
@@ -648,11 +683,97 @@ fn composition(protected: bool) -> TestResult {
     {
         return TestResult::Fail("RTL8822CE terminal disconnect not parked");
     }
+    // rtw_pci_stop + DMA idle proof ran once and released the mappings.
+    if !h.model(|io| io.reclaimed && io.quiesces == 1) || !h.lifecycle_reclaimable() {
+        return TestResult::Fail("RTL8822CE stopped idle owner kept its DMA retained");
+    }
     if h.device.enqueue(&uplink, TxMeta::default()).is_ok() {
         return TestResult::Fail("RTL8822CE disconnected packet publication reopened");
     }
     TestResult::Pass
 }
+/// Linux `rtw_pci_remove` over a joined station: the shell withdraws, the
+/// owner stops and proves DMA idle, and only then is it dropped with its
+/// mappings released. No stage or station can start afterwards.
+fn smoke_rtw8822ce_removal_withdraws_then_reclaims_after_dma_proof() -> TestResult {
+    use crate::rtw88::firmware_lifecycle::Stage;
+    let h = Harness::new(false);
+    h.join();
+    h.device.withdraw();
+    let detached = narf_net::iface::lookup(h.device.name()).is_none_or(|iface| !iface.carrier);
+    if !h.device.withdrawn()
+        || !h.device.closed()
+        || h.device.link_up()
+        || h.device.connected_bssid().is_some()
+        || !detached
+        || h.device.enqueue(&[0; 64], TxMeta::default()).is_ok()
+    {
+        return TestResult::Fail("RTL8822CE removal left the shell open");
+    }
+    if !complete(h.lifecycle.remove()) {
+        return TestResult::Fail("RTL8822CE idle removed owner kept DMA pinned");
+    }
+    let status = h.lifecycle.status();
+    if !h.lifecycle.removed()
+        || status.stage != Stage::Failed
+        || status.error != Some(crate::rtw88::FirmwareError::Gone)
+        || h.lifecycle.retained.try_lock().is_none_or(|o| o.is_some())
+    {
+        return TestResult::Fail("RTL8822CE removed lifecycle still retains an owner");
+    }
+    if complete(h.device.associate(h.request())).is_ok() || !complete(h.lifecycle.remove()) {
+        return TestResult::Fail("RTL8822CE removed owner reopened");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/station",
+    smoke_rtw8822ce_removal_withdraws_then_reclaims_after_dma_proof
+);
+/// Removal whose RXDMA never idles still tears the owner down but keeps
+/// every published mapping pinned; a lifecycle removed before any owner
+/// existed refuses later initialization.
+fn smoke_rtw8822ce_removal_without_dma_proof_pins_and_blocks_initialize() -> TestResult {
+    let h = Harness::new(false);
+    h.join();
+    h.model(|io| io.rx_dma_busy = true);
+    h.device.withdraw();
+    if complete(h.lifecycle.remove()) {
+        return TestResult::Fail("RTL8822CE busy RXDMA removal reported reclaimed");
+    }
+    drop(h);
+    let lifecycle = Lifecycle::<RadioIo>::new(0xc822);
+    if !complete(lifecycle.remove())
+        || complete(lifecycle.initialize_bytes(|| Ok(RadioIo::new()), Vec::new()))
+            != Err(crate::rtw88::FirmwareError::State)
+        || lifecycle.retained.try_lock().is_none_or(|o| o.is_some())
+    {
+        return TestResult::Fail("RTL8822CE removed lifecycle initialized an owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/station",
+    smoke_rtw8822ce_removal_without_dma_proof_pins_and_blocks_initialize
+);
+/// A disconnect whose RXDMA never idles still completes, but every
+/// published mapping stays retained (no reclaim without the proof).
+fn smoke_rtw8822ce_disconnect_without_dma_idle_proof_retains_mappings() -> TestResult {
+    let h = Harness::new(false);
+    h.join();
+    h.model(|io| io.rx_dma_busy = true);
+    if complete(h.device.disassociate()).is_err() || !h.closed() {
+        return TestResult::Fail("RTL8822CE disconnect failed on a missing DMA proof");
+    }
+    if h.model(|io| io.reclaimed || io.quiesces != 1) || h.lifecycle_reclaimable() {
+        return TestResult::Fail("RTL8822CE busy RXDMA was released");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/station",
+    smoke_rtw8822ce_disconnect_without_dma_idle_proof_retains_mappings
+);
 fn smoke_rtw8822ce_earned_native_device_open_kernel_dhcp_ip() -> TestResult {
     composition(false)
 }
@@ -917,4 +1038,190 @@ fn smoke_rtw8822ce_native_disconnect_reservation_and_cancel_preserve_cleanup() -
 kernel_test_in!(
     "drivers/wireless/rtw88/station",
     smoke_rtw8822ce_native_disconnect_reservation_and_cancel_preserve_cleanup
+);
+
+fn active_request(ssids: Vec<Vec<u8>>, extra_ies: Vec<u8>) -> ScanRequest {
+    ScanRequest {
+        ssids,
+        frequencies_mhz: vec![2412],
+        channels: vec![1],
+        active: true,
+        random_mac: None,
+        colocated_6ghz: false,
+        duration_tu: Some(2),
+        duration_mandatory: false,
+        extra_ies,
+    }
+}
+/// Expected mac80211 software-scan preq for this station, sequence masked.
+fn expected_probe(ssid: &[u8], extra: &[u8]) -> Vec<u8> {
+    let mut f = vec![0x40, 0, 0, 0];
+    f.extend_from_slice(&[255; 6]);
+    f.extend_from_slice(&OWN);
+    f.extend_from_slice(&[255; 6]);
+    f.extend_from_slice(&[0, 0, 0, ssid.len() as u8]);
+    f.extend_from_slice(ssid);
+    f.extend_from_slice(&[1, 8, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24]);
+    f.extend_from_slice(&[50, 4, 0x30, 0x48, 0x60, 0x6c, 3, 1, 1]);
+    f.extend_from_slice(extra);
+    f
+}
+fn smoke_rtw8822ce_native_active_scan_probe_response_joins() -> TestResult {
+    let h = Harness::new(false);
+    // Consume the harness's initial beacon, then age it out (10s lifetime).
+    h.scan();
+    h.env.clock.fetch_add(20_000, Ordering::AcqRel);
+    let passive = complete(h.device.scan(ScanRequest {
+        active: false,
+        ..active_request(vec![SSID.to_vec()], Vec::new())
+    }));
+    if !passive.is_ok_and(|seen| seen.is_empty()) || !h.peer.lock().probes.is_empty() {
+        return TestResult::Fail("RTL8822CE passive scan transmitted or kept stale BSS");
+    }
+    let vendor = [221, 4, 0x00, 0x10, 0x18, 0x02];
+    let before = h.model(|io| io.packets.descriptors.len());
+    let seen = match complete(h.device.scan(active_request(
+        vec![b"other".to_vec(), SSID.to_vec()],
+        vendor.to_vec(),
+    ))) {
+        Ok(seen) => seen,
+        Err(_) => return TestResult::Fail("RTL8822CE active channel1 scan failed"),
+    };
+    if seen.len() != 1 || seen[0].bssid != AP || seen[0].ssid != SSID {
+        return TestResult::Fail("RTL8822CE active scan missed the probe response");
+    }
+    let probes = h.peer.lock().probes.clone();
+    if probes.len() != 2 {
+        return TestResult::Fail("RTL8822CE active scan probe count differs");
+    }
+    for (probe, ssid) in probes.iter().zip([&b"other"[..], SSID]) {
+        let mut masked = probe.clone();
+        masked[22..24].fill(0);
+        if masked != expected_probe(ssid, &vendor) || probe[22] & 15 != 0 {
+            return TestResult::Fail("RTL8822CE native probe request bytes differ");
+        }
+    }
+    if probes[0][22..24] == probes[1][22..24] {
+        return TestResult::Fail("RTL8822CE probes reused a management sequence number");
+    }
+    let descriptors = h.model(|io| io.packets.descriptors[before..].to_vec());
+    if descriptors.len() != 2
+        || descriptors.iter().any(|d| {
+            let word = |i: usize| u32::from_le_bytes([d[i], d[i + 1], d[i + 2], d[i + 3]]);
+            word(0) & (1 << 24) == 0 || (word(4) >> 8) & 31 != 18 || word(8) & (1 << 19) != 0
+        })
+    {
+        return TestResult::Fail("RTL8822CE probe descriptor lacks BMC/MGMT or requested CCX");
+    }
+    if complete(h.device.associate(h.request())).is_err()
+        || !h.device.link_up()
+        || h.device.connected_bssid() != Some(AP)
+    {
+        return TestResult::Fail("RTL8822CE could not join a probe-response BSS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/station",
+    smoke_rtw8822ce_native_active_scan_probe_response_joins
+);
+
+/// `randomized_scan_mac`: `rtw_core_scan_start` points port0 `REG_MACID`
+/// (0x610) at the random SA for the scan; `rtw_core_scan_complete`
+/// restores the own address. The AP answers the random SA.
+fn smoke_rtw8822ce_native_random_mac_scan_restores_port_address() -> TestResult {
+    let h = Harness::new(false);
+    h.scan();
+    h.env.clock.fetch_add(20_000, Ordering::AcqRel);
+    let random = narf_wireless::scan::ScanRandomMac {
+        addr: [0x0a, 0x0b, 0, 0, 0, 0],
+        mask: [0xff, 0xff, 0, 0, 0, 0],
+    };
+    let seen = complete(h.device.scan(ScanRequest {
+        random_mac: Some(random),
+        ..active_request(vec![SSID.to_vec()], Vec::new())
+    }));
+    if !seen.is_ok_and(|s| s.len() == 1 && s[0].bssid == AP) {
+        return TestResult::Fail("RTL8822CE random-MAC scan missed the probe response");
+    }
+    let probes = h.peer.lock().probes.clone();
+    let Some(sa) = probes.first().map(|p| p[10..16].to_vec()) else {
+        return TestResult::Fail("RTL8822CE random-MAC scan sent no probe");
+    };
+    if sa[..2] != [0x0a, 0x0b] || sa == OWN {
+        return TestResult::Fail("RTL8822CE probe SA is not the masked random address");
+    }
+    let port: Vec<u8> = (0..6)
+        .map(|i| h.model(|io| io.register(0x610 + i) as u8))
+        .collect();
+    if port != OWN {
+        return TestResult::Fail("RTL8822CE port0 MAC not restored after random scan");
+    }
+    if !h.model(|io| io.port_writes.contains(&sa[0])) {
+        return TestResult::Fail("RTL8822CE port0 MAC never followed the random scan SA");
+    }
+    // Ordinary scans and association keep the own address afterwards.
+    if complete(h.device.associate(h.request())).is_err() || !h.device.link_up() {
+        return TestResult::Fail("RTL8822CE could not join after a random-MAC scan");
+    }
+    let assoc = h.peer.lock().association.clone().unwrap_or_default();
+    if assoc.get(10..16) != Some(&OWN[..]) {
+        return TestResult::Fail("RTL8822CE associated with the random scan address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/random_scan",
+    smoke_rtw8822ce_native_random_mac_scan_restores_port_address
+);
+
+fn smoke_rtw8822ce_native_active_scan_refuses_policy_and_unsupported_requests() -> TestResult {
+    let h = Harness::new(false);
+    for request in [
+        ScanRequest {
+            random_mac: Some(narf_wireless::scan::ScanRandomMac {
+                addr: [3, 0, 0, 0, 0, 0],
+                mask: [0xff, 0, 0, 0, 0, 0],
+            }),
+            ..active_request(Vec::new(), Vec::new())
+        },
+        active_request(vec![Vec::new(); 5], Vec::new()),
+        ScanRequest {
+            channels: vec![6],
+            frequencies_mhz: vec![2437],
+            ..active_request(Vec::new(), Vec::new())
+        },
+        ScanRequest {
+            active: false,
+            ..active_request(Vec::new(), vec![221, 3, 0, 0x10, 0x18])
+        },
+        active_request(Vec::new(), vec![0, 2, b'x', b'y']),
+        active_request(Vec::new(), vec![221, 9, 0]),
+    ] {
+        if complete(h.device.scan(request)).is_ok() || !h.peer.lock().probes.is_empty() {
+            return TestResult::Fail("RTL8822CE admitted an unsupported active scan request");
+        }
+    }
+    // Rejected requests are refused before the owner is touched; the
+    // station still completes a later active scan.
+    if complete(h.device.scan(active_request(Vec::new(), Vec::new())))
+        .map_or(true, |seen| seen.len() != 1)
+        || h.peer.lock().probes.len() != 1
+    {
+        return TestResult::Fail("RTL8822CE request validation disturbed the station");
+    }
+    // Current regulatory policy is rechecked before the next probe DMA.
+    h.model(|io| io.policy.lock().rules[0].flags = narf_wireless::reg::RegFlags::NO_IR);
+    let before = h.model(|io| io.packets.tx_publications);
+    if complete(h.device.scan(active_request(Vec::new(), Vec::new()))).is_ok()
+        || h.model(|io| io.packets.tx_publications) != before
+        || h.peer.lock().probes.len() != 1
+    {
+        return TestResult::Fail("RTL8822CE probed on a NO_IR policy");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/station",
+    smoke_rtw8822ce_native_active_scan_refuses_policy_and_unsupported_requests
 );

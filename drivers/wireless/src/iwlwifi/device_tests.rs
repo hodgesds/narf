@@ -34,6 +34,7 @@ impl Fixture {
             source,
             generation: Arc::new(AtomicU64::new(0)),
             quarantined: AtomicBool::new(false),
+            suspended: AtomicBool::new(false),
             admission: IrqSafeSpinLock::new(()),
             mac: [2; 6],
             irq_vector: None,

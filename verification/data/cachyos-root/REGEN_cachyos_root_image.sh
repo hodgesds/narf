@@ -46,7 +46,9 @@ DISK_GUID=c4c405ee-0000-4d15-8000-000000000001
 ESP_PARTUUID=c4c405ee-0000-4d15-8000-0000000000e5
 ROOT_PARTUUID=c4c405ee-0000-4d15-8000-0000000000b7
 
-ESP_MIB=128
+# Match the host ESP: the production ELF plus early GPU/Wi-Fi firmware no
+# longer fits in the old 128 MiB fixture, before any guest code even runs.
+ESP_MIB=512
 BTRFS_MIB="${CACHYOS_ROOT_BTRFS_MIB:-4096}"
 BGT="${CACHYOS_ROOT_BGT:-1}"
 COMPRESS="${CACHYOS_ROOT_COMPRESS:-zstd:1}"

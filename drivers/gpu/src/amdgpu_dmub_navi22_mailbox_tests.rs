@@ -370,3 +370,97 @@ kernel_test_in!(
     "drivers/gpu/dmub-navi22",
     dmub_navi22_mailbox_cancellation_timeout_and_revocation_quarantine
 );
+
+fn freesync_edid() -> Vec<u8> {
+    use crate::amdgpu_dcn30_hdmi::tests::{edid, vsdb, DTD_1080P};
+    edid(DTD_1080P, &[vsdb(0, 68), alloc::vec![0x64, 0x1a, 0, 0, 1]])
+}
+fn dmub_navi22_hdmi_freesync_authenticates_exact_cea_chunks() -> TestResult {
+    use crate::amdgpu_freesync::AmdVsdb;
+    let (_pool, mut engine) = ready();
+    let e = freesync_edid();
+    let caps = AmdVsdb {
+        version: 1,
+        min_hz: 40,
+        max_hz: 144,
+        vcp_code: 0,
+    };
+    engine.io.edid_caps = Some(caps);
+    if run(engine.hdmi_freesync_caps(&e)) != Ok(Some(caps))
+        || engine.mailbox.state != MailboxState::Ready
+        || engine.io.edid_chunks.len() != 16
+        || engine
+            .io
+            .edid_chunks
+            .iter()
+            .enumerate()
+            .any(|(i, (offset, chunk))| {
+                usize::from(*offset) != i * 8 || chunk[..] != e[128 + i * 8..136 + i * 8]
+            })
+    {
+        return TestResult::Fail("FreeSync CEA chunk/firmware reply ABI");
+    }
+    let writes = engine.io.writes.len();
+    let mut bad = e.clone();
+    bad[255] ^= 1;
+    for edid in [&bad[..], &e[..128], &e[..200]] {
+        if run(engine.hdmi_freesync_caps(edid)) != Ok(None) || engine.io.writes.len() != writes {
+            return TestResult::Fail("invalid/missing CTA touched mailbox");
+        }
+    }
+    // An older firmware may consume without implementing this command.
+    engine.io.edid_caps = None;
+    if run(engine.hdmi_freesync_caps(&e)) != Ok(None) || engine.mailbox.state != MailboxState::Ready
+    {
+        return TestResult::Fail("optional query absence poisoned mailbox");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi22",
+    dmub_navi22_hdmi_freesync_authenticates_exact_cea_chunks
+);
+
+fn dmub_navi22_hdmi_freesync_bad_ack_and_cancel_keep_mailbox_owned() -> TestResult {
+    use crate::amdgpu_freesync::AmdVsdb;
+    use core::{
+        future::Future,
+        pin::pin,
+        task::{Context, Poll},
+    };
+    let e = freesync_edid();
+    let (_pool, mut engine) = ready();
+    engine.io.edid_caps = Some(AmdVsdb {
+        version: 1,
+        min_hz: 40,
+        max_hz: 144,
+        vcp_code: 0,
+    });
+    engine.io.corrupt = Some((5, 1)); // ACK must name the posted offset.
+    if run(engine.hdmi_freesync_caps(&e)) != Err(Error::Protocol)
+        || engine.mailbox.state != MailboxState::Failed
+    {
+        return TestResult::Fail("mismatched CEA ACK accepted");
+    }
+    let (_pool, mut engine) = ready();
+    engine.io.commands = false;
+    {
+        let mut future = pin!(engine.hdmi_freesync_caps(&e));
+        if !matches!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(core::task::Waker::noop())),
+            Poll::Pending
+        ) {
+            return TestResult::Fail("missing firmware command did not wait");
+        }
+    }
+    if engine.mailbox.state != MailboxState::InFlight || run(engine.hpd(0)) != Err(Error::Busy) {
+        return TestResult::Fail("cancelled CEA operation released shared mailbox");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi22",
+    dmub_navi22_hdmi_freesync_bad_ack_and_cancel_keep_mailbox_owned
+);

@@ -305,6 +305,9 @@ impl Hif for RadioModel {
         {
             return active_scan_tests::send(self, bytes).await;
         }
+        if data_tests::captures_management(self, &bytes[8..]) {
+            return data_tests::capture_management(self, bytes);
+        }
         if self.teardown.is_some() {
             return teardown_tests::send(self, bytes).await;
         }

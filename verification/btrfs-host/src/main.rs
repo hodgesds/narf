@@ -18,6 +18,9 @@ mod model;
 mod narf;
 mod workload;
 
+#[cfg(test)]
+mod file_loading_tests;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

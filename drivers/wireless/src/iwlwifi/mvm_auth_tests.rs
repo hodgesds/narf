@@ -36,7 +36,7 @@ fn policy() -> RegulatoryDomain {
         }],
     }
 }
-fn fixture() -> Result<Fixture, &'static str> {
+pub(in crate::iwlwifi::mvm_boot) fn fixture() -> Result<Fixture, &'static str> {
     let mut fixture = ready_link_fixture(false)?;
     activate(&mut fixture, false)?;
     let image = firmware_parser_tests::mvm_image();

@@ -463,3 +463,60 @@ fn freesync_replays_primary_spd_packets() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/freesync", freesync_replays_primary_spd_packets);
+
+fn freesync_hdmi_versioned_spd_distinguishes_disabled_inactive_and_active() -> TestResult {
+    let t = qhd144();
+    let range = VrrRange {
+        min_hz: 40,
+        max_hz: 144,
+    };
+    for (version, length) in [(1, 8), (2, 9), (3, 16)] {
+        for (state, flags) in [
+            (HdmiState::Disabled, 1),
+            (HdmiState::Inactive, 3),
+            (HdmiState::Variable, 7),
+        ] {
+            let Some(p) = hdmi_info_packet(&t, range, version, state) else {
+                return TestResult::Fail("versioned HDMI SPD");
+            };
+            if p.hb != [0x83, version as u8, length, 0]
+                || p.sb[1..4] != [0x1a, 0, 0]
+                || p.sb[6] != flags
+                || p.hb
+                    .iter()
+                    .chain(&p.sb[..=length as usize])
+                    .fold(0u8, |sum, b| sum.wrapping_add(*b))
+                    != 0
+                || p.sb[7]
+                    != if state == HdmiState::Variable
+                        || version == 3 && state == HdmiState::Inactive
+                    {
+                        40
+                    } else {
+                        144
+                    }
+            {
+                return TestResult::Fail("SPD header, state/range flags or checksum");
+            }
+        }
+    }
+    let mut fast = t;
+    fast.pixel_clock_khz *= 3;
+    let range = VrrRange {
+        min_hz: 40,
+        max_hz: 432,
+    };
+    if hdmi_info_packet(&fast, range, 1, HdmiState::Variable).is_some()
+        || hdmi_info_packet(&fast, range, 2, HdmiState::Variable).is_some()
+        || hdmi_info_packet(&fast, range, 3, HdmiState::Variable)
+            .is_none_or(|p| p.sb[8] != 176 || p.sb[12] != 1)
+        || hdmi_info_packet(&t, range, 0, HdmiState::Variable).is_some()
+    {
+        return TestResult::Fail("SPD truncated an unrepresentable refresh rate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/freesync",
+    freesync_hdmi_versioned_spd_distinguishes_disabled_inactive_and_active
+);

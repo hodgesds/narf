@@ -33,7 +33,10 @@ also consult upstream Linux GPL sources.
   Revision 1.0** (Sep 1999) — USB-IF. Public.
 - **SCSI Block Commands - 3 (SBC-3)** — for the embedded SCSI
   command opcodes (`READ(10)` / `WRITE(10)` / `INQUIRY` /
-  `READ CAPACITY(10)`).
+  `READ CAPACITY(10)`, and the `(16)` forms for > 2 TiB media).
+- **SCSI Primary Commands - 4 (SPC-4)** — `REQUEST SENSE` and the
+  fixed-format sense data (sense key / ASC / ASCQ) used for error
+  reporting and the retry policy.
 
 ### USB HID
 
@@ -119,6 +122,15 @@ also consult upstream Linux GPL sources.
   runtime rampatch/NVM naming. Consulted under NARF's GPL-2.0-or-later license.
 
 ## 3. Public interface
+
+- Before an installed `narf.disks=root-ro|root-rw` root is mounted, USB late
+  initialization primes its normal supervisor if the unique `root=UUID=` is
+  valid but not registered. This wait is bounded to 30 seconds and uses the
+  synchronous spin bridge outside the executor, without holding a lock.
+  The same pinned supervisor future is then spawned, preserving claimed
+  ports, pending transfers and hub state; enumeration is not restarted.
+  An already registered root incurs no wait. A missing or ambiguous root
+  still fails through the normal root selector and disk-policy checks.
 
 - `UsbHub::attach(xhci, slot_id, iface_num, device_protocol, speed)` binds an
   addressed hub and retains its negotiated speed plus Device Descriptor
@@ -388,6 +400,22 @@ also consult upstream Linux GPL sources.
   rather than a silent no-op. `detach_serial` / `clear_serial` are the
   per-slot and controller-recovery teardowns. One port per device in
   this layer: multi-port chips bind their first interface.
+  Suspend/resume (#763): the `usb-serial-pm` Stage::Subsys initcall
+  registers an async system-PM hook (`serial::port::register_pm`).
+  Prepare quiesces `pump_all`; resume — after the synchronous
+  device fan-out restores xHCI — replays each bound port's bind-time
+  open plan (`resume_snapshot` / `resume_replay`), rebuilt from the
+  retained `settings` the reconfiguration path commits only on full
+  success, so line format, modem lines and flow state survive S3.
+  A port whose slot refuses the replay fails the hook with a typed
+  `DriverError` without stopping the other ports; a port that
+  detached while suspended is absent and gets no replay. Bind
+  records the (hub index, downstream port) a port sits behind, and
+  the supervisor wakes suspended hub ports for live serial bindings
+  before the pumps (`resume_suspended_hub_ports`), mirroring HID
+  (#840). Plan execution goes through the `ControlTransport` seam
+  (production: `Xhci`; fixtures: a recording fake), which
+  `cdc_acm`'s replay shares.
 - `ccid::devfs_bridge` publishes each bound CCID reader as `/dev/ccid<N>`
   (provider hooks installed by the `usb-ccid-devfs` Stage::Subsys
   initcall; node index = `CCID_READERS` index, assigned at bind). The
@@ -481,11 +509,35 @@ the USB download itself remains a target-silicon gate.
   mode) is accepted on the wire but discarded — vertical/horizontal
   wheel + multi-touch land with the Report-Descriptor parser.
 - **MSC** (`msc`): Bulk-Only Transport CBW/CSW codec, INQUIRY,
-  READ_CAPACITY(10), READ(10), WRITE(10) for single-block transfers.
-  The `BlockDeviceSync` adapter also performs SYNCHRONIZE
-  CACHE(10) for `flush()` and WRITE(10) with the FUA bit for
-  `write_fua()`, so the Flush/FUA capabilities it advertises are
-  issued on the wire, not merely promised (#829).
+  TEST UNIT READY, REQUEST SENSE, READ CAPACITY(10), READ(10),
+  WRITE(10). Bind issues GET MAX LUN (BOT §3.3; any failure means a
+  single LUN) and binds every populated LUN as its own block device —
+  empty slots in a multi-LUN reader are skipped, not fatal. A LUN
+  whose READ CAPACITY(10) saturates at 0xFFFFFFFF escalates to READ
+  CAPACITY(16); LUNs past 2 TiB use the 16-byte READ(16) / WRITE(16)
+  command forms with 64-bit LBAs throughout the driver and adapter.
+  The driver's read/write entry points chunk arbitrary-size requests
+  internally into sequential BOT commands of at most 4 KiB (also at
+  most eight logical blocks), so no caller has to split; the
+  `BlockDeviceSync` adapter keeps one per-device claim held for the
+  entire request. This supports 16 KiB btrfs metadata on both
+  512-byte and 4 KiB logical-block media without exceeding the xHCI
+  DMA buffer. The adapter also performs SYNCHRONIZE CACHE(10) for
+  `flush()` and WRITE with the FUA bit for `write_fua()`, so its
+  advertised Flush/FUA capabilities are issued on the wire (#829).
+  FUA requests use the same bounded chunks and whole-request range
+  validation as ordinary writes; every chunk carries FUA and the
+  claim remains held until completion.
+  Error recovery follows BOT §5.3/§6: a stalled pipe is cleared on
+  both sides (host Reset Endpoint + device CLEAR_FEATURE) before
+  the CSW is read; a Command Failed status is drained with REQUEST
+  SENSE and the command retried once when the sense is a transient
+  condition (UNIT ATTENTION, or NOT READY while the medium spins
+  up) — any other sense fails the command with the parsed sense
+  attached; a Phase Error or an invalid CSW triggers Reset
+  Recovery (Mass Storage Reset + both pipes cleared) and one
+  retry. The BOT exchanges sit behind a `BotTransport` seam so the
+  conversation is fixture-testable without an xHCI.
 - **Hub** (`hub`): hub class enumeration, multiple-TT detection from the
   Device Descriptor protocol, TT think-time propagation, and downstream
   route addressing so low/full-speed devices behind high-speed hubs are
@@ -525,10 +577,20 @@ the USB download itself remains a target-silicon gate.
   + CDC-Data class-triple constants. Used by the per-subclass
   drivers below.
 - **CDC-ACM** (`cdc_acm`): Abstract Control Model (USB serial)
-  codec. `LineCoding` builder/parser (baud + data bits + parity +
+  codec + live driver. `LineCoding` builder/parser (baud + data bits + parity +
   stop bits), `SET_LINE_CODING` / `GET_LINE_CODING` /
   `SET_CONTROL_LINE_STATE` setup-packet builders, `SerialState`
   notification decoder, ACM functional-descriptor capability bits.
+  The live driver retains each bound device's line coding +
+  control-line state — the `CdcAcmPort` setters commit to the
+  record only on transfer success and surface failures as
+  `CdcError::Transfer` — and registers the `cdc-acm` async
+  system-PM hook (`cdc_acm::register_pm`, #763): prepare quiesces
+  the pump, resume replays `SET_LINE_CODING` →
+  `SET_CONTROL_LINE_STATE` per bound device from the saved state
+  (bind order) once xHCI is restored. Hub-attached bindings record
+  their (hub, port) and join the supervisor's hub-port wake step
+  (`resume_suspended_hub_ports`).
 - **DFU** (`dfu`): USB Device Firmware Upgrade 1.1 codec.
   Class triple constants for runtime + DFU modes, DFU Functional
   Descriptor parser (handles both 7-byte DFU-1.0 and 9-byte

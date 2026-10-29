@@ -220,6 +220,7 @@ impl Surfaces {
         if surface.back.is_some() || e.status.surfaces[slot] != Some(surface.applied) {
             return Err(Error::Busy);
         }
+        crate::amdgpu_dcn401_otg::surfaces_changed();
         let memory = pool
             .reserve(surface.applied.bytes)
             .map_err(|_| Error::Allocation)?;

@@ -29,16 +29,31 @@ pub struct Mpdu {
     pub decrypted: bool,
     pub timestamp: u32,
     pub(super) native: Option<[u32; 4]>,
+    /// Set only by the station's recipient BA gate for a QoS MPDU on a TID
+    /// with an accepted ADDBA session; then (and only for HT MPDUs without
+    /// the A-MSDU bit, since the ADDBA response clears A-MSDU permission)
+    /// rxdesc16 PAGGR/FAGGR are admissible.
+    pub(super) ba: bool,
 }
 impl Mpdu {
     /// Native rxdesc16 is authoritative for encoding/width. Its old PHY block
     /// contains SGI/RXSC, not a C21/C22 page or an independently reported channel.
     pub(super) fn admitted(&self, ht_profile: bool) -> bool {
+        self.admitted_with(ht_profile, self.ba)
+    }
+    /// Radio-level admission: also passes an HT QoS MPDU that would be valid
+    /// inside a recipient BA session. The station's BA gate alone marks the
+    /// MPDU `ba`; without a session it fails `admitted` there and is dropped.
+    pub(super) fn admitted_or_aggregate(&self, ht_profile: bool) -> bool {
+        self.admitted_with(ht_profile, self.ba) || ht_profile && self.admitted_with(true, true)
+    }
+    fn admitted_with(&self, ht_profile: bool, ba: bool) -> bool {
         if self.decrypted || self.bandwidth40 {
             return false;
         }
+        let aggregation = self.aggregation_mask(ba);
         if let Some([d0, d1, d2, d3]) = self.native {
-            if d1 & ((1 << 14) | (1 << 15) | (1 << 27)) != 0 || d2 & 0xf000 != 0 {
+            if d1 & aggregation != 0 || d2 & 0xf000 != 0 {
                 return false;
             }
             let qos = self.bytes.first() == Some(&0x88);
@@ -69,7 +84,7 @@ impl Mpdu {
         let Some([d0, d1, d2, d3]) = self.native else {
             return false;
         };
-        if d3 & 0xf80 != 0 || d1 & ((1 << 14) | (1 << 15) | (1 << 27)) != 0 || d2 & 0xf000 != 0 {
+        if d3 & 0xf80 != 0 || d1 & aggregation != 0 || d2 & 0xf000 != 0 {
             return false;
         }
         if (d0 & (1 << 26) != 0) == self.phy.is_empty()
@@ -84,6 +99,22 @@ impl Mpdu {
         true
     }
 }
+impl Mpdu {
+    /// rxdesc16 DW1 bits that must be clear: MF always; PAGGR/FAGGR unless
+    /// this HT QoS MPDU was admitted by an active recipient BA session and
+    /// carries no A-MSDU (A-MSDU-in-A-MPDU is never granted).
+    fn aggregation_mask(&self, ba: bool) -> u32 {
+        let base = (1 << 14) | (1 << 15) | (1 << 27);
+        match self.native {
+            Some([_, d1, _, _])
+                if ba && self.ht && d1 & (1 << 13) == 0 && self.bytes.first() == Some(&0x88) =>
+            {
+                1 << 27
+            }
+            _ => base,
+        }
+    }
+}
 impl narf_wireless::station_security::RawFrame for Mpdu {
     fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -95,7 +126,15 @@ impl narf_wireless::station_security::RawFrame for Mpdu {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Record {
     Frame(Mpdu),
-    Report { kind: u8, bytes: Vec<u8> },
+    /// A non-MPDU record (rxdesc16 `rpt_sel` != 0). `length` is the raw
+    /// `pktlen` and `valid` the DW5:DW4 `macid_valid` words that
+    /// `rtl8188e_handle_ra_tx_report2` reads from the descriptor.
+    Report {
+        kind: u8,
+        bytes: Vec<u8>,
+        length: usize,
+        valid: u64,
+    },
 }
 fn word(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
@@ -143,6 +182,8 @@ pub fn receive(bytes: &[u8]) -> Result<Vec<Record>, Error> {
                 // Linux queues the bytes immediately after rxdesc16 for
                 // report handling; drvinfo/shift removal is MPDU-only.
                 bytes: bytes[at + RX_DESC..end].to_vec(),
+                length,
+                valid: u64::from(word(desc, 20)) << 32 | u64::from(word(desc, 16)),
             });
         } else if d0 & ((1 << 14) | (1 << 15)) == 0 {
             // No multi-descriptor reassembly is enabled in this profile.
@@ -163,6 +204,7 @@ pub fn receive(bytes: &[u8]) -> Result<Vec<Record>, Error> {
                 decrypted: d0 & (1 << 27) == 0 && d0 & (7 << 20) != 0,
                 timestamp: word(desc, 20),
                 native: Some([d0, d1, word(desc, 8), d3]),
+                ba: false,
             }));
         }
         if index + 1 < count {
@@ -203,7 +245,8 @@ pub(super) fn transmit_rate(frame: &[u8], kind: Kind, rate: u8) -> Result<Vec<u8
         Kind::Data
             if !matches!(frame[0], 0x08 | 0x88)
                 || frame[1] & 3 != 1
-                || frame[0] == 0x88 && frame.get(24..26) != Some(&[0, 0]) =>
+                || frame[0] == 0x88
+                    && !matches!(frame.get(24..26), Some(&[tid, 0]) if tid & 0xf8 == 0) =>
         {
             return Err(Error::Header)
         }
@@ -219,7 +262,13 @@ pub(super) fn transmit_rate(frame: &[u8], kind: Kind, rate: u8) -> Result<Vec<u8
         frame[4]
     };
     out[3] = 0x8c | destination & 1;
-    out[4..8].copy_from_slice(&(if management { 0x12u32 << 8 } else { 0 }).to_le_bytes());
+    // rtl8xxxu_queue_select: MGNT0x12, else the AC's TXDESC_QUEUE_*.
+    let queue = if management {
+        0x12
+    } else {
+        access_category(data_tid(frame)).0
+    };
+    out[4..8].copy_from_slice(&(u32::from(queue) << 8).to_le_bytes());
     out[8..12].copy_from_slice(&(1u32 << 16 | 1 << 24 | 1 << 25).to_le_bytes());
     out[12..16].copy_from_slice(
         &(u32::from(u16::from_le_bytes([frame[22], frame[23]]) >> 4) << 16).to_le_bytes(),
@@ -245,4 +294,71 @@ pub(super) fn transmit_rate(frame: &[u8], kind: Kind, rate: u8) -> Result<Vec<u8
     out[28..30].copy_from_slice(&checksum.to_le_bytes());
     out[TX_DESC..].copy_from_slice(frame);
     Ok(out)
+}
+
+/// `rtl8xxxu_tx` + `rtl8xxxu_fill_txdesc_v3` for QoS DATA to an HT peer
+/// (`ampdu_enable`): the peer's MPDU density in txdw2, RTS/CTS + HW RTS at
+/// DESC_RATE_24M in txdw4, and TXDESC40_AGG_ENABLE instead of AGG_BREAK only
+/// on a TID whose originator BA session is operational. The descriptor
+/// checksum is recomputed.
+pub(super) fn aggregate_fields(packet: &mut [u8], density: u8, operational: bool) {
+    let mut dw2 = word(packet, 8) | u32::from(density & 7) << 20;
+    if operational {
+        dw2 = (dw2 & !(1 << 16)) | 1 << 12;
+    }
+    packet[8..12].copy_from_slice(&dw2.to_le_bytes());
+    let dw4 = word(packet, 16) | 0x08 | 1 << 12 | 1 << 13;
+    packet[16..20].copy_from_slice(&dw4.to_le_bytes());
+    packet[28..30].fill(0);
+    let checksum = packet[..TX_DESC]
+        .chunks_exact(2)
+        .fold(0u16, |v, b| v ^ u16::from_le_bytes([b[0], b[1]]));
+    packet[28..30].copy_from_slice(&checksum.to_le_bytes());
+}
+
+/// `rtl8xxxu_fill_txdesc_v3` DATA under host rate adaptation: rate =
+/// `ra->decision_rate` with the 0x0001ff00 data/RTS fallback limits (already
+/// in txdw5), PT_STAGE in txdw4[17:15] and hardware fallback enabled (no
+/// TXDESC_DISABLE_DATA_FB). The descriptor checksum is recomputed.
+pub(super) fn adaptive_fields(packet: &mut [u8], pt_stage: u8) {
+    let dw4 = (word(packet, 16) & !(1 << 10) & !(7 << 15)) | u32::from(pt_stage & 7) << 15;
+    packet[16..20].copy_from_slice(&dw4.to_le_bytes());
+    packet[28..30].fill(0);
+    let checksum = packet[..TX_DESC]
+        .chunks_exact(2)
+        .fold(0u16, |v, b| v ^ u16::from_le_bytes([b[0], b[1]]));
+    packet[28..30].copy_from_slice(&checksum.to_le_bytes());
+}
+/// QoS TID of a DATA frame; non-QoS DATA uses mac80211's BE priority0.
+pub(super) fn data_tid(frame: &[u8]) -> u8 {
+    if frame.first() == Some(&0x88) {
+        frame.get(24).map_or(0, |q| q & 7)
+    } else {
+        0
+    }
+}
+/// Linux `ieee802_1d_to_ac` then `rtl8xxxu_80211_to_rtl_queue`: the
+/// TXDESC_QUEUE_{BK2,BE0,VI5,VO7} selector and the
+/// `rtl8xxxu_init_queue_priority` pipe class (0 VO, 1 VI, 2 BE/BK).
+pub(super) const fn access_category(tid: u8) -> (u8, u8) {
+    match tid & 7 {
+        1 | 2 => (2, 2),
+        4 | 5 => (5, 1),
+        6 | 7 => (7, 0),
+        _ => (0, 2),
+    }
+}
+/// `rtl8xxxu_init_queue_priority` bulk-out index for a DATA pipe class and
+/// `ep_tx_count`. One endpoint carries everything; two put VO/VI on
+/// out_ep[0] and BE/BK on out_ep[1]; three put BE/BK on out_ep[2] and VI on
+/// out_ep[1]. Upstream derives three-endpoint `vop` from `viq ^ 3`, so VO
+/// shares VI's out_ep[1] even though TRXDMA_CTRL maps VOQ to HIGH.
+pub(super) const fn data_endpoint(class: u8, count: u8) -> usize {
+    match (count, class) {
+        (2, 0 | 1) => 0,
+        (2, _) => 1,
+        (3, 0 | 1) => 1,
+        (3, _) => 2,
+        _ => 0,
+    }
 }

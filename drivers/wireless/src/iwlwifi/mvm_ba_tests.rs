@@ -870,3 +870,66 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2/ba",
     smoke_mvm_ba_original_qos_block_ack_policy_requires_live_native_agreement
 );
+
+/// Group-addressed QoS data from the AP: broadcast DA, Ack Policy as given,
+/// optional A-MSDU subframe index and a reported BAID (0x7f = none).
+fn group_rx(n: u8, policy: u8, amsdu: Option<(u8, bool)>, baid: u8, sn: u16) -> Vec<u8> {
+    let mut ethernet = ip(n, false);
+    ethernet[..6].copy_from_slice(&[255; 6]);
+    let mut frame = from_ap(&ethernet, sn);
+    frame[0] = 0x88;
+    frame.splice(24..24, [policy | if amsdu.is_some() { 0x80 } else { 0 }, 0]);
+    let mut bytes = envelope(&frame);
+    if let Some((index, last)) = amsdu {
+        bytes[3] |= 0x40;
+        bytes[4] = index | if last { 0x80 } else { 0 };
+    }
+    bytes[16..20].copy_from_slice(&((u32::from(baid) << 24) | u32::from(sn) << 12).to_le_bytes());
+    bytes[28..32].copy_from_slice(&0x00100207u32.to_le_bytes());
+    bytes
+}
+fn smoke_mvm_group_qos_bypasses_reorder_and_group_amsdu_stays_closed() -> TestResult {
+    check(|| {
+        let h = fixture(false)?;
+        h.join()?;
+        start(&h, 0, 100, 32)?;
+        let mut broadcast = ip(40, false);
+        broadcast[..6].copy_from_slice(&[255; 6]);
+        // No Ack and Normal group QoS data are delivered immediately even
+        // when firmware reports the TID0 BAID: multicast is never reordered.
+        if receive(&h, group_rx(40, 0x20, None, 1, 500)) != [broadcast.clone()] {
+            return Err("group No Ack QoS data was not delivered outside reorder");
+        }
+        let mut second = ip(41, false);
+        second[..6].copy_from_slice(&[255; 6]);
+        if receive(&h, group_rx(41, 0, None, 0x7f, 501)) != [second] {
+            return Err("group Normal-Ack QoS data was not delivered");
+        }
+        // Group-addressed A-MSDUs (with or without a BAID) are dropped like
+        // mac80211 __ieee80211_rx_h_amsdu; the station stays up.
+        for baid in [1u8, 0x7f] {
+            for (index, last) in [(0u8, false), (1, true)] {
+                if !receive(
+                    &h,
+                    group_rx(42 + index, 0x20, Some((index, last)), baid, 502),
+                )
+                .is_empty()
+                {
+                    return Err("group-addressed A-MSDU subframe was published");
+                }
+            }
+        }
+        // A unicast frame at the window head still follows the BA owner.
+        if receive(&h, rx(&h, 0, 100, 101, 0, 1, 50)?) != [ip(50, false)] {
+            return Err("unicast BA delivery changed after group frames");
+        }
+        if !h.device.link_up() {
+            return Err("group frames tore down the station");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/ba",
+    smoke_mvm_group_qos_bypasses_reorder_and_group_amsdu_stays_closed
+);

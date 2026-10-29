@@ -50,9 +50,8 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::intel_gpu_gtt::{
-    encode_engine_pte, encode_table_entry, pte_phys, pte_present, GttError, PatSlot, GTT_PAGE_SIZE,
-    PTE_LRU_AGE, PTE_LRU_BYPASS, PTE_NX, PTE_PAT0, PTE_PAT1, PTE_PCD, PTE_PHYS_MASK, PTE_PRESENT,
-    PTE_PWT, PTE_RW,
+    encode_table_entry, pte_phys, pte_present, GttError, PatSlot, PteFormat, GTT_PAGE_SIZE,
+    PTE_PAT0, PTE_PAT1, PTE_PAT2, PTE_PAT3, PTE_PHYS_MASK, PTE_PRESENT, PTE_RW,
 };
 
 /// Virtual-address width of the Gen12 PPGTT (PRM Vol. 5).
@@ -77,19 +76,11 @@ pub const LEVEL_PT: u8 = 3;
 
 /// Bits a well-formed *intermediate* entry may carry: `PRESENT`
 /// plus the next-table physical address.
-const TABLE_ENTRY_ALLOWED: u64 = PTE_PRESENT | PTE_PHYS_MASK;
+const TABLE_ENTRY_ALLOWED: u64 = PTE_PRESENT | PTE_RW | PTE_PHYS_MASK;
 /// Bits a well-formed *leaf* entry may carry: every flag the
 /// GFX PTE definition assigns, plus the physical address.
-const LEAF_ENTRY_ALLOWED: u64 = PTE_PRESENT
-    | PTE_RW
-    | PTE_PWT
-    | PTE_PCD
-    | PTE_LRU_AGE
-    | PTE_PHYS_MASK
-    | PTE_PAT0
-    | PTE_PAT1
-    | PTE_LRU_BYPASS
-    | PTE_NX;
+const LEAF_ENTRY_ALLOWED: u64 =
+    PTE_PRESENT | PTE_RW | PTE_PHYS_MASK | PTE_PAT0 | PTE_PAT1 | PTE_PAT2;
 
 /// Failure modes of the PPGTT walker.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -98,7 +89,7 @@ pub enum PpgttError {
     VaOutOfRange,
     /// Virtual or physical address not 4 KiB aligned.
     Unaligned,
-    /// Physical address outside the documented 39-bit space.
+    /// Physical address outside the documented 46-bit space.
     PhysOutOfRange,
     /// The leaf slot already maps a page.
     AlreadyMapped,
@@ -106,6 +97,8 @@ pub enum PpgttError {
     NotMapped,
     /// Table-page allocation failed.
     OutOfMemory,
+    /// PAT index is unavailable for this page-table format.
+    InvalidPatIndex,
     /// An intermediate entry on the map path is present but not
     /// well-formed (see [`WalkOutcome::Corrupt`]); the walker
     /// will not overwrite foreign state silently. `level` is
@@ -123,6 +116,7 @@ impl From<GttError> for PpgttError {
             GttError::PhysOutOfRange => PpgttError::PhysOutOfRange,
             GttError::OutOfMemory => PpgttError::OutOfMemory,
             GttError::OutOfBounds => PpgttError::VaOutOfRange,
+            GttError::InvalidPatIndex => PpgttError::InvalidPatIndex,
         }
     }
 }
@@ -267,6 +261,7 @@ impl PtMemory for FramePtMemory {
 /// module docs); leaf frames belong to the caller.
 #[derive(Debug)]
 pub struct Ppgtt {
+    format: PteFormat,
     root: u64,
     tables: u32,
     mapped: u64,
@@ -275,8 +270,14 @@ pub struct Ppgtt {
 impl Ppgtt {
     /// Create an empty PPGTT: allocate and zero the PML4 root.
     pub fn new<M: PtMemory>(mem: &mut M) -> Result<Self, PpgttError> {
+        Self::with_format(mem, PteFormat::Gen12)
+    }
+
+    /// A walker for Xe-LP or Xe-LPG PPGTT leaf encodings.
+    pub fn with_format<M: PtMemory>(mem: &mut M, format: PteFormat) -> Result<Self, PpgttError> {
         let root = mem.alloc_table()?;
         Ok(Self {
+            format,
             root,
             tables: 1,
             mapped: 0,
@@ -284,7 +285,7 @@ impl Ppgtt {
     }
 
     /// Physical address of the PML4 root — the value an
-    /// execlists context programs into its PDP3 pair
+    /// execlists context programs into its PDP0 pair
     /// ([`crate::intel_gpu_rcs::RcsEngine::attach_ppgtt`]).
     pub fn root_phys(&self) -> u64 {
         self.root
@@ -304,12 +305,17 @@ impl Ppgtt {
     /// validation only at the PT level). Returns the next
     /// physical address to follow, or the outcome that stops
     /// the walk.
-    fn follow(entry: u64, level: u8) -> Result<u64, WalkOutcome> {
+    fn follow(&self, entry: u64, level: u8) -> Result<u64, WalkOutcome> {
         if !pte_present(entry) {
             return Err(WalkOutcome::NotMapped { level });
         }
         let allowed = if level == LEVEL_PT {
             LEAF_ENTRY_ALLOWED
+                | if self.format == PteFormat::XeLpg {
+                    PTE_PAT3
+                } else {
+                    0
+                }
         } else {
             TABLE_ENTRY_ALLOWED
         };
@@ -323,7 +329,7 @@ impl Ppgtt {
     /// Map the 4 KiB page at physical `phys` into the PPGTT at
     /// virtual `va`, creating intermediate tables on first use.
     /// Both addresses must be page-aligned; `phys` must fit the
-    /// 39-bit GFX space. Mapping over a live leaf is
+    /// 46-bit GFX space. Mapping over a live leaf is
     /// [`PpgttError::AlreadyMapped`] — unmap first.
     pub fn map<M: PtMemory>(
         &mut self,
@@ -331,7 +337,20 @@ impl Ppgtt {
         va: u64,
         phys: u64,
         pat: PatSlot,
-        executable: bool,
+        writable: bool,
+    ) -> Result<(), PpgttError> {
+        self.map_with_pat(mem, va, phys, pat as u8, writable)
+    }
+
+    /// Full generation-specific PAT index (three bits on Gen12, four on
+    /// Xe-LPG). The index names a PAT entry programmed by the GT owner.
+    pub fn map_with_pat<M: PtMemory>(
+        &mut self,
+        mem: &mut M,
+        va: u64,
+        phys: u64,
+        pat_index: u8,
+        writable: bool,
     ) -> Result<(), PpgttError> {
         if va >= PPGTT_VA_SIZE {
             return Err(PpgttError::VaOutOfRange);
@@ -341,7 +360,7 @@ impl Ppgtt {
         }
         // Encode first: a bad physical address fails before any
         // table is created, leaving the tree untouched.
-        let leaf = encode_engine_pte(phys, pat, executable)?;
+        let leaf = self.format.encode_ppgtt(phys, pat_index, writable)?;
         let idx = va_indices(va);
         let mut table = self.root;
         for (level, &index) in idx.iter().enumerate().take(LEVEL_PT as usize) {
@@ -350,7 +369,7 @@ impl Ppgtt {
                 // An existing intermediate entry must be
                 // well-formed to descend into; a corrupt one is
                 // not ours to overwrite silently.
-                match Self::follow(entry, level as u8) {
+                match self.follow(entry, level as u8) {
                     Ok(next) => table = next,
                     Err(WalkOutcome::Corrupt { level }) => {
                         return Err(PpgttError::CorruptEntry { level });
@@ -391,7 +410,7 @@ impl Ppgtt {
         for level in 0..LEVEL_PT as usize {
             tables[level] = table;
             let entry = mem.read_entry(table, idx[level]);
-            match Self::follow(entry, level as u8) {
+            match self.follow(entry, level as u8) {
                 Ok(next) => table = next,
                 Err(WalkOutcome::Corrupt { level }) => {
                     return Err(PpgttError::CorruptEntry { level });
@@ -439,13 +458,13 @@ impl Ppgtt {
         let mut table = self.root;
         for (level, &index) in idx.iter().enumerate().take(LEVEL_PT as usize) {
             let entry = mem.read_entry(table, index);
-            match Self::follow(entry, level as u8) {
+            match self.follow(entry, level as u8) {
                 Ok(next) => table = next,
                 Err(outcome) => return Ok(outcome),
             }
         }
         let leaf = mem.read_entry(table, idx[LEVEL_PT as usize]);
-        match Self::follow(leaf, LEVEL_PT) {
+        match self.follow(leaf, LEVEL_PT) {
             Ok(page) => Ok(WalkOutcome::Mapped(page | (va & 0xFFF))),
             Err(outcome) => Ok(outcome),
         }
@@ -573,7 +592,7 @@ pub mod tests {
 
     /// Independent reference walk, written from the PRM
     /// definition alone (shifts 39/30/21/12, 9-bit indices,
-    /// phys bits 38:12, PRESENT bit 0). Shares no code with the
+    /// supported phys bits 45:12, PRESENT bit 0). Shares no code with the
     /// production walker.
     fn ref_translate(mem: &FakePtMemory, root: u64, va: u64) -> Option<u64> {
         let mut table = root;
@@ -582,13 +601,13 @@ pub mod tests {
             if e & 1 == 0 {
                 return None;
             }
-            table = e & 0x0000_007F_FFFF_F000;
+            table = e & 0x0000_3FFF_FFFF_F000;
         }
         let e = mem.read_entry(table, ((va >> 12) & 0x1FF) as usize);
         if e & 1 == 0 {
             return None;
         }
-        Some((e & 0x0000_007F_FFFF_F000) | (va & 0xFFF))
+        Some((e & 0x0000_3FFF_FFFF_F000) | (va & 0xFFF))
     }
 
     fn smoke_ppgtt_va_decomposition() -> TestResult {
@@ -624,18 +643,18 @@ pub mod tests {
         if vm.root_phys() != FAKE_PHYS_BASE {
             return TestResult::Fail("root must be the first table");
         }
-        if mem.raw_read(vm.root_phys(), 3) != (FAKE_PHYS_BASE + 0x1000) | 1 {
+        if mem.raw_read(vm.root_phys(), 3) != (FAKE_PHYS_BASE + 0x1000) | 3 {
             return TestResult::Fail("PML4 entry must be PDPT phys | PRESENT");
         }
-        if mem.raw_read(FAKE_PHYS_BASE + 0x1000, 5) != (FAKE_PHYS_BASE + 0x2000) | 1 {
+        if mem.raw_read(FAKE_PHYS_BASE + 0x1000, 5) != (FAKE_PHYS_BASE + 0x2000) | 3 {
             return TestResult::Fail("PDPT entry must be PD phys | PRESENT");
         }
-        if mem.raw_read(FAKE_PHYS_BASE + 0x2000, 7) != (FAKE_PHYS_BASE + 0x3000) | 1 {
+        if mem.raw_read(FAKE_PHYS_BASE + 0x2000, 7) != (FAKE_PHYS_BASE + 0x3000) | 3 {
             return TestResult::Fail("PD entry must be PT phys | PRESENT");
         }
-        // Leaf: PRESENT | RW | phys | PAT slot 1 (bit 60), no NX
-        // for an executable mapping — hand-computed literal.
-        if mem.raw_read(FAKE_PHYS_BASE + 0x3000, 9) != 0x1000_0000_00C0_F003 {
+        // Leaf: PRESENT | RW | phys | PAT index 1 (bit 3)
+        // for a writable mapping — hand-computed literal.
+        if mem.raw_read(FAKE_PHYS_BASE + 0x3000, 9) != 0x0000_0000_00C0_F00B {
             return TestResult::Fail("leaf entry disagrees with the PRM PTE layout");
         }
         match vm.translate(&mem, va + 0x123) {
@@ -838,9 +857,9 @@ pub mod tests {
             Err(PpgttError::Unaligned) => {}
             _ => return TestResult::Fail("unaligned phys must be refused"),
         }
-        match vm.map(&mut mem, va, 1u64 << 39, PatSlot::Slot1, true) {
+        match vm.map(&mut mem, va, 1u64 << 46, PatSlot::Slot1, true) {
             Err(PpgttError::PhysOutOfRange) => {}
-            _ => return TestResult::Fail(">39-bit phys must be refused"),
+            _ => return TestResult::Fail(">46-bit phys must be refused"),
         }
         // None of the refused maps may have created tables.
         if vm.table_pages() != 1 || mem.live_tables() != 1 {
@@ -882,14 +901,28 @@ pub mod tests {
         // (a) Reserved bit set in the PD entry (bit 5 is not
         // assigned by the GFX PTE definition): the walk must
         // stop Corrupt at the PD level, not follow the entry.
-        let pd_entry = mem.raw_read(pdpt, 2);
-        mem.raw_write(pdpt, 2, pd_entry | (1 << 5));
+        // The PD entry is the one *in* the PD table (index 3,
+        // pointing at the PT): `level` names the table that
+        // holds the offending entry, the convention
+        // `WalkOutcome` documents and the PML4/PT cases pin.
+        let pd_entry = mem.raw_read(pd, 3);
+        mem.raw_write(pd, 3, pd_entry | (1 << 5));
         match vm.translate(&mem, va) {
             Ok(WalkOutcome::Corrupt { level: LEVEL_PD }) => {}
             _ => return TestResult::Fail("reserved-bit PD entry must be Corrupt at PD"),
         }
-        mem.raw_write(pdpt, 2, pd_entry);
-        // (b) Present leaf with a zero physical address.
+        mem.raw_write(pd, 3, pd_entry);
+        // (b) Same tamper one level up: the entry in the PDPT
+        // (index 2, pointing at the PD) must stop the walk
+        // Corrupt at the PDPT level.
+        let pdpt_entry = mem.raw_read(pdpt, 2);
+        mem.raw_write(pdpt, 2, pdpt_entry | (1 << 5));
+        match vm.translate(&mem, va) {
+            Ok(WalkOutcome::Corrupt { level: LEVEL_PDPT }) => {}
+            _ => return TestResult::Fail("reserved-bit PDPT entry must be Corrupt at PDPT"),
+        }
+        mem.raw_write(pdpt, 2, pdpt_entry);
+        // (c) Present leaf with a zero physical address.
         let leaf = mem.raw_read(pt, 4);
         mem.raw_write(pt, 4, PTE_PRESENT);
         match vm.translate(&mem, va) {
@@ -897,9 +930,9 @@ pub mod tests {
             _ => return TestResult::Fail("zero-phys leaf must be Corrupt at PT"),
         }
         mem.raw_write(pt, 4, leaf);
-        // (c) Reserved bit in the leaf (bit 39 is outside the
-        // 39-bit phys field and unassigned in a leaf).
-        mem.raw_write(pt, 4, leaf | (1 << 39));
+        // (d) Reserved bit in the leaf (bit 46 is outside the
+        // 46-bit phys field and unassigned in a leaf).
+        mem.raw_write(pt, 4, leaf | (1 << 46));
         match vm.translate(&mem, va) {
             Ok(WalkOutcome::Corrupt { level: LEVEL_PT }) => {}
             _ => return TestResult::Fail("reserved-bit leaf must be Corrupt at PT"),

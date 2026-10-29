@@ -56,6 +56,7 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
                 storage: Some(storage),
                 published: false,
             },
+            hw_amsdu: false,
         },
     ))
 }
@@ -865,7 +866,7 @@ fn smoke_mt76_native_revocation_precedes_current_config_bar_and_dma_start() -> T
     let firmware = super::super::tests::firmware(16);
     // SAFETY: same revoked-cap boundary; native constructor must never reach
     // bogus configuration or allocate/publish queues under stale authority.
-    if unsafe { Transport::new(hw.mmio, hw.device, hw.authority, firmware) }.is_ok() {
+    if unsafe { Transport::new(hw.mmio, hw.device, hw.authority, firmware, 1) }.is_ok() {
         return TestResult::Fail("revoked MT76 constructor admitted DMA owner");
     }
     TestResult::Pass

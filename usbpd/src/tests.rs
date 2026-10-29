@@ -312,6 +312,87 @@ fn smoke_sink_state_machine_5v3a_contract() -> TestResult {
 }
 kernel_test_in!("usbpd/tcpm", smoke_sink_state_machine_5v3a_contract);
 
+/// #1193: after `reset()`, a sink that held a contract must report
+/// no contract and must run a *fresh* negotiation on re-attach —
+/// the new partner's capabilities, not the stale ones, decide the
+/// new contract.
+fn smoke_sink_reset_clears_contract_and_renegotiates() -> TestResult {
+    use crate::bootstrap_usbpd_authority;
+
+    let tcpc = Arc::new(FakeTcpc::new());
+    let port = Arc::new(SinkPort::new(tcpc.clone()));
+    let cap = bootstrap_usbpd_authority();
+
+    // First negotiation: 5 V / 3 A partner, walked to Ready.
+    tcpc.set_cc(CcState::Rp3A0, CcState::Open);
+    let pdos_a = [SourcePdo::Fixed {
+        voltage_mv: 5000,
+        max_current_ma: 3000,
+    }];
+    for _ in 0..5 {
+        let _ = port.step(&cap).unwrap();
+    }
+    tcpc.enqueue_rx(source_caps_frame(&pdos_a, 0));
+    let _ = port.step(&cap).unwrap(); // WaitCaps → EvaluateCaps
+    let _ = port.step(&cap).unwrap(); // EvaluateCaps → SelectCapability
+    let _ = port.step(&cap).unwrap(); // SelectCapability → TransitionSink (Request sent)
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::Accept, 1));
+    let _ = port.step(&cap).unwrap();
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::PsRdy, 2));
+    let _ = port.step(&cap).unwrap();
+    if port.state() != SinkState::Ready || port.contract().map(|c| c.op_current_ma) != Some(3000) {
+        return TestResult::Fail("first negotiation did not lock 5V/3A");
+    }
+
+    // Detach: the driving task resets the engine.
+    port.reset();
+    if port.state() != SinkState::Unattached {
+        return TestResult::Fail("reset did not return to Unattached");
+    }
+    if port.contract().is_some() {
+        return TestResult::Fail("reset left a stale contract visible");
+    }
+
+    // Re-attach to a *different* partner: 5 V / 1 A. The fresh
+    // negotiation must request 1 A — if the stale caps/contract
+    // leaked through, the Request would still ask for 3 A.
+    let pdos_b = [SourcePdo::Fixed {
+        voltage_mv: 5000,
+        max_current_ma: 1000,
+    }];
+    for _ in 0..5 {
+        let _ = port.step(&cap).unwrap();
+    }
+    if port.state() != SinkState::WaitCaps {
+        return TestResult::Fail("renegotiation did not reach WaitCaps");
+    }
+    tcpc.enqueue_rx(source_caps_frame(&pdos_b, 0));
+    let _ = port.step(&cap).unwrap();
+    let _ = port.step(&cap).unwrap();
+    let _ = port.step(&cap).unwrap(); // Request sent
+    let sent = tcpc.sent_frames();
+    let (_, objs) = match decode_message(sent.last().expect("a Request was sent")) {
+        Some(p) => p,
+        None => return TestResult::Fail("renegotiation Request failed to decode"),
+    };
+    let rdo = FixedRdo::decode(objs[0]);
+    if rdo.object_position != 1 || rdo.op_current_ma != 1000 {
+        return TestResult::Fail("renegotiation Request did not follow the new caps (1A)");
+    }
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::Accept, 1));
+    let _ = port.step(&cap).unwrap();
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::PsRdy, 2));
+    let _ = port.step(&cap).unwrap();
+    if port.state() != SinkState::Ready || port.contract().map(|c| c.op_current_ma) != Some(1000) {
+        return TestResult::Fail("renegotiation did not lock 5V/1A");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "usbpd/tcpm",
+    smoke_sink_reset_clears_contract_and_renegotiates
+);
+
 fn smoke_sink_rejects_empty_source_caps() -> TestResult {
     use crate::bootstrap_usbpd_authority;
     use crate::tcpm::SinkError;

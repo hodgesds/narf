@@ -9,6 +9,47 @@ pub struct PciIo {
     cap: Cap<BusDeviceCap, Write>,
     registers: MmioRegion,
     packet_mode: AtomicBool,
+    msi: narf_lib::sync::IrqSafeSpinLock<Option<Msi>>,
+}
+/// Single MSI vector (Linux `rtl_pci_intr_mode_msi`: `pci_enable_msi` +
+/// `request_irq(_rtl_pci_interrupt)`). The top half only raises the
+/// retained signal; BAR2 recognition runs in the station worker.
+struct Msi {
+    config: narf_bus::msi::MsiConfig,
+    vector: u8,
+    signal: alloc::sync::Arc<super::irq::Signal>,
+}
+static SIGNAL: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::irq::Signal>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+fn vector_irq(_cookie: u64) -> narf_interrupts::IrqStatus {
+    let signal = { SIGNAL.lock().clone() };
+    match signal {
+        Some(signal) => {
+            signal.raise();
+            narf_interrupts::IrqStatus::Handled
+        }
+        None => narf_interrupts::IrqStatus::None,
+    }
+}
+fn quarantine(msi: &Msi) {
+    narf_interrupts::disable_irq(msi.vector);
+    narf_interrupts::dispatch::clear_all_wakers(msi.vector);
+    narf_interrupts::synchronize_irq(msi.vector);
+}
+/// Disabled delivery: drain the handler and return the vector.
+fn teardown(msi: Msi) {
+    narf_interrupts::disable_irq(msi.vector);
+    let _ = narf_interrupts::remove_handler(msi.vector, "rtlwifi", 0);
+    narf_interrupts::dispatch::clear_all_wakers(msi.vector);
+    narf_interrupts::synchronize_irq(msi.vector);
+    let _ = narf_interrupts::vector::free(msi.vector);
+    let mut signal = SIGNAL.lock();
+    if signal
+        .as_ref()
+        .is_some_and(|s| alloc::sync::Arc::ptr_eq(s, &msi.signal))
+    {
+        *signal = None;
+    }
 }
 fn command_gate(command: u16, packet_mode: bool) -> Result<(), Error> {
     // An absent PCI function reports all ones. In active mode those bits
@@ -48,7 +89,89 @@ impl PciIo {
             cap,
             registers,
             packet_mode: AtomicBool::new(false),
+            msi: narf_lib::sync::IrqSafeSpinLock::new(None),
         }
+    }
+    /// Discover, program and install one MSI vector with delivery still
+    /// disabled. Any failure leaves the owner on scheduled polling; a
+    /// vector whose source cannot be proven disabled stays quarantined.
+    pub(super) fn arm_msi(&self) -> bool {
+        if self.msi.lock().is_some() || SIGNAL.lock().is_some() {
+            return false;
+        }
+        let Ok(Ok(mut config)) = crate::rtw88::pci_park::invoke(&self.cap, || {
+            narf_bus::msi::enable_msi(&self.cap, &self.device, 1)
+        }) else {
+            return false;
+        };
+        let Ok(vector) = narf_interrupts::vector::alloc() else {
+            return false;
+        };
+        // SAFETY: this sole retained function owns its cfg space; delivery
+        // is disabled again below before any chip interrupt is unmasked.
+        let programmed = crate::rtw88::pci_park::invoke(&self.cap, || unsafe {
+            narf_bus::msi::program_msi(&mut config, 0, vector)
+        });
+        if !matches!(programmed, Ok(Ok(_))) {
+            let _ = narf_interrupts::vector::free(vector);
+            return false;
+        }
+        let signal = super::irq::Signal::new();
+        *SIGNAL.lock() = Some(signal.clone());
+        narf_interrupts::install_handler_named(vector, "rtlwifi", 0, vector_irq);
+        let msi = Msi {
+            config,
+            vector,
+            signal,
+        };
+        // SAFETY: same owned cfg space; MSI Enable stays clear until the
+        // running owner programs HIMR.
+        let disabled = crate::rtw88::pci_park::invoke(&self.cap, || unsafe {
+            narf_bus::msi::disable(&msi.config)
+        });
+        if !matches!(disabled, Ok(Ok(()))) {
+            quarantine(&msi);
+            core::mem::forget(msi);
+            return false;
+        }
+        *self.msi.lock() = Some(msi);
+        true
+    }
+    pub(super) fn interrupt(&self) -> Option<alloc::sync::Arc<super::irq::Signal>> {
+        self.msi.lock().as_ref().map(|m| m.signal.clone())
+    }
+    /// Enable delivery, or disable it and release the vector. A failed
+    /// cfg-space disable keeps the vector quarantined rather than freed.
+    pub(super) fn deliver(&self, enabled: bool) -> bool {
+        let mut retained = self.msi.lock();
+        let Some(msi) = retained.as_ref() else {
+            return false;
+        };
+        if enabled {
+            narf_interrupts::enable_irq(msi.vector);
+            // SAFETY: sole owner of this function's MSI capability.
+            let enabled = crate::rtw88::pci_park::invoke(&self.cap, || unsafe {
+                narf_bus::msi::enable(&msi.config)
+            });
+            if matches!(enabled, Ok(Ok(()))) {
+                return true;
+            }
+        }
+        // SAFETY: as above.
+        let disabled = crate::rtw88::pci_park::invoke(&self.cap, || unsafe {
+            narf_bus::msi::disable(&msi.config)
+        });
+        let Some(msi) = retained.take() else {
+            return false;
+        };
+        drop(retained);
+        if matches!(disabled, Ok(Ok(()))) {
+            teardown(msi);
+        } else {
+            quarantine(&msi);
+            core::mem::forget(msi);
+        }
+        false
     }
     pub(super) fn allocate_dma(&self, bytes: usize) -> Result<narf_io::DmaBuffer, Error> {
         if narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain {
@@ -138,13 +261,14 @@ impl PciIo {
         .map_err(|_| Error::Access)?
     }
     pub(super) fn packet_kick(&self, queue_bit: u16) -> Result<(), Error> {
-        if !matches!(queue_bit, 2 | 16 | 64) {
+        // BK0/BE1/VI2/VO3 WMM rings, BEACON4 reserved page and MGNT6.
+        if !matches!(queue_bit, 1 | 2 | 4 | 8 | 16 | 64) {
             return Err(Error::Gate);
         }
         self.packet_authority(true, || {
             self.check(0x300, 2)?;
             // SAFETY: aligned complete MMIO word, inside current invocation;
-            // bit mapping is Linux MGNT_QUEUE6/BE_QUEUE1, not vector indices.
+            // bit mapping is Linux hw_queue BIT(n), not vector indices.
             unsafe { self.registers.write16(0x300, queue_bit) };
             // Flush the posted control write; this read is not TX completion.
             // SAFETY: the same current capability invocation and complete

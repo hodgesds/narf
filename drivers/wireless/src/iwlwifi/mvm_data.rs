@@ -33,6 +33,9 @@ pub struct LegacyDataStatus {
 #[derive(Debug, Eq, PartialEq)]
 pub enum LegacyReceive {
     Ethernet(Vec<u8>),
+    /// An Ethernet packet whose L3/L4 checksums the firmware verified
+    /// (`csum::rx_meta_l3l4`); only non-empty verdicts use this variant.
+    Checked(Vec<u8>, narf_net::RxMeta),
     /// A bounded, original plaintext EAPOL packet observed before the native
     /// RSNA owner starts. It is never delivered to the ordinary Ethernet port.
     Eapol(Vec<u8>),
@@ -41,11 +44,67 @@ pub enum LegacyReceive {
 pub(super) struct Prepared {
     pub(super) status: AssociationStatus,
     pub(super) queue: Option<u16>,
+    /// DQA queues for TIDs 1..=7 under a tag5 `QOS_TIDS` program (index 0
+    /// unused; TID0 keeps `queue`). Linux `iwl_mvm_sta_alloc_queue`.
+    pub(super) tid_queues: [Option<u16>; 8],
+    /// Per-TID QoS sequence counters for TIDs 1..=7 (TID0 uses `sequence`).
+    pub(super) tid_sequences: [u16; 8],
     pub(super) port_open: bool,
     pub(super) sequence: u16,
     pub(super) replay: frame_api::Replay,
     pub(super) last_peer: u64,
     pub(super) aggregate: super::amsdu::Receiver,
+    /// PMF receive owner (IGTKs, management PN) when `status.pmf`.
+    pub(super) pmf: super::pmf::PmfRx,
+}
+
+/// 802.1D user priority of an Ethernet frame, as Linux
+/// `net/wireless/util.c::cfg80211_classify8021d` derives it from the IPv4
+/// TOS / IPv6 traffic-class DSCP (RFC 8325 mapping).
+pub(in crate::iwlwifi) fn user_priority(ethernet: &[u8]) -> u8 {
+    let dscp = match ethernet.get(12..14) {
+        Some([8, 0]) if ethernet.len() >= 34 && ethernet[14] >> 4 == 4 => ethernet[15] & 0xfc,
+        Some([0x86, 0xdd]) if ethernet.len() >= 54 && ethernet[14] >> 4 == 6 => {
+            ((ethernet[14] & 0xf) << 4 | ethernet[15] >> 4) & 0xfc
+        }
+        _ => return 0,
+    };
+    match dscp >> 2 {
+        10 | 12 | 14 | 16 => 0, // AF11-13, CS2
+        18 | 20 | 22 => 3,      // AF21-23
+        24 => 4,                // CS3
+        40 => 5,                // CS5
+        44 | 46 => 6,           // VOICE-ADMIT, EF
+        48 => 7,                // CS6
+        _ => dscp >> 5,
+    }
+}
+
+/// Apply WMM admission control like `net/mac80211/wme.c::
+/// ieee80211_downgrade_queue`: an AC requiring ACM (which this station
+/// never negotiates) downgrades VO->VI->BE->BK; BK is the floor.
+pub(in crate::iwlwifi) fn admitted_priority(
+    wmm: &narf_wireless::wmm::Parameters,
+    mut up: u8,
+) -> u8 {
+    loop {
+        // WMM ACI: BE=0, BK=1, VI=2, VO=3.
+        let aci = match up {
+            1 | 2 => 1,
+            4 | 5 => 2,
+            6 | 7 => 3,
+            _ => 0,
+        };
+        if !wmm.ac[aci].admission_control {
+            return up;
+        }
+        up = match up {
+            6 | 7 => 5,
+            4 | 5 => 3,
+            0 | 3 => 2,
+            _ => return up,
+        };
+    }
 }
 
 fn edca(local: [u8; 6], use_11b: bool) -> [u8; 208] {
@@ -96,24 +155,6 @@ fn legacy_rx_rate(payload: &[u8], status: LegacyDataStatus) -> bool {
         _ => return false,
     };
     rate & (0xf0 | (7 << 11)) == 0 && status.supported_rates & (1 << bit) != 0
-}
-
-pub(super) fn ap_disconnected(
-    mpdu: &scan_api::Mpdu<'_>,
-    local: [u8; 6],
-    status: LegacyDataStatus,
-) -> bool {
-    let f = mpdu.frame;
-    mpdu.channel == status.channel
-        && f.len() >= 24
-        && matches!(f[0], 0xa0 | 0xc0)
-        && f[1] & 0xc7 == 0
-        && f[4..10] == local
-        && f[10..16] == status.bssid
-        && f[16..22] == status.bssid
-        && f[22] & 15 == 0
-        && !mpdu.amsdu
-        && mpdu.body(24, 0).is_some_and(|b| b.len() == 2)
 }
 
 impl Owner {
@@ -235,7 +276,13 @@ impl Owner {
             return Err("MVM data association rates invalid");
         }
         let chains = self.nvm.as_ref().unwrap().tx_chains;
-        let chains = (chains & chains.wrapping_neg()) as u8;
+        // SISO uses one antenna; TX STBC and MIMO2 use every valid TX chain
+        // (rs_fw_set_active_chains of iwl_mvm_get_valid_tx_ant).
+        let chains = if phy.is_some_and(|p| p.tx_stbc || p.tx_mcs2 != 0) {
+            chains as u8
+        } else {
+            (chains & chains.wrapping_neg()) as u8
+        };
         let payload = if let Some(p) = phy {
             p.tlc(
                 self.hardware.version(5, 15).ok_or("MVM TLC API absent")?.0,
@@ -259,11 +306,14 @@ impl Owner {
         self.power.prepared.as_mut().unwrap().mlme.data = Some(Prepared {
             status: association,
             queue: None,
+            tid_queues: [None; 8],
+            tid_sequences: [0; 8],
             port_open: false,
             sequence: 0,
             replay: frame_api::Replay::default(),
             last_peer: narf_time::now_cycles(),
             aggregate: super::amsdu::Receiver::default(),
+            pmf: super::pmf::PmfRx::default(),
         });
         self.phase = Phase::PreparingData;
         let result = self.prepare_data_inner(&edca, &payload, &mut policy).await;
@@ -326,6 +376,31 @@ impl Owner {
             .unwrap()
             .queue = Some(id);
         self.check_link_power(&policy()?)?;
+        if self.qos_tids() {
+            for tid in 1..8u8 {
+                let id = {
+                    let power = self.power.prepared.as_ref().unwrap();
+                    let mut allocation = pin!(self.hardware.allocate_tx(STATION, tid));
+                    poll_fn(|cx| {
+                        if let Err(e) = policy().and_then(|p| power.check_applied(&p)) {
+                            return Poll::Ready(Err(e));
+                        }
+                        allocation.as_mut().poll(cx)
+                    })
+                    .await?
+                };
+                self.power
+                    .prepared
+                    .as_mut()
+                    .unwrap()
+                    .mlme
+                    .data
+                    .as_mut()
+                    .unwrap()
+                    .tid_queues[usize::from(tid)] = Some(id);
+                self.check_link_power(&policy()?)?;
+            }
+        }
         self.hardware.discard_key_transition_rx()?;
         if !self
             .power
@@ -365,6 +440,27 @@ impl Owner {
         Ok(())
     }
 
+    /// Per-TID QoS queues are granted only by an applied tag5 program with
+    /// `QOS_TIDS` on a negotiated WMM link.
+    pub(super) fn qos_tids(&self) -> bool {
+        self.power.phy.negotiated.is_some()
+            && self
+                .power
+                .prepared
+                .as_ref()
+                .is_some_and(|p| p.emission.features() & super::power::feature::QOS_TIDS != 0)
+    }
+
+    /// Native TID for an ordinary Ethernet frame: its admitted 802.1D
+    /// priority under `QOS_TIDS`, otherwise BE/TID0.
+    pub(in crate::iwlwifi) fn data_tid(&self, ethernet: &[u8]) -> u8 {
+        if !self.qos_tids() {
+            return 0;
+        }
+        let wmm = self.power.phy.negotiated.as_ref().unwrap().wmm;
+        admitted_priority(&wmm, user_priority(ethernet))
+    }
+
     pub(super) fn data_failed<T>(&mut self, error: &'static str) -> Result<T, &'static str> {
         self.power.phy.ba.clear_packets();
         self.clear_data_aggregate();
@@ -392,6 +488,17 @@ impl Owner {
     pub(super) async fn transmit_data_using(
         &mut self,
         ethernet: &[u8],
+        policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
+        self.transmit_data_assisted(ethernet, 0, policy).await
+    }
+
+    /// `assist` is the checksum `offload_assist` returned by
+    /// `csum::prepare_tx` for this already-prepared Ethernet frame.
+    pub(super) async fn transmit_data_assisted(
+        &mut self,
+        ethernet: &[u8],
+        assist: u32,
         mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
         let status = match policy().and_then(|p| self.data_ready(&p)) {
@@ -407,6 +514,8 @@ impl Owner {
         if ethernet.get(12..14) == Some(&[0x88, 0x8e]) {
             return Err("MVM ordinary data producer cannot submit EAPOL");
         }
+        let qos = self.power.phy.negotiated.is_some();
+        let tid = self.data_tid(ethernet);
         let data = self
             .power
             .prepared
@@ -416,15 +525,24 @@ impl Owner {
             .data
             .as_mut()
             .unwrap();
-        let qos = self.power.phy.negotiated.is_some();
+        let queue = if tid == 0 {
+            status.queue
+        } else {
+            data.tid_queues[usize::from(tid)].ok_or("MVM QoS TID queue missing")?
+        };
+        let sequence = if tid == 0 {
+            data.sequence
+        } else {
+            data.tid_sequences[usize::from(tid)]
+        };
         let frame = if qos {
             frame_api::transmit_qos(
                 self.mac.unwrap(),
                 status.bssid,
-                data.sequence,
+                sequence,
                 ethernet,
                 status.protected,
-                0,
+                tid,
             )
         } else {
             frame_api::transmit(
@@ -436,17 +554,23 @@ impl Owner {
             )
         }
         .ok_or("invalid MVM legacy Ethernet frame")?;
-        data.sequence = data.sequence.wrapping_add(1) & 0xfff;
+        if tid == 0 {
+            data.sequence = data.sequence.wrapping_add(1) & 0xfff;
+        } else {
+            let next = &mut data.tid_sequences[usize::from(tid)];
+            *next = next.wrapping_add(1) & 0xfff;
+        }
         self.phase = Phase::TransmittingData;
         let result = async {
             self.fresh_data_policy(&mut policy).await?;
             {
                 let power = self.power.prepared.as_ref().unwrap();
-                let mut tx = pin!(self.hardware.transmit(
-                    status.queue,
+                let mut tx = pin!(self.hardware.transmit_assisted(
+                    queue,
                     &frame,
                     if qos { 26 } else { 24 },
-                    None
+                    None,
+                    assist,
                 ));
                 poll_fn(|cx| {
                     if let Err(error) = policy().and_then(|p| power.check_applied(&p)) {
@@ -457,7 +581,7 @@ impl Owner {
                 .await?;
             }
             self.check_link_power(&policy()?)?;
-            if !self.hardware.idle_tx_binding(status.queue, STATION, TID) {
+            if !self.hardware.idle_tx_binding(queue, STATION, tid) {
                 return Err("MVM data completion left outstanding DMA");
             }
             Ok(())
@@ -476,12 +600,13 @@ impl Owner {
     /// the separate management owner and cannot enter this producer.
     pub(in crate::iwlwifi) async fn transmit_data_batch_using(
         &mut self,
-        packets: &[Vec<u8>],
+        packets: &[(Vec<u8>, u32)],
         mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
         if !self.ba_qualified() {
-            for frame in packets {
-                self.transmit_data_using(frame, &mut policy).await?;
+            for (frame, assist) in packets {
+                self.transmit_data_assisted(frame, *assist, &mut policy)
+                    .await?;
             }
             return Ok(());
         }
@@ -493,6 +618,10 @@ impl Owner {
             return Err("MVM BA port not authorized");
         }
         let local = self.mac.unwrap();
+        if packets.iter().any(|(packet, _)| self.data_tid(packet) != 0) {
+            return Err("MVM BA batch carries only BE/TID0 packets");
+        }
+        let mut frames = Vec::with_capacity(packets.len());
         let data = self
             .power
             .prepared
@@ -502,8 +631,7 @@ impl Owner {
             .data
             .as_mut()
             .unwrap();
-        let mut frames = Vec::with_capacity(packets.len());
-        for packet in packets {
+        for (packet, assist) in packets {
             if packet.get(12..14) == Some(&[0x88, 0x8e]) {
                 return Err("MVM batch cannot carry EAPOL");
             }
@@ -517,7 +645,7 @@ impl Owner {
             )
             .ok_or("MVM invalid BE batch Ethernet")?;
             data.sequence = data.sequence.wrapping_add(1) & 4095;
-            frames.push(frame);
+            frames.push((frame, *assist));
         }
         self.phase = Phase::TransmittingData;
         let result = async {
@@ -636,7 +764,22 @@ impl Owner {
                 self.clear_data_aggregate();
                 continue;
             }
-            if ap_disconnected(&mpdu, local, status) {
+            let data = self
+                .power
+                .prepared
+                .as_mut()
+                .unwrap()
+                .mlme
+                .data
+                .as_mut()
+                .unwrap();
+            if super::pmf::ap_disconnected(
+                &mpdu,
+                local,
+                status.bssid,
+                status.channel,
+                data.status.pmf.then_some(&mut data.pmf),
+            ) {
                 return Err("MVM current AP disconnected legacy station");
             }
             if f[0] == 0x80
@@ -678,6 +821,14 @@ impl Owner {
             // PHY, reorder and crypto shapes before any replay publication.
             let qos = f[0] == 0x88;
             let header = if qos { 26 } else { 24 };
+            // Group-addressed data is never under a Block Ack agreement
+            // (IEEE 802.11-2020 10.25) and Linux mvm/rxmq.c::iwl_mvm_reorder
+            // never reorders multicast: any reported BAID is ignored and the
+            // MPDU takes the non-BA path with its GTK replay owner. Its Ack
+            // Policy may be Normal or No Ack (mac80211 sends group QoS data
+            // with No Ack). mac80211 `__ieee80211_rx_h_amsdu` drops every
+            // group-addressed A-MSDU (nested or not), so they stay closed.
+            let group = f[4] & 1 != 0;
             if !matches!(f[0], 8 | 0x88)
                 || qos && phy.is_none()
                 || f[1] & 0x87 != 2
@@ -685,12 +836,18 @@ impl Owner {
                 || mpdu.status & (1 << 22) != 0
                 || qos
                     && f.get(24..26).is_none_or(|q| {
-                        !self.power.phy.ba.qos_policy(q[0], mpdu.reorder)
-                            || q[1] != 0
+                        !(if group {
+                            q[0] & 15 < 8 && matches!(q[0] & 0x60, 0 | 0x20)
+                        } else {
+                            self.power.phy.ba.qos_policy(q[0], mpdu.reorder)
+                        }) || q[1] != 0
                             || (q[0] & 0x80 != 0) != mpdu.amsdu
                     })
-                || mpdu.amsdu && !phy.is_some_and(|p| p.ht)
-                || phy.is_some() && mpdu.reorder & 0x7f000000 != 0x7f000000 && !self.ba_qualified()
+                || mpdu.amsdu && (group || !phy.is_some_and(|p| p.ht))
+                || phy.is_some()
+                    && !group
+                    && mpdu.reorder & 0x7f000000 != 0x7f000000
+                    && !self.ba_qualified()
                 || !mpdu.amsdu && mpdu.amsdu_index != 0
                 || !(legacy_rx_rate(&payload, status) || phy.is_some_and(|p| p.rx_rate(&payload)))
                 || mpdu
@@ -716,7 +873,7 @@ impl Owner {
                 self.clear_data_aggregate();
                 continue;
             }
-            if mpdu.reorder & 0x7f000000 != 0x7f000000 && !released {
+            if mpdu.reorder & 0x7f000000 != 0x7f000000 && !released && !group {
                 // Retain the original native packet BEFORE any host replay
                 // update or deaggregation. Released bytes traverse these same
                 // current identity/PHY/crypto checks again, then PN in order.
@@ -732,6 +889,13 @@ impl Owner {
                 .data
                 .as_mut()
                 .unwrap();
+            // Only a single (non-A-MSDU) MPDU's descriptor describes the
+            // delivered packet; Linux likewise sets ip_summed on that skb.
+            let l3l4 = if mpdu.amsdu {
+                0
+            } else {
+                u16::from_le_bytes([payload[10], payload[11]])
+            };
             let Some(ethernet) = data.aggregate.observe(
                 &mpdu,
                 local,
@@ -786,7 +950,12 @@ impl Owner {
                     .as_mut()
                     .unwrap()
                     .last_peer = narf_time::now_cycles();
-                return Ok(Some(LegacyReceive::Ethernet(ethernet)));
+                let meta = super::super::csum::rx_meta_l3l4(l3l4, &ethernet);
+                return Ok(Some(if meta == narf_net::RxMeta::default() {
+                    LegacyReceive::Ethernet(ethernet)
+                } else {
+                    LegacyReceive::Checked(ethernet, meta)
+                }));
             }
         }
         self.check_link_power(&policy()?)?;
@@ -828,7 +997,28 @@ impl Owner {
             }
             self.remove_security_keys().await?;
             self.hardware.discard_key_transition_rx()?;
-            self.hardware.remove_idle_tx(queue, STATION, TID).await
+            self.hardware.remove_idle_tx(queue, STATION, TID).await?;
+            for tid in 1..8u8 {
+                let extra = self
+                    .power
+                    .prepared
+                    .as_ref()
+                    .and_then(|p| p.mlme.data.as_ref())
+                    .and_then(|d| d.tid_queues[usize::from(tid)]);
+                if let Some(extra) = extra {
+                    self.hardware.remove_idle_tx(extra, STATION, tid).await?;
+                    self.power
+                        .prepared
+                        .as_mut()
+                        .unwrap()
+                        .mlme
+                        .data
+                        .as_mut()
+                        .unwrap()
+                        .tid_queues[usize::from(tid)] = None;
+                }
+            }
+            Ok(())
         }
         .await;
         match result {

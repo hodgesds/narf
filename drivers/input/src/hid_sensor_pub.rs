@@ -473,9 +473,18 @@ pub mod tests {
     // Round trip for every kind: register → publish → the kernel API
     // and the sysfs device both report the reading, with the IIO
     // name/scale pinned per kind.
+    /// (kind, event, IIO name, scale, expected sysfs attrs).
+    type RoundTripCase = (
+        HidSensorKind,
+        SensorEvent,
+        &'static str,
+        &'static str,
+        &'static [(&'static str, &'static str)],
+    );
+
     fn smoke_sensor_pub_round_trip_all_kinds() -> TestResult {
         reset_all();
-        let cases: [(HidSensorKind, SensorEvent, &str, &str, &[(&str, &str)]); 6] = [
+        let cases: [RoundTripCase; 6] = [
             (
                 HidSensorKind::Accelerometer3D,
                 SensorEvent::Accel3d {

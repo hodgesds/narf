@@ -16,16 +16,17 @@
 //! derivation, only on uniqueness).
 //!
 //! Data transport seam: frames move through a [`DataLink`]. The
-//! in-kernel binding is the NHI high-speed DMA ring pair
-//! (TX `RING_FLAG_FRAME`, RX `RING_FLAG_FRAME | RING_FLAG_E2E`
-//! with the frame-start/end PDF masks, HopID `TBNET_LOCAL_PATH`);
-//! `drivers/thunderbolt/src/ring.rs` today implements only ring 0,
-//! so no production binding exists yet (specification §8 records
-//! the remaining work with these exact parameters). Until one is
-//! bound, a peer session still completes its ThunderboltIP login,
-//! but the netdev reports link down and no frames flow; the
-//! fixtures bind an in-memory pair and drive the whole data plane
-//! end-to-end.
+//! production binding is the NHI high-speed DMA ring pair in
+//! `dataring.rs` (TX `RING_FLAG_FRAME`, RX
+//! `RING_FLAG_FRAME | RING_FLAG_E2E` with the frame-start/end
+//! PDF masks, HopID `TBNET_LOCAL_PATH` on the wire), created by
+//! the control channel when a peer's mutual login completes and
+//! released when the session ends; the XDomain engine binds it
+//! through the channel seam (see `xdomain.rs`). While no
+//! transport is bound, a peer session still completes its
+//! ThunderboltIP login, but the netdev reports link down and no
+//! frames flow; the fixtures bind an in-memory pair and drive
+//! the whole data plane end-to-end.
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::fmt;
@@ -108,11 +109,13 @@ impl Interface for TbNetInterface {
     }
 }
 
-/// Registry-owned adapter that retains the shared interface while the CM
-/// side continues to pump the same rings.
-struct RegisteredTbNetInterface(Arc<TbNetInterface>);
+/// The registry holds one handle and the CM side keeps another, so
+/// the pump and the fixtures can reach the rings after
+/// registration. A newtype because the orphan rule forbids
+/// implementing the foreign `Interface` for `Arc<_>` directly.
+struct SharedTbNet(Arc<TbNetInterface>);
 
-impl Interface for RegisteredTbNetInterface {
+impl Interface for SharedTbNet {
     fn name(&self) -> &str {
         self.0.name()
     }
@@ -290,11 +293,30 @@ impl NetLink {
         self.mac
     }
 
-    /// Bind the data transport (see the module documentation for
-    /// the production binding's status).
+    /// Bind the data transport: the production NHI data-ring
+    /// pair when the control channel creates one at login, or an
+    /// in-memory pair in the fixtures.
     pub(crate) fn bind(&mut self, link: Box<dyn DataLink>) {
         self.data = Some(link);
         self.refresh_link();
+    }
+
+    /// Whether a data transport is currently bound.
+    pub(crate) fn bound(&self) -> bool {
+        self.data.is_some()
+    }
+
+    /// Take the data transport out (session ended or the peer is
+    /// going away), refreshing the link state. The caller owns
+    /// the returned transport's teardown ordering: the channel
+    /// releases the in-router paths before the transport is
+    /// dropped and its rings stop.
+    pub(crate) fn unbind(&mut self) -> Option<Box<dyn DataLink>> {
+        let link = self.data.take();
+        if link.is_some() {
+            self.refresh_link();
+        }
+        link
     }
 
     /// Record the ThunderboltIP session state (mutual login).
@@ -317,6 +339,8 @@ impl NetLink {
 
     /// The published interface (the registry holds a second
     /// handle to the same object).
+    // Used by the fixtures to drive the stack-side rings.
+    #[cfg_attr(not(feature = "kernel-test"), allow(dead_code))]
     pub(crate) fn interface(&self) -> &Arc<TbNetInterface> {
         &self.iface
     }
@@ -331,9 +355,7 @@ impl NetLink {
         let Some(authority) = narf_net::trusted_net_authority() else {
             return;
         };
-        match narf_net::registry()
-            .register(&authority, RegisteredTbNetInterface(self.iface.clone()))
-        {
+        match narf_net::registry().register(&authority, SharedTbNet(self.iface.clone())) {
             Ok(handle) => {
                 self.handle = Some(handle);
                 self.registered = true;
@@ -350,11 +372,12 @@ impl NetLink {
     /// into the RX ring.
     pub(crate) fn pump(&mut self) {
         self.ensure_registered();
-        let link_flag = self.link_flag.clone();
-        let Some(data) = self.data.as_mut() else {
+        // Taken out for the pass so the counters and `deliver` can
+        // borrow `self`; put back before returning.
+        let Some(mut data) = self.data.take() else {
             return;
         };
-        if link_flag.load(Ordering::SeqCst) {
+        if self.link_up() {
             while let Ok(Some(frame)) = self.tx_cons.try_recv() {
                 let packet = frame.payload().to_vec();
                 if packet.is_empty() || packet.len() > MAX_PACKET {
@@ -377,7 +400,7 @@ impl NetLink {
             // Frames arriving while the session is down are
             // drained and dropped: the peer must not send before
             // mutual login, and a half-open link must not deliver.
-            if !link_flag.load(Ordering::SeqCst) {
+            if !self.link_up() {
                 continue;
             }
             if let Some(packet) = self.reasm.push(&bytes) {
@@ -386,6 +409,7 @@ impl NetLink {
                 }
             }
         }
+        self.data = Some(data);
     }
 
     fn deliver(&mut self, packet: Vec<u8>) -> bool {

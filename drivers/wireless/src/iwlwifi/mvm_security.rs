@@ -25,6 +25,13 @@ struct NativeKey {
     rsc: u64,
     api: u8,
     peer: [u8; 6],
+    /// Pairwise TX PN handed to firmware (`transmit_seq_cnt`). Zero for
+    /// fresh material; a safely reused PTK starts above its retired floor.
+    tx_pn: u64,
+    /// `Hardware::protected_transmits` when this key became device-visible.
+    tx_base: u64,
+    /// Per-TID host RX replay floors restored for a reused PTK.
+    restored: Option<[u64; 17]>,
 }
 
 struct KeyHistory {
@@ -33,8 +40,57 @@ struct KeyHistory {
     group: bool,
     id: u8,
     floors: [u64; 17],
+    /// Upper bound of every pairwise TX PN the firmware may have used with
+    /// this material: its install PN plus each protected MPDU published
+    /// while it was installed (retries reuse their PN).
+    tx_floor: u64,
     /// Only native key REMOVE followed by the exact RX marker sets this.
     retired: bool,
+}
+
+/// What a retired history entry permits for newly authenticated material
+/// with the same fingerprint. Replay floors only ever rise.
+///
+/// * GTK (RX-only): restorable after an initial four-way exchange from any
+///   peer and at any key index (cross-peer / cross-index restore). The
+///   floor is per key material, so the maximum committed TID floor
+///   carries over unchanged (Linux `sta.c` single install RSC).
+/// * PTK: reusable only from the same peer at index 0. Host RX replay
+///   floors are restored per TID instead of reset, and the firmware TX PN
+///   starts above every PN the old installation could have used, so no
+///   CCMP nonce repeats (Linux `iwl_mvm_send_sta_key` `transmit_seq_cnt`).
+/// * A live (unretired) entry or a role change is never reused.
+fn restore_retired(
+    previous: &KeyHistory,
+    key: &mut NativeKey,
+    first_keys: bool,
+) -> Result<(), &'static str> {
+    if !previous.retired || previous.group != key.group || !first_keys && key.group {
+        return Err("MVM retired key role/peer/epoch reuse");
+    }
+    let floor = *previous.floors.iter().max().unwrap();
+    if key.group {
+        key.rsc = key.rsc.max(floor);
+        if key.rsc >= 0xffff_ffff_ffff {
+            return Err("MVM retired GTK PN exhausted");
+        }
+        return Ok(());
+    }
+    if previous.peer != key.peer || previous.id != key.id {
+        return Err("MVM retired PTK cross-peer reuse");
+    }
+    let tx = previous
+        .tx_floor
+        .checked_add(1)
+        .filter(|pn| *pn < 0xffff_ffff_ffff)
+        .ok_or("MVM retired PTK TX PN exhausted")?;
+    if floor >= 0xffff_ffff_ffff {
+        return Err("MVM retired PTK RX PN exhausted");
+    }
+    key.tx_pn = tx;
+    key.rsc = floor;
+    key.restored = Some(previous.floors);
+    Ok(())
 }
 
 struct Pending {
@@ -45,8 +101,17 @@ struct Pending {
     changed: Vec<usize>,
 }
 
+/// An IGTK this owner installed with MGMT_MCAST_KEY (index 4 or 5).
+struct InstalledIgtk {
+    material: Zeroizing<[u8; 16]>,
+    id: u16,
+}
+
 struct Exchange {
     session: security::Session,
+    /// WPA3-SAE: every key carries `STA_KEY_MFP` and IGTKs are installed.
+    pmf: bool,
+    igtks: [Option<InstalledIgtk>; 2],
     keys: [Option<NativeKey>; 5],
     incoming: VecDeque<(Vec<u8>, bool)>,
     pending: Option<Pending>,
@@ -64,12 +129,73 @@ pub(super) struct Context {
     history: Vec<KeyHistory>,
     cookie: u32,
     mic_keys: bool,
+    /// Station identity whose radio-scoped ledger this owner adopted.
+    ledger: Option<[u8; 6]>,
 }
+
+/// Radio-scoped retired-key ledgers, keyed by station MAC. A native owner
+/// adopts its radio's ledger after configuration and hands it back when it
+/// is dropped, so a later owner of the same radio (re-probe/rebind) keeps
+/// every replay floor and TX PN bound instead of starting from an empty
+/// history. Entries hold only key fingerprints and counters, never key
+/// material. Entries still live when their owner dropped stay unretired,
+/// so they are never reused, only kept as floors.
+static LEDGERS: narf_lib::sync::IrqSafeSpinLock<Vec<([u8; 6], Vec<KeyHistory>)>> =
+    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+/// Bound on retained radio identities; the oldest ledger is evicted.
+const LEDGER_RADIOS: usize = 4;
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        let Some(mac) = self.ledger else {
+            return;
+        };
+        let history = core::mem::take(&mut self.history);
+        let mut ledgers = LEDGERS.lock();
+        ledgers.retain(|(owner, _)| *owner != mac);
+        if ledgers.len() == LEDGER_RADIOS {
+            ledgers.remove(0);
+        }
+        ledgers.push((mac, history));
+    }
+}
+
 impl Context {
+    /// Adopt the ledger a previous owner of this radio left behind, merging
+    /// by fingerprint (floors and TX bounds only rise; an entry stays
+    /// reusable only if both copies are retired).
+    pub(super) fn adopt_ledger(&mut self, mac: [u8; 6]) {
+        if self.ledger.is_some() {
+            return;
+        }
+        self.ledger = Some(mac);
+        let mut ledgers = LEDGERS.lock();
+        let Some(index) = ledgers.iter().position(|(owner, _)| *owner == mac) else {
+            return;
+        };
+        let (_, previous) = ledgers.remove(index);
+        drop(ledgers);
+        for entry in previous {
+            if let Some(own) = self.history.iter_mut().find(|h| h.digest == entry.digest) {
+                for (saved, old) in own.floors.iter_mut().zip(entry.floors) {
+                    *saved = (*saved).max(old);
+                }
+                own.tx_floor = own.tx_floor.max(entry.tx_floor);
+                own.retired &= entry.retired;
+            } else {
+                // Never drop a floor: an over-full ledger makes later key
+                // installation fail closed ("history exhausted").
+                self.history.push(entry);
+            }
+        }
+    }
     pub(super) fn new(api: &super::super::firmware_api::FirmwareApi<'_>) -> Self {
         Self {
+            active: None,
+            history: Vec::new(),
+            cookie: 0,
             mic_keys: api.api_changes[0] & (1 << 29) != 0,
-            ..Self::default()
+            ledger: None,
         }
     }
     pub(super) fn ready(&self) -> bool {
@@ -100,12 +226,14 @@ impl Context {
     }
 }
 
-fn key_command(key: &NativeKey, remove: bool) -> Zeroizing<[u8; 76]> {
+fn key_command(key: &NativeKey, remove: bool, mfp: bool) -> Zeroizing<[u8; 76]> {
     let mut bytes = Zeroizing::new([0; 76]);
     bytes[1] = key.slot;
+    // Linux iwl_mvm_send_sta_key adds STA_KEY_MFP for an MFP station.
     let flags = 8
         | u16::from(key.id) << 8
         | if key.group { 1 << 14 } else { 0 }
+        | if mfp { super::pmf::STA_KEY_MFP } else { 0 }
         | if remove { 1 << 11 } else { 2 };
     put16(&mut bytes[..], 2, flags);
     if !remove {
@@ -117,8 +245,12 @@ fn key_command(key: &NativeKey, remove: bool) -> Zeroizing<[u8; 76]> {
         bytes[36..38].copy_from_slice(&pn[2..4]);
         let tail = if key.api == 2 { 40 } else { 38 };
         bytes[tail..tail + 4].copy_from_slice(&pn[4..]);
-        // Native TX PN starts0 only for authenticated new material. Firmware
-        // owns increments and IV/MIC insertion; retries never re-add this key.
+        // Native TX PN starts0 only for authenticated new material; a
+        // reused PTK continues above its retired floor. Firmware owns
+        // increments and IV/MIC insertion; retries never re-add this key.
+        if !key.group {
+            bytes[68..76].copy_from_slice(&key.tx_pn.to_le_bytes());
+        }
     }
     bytes
 }
@@ -189,10 +321,58 @@ impl Owner {
     pub(super) async fn secure_using(
         &mut self,
         pmk: [u8; 32],
+        nonce: impl FnMut() -> Result<[u8; 32], &'static str>,
+        policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
+        let pmk = Zeroizing::new(pmk);
+        if self.associated_pmf() {
+            return Err("MVM PMF association requires its SAE PMK owner");
+        }
+        self.secure_with(security::Akm::Wpa2Psk, pmk, nonce, policy)
+            .await
+    }
+
+    /// WPA3-SAE four-way exchange with the PMK the retained SAE
+    /// authentication derived. The station RSNE in message 2 repeats the
+    /// association request's (with its PMKID); message 3 must carry the
+    /// IGTK, which is installed with MGMT_MCAST_KEY.
+    pub async fn secure_legacy_sae(&mut self) -> Result<(), &'static str> {
+        self.secure_sae_using(security::fresh_nonce, || {
+            narf_wireless::reg::db::get_domain().ok_or("MVM WPA3 policy unavailable")
+        })
+        .await
+    }
+    pub(super) async fn secure_sae_using(
+        &mut self,
+        nonce: impl FnMut() -> Result<[u8; 32], &'static str>,
+        policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
+        if !self.associated_pmf() {
+            return Err("MVM SAE security requires a PMF association");
+        }
+        let pmk = self
+            .power
+            .prepared
+            .as_mut()
+            .and_then(|p| p.mlme.sae_pmk.take())
+            .ok_or("MVM SAE PMK absent or already consumed")?;
+        self.secure_with(security::Akm::Wpa3Sae, pmk, nonce, policy)
+            .await
+    }
+    fn associated_pmf(&self) -> bool {
+        self.power
+            .prepared
+            .as_ref()
+            .and_then(|p| p.mlme.data.as_ref())
+            .is_some_and(|d| d.status.pmf)
+    }
+    async fn secure_with(
+        &mut self,
+        akm: security::Akm,
+        pmk: Zeroizing<[u8; 32]>,
         mut nonce: impl FnMut() -> Result<[u8; 32], &'static str>,
         mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
-        let pmk = Zeroizing::new(pmk);
         if self.phase != Phase::DataPrepared || self.security.started() {
             return Err("MVM WPA2 already started or data owner not ready");
         }
@@ -219,16 +399,28 @@ impl Owner {
                 None
             })
             .ok_or("MVM actual WPA2 RSN offer absent")?;
+        let pmf = akm == security::Akm::Wpa3Sae;
+        let station_rsn = if pmf {
+            Some(
+                self.power
+                    .prepared
+                    .as_ref()
+                    .and_then(|p| p.mlme.plan.as_ref())
+                    .and_then(|plan| plan.rsn_body())
+                    .ok_or("MVM SAE association RSNE absent")?,
+            )
+        } else {
+            None
+        };
         let snonce = Zeroizing::new(nonce()?);
+        let session = security::Session::new(akm, *pmk, status.bssid, own, *snonce, rsn);
         self.security.active = Some(Exchange {
-            session: security::Session::new(
-                security::Akm::Wpa2Psk,
-                *pmk,
-                status.bssid,
-                own,
-                *snonce,
-                rsn,
-            ),
+            session: match station_rsn {
+                Some(body) => session.with_station_rsn(body),
+                None => session,
+            },
+            pmf,
+            igtks: [None, None],
             keys: core::array::from_fn(|_| None),
             incoming: VecDeque::new(),
             pending: None,
@@ -483,7 +675,13 @@ impl Owner {
         let Some(change) = change else {
             return Ok(Vec::new());
         };
-        if change.igtk.is_some() || change.group_id > 3 || change.group_rx_pn >> 48 != 0 {
+        let pmf = self.security.active.as_ref().unwrap().pmf;
+        if change
+            .igtk
+            .is_some_and(|(_, id, ipn)| !pmf || !matches!(id, 4 | 5) || ipn >> 48 != 0)
+            || change.group_id > 3
+            || change.group_rx_pn >> 48 != 0
+        {
             return Err("unsupported MVM key update");
         }
         let mut keys = Vec::new();
@@ -498,6 +696,9 @@ impl Owner {
                 rsc: 0,
                 api,
                 peer,
+                tx_pn: 0,
+                tx_base: 0,
+                restored: None,
             });
         }
         keys.push(NativeKey {
@@ -508,6 +709,9 @@ impl Owner {
             rsc: change.group_rx_pn,
             api,
             peer,
+            tx_pn: 0,
+            tx_base: 0,
+            restored: None,
         });
         let mut install = Vec::new();
         for mut key in keys {
@@ -524,25 +728,11 @@ impl Owner {
                 .iter()
                 .find(|entry| entry.digest == digest);
             if let Some(previous) = previous {
-                // Only an initial authenticated four-way exchange may restore
-                // an RX-only GTK from this exact AP/key index. Never restore a
-                // PTK/TX counter, cross role/peer or a live/uncertain native key.
-                if !self.security.active.as_ref().unwrap().first_keys
-                    || !key.group
-                    || !previous.group
-                    || previous.peer != peer
-                    || previous.id != key.id
-                    || !previous.retired
-                {
-                    return Err("MVM retired key role/peer/epoch reuse");
-                }
-                // Linux sta.c chooses the maximum RX PN across all TIDs for
-                // the single native key-install RSC. This can conservatively
-                // drop a lagging TID; it cannot lower a retired replay floor.
-                key.rsc = key.rsc.max(*previous.floors.iter().max().unwrap());
-                if key.rsc == 0xffff_ffff_ffff {
-                    return Err("MVM retired GTK PN exhausted");
-                }
+                restore_retired(
+                    previous,
+                    &mut key,
+                    self.security.active.as_ref().unwrap().first_keys,
+                )?;
             }
             let fresh = install
                 .iter()
@@ -600,10 +790,20 @@ impl Owner {
         } else {
             data.replay.pairwise
         };
+        let used = if key.group {
+            0
+        } else {
+            key.tx_pn.saturating_add(
+                self.hardware
+                    .protected_transmits()
+                    .wrapping_sub(key.tx_base),
+            )
+        };
         let entry = &mut self.security.history[index];
         for (saved, current) in entry.floors.iter_mut().zip(floor) {
             *saved = (*saved).max(current);
         }
+        entry.tx_floor = entry.tx_floor.max(used);
         entry.retired = false;
         Ok(index)
     }
@@ -642,16 +842,17 @@ impl Owner {
                 .as_ref()
                 .unwrap();
             let index = usize::from(key.slot);
-            let body = key_command(key, false);
+            let pmf = self.security.active.as_ref().unwrap().pmf;
+            let body = key_command(key, false, pmf);
             let digest = key_digest(key.material.as_ref());
-            let (peer, group, id, rsc) = (key.peer, key.group, key.id, key.rsc);
+            let (peer, group, id, rsc, tx_pn) = (key.peer, key.group, key.id, key.rsc, key.tx_pn);
             let old_history = if self.security.active.as_ref().unwrap().keys[index].is_some() {
                 Some(self.snapshot_key_history(index)?)
             } else {
                 None
             };
             if let Some(old) = self.security.active.as_ref().unwrap().keys[index].as_ref() {
-                let remove = key_command(old, true);
+                let remove = key_command(old, true, pmf);
                 let reply = self
                     .qualified_link_command(1, KEY, &remove[..], policy)
                     .await?;
@@ -668,7 +869,12 @@ impl Owner {
                 .iter_mut()
                 .find(|h| h.digest == digest)
             {
+                // A restored GTK may now live at another index or peer;
+                // retirement must find the entry under its current identity.
                 entry.retired = false;
+                entry.peer = peer;
+                entry.id = id;
+                entry.tx_floor = entry.tx_floor.max(tx_pn);
                 for pn in &mut entry.floors {
                     *pn = (*pn).max(rsc);
                 }
@@ -679,9 +885,11 @@ impl Owner {
                     group,
                     id,
                     floors: [rsc; 17],
+                    tx_floor: tx_pn,
                     retired: false,
                 });
             }
+            let tx_base = self.hardware.protected_transmits();
             let reply = self
                 .qualified_link_command(1, KEY, &body[..], policy)
                 .await?;
@@ -697,6 +905,7 @@ impl Owner {
                 .install[entry]
                 .take()
                 .unwrap();
+            let key = NativeKey { tx_base, ..key };
             self.security.active.as_mut().unwrap().keys[index] = Some(key);
             self.security
                 .active
@@ -708,6 +917,7 @@ impl Owner {
                 .changed
                 .push(index);
         }
+        let igtk = self.install_igtk(policy).await?;
         self.sync_security_rx(Some(policy)).await?;
         for index in retired {
             self.security.history[index].retired = true;
@@ -728,9 +938,25 @@ impl Owner {
             if key.group {
                 data.replay.group[usize::from(key.id)].fill(key.rsc);
                 data.replay.group_valid[usize::from(key.id)] = true;
+            } else if let Some(floors) = key.restored {
+                data.replay.reset_pairwise();
+                data.replay.pairwise = floors;
+                // The AP's single per-key PN also bounds robust management.
+                data.pmf.mgmt_pn = floors.iter().copied().max().unwrap_or(0);
             } else {
                 data.replay.reset_pairwise();
+                data.pmf.mgmt_pn = 0;
             }
+        }
+        // Host BIP verification uses the IGTK only after its native receipt
+        // and the RX epoch, with the KDE IPN as replay floor (mac80211
+        // ieee80211_crypto_aes_cmac_decrypt over the installed rx_pn).
+        if let Some((material, id, ipn)) = igtk {
+            data.pmf
+                .mfp
+                .install_active(*material, id)
+                .map_err(|_| "MVM IGTK key index invalid")?;
+            data.pmf.mfp.active.as_mut().unwrap().rx_pn = ipn;
         }
         let change = pending.change.as_ref().unwrap();
         for pn in &mut data.replay.group[usize::from(change.group_id)] {
@@ -756,7 +982,7 @@ impl Owner {
                 None
             };
             if let Some(key) = self.security.active.as_ref().unwrap().keys[index].as_ref() {
-                let body = key_command(key, true);
+                let body = key_command(key, true, self.security.active.as_ref().unwrap().pmf);
                 let reply = self
                     .hardware
                     .command_with_header_version(1, KEY, &body[..], 0)
@@ -766,12 +992,110 @@ impl Owner {
                 retired.push(history.unwrap());
             }
         }
+        for slot in 0..2 {
+            let Some(id) = self.security.active.as_ref().unwrap().igtks[slot]
+                .as_ref()
+                .map(|k| k.id)
+            else {
+                continue;
+            };
+            let body = super::pmf::igtk_command(None, id, 0);
+            self.hardware
+                .command_with_header_version(0, super::pmf::MGMT_MCAST_KEY, &body[..], 0)
+                .await?;
+            self.security.active.as_mut().unwrap().igtks[slot] = None;
+        }
         self.sync_security_rx(None::<&mut fn() -> Result<RegulatoryDomain, &'static str>>)
             .await?;
         for index in retired {
             self.security.history[index].retired = true;
         }
         self.security.active = None;
+        if let Some(data) = self
+            .power
+            .prepared
+            .as_mut()
+            .and_then(|p| p.mlme.data.as_mut())
+        {
+            data.pmf = super::pmf::PmfRx::default();
+        }
+        Ok(())
+    }
+
+    /// Install a new IGTK from the pending update with MGMT_MCAST_KEY
+    /// (Linux `iwl_mvm_send_sta_igtk`; the command's response carries no
+    /// status Linux checks, so its receipt alone completes it). Identical
+    /// material at the same index is never reinstalled, so its IPN floor
+    /// cannot be reset. Returns the key the host BIP owner must adopt.
+    async fn install_igtk(
+        &mut self,
+        policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<Option<(Zeroizing<[u8; 16]>, u16, u64)>, &'static str> {
+        let active = self.security.active.as_ref().unwrap();
+        let Some((material, id, ipn)) = active
+            .pending
+            .as_ref()
+            .and_then(|p| p.change.as_ref())
+            .and_then(|c| c.igtk)
+        else {
+            return Ok(None);
+        };
+        let material = Zeroizing::new(material);
+        let slot = usize::from(id - 4);
+        if active.igtks[slot]
+            .as_ref()
+            .is_some_and(|k| k.material.as_ref() == material.as_ref())
+        {
+            return Ok(None);
+        }
+        let body = super::pmf::igtk_command(Some(&material), id, ipn);
+        self.qualified_link_command(0, super::pmf::MGMT_MCAST_KEY, &body[..], policy)
+            .await?;
+        self.security.active.as_mut().unwrap().igtks[slot] = Some(InstalledIgtk {
+            material: material.clone(),
+            id,
+        });
+        Ok(Some((material, id, ipn)))
+    }
+
+    /// Firmware restart retirement. The transport has acknowledged its DMA
+    /// stop and cleared bus mastering, so the device can no longer use or
+    /// report any installed key: this is stronger than native key REMOVE plus
+    /// the ordered RX marker. Committed PN floors move into the retained
+    /// history first, so a later reinstall of the same key cannot lower its
+    /// replay window (Linux `iwl_mvm_restart_cleanup` plus mac80211's key
+    /// reconfiguration with the current PN).
+    pub(super) fn retire_security_after_reset(&mut self) -> Result<(), &'static str> {
+        if self.security.active.is_none() {
+            return Ok(());
+        }
+        let mut retired = Vec::new();
+        for index in 0..5 {
+            if self.security.active.as_ref().unwrap().keys[index].is_some() {
+                if self
+                    .power
+                    .prepared
+                    .as_ref()
+                    .and_then(|p| p.mlme.data.as_ref())
+                    .is_none()
+                {
+                    return Err("MVM restart retired keys without their replay owner");
+                }
+                retired.push(self.snapshot_key_history(index)?);
+            }
+        }
+        for index in retired {
+            self.security.history[index].retired = true;
+        }
+        self.security.active = None;
+        if let Some(data) = self
+            .power
+            .prepared
+            .as_mut()
+            .and_then(|p| p.mlme.data.as_mut())
+        {
+            data.pmf = super::pmf::PmfRx::default();
+        }
         Ok(())
     }
 
@@ -858,7 +1182,13 @@ impl Owner {
                     && packet.header.cmd == 0xc1
                     && super::super::scan_api::mpdu_gen2(&packet.payload).is_some_and(|mpdu| {
                         let (mac, status) = bound.unwrap();
-                        super::data::ap_disconnected(&mpdu, mac, status)
+                        let data = self
+                            .power
+                            .prepared
+                            .as_mut()
+                            .and_then(|p| p.mlme.data.as_mut());
+                        let pmf = data.and_then(|d| d.status.pmf.then_some(&mut d.pmf));
+                        super::pmf::ap_disconnected(&mpdu, mac, status.bssid, status.channel, pmf)
                     })
                 {
                     return Err("MVM AP disconnected during native RX key epoch");

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Park an old generation before fresh-ROM recovery. Published allocations
-//! remain pinned: CE halt/BME readback do not prove posted DMA or RF quiescence.
+//! Park an old generation before fresh-ROM recovery. After every CE halted
+//! and bus mastering reads back clear, an ordered flush read (no Relaxed
+//! Ordering) lets the retired owner free its allocations on Drop; any failed
+//! step keeps them pinned. No RF-quiescence claim is made.
 use super::*;
 
 pub(in crate::ath10k) struct Restart {
@@ -8,6 +10,8 @@ pub(in crate::ath10k) struct Restart {
     pub cap: Cap<BusDeviceCap, Write>,
     pub mmio: MmioRegion,
     pub hardware: HwRev,
+    /// The retired owner proved quiescence and frees its DMA on Drop.
+    pub reclaimable: bool,
 }
 
 fn park(
@@ -45,6 +49,9 @@ impl PciBoot {
             return Err(BmiError::BadResponse);
         }
         let cap = self.mmio.cap.derive::<Write>().map_err(|_| BmiError::Pci)?;
+        // ath10k_pci_hif_stop: mask CE/line/firmware sources and release the
+        // vector before the generation becomes terminal.
+        self.stop_interrupts();
         // Terminal before the first register operation. In particular, a late
         // Drop must never disable a successor's bus mastering or CE rings.
         self.retired = true;
@@ -65,11 +72,13 @@ impl PciBoot {
             })
             .map_err(|_| BmiError::Pci)?
         })?;
+        self.reclaimable = self.flushed();
         Ok(Restart {
             device,
             cap,
             mmio: self.mmio.io.0,
             hardware: self.hardware,
+            reclaimable: self.reclaimable,
         })
     }
 }

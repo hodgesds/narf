@@ -159,6 +159,91 @@ fn one_target(request: &Request, card: &Card, object: &Arc<GemObject>) -> bool {
     })
 }
 
+fn kms_linear_primary_retains_gem_and_resolves_atomic_preparation() -> TestResult {
+    let Ok(f) = Fixture::new(4) else {
+        return TestResult::Fail("fixture");
+    };
+    {
+        let mut c = f.mode.lock();
+        c.driver_name = "amdgpu";
+        c.gfx12_modifiers = false;
+        c.native_planes.clear();
+        c.overlay_formats = None;
+        c.plane_formats = Some(&[DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888]);
+    }
+    let Ok(object) = f.object() else {
+        return TestResult::Fail("linear BO");
+    };
+    let Ok(fb) = f.fb(object.clone(), MASTER, false) else {
+        return TestResult::Fail("linear-primary ADDFB2 rejected a GEM handle");
+    };
+    let request = atomic(
+        &[PRIMARY],
+        &[2],
+        &[PLANE_FB_ID_PROP_ID, PLANE_CRTC_ID_PROP_ID],
+        &[u64::from(fb), u64::from(CRTC)],
+    );
+    if !one_target(&request, &f.mode.lock(), &object) {
+        return TestResult::Fail("linear atomic FB bypassed placement preparation");
+    }
+    if request.validate(f.index, &f.mode, MASTER, None).is_err()
+        || f.mode.lock().crtcs[0].primary_fb.is_some()
+        || object.pinned()
+    {
+        return TestResult::Fail("linear atomic TEST_ONLY failed or changed live state");
+    }
+    let frame = {
+        let c = f.mode.lock();
+        crate::drm_ioctl_bridge::scanout_frame(&c, c.framebuffer(fb).unwrap())
+    };
+    let Some(frame) = frame else {
+        return TestResult::Fail("linear GEM did not produce a pinned frame");
+    };
+    if frame.bo.is_none() || !object.pinned() || frame.modifier != 0 {
+        return TestResult::Fail("linear GEM ownership lost at KMS handoff");
+    }
+    // Unsupported formats/modifiers fail before adding an FB, even
+    // though the generic amdgpu validator understands them.
+    let before = f.mode.lock().framebuffers.len();
+    let mut cmd = crate::amdgpu_dm_modifiers::FbCmd {
+        width: 64,
+        height: 12,
+        pixel_format: DRM_FORMAT_XRGB8888,
+        handles: [1, 0, 0, 0],
+        pitches: [256, 0, 0, 0],
+        ..Default::default()
+    };
+    cmd.pixel_format = crate::amdgpu_dm_modifiers::NV12;
+    if f.mode
+        .lock()
+        .addfb2_bo(&cmd, object.clone(), MASTER)
+        .is_ok()
+        || f.mode.lock().framebuffers.len() != before
+    {
+        return TestResult::Fail("linear primary accepted a multi-plane framebuffer");
+    }
+    cmd.pixel_format = DRM_FORMAT_XRGB8888;
+    cmd.flags = crate::amdgpu_dm_modifiers::FB_MODIFIERS;
+    cmd.modifier[0] = crate::amdgpu_dm_modifiers::PLANE_MODIFIERS[1];
+    if f.mode
+        .lock()
+        .addfb2_bo(&cmd, object.clone(), MASTER)
+        .is_ok()
+        || f.mode.lock().framebuffers.len() != before
+    {
+        return TestResult::Fail("linear primary accepted an AMD tiled modifier");
+    }
+    drop(frame);
+    if object.pinned() {
+        return TestResult::Fail("completed copy leaked its source pin");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    kms_linear_primary_retains_gem_and_resolves_atomic_preparation
+);
+
 fn kms_prepare_exact_inherited_cross_open_and_cursor_targets() -> TestResult {
     let Ok(f) = Fixture::new(4) else {
         return TestResult::Fail("fixture");

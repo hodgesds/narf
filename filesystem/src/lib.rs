@@ -1137,6 +1137,19 @@ pub trait FileOps: Send + Sync {
     /// initramfs and the virtiofs skeleton.
     fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize>;
 
+    /// The hardware-device LED-output write path (input devices
+    /// only): validate a buffer of evdev records as a pure `EV_LED`
+    /// sequence for LEDs the device declares and dispatch it.
+    ///
+    /// The default is `PermissionDenied` — that default IS the
+    /// security posture: no file type accepts hardware LED writes
+    /// unless it explicitly opts in. Only the evdev hardware-device
+    /// file (`devfs_input::InputEventFile`) overrides this; every
+    /// other file inherits the denial.
+    fn write_hardware_led(&self, _buf: &[u8]) -> Result<usize, FsError> {
+        Err(FsError::PermissionDenied)
+    }
+
     /// Synchronous stat — every Stage-3 FS knows its file size + mtime
     /// cheaply.
     fn stat(&self) -> Stat;

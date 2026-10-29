@@ -28,6 +28,7 @@ mod transfer;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Busy,
+    Clock,
     Authority,
     InvalidFramebuffer,
     Firmware(boot::Error),
@@ -265,6 +266,9 @@ fn training_clients(protected: &[vram::Protected]) -> Result<(), Error> {
 pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Error> {
     if !amdgpu::is_navi48() {
         return Ok(None);
+    }
+    if !amdgpu::boot_clock_ready() {
+        return Err(Error::Clock);
     }
     let mut owner = OWNER.try_lock().ok_or(Error::Busy)?;
     if owner.is_some() {
@@ -4378,6 +4382,8 @@ struct PresentSlot {
     /// scanned out in place, until `retire_scanout_pins` sees them no
     /// longer fetched.
     pins: narf_lib::sync::IrqSafeSpinLock<Vec<Arc<crate::amdgpu_gem::ScanoutPin>>>,
+    /// What the primary's staged buffers hold, for damaged (DIRTYFB) frames.
+    damage: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_present_damage::Damage>,
 }
 impl PresentSlot {
     const fn new() -> Self {
@@ -4391,6 +4397,9 @@ impl PresentSlot {
             }),
             next: narf_lib::sync::IrqSafeSpinLock::new(None),
             pins: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
+            damage: narf_lib::sync::IrqSafeSpinLock::new(
+                crate::amdgpu_present_damage::Damage::new(),
+            ),
         }
     }
     /// The mailbox lock pairs with both admission checks and the gate's
@@ -4475,6 +4484,9 @@ struct Frame {
     ticket: Option<u64>,
     /// When the oldest frame merged into this one was queued.
     queued_ns: u64,
+    /// The primary's rows that changed since its source's previous frame
+    /// (DIRTYFB); None: all of them.
+    damage: Option<core::ops::Range<u32>>,
 }
 impl Frame {
     /// `next` arriving while `self` still waits: each plane's newest
@@ -4486,11 +4498,23 @@ impl Frame {
                 *o = n;
             }
         }
+        // A replaced primary is never copied: its rows join the new one's.
+        let damage = match &next.primary {
+            Some(n) => crate::amdgpu_present_damage::coalesce(
+                (
+                    self.primary.as_ref().and_then(|f| damage_source(f, None)),
+                    self.damage.as_ref(),
+                ),
+                (damage_source(n, None), next.damage.as_ref()),
+            ),
+            None => self.damage,
+        };
         Self {
             primary: next.primary.or(self.primary),
             overlays,
             ticket: next.ticket.max(self.ticket),
             queued_ns: self.queued_ns.min(next.queued_ns),
+            damage,
         }
     }
 }
@@ -4691,6 +4715,19 @@ pub fn present_planes(
     overlays: [Option<PlaneFrame>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
     ticket: Option<u64>,
 ) -> bool {
+    present_damaged(display, primary, overlays, ticket, None)
+}
+
+/// As [`present_planes`], for a dumb-buffer primary whose rows outside
+/// `damage` are unchanged since that buffer's previous frame (DIRTYFB): a
+/// linear copy writes only those rows and the ones its back buffer missed.
+pub fn present_damaged(
+    display: u8,
+    primary: Option<PlaneFrame>,
+    overlays: [Option<PlaneFrame>; crate::amdgpu_dcn401_otg::MAX_OVERLAYS],
+    ticket: Option<u64>,
+    damage: Option<core::ops::Range<u32>>,
+) -> bool {
     // Held off for a suspend: the frame completes unshown, and is not
     // CPU-copied either.
     if PRESENT_GATED.load(Ordering::Acquire) {
@@ -4737,6 +4774,7 @@ pub fn present_planes(
             overlays,
             ticket,
             queued_ns: narf_time::wall::monotonic_ns(),
+            damage,
         };
         // A replaced frame's event completes with the frame replacing it
         // (and its pins go: that commit's framebuffers never show).
@@ -4926,11 +4964,26 @@ async unsafe fn present_native(
             g.surface
         })
     };
+    // Taken for the present: a failed copy or flip leaves the primary's
+    // staged buffers unknown.
+    let epoch = crate::amdgpu_dcn401_otg::surface_epoch();
+    let mut damage = core::mem::take(&mut *present_slot(display).damage.lock());
+    // The primary's tracked source and the staged buffer it is copied into.
+    let mut primary = None;
     if let Some(f) = &frame.primary {
         let g = shown.planes.primary;
         if f.tiling() == Some(surface_of(g).tiling) {
+            let back = boot.display_back_framebuffer(pipe).ok().map(|b| b.addr);
+            let source = damage_source(f, g);
+            let rows = back
+                .filter(|_| source.is_some())
+                .map(|b| damage.plan(source, frame.damage.as_ref(), b, epoch));
             // SAFETY: the caller's obligations.
-            sources[0] = unsafe { place_plane(boot, pipe, pipe, f, g) }.await?;
+            sources[0] = unsafe { place_plane(boot, pipe, pipe, f, g, rows) }.await?;
+            if let Some(placed) = sources[0] {
+                let written = back.filter(|_| placed == crate::amdgpu_dcn401_otg::FlipSource::Back);
+                primary = Some((source, written));
+            }
         }
     }
     for (k, f) in frame.overlays.iter().enumerate() {
@@ -4945,7 +4998,7 @@ async unsafe fn present_native(
             continue;
         }
         // SAFETY: the caller's obligations.
-        sources[k + 1] = unsafe { place_plane(boot, pipe, q, f, Some(o.geometry)) }.await?;
+        sources[k + 1] = unsafe { place_plane(boot, pipe, q, f, Some(o.geometry), None) }.await?;
     }
     for (source, f) in sources
         .iter()
@@ -4956,6 +5009,7 @@ async unsafe fn present_native(
         }
     }
     if sources.iter().all(Option::is_none) {
+        *present_slot(display).damage.lock() = damage;
         return Ok(None);
     }
     let before = boot.display_scanout_framebuffer(pipe).ok();
@@ -4969,8 +5023,33 @@ async unsafe fn present_native(
     // touches them until the next flip (the owner lock is held); the client
     // framebuffers stay pinned (the slot's) until retired.
     unsafe { boot.flip_display_sources(pipe, sources).await }?;
+    if let Some((source, written)) = primary {
+        damage.presented(source, frame.damage.as_ref(), written, epoch);
+    }
+    *present_slot(display).damage.lock() = damage;
     retire_scanout_pins(boot, display);
     Ok(Some((before, boot.display_scanout_framebuffer(pipe).ok())))
+}
+
+/// The dumb buffer a linear copy of primary `f` (shown with geometry `g`)
+/// reads, for damage tracking: None for a GEM framebuffer or a whole-
+/// framebuffer (tiled or 4:2:0) copy.
+fn damage_source(
+    f: &PlaneFrame,
+    g: Option<boot::PlaneGeometry>,
+) -> Option<crate::amdgpu_present_damage::Source> {
+    let format = SurfaceFormat::from_fourcc(f.format)?;
+    if f.bo.is_some() || g.is_some_and(|g| g.whole_framebuffer(format)) {
+        return None;
+    }
+    let (sx, sy) = g.map_or((0, 0), |g| (g.src_x, g.src_y));
+    Some(crate::amdgpu_present_damage::Source {
+        phys: f.phys,
+        pitch: f.pitch,
+        width: f.width,
+        height: f.height,
+        offset: u64::from(sy) * u64::from(f.pitch) + u64::from(sx * format.bytes_per_pixel()),
+    })
 }
 
 /// What plane `plane_pipe` of display `display` (shown with geometry `g`;
@@ -4993,11 +5072,12 @@ async unsafe fn place_plane(
     plane_pipe: u8,
     f: &PlaneFrame,
     g: Option<boot::PlaneGeometry>,
+    rows: Option<core::ops::Range<u32>>,
 ) -> Result<Option<crate::amdgpu_dcn401_otg::FlipSource>, crate::amdgpu_dcn401_otg::Error> {
     use crate::amdgpu_dcn401_otg::FlipSource;
     if f.bo.is_none() {
         // SAFETY: the caller's obligations.
-        unsafe { copy_plane(boot, display, plane_pipe, f, g) }.await?;
+        unsafe { copy_plane(boot, display, plane_pipe, f, g, rows) }.await?;
         return Ok(Some(FlipSource::Back));
     }
     let format =
@@ -5010,6 +5090,7 @@ async unsafe fn place_plane(
 /// primary): a linear RGB plane's source rectangle (its surface is the
 /// rectangle's size) row by row; a tiled or 4:2:0 plane's whole
 /// framebuffer (its surface is the framebuffer) block row by block row.
+/// A linear copy writes only the framebuffer rows `rows` names (None: all).
 /// # Safety
 /// As for `present_native`.
 async unsafe fn copy_plane(
@@ -5018,6 +5099,7 @@ async unsafe fn copy_plane(
     plane_pipe: u8,
     f: &PlaneFrame,
     g: Option<boot::PlaneGeometry>,
+    rows: Option<core::ops::Range<u32>>,
 ) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
     let format =
         SurfaceFormat::from_fourcc(f.format).ok_or(crate::amdgpu_dcn401_otg::Error::Invalid)?;
@@ -5033,7 +5115,11 @@ async unsafe fn copy_plane(
     // half word, read alone so the copy never reads past the row.
     let bytes = (width * cpp) as usize;
     let mut row = alloc::vec![0u32; bytes.div_ceil(4)];
-    for y in 0..f.height.saturating_sub(sy).min(back.height) {
+    // Framebuffer rows from the source rectangle's top are back-buffer rows.
+    let (first, end) = rows.map_or((0, u32::MAX), |r| {
+        (r.start.saturating_sub(sy), r.end.saturating_sub(sy))
+    });
+    for y in first..end.min(f.height.saturating_sub(sy).min(back.height)) {
         let at = f.phys + u64::from(sy + y) * u64::from(f.pitch) + u64::from(sx * cpp);
         // SAFETY: a kernel-mapped dumb buffer row of at least `bytes` bytes
         // past the origin (pitch >= width * bytes per pixel was checked when
@@ -7835,6 +7921,32 @@ mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
+    fn navi48_merged_frame_keeps_replaced_primary_damage() -> TestResult {
+        let frame = |phys: Option<u64>, damage| Frame {
+            primary: phys.map(|p| PlaneFrame::linear(p, 256, 64, 64, 0x3432_5258)),
+            overlays: core::array::from_fn(|_| None),
+            ticket: None,
+            queued_ns: 0,
+            damage,
+        };
+        let merged = |a: Frame, b: Frame| a.merged(b).damage;
+        if merged(frame(Some(0x1000), Some(10..20)), frame(Some(0x1000), Some(30..40)))
+            != Some(10..40)
+            // An overlay-only frame keeps the waiting primary and its rows.
+            || merged(frame(Some(0x1000), Some(10..20)), frame(None, None)) != Some(10..20)
+            || merged(frame(Some(0x1000), None), frame(Some(0x1000), Some(30..40))).is_some()
+            || merged(frame(Some(0x1000), Some(1..2)), frame(Some(0x2000), Some(30..40)))
+                .is_some()
+        {
+            return TestResult::Fail("merged primary damage");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi48",
+        navi48_merged_frame_keeps_replaced_primary_damage
+    );
+
     fn navi48_presenter_drain_requires_no_local_or_queued_frame() -> TestResult {
         let slot = PresentSlot::new();
         assert!(slot.drained());
@@ -7846,6 +7958,7 @@ mod tests {
             overlays: core::array::from_fn(|_| None),
             ticket: None,
             queued_ns: 0,
+            damage: None,
         });
         assert!(!slot.drained());
         slot.presenting.store(true, Ordering::Release);
@@ -8922,6 +9035,7 @@ mod tests {
                 overlays,
                 ticket: None,
                 queued_ns: 0,
+                damage: None,
             })),
             format: SurfaceFormat::Xrgb8888,
             setup,
@@ -9042,6 +9156,7 @@ mod tests {
                     overlays: core::array::from_fn(|_| None),
                     ticket: None,
                     queued_ns: 0,
+                    damage: None,
                 })),
                 format: SurfaceFormat::Xrgb8888,
                 setup: boot::PlaneSetup::NONE,
@@ -9077,6 +9192,7 @@ mod tests {
                 overlays: core::array::from_fn(|_| None),
                 ticket: None,
                 queued_ns: 0,
+                damage: None,
             }));
             if frames.external(0, &a).is_some() {
                 return Err("a dumb framebuffer scanned in place");

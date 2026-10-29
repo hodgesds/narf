@@ -59,11 +59,17 @@
 //!   historical silent no-op.
 //! - The termios ioctl surface is #756 and suspend/resume
 //!   line-state replay is #763; this module is the datapath those
-//!   follow-ons compose with.
+//!   follow-ons compose with. The replay lives in the
+//!   suspend/resume section below: an async system-PM hook whose
+//!   resume rebuilds every bound port's open plan from its
+//!   retained [`LineSettings`].
 
 extern crate alloc;
 
+use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -140,7 +146,7 @@ pub struct ControlXfer {
 }
 
 impl ControlXfer {
-    fn new(bm_request_type: u8, b_request: u8, w_value: u16, w_index: u16) -> Self {
+    pub fn new(bm_request_type: u8, b_request: u8, w_value: u16, w_index: u16) -> Self {
         ControlXfer {
             bm_request_type,
             b_request,
@@ -150,7 +156,7 @@ impl ControlXfer {
         }
     }
 
-    fn with_data(
+    pub fn with_data(
         bm_request_type: u8,
         b_request: u8,
         w_value: u16,
@@ -554,6 +560,12 @@ pub struct BoundPort {
     /// Latest modem-status snapshot (FTDI: from the bulk-IN
     /// status prefix; polled families: via GET_MDMSTS).
     pub modem: ModemStatus,
+    /// (hub registry index, downstream port) this device sits
+    /// behind, when bound through a hub — the wake target for
+    /// runtime hub-port resume (#763, mirroring #840 for HID).
+    /// `None` for root-hub devices, which have no downstream
+    /// port to suspend.
+    pub hub_port: Option<(usize, u8)>,
 }
 
 /// Global registry of bound vendor-serial ports, mirroring
@@ -565,15 +577,63 @@ pub fn bound_count() -> usize {
     SERIAL_PORTS.lock().len()
 }
 
+/// Transport seam for executing control plans: anything that can
+/// issue a host-to-device control transfer on a bound slot. The
+/// production implementation is the xHCI controller; fixtures
+/// implement it with a recording fake so plan execution (order,
+/// stop-at-first-failure, per-slot routing) is testable without
+/// silicon. Same async-trait shape as the thunderbolt `Config`
+/// seam (which carries the same allow).
+#[allow(async_fn_in_trait)]
+pub trait ControlTransport {
+    /// Issue one control-OUT transfer. `Err(PortError::Transfer)`
+    /// is the typed failure — a dead or refusing slot is an error
+    /// value, never a panic.
+    async fn control_out(
+        &self,
+        slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        data: &[u8],
+    ) -> Result<(), PortError>;
+}
+
+impl ControlTransport for Xhci {
+    async fn control_out(
+        &self,
+        slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        data: &[u8],
+    ) -> Result<(), PortError> {
+        Xhci::control_out(
+            self,
+            slot_id,
+            bm_request_type,
+            b_request,
+            w_value,
+            w_index,
+            data,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|_| PortError::Transfer)
+    }
+}
+
 /// Execute a control plan against a live device, in order,
 /// stopping at the first failed transfer.
-pub async fn apply_plan(
-    xhci_dev: &Xhci,
+pub async fn apply_plan<T: ControlTransport + ?Sized>(
+    transport: &T,
     slot_id: u8,
     plan: &[ControlXfer],
 ) -> Result<(), PortError> {
     for x in plan {
-        xhci_dev
+        transport
             .control_out(
                 slot_id,
                 x.bm_request_type,
@@ -582,8 +642,7 @@ pub async fn apply_plan(
                 x.w_index,
                 &x.data,
             )
-            .await
-            .map_err(|_| PortError::Transfer)?;
+            .await?;
     }
     Ok(())
 }
@@ -601,6 +660,7 @@ pub async fn try_bind_serial_already_addressed(
     vid: u16,
     pid: u16,
     cfg: &[u8],
+    hub_port: Option<(usize, u8)>,
 ) -> Result<usize, PortError> {
     let family = super::identify(vid, pid).ok_or(PortError::UnknownDevice)?;
     let eps = find_serial_endpoints(cfg).ok_or(PortError::NoSerialInterface)?;
@@ -658,6 +718,7 @@ pub async fn try_bind_serial_already_addressed(
         bulk_out_dci,
         settings,
         modem: ModemStatus::default(),
+        hub_port,
     });
     Ok(tty_index)
 }
@@ -766,6 +827,149 @@ pub fn clear_serial() {
     }
 }
 
+// ── Suspend / resume (system PM) ──────────────────────────────────
+//
+// #763: before this lane nothing replayed vendor-serial state
+// after S3 — the bind-time open plan ran once, ever, so a dongle
+// that lost power in S3 came back with its UART at power-on
+// defaults and DTR dropped. The class registers an async
+// system-PM hook (`narf_power::system_pm`): prepare latches the
+// pump quiesced before the synchronous device fan-out gates the
+// controller; resume (which runs after the fan-out restored
+// xHCI) replays every bound port's open plan rebuilt from its
+// retained `settings`. State is saved continuously —
+// `set_line_settings` commits the cache only after the plan
+// fully applies — so prepare has nothing to snapshot.
+
+/// Pump quiesce latch: set by the PM prepare hook, cleared when
+/// the resume replay settles. While set, `pump_all` leaves every
+/// endpoint alone.
+static PM_SUSPENDED: AtomicBool = AtomicBool::new(false);
+
+/// True while the class is quiesced for system suspend.
+pub fn pm_quiesced() -> bool {
+    PM_SUSPENDED.load(Ordering::SeqCst)
+}
+
+fn pm_prepare() {
+    PM_SUSPENDED.store(true, Ordering::SeqCst);
+}
+
+fn pm_finish_resume() {
+    PM_SUSPENDED.store(false, Ordering::SeqCst);
+}
+
+/// The resume work list: for every bound port, its bind-time
+/// open plan rebuilt from the retained settings — the exact
+/// sequence bind issued (family init prefix + configure plan,
+/// modem lines included), in registry order. Pure: built under
+/// the registry lock, executed after it is dropped.
+pub fn resume_snapshot() -> Vec<(u8, Result<Vec<ControlXfer>, PortError>)> {
+    let g = SERIAL_PORTS.lock();
+    g.iter()
+        .map(|p| (p.slot_id, open_plan(p.family, p.pid, p.iface, &p.settings)))
+        .collect()
+}
+
+/// Replay every bound port's saved state over `transport`. A
+/// port that detached while suspended is absent from the
+/// snapshot and gets no replay; a port whose slot refuses the
+/// transfers fails typed (`DriverError`) without stopping the
+/// remaining ports' replays.
+pub async fn resume_replay<T: ControlTransport + ?Sized>(
+    transport: &T,
+) -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    let mut failed = false;
+    for (slot_id, plan) in resume_snapshot() {
+        match plan {
+            Ok(plan) => {
+                if apply_plan(transport, slot_id, &plan).await.is_err() {
+                    failed = true;
+                }
+            }
+            Err(_) => failed = true,
+        }
+    }
+    if failed {
+        Err(narf_power::device_pm::DeviceSuspendError::DriverError)
+    } else {
+        Ok(())
+    }
+}
+
+struct UsbSerialPm;
+
+impl narf_power::system_pm::AsyncSystemPm for UsbSerialPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        Box::pin(async {
+            pm_prepare();
+            Ok(())
+        })
+    }
+
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        Box::pin(async {
+            let result = match crate::xhci::controller() {
+                Some(xhci) => resume_replay(xhci.as_ref()).await,
+                None => {
+                    if bound_count() == 0 {
+                        Ok(())
+                    } else {
+                        Err(narf_power::device_pm::DeviceSuspendError::DriverError)
+                    }
+                }
+            };
+            pm_finish_resume();
+            result
+        })
+    }
+}
+
+/// Register the class's async system-PM hook. Called once from
+/// the USB crate's Stage::Subsys initcalls; registration is
+/// idempotent on the hook name.
+pub fn register_pm() {
+    narf_power::system_pm::register_async_system_pm("usb-serial", Arc::new(UsbSerialPm));
+}
+
+/// (hub index, port) pairs with a live vendor-serial binding —
+/// the pure-filter input for the supervisor's hub-port wake
+/// step.
+pub fn hub_ports() -> Vec<(usize, u8)> {
+    let mut v: Vec<(usize, u8)> = {
+        let g = SERIAL_PORTS.lock();
+        g.iter().filter_map(|p| p.hub_port).collect()
+    };
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Supervisor wake step for hub-attached vendor serial, run
+/// immediately before `pump_all` each cycle (#763; the #840 HID
+/// pattern). A suspended hub port gates the device's endpoints,
+/// so a serial dongle behind an autosuspended port would stay
+/// dead even though it is bound and pumped every cycle. The
+/// wake opens a fresh idle window, so a silent device
+/// re-suspends after a full idle window rather than being held
+/// awake.
+pub async fn resume_suspended_hub_ports(xhci_dev: &Xhci) {
+    // Collect binding contexts first, then snapshot the hub
+    // registry — never hold HUBS across the serial registry lock
+    // (the pumps nest the other way via `mark_port_activity`).
+    let ports = hub_ports();
+    let targets = {
+        let g = crate::attach::HUBS.lock();
+        crate::attach::suspended_ports_among(&g[..], &ports)
+    };
+    for (hub_idx, port) in targets {
+        crate::attach::resume_port(xhci_dev, hub_idx, port).await;
+        if !crate::attach::hub_port_is_suspended(hub_idx, port) {
+            crate::attach::mark_port_activity(hub_idx, port);
+        }
+    }
+}
+
 // ── Supervisor pump ───────────────────────────────────────────────
 
 /// Drain and fill every bound port once. Called from the USB
@@ -782,6 +986,12 @@ pub fn clear_serial() {
 /// here are non-blocking polls — no lock in this module is ever
 /// held across an `.await` (there are none in this function).
 pub fn pump_all(xhci_dev: &Xhci) -> usize {
+    // Quiesced for system suspend (#763): the PM prepare hook
+    // latches this before the controller fan-out; leave every
+    // endpoint alone until the resume replay settles.
+    if pm_quiesced() {
+        return 0;
+    }
     let mut moved = 0usize;
     let mut ports = SERIAL_PORTS.lock();
     for port in ports.iter_mut() {
@@ -791,16 +1001,12 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
         };
         // ── RX ──
         let mut buf = [0u8; 64];
-        loop {
-            match xhci_dev.poll_interrupt_in(port.slot_id, port.bulk_in_dci, &mut buf) {
-                Ok(Some(n)) => {
-                    let n = n.min(buf.len());
-                    let (lo, hi) = ingest_rx(port.family, &buf[..n], &mut port.modem);
-                    if hi > lo {
-                        moved += tty.lock().rx.push(&buf[lo..hi]);
-                    }
-                }
-                _ => break,
+        while let Ok(Some(n)) = xhci_dev.poll_interrupt_in(port.slot_id, port.bulk_in_dci, &mut buf)
+        {
+            let n = n.min(buf.len());
+            let (lo, hi) = ingest_rx(port.family, &buf[..n], &mut port.modem);
+            if hi > lo {
+                moved += tty.lock().rx.push(&buf[lo..hi]);
             }
         }
         // ── TX ──
@@ -1242,6 +1448,7 @@ pub mod tests {
             bulk_out_dci: 2,
             settings: LineSettings::default(),
             modem: ModemStatus::default(),
+            hub_port: None,
         });
         if bound_count() != 1 || devfs_bridge::port_count() != 1 {
             return TestResult::Fail("bound port should be registered + published");
@@ -1268,15 +1475,19 @@ pub mod tests {
         // CP210x hardware flow control is refused with a typed
         // error until AN571 SET_FLOW is modelled — never the old
         // codec-state silent no-op.
-        let mut s = LineSettings::default();
-        s.flow = FlowControl::RtsCts;
+        let s = LineSettings {
+            flow: FlowControl::RtsCts,
+            ..LineSettings::default()
+        };
         match configure_plan(ChipFamily::Cp210x, 0xEA60, 0, &s) {
             Err(PortError::Unsupported(_)) => {}
             _ => return TestResult::Fail("CP210x RtsCts must be a typed refusal"),
         }
         // Baud 0 is unrepresentable in every family's model.
-        let mut z = LineSettings::default();
-        z.baud = 0;
+        let z = LineSettings {
+            baud: 0,
+            ..LineSettings::default()
+        };
         match configure_plan(ChipFamily::Ftdi, 0x6001, 0, &z) {
             Err(PortError::UnsupportedBaud(0)) => {}
             _ => return TestResult::Fail("FTDI baud 0 must be UnsupportedBaud"),
@@ -1288,4 +1499,256 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/serial/port", smoke_serial_refusals_are_typed);
+
+    // ── Suspend / resume replay (#763) ───────────────────────
+
+    /// Recording `ControlTransport` fake: logs every transfer as
+    /// (slot, xfer) and refuses transfers for scripted dead
+    /// slots, so the replay executor runs against a fake
+    /// conversation with no silicon.
+    struct FakeTransport {
+        log: IrqSafeSpinLock<Vec<(u8, ControlXfer)>>,
+        dead: Vec<u8>,
+    }
+
+    impl FakeTransport {
+        fn new(dead: Vec<u8>) -> Self {
+            FakeTransport {
+                log: IrqSafeSpinLock::new(Vec::new()),
+                dead,
+            }
+        }
+    }
+
+    impl ControlTransport for FakeTransport {
+        async fn control_out(
+            &self,
+            slot_id: u8,
+            bm_request_type: u8,
+            b_request: u8,
+            w_value: u16,
+            w_index: u16,
+            data: &[u8],
+        ) -> Result<(), PortError> {
+            if self.dead.contains(&slot_id) {
+                return Err(PortError::Transfer);
+            }
+            let mut x = ControlXfer::new(bm_request_type, b_request, w_value, w_index);
+            x.data.extend_from_slice(data);
+            self.log.lock().push((slot_id, x));
+            Ok(())
+        }
+    }
+
+    /// Fabricate a bound port with the given retained state and
+    /// return its tty index (mirror of the detach fixture's
+    /// fabrication).
+    fn fabricate_port(
+        slot_id: u8,
+        family: ChipFamily,
+        pid: u16,
+        settings: LineSettings,
+        hub_port: Option<(usize, u8)>,
+    ) -> usize {
+        let idx = devfs_bridge::register_tty_usb(family);
+        SERIAL_PORTS.lock().push(BoundPort {
+            slot_id,
+            family,
+            pid,
+            tty_index: idx,
+            iface: 0,
+            bulk_in_dci: 3,
+            bulk_out_dci: 2,
+            settings,
+            modem: ModemStatus::default(),
+            hub_port,
+        });
+        idx
+    }
+
+    fn smoke_serial_resume_snapshot_rebuilds_open_plan() -> TestResult {
+        devfs_bridge::__reset_for_test();
+        clear_serial();
+        // Non-default retained state: 9600 baud, DTR only (RTS
+        // dropped) — a replay that fell back to defaults or to
+        // the bind-time DTR|RTS would be visible here.
+        let settings = LineSettings {
+            baud: 9_600,
+            dtr: true,
+            rts: false,
+            ..LineSettings::default()
+        };
+        fabricate_port(207, ChipFamily::Ftdi, 0x6001, settings, None);
+        let snapshot = resume_snapshot();
+        let expected = match open_plan(ChipFamily::Ftdi, 0x6001, 0, &settings) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("resume: open plan must build"),
+        };
+        if snapshot.len() != 1 || snapshot[0].0 != 207 {
+            return TestResult::Fail("resume: snapshot must hold the one bound port");
+        }
+        match &snapshot[0].1 {
+            Ok(plan) if *plan == expected => {}
+            _ => return TestResult::Fail("resume: snapshot plan is not the open plan"),
+        }
+        // Byte-exact pin of the modem step: FTDI MODEM_CTRL
+        // (AN232B) wValue packs the line values in the low byte
+        // and their enable masks in the high byte — DTR asserted
+        // (0x0101) + RTS deasserted (0x0200) = 0x0301. A replay
+        // that re-asserted RTS would read 0x0303 here.
+        let modem_step = expected
+            .iter()
+            .find(|x| x.b_request == ftdi::REQ_MODEM_CTRL)
+            .expect("FTDI plan carries a modem step");
+        if modem_step.w_value != 0x0301 {
+            return TestResult::Fail("resume: modem step lost the DTR-only state");
+        }
+        clear_serial();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/serial/port",
+        smoke_serial_resume_snapshot_rebuilds_open_plan
+    );
+
+    fn smoke_serial_resume_replay_fake_conversation() -> TestResult {
+        devfs_bridge::__reset_for_test();
+        clear_serial();
+        fabricate_port(207, ChipFamily::Ftdi, 0x6001, LineSettings::default(), None);
+        let cp_settings = LineSettings {
+            baud: 9_600,
+            ..LineSettings::default()
+        };
+        fabricate_port(208, ChipFamily::Cp210x, 0xEA60, cp_settings, None);
+        let fake = FakeTransport::new(Vec::new());
+        let result = narf_scheduler::block_on_spin(resume_replay(&fake));
+        if result.is_err() {
+            return TestResult::Fail("resume: replay over a healthy fake must succeed");
+        }
+        // The transcript must be port 207's full open plan
+        // followed by port 208's, each transfer tagged with its
+        // own slot — the masking-defeating property is that the
+        // two ports' different bauds/ifaces never cross (FTDI
+        // carries its divisor in wValue, CP210x its baud in a
+        // data stage; a crossed replay would still "succeed"
+        // against the fake but mismatch the expected sequence).
+        let mut expected: Vec<(u8, ControlXfer)> = Vec::new();
+        for (slot, family, pid, settings) in [
+            (207u8, ChipFamily::Ftdi, 0x6001u16, LineSettings::default()),
+            (208u8, ChipFamily::Cp210x, 0xEA60u16, cp_settings),
+        ] {
+            let plan = match open_plan(family, pid, 0, &settings) {
+                Ok(p) => p,
+                Err(_) => return TestResult::Fail("resume: open plan must build"),
+            };
+            for x in plan {
+                expected.push((slot, x));
+            }
+        }
+        let log = fake.log.lock();
+        if *log != expected {
+            return TestResult::Fail("resume: transcript is not the two open plans in order");
+        }
+        drop(log);
+        clear_serial();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/serial/port",
+        smoke_serial_resume_replay_fake_conversation
+    );
+
+    fn smoke_serial_resume_replay_dead_slot_typed() -> TestResult {
+        devfs_bridge::__reset_for_test();
+        clear_serial();
+        fabricate_port(207, ChipFamily::Ftdi, 0x6001, LineSettings::default(), None);
+        fabricate_port(
+            208,
+            ChipFamily::Cp210x,
+            0xEA60,
+            LineSettings::default(),
+            None,
+        );
+        // Slot 208's device vanished across the sleep: every
+        // transfer to it fails. The replay must surface a typed
+        // DriverError, still deliver 207's full plan, and never
+        // panic or half-program 208.
+        let fake = FakeTransport::new(alloc::vec![208]);
+        let result = narf_scheduler::block_on_spin(resume_replay(&fake));
+        match result {
+            Err(narf_power::device_pm::DeviceSuspendError::DriverError) => {}
+            _ => return TestResult::Fail("resume: dead slot must fail typed DriverError"),
+        }
+        let log = fake.log.lock();
+        if log.iter().any(|(slot, _)| *slot == 208) {
+            return TestResult::Fail("resume: dead slot must receive no transfers");
+        }
+        let plan207 = match open_plan(ChipFamily::Ftdi, 0x6001, 0, &LineSettings::default()) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("resume: open plan must build"),
+        };
+        if log.len() != plan207.len()
+            || !log
+                .iter()
+                .zip(plan207.iter())
+                .all(|((slot, got), want)| *slot == 207 && got == want)
+        {
+            return TestResult::Fail("resume: surviving port's plan must replay in full");
+        }
+        drop(log);
+        clear_serial();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/serial/port",
+        smoke_serial_resume_replay_dead_slot_typed
+    );
+
+    fn smoke_serial_hub_ports_filter_and_pm_latch() -> TestResult {
+        devfs_bridge::__reset_for_test();
+        clear_serial();
+        fabricate_port(
+            207,
+            ChipFamily::Ftdi,
+            0x6001,
+            LineSettings::default(),
+            Some((1, 3)),
+        );
+        fabricate_port(
+            208,
+            ChipFamily::Cp210x,
+            0xEA60,
+            LineSettings::default(),
+            None,
+        );
+        fabricate_port(
+            209,
+            ChipFamily::Pl2303,
+            0x2303,
+            LineSettings::default(),
+            Some((1, 4)),
+        );
+        if hub_ports() != alloc::vec![(1usize, 3u8), (1usize, 4u8)] {
+            return TestResult::Fail("hub_ports must list only hub-bound ports, sorted");
+        }
+        clear_serial();
+        // The PM latch the prepare/resume hooks drive: the pump
+        // consults `pm_quiesced` before touching any endpoint.
+        if pm_quiesced() {
+            return TestResult::Fail("pm latch must start clear");
+        }
+        pm_prepare();
+        if !pm_quiesced() {
+            return TestResult::Fail("pm_prepare must latch the quiesce");
+        }
+        pm_finish_resume();
+        if pm_quiesced() {
+            return TestResult::Fail("pm_finish_resume must clear the quiesce");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/serial/port",
+        smoke_serial_hub_ports_filter_and_pm_latch
+    );
 }

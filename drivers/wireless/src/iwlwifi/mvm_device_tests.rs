@@ -30,6 +30,13 @@ fn domain() -> RegulatoryDomain {
         }],
     }
 }
+fn frequency(channel: u8) -> u32 {
+    if channel <= 14 {
+        2407 + 5 * u32::from(channel)
+    } else {
+        5000 + 5 * u32::from(channel)
+    }
+}
 fn tlv(bytes: &mut Vec<u8>, tag: u32, body: &[u8]) {
     bytes.extend_from_slice(&tag.to_le_bytes());
     bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -162,6 +169,20 @@ struct Actor {
     fail_phy: Option<u8>,
     beacon_ies: Option<Vec<u8>>,
     response_ies: Option<Vec<u8>>,
+    deauths: Vec<(usize, Vec<u8>)>,
+    deauth_status: u8,
+    hold_deauth: bool,
+    /// Tag5 QOS_TIDS fixture: DQA queues 25..=31 for TIDs 1..=7.
+    qos_tids: bool,
+    /// Independent receiver view of Open QoS data: (TID, queue, Ethernet).
+    tid_frames: Vec<(u8, u16, Vec<u8>)>,
+    /// NVM profile: 1 marks channels 1 and 5 NVM_CHANNEL_40MHZ (HT40
+    /// fixtures); 2 reports VHT and marks 36..=48 40/80MHz (VHT fixtures).
+    wide_nvm: u8,
+    /// Operating channel of the fixture BSS (RX descriptor, PHY, scan).
+    channel: u8,
+    /// Expected PHY_CONTEXT width and control position bytes.
+    phy_width: [u8; 2],
 }
 // SAFETY: fixture-only device-side pointers refer to the retained Owner's
 // posted coherent buffers. CURRENT retains both endpoints; every device-side
@@ -172,6 +193,12 @@ struct Actor {
 unsafe impl Send for Actor {}
 impl Actor {
     fn inject(&mut self, command: u8, group: u8, sequence: u16, body: &[u8]) {
+        if command == 0xc1 && group == 0 && body.len() >= 48 && self.channel != 1 {
+            // The API77 MPDU descriptor channel (energy offset + 2).
+            let mut body = body.to_vec();
+            body[34] = self.channel;
+            return self.firmware.inject(command, group, sequence, &body);
+        }
         self.firmware.inject(command, group, sequence, body)
     }
     fn reply(&mut self, command: u8, group: u8, sequence: u16, mut body: Vec<u8>) {
@@ -382,6 +409,29 @@ impl Actor {
                     if self.ht {
                         nvm[8] = 4;
                     }
+                    if self.wide_nvm >= 2 {
+                        // NVM_SKU_CAP_11N | 11AC; channels 36..=48 (indices
+                        // 14..=17) VALID|IBSS|ACTIVE|20|40|80MHZ; profile 3
+                        // marks 36..=64 (14..=21) 160MHZ as well.
+                        let (count, flags) = if self.wide_nvm == 3 {
+                            (22, 0xf0bu32)
+                        } else {
+                            (18, 0x70b)
+                        };
+                        nvm[8] = 12;
+                        nvm[24] = count;
+                        for index in 14..usize::from(count) {
+                            nvm[28 + 4 * index..32 + 4 * index]
+                                .copy_from_slice(&flags.to_le_bytes());
+                        }
+                    }
+                    if self.wide_nvm == 1 {
+                        // Channels 1..=5 described; 1 and 5 VALID|IBSS|
+                        // ACTIVE|20MHZ|40MHZ (iwl-nvm-parse.h).
+                        nvm[24] = 5;
+                        nvm[28..32].copy_from_slice(&0x30bu32.to_le_bytes());
+                        nvm[44..48].copy_from_slice(&0x30bu32.to_le_bytes());
+                    }
                     nvm
                 }
                 (1, 0x98) => {
@@ -462,7 +512,11 @@ impl Actor {
                     vec![]
                 }
                 (1, 8) => {
-                    if b.len() != 36 || b[17] != 1 || !matches!(b[4], 1 | 3) {
+                    if b.len() != 36
+                        || b[17] != self.channel
+                        || b[18..20] != self.phy_width
+                        || !matches!(b[4], 1 | 3)
+                    {
                         return Err("MVM native PHY identity/extent");
                     }
                     vec![]
@@ -530,10 +584,17 @@ impl Actor {
                     vec![]
                 }
                 (5, 0x17) => {
-                    if b.len() != 36 || b[4..8] != [1, 0, 0, 0] || !matches!(b[8], 0 | 15) {
+                    if b.len() != 36
+                        || b[4..8] != [1, 0, 0, 0]
+                        || !(matches!(b[8], 0 | 15) || self.qos_tids && (1..8).contains(&b[8]))
+                    {
                         return Err("MVM native queue identity/extent");
                     }
-                    let id = if b[8] == 15 { 23u16 } else { 24u16 };
+                    let id = if b[8] == 15 {
+                        23u16
+                    } else {
+                        24 + u16::from(b[8])
+                    };
                     if b[0] == 0 {
                         if b[8] == 0 {
                             self.data_added = true;
@@ -569,8 +630,13 @@ impl Actor {
                 }
                 (5, 15) => {
                     if b.len() != if self.tlc_version == 2 { 24 } else { 28 }
-                        || b[6] != 1
-                        || b[10..12] != [1, 0]
+                        || b[6]
+                            != if b[8] & 1 != 0 || b[16..20] != [0; 4] {
+                                3
+                            } else {
+                                1
+                            }
+                        || self.channel <= 14 && b[10..12] != [1, 0]
                     {
                         return Err("MVM native response-bound TLC profile");
                     }
@@ -587,7 +653,9 @@ impl Actor {
             self.reply(c, if g == 1 && c == 0x18 { 0 } else { g }, s, body);
             return Ok(());
         }
-        if !matches!(p.queue, 23 | 24) || p.bytes.len() < 48 {
+        if !(matches!(p.queue, 23 | 24) || self.qos_tids && (25..32).contains(&p.queue))
+            || p.bytes.len() < 48
+        {
             return Err("MVM native interface packet queue/header");
         }
         let frame = &p.bytes[24..];
@@ -607,6 +675,33 @@ impl Actor {
                     }
                     self.inject(0xc1, 0, 0x8000, &envelope(&reply));
                 }
+            }
+            return Ok(());
+        }
+        if p.queue == 23 && frame[0] == 0xc0 {
+            // Independent receiver view of an unprotected leaving
+            // Deauthentication (IEEE 802.11-2020 9.3.3.12, reason 3).
+            if frame.len() != 26
+                || frame[1] != 0
+                || frame[4..10] != AP
+                || frame[10..16] != OWN
+                || frame[16..22] != AP
+                || frame[22] & 15 != 0
+                || frame[24..26] != [3, 0]
+            {
+                return Err("native over-air deauthentication bytes");
+            }
+            self.deauths.push((self.commands.len(), frame.to_vec()));
+            let mut receipt = vec![0; 48];
+            receipt[0] = 1;
+            receipt[36] = 23;
+            receipt[40] = self.deauth_status;
+            receipt[44..48].copy_from_slice(&u32::from(p.pointer).to_le_bytes());
+            if self.hold_deauth {
+                self.hold_deauth = false;
+                self.held = Some((0x1c, 0, 0x8000, receipt));
+            } else {
+                self.inject(0x1c, 0, 0x8000, &receipt);
             }
             return Ok(());
         }
@@ -657,13 +752,19 @@ impl Actor {
         } else {
             let mut frame = frame.to_vec();
             let header = if self.ht { 26 } else { 24 };
+            let mut tid = 0;
             if self.ht {
-                if frame.get(26..28) != Some(&[0, 0]) || frame.get(24..26) != Some(&[0, 0]) {
+                tid = frame.get(24).copied().unwrap_or(0xff);
+                if frame.get(26..28) != Some(&[0, 0])
+                    || frame.get(25) != Some(&0)
+                    || tid > 7
+                    || tid != 0 && !self.qos_tids
+                {
                     return Err("Open QoS padding/TID");
                 }
                 frame.drain(26..28);
             }
-            if p.queue != 24
+            if p.queue != 24 + u16::from(tid)
                 || frame[0..2] != [if self.ht { 0x88 } else { 8 }, 1]
                 || frame[4..10] != AP
                 || frame[10..16] != OWN
@@ -675,7 +776,12 @@ impl Actor {
             ethernet.extend_from_slice(&OWN);
             ethernet.extend_from_slice(&frame[header + 6..]);
             self.security.data.push(ethernet.clone());
-            if self.ba && self.tx_ba_enabled {
+            if self.qos_tids {
+                self.tid_frames.push((tid, p.queue, ethernet.clone()));
+            }
+            if tid != 0 {
+                self.firmware.tx_complete(p.queue, p.pointer);
+            } else if self.ba && self.tx_ba_enabled {
                 self.batch_dma.push((p.dma_base, p.pointer));
                 self.batch.push(p.pointer);
             } else {
@@ -771,6 +877,42 @@ impl Harness {
         ba: bool,
         ml_baid: bool,
     ) -> Result<Self, &'static str> {
+        Self::build_features(protected, ht, emission, tlc_version, ba, ml_baid, 0)
+    }
+    /// `emission == 5` stages a tag5 feature program for exactly `features`.
+    fn build_features(
+        protected: bool,
+        ht: bool,
+        emission: u8,
+        tlc_version: u8,
+        ba: bool,
+        ml_baid: bool,
+        features: u16,
+    ) -> Result<Self, &'static str> {
+        Self::build_nvm(
+            protected,
+            ht,
+            emission,
+            tlc_version,
+            ba,
+            ml_baid,
+            features,
+            0,
+        )
+    }
+    /// [`Self::build_features`] with the `wide_nvm` NVM profile (see
+    /// `Actor::wide_nvm`).
+    #[allow(clippy::too_many_arguments)]
+    fn build_nvm(
+        protected: bool,
+        ht: bool,
+        emission: u8,
+        tlc_version: u8,
+        ba: bool,
+        ml_baid: bool,
+        features: u16,
+        wide_nvm: u8,
+    ) -> Result<Self, &'static str> {
         if CURRENT.lock().is_some() {
             return Err("MVM interface fixture already owned");
         }
@@ -835,6 +977,14 @@ impl Harness {
             fail_phy: None,
             beacon_ies: None,
             response_ies: None,
+            deauths: Vec::new(),
+            deauth_status: 1,
+            hold_deauth: false,
+            qos_tids: features & super::super::mvm_boot::feature_bits::QOS_TIDS != 0,
+            tid_frames: Vec::new(),
+            wide_nvm,
+            channel: 1,
+            phy_width: [0, 0],
         };
         {
             let mut configure = Box::pin(owner.model_configure());
@@ -855,6 +1005,9 @@ impl Harness {
         let source = owner.station_source(executable.cap, true);
         let mut limits = power();
         limits[46] = emission;
+        if emission == 5 {
+            limits[62..64].copy_from_slice(&features.to_le_bytes());
+        }
         let signed = asset("narf-test/mvm-interface/power", &limits, true)?;
         let cap = signed.cap;
         let digest = signed.digest;
@@ -894,6 +1047,9 @@ impl Harness {
                 if emission == 4 {
                     owner.select_nested_power(&asset, BINDING)?;
                 }
+                if emission == 5 {
+                    owner.select_feature_power(&asset, BINDING, features)?;
+                }
                 Ok((asset, BINDING))
             }),
         };
@@ -928,10 +1084,11 @@ impl Harness {
         })
     }
     fn scan(&self) -> Result<(), &'static str> {
+        let channel = self.actor.lock().channel;
         let results = run(self.device.scan(ScanRequest {
             ssids: vec![],
-            frequencies_mhz: vec![2412],
-            channels: vec![1],
+            frequencies_mhz: vec![frequency(channel)],
+            channels: vec![channel.into()],
             active: false,
             random_mac: None,
             colocated_6ghz: false,
@@ -946,11 +1103,12 @@ impl Harness {
         Ok(())
     }
     fn request(&self) -> AssociateRequest {
+        let channel = self.actor.lock().channel;
         AssociateRequest {
             bssid: AP,
             ssid: b"net".to_vec(),
-            frequency_mhz: 2412,
-            channel: 1,
+            frequency_mhz: frequency(channel),
+            channel: channel.into(),
             security: if self.actor.lock().protected {
                 narf_wireless::SecurityConfig::Wpa2 { psk: PMK }
             } else {
@@ -1015,6 +1173,19 @@ fn check(test: impl FnOnce() -> Result<(), &'static str>) -> TestResult {
     }
     test().map_or_else(TestResult::Fail, |()| TestResult::Pass)
 }
+/// Exactly one leaving Deauthentication reached the AP before any native
+/// close command (disable-TX, key removal, BA/queue/peer retirement).
+fn leaving_deauthentication_preceded_teardown(
+    h: &Harness,
+    start: usize,
+) -> Result<(), &'static str> {
+    let actor = h.actor.lock();
+    match actor.deauths.as_slice() {
+        [(at, _)] if *at == start && actor.commands.len() > start => Ok(()),
+        [] => Err("MVM local disconnect sent no over-air deauthentication"),
+        _ => Err("MVM deauthentication duplicated or followed native teardown"),
+    }
+}
 fn conversation(protected: bool) -> Result<(), &'static str> {
     conversation_profile(protected, false)
 }
@@ -1062,8 +1233,13 @@ fn conversation_profile(protected: bool, ht: bool) -> Result<(), &'static str> {
     if !seen {
         return Err("MVM actual native Ethernet absent from RX IPC");
     }
-    h.actor.lock().closing = true;
+    let start = {
+        let mut actor = h.actor.lock();
+        actor.closing = true;
+        actor.commands.len()
+    };
     run(h.device.disassociate())?.map_err(|_| "MVM actual ordered station close")?;
+    leaving_deauthentication_preceded_teardown(&h, start)?;
     if h.device.link_up()
         || h.retained() != (0, 0, 0)
         || h.device
@@ -1185,10 +1361,23 @@ fn smoke_mvm_interface_cancelled_close_retains_and_finishes_native_keys_queues_p
         }
         {
             let mut close = Box::pin(h.device.disassociate());
-            if !once(close.as_mut()).is_pending() {
-                return Err("MVM close skipped native disable wait");
+            // The leaving deauthentication's receipt precedes the held
+            // native disable; drive the close until that hold is reached.
+            let mut held = false;
+            for _ in 0..64 {
+                if !once(close.as_mut()).is_pending() {
+                    return Err("MVM close skipped native disable wait");
+                }
+                h.actor.lock().serve()?;
+                let actor = h.actor.lock();
+                if actor.held.is_some() || actor.security.holding() {
+                    held = true;
+                    break;
+                }
             }
-            h.actor.lock().serve()?;
+            if !held || h.actor.lock().deauths.len() != 1 {
+                return Err("MVM close did not reach held native disable");
+            }
         }
         if h.device.link_up()
             || !h.device.stopping.load(Ordering::Acquire)
@@ -1207,6 +1396,107 @@ fn smoke_mvm_interface_cancelled_close_retains_and_finishes_native_keys_queues_p
 kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2/interface",
     smoke_mvm_interface_cancelled_close_retains_and_finishes_native_keys_queues_phy
+);
+fn closed_configured(h: &Harness) -> bool {
+    !h.device.link_up()
+        && !h.device.terminal.load(Ordering::Acquire)
+        && h.retained() == (0, 0, 0)
+        && h.device
+            .state
+            .try_lock()
+            .is_some_and(|s| s.owner.as_ref().unwrap().phase() == Phase::Configured)
+}
+/// A terminal TX_CMD without ACK (TX_STATUS_FAIL_LONG_LIMIT) retires the
+/// frame; mac80211 then tears down locally exactly as after an ACK.
+fn smoke_mvm_interface_unacknowledged_deauthentication_still_retires_locally() -> TestResult {
+    check(|| {
+        for protected in [false, true] {
+            let h = Harness::new(protected)?;
+            h.join()?;
+            let start = {
+                let mut actor = h.actor.lock();
+                actor.closing = true;
+                actor.deauth_status = 0x83;
+                actor.commands.len()
+            };
+            run(h.device.disassociate())?.map_err(|_| "MVM NACKed deauthentication close")?;
+            leaving_deauthentication_preceded_teardown(&h, start)?;
+            if !closed_configured(&h) {
+                return Err("MVM NACKed deauthentication left native owner");
+            }
+            h.scan()?;
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/interface",
+    smoke_mvm_interface_unacknowledged_deauthentication_still_retires_locally
+);
+/// No current emission authority: the disconnect stays local (Linux
+/// `tx=false`) and no frame is published, but the native close completes.
+fn smoke_mvm_interface_revoked_policy_close_is_local_without_emission() -> TestResult {
+    check(|| {
+        let h = Harness::new(true)?;
+        h.join()?;
+        h.actor.lock().closing = true;
+        h.db.clear();
+        run(h.device.disassociate())?.map_err(|_| "MVM revoked-policy local close")?;
+        if !h.actor.lock().deauths.is_empty() {
+            return Err("MVM emitted deauthentication without current policy");
+        }
+        if !closed_configured(&h) {
+            return Err("MVM revoked-policy close left native owner");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/interface",
+    smoke_mvm_interface_revoked_policy_close_is_local_without_emission
+);
+/// Policy revoked while the published frame's receipt is outstanding: the
+/// in-flight emission is uncertain, so the owner is quarantined with its
+/// queues/keys/DMA retained rather than torn down around the frame.
+fn smoke_mvm_interface_revoked_in_flight_deauthentication_quarantines_owner() -> TestResult {
+    check(|| {
+        let h = Harness::new(true)?;
+        h.join()?;
+        {
+            let mut actor = h.actor.lock();
+            actor.closing = true;
+            actor.hold_deauth = true;
+        }
+        {
+            let mut close = Box::pin(h.device.disassociate());
+            for _ in 0..64 {
+                if once(close.as_mut()).is_ready() {
+                    return Err("MVM close skipped held deauthentication receipt");
+                }
+                h.actor.lock().serve()?;
+                if h.actor.lock().held.is_some() {
+                    break;
+                }
+            }
+        }
+        if h.actor.lock().deauths.len() != 1 || h.actor.lock().held.is_none() {
+            return Err("MVM deauthentication not published before hold");
+        }
+        h.db.clear();
+        h.actor.lock().release();
+        h.pump()?;
+        if !h.device.terminal.load(Ordering::Acquire)
+            || h.retained() == (0, 0, 0)
+            || h.actor.lock().deauths.len() != 1
+        {
+            return Err("MVM revoked in-flight deauthentication reconstructed close");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/interface",
+    smoke_mvm_interface_revoked_in_flight_deauthentication_quarantines_owner
 );
 
 fn smoke_mvm_interface_native_rekey_worker_real_key_epoch_and_encrypted_data() -> TestResult {
@@ -1595,7 +1885,19 @@ kernel_test_in!(
 );
 #[path = "mvm_ba_tests.rs"]
 mod ba_tests;
+#[path = "mvm_coding_tests.rs"]
+mod coding_tests;
+#[path = "mvm_ht40_tests.rs"]
+mod ht40_tests;
 #[path = "mvm_ht_tests.rs"]
 mod ht_tests;
+#[path = "mvm_nss2_tests.rs"]
+mod nss2_tests;
+#[path = "mvm_qos_tests.rs"]
+mod qos_tests;
 #[path = "mvm_reconnect_tests.rs"]
 mod reconnect_tests;
+#[path = "mvm_recovery_tests.rs"]
+mod recovery_tests;
+#[path = "mvm_vht_tests.rs"]
+mod vht_tests;

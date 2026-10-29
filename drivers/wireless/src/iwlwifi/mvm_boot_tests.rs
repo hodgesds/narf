@@ -174,6 +174,11 @@ fn smoke_iwl_mvm_soc_defaults_match_exact_pci_latency_profiles() -> TestResult {
     for (did, hw, expected) in [
         (0x2723, 0x340, [1, 0, 0, 0, 0, 0, 0, 0]),
         (0x02f0, 0x351, [4, 0, 0, 0, 0xf4, 1, 0, 0]),
+        (0x06f0, 0x351, [4, 0, 0, 0, 0xf4, 1, 0, 0]),
+        // LTR_APPLY_DELAY_1820 (3 << 2), no LOW_LATENCY xtal, 1820 µs.
+        (0x34f0, 0x351, [12, 0, 0, 0, 0x1c, 7, 0, 0]),
+        (0x3df0, 0x351, [12, 0, 0, 0, 0x1c, 7, 0, 0]),
+        (0x4df0, 0x351, [12, 0, 0, 0, 0x1c, 7, 0, 0]),
         (0xa0f0, 0x351, [10, 0, 0, 0, 0xe0, 0x2e, 0, 0]),
     ] {
         let c = configuration(super::super::gen2_profile::select(did, hw, 0x10c000).unwrap());

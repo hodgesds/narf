@@ -61,7 +61,12 @@ impl Mailbox {
         payload: &[u8],
         admission: Option<&super::prepare::station::Admission>,
     ) -> Result<(), Error> {
-        if self.failed || !matches!((id, payload.len()), (0, 5) | (1, 1) | (3, 2) | (0x20, 5)) {
+        if self.failed
+            || !matches!(
+                (id, payload.len()),
+                (0, 5) | (1, 1) | (3, 2) | (0x20, 5) | (0x84, 5)
+            )
+        {
             return Err(Error::State);
         }
         self.failed = true;
@@ -121,6 +126,20 @@ impl Mailbox {
         byte(io, 0x361, if previous & 0x80 == 0 { 0x80 } else { 0 })?;
         // fw.c::rtl88e_set_fw_pwrmode_cmd(ACTIVE), sw.c interval5.
         self.send(io, 0x20, &[0, 0x10, 5, 0, 0x0c]).await
+    }
+    /// hw.c::_rtl88ee_fwlps_enter with sw.c low_power_enable=false: send
+    /// fw.c::rtl88e_set_fw_pwrmode_cmd(fwctrl_psmode = FW_PS_DTIM_MODE)
+    /// (mode 1, RLBM 0, smart_ps 1, awake interval 5, no U-APSD,
+    /// FW_PWR_STATE_RF_OFF), then HW_VAR_SET_RPWM(FW_PS_STATE_RF_OFF_88E)
+    /// with the toggle bit flipped. The firmware owns the reserved-page
+    /// Null/PS-Poll templates already published by the join; no CPWM ack
+    /// is awaited on this path (only low_power_enable clock-on polls it).
+    pub(super) async fn doze(&mut self, io: &impl Io) -> Result<(), Error> {
+        radio_on(io)?;
+        self.send(io, 0x20, &[1, 0x10, 5, 0, 0]).await?;
+        let previous = io.read8(0x361)?;
+        io.delay_us(1).await;
+        byte(io, 0x361, if previous & 0x80 == 0 { 0x80 } else { 0 })
     }
 }
 pub(super) fn reserved_pages(own: [u8; 6], peer: [u8; 6], aid: u16) -> Result<[u8; 768], Error> {

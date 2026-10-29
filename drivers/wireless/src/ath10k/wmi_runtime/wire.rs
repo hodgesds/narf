@@ -161,27 +161,45 @@ impl Wire {
     /// VDEV_START): each row is a real20MHz primary with its supported side.
     /// Only the exact fully granted pair replaces the passive inventory;
     /// associated/offchannel scanning remains forbidden by the retained owner.
+    /// A VHT profile adds `WMI_CHAN_FLAG_ALLOW_VHT` (Linux sets it on every
+    /// enabled row); a granted 80 MHz receipt lists all four segment rows.
     pub fn station_ht40_channels(
         &self,
         permission: crate::ath10k::regulatory::Permission,
+        vht: bool,
     ) -> Result<Vec<u8>, Error> {
         let secondary = permission.secondary.ok_or(Error::Unsupported)?;
-        let mut out = self.channels(&[permission.frequency, secondary])?;
+        let low = if permission.width80 {
+            permission.center - 30
+        } else {
+            permission.frequency.min(secondary)
+        };
+        let segment;
+        let rows: &[u16] = if permission.width80 {
+            segment = [low, low + 20, low + 40, low + 60];
+            &segment
+        } else {
+            segment = [permission.frequency, secondary, 0, 0];
+            &segment[..2]
+        };
+        let mut out = self.channels(rows)?;
         let tlv = self.dialect == Dialect::Tlv;
-        for (i, frequency) in [permission.frequency, secondary].into_iter().enumerate() {
+        for (i, frequency) in rows.iter().copied().enumerate() {
             let at = if tlv { 20 + i * 28 } else { 8 + i * 24 };
-            // Legacy11A inventory row, ALLOW_HT; only the lower primary
-            // admits a positive secondary. No VHT/IBSS/DFS permission.
+            // Legacy11A inventory row, ALLOW_HT; only the lower channel of
+            // each HT40 pair admits a positive secondary. No IBSS/DFS.
             put(
                 &mut out,
                 at + 12,
                 (1 << 11)
-                    | if frequency < permission.center {
+                    | if vht { 1 << 12 } else { 0 }
+                    | if (frequency - low) % 40 == 0 {
                         1 << 6
                     } else {
                         0
                     },
             );
+
             out[at + 17] = permission.half_dbm;
             out[at + 18] = permission.half_dbm;
             out[at + 21] = permission.half_dbm;

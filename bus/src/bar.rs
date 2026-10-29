@@ -72,6 +72,9 @@ pub enum BarError {
     Unimplemented,
     /// Kernel mapping failed, including a conflicting memory attribute.
     MappingFailed,
+    /// Command decoding could not be disabled/restored, or a BAR did not
+    /// restore. A failed BAR restoration leaves decoding disabled.
+    ConfigFailed,
 }
 
 /// Type-0 PCIe configuration-space layout, BAR window.
@@ -91,12 +94,55 @@ const BAR_MMIO_ADDR_MASK_32: u32 = 0xFFFF_FFF0;
 /// I/O BAR address mask (clears the low 2 reserved bits).
 const BAR_IO_ADDR_MASK: u32 = 0xFFFF_FFFC;
 
+#[path = "bar_tests.rs"]
+mod tests;
+
+#[path = "bar_probe_tests.rs"]
+mod probe_tests;
+
+trait Config {
+    fn read16(&mut self, offset: u64) -> u16;
+    fn write16(&mut self, offset: u64, value: u16);
+    fn read32(&mut self, offset: u64) -> u32;
+    fn write32(&mut self, offset: u64, value: u32);
+}
+
+#[derive(Debug)]
+struct EcamConfig(PhysAddr);
+impl Config for EcamConfig {
+    fn read16(&mut self, offset: u64) -> u16 {
+        // SAFETY: constructed only by read_bar under its exclusive window
+        // contract. All offsets are bounded, naturally aligned PCI fields.
+        unsafe {
+            crate::ecam::ptr_for(self.0, offset)
+                .map_or(u16::MAX, |p| narf_arch::mmio::read16(p as u64))
+        }
+    }
+    fn write16(&mut self, offset: u64, value: u16) {
+        // SAFETY: same window. A word write never writes RW1C PCI Status.
+        unsafe {
+            if let Some(p) = crate::ecam::ptr_for(self.0, offset) {
+                narf_arch::mmio::write16(p as u64, value);
+            }
+        }
+    }
+    fn read32(&mut self, offset: u64) -> u32 {
+        // SAFETY: same mapped, exclusively owned configuration window.
+        unsafe { cfg_read32(self.0, offset) }
+    }
+    fn write32(&mut self, offset: u64, value: u32) {
+        // SAFETY: same window; this path writes BAR dwords only.
+        unsafe { cfg_write32(self.0, offset, value) }
+    }
+}
+
 /// Read BAR `idx` of `device` and return the decoded slot.
 ///
 /// # Safety
 /// `device.kind` must be PCIe and the function must own its cfg window
 /// exclusively for the duration of this call (size detection writes to
-/// the BAR briefly and restores it). Concurrent BAR access is UB.
+/// the BAR briefly and restores it). All BAR users, including IRQ handlers,
+/// must be quiesced while I/O and memory decoding are disabled.
 pub unsafe fn read_bar(device: &BusDevice, idx: u8) -> Result<Bar, BarError> {
     if idx >= NUM_BARS {
         return Err(BarError::OutOfRange);
@@ -105,23 +151,74 @@ pub unsafe fn read_bar(device: &BusDevice, idx: u8) -> Result<Bar, BarError> {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
         BusKind::VirtioMmio { .. } => return Err(BarError::NotPcie),
     };
+    read_bar_with(&mut EcamConfig(cfg_phys), idx)
+}
 
+fn read_bar_with(io: &mut impl Config, idx: u8) -> Result<Bar, BarError> {
+    if idx >= NUM_BARS {
+        return Err(BarError::OutOfRange);
+    }
+    // A 64-bit BAR consumes its following slot. Reject high halves before
+    // any configuration mutation, rather than interpreting them as BARs.
+    let mut slot = 0;
+    while slot < idx {
+        let low = io.read32(BAR0_OFFSET + u64::from(slot) * 4);
+        if low & BAR_TYPE_IO == 0 && low & 0b110 == BAR_MMIO_64BIT {
+            if slot + 1 == idx {
+                return Err(BarError::OutOfRange);
+            }
+            slot += 2;
+        } else {
+            slot += 1;
+        }
+    }
+    let off = BAR0_OFFSET + u64::from(idx) * 4;
+    let original = io.read32(off);
+    if original & BAR_TYPE_IO == 0 && original & 0b110 == BAR_MMIO_64BIT && idx + 1 >= NUM_BARS {
+        return Err(BarError::OutOfRange);
+    }
+    let command_offset = crate::pci::COMMAND_OFFSET;
+    let decode = crate::pci::cmd::IO_SPACE | crate::pci::cmd::MEM_SPACE;
+    let command = io.read16(command_offset);
+    if command & decode != 0 {
+        io.write16(command_offset, command & !decode);
+    }
+    // Flush the configuration write and refuse sizing if decode stays on.
+    if io.read16(command_offset) & decode != 0 {
+        io.write16(command_offset, command);
+        return Err(BarError::ConfigFailed);
+    }
+    let result = size_bar(io, idx, original);
+    if matches!(result, Err(BarError::ConfigFailed)) {
+        // A BAR may still contain its probe value. Do not map that address
+        // by re-enabling decoding; the caller must recover the function.
+        return result;
+    }
+    if command & decode != 0 {
+        io.write16(command_offset, command);
+    }
+    if io.read16(command_offset) != command {
+        return Err(BarError::ConfigFailed);
+    }
+    result
+}
+
+fn probe_mask(io: &mut impl Config, off: u64, original: u32) -> Result<u32, BarError> {
+    io.write32(off, u32::MAX);
+    let mask = io.read32(off);
+    io.write32(off, original);
+    if io.read32(off) != original {
+        return Err(BarError::ConfigFailed);
+    }
+    Ok(mask)
+}
+
+fn size_bar(io: &mut impl Config, idx: u8, original: u32) -> Result<Bar, BarError> {
     let off = BAR0_OFFSET + (idx as u64) * 4;
-    // SAFETY: cfg_phys + off lives inside the function's 4-KiB cfg
-    // window (off < 0x28 < 0x100); identity-mapped.
-    // SAFETY: Valid memory or trusted environment
-    let original = unsafe { cfg_read32(cfg_phys, off) };
 
     // I/O-port BAR? Bit 0 set.
     if original & BAR_TYPE_IO != 0 {
-        // Size: write all-1s, read back, mask, invert, +1.
-        // SAFETY: same window; we restore below.
-        let size_low = unsafe {
-            cfg_write32(cfg_phys, off, 0xFFFF_FFFF);
-            let v = cfg_read32(cfg_phys, off);
-            cfg_write32(cfg_phys, off, original);
-            v
-        };
+        let size_low = probe_mask(io, off, original)?;
         let masked = size_low & BAR_IO_ADDR_MASK;
         let size = if masked == 0 {
             0
@@ -143,29 +240,12 @@ pub unsafe fn read_bar(device: &BusDevice, idx: u8) -> Result<Bar, BarError> {
     let is_64 = (original & 0b110) == BAR_MMIO_64BIT;
     let prefetchable = (original & BAR_MMIO_PREFETCH) != 0;
 
-    // Size detection on the low slot.
-    // SAFETY: cfg-space writes restored below; same window.
-    let size_low = unsafe {
-        cfg_write32(cfg_phys, off, 0xFFFF_FFFF);
-        let v = cfg_read32(cfg_phys, off);
-        cfg_write32(cfg_phys, off, original);
-        v
-    };
+    let size_low = probe_mask(io, off, original)?;
 
     if is_64 {
-        if idx + 1 >= NUM_BARS {
-            return Err(BarError::OutOfRange);
-        }
         let off_hi = off + 4;
-        // SAFETY: high slot is in the same 4-KiB cfg window.
-        let original_hi = unsafe { cfg_read32(cfg_phys, off_hi) };
-        // SAFETY: cfg-space writes restored below; same window.
-        let size_hi = unsafe {
-            cfg_write32(cfg_phys, off_hi, 0xFFFF_FFFF);
-            let v = cfg_read32(cfg_phys, off_hi);
-            cfg_write32(cfg_phys, off_hi, original_hi);
-            v
-        };
+        let original_hi = io.read32(off_hi);
+        let size_hi = probe_mask(io, off_hi, original_hi)?;
         let phys = ((original_hi as u64) << 32) | ((original & BAR_MMIO_ADDR_MASK_32) as u64);
         let size_combined = ((size_hi as u64) << 32) | ((size_low & BAR_MMIO_ADDR_MASK_32) as u64);
         if size_combined == 0 {
@@ -430,7 +510,7 @@ unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
     // segment's ECAM window rather than a raw physical address.
     unsafe {
         match crate::ecam::ptr_for(cfg, off) {
-            Some(p) => core::ptr::read_volatile(p as *const u32),
+            Some(p) => narf_arch::mmio::read32(p as u64),
             None => u32::MAX,
         }
     }
@@ -442,7 +522,7 @@ unsafe fn cfg_write32(cfg: PhysAddr, off: u64, value: u32) {
     // segment's ECAM window rather than a raw physical address.
     unsafe {
         if let Some(p) = crate::ecam::ptr_for(cfg, off) {
-            core::ptr::write_volatile(p as *mut u32, value);
+            narf_arch::mmio::write32(p as u64, value);
         }
     }
 }

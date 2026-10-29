@@ -45,6 +45,7 @@ pub(super) struct Device<I: Io> {
     name: String,
     local: [u8; 6],
     published: AtomicBool,
+    withdrawn: AtomicBool,
     activating: AtomicBool,
     admitted: AtomicBool,
     up: AtomicBool,
@@ -119,6 +120,7 @@ impl<I: Io + 'static> Device<I> {
             name: name.into(),
             local,
             published: AtomicBool::new(false),
+            withdrawn: AtomicBool::new(false),
             activating: AtomicBool::new(false),
             admitted: AtomicBool::new(false),
             up: AtomicBool::new(false),
@@ -136,8 +138,55 @@ impl<I: Io + 'static> Device<I> {
     pub(super) fn closed(&self) -> bool {
         self.admission.closed()
     }
+    /// Removal (`rtw_unregister_hw` in `rtw_pci_remove`): close every
+    /// control and packet path, drop the link and withdraw the registered
+    /// netdev, wireless and stack endpoints. The owner itself is torn down
+    /// by `Lifecycle::remove`.
+    pub(super) fn withdraw(self: &Arc<Self>) {
+        if self.withdrawn.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.close();
+        if let Some(mut rings) = self.rings.try_lock() {
+            rings.clear();
+        }
+        if !self.published.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        {
+            let mut active = ACTIVE.lock();
+            let this = Arc::as_ptr(self) as *const ();
+            if active
+                .as_ref()
+                .is_some_and(|a| Arc::as_ptr(a) as *const () == this)
+            {
+                *active = None;
+            }
+        }
+        narf_wireless::registry::unregister(&self.name);
+        narf_net::registry().unregister(&self.name);
+        narf_net::iface::unregister(&self.name);
+        CLAIMED.store(false, Ordering::Release);
+    }
+    pub(super) fn withdrawn(&self) -> bool {
+        self.withdrawn.load(Ordering::Acquire)
+    }
     pub(super) fn admission(&self) -> Admission {
         self.admission.clone()
+    }
+    /// Linux `rtw_watch_dog_work`: one dynamic-mechanism period under the
+    /// retained owner mutex. A failed period closes the shell.
+    pub(super) async fn watchdog(&self) -> bool {
+        if self.closed() || !self.admitted.load(Ordering::Acquire) {
+            return false;
+        }
+        match self.lifecycle.watchdog().await {
+            Ok(ran) => ran,
+            Err(_) => {
+                self.close();
+                false
+            }
+        }
     }
     pub(super) async fn activate(&self) -> Result<(), Error> {
         if !self.published.load(Ordering::Acquire) || self.closed() {
@@ -548,8 +597,18 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     fn reports_disconnect_events(&self) -> bool {
         true
     }
+    /// Linux `main.c::rtw_register_hw` sets `NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR`.
+    fn supports_scan_random_mac(&self) -> bool {
+        true
+    }
     fn supports_scan_dwell(&self) -> bool {
         true
+    }
+    fn max_scan_ssids(&self) -> u8 {
+        super::scan::MAX_SSIDS
+    }
+    fn max_scan_ie_len(&self) -> u16 {
+        super::scan::MAX_EXTRA_IES
     }
     fn connected_bssid(&self) -> Option<[u8; 6]> {
         if !self.link_up() {
@@ -596,7 +655,7 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         })
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        let dwell = scan_dwell(&request)?;
+        let plan = super::scan::plan(&request, self.local)?;
         self.control_ready()?;
         let mut attempt = Attempt {
             device: self,
@@ -609,7 +668,9 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
             attempt.armed = false;
             return Err(WirelessError::Busy);
         }
-        let result = owner.station_scan(dwell).await;
+        let result = owner
+            .station_scan(plan.dwell_ms, &plan.probes, plan.address)
+            .await;
         attempt.armed = false;
         if result.is_err() {
             self.close();
@@ -734,25 +795,6 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
         result.map_err(error)
     }
 }
-fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
-    if request.active
-        || request.random_mac.is_some()
-        || request.colocated_6ghz
-        || !request.extra_ies.is_empty()
-        || request.frequencies_mhz.iter().any(|f| *f != 2412)
-        || request.channels.iter().any(|ch| *ch != 1)
-        || request.ssids.len() > 32
-        || request.ssids.iter().any(|s| s.len() > 32)
-    {
-        return Err(WirelessError::NotSupported);
-    }
-    match request.duration_tu {
-        Some(n @ 1..=1000) => Ok((u64::from(n) * 1024).div_ceil(1000)),
-        Some(_) => Err(WirelessError::InvalidArgs),
-        None if request.duration_mandatory => Err(WirelessError::InvalidArgs),
-        None => Ok(200),
-    }
-}
 pub(super) type Native = Device<super::pci_firmware::Transport>;
 trait Endpoint: Send + Sync {
     fn send(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>;
@@ -800,8 +842,14 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
     narf_wireless::registry::register(device.clone());
     device.published.store(true, Ordering::Release);
     narf_scheduler::spawn(async move {
-        loop {
+        let mut ticks = 0u32;
+        while !device.withdrawn() {
             device.drain();
+            ticks = ticks.wrapping_add(1);
+            // The station rate-limits itself to the source 2s period.
+            if ticks % 250 == 0 {
+                device.watchdog().await;
+            }
             narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
         }
     });

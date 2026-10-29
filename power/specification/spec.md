@@ -106,6 +106,12 @@ pub fn set_policy_current(policy: Policy) -> Result<(), CpuFreqError>;
 pub fn set_epp_current(epp: u8) -> Result<(), CpuFreqError>;
 pub fn current_perf(cpu: CpuId) -> Option<PerfState>;
 
+// Thermal limit (passive cooling, §3.4): a ceiling in permille of
+// each CPU's policy window — 1000 = uncapped, 0 = window floor.
+pub fn set_thermal_limit_permille(permille: u16);
+pub fn thermal_limit_permille() -> u16;
+pub fn install_passive_cooling() -> Result<(), ThermalError>;
+
 pub trait Governor {
     fn tick(&mut self, load: LoadSnapshot) -> Opp;
     fn name(&self) -> &'static str;
@@ -114,6 +120,20 @@ pub trait Governor {
 
 Built-in governors: `Performance`, `Powersave`, `EnergyAware`
 (scheduler-informed). Pluggability is opt-in via `Cap<Governor, Install>`.
+
+The governor also carries the thermal limit used for passive
+cooling (ACPI 6.5 §11.3). The thermal registry's cooling level
+maps linearly onto a ceiling in permille of the policy window
+(level 0 → 1000 uncapped, level 255 → 0, the window floor). The
+ceiling binds both the tick's target computation and the max
+field programmed into the HWP / CPPC request, so autonomous
+hardware selection is capped as well; a previously written
+desired above a newly tightened ceiling is rewritten even when
+the new target sits inside the hysteresis band.
+`install_passive_cooling()` registers the governor as a
+`thermal::CoolingDevice` and is called by the `cpufreq-init`
+initcall only after `enable()` succeeds — with no live backend
+there is nothing to throttle and no device is published.
 
 On x86_64, `Balanced` is the default schedutil-style policy over Intel
 HWP or AMD CPPC. One hard-pinned worker per online CPU samples that CPU's
@@ -409,6 +429,78 @@ area (`SlotArea`, design §10.2) — the secret-free mirror the
 resume environment finds slots through; its codec is strict and
 total (caps before allocation, trailing garbage refused).
 
+**TPM custody anchor (design §8.3, #1002).** `TpmAnchor`
+implements `KeyCustodyAnchor` over the TPM extension surface's
+transport seam (`narf-drivers-tpm::devfs_bridge::TpmTransport`;
+production construction reads the platform's registered
+transport, and no registered transport means the anchor does not
+exist — a TPM-less machine's other factors are unaffected, and
+the anchor's failures are `AnchorError::Unavailable`, never a
+service-wide refusal or a silent policy fallback). *Wrap* seals
+the SMS as caller-supplied data in a KEYEDHASH object
+(`sensitiveDataOrigin` CLEAR) under a regenerated owner storage
+primary; the object's `authPolicy` is a PolicyPCR digest over
+PCRs `[0,1,2,3,4,5,6,7,9,10]` in the SHA-256 bank, computed
+through a trial session from the TPM's own PCR_Read composite
+(TPM 2.0 Library Part 3 §23.7). *Unwrap* regenerates the primary,
+loads the object, and satisfies the policy in a fresh policy
+session whose Unseal carries `continueSession = 0`; PCR drift
+since sealing is the TPM's `TPM_RC_POLICY_FAIL`, surfaced as
+`AnchorError::Refused`, and every other failure — tampered blob
+parts, malformed params, wrong-epoch context — is the single
+no-oracle `AnchorError::Failed`. The slot `params` record the
+selection and the wrap-time SMS epoch; the anchor's monotonic
+epoch source is the NV counter index `0x0150_0003`, advanced
+only by `TPM2_NV_Increment`. Under a token+TPM policy the two
+factors' slots compose through the recorded slot set — each
+factor alone unwraps only its own wrapping of the SMS — and the
+TPM anchor is an alternative anchor under a TPM-only policy,
+never a requirement.
+
+**TPM lifecycle (design §8.3/§4.3, #1003).** `TpmLifecycle`
+is the anchor's lifecycle surface over the same transport
+seam. *Power sequencing:* a suspend that used the anchor ends
+its TPM conversation with `TPM2_Shutdown(TPM_SU_STATE)`,
+issued after the image is durable (design §4.3 step 6); if the
+state-saving shutdown fails, the lifecycle falls back to
+`TPM2_Shutdown(TPM_SU_CLEAR)` and reports the continuity loss
+rather than hiding it. The resume environment opens with
+`startup_for_resume`, which asks for the saved state and
+reports the outcome class — `Restored` (saved state restored,
+PCRs continuous with the suspend), `Fresh` (no saved state:
+dirty power loss or a CLEAR shutdown; the TPM starts with
+`TPM_SU_CLEAR` and slots sealed against the pre-suspend
+measurements refuse), or `AlreadyStarted` (an earlier boot
+stage started the TPM; the lifecycle never issues a second
+Startup against a running TPM). Classification follows the
+Part 3 §9.3 response policy by format-one base code, the same
+decode the production `narf_tpm` startup path folds on.
+*Clear invalidation:* `TPM2_Clear` (Part 3 §24.4) mints a new
+storage primary seed and flushes the owner hierarchy's NV
+indices, so every sealed slot dies at `Load` and the epoch
+counter reads `Absent` through the lifecycle's `epoch_state`
+(which distinguishes `Present` / `Uninitialized` / `Absent`
+where the anchor's `epoch()` collapses them). Nothing re-seals
+or resurrects: re-advancing the epoch after a Clear provisions
+a new counter under the new seed, and slots from before the
+Clear stay dead even when the new counter reaches the same
+number — the seed, not the number, was their life. NV
+undefine/re-define surgery alone moves only the accounting
+and is not an invalidation event. *DA lockout accounting*
+(Part 1 §19): the anchor's `Refused` bucket is unchanged, but
+the lifecycle attributes the anchor's recorded response code
+(`classify_refusal`: policy / lockout / auth), reads the TPM's
+own counters (`TPM_PT_LOCKOUT_COUNTER`, `TPM_PT_MAX_AUTH_FAIL`,
+and the recovery intervals), and exposes the lockout reset as
+an operator act. The resume rule the accounting supports: on
+a lockout refusal the TPM factor is not retried within the
+attempt — the TPM counts authValue failures, while policy
+failures are never counted, and the epoch counter is
+`TPMA_NV_NO_DA`, so neither the anchor's refusals nor its
+epoch traffic can deepen a lockout. Boot/resume-environment
+wiring of these two call points is the resume lane's
+remainder, as with the anchor itself.
+
 **Seams, deliberately minimal.** `parse_claims` / `OpenedImage`
 are the resume environment's entry surface (it also consumes
 `decode_hook_region` + `TrustedImage::read_hook_region` to stage
@@ -656,6 +748,15 @@ initcall registers `AcpiFan` cooling devices. Both producers log
 registration failures; the fan log prints "no PNP0C0B fans
 discovered" only when discovery genuinely found none.
 
+The passive half of the same loop is the cpufreq governor
+(§3.2): because the bridge maps the zone warn band from `_PSV`,
+the governor's inline drive on a warn crossing raises the fans
+*and* lowers the cpufreq thermal ceiling — one crossing, both
+actuator classes. `cpufreq-init` (Stage::Late) registers the
+`CpufreqCoolingDevice` once a backend has enabled; before it,
+and on machines with no cpufreq backend, the registry's
+actuators are the fans alone.
+
 ### 3.5 Runtime PM for devices
 
 ```rust
@@ -894,6 +995,21 @@ warning hook on a transition into `LaptopStateSnapshot::
 is_running_low_on_battery()` when policy enables it. The §3.3
 production-S3 arm/validated gates are unchanged: the service
 requests suspend, the core still decides.
+
+The temperature providers are registered by the hwmon crate,
+not the platform composition: `narf-drivers-hwmon`'s
+`hwmon-power-providers` initcall (Stage::Late) fills
+`StateProviders.cpu_temp_mc` with a live read of the hwmon
+registry — k10temp `Tdie` preferred, coretemp `Tpackage` as the
+fallback, `None` when neither driver has probed (the field
+stays unknown, never a fabricated zero). The dependency cannot
+run the other way (hwmon already depends on platform), and the
+merge semantics of `register_state_providers` make the order
+between the two compositions immaterial. `gpu_temp_mc` has no
+provider yet: the amdgpu SMU temperature exists only as a
+decode of a metrics-table snapshot with no live in-kernel
+handle, so the field remains `None` in production (#914
+remainder).
 
 The platform battery provider behind `StateProviders.battery`
 is itself multi-source. The composition root

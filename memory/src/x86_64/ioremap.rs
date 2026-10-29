@@ -24,7 +24,9 @@ extern crate alloc;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::paging::{self, invlpg_global, map_4kb, read_cr3, unmap_4kb, MapError, PtFlags};
+use crate::paging::{
+    self, invlpg_global, map_2mb, map_4kb, read_cr3, unmap_2mb, unmap_4kb, MapError, PtFlags,
+};
 use crate::vmalloc::{self, VmRange, VmallocError};
 use crate::{PhysAddr, VirtAddr};
 
@@ -152,7 +154,12 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
             crate::ioremap_cache::Claim::Pending(reservation) => reservation,
         };
 
-    let range = vmalloc::alloc(map_len)?;
+    const HUGE: u64 = 2 * 1024 * 1024;
+    let range = if map_len >= HUGE {
+        vmalloc::alloc_aligned(map_len, HUGE)?
+    } else {
+        vmalloc::alloc(map_len)?
+    };
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let pml4_phys = unsafe { read_cr3() };
     // Per-attr PTE flags:
@@ -175,11 +182,11 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
 
     // Map page by page. On failure, walk back and unmap the
     // pages we did install so the address space stays clean.
-    let pages = (map_len >> 12) as usize;
-    for i in 0..pages {
-        let off = (i as u64) * 4096;
+    let mut off = 0;
+    while off < map_len {
         let v = VirtAddr::new(range.base + off);
         let p = PhysAddr::new(base + off);
+        let huge = should_map_huge(v.raw(), p.raw(), map_len - off);
         let flags = if attrs != MmioAttrs::WriteBack && crate::frame::is_system_ram(p) {
             PtFlags::PRESENT | PtFlags::WRITABLE
         } else {
@@ -189,18 +196,34 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
         // existing mapping); phys + off is per the caller's
         // exclusivity contract.
         // SAFETY: Valid memory or trusted environment
-        if let Err(e) = unsafe { map_4kb(pml4_phys, v, p, flags) } {
+        let result = if huge {
+            // Large leaves use PAT bit 12 rather than bit 7, which is PS.
+            // SAFETY: this is a fresh, aligned VA and caller-owned MMIO range.
+            unsafe { map_2mb(pml4_phys, v, p, flags.protval_4k_2_large()) }
+        } else {
+            // SAFETY: this is a fresh VA and caller-owned MMIO page.
+            unsafe { map_4kb(pml4_phys, v, p, flags) }
+        };
+        if let Err(e) = result {
             // Roll back successful pages.
-            for j in 0..i {
-                let off_j = (j as u64) * 4096;
+            let mut off_j = 0;
+            while off_j < off {
                 let v_j = VirtAddr::new(range.base + off_j);
-                // SAFETY: we just installed this PTE.
-                if unsafe { unmap_4kb(pml4_phys, v_j) }.is_err() {
+                let large_j = mapped_leaf_is_huge(pml4_phys, v_j);
+                let unmapped = if large_j {
+                    // SAFETY: this 2 MiB leaf was installed above.
+                    unsafe { unmap_2mb(pml4_phys, v_j) }
+                } else {
+                    // SAFETY: this 4 KiB leaf was installed above.
+                    unsafe { unmap_4kb(pml4_phys, v_j) }
+                };
+                if unmapped.is_err() {
                     // Keep the interval reserved if rollback cannot prove
                     // every old leaf gone; never admit a conflicting alias.
                     core::mem::forget(reservation);
                     return Err(IoremapError::Map(e));
                 }
+                off_j += if large_j { HUGE } else { 4096 };
             }
             vmalloc::free(range);
             return Err(IoremapError::Map(e));
@@ -213,6 +236,7 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
         unsafe {
             paging::invlpg(v);
         }
+        off += if huge { HUGE } else { 4096 };
     }
 
     let m = IoMapping {
@@ -239,12 +263,18 @@ pub unsafe fn iounmap(m: IoMapping) {
     let reservation = crate::ioremap_cache::retire(&CACHE, |ready| ready.virt == m.virt);
     // SAFETY: caller-provided mapping handle.
     let pml4_phys = unsafe { read_cr3() };
-    let pages = (m.len >> 12) as usize;
-    for i in 0..pages {
-        let off = (i as u64) * 4096;
+    let mut off = 0;
+    while off < m.len {
         let v = VirtAddr::new(m.virt + off);
-        // SAFETY: paired with ioremap's map_4kb.
-        if unsafe { unmap_4kb(pml4_phys, v) }.is_err() {
+        let huge = mapped_leaf_is_huge(pml4_phys, v);
+        let unmapped = if huge {
+            // SAFETY: paired with ioremap's map_2mb.
+            unsafe { unmap_2mb(pml4_phys, v) }
+        } else {
+            // SAFETY: paired with ioremap's map_4kb.
+            unsafe { unmap_4kb(pml4_phys, v) }
+        };
+        if unmapped.is_err() {
             // A retained pending claim quarantines any uncertain leaf.
             core::mem::forget(reservation);
             return;
@@ -255,10 +285,26 @@ pub unsafe fn iounmap(m: IoMapping) {
         unsafe {
             invlpg_global(v);
         }
+        off += if huge { 2 * 1024 * 1024 } else { 4096 };
     }
     vmalloc::free(VmRange {
         base: m.virt,
         len: m.len,
     });
     drop(reservation);
+}
+
+const fn can_map_huge(virt: u64, phys: u64, remaining: u64) -> bool {
+    const HUGE: u64 = 2 * 1024 * 1024;
+    virt & (HUGE - 1) == 0 && phys & (HUGE - 1) == 0 && remaining >= HUGE
+}
+
+fn should_map_huge(virt: u64, phys: u64, remaining: u64) -> bool {
+    can_map_huge(virt, phys, remaining)
+        && !crate::frame::system_ram_intersects(phys, 2 * 1024 * 1024)
+}
+
+fn mapped_leaf_is_huge(root: PhysAddr, virt: VirtAddr) -> bool {
+    // SAFETY: the address belongs to an ioremap leaf installed in this root.
+    unsafe { paging::leaf_flags_at(root, virt).is_some_and(|(_, size)| size == 2 * 1024 * 1024) }
 }

@@ -75,9 +75,23 @@ pub(in crate::ath9k) struct Model {
     pub(in crate::ath9k) ht: RefCell<Option<Arc<crate::ath9k::ht::Grant>>>,
     pub(in crate::ath9k) ba: RefCell<Option<Arc<crate::ath9k::rx_ba::Grant>>>,
     pub(in crate::ath9k) tx_ba: RefCell<Option<Arc<crate::ath9k::tx_ba::Grant>>>,
+    pub(in crate::ath9k) qos: RefCell<Option<Arc<crate::ath9k::qos::Grant>>>,
+    /// QCU of the in-flight submission, and every submitted QCU in order.
+    pub(in crate::ath9k) tx_queue: Cell<u64>,
+    pub(in crate::ath9k) queues: RefCell<Vec<u64>>,
     pub(in crate::ath9k) ht_rate: Cell<u8>,
     pub(in crate::ath9k) rx_aggr: Cell<u32>,
     pub(in crate::ath9k) dma_transmitted: RefCell<Vec<Vec<u8>>>,
+    /// Keep AR_Q_TXE/QSTS pending despite AR_Q_TXD (wedged DCU).
+    pub(in crate::ath9k) stuck_tx: Cell<bool>,
+    /// Keep AR_CR_RXE set despite AR_CR_RXD (wedged RX DMA).
+    pub(in crate::ath9k) stuck_rx: Cell<bool>,
+    /// Allocations the owner released after its quiescence proof. The
+    /// model keeps them alive; any later device access is an error.
+    pub(in crate::ath9k) released: RefCell<Vec<DmaBuffer>>,
+    /// Installed MSI wake source and the delivery transitions requested.
+    pub(in crate::ath9k) signal: RefCell<Option<Arc<crate::ath9k::irq::Signal>>>,
+    pub(in crate::ath9k) delivered: RefCell<Vec<bool>>,
 }
 pub(in crate::ath9k) type Reaction =
     dyn Fn(&[u8]) -> Result<(Vec<Vec<u8>>, bool), Error> + Send + Sync;
@@ -120,9 +134,17 @@ impl Model {
             ht: RefCell::new(None),
             ba: RefCell::new(None),
             tx_ba: RefCell::new(None),
+            qos: RefCell::new(None),
+            tx_queue: Cell::new(0),
+            queues: RefCell::new(Vec::new()),
             ht_rate: Cell::new(0x80),
             rx_aggr: Cell::new(0),
             dma_transmitted: RefCell::new(Vec::new()),
+            stuck_tx: Cell::new(false),
+            stuck_rx: Cell::new(false),
+            released: RefCell::new(Vec::new()),
+            signal: RefCell::new(None),
+            delivered: RefCell::new(Vec::new()),
         })
     }
     fn access(&self) -> Result<(), Error> {
@@ -136,6 +158,14 @@ impl Model {
     }
     fn pointer(&self, address: u32, length: usize) -> Result<*mut u8, Error> {
         let address = u64::from(address);
+        if self
+            .released
+            .borrow()
+            .iter()
+            .any(|b| address >= b.dma_addr().raw() && address < b.dma_addr().raw() + b.len() as u64)
+        {
+            return Err(Error::Access);
+        }
         let regions = self.regions.borrow();
         let region = regions
             .iter()
@@ -182,6 +212,11 @@ impl Model {
         Ok(bytes)
     }
     pub(in crate::ath9k) fn complete(&self, success: bool) -> Result<(), Error> {
+        if self.tx.get().is_none() && !self.released.borrow().is_empty() {
+            // The owner aborted the queue and reclaimed its storage: a late
+            // completion has no descriptor left to write.
+            return Ok(());
+        }
         let descriptor = self.tx.get().ok_or(Error::State)?;
         let tail = self.pair_tail.get().unwrap_or(descriptor);
         let mut done = 1;
@@ -216,7 +251,9 @@ impl Model {
         self.put(tail + 60, u32::from(success))?;
         self.put(tail + 92, done)?;
         self.registers.borrow_mut().insert(QTXE, 0);
-        self.registers.borrow_mut().insert(QSTS, 0);
+        self.registers
+            .borrow_mut()
+            .insert(QSTS + self.tx_queue.get() * 4, 0);
         self.tx.set(None);
         self.pair_tail.set(None);
         self.bar_reply.borrow_mut().take();
@@ -302,6 +339,9 @@ impl Model {
     }
 }
 impl Port for Arc<Model> {
+    fn qos_grant(&self) -> Option<Arc<crate::ath9k::qos::Grant>> {
+        self.qos.borrow().clone()
+    }
     fn tx_ba_grant(&self) -> Option<Arc<crate::ath9k::tx_ba::Grant>> {
         self.tx_ba.borrow().clone()
     }
@@ -359,6 +399,9 @@ impl Port for Arc<Model> {
         if let Some(g) = self.ht_grant() {
             g.check()?;
         }
+        if let Some(g) = self.qos_grant() {
+            g.check()?;
+        }
         Ok(*self.registers.borrow().get(&reg).unwrap_or(&0))
     }
     fn write(&self, reg: u64, value: u32) -> Result<(), Error> {
@@ -372,10 +415,13 @@ impl Port for Arc<Model> {
         if let Some(g) = self.ht_grant() {
             g.check()?;
         }
+        if let Some(g) = self.qos_grant() {
+            g.check()?;
+        }
         if self.ignore.get() == Some(reg) {
             return Ok(());
         }
-        self.registers.borrow_mut().insert(reg, value);
+        let prior = self.registers.borrow_mut().insert(reg, value).unwrap_or(0);
         if reg == RXDP {
             self.cursor.set(value);
         }
@@ -384,11 +430,14 @@ impl Port for Arc<Model> {
                 self.cursor.set(self.word(last)?);
             }
         }
-        if reg == QTXE && value == 1 {
+        if reg == QTXE && value.count_ones() == 1 && value & 0xf != 0 {
             if !self.master.get() || !self.allowed.get() {
                 return Err(Error::Access);
             }
-            let descriptor = self.read(QTXDP)?;
+            let queue = u64::from(value.trailing_zeros());
+            self.tx_queue.set(queue);
+            self.queues.borrow_mut().push(queue);
+            let descriptor = self.read(QTXDP + queue * 4)?;
             let tail = self.word(descriptor)?;
             if tail != 0
                 && (self.word(tail)? != 0
@@ -404,7 +453,7 @@ impl Port for Arc<Model> {
                 self.last_pair.set(Some((descriptor, tail)));
             }
             self.tx.set(Some(descriptor));
-            self.registers.borrow_mut().insert(QSTS, 1);
+            self.registers.borrow_mut().insert(QSTS + queue * 4, 1);
             let reaction = { self.reaction.borrow().clone() };
             let mut held = reaction.is_none() || tail != 0 && self.hold_pair.get();
             let mut ack = true;
@@ -454,8 +503,39 @@ impl Port for Arc<Model> {
             }
         }
         if reg == CR && value == 0x20 {
-            self.registers.borrow_mut().insert(CR, 0);
+            let rxe = if self.stuck_rx.get() { 4 } else { 0 };
+            self.registers.borrow_mut().insert(CR, rxe);
         }
+        if reg == 0x4028 {
+            // AR_INTR_SYNC_CAUSE_CLR is write-one-to-clear.
+            self.registers.borrow_mut().insert(reg, prior & !value);
+        }
+        if reg == CR && value == 4 && self.stuck_rx.get() {
+            self.registers.borrow_mut().insert(CR, 4);
+        }
+        if reg == QTXD && value & 1 != 0 && !self.stuck_tx.get() {
+            // Disabled DCU: the in-flight descriptor is abandoned unsent.
+            self.registers.borrow_mut().insert(QTXE, 0);
+            self.registers
+                .borrow_mut()
+                .insert(QSTS + self.tx_queue.get() * 4, 0);
+            self.tx.set(None);
+            self.pair_tail.set(None);
+        }
+        Ok(())
+    }
+    fn delay_us(&self, us: u64) {
+        self.now.set(self.now.get() + us);
+    }
+    fn release(&self, buffers: Vec<DmaBuffer>) {
+        self.released.borrow_mut().extend(buffers);
+    }
+    fn interrupt(&self) -> Option<Arc<crate::ath9k::irq::Signal>> {
+        self.signal.borrow().clone()
+    }
+    fn deliver(&self, enabled: bool) -> Result<(), Error> {
+        self.as_ref().access()?;
+        self.delivered.borrow_mut().push(enabled);
         Ok(())
     }
     fn allocate(&self, bytes: usize) -> Result<DmaBuffer, Error> {
@@ -561,7 +641,6 @@ fn check_ownership() -> Result<(), &'static str> {
         return Err("rejected RX became idle or delivery");
     }
     let address = model.regions.borrow()[0].bus as u32;
-    let before = model.word(address).map_err(|_| "published mapping")?;
     packet.stop().map_err(|_| "stop")?;
     if model.master.get()
         || packet.phase() != Phase::Stopped
@@ -569,12 +648,125 @@ fn check_ownership() -> Result<(), &'static str> {
     {
         return Err("terminal park reopened");
     }
+    check_reclaimed(&model, &packet)?;
     drop(packet);
-    if model.word(address).map_err(|_| "retained mapping")? != before {
-        return Err("published mapping freed/changed after stop");
+    if model.word(address) != Err(Error::Access) {
+        return Err("released mapping still reachable by the model device");
     }
     Ok(())
 }
+pub(in crate::ath9k) fn check_reclaimed(
+    model: &Model,
+    packet: &Packet<Arc<Model>>,
+) -> Result<(), &'static str> {
+    let registers = model.registers.borrow();
+    let reg = |r| *registers.get(&r).unwrap_or(&0);
+    if !packet.reclaimed()
+        || model.released.borrow().len() != 2 + TX_DEPTH + RX_DEPTH
+        || model.released.borrow().len() != model.regions.borrow().len()
+        || reg(QTXD) != 0x3ff
+        || reg(RX_FILTER) != 0
+        || reg(DIAG) & RX_PARK != RX_PARK
+        || reg(DIAG) & DIAG_IDLE_HIGH != 0
+        || reg(PCU_MISC) & PCU_QUIET != 0
+        || reg(IFS_MISC) & IGNORE_BACKOFF != 0
+        || reg(0x24) != 0
+    {
+        return Err("DMA stop/abort did not reclaim the exact packet storage");
+    }
+    Ok(())
+}
+/// Linux `ath_drain_all_txq`/`ath_stoprecv` abort a held descriptor with
+/// bus mastering still enabled; only a proved stop releases the storage.
+fn check_reclamation() -> Result<(), &'static str> {
+    // Held TX in flight is aborted, then the storage is released.
+    let model = Model::new();
+    let mut packet = owner(model.clone()).map_err(|_| "prepare")?;
+    packet.start().map_err(|_| "start")?;
+    packet.submit(&outbound(), 0).map_err(|_| "submit")?;
+    if model.tx.get().is_none() || model.registers.borrow().get(&QTXE) != Some(&1) {
+        return Err("model did not hold the TX descriptor");
+    }
+    packet.stop().map_err(|_| "abort stop")?;
+    check_reclaimed(&model, &packet)?;
+    if packet.delivery() != Err(Error::State) || packet.stop() != Err(Error::State) {
+        return Err("reclaimed owner reopened delivery or replayed stop");
+    }
+    // Never-started owner: engines already parked, storage still reclaimed.
+    let model = Model::new();
+    let mut packet = owner(model.clone()).map_err(|_| "prepare idle")?;
+    packet.stop().map_err(|_| "idle stop")?;
+    check_reclaimed(&model, &packet)?;
+    // A wedged DCU or RX DMA keeps every allocation pinned and readable.
+    for wedged_tx in [true, false] {
+        let model = Model::new();
+        let mut packet = owner(model.clone()).map_err(|_| "prepare wedged")?;
+        packet.start().map_err(|_| "start wedged")?;
+        packet.submit(&outbound(), 0).map_err(|_| "submit wedged")?;
+        if wedged_tx {
+            model.stuck_tx.set(true);
+        } else {
+            model.complete(true).map_err(|_| "complete wedged")?;
+            model.stuck_rx.set(true);
+            model.registers.borrow_mut().insert(CR, 4);
+        }
+        let before = model.now.get();
+        if packet.stop() != Err(Error::Timeout) {
+            return Err("wedged DMA stop claimed success");
+        }
+        let waited = model.now.get() - before;
+        let budget = if wedged_tx {
+            u64::from(TX_ABORT_POLLS - 1) * 5
+        } else {
+            u64::from(RX_STOP_POLLS) * 10
+        };
+        if waited != budget {
+            return Err("DMA stop poll budget differs from Linux");
+        }
+        if packet.reclaimed() || !model.released.borrow().is_empty() || model.master.get() {
+            return Err("unproved DMA stop released storage or kept BME");
+        }
+        let address = model.regions.borrow()[0].bus as u32;
+        drop(packet);
+        if model.word(address).is_err() {
+            return Err("unproved storage was freed on drop");
+        }
+    }
+    // Pre-AR9300 DMADBG_7 hang signature ends the RX stop after two samples.
+    let model = Model::new();
+    let mut packet = owner(model.clone()).map_err(|_| "prepare hang")?;
+    packet.start().map_err(|_| "start hang")?;
+    model.stuck_rx.set(true);
+    model.registers.borrow_mut().insert(CR, 4);
+    model.registers.borrow_mut().insert(DMADBG_7, 0x1c0);
+    let before = model.now.get();
+    if packet.stop() != Err(Error::Timeout)
+        || model.now.get() - before != 10
+        || model.registers.borrow().get(&MACMISC) != Some(&((8 << 5) | (1 << 15)))
+        || packet.reclaimed()
+    {
+        return Err("RX DMA hang signature not honoured");
+    }
+    // A BAR fault during stop never claims reclamation.
+    let model = Model::new();
+    let mut packet = owner(model.clone()).map_err(|_| "prepare fault")?;
+    packet.start().map_err(|_| "start fault")?;
+    model.authority.set(false);
+    if packet.stop().is_ok() || packet.reclaimed() || !model.released.borrow().is_empty() {
+        return Err("revoked stop reclaimed storage");
+    }
+    Ok(())
+}
+fn smoke_ar9285_packet_dma_stop_proof_reclaims_storage() -> TestResult {
+    match check_reclamation() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/packet",
+    smoke_ar9285_packet_dma_stop_proof_reclaims_storage
+);
 fn check_deadlines_and_authority() -> Result<(), &'static str> {
     for done in [false, true] {
         let model = Model::new();
@@ -692,4 +884,137 @@ kernel_test_in!(
 kernel_test_in!(
     "drivers/wireless/ath9k/packet",
     smoke_ar9285_packet_every_native_access_and_address_readback_failure
+);
+
+fn check_interrupt_service() -> Result<(), &'static str> {
+    use crate::ath9k::irq;
+    use core::future::Future as _;
+    // No vector: the owner stays polled and service is a no-op.
+    let model = Model::new();
+    let mut packet = owner(model.clone()).map_err(|_| "prepare polled")?;
+    if packet.enable_interrupts() != Err(Error::State) {
+        return Err("interrupts enabled before rings ran");
+    }
+    packet.start().map_err(|_| "start polled")?;
+    if packet.enable_interrupts() != Ok(false)
+        || packet.interrupt().is_some()
+        || packet.service_begin() != Ok(None)
+        || model
+            .registers
+            .borrow()
+            .get(&irq::IER)
+            .copied()
+            .unwrap_or(0)
+            != 0
+    {
+        return Err("polled owner programmed interrupts");
+    }
+    let model = Model::new();
+    let signal = irq::Signal::new();
+    *model.signal.borrow_mut() = Some(signal.clone());
+    let mut packet = owner(model.clone()).map_err(|_| "prepare irq")?;
+    packet.start().map_err(|_| "start irq")?;
+    if packet.enable_interrupts() != Ok(true) || packet.interrupt().is_none() {
+        return Err("MSI owner did not enable interrupts");
+    }
+    let reg = |r: u64| model.registers.borrow().get(&r).copied().unwrap_or(0);
+    if reg(irq::IER) != 1
+        || reg(irq::IMR) != irq::imr(false)
+        || irq::imr(false) != 0x9100_04b0
+        || reg(0xa4) != 1 << 16
+        || reg(0xa8) != 1 << 16
+        || reg(0x2c) != (700 << 16) | 250
+        || reg(0x5c) != 6
+        || reg(0x403c) != 2
+        || reg(0x4034) != irq::SYNC_DEFAULT
+        || reg(0x40d4) != 7
+        || reg(0x4094) & 1 == 0
+        || *model.delivered.borrow() != [true]
+    {
+        return Err("interrupt programming differs from Linux station mask");
+    }
+    // Spurious vector: nothing pending, IER is still killed then resumed.
+    if packet.service_begin() != Ok(None) || reg(irq::IER) != 0 {
+        return Err("spurious vector");
+    }
+    packet.service_end().map_err(|_| "resume")?;
+    if reg(irq::IER) != 1 {
+        return Err("IER not resumed");
+    }
+    // RX mitigation + TX descriptor completion on QCU0, plus RXEOL.
+    {
+        let mut r = model.registers.borrow_mut();
+        r.insert(0x4038, 2);
+        r.insert(0x7044, 2);
+        r.insert(0x80, 0x8000_0000);
+        r.insert(0xc0, 0x8000_0000 | 0x80 | 0x10);
+        r.insert(0xc4, 1 << 16);
+    }
+    let events = packet
+        .service_begin()
+        .map_err(|_| "service")?
+        .ok_or("pending causes lost")?;
+    if !events.rx || !events.tx || events.txqs != 1 || !events.rx_eol || events.fatal {
+        return Err("cause decode differs from ar9002_hw_get_isr");
+    }
+    if reg(irq::IER) != 0 || reg(irq::IMR) & irq::RX_EOL_ORN != 0 {
+        return Err("RXEOL did not drop RXEOL|RXORN with IER killed");
+    }
+    packet.service_end().map_err(|_| "resume eol")?;
+    if reg(irq::IER) != 1 || reg(irq::IMR) != irq::imr(false) {
+        return Err("RXEOL|RXORN not restored after service");
+    }
+    // Completion timeout pulses AR_RC_HOSTIF and is fatal for the owner.
+    {
+        let mut r = model.registers.borrow_mut();
+        r.insert(0x4038, 0);
+        r.insert(0x4028, 0x1000);
+    }
+    if packet.service_begin() != Err(Error::Access)
+        || packet.phase() != Phase::Failed
+        || reg(0x4000) != 0
+        || reg(0x4028) != 0
+    {
+        return Err("fatal sync cause did not close the owner");
+    }
+    packet.stop().map_err(|_| "stop irq")?;
+    if *model.delivered.borrow() != [true, false]
+        || packet.interrupt().is_some()
+        || reg(0x403c) != 0
+        || reg(0x402c) != 0
+        || reg(0x40d4) != 0
+    {
+        return Err("stop left interrupt delivery open");
+    }
+    check_reclaimed(&model, &packet)?;
+    // Wake future: a raise between snapshot and wait completes it at once;
+    // otherwise the housekeeping fallback ends it without an interrupt.
+    let waker = core::task::Waker::noop();
+    let mut cx = core::task::Context::from_waker(waker);
+    let seen = signal.count();
+    signal.raise();
+    let mut wait = signal.wait(seen, core::future::pending::<()>());
+    if core::pin::Pin::new(&mut wait).poll(&mut cx) != core::task::Poll::Ready(true) {
+        return Err("raised signal not observed");
+    }
+    let seen = signal.count();
+    let mut wait = signal.wait(seen, core::future::pending::<()>());
+    if core::pin::Pin::new(&mut wait).poll(&mut cx).is_ready() {
+        return Err("idle signal completed");
+    }
+    let mut wait = signal.wait(seen, core::future::ready(()));
+    if core::pin::Pin::new(&mut wait).poll(&mut cx) != core::task::Poll::Ready(false) {
+        return Err("fallback did not end wait");
+    }
+    Ok(())
+}
+fn smoke_ar9285_packet_msi_cause_kill_resume_and_fatal() -> TestResult {
+    match check_interrupt_service() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/packet",
+    smoke_ar9285_packet_msi_cause_kill_resume_and_fatal
 );

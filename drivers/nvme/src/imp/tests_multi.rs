@@ -753,6 +753,7 @@ fn verdict_id(sn: u8, fr: u8) -> super::IdentifyController {
         nn: 1,
         rtd3e: 0,
         vwc: 0,
+        oncs: 0,
     }
 }
 

@@ -927,6 +927,7 @@ impl Surfaces {
         request: SurfaceRequest,
     ) -> Result<SurfaceApplied, Error> {
         let (pitch_bytes, bytes) = request.geometry()?;
+        crate::amdgpu_dcn401_otg::surfaces_changed();
         // Every fetching pipe is a pipe index of this pool (fused slots past
         // `count` have no blocks).
         let count = engine.layout.pool.count();
@@ -1065,6 +1066,7 @@ impl Surfaces {
         engine.hubp_tree_stopped(Some(pipe))?;
         engine.verify_surface(a)?;
         let map = surface.memory.mapping();
+        crate::amdgpu_dcn401_otg::surfaces_changed();
         engine.status.state = State::PreparingSurface(pipe);
         let result = engine
             .access(|_| {

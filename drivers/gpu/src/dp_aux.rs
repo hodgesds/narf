@@ -19,6 +19,11 @@
 //! byte 4..N  data (writes only)
 //! ```
 //!
+//! A request with no data is an I²C *address-only* transaction:
+//! the 3-byte header without the length byte (Linux
+//! `BARE_ADDRESS_SIZE`), used to start or — with MOT clear —
+//! stop an I²C-over-AUX transaction.
+//!
 //! Replies are 1 + 0..16 bytes. The first byte is a status
 //! nibble (`AUX_NACK`, `AUX_DEFER`, `I2C_NACK`, …) shifted up by 4.
 //!
@@ -37,13 +42,17 @@ pub enum AuxCommand {
     NativeWrite = 0x8,
     /// Native AUX read — DPCD register query.
     NativeRead = 0x9,
-    /// I²C-over-AUX write (used for EDID-DDC).
+    /// I²C-over-AUX write, MOT clear: STOP after the request.
     I2cWrite = 0x0,
-    /// I²C-over-AUX read.
+    /// I²C-over-AUX read, MOT clear: STOP after the request (an
+    /// address-only one is how a MOT transaction is closed).
     I2cRead = 0x1,
-    /// I²C-over-AUX write with stop-on-completion (single transaction).
+    /// I²C-over-AUX write with MOT (Middle-Of-Transaction, Linux
+    /// `DP_AUX_I2C_MOT`) set: no STOP after the request, the I²C
+    /// transaction stays open for the next one.
     I2cWriteMot = 0x4,
-    /// I²C-over-AUX read with stop-on-completion.
+    /// I²C-over-AUX read with MOT set: no STOP after the request.
+    /// The transaction ends with a request whose MOT is clear.
     I2cReadMot = 0x5,
 }
 
@@ -101,6 +110,18 @@ pub fn encode_request<'a>(req: &AuxRequest<'a>, out: &mut [u8]) -> Result<usize,
         return Err(AuxError::TooLong);
     }
     let n = req.data.len();
+    // Address-only: the 3-byte header, no length byte
+    // (`intel_dp_aux_xfer`'s `BARE_ADDRESS_SIZE`).
+    if n == 0 {
+        if out.len() < 3 {
+            return Err(AuxError::TooLong);
+        }
+        let cmd = (req.cmd as u8) & 0x0F;
+        out[0] = (cmd << 4) | ((req.address >> 16) as u8 & 0x0F);
+        out[1] = (req.address >> 8) as u8;
+        out[2] = req.address as u8;
+        return Ok(3);
+    }
     let total = 4 + if matches!(
         req.cmd,
         AuxCommand::NativeWrite | AuxCommand::I2cWrite | AuxCommand::I2cWriteMot
@@ -116,7 +137,7 @@ pub fn encode_request<'a>(req: &AuxRequest<'a>, out: &mut [u8]) -> Result<usize,
     out[0] = (cmd << 4) | ((req.address >> 16) as u8 & 0x0F);
     out[1] = (req.address >> 8) as u8;
     out[2] = req.address as u8;
-    out[3] = if n == 0 { 0 } else { (n - 1) as u8 };
+    out[3] = (n - 1) as u8;
     let writeback = matches!(
         req.cmd,
         AuxCommand::NativeWrite | AuxCommand::I2cWrite | AuxCommand::I2cWriteMot

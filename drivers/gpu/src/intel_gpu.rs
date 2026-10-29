@@ -191,20 +191,46 @@ pub enum Generation {
 impl Generation {
     /// Map the sub-architecture to the BAR0 region-enumeration
     /// generation. TGL / ADL / RPL share the Xe-LP MMIO map
-    /// (`RegionGeneration::Gen12`); Meteor Lake's Xe-LPG map is
-    /// out of scope for the Stage-0 enumeration.
+    /// (`RegionGeneration::Gen12`); Meteor Lake maps to the
+    /// Xe-LPG region table (#1016); Panther Lake's Xe3-LPD map
+    /// is not modelled yet.
     pub const fn region_generation(self) -> Option<RegionGeneration> {
         match self {
             Generation::TigerLake | Generation::AlderLake => Some(RegionGeneration::Gen12),
-            Generation::MeteorLake | Generation::PantherLake => None,
+            Generation::MeteorLake => Some(RegionGeneration::XeLpg),
+            Generation::PantherLake => None,
         }
     }
 
     /// Whether this lane programs the display engine for the
-    /// generation. Only Gen12 (TGL/ADL/RPL) has a validated
-    /// register sequence; MTL/ARL/PTL identify and announce but
-    /// skip modeset until #1016 lands their display engines.
+    /// generation. Gen12 (TGL/ADL/RPL) and Meteor Lake (Xe-LPG,
+    /// #1016) have validated register sequences. Panther Lake
+    /// stays gated off: Xe3-LPD is a different display IP
+    /// generation from Xe-LPG (its own PHY arrangement, PLL
+    /// tables, and widened clock-select fields), so claiming it
+    /// from the MTL sequence would claim support that cannot be
+    /// driven — the exact failure this gate exists to prevent.
     pub const fn display_supported(self) -> bool {
+        matches!(
+            self,
+            Generation::TigerLake | Generation::AlderLake | Generation::MeteorLake
+        )
+    }
+
+    /// The external sessions and HPD block currently implement Gen12 only.
+    /// Xe-LPG's internal-panel sequence does not validate these registers.
+    pub const fn external_display_supported(self) -> bool {
+        matches!(self, Generation::TigerLake | Generation::AlderLake)
+    }
+
+    /// Whether the backlight PWM install is valid for the
+    /// generation. The install programs the Gen12 BXT-style PWM
+    /// block; MTL's backlight path is owned by the backlight
+    /// composition lane (PR #1037, #947/#949/#951), which flips
+    /// this predicate when the MTL registers land. Keeping it
+    /// separate from `display_supported` lets the MTL modeset
+    /// ship without claiming a backlight it cannot drive.
+    pub const fn backlight_supported(self) -> bool {
         matches!(self, Generation::TigerLake | Generation::AlderLake)
     }
 }
@@ -627,8 +653,8 @@ pub const DEVICE_TABLE: &[DeviceEntry] = &[
     },
     // Arrow Lake (Xe-LPG) — classified Generation::MeteorLake
     // (the silicon and both Linux drivers' binding), announced
-    // under its own name. Identify + announce only, exactly
-    // like the Meteor Lake rows above.
+    // under its own name. Display disposition is exactly the
+    // Meteor Lake rows' above (Xe-LPG display, #1016).
     DeviceEntry {
         name: "intel-gpu-arl-7D41",
         did: ARL_7D41,
@@ -823,8 +849,8 @@ pub struct IntelGpu {
     pub gmd_id: u32,
     pub active_scanout: narf_lib::sync::IrqSafeSpinLock<Option<ActiveScanout>>,
     /// Owned scanout backing, set by probe when the allocation
-    /// and plane programming succeed. `None` on MTL/PTL (display
-    /// skipped) or when allocation failed (logged at probe).
+    /// and plane programming succeed. `None` on PTL (display
+    /// gated off) or when allocation failed (logged at probe).
     pub scanout: Option<ScanoutAllocation>,
 }
 
@@ -1042,8 +1068,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // not scanning), but it no longer panics and it logs
         // each failing step instead of collapsing to silence.
         let mode_opt = if panel_on {
-            // Activate backlight PWM (Gen12 BXT-style registers).
-            narf_drivers_backlight::intel_bl::install(dev.gtt_mmadr);
+            // Activate backlight PWM where the generation's PWM
+            // block is modelled (Gen12 today; MTL's install is
+            // gated on the backlight composition lane, PR #1037).
+            if dev.chip.generation.backlight_supported() {
+                narf_drivers_backlight::intel_bl::install(dev.gtt_mmadr);
+            }
             let mode = crate::intel_gpu_modeset::takeover_display(&dev);
             if mode.is_some() {
                 // The PPS backlight gate opens only with live
@@ -1057,97 +1087,112 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         };
         panel_mode = mode_opt;
 
-        let width = mode_opt.as_ref().map(|m| m.h_active as u32).unwrap_or(1024);
-        let height = mode_opt.as_ref().map(|m| m.v_active as u32).unwrap_or(768);
-        let stride_bytes = padded_stride_bytes(width);
-        let size_bytes = scanout_size_bytes(width, height);
+        // The internal display owns Pipe A from here on
+        // (#1017): external sessions arbitrate the remaining
+        // pipes through `intel_gpu_multipipe` instead of
+        // silently sharing this one. Claimed only when a
+        // firmware pipeline was actually taken over — with no
+        // internal display live, Pipe A stays free for the
+        // first external session, as before multi-pipe support.
+        if mode_opt.is_some() {
+            let _ = crate::intel_gpu_multipipe::claim_pipe(
+                crate::intel_gpu_pipes::Pipe::A,
+                crate::intel_gpu_multipipe::PipeOwner {
+                    ddi: crate::intel_gpu_ddi::Ddi::A,
+                    used_for: crate::intel_gpu_multipipe::PipeUse::InternalPanel,
+                },
+            );
+        }
 
-        match if panel_on {
-            Some(crate::intel_gpu_gtt::alloc_contiguous_scanout(
-                &dev.gtt_mmadr,
-                size_bytes,
-            ))
-        } else {
-            None
-        } {
-            Some(Ok(alloc)) => {
-                let phys_base = alloc.phys_base();
-                dev.scanout = Some(ScanoutAllocation {
-                    gtt_offset: alloc.gtt_offset,
-                    phys_base,
-                    order: alloc.order,
-                    size_bytes: alloc.size_bytes,
-                });
-                *dev.active_scanout.lock() = Some(ActiveScanout {
-                    width,
-                    height,
-                    stride_bytes,
-                    gtt_offset: alloc.gtt_offset,
-                    phys_base,
-                });
-                match crate::intel_gpu_pipes::build_primary_plane(
-                    width as u16,
-                    height as u16,
-                    stride_bytes,
-                    alloc.gtt_offset,
-                    crate::intel_gpu_pipes::PixelFormat::Argb8888,
-                ) {
-                    Ok(prog) => {
-                        let plane_base = crate::intel_gpu_pipes::Pipe::A.base()
-                            + crate::intel_gpu_pipes::PLANE_PRIMARY_OFFSET;
-                        // SAFETY: `dev.gtt_mmadr` is the BAR0 region mapped in
-                        // `bring_up`, and we own the device. `plane_base` is
-                        // Pipe A's primary plane block; every offset is a
-                        // known in-range plane register.
-                        // SAFETY: Valid MMIO bounds or trusted driver environment
-                        unsafe {
-                            dev.gtt_mmadr.write32(
-                                plane_base + crate::intel_gpu_pipes::PLANE_STRIDE_OFFSET,
-                                prog.plane_stride,
-                            );
-                            dev.gtt_mmadr.write32(
-                                plane_base + crate::intel_gpu_pipes::PLANE_SIZE_OFFSET,
-                                prog.plane_size,
-                            );
-                            dev.gtt_mmadr.write32(
-                                plane_base + crate::intel_gpu_pipes::PLANE_OFFSET_OFFSET,
-                                prog.plane_offset,
-                            );
-                            dev.gtt_mmadr.write32(
-                                plane_base + crate::intel_gpu_pipes::PLANE_CTL_OFFSET,
-                                prog.plane_ctl,
-                            );
-                            dev.gtt_mmadr.write32(
-                                plane_base + crate::intel_gpu_pipes::PLANE_SURF_OFFSET,
-                                prog.plane_surf,
-                            );
+        // A powered panel alone does not establish a scanning pipeline.
+        // Allocate and publish only after takeover returned an actual mode.
+        if let Some(mode) = mode_opt {
+            let width = u32::from(mode.h_active);
+            let height = u32::from(mode.v_active);
+            let stride_bytes = padded_stride_bytes(width);
+            let size_bytes = scanout_size_bytes(width, height);
+
+            match crate::intel_gpu_gtt::alloc_contiguous_scanout(&dev.gtt_mmadr, size_bytes) {
+                Ok(alloc) => {
+                    let phys_base = alloc.phys_base();
+                    dev.scanout = Some(ScanoutAllocation {
+                        gtt_offset: alloc.gtt_offset,
+                        phys_base,
+                        order: alloc.order,
+                        size_bytes: alloc.size_bytes,
+                    });
+                    match crate::intel_gpu_pipes::build_primary_plane(
+                        width as u16,
+                        height as u16,
+                        stride_bytes,
+                        alloc.gtt_offset,
+                        crate::intel_gpu_pipes::PixelFormat::Argb8888,
+                    ) {
+                        Ok(prog) => {
+                            let plane_base = crate::intel_gpu_pipes::Pipe::A.base()
+                                + crate::intel_gpu_pipes::PLANE_PRIMARY_OFFSET;
+                            // SAFETY: `dev.gtt_mmadr` is the BAR0 region mapped in
+                            // `bring_up`, and we own the device. `plane_base` is
+                            // Pipe A's primary plane block; every offset is a
+                            // known in-range plane register.
+                            // SAFETY: Valid MMIO bounds or trusted driver environment
+                            unsafe {
+                                dev.gtt_mmadr.write32(
+                                    plane_base + crate::intel_gpu_pipes::PLANE_STRIDE_OFFSET,
+                                    prog.plane_stride,
+                                );
+                                dev.gtt_mmadr.write32(
+                                    plane_base + crate::intel_gpu_pipes::PLANE_SIZE_OFFSET,
+                                    prog.plane_size,
+                                );
+                                dev.gtt_mmadr.write32(
+                                    plane_base + crate::intel_gpu_pipes::PLANE_OFFSET_OFFSET,
+                                    prog.plane_offset,
+                                );
+                                dev.gtt_mmadr.write32(
+                                    plane_base + crate::intel_gpu_pipes::PLANE_CTL_OFFSET,
+                                    prog.plane_ctl,
+                                );
+                                dev.gtt_mmadr.write32(
+                                    plane_base + crate::intel_gpu_pipes::PLANE_SURF_OFFSET,
+                                    prog.plane_surf,
+                                );
+                            }
+                            compiler_fence(Ordering::SeqCst);
+                            *dev.active_scanout.lock() = Some(ActiveScanout {
+                                width,
+                                height,
+                                stride_bytes,
+                                gtt_offset: alloc.gtt_offset,
+                                phys_base,
+                            });
                         }
-                    }
-                    Err(e) => {
-                        use core::fmt::Write as _;
-                        let _ = writeln!(
+                        Err(e) => {
+                            use core::fmt::Write as _;
+                            let _ = writeln!(
                             narf_console::Writer,
                             "intel-gpu: primary-plane build failed: {:?} ({}x{} stride {}) — scanout allocated but plane not reprogrammed",
                             e, width, height, stride_bytes,
                         );
+                        }
                     }
                 }
-            }
-            Some(Err(e)) => {
-                use core::fmt::Write as _;
-                let _ = writeln!(
+                Err(e) => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
                     narf_console::Writer,
                     "intel-gpu: scanout allocation failed: {:?} ({}x{} padded stride {}, {} bytes) — display left on firmware surface",
                     e, width, height, stride_bytes, size_bytes,
                 );
+                }
             }
-            None => {}
         }
     } else {
-        // MTL / PTL: identification is real, the Gen12 display
-        // sequence is not valid on Xe-LPG / Xe3-LPG silicon.
+        // PTL: identification is real, but Xe3-LPD is a
+        // different display IP generation from both Gen12 and
+        // Xe-LPG — no validated sequence exists for it yet.
         log_probe(
-            "display programming skipped — Xe-LPG/Xe3 display engine is tracked separately (#1016)",
+            "display programming skipped — Xe3-LPD display engine is not modelled (Panther Lake gated off in #1016)",
             &device,
         );
     }
@@ -1159,18 +1204,40 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         crate::intel_gpu_edp::enable_psr_for_panel(&dev, &mode);
     }
 
+    // Media-engine inventory (#1022): announce exactly the
+    // execlists media engines the submission path can drive
+    // on this part — the same list `intel_gpu_media` attaches
+    // lazily on first submit.
+    if let Some(rg) = dev.chip_info().generation.region_generation() {
+        let engines = crate::intel_gpu_media::media_engines_for(rg);
+        if !engines.is_empty() {
+            let mut names = alloc::string::String::new();
+            for (i, spec) in engines.iter().enumerate() {
+                if i > 0 {
+                    names.push(' ');
+                }
+                names.push_str(spec.name);
+            }
+            log_probe(&alloc::format!("media engines present: {}", names), &device);
+        }
+    }
+
     let scanout_mode = dev.current_mode();
     // Power management (Q9, #1015) covers the Gen12 register
-    // map — the same predicate the RCS attach uses. Xe-LPG
-    // parts are identified but get no PM until #1016's engine.
-    let pm_supported = dev.chip.generation.region_generation().is_some();
+    // map only. Xe-LPG now has a region map and a display
+    // engine (#1016), but its forcewake/RC6/DMC programming is
+    // not modelled, so MTL still gets no PM.
+    let pm_supported = matches!(
+        dev.chip.generation.region_generation(),
+        Some(RegionGeneration::Gen12)
+    );
     *CONTROLLER.lock() = Some(dev);
 
     // Register with drm_registry. With a live scanout the card
     // carries real KMS mode state (CRTC 1 + mode, encoder 2,
     // eDP connector 3 — the virtio/bochs pattern in lib.rs) and
     // the scanout is published to the framebuffer console;
-    // without one (MTL/PTL gate, allocation failure) the card
+    // without one (PTL gate, allocation failure) the card
     // stays identity-only, as before lane 1.
     let drm_count = crate::drm_registry::count() as u32;
     let card_name = alloc::format!("card{}", drm_count);
@@ -1248,7 +1315,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // generation's display support itself.
     with_controller(|gpu| {
         let window = DpBarWindow(&gpu.gtt_mmadr);
-        crate::intel_gpu_dp::enable_hpd_interrupts(&window);
+        enable_external_hpd(&window, gpu.chip.generation);
     });
     poll_dp_hpd_events();
 
@@ -1309,9 +1376,9 @@ pub fn relight_display(mode: &crate::intel_gpu_modeset::Mode) -> Option<ActiveSc
         format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
     };
     let window = BarWindow(&dev.gtt_mmadr);
-    let applied = crate::intel_gpu_modeset::Modeset::new(&window, crate::intel_gpu_ddi::Ddi::A)
-        .modeset(&fb, Some(mode))
-        .ok()?;
+    let applied =
+        crate::intel_gpu_modeset::modeset_display(&window, dev.chip.generation, &fb, Some(mode))
+            .ok()?;
     let scanout = ActiveScanout {
         width: u32::from(applied.h_active),
         height: u32::from(applied.v_active),
@@ -1434,8 +1501,11 @@ pub fn with_controller<R>(f: impl FnOnce(&IntelGpu) -> R) -> Option<R> {
 // free path, so a session allocation is retained and reused
 // across reconnects while it fits), and scanout publication
 // through the same ACTIVE + observer protocol as the takeover
-// path. The single-pipe orchestrator means an external session
-// owns Pipe A while it is live; the last HPD event wins.
+// path. Since #1017 a session claims its pipe from
+// `intel_gpu_multipipe` and allocates in that pipe's GGTT
+// window, so an internal panel and external sessions scan out
+// concurrently; the fb-console publication slot is still
+// single, so the last HPD event wins it.
 
 /// `MmioWindow` over the controller's BAR0 mapping (same
 /// adapter shape as the DP Alt-Mode bridge).
@@ -1488,7 +1558,7 @@ pub fn poll_dp_hpd_events() {
     loop {
         let event = with_controller(|gpu| {
             let window = DpBarWindow(&gpu.gtt_mmadr);
-            crate::intel_gpu_dp::poll_hpd_event(&window)
+            poll_external_hpd(&window, gpu.chip.generation)
         });
         match event {
             Some(Some(event)) => handle_dp_hpd_event(event),
@@ -1497,10 +1567,57 @@ pub fn poll_dp_hpd_events() {
     }
 }
 
+fn enable_external_hpd<M: crate::intel_gpu_aux::MmioWindow>(mmio: &M, generation: Generation) {
+    if generation.external_display_supported() {
+        crate::intel_gpu_dp::enable_hpd_interrupts(mmio);
+    }
+}
+
+fn poll_external_hpd<M: crate::intel_gpu_aux::MmioWindow>(
+    mmio: &M,
+    generation: Generation,
+) -> Option<crate::intel_gpu_dp::HpdEvent> {
+    if !generation.external_display_supported() {
+        return None;
+    }
+    crate::intel_gpu_dp::poll_hpd_event(mmio)
+}
+
 fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
     use crate::intel_gpu_dp::HpdEvent;
     match event {
         HpdEvent::Connected(ddi) => {
+            // An MST branch device (hub / dock / daisy-chain
+            // monitor) gets the MST session (#1017): if the
+            // device advertises MST and a stream comes up, the
+            // SST path never runs for this connector. Anything
+            // else — an SST sink, or an MST attempt that found
+            // no usable sink — falls through to the SST connect.
+            if mst_session_ddi() == Some(ddi) {
+                // MST session already live on this connector; a
+                // repeat connect event changes nothing.
+                return;
+            }
+            if mst_connect(ddi) {
+                let stored = {
+                    let session = MST_SESSION.lock();
+                    session.as_ref().and_then(|s| {
+                        s.streams
+                            .first()
+                            .map(|g| (g.alloc, g.fb, g.mode.h_active, g.mode.v_active))
+                    })
+                };
+                if let Some((alloc, fb, width, height)) = stored {
+                    publish_scanout(Some(narf_graphics_driver::generic::GenericFb::new(
+                        alloc.phys_base,
+                        width as u32,
+                        height as u32,
+                        fb.stride_bytes,
+                        32,
+                    )));
+                }
+                return;
+            }
             if let Some(conn) = dp_connect(ddi) {
                 // Publish from the stored session state (the
                 // retained allocation + framebuffer the session
@@ -1538,12 +1655,21 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
             }
         }
         HpdEvent::Disconnected(ddi) => {
+            if mst_session_ddi() == Some(ddi) {
+                mst_disconnect(ddi);
+                publish_scanout(None);
+                return;
+            }
             let session = DP_SESSION.lock().take();
             if let Some(state) = session {
                 if state.conn.ddi == ddi {
                     with_controller(|gpu| {
                         let window = DpBarWindow(&gpu.gtt_mmadr);
                         crate::intel_gpu_dp::disconnect(&window, &state.conn);
+                        // Hand the pipe back and re-split the
+                        // DBUF pool across the survivors.
+                        crate::intel_gpu_multipipe::release_pipe(state.conn.pipe, ddi);
+                        crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
                     });
                     publish_scanout(None);
                     return;
@@ -1564,6 +1690,14 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
             }
         }
         HpdEvent::RetrainRequired(ddi) => {
+            if mst_session_ddi() == Some(ddi) {
+                // MST links don't revalidate per-lane status the
+                // SST way; branch notifications are the change
+                // channel. Drain them (they're also how a sink
+                // disappearing mid-session first surfaces).
+                mst_poll_notifications(ddi);
+                return;
+            }
             // Snapshot under the session lock, retrain against
             // the controller, then store back — never hold
             // DP_SESSION across `with_controller` (the connect
@@ -1578,7 +1712,14 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
             if let Some((conn, fb)) = current {
                 let updated = with_controller(|gpu| {
                     let window = DpBarWindow(&gpu.gtt_mmadr);
-                    crate::intel_gpu_dp::retrain(&window, &conn, &fb).ok()
+                    let out = crate::intel_gpu_dp::retrain(&window, &conn, &fb).ok();
+                    if out.is_some() {
+                        // The retrained modeset wrote the
+                        // single-pipe watermark shape; restore
+                        // the multi-pipe DBUF split.
+                        crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
+                    }
+                    out
                 });
                 if let Some(Some(new_conn)) = updated {
                     let mut session = DP_SESSION.lock();
@@ -1594,22 +1735,49 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
 }
 
 /// Run one external-DP connect against the probed controller:
-/// probe the sink over AUX, allocate its scanout, activate.
-/// On success the session state is stored for disconnect /
-/// retrain handling.
+/// probe the sink over AUX, claim a pipe, allocate its scanout
+/// in the pipe's GGTT window, activate on that pipe. On
+/// success the session state is stored for disconnect /
+/// retrain handling. The claim is re-entrant per DDI, so a
+/// repeat connect event for a live session reuses its pipe.
 fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpConnection> {
     with_controller(|gpu| {
-        if !gpu.chip.generation.display_supported() {
+        if !gpu.chip.generation.external_display_supported() {
             return None;
         }
         let window = DpBarWindow(&gpu.gtt_mmadr);
         let probe = crate::intel_gpu_dp::probe_sink(&window, ddi).ok()?;
+        let pipe =
+            crate::intel_gpu_multipipe::claim_pipe_for(crate::intel_gpu_multipipe::PipeOwner {
+                ddi,
+                used_for: crate::intel_gpu_multipipe::PipeUse::ExternalSst,
+            })?;
+        // When this claim lights a second (or third) pipe, the
+        // session modesets with its DBUF share and the pipes
+        // already live are reprogrammed to theirs afterwards.
+        let share = {
+            let active = crate::intel_gpu_multipipe::active_pipes();
+            if active.len() >= 2 {
+                crate::intel_gpu_multipipe::share_for(&active, pipe)
+            } else {
+                None
+            }
+        };
         let width = probe.mode.h_active as u32;
         let height = probe.mode.v_active as u32;
         let stride_bytes = padded_stride_bytes(width);
         let size_bytes = scanout_size_bytes(width, height);
-        let alloc =
-            crate::intel_gpu_gtt::alloc_contiguous_scanout(&gpu.gtt_mmadr, size_bytes).ok()?;
+        let alloc = match crate::intel_gpu_gtt::alloc_contiguous_scanout_at(
+            &gpu.gtt_mmadr,
+            crate::intel_gpu_multipipe::scanout_gtt_offset(pipe),
+            size_bytes,
+        ) {
+            Ok(alloc) => alloc,
+            Err(_) => {
+                crate::intel_gpu_multipipe::release_pipe(pipe, ddi);
+                return None;
+            }
+        };
         let alloc = ScanoutAllocation {
             gtt_offset: alloc.gtt_offset,
             phys_base: alloc.phys_base(),
@@ -1621,7 +1789,14 @@ fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpC
             stride_bytes,
             format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
         };
-        let conn = crate::intel_gpu_dp::activate(&window, &probe, &fb).ok()?;
+        let conn = match crate::intel_gpu_dp::activate_on_pipe(&window, &probe, &fb, pipe, share) {
+            Ok(conn) => conn,
+            Err(_) => {
+                crate::intel_gpu_multipipe::release_pipe(pipe, ddi);
+                return None;
+            }
+        };
+        crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
         *DP_SESSION.lock() = Some(DpSessionState {
             conn: conn.clone(),
             fb,
@@ -1639,7 +1814,7 @@ fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpC
 /// not answer — an HDMI sink never answers AUX.
 fn hdmi_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_hdmi::HdmiConnection> {
     with_controller(|gpu| {
-        if !gpu.chip.generation.display_supported() {
+        if !gpu.chip.generation.external_display_supported() {
             return None;
         }
         let window = DpBarWindow(&gpu.gtt_mmadr);
@@ -1670,6 +1845,223 @@ fn hdmi_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_hdmi:
         Some(conn)
     })
     .flatten()
+}
+
+// ── DP MST session (lane Q11, #1017) ─────────────────────────
+//
+// The MST counterpart of the SST glue above: `intel_gpu_mst`
+// owns the session logic (topology, payload allocation,
+// per-stream modesets); this glue owns the controller-bound
+// parts — pipe claims, per-pipe scanout windows and
+// allocations, DBUF reprogramming as the active set changes,
+// and fb-console publication of the first stream (the
+// publication slot is single; see the SST section's note).
+
+/// Per-stream glue state: the retained allocation and
+/// framebuffer for one live MST stream.
+struct MstStreamGlue {
+    sink: crate::dp_mst_mgr::Sink,
+    mode: crate::intel_gpu_modeset::Mode,
+    fb: crate::intel_gpu_modeset::Framebuffer,
+    alloc: ScanoutAllocation,
+}
+
+/// Live MST session state for one DDI.
+struct MstSessionState {
+    link: crate::intel_gpu_mst::MstLink,
+    streams: alloc::vec::Vec<MstStreamGlue>,
+}
+
+static MST_SESSION: IrqSafeSpinLock<Option<MstSessionState>> = IrqSafeSpinLock::new(None);
+
+/// The DDI the live MST session sits on, if any.
+fn mst_session_ddi() -> Option<crate::intel_gpu_ddi::Ddi> {
+    MST_SESSION.lock().as_ref().map(|s| s.link.ddi())
+}
+
+/// Try to bring an MST session up on `ddi`. Returns `false`
+/// (leaving no trace — MST is stopped again, no pipe claimed)
+/// when the device doesn't advertise MST, the topology probe
+/// fails, or no sink stream could be lit; the caller then
+/// falls back to the SST connect.
+fn mst_connect(ddi: crate::intel_gpu_ddi::Ddi) -> bool {
+    use crate::dp_aux::AuxChannel as _;
+    let state = with_controller(|gpu| {
+        if !gpu.chip.generation.external_display_supported() {
+            return None;
+        }
+        let window = DpBarWindow(&gpu.gtt_mmadr);
+        // Capability gate: DP 1.2+ and MSTM_CAP set. Anything
+        // less is an SST device and not this path's business.
+        let mut aux = crate::intel_gpu_aux::IntelAux::new(&window, ddi);
+        let caps = crate::dp_link_training::read_caps(&mut aux).ok()?;
+        let mut raw_caps = [0u8; 16];
+        aux.dpcd_read(0, &mut raw_caps).ok()?;
+        let mut mstm_cap = [0u8; 1];
+        aux.dpcd_read(crate::dp_mst_mgr::MSTM_CAP, &mut mstm_cap)
+            .ok()?;
+        if caps.dpcd_rev < 0x12 || mstm_cap[0] & 1 == 0 {
+            return None;
+        }
+
+        let mut maux = crate::intel_gpu_mst::IntelMstAux::new(&window, ddi);
+        let mut link = crate::intel_gpu_mst::MstLink::new(ddi);
+        if link.connect(&mut maux, caps, &raw_caps).is_err() {
+            return None;
+        }
+        if link.probe_topology(&mut maux).is_err() {
+            link.disconnect(&mut maux);
+            return None;
+        }
+        let sinks = link.topology().map(|t| t.sinks()).unwrap_or_default();
+        let mut streams: alloc::vec::Vec<MstStreamGlue> = alloc::vec::Vec::new();
+        for sink in sinks {
+            let Some(pipe) =
+                crate::intel_gpu_multipipe::claim_any_pipe(crate::intel_gpu_multipipe::PipeOwner {
+                    ddi,
+                    used_for: crate::intel_gpu_multipipe::PipeUse::ExternalMst,
+                })
+            else {
+                break;
+            };
+            let mode = match link.sink_mode(&mut maux, sink) {
+                Ok(mode) => mode,
+                Err(_) => {
+                    crate::intel_gpu_multipipe::release_pipe(pipe, ddi);
+                    continue;
+                }
+            };
+            let width = mode.h_active as u32;
+            let height = mode.v_active as u32;
+            let stride_bytes = padded_stride_bytes(width);
+            let size_bytes = scanout_size_bytes(width, height);
+            let alloc = match crate::intel_gpu_gtt::alloc_contiguous_scanout_at(
+                &gpu.gtt_mmadr,
+                crate::intel_gpu_multipipe::scanout_gtt_offset(pipe),
+                size_bytes,
+            ) {
+                Ok(alloc) => ScanoutAllocation {
+                    gtt_offset: alloc.gtt_offset,
+                    phys_base: alloc.phys_base(),
+                    order: alloc.order,
+                    size_bytes: alloc.size_bytes,
+                },
+                Err(_) => {
+                    crate::intel_gpu_multipipe::release_pipe(pipe, ddi);
+                    continue;
+                }
+            };
+            let fb = crate::intel_gpu_modeset::Framebuffer {
+                phys_addr: alloc.gtt_offset as u64,
+                stride_bytes,
+                format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
+            };
+            let share = {
+                let active = crate::intel_gpu_multipipe::active_pipes();
+                if active.len() >= 2 {
+                    crate::intel_gpu_multipipe::share_for(&active, pipe)
+                } else {
+                    None
+                }
+            };
+            match link.add_stream(&window, &mut maux, sink, mode, pipe, &fb, share) {
+                Ok(_) => {
+                    streams.push(MstStreamGlue {
+                        sink,
+                        mode,
+                        fb,
+                        alloc,
+                    });
+                    crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
+                }
+                Err(_) => {
+                    crate::intel_gpu_multipipe::release_pipe(pipe, ddi);
+                }
+            }
+        }
+        if streams.is_empty() {
+            // Nothing lit: not an MST session. Stop MST so the
+            // branch presents as an SST device to the fallback.
+            link.disconnect(&mut maux);
+            return None;
+        }
+        Some(MstSessionState { link, streams })
+    })
+    .flatten();
+    match state {
+        Some(state) => {
+            *MST_SESSION.lock() = Some(state);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Tear the MST session on `ddi` down: streams in reverse
+/// bring-up order (payloads deallocated, pipes torn down),
+/// MST off, pipes released.
+fn mst_disconnect(ddi: crate::intel_gpu_ddi::Ddi) {
+    let state = {
+        let mut session = MST_SESSION.lock();
+        match session.as_ref() {
+            Some(s) if s.link.ddi() == ddi => session.take(),
+            _ => None,
+        }
+    };
+    let Some(mut state) = state else { return };
+    let pipes: alloc::vec::Vec<crate::intel_gpu_pipes::Pipe> =
+        state.link.streams().iter().map(|s| s.pipe).collect();
+    let sinks: alloc::vec::Vec<crate::dp_mst_mgr::Sink> =
+        state.streams.iter().map(|g| g.sink).collect();
+    with_controller(|gpu| {
+        let window = DpBarWindow(&gpu.gtt_mmadr);
+        let mut maux = crate::intel_gpu_mst::IntelMstAux::new(&window, ddi);
+        for sink in sinks.iter().rev() {
+            let _ = state.link.remove_stream(&window, &mut maux, *sink);
+        }
+        state.link.disconnect(&mut maux);
+        for pipe in pipes {
+            crate::intel_gpu_multipipe::release_pipe(pipe, ddi);
+        }
+        crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
+    });
+}
+
+/// Drain branch notifications for the MST session on `ddi`
+/// (the RetrainRequired route). Events are logged; acting on
+/// a vanished sink beyond the log is the session layer's next
+/// step, not this glue's.
+fn mst_poll_notifications(ddi: crate::intel_gpu_ddi::Ddi) {
+    use core::fmt::Write as _;
+    let state = {
+        let mut session = MST_SESSION.lock();
+        match session.as_ref() {
+            Some(s) if s.link.ddi() == ddi => session.take(),
+            _ => None,
+        }
+    };
+    let Some(mut state) = state else { return };
+    with_controller(|gpu| {
+        let window = DpBarWindow(&gpu.gtt_mmadr);
+        let mut maux = crate::intel_gpu_mst::IntelMstAux::new(&window, ddi);
+        if let Ok(events) = state.link.poll_notifications(&mut maux) {
+            for event in events {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "intel-gpu: MST event on DDI {:?}: {:?}",
+                    ddi,
+                    event,
+                );
+            }
+        }
+    });
+    // Restore the session (teardown races are the HPD
+    // sequencer's problem, exactly as in the SST retrain path:
+    // the store-back is unconditional).
+    let mut session = MST_SESSION.lock();
+    if session.is_none() {
+        *session = Some(state);
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -1850,18 +2242,68 @@ pub mod tests {
     }
     kernel_test_in!("drivers/gpu/intel_gpu", smoke_probe_stride_1366_regression);
 
-    fn smoke_display_gate_is_gen12_only() -> TestResult {
+    fn smoke_display_generation_gates() -> TestResult {
         if !Generation::TigerLake.display_supported() || !Generation::AlderLake.display_supported()
         {
             return TestResult::Fail("Gen12 generations must allow display programming");
         }
-        if Generation::MeteorLake.display_supported() || Generation::PantherLake.display_supported()
+        // #1016: Meteor Lake's Xe-LPG sequence is implemented, so
+        // the gate opens for MTL. Panther Lake (Xe3-LPD, a
+        // different display IP) must stay gated off.
+        if !Generation::MeteorLake.display_supported() {
+            return TestResult::Fail("MTL must allow display programming (#1016)");
+        }
+        if Generation::PantherLake.display_supported() {
+            return TestResult::Fail("PTL must skip display programming (Xe3-LPD not modelled)");
+        }
+        if !Generation::TigerLake.external_display_supported()
+            || !Generation::AlderLake.external_display_supported()
+            || Generation::MeteorLake.external_display_supported()
+            || Generation::PantherLake.external_display_supported()
         {
-            return TestResult::Fail("MTL/PTL must skip display programming in this lane");
+            return TestResult::Fail("external display sequences must remain Gen12-only");
+        }
+        // Backlight stays Gen12-only until the composition lane
+        // (PR #1037) lands the MTL PWM path.
+        if !Generation::TigerLake.backlight_supported()
+            || !Generation::AlderLake.backlight_supported()
+            || Generation::MeteorLake.backlight_supported()
+            || Generation::PantherLake.backlight_supported()
+        {
+            return TestResult::Fail("backlight gate must be Gen12-only pending #1037");
+        }
+        // Region generations follow the same split.
+        if Generation::MeteorLake.region_generation() != Some(RegionGeneration::XeLpg)
+            || Generation::PantherLake.region_generation().is_some()
+        {
+            return TestResult::Fail("region generation map wrong for MTL/PTL");
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu/intel_gpu", smoke_display_gate_is_gen12_only);
+    kernel_test_in!("drivers/gpu/intel_gpu", smoke_display_generation_gates);
+
+    fn smoke_unsupported_external_hpd_never_touches_mmio() -> TestResult {
+        struct NoAccess;
+        impl crate::intel_gpu_aux::MmioWindow for NoAccess {
+            fn read32(&self, _: u64) -> u32 {
+                panic!("unsupported HPD generation read MMIO")
+            }
+            fn write32(&self, _: u64, _: u32) {
+                panic!("unsupported HPD generation wrote MMIO")
+            }
+        }
+        for generation in [Generation::MeteorLake, Generation::PantherLake] {
+            enable_external_hpd(&NoAccess, generation);
+            if poll_external_hpd(&NoAccess, generation).is_some() {
+                return TestResult::Fail("unsupported HPD generation must report no events");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu",
+        smoke_unsupported_external_hpd_never_touches_mmio
+    );
 
     /// Arrow Lake classification (#1023): the product name says
     /// "new generation", the silicon says Xe-LPG. Linux binds
@@ -1889,14 +2331,14 @@ pub mod tests {
             if info.generation != Generation::MeteorLake {
                 return TestResult::Fail("Arrow Lake must classify as MeteorLake (Xe-LPG)");
             }
-            // Current disposition: identify + announce only —
-            // no display programming, no Stage-0 region map,
-            // exactly like the Meteor Lake rows.
-            if info.generation.display_supported() {
-                return TestResult::Fail("Arrow Lake must not arm display programming");
+            // Disposition follows the Meteor Lake rows exactly:
+            // since #1016 that is the Xe-LPG display sequence and
+            // region map — never the Gen12 one.
+            if !info.generation.display_supported() {
+                return TestResult::Fail("Arrow Lake must arm the Xe-LPG display (#1016)");
             }
-            if info.generation.region_generation().is_some() {
-                return TestResult::Fail("Arrow Lake must not claim a Stage-0 region map");
+            if info.generation.region_generation() != Some(RegionGeneration::XeLpg) {
+                return TestResult::Fail("Arrow Lake must claim the Xe-LPG region map");
             }
         }
         // No bleed across the shared 0x7Dxx space: the sibling

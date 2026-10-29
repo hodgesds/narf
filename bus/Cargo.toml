@@ -22,6 +22,7 @@ narf-interrupts   = { path = "../interrupts" }
 narf-io           = { path = "../io" }
 narf-net          = { path = "../net" }
 narf-time         = { path = "../time" }
+narf-firmware-fdt = { path = "../firmware/fdt" }
 narf-scheduler    = { path = "../scheduler" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 

@@ -817,7 +817,11 @@ async fn dispatch_after_address(
         // IAD-led composite).
         if crate::cdc_acm::find_acm_interfaces(&cfg_blob).is_some()
             && crate::cdc_acm::try_bind_cdc_acm_already_addressed(
-                xhci_dev, slot_id, &cfg_blob, speed,
+                xhci_dev,
+                slot_id,
+                &cfg_blob,
+                speed,
+                parent_hub_idx.map(|idx| (idx, port)),
             )
             .await
             .is_ok()
@@ -912,7 +916,12 @@ async fn dispatch_after_address(
         // bind as ACM above) and before the WBDI sniff.
         if crate::serial::identify(dev_vid, dev_pid).is_some()
             && crate::serial::port::try_bind_serial_already_addressed(
-                xhci_dev, slot_id, dev_vid, dev_pid, &cfg_blob,
+                xhci_dev,
+                slot_id,
+                dev_vid,
+                dev_pid,
+                &cfg_blob,
+                parent_hub_idx.map(|idx| (idx, port)),
             )
             .await
             .is_ok()

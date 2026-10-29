@@ -111,8 +111,8 @@ impl SerialRing {
     /// complete — an unfinished chunk is retried, not dropped.
     pub fn peek(&self, buf: &mut [u8]) -> usize {
         let n = buf.len().min(self.count);
-        for i in 0..n {
-            buf[i] = self.buf[(self.head + i) % self.buf.len()];
+        for (i, b) in buf[..n].iter_mut().enumerate() {
+            *b = self.buf[(self.head + i) % self.buf.len()];
         }
         n
     }

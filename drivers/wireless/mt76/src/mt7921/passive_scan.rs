@@ -84,13 +84,15 @@ pub(super) struct NativeRx<'a> {
     pub ampdu: bool,
     pub wcid: u16,
     pub tid: u8,
+    /// RXD2 `MT_RXD2_NORMAL_FRAG`.
+    pub fragment: bool,
     /// Optional original P-RXV DW0; absence is not a fabricated PHY rate.
     pub phy: Option<u32>,
 }
 
 pub(super) fn rx_native(packet: &[u8]) -> Option<NativeRx<'_>> {
     let native = rx_native_with_amsdu(packet)?;
-    (native.amsdu == 0).then_some(native)
+    (native.amsdu == 0 && !native.fragment).then_some(native)
 }
 
 /// Decode ownership/security metadata without admitting A-MSDU payloads to
@@ -107,13 +109,23 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
     let r2 = word(packet, 8)?;
     let frequency = (word(packet, 12)? >> 8) & 0x1ff;
     let channel = u8::try_from(frequency).ok()?;
-    super::super::channel::band(channel)?;
+    // RXD3 CH_FREQ, kept raw: 6 GHz values (181..) decode through
+    // mt792x_get_status_freq_info and are compared against rx_channel().
+    super::super::channel::from_rx_channel(channel)?;
     let r4 = word(packet, 16)?;
     let cipher = (r1 >> 16) & 0x1f;
     if !matches!(cipher, 0 | 4) // MT_CIPHER_NONE / MT_CIPHER_AES_CCMP
         || r1 & (0x3f << 23) != 0
-        || r2 & ((1 << 13) | (7 << 23) | (1 << 27)) != 0
+        || r2 & ((1 << 13) | (7 << 23)) != 0
     {
+        return None;
+    }
+    // MT_RXD2_NORMAL_FRAG: a fragment whose CCMP PN mt7921_mac_fill_rx hands
+    // to mac80211 for sequential validation. Only the station defragmenter
+    // consumes these; scan/auth/EAPOL paths (rx_native) never see them, and
+    // hardware A-MSDU deaggregation of a fragment is not a valid layout.
+    let fragment = r2 & (1 << 27) != 0;
+    if fragment && word(packet, 16)? & 3 != 0 {
         return None;
     }
     let mut offset = 24usize;
@@ -149,6 +161,7 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
         ampdu: r2 & (1 << 30) == 0, // MT_RXD2_NORMAL_NON_AMPDU.
         wcid: (r1 & 0x3ff) as u16,
         tid: ((r2 >> 16) & 15) as u8,
+        fragment,
         phy,
         ccmp: if cipher == 4 {
             Some(CcmpRx {
@@ -171,10 +184,11 @@ pub(super) fn beacon(packet: &[u8], nss: u8) -> Option<ScanBss> {
     let r1 = word(packet, 4)?;
     let r3 = word(packet, 12)?;
     let frequency = (r3 >> 8) & 0x1ff;
-    let channel = frequency as u8;
-    if frequency & 0x100 != 0 || super::super::channel::band(channel).is_none() {
+    if frequency & 0x100 != 0 {
         return None;
     }
+    // mt792x_get_status_freq_info: 6 GHz beacons arrive with CH_FREQ > 180.
+    let (band, channel) = super::super::channel::from_rx_channel(frequency as u8)?;
     let mut offset = 24usize;
     let mut signal = None;
     for (flag, size) in [(14, 16), (11, 16), (12, 8)] {
@@ -242,6 +256,8 @@ pub(super) fn beacon(packet: &[u8], nss: u8) -> Option<ScanBss> {
         bssid,
         ssid: ssid?,
         channel,
+        band: (band == super::super::channel::Band::Ghz6)
+            .then_some(narf_wireless::association::channel::Band::Ghz6),
         signal_dbm: signal,
         capability: u16::from_le_bytes([frame[34], frame[35]]),
         beacon_interval: u16::from_le_bytes([frame[32], frame[33]]),
@@ -256,7 +272,7 @@ pub(super) fn scan_request(sequence: u8, channels: &[u8]) -> Result<Vec<u8>, Err
         || channels.len() > 64
         || channels
             .iter()
-            .any(|ch| super::super::channel::band(*ch).is_none())
+            .any(|ch| super::super::channel::from_rx_channel(*ch).is_none())
         || channels
             .iter()
             .enumerate()
@@ -280,10 +296,13 @@ pub(super) fn scan_request(sequence: u8, channels: &[u8]) -> Result<Vec<u8>, Err
         } else {
             830 + 2 * (i - 32)
         };
-        body[offset] = super::super::channel::band(*channel)
-            .ok_or(Error::Bounds)?
-            .scan_tag();
-        body[offset + 1] = *channel;
+        // Scan channel ids are RXD CH_FREQ values (`channel::rx_channel`):
+        // 6 GHz entries carry band 3 and the 6 GHz channel number
+        // (mt76_connac_mcu_hw_scan, mt76_connac_mcu.c:1820-1832).
+        let (band, number) =
+            super::super::channel::from_rx_channel(*channel).ok_or(Error::Bounds)?;
+        body[offset] = band.scan_tag();
+        body[offset + 1] = number;
     }
     body[1110..1116].fill(255);
     Ok(body)
@@ -329,6 +348,31 @@ pub(super) fn active_scan_request_with_ies(
 
 struct ActiveScan {
     permissions: Vec<(u8, super::super::association::TxPermission)>,
+}
+
+/// The scan channel id (`channel::rx_channel`) of a scan result.
+pub(super) fn scan_id(bss: &ScanBss) -> Option<u8> {
+    if super::super::association::is_six_ghz(bss) {
+        super::super::channel::rx_channel(super::super::channel::Band::Ghz6, bss.channel)
+    } else {
+        super::super::channel::band(bss.channel).map(|_| bss.channel)
+    }
+}
+
+/// `mt76_connac_mcu_set_channel_domain` with the 6 GHz sband appended
+/// (`n_6ch`, mt76_connac_mcu.c:110-160), every channel NO_IR. Only scans
+/// that include 6 GHz channels publish it; others keep `passive_domain`.
+fn passive_domain_6ghz(info: RadioInfo) -> Vec<u8> {
+    let mut domain = passive_domain(info);
+    let six: Vec<u8> = super::super::channel::channels_6ghz().collect();
+    domain[10] = six.len() as u8;
+    for channel in six {
+        let mut entry = [0u8; 8];
+        entry[..2].copy_from_slice(&u16::from(channel).to_le_bytes());
+        entry[4..8].copy_from_slice(&2u32.to_le_bytes()); // Linux NO_IR.
+        domain.extend_from_slice(&entry);
+    }
+    domain
 }
 
 fn passive_domain(info: RadioInfo) -> Vec<u8> {
@@ -407,6 +451,19 @@ impl ActiveScan {
     }
 }
 
+/// Unassociated station `BSS_INFO_UPDATE` basic TLV. `active = false` is the
+/// first half of `mt76_connac_mcu_uni_add_dev(.., enable = false)`.
+pub(super) fn station_bss_record(active: bool) -> [u8; 36] {
+    let mut bss = [0u8; 36];
+    bss[6..8].copy_from_slice(&32u16.to_le_bytes());
+    bss[8] = u8::from(active);
+    bss[12..16].copy_from_slice(&0x10001u32.to_le_bytes()); // station/infra
+    bss[16] = 1; // initial connection state
+    bss[24..26].copy_from_slice(&19u16.to_le_bytes()); // reserved BMC WCID
+    bss[30..32].copy_from_slice(&19u16.to_le_bytes());
+    bss
+}
+
 impl<B: Backend> Session<B> {
     pub(super) async fn notify(&mut self, command: Command, body: &[u8]) -> Result<(), Error> {
         self.seq = self.seq % 15 + 1;
@@ -418,13 +475,7 @@ impl<B: Backend> Session<B> {
         super::super::cmd::encode_uni_dev_info_update(0, 0, true, info.capabilities.mac, &mut dev)
             .ok_or(Error::Bounds)?;
         self.exchange(Command::Unified { id: 1 }, &dev).await?;
-        let mut bss = [0u8; 36];
-        bss[6..8].copy_from_slice(&32u16.to_le_bytes());
-        bss[8] = 1; // active
-        bss[12..16].copy_from_slice(&0x10001u32.to_le_bytes()); // station/infra
-        bss[16] = 1; // initial connection state
-        bss[24..26].copy_from_slice(&19u16.to_le_bytes()); // reserved BMC WCID
-        bss[30..32].copy_from_slice(&19u16.to_le_bytes());
+        let bss = station_bss_record(true);
         self.exchange(Command::Unified { id: 2 }, &bss).await?;
         // Every exposed band remains NO_IR during passive scan. Association
         // installs a separate authenticated host policy before transmission.
@@ -527,11 +578,23 @@ impl<B: Backend> Session<B> {
             _ => return Err(Error::Busy),
         };
         if channels.iter().any(|channel| {
-            super::super::channel::band(*channel)
-                .is_none_or(|band| info.capabilities.phy.bands & band.capability() == 0)
+            match super::super::channel::from_rx_channel(*channel) {
+                // MT_NIC_CAP_6G gates the 6 GHz band.
+                Some((super::super::channel::Band::Ghz6, _)) => {
+                    !super::super::six_ghz::qualified(info)
+                }
+                Some((band, _)) => info.capabilities.phy.bands & band.capability() == 0,
+                None => true,
+            }
         }) {
             return Err(Error::InvalidIdentity);
         }
+        // 6 GHz channels are only ever scanned passively (ActiveScan has no
+        // 6 GHz grant and refuses them above), under a NO_IR 6 GHz domain.
+        let six = channels.iter().any(|&channel| {
+            super::super::channel::from_rx_channel(channel)
+                .is_some_and(|(band, _)| band == super::super::channel::Band::Ghz6)
+        });
         if let Some(active) = &active {
             for (_, permission) in &active.permissions {
                 permission
@@ -608,6 +671,16 @@ impl<B: Backend> Session<B> {
                 // Scan is the first autonomous probe-producing command.
                 active.current(&policy()?, channels)?;
             }
+            if six {
+                self.notify(
+                    Command::Ce {
+                        id: 0x0f,
+                        query: false,
+                    },
+                    &passive_domain_6ghz(info),
+                )
+                .await?;
+            }
             // Discard bounded stale completions before this scan's command.
             self.events.retain(|event| event.get(28) != Some(&0x0d));
             self.stage(Stage::ScanWait);
@@ -639,14 +712,12 @@ impl<B: Backend> Session<B> {
                         report.ignored = report.ignored.saturating_add(1);
                         continue;
                     };
-                    if !channels.contains(&bss.channel) {
+                    if scan_id(&bss).is_none_or(|id| !channels.contains(&id)) {
                         continue;
                     }
-                    if let Some(old) = report
-                        .bss
-                        .iter_mut()
-                        .find(|old| old.bssid == bss.bssid && old.channel == bss.channel)
-                    {
+                    if let Some(old) = report.bss.iter_mut().find(|old| {
+                        old.bssid == bss.bssid && old.channel == bss.channel && old.band == bss.band
+                    }) {
                         if !bss.ssid.is_empty() || old.ssid.is_empty() {
                             *old = bss;
                         }
@@ -679,7 +750,7 @@ impl<B: Backend> Session<B> {
                 Ok(None)
             })
             .await?;
-            if active.is_some() {
+            if active.is_some() || six {
                 // Probe permission belongs to this scan, not the idle VIF.
                 // Passive follow-up scans inherit a NO_IR-only domain.
                 self.notify(

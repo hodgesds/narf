@@ -395,10 +395,13 @@ fn aux_channel(vbios: &[u8], uid: u8, dcn: u32, count: u8) -> Result<u8, Error> 
     let (register, shift) = gpio(vbios, uid)?;
     let first = dcn.checked_add(GPIO_DDC1_A).ok_or(Error::Invalid)?;
     let relative = register.checked_sub(first).ok_or(Error::Unsupported)?;
-    // DC_GPIO_DDCnCLK_A is bit 0. The DATA bit (8) is not a clock pin.
+    // The LUT identifies a DDC pair using either its CLOCK or DATA pin.
+    // RX 6750 XT VBIOS uses DATA (bit 8). Linux hw_translate_dcn30 maps
+    // the register to the pair; DdcHandle creates both pins independently.
     // linux-lit: 0=DC_GPIO_DDC1_A__DC_GPIO_DDC1CLK_A__SHIFT@dcn
+    // linux-lit: 8=DC_GPIO_DDC1_A__DC_GPIO_DDC1DATA_A__SHIFT@dcn
     // linux-lit: 4=mmDC_GPIO_DDC2_A@dcn - mmDC_GPIO_DDC1_A@dcn
-    if shift != 0 || relative % 4 != 0 || relative / 4 >= u32::from(count) {
+    if !matches!(shift, 0 | 8) || relative % 4 != 0 || relative / 4 >= u32::from(count) {
         return Err(Error::Unsupported);
     }
     Ok((relative / 4) as u8) // linux-lit: 4=mmDC_GPIO_DDC2_A@dcn - mmDC_GPIO_DDC1_A@dcn

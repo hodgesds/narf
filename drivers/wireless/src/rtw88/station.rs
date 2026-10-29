@@ -90,6 +90,8 @@ enum Kind {
     Decline,
     Ba,
     TxBa,
+    /// Broadcast software-scan Probe Request: no ACK, so no CCX report.
+    Probe,
 }
 struct Pending {
     id: u64,
@@ -123,6 +125,16 @@ pub(super) struct State {
     rx_ba: super::rx_ba::Table,
     tx_ba_grant: Option<Arc<super::tx_ba_power::Grant>>,
     protection: Option<Arc<super::protection::Grant>>,
+    /// Bound N2xC TX coding (`coding`, tag `C`) and its admitted flags.
+    coding: Option<(Arc<super::qualification::Grant>, u8)>,
+    /// Firmware RA_INFO still carries LDPC after a coding downgrade.
+    coding_restore: bool,
+    /// Bound N2xF DATA rate fallback (`fallback`, tag `F`).
+    fallback: Option<Arc<super::qualification::Grant>>,
+    /// Current random scan SA (`rtw_core_scan_start`).
+    scan_address: Option<[u8; 6]>,
+    /// Bound N2xQ all-TID QoS routing (`qos`, tag `Q`) and its AC set.
+    qos: Option<(Arc<super::qualification::Grant>, u8)>,
     tx_ba: super::tx_ba::Originator,
     tx_config: Option<super::packet_format::Aggregation>,
     data_pending: VecDeque<Pending>,
@@ -149,6 +161,45 @@ pub(super) struct State {
     deadline: u64,
     last_peer: u64,
     last_now: u64,
+    tracking: Tracking,
+}
+/// Separately qualified dynamic-mechanism watchdog (`dm`, tag `D`).
+#[derive(Default)]
+struct Tracking {
+    facts: Option<super::dm::Facts>,
+    grant: Option<Arc<super::qualification::Grant>>,
+    tracker: Option<Box<super::dm::Tracker>>,
+    next: u64,
+    tx_bytes: u64,
+    rx_bytes: u64,
+    ticks: u64,
+}
+/// Every dm register group: current admission, continuation and base gate.
+struct Live<'a> {
+    admission: &'a Admission,
+    grant: &'a super::qualification::Grant,
+    gate: &'a super::power_policy::Gate,
+}
+impl super::dm::Authority for Live<'_> {
+    fn run<T>(
+        &self,
+        op: impl FnOnce() -> Result<T, firmware_transport::Error>,
+    ) -> Result<T, firmware_transport::Error> {
+        self.admission.run(|| self.grant.invoke(self.gate, op))
+    }
+}
+/// Base-gate-only authority used to restore the base program.
+struct Base<'a> {
+    admission: &'a Admission,
+    gate: &'a super::power_policy::Gate,
+}
+impl super::dm::Authority for Base<'_> {
+    fn run<T>(
+        &self,
+        op: impl FnOnce() -> Result<T, firmware_transport::Error>,
+    ) -> Result<T, firmware_transport::Error> {
+        self.admission.run(|| self.gate.invoke(op))
+    }
 }
 impl core::fmt::Debug for State {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -176,6 +227,11 @@ impl State {
             rx_ba: super::rx_ba::Table::new(),
             tx_ba_grant: None,
             protection: None,
+            coding: None,
+            coding_restore: false,
+            fallback: None,
+            qos: None,
+            scan_address: None,
             tx_ba: super::tx_ba::Originator::new(),
             tx_config: None,
             data_pending: VecDeque::new(),
@@ -202,7 +258,98 @@ impl State {
             deadline: 0,
             last_peer: 0,
             last_now: 0,
+            tracking: Tracking::default(),
         }
+    }
+    /// Exact retained factory/radio facts for the dm watchdog statistics.
+    pub(super) fn set_tracking_facts(&mut self, facts: Option<super::dm::Facts>) {
+        self.tracking.facts = facts;
+    }
+    pub(super) fn tracking_active(&self) -> bool {
+        self.tracking.grant.is_some()
+    }
+    pub(super) fn tracking_ticks(&self) -> u64 {
+        self.tracking.ticks
+    }
+    pub(super) fn tracker(&self) -> Option<&super::dm::Tracker> {
+        self.tracking.tracker.as_deref()
+    }
+    /// One Linux `rtw_watch_dog_work` period, at most every 2s, once the
+    /// separately qualified N2xD continuation is bound and the station is
+    /// established. Losing the continuation or leaving its measured envelope
+    /// restores the base program under the base gate and stops tracking.
+    pub(super) async fn watchdog(&mut self, io: &mut impl Io) -> Result<bool, Error> {
+        if self.established && self.ready() {
+            let admission = self.admission.clone();
+            admission.run(|| {
+                Ok(self
+                    .coding_live(io)
+                    .and_then(|()| self.qos_live(io))
+                    .and_then(|()| self.fallback_live(io)))
+            })??;
+            if self.coding_restore {
+                // Source RA_INFO without LDPC once coding is no longer current.
+                super::wmm::ra_info(io, self.data_profile, &self.admission).await?;
+                self.coding_restore = false;
+            }
+        }
+        if self.tracking.grant.is_none() || !self.established || !self.ready() {
+            return Ok(false);
+        }
+        let now = self.now()?;
+        if now < self.tracking.next {
+            return Ok(false);
+        }
+        self.tracking.next = now.saturating_add(super::dm::PERIOD_MS);
+        let grant = self.tracking.grant.clone().ok_or(Error::State)?;
+        let gate = io.station_gate()?;
+        let facts = self.tracking.facts.ok_or(Error::State)?;
+        if self.tracking.tracker.is_none() {
+            let bounds = super::dm::bounds(facts.did, grant.payload()).ok_or(Error::State)?;
+            self.tracking.tracker = Some(Box::new(super::dm::Tracker::new(bounds, facts)));
+        }
+        let period = super::dm::Period {
+            linked: self.peer.is_some(),
+            profile: self.data_profile,
+            tx_bytes: core::mem::take(&mut self.tracking.tx_bytes),
+            rx_bytes: core::mem::take(&mut self.tracking.rx_bytes),
+            country: narf_wireless::reg::db::get_domain().map_or(*b"00", |d| d.country_code),
+        };
+        let admission = self.admission.clone();
+        let live = Live {
+            admission: &admission,
+            grant: &grant,
+            gate: &gate,
+        };
+        let tracker = self.tracking.tracker.as_mut().ok_or(Error::State)?;
+        // Boxed: keep the dm state machine off small (aarch64) task stacks.
+        let result = Box::pin(tracker.tick(io, &live, period)).await;
+        let commands = match result {
+            Ok(c) => c,
+            Err(firmware_transport::Error::State) if admission.closed() => {
+                return Err(Error::State)
+            }
+            Err(e) => {
+                // Restore through the base gate; a failed restore is terminal.
+                let base = Base {
+                    admission: &admission,
+                    gate: &gate,
+                };
+                Box::pin(tracker.restore(io, &base)).await?;
+                self.tracking.grant = None;
+                self.tracking.tracker = None;
+                return match e {
+                    firmware_transport::Error::Gone => Err(Error::Native(e)),
+                    _ => Ok(false),
+                };
+            }
+        };
+        for words in commands {
+            grant.check(&gate)?;
+            station_control::send(io, words, Some(&admission)).await?;
+        }
+        self.tracking.ticks += 1;
+        Ok(true)
     }
     pub(super) fn admission(&self) -> Admission {
         self.admission.clone()
@@ -276,6 +423,10 @@ impl State {
         self.wmm = None;
         self.wmm_requested = false;
         self.data_profile = super::packet_format::DataProfile::LEGACY;
+        self.coding = None;
+        self.coding_restore = false;
+        self.fallback = None;
+        self.qos = None;
         if self.prepared {
             io.packet_stop()?;
         }
@@ -312,6 +463,30 @@ impl State {
         drop(reservation);
         control?;
         stopped
+    }
+    /// `rx.c::rtw_rx_addr_match_iter`: peer frames to us (or its beacons).
+    fn observe(&mut self, frame: &Mpdu, facts: super::dm::Facts) {
+        let Some(tracker) = self.tracking.tracker.as_mut() else {
+            return;
+        };
+        let Some(peer) = self.peer.as_ref().map(|p| p.bss.bssid) else {
+            return;
+        };
+        let b = frame.bytes();
+        if b.len() < 24 || b[0] & 0x0c == 0x04 || b[10..16] != peer {
+            return;
+        }
+        if b[4..10] != self.own && b[0] != 0x80 {
+            return;
+        }
+        self.tracking.rx_bytes = self.tracking.rx_bytes.saturating_add(b.len() as u64);
+        if let Some(sample) = frame
+            .status
+            .as_deref()
+            .and_then(|s| super::dm::sample(&facts, frame.rate, s))
+        {
+            tracker.observe(sample);
+        }
     }
     fn now(&mut self) -> Result<u64, Error> {
         let now = self.environment.now_ms();
@@ -351,7 +526,7 @@ impl State {
             bytes[22..24].copy_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
         }
-        let id = io.packet_submit(&bytes, kind != Kind::Data)?;
+        let id = io.packet_submit(&bytes, !matches!(kind, Kind::Data | Kind::Probe))?;
         if kind == Kind::Ba {
             self.rx_ba.submitted(&bytes)?;
         }
@@ -364,9 +539,14 @@ impl State {
     fn cache(&mut self, frame: &Mpdu, now: u64) {
         // This native profile exposes no calibrated per-frame dBm estimate.
         let signal = None;
+        // During a random-address scan, Probe Responses answer that SA.
+        let own = match self.scan_address {
+            Some(a) if frame.bytes().get(4..10) == Some(&a[..]) => a,
+            _ => self.own,
+        };
         let observed = match &self.local_ht {
-            Some(p) => association::observe_with_phy(frame, 1, self.own, signal, p),
-            None => association::observe(frame, 1, self.own, signal),
+            Some(p) => association::observe_with_phy(frame, 1, own, signal, p),
+            None => association::observe(frame, 1, own, signal),
         };
         let Ok(candidate) = observed else {
             return;
@@ -435,7 +615,7 @@ impl State {
         if pending.id != delivery.id || pending.bytes != delivery.bytes {
             return Err(Error::State);
         }
-        if !delivery.radio_acknowledged && !matches!(pending.kind, Kind::Data) {
+        if !delivery.radio_acknowledged && !matches!(pending.kind, Kind::Data | Kind::Probe) {
             return Err(Error::State);
         }
         if pending.kind == Kind::Security {
@@ -471,6 +651,12 @@ impl State {
             let step = io.packet_poll()?;
             if let Some(receipt) = step.receipt {
                 self.delivery(receipt)?;
+            }
+            if let (Some(body), Some(t)) = (&step.c2h, self.tracking.tracker.as_mut()) {
+                t.c2h(body);
+            }
+            if let (Some(frame), Some(facts)) = (&step.frame, self.tracking.facts) {
+                self.observe(frame, facts);
             }
             if !step.consumed_rx {
                 idle = true;
@@ -701,6 +887,10 @@ impl State {
                                 qos: self.wmm.is_some(),
                                 mcs: 0,
                                 sgi: false,
+                                ldpc: false,
+                                stbc: false,
+                                acs: 0,
+                                fallback: false,
                             };
                             if let Some(h) = &self.ht {
                                 let negotiated = self
@@ -708,9 +898,10 @@ impl State {
                                     .as_ref()
                                     .and_then(JoinPlan::negotiated_phy)
                                     .ok_or(Error::Profile)?;
-                                if negotiated.width() != association::phy::Width::Twenty
-                                    || negotiated.ht().operation().protection() != 0
-                                {
+                                // Linux rtw88 reads no ht_operation_mode and takes no
+                                // protection action (mac80211.c/tx.c); nonzero HT
+                                // protection modes are admitted unchanged.
+                                if negotiated.width() != association::phy::Width::Twenty {
                                     return Err(Error::Profile);
                                 }
                                 self.data_profile = h.profile(
@@ -718,8 +909,22 @@ impl State {
                                     negotiated.ht().tx_mcs()[0],
                                     negotiated.ht().tx_sgi20(),
                                 )?;
+                                if let Some((_, flags)) = &self.coding {
+                                    self.data_profile = super::coding::apply(
+                                        *flags,
+                                        self.data_profile,
+                                        negotiated.ht().tx_ldpc(),
+                                        negotiated.ht().tx_stbc(),
+                                    );
+                                }
                             }
                         }
+                        if let Some((_, acs)) = &self.qos {
+                            if self.data_profile.qos {
+                                self.data_profile.acs = *acs;
+                            }
+                        }
+                        self.data_profile.fallback = self.fallback.is_some();
                         self.peer_commit = Some((aid, short));
                         self.last_peer = now;
                         // Firmware peer commit is an awaited continuation in associate().
@@ -795,6 +1000,9 @@ impl State {
                                         || q[1] != 0
                                         || q[0] & 0x60 != 0 && !(live_ba && q[0] & 0x60 == 0x60)
                                 })
+                            } else if self.data_profile.acs != 0 {
+                                // N2xQ: any TID0..7 with normal ack.
+                                qos.is_none_or(|q| q[0] & 0xf8 != 0 || q[1] != 0)
                             } else {
                                 qos != Some(&[0, 0])
                             })
@@ -865,7 +1073,7 @@ impl State {
                                     self.own,
                                     self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
                                     self.data_profile.qos,
-                                    self.ht.is_some(),
+                                    self.ht.is_some() || self.data_profile.acs != 0,
                                 ) {
                                     self.last_peer = now;
                                     if self.received.len() == RECEIVE_OUTPUTS {
@@ -897,7 +1105,7 @@ impl State {
                         self.own,
                         self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
                         self.data_profile.qos,
-                        self.ht.is_some(),
+                        self.ht.is_some() || self.data_profile.acs != 0,
                     ) {
                         self.last_peer = now;
                         if self.received.len() == RECEIVE_OUTPUTS {
@@ -971,16 +1179,78 @@ impl State {
             Ok(Vec::new())
         }
     }
+    /// mac80211 software scan on the retained channel: each Probe Request
+    /// is published and retired (DMA consumption, no ACK) before the next,
+    /// then the dwell runs from the last retirement. Empty `probes` is the
+    /// original passive scan.
+    ///
+    /// With `address`, Linux `main.c::rtw_core_scan_start` points the port0
+    /// MAC (`REG_MACID` 0x610) at the random scan address for the duration
+    /// of the scan and `rtw_core_scan_complete` restores the own address.
     pub(super) async fn scan_for(
         &mut self,
         io: &mut impl Io,
         dwell_ms: u64,
+        probes: &[Vec<u8>],
+        address: Option<[u8; 6]>,
     ) -> Result<Vec<ObservedBss>, Error> {
-        if !(1..=1024).contains(&dwell_ms) {
+        if !(1..=1024).contains(&dwell_ms) || probes.len() > 4 {
             return Err(Error::Profile);
         }
         if self.phase() != Phase::Passive {
             return Err(Error::State);
+        }
+        let source = address.unwrap_or(self.own);
+        if address
+            .is_some_and(|a| a == self.own || a[0] & 1 != 0 || a == [0; 6] || probes.is_empty())
+        {
+            return Err(Error::Profile);
+        }
+        for probe in probes {
+            if probe.len() < 24
+                || probe[..4] != [0x40, 0, 0, 0]
+                || probe[4..10] != [255; 6]
+                || probe[10..16] != source
+                || probe[16..22] != [255; 6]
+            {
+                return Err(Error::Profile);
+            }
+        }
+        if let Some(a) = address {
+            station_control::port_address(io, a, &self.admission)?;
+            let admission = self.admission.clone();
+            admission.run(|| Ok(io.packet_scan_address(Some(a))))??;
+            self.scan_address = Some(a);
+        }
+        let result = self.scan_inner(io, dwell_ms, probes).await;
+        if self.scan_address.take().is_some() {
+            // rtw_core_scan_complete: back to the own address on every exit.
+            let own = self.own;
+            let restored = station_control::port_address(io, own, &self.admission)
+                .map_err(Error::Native)
+                .and_then(|()| io.packet_scan_address(None).map_err(Error::Transport));
+            if result.is_ok() {
+                restored?;
+            }
+        }
+        result
+    }
+    async fn scan_inner(
+        &mut self,
+        io: &mut impl Io,
+        dwell_ms: u64,
+        probes: &[Vec<u8>],
+    ) -> Result<Vec<ObservedBss>, Error> {
+        for probe in probes {
+            let admission = self.admission.clone();
+            admission.run(|| Ok(self.transmit(io, probe.clone(), Kind::Probe)))??;
+            while self.pending.is_some() {
+                self.poll(io)?;
+                if self.pending.is_none() {
+                    break;
+                }
+                self.environment.pause().await;
+            }
         }
         let until = self.now()?.saturating_add(dwell_ms);
         loop {
@@ -1031,14 +1301,36 @@ impl State {
             }
             _ => None,
         };
+        // N2xC TX coding needs the HT program and its own exact continuation.
+        let coding = match &proposed {
+            // Identity only here: the live check runs once the extension and
+            // HT programs enclose it (`station_bind_continuation`).
+            Some(_) => io
+                .station_continuation(&super::coding::KIND)?
+                .and_then(|g| {
+                    let gate = io.station_gate().ok()?;
+                    let flags = super::coding::bounds(gate.did(), g.payload())?;
+                    g.matches(&gate).then_some((g, flags))
+                }),
+            None => None,
+        };
+        let flags = coding.as_ref().map_or(0, |c| c.1);
         let mut plan = match &proposed {
-            Some(h) => JoinPlan::prepare_with_phy(&candidate.bss, self.own, ssid, mode, h.local())?,
+            Some(h) => JoinPlan::prepare_with_phy(
+                &candidate.bss,
+                self.own,
+                ssid,
+                mode,
+                h.local_coded(flags),
+            )?,
             None => JoinPlan::prepare(&candidate.bss, self.own, ssid, mode)?,
         };
         let ht = proposed.filter(|_| plan.offered_phy().is_some());
-        if plan.offered_phy().is_some_and(|p| {
-            p.width() != association::phy::Width::Twenty || p.ht().operation().protection() != 0
-        }) {
+        // Upstream rtw88 takes no HT protection-mode action (ht_protection_modes).
+        if plan
+            .offered_phy()
+            .is_some_and(|p| p.width() != association::phy::Width::Twenty)
+        {
             return Err(Error::Profile);
         }
         plan.append_sme_ies(ies)?;
@@ -1077,10 +1369,41 @@ impl State {
                 self.admission
                     .run(|| io.station_bind_extension(grant.clone()))?;
                 self.extension = Some(grant);
+                // N2xF fallback needs only the bound extension.
+                if let Some(g) = io.station_continuation(&super::fallback::KIND)? {
+                    let gate = io.station_gate()?;
+                    if super::fallback::bounds(g.payload()) && g.check(&gate).is_ok() {
+                        self.admission
+                            .run(|| io.station_bind_continuation(g.clone()))?;
+                        self.fallback = Some(g);
+                    }
+                }
+                if self.wmm_requested {
+                    if let Some(g) = io.station_continuation(&super::qos::KIND)? {
+                        let gate = io.station_gate()?;
+                        if let Some(acs) = super::qos::bounds(g.payload()) {
+                            if g.check(&gate).is_ok() {
+                                self.admission
+                                    .run(|| io.station_bind_continuation(g.clone()))?;
+                                self.qos = Some((g, acs));
+                            }
+                        }
+                    }
+                }
             }
         }
         if let Some(h) = ht {
             self.admission.run(|| io.station_bind_ht(h.clone()))?;
+            if let Some((g, flags)) = coding {
+                // A grant that is not current leaves TX uncoded.
+                if self
+                    .admission
+                    .run(|| io.station_bind_continuation(g.clone()))
+                    .is_ok()
+                {
+                    self.coding = Some((g, flags));
+                }
+            }
             h.program(io, &self.admission).await?;
             // RX may arrive at negotiated HT rates immediately after the AP's
             // association response, before the awaited native peer commit.
@@ -1107,6 +1430,12 @@ impl State {
                 self.protection = Some(g);
             }
             self.ht = Some(h);
+        }
+        if let Some(g) = io.station_continuation(&super::dm::KIND)? {
+            let gate = io.station_gate()?;
+            if super::dm::bounds(gate.did(), g.payload()).is_some() && g.check(&gate).is_ok() {
+                self.tracking.grant = Some(g);
+            }
         }
         station_control::prepare_peer(io, bssid, &self.admission).await?;
         self.peer = Some(candidate);
@@ -1159,8 +1488,85 @@ impl State {
         }
         result
     }
+    /// Coded DATA requires the current N2xC continuation. A revoked or
+    /// mismatched one downgrades to the uncoded base HT profile.
+    pub(super) fn coding_live(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        if !self.data_profile.ldpc && !self.data_profile.stbc {
+            return Ok(());
+        }
+        let gate = io.station_gate()?;
+        if self
+            .coding
+            .as_ref()
+            .is_some_and(|(g, _)| g.check(&gate).is_ok())
+        {
+            return Ok(());
+        }
+        self.coding = None;
+        self.coding_restore |= self.data_profile.ldpc;
+        let p = self.data_profile.uncoded();
+        // Callers already run inside the current admission.
+        io.packet_profile(p)?;
+        self.data_profile = p;
+        Ok(())
+    }
+    /// All-TID routing requires the current N2xQ continuation. A revoked or
+    /// mismatched one returns every frame to BE/TID0 under the base gate.
+    pub(super) fn qos_live(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        if self.data_profile.acs == 0 {
+            return Ok(());
+        }
+        let gate = io.station_gate()?;
+        if self
+            .qos
+            .as_ref()
+            .is_some_and(|(g, _)| g.check(&gate).is_ok())
+        {
+            return Ok(());
+        }
+        self.qos = None;
+        let p = super::packet_format::DataProfile {
+            acs: 0,
+            ..self.data_profile
+        };
+        io.packet_profile(p)?;
+        self.data_profile = p;
+        Ok(())
+    }
+    /// Firmware RA fallback requires the current N2xF continuation. A
+    /// revoked or mismatched one returns DATA to the fixed rate.
+    pub(super) fn fallback_live(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        if !self.data_profile.fallback {
+            return Ok(());
+        }
+        let gate = io.station_gate()?;
+        if self
+            .fallback
+            .as_ref()
+            .is_some_and(|g| g.check(&gate).is_ok())
+        {
+            return Ok(());
+        }
+        self.fallback = None;
+        let p = super::packet_format::DataProfile {
+            fallback: false,
+            ..self.data_profile
+        };
+        io.packet_profile(p)?;
+        self.data_profile = p;
+        Ok(())
+    }
     fn send_inner(&mut self, io: &mut impl Io, frame: &[u8]) -> Result<(), Error> {
-        if self.tx_ba.active().is_some() {
+        self.coding_live(io)?;
+        self.qos_live(io)?;
+        self.fallback_live(io)?;
+        self.tracking.tx_bytes = self.tracking.tx_bytes.saturating_add(frame.len() as u64);
+        let acm = self
+            .wmm
+            .map_or([false; 4], |p| p.ac.map(|a| a.admission_control));
+        let tid = super::qos::tid_for(frame, acm, self.data_profile);
+        // Originator BA aggregates only the TID0 (BE) agreement.
+        if self.tx_ba.active().is_some() && tid == 0 {
             self.send_batch_inner(io, &[frame])?;
             return Ok(());
         }
@@ -1173,7 +1579,7 @@ impl State {
         let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
         let native = if let Some(security) = &mut self.security {
             if self.data_profile.qos {
-                security.transmit_ethernet_qos(frame, 0)?
+                security.transmit_ethernet_qos(frame, tid)?
             } else {
                 security.transmit_ethernet(frame)?
             }
@@ -1185,7 +1591,7 @@ impl State {
             bytes.extend_from_slice(&peer);
             bytes.extend_from_slice(&self.own);
             bytes.extend_from_slice(&frame[..6]);
-            let sequence = if self.tx_ba_grant.is_some() && self.data_profile.qos {
+            let sequence = if self.tx_ba_grant.is_some() && self.data_profile.qos && tid == 0 {
                 let s = self.qos_sequence;
                 self.qos_sequence = (s + 1) & 4095;
                 s
@@ -1196,7 +1602,7 @@ impl State {
             };
             bytes.extend_from_slice(&(sequence << 4).to_le_bytes());
             if self.data_profile.qos {
-                bytes.extend_from_slice(&[0, 0]);
+                bytes.extend_from_slice(&[tid, 0]);
             }
             bytes.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
             bytes.extend_from_slice(&frame[12..]);

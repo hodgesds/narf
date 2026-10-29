@@ -940,6 +940,33 @@ interfaces and limits.
 
 ## Current work
 
+Intel render work merged through #1175 includes per-open i915-wire
+GEM storage, CPU copies/WB mmap, same-card PRIME sharing, context and VM
+namespaces, two-pass memory and
+engine queries, and bounded softpin execbuffer admission. Immutable Gen12 and
+Xe-LPG PPGTT residency retains referenced buffers after handle/fd close. The
+memory audit corrected GPU PAT fields, intermediate permissions and the raw
+PML4 root's PDP0 placement; the Gen12 engine audit corrected ring-size encoding,
+12-entry CSB depth and the extended engine-relative context restore groups.
+Follow-up work on `codex/intel-gpu-render-backend` adds owned arbitrary-VA
+Gen12 submission, render-cache-flushed post-sync breadcrumbs, cancellable
+fence waiters, stale-CSB identity protection and loss/reset residency retention.
+Xe-LPG now has capability-invoked GuC-70 firmware acquisition and a coherent
+GGTT CT owner with MMIO registration/enable/disable, bounded retry/timeout and
+quarantined allocation lifetime. These are native model/ownership paths, not
+working Mesa acceleration or a firmware boot claim.
+EXECBUFFER2 still refuses submission and queries expose no userspace engines.
+Full GT/context setup, hardware reset ownership, topology, accelerated PRIME/KMS,
+Mesa OpenGL/Vulkan acceptance and Xe-LPG GuC upload/context scheduling remain open.
+Existing Gen12 RCS/media helpers refuse Xe-LPG before MMIO.
+
+The 2026-10-28 follow-up passes the selected native GPU/DRM suites in QEMU:
+219 tests on x86_64 and 102 on aarch64, with zero failures/skips. Both include
+25 RCS and six Xe-LPG CT-owner smokes. Intel-only debug builds pass on both
+architectures; GPU all-target clippy passes for default, Intel-only, AMD-only
+and no-vendor features, and workspace formatting is clean. These results do
+not validate Intel silicon, firmware boot or Mesa rendering.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
@@ -1867,6 +1894,14 @@ is FIFO and cancellation-safe; fence IRQs wake per-client waiters. Separate
 pre-IB VM writebacks avoid treating whole-job completion as flush completion,
 while active job fences still prevent premature VMID reuse. Submitters use
 the pre-restart fence generation and reject stale owners after reset.
+
+RX 6000 MEMORY/VRAM_GTT queries now report GEM's shared system-memory budget
+instead of zero GTT capacity, and live opens use their registered client VRAM
+heap for usable sizes and allocation usage. VRAM_USAGE, VIS_VRAM_USAGE and
+GTT_USAGE expose the corresponding byte counts. Native ioctl regressions
+exercise RDNA2/RDNA4 visible and hidden heaps, GEM allocation/release, retained
+PRIME ownership and short replies. These are software checks; Mesa acceptance
+on the physical GPU remains pending.
 
 Ordinary VRAM-preferred creation now permits Linux's GTT fallback when VRAM
 is unavailable, preserving reported preferences and discardable-domain rules.

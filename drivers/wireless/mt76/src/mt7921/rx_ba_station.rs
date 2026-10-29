@@ -46,19 +46,35 @@ impl<B: Backend> Session<B> {
             return false;
         }
         if header[25] == 0 && frame.len() == 33 {
-            if ba::Request::parse(frame)
+            let limit = if self.he_profile.is_some() {
+                ba::HE_WINDOW
+            } else {
+                ba::HT_WINDOW
+            };
+            if ba::Request::parse(frame, limit)
                 .is_some_and(|r| self.rx_ba.reserve(r, self.backend.now_ns()))
             {
                 return true;
             }
+            // agg-rx.c __ieee80211_start_rx_ba_session: a delayed policy needs
+            // both HT DELAY_BA and the S1G HT_DELAYED_BA capability, so a
+            // non-S1G CONNAC2 peer is always refused with INVALID_QOS_PARAM
+            // (38), as is a buffer size above max_buf_size (64 HT / 256 HE);
+            // other refusals are REQUEST_DECLINED (37). The response always
+            // carries the immediate policy (policy argument 1).
+            let status = if frame[27] & 2 == 0 || ba::Request::oversize(frame, limit) {
+                38
+            } else {
+                37
+            };
             if self.control_pending.len() < 4 {
                 let mut response = vec![0; 33];
                 response[0] = 0xd0;
                 response[4..10].copy_from_slice(&peer);
                 response[10..16].copy_from_slice(&own);
                 response[16..22].copy_from_slice(&peer);
-                response[24..29].copy_from_slice(&[3, 1, frame[26], 37, 0]);
-                response[29] = frame[27] & 0x3e;
+                response[24..29].copy_from_slice(&[3, 1, frame[26], status, 0]);
+                response[29] = (frame[27] & 0x3c) | 2;
                 self.control_pending.push_back(response);
             }
             return true;

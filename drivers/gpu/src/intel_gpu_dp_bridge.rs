@@ -12,15 +12,22 @@
 //!    pins. EDID over I²C-over-AUX gives the sink's preferred mode.
 //! 4. Run a modeset using the existing [`Modeset`] orchestrator.
 //!
-//! ## Stage-1 scope
+//! ## Scope
 //!
 //! - **Owned by this file**: USB-C → DDI mapping, MMIO window
 //!   adapter for the BAR0 `MmioRegion`, dispatch into AUX + Modeset.
-//! - **Deferred to existing modeset Stage-2**: actual PLL / pipe /
-//!   plane / link-training register writes. We call `Modeset::modeset`
-//!   and propagate its outcome. The orchestrator's own TODOs (PLL
-//!   programming, transcoder timing, plane setup) land in its own
-//!   Stage-2.
+//! - **Multi-pipe (#1017)**: a bridge session claims a pipe from
+//!   `intel_gpu_multipipe` (re-entrant per connector — the trait
+//!   has no exit hook, so the claim is held for the session's
+//!   lifetime and released only when a modeset attempt fails),
+//!   allocates a real GGTT scanout in that pipe's window, and
+//!   runs the orchestrator bound to the claimed pipe. Before
+//!   #1017 this path funnelled into the Pipe-A-only
+//!   orchestrator with a placeholder framebuffer address.
+//! - **Named remainder**: Type-C PHY PLL programming (MG / TBT
+//!   PLLs) has no model in the modeset yet — a TC modeset keeps
+//!   the orchestrator's historical DPLL 0 selection (see
+//!   `intel_gpu_modeset::dpll_index_for`).
 //!
 //! ## USB-C connector → DDI mapping
 //!
@@ -43,11 +50,15 @@ use narf_drivers_usbpd::dp_gpu_bridge::{
     self, ConnectorId, DpAltModeGpuBridge, DpBridgeError, DpLinkConfig,
 };
 
+use narf_lib::sync::IrqSafeSpinLock;
+
 use crate::dp_edid::read_panel_edid;
 use crate::intel_gpu;
 use crate::intel_gpu_aux::{IntelAux, MmioWindow};
 use crate::intel_gpu_ddi::Ddi;
+use crate::intel_gpu_gtt::ContiguousScanout;
 use crate::intel_gpu_modeset::{Framebuffer, Mode, Modeset, ModesetError, PixelFormat};
+use crate::intel_gpu_multipipe::{self, PipeOwner, PipeUse};
 
 /// Map a USB-C [`ConnectorId`] to the Gen12 Type-C DDI it's wired
 /// to. Returns `None` if the index is outside the documented TC1..5
@@ -144,6 +155,9 @@ impl IntelDpBridge {
         ddi: Ddi,
         cfg: &DpLinkConfig,
     ) -> Result<(), DpBridgeError> {
+        if !gpu.chip.generation.external_display_supported() {
+            return Err(DpBridgeError::NoSuchConnector);
+        }
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
@@ -164,18 +178,79 @@ impl IntelDpBridge {
         // fatal for the bridge contract — we just have no mode.
         let preferred_mode = read_preferred_mode_via_aux(&mmio, ddi);
 
-        // Hand off to the existing modeset orchestrator. Stage-2
-        // modeset returns early at several internal TODOs, which
-        // surface here as ModesetError; we log + report `NotReady`
-        // since the DDI binding is captured but the engine isn't lit.
-        let mut modeset = Modeset::new(&mmio, ddi);
-        let fb = stage1_placeholder_fb();
-        match modeset.modeset(&fb, preferred_mode.as_ref()) {
-            Ok(mode) => {
+        // Claim a pipe for this connector (#1017). claim_for is
+        // keyed by DDI, so a re-entry on the same connector (the
+        // bridge trait has no exit hook) reuses its pipe instead
+        // of consuming a second one. No free pipe is a real
+        // refusal: every pipe is scanning out something else.
+        let owner = PipeOwner {
+            ddi,
+            used_for: PipeUse::AltModeBridge,
+        };
+        let Some(pipe) = intel_gpu_multipipe::claim_pipe_for(owner) else {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  intel-gpu/dp: no free pipe for DDI {:?} — all pipes owned",
+                ddi,
+            );
+            return Err(DpBridgeError::NotReady);
+        };
+
+        // A real scanout in the claimed pipe's GGTT window,
+        // sized for the sink's preferred mode when known and
+        // for 1920×1080 otherwise (the surface the modeset's
+        // own EDID path most commonly lands on when the
+        // bridge's read raced the sink's wake).
+        let (width, height) = match preferred_mode {
+            Some(m) => (m.h_active as u32, m.v_active as u32),
+            None => (1920, 1080),
+        };
+        let stride_bytes = intel_gpu::padded_stride_bytes(width);
+        let size_bytes = intel_gpu::scanout_size_bytes(width, height);
+        let alloc = match crate::intel_gpu_gtt::alloc_contiguous_scanout_at(
+            &gpu.gtt_mmadr,
+            intel_gpu_multipipe::scanout_gtt_offset(pipe),
+            size_bytes,
+        ) {
+            Ok(alloc) => alloc,
+            Err(e) => {
                 let _ = writeln!(
                     narf_console::Writer,
-                    "  intel-gpu/dp: modeset OK on DDI {:?}: {}x{} @ {} kHz pclk",
+                    "  intel-gpu/dp: scanout allocation failed on DDI {:?}: {:?}",
                     ddi,
+                    e,
+                );
+                intel_gpu_multipipe::release_pipe(pipe, ddi);
+                return Err(DpBridgeError::ModesetFailed);
+            }
+        };
+        retain_bridge_scanout(ddi, alloc);
+        let fb = Framebuffer {
+            phys_addr: alloc.gtt_offset as u64,
+            stride_bytes,
+            format: PixelFormat::Xrgb8888,
+        };
+
+        // Hand off to the modeset orchestrator, bound to the
+        // claimed pipe. When the claim made this a multi-pipe
+        // machine, the pipe gets its DBUF share and the pipes
+        // already live are reprogrammed to theirs.
+        let mut modeset = Modeset::for_pipe(&mmio, ddi, pipe);
+        let active = intel_gpu_multipipe::active_pipes();
+        if active.len() >= 2 {
+            if let Some((start, end)) = intel_gpu_multipipe::share_for(&active, pipe) {
+                modeset.set_dbuf_share(start, end);
+            }
+        }
+        let outcome = modeset.modeset(&fb, preferred_mode.as_ref());
+        match outcome {
+            Ok(mode) => {
+                intel_gpu_multipipe::reprogram_active_dbuf_shares(&mmio);
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  intel-gpu/dp: modeset OK on DDI {:?} / Pipe {:?}: {}x{} @ {} kHz pclk",
+                    ddi,
+                    pipe,
                     mode.h_active,
                     mode.v_active,
                     mode.pixel_clock_khz,
@@ -188,20 +263,40 @@ impl IntelDpBridge {
                     "  intel-gpu/dp: EDID unavailable on DDI {:?} — no sink mode known yet",
                     ddi,
                 );
+                intel_gpu_multipipe::release_pipe(pipe, ddi);
                 Err(DpBridgeError::EdidUnavailable)
             }
             Err(e) => {
                 let _ = writeln!(
                     narf_console::Writer,
-                    "  intel-gpu/dp: modeset on DDI {:?} returned {:?} \
-                     (modeset Stage-2 wiring deferred)",
+                    "  intel-gpu/dp: modeset on DDI {:?} / Pipe {:?} returned {:?}",
                     ddi,
+                    pipe,
                     e,
                 );
+                intel_gpu_multipipe::release_pipe(pipe, ddi);
                 Err(DpBridgeError::ModesetFailed)
             }
         }
     }
+}
+
+/// Scanout allocations retained per Type-C DDI. The bridge is
+/// stateless and the trait has no exit hook, so — like the DP
+/// session's retained allocation in `intel_gpu` — a bridge
+/// surface is kept for the session's lifetime; a re-entry on
+/// the same DDI frees the previous block before replacing it
+/// (its pipe is being re-modeset by that same call).
+static BRIDGE_SCANOUTS: IrqSafeSpinLock<[Option<ContiguousScanout>; 8]> =
+    IrqSafeSpinLock::new([None; 8]);
+
+fn retain_bridge_scanout(ddi: Ddi, alloc: ContiguousScanout) {
+    let mut slots = BRIDGE_SCANOUTS.lock();
+    let slot = &mut slots[ddi as usize];
+    if let Some(old) = slot.take() {
+        crate::intel_gpu_gtt::free_contiguous_scanout(&old);
+    }
+    *slot = Some(alloc);
 }
 
 /// One-shot EDID readback over AUX. Parses the panel's base block,
@@ -248,19 +343,6 @@ pub(crate) fn detailed_timing_to_mode(dt: &narf_graphics::edid::DetailedTiming) 
         v_sync_end,
         h_sync_positive: dt.h_sync_positive,
         v_sync_positive: dt.v_sync_positive,
-    }
-}
-
-/// Placeholder framebuffer for the modeset call. The modeset
-/// orchestrator validates alignment but Stage-2 hasn't allocated a
-/// real GGTT-mapped surface yet — we hand a clearly-bogus address
-/// that satisfies the alignment check so the orchestrator can run
-/// through its TODOs without panicking.
-fn stage1_placeholder_fb() -> Framebuffer {
-    Framebuffer {
-        phys_addr: 0x0010_0000, // page-aligned, otherwise unused
-        stride_bytes: 1920 * 4, // 4-byte-per-pixel XRGB at 1920 wide
-        format: PixelFormat::Xrgb8888,
     }
 }
 

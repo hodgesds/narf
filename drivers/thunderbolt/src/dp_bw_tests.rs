@@ -19,7 +19,9 @@ use crate::control::Config;
 use crate::ring::Error;
 use crate::topology::{Domain, Port, Router};
 use crate::tunnel::tests::Model;
-use crate::tunnel::{displays, forget_domain, reconcile, Endpoint, Protocol, Tunnel, TunnelInfo};
+use crate::tunnel::{
+    displays, forget_domain, reconcile, usb3_tunnels, Endpoint, Protocol, Tunnel, TunnelInfo,
+};
 use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -121,6 +123,8 @@ fn port(number: u8, kind: u32, cap: u16, secondary: bool) -> Port {
         max_out_hop: 15,
         total_credits: 64,
         secondary,
+        retimers: alloc::vec![],
+        retimer_fault: None,
     }
 }
 
@@ -330,9 +334,10 @@ fn usb4_dp_bw_multi_tunnel_shared_and_independent_groups() -> TestResult {
         return TestResult::Fail("contention reconcile");
     }
     let live: Vec<TunnelInfo> = displays().into_iter().filter(|t| t.domain == 4).collect();
-    let usb3: Vec<&TunnelInfo> = live
-        .iter()
-        .filter(|t| t.protocol == Protocol::Usb3)
+    // USB3 tunnels are published apart from the displays.
+    let usb3: Vec<TunnelInfo> = usb3_tunnels()
+        .into_iter()
+        .filter(|t| t.domain == 4)
         .collect();
     if usb3.len() != 1 || usb3[0].consumed_mbps != 225 {
         return TestResult::Fail("USB3 consumption must be charged in Mb/s");
@@ -371,7 +376,7 @@ fn usb4_dp_bw_multi_tunnel_shared_and_independent_groups() -> TestResult {
                 group: 2,
                 budget_mbps: 9_000,
             })
-        || m.get(0, 6, CfgSpace::Port, 37) != 0x1000_1200
+        || m.get(0, 6, CfgSpace::Port, 37) != 0x1000_2100
         || m.get(0, 6, CfgSpace::Port, 38) != 34 << 24
     {
         return TestResult::Fail("DP2 must fall back to HBR x4 on its own budget");
@@ -431,7 +436,8 @@ fn usb4_dp_bw_hbr3_falls_back_on_thin_link() -> TestResult {
     // HBR3 x4 (25_920 Mb/s) and HBR2 x4 (17_280) exceed the
     // budget; the ladder lands on HBR x4 (8_640): REMOTE_CAP
     // rate code 1, 8 whole 1-Gb/s units granted, estimate 9.
-    if m.get(0, 5, CfgSpace::Port, 37) != 0x1000_1200
+    // DP_COMMON_CAP: rate in bits 11:8, lanes in 14:12 (x4 = 2).
+    if m.get(0, 5, CfgSpace::Port, 37) != 0x1000_2100
         || m.get(0, 5, CfgSpace::Port, 38) != 8 << 24
         || (m.get(0, 5, CfgSpace::Port, 34) >> 24) & 0xff != 9
     {
@@ -663,17 +669,17 @@ fn usb4_dp_bw_codecs() -> TestResult {
         || DpRate::Hbr3.payload_mbps(4) != 25_920
         || DpRate::from_cap_code(0) != Some(DpRate::Rbr)
         || DpRate::from_cap_code(3) != Some(DpRate::Hbr3)
-        || DpRate::from_cap_code(4) != None
+        || DpRate::from_cap_code(4).is_some()
     {
         return TestResult::Fail("payload table / rate codes");
     }
     if decode_lane_count(0) != Some(1)
         || decode_lane_count(1) != Some(2)
         || decode_lane_count(2) != Some(4)
-        || decode_lane_count(3) != None
+        || decode_lane_count(3).is_some()
         || encode_lane_count(1) != Some(0)
         || encode_lane_count(4) != Some(2)
-        || encode_lane_count(3) != None
+        || encode_lane_count(3).is_some()
     {
         return TestResult::Fail("lane encodings");
     }
@@ -683,7 +689,7 @@ fn usb4_dp_bw_codecs() -> TestResult {
         || fit_link(DpRate::Hbr3, 4, 9_000) != Some((DpRate::Hbr, 4))
         || fit_link(DpRate::Hbr3, 4, 5_000) != Some((DpRate::Hbr, 2))
         || fit_link(DpRate::Hbr2, 4, 17_279) != Some((DpRate::Hbr, 4))
-        || fit_link(DpRate::Rbr, 1, 1_000) != None
+        || fit_link(DpRate::Rbr, 1, 1_000).is_some()
     {
         return TestResult::Fail("fit_link ladder");
     }
@@ -693,14 +699,14 @@ fn usb4_dp_bw_codecs() -> TestResult {
         || g250.map(|g| g.to_mbps(69)) != Some(17_250)
         || g1000.map(|g| g.units_floor(8_640)) != Some(8)
         || g250.map(|g| g.units_floor(1_000_000)) != Some(255)
-        || Granularity::decode(3 << 11) != None
+        || Granularity::decode(3 << 11).is_some()
     {
         return TestResult::Fail("granularity denominations");
     }
     if lane_speed_mbps(0x8) != Some(10_000)
         || lane_speed_mbps(0x4) != Some(20_000)
         || lane_speed_mbps(0x2) != Some(40_000)
-        || lane_speed_mbps(0xc) != None
+        || lane_speed_mbps(0xc).is_some()
         || link_budget_mbps(20_000, 2) != 36_000
         || link_budget_mbps(10_000, 1) != 9_000
     {

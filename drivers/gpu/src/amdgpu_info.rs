@@ -761,11 +761,8 @@ fn answers_navi22(snap: &Snapshot) -> bool {
     snap.family == Family::Navi2 && family_id(snap).is_some()
 }
 
-/// The client VRAM heap of `vm`'s card, unless Navi 22 answers for it.
+/// The client VRAM heap of `vm`'s card, including native RDNA2 cards.
 fn card_heap(vm: &crate::amdgpu_vm::VmState) -> Option<crate::amdgpu_gem::HeapUsage> {
-    if snapshot().is_some_and(|snap| answers_navi22(&snap)) {
-        return None;
-    }
     vm.card().and_then(crate::amdgpu_gem::vram_heap_usage)
 }
 
@@ -784,6 +781,7 @@ pub fn query_against(snap: &Snapshot, query: u32, payload: [u32; 4]) -> Result<V
         uapi::AMDGPU_INFO_DEV_INFO => dev_info(snap),
         uapi::AMDGPU_INFO_MEMORY => Ok(memory_info(snap)),
         uapi::AMDGPU_INFO_VRAM_GTT => Ok(vram_gtt(snap)),
+        uapi::AMDGPU_INFO_GTT_USAGE => Ok(crate::amdgpu_gem::gtt_used().to_le_bytes().to_vec()),
         // `query_hw_ip { type, ip_instance }` — type is word 0.
         uapi::AMDGPU_INFO_HW_IP_INFO => hw_ip_info(snap, payload[0]),
         uapi::AMDGPU_INFO_HW_IP_COUNT => hw_ip_count(snap, payload[0]),
@@ -858,8 +856,9 @@ pub fn dispatch_for(
             out.extend_from_slice(&f.vmhub.to_le_bytes());
             out
         }
-        // The open's card's client VRAM heap, where it has one; Navi 22
-        // answers its own.
+        // The open's card's client VRAM heap, where it has one. RDNA2's
+        // snapshot fallback cannot account for the native owner's reserved
+        // ranges or current client allocations.
         (uapi::AMDGPU_INFO_MEMORY | uapi::AMDGPU_INFO_VRAM_GTT, Some(vm))
             if card_heap(vm).is_some() =>
         {
@@ -870,6 +869,24 @@ pub fn dispatch_for(
             } else {
                 vram_gtt_heap(heap)
             }
+        }
+        // amdgpu_info_ioctl: current allocation counts, not free space or
+        // the requesting open's handle count. GTT has one shared GEM budget.
+        (
+            uapi::AMDGPU_INFO_VRAM_USAGE
+            | uapi::AMDGPU_INFO_VIS_VRAM_USAGE
+            | uapi::AMDGPU_INFO_GTT_USAGE,
+            Some(vm),
+        ) => {
+            snapshot().ok_or(FsError::NotFound)?;
+            let usage = match which {
+                uapi::AMDGPU_INFO_VRAM_USAGE => {
+                    card_heap(vm).map_or(0, |h| h.visible.1 + h.unmapped.1)
+                }
+                uapi::AMDGPU_INFO_VIS_VRAM_USAGE => card_heap(vm).map_or(0, |h| h.visible.1),
+                _ => crate::amdgpu_gem::gtt_used(),
+            };
+            usage.to_le_bytes().to_vec()
         }
         // amdgpu_hw_ip_info: the rings the open's card can run its jobs on.
         (uapi::AMDGPU_INFO_HW_IP_INFO, Some(vm)) => {

@@ -38,6 +38,9 @@ pub mod scheduler;
 pub mod syncobj;
 pub mod syncobj_ioctl;
 
+#[cfg(feature = "kernel-test")]
+mod framebuffer_tests;
+
 pub use atomic::{AtomicError, AtomicState, ConnectorState, CrtcState, PlaneState};
 pub use card::{Card, CardError, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder};
 pub use gem::{GemError, GemHandle, GemObject};

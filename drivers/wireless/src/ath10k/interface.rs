@@ -55,6 +55,7 @@ pub(super) struct RadioFeatures {
     power_save: bool,
     ht: Option<[u8; 26]>,
     ht40: Option<[u8; 26]>,
+    vht: Option<[u8; 12]>,
 }
 impl RadioFeatures {
     fn observed<T: Hif + HostMemory + HttMemory>(radio: &Radio<T>) -> Self {
@@ -62,6 +63,7 @@ impl RadioFeatures {
             power_save: radio.power_save_supported(),
             ht: radio.ht_capabilities(),
             ht40: radio.ht40_capabilities(),
+            vht: radio.vht_capabilities(),
         }
     }
 }
@@ -83,6 +85,7 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     ps_supported: bool,
     ht_capabilities: Option<[u8; 26]>,
     ht40_capabilities: Option<[u8; 26]>,
+    vht_capabilities: Option<[u8; 12]>,
     ps_request: AtomicU8,
     frequencies: Vec<u16>,
     mac: [u8; 6],
@@ -97,6 +100,8 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     bssid: AtomicU64,
     rx: IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
+    /// Owner interrupt signal shared with the service worker.
+    wake: IrqSafeSpinLock<Option<Arc<super::irq::Signal>>>,
 }
 impl<T: Hif + HostMemory + HttMemory> core::fmt::Debug for Device<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -151,6 +156,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 power_save: false,
                 ht: None,
                 ht40: None,
+                vht: None,
             });
         let frequencies = radio
             .try_lock()
@@ -186,6 +192,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             ps_supported: features.power_save,
             ht_capabilities: features.ht,
             ht40_capabilities: features.ht40,
+            vht_capabilities: features.vht,
             frequencies,
             // Submit the advertised awake default before first carrier.
             ps_request: AtomicU8::new(u8::from(features.power_save)),
@@ -206,6 +213,14 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             bssid: AtomicU64::new(0),
             rx: IrqSafeSpinLock::new(Some(consumer)),
             tx: IrqSafeSpinLock::new(Some(producer)),
+            wake: IrqSafeSpinLock::new(None),
+        }
+    }
+    /// Kick the service worker (host TX / power-save request).
+    fn kick(&self) {
+        let wake = self.wake.lock().clone();
+        if let Some(wake) = wake {
+            wake.raise();
         }
     }
     fn link(&self, peer: Option<[u8; 6]>) {
@@ -252,7 +267,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             .as_mut()
             .ok_or(())?
             .try_send(frame)
-            .map_err(|_| ())
+            .map_err(|_| ())?;
+        self.kick();
+        Ok(())
     }
     pub(super) fn enqueue_generation(
         &self,
@@ -282,7 +299,11 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             } else {
                 self.ht_capabilities?
             },
-            vht: None,
+            vht: if band == 5000 {
+                self.vht_capabilities
+            } else {
+                None
+            },
         })
     }
     #[cfg(any(test, feature = "kernel-test"))]
@@ -296,10 +317,16 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         }
         narf_wireless::registry::unregister(&self.name);
         narf_net::registry().unregister(&self.name);
-        // Reserve while still registered: another family's wlan%d allocation
-        // must never take this name between unregister and reservation.
-        narf_net::iface::reserve_name(&self.name);
-        narf_net::iface::unregister(&self.name);
+        // Keep the netdev for the next generation (mac80211
+        // `ieee80211_restart_hw` never unregisters it): the name is reserved
+        // atomically with removal, so no other wlan%d allocation can take it,
+        // and ifindex/admin state/addresses survive a `rebind_name`.
+        if !narf_net::iface::retire_for_rebind(&self.name) {
+            narf_net::iface::reserve_name(&self.name);
+        }
+    }
+    pub(super) fn name(&self) -> &str {
+        &self.name
     }
     pub(super) fn request_power_save(&self, enabled: bool) -> Result<(), i32> {
         if !self.ps_supported {
@@ -310,6 +337,31 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         }
         self.ps_request
             .store(if enabled { 2 } else { 1 }, Ordering::Release);
+        self.kick();
+        Ok(())
+    }
+    /// Send a queued protected SA Query Response (PMF) produced by the
+    /// synchronous drain; a failure closes the link like other data faults.
+    pub(super) async fn flush_management(&self) -> Result<(), WirelessError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(WirelessError::HardwareError);
+        }
+        let Some(mut radio) = self.radio.try_lock() else {
+            return Ok(());
+        };
+        let mut attempt = Attempt {
+            device: self,
+            armed: true,
+        };
+        let result = match self.policy.current() {
+            Ok(domain) => radio.flush_station_management(&domain).await,
+            Err(cause) => Err(cause),
+        };
+        if let Err(cause) = result {
+            radio.fail_station_data();
+            return Err(error(cause));
+        }
+        attempt.armed = false;
         Ok(())
     }
     pub(super) async fn apply_power_save(&self) -> Result<(), WirelessError> {
@@ -682,11 +734,20 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         {
             return Err(WirelessError::NotSupported);
         }
-        let (mode, pmk) = match request.security {
-            SecurityConfig::Open => (narf_wireless::association::SecurityMode::Open, None),
+        // WPA3-Personal runs host SAE and PMF; its PMK comes from SAE.
+        let (mode, pmk, password) = match &request.security {
+            SecurityConfig::Open => (narf_wireless::association::SecurityMode::Open, None, None),
             SecurityConfig::Wpa2 { psk } => (
                 narf_wireless::association::SecurityMode::Wpa2Psk,
-                Some(zeroize::Zeroizing::new(psk)),
+                Some(zeroize::Zeroizing::new(*psk)),
+                None,
+            ),
+            SecurityConfig::Wpa3 { password } if !password.is_empty() => (
+                narf_wireless::association::SecurityMode::Wpa3Sae {
+                    pwe: narf_wireless::association::SaePwe::Both,
+                },
+                None,
+                Some(zeroize::Zeroizing::new(password.clone())),
             ),
             _ => return Err(WirelessError::NotSupported),
         };
@@ -720,11 +781,34 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         )
         .await
         .map_err(error)?;
-        wmi_runtime::checked_policy(
-            radio.associate_station_checked(&domain, &request.ssid, mode, &request.ie, &validate),
-            &validate,
-        )
-        .await
+        match password.as_deref() {
+            Some(password) => {
+                wmi_runtime::checked_policy(
+                    radio.associate_station_sae_checked(
+                        &domain,
+                        &request.ssid,
+                        password,
+                        &request.ie,
+                        &validate,
+                    ),
+                    &validate,
+                )
+                .await
+            }
+            None => {
+                wmi_runtime::checked_policy(
+                    radio.associate_station_checked(
+                        &domain,
+                        &request.ssid,
+                        mode,
+                        &request.ie,
+                        &validate,
+                    ),
+                    &validate,
+                )
+                .await
+            }
+        }
         .map_err(error)?;
         let link = wmi_runtime::checked_policy(
             radio.start_data_with_nonce_checked(&domain, pmk.as_deref(), nonce, &validate),
@@ -867,6 +951,25 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Interface for Device<T> {
 }
 type Native = Device<super::boot::PciBoot>;
 static ACTIVE: IrqSafeSpinLock<Option<Arc<Native>>> = IrqSafeSpinLock::new(None);
+/// The interface name retired by the last recovery/suspend generation.
+static REBIND: IrqSafeSpinLock<Option<String>> = IrqSafeSpinLock::new(None);
+/// Record the retired generation's name for the next publication.
+pub(super) fn remember_rebind(name: &str) {
+    *REBIND.lock() = Some(String::from(name));
+}
+/// The next generation's name: the retired `wlan%d` while
+/// `narf_net::iface::rebind_name` still holds it, else a fresh one. The
+/// flag reports a rebind, whose restored operator state is kept.
+pub(super) fn generation_name() -> (&'static str, bool) {
+    match REBIND
+        .lock()
+        .take()
+        .and_then(|name| narf_net::iface::rebind_name(&name))
+    {
+        Some(name) => (name, true),
+        None => (narf_net::iface::reserve_name("wlan%d"), false),
+    }
+}
 fn send(generation: u64, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let device = ACTIVE.lock().clone().ok_or(())?;
     device.enqueue_generation(generation, bytes, meta)
@@ -882,6 +985,7 @@ pub(super) fn retire(radio: &Arc<Mutex<Radio<super::boot::PciBoot>>>) {
     *active = None;
     drop(active);
     device.retire_host();
+    remember_rebind(device.name());
 }
 fn drain() -> bool {
     let device = ACTIVE.lock().clone();
@@ -928,6 +1032,7 @@ fn publish_with_mac(
     quarantine: &AtomicBool,
     features: RadioFeatures,
     frequencies: Vec<u16>,
+    wake: (Arc<super::irq::Signal>, bool),
 ) -> Result<Arc<Native>, Error> {
     narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Unsupported)?;
     let authority = narf_net::trusted_net_authority()
@@ -938,26 +1043,42 @@ fn publish_with_mac(
         if active.is_some() {
             return Err(Error::Failed);
         }
-        let name = narf_net::iface::reserve_name("wlan%d");
+        let (name, rebound) = generation_name();
         let device = Arc::new(Device::new(name, mac, radio, features, frequencies));
         narf_net::registry()
             .register(&authority, Registered(device.clone()))
             .map_err(|_| Error::Unsupported)?;
         *active = Some(device.clone());
         narf_net::iface::register_with_context(name, mac, device.generation, send);
-        narf_net::iface::set_link_state(name, false);
+        if !rebound {
+            // A rebound netdev keeps the operator's IFF_UP across recovery.
+            narf_net::iface::set_link_state(name, false);
+        }
         narf_net::iface::set_link_metadata(name, false, None, None);
         narf_net::iface::install_rx_drain(drain);
         narf_wireless::registry::register(device.clone());
+        let (signal, delivered) = wake;
+        *device.wake.lock() = Some(signal.clone());
         let worker = device.clone();
+        // NAPI-equivalent service: wait for a CE/firmware vector, a host TX
+        // or power-save kick, or the bounded backstop; re-run at once while
+        // a drain made progress (Linux `napi_schedule` when work remains).
         narf_scheduler::spawn(async move {
             loop {
                 if worker.closed.load(Ordering::Acquire) {
                     break;
                 }
-                worker.drain();
+                let seen = signal.count();
+                let progressed = worker.drain();
+                let _ = worker.flush_management().await;
                 let _ = worker.apply_power_save().await;
-                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+                if progressed {
+                    narf_scheduler::yield_now().await;
+                    continue;
+                }
+                let ms = super::irq::fallback_ms(delivered);
+                let timer = narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(ms * 1_000_000));
+                signal.wait(seen, core::pin::pin!(timer)).await;
             }
         });
         Ok(device)
@@ -992,6 +1113,7 @@ pub(super) fn publish(
                 .copied()
                 .filter(|f| super::regulatory::Permission::profile_frequency(*f))
                 .collect(),
+            r.htt.wmi.htc.transport.interrupt(),
         )
     })
     .map_err(|_| Error::Failed)?;
@@ -1029,6 +1151,7 @@ pub(super) async fn wait_publish(
                             .copied()
                             .filter(|f| super::regulatory::Permission::profile_frequency(*f))
                             .collect(),
+                        r.htt.wmi.htc.transport.interrupt(),
                     )
                 })
                 .map_err(|_| Error::Failed)?;
@@ -1105,7 +1228,7 @@ impl WirelessNetIface for Native {
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
                 ht_supported: self.ht_capabilities.is_some(),
-                vht_supported: false,
+                vht_supported: self.vht_capabilities.is_some(),
                 he_supported: false,
                 eht_supported: false,
             },

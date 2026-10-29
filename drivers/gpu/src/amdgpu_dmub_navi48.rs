@@ -692,6 +692,12 @@ impl Dmub {
             .set_tmds_pixel_clock(path, otg, pixel_khz, depth)
             .await
     }
+    pub(crate) async fn power_down_pixel_clock(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+    ) -> Result<(), Error> {
+        self.engine.power_down_pixel_clock(path).await
+    }
     pub(crate) async fn setup_hdmi_stream(
         &mut self,
         stream: u8,
@@ -1112,6 +1118,23 @@ impl<I: Io> Engine<I> {
         request[10] = 3; // ATOM_ENCODER_MODE_HDMI
         request[12] = otg; // ATOM_CRTC1 + controller
         request[13] = depth.code(); // PIXEL_CLOCK_V7_DEEPCOLOR_RATIO_*
+        self.send(request).await
+    }
+    /// Power the transmitter's combo PHY PLL down. Linux
+    /// dce110_clock_source_power_down -> set_pixel_clock_v7: no pixel clock,
+    /// ENCODER_OBJECT_ID_NONE, ATOM_ENCODER_MODE_CRT, FORCE_PROG_PPLL and
+    /// ATOM_CRTC_INVALID.
+    async fn power_down_pixel_clock(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+    ) -> Result<(), Error> {
+        Self::hdmi_path(path)?;
+        let mut request = [0; 64];
+        request[..4].copy_from_slice(&SET_PIXEL_CLOCK);
+        request[8] = 20 + path.transmitter; // ATOM_COMBOPHY_PLL0
+        request[10] = 15; // ATOM_ENCODER_MODE_CRT
+        request[11] = 0x01; // PIXEL_CLOCK_V7_MISC_FORCE_PROG_PPLL
+        request[12] = 0xff; // ATOM_CRTC_INVALID
         self.send(request).await
     }
     /// DIG stream setup for TMDS HDMI. Linux

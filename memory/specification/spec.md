@@ -40,6 +40,10 @@ rollback and TLB shootdowns run with the cache lock released. Failure releases
 the pending claim only after installed leaves are removed; uncertain rollback
 retains the claim and virtual range. ARM rollback and teardown clear actual
 PTEs before releasing their claims, as on x86_64.
+The x86_64 ioremap window reserves 32 GiB so large resizable PCI BARs fit;
+the following 2 GiB remains the frame-backed valloc heap. Aligned 2 MiB
+non-RAM spans use large leaves, while unaligned spans and any span intersecting
+known System RAM use 4 KiB leaves. This keeps the WC-to-WB RAM clamp exact.
 
 ```rust
 pub struct PhysFrame;     // owned 4 KiB physical frame (base page)

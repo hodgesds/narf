@@ -153,12 +153,20 @@ fn smoke_rtw8821ce_native_station_radio_retry_receipts_and_retained_reserved_dma
                     qos: false,
                     mcs: 0,
                     sgi: false,
+                    ldpc: false,
+                    stbc: false,
+                    acs: 0,
+                    fallback: false,
                 })
                 || g.allows_profile(crate::rtw88::packet_format::DataProfile {
                     rates: 1,
                     qos: true,
                     mcs: 0,
                     sgi: false,
+                    ldpc: false,
+                    stbc: false,
+                    acs: 0,
+                    fallback: false,
                 })
         })
         || m.command_ring.pending()
@@ -552,8 +560,9 @@ fn composition(protected: bool) -> TestResult {
     }
     let drops = h.drops.clone();
     drop(h);
-    if drops.load(Ordering::SeqCst) != 0 {
-        return TestResult::Fail("C21 composed station teardown freed original firmware DMA");
+    // The disconnect's DMA-stop proof released the beacon ring and frame.
+    if drops.load(Ordering::SeqCst) != 2 {
+        return TestResult::Fail("C21 proven-idle station teardown kept firmware DMA retained");
     }
     TestResult::Pass
 }

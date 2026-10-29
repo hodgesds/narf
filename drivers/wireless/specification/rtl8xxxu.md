@@ -248,10 +248,9 @@ Explicit disconnect closes host admission before awaiting Linux TSF-disable
 and disconnected media state, verifies MAC TX/RX/filter closure, then uses
 proven USB Stop/SetDeq to retire outstanding native receipts. Cancellation
 retains them terminally. AP unicast/broadcast deauth/disassociation and peer
-loss close the carrier. This first service allows one association per
-firmware claim; a stopped or failed owner cannot construct fresh keys/radio
-state for rejoin. Controller-proven EP0 reset/recovery and safe rejoin remain
-software work; successful initial association is not that recovery proof.
+loss close the carrier. A completed explicit disconnect returns the service
+to Passive for a safe rejoin (below); a failed owner cannot construct fresh
+keys/radio state. Controller-proven EP0 reset/recovery remains software work.
 
 Disconnect publishes down immediately and repeats that publication after
 acquiring device state, the same mutex held by every up publisher. A previous
@@ -291,7 +290,7 @@ Explicit registration, operator up/down and autoconnect remain administrative
 events. Disconnect/failure clears carrier and peer identity while preserving an
 operator-UP interface; a later physical carrier sample cannot undo operator DOWN.
 
-### Negotiated RTL8188EU WMM BE/TID0
+### Negotiated RTL8188EU WMM (all ACs/TIDs)
 
 A valid AP WMM Parameter element selects an optional legacy QoS station.
 The driver appends its own Information IE requesting no U-APSD and requires
@@ -303,11 +302,34 @@ hardware8-bit AIFS field before any EDCA write.
 
 Linux `rtl8xxxu_conf_tx` plus `rtl8xxxu_set_aifs` supply BE/BK/VI/VO registers
 0x508/50c/504/500, ECW/TXOP fields and SIFS10 plus AIFSN times9/20us slot.
-Every EP0 write has an exact readback. The only selected queue is conservative
-BE (AIFSN>=3, ECWmin>=5, ECWmax>=10, TXOP0); source ACM queue bits are cleared.
-Only then may the retained bulk owner admit a QoS DATA header with TID0 and
-TXDESC32_QOS. This legacy WMM grant keeps other priorities, HT/BA, U-APSD,
+Every EP0 write has an exact readback. BE stays conservative (AIFSN>=3,
+ECWmin>=5, ECWmax>=10, TXOP0); BK/VI/VO use the AP rows. As in
+`rtl8xxxu_conf_tx`, REG_ACM_HW_CTRL BK0/BE1/VI2/VO3 mirror each AC's ACM
+(`wmm_runtime::acm_bits`; BE ACM is refused). Only then may the retained bulk
+owner admit QoS DATA with TXDESC32_QOS. This WMM grant keeps HT/BA, U-APSD,
 TSPEC and QoS Null closed; the distinct HT grant below cannot be inferred from it.
+
+#### Traffic classification and all-AC/TID routing (implemented)
+
+`station_runtime.rs::send_ethernet` classifies each Ethernet frame with
+`cfg80211_classify8021d` (DSCP/RFC 8325, MPLS TC, 802.21) and mac80211
+`ieee80211_downgrade_queue` over the AP ACM rows (shared
+`rtlwifi::wmm::priority`), writes that TID into the QoS control before
+software CCMP (also the CCMP nonce priority) and keeps per-TID SN spaces
+(Open: `qos_sequence`; CCMP: shared `Security`). `packet_codec.rs` accepts QoS
+DATA TID0..7 with normal ACK and sets TXDESC queue per
+`rtl8xxxu_queue_select`/`rtl8xxxu_80211_to_rtl_queue`: BK2, BE0, VI5, VO7,
+MGNT0x12 (the TID itself is not a descriptor field upstream).
+`packet_transport.rs` selects the bulk-out pipe from
+`rtl8xxxu_init_queue_priority`: one endpoint carries all; two put VO/VI on
+out_ep[0] and BE/BK on out_ep[1]; three put BE/BK on out_ep[2] and VI on
+out_ep[1], and VO also on out_ep[1] because upstream derives `vop` from
+`viq ^ 3`. This matches the TRXDMA_CTRL/RQPN mapping already programmed by
+`device_init::pre_firmware`. Smoke
+`smoke_rtl8188eu_wmm_classifies_dscp_to_all_tids_queues_and_bulk_pipes`
+(Open and WPA2) checks the pipe table for1/2/3 endpoints, each AC's
+queue/DCI, per-TID SN, CCMP priority at the fixture AP, REG_ACM_HW_CTRL and
+the VO->VI and VO+VI->BE downgrades.
 Open frames and host CCMP use the26-byte header; CCMP protection occurs before
 USB staging, and the shared key owner retains per-key/TID replay state.
 
@@ -319,7 +341,28 @@ association invokes that cap and rechecks the current installed country/power
 permission; active work never bootstraps a cleared policy. Packet publication
 and completion also require this retained proof. Missing/changed/revoked proof
 is terminal and cannot publish QoS, reuse pending USB storage or revive carrier.
-Bound AP parameter changes require a fresh lifecycle.
+#### Live EDCA updates (implemented)
+
+mac80211 `ieee80211_sta_wmm_params` re-applies EDCA only when a beacon from
+the bound AP carries a different WMM Parameter Set Count; `drv_conf_tx` then
+reaches `rtl8xxxu_conf_tx` for each AC. `station_runtime.rs::observe_wmm`
+follows that on both the async join path and the synchronous Open network
+path: an unchanged count is ignored (even if element bytes differ), a new
+count is checked by `wmm_runtime::words_profile` (BE ACM, ECW/AIFSN geometry,
+8-bit AIFS) before any EP0 access and recorded as pending; losing WMM after
+a WMM association is peer loss. The synchronous path never awaits EP0.
+`Station::maintain` (driven by `Service::maintain` and the interface worker
+via `Device::maintain`, which takes the owner without waiting so a
+synchronous network drain is never blocked) and `step` apply the pending
+rows through the same checked `configure_wmm_phy` EDCA/REG_ACM_HW_CTRL
+writes and readbacks inside the retained signed/policy fence, then switch
+host classification/ACM downgrade to the new rows. Cancellation or EP0
+failure is terminal and retains posted USB ownership. Smoke
+`smoke_rtl8188eu_wmm_beacon_parameter_set_count_updates_live_edca` (Open and
+WPA2) covers the ignored same-count beacon, no EP0 from the sync path, the
+literal updated rows and VO ACM bit, VO->VI downgrade after the update,
+ignored same-count byte changes, held-EP0 cancellation, and terminal
+pre-write refusal of BE-ACM and WMM loss.
 
 Two native Rust smokes compose actual EP0/bulk owners through Open/WPA2,
 literal EDCA/TXD values, exact QoS/CCMP data, actual cap loss, malformed response,
@@ -393,13 +436,14 @@ default3839-byte A-MSDU. Complete selected response HT Cap45/Operation61 must
 bind the original peer/primary1 offer,20MHz, supported protection mode and WMM.
 No mandatory membership selector is stripped. DATA chooses the highest actual
 response-bound MCS; source TXDESC32/v3 uses rate12..19, USE_DRIVER_RATE,
-DISABLE_DATA_FB, raw26-byte QoS/TID0 and software CCMP, with SGI/BW40/AGG/RTS
-disabled. Management and EAPOL keep legacy1Mbps. EU rate selection is host-owned;
+DISABLE_DATA_FB, raw26-byte QoS with the classified TID and software CCMP, with SGI/BW40/AGG/RTS
+disabled (AGG/RTS now follow the originator BA rules below, and the rate and
+fallback follow host rate adaptation below). Management and EAPOL keep legacy1Mbps. EU rate selection is host-owned;
 no C21/C22 H2C rate-mask callback or invented firmware-applied ACK is added.
 
 Native `rxdesc16` rate/HT/BW, fragment, aggregate, QoS/TID and A-MSDU facts are
 checked before crypto. HT MCS0..7 requires BW20/LGI and no greenfield/HT-control/
-EOSP/A-MPDU metadata. With PHYST present, the bounded32-byte padded
+EOSP metadata; A-MPDU metadata only under the recipient BA rules below. With PHYST present, the bounded32-byte padded
 `rtl8723au_phy_stats` block must agree with LGI and the selected full20MHz RXSC
 profile. This old block has no independent channel or C21/C22 page number;
 the source-owned fixed channel and descriptor supply those facts. PHYST absent
@@ -409,12 +453,66 @@ A-MSDU/TID disagreement are discarded. Only complete original standalone
 3839-byte A-MSDUs enter shared whole-aggregate authentication/deaggregation;
 bad MIC or a bad later subframe publishes no prefix and consumes no PN.
 
-The retained station owns valid bound immediate ADDBA requests for TIDs0..7
-and sends the actual33-byte status37 decline through the native management
-descriptor/USB endpoint. Ordinary DATA waits for that exact terminal receipt;
-a USB completion is host delivery, not a fabricated radio ACK. No BA agreement,
-reorder window or TX aggregation is enabled. Cancellation, source loss or an
-uncertain transfer retains outstanding USB resources and cannot reopen them.
+#### Recipient Block Ack, RX A-MPDU and reordering (implemented)
+
+`rtl8xxxu_ampdu_action` RX_START/RX_STOP program no register: the RTL8188EU
+MAC acknowledges A-MPDUs autonomously and mac80211 owns the session and the
+reorder buffer. `station_runtime.rs` follows mac80211 `agg-rx.c`
+`__ieee80211_start_rx_ba_session` for every peer-bound ADDBA Request on the
+HT profile: TID>=8 (TSPEC) answers status37; delayed policy (no
+`IEEE80211_HT_CAP_DELAY_BA`) or a window above `IEEE80211_MAX_AMPDU_BUF_HT`
+answers38; window0 selects64; a repeated dialog token succeeds only with an
+unchanged timeout (else37, session kept); a new token replaces the session
+without DELBA. The33-byte response echoes token/timeout, sets immediate policy
+and clears A-MSDU permission (rtl8xxxu lacks `SUPPORTS_AMSDU_IN_AMPDU`) and is
+sent through the native management descriptor/USB endpoint as before; ordinary
+DATA still waits for that exact terminal receipt.
+
+The session head starts at the request SSN. Unicast QoS DATA from the bound
+peer on a session TID passes through the shared `narf_wireless::reorder`
+buffer (`ieee80211_rx_reorder_ampdu`) before CCMP/PN, A-MSDU deaggregation or
+delivery; released original captures re-enter the batch in sequence order and
+keep their capture-time port/epoch admission. Only such MPDUs may carry rxdesc16
+PAGGR/FAGGR, and only without the A-MSDU bit. Holes release after mac80211's
+100ms `HT_RX_REORDER_BUF_TIMEOUT`; old/duplicate sequences are dropped. The
+EU RX filter passes no BlockAckReq (REG_RXFLTMAP1 PS-Poll only, no
+RCR_ACCEPT_CTRL_FRAME, as `rtl8xxxu_configure_filter` in station mode), so
+BAR-driven advance does not occur. A nonzero session timeout without traffic
+(`sta_rx_agg_session_timer_expired`) purges the buffer and queues a30-byte
+recipient DELBA with `WLAN_REASON_QSTA_TIMEOUT`; an originator DELBA purges
+the session. Failure/disconnect purge every session. Smokes
+`smoke_rtl8188eu_ht20_rx_ba_reorders_ampdu_before_pn` (Open/WPA2: held native
+response receipt, literal response, out-of-order release, duplicate, timeout
+release, A-MSDU-in-A-MPDU refusal, standalone A-MSDU on a BA TID, DELBA) and
+`smoke_rtl8188eu_ht20_rx_ba_policy_and_inactivity_delba` cover the paths.
+Cancellation, source loss or an uncertain transfer retains outstanding USB
+resources and cannot reopen them.
+
+#### Originator Block Ack and TX A-MPDU (implemented)
+
+`rtl8xxxu_tx` marks every QoS DATA to an HT peer `ampdu_enable`:
+`rtl8xxxu_fill_txdesc_v3` then carries the peer MPDU density in txdw2,
+RTS/CTS + HW RTS at DESC_RATE_24M in txdw4, and TXDESC40_AGG_ENABLE instead of
+AGG_BREAK only on an operational TID (`packet_codec::aggregate_fields`, applied
+by the packet owner after the checksummed descriptor is built). The first such
+frame on an idle TID starts a session (`ieee80211_start_tx_ba_session`, gated
+by mac80211's HT_AGG_MAX_RETRIES15 / HT_AGG_BURST_RETRIES3 within 15s). The
+async `Station::maintain`/`step` path performs `rtl8xxxu_ampdu_action` TX_START
+(`rtl8xxxu_set_ampdu_factor` REG_AGGLEN_LMT 0x458..0x45b from the fixed
+0x41/a8/72/b9 table clamped to 1<<(factor+2), and `rtl8xxxu_set_ampdu_min_space`
+read-modify-write of 0x45c, each with readback) before queueing the ADDBA
+Request: immediate policy, A-MSDU clear, window64, timeout0, SSN = the TID's
+next sequence (Open counter or shared `Security::next_qos_sequence`). A matching
+response with status0 and nonzero window makes the TID operational; any other
+status stops it without DELBA; no response within `ADDBA_RESP_INTERVAL` (1s) or
+an operational session timeout stops it as a local request with an initiator
+DELBA `WLAN_REASON_QSTA_NOT_USE`; a recipient DELBA stops it silently. Every
+stop performs TX_STOP (factor0/density0) over EP0 first, as Linux does. The
+sync network path never awaits EP0. Smoke
+`smoke_rtl8188eu_ht20_originator_ba_and_tx_ampdu` (Open/WPA2) covers literal
+descriptor bits before/after operation, TX_START/TX_STOP EP0 writes, the
+literal request, peer DELBA, response timeout DELBA, restart token and decline.
+The HT program binding records the new RTS/aggregation emission profile.
 
 RX copies record controlled-port admission and a receive/key generation before
 processing. Native terminal M2/M4/Group2 plus actual receive-idle precede shared
@@ -436,9 +534,139 @@ responses, actual held ADDBA/M4 receipts, closed captures, each current source,
 policy loss and reentrant key/ordinary-credit publication. These cases pass
 both-architecture native QEMU and coordinated build/Clippy gates. Physical
 USB/RF/HT interoperability and exact-device measured qualification remain external.
-SGI20, HT40, RX A-MPDU, TX A-MPDU, TX A-MSDU, recipient/originator BA and RX
-reordering, all AC/TIDs, adaptive rates, broader scans/channels, coexistence,
-PM and reset/rejoin remain software work.
+SGI20, HT40, broader scans/channels, coexistence
+and reset/rejoin remain software work.
+
+#### Host rate adaptation and rate fallback (implemented)
+
+The RTL8188EU has no firmware rate adaptation; Linux runs the vendor
+algorithm on the host (`8188e.c`). `rate_adaptation.rs` ports it as pure
+state: `rtl8188e_ra_info_init_all` (decision MCS7, PT_STAGE 5, report time
+1200 ms), `rtl8188e_update_rate_mask`/`rtl8188e_arfb_refresh`,
+`rtl8188e_rate_decision` with the normal-cut `retry_penalty*`,
+`rssi_threshold`, `n_threshold_*`, `dropping_necessary` and
+`pending_for_rate_up_fail` tables, `rtl8188e_rate_down`/`_up` with the
+`dynamic_tx_rpt_timing` steps, and the power-training stages (upstream forces
+PT off after `rtl8188e_power_training_try_state`, so PT_STAGE falls to 0 after
+the fifth decision and `rtl8188e_power_training_decision` is unreachable).
+Cut I (chip_cut 8) is refused at identification as in
+`rtl8188eu_identify_chip`, so its tables are not carried.
+
+`packet_codec::Record::Report` now keeps the rxdesc16 `pktlen` and the
+DW5:DW4 `macid_valid` words. `Receiver::poll` feeds every rpt_sel 2 record to
+`rtl8188e_handle_ra_tx_report2` (station mode: item 0 only, decision only when
+MACID 0 is valid and the total is nonzero); a changed minimum report time is
+owed to the async `Station::maintain`/`step` path, which writes
+REG_TX_REPORT_TIME (0x4f0) with readback. Failure or cancellation is terminal.
+At association (`rtl8xxxu_bss_info_changed` BSS_CHANGED_ASSOC) the WMM station
+starts RA with the full negotiated mask (`supp_rates[0] | rx_mask[0] << 12`,
+SGI off because the qualified profile is LGI-only) and RATR_STA_INIT. Bound-BSS
+frames addressed to the station, and beacons, update
+`DECLARE_EWMA(rssi, 10, 16)` from PHY status (`rtl8723au_rx_parse_phystats`:
+OFDM `(pwdb_all >> 1) - 110`, CCK `rtl8188e_cck_rssi` LNA/VGA tables; a record
+without PHY status contributes signal 0, as upstream's zeroed rx_status does).
+Every 2 s (`rtl8xxxu_watchdog_callback` -> `rtl8xxxu_ra_iter`) the SNR
+(`rtl8xxxu_signal_to_snr`) becomes `rssi_sta_ra` and
+`rtl8xxxu_refresh_rate_mask` applies the HIGH/MID/LOW hysteresis (thresholds
+50/20, go-up gap 5) and the 1SS B/G/BG/GN/BGN bitmaps.
+
+DATA on the WMM path (`rtl8xxxu_fill_txdesc_v3`) now carries
+`ra->decision_rate`, USE_DRIVER_RATE, PT_STAGE in txdw4[17:15] and the
+0x0001ff00 data/RTS fallback limits with TXDESC_DISABLE_DATA_FB cleared, so
+the MAC falls back autonomously within the limits (`rate_fallback`). Upstream
+never sets DISABLE_DATA_FB; the former fixed highest-rate DATA set it. One
+bound is added: `init_all` starts at MCS7 before any mask exists, and the TX
+rate is clamped to `highest_rate` while the decision lies outside the mask
+(the same clamp rate_decision applies), so a legacy peer never receives an
+MCS. Management and EAPOL keep CCK1, and the non-WMM legacy path keeps CCK1.
+The HT program binding records the host RA emission profile. Smokes under
+`drivers/wireless/rtl8xxxu/rate` (both architectures) cover decision/report
+timing, invalid and short reports, mask floor/clamp, RSSI decoding/EWMA/
+levels/bitmaps and the adaptive descriptor; composed
+`smoke_rtl8188eu_ht20_host_rate_adaptation_and_fallback` (x86_64) covers the
+initial descriptor, the REG_TX_REPORT_TIME EP0 writes, rate_down on a loss
+report, terminal failure of the write and teardown.
+
+### Bulk endpoint halt recovery and transfer-slot reuse (implemented)
+
+xHCI leaves a bulk endpoint Halted after a Stall, Babble or USB Transaction
+Error completion (xHCI 1.2 §4.10.2). Upstream `rtl8xxxu_rx_complete`
+resubmits only after -EPROTO/-EILSEQ/-ETIME/-EOVERFLOW/-ECOMM/-ENOSR (where
+Linux xHCI already performed its internal halted-endpoint reset) and frees
+the URB on -EPIPE, so a stall permanently loses that receive slot. NARF has
+no hidden controller-side reset, so `packet_transport::Owner` follows the
+USB core `usb_clear_halt` contract instead of failing:
+
+- A halting completion on the bulk-IN or bulk-OUT receipt marks only that
+  pipe halted (`Error::Halted`); the receipt stays retained. The other pipe
+  keeps working (independent endpoint contexts). Every other USB error,
+  short transmit and descriptor error stays terminal.
+- `Owner::recover` runs `USBDevice::clear_endpoint_halt` (Reset Endpoint +
+  Set TR Dequeue to a fresh dequeue, proven Stopped, then
+  CLEAR_FEATURE(ENDPOINT_HALT) resetting the device toggle) for exactly the
+  halted endpoint address, drops the now-stale token, reposts the bulk-IN
+  receipt and reopens the single TX slot. The packet that was in flight on
+  a halted OUT pipe is reported as `transmit_lost` (no USB receipt, no ACK
+  claim). Recovery follows the `stop` discipline: the owner is terminal
+  while the future runs, so an error or a dropped future leaves it failed
+  with every receipt retained.
+- `Owner::stop` recovers a halted pipe first (a Halted endpoint cannot be
+  stopped), so a stopped owner is always reusable on its channel by `start`
+  (fresh RX receipt, empty TX slot). `Receiver` stop/start (Stopped →
+  Receiving) is the reopen path for the radio.
+- `Receiver::poll`/`poll_delivery` report a halted pipe as "pending" rather
+  than an error; `recovery_pending` feeds the existing async maintenance
+  path. `Station::maintain` (FourWay/Open) and `Service::maintain` (Passive
+  scan) call `Receiver::recover` inside the current authority fence. A lost
+  best-effort DATA/Control packet is dropped; a lost EAPOL/MLME frame is
+  terminal (no retransmission owner exists for it). Join-phase halts are not
+  recovered: the join deadline fails the attempt as before.
+
+Tests: `smoke_rtl8188eu_packet_halted_pipes_recover_and_reuse_slots` (all
+three halting codes, pipe isolation, IN repost/OUT slot reuse, stop of a
+halted owner, reset failure and cancelled recovery are terminal) and
+`smoke_rtl8188eu_station_endpoint_halt_recovery_keeps_association` (open
+station survives IN and OUT halts with a full roundtrip afterwards,
+disconnect of a halted station, failed reset is terminal).
+
+### Safe rejoin after disconnect (implemented)
+
+Linux v7.2 mac80211 `ieee80211_set_disassoc` (`net/mac80211/mlme.c`)
+clears the link BSSID, so `rtl8xxxu/core.c::rtl8xxxu_bss_info_changed`
+runs `BSS_CHANGED_ASSOC` (`report_connect(..., false)`, TSF-update
+disable) and `BSS_CHANGED_BSSID` → `rtl8xxxu_set_bssid(zero)`; the driver
+keeps receiving and mac80211 may scan and associate again with new keys.
+NARF follows that on the retained owners:
+
+- `Service::disconnect` runs the existing `Station::disconnect` (media
+  disconnect, MAC TX/RX/filter closure, proven USB Stop/SetDeq), then
+  `Station::into_radio` returns the stopped `Receiver` and drops the station
+  with its keys, PN/replay windows, BA sessions and plan.
+- `Receiver::release_station` (Stopped only) writes REG_BSSID
+  0x618..0x61d to zero with readback and clears the bound `peer`,
+  `ra_info` and the owed TX report time, so `prepare_station` accepts the
+  next peer. `Receiver::start` (Stopped → Receiving) reopens RX-only
+  reception on a fresh bulk-IN receipt; the service is `Passive` again and
+  a later `connect` builds a fresh station (fresh SNonce/PTK and CCMP).
+- `interface::Device::disassociate` closes admission before waiting (stale
+  publishers are fenced exactly as before) and, only when the disconnect
+  completed with a Passive service and no failure, reopens admission under
+  the same state guard and resets the RX Narf-Ring generation so the next
+  station publishes a new consumer. `closed` is therefore no longer
+  permanent after disassociate; any failed teardown, failed association or
+  authority loss still closes terminally.
+- Any EP0/USB failure while releasing or restarting is terminal and keeps
+  the radio retained (`Service::fail`), like every other runtime write.
+
+Tests: `smoke_rtl8188eu_service_composes_passive_scan_optional_ies_rsna_and_sync_network`
+(disconnect → Passive with BSSID zero and RX-only CR, a second WPA2
+association with fresh 4-way/CCMP and data, second teardown),
+`smoke_rtl8188eu_{open,wpa2}_native_scan_dhcp_and_bidirectional_ip` and
+the HT20 variants (composed Device: old receipt stopped and a distinct
+passive receipt posted, rescan, re-association with a fresh AP session and
+uplink, second disconnect), `smoke_rtl8188eu_disconnect_overrides_waiting_old_link_publication`
+(stale publisher still fenced) and the failed USB stop smoke (teardown
+failure stays closed; no rejoin).
 
 ## 4. Invariants
 
@@ -447,7 +675,8 @@ PM and reset/rejoin remain software work.
 - Preserve unrelated SYS/MCU/page-selector fields; reset the checksum with
   its W1C bit, disable download mode before start, reset 8051, and await both
   checksum and init-ready. RTL8188EU does not use another chip's HMTFR init.
-- Short reads/writes, checksum/start failures and USB errors are terminal.
+- Short reads/writes, checksum/start failures and USB errors are terminal,
+  except bulk-pipe halts, which `Owner::recover` resets as specified above.
   No failure cleanup may reuse EP0: Future Drop/error does not prove that
   xHCI retired the prior TD or released its persistent control-data buffer.
 - The initialization attempt is bounded to 30 seconds. Cancellation/deadline
@@ -493,20 +722,51 @@ channels/rates, reset/rejoin and PM still need software implementation.
 | Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX. Separate N8HT HT20/LGI MCS0..7/whole A-MSDU/decline/capture-publication continuation passes native software gates above. Management/basic1Mbps and channel1 remain required. SGI/HT40, retune, broader bands/adaptation and coexistence remain missing |
 | USB transfer ownership / stale handles | EP0 + bulk claims, retained command DMA and generation rejection implemented; slot reuse stays gated |
 | Non-stream bulk stop/drain | Implemented in USB; exact commands/context/event-prefix proof |
-| Disconnect/peer-loss callbacks and normal bulk stop | Implemented; one association per firmware claim |
-| EP0/Halted reset, safe rejoin, FIFO retune and PM recovery | Missing; software prerequisites |
+| Disconnect/peer-loss callbacks and normal bulk stop | Implemented; a completed disconnect returns to Passive (safe rejoin) |
+| EP0/Halted reset, safe rejoin, FIFO retune and PM recovery | Bulk halt recovery and safe rejoin implemented; EP0 reset, FIFO retune and PM missing |
 
 Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 `8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional
 BT/S0S1. EU's separately qualified HT20/LGI continuation is software-validated above;
-SGI20/HT40, RX A-MPDU, TX A-MPDU/TX A-MSDU, recipient/originator BA, RX reorder, full WMM
-AC/TID routing, adaptive rates, broader active/passive scanning, runtime PM and
-reset/rejoin remain software work. 8192EU/8723BU first need their own retained power/firmware/radio/
+SGI20/HT40,
+broader active/passive scanning, runtime PM and
+reset/rejoin remain software work. Full WMM AC/TID routing is implemented.
+
+Power-management inventory (upstream `rtl8xxxu/core.c`): `rtl8xxxu_probe`
+sets only SIGNAL_DBM, HAS_RATE_CONTROL, SUPPORT_FAST_XMIT, AMPDU_AGGREGATION
+and MFP_CAPABLE (no SUPPORTS_PS/DYNAMIC_PS), `rtl8xxxu_ops` has no
+`.suspend`/`.resume`/WoWLAN, and `rtl8xxxu_driver` has no
+`.suspend`/`.resume`/`.reset_resume`/`.supports_autosuspend` but sets
+`.disable_hub_initiated_lpm = 1`. The only power transitions are
+`fops->enable_rf` in `rtl8xxxu_start`, `fops->disable_rf` in `rtl8xxxu_stop`
+and `fops->power_off` at disconnect. There are no PM submodes beyond that
+interface start/stop radio power path (the remaining
+`runtime_power_management` row); LPS/IPS/WoWLAN/USB autosuspend/LPM are
+inapplicable to this family. 8192EU/8723BU first need their own retained power/firmware/radio/
 packet/station compositions, including2-chain or coexistence dependencies.
 The repository's matched8821CU/8822BU profiles need the actual upstream
 `rtw88/rtw8821cu.c`/`rtw8822bu.c` USB transport and C21/C22B radio semantics;
 EU descriptor/register helpers cannot establish those VHT runtimes. No
 unsupported initial profile is marked hardware-inapplicable here.
+
+Source-proven inapplicability (rows removed from the remaining inventory):
+
+- **TX A-MSDU.** mac80211 `tx.c::ieee80211_amsdu_aggregate` returns early
+  unless the hardware sets `TX_AMSDU`; `rtl8xxxu_probe` sets only SIGNAL_DBM,
+  HAS_RATE_CONTROL, SUPPORT_FAST_XMIT, AMPDU_AGGREGATION and MFP_CAPABLE, so
+  mac80211 never builds an A-MSDU for this family. (RX of standalone A-MSDUs
+  is implemented above.)
+- **TSPEC admission.** `nl80211.c` exposes `NL80211_CMD_ADD_TX_TS` (and
+  `nl80211_add_tx_ts` returns `-EOPNOTSUPP` otherwise) only when the driver sets
+  `NL80211_FEATURE_SUPPORTS_WMM_ADMISSION`; mac80211 `ieee80211_add_tx_ts`
+  never originates ADDTS itself. `rtl8xxxu/core.c` never sets that wiphy feature, so no TSPEC
+  can be admitted; the implemented ACM downgrade (`ieee80211_downgrade_queue`)
+  is the complete upstream behaviour for ACM ACs.
+- **U-APSD.** mac80211 `mlme.c::ieee80211_mgd_assoc` sets
+  `assoc_data->uapsd` only when the vif has `IEEE80211_VIF_SUPPORTS_UAPSD`,
+  otherwise the WMM Information element carries QoS Info 0 and U-APSD is never
+  enabled. `rtl8xxxu/core.c` never sets that flag (no `driver_flags` assignment, no SUPPORTS_PS), so U-APSD is inapplicable; the
+  driver-owned Information IE requesting no U-APSD is the complete behaviour.
 
 Linux references: `rtl8xxxu/8188e.c` power/reset, IQK and fops;
 `rtl8xxxu/core.c` firmware, post-table init, HSSI, LC and IQ matrix functions;

@@ -6,7 +6,7 @@
 set -eu
 
 usage() {
-    echo "usage: narf-uefi install|remove|status [--esp PATH] [--source PATH] [--sign-with-sbctl|--no-sbctl-sign] [--no-manager-hooks] [--quiet]" >&2
+    echo "usage: narf-uefi install|remove|status [--esp PATH] [--source PATH] [--limine-config PATH] [--sign-with-sbctl|--no-sbctl-sign] [--no-manager-hooks] [--quiet]" >&2
     exit 2
 }
 
@@ -20,6 +20,7 @@ state_dir=${NARF_UEFI_STATE_DIR:-/var/lib/narf}
 manager_hooks=1
 quiet=0
 sbctl_sign=auto
+limine_config_override=
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -31,6 +32,11 @@ while [ "$#" -gt 0 ]; do
         --source)
             [ "$#" -ge 2 ] || usage
             source_dir=$2
+            shift 2
+            ;;
+        --limine-config)
+            [ "$#" -ge 2 ] || usage
+            limine_config_override=$2
             shift 2
             ;;
         --no-manager-hooks)
@@ -68,6 +74,7 @@ warn() {
 
 state_file=$state_dir/esp-path
 sbctl_state_file=$state_dir/sbctl-sign
+limine_state_file=$state_dir/limine-config
 
 fat_mount() {
     candidate=$1
@@ -156,6 +163,91 @@ grub_fallback_dir=$esp/boot/limine
 grub_fallback_config=$grub_fallback_dir/limine.conf
 bls_entry=$esp/loader/entries/narf.conf
 config_marker='# Managed by narf-uefi'
+host_limine_config=$limine_config_override
+if [ -z "$host_limine_config" ] && [ -f "$limine_state_file" ]; then
+    host_limine_config=$(sed -n '1p' "$limine_state_file")
+fi
+host_limine_kernel=
+
+# Adopt an existing hardware-test entry without changing its root policy,
+# command line, firmware modules, menu defaults, or EFI application. Older
+# grub-image bundles use boot/narf-frame rather than EFI/NARF/narf-frame.
+# Keep that referenced kernel synchronized with the same package payload.
+check_host_limine() {
+    [ -n "$host_limine_config" ] || return 0
+    [ "$loader_kind" = limine ] || {
+        echo "narf-uefi: --limine-config requires an x86_64 Limine payload" >&2
+        return 1
+    }
+    canonical_esp=$(realpath -e "$esp")
+    canonical_config=$(realpath -e "$host_limine_config") || return 1
+    case "$canonical_config" in
+        "$canonical_esp"/*) ;;
+        *) echo "narf-uefi: Limine config must be on the selected ESP" >&2; return 1 ;;
+    esac
+    [ "$canonical_config" != "$canonical_esp/EFI/NARF/limine.conf" ] || {
+        echo "narf-uefi: --limine-config must name the host menu, not the package config" >&2
+        return 1
+    }
+    host_limine_path=$(awk '
+        /^[ \t]*\// {
+            name = $0
+            sub(/^[ \t]*\/+/, "", name)
+            sub(/[ \t\r]+$/, "", name)
+            active = (name ~ /^NARF([ \t]|$)/)
+            if (active) entries++
+            next
+        }
+        active {
+            line = $0
+            sub(/^[ \t]+/, "", line)
+            sub(/[ \t\r]+$/, "", line)
+            if (line ~ /^protocol:[ \t]*/) {
+                sub(/^protocol:[ \t]*/, "", line)
+                protocol = line
+                protocols++
+            }
+            if (line ~ /^path:[ \t]*/) {
+                sub(/^path:[ \t]*/, "", line)
+                path = line
+                paths++
+            }
+        }
+        END {
+            if (entries != 1 || protocols != 1 || paths != 1 || protocol != "multiboot2")
+                exit 1
+            print path
+        }
+    ' "$canonical_config") || {
+        echo "narf-uefi: expected exactly one NARF Multiboot2 entry in $host_limine_config" >&2
+        return 1
+    }
+    case "$host_limine_path" in
+        *\#*)
+            entry_hash=${host_limine_path#*\#}
+            expected_hash=$(sed -n '1p' "$source_dir/kernel.blake2b")
+            [ "$entry_hash" = "$expected_hash" ] || {
+                echo "narf-uefi: host Limine entry has a different kernel digest; update its path digest first" >&2
+                return 1
+            }
+            host_limine_path=${host_limine_path%%\#*}
+            ;;
+    esac
+    case "$host_limine_path" in
+        'boot():/boot/narf-frame') host_limine_kernel=$canonical_esp/boot/narf-frame ;;
+        'boot():/EFI/NARF/narf-frame') host_limine_kernel=$canonical_esp/EFI/NARF/narf-frame ;;
+        *)
+            echo "narf-uefi: unsupported host NARF path: $host_limine_path" >&2
+            return 1
+            ;;
+    esac
+    [ -f "$host_limine_kernel" ] && [ ! -L "$host_limine_kernel" ] &&
+        [ "$(realpath -e "$host_limine_kernel")" = "$host_limine_kernel" ] || {
+        echo "narf-uefi: host Limine kernel must be an existing regular file on the ESP" >&2
+        return 1
+    }
+    host_limine_config=$canonical_config
+}
 
 payload_arch=x86_64
 loader_kind=limine
@@ -189,6 +281,7 @@ has_other_limine() {
 
 remove_limine_entry() {
     [ "$manager_hooks" -eq 1 ] || return 0
+    [ -z "$host_limine_config" ] || return 0
     if command -v limine-entry-tool >/dev/null 2>&1 && [ -f /boot/limine.conf ]; then
         if ! limine-entry-tool --remove-efi-path "$loader" --quiet >/dev/null 2>&1; then
             warn "could not remove the CachyOS Limine menu entry"
@@ -198,6 +291,7 @@ remove_limine_entry() {
 
 case "$command_name" in
     status)
+        check_host_limine || exit 1
         missing=0
         for path in "$loader" "$kernel" "$bls_entry"; do
             if [ ! -f "$path" ]; then
@@ -251,6 +345,16 @@ case "$command_name" in
         echo "kernel: $kernel"
         echo "version: ${version:-unknown}"
         echo "architecture: $payload_arch"
+        if [ -n "$host_limine_kernel" ]; then
+            echo "host Limine config: $host_limine_config"
+            echo "host Limine kernel: $host_limine_kernel"
+            if cmp -s "$source_dir/narf-frame" "$host_limine_kernel"; then
+                echo "host Limine kernel matches package: yes"
+            else
+                echo "stale: host Limine entry loads a different NARF kernel"
+                current=0
+            fi
+        fi
         if [ -f "$sbctl_state_file" ]; then
             echo "Secure Boot loader: locally signed with sbctl"
         elif [ "$(sed -n '1p' "$source_dir/secure-boot-signed" 2>/dev/null || true)" = yes ]; then
@@ -285,6 +389,10 @@ case "$command_name" in
         fi
         rm -f "$state_file"
         rm -f "$sbctl_state_file"
+        if [ -f "$limine_state_file" ]; then
+            warn "retained the pre-existing host Limine config at $host_limine_config; remove its NARF entry if no longer needed"
+            rm -f "$limine_state_file"
+        fi
         rmdir "$state_dir" 2>/dev/null || true
         say "removed NARF UEFI payload from $esp"
         exit 0
@@ -329,6 +437,11 @@ if [ "$loader_kind" = limine ] &&
     echo "narf-uefi: Limine configuration is not bound to the packaged kernel" >&2
     exit 1
 fi
+
+# Validate an explicitly selected or previously adopted host entry before
+# touching the installed payload. A malformed or moved menu is an error,
+# rather than a successful install that leaves the selected kernel stale.
+check_host_limine || exit 1
 
 case "$(sed -n '1p' "$source_signed")" in
     yes) package_signed=1 ;;
@@ -412,11 +525,16 @@ tmp_kernel=$efi_dir/.narf-frame.$$
 tmp_config=$efi_dir/.limine.conf.$$
 tmp_grub_fallback=
 tmp_signed_loader=
+tmp_host_kernel=
+tmp_host_backup=
+if [ -n "$host_limine_kernel" ] && [ "$host_limine_kernel" != "$(realpath -m "$kernel")" ]; then
+    tmp_host_kernel=$host_limine_kernel.narf-tmp.$$
+fi
 if [ "$manage_grub_fallback" -eq 1 ]; then
     tmp_grub_fallback=$grub_fallback_dir/.limine.conf.$$
 fi
 tmp_bls=$esp/loader/entries/.narf.conf.$$
-trap 'rm -f "$tmp_loader" "$tmp_kernel" "$tmp_config" ${tmp_grub_fallback:+"$tmp_grub_fallback"} ${tmp_signed_loader:+"$tmp_signed_loader"} "$tmp_bls"' EXIT HUP INT TERM
+trap 'rm -f "$tmp_loader" "$tmp_kernel" "$tmp_config" ${tmp_grub_fallback:+"$tmp_grub_fallback"} ${tmp_signed_loader:+"$tmp_signed_loader"} ${tmp_host_kernel:+"$tmp_host_kernel"} ${tmp_host_backup:+"$tmp_host_backup"} "$tmp_bls"' EXIT HUP INT TERM
 
 install -m 0644 "$source_loader" "$tmp_loader"
 install -m 0644 "$source_kernel" "$tmp_kernel"
@@ -463,6 +581,25 @@ if [ "$manage_grub_fallback" -eq 1 ]; then
 fi
 mv -f "$tmp_loader" "$loader"
 mv -f "$tmp_bls" "$bls_entry"
+if [ -n "$tmp_host_kernel" ]; then
+    # Stage the legacy copy only after replacing the primary copy: two
+    # simultaneous kernel temporaries do not fit alongside the firmware
+    # initramfs on a 512-MiB ESP. Keep the original backup on the host root.
+    if [ ! -f "$state_dir/limine-kernel-before-package" ]; then
+        tmp_host_backup=$state_dir/.limine-kernel-backup.$$
+        cp -p "$host_limine_kernel" "$tmp_host_backup"
+        mv -f "$tmp_host_backup" "$state_dir/limine-kernel-before-package"
+    fi
+    install -m 0644 "$source_kernel" "$tmp_host_kernel"
+    cmp -s "$source_kernel" "$tmp_host_kernel" || {
+        echo "narf-uefi: staged host Limine kernel differs from the package" >&2
+        exit 1
+    }
+    mv -f "$tmp_host_kernel" "$host_limine_kernel"
+fi
+if [ -n "$host_limine_config" ]; then
+    printf '%s\n' "$host_limine_config" >"$limine_state_file"
+fi
 printf '%s\n' "$esp" >"$state_file"
 if [ "$sbctl_sign" = yes ]; then
     sha256sum "$loader" | awk '{print $1}' >"$sbctl_state_file"
@@ -470,7 +607,8 @@ else
     rm -f "$sbctl_state_file"
 fi
 
-if [ "$manager_hooks" -eq 1 ] && command -v limine-entry-tool >/dev/null 2>&1 && [ -f /boot/limine.conf ]; then
+if [ "$manager_hooks" -eq 1 ] && [ -z "$host_limine_config" ] &&
+    command -v limine-entry-tool >/dev/null 2>&1 && [ -f /boot/limine.conf ]; then
     if ! limine-entry-tool --add-efi "NARF" "$loader" \
         --comment "NARF framekernel $version" --priority 20 --overwrite --quiet; then
         warn "could not add the CachyOS Limine menu entry; the EFI payload is still installed"
@@ -478,6 +616,9 @@ if [ "$manager_hooks" -eq 1 ] && command -v limine-entry-tool >/dev/null 2>&1 &&
 fi
 
 say "installed NARF $version UEFI payload on $esp"
+if [ -n "$host_limine_kernel" ]; then
+    say "host Limine kernel synchronized: $host_limine_kernel"
+fi
 if [ "$sbctl_sign" = yes ]; then
     say "Secure Boot: loader signed with the configured sbctl database key"
 elif [ "$package_signed" -eq 1 ]; then

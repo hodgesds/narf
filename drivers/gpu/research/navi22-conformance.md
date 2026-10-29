@@ -45,3 +45,22 @@ version checks, upload ownership and verified reset are separate from a file's
 source provenance or a model result. Existing fixtures and upstream notices are
 retained. External Linux/Mesa compatibility and physical firmware execution
 remain acceptance work.
+
+## Captured RX 6750 XT preflight coverage
+
+`amdgpu_navi22_board_tests.rs` carries the discovery metadata from the MSI
+`1462:3985`, PCI revision `c0`, with its actual GC/DCN/NBIO/HDP/OSSSYS banks,
+distinct `SDMA0:0` and `SDMA1:0` engines, 12272 MiB usable VRAM, 16 GiB BAR0,
+and high MC addresses. Its inert, revoked-authority constructors check the
+later HDMI/DP display paths and GMC/GART/CP/SDMA reservations without touching
+hardware. Those checks complement the stage-order and register models; they
+do not establish that a hardware checkpoint completes.
+
+This board's VBIOS `113-MSITV398MH.310` has no command entries 4
+(`digxencodercontrol`), 12 (`setpixelclock`) or 76
+(`dig1transmittercontrol`). The board case in `amdgpu_navi22_bios_tests.rs`
+therefore verifies that display setup sends DMUB commands and uses the v1.7
+transmitter fallback without requiring those tables. Without a running DMUB,
+the missing pixel-clock table remains an error. Its data tables report a
+100 MHz DCHUB reference and twelve 16-bit VRAM channels; do not substitute
+the reference clock or memory geometry of another fixture.

@@ -256,7 +256,7 @@ fn smoke_iwl_sc_callback_has_no_owner_ring_or_admission_guards_and_tx_full_retri
             drop(admission);
             guard
                 .device()
-                .enqueue(&uplink)
+                .enqueue(&uplink, narf_net::TxMeta::plain())
                 .map_err(|_| "reentrant callback TX enqueue")
         })?;
         flush()?;
@@ -274,11 +274,14 @@ fn smoke_iwl_sc_callback_has_no_owner_ring_or_admission_guards_and_tx_full_retri
         for _ in 0..TX_RING_N {
             guard
                 .device()
-                .enqueue(&uplink)
+                .enqueue(&uplink, narf_net::TxMeta::plain())
                 .map_err(|_| "Sc ring capacity fixture")?;
         }
         require(
-            guard.device().enqueue(&uplink).is_err()
+            guard
+                .device()
+                .enqueue(&uplink, narf_net::TxMeta::plain())
+                .is_err()
                 && guard.device().link_up()
                 && !guard.device().quarantined.load(Ordering::Acquire),
             "ring-full confused with source revocation",

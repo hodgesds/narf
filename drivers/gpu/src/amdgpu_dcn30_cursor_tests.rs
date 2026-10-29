@@ -30,7 +30,9 @@ fn engine(pipe: u8) -> Engine<Fake> {
         dcn2: DCN2,
         dcn3: DCN3,
         pipe,
+        slices: None,
         shown: None,
+        placed: [None; 2],
     }
 }
 fn hubp(pipe: u8, reg: u64) -> u64 {
@@ -168,4 +170,55 @@ fn dcn30_cursor_refuses_bad_images_and_releases_lock_on_loss() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     dcn30_cursor_refuses_bad_images_and_releases_lock_on_loss
+);
+
+fn dcn30_cursor_odm_places_each_slice_relative_to_its_viewport() -> TestResult {
+    let mut e = engine(0);
+    e.slices = Some([(0, 0, 960), (5, 960, 960)]);
+    // Straddling the seam: both slices show it, at the same stream x.
+    let shown = e.show(0x10_0000, (64, 64), (940, 10), VIEW, CLOCKS);
+    if shown.is_err() {
+        return TestResult::Fail("ODM cursor refused");
+    }
+    for pipe in [0, 5] {
+        if v_of(&e, hubp(pipe, CURSOR_CONTROL)) & 1 != 1
+            || v_of(&e, dpp(pipe, CUR0_CONTROL)) & 1 != 1
+            || v_of(&e, hubp(pipe, CURSOR_POSITION)) != 940 << 16 | 10
+            || v_of(&e, hubp(pipe, CURSOR_SURFACE_ADDRESS)) != 0x10_0000
+        {
+            return TestResult::Fail("straddling cursor not on both slices");
+        }
+    }
+    // hubp2_cursor_set_position: DST_X_OFFSET from the slice's own start.
+    if v_of(&e, hubp(0, CURSOR_DST_OFFSET)) != 940 * 100_000 / 148_500
+        || v_of(&e, hubp(5, CURSOR_DST_OFFSET)) != 0
+    {
+        return TestResult::Fail("per-slice destination offset");
+    }
+    // Wholly in the right half: the left slice disables it.
+    if e.move_to((1500, 10), VIEW, CLOCKS).is_err() {
+        return TestResult::Fail("ODM move refused");
+    }
+    if v_of(&e, hubp(0, CURSOR_CONTROL)) & 1 != 0
+        || v_of(&e, hubp(5, CURSOR_CONTROL)) & 1 != 1
+        || v_of(&e, hubp(5, CURSOR_DST_OFFSET)) != (1500 - 960) * 100_000 / 148_500
+    {
+        return TestResult::Fail("right-half cursor placement");
+    }
+    // Only the master OPP's cursor lock is taken, and it is released.
+    if e.io.writes.iter().any(|&(at, _)| at == lock(5)) || v_of(&e, lock(0)) != 0 {
+        return TestResult::Fail("cursor lock");
+    }
+    if e.hide().is_err()
+        || [0, 5]
+            .iter()
+            .any(|&p| v_of(&e, hubp(p, CURSOR_CONTROL)) & 1 != 0)
+    {
+        return TestResult::Fail("ODM hide left a slice's cursor on");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    dcn30_cursor_odm_places_each_slice_relative_to_its_viewport
 );

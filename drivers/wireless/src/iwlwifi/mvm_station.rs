@@ -9,6 +9,26 @@ use narf_wireless::{
 };
 use zeroize::Zeroizing;
 
+/// Station credential of one native join.
+pub(in crate::iwlwifi) enum Credential {
+    Open,
+    /// WPA2-PSK PMK for the native four-way owner.
+    Psk(Zeroizing<[u8; 32]>),
+    /// WPA3-Personal password for host SAE (sae_pwe 2) plus PMF.
+    Sae(Zeroizing<Vec<u8>>),
+}
+impl Credential {
+    pub(in crate::iwlwifi) fn mode(&self) -> SecurityMode {
+        match self {
+            Credential::Open => SecurityMode::Open,
+            Credential::Psk(_) => SecurityMode::Wpa2Psk,
+            Credential::Sae(_) => SecurityMode::Wpa3Sae {
+                pwe: narf_wireless::association::SaePwe::Both,
+            },
+        }
+    }
+}
+
 impl Owner {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::iwlwifi) fn model_expire_receive_aggregate(&mut self) {
@@ -93,6 +113,109 @@ impl Owner {
         self.hardware.fail();
         self.phase = Phase::Failed;
     }
+    /// Firmware/transport restart of a failed owner, following Linux
+    /// `mvm/ops.c::iwl_mvm_nic_restart` -> `iwl_mvm_restart_cleanup` ->
+    /// `ieee80211_restart_hw` -> `iwl_mvm_up`: stop the device (DMA stop
+    /// acknowledged, bus mastering cleared, every queue/command allocation
+    /// replaced), reload the retained executable, rerun unified NVM and the
+    /// awake-runtime defaults, then rebuild station state from scratch.
+    ///
+    /// Unlike mac80211's in-place reconfiguration, no association is
+    /// replayed: firmware objects of the stopped instance (MAC, link, peer,
+    /// queues, keys, BA sessions, PHY context) are discarded and the host
+    /// station starts from `Configured`, so a new scan/join and RSNA must
+    /// follow. Committed key PN floors survive in the retained history. The
+    /// restarted device must report the same MAC address and NVM
+    /// channels/chains/PHY; any change or failure leaves the owner failed.
+    pub(in crate::iwlwifi) async fn recover(&mut self) -> Result<(), &'static str> {
+        if !self.station_failed() {
+            return Err("MVM recovery requires a failed owner");
+        }
+        let mac = self.mac.ok_or("MVM recovery before first configuration")?;
+        // The pre-failure identity stays the reference for every attempt; a
+        // rejected restart never replaces it with what it reported.
+        let original = self.nvm.take().ok_or("MVM recovery before NVM")?;
+        self.power.phy.ba.clear_packets();
+        let result = self.recover_inner(mac, &original).await;
+        if result.is_err() {
+            self.hardware.fail();
+            self.phase = Phase::Failed;
+            self.mac = Some(mac);
+            self.nvm = Some(original);
+        }
+        result
+    }
+
+    async fn recover_inner(
+        &mut self,
+        mac: [u8; 6],
+        original: &super::super::station_api::Nvm,
+    ) -> Result<(), &'static str> {
+        self.restart_hardware(mac).await?;
+        // DMA stop is acknowledged: retire installed keys into PN history.
+        self.retire_security_after_reset()?;
+        let parsed = super::super::parse_ucode(&self.firmware)
+            .map_err(|_| "invalid retained MVM firmware")?;
+        // Every per-association owner named firmware objects or DMA of the
+        // stopped instance; the restart already released that DMA.
+        self.beacons.clear();
+        self.scan = super::scan::ScanContext::new(&parsed.api);
+        self.channel = super::channel::ChannelContext::new(&parsed.api);
+        self.peer = None;
+        self.management_queue = None;
+        self.power = super::power::Context::new(&parsed.api);
+        self.mac = None;
+        self.nvm = None;
+        self.phase = Phase::Starting;
+        self.configure(mac).await?;
+        let nvm = self.nvm.as_ref().ok_or("MVM recovery lost NVM")?;
+        if nvm.channels != original.channels
+            || nvm.tx_chains != original.tx_chains
+            || nvm.rx_chains != original.rx_chains
+            || nvm.phy != original.phy
+        {
+            return Err("MVM recovery changed NVM identity");
+        }
+        Ok(())
+    }
+
+    /// System-suspend stop of an owner without a station (Linux
+    /// `iwl_mvm_suspend` without WoWLAN: mac80211 has already quiesced and
+    /// disconnected the interface, then `iwl_mvm_mac_stop` ->
+    /// `iwl_mvm_stop_device` -> `iwl_trans_stop_device`). The owner is left
+    /// failed; [`Self::recover`] performs the resume-time `iwl_mvm_up`.
+    pub(in crate::iwlwifi) async fn suspend_transport(&mut self) -> Result<(), &'static str> {
+        if self.phase != Phase::Configured && !self.station_failed() {
+            return Err("MVM suspend with an active station owner");
+        }
+        self.power.phy.ba.clear_packets();
+        self.phase = Phase::Failed;
+        #[cfg(any(test, feature = "kernel-test"))]
+        let model = super::super::runtime::model::is_model(&self.hardware);
+        #[cfg(not(any(test, feature = "kernel-test")))]
+        let model = false;
+        if model {
+            self.hardware.fail();
+        } else {
+            self.hardware.stop_for_suspend().await?;
+        }
+        // DMA stop is acknowledged: no installed key can be used again.
+        self.retire_security_after_reset()
+    }
+
+    async fn restart_hardware(&mut self, mac: [u8; 6]) -> Result<(), &'static str> {
+        #[cfg(any(test, feature = "kernel-test"))]
+        if super::super::runtime::model::is_model(&self.hardware) {
+            return super::super::runtime::model::restart(&mut self.hardware);
+        }
+        let parsed = super::super::parse_ucode(&self.firmware)
+            .map_err(|_| "invalid retained MVM firmware")?;
+        if self.hardware.restart(&parsed).await? != mac {
+            return Err("MVM recovery changed hardware MAC");
+        }
+        Ok(())
+    }
+
     pub(in crate::iwlwifi) fn station_failed(&self) -> bool {
         self.hardware.is_failed() || self.phase == Phase::Failed
     }
@@ -164,9 +287,10 @@ impl Owner {
     pub(in crate::iwlwifi) async fn station_send(
         &mut self,
         bytes: &[u8],
+        assist: u32,
         policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
-        self.transmit_data_using(bytes, policy).await
+        self.transmit_data_assisted(bytes, assist, policy).await
     }
     pub(in crate::iwlwifi) fn station_can_pipeline(&self) -> bool {
         self.ba_qualified()
@@ -181,17 +305,18 @@ impl Owner {
         self.service_phy_actions(&mut policy).await?;
         if let Some(frame) = self.receive_data_inner(&mut policy)? {
             match frame {
-                super::LegacyReceive::Ethernet(frame) => self
-                    .power
-                    .prepared
-                    .as_mut()
-                    .unwrap()
-                    .mlme
-                    .data
-                    .as_mut()
-                    .unwrap()
-                    .aggregate
-                    .defer_validated(frame),
+                super::LegacyReceive::Ethernet(frame) | super::LegacyReceive::Checked(frame, _) => {
+                    self.power
+                        .prepared
+                        .as_mut()
+                        .unwrap()
+                        .mlme
+                        .data
+                        .as_mut()
+                        .unwrap()
+                        .aggregate
+                        .defer_validated(frame)
+                }
                 super::LegacyReceive::Eapol(_) => {
                     return self.data_failed("MVM control lost native RSNA owner")
                 }
@@ -211,7 +336,7 @@ impl Owner {
         ssid: &[u8],
         channel: u8,
         elements: &[u8],
-        pmk: Option<Zeroizing<[u8; 32]>>,
+        credential: Credential,
         source: Asset,
         binding: [u8; 32],
         stop: Arc<AtomicBool>,
@@ -221,11 +346,7 @@ impl Owner {
         if self.phase != Phase::Configured {
             return Err("MVM station requires configured scan owner");
         }
-        let mode = if pmk.is_some() {
-            SecurityMode::Wpa2Psk
-        } else {
-            SecurityMode::Open
-        };
+        let mode = credential.mode();
         let beacon = self
             .beacons
             .iter()
@@ -235,6 +356,7 @@ impl Owner {
             bssid,
             ssid: beacon.ssid.clone(),
             channel,
+            band: None,
             signal_dbm: None,
             capability: beacon.capabilities,
             beacon_interval: beacon.interval,
@@ -256,6 +378,7 @@ impl Owner {
             channel,
             self.power.phy.emission(),
         )?
+        .with_span(self.power.phy.span())
         .host_ceiling(&policy()?)?;
         self.prepare_channel_in_domain(channel, &policy()?).await?;
         self.prepare_peer_in_domain(bssid, &policy()?).await?;
@@ -264,14 +387,32 @@ impl Owner {
             .await?;
         self.power.prepared.as_mut().unwrap().stop = Some(stop);
         self.activate_link_using(&mut policy).await?;
-        if self.authenticate_open_using(&mut policy).await?.status != 0 {
+        let authenticated = match &credential {
+            Credential::Sae(password) => {
+                let ssid_owned = ssid.to_vec();
+                self.authenticate_sae_using(
+                    ssid,
+                    elements,
+                    narf_wireless::association::SaePwe::Both,
+                    |join, own, peer| {
+                        super::pmf::fresh_session(join, &ssid_owned, password, own, peer)
+                    },
+                    &mut policy,
+                )
+                .await?
+            }
+            _ => self.authenticate_open_using(&mut policy).await?,
+        };
+        if authenticated.status != 0 {
             return Err("MVM AP refused authentication");
         }
         self.associate_elements_using(ssid, mode, elements, &mut policy)
             .await?;
         self.prepare_data_using(&mut policy).await?;
-        if let Some(pmk) = pmk {
-            self.secure_using(*pmk, &mut nonce, &mut policy).await?;
+        match credential {
+            Credential::Psk(pmk) => self.secure_using(*pmk, &mut nonce, &mut policy).await?,
+            Credential::Sae(_) => self.secure_sae_using(&mut nonce, &mut policy).await?,
+            Credential::Open => {}
         }
         if !self.data_port_using(&mut policy) {
             return Err("MVM station native controlled port not completed");
@@ -281,8 +422,15 @@ impl Owner {
 
     /// Every transition consumes the preceding native terminal receipt. A
     /// partially pending/failed owner is quarantined, never reconstructed.
-    pub(in crate::iwlwifi) async fn station_close(&mut self) -> Result<(), &'static str> {
+    /// A completed association first tells its AP (§3.25 over-air
+    /// deauthentication) when current emission authority still exists.
+    pub(in crate::iwlwifi) async fn station_close(
+        &mut self,
+        mut policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
+    ) -> Result<(), &'static str> {
         if self.phase == Phase::DataPrepared {
+            self.deauthenticate_using(super::assoc::DEAUTH_LEAVING, &mut policy)
+                .await?;
             self.release_legacy_data().await?;
         }
         if self.phase == Phase::Associated {

@@ -322,3 +322,45 @@ kernel_test_in!(
     "drivers/wireless/ath9k",
     smoke_ath9k_native_mmio_revocation_and_bounds
 );
+
+fn smoke_ath9k_ar9285_suspend_disable_then_forced_full_sleep() -> TestResult {
+    let mut io = Fake::new();
+    io.registers.insert(AR_STA_ID1, 0x10);
+    if disable_and_sleep(&mut io).is_err() {
+        return TestResult::Fail("AR9285 suspend sequence failed");
+    }
+    let writes: Vec<_> = io
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Write(a, v) => Some((*a, *v)),
+            _ => None,
+        })
+        .collect();
+    // Cold reset first (IER off, RTC power-on, warm reset), then sleep.
+    let tail = &writes[writes.len() - 4..];
+    if writes.first() != Some(&(0x24, 0))
+        || tail
+            != [
+                (AR_STA_ID1, 0x10 | AR_STA_ID1_PWR_SAV),
+                (AR_RTC_FORCE_WAKE, 2),
+                (AR_RC, 0x101),
+                (AR_RTC_RESET, 0),
+            ]
+        || io.ops.last() != Some(&Op::Delay(2))
+    {
+        return TestResult::Fail("AR9285 FULL_SLEEP entry differs from ath9k_set_power_sleep");
+    }
+    let mut gone = Fake::new();
+    gone.registers.insert(AR_SREV, u32::MAX);
+    if disable_and_sleep(&mut gone) != Err(BringUpError::DeviceGone)
+        || gone.ops.iter().any(|op| matches!(op, Op::Write(..)))
+    {
+        return TestResult::Fail("removed AR9285 received suspend writes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/identity",
+    smoke_ath9k_ar9285_suspend_disable_then_forced_full_sleep
+);

@@ -74,23 +74,33 @@ pub const AUX_CTL_SEND_BUSY: u32 = 1 << 31;
 /// new transaction. Some platforms also clear it on a SEND_BUSY
 /// write; clearing explicitly avoids latched stale values.
 pub const AUX_CTL_DONE: u32 = 1 << 30;
-/// `[28]` — Interrupt on Done. We poll, so leave clear.
-pub const AUX_CTL_INTERRUPT_ON_DONE: u32 = 1 << 28;
+/// `[29]` — Interrupt on Done. We poll, so leave clear.
+pub const AUX_CTL_INTERRUPT_ON_DONE: u32 = 1 << 29;
 /// `[27:26]` — Time-Out Timer Value. `00` = 400 µs, `01` = 600 µs,
 /// `10` = 800 µs, `11` = 1600 µs. We use 1600 µs (the most
 /// permissive) to tolerate slow eDP sinks.
 pub const AUX_CTL_TIMEOUT_1600US: u32 = 0b11 << 26;
-/// `[25]` — Time-Out Error. RW1C. Set on AUX time-out (no reply
+/// `[28]` — Time-Out Error. RW1C. Set on AUX time-out (no reply
 /// within the configured window).
-pub const AUX_CTL_TIMEOUT_ERROR: u32 = 1 << 25;
-/// `[24]` — Receive Error. RW1C. Set on framing / parity error in
+pub const AUX_CTL_TIMEOUT_ERROR: u32 = 1 << 28;
+/// `[25]` — Receive Error. RW1C. Set on framing / parity error in
 /// the reply.
-pub const AUX_CTL_RECEIVE_ERROR: u32 = 1 << 24;
-/// `[23:20]` — Message Size. Number of valid bytes in
+pub const AUX_CTL_RECEIVE_ERROR: u32 = 1 << 25;
+/// `[24:20]` — Message Size. Number of valid bytes in
 /// AUX_DATA (output for sends, valid byte count of reply on
-/// receive).
+/// receive). Five bits: a maximum-size transaction is a
+/// 20-byte send and a 17-byte reply (status + 16 payload),
+/// neither of which a 4-bit field could represent. Layout
+/// cross-checked against i915 `intel_dp_aux_regs.h`
+/// (`DP_AUX_CH_CTL_MESSAGE_SIZE_MASK = REG_GENMASK(24, 20)`,
+/// `TIME_OUT_ERROR = REG_BIT(28)`, `RECEIVE_ERROR =
+/// REG_BIT(25)`); the earlier 4-bit mask silently truncated
+/// every reply longer than 15 bytes to `len & 0xF`, so the
+/// 16-byte DPCD caps read (17-byte reply) decoded as a
+/// 1-byte reply and failed `ShortReply` — every DP connect
+/// died in `read_caps`.
 pub const AUX_CTL_MSGSIZE_SHIFT: u32 = 20;
-pub const AUX_CTL_MSGSIZE_MASK: u32 = 0xF << AUX_CTL_MSGSIZE_SHIFT;
+pub const AUX_CTL_MSGSIZE_MASK: u32 = 0x1F << AUX_CTL_MSGSIZE_SHIFT;
 /// `[19:16]` — Pre-charge Time. PRM recommends 16 cycles for
 /// reliable signal integrity.
 pub const AUX_CTL_PRECHARGE_16: u32 = 0b1000 << 16;
@@ -122,6 +132,12 @@ const HW_RETRIES: u32 = 3;
 pub struct IntelAux<'a, M: MmioWindow + ?Sized> {
     mmio: &'a M,
     ddi: Ddi,
+    /// Absolute BAR0 offset of this port's AUX register block
+    /// (the CTL register sits at `base + DDI_AUX_CTL_OFFSET`).
+    /// On Gen12 this is `ddi.base()`; Xe-LPG ports have their
+    /// own AUX bases (#1016) and construct via
+    /// [`IntelAux::with_base`].
+    base: u64,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for IntelAux<'a, M> {
@@ -145,17 +161,38 @@ pub trait MmioWindow {
 impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
     /// Create a transport for `ddi` over the BAR0 window `mmio`.
     pub fn new(mmio: &'a M, ddi: Ddi) -> Self {
-        Self { mmio, ddi }
+        Self {
+            base: ddi.base(),
+            mmio,
+            ddi,
+        }
+    }
+
+    /// Create a transport over an explicit AUX register base.
+    ///
+    /// Xe-LPG (MTL) ports do not share the Gen12 DDI register
+    /// stride: their AUX blocks sit at per-port absolute offsets
+    /// (see `intel_gpu_xelpg::XeLpgPort::aux_base`). The AUX
+    /// transaction protocol itself — CTL/DATA fields, message
+    /// packing, timeout/poll discipline — is unchanged from
+    /// Gen12, so only the base differs. `ddi` is retained for
+    /// diagnostics only.
+    pub fn with_base(mmio: &'a M, base: u64) -> Self {
+        Self {
+            mmio,
+            ddi: Ddi::A,
+            base,
+        }
     }
 
     /// Absolute MMIO offset of this port's `DDI_AUX_CTL`.
     fn aux_ctl_off(&self) -> u64 {
-        self.ddi.base() + DDI_AUX_CTL_OFFSET
+        self.base + DDI_AUX_CTL_OFFSET
     }
 
     /// Absolute MMIO offset of `DDI_AUX_DATA[n]` for this port.
     fn aux_data_off(&self, n: usize) -> u64 {
-        self.ddi.base() + DDI_AUX_DATA_OFFSET + (n as u64) * 4
+        self.base + DDI_AUX_DATA_OFFSET + (n as u64) * 4
     }
 
     /// Pack a wire-format AUX request into the AUX_DATA dwords.
@@ -292,7 +329,8 @@ impl<'a, M: MmioWindow + ?Sized> AuxChannel for IntelAux<'a, M> {
         req: &AuxRequest<'_>,
         reply_buf: &'b mut [u8],
     ) -> Result<AuxResponse<'b>, AuxError> {
-        // Encode the request into the on-wire 4..20 byte frame.
+        // Encode the request into the on-wire 3..20 byte frame (3 =
+        // an I²C address-only request).
         let mut wire = [0u8; 20];
         let n = encode_request(req, &mut wire)?;
 
@@ -500,6 +538,46 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_aux",
         smoke_dpcd_read_requests_full_length
+    );
+
+    fn smoke_aux_msgsize_field_is_five_bits() -> TestResult {
+        // Regression pin for the #1114 fix round: DDI_AUX_CTL's
+        // Message Size field is five bits [24:20] (i915
+        // `intel_dp_aux_regs.h`: REG_GENMASK(24, 20)). Defined
+        // as four bits it truncated a 17-byte reply — status +
+        // the 16-byte DPCD caps block — to 1 byte, and every
+        // DP connect failed ShortReply in `read_caps`. A
+        // 16-byte DPCD read must round-trip all 16 payload
+        // bytes over the transport.
+        use crate::dp_aux::AuxChannel as _;
+        let mmio = MockMmio::default();
+        mmio.set_read(ctl_off(), AUX_CTL_DONE | (17 << AUX_CTL_MSGSIZE_SHIFT));
+        // Reply bytes: status 0x00, then payload 0x10..=0x1F,
+        // big-endian across the five DATA dwords.
+        let mut payload = [0u8; 16];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = 0x10 + i as u8;
+        }
+        let mut reply = [0u8; 20];
+        reply[1..17].copy_from_slice(&payload);
+        for (i, dword) in reply.chunks(4).enumerate() {
+            let v = u32::from_be_bytes([dword[0], dword[1], dword[2], dword[3]]);
+            mmio.set_read(Ddi::A.base() + DDI_AUX_DATA_OFFSET + (i as u64) * 4, v);
+        }
+        let mut aux = IntelAux::new(&mmio, Ddi::A);
+        let mut buf = [0u8; 16];
+        match aux.dpcd_read(0x000, &mut buf) {
+            Ok(()) => {}
+            Err(_) => return TestResult::Fail("16-byte dpcd_read must succeed over the transport"),
+        }
+        if buf != payload {
+            return TestResult::Fail("16-byte reply must not truncate");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_aux",
+        smoke_aux_msgsize_field_is_five_bits
     );
 
     fn smoke_aux_timeout_retries_exactly_three_times() -> TestResult {

@@ -33,6 +33,7 @@ pub mod prp;
 pub mod shutdown;
 
 mod tests;
+mod tests_dsm;
 mod tests_flush;
 mod tests_multi;
 
@@ -461,6 +462,13 @@ pub struct Controller {
     /// while the controller lives (a timed-out command may still read
     /// it — see `dead`).
     prp_list: Option<DmaBuffer>,
+    /// Persistent one-page buffer holding the Dataset Management
+    /// range list (at most [`DSM_MAX_RANGES`] 16-byte definitions =
+    /// exactly one 4 KiB page) while a DSM command is in flight.
+    /// Same lifetime discipline as `prp_list`: every DSM path holds
+    /// `&mut self` until its CQE is consumed, and the page is never
+    /// freed while the controller lives.
+    dsm_page: Option<DmaBuffer>,
     /// Set when an I/O command timed out. The CQ head/phase no longer
     /// match the device and the command's buffers may still be DMA
     /// targets, so later I/O is refused with
@@ -660,7 +668,20 @@ pub struct IdentifyController {
     /// Volatile Write Cache (byte 525): bit 0 = a volatile write cache is
     /// present, so completed writes are durable only after a Flush.
     pub vwc: u8,
+    /// Optional NVM Command Support (bytes 256..258). Bit 2 = the
+    /// Dataset Management command, bit 3 = the Write Zeroes command
+    /// (see [`ONCS_DATASET_MGMT`] / [`ONCS_WRITE_ZEROES`]).
+    pub oncs: u16,
 }
+
+/// ONCS bit 2: the controller supports the Dataset Management
+/// command (NVM Command Set Specification §3.2.3, whose
+/// processing-limit text keys DSM support off this bit).
+pub const ONCS_DATASET_MGMT: u16 = 1 << 2;
+/// ONCS bit 3: the controller supports the Write Zeroes command
+/// (NVM Command Set Specification, Write Zeroes command; the WZSL
+/// field's semantics key off this bit).
+pub const ONCS_WRITE_ZEROES: u16 = 1 << 3;
 
 /// What [`Controller::reset_recover`] found after re-identification.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -730,6 +751,7 @@ impl Controller {
             max_transfer: prp::NVME_CTRL_PAGE_SIZE as u32,
             ns_usable: false,
             prp_list: None,
+            dsm_page: None,
             dead: false,
             suspended: false,
             suspend_snapshot: None,
@@ -820,6 +842,198 @@ impl Controller {
                 Err(e)
             }
         }
+    }
+
+    /// Identify Controller ONCS bit 2: the controller supports the
+    /// Dataset Management command.
+    pub fn supports_dataset_mgmt(&self) -> bool {
+        self.identify
+            .is_some_and(|i| i.oncs & ONCS_DATASET_MGMT != 0)
+    }
+
+    /// Identify Controller ONCS bit 3: the controller supports the
+    /// Write Zeroes command.
+    pub fn supports_write_zeroes(&self) -> bool {
+        self.identify
+            .is_some_and(|i| i.oncs & ONCS_WRITE_ZEROES != 0)
+    }
+
+    /// NVMe Dataset Management (I/O opcode 0x09) with the Deallocate
+    /// attribute over `ranges` of namespace `ns` — the TRIM primitive
+    /// (NVM Command Set Specification §3.2.3; Linux
+    /// `nvme_setup_discard`). Ranges are issued in commands of at
+    /// most [`DSM_MAX_RANGES`] 16-byte range definitions; a range
+    /// longer than a definition's 32-bit length field is split.
+    ///
+    /// Wire encodings, per §3.2.3 Figures 39–41: CDW10 bits[7:0] =
+    /// Number of Ranges, a **0-based** count; CDW11 bit 2 =
+    /// Attribute – Deallocate; each range definition is 4 bytes of
+    /// context attributes (zero here: no access hints), 4 bytes of
+    /// length in logical blocks — a **1-based** value, the block
+    /// count itself, unlike the 0-based NLB of Read/Write — and an
+    /// 8-byte starting LBA.
+    ///
+    /// Errors are honest: an unsupported controller, an out-of-range
+    /// range or a controller error status fails the call, so no
+    /// caller is told a deallocation was issued when none was (#927).
+    pub fn dataset_mgmt_ns(
+        &mut self,
+        ns: ns::NamespaceInfo,
+        ranges: &[LbaRange],
+    ) -> Result<(), NvmeError> {
+        if self.dead {
+            return Err(NvmeError::ControllerDead);
+        }
+        if !ns.usable {
+            return Err(NvmeError::NamespaceUnusable);
+        }
+        if !self.supports_dataset_mgmt() {
+            return Err(NvmeError::NotImplemented);
+        }
+        if self.io_queues.is_empty() {
+            return Err(NvmeError::NoIoQueue);
+        }
+        // Flatten into wire entries: drop empty ranges, validate
+        // bounds, split at the length field's capacity (1-based, so
+        // one entry covers at most u32::MAX blocks).
+        let mut entries: Vec<(u64, u32)> = Vec::new();
+        for r in ranges {
+            if r.blocks == 0 {
+                continue;
+            }
+            if r.start
+                .checked_add(r.blocks)
+                .is_none_or(|end| end > ns.nsze)
+            {
+                return Err(NvmeError::OutOfRange);
+            }
+            let mut at = r.start;
+            let mut left = r.blocks;
+            while left > 0 {
+                let n = core::cmp::min(left, u32::MAX as u64);
+                entries.push((at, n as u32));
+                at += n;
+                left -= n;
+            }
+        }
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // Raw pointer + DMA address out of the persistent page: the
+        // page lives in `self` for the controller's whole life and
+        // `&mut self` excludes every other I/O path, so encoding
+        // through the pointer while `self` is borrowed mutably below
+        // (queue pick / submit) cannot alias another command — the
+        // same argument as the persistent PRP-list page.
+        let (page_ptr, page_dma) = match self.dsm_page.as_ref() {
+            Some(p) => (p.cpu_mut_ptr::<u8>(), p.dma_addr().raw()),
+            None => return Err(NvmeError::OutOfDmaMemory),
+        };
+        for chunk in entries.chunks(DSM_MAX_RANGES) {
+            // Encode this command's range list (Figure 41): context
+            // attributes, the 1-based length, the starting LBA.
+            // SAFETY: `page_ptr` is this controller's persistent 4 KiB
+            // coherent page; `chunk` holds at most DSM_MAX_RANGES
+            // entries, exactly one page of definitions; no command
+            // referencing the page is in flight (each submit below
+            // consumes its CQE before returning, and a timeout marks
+            // the controller dead, refusing further chunks).
+            unsafe {
+                for (i, &(lba, blocks)) in chunk.iter().enumerate() {
+                    let at = page_ptr.add(i * DSM_RANGE_BYTES);
+                    core::ptr::write_volatile(at as *mut u32, 0);
+                    core::ptr::write_volatile(at.add(4) as *mut u32, blocks);
+                    core::ptr::write_volatile(at.add(8) as *mut u64, lba);
+                }
+            }
+            // Publish the list before the SQE + doorbell that let
+            // the controller fetch it.
+            compiler_fence(Ordering::Release);
+            let mut sqe = Sqe::zero();
+            sqe.cdw0 = IoOpcode::DatasetMgmt as u32;
+            sqe.nsid = ns.nsid;
+            sqe.prp1 = page_dma;
+            // CDW10 bits[7:0] = number of ranges, 0-based (Figure 39).
+            sqe.cdw10 = (chunk.len() - 1) as u32;
+            // CDW11 bit 2 = Attribute – Deallocate (Figure 40).
+            sqe.cdw11 = DSM_CDW11_DEALLOCATE;
+            let qi = self.pick_queue();
+            let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
+            let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+            // SAFETY: io queue + bar are live; the range-list page is
+            // persistent DMA memory that outlives the command.
+            let r = unsafe { io.submit(bar0, sqe) };
+            if let Err(NvmeError::CompletionTimeout) = r {
+                self.dead = true;
+            }
+            r?;
+        }
+        Ok(())
+    }
+
+    /// NVMe Write Zeroes (I/O opcode 0x08) over `n_blocks` LBAs at
+    /// `lba` of namespace `ns` (NVM Command Set Specification,
+    /// Write Zeroes command, Figures 72–73). CDW12 bits[15:0] = NLB
+    /// is a 16-bit **0-based** field, so a request is split into
+    /// commands of at most 65 536 blocks. LR, FUA, PRINFO and DEAC
+    /// stay clear: a plain Write Zeroes, whose reads-after return
+    /// zeroes by construction.
+    ///
+    /// The command transfers no data — the data pointer is unused —
+    /// so the buffer a `BlockOp::WriteZeroes` request carries is
+    /// never read, let alone written to the device. (The pre-fix
+    /// async path issued a plain Write of that buffer instead:
+    /// stale bytes where zeroes were promised, #927.)
+    pub fn write_zeroes_ns(
+        &mut self,
+        ns: ns::NamespaceInfo,
+        lba: u64,
+        n_blocks: u64,
+    ) -> Result<(), NvmeError> {
+        if self.dead {
+            return Err(NvmeError::ControllerDead);
+        }
+        if !ns.usable {
+            return Err(NvmeError::NamespaceUnusable);
+        }
+        if !self.supports_write_zeroes() {
+            return Err(NvmeError::NotImplemented);
+        }
+        if self.io_queues.is_empty() {
+            return Err(NvmeError::NoIoQueue);
+        }
+        if n_blocks == 0 {
+            return Ok(());
+        }
+        if lba.checked_add(n_blocks).is_none_or(|end| end > ns.nsze) {
+            return Err(NvmeError::OutOfRange);
+        }
+        let mut at = lba;
+        let mut left = n_blocks;
+        while left > 0 {
+            let n = core::cmp::min(left, MAX_WRITE_ZEROES_BLOCKS);
+            let mut sqe = Sqe::zero();
+            sqe.cdw0 = IoOpcode::WriteZeroes as u32;
+            sqe.nsid = ns.nsid;
+            // CDW10/11 = SLBA (64-bit, little-endian split).
+            sqe.cdw10 = (at & 0xFFFF_FFFF) as u32;
+            sqe.cdw11 = (at >> 32) as u32;
+            // CDW12 bits[15:0] = NLB, 0-based (Figure 73).
+            sqe.cdw12 = (n - 1) as u32;
+            let qi = self.pick_queue();
+            let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
+            let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+            // SAFETY: io queue + bar are live; Write Zeroes carries
+            // no data pointer.
+            let r = unsafe { io.submit(bar0, sqe) };
+            if let Err(NvmeError::CompletionTimeout) = r {
+                self.dead = true;
+            }
+            r?;
+            at += n;
+            left -= n;
+        }
+        Ok(())
     }
 
     /// Final quiesce for reboot / power-off (Linux `nvme_shutdown` →
@@ -1196,6 +1410,10 @@ impl Controller {
         // `Controller::prp_list`).
         let prp_list = alloc_coherent(prp::NVME_CTRL_PAGE_SIZE, DomainId::DRIVER_0)
             .map_err(|_| NvmeError::OutOfDmaMemory)?;
+        // Persistent Dataset Management range-list page (see
+        // `Controller::dsm_page`).
+        let dsm_page = alloc_coherent(prp::NVME_CTRL_PAGE_SIZE, DomainId::DRIVER_0)
+            .map_err(|_| NvmeError::OutOfDmaMemory)?;
 
         self.max_transfer = prp::max_transfer_bytes(id.mdts, caps.mpsmin);
         self.identify = Some(id);
@@ -1215,6 +1433,7 @@ impl Controller {
         }
         self.namespaces = namespaces;
         self.prp_list = Some(prp_list);
+        self.dsm_page = Some(dsm_page);
         self.dead = false;
         Ok(())
     }
@@ -1273,15 +1492,17 @@ impl Controller {
         let admin = self.admin.take();
         let io = core::mem::take(&mut self.io_queues);
         let prp_list = self.prp_list.take();
+        let dsm_page = self.dsm_page.take();
         let pages = core::mem::take(&mut self.in_flight_dma);
         self.io_queue_locks.clear();
         self.dead = true;
         if stopped {
-            drop((admin, io, prp_list, pages));
+            drop((admin, io, prp_list, dsm_page, pages));
         } else {
             core::mem::forget(admin);
             core::mem::forget(io);
             core::mem::forget(prp_list);
+            core::mem::forget(dsm_page);
             core::mem::forget(pages);
         }
         stopped
@@ -2956,6 +3177,21 @@ unsafe fn peek_cqe(buf: &DmaBuffer, index: u16) -> Cqe {
     unsafe { core::ptr::read_volatile(base.add(index as usize)) }
 }
 
+/// Ranges per Dataset Management command: CDW10's Number of Ranges
+/// is an 8-bit 0-based field, so at most 256 (NVM Command Set
+/// Specification §3.2.3).
+pub const DSM_MAX_RANGES: usize = 256;
+/// Bytes per Dataset Management range definition (§3.2.3 Figure 41).
+const DSM_RANGE_BYTES: usize = 16;
+/// CDW11 Attribute – Deallocate for Dataset Management (§3.2.3
+/// Figure 40).
+const DSM_CDW11_DEALLOCATE: u32 = 1 << 2;
+/// Blocks per Write Zeroes command: CDW12's NLB is a 16-bit 0-based
+/// field (Write Zeroes Figure 73).
+const MAX_WRITE_ZEROES_BLOCKS: u64 = 0x1_0000;
+
+const _: () = assert!(DSM_MAX_RANGES * DSM_RANGE_BYTES <= prp::NVME_CTRL_PAGE_SIZE);
+
 /// Default completion budget for admin and read/write commands.
 const CQE_TIMEOUT_MS: u64 = 5_000;
 /// Completion budget for a Flush: draining a large volatile cache can take
@@ -3037,6 +3273,8 @@ unsafe fn parse_identify(buf: &DmaBuffer) -> IdentifyController {
         rtd3e: unsafe { core::ptr::read_volatile(base.add(88) as *const u32) },
         // SAFETY: byte 525 of the same page.
         vwc: unsafe { core::ptr::read_volatile(base.add(525)) },
+        // SAFETY: bytes 256..258 of the same page, 2-aligned.
+        oncs: read_u16(256),
     }
 }
 
@@ -3234,17 +3472,22 @@ impl BlockDevice for NvmeBlockDevice {
     }
     fn supports(&self, f: BlockFeature) -> bool {
         // Flush + Fua hit real NVMe opcodes (Flush 0x00, FUA bit in
-        // Write CDW12). WriteZeroes / Discard advertise as
-        // supported but the per-op code paths fall through to the
-        // generic NVM-Write path until the dataset-management
-        // opcodes are wired in (see the BlockOp arm below).
-        matches!(
-            f,
-            BlockFeature::Flush
-                | BlockFeature::WriteZeroes
-                | BlockFeature::Discard
-                | BlockFeature::Fua
-        )
+        // Write CDW12) unconditionally. Discard and WriteZeroes are
+        // claimed exactly when the probed controller's Identify
+        // ONCS says it implements the opcode (Dataset Management /
+        // Write Zeroes) — claiming either without it told the FS
+        // layer a deallocation / zeroing had a device path when
+        // none existed (#927, #841).
+        match f {
+            BlockFeature::Flush | BlockFeature::Fua => true,
+            BlockFeature::Discard => {
+                with_controller(|c| c.supports_dataset_mgmt()).unwrap_or(false)
+            }
+            BlockFeature::WriteZeroes => {
+                with_controller(|c| c.supports_write_zeroes()).unwrap_or(false)
+            }
+            _ => false,
+        }
     }
 
     fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion> + Send {
@@ -3270,10 +3513,15 @@ impl BlockDevice for NvmeBlockDevice {
         let r = nvme_flush_primary();
         async move { r }
     }
-    async fn discard(&self, _r: LbaRange) {
-        // Dataset Management opcode 0x09 with AD=1 lands with the
-        // larger-transfer rework; today the no-op is structurally
-        // correct (NVMe permits ignoring DSM hints).
+    async fn discard(&self, r: LbaRange) {
+        // Fire-and-forget at the trait, but the Dataset Management
+        // command (AD=1) is really issued whenever the controller
+        // supports it; an error is dropped here and surfaces on the
+        // `submit` path (`BlockOp::Trim`), as with `SyncBlock`. A
+        // controller without ONCS Dataset Management never has
+        // Discard advertised, so no caller can be misled into
+        // believing a range was deallocated when it was not (#927).
+        let _ = nvme_discard_primary(&[r]);
     }
     async fn cancel(&self, _tag: u64) -> CancelResult {
         // Polled completions are synchronous from the caller's POV,
@@ -3292,12 +3540,6 @@ fn nvme_submit_blocking(
     if req.blocks == 0 {
         return Ok(());
     }
-    let (opcode, fua) = match req.op {
-        BlockOp::Read => (IoOpcode::Read as u8, false),
-        BlockOp::Write { fua } => (IoOpcode::Write as u8, fua),
-        BlockOp::WriteZeroes => (IoOpcode::Write as u8, false),
-        BlockOp::Trim => return Ok(()),
-    };
     // Interrupts stay enabled for the whole transfer: hold the
     // device's request gate, not the IRQ-masking CONTROLLERS lock.
     // See `InstalledController`.
@@ -3312,6 +3554,34 @@ fn nvme_submit_blocking(
         recover_slot(0).map_err(map_nvme_err)?;
         ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
     }
+    // Trim and WriteZeroes move no data: they issue their own
+    // opcodes against the namespace and never touch the request's
+    // buffer (the pre-fix code wrote the buffer's stale contents
+    // for WriteZeroes and silently succeeded for Trim, #927). A
+    // controller without the ONCS bit fails the request via
+    // `NvmeError::NotImplemented` — never a silent success.
+    let (opcode, fua) = match req.op {
+        BlockOp::Read => (IoOpcode::Read as u8, false),
+        BlockOp::Write { fua } => (IoOpcode::Write as u8, fua),
+        BlockOp::Trim => {
+            let ns = ctrl.primary_geom();
+            return ctrl
+                .dataset_mgmt_ns(
+                    ns,
+                    &[LbaRange {
+                        start: req.lba,
+                        blocks: req.blocks as u64,
+                    }],
+                )
+                .map_err(map_nvme_err);
+        }
+        BlockOp::WriteZeroes => {
+            let ns = ctrl.primary_geom();
+            return ctrl
+                .write_zeroes_ns(ns, req.lba, req.blocks as u64)
+                .map_err(map_nvme_err);
+        }
+    };
     let lba_bytes = ctrl.lba_bytes as u64;
     let total_bytes = (req.blocks as u64)
         .checked_mul(lba_bytes)
@@ -3341,6 +3611,20 @@ fn nvme_submit_blocking(
         done += n;
     }
     Ok(())
+}
+
+/// Dataset Management (Deallocate) over `ranges` of the primary
+/// namespace of controller instance 0 — the async `discard` path.
+fn nvme_discard_primary(ranges: &[LbaRange]) -> Result<(), BlockError> {
+    let mut ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
+    if ctrl.is_dead() {
+        // Same dead-controller recovery as the submit path.
+        drop(ctrl);
+        recover_slot(0).map_err(map_nvme_err)?;
+        ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
+    }
+    let ns = ctrl.primary_geom();
+    ctrl.dataset_mgmt_ns(ns, ranges).map_err(map_nvme_err)
 }
 
 fn nvme_flush_primary() -> Result<(), BlockError> {
@@ -3890,6 +4174,12 @@ impl narf_block::BlockDeviceSync for NvmeNamespaceBlock {
     fn flush(&self) -> Result<(), narf_block::BlockIoError> {
         sync_flush(self.instance, Some(self.nsid))
     }
+    fn supports_trim(&self) -> bool {
+        sync_supports_trim(self.instance, Some(self.nsid))
+    }
+    fn trim(&self, lba: u64, n_blocks: u64) -> Result<(), narf_block::BlockIoError> {
+        sync_trim(self.instance, Some(self.nsid), lba, n_blocks)
+    }
     fn capabilities(&self) -> narf_block::BlockCaps {
         sync_caps(self.instance)
     }
@@ -3914,6 +4204,12 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
     fn flush(&self) -> Result<(), narf_block::BlockIoError> {
         sync_flush(0, None)
     }
+    fn supports_trim(&self) -> bool {
+        sync_supports_trim(0, None)
+    }
+    fn trim(&self, lba: u64, n_blocks: u64) -> Result<(), narf_block::BlockIoError> {
+        sync_trim(0, None, lba, n_blocks)
+    }
     fn capabilities(&self) -> narf_block::BlockCaps {
         sync_caps(0)
     }
@@ -3937,6 +4233,53 @@ fn sync_flush(instance: u32, nsid: Option<u32>) -> Result<(), narf_block::BlockI
     }
     let ns = geom(&ctrl, nsid).ok_or(narf_block::BlockIoError::DeviceRemoved)?;
     ctrl.flush_nsid(ns.nsid).map_err(map_nvme_sync_err)
+}
+
+/// Whether namespace `nsid` (`None` = primary) of controller
+/// `instance` really deallocates on `trim`: the namespace must be
+/// registered and usable, and the controller's Identify ONCS must
+/// carry Dataset Management. This is what the `SyncBlock` adapter
+/// turns into `BlockFeature::Discard` (#841, #927).
+fn sync_supports_trim(instance: u32, nsid: Option<u32>) -> bool {
+    with_controller_at(instance, |c| {
+        geom(c, nsid).is_some_and(|g| g.usable) && c.supports_dataset_mgmt()
+    })
+    .unwrap_or(false)
+}
+
+/// Deallocate `n_blocks` blocks at `lba` on namespace `nsid`
+/// (`None` = primary) of controller `instance` via Dataset
+/// Management. Controller errors propagate — never a silent
+/// success.
+fn sync_trim(
+    instance: u32,
+    nsid: Option<u32>,
+    lba: u64,
+    n_blocks: u64,
+) -> Result<(), narf_block::BlockIoError> {
+    let slot = slot_of(instance).ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+    let mut ctrl = acquire(slot);
+    if slot.removed.load(Ordering::Acquire) {
+        return Err(narf_block::BlockIoError::DeviceRemoved);
+    }
+    if ctrl.is_dead() {
+        // Same dead-controller recovery as the I/O path.
+        drop(ctrl);
+        recover_slot(instance).map_err(map_nvme_sync_err)?;
+        ctrl = acquire(slot);
+        if slot.removed.load(Ordering::Acquire) {
+            return Err(narf_block::BlockIoError::DeviceRemoved);
+        }
+    }
+    let ns = geom(&ctrl, nsid).ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+    ctrl.dataset_mgmt_ns(
+        ns,
+        &[LbaRange {
+            start: lba,
+            blocks: n_blocks,
+        }],
+    )
+    .map_err(map_nvme_sync_err)
 }
 
 /// NVMe Write always supports FUA natively; the cache is volatile when

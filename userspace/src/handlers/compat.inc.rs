@@ -2465,9 +2465,18 @@ fn do_execve_resolved(
     // errnos come ahead of an argv/envp EFAULT.
     if image_override.is_none() && !path_owned.starts_with(HOST_ANCHORED) {
         let task = current_task_id();
-        if let Err(errno) = literal_walk_check(task, &path_owned) {
-            ctx.set_return(errno_ret(errno));
-            return;
+        match literal_walk_check(task, &path_owned) {
+            Err(errno) => {
+                ctx.set_return(errno_ret(errno));
+                return;
+            }
+            // A named final slash/dot/dotdot was walked as a directory.
+            // Do not normalize that proof away and reopen it as a file.
+            Ok(Some(_)) => {
+                ctx.set_return(errno_ret(EACCES));
+                return;
+            }
+            Ok(None) => {}
         }
         if !path_owned.starts_with('/') {
             path_owned = resolve_cwd_path_user(task, &path_owned);
@@ -2602,8 +2611,18 @@ fn do_execve_resolved(
             poll_io_to_completion(narf_filesystem::resolve_async_dentry(root, rel))
         }) {
             Some(Some(Ok(o))) => o,
-            // Not found (or no mount) → ENOENT so execvp keeps searching PATH.
-            None | Some(Some(Err(narf_filesystem::FsError::NotFound))) => return Err(-ENOENT),
+            None => return Err(-ENOENT),
+            Some(Some(Err(narf_filesystem::FsError::NotFound | narf_filesystem::FsError::InvalidPath))) => {
+                // This resolver opens files only: a directory (including a
+                // mount root) is InvalidPath, not a storage failure. Linux's
+                // do_open_execat/may_open rejects non-regular files as EACCES.
+                if stat_path_dir_aware(&ep)
+                    .is_some_and(|st| st.mode.file_type == narf_filesystem::FileType::Dir)
+                {
+                    return Err(-EACCES);
+                }
+                return Err(-path_lookup_errno(&ep));
+            }
             // Genuinely-wedged device (2G-poll backstop exhausted) → EIO.
             // Loud: a silent EIO here cost a full debugging session (bash
             // reports only "Input/output error").
@@ -2612,17 +2631,24 @@ fn do_execve_resolved(
                 let _ = writeln!(narf_console::Writer, "EXECVE-EIO resolve overrun path={ep}");
                 return Err(-EIO);
             }
-            // A real FS error → EIO.
+            // Preserve filesystem errors; only actual I/O failures are EIO.
             Some(Some(Err(e))) => {
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "EXECVE-EIO resolve err={e:?} path={ep}"
-                );
-                return Err(-EIO);
+                let errno = copy_fs_errno(e);
+                if errno == EIO {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "EXECVE-EIO resolve err={e:?} path={ep}"
+                    );
+                }
+                return Err(-errno);
             }
         };
-        let file_size = ops.stat().size as usize;
+        let stat = ops.stat();
+        if stat.mode.file_type != narf_filesystem::FileType::File {
+            return Err(-EACCES);
+        }
+        let file_size = stat.size as usize;
         if file_size == 0 {
             return Err(-ENOEXEC); // ENOEXEC — empty file is not an executable
         }
@@ -3734,9 +3760,25 @@ pub(crate) fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
 /// - The caller's address space must match the AS that mapped `src_uptr`.
 /// - Must not be called from IRQ context.
 pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(), u64> {
-    validate_user_range(src_uptr, dst.len())?;
+    // SAFETY: the slice retains an exclusive writable destination for the copy.
+    unsafe { copy_raw_from_user(dst.as_mut_ptr(), src_uptr, dst.len()) }
+}
+
+/// Guarded copy into retained kernel RAM, which need not be initialized yet.
+/// Success initializes every requested byte; a fault may leave only a prefix
+/// initialized, and the caller must not publish that destination as complete.
+///
+/// # Safety
+/// `dst` must retain `len` exclusively writable bytes, disjoint from the source.
+/// The active address space must be that of the source; IRQ context is forbidden.
+pub(crate) unsafe fn copy_raw_from_user(
+    dst: *mut u8,
+    src_uptr: u64,
+    len: usize,
+) -> Result<(), u64> {
+    validate_user_range(src_uptr, len)?;
     let src = src_uptr as *const u8;
-    // SAFETY: dst is a live kernel slice; src is range-validated; the
+    // SAFETY: dst retains writable kernel RAM; src is range-validated; the
     // guarded copy opens the SMAP bracket itself and catches any
     // unrecoverable fault (#GP non-canonical, #PF on an address a
     // racing munmap just removed from the AS) as Err instead of a
@@ -3744,10 +3786,10 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
     #[cfg(target_arch = "x86_64")]
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        narf_arch::x86_64::smap::copy_user_guarded(dst.as_mut_ptr(), src, dst.len())
+        narf_arch::x86_64::smap::copy_user_guarded(dst, src, len)
             .map_err(|_remaining| EFAULT as u64)?;
     }
-    // SAFETY: dst is a live kernel slice; src is range-validated; the
+    // SAFETY: dst retains writable kernel RAM; src is range-validated; the
     // guarded copy catches any unrecoverable EL1 data abort (a validated-
     // but-unmapped user page, or a racing munmap) as Err instead of a
     // kernel panic — Linux's arm64 uaccess extable-fixup -EFAULT semantics.
@@ -3756,7 +3798,7 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
     #[cfg(target_arch = "aarch64")]
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        narf_arch::aarch64::uaccess::copy_user_guarded(dst.as_mut_ptr(), src, dst.len())
+        narf_arch::aarch64::uaccess::copy_user_guarded(dst, src, len)
             .map_err(|_remaining| EFAULT as u64)?;
     }
     // SAFETY: any other target — plain volatile read of each in-range user
@@ -3764,8 +3806,8 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        for (i, b) in dst.iter_mut().enumerate() {
-            *b = core::ptr::read_volatile(src.add(i));
+        for i in 0..len {
+            core::ptr::write(dst.add(i), core::ptr::read_volatile(src.add(i)));
         }
     }
     Ok(())

@@ -1,10 +1,21 @@
 //! Navi22/Navi48 ROM-register fallback, following amdgpu_soc15_read_bios_from_rom
-//! and smuio_v11_0.c / smuio_v14_0_2.c. Reads leave the ROM_INDEX latch unchanged; no PCI ROM
+//! and smuio_v11_0.c / smuio_v11_0_6.c / smuio_v14_0_2.c. Reads leave the ROM_INDEX latch unchanged; no PCI ROM
 //! decode, reset, flash programming or ATOM execution is involved.
 use super::*;
 
 const INDEX: u32 = 0xe4;
 const DATA: u32 = 0xe5;
+
+fn ports(gpu: &AmdGpu) -> Option<(u32, u32)> {
+    use crate::amdgpu_discovery::{find_ip, HW_ID_SMUIO};
+    let ip = find_ip(&gpu.ip_blocks, HW_ID_SMUIO, 0)?;
+    match (ip.major, ip.minor, ip.revision) {
+        // smuio_11_0_6_offset.h moves both ports by one dword.
+        (11, 0, 6) => Some((0xe5, 0xe6)),
+        (11, 0, 0 | 2 | 3 | 4 | 7 | 8) | (14, 0, 2) => Some((INDEX, DATA)),
+        _ => None,
+    }
+}
 trait Io {
     fn read_index(&mut self) -> u32;
     fn write_index(&mut self, value: u32);
@@ -14,19 +25,21 @@ trait Io {
 struct Mmio {
     regs: MmioRegion,
     base: u64,
+    index: u32,
+    data: u32,
 }
 impl Io for Mmio {
     fn read_index(&mut self) -> u32 {
         // SAFETY: exact SMUIO bank bounded through DATA at construction.
-        unsafe { self.regs.read32(self.base + INDEX as u64 * 4) }
+        unsafe { self.regs.read32(self.base + self.index as u64 * 4) }
     }
     fn write_index(&mut self, value: u32) {
         // SAFETY: exclusively owned ROM read latch, same bounded bank.
-        unsafe { self.regs.write32(self.base + INDEX as u64 * 4, value) };
+        unsafe { self.regs.write32(self.base + self.index as u64 * 4, value) };
     }
     fn read_data(&mut self) -> u32 {
         // SAFETY: same bounded bank; this is ROM read data, never a flash write.
-        unsafe { self.regs.read32(self.base + DATA as u64 * 4) }
+        unsafe { self.regs.read32(self.base + self.data as u64 * 4) }
     }
 }
 fn chunk(io: &mut impl Io, offset: usize, bytes: &mut [u8]) -> Result<(), Error> {
@@ -92,6 +105,7 @@ fn bank(gpu: &AmdGpu, device: &BusDevice) -> Result<u64, Error> {
     {
         return Err(Error::Unsupported);
     }
+    let (_, last) = ports(gpu).ok_or(Error::Unsupported)?;
     if crate::amdgpu_rdna4::Rdna4Chip::of(gpu).is_some() {
         bank(gpu, ip::HW_ID_GC, crate::amdgpu_rdna4::GC_VERSIONS, 0, 0)
             .map_err(|_| Error::Unsupported)?;
@@ -99,7 +113,7 @@ fn bank(gpu: &AmdGpu, device: &BusDevice) -> Result<u64, Error> {
         // same two port offsets, at base index zero; no other SMUIO14
         // revision is admitted by this profile.
         bank(gpu, ip::HW_ID_NBIF, &[(7, 7, 0), (7, 7, 1)], 0, 0).map_err(|_| Error::Unsupported)?;
-        return bank(gpu, ip::HW_ID_SMUIO, &[(14, 0, 2)], 0, DATA).map_err(|_| Error::Unsupported);
+        return bank(gpu, ip::HW_ID_SMUIO, &[(14, 0, 2)], 0, last).map_err(|_| Error::Unsupported);
     }
     if gpu.chip.did != amdgpu::NAVI22 {
         return Err(Error::Unsupported);
@@ -130,11 +144,12 @@ fn bank(gpu: &AmdGpu, device: &BusDevice) -> Result<u64, Error> {
             (11, 0, 2),
             (11, 0, 3),
             (11, 0, 4),
+            (11, 0, 6),
             (11, 0, 7),
             (11, 0, 8),
         ],
         0,
-        DATA,
+        last,
     )
     .map_err(|_| Error::Unsupported)
 }
@@ -147,10 +162,13 @@ pub(super) unsafe fn read_discrete(
     cap: &Cap<BusDeviceCap, Write>,
 ) -> Result<Vbios, Error> {
     let base = bank(gpu, device)?;
+    let (index, data) = ports(gpu).ok_or(Error::Unsupported)?;
     read(
         &mut Mmio {
             regs: gpu.regs,
             base,
+            index,
+            data,
         },
         device,
         cap,

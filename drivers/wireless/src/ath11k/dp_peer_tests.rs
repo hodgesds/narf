@@ -187,6 +187,9 @@ fn sizes(reo_cmd: u32) -> DpRingSizes {
         rx_mac_buf: 16,
         rxdma_err_dst: 16,
         rxdma_mon_status: 8,
+        rxdma_mon_buf: 8,
+        rxdma_mon_dst: 8,
+        rxdma_mon_desc: 8,
         tx_status_fifo: 8,
         n_link_desc: Some(64),
     }

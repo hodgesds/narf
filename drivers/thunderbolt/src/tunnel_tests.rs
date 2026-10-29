@@ -119,7 +119,11 @@ impl Config for Model {
                     }
                 }
             }
-            if space == CfgSpace::Port && offset == 38 && port == 5 {
+            // A DP OUT adapter's CMHS (DP_STATUS_CTRL bit 25) clears
+            // once the handshake completes. DP OUT adapters sit on
+            // device routers here; on a host DP IN adapter the same
+            // DWORD is DP_STATUS, whose bit 25 belongs to ALLOCATED_BW.
+            if space == CfgSpace::Port && offset == 38 && port == 5 && route != 0 {
                 self.put(route, port, space, offset, value & !(1 << 25));
             }
             if space == CfgSpace::Port && offset == 34 && port == 3 {
@@ -143,6 +147,8 @@ pub(crate) fn model() -> (Domain, Model) {
             max_out_hop: 15,
             total_credits: 64,
             secondary: false,
+            retimers: Vec::new(),
+            retimer_fault: None,
         });
     }
     let host = Router {
@@ -308,6 +314,8 @@ fn pcie_port(number: u8, kind: u32, adapter_cap: u16) -> Port {
         max_out_hop: 15,
         total_credits: 64,
         secondary: false,
+        retimers: Vec::new(),
+        retimer_fault: None,
     }
 }
 

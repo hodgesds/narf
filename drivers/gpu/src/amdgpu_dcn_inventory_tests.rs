@@ -417,7 +417,7 @@ fn inventory_gpio_ids_are_resolved_and_bad_records_fail_closed() -> TestResult {
             2 => bad.0[RECORDS + 2] = 1,
             3 => bad.0[RECORDS + 4] = 2,          // duplicate HPD
             4 => bad.0[GPIO + 4 + 6 * 8 + 4] = 1, // not an HPD bit
-            5 => bad.0[GPIO + 4 + 4] = 8,         // DDC data, not clock
+            5 => bad.0[GPIO + 4 + 4] = 1,         // neither DDC clock nor data
             6 => bad.0[GPIO + 4 + 6] = 0x81,      // missing requested GPIO uid
             7 => bad.0[DISPLAY_OBJECT + 10..DISPLAY_OBJECT + 12]
                 .copy_from_slice(&0xffffu16.to_le_bytes()),
@@ -434,6 +434,58 @@ fn inventory_gpio_ids_are_resolved_and_bad_records_fail_closed() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn-inventory",
     inventory_gpio_ids_are_resolved_and_bad_records_fail_closed
+);
+
+fn inventory_rx6750xt_ddc_data_pins_resolve_the_board_routes() -> TestResult {
+    // Routing metadata from MSI VBIOS 113-MSITV398MH.310. Each I2C LUT
+    // entry names bit 8 (DATA) of a DDC pin pair, not bit 0 (CLOCK).
+    const BASE: u32 = 0x34c0;
+    let mut image = Image::new();
+    image.paths(&[
+        (0x3113, 0x2220),
+        (0x3213, 0x2120),
+        (0x3313, 0x2121),
+        (0x310c, 0x211e),
+    ]);
+    for (i, shift) in [0u8, 8, 16, 24, 26, 28].into_iter().enumerate() {
+        let at = GPIO + 4 + i * 8;
+        image.0[at..at + 4].copy_from_slice(&(BASE + 0x28d1 + i as u32 * 4).to_le_bytes());
+        image.0[at + 4] = 8;
+        image.0[at + 6] = 0x90 + i as u8;
+        let at = at + 6 * 8;
+        image.0[at..at + 4].copy_from_slice(&(BASE + 0x28f5).to_le_bytes());
+        image.0[at + 4] = shift;
+        image.0[at + 6] = i as u8 + 1;
+    }
+    for (i, line) in [0u8, 1, 5, 3].into_iter().enumerate() {
+        let at = RECORDS + i * 16;
+        image.0[at + 2] = line + 1; // HPD record's GPIO ID
+        image.0[at + 6] = 0x90 + line; // I2C record's GPIO ID
+    }
+    let paths = match display_paths_at(image.bytes(), BASE, 6) {
+        Ok(paths) => paths,
+        Err(_) => return TestResult::Fail("RX 6750 XT DDC data-pin routing rejected"),
+    };
+    for (i, (channel, hpd, transmitter)) in [(0, 1, 3), (1, 2, 2), (5, 6, 4), (3, 4, 0)]
+        .into_iter()
+        .enumerate()
+    {
+        let path = paths[i];
+        if path.aux != Some(channel) || path.hpd != hpd || path.transmitter != transmitter {
+            return TestResult::Fail("RX 6750 XT connector routing was guessed");
+        }
+    }
+    for shift in 0..32 {
+        image.0[GPIO + 4 + 4] = shift;
+        if aux_channel(image.bytes(), 0x90, BASE, 6).is_ok() != matches!(shift, 0 | 8) {
+            return TestResult::Fail("DDC pair accepted a bit other than clock or data");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-inventory",
+    inventory_rx6750xt_ddc_data_pins_resolve_the_board_routes
 );
 
 fn inventory_route_is_validated_against_the_board() -> TestResult {

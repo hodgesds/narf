@@ -26,8 +26,12 @@ mod mfp_tests;
 mod optional_mfp_tests;
 #[path = "power_save_tests.rs"]
 mod power_save_tests;
+#[path = "scan_ies_tests.rs"]
+mod scan_ies_tests;
 #[path = "vht_tests.rs"]
 mod vht_tests;
+#[path = "wmm_tests.rs"]
+mod wmm_tests;
 
 type ModelDevice = Device<TestAdapter>;
 static ACTIVE_TEST: IrqSafeSpinLock<Option<Arc<ModelDevice>>> = IrqSafeSpinLock::new(None);
@@ -55,6 +59,55 @@ struct Configuration {
     phy: Option<(u32, u8)>,
     wide: Option<crate::cyw43439::phy_fixture::Wide>,
     vht: Option<crate::cyw43439::phy_fixture::Vht80>,
+}
+/// The station shell the harness and the generation publisher build.
+fn shell(name: String, station: Station<TestAdapter>) -> Arc<ModelDevice> {
+    let channels = station
+        .channels
+        .iter()
+        .map(|&channel| u32::from(channel))
+        .collect();
+    let supplicant = station.supplicant;
+    let mfp_supported = station.supports_management_protection();
+    let sae_offload = station.supports_sae_offload();
+    let telemetry = Arc::new(crate::cyw43439::telemetry::Counters::default());
+    let ht_capabilities = station.ht_capabilities();
+    let vht_capabilities = station.vht_capabilities();
+    let (rx, consumer) = narf_ipc::channel();
+    let (producer, tx) = narf_ipc::channel();
+    let device = Arc::new(Device {
+        state: Mutex::new(State {
+            station,
+            rx,
+            tx,
+            pending: None,
+            telemetry: telemetry.clone(),
+        }),
+        name: name.clone(),
+        mac: OWN,
+        channels,
+        supplicant,
+        mfp_supported,
+        sae_offload,
+        external_ops: narf_lib::sync::IrqSafeSpinLock::new(Default::default()),
+        telemetry,
+        pmksa: narf_lib::sync::IrqSafeSpinLock::new(Default::default()),
+        ht_capabilities,
+        vht_capabilities,
+        up: AtomicBool::new(false),
+        power_save: AtomicU8::new(0),
+        bssid: AtomicU64::new(0),
+        roaming: AtomicBool::new(false),
+        epoch: AtomicU64::new(0),
+        closing: AtomicBool::new(false),
+        publication: IrqSafeSpinLock::new(()),
+        receive_hook: IrqSafeSpinLock::new(None),
+        rx: IrqSafeSpinLock::new(Some(consumer)),
+        tx: IrqSafeSpinLock::new(Some(producer)),
+        lifecycle: Default::default(),
+    });
+    *ACTIVE_TEST.lock() = Some(device.clone());
+    device
 }
 struct Harness {
     device: Arc<ModelDevice>,
@@ -262,43 +315,8 @@ impl Harness {
         {
             return Err("PCIe firmware identity/channel/key capabilities");
         }
-        let channels = station
-            .channels
-            .iter()
-            .map(|&channel| u32::from(channel))
-            .collect();
-        let supplicant = station.supplicant;
-        let mfp_supported = station.supports_management_protection();
-        let ht_capabilities = station.ht_capabilities();
-        let vht_capabilities = station.vht_capabilities();
-        let (rx, consumer) = narf_ipc::channel();
-        let (producer, tx) = narf_ipc::channel();
         let name = narf_net::iface::register("wlan%d", OWN, send);
-        let device = Arc::new(Device {
-            state: Mutex::new(State {
-                station,
-                rx,
-                tx,
-                pending: None,
-            }),
-            name: name.clone(),
-            mac: OWN,
-            channels,
-            supplicant,
-            mfp_supported,
-            ht_capabilities,
-            vht_capabilities,
-            up: AtomicBool::new(false),
-            power_save: AtomicU8::new(0),
-            bssid: AtomicU64::new(0),
-            epoch: AtomicU64::new(0),
-            closing: AtomicBool::new(false),
-            publication: IrqSafeSpinLock::new(()),
-            receive_hook: IrqSafeSpinLock::new(None),
-            rx: IrqSafeSpinLock::new(Some(consumer)),
-            tx: IrqSafeSpinLock::new(Some(producer)),
-        });
-        *ACTIVE_TEST.lock() = Some(device.clone());
+        let device = shell(name.clone(), station);
         narf_net::iface::set_link_state(&name, true); // operator IFF_UP
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
         narf_net::iface::install_rx_drain(drain);
@@ -609,7 +627,8 @@ fn composition_native(
     Ok(())
 }
 fn smoke_brcmf_native_open_station_to_dhcp_and_bidirectional_ip() -> TestResult {
-    for version in [5, 6] {
+    // Shared 7 runs the same conversation over 24/40-byte D2H completions.
+    for version in [5, 6, 7] {
         if let Err(error) = composition(version, false, false) {
             return TestResult::Fail(error);
         }
@@ -635,7 +654,7 @@ kernel_test_in!(
     smoke_brcmf_native_open_station_to_dhcp_and_bidirectional_ip
 );
 fn smoke_brcmf_native_wpa2_station_to_dhcp_and_bidirectional_ip() -> TestResult {
-    for version in [5, 6] {
+    for version in [5, 6, 7] {
         for first in [false, true] {
             if let Err(error) = composition(version, true, first) {
                 return TestResult::Fail(error);
@@ -785,3 +804,6 @@ kernel_test_in!(
 
 #[path = "live_policy_tests.rs"]
 mod live_policy_tests;
+
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;

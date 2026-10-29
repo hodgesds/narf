@@ -35,6 +35,7 @@ fn mgmt(subtype: u8, own: [u8; 6]) -> Vec<u8> {
 fn mpdu(bytes: Vec<u8>) -> Mpdu {
     Mpdu {
         native: None,
+        ba: false,
         bytes,
         phy: Vec::new(),
         rate: 0,
@@ -106,6 +107,13 @@ struct LinkState {
     ptk: Option<Ptk>,
     wmm: Option<Vec<u8>>,
     rates: Option<Vec<u8>>,
+    /// (bulk-out DCI, QoS TID, TXDESC queue) per published DATA frame.
+    data: Vec<(u8, u8, u8)>,
+    /// Halted bulk IN/OUT pipes (xHCI Halted until Reset Endpoint).
+    halt_rx: bool,
+    halt_tx: bool,
+    clears: Vec<u8>,
+    clear_fails: bool,
 }
 #[derive(Clone)]
 struct Link {
@@ -157,7 +165,7 @@ impl Io for Link {
     }
     fn poll_receive(&self, r: &u64, out: &mut [u8]) -> Result<Option<usize>, UsbError> {
         let mut m = self.state.lock();
-        if m.rx != Some(*r) {
+        if m.rx != Some(*r) || m.halt_rx {
             return Err(UsbError::Stall);
         }
         let Some(frame) = m.queue.pop_front() else {
@@ -191,7 +199,7 @@ impl Io for Link {
     }
     fn begin_send(&self, dci: u8, bytes: &[u8]) -> Result<u64, UsbError> {
         let mut m = self.state.lock();
-        if m.tx.is_some() || dci != 4 && dci != 8 || bytes.len() < 56 {
+        if m.tx.is_some() || !matches!(dci, 4 | 6 | 8) || bytes.len() < 56 {
             return Err(UsbError::Stall);
         }
         let f = &bytes[32..];
@@ -223,14 +231,15 @@ impl Io for Link {
                     }
                 }
                 8 | 0x88 => {
-                    let header = if f[0] == 0x88 {
-                        if f.get(24..26) != Some(&[0, 0]) {
-                            return Err(UsbError::Stall);
+                    let (header, tid) = if f[0] == 0x88 {
+                        match f.get(24..26) {
+                            Some(&[tid, 0]) if tid < 8 => (26, tid),
+                            _ => return Err(UsbError::Stall),
                         }
-                        26
                     } else {
-                        24
+                        (24, 0)
                     };
+                    m.data.push((dci, tid, bytes[5] & 31));
                     let body = if f[1] & 0x40 != 0 {
                         let mut w = narf_wireless::ccmp::ReplayWindow { last_seen_pn: 0 };
                         let mut b = f[header..].to_vec();
@@ -238,7 +247,7 @@ impl Io for Link {
                             &Ccm,
                             &f[..header],
                             m.ptk.as_ref().unwrap().tk.as_slice().try_into().unwrap(),
-                            0,
+                            tid,
                             false,
                             &mut w,
                             &mut b,
@@ -303,7 +312,7 @@ impl Io for Link {
     fn poll_send(&self, r: &u64) -> Result<Option<usize>, UsbError> {
         let mut m = self.state.lock();
         let (id, n, m4) = m.tx.ok_or(UsbError::Stall)?;
-        if id != *r {
+        if id != *r || m.halt_tx {
             return Err(UsbError::Stall);
         }
         if m4 && m.hold_m4 {
@@ -323,6 +332,21 @@ impl Io for Link {
             return Ok(());
         }
         Err(UsbError::Stall)
+    }
+    async fn clear_halt(&self, endpoint: u8) -> Result<(), UsbError> {
+        let mut m = self.state.lock();
+        m.clears.push(endpoint);
+        if m.clear_fails {
+            return Err(UsbError::Timeout);
+        }
+        if endpoint & 0x80 != 0 {
+            m.rx = None;
+            m.halt_rx = false;
+        } else {
+            m.tx = None;
+            m.halt_tx = false;
+        }
+        Ok(())
     }
 }
 fn raw(
@@ -392,6 +416,9 @@ fn wmm_prepared(protected: bool) -> WmmFixture {
     wmm_rates(protected, None)
 }
 fn wmm_rates(protected: bool, rates: Option<&[u8]>) -> WmmFixture {
+    wmm_profile(protected, rates, &WMM)
+}
+fn wmm_profile(protected: bool, rates: Option<&[u8]>, parameters: &[u8]) -> WmmFixture {
     let (control, link, mut rx, permission) = raw(protected);
     let cap = narf_capabilities::Cap::bootstrap();
     let domain = Arc::new(IrqSafeSpinLock::new(super::domain(17)));
@@ -401,14 +428,14 @@ fn wmm_rates(protected: bool, rates: Option<&[u8]>) -> WmmFixture {
         cap,
         domain.clone(),
     ));
-    link.state.lock().wmm = Some(WMM.to_vec());
+    link.state.lock().wmm = Some(parameters.to_vec());
     let mut b = beacon(protected);
     if let Some(rates) = rates {
         link.state.lock().rates = Some(rates.to_vec());
         b.bytes.extend_from_slice(&[50, rates.len() as u8]);
         b.bytes.extend_from_slice(rates);
     }
-    b.bytes.extend_from_slice(&WMM);
+    b.bytes.extend_from_slice(parameters);
     let candidate = Candidate::from_receive(&b, 1, link.own).unwrap();
     let station = Station::new(
         rx,
@@ -552,6 +579,110 @@ kernel_test_in!(
     "drivers/wireless/rtl8xxxu/wmm",
     smoke_rtl8188eu_wmm_real_ep0_bulk_edca_qos_and_current_authority
 );
+fn smoke_rtl8188eu_wmm_classifies_dscp_to_all_tids_queues_and_bulk_pipes() -> TestResult {
+    use super::super::super::packet_codec::{access_category, data_endpoint};
+    // rtl8xxxu_init_queue_priority pipe indices for VO/VI/BE/BK classes.
+    for (count, pipes) in [(1u8, [0usize, 0, 0]), (2, [0, 0, 1]), (3, [1, 1, 2])] {
+        for class in 0..3u8 {
+            if data_endpoint(class, count) != pipes[usize::from(class)] {
+                return TestResult::Fail("EU source queue-priority pipe table differs");
+            }
+        }
+    }
+    // (ACM bits VO1/VI2, TOS, TID, TXDESC queue, bulk DCI on this 3-out [2,3,4] fixture)
+    const CASES: [(u8, u8, u8, u8, u8); 8] = [
+        (0, 0x00, 0, 0, 8), // DF -> BE, out_ep[2]
+        (0, 0x20, 1, 2, 8), // CS1 -> BK, out_ep[2]
+        (0, 0x50, 3, 0, 8), // AF22 -> 3 (BE)
+        (0, 0x88, 4, 5, 6), // AF41 -> VI, out_ep[1]
+        (0, 0xb8, 6, 7, 6), // EF -> VO, out_ep[1] (vop = viq ^ 3)
+        (0, 0xc0, 7, 7, 6), // CS6 -> VO
+        (1, 0xb8, 5, 5, 6), // VO ACM: EF downgraded to VI
+        (3, 0xb8, 3, 0, 8), // VO+VI ACM: EF downgraded to BE
+    ];
+    for protected in [false, true] {
+        for (acm, tos, tid, queue, dci) in CASES {
+            if access_category(tid).0 != queue {
+                return TestResult::Fail("EU TXDESC queue table differs");
+            }
+            let mut parameters = WMM;
+            if acm & 1 != 0 {
+                parameters[10] |= 16;
+            }
+            if acm & 2 != 0 {
+                parameters[18] |= 16;
+            }
+            let (control, link, mut s, _, _) = wmm_profile(protected, None, &parameters);
+            if narf_scheduler::block_on(s.begin(0)).is_err() {
+                return TestResult::Fail("EU classified WMM native begin");
+            }
+            for now in 1..20 {
+                if narf_scheduler::block_on(s.step(now, SN)).is_err() {
+                    return TestResult::Fail("EU classified WMM association/RSNA");
+                }
+                if s.controlled_port_open() {
+                    break;
+                }
+            }
+            // rtl8xxxu_conf_tx mirrors each AC's ACM into REG_ACM_HW_CTRL.
+            let expected_acm = (acm & 1) * 8 + (acm & 2) * 2;
+            if !s.controlled_port_open() || control.0.lock().regs[0x5c0] & 15 != expected_acm {
+                return TestResult::Fail("EU REG_ACM_HW_CTRL differs from AP ACM rows");
+            }
+            let mut eth = AP.to_vec();
+            eth.extend_from_slice(&link.own);
+            eth.extend_from_slice(&[8, 0, 0x45, tos, 0, 20]);
+            // Open starts each TID at SN0; shared Security seeds every TID
+            // from the supplicant SN. Either way only this TID advances.
+            let mut first: Option<u16> = None;
+            for round in 0..2u16 {
+                if s.send_ethernet(&eth, 20 + u64::from(round) * 10).is_err() {
+                    return TestResult::Fail("EU classified QoS publication");
+                }
+                let sent = link.state.lock().sent.last().unwrap().clone();
+                let data = link.state.lock().data.last().copied();
+                let sequence = u16::from_le_bytes([sent[54], sent[55]]) >> 4;
+                let expected = match (first, protected) {
+                    (Some(first), _) => (first + 1) & 4095,
+                    (None, false) => 0,
+                    (None, true) => sequence,
+                };
+                first = Some(sequence);
+                if data != Some((dci, tid, queue))
+                    || sent[56..58] != [tid, 0]
+                    || sequence != expected
+                    || u32::from_le_bytes(sent[16..20].try_into().unwrap()) & 64 == 0
+                    || sent[..32]
+                        .chunks_exact(2)
+                        .fold(0u16, |a, b| a ^ u16::from_le_bytes([b[0], b[1]]))
+                        != 0
+                {
+                    return TestResult::Fail("EU TID/queue/pipe/per-TID SN/checksum differs");
+                }
+                if round == 1 {
+                    // The fixture AP's echo reuses PN1; one roundtrip suffices.
+                    break;
+                }
+                for now in 21..25 {
+                    if s.poll_network(now, SN).is_err() {
+                        return TestResult::Fail("EU classified QoS native roundtrip");
+                    }
+                }
+                let mut expected = link.own.to_vec();
+                expected.extend_from_slice(&AP);
+                expected.extend_from_slice(&eth[12..]);
+                if s.pop_received() != Some(expected) {
+                    return TestResult::Fail("EU classified QoS CCMP/normalization");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/wmm",
+    smoke_rtl8188eu_wmm_classifies_dscp_to_all_tids_queues_and_bulk_pipes
+);
 fn smoke_rtl8188eu_wmm_response_rejection_and_pending_ep0_cancellation_retain_owner() -> TestResult
 {
     for case in 0..4 {
@@ -617,6 +748,168 @@ fn smoke_rtl8188eu_wmm_response_rejection_and_pending_ep0_cancellation_retain_ow
 kernel_test_in!(
     "drivers/wireless/rtl8xxxu/wmm",
     smoke_rtl8188eu_wmm_response_rejection_and_pending_ep0_cancellation_retain_owner
+);
+/// Bound-AP beacon carrying `parameters` after the base fixture elements.
+fn wmm_beacon(protected: bool, parameters: &[u8]) -> Vec<u8> {
+    let mut b = beacon(protected).bytes;
+    b.extend_from_slice(parameters);
+    b
+}
+/// Parameter Set Count 2: VI AIFSN2->3, VO TXOP47->30 with ACM set.
+const WMM_COUNT2: [u8; 26] = [
+    221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0x82, 0, 0x72, 0x32, 30, 0, 3, 0xa4, 0, 0, 0x43, 0x43, 94, 0,
+    0x27, 0xa4, 0, 0,
+];
+fn edca_rows(control: &Fake) -> [u32; 4] {
+    let regs = control.0.lock().regs.clone();
+    [0x508, 0x50c, 0x504, 0x500].map(|r| u32::from_le_bytes(regs[r..r + 4].try_into().unwrap()))
+}
+fn smoke_rtl8188eu_wmm_beacon_parameter_set_count_updates_live_edca() -> TestResult {
+    const INITIAL: [u32; 4] = [0xa546, 0xa496, 0x005e4332, 0x002f3232];
+    // rtl8xxxu_set_aifs/conf_tx: AIFS = SIFS10 + AIFSN*20 (long slot).
+    const UPDATED: [u32; 4] = [0xa546, 0xa496, 0x005e4346, 0x001e3232];
+    for protected in [false, true] {
+        let (control, link, mut s, _, _) = wmm_prepared(protected);
+        if narf_scheduler::block_on(s.begin(0)).is_err() {
+            return TestResult::Fail("EU live EDCA begin");
+        }
+        for now in 1..20 {
+            if narf_scheduler::block_on(s.step(now, SN)).is_err() {
+                return TestResult::Fail("EU live EDCA association/RSNA");
+            }
+            if s.controlled_port_open() {
+                break;
+            }
+        }
+        if !s.controlled_port_open() || edca_rows(&control) != INITIAL {
+            return TestResult::Fail("EU live EDCA initial rows");
+        }
+        // Same count: mac80211 ignores the beacon; no EP0 work is queued.
+        link.state
+            .lock()
+            .queue
+            .push_back(wmm_beacon(protected, &WMM));
+        let ops = control.0.lock().ops.len();
+        if s.poll_network(20, SN).is_err()
+            || narf_scheduler::block_on(s.maintain()).is_err()
+            || control.0.lock().ops.len() != ops
+        {
+            return TestResult::Fail("EU same-count beacon reprogrammed EDCA");
+        }
+        // New count: the synchronous path records it without any EP0 await.
+        link.state
+            .lock()
+            .queue
+            .push_back(wmm_beacon(protected, &WMM_COUNT2));
+        if s.poll_network(21, SN).is_err()
+            || control.0.lock().ops.len() != ops
+            || edca_rows(&control) != INITIAL
+        {
+            return TestResult::Fail("EU synchronous network path issued EP0 EDCA writes");
+        }
+        if narf_scheduler::block_on(s.maintain()).is_err()
+            || edca_rows(&control) != UPDATED
+            || control.0.lock().regs[0x5c0] & 15 != 8
+            || !s.controlled_port_open()
+        {
+            return TestResult::Fail("EU live EDCA/ACM rows not programmed after count change");
+        }
+        // Classification now downgrades VO (DSCP46) under the new VO ACM.
+        let mut eth = AP.to_vec();
+        eth.extend_from_slice(&link.own);
+        eth.extend_from_slice(&[8, 0, 0x45, 46 << 2, 0, 20]);
+        if s.send_ethernet(&eth, 22).is_err() {
+            return TestResult::Fail("EU data after live EDCA update");
+        }
+        if link.state.lock().data.last().map(|d| d.2) != Some(5) {
+            return TestResult::Fail("EU classification ignored updated ACM rows");
+        }
+        for now in 23..26 {
+            if s.poll_network(now, SN).is_err() {
+                return TestResult::Fail("EU roundtrip after live EDCA");
+            }
+        }
+        // Same new count, different bytes: still ignored.
+        let mut alt = WMM_COUNT2;
+        alt[12] = 10;
+        link.state
+            .lock()
+            .queue
+            .push_back(wmm_beacon(protected, &alt));
+        if s.poll_network(26, SN).is_err()
+            || narf_scheduler::block_on(s.maintain()).is_err()
+            || edca_rows(&control) != UPDATED
+        {
+            return TestResult::Fail("EU unchanged-count element bytes reprogrammed EDCA");
+        }
+        // Cancelled live update is terminal and leaves posted RX owned.
+        let mut count3 = WMM_COUNT2;
+        count3[8] = 0x83;
+        link.state
+            .lock()
+            .queue
+            .push_back(wmm_beacon(protected, &count3));
+        if s.poll_network(27, SN).is_err() {
+            return TestResult::Fail("EU count3 beacon");
+        }
+        control.0.lock().pending_write = Some(0x508);
+        {
+            let mut operation = Box::pin(s.maintain());
+            if operation
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+            {
+                return TestResult::Fail("EU held live EDCA EP0 completed");
+            }
+        }
+        if s.phase() != Phase::Failed
+            || s.controlled_port_open()
+            || s.send_ethernet(&eth, 28).is_ok()
+            || link.state.lock().rx.is_none()
+        {
+            return TestResult::Fail("EU cancelled live EDCA reopened station or released RX");
+        }
+    }
+    // An inadmissible new set (BE ACM) is terminal before any EP0 write;
+    // losing WMM entirely is peer loss.
+    for case in 0..2 {
+        let (control, link, mut s, _, _) = wmm_prepared(false);
+        narf_scheduler::block_on(s.begin(0)).unwrap();
+        for now in 1..20 {
+            narf_scheduler::block_on(s.step(now, SN)).unwrap();
+            if s.controlled_port_open() {
+                break;
+            }
+        }
+        let mut bad = WMM_COUNT2;
+        bad[14] |= 0x10;
+        let frame = if case == 0 {
+            wmm_beacon(false, &bad)
+        } else {
+            beacon(false).bytes
+        };
+        link.state.lock().queue.push_back(frame);
+        let ops = control.0.lock().ops.len();
+        let result = s.poll_network(20, SN);
+        let expected = if case == 0 {
+            Error::Radio(super::super::super::receive_runtime::Error::State)
+        } else {
+            Error::PeerLost
+        };
+        if result != Err(expected)
+            || s.phase() != Phase::Failed
+            || control.0.lock().ops.len() != ops
+            || edca_rows(&control) != INITIAL
+        {
+            return TestResult::Fail("EU inadmissible/lost WMM beacon was not terminal pre-write");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/wmm",
+    smoke_rtl8188eu_wmm_beacon_parameter_set_count_updates_live_edca
 );
 fn smoke_rtl8188eu_real_station_auth_assoc_fw_rsna_and_packet_roundtrip() -> TestResult {
     for protected in [false, true] {
@@ -895,20 +1188,48 @@ fn smoke_rtl8188eu_service_composes_passive_scan_optional_ies_rsna_and_sync_netw
         return TestResult::Fail("sync service did not retire real TX and deliver CCMP RX");
     }
     narf_scheduler::block_on(service.disconnect()).unwrap();
-    if service.phase() != ServicePhase::Stopped
+    // Safe rejoin: Passive again, BSSID cleared (set_bssid(zero)), RX-only
+    // reception restarted on a fresh receipt; no station/key survives.
+    let first_rx = link.state.lock().rx;
+    if service.phase() != ServicePhase::Passive
         || service.connected_peer().is_some()
         || service.transmit_ready()
         || !service.poll().unwrap().is_empty()
-        || narf_scheduler::block_on(service.connect(
-            AP,
-            b"narf",
-            SecurityMode::Wpa2Psk,
-            Some(Zeroizing::new(PMK)),
-            &[],
-        ))
-        .is_ok()
+        || control.0.lock().regs[0x618..0x61e] != [0; 6]
+        || control.0.lock().regs[0x100] & 0xc0 != 0x80
+        || first_rx.is_none()
     {
-        return TestResult::Fail("stopped service reconstructed station/key history");
+        return TestResult::Fail("disconnected service did not return to Passive");
+    }
+    // A second, independent association: fresh 4-way and CCMP.
+    {
+        let mut state = link.state.lock();
+        state.ptk = None;
+        state.sent.clear();
+        state.queue.push_back(beacon(true).bytes);
+    }
+    service.poll().unwrap();
+    if narf_scheduler::block_on(service.connect(
+        AP,
+        b"narf",
+        SecurityMode::Wpa2Psk,
+        Some(Zeroizing::new(PMK)),
+        &[],
+    ))
+    .is_err()
+        || service.connected_peer() != Some(AP)
+        || control.0.lock().regs[0x618..0x61e] != AP
+    {
+        return TestResult::Fail("Passive service refused a second association");
+    }
+    service.transmit(&ethernet).unwrap();
+    if service.poll().unwrap().len() != 1 || !service.transmit_ready() {
+        return TestResult::Fail("rejoined station lost real TX/CCMP RX");
+    }
+    // Teardown again; a failed teardown (EP0 loss) is terminal, no rejoin.
+    narf_scheduler::block_on(service.disconnect()).unwrap();
+    if service.phase() != ServicePhase::Passive {
+        return TestResult::Fail("second disconnect did not return to Passive");
     }
     TestResult::Pass
 }
@@ -1090,11 +1411,15 @@ fn smoke_rtl8188eu_interface_uses_controlled_port_rings_and_synchronous_usb_prog
     if frame.payload() != expected || !matches!(consumer.try_recv(), Ok(None)) {
         return TestResult::Fail("RX ring delivered altered or extra plaintext");
     }
+    let old_rx = link.state.lock().rx;
     narf_scheduler::block_on(device.disassociate()).unwrap();
+    // The old association's receipt is stopped; safe rejoin posts a new
+    // passive RX receipt for the reopened (carrier-down) interface.
     if device.link_up()
         || device.connected_bssid().is_some()
         || !device.progress().is_empty()
-        || link.state.lock().rx.is_some()
+        || old_rx.is_none()
+        || link.state.lock().rx == old_rx
     {
         return TestResult::Fail(
             "interface disconnect failed to close carrier and stop real receipts",
@@ -1194,4 +1519,115 @@ fn smoke_rtl8188eu_service_only_draws_entropy_at_new_handshake_consumption() -> 
 kernel_test_in!(
     "wireless",
     smoke_rtl8188eu_service_only_draws_entropy_at_new_handshake_consumption
+);
+
+/// A Stall on the open station's bulk IN or OUT pipe no longer kills the
+/// association: the async maintenance path resets exactly that endpoint
+/// and reposts/reopens it, best-effort DATA is dropped, a failed reset is
+/// terminal, and disconnect recovers a halted pipe before draining it.
+fn smoke_rtl8188eu_station_endpoint_halt_recovery_keeps_association() -> TestResult {
+    fn open() -> (Link, Station<Fake, Link>) {
+        let (_, link, mut s) = prepared(false);
+        narf_scheduler::block_on(s.begin(0)).unwrap();
+        for now in 1..20 {
+            narf_scheduler::block_on(s.step(now, SN)).unwrap();
+            if s.controlled_port_open() {
+                break;
+            }
+        }
+        (link, s)
+    }
+    fn ethernet(link: &Link) -> Vec<u8> {
+        let mut ethernet = AP.to_vec();
+        ethernet.extend_from_slice(&link.own);
+        ethernet.extend_from_slice(&[8, 0, 0x45, 0, 0, 20]);
+        ethernet
+    }
+    fn roundtrip(link: &Link, s: &mut Station<Fake, Link>, now: u64) -> bool {
+        let ethernet = ethernet(link);
+        if s.send_ethernet(&ethernet, now).is_err() {
+            return false;
+        }
+        for t in now + 1..now + 5 {
+            if s.poll_network(t, SN).is_err() {
+                return false;
+            }
+        }
+        let mut expected = link.own.to_vec();
+        expected.extend_from_slice(&AP);
+        expected.extend_from_slice(&ethernet[12..]);
+        s.pop_received() == Some(expected)
+    }
+    let (link, mut s) = open();
+    if !s.controlled_port_open() {
+        return TestResult::Fail("halt fixture failed to open the station");
+    }
+    // Bulk IN halt: service keeps polling, maintenance recovers.
+    link.state.lock().halt_rx = true;
+    let posts = link.state.lock().posts;
+    for now in 20..23 {
+        if s.poll_network(now, SN).is_err() {
+            return TestResult::Fail("bulk IN Stall was still terminal");
+        }
+    }
+    if !s.maintenance_pending() || narf_scheduler::block_on(s.maintain()).is_err() {
+        return TestResult::Fail("bulk IN halt did not schedule recovery");
+    }
+    {
+        let m = link.state.lock();
+        if m.clears != [0x81] || m.posts != posts + 1 || m.rx.is_none() {
+            return TestResult::Fail("bulk IN recovery did not reset and repost");
+        }
+    }
+    if !roundtrip(&link, &mut s, 30) {
+        return TestResult::Fail("recovered bulk IN lost the association");
+    }
+    // Bulk OUT halt: the DATA frame is dropped and the slot reopened.
+    link.state.lock().halt_tx = true;
+    s.send_ethernet(&ethernet(&link), 40).unwrap();
+    for now in 41..43 {
+        if s.poll_network(now, SN).is_err() {
+            return TestResult::Fail("bulk OUT Stall was still terminal");
+        }
+    }
+    if s.transmit_ready() || narf_scheduler::block_on(s.maintain()).is_err() {
+        return TestResult::Fail("bulk OUT halt did not hold the slot for recovery");
+    }
+    let out = link.state.lock().clears.last().copied();
+    if !matches!(out, Some(2..=4)) || link.state.lock().tx.is_some() {
+        return TestResult::Fail("bulk OUT recovery did not reset the OUT endpoint");
+    }
+    if s.poll_network(43, SN).is_err() || !s.transmit_ready() {
+        return TestResult::Fail("bulk OUT recovery did not reopen the slot");
+    }
+    for _ in 0..8 {
+        if s.pop_received().is_none() {
+            break;
+        }
+    }
+    if !roundtrip(&link, &mut s, 50) {
+        return TestResult::Fail("recovered bulk OUT lost the association");
+    }
+    // Teardown: disconnect recovers a halted pipe before Stop/SetDeq.
+    link.state.lock().halt_rx = true;
+    let _ = s.poll_network(60, SN);
+    if narf_scheduler::block_on(s.disconnect()).is_err()
+        || s.phase() != Phase::Stopped
+        || link.state.lock().rx.is_some()
+    {
+        return TestResult::Fail("halted station could not disconnect");
+    }
+    // Failure: a failed endpoint reset is terminal.
+    let (link, mut s) = open();
+    link.state.lock().halt_rx = true;
+    link.state.lock().clear_fails = true;
+    let _ = s.poll_network(20, SN);
+    if narf_scheduler::block_on(s.maintain()).is_ok() || s.phase() != Phase::Failed {
+        return TestResult::Fail("failed endpoint reset kept the station open");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtl8xxxu/packet",
+    smoke_rtl8188eu_station_endpoint_halt_recovery_keeps_association
 );

@@ -12,7 +12,10 @@
 //! This module reproduces that static enumeration for Gen12
 //! (Tiger Lake / Alder Lake / Raptor Lake — Xe-LP) so the driver
 //! core has a single canonical place to look up "where does GT
-//! live on TGL?".
+//! live on TGL?". The Xe-LPG (Meteor Lake) table joined in
+//! #1016: its display block sits lower in BAR0 and the Type-C
+//! port block lives up at 0x16F000, where Gen12 keeps its DPLL
+//! registers — Xe-LPG has no DPLL block at all.
 //!
 //! ## References
 //!
@@ -221,23 +224,92 @@ pub static GEN12_REGIONS: &[Region] = &[
     },
 ];
 
+/// Xe-LPG region map — Meteor Lake (#1016).
+///
+/// Deltas vs Gen12, each grounded in the MTL display register
+/// headers (`intel_display_regs.h`, `intel_cx0_phy_regs.h`,
+/// `intel_dp_aux_regs.h` as implemented by i915 for the MTL
+/// PRM):
+///
+/// - The display block starts at 0x40000 (power wells at
+///   0x45404, CDCLK at 0x46000, pipes/transcoders/planes and
+///   DDI A/B all inside [0x40000, 0x80000)).
+/// - The Type-C port block (TC1/TC2 buffer control, AUX, and
+///   C20 message bus) sits at 0x16F000 — the range Gen12 uses
+///   for its DPLL block. Xe-LPG has **no DPLL region**: the
+///   port PLLs live inside the C10/C20 PHYs and are programmed
+///   over the message bus, so `region_of(XeLpg, Dpll)` is
+///   honestly `None`.
+/// - GMBUS, PUNIT, FUSE, GUNIT and the GTT array half keep
+///   their Gen12 placements.
+pub static XE_LPG_REGIONS: &[Region] = &[
+    Region {
+        kind: RegionKind::Gunit,
+        offset: 0x0000_0000,
+        size: 0x0001_0000,
+    },
+    Region {
+        kind: RegionKind::Fuse,
+        offset: 0x0000_9000,
+        size: 0x0000_1000,
+    },
+    Region {
+        kind: RegionKind::Punit,
+        offset: 0x0013_8000,
+        size: 0x0000_8000,
+    },
+    Region {
+        kind: RegionKind::Gt,
+        offset: 0x0000_2000,
+        size: 0x0000_4000,
+    },
+    Region {
+        kind: RegionKind::Display,
+        offset: 0x0004_0000,
+        size: 0x0004_0000,
+    },
+    // Type-C port block (TC1/TC2) — display registers that live
+    // outside the main display range on Xe-LPG.
+    Region {
+        kind: RegionKind::Display,
+        offset: 0x0016_F000,
+        size: 0x0000_1000,
+    },
+    Region {
+        kind: RegionKind::Gmbus,
+        offset: 0x000C_5100,
+        size: 0x0000_0040,
+    },
+    // No Dpll entry — see the table header.
+    Region {
+        kind: RegionKind::GttAdr,
+        offset: 0x0080_0000,
+        size: 0x0080_0000,
+    },
+];
+
 // ── Generation routing ───────────────────────────────────────────
 
 /// Sub-architectures the Stage-0 enumeration covers. Tiger Lake /
 /// Alder Lake / Raptor Lake all share the Xe-LP register surface
 /// and are folded onto `GEN12_REGIONS`. Meteor Lake (Xe-LPG) has
-/// a different MMIO map — display block shifted, GT block extended
-/// — and is not part of this scope.
+/// a different MMIO map — display block shifted down, Type-C
+/// port block where Gen12's DPLL block sits — and maps to
+/// `XE_LPG_REGIONS` (#1016). Panther Lake (Xe3-LPD) is not
+/// modelled.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RegionGeneration {
     /// Gen12 Xe-LP — TGL / ADL / RPL.
     Gen12,
+    /// Xe-LPG — Meteor Lake.
+    XeLpg,
 }
 
 /// Resolve the region table for a generation.
 pub const fn regions_for(gen: RegionGeneration) -> &'static [Region] {
     match gen {
         RegionGeneration::Gen12 => GEN12_REGIONS,
+        RegionGeneration::XeLpg => XE_LPG_REGIONS,
     }
 }
 
@@ -322,6 +394,50 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_regions", smoke_gtt_adr_second_half);
+
+    fn smoke_xelpg_regions() -> TestResult {
+        // Every kind the Xe-LPG map defines must resolve; DPLL
+        // must NOT (there is no DPLL block on Xe-LPG — claiming
+        // one would put Gen12's DPLL offsets in the TC range).
+        for kind in [
+            RegionKind::Gt,
+            RegionKind::Display,
+            RegionKind::Gmbus,
+            RegionKind::Gunit,
+            RegionKind::Punit,
+            RegionKind::Fuse,
+            RegionKind::GttAdr,
+        ] {
+            if region_of(RegionGeneration::XeLpg, kind).is_none() {
+                return TestResult::Fail("Xe-LPG region table missing a kind");
+            }
+        }
+        if region_of(RegionGeneration::XeLpg, RegionKind::Dpll).is_some() {
+            return TestResult::Fail("Xe-LPG must not enumerate a DPLL region");
+        }
+        // The power-well register (0x45404) and the TC1 buffer
+        // control (0x16F200) must both land in DISPLAY.
+        for off in [0x4_5404u64, 0x16_F200] {
+            match region_at(RegionGeneration::XeLpg, off) {
+                Some(r) if r.kind == RegionKind::Display => {}
+                _ => return TestResult::Fail("Xe-LPG DISPLAY region missing a display register"),
+            }
+        }
+        // And the same TC offset on the Gen12 map is DPLL —
+        // the generations really do partition BAR0 differently.
+        match region_at(RegionGeneration::Gen12, 0x16_4280) {
+            Some(r) if r.kind == RegionKind::Dpll => {}
+            _ => return TestResult::Fail("Gen12 DPLL region regressed"),
+        }
+        const BAR0_LEN: u64 = 16 * 1024 * 1024;
+        for r in XE_LPG_REGIONS {
+            if r.end() > BAR0_LEN {
+                return TestResult::Fail("Xe-LPG region overflows BAR0 size");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/intel_gpu_regions", smoke_xelpg_regions);
 
     fn smoke_region_kind_roundtrip() -> TestResult {
         for kind in [

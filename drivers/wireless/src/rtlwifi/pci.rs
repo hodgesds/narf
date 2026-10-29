@@ -221,6 +221,9 @@ impl From<mac::MacInitError> for ProbeError {
 
 /// Single-device static slot.
 static CONTROLLER: IrqSafeSpinLock<Option<RtlwifiDevice>> = IrqSafeSpinLock::new(None);
+/// A removed function whose DMA could not be proven idle keeps its
+/// published mappings pinned, so the address is never re-initialized.
+static QUARANTINE: IrqSafeSpinLock<Option<narf_bus::BusAddr>> = IrqSafeSpinLock::new(None);
 
 /// Register one PCI-match entry per supported device ID.
 pub fn register_pci_driver() {
@@ -233,11 +236,78 @@ pub fn register_pci_driver() {
             },
             probe,
         });
+        narf_bus::register_pci_remove(name_for(did), remove);
     }
+}
+
+/// Linux v7.2 `pci.c::rtl_pci_remove`: `ieee80211_unregister_hw` (netdev
+/// withdrawal, then `rtl_op_stop` → `rtl_pci_stop`: `disable_interrupt`
+/// and `rtl88ee_card_disable`), `rtl_pci_deinit` (`free_irq` /
+/// `pci_disable_msi`) and only then the DMA rings are freed. Here the
+/// rings are released only after the card-disable quiescence proof;
+/// unproven mappings stay pinned and the address is quarantined.
+fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
+    let Some(owner) = detach(device.addr) else {
+        return;
+    };
+    narf_scheduler::spawn(async move {
+        let reclaimed = finish_removal(owner, device.addr).await;
+        narf_console::klog!(
+            "rtlwifi: removed; DMA {}\n",
+            if reclaimed {
+                "reclaimed"
+            } else {
+                "pinned, address quarantined"
+            }
+        );
+    });
+}
+/// Take the bound owner for `address` out of the controller slot and
+/// quarantine the address until its removal proves DMA idle.
+fn detach(address: narf_bus::BusAddr) -> Option<RtlwifiDevice> {
+    let owner = {
+        let mut controller = CONTROLLER.lock();
+        if controller
+            .as_ref()
+            .is_some_and(|owner| owner.bus_addr == address)
+        {
+            controller.take()
+        } else {
+            None
+        }
+    }?;
+    *QUARANTINE.lock() = Some(address);
+    Some(owner)
+}
+async fn finish_removal(owner: RtlwifiDevice, address: narf_bus::BusAddr) -> bool {
+    let reclaimed = match &owner.native {
+        Some(native) => native.remove().await,
+        None => {
+            // Diagnostic (non-native) profiles never publish DMA.
+            let name = *IFNAME.lock();
+            if !name.is_empty() {
+                narf_wireless::registry::unregister(name);
+                narf_net::iface::unregister(name);
+            }
+            true
+        }
+    };
+    drop(owner);
+    if reclaimed {
+        let mut quarantine = QUARANTINE.lock();
+        if *quarantine == Some(address) {
+            *quarantine = None;
+        }
+    }
+    reclaimed
 }
 
 /// PCI probe callback.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    if *QUARANTINE.lock() == Some(device.addr) {
+        // Pinned DMA from a removed owner: never power-cycle it again.
+        return Err(narf_bus::ProbeError::BadDevice);
+    }
     let bound = CONTROLLER.lock().as_ref().map(|owner| owner.bus_addr);
     match crate::rtw88::pci_park::admission(bound, device.addr) {
         crate::rtw88::pci_park::Admission::Bound => return Ok(()),
@@ -553,6 +623,7 @@ pub async fn provision() -> Result<(), super::prepare::Error> {
 #[cfg(any(test, feature = "kernel-test"))]
 pub fn __reset_for_test() {
     *CONTROLLER.lock() = None;
+    *QUARANTINE.lock() = None;
 }
 
 #[cfg(feature = "kernel-test")]
@@ -668,5 +739,58 @@ mod provision_tests {
     kernel_test_in!(
         "drivers/wireless/rtlwifi/provision",
         smoke_rtl8188ee_public_provision_admission_retains_exact_arcs_and_cancelled_wait
+    );
+    /// `rtl_pci_remove` routing: only the bound address detaches, the
+    /// address is quarantined against re-probe until removal proves DMA
+    /// idle, and a reclaimed removal lifts the quarantine.
+    fn smoke_rtl8188ee_pci_remove_detaches_and_quarantines_exact_owner() -> TestResult {
+        __reset_for_test();
+        let controller = fixture();
+        let address = controller.bus_addr;
+        let other = narf_bus::BusAddr::Pcie(narf_bus::PcieAddr::new(0xfffe, 0xfd, 0x1a, 0));
+        *CONTROLLER.lock() = Some(controller);
+        if detach(other).is_some() || !is_probed() || QUARANTINE.lock().is_some() {
+            return TestResult::Fail("EE removal detached a different function");
+        }
+        let Some(owner) = detach(address) else {
+            return TestResult::Fail("EE removal missed the bound function");
+        };
+        if is_probed() || *QUARANTINE.lock() != Some(address) {
+            return TestResult::Fail("EE removal left the owner bound or unquarantined");
+        }
+        // A quarantined address is refused before any config/BAR access
+        // (the fixture capability is revoked; any access would fail).
+        let device = BusDevice {
+            addr: address,
+            id: narf_bus::DeviceId {
+                vendor: 0x10ec,
+                device: RTL_DEV_8188EE,
+                class: 0x028000,
+                subsystem_vendor: 0x10ec,
+                subsystem_id: 0xffff,
+            },
+            kind: match address {
+                narf_bus::BusAddr::Pcie(addr) => narf_bus::BusKind::Pcie {
+                    addr,
+                    cfg_phys: narf_memory::PhysAddr::new(0),
+                },
+                _ => unreachable!(),
+            },
+        };
+        let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+        cap.revoke();
+        if probe(device, cap) != Err(narf_bus::ProbeError::BadDevice) || is_probed() {
+            return TestResult::Fail("EE quarantined function was re-probed");
+        }
+        if !narf_scheduler::block_on(finish_removal(owner, address)) || QUARANTINE.lock().is_some()
+        {
+            return TestResult::Fail("EE owner without published DMA kept its quarantine");
+        }
+        __reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/rtlwifi/provision",
+        smoke_rtl8188ee_pci_remove_detaches_and_quarantines_exact_owner
     );
 }

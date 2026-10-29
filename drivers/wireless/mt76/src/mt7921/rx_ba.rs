@@ -6,9 +6,14 @@ use alloc::{collections::VecDeque, vec, vec::Vec};
 pub(super) const TIDS: usize = 8; // Native STA_REC_BA.ba_en is one octet.
 
 // CONNAC2 WTBL/STA_REC_BA carry the actual16-bit window, without CONNAC1's
-// discrete range index. Retain an HT-sized64 MPDU host bound; wider HE/EHT
-// agreements require separate negotiated profiles.
-const MAX_WINDOW: u16 = 64;
+// discrete range index. mac80211 agg-rx.c bounds a non-HE peer at
+// IEEE80211_MAX_AMPDU_BUF_HT (64) and an HE peer at IEEE80211_MAX_AMPDU_BUF_HE
+// (256, also mt792x's max_rx_aggregation_subframes); EHT/MLO is not admitted.
+pub(super) const HT_WINDOW: u16 = 64;
+pub(super) const HE_WINDOW: u16 = crate::mt7921::he::MAX_AMPDU_BUF_HE;
+/// mt792x_core.c `max_rx_aggregation_subframes = IEEE80211_MAX_AMPDU_BUF_HE`.
+const DRIVER_WINDOW: u16 = HE_WINDOW;
+const MAX_WINDOW: u16 = HE_WINDOW;
 const MAX_READY: usize = TIDS * MAX_WINDOW as usize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,7 +26,9 @@ pub(super) struct Request {
     pub amsdu: bool,
 }
 impl Request {
-    pub fn parse(frame: &[u8]) -> Option<Self> {
+    /// `limit` is the peer's mac80211 `max_buf_size`: `HE_WINDOW` for a
+    /// negotiated HE peer, otherwise `HT_WINDOW`.
+    pub fn parse(frame: &[u8], limit: u16) -> Option<Self> {
         if frame.len() != 33 || frame[24..26] != [3, 0] {
             return None;
         }
@@ -32,11 +39,12 @@ impl Request {
         if parameters & 2 == 0 || usize::from(tid) >= TIDS || sequence & 15 != 0 {
             return None;
         }
-        let window = if requested == 0 {
-            MAX_WINDOW
-        } else {
-            requested.min(MAX_WINDOW)
-        };
+        if !matches!(limit, HT_WINDOW | HE_WINDOW) || requested > limit {
+            return None; // Oversize: declined, see `oversize`.
+        }
+        // Zero selects max_buf_size; only then does mac80211 clamp to the
+        // driver's max_rx_aggregation_subframes (mt792x: HE_WINDOW).
+        let window = if requested == 0 { limit } else { requested }.min(DRIVER_WINDOW);
         Some(Self {
             dialog: frame[26],
             tid,
@@ -45,6 +53,16 @@ impl Request {
             timeout: u16::from_le_bytes([frame[29], frame[30]]),
             amsdu: parameters & 1 != 0,
         })
+    }
+    /// mac80211 `__ieee80211_start_rx_ba_session` (agg-rx.c:337-357):
+    /// after the TID check (REQUEST_DECLINED), `buf_size > max_buf_size`
+    /// is declined with WLAN_STATUS_INVALID_QOS_PARAM, never clamped.
+    pub fn oversize(frame: &[u8], limit: u16) -> bool {
+        if frame.len() != 33 || frame[24..26] != [3, 0] {
+            return false;
+        }
+        let parameters = u16::from_le_bytes([frame[27], frame[28]]);
+        usize::from((parameters >> 2) & 15) < TIDS && parameters >> 6 > limit
     }
     pub fn response(self, own: [u8; 6], peer: [u8; 6]) -> Vec<u8> {
         let mut frame = action(own, peer, 33);

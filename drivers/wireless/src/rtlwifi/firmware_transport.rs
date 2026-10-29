@@ -113,6 +113,11 @@ impl Identity {
             source,
         }
     }
+    /// An unsourced identity over `bytes` for qualification fixtures.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn fixture(bytes: &[u8]) -> Self {
+        Self::from_bytes(bytes, None)
+    }
     pub(super) fn invoke<T>(
         &self,
         operation: impl FnOnce() -> Result<T, super::prepare::Error>,
@@ -233,6 +238,11 @@ impl<I: Io> Owner<I> {
     }
     pub fn status(&self) -> Status {
         *self.status.lock()
+    }
+    /// The retained native adapter, for vector binding only. Register
+    /// access still flows through the gated `PacketIo` continuation.
+    pub(super) fn native(&self) -> &I {
+        &self.io
     }
     pub(crate) fn identity(&self) -> Option<Identity> {
         if self.status().stage != Stage::Ready {

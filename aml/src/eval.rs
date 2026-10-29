@@ -200,6 +200,35 @@ pub fn evaluate_method(path: &str, args: &[Value]) -> Result<Value, AmlError> {
     }
 }
 
+/// Evaluate an ACPI data object in whichever of the two shapes
+/// firmware uses for it: a control Method that returns the value,
+/// or a `Name` holding it. Fan `_FIF` / `_FPS` (ACPI 6.5 §11.3.1),
+/// processor `_PSS`, power-resource `_PR0` and many other data
+/// objects are declared as `Name(Package(...))` in most DSDTs and
+/// as zero-argument Methods in the rest.
+///
+/// [`evaluate_method`] alone rejects Name nodes with
+/// `MethodNotFound`, and the namespace builder stores a static
+/// Package body as `NameValue::Unparsed` (only runtime `Store`s
+/// land as live `NameValue::Package`s), so before this helper a
+/// caller outside this crate had no way to read a Name-held
+/// Package at all. Method nodes delegate to `evaluate_method`;
+/// Name nodes convert their stored value, decoding an `Unparsed`
+/// body from the AML store (the same path `eval_term_arg` takes
+/// when AML code reads the name). `args` are only meaningful for
+/// the Method shape and are ignored for Names.
+pub fn evaluate_object(path: &str, args: &[Value]) -> Result<Value, AmlError> {
+    let node = crate::find_node(path).ok_or(AmlError::MethodNotFound)?;
+    match node.kind {
+        crate::NodeKind::Method => evaluate_method(path, args),
+        crate::NodeKind::Name => match node.value {
+            Some(nv) => Ok(name_value_to_value(nv)),
+            None => Err(AmlError::MethodNotFound),
+        },
+        _ => Err(AmlError::MethodNotFound),
+    }
+}
+
 /// Resolve a NameString against the current eval scope per ACPI
 /// §5.3: try `scope.name`, then walk parents up to root, finally
 /// the bare name. Returns the first matching node.
@@ -1521,6 +1550,13 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
                     _ => match node.value {
                         Some(NameValue::Integer(v)) => Value::Integer(v),
                         Some(NameValue::String(s)) => Value::String(s),
+                        // Live values stored by an earlier `Store`
+                        // (see `value_to_name_value`) read back as
+                        // themselves, per ACPI 6.5 §19.6.116.
+                        Some(NameValue::Buffer(b)) => Value::Buffer(b),
+                        Some(NameValue::Package(p)) => {
+                            Value::Package(p.into_iter().map(name_value_to_value).collect())
+                        }
                         Some(NameValue::Unparsed { offset, length }) if length > 0 => {
                             let mut body = alloc::vec![0u8; length];
                             let n = crate::copy_aml_bytes(offset, &mut body);
@@ -1664,9 +1700,8 @@ fn read_super_name_value(
             let name = read_name_string(buf, cur, "\\")?;
             let val = match crate::find_node(&name) {
                 Some(node) => match node.value {
-                    Some(NameValue::Integer(v)) => Value::Integer(v),
-                    Some(NameValue::String(s)) => Value::String(s),
-                    _ => Value::Integer(0),
+                    Some(nv) => name_value_to_value(nv),
+                    None => Value::Integer(0),
                 },
                 None => Value::Integer(0),
             };
@@ -1747,21 +1782,59 @@ fn write_target(
     Ok(())
 }
 
-/// Update a `Name` node's value in the global namespace.
-fn update_node_value(path: &str, value: Value) {
-    let nv = match value {
+/// Convert a live evaluator [`Value`] into the namespace's stored
+/// [`NameValue`] form (used for runtime `Store`s into a name).
+///
+/// ACPI 6.5 §19.6.116: `Store` copies the source object into the
+/// destination, and a later read of the name yields the stored
+/// object itself. Live values therefore belong in the mutable
+/// `NameValue::Buffer` / `NameValue::Package` variants, which own
+/// their bytes. `NameValue::Unparsed` is only meaningful for
+/// literal terms parsed out of a static AML table — its
+/// `(offset, length)` points into the AML store — so mapping a
+/// runtime value onto `Unparsed { offset: 0, .. }` silently
+/// destroyed the data: the stored bytes were dropped and later
+/// reads either decoded the table header at offset 0 or, via
+/// `find_node`, saw no `Buffer` at all. That was the defect behind
+/// the Dell/HP WMI fixture conversations (a firmware method's
+/// `Store(Arg2, LAST)` recorder read back nothing even though the
+/// caller had sent the exact pinned buffer).
+fn value_to_name_value(value: Value) -> NameValue {
+    match value {
         Value::Integer(v) => NameValue::Integer(v),
         Value::String(s) => NameValue::String(s),
-        Value::Buffer(b) => NameValue::Unparsed {
-            offset: 0,
-            length: b.len(),
-        },
-        Value::Package(p) => NameValue::Unparsed {
-            offset: 0,
-            length: p.len(),
-        },
-    };
-    crate::update_name_value(path, nv);
+        Value::Buffer(b) => NameValue::Buffer(b),
+        Value::Package(p) => NameValue::Package(p.into_iter().map(value_to_name_value).collect()),
+    }
+}
+
+/// Convert a stored [`NameValue`] back into a live evaluator
+/// [`Value`] (the inverse of [`value_to_name_value`]). `Unparsed`
+/// bodies — reachable for statically parsed names and package
+/// elements — decode from the AML store, mirroring the top-level
+/// name read in `eval_term_arg`.
+fn name_value_to_value(nv: NameValue) -> Value {
+    match nv {
+        NameValue::Integer(v) => Value::Integer(v),
+        NameValue::String(s) => Value::String(s),
+        NameValue::Buffer(b) => Value::Buffer(b),
+        NameValue::Package(p) => Value::Package(p.into_iter().map(name_value_to_value).collect()),
+        NameValue::Unparsed { offset, length } if length > 0 => {
+            let mut body = alloc::vec![0u8; length];
+            let n = crate::copy_aml_bytes(offset, &mut body);
+            if n < length {
+                Value::Integer(0)
+            } else {
+                decode_value(&body).unwrap_or(Value::Integer(0))
+            }
+        }
+        NameValue::Unparsed { .. } => Value::Integer(0),
+    }
+}
+
+/// Update a `Name` node's value in the global namespace.
+fn update_node_value(path: &str, value: Value) {
+    crate::update_name_value(path, value_to_name_value(value));
 }
 
 // ── Low-level helpers ─────────────────────────────────────────────────────────

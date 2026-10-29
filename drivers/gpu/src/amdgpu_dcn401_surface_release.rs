@@ -91,6 +91,7 @@ impl Surfaces {
         engine: &mut Engine<I>,
         pipe: u8,
     ) -> Result<u64, Error> {
+        crate::amdgpu_dcn401_otg::surfaces_changed();
         // Every pipe that fetched these surfaces: ODM segments and MPC
         // slices too.
         let odm = self

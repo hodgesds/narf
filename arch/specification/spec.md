@@ -111,10 +111,42 @@ pub struct aarch64::UserFpState { /* 528 bytes, 16-byte aligned */ }
 pub unsafe fn aarch64::save_user_fp_state(state: *mut u8);
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn aarch64::restore_user_fp_state(state: *const u8);
+/// GIC CPU-interface intrinsics used by `interrupts::aarch64`. GICv3:
+/// `ICC_*_EL1` system registers (valid only when
+/// `Features::gicv3_sysreg`). GICv2: memory-mapped `GICC`, through the
+/// fenced MMIO accessors. All of them are bracketed by
+/// `compiler_fence(SeqCst)` (§4).
+#[cfg(target_arch = "aarch64")]
+pub struct aarch64::Features { pub gicv3_sysreg: bool, /* ... */ }
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn aarch64::sysreg::{read_icc_iar1_el1, write_icc_eoir1_el1,
+    write_icc_sre_el1, write_icc_pmr_el1, write_icc_igrpen1_el1,
+    write_icc_sgi1r_el1};
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn aarch64::mmio::{read_u32, write_u32, read_u8, write_u8};
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn aarch64::sysreg::read_ttbr0_el1() -> u64;
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn aarch64::sysreg::write_ttbr0_el1(value: u64);
+
+/// Full-register SMCCC conduit (DEN0028E §2.6) for SiP firmware services
+/// that use more than `x0..x3` (Qualcomm SCM: `x1` arginfo, `x2..x5`
+/// values, `x6` session word returned on a retried call). `regs` carries
+/// `x0..x7` in and out; `x8..x17` are clobbered; the asm is not `nomem`
+/// and is bracketed by `compiler_fence(SeqCst)` (§4). `psci::smc`/`hvc`
+/// remain the 4-register PSCI helpers.
+#[cfg(target_arch = "aarch64")]
+pub mod aarch64::smccc {
+    pub const FAST_CALL: u32;   // x0 bit 31
+    pub const SMC64: u32;       // x0 bit 30
+    pub const OWNER_SHIFT: u32; // 24
+    pub const OWNER_CPU: u32;
+    pub const OWNER_SIP: u32;
+    pub const OWNER_STANDARD: u32;
+    pub const fn call_val(fast: bool, smc64: bool, owner: u32, function: u32) -> u32;
+    pub unsafe fn smc_call(regs: &mut [u64; 8]);
+    pub unsafe fn hvc_call(regs: &mut [u64; 8]);
+}
 
 /// FSGSBASE is enabled independently on every supporting CPU before EL0 runs.
 /// The accessors use RDFSBASE/WRFSBASE only when the current CPU's CR4 cache
@@ -512,7 +544,15 @@ pub mod xsave {
 - Boot mode: EL1, MMU off, little-endian.
 - Feature detection via `ID_AA64*_EL1` registers: MTE (`ID_AA64PFR1_EL1.MTE`),
   PAC (`ID_AA64ISAR1_EL1.APA/API`).
-- IntCtrl: GICv3 (with ITS where present).
+- IntCtrl: GICv3 (with ITS where present) or GICv2. `Features::gicv3_sysreg`
+  (`ID_AA64PFR0_EL1.GIC != 0`) says only whether the `ICC_*_EL1` system
+  registers exist; the controller version is discovered from the devicetree
+  by `interrupts::aarch64::gic::probe`. The `sysreg::*_icc_*` accessors are
+  UNDEFINED without that interface and must only run on the GICv3 backend;
+  the GICv2 CPU interface (`GICC_IAR` / `GICC_EOIR`) is reached through
+  `aarch64::mmio::{read_u32, write_u32, write_u8}`, which carry
+  `compiler_fence(SeqCst)` before and after the access (§4), exactly like
+  the `ICC_*` accessors.
 - Timer: generic timer (`CNTPCT_EL0`, `CNTP_CVAL_EL0`).
 - `DomainPrimitive::BACKEND = Mte`. `save` / `restore` snapshot
   `SCTLR_EL1.TCF` and `TCR_EL1` MTE bits. `assign` writes tag storage

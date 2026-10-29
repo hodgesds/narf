@@ -134,6 +134,176 @@ pub(super) fn edca(ac: u8, short: bool) -> [u8; 12] {
     );
     bytes
 }
+/// `rtw89_phy_ra_sta_update` + `rtw89_fw_h2c_ra` (AX, no CSI) for a
+/// legacy 2.4GHz station: `rates` is the response-bound supported-rate
+/// bitmap in hardware order (CCK1,2,5.5,11, OFDM6..54). No calibrated RSSI
+/// exists, so the RSSI floor keeps every rate and `init_rate_lv` is 0, as
+/// Linux does for an RSSI of 0/1.
+/// `rtw89_fw_h2c_ba_cam` (BA CAM v0, RTL8852B): W0 VALID, INIT_REQ (hardware
+/// takes the SSN), ENTRY_IDX[3:2], TID[7:4], MACID[15:8], BMAP_SIZE[19:16]
+/// (0 for <=64), SSN[31:20]; W1 unused. An invalidation carries only MACID
+/// and ENTRY_IDX.
+pub(super) fn ba_cam(valid: bool, entry: u8, tid: u8, buf: u16, ssn: u16) -> [u8; 8] {
+    let mut bytes = [0; 8];
+    let mut w0 = u32::from(entry & 3) << 2; // MACID0
+    if valid {
+        w0 |= 1
+            | 1 << 1
+            | u32::from(tid & 0xf) << 4
+            | if buf > 64 { 4 << 16 } else { 0 }
+            | u32::from(ssn & 0xfff) << 20;
+    }
+    word(&mut bytes, 0, w0);
+    bytes
+}
+/// Negotiated HT facts consumed by `rtw89_phy_ra_sta_update`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::rtw89) struct HtRa {
+    /// Peer RX MCS bitmap bytes 0..3 (`ht_cap.mcs.rx_mask`).
+    pub(in crate::rtw89) peer_rx_mcs: [u8; 4],
+    /// Peer RX SGI20 intersected with local TX SGI20.
+    pub(in crate::rtw89) sgi20: bool,
+    /// Peer RX LDPC intersected with local TX LDPC.
+    pub(in crate::rtw89) ldpc: bool,
+}
+/// Negotiated HE facts consumed by `rtw89_phy_ra_sta_update`'s HE branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::rtw89) struct HeRa {
+    /// Peer RX HE-MCS map at the operating width, intersected with the
+    /// local TX map (mac80211 `ieee80211_he_mcs_intersection`).
+    pub(in crate::rtw89) peer_rx_mcs: u16,
+    /// Peer HE PHY LDPC in payload (`IEEE80211_HE_PHY_CAP1_LDPC_...`).
+    pub(in crate::rtw89) ldpc: bool,
+    /// Peer DCM RX constellation nonzero (`DCM_MAX_CONST_RX_16_QAM` mask).
+    pub(in crate::rtw89) dcm: bool,
+}
+pub(super) fn ra(rates: u16) -> Option<[u8; 16]> {
+    ra_ht(rates, None)
+}
+/// `get_mcs_ra_mask(mcs_map, 11, 2)` (phy.c `get_he_ra_mask`): per NSS,
+/// MCS0..11/0..9/0..7 at bit 12 + 12 * nss.
+pub(super) fn he_mcs_mask(map: u16) -> u64 {
+    (0..4).fold(0u64, |mask, i| {
+        let top = match (map >> (2 * i)) & 3 {
+            2 => 11,
+            1 => 9,
+            0 => 7,
+            _ => return mask,
+        };
+        mask | ((1u64 << (top + 1)) - 1) << (12 + 12 * i)
+    })
+}
+/// HE branch of `rtw89_phy_ra_sta_update`: `mode = HE|CCK|OFDM` (no HT
+/// bit), HE mask from the intersected peer RX map, masked to this profile's
+/// one TX stream (`rtw89_ra_mask_he_rates[0]`) plus SUBOFDM/SUBCCK, SGI from
+/// the HT SGI20 negotiation (Linux reads `ht_cap` for 20MHz), LDPC and DCM
+/// from the peer HE PHY capabilities. `fix_giltf_en` stays clear, so firmware
+/// selects GI/LTF. ER is zero: Linux sets `er_cap` only after
+/// `rtw89_phy_ra_assoc`.
+pub(super) fn ra_he(rates: u16, ht: HtRa, he: HeRa) -> Option<[u8; 16]> {
+    const CCK: u64 = 0xf;
+    const OFDM: u64 = 0xff0;
+    const SUBCCK: u64 = 0x5;
+    let legacy = u64::from(rates) & (CCK | OFDM);
+    if legacy == 0 {
+        return None;
+    }
+    let mut mode = 0x10u32; // RTW89_RA_MODE_HE
+    if legacy & CCK != 0 {
+        mode |= 1;
+    }
+    if legacy & OFDM != 0 {
+        mode |= 2;
+    }
+    let backup = legacy | he_mcs_mask(he.peer_rx_mcs);
+    let mut allowed = 0xfff000; // RA_MASK_HE_1SS_RATES
+    if mode & 2 != 0 {
+        allowed |= 0x10; // RA_MASK_SUBOFDM_RATES
+    }
+    if mode & 1 != 0 {
+        allowed |= SUBCCK;
+    }
+    let mut mask = backup & allowed;
+    if mask & !(CCK | OFDM) == 0 {
+        mask |= backup & !(CCK | OFDM);
+    }
+    if mask == 0 {
+        mask |= backup & (CCK | OFDM);
+    }
+    let mut bytes = [0; 16];
+    word(
+        &mut bytes,
+        0,
+        mode << 1
+            | u32::from(he.dcm) << 16
+            | 1 << 20
+            | u32::from(ht.sgi20) << 21
+            | u32::from(he.ldpc) << 22,
+    );
+    word(&mut bytes, 1, mask as u32);
+    word(&mut bytes, 2, (mask >> 32) as u32 & 0x7fff_ffff);
+    Some(bytes)
+}
+/// HT branch: `mode |= HT`, MCS mask from the peer RX bitmap, then masked
+/// to this profile's one TX stream (`rtw89_ra_mask_ht_rates[0]`) plus
+/// `RA_MASK_SUBOFDM_RATES`/`RA_MASK_SUBCCK_RATES`.
+pub(super) fn ra_ht(rates: u16, ht: Option<HtRa>) -> Option<[u8; 16]> {
+    const CCK: u64 = 0xf;
+    const OFDM: u64 = 0xff0;
+    const SUBCCK: u64 = 0x5;
+    let supported = u64::from(rates) & (CCK | OFDM);
+    if supported == 0 {
+        return None;
+    }
+    let mut mode = 0u32;
+    if supported & CCK != 0 {
+        mode |= 1; // RTW89_RA_MODE_CCK
+    }
+    if supported & OFDM != 0 {
+        mode |= 2; // RTW89_RA_MODE_OFDM
+    }
+    let mut supported = supported;
+    if let Some(ht) = ht {
+        mode |= 4; // RTW89_RA_MODE_HT
+        let m = ht.peer_rx_mcs;
+        supported |= u64::from(m[3]) << 48
+            | u64::from(m[2]) << 36
+            | u64::from(m[1]) << 24
+            | u64::from(m[0]) << 12;
+    }
+    let backup = supported;
+    let mut mask = supported;
+    if mode >= 4 {
+        let mut allowed = 0xff000; // RA_MASK_HT_1SS_RATES
+        if mode & 2 != 0 {
+            allowed |= 0x10; // RA_MASK_SUBOFDM_RATES
+        }
+        if mode & 1 != 0 {
+            allowed |= SUBCCK;
+        }
+        mask &= allowed;
+    } else if mode & 2 != 0 {
+        mask &= OFDM | SUBCCK;
+    }
+    // rtw89_phy_ra_mask_recover
+    if mask & !(CCK | OFDM) == 0 {
+        mask |= backup & !(CCK | OFDM);
+    }
+    if mask == 0 {
+        mask |= backup & (CCK | OFDM);
+    }
+    let mut bytes = [0; 16];
+    // MODE[5:1], BW_CAP 20MHz, MACID0, INIT_RATE_LV0, UPD_ALL, SS_NUM0.
+    let (sgi, ldpc) = ht.map_or((false, false), |ht| (ht.sgi20, ht.ldpc));
+    word(
+        &mut bytes,
+        0,
+        mode << 1 | 1 << 20 | u32::from(sgi) << 21 | u32::from(ldpc) << 22,
+    );
+    word(&mut bytes, 1, mask as u32);
+    word(&mut bytes, 2, (mask >> 32) as u32 & 0x7fff_ffff);
+    Some(bytes)
+}
 pub(super) fn wmm_edca(p: narf_wireless::wmm::Parameters, short: bool) -> Option<[[u8; 12]; 4]> {
     if p.ac[0].admission_control
         || p.ac.iter().any(|a| {

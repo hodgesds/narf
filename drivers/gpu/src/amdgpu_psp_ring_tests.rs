@@ -22,6 +22,8 @@ struct Fake {
     tmr_size: u32,
     stall_command: Option<u32>,
     stall_type: Option<u32>,
+    /// Polls before a stalled wait times out (see `wait_poll_limit`).
+    poll_limit: u32,
     fail_hdp: bool,
     gfx_samples: Vec<GfxBootStatus>,
     gfx_reads: usize,
@@ -40,8 +42,9 @@ impl Io for Fake {
         // incomplete after sixteen polls is a designed non-completion
         // (a stalled command) whose outcome is the timeout — reached by
         // count instead of burning the wall-clock deadline under the
-        // spin executor (#879).
-        Some(16)
+        // spin executor (#879). Interruption fixtures that must keep a
+        // stalled command outstanding for longer raise `poll_limit`.
+        Some(self.poll_limit)
     }
     fn read(&mut self, reg: u32) -> u32 {
         self.regs[reg as usize]
@@ -157,6 +160,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
         tmr_size: DEFAULT_TMR_SIZE as u32,
         stall_command: None,
         stall_type: None,
+        poll_limit: 16,
         fail_hdp: false,
         gfx_samples: vec![GfxBootStatus {
             cp_stat: 0,

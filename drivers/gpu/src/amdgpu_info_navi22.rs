@@ -575,10 +575,14 @@ fn usable_vram(snap: &Snapshot) -> u64 {
 }
 fn memory(snap: &Snapshot) -> Vec<u8> {
     let usable = usable_vram(snap);
+    let gtt = crate::amdgpu_gem::gtt_limit();
     as_bytes(&uapi::DrmAmdgpuMemoryInfo {
         vram: heap(snap.vram_size, usable),
         cpu_accessible_vram: heap(snap.visible_vram_size, snap.visible_vram_size.min(usable)),
-        gtt: heap(0, 0),
+        gtt: uapi::DrmAmdgpuHeapInfo {
+            heap_usage: crate::amdgpu_gem::gtt_used(),
+            ..heap(gtt, gtt)
+        },
     })
 }
 fn vram_gtt(snap: &Snapshot) -> Vec<u8> {
@@ -586,7 +590,7 @@ fn vram_gtt(snap: &Snapshot) -> Vec<u8> {
     as_bytes(&uapi::DrmAmdgpuInfoVramGtt {
         vram_size: usable,
         vram_cpu_accessible_size: snap.visible_vram_size.min(usable),
-        gtt_size: 0,
+        gtt_size: crate::amdgpu_gem::gtt_limit(),
     })
 }
 

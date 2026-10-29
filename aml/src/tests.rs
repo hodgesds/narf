@@ -177,6 +177,105 @@ fn smoke_aml_eval_add() -> TestResult {
 }
 kernel_test_in!("aml", smoke_aml_eval_add);
 
+fn smoke_aml_eval_store_buffer_name_round_trip() -> TestResult {
+    // ACPI 6.5 §19.6.116: Store copies the source object into the
+    // destination name, and a later read yields the stored object.
+    // Regression pin: the evaluator used to convert a stored Buffer
+    // into NameValue::Unparsed { offset: 0, .. } — a pointer into
+    // the static AML store that a runtime value has no bytes in —
+    // silently destroying the data. Firmware-shaped consumers hit
+    // this first: a WMI method's `Store(Arg2, LAST)` recorder (the
+    // Dell/HP fixture conversations in drivers/platform) read back
+    // nothing even though the caller sent the exact buffer.
+    //
+    // Name(\SBF, Buffer(4) {0,0,0,0})
+    let mut name_blob: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    name_blob.push(0x08); // NameOp
+    name_blob.extend_from_slice(b"SBF_");
+    name_blob.push(0x11); // BufferOp
+    name_blob.push(1 + 2 + 4); // PkgLength (itself + size term + data)
+    name_blob.push(0x0A); // BytePrefix
+    name_blob.push(4); // buffer size
+    name_blob.extend_from_slice(&[0, 0, 0, 0]);
+    if crate::__parse_body_for_test(&name_blob, "\\").is_err() {
+        return TestResult::Fail("buffer name parse failed");
+    }
+    // Name(\SPK, Package(0) {})
+    let mut pkg_name_blob: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    pkg_name_blob.push(0x08); // NameOp
+    pkg_name_blob.extend_from_slice(b"SPK_");
+    pkg_name_blob.push(0x12); // PackageOp
+    pkg_name_blob.push(2); // PkgLength (itself + NumElements)
+    pkg_name_blob.push(0); // NumElements
+    if crate::__parse_body_for_test(&pkg_name_blob, "\\").is_err() {
+        return TestResult::Fail("package name parse failed");
+    }
+
+    // Method(\STB, 1) { Store(Arg0, \SBF); Return(\SBF) }
+    let mut stb_body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    stb_body.push(0x70); // StoreOp
+    stb_body.push(0x68); // Arg0
+    stb_body.push(b'\\');
+    stb_body.extend_from_slice(b"SBF_");
+    stb_body.push(0xA4); // ReturnOp
+    stb_body.push(b'\\');
+    stb_body.extend_from_slice(b"SBF_");
+    let blob = build_eval_method_blob(b"STB_", 1, &stb_body);
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("store method parse failed");
+    }
+    // Method(\STP, 1) { Store(Arg0, \SPK); Return(\SPK) }
+    let mut stp_body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    stp_body.push(0x70); // StoreOp
+    stp_body.push(0x68); // Arg0
+    stp_body.push(b'\\');
+    stp_body.extend_from_slice(b"SPK_");
+    stp_body.push(0xA4); // ReturnOp
+    stp_body.push(b'\\');
+    stp_body.extend_from_slice(b"SPK_");
+    let blob = build_eval_method_blob(b"STP_", 1, &stp_body);
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("package store method parse failed");
+    }
+
+    // Buffer round-trip through the evaluator's own read path.
+    let payload = alloc::vec![0xDE, 0xAD, 0xBE, 0xEF];
+    match crate::eval::evaluate_method("\\STB", &[crate::Value::Buffer(payload.clone())]) {
+        Ok(crate::Value::Buffer(b)) if b == payload => {}
+        Ok(_) => return TestResult::Fail("stored buffer did not read back as itself"),
+        Err(_) => return TestResult::Fail("store method evaluation failed"),
+    }
+    // And through the namespace, the channel value-level consumers
+    // (e.g. the platform WMI fixtures) observe.
+    match crate::find_node("\\SBF") {
+        Some(n) => match n.value {
+            Some(crate::NameValue::Buffer(b)) if b == payload => {}
+            _ => return TestResult::Fail("stored buffer not a live Buffer in the namespace"),
+        },
+        None => return TestResult::Fail("\\SBF missing after store"),
+    }
+
+    // Package round-trip (Integer + nested Buffer elements).
+    let pkg = crate::Value::Package(alloc::vec![
+        crate::Value::Integer(9),
+        crate::Value::Buffer(alloc::vec![1, 2]),
+    ]);
+    match crate::eval::evaluate_method("\\STP", &[pkg]) {
+        Ok(crate::Value::Package(p)) => {
+            if p.len() != 2
+                || p[0] != crate::Value::Integer(9)
+                || p[1] != crate::Value::Buffer(alloc::vec![1, 2])
+            {
+                return TestResult::Fail("stored package elements changed in transit");
+            }
+        }
+        Ok(_) => return TestResult::Fail("stored package did not read back as a package"),
+        Err(_) => return TestResult::Fail("package store evaluation failed"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_eval_store_buffer_name_round_trip);
+
 fn smoke_aml_eval_if_lequal() -> TestResult {
     // Method(\EV2_, 0) { Store(0x10, Local0); If(LEqual(Local0, 0x10)) { Return(One) } Return(Zero) } → 1
     let if_body: &[u8] = &[0xA4, 0x01]; // ReturnOp OneOp
@@ -2432,3 +2531,77 @@ fn smoke_aml_wmi_invoke_method_via_aml() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("aml/wmi", smoke_aml_wmi_invoke_method_via_aml);
+
+fn smoke_aml_evaluate_object_name_and_method_shapes() -> TestResult {
+    // `evaluate_object` must read a data object in both shapes
+    // firmware uses: a static `Name(Package(...))` (stored by the
+    // namespace builder as NameValue::Unparsed) and a zero-arg
+    // Method returning a Package. `evaluate_method` alone rejects
+    // the Name shape — that rejection is what kept Name-held
+    // Packages (fan _FIF/_FPS, _PSS, _PR0, ...) unreadable.
+    use crate::Value;
+    crate::__reset_for_test();
+
+    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    // Name(PKGA, Package { 0, 7 }):
+    //   NameOp, "PKGA", PackageOp, PkgLength(5), NumElements(2),
+    //   ZeroOp, BytePrefix 7.
+    body.push(0x08);
+    body.extend_from_slice(b"PKGA");
+    body.extend_from_slice(&[0x12, 5, 2, 0x00, 0x0A, 7]);
+    // Name(HIDN, DWord 0x0B0CD041) — the EisaId("PNP0C0B") form.
+    body.push(0x08);
+    body.extend_from_slice(b"HIDN");
+    body.push(0x0C);
+    body.extend_from_slice(&0x0B0CD041u32.to_le_bytes());
+    // Method(MTHD, 0) { Return(Package { 0, 9 }) }:
+    //   MethodOp, PkgLength(13 = name 4 + flags 1 + body 7, +1 for
+    //   the length byte itself), "MTHD", flags 0, ReturnOp, package.
+    body.push(0x14);
+    body.push(13);
+    body.extend_from_slice(b"MTHD");
+    body.push(0x00);
+    body.push(0xA4);
+    body.extend_from_slice(&[0x12, 5, 2, 0x00, 0x0A, 9]);
+
+    if crate::__parse_body_for_test(&body, "\\").is_err() {
+        return TestResult::Fail("evaluate_object fixture parse failed");
+    }
+
+    // Name shape: the static Package decodes through evaluate_object.
+    match crate::eval::evaluate_object("\\PKGA", &[]) {
+        Ok(Value::Package(p)) => {
+            if p.len() != 2 || p[0] != Value::Integer(0) || p[1] != Value::Integer(7) {
+                return TestResult::Fail("Name-held Package decoded to wrong elements");
+            }
+        }
+        _ => return TestResult::Fail("evaluate_object must return the Name-held Package"),
+    }
+    // ... while evaluate_method still rejects it (the documented gap
+    // evaluate_object exists to bridge).
+    match crate::eval::evaluate_method("\\PKGA", &[]) {
+        Err(crate::AmlError::MethodNotFound) => {}
+        _ => return TestResult::Fail("evaluate_method must reject a Name node"),
+    }
+    // Name shape, scalar: the integer reads back verbatim.
+    match crate::eval::evaluate_object("\\HIDN", &[]) {
+        Ok(Value::Integer(0x0B0CD041)) => {}
+        _ => return TestResult::Fail("evaluate_object must return the Name-held Integer"),
+    }
+    // Method shape: delegates to evaluate_method.
+    match crate::eval::evaluate_object("\\MTHD", &[]) {
+        Ok(Value::Package(p)) => {
+            if p.len() != 2 || p[0] != Value::Integer(0) || p[1] != Value::Integer(9) {
+                return TestResult::Fail("Method-returned Package decoded to wrong elements");
+            }
+        }
+        _ => return TestResult::Fail("evaluate_object must return the Method's Package"),
+    }
+    // Missing path is an error, not a silent zero.
+    match crate::eval::evaluate_object("\\NOPE", &[]) {
+        Err(crate::AmlError::MethodNotFound) => {}
+        _ => return TestResult::Fail("evaluate_object must fail for a missing path"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_evaluate_object_name_and_method_shapes);

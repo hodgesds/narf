@@ -220,6 +220,236 @@ SATA) and fail unless their SHA-256 is unchanged afterwards.
 from the monitor to the 6750 XT's HDMI is optional and matters only once
 native modeset lands. Attach a USB keyboard for the NARF shell.
 
+If Limine reports `Could not find viable load address for executable` before
+NARF starts, check the ELF's full `PT_LOAD` memory spans with `readelf -lW`.
+This board reserves physical `[0x099ff000, 0x0a000000)`. The production image
+outgrew its former 32 MiB load placement and its final segment, including
+`.bss`, overlapped that reservation. The x86_64 linker now starts the image
+at 256 MiB. Rebuild old kernels when testing this board; changing a menu's
+file path alone does not change an executable's load addresses.
+
+For a KDE boot, a successful PCI probe and the presence of `/dev/dri/card0`
+do not establish acceleration readiness. Check the later
+`amdgpu: navi22 preflight refused:` line before diagnosing KWin or Qt plugin
+errors. This MSI RX 6750 XT's VBIOS `113-MSITV398MH.310` supplies a version-6
+PowerPlay payload; the generic Navy Flounder firmware SKU supplies version 1.
+Both use the same 2470-byte table and 1668-byte SMC layout. NARF accepts both
+versions while retaining board-source selection and power/thermal checks.
+Native graphics initialization and the graphical login still require a
+successful hardware boot; a VM smoke does not exercise those paths.
+
+On this board, discovery reports two distinct engines as `SDMA0:0` and
+`SDMA1:0`. Queue preparation normalizes the hardware ID and its local instance
+before checking for duplicate engines. The connector GPIO LUT also identifies
+DDC pairs through DATA bit 8; that selects the same AUX/I2C channel as CLOCK
+bit 0. Rejecting either valid encoding previously stopped queue preparation
+with `Queues(Unsupported)` and display routing with `Inventory(Unsupported)`.
+
+The subsequent hardware boot completed nine of the 31 cold-boot checkpoints,
+then stopped at `Graphics`: PSP returned DMCUB type 51 entry `0x82fee00100`,
+outside the newly allocated TMR `[0x8002300000, 0x8002d00000)`. Linux preserves
+PSP's separate secure CW0/CW1 windows. NARF now carries their pre-allocation
+inventory through boot and recovery: DMCUB may use the exact reserved CW0,
+and startup validates each complete secure window against its corresponding
+reservation or TMR without changing those registers. VCN still requires TMR.
+This correction requires another native hardware test before claiming progress
+beyond `Graphics` or a working graphical login.
+
+After synchronizing the kernel selected by the host's Limine entry, the
+2026-10-22 boot passed `Graphics`, `RlcBoot`, GFX/SDMA queues and IB tests:
+26 of 28 reported checkpoints completed. `DmubStart` degraded with `Invalid`,
+then `Media(DeviceGone)` stopped startup and quarantined the framebuffer.
+The DMCUB and VCN payloads in that boot's firmware initramfs match the host
+Linux Navy Flounder files byte for byte. The next corrections retain the
+PSP-reported executable extent, reserve complete freshly programmed secure
+windows, and power VCN tiles before reading their gated status register.
+Their register-model tests do not establish a working hardware display.
+
+In the same boot, root mounting took 4314 ms and GPU startup took 52899 ms.
+At uptime 54 s the capture still showed journal flush, Plymouth's writable-root
+notification and userdb credential loading running, with `sysinit.target`,
+`basic.target` and PlasmaLogin waiting. That snapshot does not establish
+Btrfs as the cause of the later userspace wait; no graphical-login success
+has been recorded.
+
+The next capture (`plasma-8aeb8863-b279-479e-b112-feca3ff5cc50`) confirms
+that the new diagnostic kernel ran but still stopped at 26/28 checkpoints.
+DMCUB CW0 read as entirely zero. VCN's first all-ones read was at BAR5 byte
+offset `0x1fd58`: discovery base `0x7e00` plus `UVD_VCPU_CNTL` dword `0x156`,
+not UVD_STATUS. Linux uses a masked read/modify/write for this control word
+without rejecting that value. NARF now preserves the unselected bits and
+checks independent GC/NBIO presence before accepting an all-ones VCPU control
+read; status and wait registers still reject all ones. Regression cases cover
+both control updates on a live GPU and disappearance before the write.
+This correction still requires hardware validation. The DMCUB zero-window
+failure remains unresolved; its diagnostic now includes the PSP image extent
+and inherited secure reservations, without changing secure window registers.
+
+That capture also shows journal flush completing around uptime 62.7 s,
+system tmpfiles completing around 69.5 s, and the journal catalog completing
+around 75 s. The linker-cache rebuild was still running at the end of the
+readable kernel capture; it contains no PlasmaLogin start. The earlier
+journal/userdb/Plymouth snapshot therefore does not establish a permanent
+sysinit deadlock.
+
+The working-Linux comparison after that boot found DMCUB enabled, out of reset,
+and ready (`DMCUB_SCRATCH0 = 3`) while all eight CW0/CW1 registers also read
+zero. `UVD_VCPU_CNTL` and the gated GC `GB_ADDR_CONFIG` both read all ones.
+NARF therefore cannot use either observation alone as evidence of failure.
+The corrected DMUB path accepts wholly zero secure readback only with this
+PSP session's authenticated full image, matching upload size and retained
+memory ownership, then still requires a fresh ready publication and mailbox
+proof. Readable and partially readable windows retain their bounds checks.
+VCN presence uses NBIO's memory-size and aperture registers instead of GC.
+The captured root was `btrfs / ... rw`, and diagnostic files were persisted;
+the service snapshot still had PlasmaLogin waiting. These corrections have
+not yet established a working hardware graphical login.
+
+The next capture (`plasma-cbd60c86-9b79-479e-a512-fe4a80eb0ea2`)
+completed `DmubStart`, including firmware version and feature-capability
+mailbox replies. Startup reached 30/31 checkpoints, exposed the framebuffer,
+and read a 256-byte HDMI EDID with a preferred 3840x2160 mode. VCN degraded
+with `BootFailed(0)` but no longer quarantined display startup. Native HDMI
+then failed at `Clocks` with `Block(Rejected(255))`; a working native mode
+and graphical login are still unverified.
+
+The DAL clock preparation now follows Linux's `dcn3_update_clocks`: it omits
+the separate SOC/FCLK floors and unused DF C-state command, retains strict
+DCF/UCLK/PIX/DISP floor validation, and tolerates firmware rejection of the
+optional display-count and deep-sleep hints. Transport failures still abort.
+Each rejected command logs its message, argument and response so another
+clock failure identifies the exact request rather than only `Rejected(255)`.
+The captured error predates that diagnostic and does not identify which
+of the old requests was refused. Register-model tests cover the corrected
+request sequence and refused optional notifications; they do not establish
+native hardware modesetting success.
+
+The subsequent clock-request audit covers the Navi22 DAL and GFX PPSMC
+mailboxes plus the native display's PLL, DPP/DP and audio DTO paths against
+Linux `ecd997b0189a`. It does not cover other GPU families. The checks include
+message/register IDs, clock IDs, units and packing, request ordering, board
+bounds, response handling and cancellation ownership:
+
+| Request or path | Linux comparison and result |
+| --- | --- |
+| DAL startup `0x2/0x3/0x4/0xb` | `dcn3_init_clocks`: versions and scalar MHz levels; header/interface and level-query refusals are tolerated; usable ranges remain required for admission. NARF does not query unused DTBCLK. |
+| DAL display floors `0x9`, hints `0xd/0xe` | `dcn3_update_clocks`: DCF/UCLK/PIX/DISP, ceil(kHz/1000), clock ID shifted by 16. Required floors remain strict; notifications tolerate refusal. Joint setup now reports all admitted streams instead of always one. |
+| DP PHYCLK floor | `dcn30_notify_link_rate_change`: link code × 27000 kHz, no lower than the board minimum, covering all links. NARF conservatively retains the highest successful link request until GPU restart. Requests above the board maximum now fail before writing. |
+| Runtime clock operations | PHY and optional memory floors, watermark messages and audio PME now retain in-flight ownership across cancellation, including when firmware replies after the future is dropped. |
+| GFX PPSMC range/control | `smu_v11_0`: GFXCLK ID 0, UCLK ID 2; min/max queries in MHz; SoftMax then SoftMin, `0xffff/0` for automatic mode. Separate GFX and DAL mailbox registers/message spaces match Linux. |
+| Display DPM and power saving | `sienna_cichlid` feature IDs and board masks match; required protections stay enabled. Current display admission refuses FCLK switching, deep sleep and hub power gating. Their optional paths are not evidence of hardware readiness. |
+| HDMI PHY PLL | `dcn3_program_pix_clk` → `dce112_program_pix_clk` → `set_pixel_clock_v7`: target in 100 Hz, combo PLL/CRTC/encoder IDs, XTALIN 0 and deep-colour ratio 0 match. DCN's resource builder leaves `SUPPORT_YCBCR420` unset; the generic helper's YUV420 flag is therefore not added. |
+| DENTIST and DPP DTO | `dcn20_update_clocks_update_dentist` / `dccg2_update_dpp_dto`: divider IDs, completion bits, bounded waits, phase = ceil(255 × requested/reference), modulo 255. NARF retires consumers before changing dividers. |
+| DP pixel DTO | `dcn3_program_pix_clk`: 730 MHz DPREFCLK, optimized-rate entries, otherwise pixel Hz/reference Hz; no VBIOS PLL request for DP. |
+| HDMI/DP audio DTO | `dce110_populate_audio_dto_parameters` / `dce_aud_wall_dto_setup`: HDMI's lowest active OTG drives DTO0; DP uses DPREFCLK/DTO1. HDMI audio now uses the 4:2:0-halved requested clock without deep-colour PLL scaling. |
+| PMFW watermarks and audio wake | DAL `0x5/0x6/0x8` carries the retained watermark address/table 1; `0x11` is optional audio PME. Watermark failure refuses dependent power-saving admission; it does not prove a display-clock failure. |
+
+The Rust kernel regressions cover every required display-floor rejection,
+frequencies outside board bounds before writes, stream counts, interrupted
+runtime operations and HDMI audio clock selection. Linux source annotations
+retain the comparison's provenance; they are not an executable validation
+language. Hardware acceptance of these requests, native modesetting and the
+KDE login remain unverified by this source audit.
+
+The discrete GPU handoff also establishes the x86_64 TSC duration scale before
+firmware startup. Its Late initcall precedes the normal HPET/timer-IRQ setup;
+using the identity scale there shortens hardware waits and inflates reported
+milliseconds on a >1 GHz TSC. A missing calibration source now refuses the
+handoff with `Clock` before GPU writes. For older captures, retain the raw
+`cyc` total and the later calibrated Hz when interpreting elapsed time: the
+79,755,617,363-cycle RX 6750 XT capture at 4.7 GHz represents about 17 seconds,
+although its pre-calibration warning says 79,755 ms. That capture continued
+into systemd but does not establish a working physical display or KDE login.
+
+The modeset-to-power-saving audit checks the RX 6750 XT's live Linux discovery
+bases against the HDP, MMHUB, ATHUB, OSSSYS, SMUIO and GC addressing, and the
+register fields against Linux's headers. Its sequence follows Linux's IP order
+(common, GMC, IH, GFX, SDMA), with RLC safe mode around GC gating. The native
+modeset's one-frame settling delay and two-frame underflow watch also require
+the calibrated scale; the old waits ended within a fraction of one frame on
+this host. An immediate SCDC read is diagnostic, not proof of a physical image.
+
+A gating failure can leave earlier IP writes applied; the owner then refuses
+further gating transitions. It returns before the subsequent GFXOFF/deep-sleep
+feature enables and memory/fabric floor reductions. The new all-ones diagnostic
+includes the BAR5 address and preceding register-write count, distinguishing
+failure before any gating writes from a partial transition. The older
+`Gating(DeviceGone)` capture lacks that information, so its exact failure and
+the physical black screen remain unresolved by this source audit.
+
+The October 23 `plasma-25ea18c1-b779-479e-b312-fe4af7f58481` capture confirms
+early 4.7 GHz calibration and a reported native HDMI mode. It gets past the
+journal/Plymouth read-write jobs and attempts `kwin_wayland` at 172 seconds.
+The gating failure is `RLC_CGTT_MGCG_OVERRIDE`, BAR5 byte offset `0x3b120`,
+after ten writes; that register address matches the Linux GC 10.3 header.
+These observations do not establish a visible image or successful greeter.
+
+For that boot, the useful additional artifact was `/var/lib/plasmalogin/core`;
+there were no greeter text logs under its home. Its executable mappings match
+`/usr/lib/plasma-login-greeter`. The 46,096-byte file ends after 822 of 853
+program headers, before its notes, so it contains no saved fault registers or
+process-identity note. The core writer now places notes immediately after the
+ELF header, batches metadata into one sequential write, and emits a
+`coredump: fatal ...` kernel record before file I/O. This improves the next
+capture; it does not fix or identify the underlying greeter fault. Preserve
+the core's timestamp and collect the new record before planning another fix.
+
+The next capture, `plasma-3d4989b5-b779-479e-b312-fe4a7b24ccbb`, fails earlier:
+the journal records eight `SIGBUS` page faults in `timeout` and
+`systemd-executor`. Their instruction bytes match the installed dynamic
+loader at offset `0x1d778`, reading the first bytes of `/etc/ld.so.cache`.
+The mapping is readable/private, starts at `0x409000002000`, and covers
+`0x2e000` bytes; the loader's file-size operand is 187,287 bytes. `/core`
+now retains its notes and identifies another `systemd-executor` instance
+at that same loader offset. D-Bus startup times out; no Plasma start was
+saved for this boot. This is a file-backed demand-page refusal, not an
+unsupported instruction. The capture does not retain the backing filesystem
+error or inode, so its precise cause must not be inferred from SIGBUS alone.
+
+Two local checks expose relevant replacement defects. First, the VFS dentry
+table has 2,048 buckets but the old mutation guard records only 64 bits:
+high-bucket shifts panic in checked builds and miss the correct active-writer
+counter/generation in release builds. A lookup started before replacement
+can therefore publish a stale inode afterwards. Mutation tracking must span
+the full table. Second, the Btrfs retained-handle experiment reads a fresh
+replacement successfully but gets `NotFound` reading the replaced file
+through an existing handle, both before and after `syncfs`. At audit time,
+last-link replacement reclaimed the old inode immediately. Linux retains an
+unlinked inode and its data until its final open/mapping reference is gone.
+Correcting the dentry mask does not implement that missing Btrfs lifetime.
+The subsequent upstream Btrfs cache-generation change invalidates retained
+generic shared-cache pages; it does not preserve an unlinked inode. The
+failing loader mapping is private and enters the private demand-read branch,
+so that upstream change alone does not establish a fix for this refusal.
+
+The production Limine VM smoke validates built-in login/shell startup. It
+does not boot this installed KDE root or race `ldconfig` against process
+startup. The recent full CachyOS fixture attempts instead stop at a PID 1
+invalid-opcode fault because its loader uses AVX-512 absent from the TCG CPU.
+Neither result establishes working cache replacement. A representative gate
+must cover open/map/close, replacement before first touch, old and new
+contents through their respective handles, concurrent lookup publication,
+and a real dynamic executable after cache rebuild on writable Btrfs.
+The root smoke's `ldconfig | head | sed` command is a diagnostic report:
+it does not assert `ldconfig`'s exit status or concurrent loader correctness.
+
+The Btrfs file-loading fix retains shared inode metadata and a lifetime anchor
+for every node, including nodes held only by mappings. A separate open sees
+size changes immediately; async stat refreshes attributes from the tree.
+Replacement and unlink persist `nlink=0` with an `ORPHAN_ITEM`, leaving old
+handles and unfaulted mapping pages attached to their original data. Explicit
+sync, later operations and the commit timer reclaim an orphan after its final
+reference; a writable mount recovers persisted orphan items after a crash.
+Drop flushes accepted changes without starting an additional cleanup transaction.
+
+The regression tests cover old/new contents, writes through an unlinked open
+file, cross-open size changes, ordinary loader-style symlinks, and crash
+recovery on the CachyOS-shaped Btrfs fixture. The syscall-level QEMU case uses
+a small writable Btrfs fixture and exercises private mmap, fd close,
+replacement, first touch, new-file mapping and final-unmap reclamation. These
+checks address the file-loading defects; physical HDMI output and a completed
+KDE session still require native verification.
+
 **Write the stick.** Identify it first. It must show `TRAN usb`:
 
 ```sh
@@ -759,7 +989,9 @@ sudo narf-uefi status --esp /boot
 ```
 
 Replace `/boot` with the mount point reported on the machine. On UEFI GRUB,
-regenerate `/boot/grub/grub.cfg` after a manual install and verify that the
+the generated entry searches for the recorded ESP filesystem UUID, so another
+disk or USB with an older `/EFI/NARF/narf.efi` cannot take precedence.
+Regenerate `/boot/grub/grub.cfg` after a manual install and verify that the
 NARF entry contains `chainloader`:
 
 ```sh
@@ -776,6 +1008,39 @@ No manual menu edit is needed for systemd-boot: it reads
 CachyOS Limine installation, the hook asks `limine-entry-tool` to register the
 same EFI application; if the tool reports a warning, reinstall it explicitly
 with `narf-uefi install` after confirming the ESP and active manager.
+
+For an existing hardware-test Limine menu that directly loads
+`boot():/boot/narf-frame`, adopt that config so the package also updates the
+kernel the menu actually selects:
+
+```sh
+sudo narf-uefi install --esp /boot/efi \
+  --limine-config /boot/efi/boot/limine/limine.conf
+sudo narf-uefi status --esp /boot/efi
+```
+
+Use the actual ESP and config path. The config must contain exactly one NARF
+Multiboot2 entry. Its command line, writable-root policy, graphical target,
+and firmware modules remain intact. The selected kernel must report
+`host Limine kernel matches package: yes` before rebooting; checking only
+`/EFI/NARF/narf-frame` does not verify the old `/boot/narf-frame` target.
+The adopted config is remembered for future package upgrades.
+
+When building a package for this installed-root Plasma test, first build the
+production systemd kernel, then package that exact artifact with
+`--skip-build`:
+
+```sh
+cargo xtask build --arch=x86_64 \
+  --features boot-init,cgroup-all,container,firmware-allow-unsigned
+cargo narf package --version 0.5.0 --skip-build \
+  --limine-efi /usr/share/limine/BOOTX64.EFI
+```
+
+`boot-init` enables `systemd_pid1`; the cgroup and namespace features support
+the distro's systemd services. Do not package the canonical artifact left
+by a kernel-test run. The normal package build serves NARF's built-in
+userspace and does not enable these installed-root features automatically.
 
 Installing a newer `narf-kernel` package upgrades the same package name,
 removes the previous package-owned NARF image, and regenerates GRUB. It does

@@ -26,7 +26,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use narf_lib::readiness::Readiness;
@@ -70,6 +70,26 @@ impl EventType {
             _ => return None,
         })
     }
+}
+
+/// `EV_LED` codes. The bitmap the input core keeps per device
+/// (`dev->led` in Linux) is indexed by these codes, and `EVIOCGLED`
+/// returns it in this order: bit `LED_NUML` first.
+/// Ref: `include/uapi/linux/input-event-codes.h` (`LED_*` block).
+pub mod led {
+    pub const LED_NUML: u16 = 0x00;
+    pub const LED_CAPSL: u16 = 0x01;
+    pub const LED_SCROLLL: u16 = 0x02;
+    pub const LED_COMPOSE: u16 = 0x03;
+    pub const LED_KANA: u16 = 0x04;
+    pub const LED_SLEEP: u16 = 0x05;
+    pub const LED_SUSPEND: u16 = 0x06;
+    pub const LED_MUTE: u16 = 0x07;
+    pub const LED_MISC: u16 = 0x08;
+    pub const LED_MAIL: u16 = 0x09;
+    pub const LED_CHARGING: u16 = 0x0a;
+    /// Highest valid `EV_LED` code (`LED_MAX`).
+    pub const LED_MAX: u16 = 0x0f;
 }
 
 /// `EV_SYN` sub-codes.
@@ -436,6 +456,8 @@ pub struct DeviceCaps {
     pub relbit: CapBitmap,
     /// Supported `EV_ABS` axis codes.
     pub absbit: CapBitmap,
+    /// Supported `EV_LED` codes (`ledbit` in Linux `struct input_dev`).
+    pub ledbit: CapBitmap,
     /// Per-axis absolute-range info (`min`/`max`/…), keyed by ABS code.
     /// Reported to userspace via `EVIOCGABS` — libinput needs a non-zero
     /// range to map an absolute pointer's position onto the output.
@@ -458,6 +480,7 @@ impl Default for DeviceCaps {
             keybit: CapBitmap::new(),
             relbit: CapBitmap::new(),
             absbit: CapBitmap::new(),
+            ledbit: CapBitmap::new(),
             abs_info: Vec::new(),
             evbit: 0,
         }
@@ -495,6 +518,14 @@ impl DeviceCaps {
         self.evbit |= 1 << (EventType::Syn as u16);
     }
 
+    /// Declare support for `EV_LED` code `c` (a device-driven
+    /// indicator, e.g. a keyboard lock LED).
+    pub fn add_led(&mut self, c: u16) {
+        self.ledbit.set(c);
+        self.evbit |= 1 << (EventType::Led as u16);
+        self.evbit |= 1 << (EventType::Syn as u16);
+    }
+
     /// Declare an `EV_ABS` axis `c` together with its range `info`. The range
     /// is what makes an absolute pointer usable: libinput maps the reported
     /// position onto the output using `min`/`max` from `EVIOCGABS`, and drops
@@ -519,6 +550,7 @@ impl DeviceCaps {
             EventType::Key => self.keybit.get(code),
             EventType::Rel => self.relbit.get(code),
             EventType::Abs => self.absbit.get(code),
+            EventType::Led => self.ledbit.get(code),
             EventType::Syn => true, // every device supports EV_SYN
             _ => false,
         }
@@ -645,6 +677,18 @@ pub struct DeviceNode {
     /// `struct sysrq_state`, so a modifier held on one keyboard never arms
     /// another.
     sysrq: SysrqState,
+    /// Current LED bitmap, indexed by `EV_LED` code (`dev->led` in
+    /// Linux `struct input_dev`). Maintained by the input core in
+    /// [`DeviceNode::dispatch`]: `EV_LED` events set/clear bits, and a
+    /// lock-key press (Caps/Num/Scroll) toggles its bit — the two ways
+    /// Linux's core + keyboard layer update the same bitmap.
+    leds: AtomicU16,
+    /// Producer output hook, invoked with the new bitmap whenever
+    /// `leds` changes (Linux: `input_dev::event()` for `EV_LED`).
+    /// A plain `fn` pointer: producers with global state (i8042)
+    /// register a static function; pump-owned producers (I2C-HID)
+    /// instead poll [`DeviceNode::led_state`] from their pump.
+    led_sink: IrqSafeSpinLock<Option<fn(u16)>>,
 }
 
 impl core::fmt::Debug for DeviceNode {
@@ -744,6 +788,69 @@ impl DeviceNode {
             drop_count: AtomicU32::new(0),
             readers: AtomicU32::new(0),
             sysrq: SysrqState::new(),
+            leds: AtomicU16::new(0),
+            led_sink: IrqSafeSpinLock::new(None),
+        }
+    }
+
+    /// Current LED bitmap (`EVIOCGLED` state), indexed by `EV_LED`
+    /// code — see [`led`].
+    pub fn led_state(&self) -> u16 {
+        self.leds.load(Ordering::Acquire)
+    }
+
+    /// Register the producer's LED output hook. Called with the new
+    /// LED bitmap each time it changes, from whatever context
+    /// dispatched the triggering event (IRQ or task) — the hook must
+    /// be cheap and non-blocking; producers that must perform a
+    /// multi-step bus exchange (i8042) drive it from their receive
+    /// path instead of waiting here.
+    pub fn set_led_sink(&self, sink: fn(u16)) {
+        *self.led_sink.lock() = Some(sink);
+    }
+
+    /// Input-core LED bookkeeping for one dispatched event. Returns
+    /// the new bitmap iff it changed.
+    ///
+    /// * `EV_LED` (code, value): set/clear the bit — this is how a
+    ///   userspace `write()` of an `EV_LED` record (or any other
+    ///   producer of LED events) drives the state, mirroring Linux
+    ///   `input_handle_event`'s `EV_LED` disposition.
+    /// * `EV_KEY` press (value 1) of a lock key: toggle the matching
+    ///   bit — Linux's keyboard layer (`drivers/tty/vt/keyboard.c`)
+    ///   turns a lock-key press into an `EV_LED` state change on the
+    ///   same device. Releases and autorepeat (value 2) never toggle.
+    fn note_led_effect(&self, type_: EventType, code: u16, value: i32) -> Option<u16> {
+        let (bit, on) = match type_ {
+            EventType::Led => {
+                if code > led::LED_MAX {
+                    return None;
+                }
+                (code, value != 0)
+            }
+            EventType::Key if value == 1 => {
+                let led_code = match code {
+                    key::KEY_CAPSLOCK => led::LED_CAPSL,
+                    key::KEY_NUMLOCK => led::LED_NUML,
+                    key::KEY_SCROLLLOCK => led::LED_SCROLLL,
+                    _ => return None,
+                };
+                let cur = self.leds.load(Ordering::Acquire);
+                (led_code, cur & (1 << led_code) == 0)
+            }
+            _ => return None,
+        };
+        let mask = 1u16 << bit;
+        let prev = if on {
+            self.leds.fetch_or(mask, Ordering::AcqRel)
+        } else {
+            self.leds.fetch_and(!mask, Ordering::AcqRel)
+        };
+        let now = if on { prev | mask } else { prev & !mask };
+        if now != prev {
+            Some(now)
+        } else {
+            None
         }
     }
 
@@ -760,21 +867,35 @@ impl DeviceNode {
             // Linux's sysrq input handler swallows the command key.
             return true;
         }
-        let mut g = self.inner.lock();
-        let before = g.ring.len();
-        g.push(ev);
-        let after = g.ring.len();
-        // Detect if we synthesised a SYN_DROPPED (ring len grew by 2 or 1
-        // with a SYN_DROPPED at front, i.e. we dropped something).
-        if after <= before {
-            self.drop_count.fetch_add(1, Ordering::Relaxed);
+        // Input-core LED state update (EV_LED events and lock-key
+        // presses) — done before the ring push so a reader woken by
+        // this event already observes the new state via EVIOCGLED.
+        let led_change = self.note_led_effect(ev.type_, ev.code, ev.value);
+        {
+            let mut g = self.inner.lock();
+            let before = g.ring.len();
+            g.push(ev);
+            let after = g.ring.len();
+            // Detect if we synthesised a SYN_DROPPED (ring len grew by 2 or 1
+            // with a SYN_DROPPED at front, i.e. we dropped something).
+            if after <= before {
+                self.drop_count.fetch_add(1, Ordering::Relaxed);
+            }
+            self.push_count.fetch_add(1, Ordering::Relaxed);
+            // Keep the ring and the readiness level under the same device lock.
+            // A poller can therefore either observe the queued event while arming,
+            // or register first and be woken by this IRQ-safe cell update.
+            self.readiness.set_event(POLL_IN, 0, POLL_IN);
+            g.wake_readers();
         }
-        self.push_count.fetch_add(1, Ordering::Relaxed);
-        // Keep the ring and the readiness level under the same device lock.
-        // A poller can therefore either observe the queued event while arming,
-        // or register first and be woken by this IRQ-safe cell update.
-        self.readiness.set_event(POLL_IN, 0, POLL_IN);
-        g.wake_readers();
+        // Fire the producer's output hook outside the ring lock —
+        // the hook may itself take producer locks (i8042's LED
+        // exchange state).
+        if let Some(bitmap) = led_change {
+            if let Some(sink) = *self.led_sink.lock() {
+                sink(bitmap);
+            }
+        }
         true
     }
 
@@ -1054,6 +1175,17 @@ impl Router {
             .iter()
             .find(|n| n.id == id && n.is_alive())
             .map(|n| n.caps.clone())
+    }
+
+    /// Current LED bitmap of a registered device, or `None` if the
+    /// id is unknown or already removed. Used by `EVIOCGLED`.
+    pub fn led_state(&self, id: DeviceId) -> Option<u16> {
+        self.inner
+            .lock()
+            .devices
+            .iter()
+            .find(|n| n.id == id && n.is_alive())
+            .map(|n| n.led_state())
     }
 }
 

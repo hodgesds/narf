@@ -743,16 +743,18 @@ fn smoke_tb_osc_request_mask_matches_acpi_usb4() -> TestResult {
     // The USB4 _OSC control request is pinned against the ACPI
     // specification's USB4 _OSC capabilities DWORD 2: bit 0 USB3
     // tunnelling, bit 1 DisplayPort tunnelling, bit 2 PCIe
-    // tunnelling, bit 3 XDomain connections. This CM requests
-    // USB3 + DisplayPort + PCIe (0b0111); XDomain belongs to a
-    // separate lane and must not be requested here, or firmware
-    // could hand over a protocol this CM does not implement.
-    use crate::firmware::{CONTROL_DP, CONTROL_PCIE, CONTROL_REQUEST, CONTROL_USB3};
+    // tunnelling, bit 3 XDomain connections. This CM requests all
+    // four (0b1111) now that the XDomain engine exists; nothing above
+    // bit 3 may be requested, or firmware could hand over a protocol
+    // this CM does not implement.
+    use crate::firmware::{
+        CONTROL_DP, CONTROL_PCIE, CONTROL_REQUEST, CONTROL_USB3, CONTROL_XDOMAIN,
+    };
     if CONTROL_USB3 != 1 << 0
         || CONTROL_DP != 1 << 1
         || CONTROL_PCIE != 1 << 2
-        || CONTROL_REQUEST != 0b0111
-        || CONTROL_REQUEST & (1 << 3) != 0
+        || CONTROL_XDOMAIN != 1 << 3
+        || CONTROL_REQUEST != 0b1111
     {
         return TestResult::Fail(
             "thunderbolt: _OSC request mask differs from the ACPI USB4 layout",

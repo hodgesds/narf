@@ -56,6 +56,7 @@ pub mod channel;
 pub mod channel_power;
 pub mod dma;
 pub mod efuse;
+mod fallback;
 mod firmware_native;
 pub mod firmware_transport;
 pub mod fw;
@@ -72,13 +73,14 @@ pub mod power;
 pub mod prepare;
 mod prepare_native;
 pub mod radio;
+mod rate_adaptive;
 pub mod regs;
 pub mod rf;
 pub mod rx;
 mod station_control;
 pub mod tx;
 pub mod vht;
-mod wmm;
+pub(crate) mod wmm;
 
 pub mod rtl8188ee;
 pub mod rtl8192ce;
@@ -86,6 +88,7 @@ pub mod rtl8192ee;
 pub mod rtl8723be;
 pub mod rtl8821ae;
 
+pub use interface::set_leisure_power_save;
 pub use pci::{name_for, probe, register_pci_driver, RtlwifiDevice};
 pub use regs::{ALL_DEV_IDS, REALTEK_VENDOR};
 

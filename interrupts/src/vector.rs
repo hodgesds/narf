@@ -81,6 +81,23 @@ pub fn alloc() -> Result<u8, VectorError> {
     Err(VectorError::Exhausted)
 }
 
+/// Reserve one specific vector — the dispatch slot of a fixed-INTID
+/// interrupt (an aarch64 SPI dispatches on `intid & 0xFF`), so no
+/// [`alloc`] caller (MSI / LPI) can be handed the same slot.
+/// `AlreadyFree` is never returned; a taken vector is `Exhausted`.
+pub fn reserve(vector: u8) -> Result<(), VectorError> {
+    if !(ALLOC_BASE..=ALLOC_MAX).contains(&vector) {
+        return Err(VectorError::OutOfRange);
+    }
+    let (w, bit) = split(vector);
+    let prev = USED[w].fetch_or(bit, Ordering::AcqRel);
+    if prev & bit != 0 {
+        return Err(VectorError::Exhausted);
+    }
+    start_enabled(vector);
+    Ok(())
+}
+
 /// Reserve `n` *contiguous* vectors. Useful for MSI / per-CPU MSI-X
 /// where the device fires consecutive vectors. Returns the base
 /// vector; the reserved range is `[base, base + n)`. All-or-nothing

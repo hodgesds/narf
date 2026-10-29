@@ -1065,6 +1065,7 @@ dependencies = [
  "narf-boot",
  "narf-capabilities",
  "narf-event-bus",
+ "narf-firmware-fdt",
  "narf-interrupts",
  "narf-io",
  "narf-kernel-test",
@@ -2054,6 +2055,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-qcom-soc"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-firmware-fdt",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-time",
+]
+
+[[package]]
 name = "narf-drivers-sdio"
 version = "0.0.0"
 dependencies = [
@@ -2338,6 +2353,8 @@ dependencies = [
  "narf-console",
  "narf-driver-macros",
  "narf-drivers",
+ "narf-drivers-usb",
+ "narf-drivers-usbpd",
  "narf-init",
  "narf-interrupts",
  "narf-io",
@@ -2349,6 +2366,7 @@ dependencies = [
  "narf-power",
  "narf-scheduler",
  "narf-time",
+ "narf-usbpd",
 ]
 
 [[package]]
@@ -2469,10 +2487,12 @@ dependencies = [
  "narf-crypto",
  "narf-driver-runtime",
  "narf-drivers",
+ "narf-drivers-qcom-soc",
  "narf-drivers-sdio",
  "narf-drivers-usb",
  "narf-drivers-wireless-mt76",
  "narf-firmware",
+ "narf-firmware-fdt",
  "narf-firmware-smbios",
  "narf-init",
  "narf-interrupts",
@@ -2873,6 +2893,7 @@ dependencies = [
  "narf-acpi",
  "narf-arch",
  "narf-console",
+ "narf-firmware-fdt",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
@@ -3014,6 +3035,7 @@ dependencies = [
  "narf-console",
  "narf-crypto",
  "narf-ctap2",
+ "narf-drivers-tpm",
  "narf-event-bus",
  "narf-filesystem",
  "narf-init",

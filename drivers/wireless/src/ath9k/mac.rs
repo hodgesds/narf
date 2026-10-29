@@ -188,6 +188,38 @@ pub(super) fn edca(io: &impl Port, be: narf_wireless::wmm::Ac) -> Result<(), Err
     )?;
     write(io, 0x10c0, 0)
 }
+/// `mac.c::ath9k_hw_resettxqueue` for an additional DATA QCU/DCU `q`
+/// (1..3) with the actual AP's AIFS/CW word: the same finite retry,
+/// early-termination and backoff recipe as queue0, and zero channel time
+/// (one MPDU per access stays within any advertised TXOP limit).
+pub(super) fn data_queue(io: &impl Port, q: u64, ifs: u32) -> Result<(), Error> {
+    if !(1..4).contains(&q) {
+        return Err(Error::Packet);
+    }
+    write(io, 0x1000 + q * 4, 1 << q)?;
+    write(io, 0x1040 + q * 4, ifs)?;
+    write(io, 0x1080 + q * 4, 10 | (32 << 8) | (32 << 14))?;
+    write(io, 0x9c0 + q * 4, 0x800)?;
+    write(io, 0x1100 + q * 4, 0x1102)?;
+    write(io, 0x10c0 + q * 4, 0)
+}
+/// Readback of every programmed data QCU/DCU (0..3).
+pub(super) fn check_data_queues(io: &impl Port, words: &[u32; 4]) -> Result<(), Error> {
+    for q in 0..4u64 {
+        if io.read(0x1040 + q * 4)? != words[q as usize] || io.read(0x10c0 + q * 4)? != 0 {
+            return Err(Error::Descriptor);
+        }
+        if q != 0
+            && (io.read(0x1000 + q * 4)? != 1 << q
+                || io.read(0x1080 + q * 4)? != 10 | (32 << 8) | (32 << 14)
+                || io.read(0x9c0 + q * 4)? != 0x800
+                || io.read(0x1100 + q * 4)? != 0x1102)
+        {
+            return Err(Error::Descriptor);
+        }
+    }
+    Ok(())
+}
 pub(super) fn qos(io: &impl Port) -> Result<(), Error> {
     write(io, 0x8118, 0x100aa)?;
     write(io, 0x811c, 0x3210)?;

@@ -378,6 +378,7 @@ fn smoke_rtl8188eu_signed_power_then_real_retained_native_management_tx() -> Tes
         bssid: peer,
         ssid: b"narf".to_vec(),
         channel: 1,
+        band: None,
         signal_dbm: None,
         capability: 1,
         beacon_interval: 100,

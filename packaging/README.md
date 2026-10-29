@@ -81,6 +81,30 @@ known package paths, plus that registration. Native package removal invokes
 the same operation; mount the recorded ESP before removing the package so it
 can be cleaned.
 
+An existing NARF hardware-test entry can still load `boot():/boot/narf-frame`
+from an older `grub-image` bundle. Package installation normally updates
+`/EFI/NARF/narf-frame`, so that older entry otherwise keeps booting its previous
+kernel. Adopt its existing menu explicitly:
+
+```sh
+sudo narf-uefi install --esp /boot/efi \
+  --limine-config /boot/efi/boot/limine/limine.conf
+sudo narf-uefi status --esp /boot/efi
+```
+
+The config must be on the selected ESP and contain exactly one NARF
+Multiboot2 entry using `boot():/boot/narf-frame` or
+`boot():/EFI/NARF/narf-frame`. The helper copies the packaged kernel to that
+entry's existing location and saves the config path for subsequent upgrades.
+It preserves the menu, root policy, command line, firmware initramfs, and EFI
+application. Before replacing a legacy kernel, it saves the original at
+`/var/lib/narf/limine-kernel-before-package` on the host root. Kernel updates
+are staged one at a time so they fit alongside the firmware initramfs on a
+512-MiB ESP. Status also checks the selected kernel
+against the package; a stale or moved entry fails verification. An entry with
+a kernel digest must already name the packaged digest. Removal keeps the
+pre-existing menu, legacy kernel, and backup, and forgets the adoption state.
+
 Supported outputs:
 
 - Debian and Ubuntu: `.deb`

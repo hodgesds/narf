@@ -163,6 +163,7 @@ impl State {
         io: &mut impl Io,
         frames: &[&[u8]],
     ) -> Result<usize, Error> {
+        self.coding_live(io)?;
         io.station_allowed()?;
         let cfg = self.tx_config.ok_or(Error::State)?;
         if !self.ready() || self.tx_ba.active().is_none() || !io.packet_ready() {

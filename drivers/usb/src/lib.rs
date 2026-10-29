@@ -7,6 +7,7 @@
 extern crate alloc;
 
 pub mod attach;
+mod boot_root;
 pub mod btusb;
 mod btusb_intel;
 mod btusb_mtk;
@@ -54,6 +55,15 @@ pub fn register_initcalls() {
             serial::devfs_bridge::lookup_tty_usb,
             serial::devfs_bridge::enumerate_tty_usb,
         );
+        InitResult::Ok
+    });
+    // Suspend/resume state replay for the serial classes (#763):
+    // async system-PM hooks whose prepare quiesces the pumps and
+    // whose resume replays each bound device's saved line/modem
+    // state after the controller fan-out restores xHCI.
+    narf_init::register(Stage::Subsys, "usb-serial-pm", || {
+        cdc_acm::register_pm();
+        serial::port::register_pm();
         InitResult::Ok
     });
     // Install devfs hooks so /dev/ccid<N> nodes resolve for every
@@ -296,7 +306,7 @@ fn spawn_supervisor_task() {
     // Stackful: USB HID supervisor's enumeration loop polls xHCI
     // MMIO + per-port reset state. Preemption-capped at the
     // default 10 ms slice so a stuck port can't starve init.
-    narf_scheduler::spawn_stackful(async {
+    let mut supervisor = alloc::boxed::Box::pin(async {
         use crate::attach::{self, AttachOutcome, HUBS};
         const PUMP_CYCLES: u64 = 16_000_000;
         // Cap per-port enumeration attempts. After this many
@@ -680,8 +690,14 @@ fn spawn_supervisor_task() {
             // keyboard that idled into suspend would stay dead
             // even though it is bound and pumped every cycle
             // (#840). The wake opens a fresh idle window; see
-            // `hid::resume_suspended_hub_ports`.
+            // `hid::resume_suspended_hub_ports`. The serial
+            // classes get the same wake before their pumps: an
+            // ACM console or USB-serial dongle behind an
+            // autosuspended port is exactly as dead as the
+            // keyboard was (#763).
             hid::resume_suspended_hub_ports(c).await;
+            cdc_acm::resume_suspended_hub_ports(c).await;
+            serial::port::resume_suspended_hub_ports(c).await;
             hid::pump_all(c);
             hid::mouse::pump_all(c);
             hid::touchpad::pump_all(c);
@@ -720,4 +736,8 @@ fn spawn_supervisor_task() {
             narf_time::sleep_cycles(cyc).await;
         }
     });
+    // Root mounting runs before the executor. Prime this same future when
+    // the requested root has not appeared yet, then retain it for hot-plug.
+    boot_root::prepare(supervisor.as_mut());
+    narf_scheduler::spawn_stackful(supervisor);
 }

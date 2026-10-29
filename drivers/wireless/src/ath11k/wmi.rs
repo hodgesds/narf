@@ -279,6 +279,8 @@ pub const WMI_HOST_WLAN_2G_5G_CAP: u32 = 0x3;
 
 /// `WMI_RSRC_CFG_FLAG1_BSS_CHANNEL_INFO_64`.
 pub const WMI_RSRC_CFG_FLAG1_BSS_CHANNEL_INFO_64: u32 = 1 << 5;
+/// `WMI_RSRC_CFG_FLAG1_ACK_RSSI`.
+pub const WMI_RSRC_CFG_FLAG1_ACK_RSSI: u32 = 1 << 18;
 /// `WMI_RSRC_CFG_FLAG2_CALC_NEXT_DTIM_COUNT_SET`.
 pub const WMI_RSRC_CFG_FLAG2_CALC_NEXT_DTIM_COUNT_SET: u32 = 1 << 9;
 /// `WMI_CFG_HOST_SERVICE_FLAG_REG_CC_EXT` (bit position).
@@ -793,6 +795,72 @@ impl TargetResourceConfig {
         }
     }
 
+    /// `ath11k_init_wmi_config_ipq8074` (hw.c) — the IPQ8074 / IPQ6018 /
+    /// QCN9074 / IPQ5018 `hw_ops->wmi_init_config` — plus the
+    /// `is_reg_cc_ext_event_supported` fix-up. `hw_num_vdevs` /
+    /// `hw_num_peers` are `hw_params.num_vdevs` / `num_peers`,
+    /// `num_radios` is `ab->num_radios` (SERVICE_READY_EXT).
+    pub fn ipq8074(
+        hw_num_vdevs: u32,
+        hw_num_peers: u32,
+        num_radios: u32,
+        num_rf_chains: u32,
+        reg_cc_ext: bool,
+    ) -> Self {
+        let chain_mask = (1u32 << num_rf_chains).wrapping_sub(1);
+        // TARGET_NUM_PEERS_PDEV, then _SINGLE / _DBS / _DBS_SBS.
+        let per_pdev = hw_num_peers + hw_num_vdevs;
+        let num_peers = match num_radios {
+            2 => 2 * per_pdev,
+            3 => 3 * per_pdev,
+            _ => per_pdev,
+        };
+        TargetResourceConfig {
+            num_vdevs: num_radios * hw_num_vdevs,
+            num_peers,
+            // TARGET_NUM_TIDS(ab, x)
+            num_tids: 2 * num_peers + 4 * hw_num_vdevs + 8,
+            num_offload_peers: 4,
+            num_offload_reorder_buffs: 4,
+            num_peer_keys: target::NUM_PEER_KEYS,
+            ast_skid_limit: target::AST_SKID_LIMIT,
+            tx_chain_mask: chain_mask,
+            rx_chain_mask: chain_mask,
+            rx_timeout_pri: [
+                target::RX_TIMEOUT_LO_PRI,
+                target::RX_TIMEOUT_LO_PRI,
+                target::RX_TIMEOUT_LO_PRI,
+                target::RX_TIMEOUT_HI_PRI,
+            ],
+            rx_decap_mode: target::DECAP_MODE_NATIVE_WIFI,
+            scan_max_pending_req: target::SCAN_MAX_PENDING_REQS,
+            bmiss_offload_max_vdev: target::BMISS_OFFLOAD_MAX_VDEV,
+            roam_offload_max_vdev: target::ROAM_OFFLOAD_MAX_VDEV,
+            roam_offload_max_ap_profiles: target::ROAM_OFFLOAD_MAX_AP_PROFILES,
+            num_mcast_groups: 12,
+            num_mcast_table_elems: 64,
+            mcast2ucast_mode: 2,
+            tx_dbg_log_size: target::TX_DBG_LOG_SIZE,
+            num_wds_entries: 32,
+            dma_burst_size: 1,
+            rx_skip_defrag_timeout_dup_detection_check: 1,
+            vow_config: target::VOW_CONFIG,
+            gtk_offload_max_vdev: 3,
+            num_msdu_desc: 2500,
+            // num_radios * TARGET_MAX_BCN_OFFLD, + ema_max_vap_cnt.
+            beacon_tx_offload_max_vdev: num_radios * 16 + num_radios,
+            rx_batchmode: target::RX_BATCHMODE,
+            peer_map_unmap_v2_support: 1,
+            twt_ap_pdev_count: num_radios,
+            twt_ap_sta_count: 1000,
+            flag1: WMI_RSRC_CFG_FLAG1_BSS_CHANNEL_INFO_64 | WMI_RSRC_CFG_FLAG1_ACK_RSSI,
+            ema_max_vap_cnt: num_radios,
+            ema_max_profile_period: 8,
+            is_reg_cc_ext_event_supported: reg_cc_ext,
+            ..Default::default()
+        }
+    }
+
     /// `ath11k_wmi_copy_resource_config` + the `tlv_header` write in
     /// `ath11k_init_cmd_send`: the 292-byte `struct wmi_resource_config`.
     ///
@@ -922,7 +990,46 @@ pub struct InitCmdParam {
     pub band_to_mac: Vec<BandToMac>,
 }
 
+/// `ath11k_fill_band_to_mac_param`: pdev `i`'s frequency span from
+/// `hal_reg_cap[i]` by its `supported_bands` (an unknown band mask leaves
+/// the span zero, as Linux does).
+pub fn band_to_mac(ext: &ServiceReadyExt, num_radios: u32) -> Vec<BandToMac> {
+    let mut out = Vec::new();
+    for (i, p) in ext.pdevs.iter().take(num_radios as usize).enumerate() {
+        let cap = ext.hal_reg_cap(i as u32).copied().unwrap_or_default();
+        let (start_freq, end_freq) = match p.supported_bands {
+            b if b == WMI_HOST_WLAN_2G_CAP | WMI_HOST_WLAN_5G_CAP => {
+                (cap.low_2ghz_chan, cap.high_5ghz_chan)
+            }
+            WMI_HOST_WLAN_2G_CAP => (cap.low_2ghz_chan, cap.high_2ghz_chan),
+            WMI_HOST_WLAN_5G_CAP => (cap.low_5ghz_chan, cap.high_5ghz_chan),
+            _ => (0, 0),
+        };
+        out.push(BandToMac {
+            pdev_id: p.pdev_id,
+            start_freq,
+            end_freq,
+        });
+    }
+    out
+}
+
 impl InitCmdParam {
+    /// `ath11k_wmi_cmd_init` for a multi-pdev chip: `hw_mode_id =
+    /// preferred_hw_mode`, one band-to-mac entry per radio.
+    pub fn multi_pdev(
+        res_cfg: TargetResourceConfig,
+        hw_mode_id: u32,
+        band_to_mac: Vec<BandToMac>,
+    ) -> Self {
+        InitCmdParam {
+            res_cfg,
+            mem_chunks: Vec::new(),
+            hw_mode_id,
+            band_to_mac,
+        }
+    }
+
     /// `ath11k_wmi_cmd_init` for a `single_pdev_only` chip (WCN6855):
     /// no host mem chunks, `hw_mode_id = WMI_HOST_HW_MODE_MAX`.
     pub fn single_pdev(res_cfg: TargetResourceConfig) -> Self {
@@ -1492,6 +1599,207 @@ pub fn twt_disable_cmd(pdev_id: u32) -> WmiCmd {
     );
     w.u32(pdev_id);
     w.finish(WMI_TWT_DISABLE_CMDID, WMI_TWT_DISABLE_PARAMS_CMD_SIZE)
+}
+
+/// `sizeof(struct wmi_twt_add_dialog_params_cmd)`.
+pub const WMI_TWT_ADD_DIALOG_PARAMS_CMD_SIZE: usize = 40;
+/// `sizeof(struct wmi_twt_{del,pause}_dialog_params_cmd)`.
+pub const WMI_TWT_DEL_DIALOG_PARAMS_CMD_SIZE: usize = 20;
+/// `sizeof(struct wmi_twt_resume_dialog_params_cmd)`.
+pub const WMI_TWT_RESUME_DIALOG_PARAMS_CMD_SIZE: usize = 28;
+/// `WMI_TWT_ADD_DIALOG_FLAG_{BCAST,TRIGGER,FLOW_TYPE,PROTECTION}`; the
+/// low byte of `flags` carries `enum WMI_HOST_TWT_COMMAND`.
+pub mod twt_flag {
+    pub const BCAST: u32 = 1 << 8;
+    pub const TRIGGER: u32 = 1 << 9;
+    pub const FLOW_TYPE: u32 = 1 << 10;
+    pub const PROTECTION: u32 = 1 << 11;
+}
+/// `enum WMI_HOST_TWT_COMMAND` (the 802.11ax TWT Setup Command values,
+/// IEEE 802.11-2020 Table 9-297 / 802.11ax-2021 Table 9-296b).
+pub const WMI_HOST_TWT_COMMAND_REJECT_TWT: u8 = 7;
+
+/// `struct wmi_twt_add_dialog_params` (debugfs `twt/add_dialog`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TwtAddDialogParams {
+    pub vdev_id: u32,
+    pub peer_macaddr: [u8; 6],
+    pub dialog_id: u32,
+    pub wake_intvl_us: u32,
+    pub wake_intvl_mantis: u32,
+    pub wake_dura_us: u32,
+    pub sp_offset_us: u32,
+    /// `enum WMI_HOST_TWT_COMMAND` (u8 in Linux).
+    pub twt_cmd: u8,
+    pub flag_bcast: bool,
+    pub flag_trigger: bool,
+    pub flag_flow_type: bool,
+    pub flag_protection: bool,
+}
+
+/// `ath11k_wmi_send_twt_add_dialog_cmd` → `WMI_TWT_ADD_DIALOG_CMDID`.
+/// Linux ORs the flag bits over the u8 `twt_cmd`.
+pub fn twt_add_dialog_cmd(p: &TwtAddDialogParams) -> WmiCmd {
+    let len = WMI_TWT_ADD_DIALOG_PARAMS_CMD_SIZE;
+    let mut w = W::new(len);
+    w.tlv(WMI_TAG_TWT_ADD_DIALOG_CMD, len - TLV_HDR_SIZE);
+    w.u32(p.vdev_id);
+    w.mac(&p.peer_macaddr);
+    w.u32(p.dialog_id);
+    w.u32(p.wake_intvl_us);
+    w.u32(p.wake_intvl_mantis);
+    w.u32(p.wake_dura_us);
+    w.u32(p.sp_offset_us);
+    let mut flags = p.twt_cmd as u32;
+    for (on, bit) in [
+        (p.flag_bcast, twt_flag::BCAST),
+        (p.flag_trigger, twt_flag::TRIGGER),
+        (p.flag_flow_type, twt_flag::FLOW_TYPE),
+        (p.flag_protection, twt_flag::PROTECTION),
+    ] {
+        if on {
+            flags |= bit;
+        }
+    }
+    w.u32(flags);
+    w.finish(WMI_TWT_ADD_DIALOG_CMDID, len)
+}
+
+fn twt_dialog_cmd(cmd_id: u32, tag: u16, vdev_id: u32, peer: &[u8; 6], dialog_id: u32) -> WmiCmd {
+    let len = WMI_TWT_DEL_DIALOG_PARAMS_CMD_SIZE;
+    let mut w = W::new(len);
+    w.tlv(tag, len - TLV_HDR_SIZE);
+    w.u32(vdev_id);
+    w.mac(peer);
+    w.u32(dialog_id);
+    w.finish(cmd_id, len)
+}
+
+/// `ath11k_wmi_send_twt_del_dialog_cmd` → `WMI_TWT_DEL_DIALOG_CMDID`.
+pub fn twt_del_dialog_cmd(vdev_id: u32, peer: &[u8; 6], dialog_id: u32) -> WmiCmd {
+    twt_dialog_cmd(
+        WMI_TWT_DEL_DIALOG_CMDID,
+        WMI_TAG_TWT_DEL_DIALOG_CMD,
+        vdev_id,
+        peer,
+        dialog_id,
+    )
+}
+
+/// `ath11k_wmi_send_twt_pause_dialog_cmd` → `WMI_TWT_PAUSE_DIALOG_CMDID`.
+pub fn twt_pause_dialog_cmd(vdev_id: u32, peer: &[u8; 6], dialog_id: u32) -> WmiCmd {
+    twt_dialog_cmd(
+        WMI_TWT_PAUSE_DIALOG_CMDID,
+        WMI_TAG_TWT_PAUSE_DIALOG_CMD,
+        vdev_id,
+        peer,
+        dialog_id,
+    )
+}
+
+/// `ath11k_wmi_send_twt_resume_dialog_cmd` → `WMI_TWT_RESUME_DIALOG_CMDID`.
+pub fn twt_resume_dialog_cmd(
+    vdev_id: u32,
+    peer: &[u8; 6],
+    dialog_id: u32,
+    sp_offset_us: u32,
+    next_twt_size: u32,
+) -> WmiCmd {
+    let len = WMI_TWT_RESUME_DIALOG_PARAMS_CMD_SIZE;
+    let mut w = W::new(len);
+    w.tlv(WMI_TAG_TWT_RESUME_DIALOG_CMD, len - TLV_HDR_SIZE);
+    w.u32(vdev_id);
+    w.mac(peer);
+    w.u32(dialog_id);
+    w.u32(sp_offset_us);
+    w.u32(next_twt_size);
+    w.finish(WMI_TWT_RESUME_DIALOG_CMDID, len)
+}
+
+/// `struct wmi_twt_add_dialog_event` (`WMI_TWT_ADD_DIALOG_EVENTID`).
+/// `status` is `enum wmi_twt_add_dialog_status`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TwtAddDialogEvent {
+    pub vdev_id: u32,
+    pub peer_macaddr: [u8; 6],
+    pub dialog_id: u32,
+    pub status: u32,
+}
+
+/// `enum wmi_twt_add_dialog_status`.
+pub mod twt_add_status {
+    pub const OK: u32 = 0;
+    pub const TWT_NOT_ENABLED: u32 = 1;
+    pub const USED_DIALOG_ID: u32 = 2;
+    pub const INVALID_PARAM: u32 = 3;
+    pub const NOT_READY: u32 = 4;
+    pub const NO_RESOURCE: u32 = 5;
+    pub const NO_ACK: u32 = 6;
+    pub const NO_RESPONSE: u32 = 7;
+    pub const DENIED: u32 = 8;
+    pub const UNKNOWN_ERROR: u32 = 9;
+}
+
+/// `ath11k_wmi_twt_add_dialog_event_status`.
+pub const fn twt_add_dialog_status_str(status: u32) -> &'static str {
+    match status {
+        twt_add_status::OK => "ok",
+        twt_add_status::TWT_NOT_ENABLED => "twt disabled",
+        twt_add_status::USED_DIALOG_ID => "dialog id in use",
+        twt_add_status::INVALID_PARAM => "invalid parameters",
+        twt_add_status::NOT_READY => "not ready",
+        twt_add_status::NO_RESOURCE => "resource unavailable",
+        twt_add_status::NO_ACK => "no ack",
+        twt_add_status::NO_RESPONSE => "no response",
+        twt_add_status::DENIED => "denied",
+        _ => "unknown error",
+    }
+}
+
+/// `ath11k_wmi_twt_add_dialog_event`: the policy table admits a 20-byte
+/// `WMI_TAG_TWT_ADD_DIALOG_COMPLETE_EVENT`; its absence is an error.
+pub fn decode_twt_add_dialog_event(payload: &[u8]) -> Result<TwtAddDialogEvent, WmiError> {
+    let tb = TlvTable::parse(payload)?;
+    let v = tb.need(WMI_TAG_TWT_ADD_DIALOG_COMPLETE_EVENT)?.value;
+    need_len(v, 20, "twt add dialog: short TLV")?;
+    Ok(TwtAddDialogEvent {
+        vdev_id: rd32(v, 0),
+        peer_macaddr: mac_at(v, 4),
+        dialog_id: rd32(v, 12),
+        status: rd32(v, 16),
+    })
+}
+
+/// `struct wmi_unit_test_cmd` (tlv_header, vdev_id, module_id, num_args,
+/// diag_token) followed by a `WMI_TAG_ARRAY_UINT32` of the arguments.
+pub const WMI_UNIT_TEST_CMD_SIZE: usize = 20;
+/// `DFS_UNIT_TEST_MODULE` / `DFS_UNIT_TEST_TOKEN` / `DFS_MAX_TEST_ARGS`.
+pub const DFS_UNIT_TEST_MODULE: u32 = 0x2b;
+pub const DFS_UNIT_TEST_TOKEN: u32 = 0xAA;
+pub const DFS_MAX_TEST_ARGS: usize = 3;
+
+/// `ath11k_wmi_send_unit_test_cmd` → `WMI_UNIT_TEST_CMDID`.
+pub fn unit_test_cmd(vdev_id: u32, module_id: u32, diag_token: u32, args: &[u32]) -> WmiCmd {
+    let len = WMI_UNIT_TEST_CMD_SIZE + TLV_HDR_SIZE + 4 * args.len();
+    let mut w = W::new(len);
+    w.tlv(WMI_TAG_UNIT_TEST_CMD, WMI_UNIT_TEST_CMD_SIZE - TLV_HDR_SIZE);
+    w.u32(vdev_id);
+    w.u32(module_id);
+    w.u32(args.len() as u32);
+    w.u32(diag_token);
+    w.tlv(WMI_TAG_ARRAY_UINT32, 4 * args.len());
+    for &a in args {
+        w.u32(a);
+    }
+    w.finish(WMI_UNIT_TEST_CMDID, len)
+}
+
+/// `ath11k_wmi_simulate_radar`'s unit-test arguments: `DFS_TEST_CMDID` 0,
+/// `DFS_TEST_PDEV_ID`, and `DFS_TEST_RADAR_PARAM` 0 (segment 0, no chirp,
+/// no frequency offset — "valid for simulation purpose").
+pub fn dfs_simulate_radar_cmd(vdev_id: u32, pdev_id: u32) -> WmiCmd {
+    let args: [u32; DFS_MAX_TEST_ARGS] = [0, pdev_id, 0];
+    unit_test_cmd(vdev_id, DFS_UNIT_TEST_MODULE, DFS_UNIT_TEST_TOKEN, &args)
 }
 
 /// `struct wmi_channel_arg` — the channel half of
@@ -5077,6 +5385,7 @@ pub enum WmiEvent<'a> {
     PdevBssChanInfo(PdevBssChanInfo),
     DfsRadarDetected(DfsRadarDetected),
     ObssColorCollision(ObssColorCollisionEvent),
+    TwtAddDialog(TwtAddDialogEvent),
     /// Any other id — Linux logs and drops.
     Unhandled(u32),
 }
@@ -5117,6 +5426,7 @@ pub fn decode_event(frame: &[u8]) -> Result<WmiEvent<'_>, WmiError> {
         WMI_OBSS_COLOR_COLLISION_DETECTION_EVENTID => {
             WmiEvent::ObssColorCollision(decode_obss_color_collision_event(p)?)
         }
+        WMI_TWT_ADD_DIALOG_EVENTID => WmiEvent::TwtAddDialog(decode_twt_add_dialog_event(p)?),
         other => WmiEvent::Unhandled(other),
     })
 }

@@ -76,7 +76,12 @@ fn map(
     write: bool,
     memory_type: MemoryType,
 ) -> bool {
-    let mut perms = (RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT)
+    // Match the device-backed sys_mmap path: SHARED alone uses VMA-owned
+    // lifetime, while GEM mappings require the external alias registry.
+    let mut perms = (RegionPerms::READ
+        | RegionPerms::SHARED
+        | RegionPerms::EXTERNAL_REFS
+        | RegionPerms::LOCK_EXEMPT)
         .with_memory_type(memory_type);
     if write {
         perms = perms | RegionPerms::WRITE;
@@ -263,6 +268,23 @@ fn rdna2_cpu_mappings_revoke_rebind_and_refuse_pins() -> TestResult {
                 || !Arc::ptr_eq(&state.object(handle).unwrap(), &object)
                 || frames.iter().any(|&frame| alias_count(frame) == 0)
             {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "rdna2 mapping check: {label}: cpu={views_follow} gpu={gpu_follows} data={:?}/{:?} frames={frames:x?}",
+                    object.load_u64(16),
+                    object.load_u64(8192 + 8),
+                );
+                for (page, &phys) in frames.iter().enumerate() {
+                    let va = va_rw + page as u64 * 4096;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "rdna2 page {page}: translation={:x?} cache={} aliases={}",
+                        translated(&parent, va),
+                        cache_matches(&parent, va, phys),
+                        alias_count(phys),
+                    );
+                }
                 return Err(label);
             }
             Ok(())

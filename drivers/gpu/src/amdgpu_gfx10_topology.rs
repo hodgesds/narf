@@ -52,6 +52,10 @@ const GC_USER_SA_UNIT_DISABLE: Reg = Reg(0, 0x0fea);
 const RCC_DEV0_EPF0_STRAP0: u32 = 0x0011;
 /// SE/SA/instance broadcast, the selector every GRBM user leaves behind.
 const BROADCAST: u32 = 0xe000_0000;
+/// GRBM_GFX_INDEX has five reserved bits between the SE selector and the
+/// broadcast flags. Their read values are not part of the selected instance.
+// linux: GRBM_GFX_INDEX__INSTANCE_INDEX_MASK | GRBM_GFX_INDEX__SA_INDEX_MASK | GRBM_GFX_INDEX__SE_INDEX_MASK | GRBM_GFX_INDEX__SA_BROADCAST_WRITES_MASK | GRBM_GFX_INDEX__INSTANCE_BROADCAST_WRITES_MASK | GRBM_GFX_INDEX__SE_BROADCAST_WRITES_MASK
+const INDEX_FIELDS: u32 = 0xe0ff_ffff;
 /// `AMDGPU_GFX_MAX_SE` x `AMDGPU_GFX_MAX_SH_PER_SE` for GFX10
 /// (`disable_masks[4 * 2]` in `gfx_v10_0_get_cu_info`).
 const MAX_SE: u32 = 4;
@@ -237,7 +241,7 @@ fn sample(io: &mut impl Io, layout: &Layout, limits: Limits) -> Result<Sample, E
                 // gfx_v10_0_select_se_sh(se, sh, 0xffffffff)
                 let selector = (1 << 30) | (se << 16) | (sh << 8);
                 io.write(index, selector);
-                if checked(io.read(index))? != selector {
+                if checked(io.read(index))? & INDEX_FIELDS != selector {
                     return Err(Error::Readback);
                 }
                 let (i, j) = (se as usize, sh as usize);
@@ -252,7 +256,7 @@ fn sample(io: &mut impl Io, layout: &Layout, limits: Limits) -> Result<Sample, E
     // Restore broadcast even after a failed read, inside the same capability
     // operation that owns the selector.
     io.write(index, BROADCAST);
-    if checked(io.read(index))? != BROADCAST {
+    if checked(io.read(index))? & INDEX_FIELDS != BROADCAST {
         return Err(Error::Readback);
     }
     result?;

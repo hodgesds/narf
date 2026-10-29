@@ -50,3 +50,7 @@ qemu.log
 .mcp.json
 systemd_ctx.md
 .semcode-mcp.json
+
+# Local notes
+/cachy.md
+/youtube.md

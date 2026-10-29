@@ -66,6 +66,24 @@ pub(crate) trait Environment: Send + Sync {
     ) -> Result<Option<Arc<super::super::ht::Grant>>, Error> {
         Ok(None)
     }
+    /// The separately signed DATA rate fallback continuation (`NEFB`)
+    /// over `base`, or `None` (DATA stays USE_RATE + DISFB).
+    fn fallback(
+        &self,
+        _base: Arc<super::super::channel_power::Calibration>,
+    ) -> Result<Option<Arc<super::super::fallback::Grant>>, Error> {
+        Ok(None)
+    }
+    /// The bound MSI vector's wake (Linux `rtl_pci_intr_mode_msi`), or
+    /// `None` on the polling fallback.
+    fn interrupt(&self) -> Option<Arc<super::super::irq::Signal>> {
+        None
+    }
+    /// Enable delivery of the bound vector, or withdraw and release it.
+    /// `false` means no vector remains bound; the owner keeps polling.
+    fn deliver(&self, _enabled: bool) -> bool {
+        false
+    }
 }
 /// Shared public closure and bounded publication gate. No guard crosses an
 /// await; an already-entered native publication completes before close returns.
@@ -145,6 +163,64 @@ struct Captured {
     admitted: bool,
     epoch: u64,
 }
+/// mac80211 `IEEE80211_MAX_AMPDU_BUF_HT`; `rtl_rx_ampdu_apply` keeps it
+/// without a BT-coexistence aggregation limit (RTL8188EE has no BT).
+const BA_MAX_WINDOW: u16 = 64;
+/// mac80211 `HT_RX_REORDER_BUF_TIMEOUT` (HZ / 10).
+const REORDER_TIMEOUT_NS: u64 = 100_000_000;
+/// `WLAN_STATUS_REQUEST_DECLINED` / `WLAN_STATUS_INVALID_QOS_PARAM`.
+const STATUS_DECLINED: u16 = 37;
+const STATUS_INVALID_QOS: u16 = 38;
+/// `WLAN_REASON_QSTA_REQUIRE_SETUP` / `WLAN_REASON_QSTA_TIMEOUT`.
+const REASON_REQUIRE_SETUP: u16 = 38;
+const REASON_TIMEOUT: u16 = 39;
+/// One accepted recipient BA session. `rtl_rx_agg_start`/`rtl_rx_agg_stop`
+/// only record per-TID host state; the EE MAC acknowledges autonomously.
+struct RxBa {
+    reorder: narf_wireless::reorder::Reorder<Captured>,
+    token: u8,
+    timeout_tu: u16,
+    last_rx: u64,
+}
+/// mac80211 `sta_info.h` originator retry policy and `ADDBA_RESP_INTERVAL`.
+const HT_AGG_MAX_RETRIES: u8 = 15;
+const HT_AGG_BURST_RETRIES: u8 = 3;
+const HT_AGG_RETRIES_PERIOD_MS: u64 = 15_000;
+const ADDBA_RESP_INTERVAL_MS: u64 = 1000;
+/// `rtl_tx_status` -> `ieee80211_start_tx_ba_session(sta, tid, 5000)`.
+const TX_BA_TIMEOUT_TU: u16 = 5000;
+/// `_rtl_tx_aggr_check`: `cnt_after_linked < 3` with the 2 s
+/// `RTL_WATCH_DOG_TIME` watchdog incrementing it once per period.
+const TX_BA_LINK_SETTLE_MS: u64 = 3 * 2000;
+/// `WLAN_REASON_QSTA_NOT_USE`: DELBA for a local originator stop.
+const REASON_NOT_USE: u16 = 37;
+/// One originator BA session (mac80211 `tid_ampdu_tx` plus rtlwifi
+/// `rtl_tid_data.agg.agg_state`). `rtl_tx_agg_start` returns
+/// `IEEE80211_AMPDU_TX_START_IMMEDIATE` and `rtl_tx_agg_oper`/`_stop` only
+/// record the state, so no device access accompanies a transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TxBa {
+    /// ADDBA Request queued; `ADDBA_RESP_INTERVAL` runs to `deadline`.
+    Requested { token: u8, deadline: u64 },
+    /// RTL_AGG_OPERATIONAL: QoS DATA on the TID carries TXD AGG_EN.
+    Operational { timeout_tu: u16, last_tx: u64 },
+}
+fn action_header(peer: [u8; 6], own: [u8; 6]) -> Vec<u8> {
+    let mut header = vec![0xd0, 0, 0, 0];
+    header.extend_from_slice(&peer);
+    header.extend_from_slice(&own);
+    header.extend_from_slice(&peer);
+    header.extend_from_slice(&[0, 0]);
+    header
+}
+fn delba(peer: [u8; 6], own: [u8; 6], tid: u16, reason: u16) -> Vec<u8> {
+    // ieee80211_send_delba as recipient: initiator bit clear.
+    let mut frame = action_header(peer, own);
+    frame.extend_from_slice(&[3, 2]);
+    frame.extend_from_slice(&(tid << 12).to_le_bytes());
+    frame.extend_from_slice(&reason.to_le_bytes());
+    frame
+}
 pub(crate) struct Publication {
     pci: super::packet::Publication,
     base: Arc<super::super::channel_power::Calibration>,
@@ -208,6 +284,9 @@ pub(super) struct State {
     native_associated: bool,
     admitted: bool,
     sequence: u16,
+    /// Open-path per-TID QoS SN space; software CCMP keeps its own
+    /// per-TID counters inside shared `Security`.
+    qos_sequence: [u16; 8],
     deadline: u64,
     last_now: u64,
     last_peer: u64,
@@ -220,6 +299,25 @@ pub(super) struct State {
     delivered_reply: Option<Pending>,
     epoch: Arc<AtomicU64>,
     retire: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Recipient BA sessions by TID (mac80211 `tid_ampdu_rx`).
+    rx_ba: [Option<RxBa>; 8],
+    /// mac80211 `ampdu_mlme.unexpected_agg`: one DELBA per TID.
+    unexpected_ba: u16,
+    /// Originator BA sessions by TID with mac80211 retry bookkeeping.
+    tx_ba: [Option<TxBa>; 8],
+    tx_token: u8,
+    addba_req_num: [u8; 8],
+    last_addba_req: [u64; 8],
+    /// TIDs left at RTL_AGG_PROGRESS after mac80211 refused a start
+    /// (-EBUSY): `_rtl_tx_aggr_check` never retries them on this link.
+    tx_ba_stuck: u8,
+    /// Time the association completed (`MAC80211_LINKED`).
+    linked_at: Option<u64>,
+    /// `dm.undec_sm_pwdb` and `ra.pre_ratr_state` (driver RA mask).
+    ra: super::super::rate_adaptive::State,
+    /// The `NEFB` grant consulted for this association; dropped on the
+    /// first send or watchdog pass that finds it revoked.
+    fallback: Option<Arc<super::super::fallback::Grant>>,
 }
 impl State {
     pub(super) fn new() -> Self {
@@ -239,6 +337,7 @@ impl State {
             native_associated: false,
             admitted: false,
             sequence: 0,
+            qos_sequence: [0; 8],
             deadline: 0,
             last_now: 0,
             last_peer: 0,
@@ -251,6 +350,16 @@ impl State {
             delivered_reply: None,
             epoch: Arc::new(AtomicU64::new(1)),
             retire: None,
+            rx_ba: Default::default(),
+            unexpected_ba: 0,
+            tx_ba: [None; 8],
+            tx_token: 0,
+            addba_req_num: [0; 8],
+            last_addba_req: [0; 8],
+            ra: super::super::rate_adaptive::State::new(),
+            fallback: None,
+            tx_ba_stuck: 0,
+            linked_at: None,
         }
     }
     fn fail(&mut self) {
@@ -263,12 +372,50 @@ impl State {
         self.wmm = None;
         self.retire_receive();
         self.controls.clear();
+        self.retire_ba();
         if let Some(plan) = &mut self.plan {
             plan.cancel();
         }
         if let Some(security) = &mut self.security {
             security.fail();
         }
+    }
+    /// mac80211 `ieee80211_set_disassoc` + `rtl_op_sta_remove`: forget the
+    /// association (plan, keys, PN/replay, BA, WMM/HT negotiation, AID, RA
+    /// smoothing) and return to Passive scanning. The receive epoch was
+    /// already advanced by `retire_receive`; the HT grant, scan cache and
+    /// signed calibration belong to the radio and are kept.
+    fn reset_passive(&mut self) {
+        self.phase = Phase::Passive;
+        self.candidate = None;
+        self.plan = None;
+        self.pmk = None;
+        self.security = None;
+        self.pending = None;
+        self.incoming.clear();
+        self.received.clear();
+        self.aid = None;
+        self.native_associated = false;
+        self.admitted = false;
+        self.qos_sequence = [0; 8];
+        self.deadline = 0;
+        self.capability = 0;
+        self.wmm = None;
+        self.ht_profile = None;
+        self.controls.clear();
+        self.delivered_reply = None;
+        self.retire_ba();
+        self.ra = super::super::rate_adaptive::State::new();
+        self.fallback = None;
+    }
+    /// Whether the association's fallback grant is still current; a
+    /// revoked grant is dropped so DATA returns to the fixed rate.
+    fn fallback_current(&mut self) -> bool {
+        let current = self.fallback.as_ref().is_some_and(|g| g.current());
+        if !current {
+            self.fallback = None;
+        }
+        current
     }
     fn retire_receive(&mut self) {
         self.received.clear();
@@ -283,6 +430,245 @@ impl State {
         if let Some(retire) = &self.retire {
             retire();
         }
+    }
+    fn retire_ba(&mut self) {
+        for slot in &mut self.rx_ba {
+            if let Some(session) = slot.take() {
+                session.reorder.retire();
+            }
+        }
+        self.unexpected_ba = 0;
+        self.tx_ba = [None; 8];
+        self.addba_req_num = [0; 8];
+        self.last_addba_req = [0; 8];
+        self.tx_ba_stuck = 0;
+        self.linked_at = None;
+    }
+    /// TXD aggregation facts for one frame: (peer density, operational).
+    /// `rtl8188ee_tx_fill_desc` sets the station's density and, for an
+    /// `IEEE80211_TX_CTL_AMPDU` frame, AGG_EN + MAX_AGG_NUM.
+    fn aggregate(&mut self, bytes: &[u8], now: u64) -> Option<(u8, bool)> {
+        let profile = self.ht_profile?;
+        if bytes.first() != Some(&0x88) || bytes.len() < 26 {
+            return None;
+        }
+        let tid = usize::from(bytes[24] & 7);
+        let operational = match &mut self.tx_ba[tid] {
+            Some(TxBa::Operational { last_tx, .. }) => {
+                *last_tx = now;
+                true
+            }
+            _ => false,
+        };
+        Some((profile.peer_mpdu_density(), operational))
+    }
+    /// `rtl_tx_status` on a delivered QoS DATA frame (never EAPOL):
+    /// `_rtl_tx_aggr_check` then `ieee80211_start_tx_ba_session`, which
+    /// mac80211 refuses beyond HT_AGG_BURST_RETRIES within
+    /// HT_AGG_RETRIES_PERIOD or HT_AGG_MAX_RETRIES. The immediate start sends
+    /// the ADDBA Request (`ieee80211_send_addba_request`: SUPPORTS_AMSDU_IN_
+    /// AMPDU A-MSDU bit, immediate policy, window IEEE80211_MAX_AMPDU_BUF_HT,
+    /// timeout 5000 TU, SSN = the TID's next sequence).
+    fn tx_status(&mut self, bytes: &[u8], now: u64, own: [u8; 6]) -> Result<(), Error> {
+        if self.ht_profile.is_none() || bytes.first() != Some(&0x88) || bytes.len() < 26 {
+            return Ok(());
+        }
+        let tid = bytes[24] & 7;
+        let i = usize::from(tid);
+        if self.tx_ba[i].is_some()
+            || self.tx_ba_stuck & (1 << tid) != 0
+            || self
+                .linked_at
+                .is_none_or(|at| now < at.saturating_add(TX_BA_LINK_SETTLE_MS))
+        {
+            return Ok(());
+        }
+        let tries = self.addba_req_num[i];
+        if tries > HT_AGG_MAX_RETRIES
+            || tries > HT_AGG_BURST_RETRIES
+                && now < self.last_addba_req[i].saturating_add(HT_AGG_RETRIES_PERIOD_MS)
+        {
+            self.tx_ba_stuck |= 1 << tid;
+            return Ok(());
+        }
+        let peer = self
+            .candidate
+            .as_ref()
+            .map(|c| c.bss.bssid)
+            .ok_or(Error::State)?;
+        if self.controls.len() == 8 {
+            return Err(Error::Allocation);
+        }
+        let ssn = match &self.security {
+            Some(security) => security.next_qos_sequence(tid).map_err(Error::Security)?,
+            None => self.qos_sequence[i],
+        };
+        self.tx_token = self.tx_token.wrapping_add(1);
+        let token = self.tx_token;
+        let mut request = action_header(peer, own);
+        request.extend_from_slice(&[3, 0, token]);
+        request
+            .extend_from_slice(&(1 | 2 | u16::from(tid) << 2 | BA_MAX_WINDOW << 6).to_le_bytes());
+        request.extend_from_slice(&TX_BA_TIMEOUT_TU.to_le_bytes());
+        request.extend_from_slice(&((ssn & 4095) << 4).to_le_bytes());
+        self.controls.push_back(request);
+        self.last_addba_req[i] = now;
+        self.addba_req_num[i] = tries.saturating_add(1);
+        self.tx_ba[i] = Some(TxBa::Requested {
+            token,
+            deadline: now.saturating_add(ADDBA_RESP_INTERVAL_MS),
+        });
+        Ok(())
+    }
+    /// `ieee80211_process_addba_resp`: only the outstanding dialog token is
+    /// matched; success with a nonzero window makes the TID operational
+    /// (`rtl_tx_agg_oper`), anything else stops it without a DELBA
+    /// (AGG_STOP_DECLINED -> `rtl_tx_agg_stop`, RTL_AGG_STOP).
+    fn addba_response(&mut self, token: u8, status: u16, p: u16, timeout: u16, now: u64) {
+        let tid = usize::from((p >> 2) & 15);
+        if tid >= 8 {
+            return;
+        }
+        let Some(TxBa::Requested {
+            token: outstanding, ..
+        }) = self.tx_ba[tid]
+        else {
+            return;
+        };
+        if outstanding != token {
+            return;
+        }
+        self.tx_ba[tid] = if status == 0 && p >> 6 != 0 {
+            self.addba_req_num[tid] = 0;
+            Some(TxBa::Operational {
+                timeout_tu: timeout,
+                last_tx: now,
+            })
+        } else {
+            None
+        };
+    }
+    /// `sta_addba_resp_timer_expired` and `sta_tx_agg_session_timer_expired`
+    /// stop as a local request: initiator DELBA `WLAN_REASON_QSTA_NOT_USE`.
+    fn service_tx_ba(&mut self, now: u64, peer: [u8; 6], own: [u8; 6]) -> Result<(), Error> {
+        for tid in 0..8u16 {
+            let expired = match self.tx_ba[usize::from(tid)] {
+                Some(TxBa::Requested { deadline, .. }) => now >= deadline,
+                Some(TxBa::Operational {
+                    timeout_tu,
+                    last_tx,
+                }) => {
+                    timeout_tu != 0
+                        && now.saturating_sub(last_tx) >= u64::from(timeout_tu) * 1024 / 1000
+                }
+                None => false,
+            };
+            if expired {
+                self.tx_ba[usize::from(tid)] = None;
+                if self.controls.len() == 8 {
+                    return Err(Error::Allocation);
+                }
+                let mut frame = action_header(peer, own);
+                frame.extend_from_slice(&[3, 2]);
+                frame.extend_from_slice(&(tid << 12 | 1 << 11).to_le_bytes());
+                frame.extend_from_slice(&REASON_NOT_USE.to_le_bytes());
+                self.controls.push_back(frame);
+            }
+        }
+        Ok(())
+    }
+    /// mac80211 `__ieee80211_start_rx_ba_session`; returns (status, TID, window).
+    fn addba_request(
+        &mut self,
+        token: u8,
+        p: u16,
+        timeout: u16,
+        ssn: u16,
+        now: u64,
+    ) -> (u16, u8, u16) {
+        let policy = (p >> 1) & 1;
+        let tid = ((p >> 2) & 15) as u8;
+        let mut buf = p >> 6;
+        if tid >= 8 {
+            return (STATUS_DECLINED, tid, buf);
+        }
+        if policy != 1 || buf > BA_MAX_WINDOW {
+            return (STATUS_INVALID_QOS, tid, buf);
+        }
+        if buf == 0 {
+            buf = BA_MAX_WINDOW;
+        }
+        let slot = &mut self.rx_ba[usize::from(tid)];
+        if let Some(session) = slot {
+            if session.token == token {
+                let status = if session.timeout_tu == timeout {
+                    0
+                } else {
+                    STATUS_DECLINED
+                };
+                return (status, tid, buf);
+            }
+            if let Some(old) = slot.take() {
+                old.reorder.retire();
+            }
+        }
+        let Ok(mut reorder) = narf_wireless::reorder::Reorder::new(buf as u8, REORDER_TIMEOUT_NS)
+        else {
+            return (STATUS_DECLINED, tid, buf);
+        };
+        if reorder.advance(ssn, now.saturating_mul(1_000_000)).is_err() {
+            return (STATUS_DECLINED, tid, buf);
+        }
+        *slot = Some(RxBa {
+            reorder,
+            token,
+            timeout_tu: timeout,
+            last_rx: now,
+        });
+        self.unexpected_ba &= !(1 << tid);
+        (0, tid, buf)
+    }
+    fn release(&mut self, released: Vec<Captured>) -> Result<(), Error> {
+        if self.incoming.len() + released.len() > 256 {
+            return Err(Error::Allocation);
+        }
+        self.incoming.extend(released);
+        Ok(())
+    }
+    /// Session inactivity (`sta_rx_agg_session_timer_expired`) and reorder
+    /// hole expiry (`sta_rx_agg_reorder_timer_expired`).
+    fn service_ba(&mut self, now: u64, own: [u8; 6]) -> Result<(), Error> {
+        let peer = self
+            .candidate
+            .as_ref()
+            .map(|c| c.bss.bssid)
+            .ok_or(Error::State)?;
+        self.service_tx_ba(now, peer, own)?;
+        for tid in 0..8u16 {
+            let Some(session) = self.rx_ba[usize::from(tid)].as_mut() else {
+                continue;
+            };
+            if session.timeout_tu != 0
+                && now.saturating_sub(session.last_rx)
+                    >= u64::from(session.timeout_tu) * 1024 / 1000
+            {
+                if let Some(session) = self.rx_ba[usize::from(tid)].take() {
+                    session.reorder.retire();
+                }
+                if self.controls.len() == 8 {
+                    return Err(Error::Allocation);
+                }
+                self.controls
+                    .push_back(delba(peer, own, tid, REASON_TIMEOUT));
+                continue;
+            }
+            let released = session
+                .reorder
+                .expire(now.saturating_mul(1_000_000))
+                .unwrap_or_default();
+            self.release(released)?;
+        }
+        Ok(())
     }
     fn receive_open(&self) -> bool {
         self.phase == Phase::Open
@@ -466,6 +852,49 @@ impl<I: Io, M: Memory> Prepared<I, M> {
                 .map_err(Error::Radio)?;
         }
         Ok(())
+    }
+    /// Program all four EDCA rows inside the retained calibration (or HT
+    /// grant) invocation. Every row is admitted before the first write and
+    /// every write is read back, both at association and for a live update.
+    fn program_station_edca(&self, p: narf_wireless::wmm::Parameters) -> Result<(), Error> {
+        let calibration = self.station.calibration.as_ref().ok_or(Error::Profile)?;
+        let program = || {
+            if self.station.ht_profile.is_some() {
+                return super::super::wmm::program_ht(&self.io, p);
+            }
+            super::super::wmm::program(&self.io, p, self.station.capability & 0x400 != 0)
+        };
+        if let Some(ht) = &self.station.ht {
+            ht.invoke(program)?;
+        } else {
+            calibration.with_current(program)?;
+        }
+        Ok(())
+    }
+    /// mac80211 `ieee80211_sta_wmm_params`: a beacon from the bound AP whose
+    /// WMM Parameter Set Count differs from the installed one carries new
+    /// EDCA rows, which `drv_conf_tx` -> rtl88ee `set_qos` writes live. An
+    /// unchanged count is ignored exactly as upstream does. Losing WMM or a
+    /// row this profile cannot admit (BE ACM, bad geometry) stays terminal.
+    fn update_station_edca(
+        &mut self,
+        information_elements: &[u8],
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        let Some(current) = self.station.wmm else {
+            return Ok(());
+        };
+        let fresh = narf_wireless::wmm::Parameters::parse(information_elements)
+            .ok()
+            .flatten()
+            .ok_or(Error::Profile)?;
+        if fresh.parameter_set_count == current.parameter_set_count {
+            return Ok(());
+        }
+        self.check_station_policy(environment)?;
+        self.program_station_edca(fresh)?;
+        self.station.wmm = Some(fresh);
+        self.check_station_policy(environment)
     }
 }
 impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
@@ -683,11 +1112,19 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .ok_or(Error::Profile)?
             .clone();
         let ht = self.station.ht.clone();
+        let aggregate = if matches!(kind, Kind::Data) {
+            self.station.aggregate(&bytes, now)
+        } else {
+            None
+        };
+        // Ordinary DATA may clear DISFB only under a current NEFB grant;
+        // without it the base programs' fixed USE_RATE + DISFB applies.
+        let fallback = matches!(kind, Kind::Data) && self.station.fallback_current();
         let mut publish = || {
             let op = || {
                 self.check_station_policy(environment)
                     .map_err(|_| RadioError::Power(super::super::channel_power::Error::Policy))?;
-                self.submit(&bytes, rate)
+                self.submit_aggregate(&bytes, rate, aggregate, fallback)
             };
             if let Some(ht) = &ht {
                 ht.invoke(op)
@@ -816,23 +1253,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         )
                     })?;
                     if let Some(p) = self.station.wmm {
-                        let calibration =
-                            self.station.calibration.as_ref().ok_or(Error::Profile)?;
-                        let program = || {
-                            if self.station.ht_profile.is_some() {
-                                return super::super::wmm::program_ht(&self.io, p);
-                            }
-                            super::super::wmm::program(
-                                &self.io,
-                                p,
-                                self.station.capability & 0x400 != 0,
-                            )
-                        };
-                        if let Some(ht) = &self.station.ht {
-                            ht.invoke(program)?;
-                        } else {
-                            calibration.with_current(program)?;
-                        }
+                        self.program_station_edca(p)?;
                         self.check_station_policy(environment)?;
                         self.packet.qos = true;
                     }
@@ -849,12 +1270,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         ht.readback(&self.io, self.station.ht_indices, true)?;
                         self.packet.ht = true;
                     }
+                    self.station.linked_at = Some(environment.now_ms());
                     let base = self
                         .station
                         .calibration
                         .as_ref()
                         .ok_or(Error::State)?
                         .clone();
+                    let base_for_fallback = base.clone();
                     let ht = self.station.ht.clone();
                     let permission = self.permission.ok_or(Error::State)?;
                     super::super::ht::wait(
@@ -876,6 +1299,19 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     .await?;
                     self.check_station_policy(environment)?;
                     self.station.native_associated = true;
+                    self.station.fallback = None;
+                    if let Some(grant) = environment.fallback(base_for_fallback.clone())? {
+                        if !grant.matches(&base_for_fallback) {
+                            return Err(Error::Profile);
+                        }
+                        self.station.fallback = Some(grant);
+                    }
+                    // core.c BSS_CHANGED_ASSOC: update_rate_tbl(sta, 0).
+                    self.install_station_rate_mask(
+                        super::super::rate_adaptive::STA_INIT,
+                        environment,
+                    )
+                    .await?;
                     if mode.is_wpa2() {
                         let candidate = self.station.candidate.as_ref().ok_or(Error::State)?;
                         let body = self
@@ -1005,6 +1441,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     // A real host receipt is necessary but queued DMA must be
                     // copied under the still-closed capture generation first.
                     self.station.delivered_reply = Some(pending);
+                } else if matches!(pending.kind, Kind::Data) {
+                    let own = self.local().ok_or(Error::State)?;
+                    self.station.tx_status(&pending.bytes, now, own)?;
                 }
             }
         }
@@ -1014,6 +1453,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .candidate
             .as_ref()
             .map(|candidate| candidate.bss.bssid);
+        if self.station.receive_open() {
+            self.station.service_ba(now, own)?;
+        }
         let mut idle = false;
         for _ in 0..64 {
             let step = self.poll_receive_step()?;
@@ -1024,6 +1466,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             let Some(frame) = step.packet else {
                 continue;
             };
+            // _rtl88ee_translate_rx_signal_stuff → rtl_process_phyinfo.
+            if let (Some(pwdb), Some(bssid)) = (frame.pwdb(), peer) {
+                if super::super::rate_adaptive::matches_bssid(frame.bytes(), bssid) {
+                    self.station.ra.sample(pwdb);
+                }
+            }
             if let Ok(candidate) = Candidate::receive(&frame, own, self.station.ht.is_some()) {
                 if self.station.phase == Phase::Passive {
                     self.cache_candidate(candidate, now);
@@ -1038,23 +1486,19 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             ) != association::phy::ApElements::parse(
                                 &old.bss.information_elements,
                             )
-                        || self.station.native_associated
-                            && self.station.wmm.is_some()
-                            && narf_wireless::wmm::Parameters::parse(
-                                &candidate.bss.information_elements,
-                            )
-                            .ok()
-                            .flatten()
-                                != self.station.wmm
                     {
                         return Err(Error::Profile);
+                    }
+                    if self.station.native_associated {
+                        self.update_station_edca(&candidate.bss.information_elements, environment)?;
                     }
                     self.station.last_peer = now;
                 }
                 continue;
             }
             let bytes = frame.bytes();
-            if bytes.len() < 24 || Some(bytes[10..16].try_into().unwrap()) != peer {
+            let bar = bytes.len() == 20 && bytes[0] == 0x84;
+            if bytes.len() < 24 && !bar || Some(bytes[10..16].try_into().unwrap()) != peer {
                 continue;
             }
             if matches!(bytes[0], 0xa0 | 0xc0)
@@ -1066,29 +1510,105 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 }
                 return Err(Error::PeerLost);
             }
+            let peer_address = peer.ok_or(Error::State)?;
             if bytes[0] == 0xd0
                 && self.station.ht_profile.is_some()
                 && self.station.receive_open()
-                && bytes.len() == 33
+                && bytes.len() >= 26
                 && bytes[1] & 0xc7 == 0
                 && bytes[4..10] == own
                 && bytes[16..22] == bytes[10..16]
                 && bytes[22] & 15 == 0
-                && bytes[24..26] == [3, 0]
+                && bytes[24] == 3
             {
-                let p = u16::from_le_bytes([bytes[27], bytes[28]]);
-                if p & 2 != 0 && (p >> 2) & 15 < 8 && bytes[31] & 15 == 0 && (p >> 6) != 0 {
-                    if self.station.controls.len() == 8 {
-                        return Err(Error::Allocation);
+                match bytes[25] {
+                    // ieee80211_process_addba_request; the response A-MSDU bit
+                    // follows SUPPORTS_AMSDU_IN_AMPDU, which rtlwifi sets.
+                    0 if bytes.len() >= 33 => {
+                        if self.station.controls.len() == 8 {
+                            return Err(Error::Allocation);
+                        }
+                        let token = bytes[26];
+                        let p = u16::from_le_bytes([bytes[27], bytes[28]]);
+                        let timeout = u16::from_le_bytes([bytes[29], bytes[30]]);
+                        let ssn = u16::from_le_bytes([bytes[31], bytes[32]]) >> 4;
+                        let (status, tid, buf) =
+                            self.station.addba_request(token, p, timeout, ssn, now);
+                        let params = (buf << 6) | (u16::from(tid) << 2) | 2 | 1;
+                        let mut response = action_header(peer_address, own);
+                        response.extend_from_slice(&[3, 1, token]);
+                        response.extend_from_slice(&status.to_le_bytes());
+                        response.extend_from_slice(&params.to_le_bytes());
+                        response.extend_from_slice(&timeout.to_le_bytes());
+                        self.station.controls.push_back(response);
                     }
-                    let mut response = vec![0xd0, 0, 0, 0];
-                    response.extend_from_slice(&bytes[10..16]);
-                    response.extend_from_slice(&own);
-                    response.extend_from_slice(&bytes[10..16]);
-                    response.extend_from_slice(&[0, 0, 3, 1, bytes[26], 37, 0]);
-                    response.extend_from_slice(&(p & !1).to_le_bytes());
-                    response.extend_from_slice(&bytes[29..31]);
-                    self.station.controls.push_back(response);
+                    1 if bytes.len() >= 33 => {
+                        let token = bytes[26];
+                        let status = u16::from_le_bytes([bytes[27], bytes[28]]);
+                        let p = u16::from_le_bytes([bytes[29], bytes[30]]);
+                        let timeout = u16::from_le_bytes([bytes[31], bytes[32]]);
+                        self.station.addba_response(token, status, p, timeout, now);
+                    }
+                    // ieee80211_process_delba: initiator set tears down our
+                    // recipient session; clear ends our originator session
+                    // (AGG_STOP_PEER_REQUEST, no DELBA of our own).
+                    2 if bytes.len() >= 30 => {
+                        let p = u16::from_le_bytes([bytes[26], bytes[27]]);
+                        let tid = usize::from(p >> 12) & 7;
+                        if p & (1 << 11) != 0 {
+                            if let Some(session) = self.station.rx_ba[tid].take() {
+                                session.reorder.retire();
+                            }
+                        } else {
+                            self.station.tx_ba[tid] = None;
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            // ieee80211_rx_h_ctrl BlockAckReq: release up to its SSN, refresh
+            // the session timer; a BAR for a TID without a session sends one
+            // recipient DELBA QSTA_REQUIRE_SETUP per TID.
+            if bar {
+                if bytes[4..10] != own
+                    || self.station.ht_profile.is_none()
+                    || !self.station.receive_open()
+                {
+                    continue;
+                }
+                let control = u16::from_le_bytes([bytes[16], bytes[17]]);
+                let tid = control >> 12;
+                let ssn = u16::from_le_bytes([bytes[18], bytes[19]]) >> 4;
+                match self
+                    .station
+                    .rx_ba
+                    .get_mut(usize::from(tid))
+                    .and_then(Option::as_mut)
+                {
+                    Some(session) => {
+                        if session.timeout_tu != 0 {
+                            session.last_rx = now;
+                        }
+                        let released = session
+                            .reorder
+                            .advance(ssn, now.saturating_mul(1_000_000))
+                            .unwrap_or_default();
+                        self.station.release(released)?;
+                    }
+                    None if self.station.unexpected_ba & (1 << tid) == 0 => {
+                        if self.station.controls.len() == 8 {
+                            return Err(Error::Allocation);
+                        }
+                        self.station.unexpected_ba |= 1 << tid;
+                        self.station.controls.push_back(delba(
+                            peer_address,
+                            own,
+                            tid,
+                            REASON_REQUIRE_SETUP,
+                        ));
+                    }
+                    None => {}
                 }
                 continue;
             }
@@ -1100,14 +1620,40 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             let data = self.station.phase == Phase::Open
                 && (bytes[0] == 8 || self.station.wmm.is_some() && bytes[0] == 0x88);
             if management || key && self.station.phase != Phase::Passive || data {
-                if self.station.incoming.len() == 64 {
+                if self.station.incoming.len() >= 64 {
                     return Err(Error::Allocation);
                 }
-                self.station.incoming.push_back(Captured {
+                // ieee80211_rx_reorder_ampdu: unicast QoS DATA from the peer
+                // on a session TID is ordered before CCMP/PN and delivery.
+                let session_tid = (data
+                    && bytes[0] == 0x88
+                    && bytes.len() >= 26
+                    && bytes[1] & 3 == 2
+                    && bytes[4..10] == own
+                    && bytes[22] & 15 == 0)
+                    .then_some(usize::from(bytes[24] & 15))
+                    .filter(|tid| self.station.rx_ba.get(*tid).is_some_and(Option::is_some));
+                let sequence = u16::from_le_bytes([bytes[22], bytes[23]]) >> 4;
+                let aggregated = frame.aggregated();
+                let captured = Captured {
                     admitted: self.station.receive_open(),
                     epoch: self.station.epoch.load(Ordering::Acquire),
                     frame,
-                });
+                };
+                if let Some(tid) = session_tid {
+                    if let Some(session) = self.station.rx_ba[tid].as_mut() {
+                        session.last_rx = now;
+                        let released = session
+                            .reorder
+                            .push(sequence, now.saturating_mul(1_000_000), captured)
+                            .unwrap_or_default();
+                        self.station.release(released)?;
+                    }
+                } else if !aggregated {
+                    // A-MPDU membership without an accepted session is refused
+                    // before CCMP/PN.
+                    self.station.incoming.push_back(captured);
+                }
             }
         }
         if idle {
@@ -1287,6 +1833,90 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         Ok(idle)
     }
+    /// `rtl88ee_update_hal_rate_mask` for the bound AP at `level`, from
+    /// the association's legacy intersection (`supp_rates[0]`) and HT
+    /// TX MCS set (`ht_cap.mcs.rx_mask[0]`). SGI is never offered: the
+    /// LGI-only profile refuses an AP SGI20 join.
+    async fn install_station_rate_mask(
+        &mut self,
+        level: u8,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        let (rates, _) = self
+            .station
+            .plan
+            .as_ref()
+            .ok_or(Error::State)?
+            .legacy_rates();
+        let mcs = self.station.ht_profile.map(|profile| profile.tx_mcs()[0]);
+        let payload = super::super::rate_adaptive::rate_mask(rates, mcs, level, false);
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .ok_or(Error::State)?
+            .clone();
+        let ht = self.station.ht.clone();
+        let permission = self.permission.ok_or(Error::State)?;
+        super::super::ht::wait(
+            base,
+            ht,
+            permission,
+            environment,
+            self.install_rate_mask(payload, environment.admission().map(Arc::as_ref)),
+        )
+        .await?;
+        self.check_station_policy(environment)
+    }
+    /// `rtl88e_dm_watchdog` → `rtl88e_dm_refresh_rate_adaptive_mask`: every
+    /// `RTL_WATCHDOG_TIME`, outside firmware LPS, a linked station whose
+    /// smoothed PWDB crossed its hysteresis re-sends the mask at the new
+    /// level. Returns whether a mask was sent. Failure is terminal.
+    pub(crate) async fn refresh_station_rate_mask(
+        &mut self,
+        environment: &impl Environment,
+    ) -> Result<bool, Error> {
+        // Each watchdog pass re-proves the fallback grant (revocation
+        // returns DATA to the fixed rate without touching the link).
+        self.station.fallback_current();
+        if !self.station_linked()
+            || self.leisure()
+            || !self.transmit_ready()
+            || self.rate_mask().is_none()
+            || !self.station.ra.due(environment.now_ms())
+        {
+            return Ok(false);
+        }
+        let Some(level) = self.station.ra.refresh() else {
+            return Ok(false);
+        };
+        let result = self.install_station_rate_mask(level, environment).await;
+        if result.is_err() {
+            self.abort_station();
+        }
+        result?;
+        self.station.ra.commit(level);
+        Ok(true)
+    }
+    /// Whether ordinary DATA currently runs with firmware rate fallback.
+    pub(crate) fn station_fallback(&self) -> bool {
+        self.station.fallback.is_some()
+    }
+    /// Smoothed station PWDB (`dm.undec_sm_pwdb`) and RA level.
+    pub(crate) fn station_rate_state(&self) -> (i64, u8) {
+        (self.station.ra.smoothed(), self.station.ra.level())
+    }
+    /// Linux `rtl_lps_enter_core` link gate: associated, not
+    /// `being_setkey` (RSNA port open, no handshake frame outstanding).
+    pub(crate) fn station_linked(&self) -> bool {
+        self.station_peer().is_some()
+            && matches!(self.station.phase, Phase::Open)
+            && self
+                .station
+                .security
+                .as_ref()
+                .is_none_or(|security| security.port_open() && security.pending_frame().is_none())
+    }
     pub(crate) fn station_transmit_ready(&self) -> bool {
         self.station_peer().is_some()
             && self.station.pending.is_none()
@@ -1311,9 +1941,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             self.check_station_policy(environment)?;
             let own = self.local().ok_or(Error::State)?;
             let peer = self.station_peer().ok_or(Error::State)?;
+            // Classify before forming the header: the TID selects the AC
+            // ring/QSEL and is authenticated by CCMP's nonce priority.
+            let tid = self
+                .station
+                .wmm
+                .as_ref()
+                .map(|p| super::super::wmm::priority(bytes, p));
             let frame = if let Some(security) = &mut self.station.security {
-                if self.station.wmm.is_some() {
-                    security.transmit_ethernet_qos(bytes, 0)
+                if let Some(tid) = tid {
+                    security.transmit_ethernet_qos(bytes, tid)
                 } else {
                     security.transmit_ethernet(bytes)
                 }
@@ -1329,14 +1966,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 if protocol < 0x600 || matches!(protocol, 0x888e | 0x80f3 | 0x8137) {
                     return Err(Error::Profile);
                 }
-                let mut frame = vec![if self.station.wmm.is_some() { 0x88 } else { 8 }, 1, 0, 0];
+                let mut frame = vec![if tid.is_some() { 0x88 } else { 8 }, 1, 0, 0];
                 frame.extend_from_slice(&peer);
                 frame.extend_from_slice(&own);
                 frame.extend_from_slice(&bytes[..6]);
-                frame.extend_from_slice(&(self.station.sequence << 4).to_le_bytes());
-                self.station.sequence = (self.station.sequence + 1) & 4095;
-                if self.station.wmm.is_some() {
-                    frame.extend_from_slice(&[0, 0]);
+                let counter = match tid {
+                    Some(tid) => &mut self.station.qos_sequence[usize::from(tid)],
+                    None => &mut self.station.sequence,
+                };
+                frame.extend_from_slice(&(*counter << 4).to_le_bytes());
+                *counter = (*counter + 1) & 4095;
+                if let Some(tid) = tid {
+                    frame.extend_from_slice(&[tid, 0]);
                 }
                 frame.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
                 frame.extend_from_slice(&bytes[12..]);
@@ -1349,8 +1990,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         result
     }
+    /// Disassociation. A live owner with no device-owned frame leaves the
+    /// peer (`leave_station_peer`) and returns to Passive for a safe rejoin;
+    /// otherwise the terminal stop/quiesce path runs. Any failure aborts
+    /// the station and stops the packet engines.
     pub(crate) async fn disconnect_station(&mut self) -> Result<(), Error> {
-        if self.station.phase == Phase::Stopped {
+        if matches!(self.station.phase, Phase::Stopped | Phase::Passive) {
             return Ok(());
         }
         self.station.phase = Phase::Stopping;
@@ -1358,6 +2003,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.station.retire_receive();
         self.station.controls.clear();
         self.station.incoming.clear();
+        self.station.retire_ba();
         self.station.pmk = None;
         if let Some(security) = &mut self.station.security {
             security.fail();
@@ -1366,10 +2012,18 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             failed: self.station.failed.clone(),
             armed: true,
         };
-        let result = self.disconnect_station_peer().await.map_err(Error::Radio);
+        let rejoin = self.rejoinable();
+        let result = if rejoin {
+            self.leave_station_peer().await
+        } else {
+            self.disconnect_station_peer().await
+        }
+        .map_err(Error::Radio);
         attempt.armed = false;
         if result.is_err() {
             self.abort_station();
+        } else if rejoin {
+            self.station.reset_passive();
         } else {
             self.station.native_associated = false;
             self.station.phase = Phase::Stopped;

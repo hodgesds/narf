@@ -906,6 +906,7 @@ pub fn config_for(hw_rev: super::hw::HwRev) -> Option<&'static ControllerConfig>
         Qca6390Hw20 | Wcn6855Hw20 | Wcn6855Hw21 | Qca2066Hw21 | Qca6698aqHw21 => {
             Some(&ATH11K_MHI_CONFIG_QCA6390)
         }
-        Unknown => None,
+        // AHB / hybrid-bus parts have no MHI.
+        Ipq8074 | Ipq6018Hw10 | Ipq5018Hw10 | Wcn6750Hw10 | Unknown => None,
     }
 }

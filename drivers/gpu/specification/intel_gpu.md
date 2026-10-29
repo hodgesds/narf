@@ -1,17 +1,18 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.10** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.11** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
 > bounds/flush discipline landed — see §9; forcewake domains
 > landed — see §11; RC6 + DMC landed — see §12; suspend/resume
 > + D-state transitions landed — see §13; external DisplayPort
-> full single-stream landed — see §14).
+> full single-stream landed — see §14; multi-pipe
+> display + DP MST landed — see §16).
 >
-> Clean-room driver for Intel integrated graphics from Tiger Lake
-> through Meteor Lake. **No GPL Linux `i915` / `xe` source
-> consulted.**
+> Driver for Intel integrated graphics from Tiger Lake through Meteor Lake.
+> References include Intel PRMs and the cited MIT-licensed Linux i915 ABI,
+> command and register definitions.
 
 ## 1. Why this is feasible
 
@@ -108,8 +109,8 @@ the canonical bit definition without re-deriving it.
   rates, the DDI ↔ transcoder route latch (`TRANS_DDI_FUNC_CTL`).
   Source: TGL PRM Vol. 12 "Display DDI".
 - **`intel_gpu_gtt`** — 64-bit GTT page-table entry layout: phys
-  address bits, PRESENT, level-of-cache (LLC eLLC), age policy,
-  TC bits. Source: TGL PRM Vol. 5 "Memory Views".
+  separate GGTT / PPGTT address, permission and PAT fields;
+  Gen12 / Xe-LPG system-memory formats. Source: TGL PRM Vol. 5 "Memory Views".
 
 Codec layer is transport-agnostic — it produces the wire
 register values without performing the MMIO write. The
@@ -117,15 +118,14 @@ Stage-3 driver core consumes these codecs through the
 `Transport`-equivalent indirection used elsewhere in narf
 (direct MMIO in kernel mode, cap-mediated MMIO in userspace).
 
-### Stage 3 (future) — Display-only driver core
-- Wire GMBUS to `narf-graphics::edid::Edid::parse` for EDID
-  read-out on whatever DDI the firmware left active.
-  (The GMBUS transport itself landed in #1018; the session
-  wiring into the driver core is the remaining step.)
-- Compute pipe / transcoder timing from EDID detailed-timing
+### Stage 3 (partially landed) — Display-only driver core
+- Internal-panel takeover uses Pipe A / DDI A and reads EDID
+  over AUX. External HDMI sessions use GMBUS (§15).
+- Compute pipe / transcoder timing from an EDID detailed-timing
   block; program PIPE / TRANS / PLANE through the Stage-2 codec.
-- Take over scanout from UEFI GOP without re-training the link
-  (modeset to firmware-supplied mode).
+- Take over an enabled firmware Pipe A surface with link
+  retraining. Arbitrary firmware pipe / DDI routing and a
+  takeover preserving the trained link remain open.
 
 ### Stage 4 (partially landed) — Frame buffer + KMS
 - GTT entry table population from the Stage-2 codec.
@@ -135,9 +135,14 @@ Stage-3 driver core consumes these codecs through the
 
 ### Stage 5+ (partially landed) — 3D / compute (TGL only)
 - Command streamer (RCS0) ring submission — **landed** as the
-  execlists path in `intel_gpu_rcs` (§8). GGTT addressing only.
-- Remaining: PPGTT per-context page tables, media engines,
-  full 3D pipeline state. Out of scope for v1; the
+  execlists path in `intel_gpu_rcs` (§8), with GGTT batches and
+  attached-context PPGTT batches (§18).
+- PPGTT per-context page tables and media submission — **landed**
+  (§9, §18).
+- Remaining: GT initialization, complete context/completion/reset ownership,
+  Xe-LPG GuC submission and Mesa interoperability. The storage/context/query
+  UAPI and immutable residency admission are described in §19.
+  Out of scope for v1; the
   kernel-resident driver only needs a display surface plus
   batch submission.
 
@@ -269,6 +274,29 @@ DDI A / eDP, single pipe):
   carries real KMS mode state (CRTC 1, encoder 2 TMDS,
   connector 3 eDP) instead of the identity stub.
 
+Scanout handoff requires an enabled firmware Pipe A and a successful
+takeover mode. Panel power with no admitted mode allocates no internal
+surface and publishes no synthetic 1024×768 display. The owned scanout
+becomes active only after its primary-plane register program is armed.
+
+Takeover and relight share generation dispatch (Gen12 versus Xe-LPG),
+with Panther Lake refused before MMIO. Restore uses `modeset_fixed` on
+the selected orchestrator, preserving the saved timing used to size the
+new allocation even if EDID now advertises a different preferred mode.
+Plane geometry, pitch and the complete 32-bit GGTT surface extent are
+validated before pipeline teardown. This does not enable Xe-LPG PM or
+establish physical display/suspend acceptance.
+The external-session gate is separate: combo HPD enable/poll, DP, HDMI,
+MST and USB-C DP Alt Mode remain Gen12-only until their Xe-LPG port
+sequences exist. Unsupported generations return before HPD register
+access; enabling the Xe-LPG internal panel must not enable Gen12 ports.
+
+Intel-only crate builds (`--no-default-features --features intel`) and
+their `kernel-test` fixtures use vendor feature guards throughout shared
+DRM hooks and tests. AMD native placement admission cannot be constructed
+without its backend; generic DRM/DP fixtures and the registration census
+remain enabled. Intel media and MST modules likewise require `intel`.
+
 ### Lane Q6 (#1024) — display follow-ons
 
 - **DBUF_CTL power sequencing** — the modeset requests power
@@ -319,8 +347,14 @@ DDI A / eDP, single pipe):
 
 ## 8. Command submission (Stage 5 — `intel_gpu_rcs`)
 
-The RCS0 execlists engine for Gen12. Compiled only under the
-gpu crate's `intel` feature. Public interface:
+The RCS0 execlists engine model and kernel submission helper for Gen12.
+Compiled only under the GPU crate's `intel` feature. This is not a complete
+userspace render backend (see §19). The corrected Gen12 restore template has
+13 initial register pairs, engine-relative LRI selectors and extended render
+state groups, ending at dword 0xb9; XCS ends at 0x34. RING_CTL uses byte size
+minus one page (128 KiB encodes 0x1f001) and the CSB has 12 entries. Fixed
+source-cited vectors pin these values separately from the hardware model.
+Public interface:
 
 - `RcsEngine::new(mmio, alloc)` — allocate the engine status
   page, program `RING_HWS_PGA`, adopt the hardware CSB write
@@ -336,25 +370,31 @@ gpu crate's `intel` feature. Public interface:
 - `write_batch(dwords) -> BatchBuf` — GGTT batch allocation;
   the batch must end with `MI_BATCH_BUFFER_END`.
 - `submit(ctx, batch) -> request id` — appends
-  `MI_BATCH_BUFFER_START` (GGTT) + an `MI_STORE_DWORD_IMM`
-  breadcrumb (per-context seqno) to the ring, advances the
+  `MI_BATCH_BUFFER_START` (GGTT), a render-cache drain/stall and a separate
+  PIPE_CONTROL GGTT post-sync breadcrumb (XCS uses MI_FLUSH_DW), advances the
   image tail, and pumps the execlist ports. The context must
   be idle: this driver never patches an image the hardware
   may be restoring or saving, so re-submitting to a loaded
   context is `ContextBusy` (queued-but-unloaded contexts
   accept further submits and are covered together).
+- `submit_resident(ctx, ResidentBatch) -> ResidentSubmission` — owns arbitrary
+  PPGTT batch placement and its complete residency until verified retirement.
+  A resident context must have no queued or loaded work. Returns a request ID
+  and a cancellation-safe `CompletionFence`; see `spec.md` §3 for loss/reset.
 - `poll_completions() -> Vec<CompletedRequest>` — drains the
   Gen12 CSB from the engine status page (promote / preempt /
-  complete), retires requests, frees batch allocations, and
-  pumps the next ports. `wait_seqno` is the bounded-poll
-  wrapper. Production glue: `submit_dwords` /
+  complete), verifies the final breadcrumb and saved ring head, retires
+  requests, frees batch allocations, and
+  pumps the next ports. `wait_seqno_async` samples through timer awaits;
+  `wait_seqno` is its spin-safe sync bridge outside executor polls.
+  Production glue: `submit_dwords` /
   `poll_default_completions` attach lazily to the probed
   controller on a default context.
 - `attach_ppgtt(ctx, root_phys)` / `detach_ppgtt(ctx)` /
   `ppgtt_root(ctx)` — program a PPGTT root (§9) into the
-  context image's PDP3 pair. Idle-context discipline, like
+  context image's PDP0 pair. Idle-context discipline, like
   every image patch here: a loaded or covered context refuses
-  with `ContextBusy`; an unaligned or >39-bit root is
+  with `ContextBusy`, including queued requests; an unaligned or >46-bit root is
   `InvalidPpgttRoot`.
 
 Invariants:
@@ -364,19 +404,25 @@ Invariants:
   descriptor marks an empty port.
 - Contexts address via GGTT by default: descriptor mode
   Legacy-64B, PDP image fields zero, batch ASI = GGTT. With
-  a PPGTT root attached (§9) the PDP3 pair carries the root
+  a PPGTT root attached (§9) the PDP0 pair carries the raw root address
   and the hardware walk runs under the context; batch
-  allocations remain GGTT-backed and batch ASI stays GGTT
-  until a VA-batch consumer lands.
+  allocations from `write_batch` remain GGTT-backed; `submit_ppgtt` uses their
+  identity VA, whereas `submit_resident` uses the admitted arbitrary PPGTT VA.
 - A context's requests retire strictly in submission order;
   a preempted context's covered requests return to the queue
   front and are resubmitted, never retired early.
 - Every allocation (image / ring / HWSP / batch / status
   page) is arena-accounted; destroy and retirement return
   the arena to its prior balance.
+- Missing breadcrumb/head proof sets `CompletionLost` and stops publication
+  without completing fences or releasing resident tables/BOs. A context's CSB
+  software identity is not reused during the engine lifetime. Proven hardware
+  reset is the only alternate release path; pending fences report reset error.
+- Qword-aligned ring tails include wrap-padding in capacity checks. Hardware
+  release/acquire barriers order the submission doorbell and CSB publication.
 
 Flagged for first-silicon verification (single named
-constants in `intel_gpu_rcs`): `CSB_ENTRIES` = 8 (Gen11+
+constants in `intel_gpu_rcs`): `CSB_ENTRIES` = 12 (Gen11+
 CSB depth), `RCS_IMAGE_PAGES` = 48 (allocation bound above
 the hardware image size), and the descriptor Legacy-64B
 mode choice.
@@ -395,7 +441,7 @@ Public interface:
   allocated PML4 root page. `root_phys()` is the value a
   context programs as its PPGTT root (§8's
   `RcsEngine::attach_ppgtt`).
-- `map(mem, va, phys, pat, executable)` / `unmap(mem, va)` —
+- `map(mem, va, phys, pat, writable)` / `unmap(mem, va)` —
   4 KiB leaf mappings over the 48-bit VA space (levels
   PML4 → PDPT → PD → PT, 512 entries per table). Double
   mapping is `AlreadyMapped`; unmapping an absent VA is
@@ -438,11 +484,11 @@ Invariants:
   (§8); the media lane (#1022) is the named consumer that
   builds on per-context PPGTT.
 
-Flagged for first-silicon verification: in 4-level mode the
-execlists context's PDP3 pair carries the PML4 root (as a
-table entry, `phys | PRESENT`) and PDP0–PDP2 stay zero — the
-encoding `attach_ppgtt` writes (§8). It is a single patch
-site in `intel_gpu_rcs` if bring-up shows otherwise.
+In 4-level mode the context's **PDP0** pair carries the raw PML4
+physical address; PDP1–PDP3 remain zero. This is a register value,
+not a PTE. Source: MIT i915 `gt/intel_lrc_reg.h` ASSIGN_CTX_PML4
+and `gt/intel_lrc.c` lrc_update_regs (Linux v6.12). Native fixtures
+check the literal register image. Hardware acceptance remains open.
 
 
 ## 10. eDP panel power sequencing + PSR (Stage 5 — `intel_gpu_edp`, #1020)
@@ -795,8 +841,10 @@ and RC6/DMC conversations composed here.
 ### 13.1 Registration and census
 
 At probe success (Gen12-class parts only — the predicate
-is `region_generation().is_some()`, the same one the RCS
-attach uses; Xe-LPG is excluded until #1016), probe
+is `region_generation() == Some(RegionGeneration::Gen12)`;
+Xe-LPG has a region map and display engine since #1016 but
+no modelled forcewake/RC6/DMC programming, so it stays
+excluded), probe
 retains its `(BusDevice, Cap)` in the PM module and
 registers, both under the name `"intel-gpu"`: a
 `device_pm` ops pair (S3 fan-out) and a `SuspendStateHook`
@@ -1126,3 +1174,356 @@ no infoframes/SCDC — a follow-up, not filed here), YCbCr
 4:2:0 and deep colour (character rate ≠ pixel clock —
 the rate rule's premise is 8 bpc RGB), HDCP (separate
 programme), HDMI 2.1 FRL, Type-C HDMI alt mode.
+
+## 16. Multi-pipe display + DP MST (lane Q11 — `intel_gpu_multipipe`, `intel_gpu_mst`, #1017)
+
+Supersedes §14's "DP MST and multi-pipe" remainder. Compiled
+only under the gpu crate's `intel` feature. Sources: VESA
+DisplayPort 1.4a (§2.7.6 sideband messaging, §2.11 MST
+payload management, PBN accounting), TGL PRM Vol. 11 (DPLL,
+power wells), Vol. 12 (DBUF allocation, transcoder/DDI),
+Vol. 14 (plane watermarks). The sideband codec and topology
+manager are the vendor-neutral `dp_mst` / `dp_mst_mgr`
+modules (shared with the AMD MST consumer); this lane adds
+the Intel transport adapter, the pipe/DBUF substrate, and
+the session composition. No new initcalls: sessions ride
+the §14 HPD/initcall flow.
+
+### Multi-pipe substrate (`intel_gpu_multipipe`, `Modeset::for_pipe`)
+
+- **Pipe ownership.** Pipes A–C are allocatable; Pipe D is
+  refused (no power well in the Gen12 orchestrator map).
+  `PipeAllocator` hands a pipe to exactly one
+  `PipeOwner { ddi, used_for }` (`InternalPanel`,
+  `ExternalSst`, `ExternalMst`, `AltModeBridge`). Claims are
+  idempotent for the same owner, owner-only on release; the
+  process-global registry (`PIPE_ALLOCATOR`) is the single
+  arbiter between the internal panel, SST sessions, MST
+  streams, and Alt-Mode bridge sessions. Probe claims Pipe A
+  for the internal panel when takeover produced a mode.
+- **Per-pipe modeset.** `Modeset::for_pipe(pipe)` binds the
+  pipe, its same-index transcoder, its power well (PG2/PG3/
+  PG4 for pipes A/B/C — the i915 ICL+ domain map), and its
+  DPLL index (DDI A→DPLL0, B→DPLL1, C→DPLL2; TC DDIs D–H
+  share DPLL0 historically — TC PHY PLL programming is a
+  named remainder). `Modeset::new` is `for_pipe(Pipe::A)`
+  and the single-pipe register sequence is byte-identical
+  to the pre-lane orchestrator.
+- **Per-pipe GGTT scanout windows.** Windows are strided
+  32 MiB apart from `SCANOUT_GTT_OFFSET_PIPE_A`
+  (A 0x1000000, B 0x3000000, C 0x5000000) via
+  `alloc_contiguous_scanout_at`, so concurrent sessions
+  never share a scanout block.
+- **DBUF partition.** The partition covers 1024 blocks
+  (slice S1; PRM Vol. 12: S1 alone = 1024, S1+S2 = 2048).
+  Q6 (#1024) now powers both slices at modeset, but the
+  multi-pipe split stays within S1 — using S2 and the PRM
+  slice-assignment table are named remainders. With ≥2
+  active pipes the coordinator
+  (`reprogram_dbuf_shares`) partitions the 1024 blocks into
+  contiguous equal shares over the sorted active set and
+  reprograms each pipe's PLANE_BUF_CFG / PLANE_WM level 0
+  from its share. A lone pipe keeps the preboot programming
+  untouched; when the active set drops back to one pipe the
+  survivor keeps its last share until its next modeset.
+  A pipe with an explicit share is programmed in the
+  preboot shape at its share's size; a lone pipe (no share)
+  runs Q6 (#1024)'s latency-based watermark algorithm over
+  the whole DDB on its own pipe, falling back to the preboot
+  values as before.
+
+### MST session (`intel_gpu_mst`)
+
+- **Transport.** `IntelMstAux` implements the manager's
+  `MstAux` trait over `IntelAux`, chunking every transfer
+  at the 16-byte native AUX limit. `MstLink` owns one DDI's
+  `dp_mst_mgr::Manager`, the negotiated caps, the trained
+  link, a per-hop available-PBN ledger seeded from
+  ENUM_PATH_RESOURCES at probe, and the live stream set.
+- **Stream lifecycle.** `add_stream` refuses locally —
+  before any modeset or allocation traffic — when the
+  stream's PBN exceeds any hop's ledger availability
+  (`InsufficientBandwidth { needed_pbn, available_pbn }`).
+  The primary stream trains the link via
+  `Modeset::modeset_mst_primary` (TRANS_DDI_FUNC_CTL DP-MST
+  mode); secondary streams reuse the trained link via
+  `modeset_mst_secondary` and never touch the shared link
+  blocks (DPLL, DPCLKA, BUF_TRANS, training, DDI buffer).
+  Payload commit order per stream: source payload-table
+  entry (`write_payload` part 1), then ALLOCATE_PAYLOAD to
+  the end branch (part 2); a partial grant (granted ≠
+  requested) is a refusal. Any failure rolls back in
+  reverse — payload deallocation and table clear, then
+  modeset teardown (full teardown + untrain only when no
+  stream survives; otherwise a pipe-scoped
+  `teardown_stream`) — so a refused or failed stream never
+  disturbs a live one. `remove_stream` deallocates,
+  clears the table entry, tears down, credits the ledger,
+  and compacts surviving streams' table slots back to
+  dense (slot 0 is the MTP header; VCPIs are 1..=63).
+- **Notifications.** Up requests drained on the HPD
+  RetrainRequired path surface as `MstEvent`s;
+  RESOURCE_STATUS_NOTIFY additionally updates the ledger
+  entry for the notifying branch's port.
+- **Failure discipline.** Sideband timeouts, NAKs, and
+  malformed replies are the manager's typed errors,
+  wrapped unchanged (`MstError::Mgr`); AUX failures stay
+  `MstError::Aux`. A DDI whose sink lacks MST capability
+  (DPCD rev < 1.2 or MSTM_CAP clear) falls back to the §14
+  SST session. An HPD disconnect tears streams down in
+  reverse order, disconnects the manager, and releases
+  the pipes.
+
+Named remainders: per-stream MST display audio, DSC/FEC
+over MST, TC PHY PLL programming for DDI D–H, DBUF slice
+S2, fb-console publication staying single-slot (last HPD
+wins; per-pipe publication is a console-layer decision),
+and the Alt-Mode bridge holding its pipe claim for the
+session lifetime (the bridge trait has no exit hook).
+## 17. Xe-LPG display — Meteor Lake (lane Q10, #1016)
+
+Meteor Lake's display engine is Xe-LPG, a different IP block
+from Gen12's Xe-LP. Before this lane, probe identified MTL SKUs
+but the takeover path ran the Gen12 sequence at them; lane 1
+gated MTL/PTL to identify-and-skip, and this lane implements
+the real Xe-LPG path. Sources are the Meteor Lake display PRM
+(§2) as implemented by i915 — `intel_cx0_phy_regs.h`,
+`intel_cx0_phy.c`, `intel_cdclk.c`, `intel_ddi.c`,
+`intel_display_power_map.c` — never the Gen12 code being
+diverged from.
+
+Structure: dispatch is by generation at the single takeover
+entry (`intel_gpu_modeset::takeover_display`). Gen12 silicon
+runs the Gen12 orchestrator byte-identically; Meteor Lake runs
+`intel_gpu_modeset_xelpg::XeLpgModeset`. The pipe / transcoder /
+plane register block did not move, so both orchestrators build
+those programs from the shared `intel_gpu_pipes` codecs.
+
+### 10.1 Port / PHY map
+
+| Port | BAR0 block | PHY | TRANS_CLK_SEL idx | TRANS_DDI_FUNC_CTL idx | AUX well (AUX2) |
+| ---- | ---------- | --- | ----------------- | ---------------------- | --------------- |
+| DDI A | 0x64000 | C10 | 0 | 0 | AUX_A (0) |
+| DDI B | 0x64100 | C10 | 1 | 1 | AUX_B (1) |
+| TC1 | 0x16F200 | C20 | 2 | 9 | AUX_USBC1 (3) |
+| TC2 | 0x16F400 | C20 | 3 | 10 | AUX_USBC2 (4) |
+
+Port register offsets are per-port absolutes, not a uniform
+stride (e.g. the message-bus timer sits at +0xD8 on DDI A/B but
++0x58 on the TC ports). `DDI_CLK_VALFREQ` exists only on the
+C10 ports; C20 carries its rate in the PHY's serdes-rate VDR.
+
+### 10.2 PHY programming (C10 / C20)
+
+The port PLLs live inside the PHYs and are programmed over a
+per-lane message bus (`M2P_MSGBUS_CTL` / `P2M_MSGBUS_STATUS`):
+write transactions are committed or uncommitted, every
+transaction is followed by a bus reset, and an ACK whose
+command type doesn't match the transaction — or any answer
+with the error bit set — fails the modeset with
+`ModesetError::PhyBusFailure` rather than programming through
+a wrong-generation PHY. C10 state is a 20-byte PLL table plus
+CMN/TX bytes; C20 state lives in SRAM contexts (the program
+writes the context the serdes toggle bit does not select,
+then flips the bit). TX signal levels are VDR override
+registers (SNPS preset tables), staged before training and
+re-applied with the trained levels after. PLL enable order:
+port clock control (MAXPCLK select, SSC PLLB for the MPLLB
+tables) → lane reset + powerdown staging (P2 reset, then P0
+active) → PLL state → per-TX single-TX disables →
+`DDI_CLK_VALFREQ` (C10 only) → PCLK PLL request/ACK. Every MTL
+port also traverses the die-to-die (D2D) link, enabled
+unconditionally in the retrain preamble.
+
+### 10.3 Power wells and CDCLK
+
+Xe-LPD well topology (`PWR_WELL_CTL2` = 0x45404,
+`PWR_WELL_CTL_AUX2` = 0x45444, HSW request/state encoding):
+PW_1 (idx 0, transcoder A + DDI A/B) → PW_A (idx 5, pipe A) →
+the port's AUX well. CDCLK runs on the fixed 38.4 MHz MTL
+reference: six rungs (172.8–652.8 MHz), the two lowest reached
+by squash waveforms programmed in `CDCLK_SQUASH_CTL`; the
+modeset raises CDCLK to the `pixel_clock ≤ 2 × CDCLK` floor
+and never lowers a faster firmware setting. The current-CDCLK
+readback decodes ratio + divider + squash popcount — under
+squash the CDCLK_CTL decimal field is nominal and is not
+trusted.
+
+### 10.4 Gates and named remainders
+
+- `display_supported()`: Gen12 + Meteor Lake. **Panther Lake
+  stays off** — Xe3-LPD is a different display IP generation
+  (widened clock-select fields, different PLL tables and DDI
+  arrangement); the MTL sequence must not claim it.
+- `backlight_supported()`: Gen12 only. MTL's PWM path belongs
+  to the backlight composition lane (PR #1037); the modeset
+  shipping first must not claim a backlight it cannot drive.
+- Region enumeration: `RegionGeneration::XeLpg` — display at
+  0x40000/0x40000 plus the TC block at 0x16F000/0x1000, and
+  **no DPLL region** (Xe-LPG has no DPLL block; Gen12's DPLL
+  range is the TC block here).
+- Not programmed by this lane: watermark / DBUF allocation
+  (i915 computes MTL allocations from pcode latency tables;
+  firmware's allocation is retained), HDMI PLL states, DP 2.0
+  UHBR rates (the DP stack tops out at HBR3), MST / multi-pipe,
+  DVFS/pcode notifications around CDCLK changes, and
+  per-iteration TX-level updates inside the DPCD training loop
+  (would need a source-side callback in the shared
+  `dp_link_training`; levels are staged before training and
+  re-applied after, the same simplification class as Gen12's
+  preloaded DDI_BUF_TRANS table).
+- §5's device table is unchanged by this lane: the MTL DIDs
+  were already in the census; only their display gate moved.
+## 18. Media engines — VCS / VECS (`intel_gpu_media`, #1022)
+
+The Gen12 media engines brought to the §8 (RCS0) standard.
+The execlists machinery of §8 is shared, not forked:
+`intel_gpu_rcs` is generalised over an `EngineSpec` (register
+base, descriptor engine class + instance, context-image
+allocation bound, render-group presence), and each media
+engine is an `RcsEngine` instantiated over its spec. Compiled
+only under the gpu crate's `intel` feature; no new initcalls
+(the engines attach lazily like RCS). Sources: TGL PRM
+Vol. 2c (engine register blocks), cross-checked against
+i915's `intel_gt_regs.h` (Gen11 media ring bases),
+`intel_engine_cs.c` (engine table, per-class context sizes),
+`intel_lrc.c` (descriptor upper-dword construction; the
+Gen12 XCS register-state offset table), and `i915_reg.h`
+(Gen11 media forcewake sub-domain registers).
+
+Public interface:
+
+- Engine table — `VCS0_SPEC` (base `0x1c0000`, video-decode
+  class 1, instance 0), `VCS1_SPEC` (base `0x1c4000`, class
+  1, instance 1), `VECS0_SPEC` (base `0x1c8000`,
+  video-enhance class 2, instance 0);
+  `GEN12_MEDIA_ENGINES` and `media_engines_for(gen)` are the
+  inventory. The probe path announces exactly this set for a
+  probed Gen12 part; no engine-query UAPI exists in the tree
+  yet, and none is claimed here.
+- Descriptor — `context_descriptor_for(spec, lrca, sw_id)`
+  in `intel_gpu_rcs`: SW id at bits 37:47, engine instance
+  at bits 48:53, engine class at bits 61:63 with the
+  Gen12-era i915 class numbering (render 0, video decode 1,
+  video enhance 2, copy 3, other 4). The RCS descriptor is
+  the class-0/instance-0 special case and is byte-identical
+  to its pre-generalisation form.
+- Register state — `build_reg_state_for(spec, …)`: the
+  shared PRM ENGINE CONTEXT layout at the engine's own base.
+  The one structural delta from RCS: group 2
+  (`R_PWR_CLK_STATE`) is render-only (i915's Gen12 XCS
+  offset table has no third group), so media templates
+  leave those dwords zero. Media image allocation bound is
+  4 pages over the 2-page non-render hardware image
+  (`GEN8_LR_CONTEXT_OTHER_SIZE`).
+- VA batches — `RcsEngine::submit_ppgtt` (§8's engine, any
+  spec): the batch-start carries the PPGTT address-space
+  indicator, the batch is addressed at the VA equal to its
+  GGTT offset (identity placement over the GGTT arena), and
+  submission refuses with `PpgttNotAttached` when the
+  context carries no root from §9's `attach_ppgtt`. This is
+  the VA-batch step §8/§9 deferred to this lane.
+- Forcewake — `MediaForcewake`: refcounted holds over the
+  Gen11 media sub-domains (`VdBox(n)` request `0xa540 + 4n`,
+  ack `0x0d50 + 4n`; `VeBox(n)` request `0xa560 + 4n`, ack
+  `0x0d70 + 4n`), masked-write protocol with the
+  aggregate-domain discipline (poll-counted ack budget,
+  one clear→set re-kick, rollback on timeout). Production
+  submissions and engine bring-up run inside the engine's
+  sub-domain hold; completion polling takes none (the CSB
+  is host memory). Composition with the aggregate MEDIA
+  domain of #1013 is at the marked seam in
+  `submit_media_dwords` — the sub-domain hold nests inside
+  it once that lane lands.
+- Production glue — `submit_media_dwords(engine, dwords)` /
+  `poll_media_completions(engine)` over `MediaEngineId`,
+  mirroring §8's glue. Every production engine on the
+  controller allocates from the one arena
+  (`intel_gpu_rcs::production_arena`), so objects never
+  alias across engines.
+
+Invariants:
+
+- One engine's contexts, rings, status page and doorbell
+  never alias another's: the fixtures run all three engines
+  concurrently over one arena and one register file and
+  assert per-engine descriptors, completions and
+  breadcrumbs; a wedged engine (hardware never posts CSB)
+  does not block a peer's submissions or completions.
+- A failed forcewake acquire holds nothing; a media
+  submission's doorbell is always inside a held sub-domain
+  (fixture-pinned write order).
+- The generalised §8 paths are regression-pinned: the RCS
+  descriptor and RCS register-state template are asserted
+  byte-identical to their pre-generalisation forms, and the
+  existing §8 fixtures pass unchanged.
+
+Flagged for first-silicon verification: the per-SKU media
+engine set (a part with an engine fused off is still listed
+— the media fuse readout that trims the table is not
+modelled); the 4-page media image bound; and the descriptor
+class numbering's era (later i915 trees renumbered their
+internal class enum — the Gen12 execlists construction
+governs here). BCS0 (copy, base `0x22000`) is one more
+`EngineSpec` away and deliberately out of this lane's
+scope; MTL media belongs to the Xe-LPG GT generation and is
+not claimed.
+
+
+## 19. Render UAPI and 3D admission (in progress)
+
+The public contract is `spec.md` §3, "Intel render UAPI and address-space
+admission". The modules are `intel_gpu_uapi` (wire definitions),
+`intel_gpu_gem` (owned system memory), `intel_gpu_render` (per-open dispatcher,
+contexts, VM handles and queries) and `intel_gpu_exec` (softpin admission and
+immutable PPGTT residency). Same-card PRIME shares owned objects and stable,
+globally distinct mmap offsets; foreign attachments/sync-file imports are
+unavailable. Both primary and render nodes route these requests
+before shared DRM/KMS dispatch and acquire mmap backing atomically.
+
+This is **not a working Mesa 3D backend**. Validated execbuffer requests still
+return NotImplemented. No userspace engines or acceleration capabilities are
+advertised. Gen12 production execlists helpers no longer admit Meteor/Arrow
+Lake merely because those devices have a region map. The Xe-LPG GT/GuC owner
+still needs firmware upload/authentication, context registration, scheduling,
+completion and hardware reset integration.
+`intel_gpu_guc` now supplies validated CSS component ranges and coherent CTB
+send/receive primitives. `intel_gpu_guc_firmware` acquires a bounded immutable
+MTL/Arrow GuC-70 image through invoked registry/blob capabilities, preserving
+its identity. `intel_gpu_guc_transport` owns coherent GGTT CT memory and the
+graphics-GuC MMIO registration/enable/disable state machine. Its partial
+registration, timeout and broken-CT paths retain allocations until disable
+acknowledgment or proven reset. These do not upload/authenticate or schedule
+firmware by themselves. Gen12 owned resident submission, cache-flushed
+post-sync breadcrumbs, terminal fences and loss retention now have native
+hardware models; full GT/context setup, topology, hardware reset, accelerated
+PRIME/presentation and real Mesa acceptance remain outstanding.
+
+The memory audit corrected previous x86-like GPU PTE assumptions. Gen12
+PPGTT PAT bits are 3,4,7 and Xe-LPG adds bit62; Xe-LPG GGTT uses bits52,53.
+Gen12 system GGTT has no PAT bits. Intermediate PPGTT entries include RW;
+context PDP0 holds a raw physical address. No GPU NX/LRU permission is claimed.
+The common physical range is conservatively bounded to 46 bits. PAT numeric
+indices do not define cache policy: the eventual GT owner must program it.
+
+Native Rust fixtures use literal ABI/PTE vectors, fault-contained user-memory
+models, cross-open ownership failures, copy-failure rollback, extension cycles,
+query sizing/item errors, hostile residency placement and actual production
+PPGTT ownership after GEM/fd close. They do not establish silicon or Mesa
+interoperability.
+
+Primary references:
+
+- [Linux DRM i915 uAPI](https://docs.kernel.org/gpu/driver-uapi.html#drm-i915-uapi),
+  and the MIT `include/uapi/drm/i915_drm.h` wire definitions.
+- [Intel GPU page-table fields](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/i915/gt/intel_gtt.h),
+  MIT; fixed encoding vectors also follow `gen8_ppgtt.c` and `intel_ggtt.c`.
+- [Logical context root registers](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/i915/gt/intel_lrc_reg.h), MIT.
+- [GuC/HuC firmware layout](https://docs.kernel.org/gpu/xe/xe_firmware.html),
+  required background for the Xe-LPG firmware owner; no loader is claimed here.
+- [Gen12 render and XCS completion streams](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/i915/gt/gen8_engine_cs.c),
+  MIT command ordering and generation workarounds, with `gen8_engine_cs.h` and
+  `intel_gpu_commands.h` bitfields.
+- [GuC CT registration](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/i915/gt/uc/intel_guc_ct.c),
+  MIT; `intel_guc.c` and the actions/KLV/message ABI headers specify the MMIO
+  mailbox, receive-first registration and CONTROL_CTB acknowledgment protocol.

@@ -244,6 +244,9 @@ impl Bench {
             },
         };
         let model = Arc::new(Model(IrqSafeSpinLock::new(State::default())));
+        // Representative Navi22 GB_ADDR_CONFIG: 8 pipes / 8 packers,
+        // 256-byte interleave and 2 compressed fragments.
+        model.0.lock().mem.insert(0x263e, 0x343);
         let attached = model::attach(regs.virt, model.clone());
         let ip = |hw_id, v: (u8, u8, u8), bases: &[u32]| {
             let mut base_addrs = [0; d::MAX_BASE_ADDRS];
@@ -476,6 +479,8 @@ pub(crate) struct DpSink {
     pub feature: u8,
     /// Receiver caps at DPCD 0x0 (and, with bit 7 of 0xE, at 0x2200).
     pub caps: [u8; 16],
+    /// MSTM_CAP (DPCD 0x21).
+    pub mstm_cap: u8,
 }
 impl DpSink {
     pub fn new(model: Arc<Model>) -> Self {
@@ -485,6 +490,7 @@ impl DpSink {
             fail_rates: Vec::new(),
             feature: 0,
             caps: dpcd(0x12),
+            mstm_cap: 0,
         }
     }
 }
@@ -510,6 +516,8 @@ impl crate::amdgpu_dcn30_dp::Aux for DpSink {
                 0x204 | 0x200e if locked => 0x01,
                 0x600 => *self.dpcd.get(&0x600).unwrap_or(&1),
                 0x2210 => self.feature,
+                0x021 => self.mstm_cap,
+                0x111 => *self.dpcd.get(&0x111).unwrap_or(&0),
                 _ => 0,
             };
         }

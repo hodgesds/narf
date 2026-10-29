@@ -1,4 +1,4 @@
-//! RTL8188EU WMM admission: source conf_tx/set_aifs, fixed BE/TID0 only.
+//! RTL8188EU WMM admission: source conf_tx/set_aifs over all four ACs.
 use super::{
     device_init::Factory,
     power_policy::{Calibration, Permission},
@@ -158,4 +158,12 @@ impl Proof {
         })
         .await
     }
+}
+/// `rtl8xxxu_conf_tx` REG_ACM_HW_CTRL bits: BK0, BE1, VI2, VO3 per AC ACM.
+/// Parameters use canonical ACI order BE, BK, VI, VO.
+pub(super) fn acm_bits(p: Parameters) -> u8 {
+    [(0usize, 2u8), (1, 1), (2, 4), (3, 8)]
+        .into_iter()
+        .filter(|&(ac, _)| p.ac[ac].admission_control)
+        .fold(0, |bits, (_, bit)| bits | bit)
 }

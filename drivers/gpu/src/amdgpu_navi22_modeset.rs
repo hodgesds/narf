@@ -48,7 +48,7 @@ use crate::{
     amdgpu_dcn30_dp_link as dp_link,
     amdgpu_dcn30_hdmi::{self as hdmi, DigMode, Hdmi},
     amdgpu_dcn30_hubbub::{self as hubbub, Hubbub},
-    amdgpu_dcn30_takeover::{self as takeover, Inherited, Regs, Takeover},
+    amdgpu_dcn30_takeover::{self as takeover, Inherited, IpRequest, Regs, Takeover},
     amdgpu_dcn_hubp::{Hubp, Surface},
     amdgpu_dcn_otg::{GlobalSync, Otg},
     amdgpu_dcn_plane::{Dpp, Encoding, Mpc, Opp},
@@ -283,6 +283,7 @@ pub struct Resources {
     /// PLL runs, and the DSC engines in use.
     pll_sharers: [u8; PLLS as usize],
     pll_timing: [Option<Timing>; PLLS as usize],
+    pll_format: [Option<(hdmi::Format, u32)>; PLLS as usize],
     dscs: u8,
 }
 fn first_free(used: u8, count: u8) -> Option<u8> {
@@ -297,6 +298,7 @@ impl Resources {
             plls: 0,
             pll_sharers: [0; PLLS as usize],
             pll_timing: [None; PLLS as usize],
+            pll_format: [None; PLLS as usize],
             dscs: 0,
         }
     }
@@ -366,6 +368,27 @@ impl Resources {
 /// (Navi48's policy: HPD asserted, EDID read, DPCD read). Report order is
 /// VBIOS table order.
 pub fn choose(reports: &[Report]) -> Option<(Connector, &Sink)> {
+    let prefer = match PREFER.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => Some(Signal::Hdmi),
+        2 => Some(Signal::DisplayPort),
+        _ => None,
+    };
+    choose_preferring(reports, prefer)
+}
+/// `amdgpu.rdna2_connector`: 0 Linux's order, 1 HDMI, 2 DisplayPort.
+static PREFER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// Set once from the boot options, before the first modeset.
+pub fn set_connector_preference(prefer: crate::amdgpu_rdna2::options::Connector) {
+    use crate::amdgpu_rdna2::options::Connector as C;
+    let v = match prefer {
+        C::Any => 0,
+        C::Hdmi => 1,
+        C::DisplayPort => 2,
+    };
+    PREFER.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+/// [`choose`] with `prefer`'s kind of sink first, when one is connected.
+pub fn choose_preferring(reports: &[Report], prefer: Option<Signal>) -> Option<(Connector, &Sink)> {
     let connected = |want: Signal| {
         reports.iter().find_map(|r| match &r.detection {
             Detection::Connected(sink)
@@ -378,7 +401,8 @@ pub fn choose(reports: &[Report]) -> Option<(Connector, &Sink)> {
             _ => None,
         })
     };
-    connected(Signal::Hdmi).or_else(|| connected(Signal::DisplayPort))
+    let first = prefer.and_then(connected);
+    first.or_else(|| connected(Signal::Hdmi).or_else(|| connected(Signal::DisplayPort)))
 }
 
 /// Underflow status as the hardware latched it.
@@ -485,21 +509,31 @@ pub(crate) fn hdmi_stream(
     soc: &dml30::Soc,
     limits: hdmi::Limits,
 ) -> Option<hdmi::Stream> {
+    hdmi_stream_with(sink, timing, soc, limits, hdmi::OutputSettings::default())
+}
+fn hdmi_stream_with(
+    sink: &Sink,
+    timing: &Timing,
+    soc: &dml30::Soc,
+    limits: hdmi::Limits,
+    settings: hdmi::OutputSettings,
+) -> Option<hdmi::Stream> {
     use crate::amdgpu_navi48_boot as navi48;
     let limits = hdmi::Limits {
         max_phy_khz: limits.max_phy_khz.min(soc.max_phyclk_khz),
         ..limits
     };
-    hdmi::stream_for(
+    hdmi::stream_with_settings(
         &sink.edid,
         timing,
-        navi48::max_bpc(),
+        settings,
         navi48::limited_range(navi48::broadcast_rgb()),
         limits,
     )
 }
 /// [`select`] with the whole stream, or exactly `want` when DRM asked for a
 /// timing the same checks admit.
+#[cfg(feature = "kernel-test")]
 pub(crate) fn select_hdmi(
     sink: &Sink,
     soc: &dml30::Soc,
@@ -507,24 +541,63 @@ pub(crate) fn select_hdmi(
     want: Option<Timing>,
     limits: hdmi::Limits,
 ) -> Result<(Timing, hdmi::Stream, dml30::Plan), Error> {
+    select_hdmi_with(
+        sink,
+        soc,
+        vco_khz,
+        want,
+        limits,
+        hdmi::OutputSettings::default(),
+    )
+}
+pub(crate) fn select_hdmi_with(
+    sink: &Sink,
+    soc: &dml30::Soc,
+    vco_khz: u32,
+    want: Option<Timing>,
+    limits: hdmi::Limits,
+    settings: hdmi::OutputSettings,
+) -> Result<(Timing, hdmi::Stream, dml30::Plan), Error> {
     if let Some(want) = want {
-        if !offered(sink, soc, vco_khz).contains(&want) {
+        if !crate::amdgpu_navi48_boot::edid_timings(&sink.edid).contains(&want) {
             return Err(Error::NoMode);
         }
-        let stream = hdmi_stream(sink, &want, soc, limits).ok_or(Error::NoMode)?;
-        let plan = dml30::plan(&config(&want, vco_khz), soc).map_err(Error::Mode)?;
+        let stream = hdmi_stream_with(sink, &want, soc, limits, settings).ok_or(Error::NoMode)?;
+        let (plan, _) = hdmi_plan(&want, &stream, soc, vco_khz)?;
         return Ok((want, stream, plan));
     }
     for timing in crate::amdgpu_navi48_boot::edid_timings(&sink.edid) {
-        let Some(stream) = hdmi_stream(sink, &timing, soc, limits) else {
+        let Some(stream) = hdmi_stream_with(sink, &timing, soc, limits, settings) else {
             continue;
         };
-        let Ok(plan) = dml30::plan(&config(&timing, vco_khz), soc) else {
+        let Ok((plan, _)) = hdmi_plan(&timing, &stream, soc, vco_khz) else {
             continue;
         };
         return Ok((timing, stream, plan));
     }
     Err(Error::NoMode)
+}
+/// HDMI admission on the pipes DML30 mode support chooses (ODM 2:1 where
+/// one pipe's DISPCLK would exceed the ceiling). A split of a non-RGB stream
+/// is refused: the ODM slice's encoding-specific left-edge handling is not
+/// implemented.
+pub(crate) fn hdmi_plan(
+    timing: &Timing,
+    stream: &hdmi::Stream,
+    soc: &dml30::Soc,
+    vco_khz: u32,
+) -> Result<(dml30::Plan, dml30::PlanePlan), Error> {
+    let (plan, plane) =
+        dml30::plan_odm(&config(timing, vco_khz), soc, dml30::Odm::None).map_err(Error::Mode)?;
+    if plane.odm != dml30::Odm::None && !stream.format.encoding.is_rgb() {
+        return Err(Error::Mode(dml::Error::Unsupported));
+    }
+    Ok((plan, plane))
+}
+/// The ODM secondary of a stream on `pipe` alone: the highest other pipe
+/// (`dcn30_find_split_pipe` from the top of the pool, as Linux's pipe 5).
+fn split_pipe(pipe: u8, pipes: u8) -> Option<u8> {
+    (0..pipes).rev().find(|&p| p != pipe)
 }
 /// The link a DP sink's modes are checked against: its verified link, or
 /// before verification what its receiver caps bound
@@ -586,16 +659,8 @@ pub struct Admitted {
     pub offered: Vec<Timing>,
 }
 
-/// Every distinct EDID timing `select_hdmi`/`select_dp_on` could choose: a
-/// stream the DCN3.0 TMDS encoder carries (HDMI) or inside the sink's link at
-/// 8 bpc (a sink with DPCD, i.e. DisplayPort: its receiver-caps ceiling until
-/// verified), and admitted by the DCN30 mode math. This is what KMS offers;
-/// a DRM TEST_ONLY or SETCRTC is checked against it.
-pub(crate) fn offered(sink: &Sink, soc: &dml30::Soc, vco_khz: u32) -> Vec<Timing> {
-    offered_on(sink, soc, vco_khz, None)
-}
-/// `offered` for a DP sink whose link was verified at `verified`
-/// (`dp_validate_mode_timing` against `verified_link_cap`).
+/// Every distinct EDID timing the HDMI selector or DP admission can choose,
+/// bounded by board mode math and (for DP) the observed verified link.
 pub(crate) fn offered_on(
     sink: &Sink,
     soc: &dml30::Soc,
@@ -754,6 +819,12 @@ pub struct Pipeline {
     /// black), and the admitted HDMI stream (format, clocks, scrambling).
     format: hdmi::Formatter,
     hdmi: Option<hdmi::Stream>,
+    hdmi_settings: hdmi::OutputSettings,
+    hdmi_vrr: Option<(Option<crate::amdgpu_freesync::AmdVsdb>, bool)>,
+    /// ODM 2:1 ([`hdmi_plan`]): the secondary pipe's front end and the
+    /// plane with both slices.
+    slice: Option<Slice>,
+    odm: Option<dml30::PlanePlan>,
 }
 impl core::fmt::Debug for Pipeline {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -856,6 +927,10 @@ impl Pipeline {
                 dp: DpState::default(),
                 format: hdmi::Formatter::new(gpu, authority, pipe)?,
                 hdmi: None,
+                hdmi_settings: hdmi::OutputSettings::default(),
+                hdmi_vrr: None,
+                slice: None,
+                odm: None,
             })
         }
     }
@@ -995,18 +1070,41 @@ impl Pipeline {
     /// `dcn3_program_pix_clk`: VBIOS SetPixelClock and the PHY PLL's deep
     /// colour resync for TMDS (`dce112_program_pix_clk`: the target is the
     /// deep-colour-scaled clock of the 4:2:0-halved pixel clock, and
-    /// DCCG_DEEP_COLOR_CNTL the depth); the DP DTO for DisplayPort.
-    fn program_pix_clk(&mut self, tables: &Tables<'_>, pixel_khz: u32) -> Result<(), Error> {
+    /// DCCG_DEEP_COLOR_CNTL the depth); the DP DTO for DisplayPort. `opps`
+    /// is the OTG's ODM segment count: the PLL or DTO drives the OTG, which
+    /// takes `opps` pixels per clock (dcn20 `get_pixel_clock_parameters`).
+    /// `fresh`: no lit stream shares this PLL yet, so it is powered down
+    /// before it is programmed; a sharer only adds its OTG.
+    fn program_pix_clk(
+        &mut self,
+        tables: &Tables<'_>,
+        pixel_khz: u32,
+        opps: u32,
+        fresh: bool,
+    ) -> Result<(), Error> {
         let pipe = u64::from(self.route.pipe);
+        let opps = opps.max(1);
         match self.route.clock {
             ClockSource::Pll(pll) => {
+                // Linux's commit powers the old clock source down right
+                // before programming the new one (DC_LOG_BIOS shows the
+                // pair). A PLL another owner left programmed without a lit
+                // DIG (a VFIO bus reset, a previous driver) skips init's
+                // power_down_clock_sources, so the first stream on a PLL
+                // starts from a powered-down PLL. A sharer must not: the
+                // power-down would stop the lit stream already on it.
+                if fresh {
+                    tables.power_down_pixel_clock(self.bus(), pll)?;
+                }
                 tables.set_pixel_clock(
                     self.bus(),
                     &PixelClock {
                         otg: self.route.pipe,
                         pll,
                         transmitter: self.connector.path.transmitter,
-                        pixel_100hz: self.hdmi.map_or(pixel_khz * 10, |s| s.character_100hz),
+                        pixel_100hz: self.hdmi.map_or(pixel_khz * 10 / opps, |s| {
+                            s.pll_target_100hz(pixel_khz, opps)
+                        }),
                         // dce112_program_pix_clk never sets bp_pc_params.color_depth:
                         // the table gets DEEPCOLOR_RATIO_DIS and the deep-colour DTO is
                         // the resync below (dce112_program_pixel_clk_resync).
@@ -1018,7 +1116,7 @@ impl Pipeline {
                 self.regs.update(resync, DCCG_DEEP_COLOR_CNTL, deep)
             }
             ClockSource::DpDto => {
-                let (phase, modulo) = dp_dto(pixel_khz);
+                let (phase, modulo) = dp_dto(pixel_khz / opps);
                 self.regs
                     .write(self.d1(DP_DTO0_PHASE + pipe * DTO_STRIDE), phase)?;
                 self.regs
@@ -1028,6 +1126,14 @@ impl Pipeline {
             }
         }
     }
+    /// `dce110_clock_source_power_down` of the route's PHY PLL (the DP DTO
+    /// has nothing to power down), as `dcn20_reset_back_end` runs it.
+    fn power_down_pix_clk(&mut self, tables: &Tables<'_>) -> Result<(), Error> {
+        match self.route.clock {
+            ClockSource::Pll(pll) => Ok(tables.power_down_pixel_clock(self.bus(), pll)?),
+            ClockSource::DpDto => Ok(()),
+        }
+    }
     /// `dcn20_power_on_plane_resources` (DPP n is DOMAIN 2n+1, HUBP n DOMAIN
     /// 2n, each waited to PGFSM on for up to 1000 us) and `hubp1_clk_cntl`.
     /// Pipe 5's domains are never touched: `dcn20_{dpp,hubp}_pg_control`
@@ -1035,35 +1141,43 @@ impl Pipeline {
     /// de-featured and may hard-reset the GPU).
     async fn power_on_plane(&mut self) -> Result<(), Error> {
         let pipe = u64::from(self.route.pipe);
-        let request = self.d2(DC_IP_REQUEST_CNTL);
-        if !crate::amdgpu_dcn_profile::Profile::resolve(&self.gpu)?.has_plane_power_gating() {
-            let clock = self.d2(HUBP0_HUBP_CLK_CNTL + pipe * HUBP_STRIDE);
-            return self
-                .regs
-                .update(clock, HUBP_CLOCK_ENABLE, HUBP_CLOCK_ENABLE);
-        }
-        self.regs.write(request, 1)?; // linux-lit: 1=DC_IP_REQUEST_CNTL__IP_REQUEST_EN_MASK
-        if self.route.pipe != 5 {
-            // linux: n/a (pipe 5 power gating de-featured, dcn20_hwseq.c)
-            // linux-lit: 2=mmDOMAIN1_PG_CONFIG - mmDOMAIN0_PG_CONFIG
-            for domain in [2 * pipe + 1, 2 * pipe] {
-                let config = self.d2(DOMAIN0_PG_CONFIG + 2 * domain);
-                self.regs.update(config, DOMAIN_POWER_GATE, 0)?;
-                if !self
-                    .regs
-                    // linux-lit: 4=(mmDOMAIN0_PG_STATUS - mmDOMAIN0_PG_CONFIG) * 4
-                    .wait(config + 4, DOMAIN_PGFSM_PWR_STATUS, 0, 1, 1000)
-                    .await?
-                {
-                    let _ = self.regs.write(request, 0);
-                    return Err(Error::Block(crate::amdgpu_dcn_clk::Error::Timeout));
+        if crate::amdgpu_dcn_profile::Profile::resolve(&self.gpu)?.has_plane_power_gating() {
+            let mut request = IpRequest::acquire(self.regs, self.d2(DC_IP_REQUEST_CNTL))?;
+            if self.route.pipe != 5 {
+                // linux: n/a (pipe 5 power gating de-featured, dcn20_hwseq.c)
+                // linux-lit: 2=mmDOMAIN1_PG_CONFIG - mmDOMAIN0_PG_CONFIG
+                for domain in [2 * pipe + 1, 2 * pipe] {
+                    let config = self.d2(DOMAIN0_PG_CONFIG + 2 * domain);
+                    self.regs.update(config, DOMAIN_POWER_GATE, 0)?;
+                    if !self
+                        .regs
+                        // linux-lit: 4=(mmDOMAIN0_PG_STATUS - mmDOMAIN0_PG_CONFIG) * 4
+                        .wait(config + 4, DOMAIN_PGFSM_PWR_STATUS, 0, 1, 1000)
+                        .await?
+                    {
+                        return Err(Error::Block(crate::amdgpu_dcn_clk::Error::Timeout));
+                    }
                 }
             }
+            request.release()?;
         }
-        self.regs.write(request, 0)?;
         let clock = self.d2(HUBP0_HUBP_CLK_CNTL + pipe * HUBP_STRIDE);
         self.regs
-            .update(clock, HUBP_CLOCK_ENABLE, HUBP_CLOCK_ENABLE)
+            .update(clock, HUBP_CLOCK_ENABLE, HUBP_CLOCK_ENABLE)?;
+        // hubp3_program_tiling derives the display fabric geometry from
+        // this ASIC's GB_ADDR_CONFIG, not the GOP's previous surface.
+        let profile = crate::amdgpu_rdna2::for_pci_id(self.gpu.chip.vid, self.gpu.chip.did)
+            .ok_or(Error::Unsupported)?;
+        let gc0 = crate::amdgpu_psp_ring::bank(
+            &self.gpu,
+            crate::amdgpu_discovery::HW_ID_GC,
+            &[profile.gc_version],
+            0,
+            0x13de, // linux-lit: 0x13de=mmGB_ADDR_CONFIG@gc101
+        )
+        .map_err(|_| Error::Unsupported)?;
+        let config = self.regs.read(gc0 + 0x13de * 4)?;
+        self.hubp.initialize(config).map_err(Error::Block)
     }
     /// `hubp2_program_deadline`'s cursor half: the cursor's request pacing
     /// from the plan, so a cursor shown later fetches on the budget the
@@ -1121,26 +1235,38 @@ impl Pipeline {
             self.d2(HUBP0_DCHUBP_CNTL + pipe * HUBP_STRIDE),
         )
     }
-    /// `optc1_clear_optc_underflow` and `hubp2_clear_underflow`.
+    /// `optc1_clear_optc_underflow` and `hubp2_clear_underflow`, for every
+    /// pipe of the stream.
     fn clear_underflow(&mut self) -> Result<(), Error> {
         let (optc, hubp) = self.underflow_regs();
         self.regs
             .update(optc, OPTC_UNDERFLOW_CLEAR, OPTC_UNDERFLOW_CLEAR)?;
         self.regs
-            .update(hubp, HUBP_UNDERFLOW_CLEAR, HUBP_UNDERFLOW_CLEAR)
+            .update(hubp, HUBP_UNDERFLOW_CLEAR, HUBP_UNDERFLOW_CLEAR)?;
+        if let Some(pipe) = self.slice.as_ref().map(|s| s.pipe) {
+            self.hubp_underflow(pipe, true)?;
+        }
+        Ok(())
     }
-    /// `optc1_is_optc_underflow_occurred` and `hubp1_get_underflow_status`.
+    /// `optc1_is_optc_underflow_occurred` and `hubp1_get_underflow_status`,
+    /// the HUBP status of every pipe of the stream combined.
     fn read_underflow(&mut self) -> Result<Option<Underflow>, Error> {
         let (optc, hubp) = self.underflow_regs();
         let otg = self.regs.read(optc)? & OPTC_UNDERFLOW_OCCURRED_STATUS != 0;
         // linux-lit: 28=HUBP0_DCHUBP_CNTL__HUBP_UNDERFLOW_STATUS__SHIFT
-        let hubp = ((self.regs.read(hubp)? & HUBP_UNDERFLOW_STATUS) >> 28) as u8;
+        let mut hubp = ((self.regs.read(hubp)? & HUBP_UNDERFLOW_STATUS) >> 28) as u8;
+        if let Some(pipe) = self.slice.as_ref().map(|s| s.pipe) {
+            hubp |= self.hubp_underflow(pipe, false)?;
+        }
         Ok((otg || hubp != 0).then_some(Underflow { otg, hubp }))
     }
     /// Turn an underflowing stream black and quarantine it: the OPP pattern
     /// generator replaces the pixels at once, independent of the fetch.
     fn quarantine(&mut self, underflow: Underflow) -> Error {
         self.underflow = Some(underflow);
+        if let Some(slice) = self.slice.as_mut() {
+            let _ = slice.opp.set_blank(true);
+        }
         let _ = self.opp.set_blank(true);
         self.state = State::Quarantined(underflow);
         Error::Underflow(underflow)
@@ -1248,8 +1374,17 @@ impl Pipeline {
         let (timing, avi, plan) = match signal {
             Signal::Hdmi => {
                 let limits = self.hdmi_limits(tables);
-                let (t, stream, plan) = select_hdmi(sink, &soc, levels.vco_khz, self.want, limits)?;
+                let (t, stream, _) = select_hdmi_with(
+                    sink,
+                    &soc,
+                    levels.vco_khz,
+                    self.want,
+                    limits,
+                    self.hdmi_settings,
+                )?;
                 self.hdmi = Some(stream);
+                // The same admission again, retaining an ODM split's slices.
+                let plan = self.plan_single_odm(&t, &stream, &soc, levels.vco_khz)?;
                 (t, stream.avi, plan)
             }
             Signal::DisplayPort => {
@@ -1315,7 +1450,8 @@ impl Pipeline {
         // enable_stream_timing: OPTC clocks, then the pixel clock.
         self.at(Step::PixelClock);
         self.enable_optc_clock().await?;
-        self.program_pix_clk(tables, timing.pixel_clock_khz)?;
+        let opps = self.odm.map_or(1, |p| p.odm.pipes());
+        self.program_pix_clk(tables, timing.pixel_clock_khz, opps, true)?;
         // Timing and global sync, the OPP clock and format, then black.
         self.at(Step::Timing);
         let sync = GlobalSync {
@@ -1328,10 +1464,19 @@ impl Pipeline {
             Signal::Hdmi => self.otg.program_tmds_timing(&timing, &sync)?,
             Signal::DisplayPort => self.otg.program_timing(&timing, &sync)?,
         }
-        self.opp
-            .program(Encoding::Rgb, timing.h_active, timing.v_active)?;
+        // dcn20_enable_stream_timing -> mpc3_set_out_rate_control.
+        // mpc3_mpc_init_single_inst only clears FLOW_CONTROL_COUNT;
+        // the stream step also clears a previously selected rate mode.
+        self.mpc_rate_control_off(pipe)?;
+        let width = timing.h_active / opps;
+        self.opp.program(Encoding::Rgb, width, timing.v_active)?;
         self.opp.set_blank(true)?;
-        self.hdmi_format().await?;
+        self.output_format().await?;
+        if let Some(mut slice) = self.slice.take() {
+            let combined = self.combine_slice(&mut slice, width, timing.v_active).await;
+            self.slice = Some(slice);
+            combined?;
+        }
         // enable_crtc, then one frame for the timing to settle.
         self.at(Step::Start);
         self.otg.enable()?;
@@ -1351,13 +1496,37 @@ impl Pipeline {
         self.clocks
             .pipe_clock(pipe, plan.clocks.dppclk_khz)
             .map_err(Error::Block)?;
-        self.dpp
-            .program(Format::Rgb32, timing.h_active, timing.v_active)?;
-        self.mpc.mux_plane(pipe, pipe)?;
-        self.hubp.select_vtg(pipe)?;
-        self.hubp.program(&surface, &plan.registers)?;
+        match self.odm.and_then(|p| p.pipes[0]) {
+            None => {
+                self.dpp
+                    .program(Format::Rgb32, timing.h_active, timing.v_active)?;
+                self.mpc.mux_plane(pipe, pipe)?;
+                self.hubp.select_vtg(pipe)?;
+                self.hubp.program(&surface, &plan.registers)?;
+            }
+            Some(left) => {
+                self.dpp
+                    .program(Format::Rgb32, left.viewport_width, timing.v_active)?;
+                self.mpc.mux_plane(pipe, pipe)?;
+                self.hubp.select_vtg(pipe)?;
+                let left_surface = Surface {
+                    viewport_width: left.viewport_width,
+                    ..surface
+                };
+                self.hubp
+                    .program_at(&left_surface, &left.registers, left.viewport_x)?;
+            }
+        }
         self.program_cursor_ttu(plan.cursor)?;
+        if let Some(mut slice) = self.slice.take() {
+            let programmed = self.program_slice(&mut slice, &surface, &timing).await;
+            self.slice = Some(slice);
+            programmed?;
+        }
         self.hubp.unblank().await?;
+        if let Some(slice) = self.slice.as_mut() {
+            slice.hubp.unblank().await?;
+        }
         self.clear_underflow()?;
         self.unlock()?;
         self.start_audio(&timing, sink).await;
@@ -1367,6 +1536,7 @@ impl Pipeline {
         if let Some(underflow) = self.read_underflow()? {
             return Err(self.quarantine(underflow));
         }
+        self.report_hdmi_status(aux, "settled").await;
         Ok(Output {
             connector: self.connector,
             route: self.route,
@@ -1380,15 +1550,93 @@ impl Pipeline {
             scanout: fb,
         })
     }
-    /// The stream's audio once pixels flow (`dce110_enable_audio_stream`
-    /// and its setup half, as the DCN30 audio owner orders them). Audio never
-    /// fails the display: an error is logged and the stream stays lit.
-    async fn start_audio(&mut self, timing: &Timing, sink: &Sink) {
-        let (otg, dig) = (self.route.pipe, self.route.stream);
-        let stream = match self.connector.signal {
-            Signal::Hdmi => AudioStream::hdmi(otg, dig, *timing),
-            Signal::DisplayPort => AudioStream::dp(otg, dig, *timing),
+    /// [`hdmi_plan`] for the lit stream: on a split, the secondary pipe's
+    /// blocks and the plane with both slices are retained for bring-up.
+    fn plan_single_odm(
+        &mut self,
+        timing: &Timing,
+        stream: &hdmi::Stream,
+        soc: &dml30::Soc,
+        vco_khz: u32,
+    ) -> Result<dml30::Plan, Error> {
+        self.slice = None;
+        self.odm = None;
+        let (plan, plane) = hdmi_plan(timing, stream, soc, vco_khz)?;
+        if plane.odm == dml30::Odm::None {
+            return Ok(plan);
+        }
+        if !matches!(self.route.clock, ClockSource::Pll(_)) || plane.pipes[1].is_none() {
+            return Err(Error::Invalid);
+        }
+        let pipes = crate::amdgpu_dcn_profile::Profile::resolve(&self.gpu)?.pipes();
+        let secondary = split_pipe(self.route.pipe, pipes).ok_or(Error::Busy)?;
+        // SAFETY: this one-stream owner holds the whole display pool (the
+        // caller's contract), and `secondary` is not its route's pipe.
+        self.slice = Some(unsafe { Slice::new(&self.gpu, self.regs.authority, secondary)? });
+        self.odm = Some(plane);
+        Ok(plan)
+    }
+    /// `dcn20_program_front_end_for_ctx` for the ODM secondary, under the
+    /// OTG lock the master holds: its OPP out of black, power domains, DPP
+    /// DTO, DPP, MPCC, and the HUBP on the master's VTG fetching the right
+    /// slice of the same surface, then its cursor pacing.
+    async fn program_slice(
+        &mut self,
+        slice: &mut Slice,
+        surface: &Surface,
+        timing: &Timing,
+    ) -> Result<(), Error> {
+        let plane = self.odm.ok_or(Error::Invalid)?;
+        let right = plane.pipes[1].ok_or(Error::Invalid)?;
+        slice.opp.set_blank(false)?;
+        self.power_on_pipe(slice.pipe).await?;
+        self.clocks
+            .pipe_clock(slice.pipe, plane.dppclk_khz)
+            .map_err(Error::Block)?;
+        slice
+            .dpp
+            .program(Format::Rgb32, right.viewport_width, timing.v_active)?;
+        slice.mpc.mux_plane(slice.pipe, slice.pipe)?;
+        slice.hubp.select_vtg(self.route.pipe)?;
+        let right_surface = Surface {
+            viewport_width: right.viewport_width,
+            ..*surface
         };
+        slice
+            .hubp
+            .program_at(&right_surface, &right.registers, right.viewport_x)?;
+        self.program_cursor_ttu_at(slice.pipe, right.cursor)
+    }
+    /// Every HUBP of the lit stream with its ODM slice of the surface
+    /// (`viewport_x`, `viewport_width`), left to right; `None` on one pipe.
+    pub fn odm_pipes(&self) -> Option<[(u8, u32, u32); 2]> {
+        let plane = self.odm?;
+        let slice = self.slice.as_ref()?;
+        let (left, right) = (plane.pipes[0]?, plane.pipes[1]?);
+        Some([
+            (self.route.pipe, left.viewport_x, left.viewport_width),
+            (slice.pipe, right.viewport_x, right.viewport_width),
+        ])
+    }
+    /// dce110_populate_audio_dto_parameters: HDMI 4:2:0 uses the halved
+    /// requested pixel clock for DTO/ACR, without the PLL's deep-colour scale.
+    pub(crate) fn audio_stream(&self, timing: &Timing) -> AudioStream {
+        let (otg, dig) = (self.route.pipe, self.route.stream);
+        match self.connector.signal {
+            Signal::Hdmi => {
+                let mut audio_timing = *timing;
+                if self.hdmi.is_some_and(|s| s.format.encoding.is_420()) {
+                    audio_timing.pixel_clock_khz /= 2;
+                }
+                AudioStream::hdmi(otg, dig, audio_timing)
+            }
+            Signal::DisplayPort => AudioStream::dp(otg, dig, *timing),
+        }
+    }
+    /// Start audio once pixels flow. An audio error leaves the stream lit.
+    async fn start_audio(&mut self, timing: &Timing, sink: &Sink) {
+        let stream = self.audio_stream(timing);
+        let dig = stream.dig;
         // SAFETY: the stream is live and stays live until tear_down stops
         // its audio first; this pipeline owns the DIG and the endpoints.
         let result = unsafe {
@@ -1418,6 +1666,7 @@ impl Pipeline {
         self.dig.setup_stereo_sync(self.route.pipe)?;
         tables.hdmi_stream_setup(self.bus(), self.route.stream, stream.character_khz)?;
         self.dig.hdmi_stream_attribute(&stream)?;
+        self.dig.retire_reset_clock_pattern()?;
         self.dig.hdmi_info_packets(&stream).await?;
         // enable_link_hdmi: write_scdc_data, then setup_dio_stream_encoder
         // (the backend takes the frontend first, so a 1/4-rate clock channel
@@ -1437,19 +1686,8 @@ impl Pipeline {
                 symbol_khz: stream.character_khz,
             },
         )?;
-        if let Some(status) = hdmi::read_scdc_data(aux, &stream).await {
-            use core::fmt::Write as _;
-            let _ = writeln!(
-                narf_console::Writer,
-                "amdgpu: navi22 HDMI {} kHz {} bpc{} SCDC TMDS_Config {:#x} scrambler {:?} flags {:?}",
-                stream.character_khz,
-                stream.format.depth.bpc(),
-                if stream.format.ycbcr420 { " 4:2:0" } else { "" },
-                status.tmds_config,
-                status.scrambler_status,
-                status.status_flags,
-            );
-        }
+        self.dig.retire_reset_clock_pattern()?;
+        self.report_hdmi_status(aux, "transmitter").await;
         // The second setup Linux issues after transmitter control.
         self.dig.setup(DigMode::Hdmi)?;
         // dcn20_enable_stream: setup_dio_stream_encoder, update_info_frame.
@@ -1457,6 +1695,30 @@ impl Pipeline {
         self.dig.hdmi_info_packets(&stream).await?;
         self.dig.set_avmute(false)?;
         Ok(())
+    }
+    /// Diagnostic only: the early Linux sample precedes final plane unblank.
+    /// A second sample after the verify frames observes the enabled stream.
+    async fn report_hdmi_status<A: Aux + Send>(&mut self, aux: &mut A, phase: &str) {
+        if self.connector.signal != Signal::Hdmi {
+            return;
+        }
+        let Some(stream) = self.hdmi else {
+            return;
+        };
+        if let Some(status) = hdmi::read_scdc_data(aux, &stream).await {
+            let pattern = self.dig.tmds_clock_pattern().ok();
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 HDMI {} kHz {} bpc{} SCDC TMDS_Config {:#x} scrambler {:?} flags {:?} clock_pattern={pattern:x?} phase={phase}",
+                stream.character_khz,
+                stream.format.depth.bpc(),
+                if stream.format.encoding.is_420() { " 4:2:0" } else { "" },
+                status.tmds_config,
+                status.scrambler_status,
+                status.status_flags,
+            );
+        }
     }
     /// m5hdmi: the board's HDMI ceilings, from the VBIOS encoder caps of
     /// this connector's transmitter (`dcn30_link_encoder_construct`: no
@@ -1471,14 +1733,21 @@ impl Pipeline {
             ..hdmi::Limits::DEFAULT
         }
     }
-    /// m5hdmi: the HDMI stream's output format on the pipe, after the timing
-    /// and before the OTG starts: OTG 4:2:0 container, FMT dither/clamp/
-    /// encoding, OCSC and the DPG's black for the colour space.
-    async fn hdmi_format(&mut self) -> Result<(), Error> {
-        let Some(stream) = self.hdmi.filter(|_| self.connector.signal == Signal::Hdmi) else {
-            return Ok(());
+    /// m5hdmi: the stream's output format on the pipe, after the timing and
+    /// before the OTG starts: OTG 4:2:0 container, FMT dither/clamp/
+    /// encoding, OCSC and the DPG's black for the colour space. Linux
+    /// programs these for every signal (optc1_program_timing's
+    /// OPTC_DATA_FORMAT, opp_program_fmt, dcn20_program_pipe's
+    /// program_output_csc): DisplayPort SST is full-range 8-bpc RGB, as its
+    /// MSA says, rather than whatever an earlier stream left on the pipe.
+    async fn output_format(&mut self) -> Result<(), Error> {
+        let format = match self.connector.signal {
+            Signal::Hdmi => match self.hdmi {
+                Some(stream) => stream.format,
+                None => return Ok(()),
+            },
+            Signal::DisplayPort => hdmi::Format::RGB8,
         };
-        let format = stream.format;
         self.format.program_otg(format)?;
         self.format.program_fmt(format)?;
         self.format.program_ocsc(format).await?;
@@ -1489,6 +1758,17 @@ impl Pipeline {
     /// owner's unplug path ([`hdmi::write_scdc_legacy`]).
     pub fn hdmi_output(&self) -> Option<hdmi::Stream> {
         self.hdmi
+    }
+    /// Observe the running TMDS link. Reading SCDC never changes the PHY,
+    /// and an unavailable DDC status is not evidence of a failed stream.
+    pub async fn hdmi_link_health<A: Aux + Send>(&mut self, aux: &mut A) -> hdmi::LinkHealth {
+        if self.connector.signal != Signal::Hdmi || self.state != State::At(Step::Running) {
+            return hdmi::LinkHealth::Unmonitored;
+        }
+        let Some(stream) = self.hdmi else {
+            return hdmi::LinkHealth::Unmonitored;
+        };
+        hdmi::link_health(&stream, hdmi::read_scdc_data(aux, &stream).await)
     }
     /// `link_set_dpms_on` for DisplayPort SST at the least link the
     /// verified one has that carries the stream (`decide_dp_link_settings`).
@@ -1507,13 +1787,17 @@ impl Pipeline {
             Depth::Bpc8.bits_per_pixel(),
         )
         .ok_or(Error::NoMode)?;
-        self.link_dp_at(tables, timing, &caps, setting, aux).await
+        self.link_dp_at(tables, timing, &caps, setting, aux, true)
+            .await
     }
     /// `link_set_dpms_on` for DisplayPort SST at `setting`: DIG setup, stream
     /// attributes and SDPs, the PHY clock, the backend connected
     /// (`setup_dio_stream_encoder` before training), training with retries
     /// (`perform_link_training_with_retries`), then `dcn20_enable_stream`
-    /// and `dcn20_unblank_stream`.
+    /// and `dcn20_unblank_stream`. At a `commit`, a link that never trained
+    /// still enables its stream, as `link_set_dpms_on` does for SST ("some
+    /// DP monitors will recover and show the stream anyway"); a retrain
+    /// reports the failure.
     async fn link_dp_at<A: Aux + Send>(
         &mut self,
         tables: &Tables<'_>,
@@ -1521,13 +1805,16 @@ impl Pipeline {
         caps: &dp_link::Caps,
         setting: DpLink,
         aux: &mut A,
+        commit: bool,
     ) -> Result<(), Error> {
         self.dig.setup(DigMode::DisplayPort)?;
         self.dig.setup_stereo_sync(self.route.pipe)?;
         // DPRX_FEATURE_ENUMERATION_LIST (retrieve_link_cap, extended caps
         // only): SST_SPLIT_SDP_CAP bit 1, VSC_SDP_COLORIMETRY_SUPPORTED bit 3.
         let feature = caps.dprx_feature;
-        let vsc_colorimetry = feature & 1 << 3 != 0;
+        // amdgpu_dm's VSC colorimetry also needs a DPCD 1.4 receiver.
+        // linux-lit: 0x14=DP_DPCD_REV_14
+        let vsc_colorimetry = caps.rev() >= 0x14 && feature & 1 << 3 != 0;
         let vsc = vsc_colorimetry.then(|| dp::vsc_packet(Depth::Bpc8));
         self.dp_stream.set_stream_attribute(
             timing,
@@ -1558,7 +1845,20 @@ impl Pipeline {
             link: self.dp_link,
             phy: &mut phy,
         };
-        let trained = dp_link::train_with_retries(aux, &mut source, caps, setting).await?;
+        dp_link::disable_mst_on_sink(aux, caps).await;
+        let trained = match dp_link::train_with_retries(aux, &mut source, caps, setting).await {
+            Ok(trained) => trained,
+            // The last attempt left the PHY on at `setting`.
+            Err(Error::Training(error)) if commit => {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi22 DP link training failed ({error:?}); enabling the stream anyway"
+                );
+                setting
+            }
+            Err(error) => return Err(error),
+        };
         self.link = Some(trained);
         self.dig.setup(DigMode::DisplayPort)?;
         // dcn20_enable_stream, then dcn20_unblank_stream.
@@ -1613,15 +1913,26 @@ impl Pipeline {
             }
         };
         // Front end: blank_pixel_data(true), MPCC removal, HUBP blank.
+        let hdmi = self.hdmi.filter(|_| self.connector.signal == Signal::Hdmi);
         if reached >= Step::Timing {
             record(self.opp.set_blank(true).map_err(Error::Block));
-            if let Some(s) = self.hdmi.filter(|_| self.connector.signal == Signal::Hdmi) {
+            if let Some(s) = hdmi {
                 record(self.format.set_blank_color(s.format).map_err(Error::Hdmi));
+            }
+            if let Some(slice) = self.slice.as_mut() {
+                record(slice.opp.set_blank(true).map_err(Error::Block));
+                if let Some(s) = hdmi {
+                    record(slice.format.set_blank_color(s.format).map_err(Error::Hdmi));
+                }
             }
         }
         if reached >= Step::Plane {
             record(self.mpc.release(self.route.pipe).map_err(Error::Block));
             record(self.hubp.blank().await.map_err(Error::Block));
+            if let Some(slice) = self.slice.as_mut() {
+                record(slice.mpc.release(slice.pipe).map_err(Error::Block));
+                record(slice.hubp.blank().await.map_err(Error::Block));
+            }
         }
         // A link verification the future dropped may have left the PHY on.
         if self.dp.probing {
@@ -1638,15 +1949,17 @@ impl Pipeline {
                 Signal::DisplayPort => record(self.unlink_dp(tables, aux).await),
             }
         }
-        // dcn20_reset_back_end_for_pipe: disable_crtc, then the OPTC clocks.
-        // The PHY PLL is not powered down: dce110_clock_source_power_down's
-        // SetPixelClock with CONTROLLER_ID_UNDEFINED is refused by
-        // set_pixel_clock_v7, so Linux never runs it.
+        // dcn20_reset_back_end_for_pipe: disable_crtc, then the OPTC clocks;
+        // then dcn20_reset_back_end's cs_power_down of the old clock source.
         if reached >= Step::Start {
             record(self.otg.disable().await.map_err(Error::Block));
         }
+        if reached >= Step::Timing && self.slice.is_some() {
+            record(self.set_odm_bypass());
+        }
         if reached >= Step::PixelClock {
             record(self.disable_optc_clock());
+            record(self.power_down_pix_clk(tables));
         }
         first
     }
@@ -1920,7 +2233,7 @@ impl Pipeline {
         }
         self.unlink_dp(tables, aux).await?;
         sleep_us(DP_BLANK_SETTLE_US).await;
-        self.link_dp_at(tables, &output.timing, &caps, setting, aux)
+        self.link_dp_at(tables, &output.timing, &caps, setting, aux, false)
             .await?;
         self.state = State::At(Step::Running);
         let sink = Sink {
@@ -1991,6 +2304,77 @@ impl Aux for NoAux {
 /// KMS hooks (amdgpu_navi22_kms / amdgpu_navi22_scanout).
 impl Pipeline {
     /// Ask `enable` for exactly this timing (None: the sink's preferred).
+    /// The fixed/variable timing and AMD SPD are committed together by the
+    /// retained stream owner; this never reinitializes a working PHY.
+    pub async fn configure_hdmi_vrr(
+        &mut self,
+        caps: Option<crate::amdgpu_freesync::AmdVsdb>,
+        enabled: bool,
+    ) -> Result<Option<crate::amdgpu_freesync::Drr>, Error> {
+        use crate::amdgpu_freesync::{self as fs, HdmiState};
+        if self.state != State::At(Step::Running) || self.connector.signal != Signal::Hdmi {
+            return Err(Error::Invalid);
+        }
+        let timing = self.output.ok_or(Error::Invalid)?.timing;
+        let usable = caps.filter(|c| {
+            c.range().is_some_and(|r| {
+                fs::hdmi_info_packet(&timing, r, c.version, HdmiState::Disabled).is_some()
+            })
+        });
+        let range = usable.and_then(|c| c.range());
+        let bounds = range.filter(|_| enabled).and_then(|r| fs::drr(&timing, r));
+        if self.hdmi_vrr == Some((usable, enabled)) {
+            return Ok(bounds);
+        }
+        let mut stream = self.hdmi.ok_or(Error::Invalid)?;
+        stream.spd = usable
+            .and_then(|c| {
+                fs::hdmi_info_packet(
+                    &timing,
+                    c.range()?,
+                    c.version,
+                    if enabled {
+                        HdmiState::Variable
+                    } else {
+                        HdmiState::Disabled
+                    },
+                )
+            })
+            .map(|p| p.bytes());
+        self.otg.configure_dcn30_drr(bounds)?;
+        if usable.is_some() || self.hdmi_vrr.is_some_and(|(c, _)| c.is_some()) {
+            self.dig.hdmi_info_packets(&stream).await?;
+        }
+        self.hdmi = Some(stream);
+        self.hdmi_vrr = Some((usable, enabled));
+        Ok(bounds)
+    }
+    /// Metadata-only updates do not blank or retrain TMDS. Format/depth and
+    /// HDR enable/disable transitions still go through normal modesetting.
+    pub async fn update_hdmi_metadata(
+        &mut self,
+        settings: hdmi::OutputSettings,
+    ) -> Result<(), Error> {
+        if !matches!(self.state, State::At(Step::Running))
+            || settings.needs_modeset(self.hdmi_settings)
+        {
+            return Err(Error::Invalid);
+        }
+        let mut stream = self.hdmi.ok_or(Error::Invalid)?;
+        stream.hdr = settings.hdr.as_ref().map(|h| {
+            crate::amdgpu_hdr::hdr_info_packet(Some(h), crate::amdgpu_hdr::HdrConnector::Hdmi)
+                .bytes()
+        });
+        self.dig.hdmi_info_packets(&stream).await?;
+        self.hdmi = Some(stream);
+        self.hdmi_settings = settings;
+        Ok(())
+    }
+    /// Connector state captured before enable; requests during enable are
+    /// left pending for the monitor's next convergence pass.
+    pub fn set_hdmi_settings(&mut self, settings: hdmi::OutputSettings) {
+        self.hdmi_settings = settings;
+    }
     pub fn request(&mut self, timing: Option<Timing>) {
         self.want = timing;
     }

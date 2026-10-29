@@ -139,6 +139,7 @@ pub const SZ_DRM_MODE_GET_PLANE_RES: u32 = 16; // drm_mode_get_plane_res
 pub const SZ_DRM_MODE_GET_ENCODER: u32 = 20; // drm_mode_get_encoder
 pub const SZ_DRM_MODE_GET_CONNECTOR: u32 = 80; // drm_mode_get_connector
 pub const SZ_DRM_MODE_GET_PROPERTY: u32 = 64; // drm_mode_get_property
+pub const SZ_DRM_MODE_FB_CMD: u32 = 28; // drm_mode_fb_cmd
 pub const SZ_DRM_MODE_FB_CMD2: u32 = 104; // drm_mode_fb_cmd2
 pub const SZ_DRM_MODE_RMFB: u32 = 4; // drm_mode_rmfb
 pub const SZ_DRM_MODE_ATOMIC: u32 = 56; // drm_mode_atomic
@@ -211,6 +212,9 @@ pub const DRM_IOCTL_MODE_GETENCODER: u32 = iowr(DRM_IOCTL_BASE, 0xA6, SZ_DRM_MOD
 
 /// DRM_IOCTL_MODE_GETCONNECTOR = _IOWR('d', 0xa7, struct drm_mode_get_connector).
 pub const DRM_IOCTL_MODE_GETCONNECTOR: u32 = iowr(DRM_IOCTL_BASE, 0xA7, SZ_DRM_MODE_GET_CONNECTOR);
+
+/// DRM_IOCTL_MODE_ADDFB = _IOWR('d', 0xae, struct drm_mode_fb_cmd).
+pub const DRM_IOCTL_MODE_ADDFB: u32 = iowr(DRM_IOCTL_BASE, 0xAE, SZ_DRM_MODE_FB_CMD);
 
 /// DRM_IOCTL_MODE_RMFB = _IOWR('d', 0xaf, struct drm_mode_rmfb).
 pub const DRM_IOCTL_MODE_RMFB: u32 = iowr(DRM_IOCTL_BASE, 0xAF, SZ_DRM_MODE_RMFB);

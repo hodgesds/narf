@@ -90,8 +90,21 @@ pub struct Placement {
 pub fn placement(
     x: i32,
     y: i32,
-    (width, height): (u32, u32),
+    size: (u32, u32),
     (view_w, view_h): (u32, u32),
+    clocks: (u32, u32),
+) -> Placement {
+    placement_in(x, y, size, (0, view_w, view_h), clocks)
+}
+/// [`placement`] for the pipe whose viewport starts at `view_x` (an ODM
+/// slice): the position registers keep the stream coordinate, while
+/// visibility and `CURSOR_DST_X_OFFSET` are relative to the slice
+/// (`hubp2_cursor_set_position`'s `pos->x - param->viewport.x`).
+pub fn placement_in(
+    x: i32,
+    y: i32,
+    (width, height): (u32, u32),
+    (view_x, view_w, view_h): (u32, u32, u32),
     (refclk_khz, pixclk_khz): (u32, u32),
 ) -> Placement {
     let hidden = Placement {
@@ -117,7 +130,7 @@ pub fn placement(
     } else {
         (y, 0)
     };
-    let (sx, sy) = (px - hot_x, py - hot_y);
+    let (sx, sy) = (px - i64::from(view_x) - hot_x, py - hot_y);
     let (w, h) = (i64::from(width), i64::from(height));
     if sx >= i64::from(view_w) || sx + w <= 0 || sy >= i64::from(view_h) || sy + h <= 0 {
         return hidden;
@@ -180,14 +193,41 @@ pub(crate) struct Engine<I: Io> {
     pub(crate) dcn2: u64,
     pub(crate) dcn3: u64,
     pub(crate) pipe: u8,
+    /// ODM 2:1: each slice's pipe, `viewport_x` and width, left to right
+    /// (the first is `pipe`).
+    pub(crate) slices: Option<[(u8, u32, u32); 2]>,
     pub(crate) shown: Option<Shown>,
+    /// What each programmed pipe was last placed at.
+    pub(crate) placed: [Option<(u8, Placement)>; 2],
 }
 impl<I: Io> Engine<I> {
-    fn hubp(&self, reg: u64) -> u64 {
-        self.dcn2 + (reg + u64::from(self.pipe) * HUBP_STRIDE) * 4
+    fn hubp(&self, pipe: u8, reg: u64) -> u64 {
+        self.dcn2 + (reg + u64::from(pipe) * HUBP_STRIDE) * 4
     }
-    fn dpp(&self, reg: u64) -> u64 {
-        self.dcn2 + (reg + u64::from(self.pipe) * DPP_STRIDE) * 4
+    fn dpp(&self, pipe: u8, reg: u64) -> u64 {
+        self.dcn2 + (reg + u64::from(pipe) * DPP_STRIDE) * 4
+    }
+    /// Each pipe's placement: one pipe over the whole `viewport`, or every
+    /// ODM slice over its part of it.
+    fn placements(
+        &self,
+        (x, y): (i32, i32),
+        size: (u32, u32),
+        (view_w, view_h): (u32, u32),
+        clocks: (u32, u32),
+    ) -> [Option<(u8, Placement)>; 2] {
+        match self.slices {
+            None => [
+                Some((self.pipe, placement(x, y, size, (view_w, view_h), clocks))),
+                None,
+            ],
+            Some(slices) => slices.map(|(pipe, view_x, width)| {
+                Some((
+                    pipe,
+                    placement_in(x, y, size, (view_x, width, view_h), clocks),
+                ))
+            }),
+        }
     }
     fn lock_reg(&self) -> u64 {
         // The console pipe's MPCC tree feeds the OPP of the same index.
@@ -218,52 +258,56 @@ impl<I: Io> Engine<I> {
         result.and(self.set(lock, 0))
     }
     /// `hubp2_cursor_set_attributes` + `dpp3_set_cursor_attributes`.
-    fn attributes(&mut self, address: u64, width: u32, height: u32) -> Result<(), Error> {
+    fn attributes(&mut self, pipe: u8, address: u64, width: u32, height: u32) -> Result<(), Error> {
         self.update(
-            self.hubp(CURSOR_SURFACE_ADDRESS_HIGH),
+            self.hubp(pipe, CURSOR_SURFACE_ADDRESS_HIGH),
             // linux-lit: 0xffff=CURSOR0_0_CURSOR_SURFACE_ADDRESS_HIGH__CURSOR_SURFACE_ADDRESS_HIGH_MASK
             0xffff,
             (address >> 32) as u32,
         )?;
-        self.set(self.hubp(CURSOR_SURFACE_ADDRESS), address as u32)?;
+        self.set(self.hubp(pipe, CURSOR_SURFACE_ADDRESS), address as u32)?;
         // linux-lit: 16=CURSOR0_0_CURSOR_SIZE__CURSOR_WIDTH__SHIFT
-        self.update(self.hubp(CURSOR_SIZE), SIZE_MASK, width << 16 | height)?;
         self.update(
-            self.hubp(CURSOR_CONTROL),
+            self.hubp(pipe, CURSOR_SIZE),
+            SIZE_MASK,
+            width << 16 | height,
+        )?;
+        self.update(
+            self.hubp(pipe, CURSOR_CONTROL),
             CONTROL_FIELDS,
             // linux-lit: 24=CURSOR0_0_CURSOR_CONTROL__CURSOR_LINES_PER_CHUNK__SHIFT
             // linux-lit: 16=CURSOR0_0_CURSOR_CONTROL__CURSOR_PITCH__SHIFT
             // linux-lit: 8=CURSOR0_0_CURSOR_CONTROL__CURSOR_MODE__SHIFT
             lines_per_chunk(width) << 24 | PITCH_256 << 16 | PRE_MULTIPLIED << 8,
         )?;
-        self.set(self.hubp(CURSOR_SETTINGS), SETTINGS)?;
+        self.set(self.hubp(pipe, CURSOR_SETTINGS), SETTINGS)?;
         // CUR0_MODE premultiplied, no expansion, no degamma ROM; enable is
         // the position's.
         self.update(
-            self.dpp(CUR0_CONTROL),
+            self.dpp(pipe, CUR0_CONTROL),
             CUR0_FIELDS & !ENABLE,
             PRE_MULTIPLIED << 4, // linux-lit: 4=CNVC_CUR0_CURSOR0_CONTROL__CUR0_MODE__SHIFT
         )
     }
     /// `hubp2_cursor_set_position` + `dpp1_set_cursor_position`.
-    fn position(&mut self, p: Placement) -> Result<(), Error> {
+    fn position(&mut self, pipe: u8, p: Placement) -> Result<(), Error> {
         let enable = u32::from(p.visible);
-        self.update(self.hubp(CURSOR_CONTROL), ENABLE, enable)?;
+        self.update(self.hubp(pipe, CURSOR_CONTROL), ENABLE, enable)?;
         self.set(
-            self.hubp(CURSOR_POSITION),
+            self.hubp(pipe, CURSOR_POSITION),
             // linux-lit: 16=CURSOR0_0_CURSOR_POSITION__CURSOR_X_POSITION__SHIFT
             (p.x & POSITION_MASK) << 16 | (p.y & POSITION_MASK),
         )?;
         self.set(
-            self.hubp(CURSOR_HOT_SPOT),
+            self.hubp(pipe, CURSOR_HOT_SPOT),
             // linux-lit: 16=CURSOR0_0_CURSOR_HOT_SPOT__CURSOR_HOT_SPOT_X__SHIFT
             (p.hot_x & HOT_SPOT_MASK) << 16 | (p.hot_y & HOT_SPOT_MASK),
         )?;
         self.set(
-            self.hubp(CURSOR_DST_OFFSET),
+            self.hubp(pipe, CURSOR_DST_OFFSET),
             p.dst_x_offset & DST_X_OFFSET_MASK,
         )?;
-        self.update(self.dpp(CUR0_CONTROL), ENABLE, enable)
+        self.update(self.dpp(pipe, CUR0_CONTROL), ENABLE, enable)
     }
     /// Program a new image (already in VRAM at `address`, pitch [`PITCH`])
     /// and place it, under one cursor lock.
@@ -284,13 +328,17 @@ impl<I: Io> Engine<I> {
         {
             return Err(Error::Invalid);
         }
-        let p = placement(x, y, (width, height), viewport, clocks);
+        let placed = self.placements((x, y), (width, height), viewport, clocks);
         let result = self.locked(|e| {
-            e.attributes(address, width, height)?;
-            e.position(p)
+            for (pipe, p) in placed.into_iter().flatten() {
+                e.attributes(pipe, address, width, height)?;
+                e.position(pipe, p)?;
+            }
+            Ok(())
         });
         // Whatever was written, the old image is no longer what is shown.
         self.shown = None;
+        self.placed = [None; 2];
         result?;
         let shown = Shown {
             address,
@@ -298,9 +346,10 @@ impl<I: Io> Engine<I> {
             height,
             x,
             y,
-            placement: p,
+            placement: placed[0].map(|(_, p)| p).ok_or(Error::Invalid)?,
         };
         self.shown = Some(shown);
+        self.placed = placed;
         Ok(shown)
     }
     /// Move the shown image.
@@ -311,30 +360,45 @@ impl<I: Io> Engine<I> {
         clocks: (u32, u32),
     ) -> Result<Shown, Error> {
         let mut shown = self.shown.ok_or(Error::Invalid)?;
-        let p = placement(x, y, (shown.width, shown.height), viewport, clocks);
-        if p == shown.placement {
+        let placed = self.placements((x, y), (shown.width, shown.height), viewport, clocks);
+        if placed == self.placed {
             shown.x = x;
             shown.y = y;
             self.shown = Some(shown);
             return Ok(shown);
         }
-        let result = self.locked(|e| e.position(p));
+        let result = self.locked(|e| {
+            for (pipe, p) in placed.into_iter().flatten() {
+                e.position(pipe, p)?;
+            }
+            Ok(())
+        });
         if result.is_err() {
             self.shown = None;
+            self.placed = [None; 2];
         }
         result?;
         shown.x = x;
         shown.y = y;
-        shown.placement = p;
+        shown.placement = placed[0].map(|(_, p)| p).ok_or(Error::Invalid)?;
         self.shown = Some(shown);
+        self.placed = placed;
         Ok(shown)
     }
     /// Disable the cursor in both HUBP and DPP (latched at the next VUPDATE).
     pub(crate) fn hide(&mut self) -> Result<(), Error> {
         self.shown = None;
+        self.placed = [None; 2];
+        let pipes = match self.slices {
+            None => [Some(self.pipe), None],
+            Some([(a, ..), (b, ..)]) => [Some(a), Some(b)],
+        };
         self.locked(|e| {
-            e.update(e.hubp(CURSOR_CONTROL), ENABLE, 0)?;
-            e.update(e.dpp(CUR0_CONTROL), ENABLE, 0)
+            for pipe in pipes.into_iter().flatten() {
+                e.update(e.hubp(pipe, CURSOR_CONTROL), ENABLE, 0)?;
+                e.update(e.dpp(pipe, CUR0_CONTROL), ENABLE, 0)?;
+            }
+            Ok(())
         })
     }
 }
@@ -366,8 +430,33 @@ impl Cursor {
             dcn2,
             dcn3,
             pipe,
+            slices: None,
             shown: None,
+            placed: [None; 2],
         }))
+    }
+    /// Drive the cursor across ODM 2:1 `slices` (pipe, `viewport_x`,
+    /// width; the first is this cursor's pipe), each pipe placed within its
+    /// slice under the master OPP's cursor lock, as `dc_stream_set_cursor_*`
+    /// programs every pipe of the stream.
+    ///
+    /// # Safety
+    /// As [`Cursor::new`], for the secondary pipe's HUBP and DPP too.
+    pub unsafe fn with_odm(
+        mut self,
+        gpu: &AmdGpu,
+        slices: [(u8, u32, u32); 2],
+    ) -> Result<Self, Error> {
+        let pipes = Profile::resolve(gpu)?.pipes();
+        if slices[0].0 != self.0.pipe
+            || slices[1].0 == slices[0].0
+            || slices[1].0 >= pipes
+            || slices.iter().any(|&(_, _, width)| width == 0)
+        {
+            return Err(Error::Invalid);
+        }
+        self.0.slices = Some(slices);
+        Ok(self)
     }
     pub fn shown(&self) -> Option<Shown> {
         self.0.shown

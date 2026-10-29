@@ -332,6 +332,34 @@ impl I2cHidDriver {
         report_id: u8,
         payload: &[u8],
     ) -> Result<(), I2cHidError> {
+        self.set_report(REPORT_TYPE_FEATURE, report_id, payload)
+            .await
+    }
+
+    /// SET_REPORT for an OUTPUT report by ID + payload — the
+    /// transport for keyboard LED state (the descriptor's LED-page
+    /// Output report; see `narf_hid::keyboard::detect_led_output`).
+    /// Framing is identical to the Feature form with the Output
+    /// report type (Microsoft HID-over-I2C §7.2 command table).
+    pub async fn set_output_report(
+        &self,
+        report_id: u8,
+        payload: &[u8],
+    ) -> Result<(), I2cHidError> {
+        self.set_report(REPORT_TYPE_OUTPUT, report_id, payload)
+            .await
+    }
+
+    /// Shared SET_REPORT framing for `set_feature_report` /
+    /// `set_output_report`: one write of [command register][(type
+    /// nibble | report ID nibble), SET_REPORT opcode][data
+    /// register][total length LE][report ID][payload].
+    async fn set_report(
+        &self,
+        report_type: u8,
+        report_id: u8,
+        payload: &[u8],
+    ) -> Result<(), I2cHidError> {
         let desc = self.descriptor.ok_or(I2cHidError::NotInitialised)?;
         let cmd_addr = desc.w_command_register.to_le_bytes();
         let data_addr = desc.w_data_register.to_le_bytes();
@@ -341,7 +369,7 @@ impl I2cHidDriver {
         let total_le = total_len.to_le_bytes();
         let mut buf = Vec::<u8>::with_capacity(8 + payload.len());
         buf.extend_from_slice(&cmd_addr);
-        buf.push((REPORT_TYPE_FEATURE << 4) | (report_id & 0x0f));
+        buf.push((report_type << 4) | (report_id & 0x0f));
         buf.push(CMD_OP_SET_REPORT);
         buf.extend_from_slice(&data_addr);
         buf.extend_from_slice(&total_le);
@@ -553,8 +581,9 @@ fn report_crs(path: &str) {
     }
 }
 
-// REPORT_TYPE_INPUT / OUTPUT are exported in case future code (e.g.
-// a debug shell that issues GET_REPORT against an Input report
-// directly) needs them; suppress unused warnings until then.
+// REPORT_TYPE_INPUT is kept in case future code (e.g. a debug
+// shell that issues GET_REPORT against an Input report directly)
+// needs it; suppress the unused warning until then.
+// (REPORT_TYPE_OUTPUT is live: `set_output_report`.)
 #[allow(dead_code)]
-const _ENSURE_REPORT_TYPES_LIVE: (u8, u8) = (REPORT_TYPE_INPUT, REPORT_TYPE_OUTPUT);
+const _ENSURE_REPORT_TYPES_LIVE: u8 = REPORT_TYPE_INPUT;

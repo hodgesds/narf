@@ -949,7 +949,10 @@ pub(super) fn pmksa(
             if !station {
                 return Err(EOPNOTSUPP);
             }
-            Err(EOPNOTSUPP)
+            iface
+                .set_pmksa(pmksa_entry(attrs, Some(pmkid))?)
+                .map(|()| Vec::new())
+                .map_err(errno_of)
         }
         DEL_PMKSA => {
             if let Some(p) = attr(attrs, 85) {
@@ -967,13 +970,31 @@ pub(super) fn pmksa(
                     return Err(EINVAL);
                 }
             }
-            Err(EOPNOTSUPP)
+            if !station {
+                return Err(EOPNOTSUPP);
+            }
+            iface
+                .del_pmksa(pmksa_entry(attrs, attr(attrs, 85))?)
+                .map(|()| Vec::new())
+                .map_err(errno_of)
         }
         _ => {
-            // FLUSH_PMKSA: station only, then no op.
-            Err(EOPNOTSUPP)
+            // FLUSH_PMKSA: station only, then the driver's flush.
+            if !station {
+                return Err(EOPNOTSUPP);
+            }
+            iface.flush_pmksa().map(|()| Vec::new()).map_err(errno_of)
         }
     }
+}
+
+/// `struct cfg80211_pmksa` from the validated SET/DEL_PMKSA attributes.
+fn pmksa_entry(attrs: &[(u16, &[u8])], pmkid: Option<&[u8]>) -> Result<crate::PmksaEntry, i32> {
+    Ok(crate::PmksaEntry {
+        bssid: mac_of(attrs)?,
+        pmkid: pmkid.map(|p| p[..16].try_into().unwrap()),
+        ssid: attr(attrs, 52).map(<[u8]>::to_vec),
+    })
 }
 
 // ── control port ─────────────────────────────────────────────────────
@@ -1232,6 +1253,8 @@ pub(super) fn regulatory_rule_flags(flags: crate::reg::RegFlags) -> u32 {
     u32::from(flags.contains(crate::reg::RegFlags::DFS)) << 4
         | u32::from(flags.contains(crate::reg::RegFlags::INDOOR_ONLY)) << 3
         | u32::from(flags.contains(crate::reg::RegFlags::NO_IR)) << 7
+        | u32::from(flags.contains(crate::reg::RegFlags::NO_6GHZ_VLP_CLIENT)) << 22
+        | u32::from(flags.contains(crate::reg::RegFlags::NO_6GHZ_AFC_CLIENT)) << 23
 }
 
 /// The global regulatory domain (`cfg80211_regdomain`): the deployment

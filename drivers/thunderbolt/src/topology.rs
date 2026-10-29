@@ -3,6 +3,7 @@
 use super::{
     cm::{compose_downstream, route_depth, CfgSpace},
     control::{Config, Control},
+    retimer::{self, Retimer},
     ring::Error,
 };
 use alloc::vec::Vec;
@@ -20,6 +21,16 @@ pub struct Port {
     pub max_out_hop: u16,
     pub total_credits: u16,
     pub secondary: bool,
+    /// Retimers enumerated on this port's link (lane adapters
+    /// only), in index order from this router. Empty when the link
+    /// carries no retimers — or when enumeration faulted, in which
+    /// case `retimer_fault` says why.
+    pub retimers: Vec<Retimer>,
+    /// The typed fault from the last retimer enumeration of this
+    /// port's link (a bonding disagreement, a refused or garbage
+    /// sideband reply, a timeout), or None when enumeration
+    /// completed — including the no-retimer case.
+    pub retimer_fault: Option<retimer::Error>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Router {
@@ -87,6 +98,8 @@ async fn port(ctl: &mut impl Config, route: u64, number: u8) -> Result<Port, Err
         max_out_hop: ((hdr[5] >> 11) & 2047) as u16,
         total_credits: ((hdr[4] >> 20) & 1023) as u16,
         secondary: false,
+        retimers: Vec::new(),
+        retimer_fault: None,
     };
     let mut next = (hdr[1] & 255) as u16;
     let mut seen = [false; 256];
@@ -200,7 +213,7 @@ async fn router(
         ports,
     })
 }
-async fn scan(
+pub(crate) async fn scan(
     ctl: &mut impl Config,
     id: u32,
     controls: u32,
@@ -219,11 +232,12 @@ async fn scan(
         let (route, upstream, parent_pcie_down) = queue[index];
         index += 1;
         let known = previous.routers.iter().any(|r| r.route == route);
-        let router = match router(ctl, route, upstream, controls, !known, parent_pcie_down).await {
-            Ok(r) => r,
-            Err(Error::Remote(0 | 1 | 4)) if route != 0 => continue,
-            Err(e) => return Err(e),
-        };
+        let mut router =
+            match router(ctl, route, upstream, controls, !known, parent_pcie_down).await {
+                Ok(r) => r,
+                Err(Error::Remote(0 | 1 | 4)) if route != 0 => continue,
+                Err(e) => return Err(e),
+            };
         if route_depth(route) < 5 {
             for p in &router.ports {
                 if p.kind != 1 || p.number == router.upstream || p.secondary || p.phy_cap == 0 {
@@ -237,6 +251,43 @@ async fn scan(
                         .ok_or(Error::Invalid)?;
                     let pcie_down = router.ports.iter().any(|p| p.kind == 0x100101);
                     queue.push((child, 0, pcie_down));
+                }
+            }
+        }
+        // Retimer enumeration rides the same link-up evidence as
+        // child discovery: a lane-0 port whose PHY reports a
+        // trained link state. Enumeration is best-effort discovery
+        // — a fault is recorded on the port as a typed value (and
+        // published with the domain snapshot) rather than failing
+        // the scan, but it is never silently folded into the
+        // no-retimer state.
+        for p in router.ports.iter_mut() {
+            if p.kind != 1
+                || p.number == router.upstream
+                || p.secondary
+                || p.phy_cap == 0
+                || p.usb4_cap == 0
+            {
+                continue;
+            }
+            let state = match ctl
+                .read(route, p.number, CfgSpace::Port, p.phy_cap + 1, 1)
+                .await
+            {
+                Ok(value) => value[0],
+                Err(_) => continue,
+            };
+            if !matches!((state >> 26) & 15, 2..=6) {
+                continue;
+            }
+            match retimer::scan_link(ctl, route, p).await {
+                Ok(chain) => {
+                    p.retimers = chain;
+                    p.retimer_fault = None;
+                }
+                Err(fault) => {
+                    p.retimers = Vec::new();
+                    p.retimer_fault = Some(fault);
                 }
             }
         }
@@ -354,6 +405,27 @@ pub(crate) async fn run(id: u32, controls: u32, ctl: &mut Control) -> Result<(),
                     "usb4: domain {id}: {} routers",
                     current.routers.len()
                 );
+                for router in &current.routers {
+                    for p in &router.ports {
+                        if let Some(fault) = p.retimer_fault {
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "usb4: domain {id}: route {:#x} port {} retimer fault: {:?}",
+                                router.route,
+                                p.number,
+                                fault
+                            );
+                        } else if !p.retimers.is_empty() {
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "usb4: domain {id}: route {:#x} port {}: {} retimers",
+                                router.route,
+                                p.number,
+                                p.retimers.len()
+                            );
+                        }
+                    }
+                }
                 let mut domains = DOMAINS.lock();
                 domains.retain(|d| d.id != id);
                 domains.push(current.clone());
@@ -372,6 +444,13 @@ pub(crate) async fn run(id: u32, controls: u32, ctl: &mut Control) -> Result<(),
     for tunnel in tunnels.iter_mut().rev() {
         let _ = tunnel.teardown(ctl, &current).await;
     }
+    // Disconnect the XDomain data paths too: their Hops entries
+    // are not tunnel-journaled, and leaving them enabled would
+    // route frames at NHI rings that stop with the engine's
+    // peers when `xd` drops at the end of this scope. The device
+    //-PM teardown after run() returns revokes bus mastering
+    // before any ring state is freed.
+    ctl.release_all_data_links().await;
     // A teardown that could not roll its journal back (e.g. a
     // poisoned channel) leaves paths possibly programmed in the
     // routers with no owner; record that so the device-PM handler

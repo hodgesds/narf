@@ -100,6 +100,7 @@ fn vector_inputs(fields: &[u32]) -> Option<(Soc, Vec<Stream>)> {
             }),
             // TMDS runs the PHY at the pixel clock, DP at its link rate.
             phy_khz: if f[12] != 0 { f[0] } else { s[6] },
+            odm: Odm::None,
         });
     }
     Some((soc, streams))

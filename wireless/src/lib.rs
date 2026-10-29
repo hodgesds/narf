@@ -15,6 +15,7 @@ pub mod ccmp;
 pub mod eapol;
 pub mod iface;
 pub mod mfp;
+pub mod mgmt_defrag;
 pub mod mlme;
 pub mod nl80211;
 pub mod packet_key;
@@ -27,7 +28,10 @@ pub mod station_security;
 pub mod wmm;
 
 pub use iface::{AccessCategory, WirelessError, WirelessIface, WirelessIfaceInfo};
-pub use scan::{BssInfo, ScanRandomMac, ScanRequest, ScanResult};
+pub use scan::{
+    BssInfo, ColocatedAp, Scan6GhzPlan, Scan6GhzTarget, ScanFlags, ScanRandomMac, ScanRequest,
+    ScanResult,
+};
 
 /// One `struct ieee80211_iface_limit` exposed through nl80211.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -343,10 +347,40 @@ pub trait WirelessNetIface: Interface {
         Err(EOPNOTSUPP)
     }
 
+    /// Scheduled-scan limits, or `None` (the default) when the wiphy has no
+    /// `sched_scan_start` (`NL80211_CMD_START_SCHED_SCAN` is EOPNOTSUPP).
+    fn sched_scan_support(&self) -> Option<SchedScanSupport> {
+        None
+    }
+
+    /// cfg80211 `rdev_sched_scan_start`: begin the parsed scheduled scan.
+    /// The driver reports matches with `nl80211::notify_sched_scan_results`
+    /// and a firmware-initiated end with `nl80211::notify_sched_scan_stopped`.
+    fn start_sched_scan(&self, _request: SchedScanRequest) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
+    /// cfg80211 `rdev_sched_scan_stop`: end the running scheduled scan
+    /// (ENOENT when none runs).
+    fn stop_sched_scan(&self) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+
     /// Current `WIPHY_FRAG_THRESHOLD`, or `None` when the driver does not
     /// publish a fragmentation-threshold setting.
     fn fragmentation_threshold(&self) -> Option<u32> {
         None
+    }
+
+    /// mac80211 `set_frag_threshold` / cfg80211 `rdev_set_wiphy_params`
+    /// with `WIPHY_PARAM_FRAG_THRESHOLD`: apply a physical-radio TX
+    /// fragmentation threshold in octets. The nl80211 layer has already
+    /// rejected values below 256 and rounded others down to an even length;
+    /// `u32::MAX` disables fragmentation. A driver that implements it also
+    /// reports the retained value from `fragmentation_threshold()`. The
+    /// default refuses, as drivers without the mac80211 op do.
+    fn set_fragmentation_threshold(&self, _threshold: u32) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
     }
 
     /// Current `WIPHY_RTS_THRESHOLD`, or `None` if this wiphy has no
@@ -431,6 +465,14 @@ pub trait WirelessNetIface: Interface {
     /// rejected unless its physical driver explicitly exposes the firmware
     /// capability.
     fn supports_scan_random_mac(&self) -> bool {
+        false
+    }
+
+    /// Whether this wiphy randomizes Probe Request sequence numbers on
+    /// request (`NL80211_EXT_FEATURE_SCAN_RANDOM_SN`). When true,
+    /// `NL80211_SCAN_FLAG_RANDOM_SN` is accepted and reaches
+    /// `scan_with_flags`; otherwise cfg80211's EOPNOTSUPP applies.
+    fn supports_scan_random_sn(&self) -> bool {
         false
     }
 
@@ -529,6 +571,17 @@ pub trait WirelessNetIface: Interface {
 
     /// Triggers an asynchronous scan.
     async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError>;
+
+    /// A triggered scan whose request carried `ScanFlags` (today only
+    /// `random_sn`, after `supports_scan_random_sn()` admitted it). The
+    /// default ignores the flags and runs `scan`.
+    async fn scan_with_flags(
+        &self,
+        req: ScanRequest,
+        _flags: ScanFlags,
+    ) -> Result<Vec<BssInfo>, WirelessError> {
+        self.scan(req).await
+    }
 
     /// Initiates association with an Access Point.
     async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError>;
@@ -885,6 +938,20 @@ pub trait WirelessNetIface: Interface {
     fn set_gtk_rekey_data(&self, _data: GtkRekeyData) -> Result<(), i32> {
         Err(EOPNOTSUPP)
     }
+    /// `cfg80211_ops.set_pmksa` (NL80211_CMD_SET_PMKSA): add or replace a
+    /// cached PMKSA in a FullMAC firmware's PMKID list. mac80211 drivers
+    /// keep the default -EOPNOTSUPP; the supplicant owns their cache.
+    fn set_pmksa(&self, _entry: PmksaEntry) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+    /// `cfg80211_ops.del_pmksa` (NL80211_CMD_DEL_PMKSA).
+    fn del_pmksa(&self, _entry: PmksaEntry) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+    /// `cfg80211_ops.flush_pmksa` (NL80211_CMD_FLUSH_PMKSA).
+    fn flush_pmksa(&self) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
 
     /// `wiphy->wowlan`: capabilities the driver advertises for WoWLAN.
     /// Absence means `GET/SET_WOWLAN` must return `-EOPNOTSUPP`.
@@ -1126,6 +1193,15 @@ pub struct GtkRekeyData {
     pub akm: Option<u32>,
 }
 
+/// One `struct cfg80211_pmksa` request (NL80211_ATTR_MAC / _PMKID / _SSID).
+/// A PMKID is an identifier, not key material; no PMK is carried here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PmksaEntry {
+    pub bssid: Option<[u8; 6]>,
+    pub pmkid: Option<[u8; 16]>,
+    pub ssid: Option<Vec<u8>>,
+}
+
 /// One SSID/RSSI match condition for WoWLAN network detection.  The RSSI
 /// threshold is in dBm; `None` leaves firmware's normal candidate policy in
 /// effect.
@@ -1134,6 +1210,50 @@ pub struct NetDetectMatch {
     pub ssid: Vec<u8>,
     pub rssi_threshold_dbm: Option<i32>,
 }
+
+/// Scheduled-scan (PNO) limits of a wiphy (cfg80211 `wiphy->max_sched_scan_*`
+/// / `max_match_sets`). Returning it from
+/// `WirelessIface::sched_scan_support` advertises
+/// `NL80211_CMD_START_SCHED_SCAN` / `STOP_SCHED_SCAN` and these limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SchedScanSupport {
+    /// `max_match_sets` (nonzero).
+    pub max_match_sets: u8,
+    /// `max_sched_scan_ssids`.
+    pub max_ssids: u8,
+    /// `max_sched_scan_ie_len`.
+    pub max_ie_len: u16,
+    /// `max_sched_scan_plans`.
+    pub max_scan_plans: u32,
+    /// `max_sched_scan_plan_interval`, seconds.
+    pub max_plan_interval_secs: u32,
+    /// `max_sched_scan_plan_iterations`.
+    pub max_plan_iterations: u32,
+    /// Frequencies one request may list.
+    pub max_frequencies: u16,
+    /// `NL80211_FEATURE_SCHED_SCAN_RANDOM_MAC_ADDR`.
+    pub random_mac: bool,
+}
+impl SchedScanSupport {
+    /// The limits the WoWLAN net-detect parser has always applied (ath11k
+    /// PNO: 16 SSIDs, 512-octet IEs, two plans of at most 7200 s / 100
+    /// iterations, 60 channels); `max_match_sets` and `random_mac` come from
+    /// `WowlanSupport`.
+    pub const NET_DETECT: Self = Self {
+        max_match_sets: 0,
+        max_ssids: 16,
+        max_ie_len: 512,
+        max_scan_plans: 2,
+        max_plan_interval_secs: 7200,
+        max_plan_iterations: 100,
+        max_frequencies: 60,
+        random_mac: false,
+    };
+}
+
+/// A parsed `NL80211_CMD_START_SCHED_SCAN` request: the same
+/// `nl80211_parse_sched_scan` result WoWLAN net-detect carries.
+pub type SchedScanRequest = NetDetectConfig;
 
 /// One `NL80211_SCHED_SCAN_PLAN`: after `iterations` scans at `interval`,
 /// firmware advances to the next plan.  The final plan has no iteration

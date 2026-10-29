@@ -166,6 +166,39 @@ pub fn notify_color_change(name: &str, state: u8, count: u8) {
     );
 }
 
+/// `nl80211_send_sched_scan`: multicast a scheduled-scan event (START,
+/// RESULTS = 77 or STOPPED = 78) for `name` on the "scan" group with its
+/// wiphy-independent IFINDEX.
+pub(crate) fn notify_sched_scan(name: &str, index: u32, command: u8) {
+    let Some(iface) = narf_net::iface::lookup(name) else {
+        return;
+    };
+    let mut attrs = Vec::new();
+    push_attr(&mut attrs, 3, &index.to_ne_bytes());
+    narf_net::netlink_generic::publish_event(
+        NL80211_FAMILY_ID,
+        18,
+        iface.net_ns_id,
+        GenlReply { command, attrs },
+    );
+}
+
+/// `cfg80211_sched_scan_results`: the running scheduled scan found matches
+/// (`NL80211_CMD_SCHED_SCAN_RESULTS`); userspace then dumps GET_SCAN.
+pub fn notify_sched_scan_results(name: &str) {
+    if let Some(index) = narf_net::netlink_route::ifindex_for_name(name) {
+        notify_sched_scan(name, index, 77);
+    }
+}
+
+/// `cfg80211_sched_scan_stopped`: the driver or firmware ended the
+/// scheduled scan (`NL80211_CMD_SCHED_SCAN_STOPPED`).
+pub fn notify_sched_scan_stopped(name: &str) {
+    if let Some(index) = narf_net::netlink_route::ifindex_for_name(name) {
+        notify_sched_scan(name, index, 78);
+    }
+}
+
 /// Report a driver's completed link-down transition
 /// (`nl80211_send_disconnected` from `__cfg80211_disconnected`): the
 /// reason code (omitted when 0) and, when the AP sent the
@@ -186,6 +219,56 @@ pub fn notify_disconnect(name: &str, reason: u16, from_ap: bool) {
         iface.net_ns_id,
         GenlReply { command: 48, attrs },
     );
+}
+
+/// Report a driver-completed roam (`cfg80211_roamed` →
+/// `nl80211_send_roamed`, NL80211_CMD_ROAM = 47): the new BSSID, its
+/// operating frequency and the (re)association request/response elements.
+/// FullMAC firmware roaming calls this after its own key/port confirmation.
+pub fn notify_roamed(
+    name: &str,
+    bssid: [u8; 6],
+    frequency_mhz: u32,
+    req_ie: &[u8],
+    resp_ie: &[u8],
+) {
+    let Some(index) = narf_net::netlink_route::ifindex_for_name(name) else {
+        return;
+    };
+    let Some(iface) = narf_net::iface::lookup(name) else {
+        return;
+    };
+    narf_net::netlink_generic::publish_event(
+        NL80211_FAMILY_ID,
+        19,
+        iface.net_ns_id,
+        GenlReply {
+            command: 47,
+            attrs: roamed_attrs(index, bssid, frequency_mhz, req_ie, resp_ie),
+        },
+    );
+}
+
+/// Attributes of `nl80211_send_roamed`: IFINDEX, MAC, WIPHY_FREQ and the
+/// non-empty REQ_IE / RESP_IE elements.
+pub fn roamed_attrs(
+    ifindex: u32,
+    bssid: [u8; 6],
+    frequency_mhz: u32,
+    req_ie: &[u8],
+    resp_ie: &[u8],
+) -> Vec<u8> {
+    let mut attrs = Vec::new();
+    push_attr(&mut attrs, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    push_attr(&mut attrs, 6, &bssid); // NL80211_ATTR_MAC
+    push_attr(&mut attrs, 38, &frequency_mhz.to_ne_bytes()); // WIPHY_FREQ
+    if !req_ie.is_empty() {
+        push_attr(&mut attrs, 77, req_ie); // NL80211_ATTR_REQ_IE
+    }
+    if !resp_ie.is_empty() {
+        push_attr(&mut attrs, 78, resp_ie); // NL80211_ATTR_RESP_IE
+    }
+    attrs
 }
 
 /// `cfg80211_cqm_pktloss_notify`: firmware reported that `peer` did not
@@ -929,14 +1012,28 @@ fn wiphy_attrs(
             // general scheduled-scan operation.
             // `nl80211_send_wiphy` uses u8/u16/u8 for these three limits;
             // their attribute widths are part of the netlink ABI.
-            push_attr(&mut attrs, 123, &[16]);
-            push_attr(&mut attrs, 124, &512u16.to_ne_bytes());
-            push_attr(&mut attrs, 133, &[wowlan.net_detect_max_match_sets]);
-            push_attr(&mut attrs, 222, &2u32.to_ne_bytes());
-            push_attr(&mut attrs, 223, &7200u32.to_ne_bytes());
-            push_attr(&mut attrs, 224, &100u32.to_ne_bytes());
+            // A wiphy with `sched_scan_support()` publishes its own limits.
+            if iface.is_none_or(|iface| iface.sched_scan_support().is_none()) {
+                push_attr(&mut attrs, 123, &[16]);
+                push_attr(&mut attrs, 124, &512u16.to_ne_bytes());
+                push_attr(&mut attrs, 133, &[wowlan.net_detect_max_match_sets]);
+                push_attr(&mut attrs, 222, &2u32.to_ne_bytes());
+                push_attr(&mut attrs, 223, &7200u32.to_ne_bytes());
+                push_attr(&mut attrs, 224, &100u32.to_ne_bytes());
+            }
         }
         push_attr(&mut attrs, 118 | NLA_F_NESTED, &triggers);
+    }
+    if let Some(sched) = iface.and_then(|iface| iface.sched_scan_support()) {
+        // `nl80211_send_wiphy` widths: u8 SSIDs, u16 IE length, u8 match
+        // sets, u32 plan limits and request count.
+        push_attr(&mut attrs, 123, &[sched.max_ssids]);
+        push_attr(&mut attrs, 124, &sched.max_ie_len.to_ne_bytes());
+        push_attr(&mut attrs, 133, &[sched.max_match_sets]);
+        push_attr(&mut attrs, 222, &sched.max_scan_plans.to_ne_bytes());
+        push_attr(&mut attrs, 223, &sched.max_plan_interval_secs.to_ne_bytes());
+        push_attr(&mut attrs, 224, &sched.max_plan_iterations.to_ne_bytes());
+        push_attr(&mut attrs, 256, &1u32.to_ne_bytes()); // SCHED_SCAN_MAX_REQS
     }
     let mut command_list: Vec<u32> = alloc::vec![
         NL80211_CMD_GET_WIPHY as u32,
@@ -949,12 +1046,18 @@ fn wiphy_attrs(
         6,  // SET_INTERFACE
         17, // GET_STATION
     ];
-    if iface.is_some_and(|iface| iface.antenna_info().is_some() || iface.rts_threshold().is_some())
-    {
+    if iface.is_some_and(|iface| {
+        iface.antenna_info().is_some()
+            || iface.rts_threshold().is_some()
+            || iface.fragmentation_threshold().is_some()
+    }) {
         command_list.push(NL80211_CMD_SET_WIPHY as u32);
     }
     if iface.is_some_and(|iface| iface.supports_survey()) {
         command_list.push(NL80211_CMD_GET_SURVEY as u32);
+    }
+    if iface.is_some_and(|iface| iface.sched_scan_support().is_some()) {
+        command_list.extend_from_slice(&[75, 76]); // START/STOP_SCHED_SCAN
     }
     if iface.is_some_and(|iface| iface.supports_tx_bitrate_mask()) {
         command_list.push(NL80211_CMD_SET_TX_BITRATE_MASK as u32);
@@ -1064,6 +1167,13 @@ fn wiphy_security_attrs(attrs: &mut Vec<u8>, iface: &dyn crate::WirelessNetIface
         feature_flags |= 1 << 29;
     }
     if iface
+        .sched_scan_support()
+        .is_some_and(|support| support.random_mac)
+    {
+        // NL80211_FEATURE_SCHED_SCAN_RANDOM_MAC_ADDR.
+        feature_flags |= 1 << 30;
+    }
+    if iface
         .wowlan_support()
         .is_some_and(|support| support.net_detect_random_mac)
     {
@@ -1104,13 +1214,16 @@ fn wiphy_security_attrs(attrs: &mut Vec<u8>, iface: &dyn crate::WirelessNetIface
         bits.push(58); // BSS_COLOR
     }
     if iface.supports_station_tx_power() {
-        bits.push(36); // STA_TX_PWR
+        bits.push(37); // STA_TX_PWR
     }
     if iface.supports_ack_signal() {
         bits.push(27); // ACK_SIGNAL_SUPPORT
     }
     if iface.supports_scan_dwell() {
         bits.push(5); // SET_SCAN_DWELL
+    }
+    if iface.supports_scan_random_sn() {
+        bits.push(29); // SCAN_RANDOM_SN
     }
     if iface.supports_cqm_rssi_list() {
         bits.push(13); // CQM_RSSI_LIST
@@ -1367,6 +1480,8 @@ pub(crate) const OPERATIONS: &[GenlOperation] = &[
     op(NL80211_CMD_DEL_INTERFACE, DO, UNS),
     op(NL80211_CMD_GET_WOWLAN, DO, OPEN),
     op(NL80211_CMD_SET_WOWLAN, DO, UNS),
+    op(75, DO, UNS),         // START_SCHED_SCAN
+    op(76, DO, UNS),         // STOP_SCHED_SCAN
     op(6, DO, UNS),          // SET_INTERFACE
     op(17, DO | DUMP, OPEN), // GET_STATION
     op(32, DUMP, OPEN),      // GET_SCAN

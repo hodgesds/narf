@@ -42,18 +42,28 @@ const FIONREAD: u32 = 0x541B;
 use narf_filesystem::{pipe_buffer::PipeBufs, pipe_queue as queue};
 
 fn lock_queue(queue: &queue::Queue) -> queue::Guard<'_> {
+    // The common uncontended case needs no task waker or future bridge.
+    // Contention still takes the same sleepable mutex through lock_async.
+    if let Some(guard) = queue.try_lock() {
+        return guard;
+    }
+    // Avoid parking for a short resident-page copy on a peer CPU. The queue
+    // limits this to one spinner and 32 pauses, respecting queued sleepers.
+    if let Some(guard) = queue.try_lock_optimistic() {
+        return guard;
+    }
     crate::handlers::poll_blocking(queue.lock_async())
         .expect("pipe mutex acquisition requires a runnable task context")
 }
 
-enum Endpoint<'a> {
+pub(crate) enum Endpoint<'a> {
     Read(&'a PipeRead),
     Write(&'a PipeWrite),
     Named(&'a narf_filesystem::fifo::FifoHandle),
 }
 
 impl<'a> Endpoint<'a> {
-    fn from_file(ops: &'a dyn FileOps) -> Option<Self> {
+    pub(crate) fn from_file(ops: &'a dyn FileOps) -> Option<Self> {
         let any = ops.as_any()?;
         if let Some(read) = any.downcast_ref::<PipeRead>() {
             return Some(Self::Read(read));
@@ -108,19 +118,23 @@ impl<'a> Endpoint<'a> {
     }
 }
 
-/// One transactional iterator write, including capacity/fault distinction for
-/// a blocking syscall which must retain its accepted prefix while sleeping.
-pub(crate) fn write_from_iter(
-    ops: &dyn FileOps,
+/// One transactional raw iterator write, retaining a committed prefix across
+/// a blocking syscall's capacity wait.
+/// # Safety
+/// On success the callback initializes every requested destination byte and
+/// accesses only that range, without reading uninitialized bytes or retaining
+/// a pointer beyond the call. Errors leave that callback's range unpublished.
+pub(crate) unsafe fn write_from_raw_iter(
+    output: &Endpoint<'_>,
     len: usize,
-    copy: impl FnMut(usize, &mut [u8]) -> Result<(), u64>,
+    copy: impl FnMut(usize, *mut u8, usize) -> Result<(), u64>,
 ) -> Result<(usize, bool), u64> {
-    let output = Endpoint::from_file(ops).ok_or(EBADF as u64)?;
     let mut q = lock_queue(output.queue());
     if output.reader_closed() {
         return Err(EPIPE as u64);
     }
-    let n = q.write_with(len, output.packetized(), copy)?;
+    // SAFETY: forwarded complete-initialization contract from the caller.
+    let n = unsafe { q.write_with_raw(len, output.packetized(), copy) }?;
     let full = q.is_full();
     drop(q);
     if n != 0 {
@@ -133,9 +147,18 @@ pub(crate) fn read_to_iter(
     ops: &dyn FileOps,
     len: usize,
     discard_packets: bool,
-    mut copy: impl FnMut(usize, *const u8, usize) -> Result<(), u64>,
+    copy: impl FnMut(usize, *const u8, usize) -> Result<(), u64>,
 ) -> Result<usize, u64> {
     let input = Endpoint::from_file(ops).ok_or(EBADF as u64)?;
+    read_endpoint(&input, len, discard_packets, copy)
+}
+
+pub(crate) fn read_endpoint(
+    input: &Endpoint<'_>,
+    len: usize,
+    discard_packets: bool,
+    mut copy: impl FnMut(usize, *const u8, usize) -> Result<(), u64>,
+) -> Result<usize, u64> {
     let mut q = lock_queue(input.queue());
     if q.is_empty() {
         return if input.writer_closed() {
@@ -206,6 +229,11 @@ pub(crate) fn transfer(
         src.copy_prefix_to(&mut dst, max)
     } else {
         src.move_prefix_to(&mut dst, max)
+    }
+    .map_err(|_| FsError::OutOfMemory);
+    let n = match n {
+        Ok(n) => n,
+        Err(error) => return Some(Err(error)),
     };
     drop(dst);
     drop(src);
@@ -490,12 +518,15 @@ impl PipeShared {
         wake_all: bool,
         urgent_handoff: bool,
     ) {
-        if !self.readiness_active.load(Ordering::Acquire) {
-            return;
-        }
         // Re-sample under the publication lock so a delayed older writer
         // cannot overwrite a newer state or a final-close notification.
         let _publish = self.publish.lock();
+        // Serialize the inactive decision with first activation too: either
+        // activation samples this completed mutation, or we see it active and
+        // publish. An early return outside the lock permits both to miss.
+        if !self.readiness_active.load(Ordering::Acquire) {
+            return;
+        }
         let (len, full) = self.queue.snapshot();
         self.publish_readiness_state_with_policy(event, len, full, wake_all, urgent_handoff);
     }

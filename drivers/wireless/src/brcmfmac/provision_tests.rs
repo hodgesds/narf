@@ -381,6 +381,7 @@ fn smoke_brcm_revoked_board_source_precedes_native_pcie_configuration_dma_and_mm
         device,
         cap,
         pcie_core: None,
+        msi: None,
     };
     if bus.read32(0x18000000).is_ok()
         || bus.write32(0x18000000, 0).is_ok()

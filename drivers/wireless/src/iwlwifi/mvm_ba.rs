@@ -308,12 +308,11 @@ impl Owner {
     pub(super) fn ba_qualified(&self) -> bool {
         self.power.phy.ba.selected
             && self.power.phy.negotiated.is_some_and(|p| p.ht)
-            && self.power.prepared.as_ref().is_some_and(|p| {
-                matches!(
-                    p.emission,
-                    super::power::Emission::Ht20Ba | super::power::Emission::Ht20NestedBa
-                )
-            })
+            && self
+                .power
+                .prepared
+                .as_ref()
+                .is_some_and(|p| p.emission.features() & super::power::feature::BA != 0)
     }
     pub(super) fn capture_ba_action(&mut self, body: &[u8]) -> bool {
         if !self.ba_qualified()

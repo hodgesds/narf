@@ -505,6 +505,9 @@ pub fn register_pci_driver() {
             },
             probe,
         });
+        if matches!(did, 0xb852 | 0xb85b) {
+            narf_bus::register_pci_remove(name_for(did), super::bootstrap::remove);
+        }
     }
 }
 

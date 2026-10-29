@@ -24,6 +24,7 @@ struct State<R: Fullmac> {
     rx: Producer<Frame, RX_RING_N>,
     tx: Consumer<Frame, TX_RING_N>,
     pending: Option<PendingTx>,
+    telemetry: Arc<super::telemetry::Counters>,
 }
 struct PendingTx {
     frame: Frame,
@@ -33,6 +34,14 @@ struct Received {
     epoch: u64,
     peer: [u8; 6],
     bytes: Vec<u8>,
+    /// EAPOL for the host supplicant's control port.
+    control: bool,
+}
+/// Ordered host-supplicant control operations, applied by the worker.
+enum ExternalOp {
+    Key(narf_wireless::KeyParams),
+    DeleteKey(u8),
+    Authorize([u8; 6], bool),
 }
 #[cfg(any(test, feature = "kernel-test"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,14 +53,32 @@ enum ReceivePoint {
 type ReceiveHook = Arc<dyn Fn(ReceivePoint) + Send + Sync>;
 impl<R: Fullmac> State<R> {
     fn clear_transmit(&mut self) {
-        self.pending = None;
+        if let Some(pending) = self.pending.take() {
+            self.drop_frame(&pending.frame);
+        }
         // A ring has finite capacity. Bound cleanup even if its producer
         // runs concurrently; a disconnected interface admits no new TX.
         for _ in 0..TX_RING_N {
-            if !matches!(self.tx.try_recv(), Ok(Some(_))) {
-                break;
+            match self.tx.try_recv() {
+                Ok(Some(frame)) => self.drop_frame(&frame),
+                _ => break,
             }
         }
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    fn tx_queue_for_test(&mut self, bytes: Vec<u8>) {
+        let buffer = narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
+            .expect("test frame");
+        let mut frame = Frame::new(buffer, bytes.len() as u32);
+        frame.payload_mut().copy_from_slice(&bytes);
+        self.pending = Some(PendingTx {
+            frame,
+            deadline: narf_time::Deadline::after_ms(2000),
+        });
+    }
+    fn drop_frame(&self, frame: &Frame) {
+        self.telemetry
+            .dropped(crate::ath11k::tx_hdr::classify8021d(frame.payload()));
     }
 
     /// One synchronous progress step, shared by the timer and kernel
@@ -61,7 +88,9 @@ impl<R: Fullmac> State<R> {
             self.clear_transmit();
             return Err(error);
         }
-        if self.station.bssid.is_none() {
+        if self.station.bssid.is_none() || self.station.external_port() == Some(false) {
+            // An unauthorized host-supplicant port passes only EAPOL, which
+            // uses the control-port path, never the netdev rings.
             self.clear_transmit();
             return Ok(());
         }
@@ -78,13 +107,19 @@ impl<R: Fullmac> State<R> {
         let Some(pending) = self.pending.as_ref() else {
             return Ok(());
         };
+        // Linux brcmf_netdev_start_xmit: cfg80211_classify8021d.
+        let priority = crate::ath11k::tx_hdr::classify8021d(pending.frame.payload());
+        let length = pending.frame.payload().len();
         let result = if pending.deadline.expired() {
             Err(Error::Timeout)
         } else {
-            self.station.send_data(pending.frame.payload(), 0)
+            self.station.send_data(pending.frame.payload(), priority)
         };
         match result {
-            Ok(()) => self.pending = None,
+            Ok(()) => {
+                self.pending = None;
+                self.telemetry.transmitted(priority, length);
+            }
             Err(Error::Busy) => {}
             Err(error) => {
                 self.station.runtime.fail();
@@ -103,6 +138,12 @@ pub struct Device<R: Fullmac> {
     channels: Vec<u32>,
     supplicant: bool,
     mfp_supported: bool,
+    sae_offload: bool,
+    telemetry: Arc<super::telemetry::Counters>,
+    external_ops: IrqSafeSpinLock<alloc::collections::VecDeque<ExternalOp>>,
+    /// Desired firmware PMKID list (nl80211 SET/DEL/FLUSH_PMKSA); the
+    /// worker and each association reconcile firmware with it.
+    pmksa: IrqSafeSpinLock<super::station::pmksa::Cache>,
     ht_capabilities: [Option<[u8; 26]>; 2],
     vht_capabilities: [Option<[u8; 12]>; 2],
     up: AtomicBool,
@@ -112,11 +153,53 @@ pub struct Device<R: Fullmac> {
     bssid: AtomicU64,
     epoch: AtomicU64,
     closing: AtomicBool,
+    /// A firmware roam holds the port closed; carrier loss is not reported
+    /// as a disconnect unless the roam fails.
+    roaming: AtomicBool,
     publication: IrqSafeSpinLock<()>,
     #[cfg(any(test, feature = "kernel-test"))]
     receive_hook: IrqSafeSpinLock<Option<ReceiveHook>>,
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    lifecycle: Lifecycle,
+}
+/// Teardown state of one published shell (one transport generation).
+pub(crate) struct Lifecycle {
+    /// Set by [`Device::withdraw`]: registrations are gone and the worker
+    /// exits; the shell never publishes again.
+    withdrawn: AtomicBool,
+    /// The last association the operator requested and the firmware
+    /// completed; a transport reset replays it on the next generation.
+    /// Cleared by a disconnect. Host-supplicant (`External`) associations
+    /// are not retained: their keys live in userspace.
+    request: IrqSafeSpinLock<Option<AssociateRequest>>,
+}
+impl Default for Lifecycle {
+    fn default() -> Self {
+        Self {
+            withdrawn: AtomicBool::new(false),
+            request: IrqSafeSpinLock::new(None),
+        }
+    }
+}
+fn retained_request(request: &AssociateRequest) -> Option<AssociateRequest> {
+    use narf_wireless::SecurityConfig;
+    let security = match &request.security {
+        SecurityConfig::Open => SecurityConfig::Open,
+        SecurityConfig::Wpa2 { psk } => SecurityConfig::Wpa2 { psk: *psk },
+        SecurityConfig::Wpa3 { password } => SecurityConfig::Wpa3 {
+            password: password.clone(),
+        },
+        SecurityConfig::External(_) => return None,
+    };
+    Some(AssociateRequest {
+        bssid: request.bssid,
+        ssid: request.ssid.clone(),
+        frequency_mhz: request.frequency_mhz,
+        channel: request.channel,
+        security,
+        ie: request.ie.clone(),
+    })
 }
 impl<R: Fullmac> core::fmt::Debug for Device<R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -127,9 +210,32 @@ impl<R: Fullmac> core::fmt::Debug for Device<R> {
     }
 }
 
+type PmFuture<'a> = core::pin::Pin<
+    alloc::boxed::Box<dyn core::future::Future<Output = Result<(), Error>> + Send + 'a>,
+>;
 trait Endpoint: Send + Sync {
     fn enqueue(&self, bytes: &[u8]) -> Result<(), ()>;
     fn drain(&self) -> bool;
+    fn suspend(&self) -> PmFuture<'_>;
+    fn resume(&self) -> PmFuture<'_>;
+}
+/// System-suspend prepare for the attached PCIe FullMAC owner, if any:
+/// Linux `brcmf_cfg80211_suspend` without WoWL (`brcmf_link_down` on a
+/// connected station) followed by the bus `suspend` op.
+pub async fn suspend_pcie() -> Result<(), Error> {
+    let active = ACTIVE_PCIE.lock().clone();
+    match active {
+        Some(active) => active.suspend().await,
+        None => Ok(()),
+    }
+}
+/// Paired resume for [`suspend_pcie`].
+pub async fn resume_pcie() -> Result<(), Error> {
+    let active = ACTIVE_PCIE.lock().clone();
+    match active {
+        Some(active) => active.resume().await,
+        None => Ok(()),
+    }
 }
 static ACTIVE_SDIO: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
 static ACTIVE_PCIE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
@@ -177,6 +283,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
     narf_wireless::reg::db::ensure_snapshot().map_err(|_| Error::Authority)?;
     let station =
         Station::initialize_live(runtime, clm, Arc::new(super::station::GlobalPolicy)).await?;
+    let telemetry = Arc::new(super::telemetry::Counters::default());
     let (rx_producer, rx_consumer) = narf_ipc::channel();
     let (tx_producer, tx_consumer) = narf_ipc::channel();
     let device = Arc::new(Device {
@@ -185,6 +292,10 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
         channels: station.channels.iter().map(|&ch| u32::from(ch)).collect(),
         supplicant: station.supplicant,
         mfp_supported: station.supports_management_protection(),
+        sae_offload: station.supports_sae_offload(),
+        telemetry: telemetry.clone(),
+        external_ops: IrqSafeSpinLock::new(Default::default()),
+        pmksa: IrqSafeSpinLock::new(Default::default()),
         ht_capabilities: station.ht_capabilities(),
         vht_capabilities: station.vht_capabilities(),
         state: Mutex::new(State {
@@ -192,10 +303,12 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
             rx: rx_producer,
             tx: tx_consumer,
             pending: None,
+            telemetry,
         }),
         up: AtomicBool::new(false),
         power_save: AtomicU8::new(0),
         bssid: AtomicU64::new(0),
+        roaming: AtomicBool::new(false),
         epoch: AtomicU64::new(0),
         closing: AtomicBool::new(false),
         publication: IrqSafeSpinLock::new(()),
@@ -203,6 +316,7 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
         receive_hook: IrqSafeSpinLock::new(None),
         rx: IrqSafeSpinLock::new(Some(rx_consumer)),
         tx: IrqSafeSpinLock::new(Some(tx_producer)),
+        lifecycle: Lifecycle::default(),
     });
     {
         let mut active = slot.lock();
@@ -242,6 +356,62 @@ pub async fn attach_runtime<R: Fullmac + 'static>(
 }
 
 impl<R: Fullmac + 'static> Device<R> {
+    /// Interface name of this shell.
+    pub fn interface_name(&self) -> &str {
+        &self.name
+    }
+    /// The transport generation is terminal and needs a reset. `false`
+    /// while another path holds the station mutex.
+    pub fn transport_failed(&self) -> bool {
+        self.state
+            .try_lock()
+            .is_some_and(|state| state.station.runtime.transport_failed())
+    }
+    /// Whether [`Self::withdraw`] has run.
+    pub fn withdrawn(&self) -> bool {
+        self.lifecycle.withdrawn.load(Ordering::Acquire)
+    }
+    /// Linux `brcmf_detach` for this shell: close host admission, drop the
+    /// carrier and withdraw the wireless, network-registry and kernel
+    /// netdev publications. The netdev is retired, not unregistered
+    /// (`narf_net::iface::retire_for_rebind`), so a later generation of the
+    /// same function reclaims its name, ifindex and configuration. The
+    /// receive worker exits at its next iteration. The transport itself is
+    /// stopped by [`Self::teardown`].
+    pub fn withdraw(self: &Arc<Self>) {
+        if self.lifecycle.withdrawn.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.close_host();
+        {
+            let mut active = active_slot(R::FAMILY).lock();
+            let this = Arc::as_ptr(self) as *const ();
+            if active
+                .as_ref()
+                .is_some_and(|owner| Arc::as_ptr(owner) as *const () == this)
+            {
+                *active = None;
+            }
+        }
+        narf_wireless::registry::unregister(&self.name);
+        narf_net::registry().unregister(&self.name);
+        narf_net::iface::retire_for_rebind(&self.name);
+    }
+    /// Withdraw the shell, then stop and release the transport generation
+    /// under the station mutex (Linux `brcmf_pcie_remove`: `brcmf_detach`,
+    /// release IRQ, then the ring/scratch buffers). Returns true only when
+    /// the confirmed stop proved every published mapping reclaimable and
+    /// they were freed; otherwise they stay pinned.
+    pub async fn teardown(self: &Arc<Self>) -> bool {
+        self.withdraw();
+        let mut state = self.state.lock().await;
+        state.clear_transmit();
+        state.station.bssid = None;
+        let proof = state.station.runtime.stop_transport().await.is_ok();
+        let released = state.station.runtime.release_transport();
+        self.power_save.store(2, Ordering::Release);
+        proof && released
+    }
     fn link(&self, peer: Option<[u8; 6]>) {
         let _publication = self.publication.lock();
         self.publish_link(peer);
@@ -293,7 +463,9 @@ impl<R: Fullmac + 'static> Device<R> {
         narf_net::iface::set_link_metadata(&self.name, up, None, None);
         if was_up && !up {
             self.clear_rx();
-            narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
+            if !self.roaming.load(Ordering::Acquire) {
+                narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
+            }
         }
     }
 
@@ -323,6 +495,12 @@ impl<R: Fullmac + 'static> Device<R> {
                 state.progress()
             }
         };
+        let roaming = state.station.roam_pending().is_some();
+        if self.roaming.swap(roaming, Ordering::AcqRel) && !roaming && state.station.bssid.is_none()
+        {
+            // The firmware roam failed after its carrier loss was withheld.
+            narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
+        }
         if result.is_err() {
             self.power_save.store(2, Ordering::Release);
             self.link(None);
@@ -344,10 +522,27 @@ impl<R: Fullmac + 'static> Device<R> {
             let Some(bytes) = state.station.runtime.pop_data() else {
                 break;
             };
-            if !self.up.load(Ordering::Acquire) || !receive_admitted(&bytes, self.mac) {
+            if state.station.external_port().is_some() && eapol_admitted(&bytes, self.mac, peer) {
+                output.push(Received {
+                    epoch,
+                    peer,
+                    bytes,
+                    control: true,
+                });
                 continue;
             }
-            output.push(Received { epoch, peer, bytes });
+            if !self.up.load(Ordering::Acquire)
+                || state.station.external_port() == Some(false)
+                || !receive_admitted(&bytes, self.mac)
+            {
+                continue;
+            }
+            output.push(Received {
+                epoch,
+                peer,
+                bytes,
+                control: false,
+            });
         }
         output
     }
@@ -414,14 +609,98 @@ impl<R: Fullmac + 'static> Device<R> {
     fn deliver_received(&self, frames: Vec<Received>) -> bool {
         let mut progress = false;
         for mut frame in frames {
+            if frame.control {
+                self.deliver_control(&frame);
+                progress = true;
+                continue;
+            }
             if !self.publish_received(&frame) {
                 break;
             }
+            self.telemetry.received(
+                crate::ath11k::tx_hdr::classify8021d(&frame.bytes),
+                frame.bytes.len(),
+            );
             // No state/publication/ring guard survives the final admission.
             narf_net::iface::on_rx_frame_from(&self.name, &mut frame.bytes);
             progress = true;
         }
         progress
+    }
+
+    /// `cfg80211_rx_control_port` for the current host-supplicant peer, or
+    /// the netdev when the owner did not request control port over nl80211.
+    fn deliver_control(&self, received: &Received) {
+        let authorized = {
+            let Some(state) = self.state.try_lock() else {
+                return;
+            };
+            if self.epoch.load(Ordering::Acquire) != received.epoch
+                || state.station.bssid != Some(received.peer)
+            {
+                return;
+            }
+            state.station.external_port() == Some(true)
+        };
+        if narf_wireless::nl80211::control_port_over_nl80211(&self.name) {
+            narf_wireless::nl80211::rx_control_port(
+                &self.name,
+                received.peer,
+                0x888e,
+                &received.bytes[14..],
+                !authorized,
+            );
+        } else {
+            let mut bytes = received.bytes.clone();
+            narf_net::iface::on_rx_frame_from(&self.name, &mut bytes);
+        }
+    }
+
+    /// Apply queued host-supplicant key/port operations in order.
+    async fn apply_external(&self) {
+        if self.external_ops.lock().is_empty() {
+            return;
+        }
+        let Some(mut state) = self.state.try_lock() else {
+            return;
+        };
+        loop {
+            let Some(op) = self.external_ops.lock().pop_front() else {
+                break;
+            };
+            let result = match op {
+                ExternalOp::Key(key) => {
+                    state
+                        .station
+                        .install_key(
+                            key.idx,
+                            key.pairwise,
+                            key.peer,
+                            key.cipher,
+                            &key.key,
+                            &key.seq,
+                        )
+                        .await
+                }
+                ExternalOp::DeleteKey(index) => state.station.delete_key(index).await,
+                ExternalOp::Authorize(peer, authorized) => {
+                    state.station.authorize_port(peer, authorized)
+                }
+            };
+            if let Err(error) = result {
+                self.external_ops.lock().clear();
+                state.clear_transmit();
+                if state.station.bssid.is_none() {
+                    self.link(None);
+                }
+                narf_console::klog!(
+                    "{}: FullMAC host-supplicant operation failed: {:?}\n",
+                    self.name,
+                    error
+                );
+                break;
+            }
+        }
     }
 
     async fn apply_power_save(&self) {
@@ -452,11 +731,102 @@ impl<R: Fullmac + 'static> Device<R> {
         }
     }
 
+    async fn apply_pmksa(&self) {
+        let desired = self.pmksa.lock().clone();
+        let Some(mut state) = self.state.try_lock() else {
+            return;
+        };
+        if state.station.programmed_pmksa() == Some(&desired) {
+            return;
+        }
+        if let Err(error) = state.station.sync_pmksa(&desired).await {
+            if state.station.bssid.is_none() {
+                self.link(None);
+            }
+            narf_console::klog!(
+                "{}: FullMAC pmkid_info update failed: {:?}\n",
+                self.name,
+                error
+            );
+        }
+    }
+
+    /// Confirm a pending firmware roam and report `cfg80211_roamed`.
+    async fn apply_roam(&self) {
+        let Some(mut state) = self.state.try_lock() else {
+            return;
+        };
+        if state.station.roam_pending().is_none() {
+            return;
+        }
+        match state.station.complete_roam().await {
+            Ok(Some(roamed)) => {
+                state.clear_transmit();
+                self.link(state.station.bssid);
+                self.roaming.store(false, Ordering::Release);
+                narf_wireless::nl80211::notify_roamed(
+                    &self.name,
+                    roamed.bssid,
+                    roamed.frequency_mhz,
+                    &roamed.request_ies,
+                    &roamed.response_ies,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                state.clear_transmit();
+                self.power_save.store(2, Ordering::Release);
+                self.link(None);
+                narf_console::klog!("{}: FullMAC firmware roam failed: {:?}\n", self.name, error);
+            }
+        }
+    }
+
+    /// Per-AC host queue/traffic counters (VO, VI, BE, BK).
+    pub fn ac_statistics(&self) -> [super::telemetry::AcStats; 4] {
+        self.telemetry.snapshot()
+    }
+
+    /// Platform roaming policy (Linux brcmfmac `roamoff`): enable or
+    /// disable the firmware roaming engine while disconnected.
+    pub async fn set_firmware_roaming(&self, enabled: bool) -> Result<(), WirelessError> {
+        let mut state = self.state.lock().await;
+        state
+            .station
+            .set_firmware_roaming(enabled)
+            .await
+            .map_err(wireless_error)
+    }
+
     async fn receive_worker(self: Arc<Self>) {
-        loop {
+        let mut wake = None;
+        while !self.withdrawn() {
+            // A transport generation may rebind its vector; re-read the wake
+            // source whenever the state is uncontended. The count is sampled
+            // before service so a vector raised during service re-runs it.
+            if let Some(state) = self.state.try_lock() {
+                wake = state.station.runtime.wake_source();
+            }
+            let seen = wake.as_ref().map(|(signal, _)| signal.count());
             self.deliver_received(self.step());
+            self.apply_roam().await;
+            self.apply_external().await;
             self.apply_power_save().await;
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+            self.apply_pmksa().await;
+            match (&wake, seen) {
+                (Some((signal, delivered)), Some(seen)) => {
+                    // brcmf_pcie_isr_thread wakes msgbuf service; the timer
+                    // is a missed-edge backstop (or the poll without MSI).
+                    let ms = crate::brcmfmac::irq::fallback_ms(*delivered);
+                    let fallback = core::pin::pin!(narf_time::sleep_cycles(
+                        narf_time::wall::ns_to_cycles(ms * 1_000_000)
+                    ));
+                    signal.wait(seen, fallback).await;
+                }
+                _ => {
+                    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+                }
+            }
         }
     }
 }
@@ -486,6 +856,28 @@ impl<R: Fullmac + 'static> Endpoint for Device<R> {
     }
     fn drain(&self) -> bool {
         self.deliver_received(self.step())
+    }
+    fn suspend(&self) -> PmFuture<'_> {
+        alloc::boxed::Box::pin(async move {
+            let connected = self.state.lock().await.station.bssid.is_some();
+            if connected {
+                let _ = WirelessNetIface::disassociate(self).await;
+            }
+            let mut state = self.state.lock().await;
+            state.clear_transmit();
+            state.station.runtime.suspend_transport().await
+        })
+    }
+    fn resume(&self) -> PmFuture<'_> {
+        alloc::boxed::Box::pin(async move {
+            let mut state = self.state.lock().await;
+            let result = state.station.runtime.resume_transport().await;
+            if result.is_err() {
+                self.power_save.store(2, Ordering::Release);
+                self.link(None);
+            }
+            result
+        })
     }
 }
 fn send_sdio(bytes: &[u8], _: narf_net::TxMeta) -> Result<(), ()> {
@@ -581,6 +973,112 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
     fn supports_optional_mfp(&self) -> bool {
         self.mfp_supported
     }
+    fn supports_sae_offload(&self) -> bool {
+        self.sae_offload
+    }
+    fn supports_external_supplicant(&self) -> bool {
+        true
+    }
+    fn add_key(&self, key: narf_wireless::KeyParams) -> Result<(), i32> {
+        // brcmf_cfg80211_add_key: index < BRCMF_MAX_DEFAULT_KEYS; this
+        // profile installs CCMP-128 only.
+        if key.idx >= super::station::external::MAX_DEFAULT_KEYS
+            || key.cipher != narf_wireless::CIPHER_SUITE_CCMP
+            || key.key.len() != 16
+            || !(key.seq.is_empty() || key.seq.len() == 6)
+        {
+            return Err(22);
+        }
+        let current = self.connected_bssid().ok_or(2)?;
+        if key.pairwise && key.peer != Some(current) {
+            return Err(2); // ENOENT: not the associated AP.
+        }
+        self.external_ops.lock().push_back(ExternalOp::Key(key));
+        Ok(())
+    }
+    fn del_key(&self, idx: u8, _pairwise: bool, _peer: Option<[u8; 6]>) -> Result<(), i32> {
+        if idx >= super::station::external::MAX_DEFAULT_KEYS {
+            return Err(22);
+        }
+        self.connected_bssid().ok_or(2)?;
+        self.external_ops
+            .lock()
+            .push_back(ExternalOp::DeleteKey(idx));
+        Ok(())
+    }
+    fn set_port_authorized(&self, peer: [u8; 6], authorized: bool) -> Result<(), i32> {
+        if self.connected_bssid() != Some(peer) {
+            return Err(if authorized { 22 } else { 2 });
+        }
+        self.external_ops
+            .lock()
+            .push_back(ExternalOp::Authorize(peer, authorized));
+        Ok(())
+    }
+    fn tx_control_port(
+        &self,
+        dest: [u8; 6],
+        proto: u16,
+        frame: Vec<u8>,
+        _no_encrypt: bool,
+    ) -> Result<(), i32> {
+        // EAPOL (and RSN pre-authentication) to the associated AP only.
+        if !matches!(proto, 0x888e | 0x88c7) || frame.len() > 1500 {
+            return Err(22);
+        }
+        let peer = self.connected_bssid().ok_or(107)?; // ENOTCONN
+        if dest != peer {
+            return Err(22);
+        }
+        let mut state = self.state.try_lock().ok_or(16)?; // EBUSY
+        if state.station.external_port().is_none() {
+            return Err(95);
+        }
+        let mut bytes = Vec::with_capacity(14 + frame.len());
+        bytes.extend_from_slice(&dest);
+        bytes.extend_from_slice(&self.mac);
+        bytes.extend_from_slice(&proto.to_be_bytes());
+        bytes.extend_from_slice(&frame);
+        // mac80211 sends control-port frames as VO (802.1D 7).
+        match state.station.send_data(&bytes, 7) {
+            Ok(()) => Ok(()),
+            Err(Error::Busy) => Err(16),
+            Err(_) => Err(5),
+        }
+    }
+    fn station_info(&self) -> Option<narf_wireless::StationInfo> {
+        self.connected_bssid()?;
+        let (tx, rx, failed) = self.telemetry.totals();
+        Some(narf_wireless::StationInfo {
+            tx_packets: Some(tx),
+            rx_packets: Some(rx),
+            tx_failed: Some(failed),
+            ..Default::default()
+        })
+    }
+    fn set_pmksa(&self, entry: narf_wireless::PmksaEntry) -> Result<(), i32> {
+        // Linux v1 list rows are {bssid, pmkid}; FILS/SSID-only caching is
+        // not a profile here. Full list or missing BSSID is -EINVAL.
+        let (Some(bssid), Some(pmkid)) = (entry.bssid, entry.pmkid) else {
+            return Err(22);
+        };
+        self.pmksa
+            .lock()
+            .set(super::station::pmksa::Entry {
+                bssid,
+                pmkid,
+                ssid: entry.ssid.unwrap_or_default(),
+            })
+            .map_err(|_| 22)
+    }
+    fn del_pmksa(&self, entry: narf_wireless::PmksaEntry) -> Result<(), i32> {
+        let bssid = entry.bssid.ok_or(22)?;
+        self.pmksa.lock().delete(bssid).map_err(|_| 22)
+    }
+    fn flush_pmksa(&self) -> Result<(), i32> {
+        self.pmksa.lock().flush();
+        Ok(())
+    }
     fn reports_disconnect_events(&self) -> bool {
         true
     }
@@ -638,12 +1136,19 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
         if state.station.bssid.is_some() {
             return Err(WirelessError::Busy);
         }
+        let retained = retained_request(&request);
         let ticket = self.close_host();
         state.clear_transmit();
         if ticket == u64::MAX {
             return Err(WirelessError::HardwareError);
         }
-        let result = state.station.associate(request).await;
+        // Firmware inserts cached PMKIDs into its (re)association RSNE;
+        // the list must be current before the join is issued.
+        let desired = self.pmksa.lock().clone();
+        let result = match state.station.sync_pmksa(&desired).await {
+            Ok(()) => state.station.associate(request).await,
+            Err(error) => Err(error),
+        };
         {
             let _publication = self.publication.lock();
             if self.epoch.load(Ordering::Acquire) != ticket {
@@ -661,9 +1166,13 @@ impl<R: Fullmac + 'static> WirelessNetIface for Device<R> {
             }
             self.publish_link(state.station.bssid);
         }
+        if result.is_ok() {
+            *self.lifecycle.request.lock() = retained;
+        }
         result.map_err(wireless_error)
     }
     async fn disassociate(&self) -> Result<(), WirelessError> {
+        self.lifecycle.request.lock().take();
         self.close_host();
         let mut state = self.state.lock().await;
         // Close again under the same lock as association/progress publication:
@@ -694,6 +1203,13 @@ fn receive_admitted(bytes: &[u8], local: [u8; 6]) -> bool {
         && (bytes[0] & 1 != 0 || bytes[..6] == local)
         && bytes[6] & 1 == 0
         && bytes[6..12] != [0; 6]
+}
+/// EAPOL from the associated AP to this station (host-supplicant mode).
+fn eapol_admitted(bytes: &[u8], local: [u8; 6], peer: [u8; 6]) -> bool {
+    (18..=1514).contains(&bytes.len())
+        && bytes[12..14] == [0x88, 0x8e]
+        && bytes[..6] == local
+        && bytes[6..12] == peer
 }
 fn transmit_admitted(bytes: &[u8], local: [u8; 6]) -> bool {
     (14..=1514).contains(&bytes.len())
@@ -781,6 +1297,7 @@ mod tests {
             rx,
             tx,
             pending: None,
+            telemetry: Default::default(),
         };
         let mut bytes = vec![0; 14];
         bytes[..6].copy_from_slice(&[2, 1, 2, 3, 4, 5]);
@@ -922,6 +1439,9 @@ impl<R: Fullmac + 'static> Interface for Registered<R> {
         self.0.tx_ring()
     }
 }
+
+#[path = "generation.rs"]
+pub mod generation;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "interface_dhcp_tests.rs"]

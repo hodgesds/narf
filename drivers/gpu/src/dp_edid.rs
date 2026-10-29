@@ -9,24 +9,30 @@
 //! ## Wire shape
 //!
 //! Every DP sink exposes its EDID at I²C address `0x50` (the
-//! standard DDC/CI slave). The AUX I²C transport packs the I²C
-//! address into bits[19:0] of the AUX address field — bits[7:1]
-//! are the I²C address, bit 0 is the read/write flag. The
-//! source issues:
+//! standard DDC/CI slave). I²C-over-AUX carries the 7-bit I²C
+//! address itself in the AUX address field — `0x50`, not the
+//! `0xA0`/`0xA1` byte a bit-banged bus clocks out; direction is
+//! the command (Linux `drm_dp_i2c_xfer` sets `msg.address` to
+//! the 7-bit `i2c_msg.addr`, and `intel_dp_aux_header` writes
+//! its low byte to the wire). The source issues:
 //!
-//!   1. `I2C_WRITE` to `0x50 << 1` with one byte = the EDID
+//!   1. `I2C_WRITE_MOT` to `0x50` with one byte = the EDID
 //!      offset (typically 0).
-//!   2. `I2C_READ_MOT` (read with stop) to read the 128-byte
-//!      block in 16-byte chunks (AUX caps reads at 16 bytes).
+//!   2. `I2C_READ_MOT` to read the 128-byte block in 16-byte
+//!      chunks (AUX caps reads at 16 bytes).
+//!   3. An address-only `I2C_READ` (MOT clear) to issue the
+//!      I²C STOP.
 //!
-//! Each chunk is one `transact` round-trip; the helper batches
-//! them into a single 128-byte read.
+//! MOT is DP's Middle-Of-Transaction bit: set means "no STOP
+//! after this request". Each chunk is one `transact`
+//! round-trip; the helper batches them into a single 128-byte
+//! read.
 
 use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest};
 
-/// Standard DDC/CI EDID slave address (left-shifted by 1 to
-/// match the AUX wire format).
-const EDID_I2C_ADDR_SHIFTED: u32 = 0x50 << 1;
+/// Standard DDC/CI EDID slave address — the 7-bit I²C address,
+/// as the AUX address field carries it (Linux `DDC_ADDR`).
+const EDID_I2C_ADDR: u32 = 0x50;
 
 /// AUX caps each read at 16 bytes (DP §2.7.4).
 const AUX_CHUNK: usize = 16;
@@ -56,24 +62,47 @@ impl From<AuxError> for EdidReadError {
 /// `offset` (0 for the base block, 128/256/… for extension
 /// blocks) into `block`.
 ///
-/// Wire shape (DP 1.4a §2.7.6): an `I2C_WRITE` sets the slave's
-/// offset pointer, then the block is read in 16-byte AUX bursts
-/// as ONE I²C read transaction — every burst but the last uses
-/// `I2C_READ` (MOT = 0, no STOP, the slave's pointer keeps
-/// advancing across the repeated-start), and the final burst
-/// uses `I2C_READ_MOT` to close the transaction with a STOP.
-/// (Issuing a STOP after every burst happens to work on EEPROM
-/// sinks whose pointer persists, but it is not the spec shape
-/// and power-cycled DDC muxes are not required to tolerate it.)
+/// Wire shape (DP 1.4a §2.7.6, as Linux `drm_dp_i2c_xfer`
+/// drives the offset-write + block-read message pair): the
+/// offset write and every 16-byte read burst carry MOT, so the
+/// whole exchange is ONE I²C transaction (write, repeated start,
+/// read) and the slave's pointer keeps advancing across bursts;
+/// a final address-only `I2C_READ` with MOT clear issues the
+/// STOP. (Linux also opens each message with an address-only
+/// MOT request; the first data request carries the same
+/// address, so the start is not repeated here.)
+///
+/// The STOP is sent even when a burst fails, as Linux does, so
+/// a failed read does not leave the DDC bus mid-transaction.
 fn read_edid_block<A: AuxChannel>(
+    aux: &mut A,
+    offset: u8,
+    block: &mut [u8; 128],
+) -> Result<(), EdidReadError> {
+    let result = read_edid_block_mot(aux, offset, block);
+    let stop = AuxRequest {
+        cmd: AuxCommand::I2cRead,
+        address: EDID_I2C_ADDR,
+        data: &[],
+    };
+    let mut reply = [0u8; 1];
+    let stopped = aux.transact(&stop, &mut reply);
+    result?;
+    stopped?;
+    Ok(())
+}
+
+/// The MOT half of [`read_edid_block`]: offset write plus the
+/// read bursts, all with MOT set (no STOP).
+fn read_edid_block_mot<A: AuxChannel>(
     aux: &mut A,
     offset: u8,
     block: &mut [u8; 128],
 ) -> Result<(), EdidReadError> {
     let offset_byte = [offset];
     let req = AuxRequest {
-        cmd: AuxCommand::I2cWrite,
-        address: EDID_I2C_ADDR_SHIFTED,
+        cmd: AuxCommand::I2cWriteMot,
+        address: EDID_I2C_ADDR,
         data: &offset_byte,
     };
     let mut reply = [0u8; 1];
@@ -82,14 +111,9 @@ fn read_edid_block<A: AuxChannel>(
     let mut read = 0usize;
     while read < 128 {
         let chunk_len = AUX_CHUNK.min(128 - read);
-        let last = read + chunk_len == 128;
         let req = AuxRequest {
-            cmd: if last {
-                AuxCommand::I2cReadMot
-            } else {
-                AuxCommand::I2cRead
-            },
-            address: EDID_I2C_ADDR_SHIFTED | 1, // read flag
+            cmd: AuxCommand::I2cReadMot,
+            address: EDID_I2C_ADDR,
             data: &ZERO_CHUNK[..chunk_len],
         };
         let mut reply = [0u8; AUX_CHUNK + 1];

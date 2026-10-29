@@ -233,6 +233,24 @@ impl<T> TxQueue<T> {
         Ok(self.retire(index))
     }
 }
+impl<T> TxQueue<T> {
+    /// Hand back every reserved or published resource and empty the queue.
+    ///
+    /// # Safety
+    /// The owner proved its DMA engines stopped and idle with bus mastering
+    /// off (`dma_stop::Idle`); no descriptor, prefetch or firmware release
+    /// can still reference any slot.
+    pub unsafe fn reclaim_fenced(&mut self) -> Vec<T> {
+        let resources = self
+            .slots
+            .iter_mut()
+            .filter_map(|slot| slot.take().and_then(|entry| entry.resource))
+            .collect();
+        self.wp = 0;
+        self.rp = 0;
+        resources
+    }
+}
 impl<T> Drop for TxQueue<T> {
     fn drop(&mut self) {
         for entry in self.slots.iter_mut().flatten() {
@@ -337,7 +355,11 @@ pub fn prepare_header(
         return Err(Error::BadFrame);
     }
     let header_length = if fc & 0xfc == 0x88 {
-        if chip != ChipId::Rtl8852B || frame.get(24..26) != Some(&[0, 0]) {
+        // TID0..7 with normal ack policy; EOSP/A-MSDU/TXOP bits unsupported.
+        if chip != ChipId::Rtl8852B
+            || frame.get(24).is_none_or(|control| control & 0xf8 != 0)
+            || frame.get(25) != Some(&0)
+        {
             return Err(Error::BadFrame);
         }
         26
@@ -346,10 +368,12 @@ pub fn prepare_header(
     };
     if fc & 0x4000 != 0
         && (chip != ChipId::Rtl8852B
-            || !matches!(fc & 0x00fc,8|0x88)
-            || fc & 0x0300 != 0x0100
-            //24 native header +8 CCMP IV +>=8 ciphertext +8 MIC.
-            || frame.len() < header_length+24
+            // Host-CCMP data to the AP, or (PMF) a robust disassociation,
+            // deauthentication or Action frame with no DS bits.
+            || !(matches!(fc & 0x00fc, 8 | 0x88) && fc & 0x0300 == 0x0100
+                || matches!(fc & 0x00fc, 0xa0 | 0xc0 | 0xd0) && fc & 0x0300 == 0)
+            //24 native header +8 CCMP IV +ciphertext (>=8 data, >=2 management) +8 MIC.
+            || frame.len() < header_length + if fc & 0x0c == 0 { 18 } else { 24 }
             || frame[header_length+2] != 0
             || frame[header_length+3] & 0x3f != 0x20
             || [frame[header_length], frame[header_length+1], frame[header_length+4], frame[header_length+5], frame[header_length+6], frame[header_length+7]] == [0; 6])

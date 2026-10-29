@@ -68,6 +68,19 @@ for callers that need tighter than 11.6 ppm frequency stability:
 - **Wall clock is advisory only.** Never used for scheduling,
   timeouts, or security decisions.
 
+On x86_64, `calibrate_clocks_with_source()` establishes both directions of
+the fixed-point counter conversion, including when it reuses an arch-cached
+TSC frequency. Before calibration, `cycles_to_ns` and `ns_to_cycles` use an
+identity fallback; hardware minimum delays and timeouts must not treat it as
+wall time (a >1 GHz TSC makes such waits too short).
+
+`hpet::calibrate_tsc_at(mapped_base)` is an unsafe x86_64 boot-only
+measurement for callers running before timer installation. The caller owns
+an uncached HPET mapping exclusively. It enables and samples a 64-bit main
+counter without publishing the singleton, changing the physical-base override
+or programming comparators. Both this path and singleton calibration bound
+counter reads and return unavailable for a stopped counter or invalid ratio.
+
 ### 3.2 Timers
 
 ```rust

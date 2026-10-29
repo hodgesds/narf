@@ -41,9 +41,13 @@ pub fn select(did: u16, hw_rev: u32, hw_rf: u32) -> Result<Profile, Error> {
             ltr_delay_us: 0,
         });
     }
-    let long_latency = match did {
-        0x02f0 => false,
-        0x43f0 | 0xa0f0 => true,
+    // Linux pcie/drv.c "Qu devices" binds each PCI ID to one cfg/22000.c
+    // mac_cfg: iwl_qu_mac_cfg (xtal 500 µs, LTR 200 µs), the medium-latency
+    // cfg (1820/1820 µs) or the long-latency cfg (12000/2500 µs).
+    let (xtal_latency_us, ltr_delay_us) = match did {
+        0x02f0 | 0x06f0 => (500, 200),
+        0x34f0 | 0x3df0 | 0x4df0 => (1820, 1820),
+        0x43f0 | 0xa0f0 => (12000, 2500),
         _ => return Err(Error::Pci),
     };
     let mac = match (mac_type, hw_rev & 15) {
@@ -70,7 +74,7 @@ pub fn select(did: u16, hw_rev: u32, hw_rf: u32) -> Result<Profile, Error> {
     Ok(Profile {
         prefix,
         integrated: true,
-        xtal_latency_us: if long_latency { 12000 } else { 500 },
-        ltr_delay_us: if long_latency { 2500 } else { 200 },
+        xtal_latency_us,
+        ltr_delay_us,
     })
 }

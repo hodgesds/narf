@@ -6,7 +6,8 @@
 //! grant includes the PCIe bit, and the XDomain engine (host-to-host
 //! connections, service discovery, ThunderboltIP networking) runs only when
 //! the grant includes the XDomain bit. One actor owns each NHI's DMA rings,
-//! config transactions, topology, tunnels and XDomain peers.
+//! config transactions, topology, tunnels, XDomain peers, and retimer
+//! enumeration on trained links.
 //! Legacy ICM (firmware-CM) hosts are detected from NHI firmware status
 //! before ring 0 starts and the native CM stands down for those controllers
 //! (see `icm`); the ICM protocol itself is deliberately not implemented.
@@ -34,6 +35,8 @@ pub mod cm;
 #[cfg(feature = "builtin")]
 mod control;
 #[cfg(feature = "builtin")]
+mod dataring;
+#[cfg(feature = "builtin")]
 pub mod dp_bw;
 #[cfg(feature = "builtin")]
 mod firmware;
@@ -43,6 +46,8 @@ pub mod icm;
 pub mod nhi;
 #[cfg(feature = "builtin")]
 mod pm;
+#[cfg(feature = "builtin")]
+pub mod retimer;
 #[cfg(feature = "builtin")]
 mod ring;
 #[cfg(feature = "builtin")]
@@ -60,6 +65,9 @@ pub mod xdomain;
 
 #[cfg(all(feature = "builtin", target_arch = "x86_64"))]
 mod tests;
+
+#[cfg(all(feature = "builtin", feature = "kernel-test"))]
+mod dock_tests;
 
 #[cfg(feature = "module")]
 mod module_probe;

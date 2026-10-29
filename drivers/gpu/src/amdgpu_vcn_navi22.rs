@@ -4,17 +4,23 @@
 //! vcn_v2_0.c ring emitters reused by VCN 3.0, amdgpu_vcn.c (`sw_init`,
 //! ring/IB tests), jpeg_v3_0.c, nbio_v2_3.c and vcn_3_0_0_{offset,sh_mask}.h.
 //!
-//! Power policy: Linux selects DPG (`AMD_PG_SUPPORT_VCN_DPG`) on GC 10.3.2,
-//! which dynamically gates VCN tiles and needs PSP indirect-SRAM uploads.
-//! NARF keeps media power gating disabled during bring-up, so this owner
-//! runs Linux's static path with `AMD_PG_SUPPORT_VCN` clear (the
-//! `amdgpu.pg_mask` configuration): every tile powered on through PGFSM and
-//! never re-gated. Clock gating follows the default `AMD_CG_SUPPORT_VCN_MGCG`
-//! programming of `vcn_v3_0_disable_clock_gating`. The SMU's MM_DPM_PG
-//! feature is outside the boot policy, so Linux's `PowerUpVcn` message is
-//! skipped exactly as `sienna_cichlid_dpm_set_vcn_enable` does; a board
-//! where it runs is refused before any write. Firmware images come from the
-//! PSP-loaded TMR (`AMDGPU_FW_LOAD_PSP`). Only VMID0 kernel rings exist.
+//! Power policy: like Linux on GC 10.3.2 (`AMD_PG_SUPPORT_VCN_DPG` with
+//! PSP-loaded firmware), each instance starts in dynamic power gating with
+//! an indirect register list that PSP writes into the instance's DPG SRAM
+//! (`vcn_v3_0_start_dpg_mode`), leaving the firmware and stack windows for
+//! PSP to fill in. On the RX 6750 XT the static path's direct writes to
+//! those VCPU registers never take (they read back as all ones) and the
+//! VCPU never boots. Encode needs the instance paused (`vcn_v3_0_pause_dpg_mode`);
+//! without Linux's idle work an instance stays paused after its first
+//! encode use. `amdgpu.rdna2_vcn_dpg=0` selects Linux's static path with
+//! `AMD_PG_SUPPORT_VCN` clear instead: every tile powered on through PGFSM
+//! and the registers written directly, clock gating as
+//! `vcn_v3_0_disable_clock_gating` programs it. MM_DPM_PG is outside the
+//! default SMU boot policy, so `PowerUpVcn` is skipped exactly as
+//! `sienna_cichlid_dpm_set_vcn_enable` does; with
+//! `amdgpu.rdna2_vcn_smu_pg=1` the boot sends it first, and a board where it
+//! runs unannounced is refused before any write. Firmware images come from
+//! the PSP-loaded TMR (`AMDGPU_FW_LOAD_PSP`). Only VMID0 kernel rings exist.
 use crate::{
     amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_fence_navi22 as fence, amdgpu_vram::Pool,
     amdgpu_vram::Reservation,
@@ -39,6 +45,8 @@ pub enum Error {
     PowerGated,
     /// The discovery harvest table could not be trusted.
     Harvest(ip::DiscoveryError),
+    /// PSP refused the DPG register list (`amdgpu_vcn_psp_update_sram`).
+    Sram(crate::amdgpu_psp_ring::Error),
 }
 
 /// Register offsets as (SOC15 BASE_IDX, dword), vcn_3_0_0_offset.h. JPEG 3.0
@@ -51,6 +59,7 @@ pub(crate) mod regs {
     pub const POWER_STATUS: Reg = Reg(1, 0x004); // linux: mmUVD_POWER_STATUS
     pub const CC_UVD_HARVESTING: Reg = Reg(1, 0x007); // linux: mmCC_UVD_HARVESTING
     pub const JPEG_POWER_STATUS: Reg = Reg(1, 0x00a); // linux: mmUVD_JPEG_POWER_STATUS
+    pub const DPG_PAUSE: Reg = Reg(1, 0x014); // linux: mmUVD_DPG_PAUSE
     pub const SCRATCH2: Reg = Reg(1, 0x016); // linux: mmUVD_SCRATCH2
     pub const SCRATCH9: Reg = Reg(1, 0x01d); // linux: mmUVD_SCRATCH9
     pub const GFX10_ADDR_CONFIG: Reg = Reg(1, 0x04a); // linux: mmUVD_GFX10_ADDR_CONFIG
@@ -74,6 +83,8 @@ pub(crate) mod regs {
     // linux: mmUVD_RB_WPTR; mmUVD_RB_WPTR2
     pub const RB_WPTR: [Reg; 2] = [Reg(1, 0x0ae), Reg(1, 0x0b3)];
     pub const RB_ARB_CTRL: Reg = Reg(1, 0x0c6); // linux: mmUVD_RB_ARB_CTRL
+    pub const RBC_XX_IB_REG_CHECK: Reg = Reg(1, 0x26b); // linux: mmUVD_RBC_XX_IB_REG_CHECK
+    pub const REG_XX_MASK: Reg = Reg(1, 0x26c); // linux: mmUVD_REG_XX_MASK
     pub const VCPU_CACHE_OFFSET0: Reg = Reg(1, 0x140); // linux: mmUVD_VCPU_CACHE_OFFSET0
     pub const VCPU_CACHE_SIZE0: Reg = Reg(1, 0x141); // linux: mmUVD_VCPU_CACHE_SIZE0
     pub const VCPU_CACHE_OFFSET1: Reg = Reg(1, 0x142); // linux: mmUVD_VCPU_CACHE_OFFSET1
@@ -88,8 +99,10 @@ pub(crate) mod regs {
     pub const MPC_SET_MUXB0: Reg = Reg(1, 0x2d0); // linux: mmUVD_MPC_SET_MUXB0
     pub const MPC_SET_MUX: Reg = Reg(1, 0x2d2); // linux: mmUVD_MPC_SET_MUX
     pub const RBC_RB_CNTL: Reg = Reg(1, 0x2de); // linux: mmUVD_RBC_RB_CNTL
+    pub const RBC_RB_RPTR_ADDR: Reg = Reg(1, 0x2df); // linux: mmUVD_RBC_RB_RPTR_ADDR
     pub const RBC_RB_RPTR: Reg = Reg(1, 0x2e0); // linux: mmUVD_RBC_RB_RPTR
     pub const RBC_RB_WPTR: Reg = Reg(1, 0x2e1); // linux: mmUVD_RBC_RB_WPTR
+    pub const RBC_RB_WPTR_CNTL: Reg = Reg(1, 0x2e6); // linux: mmUVD_RBC_RB_WPTR_CNTL
     pub const LMI_RBC_RB_BAR_LOW: Reg = Reg(1, 0x432); // linux: mmUVD_LMI_RBC_RB_64BIT_BAR_LOW
     pub const LMI_RBC_RB_BAR_HIGH: Reg = Reg(1, 0x433); // linux: mmUVD_LMI_RBC_RB_64BIT_BAR_HIGH
     pub const LMI_VCPU_NC0_BAR_LOW: Reg = Reg(1, 0x438); // linux: mmUVD_LMI_VCPU_NC0_64BIT_BAR_LOW
@@ -137,6 +150,7 @@ pub(crate) mod regs {
     /// nbio_2_3_offset.h / nbio_v2_3.c, NBIO BASE_IDX 2.
     // linux-ctx: hdr=nbio seg=2
     pub const NBIO_DOORBELL_APER_EN: u32 = 0x0c0; // linux: mmRCC_DEV0_EPF0_RCC_DOORBELL_APER_EN
+    pub const NBIO_CONFIG_MEMSIZE: u32 = 0x0c3; // linux: mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
     /// linux: mmBIF_MMSCH0_DOORBELL_RANGE; mmBIF_MMSCH1_DOORBELL_RANGE
     pub const NBIO_MMSCH_DOORBELL_RANGE: [u32; 2] = [0x1d3, 0x1d8];
     pub const LAST_NBIO: u32 = 0x1d8; // linux: mmBIF_MMSCH1_DOORBELL_RANGE
@@ -217,6 +231,25 @@ pub(crate) mod bits {
     pub const JPEG_CGC_CTRL_MODES: u32 = 0x001b_0000;
     pub const JMI_SOFT_RESET: u32 = 1; // linux: UVD_JMI_CNTL__SOFT_RESET_MASK
     pub const JPEG_SYS_INT_DJRBC: u32 = 1 << 1; // linux: JPEG_SYS_INT_EN__DJRBC_MASK
+                                                // DPG (vcn_v3_0_start_dpg_mode, _pause_dpg_mode, _stop_dpg_mode).
+                                                // linux: UVD_POWER_STATUS__UVD_POWER_STATUS_MASK
+    pub const POWER_STATUS_MASK: u32 = 3;
+    pub const POWER_PG_MODE: u32 = 1 << 2; // linux: UVD_POWER_STATUS__UVD_PG_MODE_MASK
+    pub const POWER_PG_EN: u32 = 1 << 8; // linux: UVD_POWER_STATUS__UVD_PG_EN_MASK
+                                         // linux: UVD_POWER_STATUS__STALL_DPG_POWER_UP_MASK
+    pub const POWER_STALL_DPG: u32 = 1 << 31;
+    /// UVD_POWER_STATUS once a paused instance is powered back up.
+    pub const POWER_UVDM_UVDU_ON: u32 = 2; // linux: UVD_PGFSM_CONFIG__UVDM_UVDU_PWR_ON
+    pub const DPG_PAUSE_REQ: u32 = 1 << 2; // linux: UVD_DPG_PAUSE__NJ_PAUSE_DPG_REQ_MASK
+    pub const DPG_PAUSE_ACK: u32 = 1 << 3; // linux: UVD_DPG_PAUSE__NJ_PAUSE_DPG_ACK_MASK
+    /// PRB_TIMEOUT_VAL 0xff | CLK_EN, the DPG VCPU control word.
+    // linux: (0xFF << UVD_VCPU_CNTL__PRB_TIMEOUT_VAL__SHIFT) | UVD_VCPU_CNTL__CLK_EN_MASK
+    pub const VCPU_CNTL_DPG: u32 = (0xff << 20) | VCPU_CLK_EN;
+    /// 0x8 | WRITE_CLEAN_TIMER_EN | REQ_MODE | CRC_RESET | MASK_MC_URGENT |
+    /// DATA_COHERENCY_EN | VCPU_DATA_COHERENCY_EN | WRITE_CLEAN_TIMER 8 |
+    /// 0x00100000, the DPG UVD_LMI_CTRL.
+    // linux: 0x8 | UVD_LMI_CTRL__WRITE_CLEAN_TIMER_EN_MASK | UVD_LMI_CTRL__REQ_MODE_MASK | UVD_LMI_CTRL__CRC_RESET_MASK | UVD_LMI_CTRL__MASK_MC_URGENT_MASK | UVD_LMI_CTRL__DATA_COHERENCY_EN_MASK | UVD_LMI_CTRL__VCPU_DATA_COHERENCY_EN_MASK | (8 << UVD_LMI_CTRL__WRITE_CLEAN_TIMER__SHIFT) | 0x00100000L
+    pub const LMI_CTRL_DPG: u32 = 0x0030_7308;
 }
 use bits::*;
 
@@ -305,6 +338,7 @@ pub(crate) const JPEG_BYTES: u64 = 2 * RING_BYTES;
 /// amdgpu_fw_shared byte offsets (natural C layout, not packed).
 pub(crate) mod shared {
     pub const PRESENT_FLAG_0: u64 = 0; // linux: n/a (offsetof amdgpu_fw_shared.present_flag_0)
+    pub const RB_RPTR: u64 = 48; // linux: n/a (offsetof amdgpu_fw_shared.rb.rptr = 48)
     pub const RB_WPTR: u64 = 52; // linux: n/a (offsetof amdgpu_fw_shared.rb.wptr = 52)
     /// Dword holding pad1 and the multi_queue decode/encode-GP/encode-LL
     /// mode bytes (offsets 57, 58, 59).
@@ -486,7 +520,15 @@ impl Io for Mmio {
     fn read(&mut self, address: u64) -> u32 {
         // SAFETY: Layout bounds every VCN/GC/NBIO/HDP bank inside BAR5 and
         // this exclusive owner only calls this inside live PCI authority.
-        unsafe { self.regs.read32(address) }
+        let value = unsafe { self.regs.read32(address) };
+        if value == u32::MAX {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: VCN MMIO {address:#x} returned all ones"
+            );
+        }
+        value
     }
     fn write(&mut self, address: u64, value: u32) {
         // SAFETY: same bounded exclusive register mapping and authority.
@@ -529,6 +571,30 @@ fn update<I: Io>(io: &mut I, address: u64, mask: u32, value: u32) -> Result<(), 
     io.write(address, (old & !mask) | (value & mask));
     Ok(())
 }
+/// Linux uses WREG32_P for VCPU_CNTL, preserving all unselected bits even
+/// when the register reads all ones. That control word alone cannot prove
+/// removal: verify NBIO's memory-size and aperture registers before accepting
+/// it. GC registers themselves can return all ones while GFXOFF is active.
+fn update_vcpu<I: Io>(
+    io: &mut I,
+    layout: Layout,
+    instance: usize,
+    mask: u32,
+    value: u32,
+) -> Result<(), Error> {
+    let address = layout.reg(instance, VCPU_CNTL);
+    let old = io.read(address);
+    if old == u32::MAX {
+        if checked(io.read(layout.nbio(NBIO_CONFIG_MEMSIZE)))? == 0 {
+            return Err(Error::Invalid);
+        }
+        if checked(io.read(layout.nbio(NBIO_DOORBELL_APER_EN)))? & 1 == 0 {
+            return Err(Error::Invalid);
+        }
+    }
+    io.write(address, (old & !mask) | (value & mask));
+    Ok(())
+}
 async fn delay(us: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
 }
@@ -537,7 +603,7 @@ fn flush<I: Io>(io: &mut I, l: Layout) {
     barrier(Ordering::SeqCst);
     // linux: n/a (MMIO_REG_HOLE_OFFSET write, amdgpu_hdp_generic_flush)
     io.write(0x7f000, 0);
-    io.read(l.nbio + 0xc3 * 4); // linux-lit: 0xc3=mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE
+    io.read(l.nbio(NBIO_CONFIG_MEMSIZE));
     barrier(Ordering::SeqCst);
 }
 /// HDP read-cache invalidate before the CPU samples engine writes.
@@ -568,6 +634,142 @@ pub(crate) const LINUX_TIMING: Timing = Timing {
     poll_us: 10_000,
     reset_us: 10_000,
 };
+
+/// How `vcn_v3_0_start` brings an instance up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartMode {
+    /// `AMD_PG_SUPPORT_VCN_DPG` with indirect SRAM, Linux's GC 10.3.2
+    /// default: PSP programs the VCPU, LMI and cache-window registers from
+    /// a register list, and VCN gates its own tiles dynamically.
+    Dpg,
+    /// The static path (VCN power gating off): every register written
+    /// directly and the VCPU boot polled. PSP-protected registers make this
+    /// fail on RX 6000 boards; kept for diagnosis.
+    Static,
+}
+/// `amdgpu.rdna2_vcn_dpg`, set once from the boot options.
+static DPG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+pub fn set_dpg(enabled: bool) {
+    DPG.store(enabled, Ordering::Relaxed);
+}
+
+/// `amdgpu_vcn_psp_update_sram`: PSP writes one instance's DPG register
+/// list (offset/value pairs) into that instance's DPG SRAM.
+pub(crate) trait SramLoader {
+    async fn load_sram(&mut self, instance: usize, words: &[u32]) -> Result<(), Error>;
+}
+impl SramLoader for crate::amdgpu_psp_ring::Psp {
+    async fn load_sram(&mut self, instance: usize, words: &[u32]) -> Result<(), Error> {
+        use crate::amdgpu_psp_ring::Error as Psp;
+        self.load_vcn_sram(instance, words)
+            .await
+            .map_err(|error| match error {
+                Psp::Revoked => Error::Revoked,
+                Psp::DeviceGone => Error::DeviceGone,
+                other => Error::Sram(other),
+            })
+    }
+}
+
+/// `dpg_sram_bo`: 64 offset/value pairs (`64 * 2 * 4` bytes).
+pub(crate) const DPG_SRAM_DW: usize = 128; // linux: n/a (64 * 2 * 4 bytes, amdgpu_vcn_sw_init)
+                                           // linux: VCN_VID_SOC_ADDRESS_2_0; VCN1_VID_SOC_ADDRESS_3_0; VCN_AON_SOC_ADDRESS_2_0; VCN1_AON_SOC_ADDRESS_3_0
+const DPG_SOC: [u32; 4] = [0x1fa00, 0x48200, 0x1f800, 0x48000];
+// linux: VCN_VID_IP_ADDRESS_2_0; VCN_AON_IP_ADDRESS_2_0
+const DPG_IP: [u32; 2] = [0, 0x30000];
+/// `SOC15_DPG_MODE_OFFSET`: the VCN-internal dword offset of the register
+/// at BAR byte address `address` (the discovery base plus the register).
+pub(crate) fn dpg_offset(address: u64) -> u32 {
+    let a = (address & 0xf_ffff) as u32;
+    // Video ranges span 0x2600 bytes, always-on ranges 0x600; video wins.
+    let ranges = [
+        (DPG_SOC[0], 0x2600, DPG_IP[0]),
+        (DPG_SOC[2], 0x600, DPG_IP[1]),
+        (DPG_SOC[1], 0x2600, DPG_IP[0]),
+        (DPG_SOC[3], 0x600, DPG_IP[1]),
+    ];
+    let internal = ranges
+        .iter()
+        .find(|&&(soc, len, _)| (soc..soc + len).contains(&a))
+        .map_or(a, |&(soc, _, ip)| a - soc + ip);
+    internal >> 2
+}
+/// The indirect DPG register list `WREG32_SOC15_DPG_MODE` accumulates.
+struct DpgList {
+    words: alloc::vec::Vec<u32>,
+    layout: Layout,
+    instance: usize,
+}
+impl DpgList {
+    fn write(&mut self, reg: Reg, value: u32) {
+        let offset = dpg_offset(self.layout.reg(self.instance, reg));
+        self.words.extend_from_slice(&[offset, value]);
+    }
+}
+/// `vcn_v3_0_start_dpg_mode`'s indirect writes (clock gating, VCPU, LMI,
+/// MPC, `vcn_v3_0_mc_resume_dpg_mode` with PSP-loaded firmware, then the
+/// VCPU release) for instance `i` whose VCPU BO starts at `base`.
+pub(crate) fn dpg_list(
+    layout: Layout,
+    i: usize,
+    base: u64,
+    gb_addr_config: u32,
+) -> alloc::vec::Vec<u32> {
+    let mut l = DpgList {
+        words: alloc::vec::Vec::with_capacity(DPG_SRAM_DW),
+        layout,
+        instance: i,
+    };
+    // vcn_v3_0_clock_gating_dpg_mode(sram_sel 0)
+    l.write(CGC_CTRL, CGC_CTRL_DYN);
+    l.write(CGC_GATE, 0);
+    l.write(SUVD_CGC_GATE, 1);
+    l.write(SUVD_CGC_CTRL, 0);
+    // enable VCPU clock (held in reset), disable master interrupt
+    l.write(VCPU_CNTL, VCPU_CNTL_DPG | VCPU_BLK_RST);
+    l.write(MASTINT_EN, 0);
+    l.write(LMI_CTRL, LMI_CTRL_DPG);
+    // linux-lit: 3=UVD_MPC_CNTL__REPLACEMENT_MODE__SHIFT
+    l.write(MPC_CNTL, 2 << 3);
+    l.write(MPC_SET_MUXA0, MPC_MUX0);
+    l.write(MPC_SET_MUXB0, MPC_MUX0);
+    l.write(MPC_SET_MUX, MPC_MUX);
+    // mc_resume: PSP fills in the firmware and stack windows itself.
+    for reg in [
+        LMI_VCPU_CACHE_BAR_LOW,
+        LMI_VCPU_CACHE_BAR_HIGH,
+        VCPU_CACHE_OFFSET0,
+        VCPU_CACHE_SIZE0,
+        LMI_VCPU_CACHE1_BAR_LOW,
+        LMI_VCPU_CACHE1_BAR_HIGH,
+        VCPU_CACHE_OFFSET1,
+    ] {
+        l.write(reg, 0);
+    }
+    l.write(VCPU_CACHE_SIZE1, STACK_SIZE);
+    let context = base + CONTEXT;
+    l.write(LMI_VCPU_CACHE2_BAR_LOW, context as u32);
+    l.write(LMI_VCPU_CACHE2_BAR_HIGH, (context >> 32) as u32);
+    l.write(VCPU_CACHE_OFFSET2, 0);
+    l.write(VCPU_CACHE_SIZE2, CONTEXT_SIZE);
+    let shared_address = base + SHARED;
+    l.write(LMI_VCPU_NC0_BAR_LOW, shared_address as u32);
+    l.write(LMI_VCPU_NC0_BAR_HIGH, (shared_address >> 32) as u32);
+    l.write(VCPU_NONCACHE_OFFSET0, 0);
+    l.write(VCPU_NONCACHE_SIZE0, SHARED_SIZE);
+    l.write(GFX10_ADDR_CONFIG, gb_addr_config);
+    // linux: n/a (literals 0x10 and 0x3 in vcn_v3_0_start_dpg_mode)
+    l.write(REG_XX_MASK, 0x10);
+    l.write(RBC_XX_IB_REG_CHECK, 0x3);
+    // enable LMI MC and UMC channels, unblock VCPU register access
+    l.write(LMI_CTRL2, 0);
+    l.write(RB_ARB_CTRL, 0);
+    l.write(VCPU_CNTL, VCPU_CNTL_DPG);
+    l.write(MASTINT_EN, MASTINT_VCPU_EN);
+    // "add nop to workaround PSP size check"
+    l.write(VCPU_CNTL, VCPU_CNTL_DPG);
+    l.words
+}
 
 #[derive(Debug)]
 pub(crate) struct Hw<I: Io> {
@@ -634,6 +836,10 @@ pub(crate) struct Ring {
     pub doorbell: u32,
     /// Writeback dword mirroring the last committed wptr (`wptr_cpu_addr`).
     pub shadow: u64,
+    /// DPG decode ring: the UVD_SCRATCH2 address and fw_shared `rb.wptr`
+    /// offset that `vcn_v3_0_dec_ring_set_wptr` also writes, so firmware
+    /// restores the wptr when it powers the instance back up.
+    pub dpg_wptr: Option<(u64, u64)>,
     pub wptr: u32,
     pub seq: u32,
 }
@@ -677,7 +883,13 @@ impl Ring {
             self.wptr = (self.wptr + 1) % RING_DW;
         }
         io.write_memory(map, self.shadow, self.wptr);
+        if let Some((_, shared_wptr)) = self.dpg_wptr {
+            io.write_memory(map, shared_wptr, self.wptr);
+        }
         flush(io, l);
+        if let Some((scratch2, _)) = self.dpg_wptr {
+            io.write(scratch2, self.wptr);
+        }
         io.doorbell(self.doorbell, self.wptr);
     }
     fn next_seq(&mut self) -> u32 {
@@ -753,6 +965,7 @@ impl Instance {
             kind,
             doorbell,
             shadow,
+            dpg_wptr: None,
             wptr: 0,
             seq: 0,
         };
@@ -784,6 +997,7 @@ impl Jpeg {
                 kind: Kind::Jpeg,
                 doorbell: doorbell::JPEG,
                 shadow: RING_BYTES,
+                dpg_wptr: None,
                 wptr: 0,
                 seq: 0,
             },
@@ -800,6 +1014,9 @@ pub(crate) struct Engine<I: Io> {
     /// `adev->vcn.inst[i].fw->size`: the VCN container file length.
     pub firmware_bytes: u32,
     pub timing: Timing,
+    pub mode: StartMode,
+    /// DPG instances paused for encode (`pause_state.fw_based`).
+    pub paused: [bool; 2],
     pub state: State,
     pub jpeg_state: JpegState,
     pub proof: Proof,
@@ -919,6 +1136,7 @@ impl<I: Io> Engine<I> {
         &mut self,
         firmware: crate::amdgpu_psp_ring::MediaFirmware,
         power: Option<crate::amdgpu_smu_navi22::PowerStatus>,
+        sram: &mut impl SramLoader,
     ) -> Result<(), Error> {
         if self.state != State::Prepared {
             return Err(Error::Busy);
@@ -937,7 +1155,7 @@ impl<I: Io> Engine<I> {
             });
         }
         self.state = State::Starting(0);
-        let result = self.start_inner(images).await;
+        let result = self.start_inner(images, sram).await;
         self.state = if result.is_ok() {
             State::Running
         } else {
@@ -945,7 +1163,11 @@ impl<I: Io> Engine<I> {
         };
         result
     }
-    async fn start_inner(&mut self, images: [Option<u64>; 2]) -> Result<(), Error> {
+    async fn start_inner(
+        &mut self,
+        images: [Option<u64>; 2],
+        sram: &mut impl SramLoader,
+    ) -> Result<(), Error> {
         // gfx_v10_0_gpu_early_init: GC 10.3 reads GB_ADDR_CONFIG as-is.
         let gb_addr_config = self
             .hw
@@ -959,9 +1181,22 @@ impl<I: Io> Engine<I> {
             }
             self.state = State::Starting(i as u8);
             self.prepare_instance(i)?;
-            self.start_instance(i, firmware, gb_addr_config).await?;
-            self.test_dec_ring(i).await?;
+            match self.mode {
+                StartMode::Dpg => self.start_instance_dpg(i, gb_addr_config, sram).await?,
+                StartMode::Static => self.start_instance(i, firmware, gb_addr_config).await?,
+            }
+            if let Err(error) = self.test_dec_ring(i).await {
+                if self.mode == StartMode::Dpg {
+                    self.report_failure(i, "decode ring never ran", firmware);
+                }
+                return Err(error);
+            }
             self.proof.dec_ring[i] = true;
+            if self.mode == StartMode::Dpg && self.enc_count > 0 {
+                // amdgpu_vcn_ring_begin_use on an encode ring. NARF has no
+                // VCN idle work, so the instance stays paused afterwards.
+                self.pause_dpg(i).await?;
+            }
             for j in 0..self.enc_count {
                 self.test_enc_ring(i, j).await?;
                 self.proof.enc_ring[i][j] = true;
@@ -1019,7 +1254,9 @@ impl<I: Io> Engine<I> {
         let r = move |l: Layout, reg: Reg| l.reg(i, reg);
         // vcn_v3_0_disable_static_power_gating, !AMD_PG_SUPPORT_VCN branch.
         self.hw.access(|io, l| {
-            checked(io.read(r(l, STATUS)))?;
+            // UVD_STATUS belongs to the gated domain. Like vcn_v3_0_start,
+            // power the tiles first; GC and NBIO liveness were checked before
+            // reaching here. A gated status read is not proof of device loss.
             io.write(r(l, PGFSM_CONFIG), PGFSM_ALL_ON);
             Ok(())
         })?;
@@ -1055,7 +1292,7 @@ impl<I: Io> Engine<I> {
             )?;
             update(io, r(l, SUVD_CGC_CTRL), SUVD_CGC_CTRL_MODES, 0)?;
             // enable VCPU clock, disable master interrupt, LMI channels on
-            update(io, r(l, VCPU_CNTL), VCPU_CLK_EN, VCPU_CLK_EN)?;
+            update_vcpu(io, l, i, VCPU_CLK_EN, VCPU_CLK_EN)?;
             update(io, r(l, MASTINT_EN), MASTINT_VCPU_EN, 0)?;
             update(io, r(l, LMI_CTRL2), LMI_CTRL2_STALL_ARB_UMC, 0)?;
             update(io, r(l, SOFT_RESET), SOFT_RESET_LMI | SOFT_RESET_LMI_UMC, 0)?;
@@ -1097,12 +1334,227 @@ impl<I: Io> Engine<I> {
             io.write(r(l, GFX10_ADDR_CONFIG), gb_addr_config);
             // unblock VCPU register access, release VCPU reset to boot
             update(io, r(l, RB_ARB_CTRL), RB_ARB_VCPU_DIS, 0)?;
-            update(io, r(l, VCPU_CNTL), VCPU_BLK_RST, 0)?;
+            update_vcpu(io, l, i, VCPU_BLK_RST, 0)?;
             Ok(())
         })?;
-        let attempt = self.boot_vcpu(i).await?;
+        let attempt = match self.boot_vcpu(i).await {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                self.report_failure(i, "VCPU never booted", firmware);
+                return Err(error);
+            }
+        };
         self.proof.booted[i] = attempt;
         self.program_rings(i)
+    }
+    /// One line of what an instance that never ran left behind: the
+    /// power, PGFSM, DPG, reset, clock-gating, cache-window and decode
+    /// ring registers, for comparison with a Linux register dump.
+    fn report_failure(&mut self, i: usize, what: &str, firmware: u64) {
+        use core::fmt::Write;
+        let regs = [
+            ("STATUS", STATUS),
+            ("POWER_STATUS", POWER_STATUS),
+            ("PGFSM_STATUS", PGFSM_STATUS),
+            ("DPG_PAUSE", DPG_PAUSE),
+            ("RBC_RPTR", RBC_RB_RPTR),
+            ("RBC_WPTR", RBC_RB_WPTR),
+            ("SCRATCH2", SCRATCH2),
+            ("SCRATCH9", SCRATCH9),
+            ("SOFT_RESET", SOFT_RESET),
+            ("VCPU_CNTL", VCPU_CNTL),
+            ("RB_ARB_CTRL", RB_ARB_CTRL),
+            ("CGC_GATE", CGC_GATE),
+            ("CGC_CTRL", CGC_CTRL),
+            ("CACHE_BAR_LO", LMI_VCPU_CACHE_BAR_LOW),
+            ("CACHE_BAR_HI", LMI_VCPU_CACHE_BAR_HIGH),
+            ("CACHE_SIZE0", VCPU_CACHE_SIZE0),
+            ("ADDR_CONFIG", GFX10_ADDR_CONFIG),
+            ("HARVESTING", CC_UVD_HARVESTING),
+        ];
+        let mut values = [0u32; 18];
+        let read = self.hw.access(|io, l| {
+            for (value, (_, reg)) in values.iter_mut().zip(regs) {
+                *value = io.read(l.reg(i, reg));
+            }
+            Ok(())
+        });
+        let mut w = narf_console::Writer;
+        let _ = write!(
+            w,
+            "amdgpu: VCN{i} {what} ({:?}): firmware {firmware:#x} ({} bytes)",
+            self.mode, self.firmware_bytes
+        );
+        if read.is_ok() {
+            for ((name, _), value) in regs.iter().zip(values) {
+                let _ = write!(w, " {name}={value:#x}");
+            }
+        }
+        let _ = writeln!(w);
+    }
+    /// `vcn_v3_0_start_dpg_mode(indirect)`: dynamic power gating on, the
+    /// register list through PSP, then the decode RBC with its fw_shared
+    /// copy of the ring pointers. There is no boot poll; the decode ring
+    /// test is the first evidence the VCPU runs. Encode rings are set up
+    /// by the first pause (`vcn_v3_0_pause_dpg_mode`).
+    async fn start_instance_dpg(
+        &mut self,
+        i: usize,
+        gb_addr_config: u32,
+        sram: &mut impl SramLoader,
+    ) -> Result<(), Error> {
+        let instance = self.vcn[i].as_ref().ok_or(Error::Invalid)?;
+        let base = instance.address(0);
+        let map = instance.memory.mapping();
+        let dec = instance.address(DEC_RING);
+        let r = move |l: Layout, reg: Reg| l.reg(i, reg);
+        self.hw.access(|io, l| {
+            // disable register anti-hang mechanism
+            update(io, r(l, POWER_STATUS), POWER_STATUS_MASK, 1)?;
+            // enable dynamic power gating mode
+            let power = checked(io.read(r(l, POWER_STATUS)))?;
+            io.write(r(l, POWER_STATUS), power | POWER_PG_MODE | POWER_PG_EN);
+            Ok(())
+        })?;
+        let list = dpg_list(self.hw.layout, i, base, gb_addr_config);
+        if list.len() > DPG_SRAM_DW {
+            return Err(Error::Invalid);
+        }
+        sram.load_sram(i, &list).await?;
+        let wptr = self.hw.access(|io, l| {
+            let modes = |io: &mut I, value: u32| {
+                io.write_memory(map, SHARED + shared::QUEUE_MODES, value);
+                flush(io, l);
+            };
+            // force RBC into idle state
+            io.write(r(l, RBC_RB_CNTL), RBC_RB_CNTL_IDLE);
+            // Stall DPG before WPTR/RPTR reset
+            update(io, r(l, POWER_STATUS), POWER_STALL_DPG, POWER_STALL_DPG)?;
+            modes(io, shared::RING_RESET << shared::DECODE_SHIFT);
+            io.write(r(l, RBC_RB_WPTR_CNTL), 0);
+            // linux: n/a (upper_32_bits(ring->gpu_addr) >> 2, vcn_v3_0_start_dpg_mode)
+            io.write(r(l, RBC_RB_RPTR_ADDR), ((dec >> 32) as u32) >> 2);
+            io.write(r(l, LMI_RBC_RB_BAR_LOW), dec as u32);
+            io.write(r(l, LMI_RBC_RB_BAR_HIGH), (dec >> 32) as u32);
+            io.write(r(l, RBC_RB_RPTR), 0);
+            io.write(r(l, SCRATCH2), 0);
+            let wptr = checked(io.read(r(l, RBC_RB_RPTR)))?;
+            io.write(r(l, RBC_RB_WPTR), wptr);
+            // Reset FW shared memory RBC WPTR/RPTR
+            io.write_memory(map, SHARED + shared::RB_RPTR, 0);
+            io.write_memory(map, SHARED + shared::RB_WPTR, wptr);
+            modes(io, 0);
+            // Unstall DPG
+            update(io, r(l, POWER_STATUS), POWER_STALL_DPG, 0)?;
+            checked(io.read(r(l, STATUS)))?;
+            Ok(wptr)
+        })?;
+        if wptr >= RING_DW {
+            return Err(Error::Invalid);
+        }
+        let instance = self.vcn[i].as_mut().ok_or(Error::Invalid)?;
+        instance.dec.wptr = wptr;
+        instance.dec.dpg_wptr = Some((self.hw.layout.reg(i, SCRATCH2), SHARED + shared::RB_WPTR));
+        Ok(())
+    }
+    /// `vcn_v3_0_pause_dpg_mode(VCN_DPG_STATE__PAUSE)`: hold the instance
+    /// powered, then program both encode rings (whose registers DPG does
+    /// not retain) and restore the decode pointers from fw_shared.
+    async fn pause_dpg(&mut self, i: usize) -> Result<(), Error> {
+        if self.paused[i] {
+            return Ok(());
+        }
+        let enc_count = self.enc_count;
+        let instance = self.vcn[i].as_mut().ok_or(Error::Invalid)?;
+        let (map, engine) = (instance.memory.mapping(), instance.engine);
+        let enc = [instance.address(ENC_RING[0]), instance.address(ENC_RING[1])];
+        let power = self.hw.layout.reg(i, POWER_STATUS);
+        let pause = self.hw.layout.reg(i, DPG_PAUSE);
+        self.hw
+            .wait_reg(engine, power, 1, POWER_STATUS_MASK)
+            .await?;
+        self.hw.access(|io, _| {
+            let value = checked(io.read(pause))? & !DPG_PAUSE_ACK;
+            io.write(pause, value | DPG_PAUSE_REQ);
+            Ok(())
+        })?;
+        self.hw
+            .wait_reg(engine, pause, DPG_PAUSE_ACK, DPG_PAUSE_ACK)
+            .await?;
+        self.hw.access(|io, l| {
+            let r = |reg: Reg| l.reg(i, reg);
+            let modes = |io: &mut I, value: u32| {
+                io.write_memory(map, SHARED + shared::QUEUE_MODES, value);
+                flush(io, l);
+            };
+            // Stall DPG before WPTR/RPTR reset
+            update(io, r(POWER_STATUS), POWER_STALL_DPG, POWER_STALL_DPG)?;
+            for j in 0..enc_count {
+                modes(io, shared::RING_RESET << shared::ENCODE_SHIFT[j]);
+                io.write(r(RB_BASE_LO[j]), enc[j] as u32);
+                io.write(r(RB_BASE_HI[j]), (enc[j] >> 32) as u32);
+                io.write(r(RB_SIZE[j]), RING_DW);
+                io.write(r(RB_RPTR[j]), 0);
+                io.write(r(RB_WPTR[j]), 0);
+                modes(io, 0);
+            }
+            // restore wptr/rptr with pointers saved in FW shared memory
+            invalidate(io, l);
+            let rptr = io.read_memory(map, SHARED + shared::RB_RPTR);
+            let wptr = io.read_memory(map, SHARED + shared::RB_WPTR);
+            io.write(r(RBC_RB_RPTR), rptr);
+            io.write(r(RBC_RB_WPTR), wptr);
+            // Unstall DPG
+            update(io, r(POWER_STATUS), POWER_STALL_DPG, 0)
+        })?;
+        for ring in &mut instance.enc {
+            ring.reset();
+        }
+        self.hw
+            .wait_reg(engine, power, POWER_UVDM_UVDU_ON, POWER_STATUS_MASK)
+            .await?;
+        self.paused[i] = true;
+        Ok(())
+    }
+    /// `vcn_v3_0_stop_dpg_mode`: unpause, wait for every ring to drain and
+    /// the instance to report powered, then leave dynamic power gating.
+    async fn stop_dpg(&mut self, i: usize) -> Result<(), Error> {
+        let engine = self.vcn[i].as_ref().ok_or(Error::Invalid)?.engine;
+        let l = self.hw.layout;
+        let r = |reg: Reg| l.reg(i, reg);
+        if self.paused[i] {
+            // unpause dpg, no need to wait
+            self.hw.access(|io, _| {
+                let value = checked(io.read(r(DPG_PAUSE)))? & !DPG_PAUSE_ACK;
+                io.write(r(DPG_PAUSE), value & !DPG_PAUSE_REQ);
+                Ok(())
+            })?;
+            self.paused[i] = false;
+        }
+        let power = r(POWER_STATUS);
+        self.hw
+            .wait_reg(engine, power, 1, POWER_STATUS_MASK)
+            .await?;
+        for (rptr, wptr, mask) in [
+            (RB_RPTR[0], RB_WPTR[0], u32::MAX),
+            (RB_RPTR[1], RB_WPTR[1], u32::MAX),
+            // linux: n/a (literal 0x7FFFFFFF in vcn_v3_0_stop_dpg_mode)
+            (RBC_RB_RPTR, RBC_RB_WPTR, 0x7fff_ffff),
+        ] {
+            let want = self
+                .hw
+                .access(|io, _| Ok(checked(io.read(r(wptr)))? & mask))?;
+            self.hw.wait_reg(engine, r(rptr), want, u32::MAX).await?;
+        }
+        self.hw
+            .wait_reg(engine, power, 1, POWER_STATUS_MASK)
+            .await?;
+        self.hw.access(|io, _| {
+            // disable dynamic power gating mode
+            update(io, power, POWER_PG_MODE, 0)?;
+            checked(io.read(r(STATUS)))?;
+            Ok(())
+        })
     }
     /// The `for (j = 0; j < 10; ++j)` boot loop of `vcn_v3_0_start`.
     async fn boot_vcpu(&mut self, i: usize) -> Result<u8, Error> {
@@ -1117,10 +1569,10 @@ impl<I: Io> Engine<I> {
             }
             // "decode not responding, trying to reset the VCPU"
             self.hw
-                .access(|io, l| update(io, l.reg(i, VCPU_CNTL), VCPU_BLK_RST, VCPU_BLK_RST))?;
+                .access(|io, l| update_vcpu(io, l, i, VCPU_BLK_RST, VCPU_BLK_RST))?;
             delay(t.reset_us).await;
             self.hw
-                .access(|io, l| update(io, l.reg(i, VCPU_CNTL), VCPU_BLK_RST, 0))?;
+                .access(|io, l| update_vcpu(io, l, i, VCPU_BLK_RST, 0))?;
             delay(t.reset_us).await;
         }
         Err(Error::BootFailed(i as u8))
@@ -1333,9 +1785,10 @@ impl<I: Io> Engine<I> {
         self.proof.enc_ib[i][j] = last;
         Ok(())
     }
-    /// `vcn_v3_0_stop` (non-DPG) for every started instance, and
-    /// `jpeg_v3_0_stop` when JPEG runs. Power gating stays disabled, so the
-    /// static PG re-enable steps are skipped; nothing is restarted.
+    /// `vcn_v3_0_stop` for every started instance (`_stop_dpg_mode` in
+    /// DPG mode), and `jpeg_v3_0_stop` when JPEG runs. Static power gating
+    /// stays disabled, so its re-enable steps are skipped, as is the SMU
+    /// PowerDownVcn; nothing is restarted.
     pub(crate) async fn stop(&mut self) -> Result<(), Error> {
         if !matches!(self.state, State::Running | State::Verified) {
             return Err(Error::Busy);
@@ -1362,6 +1815,10 @@ impl<I: Io> Engine<I> {
         }
         let instances: alloc::vec::Vec<usize> = self.active().collect();
         for i in instances {
+            if self.mode == StartMode::Dpg {
+                self.stop_dpg(i).await?;
+                continue;
+            }
             let engine = self.vcn[i].as_ref().ok_or(Error::Invalid)?.engine;
             let reg = |l: Layout, r: Reg| l.reg(i, r);
             let (status, lmi) = (reg(self.hw.layout, STATUS), reg(self.hw.layout, LMI_STATUS));
@@ -1384,8 +1841,8 @@ impl<I: Io> Engine<I> {
             self.hw.access(|io, l| {
                 let r = |x: Reg| reg(l, x);
                 update(io, r(RB_ARB_CTRL), RB_ARB_VCPU_DIS, RB_ARB_VCPU_DIS)?;
-                update(io, r(VCPU_CNTL), VCPU_BLK_RST, VCPU_BLK_RST)?;
-                update(io, r(VCPU_CNTL), VCPU_CLK_EN, 0)?;
+                update_vcpu(io, l, i, VCPU_BLK_RST, VCPU_BLK_RST)?;
+                update_vcpu(io, l, i, VCPU_CLK_EN, 0)?;
                 update(io, r(SOFT_RESET), SOFT_RESET_LMI_UMC, SOFT_RESET_LMI_UMC)?;
                 update(io, r(SOFT_RESET), SOFT_RESET_LMI, SOFT_RESET_LMI)?;
                 io.write(r(STATUS), 0);
@@ -1591,6 +2048,10 @@ pub struct Media {
     client: Option<Client>,
 }
 impl Media {
+    /// The unharvested VCN instances this owner programs.
+    pub fn active_instances(&self) -> [bool; 2] {
+        [self.engine.vcn[0].is_some(), self.engine.vcn[1].is_some()]
+    }
     /// Reserve per-instance VCPU/ring/IB storage without device I/O.
     /// `instances` is the unharvested VCN mask whose firmware PSP loads;
     /// JPEG exists when instance 0 does (`num_jpeg_inst = 1`).
@@ -1652,6 +2113,12 @@ impl Media {
                 jpeg,
                 firmware_bytes,
                 timing: LINUX_TIMING,
+                mode: if DPG.load(Ordering::Relaxed) {
+                    StartMode::Dpg
+                } else {
+                    StartMode::Static
+                },
+                paused: [false; 2],
                 state: State::Prepared,
                 proof: Proof {
                     instances,
@@ -1661,6 +2128,8 @@ impl Media {
         })
     }
     /// Power, clock, boot and ring-test every owned VCN instance once.
+    /// In DPG mode `psp` (which loaded the images) programs each
+    /// instance's protected registers from its DPG register list.
     ///
     /// # Safety
     /// PSP loaded the VCN images reported in `firmware` into the retained
@@ -1671,8 +2140,12 @@ impl Media {
         &mut self,
         firmware: crate::amdgpu_psp_ring::MediaFirmware,
         power: Option<crate::amdgpu_smu_navi22::PowerStatus>,
+        psp: &mut crate::amdgpu_psp_ring::Psp,
     ) -> Result<(), Error> {
-        self.engine.start(firmware, power).await
+        self.engine.start(firmware, power, psp).await
+    }
+    pub fn mode(&self) -> StartMode {
+        self.engine.mode
     }
     /// Start JPEG and ring-test it once (instance 0 register space).
     ///

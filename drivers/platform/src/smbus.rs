@@ -273,10 +273,14 @@ static CONTROLLER: IrqSafeSpinLock<Option<Smbus>> = IrqSafeSpinLock::new(None);
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     // Class match catches all class-0x0C devices; verify subclass
-    // is 0x05 (SMBus) before bringing up.
+    // is 0x05 (SMBus) before bringing up. A wrong subclass is an
+    // identity mismatch, not a broken device: decline with
+    // `NotForThisDriver` so `probe_all` falls through to the next
+    // candidate (bus spec §9.3). `BadDevice` below stays reserved
+    // for post-identity bring-up failures.
     let subclass = ((device.id.class >> 8) & 0xFF) as u8;
     if subclass != SMBUS_PCI_SUBCLASS {
-        return Err(narf_bus::ProbeError::BadDevice);
+        return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     if CONTROLLER.lock().is_some() {
         return Ok(());

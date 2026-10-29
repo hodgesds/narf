@@ -107,6 +107,19 @@ impl<T: ?Sized> Mutex<T> {
         Some(MutexGuard { mutex: self })
     }
 
+    /// Acquire only when free and no waiter remains queued. Optional
+    /// optimistic spinners use this to avoid bypassing queued sleepers.
+    /// Failure neither enrolls a waiter nor changes wake ownership.
+    #[inline]
+    pub fn try_lock_unqueued(&self) -> Option<MutexGuard<'_, T>> {
+        let mut inner = self.inner.lock();
+        if inner.locked || !inner.waiters.is_empty() {
+            return None;
+        }
+        inner.locked = true;
+        Some(MutexGuard { mutex: self })
+    }
+
     /// `true` if the lock is currently held by some task. Diagnostic
     /// only — the result is racy with respect to concurrent
     /// acquire/release on other CPUs.
@@ -268,6 +281,33 @@ impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     }
 }
 
-// Smoke tests live in `lib/src/tests.rs` under the kernel-test
-// harness — host `cargo test` can't link against narf-arch hooks
-// the rest of the crate pulls in.
+// Kernel smoke tests live in lib/src/tests.rs. The optional optimistic
+// admission rule also has a direct host test below.
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn optimistic_admission_defers_to_queued_waiters() {
+        let mutex = Mutex::new(());
+        let holder = mutex.try_lock().unwrap();
+        let mut a = mutex.lock();
+        let mut b = mutex.lock();
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut a).poll(&mut cx).is_pending());
+        assert!(Pin::new(&mut b).poll(&mut cx).is_pending());
+        drop(holder); // A is woken; B is still queued.
+        assert!(mutex.try_lock_unqueued().is_none());
+        let Poll::Ready(a_guard) = Pin::new(&mut a).poll(&mut cx) else {
+            panic!("optimistic admission displaced the first waiter");
+        };
+        drop(a_guard);
+        let Poll::Ready(b_guard) = Pin::new(&mut b).poll(&mut cx) else {
+            panic!("the remaining queued waiter was stranded");
+        };
+        assert!(mutex.try_lock_unqueued().is_none());
+        drop(b_guard);
+        assert!(mutex.try_lock_unqueued().is_some());
+    }
+}

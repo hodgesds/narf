@@ -136,6 +136,165 @@ fn register_test_virtio_card() -> u32 {
     idx
 }
 
+/// The actual Linux ADDFB word and 28-byte buffer through the user-copy
+/// bridge, including preserving every input byte and adjacent memory.
+fn smoke_drm_legacy_addfb_user_buffer_and_rmfb() -> TestResult {
+    let idx = register_test_card();
+    let state = crate::drm_registry::mode_state(idx).unwrap();
+    let handle = state.lock().gem.alloc(0x8000_0000, 8192).unwrap();
+    let mut bytes = [0xa5u8; 36];
+    for (dst, value) in bytes[4..32]
+        .chunks_exact_mut(4)
+        .zip([0, 64, 32, 256, 32, 24, handle])
+    {
+        dst.copy_from_slice(&value.to_le_bytes());
+    }
+    let saved = bytes;
+    let arg = bytes[4..].as_mut_ptr() as usize;
+    if dispatch_card(idx, 0xc01c_64ae, arg, true) != Err(FsError::PermissionDenied)
+        || crate::drm_ioctl_bridge::dispatch_card(idx, SMOKE_MASTER_ID + 1, 0xc01c_64ae, arg, false)
+            != Err(FsError::PermissionDenied)
+        || bytes != saved
+        || !state.lock().framebuffers.is_empty()
+    {
+        return TestResult::Fail("legacy bridge permissions or unchanged failure buffer");
+    }
+    if dispatch_card(idx, 0xc01c_64ae, arg, false) != Ok(0)
+        || bytes[..4] != saved[..4]
+        || bytes[8..] != saved[8..]
+    {
+        return TestResult::Fail("legacy ADDFB failed or overwrote fields beyond fb_id");
+    }
+    let id = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if id == 0 || state.lock().framebuffer(id).is_err() {
+        return TestResult::Fail("legacy bridge failed to publish framebuffer id");
+    }
+    if dispatch_card(idx, 0xc004_64a8, arg, false) != Err(FsError::Unsupported)
+        || state.lock().framebuffer(id).is_err()
+    {
+        return TestResult::Fail("old incorrect RMFB number removed a framebuffer");
+    }
+    if dispatch_card(idx, 0xc004_64af, arg, false) != Ok(0) || !state.lock().framebuffers.is_empty()
+    {
+        return TestResult::Fail("Linux RMFB number did not remove legacy framebuffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_legacy_addfb_user_buffer_and_rmfb
+);
+
+fn smoke_drm_native_connector_timings_count_copy_and_admission() -> TestResult {
+    use crate::drm::card::NativeOutput;
+    use crate::drm::ioctl::{mode_to_wire, DrmModeModeInfo};
+    let idx = register_test_card();
+    let ms = crate::drm_registry::mode_state(idx).unwrap();
+    let mode = crate::Mode {
+        width: 3840,
+        height: 2160,
+        refresh_hz: 60,
+        bpp: 32,
+    };
+    let first = DrmModeModeInfo {
+        clock: 533_250,
+        hdisplay: 3840,
+        hsync_start: 3888,
+        hsync_end: 3920,
+        htotal: 4000,
+        vdisplay: 2160,
+        vsync_start: 2163,
+        vsync_end: 2168,
+        vtotal: 2222,
+        vrefresh: 60,
+        flags: 1 | 8,
+        r#type: (1 << 3) | (1 << 6),
+        ..Default::default()
+    };
+    let second = DrmModeModeInfo {
+        clock: 594_000,
+        hsync_start: 4016,
+        hsync_end: 4104,
+        htotal: 4400,
+        vsync_start: 2168,
+        vsync_end: 2178,
+        vtotal: 2250,
+        r#type: 1 << 6,
+        ..first
+    };
+    {
+        let mut card = ms.lock();
+        card.connectors[0].modes = vec![mode];
+        card.native.push(NativeOutput {
+            connector: 31,
+            edid: None,
+            timings: vec![first, second],
+            color_format: None,
+            broadcast_rgb: None,
+            vrr_capable: None,
+            colorspace: None,
+            hdr_output_metadata: None,
+            max_bpc: None,
+        });
+    }
+    let mut arg = [0u8; 80];
+    arg[48..52].copy_from_slice(&31u32.to_le_bytes());
+    let call =
+        |arg: &mut [u8; 80]| dispatch_card(idx, 0xc050_64a7, arg.as_mut_ptr() as usize, false);
+    if call(&mut arg) != Ok(0) || u32::from_le_bytes(arg[32..36].try_into().unwrap()) != 2 {
+        return TestResult::Fail("native GETCONNECTOR count pass used the rounded mode count");
+    }
+    let mut modes = [0xa5u8; 3 * 68];
+    arg[8..16].copy_from_slice(&(modes.as_mut_ptr() as u64).to_le_bytes());
+    // A too-small second-pass buffer must be left untouched, while the
+    // returned count tells libdrm to retry with room for both exact timings.
+    arg[32..36].copy_from_slice(&1u32.to_le_bytes());
+    let saved_ptrs = <[u8; 32]>::try_from(&arg[..32]).unwrap();
+    if call(&mut arg) != Ok(0)
+        || modes != [0xa5; 3 * 68]
+        || arg[..32] != saved_ptrs
+        || u32::from_le_bytes(arg[32..36].try_into().unwrap()) != 2
+    {
+        return TestResult::Fail("native GETCONNECTOR short-buffer protocol");
+    }
+    if call(&mut arg) != Ok(0) || modes[2 * 68..] != [0xa5; 68] || arg[..32] != saved_ptrs {
+        return TestResult::Fail(
+            "native GETCONNECTOR overwrote count/pointers or its output bounds",
+        );
+    }
+    for (bytes, expected) in modes[..2 * 68].chunks_exact(68).zip([first, second]) {
+        let wire = DrmModeModeInfo::from_bytes(bytes).unwrap();
+        if wire.clock != expected.clock
+            || wire.hsync_start != expected.hsync_start
+            || wire.hsync_end != expected.hsync_end
+            || wire.htotal != expected.htotal
+            || wire.vsync_start != expected.vsync_start
+            || wire.vsync_end != expected.vsync_end
+            || wire.vtotal != expected.vtotal
+            || wire.flags != expected.flags
+            || wire.r#type != expected.r#type
+            || !ms.lock().accepts_mode(&wire)
+        {
+            return TestResult::Fail("native GETCONNECTOR copied an unadmitted timing");
+        }
+    }
+    if ms.lock().accepts_mode(&mode_to_wire(&mode)) {
+        return TestResult::Fail("native timing checks were weakened to admit synthesized modes");
+    }
+    // An unplugged/unadmitted native output must not acquire synthetic modes.
+    ms.lock().native[0].timings.clear();
+    if call(&mut arg) != Ok(0) || u32::from_le_bytes(arg[32..36].try_into().unwrap()) != 0 {
+        return TestResult::Fail(
+            "native output with no admitted timings advertised synthetic modes",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_native_connector_timings_count_copy_and_admission
+);
+
 // ── 1. _IOC encoding round-trip ────────────────────────────────────────
 
 #[allow(dead_code)]
@@ -3607,7 +3766,7 @@ fn smoke_drm_native_planes_refuse_what_scanout_cannot_show() -> TestResult {
     // RMFB of the framebuffer on screen turns the CRTC off.
     if dispatch_card(
         idx,
-        iowr(DRM_IOCTL_BASE, 0xA8, 4),
+        crate::drm_uapi::DRM_IOCTL_MODE_RMFB,
         &full as *const u32 as usize,
         false,
     ) != Ok(0)
@@ -3633,6 +3792,7 @@ kernel_test_in!(
 /// shows each full screen, PAGE_FLIP keeps the format (EINVAL across
 /// formats, as drm_mode_page_flip_ioctl) and the atomic plane check takes
 /// them. A card without native planes keeps its three legacy formats.
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_navi48_plane_formats_end_to_end() -> TestResult {
     use crate::drm::atomic::{AtomicState, PlaneState};
     use crate::drm::card::{CardError, DumbBacking, PixelFormat};
@@ -3801,6 +3961,7 @@ fn smoke_drm_navi48_plane_formats_end_to_end() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_navi48_plane_formats_end_to_end
@@ -3817,6 +3978,7 @@ kernel_test_in!(
 /// buffer is never evicted, outlives RMFB and GEM_CLOSE, and is unpinned
 /// (and freed) only once the HUBPs report the flip that replaced it
 /// latched; drm_fb_release removes an open's GEM framebuffers on close.
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_navi48_gem_framebuffers_scan_out_in_place() -> TestResult {
     use crate::amdgpu_dm_modifiers::{DccBlock, Swizzle, Tiling};
     use crate::amdgpu_gem::{GemState, VramHeap};
@@ -4043,6 +4205,7 @@ fn smoke_drm_navi48_gem_framebuffers_scan_out_in_place() -> TestResult {
     crate::amdgpu_gem::unregister_vram_heap(idx);
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_navi48_gem_framebuffers_scan_out_in_place
@@ -4058,6 +4221,7 @@ kernel_test_in!(
 /// eviction moves an unpinned dumb buffer to system memory and the next
 /// flip's prepare_fb brings it back. Before the card's VRAM heap is up the
 /// card keeps its system-memory dumb buffers.
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
     use crate::amdgpu_gem::{GemState, VramHeap};
     use crate::drm_uapi::{
@@ -4195,9 +4359,31 @@ fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
     let (Some(Ok(0)), fa) = addfb(a.handle) else {
         return TestResult::Fail("ADDFB2 of a dumb handle");
     };
-    let (Some(Ok(0)), fb_b) = addfb(b.handle) else {
-        return TestResult::Fail("ADDFB2 of the second dumb handle");
-    };
+    // Xorg's legacy ADDFB fallback must also find a native per-open GEM BO,
+    // not accidentally look for the same number in the card's dumb table.
+    let mut legacy = [0u8; 28];
+    for (dst, value) in legacy
+        .chunks_exact_mut(4)
+        .zip([0, 200, 100, 1024, 32, 24, b.handle])
+    {
+        dst.copy_from_slice(&value.to_le_bytes());
+    }
+    let saved = legacy;
+    let legacy_ptr = legacy.as_mut_ptr() as usize;
+    let legacy_add =
+        || crate::drm_ioctl_bridge::amdgpu_addfb2_bo(idx, OWNER, 0xc01c_64ae, legacy_ptr, &gem);
+    if legacy_add() != Some(Err(FsError::PermissionDenied)) || legacy != saved {
+        return TestResult::Fail("native legacy ADDFB bypassed master gate");
+    }
+    {
+        let mut card = ms.lock();
+        card.drop_master(SMOKE_MASTER_ID).unwrap();
+        card.set_master(OWNER).unwrap();
+    }
+    if legacy_add() != Some(Ok(0)) || legacy[4..] != saved[4..] {
+        return TestResult::Fail("ADDFB of the second native dumb handle");
+    }
+    let fb_b = u32::from_le_bytes(legacy[..4].try_into().unwrap());
     let show = |fb: u32| {
         let card = ms.lock();
         let fb = card.framebuffer(fb).ok()?;
@@ -4292,6 +4478,7 @@ fn smoke_drm_navi48_dumb_buffers_scan_out_of_vram() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_navi48_dumb_buffers_scan_out_of_vram
@@ -4374,6 +4561,7 @@ kernel_test_in!(
 /// `AMDGPU_INFO.return_pointer` is the client's: aimed at kernel memory it is
 /// EFAULT and the kernel bytes stay untouched, while the same request with
 /// the pointer standing in for user memory answers.
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_user_copies_info_return_pointer() -> TestResult {
     use crate::amdgpu_uapi as u;
     use crate::drm_ioctl_bridge::kernel_test_buffers::StrictUserCopies;
@@ -4397,6 +4585,7 @@ fn smoke_drm_user_copies_info_return_pointer() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_user_copies_info_return_pointer
@@ -4435,6 +4624,7 @@ kernel_test_in!(
 // and runs amdgpu_dm's plane checks on ATOMIC (TEST_ONLY included) and
 // SETPLANE. DML admission and presentation are the native display's
 // (exercised by the navi48 tests); this card has none.
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     use crate::drm::card::DumbBacking;
     use crate::drm_native_planes as planes;
@@ -4920,7 +5110,7 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     let mut rm = video_fb.to_le_bytes();
     if dispatch_card(
         idx,
-        iowr(DRM_IOCTL_BASE, 0xA8, 4),
+        crate::drm_uapi::DRM_IOCTL_MODE_RMFB,
         rm.as_mut_ptr() as usize,
         false,
     ) != Ok(0)
@@ -4962,6 +5152,7 @@ fn smoke_drm_ioctl_native_overlay_planes() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_ioctl_native_overlay_planes
@@ -4974,6 +5165,7 @@ kernel_test_in!(
 // the legacy CURSOR/CURSOR2 ioctls (drm_mode_cursor_universal) update it
 // through amdgpu_dm's cursor checks; the hardware cursor it drives is the
 // native display's (this card has none).
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_ioctl_native_cursor_plane() -> TestResult {
     use crate::amdgpu_dm_modifiers::{FbCmd, FB_MODIFIERS};
     use crate::drm::card::DumbBacking;
@@ -5422,7 +5614,7 @@ fn smoke_drm_ioctl_native_cursor_plane() -> TestResult {
     let mut rm = cursor_fb.to_le_bytes();
     if dispatch_card(
         idx,
-        iowr(DRM_IOCTL_BASE, 0xA8, 4),
+        crate::drm_uapi::DRM_IOCTL_MODE_RMFB,
         rm.as_mut_ptr() as usize,
         false,
     ) != Ok(0)
@@ -5432,8 +5624,10 @@ fn smoke_drm_ioctl_native_cursor_plane() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_native_cursor_plane);
 
+#[cfg(feature = "amdgpu")]
 fn smoke_drm_ioctl_hdmi_color_format_property() -> TestResult {
     use crate::amdgpu_hdr::ColorFormat as F;
     let Some(idx) = color_card() else {
@@ -5503,6 +5697,7 @@ fn smoke_drm_ioctl_hdmi_color_format_property() -> TestResult {
     assert_eq!(atomic(0x400, 0), Err(FsError::InvalidData));
     TestResult::Pass
 }
+#[cfg(feature = "amdgpu")]
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_ioctl_hdmi_color_format_property

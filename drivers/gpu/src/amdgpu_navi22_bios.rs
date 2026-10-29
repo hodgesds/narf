@@ -41,6 +41,10 @@ const DIG1_TRANSMITTER_CONTROL: u16 = 76;
 const ATOM_ENCODER_MODE_HDMI: u8 = 3; // linux: ATOM_ENCODER_MODE_HDMI
 const ATOM_ENCODER_CMD_STREAM_SETUP: u8 = 0x0f; // linux: ATOM_ENCODER_CMD_STREAM_SETUP
 const ATOM_COMBOPHY_PLL0: u8 = 20; // linux: ATOM_COMBOPHY_PLL0
+const ATOM_ENCODER_MODE_CRT: u8 = 15; // linux: ATOM_ENCODER_MODE_CRT
+const ATOM_CRTC_INVALID: u8 = 0xff; // linux: ATOM_CRTC_INVALID
+const PIXEL_CLOCK_V7_MISC_FORCE_PROG_PPLL: u8 = 0x01; // linux: PIXEL_CLOCK_V7_MISC_FORCE_PROG_PPLL
+const ENCODER_OBJECT_ID_NONE: u8 = 0x00; // linux: n/a (ENCODER_OBJECT_ID_NONE, amdgpu/ObjectID.h; not in checker sets)
 /// `ENCODER_OBJECT_ID_INTERNAL_UNIPHY`, `_UNIPHY1`, `_UNIPHY2`.
 // linux: n/a (ENCODER_OBJECT_ID_INTERNAL_UNIPHY{,1,2} = 0x1E/0x20/0x21, amdgpu/ObjectID.h; not in checker sets)
 const UNIPHY_OBJECT_IDS: [u8; 3] = [0x1e, 0x20, 0x21];
@@ -172,11 +176,32 @@ impl core::fmt::Debug for DmubRoute<'_> {
         f.write_str("DmubRoute")
     }
 }
+/// `amdgpu.rdna2_dmub_tables`: false sends every display table to the ATOM
+/// interpreter (a diagnostic A/B against Linux's DMCUB route).
+static DMUB_TABLES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// `amdgpu.rdna2_atom_pixclk`: SetPixelClock alone in the ATOM interpreter.
+static ATOM_PIXCLK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Set once from the boot options, before the first modeset.
+pub fn set_dmub_tables(enabled: bool) {
+    DMUB_TABLES.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+/// Set once from the boot options, before the first modeset.
+pub fn set_atom_pixclk(enabled: bool) {
+    ATOM_PIXCLK.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
 impl<'d> DmubRoute<'d> {
     /// The DMUB path when `dmub` runs with an idle mailbox (DCN3.0's
     /// `dmub_command_table`); otherwise `None`, logged: the ATOM
     /// interpreter is the fallback.
     pub fn new(dmub: Option<&'d mut Dmub>) -> Option<Self> {
+        if !DMUB_TABLES.load(core::sync::atomic::Ordering::Relaxed) {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 VBIOS display tables via ATOM interpreter (amdgpu.rdna2_dmub_tables=0)"
+            );
+            return None;
+        }
         match dmub {
             Some(dmub) if dmub.vbios_ready() => Some(Self(MailboxLock::new(dmub))),
             _ => {
@@ -360,6 +385,33 @@ impl<'a> Tables<'a> {
         clock: &PixelClock,
     ) -> Result<(), Error> {
         let block = clock.params()?;
+        if !ATOM_PIXCLK.load(core::sync::atomic::Ordering::Relaxed) {
+            if let Some(result) = self.dmub(VbiosCommand::SetPixelClock, &block) {
+                return result;
+            }
+        } else {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 SetPixelClock via ATOM interpreter (amdgpu.rdna2_atom_pixclk=1): {:02x?}",
+                block
+            );
+        }
+        self.require(SET_PIXEL_CLOCK, &[7])?;
+        let mut params = ps(&block);
+        self.execute(bus, SET_PIXEL_CLOCK, &mut params)
+    }
+    /// `dce110_clock_source_power_down`: SetPixelClock with a zero clock
+    /// for combo PHY PLL `pll` (`CONTROLLER_ID_UNDEFINED`, no encoder,
+    /// `SIGNAL_TYPE_NONE`, FORCE_PROGRAMMING_OF_PLL). Linux sends it as an
+    /// old stream's back end is reset and, for every PLL, from
+    /// `power_down_clock_sources` when init finds a lit DIG.
+    pub fn power_down_pixel_clock<B: Bus + 'static>(
+        &self,
+        bus: Rc<RefCell<B>>,
+        pll: u8,
+    ) -> Result<(), Error> {
+        let block = pll_power_down_params(pll)?;
         if let Some(result) = self.dmub(VbiosCommand::SetPixelClock, &block) {
             return result;
         }
@@ -487,6 +539,31 @@ impl PixelClock {
         p[9] = self.deep_color;
         Ok(p)
     }
+}
+
+/// `set_pixel_clock_v7` as `dce110_clock_source_power_down` fills it:
+/// pixclk 0, `controller_id_to_atom(CONTROLLER_ID_UNDEFINED)` =
+/// ATOM_CRTC_INVALID, `encoder_id_to_atom(ENCODER_ID_UNKNOWN)` = NONE,
+/// `encoder_mode_bp_to_atom(SIGNAL_TYPE_NONE)` = CRT, and miscinfo
+/// FORCE_PROG_PPLL only (no XTALIN flag: `use_external_clk` is not consulted).
+// linux-lit: 16=sizeof(struct set_pixel_clock_parameter_v1_7)
+pub(crate) fn pll_power_down_params(pll: u8) -> Result<[u8; 16], Error> {
+    if pll >= STREAMS {
+        return Err(Error::Invalid);
+    }
+    // linux-lit: 16=sizeof(struct set_pixel_clock_parameter_v1_7)
+    let mut p = [0u8; 16];
+    // linux-lit: 4=offsetof(struct set_pixel_clock_parameter_v1_7, pll_id)
+    p[4] = ATOM_COMBOPHY_PLL0 + pll;
+    // linux-lit: 5=offsetof(struct set_pixel_clock_parameter_v1_7, encoderobjid)
+    p[5] = ENCODER_OBJECT_ID_NONE;
+    // linux-lit: 6=offsetof(struct set_pixel_clock_parameter_v1_7, encoder_mode)
+    p[6] = ATOM_ENCODER_MODE_CRT;
+    // linux-lit: 7=offsetof(struct set_pixel_clock_parameter_v1_7, miscinfo)
+    p[7] = PIXEL_CLOCK_V7_MISC_FORCE_PROG_PPLL;
+    // linux-lit: 8=offsetof(struct set_pixel_clock_parameter_v1_7, crtc_id)
+    p[8] = ATOM_CRTC_INVALID;
+    Ok(p)
 }
 
 // linux-lit: 12=sizeof(struct dig_encoder_stream_setup_parameters_v1_5)

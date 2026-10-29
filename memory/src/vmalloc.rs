@@ -38,15 +38,18 @@ const VMALLOC_BASE: u64 = 0xFFFF_8800_0000_0000;
 #[cfg(target_arch = "aarch64")]
 const VMALLOC_BASE: u64 = 0xFFFF_C000_0000_0000;
 
-/// 4 GiB of vmalloc space, split in two halves that share one kernel PML4
+/// 34 GiB of vmalloc space: 32 GiB for ioremap (large PCI BARs) followed by
+/// 2 GiB for the frame-backed [`valloc`] heap fallback. Both share one kernel PML4
 /// slot (so one boot-time `reserve_kernel_slot` covers both):
-///   * lower 2 GiB — `ioremap`'s unbacked bump allocator (device BARs;
+///   * lower 32 GiB — `ioremap`'s unbacked bump allocator (device BARs;
 ///     long-lived, so its no-op free is acceptable).
 ///   * upper 2 GiB — the frame-backed [`valloc`] heap fallback, with a
 ///     bitmap allocator that actually reclaims VA on `vfree`.
 ///
 /// Total span the window occupies at whatever base it is placed at.
-const VMALLOC_SPAN: u64 = 4u64 << 30;
+const IOREMAP_SPAN: u64 = 32u64 << 30;
+const VALLOC_SPAN: u64 = 2u64 << 30;
+const VMALLOC_SPAN: u64 = IOREMAP_SPAN + VALLOC_SPAN;
 
 /// Live base of the vmalloc window, or 0 before it is chosen.
 ///
@@ -74,7 +77,7 @@ pub fn vmalloc_base() -> u64 {
 
 #[inline]
 fn ioremap_limit() -> u64 {
-    vmalloc_base() + (2u64 << 30)
+    vmalloc_base() + IOREMAP_SPAN
 }
 #[inline]
 fn valloc_base() -> u64 {
@@ -83,6 +86,28 @@ fn valloc_base() -> u64 {
 #[inline]
 fn valloc_limit() -> u64 {
     vmalloc_base() + VMALLOC_SPAN
+}
+
+/// Allocate aligned VA for large-leaf ioremap ranges.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn alloc_aligned(len: u64, align: u64) -> Result<VmRange, VmallocError> {
+    let len_pg = len.checked_add(0xFFF).ok_or(VmallocError::BadLen)? & !0xFFF;
+    if len_pg == 0 || !align.is_power_of_two() || align < 4096 {
+        return Err(VmallocError::BadLen);
+    }
+    let _ = CURSOR.compare_exchange(0, vmalloc_base(), Ordering::AcqRel, Ordering::Relaxed);
+    loop {
+        let cur = CURSOR.load(Ordering::Relaxed);
+        let base = cur.checked_add(align - 1).ok_or(VmallocError::Exhausted)? & !(align - 1);
+        let end = base.checked_add(len_pg).ok_or(VmallocError::Exhausted)?;
+        if end > ioremap_limit() {
+            return Err(VmallocError::Exhausted);
+        }
+        match CURSOR.compare_exchange_weak(cur, end, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return Ok(VmRange { base, len: len_pg }),
+            Err(_) => continue,
+        }
+    }
 }
 
 /// Choose this boot's vmalloc base, inside the slot it already owns.
@@ -113,7 +138,7 @@ const VALLOC_PAGES: usize = (2usize << 30) / 4096;
 const VALLOC_WORDS: usize = VALLOC_PAGES / 64;
 
 /// Kernel PML4 (x86) / L0 (aarch64) slot the whole vmalloc window lives in.
-/// The entire 4 GiB fits in one 512 GiB slot. Boot pre-populates this slot's
+/// The entire 34 GiB fits in one 512 GiB slot. Boot pre-populates this slot's
 /// top-level entry BEFORE any user address space is created, so the by-value
 /// kernel-half copy in `new_user_pml4` shares the same lower page tables and
 /// vmalloc/ioremap mappings are visible in every address space (otherwise a

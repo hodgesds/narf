@@ -29,6 +29,13 @@ narf-aml          = { path = "../../aml", optional = true }
 narf-power        = { path = "../../power", optional = true }
 narf-net          = { path = "../../net", optional = true }
 narf-ipc          = { path = "../../ipc", optional = true }
+# Test-only: the composed dock fixture drives the PD contract
+# (usbpd/TCPM) and the USB class cascade (drivers/usb) through
+# their production APIs. These are NOT production dependencies
+# of the CM; they exist only under kernel-test.
+narf-drivers-usbpd = { path = "../usbpd", optional = true }
+narf-usbpd        = { path = "../../usbpd", optional = true }
+narf-drivers-usb  = { path = "../usb", optional = true }
 
 [features]
 # Dual-build: built-in (rlib) or loadable `.ko`. `default = builtin` keeps the
@@ -45,8 +52,14 @@ builtin = [
 module = []
 # Declared so `#[cfg(feature = "kernel-test")]` in src/ doesn't trip the
 # unexpected_cfgs lint. Gating is at the source level; the harness pulls these
-# crates regardless.
-kernel-test = []
+# crates regardless. The optional deps below are the composed dock
+# fixture's cross-crate seam (see the test-only deps above): they are
+# compiled only for the kernel-test build, never for the CM itself.
+kernel-test = [
+    "dep:narf-drivers-usbpd",
+    "dep:narf-drivers-usb",
+    "dep:narf-usbpd",
+]
 
 [lints]
 workspace = true
