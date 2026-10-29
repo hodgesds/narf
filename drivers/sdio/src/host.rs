@@ -38,6 +38,10 @@ pub struct SdhciHost {
     pub voltage: SignalVoltage,
     /// True once CMD7 has been issued and the card is in Transfer state.
     pub card_selected: bool,
+    /// Negotiated data-bus width (1 or 4); host `CTRL_4BITBUS` follows it.
+    pub bus_width: u8,
+    /// SDIO high-speed timing negotiated (CCCR EHS + host `CTRL_HISPD`).
+    pub high_speed: bool,
 }
 
 impl SdhciHost {
@@ -57,6 +61,8 @@ impl SdhciHost {
             func_count: 0,
             voltage: SignalVoltage::V3_3,
             card_selected: false,
+            bus_width: 1,
+            high_speed: false,
         }
     }
 

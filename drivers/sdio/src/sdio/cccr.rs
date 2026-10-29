@@ -60,6 +60,10 @@ pub const BUS_IFACE_BW_1BIT: u8 = 0x00;
 pub const BUS_IFACE_BW_4BIT: u8 = 0x02;
 pub const BUS_IFACE_CD_DISABLE: u8 = 0x80;
 
+// CCCR_CARD_CAPABILITY bits
+pub const CARD_CAP_LSC: u8 = 0x40; // low-speed card
+pub const CARD_CAP_4BLS: u8 = 0x80; // 4-bit low-speed card
+
 // CCCR_HIGH_SPEED bits
 pub const HIGH_SPEED_SHS: u8 = 0x01; // support high speed
 pub const HIGH_SPEED_EHS: u8 = 0x02; // enable high speed

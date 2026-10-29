@@ -65,10 +65,7 @@ cyw43439	host_bus_runtime_pm	Host-bus runtime power management	feature	drivers/w
 cyw43439	monitor_mode	Monitor mode	feature	drivers/wireless/specification/cyw43439.md	519
 cyw43439	p2p_mode	P2P mode	feature	drivers/wireless/specification/cyw43439.md	519
 cyw43439	post_reset_rejoin	Rejoin after native reset	feature	drivers/wireless/specification/cyw43439.md	515
-cyw43439	sdio_4bit	4-bit SDIO operation	feature	drivers/wireless/specification/cyw43439.md	520
-cyw43439	sdio_high_speed	High-speed SDIO operation	feature	drivers/wireless/specification/cyw43439.md	520
 cyw43439	sdio_host_dma	SDIO host DMA operation	feature	drivers/wireless/specification/cyw43439.md	520
-cyw43439	sdio_irq	SDIO interrupt-driven service	feature	drivers/wireless/specification/cyw43439.md	520
 cyw43439	system_resume	System resume	feature	drivers/wireless/specification/cyw43439.md	517
 cyw43439	system_suspend	System suspend	feature	drivers/wireless/specification/cyw43439.md	517
 cyw43439	transport_reset	Confirmed native transport reset	feature	drivers/wireless/specification/cyw43439.md	515

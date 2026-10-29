@@ -165,4 +165,7 @@ impl<T: PacketTransport> Fullmac for Runtime<T> {
     fn firmware_vendor(&self) -> FirmwareVendor {
         Runtime::firmware_vendor(self)
     }
+    fn wake_source(&self) -> Option<(alloc::sync::Arc<crate::brcmfmac::irq::Signal>, bool)> {
+        Runtime::interrupt(self).map(|signal| (signal, true))
+    }
 }

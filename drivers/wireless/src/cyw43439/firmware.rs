@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 use super::backplane::{split as window_split, window_writes};
 use super::chipclk;
 use super::core::{D11, SDIO_DEVICE, SOC_RAM, SOC_RAM_BASE, WLAN_ARM};
-use super::sdio::{BusWidth, CCCR_BUS_IFACE_CTRL, CCCR_IO_ENABLE, CCCR_IO_READY, F1_CHIPCLK_CTRL};
+use super::sdio::{CCCR_IO_ENABLE, CCCR_IO_READY, F1_CHIPCLK_CTRL};
 use super::transport::{Function, Transport, TransportError};
 use crate::brcmfmac::chip::{Backplane, Chip, Core};
 
@@ -300,8 +300,8 @@ impl<'fw, T: Transport> FirmwareLoader<'fw, T> {
     }
 
     fn bus_init(&mut self) -> Result<(), LoadError> {
-        // 4-bit bus + enable F1 are the SDIO-side sequence.
-        self.write_byte(Function::Bus, CCCR_BUS_IFACE_CTRL, BusWidth::OneBit as u8)?;
+        // Enable F1. The bus width belongs to the host's SDIO enumeration
+        // (Linux mmc sdio_enable_4bit_bus); brcmfmac never rewrites CCCR_IF.
         self.write_byte(Function::Bus, CCCR_IO_ENABLE, 1 << 1)?; // F1
         self.poll_byte(Function::Bus, CCCR_IO_READY, 1 << 1)?;
         Ok(())

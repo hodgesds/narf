@@ -20,6 +20,7 @@ pub mod dispatch;
 pub mod gic_dt;
 pub mod its_core;
 pub mod its_fw;
+pub mod oneshot;
 pub mod vector;
 pub mod wait;
 

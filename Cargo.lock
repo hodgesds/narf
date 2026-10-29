@@ -2072,6 +2072,7 @@ dependencies = [
 name = "narf-drivers-sdio"
 version = "0.0.0"
 dependencies = [
+ "narf-aml",
  "narf-bus",
  "narf-capabilities",
  "narf-console",

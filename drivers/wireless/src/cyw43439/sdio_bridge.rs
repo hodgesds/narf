@@ -71,6 +71,8 @@ pub struct SdioTransport<F: SdioFunction> {
     rx_pending: bool,
     flow_stopped: bool,
     failed: bool,
+    /// Card-interrupt wake when the host delivers F1/F2 interrupts.
+    interrupt: Option<alloc::sync::Arc<crate::brcmfmac::irq::Signal>>,
 }
 
 impl<F: SdioFunction> core::fmt::Debug for SdioTransport<F> {
@@ -90,6 +92,7 @@ impl<F: SdioFunction> SdioTransport<F> {
             rx_pending: false,
             flow_stopped: false,
             failed: false,
+            interrupt: None,
         }
     }
     pub(crate) fn qualify(
@@ -147,7 +150,9 @@ impl<F: SdioFunction> SdioTransport<F> {
         Ok(())
     }
     /// Linux sdio.c firmware callback: publish protocol v4 before enabling
-    /// F2, and latch core mailbox/frame indications. Polling needs no IRQ.
+    /// F2, and latch core mailbox/frame indications; then claim F1 and F2
+    /// card interrupts (`brcmf_sdiod_intr_register`) when the host has a
+    /// line. Without one the owner keeps polling.
     pub fn initialize_packets(&mut self, core: u32) -> Result<(), TransportError> {
         if !crate::brcmfmac::chip::valid_address(core) {
             return Err(TransportError::AddressOverflow);
@@ -156,6 +161,18 @@ impl<F: SdioFunction> SdioTransport<F> {
         self.enable_wlan()?;
         self.write_backplane(core + 0x24, 0xf0 | (1 << 29))?;
         self.packet_core = Some(core);
+        let signal = crate::brcmfmac::irq::Signal::new();
+        let raised = signal.clone();
+        if self
+            .func
+            .enable_card_interrupt(
+                (1 << 1) | (1 << 2),
+                alloc::sync::Arc::new(move || raised.raise()),
+            )
+            .map_err(map_err)?
+        {
+            self.interrupt = Some(signal);
+        }
         Ok(())
     }
     fn mailbox(&mut self) -> Result<(), TransportError> {
@@ -344,6 +361,14 @@ impl<F: SdioFunction> Transport for SdioTransport<F> {
     }
 }
 impl<F: SdioFunction + Send> PacketTransport for SdioTransport<F> {
+    fn interrupt(&self) -> Option<alloc::sync::Arc<crate::brcmfmac::irq::Signal>> {
+        self.interrupt.clone()
+    }
+    fn interrupt_serviced(&mut self) {
+        if self.interrupt.is_some() && !self.failed {
+            self.func.rearm_card_interrupt();
+        }
+    }
     fn receive_packet(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
         if self.failed {
             return Err(TransportError::NotReady);

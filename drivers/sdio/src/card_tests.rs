@@ -88,6 +88,9 @@ impl Model {
     }
 }
 impl Registers for Model {
+    fn enable_intx(&mut self) -> bool {
+        true
+    }
     fn host_identity(&self) -> Option<crate::pio::HostIdentity> {
         self.1
     }
@@ -321,3 +324,143 @@ impl Model {
         self.0.lock().commands.len()
     }
 }
+
+fn smoke_sdio_card_negotiates_four_bit_and_high_speed_like_linux() -> TestResult {
+    // mmc_sdio_init_card on an sdhci-pci host: SHS card + CAN_DO_HISPD host
+    // -> EHS + CTRL_HISPD + 50 MHz; then sdio_enable_wide -> CCCR_IF 4-bit +
+    // CTRL_4BITBUS. Reserved CCCR_IF bits are preserved.
+    let model = Model::new();
+    let shared = model.0.clone();
+    {
+        let mut s = shared.lock();
+        s.set32(
+            CAPABILITIES,
+            (50 << 8) | CAPS_CAN_VDD_330 | CAPS_CAN_DO_HISPD,
+        );
+        s.common[CCCR_HIGH_SPEED as usize] = HIGH_SPEED_SHS;
+        s.common[CCCR_BUS_IFACE as usize] = BUS_IFACE_CD_DISABLE;
+    }
+    let config = Config {
+        max_clock_hz: 50_000_000,
+        ..Config::default()
+    };
+    let card = match Card::initialize(model, config) {
+        Ok(card) => card,
+        Err(_) => return TestResult::Fail("high-speed card initialization failed"),
+    };
+    {
+        let s = shared.lock();
+        if s.common[CCCR_HIGH_SPEED as usize] != HIGH_SPEED_SHS | HIGH_SPEED_EHS
+            || s.common[CCCR_BUS_IFACE as usize] != BUS_IFACE_CD_DISABLE | BUS_IFACE_BW_4BIT
+            || s.registers[HOST_CONTROL as usize] & (CTRL_HISPD | CTRL_4BITBUS)
+                != CTRL_HISPD | CTRL_4BITBUS
+        {
+            return TestResult::Fail("card/host high-speed or 4-bit state differs from Linux");
+        }
+    }
+    if card.host().current_clock_hz != 50_000_000
+        || card.host().bus_width != 4
+        || !card.host().high_speed
+    {
+        return TestResult::Fail("negotiated clock/width not retained");
+    }
+    // A low-speed card without 4BLS stays 1-bit; no HISPD host stays legacy.
+    let model = Model::new();
+    let shared = model.0.clone();
+    {
+        let mut s = shared.lock();
+        s.common[CCCR_CARD_CAPABILITY as usize] = CARD_CAP_LSC;
+        s.common[CCCR_HIGH_SPEED as usize] = HIGH_SPEED_SHS;
+    }
+    let card = match Card::initialize(model, Config::default()) {
+        Ok(card) => card,
+        Err(_) => return TestResult::Fail("legacy card initialization failed"),
+    };
+    let s = shared.lock();
+    if s.common[CCCR_BUS_IFACE as usize] & BUS_IFACE_BW_MASK != BUS_IFACE_BW_1BIT
+        || s.common[CCCR_HIGH_SPEED as usize] & HIGH_SPEED_EHS != 0
+        || s.registers[HOST_CONTROL as usize] & (CTRL_HISPD | CTRL_4BITBUS) != 0
+        || card.host().bus_width != 1
+        || card.host().current_clock_hz != 25_000_000
+    {
+        return TestResult::Fail("low-speed/no-HISPD card was widened or sped up");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sdio/card",
+    smoke_sdio_card_negotiates_four_bit_and_high_speed_like_linux
+);
+
+#[derive(Clone, Default)]
+struct FakeLine(alloc::sync::Arc<core::sync::atomic::AtomicU32>);
+impl crate::card::InterruptLine for FakeLine {
+    fn unmask(&self) {
+        self.0.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
+fn smoke_sdio_card_interrupt_claim_enables_cccr_and_sdhci_like_linux() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    let model = Model::new();
+    let shared = model.0.clone();
+    let mut card = match Card::initialize(model, Config::default()) {
+        Ok(card) => card,
+        Err(_) => return TestResult::Fail("card initialization failed"),
+    };
+    // No platform line: claim reports polling and touches nothing.
+    if card.enable_card_interrupt(0b110, alloc::sync::Arc::new(|| {})) != Ok(false)
+        || shared.lock().common[CCCR_INT_ENABLE as usize] != 0
+    {
+        return TestResult::Fail("claim without a line changed the card");
+    }
+    let line = FakeLine::default();
+    let subscriber = alloc::sync::Arc::new(crate::card::Subscriber::default());
+    if !card.attach_interrupt(alloc::boxed::Box::new(line.clone()), subscriber.clone()) {
+        return TestResult::Fail("model registers refused INTx");
+    }
+    // Bit 0 is the master enable; function 3 does not exist on this card.
+    if card.enable_card_interrupt(0b1, alloc::sync::Arc::new(|| {})) != Err(SdioError::BadFunction)
+        || card.enable_card_interrupt(0b1000, alloc::sync::Arc::new(|| {}))
+            != Err(SdioError::BadFunction)
+    {
+        return TestResult::Fail("invalid function interrupt claim accepted");
+    }
+    static WAKES: AtomicU32 = AtomicU32::new(0);
+    let notify = alloc::sync::Arc::new(|| {
+        WAKES.fetch_add(1, Ordering::AcqRel);
+    });
+    if card.enable_card_interrupt(0b110, notify) != Ok(true) {
+        return TestResult::Fail("card interrupt claim failed");
+    }
+    {
+        let s = shared.lock();
+        // sdio_claim_irq: IENM | IEN1 | IEN2; sdhci_enable_sdio_irq.
+        if s.common[CCCR_INT_ENABLE as usize] != 0b111
+            || s.get32(INT_ENABLE) & INT_CARD_INT == 0
+            || s.get32(SIGNAL_ENABLE) != INT_CARD_INT
+        {
+            return TestResult::Fail("CCCR/SDHCI card-interrupt enables differ from Linux");
+        }
+    }
+    if line.0.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("claim did not unmask the line");
+    }
+    subscriber.notify();
+    if WAKES.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("line delivery did not reach the function driver");
+    }
+    card.rearm_card_interrupt();
+    if line.0.load(Ordering::Acquire) != 2 {
+        return TestResult::Fail("rearm did not unmask the line");
+    }
+    drop(card);
+    let s = shared.lock();
+    if s.get32(SIGNAL_ENABLE) != 0 || s.get32(INT_ENABLE) != 0 {
+        return TestResult::Fail("dropped card left interrupt signalling enabled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sdio/card",
+    smoke_sdio_card_interrupt_claim_enables_cccr_and_sdhci_like_linux
+);
