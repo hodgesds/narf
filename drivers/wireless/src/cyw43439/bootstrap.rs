@@ -147,12 +147,19 @@ impl<R: narf_drivers_sdio::pio::Registers + Send + 'static> Provisioner<R> {
             .run()
             .map_err(|_| "firmware bootstrap/chip revision failed")?;
         let core = loader.packet_core().ok_or("firmware did not release CM3")?;
+        let revision = loader
+            .packet_core_revision()
+            .ok_or("firmware did not release CM3")?;
         let mut transport = loader
             .into_transport()
             .map_err(|_| "firmware owner not ready")?;
         transport
             .initialize_packets(core)
             .map_err(|_| "F2/mailbox setup failed")?;
+        // brcmf_sdio_firmware_callback: save-restore idle sleep setup.
+        transport
+            .initialize_sleep(revision)
+            .map_err(|_| "SDIO save-restore setup failed")?;
         drop(slot);
         let name = narf_net::iface::reserve_name("wlan%d");
         let runtime = super::runtime::Runtime::new(transport).with_firmware_vendor(vendor);
