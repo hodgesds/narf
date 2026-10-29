@@ -1644,3 +1644,18 @@ Refined feature rows: `wow` is declared by at least 8852B and 8852C
 (`wowlan_stub` under `CONFIG_PM`). `tspec` has no rtw89 driver hook
 (`mac80211.c` has no TSPEC path); WMM admission control is mac80211-owned
 host MLME work on top of `wmm_all_access_categories`.
+
+Resolved 2026-10-28 against Linux v7.2 (rows removed or narrowed):
+`tspec` is inapplicable — rtw89 never sets
+`NL80211_FEATURE_SUPPORTS_WMM_ADMISSION`, so `nl80211_add_tx_ts` refuses
+ADD_TX_TS and mac80211 never originates ADDTS. Station U-APSD is
+inapplicable — `rtw89_ops_add_interface` sets only `BEACON_FILTER` and
+`SUPPORTS_CQM_RSSI` (no `IEEE80211_VIF_SUPPORTS_UAPSD`); `uapsd` now tracks
+only AP-side U-APSD (`WIPHY_FLAG_AP_UAPSD`). `nhm_diagnostics` is removed:
+NHM needs `chip->support_noise`, true only on RTL8852A (folded into the
+`rtl8852a` chip row); upstream runs no FAHM ("only ifs_clm for now"); the
+background IFS-CLM runs in `track.rs`; EDCCA-CLM results feed only debug
+diagnostics. `antenna_diversity_tracking` is removed:
+`rtw89_mac_setup_phycap` sets `hal->ant_diversity` only for one-path chips
+with `rfe_type % 3 == 2`, i.e. RTL8851B (folded into the `rtl8851b` chip
+row).

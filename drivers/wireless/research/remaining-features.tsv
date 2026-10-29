@@ -171,7 +171,6 @@ rtw88	vht	VHT operation	feature	drivers/wireless/specification/rtw88.md	1884
 rtw88	wow	Wake on Wireless on RTL8822CE	feature	drivers/wireless/specification/rtw88.md	1885
 rtw89	additional_operating_channels	Noninitial operating channels and retuning	feature	drivers/wireless/specification/rtw89.md	1006
 rtw89	aggregation	TX A-MSDU/A-MSDU-in-A-MPDU aggregation (TX A-MPDU implemented)	feature	drivers/wireless/specification/rtw89.md	1582
-rtw89	antenna_diversity_tracking	Dynamic antenna diversity/tracking	feature	drivers/wireless/specification/rtw89.md	713
 rtw89	carrier_frequency_tracking	Periodic carrier-frequency offset tracking	feature	drivers/wireless/specification/rtw89.md	715
 rtw89	eht	EHT operation on RTL8922A	feature	drivers/wireless/specification/rtw89.md	1581
 rtw89	five_ghz_operation	5GHz band operation	feature	drivers/wireless/specification/rtw89.md	1012
@@ -179,16 +178,14 @@ rtw89	fragmentation	Host fragmentation/defragmentation with native fragment MPDU
 rtw89	he_htc	HE +HTC insertion in QoS DATA [API available: station_security::Security receives +HTC QoS DATA (HT Control skipped, Order masked from the CCMP AAD) on the MSDU and A-MSDU paths, so advertising HTC_HE loses no AP traffic (wireless spec 3.4.1)]	feature	drivers/wireless/specification/rtw89.md	1584
 rtw89	monitor_mode	Monitor radio mode with PHY-status RX metadata	feature	drivers/wireless/specification/rtw89.md	1039
 rtw89	multiple_live_functions	Multiple live PCI functions	feature	drivers/wireless/specification/rtw89.md	1009
-rtw89	nhm_diagnostics	Noise-histogram/CLM/FAHM environment monitoring	feature	drivers/wireless/specification/rtw89.md	1039
 rtw89	rf_power_tracking	Periodic RF calibration/power tracking	feature	drivers/wireless/specification/rtw89.md	1006
-rtw89	rtl8851b	RTL8851B retained runtime including exact secure-policy loading	chip	drivers/wireless/specification/rtw89.md	1017
-rtw89	rtl8852a	RTL8852A retained runtime including exact secure-policy loading	chip	drivers/wireless/specification/rtw89.md	1002
+rtw89	rtl8851b	RTL8851B retained runtime including exact secure-policy loading and its one-path antenna-diversity tracking (hal->ant_diversity)	chip	drivers/wireless/specification/rtw89.md	1017
+rtw89	rtl8852a	RTL8852A retained runtime including exact secure-policy loading and its NHM noise monitoring (support_noise)	chip	drivers/wireless/specification/rtw89.md	1002
 rtw89	rtl8852c	RTL8852C retained runtime	chip	drivers/wireless/specification/rtw89.md	1017
 rtw89	rtl8922a	RTL8922A BE EFUSE/container/descriptor/transport/runtime	chip	drivers/wireless/specification/rtw89.md	1018
 rtw89	runtime_sleep	Runtime sleep/LPS	feature	drivers/wireless/specification/rtw89.md	1016
 rtw89	six_ghz_operation	6GHz band operation on RTL8852C/RTL8922A [API available: association::Bss.band / channel::Band::Ghz6 / frequency_in, he::HeOperation::six_ghz_operation, association::six_ghz::{admit, admit_with_rule, He6GhzCapability, He6GhzOperation}, reg::PowerType6Ghz + RegFlags::NO_6GHZ_{VLP,AFC}_CLIENT (wireless spec 3, 6 GHz band identity); a 6 GHz JoinPlan is not yet available] [API available: 6 GHz JoinPlan - association::JoinPlan::prepare_6ghz + six_ghz()/SixGhzPlan {operation, power_type, channel/width (SixGhzWidth incl. 320 with EHT), peer/local He6GhzCapability for STA_REC_HE_6G, he/eht}, six_ghz::{SixGhzLocal, plan}, eht::LocalEht::with_320mhz (wireless spec 3, 6 GHz JoinPlan)]	feature	drivers/wireless/specification/rtw89.md	1013
-rtw89	tspec	TSPEC/WMM admission control (mac80211-owned host MLME)	feature	drivers/wireless/specification/rtw89.md	1044
-rtw89	uapsd	U-APSD	feature	drivers/wireless/specification/rtw89.md	933
+rtw89	uapsd	AP-side U-APSD (WIPHY_FLAG_AP_UAPSD) with AP mode; station U-APSD is inapplicable (no IEEE80211_VIF_SUPPORTS_UAPSD)	feature	drivers/wireless/specification/rtw89.md	933
 rtw89	wide_channels	HT40/80MHz widths on all AX chips and 160MHz on RTL8852C/RTL8922A	feature	drivers/wireless/specification/rtw89.md	1035
 rtw89	wow	Wake on Wireless	feature	drivers/wireless/specification/rtw89.md	1043
 shared	mlo_station_association	Single-link MLD (Basic Multi-Link) station association in JoinPlan with MLD addressing and MLO key delivery; required before JoinPlan can negotiate UHR (P802.11bn) [Assessed round 3: not feasible as an additive change yet. It needs (1) a Basic Multi-Link element (MLD MAC, common info) in the JoinPlan request and response parsing, (2) PTK derivation over MLD addresses, (3) MLO GTK/IGTK/Link KDE handling in the eapol supplicant (wpa_supplicant MLO 3/4 path) and (4) per-link key installation in station_security; JoinPlan size must be boxed for it]	feature	wireless/specification/spec.md	249
