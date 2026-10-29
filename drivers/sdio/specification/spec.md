@@ -13,8 +13,10 @@ of the current implementation profile.
 ## 2. Assumptions
 
 A standard register aperture is exclusively owned, device ordered, and at
-least 256 bytes long. The initial profile uses 3.3 V, one data line, legacy
-timing and at most 25 MHz. PCI interfaces 0 (PIO) and 1 (standard registers
+least 256 bytes long. The profile uses 3.3 V and negotiates, as Linux
+`mmc_sdio_init_card` does on sdhci-pci, a 4-bit bus and SDIO high-speed
+timing (≤ 50 MHz) when card, host and board configuration allow; otherwise
+one data line, legacy timing and at most 25 MHz. PCI interfaces 0 (PIO) and 1 (standard registers
 with DMA capability) are supported using PIO. Vendor interface 2 and
 multi-slot PCI functions are rejected. A platform supplies its own owned
 `pio::Registers` implementation and explicit soldered-card configuration;
@@ -47,8 +49,16 @@ this does not configure platform clocks, pin muxes or power GPIOs.
 - `Card::host` returns immutable negotiated state; `function(n)` returns
   validated CIS identity/block limit metadata. CIS scanning is bounded to
   1024 bytes per function, checks 17-bit extents, and requires a valid
-  FUNCE. Function MANFID may inherit common identity. Legacy clock is
-  bounded by both the common CIS maximum and caller maximum.
+  FUNCE. Function MANFID may inherit common identity. After the CIS,
+  initialization reads CCCR card capability; with `Config::high_speed`, a
+  `CAN_DO_HISPD` host and an SDIO ≥ 1.20 card advertising SHS, it sets EHS
+  and host `CTRL_HISPD` (`mmc_sdio_switch_hs`) and allows 50 MHz; otherwise
+  the clock is bounded by the common CIS maximum and 25 MHz. The caller's
+  `Config::max_clock_hz` always bounds it. With `Config::four_bit` and not a
+  low-speed card lacking 4BLS (`sdio_enable_wide`), it writes CCCR_IF
+  4-bit (reserved bits kept) and host `CTRL_4BITBUS`. `SdhciHost::bus_width`
+  and `high_speed` record the result. `Config` defaults: 25 MHz,
+  `four_bit` and `high_speed` enabled (sdhci-pci `MMC_CAP_4_BIT_DATA`).
 - `SdioFunction` is implemented by `Card`. CMD52 checks function/address;
   CMD53 checks function enable, address extent, byte count, CIS per-function
   block limit in both byte/block modes, programmed block size and exact
@@ -118,7 +128,7 @@ They validate software contracts, not electrical/controller compatibility.
 ## 8. Open questions
 
 Platform ACPI/devicetree enumeration, regulators/pin mux/clock/reset GPIOs,
-vendor SDHCI quirks, multiple slots/card removal/reprobe, 4-bit/high-speed
-negotiation, interrupt-driven completion and DMA remain software work.
+vendor SDHCI quirks, multiple slots/card removal/reprobe, UHS-I,
+interrupt-driven completion and DMA remain software work.
 Physical PCI/SDIO acceptance, real card timing and cancellation/power-down
 behavior require a target test after these software profiles are reviewed.

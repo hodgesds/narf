@@ -135,8 +135,8 @@ RTL8188EE live EDCA; rtw88 channel1 active scan with extra probe IEs. AR2427 and
 Intel Qu PCI identities are also admitted. Family specs carry the evidence.
 
 **Recount 2026-10-28** (ledger after the round-5 merges, PR#1195): the
-[inventory](../research/remaining-features.tsv) now holds **148 `feature`**
-rows (147 driver, 1 `shared`), **35 `chip`** and **1 `unknown`**; the table
+[inventory](../research/remaining-features.tsv) now holds **146 `feature`**
+rows (145 driver, 1 `shared`), **35 `chip`** and **1 `unknown`**; the table
 below counts `feature` rows per family. This recount also removes two rows as
 inapplicable: ath9k `tx_amsdu` (Linux ath9k never sets
 `IEEE80211_HW_TX_AMSDU`; `ath9k.md`) and shared `glk_membership_selector`
@@ -161,7 +161,7 @@ inapplicable or folded into chip rows, and `uapsd` narrowed to AP-side
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
 | rtw89 | 14 | Other AX/BE profiles and BE transport/EFUSE, wider PHY/channel/rate/role/security profiles, periodic RF tracking, IRQs, reset/rejoin/removal/suspend and multiple functions |
 | brcmfmac | 13 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
-| cyw43439 | 16 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
+| cyw43439 | 14 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
 
 Ordinary firmware station power save is implemented for CYW43439 and BCM43602
 through the common retained FullMAC owner; system suspend, wake offload and

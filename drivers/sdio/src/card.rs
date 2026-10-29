@@ -18,14 +18,22 @@ const MAX_CIS_BYTES: u32 = 1024;
 pub struct Config {
     /// Platform has a soldered card and no valid card-detect input.
     pub non_removable: bool,
-    /// Upper bound; this profile never exceeds legacy 25 MHz/1-bit.
+    /// Board clock ceiling. Legacy timing stays at or below 25 MHz;
+    /// negotiated SDIO high speed raises the card limit to 50 MHz.
     pub max_clock_hz: u32,
+    /// Board wiring permits a 4-bit data bus (sdhci-pci `MMC_CAP_4_BIT_DATA`).
+    pub four_bit: bool,
+    /// Board permits SD high-speed timing (`MMC_CAP_SD_HIGHSPEED`, still
+    /// gated by the controller's `CAN_DO_HISPD` capability).
+    pub high_speed: bool,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
             non_removable: false,
             max_clock_hz: 25_000_000,
+            four_bit: true,
+            high_speed: true,
         }
     }
 }
@@ -236,7 +244,53 @@ impl<R: Registers> Card<R> {
             }
             self.functions[function as usize] = info;
         }
-        self.set_clock(config.max_clock_hz.min(25_000_000).min(max_rate))?;
+        // mmc_sdio_init_card after the CIS: sdio_read_cccr capability bits,
+        // sdio_enable_hs, mmc_sdio_get_max_clock, sdio_enable_4bit_bus.
+        let capability = self
+            .direct(false, 0, CCCR_CARD_CAPABILITY, 0)
+            .map_err(|_| Error::Response)?;
+        let mut high_speed = false;
+        if config.high_speed
+            && self.host.can_do_hispeed()
+            && revision & SDIO_REV_MASK >= SDIO_REV_1_20
+        {
+            let speed = self
+                .direct(false, 0, CCCR_HIGH_SPEED, 0)
+                .map_err(|_| Error::Response)?;
+            if speed & HIGH_SPEED_SHS != 0 {
+                self.direct(true, 0, CCCR_HIGH_SPEED, speed | HIGH_SPEED_EHS)
+                    .map_err(|_| Error::Response)?;
+                let io = self.controller.registers();
+                let control = io.read8(HOST_CONTROL);
+                io.write8(HOST_CONTROL, control | CTRL_HISPD);
+                high_speed = true;
+            }
+        }
+        // High speed makes 50 MHz mandatory; legacy timing keeps the CIS rate.
+        let card_limit = if high_speed {
+            50_000_000
+        } else {
+            max_rate.min(25_000_000)
+        };
+        self.set_clock(config.max_clock_hz.min(card_limit))?;
+        // sdio_enable_wide: not for a low-speed card without 4BLS.
+        if config.four_bit && (capability & CARD_CAP_LSC == 0 || capability & CARD_CAP_4BLS != 0) {
+            let ctrl = self
+                .direct(false, 0, CCCR_BUS_IFACE, 0)
+                .map_err(|_| Error::Response)?;
+            self.direct(
+                true,
+                0,
+                CCCR_BUS_IFACE,
+                (ctrl & !BUS_IFACE_BW_MASK) | BUS_IFACE_BW_4BIT,
+            )
+            .map_err(|_| Error::Response)?;
+            let io = self.controller.registers();
+            let control = io.read8(HOST_CONTROL);
+            io.write8(HOST_CONTROL, control | CTRL_4BITBUS);
+            self.host.bus_width = 4;
+        }
+        self.host.high_speed = high_speed;
         Ok(())
     }
     fn direct(&mut self, write: bool, func: u8, addr: u32, value: u8) -> Result<u8, SdioError> {
