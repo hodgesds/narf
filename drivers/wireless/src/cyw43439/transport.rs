@@ -130,6 +130,15 @@ pub trait PacketTransport: Transport + Send {
     /// Synchronously copy one complete packet to F2. On return the adapter
     /// no longer borrows `packet`; it must not retain a pointer into it.
     fn transmit_packet(&mut self, packet: &[u8]) -> Result<(), TransportError>;
+
+    /// Card-interrupt wake raised by the host's oneshot line (Linux
+    /// `brcmf_sdiod_intr_register`); `None` keeps the polled service.
+    fn interrupt(&self) -> Option<alloc::sync::Arc<crate::brcmfmac::irq::Signal>> {
+        None
+    }
+
+    /// Every pending F1/F2 source has been serviced: re-enable delivery.
+    fn interrupt_serviced(&mut self) {}
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

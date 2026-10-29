@@ -145,8 +145,15 @@ impl<T: PacketTransport> Runtime<T> {
         let result = self.poll_inner();
         if result.is_err() {
             self.failed = true;
+        } else {
+            // The SDIO IRQ thread re-enables the card interrupt after its
+            // function handlers ran; a still-asserted line fires again.
+            self.transport.interrupt_serviced();
         }
         result
+    }
+    pub fn interrupt(&self) -> Option<alloc::sync::Arc<crate::brcmfmac::irq::Signal>> {
+        self.transport.interrupt()
     }
 
     fn poll_inner(&mut self) -> Result<usize, Error> {
