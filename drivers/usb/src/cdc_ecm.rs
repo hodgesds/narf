@@ -936,12 +936,17 @@ pub fn recv_frame(idx: usize, scratch: &mut [u8]) -> Result<Option<&[u8]>, EcmEr
 /// TX cookies for the index keep resolving to `NotBound` instead
 /// of retargeting a later device (records are never removed).
 /// Unknown slots no-op.
-pub fn detach_ecm_slot(slot_id: u8) {
+///
+/// Infallible bookkeeping, adapted to the [`UsbUnbindFn`] contract
+/// with an unconditional `Ok(())` (#893: a hook reports failure with
+/// `Err(())`, never by panicking).
+pub fn detach_ecm_slot(slot_id: u8) -> Result<(), ()> {
     let mut g = CDC_ECM_DEVICES.lock();
     for dev in g.iter_mut().filter(|d| d.slot_id == slot_id && !d.detached) {
         dev.detached = true;
         let _ = narf_net::iface::unregister(&dev.iface_name);
     }
+    Ok(())
 }
 
 fn ecm_send_ctx(cookie: u64, frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
