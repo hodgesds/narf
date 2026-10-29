@@ -225,6 +225,22 @@ The PMU route accepts only private INTIDs 16–31, enables the current CPU's
 redistributor immediately, and is inherited by subsequent per-CPU GIC
 initialisation. Its input must come from firmware discovery.
 
+**Oneshot level INTx** (`oneshot::Line`, x86_64). For a device whose
+interrupt source only its owning task can clear (Linux
+`request_threaded_irq(.., NULL, thread_fn, IRQF_ONESHOT)` through
+`handle_fasteoi_irq`). `unsafe Line::bind_exclusive(gsi, name, notify)`
+refuses a live (unmasked) route with `Error::Shared`, allocates a vector,
+installs the hard half, and routes the GSI level/active-low to the current
+CPU **masked**. The hard half never touches the device: it masks the GSI
+(`acpi::ioapic::set_gsi_masked`), counts the delivery and calls `notify`
+(wake only). The trap's EOI then retires Remote IRR with the line masked.
+The owner services the device, clears the source and calls `unmask()`; a
+still-asserted line is delivered again. Mask transitions are serialized
+under an IRQ-safe lock, so an unmask cannot race a fresh delivery. `Drop`
+masks the route, removes and synchronizes the handler and frees the vector.
+Only exclusive GSIs are supported (masking a line shared with synchronous
+handlers would stall them). Other architectures return `Error::Unsupported`.
+
 ## 4. Invariants & safety properties
 
 - Every IRQ has exactly one `target` at any time.
@@ -494,4 +510,10 @@ the rest of the cap bundle.
   redistributor lookup by `GICR_TYPER` affinity on multi-cluster v3
   silicon, and GICv2m MSI frames for PCIe on IPQ parts.
 
-(none — all v0.1 questions resolved in §12)
+- **aarch64 PCI INTx.** No PCI INTx-to-SPI (`interrupt-map`) routing
+  exists, so `oneshot::Line` is x86_64-only; aarch64 INTx clients poll.
+- **Shared oneshot lines.** A per-GSI registry with a mask refcount would
+  let oneshot owners share a level line with each other (Linux requires
+  matching `IRQF_ONESHOT` across sharers).
+
+(all v0.1 questions resolved in §12)
