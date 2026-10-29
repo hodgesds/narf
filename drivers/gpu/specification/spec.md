@@ -132,8 +132,9 @@ engine info reports zero available userspace engines. HWCONFIG returns the exact
 firmware KLV bytes only after this card's GT publishes a validated snapshot;
 absence returns per-item -ENODEV. Size-only queries never access the data pointer;
 short capacity returns -EINVAL, failed data copies return -EFAULT and later
-items still run. Only the item length is written back. Topology remains
-unavailable. GuC submission-version returns -ENODEV until the userspace scheduling
+items still run. Only the item length is written back. Topology and geometry-DSS
+queries return per-card observed fuse snapshots using the i915 topology layout;
+absence returns -ENODEV. GuC submission-version returns -ENODEV until the userspace scheduling
 interface is admitted; the loaded firmware release cannot substitute for that interface
 version. Submission capabilities and HAS_ALIASING_PPGTT remain zero.
 
@@ -142,7 +143,7 @@ nodes reach Intel dispatch and retain their GEM mmap/PRIME namespaces.
 `drm_registry::card(index)` retains that card's Arc; DeviceInfo reads driver state
 after the registry lock is released. `DeviceInfo::for_card` validates the
 driver/vendor and exact integrated/Alchemist/Battlemage PCI profile and captures
-that instance's optional immutable HWCONFIG Arc. Discrete profiles report system
+that instance's optional immutable HWCONFIG and topology Arcs. Discrete profiles report system
 RAM as system RAM; no local-memory region or Arc display binding is inferred.
 
 `intel_gpu_exec::ExecRequest::read` admits a bounded softpin/no-relocation
@@ -188,7 +189,7 @@ Raptor Lake and a separate Xe-LPG GuC path for Meteor/Arrow Lake. Panther Lake
 has no submission profile. Existing default RCS/media production attach paths
 admit only Gen12 before any MMIO. A display gate cannot admit a render engine.
 The physical GuC path below starts an owned RCS0 kernel context on MTL/Arrow,
-DG2 and BMG. Active render topology, userspace context isolation/state,
+DG2 and BMG. Complete engine/media/cache inventory, userspace context isolation/state,
 accelerated PRIME/KMS integration and Mesa interoperability remain required
 before exposing acceleration. Graphics APIs and shader/state
 generation belong in userspace.
@@ -287,7 +288,7 @@ Legacy FrameBacking makes no coherence claim. The physical-GT arena below
 admits x86_64 system memory only after installing its platform PAT/MOCS policy;
 Linux's DG2/BMG system-memory contract is CPU-coherent. ARM PCI host-bridge
 coherence is unproven and physical scheduling refuses that backing. Local VRAM
-allocation and active topology remain separate work.
+allocation and complete engine/media/cache inventory remain separate work.
 
 `intel_gpu_guc_gt::GuCGt::stage` owns the staged firmware bootstrap and its
 optional CT transport together. It is an exclusive graphics-GT owner, not a
@@ -347,7 +348,8 @@ this path does not install a GuC IRQ handler. Wake/reset/semaphore waits have
 deadlines and async timer/yield progression.
 
 `GuCGt::begin_scheduling` requires awake authenticated Ready, validated HWCONFIG,
-supported submission ABI and no CT. It allocates owned HWS and golden-LRC
+observed nonempty geometry DSS, supported submission ABI and no CT. A compute-only
+GT cannot authorize RCS0 programming or allocation. It allocates owned HWS and golden-LRC
 storage, enables RCS0 under both wake holds, then stops GuC before rewriting
 ADS. The reload enables only RCS0, installs engine mapping, HWS/register saves
 and source-defined context sizes, selects LiteRestore and disables autonomous
@@ -394,6 +396,40 @@ and any owned display mode, then rebuilds GT state using the retained firmware
 asset. No synchronous bridge waits run inside executor polls. A failed cleanup
 is not retried forever.
 The worker logs execution success only after its kernel probe retires.
+
+`intel_gpu_topology::GtTopology` owns immutable main-graphics-GT geometry and
+compute DSS masks, per-DSS EU mask and SIMD width. It is distinct from firmware
+HWCONFIG maxima. Discovery admits only MTL/Arrow, DG2 and BMG, whose source
+profiles each use one geometry (0x913c) and one compute (0x9144) register. Two
+bounded identical samples include the eight-bit EU fuse register at 0x9134;
+unexpected upper EU bits, unstable samples and empty DSS/EU sets refuse startup.
+An all-ones DSS mask is valid for a fully populated 32-DSS GT. MTL/DG2 expand
+each enabled EU fuse bit to two SIMD8 EUs; BMG preserves individual SIMD16 EUs.
+Geometry/compute overlap counts once. Separate media GTs, L3 banks and future
+multi-register/expanded EU formats are not inferred.
+
+The physical owner reads fuses after initial quiescence/cache setup, rechecks
+both current wake holds, and accepts the snapshot before publishing staged
+PTEs or starting firmware DMA. `GuCGt::topology` retains the last observed CPU
+snapshot across stop. `IntelGpuCard::publish_gt_topology` additionally requires
+an awake Ready/CtReady/SchedulingReady owner, matching PCI ID and acquired
+HWCONFIG. The PCI owner must pair the actual card/function, including equal-ID
+cards. Reobserving identical fuses is idempotent on resume; changed fuses refuse
+restart rather than silently replacing published facts. Another card's slot
+is independent. Registry snapshots captured before publication remain absent.
+
+`DrmCard::intel_topology` defaults to absence. QUERY_TOPOLOGY returns the union
+of geometry/compute DSS; QUERY_GEOMETRY_SUBSLICES accepts only render class 0,
+instance 0 (item flags 0), and requires geometry DSS. Wire data has one software
+slice, 32 DSS slots without compaction, EU strides of two bytes for paired
+SIMD8 or one for the admitted SIMD16 format, and zero EU masks for disabled
+DSS. Header fields are little endian; capacities may exceed the exact reply
+without copying past it. Size queries do not dereference the output pointer;
+data queries require a readable 16-byte header before writing, as in i915.
+Short buffers and invalid flags return per-item -EINVAL; read/write faults
+return -EFAULT and later items continue. These static queries survive verified
+GT shutdown and release of all DMA allocations. They do not advertise userspace
+engines, enable EXECBUFFER2 or establish Mesa/physical-silicon acceptance.
 
 `GuCGt::begin_hwconfig` retrieves the firmware HWCONFIG table while GuC is
 `Ready`, before CT owns the graphics MMIO mailbox. It sends GET_HWCONFIG

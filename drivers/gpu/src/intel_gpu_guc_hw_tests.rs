@@ -18,6 +18,9 @@ fn hardware_model_with_interface(
         d.regs.insert(0xa278, 2);
         d.regs.insert(0xd84, 0);
         d.regs.insert(0xfd0, 1);
+        d.regs.insert(0x913c, 5);
+        d.regs.insert(0x9144, 6);
+        d.regs.insert(0x9134, 5);
     }
     let mut boot = stage(window.clone(), arena.clone(), platform);
     boot.submission_version = (version, 0, 0);
@@ -56,6 +59,176 @@ fn hardware_discovery(gt: &mut GuCGt<Window, Arena>, w: &Window, ack: u64) {
     w.0.borrow_mut().regs.insert(0x190240, 0xf0000000);
     assert_eq!(gt.poll(11), Poll::Ready(Ok(GtState::Ready)));
 }
+
+fn smoke_hardware_topology_publication_and_card_queries() -> TestResult {
+    use crate::drm_devfs_bridge::IntelGpuCard;
+    use crate::intel_gpu_render::{tests::check_card_topology, DeviceInfo};
+    for (platform, device, ack) in [
+        (
+            GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
+            0x7d55,
+            0xdfc,
+        ),
+        (GtPlatform::Alchemist, 0x56a0, 0x130044),
+        (GtPlatform::Battlemage, 0xe20b, 0xdfc),
+    ] {
+        let card = Arc::new(IntelGpuCard::new(
+            alloc::string::String::new(),
+            0x8086,
+            device,
+            0,
+            0,
+        ));
+        let other = Arc::new(IntelGpuCard::new(
+            alloc::string::String::new(),
+            0x8086,
+            device,
+            0,
+            0,
+        ));
+        let index = crate::drm_registry::register_drm_card(card.clone());
+        let other_index = crate::drm_registry::register_drm_card(other.clone());
+        let before = DeviceInfo::for_card(index).unwrap();
+        check_card_topology(index, None, None).unwrap();
+        let (w, arena, mut gt) = hardware_model(platform, ack);
+        assert!(card.publish_gt_topology(&mut gt).is_err());
+        hardware_discovery(&mut gt, &w, ack);
+        card.publish_gt_topology(&mut gt).unwrap();
+        card.publish_gt_topology(&mut gt).unwrap(); // identical resume observation
+        assert!(before.topology.is_none());
+        assert!(DeviceInfo::for_card(other_index)
+            .unwrap()
+            .topology
+            .is_none());
+        let snapshot = DeviceInfo::for_card(index).unwrap().topology.unwrap();
+        assert_eq!((snapshot.geometry_dss(), snapshot.compute_dss()), (5, 6));
+
+        let (w2, arena2, mut gt2) = hardware_model(platform, ack);
+        w2.0.borrow_mut()
+            .regs
+            .extend([(0x913c, 2), (0x9144, 0), (0x9134, 3)]);
+        hardware_discovery(&mut gt2, &w2, ack);
+        assert_eq!(
+            card.publish_gt_topology(&mut gt2),
+            Err(GtError::Topology(
+                crate::intel_gpu_topology::TopologyError::Unstable
+            ))
+        );
+        other.publish_gt_topology(&mut gt2).unwrap();
+        let wrong = IntelGpuCard::new(alloc::string::String::new(), 0x8086, 0xffff, 0, 0);
+        assert!(wrong.publish_gt_topology(&mut gt).is_err());
+        hardware_stop(&mut gt, &w, ack);
+        hardware_stop(&mut gt2, &w2, ack);
+        drop(gt);
+        drop(gt2);
+        assert_eq!(
+            (arena.live_allocations(), arena2.live_allocations()),
+            (0, 0)
+        );
+        assert_eq!((snapshot.geometry_dss(), snapshot.compute_dss()), (5, 6));
+
+        let mut expected = if platform == GtPlatform::Battlemage {
+            let mut bytes = alloc::vec![0;53];
+            bytes[..16].copy_from_slice(&[0, 0, 1, 0, 32, 0, 8, 0, 1, 0, 4, 0, 5, 0, 1, 0]);
+            bytes[16..24].copy_from_slice(&[1, 7, 0, 0, 0, 5, 5, 5]);
+            bytes
+        } else {
+            let mut bytes = alloc::vec![0;85];
+            bytes[..16].copy_from_slice(&[0, 0, 1, 0, 32, 0, 16, 0, 1, 0, 4, 0, 5, 0, 2, 0]);
+            bytes[16..27].copy_from_slice(&[1, 7, 0, 0, 0, 0x33, 0, 0x33, 0, 0x33, 0]);
+            bytes
+        };
+        let mut geometry = expected.clone();
+        geometry[17] = 5;
+        if platform == GtPlatform::Battlemage {
+            geometry[22] = 0;
+        } else {
+            geometry[23..25].fill(0);
+        }
+        check_card_topology(index, Some(&expected), Some(&geometry)).unwrap();
+        expected[17] = 2;
+        expected[21..].fill(0);
+        if platform == GtPlatform::Battlemage {
+            expected[22] = 3;
+        } else {
+            expected[23] = 0xf;
+        }
+        check_card_topology(other_index, Some(&expected), Some(&expected)).unwrap();
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_topology_publication_and_card_queries
+);
+
+fn smoke_hardware_fuse_admission_before_dma_and_scheduling() -> TestResult {
+    use crate::intel_gpu_topology::TopologyError;
+    for fuses in [[0, 0, 1], [1, 0, 0], [1, 1, u32::MAX]] {
+        let (w, arena, mut gt) = hardware_model(GtPlatform::Alchemist, 0x130044);
+        w.0.borrow_mut()
+            .regs
+            .extend([(0x913c, fuses[0]), (0x9144, fuses[1]), (0x9134, fuses[2])]);
+        gt.begin(0).unwrap();
+        w.0.borrow_mut().regs.insert(0x130044, 1);
+        assert!(gt.poll(1).is_pending());
+        w.0.borrow_mut().regs.insert(0xd84, 1);
+        assert!(gt.poll(2).is_pending());
+        reset_done(&w);
+        assert!(gt.poll(3).is_pending());
+        reset_done(&w);
+        assert!(matches!(gt.poll(4), Poll::Ready(Err(GtError::Topology(_)))));
+        assert_eq!(gt.state(), GtState::Lost);
+        assert!(gt.topology().is_none());
+        assert!(!w
+            .0
+            .borrow()
+            .writes
+            .iter()
+            .any(|&(r, v)| (r == 0xc314 && v == 0x00110011) || r == 0x2080));
+        hardware_stop(&mut gt, &w, 0x130044);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    let (w, arena, mut gt) = hardware_model(GtPlatform::Alchemist, 0x130044);
+    w.0.borrow_mut().regs.insert(0x913c, 0); // valid compute-only GT
+    hardware_discovery(&mut gt, &w, 0x130044);
+    assert!(!gt.topology().unwrap().has_render());
+    let count = arena.live_allocations();
+    assert_eq!(
+        gt.begin_scheduling(12),
+        Err(GtError::Topology(TopologyError::NoRender))
+    );
+    assert_eq!(arena.live_allocations(), count);
+    assert!(!w.0.borrow().writes.iter().any(|(r, _)| *r == 0x2080));
+    let card = crate::drm_devfs_bridge::IntelGpuCard::new(
+        alloc::string::String::new(),
+        0x8086,
+        0x56a0,
+        0,
+        0,
+    );
+    w.0.borrow_mut().regs.insert(0x130044, 0);
+    assert_eq!(card.publish_gt_topology(&mut gt), Err(GtError::WakeLost));
+    assert_eq!(gt.state(), GtState::Lost);
+    gt.begin_stop(20).unwrap();
+    w.0.borrow_mut().regs.insert(0x130044, 1);
+    assert!(gt.poll(21).is_pending());
+    reset_done(&w);
+    w.0.borrow_mut().regs.insert(0xc314, 0);
+    assert!(gt.poll(22).is_pending());
+    w.0.borrow_mut().regs.insert(0xd84, 0);
+    assert!(gt.poll(23).is_pending());
+    w.0.borrow_mut().regs.insert(0x130044, 0);
+    assert_eq!(gt.poll(24), Poll::Ready(Ok(GtState::Stopped)));
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_fuse_admission_before_dma_and_scheduling
+);
 
 fn hardware_scheduling(gt: &mut GuCGt<Window, Arena>, w: &Window) {
     gt.begin_scheduling(12).unwrap();

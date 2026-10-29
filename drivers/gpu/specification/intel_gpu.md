@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.16** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.17** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -1486,7 +1486,9 @@ Validated execbuffer requests still return NotImplemented. No userspace engines
 or acceleration capabilities are advertised. Gen12 production execlists helpers
 refuse Meteor/Arrow Lake before MMIO. The physical GuC owner now supplies
 per-card startup, kernel context scheduling, completion and full-engine reset
-ownership; userspace state/isolation, active topology and Mesa 3D remain open.
+ownership. Live geometry/compute DSS and EU fuses now feed per-card topology
+queries; userspace state/isolation, complete engine/media/cache inventory and
+Mesa 3D remain open.
 
 `intel_gpu_guc` now supplies validated CSS component ranges and coherent CTB
 send/receive primitives. `intel_gpu_guc_firmware` acquires a bounded immutable
@@ -1560,6 +1562,26 @@ GRDOM_FULL; then fences report Reset and render/GT wake releases are acknowledge
 The service logs startup success only after its hardware probe retires. The
 async `kernel_probe(card)` API queues another owned context on that function.
 
+`intel_gpu_topology::GtTopology` reads main-GT geometry/compute DSS and EU fuses
+after initial quiescence, with two matching samples and current wake checks
+before firmware DMA. All three admitted profiles use one geometry and one
+compute register; Xe2 BMG does not use Xe3's three-register DSS layout. MTL/DG2
+expand paired SIMD8 EU bits; BMG preserves SIMD16 bits. The admitted EU format
+is eight fuse bits; unexpected upper bits, empty units and unstable readings
+refuse discovery. Full 32-bit DSS masks remain valid. Compute-only fuses can
+describe a GT but cannot authorize the RCS0 kernel scheduler.
+
+Each card publishes its immutable observed snapshot through a live GT owner,
+separately from HWCONFIG maxima. Identical resume observations are idempotent;
+changed fuses refuse restart. QUERY_TOPOLOGY reports the geometry/compute union
+and QUERY_GEOMETRY_SUBSLICES the geometry subset in i915's single software-slice
+wire layout, preserving sparse DSS indices and per-DSS EU masks. Missing
+snapshots return -ENODEV; data queries check readable headers, short capacity
+and user-copy failures with independent per-item errors. Snapshots remain
+queryable on both DRM nodes after verified stop frees all GT DMA storage.
+They do not admit userspace engines or commands. Media GT and L3 inventory
+remain separate work.
+
 Before CT enablement, `GuCGt::begin_hwconfig` performs the source-defined
 GET_HWCONFIG size query and GGTT copy through the same bounded MMIO mailbox
 protocol. The destination is zeroed, cache-cleaned and GuC-TLB-invalidated
@@ -1594,7 +1616,7 @@ Arc identity still adds no display binding, local VRAM or userspace engines.
 
 Gen12 owned resident submission, cache-flushed
 post-sync breadcrumbs, terminal fences and loss retention have native hardware
-models. Active topology, userspace context setup, accelerated PRIME/presentation
+models. Complete engine/media/cache inventory, userspace context setup, accelerated PRIME/presentation
 and real Mesa acceptance remain outstanding.
 
 The memory audit corrected previous x86-like GPU PTE assumptions. Gen12
@@ -1632,7 +1654,8 @@ checkout at `b90c984d615e8ce2af96f5b1411a962d83fed2ad`: MIT-licensed
 `include/drm/intel/pciids.h`, `drivers/gpu/drm/xe/{xe_uc_fw.c,xe_guc.c,xe_wopcm.c,
 xe_guc_ads.c,xe_guc_fwif.h,xe_guc_tlb_inval.c,xe_ggtt.c,xe_force_wake.c,
 xe_guc_hwconfig.c,xe_mocs.c,xe_pat.c,xe_gt_mcr.c,xe_bo.c,xe_lrc.c,
-xe_hw_engine.c,xe_guc_submit.c}`, `drivers/gpu/drm/i915/gt/uc/intel_guc_hwconfig.c`,
+xe_hw_engine.c,xe_guc_submit.c,xe_gt_topology.c}`,
+`drivers/gpu/drm/i915/gt/{uc/intel_guc_hwconfig.c,intel_sseu.c}`,
 `drivers/gpu/drm/i915/i915_query.c`, `include/uapi/drm/i915_drm.h` and
 `drivers/gpu/drm/xe/regs/{xe_guc_regs.h,xe_gt_regs.h,xe_irq_regs.h}` and the
 GuC actions/KLV/CSS ABI headers. Native Rust models pin register/ADS values,

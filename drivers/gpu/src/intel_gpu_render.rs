@@ -49,6 +49,7 @@ pub struct DeviceInfo {
     pub platform: GtPlatform,
     pub memory_bytes: u64,
     pub hwconfig: Option<Arc<HardwareConfig>>,
+    pub topology: Option<Arc<crate::intel_gpu_topology::GtTopology>>,
 }
 
 impl DeviceInfo {
@@ -64,6 +65,7 @@ impl DeviceInfo {
             platform,
             memory_bytes: narf_memory::frame::stats().total as u64 * 4096,
             hwconfig: card.intel_hwconfig(),
+            topology: card.intel_topology(),
         })
     }
 
@@ -657,6 +659,15 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
                 abi::QUERY_HWCONFIG => {
                     Cow::Borrowed(info.hwconfig.as_ref().ok_or(FsError::NoDevice)?.as_bytes())
                 }
+                abi::QUERY_TOPOLOGY | abi::QUERY_GEOMETRY_SUBSLICES => {
+                    let topology = info.topology.as_ref().ok_or(FsError::NoDevice)?;
+                    if topology.platform() != info.platform
+                        || (id == abi::QUERY_GEOMETRY_SUBSLICES && !topology.has_render())
+                    {
+                        return Err(FsError::NoDevice);
+                    }
+                    Cow::Owned(topology.i915_bytes(id == abi::QUERY_GEOMETRY_SUBSLICES))
+                }
                 // Linux reports the GuC scheduling interface, not the loaded
                 // firmware's release. No submission interface is installed yet.
                 abi::QUERY_GUC_SUBMISSION_VERSION => return Err(FsError::NoDevice),
@@ -666,6 +677,11 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
             if capacity != 0 {
                 if capacity < required {
                     return Err(FsError::InvalidData);
+                }
+                if matches!(id, abi::QUERY_TOPOLOGY | abi::QUERY_GEOMETRY_SUBSLICES) {
+                    // i915_query.c::copy_query_item requires a readable header
+                    // before replacing it, even though its contents are ignored.
+                    read(user, u64_at(item, 16), 16)?;
                 }
                 user.write(u64_at(item, 16), &reply)?;
             }
@@ -694,12 +710,14 @@ pub(crate) mod tests {
     struct User {
         bytes: IrqSafeSpinLock<Vec<u8>>,
         fail_write: IrqSafeSpinLock<Option<u64>>,
+        fail_read: IrqSafeSpinLock<Option<u64>>,
     }
     impl User {
         fn new() -> Self {
             Self {
                 bytes: IrqSafeSpinLock::new(vec![0; 32768]),
                 fail_write: IrqSafeSpinLock::new(None),
+                fail_read: IrqSafeSpinLock::new(None),
             }
         }
         fn store(&self, address: u64, data: &[u8]) {
@@ -711,6 +729,9 @@ pub(crate) mod tests {
     }
     impl IoctlContext for User {
         fn read(&self, address: u64, destination: &mut [u8]) -> Result<(), FsError> {
+            if *self.fail_read.lock() == Some(address) {
+                return Err(FsError::BadAddress);
+            }
             let memory = self.bytes.lock();
             let end = address
                 .checked_add(destination.len() as u64)
@@ -745,6 +766,7 @@ pub(crate) mod tests {
             platform: GtPlatform::Integrated(generation),
             memory_bytes: 0x8000_0000,
             hwconfig: None,
+            topology: None,
         }
     }
     fn invoke(file: &RenderFile, user: &User, cmd: u32) -> Result<u64, FsError> {
@@ -788,7 +810,7 @@ pub(crate) mod tests {
             if u32_at(&lengths, 8) as i32 != expected.map_or(-19, |bytes| bytes.len() as i32)
                 || u32_at(&lengths, 32) as i32 != -19 // no GuC submission interface
                 || u32_at(&lengths, 56) != 16 // no admitted engines
-                || u32_at(&lengths, 80) as i32 != -22 // no active topology
+                || u32_at(&lengths, 80) as i32 != -19 // no observed topology
                 || u32_at(&lengths, 104) != 104
             // system RAM only
             {
@@ -819,6 +841,138 @@ pub(crate) mod tests {
         }
         Ok(())
     }
+
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn check_card_topology(
+        card: u32,
+        expected: Option<&[u8]>,
+        geometry: Option<&[u8]>,
+    ) -> Result<(), &'static str> {
+        use narf_filesystem::DirOps;
+        for name in [
+            alloc::format!("card{card}"),
+            alloc::format!("renderD{}", card + 128),
+        ] {
+            let file = crate::drm_devfs_bridge::DriDir
+                .lookup(&name)
+                .ok_or("DRM topology node")?;
+            let user = User::new();
+            let mut request = [0; 16];
+            put32(&mut request, 0, 3);
+            put64(&mut request, 8, 256);
+            user.store(64, &request);
+            let mut items = [0; 72];
+            for (item, id) in items.chunks_exact_mut(24).zip([1, 6, 2]) {
+                put64(item, 0, id);
+                put64(item, 16, u64::MAX); // size-only never touches it
+            }
+            user.store(256, &items);
+            narf_scheduler::block_on_spin(file.ioctl_user(abi::QUERY, 64, &user))
+                .map_err(|_| "node topology size")?;
+            let lengths = user.load(256, 72);
+            if u32_at(&lengths, 8) as i32 != expected.map_or(-19, |v| v.len() as i32)
+                || u32_at(&lengths, 32) as i32 != geometry.map_or(-19, |v| v.len() as i32)
+                || u32_at(&lengths, 56) != 16
+            {
+                return Err("topology size/absence or engine admission");
+            }
+            for (index, bytes) in [expected, geometry].into_iter().enumerate() {
+                let Some(bytes) = bytes else { continue };
+                let address = 1024 + index as u64 * 1024;
+                put32(&mut items, index * 24 + 8, bytes.len() as u32 + 8);
+                put64(&mut items, index * 24 + 16, address);
+                user.store(address, &vec![0xaa; bytes.len() + 8]);
+            }
+            put32(&mut items, 56, 16);
+            put64(&mut items, 64, 4096);
+            user.store(256, &items);
+            narf_scheduler::block_on_spin(file.ioctl_user(abi::QUERY, 64, &user))
+                .map_err(|_| "node topology data")?;
+            for (index, bytes) in [expected, geometry].into_iter().enumerate() {
+                if let Some(bytes) = bytes {
+                    let address = 1024 + index as u64 * 1024;
+                    if user.load(address, bytes.len()) != bytes
+                        || user.load(address + bytes.len() as u64, 8) != [0xaa; 8]
+                    {
+                        return Err("topology content or copy extent");
+                    }
+                }
+            }
+            if user.load(4096, 16) != [0; 16] {
+                return Err("topology advertised execution");
+            }
+        }
+        Ok(())
+    }
+
+    fn smoke_intel_topology_query_faults() -> TestResult {
+        struct Fuses;
+        impl crate::intel_gpu_aux::MmioWindow for Fuses {
+            fn read32(&self, offset: u64) -> u32 {
+                match offset {
+                    0x913c => 5,
+                    0x9144 => 6,
+                    0x9134 => 5,
+                    _ => panic!("topology register"),
+                }
+            }
+            fn write32(&self, _: u64, _: u32) {
+                panic!("topology write")
+            }
+        }
+        let mut info = info(Generation::MeteorLake);
+        info.topology = Some(Arc::new(
+            crate::intel_gpu_topology::GtTopology::read(&Fuses, info.platform).unwrap(),
+        ));
+        let user = User::new();
+        let mut request = [0; 16];
+        put32(&mut request, 0, 3);
+        put64(&mut request, 8, 256);
+        user.store(64, &request);
+        for (capacity, flags, fault_read, fault_write, expected) in [
+            (0, 0, true, true, 85),
+            (84, 0, false, false, -22),
+            (85, 1, false, false, -22),
+            (85, 0, true, false, -14),
+            (85, 0, false, true, -14),
+            (85, 0, false, false, 85),
+        ] {
+            let mut items = [0; 72];
+            put64(&mut items, 0, 1);
+            put32(&mut items, 8, capacity);
+            put32(&mut items, 12, flags);
+            put64(&mut items, 16, 1024);
+            put64(&mut items, 24, 6);
+            put32(&mut items, 32, 85);
+            put64(&mut items, 40, 2048);
+            put64(&mut items, 48, 2);
+            user.store(1024, &[0xaa; 93]);
+            user.store(256, &items);
+            *user.fail_read.lock() = fault_read.then_some(1024);
+            *user.fail_write.lock() = fault_write.then_some(1024);
+            query(&info, 64, &user).unwrap();
+            *user.fail_read.lock() = None;
+            *user.fail_write.lock() = None;
+            let mut expected_items = items;
+            put32(&mut expected_items, 8, expected as u32);
+            put32(&mut expected_items, 32, 85);
+            put32(&mut expected_items, 56, 16);
+            assert_eq!(user.load(256, 72), expected_items);
+            assert_eq!(user.load(1109, 8), [0xaa; 8]);
+            if expected < 0 || capacity == 0 {
+                assert_eq!(user.load(1024, 85), [0xaa; 85]);
+            }
+        }
+        assert!(!info.submission_ready());
+        info.platform = GtPlatform::Battlemage;
+        query(&info, 64, &user).unwrap();
+        assert_eq!(u32_at(&user.load(256, 72), 8) as i32, -19);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_render",
+        smoke_intel_topology_query_faults
+    );
 
     fn smoke_intel_registry_routes_primary_and_render_nodes() -> TestResult {
         use narf_filesystem::DirOps;

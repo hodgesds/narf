@@ -97,6 +97,12 @@ pub trait DrmCard: Send + Sync {
     fn intel_hwconfig(&self) -> Option<Arc<crate::intel_gpu_hwconfig::HardwareConfig>> {
         None
     }
+
+    /// Observed graphics-GT fuse topology, independent of userspace admission.
+    #[cfg(feature = "intel")]
+    fn intel_topology(&self) -> Option<Arc<crate::intel_gpu_topology::GtTopology>> {
+        None
+    }
 }
 
 // ── Global registry ────────────────────────────────────────────────────────

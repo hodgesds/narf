@@ -2080,6 +2080,7 @@ pub struct IntelGpuCard {
     pub subsystem_did: u16,
     hwconfig:
         narf_lib::sync::IrqSafeSpinLock<Option<Arc<crate::intel_gpu_hwconfig::HardwareConfig>>>,
+    topology: narf_lib::sync::IrqSafeSpinLock<Option<Arc<crate::intel_gpu_topology::GtTopology>>>,
 }
 
 #[cfg(feature = "intel")]
@@ -2098,6 +2099,7 @@ impl IntelGpuCard {
             subsystem_vid,
             subsystem_did,
             hwconfig: narf_lib::sync::IrqSafeSpinLock::new(None),
+            topology: narf_lib::sync::IrqSafeSpinLock::new(None),
         }
     }
 
@@ -2125,6 +2127,34 @@ impl IntelGpuCard {
         *slot = Some(snapshot);
         Ok(())
     }
+
+    /// Publish only a validated snapshot from this function's live GT owner.
+    /// A resume may revalidate identical immutable fuses; changed fuses refuse
+    /// restart instead of silently keeping an incompatible published snapshot.
+    pub fn publish_gt_topology<M, A>(
+        &self,
+        gt: &mut crate::intel_gpu_guc_gt::GuCGt<M, A>,
+    ) -> Result<(), crate::intel_gpu_guc_gt::GtError>
+    where
+        M: crate::intel_gpu_aux::MmioWindow,
+        A: crate::intel_gpu_guc_boot::BootAllocator,
+    {
+        use crate::intel_gpu_guc_gt::GtError;
+        if self.vid != 0x8086 {
+            return Err(GtError::Boot(crate::intel_gpu_guc_boot::BootError::Device));
+        }
+        let snapshot = gt.topology_for_device(self.did)?;
+        let mut slot = self.topology.lock();
+        if slot.as_ref().is_some_and(|old| **old != *snapshot) {
+            return Err(GtError::Topology(
+                crate::intel_gpu_topology::TopologyError::Unstable,
+            ));
+        }
+        if slot.is_none() {
+            *slot = Some(snapshot);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "intel")]
@@ -2143,6 +2173,9 @@ impl crate::drm_registry::DrmCard for IntelGpuCard {
     }
     fn intel_hwconfig(&self) -> Option<Arc<crate::intel_gpu_hwconfig::HardwareConfig>> {
         self.hwconfig.lock().clone()
+    }
+    fn intel_topology(&self) -> Option<Arc<crate::intel_gpu_topology::GtTopology>> {
+        self.topology.lock().clone()
     }
     fn subsystem_vendor(&self) -> u16 {
         self.subsystem_vid

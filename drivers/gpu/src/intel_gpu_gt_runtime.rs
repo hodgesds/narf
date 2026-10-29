@@ -326,6 +326,10 @@ impl Owner {
                     Ok(()) | Err(GtError::Busy) => {}
                     Err(e) => return Err(RuntimeError::Gt(e)),
                 }
+                self.pending
+                    .card
+                    .publish_gt_topology(gt)
+                    .map_err(RuntimeError::Gt)?;
                 gt.begin_scheduling(now).map_err(RuntimeError::Gt)?;
                 state.phase = Phase::Reloading;
             }

@@ -956,7 +956,7 @@ GGTT CT owner with MMIO registration/enable/disable, bounded retry/timeout and
 quarantined allocation lifetime. These are native model/ownership paths, not
 working Mesa acceleration or a firmware boot claim.
 EXECBUFFER2 still refuses submission and queries expose no userspace engines.
-Active topology, userspace context setup, accelerated PRIME/KMS and Mesa
+Complete engine/media/cache inventory, userspace context setup, accelerated PRIME/KMS and Mesa
 OpenGL/Vulkan acceptance remain open. The physical GuC kernel path below now
 owns GT reset and context scheduling.
 Existing Gen12 RCS/media helpers refuse Xe-LPG before MMIO.
@@ -1058,6 +1058,26 @@ vendor-only MST helper is now gated when both vendors and kernel tests are
 disabled. Production boot and both btrfs interoperability checks pass on both
 architectures. These results do not validate Intel silicon, firmware boot on
 hardware or Mesa rendering.
+
+The `codex/intel-gt-topology` follow-up reads stable main-GT geometry/compute
+DSS and EU fuses under the owned wake/reset protocol before firmware DMA.
+MTL/Arrow and DG2 expand paired SIMD8 EUs; BMG retains individual SIMD16 EUs.
+Full 32-DSS masks are valid; unstable/empty/unavailable fuse reads close startup.
+Compute-only GTs cannot authorize RCS0 programming. Per-card immutable snapshots
+are independent of HWCONFIG maxima and survive verified stop/reclamation.
+Identical resume observations are accepted; changed fuses refuse restart.
+Primary and render nodes expose i915 topology and geometry-DSS queries with
+sparse masks, exact little-endian layouts, two-pass sizes and per-item copy
+errors. These queries add no userspace engine or EXECBUFFER2 admission.
+Media/cache inventory, userspace isolation/state and silicon/Mesa acceptance
+remain open.
+Six new native smokes cover fuse decoding/stability, literal topology layouts,
+pre-DMA and compute-only admission, equal-ID card isolation, immutable snapshots
+after reclamation and per-item user-copy failures. Selected GPU/DRM coverage
+passes 296 tests on x86_64 and 135 on aarch64, with zero failures/skips. GPU CI
+Clippy passes all three contexts on both targets; host default, Intel-only,
+AMD-only and no-vendor all-target checks, Intel-only debug builds and formatting
+pass. Both architectures pass production boot and btrfs interoperability.
 
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI

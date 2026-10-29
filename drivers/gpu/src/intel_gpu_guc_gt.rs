@@ -14,6 +14,7 @@ use crate::intel_gpu_guc_firmware::GuCFirmware;
 use crate::intel_gpu_guc_sched::{GuCScheduler, SchedulingError};
 use crate::intel_gpu_guc_transport::{Mailbox, TransportError, TransportState, XeLpgTransport};
 use crate::intel_gpu_hwconfig::HardwareConfig;
+use crate::intel_gpu_topology::{GtTopology, TopologyError};
 use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
 use core::task::Poll;
@@ -56,6 +57,7 @@ pub enum GtError {
     Poisoned,
     Hardware(HardwareError),
     Scheduling(SchedulingError),
+    Topology(TopologyError),
 }
 
 struct Parts<M: MmioWindow, A: BootAllocator> {
@@ -63,6 +65,7 @@ struct Parts<M: MmioWindow, A: BootAllocator> {
     ct: Option<XeLpgTransport<M, A>>,
     discovery_mailbox: Option<Mailbox<M>>,
     scheduler: Option<GuCScheduler<A>>,
+    topology: Option<Arc<GtTopology>>,
 }
 
 /// The sole owner of the GT kernel-request bit and graphics-GuC mailbox.
@@ -132,6 +135,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 ct: None,
                 discovery_mailbox: None,
                 scheduler: None,
+                topology: None,
             }),
             state: GtState::Staged,
             deadline: 0,
@@ -149,6 +153,20 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     /// active engine/fuse masks or permission to admit userspace submissions.
     pub fn hwconfig(&self) -> Option<&HardwareConfig> {
         self.parts.boot.hwconfig()
+    }
+
+    pub fn topology(&self) -> Option<&GtTopology> {
+        self.parts.topology.as_deref()
+    }
+
+    pub(crate) fn topology_for_device(
+        &mut self,
+        device_id: u16,
+    ) -> Result<Arc<GtTopology>, GtError> {
+        // Reuse the live state, current wake, actual PCI ID and acquired
+        // HWCONFIG gate; a numeric PCI ID alone cannot authorize publication.
+        self.hwconfig_for_device(device_id)?;
+        self.parts.topology.clone().ok_or(GtError::State)
     }
 
     /// Only a live, awake owner may supply a card's first discovery snapshot.
@@ -354,6 +372,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             self.state = GtState::Lost;
             return Err(error);
         }
+        if !self.topology().is_some_and(GtTopology::has_render) {
+            return Err(GtError::Topology(TopologyError::NoRender));
+        }
         let scheduler = self.parts.boot.scheduler().map_err(GtError::Boot)?;
         self.parts.scheduler = Some(scheduler);
         self.state = GtState::Lost;
@@ -507,6 +528,16 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 if self.state == GtState::RecoveringRender {
                     self.start_reset(now)?;
                 } else {
+                    let topology =
+                        GtTopology::read(self.parts.boot.window(), self.parts.boot.platform())
+                            .map_err(GtError::Topology)?;
+                    self.hardware
+                        .as_ref()
+                        .expect("hardware owner")
+                        .awake(self.parts.boot.window())
+                        .map_err(GtError::Hardware)?;
+                    self.awake()?;
+                    self.parts.topology = Some(Arc::new(topology));
                     self.parts
                         .boot
                         .configure_cache(policy)
