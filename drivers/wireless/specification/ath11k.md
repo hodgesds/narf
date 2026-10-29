@@ -16,8 +16,9 @@
 >
 > Qualcomm ath11k Wi-Fi 6 / 6E driver for PCIe host-attached
 > silicon. QCA6390 and WCN6855-layout parts have native receive/runtime
-> profiles; QCN9074 is admitted (register map, static BAR windows,
-> multi-pdev core/DP configuration) but unverified beyond fixtures.
+> profiles; QCN9074 has its register map, static BAR windows and
+> multi-pdev core/DP configuration, but probe refuses it
+> (`pci::UNVERIFIED_RUNTIME`) until a composed start-up has run.
 > Adapted from Linux
 > `drivers/net/wireless/ath/ath11k/` (BSD-3-Clause-Clear) and
 > `drivers/bus/mhi/host/`, `net/qrtr/`, `drivers/soc/qcom/qmi_*`.
@@ -174,7 +175,7 @@ MHI/QMI support for another revision do not imply a registered WLAN:
 |---|---|---|
 | WCN6855 / QCA2066 / QCA6698AQ | MHI/QMI, CE/HTC/WMI, DP and STA/AP/P2P interfaces | Target-card and AP interoperability validation remains; optional Linux features outside this profile are not implied |
 | QCA6390 HW2.0 | Native IPQ8074 RX/error/fragment DP and production core/CE profile; resource and host vdev capacity four | Native DMA fixtures pass both architectures; composed production-profile CE startup, WPA2 station/data and four-slot tests pass on x86_64; those integration fixtures are x86-only; physical interoperability remains |
-| QCN9074 HW1.0 | Recognized PCI ID; `qcn9074_regs`, static BAR windows, multi-pdev `CoreConfig` / `DpHwParams` admission; passes the runtime-profile check (fixture-tested only) | Multi-pdev runtime residuals: the RX service pass (refill replenish, RXDMA error and monitor-status reaping) covers pdev 0 only, the mac layer registers one radio on pdev 0 (`MacConfig::wcn6855`) and WMI commands go to `wmi[0]` although every per-pdev endpoint is connected, and monitor mode (incl. QCN9074 `full_monitor_mode`) is not supported; composed PCI bring-up never run (no hardware, no composed fixture) |
+| QCN9074 HW1.0 | Recognized PCI ID; `qcn9074_regs`, static BAR windows, multi-pdev `CoreConfig` / `DpHwParams` admission; tables pass `runtime_profile_complete`, but probe refuses it (`pci::UNVERIFIED_RUNTIME`) until a composed start-up smoke exists (fixture-tested only) | Multi-pdev runtime residuals: the RX service pass (refill replenish, RXDMA error and monitor-status reaping) covers pdev 0 only, the mac layer registers one radio on pdev 0 (`MacConfig::wcn6855`) and WMI commands go to `wmi[0]` although every per-pdev endpoint is connected, and monitor mode (incl. QCN9074 `full_monitor_mode`) is not supported; composed PCI bring-up never run (no hardware, no composed fixture) |
 
 Probe first verifies inherited bus mastering and memory decode are off,
 with INTx masked, using command-register readback. Rejected family/singleton

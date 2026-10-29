@@ -110,17 +110,33 @@ impl ProbeError {
     }
 }
 
-/// A PCI ID and firmware directory alone are not a runtime implementation.
-/// Keep probe admission tied to the profiles the live core and RX/TX path
-/// actually use, before any MSI allocation, reset or DMA activation.
-pub(super) fn validate_runtime_profile(hw_rev: HwRev) -> Result<(), ProbeError> {
-    let complete = hw_rev.params().is_some_and(|params| {
+/// Families whose tables are complete (`runtime_profile_complete`) but whose
+/// live PCI start-up has never run end to end, not even against a composed
+/// fixture. Probe refuses them so a real card does not enter an unexercised
+/// runtime; remove an entry only together with a composed start-up smoke.
+/// QCN9074: no composed PCI start-up fixture; full-monitor DP missing.
+pub(super) const UNVERIFIED_RUNTIME: &[HwRev] = &[HwRev::Qcn9074Hw10];
+
+/// Table-level completeness only: register map, core config, DP params and
+/// MHI config all exist for `hw_rev`. Probe additionally requires the family
+/// to be absent from [`UNVERIFIED_RUNTIME`].
+pub(super) fn runtime_profile_complete(hw_rev: HwRev) -> bool {
+    hw_rev.params().is_some_and(|params| {
         params.regs.is_some()
             && super::core::CoreConfig::for_hw(&params).is_some()
             && super::dp_ring::DpHwParams::for_rev(hw_rev).is_some()
             && mhi::config_for(hw_rev).is_some()
-    });
-    if complete {
+    })
+}
+
+/// A PCI ID and firmware directory alone are not a runtime implementation.
+/// Keep probe admission tied to the profiles the live core and RX/TX path
+/// actually use, before any MSI allocation, reset or DMA activation.
+pub(super) fn validate_runtime_profile(hw_rev: HwRev) -> Result<(), ProbeError> {
+    if UNVERIFIED_RUNTIME.contains(&hw_rev) {
+        return Err(ProbeError::UnsupportedRuntime { hw_rev });
+    }
+    if runtime_profile_complete(hw_rev) {
         Ok(())
     } else {
         Err(ProbeError::UnsupportedRuntime { hw_rev })

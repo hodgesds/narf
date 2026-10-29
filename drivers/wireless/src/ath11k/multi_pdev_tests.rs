@@ -185,7 +185,10 @@ fn smoke_ath11k_qcn9074_regs_windows_admission() -> TestResult {
     let c = CoreConfig::for_hw(&p).expect("qcn9074 core config");
     kt_assert_eq!((c.max_radios, c.num_vdevs, c.num_peers), (1, 8, 128));
     kt_assert!(!c.single_pdev_only);
-    kt_assert!(super::pci::validate_runtime_profile(HwRev::Qcn9074Hw10).is_ok());
+    // Tables are complete, but probe stays closed until a composed start-up runs.
+    kt_assert!(super::pci::runtime_profile_complete(HwRev::Qcn9074Hw10));
+    kt_assert!(super::pci::UNVERIFIED_RUNTIME.contains(&HwRev::Qcn9074Hw10));
+    kt_assert!(super::pci::validate_runtime_profile(HwRev::Qcn9074Hw10).is_err());
     TestResult::Pass
 }
 kernel_test_in!(
