@@ -1875,12 +1875,18 @@ fn insert_advice_record(records: &mut Vec<AdviceRecord>, mut record: AdviceRecor
             index += 1;
         }
     }
+    push_advice_record(records, record);
+}
+
+// Splitting an existing record must obey the same bound as a new advise.
+// Losing advisory metadata only selects the ordinary fault-around path.
+fn push_advice_record(records: &mut Vec<AdviceRecord>, record: AdviceRecord) {
     if records.len() >= MAX_ADVICE_RECORDS {
-        // Full: drop the oldest. Which batch is sacrificed is a pure
-        // performance choice — every record is re-derivable.
         records.remove(0);
     }
-    records.push(record);
+    if records.try_reserve(1).is_ok() {
+        records.push(record);
+    }
 }
 
 /// Record the batches behind a `MADV_WILLNEED` of `[base, base + len)`:
@@ -1938,22 +1944,28 @@ pub(crate) fn scrub_advice_range(address_space_id: u64, base: u64, len: u64) {
     for record in old {
         let record_end = record.base.saturating_add(record.len);
         if record_end <= base || record.base >= end {
-            records.push(record);
+            push_advice_record(&mut records, record);
             continue;
         }
         if record.base < base {
-            records.push(AdviceRecord {
-                base: record.base,
-                len: base - record.base,
-                ops: Arc::clone(&record.ops),
-            });
+            push_advice_record(
+                &mut records,
+                AdviceRecord {
+                    base: record.base,
+                    len: base - record.base,
+                    ops: Arc::clone(&record.ops),
+                },
+            );
         }
         if record_end > end {
-            records.push(AdviceRecord {
-                base: end,
-                len: record_end - end,
-                ops: record.ops,
-            });
+            push_advice_record(
+                &mut records,
+                AdviceRecord {
+                    base: end,
+                    len: record_end - end,
+                    ops: record.ops,
+                },
+            );
         }
     }
 }
@@ -2040,7 +2052,7 @@ fn restore_recorded_batch(address_space_id: u64, fault_page: u64) -> bool {
     let Some(bucket) = existing_mapping_owners(address_space_id) else {
         return false;
     };
-    let (first_va, pages) = {
+    let (first_va, owner_base, owner_end, file_offset, ops) = {
         let owners = bucket.lock();
         let Some(owner) = owners.iter().find(|mapping| {
             fault_page >= mapping.base
@@ -2051,22 +2063,30 @@ fn restore_recorded_batch(address_space_id: u64, fault_page: u64) -> bool {
         }) else {
             return false;
         };
-        let start = record.base.max(owner.base);
-        let size = owner.ops.stat().size;
-        if size <= owner.file_offset {
-            return false;
-        }
-        let owner_pages = (size - owner.file_offset).div_ceil(4096);
-        let stop = record
-            .base
-            .saturating_add(record.len)
-            .min(owner.base.saturating_add(owner.len))
-            .min(owner.base + owner_pages * 4096);
-        if stop <= start {
-            return false;
-        }
-        (start, (stop - start) / 4096)
+        (
+            record.base.max(owner.base),
+            owner.base,
+            owner.base.saturating_add(owner.len),
+            owner.file_offset,
+            Arc::clone(&owner.ops),
+        )
     };
+    // FileOps::stat may enter the filesystem or block. The owner snapshot
+    // pins the file, so no IRQ-safe mapping lock is needed around that call.
+    let size = ops.stat().size;
+    if size <= file_offset {
+        return false;
+    }
+    let owner_pages = (size - file_offset).div_ceil(4096);
+    let stop = record
+        .base
+        .saturating_add(record.len)
+        .min(owner_end)
+        .min(owner_base.saturating_add(owner_pages.saturating_mul(4096)));
+    if stop <= first_va {
+        return false;
+    }
+    let pages = (stop - first_va) / 4096;
     if pages == 0 {
         return false;
     }
@@ -3223,6 +3243,41 @@ mod tests {
             Some(self.generation.load(Ordering::Acquire))
         }
     }
+
+    fn smoke_advice_record_splits_stay_bounded() -> TestResult {
+        const SPACE: u64 = u64::MAX - 1001;
+        drop_advice_records(SPACE);
+        let records = advice_records(SPACE);
+        insert_advice_record(
+            &mut records.lock(),
+            AdviceRecord {
+                base: 0x1000,
+                len: 128 * 4096,
+                ops: Arc::new(FixedRemapOwner),
+            },
+        );
+        let result = (|| {
+            for page in (1..64).step_by(2) {
+                scrub_advice_range(SPACE, 0x1000 + page * 4096, 4096);
+                let snapshot = records.lock();
+                if snapshot.len() > MAX_ADVICE_RECORDS {
+                    return TestResult::Fail("partial unmaps grew advice metadata past its cap");
+                }
+                if snapshot.iter().any(|r| {
+                    r.base <= 0x1000 + page * 4096 && 0x1000 + page * 4096 < r.base + r.len
+                }) {
+                    return TestResult::Fail("scrub retained a record over an unmapped hole");
+                }
+            }
+            TestResult::Pass
+        })();
+        drop_advice_records(SPACE);
+        result
+    }
+    kernel_test_in!(
+        "userspace/batch_restore",
+        smoke_advice_record_splits_stay_bounded
+    );
 
     fn smoke_mapped_file_owner_lifecycle() -> TestResult {
         const PARENT: u64 = u64::MAX - 20;
