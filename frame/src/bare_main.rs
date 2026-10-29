@@ -438,6 +438,8 @@ pub mod x86_64;
 pub mod aarch64;
 
 mod canary;
+#[cfg(feature = "kernel-test")]
+mod census;
 mod cross_crate_init;
 mod measure;
 mod reclaim_wait;
@@ -3206,12 +3208,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_input::register_initcalls();
             narf_drivers_nvme::register_initcalls();
             narf_drivers_virtio::register_initcalls();
+            #[cfg(feature = "drivers-net")]
             narf_drivers_net::register_initcalls();
             narf_drivers_wireless::register_initcalls();
             narf_drivers_i3c::register_initcalls();
             narf_drivers_gpio::register_initcalls();
             narf_drivers_i2c::register_initcalls();
             narf_drivers_usbpd::register_initcalls();
+            #[cfg(feature = "drivers-storage")]
             narf_drivers_storage::register_initcalls();
             narf_drivers_usb::register_initcalls();
             narf_drivers_video::register_initcalls();
@@ -3270,6 +3274,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_bluetooth::register_firmware_initcalls();
             // Same ordering requirement: the RTL8127 PHY firmware
             // patch has to run after the firmware scans above.
+            #[cfg(feature = "drivers-net")]
             narf_drivers_net::register_late_firmware_initcalls();
             // Bluetooth bring-up runs after the firmware download
             // above has had its chance to register a transport, since
@@ -4739,6 +4744,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     // `kernel-test` feature is on. `run_all_and_exit` never returns.
     #[cfg(feature = "kernel-test")]
     {
+        // Snapshot the composed initcall registry before any smoke
+        // can add registrations of its own (configurable-drivers
+        // census fixture, frame/src/census.rs).
+        census::capture();
         // Give the tests the production timebase: the same HPET bring-up
         // and TSC calibration the real boot runs, so `monotonic_ns` and every
         // `Deadline` count nanoseconds rather than raw TSC cycles.
