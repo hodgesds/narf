@@ -1868,28 +1868,45 @@ mod tests {
         peer_f5_half(sbox, dhkey_wire, 1, na, nb, a1, a2)
     }
 
+    /// The §2.2.8 f6 message block, in formula order — the
+    /// peer-model mirror of production's DhKeyCheckInputs.
+    /// Deliberately a separate type, not the production struct:
+    /// the peer model shares no code with the SMP state machine,
+    /// so a production-side field change cannot silently move
+    /// the model's message layout. The caller picks the table
+    /// 2.2 orientation by which values it places in `n1`/`n2`
+    /// and `a1`/`a2`.
+    #[derive(Debug)]
+    struct F6Inputs<'a> {
+        /// First nonce (Na for Ea, Nb for Eb).
+        n1: &'a [u8; 16],
+        /// Second nonce (Nb for Ea, Na for Eb).
+        n2: &'a [u8; 16],
+        /// The 128-bit random (zero for Just Works / Numeric
+        /// Comparison).
+        r: &'a [u8; 16],
+        /// IO capabilities.
+        iocap: &'a [u8; 3],
+        /// First address (A for Ea, B for Eb): type byte + BD_ADDR.
+        a1: &'a [u8; 7],
+        /// Second address (B for Ea, A for Eb).
+        a2: &'a [u8; 7],
+    }
+
     /// f6 (Core 5.3 Vol 3 Part H §2.2.8): AES-CMAC keyed on the
     /// MacKey over `n1 ‖ n2 ‖ r ‖ iocap ‖ a1 ‖ a2`, computed with
-    /// the fixture CMAC. The caller supplies the table 2.2
+    /// the fixture CMAC. `inputs` carries the message block in
+    /// formula order; the caller supplies the table 2.2
     /// orientation for the side being modelled — the responder's
     /// check swaps both the nonce order and the address order.
-    fn peer_f6(
-        sbox: &[u8; 256],
-        mac_key: &[u8; 16],
-        n1: &[u8; 16],
-        n2: &[u8; 16],
-        r: &[u8; 16],
-        iocap: &[u8; 3],
-        a1: &[u8; 7],
-        a2: &[u8; 7],
-    ) -> [u8; 16] {
+    fn peer_f6(sbox: &[u8; 256], mac_key: &[u8; 16], inputs: &F6Inputs<'_>) -> [u8; 16] {
         let mut msg = [0u8; 65];
-        msg[0..16].copy_from_slice(n1);
-        msg[16..32].copy_from_slice(n2);
-        msg[32..48].copy_from_slice(r);
-        msg[48..51].copy_from_slice(iocap);
-        msg[51..58].copy_from_slice(a1);
-        msg[58..65].copy_from_slice(a2);
+        msg[0..16].copy_from_slice(inputs.n1);
+        msg[16..32].copy_from_slice(inputs.n2);
+        msg[32..48].copy_from_slice(inputs.r);
+        msg[48..51].copy_from_slice(inputs.iocap);
+        msg[51..58].copy_from_slice(inputs.a1);
+        msg[58..65].copy_from_slice(inputs.a2);
         peer_cmac(sbox, mac_key, &msg)
     }
 
@@ -2000,6 +2017,11 @@ mod tests {
         mac_key: [u8; 16],
     }
 
+    /// (responder, initiator wire X, responder wire X): the
+    /// drive_to_public_key outcome, aliased so the return type
+    /// stays under clippy's type-complexity threshold.
+    type PublicKeyOutcome = (Responder<NarfSmpCrypto>, [u8; 32], [u8; 32]);
+
     /// Drive the production responder through the feature
     /// exchange and the public-key exchange, asserting the ECDH
     /// DHKey against the peer model. Returns the responder in
@@ -2009,7 +2031,7 @@ mod tests {
         initiator_io: u8,
         initiator_auth: u8,
         peer_priv: &Fe,
-    ) -> Result<(Responder<NarfSmpCrypto>, [u8; 32], [u8; 32]), &'static str> {
+    ) -> Result<PublicKeyOutcome, &'static str> {
         let mut r = Responder::new(NarfSmpCrypto, SMP_IAT, SMP_RAT);
         let req = smp::PairingFeatureExchange {
             io_capability: initiator_io,
@@ -2193,7 +2215,16 @@ mod tests {
                 smp::IoCapability::NoInputNoOutput as u8,
             ];
             let ea = peer_f6(
-                &sbox, &mac_key, &SMP_NA, &nb, &[0u8; 16], &iocap_a, &SMP_IAT, &SMP_RAT,
+                &sbox,
+                &mac_key,
+                &F6Inputs {
+                    n1: &SMP_NA,
+                    n2: &nb,
+                    r: &[0u8; 16],
+                    iocap: &iocap_a,
+                    a1: &SMP_IAT,
+                    a2: &SMP_RAT,
+                },
             );
             let check = r
                 .feed(&smp::Pdu {
@@ -2210,7 +2241,16 @@ mod tests {
             // AuthReq 0x0D, OOB 0, DisplayYesNo).
             let iocap_b: [u8; 3] = [0x0D, 0, smp::IoCapability::DisplayYesNo as u8];
             let want_eb = peer_f6(
-                &sbox, &mac_key, &nb, &SMP_NA, &[0u8; 16], &iocap_b, &SMP_RAT, &SMP_IAT,
+                &sbox,
+                &mac_key,
+                &F6Inputs {
+                    n1: &nb,
+                    n2: &SMP_NA,
+                    r: &[0u8; 16],
+                    iocap: &iocap_b,
+                    a1: &SMP_RAT,
+                    a2: &SMP_IAT,
+                },
             );
             if check[0].payload != want_eb {
                 return Err("Eb mismatch: production f6 disagrees with the independent peer");
@@ -2308,7 +2348,19 @@ mod tests {
             0xE3, 0xC4, 0x73, 0x98, 0x9C, 0xD0, 0xE8, 0xC5, 0xD2, 0x6C, 0x0B, 0x09, 0xDA, 0x95,
             0x8F, 0x61,
         ];
-        if peer_f6(&sbox, &want_mac_key, &n1, &n2, &r, &iocap, &a1, &a2) != want_f6 {
+        if peer_f6(
+            &sbox,
+            &want_mac_key,
+            &F6Inputs {
+                n1: &n1,
+                n2: &n2,
+                r: &r,
+                iocap: &iocap,
+                a1: &a1,
+                a2: &a2,
+            },
+        ) != want_f6
+        {
             return TestResult::Fail("peer model f6 disagrees with Appendix D.4");
         }
         if smp::dhkey_check_value(
@@ -2458,12 +2510,14 @@ mod tests {
             let mut ea = peer_f6(
                 &sbox,
                 &out.mac_key,
-                &SMP_NA,
-                &out.nb,
-                &[0u8; 16],
-                &iocap_a,
-                &SMP_IAT,
-                &SMP_RAT,
+                &F6Inputs {
+                    n1: &SMP_NA,
+                    n2: &out.nb,
+                    r: &[0u8; 16],
+                    iocap: &iocap_a,
+                    a1: &SMP_IAT,
+                    a2: &SMP_RAT,
+                },
             );
             ea[15] ^= 0x80;
             match out.responder.feed(&smp::Pdu {
