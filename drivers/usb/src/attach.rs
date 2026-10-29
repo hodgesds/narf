@@ -860,6 +860,16 @@ async fn dispatch_after_address(
         {
             return AttachOutcome::NetworkClass;
         }
+        // CDC-ECM ethernet — class 0x02 (Comm), subclass 0x06.
+        // Tried after NCM: the finders are subclass-gated, so an
+        // ECM device falls through NCM's attempt (NotEcm) and an
+        // NCM device falls through ECM's the same way. Same
+        // outcome: one Ethernet iface either way.
+        if let Ok(_idx) =
+            crate::cdc_ecm::try_bind_ecm_already_addressed(xhci_dev, slot_id, &cfg_blob).await
+        {
+            return AttachOutcome::NetworkClass;
+        }
         // USB Bluetooth HCI — class 0xE0 / subclass 0x01 / proto 0x01.
         // `find_bt_endpoints` walks the config blob; if no matching
         // interface is present it returns NotBluetooth and we fall
