@@ -4586,6 +4586,353 @@ fn smoke_fp_bos_platform_cap() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/fingerprint", smoke_fp_bos_platform_cap);
+/// Provider publication (#920): every bound reader resolves as
+/// `/dev/fp<N>` by registry index — the second reader is fp1, not
+/// unpublished — and enumeration agrees with lookup exactly.
+fn smoke_fp_provider_publishes_every_reader() -> TestResult {
+    use crate::fingerprint::{
+        __reset_fp_for_test, __test_register_device, enumerate_fp, lookup_fp, FpVendor,
+    };
+    use narf_filesystem::{FileOps, FileType};
+    __reset_fp_for_test();
+    let mut fail: Option<&str> = None;
+    __test_register_device(3, FpVendor::Synaptics, 3, 2);
+    __test_register_device(5, FpVendor::Elan, 3, 0);
+    if crate::fingerprint::attached_fp_count() != 2 {
+        fail = Some("registry should hold two test readers");
+    }
+    // First device is still fp0; the second is fp1 (was: unpublished).
+    if fail.is_none() && lookup_fp("fp0").is_none() {
+        fail = Some("fp0 should resolve for the first reader");
+    }
+    if fail.is_none() && lookup_fp("fp1").is_none() {
+        fail = Some("fp1 should resolve for the second reader");
+    }
+    // Masking defeats: unknown index and malformed names are not nodes.
+    if fail.is_none() && lookup_fp("fp2").is_some() {
+        fail = Some("fp2 must not resolve with two readers bound");
+    }
+    if fail.is_none() && (lookup_fp("fp").is_some() || lookup_fp("fpx").is_some()) {
+        fail = Some("malformed fp names must not resolve");
+    }
+    if fail.is_none() {
+        let names = enumerate_fp();
+        let expected = [
+            (alloc::format!("fp0"), FileType::Special),
+            (alloc::format!("fp1"), FileType::Special),
+        ];
+        if names != expected {
+            fail = Some("enumerate must list exactly fp0, fp1");
+        }
+    }
+    if fail.is_none() {
+        // The published node keeps the 0o660 special mode.
+        if let Some(node) = lookup_fp("fp1") {
+            if node.stat().mode.perms != 0o660 {
+                fail = Some("fp1 node must keep mode 0o660");
+            }
+        } else {
+            fail = Some("fp1 should resolve for the mode check");
+        }
+    }
+    __reset_fp_for_test();
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+kernel_test_in!(
+    "drivers/usb/fingerprint",
+    smoke_fp_provider_publishes_every_reader
+);
+
+/// Capability gate (#920): opening a `/dev/fp<N>` node requires
+/// `CAP_SYS_RAWIO`, for reads as well as writes. The hook is
+/// swapped explicitly both ways (never assumed), and restored
+/// before returning, so the global hook state cannot leak into
+/// other smokes.
+fn smoke_fp_open_requires_rawio_cap() -> TestResult {
+    use crate::fingerprint::{__reset_fp_for_test, __test_register_device, lookup_fp, FpVendor};
+    use narf_filesystem::{FileOps, FsError};
+    fn deny(_cap: u32) -> bool {
+        false
+    }
+    fn allow(_cap: u32) -> bool {
+        true
+    }
+    __reset_fp_for_test();
+    __test_register_device(3, FpVendor::Synaptics, 3, 2);
+    let node = match lookup_fp("fp0") {
+        Some(n) => n,
+        None => {
+            __reset_fp_for_test();
+            return TestResult::Fail("fp0 should resolve for the gate smoke");
+        }
+    };
+    let orig = narf_filesystem::__test_swap_caller_capable_hook(Some(deny));
+    let mut fail: Option<&str> = None;
+    if !matches!(
+        node.open_instance_checked(false),
+        Err(FsError::PermissionDenied)
+    ) {
+        fail = Some("read open without the cap must be refused");
+    }
+    if fail.is_none()
+        && !matches!(
+            node.open_instance_checked(true),
+            Err(FsError::PermissionDenied)
+        )
+    {
+        fail = Some("write open without the cap must be refused");
+    }
+    let _ = narf_filesystem::__test_swap_caller_capable_hook(Some(allow));
+    if fail.is_none() && !matches!(node.open_instance_checked(false), Ok(None)) {
+        fail = Some("read open with the cap must succeed");
+    }
+    if fail.is_none() && !matches!(node.open_instance_checked(true), Ok(None)) {
+        fail = Some("write open with the cap must succeed");
+    }
+    let _ = narf_filesystem::__test_swap_caller_capable_hook(orig);
+    __reset_fp_for_test();
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+kernel_test_in!("drivers/usb/fingerprint", smoke_fp_open_requires_rawio_cap);
+
+/// Modelled control-transfer device for the ioctl smoke: records
+/// the SETUP fields of every OUT transfer and answers IN transfers
+/// from a fixed byte string.
+struct FakeFpTransport {
+    in_bytes: alloc::vec::Vec<u8>,
+    last_out: narf_lib::sync::IrqSafeSpinLock<Option<(u8, u8, u16, u16, alloc::vec::Vec<u8>)>>,
+}
+
+impl crate::fingerprint::FpTransport for FakeFpTransport {
+    fn control_in<'a>(
+        &'a self,
+        _slot_id: u8,
+        _bm_request_type: u8,
+        _b_request: u8,
+        _w_value: u16,
+        _w_index: u16,
+        out: &'a mut [u8],
+    ) -> crate::fingerprint::FpFuture<'a, Result<usize, crate::fingerprint::FpError>> {
+        let bytes = self.in_bytes.clone();
+        alloc::boxed::Box::pin(async move {
+            let n = bytes.len().min(out.len());
+            out[..n].copy_from_slice(&bytes[..n]);
+            Ok(n)
+        })
+    }
+
+    fn control_out<'a>(
+        &'a self,
+        _slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        data: &'a [u8],
+    ) -> crate::fingerprint::FpFuture<'a, Result<usize, crate::fingerprint::FpError>> {
+        let data = data.to_vec();
+        let mut g = self.last_out.lock();
+        *g = Some((bm_request_type, b_request, w_value, w_index, data.clone()));
+        alloc::boxed::Box::pin(async move { Ok(data.len()) })
+    }
+}
+
+/// Userspace-memory stand-in for the ioctl smoke: one flat buffer
+/// at base 0x1000; out-of-range accesses fail `BadAddress`, like a
+/// real userspace pointer fault.
+struct MemCtx {
+    mem: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u8>>,
+}
+
+impl MemCtx {
+    fn new() -> Self {
+        Self {
+            mem: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec![0u8; 0x4000]),
+        }
+    }
+
+    fn offset(&self, address: u64, len: usize) -> Result<usize, narf_filesystem::FsError> {
+        let base = address
+            .checked_sub(0x1000)
+            .ok_or(narf_filesystem::FsError::BadAddress)?;
+        let off = base as usize;
+        if off.checked_add(len).is_none_or(|end| end > 0x4000) {
+            return Err(narf_filesystem::FsError::BadAddress);
+        }
+        Ok(off)
+    }
+}
+
+impl narf_filesystem::IoctlContext for MemCtx {
+    fn read(&self, address: u64, dest: &mut [u8]) -> Result<(), narf_filesystem::FsError> {
+        let off = self.offset(address, dest.len())?;
+        dest.copy_from_slice(&self.mem.lock()[off..off + dest.len()]);
+        Ok(())
+    }
+
+    fn write(&self, address: u64, src: &[u8]) -> Result<(), narf_filesystem::FsError> {
+        let off = self.offset(address, src.len())?;
+        self.mem.lock()[off..off + src.len()].copy_from_slice(src);
+        Ok(())
+    }
+
+    fn nonblocking(&self) -> bool {
+        true
+    }
+}
+
+/// Build a 24-byte `FP_IOC_CTRL_TRANSFER` argument (see the layout
+/// comment on the ioctl constant).
+fn fp_ctrl_arg(bm: u8, req: u8, val: u16, idx: u16, len: u32, ptr: u64) -> [u8; 24] {
+    let mut a = [0u8; 24];
+    a[0] = bm;
+    a[1] = req;
+    a[2..4].copy_from_slice(&val.to_le_bytes());
+    a[4..6].copy_from_slice(&idx.to_le_bytes());
+    a[8..12].copy_from_slice(&len.to_le_bytes());
+    a[16..24].copy_from_slice(&ptr.to_le_bytes());
+    a
+}
+
+/// Control-transfer ioctl (#920): an OUT vendor request reaches
+/// the transport with its SETUP fields intact, an IN vendor
+/// request copies the response back and writes back the actual
+/// length, and malformed requests never reach the transport.
+/// The data plane is untouched by this change (diff proof); the
+/// read step below only pins that the read path still resolves
+/// through the controller and fails without a device.
+fn smoke_fp_ctrl_transfer_ioctl() -> TestResult {
+    use crate::fingerprint::{
+        FpVendor, __reset_fp_for_test, __test_fp_node, __test_register_device, FP_DEVICES,
+        FP_IOC_CTRL_TRANSFER, FP_IOC_GET_INFO,
+    };
+    use narf_filesystem::{FileOps, FsError};
+    __reset_fp_for_test();
+    let idx = __test_register_device(7, FpVendor::Goodix, 3, 2);
+    let dev = match FP_DEVICES.lock().get(idx).cloned() {
+        Some(d) => d,
+        None => {
+            __reset_fp_for_test();
+            return TestResult::Fail("test device should be in the registry");
+        }
+    };
+    let transport = alloc::sync::Arc::new(FakeFpTransport {
+        in_bytes: alloc::vec![0xAA, 0xBB],
+        last_out: narf_lib::sync::IrqSafeSpinLock::new(None),
+    });
+    let node = __test_fp_node(dev, transport.clone());
+    let ctx = MemCtx::new();
+    let mut fail: Option<&str> = None;
+    // OUT vendor request: SETUP fields + payload reach the transport.
+    let arg_addr = 0x1000u64;
+    let data_addr = 0x2000u64;
+    {
+        let mut mem = ctx.mem.lock();
+        mem[0x0000..0x0018].copy_from_slice(&fp_ctrl_arg(0x40, 0x01, 0x0203, 0x0004, 3, data_addr));
+        mem[0x1000..0x1003].copy_from_slice(&[0x11, 0x22, 0x33]);
+    }
+    let out = narf_scheduler::block_on(node.ioctl_user(FP_IOC_CTRL_TRANSFER, arg_addr, &ctx));
+    if fail.is_none() && out != Ok(3) {
+        fail = Some("OUT vendor transfer should report 3 bytes");
+    }
+    if fail.is_none() {
+        match transport.last_out.lock().as_ref() {
+            Some((bm, req, val, widx, data))
+                if *bm == 0x40
+                    && *req == 0x01
+                    && *val == 0x0203
+                    && *widx == 0x0004
+                    && data.as_slice() == [0x11, 0x22, 0x33] => {}
+            _ => fail = Some("OUT transfer SETUP fields or payload mismatch"),
+        }
+    }
+    // IN vendor request: response copied back, actual length written back.
+    if fail.is_none() {
+        let resp_addr = 0x3000u64;
+        {
+            let mut mem = ctx.mem.lock();
+            mem[0x0000..0x0018]
+                .copy_from_slice(&fp_ctrl_arg(0xC0, 0x02, 0x0000, 0x0000, 2, resp_addr));
+        }
+        let r = narf_scheduler::block_on(node.ioctl_user(FP_IOC_CTRL_TRANSFER, arg_addr, &ctx));
+        if r != Ok(2) {
+            fail = Some("IN vendor transfer should report 2 bytes");
+        } else {
+            let mem = ctx.mem.lock();
+            if mem[0x2000..0x2002] != [0xAA, 0xBB] {
+                fail = Some("IN response bytes not copied back");
+            } else if mem[0x0008..0x000C] != 2u32.to_le_bytes() {
+                fail = Some("IN actual length not written back into data_len");
+            }
+        }
+    }
+    // Validation defeats: none of these may reach the transport.
+    if fail.is_none() {
+        let bad = [
+            (0x00, "standard OUT request must be rejected"),
+            (0x80, "standard IN request must be rejected"),
+            (0x20, "class request must be rejected"),
+            (
+                0x41,
+                "vendor request to a non-device recipient must be rejected",
+            ),
+        ];
+        for (bm, msg) in bad {
+            let mut mem = ctx.mem.lock();
+            mem[0x0000..0x0018].copy_from_slice(&fp_ctrl_arg(bm, 0x01, 0, 0, 0, 0x2000));
+            drop(mem);
+            let r = narf_scheduler::block_on(node.ioctl_user(FP_IOC_CTRL_TRANSFER, arg_addr, &ctx));
+            if !matches!(r, Err(FsError::Unsupported)) {
+                fail = Some(msg);
+                break;
+            }
+        }
+    }
+    if fail.is_none() {
+        let mut mem = ctx.mem.lock();
+        mem[0x0000..0x0018].copy_from_slice(&fp_ctrl_arg(0x40, 0x01, 0, 0, 4097, 0x2000));
+        drop(mem);
+        let r = narf_scheduler::block_on(node.ioctl_user(FP_IOC_CTRL_TRANSFER, arg_addr, &ctx));
+        if !matches!(r, Err(FsError::InvalidData)) {
+            fail = Some("oversize data_len must be rejected with InvalidData");
+        }
+    }
+    if fail.is_none() {
+        let r = narf_scheduler::block_on(node.ioctl_user(0xdead, arg_addr, &ctx));
+        if !matches!(r, Err(FsError::Unsupported)) {
+            fail = Some("unknown ioctl must be rejected");
+        }
+    }
+    // GET_INFO packing: slot 7, Goodix = 1, IN DCI 3, OUT DCI 2.
+    if fail.is_none() {
+        let r = narf_scheduler::block_on(node.ioctl_user(FP_IOC_GET_INFO, 0, &ctx));
+        let expected: u64 = 7 | (1 << 8) | (3 << 16) | (2 << 24);
+        if r != Ok(expected) {
+            fail = Some("GET_INFO packing mismatch");
+        }
+    }
+    // Data plane intact: a read still resolves through the
+    // controller and fails without a bound device on this slot.
+    if fail.is_none() {
+        let mut buf = [0u8; 64];
+        let r = narf_scheduler::block_on(node.read(0, &mut buf));
+        if r.is_ok() {
+            fail = Some("data-plane read must fail without a device");
+        }
+    }
+    __reset_fp_for_test();
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+kernel_test_in!("drivers/usb/fingerprint", smoke_fp_ctrl_transfer_ioctl);
 
 /// xHCI control helpers reject a method/SETUP direction mismatch. This is
 /// load-bearing for payload-carrying host-to-device requests such as HID

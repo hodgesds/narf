@@ -607,28 +607,6 @@ impl FileOps for DevFuseNode {
     }
 }
 
-// ── /dev/fp0 ─────────────────────────────────────────────────────────
-
-/// Optional `FileOps` delegate for `/dev/fp0`. Installed by the USB
-/// fingerprint driver when a reader is bound. Reads/writes from
-/// `/dev/fp0` route to the raw bulk/interrupt-IN endpoint of the
-/// device.
-///
-/// Stored as a global so the USB crate can register the node without a
-/// direct dependency between devfs and the USB crate.
-static FP_NODE: IrqSafeSpinLock<Option<Arc<dyn FileOps>>> = IrqSafeSpinLock::new(None);
-
-/// Register (or replace) the `/dev/fp0` file node.  Called by the USB
-/// fingerprint driver after a device is successfully bound.
-pub fn register_fp(node: Arc<dyn FileOps>) {
-    *FP_NODE.lock() = Some(node);
-}
-
-/// Unregister the `/dev/fp0` node (device detached).
-pub fn unregister_fp() {
-    *FP_NODE.lock() = None;
-}
-
 // ── /dev/fb0 ─────────────────────────────────────────────────────────
 
 /// Optional `FileOps` delegate for `/dev/fb0`. Installed by the FB
@@ -683,6 +661,15 @@ pub fn install_ccid_hooks(
     });
 }
 
+pub fn install_fp_hooks(lookup: providers::DeviceLookup, enumerate: providers::DeviceEnumeration) {
+    register_provider(DeviceProvider {
+        name: "fp",
+        lookup,
+        lookup_dir: |_| None,
+        enumerate,
+    });
+}
+
 pub fn install_video_hooks(
     lookup: providers::DeviceLookup,
     enumerate: providers::DeviceEnumeration,
@@ -720,7 +707,7 @@ pub fn register_dri_dir(dir: Arc<dyn DirOps>) {
 
 /// Delegate for `/dev/snd/*`, installed by the sound driver.
 ///
-/// Same hook/delegate pattern as `FP_NODE` (fingerprint) to avoid a
+/// Same hook/delegate pattern as the fingerprint provider to avoid a
 /// circular dependency between `narf-filesystem` and `narf-drivers-sound`.
 static SND_DIR: IrqSafeSpinLock<Option<Arc<dyn DirOps>>> = IrqSafeSpinLock::new(None);
 
@@ -730,61 +717,6 @@ static SND_DIR: IrqSafeSpinLock<Option<Arc<dyn DirOps>>> = IrqSafeSpinLock::new(
 /// first card is probed.  Idempotent.
 pub fn register_snd_dir(dir: Arc<dyn DirOps>) {
     *SND_DIR.lock() = Some(dir);
-}
-
-/// `/dev/fp0` — proxy to whatever `Arc<dyn FileOps>` the USB
-/// fingerprint driver installed.
-struct DevFp;
-
-impl FileOps for DevFp {
-    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        let node = FP_NODE.lock().clone();
-        Box::pin(async move {
-            match node {
-                Some(n) => n.read(offset, buf).await,
-                None => Err(FsError::Io(narf_block::BlockError::IOError)),
-            }
-        })
-    }
-
-    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        let node = FP_NODE.lock().clone();
-        Box::pin(async move {
-            match node {
-                Some(n) => n.write(offset, buf).await,
-                None => Err(FsError::Io(narf_block::BlockError::IOError)),
-            }
-        })
-    }
-
-    fn stat(&self) -> Stat {
-        FP_NODE
-            .lock()
-            .as_ref()
-            .map(|node| node.stat())
-            .unwrap_or(Stat {
-                size: 0,
-                blocks: 0,
-                mode: Mode {
-                    file_type: FileType::Special,
-                    perms: 0o660,
-                },
-                mtime_cycles: 0,
-            })
-    }
-    fn rdev(&self) -> u64 {
-        FP_NODE.lock().as_ref().map(|node| node.rdev()).unwrap_or(0)
-    }
-    fn ino(&self) -> u64 {
-        named_inode("fp0", 1)
-    }
-    fn owners(&self) -> (u32, u32) {
-        FP_NODE
-            .lock()
-            .as_ref()
-            .map(|node| node.owners())
-            .unwrap_or((0, 0))
-    }
 }
 
 /// `/dev/fb0` — proxy to the installed FB FileOps.
