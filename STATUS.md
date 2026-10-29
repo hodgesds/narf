@@ -1895,6 +1895,14 @@ pre-IB VM writebacks avoid treating whole-job completion as flush completion,
 while active job fences still prevent premature VMID reuse. Submitters use
 the pre-restart fence generation and reject stale owners after reset.
 
+RX 6000 MEMORY/VRAM_GTT queries now report GEM's shared system-memory budget
+instead of zero GTT capacity, and live opens use their registered client VRAM
+heap for usable sizes and allocation usage. VRAM_USAGE, VIS_VRAM_USAGE and
+GTT_USAGE expose the corresponding byte counts. Native ioctl regressions
+exercise RDNA2/RDNA4 visible and hidden heaps, GEM allocation/release, retained
+PRIME ownership and short replies. These are software checks; Mesa acceptance
+on the physical GPU remains pending.
+
 Ordinary VRAM-preferred creation now permits Linux's GTT fallback when VRAM
 is unavailable, preserving reported preferences and discardable-domain rules.
 Visible client VRAM now supports pressure eviction to GTT and promotion back

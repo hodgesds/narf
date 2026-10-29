@@ -637,8 +637,16 @@ A bound Navi 22's `AMDGPU_INFO` replies come from `amdgpu_info_navi22`
 range), HW_IP_INFO with IP-block versions (GFX/compute 10.0, SDMA 5.2,
 VCN/JPEG 3.0) plus discovery versions and Linux IB alignments, HW_IP_COUNT,
 FW_VERSION from the loaded file headers and `GetSmuVersion`, READ_MMR_REG for
-GB_ADDR_CONFIG (0x263e; other offsets EFAULT) and MEMORY/VRAM_GTT with the
-8 MiB VM reservation. `Snapshot::navi22: Published { topology, pci_revision,
+GB_ADDR_CONFIG (0x263e; other offsets EFAULT). MEMORY/VRAM_GTT use the open's
+registered client VRAM heap for usable sizes and live allocation usage; physical
+totals still come from probe. Snapshot-only replies and cards without a heap
+retain the 8 MiB VM reservation. Both paths report the actual GEM system-memory
+limit (half of RAM) as GTT capacity, with live shared GEM system-memory usage in
+MEMORY. VRAM_USAGE and VIS_VRAM_USAGE report the open's card heap usage (zero
+without a registered heap); GTT_USAGE reports that shared system-memory usage.
+These are byte counts, not per-open allocations; retained PRIME/mmap/job owners
+continue to count after handle closure. Replies retain Linux's short-copy rule.
+`Snapshot::navi22: Published { topology, pci_revision,
 boot }` carries the inputs, published by `amdgpu_info::publish_navi22_topology`
 (cold-boot `Stage::ReadTopology`, appended after `FenceInterrupts`),
 `publish_navi22_pci_revision` (platform prepare) and `publish_navi22_boot`

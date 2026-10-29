@@ -384,6 +384,14 @@ SMU memory-clock limits (boot MCLK while UCLK DPM is disabled). Missing board
 metadata stays unknown. Live register queries use Linux's allow-list and wait
 for the retained GPU owner with GC powered.
 
+RX 6000 MEMORY/VRAM_GTT replies now expose GEM's actual shared GTT budget
+and the open's registered client VRAM heap, including live visible/hidden
+VRAM usage. VRAM_USAGE, VIS_VRAM_USAGE and GTT_USAGE return byte counts from
+those owners; retained objects still count after their handles close. Snapshot
+fallbacks retain the 8 MiB VRAM reservation and now report nonzero GTT capacity.
+Native ioctl regressions cover RDNA2 and RDNA4 allocations, release, shared
+ownership and bounded copies. Mesa hardware validation remains outstanding.
+
 Native submissions use FIFO ring admission and IRQ-driven fence/VMID waits.
 VM programming has a separate completion writeback before the client IB;
 its completion cannot release a VMID whose job is still running. Reset

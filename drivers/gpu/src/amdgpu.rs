@@ -2808,6 +2808,10 @@ pub fn with_controller_mut<R>(f: impl FnOnce(&mut AmdGpu) -> R) -> Option<R> {
 }
 
 #[cfg(feature = "kernel-test")]
+#[path = "amdgpu_memory_info_tests.rs"]
+mod memory_info_tests;
+
+#[cfg(feature = "kernel-test")]
 mod navi22_ownership_tests {
     use super::*;
     use core::sync::atomic::Ordering;
