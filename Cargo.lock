@@ -2397,6 +2397,7 @@ dependencies = [
  "narf-crypto",
  "narf-ctap2",
  "narf-drivers",
+ "narf-drivers-fingerprint",
  "narf-drivers-sound",
  "narf-drivers-video",
  "narf-filesystem",
