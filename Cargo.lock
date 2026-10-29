@@ -2463,6 +2463,7 @@ dependencies = [
  "narf-capabilities",
  "narf-drivers",
  "narf-drivers-sound",
+ "narf-filesystem",
  "narf-graphics",
  "narf-init",
  "narf-input",

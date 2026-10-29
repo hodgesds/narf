@@ -3379,6 +3379,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "  csprng: seeded DEGRADED (RDRAND conditioned output; no seed-grade source)"
                         );
                     }
+                    // Unreachable at Subsys time today — virtio-rng probes
+                    // at Stage::Device, after this line — but the match
+                    // must stay exhaustive over SeedClass, and the arm
+                    // keeps the line truthful if ordering ever changes.
+                    Some(narf_filesystem::csprng::SeedClass::VirtioRng) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  csprng: seeded DEGRADED (host-provided entropy via virtio-rng; no architectural source)"
+                        );
+                    }
                     None => {
                         let _ = writeln!(
                             console::Writer,

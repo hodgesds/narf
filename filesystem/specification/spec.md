@@ -84,14 +84,19 @@ devices backed by `csprng`, a ChaCha20 pool that also serves `getrandom(2)`
 and the ELF `AT_RANDOM` aux vector. The pool's entropy contract (issue
 #1026) is part of this crate's public interface:
 
-- The pool seeds only from hardware entropy drawn through `narf-crypto`:
-  the key-material surface (`try_fill_key_material`, seed-grade RDSEED on
+- The pool seeds from a three-class ladder (issue #1074): the
+  key-material surface (`try_fill_key_material`, seed-grade RDSEED on
   x86_64 / RNDR-RNDRRS on aarch64, SP 800-90B health-tested) whenever a
   seed-grade source is present, else — x86_64 only — the protocol adapter
-  over RDRAND, recorded as the pool's **Conditioned** seed class. No other
-  source exists: there is no cycle-counter or timer fallback, and a
-  seed-grade refusal (starvation or health latch) is never routed around
-  via the weaker draw.
+  over RDRAND, recorded as the pool's **Conditioned** seed class, else —
+  when no architectural source exists at all — a registered virtio-rng
+  device draw (VirtIO 1.2 §5.4), recorded as the pool's **VirtioRng**
+  seed class. VirtioRng is host-provided entropy, not architectural
+  entropy: it is explicitly labelled wherever the class is observable
+  and is never permitted to seed key generation. No other source
+  exists: there is no cycle-counter or timer fallback, and a
+  present-but-refusing higher rung (starvation or health latch) is
+  never routed around via a weaker draw.
 - Reseeds (every 1 MiB of output) draw from the pool's own class only and
   never downgrade it; a failed reseed leaves the pool serving from its
   existing key, counted in `PoolState::reseed_failures`.
@@ -102,8 +107,8 @@ and the ELF `AT_RANDOM` aux vector. The pool's entropy contract (issue
   (net IP-ID hook) leaves its buffer unchanged on refusal; it is not a
   cryptographic interface.
 - The seed class is observable, never silent: `csprng::seed_class()`,
-  the boot console line, and the kernel log announce a Conditioned seed
-  or an unseeded pool; `RNDGETENTCNT` and
+  the boot console line, and the kernel log announce a Conditioned or
+  VirtioRng seed or an unseeded pool; `RNDGETENTCNT` and
   `/proc/sys/kernel/random/entropy_avail` report `entropy_avail_bits()`
   (4096 seeded, 0 unseeded) rather than constants.
 

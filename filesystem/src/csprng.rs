@@ -32,16 +32,18 @@
 //! warning log line as the only signal. The TSC gather is **deleted**;
 //! no path in this module can seed the pool from a timing counter.
 //!
-//! A seed is now drawn by a two-class ladder over `narf-crypto`:
+//! A seed is now drawn by a three-class ladder — two architectural
+//! rungs over `narf-crypto`, plus a host-provided rung for hardware
+//! with no architectural source at all (issue #1074):
 //!
 //! 1. **Seed-grade** — `narf_crypto::try_fill_key_material`: RDSEED on
 //!    x86_64, RNDR/RNDRRS on aarch64, every released byte covered by
 //!    the SP 800-90B health tests of issue #996, fail-closed. This is
 //!    the only class that can seed the pool when a seed-grade source
 //!    is present: if the key-material surface refuses (source starved
-//!    or health-latched off), the pool refuses too. The weaker adapter
-//!    is never consulted as a route around the health latch — on
-//!    aarch64 it draws the very same instructions.
+//!    or health-latched off), the pool refuses too. The weaker draws
+//!    are never consulted as a route around the health latch — on
+//!    aarch64 the conditioned draw uses the very same instructions.
 //! 2. **Conditioned** (x86_64 only) — when no seed-grade source exists
 //!    but RDRAND does, the pool seeds through the protocol adapter
 //!    `narf_crypto::try_fill_random_bytes`. RDRAND is a conditioned
@@ -52,8 +54,24 @@
 //!    hardware. The class is never silent: it is recorded in
 //!    [`seed_class`], announced on the kernel log when installed, and
 //!    printed by the boot console line.
+//! 3. **VirtioRng** — when no architectural source exists at all, but
+//!    a virtio-rng device has been probed and registered a seed draw
+//!    (see [`register_virtio_rng_source`]), the pool seeds from the
+//!    host-provided bytes. This is a degraded class with a different
+//!    trust story from either architectural rung: the host is in the
+//!    entropy path, so the class is explicitly labelled everywhere
+//!    the other classes are — [`seed_class`], the kernel log, the
+//!    boot console line — and it is never permitted to seed key
+//!    generation, which stays seed-grade-only. A present-but-refusing
+//!    higher rung is terminal, exactly as for seed-grade: the virtio
+//!    draw is never consulted to route around a starved or latched
+//!    architectural source. It exists only for hardware with no
+//!    architectural source, and only once the device has probed — a
+//!    fill attempted before probe still refuses, and the next fill
+//!    after probe seeds, because [`try_fill`] re-attempts seeding
+//!    while unseeded.
 //!
-//! When neither class is available the pool **stays unseeded** and
+//! When no class is available the pool **stays unseeded** and
 //! every cryptographic fill refuses (see "Blocking semantics"). A
 //! failed *reseed* is different: the pool keeps serving from its
 //! existing, properly seeded key — output never degrades — and the
@@ -377,6 +395,15 @@ pub enum SeedClass {
     /// time. A `SeedGrade` pool can never become `Conditioned`, and a
     /// `Conditioned` pool never claims to be `SeedGrade`.
     Conditioned,
+    /// No architectural source exists, so the pool seeded from a
+    /// registered virtio-rng device (VirtIO 1.2 §5.4, issue #1074).
+    /// The bytes are host-provided: the host is in the entropy path,
+    /// so the class is announced — kernel log at install, boot
+    /// console line, and this queryable state — every time, and it
+    /// is never permitted to seed key generation. A higher-class pool
+    /// never downgrades to `VirtioRng`, and a `VirtioRng` pool never
+    /// claims to be architectural.
+    VirtioRng,
 }
 
 /// The pool could not produce bytes: it is unseeded and no seed could
@@ -384,7 +411,8 @@ pub enum SeedClass {
 /// health tests latched it off). ABI consumers map this to `EAGAIN`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CsprngError {
-    /// No seed-grade or conditioned hardware entropy is available.
+    /// No seed-grade, conditioned, or registered virtio-rng entropy
+    /// is available.
     EntropyUnavailable,
 }
 
@@ -443,30 +471,38 @@ fn conditioned_present() -> bool {
 ///   health tests, and on x86_64 routing around a latched-off RDSEED
 ///   with RDRAND would defeat the latch. Only when no seed-grade
 ///   source exists at all may the conditioned draw seed the pool.
+///   Only when no architectural source exists at all may the
+///   registered virtio-rng draw seed the pool (issue #1074), as the
+///   labelled `VirtioRng` class — never as a route around a refusing
+///   higher rung.
 fn obtain_seed(
-    seed_grade_present: bool,
-    conditioned_present: bool,
+    draws: SeedDraws<'_>,
     current: Option<SeedClass>,
-    key_material: &mut dyn FnMut(&mut [u8; 32]) -> Result<(), narf_crypto::CryptoError>,
-    conditioned: &mut dyn FnMut(&mut [u8; 32]) -> Result<(), narf_crypto::CryptoError>,
 ) -> Result<([u8; 32], SeedClass), CsprngError> {
     let mut seed = [0u8; 32];
     let class = match current {
         Some(SeedClass::SeedGrade) => {
-            key_material(&mut seed).map_err(|_| CsprngError::EntropyUnavailable)?;
+            (draws.key_material)(&mut seed)?;
             SeedClass::SeedGrade
         }
         Some(SeedClass::Conditioned) => {
-            conditioned(&mut seed).map_err(|_| CsprngError::EntropyUnavailable)?;
+            (draws.conditioned)(&mut seed)?;
             SeedClass::Conditioned
         }
+        Some(SeedClass::VirtioRng) => {
+            (draws.virtio)(&mut seed)?;
+            SeedClass::VirtioRng
+        }
         None => {
-            if seed_grade_present {
-                key_material(&mut seed).map_err(|_| CsprngError::EntropyUnavailable)?;
+            if draws.seed_grade_present {
+                (draws.key_material)(&mut seed)?;
                 SeedClass::SeedGrade
-            } else if conditioned_present {
-                conditioned(&mut seed).map_err(|_| CsprngError::EntropyUnavailable)?;
+            } else if draws.conditioned_present {
+                (draws.conditioned)(&mut seed)?;
                 SeedClass::Conditioned
+            } else if draws.virtio_present {
+                (draws.virtio)(&mut seed)?;
+                SeedClass::VirtioRng
             } else {
                 return Err(CsprngError::EntropyUnavailable);
             }
@@ -485,6 +521,19 @@ fn wipe(seed: &mut [u8; 32]) {
         unsafe { core::ptr::write_volatile(byte, 0) };
     }
     core::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
+/// The draws a seed attempt may consult, bundled so the seed path
+/// stays under clippy's argument-count limit. Presence is separate
+/// from the draw itself: a present-but-refusing source is terminal,
+/// and an absent source's draw is never consulted.
+struct SeedDraws<'a> {
+    seed_grade_present: bool,
+    conditioned_present: bool,
+    virtio_present: bool,
+    key_material: &'a mut dyn FnMut(&mut [u8; 32]) -> Result<(), CsprngError>,
+    conditioned: &'a mut dyn FnMut(&mut [u8; 32]) -> Result<(), CsprngError>,
+    virtio: &'a mut dyn FnMut(&mut [u8; 32]) -> Result<(), CsprngError>,
 }
 
 // ── Pool state ───────────────────────────────────────────────────────────────
@@ -548,20 +597,8 @@ impl PoolState {
 /// NOT an error: the pool keeps its class and its key, the failure is
 /// counted, and `Ok(class)` reports that the pool remains serviceable.
 /// A failed draw against an unseeded pool is `Err`.
-fn seed_pool(
-    state: &mut PoolState,
-    seed_grade_present: bool,
-    conditioned_present: bool,
-    key_material: &mut dyn FnMut(&mut [u8; 32]) -> Result<(), narf_crypto::CryptoError>,
-    conditioned: &mut dyn FnMut(&mut [u8; 32]) -> Result<(), narf_crypto::CryptoError>,
-) -> Result<SeedClass, CsprngError> {
-    match obtain_seed(
-        seed_grade_present,
-        conditioned_present,
-        state.class,
-        key_material,
-        conditioned,
-    ) {
+fn seed_pool(state: &mut PoolState, draws: SeedDraws<'_>) -> Result<SeedClass, CsprngError> {
+    match obtain_seed(draws, state.class) {
         Ok((mut seed, class)) => {
             state.install(&seed, class);
             wipe(&mut seed);
@@ -581,23 +618,14 @@ fn seed_pool(
 /// needed. Mirrors the global [`try_fill`] discipline exactly.
 fn fill_pool(
     state: &mut PoolState,
-    seed_grade_present: bool,
-    conditioned_present: bool,
-    key_material: &mut dyn FnMut(&mut [u8; 32]) -> Result<(), narf_crypto::CryptoError>,
-    conditioned: &mut dyn FnMut(&mut [u8; 32]) -> Result<(), narf_crypto::CryptoError>,
+    draws: SeedDraws<'_>,
     buf: &mut [u8],
 ) -> Result<(), CsprngError> {
     if buf.is_empty() {
         return Ok(());
     }
     if state.class.is_none() || state.reseed_due() {
-        seed_pool(
-            state,
-            seed_grade_present,
-            conditioned_present,
-            key_material,
-            conditioned,
-        )?;
+        seed_pool(state, draws)?;
     }
     state.inner.fill(buf);
     Ok(())
@@ -613,7 +641,7 @@ static POOL: IrqSafeSpinLock<PoolState> = IrqSafeSpinLock::new(PoolState::uninit
 pub static CSPRNG_SEEDED: AtomicBool = AtomicBool::new(false);
 
 /// Encoding of the pool's [`SeedClass`] for lock-free readers:
-/// 0 = unseeded, 1 = seed-grade, 2 = conditioned.
+/// 0 = unseeded, 1 = seed-grade, 2 = conditioned, 3 = virtio-rng.
 static SEED_CLASS_CODE: AtomicU8 = AtomicU8::new(0);
 
 /// One-shot guard for the unseeded-refusal kernel-log line: the
@@ -638,6 +666,10 @@ pub enum EntropySource {
     Rndrrs,
     /// aarch64 FEAT_RNG RNDR instruction.
     Rndr,
+    /// Host-provided entropy via a registered virtio-rng device
+    /// (VirtIO 1.2 §5.4). Not an architectural instruction: the
+    /// host is in the entropy path.
+    VirtioRng,
 }
 
 /// Atomic encoding of the last entropy source used (255 = none yet).
@@ -657,6 +689,7 @@ fn source_of(class: SeedClass) -> EntropySource {
             }
         }
         SeedClass::Conditioned => EntropySource::Rdrand,
+        SeedClass::VirtioRng => EntropySource::VirtioRng,
     }
 }
 
@@ -666,6 +699,7 @@ fn record_source(src: EntropySource) {
         EntropySource::Rdrand => 1,
         EntropySource::Rndrrs => 2,
         EntropySource::Rndr => 3,
+        EntropySource::VirtioRng => 4,
     };
     LAST_SOURCE.store(val, Ordering::Release);
 }
@@ -678,6 +712,7 @@ pub fn last_entropy_source() -> Option<EntropySource> {
         1 => Some(EntropySource::Rdrand),
         2 => Some(EntropySource::Rndrrs),
         3 => Some(EntropySource::Rndr),
+        4 => Some(EntropySource::VirtioRng),
         _ => None,
     }
 }
@@ -696,6 +731,7 @@ pub fn seed_class() -> Option<SeedClass> {
     match SEED_CLASS_CODE.load(Ordering::Acquire) {
         1 => Some(SeedClass::SeedGrade),
         2 => Some(SeedClass::Conditioned),
+        3 => Some(SeedClass::VirtioRng),
         _ => None,
     }
 }
@@ -732,12 +768,13 @@ fn log_reseed_failure_once() {
 }
 
 /// Publish a successfully installed seed class to the lock-free
-/// observers, announcing a first-time conditioned (degraded) seed on
-/// the kernel log.
+/// observers, announcing a first-time degraded seed on the kernel
+/// log (conditioned or virtio-rng).
 fn publish_class(class: SeedClass) {
     let code = match class {
         SeedClass::SeedGrade => 1,
         SeedClass::Conditioned => 2,
+        SeedClass::VirtioRng => 3,
     };
     let previous = SEED_CLASS_CODE.swap(code, Ordering::AcqRel);
     CSPRNG_SEEDED.store(true, Ordering::Release);
@@ -748,6 +785,48 @@ fn publish_class(class: SeedClass) {
              RDRAND conditioned output (DEGRADED class, #1026)",
         );
     }
+    if class == SeedClass::VirtioRng && previous == 0 {
+        narf_console::klog::record(
+            "csprng: WARNING - no architectural entropy source; pool seeded \
+             from host-provided virtio-rng entropy (DEGRADED class, #1074)",
+        );
+    }
+}
+
+// ── Virtio-rng seed draw registration ────────────────────────────────────────
+
+/// A seed draw supplied by a probed virtio-rng device: fills a full
+/// 32-byte seed or fails. The driver registers exactly one draw (its
+/// controller is a singleton); the fill runs with no pool lock held,
+/// so the device conversation cannot deadlock against the pool.
+pub type VirtioRngFill = fn(&mut [u8; 32]) -> Result<(), CsprngError>;
+
+/// The registered virtio-rng draw, if any device has probed.
+static VIRTIO_SOURCE: IrqSafeSpinLock<Option<VirtioRngFill>> = IrqSafeSpinLock::new(None);
+
+/// Register a virtio-rng seed draw. First-wins: a second device (the
+/// driver probes at most one controller) must not silently replace
+/// the source the pool may already have seeded from.
+pub fn register_virtio_rng_source(fill: VirtioRngFill) {
+    let mut slot = VIRTIO_SOURCE.lock();
+    if slot.is_none() {
+        *slot = Some(fill);
+    }
+}
+
+/// Whether a virtio-rng device has registered a seed draw. Presence
+/// is what the ladder consults — the draw itself runs only when the
+/// ladder reaches the virtio rung.
+pub fn virtio_rng_source_present() -> bool {
+    VIRTIO_SOURCE.lock().is_some()
+}
+
+/// Test-only setter for the registered virtio-rng draw, mirroring
+/// [`__test_unseed`]: kernel-test smokes install a fake draw and
+/// clear it at the end of the test. Production code never calls this.
+#[doc(hidden)]
+pub fn __test_set_virtio_rng_source(source: Option<VirtioRngFill>) {
+    *VIRTIO_SOURCE.lock() = source;
 }
 
 /// One seed attempt against the global pool, drawing through
@@ -757,15 +836,28 @@ fn publish_class(class: SeedClass) {
 /// is unseeded and unseedable.
 fn global_seed_attempt() -> Result<SeedClass, CsprngError> {
     let current = POOL.lock().class;
-    let mut key_material = |buf: &mut [u8; 32]| narf_crypto::try_fill_key_material(buf);
-    let mut conditioned = |buf: &mut [u8; 32]| narf_crypto::try_fill_random_bytes(buf);
-    match obtain_seed(
-        seed_grade_present(),
-        conditioned_present(),
-        current,
-        &mut key_material,
-        &mut conditioned,
-    ) {
+    let mut key_material = |buf: &mut [u8; 32]| {
+        narf_crypto::try_fill_key_material(buf).map_err(|_| CsprngError::EntropyUnavailable)
+    };
+    let mut conditioned = |buf: &mut [u8; 32]| {
+        narf_crypto::try_fill_random_bytes(buf).map_err(|_| CsprngError::EntropyUnavailable)
+    };
+    // The registered draw is read out of its lock before the draw
+    // runs, so no lock is held across the device conversation.
+    let registered = *VIRTIO_SOURCE.lock();
+    let mut virtio = |buf: &mut [u8; 32]| match registered {
+        Some(fill) => fill(buf),
+        None => Err(CsprngError::EntropyUnavailable),
+    };
+    let draws = SeedDraws {
+        seed_grade_present: seed_grade_present(),
+        conditioned_present: conditioned_present(),
+        virtio_present: virtio_rng_source_present(),
+        key_material: &mut key_material,
+        conditioned: &mut conditioned,
+        virtio: &mut virtio,
+    };
+    match obtain_seed(draws, current) {
         Ok((mut seed, class)) => {
             POOL.lock().install(&seed, class);
             wipe(&mut seed);
