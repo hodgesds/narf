@@ -713,7 +713,7 @@ rows and the tree facts that keep each open:
   fixes member count 2 and 4095 air bytes. Linux `xmit.c::ath_tx_form_aggr`
   builds up to the BAW/`ATH_AMPDU_LIMIT_MAX`/4 ms limit. It needs N-slot TX
   storage, an N-member chain/retry/bitmap owner and an `N85T` v2 member count.
-- `tx_amsdu`: Linux ath9k never sets `IEEE80211_HW_TX_AMSDU`
+- `tx_amsdu` (inapplicable, row removed 2026-10-28): Linux ath9k never sets `IEEE80211_HW_TX_AMSDU`
   (`init.c::ath9k_set_hw_capab`), so mac80211 forms no TX A-MSDU for this
   driver and there is no Linux reference path. Natively the TX maps are
   `descriptor::MAX_MPDU + 2` (2306) bytes and `descriptor::transmit_ht`

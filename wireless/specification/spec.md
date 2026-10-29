@@ -159,7 +159,8 @@ opt-in (see the HE, EHT, UHR, SAE and EPD paragraphs below). GLK (125) and
 unknown mandatory values fail closed: Linux mac80211 also never adds GLK
 ("We do not support EPD or GLK", mlme.c), and the IEEE802.11-2020 General
 Link (802.11ak) bridged-link operation has no open reference implementation
-in this tree; the remaining row records that blocker. Optional unflagged values grant no
+in this tree, so GLK admission is inapplicable and its ledger row was
+removed (2026-10-28). Optional unflagged values grant no
 membership. Present malformed or orphan PHY elements fail instead of becoming
 legacy fallback. Missing optional PHY can retain legacy operation. Generated
 local capability IEs are protocol-owned; caller HT/VHT capabilities and, on

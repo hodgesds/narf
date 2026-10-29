@@ -130,6 +130,7 @@ mod station;
 mod station_composition_tests;
 pub(super) mod station_control;
 mod station_lifecycle;
+mod track;
 mod tssi;
 pub mod tx_transport;
 pub mod txrx;

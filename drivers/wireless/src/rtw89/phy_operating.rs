@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 //! RTL8852B static awake receive/carrier-sense initialization after BB tables.
-//! Source phy_dm_init's PHYSTS/DIG/CFO/EDCCA; no periodic adaptive workers.
+//! Source phy_dm_init's PHYSTS/DIG/CFO/EDCCA; periodic DIG/EDCCA track work is
+//! `track.rs`; CFO/antenna tracking stay open.
 use super::{
     factory::Identity,
     mac::ChipId,

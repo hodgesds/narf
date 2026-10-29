@@ -86,6 +86,23 @@ pub(super) unsafe trait Io: Send {
     ) -> Result<u64, packet::Error> {
         Err(packet::Error::State)
     }
+    /// Track-work register read (`track::REGISTERS` only). `Unsupported`
+    /// disables tracking, as `disabled_dm_bitmap` does.
+    fn station_track_read(&mut self, _: u32) -> Result<u32, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// Track-work register write (`track::REGISTERS` only).
+    fn station_track_write(&mut self, _: u32, _: u32) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// Prepared operating-PHY facts (`track::Profile`).
+    fn station_track_profile(&mut self) -> Result<super::track::Profile, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// CFO crystal-capacitor write through XTAL SI; returns the SC_XI readback.
+    async fn station_track_crystal(&mut self, _: u8) -> Result<u8, power::Error> {
+        Err(power::Error::Unsupported)
+    }
     /// Signed HE20 program (`Program::He`).
     fn station_he_allowed(&mut self) -> Result<bool, power::Error> {
         Ok(false)
@@ -403,6 +420,9 @@ pub(super) struct State {
     deadline: u64,
     last_peer: u64,
     last_now: u64,
+    /// `rtw89_track_work` RSSI statistics and dynamic EDCCA.
+    track: super::track::Tracker,
+    scanning: bool,
 }
 impl core::fmt::Debug for State {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -455,6 +475,8 @@ impl State {
             deadline: 0,
             last_peer: 0,
             last_now: 0,
+            track: super::track::Tracker::default(),
+            scanning: false,
         }
     }
     pub(super) fn admission(&self) -> Admission {
@@ -586,6 +608,42 @@ impl State {
         }
         self.last_now = now;
         Ok(now)
+    }
+    /// `total_sta_assoc > 0`: the associated AP, as `rtw89_track_work` sees it.
+    /// mac80211 adds the station at association (`total_sta_assoc`), so the
+    /// four-way handshake already counts as linked.
+    fn linked(&self) -> Option<[u8; 6]> {
+        matches!(self.phase, Phase::FourWay | Phase::Open)
+            .then(|| self.peer.as_ref().map(|peer| peer.bss.bssid))
+            .flatten()
+    }
+    /// `rtw89_track_work` (and the enhanced CFO timer) when due (`track.rs`).
+    async fn track(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        struct Hw<'a, I>(&'a mut I);
+        impl<I: Io> super::track::Hw for Hw<'_, I> {
+            fn read(&mut self, address: u32) -> Result<u32, power::Error> {
+                self.0.station_track_read(address)
+            }
+            fn write(&mut self, address: u32, value: u32) -> Result<(), power::Error> {
+                self.0.station_track_write(address, value)
+            }
+            fn profile(&mut self) -> Result<super::track::Profile, power::Error> {
+                self.0.station_track_profile()
+            }
+            async fn crystal(&mut self, cap: u8) -> Result<u8, power::Error> {
+                self.0.station_track_crystal(cap).await
+            }
+        }
+        let now = self.now()?;
+        let (peer, scanning) = (self.linked(), self.scanning);
+        match self.track.run(&mut Hw(io), now, peer, scanning).await {
+            Ok(()) => Ok(()),
+            Err(power::Error::Unsupported) => {
+                self.track.disable();
+                Ok(())
+            }
+            Err(error) => Err(Error::Native(error)),
+        }
     }
     pub(super) fn candidates(&self) -> Vec<ObservedBss> {
         let now = self.environment.now_ms();
@@ -982,11 +1040,17 @@ impl State {
     }
     /// Work that needs awaited firmware receipts (EDCA, BA CAM).
     pub(super) fn async_pending(&self) -> bool {
-        self.edca_pending() || self.phase == Phase::Open && !self.ba_ops.is_empty()
+        self.edca_pending()
+            || self.phase == Phase::Open && !self.ba_ops.is_empty()
+            || !matches!(self.phase, Phase::Prepared | Phase::Failed | Phase::Stopped)
+                && self.track.due(self.environment.now_ms())
     }
     pub(super) async fn apply_async(&mut self, io: &mut impl Io) -> Result<(), Error> {
         if self.edca_pending() {
             self.apply_edca(io).await?;
+        }
+        if !matches!(self.phase, Phase::Prepared | Phase::Failed | Phase::Stopped) {
+            self.track(io).await?;
         }
         while let Some(op) = self.ba_ops.pop_front() {
             if self.phase != Phase::Open {
@@ -1148,6 +1212,12 @@ impl State {
         let mut idle = false;
         for _ in 0..32 {
             let step = io.packet_poll()?;
+            if let Some(rssi) = step.rssi {
+                self.track.sample(self.linked(), rssi);
+            }
+            if let Some(cfo) = step.cfo {
+                self.track.sample_cfo(self.linked(), cfo);
+            }
             if let Some(receipt) = step.receipt {
                 self.delivery(receipt)?;
             }
@@ -1475,7 +1545,9 @@ impl State {
             admission.run(|| Ok(io.packet_scan_address(Some(address))))??;
             self.scan = Some(address);
         }
+        self.scanning = true;
         let result = self.scan_dwell(io, until, probe, random_sn).await;
+        self.scanning = false;
         // A failed dwell is terminal: the interface stops the station.
         if address.is_some() && result.is_ok() {
             // rtw89_core_scan_complete: restore the own address once the last
@@ -1761,6 +1833,10 @@ impl State {
             })
         {
             self.fail(io);
+        }
+        // __rtw89_traffic_stats_accu: unicast data only (Ethernet bytes here).
+        if result.is_ok() && frame.first().is_some_and(|byte| byte & 1 == 0) {
+            self.track.transmitted(frame.len());
         }
         result
     }

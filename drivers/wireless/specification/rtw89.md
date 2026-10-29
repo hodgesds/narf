@@ -711,9 +711,71 @@ or XO/XI writes and cancellation at an actual analog request.
 
 B has no source `rfe_gpio` or AX BB-wrap callback, and the admitted two-path
 profile does not enable antenna diversity. Unsupported-IGI gain-table writes
-are skipped by the actual B source branch. Monitor/NHM diagnostics and periodic
-DIG/CFO/EDCCA/antenna tracking are separate from this static working owner; they
+are skipped by the actual B source branch. Monitor diagnostics and periodic
+antenna tracking (RTL8851B only) are separate from this static working owner; they
 are not reported as completed by its successful state.
+
+**Periodic track work** (`track.rs`) follows `rtw89_track_work` in Linux
+order: traffic statistics, environment monitor, DIG, CFO, EDCCA. It runs in
+the station's async worker pass (`apply_async`) so XTAL SI writes can await.
+Its first period performs the
+`rtw89_core_start` half: PPDU status reports (`rtw89_mac_cfg_ppdu_status_ax`:
+`R_AX_PPDU_STAT` RPT_EN/MAC_INFO/PLCP/CRC32, `R_AX_HW_RPT_FWD` to host) and
+`rtw89_phy_env_monitor_init` (CCX enable/trigger option, EDCCA BW20 option,
+IFS-CLM collect and T1–T4 thresholds 64/256/1024/4096 µs at the 32 µs unit).
+Each period then runs `__rtw89_phy_env_monitor_track` for the background
+IFS-CLM only (collect CCK/OFDM false alarms when `R_IFSCNT` reports done,
+convert with `rtw89_phy_ccx_get_report` to per-mille, program the 1900 ms
+period/unit once, pulse clear and measurement trigger) and `__rtw89_phy_dig`
+for 2.4 GHz/20 MHz: B has `support_igi = false`, so no gain-code writes;
+link transitions reseed `igi_fa_rssi` and switch `fa_th_2g`/`fa_th_nolink`;
+the false-alarm noise level adjusts `fa_rssi_ofst`
+(`rtw89_phy_dig_igi_offset_by_env`), `rtw89_phy_cal_igi_fa_rssi` clamps to
+the dynamic IGI window, and `rtw89_phy_dig_dyn_pd_th` writes the OFDM PD
+lower bound with spatial reuse, the CCK PD limit/lower bound when
+`support_cckpd` (cut > A), and the four SDAGC-follow-PAGC enables. The native
+owner admits track reads/writes only for `track::REGISTERS`, under current
+ordinary authority and the prepared operating PHY. Debug-only
+`rtw89_phy_dig_diag`, NHM and the EDCCA-CLM utility are not ported; MCC,
+paused/bypassed DIG and fixed-PD debug overrides do not exist natively.
+
+CFO tracking follows `rtw89_phy_cfo_track`/`rtw89_phy_cfo_dm` for the single
+linked station (`rtw89_phy_average_cfo_calc`). PPDU status IE01 of an
+OFDM-or-faster PPDU addressed to the station yields `FD_CFO` (`cfo_src_fd`,
+S(12,2), `rtw89_core_parse_phy_status_ie01`), accumulated per period. The
+operating owner already wrote and verified the default capacitor and B's
+DCFO/hardware-CFO setup (`rtw89_dcfo_comp_init`, `cfo_hw_comp`), so
+`rtw89_phy_cfo_init` only seeds state from it (`x_cap_lb`/`x_cap_ub` = ±64).
+Each decision applies the enable/stop hysteresis and ±3/±1 steps, writes the
+capacitor through XTAL SI SC_XO then SC_XI with readback (B has no
+`xtal_info`), applies the divergence lock (15 periods) at the bounds, steps
+back toward the default while unlinked, and programs `R_DCFO_COMP_S0` from the
+shifted average with `CFO_SW_COMP_FINE_TUNE` after a capacitor change. TX
+throughput (`rtw89_traffic_stats_calc`: unicast data bytes >> 18 per 2 s,
+`DECLARE_EWMA(tp, 10, 2)`) drives NORMAL ⇄ ENHANCE at 100/50 Mbps; ENHANCE runs
+the decision on the 250 ms `cfo_track_work` timer instead. Native counts the
+Ethernet bytes of accepted unicast frames (Linux counts the 802.11 skb). No
+UL-OFDMA trigger-frame statistic exists natively, so HOLD is never entered. The RX
+assembler parses `RTW89_CORE_RX_TYPE_PPDU_STAT` exactly as
+`rtw89_core_rx_process_ppdu_sts` accepts it (MAC-info users ≤ `ppdu_max_usr`
+4, PHY-status VALID, header length equal to the report, IE map ≥
+`RTW89_CCK_PKT`, the AX `physt_ie_len` walk, A1 match) and yields
+`RSSI_AVG` for the RXD dword5 MACID. The packet owner forwards only its own
+MACID; the station keeps `DECLARE_EWMA(rssi, 10, 16)`, counted only from
+association (four-way or open) and restarted for a new peer
+(`ewma_rssi_init`). Every 2 s (`RTW89_TRACK_WORK_PERIOD`), and never while
+scanning, the station computes `rtw89_phy_edcca_get_thre_by_rssi` (unlinked
+`EDCCA_MAX` 249; linked `rssi/2 − 110 + 128 − 3`, floored at 66) and, when it
+differs from the last written level (`th_old`), writes `R_SEG0R_EDCCA_LVL_V1`
+bytes 0, 1 and 3 with readback. An owner without the track hooks reports
+`Unsupported`, which disables tracking (`disabled_dm_bitmap`). Debug-only
+`rtw89_phy_edcca_log`/`_diag` and the scan-time `rtw89_phy_config_edcca`
+backup are not used: track work skips scans and native scans do not change
+the level. Smokes: `smoke_rtw89_track_*` (including a register-file model
+of the full first and linked periods and the CFO crystal/DCFO decisions),
+`smoke_rtw89_rx_ppdu_status_ie01_cfo_matches_linux`,
+`smoke_rtw89_rx_ppdu_status_yields_rssi_only_when_linux_accepts`. QEMU-only
+software evidence; no silicon run.
 
 `firmware_phycap::Receipt` records actual firmware GET_FEATURE PHY capabilities,
 separately from EFUSE PHY calibration bytes. RTL8852B follows the AX source
@@ -1603,3 +1665,18 @@ Refined feature rows: `wow` is declared by at least 8852B and 8852C
 (`wowlan_stub` under `CONFIG_PM`). `tspec` has no rtw89 driver hook
 (`mac80211.c` has no TSPEC path); WMM admission control is mac80211-owned
 host MLME work on top of `wmm_all_access_categories`.
+
+Resolved 2026-10-28 against Linux v7.2 (rows removed or narrowed):
+`tspec` is inapplicable — rtw89 never sets
+`NL80211_FEATURE_SUPPORTS_WMM_ADMISSION`, so `nl80211_add_tx_ts` refuses
+ADD_TX_TS and mac80211 never originates ADDTS. Station U-APSD is
+inapplicable — `rtw89_ops_add_interface` sets only `BEACON_FILTER` and
+`SUPPORTS_CQM_RSSI` (no `IEEE80211_VIF_SUPPORTS_UAPSD`); `uapsd` now tracks
+only AP-side U-APSD (`WIPHY_FLAG_AP_UAPSD`). `nhm_diagnostics` is removed:
+NHM needs `chip->support_noise`, true only on RTL8852A (folded into the
+`rtl8852a` chip row); upstream runs no FAHM ("only ifs_clm for now"); the
+background IFS-CLM runs in `track.rs`; EDCCA-CLM results feed only debug
+diagnostics. `antenna_diversity_tracking` is removed:
+`rtw89_mac_setup_phycap` sets `hal->ant_diversity` only for one-path chips
+with `rfe_type % 3 == 2`, i.e. RTL8851B (folded into the `rtl8851b` chip
+row).
