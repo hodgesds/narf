@@ -94,8 +94,6 @@ pub struct Native {
     ordinary: Option<OrdinaryGrant>,
     full_qualification: Option<alloc::sync::Arc<super::radio_policy::Qualification>>,
     operating: Option<super::phy_operating::Operating>,
-    /// `rtw89_mac_cfg_ppdu_status` has enabled PPDU status reports.
-    ppdu_status: bool,
     irq: Option<super::irq::Binding>,
     /// RTL8852B HCI DMA-stop proof earned by the terminal closure.
     dma_idle: Option<super::dma_stop::Idle>,
@@ -272,7 +270,6 @@ impl Native {
             ordinary: None,
             full_qualification: None,
             operating: Some(super::phy_operating::Operating::default()),
-            ppdu_status: false,
             irq: None,
         })
     }

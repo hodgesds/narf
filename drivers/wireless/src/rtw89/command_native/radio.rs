@@ -151,15 +151,39 @@ impl Native {
             .allows(radio_policy::Program::He)
             .map_err(denied)
     }
-    /// Dynamic EDCCA level for the live station (`track.rs`), on the prepared
-    /// operating PHY and current ordinary authority only.
-    pub(in crate::rtw89) fn station_edcca(&mut self, threshold: u8) -> Result<(), power::Error> {
+    /// Track-work register access for the live station (`track.rs`): only
+    /// the listed CCX/DIG/EDCCA/PPDU-status registers, on the prepared
+    /// operating PHY and current ordinary authority.
+    fn track_port(&mut self, address: u32) -> Result<Port<'_>, power::Error> {
+        if !crate::rtw89::track::REGISTERS.contains(&address) {
+            return Err(power::Error::Access);
+        }
         self.operating_current()?;
-        let ppdu_status = !self.ppdu_status;
-        let mut port = self.radio_io()?;
-        crate::rtw89::phy_operating::edcca(&mut port, threshold, ppdu_status)?;
-        self.ppdu_status = true;
-        Ok(())
+        self.radio_io()
+    }
+    pub(in crate::rtw89) fn station_track_read(
+        &mut self,
+        address: u32,
+    ) -> Result<u32, power::Error> {
+        use power::Io as _;
+        self.track_port(address)?.read32(address)
+    }
+    pub(in crate::rtw89) fn station_track_write(
+        &mut self,
+        address: u32,
+        value: u32,
+    ) -> Result<(), power::Error> {
+        use power::Io as _;
+        self.track_port(address)?.write32(address, value)
+    }
+    pub(in crate::rtw89) fn station_track_cck_pd(&self) -> Result<bool, power::Error> {
+        self.operating_current()?;
+        Ok(self
+            .operating
+            .as_ref()
+            .and_then(|owner| owner.working())
+            .ok_or(power::Error::Unsupported)?
+            .cck_pd)
     }
     pub(in crate::rtw89) fn station_ampdu_allowed(&self) -> Result<bool, power::Error> {
         self.full_radio_scope()

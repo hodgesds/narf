@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 //! RTL8852B static awake receive/carrier-sense initialization after BB tables.
-//! Source phy_dm_init's PHYSTS/DIG/CFO/EDCCA; [`edcca`] is the periodic
-//! EDCCA track-work write (`track.rs`); DIG/CFO/antenna tracking stay open.
+//! Source phy_dm_init's PHYSTS/DIG/CFO/EDCCA; periodic DIG/EDCCA track work is
+//! `track.rs`; CFO/antenna tracking stay open.
 use super::{
     factory::Identity,
     mac::ChipId,
@@ -190,59 +190,6 @@ impl Operating {
         self.state = State::Prepared;
         Ok(())
     }
-}
-/// Live `rtw89_track_work` register half on the prepared RTL8852B PHY0 owner.
-/// `ppdu_status` first runs `rtw89_mac_cfg_ppdu_status_ax(.., true)` so PPDU
-/// status reports reach the host RX queue; then `rtw89_phy_edcca_thre_calc`
-/// programs the EDCCA, P20 and PPDU levels. Every field is read back.
-pub(super) fn edcca(
-    io: &mut impl power::Io,
-    threshold: u8,
-    ppdu_status: bool,
-) -> Result<(), power::Error> {
-    fn modify(
-        io: &mut impl power::Io,
-        address: u32,
-        mask: u32,
-        value: u32,
-    ) -> Result<(), power::Error> {
-        let shift = mask.trailing_zeros();
-        let old = io.read32(address)?;
-        if old == u32::MAX {
-            return Err(power::Error::Gone);
-        }
-        io.write32(address, (old & !mask) | ((value << shift) & mask))?;
-        if (io.read32(address)? & mask) >> shift != value & (mask >> shift) {
-            return Err(power::Error::Terminal);
-        }
-        Ok(())
-    }
-    if ppdu_status {
-        modify(
-            io,
-            R_AX_PPDU_STAT,
-            u32::MAX,
-            B_AX_PPDU_STAT_RPT_EN
-                | B_AX_APP_MAC_INFO_RPT
-                | B_AX_APP_PLCP_HDR_RPT
-                | B_AX_PPDU_STAT_RPT_CRC32,
-        )?;
-        modify(
-            io,
-            R_AX_HW_RPT_FWD,
-            B_AX_FWD_PPDU_STAT_MASK,
-            RTW89_PRPT_DEST_HOST,
-        )?;
-    }
-    for mask in [B_EDCCA_LVL_MSK0, B_EDCCA_LVL_MSK1, B_EDCCA_LVL_MSK3] {
-        modify(
-            io,
-            0x10000 + R_SEG0R_EDCCA_LVL_V1,
-            mask,
-            u32::from(threshold),
-        )?;
-    }
-    Ok(())
 }
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "phy_operating/tests.rs"]

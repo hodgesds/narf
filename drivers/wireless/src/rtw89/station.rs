@@ -86,10 +86,17 @@ pub(super) unsafe trait Io: Send {
     ) -> Result<u64, packet::Error> {
         Err(packet::Error::State)
     }
-    /// `rtw89_phy_edcca_thre_calc` hardware write: program the EDCCA, P20 and
-    /// PPDU levels. The first call also enables PPDU status reports
-    /// (`rtw89_mac_cfg_ppdu_status`). `Unsupported` disables tracking.
-    fn station_edcca(&mut self, _: u8) -> Result<(), power::Error> {
+    /// Track-work register read (`track::REGISTERS` only). `Unsupported`
+    /// disables tracking, as `disabled_dm_bitmap` does.
+    fn station_track_read(&mut self, _: u32) -> Result<u32, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// Track-work register write (`track::REGISTERS` only).
+    fn station_track_write(&mut self, _: u32, _: u32) -> Result<(), power::Error> {
+        Err(power::Error::Unsupported)
+    }
+    /// `hal.support_cckpd` of the prepared operating PHY.
+    fn station_track_cck_pd(&mut self) -> Result<bool, power::Error> {
         Err(power::Error::Unsupported)
     }
     /// Signed HE20 program (`Program::He`).
@@ -606,18 +613,29 @@ impl State {
             .then(|| self.peer.as_ref().map(|peer| peer.bss.bssid))
             .flatten()
     }
-    /// `rtw89_phy_edcca_track` once per `RTW89_TRACK_WORK_PERIOD`. An owner
-    /// without the PHY hook disables tracking, as `disabled_dm_bitmap` does.
+    /// `rtw89_track_work` once per `RTW89_TRACK_WORK_PERIOD` (`track.rs`).
     fn track(&mut self, io: &mut impl Io, now: u64) -> Result<(), Error> {
-        let Some(threshold) = self.track.due(now, self.linked(), self.scanning) else {
-            return Ok(());
-        };
-        match io.station_edcca(threshold) {
-            Ok(()) => self.track.written(threshold),
-            Err(power::Error::Unsupported) => self.track.disable(),
-            Err(error) => return Err(Error::Native(error)),
+        struct Hw<'a, I>(&'a mut I);
+        impl<I: Io> super::track::Hw for Hw<'_, I> {
+            fn read(&mut self, address: u32) -> Result<u32, power::Error> {
+                self.0.station_track_read(address)
+            }
+            fn write(&mut self, address: u32, value: u32) -> Result<(), power::Error> {
+                self.0.station_track_write(address, value)
+            }
+            fn cck_pd(&mut self) -> Result<bool, power::Error> {
+                self.0.station_track_cck_pd()
+            }
         }
-        Ok(())
+        let (peer, scanning) = (self.linked(), self.scanning);
+        match self.track.run(&mut Hw(io), now, peer, scanning) {
+            Ok(()) => Ok(()),
+            Err(power::Error::Unsupported) => {
+                self.track.disable();
+                Ok(())
+            }
+            Err(error) => Err(Error::Native(error)),
+        }
     }
     pub(super) fn candidates(&self) -> Vec<ObservedBss> {
         let now = self.environment.now_ms();

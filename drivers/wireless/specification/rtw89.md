@@ -712,13 +712,30 @@ or XO/XI writes and cancellation at an actual analog request.
 B has no source `rfe_gpio` or AX BB-wrap callback, and the admitted two-path
 profile does not enable antenna diversity. Unsupported-IGI gain-table writes
 are skipped by the actual B source branch. Monitor/NHM diagnostics and periodic
-DIG/CFO/antenna tracking are separate from this static working owner; they
+CFO/antenna tracking are separate from this static working owner; they
 are not reported as completed by its successful state.
 
-**Periodic EDCCA tracking** (`track.rs`, `phy_operating::edcca`) follows
-`rtw89_track_work` → `rtw89_phy_edcca_track`. PPDU status reports
-(`rtw89_mac_cfg_ppdu_status_ax`: `R_AX_PPDU_STAT` RPT_EN/MAC_INFO/PLCP/CRC32,
-`R_AX_HW_RPT_FWD` to host) are enabled by the first track write. The RX
+**Periodic track work** (`track.rs`) follows `rtw89_track_work` in Linux
+order: environment monitor, DIG, EDCCA. Its first period performs the
+`rtw89_core_start` half: PPDU status reports (`rtw89_mac_cfg_ppdu_status_ax`:
+`R_AX_PPDU_STAT` RPT_EN/MAC_INFO/PLCP/CRC32, `R_AX_HW_RPT_FWD` to host) and
+`rtw89_phy_env_monitor_init` (CCX enable/trigger option, EDCCA BW20 option,
+IFS-CLM collect and T1–T4 thresholds 64/256/1024/4096 µs at the 32 µs unit).
+Each period then runs `__rtw89_phy_env_monitor_track` for the background
+IFS-CLM only (collect CCK/OFDM false alarms when `R_IFSCNT` reports done,
+convert with `rtw89_phy_ccx_get_report` to per-mille, program the 1900 ms
+period/unit once, pulse clear and measurement trigger) and `__rtw89_phy_dig`
+for 2.4 GHz/20 MHz: B has `support_igi = false`, so no gain-code writes;
+link transitions reseed `igi_fa_rssi` and switch `fa_th_2g`/`fa_th_nolink`;
+the false-alarm noise level adjusts `fa_rssi_ofst`
+(`rtw89_phy_dig_igi_offset_by_env`), `rtw89_phy_cal_igi_fa_rssi` clamps to
+the dynamic IGI window, and `rtw89_phy_dig_dyn_pd_th` writes the OFDM PD
+lower bound with spatial reuse, the CCK PD limit/lower bound when
+`support_cckpd` (cut > A), and the four SDAGC-follow-PAGC enables. The native
+owner admits track reads/writes only for `track::REGISTERS`, under current
+ordinary authority and the prepared operating PHY. Debug-only
+`rtw89_phy_dig_diag`, NHM and the EDCCA-CLM utility are not ported; MCC,
+paused/bypassed DIG and fixed-PD debug overrides do not exist natively. The RX
 assembler parses `RTW89_CORE_RX_TYPE_PPDU_STAT` exactly as
 `rtw89_core_rx_process_ppdu_sts` accepts it (MAC-info users ≤ `ppdu_max_usr`
 4, PHY-status VALID, header length equal to the report, IE map ≥
@@ -730,13 +747,12 @@ association (four-way or open) and restarted for a new peer
 scanning, the station computes `rtw89_phy_edcca_get_thre_by_rssi` (unlinked
 `EDCCA_MAX` 249; linked `rssi/2 − 110 + 128 − 3`, floored at 66) and, when it
 differs from the last written level (`th_old`), writes `R_SEG0R_EDCCA_LVL_V1`
-bytes 0, 1 and 3 with readback under the current ordinary authority and
-prepared operating PHY. An owner without that hook reports `Unsupported`,
-which disables tracking (`RTW89_DM_DYNAMIC_EDCCA`). Debug-only
+bytes 0, 1 and 3 with readback. An owner without the track hooks reports
+`Unsupported`, which disables tracking (`disabled_dm_bitmap`). Debug-only
 `rtw89_phy_edcca_log`/`_diag` and the scan-time `rtw89_phy_config_edcca`
 backup are not used: track work skips scans and native scans do not change
-the level. The single-link RSSI average is the input DIG tracking still needs.
-Smokes: `smoke_rtw89_track_*`,
+the level. Smokes: `smoke_rtw89_track_*` (including a register-file model
+of the full first and linked periods),
 `smoke_rtw89_rx_ppdu_status_yields_rssi_only_when_linux_accepts`. QEMU-only
 software evidence; no silicon run.
 
