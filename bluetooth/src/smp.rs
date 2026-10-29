@@ -326,31 +326,47 @@ pub fn derive_mac_key_and_ltk(
     (mac_key, ltk)
 }
 
+/// The §2.2.8 f6 message inputs, in formula order. Bundled so
+/// [`dhkey_check_value`] takes the MacKey plus this one
+/// spec-shaped block instead of six loose slices: the caller
+/// picks the initiator or the table-2.2 responder ordering by
+/// which values it places in `n1`/`n2` and `a1`/`a2`.
+pub struct DhKeyCheckInputs<'a> {
+    /// First nonce (Na for Ea, Nb for Eb).
+    pub n1: &'a [u8; 16],
+    /// Second nonce (Nb for Ea, Na for Eb).
+    pub n2: &'a [u8; 16],
+    /// The 128-bit random (zero for Just Works / Numeric
+    /// Comparison).
+    pub r: &'a [u8; 16],
+    /// IO capabilities, from [`iocap_bytes`].
+    pub iocap: &'a [u8; 3],
+    /// First address (A for Ea, B for Eb): type byte + BD_ADDR.
+    pub a1: &'a [u8; 7],
+    /// Second address (B for Ea, A for Eb).
+    pub a2: &'a [u8; 7],
+}
+
 /// f6 DHKey check value (§2.2.8):
 /// `AES-CMAC_W(N1 ‖ N2 ‖ R ‖ IOcap ‖ A1 ‖ A2)` keyed on the f5
 /// MacKey. Per table 2.2, for Just Works / Numeric Comparison the
 /// initiator's check is `Ea = f6(MacKey, Na, Nb, 0, IOcapA, A, B)`
 /// and the responder's is `Eb = f6(MacKey, Nb, Na, 0, IOcapB, B, A)`
 /// — the responder's form swaps both the nonce order and the
-/// address order. `r` is the 128-bit random (zero for JW/NC);
-/// `iocap` comes from [`iocap_bytes`].
+/// address order. `inputs` carries the message block in formula
+/// order; see [`DhKeyCheckInputs`].
 pub fn dhkey_check_value(
     crypto: &dyn SmpCrypto,
     mac_key: &[u8; 16],
-    n1: &[u8; 16],
-    n2: &[u8; 16],
-    r: &[u8; 16],
-    iocap: &[u8; 3],
-    a1: &[u8; 7],
-    a2: &[u8; 7],
+    inputs: &DhKeyCheckInputs<'_>,
 ) -> [u8; 16] {
     let mut data = Vec::with_capacity(65);
-    data.extend_from_slice(n1);
-    data.extend_from_slice(n2);
-    data.extend_from_slice(r);
-    data.extend_from_slice(iocap);
-    data.extend_from_slice(a1);
-    data.extend_from_slice(a2);
+    data.extend_from_slice(inputs.n1);
+    data.extend_from_slice(inputs.n2);
+    data.extend_from_slice(inputs.r);
+    data.extend_from_slice(inputs.iocap);
+    data.extend_from_slice(inputs.a1);
+    data.extend_from_slice(inputs.a2);
     crypto.aes_cmac(mac_key, &data)
 }
 
@@ -588,12 +604,14 @@ impl<C: SmpCrypto> Initiator<C> {
         let ea = dhkey_check_value(
             &self.crypto,
             &self.mac_key,
-            &self.na,
-            &self.nb,
-            &[0u8; 16],
-            &iocap_bytes(&self.features),
-            &self.iat_addr,
-            &self.rat_addr,
+            &DhKeyCheckInputs {
+                n1: &self.na,
+                n2: &self.nb,
+                r: &[0u8; 16],
+                iocap: &iocap_bytes(&self.features),
+                a1: &self.iat_addr,
+                a2: &self.rat_addr,
+            },
         );
         self.state = PairingState::SentDhKeyCheck;
         Ok(alloc::vec![
@@ -622,12 +640,14 @@ impl<C: SmpCrypto> Initiator<C> {
         let want_eb = dhkey_check_value(
             &self.crypto,
             &self.mac_key,
-            &self.nb,
-            &self.na,
-            &[0u8; 16],
-            &iocap_bytes(&self.peer_features),
-            &self.rat_addr,
-            &self.iat_addr,
+            &DhKeyCheckInputs {
+                n1: &self.nb,
+                n2: &self.na,
+                r: &[0u8; 16],
+                iocap: &iocap_bytes(&self.peer_features),
+                a1: &self.rat_addr,
+                a2: &self.iat_addr,
+            },
         );
         if rx.payload[..16] != want_eb[..] {
             self.state = PairingState::Failed;
@@ -907,12 +927,14 @@ impl<C: SmpCrypto> Responder<C> {
         let want_ea = dhkey_check_value(
             &self.crypto,
             &self.mac_key,
-            &self.na,
-            &self.nb,
-            &[0u8; 16],
-            &iocap_bytes(&self.features_peer),
-            &self.iat_addr,
-            &self.rat_addr,
+            &DhKeyCheckInputs {
+                n1: &self.na,
+                n2: &self.nb,
+                r: &[0u8; 16],
+                iocap: &iocap_bytes(&self.features_peer),
+                a1: &self.iat_addr,
+                a2: &self.rat_addr,
+            },
         );
         if rx.payload[..16] != want_ea[..] {
             self.state = ResponderState::Failed;
@@ -922,12 +944,14 @@ impl<C: SmpCrypto> Responder<C> {
         let eb = dhkey_check_value(
             &self.crypto,
             &self.mac_key,
-            &self.nb,
-            &self.na,
-            &[0u8; 16],
-            &iocap_bytes(&self.features_local),
-            &self.rat_addr,
-            &self.iat_addr,
+            &DhKeyCheckInputs {
+                n1: &self.nb,
+                n2: &self.na,
+                r: &[0u8; 16],
+                iocap: &iocap_bytes(&self.features_local),
+                a1: &self.rat_addr,
+                a2: &self.iat_addr,
+            },
         );
         self.state = ResponderState::Done;
         Ok(alloc::vec![Pdu {

@@ -2314,12 +2314,14 @@ mod tests {
         if smp::dhkey_check_value(
             &NarfSmpCrypto,
             &want_mac_key,
-            &n1,
-            &n2,
-            &r,
-            &iocap,
-            &a1,
-            &a2,
+            &smp::DhKeyCheckInputs {
+                n1: &n1,
+                n2: &n2,
+                r: &r,
+                iocap: &iocap,
+                a1: &a1,
+                a2: &a2,
+            },
         ) != want_f6
         {
             return TestResult::Fail("production f6 disagrees with Appendix D.4");

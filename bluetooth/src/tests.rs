@@ -494,7 +494,7 @@ kernel_test_in!("bluetooth/smp", smoke_smp_pick_pairing_method_just_works);
 
 fn smoke_smp_initiator_just_works_walk() -> TestResult {
     use crate::smp::{
-        confirm_value, dhkey_check_value, Initiator, IoCapability, PairingError,
+        confirm_value, dhkey_check_value, DhKeyCheckInputs, Initiator, IoCapability, PairingError,
         PairingFeatureExchange, PairingState, SmpCrypto, AUTH_BONDING, AUTH_SC,
         SMP_PAIRING_CONFIRM, SMP_PAIRING_DHKEY_CHECK, SMP_PAIRING_PUBLIC_KEY, SMP_PAIRING_RANDOM,
         SMP_PAIRING_REQUEST, SMP_PAIRING_RESPONSE,
@@ -602,16 +602,18 @@ fn smoke_smp_initiator_just_works_walk() -> TestResult {
     let want_ea = dhkey_check_value(
         &StubCrypto,
         &init.mac_key,
-        &[0x55; 16],
-        &nb,
-        &[0u8; 16],
-        &[
-            AUTH_BONDING | AUTH_SC,
-            0,
-            IoCapability::NoInputNoOutput as u8,
-        ],
-        &[0u8; 7],
-        &[0u8; 7],
+        &DhKeyCheckInputs {
+            n1: &[0x55; 16],
+            n2: &nb,
+            r: &[0u8; 16],
+            iocap: &[
+                AUTH_BONDING | AUTH_SC,
+                0,
+                IoCapability::NoInputNoOutput as u8,
+            ],
+            a1: &[0u8; 7],
+            a2: &[0u8; 7],
+        },
     );
     if out[1].code != SMP_PAIRING_DHKEY_CHECK || out[1].payload != want_ea {
         return TestResult::Fail("Ea is not the f6 check value");
@@ -628,16 +630,18 @@ fn smoke_smp_initiator_just_works_walk() -> TestResult {
     let eb = dhkey_check_value(
         &StubCrypto,
         &init.mac_key,
-        &nb,
-        &[0x55; 16],
-        &[0u8; 16],
-        &[
-            AUTH_BONDING | AUTH_SC,
-            0,
-            IoCapability::NoInputNoOutput as u8,
-        ],
-        &[0u8; 7],
-        &[0u8; 7],
+        &DhKeyCheckInputs {
+            n1: &nb,
+            n2: &[0x55; 16],
+            r: &[0u8; 16],
+            iocap: &[
+                AUTH_BONDING | AUTH_SC,
+                0,
+                IoCapability::NoInputNoOutput as u8,
+            ],
+            a1: &[0u8; 7],
+            a2: &[0u8; 7],
+        },
     );
     let out = init
         .feed(&crate::smp::Pdu {
@@ -909,8 +913,8 @@ kernel_test_in!(
 
 fn smoke_smp_responder_full_walk() -> TestResult {
     use crate::smp::{
-        confirm_value, dhkey_check_value, IoCapability, PairingFeatureExchange, Pdu, Responder,
-        ResponderState, SmpCrypto, AUTH_BONDING, AUTH_SC, SMP_PAIRING_CONFIRM,
+        confirm_value, dhkey_check_value, DhKeyCheckInputs, IoCapability, PairingFeatureExchange,
+        Pdu, Responder, ResponderState, SmpCrypto, AUTH_BONDING, AUTH_SC, SMP_PAIRING_CONFIRM,
         SMP_PAIRING_DHKEY_CHECK, SMP_PAIRING_PUBLIC_KEY, SMP_PAIRING_RANDOM, SMP_PAIRING_REQUEST,
         SMP_PAIRING_RESPONSE,
     };
@@ -1019,16 +1023,18 @@ fn smoke_smp_responder_full_walk() -> TestResult {
     let ea = dhkey_check_value(
         &StubCrypto,
         &r.mac_key,
-        &na,
-        &[0x55; 16],
-        &[0u8; 16],
-        &[
-            AUTH_BONDING | AUTH_SC,
-            0,
-            IoCapability::NoInputNoOutput as u8,
-        ],
-        &[0u8; 7],
-        &[0u8; 7],
+        &DhKeyCheckInputs {
+            n1: &na,
+            n2: &[0x55; 16],
+            r: &[0u8; 16],
+            iocap: &[
+                AUTH_BONDING | AUTH_SC,
+                0,
+                IoCapability::NoInputNoOutput as u8,
+            ],
+            a1: &[0u8; 7],
+            a2: &[0u8; 7],
+        },
     );
     let out = r
         .feed(&Pdu {
@@ -1039,12 +1045,14 @@ fn smoke_smp_responder_full_walk() -> TestResult {
     let want_eb = dhkey_check_value(
         &StubCrypto,
         &r.mac_key,
-        &[0x55; 16],
-        &na,
-        &[0u8; 16],
-        &[0x0D, 0, IoCapability::DisplayYesNo as u8],
-        &[0u8; 7],
-        &[0u8; 7],
+        &DhKeyCheckInputs {
+            n1: &[0x55; 16],
+            n2: &na,
+            r: &[0u8; 16],
+            iocap: &[0x0D, 0, IoCapability::DisplayYesNo as u8],
+            a1: &[0u8; 7],
+            a2: &[0u8; 7],
+        },
     );
     if out.len() != 1 || out[0].code != SMP_PAIRING_DHKEY_CHECK || out[0].payload != want_eb {
         return TestResult::Fail("responder didn't emit the f6 DHKey check Eb");

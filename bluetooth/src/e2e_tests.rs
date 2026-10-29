@@ -568,16 +568,18 @@ fn smoke_e2e_smp_phase2_ltk_derivation() -> TestResult {
     let ea = smp::dhkey_check_value(
         &E2eCrypto,
         &r.mac_key,
-        &na,
-        &r.nb,
-        &[0u8; 16],
-        &[
-            AUTH_BONDING | AUTH_SC,
-            0,
-            IoCapability::NoInputNoOutput as u8,
-        ],
-        &[0u8; 7],
-        &[0u8; 7],
+        &smp::DhKeyCheckInputs {
+            n1: &na,
+            n2: &r.nb,
+            r: &[0u8; 16],
+            iocap: &[
+                AUTH_BONDING | AUTH_SC,
+                0,
+                IoCapability::NoInputNoOutput as u8,
+            ],
+            a1: &[0u8; 7],
+            a2: &[0u8; 7],
+        },
     );
     let out = match r.feed(&Pdu {
         code: SMP_PAIRING_DHKEY_CHECK,
