@@ -39,6 +39,7 @@ impl<B: Backend> Session<B> {
     }
 
     async fn recover_inner(&mut self, expected_mac: Option<[u8; 6]>) -> Result<RadioInfo, Error> {
+        self.normalize_wake_bus().await?;
         self.backend.check()?;
         self.backend.park_bus_master()?;
         let mut owned = false;
@@ -95,6 +96,8 @@ impl<B: Backend> Session<B> {
         self.scanning = false;
         self.used_tids = 0;
         self.security = None;
+        self.wow_config = None;
+        self.wow_nlo = None;
         self.wmm = None;
         self.wmm_pending = None;
         self.station_permission = None;

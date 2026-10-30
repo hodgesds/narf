@@ -38,8 +38,13 @@ mod monitor;
 mod recovery;
 #[path = "system_pm.rs"]
 mod system_pm;
+#[path = "wowlan_station.rs"]
+mod wowlan;
+#[path = "wowlan_owner.rs"]
+mod wowlan_owner;
 pub(super) use join::{extract_eapol, wrap_eapol_frame};
 pub use monitor::{validate_channel as validate_monitor_channel, Capture as MonitorCapture};
+pub use wowlan_owner::{boot_validate_rekey_data, boot_wake_route_available, suspend_boot_wowlan};
 
 #[path = "firmware_transport_hw.rs"]
 mod hardware;
@@ -612,7 +617,12 @@ pub async fn resume_boot_radio(expected_mac: [u8; 6]) -> Result<(), Error> {
     retained_owner_work(true, move |mut transport| {
         alloc::boxed::Box::pin(async move {
             let result = match transport.state() {
-                State::Suspended(_) => transport.resume(expected_mac).await.map(|_| ()),
+                State::Suspended(_) | State::WowSuspended { .. } => {
+                    transport.resume(expected_mac).await.map(|_| ())
+                }
+                State::Failed { .. } | State::Running(_) => {
+                    transport.recover(expected_mac).await.map(|_| ())
+                }
                 // A suspend that never completed left the radio usable.
                 _ => Ok(()),
             };
@@ -855,6 +865,7 @@ pub enum Stage {
     RecoveryReady,
     RecoveryRearm,
     Suspend,
+    WowSuspend,
     Resume,
     Quiesce,
     Initialize,
@@ -892,6 +903,14 @@ pub struct Report {
     pub patch_already_loaded: bool,
     pub bytes_transferred: usize,
 }
+
+/// Actual firmware association retained solely for autonomous wake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WakeAssociation {
+    pub peer: [u8; 6],
+    pub channel: u8,
+    pub aid: u16,
+}
 /// Session state survives cancellation of its borrowed run future.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -913,6 +932,12 @@ pub enum State {
     },
     /// PCIe low-power handoff completed; firmware owns LPCTL and DMA is off.
     Suspended(RadioInfo),
+    /// Firmware association/offloads retained for wake; host RX/TX closed.
+    WowSuspended {
+        info: RadioInfo,
+        association: Option<WakeAssociation>,
+        target: narf_power::system_pm::SystemSleepState,
+    },
     Failed {
         stage: Stage,
         error: Error,
@@ -1098,6 +1123,9 @@ trait Backend {
     fn progress(&mut self, _stage: Stage) {}
     fn now_ns(&self) -> u64;
     fn check(&self) -> Result<(), Error>;
+    fn regulatory_domain(&self) -> Result<Arc<narf_wireless::reg::RegulatoryDomain>, Error> {
+        narf_wireless::reg::db::snapshot().ok_or(Error::Authority)
+    }
     fn check_tx_permission(
         &self,
         permission: crate::mt7921::association::TxPermission,
@@ -1130,6 +1158,36 @@ trait Backend {
     /// `__mt792x_mcu_fw_pmctrl`: return LPCTL ownership to firmware.
     fn request_firmware_own(&mut self) -> Result<(), Error>;
     fn firmware_owned(&mut self) -> Result<bool, Error>;
+    fn prepare_wake_route(
+        &mut self,
+        _target: narf_power::system_pm::SystemSleepState,
+    ) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn arm_wake_route(
+        &mut self,
+        _target: narf_power::system_pm::SystemSleepState,
+    ) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn wake_power_settled(&self) -> bool {
+        true
+    }
+    fn enter_wake_d3hot(&mut self) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn verify_wake_d3hot(&mut self) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn begin_wake_d0(&mut self) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn verify_wake_d0(&mut self) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn disarm_wake_route(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
     /// Restore memory decoding after a platform power transition, without
     /// bus mastering (Linux PCI core config restore precedes driver resume).
     fn restore_bus(&mut self) -> Result<(), Error>;
@@ -1274,6 +1332,8 @@ struct Session<B: Backend> {
     /// During an associated scan, RX consumes only the hand-off queue so
     /// station service cannot swallow off-channel scan observations.
     scanning: bool,
+    wow_config: Option<narf_wireless::WowlanConfig>,
+    wow_nlo: Option<Arc<scan::nlo::Plan>>,
 }
 impl<B: Backend> Session<B> {
     fn new(backend: B, firmware: Firmware) -> Self {
@@ -1311,6 +1371,8 @@ impl<B: Backend> Session<B> {
             receive_epoch: 0,
             scan_packets: VecDeque::new(),
             scanning: false,
+            wow_config: None,
+            wow_nlo: None,
         }
     }
     fn stage(&mut self, stage: Stage) {
@@ -1531,6 +1593,7 @@ impl<B: Backend> Session<B> {
         self.rx_fragments.clear();
         self.stage(Stage::Shutdown);
         let result = async {
+            self.normalize_wake_bus().await?;
             self.backend.check()?;
             self.backend.quiesce()?;
             self.wait(100, |b| b.idle().map(|idle| idle.then_some(())))

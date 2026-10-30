@@ -999,13 +999,18 @@ fn wiphy_attrs(
             }
             push_attr(&mut triggers, 4, &pattern); // PKT_PATTERN support
         }
-        if wowlan.net_detect_max_match_sets != 0 {
+        if let Some(limits) = iface
+            .filter(|_| wowlan.net_detect_max_match_sets != 0)
+            .and_then(|iface| iface.wowlan_net_detect_limits())
+            .filter(|limits| limits.max_match_sets != 0)
+        {
+            let matches = limits.max_match_sets.min(wowlan.net_detect_max_match_sets);
             // WIPHY_WOWLAN_NET_DETECT is represented by the maximum number
             // of cfg80211 match sets, not a nested capability structure.
             push_attr(
                 &mut triggers,
                 17, // NL80211_WOWLAN_TRIG_NET_DETECT
-                &(wowlan.net_detect_max_match_sets as u32).to_ne_bytes(),
+                &u32::from(matches).to_ne_bytes(),
             );
             // ath11k publishes its PNO limits on the wiphy even though it
             // implements NLO only as the WoWLAN NET_DETECT path, not as a
@@ -1014,12 +1019,16 @@ fn wiphy_attrs(
             // their attribute widths are part of the netlink ABI.
             // A wiphy with `sched_scan_support()` publishes its own limits.
             if iface.is_none_or(|iface| iface.sched_scan_support().is_none()) {
-                push_attr(&mut attrs, 123, &[16]);
-                push_attr(&mut attrs, 124, &512u16.to_ne_bytes());
-                push_attr(&mut attrs, 133, &[wowlan.net_detect_max_match_sets]);
-                push_attr(&mut attrs, 222, &2u32.to_ne_bytes());
-                push_attr(&mut attrs, 223, &7200u32.to_ne_bytes());
-                push_attr(&mut attrs, 224, &100u32.to_ne_bytes());
+                push_attr(&mut attrs, 123, &[limits.max_ssids]);
+                push_attr(&mut attrs, 124, &limits.max_ie_len.to_ne_bytes());
+                push_attr(&mut attrs, 133, &[matches]);
+                push_attr(&mut attrs, 222, &limits.max_scan_plans.to_ne_bytes());
+                push_attr(
+                    &mut attrs,
+                    223,
+                    &limits.max_plan_interval_secs.to_ne_bytes(),
+                );
+                push_attr(&mut attrs, 224, &limits.max_plan_iterations.to_ne_bytes());
             }
         }
         push_attr(&mut attrs, 118 | NLA_F_NESTED, &triggers);
@@ -1176,6 +1185,9 @@ fn wiphy_security_attrs(attrs: &mut Vec<u8>, iface: &dyn crate::WirelessNetIface
     if iface
         .wowlan_support()
         .is_some_and(|support| support.net_detect_random_mac)
+        && iface
+            .wowlan_net_detect_limits()
+            .is_some_and(|limits| limits.random_mac)
     {
         // NL80211_FEATURE_ND_RANDOM_MAC_ADDR.  This applies only to the
         // low-power NET_DETECT payload, independently of normal scans.

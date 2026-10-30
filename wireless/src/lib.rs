@@ -975,6 +975,18 @@ pub trait WirelessNetIface: Interface {
         None
     }
 
+    /// Per-family NET_DETECT bounds. These do not create an offload
+    /// capability; `wowlan_support` must also advertise network detection.
+    /// The default preserves the existing ath11k low-power scan profile.
+    fn wowlan_net_detect_limits(&self) -> Option<SchedScanSupport> {
+        let support = self.wowlan_support()?;
+        (support.net_detect_max_match_sets != 0).then_some(SchedScanSupport {
+            max_match_sets: support.net_detect_max_match_sets,
+            random_mac: support.net_detect_random_mac,
+            ..SchedScanSupport::NET_DETECT
+        })
+    }
+
     /// `nl80211_set_wowlan`: retain a validated wake configuration until a
     /// later system low-power transition programs the hardware.  `None`
     /// clears the configuration, mirroring a SET_WOWLAN request without

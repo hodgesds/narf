@@ -1056,6 +1056,14 @@ userspace over AUTHENTICATE as on Linux. The external mode is:
   preserves the associated firmware transport; absent WoW disconnects and
   cold-cycles the interface. `GET_WOWLAN` therefore reports configuration,
   not a promise that the platform is currently asleep.
+  `wowlan_net_detect_limits() -> Option<SchedScanSupport>` supplies the
+  family's NET_DETECT SSID, IE, match, frequency and scan-plan bounds for
+  both GET_WIPHY and SET_WOWLAN parsing. These bounds grant no capability:
+  `WowlanSupport` must separately advertise network detection, and the
+  parser intersects match/random-address support with that advertisement.
+  The default retains ath11k's existing 16-SSID, 512-byte IE, two-plan,
+  7200-second/100-iteration profile. CONNAC2 can provide its actual ten-SSID,
+  one-plan/65535-second profile without changing the other family.
 - **Scheduled scan.** A wiphy whose
   `WirelessNetIface::sched_scan_support() -> Option<SchedScanSupport>` is
   `Some` advertises `NL80211_CMD_START_SCHED_SCAN` / `STOP_SCHED_SCAN` (75 /

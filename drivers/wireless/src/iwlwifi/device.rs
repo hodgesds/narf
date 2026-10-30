@@ -1314,11 +1314,15 @@ impl WirelessNetIface for Device {
                         })
                         .collect();
                     if let Some(power) = powers.iter().flatten().min() {
-                        let power_command = station_api::tx_power(
+                        hw.ensure_platform_power()
+                            .await
+                            .map_err(|_| WirelessError::HardwareError)?;
+                        let mut power_command = station_api::tx_power(
                             hw.version(1, 0x9f).ok_or(WirelessError::NotSupported)?.0,
                             *power,
                         )
                         .map_err(|_| WirelessError::NotSupported)?;
+                        power_command[0] = 1; // SET_DEVICE: scan probes are not bound to link0
                         hw.command(1, 0x9f, &power_command)
                             .await
                             .map_err(|_| WirelessError::HardwareError)?;

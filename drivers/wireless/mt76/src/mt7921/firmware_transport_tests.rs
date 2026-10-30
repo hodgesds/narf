@@ -260,9 +260,14 @@ struct Model {
 }
 #[path = "associated_scan_tests.rs"]
 mod associated_scan_tests;
+#[path = "wowlan_model.rs"]
+mod wowlan_model;
+#[path = "wowlan_tests.rs"]
+mod wowlan_tests;
 /// Low-power state of the model device, for system suspend/resume.
 #[derive(Debug, Default)]
 struct PowerModel {
+    wow: wowlan_model::Fixture,
     trace: Vec<&'static str>,
     dma_enabled: bool,
     firmware_owned: bool,
@@ -430,6 +435,14 @@ impl Backend for Model {
             Err(Error::Authority)
         }
     }
+    fn regulatory_domain(&self) -> Result<Arc<narf_wireless::reg::RegulatoryDomain>, Error> {
+        self.tx_policy
+            .as_ref()
+            .map_or_else(narf_wireless::reg::db::snapshot, |policy| {
+                policy.database.snapshot()
+            })
+            .ok_or(Error::Authority)
+    }
     fn check_tx_permission(
         &self,
         permission: crate::mt7921::association::TxPermission,
@@ -587,6 +600,8 @@ impl Backend for Model {
                     || cmd == 0x1b
                     || cmd == 0x1d
                     || cmd == 0xb0
+                    || cmd == 0x61
+                    || cmd == 0x62
                     || cmd == 3 && self.scan_stall)
                 {
                     self.replies.push_back(reply);
@@ -619,6 +634,13 @@ impl Backend for Model {
         }
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        if self.pm.wow.hold_offload_ack.load(Ordering::Acquire)
+            && self.frames.last().is_some_and(|(_, frame)| {
+                frame.len() >= 48 && frame[43] == 7 && frame[34..36] == [6, 0]
+            })
+        {
+            return Ok(None);
+        }
         let held = self.tx_policy.as_ref().is_some_and(|policy| {
             policy.hold_bss_ack.load(Ordering::SeqCst)
                 && self.frames.last().is_some_and(|(_, frame)| {
@@ -681,6 +703,36 @@ impl Backend for Model {
     }
     fn firmware_owned(&mut self) -> Result<bool, Error> {
         Ok(self.pm.firmware_owned)
+    }
+    fn prepare_wake_route(
+        &mut self,
+        target: narf_power::system_pm::SystemSleepState,
+    ) -> Result<(), Error> {
+        self.wow_prepare_route(target)
+    }
+    fn arm_wake_route(
+        &mut self,
+        target: narf_power::system_pm::SystemSleepState,
+    ) -> Result<(), Error> {
+        self.wow_arm_route(target)
+    }
+    fn wake_power_settled(&self) -> bool {
+        self.wow_settled()
+    }
+    fn enter_wake_d3hot(&mut self) -> Result<(), Error> {
+        self.wow_enter_d3hot()
+    }
+    fn verify_wake_d3hot(&mut self) -> Result<(), Error> {
+        self.wow_verify_d3hot()
+    }
+    fn begin_wake_d0(&mut self) -> Result<bool, Error> {
+        self.wow_begin_d0()
+    }
+    fn verify_wake_d0(&mut self) -> Result<(), Error> {
+        self.wow_verify_d0()
+    }
+    fn disarm_wake_route(&mut self) -> Result<(), Error> {
+        self.wow_disarm_route()
     }
     fn restore_bus(&mut self) -> Result<(), Error> {
         self.check()?;

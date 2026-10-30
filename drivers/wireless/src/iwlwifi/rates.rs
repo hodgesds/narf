@@ -13,7 +13,17 @@ impl Rates {
         Self::parse_for_phy(ies, channel, 0)
     }
 
-    pub fn parse_for_phy(mut ies: &[u8], channel: u8, mode: u8) -> Result<Self, &'static str> {
+    pub fn parse_for_phy(ies: &[u8], channel: u8, mode: u8) -> Result<Self, &'static str> {
+        Self::parse_for_security(ies, channel, mode, false)
+    }
+    /// SAE-H2E membership selector123 is admitted only after the shared
+    /// security plan proved H2E; it is never a legacy rate or TLC bit.
+    pub(super) fn parse_for_security(
+        mut ies: &[u8],
+        channel: u8,
+        mode: u8,
+        sae_h2e: bool,
+    ) -> Result<Self, &'static str> {
         let allowed = if channel == 14 {
             0xf
         } else if channel <= 13 {
@@ -33,7 +43,10 @@ impl Rates {
             if matches!(ies[0], 1 | 50) {
                 for &rate in bytes {
                     // HT/VHT BSS membership selectors are not bitrates.
-                    if (rate == 0xff && mode >= 1) || (rate == 0xfe && mode >= 2) {
+                    if (rate == 0xff && mode >= 1)
+                        || (rate == 0xfe && mode >= 2)
+                        || (rate == 0xfb && sae_h2e)
+                    {
                         continue;
                     }
                     let bit = RATES

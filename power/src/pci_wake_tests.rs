@@ -48,6 +48,10 @@ impl Namespace for Firmware {
         self.devices.clone()
     }
 
+    fn exists(&self, path: &str) -> bool {
+        self.objects.iter().any(|(key, _)| key == path)
+    }
+
     fn object(&self, path: &str) -> Result<Option<Value>, WakeError> {
         Ok(self
             .objects

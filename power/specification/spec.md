@@ -210,7 +210,39 @@ This profile forwards only the required bus/ACPI/AML wake fixtures; it does
 not activate token/TPM fixture providers. The existing `kernel-test` profile
 retains those independent providers and includes the wake tests as well.
 
-### 3.3a Firmware-owned PCI wake routes
+### 3.3a Typed PCI firmware policy metadata
+
+`pci_firmware::PciMetadata::discover(&Cap<BusDeviceCap, Write>, BusDevice)`
+walks actual registered PCI bridges inside the current endpoint invocation,
+then resolves exact `_SEG`/`_BBN` roots and immediate `_ADR` children inside
+the installed platform Power owner's invocation. Matching itself also enters
+a fresh endpoint invocation, so the prior topology receipt alone never grants
+later firmware execution. It requires no PM capability,
+`_PRW` or SCI. The trusted binding must pair that capability and function,
+as in the existing bus interface. Namespace replacement must not race live
+facades. `endpoint_path()` returns cached identity only, not a current grant.
+A missing exact endpoint produces `None`; an ancestor never supplies its
+policy tables. Root/topology ambiguity, firmware evaluation failure and
+unavailable/revoked authority remain distinct diagnostics.
+
+`object(PciMetadataKey::{Wrds,Ewrd,Wgds,Ppag})` returns the actual optional
+`narf_aml::Value` from the selected known endpoint object. Every query runs
+inside both current endpoint and retained platform invocations, including
+queries whose cached endpoint is absent. Existing firmware errors cannot
+become absent optional data. Firmware methods may have supported side effects;
+this is firmware execution rather than a read-only evaluator. The facade
+exposes neither its platform capability nor an arbitrary evaluator callback.
+Metadata supplies no radio or transmit grant: drivers apply the relevant
+Linux optional-data/error behavior and require their own current native
+firmware/RF ownership and command receipts. An absent table does not invent a
+new radio admission prerequisite or erase a previously programmed limit.
+
+The `wake-test` feature adds `unsafe __test_platform_authority_scope`, which
+invokes a provided fixture grant, restores the prior installed grant on Drop,
+and mints no production authority. Callers serialize all metadata/wake users,
+retire their work before scope exit, and separately own namespace/ECAM scopes.
+
+### 3.3b Firmware-owned PCI wake routes
 
 `pci_wake::install_authority(&Cap<Power, Grant>)` retains the platform
 composition root's already-issued grant. `PciWake::discover(endpoint_cap,
@@ -224,7 +256,8 @@ Ambiguous roots/functions, external GPE-device references and power-resource
 packages are refused. No suffix-matched name or board-profile GPE can supply
 a route. An installed SCI and validated byte-port FADT GPE are required.
 Discovery evaluates firmware objects inside the granted Power operation and
-defers explicit PME/GPE arming. Firmware methods used by `_ADR`, `_PRW` or
+rechecks endpoint authority at matching entry, deferring explicit PME/GPE
+arming. Firmware methods used by `_ADR`, `_PRW` or
 other metadata objects may themselves have supported side effects; discovery
 does not promise a read-only firmware interpreter.
 Route objects and firmware wake methods use `narf_aml::eval::strict`, whose
@@ -250,6 +283,17 @@ change D-state, claim native Root Port PME service or write a bridge through
 an endpoint capability. The current platform has no native PCIe-PME `_OSC`
 takeover; this API is specifically the firmware-owned route.
 
+`admits(SleepState, WakeState)` also checks the exact endpoint's optional
+`_S0W` or `_S3D`/`_S3W` bounds before choosing its D-state. An ancestor's
+`_PRW` never supplies child power-policy objects. With `_S3D` but no `_S3W`,
+the wake ceiling stays at `_S3D`; without either, the caller's actual PCI
+capability bounds the default ceiling. Malformed or contradictory bounds
+are refused. Endpoint `_PSx`/`_PRx` sequences require an ACPI device-power
+owner and are explicitly unsupported by this bounded route owner; discovery
+checks their namespace presence without executing a power method. `arm`
+repeats this admission before arming. Callers serialize power-state/config
+access and honor every actual D3hot transition delay.
+
 GPE ownership is established before firmware routing and endpoint PME enable:
 this reserves the shared bit before side effects, preserves an existing
 runtime event, and captures early SCI delivery. Only disabled stale status
@@ -264,6 +308,10 @@ trigger. Every stage and granted capability stays retained on failure;
 dropping an owner attempts synchronous cleanup and quarantines its remaining
 ownership if cleanup fails. Callers must complete cleanup before a new
 normal device generation. `quarantined_count()` exposes the retained failures.
+`quarantine(self)` consumes an actual owner without hardware I/O when a
+caller's synchronous Drop cannot settle an outstanding device-power
+transition. It retains the same endpoint/GPE/capability ownership and returns
+no cleanup receipt; it cannot grant a new owner or release the route.
 Observed evidence remains attached to the owner through rollback and repeated
 cleanup; only a new arm starts a new observation cycle.
 PME observations are retained independently of the terminal disable result.

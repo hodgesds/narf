@@ -12,6 +12,9 @@ use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_io::DmaBuffer;
 
+#[path = "wowlan_hardware.rs"]
+mod wake;
+
 // A CPU atomic fence is inner-shareable on ARM. Device ownership also needs
 // the outer-shareable domain used by PCI DMA (Linux dma_rmb/dma_wmb).
 fn dma_barrier() {
@@ -195,6 +198,7 @@ struct Hardware {
     /// Linux `wcid->amsdu` for the station peer (TXD7 HW_AMSDU).
     hw_amsdu: bool,
     sequence_reset: SequenceReset,
+    wake: wake::Wake,
 }
 impl Hardware {
     fn receive_ring(&mut self, which: usize) -> Result<Option<Vec<u8>>, Error> {
@@ -595,6 +599,9 @@ impl Hardware {
         Ok(result)
     }
     fn read(&self, addr: u32) -> Result<u32, Error> {
+        if !self.wake.mmio_ready() {
+            return Err(Error::Busy);
+        }
         crate::mt7921::pci::invoke(&self.authority, || {
             // SAFETY: exclusive retained aperture/L1 latch inside current invocation.
             let value =
@@ -608,6 +615,9 @@ impl Hardware {
         .map_err(|_| Error::Authority)?
     }
     fn write(&self, addr: u32, value: u32) -> Result<(), Error> {
+        if !self.wake.mmio_ready() {
+            return Err(Error::Busy);
+        }
         crate::mt7921::pci::invoke(&self.authority, || {
             // SAFETY: bounded register plan and current retained PCI invocation.
             unsafe { registers::write32(&self.mmio, addr, value) }.map_err(|_| Error::Register)
@@ -615,6 +625,9 @@ impl Hardware {
         .map_err(|_| Error::Authority)?
     }
     fn command(&self, clear: u16, set: u16) -> Result<u16, Error> {
+        if !self.wake.mmio_ready() {
+            return Err(Error::Busy);
+        }
         crate::mt7921::pci::invoke(&self.authority, || {
             if clear != 0 {
                 narf_bus::pci::clear_command(&self.authority, &self.device, clear)
@@ -692,6 +705,36 @@ impl Backend for Hardware {
     }
     fn firmware_owned(&mut self) -> Result<bool, Error> {
         Ok(self.read(MT_CONN_ON_LPCTL)? & PCIE_LPCR_HOST_OWN_SYNC != 0)
+    }
+    fn prepare_wake_route(
+        &mut self,
+        target: narf_power::system_pm::SystemSleepState,
+    ) -> Result<(), Error> {
+        Hardware::prepare_wake_route(self, target)
+    }
+    fn arm_wake_route(
+        &mut self,
+        target: narf_power::system_pm::SystemSleepState,
+    ) -> Result<(), Error> {
+        Hardware::arm_wake_route(self, target)
+    }
+    fn wake_power_settled(&self) -> bool {
+        self.wake.settled(self.now_ns())
+    }
+    fn enter_wake_d3hot(&mut self) -> Result<(), Error> {
+        Hardware::enter_wake_d3hot(self)
+    }
+    fn verify_wake_d3hot(&mut self) -> Result<(), Error> {
+        Hardware::verify_wake_d3hot(self)
+    }
+    fn begin_wake_d0(&mut self) -> Result<bool, Error> {
+        Hardware::begin_wake_d0(self)
+    }
+    fn verify_wake_d0(&mut self) -> Result<(), Error> {
+        Hardware::verify_wake_d0(self)
+    }
+    fn disarm_wake_route(&mut self) -> Result<(), Error> {
+        Hardware::disarm_wake_route(self)
     }
     fn restore_bus(&mut self) -> Result<(), Error> {
         use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
@@ -1166,6 +1209,7 @@ impl Transport {
                         },
                         hw_amsdu: false,
                         sequence_reset: SequenceReset::None,
+                        wake: wake::Wake::default(),
                     },
                     firmware,
                 ),
@@ -1319,7 +1363,35 @@ impl Transport {
     }
     /// Leave the low-power handoff, or reset with the same identity.
     pub async fn resume(&mut self, expected_mac: [u8; 6]) -> Result<RadioInfo, Error> {
-        self.session.resume(expected_mac).await
+        if let State::WowSuspended { info, .. } = self.session.state {
+            self.session.resume_wowlan(expected_mac).await?;
+            Ok(info)
+        } else {
+            self.session.resume(expected_mac).await
+        }
+    }
+    pub async fn suspend_wowlan(
+        &mut self,
+        config: &narf_wireless::WowlanConfig,
+        target: narf_power::system_pm::SystemSleepState,
+    ) -> Result<(), Error> {
+        self.session.suspend_wowlan(config, target).await
+    }
+    pub fn wake_route_available(&self) -> Result<bool, Error> {
+        self.session.backend.wake_route_available()
+    }
+    pub(super) fn validate_rekey_data(
+        &self,
+        data: &narf_wireless::GtkRekeyData,
+    ) -> Result<(), Error> {
+        if !matches!(self.session.state, State::Associated { .. }) {
+            return Err(Error::Busy);
+        }
+        self.session
+            .security
+            .as_ref()
+            .ok_or(Error::Busy)?
+            .validate_wow_gtk_data(data)
     }
     /// Park DMA, reset WFSYS, retire old ring ownership, and reload firmware.
     /// The caller closes carrier before awaiting. No association/key replay is

@@ -130,6 +130,11 @@ impl<B: Backend> Session<B> {
             )
             .await?;
         }
+        self.suspend_associated_hif().await
+    }
+
+    /// Retain the associated firmware BSS/key context for autonomous wake.
+    pub(super) async fn suspend_associated_hif(&mut self) -> Result<(), Error> {
         if !self.data_pending.is_empty() {
             return Err(Error::Busy);
         }

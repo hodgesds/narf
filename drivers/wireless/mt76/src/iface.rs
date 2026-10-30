@@ -17,6 +17,8 @@ use narf_wireless::{
 
 #[path = "iface_monitor.rs"]
 mod monitor;
+#[path = "iface_wowlan.rs"]
+mod wowlan;
 
 /// Publish physical carrier while preserving operator-controlled IFF_UP.
 /// No administrative open/stop callback runs under the caller's driver locks.
@@ -68,6 +70,12 @@ pub struct Mt76Iface {
     monitor_channel: IrqSafeSpinLock<Option<narf_wireless::monitor::Channel>>,
     monitor_started: AtomicBool,
     monitor_token: IrqSafeSpinLock<Option<narf_net::iface::MonitorRxToken>>,
+    sleeping: AtomicBool,
+    /// A positively proven implementation/platform profile for stable
+    /// capability reporting. Every actual configuration and handoff still
+    /// obtains a fresh native wake-route receipt.
+    wake_reported: AtomicBool,
+    wowlan: IrqSafeSpinLock<Option<narf_wireless::WowlanConfig>>,
 }
 impl Mt76Iface {
     /// Build from validated radio identity, without disconnected frame rings.
@@ -97,6 +105,9 @@ impl Mt76Iface {
             monitor_channel: IrqSafeSpinLock::new(None),
             monitor_started: AtomicBool::new(false),
             monitor_token: IrqSafeSpinLock::new(None),
+            sleeping: AtomicBool::new(false),
+            wake_reported: AtomicBool::new(false),
+            wowlan: IrqSafeSpinLock::new(None),
         })
     }
     /// Legacy 20 MHz channels on firmware-reported bands.
@@ -203,6 +214,9 @@ impl Mt76Iface {
     /// Advance bounded packet work, then service authenticated rekeys. No
     /// IRQ-safe lock survives an await; hardware ownership uses a regular mutex.
     pub async fn poll_data(&self) -> Result<(), WirelessError> {
+        if self.sleeping.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if self.current_iftype() == 6 {
             return self.poll_monitor().await;
         }
@@ -412,6 +426,7 @@ impl Mt76Iface {
         crate::mt7921::firmware_transport::recover_boot_radio(self.mac())
             .await
             .map_err(|_| WirelessError::HardwareError)?;
+        self.sleeping.store(false, Ordering::Release);
         self.teardown_needed.store(false, Ordering::Release);
         self.recovery_attempts.store(0, Ordering::Release);
         self.recovery_after_ns.store(0, Ordering::Release);
@@ -421,31 +436,14 @@ impl Mt76Iface {
     /// cfg80211 `wiphy_suspend` without WoWLAN: leave the BSS (locally
     /// generated DEAUTH_LEAVING), then the PCIe low-power handoff.
     async fn prepare_suspend(&self) -> Result<(), WirelessError> {
-        let _control = self.control.lock().await;
-        if self.monitor_started.load(Ordering::Acquire) {
-            self.close_monitor();
-            crate::mt7921::firmware_transport::stop_boot_monitor()
-                .await
-                .map_err(|_| WirelessError::HardwareError)?;
-            self.monitor_started.store(false, Ordering::Release);
-        }
-        let connected = self.associated_bssid.lock().is_some();
-        if connected {
-            self.teardown_needed.store(true, Ordering::Release);
-        }
-        self.clear_link();
-        self.scan_cache.lock().clear();
-        if connected {
-            narf_wireless::nl80211::notify_disconnect(&self.name, 3, false);
-        }
-        suspend_result(crate::mt7921::firmware_transport::suspend_boot_radio().await)?;
-        self.teardown_needed.store(false, Ordering::Release);
-        Ok(())
+        self.prepare_suspend_target(narf_power::system_pm::SystemSleepState::S3)
+            .await
     }
 
     async fn resume_from_suspend(&self) -> Result<(), WirelessError> {
         let _control = self.control.lock().await;
         suspend_result(crate::mt7921::firmware_transport::resume_boot_radio(self.mac()).await)?;
+        self.sleeping.store(false, Ordering::Release);
         self.recovery_attempts.store(0, Ordering::Release);
         self.recovery_after_ns.store(0, Ordering::Release);
         Ok(())
@@ -486,9 +484,15 @@ fn suspend_result(
 /// mac80211 suspend). Runs in executor context with no IRQ lock held; the
 /// started transition is retained across caller cancellation.
 pub async fn system_prepare_suspend() -> Result<(), WirelessError> {
+    system_prepare_suspend_for(narf_power::system_pm::SystemSleepState::S3).await
+}
+
+pub async fn system_prepare_suspend_for(
+    target: narf_power::system_pm::SystemSleepState,
+) -> Result<(), WirelessError> {
     let iface = ACTIVE.lock().clone();
     match iface {
-        Some(iface) => iface.prepare_suspend().await,
+        Some(iface) => iface.prepare_suspend_target(target).await,
         None => suspend_result(crate::mt7921::firmware_transport::suspend_boot_radio().await),
     }
 }
@@ -504,10 +508,12 @@ pub async fn system_resume() -> Result<(), WirelessError> {
         None => {
             use crate::mt7921::firmware_transport::{boot_status, BootStatus, State};
             match boot_status() {
-                BootStatus::Retained(State::Suspended(info)) => suspend_result(
-                    crate::mt7921::firmware_transport::resume_boot_radio(info.capabilities.mac)
-                        .await,
-                ),
+                BootStatus::Retained(State::Suspended(info) | State::WowSuspended { info, .. }) => {
+                    suspend_result(
+                        crate::mt7921::firmware_transport::resume_boot_radio(info.capabilities.mac)
+                            .await,
+                    )
+                }
                 _ => Ok(()),
             }
         }
@@ -550,6 +556,24 @@ impl Interface for Mt76Iface {
 }
 #[async_trait]
 impl WirelessNetIface for Mt76Iface {
+    fn wowlan_support(&self) -> Option<narf_wireless::WowlanSupport> {
+        self.native_wowlan_support()
+    }
+    fn wowlan_net_detect_limits(&self) -> Option<narf_wireless::SchedScanSupport> {
+        Some(crate::mt7921::wowlan_nlo::LIMITS)
+    }
+    fn set_wowlan(&self, config: Option<narf_wireless::WowlanConfig>) -> Result<(), i32> {
+        self.configure_wowlan(config)
+    }
+    fn wowlan_config(&self) -> Option<narf_wireless::WowlanConfig> {
+        self.wowlan.lock().clone()
+    }
+    fn supports_gtk_rekey_offload(&self) -> bool {
+        self.native_wowlan_support().is_some()
+    }
+    fn set_gtk_rekey_data(&self, data: narf_wireless::GtkRekeyData) -> Result<(), i32> {
+        self.validate_rekey_data(data)
+    }
     fn current_iftype(&self) -> u32 {
         self.iftype.load(Ordering::Acquire)
     }
@@ -1418,6 +1442,69 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/mt7921/scan",
         mt76_repeat_scan_registration_preserves_same_associated_owner_and_admin
+    );
+    fn mt76_wow_capability_busy_reporting_does_not_cache_authority() -> TestResult {
+        use crate::mt7921::firmware_transport::Error;
+        let iface = Mt76Iface::new(String::from("mt76-wake-report"), radio()).unwrap();
+        let config = narf_wireless::WowlanConfig {
+            magic_packet: true,
+            ..narf_wireless::WowlanConfig::default()
+        };
+        if iface.wowlan_support_with(|| Ok(false)).is_some()
+            || iface.wowlan_support_with(|| Err(Error::Busy)).is_some()
+            || iface.wake_reported.load(Ordering::Acquire)
+        {
+            return TestResult::Fail("absent/busy route invented a wake capability");
+        }
+        let Some(expected) = iface.wowlan_support_with(|| Ok(true)) else {
+            return TestResult::Fail("actual positive route was not reported");
+        };
+        let mut calls = 0;
+        let reported = iface.wowlan_support_with(|| {
+            calls += 1;
+            Err(Error::Busy)
+        });
+        if reported != Some(expected) || calls != 0 {
+            return TestResult::Fail("temporary transport ownership changed reported capability");
+        }
+        iface.iftype.store(6, Ordering::Release);
+        if iface.wowlan_support_with(|| Ok(true)).is_some() {
+            return TestResult::Fail("station wake profile leaked into monitor mode");
+        }
+        iface.iftype.store(2, Ordering::Release);
+        for (receipt, expected_errno) in [
+            (Err(Error::Busy), -16),
+            (Err(Error::Authority), -1),
+            (Ok(false), -95),
+        ] {
+            if iface.configure_wowlan_with(Some(config.clone()), || receipt) != Err(expected_errno)
+                || iface.wowlan.lock().is_some()
+            {
+                return TestResult::Fail("capability cache authorized stale wake configuration");
+            }
+        }
+        if iface.configure_wowlan_with(Some(config.clone()), || Ok(true)) != Ok(())
+            || *iface.wowlan.lock() != Some(config.clone())
+        {
+            return TestResult::Fail("fresh wake route did not admit host configuration");
+        }
+        iface.sleeping.store(true, Ordering::Release);
+        if iface.configure_wowlan_with(None, || Ok(true)) != Err(-16)
+            || *iface.wowlan.lock() != Some(config)
+        {
+            return TestResult::Fail("sleeping owner allowed a configuration replacement");
+        }
+        iface.sleeping.store(false, Ordering::Release);
+        if iface.configure_wowlan_with(None, || Err(Error::Authority)) != Ok(())
+            || iface.wowlan.lock().is_some()
+        {
+            return TestResult::Fail("host wake configuration could not be cleared without arming");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/mt7921/wowlan",
+        mt76_wow_capability_busy_reporting_does_not_cache_authority
     );
     fn mt76_scan_interface_reports_implemented_profile() -> TestResult {
         let iface = Mt76Iface::new(String::from("wlan7"), radio()).unwrap();

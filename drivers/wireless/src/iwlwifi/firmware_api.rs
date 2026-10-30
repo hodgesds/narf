@@ -8,6 +8,7 @@ pub struct FirmwareApi<'a> {
     pub iml: Option<&'a [u8]>,
     pub pnvm: Option<&'a [u8]>,
     pub commands: &'a [u8],
+    pub bios_commands: Option<&'a [u8]>,
     pub capabilities: [u32; 8],
     pub api_changes: [u32; 8],
     pub phy_config: u32,
@@ -47,8 +48,14 @@ impl<'a> FirmwareApi<'a> {
             }
             48 if data.len() % 4 == 0 => self.commands = data,
             52 if !data.is_empty() => self.iml = Some(data),
+            73 if data.len() % 4 == 0 => {
+                if self.bios_commands.is_some() {
+                    return Err("duplicate firmware BIOS command table");
+                }
+                self.bios_commands = Some(data);
+            }
             74 if !data.is_empty() => self.pnvm = Some(data),
-            22 | 23 | 29 | 30 | 48 | 52 | 74 => return Err("malformed firmware API TLV"),
+            22 | 23 | 29 | 30 | 48 | 52 | 73 | 74 => return Err("malformed firmware API TLV"),
             _ => return Ok(false),
         }
         Ok(true)
@@ -66,5 +73,19 @@ impl<'a> FirmwareApi<'a> {
             .chunks_exact(4)
             .find(|entry| entry[0] == command && entry[1] == group)
             .map(|entry| (entry[2], entry[3]))
+    }
+
+    /// TLV73's source-specific supported BIOS revision. Missing metadata,
+    /// command or source uses Linux's caller-provided revision fallback.
+    pub fn bios_revision(&self, source: u8, group: u8, command: u8, default: u8) -> u8 {
+        if !matches!(source, 1 | 2) {
+            return default;
+        }
+        let group = if group == 0 { 1 } else { group };
+        self.bios_commands
+            .unwrap_or(&[])
+            .chunks_exact(4)
+            .find(|entry| entry[0] == command && entry[1] == group)
+            .map_or(default, |entry| entry[usize::from(source) + 1])
     }
 }

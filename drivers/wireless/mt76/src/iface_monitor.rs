@@ -16,6 +16,9 @@ impl Mt76Iface {
             return Err(WirelessError::NotSupported);
         }
         let _control = self.control.try_lock().ok_or(WirelessError::Busy)?;
+        if self.sleeping.load(Ordering::Acquire) {
+            return Err(WirelessError::Busy);
+        }
         let entry = narf_net::iface::lookup(&self.name).ok_or(WirelessError::HardwareError)?;
         if entry.link_up
             || entry.carrier
@@ -32,6 +35,7 @@ impl Mt76Iface {
         };
         narf_net::iface::set_link_layer(&self.name, layer).map_err(|_| WirelessError::Busy)?;
         self.iftype.store(iftype, Ordering::Release);
+        self.wowlan.lock().take();
         self.scan_cache.lock().clear();
         Ok(())
     }
@@ -40,6 +44,9 @@ impl Mt76Iface {
         channel: narf_wireless::monitor::Channel,
     ) -> Result<(), WirelessError> {
         let _control = self.control.try_lock().ok_or(WirelessError::Busy)?;
+        if self.sleeping.load(Ordering::Acquire) {
+            return Err(WirelessError::Busy);
+        }
         let entry = narf_net::iface::lookup(&self.name).ok_or(WirelessError::HardwareError)?;
         if self.current_iftype() != 6 {
             return Err(WirelessError::NotSupported);

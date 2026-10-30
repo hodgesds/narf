@@ -61,6 +61,7 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
             },
             hw_amsdu: false,
             sequence_reset: SequenceReset::None,
+            wake: wake::Wake::default(),
         },
     ))
 }

@@ -3,7 +3,7 @@
 //! map is bound to its host country and already-programmed span/ceiling;
 //! it is never a replacement for SAR or measured platform qualification.
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI8, Ordering};
 use narf_wireless::reg::RegulatoryDomain;
 
 #[derive(Clone)]
@@ -78,6 +78,13 @@ pub(super) enum Authority {
     Station(Fence),
 }
 impl Authority {
+    pub fn domain(&self) -> Result<Arc<RegulatoryDomain>, &'static str> {
+        self.check()?;
+        match self {
+            Self::Transaction(t) => Ok(t.initial.clone()),
+            Self::Station(f) => f.source.snapshot(),
+        }
+    }
     pub fn check(&self) -> Result<(), &'static str> {
         match self {
             Self::Transaction(t) => t.check(),
@@ -105,7 +112,7 @@ pub(super) struct Program {
     pub primary: u8,
     width: u8,
     center: u8,
-    applied_dbm: i8,
+    applied_dbm: Arc<AtomicI8>,
     qos: Option<super::qos::Parameters>,
 }
 impl Program {
@@ -127,11 +134,33 @@ impl Program {
             primary,
             width,
             center,
-            applied_dbm,
+            applied_dbm: Arc::new(AtomicI8::new(applied_dbm)),
             qos,
         };
         program.check(domain)?;
         Ok(program)
+    }
+    pub fn power(&self) -> i8 {
+        self.applied_dbm.load(Ordering::Acquire)
+    }
+    pub fn ceiling(&self, domain: &RegulatoryDomain) -> Result<i8, &'static str> {
+        self.check(domain)?;
+        super::connection::channel_power_width(
+            domain,
+            self.primary,
+            self.width,
+            self.center,
+            &self.firmware.channels,
+        )
+        .ok_or("Intel current policy has no station power ceiling")
+    }
+    /// A planned increase is part of every copied proof before publication.
+    /// Decreases become visible only after their native receipt completes.
+    pub fn reserve_power(&self, power: i8) {
+        self.applied_dbm.fetch_max(power, Ordering::AcqRel);
+    }
+    pub fn commit_power(&self, power: i8) {
+        self.applied_dbm.store(power, Ordering::Release);
     }
     fn check(&self, domain: &RegulatoryDomain) -> Result<(), &'static str> {
         self.validity.check()?;
@@ -144,7 +173,7 @@ impl Program {
                 self.center,
                 &self.firmware.channels,
             )
-            .is_none_or(|ceiling| ceiling < self.applied_dbm)
+            .is_none_or(|ceiling| ceiling < self.power())
             || self.firmware.country != *b"00"
                 && !self.firmware.country.iter().all(u8::is_ascii_uppercase)
             || self

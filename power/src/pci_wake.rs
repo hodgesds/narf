@@ -22,7 +22,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::Power;
 
-static AUTHORITY: IrqSafeSpinLock<Option<Cap<Power, Grant>>> = IrqSafeSpinLock::new(None);
+pub(super) static AUTHORITY: IrqSafeSpinLock<Option<Cap<Power, Grant>>> =
+    IrqSafeSpinLock::new(None);
 static QUARANTINED: IrqSafeSpinLock<Vec<Owned>> = IrqSafeSpinLock::new(Vec::new());
 static GPE_HITS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
@@ -59,6 +60,9 @@ impl From<WakeGpeError> for WakeError {
 /// firmware-owned device wake route used while the CPU stays in s2idle.
 pub use crate::system_pm::SystemSleepState as SleepState;
 
+#[path = "pci_wake_state.rs"]
+mod device_state;
+
 impl SleepState {
     fn number(self) -> u8 {
         match self {
@@ -71,6 +75,7 @@ impl SleepState {
 #[derive(Clone, Debug)]
 struct Route {
     path: String,
+    endpoint_path: Option<String>,
     gpe: u32,
     deepest_sleep: u8,
 }
@@ -105,7 +110,18 @@ pub struct WakeEvidence {
     pub endpoint_pme_pending: bool,
 }
 
-struct PowerOp<F>(F);
+pub(super) struct PowerOp<F>(pub(super) F);
+pub(super) struct EndpointOp<F>(pub(super) F);
+
+impl<F, R> CapOp<BusDeviceCap, Write> for EndpointOp<F>
+where
+    F: FnOnce() -> R,
+{
+    type Output = R;
+    fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<R, CapError> {
+        Ok((self.0)())
+    }
+}
 
 impl<F, R> CapOp<Power, Grant> for PowerOp<F>
 where
@@ -127,16 +143,25 @@ pub fn install_authority(cap: &Cap<Power, Grant>) -> Result<(), WakeError> {
     Ok(())
 }
 
-trait Namespace {
+pub(super) fn delegated_authority() -> Result<Cap<Power, Grant>, WakeError> {
+    (*AUTHORITY.lock()).ok_or(WakeError::Authority)
+}
+
+pub(super) trait Namespace {
     fn devices(&self) -> Vec<String>;
+    fn exists(&self, path: &str) -> bool;
     fn object(&self, path: &str) -> Result<Option<Value>, WakeError>;
 }
 
-struct Aml;
+pub(super) struct Aml;
 
 impl Namespace for Aml {
     fn devices(&self) -> Vec<String> {
         narf_aml::list_all_device_paths()
+    }
+
+    fn exists(&self, path: &str) -> bool {
+        narf_aml::find_node(path).is_some()
     }
 
     fn object(&self, path: &str) -> Result<Option<Value>, WakeError> {
@@ -191,12 +216,17 @@ fn present(ns: &impl Namespace, path: &str) -> Result<bool, WakeError> {
 /// Hops are root-port/root-bus devfn first and endpoint last. If firmware
 /// omits an endpoint node, only an exactly matched ancestor's _PRW may be
 /// used. A same-named node in another scope never supplies a route.
-fn discover_route(
+pub(super) struct Matched {
+    pub(super) chain: Vec<String>,
+    pub(super) exact_endpoint: Option<String>,
+}
+
+pub(super) fn match_namespace(
     ns: &impl Namespace,
     segment: u16,
     root_bus: u8,
     hops: &[u8],
-) -> Result<Route, WakeError> {
+) -> Result<Matched, WakeError> {
     if hops.is_empty() || hops.len() > 256 {
         return Err(WakeError::Unsupported);
     }
@@ -218,7 +248,12 @@ fn discover_route(
     }
     let mut matched = match roots.as_slice() {
         [root] => alloc::vec![root.clone()],
-        [] => return Err(WakeError::Unsupported),
+        [] => {
+            return Ok(Matched {
+                chain: Vec::new(),
+                exact_endpoint: None,
+            });
+        }
         _ => return Err(WakeError::Ambiguous),
     };
     for &devfn in hops {
@@ -246,10 +281,26 @@ fn discover_route(
             _ => return Err(WakeError::Ambiguous),
         }
     }
+    let exact_endpoint = (matched.len() == hops.len() + 1)
+        .then(|| matched.last().cloned())
+        .flatten();
+    Ok(Matched {
+        chain: matched,
+        exact_endpoint,
+    })
+}
+
+fn discover_route(
+    ns: &impl Namespace,
+    segment: u16,
+    root_bus: u8,
+    hops: &[u8],
+) -> Result<Route, WakeError> {
+    let matched = match_namespace(ns, segment, root_bus, hops)?;
     // Linux acpi_pci_propagate_wakeup also permits the actual host bridge's
     // _PRW after walking upstream bridges. Its exact _SEG/_BBN binds that
     // fallback to this endpoint's real PCI root, without a guessed devfn.
-    for path in matched.into_iter().rev() {
+    for path in matched.chain.into_iter().rev() {
         let Some(prw) = object(ns, &path, "_PRW")? else {
             continue;
         };
@@ -267,6 +318,7 @@ fn discover_route(
         }
         return Ok(Route {
             path,
+            endpoint_path: matched.exact_endpoint,
             gpe: *gpe as u32,
             deepest_sleep: *deepest as u8,
         });
@@ -274,7 +326,7 @@ fn discover_route(
     Err(WakeError::Unsupported)
 }
 
-struct Topology<'a>(&'a BusDevice);
+pub(super) struct Topology<'a>(pub(super) &'a BusDevice);
 
 impl CapOp<BusDeviceCap, Write> for Topology<'_> {
     type Output = Result<(u16, u8, Vec<u8>), WakeError>;
@@ -351,18 +403,21 @@ fn set_firmware_wake(route: &Route, enable: bool, sleep: u8, device: u8) -> Resu
 }
 
 impl PciWake {
-    /// Resolve a real platform route without changing hardware. This is
-    /// unavailable until platform composition delegates its Power grant.
+    /// Resolve firmware objects inside the delegated Power operation,
+    /// deferring explicit PME/GPE arming. Metadata methods may have effects.
     pub fn discover(
         endpoint: &Cap<BusDeviceCap, Write>,
         device: BusDevice,
     ) -> Result<Self, WakeError> {
-        let platform = (*AUTHORITY.lock()).ok_or(WakeError::Authority)?;
+        let platform = delegated_authority()?;
         let (segment, root_bus, hops) = endpoint.invoke(Topology(&device))??;
         let read: Cap<BusDeviceCap, Read> = endpoint.derive()?;
         pme::status(&read, &device)?;
-        let route =
-            platform.invoke(PowerOp(|| discover_route(&Aml, segment, root_bus, &hops)))??;
+        // Topology/config observation does not grant later AML execution.
+        // Recheck the endpoint at matching entry as well as platform Power.
+        let route = endpoint.invoke(EndpointOp(|| {
+            platform.invoke(PowerOp(|| discover_route(&Aml, segment, root_bus, &hops)))?
+        }))??;
         if narf_acpi::sci_vector().is_none() || !narf_acpi::gpe_wake::supported(route.gpe) {
             return Err(WakeError::Unsupported);
         }
@@ -381,7 +436,26 @@ impl PciWake {
         })
     }
 
+    /// Validate this endpoint's actual power policy before choosing a
+    /// D-state. Ancestor _PRW routing never supplies child _SxD/_SxW.
+    pub fn admits(&self, sleep: SleepState, state: WakeState) -> Result<(), WakeError> {
+        let owned = self.owned.as_ref().ok_or(WakeError::Busy)?;
+        if sleep.number() > owned.route.deepest_sleep || state == WakeState::D3Cold {
+            return Err(WakeError::Unsupported);
+        }
+        owned.platform.invoke(PowerOp(|| {
+            let read: Cap<BusDeviceCap, Read> = owned.endpoint.derive()?;
+            if !pme::status(&read, &owned.device)?.supports(state) {
+                return Err(WakeError::Pme(PmeError::Unsupported));
+            }
+            owned.endpoint.invoke(EndpointOp(|| {
+                device_state::admit(&Aml, owned.route.endpoint_path.as_deref(), sleep, state)
+            }))?
+        }))?
+    }
+
     pub fn arm(&mut self, sleep: SleepState, state: WakeState) -> Result<(), WakeError> {
+        self.admits(sleep, state)?;
         let owned = self.owned.as_mut().ok_or(WakeError::Busy)?;
         if owned.gpe.is_some() || owned.firmware || owned.endpoint_armed {
             return Err(WakeError::Busy);
@@ -444,6 +518,15 @@ impl PciWake {
 
     pub fn armed(&self) -> bool {
         self.owned.as_ref().is_some_and(|owned| owned.ready)
+    }
+
+    /// Retain actual ownership without hardware I/O when a device's power
+    /// transition cannot be settled by a synchronous Drop. This consumes
+    /// the owner and grants no authority or successful cleanup receipt.
+    pub fn quarantine(mut self) {
+        if let Some(owned) = self.owned.take() {
+            QUARANTINED.lock().push(owned);
+        }
     }
 }
 

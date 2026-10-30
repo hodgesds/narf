@@ -1,0 +1,269 @@
+//! MLD station security negotiation and native key/PMF wire facts.
+//! Admission follows the shared supplicant plan; key flags follow Linux
+//! `mld/key.c::iwl_mld_get_key_flags`, SEC_KEY_CMD v1 and STA_CONFIG v2.
+use super::{
+    boot_context::{put32, put64},
+    connection::{AuthMethod, Beacon},
+    ht_vht::Local,
+    scan_api, security,
+};
+use alloc::vec::Vec;
+use narf_wireless::association::{
+    phy::{HtGi, HtWidth, LocalHt, LocalPhy, LocalVht},
+    AkmSet, Bss, JoinOptions, JoinPlan, Pmf, SaeJoin, SaePwe, SecurityMode,
+};
+use zeroize::Zeroizing;
+
+pub(super) struct Profile {
+    pub akm: Option<security::Akm>,
+    pub pmf: bool,
+    pub rsne: Option<Vec<u8>>,
+    pub sae: Option<SaeJoin>,
+}
+
+/// Retired material cannot return with reset replay/nonce state during this
+/// connection owner. Like shared station_security::Security, exhaustion is
+/// terminal instead of evicting evidence. Fingerprints retain no raw keys.
+#[derive(Default)]
+pub(super) struct KeyHistory {
+    digests: Vec<[u8; 32]>,
+}
+impl KeyHistory {
+    pub fn reserve(&mut self, candidates: [Option<&[u8; 16]>; 3]) -> Result<(), &'static str> {
+        let mut fresh = [[0; 32]; 3];
+        let mut count = 0;
+        for material in candidates.into_iter().flatten() {
+            let mut hash = narf_crypto::sha256::Sha256::new();
+            hash.update(material);
+            let digest = hash.finalize();
+            if self.digests.contains(&digest) || fresh[..count].contains(&digest) {
+                return Err("MLD retired/cross-role key material cannot restart packet numbers");
+            }
+            fresh[count] = digest;
+            count += 1;
+        }
+        if self.digests.len() + count > 16 {
+            return Err("MLD connection key history exhausted");
+        }
+        self.digests
+            .try_reserve(count)
+            .map_err(|_| "MLD connection key history allocation failed")?;
+        // Reserve before any REMOVE/ADD can become device-visible. A failed
+        // or cancelled installation must not become a same-owner retry.
+        self.digests.extend_from_slice(&fresh[..count]);
+        Ok(())
+    }
+}
+
+fn local_phy(local: Local, channel: u8) -> Result<Option<LocalPhy>, &'static str> {
+    if !local.ht {
+        return Ok(None);
+    }
+    if !(1..=2).contains(&local.rx_streams) || !(1..=2).contains(&local.tx_streams) {
+        return Err("MLD security plan has no native PHY streams");
+    }
+    let mut rx = [0; 10];
+    let mut tx = [0; 10];
+    rx[..usize::from(local.rx_streams)].fill(255);
+    tx[..usize::from(local.tx_streams)].fill(255);
+    let ht = LocalHt::new(
+        rx,
+        tx,
+        HtWidth::TwentyForty,
+        HtGi {
+            rx20: true,
+            tx20: true,
+            rx40: true,
+            tx40: true,
+        },
+        3,
+        4,
+    )
+    .map_err(|_| "MLD local security HT profile invalid")?;
+    let phy = if local.vht && channel > 14 {
+        let map = |streams| {
+            let mut map = u16::MAX;
+            for stream in 0..streams {
+                map = (map & !(3 << (2 * stream))) | (2 << (2 * stream));
+            }
+            map
+        };
+        let vht = LocalVht::new(map(local.rx_streams), map(local.tx_streams), true, true, 3)
+            .map_err(|_| "MLD local security VHT profile invalid")?;
+        LocalPhy::vht80(ht, vht)
+    } else {
+        LocalPhy::ht40(ht)
+    };
+    phy.map(Some)
+        .map_err(|_| "MLD local security PHY profile invalid")
+}
+
+impl Profile {
+    pub fn negotiate(
+        beacon: &Beacon,
+        own: [u8; 6],
+        auth: &AuthMethod,
+        local: Local,
+    ) -> Result<Self, &'static str> {
+        let mode = match auth {
+            AuthMethod::Open => {
+                if beacon.privacy {
+                    return Err("secured AP requested as open");
+                }
+                return Ok(Self {
+                    akm: None,
+                    pmf: false,
+                    rsne: None,
+                    sae: None,
+                });
+            }
+            AuthMethod::Wpa2Psk(_) => SecurityMode::Wpa2Psk,
+            AuthMethod::Wpa3Sae { .. } => SecurityMode::Wpa3Sae { pwe: SaePwe::Both },
+        };
+        let bss = Bss {
+            bssid: beacon.bssid,
+            ssid: beacon.ssid.clone(),
+            channel: beacon.channel,
+            band: None,
+            signal_dbm: None,
+            capability: beacon.capabilities,
+            beacon_interval: beacon.interval,
+            information_elements: beacon.information_elements.clone(),
+        };
+        // Preserve the legacy no-PMF offer when the peer cannot negotiate
+        // it, like the Gen2 station owner. An MFPC AP enables optional PMF;
+        // MFPR is then admitted only with a usable BIP-CMAC-128 profile.
+        let peer_mfpc = beacon
+            .rsn
+            .as_deref()
+            .and_then(narf_wireless::rsn::RsnIe::decode_body)
+            .is_some_and(|rsn| rsn.rsn_capabilities & narf_wireless::rsn::RSN_CAP_MFP_CAPABLE != 0);
+        let plan = JoinPlan::prepare_with_options(
+            &bss,
+            own,
+            &beacon.ssid,
+            mode,
+            local_phy(local, beacon.channel)?,
+            JoinOptions::default()
+                .with_akms(AkmSet::ALL)
+                .with_pmf(if peer_mfpc {
+                    Pmf::Optional
+                } else {
+                    Pmf::Disabled
+                }),
+        )
+        .map_err(|_| "unsupported MLD station security offer")?;
+        use narf_wireless::eapol::KeyMgmt;
+        let akm = match plan.akm() {
+            Some(KeyMgmt::Psk) => security::Akm::Wpa2Psk,
+            Some(KeyMgmt::PskSha256) => security::Akm::Wpa2PskSha256,
+            Some(KeyMgmt::Sae) => security::Akm::Wpa3Sae,
+            Some(KeyMgmt::SaeExtKey) => security::Akm::Wpa3SaeExtKey,
+            _ => return Err("unsupported MLD negotiated key hierarchy"),
+        };
+        Ok(Self {
+            akm: Some(akm),
+            pmf: plan.pmf(),
+            rsne: plan.rsn_body(),
+            sae: plan.sae().cloned(),
+        })
+    }
+
+    /// Optional response RSNEs cannot silently change the negotiated AKM,
+    /// cipher or PMF facts. SAE responses may omit the SAE PMKID.
+    pub fn check_response(&self, mut ies: &[u8]) -> Result<(), &'static str> {
+        let mut seen = false;
+        while !ies.is_empty() {
+            if ies.len() < 2 || usize::from(ies[1]) > ies.len() - 2 {
+                return Err("truncated MLD association-response IE");
+            }
+            let end = 2 + usize::from(ies[1]);
+            if ies[0] == 48 {
+                if seen {
+                    return Err("duplicate MLD association-response RSNE");
+                }
+                seen = true;
+                let got = narf_wireless::rsn::RsnIe::decode_body(&ies[2..end])
+                    .ok_or("invalid MLD association-response RSNE")?;
+                let expected = self
+                    .rsne
+                    .as_deref()
+                    .and_then(narf_wireless::rsn::RsnIe::decode_body);
+                let no_pmkid = self
+                    .sae
+                    .as_ref()
+                    .and_then(|s| narf_wireless::rsn::RsnIe::decode_body(&s.station_rsne(None)));
+                if expected.as_ref() != Some(&got) && no_pmkid.as_ref() != Some(&got) {
+                    return Err("MLD response changed the negotiated security profile");
+                }
+            }
+            ies = &ies[end..];
+        }
+        Ok(())
+    }
+}
+
+/// ADD/REMOVE SEC_KEY_CMD v1. CMAC IGTKs use the CCMP cipher selector;
+/// only pairwise PMF keys and IGTKs get MFP, while station group keys get
+/// NO_TX. RX sequence is the authenticated KDE replay floor (offset64).
+pub(super) fn key_command(
+    id: u8,
+    group: bool,
+    pmf: bool,
+    key: Option<&[u8; 16]>,
+    rx_pn: u64,
+) -> Result<Zeroizing<[u8; 80]>, &'static str> {
+    if (group && id > 5) || (!group && id != 0) || rx_pn >= 1 << 48 {
+        return Err("invalid MLD native key identity/PN");
+    }
+    let igtk = group && id >= 4;
+    let mut body = Zeroizing::new([0; 80]);
+    put32(&mut body[..], 0, if key.is_some() { 1 } else { 3 });
+    put32(&mut body[..], 4, 1);
+    put32(&mut body[..], 8, u32::from(id));
+    put32(
+        &mut body[..],
+        12,
+        2 | if group { 0x48 } else { 0 } | if igtk || (!group && pmf) { 0x20 } else { 0 },
+    );
+    if let Some(key) = key {
+        body[16..32].copy_from_slice(key);
+        put64(&mut body[..], 64, rx_pn);
+    }
+    Ok(body)
+}
+
+/// Validate firmware's unicast CCMP integrity result and the management
+/// replay domain before exposing a robust frame's decrypted body. It is
+/// separate from all data-TID PN counters (mac80211 NUM_TIDS).
+pub(super) fn robust_unicast_body<'a>(
+    mpdu: &scan_api::Mpdu<'a>,
+    protected_required: bool,
+    management_pn: &mut u64,
+) -> Option<&'a [u8]> {
+    let f = mpdu.frame;
+    if f.len() < 24 || f[1] & 0x87 != 0 || f[22] & 15 != 0 || mpdu.amsdu {
+        return None;
+    }
+    if !protected_required {
+        return (f[1] & 0x40 == 0).then(|| mpdu.body(24, 0)).flatten();
+    }
+    // MLD v3 status: CCM=2<<8, MIC_OK=bit6, REPLAY_ERROR=bit7.
+    // Linux iwl_mld_rx_crypto uses CCM+MIC rather than DEC_DONE. When
+    // firmware supplied a station lookup, it must refer to our station0;
+    // otherwise the caller's exact AP MAC binding is the lookup fallback.
+    if f[1] & 0x40 == 0
+        || mpdu.status & 0x7c0 != 0x240
+        || mpdu.status & 4 != 0 && mpdu.status & 0x1f000000 != 0
+    {
+        return None;
+    }
+    let iv = f.get(24..32).filter(|iv| iv[3] == 0x20)?;
+    let pn = u64::from_le_bytes([iv[0], iv[1], iv[4], iv[5], iv[6], iv[7], 0, 0]);
+    if pn <= *management_pn {
+        return None;
+    }
+    let body = mpdu.body(24, 8)?;
+    *management_pn = pn;
+    Some(body)
+}

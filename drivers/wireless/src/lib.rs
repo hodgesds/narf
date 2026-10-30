@@ -35,8 +35,15 @@ struct Mt76SystemPm;
 
 impl narf_power::system_pm::AsyncSystemPm for Mt76SystemPm {
     fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
-        alloc::boxed::Box::pin(async {
-            mt76::iface::system_prepare_suspend()
+        self.prepare_suspend_target(narf_power::system_pm::SystemSleepState::S3)
+    }
+
+    fn prepare_suspend_target<'a>(
+        &'a self,
+        target: narf_power::system_pm::SystemSleepState,
+    ) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async move {
+            mt76::iface::system_prepare_suspend_for(target)
                 .await
                 .map_err(|error| match error {
                     narf_wireless::WirelessError::Busy | narf_wireless::WirelessError::Timeout => {
@@ -64,8 +71,7 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "mt76", || {
         mt76::register();
-        // The mt76 crate does not depend on narf-power; its async system-PM
-        // phases are bridged here (Linux mt7921_pm_ops).
+        // Actual S0Idle/S3 targets reach the retained mt76 wake owner.
         narf_power::system_pm::register_async_system_pm(
             "mt76",
             alloc::sync::Arc::new(Mt76SystemPm),

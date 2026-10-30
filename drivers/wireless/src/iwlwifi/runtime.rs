@@ -593,6 +593,8 @@ pub struct Hardware {
     responses: alloc::collections::VecDeque<Packet>,
     tx_completed: alloc::collections::VecDeque<(u16, u16, bool)>,
     versions: Vec<u8>,
+    bios_versions: Vec<u8>,
+    platform_power: platform_power::State,
     armed: bool,
     failed: bool,
     station_stop: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
@@ -694,6 +696,8 @@ impl Hardware {
             responses: alloc::collections::VecDeque::new(),
             tx_completed: alloc::collections::VecDeque::new(),
             versions: parsed.api.commands.to_vec(),
+            bios_versions: parsed.api.bios_commands.unwrap_or(&[]).to_vec(),
+            platform_power: platform_power::State::default(),
             armed: false,
             failed: false,
             station_stop: None,
@@ -1478,6 +1482,7 @@ impl Hardware {
             core::mem::ManuallyDrop::drop(&mut self.resources);
         }
         self.resources = core::mem::ManuallyDrop::new(resources);
+        self.platform_power = platform_power::State::default();
         self.rx_epoch.reset_after_dma_stop();
         self.armed = false;
         self.failed = false;
@@ -1896,6 +1901,9 @@ pub(super) mod rx_epoch;
 
 #[path = "runtime_source.rs"]
 pub(super) mod source;
+
+#[path = "runtime_mld_power.rs"]
+mod platform_power;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "runtime_stop_tests.rs"]

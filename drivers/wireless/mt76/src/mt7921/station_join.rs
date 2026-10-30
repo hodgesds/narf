@@ -13,6 +13,9 @@ use alloc::{collections::VecDeque, vec, vec::Vec};
 use narf_wireless::eapol::{EapolRx, EapolRxError, Gtk, RsnaParams, Supplicant};
 use zeroize::{Zeroize, Zeroizing};
 
+#[path = "wowlan_security.rs"]
+mod wowlan;
+
 /// Association-owned RSNA state. Key bytes are never included in driver
 /// diagnostics. Keeping the same supplicant across RX permits PTK/GTK rekeys
 /// and preserves its key-reinstallation and EAPOL replay checks.
@@ -714,6 +717,10 @@ impl<B: Backend> Session<B> {
         associated: State,
     ) -> Result<(), Error> {
         self.service_keys_in(associated, State::Running(Stage::ScanWait))
+            .await
+    }
+    pub(super) async fn service_keys_during_wow(&mut self, associated: State) -> Result<(), Error> {
+        self.service_keys_in(associated, State::Running(Stage::WowSuspend))
             .await
     }
     async fn service_keys_in(&mut self, associated: State, restore: State) -> Result<(), Error> {

@@ -1764,7 +1764,7 @@ fn wowlan_handle(
         SET_WOWLAN => {
             let _admin = authority(&context, iface.as_ref())?;
             let config = attr(&attrs, ATTR_WOWLAN_TRIGGERS)
-                .map(|raw| parse_wowlan(raw, support))
+                .map(|raw| parse_wowlan(raw, support, iface.wowlan_net_detect_limits()))
                 .transpose()?;
             iface.set_wowlan(config)?;
             Ok(Vec::new())
@@ -1776,7 +1776,11 @@ fn wowlan_handle(
 /// Parse `NL80211_ATTR_WOWLAN_TRIGGERS` using the exact trigger subset
 /// ath11k advertises.  Unsupported known triggers fail like cfg80211;
 /// unknown future attributes remain ignored by the deprecated Linux parser.
-fn parse_wowlan(raw: &[u8], support: crate::WowlanSupport) -> Result<crate::WowlanConfig, i32> {
+fn parse_wowlan(
+    raw: &[u8],
+    support: crate::WowlanSupport,
+    net_detect_limits: Option<crate::SchedScanSupport>,
+) -> Result<crate::WowlanConfig, i32> {
     const ANY: u16 = 1;
     const DISCONNECT: u16 = 2;
     const MAGIC_PACKET: u16 = 3;
@@ -1837,7 +1841,7 @@ fn parse_wowlan(raw: &[u8], support: crate::WowlanSupport) -> Result<crate::Wowl
                 }
             }
             NET_DETECT => {
-                config.net_detect = Some(parse_net_detect(value, support)?);
+                config.net_detect = Some(parse_net_detect(value, support, net_detect_limits)?);
             }
             // Linux sees these as requests for capabilities ath11k does not
             // advertise, hence -EINVAL rather than silently accepting them.
@@ -1855,18 +1859,14 @@ fn parse_wowlan(raw: &[u8], support: crate::WowlanSupport) -> Result<crate::Wowl
 fn parse_net_detect(
     raw: &[u8],
     support: crate::WowlanSupport,
+    limits: Option<crate::SchedScanSupport>,
 ) -> Result<crate::NetDetectConfig, i32> {
     if support.net_detect_max_match_sets == 0 {
         return Err(EOPNOTSUPP);
     }
-    // Linux ath11k advertises the PNO 512-byte probe-IE limit even though
-    // this WMI layout only has an IE bitmap; retain the bytes for
-    // GET_WOWLAN like cfg80211 does.
-    let limits = crate::SchedScanSupport {
-        max_match_sets: support.net_detect_max_match_sets,
-        random_mac: support.net_detect_random_mac,
-        ..crate::SchedScanSupport::NET_DETECT
-    };
+    let mut limits = limits.ok_or(EOPNOTSUPP)?;
+    limits.max_match_sets = limits.max_match_sets.min(support.net_detect_max_match_sets);
+    limits.random_mac &= support.net_detect_random_mac;
     parse_sched_scan(&attributes(raw)?, limits, &[])
 }
 

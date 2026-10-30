@@ -13,6 +13,14 @@ use narf_wifi_fixtures::{udp_ipv4, ApPhase, DhcpServer, FakeAp, NetworkPlan};
 #[path = "sc_source_tests.rs"]
 mod source_tests;
 
+#[cfg(feature = "kernel-test")]
+#[path = "sc_power_tests.rs"]
+mod power_tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "sc_security_tests.rs"]
+mod security_tests;
+
 type R<T = ()> = Result<T, &'static str>;
 const OWN: [u8; 6] = [2, 0x71, 2, 3, 4, 5];
 const AP: [u8; 6] = [2, 0x72, 2, 3, 4, 5];
@@ -50,6 +58,9 @@ enum Fault {
     HoldRxFence,
     HoldGroupReply,
     HoldScan,
+    HoldPower,
+    HoldIgtk,
+    WrongSaeSelector,
 }
 
 struct Wire {
@@ -76,6 +87,13 @@ struct Wire {
     held_rx: Option<u32>,
     m4: bool,
     error: Option<&'static str>,
+    power_expectation: Option<i16>,
+    security_fault_applied: bool,
+    sa_query_reply: Option<[u8; 4]>,
+    sae_h2e_only: bool,
+    group_replay: u64,
+    igtk_expected: Option<([u8; 16], u16, u64)>,
+    gtk_expected: Option<(u8, [u8; 16])>,
 }
 
 // SAFETY: no real device or thread accesses these fixture pointers. The sole
@@ -237,19 +255,63 @@ impl Wire {
             }
             (5, 0x18) => {
                 require(
-                    version == 1 && body.len() == 80 && word(body, 0) == 1 && word(body, 4) == 1,
+                    version == 1 && body.len() == 80 && word(body, 4) == 1,
                     "Sc native key command",
                 )?;
+                if word(body, 0) == 3 {
+                    require(
+                        self.ap.pmf()
+                            && ((word(body, 12) == 0x6a && (4..=5).contains(&word(body, 8)))
+                                || (self.gtk_expected.is_some()
+                                    && word(body, 12) == 0x4a
+                                    && word(body, 8) <= 3))
+                            && body[16..].iter().all(|b| *b == 0),
+                        "Sc IGTK removal native identity/flags",
+                    )?;
+                    self.firmware.inject(cmd, group, sequence, &[]);
+                    return Ok(());
+                }
+                require(word(body, 0) == 1, "Sc native key action")?;
                 match word(body, 12) {
-                    2 => require(
-                        word(body, 8) == 0 && self.key.as_deref() == Some(&body[16..32]),
+                    2 | 0x22 => require(
+                        word(body, 8) == 0
+                            && word(body, 12) == if self.ap.pmf() { 0x22 } else { 2 }
+                            && self.key.as_deref() == Some(&body[16..32]),
                         "Sc installed PTK differs from AP exchange",
                     )?,
                     0x4a => require(
-                        (word(body, 8) == 1 && body[16..32] == [0x77; 16])
-                            || self.group_rekey && word(body, 8) == 2 && body[16..32] == [0x88; 16],
+                        self.gtk_expected.map_or_else(
+                            || {
+                                (word(body, 8) == 1 && body[16..32] == [0x77; 16])
+                                    || self.group_rekey
+                                        && word(body, 8) == 2
+                                        && body[16..32] == [0x88; 16]
+                            },
+                            |(id, material)| {
+                                word(body, 8) == u32::from(id) && body[16..32] == material
+                            },
+                        ),
                         "Sc installed GTK differs from M3",
                     )?,
+                    0x6a => {
+                        let (material, id) = self
+                            .igtk_expected
+                            .map(|(material, id, _)| (material, id))
+                            .or_else(|| self.ap.igtk())
+                            .ok_or("Sc installed unnegotiated IGTK")?;
+                        require(
+                            word(body, 8) == u32::from(id)
+                                && body[16..32] == material
+                                && self
+                                    .igtk_expected
+                                    .is_none_or(|(_, _, pn)| body[64..72] == pn.to_le_bytes()),
+                            "Sc native IGTK differs from authenticated M3",
+                        )?;
+                        if self.fault == Fault::HoldIgtk {
+                            self.held = Some((cmd, group, sequence));
+                            return Ok(());
+                        }
+                    }
                     _ => return Err("Sc key flags"),
                 }
                 self.keys += 1;
@@ -265,10 +327,17 @@ impl Wire {
             (3, 9) => require(body.len() == 208 && body[16..22] == OWN, "Sc LINK identity")?,
             (3, 10) => require(body.len() == 104 && body[8..14] == AP, "Sc peer identity")?,
             (1, 8) => require(body.len() == 32 && word(body, 8) == 6, "Sc PHY channel")?,
-            (1, 0x9f) => require(
-                body.len() == 108 && half(body, 8) == 136,
-                "Sc TX power policy ceiling",
-            )?,
+            (1, 0x9f) => {
+                require(
+                    body.len() == 108
+                        && half(body, 8) == self.power_expectation.unwrap_or(136) as u16,
+                    "Sc TX power policy ceiling",
+                )?;
+                if self.fault == Fault::HoldPower {
+                    self.held = Some((cmd, group, sequence));
+                    return Ok(());
+                }
+            }
             (5, 0xf) => require(body.len() == 44, "Sc TLC ABI")?,
             (3, 0xc) => require(
                 body == [0; 4] && self.queues.iter().all(|q| !q.2),
@@ -321,7 +390,13 @@ impl Wire {
                 &[0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
             );
         } else if (group, cmd) == (1, 0xd) {
-            self.mpdu(&self.ap.beacon(), false);
+            let mut beacon = self.ap.beacon();
+            if self.sae_h2e_only {
+                // Actual BSS membership selector123; the AP's RSNXE and
+                // SAE Commit must independently confirm H2E.
+                beacon.extend_from_slice(&[50, 1, 0xfb]);
+            }
+            self.mpdu(&beacon, false);
             let mut done = [0; 16];
             done[..4].copy_from_slice(&body[..4]);
             done[6] = 1;
@@ -380,7 +455,7 @@ impl Wire {
                 require(
                     protected
                         && reply.key_information == 0x302
-                        && reply.replay_counter == 3
+                        && reply.replay_counter == self.group_replay
                         && reply.key_data.is_empty()
                         && reply.key_mic.as_slice()
                             == super::super::handshake::compute_mic(
@@ -394,6 +469,12 @@ impl Wire {
                     self.held_tx = Some((p.queue, p.pointer));
                     return Ok(());
                 }
+            } else if frame[0] == 0xd0 && self.ap.pmf() {
+                require(
+                    protected && frame.get(24..26) == Some(&[8, 1]) && frame.len() == 28,
+                    "Sc SA Query response was not natively protected",
+                )?;
+                self.sa_query_reply = Some(frame[24..28].try_into().unwrap());
             } else if frame[0] == 0xa0 {
                 require(
                     self.ap.phase() == ApPhase::Authorized,
@@ -418,16 +499,39 @@ impl Wire {
                     }
                     let m2 =
                         KeyFrame::decode(&frame[header + 12..], 16).ok_or("Sc M2 key frame")?;
-                    let ptk = derive_ptk(&Sha1, &PMK, &AP, &OWN, &ANONCE, &m2.key_nonce, 16);
-                    self.key = Some(ptk.tk.clone());
-                    self.ptk = Some(ptk);
+                    if matches!(
+                        self.ap.akm(),
+                        None | Some(narf_wireless::eapol::KeyMgmt::Psk)
+                    ) {
+                        let ptk = derive_ptk(&Sha1, &PMK, &AP, &OWN, &ANONCE, &m2.key_nonce, 16);
+                        self.key = Some(ptk.tk.clone());
+                        self.ptk = Some(ptk);
+                    } else {
+                        self.key = Some(
+                            self.ap
+                                .pairwise_tk()
+                                .ok_or("Sc AP did not derive negotiated TK")?
+                                .to_vec(),
+                        );
+                    }
                 }
-                for response in responses {
+                for mut response in responses {
+                    if self.fault == Fault::WrongSaeSelector
+                        && response[0] == 0xb0
+                        && half(&response, 26) == 1
+                        && response.ends_with(&[255, 5, 114, 0, 15, 172, 24])
+                    {
+                        *response.last_mut().unwrap() = 8;
+                        self.security_fault_applied = true;
+                    }
                     self.mpdu(&response, false);
                 }
                 if phase == ApPhase::Message4 {
                     self.m4 = true;
-                    require(self.keys == 2, "Sc M4 before key receipts")?;
+                    require(
+                        self.keys == if self.ap.pmf() { 3 } else { 2 },
+                        "Sc M4 before key receipts",
+                    )?;
                     if self.fault == Fault::HoldM4 {
                         self.held_tx = Some((p.queue, p.pointer));
                         return Ok(());
@@ -438,7 +542,7 @@ impl Wire {
             require(
                 self.ap.phase() == ApPhase::Authorized
                     && protected == self.ap.protected()
-                    && (!protected || self.keys == 2),
+                    && (!protected || self.keys == if self.ap.pmf() { 3 } else { 2 }),
                 "Sc controlled port/protection",
             )?;
             require(
@@ -615,6 +719,13 @@ impl Guard {
             held_rx: None,
             m4: false,
             error: None,
+            power_expectation: None,
+            security_fault_applied: false,
+            sa_query_reply: None,
+            sae_h2e_only: false,
+            group_replay: 3,
+            igtk_expected: None,
+            gtk_expected: None,
         };
         let configured = run(Device::configure(&mut hardware, OWN), || wire.service());
         let nvm = match configured {

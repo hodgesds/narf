@@ -4,6 +4,8 @@
 use super::{station::Command, *};
 #[path = "associated_scan.rs"]
 mod associated;
+#[path = "wowlan_nlo_station.rs"]
+pub(super) mod nlo;
 
 pub use narf_wireless::association::Bss as ScanBss;
 /// Linux MT76_CONNAC_SCAN_IE_LEN; the packed v1 request reserves600 bytes.

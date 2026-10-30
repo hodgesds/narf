@@ -246,6 +246,8 @@ pub(in crate::iwlwifi) fn create_for_format(
         responses: alloc::collections::VecDeque::new(),
         tx_completed: alloc::collections::VecDeque::new(),
         versions: Vec::new(),
+        bios_versions: Vec::new(),
+        platform_power: platform_power::State::default(),
         armed: false,
         failed: false,
         station_stop: None,
@@ -276,6 +278,8 @@ pub(in crate::iwlwifi) unsafe fn destroy(hardware: Hardware) {
         core::ptr::drop_in_place(&mut hardware.responses);
         core::ptr::drop_in_place(&mut hardware.tx_completed);
         core::ptr::drop_in_place(&mut hardware.versions);
+        core::ptr::drop_in_place(&mut hardware.bios_versions);
+        core::ptr::drop_in_place(&mut hardware.platform_power);
     };
 }
 
@@ -318,6 +322,7 @@ pub(in crate::iwlwifi) fn restart(hardware: &mut Hardware) -> Result<(), &'stati
     let mut commands = CommandQueue::new()?;
     commands.trace = trace;
     hardware.resources.commands = commands;
+    hardware.platform_power = platform_power::State::default();
     hardware.resources.data.clear();
     hardware.rx_epoch.reset_after_dma_stop();
     hardware.failed = false;

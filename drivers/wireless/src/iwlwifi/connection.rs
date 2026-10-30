@@ -1,7 +1,7 @@
 //! Station association and controlled-port state for the MLD interface.
 
 use super::{
-    boot_context::{put16, put32, put64},
+    boot_context::{put16, put32},
     frame_api, mlme,
     runtime::Hardware,
     scan_api, security, station_api,
@@ -41,12 +41,18 @@ pub struct Connection {
     phy: super::ht_vht::Negotiated,
     local_phy: super::ht_vht::Local,
     regulatory: super::mld_policy::Program,
+    ap_power_limit: Option<i16>,
+    power_pending: bool,
+    power_inflight: bool,
     rx_ba: [Option<super::aggregation::Window>; super::aggregation::MAX_TIDS],
     actions: VecDeque<Vec<u8>>,
     /// 802.11w IGTK store (BIP-CMAC-128), populated from message 3 on
-    /// WPA3. `mfp_active` gates management-frame protection enforcement.
+    /// negotiated PSK/SAE PMF. `mfp_active` records actual IGTK adoption.
     mfp: narf_wireless::mfp::MfpKeyStore,
     mfp_active: bool,
+    pmf_negotiated: bool,
+    management_pn: u64,
+    key_history: super::sc_security::KeyHistory,
 }
 
 impl core::fmt::Debug for Connection {
@@ -64,6 +70,12 @@ impl Drop for Connection {
         }
         for key in self.group_keys.iter_mut().flatten() {
             key.zeroize();
+        }
+        for key in [&mut self.mfp.active, &mut self.mfp.next]
+            .into_iter()
+            .flatten()
+        {
+            key.key.zeroize();
         }
     }
 }
@@ -121,10 +133,16 @@ impl Connection {
             phy: super::ht_vht::Negotiated::default(),
             local_phy: super::ht_vht::Local::from_nvm(0, 1, 1),
             regulatory: Self::model_policy_program(),
+            ap_power_limit: None,
+            power_pending: false,
+            power_inflight: false,
             rx_ba: core::array::from_fn(|_| None),
             actions: VecDeque::new(),
             mfp: narf_wireless::mfp::MfpKeyStore::new(),
             mfp_active: false,
+            pmf_negotiated: false,
+            management_pn: 0,
+            key_history: super::sc_security::KeyHistory::default(),
         }
     }
     #[cfg(any(test, feature = "kernel-test"))]
@@ -222,43 +240,10 @@ impl Connection {
         // descriptors copied while this port is closed belong to the new key.
         let receive_epoch = hw.close_receive_epoch()?;
         let secure = !matches!(auth, AuthMethod::Open);
-        let akm = match &auth {
-            AuthMethod::Open => None,
-            AuthMethod::Wpa2Psk(_) => Some(security::Akm::Wpa2Psk),
-            AuthMethod::Wpa3Sae { .. } => Some(security::Akm::Wpa3Sae),
-        };
-        if secure {
-            let rsn = narf_wireless::rsn::RsnIe::decode_body(
-                beacon.rsn.as_ref().ok_or("AP has no RSN IE")?,
-            )
-            .ok_or("invalid AP RSN")?;
-            use narf_wireless::rsn::*;
-            let ccmp = Suite::standard(CIPHER_CCMP_128);
-            let ciphers_ok = rsn.group_cipher == ccmp && rsn.pairwise_ciphers.contains(&ccmp);
-            match akm {
-                Some(security::Akm::Wpa3Sae) => {
-                    // WPA3-Personal: AKM-SAE and mandatory management-frame
-                    // protection (the AP must at least be MFP-capable).
-                    if !ciphers_ok
-                        || !rsn.akms.contains(&Suite::standard(AKM_SAE))
-                        || rsn.rsn_capabilities & RSN_CAP_MFP_CAPABLE == 0
-                    {
-                        return Err("AP does not support WPA3-SAE/CCMP with MFP");
-                    }
-                }
-                _ => {
-                    // WPA2-PSK: AKM-PSK, CCMP, and the AP must not require MFP
-                    // (this profile's WPA2 path does not protect mgmt frames).
-                    if !ciphers_ok
-                        || !rsn.akms.contains(&Suite::standard(AKM_PSK))
-                        || rsn.rsn_capabilities & RSN_CAP_MFP_REQUIRED != 0
-                    {
-                        return Err("AP does not support WPA2-PSK/CCMP without required MFP");
-                    }
-                }
-            }
-        } else if beacon.privacy {
-            return Err("secured AP requested as open");
+        let mut profile = super::sc_security::Profile::negotiate(&beacon, local, &auth, local_phy)?;
+        let akm = profile.akm;
+        if secure && hw.version(5, 0x18).map(|v| v.0) != Some(1) {
+            return Err("unsupported MLD security key command");
         }
         // Fail before station firmware changes if secure association cannot
         // obtain an unpredictable SNonce. Open networks do not sample entropy.
@@ -279,10 +264,11 @@ impl Connection {
                     .is_some()
             },
         )?;
-        let rates = super::rates::Rates::parse_for_phy(
+        let rates = super::rates::Rates::parse_for_security(
             &beacon.information_elements,
             beacon.channel,
             phy.mode,
+            profile.sae.as_ref().is_some_and(|join| join.h2e()),
         )?;
         let max_power = channel_power_width(
             domain,
@@ -292,6 +278,12 @@ impl Connection {
             &permissions.channels,
         )
         .ok_or("channel transmission prohibited by host/firmware regulatory policy")?;
+        let ap_power = super::mld_power::ap_limit_in_ies(
+            &beacon.information_elements,
+            beacon.capabilities,
+            beacon.channel,
+        )?;
+        let max_power = ap_power.map_or(max_power, |limit| i16::from(max_power).min(limit) as i8);
         let qos = permissions.limit_qos(domain, beacon.channel, phy.width, phy.center, qos);
         let regulatory = super::mld_policy::Program::new(
             domain,
@@ -303,6 +295,7 @@ impl Connection {
             qos,
             hw.rf_policy_validity()?,
         )?;
+        hw.ensure_platform_power().await?;
         let mut phy_command = station_api::phy(1, beacon.channel);
         phy.apply_phy(&mut phy_command, beacon.channel);
         hw.command(1, 8, &phy_command).await?;
@@ -319,6 +312,12 @@ impl Connection {
         );
         put32(&mut binding, 12, 0);
         hw.command(3, 9, &binding).await?;
+        // Program host/AP power before any active link or autonomous TX.
+        let power = station_api::tx_power(
+            hw.version(1, 0x9f).ok_or("missing TX power command")?.0,
+            max_power,
+        )?;
+        hw.command(1, 0x9f, &power).await?;
         let mut link =
             station_api::link(2, local, true, beacon.channel, beacon.interval, beacon.dtim);
         rates.apply(&mut link);
@@ -337,13 +336,9 @@ impl Connection {
         }
         phy.apply_link(&mut link);
         hw.command(3, 9, &link).await?;
-        let power = station_api::tx_power(
-            hw.version(1, 0x9f).ok_or("missing TX power command")?.0,
-            max_power,
-        )?;
-        hw.command(1, 0x9f, &power).await?;
         let mut peer = station_api::peer(beacon.bssid);
         phy.apply_peer(&mut peer, 0);
+        put32(&mut peer, 36, u32::from(profile.pmf));
         hw.command(3, 0xa, &peer).await?;
         let management_queue = hw.allocate_tx(0, 15).await?;
         let mut data_queues = [None; 4];
@@ -380,10 +375,16 @@ impl Connection {
             phy,
             local_phy,
             regulatory,
+            ap_power_limit: ap_power,
+            power_pending: false,
+            power_inflight: false,
             rx_ba: core::array::from_fn(|_| None),
             actions: VecDeque::new(),
             mfp: narf_wireless::mfp::MfpKeyStore::new(),
             mfp_active: false,
+            pmf_negotiated: profile.pmf,
+            management_pn: 0,
+            key_history: super::sc_security::KeyHistory::default(),
         };
         // Authenticate: open-system auth for Open/WPA2-PSK; the SAE
         // commit/confirm exchange for WPA3, which also yields the PMK.
@@ -401,20 +402,29 @@ impl Connection {
                     _ => None,
                 }
             }
-            AuthMethod::Wpa3Sae { password } => Some(this.sae_authenticate(hw, password).await?),
+            AuthMethod::Wpa3Sae { password } => {
+                let join = profile.sae.as_ref().ok_or("MLD SAE negotiation missing")?;
+                let (pmk, pmkid) = this.sae_authenticate(hw, password, join).await?;
+                profile.rsne = Some(join.station_rsne(Some(pmkid)));
+                Some(pmk)
+            }
         };
         // With the PMK in hand, arm the 4-way handshake session.
         if let (Some(pmk), Some(akm)) = (pmk, akm) {
-            this.security = Some(security::Session::new(
-                akm,
-                pmk,
-                this.beacon.bssid,
-                local,
-                **snonce.as_ref().ok_or("missing secure association nonce")?,
-                this.beacon.rsn.clone().ok_or("AP has no RSN IE")?,
-            ));
+            this.security = Some(
+                security::Session::new(
+                    akm,
+                    pmk,
+                    this.beacon.bssid,
+                    local,
+                    **snonce.as_ref().ok_or("missing secure association nonce")?,
+                    this.beacon.rsn.clone().ok_or("AP has no RSN IE")?,
+                )
+                .with_pmf(profile.pmf)
+                .with_station_rsn(profile.rsne.clone().ok_or("MLD station RSNE missing")?),
+            );
         }
-        let rsn = akm.map(security::Akm::sta_rsn_ie);
+        let rsn = profile.rsne.clone();
         let rates = this.rates.elements();
         let params = mlme::AssocParamsRsn {
             base: mlme::AssocParams {
@@ -437,6 +447,10 @@ impl Connection {
             Some(current_ap) => (mlme::build_reassoc_request_rsn(&params, current_ap), 0x30),
             None => (mlme::build_assoc_request_rsn(&params), 0x10),
         };
+        if let Some(rsnxe) = profile.sae.as_ref().and_then(|join| join.station_rsnxe()) {
+            request.extend_from_slice(&[244, rsnxe.len() as u8]);
+            request.extend_from_slice(&rsnxe);
+        }
         if this.qos.is_some() {
             request.extend_from_slice(&super::qos::INFORMATION_IE);
         }
@@ -450,6 +464,7 @@ impl Connection {
         if !response.is_success() || !(1..=2007).contains(&response.aid) {
             return Err("AP rejected association");
         }
+        profile.check_response(&reply[6..])?;
         if this.qos.is_some() {
             // Association response may refine contention parameters from
             // the beacon. Only use QoS if the AP confirms WMM support.
@@ -487,10 +502,11 @@ impl Connection {
             hw.command(1, 0x9f, &power).await?;
         }
         // Recheck membership selectors after a response downgrades PHY.
-        this.rates = super::rates::Rates::parse_for_phy(
+        this.rates = super::rates::Rates::parse_for_security(
             &this.beacon.information_elements,
             this.beacon.channel,
             this.phy.mode,
+            profile.sae.as_ref().is_some_and(|join| join.h2e()),
         )?;
         let mut phy_command = station_api::phy(2, this.beacon.channel);
         this.phy.apply_phy(&mut phy_command, this.beacon.channel);
@@ -523,6 +539,7 @@ impl Connection {
         }
         let mut peer = station_api::peer(this.beacon.bssid);
         this.phy.apply_peer(&mut peer, response.aid);
+        put32(&mut peer, 36, u32::from(this.pmf_negotiated));
         hw.command(3, 0xa, &peer).await?;
         hw.command(3, 8, &station_api::mac(2, local, Some(response.aid)))
             .await?;
@@ -535,6 +552,18 @@ impl Connection {
         }
         this.phy.apply_tlc(&mut tlc);
         hw.command(5, 0xf, &tlc).await?;
+        // The response-refined native span/power is the handshake's owner;
+        // a beacon received during M4 can update that same shared proof.
+        this.regulatory = super::mld_policy::Program::new(
+            domain,
+            permissions,
+            this.beacon.channel,
+            this.phy.width,
+            this.phy.center,
+            final_power.min(max_power),
+            this.qos,
+            hw.rf_policy_validity()?,
+        )?;
         if secure {
             let deadline = narf_time::Deadline::after_ms(8000);
             while !this.security.as_ref().unwrap().complete() {
@@ -559,16 +588,6 @@ impl Connection {
             this.open_receive_epoch(hw).await?;
         }
         hw.poll()?;
-        this.regulatory = super::mld_policy::Program::new(
-            domain,
-            permissions,
-            this.beacon.channel,
-            this.phy.width,
-            this.phy.center,
-            final_power.min(max_power),
-            this.qos,
-            hw.rf_policy_validity()?,
-        )?;
         this.authorized = true;
         Ok(this)
     }
@@ -578,8 +597,14 @@ impl Connection {
     }
 
     fn management(&mut self, subtype: u8, body: &[u8]) -> Vec<u8> {
-        let frame =
+        let mut frame =
             frame_api::management(subtype, self.local, self.beacon.bssid, self.sequence, body);
+        if self.pmf_negotiated
+            && self.pairwise_key.is_some()
+            && matches!(subtype, 0xa0 | 0xc0 | 0xd0)
+        {
+            frame[1] |= 0x40;
+        }
         self.sequence = self.sequence.wrapping_add(1);
         frame
     }
@@ -625,51 +650,43 @@ impl Connection {
         }
     }
 
-    /// Drive the WPA3-SAE (H2E) commit/confirm exchange over the
-    /// management path and return the derived 32-byte PMK. Authentication
-    /// frames use algorithm 3 (SAE); the SAE variable body carries the
-    /// commit scalar/element and the confirm transcript MAC.
+    /// Drive the admitted group19 SAE profile, including AKM24's suite
+    /// selector in the complete H2E transcript. SAE-PK retains its AP
+    /// KeyAuth verification before either the PMK or PMKID is used.
     async fn sae_authenticate(
         &mut self,
         hw: &mut Hardware,
         password: &[u8],
-    ) -> Result<[u8; 32], &'static str> {
+        join: &narf_wireless::association::SaeJoin,
+    ) -> Result<([u8; 32], [u8; 16]), &'static str> {
         use narf_wireless::sae::{SaeSession, SaeState, SAE_STATUS_HASH_TO_ELEMENT};
-        // Own the SSID: its borrow must outlive the `&mut self` TX calls below
-        // (SAE-PK verification at the end needs it again).
-        let ssid = alloc::string::String::from_utf8(self.beacon.ssid.clone())
-            .map_err(|_| "SSID is not valid UTF-8")?;
-        let password =
-            core::str::from_utf8(password).map_err(|_| "SAE password is not valid UTF-8")?;
-        let mut sae = SaeSession::new(&ssid, password, self.local, self.beacon.bssid);
-
-        // Commit (seq 1). H2E signals via status SAE_STATUS_HASH_TO_ELEMENT.
-        // `build_commit` is called once: an anti-clogging retry must resend the
-        // same scalar/element, adding only the AP-supplied token (§12.4.7.4).
-        const SAE_STATUS_ANTI_CLOGGING: u16 = 76; // §9.4.1.9
-        let commit = sae
-            .try_build_commit()
+        let ssid = self.beacon.ssid.clone();
+        let sae = if join.h2e() {
+            SaeSession::new_h2e_bytes(&ssid, password, self.local, self.beacon.bssid)
+        } else {
+            SaeSession::new_hunt_and_peck(password, self.local, self.beacon.bssid)
+        };
+        let mut sae = match join.akm_suite_selector() {
+            Some(selector) => sae
+                .with_akm_suite_selector(selector)
+                .map_err(|_| "MLD SAE AKM selector refused")?,
+            None => sae,
+        };
+        sae.try_build_commit()
             .map_err(|_| "SAE commit entropy/parameters unavailable")?;
-        let mut token: Vec<u8> = Vec::new();
+        let status = if join.h2e() {
+            SAE_STATUS_HASH_TO_ELEMENT
+        } else {
+            0
+        };
+        let mut token: Option<Vec<u8>> = None;
         let mut commit_reply = Vec::new();
         let mut accepted = false;
-        // Initial commit plus up to two anti-clogging retries.
-        for _ in 0..3 {
-            // SAE Commit body: group(2) || scalar || element, plus the
-            // Anti-Clogging Token Container element (ID 255, ext 93) on the
-            // H2E retry (§9.4.2.199).
-            let mut body = Vec::with_capacity(commit.len() + token.len() + 3);
-            body.extend_from_slice(&commit);
-            if !token.is_empty() {
-                body.push(0xff);
-                body.push((token.len() + 1) as u8);
-                body.push(93);
-                body.extend_from_slice(&token);
-            }
-            let frame = self.management(
-                0xb0,
-                &mlme::build_sae_auth_body(1, SAE_STATUS_HASH_TO_ELEMENT, &body),
-            );
+        // Initial Commit plus at most three token retries. Reuse the actual
+        // scalar/element; commit_body positions tokens according to the PWE.
+        for _ in 0..=3 {
+            let commit = sae.commit_body(token.as_deref());
+            let frame = self.management(0xb0, &mlme::build_sae_auth_body(1, status, &commit));
             hw.transmit(self.management_queue, &frame, 24, self.rate())
                 .await?;
             commit_reply = self.wait_management(hw, 0xb0).await?;
@@ -679,27 +696,44 @@ impl Connection {
                 return Err("AP did not answer SAE commit");
             }
             match header.status {
-                0 | SAE_STATUS_HASH_TO_ELEMENT => {
+                0 | SAE_STATUS_HASH_TO_ELEMENT if header.status == status => {
                     accepted = true;
                     break;
                 }
-                SAE_STATUS_ANTI_CLOGGING => {
-                    token = extract_anti_clogging_token(commit_reply.get(6..).unwrap_or(&[]))
-                        .ok_or("SAE anti-clogging token missing")?;
+                76 => {
+                    let body = commit_reply
+                        .get(6..)
+                        .ok_or("SAE token response missing body")?;
+                    if body.get(..2) != Some(&19u16.to_le_bytes()) {
+                        return Err("SAE token response changed group");
+                    }
+                    let bytes = &body[2..];
+                    token = if join.h2e() {
+                        if bytes.len() < 4
+                            || bytes[0] != 255
+                            || bytes[2] != 93
+                            || usize::from(bytes[1]) + 2 != bytes.len()
+                        {
+                            return Err("SAE H2E token container malformed");
+                        }
+                        extract_anti_clogging_token(bytes)
+                    } else {
+                        (!bytes.is_empty()).then(|| bytes.to_vec())
+                    };
+                    if token.is_none() {
+                        return Err("SAE anti-clogging token missing");
+                    }
                 }
-                _ => return Err("AP rejected SAE commit"),
+                _ => return Err("AP rejected SAE commit/PWE"),
             }
         }
         if !accepted {
             return Err("SAE anti-clogging retries exhausted");
         }
-        // The AP commit's fixed fields are group(2)+scalar(32)+element(64);
-        // ignore any trailing H2E elements (rejected groups, token container).
-        let commit_body = &commit_reply[6..];
-        sae.on_commit(commit_body.get(..98).unwrap_or(commit_body))
+        // Do not truncate the H2E elements: on_commit checks the AKM Suite
+        // Selector and rejected-group salt before deriving the KCK/PMK.
+        sae.on_commit(&commit_reply[6..])
             .map_err(|_| "SAE commit processing failed")?;
-
-        // Confirm (seq 2, status 0).
         let confirm = sae.build_confirm();
         let frame = self.management(0xb0, &mlme::build_sae_auth_body(2, 0, &confirm));
         hw.transmit(self.management_queue, &frame, 24, self.rate())
@@ -714,13 +748,16 @@ impl Connection {
         if sae.state() != SaeState::Accepted {
             return Err("SAE did not reach Accepted");
         }
-        // WPA3 SAE-PK: the AP must prove possession of the public key whose
-        // fingerprint the password encodes. Authenticate it before trusting
-        // the PMK, and abort the association on failure (evil-twin defence).
         if sae.is_sae_pk() {
-            self.verify_sae_pk(&sae, &ssid, password)?;
+            let ssid = core::str::from_utf8(&ssid).map_err(|_| "SAE-PK SSID is not UTF-8")?;
+            let password =
+                core::str::from_utf8(password).map_err(|_| "SAE-PK password is not UTF-8")?;
+            self.verify_sae_pk(&sae, ssid, password)?;
         }
-        sae.pmk().copied().ok_or("SAE produced no PMK")
+        Ok((
+            *sae.pmk().ok_or("SAE produced no PMK")?,
+            *sae.pmkid().ok_or("SAE produced no PMKID")?,
+        ))
     }
 
     /// WPA3 SAE-PK AP authentication: recover the Modifier from the AP's
@@ -810,6 +847,9 @@ impl Connection {
         if !self.authorized {
             return Err("controlled port closed");
         }
+        if self.power_pending {
+            return Ok(false);
+        }
         let (queue, frame, header) = self.ethernet_frame(ethernet, self.security.is_some(), ac)?;
         if !hw.transmit_space(queue)? {
             return Ok(false);
@@ -820,7 +860,8 @@ impl Connection {
     }
 
     pub(super) fn maintenance_pending(&self) -> bool {
-        !self.actions.is_empty()
+        self.power_pending
+            || !self.actions.is_empty()
             || self
                 .rx_ba
                 .iter()
@@ -876,6 +917,7 @@ impl Connection {
         ethernet: &[u8],
         protected: bool,
     ) -> Result<(), &'static str> {
+        self.service_power(hw).await?;
         let (queue, frame, header) = self.ethernet_frame(ethernet, protected, None)?;
         self.sequence = self.sequence.wrapping_add(1);
         hw.transmit(queue, &frame, header, None).await
@@ -886,6 +928,11 @@ impl Connection {
         hw: &mut Hardware,
         mpdu: &scan_api::Mpdu<'_>,
     ) -> Result<Option<Vec<u8>>, &'static str> {
+        if !self.authorized && mpdu.frame.first() == Some(&0x80) {
+            self.receive_frame(mpdu)?;
+            self.service_power(hw).await?;
+            return Ok(None);
+        }
         if !self.authorized {
             // Closed-port ordinary data must not consume PN even when it is
             // buffered beside a genuine initial EAPOL message.
@@ -957,16 +1004,23 @@ impl Connection {
                 let frame = mpdu.frame;
                 if frame.len() >= 24
                     && frame[0] == 0xd0
-                    && frame[1] & 0xc7 == 0
+                    && frame[1] & 0x87 == 0
                     && frame[22] & 15 == 0
                     && frame[4..10] == self.local
                     && frame[10..16] == self.beacon.bssid
                     && frame[16..22] == self.beacon.bssid
                     && self.authorized
-                    && self.phy.mode != 0
                 {
-                    if let Some(body) = mpdu.body(24, 0) {
-                        if super::aggregation::action(body).is_some() && self.actions.len() < 16 {
+                    if let Some(body) = super::sc_security::robust_unicast_body(
+                        &mpdu,
+                        self.pmf_negotiated || self.mfp_active,
+                        &mut self.management_pn,
+                    ) {
+                        let block_ack =
+                            self.phy.mode != 0 && super::aggregation::action(body).is_some();
+                        let sa_query =
+                            self.pmf_negotiated && body.len() == 4 && body[..2] == [8, 0];
+                        if (block_ack || sa_query) && self.actions.len() < 16 {
                             self.actions.push_back(body.to_vec());
                         }
                     }
@@ -1075,13 +1129,67 @@ impl Connection {
         Ok(output.into_iter().map(|(frame, _)| frame).collect())
     }
 
+    async fn service_power(&mut self, hw: &mut Hardware) -> Result<(), &'static str> {
+        if !self.power_pending {
+            return Ok(());
+        }
+        if self.power_inflight {
+            return Err("MLD AP power command still owns an uncertain receipt");
+        }
+        let domain = hw.current_policy_domain()?;
+        let ceiling = self.regulatory.ceiling(&domain)?;
+        let power = i16::from(ceiling).min(
+            self.ap_power_limit
+                .ok_or("MLD AP power update has no bound")?,
+        ) as i8;
+        if power == self.regulatory.power() {
+            self.power_pending = false;
+            return Ok(());
+        }
+        let command = station_api::tx_power(
+            hw.version(1, 0x9f).ok_or("missing native AP power ABI")?.0,
+            power,
+        )?;
+        self.regulatory.reserve_power(power);
+        self.power_inflight = true;
+        let result = async {
+            let receipt = hw.command(1, 0x9f, &command).await?;
+            if !receipt.payload.is_empty() {
+                return Err("unexpected native AP power receipt");
+            }
+            hw.source_fence()?.invoke(|| {
+                self.regulatory.commit_power(power);
+                Ok(())
+            })
+        }
+        .await;
+        if let Err(reason) = result {
+            self.authorized = false;
+            hw.fail();
+            return Err(reason);
+        }
+        self.power_inflight = false;
+        self.power_pending = false;
+        Ok(())
+    }
+
     pub async fn service_aggregation(&mut self, hw: &mut Hardware) -> Result<(), &'static str> {
         use super::aggregation::{self, Action};
+        self.service_power(hw).await?;
         if !self.authorized {
             self.actions.clear();
             return Ok(());
         }
         while let Some(body) = self.actions.pop_front() {
+            // 802.11w SA Query Request: echo the authenticated transaction
+            // identifier in a protected response under the live pairwise key
+            // (mac80211 rx.c ieee80211_process_sa_query_req).
+            if self.pmf_negotiated && body.len() == 4 && body[..2] == [8, 0] {
+                let frame = self.management(0xd0, &[8, 1, body[2], body[3]]);
+                hw.transmit(self.management_queue, &frame, 24, self.rate())
+                    .await?;
+                continue;
+            }
             match aggregation::action(&body) {
                 Some(Action::Add {
                     token,
@@ -1142,6 +1250,7 @@ impl Connection {
                         }
                     }
                     let response = aggregation::add_response(token, tid, window, timeout, status);
+                    self.service_power(hw).await?;
                     let frame = self.management(0xd0, &response);
                     hw.transmit(self.management_queue, &frame, 24, self.rate())
                         .await?;
@@ -1167,6 +1276,7 @@ impl Connection {
                 .is_some_and(|w| w.expired(narf_time::now_cycles()))
             {
                 self.stop_rx_ba(hw, tid as u8).await?;
+                self.service_power(hw).await?;
                 let frame = self.management(0xd0, &aggregation::delete(tid as u8));
                 hw.transmit(self.management_queue, &frame, 24, self.rate())
                     .await?;
@@ -1217,6 +1327,23 @@ impl Connection {
             && frame[16..22] == self.beacon.bssid
         {
             if frame[0] == 0x80 {
+                if let Some(body) = mpdu.body(24, 0) {
+                    if let Some(ies) = body.get(12..) {
+                        let capabilities = u16::from_le_bytes([body[10], body[11]]);
+                        if let Ok(Some(power)) = super::mld_power::ap_limit_in_ies(
+                            ies,
+                            capabilities,
+                            self.beacon.channel,
+                        ) {
+                            if self.ap_power_limit != Some(power) {
+                                self.ap_power_limit = Some(power);
+                                self.power_pending = true;
+                            }
+                        }
+                        // Missing/invalid later AP data never clears an
+                        // already programmed restriction (Linux's no-change).
+                    }
+                }
                 if self.phy.mode != 0 {
                     let body = mpdu.body(24, 0).ok_or("invalid associated beacon")?;
                     let ies = body.get(12..).ok_or("short associated beacon")?;
@@ -1243,11 +1370,14 @@ impl Connection {
                 // 802.11w: once MFP is active a deauth/disassoc must be
                 // authentic, else it is dropped instead of tearing the link
                 // down — this is the forged-broadcast-deauth DoS defense.
-                if self.mfp_active {
+                if self.pmf_negotiated || self.mfp_active {
                     if frame[4] & 1 == 1 {
                         // Group-addressed robust mgmt frame: require a valid
                         // BIP MMIE signed by the AP's IGTK.
-                        let Some(body) = mpdu.body(24, 0) else {
+                        if frame[1] & 0xc7 != 0 || frame[22] & 15 != 0 || mpdu.amsdu {
+                            return Ok(None);
+                        }
+                        let Some(body) = mpdu.body(24, 0).filter(|body| body.len() == 20) else {
                             return Ok(None);
                         };
                         if narf_wireless::mfp::verify_inbound(&mut self.mfp, &frame[..24], body)
@@ -1255,11 +1385,25 @@ impl Connection {
                         {
                             return Ok(None);
                         }
-                    } else if frame[1] & 0x40 == 0 {
-                        // Individually-addressed robust mgmt frame must be
-                        // CCMP-protected (Protected bit set); drop the forgery.
+                    } else if super::sc_security::robust_unicast_body(
+                        mpdu,
+                        true,
+                        &mut self.management_pn,
+                    )
+                    .is_none_or(|body| body.len() != 2)
+                    {
+                        // A Protected bit alone is not an integrity verdict;
+                        // require station0 CCM MIC success and an advancing PN.
                         return Ok(None);
                     }
+                } else if super::sc_security::robust_unicast_body(
+                    mpdu,
+                    false,
+                    &mut self.management_pn,
+                )
+                .is_none_or(|body| body.len() != 2)
+                {
+                    return Ok(None);
                 }
                 self.authorized = false;
                 return Err("AP disconnected");
@@ -1297,30 +1441,71 @@ impl Connection {
         let Ok(response) = security.process(&ethernet[14..]) else {
             return Ok(());
         };
+        let igtk_changed = response
+            .keys
+            .as_ref()
+            .and_then(|keys| keys.igtk.as_ref())
+            .is_some_and(|(material, id, _)| {
+                self.mfp
+                    .find_by_key_id(*id)
+                    .is_none_or(|old| old.key != *material)
+            });
+        if let Some(keys) = &response.keys {
+            let validated = (|| {
+                if keys.group_id > 3
+                    || keys
+                        .igtk
+                        .as_ref()
+                        .is_some_and(|(_, id, pn)| !(4..=5).contains(id) || *pn >= 1 << 48)
+                {
+                    return Err("invalid MLD authenticated key identity/replay floor");
+                }
+                let candidates = [
+                    keys.pairwise
+                        .as_ref()
+                        .filter(|key| self.pairwise_key.as_ref() != Some(*key)),
+                    (self.group_keys[usize::from(keys.group_id)] != Some(keys.group))
+                        .then_some(&keys.group),
+                    keys.igtk
+                        .as_ref()
+                        .filter(|_| igtk_changed)
+                        .map(|(material, _, _)| material),
+                ];
+                self.key_history.reserve(candidates)
+            })();
+            if let Err(reason) = validated {
+                self.authorized = false;
+                hw.fail();
+                return Err(reason);
+            }
+        }
         let changed = response.keys.as_ref().is_some_and(|keys| {
             keys.pairwise
                 .as_ref()
                 .is_some_and(|key| self.pairwise_key.as_ref() != Some(key))
                 || self.group_keys[keys.group_id as usize] != Some(keys.group)
+                || igtk_changed
         });
         if changed {
             self.receive_epoch = hw.close_receive_epoch()?;
             self.discard_reorder();
             self.actions.clear();
         }
+        let mut pending_igtk = None;
         if let Some(keys) = response.keys {
             if let Some(pairwise) = keys.pairwise.as_ref() {
                 if self.pairwise_key.as_ref() != Some(pairwise) {
                     hw.drain_transmits().await?;
                     if self.pairwise_key.is_some() {
-                        remove_key(hw, 0, false).await?;
+                        remove_key(hw, 0, false, self.pmf_negotiated).await?;
                     }
-                    install_key(hw, 0, false, pairwise, 0).await?;
+                    install_key(hw, 0, false, self.pmf_negotiated, pairwise, 0).await?;
                     if let Some(old) = &mut self.pairwise_key {
                         old.zeroize();
                     }
                     self.pairwise_key = Some(*pairwise);
                     self.replay.reset_pairwise();
+                    self.management_pn = 0;
                     self.discard_reorder();
                 }
             }
@@ -1330,9 +1515,17 @@ impl Connection {
             // it would reset firmware/host packet numbers (KRACK).
             if self.group_keys[id] != Some(keys.group) {
                 if self.group_keys[id].is_some() {
-                    remove_key(hw, keys.group_id, true).await?;
+                    remove_key(hw, keys.group_id, true, self.pmf_negotiated).await?;
                 }
-                install_key(hw, keys.group_id, true, &keys.group, keys.group_rx_pn).await?;
+                install_key(
+                    hw,
+                    keys.group_id,
+                    true,
+                    self.pmf_negotiated,
+                    &keys.group,
+                    keys.group_rx_pn,
+                )
+                .await?;
                 if let Some(old) = &mut self.group_keys[id] {
                     old.zeroize();
                 }
@@ -1342,15 +1535,42 @@ impl Connection {
                 self.replay.reset_subframes();
                 self.discard_reorder();
             }
-            // 802.11w: install the IGTK and arm management-frame protection.
-            // The host verifies group-addressed robust mgmt frames (BIP) and
-            // drops unprotected ones; per-frame BIP math lives in `mfp`.
-            if let Some((igtk, key_id, _)) = keys.igtk {
-                self.mfp
-                    .install_active(igtk, key_id)
-                    .map_err(|_| "invalid IGTK key index")?;
-                self.mfp_active = true;
+            // New IGTKs are native keys too. Adopt the authenticated KDE
+            // floor only after its receipt and the native ordered RX marker.
+            // Identical material never reinstalls/reset its replay counters.
+            if let Some((igtk, key_id, ipn)) = keys.igtk.as_ref().filter(|_| igtk_changed) {
+                let (key_id, ipn) = (*key_id, *ipn);
+                let material = Zeroizing::new(*igtk);
+                if !(4..=5).contains(&key_id) {
+                    return Err("invalid IGTK key index");
+                }
+                if self.mfp.find_by_key_id(key_id).is_some() {
+                    remove_key(hw, key_id as u8, true, true).await?;
+                }
+                install_key(hw, key_id as u8, true, true, &material, ipn).await?;
+                pending_igtk = Some((material, key_id, ipn));
             }
+        }
+        if pending_igtk.is_some() {
+            self.open_receive_epoch(hw).await?;
+        }
+        if let Some((material, key_id, ipn)) = pending_igtk {
+            // This slot is about to be replaced by the previous active key.
+            // The shared BIP store has plain arrays, so retire its old bytes
+            // explicitly before rotating the two native station slots.
+            if let Some(old) = &mut self.mfp.next {
+                old.key.zeroize();
+            }
+            self.mfp
+                .install_active(*material, key_id)
+                .map_err(|_| "invalid IGTK key index")?;
+            self.mfp.active.as_mut().unwrap().rx_pn = ipn;
+            self.mfp_active = true;
+            // Key adoption and controlled-port publication are separate
+            // boundaries. Close capture again before held M4 TX so ordinary
+            // packets copied while the port is closed can never acquire the
+            // post-M4 epoch. The final marker below proves that boundary.
+            self.receive_epoch = hw.close_receive_epoch()?;
         }
         let mut reply = Vec::new();
         reply.extend_from_slice(&self.beacon.bssid);
@@ -1400,6 +1620,7 @@ impl Connection {
             self.stop_rx_ba(hw, tid as u8).await?;
         }
         hw.drain_transmits().await?;
+        self.service_power(hw).await?;
         let mfp_active = self.mfp_active;
         let mut frame = self.management(0xa0, &3u16.to_le_bytes());
         if mfp_active {
@@ -1454,13 +1675,12 @@ fn extract_anti_clogging_token(body: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     (!body.is_empty()).then(|| body.to_vec())
 }
 
-async fn remove_key(hw: &mut Hardware, id: u8, group: bool) -> Result<(), &'static str> {
-    let mut body = [0; 80];
-    put32(&mut body, 0, 3); // REMOVE
-    put32(&mut body, 4, 1); // station 0
-    put32(&mut body, 8, id as u32);
-    put32(&mut body, 12, 2 | if group { 0x48 } else { 0 });
-    hw.command(5, 0x18, &body).await?;
+async fn remove_key(hw: &mut Hardware, id: u8, group: bool, pmf: bool) -> Result<(), &'static str> {
+    let body = super::sc_security::key_command(id, group, pmf, None, 0)?;
+    let receipt = hw.command(5, 0x18, &body[..]).await?;
+    if !receipt.payload.is_empty() {
+        return Err("unexpected native key-removal receipt");
+    }
     Ok(())
 }
 
@@ -1468,20 +1688,18 @@ async fn install_key(
     hw: &mut Hardware,
     id: u8,
     group: bool,
+    pmf: bool,
     key: &[u8; 16],
     rx_pn: u64,
 ) -> Result<(), &'static str> {
     if hw.version(5, 0x18).map(|v| v.0) != Some(1) {
         return Err("unsupported security key command");
     }
-    let mut body = zeroize::Zeroizing::new([0; 80]);
-    put32(&mut body[..], 0, 1); // ADD
-    put32(&mut body[..], 4, 1); // station 0 mask
-    put32(&mut body[..], 8, id as u32);
-    put32(&mut body[..], 12, 2 | if group { 0x48 } else { 0 });
-    body[16..32].copy_from_slice(key);
-    put64(&mut body[..], 64, rx_pn);
-    hw.command(5, 0x18, &body[..]).await?;
+    let body = super::sc_security::key_command(id, group, pmf, Some(key), rx_pn)?;
+    let receipt = hw.command(5, 0x18, &body[..]).await?;
+    if !receipt.payload.is_empty() {
+        return Err("unexpected native key-install receipt");
+    }
     Ok(())
 }
 

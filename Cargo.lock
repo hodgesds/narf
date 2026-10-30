@@ -2500,6 +2500,7 @@ name = "narf-drivers-wireless"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "narf-aml",
  "narf-boot",
  "narf-bus",
  "narf-capabilities",
@@ -2552,10 +2553,12 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-net",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
  "narf-wifi-fixtures",
  "narf-wireless",
+ "subtle",
  "zeroize",
 ]
 

@@ -77,6 +77,41 @@ pub(super) fn mld_image() -> Vec<u8> {
     image(MLD_COMMANDS)
 }
 
+fn smoke_iwlwifi_bios_command_revision_tlv_is_source_bound_and_not_silently_replaced() -> TestResult
+{
+    let mut bytes = image(MLD_COMMANDS);
+    tlv(&mut bytes, 73, &[7, 4, 5, 4, 9, 1, 3, 2]);
+    let parsed = parse_ucode(&bytes).unwrap();
+    if parsed.api.bios_revision(1, 4, 7, 8) != 5
+        || parsed.api.bios_revision(2, 4, 7, 8) != 4
+        || parsed.api.bios_revision(2, 0, 9, 8) != 2
+        || parsed.api.bios_revision(0, 4, 7, 8) != 8
+        || parsed.api.bios_revision(1, 4, 99, 8) != 8
+    {
+        return TestResult::Fail("TLV73 lost BIOS source/command/group or revision fallback");
+    }
+    tlv(&mut bytes, 73, &[]);
+    if parse_ucode(&bytes).is_ok() {
+        return TestResult::Fail("duplicate BIOS command TLV replaced the installed table");
+    }
+    let mut malformed = image(MLD_COMMANDS);
+    tlv(&mut malformed, 73, &[7, 4, 5]);
+    if parse_ucode(&malformed).is_ok() {
+        return TestResult::Fail("partial BIOS command table became missing metadata");
+    }
+    let mut empty = image(MLD_COMMANDS);
+    tlv(&mut empty, 73, &[]);
+    tlv(&mut empty, 73, &[7, 4, 5, 4]);
+    if parse_ucode(&empty).is_ok() {
+        return TestResult::Fail("duplicate empty BIOS command table was treated as absent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/firmware",
+    smoke_iwlwifi_bios_command_revision_tlv_is_source_bound_and_not_silently_replaced
+);
+
 fn smoke_iwlwifi_authored_tlv_sections_and_first_command_version() -> TestResult {
     let mut bytes = image(&[[0xd, 1, 18, 0], [0xd, 1, 29, 4]]);
     tlv(&mut bytes, 27, &2u32.to_le_bytes());
