@@ -470,6 +470,8 @@ impl Harness {
 mod ht_tests;
 #[path = "power_composition_tests.rs"]
 mod power_tests;
+#[path = "probe_composition_tests.rs"]
+mod probe_tests;
 #[path = "recovery_composition_tests.rs"]
 mod recovery_tests;
 impl Drop for Harness {

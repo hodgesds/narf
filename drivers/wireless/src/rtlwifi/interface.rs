@@ -852,8 +852,16 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             generation: self.lifecycle.generation(),
             armed: true,
         };
-        let deadline = self.environment.now_ms().saturating_add(dwell);
         let result = async {
+            if request.active {
+                if request.ssids.is_empty() {
+                    owner.probe_station(&[], &self.environment).await?;
+                }
+                for ssid in &request.ssids {
+                    owner.probe_station(ssid, &self.environment).await?;
+                }
+            }
+            let deadline = self.environment.now_ms().saturating_add(dwell);
             loop {
                 owner.progress_station(&self.environment)?;
                 if self.environment.now_ms() >= deadline {
@@ -1005,8 +1013,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     }
 }
 fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
-    if request.active
-        || request.random_mac.is_some()
+    if request.random_mac.is_some()
         || request.colocated_6ghz
         || !request.extra_ies.is_empty()
         || request
@@ -1016,6 +1023,7 @@ fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
         || request.frequencies_mhz.is_empty()
             && request.channels.iter().any(|channel| *channel != 1)
         || request.ssids.len() > 32
+        || request.active && request.ssids.len() > super::probe_scan::MAX_SSIDS
         || request.ssids.iter().any(|ssid| ssid.len() > 32)
     {
         return Err(WirelessError::NotSupported);

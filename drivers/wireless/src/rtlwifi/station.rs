@@ -1159,6 +1159,37 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         });
         Ok(())
     }
+    /// Software-scan probe through the actual management ring. Completion is
+    /// native descriptor retirement, never a fabricated broadcast ACK.
+    pub(crate) async fn probe_station(
+        &mut self,
+        ssid: &[u8],
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        if self.station_phase() != Phase::Passive {
+            return Err(Error::State);
+        }
+        let bytes = super::super::probe_scan::request(
+            self.local().ok_or(Error::State)?,
+            self.permission.ok_or(Error::State)?.channel(),
+            ssid,
+            self.station_ht_capability(),
+        )?;
+        self.queue_station(
+            bytes,
+            Kind::Control,
+            environment.now_ms(),
+            true,
+            environment,
+        )?;
+        loop {
+            self.progress_station(environment)?;
+            if self.station.pending.is_none() {
+                return Ok(());
+            }
+            environment.pause().await;
+        }
+    }
     pub(crate) async fn connect_station(
         &mut self,
         bssid: [u8; 6],

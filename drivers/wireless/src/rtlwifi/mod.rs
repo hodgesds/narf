@@ -64,6 +64,7 @@ pub mod h2c;
 mod ht;
 mod interface;
 mod power_runtime;
+mod probe_scan;
 pub use ht::Request as Ht20Request;
 pub mod irq;
 pub mod mac;

@@ -131,6 +131,8 @@ pub(super) struct Peer {
     ht: Option<Vec<u8>>,
     controls: Vec<Vec<u8>>,
     hold_control: bool,
+    probes: Vec<Vec<u8>>,
+    hold_probe: bool,
     tids: Vec<u8>,
 }
 impl Peer {
@@ -165,6 +167,8 @@ impl Peer {
             ht: None,
             controls: Vec::new(),
             hold_control: false,
+            probes: Vec::new(),
+            hold_probe: false,
             tids: Vec::new(),
         }
     }
@@ -201,6 +205,42 @@ impl Peer {
         Ok(frame)
     }
     pub(super) fn react(&mut self, frame: &[u8]) -> Result<(Vec<Vec<u8>>, bool), &'static str> {
+        if frame.first() == Some(&0x40) {
+            if frame.len() < 26
+                || frame[1..4] != [0, 0, 0]
+                || frame[4..10] != [255; 6]
+                || frame[10..16] != self.plan.station
+                || frame[16..22] != [255; 6]
+            {
+                return Err("native AP probe identity");
+            }
+            let mut ies = &frame[24..];
+            let mut ssid = None;
+            while !ies.is_empty() {
+                let h = ies.get(..2).ok_or("native AP truncated probe IE")?;
+                let end = 2 + usize::from(h[1]);
+                let body = ies.get(2..end).ok_or("native AP probe IE extent")?;
+                if h[0] == 0 && ssid.replace(body).is_some() {
+                    return Err("native AP duplicate probe SSID");
+                }
+                ies = &ies[end..];
+            }
+            self.probes.push(frame.to_vec());
+            if ssid.is_none_or(|s| !s.is_empty() && s != SSID) {
+                return Ok((Vec::new(), self.hold_probe));
+            }
+            let mut response = self.ap.beacon();
+            response[0] = 0x50;
+            response[4..10].copy_from_slice(&self.plan.station);
+            if let Some(wmm) = &self.wmm {
+                response.extend_from_slice(wmm);
+            }
+            if let Some(ht) = &self.ht {
+                response[35] |= 4;
+                response.extend_from_slice(ht);
+            }
+            return Ok((vec![response], self.hold_probe));
+        }
         if frame.len() < 24 || frame[4..10] != PEER || frame[10..16] != self.plan.station {
             return Err("native AP peer identity");
         }

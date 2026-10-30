@@ -282,28 +282,41 @@ carrier or controlled port.
 `interface::Device` is the single shared native RTL8188EE view used by the
 controller, wireless registry and real Ethernet stack. It retains the same async
 `Prepared` storage installed before the probe worker publishes any ring address;
-it never takes/reconstructs the firmware or packet owner. Current net authority
+it preserves that owner for a live generation; verified recovery replaces the
+retained slot with a fresh owner. Current net authority
 is required before production publication admits station DMA. Only
 channel1/2412MHz, legacy20/1T or the separately qualified HT20/LGI profile below,
-mandatory basic1Mbps, continuously awake software crypto and one association
-per firmware claim are admitted. IRQs stay masked
-and a bounded synchronous drain serves the real stack even while a synchronous
+mandatory basic1Mbps, software crypto and one peer at a time are admitted.
+MSI drives the native owner when available, with polling fallback;
+a bounded synchronous drain serves the real stack even while a synchronous
 DHCP caller prevents other executor tasks from running. Both native-owner and
 endpoint-state mutexes are released before stack dispatch/reentrant ARP/ND TX.
 Missing signed board calibration or staged host policy can be retried from the
-retained parked radio/MAC boundary; a dirty/cancelled operation cannot retry.
+retained parked radio/MAC boundary; a dirty/cancelled generation requires
+fresh-owner recovery before retry.
 The existing public scan/associate facade invokes `Device::ready` before arming
 station cancellation. From RadioConfigured/ChannelConfigured it reloads the
 signed envelope/current domain, continues channel/MAC setup and stages station
 calibration on that same retained Prepared owner. It performs no firmware reset,
-owner reconstruction or second association attempt.
+owner reconstruction itself; explicit fresh-generation recovery is separate.
 
-Public passive scan validates channel/frequency, filters and bounded dwell;
+Public scan validates channel/frequency, filters and bounded dwell;
 beacons/probe responses come only from actual consumed native RX descriptors.
 Shared `association::observe` checks raw admission, addresses, ESS/interval,
 singleton IEs, rates and DS/current-channel agreement; EE additionally requires
-channel1/basic1Mbps. Signal is unknown instead of invented RSSI. Active scans
-and other channels remain unsupported (randomized scan addresses are
+channel1/basic1Mbps. Signal is unknown instead of invented RSSI. Active
+software scans now send actual broadcast Probe Requests on the qualified
+channel, one per requested SSID (up to mac80211's ordinary four; empty means
+wildcard), through the owned MGNT ring at basic1Mbps. Their rates and optional
+HT capability come from the retained current profile. No AP operation IEs or
+unqualified rate/power facts are advertised. Each probe requires actual native
+TX descriptor retirement before the bounded receive dwell begins; broadcast
+frames imply no peer ACK. Probe responses enter the same raw RX/BSS path.
+Cancellation and source loss close this generation and retain uncertain DMA.
+Four native composed scan cases cover Open/WPA2 conversations, literal probe
+and descriptor bytes, held completion/cancellation and prevalidation without
+radio mutation; native acceptance is pending. Other channels remain separate
+retune work (randomized scan addresses are
 source-inapplicable, section 8). Without the distinct HT record,
 HT/VHT/HE/EHT remain unselected; VHT/HE/EHT are never admitted by this EE path.
 
@@ -1233,7 +1246,7 @@ runtimes remain separate from the retained RTL8188EE owner.
 
 | Row | Concrete blocker |
 |---|---|
-| `active_scanning` | Active scanning; blocked on probe-request emission within a signed NEPC envelope plus per-channel retune (additional_operating_channels) |
+| `active_scanning` | Qualified channel1 software Probe Requests implemented pending native acceptance; broader active scans still require per-channel retune and actual signed NEPC rows (additional_operating_channels) |
 | `additional_operating_channels` | Noninitial operating channels and retuning; blocked on live retune (RF18/BW with paused DMA) and per-channel permission re-derivation from signed NEPC rows |
 | `bt_coexistence` | Bluetooth coexistence on RTL8723AE/BE; blocked on the rtl8723ae/rtl8723be chip runtimes |
 | `dynamic_antenna_selection` | Dynamic antenna selection/tracking; blocked on per-antenna signed board measurements (NEPC binds one static factory antenna) |
