@@ -1137,6 +1137,24 @@ Clippy, Intel-only debug builds and formatting pass. Both architectures also
 pass production boot and both btrfs interoperability postflights. These are
 register/DMA models and QEMU checks, not physical Intel or Mesa acceptance.
 
+The next Linux-source audit corrects Wa_14019789679 coverage: all admitted
+Xe-LPG and Battlemage profiles now seed the same fifty SVG headers as DG2,
+with Xe2's DRAWING_RECTANGLE_FAST substitution. Captured opaque model state
+reaches both the golden template and new PPGTT contexts. Xe-LPG also receives
+the source-required extra depth-cache flush before completion. Firmware boot
+now binds stable live IP/stepping and supplies platform/die GuC WA flags plus
+ADS KLV records before DMA/cache publication, preserving the same records on
+scheduling reload and rejecting changed identity. Media/additional engines,
+remaining out-of-band/reset handling, isolated userspace 3D and physical
+acceptance remain open.
+Three new native smokes cover firmware wire profiles, refused live IP and
+identity changes during reload; extended state/PPGTT fixtures cover all six
+admitted IP variants. All 101 targeted smokes pass on each architecture,
+without failures/skips. GPU CI Clippy passes three contexts per architecture;
+host default/Intel-only/AMD-only/no-vendor all-target checks, Intel-only debug
+builds and formatting pass. Both production boots and both btrfs postflights
+per architecture pass. Physical Intel/Mesa acceptance remains untested.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

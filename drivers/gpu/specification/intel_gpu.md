@@ -1572,7 +1572,7 @@ DG2/BMG retain their WB policy for those entries. Every immutable table
 and BO is cache-cleaned before context registration; Xe-LPG's non-coherent
 table walker cannot observe dirty CPU cache lines. Registration sets PPGTT
 mode and the kernel ring uses PPGTT batch start, preparser/TLB/cache
-invalidation, MTL AuxCCS invalidation, DG2 depth-flush workaround, render-cache
+invalidation, MTL AuxCCS invalidation, DG2/Xe-LPG depth-flush workaround, render-cache
 drain and a separate GGTT post-sync fence. The submitted tail, deregistration
 and final invalidation must all agree before tables and BOs are released and
 the terminal fence is published. Uncertain residency survives until full reset.
@@ -1590,7 +1590,9 @@ and tuning tables using stable GMD ID and fuse observations: Xe-LPG
 use GPU MI_MATH read/modify/write through a non-terminated MCR instance;
 HWCONFIG physical maxima select the DSS layout, while observed L3 fuses select
 the cache bank. Temporary GPRs and CS selective-read steering are reset after
-use. DG2 explicitly seeds all fifty SVG command headers (Wa_14019789679).
+use. Every admitted profile explicitly seeds all fifty SVG command headers
+(Wa_14019789679); Xe2 substitutes pipelined DRAWING_RECTANGLE_FAST for the
+non-pipelined DG2/Xe-LPG command. This corrects the earlier DG2-only selection.
 
 `begin_context_defaults` owns an exclusive seed → complete retirement →
 different-context execution/retirement → CPU synchronization → golden copy →
@@ -1620,6 +1622,18 @@ DG2 CACHE_MODE_SS follows Linux's no-readback exception. Failure closes
 scheduling admission, retaining owned storage until full reset. Media GT,
 other engine classes, out-of-band workarounds, nonprivileged register policy
 and coordinated reset recovery remain separate work.
+
+The firmware-side workaround path binds stable graphics IP/stepping before
+GuC's first reset/DMA and refuses a different identity on scheduling reload.
+GuC boot parameters now carry DG2 die and Xe-LPG stepping flags. Source-defined
+zero-length KLV headers occupy a dedicated ADS page, with packed pointer/size
+fields published before DMA cache synchronization. DG2/Xe-LPG use MGSR and
+BB-stack-pointer records; Battlemage 20.01 adds PFQ polling and asynchronous
+compute MTP records, while 20.02 keeps its narrower reset/BB-stack list.
+The physical service remains RCS0-only, so modern CCS DUAL_QUEUE handling,
+other engines, reset sequencing and RC6 acceptance remain separate work.
+Native wire fixtures check each variant and reject bad live identity before
+DMA; reload checks preserve firmware records and retain uncertain ownership.
 
 `intel_gpu_topology::GtTopology` reads main-GT geometry/compute DSS and EU fuses
 after initial quiescence, with two matching samples and current wake checks

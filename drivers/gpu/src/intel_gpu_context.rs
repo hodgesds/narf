@@ -43,27 +43,13 @@ impl ContextSeed {
         if topology.platform() != platform || !topology.has_render() {
             return Err(ContextError::Topology);
         }
-        let (graphics, step) = if platform == GtPlatform::Alchemist {
-            (1255, 0)
-        } else {
-            let a = mmio.read32(0xd8c);
-            let b = mmio.read32(0xd8c);
-            if a == u32::MAX || b == u32::MAX {
-                return Err(ContextError::Unavailable);
-            }
-            if a != b {
-                return Err(ContextError::Unstable);
-            }
-            let version = (a >> 22) * 100 + ((a >> 14) & 255);
-            let supported = match platform {
-                GtPlatform::Battlemage => matches!(version, 2001 | 2002),
-                _ => matches!(version, 1270 | 1271 | 1274),
-            };
-            if !supported {
-                return Err(ContextError::Unsupported);
-            }
-            (version as u16, (a & 63) as u8)
-        };
+        let ip =
+            crate::intel_gpu_gt::GraphicsIp::read(mmio, platform).map_err(|error| match error {
+                crate::intel_gpu_gt::GraphicsError::Unavailable => ContextError::Unavailable,
+                crate::intel_gpu_gt::GraphicsError::Unstable => ContextError::Unstable,
+                crate::intel_gpu_gt::GraphicsError::Unsupported => ContextError::Unsupported,
+            })?;
+        let (graphics, step) = (ip.version, ip.step);
         let slices = config.lookup_u32(1).map_err(|_| ContextError::Hwconfig)?;
         let subs = config.lookup_u32(70).map_err(|_| ContextError::Hwconfig)?;
         // xe_gt_mcr.c uses the physical layout maxima, not live DSS counts.
@@ -167,12 +153,16 @@ impl ContextSeed {
         words.extend_from_slice(&[
             0, 0x11080005, 0x600, 0, 0x608, 0, 0x610, 0, 0, 0x11000001, 0x20cc, 0,
         ]);
-        if self.platform == GtPlatform::Alchemist {
-            // Wa_14019789679: explicitly create every SVG restore header.
-            for &(subopcode, size) in SVG {
-                words.push(0x78000000 | u32::from(subopcode) << 16 | (size - 2));
-                words.resize(words.len() + size as usize - 1, 0);
-            }
+        // Wa_14019789679 also covers Xe-LPG and Xe2. Omitted headers
+        // otherwise let a later context inherit the previous context's state.
+        for &(subopcode, size) in SVG {
+            let opcode = if self.graphics >= 2000 && subopcode == 0x100 {
+                0 // Xe2 replaces DRAWING_RECTANGLE with pipelined _FAST.
+            } else {
+                subopcode
+            };
+            words.push(0x78000000 | u32::from(opcode) << 16 | (size - 2));
+            words.resize(words.len() + size as usize - 1, 0);
         }
         words
     }
@@ -405,7 +395,6 @@ pub(crate) mod tests {
                 assert_eq!(regs[&0x2580], 2);
                 assert_eq!(regs[&0x6204], 0x140);
                 assert_eq!(regs[&0x7044], 0x420);
-                assert!(svg.is_empty());
             } else {
                 assert_eq!(regs[&0xb158], 0xa500007f);
                 assert_eq!(
@@ -419,19 +408,25 @@ pub(crate) mod tests {
                 if platform == GtPlatform::Alchemist {
                     assert_eq!(regs[&0x6604], 0xa5041234);
                     assert_eq!(regs[&0x83a4], 0x4000);
-                    assert_eq!(svg.len(), 50);
-                    assert_eq!(
-                        &svg[..5],
-                        &[0x78150009, 0x78190009, 0x781a0009, 0x78160009, 0x78090043]
-                    );
-                    assert_eq!(
-                        &svg[svg.len() - 5..],
-                        &[0x78770001, 0x787b0008, 0x787f0001, 0x787a0006, 0x79000002]
-                    );
-                } else {
-                    assert!(svg.is_empty());
                 }
             }
+            assert_eq!(svg.len(), 50);
+            assert_eq!(
+                &svg[..5],
+                &[0x78150009, 0x78190009, 0x781a0009, 0x78160009, 0x78090043]
+            );
+            assert_eq!(
+                &svg[45..49],
+                &[0x78770001, 0x787b0008, 0x787f0001, 0x787a0006]
+            );
+            assert_eq!(
+                svg[49],
+                if platform == GtPlatform::Battlemage {
+                    0x78000002
+                } else {
+                    0x79000002
+                }
+            );
         }
         let mut w = window();
         w.regs.insert(0xd8c, (20 << 22) | (2 << 14));
@@ -440,7 +435,9 @@ pub(crate) mod tests {
             .unwrap()
             .commands();
         let mut regs = BTreeMap::from([(0x6210, 0xa4000001)]);
-        execute(&words, &mut regs);
+        let (svg, used) = execute(&words, &mut regs);
+        assert_eq!(used, words.len());
+        assert_eq!((svg.len(), svg[49]), (50, 0x78000002));
         assert_eq!(regs[&0x6204], 0x40);
         assert_eq!(regs[&0x6210], 0xa4000001);
         assert!(!regs.contains_key(&0x5588) && !regs.contains_key(&0x62a8));

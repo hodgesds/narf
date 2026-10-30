@@ -740,6 +740,8 @@ pub mod intel_gpu_guc_sched;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_guc_transport;
 #[cfg(feature = "intel")]
+mod intel_gpu_guc_wa;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_hdmi;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_hwconfig;

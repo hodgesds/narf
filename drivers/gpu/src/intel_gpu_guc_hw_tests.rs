@@ -241,6 +241,15 @@ kernel_test_in!(
 );
 
 fn hardware_scheduling(gt: &mut GuCGt<Window, Arena>, w: &Window) {
+    let before = {
+        let d = w.0.borrow();
+        let ads = d.memory[&0x20001000].borrow();
+        (
+            d.regs[&0xc188],
+            ads[0x11a4 / 4..0x11b0 / 4].to_vec(),
+            ads[0x3000 / 4..0x4000 / 4].to_vec(),
+        )
+    };
     gt.begin_scheduling(12).unwrap();
     assert_eq!(gt.state(), GtState::PreparingScheduling);
     assert!(gt.poll(12).is_pending());
@@ -254,6 +263,14 @@ fn hardware_scheduling(gt: &mut GuCGt<Window, Arena>, w: &Window) {
     assert!(gt.poll(16).is_pending());
     w.0.borrow_mut().regs.insert(0xc000, 0x8000f000);
     assert_eq!(gt.poll(17), Poll::Ready(Ok(GtState::Ready)));
+    {
+        let d = w.0.borrow();
+        let ads = d.memory[&0x20001000].borrow();
+        assert_eq!(d.regs[&0xc188], before.0);
+        assert_eq!(&ads[0x11a4 / 4..0x11b0 / 4], before.1.as_slice());
+        assert_eq!(&ads[0x3000 / 4..0x4000 / 4], before.2.as_slice());
+        assert_eq!(ads[0x2000 / 4], 0x229c); // KLVs did not overlap register saves
+    }
     gt.begin_ct(18).unwrap();
     for now in 19..25 {
         w.0.borrow_mut().regs.insert(0x190240, 0xf0000001);
@@ -316,6 +333,40 @@ fn smoke_hardware_register_initialization_gates_scheduling() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_guc_gt",
     smoke_hardware_register_initialization_gates_scheduling
+);
+
+fn smoke_hardware_workaround_ip_change_blocks_reload() -> TestResult {
+    let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+    hardware_discovery(&mut gt, &w, 0xdfc);
+    w.0.borrow_mut().regs.insert(0xd8c, (20 << 22) | (2 << 14));
+    gt.begin_scheduling(12).unwrap();
+    assert!(gt.poll(12).is_pending());
+    assert!(gt.poll(13).is_pending());
+    reset_done(&w);
+    w.0.borrow_mut().regs.insert(0xc314, 0);
+    let count = arena.live_allocations();
+    assert_eq!(
+        gt.poll(14),
+        Poll::Ready(Err(GtError::Boot(BootError::Device)))
+    );
+    assert_eq!(gt.state(), GtState::Lost);
+    assert_eq!(arena.live_allocations(), count);
+    assert_eq!(
+        w.0.borrow()
+            .writes
+            .iter()
+            .filter(|p| **p == (0xc314, 0x00110011))
+            .count(),
+        1
+    );
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_workaround_ip_change_blocks_reload
 );
 
 fn hardware_stop(gt: &mut GuCGt<Window, Arena>, w: &Window, ack: u64) {
@@ -431,14 +482,26 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     if image.borrow()[1024 + 0x33] != 0 {
                         execute_ppgtt_probe(&d.regs, &image.borrow(), &ring, id, base);
                     } else if tail != 32 {
-                        let (_, used) =
+                        let (svg, used) =
                             crate::intel_gpu_context::tests::execute(&ring[1..], &mut d.regs);
+                        assert_eq!(svg.len(), 50);
+                        assert_eq!(
+                            svg[49],
+                            if d.regs[&0xd8c] >> 22 == 20 {
+                                0x78000002
+                            } else {
+                                0x79000002
+                            }
+                        );
                         assert_eq!(ring[0], 0x04000001);
                         assert_eq!(ring[used + 1] & 0xfffffdff, 0x7a000004);
                         // Opaque device-saved state, outside the hand-written
                         // register restore groups. The driver must copy it.
                         image.borrow_mut()[0x2000 / 4] = 0xc01dcafe;
                         image.borrow_mut()[0x2004 / 4] = d.regs[&0x7044];
+                        // Fixture-only opaque save area, not a claimed hardware
+                        // SVG layout. Capture proves every header reaches clones.
+                        image.borrow_mut()[0x2100 / 4..0x2100 / 4 + 50].copy_from_slice(&svg);
                     } else {
                         assert_eq!(
                             &ring[..8],
@@ -512,7 +575,7 @@ fn execute_ppgtt_probe(regs: &BTreeMap<u64, u32>, image: &[u32], ring: &[u32], i
         expected.extend_from_slice(&[0x11020001, 0x4208, 1, 0]);
     }
     expected.extend_from_slice(&[0x02800100, 0x18800101, 0, 0x1234, 0x04000000]);
-    if pat == 0 {
+    if pat == 0 || pat == 3 {
         expected.extend_from_slice(&[0x7a000004, 1, 0xd0, 0, 0, 0]);
     }
     expected.extend_from_slice(&[
@@ -559,6 +622,16 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
         (GtPlatform::Alchemist, 0x130044, 0),
         (GtPlatform::Battlemage, 0xdfc, (20 << 22) | (1 << 14)),
         (GtPlatform::Battlemage, 0xdfc, (20 << 22) | (2 << 14)),
+        (
+            GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
+            0xdfc,
+            (12 << 22) | (70 << 14),
+        ),
+        (
+            GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
+            0xdfc,
+            (12 << 22) | (71 << 14),
+        ),
         (
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
             0xdfc,
@@ -619,6 +692,16 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
             assert_eq!((data[1029], data[1031], data[1033]), (0, 0, 0));
             assert_eq!(data[0x2000 / 4], 0xc01dcafe);
             assert_ne!(data[0x2004 / 4] & 0x20, 0);
+            assert_eq!(data[0x2100 / 4], 0x78150009);
+            assert_eq!(data[0x2100 / 4 + 45], 0x78770001); // MESH_CONTROL
+            assert_eq!(
+                data[0x2100 / 4 + 49],
+                if platform == GtPlatform::Battlemage {
+                    0x78000002
+                } else {
+                    0x79000002
+                }
+            );
         }
         // A fresh PPGTT context must inherit the device's saved opaque state,
         // restore it rather than inhibit, and receive its own ring and root.
@@ -630,6 +713,10 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
                 let image = w.0.borrow().memory[base].clone();
                 assert_eq!(image.borrow()[1027], 0x00090008);
                 assert_eq!(image.borrow()[0x2000 / 4], 0xc01dcafe);
+                assert_eq!(
+                    &image.borrow()[0x2100 / 4..0x2100 / 4 + 50],
+                    &golden.borrow()[0x2100 / 4..0x2100 / 4 + 50]
+                );
                 assert_ne!(image.borrow()[1033], 0);
             }
             if probe.completion.result().is_some() {

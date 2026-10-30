@@ -661,7 +661,7 @@ fn overlap(a: &impl GpuBacking, b: &impl GpuBacking) -> bool {
 /// Single render-engine kernel job, following xe_ring_ops.c. Preparser/TLB
 /// invalidation precedes the PPGTT batch; HDC/render/depth/data cache drain
 /// precedes the separate GGTT post-sync completion write. No compression or
-/// user state is enabled. MTL needs AuxCCS invalidation; DG2 needs the extra
+/// user state is enabled. MTL needs AuxCCS invalidation; DG2 and Xe-LPG need the extra
 /// depth flush (Wa_14016712196). All tails are qword aligned.
 fn resident_ring(platform: GtPlatform, batch: u64, image: u32, seq: u32) -> Vec<u32> {
     let mut words = alloc::vec![0x04000001, 0x02800101, 0x7a000404, 0x20344c1c, 0xd0, 0, 0, 0,];
@@ -680,7 +680,7 @@ fn resident_ring(platform: GtPlatform, batch: u64, image: u32, seq: u32) -> Vec<
 }
 
 fn render_completion(platform: GtPlatform, image: u32, seq: u32, words: &mut Vec<u32>) {
-    if platform == GtPlatform::Alchemist {
+    if platform != GtPlatform::Battlemage {
         words.extend_from_slice(&[0x7a000004, 1, 0xd0, 0, 0, 0]);
     }
     words.extend_from_slice(&[

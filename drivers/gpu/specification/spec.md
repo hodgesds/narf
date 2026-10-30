@@ -360,6 +360,19 @@ drain. GuC host and RCS interrupts are masked for the bounded polling service;
 this path does not install a GuC IRQ handler. Wake/reset/semaphore waits have
 deadlines and async timer/yield progression.
 
+Before firmware DMA, `GuCBoot::begin` validates and binds two matching live
+GMD samples to the admitted Xe-LPG/Battlemage IP and stepping; DG2 uses its
+pre-GMD identity. Unsupported, unavailable or unstable observations return
+`BootError::Graphics`; a changed supported identity refuses reload. Both
+initial discovery and scheduling reload publish source-defined GuC WA flags
+and zero-payload 16:16 ADS KLVs before cache synchronization. The KLV page at
+ADS+0x3000 is separate from engine saves/private data, with the complete
+64-bit pointer and byte size in the packed ADS ABI. DG2 G11 selects context
+isolation, Xe-LPG pre-B0 selects hold-switchout, and Battlemage 20.01/20.02
+select different KLV lists. Only RCS0 is enabled: modern DUAL_QUEUE selection
+must be extended when CCS engines are admitted. Firmware flags do not grant
+userspace isolation, coordinated reset or RC6 admission.
+
 `GuCGt::begin_scheduling` requires awake authenticated Ready, validated HWCONFIG,
 observed nonempty geometry DSS, supported submission ABI and no CT. A compute-only
 GT cannot authorize RCS0 programming or allocation. It allocates owned HWS and golden-LRC
@@ -402,7 +415,7 @@ isolation. Each context retains its private tables and objects through stop,
 waiter cancellation and failures. Registration selects PPGTT (descriptor bit8),
 PDP0/PTBP receives the full root descriptor, and MI_BATCH_BUFFER_START selects
 PPGTT. The ring brackets execution with preparser/TLB/cache invalidation,
-MTL AuxCCS invalidation or DG2's extra depth flush as applicable, and a full
+MTL AuxCCS invalidation and DG2/Xe-LPG's extra depth flush as applicable, and a full
 render-cache drain before the separate GGTT post-sync breadcrumb. Retirement
 checks the submitted tail, not a fixed probe size; all residency is dropped
 before the terminal fence is signalled.
@@ -427,9 +440,11 @@ fuses require matching available samples. DSS steering uses observed live
 units and HWCONFIG layout maxima (the source's four-DSS fallback for absent
 maxima); L3 steering selects a live bank. Masked writes preserve unrelated
 bits; non-masked tuning uses steered GPU MI_MATH read/modify/write and clears
-its GPRs and selective-read selector afterward. DG2's Wa_14019789679 explicitly
-seeds all fifty SVG commands with zero payloads to prevent omitted restore
-headers. This table covers context state, not global GT/engine initialization.
+its GPRs and selective-read selector afterward. Wa_14019789679 explicitly
+seeds all fifty SVG commands with zero payloads on every admitted profile to
+prevent omitted restore headers. Xe2 uses DRAWING_RECTANGLE_FAST in place of
+DG2/Xe-LPG's non-pipelined DRAWING_RECTANGLE. This table covers context state,
+not global GT/engine initialization.
 
 The priming scheduler fully retires the seed context while retaining its
 image, then executes and fully retires a different context to force a save.
