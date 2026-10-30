@@ -1,4 +1,6 @@
 use super::*;
+#[path = "amdgpu_dcn401_power_tests.rs"]
+mod power_tests;
 use alloc::{collections::BTreeMap, vec, vec::Vec};
 use core::task::{Context, Waker};
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -130,6 +132,8 @@ fn engine() -> Engine<Fake> {
             applied: None,
             bandwidth: Bandwidth::INIT,
             ignored: Ignored::default(),
+            watermarks_ready: false,
+            dynamic_power: false,
         },
         io: Fake {
             regs: BTreeMap::from([(0x589d0, 1)]),

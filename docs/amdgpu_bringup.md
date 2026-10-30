@@ -1,7 +1,8 @@
 # amdgpu bring-up: remaining work
 
 Status as of 2026-10-29, based on `main` at `eb9c6c8a1` (#1236), plus
-RX 9000 idle-power changes on `codex/amdgpu-rdna4-idle-power`.
+RX 9000 idle-power and workload-policy changes on
+`codex/amdgpu-rdna4-idle-power`.
 Evidence below the "Verified on hardware" section comes from code review
 and software tests, including QEMU and register/fake-engine models.
 
@@ -116,8 +117,19 @@ IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
   Every SRAM restore needs a new physical fence probe before publication.
   Recovery disables media clock sleep for static re-proof and keeps JPEG
   JMI reset/power-cycle retirement. `amdgpu.rdna4_media_dpg=0` retains
-  static media idle and disables this media DPM/deep-sleep transition. Cold media setup now reads GC12's
+  static media idle and disables this media DPM/deep-sleep transition. Cold
+  media setup now reads GC12's
   segment-relative GB_ADDR_CONFIG at 0x13de; fixtures poison the older offset.
+- **RX 9000 runtime power.** The existing DML UCLK/FCLK convergence now
+  requires acknowledged watermark ranges and a strict clock-constraint replay
+  before relaxation. Runtime refusals or missing hard-min ACKs close the
+  owner. Newer per-die PMFW uses paired active/idle floors; older firmware
+  pins FCLK until the last display retires. `pp_power_profile_mode` exposes
+  factory presets 0/1/2/3/4/5/7, including compute sleep suppression, and
+  restores the last accepted preset on reset/resume. Board-supported GFX_ULV
+  follows native GC proofs; DS_DCFCLK follows a checked DML deep-sleep floor.
+  `amdgpu.rdna4_gfx_ulv=0` and `amdgpu.rdna4_dcf_sleep=0` skip those features.
+  All of these RX 9000 transitions still need physical acceptance.
 - **RX 6000 VCN3 idle power.** After one second of inactivity and physical
   fence completion, idle work releases encode DPG pause, stops VCN and sends
   PowerDownVcn when MM_DPM_PG is enabled. Begin-use restores power/hardware
@@ -155,15 +167,19 @@ IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
 
 Validation for statistics, memory, recovery and idle changes: native ioctl,
 MMIO and SMU model regressions cover both families.
-The full GPU suites report 2,710 pass / 0 fail /
-5 skip with `--arch x86_64`, and 2,164 pass / 0 fail / 1 skip with
+The full GPU suites report 2,724 pass / 0 fail /
+5 skip with `--arch x86_64`, and 2,178 pass / 0 fail / 1 skip with
 `--arch aarch64`. Coverage includes sensor/hwmon units and missing data,
 refresh cancellation, timestamp loss, original fence errors across engine
 replacement, GFXOFF activation/cancellation, physical VCN drain and static/DPG
 idle/resume failure paths. RX 9000 idle/DPG regressions cover separate PSP
-SRAM types, per-die JPEG admission, physical restore probes, retained sessions/IB slots, board feature
-masks, full hang recovery, cancellation and failed SRAM uploads.
-GPU, framebuffer and USB Clippy pass in all three feature contexts on both architectures;
+SRAM types, per-die JPEG admission, physical restore probes, retained
+sessions/IB slots, board feature masks, full hang recovery, cancellation and
+failed SRAM uploads. Fourteen new runtime-policy regressions cover workload
+masks, compute/display/media ordering, selection replay, per-die clock
+admission, missing/refused ACKs, custom-profile refusal and sysfs dispatch;
+the focused x86 policy run reports 61 pass / 0 fail / 0 skip.
+GPU and framebuffer Clippy pass in all three feature contexts on both architectures;
 `cargo fmt --all -- --check` passes. Production boot-smoke and btrfs
 interoperability checks also pass on both architectures.
 
@@ -172,6 +188,12 @@ workloads with `amdgpu.rdna4_media_dpg=0` and the default policy. Check
 repeated idle/use, GC sleeping during video, lost-device waits and media
 hang recovery, then system/runtime suspend and resume on both dies. Navi44
 must keep JPEG static while VCN uses DPG.
+Also change factory profiles at idle and under graphics/video/compute load;
+check the applied marker and running sleep bits, and verify the selected
+profile survives GPU reset, S3 and runtime resume. Exercise low-bandwidth,
+high-bandwidth, multi-display and no-display configurations, including
+hotplug while clocks can switch. Compare with GFX_ULV and DCF sleep disabled
+independently; capture clocks, underruns and recovery results on both dies.
 
 ## Not amdgpu, but seen during bring-up
 

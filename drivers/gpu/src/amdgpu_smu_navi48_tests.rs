@@ -1,4 +1,6 @@
 use super::*;
+#[path = "amdgpu_smu_navi48_profile_tests.rs"]
+mod profile_tests;
 use alloc::vec;
 use core::{
     future::Future,
@@ -40,6 +42,7 @@ struct Fake {
     reject_arg: Option<(u32, u32)>,
     interface: u32,
     enabled: u64,
+    allowed: u64,
     reported: Option<u64>,
     revoke: Option<(u32, Cap<BusDeviceCap, Write>)>,
     dirty: bool,
@@ -106,11 +109,11 @@ impl Io for Fake {
                 0
             }
             5 => {
-                self.enabled = (p as u64) << 32;
+                self.allowed = (self.allowed & 0xffff_ffff) | (u64::from(p) << 32);
                 0
             }
             4 => {
-                self.enabled |= p as u64;
+                self.allowed = (self.allowed & !0xffff_ffff) | u64::from(p);
                 0
             }
             0xc => self.reported.unwrap_or(self.enabled) as u32,
@@ -123,7 +126,11 @@ impl Io for Fake {
             0x1f if p & 0xffff == 0xff => self.dpm_count,
             0x1f if p >> 16 == 2 => 1258,
             0x1f => 3100,
-            0x4d | 0x36 | 6 | 0x19 | 0x1a | 0x28..=0x2d | 0x32 | 0x15..=0x17 => 0,
+            0x4d | 0x36 | 0x24 | 0x19 | 0x1a | 0x28..=0x2d | 0x32 | 0x15..=0x17 => 0,
+            6 => {
+                self.enabled = self.allowed;
+                0
+            }
             8 => {
                 self.enabled |= p as u64;
                 0
@@ -194,6 +201,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
                 reject_arg: None,
                 interface: DRIVER_INTERFACE,
                 enabled: 0,
+                allowed: 0,
                 reported: None,
                 revoke: None,
                 dirty: false,
@@ -214,6 +222,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
             limits: None,
             protection: 0,
             gfx_level: GfxLevel::Auto,
+            profile: PowerProfile::BootupDefault,
             baco: BacoState::Exit,
             boot_enabled: 0,
         },
@@ -591,6 +600,10 @@ fn display_engine() -> (Pool, Engine<Fake>) {
     let (pool, mut e) = fixture();
     e.state = State::PowerReady;
     e.features = ALLOWED | DISPLAY;
+    // Startup already enabled the baseline. Allowed-mask writes alone must
+    // never manufacture running features in this display-only fixture.
+    e.io.allowed = ALLOWED;
+    e.io.enabled = ALLOWED;
     e.power = Some(PowerStatus {
         allowed: ALLOWED,
         enabled: ALLOWED,
@@ -619,7 +632,7 @@ fn smu14_display_policy_enables_only_required_clocks_and_preserves_protection() 
         [
             (5, (power.allowed >> 32) as u32),
             (4, power.allowed as u32),
-            (6, 0),
+            (8, DISPLAY as u32),
             (12, 0),
             (13, 0),
             (0x1d, 2 << 16),
@@ -693,7 +706,7 @@ kernel_test_in!(
 );
 
 fn smu14_display_power_partial_failures_cancellation_and_revocation_are_terminal() -> TestResult {
-    for (i, message) in [5, 4, 6, 12, 13].into_iter().enumerate() {
+    for (i, message) in [5, 4, 8, 12, 13].into_iter().enumerate() {
         for case in 0..3 {
             let (_, mut e) = display_engine();
             let old = e.power;

@@ -458,6 +458,17 @@ activation; recovery returns to static policy for re-proof. Use
 `amdgpu.rdna4_media_dpg=0` for static media idle. Physical idle-power, session
 retention and reset/resume acceptance on both dies remain pending.
 
+RX 9000 also exposes factory workload presets through
+`card<N>/device/pp_power_profile_mode` (0 default, 1 fullscreen 3D, 2 power
+saving, 3 video, 4 VR, 5 compute, 7 windowed 3D). The applied preset has `*`;
+custom coefficients are unsupported. COMPUTE suppresses only admitted sleep
+features, and selection survives reset/resume. Memory/fabric relaxation uses
+the existing DML plans with acknowledged watermark/clock admission and strict
+runtime floor replies. Board-supported GFX_ULV and DS_DCFCLK have separate
+native GC and display-floor admission; `amdgpu.rdna4_gfx_ulv=0` and
+`amdgpu.rdna4_dcf_sleep=0` disable them for comparison. These paths remain
+software-model tested until acceptance on Navi48 and Navi44.
+
 - The Fedora image runs Fedora's Mesa (glibc), not this build; the musl
   build is the reference that the smoke and ioctl traces describe.
 - How the ext2 image reaches the board (USB/NVMe partition vs. the QEMU

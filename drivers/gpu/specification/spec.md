@@ -1439,8 +1439,11 @@ capability revalidation at every command/read/copy chunk.
 The internal `Smu::enable_display_power` transition extends the verified mask
 only with UCLK/FCLK/SOCCLK/DCN DPM (bits 3/4/5/7). The board must support all
 four; SCPM is checked again and required autonomous protections must remain
-enabled. Voltage scaling, link DPM and DF C-states stay excluded. Deep sleep
-and GFXOFF have separate owned transitions below. It requires retired display consumers and idle engines. Success
+enabled. Only those four bits are enabled with EnableSmuFeaturesLow;
+EnableAll is avoided so a COMPUTE workload cannot regain admitted sleep
+features during display startup. Memory-voltage scaling, link DPM and DF
+C-states stay excluded. Deep sleep, GFX_ULV and GFXOFF have separate owned
+transitions below. It requires retired display consumers and idle engines. Success
 publishes the new `PowerStatus`; partial failure/cancellation retains the
 owner and prevents replay. Only the retained DCN4 clock owner initiates this
 transition, after checking every display consumer. With UCLK DPM running it
@@ -1477,7 +1480,7 @@ socket/board watts, VDDGFX mV, current clocks, and a throttler bit per nonzero
 GFXCLK `SetSoftMaxByFreq` then `SetSoftMinByFreq`, as Linux
 `smu_v14_0_set_performance_level` does for GFXCLK (automatic `0xffff`/0
 bounds, `SMU_V14_SOFT_FREQ_ROUND` on manual maxima); display, memory and
-fabric clocks keep their pinned floors. Runtime commands run from
+fabric constraints remain with the display owner. Runtime commands run from
 `PowerReady`/`DisplayPowerReady` through a transient `Runtime` state: a clean
 PMFW rejection restores the previous state as in Linux, while timeout,
 revocation, device loss or cancellation leave the owner unusable.
@@ -1498,14 +1501,34 @@ or the owner fails; transport failures are terminal, as for every runtime
 command. Linux runs it from `smu_v14_0_2_set_power_profile_mode`
 (`smu_bump_power_profile_mode` at COMPLETE_INIT and on every profile
 change), and with `PP_SMC_POWER_PROFILE_COMPUTE` in the workload mask it
-disables deep sleep instead. Navi48 in narf has no power-profile path (no
-`pp_power_profile_mode`, no KFD compute profile), so the bootup default
-profile, which is not COMPUTE, is the only one: the display owner runs the
-enable once, right after the DCN4 clock owner started (narf turns display DPM
-on only then) and offered PMFW the watermark ranges
-(`ColdBoot::start_display_clocks`, below). A board whose display clocks never
-start keeps deep sleep off. DS_DCFCLK and GFX_ULV, which Linux's
-EnableAllSmuFeatures turns on at boot outside this walk, stay off.
+disables deep sleep instead. The retained workload selection now applies to
+this walk as well: COMPUTE admits the supported bits without enabling them.
+The display owner runs it after its clock startup and acknowledged watermark
+range transfer. DS_VCN is admitted by the retained media DPG owner; a media
+recovery withdraws that admission before static re-proof. Each later profile
+change affects only bits those owners already admitted.
+
+`PowerProfile` exposes the seven factory presets in SMU14's workload map:
+BOOTUP_DEFAULT (0), 3D_FULL_SCREEN (1), POWER_SAVING (2), VIDEO (3), VR (4),
+COMPUTE (5) and WINDOW_3D (7). `Smu::set_power_profile` preserves board limits,
+GFXCLK soft bounds, display constraints and all protections. It checks fresh
+running/protection masks, adjusts only already admitted sleep features, then
+sends SetWorkloadMask (0x24) with the corresponding single-bit factory mask.
+COMPUTE disables admitted DS_GFXCLK/SOCCLK/FCLK/LCLK/UCLK/VCN, DS_DCFCLK and
+GFX_ULV; other profiles restore only admitted, board-supported bits. A clean
+refusal before a mutation leaves the previous selection reusable; failure
+after partial policy changes is terminal. Cancellation leaves Runtime closed,
+and the selected profile changes only after the whole operation succeeds.
+
+GFX_ULV (feature 16) is admitted after fresh GC/RLC/GMC/IRQ proofs. DS_DCFCLK
+(feature 14) requires the matching display owner's acknowledged watermark
+ranges, successful strict clock-admission replay, and a positive DML deep-sleep
+DCFCLK floor. Both are restricted by FeaturesToRun and the selected profile.
+`amdgpu.rdna4_gfx_ulv=0` and `amdgpu.rdna4_dcf_sleep=0` independently skip
+these admissions. All admitted features retain PMFW's board-defined limits;
+there is no voltage or coefficient tuning interface. Reset/resume reconstructs
+the clock and sleep admissions and restores the last successfully applied
+factory profile before fresh queue/media/display proofs and client publication.
 
 After the native queue and requested media proofs complete,
 `amdgpu_navi48_gfxoff` starts a separate GC12 controller on both Navi48 and
@@ -1576,7 +1599,18 @@ requests. Reads report the last successfully applied level (initially `auto`),
 updated synchronously under OWNER only after both GFXCLK bounds succeed;
 rejected or cancelled changes never publish the requested level. Display,
 memory and fabric floors remain with their existing admission owners.
-Other power-policy feature-mask controls are unchanged.
+The card and PCI-device sysfs `pp_power_profile_mode` use
+`DrmCard::{power_profiles, set_power_profile}` (defaults None/Unsupported),
+backed on both RDNA4 dies by `amdgpu_navi48_power::{profiles, request_profile}`.
+Reads list factory names and mark the applied profile with `*`; they issue no
+mailbox transaction. Stores accept one decimal factory ID (surrounding
+whitespace allowed); malformed values are EINVAL and custom profile 6 with
+or without coefficient arguments is EOPNOTSUPP. A separate async mutex and
+request counter coalesce pending profile writes. After runtime-PM access,
+the task checks its original power-owner generation under OWNER before any
+policy write. No GC lease or GC MMIO is needed. Successful application updates
+the published profile synchronously under OWNER; telemetry carries the same
+selection. Other power-policy feature-mask controls are unchanged.
 
 `amdgpu_navi48_power::thermal` retains THM/MP1 interrupt-register ownership
 in the independent IH service. Native THM14.0.2/3 bank0 and MP1 bank1 are
@@ -1698,6 +1732,27 @@ TransferTableDram2Smu (8) of TABLE_WATERMARKS (2), each refusal or sent timeout
 ignored and logged the same way. The owner stays `Applying` throughout the
 sequence and on cancellation; a transport/authority failure enters `Failed`,
 so a partially sent watermark sequence cannot be reused.
+
+`Status::watermarks_ready` records actual success of all three table messages;
+a saturated ignored-message counter cannot manufacture it. Native
+`prepare_display_clocks` and every live bandwidth update pass through
+`admit_dynamic_power(regs, held)` before runtime relaxation or DS_DCFCLK
+admission. It checks owned consumers and acknowledged watermarks, refuses
+an outstanding legacy transaction, marks Applying before awaits, then replays
+NumOfDisplays, DCFCLK's maximum floor, and pinned UCLK/FCLK active/idle
+floors with real acknowledgements. On older PMFW without paired idle DPM,
+FCLK keeps an explicitly acknowledged maximum while displays run.
+
+A successful replay publishes `Status::dynamic_power` with Applied. From
+then on bandwidth, display-count, deep-sleep-floor and watermark messages
+require their actual replies and hard-min acknowledgements. Refusal, missing
+ACK, revocation or cancellation closes the retained owner; diagnostic old
+floors never establish a successful update. Runtime requests are bounded by
+the board ranges and idle floors cannot exceed active floors. DML continues
+to select admissible modes, latencies and per-pipe watermarks; lowering is
+still an optimize step after their updates. Both Navi48 and Navi44 use their
+own existing minimum PMFW versions for paired idle DPM. With no displays,
+legacy FCLK's hard minimum is also released to its first level.
 
 `release(regs).await` is dcn401_update_clocks' optimize once no stream is
 left (NumOfDisplays 0, DCFCLK, UCLK and FCLK at their lowest levels, UCLK
@@ -6509,9 +6564,11 @@ expanded lists (`dcn401_pstate_strategy_lists_match_linux`).
 The display owner applies the answer as dcn401_prepare/optimize_bandwidth.
 `ColdBoot::start_display_clocks`, once the clock owner started, writes
 `wm_range_table` to a 4-KiB VRAM range kept out of reuse, sends
-`notify_wm_ranges` and runs `deep_sleep_control`. A table that cannot be
-placed is skipped (as Linux skips a missing `wm_range_table`); firmware
-refusals and ignored sent timeouts do not fail bring-up. An interrupted or
+`notify_wm_ranges` and, only with acknowledged ranges, runs the selected
+profile's `deep_sleep_control`. A table that cannot be placed or acknowledged
+keeps runtime clock relaxation and DS_DCFCLK unavailable. Bootstrap may keep
+the pinned path, while strict runtime admission requires fresh acknowledged
+constraints before enabling any relaxation. An interrupted or
 authority-failed watermark transaction retains an unusable clock owner,
 which subsequent preparation refuses. Every refusal or error is logged in
 `ColdBoot::display_power_policy()` (`DisplayPowerPolicy { wm_ranges,

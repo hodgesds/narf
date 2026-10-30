@@ -584,6 +584,7 @@ impl Backend for Hardware {
 }
 #[derive(Debug)]
 pub struct ColdBoot {
+    power_profile: smu::PowerProfile,
     sequence: alloc::boxed::Box<Sequence<Hardware>>,
     reset: Option<crate::amdgpu_reset_navi22::Reset>,
     /// PMFW acknowledged the BACO exit of a runtime resume: SMU firmware
@@ -841,6 +842,7 @@ impl ColdBoot {
             client_heap: None,
             unmapped_vram: unmapped.clone(),
             display_power_policy: None,
+            power_profile: smu::PowerProfile::BootupDefault,
             reset: None,
             baco_exited: false,
             sequence: alloc::boxed::Box::new(Sequence {
@@ -998,6 +1000,7 @@ impl ColdBoot {
                 None,
             )
         }?;
+        new.power_profile = self.power_profile();
         new.client_heap = self.client_heap.take();
         if let Some(heap) = &mut new.client_heap {
             heap.unmapped = None;
@@ -1685,10 +1688,12 @@ impl ColdBoot {
             .await
             .map_err(crate::amdgpu_info_stats::smu14_error)
     }
-    pub(crate) fn power_info(&self) -> Option<(Option<smu::Limits>, smu::GfxLevel)> {
+    pub(crate) fn power_info(
+        &self,
+    ) -> Option<(Option<smu::Limits>, smu::GfxLevel, smu::PowerProfile)> {
         let smu = self.sequence.backend.smu.as_ref()?;
         (self.state() == State::MemoryReady && smu.power_status().is_some())
-            .then(|| (smu.limits(), smu.gfx_level()))
+            .then(|| (smu.limits(), smu.gfx_level(), smu.power_profile()))
     }
     fn power_owner(&mut self) -> Result<&mut smu::Smu, Error> {
         if self.state() != State::MemoryReady {
@@ -1708,9 +1713,10 @@ impl ColdBoot {
             telemetry,
             limits: smu.limits(),
             gfx_level: smu.gfx_level(),
+            profile: smu.power_profile(),
         })
     }
-    /// GFXCLK soft limits only; display/memory clocks stay pinned.
+    /// PPT only; display and memory constraints stay with the display owner.
     pub async fn set_power_cap(&mut self, watts: u32) -> Result<(), Error> {
         self.power_owner()?
             .set_ppt_limit(watts)
@@ -1764,7 +1770,15 @@ impl ColdBoot {
         request: clocks::Request,
     ) -> Result<clocks::Applied, clocks::Error> {
         self.start_display_clocks().await?;
-        self.clocks.as_mut().map_err(|e| *e)?.prepare(request).await
+        self.clocks
+            .as_mut()
+            .map_err(|e| *e)?
+            .prepare(request)
+            .await?;
+        self.configure_display_saving().await?;
+        self.display_clock_status()?
+            .applied
+            .ok_or(clocks::Error::Invalid)
     }
     /// Query board DPM limits without requesting any active displays or
     /// programming pipe clocks. The same ownership checks govern both paths.
@@ -1816,9 +1830,9 @@ impl ColdBoot {
     /// dcn401_init_hw's dcn401_notify_wm_ranges hands PMFW the watermark
     /// range table (set A, and set 1A for the dummy P-state), and
     /// smu_bump_power_profile_mode's smu_v14_0_2_set_power_profile_mode runs
-    /// smu_v14_0_deep_sleep_control(true) for the default workload (narf has
-    /// no power-profile or compute-profile path on Navi48, so the bootup
-    /// default profile, which is not COMPUTE, is the only one). As in Linux,
+    /// smu_v14_0_deep_sleep_control for the retained workload: enable for
+    /// non-COMPUTE, disable for COMPUTE. Table acknowledgement precedes
+    /// admission; runtime bandwidth replays require strict replies. As in Linux,
     /// a table that cannot be placed is skipped, and firmware refusals are
     /// logged and recorded (`display_power_policy`). An interrupted or
     /// authority-failed watermark transaction leaves the clock owner
@@ -1833,7 +1847,17 @@ impl ColdBoot {
             // as Linux's do; every plan's watermarks carry DML's
             // self-refresh exit latencies and the deep-sleep DCFCLK floor,
             // and the watermark ranges were offered to PMFW above.
-            Some(smu) => Some(unsafe { smu.deep_sleep_control() }.await),
+            Some(smu)
+                if self
+                    .clocks
+                    .as_ref()
+                    .is_ok_and(|c| c.status().watermarks_ready) =>
+            {
+                // SAFETY: the retained display owner acknowledged the table
+                // and its DML plans retain the required latency constraints.
+                Some(unsafe { smu.deep_sleep_control() }.await)
+            }
+            Some(_) => None,
             None => None,
         };
         match deep_sleep {
@@ -2590,6 +2614,10 @@ impl ColdBoot {
         let regs = self.sequence.backend.gpu.regs;
         let old = clocks
             .retained_pipe_clocks(regs)
+            .map_err(otg::Error::Clocks)?;
+        clocks
+            .admit_dynamic_power(regs, &held)
+            .await
             .map_err(otg::Error::Clocks)?;
         let new = clocks
             .update_bandwidth(regs, bandwidth, safe_to_lower, &held)
@@ -4252,7 +4280,11 @@ impl ColdBoot {
     /// the unified MES12 firmware queues and the DMUB capability handshake.
     /// It does not establish userspace queues or a native display mode.
     pub async fn run(&mut self) -> Result<Report, Error> {
-        self.sequence.run().await
+        let report = self.sequence.run().await?;
+        // Restore before fresh queue/media/display power admission or clients.
+        let profile = self.power_profile;
+        self.set_power_profile(profile).await?;
+        Ok(report)
     }
     /// Access the live display mailbox while retaining this session's PSP/TMR.
     pub fn dmub(&mut self) -> Result<&mut dmub::Dmub, Error> {
@@ -4329,3 +4361,6 @@ pub use teardown::{TeardownStatus, TeardownStep};
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi48_boot_tests.rs"]
 mod tests;
+
+#[path = "amdgpu_navi48_boot_power.rs"]
+mod power_policy;

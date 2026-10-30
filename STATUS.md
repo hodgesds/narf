@@ -1965,7 +1965,7 @@ Still open: physical MSI delivery and reset/replay acceptance, GC12 rendering
 and application shader execution, GPU VM/userspace and DCN4
 clock/bandwidth/link/scanout hardware acceptance, VCN5 known-stream video,
 thermal/CTF and reset/suspend/resume hardware acceptance, memory/fabric DPM
-relaxation (display admission/watermark rework first), and physical RX 9000
+and low-power transition hardware acceptance, and physical RX 9000
 testing on both Navi48 and Navi44. Thermal interrupts/shutdown, system/runtime
 PM and training replay already have software implementations; older entries
 above are historical, not a current missing-feature list.
@@ -1990,6 +1990,22 @@ Board-supported MM_DPM and DS_VCN follow DPG activation. Recovery disables
 media sleep before static re-proof, and JPEG hang retirement keeps its
 JMI reset/power cycle. `amdgpu.rdna4_media_dpg=0` retains static media policy.
 Physical power-transition and session-retention acceptance remain pending.
+
+RX 9000 runtime power now also has seven factory workload presets through
+`pp_power_profile_mode`, including COMPUTE's sleep suppression. Selection
+changes are serialized, coalesced and bound to their admitting owner; reset
+and resume restore the last accepted profile before fresh client proofs.
+Memory/fabric DPM already had DML admission and P-state convergence; its
+runtime path now requires acknowledged watermark ranges and a strict replay
+of clock constraints before relaxation. Refused or incomplete runtime floors
+cannot be published as applied. Newer per-die PMFW uses active/idle UCLK/FCLK
+pairs; older PMFW retains a checked FCLK maximum until the last display leaves.
+Board-supported GFX_ULV follows native GC proofs, and DS_DCFCLK follows the
+acknowledged DML deep-sleep floor. Independent `amdgpu.rdna4_gfx_ulv=0` and
+`amdgpu.rdna4_dcf_sleep=0` switches skip those features. Software models cover
+factory masks, compute/display/media interactions, reset selection replay,
+per-die thresholds, partial failures and cancellation; physical acceptance
+remains pending on both dies.
 
 Navi22 third-review fixes (software-model tested only): DRM ioctl user copies
 apply `access_ok` and fault-guarded copies (EFAULT); NVMe/AHCI bring-up

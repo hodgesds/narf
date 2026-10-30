@@ -443,8 +443,8 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     }
     narf_scheduler::spawn(prove_queue_interrupts());
     idle::start();
-    if let Some((limits, level)) = boot.power_info() {
-        crate::amdgpu_navi48_power::start(limits, level);
+    if let Some((limits, level, profile)) = boot.power_info() {
+        crate::amdgpu_navi48_power::start(limits, level, profile);
     }
     register_submitter(
         boot,
@@ -1273,6 +1273,7 @@ async unsafe fn restart(
     unsafe { boot.prove_queue_interrupts().await }.map_err(boot::Error::Queues)?;
     // SAFETY: GC12 proof drained; SDMA exclusively owns the same GMC test pages.
     unsafe { boot.prove_sdma_interrupts().await }.map_err(boot::Error::Sdma)?;
+    boot.configure_graphics_saving().await?;
     if SHADER_PROOF.load(Ordering::Acquire) {
         // SAFETY: new queues are drained and all test-page users stay under OWNER.
         unsafe { boot.prove_shaders().await }.map_err(boot::Error::Queues)?;
@@ -1319,8 +1320,8 @@ async unsafe fn restart(
     RECOVERY_STATE.store(2, Ordering::Release);
     idle::start();
     crate::amdgpu_navi48_gfxoff::start();
-    if let Some((limits, level)) = owner.as_ref().and_then(|b| b.power_info()) {
-        crate::amdgpu_navi48_power::restart(limits, level);
+    if let Some((limits, level, profile)) = owner.as_ref().and_then(|b| b.power_info()) {
+        crate::amdgpu_navi48_power::restart(limits, level, profile);
     }
     if restart_display {
         // SAFETY: caller's external writer exclusions and the existing native
@@ -2122,6 +2123,26 @@ async fn apply_gfx_level(
     Ok(())
 }
 
+pub(crate) async fn set_power_profile_current(
+    profile: crate::amdgpu_smu_navi48::PowerProfile,
+    generation: u64,
+) -> Result<(), boot::Error> {
+    let _rpm = crate::amdgpu_navi48_runtime_pm::access().await?;
+    // Workload/features use only PPSMC, so a stale request must not even
+    // acquire a GC lease (which could send DisallowGfxOff to a successor).
+    let mut owner = OWNER.lock().await;
+    if !crate::amdgpu_navi48_power::level_owner_current(generation) {
+        return Err(boot::Error::Invalid);
+    }
+    owner
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .set_power_profile(profile)
+        .await?;
+    crate::amdgpu_navi48_power::applied_profile(profile);
+    Ok(())
+}
+
 async fn prove_queue_interrupts() {
     let mut owner = OWNER.lock().await;
     if let Some(boot) = owner.as_mut() {
@@ -2134,6 +2155,14 @@ async fn prove_queue_interrupts() {
             let proved = unsafe { boot.prove_sdma_interrupts().await };
             // SDMA0 now runs jobs, so it can clear VRAM past the BAR.
             if proved.is_ok() {
+                if let Err(error) = boot.configure_graphics_saving().await {
+                    crate::amdgpu_navi48_interrupts::lose();
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut narf_console::Writer,
+                        format_args!("amdgpu: rdna4 GFX ULV admission failed: {error:?}\n"),
+                    );
+                    return;
+                }
                 if SHADER_PROOF.load(Ordering::Acquire) {
                     // SAFETY: both interrupt proofs drained; OWNER retains every
                     // queue and test page before client/clear work can acquire it.

@@ -11,6 +11,7 @@ use crate::{
 use alloc::vec::Vec;
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
+pub use profile::PowerProfile;
 
 const MESSAGE: u32 = 0x82;
 const ARGUMENT: u32 = 0x92;
@@ -318,6 +319,7 @@ struct Engine<I: Io> {
     /// PROTECTION bits running when boot power configuration completed.
     protection: u64,
     gfx_level: GfxLevel,
+    profile: PowerProfile,
     /// `smu_baco->state`.
     baco: BacoState,
     /// The features running after boot configuration (Linux's SUPPORTED
@@ -539,7 +541,9 @@ impl<I: Io> Engine<I> {
             let allowed = previous.allowed | DISPLAY;
             self.command(5, (allowed >> 32) as u32).await?;
             self.command(4, allowed as u32).await?;
-            self.command(6, 0).await?;
+            // Preserve intentionally disabled sleep features (COMPUTE).
+            // EnableAll would re-enable every previously admitted sleep bit.
+            self.command(8, DISPLAY as u32).await?;
             let low = u64::from(self.command(0xc, 0).await?);
             let enabled = low | (u64::from(self.command(0xd, 0).await?) << 32);
             if enabled & (REQUIRED | DISPLAY) != REQUIRED | DISPLAY || enabled & !allowed != 0 {
@@ -941,8 +945,13 @@ impl<I: Io> Engine<I> {
             if refused.is_none() {
                 for (bit, feature) in walk {
                     let sent = async {
-                        self.command(8, bit as u32).await?;
-                        self.command(9, (bit >> 32) as u32).await
+                        self.command(if self.profile.compute() { 0xa } else { 8 }, bit as u32)
+                            .await?;
+                        self.command(
+                            if self.profile.compute() { 0xb } else { 9 },
+                            (bit >> 32) as u32,
+                        )
+                        .await
                     }
                     .await;
                     match sent {
@@ -957,7 +966,10 @@ impl<I: Io> Engine<I> {
             }
             let enabled = self.running().await?;
             // Nothing outside the allowed mask and the walk may run.
-            if enabled & required != required || enabled & !(allowed | bits) != 0 {
+            if enabled & required != required
+                || enabled & !(allowed | bits) != 0
+                || (self.profile.compute() && enabled & bits != 0)
+            {
                 return Err(Error::Features(enabled));
             }
             Ok(DeepSleep {
@@ -1071,6 +1083,7 @@ impl Smu {
                 limits: None,
                 protection: 0,
                 gfx_level: GfxLevel::Auto,
+                profile: PowerProfile::BootupDefault,
                 baco: BacoState::Exit,
                 boot_enabled: 0,
             },
@@ -1212,6 +1225,8 @@ impl Smu {
 mod gfxoff;
 #[path = "amdgpu_smu_navi48_media.rs"]
 mod media;
+#[path = "amdgpu_smu_navi48_profile.rs"]
+mod profile;
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_smu_navi48_tests.rs"]
 mod tests;

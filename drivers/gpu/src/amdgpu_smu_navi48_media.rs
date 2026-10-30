@@ -7,7 +7,12 @@ impl<I: Io> Engine<I> {
         enable: bool,
     ) -> Result<PowerStatus, Error> {
         let previous = self.power.ok_or(Error::Invalid)?;
-        let bits = if enable { self.features & FEATURES } else { 0 };
+        let admitted = if enable { self.features & FEATURES } else { 0 };
+        let bits = if self.profile.compute() {
+            admitted & !(1 << 44)
+        } else {
+            admitted
+        };
         let resume = self.begin_runtime()?;
         let result = async {
             self.access(|io| io.check_policy())??;
@@ -15,7 +20,7 @@ impl<I: Io> Engine<I> {
             if !self.protected(running) {
                 return Err(Error::Features(running));
             }
-            let allowed = (previous.allowed & !FEATURES) | bits;
+            let allowed = (previous.allowed & !FEATURES) | admitted;
             if enable {
                 self.command(5, (allowed >> 32) as u32).await?;
                 self.command(4, allowed as u32).await?;
