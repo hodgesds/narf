@@ -40,6 +40,7 @@ fn until(mut condition: impl FnMut() -> bool) -> R {
             return Ok(());
         }
         if deadline.expired() {
+            diagnose("Sc native security progress bound");
             return Err("Sc native security progress bound");
         }
     }
@@ -412,7 +413,8 @@ fn smoke_sc_pmf_native_m4_keeps_closed_copies_out_of_successor_epoch() -> TestRe
         require(
             HARNESS.lock().as_ref().unwrap().1.received.as_slice() == [frame],
             "Sc PMF closed copy consumed a successor key PN",
-        )
+        )?;
+        Ok(())
     })
 }
 kernel_test_in!(
@@ -481,7 +483,12 @@ fn acknowledged_rotation(
     counter: u64,
 ) -> R {
     rotation(gtk, igtk, counter)?;
-    until(|| HARNESS.lock().as_ref().unwrap().1.group_reply)
+    until(|| HARNESS.lock().as_ref().unwrap().1.group_reply).map_err(|_| match counter {
+        3 => "Sc first authenticated group rotation stalled",
+        4 => "Sc second authenticated group rotation stalled",
+        5 => "Sc third authenticated group rotation stalled",
+        _ => "Sc later authenticated group rotation stalled",
+    })
 }
 fn initial_history_ap() -> R<FakeAp> {
     psk_ap(2)?
@@ -525,7 +532,8 @@ fn smoke_sc_native_igtk_multiple_rotations_reject_retired_material_before_remove
         require(
             key_commands() == before && !HARNESS.lock().as_ref().unwrap().1.group_reply,
             "Sc retired IGTK returned with native REMOVE/ADD or an authenticated reply",
-        )
+        )?;
+        Ok(())
     })
 }
 kernel_test_in!(
@@ -548,7 +556,8 @@ fn smoke_sc_native_gtk_overwritten_slots_reject_retired_material_before_native_m
         require(
             key_commands() == before && !HARNESS.lock().as_ref().unwrap().1.group_reply,
             "Sc overwritten retired GTK returned with reset PN/native key mutation",
-        )
+        )?;
+        Ok(())
     })
 }
 kernel_test_in!(
