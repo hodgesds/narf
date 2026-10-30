@@ -61,11 +61,13 @@ impl Io for BootPort {
         self.packet.read32(reg)
     }
     fn write8(&self, reg: u16, value: u8) -> Result<(), AccessError> {
+        let begin_download =
+            reg == 0x80 && value & 1 != 0 && self.packet.radio.hardware_read8(0x80) & 1 == 0;
         self.packet.write8(reg, value)?;
         if reg == 0x80 && value & 4 != 0 {
             self.packet.radio.hardware_byte(reg, value & !4);
         }
-        if reg == 0x80 && value == 0 {
+        if begin_download {
             for page in self.pages.lock().iter_mut() {
                 page.clear();
             }
