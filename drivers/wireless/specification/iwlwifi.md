@@ -3145,6 +3145,45 @@ MVM key/BA/PN owner remains a separate residual; this MLD continuation
 cannot close the whole multiple-RX-queues row or enable parked chips.
 
 
+### 3.51 Sc native TX A-MSDU batching
+
+The Sc station intersects its confirmed WMM/HT peer, admitted access
+category and native TLC v2/v3/v4 station0 A-MSDU size/TID feedback before
+batching. Feedback remains a scheduling/geometry fact; it supplies no key,
+controlled-port, firmware, PCI or RF authority. Malformed matching feedback
+suppresses batching, and a foreign station cannot replace local facts.
+An actual firmware shared-memory receipt bounds every candidate further.
+The retained firmware's capability40 selects the CDB LMAC by the current
+2.4/5GHz band, and capability80 selects Linux's extended SYSTEM command
+rather than the legacy bare opcode. FIFO addresses remain opaque. The
+Bz EDCA FIFO order starts at BK0/BE1/VI2/VO3; negotiated HE selects the
+corresponding trigger FIFO4–7. The sender keeps Linux's256-byte FIFO
+margin and the existing3839-byte complete-MPDU bound. Unavailable or
+unsupported geometry leaves the ordinary single-frame path available;
+an uncertain native query retains its command/DMA owner and fails closed.
+
+Two original IPC frames and their individual credit deadlines remain
+owned until native publication succeeds. Busy credit preserves both;
+an unsuitable pair uses singles without discarding the second packet or
+renewing its deadline. Partial-checksum requests keep the existing
+single-frame hardware offload. The structural A-MSDU encoder refuses
+control/tunnel encapsulations and foreign source/multicast destinations.
+The host builds bounded plaintext subframes and the original QoS header;
+firmware keeps the installed CCMP key and assigns one PN to the complete
+MPDU. Native AMSDU/PAD flags remain exclusive, with no QoS padding gap.
+Every actual queue publication invokes the existing current source/PCI/
+regulatory owner, and key/close epochs keep their existing all-ring fence.
+
+Four native Sc tests are wired for Open/WPA2/HE, actual extended and
+legacy SMEM selection, CDB/HE FIFO bounds, TLC/TID/partial-checksum
+fallback, and two-frame retention under native credit exhaustion across
+the physical TX ring wrap. Actual executable/PNVM revocation is exercised
+with retained credit-blocked frames and a held native SMEM query; late
+receipts cannot authorize publication and uncertain DMA stays pinned.
+Coordinated native execution remains pending; no physical RF acceptance
+or parked Gen3 station enablement follows from this Sc continuation.
+Gen2 retains its independently qualified sender in §3.43.
+
 ## 4. References
 
 - Linux `drivers/net/wireless/intel/iwlwifi/`

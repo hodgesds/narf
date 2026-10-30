@@ -61,13 +61,20 @@ impl<T> PendingTx<T> {
         }
     }
 
+    pub(super) fn frame(&self) -> &T {
+        &self.frame
+    }
+    pub(super) fn expired(&self) -> bool {
+        self.deadline.expired()
+    }
+
     /// Try once. A lack of credit preserves the exact original packet and
     /// its deadline; success alone permits the caller to retire this slot.
     pub(super) fn progress<E>(
         &self,
         submit: impl FnOnce(&T) -> Result<bool, E>,
     ) -> Result<Transmit, E> {
-        if self.deadline.expired() {
+        if self.expired() {
             Ok(Transmit::Expired)
         } else {
             submit(&self.frame).map(|sent| if sent { Transmit::Sent } else { Transmit::Busy })

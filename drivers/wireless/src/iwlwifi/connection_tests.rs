@@ -57,6 +57,10 @@ fn connection() -> Connection {
         management_pn: 0,
         key_history: super::super::sc_security::KeyHistory::default(),
         he: None,
+        tx_amsdu: super::super::sc_tx_amsdu::Limits::default(),
+        amsdu_memory: None,
+        amsdu_memory_attempted: false,
+        tlc_notification_version: None,
     }
 }
 

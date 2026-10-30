@@ -36,7 +36,7 @@ impl SharedMemory {
         };
         self.tx_fifo_bytes(lmac, fifo)?.checked_sub(256)
     }
-    pub(super) fn parse(version: u8, bytes: &[u8]) -> Result<Self, &'static str> {
+    pub(in crate::iwlwifi) fn parse(version: u8, bytes: &[u8]) -> Result<Self, &'static str> {
         if version > 4
             || bytes.len() < 180
             || bytes.len() > 260

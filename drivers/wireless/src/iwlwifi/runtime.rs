@@ -628,6 +628,7 @@ pub struct Hardware {
     versions: Vec<u8>,
     bios_versions: Vec<u8>,
     platform_power: platform_power::State,
+    shared_memory: smem::State,
     armed: bool,
     failed: bool,
     station_stop: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
@@ -733,6 +734,7 @@ impl Hardware {
             versions: parsed.api.commands.to_vec(),
             bios_versions: parsed.api.bios_commands.unwrap_or(&[]).to_vec(),
             platform_power: platform_power::State::default(),
+            shared_memory: smem::State::new(parsed),
             armed: false,
             failed: false,
             station_stop: None,
@@ -1532,6 +1534,7 @@ impl Hardware {
         }
         self.resources = core::mem::ManuallyDrop::new(resources);
         self.platform_power = platform_power::State::default();
+        self.shared_memory = smem::State::new(parsed);
         self.receive_queues = rx_multi::State::default();
         self.rx_epoch.reset_after_dma_stop();
         self.armed = false;
@@ -1961,3 +1964,6 @@ mod platform_power;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "runtime_stop_tests.rs"]
 mod stop_tests;
+
+#[path = "runtime_smem.rs"]
+mod smem;

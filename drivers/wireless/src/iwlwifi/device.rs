@@ -72,6 +72,7 @@ struct State {
     eapol: VecDeque<Vec<u8>>,
     tx: [Option<Consumer<Frame, TX_RING_N>>; 4],
     pending: [Option<PendingTx<Frame>>; 4],
+    pending_next: [Option<PendingTx<Frame>>; 4],
     tx_progress: bool,
 }
 
@@ -112,6 +113,7 @@ impl Delivery {
 impl State {
     fn clear_transmit(&mut self) {
         self.pending = core::array::from_fn(|_| None);
+        self.pending_next = core::array::from_fn(|_| None);
         self.tx_progress = false;
         for consumer in self.tx.iter_mut().flatten() {
             for _ in 0..TX_RING_N {
@@ -130,6 +132,9 @@ impl State {
         };
         for category in 0..4 {
             if self.pending[category].is_none() {
+                self.pending[category] = self.pending_next[category].take();
+            }
+            if self.pending[category].is_none() {
                 if let Some(consumer) = &mut self.tx[category] {
                     let frame = if let Some(cx) = cx.as_deref_mut() {
                         match Pin::new(&mut consumer.recv()).poll(cx) {
@@ -140,6 +145,48 @@ impl State {
                         consumer.try_recv().ok().flatten()
                     };
                     self.pending[category] = frame.map(PendingTx::new);
+                }
+            }
+            if connection.can_batch(category)
+                && self.pending[category].is_some()
+                && self.pending_next[category].is_none()
+            {
+                self.pending_next[category] = self.tx[category]
+                    .as_mut()
+                    .and_then(|consumer| consumer.try_recv().ok().flatten())
+                    .map(PendingTx::new);
+            }
+            if let (Some(first), Some(second)) =
+                (&self.pending[category], &self.pending_next[category])
+            {
+                if first.expired() || second.expired() {
+                    return Err("TX batch queue credit timed out");
+                }
+                let first = first.frame();
+                let second = second.frame();
+                // A partial checksum retains the existing single-frame HW
+                // offload. Both original IPC frames/deadlines stay owned
+                // while an otherwise valid aggregate lacks native credit.
+                let result =
+                    if first.tx_meta().csum_l4.is_some() || second.tx_meta().csum_l4.is_some() {
+                        super::connection::tx_amsdu::Batch::Unsuited
+                    } else {
+                        connection.try_enqueue_batch(
+                            &mut self.hardware,
+                            first.payload(),
+                            second.payload(),
+                            category,
+                        )?
+                    };
+                match result {
+                    super::connection::tx_amsdu::Batch::Sent => {
+                        self.pending[category] = None;
+                        self.pending_next[category] = None;
+                        self.tx_progress = true;
+                        continue;
+                    }
+                    super::connection::tx_amsdu::Batch::Busy => continue,
+                    super::connection::tx_amsdu::Batch::Unsuited => {}
                 }
             }
             if let Some(pending) = &self.pending[category] {
@@ -154,7 +201,7 @@ impl State {
                     )
                 })? {
                     Transmit::Sent => {
-                        self.pending[category] = None;
+                        self.pending[category] = self.pending_next[category].take();
                         self.tx_progress = true;
                     }
                     Transmit::Busy => {}
@@ -208,6 +255,7 @@ impl Device {
                 eapol: VecDeque::new(),
                 tx: core::array::from_fn(|_| None),
                 pending: core::array::from_fn(|_| None),
+                pending_next: core::array::from_fn(|_| None),
                 tx_progress: false,
             }),
             control: Mutex::new(None),

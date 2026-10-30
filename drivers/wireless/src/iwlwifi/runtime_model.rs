@@ -345,6 +345,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         versions: Vec::new(),
         bios_versions: Vec::new(),
         platform_power: platform_power::State::default(),
+        shared_memory: smem::State::default(),
         armed: false,
         failed: false,
         station_stop: None,
@@ -378,12 +379,28 @@ pub(in crate::iwlwifi) unsafe fn destroy(hardware: Hardware) {
         core::ptr::drop_in_place(&mut hardware.versions);
         core::ptr::drop_in_place(&mut hardware.bios_versions);
         core::ptr::drop_in_place(&mut hardware.platform_power);
+        core::ptr::drop_in_place(&mut hardware.shared_memory);
         core::ptr::drop_in_place(&mut hardware.receive_queues);
     };
 }
 
 pub(in crate::iwlwifi) fn versions(hardware: &mut Hardware, commands: &[u8]) {
     hardware.versions = commands.to_vec();
+}
+
+/// Consume the same decoded firmware facts as native Hardware::new.
+/// No production fields are supplied as a second synthetic profile.
+pub(in crate::iwlwifi) fn firmware_profile(
+    hardware: &mut Hardware,
+    parsed: &ParsedUcode<'_>,
+) -> Result<(), &'static str> {
+    if hardware.device.id.vendor != 0xffff || hardware.armed || !hardware.resources.data.is_empty()
+    {
+        return Err("model firmware metadata on a live/native station");
+    }
+    hardware.versions = parsed.api.commands.to_vec();
+    hardware.shared_memory = smem::State::new(parsed);
+    Ok(())
 }
 
 /// Post-firmware-ready Sc model with no pre-created station queues. The
@@ -427,6 +444,7 @@ pub(in crate::iwlwifi) fn restart(hardware: &mut Hardware) -> Result<(), &'stati
     commands.trace = trace;
     hardware.resources.commands = commands;
     hardware.platform_power = platform_power::State::default();
+    hardware.shared_memory.reset();
     hardware.receive_queues = rx_multi::State::default();
     // This is the fixture's terminal DMA-stop boundary. Retire observation
     // views before releasing any of the actual additional ring allocations.

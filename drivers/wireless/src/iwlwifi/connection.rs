@@ -71,6 +71,10 @@ pub struct Connection {
     management_pn: u64,
     key_history: super::sc_security::KeyHistory,
     he: Option<super::sc_he::Profile>,
+    tx_amsdu: super::sc_tx_amsdu::Limits,
+    amsdu_memory: Option<super::Gen2SharedMemory>,
+    amsdu_memory_attempted: bool,
+    tlc_notification_version: Option<u8>,
 }
 
 impl core::fmt::Debug for Connection {
@@ -163,6 +167,10 @@ impl Connection {
             management_pn: 0,
             key_history: super::sc_security::KeyHistory::default(),
             he: None,
+            tx_amsdu: super::sc_tx_amsdu::Limits::default(),
+            amsdu_memory: None,
+            amsdu_memory_attempted: false,
+            tlc_notification_version: None,
         }
     }
     #[cfg(any(test, feature = "kernel-test"))]
@@ -423,6 +431,10 @@ impl Connection {
             management_pn: 0,
             key_history: super::sc_security::KeyHistory::default(),
             he: None,
+            tx_amsdu: super::sc_tx_amsdu::Limits::default(),
+            amsdu_memory: None,
+            amsdu_memory_attempted: false,
+            tlc_notification_version: hw.version(5, 0xf7).map(|v| v.1),
         };
         // Authenticate: open-system auth for Open/WPA2-PSK; the SAE
         // commit/confirm exchange for WPA3, which also yields the PMK.
@@ -655,6 +667,7 @@ impl Connection {
                 let activity = hw.activity();
                 hw.poll()?;
                 while let Some(packet) = hw.notifications.pop_front() {
+                    this.amsdu_feedback(&packet);
                     if packet.receive_queue != 0
                         || packet.header.group_id != 0
                         || packet.header.cmd != 0xc1
@@ -991,6 +1004,7 @@ impl Connection {
     }
     pub(super) fn maintenance_pending(&self) -> bool {
         self.power_pending
+            || self.amsdu_memory_pending()
             || !self.actions.is_empty()
             || (0..super::aggregation::MAX_TIDS)
                 .any(|tid| self.ba_expired(tid, narf_time::now_cycles()))
@@ -1118,6 +1132,7 @@ impl Connection {
         if queue != 0 && !self.authorized {
             return Ok(output);
         }
+        self.amsdu_feedback(packet);
         if packet.header.group_id != 0 {
             return Ok(output);
         }
@@ -1352,6 +1367,7 @@ impl Connection {
             self.actions.clear();
             return Ok(());
         }
+        self.prepare_amsdu_memory(hw).await?;
         while let Some(body) = self.actions.pop_front() {
             // 802.11w SA Query Request: echo the authenticated transaction
             // identifier in a protected response under the live pairwise key
@@ -2071,3 +2087,6 @@ pub(super) fn channel_power_width(
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "connection_tests.rs"]
 mod tests;
+
+#[path = "connection_tx_amsdu.rs"]
+pub(super) mod tx_amsdu;

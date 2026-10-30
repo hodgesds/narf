@@ -100,6 +100,7 @@ mod rx_multi;
 pub mod rx_rfh;
 mod sc_he;
 mod sc_security;
+mod sc_tx_amsdu;
 pub mod scan_api;
 pub mod security;
 pub mod sta;

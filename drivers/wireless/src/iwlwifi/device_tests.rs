@@ -37,6 +37,7 @@ impl Fixture {
                 eapol: VecDeque::new(),
                 tx: consumers,
                 pending: core::array::from_fn(|_| None),
+                pending_next: core::array::from_fn(|_| None),
                 tx_progress: false,
             }),
             control: Mutex::new(None),

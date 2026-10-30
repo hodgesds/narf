@@ -29,6 +29,10 @@ mod he_tests;
 #[path = "sc_rx_multi_tests.rs"]
 mod rx_multi_tests;
 
+#[cfg(feature = "kernel-test")]
+#[path = "sc_tx_amsdu_tests.rs"]
+mod tx_amsdu_tests;
+
 type R<T = ()> = Result<T, &'static str>;
 const OWN: [u8; 6] = [2, 0x71, 2, 3, 4, 5];
 const AP: [u8; 6] = [2, 0x72, 2, 3, 4, 5];
@@ -71,6 +75,8 @@ enum Fault {
     WrongSaeSelector,
     HoldHe,
     HoldRfh,
+    HoldSmem,
+    HoldData,
 }
 
 /// Authored firmware/NVM/AP facts, only for the native HE composition.
@@ -99,6 +105,15 @@ impl PhyModel {
     }
 }
 
+/// Test-authored firmware capability TLVs and the literal native SMEM
+/// response. Production cache fields are populated only by parsing/receipts.
+#[derive(Clone)]
+struct TxModel {
+    extended: bool,
+    cdb: bool,
+    version: u8,
+    memory: Vec<u8>,
+}
 struct Wire {
     firmware: model::Firmware,
     trace: TxTrace,
@@ -137,6 +152,9 @@ struct Wire {
     hold_rx_queue: Option<u8>,
     held_markers: Vec<(u8, Vec<u8>)>,
     baid_live: bool,
+    tx_model: Option<TxModel>,
+    aggregates: Vec<Vec<Vec<u8>>>,
+    held_data: Vec<(u16, u16)>,
 }
 
 // SAFETY: no real device or thread accesses these fixture pointers. The sole
@@ -234,6 +252,20 @@ impl Wire {
         self.commands.push((group, cmd, body.to_vec()));
         let mut response = Vec::new();
         match (group, cmd) {
+            (0, 0x25) | (2, 0) if self.tx_model.is_some() => {
+                let tx = self.tx_model.as_ref().unwrap();
+                require(
+                    body.is_empty()
+                        && bytes[6] == 0
+                        && ((group, cmd) == if tx.extended { (2, 0) } else { (0, 0x25) }),
+                    "Sc shared-memory command ignored actual firmware TLV capability",
+                )?;
+                response = tx.memory.clone();
+                if self.fault == Fault::HoldSmem {
+                    self.held = Some((cmd, group, sequence));
+                    return Ok(());
+                }
+            }
             (0xc, 2) => {
                 require(body == [0; 4] && version == 1, "Sc NVM request")?;
                 // The authored MLD table selects iwl_nvm_get_info_rsp v4:
@@ -587,9 +619,17 @@ impl Wire {
         )?;
         let len = usize::from(half(bytes, 4));
         let header = ((word(bytes, 8) >> 8) & 31) as usize * 2;
+        let amsdu = word(bytes, 8) & 0x4000 != 0;
         require(
             matches!(header, 24 | 26)
-                && bytes.len() == 32 + len + header.next_multiple_of(4) - header,
+                && bytes.len()
+                    == 32
+                        + len
+                        + if amsdu {
+                            0
+                        } else {
+                            header.next_multiple_of(4) - header
+                        },
             "Sc TX length/padding",
         )?;
         require(
@@ -597,7 +637,14 @@ impl Wire {
             "Sc TX sequence",
         )?;
         let mut frame = bytes[32..32 + header].to_vec();
-        frame.extend_from_slice(&bytes[32 + header.next_multiple_of(4)..]);
+        frame.extend_from_slice(
+            &bytes[32
+                + if amsdu {
+                    header
+                } else {
+                    header.next_multiple_of(4)
+                }..],
+        );
         if self.phy.is_some() && matches!(frame[0], 0 | 0x20) {
             self.phy_requests.push(frame.clone());
         }
@@ -611,6 +658,63 @@ impl Wire {
             "Sc native encryption flag",
         )?;
         let data = frame[0] & 0x0c == 8;
+        if amsdu {
+            require(
+                self.tx_model.is_some()
+                    && data
+                    && header == 26
+                    && frame[24] & 0x80 != 0
+                    && word(bytes, 8) == 0x4d00
+                    && protected == self.ap.protected(),
+                "Sc native A-MSDU flag/header/PAD/encryption geometry",
+            )?;
+            let mut at = 26;
+            let mut frames = Vec::new();
+            while at < frame.len() {
+                require(
+                    frame.len() - at >= 22,
+                    "Sc native A-MSDU literal subframe prefix",
+                )?;
+                let count = usize::from(u16::from_be_bytes([frame[at + 12], frame[at + 13]]));
+                let end = at + 14 + count;
+                require(
+                    count >= 8
+                        && end <= frame.len()
+                        && frame[at] & 1 == 0
+                        && frame[at + 6..at + 12] == OWN
+                        && frame[at + 14..at + 20] == [0xaa, 0xaa, 3, 0, 0, 0],
+                    "Sc native A-MSDU literal addresses/length/LLC",
+                )?;
+                let mut ethernet = frame[at..at + 12].to_vec();
+                ethernet.extend_from_slice(&frame[at + 20..end]);
+                require(
+                    ethernet[12..14] != [0x88, 0x8e],
+                    "Sc aggregated the private EAPOL port",
+                )?;
+                self.data.push((ethernet.clone(), protected));
+                frames.push(ethernet);
+                if end == frame.len() {
+                    break;
+                }
+                let next = end + (4 - ((14 + count) % 4)) % 4;
+                require(
+                    next < frame.len() && frame[end..next].iter().all(|byte| *byte == 0),
+                    "Sc A-MSDU inter-subframe padding/terminal extent",
+                )?;
+                at = next;
+            }
+            require(
+                frames.len() == 2 && frame.len() <= 3819,
+                "Sc native A-MSDU two-frame MPDU bound",
+            )?;
+            self.aggregates.push(frames);
+            if self.fault == Fault::HoldData {
+                self.held_data.push((p.queue, p.pointer));
+            } else {
+                self.firmware.tx_complete(p.queue, p.pointer);
+            }
+            return Ok(());
+        }
         let eapol =
             data && frame.get(header..header + 8) == Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
         if !data || eapol {
@@ -757,7 +861,11 @@ impl Wire {
             }
             self.data.push((ethernet, protected));
         }
-        self.firmware.tx_complete(p.queue, p.pointer);
+        if data && !eapol && self.fault == Fault::HoldData {
+            self.held_data.push((p.queue, p.pointer));
+        } else {
+            self.firmware.tx_complete(p.queue, p.pointer);
+        }
         Ok(())
     }
 
@@ -900,6 +1008,17 @@ impl Guard {
         phy: Option<PhyModel>,
         multi_receive: bool,
     ) -> R<Self> {
+        Self::build_features(secured, fault, name, sources, phy, multi_receive, None)
+    }
+    fn build_features(
+        secured: bool,
+        fault: Fault,
+        name: Option<&'static str>,
+        sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
+        phy: Option<PhyModel>,
+        multi_receive: bool,
+        tx_model: Option<TxModel>,
+    ) -> R<Self> {
         require(
             ACTIVE.lock().is_none()
                 && narf_net::iface::lookup(super::super::iwl_ifname()).is_none()
@@ -913,8 +1032,14 @@ impl Guard {
         if multi_receive {
             versions.extend_from_slice(&[0x0d, 5, 1, 0, 0xb3, 0, 1, 0]);
         }
+        if let Some(tx) = &tx_model {
+            versions.extend_from_slice(&[0, 2, 0, tx.version]);
+        }
         let (mut hardware, firmware, trace) = model::station_model();
-        model::versions(&mut hardware, &versions);
+        let authored = tx_amsdu_tests::image(&versions, tx_model.as_ref())?;
+        let parsed = super::super::parse_ucode(&authored)
+            .map_err(|_| "Sc fixture firmware metadata parse")?;
+        model::firmware_profile(&mut hardware, &parsed)?;
         if let Some((firmware, pnvm)) = sources {
             let parsed = super::super::parse_ucode(&firmware.bytes)
                 .map_err(|_| "Sc source fixture parse")?;
@@ -922,6 +1047,7 @@ impl Guard {
                 parsed.api.commands == versions,
                 "Sc source fixture executable/command table mismatch",
             )?;
+            model::firmware_profile(&mut hardware, &parsed)?;
             hardware.bind_sources(firmware, Some(pnvm))?;
         }
         Device::validate_station_profile(&hardware)?;
@@ -970,6 +1096,9 @@ impl Guard {
             hold_rx_queue: None,
             held_markers: Vec::new(),
             baid_live: false,
+            tx_model,
+            aggregates: Vec::new(),
+            held_data: Vec::new(),
         };
         let configured = run(Device::configure(&mut hardware, OWN), || wire.service());
         let nvm = match configured {
@@ -995,6 +1124,7 @@ impl Guard {
             eapol: VecDeque::new(),
             tx: core::array::from_fn(|_| None),
             pending: core::array::from_fn(|_| None),
+            pending_next: core::array::from_fn(|_| None),
             tx_progress: false,
         };
         let tx = core::array::from_fn(|category| {
