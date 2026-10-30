@@ -756,6 +756,8 @@ pub mod intel_gpu_mst;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_multipipe;
 #[cfg(feature = "intel")]
+mod intel_gpu_nonpriv;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_pcode;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_pipes;

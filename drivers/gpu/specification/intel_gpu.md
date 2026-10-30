@@ -1639,8 +1639,22 @@ a deadline, and selector/semaphore ownership is restored on every outcome.
 Readable registers are preflighted before WA writes and verified afterward;
 DG2 CACHE_MODE_SS follows Linux's no-readback exception. Failure closes
 scheduling admission, retaining owned storage until full reset. Media GT,
-other engine classes, out-of-band workarounds, nonprivileged register policy
-and coordinated reset recovery remain separate work.
+other engine classes, out-of-band workarounds and coordinated reset recovery
+remain separate work.
+
+RCS0 now also installs an explicit nonprivileged register policy before ring
+publication. All twelve FORCE_TO_NONPRIV entries are cleared to RING_NOPID
+and verified before the three Linux Xe OA grants are installed in address
+order: status RD, head/tail/buffer/control RD, and MMIO trigger RW. Unused slots
+stay at NOPID; inherited addresses, ranges and access bits cannot survive.
+The source is `xe_reg_whitelist.c`, `regs/xe_engine_regs.h`, `regs/xe_oa_regs.h`
+and i915's `intel_engine_apply_whitelist` at the pinned revision. The complete
+policy is checked after firmware reload, CT enablement and before kernel
+submission/default priming. Drift closes admission without a live repair and
+keeps existing jobs/reservations until proven full reset. Native literal vectors
+and hardware conversations cover all six admitted IP profiles, failed clears,
+unavailable/cross-slot writes, reload/CT drift and reset ownership. This does not
+enable an OA stream, legacy Gen12/media policies or isolated userspace execution.
 
 The firmware-side workaround path binds stable graphics IP/stepping before
 GuC's first reset/DMA and refuses a different identity on scheduling reload.
@@ -1769,7 +1783,7 @@ acceptance or a claim of complete acceleration.
 
 | Area | Current checkpoint | Still required |
 | --- | --- | --- |
-| GuC execution | Owned GGTT/PPGTT jobs, primed RCS state, graphics-GT/RCS MMIO and context workarounds on MTL/Arrow, DG2 and BMG | Other engines, out-of-band workarounds, coordinated recovery and isolated user state |
+| GuC execution | Owned GGTT/PPGTT jobs, primed RCS state, verified RCS register policy, graphics-GT/RCS MMIO and context workarounds on MTL/Arrow, DG2 and BMG | Other engines, out-of-band workarounds, coordinated recovery and isolated user state |
 | Render UAPI | Per-open GEM, VM/context namespaces, topology/HWCONFIG and softpin admission | EXECBUFFER2 dispatch, busy/wait/domain synchronization, implicit and explicit fences, context loss/banning and recovery |
 | Engines and platforms | Main-GT DSS/EU discovery and RCS0 kernel scheduling; separate Gen12 foundations | Fused engine/cache/media inventory, compute/copy/media submission and independently sourced profiles for other IP |
 | Memory and presentation | Owned system RAM, private tables and same-card CPU PRIME mappings | Local VRAM, accelerated PRIME/presentation and GPU/KMS synchronization |

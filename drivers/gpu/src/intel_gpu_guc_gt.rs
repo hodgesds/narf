@@ -15,6 +15,7 @@ use crate::intel_gpu_guc_firmware::GuCFirmware;
 use crate::intel_gpu_guc_sched::{GuCScheduler, SchedulingError};
 use crate::intel_gpu_guc_transport::{Mailbox, TransportError, TransportState, XeLpgTransport};
 use crate::intel_gpu_hwconfig::HardwareConfig;
+use crate::intel_gpu_nonpriv::RcsPolicy;
 use crate::intel_gpu_topology::{GtTopology, TopologyError};
 use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
@@ -267,6 +268,23 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         Ok(())
     }
 
+    fn verify_register_policy(&self) -> Result<(), GtError> {
+        RcsPolicy::new(self.parts.boot.platform())
+            .and_then(|policy| policy.verify(self.parts.boot.window()))
+            .map_err(GtError::Registers)
+    }
+
+    fn admit_scheduling(&mut self) -> Result<(), GtError> {
+        if self.state != GtState::SchedulingReady {
+            return Err(GtError::State);
+        }
+        let result = self.awake().and_then(|()| self.verify_register_policy());
+        if result.is_err() {
+            self.state = GtState::Lost;
+        }
+        result
+    }
+
     /// Requires exclusive physical-function graphics-GT ownership and a
     /// runtime-PM hold. Never steals a preexisting kernel wake request.
     pub fn begin(&mut self, now: u64) -> Result<(), GtError> {
@@ -400,13 +418,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         &mut self,
         now: u64,
     ) -> Result<(u16, Arc<crate::intel_gpu_fence::CompletionFence>), GtError> {
-        if self.state != GtState::SchedulingReady {
-            return Err(GtError::State);
-        }
-        if let Err(error) = self.awake() {
-            self.state = GtState::Lost;
-            return Err(error);
-        }
+        self.admit_scheduling()?;
         self.parts
             .scheduler
             .as_mut()
@@ -423,13 +435,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         &mut self,
         now: u64,
     ) -> Result<Arc<crate::intel_gpu_fence::CompletionFence>, GtError> {
-        if self.state != GtState::SchedulingReady {
-            return Err(GtError::State);
-        }
-        if let Err(error) = self.awake() {
-            self.state = GtState::Lost;
-            return Err(error);
-        }
+        self.admit_scheduling()?;
         if !self
             .parts
             .scheduler
@@ -446,11 +452,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             self.hwconfig().ok_or(GtError::State)?,
         )
         .map_err(|error| GtError::Scheduling(SchedulingError::Defaults(error)))?;
-        // Revalidate current authority and both wake holds after fuse reads.
-        if let Err(error) = self.awake() {
-            self.state = GtState::Lost;
-            return Err(error);
-        }
+        // Revalidate current authority, wake holds and policy after fuse reads.
+        self.admit_scheduling()?;
         self.parts
             .scheduler
             .as_mut()
@@ -474,7 +477,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     /// # Safety
     /// Every instruction (including nested batches) must be trusted kernel
     /// code, access only its resident mappings and return with BB_END. It must
-    /// not alter GGTT, page tables, rings, context/transport state or completion
+    /// not alter GGTT, page tables, rings, register access policy, context/transport state or completion
     /// evidence. No CPU mapping or peer may write the objects before terminal
     /// completion. Default 3D state/isolation is not established by this API.
     pub unsafe fn submit_kernel_batch(
@@ -482,13 +485,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         now: u64,
         batch: crate::intel_gpu_exec::ResidentBatch,
     ) -> Result<(u16, Arc<crate::intel_gpu_fence::CompletionFence>), GtError> {
-        if self.state != GtState::SchedulingReady {
-            return Err(GtError::State);
-        }
-        if let Err(error) = self.awake() {
-            self.state = GtState::Lost;
-            return Err(error);
-        }
+        self.admit_scheduling()?;
         // SAFETY: forwarded caller contract; the exclusive GT owns CT/reset.
         unsafe {
             self.parts
@@ -760,7 +757,12 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             GtState::Booting | GtState::StartingScheduling => match self.parts.boot.poll(now) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(GtError::Boot(error))),
-                Poll::Ready(Ok(BootState::Ready)) => self.state = GtState::Ready,
+                Poll::Ready(Ok(BootState::Ready)) => {
+                    if self.state == GtState::StartingScheduling {
+                        self.verify_register_policy()?;
+                    }
+                    self.state = GtState::Ready;
+                }
                 _ => return Poll::Ready(Err(GtError::State)),
             },
             GtState::EnablingCt => {
@@ -774,6 +776,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(error)) => return Poll::Ready(Err(GtError::Transport(error))),
                     Poll::Ready(Ok(TransportState::Enabled)) => {
+                        if self.parts.scheduler.is_some() {
+                            self.verify_register_policy()?;
+                        }
                         self.state = if self.parts.scheduler.is_some() {
                             GtState::SchedulingReady
                         } else {

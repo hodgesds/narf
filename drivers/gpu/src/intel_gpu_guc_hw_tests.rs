@@ -240,7 +240,7 @@ kernel_test_in!(
     smoke_hardware_fuse_admission_before_dma_and_scheduling
 );
 
-fn hardware_scheduling(gt: &mut GuCGt<Window, Arena>, w: &Window) {
+fn hardware_scheduling_reload(gt: &mut GuCGt<Window, Arena>, w: &Window) {
     let before = {
         let d = w.0.borrow();
         let ads = d.memory[&0x20001000].borrow();
@@ -271,6 +271,10 @@ fn hardware_scheduling(gt: &mut GuCGt<Window, Arena>, w: &Window) {
         assert_eq!(&ads[0x3000 / 4..0x4000 / 4], before.2.as_slice());
         assert_eq!(ads[0x2000 / 4], 0x229c); // KLVs did not overlap register saves
     }
+}
+
+fn hardware_scheduling(gt: &mut GuCGt<Window, Arena>, w: &Window) {
+    hardware_scheduling_reload(gt, w);
     gt.begin_ct(18).unwrap();
     for now in 19..25 {
         w.0.borrow_mut().regs.insert(0x190240, 0xf0000001);
@@ -279,6 +283,194 @@ fn hardware_scheduling(gt: &mut GuCGt<Window, Arena>, w: &Window) {
     w.0.borrow_mut().regs.insert(0x190240, 0xf0000000);
     assert_eq!(gt.poll(25), Poll::Ready(Ok(GtState::SchedulingReady)));
 }
+
+fn smoke_hardware_nonpriv_profiles_before_ring_and_reload() -> TestResult {
+    let mtl = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+    for (platform, ack, main, release) in [
+        (GtPlatform::Alchemist, 0x130044, 12, 55),
+        (mtl, 0xdfc, 12, 70),
+        (mtl, 0xdfc, 12, 71),
+        (mtl, 0xdfc, 12, 74),
+        (GtPlatform::Battlemage, 0xdfc, 20, 1),
+        (GtPlatform::Battlemage, 0xdfc, 20, 2),
+    ] {
+        let (w, arena, mut gt) = hardware_model(platform, ack);
+        w.0.borrow_mut()
+            .regs
+            .insert(0xd8c, (main << 22) | (release << 14) | 4);
+        hardware_discovery(&mut gt, &w, ack);
+        {
+            let mut device = w.0.borrow_mut();
+            for slot in 0..12 {
+                device.regs.insert(0x24d0 + slot * 4, 0x2030);
+            }
+            device.writes.clear();
+        }
+        hardware_scheduling(&mut gt, &w);
+        {
+            let d = w.0.borrow();
+            let policy: Vec<_> = d
+                .writes
+                .iter()
+                .copied()
+                .filter(|(reg, _)| (0x24d0..=0x24fc).contains(reg))
+                .collect();
+            assert_eq!(policy.len(), 15);
+            for (slot, entry) in policy[..12].iter().enumerate() {
+                assert_eq!(*entry, (0x24d0 + slot as u64 * 4, 0x2094));
+            }
+            assert_eq!(
+                &policy[12..],
+                &[(0x24d0, 0x1000dafc), (0x24d4, 0x1000db01), (0x24d8, 0xdb1c)]
+            );
+            let last = d.writes.iter().rposition(|p| p.0 == 0x24d8).unwrap();
+            let enable = d.writes.iter().position(|p| p.0 == 0x2080).unwrap();
+            assert!(last < enable, "RCS published before access policy");
+            for (slot, expected) in [
+                0x1000dafc, 0x1000db01, 0xdb1c, 0x2094, 0x2094, 0x2094, 0x2094, 0x2094, 0x2094,
+                0x2094, 0x2094, 0x2094,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_eq!(d.regs[&(0x24d0 + slot as u64 * 4)], expected);
+            }
+        }
+        hardware_stop(&mut gt, &w, ack);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_nonpriv_profiles_before_ring_and_reload
+);
+
+fn smoke_hardware_nonpriv_failure_blocks_reload_and_ct() -> TestResult {
+    use crate::intel_gpu_gt_registers::RegisterError;
+    for failure in 0..3 {
+        let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+        hardware_discovery(&mut gt, &w, 0xdfc);
+        if failure <= 1 {
+            gt.begin_scheduling(12).unwrap();
+            if failure == 0 {
+                w.0.borrow_mut().regs.insert(0x24fc, u32::MAX);
+                assert_eq!(
+                    gt.poll(12),
+                    Poll::Ready(Err(GtError::Registers(RegisterError::Unavailable)))
+                );
+                assert!(!w.0.borrow().writes.iter().any(|p| p.0 == 0x2080));
+            } else {
+                assert!(gt.poll(12).is_pending());
+                w.0.borrow_mut().regs.insert(0x24fc, 0x2030);
+                assert!(gt.poll(13).is_pending());
+                reset_done(&w);
+                assert!(gt.poll(14).is_pending());
+                reset_done(&w);
+                assert!(gt.poll(15).is_pending());
+                w.0.borrow_mut().regs.insert(0xc314, 0x10);
+                assert!(gt.poll(16).is_pending());
+                w.0.borrow_mut().regs.insert(0xc000, 0x8000f000);
+                assert_eq!(
+                    gt.poll(17),
+                    Poll::Ready(Err(GtError::Registers(RegisterError::Verify(0x24fc))))
+                );
+                assert_eq!(gt.begin_ct(18), Err(GtError::State));
+            }
+        } else {
+            hardware_scheduling_reload(&mut gt, &w);
+            gt.begin_ct(18).unwrap();
+            for now in 19..25 {
+                w.0.borrow_mut().regs.insert(0x190240, 0xf0000001);
+                assert!(gt.poll(now).is_pending());
+            }
+            w.0.borrow_mut().regs.insert(0x24d0, 0xdafc); // RO became RW
+            w.0.borrow_mut().regs.insert(0x190240, 0xf0000000);
+            assert_eq!(
+                gt.poll(25),
+                Poll::Ready(Err(GtError::Registers(RegisterError::Verify(0x24d0))))
+            );
+        }
+        assert_eq!(gt.state(), GtState::Lost);
+        assert!(arena.live_allocations() > 0);
+        let count = arena.live_allocations();
+        assert!(gt.submit_kernel_probe(30).is_err());
+        assert_eq!(arena.live_allocations(), count);
+        hardware_stop(&mut gt, &w, 0xdfc);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_nonpriv_failure_blocks_reload_and_ct
+);
+
+fn smoke_hardware_nonpriv_drift_retains_jobs_until_full_reset() -> TestResult {
+    use crate::intel_gpu_gt_registers::RegisterError;
+    for api in 0..3 {
+        let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+        hardware_discovery(&mut gt, &w, 0xdfc);
+        hardware_scheduling(&mut gt, &w);
+        let probe = gt.submit_ppgtt_probe(26).unwrap();
+        let weak = probe.result.weak_objects();
+        let completion = probe.completion.clone();
+        drop(probe);
+        let mut registered = BTreeMap::new();
+        for now in 27..33 {
+            assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+            service_contexts(&w, &mut registered, false);
+        }
+        w.0.borrow_mut().regs.insert(0x24fc, 0x20002030);
+        let count = arena.live_allocations();
+        let result = match api {
+            0 => gt.submit_kernel_probe(33).map(|_| ()),
+            1 => gt.begin_context_defaults(33).map(|_| ()),
+            _ => gt.submit_ppgtt_probe(33).map(|_| ()),
+        };
+        assert_eq!(
+            result,
+            Err(GtError::Registers(RegisterError::Verify(0x24fc)))
+        );
+        assert_eq!(gt.state(), GtState::Lost);
+        assert_eq!(arena.live_allocations(), count);
+        assert_eq!(completion.result(), None);
+        assert_eq!(weak[1].upgrade().unwrap().busy(), 0x10001);
+        assert_eq!(
+            w.0.borrow().regs[&0x24fc],
+            0x20002030,
+            "live policy was silently repaired"
+        );
+        gt.begin_stop(10_000_000_000).unwrap();
+        reset_done(&w);
+        w.0.borrow_mut().regs.insert(0xc314, 0);
+        assert!(gt.poll(10_000_000_001).is_pending());
+        assert_eq!(gt.state(), GtState::ResettingEngines);
+        assert_eq!(completion.result(), None);
+        assert_eq!(weak[1].upgrade().unwrap().busy(), 0x10001);
+        assert!(gt.poll(10_000_000_002).is_pending());
+        reset_done(&w);
+        assert!(gt.poll(10_000_000_003).is_pending());
+        assert_eq!(
+            completion.result(),
+            Some(Err(crate::intel_gpu_fence::JobError::Reset))
+        );
+        assert!(weak.iter().all(|object| object.upgrade().is_none()));
+        w.0.borrow_mut().regs.insert(0xd84, 0);
+        assert!(gt.poll(10_000_000_004).is_pending());
+        w.0.borrow_mut().regs.insert(0xdfc, 0);
+        assert_eq!(gt.poll(10_000_000_005), Poll::Ready(Ok(GtState::Stopped)));
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_nonpriv_drift_retains_jobs_until_full_reset
+);
 
 fn smoke_hardware_register_initialization_gates_scheduling() -> TestResult {
     use crate::intel_gpu_gt_registers::RegisterError;

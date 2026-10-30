@@ -415,6 +415,25 @@ yields with a deadline; every acquired semaphore is released and the selector
 restored on success or error. Preflight refuses unavailable registers before
 WA writes; readback failures close admission and retain owned storage through
 full reset. DG2 CACHE_MODE_SS is not read back (Wa_14012342262).
+
+`intel_gpu_nonpriv` initializes RCS0's twelve FORCE_TO_NONPRIV slots while the
+engine is idle under the GT owner's forcewake holds. It refuses unavailable
+slot reads, writes RING_NOPID (0x2094) to every inherited entry and verifies
+all twelve before installing the address-sorted Linux Xe policy: OAG status
+read-only (0xdafc), four read-only registers from OA head (0xdb00), and MMIO
+trigger read/write (0xdb1c). Nine unused entries retain the NOPID fill. Full-word
+posted readback checks addresses, range, access, DENY and reserved bits; a
+failed clear never publishes a new grant or enables the ring.
+`GuCGt` verifies the complete policy again after scheduling firmware reload,
+before publishing SchedulingReady at CT enablement, and before kernel probe,
+default-context priming or resident batch admission. A failed verification
+returns `GtError::Registers` and enters Lost without repairing live policy or
+releasing DMA owners/reservations. GuC reset plus full-engine reset remains
+required before terminal reset fences or reclamation. The policy covers only
+the admitted DG2, Xe-LPG 12.70/12.71/12.74 and BMG 20.01/20.02 RCS0 profiles;
+legacy Gen12 execlists and other engine classes require their own tables.
+Installing OA register access does not open an OA stream or userspace queue.
+
 This covers the graphics GT and admitted RCS0; media and additional engine
 classes require their own tables before admission. The owner then enables
 RCS0 under both wake holds and stops GuC before rewriting

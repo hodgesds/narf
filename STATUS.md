@@ -1180,6 +1180,25 @@ postflights. The refreshed standalone x86_64 boot uses the dedicated test
 virtio-blk image through NARF_VBLK_IMG; the default Alpine image is not writable
 by the current user.
 
+The Intel continuation now installs and verifies the RCS0 nonprivileged
+register policy before ring publication. All twelve inherited slots are
+cleared before the three Linux Xe OA access entries are granted; unused slots
+remain at RING_NOPID. Reload, CT enablement and kernel submission/default
+priming check the exact policy. Failure enters Lost without repairing live
+registers or releasing existing jobs and GEM reservations before full reset.
+The implementation covers DG2, Xe-LPG 12.70/12.71/12.74 and BMG 20.01/20.02.
+OA streams, legacy Gen12/media register policies, isolated userspace scheduling
+and physical Intel/Mesa acceptance remain open.
+Six new native smokes cover literal permissions, inherited-slot clearing,
+dropped/cross-slot writes, all six admitted IP profiles, reload/CT failures
+and live-job ownership across policy drift and full reset. All 64 selected
+policy/firmware/context/GEM/render smokes pass on each architecture, without
+failures/skips. GPU CI Clippy passes three contexts on x86_64 and aarch64;
+host default/Intel-only/AMD-only/no-vendor all-target Clippy, Intel debug
+builds and formatting pass.
+Both architectures also pass production boot and both btrfs interoperability
+postflights. These remain native model/QEMU results; physical execution is unrun.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

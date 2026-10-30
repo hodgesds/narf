@@ -461,7 +461,7 @@ impl RegisterInit {
                 }
             }
         }
-        Ok(())
+        crate::intel_gpu_nonpriv::RcsPolicy::new(self.platform)?.install(mmio)
     }
 
     fn entries(&self, flat: bool) -> Vec<Entry> {
