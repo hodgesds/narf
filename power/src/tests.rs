@@ -304,6 +304,68 @@ fn smoke_thermal_active_cooling_governor() -> TestResult {
 }
 kernel_test_in!("power/thermal", smoke_thermal_active_cooling_governor);
 
+/// #916: the last-driven-level tracker behind resume re-assert.
+/// `None` on a fresh registry, `Some` after an explicit set, and
+/// updated by a governor crossing — so a resume handler reading it
+/// back re-applies the level the governor last drove, not a stale
+/// or invented one.
+fn smoke_thermal_current_cooling_level_tracks_drives() -> TestResult {
+    use crate::bootstrap_thermal_authority;
+    use crate::thermal::{
+        current_cooling_level, init, record_temp, register_cooling_device, register_zone,
+        set_cooling_level, CoolingDevice,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    init();
+    if current_cooling_level().is_some() {
+        return TestResult::Fail("fresh registry reports a level before any drive");
+    }
+
+    #[derive(Debug)]
+    struct RecordingFan(AtomicU8);
+    impl CoolingDevice for RecordingFan {
+        fn name(&self) -> &'static str {
+            "rec"
+        }
+        fn set_level(&self, level: u8) {
+            self.0.store(level, Ordering::SeqCst);
+        }
+    }
+
+    let cap = bootstrap_thermal_authority();
+    let fan = Arc::new(RecordingFan(AtomicU8::new(0)));
+    if register_cooling_device(&cap, fan.clone()).is_err() {
+        return TestResult::Fail("register_cooling_device rejected a live cap");
+    }
+
+    if set_cooling_level(77).is_err() {
+        return TestResult::Fail("set_cooling_level failed");
+    }
+    if current_cooling_level() != Some(77) {
+        return TestResult::Fail("explicit set did not record level 77");
+    }
+
+    let zone = match register_zone(&cap, "TZ0", 70_000, 90_000) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("register_zone rejected a live cap"),
+    };
+    let _ = record_temp(zone, 75_000);
+    if fan.0.load(Ordering::SeqCst) != 128 {
+        return TestResult::Fail("Warm crossing did not drive fan to 128");
+    }
+    if current_cooling_level() != Some(128) {
+        return TestResult::Fail("governor crossing did not update tracked level to 128");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/thermal",
+    smoke_thermal_current_cooling_level_tracks_drives
+);
+
 fn smoke_thermal_cap_revocation_blocks_install() -> TestResult {
     use crate::bootstrap_thermal_authority;
     use crate::thermal::{

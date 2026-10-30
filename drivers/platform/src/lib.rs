@@ -70,6 +70,7 @@ pub mod proc_thermal;
 pub mod sbs;
 pub mod smbus;
 pub mod thermal;
+pub mod thermal_pm;
 pub mod tpm;
 /// Attestation composition (#945): AK provisioning + guarded
 /// quote production over the registered TPM device.
@@ -183,6 +184,15 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "acpi-fan", || {
         fan::init();
+        InitResult::Ok
+    });
+    // Platform thermal suspend/resume (#916): registers the
+    // `platform-thermal` device_pm entry so resume re-asserts the
+    // last cooling level. After the thermal and fan initcalls;
+    // registration only stores the handler pair, so ordering here
+    // is about boot-log readability, not correctness.
+    narf_init::register(Stage::Subsys, "platform-thermal-pm", || {
+        thermal_pm::register();
         InitResult::Ok
     });
     #[cfg(target_arch = "x86_64")]

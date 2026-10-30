@@ -4331,3 +4331,171 @@ kernel_test_in!(
     "drivers/platform/wmi1086",
     smoke_platform_profile_sysfs_surface
 );
+
+// ── Platform thermal suspend/resume (#916) ──────────────────────────
+
+/// Fake cooling device for the #916 smokes. `lose_state` models
+/// firmware forgetting the `_FSL` level across S3: the applied
+/// level drops to 0 without any driver call, so a resume handler
+/// that fails to re-assert leaves the fan at 0 and the smoke
+/// fails — a no-op resume cannot pass by accident.
+#[derive(Debug)]
+struct FakeFan916 {
+    level: core::sync::atomic::AtomicU8,
+    calls: core::sync::atomic::AtomicU8,
+}
+
+impl FakeFan916 {
+    fn new() -> Self {
+        Self {
+            level: core::sync::atomic::AtomicU8::new(0),
+            calls: core::sync::atomic::AtomicU8::new(0),
+        }
+    }
+
+    fn level(&self) -> u8 {
+        self.level.load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn calls(&self) -> u8 {
+        self.calls.load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn lose_state(&self) {
+        self.level.store(0, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl narf_power::thermal::CoolingDevice for FakeFan916 {
+    fn name(&self) -> &'static str {
+        "fake-fan-916"
+    }
+
+    fn set_level(&self, level: u8) {
+        self.level
+            .store(level, core::sync::atomic::Ordering::SeqCst);
+        self.calls
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Snapshot/restore wrapper for the #916 smokes: the `device_pm`
+/// registry is probe-owned global state (same reason the
+/// power-state-freeze smoke snapshots it), and the thermal
+/// registry is left clean afterwards so no fake leaks into later
+/// smokes. The body runs against an isolated device_pm registry
+/// containing only the platform-thermal entry, so the suspend /
+/// resume fan-outs below never touch real drivers' handlers.
+fn smoke_thermal_pm_isolated(body: fn() -> TestResult) -> TestResult {
+    let saved = narf_power::device_pm::registered_devices();
+    let result = body();
+    narf_power::device_pm::__reset_for_test();
+    for entry in &saved {
+        match &entry.ops {
+            Some(ops) => narf_power::device_pm::register_device_pm_ops(&entry.name, ops.clone()),
+            None => {
+                narf_power::device_pm::register_device_pm(&entry.name, entry.suspend, entry.resume)
+            }
+        }
+    }
+    narf_power::thermal::__test_reset();
+    narf_power::thermal::init();
+    result
+}
+
+fn smoke_thermal_pm_registered_body() -> TestResult {
+    narf_power::device_pm::__reset_for_test();
+    crate::thermal_pm::register();
+    let found = narf_power::device_pm::registered_devices()
+        .iter()
+        .any(|e| e.name == crate::thermal_pm::PM_NAME);
+    if !found {
+        return TestResult::Fail("platform-thermal entry missing after register()");
+    }
+    TestResult::Pass
+}
+
+fn smoke_thermal_pm_registered() -> TestResult {
+    smoke_thermal_pm_isolated(smoke_thermal_pm_registered_body)
+}
+kernel_test_in!("drivers/platform/thermal-pm", smoke_thermal_pm_registered);
+
+fn smoke_thermal_pm_resume_reasserts_level_body() -> TestResult {
+    use alloc::sync::Arc;
+    narf_power::thermal::__test_reset();
+    narf_power::thermal::init();
+    let cap = narf_power::bootstrap_thermal_authority();
+    let fan = Arc::new(FakeFan916::new());
+    if narf_power::thermal::register_cooling_device(&cap, fan.clone()).is_err() {
+        return TestResult::Fail("register_cooling_device rejected a live cap");
+    }
+    let zone = match narf_power::thermal::register_zone(&cap, "TZ0", 70_000, 90_000) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("register_zone rejected a live cap"),
+    };
+    narf_power::device_pm::__reset_for_test();
+    crate::thermal_pm::register();
+    // Drive a Warm crossing through the governor: Normal → Warm
+    // maps to level 128 under the default StepPolicy.
+    let _ = narf_power::thermal::record_temp(zone, 75_000);
+    if fan.level() != 128 {
+        return TestResult::Fail("governor Warm crossing did not drive fan to 128");
+    }
+    // Suspend fan-out (only our entry is registered), then model
+    // firmware S3 amnesia.
+    let _ = narf_power::device_pm::suspend_all_devices();
+    fan.lose_state();
+    if fan.level() != 0 {
+        return TestResult::Fail("lose_state model broken: fan level not forgotten");
+    }
+    // Resume must re-assert 128. A no-op resume leaves 0, so this
+    // smoke fails on the unfixed tree.
+    let report = narf_power::device_pm::resume_all_devices();
+    if !report.ok() {
+        return TestResult::Fail("resume fan-out reported failures");
+    }
+    if fan.level() != 128 {
+        return TestResult::Fail("resume did not re-assert cooling level 128");
+    }
+    TestResult::Pass
+}
+
+fn smoke_thermal_pm_resume_reasserts_level() -> TestResult {
+    smoke_thermal_pm_isolated(smoke_thermal_pm_resume_reasserts_level_body)
+}
+kernel_test_in!(
+    "drivers/platform/thermal-pm",
+    smoke_thermal_pm_resume_reasserts_level
+);
+
+fn smoke_thermal_pm_resume_without_level_is_quiet_body() -> TestResult {
+    use alloc::sync::Arc;
+    narf_power::thermal::__test_reset();
+    narf_power::thermal::init();
+    let cap = narf_power::bootstrap_thermal_authority();
+    let fan = Arc::new(FakeFan916::new());
+    if narf_power::thermal::register_cooling_device(&cap, fan.clone()).is_err() {
+        return TestResult::Fail("register_cooling_device rejected a live cap");
+    }
+    narf_power::device_pm::__reset_for_test();
+    crate::thermal_pm::register();
+    // No level ever driven: resume must succeed without touching
+    // any device (no spurious set_level(0)).
+    let _ = narf_power::device_pm::suspend_all_devices();
+    let report = narf_power::device_pm::resume_all_devices();
+    if !report.ok() {
+        return TestResult::Fail("resume fan-out reported failures with no level set");
+    }
+    if fan.calls() != 0 {
+        return TestResult::Fail("resume drove a device despite no level ever set");
+    }
+    TestResult::Pass
+}
+
+fn smoke_thermal_pm_resume_without_level_is_quiet() -> TestResult {
+    smoke_thermal_pm_isolated(smoke_thermal_pm_resume_without_level_is_quiet_body)
+}
+kernel_test_in!(
+    "drivers/platform/thermal-pm",
+    smoke_thermal_pm_resume_without_level_is_quiet
+);
