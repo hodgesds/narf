@@ -71,7 +71,7 @@ impl Layout {
                 ip::HW_ID_GC,
                 crate::amdgpu_rdna4::GC_VERSIONS,
                 1,
-                0x2938,
+                0x4c43,
             )
             .map_err(|_| Error::Unsupported)?,
         })
@@ -182,7 +182,26 @@ pub struct Rs64 {
     starts: Starts,
     state: State,
 }
+fn enable_gfxoff_handshake(io: &mut impl Io, layout: Layout) -> Result<(), Error> {
+    // gc_12_0_0: RLC_CNTL / RLC_PG_CNTL, BASE_IDX 1.
+    if checked(io.read(layout.hyp + 0x4c00 * 4))? & 1 == 0 {
+        return Err(Error::Busy);
+    }
+    let at = layout.hyp + 0x4c43 * 4;
+    let value = checked(io.read(at))? & !0x0080_0000; // SMU_HANDSHAKE_DISABLE
+    write_checked(io, at, value)
+}
 impl Rs64 {
+    /// Enable RLC/SMU handshakes while GC is powered and OWNER excludes
+    /// queue/PM writers, as gfx_v12_0_rlc_smu_handshake_cntl(true).
+    pub(crate) fn enable_gfxoff(&mut self) -> Result<(), Error> {
+        if self.state != State::Configured {
+            return Err(Error::Busy);
+        }
+        self.authority
+            .invoke(Op(|| enable_gfxoff_handshake(&mut self.io, self.layout)))
+            .map_err(|_| Error::Revoked)?
+    }
     /// Pure preparation; validates the exact device and immutable firmware set.
     /// # Safety
     /// Caller owns permanent mappings, this GPU's GRBM selector and every

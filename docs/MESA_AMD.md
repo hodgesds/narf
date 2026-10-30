@@ -445,6 +445,19 @@ after moving to GTT.
 
 ## Open items
 
+RX 9000 idle-power software now covers independent VCN5/JPEG5 static idle
+and resume plus board-supported GC12 GFXOFF. Idle retains codec context,
+JPEG copies and fence sequences; normal media traffic uses cached GC
+configuration so the graphics island can remain idle. Reset/suspend replace
+the GFXOFF controller epoch after fresh native proofs. Use
+`amdgpu.rdna4_gfxoff=0` to compare with graphics power gating disabled.
+After the native proofs, VCN5 DPG is available on both dies and JPEG5 DPG
+on Navi48; Navi44 keeps static JPEG gating. Every DPG restore requires a
+new physical fence probe. Board-supported media DPM and DS_VCN follow DPG
+activation; recovery returns to static policy for re-proof. Use
+`amdgpu.rdna4_media_dpg=0` for static media idle. Physical idle-power, session
+retention and reset/resume acceptance on both dies remain pending.
+
 - The Fedora image runs Fedora's Mesa (glibc), not this build; the musl
   build is the reference that the smoke and ioctl traces describe.
 - How the ext2 image reaches the board (USB/NVMe partition vs. the QEMU

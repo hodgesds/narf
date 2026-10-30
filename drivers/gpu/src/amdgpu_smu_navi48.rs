@@ -52,7 +52,7 @@ const PROTECTION: u64 =
     (1 << 23) | (1 << 25) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29) | (1 << 57);
 // smu_v14_0_deep_sleep_control's walk as smu_v14_0_2_ppt.c maps it, in its
 // order: DS_GFXCLK, DS_UCLK, DS_FCLK, DS_SOCCLK, DS_LCLK (then DS_VCN, left
-// out: the static media policy requires it off; DS_MP0CLK and DS_MP1CLK have
+// out until the proved media DPG transition; DS_MP0CLK and DS_MP1CLK have
 // no SMU 14.0.2 bit).
 const DEEP_SLEEP_WALK: [(u64, &str); 5] = [
     (1 << 10, "GFXCLK"),
@@ -817,7 +817,8 @@ impl<I: Io> Engine<I> {
         result
     }
     /// Linux smu_v14_0_set_vcn_enable, dGPU instance 0. Static media keeps
-    /// MM_DPM/DS_VCN disabled and every autonomous protection running.
+    /// MM_DPM/DS_VCN disabled until the explicit DPG policy transition; every
+    /// autonomous protection must remain running.
     async fn set_vcn_power(&mut self, enabled: bool) -> Result<PowerStatus, Error> {
         self.set_media_power(enabled, false).await
     }
@@ -829,7 +830,9 @@ impl<I: Io> Engine<I> {
         let resume = self.begin_runtime()?;
         let result = async {
             let running = self.running().await?;
-            if !self.protected(running) || running & ((1 << 20) | (1 << 44)) != 0 {
+            if !self.protected(running)
+                || running & crate::amdgpu_navi48_media_power::FEATURES & !power.allowed != 0
+            {
                 return Err(Error::Features(running));
             }
             let command = match (jpeg, enabled) {
@@ -1205,6 +1208,10 @@ impl Smu {
     }
 }
 
+#[path = "amdgpu_smu_navi48_gfxoff.rs"]
+mod gfxoff;
+#[path = "amdgpu_smu_navi48_media.rs"]
+mod media;
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_smu_navi48_tests.rs"]
 mod tests;

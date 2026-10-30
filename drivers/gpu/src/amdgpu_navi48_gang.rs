@@ -183,7 +183,7 @@ impl Submitter {
         let deadline =
             narf_time::monotonic_ns().saturating_add(crate::amdgpu_ring_watch::JOB_TIMEOUT_NS);
         loop {
-            let mut owner = OWNER.lock().await;
+            let (_gc, mut owner) = super::gc_owner().await?;
             let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
             if *READ_GENERATION.lock() != self.generation
                 || crate::amdgpu_navi48_interrupts::blocked()

@@ -1003,7 +1003,7 @@ DCHUB reference — there is no per-SKU bounding box).
 | Linux site | GC 12.0.1 / MP 14.0.3 (Navi48) | GC 12.0.0 / MP 14.0.2 (Navi44) | NARF |
 | --- | --- | --- | --- |
 | `soc24_common_early_init` `external_rev_id` | `rev_id + 0x50` | `rev_id + 0x40` | `Rdna4Chip::external_rev` on `rev_id`, the NBIO `STRAP_ATI_REV_ID` strap (`amdgpu_rdna4::rev_id_strap`: `nbif_v6_3_1_get_rev_id` / `nbio_v7_7_get_rev_id`, BASE_IDX 2), read by the probe — never the PCI revision; DEV_INFO `chip_rev`/`external_rev`, plus `pci_rev` (`pdev->revision`) and `mall_size` (`amdgpu_discovery::mall_size`, MALL_INFO less harvested UMCs) once the probe publishes `Rdna4Identity`. Every 4-bit strap lands in Mesa's `AMDGPU_GFX1200_RANGE` [0x40, 0x50) / `AMDGPU_GFX1201_RANGE` [0x50, 0xFF) (`mesa_external_rev_range`). An unreadable PCI revision or strap fails the RDNA4 probe (Linux never enumerates such a function) |
-| `soc24_common_early_init` pg_flags | VCN, JPEG, VCN_DPG, **JPEG_DPG** | VCN, JPEG, VCN_DPG | `jpeg_dpg()` recorded; both start JPEG/VCN statically (no DPG) |
+| `soc24_common_early_init` pg_flags | VCN, JPEG, VCN_DPG, **JPEG_DPG** | VCN, JPEG, VCN_DPG | Static bootstrap on both; VCN5 DPG on both, JPEG5 DPG only Navi48, after native proofs |
 | `kfd_device.c` gfx_target_version | 120001 (gfx1201) | 120000 (gfx1200) | `gfx_target_version()`; no KFD |
 | `gfx_v12_0`, `imu_v12_0`, `mes_v12_0` firmware | `gc_12_0_1_{pfp,me,mec,rlc,imu,mes,mes1,uni_mes,toc}` + RLC/IMU kicker | `gc_12_0_0_*`, no kicker | `GC_12_0_1_FW` / `GC_12_0_0_FW` (TOC is RLC-backdoor only, never loaded) |
 | `psp_v14_0`, `smu_v14_0` firmware | `psp_14_0_3_{sos,ta}`, `smu_14_0_3`, + kicker builds | `psp_14_0_2_{sos,ta}`, `smu_14_0_2` | `MP_14_0_3_FW` / `MP_14_0_2_FW`, chosen by the discovered MP revision |
@@ -1439,8 +1439,8 @@ capability revalidation at every command/read/copy chunk.
 The internal `Smu::enable_display_power` transition extends the verified mask
 only with UCLK/FCLK/SOCCLK/DCN DPM (bits 3/4/5/7). The board must support all
 four; SCPM is checked again and required autonomous protections must remain
-enabled. Voltage scaling, deep sleep, link DPM, DF C-states and GFXOFF stay
-excluded. It requires retired display consumers and idle engines. Success
+enabled. Voltage scaling, link DPM and DF C-states stay excluded. Deep sleep
+and GFXOFF have separate owned transitions below. It requires retired display consumers and idle engines. Success
 publishes the new `PowerStatus`; partial failure/cancellation retains the
 owner and prevents replay. Only the retained DCN4 clock owner initiates this
 transition, after checking every display consumer. With UCLK DPM running it
@@ -1486,9 +1486,9 @@ revocation, device loss or cancellation leave the owner unusable.
 as SMU 14.0.2 maps it: for each DS feature of Linux's walk the board supports
 (FeaturesToRun), in Linux's order DS_GFXCLK, DS_UCLK, DS_FCLK, DS_SOCCLK,
 DS_LCLK, EnableSmuFeaturesLow/High of that bit (sent again when already
-running, as Linux does). DS_VCN, the walk's last bit, is left out because the
-static media policy requires it off, and DS_MP0CLK/DS_MP1CLK have no 14.0.2
-bit. Narf's boot allowed only a restricted mask, so the walk's bits are first
+running, as Linux does). DS_VCN, the walk's last bit, is deferred to the
+separate proved media DPG transition below. DS_MP0CLK/DS_MP1CLK have no
+14.0.2 bit. Narf's boot allowed only a restricted mask, so the walk's bits are first
 added to the allowed mask (SetAllowedFeaturesMaskHigh/Low). It runs only
 after the display power transition. The first PMFW refusal ends the walk and
 is returned in `DeepSleep::refused` (`DeepSleepRefused { feature, error }`)
@@ -1506,6 +1506,28 @@ on only then) and offered PMFW the watermark ranges
 (`ColdBoot::start_display_clocks`, below). A board whose display clocks never
 start keeps deep sleep off. DS_DCFCLK and GFX_ULV, which Linux's
 EnableAllSmuFeatures turns on at boot outside this walk, stay off.
+
+After the native queue and requested media proofs complete,
+`amdgpu_navi48_gfxoff` starts a separate GC12 controller on both Navi48 and
+Navi44. It shares RDNA2's request-count state machine, with independent
+device epochs and delayed work. The board must support FEATURE_GFXOFF
+(bit 18); the retained RS64 owner requires a running RLC and clears only
+RLC_PG_CNTL.SMU_HANDSHAKE_DISABLE. SMU14 extends the existing allowed mask
+with GFXOFF alone, enables that feature, verifies all previous running
+features/protections, and sends DisallowGfxOff. A zero request count schedules
+AllowGfxOff after 100 ms. Failed/cancelled messages refuse GC access.
+`amdgpu.rdna4_gfxoff=0` disables startup; unsupported boards remain powered.
+
+`amdgpu_navi48_platform::gc_owner().await` acquires a GC reference before
+OWNER and rechecks activation/reset epoch under OWNER. GFX/compute jobs,
+gangs, ring/fault recovery, kernel VRAM work and reset/suspend use this order.
+Media jobs use cached GC configuration and do not wake the graphics island.
+Quiesce invalidates delayed work while GC is held awake; the fresh proven
+owner starts a new controller. Stale startup tasks cannot fail a successor.
+Initialization holds the controller until its result is known, so a waiting
+submission cannot misclassify initialization as device loss.
+`Diagnostics::gfxoff` / `gfxoff::status()` expose the software request state;
+SMU acceptance does not establish physical GFXOFF entry.
 
 After a successful retained boot, `amdgpu_navi48_platform::run` starts
 `amdgpu_navi48_power`. Through the shared `amdgpu_hwmon` it publishes `/sys/class/hwmon/hwmon<N>` (first free N)
@@ -9242,10 +9264,70 @@ backing reusable. Uncertain completion, revocation or cancellation retains
 the published allocation and refuses replay until device recovery.
 
 `unsafe Smu::set_vcn_power(bool).await` is SMU14's dGPU instance-0
-PowerUpVcn/PowerDownVcn, with a fresh static-media/protection feature check.
+PowerUpVcn/PowerDownVcn, with fresh protection and admitted-media-feature checks.
 Power-down requires the retained VCPU/LMI retirement proof. As other SMU
 runtime operations, cancellation leaves the mailbox owner busy and terminal
 transport errors forbid reuse. No display/GFX clock policy is changed.
+
+Normal retained VCN5/JPEG5 clients also have independent static-power idle
+paths. A generation-bound 100 ms supervisor uses Linux's 1 s media idle
+delay. Under OWNER it requires each engine's physical fence and complete
+RPTR drain, then its VCPU/LMI or JMI clean shutdown before the SMU power-down
+message. VCN idle retains the shared NBIO doorbell range even if JPEG is
+busy; JPEG can sleep while VCN remains active. The same supervisor retains
+the static fallback selected by `amdgpu.rdna4_media_dpg=0`.
+
+`ColdBoot::begin_media_use(jpeg).await` runs before normal publication, and
+`wake_media().await` precedes media recovery. Power-up and hardware restore
+preserve VCPU context, JPEG copy slots, proof results, writebacks and logical
+sequences. Warm restore resets only ring pointers and restores master IRQs;
+cached GB_ADDR_CONFIG avoids GC reads while GFXOFF is allowed. Idle never
+marks backing reusable. `IdleStopping`/`IdleStarting` and a retained SMU
+transition marker precede awaits; failure/cancellation prevents replay.
+Full shutdown/recovery keeps its existing destructive retirement proof.
+
+Before stopping an island, the native I/O owner drains synchronous fence
+readers under READ_GENERATION and marks only that island unavailable for
+status reads. Its retained VRAM fence remains readable through live capability,
+HDP and always-on NBIO presence checks. Static engines with fixed clocks
+retain their status checks after restoration. DPG owners and JPEG under
+media clock DPM keep using the always-on presence checks between jobs.
+
+After the requested static transport/IRQ/codec proofs, retained media client
+owners default to DPG (`amdgpu.rdna4_media_dpg=0` keeps the static policy).
+`Vcn::enable_dpg(&mut Psp)` drains the physical fence/RPTR and shuts down the
+static VCPU without releasing any backing or the shared NBIO range. It
+power-cycles ONO5..2, enables PG_MODE/PG_EN, and sends VCN5's 23-pair SOC24
+internal-offset program through PSP14 `LOAD_IP_FW`, type VCN0_RAM (49).
+PSP patches firmware and stack placeholders; context/shared BARs and cached
+GB_ADDR_CONFIG remain owned by this device. This operation is distinct from
+the RDNA2 SRAM loader. It then restores the unified ring and source enable.
+JPEG5 uses JPEG internal addresses, a five-pair restore program including
+PSP's required trailing NO_OP, and JPEG_RAM (128). Both the boot policy and
+PSP firmware-target admission reject JPEG DPG on Navi44 (GC12.0.0); its JPEG
+owner keeps static idle/resume. Navi48 (GC12.0.1) supports both DPG paths.
+
+Every DPG start/resume executes a fresh fence-only frame into a separate
+owned probe word and requires both that new write and RPTR drain. Client
+sequences, completion words, sessions, proof results and copied IB slots
+remain unchanged. `IdleStarting` precedes SRAM upload/probe awaits; an upload
+acknowledgement without physical execution cannot reopen publication.
+DPG idle stops use firmware hold-off, physical fence/RPTR drain and PG_MODE
+withdrawal before SMU power-down. Warm use reloads SRAM under the same PSP,
+TMR, GMC and IRQ owner. Full VCN shutdown additionally pauses DPG, wakes the
+island and performs the existing VCPU/LMI clean reset before reuse. JPEG
+hang recovery clears DPG, powers ONO1 on, resets JMI and completes the
+static clean/power-off sequence; clearing PG_MODE alone is no retirement proof.
+
+Only after successful DPG activation, `unsafe Smu::configure_media_power(true)`
+admits board FeaturesToRun's MM_DPM (20) and DS_VCN (44) through allowed-mask
+and feature-enable commands. Other enabled features and every autonomous
+protection must survive, and unadmitted bits are rejected. Native JPEG fence
+readers are drained before clock sleep is allowed, including Navi44's static
+JPEG path. Queue recovery disables these media features before static
+re-proof, then re-enters DPG and the board-supported media policy before
+client publication. Failed/cancelled owner or mailbox transitions retain
+resources and block replay. Physical acceptance remains pending on both dies.
 
 `Vcn::prove_interrupts().await` requires a retained independent dispatch
 owner (`Key::Vcn { instance: 0 }`, VMID0/PASID0) before enabling the VCPU

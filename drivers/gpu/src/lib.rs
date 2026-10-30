@@ -511,9 +511,13 @@ pub mod amdgpu_navi48_faults;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_firmware;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_navi48_gfxoff;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_interrupts;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_kms;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_navi48_media_power;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_msi;
 #[cfg(feature = "amdgpu")]

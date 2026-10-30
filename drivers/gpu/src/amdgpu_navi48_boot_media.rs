@@ -269,6 +269,7 @@ impl ColdBoot {
                 unsafe { hw.prove_jpeg(doorbells, jpeg_decode, keep_running).await }?;
             }
             if keep_running {
+                hw.configure_media_power().await?;
                 return Ok(proof);
             }
             // SAFETY: no client publication; the proof drained its whole ring.

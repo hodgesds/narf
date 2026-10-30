@@ -5,7 +5,10 @@ use crate::amdgpu_navi48_interrupts as irq;
 impl Submitter {
     pub(super) async fn recover_faults(&self) {
         use core::fmt::Write as _;
-        let mut owner = OWNER.lock().await;
+        let Ok((_gc, mut owner)) = super::gc_owner().await else {
+            self.stop_all();
+            return;
+        };
         if *READ_GENERATION.lock() != self.generation {
             return;
         }

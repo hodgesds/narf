@@ -1,10 +1,9 @@
 # amdgpu bring-up: remaining work
 
-Status as of 2026-10-29, based on `main` at `0a0a8c90c` (#1209), plus the
-recovery/GFXOFF/VCN idle changes on `codex/amdgpu-recovery-and-idle`.
+Status as of 2026-10-29, based on `main` at `eb9c6c8a1` (#1236), plus
+RX 9000 idle-power changes on `codex/amdgpu-rdna4-idle-power`.
 Evidence below the "Verified on hardware" section comes from code review
-and software tests, including QEMU
-and register/fake-engine models.
+and software tests, including QEMU and register/fake-engine models.
 
 ## Verified on hardware (RX 6750 XT, Navi22, VFIO bench)
 
@@ -45,6 +44,11 @@ Rebuild from the checkout being validated and run
    of idle. VCN must resume without losing sessions or fence progress;
    JPEG must remain usable. Repeat with `amdgpu.rdna2_vcn_dpg=0` and, when
    opted in, `amdgpu.rdna2_vcn_smu_pg=1` for PMFW power messages.
+   On RX 9000, exercise separate and simultaneous VCN5/JPEG5 workloads
+   across idle intervals. Sessions, JPEG copy slots and fence progress must
+   survive resume. Check graphics-idle power while media runs, then repeated
+   render/idle, reset and suspend/resume cycles. Compare against
+   `amdgpu.rdna4_gfxoff=0`; repeat on Navi48 and Navi44.
 
 ## Bare-metal boot
 
@@ -99,12 +103,27 @@ IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
   activation/reset epoch before GC access, closing the enable race. Native
   registration now declares these paths guarded; other policy prerequisites
   still apply. Physical transitions remain unverified.
+- **RX 9000 idle power.** VCN5 and JPEG5 independently drain physical work,
+  stop and power down after idle; begin-use restores their hardware, IRQs,
+  codec context and sequences. The shared media doorbell range stays owned.
+  Fence reads use always-on presence while an island is gated. SMU14/RLC
+  GFXOFF is board-gated, with GC references around runtime register access
+  and fresh controller epochs after reset/suspend. Media traffic alone does
+  not keep GC awake. Failed/cancelled transitions stay closed. Physical
+  transitions remain unverified. After static native proofs, VCN5 DPG runs
+  on both dies; JPEG5 DPG is Navi48-only, while Navi44 keeps static JPEG
+  gating. Board-supported MM_DPM and DS_VCN follow successful DPG setup.
+  Every SRAM restore needs a new physical fence probe before publication.
+  Recovery disables media clock sleep for static re-proof and keeps JPEG
+  JMI reset/power-cycle retirement. `amdgpu.rdna4_media_dpg=0` retains
+  static media idle and disables this media DPM/deep-sleep transition. Cold media setup now reads GC12's
+  segment-relative GB_ADDR_CONFIG at 0x13de; fixtures poison the older offset.
 - **RX 6000 VCN3 idle power.** After one second of inactivity and physical
   fence completion, idle work releases encode DPG pause, stops VCN and sends
   PowerDownVcn when MM_DPM_PG is enabled. Begin-use restores power/hardware
   while preserving context and fence sequences; JPEG stays independent.
   Cancelled/failed transitions prevent replay. PMFW media gating keeps its
-  existing opt-in. These changes do not add RX 9000 VCN5 idle work.
+  existing opt-in.
 - **Statistics on RX 6000 and RX 9000.** Native primary/render nodes answer
   TIMESTAMP and the supported Linux SENSOR selectors, including all four
   stable/peak GFX/MCLK queries. Measurements use fresh SMU telemetry; P-states
@@ -136,15 +155,23 @@ IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
 
 Validation for statistics, memory, recovery and idle changes: native ioctl,
 MMIO and SMU model regressions cover both families.
-`cargo xtask test --subsystem drivers/gpu` reports 2,661 pass / 0 fail /
-5 skip with `--arch x86_64`, and 2,115 pass / 0 fail / 1 skip with
+The full GPU suites report 2,710 pass / 0 fail /
+5 skip with `--arch x86_64`, and 2,164 pass / 0 fail / 1 skip with
 `--arch aarch64`. Coverage includes sensor/hwmon units and missing data,
 refresh cancellation, timestamp loss, original fence errors across engine
 replacement, GFXOFF activation/cancellation, physical VCN drain and static/DPG
-idle/resume failure paths. Focused reruns cover the final shutdown guard.
-GPU Clippy passes in all three feature contexts on both architectures;
+idle/resume failure paths. RX 9000 idle/DPG regressions cover separate PSP
+SRAM types, per-die JPEG admission, physical restore probes, retained sessions/IB slots, board feature
+masks, full hang recovery, cancellation and failed SRAM uploads.
+GPU, framebuffer and USB Clippy pass in all three feature contexts on both architectures;
 `cargo fmt --all -- --check` passes. Production boot-smoke and btrfs
 interoperability checks also pass on both architectures.
+
+For RX 9000 hardware acceptance, repeat separate and simultaneous VCN/JPEG
+workloads with `amdgpu.rdna4_media_dpg=0` and the default policy. Check
+repeated idle/use, GC sleeping during video, lost-device waits and media
+hang recovery, then system/runtime suspend and resume on both dies. Navi44
+must keep JPEG static while VCN uses DPG.
 
 ## Not amdgpu, but seen during bring-up
 

@@ -1027,7 +1027,10 @@ pub fn register_initcalls() {
         "cdc-ecm",
         &CDC_ECM_MATCH,
         probe,
-        detach_ecm_slot,
+        |slot| {
+            detach_ecm_slot(slot);
+            Ok(())
+        },
     );
 }
 

@@ -1964,12 +1964,32 @@ allocations pinned; old readers cannot fail a replacement device.
 Still open: physical MSI delivery and reset/replay acceptance, GC12 rendering
 and application shader execution, GPU VM/userspace and DCN4
 clock/bandwidth/link/scanout hardware acceptance, VCN5 known-stream video,
-THM/SMU thermal interrupts and software-CTF shutdown,
-memory/fabric DPM relaxation (display admission/watermark rework first),
-reset/suspend/resume, and physical RX 9070 XT testing.
+thermal/CTF and reset/suspend/resume hardware acceptance, memory/fabric DPM
+relaxation (display admission/watermark rework first), and physical RX 9000
+testing on both Navi48 and Navi44. Thermal interrupts/shutdown, system/runtime
+PM and training replay already have software implementations; older entries
+above are historical, not a current missing-feature list.
 The verified DMA proof covers only two kernel-owned VRAM pages. The driver
 continues to report acceleration unavailable; model/QEMU tests do not prove
 working silicon, native modesetting or Mesa/Vulkan support.
+
+RX 9000 now also has VCN5/JPEG5 static idle power and GC12 GFXOFF ownership.
+Independent media idle waits for physical fences, RPTR drain and DMA-clean
+shutdown before SMU power-down. Warm resume preserves codec context, JPEG
+copy slots, proofs and sequences, restores IRQs and keeps the shared media
+doorbell range owned. Gated fence reads retain capability/HDP/NBIO checks;
+fixed-clock static engines still check their status registers. Board-supported SMU14
+GFXOFF uses RLC handshakes and disable references around GC MMIO, with fresh
+epochs after reset/suspend and no graphics wake for normal media traffic.
+Failed/cancelled transitions cannot replay or free unconfirmed resources.
+`amdgpu.rdna4_gfxoff=0` disables GFXOFF startup. Proved retained media owners
+now enter VCN5 DPG on both dies and JPEG5 DPG on Navi48; Navi44 keeps static
+JPEG gating. PSP14 uses separate VCN/JPEG SRAM types and every restore
+requires a new physical fence probe without changing client sequences.
+Board-supported MM_DPM and DS_VCN follow DPG activation. Recovery disables
+media sleep before static re-proof, and JPEG hang retirement keeps its
+JMI reset/power cycle. `amdgpu.rdna4_media_dpg=0` retains static media policy.
+Physical power-transition and session-retention acceptance remain pending.
 
 Navi22 third-review fixes (software-model tested only): DRM ioctl user copies
 apply `access_ok` and fault-guarded copies (EFAULT); NVMe/AHCI bring-up

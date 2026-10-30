@@ -243,6 +243,7 @@ impl MediaRequest {
 }
 #[derive(Debug)]
 struct Hardware {
+    media_idle: media_idle::Idle,
     gpu: AmdGpu,
     pci: narf_bus::BusDevice,
     authority: Cap<BusDeviceCap, Write>,
@@ -844,6 +845,7 @@ impl ColdBoot {
             baco_exited: false,
             sequence: alloc::boxed::Box::new(Sequence {
                 backend: Hardware {
+                    media_idle: media_idle::Idle::new(),
                     gpu: saved,
                     pci,
                     authority,
@@ -1718,6 +1720,34 @@ impl ColdBoot {
     pub async fn set_gfx_level(&mut self, level: smu::GfxLevel) -> Result<(), Error> {
         self.power_owner()?
             .set_gfx_level(level)
+            .await
+            .map_err(Error::Smu)
+    }
+    pub(crate) async fn enable_gfxoff(&mut self) -> Result<bool, Error> {
+        if !self.power_owner()?.gfxoff_supported() {
+            return Ok(false);
+        }
+        self.sequence
+            .backend
+            .rs64
+            .enable_gfxoff()
+            .map_err(Error::Rs64)?;
+        let enabled = self
+            .power_owner()?
+            .configure_gfxoff()
+            .await
+            .map_err(Error::Smu)?;
+        self.sequence.backend.power = self
+            .sequence
+            .backend
+            .smu
+            .as_ref()
+            .and_then(smu::Smu::power_status);
+        Ok(enabled)
+    }
+    pub(crate) async fn gfx_off_control(&mut self, allow: bool) -> Result<(), Error> {
+        self.power_owner()?
+            .gfx_off_control(allow)
             .await
             .map_err(Error::Smu)
     }
@@ -4264,6 +4294,8 @@ impl bandwidth::UclkPin for ColdBoot {
 pub(crate) mod bandwidth;
 #[path = "amdgpu_navi48_boot_media_clients.rs"]
 mod media_clients;
+#[path = "amdgpu_navi48_boot_media_idle.rs"]
+mod media_idle;
 #[path = "amdgpu_navi48_boot_media.rs"]
 mod media_transport;
 

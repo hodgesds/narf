@@ -135,26 +135,39 @@ impl<I: Io> Engine<I> {
         }
     }
     pub(super) fn completed_job(&mut self) -> Result<u32, Error> {
-        client_fence(
+        retained_fence(
             &mut self.io,
             self.authority,
             self.layout,
             self.memory.mapping(),
+            !self.dpg
+                && !matches!(
+                    self.state,
+                    State::Idle | State::IdleStarting | State::IdleStopping
+                ),
         )
     }
 }
-pub(super) fn client_fence(
+pub(super) fn retained_fence(
     io: &mut impl Io,
     authority: Cap<BusDeviceCap, Write>,
     l: Layout,
     map: MmioRegion,
+    active: bool,
 ) -> Result<u32, Error> {
     let value = authority
         .invoke(Op(|| {
-            checked(io.read(l.vcn + u64::from(STATUS) * 4))?;
+            // NBIO remains powered while the media island is idle. The
+            // retained writeback survives idle/resume; VCN STATUS does not.
+            checked(io.read(l.nbio + 0xc3 * 4))?;
+            if active {
+                checked(io.read(l.vcn + u64::from(STATUS) * 4))?;
+            }
             flush(io, l)?;
             let value = io.memory_read(map, FENCE);
-            checked(io.read(l.vcn + u64::from(STATUS) * 4))?;
+            if active {
+                checked(io.read(l.vcn + u64::from(STATUS) * 4))?;
+            }
             checked(io.read(l.nbio + 0xc3 * 4))?;
             Ok(value)
         }))

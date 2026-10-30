@@ -1232,6 +1232,33 @@ impl Psp {
         let bytes: alloc::vec::Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         self.session.load_ip(&bytes, kind).await.map(|_| ())
     }
+    /// VCN5/JPEG5's indirect DPG SRAM. PSP patches the VCN firmware/stack
+    /// placeholders against its retained TMR, as in amdgpu_vcn_psp_update_sram.
+    /// JPEG uses its own internal address space and GFX_FW_TYPE_JPEG_RAM.
+    pub(crate) async fn load_media_sram5(
+        &mut self,
+        jpeg: bool,
+        words: &[u32],
+    ) -> Result<(), Error> {
+        if !matches!(self.kind, Kind::Navi48(_)) {
+            return Err(Error::Unsupported);
+        }
+        let firmware_type = self
+            .navi48_target
+            .and_then(|target| target.media_sram_type(jpeg))
+            .ok_or(Error::Unsupported)?;
+        if self.session.media_firmware.vcn.is_none() {
+            return Err(Error::Busy);
+        }
+        if words.is_empty() || words.len() % 2 != 0 || words.len() > 128 {
+            return Err(Error::Invalid);
+        }
+        let bytes: alloc::vec::Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        self.session
+            .load_ip(&bytes, firmware_type)
+            .await
+            .map(|_| ())
+    }
     /// Load Navi22 SMC once during cold boot, after LOAD_TOC/TMR reservation
     /// and before other IP firmware, then SETUP_TMR (psp_hw_start's
     /// psp_load_smu_fw then psp_tmr_load for pmfw_centralized_cstate_management).

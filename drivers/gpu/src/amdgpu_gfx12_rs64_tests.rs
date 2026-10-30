@@ -2,6 +2,31 @@ use super::*;
 use alloc::{collections::BTreeMap, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn gfx12_gfxoff_handshake_preserves_controls_and_requires_running_rlc() -> TestResult {
+    let mut f = fake();
+    let l = Layout { gc: GC, hyp: HYP };
+    f.registers.insert((0, 0x53000), 1);
+    f.registers.insert((0, 0x5310c), 0xa5810072);
+    assert_eq!(enable_gfxoff_handshake(&mut f, l), Ok(()));
+    assert_eq!(f.registers[&(0, 0x5310c)], 0xa5010072);
+    assert_eq!(f.writes, [(0x32, 0x5310c, 0xa5010072)]);
+    f.registers.insert((0, 0x53000), 0);
+    let writes = f.writes.len();
+    assert_eq!(enable_gfxoff_handshake(&mut f, l), Err(Error::Busy));
+    assert_eq!(f.writes.len(), writes);
+    f.registers.insert((0, 0x53000), 1);
+    f.registers.insert((0, 0x5310c), 0xa5810072);
+    f.refuse = Some(0x5310c);
+    assert_eq!(enable_gfxoff_handshake(&mut f, l), Err(Error::Readback));
+    f.registers.insert((0, 0x53000), u32::MAX);
+    assert_eq!(enable_gfxoff_handshake(&mut f, l), Err(Error::DeviceGone));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4-idle",
+    gfx12_gfxoff_handshake_preserves_controls_and_requires_running_rlc
+);
+
 // Intentionally different banks. Golden absolute addresses come from GC12's
 // headers, not the implementation constants or a map accepting all writes.
 const GC: u64 = 0x10000;
@@ -27,7 +52,7 @@ impl Io for Fake {
     fn read(&mut self, address: u64) -> u32 {
         match address {
             INDEX => self.index,
-            0x4200c | 0x4a410 => self.registers[&(0, address)],
+            0x4200c | 0x4a410 | 0x53000 | 0x5310c => self.registers[&(0, address)],
             0x4a01c => {
                 if self.busy == Some((self.index, address)) {
                     0x04000000
@@ -51,7 +76,7 @@ impl Io for Fake {
         }
         match address {
             INDEX => self.index = value,
-            0x4200c | 0x4a410 => {
+            0x4200c | 0x4a410 | 0x5310c => {
                 self.registers.insert((0, address), value);
             }
             0x17910 | 0x17964 | 0x17914 | 0x179e4 => {
@@ -160,7 +185,7 @@ fn gfx12_rs64_constructor_and_revocation_are_checked_before_mmio() -> TestResult
     let firmware = fw::fixture();
     let mut gpu = fw::tests::gpu();
     gpu.ip_blocks[0].num_bases = 2;
-    gpu.regs.len = 0x10000;
+    gpu.regs.len = 0x20000;
     let cap = Cap::bootstrap();
     cap.revoke();
     // SAFETY: descriptor has a null mapping; revoked authority must never use it.
@@ -173,14 +198,14 @@ fn gfx12_rs64_constructor_and_revocation_are_checked_before_mmio() -> TestResult
     {
         return TestResult::Fail("revoked or repeated RS64 setup reached registers");
     }
-    for len in [0, 0x2938 * 4 + 3] {
+    for len in [0, 0x2938 * 4 + 3, 0x4c43 * 4 + 3] {
         gpu.regs.len = len;
         // SAFETY: construction validates metadata without accessing MMIO.
         if unsafe { Rs64::new(&gpu, cap, &firmware) }.is_ok() {
             return TestResult::Fail("truncated GC bank accepted");
         }
     }
-    gpu.regs.len = 0x10000;
+    gpu.regs.len = 0x20000;
     gpu.ip_blocks[0].revision = 2;
     // SAFETY: construction validates metadata without accessing MMIO.
     if unsafe { Rs64::new(&gpu, cap, &firmware) }.is_ok() {

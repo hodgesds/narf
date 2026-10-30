@@ -18,12 +18,67 @@ mod client_shaders;
 mod fault_recovery;
 #[path = "amdgpu_navi48_gang.rs"]
 mod gangs;
+#[path = "amdgpu_navi48_idle.rs"]
+mod idle;
 #[path = "amdgpu_navi48_platform_media.rs"]
 mod media_clients;
 #[path = "amdgpu_navi48_suspend_transition.rs"]
 mod suspend_transition;
 #[path = "amdgpu_navi48_platform_transfer.rs"]
 mod transfer;
+pub(crate) fn media_idle_reader(jpeg: bool) -> bool {
+    idle::reader(jpeg)
+}
+pub(crate) fn set_media_idle_reader(jpeg: bool, gated: bool) {
+    let _generation = READ_GENERATION.lock();
+    idle::set_reader(jpeg, gated);
+}
+
+pub(crate) async fn gc_owner() -> Result<
+    (
+        crate::amdgpu_navi48_gfxoff::Reference,
+        narf_lib::mutex::MutexGuard<'static, Option<alloc::boxed::Box<boot::ColdBoot>>>,
+    ),
+    narf_filesystem::FsError,
+> {
+    loop {
+        let gc = crate::amdgpu_navi48_gfxoff::Reference::acquire()
+            .await
+            .map_err(|_| {
+                crate::amdgpu_navi48_interrupts::lose();
+                narf_filesystem::FsError::NoDevice
+            })?;
+        let owner = OWNER.lock().await;
+        if gc.covers_access() {
+            return Ok((gc, owner));
+        }
+        drop(owner);
+        drop(gc);
+    }
+}
+pub(crate) async fn enable_gfxoff(epoch: u64) -> Result<bool, boot::Error> {
+    let mut owner = OWNER.lock().await;
+    if crate::amdgpu_navi48_gfxoff::epoch() != epoch {
+        return Err(boot::Error::Busy);
+    }
+    crate::amdgpu_navi48_gfxoff::transitioning();
+    owner
+        .as_mut()
+        .ok_or(boot::Error::DeviceGone)?
+        .enable_gfxoff()
+        .await
+}
+pub(crate) async fn gfxoff_command(epoch: u64, allow: bool) -> Result<(), boot::Error> {
+    let mut owner = OWNER.lock().await;
+    if crate::amdgpu_navi48_gfxoff::epoch() != epoch {
+        return Err(boot::Error::Busy);
+    }
+    owner
+        .as_mut()
+        .ok_or(boot::Error::DeviceGone)?
+        .gfx_off_control(allow)
+        .await
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -105,6 +160,7 @@ pub enum Status {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Diagnostics {
+    pub gfxoff: Option<crate::amdgpu_navi48_gfxoff::Status>,
     pub state: boot::State,
     pub report: Option<boot::Report>,
     pub display: Result<display::State, display::Error>,
@@ -162,6 +218,7 @@ pub fn status() -> Status {
         None => Status::Running,
         Some(owner) => owner.as_ref().map_or(Status::Absent, |boot| {
             Status::Retained(Diagnostics {
+                gfxoff: crate::amdgpu_navi48_gfxoff::status(),
                 state: boot.state(),
                 report: boot.report(),
                 display: boot.display_state(),
@@ -385,6 +442,7 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
         }?;
     }
     narf_scheduler::spawn(prove_queue_interrupts());
+    idle::start();
     if let Some((limits, level)) = boot.power_info() {
         crate::amdgpu_navi48_power::start(limits, level);
     }
@@ -500,7 +558,7 @@ pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
 async unsafe fn recover_placed(
     placement: crate::amdgpu_gem::PlacementGuard,
 ) -> Result<boot::Report, boot::Error> {
-    let mut owner = OWNER.lock().await;
+    let (_gc, mut owner) = gc_owner().await.map_err(|_| boot::Error::DeviceGone)?;
     // SAFETY: forwarded caller contract.
     let quiesced = unsafe { quiesce(&mut owner, boot::ColdBoot::prepare_reset, placement) }.await?;
     // SAFETY: forwarded caller contract; every accessor was withdrawn.
@@ -792,7 +850,7 @@ async unsafe fn suspend_gated(baco: Option<Baco>) -> Result<(), boot::Error> {
         );
         return Err(boot::Error::Busy);
     }
-    let mut owner = OWNER.lock().await;
+    let (_gc, mut owner) = gc_owner().await.map_err(|_| boot::Error::DeviceGone)?;
     // SAFETY: forwarded caller contract; client VRAM is empty.
     let quiesced =
         match unsafe { quiesce(&mut owner, boot::ColdBoot::prepare_suspend, placement) }.await {
@@ -1107,6 +1165,8 @@ async unsafe fn quiesce(
         quarantine: |guard| QUARANTINED_PLACEMENTS.lock().push(guard),
     };
     RECOVERY_STATE.store(1, Ordering::Release);
+    idle::stop();
+    crate::amdgpu_navi48_gfxoff::invalidate();
     let retained = RecoveryOwner {
         boot: owner.take(),
         armed: true,
@@ -1257,6 +1317,8 @@ async unsafe fn restart(
     *owner = retained.boot.take();
     retained.armed = false;
     RECOVERY_STATE.store(2, Ordering::Release);
+    idle::start();
+    crate::amdgpu_navi48_gfxoff::start();
     if let Some((limits, level)) = owner.as_ref().and_then(|b| b.power_info()) {
         crate::amdgpu_navi48_power::restart(limits, level);
     }
@@ -1593,7 +1655,10 @@ impl Submitter {
                 done
             );
             let recovered = {
-                let mut owner = OWNER.lock().await;
+                let Ok((_gc, mut owner)) = gc_owner().await else {
+                    self.stop_all();
+                    return;
+                };
                 if *READ_GENERATION.lock() != self.generation {
                     return;
                 }
@@ -1853,8 +1918,20 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                 narf_time::monotonic_ns().saturating_add(crate::amdgpu_ring_watch::JOB_TIMEOUT_NS);
             let entity = (request.owner, submission.ctx_id);
             let result = loop {
-                let mut owner = OWNER.lock().await;
+                // Media restore uses cached GC configuration. Video/JPEG
+                // traffic alone must not keep the graphics island awake.
+                let (_gc, mut owner) = if ring < SDMA_RING {
+                    let (gc, owner) = gc_owner().await?;
+                    (Some(gc), owner)
+                } else {
+                    (None, OWNER.lock().await)
+                };
                 let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
+                if matches!(ring, MEDIA_RING | JPEG_RING) {
+                    boot.begin_media_use(ring == JPEG_RING)
+                        .await
+                        .map_err(|_| FsError::NoDevice)?;
+                }
                 if health.reset_epoch() != crate::amdgpu_ctx::recoveries() {
                     health.mark_canceled();
                     break Err(FsError::Canceled);
@@ -2101,6 +2178,7 @@ async fn prove_queue_interrupts() {
                     media_clients::activate_media(boot);
                 }
                 publish_clearer(boot);
+                crate::amdgpu_navi48_gfxoff::start();
                 if SHADER_PROOF.load(Ordering::Acquire) {
                     // The worker takes placement admission before its own
                     // native submissions acquire OWNER. This scope releases
@@ -2464,7 +2542,10 @@ impl VramClearer {
         loop {
             // The batch is taken and queued under OWNER, as an SDMA0 reset
             // requeues skipped clears at the queue's front under it too.
-            let mut owner = OWNER.lock().await;
+            let Ok((_gc, mut owner)) = gc_owner().await else {
+                self.refuse_queued();
+                return;
+            };
             if !self.current_generation() || crate::amdgpu_navi48_interrupts::failed() {
                 // These requests have no live SDMA slot (including skipped
                 // clears requeued only after a proven reset). Published
