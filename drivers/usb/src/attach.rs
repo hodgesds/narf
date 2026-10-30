@@ -539,7 +539,7 @@ pub async fn try_attach_via_hub(
 /// a genuine unplug the device is gone either way, and a slot whose
 /// reclaim refuses (Disable Slot failed) stays retired rather than
 /// returning to the pool half-alive. Classes the supervisor does
-/// not pump (MSC / UAC / UVC / btusb / CCID) have no
+/// not pump (MSC / UAC / btusb / CCID) have no
 /// per-class binding removal yet — their slot is disabled and
 /// reclaimed here, but their class-level registries are a
 /// documented follow-up in #748. CDC-NCM + r8152 are NOT in
@@ -547,7 +547,11 @@ pub async fn try_attach_via_hub(
 /// `r8152::detach_r8152_slot`, registered in their
 /// `register_initcalls` / `register`) run via `dispatch_unbind`
 /// in step 1 above, tombstoning the slot's binding and
-/// unregistering its net iface.
+/// unregistering its net iface. UVC is not in that set either: its
+/// unbind hook (`uvc::detach_uvc`, registered in
+/// `uvc::register_initcalls`) runs via `dispatch_unbind` in step 1
+/// above, dropping the slot's UVC binding and unregistering its
+/// `/dev/video<N>` node.
 pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
     // 1. Class bindings.
     hid::detach_boot_keyboard(slot_id);
@@ -603,16 +607,19 @@ pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
 /// `msc::unbind_all_msc`, and the hub registry is cleared.
 /// Registered class drivers' per-slot unbind hooks are NOT called
 /// on this path, and classes with neither a pumped clear nor a
-/// wholesale unbind here (UAC / UVC / btusb / CCID)
+/// wholesale unbind here (UAC / btusb / CCID)
 /// keep their class-level registries across recovery — the
 /// documented remainder of #748. CDC-NCM + r8152 are NOT in
 /// that set: `cdc_ncm::detach_all_ncm` and
 /// `r8152::detach_all_r8152` tombstone every binding and
 /// unregister every net iface, so re-enumeration cannot append
-/// a second live iface for the same adapter. The MSC call is load-bearing,
-/// not symmetry: a surviving `MSC_DEVICES` entry would make
-/// re-enumeration append a second live adapter for the same BOT
-/// device (queue 16, Concern C).
+/// a second live iface for the same adapter. UVC is not in that
+/// set either: `uvc::detach_all_uvc` drops every
+/// UVC binding and unregisters every video node, so re-enumeration
+/// cannot append a second live node for the same camera. The MSC
+/// call is load-bearing, not symmetry: a surviving `MSC_DEVICES`
+/// entry would make re-enumeration append a second live adapter for
+/// the same BOT device (queue 16, Concern C).
 pub fn detach_all_bindings() {
     hid::clear_boot_keyboards();
     hid::keyboard::unregister_all_keyboards();
@@ -626,6 +633,7 @@ pub fn detach_all_bindings() {
     crate::msc::unbind_all_msc();
     crate::cdc_ncm::detach_all_ncm();
     crate::r8152::detach_all_r8152();
+    crate::uvc::detach_all_uvc();
     HUBS.lock().clear();
 }
 

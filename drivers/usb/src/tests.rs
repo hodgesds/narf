@@ -7426,6 +7426,130 @@ fn smoke_uvc_streamon_composition_e2e() -> TestResult {
 }
 kernel_test_in!("drivers/usb/uvc", smoke_uvc_streamon_composition_e2e);
 
+/// Two modelled cameras bind, the first detaches cleanly (binding
+/// and node both gone, survivor untouched), detach is idempotent
+/// and a no-op for unknown slots, wholesale detach clears the rest,
+/// and a re-bind of the same slot publishes under a fresh index —
+/// never a duplicate node for the same camera.
+fn smoke_uvc_detach_drops_binding_and_node() -> TestResult {
+    let (transport, _idx, _dev, _ctx, _events) = match uvc_fixture_bound(false, false) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // Second modelled camera on slot 8, same descriptor blob, no
+    // registry reset — the two bindings must coexist.
+    if narf_scheduler::block_on(crate::uvc::try_bind_video_with_transport(
+        &*transport,
+        8,
+        &uvc_fixture_config_blob(),
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("second camera bind failed");
+    }
+    let (node7, node8) = {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        let first = match devices.iter().find(|d| d.slot_id == 7) {
+            Some(d) => d.video_node,
+            None => return TestResult::Fail("slot 7 binding missing"),
+        };
+        let second = match devices.iter().find(|d| d.slot_id == 8) {
+            Some(d) => d.video_node,
+            None => return TestResult::Fail("slot 8 binding missing"),
+        };
+        (first, second)
+    };
+    if crate::uvc::attached_uvc_count() != 2 {
+        return TestResult::Fail("two cameras should be bound");
+    }
+    if node7 == node8 {
+        return TestResult::Fail("two cameras must publish distinct nodes");
+    }
+    if narf_drivers_video::devfs_bridge::get_device(node7).is_none()
+        || narf_drivers_video::devfs_bridge::get_device(node8).is_none()
+    {
+        return TestResult::Fail("both nodes must resolve before detach");
+    }
+    crate::uvc::detach_uvc(7);
+    if crate::uvc::attached_uvc_count() != 1 {
+        return TestResult::Fail("detach must drop exactly one binding");
+    }
+    if crate::uvc::UVC_DEVICES
+        .lock()
+        .iter()
+        .any(|d| d.slot_id == 7)
+    {
+        return TestResult::Fail("slot 7 binding must be gone");
+    }
+    if narf_drivers_video::devfs_bridge::get_device(node7).is_some() {
+        return TestResult::Fail("detached node must no longer resolve");
+    }
+    if narf_drivers_video::devfs_bridge::get_device(node8).is_none() {
+        return TestResult::Fail("survivor node must keep resolving");
+    }
+    // Idempotent, and unknown slots are a silent no-op.
+    crate::uvc::detach_uvc(7);
+    crate::uvc::detach_uvc(99);
+    if crate::uvc::attached_uvc_count() != 1 {
+        return TestResult::Fail("repeat/unknown detach must not change the registry");
+    }
+    crate::uvc::detach_all_uvc();
+    if crate::uvc::attached_uvc_count() != 0 {
+        return TestResult::Fail("wholesale detach must clear every binding");
+    }
+    if narf_drivers_video::devfs_bridge::get_device(node8).is_some() {
+        return TestResult::Fail("wholesale detach must unregister every node");
+    }
+    // Re-bind the same slot: a fresh node, never a duplicate, and
+    // the index is not recycled (the old minor stays retired).
+    if narf_scheduler::block_on(crate::uvc::try_bind_video_with_transport(
+        &*transport,
+        7,
+        &uvc_fixture_config_blob(),
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("re-bind after detach failed");
+    }
+    let rebound_node = match crate::uvc::UVC_DEVICES
+        .lock()
+        .iter()
+        .find(|d| d.slot_id == 7)
+    {
+        Some(d) => d.video_node,
+        None => return TestResult::Fail("re-bound slot 7 binding missing"),
+    };
+    if rebound_node == node7 {
+        return TestResult::Fail("re-bind must not recycle the detached index");
+    }
+    if crate::uvc::attached_uvc_count() != 1 {
+        return TestResult::Fail("re-bind must leave exactly one binding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_detach_drops_binding_and_node);
+
+/// The class-registry unbind hook installed by
+/// `uvc::register_initcalls` must reach `detach_uvc` through the
+/// supervisor's `dispatch_unbind` path — the wiring the hub-detach
+/// path actually uses, not just the detach function in isolation.
+fn smoke_uvc_dispatch_unbind_reaches_detach() -> TestResult {
+    let (_transport, _idx, _dev, _ctx, _events) = match uvc_fixture_bound(false, false) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    crate::uvc::register_initcalls();
+    let report = crate::class_registry::dispatch_unbind(7);
+    if report.invoked == 0 {
+        return TestResult::Fail("dispatch_unbind invoked no hooks");
+    }
+    if crate::uvc::attached_uvc_count() != 0 {
+        return TestResult::Fail("unbind hook must drop the slot 7 binding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_dispatch_unbind_reaches_detach);
+
 fn smoke_uvc_streamon_probe_failure_fails_ioctl() -> TestResult {
     let (transport, idx, dev, ctx, events) = match uvc_fixture_bound(true, false) {
         Ok(v) => v,
