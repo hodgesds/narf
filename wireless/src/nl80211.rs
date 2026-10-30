@@ -1577,6 +1577,10 @@ pub fn register() -> bool {
     if registered {
         let _ =
             narf_net::netlink_generic::register_context_handler(NL80211_FAMILY_ID, control::handle);
+        let _ = narf_net::netlink_generic::register_deferred_context_handler(
+            NL80211_FAMILY_ID,
+            control::deferred_handle,
+        );
         // nl80211_netlink_notifier.
         narf_net::netlink_generic::register_release_notifier(control::station::release);
     }

@@ -155,6 +155,14 @@ BSS or response and do not prove peer/status, SSID, security, legacy-rate
 agreement, native channel, firmware completion, power, key or port authority.
 The FullMAC owner must retain and check those independent native facts.
 
+`offer.response_elements_with_sae_h2e(ies, sae_h2e)` is a narrow native
+response parser opt-in: `sae_h2e` must come from the owner's already
+negotiated `SaeJoin::h2e()`. It permits membership selector123 as a security
+fact and removes it from PHY selector checking; it never treats123 as a
+PHY mode or legacy rate. The bool supplies no security, PHY, channel,
+firmware-completion or publication authority. `response_elements` and
+`from_elements` remain strict; unsupported PHY selectors still fail.
+
 The opt-in path admits mandatory HT127/VHT126 membership selectors only with
 the corresponding complete compatible PHY, while preserving actual legacy
 basic rates for management frames. HE (122), EHT (121) and UHR (120) are
@@ -652,6 +660,30 @@ exact `NL80211_ATTR_WIPHY_FREQ`, not only its derived channel number, because
 `NL80211_ATTR_CHANNEL_WIDTH` channel definition. Drivers validate its
 geometry and every constituent regulatory channel; 20/40/80/160 and 80+80
 must never be silently reduced to a different on-air BSS.
+
+`ap_control_generation() -> Option<NonZeroU64>` opts into native terminal
+AP controls. The nonzero generation changes on every interface/mode replacement
+and never wraps to an older generation. `ApControlAuthority::bind` captures
+the existing interface-bound `AdminHandle`, exact registered interface, current
+namespace/ifindex, AP/GO mode and generation, plus the source socket's deferred
+reply liveness. It mints no grant. `current` invokes administrative authority
+and rechecks all identities; `check_for` also prevents replay against another
+concrete interface. Drivers retain a copy across cancellation cleanup and
+check it at native command/poll/publication boundaries. Socket closure,
+revocation, namespace transfer, mode replacement or interface replacement closes
+that request's authority even when a name/ifindex/port is reused.
+Binding retains the original request context's namespace and resolved ifindex;
+a transfer between lookup and admission cannot silently retarget the request.
+Trusted driver registration must pair the net and wireless registry entries
+for the same device, as on the existing interface-control path.
+The additive `start_ap_async`, `stop_ap_async`, `set_beacon_async` and
+`add_station_async`/`set_station_async`/`del_station_async` methods represent
+actual native terminal results. Their defaults adapt existing synchronous
+methods; generic netlink selects them only for an explicit generation opt-in,
+using the exact-socket deferred ACK path. An admitted queue entry never claims
+a completed native AP operation. Existing synchronous drivers retain their
+ordered admission contract below.
+
 `MbssidSupport` exposes a physical wiphy's
 `NL80211_ATTR_MBSSID_CONFIG` maxima. When present, `START_AP` accepts the
 nested MBSSID role (`INDEX`, optional self `TX_IFINDEX`, or a distinct

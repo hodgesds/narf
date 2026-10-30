@@ -485,6 +485,29 @@ and sequence/sender fields.
 Generic control errors honor `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK` with the
 same capped echo and diagnostic-TLV rules as rtnetlink.
 
+`build_replies_with_endpoint` additionally accepts the sending socket's
+`DeferredReplySink`; the bridge retains a weak reference to that exact file,
+never resolving a later namespace/port-id occupant. A family's additive
+`register_deferred_context_handler` receives a borrowed `DeferredRequest`.
+After synchronous validation it may `defer` an owned `Send` ACK future and
+return no immediate payloads. Only that successful empty return commits the
+job; errors or mixed immediate replies drop it unpolled. Dumps cannot defer.
+The job produces one actual terminal result, preserving the original request
+and sequence plus CAP_ACK/EXT_ACK/cookie options. Following `netlink_ack`,
+successful ACKs always cap their request echo; CAP_ACK additionally caps
+errors. Retained request bytes are zeroized on retirement/cancellation.
+Queuing never reports a
+successful ACK. Closing the original socket cancels the waiter and suppresses
+its reply; a bound replacement cannot receive it. A sink grants no object
+authority: families retain and invoke their actual current admin handle,
+interface identity and mode generation throughout native work/publication.
+`defer_checked` additionally retains a family's `DeferredAuthority` through
+the final ACK edge. Revocation stops polling and converts a would-be success
+to `EPERM`, including revocation at the native terminal-result boundary.
+Drivers retain hardware resources until their own terminal cancellation or
+cleanup receipt even if the netlink waiter disappears. Existing synchronous
+handlers and context-only builders retain their existing behavior.
+
 Operation flags carry Linux's permission bits verbatim (`GENL_ADMIN_PERM`
 0x01, `GENL_UNS_ADMIN_PERM` 0x10, reported in `CTRL_ATTR_OP_FLAGS`). After the
 op lookup and before the family callback, `genl_family_rcv_msg`'s check runs:

@@ -19,6 +19,7 @@ pub(super) struct Profile {
     pub pmf: bool,
     pub rsne: Option<Vec<u8>>,
     pub sae: Option<SaeJoin>,
+    pub offer: Option<narf_wireless::association::phy::Offer>,
 }
 
 /// Retired material cannot return with reset replay/nonce state during this
@@ -94,8 +95,14 @@ fn local_phy(local: Local, channel: u8) -> Result<Option<LocalPhy>, &'static str
     } else {
         LocalPhy::ht40(ht)
     };
-    phy.map(Some)
-        .map_err(|_| "MLD local security PHY profile invalid")
+    let phy = phy.map_err(|_| "MLD local security PHY profile invalid")?;
+    let phy = if local.he {
+        phy.with_he(super::sc_he::local(local, channel)?)
+            .map_err(|_| "MLD local HE security profile invalid")?
+    } else {
+        phy
+    };
+    Ok(Some(phy))
 }
 
 impl Profile {
@@ -106,7 +113,7 @@ impl Profile {
         local: Local,
     ) -> Result<Self, &'static str> {
         let mode = match auth {
-            AuthMethod::Open => {
+            AuthMethod::Open if !local.he => {
                 if beacon.privacy {
                     return Err("secured AP requested as open");
                 }
@@ -115,8 +122,10 @@ impl Profile {
                     pmf: false,
                     rsne: None,
                     sae: None,
+                    offer: None,
                 });
             }
+            AuthMethod::Open => SecurityMode::Open,
             AuthMethod::Wpa2Psk(_) => SecurityMode::Wpa2Psk,
             AuthMethod::Wpa3Sae { .. } => SecurityMode::Wpa3Sae { pwe: SaePwe::Both },
         };
@@ -138,12 +147,21 @@ impl Profile {
             .as_deref()
             .and_then(narf_wireless::rsn::RsnIe::decode_body)
             .is_some_and(|rsn| rsn.rsn_capabilities & narf_wireless::rsn::RSN_CAP_MFP_CAPABLE != 0);
+        let physical = match local_phy(local, beacon.channel) {
+            Ok(physical) => physical,
+            Err(_) if local.he => {
+                let mut legacy = local;
+                legacy.he = false;
+                return Self::negotiate(beacon, own, auth, legacy);
+            }
+            Err(reason) => return Err(reason),
+        };
         let plan = JoinPlan::prepare_with_options(
             &bss,
             own,
             &beacon.ssid,
             mode,
-            local_phy(local, beacon.channel)?,
+            physical,
             JoinOptions::default()
                 .with_akms(AkmSet::ALL)
                 .with_pmf(if peer_mfpc {
@@ -151,21 +169,34 @@ impl Profile {
                 } else {
                     Pmf::Disabled
                 }),
-        )
-        .map_err(|_| "unsupported MLD station security offer")?;
+        );
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(_) if local.he => {
+                // A non-HE-mandatory BSS can retain the native legacy path
+                // when its optional HE profile is not implemented. The
+                // shared plan still rejects a mandatory HE selector.
+                let mut legacy = local;
+                legacy.he = false;
+                return Self::negotiate(beacon, own, auth, legacy);
+            }
+            Err(_) => return Err("unsupported MLD station security offer"),
+        };
         use narf_wireless::eapol::KeyMgmt;
         let akm = match plan.akm() {
-            Some(KeyMgmt::Psk) => security::Akm::Wpa2Psk,
-            Some(KeyMgmt::PskSha256) => security::Akm::Wpa2PskSha256,
-            Some(KeyMgmt::Sae) => security::Akm::Wpa3Sae,
-            Some(KeyMgmt::SaeExtKey) => security::Akm::Wpa3SaeExtKey,
+            None if mode == SecurityMode::Open => None,
+            Some(KeyMgmt::Psk) => Some(security::Akm::Wpa2Psk),
+            Some(KeyMgmt::PskSha256) => Some(security::Akm::Wpa2PskSha256),
+            Some(KeyMgmt::Sae) => Some(security::Akm::Wpa3Sae),
+            Some(KeyMgmt::SaeExtKey) => Some(security::Akm::Wpa3SaeExtKey),
             _ => return Err("unsupported MLD negotiated key hierarchy"),
         };
         Ok(Self {
-            akm: Some(akm),
+            akm,
             pmf: plan.pmf(),
             rsne: plan.rsn_body(),
             sae: plan.sae().cloned(),
+            offer: plan.offered_phy().copied(),
         })
     }
 

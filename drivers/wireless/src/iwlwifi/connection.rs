@@ -53,6 +53,7 @@ pub struct Connection {
     pmf_negotiated: bool,
     management_pn: u64,
     key_history: super::sc_security::KeyHistory,
+    he: Option<super::sc_he::Profile>,
 }
 
 impl core::fmt::Debug for Connection {
@@ -143,6 +144,7 @@ impl Connection {
             pmf_negotiated: false,
             management_pn: 0,
             key_history: super::sc_security::KeyHistory::default(),
+            he: None,
         }
     }
     #[cfg(any(test, feature = "kernel-test"))]
@@ -166,6 +168,7 @@ impl Connection {
                 channels: alloc::vec![13;51].into(),
                 country: *b"US",
                 etsi_5ghz: false,
+                he_allowed: false,
             },
             1,
             0,
@@ -232,7 +235,7 @@ impl Connection {
         beacon: Beacon,
         auth: AuthMethod,
         tx_chains: u32,
-        local_phy: super::ht_vht::Local,
+        mut local_phy: super::ht_vht::Local,
         roam_from: Option<[u8; 6]>,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<Self, &'static str> {
@@ -254,6 +257,10 @@ impl Connection {
         };
         let qos = super::qos::Parameters::parse(&beacon.information_elements)?;
         let permissions = regulatory_channels_in_domain(hw, domain).await?;
+        if local_phy.he && (!permissions.he_allowed || !super::sc_he::native_supported(hw)) {
+            local_phy.he = false;
+            profile = super::sc_security::Profile::negotiate(&beacon, local, &auth, local_phy)?;
+        }
         let phy = super::ht_vht::Negotiated::parse(
             local_phy,
             &beacon.information_elements,
@@ -264,11 +271,19 @@ impl Connection {
                     .is_some()
             },
         )?;
-        let rates = super::rates::Rates::parse_for_security(
+        let he_offer = profile
+            .offer
+            .filter(|offer| qos.is_some() && super::sc_he::matches_native(offer, phy));
+        if he_offer.is_none() && profile.offer.is_some_and(|offer| offer.he().is_some()) {
+            local_phy.he = false;
+            profile = super::sc_security::Profile::negotiate(&beacon, local, &auth, local_phy)?;
+        }
+        let rates = super::rates::Rates::parse_for_profiles(
             &beacon.information_elements,
             beacon.channel,
             phy.mode,
             profile.sae.as_ref().is_some_and(|join| join.h2e()),
+            he_offer.is_some(),
         )?;
         let max_power = channel_power_width(
             domain,
@@ -385,6 +400,7 @@ impl Connection {
             pmf_negotiated: profile.pmf,
             management_pn: 0,
             key_history: super::sc_security::KeyHistory::default(),
+            he: None,
         };
         // Authenticate: open-system auth for Open/WPA2-PSK; the SAE
         // commit/confirm exchange for WPA3, which also yields the PMK.
@@ -455,6 +471,11 @@ impl Connection {
             request.extend_from_slice(&super::qos::INFORMATION_IE);
         }
         request.extend_from_slice(&this.phy.association_ies(local_phy, this.beacon.channel));
+        if let Some(he) = he_offer.as_ref().and_then(|offer| offer.he()) {
+            let capability = he.local_capability();
+            request.extend_from_slice(&[255, capability.len() as u8]);
+            request.extend_from_slice(&capability);
+        }
         this.sequence = this.sequence.wrapping_add(1);
         hw.transmit(management_queue, &request, 24, this.rate())
             .await?;
@@ -477,6 +498,31 @@ impl Connection {
             this.beacon.channel,
             this.qos.is_some(),
         )?;
+        if let Some(offer) = he_offer {
+            let negotiated = offer
+                .response_elements_with_sae_h2e(
+                    &reply[6..],
+                    profile.sae.as_ref().is_some_and(|join| join.h2e()),
+                )
+                .map_err(|_| "MLD association response did not confirm the HE offer")?;
+            let he = *negotiated.he().ok_or("MLD response omitted HE")?;
+            if negotiated.center_channel() != this.phy.center
+                || match negotiated.width() {
+                    narf_wireless::association::phy::Width::Twenty => this.phy.width != 0,
+                    narf_wireless::association::phy::Width::Forty => this.phy.width != 1,
+                    narf_wireless::association::phy::Width::Eighty => this.phy.width != 2,
+                    narf_wireless::association::phy::Width::OneSixty => true,
+                }
+            {
+                return Err("MLD HE response differs from native PHY/MCC span");
+            }
+            this.he = Some(super::sc_he::Profile::new(
+                he,
+                &reply[6..],
+                (negotiated.ht().peer_capability() >> 2) & 3 == 0,
+                super::sc_he::rates_version(hw).ok_or("MLD HE rate ABI changed")?,
+            )?);
+        }
         this.qos = permissions.limit_qos(
             domain,
             this.beacon.channel,
@@ -502,11 +548,12 @@ impl Connection {
             hw.command(1, 0x9f, &power).await?;
         }
         // Recheck membership selectors after a response downgrades PHY.
-        this.rates = super::rates::Rates::parse_for_security(
+        this.rates = super::rates::Rates::parse_for_profiles(
             &this.beacon.information_elements,
             this.beacon.channel,
             this.phy.mode,
             profile.sae.as_ref().is_some_and(|join| join.h2e()),
+            this.he.is_some(),
         )?;
         let mut phy_command = station_api::phy(2, this.beacon.channel);
         this.phy.apply_phy(&mut phy_command, this.beacon.channel);
@@ -535,14 +582,23 @@ impl Connection {
                 qos.apply(&mut link);
             }
             this.phy.apply_link(&mut link);
+            if let Some(he) = this.he {
+                he.apply_link(&mut link);
+            }
             hw.command(3, 9, &link).await?;
         }
         let mut peer = station_api::peer(this.beacon.bssid);
         this.phy.apply_peer(&mut peer, response.aid);
+        if let Some(he) = this.he {
+            he.apply_sta(&mut peer);
+        }
         put32(&mut peer, 36, u32::from(this.pmf_negotiated));
         hw.command(3, 0xa, &peer).await?;
-        hw.command(3, 8, &station_api::mac(2, local, Some(response.aid)))
-            .await?;
+        let mut mac = station_api::mac(2, local, Some(response.aid));
+        if let Some(he) = this.he {
+            he.apply_mac(&mut mac);
+        }
+        hw.command(3, 8, &mac).await?;
         let mut tlc = this.rates.tlc(
             hw.version(5, 0xf).ok_or("firmware has no TLC command")?.0,
             tx_chains,
@@ -551,6 +607,9 @@ impl Connection {
             hw.enable_aggregation()?;
         }
         this.phy.apply_tlc(&mut tlc);
+        if let Some(he) = this.he {
+            he.apply_tlc(&mut tlc)?;
+        }
         hw.command(5, 0xf, &tlc).await?;
         // The response-refined native span/power is the handshake's owner;
         // a beacon received during M4 can update that same shared proof.
@@ -563,7 +622,8 @@ impl Connection {
             final_power.min(max_power),
             this.qos,
             hw.rf_policy_validity()?,
-        )?;
+        )?
+        .with_he(this.he.is_some())?;
         if secure {
             let deadline = narf_time::Deadline::after_ms(8000);
             while !this.security.as_ref().unwrap().complete() {
@@ -928,6 +988,9 @@ impl Connection {
         hw: &mut Hardware,
         mpdu: &scan_api::Mpdu<'_>,
     ) -> Result<Option<Vec<u8>>, &'static str> {
+        if !self.admits_data_header(mpdu) {
+            return Ok(None);
+        }
         if !self.authorized && mpdu.frame.first() == Some(&0x80) {
             self.receive_frame(mpdu)?;
             self.service_power(hw).await?;
@@ -1002,6 +1065,9 @@ impl Connection {
                     return Ok(output);
                 }
                 let frame = mpdu.frame;
+                if !self.admits_data_header(&mpdu) {
+                    return Ok(output);
+                }
                 if frame.len() >= 24
                     && frame[0] == 0xd0
                     && frame[1] & 0x87 == 0
@@ -1314,12 +1380,34 @@ impl Connection {
         }
     }
 
+    /// Keep original +HTC bytes and CCMP IV offsets. A HE control field
+    /// requires the actual response-bound HTC_HE profile; it cannot enter
+    /// the BA reorder owner first and acquire that permission later.
+    fn admits_data_header(&self, mpdu: &scan_api::Mpdu<'_>) -> bool {
+        let frame = mpdu.frame;
+        if frame.first().is_none_or(|fc| fc & 15 != 8) {
+            return true;
+        }
+        if frame.len() < 24
+            || (mpdu.rate_n_flags >> 8) & 7 >= 4
+                && self.he.is_none_or(|he| !he.admits_rx_rate(mpdu.rate_n_flags))
+        {
+            return false;
+        }
+        if frame[1] & 0x80 == 0 {
+            return true;
+        }
+        frame[0] == 0x88
+            && self.he.is_some_and(|he| he.negotiation.htc_he())
+            && frame.get(26..30).is_some_and(|control| control[0] & 3 == 3)
+    }
+
     pub fn receive_frame(
         &mut self,
         mpdu: &scan_api::Mpdu<'_>,
     ) -> Result<Option<Vec<u8>>, &'static str> {
         let frame = mpdu.frame;
-        if mpdu.channel != self.beacon.channel {
+        if mpdu.channel != self.beacon.channel || !self.admits_data_header(mpdu) {
             return Ok(None);
         }
         if frame.len() >= 24
@@ -1357,6 +1445,7 @@ impl Connection {
                         self.beacon.channel,
                         self.qos.is_some(),
                     )? != self.phy
+                        || self.he.is_some_and(|he| !he.matches(ies))
                     {
                         self.authorized = false;
                         return Err("AP changed PHY operation; reassociation required");
@@ -1438,8 +1527,18 @@ impl Connection {
         // Unauthenticated EAPOL must not close an established port or
         // poison replay state. A missing valid response times out during
         // initial association; an established connection simply drops it.
-        let Ok(response) = security.process(&ethernet[14..]) else {
-            return Ok(());
+        let response = match security.process(&ethernet[14..]) {
+            Ok(response) => response,
+            Err(reason) => {
+                #[cfg(feature = "kernel-test")]
+                {
+                    use core::fmt::Write;
+                    let _ = writeln!(narf_console::Writer, "Sc rejected EAPOL: {reason}");
+                }
+                #[cfg(not(feature = "kernel-test"))]
+                let _ = reason;
+                return Ok(());
+            }
         };
         let igtk_changed = response
             .keys

@@ -8,6 +8,7 @@ pub(super) struct Mcc {
     pub channels: Arc<[u32]>,
     pub country: [u8; 2],
     pub etsi_5ghz: bool,
+    pub he_allowed: bool,
 }
 impl Mcc {
     pub fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
@@ -31,6 +32,9 @@ impl Mcc {
                 .into(),
             country,
             etsi_5ghz: u16::from_le_bytes(bytes[14..16].try_into().unwrap()) & 1 != 0,
+            // MCC v8 carries regulatory capability v4/v5's HE prohibition.
+            // Source: iwl-nvm-parse.c::iwl_get_reg_capa.
+            he_allowed: u32::from_le_bytes(bytes[8..12].try_into().unwrap()) & (1 << 13) == 0,
         })
     }
     /// Linux iwl_parse_nvm_mcc_info's GEO_WMM_ETSI_5GHZ_INFO and

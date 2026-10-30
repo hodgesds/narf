@@ -245,9 +245,17 @@ impl DataQueue {
         if self.pending[slot].is_some() {
             return Err("TX slot still owned by device");
         }
-        let padding = header_len.next_multiple_of(4) - header_len;
-        // Short command header, 28-byte TX command, MAC header (padded
-        // to a dword), followed by the payload. len excludes the padding.
+        // Linux mvm/tx.c and mld/tx.c make AMSDU/PAD exclusive.
+        // pcie/gen1_2/tx-gen2.c passes !amsdu to build_tx: TB1 ends
+        // immediately after an A-MSDU's QoS header, without a dword gap.
+        let padding = if amsdu {
+            0
+        } else {
+            header_len.next_multiple_of(4) - header_len
+        };
+        // Short command header, generation-selected TX command, then the
+        // MAC header and payload. Ordinary headers use a dword pad; an
+        // A-MSDU has no gap. The native length excludes any padding.
         let command_bytes = if self.pre_ax210 { 20 } else { 28 };
         let mac_offset = 4 + command_bytes;
         let mut bytes = vec![0; mac_offset + frame.len() + padding];
@@ -400,6 +408,58 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/iwlwifi/gen2",
         smoke_gen2_native_tx_command_and_dword_byte_count
+    );
+
+    fn smoke_native_amsdu_omits_pad_flag_and_gap_in_both_tfh_command_layouts() -> TestResult {
+        use super::super::rx_rfh::CompletionFormat;
+        for (format, mac, remainder) in [
+            (CompletionFormat::Qu, 24, 30),
+            (CompletionFormat::Ax210, 32, 38),
+        ] {
+            let mut q = DataQueue::for_format(format).unwrap();
+            q.activate(&[17, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+            let mut frame = [0; 48];
+            frame[0] = 0x88;
+            frame[1] = 0x41;
+            frame[24] = 0x80;
+            // One literal Ethernet subframe: DA/SA, BE length8, LLC/SNAP.
+            let body = [
+                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0, 8, 0xaa,
+                0xaa, 3, 0, 0, 0, 8, 0,
+            ];
+            frame[26..].copy_from_slice(&body);
+            q.send_assisted(&mut Mmio, &frame, 26, None, 1 << 14)
+                .unwrap();
+            let dma = q.pending[0].as_ref().unwrap();
+            let bytes = dma.as_slice();
+            let tfd = q.descriptors.as_slice();
+            let offload = if format == CompletionFormat::Qu {
+                u32::from(u16::from_le_bytes(bytes[6..8].try_into().unwrap()))
+            } else {
+                u32::from_le_bytes(bytes[8..12].try_into().unwrap())
+            };
+            let address = |at| u64::from_le_bytes(tfd[at..at + 8].try_into().unwrap());
+            if offload != 0x4d00
+                || bytes.len() != mac + 48
+                || bytes[mac + 24..mac + 26] != [0x80, 0]
+                || bytes[mac + 26..] != body
+                || tfd[..4] != [3, 0, 20, 0]
+                || tfd[12..14] != [remainder, 0]
+                || tfd[22..24] != [22, 0]
+                || address(4) != dma.dma_addr().raw()
+                || address(14) != address(4) + 20
+                || address(24) != address(4) + (mac + 26) as u64
+            {
+                return TestResult::Fail(
+                    "native A-MSDU/PAD exclusivity or independent TFH TB extent/address",
+                );
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/runtime",
+        smoke_native_amsdu_omits_pad_flag_and_gap_in_both_tfh_command_layouts
     );
 
     fn smoke_tx_adaptive_rate_and_qos_padding() -> TestResult {

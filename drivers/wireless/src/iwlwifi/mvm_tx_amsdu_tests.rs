@@ -47,15 +47,15 @@ fn smoke_mvm_tx_amsdu_native_open_wpa2_tlc_fifo_and_single_completion() -> TestR
             }
             let raw = &actor.amsdu_packets[0];
             let length = usize::from(u16::from_le_bytes([raw[4], raw[5]]));
-            let second = 52 + (frames[0].len() + 8).next_multiple_of(4);
-            if raw[6..8] != [0, 0x6d]
+            let second = 50 + (frames[0].len() + 8).next_multiple_of(4);
+            if raw[6..8] != [0, 0x4d]
                 || raw[24..26] != [0x88, if protected { 0x41 } else { 1 }]
                 || raw[40..46] != AP
-                || raw[48..52] != [0x80, 0, 0, 0]
-                || raw[52..64] != frames[0][..12]
-                || raw[64..66] != ((frames[0].len() - 6) as u16).to_be_bytes()
+                || raw[48..50] != [0x80, 0]
+                || raw[50..62] != frames[0][..12]
+                || raw[62..64] != ((frames[0].len() - 6) as u16).to_be_bytes()
                 || raw[second..second + 12] != frames[1][..12]
-                || raw.len() != 24 + length + 2
+                || raw.len() != 24 + length
             {
                 return Err("native A-MSDU TXWD header/offload/length/padding/subframes");
             }

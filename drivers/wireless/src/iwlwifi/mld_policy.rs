@@ -114,6 +114,7 @@ pub(super) struct Program {
     center: u8,
     applied_dbm: Arc<AtomicI8>,
     qos: Option<super::qos::Parameters>,
+    he: bool,
 }
 impl Program {
     #[allow(clippy::too_many_arguments)]
@@ -136,9 +137,17 @@ impl Program {
             center,
             applied_dbm: Arc::new(AtomicI8::new(applied_dbm)),
             qos,
+            he: false,
         };
         program.check(domain)?;
         Ok(program)
+    }
+    pub fn with_he(mut self, he: bool) -> Result<Self, &'static str> {
+        if he && !self.firmware.he_allowed {
+            return Err("Intel native MCC prohibits HE operation");
+        }
+        self.he = he;
+        Ok(self)
     }
     pub fn power(&self) -> i8 {
         self.applied_dbm.load(Ordering::Acquire)
@@ -165,6 +174,7 @@ impl Program {
     fn check(&self, domain: &RegulatoryDomain) -> Result<(), &'static str> {
         self.validity.check()?;
         if domain.country_code != self.country
+            || self.he && !self.firmware.he_allowed
             || self.country != *b"00" && !self.country.iter().all(u8::is_ascii_uppercase)
             || super::connection::channel_power_width(
                 domain,
@@ -238,6 +248,7 @@ mod tests {
                     channels: permissions.into(),
                     country: *b"US",
                     etsi_5ghz: false,
+                    he_allowed: false,
                 },
                 36,
                 2,

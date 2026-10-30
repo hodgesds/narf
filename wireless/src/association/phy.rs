@@ -936,9 +936,20 @@ impl Offer {
     /// The caller must already prove the actual response's peer/status and
     /// native completion. This does not build or authenticate a response.
     pub fn response_elements(&self, bytes: &[u8]) -> Result<Negotiated, Error> {
+        self.response_elements_with_sae_h2e(bytes, false)
+    }
+    /// As response_elements, permitting the SAE-H2E membership selector123
+    /// only when the native owner already negotiated SaeJoin::h2e(). This
+    /// parsing fact grants no security, PHY, channel or publication authority;
+    /// the selector is not interpreted as a PHY mode or a legacy bitrate.
+    pub fn response_elements_with_sae_h2e(
+        &self,
+        bytes: &[u8],
+        sae_h2e: bool,
+    ) -> Result<Negotiated, Error> {
         self.response(
             bytes,
-            element_selectors(bytes, self.0.ht.operation.primary())?,
+            element_selectors_with_sae_h2e(bytes, self.0.ht.operation.primary(), sae_h2e)?,
         )
     }
     pub(super) fn prepare(
@@ -1085,12 +1096,15 @@ impl Negotiated {
 }
 
 fn element_selectors(bytes: &[u8], primary: u8) -> Result<u8, Error> {
+    element_selectors_with_sae_h2e(bytes, primary, false)
+}
+fn element_selectors_with_sae_h2e(bytes: &[u8], primary: u8, sae_h2e: bool) -> Result<u8, Error> {
     let band = channel::band(primary).ok_or(Error::InvalidBss)?;
     if bytes.len() > 2048 {
         return Err(Error::InvalidBss);
     }
     let mut rates = super::RateElements {
-        allowed: super::SEL_PHY,
+        allowed: super::SEL_PHY | if sae_h2e { super::SEL_SAE_H2E } else { 0 },
         ..Default::default()
     };
     super::ies(bytes, |id, body| rates.observe(id, body))?;
@@ -1101,7 +1115,7 @@ fn element_selectors(bytes: &[u8], primary: u8) -> Result<u8, Error> {
     {
         return Err(Error::UnsupportedRates);
     }
-    Ok(rates.selectors)
+    Ok(rates.selectors & !super::SEL_SAE_H2E)
 }
 
 /// Every mandatory PHY membership selector needs that PHY negotiated

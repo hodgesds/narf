@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use narf_net::Interface;
 
 pub mod amsdu;
+pub mod ap_control;
 pub mod association;
 pub mod caps;
 pub mod ccmp;
@@ -806,6 +807,83 @@ pub trait WirelessNetIface: Interface {
     /// through its ordered control path.
     fn set_four_addr(&self, _enabled: bool) -> Result<(), i32> {
         Err(EOPNOTSUPP)
+    }
+
+    /// Opt into native terminal-completion AP controls and identify this
+    /// interface's current mode generation. An opting-in driver increments
+    /// the nonzero generation on every mode/identity replacement; it never
+    /// wraps into an old generation. Legacy queued-control drivers return
+    /// None and keep their existing synchronous admission contract.
+    fn ap_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        None
+    }
+
+    /// Native terminal-completion counterparts. The request guard must stay
+    /// current through every awaited command and final state publication;
+    /// drivers retain cancellation cleanup even if the borrowed waiter is
+    /// dropped. Defaults adapt synchronous implementations only; nl80211
+    /// selects this path solely for an explicit generation opt-in.
+    async fn start_ap_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        config: ApConfig,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        let result = self.start_ap(config);
+        authority.check_for(self)?;
+        result
+    }
+    async fn stop_ap_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        let result = self.stop_ap();
+        authority.check_for(self)?;
+        result
+    }
+    async fn set_beacon_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        head: Option<Vec<u8>>,
+        tail: Option<Vec<u8>>,
+        probe_resp: Option<Vec<u8>>,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        let result = self.set_beacon(head, tail, probe_resp);
+        authority.check_for(self)?;
+        result
+    }
+    async fn add_station_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        station: StationConfig,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        let result = self.add_station(station);
+        authority.check_for(self)?;
+        result
+    }
+    async fn set_station_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        station: StationConfig,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        let result = self.set_station(station);
+        authority.check_for(self)?;
+        result
+    }
+    async fn del_station_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        peer: Option<[u8; 6]>,
+        reason: u16,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        let result = self.del_station(peer, reason);
+        authority.check_for(self)?;
+        result
     }
 
     /// Begin AP operation: upload the beacon template and start beaconing.

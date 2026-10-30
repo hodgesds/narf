@@ -21,6 +21,10 @@ mod power_tests;
 #[path = "sc_security_tests.rs"]
 mod security_tests;
 
+#[cfg(feature = "kernel-test")]
+#[path = "sc_he_tests.rs"]
+mod he_tests;
+
 type R<T = ()> = Result<T, &'static str>;
 const OWN: [u8; 6] = [2, 0x71, 2, 3, 4, 5];
 const AP: [u8; 6] = [2, 0x72, 2, 3, 4, 5];
@@ -61,6 +65,33 @@ enum Fault {
     HoldPower,
     HoldIgtk,
     WrongSaeSelector,
+    HoldHe,
+}
+
+/// Authored firmware/NVM/AP facts, only for the native HE composition.
+#[derive(Clone, Copy)]
+struct PhyModel {
+    width: u8,
+    streams: u8,
+    rates: u8,
+    mcc_he: bool,
+    response_he: bool,
+}
+impl PhyModel {
+    fn channel(self) -> u8 {
+        if self.width == 2 {
+            36
+        } else {
+            6
+        }
+    }
+    fn chains(self) -> u32 {
+        if self.streams == 2 {
+            3
+        } else {
+            1
+        }
+    }
 }
 
 struct Wire {
@@ -94,6 +125,8 @@ struct Wire {
     group_replay: u64,
     igtk_expected: Option<([u8; 16], u16, u64)>,
     gtk_expected: Option<(u8, [u8; 16])>,
+    phy: Option<PhyModel>,
+    phy_requests: Vec<Vec<u8>>,
 }
 
 // SAFETY: no real device or thread accesses these fixture pointers. The sole
@@ -196,10 +229,13 @@ impl Wire {
                 // The authored MLD table selects iwl_nvm_get_info_rsp v4:
                 // legacy-only single-chain NVM, 14 valid channels/110 entries.
                 response.resize(28 + 110 * 4, 0);
-                response[12..16].copy_from_slice(&1u32.to_le_bytes());
-                response[16..20].copy_from_slice(&1u32.to_le_bytes());
-                response[24..28].copy_from_slice(&14u32.to_le_bytes());
-                for i in 0..14 {
+                let count = if self.phy.is_some() { 51u32 } else { 14 };
+                let chains = self.phy.map_or(1, PhyModel::chains);
+                response[8..12].copy_from_slice(&self.phy.map_or(0u32, |_| 28).to_le_bytes());
+                response[12..16].copy_from_slice(&chains.to_le_bytes());
+                response[16..20].copy_from_slice(&chains.to_le_bytes());
+                response[24..28].copy_from_slice(&count.to_le_bytes());
+                for i in 0..count as usize {
                     response[28 + i * 4..32 + i * 4].copy_from_slice(&1u32.to_le_bytes());
                 }
             }
@@ -208,11 +244,20 @@ impl Wire {
                     body.len() == 28 && half(body, 0) == u16::from_be_bytes(*b"US") && body[2] == 2,
                     "Sc MCC source/country",
                 )?;
-                response.resize(24 + 14 * 4, 0);
+                let count = if self.phy.is_some() { 51u32 } else { 14 };
+                response.resize(24 + count as usize * 4, 0);
                 response[4..6].copy_from_slice(&body[..2]);
-                response[20..24].copy_from_slice(&14u32.to_le_bytes());
-                for i in 0..14 {
-                    response[24 + i * 4..28 + i * 4].copy_from_slice(&13u32.to_le_bytes());
+                if self.phy.is_some_and(|phy| !phy.mcc_he) {
+                    response[8..12].copy_from_slice(&(1u32 << 13).to_le_bytes());
+                }
+                response[20..24].copy_from_slice(&count.to_le_bytes());
+                let permission = if self.phy.is_some() {
+                    13u32 | (1 << 9) | (1 << 10)
+                } else {
+                    13
+                };
+                for i in 0..count as usize {
+                    response[24 + i * 4..28 + i * 4].copy_from_slice(&permission.to_le_bytes());
                 }
             }
             (5, 0x17) => {
@@ -223,7 +268,7 @@ impl Wire {
                 let tid = body[8];
                 if word(body, 0) == 0 {
                     require(
-                        matches!(tid, 0 | 15)
+                        (matches!(tid, 0 | 15) || self.phy.is_some() && matches!(tid, 1 | 4 | 6))
                             && word(body, 16) == 4
                             && body[20..28] != [0; 8]
                             && body[28..36] != [0; 8]
@@ -325,8 +370,18 @@ impl Wire {
             )?,
             (3, 8) => require(body.len() == 52 && body[12..18] == OWN, "Sc MAC identity")?,
             (3, 9) => require(body.len() == 208 && body[16..22] == OWN, "Sc LINK identity")?,
-            (3, 10) => require(body.len() == 104 && body[8..14] == AP, "Sc peer identity")?,
-            (1, 8) => require(body.len() == 32 && word(body, 8) == 6, "Sc PHY channel")?,
+            (3, 10) => {
+                require(body.len() == 104 && body[8..14] == AP, "Sc peer identity")?;
+                if self.fault == Fault::HoldHe && word(body, 92) & 1 != 0 {
+                    self.held = Some((cmd, group, sequence));
+                    return Ok(());
+                }
+            }
+            (1, 8) => require(
+                body.len() == 32
+                    && word(body, 8) == u32::from(self.phy.map_or(6, PhyModel::channel)),
+                "Sc PHY channel",
+            )?,
             (1, 0x9f) => {
                 require(
                     body.len() == 108
@@ -348,17 +403,30 @@ impl Wire {
                 "Sc association residency",
             )?,
             (1, 0xd) => require(
-                body.len() == 1948 && half(body, 8) == 0x802 && body[45] == 1 && body[52] == 6,
+                body.len() == 1948
+                    && (half(body, 8) == 0x802 || self.phy.is_some() && half(body, 8) == 2)
+                    && body[45] == 1
+                    && body[52] == self.phy.map_or(6, PhyModel::channel),
                 "Sc passive scan ABI",
             )?,
-            (1, 0x98) => require(body == [1, 0, 0, 0], "Sc NVM chain identity")?,
+            (1, 0x98) => require(
+                body == self.phy.map_or(1, PhyModel::chains).to_le_bytes(),
+                "Sc NVM chain identity",
+            )?,
             (1, 0x9b) => require(body == [1, 0, 0, 0, 17, 0, 0, 0], "Sc coexistence defaults")?,
             (2, 1) => require(
                 body == [10, 0, 0, 0, 224, 46, 0, 0],
                 "Sc integrated SoC defaults",
             )?,
             (1, 0xc) => require(
-                body == [0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+                body == [
+                    0u32,
+                    self.phy.map_or(1, PhyModel::chains),
+                    self.phy.map_or(1, PhyModel::chains),
+                ]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
                 "Sc scan chain defaults",
             )?,
             (1, 0x77) => require(body == [0; 4], "Sc continuously awake defaults")?,
@@ -391,6 +459,9 @@ impl Wire {
             );
         } else if (group, cmd) == (1, 0xd) {
             let mut beacon = self.ap.beacon();
+            if let Some(phy) = self.phy {
+                beacon.extend_from_slice(&he_tests::elements(phy, true));
+            }
             if self.sae_h2e_only {
                 // Actual BSS membership selector123; the AP's RSNXE and
                 // SAE Commit must independently confirm H2E.
@@ -430,6 +501,9 @@ impl Wire {
         )?;
         let mut frame = bytes[32..32 + header].to_vec();
         frame.extend_from_slice(&bytes[32 + header.next_multiple_of(4)..]);
+        if self.phy.is_some() && matches!(frame[0], 0 | 0x20) {
+            self.phy_requests.push(frame.clone());
+        }
         let protected = frame[1] & 0x40 != 0;
         if self.air.len() < 64 {
             self.air
@@ -516,6 +590,12 @@ impl Wire {
                     }
                 }
                 for mut response in responses {
+                    if let Some(phy) = self
+                        .phy
+                        .filter(|_| response[0] == 0x10 || response[0] == 0x30)
+                    {
+                        response.extend_from_slice(&he_tests::elements(phy, phy.response_he));
+                    }
                     if self.fault == Fault::WrongSaeSelector
                         && response[0] == 0xb0
                         && half(&response, 26) == 1
@@ -571,9 +651,23 @@ impl Wire {
         let mut payload = vec![0; 64];
         payload[..2].copy_from_slice(&(frame.len() as u16).to_le_bytes());
         payload[12..16].copy_from_slice(&(if protected { 0x243u32 } else { 3 }).to_le_bytes());
+        if self.phy.is_some_and(|phy| phy.mcc_he) && frame[0] & 0xc == 8 {
+            let phy = self.phy.unwrap();
+            let rate = 0x400u32
+                | if phy.streams == 2 {
+                    if phy.rates == 3 {
+                        32
+                    } else {
+                        16
+                    }
+                } else {
+                    0
+                };
+            payload[36..40].copy_from_slice(&rate.to_le_bytes());
+        }
         payload[40] = 50;
         payload[41] = 60;
-        payload[42] = 6;
+        payload[42] = self.phy.map_or(6, PhyModel::channel);
         payload.extend_from_slice(frame);
         self.firmware.inject(0xc1, 0, 0x8000, &payload);
     }
@@ -670,13 +764,25 @@ impl Guard {
         name: Option<&'static str>,
         sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
     ) -> R<Self> {
+        Self::build(secured, fault, name, sources, None)
+    }
+    fn build(
+        secured: bool,
+        fault: Fault,
+        name: Option<&'static str>,
+        sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
+        phy: Option<PhyModel>,
+    ) -> R<Self> {
         require(
             ACTIVE.lock().is_none()
                 && narf_net::iface::lookup(super::super::iwl_ifname()).is_none()
                 && name.is_none_or(|name| narf_net::iface::lookup(name).is_none()),
             "live iwlwifi owner exists",
         )?;
-        let versions = super::super::firmware_parser_tests::mld_commands();
+        let mut versions = super::super::firmware_parser_tests::mld_commands();
+        if let Some(phy) = phy {
+            he_tests::versions(&mut versions, phy.rates);
+        }
         let (mut hardware, firmware, trace) = model::station_model();
         model::versions(&mut hardware, &versions);
         if let Some((firmware, pnvm)) = sources {
@@ -689,10 +795,11 @@ impl Guard {
             hardware.bind_sources(firmware, Some(pnvm))?;
         }
         Device::validate_station_profile(&hardware)?;
+        let channel = phy.map_or(6, PhyModel::channel);
         let ap = if secured {
-            FakeAp::wpa2(NETWORK, SSID, 6, 7, PMK, ANONCE)
+            FakeAp::wpa2(NETWORK, SSID, channel, 7, PMK, ANONCE)
         } else {
-            FakeAp::open(NETWORK, SSID, 6, 7)
+            FakeAp::open(NETWORK, SSID, channel, 7)
         }
         .map_err(|_| "shared Sc AP configuration")?;
         let mut wire = Wire {
@@ -726,6 +833,8 @@ impl Guard {
             group_replay: 3,
             igtk_expected: None,
             gtk_expected: None,
+            phy,
+            phy_requests: Vec::new(),
         };
         let configured = run(Device::configure(&mut hardware, OWN), || wire.service());
         let nvm = match configured {
@@ -760,7 +869,11 @@ impl Guard {
         });
         let source = state.hardware.source_fence()?;
         let policy_db = Arc::new(narf_wireless::reg::db::Database::new());
-        policy_db.install(policy());
+        policy_db.install(if phy.is_some() {
+            he_tests::policy()
+        } else {
+            policy()
+        });
         let device = Arc::new(Device {
             test_name: name,
             state: Mutex::new(state),

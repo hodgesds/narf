@@ -9,6 +9,7 @@ use narf_wireless::iface::PhyCapabilities;
 pub struct Local {
     pub ht: bool,
     pub vht: bool,
+    pub he: bool,
     pub tx_streams: u8,
     pub rx_streams: u8,
 }
@@ -19,6 +20,7 @@ impl Local {
         Self {
             ht: sku & 4 != 0,
             vht: sku & 12 == 12,
+            he: sku & 20 == 20,
             tx_streams: tx.count_ones().min(limit) as u8,
             rx_streams: rx.count_ones().min(limit) as u8,
         }

@@ -10,6 +10,13 @@ use alloc::vec;
 use alloc::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
 
+#[path = "netlink_generic_deferred.rs"]
+mod deferred;
+pub use deferred::{
+    register_deferred_context_handler, DeferredAckFuture, DeferredAuthority,
+    DeferredContextHandler, DeferredReplySink, DeferredRequest,
+};
+
 const NLMSG_HDRLEN: usize = 16;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
@@ -390,6 +397,7 @@ fn build_one(
     request: &[u8],
     context: RequestContext<'_>,
     options: ReplyOptions,
+    endpoint: Option<&alloc::sync::Arc<dyn DeferredReplySink>>,
 ) -> Result<Vec<Vec<u8>>, ()> {
     crate::ethtool::ensure_genl_registered();
     if request.len() < NLMSG_HDRLEN + 4 {
@@ -452,11 +460,32 @@ fn build_one(
             .iter()
             .find(|(id, _)| *id == kind)
             .map(|(_, handler)| *handler);
-        let result = if let Some(handler) = contextual {
+        let deferred = endpoint.map(|sink| DeferredRequest::new(sink.clone(), dump));
+        let result = if let (Some(slot), Some(handler)) = (&deferred, deferred::handler(kind)) {
+            handler(command, &request[NLMSG_HDRLEN + 4..], dump, context, slot)
+        } else if let Some(handler) = contextual {
             handler(command, &request[NLMSG_HDRLEN + 4..], dump, context)
         } else {
             (family.handler)(command, &request[NLMSG_HDRLEN + 4..], dump)
         };
+        if let Some(job) = deferred.as_ref().and_then(DeferredRequest::take) {
+            if matches!(&result, Ok(replies) if replies.is_empty()) {
+                deferred::spawn_ack(
+                    job,
+                    deferred.as_ref().unwrap().reply_sink(),
+                    zeroize::Zeroizing::new(request.to_vec()),
+                    options,
+                    cookie.get(),
+                );
+                return Ok(Vec::new());
+            }
+            // A rejected/mixed response must never start native work or
+            // acknowledge a queued command as though it had completed.
+            drop(job);
+            if result.is_ok() {
+                return Ok(vec![error(EINVAL, seq, request)]);
+            }
+        }
         let mut out = match result {
             Ok(payloads) => payloads
                 .into_iter()
@@ -566,6 +595,27 @@ pub fn build_replies_with_context(
     options: ReplyOptions,
     context: RequestContext<'_>,
 ) -> Result<Vec<Vec<u8>>, ()> {
+    build_routed_replies(datagram, options, context, None)
+}
+
+/// Socket-owned asynchronous control path. The sink must hold only the
+/// exact sender's weak identity and must never resolve a reused port id.
+/// Families still obtain and invoke their own current object authority.
+pub fn build_replies_with_endpoint(
+    datagram: &[u8],
+    options: ReplyOptions,
+    context: RequestContext<'_>,
+    endpoint: alloc::sync::Arc<dyn DeferredReplySink>,
+) -> Result<Vec<Vec<u8>>, ()> {
+    build_routed_replies(datagram, options, context, Some(endpoint))
+}
+
+fn build_routed_replies(
+    datagram: &[u8],
+    options: ReplyOptions,
+    context: RequestContext<'_>,
+    endpoint: Option<alloc::sync::Arc<dyn DeferredReplySink>>,
+) -> Result<Vec<Vec<u8>>, ()> {
     let mut offset = 0usize;
     let mut replies = Vec::new();
     while offset < datagram.len() {
@@ -577,7 +627,12 @@ pub fn build_replies_with_context(
         if len < NLMSG_HDRLEN + 4 || len > remaining.len() {
             return Err(());
         }
-        replies.extend(build_one(&remaining[..len], context, options)?);
+        replies.extend(build_one(
+            &remaining[..len],
+            context,
+            options,
+            endpoint.as_ref(),
+        )?);
         let step = align(len);
         if step > remaining.len() {
             if len == remaining.len() {

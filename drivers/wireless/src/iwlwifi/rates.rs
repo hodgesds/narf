@@ -19,10 +19,19 @@ impl Rates {
     /// SAE-H2E membership selector123 is admitted only after the shared
     /// security plan proved H2E; it is never a legacy rate or TLC bit.
     pub(super) fn parse_for_security(
+        ies: &[u8],
+        channel: u8,
+        mode: u8,
+        sae_h2e: bool,
+    ) -> Result<Self, &'static str> {
+        Self::parse_for_profiles(ies, channel, mode, sae_h2e, false)
+    }
+    pub(super) fn parse_for_profiles(
         mut ies: &[u8],
         channel: u8,
         mode: u8,
         sae_h2e: bool,
+        he: bool,
     ) -> Result<Self, &'static str> {
         let allowed = if channel == 14 {
             0xf
@@ -46,6 +55,7 @@ impl Rates {
                     if (rate == 0xff && mode >= 1)
                         || (rate == 0xfe && mode >= 2)
                         || (rate == 0xfb && sae_h2e)
+                        || (rate == 0xfa && he)
                     {
                         continue;
                     }

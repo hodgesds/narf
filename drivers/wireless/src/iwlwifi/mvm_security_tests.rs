@@ -537,13 +537,15 @@ impl Device {
             let header = if frame[0] == 0x88 { 26 } else { 24 };
             let amsdu = header == 26 && frame[24] & 0x80 != 0;
             if header == 26 {
-                if p.bytes[6..8] != [0, if amsdu { 0x6d } else { 0x2d }]
-                    || frame.get(26..28) != Some(&[0, 0])
+                if p.bytes[6..8] != [0, if amsdu { 0x4d } else { 0x2d }]
+                    || !amsdu && frame.get(26..28) != Some(&[0, 0])
                     || frame[24..26] != [if amsdu { 0x80 } else { 0 }, 0]
                 {
                     return Err("native QoS TX-v9 padding/TID/offload geometry");
                 }
-                frame.drain(26..28);
+                if !amsdu {
+                    frame.drain(26..28);
+                }
             }
             if !matches!(frame[0], 8 | 0x88)
                 || frame[1] & 0x87 != 1

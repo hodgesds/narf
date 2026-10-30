@@ -136,6 +136,12 @@ the admin handle returned by stack attachment to a task's generic-netlink
 fd. This is an internal launcher API, not a Linux syscall accepting raw
 capability bytes. Kernel generic-netlink events reach only subscribers in
 the event's namespace and preserve their multicast group in packet info.
+Native asynchronous control ACKs use `GenericReplyEndpoint`, which holds a
+weak reference to the exact sending `SocketFile` and checks its namespace,
+protocol and bound port before publication. It never looks up a replacement
+socket by port id and does not keep a closed file alive across firmware waits.
+Owned command replies are queued with that socket's port id and group0 only
+after actual terminal completion; multicast delivery remains independent.
 A wireless-only service obtains its reply with
 `net::stack::control_registered`, leaving IP frame delivery with the existing
 stack. `network_daemon::prepare(process, &StackAttachReply, TaskSpec)` installs

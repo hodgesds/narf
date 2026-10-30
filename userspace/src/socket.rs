@@ -3556,6 +3556,57 @@ impl core::fmt::Debug for SocketFile {
     }
 }
 
+/// Deferred control replies stay attached to this exact file, even when
+/// its port id is later reused by another netlink socket. A pending native
+/// operation never keeps the file alive after its last descriptor closes.
+#[derive(Debug)]
+struct GenericReplyEndpoint {
+    socket: Weak<SocketFile>,
+    namespace: u64,
+    portid: u32,
+}
+
+#[cfg(feature = "kernel-test")]
+#[path = "socket_deferred_tests.rs"]
+mod deferred_tests;
+
+impl narf_net::netlink_generic::DeferredReplySink for GenericReplyEndpoint {
+    fn current(&self) -> bool {
+        self.socket.upgrade().is_some_and(|socket| {
+            socket.protocol == NETLINK_GENERIC
+                && socket.net_ns_id() == self.namespace
+                && socket.netlink_portid.load(Ordering::Acquire) == self.portid
+                && matches!(&*socket.state.lock(), SocketState::NetlinkGeneric { .. })
+        })
+    }
+
+    fn deliver(&self, mut message: Vec<u8>) -> Result<(), i32> {
+        const NLMSG_HDRLEN: usize = 16;
+        let socket = self.socket.upgrade().ok_or(111)?;
+        if socket.protocol != NETLINK_GENERIC
+            || socket.net_ns_id() != self.namespace
+            || socket.netlink_portid.load(Ordering::Acquire) != self.portid
+            || message.len() < NLMSG_HDRLEN
+        {
+            return Err(111);
+        }
+        message[12..16].copy_from_slice(&self.portid.to_ne_bytes());
+        {
+            let mut state = socket.state.lock();
+            let SocketState::NetlinkGeneric { replies } = &mut *state else {
+                return Err(111);
+            };
+            // Like synchronous command ACKs, this is an owned reply to a
+            // request, not a lossy multicast notification.
+            replies.push_back(message);
+            socket.netlink_reply_groups.lock().push_back(0);
+        }
+        socket.wake_netlink_readable();
+        narf_net::readiness::notify(0);
+        Ok(())
+    }
+}
+
 /// Build a `SockAddr` matching the wire body shape (`copy_user_addr`
 /// in handlers.rs): family u16 + body[port_be, ip_be...]. `addr`
 /// and `port` are taken in host byte order; the body is encoded BE.
@@ -5652,7 +5703,7 @@ impl SocketFile {
                 narf_net::netlink_generic::install_event_sink(Self::broadcast_netlink_generic);
                 narf_net::netlink_generic::install_unicast_sink(Self::unicast_netlink_generic);
                 let admin = self.netlink_admin.lock().clone();
-                let mut replies = match narf_net::netlink_generic::build_replies_with_context(
+                let mut replies = match narf_net::netlink_generic::build_replies_with_endpoint(
                     buf,
                     narf_net::netlink_generic::ReplyOptions {
                         ext_ack: self.netlink_ext_ack.load(Ordering::Acquire),
@@ -5668,6 +5719,11 @@ impl SocketFile {
                         portid: dest_portid,
                         ack_cookie: None,
                     },
+                    Arc::new(GenericReplyEndpoint {
+                        socket: Arc::downgrade(self),
+                        namespace: self.net_ns_id(),
+                        portid: dest_portid,
+                    }),
                 ) {
                     Ok(replies) => replies,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),

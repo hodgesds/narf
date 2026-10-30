@@ -14,6 +14,9 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::netlink_generic::{publish_event, RequestContext};
 use zeroize::Zeroizing;
 
+#[path = "ap_async.rs"]
+mod ap_async;
+
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "control_tests.rs"]
 mod tests;
@@ -1031,6 +1034,26 @@ pub(super) fn handle(
     dump: bool,
     context: RequestContext<'_>,
 ) -> Result<Vec<GenlReply>, i32> {
+    route(command, bytes, dump, context, None)
+}
+
+pub(super) fn deferred_handle(
+    command: u8,
+    bytes: &[u8],
+    dump: bool,
+    context: RequestContext<'_>,
+    slot: &narf_net::netlink_generic::DeferredRequest,
+) -> Result<Vec<GenlReply>, i32> {
+    route(command, bytes, dump, context, Some(slot))
+}
+
+fn route(
+    command: u8,
+    bytes: &[u8],
+    dump: bool,
+    context: RequestContext<'_>,
+    deferred: Option<&narf_net::netlink_generic::DeferredRequest>,
+) -> Result<Vec<GenlReply>, i32> {
     if matches!(command, NEW_INTERFACE | DEL_INTERFACE) {
         return virtual_interface_handle(command, bytes, context);
     }
@@ -1100,7 +1123,10 @@ pub(super) fn handle(
             | CHANNEL_SWITCH
             | COLOR_CHANGE_REQUEST
     ) {
-        return ap_handle(command, bytes, context);
+        return match deferred {
+            Some(slot) => ap_handle_with(command, bytes, context, Some(slot)),
+            None => ap_handle(command, bytes, context),
+        };
     }
     if matches!(command, SET_INTERFACE | GET_STATION) {
         return interface_handle(command, bytes, dump, context);
@@ -3171,6 +3197,15 @@ fn ap_handle(
     bytes: &[u8],
     context: RequestContext<'_>,
 ) -> Result<Vec<GenlReply>, i32> {
+    ap_handle_with(command, bytes, context, None)
+}
+
+fn ap_handle_with(
+    command: u8,
+    bytes: &[u8],
+    context: RequestContext<'_>,
+    deferred: Option<&narf_net::netlink_generic::DeferredRequest>,
+) -> Result<Vec<GenlReply>, i32> {
     let attrs = attributes(bytes)?;
     let index = u32_attr(&attrs, 3)?.ok_or(EINVAL)?;
     let iface = crate::registry::list()
@@ -3180,7 +3215,7 @@ fn ap_handle(
                 && super::in_namespace(iface.as_ref(), context.net_ns_id)
         })
         .ok_or(ENODEV)?;
-    let _admin = authority(&context, iface.as_ref())?;
+    let admin = authority(&context, iface.as_ref())?;
     if !iface.supports_ap() {
         return Err(EOPNOTSUPP);
     }
@@ -3359,11 +3394,32 @@ fn ap_handle(
                 he_obss_pd,
                 he_bss_color,
             };
+            if iface.ap_control_generation().is_some() {
+                station::netdev_up(iface.as_ref())?;
+                return ap_async::defer(
+                    iface,
+                    admin,
+                    deferred,
+                    context.net_ns_id,
+                    index,
+                    ap_async::Operation::Start(cfg),
+                );
+            }
             iface.start_ap(cfg).map_err(mlme_errno)?;
             Ok(Vec::new())
         }
         STOP_AP => {
             reject_unknown(&attrs, &[3])?;
+            if iface.ap_control_generation().is_some() {
+                return ap_async::defer(
+                    iface,
+                    admin,
+                    deferred,
+                    context.net_ns_id,
+                    index,
+                    ap_async::Operation::Stop,
+                );
+            }
             iface.stop_ap().map_err(mlme_errno)?;
             Ok(Vec::new())
         }
@@ -3403,6 +3459,27 @@ fn ap_handle(
             }
             if head.is_some_and(|h| h.len() < 24) {
                 return Err(EINVAL);
+            }
+            if iface.ap_control_generation().is_some() {
+                if fils.is_some()
+                    || unsol_bcast_probe_resp.is_some()
+                    || ftm_responder.is_some()
+                    || he_bss_color.is_some()
+                {
+                    return Err(EOPNOTSUPP);
+                }
+                return ap_async::defer(
+                    iface,
+                    admin,
+                    deferred,
+                    context.net_ns_id,
+                    index,
+                    ap_async::Operation::Beacon(
+                        head.map(|value| value.to_vec()),
+                        tail.map(|value| value.to_vec()),
+                        probe_resp.map(|value| value.to_vec()),
+                    ),
+                );
             }
             if head.is_some() || tail.is_some() || probe_resp.is_some() {
                 iface
@@ -3687,8 +3764,28 @@ fn ap_handle(
                 station_tx_power,
             };
             if command == NEW_STATION {
+                if iface.ap_control_generation().is_some() {
+                    return ap_async::defer(
+                        iface,
+                        admin,
+                        deferred,
+                        context.net_ns_id,
+                        index,
+                        ap_async::Operation::AddStation(sta),
+                    );
+                }
                 iface.add_station(sta).map_err(mlme_errno)?;
             } else {
+                if iface.ap_control_generation().is_some() {
+                    return ap_async::defer(
+                        iface,
+                        admin,
+                        deferred,
+                        context.net_ns_id,
+                        index,
+                        ap_async::Operation::SetStation(sta),
+                    );
+                }
                 iface.set_station(sta).map_err(mlme_errno)?;
             }
             Ok(Vec::new())
@@ -3701,6 +3798,16 @@ fn ap_handle(
                 return Err(EINVAL);
             }
             let reason = u16_attr(&attrs, 54)?.unwrap_or(2);
+            if iface.ap_control_generation().is_some() {
+                return ap_async::defer(
+                    iface,
+                    admin,
+                    deferred,
+                    context.net_ns_id,
+                    index,
+                    ap_async::Operation::DelStation(mac, reason),
+                );
+            }
             iface.del_station(mac, reason).map_err(mlme_errno)?;
             Ok(Vec::new())
         }

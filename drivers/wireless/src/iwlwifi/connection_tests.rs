@@ -55,6 +55,7 @@ fn connection() -> Connection {
         pmf_negotiated: false,
         management_pn: 0,
         key_history: super::super::sc_security::KeyHistory::default(),
+        he: None,
     }
 }
 

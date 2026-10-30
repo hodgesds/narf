@@ -127,6 +127,7 @@ pub struct Mpdu<'a> {
     pub frame: &'a [u8],
     pub channel: u8,
     pub rssi: i8,
+    pub rate_n_flags: u32,
     pub status: u32,
     pub reorder: u32,
     padding: usize,
@@ -178,6 +179,7 @@ fn mpdu_layout(bytes: &[u8], prefix: usize, energy_offset: usize) -> Option<Mpdu
         frame: &bytes[prefix..prefix + len],
         channel: bytes[energy_offset + 2],
         rssi: -(energy.min(127) as i8),
+        rate_n_flags: u32::from_le_bytes(bytes[energy_offset - 4..energy_offset].try_into().ok()?),
         status,
         reorder: u32::from_le_bytes(bytes[16..20].try_into().ok()?),
         padding: if bytes[3] & 0x20 != 0 { 2 } else { 0 },
@@ -229,6 +231,12 @@ pub fn with_phy_capabilities(
             if let Some(vht) = caps.vht {
                 bytes.extend_from_slice(&[191, 12]);
                 bytes.extend_from_slice(&vht);
+            }
+            if local.he && (band == 2400 || local.vht) {
+                let he = super::sc_he::local(local, if band == 2400 { 1 } else { 36 })?
+                    .capability_body();
+                bytes.extend_from_slice(&[255, he.len() as u8]);
+                bytes.extend_from_slice(&he);
             }
         }
         segments.push((descriptor, bytes));

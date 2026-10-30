@@ -98,6 +98,43 @@ fn local_vht160() -> LocalPhy {
     )
     .unwrap()
 }
+fn native_response_sae_h2e_selector() -> Result<(), &'static str> {
+    let scan = ap(true, true, None);
+    let offer = Offer::from_elements(local_vht(), &scan.information_elements, scan.channel)
+        .map_err(|_| "native selector offer")?
+        .ok_or("native selector PHY absent")?;
+    let mut response = scan.information_elements.clone();
+    element(&mut response, 50, &[0xfb]);
+    check!(
+        offer.response_elements(&response).is_err()
+            && offer
+                .response_elements_with_sae_h2e(&response, false)
+                .is_err()
+            && Offer::from_elements(local_vht(), &response, scan.channel).is_err(),
+        "legacy native PHY entrypoint silently acquired SAE-H2E permission"
+    );
+    let confirmed = offer
+        .response_elements_with_sae_h2e(&response, true)
+        .map_err(|_| "negotiated H2E selector was rejected by independent PHY parser")?;
+    check!(
+        confirmed.width() == offer.width()
+            && confirmed.center_channel() == offer.center_channel()
+            && confirmed.ht().tx_mcs() == offer.ht().tx_mcs(),
+        "security selector changed native PHY facts"
+    );
+    *response.last_mut().unwrap() = 0xfa;
+    check!(
+        offer
+            .response_elements_with_sae_h2e(&response, true)
+            .is_err(),
+        "H2E parsing fact admitted unsupported HE membership"
+    );
+    Ok(())
+}
+smoke!(
+    smoke_phy_native_response_sae_h2e_selector_requires_explicit_fact,
+    native_response_sae_h2e_selector
+);
 fn ap160(primary: u8, center: u8, revised: bool) -> Bss {
     let index = usize::from((primary - (center - 14)) / 4);
     let mut operation = [0; 22];

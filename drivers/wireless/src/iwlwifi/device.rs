@@ -239,13 +239,14 @@ impl Device {
         mac: [u8; 6],
     ) -> Result<station_api::Nvm, &'static str> {
         let nvm_packet = hardware.command(0xc, 2, &[0; 4]).await?;
-        let nvm = station_api::Nvm::parse(
+        let mut nvm = station_api::Nvm::parse(
             hardware.version(0xc, 2).ok_or("missing NVM version")?.1,
             &nvm_packet.payload,
         )?;
         if nvm.phy.ht {
             hardware.check_aggregation_api()?;
         }
+        nvm.phy.he &= super::sc_he::native_supported(hardware);
         let runtime = hardware.runtime_configuration()?;
         hardware
             .command(1, 0x98, &nvm.tx_chains.to_le_bytes())
@@ -1230,7 +1231,7 @@ impl WirelessNetIface for Device {
             hw_caps: HwCaps {
                 ht_supported: self.phy.ht,
                 vht_supported: self.phy.vht,
-                he_supported: false,
+                he_supported: self.phy.he,
                 eht_supported: false,
             },
         }
@@ -1336,7 +1337,9 @@ impl WirelessNetIface for Device {
                         &request.ssids,
                     )
                     .map_err(|_| WirelessError::InvalidArgs)?;
-                    scan_api::with_phy_capabilities(version, &mut body, self.phy)
+                    let mut probe_phy = self.phy;
+                    probe_phy.he &= permissions.he_allowed;
+                    scan_api::with_phy_capabilities(version, &mut body, probe_phy)
                         .map_err(|_| WirelessError::InvalidArgs)?;
                 }
             }

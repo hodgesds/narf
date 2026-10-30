@@ -97,6 +97,7 @@ pub mod rekey;
 pub mod runtime;
 pub mod rx;
 pub mod rx_rfh;
+mod sc_he;
 mod sc_security;
 pub mod scan_api;
 pub mod security;

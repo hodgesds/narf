@@ -909,7 +909,7 @@ impl Actor {
                 let qc = frame.get(24).copied().unwrap_or(0xff);
                 tid = qc & 15;
                 amsdu = qc & 0x80 != 0;
-                if frame.get(26..28) != Some(&[0, 0])
+                if !amsdu && frame.get(26..28) != Some(&[0, 0])
                     || frame.get(25) != Some(&0)
                     || tid > 7
                     || qc & 0x70 != 0
@@ -918,7 +918,9 @@ impl Actor {
                 {
                     return Err("Open QoS padding/TID");
                 }
-                frame.drain(26..28);
+                if !amsdu {
+                    frame.drain(26..28);
+                }
             }
             if p.queue != 24 + u16::from(tid)
                 || frame[0..2] != [if self.ht { 0x88 } else { 8 }, 1]
@@ -929,7 +931,7 @@ impl Actor {
                 return Err("MVM actual Open Ethernet header");
             }
             let ethernet = if amsdu {
-                if p.bytes[6..8] != [0, 0x6d] {
+                if p.bytes[6..8] != [0, 0x4d] {
                     return Err("native A-MSDU TX offload flag");
                 }
                 self.amsdu_packets.push(p.bytes.clone());
