@@ -855,6 +855,19 @@ pub trait WirelessNetIface: Interface {
     ) -> Result<Option<Arc<dyn ap_control::ApControlReservation>>, WirelessError> {
         Ok(None)
     }
+    /// Native radio/CNM/P2P controls opt in independently of AP lifecycle.
+    /// The current mode/identity generation never wraps; legacy ROC drivers
+    /// keep None and retain their existing admission/completion contract.
+    fn radio_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        None
+    }
+    /// Actual native serialization, supplementing current delegated grants.
+    /// A driver sharing its physical owner with AP must share that AP lease.
+    fn reserve_radio_control(
+        &self,
+    ) -> Result<Option<Arc<dyn ap_control::ApControlReservation>>, WirelessError> {
+        Ok(None)
+    }
 
     /// Native terminal-completion counterparts. The request guard must stay
     /// current through every awaited command and final state publication;

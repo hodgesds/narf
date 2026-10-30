@@ -1935,6 +1935,36 @@ pub fn withdraw_link_metadata_for(expected: &NetIfaceSnapshot) -> bool {
     true
 }
 
+/// Delegated control records this existing registration observation, never
+/// a grant. A typed-only interface legitimately has no legacy entry yet.
+pub(crate) fn registration_identity(name: &str) -> Option<u64> {
+    IFACES
+        .lock()
+        .as_ref()
+        .and_then(|entries| entries.iter().find(|entry| entry.name == name))
+        .map(|entry| entry.registration_epoch)
+}
+/// Called after the actual registered NetIface capability was invoked.
+/// No callback/capability operation runs under this short comparison lock.
+pub(crate) fn registration_matches(
+    name: &str,
+    expected: Option<u64>,
+    namespace: Option<u64>,
+) -> bool {
+    let guard = IFACES.lock();
+    match guard
+        .as_ref()
+        .and_then(|entries| entries.iter().find(|entry| entry.name == name))
+    {
+        Some(entry) => {
+            expected == Some(entry.registration_epoch)
+                && entry.registration_epoch != 0
+                && namespace.is_none_or(|namespace| entry.net_ns_id == namespace)
+        }
+        None => expected.is_none() && namespace.is_none_or(|namespace| namespace == 0),
+    }
+}
+
 fn update_link_metadata(
     entry: &mut NetIfaceEntry,
     carrier: bool,

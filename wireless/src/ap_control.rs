@@ -14,6 +14,29 @@ use crate::{WirelessError, WirelessNetIface};
 #[path = "ap_event.rs"]
 mod event;
 pub use event::ApEventAuthority;
+#[path = "radio_control.rs"]
+mod radio;
+pub use radio::{RadioControlAuthority, RadioEventAuthority, RadioInterfaceIdentity};
+
+#[derive(Clone, Copy, Debug)]
+enum ControlKind {
+    Ap,
+    Radio,
+}
+impl ControlKind {
+    fn generation(self, iface: &dyn WirelessNetIface) -> Option<NonZeroU64> {
+        match self {
+            Self::Ap => iface.ap_control_generation(),
+            Self::Radio => iface.radio_control_generation(),
+        }
+    }
+    fn permits(self, mode: u32) -> bool {
+        match self {
+            Self::Ap => matches!(mode, 3 | 9),
+            Self::Radio => matches!(mode, 2 | 3 | 8 | 9 | 10),
+        }
+    }
+}
 
 #[cfg(feature = "kernel-test")]
 #[path = "ap_control_tests.rs"]
@@ -24,6 +47,7 @@ mod tests;
 /// boundaries; retaining this object alone never proves current authority.
 #[derive(Clone)]
 pub struct ApControlAuthority {
+    kind: ControlKind,
     iface: Weak<dyn WirelessNetIface>,
     admin: AdminHandle,
     namespace: u64,
@@ -66,14 +90,34 @@ impl ApControlAuthority {
         ifindex: u32,
         reply: Arc<dyn DeferredReplySink>,
     ) -> Result<Self, WirelessError> {
-        let generation = iface
-            .ap_control_generation()
+        Self::bind_kind(admin, iface, namespace, ifindex, reply, ControlKind::Ap)
+    }
+    fn bind_radio(
+        admin: AdminHandle,
+        iface: &Arc<dyn WirelessNetIface>,
+        namespace: u64,
+        ifindex: u32,
+        reply: Arc<dyn DeferredReplySink>,
+    ) -> Result<Self, WirelessError> {
+        Self::bind_kind(admin, iface, namespace, ifindex, reply, ControlKind::Radio)
+    }
+    fn bind_kind(
+        admin: AdminHandle,
+        iface: &Arc<dyn WirelessNetIface>,
+        namespace: u64,
+        ifindex: u32,
+        reply: Arc<dyn DeferredReplySink>,
+        kind: ControlKind,
+    ) -> Result<Self, WirelessError> {
+        let generation = kind
+            .generation(iface.as_ref())
             .ok_or(WirelessError::NotSupported)?;
         let snapshot =
             narf_net::iface::lookup_in(namespace, iface.name()).ok_or(WirelessError::Denied)?;
         let ownership_epoch =
             NonZeroU64::new(snapshot.ownership_epoch).ok_or(WirelessError::Denied)?;
         let authority = Self {
+            kind,
             iface: Arc::downgrade(iface),
             admin,
             namespace,
@@ -85,7 +129,7 @@ impl ApControlAuthority {
             reservation: None,
             reserved: false,
         };
-        if !matches!(authority.mode, 3 | 9) {
+        if !kind.permits(authority.mode) {
             return Err(WirelessError::NotSupported);
         }
         authority.current()?;
@@ -110,7 +154,10 @@ impl ApControlAuthority {
             return Err(WirelessError::Busy);
         }
         let iface = self.iface.upgrade().ok_or(WirelessError::Denied)?;
-        self.reservation = iface.reserve_ap_control()?;
+        self.reservation = match self.kind {
+            ControlKind::Ap => iface.reserve_ap_control()?,
+            ControlKind::Radio => iface.reserve_radio_control()?,
+        };
         self.reserved = true;
         self.current()?;
         Ok(self)
@@ -134,7 +181,7 @@ impl ApControlAuthority {
         let iface = self.iface.upgrade().ok_or(WirelessError::Denied)?;
         if receiver.is_some_and(|pointer| pointer != Arc::as_ptr(&iface).cast::<()>())
             || iface.current_iftype() != self.mode
-            || iface.ap_control_generation() != Some(self.generation)
+            || self.kind.generation(iface.as_ref()) != Some(self.generation)
             || narf_net::iface::lookup_in(self.namespace, iface.name()).is_none_or(|link| {
                 link.ifindex != self.ifindex || link.ownership_epoch != self.ownership_epoch.get()
             })
@@ -155,6 +202,7 @@ impl ApControlAuthority {
 /// Native device/RF/key/controlled-port owners must still authorize every packet.
 #[derive(Clone)]
 pub struct ApInterfaceIdentity {
+    kind: ControlKind,
     iface: Weak<dyn WirelessNetIface>,
     namespace: u64,
     ifindex: u32,
@@ -183,9 +231,13 @@ impl ApControlAuthority {
     /// Capture identity only while the actual request is current. Calling
     /// this does not prove native command completion or open a port/carrier.
     pub fn identity(&self) -> Result<ApInterfaceIdentity, WirelessError> {
+        self.capture_identity(true)
+    }
+    fn capture_identity(&self, require_up: bool) -> Result<ApInterfaceIdentity, WirelessError> {
         self.current()?;
         let iface = self.iface.upgrade().ok_or(WirelessError::Denied)?;
         let identity = ApInterfaceIdentity {
+            kind: self.kind,
             iface: self.iface.clone(),
             namespace: self.namespace,
             ifindex: self.ifindex,
@@ -194,7 +246,7 @@ impl ApControlAuthority {
             ownership_epoch: self.ownership_epoch,
             mac: iface.mac(),
         };
-        identity.current()?;
+        identity.check_with_up(None, require_up)?;
         Ok(identity)
     }
 }
@@ -225,13 +277,20 @@ impl ApInterfaceIdentity {
         self.check(Some(core::ptr::from_ref(iface).cast::<()>()))
     }
     fn check(&self, receiver: Option<*const ()>) -> Result<(), WirelessError> {
+        self.check_with_up(receiver, true)
+    }
+    fn check_with_up(
+        &self,
+        receiver: Option<*const ()>,
+        require_up: bool,
+    ) -> Result<(), WirelessError> {
         let iface = self.iface.upgrade().ok_or(WirelessError::Denied)?;
         if receiver.is_some_and(|pointer| pointer != Arc::as_ptr(&iface).cast::<()>())
             || iface.current_iftype() != self.mode
-            || iface.ap_control_generation() != Some(self.generation)
+            || self.kind.generation(iface.as_ref()) != Some(self.generation)
             || iface.mac() != self.mac
             || narf_net::iface::lookup_in(self.namespace, iface.name()).is_none_or(|link| {
-                !link.link_up
+                require_up && !link.link_up
                     || link.ifindex != self.ifindex
                     || link.ownership_epoch != self.ownership_epoch.get()
             })

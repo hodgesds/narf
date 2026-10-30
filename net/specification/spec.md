@@ -320,6 +320,19 @@ handle and daemon identity through `Cap::invoke`, returning an interface-bound
 control service alongside the existing IP stack. Its administrative handle
 retains both source grants and becomes unusable when either is revoked;
 creating it does not attach an XDP socket or consume interface frame rings.
+Delegated administration remains bound to the original still-registered typed
+`NetIface` handle and its legacy registration identity, including the explicit
+absence of a legacy entry for a typed-only device. Each `authorize_interface`
+and `check_live` boundary invokes the Admin, source daemon and exact source
+interface grants and rechecks that binding. A live capability dropped from the
+registry cannot freshly authorize a replacement with the same name; neither can
+a same-name/index/MAC legacy rebind renew the old delegation. A fresh delegation
+through the current registered handle captures its own registration. Device
+namespace moves preserve registration while authorization still requires the
+current namespace. Retired binding returns `NoIface`; revoked grants return
+`AuthorityRevoked`. Kernel namespace/name administrative handles retain their
+existing independent scope. Native async drivers still recheck current authority
+and actual device/interface generations at every awaited/publication boundary.
 
 ### 3.4 Loopback
 

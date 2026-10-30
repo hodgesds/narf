@@ -117,6 +117,14 @@ impl WirelessNetIface for Radio {
     fn ap_control_generation(&self) -> Option<NonZeroU64> {
         NonZeroU64::new(self.generation.load(Ordering::Acquire))
     }
+    fn radio_control_generation(&self) -> Option<NonZeroU64> {
+        NonZeroU64::new(self.generation.load(Ordering::Acquire))
+    }
+    fn reserve_radio_control(
+        &self,
+    ) -> Result<Option<Arc<dyn ApControlReservation>>, WirelessError> {
+        self.serial.try_reserve().map(Some)
+    }
     fn reserve_ap_control(&self) -> Result<Option<Arc<dyn ApControlReservation>>, WirelessError> {
         self.serial.try_reserve().map(Some)
     }
@@ -705,3 +713,6 @@ kernel_test_in!(
     "wireless/ap_control",
     ap_admission_reservation_is_retained_until_every_native_owner_retires
 );
+
+#[path = "radio_control_tests.rs"]
+mod radio;

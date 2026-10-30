@@ -709,6 +709,29 @@ management/control-port and other BSS mutations in their ordered admission.
 Drivers with their own ordering keep the default hook returning no additional
 reservation. Existing synchronous admission remains unchanged.
 
+`ap_control::RadioControlAuthority` is the typed native radio/CNM/P2P counterpart,
+with independent `radio_control_generation` / `reserve_radio_control` opt-in.
+Legacy ROC drivers retain their existing callbacks. The private current-grant,
+exact-socket, registered-object, namespace/index/ownership-epoch and nonwrapping
+mode-generation checks are shared; public AP binding remains limited to AP/GO.
+Radio binding permits actual station, AP, P2P-client/GO/device modes and exports
+no administrative/device cap or arbitrary evaluation callback. A physical owner
+shared with AP must share its actual serialization lease.
+
+`require_link` and `RadioInterfaceIdentity` require administrative UP for netdev
+roles. A P2P-device wdev has no synthetic IFF_UP requirement: its native owner must
+separately prove the actual completed START_P2P_DEVICE state before ROC or frame
+use. Capturing that identity proves no started device, native CNM grant, RF right,
+key or controlled port. Its generation/registration/namespace observations remain
+current independently of a completed CLI's lifetime. `RadioEventAuthority` sheds
+only a completed control reservation and retains the actual source grants and
+exact socket. Typed ROC-ready/expired and management events require current source
+and role identity; the driver independently supplies exact native grant, finite
+timer/abort/packet retirement and copy/channel/filter proof. Neither queued
+acquire nor no-response abort becomes native success through this API. Closing
+or rebinding a source cannot retarget these notifications. The interface alone
+advertises no ROC or P2P role.
+
 The additive `start_ap_async`, `stop_ap_async`, `set_beacon_async` and
 `add_station_async`/`set_station_async`/`del_station_async` methods represent
 actual native terminal results. Their defaults adapt existing synchronous
