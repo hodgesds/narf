@@ -4303,8 +4303,8 @@ fn smoke_fp_provider_publishes_every_reader() -> TestResult {
     if fail.is_none() {
         let names = enumerate_fp();
         let expected = [
-            (alloc::format!("fp0"), FileType::Special),
-            (alloc::format!("fp1"), FileType::Special),
+            (alloc::string::String::from("fp0"), FileType::Special),
+            (alloc::string::String::from("fp1"), FileType::Special),
         ];
         if names != expected {
             fail = Some("enumerate must list exactly fp0, fp1");
@@ -4389,9 +4389,15 @@ kernel_test_in!("drivers/usb/fingerprint", smoke_fp_open_requires_rawio_cap);
 /// Modelled control-transfer device for the ioctl smoke: records
 /// the SETUP fields of every OUT transfer and answers IN transfers
 /// from a fixed byte string.
+///
+/// `FpOutRecord` names the OUT-transfer record tuple so the
+/// `FakeFpTransport::last_out` field type stays under clippy's
+/// `type_complexity` threshold.
+type FpOutRecord = (u8, u8, u16, u16, alloc::vec::Vec<u8>);
+
 struct FakeFpTransport {
     in_bytes: alloc::vec::Vec<u8>,
-    last_out: narf_lib::sync::IrqSafeSpinLock<Option<(u8, u8, u16, u16, alloc::vec::Vec<u8>)>>,
+    last_out: narf_lib::sync::IrqSafeSpinLock<Option<FpOutRecord>>,
 }
 
 impl crate::fingerprint::FpTransport for FakeFpTransport {
