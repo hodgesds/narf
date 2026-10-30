@@ -1006,6 +1006,47 @@ fresh AP session, a new reserved-page upload on the reused descriptor,
 exact uplink, second disconnect) and the HT20 and paused-publisher
 regressions (stale publisher still fenced, Passive after close).
 
+### RTL8188EE operating-owner replacement (implemented, native acceptance pending)
+
+The persistent `interface::Device` now retains generation-tagged reset work.
+Its worker detects a closed owner and makes up to three automatic recovery
+attempts with a one-second retry interval. A later valid passive scan can
+request another attempt when missing inputs or device access are restored.
+Invalid scan options do not initiate reset. Initial staged provisioning,
+scanning, association, disconnect, removal and replacement share the same
+async control mutex.
+
+Replacement closes the logical frontend, advances a checked non-wrapping
+generation, withdraws interrupts, aborts the station, and requires the actual
+old `Prepared::retire` DMA-idle receipt. Old synchronous TX publications and
+unlocked stack callbacks hold counted leases; replacement drains those leases
+before clearing queued packets and reopening. Copies, cancellations and late
+errors retain their original generation. Neither an old copy nor its late
+error can acquire publication or close a replacement generation. No spinlock
+is held through a stack callback or asynchronous hardware wait.
+
+After retirement, current PCI vendor/device/subsystem/BAR identity, parked
+BME and successful interrupt withdrawal permit a fresh control port. The
+cooperative card-disable/enable sequence follows Linux rtl8188ee `hw.c`,
+`fw.c` and `pwrseq.h`; it stops the firmware CPU and executes the actual
+ACT/LPS/CardEmu/CardDisabled transitions. Power polling requires observed
+hardware ACKs. The factory map is reread and compared before a fresh
+authenticated firmware owner, fresh LLT/rings, IQ/LC radio calibration and
+current signed channel policy are installed. The old firmware `begin` and
+packet claim remain one-shot. No keys, PNs, scan cache or old DMA are restored;
+the interface returns to Passive and requires a fresh association/RSNA.
+
+The public reset waiter pumps work owned by the device; dropping it preserves
+the exact in-flight power transition for the worker. Removal continues to
+drive already-retained work before withdrawing the owner. Missing DMA/IRQ
+retirement proof retains old resources and forbids replacement. A failed new
+preparation is stopped and parked before retry. The logical interface name,
+MAC and operator-controlled IFF_UP survive a successful replacement.
+
+Native regressions compose the production generation supervisor with real
+firmware, LLT, radio, station and DHCP code, using inert MMIO/DMA/peer models.
+Acceptance on both architectures remains pending; the inventory row stays open.
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE
@@ -1164,7 +1205,7 @@ runtimes remain separate from the retained RTL8188EE owner.
 | `ht40` | HT40; blocked on a signed NEHT v2 record covering 40MHz emissions (NEHT v1 binds width20) and 40MHz BW programming |
 | `inactive_power_save` | Inactive power save (IPS, inactiveps default on); blocked on operating_reset: IPS powers RF/BB off and re-runs radio configuration on the retained owner |
 | `multi_radio` | Multiple live radios; blocked on per-device owners replacing the singleton controller (interface ACTIVE/CLAIMED and firmware_native MSI SIGNAL statics) |
-| `operating_reset` | Reset of an operating retained owner; the stop + card-disable quiescence teardown now exists as Prepared::retire (used by the PCI remove hook) and disassociation keeps the live owner (safe rejoin). Remaining family work: no generation supervisor detects a Failed owner and rebuilds it; firmware_transport::Owner::begin/claim_packet_io stay one-shot (started/native_claimed never re-armed after the previous PacketIo is retired), bring_up's power::power_on card-enable flow is not re-runnable on the parked function, and interface::Device has no path to swap a fresh prepare_native::initialize_registered owner into its retained storage |
+| `operating_reset` | Operating reset implemented pending native acceptance: retained generation supervisor, publication-lease drain, verified DMA/IRQ retirement, actual card-disable/enable, current PCI/factory identity and fresh authenticated firmware/LLT/radio/station owner. Old firmware claims stay one-shot; old keys, PNs, packets and cancellation never migrate to the replacement. |
 | `pcie_aspm` | PCIe ASPM link power management; blocked on bus/ PCIe link-control ASPM programming coordinated with the upstream bridge (outside family scope) |
 | `rf_gain_tracking` | RF gain/power tracking; blocked on a thermal-indexed signed gain envelope (thermal power tracking moves gains outside the fixed NEPC/NEHT envelope) |
 | `rts_cts_protection` | RTS/CTS protection; blocked on signed qualification of RTS/CTS-to-self emissions (NEPC/NEHT exclude them) and TXD RTS fields driven by bss use_cts_prot/use_rts |

@@ -56,6 +56,12 @@ pub struct RtlwifiDevice {
 static IFNAME: IrqSafeSpinLock<&'static str> = IrqSafeSpinLock::new("");
 
 impl RtlwifiDevice {
+    fn current_firmware(&self) -> Option<Arc<FirmwareOwner<PciIo>>> {
+        self.native
+            .as_ref()
+            .map(|native| native.native_firmware())
+            .or_else(|| self.firmware.clone())
+    }
     /// Provisioning metadata only; no measured gain or transmit permission.
     pub fn ht20_request(&self) -> Result<super::Ht20Request, super::channel_power::Error> {
         let factory = self
@@ -64,8 +70,7 @@ impl RtlwifiDevice {
             .ok_or(super::channel_power::Error::Identity)?;
         let base = super::channel_power::Calibration::load_registered(factory)?;
         let firmware = self
-            .firmware
-            .as_ref()
+            .current_firmware()
             .and_then(|f| f.identity())
             .ok_or(super::channel_power::Error::Identity)?;
         firmware
@@ -75,7 +80,7 @@ impl RtlwifiDevice {
     }
     /// Firmware-ready is diagnostic CPU readiness, never station readiness.
     pub fn firmware_status(&self) -> Option<super::firmware_transport::Status> {
-        self.firmware.as_ref().map(|owner| owner.status())
+        self.current_firmware().map(|owner| owner.status())
     }
     /// Inactive descriptor/LLT readiness remains below RF and packet admission.
     /// None covers unallocated state or async preparation holding its guard.
@@ -525,8 +530,7 @@ fn provisioning(controller: Option<&RtlwifiDevice>) -> Result<Provisioning, supe
         return Err(super::prepare::Error::State);
     }
     let firmware = controller
-        .firmware
-        .as_ref()
+        .current_firmware()
         .ok_or(super::prepare::Error::State)?;
     let stage = firmware.status().stage;
     if !matches!(
@@ -612,6 +616,13 @@ async fn provision_with(
 /// Retry staged firmware only while the exact retained EE owner is Detected.
 /// Started/failed firmware and existing preparation are never replayed/reset.
 pub async fn provision() -> Result<(), super::prepare::Error> {
+    let native = CONTROLLER
+        .lock()
+        .as_ref()
+        .and_then(|controller| controller.native.clone());
+    if let Some(native) = native {
+        return native.provision().await;
+    }
     provision_with(&PROVISIONING, || {
         let controller = CONTROLLER.lock();
         provisioning(controller.as_ref())

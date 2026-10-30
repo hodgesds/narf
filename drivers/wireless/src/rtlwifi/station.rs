@@ -50,6 +50,14 @@ pub(crate) enum Phase {
     Failed,
 }
 pub(crate) trait Environment: Send + Sync {
+    /// Request replacement before taking the public control lock. The future
+    /// is a waiter for driver-owned work; dropping it cannot cancel card power.
+    fn recovery(
+        &self,
+    ) -> Option<core::pin::Pin<alloc::boxed::Box<dyn Future<Output = Result<(), Error>> + Send>>>
+    {
+        None
+    }
     fn now_ms(&self) -> u64;
     fn fresh_nonce(&self) -> Option<[u8; 32]>;
     fn domain(&self) -> Result<narf_wireless::reg::RegulatoryDomain, Error>;

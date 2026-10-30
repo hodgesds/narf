@@ -9,7 +9,13 @@ use super::{
         Memory, Phase, Prepared,
     },
 };
-use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{
+    boxed::Box,
+    string::String,
+    sync::{Arc, Weak},
+    vec,
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
@@ -18,6 +24,14 @@ use narf_wireless::{
     WirelessNetIface,
 };
 use zeroize::Zeroizing;
+#[path = "lifecycle.rs"]
+mod lifecycle;
+#[path = "rebuild_native.rs"]
+mod rebuild_native;
+#[path = "recovery.rs"]
+pub(crate) mod recovery;
+#[path = "supervisor.rs"]
+pub(crate) mod supervisor;
 type Error = station::Error;
 struct EndpointState {
     rx: narf_ipc::Producer<Frame, RX_RING_N>,
@@ -28,6 +42,7 @@ struct EndpointState {
 struct Received {
     bytes: Vec<u8>,
     publication: Arc<station::Publication>,
+    generation: u64,
 }
 impl EndpointState {
     fn clear(&mut self) {
@@ -53,6 +68,8 @@ pub(crate) struct Device<I: Port<Buffer = M>, M: Memory, E: Environment> {
     rx: Arc<IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
     leisure: IrqSafeSpinLock<Leisure>,
+    lifecycle: lifecycle::Lifecycle,
+    work: Mutex<Option<supervisor::Work>>,
     /// `rtl_pci_remove` ran: the publisher worker exits.
     removed: AtomicBool,
 }
@@ -118,11 +135,13 @@ impl<I: Port<Buffer = M>, M: Memory, E: Environment> core::fmt::Debug for Device
 struct Attempt<'a> {
     device: &'a dyn Close,
     owner: Option<Arc<AtomicBool>>,
+    generation: u64,
     armed: bool,
 }
 trait Close: Sync {
     fn close(&self);
     fn request_abort(&self);
+    fn abort_generation(&self, expected: u64);
 }
 impl Drop for Attempt<'_> {
     fn drop(&mut self) {
@@ -130,7 +149,7 @@ impl Drop for Attempt<'_> {
             if let Some(owner) = &self.owner {
                 owner.store(true, Ordering::Release);
             }
-            self.device.request_abort();
+            self.device.abort_generation(self.generation);
         }
     }
 }
@@ -143,6 +162,13 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     fn request_abort(&self) {
         self.admission.abort.store(true, Ordering::Release);
         self.close();
+    }
+    fn abort_generation(&self, expected: u64) {
+        let publication = self.admission.publication.lock();
+        if self.lifecycle.generation() == expected {
+            self.admission.abort.store(true, Ordering::Release);
+            self.commit_close(publication);
+        }
     }
 }
 impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'static> Device<I, M, E> {
@@ -183,6 +209,8 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             rx: Arc::new(IrqSafeSpinLock::new(Some(consumer))),
             tx: IrqSafeSpinLock::new(Some(producer)),
             leisure: IrqSafeSpinLock::new(Leisure::default()),
+            lifecycle: lifecycle::Lifecycle::new(),
+            work: Mutex::new(None),
             removed: AtomicBool::new(false),
         }
     }
@@ -260,23 +288,28 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         {
             return Err(());
         }
-        let publication = {
+        let (publication, generation) = {
             let owner = self.prepared.try_lock().ok_or(())?;
             let owner = owner.as_ref().ok_or(())?;
             if owner.station_peer().is_none() {
                 return Err(());
             }
-            owner
+            let publication = owner
                 .station_publication_token(&self.environment)
                 .map_err(|_| {
                     self.request_abort();
-                })?
+                })?;
+            (publication, self.lifecycle.generation())
         };
         let buffer = narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
             .map_err(|_| ())?;
         let mut frame = Frame::new(buffer, bytes.len() as u32);
         frame.payload_mut().copy_from_slice(bytes);
         frame.set_tx_meta(meta);
+        let _lease = self
+            .lifecycle
+            .lease(&self.admission, generation)
+            .ok_or(())?;
         let result = self.environment.domain().and_then(|domain| {
             publication.invoke(&domain, || {
                 Ok(self
@@ -296,12 +329,17 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             Ok(Some(result)) => result,
             Ok(None) => Err(()),
             Err(_) => {
-                self.request_abort();
+                self.abort_generation(generation);
                 Err(())
             }
         }
     }
     fn progress(&self) -> Vec<Received> {
+        if self.lifecycle.rebuilding.load(Ordering::Acquire)
+            || self.lifecycle.suspended.load(Ordering::Acquire)
+        {
+            return Vec::new();
+        }
         let Some(mut storage) = self.prepared.try_lock() else {
             return Vec::new();
         };
@@ -311,6 +349,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         let Some(mut state) = self.state.try_lock() else {
             return Vec::new();
         };
+        let generation = self.lifecycle.generation();
         if self.admission.closed.load(Ordering::Acquire) {
             state.clear();
             self.withdraw_interrupts(owner);
@@ -407,6 +446,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 .map(|bytes| Received {
                     bytes,
                     publication: publication.clone(),
+                    generation,
                 })
                 .collect())
         })();
@@ -502,6 +542,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             signal.raise();
         }
         self.withdraw();
+        let _control = self.lifecycle.control.lock().await;
         let mut storage = self.prepared.lock().await;
         self.state.lock().await.clear();
         let Some(owner) = storage.as_mut() else {
@@ -513,11 +554,12 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             let _ = owner.disconnect_station_peer().await;
         }
         let reclaimed = owner.retire().await;
+        let publishers_retired = self.lifecycle.drain_publications().await.is_ok();
         if reclaimed {
             // Proven idle (or never published): Drop releases every ring.
             storage.take();
         }
-        reclaimed
+        reclaimed && publishers_retired
     }
     /// Withdraw this device from every registry `publish` entered.
     fn withdraw(self: &Arc<Self>) {
@@ -613,6 +655,9 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             if !allowed {
                 break;
             }
+            let Some(_lease) = self.lifecycle.lease(&self.admission, frame.generation) else {
+                break;
+            };
             let mut bytes = frame.bytes;
             let result = self.environment.domain().and_then(|domain| {
                 frame.publication.invoke(&domain, || {
@@ -623,7 +668,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 })
             });
             if result.is_err() {
-                self.request_abort();
+                self.abort_generation(frame.generation);
                 break;
             }
         }
@@ -642,6 +687,18 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn admit_for_test(&self) {
         self.published.store(true, Ordering::Release);
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn fail_for_test(&self) {
+        self.request_abort();
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn generation_for_test(&self) -> u64 {
+        self.lifecycle.generation()
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn environment_for_test(&self) -> &E {
+        &self.environment
     }
 }
 fn admitted(bytes: &[u8], own: [u8; 6]) -> bool {
@@ -748,6 +805,14 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
         let dwell = scan_dwell(&request)?;
         if self.admission.closed.load(Ordering::Acquire) {
+            self.environment
+                .recovery()
+                .ok_or(WirelessError::HardwareError)?
+                .await
+                .map_err(error)?;
+        }
+        let _control = self.lifecycle.control.lock().await;
+        if self.admission.closed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
         }
         let mut storage = self.prepared.lock().await;
@@ -765,6 +830,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         let mut attempt = Attempt {
             device: self,
             owner: Some(owner.station_cancellation()),
+            generation: self.lifecycle.generation(),
             armed: true,
         };
         let deadline = self.environment.now_ms().saturating_add(dwell);
@@ -813,6 +879,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         result.map_err(error)
     }
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
+        let _control = self.lifecycle.control.lock().await;
         if self.admission.closed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
         }
@@ -837,6 +904,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         let mut attempt = Attempt {
             device: self,
             owner: Some(owner.station_cancellation()),
+            generation: self.lifecycle.generation(),
             armed: true,
         };
         let result = owner
@@ -876,14 +944,16 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         let mut attempt = Attempt {
             device: self,
             owner: None,
+            generation: self.lifecycle.generation(),
             armed: true,
         };
+        let _control = self.lifecycle.control.lock().await;
+        attempt.generation = self.lifecycle.generation();
         let mut storage = self.prepared.lock().await;
         self.state.lock().await.clear();
         self.close();
         let owner = storage.as_mut().ok_or(WirelessError::Busy)?;
         let result = owner.disconnect_station().await.map_err(error);
-        attempt.armed = false;
         // Safe rejoin: a completed disassociation leaves a Passive station
         // on the same live owner. Reopen admission under the owner and
         // publication locks; the advanced receive epoch fences every stale
@@ -892,12 +962,19 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             && owner.station_phase() == station::Phase::Passive
             && !self.removed.load(Ordering::Acquire)
         {
+            if let Err(reason) = self.lifecycle.drain_publications().await {
+                owner.abort_station();
+                self.request_abort();
+                attempt.armed = false;
+                return Err(error(reason));
+            }
             let _publication = self.admission.publication.lock();
             self.admission.abort.store(false, Ordering::Release);
             self.admission.closed.store(false, Ordering::Release);
             self.ht
                 .store(owner.station_ht_capability().is_some(), Ordering::Release);
         }
+        attempt.armed = false;
         result
     }
     async fn set_config(&self, config: WirelessConfig) -> Result<(), WirelessError> {
@@ -940,6 +1017,59 @@ pub(super) mod publication_test {
         pin::pin,
         task::{Context, Waker},
     };
+
+    pub(in crate::rtlwifi) async fn old_copy_and_error_across_rebuild<
+        I: Port<Buffer = M> + 'static,
+        M: Memory + 'static,
+        E: recovery::Rebuild<I, M> + 'static,
+    >(
+        device: &Arc<Device<I, M, E>>,
+    ) -> Result<(), &'static str> {
+        let old = device
+            .progress()
+            .pop()
+            .ok_or("EE fixture lacks actual native copied RX")?;
+        let lease = device
+            .lifecycle
+            .lease(&device.admission, old.generation)
+            .ok_or("EE old callback could not enter publication")?;
+        let attempt = Attempt {
+            device: device.as_ref(),
+            owner: None,
+            generation: old.generation,
+            armed: true,
+        };
+        device.request_abort();
+        let mut pending = Box::pin(
+            device
+                .schedule(supervisor::Operation::Recover)
+                .map_err(|_| "EE rebuild not scheduled")?,
+        );
+        if pending
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+        {
+            return Err("EE rebuild passed an active old publication lease");
+        }
+        if !device.admission.closed.load(Ordering::Acquire) {
+            return Err("EE paused old publication reopened logical carrier");
+        }
+        drop(lease);
+        pending
+            .await
+            .map_err(|_| "EE rebuild after publication retirement failed")?;
+        drop(attempt); // A late error/drop belongs exclusively to the old generation.
+        if device.admission.closed.load(Ordering::Acquire)
+            || device
+                .lifecycle
+                .lease(&device.admission, old.generation)
+                .is_some()
+        {
+            return Err("EE old copied RX or late error reached replacement generation");
+        }
+        Ok(())
+    }
 
     pub(in crate::rtlwifi) async fn paused_publisher_then_close<
         I: Port<Buffer = M> + 'static,
@@ -1024,7 +1154,8 @@ pub(super) mod publication_test {
 
 pub(super) struct NativeEnvironment {
     admission: Arc<station::Admission>,
-    firmware: Arc<super::firmware_transport::Owner<super::firmware_native::PciIo>>,
+    firmware: IrqSafeSpinLock<Arc<super::firmware_transport::Owner<super::firmware_native::PciIo>>>,
+    device: IrqSafeSpinLock<Weak<Native>>,
 }
 /// Live station work consumes only the current installation. The explicit
 /// native preparation boundary owns signed-policy bootstrap.
@@ -1040,9 +1171,15 @@ impl NativeEnvironment {
         firmware: Arc<super::firmware_transport::Owner<super::firmware_native::PciIo>>,
     ) -> Self {
         Self {
-            firmware,
+            firmware: IrqSafeSpinLock::new(firmware),
             admission: Arc::new(station::Admission::new()),
+            device: IrqSafeSpinLock::new(Weak::new()),
         }
+    }
+    pub(super) fn firmware(
+        &self,
+    ) -> Arc<super::firmware_transport::Owner<super::firmware_native::PciIo>> {
+        self.firmware.lock().clone()
     }
 }
 impl Environment for NativeEnvironment {
@@ -1050,14 +1187,14 @@ impl Environment for NativeEnvironment {
         &self,
         base: Arc<super::channel_power::Calibration>,
     ) -> Result<Option<Arc<super::ht::Grant>>, Error> {
-        super::ht::Grant::registered(base, self.firmware.identity().ok_or(Error::State)?)
+        super::ht::Grant::registered(base, self.firmware().identity().ok_or(Error::State)?)
             .map_err(Error::Radio)
     }
     fn fallback(
         &self,
         base: Arc<super::channel_power::Calibration>,
     ) -> Result<Option<Arc<super::fallback::Grant>>, Error> {
-        super::fallback::Grant::registered(base, self.firmware.identity().ok_or(Error::State)?)
+        super::fallback::Grant::registered(base, self.firmware().identity().ok_or(Error::State)?)
             .map_err(Error::Radio)
     }
     fn admission(&self) -> Option<&Arc<station::Admission>> {
@@ -1079,13 +1216,23 @@ impl Environment for NativeEnvironment {
         narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
     }
     fn preparation_failed(&self) -> bool {
-        self.firmware.status().stage == super::firmware_transport::Stage::Failed
+        self.firmware().status().stage == super::firmware_transport::Stage::Failed
     }
     fn interrupt(&self) -> Option<Arc<super::irq::Signal>> {
-        self.firmware.native().interrupt()
+        self.firmware().native().interrupt()
     }
     fn deliver(&self, enabled: bool) -> bool {
-        self.firmware.native().deliver(enabled)
+        self.firmware().native().deliver(enabled)
+    }
+    fn recovery(
+        &self,
+    ) -> Option<core::pin::Pin<Box<dyn core::future::Future<Output = Result<(), Error>> + Send>>>
+    {
+        let device = self.device.lock().upgrade()?;
+        match device.schedule(supervisor::Operation::Recover) {
+            Ok(waiter) => Some(Box::pin(waiter)),
+            Err(error) => Some(Box::pin(async move { Err(error) })),
+        }
     }
 }
 pub(super) type Native = Device<
@@ -1124,6 +1271,7 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
     CLAIMED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| Error::State)?;
+    *device.environment.device.lock() = Arc::downgrade(&device);
     narf_net::registry()
         .register(&authority, Registered(device.clone()))
         .map_err(|_| Error::Profile)?;
@@ -1135,11 +1283,32 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
     narf_wireless::registry::register(device.clone());
     // Linux `rtl_pci_intr_mode_decide`: MSI first. Without a vector the
     // owner keeps every IMR clear and this worker polls at 1 ms.
-    device.environment.firmware.native().arm_msi();
+    device.environment.firmware().native().arm_msi();
     narf_scheduler::spawn(async move {
+        let mut retries = 0;
+        let mut retry_at = 0;
         loop {
-            if device.removed.load(Ordering::Acquire) {
+            core::future::poll_fn(|cx| {
+                device.poll_transition(cx);
+                core::task::Poll::Ready(())
+            })
+            .await;
+            let working = device.work.try_lock().is_none_or(|slot| slot.is_some());
+            if device.removed.load(Ordering::Acquire) && !working {
                 break;
+            }
+            if !working
+                && !device.removed.load(Ordering::Acquire)
+                && !device.lifecycle.suspended.load(Ordering::Acquire)
+            {
+                if !device.admission.closed.load(Ordering::Acquire) {
+                    retries = 0;
+                } else if retries < 3 && device.environment.now_ms() >= retry_at {
+                    if device.schedule(supervisor::Operation::Recover).is_ok() {
+                        retries += 1;
+                        retry_at = device.environment.now_ms().saturating_add(1000);
+                    }
+                }
             }
             // Snapshot before servicing so a vector raised mid-pass is seen.
             let signal = device.environment.interrupt();

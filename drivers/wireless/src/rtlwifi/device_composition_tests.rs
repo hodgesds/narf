@@ -15,10 +15,36 @@ use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessNetIf
 struct BootPort {
     packet: PacketPort,
     pages: Arc<IrqSafeSpinLock<Vec<Vec<u8>>>>,
+    powered_off: Arc<AtomicBool>,
+    power_ack: Arc<AtomicBool>,
+    cycles: Arc<AtomicUsize>,
 }
 #[async_trait::async_trait]
 impl Io for BootPort {
     fn read8(&self, reg: u16) -> Result<u8, AccessError> {
+        if reg == 5 && self.power_ack.load(Ordering::Acquire) {
+            let value = self.packet.radio.hardware_read8(reg);
+            if value & 3 != 0 {
+                if self.packet.model.lock().master {
+                    return Err(AccessError::Gate);
+                }
+                if value & 2 != 0 {
+                    self.powered_off.store(true, Ordering::Release);
+                }
+                if value & 1 != 0 {
+                    if !self.powered_off.swap(false, Ordering::AcqRel) {
+                        return Err(AccessError::Gate);
+                    }
+                    let mut model = self.packet.model.lock();
+                    model.started = false;
+                    model.slots = [0; 7];
+                    model.rx_next = 0;
+                    model.held = None;
+                    self.cycles.fetch_add(1, Ordering::AcqRel);
+                }
+                self.packet.radio.hardware_byte(reg, value & !3);
+            }
+        }
         self.packet.read8(reg)
     }
     fn read32(&self, reg: u16) -> Result<u32, AccessError> {
@@ -38,6 +64,11 @@ impl Io for BootPort {
         self.packet.write8(reg, value)?;
         if reg == 0x80 && value & 4 != 0 {
             self.packet.radio.hardware_byte(reg, value & !4);
+        }
+        if reg == 0x80 && value == 0 {
+            for page in self.pages.lock().iter_mut() {
+                page.clear();
+            }
         }
         Ok(())
     }
@@ -105,6 +136,8 @@ impl Default for IrqFixture {
     }
 }
 struct DeviceEnvironment {
+    firmware: IrqSafeSpinLock<Arc<Firmware<BootPort>>>,
+    device: IrqSafeSpinLock<alloc::sync::Weak<TestDevice>>,
     irq: Arc<IrqFixture>,
     admission: Arc<Admission>,
     base: Arc<Env>,
@@ -113,6 +146,17 @@ struct DeviceEnvironment {
     ht: Option<HtFixtureSource>,
 }
 impl Environment for DeviceEnvironment {
+    fn recovery(
+        &self,
+    ) -> Option<core::pin::Pin<Box<dyn Future<Output = Result<(), StationError>> + Send>>> {
+        let device = self.device.lock().upgrade()?;
+        let pending = device
+            .schedule(super::super::super::super::super::interface::supervisor::Operation::Recover);
+        Some(match pending {
+            Ok(waiter) => Box::pin(waiter),
+            Err(error) => Box::pin(async move { Err(error) }),
+        })
+    }
     fn fallback(
         &self,
         base: Arc<super::super::super::super::super::channel_power::Calibration>,
@@ -223,11 +267,15 @@ impl Harness {
         packet.radio.hardware_word(0x6c, 1 << 31);
         packet.radio.hardware_byte(3, 0xff);
         packet.radio.hardware_byte(0x82, 0xf8);
+        packet.radio.hardware_byte(6, 2); // Independently supplied power-ready status.
         let pages = Arc::new(IrqSafeSpinLock::new(vec![Vec::new(); 8]));
         let firmware = Arc::new(Firmware::new(
             BootPort {
                 packet: packet.clone(),
                 pages: pages.clone(),
+                powered_off: Arc::new(AtomicBool::new(false)),
+                power_ack: Arc::new(AtomicBool::new(true)),
+                cycles: Arc::new(AtomicUsize::new(0)),
             },
             super::super::super::super::super::regs::RTL_DEV_8188EE,
         ));
@@ -304,6 +352,8 @@ impl Harness {
             Arc::new(Mutex::new(Some(owner))),
             factory,
             DeviceEnvironment {
+                firmware: IrqSafeSpinLock::new(firmware.clone()),
+                device: IrqSafeSpinLock::new(alloc::sync::Weak::new()),
                 irq: irq.clone(),
                 admission: Arc::new(Admission::new()),
                 base: env.clone(),
@@ -312,6 +362,7 @@ impl Harness {
                 ht: ht_source.clone(),
             },
         ));
+        *device.environment_for_test().device.lock() = Arc::downgrade(&device);
         device.admit_for_test();
         *ACTIVE_TEST.lock() = Some(device.clone());
         narf_net::iface::register(name, device.mac(), send);
@@ -415,6 +466,8 @@ impl Harness {
 }
 #[path = "ht_composition_tests.rs"]
 mod ht_tests;
+#[path = "recovery_composition_tests.rs"]
+mod recovery_tests;
 impl Drop for Harness {
     fn drop(&mut self) {
         *ACTIVE_TEST.lock() = None;

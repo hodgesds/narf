@@ -9,6 +9,7 @@ pub struct PciIo {
     cap: Cap<BusDeviceCap, Write>,
     registers: MmioRegion,
     packet_mode: AtomicBool,
+    quarantined: AtomicBool,
     msi: narf_lib::sync::IrqSafeSpinLock<Option<Msi>>,
 }
 /// Single MSI vector (Linux `rtl_pci_intr_mode_msi`: `pci_enable_msi` +
@@ -89,6 +90,7 @@ impl PciIo {
             cap,
             registers,
             packet_mode: AtomicBool::new(false),
+            quarantined: AtomicBool::new(false),
             msi: narf_lib::sync::IrqSafeSpinLock::new(None),
         }
     }
@@ -130,6 +132,7 @@ impl PciIo {
             narf_bus::msi::disable(&msi.config)
         });
         if !matches!(disabled, Ok(Ok(()))) {
+            self.quarantined.store(true, Ordering::Release);
             quarantine(&msi);
             core::mem::forget(msi);
             return false;
@@ -168,10 +171,73 @@ impl PciIo {
         if matches!(disabled, Ok(Ok(()))) {
             teardown(msi);
         } else {
+            self.quarantined.store(true, Ordering::Release);
             quarantine(&msi);
             core::mem::forget(msi);
         }
         false
+    }
+    /// Only the serialized replacement owner calls this after the old
+    /// Prepared DMA retirement receipt and IRQ withdrawal. A failed MSI
+    /// disable cannot be converted into a fresh source of register authority.
+    pub(super) fn parked_control(&self) -> Result<Self, Error> {
+        if self.quarantined.load(Ordering::Acquire) || self.msi.lock().is_some() {
+            return Err(Error::Gate);
+        }
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            self.check(0, 1)?;
+            let command =
+                narf_bus::pci::read_command(&self.cap, &self.device).map_err(|_| Error::Access)?;
+            command_gate(command, false)?;
+            self.check_identity()?;
+            // SAFETY: the old IRQ and DMA owner is retired, the caller owns
+            // the device control mutex, and current config proves parked DMA.
+            Ok(unsafe { Self::new(self.device, self.cap, self.registers) })
+        })
+        .map_err(|_| Error::Access)?
+    }
+    fn check_identity(&self) -> Result<(), Error> {
+        let read = |at| {
+            narf_bus::pci::read_config32(&self.cap, &self.device, at).map_err(|_| Error::Access)
+        };
+        let id = u32::from(self.device.id.vendor) | (u32::from(self.device.id.device) << 16);
+        let subsystem = u32::from(self.device.id.subsystem_vendor)
+            | (u32::from(self.device.id.subsystem_id) << 16);
+        if read(0)? != id || read(0x2c)? != subsystem {
+            return Err(Error::Gone);
+        }
+        let low = read(0x18)?;
+        if low & 1 != 0 || low == u32::MAX {
+            return Err(Error::Gone);
+        }
+        let high = if low & 6 == 4 {
+            u64::from(read(0x1c)?) << 32
+        } else {
+            0
+        };
+        if high | u64::from(low & !15) != self.registers.phys.raw() {
+            return Err(Error::Gone);
+        }
+        Ok(())
+    }
+    pub(super) fn verify_factory(&self, expected: &super::efuse::Factory) -> Result<(), Error> {
+        self.access(0xcf, 1, || {
+            self.check_identity()?;
+            let function = match self.device.addr {
+                narf_bus::BusAddr::Pcie(address) => address.function,
+                _ => return Err(Error::Unsupported),
+            };
+            // SAFETY: the caller holds exclusive control after card enable,
+            // current PCI identity/BAR were checked within this invocation.
+            let actual = unsafe {
+                super::efuse::read_factory(&self.registers, self.device.id.device, function)
+            }
+            .map_err(|_| Error::Gate)?;
+            if actual.mac != expected.mac || actual.logical != expected.logical {
+                return Err(Error::Gate);
+            }
+            Ok(())
+        })?
     }
     pub(super) fn allocate_dma(&self, bytes: usize) -> Result<narf_io::DmaBuffer, Error> {
         if narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain {
