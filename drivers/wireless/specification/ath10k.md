@@ -876,9 +876,24 @@ Host-bus/system power transitions remain separate profiles.
   An absent device or revoked authority fails the boot. Smokes
   `drivers/wireless/ath10k/eeprom` and
   `smoke_ath10k_qca9887_eeprom_calibration_replaces_board_data_and_skips_otp`
-  cover the register sequence, fallbacks and non-QCA9887 isolation. Pre-cal/cal
-  files and DT/NVMEM sources remain unimplemented. The EEPROM bytes are factory
+  cover the register sequence, fallbacks and non-QCA9887 isolation.
+  DT/NVMEM sources remain unimplemented. The EEPROM bytes are factory
   calibration only; regulatory and transmit-power authority are unchanged.
+- Exact PCI-function calibration files use Linux's
+  `ath10k/pre-cal-pci-<domain:bus:device.function>.bin` then
+  `ath10k/cal-pci-<domain:bus:device.function>.bin` lookup order. The address
+  comes from the owned enumerated PCI function, not a caller's board hint.
+  Both inputs require verified signatures even in executable-developer builds,
+  exact per-silicon calibration length and complete advertised extension data.
+  Pre-cal bytes reach host-interest memory before FLASH board-ID OTP (`0x8000`);
+  the selected signed BDF then precedes FLASH_SECTION_ALL calibration (`0x10000`).
+  A final cal file replaces the board payload and skips EEPROM/OTP calibration,
+  while preserving the existing signed-board and extended-board lookup path.
+  Missing optional files preserve EEPROM/board-plus-OTP fallback. A malformed
+  or refused present file fails before firmware activation. The same immutable
+  source owner retains the actual file capability through mission startup.
+  Native file-selection/BMI and signed-registry execution gates are pending.
+  DT/NVMEM calibration still needs an actual platform source provider.
 - `firmware::Image::{parse, load}` own the API 2–6 container and expose
   bounded image/OTP/code-swap slices, feature bits and WMI/HTT operation
   versions. `Files` supplies owned immutable bytes and `Files::wait_missing`
@@ -906,6 +921,9 @@ Host-bus/system power transitions remain separate profiles.
   they become available. Mission startup requires the sealed owner. The real
   PciBoot path has no missing-source fallback, including kernel-test builds;
   only private protocol models can omit external firmware inputs.
+  Repeated identical signed-container staging lookups retain the original name,
+  bytes, signer and capability rather than exhausting that eight-record log;
+  a fresh registry open cannot replace a revoked original epoch.
   Native MMIO read/write closures, every HIF send/receive/progress future poll,
   RSNA processing and terminal key-reply commitment, netdev registration,
   carrier, receive IPC and final stack publication use these retained current
@@ -1310,7 +1328,7 @@ VHT160/80+80 (SISO VHT20/40/80 is implemented); PFC fetch/queue ownership;
 AP-side U-APSD under the AP owner; DFS/indoor/beacon-hint
 qualification; remain-on-channel/action-frame control; hardware key offload;
 AP/P2P roles; host-bus PM and wake offload (system suspend is implemented);
-pre-cal/cal-file and DT/NVMEM calibration sources (QCA9887 EEPROM is implemented)
+DT/NVMEM calibration sources (QCA9887 EEPROM and registry files are implemented)
 and automatic credential replay after recovery.
 Firmware-owned TX BA, the N-deep HTT pipeline and aggregate retry accounting
 are implemented above, beside the bounded RX BA/reorder and RAW A-MSDU receiver. Unsupported role, width, stream,

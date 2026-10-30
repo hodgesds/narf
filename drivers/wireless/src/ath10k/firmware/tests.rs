@@ -127,7 +127,8 @@ impl Transport for Target {
                 let address = word(request, 4).unwrap();
                 let parameter = word(request, 8).unwrap();
                 self.executions.push((address, parameter));
-                let value = if parameter == 0x10 {
+                self.sequence.push((4, address, parameter));
+                let value = if matches!(parameter, 0x10 | 0x8000) {
                     self.otp_identity.unwrap_or(0x8c00)
                 } else if parameter == 0x40000 {
                     self.extended_board_id
@@ -722,3 +723,6 @@ kernel_test_in!(
     "drivers/wireless/ath10k/firmware",
     smoke_ath10k_staged_firmware_and_extended_board_preserve_rom_state
 );
+
+#[path = "calibration_conversation_tests.rs"]
+mod calibration_conversation_tests;

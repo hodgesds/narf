@@ -1171,8 +1171,20 @@ async fn boot_task(
                 let variant = crate::ath11k::board::check_smbios().bdf_ext;
                 let variant = core::str::from_utf8(&variant)
                     .map_err(|_| super::firmware::Error::Unsupported)?;
-                super::firmware::prepare(&mut bmi, &mut files, profile, identity, variant, &image)
-                    .await?;
+                let address = match device.addr {
+                    narf_bus::BusAddr::Pcie(address) => address,
+                    _ => return Err(super::firmware::Error::Unsupported),
+                };
+                super::firmware::prepare_for_address(
+                    &mut bmi,
+                    &mut files,
+                    profile,
+                    identity,
+                    variant,
+                    &image,
+                    Some(address),
+                )
+                .await?;
                 files.seal()?;
                 let status = FirmwarePrepared {
                     directory: profile.directory,
