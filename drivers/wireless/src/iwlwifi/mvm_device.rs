@@ -148,6 +148,8 @@ pub(super) struct Device {
     wpa2: bool,
     sae: bool,
     ht20: bool,
+    vht: bool,
+    he: bool,
     irq: Option<u8>,
     publication: AtomicBool,
     terminal: AtomicBool,
@@ -274,6 +276,8 @@ impl Device {
         let wpa2 = owner.station_wpa2_supported();
         let sae = owner.station_sae_supported();
         let ht20 = owner.supports_native_ht20();
+        let vht = ht20 && nvm.phy.vht;
+        let he = owner.supports_native_he_contract();
         let stopping = Arc::new(AtomicBool::new(false));
         owner.bind_station_stop(stopping.clone());
         Ok(Arc::new_cyclic(|me| Self {
@@ -293,6 +297,8 @@ impl Device {
             wpa2,
             sae,
             ht20,
+            vht,
+            he,
             irq,
             publication: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
@@ -1123,8 +1129,14 @@ impl WirelessNetIface for Device {
     fn phy_capabilities(&self, band_mhz: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
         (self.ht20 && matches!(band_mhz, 2400 | 5000)).then(|| {
             narf_wireless::iface::PhyCapabilities {
-                ht: super::mvm_boot::local_ht().capability_body(),
-                vht: None,
+                ht: if self.vht && band_mhz == 5000 {
+                    super::mvm_boot::local_ht_for(super::mvm_boot::feature_bits::HT40)
+                } else {
+                    super::mvm_boot::local_ht()
+                }
+                .capability_body(),
+                vht: (self.vht && band_mhz == 5000)
+                    .then(|| super::mvm_boot::local_vht_for(0).capability_body()),
             }
         })
     }
@@ -1149,8 +1161,8 @@ impl WirelessNetIface for Device {
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
                 ht_supported: self.ht20,
-                vht_supported: false,
-                he_supported: false,
+                vht_supported: self.vht,
+                he_supported: self.he,
                 eht_supported: false,
             },
         }

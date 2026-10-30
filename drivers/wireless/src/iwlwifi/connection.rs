@@ -40,6 +40,7 @@ pub struct Connection {
     rates: super::rates::Rates,
     phy: super::ht_vht::Negotiated,
     local_phy: super::ht_vht::Local,
+    regulatory: super::mld_policy::Program,
     rx_ba: [Option<super::aggregation::Window>; super::aggregation::MAX_TIDS],
     actions: VecDeque<Vec<u8>>,
     /// 802.11w IGTK store (BIP-CMAC-128), populated from message 3 on
@@ -119,12 +120,48 @@ impl Connection {
             rates: super::rates::Rates::parse(&[1, 1, 0x82], 1).unwrap(),
             phy: super::ht_vht::Negotiated::default(),
             local_phy: super::ht_vht::Local::from_nvm(0, 1, 1),
+            regulatory: Self::model_policy_program(),
             rx_ba: core::array::from_fn(|_| None),
             actions: VecDeque::new(),
             mfp: narf_wireless::mfp::MfpKeyStore::new(),
             mfp_active: false,
         }
     }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn model_policy_domain() -> narf_wireless::reg::RegulatoryDomain {
+        narf_wireless::reg::RegulatoryDomain {
+            country_code: *b"US",
+            rules: alloc::vec![narf_wireless::reg::RegRule {
+                freq_start_mhz: 2402,
+                freq_end_mhz: 2422,
+                max_bandwidth_mhz: 20,
+                max_power_dbm: 10,
+                flags: narf_wireless::reg::RegFlags::empty(),
+            }],
+        }
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    fn model_policy_program() -> super::mld_policy::Program {
+        super::mld_policy::Program::new(
+            &Self::model_policy_domain(),
+            super::mld_regulatory::Mcc {
+                channels: alloc::vec![13;51].into(),
+                country: *b"US",
+                etsi_5ghz: false,
+            },
+            1,
+            0,
+            1,
+            10,
+            None,
+            super::mld_policy::Validity::new(),
+        )
+        .unwrap()
+    }
+    pub(super) fn regulatory_program(&self) -> super::mld_policy::Program {
+        self.regulatory.clone()
+    }
+
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn secure_model() -> Self {
         let mut connection = Self::open_model();
@@ -155,10 +192,17 @@ impl Connection {
     ) -> Result<Self, &'static str> {
         let domain = narf_wireless::reg::db::ensure_domain()
             .map_err(|_| "wireless regulatory domain is not configured")?;
-        Self::associate_in_domain(
+        let policy = super::mld_policy::Source::native();
+        hw.install_rf_policy(super::mld_policy::Authority::Transaction(
+            policy.transaction(&domain)?,
+        ))?;
+        let connection = Self::associate_in_domain(
             hw, local, beacon, auth, tx_chains, local_phy, roam_from, &domain,
         )
-        .await
+        .await?;
+        let fence = policy.bind(connection.regulatory_program())?;
+        hw.install_rf_policy(super::mld_policy::Authority::Station(fence))?;
+        Ok(connection)
     }
 
     // The private model supplies its explicit policy through the same full
@@ -231,7 +275,8 @@ impl Connection {
             beacon.channel,
             qos.is_some(),
             |width, center| {
-                channel_power_width(domain, beacon.channel, width, center, &permissions).is_some()
+                channel_power_width(domain, beacon.channel, width, center, &permissions.channels)
+                    .is_some()
             },
         )?;
         let rates = super::rates::Rates::parse_for_phy(
@@ -239,9 +284,25 @@ impl Connection {
             beacon.channel,
             phy.mode,
         )?;
-        let max_power =
-            channel_power_width(domain, beacon.channel, phy.width, phy.center, &permissions)
-                .ok_or("channel transmission prohibited by host/firmware regulatory policy")?;
+        let max_power = channel_power_width(
+            domain,
+            beacon.channel,
+            phy.width,
+            phy.center,
+            &permissions.channels,
+        )
+        .ok_or("channel transmission prohibited by host/firmware regulatory policy")?;
+        let qos = permissions.limit_qos(domain, beacon.channel, phy.width, phy.center, qos);
+        let regulatory = super::mld_policy::Program::new(
+            domain,
+            permissions.clone(),
+            beacon.channel,
+            phy.width,
+            phy.center,
+            max_power,
+            qos,
+            hw.rf_policy_validity()?,
+        )?;
         let mut phy_command = station_api::phy(1, beacon.channel);
         phy.apply_phy(&mut phy_command, beacon.channel);
         hw.command(1, 8, &phy_command).await?;
@@ -318,6 +379,7 @@ impl Connection {
             rates,
             phy,
             local_phy,
+            regulatory,
             rx_ba: core::array::from_fn(|_| None),
             actions: VecDeque::new(),
             mfp: narf_wireless::mfp::MfpKeyStore::new(),
@@ -352,10 +414,7 @@ impl Connection {
                 this.beacon.rsn.clone().ok_or("AP has no RSN IE")?,
             ));
         }
-        let rsn = akm.map(|akm| match akm {
-            security::Akm::Wpa2Psk => narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body(),
-            security::Akm::Wpa3Sae => narf_wireless::rsn::RsnIe::wpa3_sae_ccmp().encode_body(),
-        });
+        let rsn = akm.map(security::Akm::sta_rsn_ie);
         let rates = this.rates.elements();
         let params = mlme::AssocParamsRsn {
             base: mlme::AssocParams {
@@ -403,6 +462,13 @@ impl Connection {
             this.beacon.channel,
             this.qos.is_some(),
         )?;
+        this.qos = permissions.limit_qos(
+            domain,
+            this.beacon.channel,
+            this.phy.width,
+            this.phy.center,
+            this.qos,
+        );
         // The response can choose a different secondary channel while
         // narrowing bandwidth. Revalidate the resulting entire span.
         let final_power = channel_power_width(
@@ -410,7 +476,7 @@ impl Connection {
             this.beacon.channel,
             this.phy.width,
             this.phy.center,
-            &permissions,
+            &permissions.channels,
         )
         .ok_or("association response selected a prohibited channel span")?;
         if final_power < max_power {
@@ -492,6 +558,17 @@ impl Connection {
         if hw.receive_capture_epoch() != Some(this.receive_epoch) {
             this.open_receive_epoch(hw).await?;
         }
+        hw.poll()?;
+        this.regulatory = super::mld_policy::Program::new(
+            domain,
+            permissions,
+            this.beacon.channel,
+            this.phy.width,
+            this.phy.center,
+            final_power.min(max_power),
+            this.qos,
+            hw.rf_policy_validity()?,
+        )?;
         this.authorized = true;
         Ok(this)
     }
@@ -1409,16 +1486,10 @@ async fn install_key(
 }
 
 /// Firmware permission is refreshed once per scan/association operation.
-pub(super) async fn regulatory_channels(hw: &mut Hardware) -> Result<Vec<u32>, &'static str> {
-    let domain = narf_wireless::reg::db::ensure_domain()
-        .map_err(|_| "wireless regulatory domain is not configured")?;
-    regulatory_channels_in_domain(hw, &domain).await
-}
-
-async fn regulatory_channels_in_domain(
+pub(super) async fn regulatory_channels_in_domain(
     hw: &mut Hardware,
     domain: &narf_wireless::reg::RegulatoryDomain,
-) -> Result<Vec<u32>, &'static str> {
+) -> Result<super::mld_regulatory::Mcc, &'static str> {
     if hw.version(1, 0xc8).map(|v| v.1) != Some(8) {
         return Err("unsupported regulatory response");
     }
@@ -1426,20 +1497,7 @@ async fn regulatory_channels_in_domain(
     put16(&mut body, 0, u16::from_be_bytes(domain.country_code));
     body[2] = 2; // MCC_SOURCE_BIOS
     let response = hw.command(1, 0xc8, &body).await?;
-    if response.payload.len() < 24 {
-        return Err("invalid MCC response");
-    }
-    if u32::from_le_bytes(response.payload[..4].try_into().unwrap()) > 1 {
-        return Err("firmware rejected regulatory update");
-    }
-    let count = u32::from_le_bytes(response.payload[20..24].try_into().unwrap()) as usize;
-    if count > 115 || response.payload.len() != 24 + count * 4 {
-        return Err("invalid MCC channel count");
-    }
-    Ok(response.payload[24..]
-        .chunks_exact(4)
-        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
-        .collect())
+    super::mld_regulatory::Mcc::parse(&response.payload)
 }
 
 /// Host policy is intersected with firmware permission, with the lowest

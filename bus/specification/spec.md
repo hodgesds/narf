@@ -258,6 +258,48 @@ registered bridge whose secondary bus is the function's bus, and
 `sibling_function` another function of the same slot; both read only
 the type-1 / registry data and need no capability.
 
+`pci::pme` exposes endpoint PME registers without claiming a platform route:
+
+```rust
+pub enum WakeState { D0, D1, D2, D3Hot, D3Cold }
+pub struct Status { pub supported_states: u8, pub enabled: bool, pub pending: bool }
+pub fn status(cap: &Cap<BusDeviceCap, Read>, device: &BusDevice)
+    -> Result<Status, PmeError>;
+pub fn arm(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice, state: WakeState)
+    -> Result<(), PmeError>;
+pub fn disarm(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice)
+    -> Result<bool, PmeError>;
+```
+
+The trusted driver binding must supply the capability and `BusDevice` for
+the same exclusively owned endpoint. `BusDeviceCap` currently carries a
+capability identity and epoch without a recorded PCI-address binding;
+`Cap::invoke` checks current validity, not that the supplied device matches
+that identity. These APIs rely on the existing config-space caller-ownership
+contract and do not authorize selecting another function with an endpoint cap.
+The caller also serializes PMCSR with its power-state writer.
+
+Every read/write runs inside the supplied current `Cap::invoke`. `arm`
+requires the actual PMC.PME_Support bit and refuses an already-enabled source
+without changing it. It sets PME_Enable and acknowledges stale W1C
+PME_Status while preserving D-state, data and unrelated control fields;
+enable readback must succeed. `disarm` returns the observed terminal status,
+disables PME and acknowledges status, with disable readback. Absent,
+malformed, truncated or all-ones PM capability words fail closed. The caller
+retains ownership through failed cleanup. These functions neither change
+D-state nor provide auxiliary
+power, an upstream bridge grant, ACPI wake routing or a wake interrupt.
+`disarm_observed` returns a `DisarmObservation` containing the actual observed
+pending bit and a separate `terminal: Result<(), PmeError>`. An outer Ok
+means an observation exists, not that disable succeeded. Callers retain the
+observation before propagating a terminal error, because W1C may already
+have cleared the hardware cause. The existing `disarm` wrapper still returns
+an error unless terminal disable/readback succeeded.
+The `kernel-test` graph additionally exports the scoped
+`ecam::__test_windows` registration and one-window PME arm/disarm-receipt failure
+fixture. Both restore their prior test ownership and are absent from the
+production feature graph; neither establishes an actual platform wake route.
+
 ### 3.5 Hot-plug
 
 ```rust

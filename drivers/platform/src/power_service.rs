@@ -41,6 +41,11 @@ use narf_power::sleep_request::{SleepRequestError, SleepState};
 
 use crate::lid::LidEvent;
 
+#[path = "power_service_sleep.rs"]
+mod sleep;
+pub(crate) use sleep::schedule_sleep;
+pub use sleep::{last_sleep_request, SleepRequest};
+
 /// The composition root's executor: owns the suspend authority and
 /// runs actions from the power service's worker (task context).
 #[derive(Debug)]
@@ -49,42 +54,12 @@ struct PlatformExecutor;
 impl service::ActionExecutor for PlatformExecutor {
     fn execute(&self, action: PowerAction) {
         match action {
-            PowerAction::Suspend => {
-                // The production-S3 gate inside the suspend core
-                // decides whether this request actually sleeps the
-                // machine; on unvalidated hardware it refuses and
-                // the refusal is the log line.
+            PowerAction::Suspend | PowerAction::Freeze => {
+                // This composition site owns minting. The service/sysfs
+                // writer gets a queued acknowledgment; the retained request
+                // exposes actual completion/refusal from the async task.
                 let cap: Cap<narf_power::Power, Invoke> = Cap::bootstrap();
-                match narf_power::suspend::s3_enter(&cap) {
-                    Ok(()) => {
-                        let _ = writeln!(narf_console::Writer, "  power-service: resumed");
-                    }
-                    Err(e) => {
-                        let _ = writeln!(
-                            narf_console::Writer,
-                            "  power-service: suspend request not carried out: {e:?}"
-                        );
-                    }
-                }
-            }
-            PowerAction::Freeze => {
-                // The s2idle twin of the S3 arm above: same minted
-                // authority, different core. The s2idle production
-                // gate inside `suspend_to_idle` decides whether the
-                // request actually parks the machine; unarmed or
-                // unsupported, the refusal is the log line.
-                let cap: Cap<narf_power::Power, Invoke> = Cap::bootstrap();
-                match narf_power::s2idle::suspend_to_idle(&cap) {
-                    Ok(()) => {
-                        let _ = writeln!(narf_console::Writer, "  power-service: resumed");
-                    }
-                    Err(e) => {
-                        let _ = writeln!(
-                            narf_console::Writer,
-                            "  power-service: freeze request not carried out: {e:?}"
-                        );
-                    }
-                }
+                let _ = schedule_sleep(action, cap);
             }
             PowerAction::PowerOff => {
                 narf_power::orderly::orderly_poweroff(
@@ -205,6 +180,7 @@ fn providers() -> StateProviders {
 /// are order-tolerant (requests wait for an executor).
 pub fn init() {
     let cap = narf_power::bootstrap_power_authority();
+    let _ = narf_power::pci_wake::install_authority(&cap);
     let _ = service::install_action_executor(&cap, Arc::new(PlatformExecutor));
     // Userspace trigger composition: with the executor in place,
     // install the sleep-request hook so `/sys/power/state` stores

@@ -230,11 +230,11 @@ mod ba;
 #[path = "mvm_phy.rs"]
 mod phy;
 pub(super) use phy::local_ht;
+pub(super) use phy::{local_ht_for, local_vht_for};
 #[path = "mvm_power.rs"]
 mod power;
 pub type PowerRequest = power::PowerRequest;
 pub type PowerStatus = power::PowerStatus;
-#[cfg(any(test, feature = "kernel-test"))]
 pub(super) use power::feature as feature_bits;
 pub(super) use power::Emission as PowerEmission;
 

@@ -412,6 +412,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         &self,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<(), Error> {
+        self.check_dwell_scan(domain)?;
         self.htt
             .wmi
             .htc

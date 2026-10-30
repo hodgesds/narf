@@ -408,7 +408,7 @@ impl Owner {
                         supported_rates,
                         basic_rates,
                         protected: plan.security().is_rsn(),
-                        pmf: plan.security().is_sae(),
+                        pmf: plan.pmf(),
                         short_preamble: active.channel <= 14 && negotiated & 32 != 0,
                         short_slot: active.channel > 14 || negotiated & 1024 != 0,
                         erp_protection: active.channel <= 14 && erp.is_some_and(|erp| erp & 2 != 0),

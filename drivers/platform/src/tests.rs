@@ -2840,6 +2840,7 @@ kernel_test_in!("drivers/platform/intel_vsec", smoke_intel_vsec_feature_ids);
 /// halt — the harness arms no periodic clockevent on this path,
 /// so a real halt could sleep past the idle-kill (the hazard
 /// `s2idle`'s bounded test entry documents).
+#[cfg(feature = "kernel-test")]
 fn composition_park_step_latch() {
     narf_power::s2idle::note_wake_event(narf_power::s2idle::WakeSource::TestInjected);
 }
@@ -2852,7 +2853,14 @@ fn composition_park_step_latch() {
 /// runs and hand it back afterwards, whatever the body returns.
 fn smoke_power_state_freeze_end_to_end() -> TestResult {
     let saved = narf_power::device_pm::registered_devices();
+    // SAFETY: this serialized composition smoke owns PM registration and
+    // drives every spawned transition terminal before restoring live hooks.
+    #[cfg(feature = "kernel-test")]
+    let _async_registry = unsafe { narf_power::system_pm::__test_registry_scope() };
+    #[cfg(feature = "kernel-test")]
     let result = smoke_power_state_freeze_end_to_end_body();
+    #[cfg(not(feature = "kernel-test"))]
+    let result = TestResult::Skip("requires scoped async-PM kernel fixture");
     narf_power::device_pm::__reset_for_test();
     for entry in &saved {
         match &entry.ops {
@@ -2865,6 +2873,59 @@ fn smoke_power_state_freeze_end_to_end() -> TestResult {
     result
 }
 
+#[cfg(feature = "kernel-test")]
+struct CompositionAsyncPm {
+    entered: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+    resumed: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+    allow: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "kernel-test")]
+impl narf_power::system_pm::AsyncSystemPm for CompositionAsyncPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async { Err(narf_power::device_pm::DevicePmError::DriverError) })
+    }
+    fn prepare_suspend_target<'a>(
+        &'a self,
+        _target: narf_power::system_pm::SystemSleepState,
+    ) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            use core::sync::atomic::Ordering;
+            self.entered.fetch_add(1, Ordering::AcqRel);
+            core::future::poll_fn(|cx| {
+                if self.allow.load(Ordering::Acquire) {
+                    core::task::Poll::Ready(Ok(()))
+                } else {
+                    cx.waker().wake_by_ref();
+                    core::task::Poll::Pending
+                }
+            })
+            .await
+        })
+    }
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        alloc::boxed::Box::pin(async {
+            self.resumed
+                .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+            Ok(())
+        })
+    }
+}
+
+#[cfg(feature = "kernel-test")]
+fn drive_composition_until(done: impl Fn() -> bool) -> bool {
+    for _ in 0..16 {
+        if done() {
+            return true;
+        }
+        // Keep existing Stage::Late work and scheduler initialization intact.
+        // This bounded executor round never halts or resets any task queue.
+        narf_scheduler::poll_one_round_nested();
+    }
+    done()
+}
+
+#[cfg(feature = "kernel-test")]
 fn smoke_power_state_freeze_end_to_end_body() -> TestResult {
     use narf_power::service;
 
@@ -2904,6 +2965,17 @@ fn smoke_power_state_freeze_end_to_end_body() -> TestResult {
         return TestResult::Fail("composition did not install the sleep-request hook");
     }
 
+    let entered = alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+    let resumed = alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+    narf_power::system_pm::register_async_system_pm(
+        "platform-composition-test",
+        alloc::sync::Arc::new(CompositionAsyncPm {
+            entered: entered.clone(),
+            resumed: resumed.clone(),
+            allow: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(true)),
+        }),
+    );
+
     // Arm the park and model the wake source.
     narf_power::s2idle::__test_arm_s2idle();
     narf_power::s2idle::__test_set_park_step_hook(Some(composition_park_step_latch));
@@ -2925,10 +2997,20 @@ fn smoke_power_state_freeze_end_to_end_body() -> TestResult {
         return TestResult::Fail("service did not count the freeze request");
     }
 
-    // Execute from task context: the platform executor mints the
-    // Power cap and runs `suspend_to_idle` — park, wake, resume.
+    // The platform executor queues an owned async coordinator. Drive that
+    // actual task to terminal completion before inspecting park/wake state.
     if service::pump_pending() != 1 {
         return TestResult::Fail("pump did not execute the queued freeze");
+    }
+    let Some(request) = crate::power_service::last_sleep_request() else {
+        return TestResult::Fail("freeze executor retained no observable request");
+    };
+    if !drive_composition_until(|| request.result().is_some())
+        || request.result() != Some(Ok(()))
+        || entered.load(core::sync::atomic::Ordering::Acquire) != 1
+        || resumed.load(core::sync::atomic::Ordering::Acquire) != 1
+    {
+        return TestResult::Fail("spawned freeze skipped async hooks or did not report completion");
     }
     let s = narf_power::s2idle::stats();
     if s.parks != 1 || s.wakes != 1 || s.last_exit != narf_power::s2idle::ParkExit::WakeEvent {
@@ -2953,6 +3035,16 @@ fn smoke_power_state_freeze_end_to_end_body() -> TestResult {
         if service::pump_pending() != 1 {
             return TestResult::Fail("pump did not execute the queued suspend");
         }
+        let Some(request) = crate::power_service::last_sleep_request() else {
+            return TestResult::Fail("mem executor retained no observable request");
+        };
+        if !drive_composition_until(|| request.result().is_some())
+            || request.result() != Some(Err(narf_power::SuspendError::NotImplemented))
+            || entered.load(core::sync::atomic::Ordering::Acquire) != 2
+            || resumed.load(core::sync::atomic::Ordering::Acquire) != 2
+        {
+            return TestResult::Fail("unarmed mem request lost async hooks or observable refusal");
+        }
         if narf_power::suspend::current_phase() != narf_power::SuspendPhase::Idle {
             return TestResult::Fail("phase did not return to Idle after the mem cycle");
         }
@@ -2967,6 +3059,87 @@ fn smoke_power_state_freeze_end_to_end_body() -> TestResult {
 kernel_test_in!(
     "drivers/platform/power-service",
     smoke_power_state_freeze_end_to_end
+);
+
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+fn smoke_spawned_sleep_rechecks_captured_invoke_after_pending_prepare() -> TestResult {
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use narf_capabilities::{Cap, Invoke};
+    use narf_power::{service::PowerAction, suspend::SuspendError};
+    if narf_power::suspend::current_phase() != narf_power::SuspendPhase::Idle {
+        return TestResult::Fail("prior test left a live system-PM transition");
+    }
+    // SAFETY: serialized fixture; cleanup below drives the actual task
+    // terminal before this scope restores probe-owned asynchronous hooks.
+    let _registry = unsafe { narf_power::system_pm::__test_registry_scope() };
+    let entered = alloc::sync::Arc::new(AtomicUsize::new(0));
+    let resumed = alloc::sync::Arc::new(AtomicUsize::new(0));
+    let allow = alloc::sync::Arc::new(AtomicBool::new(false));
+    narf_power::system_pm::register_async_system_pm(
+        "held-composition-test",
+        alloc::sync::Arc::new(CompositionAsyncPm {
+            entered: entered.clone(),
+            resumed: resumed.clone(),
+            allow: allow.clone(),
+        }),
+    );
+    let cap = Cap::<narf_power::Power, Invoke>::bootstrap();
+    let request = crate::power_service::schedule_sleep(PowerAction::Freeze, cap);
+    struct Cleanup {
+        cap: Cap<narf_power::Power, Invoke>,
+        allow: alloc::sync::Arc<AtomicBool>,
+        request: alloc::sync::Arc<crate::power_service::SleepRequest>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if self.cap.is_live() {
+                self.cap.revoke();
+            }
+            self.allow.store(true, Ordering::Release);
+            let _ = drive_composition_until(|| self.request.result().is_some());
+        }
+    }
+    let _cleanup = Cleanup {
+        cap,
+        allow: allow.clone(),
+        request: request.clone(),
+    };
+    if !drive_composition_until(|| entered.load(Ordering::Acquire) == 1)
+        || request.result().is_some()
+        || narf_power::suspend::current_phase() != narf_power::SuspendPhase::FreezingUserspace
+    {
+        return TestResult::Fail("spawned task did not retain the Pending preparation owner");
+    }
+    let parks = narf_power::s2idle::stats().parks;
+    cap.revoke();
+    allow.store(true, Ordering::Release);
+    if !drive_composition_until(|| request.result().is_some())
+        || request.result() != Some(Err(SuspendError::AuthorityRevoked))
+        || narf_power::s2idle::stats().parks != parks
+        || resumed.load(Ordering::Acquire) != 1
+        || narf_power::suspend::current_phase() != narf_power::SuspendPhase::Idle
+    {
+        return TestResult::Fail(
+            "Pending sleep task replaced its revoked Invoke cap or lost rollback",
+        );
+    }
+    // A cap invalid before admission produces an observable refusal without
+    // spawning preparation, and the earlier request's Arc stays unchanged.
+    let refused = crate::power_service::schedule_sleep(PowerAction::Freeze, cap);
+    if refused.result() != Some(Err(SuspendError::AuthorityRevoked))
+        || request.result() != Some(Err(SuspendError::AuthorityRevoked))
+        || entered.load(Ordering::Acquire) != 1
+    {
+        return TestResult::Fail(
+            "invalid admission became queued success or overwrote an older request",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+kernel_test_in!(
+    "drivers/platform/power-service",
+    smoke_spawned_sleep_rechecks_captured_invoke_after_pending_prepare
 );
 
 // ── Intel HID events (filter + virtual buttons) ──────────────────

@@ -80,6 +80,8 @@ pub mod handshake;
 pub mod ht_vht;
 pub mod iwl_msix;
 pub mod mac_ctx;
+mod mld_policy;
+mod mld_regulatory;
 pub mod mlme;
 mod mvm_boot;
 mod mvm_device;

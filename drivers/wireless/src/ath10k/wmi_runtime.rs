@@ -15,7 +15,11 @@ pub use management::{
     Completion as ManagementCompletion, Receipt as ManagementReceipt, Token as ManagementToken,
 };
 mod active_scan;
+mod associated_scan;
+mod dwell_scan;
 pub(in crate::ath10k) use active_scan::checked as checked_policy;
+pub(in crate::ath10k) use associated_scan::receive_permission;
+pub(in crate::ath10k) use dwell_scan::ScanPolicy;
 mod data;
 mod ht;
 mod mlme;
@@ -95,6 +99,12 @@ pub(super) struct Radio<T> {
     pub ready: Option<ScanReady>,
     channels: Vec<u16>,
     sequence: u16,
+    // Set before any scan setup publication, cleared only after a matched
+    // terminal plus successful restore. A dropped public future leaves this
+    // retained for the registered worker's STOP/vdev cleanup.
+    scan_pending: Option<u16>,
+    scan_terminal: Option<u16>,
+    scan_dwell: Option<dwell_scan::Work>,
     pending: VecDeque<htt::Event>,
     failed: bool,
     power_save: Option<bool>,
@@ -122,6 +132,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             data: None,
             channels: Vec::new(),
             sequence: 0,
+            scan_pending: None,
+            scan_terminal: None,
+            scan_dwell: None,
             pending: VecDeque::new(),
             failed: false,
             power_save: None,
@@ -202,7 +215,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         restore: Option<&[u8]>,
         validate: impl Fn() -> Result<(), Error>,
     ) -> Result<ScanReport, Error> {
-        if self.failed || self.ready.is_none() || self.peer.is_some() {
+        if self.failed || self.ready.is_none() || self.peer.is_some() || self.scan_pending.is_some()
+        {
             return Err(Error::Failed);
         }
         wire::validate_channels(channels)?;
@@ -233,38 +247,49 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .map_err(|_| Error::NoMemory)?;
         self.sequence = sequence;
         self.failed = true;
+        self.scan_pending = Some(sequence);
+        self.scan_terminal = None;
+        let retained = self.htt.wmi.htc.transport.nonblocking_wmi();
         for packet in setup
             .iter()
             .map(Vec::as_slice)
             .chain(core::iter::once(command.as_slice()))
         {
-            active_scan::checked(
-                async {
-                    self.htt
-                        .wmi
-                        .htc
-                        .send_wmi(packet)
-                        .await
-                        .map_err(htt::Error::from)
-                        .map_err(Error::from)
-                },
-                &validate,
-            )
-            .await?;
+            if retained {
+                self.send_scan_command(packet, &validate).await?;
+            } else {
+                active_scan::checked(
+                    async {
+                        self.htt
+                            .wmi
+                            .htc
+                            .send_wmi(packet)
+                            .await
+                            .map_err(htt::Error::from)
+                            .map_err(Error::from)
+                    },
+                    &validate,
+                )
+                .await?;
+            }
         }
         let deadline = narf_time::Deadline::after_ms(25_000);
-        for _ in 0..65_536 {
+        loop {
             narf_scheduler::yield_now().await;
             validate()?;
             if deadline.expired() {
                 return Err(Error::Timeout);
             }
-            match active_scan::checked(
-                async { self.htt.poll().await.map_err(Error::from) },
-                &validate,
-            )
-            .await?
-            {
+            let event = if retained {
+                self.htt.poll_now()?
+            } else {
+                active_scan::checked(
+                    async { self.htt.poll().await.map_err(Error::from) },
+                    &validate,
+                )
+                .await?
+            };
+            match event {
                 htt::Event::Wmi(bytes) => {
                     let id = wire::word(&bytes, 0)? & 0xffffff;
                     if id == self.wire.scan_event {
@@ -276,22 +301,29 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                             report.ignored = report.ignored.saturating_add(1);
                             continue;
                         }
+                        if matches!(event.kind, 2 | 64) {
+                            self.scan_terminal = Some(sequence);
+                        }
                         match event.kind {
                             2 if event.reason == 0 => {
                                 if let Some(packet) = restore {
-                                    active_scan::checked(
-                                        async {
-                                            self.htt
-                                                .wmi
-                                                .htc
-                                                .send_wmi(packet)
-                                                .await
-                                                .map_err(htt::Error::from)
-                                                .map_err(Error::from)
-                                        },
-                                        &validate,
-                                    )
-                                    .await?;
+                                    if retained {
+                                        self.send_scan_command(packet, &validate).await?;
+                                    } else {
+                                        active_scan::checked(
+                                            async {
+                                                self.htt
+                                                    .wmi
+                                                    .htc
+                                                    .send_wmi(packet)
+                                                    .await
+                                                    .map_err(htt::Error::from)
+                                                    .map_err(Error::from)
+                                            },
+                                            &validate,
+                                        )
+                                        .await?;
+                                    }
                                 }
                                 validate()?;
                                 let mut cache = Vec::new();
@@ -302,6 +334,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                                     cache.push(bss.copy_owned()?);
                                 }
                                 self.scan_cache = cache;
+                                self.scan_pending = None;
                                 self.failed = false;
                                 return Ok(report);
                             }
@@ -336,7 +369,6 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 event => self.queue(event)?,
             }
         }
-        Err(Error::Timeout)
     }
     fn queue(&mut self, event: htt::Event) -> Result<(), Error> {
         if self.pending.len() == 64 {

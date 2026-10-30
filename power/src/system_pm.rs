@@ -24,6 +24,15 @@ use crate::device_pm::DevicePmError;
 /// Object-safe future returned by an asynchronous system-PM driver hook.
 pub type SystemPmFuture<'a> = Pin<Box<dyn Future<Output = Result<(), DevicePmError>> + Send + 'a>>;
 
+/// Actual system transition requested by the coordinator. Firmware _DSW
+/// uses S0 for suspend-to-idle and S3 for suspend-to-RAM; a driver must not
+/// guess the target from callback ordering or a register observation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SystemSleepState {
+    S0Idle,
+    S3,
+}
+
 /// A driver phase that must run outside the interrupt-gated
 /// [`crate::device_pm::DevicePmOps`] fan-out.
 ///
@@ -35,6 +44,12 @@ pub trait AsyncSystemPm: Send + Sync {
     /// Complete asynchronous protocol/firmware work before synchronous
     /// device quiesce gates the corresponding interrupt sources.
     fn prepare_suspend<'a>(&'a self) -> SystemPmFuture<'a>;
+    /// Target-aware preparation for device wake owners. Existing drivers
+    /// inherit their normal preparation when they need no target-specific
+    /// firmware or routing work.
+    fn prepare_suspend_target<'a>(&'a self, _target: SystemSleepState) -> SystemPmFuture<'a> {
+        self.prepare_suspend()
+    }
     /// Undo [`Self::prepare_suspend`] after synchronous device resume has
     /// restored the transport and its interrupt sources.
     fn resume_from_suspend<'a>(&'a self) -> SystemPmFuture<'a>;
@@ -128,10 +143,23 @@ impl AsyncSystemPmTransition {
 /// [`AsyncSystemPmTransition::resume`] even when this returns a failed
 /// transition so all earlier hooks are rolled back.
 pub async fn prepare_async_system_pm() -> AsyncSystemPmTransition {
+    prepare_async_system_pm_for(SystemSleepState::S3).await
+}
+
+/// Run preparation for the coordinator's actual target, retaining the same
+/// ordering, cancellation and rollback contract as the legacy S3 entry.
+pub async fn prepare_async_system_pm_for(target: SystemSleepState) -> AsyncSystemPmTransition {
     let snapshot = REGISTRY.lock().clone();
+    prepare_entries(snapshot, target).await
+}
+
+async fn prepare_entries(
+    snapshot: Vec<Entry>,
+    target: SystemSleepState,
+) -> AsyncSystemPmTransition {
     let mut prepared = Vec::with_capacity(snapshot.len());
     for entry in snapshot.iter().rev() {
-        match entry.ops.prepare_suspend().await {
+        match entry.ops.prepare_suspend_target(target).await {
             Ok(()) => prepared.push(entry.clone()),
             Err(error) => {
                 return AsyncSystemPmTransition {
@@ -155,3 +183,27 @@ pub async fn prepare_async_system_pm() -> AsyncSystemPmTransition {
 pub fn __reset_for_test() {
     REGISTRY.lock().clear();
 }
+
+/// Scoped async-hook registry isolation; queued scheduler work is untouched.
+#[cfg(feature = "wake-test")]
+#[derive(Debug)]
+pub struct TestRegistry(Vec<Entry>);
+
+/// # Safety
+/// Serialize registry registration/preparation against this scope and drive
+/// all test-created transitions terminal before the guard restores real hooks.
+#[cfg(feature = "wake-test")]
+pub unsafe fn __test_registry_scope() -> TestRegistry {
+    TestRegistry(core::mem::take(&mut *REGISTRY.lock()))
+}
+
+#[cfg(feature = "wake-test")]
+impl Drop for TestRegistry {
+    fn drop(&mut self) {
+        core::mem::swap(&mut *REGISTRY.lock(), &mut self.0);
+    }
+}
+
+#[cfg(feature = "wake-test")]
+#[path = "system_pm_tests.rs"]
+mod tests;

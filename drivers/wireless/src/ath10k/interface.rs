@@ -16,6 +16,7 @@ use narf_wireless::{
     WirelessNetIface,
 };
 type Error = wmi_runtime::Error;
+use wmi_runtime::receive_permission;
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 enum Policy {
     Installed,
@@ -40,6 +41,7 @@ struct State {
 struct ReceiveBatch {
     permission: super::regulatory::Permission,
     source: Option<super::firmware_source::Source>,
+    scan_policy: Option<Arc<wmi_runtime::ScanPolicy>>,
     frames: Vec<Vec<u8>>,
 }
 #[cfg(any(test, feature = "kernel-test"))]
@@ -92,6 +94,7 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     policy: Policy,
     up: AtomicBool,
     closed: AtomicBool,
+    retired: AtomicBool,
     publication: IrqSafeSpinLock<()>,
     #[cfg(any(test, feature = "kernel-test"))]
     close_on_progress: AtomicBool,
@@ -127,9 +130,12 @@ impl Drop for Attempt<'_> {
 }
 impl<T: Hif + HostMemory + HttMemory + Send + 'static> HostClose for Device<T> {
     fn close(&self) {
-        let _publication = self.publication.lock();
-        self.closed.store(true, Ordering::Release);
-        self.publish_link(None);
+        {
+            let _publication = self.publication.lock();
+            self.closed.store(true, Ordering::Release);
+            self.publish_link(None);
+        }
+        self.kick();
     }
 }
 impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
@@ -205,6 +211,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             policy,
             up: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
             publication: IrqSafeSpinLock::new(()),
             #[cfg(any(test, feature = "kernel-test"))]
             close_on_progress: AtomicBool::new(false),
@@ -223,6 +230,50 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             wake.raise();
         }
     }
+    /// The real worker retains cancellation cleanup after the public scan
+    /// future has gone away. The radio mutex excludes live scan/recovery;
+    /// retire_host closes this path before a successor may touch hardware.
+    pub(super) async fn cleanup_failed_scan(&self) -> Result<bool, Error> {
+        let mut radio = if self.closed.load(Ordering::Acquire) {
+            self.radio.lock().await
+        } else {
+            let Some(radio) = self.radio.try_lock() else {
+                return Ok(false);
+            };
+            radio
+        };
+        if self.retired.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        if !radio.scan_in_progress() {
+            if radio.failed_station_pending() {
+                self.close();
+                radio.retire_station_receive();
+                self.state.lock().await.clear();
+                return Err(Error::Failed);
+            }
+            return Ok(false);
+        }
+        if self.closed.load(Ordering::Acquire) {
+            radio.fail_station_data();
+        }
+        if !radio.failed_scan_pending() {
+            return Ok(false);
+        }
+        self.close();
+        radio.retire_station_receive();
+        self.state.lock().await.clear();
+        radio
+            .abort_failed_scan(&|| {
+                if self.retired.load(Ordering::Acquire) {
+                    Err(Error::Failed)
+                } else {
+                    Ok(())
+                }
+            })
+            .await?;
+        Ok(true)
+    }
     fn link(&self, peer: Option<[u8; 6]>) {
         let _publication = self.publication.lock();
         self.publish_link(peer);
@@ -230,6 +281,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
     // Caller holds publication; close and a previously sampled peer can never
     // interleave their BSSID/carrier/netdev metadata writes.
     fn publish_link(&self, peer: Option<[u8; 6]>) {
+        if self.retired.load(Ordering::Acquire) {
+            return;
+        }
         let peer = peer.filter(|_| !self.closed.load(Ordering::Acquire));
         let mut packed = [0; 8];
         if let Some(peer) = peer {
@@ -311,7 +365,16 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         self.generation
     }
     pub(super) fn retire_host(&self) {
-        self.close();
+        {
+            let _publication = self.publication.lock();
+            if self.retired.load(Ordering::Acquire) {
+                return;
+            }
+            self.closed.store(true, Ordering::Release);
+            self.publish_link(None);
+            self.retired.store(true, Ordering::Release);
+        }
+        self.kick();
         if let Some(mut state) = self.state.try_lock() {
             state.clear();
         }
@@ -354,7 +417,19 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             armed: true,
         };
         let result = match self.policy.current() {
-            Ok(domain) => radio.flush_station_management(&domain).await,
+            Ok(domain) => {
+                wmi_runtime::checked_policy(radio.flush_station_management(&domain), &|| {
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(Error::Failed);
+                    }
+                    let now = self.policy.current()?;
+                    if now.country_code != domain.country_code || now.rules != domain.rules {
+                        return Err(Error::Unsupported);
+                    }
+                    Ok(())
+                })
+                .await
+            }
             Err(cause) => Err(cause),
         };
         if let Err(cause) = result {
@@ -375,6 +450,11 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         let Some(mut radio) = self.radio.try_lock() else {
             return Ok(());
         };
+        // Firmware owns scan power-save dwell. Keep an operator PS request
+        // queued until the matched scan terminal and home inventory restore.
+        if radio.scan_in_progress() {
+            return Ok(());
+        }
         let enabled = request == 2;
         if radio.station_link().is_none() {
             return Ok(());
@@ -502,6 +582,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 Ok(Some(ReceiveBatch {
                     permission,
                     source,
+                    scan_policy: radio.scan_policy(),
                     frames,
                 }))
             })()
@@ -554,7 +635,11 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 }
             }
             let published = super::firmware_source::invoke(batch.source.as_ref(), || {
-                batch.permission.check(&self.policy.current()?)?;
+                let domain = self.policy.current()?;
+                batch.permission.check(&domain)?;
+                if let Some(scan) = &batch.scan_policy {
+                    scan.check(&domain)?;
+                }
                 if self.closed.load(Ordering::Acquire) {
                     return Err(Error::Failed);
                 }
@@ -627,7 +712,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             return Err(WirelessError::NotSupported);
         }
         let mut radio = self.radio.lock().await;
-        if radio.prepared_peer().is_some() {
+        if radio.prepared_peer().is_some() && radio.station_link().is_none() {
             return Err(WirelessError::Busy);
         }
         if self.closed.load(Ordering::Acquire) {
@@ -641,11 +726,18 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             });
         }
         receive_permission(&domain, &frequencies).map_err(error)?;
+        let associated = radio.station_link().is_some();
         let active = if request.active {
             Some(
                 radio
                     .prepare_active_scan(&frequencies, &request.ssids, &domain)
                     .and_then(|plan| plan.with_extra_ies(&request.extra_ies))
+                    .map_err(error)?,
+            )
+        } else if associated {
+            Some(
+                radio
+                    .prepare_associated_passive_scan(&frequencies, &domain)
                     .map_err(error)?,
             )
         } else {
@@ -655,19 +747,47 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             device: self,
             armed: true,
         };
-        let report = if let Some(plan) = active {
+        let current = || {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(Error::Failed);
+            }
+            self.policy.current()
+        };
+        let report = if associated {
             radio
-                .active_scan(plan, || {
-                    if self.closed.load(Ordering::Acquire) {
-                        return Err(Error::Failed);
-                    }
-                    self.policy.current()
-                })
+                .begin_associated_scan(active.ok_or(WirelessError::HardwareError)?, current)
                 .await
+                .map_err(|cause| {
+                    radio.fail_station_data();
+                    error(cause)
+                })?;
+            // Dwell owns receipts in Radio, not this mutex guard. The same
+            // normal data path can now transmit queued host packets and
+            // publish RX to the stack with all owner locks released.
+            drop(radio);
+            self.kick();
+            loop {
+                current().map_err(error)?;
+                self.drain();
+                {
+                    let mut radio = self.radio.lock().await;
+                    if radio
+                        .associated_scan_complete(&current().map_err(error)?)
+                        .map_err(error)?
+                    {
+                        break radio.finish_associated_scan(current).await.map_err(error);
+                    }
+                }
+                narf_scheduler::yield_now().await;
+            }
+        } else if let Some(plan) = active {
+            radio.active_scan(plan, current).await.map_err(error)
         } else {
-            radio.passive_scan(&frequencies).await
-        }
-        .map_err(error)?;
+            radio
+                .passive_scan_current(&frequencies, current)
+                .await
+                .map_err(error)
+        }?;
         let result = report
             .bss
             .into_iter()
@@ -850,6 +970,20 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         self.close();
         let mut radio = self.radio.lock().await;
         self.state.lock().await.clear();
+        if self.retired.load(Ordering::Acquire) {
+            return Err(WirelessError::HardwareError);
+        }
+        if radio.scan_in_progress() {
+            // The retained worker owns exact scan STOP and subsequent vdev
+            // teardown. Never submit DELETE while firmware still scans, or
+            // move its continuation into this cancellable public waiter.
+            radio.fail_station_data();
+            self.kick();
+            return Err(WirelessError::Busy);
+        }
+        if radio.station_retired() {
+            return Ok(());
+        }
         radio.disconnect_station().await.map(|_| ()).map_err(error)
     }
     #[cfg(any(test, feature = "kernel-test"))]
@@ -885,31 +1019,6 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         self.close();
         self.link(Some(peer));
     }
-}
-fn receive_permission(
-    domain: &narf_wireless::reg::RegulatoryDomain,
-    frequencies: &[u16],
-) -> Result<(), Error> {
-    if !domain.country_code.iter().all(u8::is_ascii_uppercase)
-        || frequencies.iter().any(|frequency| {
-            let low = u32::from(*frequency) - 10;
-            let high = u32::from(*frequency) + 10;
-            let mut covering = false;
-            for rule in &domain.rules {
-                if rule.freq_end_mhz <= low || high <= rule.freq_start_mhz {
-                    continue;
-                }
-                if rule.freq_start_mhz >= rule.freq_end_mhz || rule.max_bandwidth_mhz < 20 {
-                    return true;
-                }
-                covering |= rule.freq_start_mhz <= low && high <= rule.freq_end_mhz;
-            }
-            !covering
-        })
-    {
-        return Err(Error::Unsupported);
-    }
-    Ok(())
 }
 fn admitted(bytes: &[u8], own: [u8; 6]) -> bool {
     (14..=1514).contains(&bytes.len())
@@ -1066,7 +1175,18 @@ fn publish_with_mac(
         narf_scheduler::spawn(async move {
             loop {
                 if worker.closed.load(Ordering::Acquire) {
+                    if worker.cleanup_failed_scan().await.is_err() {
+                        super::pci::scan_cleanup_failed(worker.radio.clone());
+                    }
                     break;
+                }
+                match worker.cleanup_failed_scan().await {
+                    Ok(false) => {}
+                    Ok(true) => break,
+                    Err(_) => {
+                        super::pci::scan_cleanup_failed(worker.radio.clone());
+                        break;
+                    }
                 }
                 let seen = signal.count();
                 let progressed = worker.drain();

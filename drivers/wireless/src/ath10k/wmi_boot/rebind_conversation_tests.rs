@@ -26,6 +26,7 @@ fn smoke_ath10k_recovery_rebinds_same_wlan_name_ifindex_and_operator_state() -> 
             old.join()?;
             let name = old.name.clone();
             let before = narf_net::iface::lookup(&name).ok_or("old netdev")?;
+            let retired = old.device.clone();
             // The production retire path for this generation.
             old.device.retire_host();
             interface::remember_rebind(&name);
@@ -55,6 +56,22 @@ fn smoke_ath10k_recovery_rebinds_same_wlan_name_ifindex_and_operator_state() -> 
                 return Err("rebind lost ifindex/counters or kept the old send hook");
             }
             associate(&new)?;
+            let carrier = narf_net::iface::lookup(&new.name).ok_or("fresh carrier")?;
+            // A public scan/control future can be dropped only after its
+            // retired name has already rebound. Its late close or repeated
+            // retirement must not address the new registration.
+            retired.close_before_lock_for_test();
+            retired.stale_link_after_close_for_test(AP);
+            retired.retire_host();
+            let current =
+                narf_net::iface::lookup(&new.name).ok_or("late old retire removed successor")?;
+            if !current.carrier
+                || !new.device.link_up()
+                || current.carrier_up_count != carrier.carrier_up_count
+                || current.carrier_down_count != carrier.carrier_down_count
+            {
+                return Err("late retired control changed rebound carrier or counters");
+            }
             narf_net::iface::send_on(&new.name, &up).map_err(|_| "rebound uplink")?;
             new.pump();
             let bytes = new.model(|m| m.data.as_mut().unwrap().downlink(&down));

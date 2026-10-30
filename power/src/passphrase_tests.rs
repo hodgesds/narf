@@ -534,6 +534,7 @@ kernel_test_in!(
 // ── Entropy refusal ────────────────────────────────────────────
 
 fn smoke_passphrase_entropy_absent_refuses_wrap() -> TestResult {
+    // Both attempts consume a passphrase before observing missing entropy.
     let anchor = PassphraseAnchor::new(
         AtomicScriptedEntropy::new(false),
         ScriptedSource::new(&["pw", "pw"]),

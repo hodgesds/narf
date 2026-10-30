@@ -22,5 +22,8 @@ narf-capabilities = { path = "../capabilities" }
 narf-event-bus   = { path = "../event_bus" }
 narf-kernel-test = { path = "../verification/kernel-test" }
 
+[features]
+kernel-test = []
+
 [lints]
 workspace = true

@@ -45,7 +45,7 @@ narf-crypto       = { path = "../../crypto", features = ["ecdsa-sign"] }
 async-trait       = "0.1"
 
 [features]
-kernel-test = []
+kernel-test = ["narf-power/wake-test"]
 
 [lints]
 workspace = true

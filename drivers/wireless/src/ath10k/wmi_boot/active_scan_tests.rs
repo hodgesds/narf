@@ -32,8 +32,18 @@ pub(super) struct Fixture {
     pub(super) frequencies: [u16; 2],
     pub(super) receive: Vec<u16>,
     pub(super) fixed_country: bool,
+    pub(super) hold_terminal: bool,
 }
 impl Fixture {
+    pub(super) fn hold_start_source(&mut self) {
+        self.stall = Some(3);
+    }
+    pub(super) fn is_started(&self) -> bool {
+        self.started
+    }
+    pub(super) fn is_stopped(&self) -> bool {
+        self.stopped
+    }
     pub(super) fn new(sequence: u16) -> Self {
         Self {
             done: false,
@@ -52,6 +62,7 @@ impl Fixture {
             frequencies: [2412, 2437],
             receive: vec![2412, 2437, 5180],
             fixed_country: false,
+            hold_terminal: false,
         }
     }
     pub(super) fn directed(sequence: u16) -> Self {
@@ -110,7 +121,7 @@ fn channels(dialect: Dialect, limits: [u8; 2], frequencies: [u16; 2]) -> Vec<u8>
     }
     out
 }
-fn scan(
+pub(super) fn scan(
     dialect: Dialect,
     sequence: u16,
     ssids: &[Vec<u8>],
@@ -174,7 +185,7 @@ fn scan(
     out.resize(out.len().next_multiple_of(4), 0);
     out
 }
-fn stop(dialect: Dialect, sequence: u16) -> Vec<u8> {
+pub(super) fn stop(dialect: Dialect, sequence: u16) -> Vec<u8> {
     let tlv = dialect == Dialect::Tlv;
     let mut out = vec![0; if tlv { 24 } else { 20 }];
     u32at(
@@ -349,6 +360,7 @@ pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiErro
             policy.lock().as_mut().unwrap().rules[0].flags = RegFlags::NO_IR;
         }
     }
+    let hold_terminal = fixture.hold_terminal;
     if starting {
         m.scan = fixture.sequence;
         m.phase += 1;
@@ -367,15 +379,22 @@ pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiErro
                 },
                 &[0; 4],
             );
-        } else {
+        } else if !hold_terminal {
             scan_event(m, 2, 0xa000 | m.scan, 0xa001);
         }
+    }
+    if stopping && hold_terminal {
+        let sequence = m.active.as_ref().unwrap().sequence;
+        scan_event(m, 2, 0xa000 | sequence, 0xa001);
     }
     credit(m, bytes);
     if stalled {
         core::future::pending::<()>().await;
     }
     Ok(())
+}
+pub(super) fn stall_next(f: &Fixture) -> bool {
+    f.stall == Some(f.step) && !f.stopped
 }
 pub(super) fn handles(fixture: &Fixture, dialect: Dialect, packet: &[u8]) -> bool {
     !fixture.done

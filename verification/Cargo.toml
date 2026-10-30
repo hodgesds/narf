@@ -14,8 +14,8 @@ path = "src/lib.rs"
 [dependencies]
 narf-kernel-test  = { path = "kernel-test" }
 narf-lib         = { path = "../lib" }
-narf-acpi        = { path = "../acpi" }
-narf-aml         = { path = "../aml" }
+narf-acpi        = { path = "../acpi", features = ["kernel-test"] }
+narf-aml         = { path = "../aml", features = ["kernel-test"] }
 narf-arch        = { path = "../arch" }
 narf-memory      = { path = "../memory" }
 narf-scheduler   = { path = "../scheduler" }
@@ -55,7 +55,7 @@ narf-time       = { path = "../time" }
 narf-crypto     = { path = "../crypto" }
 narf-net        = { path = "../net" }
 narf-filesystem = { path = "../filesystem" }
-narf-power      = { path = "../power" }
+narf-power      = { path = "../power", features = ["wake-test"] }
 narf-observability = { path = "../observability" }
 narf-userspace  = { path = "../userspace" }
 # Optional: pulled in only under `boot-init` so default builds
@@ -70,7 +70,7 @@ narf-drivers-storage = { path = "../drivers/storage" }
 narf-drivers-usb     = { path = "../drivers/usb" }
 narf-drivers-thunderbolt = { path = "../drivers/thunderbolt", features = ["kernel-test"] }
 narf-drivers-fingerprint = { path = "../drivers/fingerprint" }
-narf-drivers-platform = { path = "../drivers/platform" }
+narf-drivers-platform = { path = "../drivers/platform", features = ["kernel-test"] }
 narf-drivers-sound = { path = "../drivers/sound" }
 narf-drivers-hwmon   = { path = "../drivers/hwmon", features = ["kernel-test"] }
 narf-drivers-extcon  = { path = "../drivers/extcon", features = ["kernel-test"] }

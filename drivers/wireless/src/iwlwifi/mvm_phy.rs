@@ -735,11 +735,40 @@ impl super::Owner {
         selected: bool,
     ) -> Result<JoinPlan, &'static str> {
         let local = self.mac.ok_or("MVM station MAC absent")?;
-        let mut plan = if selected {
-            JoinPlan::prepare_with_phy(bss, local, ssid, security, self.local_ht20()?)
-        } else {
-            JoinPlan::prepare(bss, local, ssid, security)
+        let mut ies = bss.information_elements.as_slice();
+        let mut peer_mfp = false;
+        while ies.len() >= 2 {
+            let end = 2 + usize::from(ies[1]);
+            let Some(body) = ies.get(2..end) else {
+                break;
+            };
+            if ies[0] == 48 {
+                peer_mfp = narf_wireless::rsn::RsnIe::decode_body(body).is_some_and(|rsn| {
+                    rsn.rsn_capabilities & narf_wireless::rsn::RSN_CAP_MFP_CAPABLE != 0
+                });
+            }
+            ies = &ies[end..];
         }
+        use narf_wireless::association::{AkmSet, JoinOptions, Pmf};
+        let options = JoinOptions::default().with_akms(AkmSet::ALL).with_pmf(
+            if security.is_wpa2() && peer_mfp && self.station_sae_supported() {
+                Pmf::Optional
+            } else {
+                Pmf::Disabled
+            },
+        );
+        let mut plan = JoinPlan::prepare_with_options(
+            bss,
+            local,
+            ssid,
+            security,
+            if selected {
+                Some(self.local_ht20()?)
+            } else {
+                None
+            },
+            options,
+        )
         .map_err(|_| "unsupported MVM native station offer")?;
         plan.append_sme_ies(elements)
             .map_err(|_| "unsupported MVM native SME elements")?;

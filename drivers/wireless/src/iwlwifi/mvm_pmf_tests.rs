@@ -28,11 +28,12 @@ const ANONCE: [u8; 32] = [0x22; 32];
 const GTK: [u8; 16] = [0x77; 16];
 const IGTK: [u8; 16] = [0x99; 16];
 const IPN: u64 = 0x0102_0304;
+const PSK: [u8; 32] = [0x55; 32];
 
 fn check(test: impl FnOnce() -> Result<(), &'static str>) -> TestResult {
     test().map_or_else(TestResult::Fail, |()| TestResult::Pass)
 }
-fn poll<T>(future: Pin<&mut impl Future<Output = T>>) -> Poll<T> {
+fn poll<T>(future: Pin<&mut (impl Future<Output = T> + ?Sized)>) -> Poll<T> {
     let result = future.poll(&mut TaskContext::from_waker(Waker::noop()));
     if result.is_pending() {
         narf_scheduler::block_on_spin(narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(
@@ -111,9 +112,12 @@ enum Fault {
     WrongPassword,
     /// Message 3 omits the IGTK KDE.
     NoIgtk,
+    /// AKM24 M3 incorrectly uses the SAE8 AES-CMAC algorithm.
+    LegacySaeMic,
 }
 /// Independent AP + firmware receipt model.
 struct Ap {
+    akm: u8,
     sae: SaeSession,
     h2e: bool,
     fault: Fault,
@@ -124,11 +128,16 @@ struct Ap {
     enabled: bool,
     m4: bool,
     sync: u32,
+    hold_igtk: bool,
+    held_igtk: Option<(u8, u16)>,
     assoc_rsne: Vec<u8>,
     data: Vec<Vec<u8>>,
 }
 impl Ap {
     fn new(h2e: bool, fault: Fault) -> Self {
+        Self::with_akm(h2e, fault, 8)
+    }
+    fn with_akm(h2e: bool, fault: Fault, akm: u8) -> Self {
         let password = if fault == Fault::WrongPassword {
             &b"wrong battery"[..]
         } else {
@@ -140,7 +149,13 @@ impl Ap {
             SaeSession::new_hunt_and_peck(password, AP, OWN)
         }
         .with_test_seed([0x42; 64]);
+        let sae = if akm == 24 {
+            sae.with_akm_suite_selector([0, 15, 172, 24]).unwrap()
+        } else {
+            sae
+        };
         Self {
+            akm,
             sae,
             h2e,
             fault,
@@ -151,6 +166,8 @@ impl Ap {
             enabled: false,
             m4: false,
             sync: 0,
+            hold_igtk: false,
+            held_igtk: None,
             assoc_rsne: Vec::new(),
             data: Vec::new(),
         }
@@ -163,23 +180,58 @@ impl Ap {
         f.extend_from_slice(body);
         envelope(&f, 3)
     }
+    fn descriptor(&self) -> u16 {
+        match self.akm {
+            2 => 2,
+            6 => 3,
+            _ => 0,
+        }
+    }
+    fn mic(&self, kck: &[u8], pdu: &[u8]) -> [u8; 16] {
+        let mut clear = pdu.to_vec();
+        clear[81..97].fill(0);
+        match self.akm {
+            2 => narf_crypto::pbkdf2_sha1::hmac_sha1(kck, &clear)[..16]
+                .try_into()
+                .unwrap(),
+            24 => narf_crypto::hkdf::hmac_sha256(kck, &clear)[..16]
+                .try_into()
+                .unwrap(),
+            _ => cmac_mic(kck, pdu),
+        }
+    }
     fn m1(&self) -> Vec<u8> {
         let mut m1 = KeyFrame::empty(16);
-        m1.key_information = 0x88;
+        m1.key_information = 0x88 | self.descriptor();
         m1.key_length = 16;
         m1.replay_counter = 1;
         m1.key_nonce = ANONCE;
         envelope(&eapol_frame(&m1.into_eapol()), 3)
     }
     fn derive(&mut self, snonce: &[u8; 32]) -> Result<(), &'static str> {
-        let pmk = *self.sae.pmk().ok_or("AP SAE PMK absent")?;
+        let pmk = if matches!(self.akm, 2 | 6) {
+            PSK
+        } else {
+            *self.sae.pmk().ok_or("AP SAE PMK absent")?
+        };
         let mut context = Vec::new();
         context.extend_from_slice(&AP.min(OWN));
         context.extend_from_slice(&AP.max(OWN));
         context.extend_from_slice(&ANONCE.min(*snonce));
         context.extend_from_slice(&ANONCE.max(*snonce));
-        let ptk =
-            narf_wireless::sae::session::kdf_sha256(&pmk, b"Pairwise key expansion", &context, 48);
+        let ptk = if self.akm == 2 {
+            let mut bytes = Vec::new();
+            for counter in 0..3u8 {
+                let mut input = b"Pairwise key expansion\0".to_vec();
+                input.extend_from_slice(&context);
+                input.push(counter);
+                bytes.extend_from_slice(&narf_crypto::pbkdf2_sha1::hmac_sha1(&pmk, &input));
+            }
+            bytes.truncate(48);
+            bytes
+        } else {
+            narf_wireless::sae::session::kdf_sha256(&pmk, b"Pairwise key expansion", &context, 48)
+        };
         self.ptk = Some((
             ptk[..16].to_vec(),
             ptk[16..32].to_vec(),
@@ -190,7 +242,7 @@ impl Ap {
     fn m3(&self) -> Result<Vec<u8>, &'static str> {
         let (kck, kek, _) = self.ptk.as_ref().ok_or("AP M3 before PTK")?;
         let mut clear = vec![48, 20];
-        clear.extend_from_slice(&rsne(8));
+        clear.extend_from_slice(&rsne(self.akm));
         clear.extend_from_slice(&[221, 22, 0, 15, 172, 1, 1, 0]);
         clear.extend_from_slice(&GTK);
         if self.fault != Fault::NoIgtk {
@@ -205,14 +257,18 @@ impl Ap {
             clear.push(0);
         }
         let mut m3 = KeyFrame::empty(16);
-        m3.key_information = 0x13c8;
+        m3.key_information = 0x13c8 | self.descriptor();
         m3.key_length = 16;
         m3.replay_counter = 2;
         m3.key_nonce = ANONCE;
         m3.key_data = narf_crypto::aes_kw::aes_wrap(kek.as_slice().try_into().unwrap(), &clear)
             .ok_or("AP key wrap")?;
         let mut pdu = m3.into_eapol();
-        let mic = cmac_mic(kck, &pdu);
+        let mic = if self.fault == Fault::LegacySaeMic {
+            cmac_mic(kck, &pdu)
+        } else {
+            self.mic(kck, &pdu)
+        };
         pdu[81..97].copy_from_slice(&mic);
         Ok(envelope(&eapol_frame(&pdu), 3))
     }
@@ -339,6 +395,10 @@ impl Ap {
                 _ => return Err("unexpected native SAE/PMF control"),
             };
             self.events.push(kind);
+            if kind == Kind::Igtk && self.hold_igtk {
+                self.held_igtk = Some((op, sequence));
+                return Ok(());
+            }
             fw.inject(op, reply_group, sequence, &reply);
             return Ok(());
         }
@@ -360,6 +420,15 @@ impl Ap {
             0xb0 => {
                 let field = |at: usize| u16::from_le_bytes([frame[at], frame[at + 1]]);
                 let (alg, seq) = (field(24), field(26));
+                if matches!(self.akm, 2 | 6) {
+                    if alg != 0 || seq != 1 || field(28) != 0 {
+                        return Err("PSK owner sent invalid open-system authentication");
+                    }
+                    let mut reply = header(0xb0, OWN, AP, AP);
+                    reply.extend_from_slice(&[0, 0, 2, 0, 0, 0]);
+                    fw.inject(0xc1, 0, 0x8000, &envelope(&reply, 3));
+                    return Ok(());
+                }
                 if alg != 3 {
                     return Err("SAE owner sent another algorithm");
                 }
@@ -399,10 +468,14 @@ impl Ap {
                     }
                     at += 2 + len;
                 }
-                let mut expected = rsne(8);
-                expected.truncate(18);
-                expected.extend_from_slice(&[0xc0, 0, 1, 0]);
-                expected.extend_from_slice(self.sae.pmkid().ok_or("AP PMKID absent")?);
+                let mut expected = rsne(self.akm);
+                if matches!(self.akm, 8 | 24) {
+                    expected.extend_from_slice(&[1, 0]);
+                    expected.extend_from_slice(self.sae.pmkid().ok_or("AP PMKID absent")?);
+                } else {
+                    // Local PMF Optional: MFPC, while the AP requires it.
+                    expected[18] = 0x80;
+                }
                 if self.assoc_rsne != expected || frame[24] & 0x10 == 0 {
                     return Err("association RSNE lacks exact SAE PMKID/MFPR");
                 }
@@ -418,7 +491,7 @@ impl Ap {
                 }
                 let pdu = &frame[32..];
                 let key = KeyFrame::decode(&pdu[4..], 16).ok_or("AP EAPOL decode")?;
-                if key.key_information == 0x108 {
+                if key.key_information == 0x108 | self.descriptor() {
                     self.events.push(Kind::Message2);
                     let mut station = vec![48, self.assoc_rsne.len() as u8];
                     station.extend_from_slice(&self.assoc_rsne);
@@ -426,7 +499,7 @@ impl Ap {
                     let kck = self.ptk.as_ref().unwrap().0.clone();
                     if key.replay_counter != 1
                         || key.key_data != station
-                        || pdu[81..97] != cmac_mic(&kck, pdu)
+                        || pdu[81..97] != self.mic(&kck, pdu)
                     {
                         return Err("M2 RSNE/replay/AES-CMAC MIC");
                     }
@@ -435,7 +508,9 @@ impl Ap {
                 } else {
                     self.events.push(Kind::Message4);
                     let kck = &self.ptk.as_ref().ok_or("M4 before M2")?.0;
-                    if key.key_information != 0x308 || pdu[81..97] != cmac_mic(kck, pdu) {
+                    if key.key_information != 0x308 | self.descriptor()
+                        || pdu[81..97] != self.mic(kck, pdu)
+                    {
                         return Err("M4 flags/AES-CMAC MIC");
                     }
                     self.m4 = true;
@@ -511,6 +586,11 @@ fn seeded(join: &SaeJoin, own: [u8; 6], peer: [u8; 6]) -> Result<SaeSession, &'s
         SaeSession::new_hunt_and_peck(PASSWORD, own, peer)
     }
     .with_test_seed([0x31; 64]);
+    if let Some(selector) = join.akm_suite_selector() {
+        session = session
+            .with_akm_suite_selector(selector)
+            .map_err(|_| "test SAE selector")?;
+    }
     session.build_commit();
     Ok(session)
 }
@@ -525,21 +605,36 @@ fn authenticate(
 }
 /// SAE authentication, PMF association and data preparation.
 fn sae_prepared(h2e: bool, fault: Fault) -> Result<(Fixture, Ap), &'static str> {
-    let mut f = sae_fixture(h2e, 8)?;
-    let mut ap = Ap::new(h2e, fault);
-    if authenticate(&mut f, &mut ap)?.map(|s| s.status) != Ok(0) {
-        return Err("SAE authentication did not complete");
+    prepared_akm(h2e, fault, 8)
+}
+fn prepared_akm(h2e: bool, fault: Fault, akm: u8) -> Result<(Fixture, Ap), &'static str> {
+    let mut f = sae_fixture(h2e, akm)?;
+    let mut ap = Ap::with_akm(h2e, fault, akm);
+    let sae = matches!(akm, 8 | 24);
+    let status = if sae {
+        authenticate(&mut f, &mut ap)?
+    } else {
+        let owner = f.owner.as_mut().unwrap();
+        let mut op = pin!(owner.authenticate_open_using(|| Ok(policy())));
+        drive(op.as_mut(), &f.trace, &mut f.firmware, &mut ap)?
+    };
+    if status.map(|s| s.status) != Ok(0) {
+        return Err("PMF authentication did not complete");
     }
     {
         let owner = f.owner.as_mut().unwrap();
         let mut op = pin!(owner.associate_legacy_using(
             b"net",
-            SecurityMode::Wpa3Sae { pwe: SaePwe::Both },
+            if sae {
+                SecurityMode::Wpa3Sae { pwe: SaePwe::Both }
+            } else {
+                SecurityMode::Wpa2Psk
+            },
             || Ok(policy())
         ));
         let status = drive(op.as_mut(), &f.trace, &mut f.firmware, &mut ap)??;
         if !status.pmf || !status.protected || status.aid != 7 {
-            return Err("SAE association did not negotiate PMF");
+            return Err("association did not negotiate PMF");
         }
     }
     prepare(&mut f, true)?;
@@ -549,8 +644,13 @@ fn sae_prepared(h2e: bool, fault: Fault) -> Result<(Fixture, Ap), &'static str> 
 fn secure(f: &mut Fixture, ap: &mut Ap) -> Result<Result<(), &'static str>, &'static str> {
     f.firmware.inject(0xc1, 0, 0x8000, &ap.m1());
     let owner = f.owner.as_mut().unwrap();
-    let mut op = pin!(owner.secure_sae_using(|| Ok(SNONCE), || Ok(policy())));
-    drive(op.as_mut(), &f.trace, &mut f.firmware, ap)
+    if matches!(ap.akm, 2 | 6) {
+        let mut op = pin!(owner.secure_using(PSK, || Ok(SNONCE), || Ok(policy())));
+        drive(op.as_mut(), &f.trace, &mut f.firmware, ap)
+    } else {
+        let mut op = pin!(owner.secure_sae_using(|| Ok(SNONCE), || Ok(policy())));
+        drive(op.as_mut(), &f.trace, &mut f.firmware, ap)
+    }
 }
 fn secured(h2e: bool) -> Result<(Fixture, Ap), &'static str> {
     let (mut f, mut ap) = sae_prepared(h2e, Fault::None)?;
@@ -710,12 +810,6 @@ kernel_test_in!(
 
 fn smoke_gen2_pmf_not_granted_paths_refuse_and_wire_layouts() -> TestResult {
     check(|| {
-        // SAE-EXT-KEY (AKM 24) under H2E is not offered by this key owner.
-        let mut f = sae_fixture(true, 24)?;
-        let mut ap = Ap::new(true, Fault::None);
-        if authenticate(&mut f, &mut ap)?.is_ok() || !ap.events.is_empty() {
-            return Err("AKM 24 SAE reached the air");
-        }
         // Without the native key API there is no PMF owner.
         let mut f = link_fixture()?;
         if f.owner.as_ref().unwrap().station_sae_supported() {
@@ -773,4 +867,149 @@ fn smoke_gen2_pmf_not_granted_paths_refuse_and_wire_layouts() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2/pmf",
     smoke_gen2_pmf_not_granted_paths_refuse_and_wire_layouts
+);
+
+fn assert_pmf_port(f: &mut Fixture, ap: &Ap) -> Result<(), &'static str> {
+    let owner = f.owner.as_mut().unwrap();
+    if !owner.data_port_using(|| Ok(policy())) || !ap.m4 || ap.igtk != Some(4) {
+        return Err("PMF controlled port preceded M4/native IGTK receipts");
+    }
+    let keys = ap
+        .events
+        .iter()
+        .position(|e| *e == Kind::PairKey)
+        .ok_or("native PTK absent")?;
+    let igtk = ap
+        .events
+        .iter()
+        .position(|e| *e == Kind::Igtk)
+        .ok_or("native IGTK absent")?;
+    let fence = ap
+        .events
+        .iter()
+        .position(|e| *e == Kind::Fence)
+        .ok_or("native RX marker absent")?;
+    if keys >= igtk || igtk >= fence || ap.events.last() != Some(&Kind::Enable) {
+        return Err("PMF key/IGTK/marker/port order");
+    }
+    for packet in [ap.unprotected_deauth(), ap.bip_deauth(IGTK, IPN)] {
+        f.firmware.inject(0xc1, 0, 0x8000, &packet);
+        if owner.receive_data_using(|| Ok(policy())).is_err() {
+            return Err("PMF accepted unprotected or replayed BIP deauthentication");
+        }
+    }
+    f.firmware
+        .inject(0xc1, 0, 0x8000, &ap.bip_deauth(IGTK, IPN + 1));
+    if owner.receive_data_using(|| Ok(policy())).is_ok() {
+        return Err("PMF fresh authenticated BIP deauthentication ignored");
+    }
+    Ok(())
+}
+fn smoke_gen2_wpa2_pmf_psk_and_sha256_native_keys_and_bip() -> TestResult {
+    check(|| {
+        for akm in [2, 6] {
+            let (mut f, mut ap) = prepared_akm(false, Fault::None, akm)?;
+            secure(&mut f, &mut ap)??;
+            if ap.assoc_rsne.get(17) != Some(&akm) || ap.assoc_rsne.get(18) != Some(&0x80) {
+                return Err("WPA2 PMF association did not retain negotiated AKM/MFPC");
+            }
+            assert_pmf_port(&mut f, &ap)?;
+            let (mut f, mut ap) = prepared_akm(false, Fault::NoIgtk, akm)?;
+            if secure(&mut f, &mut ap)?.is_ok() || ap.keys.iter().any(Option::is_some) {
+                return Err("WPA2 PMF missing IGTK installed keys");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/pmf",
+    smoke_gen2_wpa2_pmf_psk_and_sha256_native_keys_and_bip
+);
+
+fn smoke_gen2_sae_ext_key_group19_native_hmac_and_suite_bound_confirm() -> TestResult {
+    check(|| {
+        {
+            let (mut f, mut ap) = prepared_akm(true, Fault::None, 24)?;
+            secure(&mut f, &mut ap)??;
+            if ap.assoc_rsne.get(17) != Some(&24) || ap.assoc_rsne.get(18) != Some(&0xc0) {
+                return Err("SAE-EXT-KEY association omitted AKM24/PMF");
+            }
+            assert_pmf_port(&mut f, &ap)?;
+        }
+        let (mut f, mut ap) = prepared_akm(true, Fault::LegacySaeMic, 24)?;
+        if secure(&mut f, &mut ap)?.is_ok() || ap.keys.iter().any(Option::is_some) {
+            return Err("AKM24 accepted the SAE8 AES-CMAC MIC or installed keys");
+        }
+        // Both SAE peers must bind AKM24's selector into commit/confirm.
+        let mut f = sae_fixture(true, 24)?;
+        let mut ap = Ap::new(true, Fault::None);
+        if matches!(authenticate(&mut f, &mut ap), Ok(Ok(_))) {
+            return Err("AKM24 confirmed against an AP using the SAE8 suite binding");
+        }
+        let mut f = sae_fixture(false, 24)?;
+        let mut ap = Ap::new(false, Fault::None);
+        if authenticate(&mut f, &mut ap)?.is_ok() || !ap.events.is_empty() {
+            return Err("Hunt-and-Peck admitted H2E-only SAE-EXT-KEY");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/pmf",
+    smoke_gen2_sae_ext_key_group19_native_hmac_and_suite_bound_confirm
+);
+
+fn smoke_gen2_pmf_new_akms_hold_igtk_receipt_and_revoke_before_port() -> TestResult {
+    check(|| {
+        use core::cell::Cell;
+        for akm in [6, 24] {
+            let (mut f, mut ap) = prepared_akm(true, Fault::None, akm)?;
+            ap.hold_igtk = true;
+            f.firmware.inject(0xc1, 0, 0x8000, &ap.m1());
+            let current = Cell::new(true);
+            let policy_now = || {
+                if current.get() {
+                    Ok(policy())
+                } else {
+                    Err("test PMF authority revoked")
+                }
+            };
+            let owner = f.owner.as_mut().unwrap();
+            // The two operations have different opaque future types.
+            let mut op: Pin<alloc::boxed::Box<dyn Future<Output = Result<(), &'static str>> + '_>> =
+                if akm == 6 {
+                    alloc::boxed::Box::pin(owner.secure_using(PSK, || Ok(SNONCE), policy_now))
+                } else {
+                    alloc::boxed::Box::pin(owner.secure_sae_using(|| Ok(SNONCE), policy_now))
+                };
+            for _ in 0..256 {
+                if poll(op.as_mut()).is_ready() {
+                    return Err("PMF completed before held IGTK receipt");
+                }
+                while let Some(p) = f.trace.take() {
+                    ap.react(p, &mut f.firmware)?;
+                }
+                if ap.held_igtk.is_some() {
+                    break;
+                }
+            }
+            if ap.held_igtk.is_none() || ap.enabled || ap.events.last() != Some(&Kind::Igtk) {
+                return Err("IGTK wait did not retain disabled native peer");
+            }
+            current.set(false);
+            if !matches!(poll(op.as_mut()), Poll::Ready(Err(_))) {
+                return Err("PMF authority revocation did not stop held IGTK wait");
+            }
+            drop(op);
+            if f.owner.as_mut().unwrap().data_port_using(|| Ok(policy())) || ap.enabled {
+                return Err("revoked PMF IGTK wait admitted controlled port");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/pmf",
+    smoke_gen2_pmf_new_akms_hold_igtk_receipt_and_revoke_before_port
 );

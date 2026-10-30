@@ -210,3 +210,56 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2/he",
     smoke_mvm_he_requires_sku_program_response_and_retains_context_wait
 );
+
+fn smoke_mvm_native_phy_metadata_reports_he_vht_without_radio_authority() -> TestResult {
+    check(|| {
+        // Metadata describes the implemented SKU/ABI profile before any
+        // association or measured emission program has been admitted.
+        let h = Harness::build_nvm_he(false, true, 2, 3, false, false, 0, 0, 1, true)?;
+        let before = h.actor.lock().commands.len();
+        let caps = h.device.get_wireless_info().hw_caps;
+        if !caps.ht_supported
+            || !caps.he_supported
+            || caps.vht_supported
+            || h.device.phy_capabilities(2400).is_none()
+            || h.device.phy_capabilities(6000).is_some()
+            || h.device.link_up()
+            || h.actor.lock().commands.len() != before
+        {
+            return Err("HE metadata inferred authority or hid the supported SKU/ABI");
+        }
+        drop(h);
+        let h = Harness::build_nvm_he(false, true, 2, 3, false, false, 0, 0, 1, false)?;
+        if h.device.get_wireless_info().hw_caps.he_supported {
+            return Err("HE metadata ignored absent NVM SKU");
+        }
+        drop(h);
+        let h = Harness::build_nvm(false, true, 2, 3, false, false, 0, 2)?;
+        let before = h.actor.lock().commands.len();
+        let caps = h.device.get_wireless_info().hw_caps;
+        let band2 = h
+            .device
+            .phy_capabilities(2400)
+            .ok_or("2GHz HT metadata absent")?;
+        let band5 = h
+            .device
+            .phy_capabilities(5000)
+            .ok_or("5GHz HT metadata absent")?;
+        if !caps.vht_supported
+            || caps.he_supported
+            || band2.vht.is_some()
+            || band5.vht != Some(super::super::super::mvm_boot::local_vht_for(0).capability_body())
+            || band2.ht[0] & 2 != 0
+            || band5.ht[0] & 2 == 0
+            || h.device.link_up()
+            || h.actor.lock().commands.len() != before
+        {
+            return Err("VHT metadata omitted 5GHz width intersection or inferred TX authority");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/he",
+    smoke_mvm_native_phy_metadata_reports_he_vht_without_radio_authority
+);

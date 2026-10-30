@@ -254,6 +254,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         // Real association immediately closes/reserves its own generation.
         rx_epoch: rx_epoch::State::model(),
         sources: None,
+        rf_policy: None,
     };
     (hardware, firmware)
 }

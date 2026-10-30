@@ -1,7 +1,7 @@
 //! Firmware-side RAW packet conversation over actual HTT TX/RX DMA storage.
 use super::*;
-use narf_wifi_fixtures::{udp_ipv4, ApPhase, DhcpServer, FakeAp, NetworkPlan};
 use alloc::boxed::Box;
+use narf_wifi_fixtures::{udp_ipv4, ApPhase, DhcpServer, FakeAp, NetworkPlan};
 use narf_wireless::eapol::{KeyFrame, KeyMgmt, Ptk};
 const OWN: [u8; 6] = [2, 3, 4, 5, 6, 7];
 const AP: [u8; 6] = [2, 8, 9, 10, 11, 12];
@@ -64,6 +64,8 @@ pub(super) struct Fixture {
     uplink: Vec<Vec<u8>>,
     held: VecDeque<u16>,
     pn: u64,
+    /// Opt-in native AP QoS sequence owner for composed receive BA traffic.
+    receive_sequence: Option<u16>,
     replay: narf_wireless::ccmp::ReplayWindow,
     hold_m4: bool,
     m4_before_receipt: Option<Vec<u8>>,
@@ -196,6 +198,7 @@ impl Fixture {
             uplink: Vec::new(),
             held: VecDeque::new(),
             pn: 1,
+            receive_sequence: None,
             replay: narf_wireless::ccmp::ReplayWindow { last_seen_pn: 0 },
             hold_m4: false,
             m4_before_receipt: None,
@@ -320,7 +323,16 @@ impl Fixture {
         frame.extend_from_slice(&ethernet[..6]);
         frame.extend_from_slice(&AP);
         frame.extend_from_slice(&ethernet[6..12]);
-        frame.extend_from_slice(&[0, 0]);
+        let sequence = if qos {
+            self.receive_sequence.as_mut().map_or(0, |sequence| {
+                let current = *sequence;
+                *sequence = (*sequence + 1) & 4095;
+                current
+            })
+        } else {
+            0
+        };
+        frame.extend_from_slice(&(sequence << 4).to_le_bytes());
         if qos {
             frame.extend_from_slice(&[0, 0]);
         }
@@ -577,7 +589,9 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             let density = [0, 1, 1, 1, 2, 4, 8, 16][usize::from((f.ht_ampdu >> 2) & 7)];
             if word(at + 32) != u32::from(f.ht_capabilities)
                 || word(at + 36)
-                    != f.vht.as_ref().map_or((1 << (13 + (f.ht_ampdu & 3))) - 1, |v| v.max_mpdu)
+                    != f.vht
+                        .as_ref()
+                        .map_or((1 << (13 + (f.ht_ampdu & 3))) - 1, |v| v.max_mpdu)
                 || word(at + 40) != density
                 || word(at + 44)
                     != (if f.ht_sgi { 12 } else { 8 }
@@ -1097,7 +1111,8 @@ pub(super) fn captures_management(m: &RadioModel, command: &[u8]) -> bool {
         .as_ref()
         .is_some_and(|d| d.ap.phase() == ApPhase::Authorized)
         && command.len() >= 4
-        && u32::from_le_bytes(command[..4].try_into().unwrap()) == management_id(m.inner.inner.dialect)
+        && u32::from_le_bytes(command[..4].try_into().unwrap())
+            == management_id(m.inner.inner.dialect)
 }
 pub(super) fn capture_management(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
     let command = &bytes[8..];

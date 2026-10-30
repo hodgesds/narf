@@ -226,10 +226,11 @@ impl Owner {
             self.power.phy.offered.is_some(),
         )?;
         let join = plan.sae().ok_or("MVM SAE plan absent")?;
-        // The native 4-way owner implements AKM 8 (SHA-256 KDF, AES-CMAC
-        // MIC). SAE-EXT-KEY (AKM 24) needs its variable-length KDF.
-        if join.akm() != KeyMgmt::Sae {
-            return Err("MVM SAE-EXT-KEY (AKM 24) is not implemented");
+        // The shared SAE implementation is group19 (32-byte PMK). Both
+        // admitted AKMs use16-byte KCK/KEK/MIC; AKM24 selects HMAC-SHA256
+        // instead of SAE's AES-CMAC in the retained four-way owner.
+        if !matches!(join.akm(), KeyMgmt::Sae | KeyMgmt::SaeExtKey) {
+            return Err("MVM unsupported SAE key-management profile");
         }
         let mut sae = session(join, local, link.bssid)?;
         let commit = plan

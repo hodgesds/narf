@@ -9,6 +9,7 @@ use core::{
     pin::pin,
     task::Poll,
 };
+mod retained_wmi;
 async fn source_wait<T>(
     source: Option<super::firmware_source::Source>,
     operation: impl Future<Output = Result<T, BmiError>>,
@@ -40,6 +41,9 @@ impl From<BmiError> for Error {
     }
 }
 pub(super) trait Hif {
+    fn nonblocking_wmi(&self) -> bool {
+        false
+    }
     fn current_sources(&self) -> Option<super::firmware_source::Source> {
         None
     }
@@ -76,6 +80,9 @@ pub(super) trait Hif {
     }
 }
 impl Hif for super::boot::PciBoot {
+    fn nonblocking_wmi(&self) -> bool {
+        true
+    }
     fn current_sources(&self) -> Option<super::firmware_source::Source> {
         super::boot::PciBoot::current_sources(self)
     }

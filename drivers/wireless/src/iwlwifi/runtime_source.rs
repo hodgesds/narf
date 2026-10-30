@@ -71,16 +71,28 @@ impl Assets {
 pub(in crate::iwlwifi) struct Fence {
     assets: Assets,
     pci: super::Authority,
+    policy: Option<super::super::mld_policy::Authority>,
 }
 impl Fence {
     pub(super) fn new(assets: Assets, pci: super::Authority) -> Self {
-        Self { assets, pci }
+        Self {
+            assets,
+            pci,
+            policy: None,
+        }
     }
     pub(in crate::iwlwifi) fn invoke<T>(
         &self,
         operation: impl FnOnce() -> Result<T, &'static str>,
     ) -> Result<T, &'static str> {
-        self.assets.invoke(|| self.pci.invoke(operation))
+        self.assets.invoke(|| {
+            self.pci.invoke(|| {
+                if let Some(policy) = &self.policy {
+                    policy.check()?;
+                }
+                operation()
+            })
+        })
     }
     #[cfg(feature = "kernel-test")]
     pub(in crate::iwlwifi) fn revoke_model_pci(&self) {
@@ -114,7 +126,9 @@ impl super::Hardware {
         Err("native Intel executable/PNVM source owner absent")
     }
     pub(in crate::iwlwifi) fn source_fence(&self) -> Result<Fence, &'static str> {
-        Ok(Fence::new(self.source_assets()?, self.authority(true)))
+        let mut fence = Fence::new(self.source_assets()?, self.authority(true));
+        fence.policy = self.rf_policy.clone();
+        Ok(fence)
     }
 }
 

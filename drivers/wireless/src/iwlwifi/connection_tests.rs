@@ -42,6 +42,7 @@ fn connection() -> Connection {
             ..Default::default()
         },
         local_phy: super::super::ht_vht::Local::from_nvm(12, 3, 3),
+        regulatory: Connection::model_policy_program(),
         rx_ba: core::array::from_fn(|tid| {
             (tid == 0).then(|| Window::new(3, 0, 1, 100, 64, 0, 0).unwrap())
         }),

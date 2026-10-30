@@ -26,8 +26,12 @@ pub struct Device {
     control: Mutex<Option<Work>>,
     publication: AtomicBool,
     source: super::runtime::source::Fence,
+    policy: super::mld_policy::Source,
+    policy_fence: IrqSafeSpinLock<Option<super::mld_policy::Fence>>,
     generation: Arc<AtomicU64>,
     quarantined: AtomicBool,
+    /// A terminal close request survives a dropped state-lock waiter.
+    closing: AtomicBool,
     /// A completed system-suspend stop awaiting its resume restart.
     suspended: AtomicBool,
     admission: IrqSafeSpinLock<()>,
@@ -62,6 +66,7 @@ struct State {
     beacons: Vec<Beacon>,
     connection: Option<Connection>,
     needs_reset: bool,
+    stop_completed: bool,
     producer: Option<Producer<Frame, RX_RING_N>>,
     receive_ipc: Option<super::runtime::rx_epoch::Publication>,
     eapol: VecDeque<Vec<u8>>,
@@ -77,6 +82,7 @@ struct Delivery {
     generation: Arc<AtomicU64>,
     epoch: u64,
     receive: super::runtime::rx_epoch::Publication,
+    policy: super::mld_policy::Fence,
 }
 impl core::ops::Deref for Delivery {
     type Target = Vec<u8>;
@@ -93,10 +99,12 @@ impl Delivery {
         operation: impl FnOnce() -> Result<T, &'static str>,
     ) -> Result<T, &'static str> {
         self.source.invoke(|| {
-            if !self.current() {
-                return Err("stale Intel station publication generation");
-            }
-            operation()
+            self.policy.invoke(|| {
+                if !self.current() {
+                    return Err("stale Intel station publication generation");
+                }
+                operation()
+            })
         })
     }
 }
@@ -194,6 +202,7 @@ impl Device {
                 beacons: Vec::new(),
                 connection: None,
                 needs_reset: false,
+                stop_completed: false,
                 producer: None,
                 receive_ipc: None,
                 eapol: VecDeque::new(),
@@ -204,8 +213,11 @@ impl Device {
             control: Mutex::new(None),
             publication: AtomicBool::new(false),
             source,
+            policy: super::mld_policy::Source::native(),
+            policy_fence: IrqSafeSpinLock::new(None),
             generation: Arc::new(AtomicU64::new(0)),
             quarantined: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
             admission: IrqSafeSpinLock::new(()),
             mac,
@@ -258,7 +270,10 @@ impl Device {
             return Err(WirelessError::HardwareError);
         }
         self.set_link(false);
+        *self.policy_fence.lock() = None;
+        state.hardware.clear_rf_policy();
         state.needs_reset = true;
+        state.stop_completed = false;
         state.connection = None;
         state.clear_transmit();
         state.eapol.clear();
@@ -479,11 +494,134 @@ impl Device {
             .as_ref()
             .is_some_and(|d| core::ptr::eq(Arc::as_ptr(d), self))
     }
+    fn policy_current(&self) -> Result<(), &'static str> {
+        match self.policy_fence.lock().as_ref() {
+            Some(fence) => fence.check(),
+            None if !self.up.load(Ordering::Acquire) => Ok(()),
+            None => Err("Intel station publication lacks current RF policy"),
+        }
+    }
+    fn install_station_policy(&self, state: &mut State) -> Result<(), &'static str> {
+        let program = state
+            .connection
+            .as_ref()
+            .ok_or("Intel station policy lacks association")?
+            .regulatory_program();
+        let fence = self.policy.bind(program)?;
+        state
+            .hardware
+            .install_rf_policy(super::mld_policy::Authority::Station(fence.clone()))?;
+        *self.policy_fence.lock() = Some(fence);
+        Ok(())
+    }
+    /// The retained transport owner stops autonomous firmware emission and
+    /// pins uncertain DMA. It does not need continuing RF/source authority.
+    async fn stop_locked(&self, state: &mut State) {
+        self.set_link(false);
+        self.retire_receive_ipc(state);
+        state.needs_reset = true;
+        state.clear_transmit();
+        state.eapol.clear();
+        if let Some(connection) = state.connection.as_mut() {
+            connection.authorized = false;
+        }
+        if !state.stop_completed {
+            if state.hardware.stop_for_suspend().await.is_err() {
+                self.quarantined.store(true, Ordering::Release);
+            }
+            state.stop_completed = true;
+        }
+        self.closing.store(false, Ordering::Release);
+    }
+    fn start_repair(self: &Arc<Self>, state: &mut State) {
+        self.set_link(false);
+        self.retire_receive_ipc(state);
+        state.needs_reset = true;
+        state.hardware.fail();
+        state.clear_transmit();
+        state.eapol.clear();
+        if let Some(connection) = state.connection.as_mut() {
+            connection.authorized = false;
+        }
+        if state.stop_completed {
+            return;
+        }
+        let Some(mut slot) = self.control.try_lock() else {
+            return;
+        };
+        if slot.is_some() {
+            return;
+        }
+        let device = self.clone();
+        *slot = Some(Work::new(async move {
+            let mut state = device.state.lock().await;
+            device.stop_locked(&mut state).await;
+        }));
+    }
+
+    fn healthy_close_pending(&self, state: &State) -> bool {
+        self.closing.load(Ordering::Acquire)
+            && !self.quarantined.load(Ordering::Acquire)
+            && !state.hardware.is_failed()
+            && self.current_owner()
+            && self.source.invoke(|| Ok(())).is_ok()
+            && self.policy_current().is_ok()
+    }
+    async fn close_locked(&self, state: &mut State) -> Result<(), WirelessError> {
+        self.set_link(false);
+        self.retire_receive_ipc(state);
+        state.clear_transmit();
+        state.eapol.clear();
+        if state.connection.is_none() && (state.needs_reset || state.hardware.is_failed()) {
+            self.stop_locked(state).await;
+            return if self.quarantined.load(Ordering::Acquire) {
+                Err(WirelessError::HardwareError)
+            } else {
+                Ok(())
+            };
+        }
+        if let Some(connection) = state.connection.take() {
+            state.needs_reset = true;
+            if connection.disconnect(&mut state.hardware).await.is_err() {
+                self.stop_locked(state).await;
+                return Err(WirelessError::HardwareError);
+            }
+            state.hardware.clear_rf_policy();
+            *self.policy_fence.lock() = None;
+            state.needs_reset = false;
+        }
+        self.closing.store(false, Ordering::Release);
+        Ok(())
+    }
+    fn start_close(self: &Arc<Self>, state: &mut State) {
+        state.clear_transmit();
+        state.eapol.clear();
+        self.retire_receive_ipc(state);
+        if let Some(connection) = state.connection.as_mut() {
+            connection.authorized = false;
+        }
+        let Some(mut slot) = self.control.try_lock() else {
+            return;
+        };
+        if slot.is_some() {
+            return;
+        }
+        let device = self.clone();
+        *slot = Some(Work::new(async move {
+            let mut state = device.state.lock().await;
+            if device.closing.load(Ordering::Acquire) {
+                let _ = device.close_locked(&mut state).await;
+            }
+        }));
+    }
+
     fn publish_link(&self, bssid: [u8; 6], epoch: u64) -> Result<(), &'static str> {
         let _admission = self.admission.lock();
         self.source.invoke(|| {
+            self.policy_current()?;
             if self.generation.load(Ordering::Acquire) != epoch
                 || self.quarantined.load(Ordering::Acquire)
+                || self.closing.load(Ordering::Acquire)
                 || !self.current_owner()
             {
                 return Err("Intel station publication retired before carrier");
@@ -528,6 +666,7 @@ impl Device {
             return Ok(());
         };
         let result = self.source.invoke(|| {
+            self.policy_current()?;
             if !receive.current() {
                 return Err("Intel RX IPC key epoch closed");
             }
@@ -580,19 +719,28 @@ impl Device {
         {
             return Vec::new();
         }
-        if self.quarantined.load(Ordering::Acquire) {
-            return Vec::new();
-        }
-        if self.source.invoke(|| Ok(())).is_err() {
+        let source_lost = self.source.invoke(|| Ok(())).is_err();
+        let policy_lost = self.policy_current().is_err();
+        if source_lost {
             self.source_failed(epoch);
-            return Vec::new();
+        }
+        if policy_lost && self.up.load(Ordering::Acquire) {
+            self.set_link(false);
         }
         let Some(mut state) = self.state.try_lock() else {
             return Vec::new();
         };
-        if state.needs_reset {
-            state.hardware.fail();
-            state.clear_transmit();
+        if source_lost
+            || policy_lost
+            || state.needs_reset
+            || self.quarantined.load(Ordering::Acquire)
+        {
+            self.start_repair(&mut state);
+            return Vec::new();
+        }
+        if self.closing.load(Ordering::Acquire) {
+            self.start_close(&mut state);
+            return Vec::new();
         }
         let State {
             hardware,
@@ -601,8 +749,7 @@ impl Device {
             ..
         } = &mut *state;
         if hardware.poll().is_err() {
-            state.clear_transmit();
-            self.set_link(false);
+            self.start_repair(&mut state);
             return Vec::new();
         }
         hardware.retire_transmits();
@@ -673,7 +820,11 @@ impl Device {
         }
         let mut deliveries = Vec::new();
         let receive = state.hardware.receive_publication();
+        let policy = self.policy_fence.lock().clone();
         for (bytes, meta) in output {
+            let Some(policy) = policy.clone() else {
+                break;
+            };
             let Some(receive) = receive.clone() else {
                 break;
             };
@@ -683,6 +834,7 @@ impl Device {
                 generation: self.generation.clone(),
                 epoch,
                 receive,
+                policy,
             };
             let published = {
                 let _admission = self.admission.lock();
@@ -708,7 +860,11 @@ impl Device {
             if published.is_ok() {
                 deliveries.push(delivery);
             } else if delivery.current() {
-                self.source_failed(epoch);
+                if self.policy_current().is_err() {
+                    self.set_link(false);
+                } else {
+                    self.source_failed(epoch);
+                }
                 break;
             }
         }
@@ -776,14 +932,14 @@ impl Device {
                     connection.authorized = false;
                 }
                 state.clear_transmit();
-                device.set_link(false);
+                device.stop_locked(&mut state).await;
             } else {
                 state.needs_reset = false;
                 if device.refresh_receive_ipc(&mut state).is_err() {
                     state.hardware.fail();
                     state.needs_reset = true;
                     state.clear_transmit();
-                    device.set_link(false);
+                    device.stop_locked(&mut state).await;
                 }
             }
         }));
@@ -845,7 +1001,11 @@ impl Device {
                 .is_err()
                 && fence.current()
             {
-                self.source_failed(fence.epoch);
+                if self.policy_current().is_err() {
+                    self.set_link(false);
+                } else {
+                    self.source_failed(fence.epoch);
+                }
                 break;
             }
         }
@@ -885,9 +1045,11 @@ impl Interface for Device {
     }
     fn link_up(&self) -> bool {
         self.up.load(Ordering::Acquire)
+            && !self.closing.load(Ordering::Acquire)
             && !self.quarantined.load(Ordering::Acquire)
             && self.current_owner()
             && self.source.invoke(|| Ok(())).is_ok()
+            && self.policy_current().is_ok()
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         &self.rx
@@ -916,6 +1078,9 @@ impl Device {
             return Err(WirelessError::InvalidArgs);
         }
         self.finish_control().await;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(WirelessError::Busy);
+        }
         let mut state = self.state.try_lock().ok_or(WirelessError::Busy)?;
         if state.needs_reset
             || state.hardware.is_failed()
@@ -925,6 +1090,9 @@ impl Device {
                 .is_some_and(|connection| !connection.authorized)
         {
             self.recover(&mut state).await?;
+            if self.closing.load(Ordering::Acquire) {
+                return Err(WirelessError::Busy);
+            }
         }
         if state.connection.is_some() {
             return Err(WirelessError::Busy);
@@ -946,6 +1114,15 @@ impl Device {
         // Cancellation leaves this set. The pump fails closed rather
         // than driving partially configured station/queue state.
         state.needs_reset = true;
+        state.stop_completed = false;
+        state
+            .hardware
+            .install_rf_policy(super::mld_policy::Authority::Transaction(
+                self.policy
+                    .transaction(domain)
+                    .map_err(|_| WirelessError::HardwareError)?,
+            ))
+            .map_err(|_| WirelessError::HardwareError)?;
         let bssid = request.bssid;
         match Connection::associate_in_domain(
             &mut state.hardware,
@@ -961,10 +1138,25 @@ impl Device {
         {
             Ok(connection) => {
                 state.connection = Some(connection);
+                if self.install_station_policy(&mut state).is_err() {
+                    self.stop_locked(&mut state).await;
+                    return Err(WirelessError::HardwareError);
+                }
                 state.needs_reset = false;
-                self.publish_link(bssid, epoch)
-                    .and_then(|()| self.refresh_receive_ipc(&mut state))
-                    .map_err(|_| WirelessError::HardwareError)
+                let result = self
+                    .publish_link(bssid, epoch)
+                    .and_then(|()| self.refresh_receive_ipc(&mut state));
+                if result.is_err() {
+                    if self.healthy_close_pending(&state) {
+                        // The terminal M4/key owner is still valid. Close
+                        // owns its ordered native retirement; never publish
+                        // data while that close waits for this state guard.
+                        state.connection.as_mut().unwrap().authorized = false;
+                    } else {
+                        self.stop_locked(&mut state).await;
+                    }
+                }
+                result.map_err(|_| WirelessError::HardwareError)
             }
             Err(error) => {
                 use core::fmt::Write;
@@ -973,7 +1165,7 @@ impl Device {
                     "iwlwifi: association failed: {}",
                     error
                 );
-                state.hardware.fail();
+                self.stop_locked(&mut state).await;
                 Err(WirelessError::HardwareError)
             }
         }
@@ -1064,6 +1256,9 @@ impl WirelessNetIface for Device {
             channels
         };
         self.finish_control().await;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(WirelessError::Busy);
+        }
         let mut state = self.state.try_lock().ok_or(WirelessError::Busy)?;
         if state.needs_reset
             || state.hardware.is_failed()
@@ -1073,11 +1268,17 @@ impl WirelessNetIface for Device {
                 .is_some_and(|connection| !connection.authorized)
         {
             self.recover(&mut state).await?;
+            if self.closing.load(Ordering::Acquire) {
+                return Err(WirelessError::Busy);
+            }
         }
         if state.connection.is_some() {
             return Err(WirelessError::Busy);
         }
+        state.hardware.clear_rf_policy();
+        *self.policy_fence.lock() = None;
         state.needs_reset = true;
+        state.stop_completed = false;
         // Only one scan runs at a time; firmware scan slot zero.
         state.scan_uid = 0;
         let uid = state.scan_uid;
@@ -1091,14 +1292,25 @@ impl WirelessNetIface for Device {
             let mut body = scan_api::passive(version, uid, &channels)
                 .map_err(|_| WirelessError::NotSupported)?;
             if request.active {
-                if let Ok(domain) = narf_wireless::reg::db::ensure_domain() {
-                    let permissions = super::connection::regulatory_channels(hw)
+                if let Ok(domain) = self.policy.snapshot() {
+                    hw.install_rf_policy(super::mld_policy::Authority::Transaction(
+                        self.policy
+                            .transaction(&domain)
+                            .map_err(|_| WirelessError::HardwareError)?,
+                    ))
+                    .map_err(|_| WirelessError::HardwareError)?;
+                    let permissions = super::connection::regulatory_channels_in_domain(hw, &domain)
                         .await
                         .map_err(|_| WirelessError::HardwareError)?;
                     let powers: Vec<_> = channels
                         .iter()
                         .map(|&channel| {
-                            super::connection::channel_power(&domain, channel, &permissions, true)
+                            super::connection::channel_power(
+                                &domain,
+                                channel,
+                                &permissions.channels,
+                                true,
+                            )
                         })
                         .collect();
                     if let Some(power) = powers.iter().flatten().min() {
@@ -1231,6 +1443,11 @@ impl WirelessNetIface for Device {
         }
         .await;
         state.needs_reset = outcome.is_err();
+        if outcome.is_ok() {
+            state.hardware.clear_rf_policy();
+        } else {
+            self.stop_locked(&mut state).await;
+        }
         outcome
     }
 
@@ -1241,26 +1458,16 @@ impl WirelessNetIface for Device {
     }
 
     async fn disassociate(&self) -> Result<(), WirelessError> {
+        self.closing.store(true, Ordering::Release);
         self.set_link(false);
         self.finish_control().await;
-        // Socket-owner release is a terminal request even while association
-        // owns state. Waiting serializes its eventual publication and teardown;
-        // returning Busy here would discard that one-shot release notification.
+        // The close request is retained independently of this state-lock
+        // waiter. The pump completes it if the public future is dropped.
         let mut state = self.state.lock().await;
-        // Association/roam publish up under state. Repeat the close after
-        // acquiring it in case an earlier owner finished while we waited.
-        self.set_link(false);
-        state.clear_transmit();
-        state.eapol.clear();
-        if let Some(connection) = state.connection.take() {
-            state.needs_reset = true;
-            connection
-                .disconnect(&mut state.hardware)
-                .await
-                .map_err(|_| WirelessError::HardwareError)?;
-            state.needs_reset = false;
+        if !self.closing.load(Ordering::Acquire) {
+            return Ok(());
         }
-        Ok(())
+        self.close_locked(&mut state).await
     }
 
     fn connected_bssid(&self) -> Option<[u8; 6]> {
@@ -1281,6 +1488,9 @@ impl WirelessNetIface for Device {
             narf_wireless::SecurityConfig::External(_) => return Err(WirelessError::NotSupported),
         };
         self.finish_control().await;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(WirelessError::Busy);
+        }
         let mut state = self.state.try_lock().ok_or(WirelessError::Busy)?;
         // Roaming requires an existing association to reassociate away from.
         let Some(old) = state.connection.take() else {
@@ -1311,12 +1521,30 @@ impl WirelessNetIface for Device {
         state.eapol.clear();
         state.needs_reset = true;
         if old.disconnect(&mut state.hardware).await.is_err() {
-            state.hardware.fail();
+            self.stop_locked(&mut state).await;
             return Err(WirelessError::HardwareError);
+        }
+        state.hardware.clear_rf_policy();
+        *self.policy_fence.lock() = None;
+        if self.closing.load(Ordering::Acquire) {
+            state.needs_reset = false;
+            return Err(WirelessError::Busy);
         }
         let bssid = request.bssid;
         let epoch = self.generation.load(Ordering::Acquire);
-        match Connection::associate(
+        let domain = self
+            .policy
+            .snapshot()
+            .map_err(|_| WirelessError::HardwareError)?;
+        state
+            .hardware
+            .install_rf_policy(super::mld_policy::Authority::Transaction(
+                self.policy
+                    .transaction(&domain)
+                    .map_err(|_| WirelessError::HardwareError)?,
+            ))
+            .map_err(|_| WirelessError::HardwareError)?;
+        match Connection::associate_in_domain(
             &mut state.hardware,
             self.mac,
             beacon,
@@ -1324,21 +1552,36 @@ impl WirelessNetIface for Device {
             self.tx_chains,
             self.phy,
             Some(current_ap),
+            &domain,
         )
         .await
         {
             Ok(connection) => {
                 state.connection = Some(connection);
+                if self.install_station_policy(&mut state).is_err() {
+                    self.stop_locked(&mut state).await;
+                    return Err(WirelessError::HardwareError);
+                }
                 state.needs_reset = false;
-                self.publish_link(bssid, epoch)
-                    .and_then(|()| self.refresh_receive_ipc(&mut state))
-                    .map_err(|_| WirelessError::HardwareError)
+                let result = self
+                    .publish_link(bssid, epoch)
+                    .and_then(|()| self.refresh_receive_ipc(&mut state));
+                if result.is_err() {
+                    if self.healthy_close_pending(&state) {
+                        // The terminal M4/key owner is still valid. Close
+                        // owns its ordered native retirement; never publish
+                        // data while that close waits for this state guard.
+                        state.connection.as_mut().unwrap().authorized = false;
+                    } else {
+                        self.stop_locked(&mut state).await;
+                    }
+                }
+                result.map_err(|_| WirelessError::HardwareError)
             }
             Err(error) => {
                 use core::fmt::Write;
                 let _ = writeln!(narf_console::Writer, "iwlwifi: roam failed: {}", error);
-                state.hardware.fail();
-                self.set_link(false);
+                self.stop_locked(&mut state).await;
                 Err(WirelessError::HardwareError)
             }
         }
@@ -1349,6 +1592,9 @@ impl WirelessNetIface for Device {
             return Err(WirelessError::NotSupported);
         }
         self.finish_control().await;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(WirelessError::Busy);
+        }
         let state = self.state.try_lock().ok_or(WirelessError::Busy)?;
         if state
             .connection

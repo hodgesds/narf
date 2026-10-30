@@ -40,6 +40,7 @@ pub mod button;
 pub mod device_pm;
 pub mod laptop_state;
 pub mod orderly;
+pub mod pci_wake;
 pub mod psci;
 pub mod runtime_pm;
 pub mod runtime_pm_pci;

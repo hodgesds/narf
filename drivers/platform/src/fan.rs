@@ -952,7 +952,7 @@ mod tests {
         ));
         // Method(_ON, 0) { Store(One, POWR) }
         v.extend_from_slice(&method_term(
-            b"_ON",
+            b"_ON_",
             0x00,
             &store_term(int_term(1), b"POWR"),
         ));
@@ -1055,7 +1055,7 @@ mod tests {
         body.extend_from_slice(&name_term(b"_HID", string_term("PNP0C0B")));
         body.extend_from_slice(&name_term(b"POWR", int_term(0)));
         body.extend_from_slice(&method_term(
-            b"_ON",
+            b"_ON_",
             0x00,
             &store_term(int_term(1), b"POWR"),
         ));

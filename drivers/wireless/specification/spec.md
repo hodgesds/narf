@@ -172,12 +172,34 @@ architecture unknown is resolved: its full subtree completes367/0/2
 (pass/fail/skip) on x86_64 and366/0/3 on aarch64 after reducing transient
 fixture/recovery stack use. Full branch build/validation gates remain separate.
 
+**Inventory audit 2026-10-29** (second checkpoint in progress): the ledger
+now holds **134 `feature`** rows (133 driver,1 shared), **35 `chip`** and
+**0 `unknown`**. Two additional omissions are Sc WPA2-PMF and Sc SAE-EXT-KEY
+(`iwlwifi.md` §3.35); the Gen2 rows above cover a different native owner.
+New implementations remain open until their coordinated validation passes.
+
+**Recount 2026-10-29** (second checkpoint): the ledger now holds
+**130 `feature`** rows (129 driver,1 shared), **35 `chip`** and
+**0 `unknown`**. Native x86_64/aarch64 validation closes Gen2 WPA2-PMF,
+Gen2 SAE-EXT-KEY, the retained Gen3/Sc live regulatory owner and ath10k
+associated scanning. Gen2 HE capability reporting is also complete; the HE
+row retains Gen3/Sc work. Intel completes450/0 on each architecture,
+including233/0 Gen2 and8/0 live-policy cases. Ath10k's twelve associated-scan
+conversations pass on both architectures; refreshed retirement and
+restart cases pass23/0 on x86_64 and are included in ARM's273/0 ath10k scope.
+The coordinated native coverage is3575/0/16 on x86_64 across the full run
+and deduplicated follow-up runs, and3185/0/12 in the full ARM run. These also
+exercise the new shared PCI PME, fixed-GPE, strict AML and async platform
+sleep foundations. Those foundations do not close a driver's native WoW row.
+Sc security, actual platform-power ownership, ROC and chip enablement remain
+tracked separately. Software fixtures confer no physical board acceptance.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 17 | Retained Gen3/Sc live regulatory and measured platform-power owners, HE/TX A-MSDU and wider bands/widths; AP/P2P/WoW, scheduled scan, multiple RX queues/RSS; additional chip profiles are tracked separately |
+| iwlwifi | 16 | Retained Gen3/Sc platform-power and negotiated security owners, HE/TX A-MSDU and wider bands/widths; AP/P2P/WoW, scheduled scan, multiple RX queues/RSS; additional chip profiles are tracked separately |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 7 | AP/P2P and wake; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA and loadable packet ABI |
-| ath10k | 19 | Broader HT40 pairs/bands, multiple streams/VHT/TX aggregation and richer RX profiles, PFC, alternate calibration sources, associated/off-channel scanning, IRQ operation, automatic/stable-interface recovery, DMA reclamation and host-bus/system PM |
+| ath10k | 18 | 2.4-GHz HT40/coexistence, additional streams/TX STBC and VHT160/80+80, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload |
 | ath9k | 9 | Channel/retune and HT40/SGI40 profiles, factory selection, periodic calibration, larger TX aggregates and idle/station sleep; other chips are separate rows |
 | rtlwifi | 15 | Other matched chips, broader channels/HT40/VHT, antenna/gain/coexistence, multiple radios, reset/IPS/system PM, RTS/CTS and PCIe ASPM |
 | rtl8xxxu | 9 | Other matched USB chips, SGI20/HT40 and wider channels/rates, RX/TX A-MPDU, TX A-MSDU, both BA directions and RX reorder, coexistence, EP0/halted reset, safe rejoin, FIFO retune and PM |

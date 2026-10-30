@@ -140,7 +140,8 @@ pub async fn suspend_async(
     cap.invoke(NoopOp)?;
     claim_suspend_transition()?;
 
-    let transition = crate::system_pm::prepare_async_system_pm().await;
+    let transition =
+        crate::system_pm::prepare_async_system_pm_for(crate::system_pm::SystemSleepState::S3).await;
     if !transition.succeeded() {
         // The failing hook owns its own rollback; unwind every preceding
         // successful hook in forward-registration order before allowing a

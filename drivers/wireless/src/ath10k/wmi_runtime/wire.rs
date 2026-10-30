@@ -160,7 +160,7 @@ impl Wire {
     /// Linux mac.c::ath10k_update_channel_list sets HT40_PLUS here (not
     /// VDEV_START): each row is a real20MHz primary with its supported side.
     /// Only the exact fully granted pair replaces the passive inventory;
-    /// associated/offchannel scanning remains forbidden by the retained owner.
+    /// an associated scan retains these occupied home rows during dwell.
     /// A VHT profile adds `WMI_CHAN_FLAG_ALLOW_VHT` (Linux sets it on every
     /// enabled row); a granted 80 MHz receipt lists all four segment rows.
     pub fn station_ht40_channels(

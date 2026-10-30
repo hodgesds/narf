@@ -41,6 +41,7 @@ struct RadioModel {
     ce: Option<crate::ath10k::boot::CeFixture>,
     data: Option<data_tests::Fixture>,
     active: Option<active_scan_tests::Fixture>,
+    associated: Option<associated_scan_tests::Fixture>,
     ps: Option<power_save_tests::Fixture>,
     ps_default_off: bool,
     frequency: u16,
@@ -206,16 +207,72 @@ fn management_frame(model: &mut RadioModel, frame: Vec<u8>) {
     add_event(model, id, &body);
 }
 impl Hif for RadioModel {
+    fn nonblocking_wmi(&self) -> bool {
+        self.ce.is_some()
+    }
     fn current_sources(&self) -> Option<crate::ath10k::firmware_source::Source> {
         self.sources.clone()
     }
     fn source_ready(&mut self, pipe: u8) -> Result<bool, BmiError> {
+        if pipe == 3 {
+            if let Some(fixture) = &mut self.associated {
+                if let Some((remaining, bytes)) = &mut fixture.release_after_ready {
+                    let ce = self.ce.as_mut().ok_or(BmiError::Unsupported)?;
+                    if ce.source_bytes(3) != *bytes {
+                        return Err(BmiError::BadResponse);
+                    }
+                    if *remaining == 0 {
+                        ce.hold_source(false);
+                        fixture.release_after_ready = None;
+                    } else {
+                        *remaining -= 1;
+                    }
+                }
+            }
+        }
         match &mut self.ce {
             Some(ce) => ce.source_ready(pipe),
             None => Ok(true),
         }
     }
     fn begin_send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError> {
+        if pipe == 3 && self.ce.is_some() {
+            // Reuse the independent firmware parser/emitter below, with its
+            // blocking CE wrapper detached. The actual nonblocking source
+            // descriptor/bounce and terminal receipt are owned by CeFixture.
+            let stalled = self
+                .associated
+                .as_ref()
+                .is_some_and(associated_scan_tests::stall_next)
+                || self
+                    .active
+                    .as_ref()
+                    .is_some_and(active_scan_tests::stall_next)
+                || self.stall == Some(self.phase);
+            let mut ce = self.ce.take().unwrap();
+            let outcome = {
+                let mut emit = core::pin::pin!(self.send(pipe, bytes));
+                emit.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            };
+            let result = match outcome {
+                Poll::Ready(Ok(())) => Ok(()),
+                // Only the explicit model hold may suspend the emitter;
+                // its transport receipt is still the native CE below.
+                Poll::Pending if stalled => Ok(()),
+                Poll::Pending => Err(BmiError::BadResponse),
+                Poll::Ready(Err(error)) => Err(error),
+            };
+            if let Err(error) = result {
+                self.ce = Some(ce);
+                return Err(error);
+            }
+            if stalled {
+                ce.hold_source(true);
+            }
+            let result = ce.begin_send(pipe, bytes);
+            self.ce = Some(ce);
+            return result;
+        }
         if pipe != 4 || self.data.is_none() {
             return Err(BmiError::Unsupported);
         }
@@ -297,6 +354,11 @@ impl Hif for RadioModel {
         }
         if power_save_tests::handles(self.inner.inner.dialect, &bytes[8..]) {
             return power_save_tests::send(self, bytes).await;
+        }
+        if self.associated.as_ref().is_some_and(|fixture| {
+            associated_scan_tests::handles(fixture, self.inner.inner.dialect, &bytes[8..])
+        }) {
+            return associated_scan_tests::send(self, bytes).await;
         }
         if self.phase >= 2
             && self.active.as_ref().is_some_and(|active| {
@@ -530,6 +592,7 @@ fn radio_boot_country_ht(
         ps: None,
         ps_default_off: false,
         frequency: 2412,
+        associated: None,
     };
     let mut htc = Session::new(model, hardware);
     assert_eq!(once(htc.start()), Poll::Ready(Ok(())));
@@ -797,5 +860,7 @@ mod data_tests;
 
 #[path = "active_scan_tests.rs"]
 mod active_scan_tests;
+#[path = "associated_scan_tests.rs"]
+mod associated_scan_tests;
 #[path = "power_save_tests.rs"]
 mod power_save_tests;

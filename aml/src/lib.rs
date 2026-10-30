@@ -61,6 +61,11 @@ pub mod wmi;
 mod e2e_tests;
 mod tests;
 
+#[cfg(feature = "kernel-test")]
+mod test_scope;
+#[cfg(feature = "kernel-test")]
+pub use test_scope::{TestNamespace, __test_namespace_scope};
+
 /// Run-time AML value, used by the method evaluator + Field
 /// accessors. `Name(...)` flat-constant decoding stays in
 /// `NameValue` for backwards compat; `Value` is the live form.
@@ -212,6 +217,9 @@ pub struct BufferFieldRef {
 #[derive(Debug, Default)]
 struct Namespace {
     nodes: Vec<AmlNode>,
+    /// Integer semantics selected by the actual DSDT revision. Unknown
+    /// metadata cannot authorize strict 64-bit arithmetic.
+    integer_width: Option<u8>,
     /// Concatenated AML byte streams of every table walked, so
     /// Method body offsets resolve cheaply. Each node's
     /// `method_body.0` is an offset into this Vec when the node
@@ -221,6 +229,7 @@ struct Namespace {
 
 pub(crate) static NAMESPACE: IrqSafeSpinLock<Namespace> = IrqSafeSpinLock::new(Namespace {
     nodes: Vec::new(),
+    integer_width: None,
     aml: Vec::new(),
 });
 
@@ -885,6 +894,7 @@ pub unsafe fn parse_namespace(rsdp_phys: PhysAddr) -> Result<u32, AmlError> {
     {
         let mut g = NAMESPACE.lock();
         g.nodes.clear();
+        g.integer_width = None;
     }
 
     // SAFETY: caller assertion.
@@ -962,6 +972,11 @@ unsafe fn walk_aml_table(phys: u64, root_path: &str) -> Result<u32, AmlError> {
     // node body-offsets are absolute into that store.
     let base = {
         let mut g = NAMESPACE.lock();
+        if &body[..4] == b"DSDT" {
+            // ACPICA utglobal.c/acpi_ut_set_integer_width: revision1
+            // selects32-bit Integers; revision2+ selects64-bit Integers.
+            g.integer_width = Some(if body[8] < 2 { 32 } else { 64 });
+        }
         let b = g.aml.len();
         g.aml.extend_from_slice(aml_slice);
         b
@@ -2198,6 +2213,7 @@ pub fn __reset_for_test() {
     let mut g = NAMESPACE.lock();
     g.nodes.clear();
     g.aml.clear();
+    g.integer_width = None;
 }
 
 /// Test entry: parse a synthetic AML body (no SDT header) under the

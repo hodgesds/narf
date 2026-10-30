@@ -109,7 +109,7 @@ struct InstalledIgtk {
 
 struct Exchange {
     session: security::Session,
-    /// WPA3-SAE: every key carries `STA_KEY_MFP` and IGTKs are installed.
+    /// Negotiated PMF: every key carries `STA_KEY_MFP` and IGTKs are installed.
     pmf: bool,
     igtks: [Option<InstalledIgtk>; 2],
     keys: [Option<NativeKey>; 5],
@@ -325,11 +325,18 @@ impl Owner {
         policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
         let pmk = Zeroizing::new(pmk);
-        if self.associated_pmf() {
-            return Err("MVM PMF association requires its SAE PMK owner");
-        }
-        self.secure_with(security::Akm::Wpa2Psk, pmk, nonce, policy)
-            .await
+        let akm = match self
+            .power
+            .prepared
+            .as_ref()
+            .and_then(|p| p.mlme.plan.as_ref())
+            .and_then(|plan| plan.akm())
+        {
+            Some(narf_wireless::eapol::KeyMgmt::PskSha256) => security::Akm::Wpa2PskSha256,
+            Some(narf_wireless::eapol::KeyMgmt::Psk) | None => security::Akm::Wpa2Psk,
+            _ => return Err("MVM PSK credential differs from negotiated AKM"),
+        };
+        self.secure_with(akm, pmk, nonce, policy).await
     }
 
     /// WPA3-SAE four-way exchange with the PMK the retained SAE
@@ -356,8 +363,18 @@ impl Owner {
             .as_mut()
             .and_then(|p| p.mlme.sae_pmk.take())
             .ok_or("MVM SAE PMK absent or already consumed")?;
-        self.secure_with(security::Akm::Wpa3Sae, pmk, nonce, policy)
-            .await
+        let akm = match self
+            .power
+            .prepared
+            .as_ref()
+            .and_then(|p| p.mlme.plan.as_ref())
+            .and_then(|plan| plan.akm())
+        {
+            Some(narf_wireless::eapol::KeyMgmt::SaeExtKey) => security::Akm::Wpa3SaeExtKey,
+            Some(narf_wireless::eapol::KeyMgmt::Sae) => security::Akm::Wpa3Sae,
+            _ => return Err("MVM SAE PMK differs from negotiated AKM"),
+        };
+        self.secure_with(akm, pmk, nonce, policy).await
     }
     fn associated_pmf(&self) -> bool {
         self.power
@@ -399,21 +416,19 @@ impl Owner {
                 None
             })
             .ok_or("MVM actual WPA2 RSN offer absent")?;
-        let pmf = akm == security::Akm::Wpa3Sae;
-        let station_rsn = if pmf {
-            Some(
-                self.power
-                    .prepared
-                    .as_ref()
-                    .and_then(|p| p.mlme.plan.as_ref())
-                    .and_then(|plan| plan.rsn_body())
-                    .ok_or("MVM SAE association RSNE absent")?,
-            )
-        } else {
-            None
-        };
+        let pmf = self.associated_pmf();
+        let station_rsn = self
+            .power
+            .prepared
+            .as_ref()
+            .and_then(|p| p.mlme.plan.as_ref())
+            .and_then(|plan| plan.rsn_body());
+        if pmf && station_rsn.is_none() {
+            return Err("MVM PMF association RSNE absent");
+        }
         let snonce = Zeroizing::new(nonce()?);
-        let session = security::Session::new(akm, *pmk, status.bssid, own, *snonce, rsn);
+        let session =
+            security::Session::new(akm, *pmk, status.bssid, own, *snonce, rsn).with_pmf(pmf);
         self.security.active = Some(Exchange {
             session: match station_rsn {
                 Some(body) => session.with_station_rsn(body),

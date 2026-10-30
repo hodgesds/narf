@@ -201,34 +201,119 @@ pub struct RecoveryScheduled {
 static RESTART: super::restart::Gate = super::restart::Gate::new();
 static LAST_RECOVERY: IrqSafeSpinLock<Option<super::restart::Outcome>> = IrqSafeSpinLock::new(None);
 
-/// Firmware crash reported by the PCIe owner's service (Linux
-/// `ath10k_pci_fw_dump_work` -> `ath10k_core_start_recovery`). One supervisor
-/// runs at a time; it drives [`recover`] and records the outcome.
-pub(in crate::ath10k) fn firmware_crashed() {
-    if !RESTART.request() {
+type RecoveryRequest =
+    super::restart::Scope<narf_lib::mutex::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>>;
+static GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+static PENDING_RECOVERY: IrqSafeSpinLock<
+    super::restart::Requests<
+        narf_lib::mutex::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>,
+    >,
+> = IrqSafeSpinLock::new(super::restart::Requests::new());
+
+fn queue_recovery(request: RecoveryRequest, crash: bool) {
+    let mut pending = PENDING_RECOVERY.lock();
+    let discarded = pending.enqueue(request);
+    let start = if crash {
+        RESTART.request()
+    } else {
+        RESTART.request_non_crash()
+    };
+    drop(pending);
+    // A last retired Arc can own DMA; never run its Drop under this IRQ lock.
+    drop(discarded);
+    if !start {
         return;
     }
-    let _ = writeln!(
-        narf_console::Writer,
-        "  ath10k: firmware crashed (count {}), restarting",
-        RESTART.crashes()
-    );
     narf_scheduler::spawn(async {
-        let delay = super::restart::BUSY_DELAY_MS * 1_000_000;
-        let outcome = super::restart::supervise(
-            recover,
-            || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay)),
-            super::restart::BUSY_RETRIES,
-        )
-        .await;
-        let _ = writeln!(
-            narf_console::Writer,
-            "  ath10k: automatic recovery {:?}",
-            outcome
-        );
-        *LAST_RECOVERY.lock() = Some(outcome);
-        RESTART.complete();
+        loop {
+            let request = {
+                let mut pending = PENDING_RECOVERY.lock();
+                match pending.take() {
+                    Some(request) => request,
+                    None => {
+                        // Complete under the queue lock: an arrival either
+                        // stays in this worker or starts its own successor.
+                        RESTART.complete();
+                        break;
+                    }
+                }
+            };
+            let delay = super::restart::BUSY_DELAY_MS * 1_000_000;
+            let outcome = super::restart::supervise_scoped(
+                || recover_scoped(&request),
+                || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay)),
+                super::restart::BUSY_RETRIES,
+            )
+            .await;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ath10k: automatic recovery {:?}",
+                outcome
+            );
+            *LAST_RECOVERY.lock() = Some(outcome);
+        }
     });
+}
+
+/// Firmware crash notification keeps its Linux crash-counter meaning while
+/// automatic recovery is bound to the reporting physical generation.
+pub(in crate::ath10k) fn firmware_crashed() {
+    queue_recovery(
+        RecoveryRequest {
+            generation: GENERATION.load(core::sync::atomic::Ordering::Acquire),
+            owner: None,
+        },
+        true,
+    );
+}
+
+/// The registered native worker calls this after retained scan cleanup fails.
+/// It creates no new firmware/board grant: only the existing PCI owner may
+/// silence that exact physical generation and arrange a fresh-ROM attempt.
+pub(in crate::ath10k) fn scan_cleanup_failed(
+    radio: alloc::sync::Arc<
+        narf_lib::mutex::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>,
+    >,
+) {
+    queue_recovery(
+        RecoveryRequest {
+            generation: GENERATION.load(core::sync::atomic::Ordering::Acquire),
+            owner: Some(radio),
+        },
+        false,
+    );
+}
+
+/// Declared before SESSION/Radio guards, so cancellation drops those guards
+/// before queueing physical recovery. Immediate denied preflight disarms it.
+struct DiagnosticScan {
+    request: Option<RecoveryRequest>,
+}
+impl DiagnosticScan {
+    fn new(
+        radio: alloc::sync::Arc<
+            narf_lib::mutex::Mutex<super::wmi_runtime::Radio<super::boot::PciBoot>>,
+        >,
+    ) -> Self {
+        Self {
+            request: Some(RecoveryRequest {
+                generation: GENERATION.load(core::sync::atomic::Ordering::Acquire),
+                owner: Some(radio),
+            }),
+        }
+    }
+    fn finish(&mut self, pending: bool) {
+        if !pending {
+            self.request = None;
+        }
+    }
+}
+impl Drop for DiagnosticScan {
+    fn drop(&mut self) {
+        if let Some(request) = self.request.take() {
+            queue_recovery(request, false);
+        }
+    }
 }
 
 /// Firmware crashes observed this boot (`fw_crash_counter`).
@@ -245,23 +330,64 @@ pub fn last_automatic_recovery() -> Option<super::restart::Outcome> {
 /// interface. Three attempts per boot bound permanently pinned old DMA.
 /// Success reports scheduling, not readiness, RF quiescence or DMA reclamation.
 pub async fn recover() -> Result<RecoveryScheduled, RecoveryError> {
+    recover_inner(None).await?.ok_or(RecoveryError::Busy)
+}
+
+async fn recover_scoped(
+    request: &RecoveryRequest,
+) -> Result<Option<RecoveryScheduled>, RecoveryError> {
+    recover_inner(Some(request)).await
+}
+
+async fn recover_inner(
+    request: Option<&RecoveryRequest>,
+) -> Result<Option<RecoveryScheduled>, RecoveryError> {
     let mut session = SESSION.lock().await;
+    if request.is_some_and(|request| {
+        request.generation != GENERATION.load(core::sync::atomic::Ordering::Acquire)
+    }) {
+        // Fresh boot can leave SESSION empty temporarily. An obsolete request
+        // must not spend Busy retries waiting for that successor to appear.
+        return Ok(None);
+    }
     let owner = session.as_mut().ok_or(RecoveryError::Busy)?;
+    if let Some(request) = request {
+        let radio = match owner {
+            DriverSession::Radio(owner) => Some(&owner.radio),
+            _ => None,
+        };
+        if !request.matches(
+            GENERATION.load(core::sync::atomic::Ordering::Acquire),
+            radio,
+        ) {
+            return Ok(None);
+        }
+    }
     let attempt = {
         let mut attempts = RECOVERY_ATTEMPTS.lock();
         if *attempts >= 3 {
-            return Err(RecoveryError::Exhausted);
+            None
+        } else {
+            *attempts += 1;
+            Some(*attempts)
         }
-        *attempts += 1;
-        *attempts
     };
-    let restart = retire_owner(owner)
-        .await
-        .map_err(RecoveryError::Transport)?;
-    // A retired transport's Drop performs no hardware access and preserves all
-    // old mappings. A late old firmware/CE write can only hit permanently pinned DMA.
+    // A spent fresh-boot budget cannot skip the current owner's independent
+    // physical silencing attempt after an autonomous scan cleanup failure.
+    if attempt.is_none() && request.is_none() {
+        return Err(RecoveryError::Exhausted);
+    }
+    let restart = if request.is_some() {
+        retire_owner_physically(owner).await
+    } else {
+        retire_owner(owner).await
+    }
+    .map_err(RecoveryError::Transport)?;
     *session = None;
     let revision = clear_generation().ok_or(RecoveryError::Busy)?;
+    let Some(attempt) = attempt else {
+        return Err(RecoveryError::Exhausted);
+    };
     narf_scheduler::spawn(boot_task(
         restart.device,
         restart.cap,
@@ -269,7 +395,25 @@ pub async fn recover() -> Result<RecoveryScheduled, RecoveryError> {
         restart.hardware,
         revision,
     ));
-    Ok(RecoveryScheduled { attempt })
+    Ok(Some(RecoveryScheduled { attempt }))
+}
+
+async fn retire_owner_physically(
+    owner: &mut DriverSession,
+) -> Result<super::boot::Restart, super::bmi::BmiError> {
+    match owner {
+        DriverSession::Boot(owner) => owner.bmi.transport.retire_after_failed_scan().await,
+        DriverSession::Runtime(owner) => owner.htc.transport.retire_after_failed_scan().await,
+        DriverSession::Wmi(owner) => owner.wmi.htc.transport.retire_after_failed_scan().await,
+        DriverSession::Htt(owner) => owner.htt.wmi.htc.transport.retire_after_failed_scan().await,
+        DriverSession::Radio(owner) => {
+            let mut radio = retire_radio(&owner.radio, &owner.quarantine, || {
+                super::interface::retire(&owner.radio)
+            })
+            .await;
+            radio.htt.wmi.htc.transport.retire_after_failed_scan().await
+        }
+    }
 }
 
 /// Retire whichever generation the session holds (host interface first for
@@ -353,6 +497,13 @@ pub fn resume() -> bool {
 
 /// Clear per-generation controller facts; returns the chip revision.
 fn clear_generation() -> Option<u32> {
+    GENERATION
+        .fetch_update(
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+            |old| old.checked_add(1),
+        )
+        .ok()?;
     let mut controller = CONTROLLER.lock();
     let controller = controller.as_mut()?;
     controller.target_info = None;
@@ -496,15 +647,21 @@ async fn initialize_radio(
 pub async fn scan_passive(
     frequencies: &[u16],
 ) -> Result<super::wmi_runtime::ScanReport, super::wmi_runtime::Error> {
+    let mut cleanup;
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
     let mut radio = owner.radio.lock().await;
+    cleanup = DiagnosticScan::new(owner.radio.clone());
     let result = radio.passive_scan(frequencies).await;
     if let Err(error) = &result {
         if let Some(controller) = CONTROLLER.lock().as_mut() {
             controller.scan_error = Some(*error);
         }
     }
+    cleanup.finish(result.is_err() && radio.failed_scan_pending());
+    drop(radio);
+    drop(session);
+    drop(cleanup);
     result
 }
 
@@ -530,12 +687,14 @@ pub async fn scan_active_with_ies(
     use super::wmi_runtime::Error;
     super::wmi_runtime::validate_probe_ies(extra_ies)?;
     let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Unsupported)?;
+    let mut cleanup;
     let mut session = SESSION.lock().await;
     let owner = live_radio(&mut session)?;
     let mut radio = owner.radio.lock().await;
     let plan = radio
         .prepare_active_scan(frequencies, ssids, &domain)?
         .with_extra_ies(extra_ies)?;
+    cleanup = DiagnosticScan::new(owner.radio.clone());
     let result = radio
         .active_scan(plan, || {
             narf_wireless::reg::db::get_domain().ok_or(Error::Unsupported)
@@ -546,6 +705,10 @@ pub async fn scan_active_with_ies(
             controller.scan_error = Some(*error);
         }
     }
+    cleanup.finish(result.is_err() && radio.failed_scan_pending());
+    drop(radio);
+    drop(session);
+    drop(cleanup);
     result
 }
 

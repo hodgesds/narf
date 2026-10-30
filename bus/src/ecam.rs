@@ -105,7 +105,16 @@ pub fn __reset_for_test() {
 /// Scoped config-space fixtures. The owned RAM must outlive the guard;
 /// dropping the guard restores the real ECAM registrations before it is freed.
 #[cfg(feature = "kernel-test")]
-pub(crate) struct TestWindows([Option<Segment>; MAX_SEGMENTS]);
+pub struct TestWindows([Option<Segment>; MAX_SEGMENTS]);
+
+#[cfg(feature = "kernel-test")]
+impl core::fmt::Debug for TestWindows {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("TestWindows")
+            .finish_non_exhaustive()
+    }
+}
 
 #[cfg(feature = "kernel-test")]
 impl Drop for TestWindows {
@@ -118,7 +127,7 @@ impl Drop for TestWindows {
 /// Every pointer must cover its declared length until the returned guard is
 /// dropped. Run only with exclusive ownership of the test's PCI registry.
 #[cfg(feature = "kernel-test")]
-pub(crate) unsafe fn __test_windows(windows: &[(PhysAddr, *mut u8, u64)]) -> TestWindows {
+pub unsafe fn __test_windows(windows: &[(PhysAddr, *mut u8, u64)]) -> TestWindows {
     assert!(windows.len() <= MAX_SEGMENTS);
     let mut segments = SEGMENTS.lock();
     let restore = TestWindows(*segments);

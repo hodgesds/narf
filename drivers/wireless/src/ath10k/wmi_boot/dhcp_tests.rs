@@ -6,6 +6,8 @@ use alloc::{string::String, sync::Arc};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::Interface;
 use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessError};
+#[path = "associated_scan_conversation_tests.rs"]
+mod associated_scan_conversation_tests;
 #[path = "coding_conversation_tests.rs"]
 mod coding_conversation_tests;
 #[path = "ht40_conversation_tests.rs"]
@@ -14,10 +16,10 @@ mod ht40_conversation_tests;
 mod ht_conversation_tests;
 #[path = "pmf_conversation_tests.rs"]
 mod pmf_conversation_tests;
-#[path = "rebind_conversation_tests.rs"]
-mod rebind_conversation_tests;
 #[path = "protection_conversation_tests.rs"]
 mod protection_conversation_tests;
+#[path = "rebind_conversation_tests.rs"]
+mod rebind_conversation_tests;
 #[path = "sgi40_conversation_tests.rs"]
 mod sgi40_conversation_tests;
 #[path = "source_conversation_tests.rs"]
@@ -1004,28 +1006,6 @@ fn composition_radio(
         })
     {
         return Err("power-save initialization did not precede carrier");
-    }
-    if active_scan {
-        let sent = h.model(|m| m.sent.len());
-        let request = ScanRequest {
-            ssids: vec![b"narf".to_vec()],
-            frequencies_mhz: vec![2412],
-            channels: vec![1],
-            active: true,
-            random_mac: None,
-            colocated_6ghz: false,
-            duration_tu: None,
-            duration_mandatory: false,
-            extra_ies: Vec::new(),
-        };
-        if !matches!(
-            drive(h.device.scan(request)),
-            Poll::Ready(Err(WirelessError::Busy))
-        ) || !h.device.link_up()
-            || h.model(|m| m.sent.len()) != sent
-        {
-            return Err("associated active scan failed to preserve exclusive peer and carrier");
-        }
     }
     let lease = narf_net::dhcp::dhcp_acquire(&h.name, 0)
         .map_err(|_| "actual kernel DHCP through CE/HTT failed")?;

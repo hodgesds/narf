@@ -258,9 +258,11 @@ impl super::Owner {
         })
     }
     pub(super) fn supports_native_he(&self) -> bool {
+        self.supports_native_he_contract() && self.scan_he_permitted()
+    }
+    pub(in crate::iwlwifi) fn supports_native_he_contract(&self) -> bool {
         self.supports_native_ht20()
             && self.nvm.as_ref().is_some_and(|nvm| nvm.he)
-            && self.scan_he_permitted()
             && self.he_context_version().is_some()
     }
 }

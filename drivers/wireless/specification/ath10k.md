@@ -81,8 +81,9 @@ Host-bus/system power transitions remain separate profiles.
   power ceiling denies probes. Implicit lists select only eligible channels;
   explicit denied channels and invalid SSID/geometry/options fail before I/O.
   Random-MAC, dwell and colocated-6-GHz requests remain unsupported.
-  The interface returns Busy for scans with a prepared/associated peer, without
-  closing that live station or publishing scan commands.
+  Raw PCI diagnostic scans retain exclusive unassociated ownership. The
+  registered interface refuses a partially prepared peer and concurrent scan;
+  an authorized associated peer uses the retained dwell contract below.
   All six MAIN/10.1/10.2/10.2.4/10.4/TLV layouts encode real SSID arrays,
   CCK/OFDM probe rates and DFS bypass. TLV's inverted probe-request-filter bit
   is handled explicitly. Before START, ordered commands retain factory RD/CTL,
@@ -759,6 +760,62 @@ Host-bus/system power transitions remain separate profiles.
   Carrier starts closed and opens only after actual authorization. Disconnect,
   cancelled control operations, peer loss, malformed state and native progress
   failure close carrier permanently; another join requires a future reset owner.
+- **Associated scans:** the Device now has a retained scan receipt owner for
+  passive or directed/wildcard active scans on an authorized station vdev.
+  Firmware's normal WMI scan scheduler handles home/off-channel PS and dwell,
+  following Linux `mac.c::ath10k_hw_scan`. Twelve native conversation cases
+  pass on x86_64 and aarch64; physical RF/board acceptance remains separate.
+  Preflight binds the current associated BSSID and occupied permission before
+  reserving a nonwrapping scan ID. Active setup sends the native domain,
+  minimum granted per-band power and a complete channel inventory before
+  START_SCAN. Probe rows receive only their actual20MHz initiation permission;
+  the home20/40/80MHz rows retain their occupied power and negotiated HT/VHT
+  flags. Passive setup never promotes a probe row. Small discovery inventories
+  retain any real home HT partner/VHT segment rows required by the existing
+  association. A successful matched terminal restores home domain, power and
+  inventory; an off-channel report cannot erase the bound home beacon cache.
+  During dwell the public future releases Radio's async mutex. The ordinary
+  native peer/HTT/key/BA drain observes scan events and continues host TX, RX,
+  DHCP and stack callbacks under the existing ownership and controlled-port
+  fences. Callbacks still run after Radio/ring/publication locks are released.
+  Authenticated rekey can temporarily close DATA while preserving carrier and
+  the scan's peer binding. Operator PS changes remain queued until restoration.
+  Current probe and occupied-home permissions are checked on every control
+  poll and packet-progress pass. Policy loss never restores obsolete power.
+  A dropped public future closes host publication and wakes the retained
+  worker. Its exact STOP_SCAN terminal precedes native DOWN/DELETE/UNMAP and
+  VDEV_STOPPED; command submission, wrong scan/request/vdev events and timeout
+  cannot stand in for those receipts. A terminal already observed before a
+  cancelled restore is retained as the stop proof. Concurrent disassociate
+  closes host traffic and returns Busy while this worker owns retirement;
+  retry succeeds after the native teardown receipt. Physical-generation
+  retirement prevents an old cleanup continuation from addressing a successor.
+  DMA stays retained and the failed owner requires full reset; this is no
+  receive-generation or recovery proof. Remain-on-channel/action-frame TX for
+  P2P is a separate residual under the off-channel feature row.
+  Scan setup/restore/STOP use cooperative retained WMI publication: HTC credits
+  and sequence remain in Session, while native CE3 occupancy, bounce bytes and
+  completion deadline remain in HIF. A public drop at a credit/CE wait cannot
+  poison away the worker's STOP path or make a busy source buffer reusable.
+  The worker first waits for that exact source receipt; its later matching
+  firmware scan terminal is a separate requirement. Ordinary BMI/control
+  operations retain their existing fail-stop cancellation behavior.
+  Actual PCI unassociated scans also retain their WMI source/credit waits;
+  pure protocol fixtures without native CE keep the legacy transport surface.
+  Scan completion follows the time deadline rather than a CPU poll count.
+  Copied RX carries the immutable scan program/caps through the last policy
+  read before its stack callback, including an off-channel restriction that
+  leaves the associated home channel permitted. Retired host closure and
+  repeated retirement cannot update or remove a rebound registration.
+  Failed scan/peer cleanup queues a supervisor bound to the exact Radio and
+  physical generation; raw diagnostic scan errors/cancellation do the same.
+  It makes the generation terminal before detaching expired executable/board
+  scopes. Reset/MMIO and bus-master-disable attempts still require current
+  PCI authority. Native CE park, family-safe reset and a post-reset BME-off
+  attempt run even when the DMA halt acknowledgement is ambiguous. Reclamation
+  requires the original halt plus ordered-flush proof; otherwise DMA stays
+  pinned. A stale request cannot retire a successor. Physical grant loss may
+  deny the attempt; no timeout or reset submission asserts physical RF quiet.
 - RAW/non-PFC images without firmware `NO_PS` expose an awake station
   power-save default and `WirelessNetIface::set_power_save`. The synchronous
   setter records desired intent; the retained async worker submits native
@@ -1250,8 +1307,8 @@ coexistence/occupied-power ownership;
 additional streams and TX STBC (which needs a second selected TX chain;
 LDPC and one-stream RX STBC are implemented above);
 VHT160/80+80 (SISO VHT20/40/80 is implemented); PFC fetch/queue ownership;
-dynamic WMM/protection updates and TSPEC/U-APSD; DFS/indoor/beacon-hint
-qualification; associated/off-channel scanning; hardware key offload;
+AP-side U-APSD under the AP owner; DFS/indoor/beacon-hint
+qualification; remain-on-channel/action-frame control; hardware key offload;
 AP/P2P roles; host-bus PM and wake offload (system suspend is implemented);
 pre-cal/cal-file and DT/NVMEM calibration sources (QCA9887 EEPROM is implemented)
 and automatic credential replay after recovery.

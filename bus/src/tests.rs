@@ -7,6 +7,10 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 extern crate alloc;
 
+#[cfg(feature = "kernel-test")]
+#[path = "pci_pme_tests.rs"]
+mod pci_pme;
+
 /// Restore the live bus registry after a smoke temporarily installs
 /// synthetic devices.  Kernel smokes share one process and therefore one
 /// registry; leaking a fake ECAM address makes later MMIO tests order-

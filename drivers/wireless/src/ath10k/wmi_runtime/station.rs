@@ -406,6 +406,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.failed {
             return None;
         }
+        self.prepared_peer_snapshot()
+    }
+    pub(super) fn prepared_peer_snapshot(&self) -> Option<PeerPrepared> {
         let peer = self.peer.as_ref()?;
         Some(PeerPrepared {
             bssid: peer.bssid,
@@ -770,6 +773,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.station_event(event)
     }
     pub(super) fn station_event(&mut self, event: htt::Event) -> Result<htt::Event, Error> {
+        self.observe_dwell_scan(&event)?;
         if let htt::Event::Wmi(bytes) = &event {
             if self.wire.dialect == Dialect::Tlv {
                 if let Some(reports) = management::completions(bytes)? {

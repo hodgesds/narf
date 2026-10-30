@@ -41,3 +41,6 @@ Deliberately out of scope here: the AML bytecode interpreter itself
 This crate is `no_std`. It builds on `narf-memory` for physical-address
 handling, `narf-arch` for architecture glue, and `narf-lib` for the
 per-CPU and locking primitives that guard the shared topology tables.
+
+The fixed-FADT wake lease and SCI observation contract is specified in
+[Fixed-FADT GPE wake](specification/gpe-wake.md).

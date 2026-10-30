@@ -173,6 +173,7 @@ impl Owner {
             || nvm.tx_chains != original.tx_chains
             || nvm.rx_chains != original.rx_chains
             || nvm.phy != original.phy
+            || nvm.he != original.he
         {
             return Err("MVM recovery changed NVM identity");
         }

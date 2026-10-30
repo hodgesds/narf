@@ -11,6 +11,9 @@ use alloc::vec::Vec;
 
 use crate::{AmlError, AmlNode, NameValue, NodeKind, Value};
 
+#[path = "strict.rs"]
+pub mod strict;
+
 // ── Opcode constants ─────────────────────────────────────────────────────────
 
 const ZERO_OP: u8 = 0x00;

@@ -49,6 +49,7 @@ enum Fault {
     HoldRemoval,
     HoldRxFence,
     HoldGroupReply,
+    HoldScan,
 }
 
 struct Wire {
@@ -190,6 +191,7 @@ impl Wire {
                     "Sc MCC source/country",
                 )?;
                 response.resize(24 + 14 * 4, 0);
+                response[4..6].copy_from_slice(&body[..2]);
                 response[20..24].copy_from_slice(&14u32.to_le_bytes());
                 for i in 0..14 {
                     response[24 + i * 4..28 + i * 4].copy_from_slice(&13u32.to_le_bytes());
@@ -292,6 +294,10 @@ impl Wire {
             )?,
             (1, 0x77) => require(body == [0; 4], "Sc continuously awake defaults")?,
             _ => return Err("unexpected command in Sc composition"),
+        }
+        if (group, cmd) == (1, 0xd) && self.fault == Fault::HoldScan {
+            self.held = Some((cmd, group, sequence));
+            return Ok(());
         }
         self.firmware
             .inject(cmd, if group == 1 { 0 } else { group }, sequence, &response);
@@ -543,6 +549,7 @@ fn run<F: Future>(future: F, mut progress: impl FnMut() -> R<bool>) -> R<F::Outp
 
 struct Guard {
     device: Option<Arc<Device>>,
+    policy_db: Arc<narf_wireless::reg::db::Database>,
     #[cfg(feature = "kernel-test")]
     owner: Option<narf_wireless::nl80211::ConnectionOwnerFixture>,
 }
@@ -627,6 +634,7 @@ impl Guard {
             beacons: Vec::new(),
             connection: None,
             needs_reset: false,
+            stop_completed: false,
             producer: Some(rx_producer),
             receive_ipc: None,
             eapol: VecDeque::new(),
@@ -640,14 +648,19 @@ impl Guard {
             IrqSafeSpinLock::new(Some(producer))
         });
         let source = state.hardware.source_fence()?;
+        let policy_db = Arc::new(narf_wireless::reg::db::Database::new());
+        policy_db.install(policy());
         let device = Arc::new(Device {
             test_name: name,
             state: Mutex::new(state),
             control: Mutex::new(None),
             publication: AtomicBool::new(true),
             source,
+            policy: super::super::mld_policy::Source::database(policy_db.clone()),
+            policy_fence: IrqSafeSpinLock::new(None),
             generation: Arc::new(AtomicU64::new(0)),
             quarantined: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
             admission: IrqSafeSpinLock::new(()),
             mac: OWN,
@@ -671,6 +684,7 @@ impl Guard {
         narf_net::iface::install_rx_drain(drain);
         Ok(Self {
             device: Some(device),
+            policy_db,
             #[cfg(feature = "kernel-test")]
             owner: None,
         })
@@ -757,8 +771,8 @@ fn request(secured: bool) -> AssociateRequest {
         ie: Vec::new(),
     }
 }
-fn scan(device: &Device) -> R {
-    let request = ScanRequest {
+fn scan_request() -> ScanRequest {
+    ScanRequest {
         ssids: vec![SSID.to_vec()],
         channels: vec![6],
         frequencies_mhz: vec![2437],
@@ -768,8 +782,10 @@ fn scan(device: &Device) -> R {
         duration_tu: None,
         duration_mandatory: false,
         extra_ies: Vec::new(),
-    };
-    let bss = run(device.scan(request), service)?.map_err(|_| "Sc native scan failed")?;
+    }
+}
+fn scan(device: &Device) -> R {
+    let bss = run(device.scan(scan_request()), service)?.map_err(|_| "Sc native scan failed")?;
     require(
         bss.len() == 1 && bss[0].bssid == AP && bss[0].ssid == SSID && bss[0].channel == 6,
         "Sc native scan did not populate association identity",
@@ -1383,4 +1399,234 @@ fn smoke_sc_socket_owner_close_waits_for_native_m4_then_tears_down() -> TestResu
 kernel_test_in!(
     "drivers/wireless/iwlwifi/dhcp",
     smoke_sc_socket_owner_close_waits_for_native_m4_then_tears_down
+);
+
+fn smoke_sc_current_policy_mcc_epoch_and_pending_native_configuration() -> TestResult {
+    check(|| {
+        let guard = Guard::new(false, Fault::None)?;
+        let device = guard.device();
+        scan(device)?;
+        run(
+            device.associate_in_domain(request(false), &policy()),
+            service,
+        )?
+        .map_err(|_| "Sc policy association failed")?;
+        require(device.link_up(), "Sc policy fixture did not associate")?;
+        // Correlated MCC facts cannot survive a CHUB notification, even
+        // when the host's country and rules are unchanged.
+        HARNESS
+            .lock()
+            .as_mut()
+            .unwrap()
+            .1
+            .firmware
+            .inject(0xc9, 0, 0x8000, &[b'S', b'U', 2, 0]);
+        for _ in 0..4 {
+            device.step(None);
+        }
+        require(!device.link_up(), "Sc CHUB notification retained carrier")?;
+        {
+            let state = device
+                .state
+                .try_lock()
+                .ok_or("Sc policy stop not terminal")?;
+            require(
+                state.needs_reset && state.stop_completed && state.hardware.is_failed(),
+                "Sc MCC loss did not complete retained transport stop",
+            )?;
+        }
+        drop(guard);
+        let guard = Guard::new(true, Fault::HoldM4)?;
+        let device = guard.device();
+        scan(device)?;
+        let domain = policy();
+        let mut association = Box::pin(device.associate_in_domain(request(true), &domain));
+        let deadline = narf_time::Deadline::after_ms(3000);
+        loop {
+            if association
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+            {
+                return Err("Sc held-M4 policy fixture completed early");
+            }
+            service()?;
+            if HARNESS.lock().as_ref().unwrap().1.held_tx.is_some() {
+                break;
+            }
+            if deadline.expired() {
+                return Err("Sc policy test did not reach native M4");
+            }
+            narf_scheduler::sleep_pumps::run();
+        }
+        let mut replacement = policy();
+        replacement.rules[0].max_power_dbm -= 1;
+        guard.policy_db.install(replacement);
+        require(
+            matches!(
+                association
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(_))
+            ),
+            "Sc configuration accepted changed installed policy",
+        )?;
+        drop(association);
+        for _ in 0..4 {
+            device.step(None);
+        }
+        require(
+            !device.link_up(),
+            "Sc policy change during M4 admitted carrier",
+        )?;
+        let state = device
+            .state
+            .try_lock()
+            .ok_or("Sc held-M4 stop still busy")?;
+        require(
+            state.needs_reset
+                && state.stop_completed
+                && super::super::runtime::model::retained(&state.hardware).2 > 0,
+            "Sc held native M4 DMA was released after policy loss",
+        )?;
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/policy",
+    smoke_sc_current_policy_mcc_epoch_and_pending_native_configuration
+);
+
+fn smoke_sc_dropped_public_scan_retains_native_command_until_transport_stop() -> TestResult {
+    check(|| {
+        let guard = Guard::new(false, Fault::HoldScan)?;
+        let device = guard.device();
+        let mut scan = Box::pin(device.scan(scan_request()));
+        let deadline = narf_time::Deadline::after_ms(3000);
+        loop {
+            require(
+                scan.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending(),
+                "Sc held scan completed early",
+            )?;
+            service()?;
+            if HARNESS.lock().as_ref().unwrap().1.held.is_some() {
+                break;
+            }
+            if deadline.expired() {
+                return Err("Sc held scan command was not published");
+            }
+            narf_scheduler::sleep_pumps::run();
+        }
+        drop(scan);
+        {
+            let state = device
+                .state
+                .try_lock()
+                .ok_or("Sc dropped scan retained caller lock")?;
+            require(
+                state.needs_reset && model::retained(&state.hardware).0 == 1,
+                "Sc dropped scan discarded pending native DMA",
+            )?;
+        }
+        let commands = HARNESS.lock().as_ref().unwrap().1.commands.len();
+        for _ in 0..4 {
+            device.step(None);
+        }
+        let state = device
+            .state
+            .try_lock()
+            .ok_or("Sc scan stop remains unowned")?;
+        require(
+            state.stop_completed
+                && state.hardware.is_failed()
+                && !device.link_up()
+                && model::retained(&state.hardware).0 == 1
+                && HARNESS.lock().as_ref().unwrap().1.commands.len() == commands,
+            "Sc scan cancellation resumed emission or released uncertain command DMA",
+        )?;
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/policy",
+    smoke_sc_dropped_public_scan_retains_native_command_until_transport_stop
+);
+
+fn smoke_sc_dropped_close_waiter_after_m4_request_still_retires_native_station() -> TestResult {
+    check(|| {
+        let guard = Guard::new(true, Fault::HoldM4)?;
+        let device = guard.device();
+        scan(device)?;
+        let domain = policy();
+        let mut association = Box::pin(device.associate_in_domain(request(true), &domain));
+        let mut cx = Context::from_waker(Waker::noop());
+        let deadline = narf_time::Deadline::after_ms(3000);
+        loop {
+            require(
+                association.as_mut().poll(&mut cx).is_pending(),
+                "Sc close-drop setup completed before held M4",
+            )?;
+            service()?;
+            if HARNESS.lock().as_ref().unwrap().1.held_tx.is_some() {
+                break;
+            }
+            if deadline.expired() {
+                return Err("Sc close-drop fixture did not reach M4");
+            }
+            narf_scheduler::sleep_pumps::run();
+        }
+        let mut close = Box::pin(device.disassociate());
+        require(
+            close.as_mut().poll(&mut cx).is_pending(),
+            "Sc close did not wait for the native M4 owner",
+        )?;
+        drop(close);
+        require(
+            device.closing.load(Ordering::Acquire) && !device.link_up(),
+            "Sc dropped close waiter lost its terminal request",
+        )?;
+        {
+            let mut slot = HARNESS.lock();
+            let wire = &mut slot.as_mut().unwrap().1;
+            let (queue, pointer) = wire.held_tx.take().ok_or("Sc held M4 absent")?;
+            wire.fault = Fault::None;
+            wire.firmware.tx_complete(queue, pointer);
+        }
+        require(
+            run(association.as_mut(), service)?.is_err(),
+            "Sc dropped close admitted stale carrier",
+        )?;
+        drop(association);
+        let deadline = narf_time::Deadline::after_ms(3000);
+        loop {
+            service()?;
+            device.step(None);
+            if !device.closing.load(Ordering::Acquire) {
+                break;
+            }
+            if deadline.expired() {
+                return Err("Sc retained close did not finish native retirement");
+            }
+            narf_scheduler::sleep_pumps::run();
+        }
+        let state = device
+            .state
+            .try_lock()
+            .ok_or("Sc retained close still owns state")?;
+        require(
+            state.connection.is_none()
+                && !state.needs_reset
+                && !state.hardware.is_failed()
+                && model::retained(&state.hardware) == (0, 0, 0)
+                && !device.link_up(),
+            "Sc dropped close waiter reset or leaked healthy native owners",
+        )?;
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/policy",
+    smoke_sc_dropped_close_waiter_after_m4_request_still_retires_native_station
 );

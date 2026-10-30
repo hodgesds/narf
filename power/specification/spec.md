@@ -164,9 +164,12 @@ pub async fn suspend(target: SuspendTarget, cap: &Cap<Power, Suspend>) -> Suspen
 
 pub trait AsyncSystemPm: Send + Sync {
     fn prepare_suspend(&self) -> SystemPmFuture<'_>;
+    fn prepare_suspend_target(&self, target: SystemSleepState) -> SystemPmFuture<'_>;
     fn resume_from_suspend(&self) -> SystemPmFuture<'_>;
 }
+pub enum SystemSleepState { S0Idle, S3 }
 pub fn register_async_system_pm(name: &str, ops: Arc<dyn AsyncSystemPm>);
+pub async fn prepare_async_system_pm_for(target: SystemSleepState) -> AsyncSystemPmTransition;
 pub async fn suspend_async(cap: &Cap<Power, Invoke>) -> Result<(), SuspendError>;
 
 pub enum SuspendTarget { Freeze, StandbyS1, SuspendToRamS3, SuspendToDiskS4 }
@@ -189,6 +192,93 @@ child after the synchronous fan-out has restored PCI/platform delivery. The
 registry snapshots its entries and releases its lock before every await. A
 failed prepare must leave its own device usable; the coordinator resumes every
 earlier successful hook before it returns `SuspendError::Aborted`.
+
+The coordinator passes its actual target: s2idle uses `S0Idle`, suspend-to-RAM
+uses `S3`. `prepare_suspend_target` defaults to the existing no-argument
+preparation so current drivers retain their behavior. The legacy
+`prepare_async_system_pm()` entry remains the S3 wrapper. Firmware wake
+owners use the target for `_DSW(enable,Sx,Dx)` instead of guessing it from
+callback order. Platform composition schedules the asynchronous entry from
+the executor; an interrupt-driven driver must never use a nested `block_on`.
+
+The `wake-test` profile provides `unsafe system_pm::__test_registry_scope`:
+its guard temporarily owns and restores only asynchronous PM registrations.
+The caller serializes registration and drives all created transitions to
+terminal completion before Drop. Scheduler initialization and queued tasks
+are not reset by this fixture.
+This profile forwards only the required bus/ACPI/AML wake fixtures; it does
+not activate token/TPM fixture providers. The existing `kernel-test` profile
+retains those independent providers and includes the wake tests as well.
+
+### 3.3a Firmware-owned PCI wake routes
+
+`pci_wake::install_authority(&Cap<Power, Grant>)` retains the platform
+composition root's already-issued grant. `PciWake::discover(endpoint_cap,
+device)` requires the driver's existing `Cap<BusDeviceCap, Write>` and that
+installed grant. It reads actual PCI topology under current endpoint
+invocation, matches one exact AML `PNP0A03`/`PNP0A08` root by `_SEG`/`_BBN`,
+and follows immediate `_ADR` children for the actual devfn hops. The nearest
+exact endpoint/ancestor `_PRW`, including the actual host-bridge fallback,
+must contain exactly two integers: fixed-FADT GPE number and deepest S-state.
+Ambiguous roots/functions, external GPE-device references and power-resource
+packages are refused. No suffix-matched name or board-profile GPE can supply
+a route. An installed SCI and validated byte-port FADT GPE are required.
+Discovery evaluates firmware objects inside the granted Power operation and
+defers explicit PME/GPE arming. Firmware methods used by `_ADR`, `_PRW` or
+other metadata objects may themselves have supported side effects; discovery
+does not promise a read-only firmware interpreter.
+Route objects and firmware wake methods use `narf_aml::eval::strict`, whose
+bounded profile propagates helper/OpRegion errors and refuses unsupported
+instructions. The compatibility evaluator's best-effort result is never a
+wake receipt.
+
+As with the existing bus config-space interface, the trusted driver binding
+must supply an endpoint capability and `BusDevice` for the same exclusively
+owned function. The current `BusDeviceCap` has no recorded PCI-address binding;
+its invocation validates the capability epoch without proving that pairing.
+Exact AML topology resolution does not replace this caller precondition.
+The endpoint's grant cannot authorize another PCI function or a Root Port.
+
+`PciWake::arm(SleepState, pci::pme::WakeState)` checks both current grants,
+the actual PME-support bit and `_PRW` sleep bound. It retains the GPE lease,
+calls `_DSW(1,Sx,Dx)` or `_PSW(1)` only when `_DSW` is absent, and enables the
+endpoint PME source with native readback. Both firmware methods may be absent;
+an existing failing method is a failure. The GPE lease preserves pre-existing
+and subsequently requested runtime enables. D3cold is refused because the
+power-resource/auxiliary-supply owner is absent. The route owner does not
+change D-state, claim native Root Port PME service or write a bridge through
+an endpoint capability. The current platform has no native PCIe-PME `_OSC`
+takeover; this API is specifically the firmware-owned route.
+
+GPE ownership is established before firmware routing and endpoint PME enable:
+this reserves the shared bit before side effects, preserves an existing
+runtime event, and captures early SCI delivery. Only disabled stale status
+is cleared, before the endpoint source is enabled. This order prevents a
+later GPE setup from erasing a newly armed device wake event; it does not
+infer Root Port ownership from Linux's native-PME ordering.
+
+`disarm()` reads and disables the exact endpoint source, disables firmware
+wake and releases its exact GPE lease. `WakeEvidence` reports only observed
+PME_Status/GPE delivery, which cannot identify a packet or prove a firmware
+trigger. Every stage and granted capability stays retained on failure;
+dropping an owner attempts synchronous cleanup and quarantines its remaining
+ownership if cleanup fails. Callers must complete cleanup before a new
+normal device generation. `quarantined_count()` exposes the retained failures.
+Observed evidence remains attached to the owner through rollback and repeated
+cleanup; only a new arm starts a new observation cycle.
+PME observations are retained independently of the terminal disable result.
+GPE observation reset/consumption occurs within the ACPI lease's exclusive
+claim/release handoff, so failed second claims and old host cleanup cannot
+erase another generation's observed wake.
+
+The SCI hard-IRQ path calls `note_gpe_irq` before deferring AML. It performs
+atomic recording and latches s2idle wake only for a currently leased GPE.
+Recorded leased-GPE evidence survives the park entry's generic-latch clear
+until terminal cleanup; SCI has already W1C-cleared its physical status and
+must not be assumed to retrigger it. This adds no aarch64 wake route: fixed
+FADT byte-port GPE/SCI ownership is currently x86_64-only, and the existing
+aarch64 production s2idle gate remains closed. A route alone does not
+implement a wireless driver's associated suspend, offloads or secure resume.
 
 `suspend::suspend_async(&Cap<Power, Invoke>)` is the required entry point for
 drivers whose suspend protocol waits on firmware interrupts. `suspend` remains
@@ -1267,25 +1357,16 @@ The energy curves are populated from CPUID (x86_64) /
 PSCI/SCMI (aarch64) at boot. Platforms without published
 curves get a heuristic default (linear power vs. freq).
 
-### 8.3 AML evaluation (resolved)
+### 8.3 AML evaluation (current implementation)
 
-**Decision:** **NARF does not execute AML**, mirroring
-`bus/spec` §11.1. This loses some PM features on legacy
-platforms (S3 wake notifications, dynamic DVFS tables on
-older Intel) but keeps the kernel free of an AML interpreter
-attack surface.
-
-PM info comes from:
-- ACPI tables: FADT, MADT, SRAT, MCFG, HPET (no AML).
-- ACPI _PSS / _CST tables that are static-data variants.
-- Devicetree `cpu-supply`, `operating-points`, `power-domains`
-  on aarch64.
-- SCMI for runtime-negotiated PM on SCMI-capable platforms.
-
-Platforms that require AML for PM functionality run with
-reduced PM support (no DVFS, no per-device runtime PM).
-Mainstream server x86_64 + modern aarch64 SoCs are fine; old
-desktop ACPI-heavy systems are second-class.
+The earlier no-AML design decision is superseded by the in-tree
+`narf_aml` evaluator and production platform providers. Battery, AC, lid,
+thermal and fan drivers evaluate firmware methods. The PCI wake owner also
+evaluates exact `_PRW`, `_DSW` and `_PSW` objects under the platform's current
+Power grant. Unsupported firmware forms fail closed; the interpreter's
+existence does not establish arbitrary power-resource, D3cold or external-GPE
+support. Static ACPI tables, Devicetree and SCMI remain independent sources
+for the platform paths that use them.
 
 ### 8.4 S3 vs modern standby (resolved)
 

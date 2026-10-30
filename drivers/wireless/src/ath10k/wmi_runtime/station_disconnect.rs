@@ -17,7 +17,22 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// matching VDEV_STOPPED event. DMA remains retained through full reset.
     /// Unversioned firmware events do not fence another join on this owner.
     pub async fn disconnect_station(&mut self) -> Result<Disconnected, Error> {
-        let prepared = self.prepared_peer().ok_or(Error::Failed)?;
+        self.disconnect_station_inner(false).await
+    }
+    /// Only the retained failed-scan worker calls this after the matching
+    /// scan terminal. Do not emit deauthentication after an RF-policy loss.
+    pub(in crate::ath10k::wmi_runtime) async fn disconnect_after_failed_scan(
+        &mut self,
+    ) -> Result<Disconnected, Error> {
+        self.disconnect_station_inner(true).await
+    }
+    async fn disconnect_station_inner(&mut self, failed_scan: bool) -> Result<Disconnected, Error> {
+        let prepared = if failed_scan {
+            self.prepared_peer_snapshot()
+        } else {
+            self.prepared_peer()
+        }
+        .ok_or(Error::Failed)?;
         let synchronous_delete = self
             .wire
             .sync_delete_required(self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?);
@@ -25,7 +40,11 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let delete = self.wire.delete_peer(prepared.bssid)?;
         let stop = self.wire.stop_station()?;
         // Protected with the still-installed PTK before the owner fails.
-        let deauthentication = self.pmf_deauthentication()?;
+        let deauthentication = if failed_scan {
+            None
+        } else {
+            self.pmf_deauthentication()?
+        };
         // This happens before any await, including receive quiescence. A
         // cancelled waiter can never restore association or replay DELETE.
         self.failed = true;

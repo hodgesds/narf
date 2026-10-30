@@ -457,6 +457,10 @@ fn record_gpe_bits_irq(block: narf_acpi::GpeBlockInfo) {
                 continue;
             }
             let gpe_num = block.base_gsi + (byte_idx as u32 * 8) + bit;
+            // A parked executor cannot run deferred AML/notify. The real
+            // platform wake lease's atomic observer must latch here, while
+            // SCI is still deliverable through the s2idle IRQ allowlist.
+            narf_power::pci_wake::note_gpe_irq(gpe_num);
             // W1C-clear immediately so the line deasserts.
             narf_acpi::gpe_status_clear_bit(gpe_num);
             // Record for the drain task (GPEs 0..127 only;

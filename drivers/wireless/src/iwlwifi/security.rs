@@ -1,4 +1,4 @@
-//! WPA2-PSK/CCMP EAPOL processing for the live station path.
+//! Negotiated PSK/SAE CCMP EAPOL processing for the live station path.
 //! Authenticate the original wire PDU before changing replay/key state.
 //! Retransmissions return cached replies without reinstalling keys.
 
@@ -28,7 +28,7 @@ pub struct KeyUpdate {
     pub group_id: u8,
     pub group_rx_pn: u64,
     /// 802.11w Integrity GTK (BIP-CMAC-128) + its key index, present only
-    /// when management-frame protection was negotiated (WPA3-SAE).
+    /// when management-frame protection was negotiated (PSK or SAE).
     /// IGTK material, key index and the KDE IPN (receive replay floor).
     pub igtk: Option<([u8; 16], u16, u64)>,
 }
@@ -61,9 +61,13 @@ pub enum Akm {
     /// WPA2-Personal (00-0F-AC:2): HMAC-SHA1 PRF + HMAC-SHA1-128 MIC,
     /// Key Descriptor Version 2.
     Wpa2Psk,
+    /// PSK-SHA256 (AKM6), SHA-256 KDF and AES-CMAC MIC, descriptor3.
+    Wpa2PskSha256,
     /// WPA3-Personal SAE (00-0F-AC:8): SHA-256 KDF + AES-128-CMAC MIC,
     /// Key Descriptor Version 0, management-frame protection required.
     Wpa3Sae,
+    /// SAE-EXT-KEY group19 (AKM24): SHA-256 KDF and HMAC-SHA256-128 MIC.
+    Wpa3SaeExtKey,
 }
 
 impl Akm {
@@ -71,7 +75,8 @@ impl Akm {
     fn ki_version(self) -> u16 {
         match self {
             Akm::Wpa2Psk => KI_VERSION_HMAC_SHA1_AES,
-            Akm::Wpa3Sae => 0,
+            Akm::Wpa2PskSha256 => KI_VERSION_AES_128_CMAC,
+            Akm::Wpa3Sae | Akm::Wpa3SaeExtKey => 0,
         }
     }
 
@@ -87,21 +92,41 @@ impl Akm {
         match self {
             Akm::Wpa2Psk => wpa::derive_ptk_sha1(pmk, aa, sa, anonce, snonce, tk_len),
             Akm::Wpa3Sae => wpa::derive_ptk_sha256(pmk, aa, sa, anonce, snonce, tk_len),
+            Akm::Wpa2PskSha256 => {
+                wpa_pmk_to_ptk(KeyMgmt::PskSha256, pmk, aa, sa, anonce, snonce, tk_len)
+            }
+            Akm::Wpa3SaeExtKey => {
+                wpa_pmk_to_ptk(KeyMgmt::SaeExtKey, pmk, aa, sa, anonce, snonce, tk_len)
+            }
         }
     }
 
     fn mic(self, kck: &[u8], eapol_with_zero_mic: &[u8]) -> [u8; 16] {
         match self {
             Akm::Wpa2Psk => handshake::compute_mic(kck, eapol_with_zero_mic),
-            Akm::Wpa3Sae => wpa::compute_mic_cmac(kck, eapol_with_zero_mic),
+            Akm::Wpa3Sae | Akm::Wpa2PskSha256 => wpa::compute_mic_cmac(kck, eapol_with_zero_mic),
+            Akm::Wpa3SaeExtKey => narf_crypto::hkdf::hmac_sha256(kck, eapol_with_zero_mic)[..16]
+                .try_into()
+                .unwrap(),
         }
     }
 
     /// The STA's own RSN IE body, echoed in M2 and checked by the AP.
-    fn sta_rsn_ie(self) -> Vec<u8> {
+    pub(super) fn sta_rsn_ie(self) -> Vec<u8> {
         match self {
             Akm::Wpa2Psk => narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body(),
             Akm::Wpa3Sae => narf_wireless::rsn::RsnIe::wpa3_sae_ccmp().encode_body(),
+            Akm::Wpa2PskSha256 | Akm::Wpa3SaeExtKey => {
+                let mut rsn = if self == Akm::Wpa2PskSha256 {
+                    narf_wireless::rsn::RsnIe::wpa2_psk_ccmp()
+                } else {
+                    narf_wireless::rsn::RsnIe::wpa3_sae_ccmp()
+                };
+                rsn.akms = alloc::vec![narf_wireless::rsn::Suite::standard(
+                    if self == Akm::Wpa2PskSha256 { 6 } else { 24 }
+                )];
+                rsn.encode_body()
+            }
         }
     }
 }
@@ -448,6 +473,7 @@ mod tests {
 
 pub struct Session {
     akm: Akm,
+    pmf: bool,
     pmk: [u8; 32],
     ap: [u8; 6],
     local: [u8; 6],
@@ -497,6 +523,7 @@ impl Session {
     ) -> Self {
         Self {
             akm,
+            pmf: matches!(akm, Akm::Wpa3Sae | Akm::Wpa3SaeExtKey),
             pmk,
             ap,
             local,
@@ -516,6 +543,11 @@ impl Session {
 
     pub fn complete(&self) -> bool {
         self.complete
+    }
+    /// PMF is negotiated by the RSNE, independently of the PSK/SAE AKM.
+    pub(super) fn with_pmf(mut self, pmf: bool) -> Self {
+        self.pmf = pmf;
+        self
     }
 
     /// Echo `rsn` (the exact association-request RSNE body) in message 2
@@ -565,6 +597,7 @@ impl Session {
                     self.ap_rsn.clone(),
                 ));
                 candidate.sta_rsn = self.sta_rsn.clone();
+                candidate.pmf = self.pmf;
                 let reply = candidate.process_inner(pdu)?;
                 self.pending_rekey = Some(candidate);
                 return Ok(reply);
@@ -706,14 +739,13 @@ impl Session {
             if pn >> 48 != 0 {
                 return Err("invalid GTK replay counter");
             }
-            // WPA3 negotiates management-frame protection, so the initial
-            // M3 must carry the IGTK (BIP-CMAC-128). Group rekeys may omit
-            // it. WPA2 never installs an IGTK.
-            let igtk = if self.akm == Akm::Wpa3Sae {
+            // A PMF association requires its initial IGTK irrespective of
+            // AKM. Group rekeys may retain the already-installed IGTK.
+            let igtk = if self.pmf {
                 match rekey::parse_igtk_kde(&clear) {
                     Some(kde) => Some((kde.igtk, kde.key_id, kde.ipn)),
                     None if pairwise_message && !self.complete => {
-                        return Err("WPA3 message 3 lacks IGTK")
+                        return Err("PMF message 3 lacks IGTK")
                     }
                     None => None,
                 }

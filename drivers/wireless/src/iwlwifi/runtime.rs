@@ -8,6 +8,34 @@ use narf_lib::id::DomainId;
 
 use super::{boot_context, rx, rx_rfh, transport::IwlMmio, tx_gen2, ParsedUcode};
 
+/// A native IRQ/timer wait whose current source/RF authority is checked
+/// on every poll. Revocation completes the wait immediately so its owner
+/// reaches `Hardware::poll` and the retained stop path without timer lag.
+pub struct Activity {
+    inner: super::iwl_msix::Activity,
+    source: Result<source::Fence, &'static str>,
+}
+impl core::fmt::Debug for Activity {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("IwlNativeActivity").finish_non_exhaustive()
+    }
+}
+impl core::future::Future for Activity {
+    type Output = ();
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        if match &self.source {
+            Ok(source) => source.invoke(|| Ok(())).is_err(),
+            Err(_) => true,
+        } {
+            return core::task::Poll::Ready(());
+        }
+        core::future::Future::poll(core::pin::Pin::new(&mut self.inner), cx)
+    }
+}
+
 pub const RX_DEPTH: usize = 512;
 pub const COMMAND_DEPTH: usize = 128;
 pub const RX_BUFFER_BYTES: usize = 4096;
@@ -574,6 +602,7 @@ pub struct Hardware {
     protected_tx: u64,
     rx_epoch: rx_epoch::State,
     sources: Option<source::Assets>,
+    rf_policy: Option<super::mld_policy::Authority>,
 }
 
 impl core::fmt::Debug for Hardware {
@@ -671,6 +700,7 @@ impl Hardware {
             protected_tx: 0,
             rx_epoch: rx_epoch::State::default(),
             sources: None,
+            rf_policy: None,
         })
     }
 
@@ -767,8 +797,11 @@ impl Hardware {
 
     /// Capture the IRQ count before polling completions, including when
     /// the command caller owns the device mutex across this wait.
-    pub fn activity(&self) -> super::iwl_msix::Activity {
-        super::iwl_msix::Activity::new(self.irq_vector(), 10)
+    pub fn activity(&self) -> Activity {
+        Activity {
+            inner: super::iwl_msix::Activity::new(self.irq_vector(), 10),
+            source: self.source_fence(),
+        }
     }
 
     async fn sample_delay() {
@@ -1067,6 +1100,12 @@ impl Hardware {
         let capture = self.rx_epoch.capture();
         for mut packet in self.resources.rx.drain(&mut self.mmio)? {
             packet.receive_epoch = capture;
+            if packet.header.group_id == 0 && packet.header.cmd == 0xc9 {
+                if let Some(policy) = &self.rf_policy {
+                    policy.invalidate();
+                    return Err("Intel native MCC changed during retained RF policy");
+                }
+            }
             if packet.header.group_id == 0 && packet.header.cmd == 0xc5 {
                 if !matches!(self.version(0, 0xc5).map(|v| v.1), Some(4 | 6 | 7)) {
                     return Err("unsupported compressed BA notification");
@@ -1296,6 +1335,26 @@ impl Hardware {
         self.protected_tx
     }
 
+    pub(super) fn install_rf_policy(
+        &mut self,
+        policy: super::mld_policy::Authority,
+    ) -> Result<(), &'static str> {
+        policy.check()?;
+        self.rf_policy = Some(policy);
+        Ok(())
+    }
+    pub(super) fn rf_policy_validity(&self) -> Result<super::mld_policy::Validity, &'static str> {
+        self.rf_policy
+            .as_ref()
+            .map(super::mld_policy::Authority::validity)
+            .ok_or("Intel native RF policy owner absent")
+    }
+    pub(super) fn clear_rf_policy(&mut self) {
+        if let Some(policy) = self.rf_policy.take() {
+            policy.invalidate();
+        }
+    }
+
     pub fn fail(&mut self) {
         self.failed = true;
         self.rx_epoch.deny();
@@ -1315,13 +1374,14 @@ impl Hardware {
     /// are retained (DMA is provably stopped) until the resume restart
     /// replaces them, or final teardown frees them.
     pub async fn stop_for_suspend(&mut self) -> Result<(), &'static str> {
+        self.clear_rf_policy();
         self.fail();
         if let Some(interrupts) = &mut self.interrupts {
             interrupts.mask();
         }
         self.mmio.write(super::regs::CSR_INT_MASK, 0);
         let bz = self.format == rx_rfh::CompletionFormat::Bz;
-        if self.armed {
+        let stopped = if self.armed {
             let (register, request, done) = if bz {
                 (super::regs::CSR_GP_CNTRL, 1 << 29, 1 << 28)
             } else {
@@ -1329,18 +1389,50 @@ impl Hardware {
             };
             let value = self.mmio.read(register);
             self.mmio.write(register, value | request);
-            self.poll_register(register, done, done, 100).await?;
-        }
-        // CSR_GP_CNTRL_REG_FLAG_SW_RESET (bit 31) on Bz+, else
-        // CSR_RESET_REG_FLAG_SW_RESET (bit 7).
-        let (register, reset) = if bz {
+            // Keep the bounded proof result, but never let an ambiguous
+            // engine ACK skip the independent RF-reset/BME-off attempts.
+            let result = self.poll_register(register, done, done, 100).await;
+            if bz {
+                // Linux iwl_pcie_apm_stop_master waits10..20ms after its Bz
+                // stop attempt, including timeout, before the SW reset.
+                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(10_000_000)).await;
+            }
+            result
+        } else {
+            Ok(())
+        };
+        let authority = self.authority(false);
+        let device = self.device;
+        let cap = self.cap;
+        self.finish_stop(stopped, || {
+            if authority.native {
+                super::mmio::set_master(&device, &cap, false)
+            } else {
+                // Explicit RAM backend: invoke its real PCI capability;
+                // the fixture owns no physical config space or bus master.
+                authority.invoke(|| Ok(()))
+            }
+        })
+    }
+
+    fn finish_stop(
+        &mut self,
+        stopped: Result<(), &'static str>,
+        disable_master: impl FnOnce() -> Result<(), &'static str>,
+    ) -> Result<(), &'static str> {
+        // Always attempt the physical RF reset and BME disable, as Linux
+        // does after iwl_pcie_apm_stop_master warns about a missing ACK.
+        let (register, reset) = if self.format == rx_rfh::CompletionFormat::Bz {
             (super::regs::CSR_GP_CNTRL, 1 << 31)
         } else {
             (super::regs::CSR_RESET, 1 << 7)
         };
         let value = self.mmio.read(register);
         self.mmio.write(register, value | reset);
-        super::mmio::set_master(&self.device, &self.cap, false)?;
+        disable_master()?;
+        // BME-off/reset do not prove already-issued DMA drained. Keep the
+        // transport armed and every allocation pinned if that ACK was lost.
+        stopped?;
         self.armed = false;
         self.notifications.clear();
         self.responses.clear();
@@ -1349,6 +1441,7 @@ impl Hardware {
     }
 
     pub async fn restart(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
+        self.clear_rf_policy();
         self.fail();
         if let Some(interrupts) = &mut self.interrupts {
             interrupts.mask();
@@ -1803,3 +1896,7 @@ pub(super) mod rx_epoch;
 
 #[path = "runtime_source.rs"]
 pub(super) mod source;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "runtime_stop_tests.rs"]
+mod stop_tests;

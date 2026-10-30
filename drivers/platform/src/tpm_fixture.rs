@@ -2399,8 +2399,17 @@ fn smoke_tpm_tis_multi_command_conversation() -> TestResult {
     });
     narf_scheduler::run_until_empty();
     let stages = *stages.lock();
-    if stages != [true; 6] {
-        return TestResult::Fail("multi-command TIS stage failed (see stage order in source)");
+    if let Some(stage) = stages.iter().position(|passed| !passed) {
+        return TestResult::Fail(
+            [
+                "TIS pre-Startup PCR_Extend did not return Initialize",
+                "TIS Startup(CLEAR) failed",
+                "TIS repeated Startup(CLEAR) was not folded to success",
+                "TIS first authenticated PCR_Extend failed",
+                "TIS PCR read-back did not match the first extend",
+                "TIS second authenticated PCR_Extend failed",
+            ][stage],
+        );
     }
     let after1 = pcr_extend_value(&[0u8; 32], &digest1);
     if dev.pcr(4) != pcr_extend_value(&after1, &digest2) {
