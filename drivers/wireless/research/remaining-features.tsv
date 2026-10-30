@@ -67,32 +67,27 @@ cyw43439	transport_reset	Confirmed native transport reset	feature	drivers/wirele
 cyw43439	virtual_interfaces	Additional virtual interfaces	feature	drivers/wireless/specification/cyw43439.md	519
 cyw43439	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	518
 iwlwifi	ap	AP role	feature	drivers/wireless/specification/iwlwifi.md	2183
-iwlwifi	ax210_station_enablement	AX210 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	2193
-iwlwifi	ax211_station_enablement	AX211 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	2193
-iwlwifi	ax411_station_enablement	AX411 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	2193
-iwlwifi	be200_station_enablement	Bz/BE200 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	2193
+iwlwifi	ax210_station_enablement	AX210 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	2195
+iwlwifi	ax211_station_enablement	AX211 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	2195
+iwlwifi	ax411_station_enablement	AX411 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	2195
+iwlwifi	be200_station_enablement	Bz/BE200 exact native station profile enablement	chip	drivers/wireless/specification/iwlwifi.md	2195
 iwlwifi	eht	EHT on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	2138
-iwlwifi	he	HE on retained Gen3/Sc profiles; qualified Gen2 native station context/TLC/+HTC receive and public capability reporting are implemented and software-validated in iwlwifi.md sections3.44-3.45	feature	drivers/wireless/specification/iwlwifi.md	2134
-iwlwifi	mlo	MLO on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	2138
-iwlwifi	multiple_rx_queues	Multiple RX queues	feature	drivers/wireless/specification/iwlwifi.md	2180
+iwlwifi	he	Sc/MLD HE20/40/80 is implemented and validated; remaining Gen3 AX210/AX211/AX411 station profiles are parked and require their retained active runtime and HE command owner	feature	drivers/wireless/specification/iwlwifi.md	2136
+iwlwifi	mlo	MLO on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	2139
+iwlwifi	multiple_rx_queues	Sc/MLD native RFH/RSS with actual physical rings, per-queue PN/BA and all-queue receive markers is implemented and validated; remaining Gen2 MVM per-queue key/PN/BA owner is unimplemented	feature	drivers/wireless/specification/iwlwifi.md	2182
 iwlwifi	p2p	P2P role	feature	drivers/wireless/specification/iwlwifi.md	2186
-iwlwifi	platform_power_owner	Gen3/Sc native optional ACPI PPAG/SAR/GEO command ownership and live legacy AP Country/Power Constraint/Cisco DTPC bounds are implemented in section3.47, awaiting coordinated native validation; unavailable UEFI acquisition follows Linux optional-input behavior	feature	drivers/wireless/specification/iwlwifi.md	2215
-iwlwifi	rss	Receive-side scaling	feature	drivers/wireless/specification/iwlwifi.md	2180
-iwlwifi	sc_sae_ext_key	Sc SAE-EXT-KEY (AKM24); complete suite-bound H2E Commit/PMKID/RSNXE and native PTK/IGTK receipts are implemented in section3.48, awaiting coordinated native validation	feature	drivers/wireless/specification/iwlwifi.md	2156
-iwlwifi	sc_wpa2_pmf	Sc negotiated WPA2-PMF (AKM2/6), native IGTK and authenticated IPN floor are implemented in section3.48, with bounded per-connection retired-key history; coordinated native validation remains pending	feature	drivers/wireless/specification/iwlwifi.md	2150
-iwlwifi	sched_scan_offload	Scheduled-scan (PNO/net-detect) firmware offload [API available: WirelessNetIface::{sched_scan_support, start_sched_scan, stop_sched_scan} with SchedScanSupport/SchedScanRequest, NL80211_CMD_START/STOP_SCHED_SCAN, nl80211::notify_sched_scan_results/stopped (wireless spec 3.4, Scheduled scan)]	feature	drivers/wireless/specification/iwlwifi.md	2200
-iwlwifi	six_ghz	6GHz operation on applicable 6E/7 profiles [API available: association::Bss.band / channel::Band::Ghz6 / frequency_in, he::HeOperation::six_ghz_operation, association::six_ghz::{admit, admit_with_rule, He6GhzCapability, He6GhzOperation}, reg::PowerType6Ghz + RegFlags::NO_6GHZ_{VLP,AFC}_CLIENT (wireless spec 3, 6 GHz band identity); a 6 GHz JoinPlan is not yet available] [API available: 6 GHz JoinPlan - association::JoinPlan::prepare_6ghz + six_ghz()/SixGhzPlan {operation, power_type, channel/width (SixGhzWidth incl. 320 with EHT), peer/local He6GhzCapability for STA_REC_HE_6G, he/eht}, six_ghz::{SixGhzLocal, plan}, eht::LocalEht::with_320mhz (wireless spec 3, 6 GHz JoinPlan)]	feature	drivers/wireless/specification/iwlwifi.md	2142
-iwlwifi	tx_amsdu	TX A-MSDU on retained Gen3/Sc profiles; bounded qualified Gen2 plaintext batching with firmware key/PN ownership is implemented and software-validated in iwlwifi.md section3.43	feature	drivers/wireless/specification/iwlwifi.md	2162
-iwlwifi	width_160	160MHz operation on applicable profiles	feature	drivers/wireless/specification/iwlwifi.md	2127
-iwlwifi	width_320	320MHz operation on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	2138
+iwlwifi	rss	Sc/MLD native RSS with secure random owner key and immutable indirection is implemented and validated; remaining Gen2 MVM multiple-RX-queue key/PN/BA owner is unimplemented	feature	drivers/wireless/specification/iwlwifi.md	2182
+iwlwifi	sched_scan_offload	Scheduled-scan (PNO/net-detect) firmware offload [API available: WirelessNetIface::{sched_scan_support, start_sched_scan, stop_sched_scan} with SchedScanSupport/SchedScanRequest, NL80211_CMD_START/STOP_SCHED_SCAN, nl80211::notify_sched_scan_results/stopped (wireless spec 3.4, Scheduled scan)]	feature	drivers/wireless/specification/iwlwifi.md	2202
+iwlwifi	six_ghz	6GHz operation on applicable 6E/7 profiles [API available: association::Bss.band / channel::Band::Ghz6 / frequency_in, he::HeOperation::six_ghz_operation, association::six_ghz::{admit, admit_with_rule, He6GhzCapability, He6GhzOperation}, reg::PowerType6Ghz + RegFlags::NO_6GHZ_{VLP,AFC}_CLIENT (wireless spec 3, 6 GHz band identity); a 6 GHz JoinPlan is not yet available] [API available: 6 GHz JoinPlan - association::JoinPlan::prepare_6ghz + six_ghz()/SixGhzPlan {operation, power_type, channel/width (SixGhzWidth incl. 320 with EHT), peer/local He6GhzCapability for STA_REC_HE_6G, he/eht}, six_ghz::{SixGhzLocal, plan}, eht::LocalEht::with_320mhz (wireless spec 3, 6 GHz JoinPlan)]	feature	drivers/wireless/specification/iwlwifi.md	2143
+iwlwifi	tx_amsdu	TX A-MSDU on retained Gen3/Sc profiles; bounded qualified Gen2 plaintext batching with firmware key/PN ownership is implemented and software-validated in iwlwifi.md section3.43	feature	drivers/wireless/specification/iwlwifi.md	2174
+iwlwifi	width_160	160MHz operation on applicable profiles	feature	drivers/wireless/specification/iwlwifi.md	2129
+iwlwifi	width_320	320MHz operation on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	2139
 iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	2188
-mt76	ap_mode	Access Point mode (mt792x_init_wiphy NL80211_IFTYPE_AP)	feature	drivers/wireless/specification/mt7921.md	1861
 mt76	loadable_packet_abi	Loadable wireless packet ABI	feature	drivers/wireless/specification/mt7921.md	18
-mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	1838
-mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/specification/mt7921.md	1726
-mt76	p2p_mode	P2P client / GO / device roles	feature	drivers/wireless/specification/mt7921.md	1862
-mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	1731
-mt76	wake_on_wireless	Native CONNAC2 magic/disconnect/pattern/current-GTK/NET_DETECT wake, exact PCI/firmware D-state admission and verified-reset fresh-RSNA resume are implemented pending coordinated native execution; optional ARP/NS address updates remain separate	feature	drivers/wireless/specification/mt7921.md	1828
+mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	2009
+mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/specification/mt7921.md	1895
+mt76	p2p_mode	P2P client / GO / device roles	feature	drivers/wireless/specification/mt7921.md	2034
+mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	1902
 rtl8xxxu	additional_operating_channels	Noninitial operating channels and safe FIFO retuning; blocked on per-channel signed N8PC envelope rows beyond channel1 and a FIFO-safe retune while bulk RX is posted, which needs endpoint_reset/slot reuse	feature	drivers/wireless/specification/rtl8xxxu.md	722
 rtl8xxxu	bt_coexistence	Bluetooth coexistence on RTL8723BU; blocked on the rtl8723bu chip runtime	feature	drivers/wireless/specification/rtl8xxxu.md	745
 rtl8xxxu	expanded_active_scanning	Active scanning beyond the initial profile; blocked on additional_operating_channels (retune) and a per-channel probe-request emission envelope	feature	drivers/wireless/specification/rtl8xxxu.md	732

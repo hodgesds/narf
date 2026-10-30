@@ -194,11 +194,26 @@ sleep foundations. Those foundations do not close a driver's native WoW row.
 Sc security, actual platform-power ownership, ROC and chip enablement remain
 tracked separately. Software fixtures confer no physical board acceptance.
 
+**Recount 2026-10-30** (validated Intel/MQ and native MT76 AP checkpoint):
+the ledger now holds **125 `feature`** rows (124 driver,1 shared),
+**35 `chip`** and **0 `unknown`**. Native validation closes Intel's actual
+platform-power owner, Sc WPA2-PMF and SAE-EXT-KEY, and MT76's bounded native
+WoW and AP profiles. Sc HE and multiple RFH queues/RSS are also implemented;
+their family rows retain parked Gen3 HE and Gen2 MVM queue/PN/BA work.
+The canonical runtime source in `ff6a01695` matches the fixed acceptance
+candidate: x86_64 **3824/0/9**, aarch64 **3598/0/5**, each including Intel481
+and MT76 AP22. Both production release boots, two btrfs postflight images
+per architecture, release Clippy contexts and formatting pass. Debug builds
+are omitted by the explicit release-by-default task instruction. These are
+software model/QEMU results; board RF acceptance remains separate.
+RTL8188EE operating-owner replacement is implemented on the branch and
+remains open pending its own native recovery/DHCP acceptance.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 16 | Retained Gen3/Sc platform-power and negotiated security owners, HE/TX A-MSDU and wider bands/widths; AP/P2P/WoW, scheduled scan, multiple RX queues/RSS; additional chip profiles are tracked separately |
+| iwlwifi | 13 | Parked Gen3 HE, Sc TX A-MSDU and wider bands/widths; AP/P2P/WoW, scheduled scan and Gen2 multiple RX queues/RSS; additional chip profiles are tracked separately |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
-| mt76 | 7 | AP/P2P and wake; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA and loadable packet ABI |
+| mt76 | 5 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA and loadable packet ABI |
 | ath10k | 18 | 2.4-GHz HT40/coexistence, additional streams/TX STBC and VHT160/80+80, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload |
 | ath9k | 9 | Channel/retune and HT40/SGI40 profiles, factory selection, periodic calibration, larger TX aggregates and idle/station sleep; other chips are separate rows |
 | rtlwifi | 15 | Other matched chips, broader channels/HT40/VHT, antenna/gain/coexistence, multiple radios, reset/IPS/system PM, RTS/CTS and PCIe ASPM |
