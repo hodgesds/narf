@@ -440,9 +440,14 @@ mod tests {
             };
             let address = |at| u64::from_le_bytes(tfd[at..at + 8].try_into().unwrap());
             if offload != 0x4d00
-                || bytes.len() != mac + 48
+                // The allocator retains whole pages; only the three
+                // independently checked TFD extents are device-visible.
+                || usize::from(u16::from_le_bytes(tfd[2..4].try_into().unwrap()))
+                    + usize::from(u16::from_le_bytes(tfd[12..14].try_into().unwrap()))
+                    + usize::from(u16::from_le_bytes(tfd[22..24].try_into().unwrap()))
+                    != mac + 48
                 || bytes[mac + 24..mac + 26] != [0x80, 0]
-                || bytes[mac + 26..] != body
+                || bytes[mac + 26..mac + 48] != body
                 || tfd[..4] != [3, 0, 20, 0]
                 || tfd[12..14] != [remainder, 0]
                 || tfd[22..24] != [22, 0]

@@ -1091,7 +1091,7 @@ fn route(
             | FRAME
             | EXTERNAL_AUTH
     ) {
-        return mlme_handle(command, bytes, context);
+        return mlme_handle(command, bytes, context, deferred);
     }
     if matches!(
         command,
@@ -1107,7 +1107,7 @@ fn route(
             | station::SET_REKEY_OFFLOAD
     ) || command == SET_STATION && station_iface(bytes, context.net_ns_id)
     {
-        return station_handle(command, bytes, context);
+        return station_handle(command, bytes, context, deferred);
     }
     if command == station::GET_REG {
         return station::get_reg(bytes, dump, context.net_ns_id);
@@ -1682,16 +1682,33 @@ fn station_handle(
     command: u8,
     bytes: &[u8],
     context: RequestContext<'_>,
+    deferred: Option<&narf_net::netlink_generic::DeferredRequest>,
 ) -> Result<Vec<GenlReply>, i32> {
     let attrs = attributes(bytes)?;
-    let (_, iface) = netdev_from_attrs(&attrs, context.net_ns_id)?;
+    let (index, iface) = netdev_from_attrs(&attrs, context.net_ns_id)?;
     if command == station::GET_POWER_SAVE {
         return station::power_save(command, iface, &attrs, context.net_ns_id);
     }
     if command != station::SET_POWER_SAVE {
         station::netdev_up(iface.as_ref())?;
     }
-    let _admin = authority(&context, iface.as_ref())?;
+    let admin = authority(&context, iface.as_ref())?;
+    if matches!(
+        command,
+        station::NEW_KEY | station::SET_KEY | station::DEL_KEY
+    ) && matches!(iface.current_iftype(), 3 | 9)
+        && iface.ap_control_generation().is_some()
+    {
+        let operation = station::native_ap_key(command, iface.as_ref(), &attrs)?;
+        return ap_async::defer(iface, admin, deferred, context.net_ns_id, index, operation);
+    }
+    if command == station::CONTROL_PORT_FRAME
+        && matches!(iface.current_iftype(), 3 | 9)
+        && iface.ap_control_generation().is_some()
+    {
+        let operation = station::native_ap_control(iface.as_ref(), &attrs, &context)?;
+        return ap_async::defer(iface, admin, deferred, context.net_ns_id, index, operation);
+    }
     match command {
         station::NEW_KEY => station::new_key(iface, &attrs),
         station::SET_KEY => station::set_key(iface, &attrs),
@@ -2817,6 +2834,7 @@ fn mlme_handle(
     command: u8,
     bytes: &[u8],
     context: RequestContext<'_>,
+    deferred: Option<&narf_net::netlink_generic::DeferredRequest>,
 ) -> Result<Vec<GenlReply>, i32> {
     let attrs = attributes(bytes)?;
     let index = u32_attr(&attrs, 3)?.ok_or(EINVAL)?;
@@ -2827,7 +2845,7 @@ fn mlme_handle(
                 && super::in_namespace(iface.as_ref(), context.net_ns_id)
         })
         .ok_or(ENODEV)?;
-    let _admin = authority(&context, iface.as_ref())?;
+    let admin = authority(&context, iface.as_ref())?;
     let ns = context.net_ns_id;
     if matches!(
         command,
@@ -2839,7 +2857,9 @@ fn mlme_handle(
     }
     // cfg80211 rejects these on a driver that offloads its SME (-EOPNOTSUPP
     // before the op is attempted).
-    if !iface.supports_userspace_mlme() {
+    if !(iface.supports_userspace_mlme()
+        || matches!(iface.current_iftype(), 3 | 9) && iface.supports_ap_userspace_mlme())
+    {
         return Err(EOPNOTSUPP);
     }
     match command {
@@ -2854,6 +2874,16 @@ fn mlme_handle(
             // empty; presence distinguishes a registration from a malformed
             // request.
             let match_prefix = attr(&attrs, 91).ok_or(EINVAL)?;
+            if matches!(iface.current_iftype(), 3 | 9) && iface.ap_control_generation().is_some() {
+                return ap_async::defer(
+                    iface,
+                    admin,
+                    deferred,
+                    ns,
+                    index,
+                    ap_async::Operation::RegisterFrame(frame_type, match_prefix.to_vec()),
+                );
+            }
             iface
                 .register_mgmt_frame(frame_type, match_prefix)
                 .map_err(mlme_errno)?;
@@ -2878,7 +2908,16 @@ fn mlme_handle(
                 offchannel_ok: attr(&attrs, 108).is_some(),
                 duration: u32_attr(&attrs, 87)?.unwrap_or(0),
             };
-            let cookie = FRAME_COOKIE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let cookie = FRAME_COOKIE
+                .fetch_update(
+                    core::sync::atomic::Ordering::Relaxed,
+                    core::sync::atomic::Ordering::Relaxed,
+                    |value| (value != 0).then(|| value.checked_add(1)).flatten(),
+                )
+                .map_err(|_| EBUSY)?;
+            if matches!(iface.current_iftype(), 3 | 9) && iface.ap_control_generation().is_some() {
+                return ap_async::defer_frame(iface, admin, deferred, ns, index, cookie, request);
+            }
             narf_scheduler::spawn(run_mlme(
                 iface,
                 ns,
@@ -3221,13 +3260,14 @@ fn ap_handle_with(
     }
     match command {
         START_AP => {
-            reject_unknown(
-                &attrs,
-                &[
-                    3, 12, 13, 14, 15, 38, 39, 52, 53, 70, 126, 145, 159, 160, 161, 270, 278, 279,
-                    283, 294, 295, 306, 307, 325,
-                ],
-            )?;
+            let mut allowed = alloc::vec![
+                3, 12, 13, 14, 15, 38, 39, 52, 53, 70, 126, 145, 159, 160, 161, 270, 278, 279, 283,
+                294, 295, 306, 307, 325,
+            ];
+            if iface.ap_control_generation().is_some() {
+                allowed.extend_from_slice(&[68, 73, 74, 75, 76, 102, 103, 204, 264, 286]);
+            }
+            reject_unknown(&attrs, &allowed)?;
             let ssid = attr(&attrs, 52).ok_or(EINVAL)?;
             if ssid.is_empty() || ssid.len() > 32 {
                 return Err(EINVAL);
@@ -3396,13 +3436,35 @@ fn ap_handle_with(
             };
             if iface.ap_control_generation().is_some() {
                 station::netdev_up(iface.as_ref())?;
+                crypto_suites(&attrs, iface.cipher_suites(), 5)?;
+                let suite_list = |kind| -> Result<Option<Vec<u32>>, i32> {
+                    attr(&attrs, kind)
+                        .map(|raw| {
+                            if raw.len() % 4 != 0 {
+                                return Err(EINVAL);
+                            }
+                            Ok(raw
+                                .chunks_exact(4)
+                                .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+                                .collect())
+                        })
+                        .transpose()
+                };
+                let settings = crate::ApStartSettings {
+                    auth_type: u32_attr(&attrs, 53)?,
+                    wpa_versions: u32_attr(&attrs, 75)?,
+                    pairwise_ciphers: suite_list(73)?,
+                    group_cipher: u32_attr(&attrs, 74)?,
+                    akms: suite_list(76)?,
+                    control_port: control_port(&attrs, iface.supports_ap_authenticator())?,
+                };
                 return ap_async::defer(
                     iface,
                     admin,
                     deferred,
                     context.net_ns_id,
                     index,
-                    ap_async::Operation::Start(cfg),
+                    ap_async::Operation::Start(alloc::boxed::Box::new((cfg, settings))),
                 );
             }
             iface.start_ap(cfg).map_err(mlme_errno)?;

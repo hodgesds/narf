@@ -9,7 +9,7 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use narf_io::pool::DmaPool;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -167,6 +167,10 @@ pub struct NetIfaceEntry {
     pub link_layer: LinkLayer,
     /// Binding generation for devices whose link representation can change.
     pub packet_generation: u64,
+    /// Nonzero identity epoch for retained interface operations; zero means exhausted.
+    pub ownership_epoch: u64,
+    // Immutable for this registration, distinct from administrative/RX epochs.
+    registration_epoch: u64,
     monitor_epoch: u64,
     pub send: SendFn,
     send_context: Option<(u64, SendCtxFn)>,
@@ -626,6 +630,15 @@ fn dev_conf_register(iface_name: &str) {
     f(iface_name);
 }
 
+static OWNERSHIP_EPOCH: AtomicU64 = AtomicU64::new(1);
+fn next_ownership_epoch() -> u64 {
+    OWNERSHIP_EPOCH
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+            old.checked_add(1)
+        })
+        .unwrap_or(0)
+}
+
 static IFACES: IrqSafeSpinLock<Option<Vec<NetIfaceEntry>>> = IrqSafeSpinLock::new(None);
 
 /// Loopback transmit: a frame sent on "lo" is immediately received on
@@ -800,6 +813,8 @@ fn register_inner(
         link_layer: old
             .as_ref()
             .map_or(LinkLayer::Ethernet, |old| old.link_layer),
+        ownership_epoch: next_ownership_epoch(),
+        registration_epoch: next_ownership_epoch(),
         monitor_epoch: 0,
         packet_generation: old.as_ref().map_or(0, |old| {
             if old.packet_generation != 0 {
@@ -1232,6 +1247,7 @@ pub(crate) fn set_net_ns(name: &str, net_ns_id: u64) -> bool {
     let old_ns = entry.net_ns_id;
     entry.net_ns_id = net_ns_id;
     if old_ns != net_ns_id {
+        entry.ownership_epoch = next_ownership_epoch();
         entry.monitor_epoch = 0;
         if entry.packet_generation != 0 {
             entry.packet_generation = monitor::next_epoch().unwrap_or(u64::MAX);
@@ -1322,6 +1338,9 @@ pub struct NetIfaceSnapshot {
     pub link_layer: LinkLayer,
     /// Binding generation for devices whose link representation can change.
     pub packet_generation: u64,
+    /// Nonzero identity epoch for retained interface operations; zero means exhausted.
+    pub ownership_epoch: u64,
+    registration_epoch: u64,
     /// The driver's transmit hook. Private: every kernel transmit goes
     /// through [`NetIfaceSnapshot::xmit`] so packet taps see it.
     driver_send: SendDispatch,
@@ -1531,6 +1550,8 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
         mac: entry.mac,
         link_layer: entry.link_layer,
         packet_generation: entry.packet_generation,
+        ownership_epoch: entry.ownership_epoch,
+        registration_epoch: entry.registration_epoch,
         driver_send: send_dispatch(entry),
         ipv4: entry.ipv4,
         gateway: entry.gateway,
@@ -1813,6 +1834,7 @@ pub fn set_link_state(name: &str, up: bool) -> bool {
     let changed = entry.link_up != up;
     entry.link_up = up;
     if changed && !up {
+        entry.ownership_epoch = next_ownership_epoch();
         entry.monitor_epoch = 0;
         if entry.link_layer == LinkLayer::Ieee80211Radiotap {
             entry.packet_generation = monitor::next_epoch().unwrap_or(u64::MAX);
@@ -1863,6 +1885,62 @@ pub fn set_link_metadata(
     else {
         return false;
     };
+    update_link_metadata(entry, carrier, speed_mbps, duplex);
+    true
+}
+
+/// Identity-fenced physical-link observation from a trusted device owner.
+/// A copied snapshot is not an administrative/device grant; the caller
+/// supplies its native receipt and current capability checks independently.
+/// No callback runs while IFACES serializes this comparison/publication.
+pub fn set_link_metadata_for(
+    expected: &NetIfaceSnapshot,
+    carrier: bool,
+    speed_mbps: Option<u32>,
+    duplex: Option<LinkDuplex>,
+) -> bool {
+    let _capture = monitor::PUBLISH.lock();
+    let mut guard = IFACES.lock();
+    let Some(entry) = guard.as_mut().and_then(|entries| {
+        entries.iter_mut().find(|entry| {
+            entry.name == expected.name
+                && entry.net_ns_id == expected.net_ns_id
+                && entry.ifindex == expected.ifindex
+                && expected.ownership_epoch != 0
+                && entry.ownership_epoch == expected.ownership_epoch
+        })
+    }) else {
+        return false;
+    };
+    update_link_metadata(entry, carrier, speed_mbps, duplex);
+    true
+}
+
+/// Withdraw this physical registration's carrier after DOWN/namespace
+/// retirement. The immutable registration identity survives those changes,
+/// but a same-name/index/MAC rebind gets a fresh identity. This can only
+/// close carrier; it cannot publish UP, packets or administrative authority.
+pub fn withdraw_link_metadata_for(expected: &NetIfaceSnapshot) -> bool {
+    let _capture = monitor::PUBLISH.lock();
+    let mut guard = IFACES.lock();
+    let Some(entry) = guard.as_mut().and_then(|entries| {
+        entries.iter_mut().find(|entry| {
+            expected.registration_epoch != 0
+                && entry.registration_epoch == expected.registration_epoch
+        })
+    }) else {
+        return false;
+    };
+    update_link_metadata(entry, false, None, None);
+    true
+}
+
+fn update_link_metadata(
+    entry: &mut NetIfaceEntry,
+    carrier: bool,
+    speed_mbps: Option<u32>,
+    duplex: Option<LinkDuplex>,
+) {
     if entry.carrier != carrier {
         entry.carrier = carrier;
         entry.carrier_changes = entry.carrier_changes.saturating_add(1);
@@ -1874,7 +1952,6 @@ pub fn set_link_metadata(
     }
     entry.speed_mbps = carrier.then_some(speed_mbps).flatten();
     entry.duplex = carrier.then_some(duplex).flatten();
-    true
 }
 
 pub fn set_mtu(name: &str, mtu: u32) -> bool {
@@ -1901,6 +1978,9 @@ pub fn try_set_mac(name: &str, mac: [u8; 6]) -> Result<(), i32> {
     configure_device(
         |e| e.name == name,
         |e| {
+            if e.mac != mac {
+                e.ownership_epoch = next_ownership_epoch();
+            }
             e.mac = mac;
             e.addr_assign_type = 3;
             Ok(())
@@ -2244,6 +2324,85 @@ mod zc_tx_tests {
     fn dummy_send_frame(_f: crate::Frame, _m: crate::TxMeta) -> Result<(), ()> {
         Ok(())
     }
+
+    fn iface_link_metadata_snapshot_fences_down_namespace_and_rebind_aba() -> TestResult {
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if lookup(&self.0).is_none() {
+                    if let Some(name) = rebind_name(&self.0) {
+                        register(name, [2, 0, 0, 0, 0x76, 0x44], dummy_send);
+                    }
+                }
+                unregister(&self.0);
+            }
+        }
+        let name = register("ap-link-fence%d", [2, 0, 0, 0, 0x76, 0x44], dummy_send);
+        let _cleanup = Cleanup(name.clone());
+        set_link_state(&name, true);
+        let original = lookup(&name).unwrap();
+        if !set_link_metadata_for(&original, true, None, None) {
+            return TestResult::Fail("current metadata snapshot refused physical carrier");
+        }
+        set_link_state(&name, false);
+        set_link_state(&name, true);
+        if set_link_metadata_for(&original, false, None, None)
+            || lookup(&name).is_none_or(|e| !e.carrier)
+        {
+            return TestResult::Fail("stale DOWN/UP snapshot changed current carrier");
+        }
+        let current = lookup(&name).unwrap();
+        set_net_ns(&name, 0x76ff);
+        set_net_ns(&name, 0);
+        if set_link_metadata_for(&current, false, None, None)
+            || lookup(&name).is_none_or(|e| !e.carrier)
+        {
+            return TestResult::Fail("namespace away/back revived old metadata publication");
+        }
+        if !withdraw_link_metadata_for(&original) || lookup(&name).is_none_or(|e| e.carrier) {
+            return TestResult::Fail(
+                "original registration could not withdraw after DOWN/namespace",
+            );
+        }
+        let before_rebind = lookup(&name).unwrap();
+        let index = before_rebind.ifindex;
+        // Ethernet rebind intentionally preserves carrier metadata. Give
+        // the successor a down sample before testing the old up publisher.
+        if !set_link_metadata_for(&before_rebind, false, None, None) {
+            return TestResult::Fail("current pre-rebind carrier withdrawal");
+        }
+        if !retire_for_rebind(&name) {
+            return TestResult::Fail("metadata rebind fixture retirement");
+        }
+        let Some(claim) = rebind_name(&name) else {
+            return TestResult::Fail("metadata rebind fixture claim");
+        };
+        let again = register(claim, [2, 0, 0, 0, 0x76, 0x44], dummy_send);
+        let Some(fresh) = lookup(&again) else {
+            return TestResult::Fail("metadata rebind fixture publication");
+        };
+        if again != name
+            || fresh.ifindex != index
+            || fresh.ownership_epoch == before_rebind.ownership_epoch
+            || set_link_metadata_for(&before_rebind, true, None, None)
+            || lookup(&again).is_none_or(|e| e.carrier)
+        {
+            return TestResult::Fail("same name/index/MAC rebind accepted an old carrier owner");
+        }
+        if !set_link_metadata_for(&fresh, true, None, None)
+            || set_link_metadata_for(&before_rebind, false, None, None)
+            || withdraw_link_metadata_for(&before_rebind)
+            || withdraw_link_metadata_for(&original)
+            || lookup(&again).is_none_or(|e| !e.carrier)
+        {
+            return TestResult::Fail("old metadata owner cleared successor carrier");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "net/iface",
+        iface_link_metadata_snapshot_fences_down_namespace_and_rebind_aba
+    );
 
     // Exercises the zero-copy TX acquire/release/size-guard path end to end on
     // a throwaway interface. `register` replaces a same-named entry in place,

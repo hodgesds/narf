@@ -1,5 +1,5 @@
-//! Single-RFH MLD BAID retirement. Firmware echoes an opaque host cookie,
-//! type and BAID after that queue's prefix (Linux mld/{agg,rx}.c,rx.h).
+//! All-owned-RFH MLD BAID retirement. Firmware echoes an opaque host cookie,
+//! type and BAID after each queue's prefix (Linux mld/{agg,rx}.c,rx.h).
 use super::super::scan_api;
 use super::*;
 use alloc::sync::Arc;
@@ -104,7 +104,7 @@ impl Hardware {
         self.rx_epoch.open.store(true, Ordering::Release);
         Ok(())
     }
-    /// MLD EMPTY (type0) is an ordered single-RFH prefix proof, not a
+    /// MLD EMPTY (type0) is an ordered all-owned-RFH prefix proof, not a
     /// temporarily empty descriptor ring or a key-command acknowledgement.
     pub(in crate::iwlwifi) async fn synchronize_receive_epoch(
         &mut self,
@@ -151,7 +151,9 @@ impl Hardware {
         cookie: u32,
     ) -> Result<Vec<Packet>, &'static str> {
         let mut body = vec![0; if baid.is_some() { 24 } else { 20 }];
-        boot_context::put32(&mut body, 4, 1); // single owned RFH queue0
+        let queues = self.receive_queue_count();
+        let mut prefix = super::super::rx_multi::Prefix::new(queues, cookie, baid)?;
+        boot_context::put32(&mut body, 4, u32::from(prefix.mask()));
         let count = if baid.is_some() { 12 } else { 8 };
         boot_context::put32(&mut body, 8, count);
         body[12] = u8::from(baid.is_some()); // EMPTY0 / DEL_BA1
@@ -177,21 +179,13 @@ impl Hardware {
                 };
                 let packet = self.notifications.remove(index).unwrap();
                 if packet.header.group_id == 5 {
-                    let b = &packet.payload;
-                    if b.len() != count as usize + 4
-                        || b[..8] != [count as u8, 0, 0, 0, u8::from(baid.is_some()), 0, 0, 0]
-                    {
-                        return Err("MLD RX BAID marker geometry/type");
+                    if prefix.observe(packet.receive_queue, &packet.payload)? {
+                        return Ok(management);
                     }
-                    if u32::from_le_bytes(b[8..12].try_into().unwrap()) != cookie {
-                        continue;
-                    }
-                    if baid.is_some_and(|id| b[12..16] != u32::from(id).to_le_bytes()) {
-                        return Err("MLD RX BAID marker identity");
-                    }
-                    return Ok(management);
+                    continue;
                 }
-                if packet.header.cmd == 0xc1
+                if packet.receive_queue == 0
+                    && packet.header.cmd == 0xc1
                     && scan_api::mpdu(&packet.payload)
                         .is_some_and(|m| m.frame.first().is_some_and(|fc| fc & 12 == 0))
                 {

@@ -29,6 +29,7 @@ fn connection() -> Connection {
             Vec::new(),
         )),
         replay: frame_api::Replay::default(),
+        extra_rx: Vec::new(),
         receive_epoch: 0,
         authorized: true,
         last_beacon: 0,
@@ -80,6 +81,7 @@ fn notification(cmd: u8, payload: Vec<u8>) -> Packet {
         },
         payload,
         receive_epoch: Some(0),
+        receive_queue: 0,
     }
 }
 

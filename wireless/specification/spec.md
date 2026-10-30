@@ -676,6 +676,39 @@ Binding retains the original request context's namespace and resolved ifindex;
 a transfer between lookup and admission cannot silently retarget the request.
 Trusted driver registration must pair the net and wireless registry entries
 for the same device, as on the existing interface-control path.
+The guard also captures the nonzero net-interface `ownership_epoch`. Register,
+namespace transfer, actual administrative DOWN and MAC replacement retire that
+epoch; namespace-away/back and DOWN/UP cannot revive an old request even if a
+driver's mode generation is unchanged. `require_up` additionally checks the
+original administrative-UP identity for native START/update publication;
+STOP cleanup remains callable after DOWN.
+`ApControlAuthority::identity` captures an `ApInterfaceIdentity` only through a
+current request. That type observes the exact registered interface, namespace,
+ifindex, ownership epoch, mode generation, MAC and administrative UP, independently
+of a finished request's socket lifetime. `current` and `check_for` recheck those
+facts. It is neither a capability nor proof of native command completion, and
+opens no carrier, key or controlled port. The trusted driver may retain it only
+as an additional fence after its real native receipts; current device, RF and
+peer/key/port owners still authorize every packet. A CLI closing after a completed
+AP command therefore does not itself cancel the configured device, while pending
+request cancellation still requires the retained native cleanup owner.
+`metadata_snapshot` observes that same current UP identity for the net layer's
+identity-fenced metadata setter. It carries no additional grant or native
+completion receipt; the setter rechecks its epoch under IFACES publication.
+
+`ApControlAuthority::reserve` calls the optional `reserve_ap_control` driver
+hook synchronously at deferred admission, before the first executor poll.
+A provided `ApControlReservation` serializes mutations; it grants no capability
+and its `current` predicate supplements all existing grant/identity checks.
+`ExclusiveControl` provides one current operation with nonwrapping nonce ownership;
+a competing request gets `Busy`. Cloned request guards retain the lease through
+native cancellation cleanup and the final ACK, so dropping a borrowed waiter
+cannot expose a still-owned BSS to a successor. An old lease's destructor cannot
+release a successor. Native implementations must include peer, key/default-key,
+management/control-port and other BSS mutations in their ordered admission.
+Drivers with their own ordering keep the default hook returning no additional
+reservation. Existing synchronous admission remains unchanged.
+
 The additive `start_ap_async`, `stop_ap_async`, `set_beacon_async` and
 `add_station_async`/`set_station_async`/`del_station_async` methods represent
 actual native terminal results. Their defaults adapt existing synchronous
@@ -683,6 +716,67 @@ methods; generic netlink selects them only for an explicit generation opt-in,
 using the exact-socket deferred ACK path. An admitted queue entry never claims
 a completed native AP operation. Existing synchronous drivers retain their
 ordered admission contract below.
+
+Native AP `FRAME` and `REGISTER_FRAME` use `mgmt_tx_ap_async` and
+`register_mgmt_frame_ap_async` under the same current request guard and
+synchronous reservation. A FRAME cookie response is deferred until its native
+TX result; neither dispatch nor queue admission reports completion. The generic
+core frames that terminal response for the exact original socket and sequence.
+FRAME_TX_STATUS carries the actual returned ACK bool on the MLME group, after
+rechecking the original admin/source/interface ownership; false is a negative
+native observation, not a positive ACK inferred from freeing a packet token.
+Drivers check current occupied-channel/device authority and retain uncertain
+native TXS/DMA/FW ownership after waiter cancellation. Cookie exhaustion refuses
+new work rather than wrapping. Synchronous legacy MLME drivers retain their
+existing dispatch path, and these hooks add no AP/GO capability by themselves.
+
+`ApControlAuthority::event_authority` derives typed `ApEventAuthority` delivery
+from the existing current registration request. It sheds that completed
+operation's serialization lease and retains the actual administrative grant,
+exact original socket, namespace/ifindex, mode and ownership epoch. It creates
+no grant and exports no capability or arbitrary-message callback. Its
+registration may precede administrative UP, matching REGISTER_FRAME; capturing
+that identity opens no RX. Its
+`registration_current` checks the retained registration grant before UP so a
+driver can discard closed/revoked registrations without treating them as RX
+authority. Its
+`management_received` and `control_received` methods recheck current UP and
+those grants before typed nl80211 unicast to the exact source; closing/rebinding
+that socket, capability revocation, mode change, DOWN/UP or namespace/rebind
+retires delivery. The concrete native driver must separately check its copy
+epoch/current RF owner, registered frame filter, peer/cipher/replay facts and
+control-port configuration. The type supplies none of those hardware or packet
+receipts, and neither authorizes ordinary Ethernet/IP delivery nor injection.
+
+Native AP NEW/DEL/SET_KEY use `add_key_ap_async`, `del_key_ap_async` and
+`default_key_ap_async` under the same current exact-source guard/reservation.
+`OwnedKey` holds synchronous zeroizing key/RSC staging before constructing the
+async callback; rejection or unpolled cancellation erases it. Parsed key staging
+also erases temporary copies on every exit. The type exposes bytes, not proof
+of native installation or a peer controlled port. Defaults refuse unsupported
+native key callbacks, while existing station/synchronous key operations retain
+their driver path. Native errno is preserved. A NEW_KEY default choice follows
+successful installation in the same reserved operation; failed installation
+cannot select a transmit key. SET_KEY delegates the actual unicast/multicast/
+management/beacon selection instead of acknowledging a station-only no-op.
+
+`supports_ap_authenticator` and `supports_ap_userspace_mlme` report the physical
+AP key/control and management paths independently of station external-supplicant
+and SME admission. GET_WIPHY reports the union of actual mode capabilities;
+station handshake offload/SAE admission remains derived from the station hooks.
+`supports_control_port_no_preauth` separately gates that ext feature. New native
+drivers do not gain its netdev-routing semantics merely by exposing AP EAPOL.
+`ApStartSettings` retains optional START_AP crypto attributes and the actual
+control-port configuration for `start_ap_with_settings_async`; a compatibility
+default refuses extra settings. The native owner checks agreement with its
+actual beacon/security profile before RF publication. SOCKET_OWNER and the
+actual control-port capability gate over-nl80211 configuration as in Linux.
+`ControlPortTxRequest` owns zeroizing staging before async admission. Native AP
+CONTROL_PORT_FRAME uses `tx_control_port_ap_async` with the same current guard
+and reservation. A requested status cookie is nonwrapping and its terminal
+extended ACK/status follows actual native completion. DONT_WAIT requests no
+peer-status receipt/event. Neither form is ordinary Ethernet/IP transmission;
+the native owner still validates configured EtherType, current peer and keys.
 
 `MbssidSupport` exposes a physical wiphy's
 `NL80211_ATTR_MBSSID_CONFIG` maxima. When present, `START_AP` accepts the

@@ -417,6 +417,35 @@ impl Owner {
             })
             .ok_or("MVM actual WPA2 RSN offer absent")?;
         let pmf = self.associated_pmf();
+        let plan = self
+            .power
+            .prepared
+            .as_ref()
+            .and_then(|p| p.mlme.plan.as_ref());
+        let station_rsnxe = plan
+            .and_then(|p| p.sae())
+            .and_then(|join| join.station_rsnxe());
+        let mut ap_rsnxe = None;
+        if let Some(beacon) = self
+            .beacons
+            .iter()
+            .find(|b| b.bssid == status.bssid && b.channel == status.channel)
+        {
+            let mut ies = beacon.information_elements.as_slice();
+            while !ies.is_empty() {
+                if ies.len() < 2 || ies.len() < 2 + usize::from(ies[1]) {
+                    return Err("MVM truncated RSNXE offer");
+                }
+                if ies[0] == 244 {
+                    if ap_rsnxe.is_some() {
+                        return Err("MVM duplicate AP RSNXE");
+                    }
+                    ap_rsnxe = Some(ies[2..2 + usize::from(ies[1])].to_vec());
+                }
+                ies = &ies[2 + usize::from(ies[1])..];
+            }
+        }
+        let bind_extensions = plan.is_some() || ap_rsnxe.is_some();
         let station_rsn = self
             .power
             .prepared
@@ -429,6 +458,11 @@ impl Owner {
         let snonce = Zeroizing::new(nonce()?);
         let session =
             security::Session::new(akm, *pmk, status.bssid, own, *snonce, rsn).with_pmf(pmf);
+        let session = if bind_extensions {
+            session.with_rsn_extensions(station_rsnxe, ap_rsnxe)?
+        } else {
+            session
+        };
         self.security.active = Some(Exchange {
             session: match station_rsn {
                 Some(body) => session.with_station_rsn(body),

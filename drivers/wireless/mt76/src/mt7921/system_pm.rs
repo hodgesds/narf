@@ -69,6 +69,10 @@ impl<B: Backend> Session<B> {
     /// first (cfg80211 without WoWLAN); the firmware VIF and MAC are then
     /// stopped before the PCIe low-power handoff.
     pub(super) async fn suspend(&mut self) -> Result<(), Error> {
+        // A non-WoW AP cannot retain autonomous beacons across host sleep.
+        if self.ap_owner.is_some() {
+            self.stop_ap_owned().await?;
+        }
         let (info, vif) = match self.state {
             State::Suspended(_) => return Ok(()),
             State::Associated { info, .. } => {

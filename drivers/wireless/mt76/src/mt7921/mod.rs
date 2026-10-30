@@ -34,6 +34,7 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod ap_wire;
 pub mod association;
 pub mod bringup;
 pub(crate) mod channel;

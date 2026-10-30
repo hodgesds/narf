@@ -74,6 +74,8 @@ pub struct Packet {
     /// Immutable RFH copy-time owner. Closed-port captures never acquire a
     /// later key/association epoch merely because parsing was delayed.
     pub receive_epoch: Option<u64>,
+    /// Physical RFH owner that copied this packet; never firmware payload.
+    pub receive_queue: u8,
 }
 
 /// Extract notifications/responses without treating padding or a short
@@ -94,6 +96,7 @@ pub fn packets(bytes: &[u8]) -> Result<Vec<Packet>, &'static str> {
             header,
             payload: bytes[offset + 8..offset + 4 + length].to_vec(),
             receive_epoch: None,
+            receive_queue: 0,
         });
         offset += (length + 4).next_multiple_of(64);
     }
@@ -102,6 +105,7 @@ pub fn packets(bytes: &[u8]) -> Result<Vec<Packet>, &'static str> {
 
 #[derive(Debug)]
 pub struct ReceiveQueue {
+    id: u8,
     free: DmaBuffer,
     used: DmaBuffer,
     status: DmaBuffer,
@@ -116,7 +120,14 @@ pub struct ReceiveQueue {
 
 impl ReceiveQueue {
     pub fn new(format: rx_rfh::CompletionFormat) -> Result<Self, &'static str> {
+        Self::for_queue(format, 0)
+    }
+    fn for_queue(format: rx_rfh::CompletionFormat, id: u8) -> Result<Self, &'static str> {
+        if id >= 16 {
+            return Err("RFH queue outside native sender mask");
+        }
         let mut queue = Self {
+            id,
             free: dma_alloc(RX_DEPTH * format.free_size())?,
             used: dma_alloc(RX_DEPTH * format.size())?,
             status: dma_alloc(16)?,
@@ -159,6 +170,24 @@ impl ReceiveQueue {
         self.write = (self.write + 1) & (RX_DEPTH - 1);
     }
 
+    /// RFH_QUEUE_CONFIG publishes the initial free index itself. Record
+    /// every posted buffer before publishing that command, since firmware
+    /// may fetch the named ring before its command ACK reaches fallback0.
+    fn prepare_configuration(&mut self) -> Result<(), &'static str> {
+        if self.id == 0 || self.advertised != 0 || self.read != 0 {
+            return Err("RFH initial configuration ownership mismatch");
+        }
+        let next = self.write & !7;
+        while self.advertised != next {
+            self.tracker
+                .post(self.tags[self.advertised])
+                .map_err(|_| "double-posted configured RX buffer")?;
+            self.advertised = (self.advertised + 1) & (RX_DEPTH - 1);
+        }
+        dma_barrier();
+        Ok(())
+    }
+
     pub fn publish(&mut self, mmio: &mut impl IwlMmio) -> Result<(), &'static str> {
         if !mmio.authorized() {
             return Err("Wi-Fi authority revoked");
@@ -174,7 +203,7 @@ impl ReceiveQueue {
             self.advertised = (self.advertised + 1) & (RX_DEPTH - 1);
         }
         dma_barrier();
-        let (register, value) = self.format.doorbell(0, next as u16);
+        let (register, value) = self.format.doorbell(u16::from(self.id), next as u16);
         mmio.write(register, value);
         Ok(())
     }
@@ -217,9 +246,12 @@ impl ReceiveQueue {
             }
             if !buffer.discard {
                 // Complete packet copies precede any restock/doorbell.
-                output.extend(packets(
-                    &self.buffers[buffer.buffer_index].as_slice()[..RX_BUFFER_BYTES],
-                )?);
+                let mut copied =
+                    packets(&self.buffers[buffer.buffer_index].as_slice()[..RX_BUFFER_BYTES])?;
+                for packet in &mut copied {
+                    packet.receive_queue = self.id;
+                }
+                output.extend(copied);
             }
             returned.push(buffer.buffer_index);
             self.read = (self.read + 1) & (RX_DEPTH - 1);
@@ -543,6 +575,7 @@ impl BootImage {
 #[derive(Debug)]
 struct Resources {
     rx: ReceiveQueue,
+    extra_rx: Vec<ReceiveQueue>,
     commands: CommandQueue,
     boot: BootImage,
     data: Vec<super::data_queue::DataQueue>,
@@ -603,6 +636,7 @@ pub struct Hardware {
     /// bound the PN range a pairwise key can have used.
     protected_tx: u64,
     rx_epoch: rx_epoch::State,
+    receive_queues: rx_multi::State,
     sources: Option<source::Assets>,
     rf_policy: Option<super::mld_policy::Authority>,
 }
@@ -683,6 +717,7 @@ impl Hardware {
             mmio,
             resources: core::mem::ManuallyDrop::new(Resources {
                 rx,
+                extra_rx: Vec::new(),
                 commands,
                 boot,
                 data: Vec::new(),
@@ -703,6 +738,7 @@ impl Hardware {
             station_stop: None,
             protected_tx: 0,
             rx_epoch: rx_epoch::State::default(),
+            receive_queues: rx_multi::State::default(),
             sources: None,
             rf_policy: None,
         })
@@ -1102,8 +1138,20 @@ impl Hardware {
             }
         }
         let capture = self.rx_epoch.capture();
-        for mut packet in self.resources.rx.drain(&mut self.mmio)? {
+        let mut copied = self.resources.rx.drain(&mut self.mmio)?;
+        for queue in &mut self.resources.extra_rx {
+            copied.extend(queue.drain(&mut self.mmio)?);
+        }
+        for mut packet in copied {
             packet.receive_epoch = capture;
+            if packet.receive_queue != 0
+                && !(packet.header.group_id == 0 && matches!(packet.header.cmd, 0xc1..=0xc3)
+                    || packet.header.group_id == 5 && packet.header.cmd == 0xff)
+            {
+                // Command/control ownership belongs to fallback0. A payload
+                // copied from another physical ring cannot complete its DMA.
+                continue;
+            }
             if packet.header.group_id == 0 && packet.header.cmd == 0xc9 {
                 if let Some(policy) = &self.rf_policy {
                     policy.invalidate();
@@ -1472,6 +1520,7 @@ impl Hardware {
         )?;
         let resources = Resources {
             rx,
+            extra_rx: Vec::new(),
             commands,
             boot,
             data: Vec::new(),
@@ -1483,6 +1532,7 @@ impl Hardware {
         }
         self.resources = core::mem::ManuallyDrop::new(resources);
         self.platform_power = platform_power::State::default();
+        self.receive_queues = rx_multi::State::default();
         self.rx_epoch.reset_after_dma_stop();
         self.armed = false;
         self.failed = false;
@@ -1898,6 +1948,9 @@ mod retirement_tests;
 
 #[path = "runtime_rx_epoch.rs"]
 pub(super) mod rx_epoch;
+
+#[path = "runtime_rx_multi.rs"]
+mod rx_multi;
 
 #[path = "runtime_source.rs"]
 pub(super) mod source;

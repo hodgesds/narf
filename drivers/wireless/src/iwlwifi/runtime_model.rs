@@ -13,6 +13,9 @@ use narf_capabilities::{Cap, Write};
 #[derive(Clone, Debug)]
 pub(in crate::iwlwifi) struct TxTrace(
     alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<alloc::collections::VecDeque<Published>>>,
+    alloc::sync::Arc<
+        narf_lib::sync::IrqSafeSpinLock<alloc::collections::VecDeque<ReceiveFirmware>>,
+    >,
 );
 
 #[derive(Debug)]
@@ -82,8 +85,101 @@ impl TxTrace {
         });
         Ok(())
     }
+    /// Capture CPU views only from rings retained by the native Resources
+    /// owner, after their native RFH configuration receipt. Its initial
+    /// free index publishes the posted prefix. Observed DMA addresses
+    /// are compared as integers, never converted into writable CPU views.
+    pub(super) fn receive_queue(&self, queue: &ReceiveQueue) -> Result<(), &'static str> {
+        let mut views = self.1.lock();
+        if views.len() == 15 || views.iter().any(|view| view.queue == queue.id) {
+            return Err("private additional RFH observation bound/duplicate");
+        }
+        views.push_back(ReceiveFirmware {
+            queue: queue.id,
+            dma: [
+                queue.status.dma_addr().raw(),
+                queue.free.dma_addr().raw(),
+                queue.used.dma_addr().raw(),
+            ],
+            free_write: (queue.write & !7) as u32,
+            buffers: queue
+                .buffers
+                .iter()
+                .map(|buffer| buffer.as_mut_ptr() as usize)
+                .collect(),
+            used: queue.used.as_mut_ptr() as usize,
+            status: queue.status.as_mut_ptr() as usize,
+            next: 0,
+            format: queue.format,
+        });
+        Ok(())
+    }
+    /// # Safety
+    /// The fixture must keep the native Hardware/rings alive and serialize
+    /// device injection with every host poll until this view is retired.
+    pub(in crate::iwlwifi) unsafe fn take_receive_queue(
+        &self,
+        queue: u8,
+    ) -> Option<ReceiveFirmware> {
+        let mut views = self.1.lock();
+        let index = views.iter().position(|view| view.queue == queue)?;
+        views.remove(index)
+    }
     pub(in crate::iwlwifi) fn take(&self) -> Option<Published> {
         self.0.lock().pop_front()
+    }
+}
+
+#[derive(Debug)]
+pub(in crate::iwlwifi) struct ReceiveFirmware {
+    pub queue: u8,
+    pub dma: [u64; 3], // actual retained status/free/used DMA identities
+    pub free_write: u32,
+    buffers: Vec<usize>,
+    used: usize,
+    status: usize,
+    next: u16,
+    format: rx_rfh::CompletionFormat,
+}
+impl ReceiveFirmware {
+    pub(in crate::iwlwifi) fn inject(
+        &mut self,
+        command: u8,
+        group: u8,
+        sequence: u16,
+        payload: &[u8],
+    ) {
+        let index = usize::from(self.next);
+        assert!(index < self.buffers.len() && index < self.free_write as usize);
+        assert!(8 + payload.len() <= RX_BUFFER_BYTES);
+        let mut header = [0; 8];
+        boot_context::put32(&mut header, 0, payload.len() as u32 + 4);
+        header[4] = command;
+        header[5] = group;
+        boot_context::put16(&mut header, 6, sequence);
+        // SAFETY: the constructor's fixture contract keeps these actual CPU
+        // allocation views live and excludes a concurrent host copy. The
+        // posted initial prefix and complete copied extents are checked above.
+        unsafe {
+            let buffer = self.buffers[index] as *mut u8;
+            core::ptr::write_bytes(buffer, 0, RX_BUFFER_BYTES);
+            core::ptr::copy_nonoverlapping(header.as_ptr(), buffer, 8);
+            core::ptr::copy_nonoverlapping(payload.as_ptr(), buffer.add(8), payload.len());
+            let tag_offset = if self.format == rx_rfh::CompletionFormat::Ax210 {
+                4
+            } else {
+                0
+            };
+            core::ptr::write_volatile(
+                (self.used as *mut u8)
+                    .add(index * self.format.size() + tag_offset)
+                    .cast::<u16>(),
+                (self.next + 1).to_le(),
+            );
+            dma_barrier();
+            self.next += 1;
+            core::ptr::write_volatile((self.status as *mut u8).cast::<u16>(), self.next.to_le());
+        }
     }
 }
 
@@ -212,6 +308,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         mmio,
         resources: core::mem::ManuallyDrop::new(Resources {
             rx,
+            extra_rx: Vec::new(),
             commands: CommandQueue::new().unwrap(),
             boot: BootImage {
                 context: dma_alloc(4096).unwrap(),
@@ -255,6 +352,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         // This RAM constructor models an already admitted post-INIT owner.
         // Real association immediately closes/reserves its own generation.
         rx_epoch: rx_epoch::State::model(),
+        receive_queues: rx_multi::State::default(),
         sources: None,
         rf_policy: None,
     };
@@ -280,6 +378,7 @@ pub(in crate::iwlwifi) unsafe fn destroy(hardware: Hardware) {
         core::ptr::drop_in_place(&mut hardware.versions);
         core::ptr::drop_in_place(&mut hardware.bios_versions);
         core::ptr::drop_in_place(&mut hardware.platform_power);
+        core::ptr::drop_in_place(&mut hardware.receive_queues);
     };
 }
 
@@ -300,9 +399,14 @@ pub(in crate::iwlwifi) fn station_model_for_format(
 ) -> (Hardware, Firmware, TxTrace) {
     let (mut hardware, firmware) = create_for_format(false, format);
     hardware.resources.data.clear();
-    let trace = TxTrace(alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
-        alloc::collections::VecDeque::new(),
-    )));
+    let trace = TxTrace(
+        alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+            alloc::collections::VecDeque::new(),
+        )),
+        alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+            alloc::collections::VecDeque::new(),
+        )),
+    );
     hardware.resources.commands.trace = Some(trace.clone());
     (hardware, firmware, trace)
 }
@@ -323,6 +427,13 @@ pub(in crate::iwlwifi) fn restart(hardware: &mut Hardware) -> Result<(), &'stati
     commands.trace = trace;
     hardware.resources.commands = commands;
     hardware.platform_power = platform_power::State::default();
+    hardware.receive_queues = rx_multi::State::default();
+    // This is the fixture's terminal DMA-stop boundary. Retire observation
+    // views before releasing any of the actual additional ring allocations.
+    if let Some(trace) = &hardware.resources.commands.trace {
+        trace.1.lock().clear();
+    }
+    hardware.resources.extra_rx.clear();
     hardware.resources.data.clear();
     hardware.rx_epoch.reset_after_dma_stop();
     hardware.failed = false;
@@ -366,9 +477,14 @@ mod trace_tests {
     fn smoke_iwl_trace_reads_actual_published_dma_slot_and_body() -> TestResult {
         let body = dma_alloc(24).unwrap();
         let descriptors = dma_alloc(1024).unwrap();
-        let trace = TxTrace(alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
-            alloc::collections::VecDeque::new(),
-        )));
+        let trace = TxTrace(
+            alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+                alloc::collections::VecDeque::new(),
+            )),
+            alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+                alloc::collections::VecDeque::new(),
+            )),
+        );
         // Independent packed TFH bytes, written to slot3 rather than slot0.
         let mut descriptor = [0u8; 256];
         descriptor[..2].copy_from_slice(&2u16.to_le_bytes());

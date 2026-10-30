@@ -11,6 +11,8 @@ const FIRST_PID: u16 = 3;
 #[derive(Clone, Copy, Debug)]
 struct Sample {
     tid: u8,
+    wcid: u16,
+    management: bool,
     pid: u8,
     token: Option<u16>,
     terminal: Option<u8>,
@@ -33,6 +35,17 @@ impl Owner {
     /// The caller proves every earlier native data token terminal before
     /// arming. Re-arm cannot overlap an old, unconsumed report owner.
     pub fn arm(&mut self, tid: u8) -> Result<(), Error> {
+        self.arm_for(tid, 1, false)
+    }
+    /// Same native terminal-report owner for an AP management MPDU. This
+    /// does not assert a sequence originator or create a transmit grant.
+    pub fn arm_ap_management(&mut self, wcid: u8) -> Result<(), Error> {
+        if !(1..=13).contains(&wcid) && wcid != 19 {
+            return Err(Error::Bounds);
+        }
+        self.arm_for(0, u16::from(wcid), true)
+    }
+    fn arm_for(&mut self, tid: u8, wcid: u16, management: bool) -> Result<(), Error> {
         if tid >= 8 {
             return Err(Error::Bounds);
         }
@@ -57,6 +70,8 @@ impl Owner {
         self.occupied[usize::from(pid) / 64] |= 1u64 << (pid % 64);
         self.sample = Some(Sample {
             tid,
+            wcid,
+            management,
             pid,
             token: None,
             terminal: None,
@@ -110,7 +125,11 @@ impl Owner {
             .into_iter()
             .filter(|report| report.pid == sample.pid)
         {
-            if report.tid != sample.tid || report.wcid != 1 || report.format > 1 || report.ampdu {
+            if report.tid != sample.tid
+                || report.wcid != sample.wcid
+                || report.format > 1
+                || report.ampdu
+            {
                 return Err(Error::MalformedEvent);
             }
             let result = if report.failed {
@@ -145,6 +164,19 @@ impl Owner {
         self.sample = None;
         self.release_pid(sample.pid);
         Ok(Some(sequence))
+    }
+    /// Management ACK is a native TXS fact, joined with packet dual
+    /// retirement. A failed terminal report yields false, never a guessed
+    /// positive ACK from TX_FREE alone. Malformed/conflicting reports have
+    /// already failed receive and remain quarantined by the caller.
+    pub fn take_ap_ack(&mut self) -> Result<Option<bool>, Error> {
+        let sample = self.sample.filter(|s| s.management).ok_or(Error::Busy)?;
+        let (Some(status), Some(report)) = (sample.terminal, sample.report) else {
+            return Ok(None);
+        };
+        self.sample = None;
+        self.release_pid(sample.pid);
+        Ok(Some(status == 0 && report.is_ok()))
     }
     fn release_pid(&mut self, pid: u8) {
         self.occupied[usize::from(pid) / 64] &= !(1u64 << (pid % 64));

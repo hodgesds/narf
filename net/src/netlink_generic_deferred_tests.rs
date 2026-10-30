@@ -257,6 +257,10 @@ const OPS: &[GenlOperation] = &[
         command: 3,
         flags: GENL_CMD_CAP_DO | GENL_UNS_ADMIN_PERM,
     },
+    GenlOperation {
+        command: 4,
+        flags: GENL_CMD_CAP_DO | GENL_UNS_ADMIN_PERM,
+    },
 ];
 fn handler(_: u8, _: &[u8], _: bool) -> Result<Vec<GenlReply>, i32> {
     Err(EOPNOTSUPP)
@@ -269,6 +273,19 @@ fn deferred_handler(
     slot: &DeferredRequest,
 ) -> Result<Vec<GenlReply>, i32> {
     let receipt = RECEIPT.lock().as_ref().cloned().ok_or(ENOENT)?;
+    if command == 4 {
+        slot.defer_replies_checked(
+            Box::pin(async move {
+                Gate(receipt, 0).await?;
+                Ok(vec![GenlReply {
+                    command: 4,
+                    attrs: vec![8, 0, 1, 0, 0x76, 0, 0, 0],
+                }])
+            }),
+            Arc::new(Authority(AtomicBool::new(true))),
+        )?;
+        return Ok(Vec::new());
+    }
     slot.defer(Box::pin(Gate(receipt, 0)))?;
     match command {
         1 => Ok(Vec::new()),
@@ -355,9 +372,170 @@ fn native_router_defers_only_successful_empty_admission() -> TestResult {
     if sink.messages.lock().len() != 1 || receipt.drops.load(Ordering::Acquire) != 1 {
         return TestResult::Fail("native deferred task lost its terminal ACK");
     }
+    sink.messages.lock().clear();
+    let receipt = Arc::new(NativeReceipt::default());
+    *RECEIPT.lock() = Some(receipt.clone());
+    if !matches!(build_replies_with_endpoint(&request(4,5),ReplyOptions::default(),context,sink.clone()),Ok(messages) if messages.is_empty())
+    {
+        return TestResult::Fail("native result-bearing dispatch admission");
+    }
+    narf_scheduler::poll_one_round();
+    if !sink.messages.lock().is_empty() {
+        return TestResult::Fail("native result-bearing dispatch returned an early cookie");
+    }
+    receipt.ready.store(true, Ordering::Release);
+    for _ in 0..16 {
+        narf_scheduler::poll_one_round();
+        if sink.messages.lock().len() == 2 {
+            break;
+        }
+    }
+    let messages = sink.messages.lock();
+    if messages.len() != 2
+        || messages[0][4..6] != ID.to_ne_bytes()
+        || messages[0][8..12] != 0x12345678u32.to_ne_bytes()
+        || messages[0][16..20] != [4, 1, 0, 0]
+        || messages[0][20..28] != [8, 0, 1, 0, 0x76, 0, 0, 0]
+        || messages[1][16..20] != [0; 4]
+        || receipt.drops.load(Ordering::Acquire) != 1
+    {
+        return TestResult::Fail(
+            "native terminal replies lost admitted family/version/sequence or final ACK",
+        );
+    }
     TestResult::Pass
 }
 kernel_test_in!(
     "net/generic_deferred",
     native_router_defers_only_successful_empty_admission
+);
+
+fn terminal_replies_recheck_exact_socket_and_authority_before_payload() -> TestResult {
+    for boundary in 0..3 {
+        let authority = Arc::new(Authority(AtomicBool::new(true)));
+        let sink = Sink::new();
+        let replacement = Sink::new();
+        let receipt = Arc::new(NativeReceipt::default());
+        let captured = receipt.clone();
+        let revoke = authority.clone();
+        let future = Box::pin(async move {
+            Gate(captured, 0).await?;
+            if boundary == 2 {
+                revoke.0.store(false, Ordering::Release);
+            }
+            Ok(vec![GenlReply {
+                command: 7,
+                attrs: vec![4, 0, 1, 0],
+            }])
+        });
+        let mut task = Box::pin(run_replies(
+            future,
+            Some(authority),
+            sink.clone(),
+            Zeroizing::new(request(4, 5)),
+            ReplyOptions::default(),
+            None,
+            3,
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        if task.as_mut().poll(&mut cx).is_ready() || !sink.messages.lock().is_empty() {
+            return TestResult::Fail("native result appeared before terminal receipt");
+        }
+        if boundary == 1 {
+            sink.alive.store(false, Ordering::Release);
+        }
+        receipt.ready.store(true, Ordering::Release);
+        if task.as_mut().poll(&mut cx).is_pending()
+            || receipt.drops.load(Ordering::Acquire) != 1
+            || !replacement.messages.lock().is_empty()
+        {
+            return TestResult::Fail(
+                "deferred reply lost native cancellation or retargeted a replacement socket",
+            );
+        }
+        let messages = sink.messages.lock();
+        match boundary {
+            0 if messages.len() == 2
+                && messages[0][16..20] == [7, 3, 0, 0]
+                && messages[1][16..20] == [0; 4] => {}
+            1 if messages.is_empty() => (),
+            2 if messages.len() == 1
+                && messages[0][4..6] == NLMSG_ERROR.to_ne_bytes()
+                && messages[0][16..20] == (-EPERM).to_ne_bytes() => {}
+            _ => {
+                return TestResult::Fail(
+                    "deferred native payload ignored final socket/authority ownership",
+                )
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/generic_deferred",
+    terminal_replies_recheck_exact_socket_and_authority_before_payload
+);
+
+#[derive(Debug)]
+struct ReentrantSink {
+    sink: Arc<Sink>,
+    authority: Arc<Authority>,
+}
+impl DeferredReplySink for ReentrantSink {
+    fn current(&self) -> bool {
+        self.sink.current()
+    }
+    fn deliver(&self, message: Vec<u8>) -> Result<(), i32> {
+        self.sink.deliver(message)?;
+        self.authority.0.store(false, Ordering::Release);
+        Ok(())
+    }
+}
+fn each_deferred_reply_and_final_ack_rechecks_after_reentrant_delivery() -> TestResult {
+    let authority = Arc::new(Authority(AtomicBool::new(true)));
+    let storage = Sink::new();
+    let sink = Arc::new(ReentrantSink {
+        sink: storage.clone(),
+        authority: authority.clone(),
+    });
+    let future = Box::pin(async {
+        Ok(vec![
+            GenlReply {
+                command: 7,
+                attrs: Vec::new(),
+            },
+            GenlReply {
+                command: 8,
+                attrs: Vec::new(),
+            },
+        ])
+    });
+    let mut task = Box::pin(run_replies(
+        future,
+        Some(authority),
+        sink,
+        Zeroizing::new(request(4, 5)),
+        ReplyOptions::default(),
+        None,
+        3,
+    ));
+    let mut cx = Context::from_waker(Waker::noop());
+    if task.as_mut().poll(&mut cx).is_pending() {
+        return TestResult::Fail("ready native reply unexpectedly pending");
+    }
+    let messages = storage.messages.lock();
+    if messages.len() != 2
+        || messages[0][16] != 7
+        || messages[1][4..6] != NLMSG_ERROR.to_ne_bytes()
+        || messages[1][16..20] != (-EPERM).to_ne_bytes()
+    {
+        return TestResult::Fail(
+            "a later payload/success ACK survived revocation by prior delivery",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/generic_deferred",
+    each_deferred_reply_and_final_ack_rechecks_after_reentrant_delivery
 );

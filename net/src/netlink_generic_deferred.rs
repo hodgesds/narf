@@ -27,13 +27,23 @@ pub trait DeferredAuthority: fmt::Debug + Send + Sync {
 }
 
 pub(super) struct PendingAck {
-    future: DeferredAckFuture,
+    future: CompletionFuture,
     authority: Option<Arc<dyn DeferredAuthority>>,
 }
 
 /// This path delays an ACK, not a multipart response or dump. The family
 /// owns current interface authority and native cancellation/retirement.
 pub type DeferredAckFuture = Pin<Box<dyn Future<Output = Result<(), i32>> + Send + 'static>>;
+/// Terminal unicast responses from native asynchronous work. These are
+/// framed with the admitted request's sequence/family, after current socket
+/// and family-authority checks. Dumps remain unsupported on this path.
+pub type DeferredReplyFuture =
+    Pin<Box<dyn Future<Output = Result<Vec<GenlReply>, i32>> + Send + 'static>>;
+
+enum CompletionFuture {
+    Ack(DeferredAckFuture),
+    Replies(DeferredReplyFuture),
+}
 
 /// Borrowed only during the synchronous family callback. A rejected
 /// callback drops its unpolled future; only Ok(empty replies) can commit
@@ -69,7 +79,7 @@ impl DeferredRequest {
     }
 
     pub fn defer(&self, job: DeferredAckFuture) -> Result<(), i32> {
-        self.defer_inner(job, None)
+        self.defer_inner(CompletionFuture::Ack(job), None)
     }
 
     pub fn defer_checked(
@@ -77,12 +87,20 @@ impl DeferredRequest {
         job: DeferredAckFuture,
         authority: Arc<dyn DeferredAuthority>,
     ) -> Result<(), i32> {
-        self.defer_inner(job, Some(authority))
+        self.defer_inner(CompletionFuture::Ack(job), Some(authority))
+    }
+
+    pub fn defer_replies_checked(
+        &self,
+        job: DeferredReplyFuture,
+        authority: Arc<dyn DeferredAuthority>,
+    ) -> Result<(), i32> {
+        self.defer_inner(CompletionFuture::Replies(job), Some(authority))
     }
 
     fn defer_inner(
         &self,
-        job: DeferredAckFuture,
+        job: CompletionFuture,
         authority: Option<Arc<dyn DeferredAuthority>>,
     ) -> Result<(), i32> {
         if self.dump {
@@ -146,24 +164,57 @@ pub(super) fn spawn_ack(
     request: Zeroizing<Vec<u8>>,
     options: ReplyOptions,
     cookie: Option<u64>,
+    version: u8,
 ) {
-    narf_scheduler::spawn(run_ack(
-        job.future,
-        job.authority,
-        sink,
-        request,
-        options,
-        cookie,
-    ));
+    match job.future {
+        CompletionFuture::Ack(future) => narf_scheduler::spawn(run_ack(
+            future,
+            job.authority,
+            sink,
+            request,
+            options,
+            cookie,
+        )),
+        CompletionFuture::Replies(future) => narf_scheduler::spawn(run_replies(
+            future,
+            job.authority,
+            sink,
+            request,
+            options,
+            cookie,
+            version,
+        )),
+    };
 }
 
 async fn run_ack(
-    mut job: DeferredAckFuture,
+    job: DeferredAckFuture,
     authority: Option<Arc<dyn DeferredAuthority>>,
     sink: Arc<dyn DeferredReplySink>,
     request: Zeroizing<Vec<u8>>,
     options: ReplyOptions,
     cookie: Option<u64>,
+) {
+    run_replies(
+        Box::pin(async move { job.await.map(|()| Vec::new()) }),
+        authority,
+        sink,
+        request,
+        options,
+        cookie,
+        0,
+    )
+    .await;
+}
+
+async fn run_replies(
+    mut job: DeferredReplyFuture,
+    authority: Option<Arc<dyn DeferredAuthority>>,
+    sink: Arc<dyn DeferredReplySink>,
+    request: Zeroizing<Vec<u8>>,
+    options: ReplyOptions,
+    cookie: Option<u64>,
+    version: u8,
 ) {
     let result = core::future::poll_fn(|cx| {
         if !sink.current() {
@@ -185,14 +236,36 @@ async fn run_ack(
     let seq = u32::from_ne_bytes(request[8..12].try_into().unwrap());
     // Keep the family's actual authority alive beyond dropping the native
     // future, and recheck it at the final publication edge too.
-    let result = if authority.as_ref().is_some_and(|guard| !guard.current()) {
+    let mut result = if authority.as_ref().is_some_and(|guard| !guard.current()) {
         Err(EPERM)
     } else {
         result
     };
+    if let Ok(replies) = result.as_mut() {
+        let family = u16::from_ne_bytes(request[4..6].try_into().unwrap());
+        for reply in replies.drain(..) {
+            if !sink.current() {
+                return;
+            }
+            if authority.as_ref().is_some_and(|guard| !guard.current()) {
+                break;
+            }
+            let mut body = vec![reply.command, version, 0, 0];
+            body.extend_from_slice(&reply.attrs);
+            if sink.deliver(frame(family, 0, seq, &body)).is_err() {
+                return;
+            }
+        }
+    }
+    if !sink.current() {
+        return;
+    }
+    if authority.as_ref().is_some_and(|guard| !guard.current()) {
+        result = Err(EPERM);
+    }
     let errno = match result {
-        Ok(()) if flags & NLM_F_ACK == 0 => return,
-        Ok(()) => 0,
+        Ok(_) if flags & NLM_F_ACK == 0 => return,
+        Ok(_) => 0,
         Err(errno) => errno,
     };
     let mut ack = error(errno, seq, &request);

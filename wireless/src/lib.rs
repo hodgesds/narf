@@ -623,6 +623,11 @@ pub trait WirelessNetIface: Interface {
     fn supports_userspace_mlme(&self) -> bool {
         false
     }
+    /// AP userspace authentication/association management without changing
+    /// the station SME/handshake-offload contract of this physical device.
+    fn supports_ap_userspace_mlme(&self) -> bool {
+        self.supports_ap() && self.supports_userspace_mlme()
+    }
 
     /// Send an Authentication frame and return the peer's response frame,
     /// delivered to userspace as NL80211_CMD_AUTHENTICATE.
@@ -671,6 +676,31 @@ pub trait WirelessNetIface: Interface {
     /// whether it was acknowledged, for NL80211_CMD_FRAME_TX_STATUS.
     async fn mgmt_tx(&self, _cookie: u64, _req: MgmtTxRequest) -> Result<bool, WirelessError> {
         Err(WirelessError::NotSupported)
+    }
+    /// Native AP userspace-SME counterpart. This uses the same synchronous
+    /// control reservation and exact source/interface guard as AP lifecycle
+    /// operations; completion must report actual native peer ACK status.
+    async fn mgmt_tx_ap_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        cookie: u64,
+        request: MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        authority.check_for(self)?;
+        let result = self.mgmt_tx(cookie, request).await;
+        authority.check_for(self)?;
+        result
+    }
+    async fn register_mgmt_frame_ap_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        frame_type: u16,
+        match_prefix: Vec<u8>,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        let result = self.register_mgmt_frame(frame_type, &match_prefix);
+        authority.check_for(self)?;
+        result
     }
 
     /// Maximum `NL80211_CMD_REMAIN_ON_CHANNEL` duration in milliseconds.
@@ -817,6 +847,14 @@ pub trait WirelessNetIface: Interface {
     fn ap_control_generation(&self) -> Option<core::num::NonZeroU64> {
         None
     }
+    /// Optional synchronous native-control admission. This serializes the
+    /// original request before its async callback is first polled; it is not
+    /// an administrative capability or a native completion receipt.
+    fn reserve_ap_control(
+        &self,
+    ) -> Result<Option<Arc<dyn ap_control::ApControlReservation>>, WirelessError> {
+        Ok(None)
+    }
 
     /// Native terminal-completion counterparts. The request guard must stay
     /// current through every awaited command and final state publication;
@@ -832,6 +870,20 @@ pub trait WirelessNetIface: Interface {
         let result = self.start_ap(config);
         authority.check_for(self)?;
         result
+    }
+    /// Preserve actual START_AP crypto/control-port attributes for a native
+    /// userspace authenticator. Drivers that only adapt the historic AP
+    /// callback refuse additional settings rather than silently discarding them.
+    async fn start_ap_with_settings_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        config: ApConfig,
+        settings: ApStartSettings,
+    ) -> Result<(), WirelessError> {
+        if settings != ApStartSettings::default() {
+            return Err(WirelessError::NotSupported);
+        }
+        self.start_ap_async(authority, config).await
     }
     async fn stop_ap_async(
         &self,
@@ -884,6 +936,42 @@ pub trait WirelessNetIface: Interface {
         let result = self.del_station(peer, reason);
         authority.check_for(self)?;
         result
+    }
+    /// Native AP key controls own zeroizing staging before construction of
+    /// their async callback. A queue entry supplies no installed-key receipt.
+    async fn add_key_ap_async(
+        &self,
+        _authority: &ap_control::ApControlAuthority,
+        _key: OwnedKey,
+    ) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+    async fn del_key_ap_async(
+        &self,
+        _authority: &ap_control::ApControlAuthority,
+        _index: u8,
+        _pairwise: bool,
+        _peer: Option<[u8; 6]>,
+    ) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+    async fn default_key_ap_async(
+        &self,
+        _authority: &ap_control::ApControlAuthority,
+        _index: u8,
+        _unicast: bool,
+        _multicast: bool,
+        _management: bool,
+        _beacon: bool,
+    ) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+    async fn tx_control_port_ap_async(
+        &self,
+        _authority: &ap_control::ApControlAuthority,
+        _request: ControlPortTxRequest,
+    ) -> Result<bool, i32> {
+        Err(EOPNOTSUPP)
     }
 
     /// Begin AP operation: upload the beacon template and start beaconing.
@@ -989,6 +1077,15 @@ pub trait WirelessNetIface: Interface {
     /// `NL80211_EXT_FEATURE_CONTROL_PORT_OVER_NL80211`.
     fn supports_external_supplicant(&self) -> bool {
         false
+    }
+    /// Physical AP key/control-port operations, independently of managed
+    /// station SecurityConfig::External admission. Report this before mode
+    /// selection only when the actual AP key/control path is complete.
+    fn supports_ap_authenticator(&self) -> bool {
+        self.supports_ap() && self.supports_external_supplicant()
+    }
+    fn supports_control_port_no_preauth(&self) -> bool {
+        self.supports_external_supplicant()
     }
 
     /// The control-port TX path retains `IEEE80211_TX_CTL_REQ_TX_STATUS`
@@ -1280,6 +1377,67 @@ pub struct KeyParams {
     /// `NL80211_ATTR_KEY_DEFAULT_MGMT`: this IGTK is the AP's selected
     /// transmit management key. Meaningful only for a non-pairwise IGTK.
     pub default_mgmt: bool,
+}
+
+/// Opaque owned staging for a native asynchronous key operation. Creation
+/// belongs to synchronous admission, so an unpolled future also erases its
+/// key/RSC on drop. Access supplies bytes, never installed-key authority.
+#[derive(Debug)]
+pub struct OwnedKey(KeyParams);
+impl OwnedKey {
+    pub fn new(params: KeyParams) -> Self {
+        Self(params)
+    }
+    pub fn params(&self) -> &KeyParams {
+        &self.0
+    }
+}
+impl Drop for OwnedKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.key.zeroize();
+        self.0.seq.zeroize();
+    }
+}
+
+/// An actual admitted control-port PDU, separate from ordinary Ethernet TX.
+/// Staging is zeroizing before any asynchronous callback is constructed.
+pub struct ControlPortTxRequest {
+    pub dest: [u8; 6],
+    pub ethertype: u16,
+    pub no_encrypt: bool,
+    pub wait_for_ack: bool,
+    pdu: zeroize::Zeroizing<Vec<u8>>,
+}
+impl ControlPortTxRequest {
+    pub fn new(
+        dest: [u8; 6],
+        ethertype: u16,
+        pdu: Vec<u8>,
+        no_encrypt: bool,
+        wait_for_ack: bool,
+    ) -> Self {
+        Self {
+            dest,
+            ethertype,
+            pdu: zeroize::Zeroizing::new(pdu),
+            no_encrypt,
+            wait_for_ack,
+        }
+    }
+    pub fn pdu(&self) -> &[u8] {
+        &self.pdu
+    }
+}
+impl core::fmt::Debug for ControlPortTxRequest {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ControlPortTxRequest")
+            .field("dest", &self.dest)
+            .field("ethertype", &self.ethertype)
+            .field("length", &self.pdu.len())
+            .field("wait_for_ack", &self.wait_for_ack)
+            .finish_non_exhaustive()
+    }
 }
 
 /// GTK rekey material from `NL80211_CMD_SET_REKEY_OFFLOAD` /
@@ -1662,6 +1820,18 @@ pub struct ApConfig {
     pub he_obss_pd: Option<HeObssPdConfig>,
     /// Optional `NL80211_ATTR_HE_BSS_COLOR` state for an HE AP.
     pub he_bss_color: Option<HeBssColorConfig>,
+}
+
+/// Actual optional nl80211 START_AP crypto metadata, distinct from the
+/// on-air beacon RSNE. A native driver checks agreement before publication.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ApStartSettings {
+    pub auth_type: Option<u32>,
+    pub wpa_versions: Option<u32>,
+    pub pairwise_ciphers: Option<Vec<u32>>,
+    pub group_cipher: Option<u32>,
+    pub akms: Option<Vec<u32>>,
+    pub control_port: ControlPort,
 }
 
 /// Request-side `NL80211_ATTR_MBSSID_CONFIG`. `index == 0` is the

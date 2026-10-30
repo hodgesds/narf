@@ -2,6 +2,13 @@
 use super::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+#[path = "ap_management_hw_tests.rs"]
+mod ap_management_hw_tests;
+#[path = "ap_packet_hw_tests.rs"]
+mod ap_packet_hw_tests;
+#[path = "ap_timing_hw_tests.rs"]
+mod ap_timing_hw_tests;
+
 #[path = "tx_pipeline_hw_tests.rs"]
 mod tx_pipeline_hw_tests;
 #[path = "tx_sequence_hw_tests.rs"]

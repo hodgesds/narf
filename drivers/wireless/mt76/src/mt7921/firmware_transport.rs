@@ -5,6 +5,21 @@ use super::fwdl;
 use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::{future::poll_fn, ops::Range, task::Poll};
 
+#[path = "ap_session.rs"]
+mod ap;
+pub(crate) use ap::ApRxEvent;
+pub(crate) type ApEvent = ap::ApEvent;
+#[path = "ap_crypto.rs"]
+mod ap_crypto;
+#[path = "ap_packet.rs"]
+mod ap_packet;
+#[path = "ap_peer.rs"]
+mod ap_peer;
+#[path = "ap_rx.rs"]
+mod ap_rx;
+#[path = "boot_ap.rs"]
+pub(crate) mod boot_ap;
+
 #[path = "station_mcu.rs"]
 mod station;
 pub use station::{NicCapabilities, PhyCapabilities, RadioInfo};
@@ -273,7 +288,7 @@ pub async fn provision_boot_radio() -> Result<RadioInfo, Error> {
         };
         match owner.as_ref().map(Transport::state) {
             Some(State::RadioReady(info) | State::ScanReady(info))
-            | Some(State::Associated { info, .. }) => info,
+            | Some(State::Associated { info, .. } | State::AccessPoint { info, .. }) => info,
             Some(State::Failed { error, .. }) => return Err(error),
             _ => return Err(Error::Busy),
         }
@@ -839,6 +854,7 @@ impl<T> Drop for Retained<T> {
 /// Firmware/transport failure. A started failure cannot be replayed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    Cancelled,
     EntropyUnavailable,
     Busy,
     InvalidFirmware,
@@ -894,6 +910,9 @@ pub enum Stage {
     Shutdown,
     MonitorStart,
     MonitorStop,
+    ApStart,
+    ApStop,
+    ApPeer,
 }
 /// Firmware observations, not an operational WLAN interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -924,6 +943,12 @@ pub enum State {
         peer: [u8; 6],
         channel: u8,
         aid: u16,
+    },
+    /// Native BSS, group WTBL and beacon template acknowledged. Host
+    /// carrier/peer admission requires the separate current interface owner.
+    AccessPoint {
+        info: RadioInfo,
+        frequency_mhz: u32,
     },
     /// Native passive sniffer acknowledged; ordinary station RX/TX stays closed.
     Monitor {
@@ -1102,6 +1127,9 @@ fn command_frame(command: u8, seq: u8, payload: &[u8]) -> Result<Vec<u8>, Error>
 
 /// Immutable admission facts at the native DMA-to-owned-copy boundary.
 /// A later port opening cannot authorize a copy made while the port was shut.
+/// In AP mode this flag denotes the BSS capture binding only: the native
+/// WCID, per-peer association/port and current software CCMP proof are also
+/// required. Every AP peer/key/port change renews this global capture epoch.
 #[derive(Debug, PartialEq, Eq)]
 struct CapturedData {
     bytes: Vec<u8>,
@@ -1208,6 +1236,8 @@ trait Backend {
     /// and every device ring reference cleared.
     fn recycle(&mut self) -> Result<(), Error>;
     fn configure_mac(&mut self) -> Result<(), Error>;
+    fn pause_ap_timing(&mut self) -> Result<(), Error>;
+    fn finish_ap_timing(&mut self, five: bool, short_slot: bool) -> Result<(), Error>;
     fn clear_wtbl(&mut self, index: u8) -> Result<(), Error>;
     fn wtbl_idle(&mut self) -> Result<bool, Error>;
     fn submit_management(
@@ -1222,6 +1252,21 @@ trait Backend {
     /// One 802.11 data fragment (`packet_tx::fragment`) on the data ring.
     fn submit_fragment(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error>;
     fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error>;
+    /// Raw AP frame, with no hardware encryption key or header translation.
+    fn submit_ap_frame(
+        &mut self,
+        frame: &[u8],
+        wcid: u8,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error>;
+    fn arm_ap_management(&mut self, wcid: u8) -> Result<(), Error>;
+    fn submit_ap_management(
+        &mut self,
+        frame: &[u8],
+        wcid: u8,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error>;
+    fn poll_ap_management_ack(&mut self) -> Result<Option<bool>, Error>;
     fn submit_data_pipelined(
         &mut self,
         frame: &[u8],
@@ -1332,6 +1377,9 @@ struct Session<B: Backend> {
     /// During an associated scan, RX consumes only the hand-off queue so
     /// station service cannot swallow off-channel scan observations.
     scanning: bool,
+    ap_owner: Option<ap::Owner>,
+    // Keep retired AP temporal-key evidence across verified role resets.
+    ap_keys: ap_crypto::Keys,
     wow_config: Option<narf_wireless::WowlanConfig>,
     wow_nlo: Option<Arc<scan::nlo::Plan>>,
 }
@@ -1371,6 +1419,8 @@ impl<B: Backend> Session<B> {
             receive_epoch: 0,
             scan_packets: VecDeque::new(),
             scanning: false,
+            ap_owner: None,
+            ap_keys: ap_crypto::Keys::default(),
             wow_config: None,
             wow_nlo: None,
         }
@@ -1386,6 +1436,26 @@ impl<B: Backend> Session<B> {
     ) -> Result<T, Error> {
         let start = self.backend.now_ns();
         poll_fn(|cx| {
+            // The AP can already beacon while its last command receipt is
+            // pending. Recheck the actual request and RF owner on every
+            // native wait poll; cleanup/recovery uses its own device grant.
+            if matches!(self.state, State::Running(Stage::ApStart | Stage::ApPeer)) {
+                if let Some(owner) = &self.ap_owner {
+                    if owner
+                        .pending
+                        .as_ref()
+                        .is_none_or(|grant| grant.current().is_err())
+                    {
+                        return Poll::Ready(Err(Error::Authority));
+                    }
+                    if owner.identity.current().is_err() {
+                        return Poll::Ready(Err(Error::Authority));
+                    }
+                    if let Err(error) = self.backend.check_tx_permission(owner.plan.permission) {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+            }
             if let Err(error) = self.backend.check() {
                 return Poll::Ready(Err(error));
             }
@@ -1578,6 +1648,18 @@ impl<B: Backend> Session<B> {
     async fn shutdown(&mut self) -> Result<(), Error> {
         if self.state == State::Stopped {
             return Ok(());
+        }
+        let _ap_request = self
+            .ap_owner
+            .as_ref()
+            .and_then(|owner| owner.pending.clone());
+        // WFDMA shutdown alone cannot stop autonomous firmware beacons.
+        // Retain the AP owner unless its verified reset actually completes.
+        if self.ap_owner.is_some() {
+            let result = self.stop_ap_owned().await;
+            if self.ap_owner.is_some() {
+                return result;
+            }
         }
         self.boot_started = None;
         self.rx_ba.fence();

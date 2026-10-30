@@ -23,6 +23,13 @@ impl<B: Backend> Session<B> {
         if self.state == State::Prepared {
             return Err(Error::Busy);
         }
+        // Keep the original request's serialization lease through the
+        // entire cleanup, including firmware reinitialization after the
+        // old autonomous AP owner is retired and removed below.
+        let _ap_request = self
+            .ap_owner
+            .as_ref()
+            .and_then(|owner| owner.pending.clone());
         self.boot_started = None;
         self.rx_ba.fence();
         self.tx_ba.fence();
@@ -96,6 +103,9 @@ impl<B: Backend> Session<B> {
         self.scanning = false;
         self.used_tids = 0;
         self.security = None;
+        // Only verified MAC/FW reset plus DMA retirement releases AP owners.
+        self.ap_owner = None;
+        self.ap_keys.clear_active();
         self.wow_config = None;
         self.wow_nlo = None;
         self.wmm = None;

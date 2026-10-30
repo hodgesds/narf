@@ -25,6 +25,10 @@ mod security_tests;
 #[path = "sc_he_tests.rs"]
 mod he_tests;
 
+#[cfg(feature = "kernel-test")]
+#[path = "sc_rx_multi_tests.rs"]
+mod rx_multi_tests;
+
 type R<T = ()> = Result<T, &'static str>;
 const OWN: [u8; 6] = [2, 0x71, 2, 3, 4, 5];
 const AP: [u8; 6] = [2, 0x72, 2, 3, 4, 5];
@@ -66,6 +70,7 @@ enum Fault {
     HoldIgtk,
     WrongSaeSelector,
     HoldHe,
+    HoldRfh,
 }
 
 /// Authored firmware/NVM/AP facts, only for the native HE composition.
@@ -127,6 +132,11 @@ struct Wire {
     gtk_expected: Option<(u8, [u8; 16])>,
     phy: Option<PhyModel>,
     phy_requests: Vec<Vec<u8>>,
+    multi_receive: bool,
+    rx_queues: Vec<model::ReceiveFirmware>,
+    hold_rx_queue: Option<u8>,
+    held_markers: Vec<(u8, Vec<u8>)>,
+    baid_live: bool,
 }
 
 // SAFETY: no real device or thread accesses these fixture pointers. The sole
@@ -361,13 +371,90 @@ impl Wire {
                 }
                 self.keys += 1;
             }
-            (5, 2) => require(
-                body.len() == 20
-                    && bytes[6] == 0
-                    && body[..16] == [0, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0]
-                    && word(body, 16) != 0,
-                "Sc EMPTY single-RFH epoch native contract",
-            )?,
+            (5, 0x0d) if self.multi_receive => {
+                self.rx_queues.clear();
+                require(
+                    body.len() == 68 && body[..4] == [2, 0, 0, 0],
+                    "Sc additional RFH v1 extent/count",
+                )?;
+                for (index, entry) in body[4..].chunks_exact(32).enumerate() {
+                    require(
+                        entry[..4] == [index as u8 + 1, 0, 0, 0] && word(entry, 28) == 504,
+                        "Sc additional RFH queue/enable/write index",
+                    )?;
+                }
+            }
+            (0, 0xb3) if self.multi_receive => {
+                require(
+                    body.len() == 176
+                        && body[..8] == [1, 0, 0, 0, 0x3f, 0, 0, 0]
+                        && body[48..]
+                            .iter()
+                            .enumerate()
+                            .all(|(i, q)| *q == 1 + (i % 2) as u8),
+                    "Sc RSS v1 flags/hash/indirection",
+                )?;
+                let configuration = &self
+                    .commands
+                    .iter()
+                    .rev()
+                    .find(|(g, c, _)| (*g, *c) == (5, 0x0d))
+                    .ok_or("Sc RSS before RFH")?
+                    .2;
+                for queue in 1..=2 {
+                    // SAFETY: Guard retains Hardware until this Wire and all
+                    // views are destroyed; HARNESS serializes device injection
+                    // with every production host poll of the actual rings.
+                    let view = unsafe { self.trace.take_receive_queue(queue) }
+                        .ok_or("Sc missing posted RFH allocation view")?;
+                    let at = 4 + 32 * usize::from(queue - 1);
+                    require(
+                        view.queue == queue
+                            && view.free_write == 504
+                            && view.dma.iter().enumerate().all(|(i, dma)| {
+                                configuration[at + 4 + i * 8..at + 12 + i * 8] == dma.to_le_bytes()
+                            }),
+                        "Sc RFH command did not name retained allocations",
+                    )?;
+                    self.rx_queues.push(view);
+                }
+            }
+            (5, 0x16) if self.multi_receive => {
+                require(
+                    body.len() == 16 && word(body, 4) == 1 && word(body, 8) == 0,
+                    "Sc BAID command station/TID",
+                )?;
+                if word(body, 0) == 0 {
+                    require(
+                        !self.baid_live && half(body, 12) == 100 && half(body, 14) == 32,
+                        "Sc BAID allocation reuse/window",
+                    )?;
+                    self.baid_live = true;
+                } else {
+                    require(
+                        word(body, 0) == 2 && self.baid_live && body[12..] == [0; 4],
+                        "Sc BAID removal without owner",
+                    )?;
+                    self.baid_live = false;
+                }
+                response = 3u32.to_le_bytes().to_vec();
+            }
+            (5, 2) => {
+                let baid = body.get(12) == Some(&1);
+                let count = if baid { 12 } else { 8 };
+                let mask = if self.multi_receive { 7 } else { 1 };
+                require(
+                    body.len() == 12 + count
+                        && bytes[6] == 0
+                        && word(body, 0) == 0
+                        && word(body, 4) == mask
+                        && word(body, 8) == count as u32
+                        && word(body, 12) == u32::from(baid)
+                        && word(body, 16) != 0
+                        && (!baid || self.multi_receive && word(body, 20) == 3),
+                    "Sc all-owned-RFH epoch native contract",
+                )?;
+            }
             (3, 8) => require(body.len() == 52 && body[12..18] == OWN, "Sc MAC identity")?,
             (3, 9) => require(body.len() == 208 && body[16..22] == OWN, "Sc LINK identity")?,
             (3, 10) => {
@@ -432,6 +519,10 @@ impl Wire {
             (1, 0x77) => require(body == [0; 4], "Sc continuously awake defaults")?,
             _ => return Err("unexpected command in Sc composition"),
         }
+        if (group, cmd) == (5, 0x0d) && self.fault == Fault::HoldRfh {
+            self.held = Some((cmd, group, sequence));
+            return Ok(());
+        }
         if (group, cmd) == (1, 0xd) && self.fault == Fault::HoldScan {
             self.held = Some((cmd, group, sequence));
             return Ok(());
@@ -439,8 +530,7 @@ impl Wire {
         self.firmware
             .inject(cmd, if group == 1 { 0 } else { group }, sequence, &response);
         if (group, cmd) == (5, 2) {
-            let mut marker = [8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-            marker[8..12].copy_from_slice(&body[16..20]);
+            let marker = body[8..].to_vec();
             if self.fault == Fault::HoldRxFence {
                 require(
                     self.held_rx.is_none(),
@@ -449,6 +539,13 @@ impl Wire {
                 self.held_rx = Some(word(body, 16));
             } else {
                 self.firmware.inject(0xff, 5, 0x8000, &marker);
+            }
+            for queue in &mut self.rx_queues {
+                if self.hold_rx_queue == Some(queue.queue) {
+                    self.held_markers.push((queue.queue, marker.clone()));
+                } else {
+                    queue.inject(0xff, 5, 0x8000, &marker);
+                }
             }
         } else if (group, cmd) == (3, 5) {
             self.firmware.inject(
@@ -543,6 +640,11 @@ impl Wire {
                     self.held_tx = Some((p.queue, p.pointer));
                     return Ok(());
                 }
+            } else if frame[0] == 0xd0 && self.multi_receive && frame.get(24..26) == Some(&[3, 1]) {
+                require(
+                    frame[24..] == [3, 1, 1, 0, 0, 2, 8, 0, 0],
+                    "Sc BA response immediate/window/AMSDU decline",
+                )?;
             } else if frame[0] == 0xd0 && self.ap.pmf() {
                 require(
                     protected && frame.get(24..26) == Some(&[8, 1]) && frame.len() == 28,
@@ -559,7 +661,22 @@ impl Wire {
                 let responses = self
                     .ap
                     .receive(&frame)
-                    .map_err(|_| "shared AP rejected native Sc management/EAPOL")?;
+                    .map_err(|error| match (error, phase) {
+                        (narf_wifi_fixtures::ApError::Association, _) => {
+                            "Sc AP rejected association RSNE/RSNXE/rates"
+                        }
+                        (narf_wifi_fixtures::ApError::Mic, _) => "Sc AP rejected four-way MIC",
+                        (narf_wifi_fixtures::ApError::Key, ApPhase::Message2) => {
+                            "Sc AP rejected M2 association transcript/nonce/counter"
+                        }
+                        (narf_wifi_fixtures::ApError::Key, ApPhase::Message4) => {
+                            "Sc AP rejected M4 key information/counter"
+                        }
+                        (narf_wifi_fixtures::ApError::Key, ApPhase::Authentication) => {
+                            "Sc AP rejected SAE Commit/Confirm"
+                        }
+                        _ => "shared AP rejected native Sc management/EAPOL",
+                    })?;
                 if phase == ApPhase::Message2 {
                     use narf_wireless::eapol::{derive_ptk, HmacPrimitive, KeyFrame};
                     struct Sha1;
@@ -773,6 +890,16 @@ impl Guard {
         sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
         phy: Option<PhyModel>,
     ) -> R<Self> {
+        Self::build_receive(secured, fault, name, sources, phy, false)
+    }
+    fn build_receive(
+        secured: bool,
+        fault: Fault,
+        name: Option<&'static str>,
+        sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
+        phy: Option<PhyModel>,
+        multi_receive: bool,
+    ) -> R<Self> {
         require(
             ACTIVE.lock().is_none()
                 && narf_net::iface::lookup(super::super::iwl_ifname()).is_none()
@@ -782,6 +909,9 @@ impl Guard {
         let mut versions = super::super::firmware_parser_tests::mld_commands();
         if let Some(phy) = phy {
             he_tests::versions(&mut versions, phy.rates);
+        }
+        if multi_receive {
+            versions.extend_from_slice(&[0x0d, 5, 1, 0, 0xb3, 0, 1, 0]);
         }
         let (mut hardware, firmware, trace) = model::station_model();
         model::versions(&mut hardware, &versions);
@@ -835,6 +965,11 @@ impl Guard {
             gtk_expected: None,
             phy,
             phy_requests: Vec::new(),
+            multi_receive,
+            rx_queues: Vec::new(),
+            hold_rx_queue: None,
+            held_markers: Vec::new(),
+            baid_live: false,
         };
         let configured = run(Device::configure(&mut hardware, OWN), || wire.service());
         let nvm = match configured {

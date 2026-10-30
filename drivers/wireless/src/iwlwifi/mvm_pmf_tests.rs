@@ -114,6 +114,9 @@ enum Fault {
     NoIgtk,
     /// AKM24 M3 incorrectly uses the SAE8 AES-CMAC algorithm.
     LegacySaeMic,
+    MissingRsnxe,
+    ChangedRsnxe,
+    DuplicateRsnxe,
 }
 /// Independent AP + firmware receipt model.
 struct Ap {
@@ -131,6 +134,7 @@ struct Ap {
     hold_igtk: bool,
     held_igtk: Option<(u8, u16)>,
     assoc_rsne: Vec<u8>,
+    assoc_rsnxe: Option<Vec<u8>>,
     data: Vec<Vec<u8>>,
 }
 impl Ap {
@@ -169,6 +173,7 @@ impl Ap {
             hold_igtk: false,
             held_igtk: None,
             assoc_rsne: Vec::new(),
+            assoc_rsnxe: None,
             data: Vec::new(),
         }
     }
@@ -243,6 +248,20 @@ impl Ap {
         let (kck, kek, _) = self.ptk.as_ref().ok_or("AP M3 before PTK")?;
         let mut clear = vec![48, 20];
         clear.extend_from_slice(&rsne(self.akm));
+        if self.h2e && self.fault != Fault::MissingRsnxe {
+            clear.extend_from_slice(&[
+                244,
+                1,
+                if self.fault == Fault::ChangedRsnxe {
+                    0
+                } else {
+                    0x20
+                },
+            ]);
+            if self.fault == Fault::DuplicateRsnxe {
+                clear.extend_from_slice(&[244, 1, 0x20]);
+            }
+        }
         clear.extend_from_slice(&[221, 22, 0, 15, 172, 1, 1, 0]);
         clear.extend_from_slice(&GTK);
         if self.fault != Fault::NoIgtk {
@@ -466,6 +485,12 @@ impl Ap {
                     if frame[at] == 48 {
                         self.assoc_rsne = frame[at + 2..at + 2 + len].to_vec();
                     }
+                    if frame[at] == 244 {
+                        if self.assoc_rsnxe.is_some() {
+                            return Err("duplicate station RSNXE");
+                        }
+                        self.assoc_rsnxe = Some(frame[at..at + 2 + len].to_vec());
+                    }
                     at += 2 + len;
                 }
                 let mut expected = rsne(self.akm);
@@ -475,6 +500,18 @@ impl Ap {
                 } else {
                     // Local PMF Optional: MFPC, while the AP requires it.
                     expected[18] = 0x80;
+                }
+                if self.assoc_rsnxe.as_deref()
+                    // These SAE associations use SaePwe::Both. The
+                    // station advertises H2E even when this AP negotiates
+                    // Hunt-and-Peck; the AP's own M3 RSNXE remains absent.
+                    != if matches!(self.akm, 8 | 24) {
+                        Some(&[244, 1, 0x20][..])
+                    } else {
+                        None
+                    }
+                {
+                    return Err("association RSNXE differs from actual SAE PWE");
                 }
                 if self.assoc_rsne != expected || frame[24] & 0x10 == 0 {
                     return Err("association RSNE lacks exact SAE PMKID/MFPR");
@@ -495,6 +532,9 @@ impl Ap {
                     self.events.push(Kind::Message2);
                     let mut station = vec![48, self.assoc_rsne.len() as u8];
                     station.extend_from_slice(&self.assoc_rsne);
+                    if let Some(rsnxe) = &self.assoc_rsnxe {
+                        station.extend_from_slice(rsnxe);
+                    }
                     self.derive(&key.key_nonce)?;
                     let kck = self.ptk.as_ref().unwrap().0.clone();
                     if key.replay_counter != 1
@@ -1012,4 +1052,30 @@ fn smoke_gen2_pmf_new_akms_hold_igtk_receipt_and_revoke_before_port() -> TestRes
 kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2/pmf",
     smoke_gen2_pmf_new_akms_hold_igtk_receipt_and_revoke_before_port
+);
+
+fn smoke_gen2_sae_h2e_native_rsnxe_transcript_rejects_authenticated_m3_changes() -> TestResult {
+    check(|| {
+        for akm in [8, 24] {
+            for fault in [
+                Fault::MissingRsnxe,
+                Fault::ChangedRsnxe,
+                Fault::DuplicateRsnxe,
+            ] {
+                let (mut fixture, mut ap) = prepared_akm(true, fault, akm)?;
+                let result = secure(&mut fixture, &mut ap)?;
+                if result != Err("AP RSNXE changed during handshake")
+                    || ap.keys.iter().any(Option::is_some)
+                    || ap.m4
+                {
+                    return Err("Gen2 authenticated RSNXE change installed keys or escaped transcript check");
+                }
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/pmf",
+    smoke_gen2_sae_h2e_native_rsnxe_transcript_rejects_authenticated_m3_changes
 );

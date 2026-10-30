@@ -743,6 +743,7 @@ impl Device {
             self.start_close(&mut state);
             return Vec::new();
         }
+        let mut receive_failed = false;
         let State {
             hardware,
             connection,
@@ -769,7 +770,8 @@ impl Device {
                     }
                     Err(_) => {
                         connection.authorized = false;
-                        self.set_link(false);
+                        receive_failed = true;
+                        break;
                     }
                 }
             }
@@ -787,17 +789,24 @@ impl Device {
                 }
                 Err(_) => {
                     connection.authorized = false;
-                    self.set_link(false);
+                    receive_failed = true;
                 }
             }
             if narf_time::now_cycles().wrapping_sub(connection.last_beacon)
                 > narf_time::wall::ns_to_cycles(10_000_000_000)
             {
                 connection.authorized = false;
-                self.set_link(false);
+                receive_failed = true;
             }
         } else {
             hardware.notifications.clear();
+        }
+        if receive_failed {
+            // Closing carrier alone leaves firmware's autonomous station
+            // and DMA alive. The retained owner must perform the ordinary
+            // bounded transport stop, preserving allocations on ambiguity.
+            self.start_repair(&mut state);
+            return Vec::new();
         }
         let maintenance = !state.needs_reset
             && !state.hardware.is_failed()
@@ -1370,7 +1379,7 @@ impl WirelessNetIface for Device {
                             Err(WirelessError::HardwareError)
                         };
                     }
-                    if packet.header.cmd != 0xc1 {
+                    if packet.receive_queue != 0 || packet.header.cmd != 0xc1 {
                         continue;
                     }
                     let Some(mpdu) = scan_api::mpdu(&packet.payload) else {

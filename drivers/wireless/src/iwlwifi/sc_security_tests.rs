@@ -483,7 +483,32 @@ fn acknowledged_rotation(
     counter: u64,
 ) -> R {
     rotation(gtk, igtk, counter)?;
-    until(|| HARNESS.lock().as_ref().unwrap().1.group_reply).map_err(|_| match counter {
+    until(|| {
+        let (device, replied) = {
+            let slot = HARNESS.lock();
+            let (device, wire) = slot.as_ref().unwrap();
+            (device.clone(), wire.group_reply)
+        };
+        // A published G2 still owns its native TX receipt and final RX
+        // marker. A subsequent G1 injected before that terminal boundary
+        // is correctly an old closed-epoch copy, not a new rekey request.
+        if !replied || !device.control.try_lock().is_some_and(|slot| slot.is_none()) {
+            return false;
+        }
+        device.state.try_lock().is_some_and(|state| {
+            !state.needs_reset
+                && state.hardware.receive_capture_epoch().is_some()
+                && state
+                    .receive_ipc
+                    .as_ref()
+                    .is_some_and(|epoch| epoch.current())
+                && state
+                    .connection
+                    .as_ref()
+                    .is_some_and(|connection| connection.authorized)
+        })
+    })
+    .map_err(|_| match counter {
         3 => "Sc first authenticated group rotation stalled",
         4 => "Sc second authenticated group rotation stalled",
         5 => "Sc third authenticated group rotation stalled",

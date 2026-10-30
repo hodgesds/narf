@@ -15,6 +15,11 @@ use narf_wireless::{
     scan::BssInfo, AssociateRequest, ScanRequest, WirelessConfig, WirelessError, WirelessNetIface,
 };
 
+#[path = "iface_ap.rs"]
+mod ap;
+#[cfg(any(test, feature = "builtin"))]
+#[path = "iface_ap_tests.rs"]
+pub(crate) mod ap_tests;
 #[path = "iface_monitor.rs"]
 mod monitor;
 #[path = "iface_wowlan.rs"]
@@ -67,6 +72,11 @@ pub struct Mt76Iface {
     recovery_after_ns: AtomicU64,
     receive_epoch: AtomicU64,
     iftype: AtomicU32,
+    ap_generation: AtomicU64,
+    ap_serial: Arc<narf_wireless::ap_control::ExclusiveControl>,
+    ap_started: AtomicBool,
+    ap_owned: AtomicBool,
+    ap_host: IrqSafeSpinLock<ap::Host>,
     monitor_channel: IrqSafeSpinLock<Option<narf_wireless::monitor::Channel>>,
     monitor_started: AtomicBool,
     monitor_token: IrqSafeSpinLock<Option<narf_net::iface::MonitorRxToken>>,
@@ -102,6 +112,11 @@ impl Mt76Iface {
             recovery_after_ns: AtomicU64::new(0),
             receive_epoch: AtomicU64::new(0),
             iftype: AtomicU32::new(2),
+            ap_generation: AtomicU64::new(1),
+            ap_serial: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
+            ap_started: AtomicBool::new(false),
+            ap_owned: AtomicBool::new(false),
+            ap_host: IrqSafeSpinLock::new(ap::Host::default()),
             monitor_channel: IrqSafeSpinLock::new(None),
             monitor_started: AtomicBool::new(false),
             monitor_token: IrqSafeSpinLock::new(None),
@@ -143,6 +158,9 @@ impl Mt76Iface {
 
     /// Transmit an 802.3 Ethernet frame over the associated wireless datapath.
     pub async fn transmit_frame(&self, frame: &[u8]) -> Result<(), WirelessError> {
+        if self.current_iftype() != 2 {
+            return Err(WirelessError::NotSupported);
+        }
         if !self.link_up() {
             return Err(WirelessError::Denied);
         }
@@ -200,6 +218,9 @@ impl Mt76Iface {
 
     /// Receive an 802.3 Ethernet frame from the wireless datapath.
     pub async fn receive_frame(&self) -> Result<Option<Vec<u8>>, WirelessError> {
+        if self.current_iftype() != 2 {
+            return Err(WirelessError::NotSupported);
+        }
         if !self.link_up() {
             return Err(WirelessError::Denied);
         }
@@ -214,6 +235,17 @@ impl Mt76Iface {
     /// Advance bounded packet work, then service authenticated rekeys. No
     /// IRQ-safe lock survives an await; hardware ownership uses a regular mutex.
     pub async fn poll_data(&self) -> Result<(), WirelessError> {
+        // Retained native cleanup is independent of carrier and role. A
+        // dropped callback must not strand autonomous AP beaconing.
+        match crate::mt7921::firmware_transport::boot_ap::progress() {
+            Ok(false) => return Ok(()),
+            Ok(true) => (),
+            Err(_) if self.ap_owned.load(Ordering::Acquire) => return self.poll_ap().await,
+            Err(_) => (),
+        }
+        if self.ap_owned.load(Ordering::Acquire) || self.current_iftype() == 3 {
+            return self.poll_ap().await;
+        }
         if self.sleeping.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -249,6 +281,14 @@ impl Mt76Iface {
 
     /// The synchronous path never waits on a future or another executor task.
     fn drain_network(&self) -> Result<bool, WirelessError> {
+        let progressed = crate::mt7921::firmware_transport::boot_ap::progress()
+            .map_err(|_| WirelessError::HardwareError)?;
+        if !progressed {
+            return Ok(false);
+        }
+        if self.ap_owned.load(Ordering::Acquire) || self.current_iftype() == 3 {
+            return self.drain_ap_network();
+        }
         if !self.link_up() {
             return Ok(false);
         }
@@ -364,10 +404,14 @@ impl Mt76Iface {
     }
 
     fn clear_link(&self) {
+        let ap = self.current_iftype() == 3 || self.ap_owned.load(Ordering::Acquire);
+        self.close_ap_host();
         self.close_monitor();
         self.receive_epoch.store(0, Ordering::Release);
         *self.associated_bssid.lock() = None;
-        publish_link(&self.name, false);
+        if !ap {
+            publish_link(&self.name, false);
+        }
         *self.pending_tx.lock() = None;
         *self.tx_ring.lock() = None;
         *self.rx_ring.lock() = None;
@@ -376,7 +420,7 @@ impl Mt76Iface {
     }
 
     fn lose_link(&self) {
-        let connected = self.link_up();
+        let connected = self.current_iftype() == 2 && self.link_up();
         if connected {
             self.teardown_needed.store(true, Ordering::Release);
         }
@@ -443,6 +487,9 @@ impl Mt76Iface {
     async fn resume_from_suspend(&self) -> Result<(), WirelessError> {
         let _control = self.control.lock().await;
         suspend_result(crate::mt7921::firmware_transport::resume_boot_radio(self.mac()).await)?;
+        if self.ap_owned.load(Ordering::Acquire) {
+            self.commit_ap_stopped();
+        }
         self.sleeping.store(false, Ordering::Release);
         self.recovery_attempts.store(0, Ordering::Release);
         self.recovery_after_ns.store(0, Ordering::Release);
@@ -450,10 +497,15 @@ impl Mt76Iface {
     }
 
     fn enqueue(&self, bytes: &[u8]) -> Result<(), ()> {
-        if self.current_iftype() != 2 {
+        let admitted = match self.current_iftype() {
+            2 => transmit_admitted(bytes, self.mac()),
+            3 => self.ap_transmit_admitted(bytes),
+            _ => false,
+        };
+        if !admitted {
             return Err(());
         }
-        if !self.link_up() || !transmit_admitted(bytes, self.mac()) {
+        if !self.link_up() {
             return Err(());
         }
         let mut buffer = narf_io::alloc_coherent(bytes.len(), narf_lib::id::DomainId::DRIVER_0)
@@ -545,7 +597,11 @@ impl Interface for Mt76Iface {
         1500
     }
     fn link_up(&self) -> bool {
-        self.associated_bssid.lock().is_some()
+        if self.current_iftype() == 3 {
+            self.ap_link_up()
+        } else {
+            self.associated_bssid.lock().is_some()
+        }
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         &self.rx_ring
@@ -556,6 +612,138 @@ impl Interface for Mt76Iface {
 }
 #[async_trait]
 impl WirelessNetIface for Mt76Iface {
+    fn supports_ap(&self) -> bool {
+        true
+    }
+    fn supports_ap_userspace_mlme(&self) -> bool {
+        true
+    }
+    fn supports_ap_authenticator(&self) -> bool {
+        true
+    }
+    fn supports_control_port_no_preauth(&self) -> bool {
+        true
+    }
+    fn supports_control_port_tx_status(&self) -> bool {
+        true
+    }
+    fn ap_station_macs(&self) -> Vec<[u8; 6]> {
+        if self.ap_link_up() {
+            crate::mt7921::firmware_transport::boot_ap::stations()
+        } else {
+            Vec::new()
+        }
+    }
+    fn ap_station_info(&self, peer: [u8; 6]) -> Option<narf_wireless::StationInfo> {
+        self.ap_station_macs()
+            .contains(&peer)
+            .then(narf_wireless::StationInfo::default)
+    }
+    fn ap_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        self.ap_generation()
+    }
+    fn reserve_ap_control(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        self.ap_serial.try_reserve().map(Some)
+    }
+    async fn start_ap_with_settings_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::ApConfig,
+        settings: narf_wireless::ApStartSettings,
+    ) -> Result<(), WirelessError> {
+        self.ap_start(authority, config, settings).await
+    }
+    async fn stop_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+    ) -> Result<(), WirelessError> {
+        self.ap_stop(authority).await
+    }
+    async fn set_beacon_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        head: Option<Vec<u8>>,
+        tail: Option<Vec<u8>>,
+        probe: Option<Vec<u8>>,
+    ) -> Result<(), WirelessError> {
+        self.ap_beacon(authority, head, tail, probe).await
+    }
+    async fn add_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::StationConfig,
+    ) -> Result<(), WirelessError> {
+        self.ap_add_station(authority, config).await
+    }
+    async fn set_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::StationConfig,
+    ) -> Result<(), WirelessError> {
+        self.ap_set_station(authority, config).await
+    }
+    async fn del_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        peer: Option<[u8; 6]>,
+        _reason: u16,
+    ) -> Result<(), WirelessError> {
+        self.ap_del_station(authority, peer).await
+    }
+    async fn add_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        key: narf_wireless::OwnedKey,
+    ) -> Result<(), i32> {
+        self.ap_add_key(authority, key).await
+    }
+    async fn del_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<(), i32> {
+        self.ap_del_key(authority, index, pairwise, peer).await
+    }
+    async fn default_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        unicast: bool,
+        multicast: bool,
+        management: bool,
+        beacon: bool,
+    ) -> Result<(), i32> {
+        self.ap_default_key(authority, index, unicast, multicast, management, beacon)
+            .await
+    }
+    async fn mgmt_tx_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        _cookie: u64,
+        request: narf_wireless::MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        self.ap_management(authority, request).await
+    }
+    async fn register_mgmt_frame_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        frame_type: u16,
+        prefix: Vec<u8>,
+    ) -> Result<(), WirelessError> {
+        self.ap_register_frame(authority, frame_type, prefix).await
+    }
+    async fn tx_control_port_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        request: narf_wireless::ControlPortTxRequest,
+    ) -> Result<bool, i32> {
+        self.ap_control_tx(authority, request).await
+    }
     fn wowlan_support(&self) -> Option<narf_wireless::WowlanSupport> {
         self.native_wowlan_support()
     }
@@ -600,7 +788,7 @@ impl WirelessNetIface for Mt76Iface {
             base_name: self.name.clone(),
             base_mac: self.mac(),
             bands: self.bands(),
-            modes: WirelessModes::STATION | WirelessModes::MONITOR,
+            modes: WirelessModes::STATION | WirelessModes::AP | WirelessModes::MONITOR,
             hw_caps: HwCaps {
                 ht_supported: self.radio.capabilities.phy.ht,
                 vht_supported: crate::mt7921::vht::qualified(self.radio),
@@ -1532,6 +1720,13 @@ mod tests {
             || info.hw_caps.he_supported
             || info.hw_caps.eht_supported
             || !iface.supports_handshake_offload()
+            || !iface.supports_ap()
+            || !iface.supports_ap_authenticator()
+            || !iface.supports_ap_userspace_mlme()
+            || iface.supports_ap_uapsd()
+            || iface.supports_external_supplicant()
+            || iface.supports_userspace_mlme()
+            || !info.modes.contains(WirelessModes::AP)
             || iface.supports_sae_offload()
             || iface.max_scan_ssids() != 4
             || iface.max_scan_ie_len() != 600

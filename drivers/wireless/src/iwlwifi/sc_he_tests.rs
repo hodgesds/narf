@@ -151,14 +151,96 @@ fn probe(phy: PhyModel) -> R {
     let descriptor = if phy.channel() <= 14 { 4 } else { 8 };
     let offset = usize::from(half(scan, at + descriptor));
     let length = usize::from(half(scan, at + descriptor + 2));
-    let facts = narf_wireless::association::phy::ApElements::parse(
-        &scan[at + 20 + offset..at + 20 + offset + length],
-    )
-    .map_err(|_| "Sc active probe actual IE segment extent")?;
+    let bytes = scan
+        .get(at + 20 + offset..at + 20 + offset + length)
+        .ok_or("Sc active probe actual IE segment extent")?;
+    let he = request_capabilities(bytes, phy)?;
     require(
-        facts.he_capability().is_some() == phy.mcc_he,
+        he.is_some() == phy.mcc_he,
         "Sc active probe HE facts differ from current MCC admission",
     )
+}
+/// Probe/Association Requests contain capabilities, without AP operation
+/// elements. The BSS parser deliberately requires those operation pairs.
+/// Walk each actual request extent independently and reject duplicate PHY
+/// capabilities and accidental AP-only operation elements.
+fn request_capabilities(
+    mut bytes: &[u8],
+    phy: PhyModel,
+) -> R<Option<narf_wireless::association::he::HeCapability>> {
+    use narf_wireless::association::he::HeCapability;
+    let (mut ht, mut vht, mut he) = (false, false, None);
+    while !bytes.is_empty() {
+        let &[id, len, ..] = bytes else {
+            return Err("Sc request truncated element header");
+        };
+        let end = 2 + usize::from(len);
+        let body = bytes
+            .get(2..end)
+            .ok_or("Sc request truncated element body")?;
+        match id {
+            45 => {
+                require(
+                    !ht && body.len() == 26,
+                    "Sc request HT capability singleton",
+                )?;
+                ht = true;
+            }
+            191 => {
+                require(
+                    !vht && body.len() == 12,
+                    "Sc request VHT capability singleton",
+                )?;
+                vht = true;
+            }
+            61 | 192 => return Err("Sc request contains AP operation element"),
+            255 => match body.split_first() {
+                Some((&35, rest)) => {
+                    require(he.is_none(), "Sc request HE capability singleton")?;
+                    he = Some(HeCapability::parse(rest).map_err(|_| "Sc request HE capability")?);
+                }
+                Some((&36, _)) => return Err("Sc request contains AP HE operation element"),
+                None => return Err("Sc request empty extension element"),
+                _ => {}
+            },
+            _ => {}
+        }
+        bytes = &bytes[end..];
+    }
+    require(
+        ht && vht == (phy.channel() > 14),
+        "Sc request HT/VHT capability band facts",
+    )?;
+    if let Some(cap) = he {
+        let map = if phy.streams == 2 { 0xfff0 } else { 0xfffc };
+        let maps = cap.mcs_nss();
+        require(
+            cap.mac_capability() == [1, 0, 0x20, 0, 0, 0]
+                && cap.phy_capability()
+                    == [
+                        if phy.channel() <= 14 { 2 } else { 4 },
+                        0x30,
+                        10,
+                        0,
+                        0,
+                        0,
+                        0,
+                        4,
+                        1,
+                        0x30,
+                        0,
+                    ]
+                && maps.rx80 == map
+                && maps.tx80 == map
+                && maps.rx160 == 0xffff
+                && maps.tx160 == 0xffff
+                && maps.rx80p80 == 0xffff
+                && maps.tx80p80 == 0xffff
+                && cap.ppe_thresholds().is_empty(),
+            "Sc request HE local NSS/maps/unsupported features",
+        )?;
+    }
+    Ok(he)
 }
 fn beacon(phy: PhyModel, changed: bool) {
     let mut slot = HARNESS.lock();
@@ -217,10 +299,9 @@ fn native_context(phy: PhyModel, expected_he: bool) -> R {
         .phy_requests
         .last()
         .ok_or("Sc HE association request absent")?;
-    let offered = narf_wireless::association::phy::ApElements::parse(&req[28..])
-        .map_err(|_| "Sc HE emitted request extent")?;
+    let offered = request_capabilities(&req[28..], phy)?;
     require(
-        offered.he_capability().is_some() == expected_he,
+        offered.is_some() == expected_he,
         "Sc HE request ignored actual native/NVM/MCC admission",
     )?;
     if !expected_he {
@@ -468,12 +549,10 @@ fn smoke_sc_he_native_mcc_prohibition_and_missing_response_do_not_open_he_port()
                 let probe = 48 + 68 * 8 + 12;
                 let offset = usize::from(half(scan, probe + 4));
                 let len = usize::from(half(scan, probe + 6));
-                narf_wireless::association::phy::ApElements::parse(
-                    &scan[probe + 20 + offset..probe + 20 + offset + len],
-                )
-                .map_err(|_| "Sc active probe extent")?
-                .he_capability()
-                .is_none()
+                let bytes = scan
+                    .get(probe + 20 + offset..probe + 20 + offset + len)
+                    .ok_or("Sc active probe extent")?;
+                request_capabilities(bytes, phy)?.is_none()
             };
             require(no_he_probe, "Sc active probe advertised MCC-forbidden HE")?;
             run(guard.device().disassociate(), service)?.map_err(|_| "Sc HE fallback teardown")?;
@@ -495,8 +574,28 @@ fn smoke_sc_he_native_mcc_prohibition_and_missing_response_do_not_open_he_port()
                 .try_lock()
                 .ok_or("Sc changed HE beacon retained owner")?;
             require(
-                state.needs_reset,
+                state.needs_reset
+                    && state.hardware.is_failed()
+                    && state.hardware.receive_capture_epoch().is_none()
+                    && model::retained(&state.hardware).1 != 0,
                 "Sc changed HE operation left RF owner live",
+            )?;
+            drop(state);
+            // Poll the retained repair even after no frame is delivered.
+            // Revoked/changed radio facts cannot require a new RX packet
+            // or continuing emission authority to complete that stop.
+            for _ in 0..8 {
+                service()?;
+                drain();
+            }
+            let state = guard
+                .device()
+                .state
+                .try_lock()
+                .ok_or("Sc changed HE repair retained state")?;
+            require(
+                state.stop_completed && !state.connection.as_ref().is_some_and(|c| c.authorized),
+                "Sc changed HE operation did not drive retained native stop",
             )?;
         }
         phy.response_he = false;

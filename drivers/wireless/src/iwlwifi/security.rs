@@ -469,7 +469,72 @@ mod tests {
         "drivers/wireless/iwlwifi/security",
         smoke_wpa3_sae_m1_m2_descriptor_and_cmac_mic
     );
+    fn smoke_negotiated_rsnxe_binds_m2_and_authenticated_m3_before_keys() -> TestResult {
+        (|| {
+            let (session, m1, m3) = fixture();
+            let mut session =
+                session.with_rsn_extensions(Some(alloc::vec![0x20]), Some(alloc::vec![0x20]))?;
+            let response = session.process(&m1)?;
+            let m2 = KeyFrame::decode(&response.bytes[4..], 16).ok_or("RSNXE M2 decode")?;
+            let mut expected = alloc::vec![48, session.ap_rsn.len() as u8];
+            expected.extend_from_slice(&session.ap_rsn);
+            expected.extend_from_slice(&[244, 1, 0x20]);
+            if m2.key_data != expected {
+                return Err("M2 omitted/changed negotiated station RSNXE");
+            }
+            let ptk = session.ptk.as_ref().unwrap();
+            let mut unsigned = response.bytes.clone();
+            unsigned[81..97].fill(0);
+            if m2.key_mic.as_slice() != handshake::compute_mic(&ptk.kck, &unsigned) {
+                return Err("M2 MIC did not authenticate RSNXE");
+            }
+            let kck = ptk.kck.clone();
+            let kek: [u8; 16] = ptk.kek.as_slice().try_into().unwrap();
+            // Independently authenticated, encrypted M3 variants: absent,
+            // changed and duplicate AP RSNXE must preserve M1's state.
+            for variants in [
+                alloc::vec![],
+                alloc::vec![0],
+                alloc::vec![0x20, 0x20],
+                alloc::vec![0x20],
+            ] {
+                let mut clear = alloc::vec![48, session.ap_rsn.len() as u8];
+                clear.extend_from_slice(&session.ap_rsn);
+                for value in &variants {
+                    clear.extend_from_slice(&[244, 1, *value]);
+                }
+                clear.extend_from_slice(&[221, 22, 0, 15, 172, 1, 1, 0]);
+                clear.extend_from_slice(&[0x77; 16]);
+                if clear.len() % 8 != 0 {
+                    clear.push(221);
+                }
+                while clear.len() % 8 != 0 {
+                    clear.push(0);
+                }
+                let mut challenge = KeyFrame::decode(&m3[4..], 16).ok_or("RSNXE M3 decode")?;
+                challenge.key_data =
+                    narf_crypto::aes_kw::aes_wrap(&kek, &clear).ok_or("RSNXE M3 wrap")?;
+                handshake::install_mic(&mut challenge, &kck);
+                let result = session.process(&challenge.into_eapol());
+                if variants == [0x20] {
+                    if result?.keys.is_none() || !session.complete() {
+                        return Err("valid authenticated AP RSNXE did not complete");
+                    }
+                } else if result.is_ok() || session.complete() || session.replay != 1 {
+                    return Err("authenticated RSNXE mismatch mutated replay/key owner");
+                }
+            }
+            Ok(())
+        })()
+        .map_or_else(TestResult::Fail, |()| TestResult::Pass)
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/security",
+        smoke_negotiated_rsnxe_binds_m2_and_authenticated_m3_before_keys
+    );
 }
+
+pub(super) type RsnExtensions = (Option<Vec<u8>>, Option<Vec<u8>>);
 
 pub struct Session {
     akm: Akm,
@@ -485,6 +550,8 @@ pub struct Session {
     /// Exact station RSNE body sent in the association request (SAE: with
     /// its PMKID). `None` keeps the AKM's default body.
     sta_rsn: Option<Vec<u8>>,
+    /// Exact Association station/AP RSNXE bodies when explicitly bound.
+    rsn_extensions: Option<RsnExtensions>,
     last_request: Vec<u8>,
     last_response: Vec<u8>,
     initial_key_data: Vec<u8>,
@@ -533,6 +600,7 @@ impl Session {
             replay: 0,
             ap_rsn,
             sta_rsn: None,
+            rsn_extensions: None,
             last_request: Vec::new(),
             last_response: Vec::new(),
             initial_key_data: Vec::new(),
@@ -556,6 +624,23 @@ impl Session {
     pub fn with_station_rsn(mut self, rsn: Vec<u8>) -> Self {
         self.sta_rsn = Some(rsn);
         self
+    }
+
+    /// wpa_supplicant assoc_rsnxe is repeated beside assoc_wpa_ie in
+    /// M2; AP RSNXE must match the authenticated M3 (rsn_supp/wpa.c).
+    /// Bodies come from the checked association plan and received AP IEs.
+    pub(super) fn with_rsn_extensions(
+        mut self,
+        station: Option<Vec<u8>>,
+        ap: Option<Vec<u8>>,
+    ) -> Result<Self, &'static str> {
+        for body in [station.as_deref(), ap.as_deref()].into_iter().flatten() {
+            if body.is_empty() || body.len() > 16 || usize::from(body[0] & 15) + 1 != body.len() {
+                return Err("invalid negotiated RSNXE body");
+            }
+        }
+        self.rsn_extensions = Some((station, ap));
+        Ok(self)
     }
 
     pub fn process(&mut self, pdu: &[u8]) -> Result<Response, &'static str> {
@@ -597,6 +682,7 @@ impl Session {
                     self.ap_rsn.clone(),
                 ));
                 candidate.sta_rsn = self.sta_rsn.clone();
+                candidate.rsn_extensions = self.rsn_extensions.clone();
                 candidate.pmf = self.pmf;
                 let reply = candidate.process_inner(pdu)?;
                 self.pending_rekey = Some(candidate);
@@ -669,6 +755,16 @@ impl Session {
                 .unwrap_or_else(|| self.akm.sta_rsn_ie());
             reply.key_data.extend_from_slice(&[48, rsn.len() as u8]);
             reply.key_data.extend_from_slice(&rsn);
+            if let Some(station) = self
+                .rsn_extensions
+                .as_ref()
+                .and_then(|(station, _)| station.as_ref())
+            {
+                reply
+                    .key_data
+                    .extend_from_slice(&[244, station.len() as u8]);
+                reply.key_data.extend_from_slice(station);
+            }
             self.ptk = Some(ptk);
             self.anonce = key.key_nonce;
             (reply, None)
@@ -714,6 +810,14 @@ impl Session {
             );
             if pairwise_message && !contains_ie(&clear, 48, &self.ap_rsn) {
                 return Err("AP RSN changed during handshake");
+            }
+            if pairwise_message
+                && self
+                    .rsn_extensions
+                    .as_ref()
+                    .is_some_and(|(_, ap)| !matches_rsnxe(&clear, ap.as_deref()))
+            {
+                return Err("AP RSNXE changed during handshake");
             }
             if pairwise_message && self.complete && *clear != self.initial_key_data {
                 return Err("retransmitted M3 changed key data");
@@ -807,4 +911,30 @@ fn contains_ie(bytes: &[u8], tag: u8, expected: &[u8]) -> bool {
         offset += 2 + len;
     }
     false
+}
+
+/// Bounded singleton RSNXE in authenticated key data, allowing only the
+/// standard0xdd/zero AES-wrap padding after the final complete element.
+fn matches_rsnxe(mut bytes: &[u8], expected: Option<&[u8]>) -> bool {
+    let mut found = None;
+    while !bytes.is_empty() {
+        if bytes[0] == 221 && (bytes.len() == 1 || bytes[1] == 0) {
+            if bytes[1..].iter().any(|byte| *byte != 0) {
+                return false;
+            }
+            break;
+        }
+        if bytes.len() < 2 || bytes.len() < 2 + usize::from(bytes[1]) {
+            return false;
+        }
+        let body = &bytes[2..2 + usize::from(bytes[1])];
+        if bytes[0] == 244 {
+            if found.is_some() {
+                return false;
+            }
+            found = Some(body);
+        }
+        bytes = &bytes[2 + usize::from(bytes[1])..];
+    }
+    found == expected
 }

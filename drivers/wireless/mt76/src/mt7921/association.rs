@@ -9,6 +9,9 @@ use narf_wireless::rsn::{self, RsnIe, Suite};
 #[cfg(any(test, feature = "builtin"))]
 const RATES: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
 
+#[path = "ap_plan.rs"]
+pub(crate) mod ap;
+
 #[path = "wmm.rs"]
 pub(crate) mod wmm;
 
@@ -917,7 +920,7 @@ pub(crate) fn bss_record_ht20(bss: &ScanBss, qos: bool, ht: bool) -> Result<Vec<
 }
 
 /// A complete occupied station channel authorized by the installed host policy.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TxPermission {
     pub country: [u8; 2],
     pub power_dbm: i8,

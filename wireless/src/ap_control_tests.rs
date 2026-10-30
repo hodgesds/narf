@@ -9,15 +9,28 @@ use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 
 #[path = "ap_dispatch_tests.rs"]
 mod dispatch;
+#[path = "ap_event_tests.rs"]
+mod events;
 
 struct Radio {
     name: String,
     mode: AtomicU32,
     generation: AtomicU64,
+    serial: Arc<ExclusiveControl>,
     start_ready: AtomicBool,
     start_polls: AtomicU32,
     starts: AtomicU32,
     start_drops: AtomicU32,
+    mgmt_cookie: AtomicU64,
+    mgmt_acked: AtomicBool,
+    key_errno: AtomicU32,
+    key_installs: AtomicU32,
+    default_key: AtomicU32,
+    station_external: AtomicBool,
+    station_sme: AtomicBool,
+    station_handshake: AtomicBool,
+    settings_seen: AtomicBool,
+    control_sends: AtomicU32,
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
@@ -27,10 +40,21 @@ impl Radio {
             name,
             mode: AtomicU32::new(3),
             generation: AtomicU64::new(1),
+            serial: Arc::new(ExclusiveControl::new()),
             start_ready: AtomicBool::new(false),
             start_polls: AtomicU32::new(0),
             starts: AtomicU32::new(0),
             start_drops: AtomicU32::new(0),
+            mgmt_cookie: AtomicU64::new(0),
+            mgmt_acked: AtomicBool::new(true),
+            key_errno: AtomicU32::new(0),
+            key_installs: AtomicU32::new(0),
+            default_key: AtomicU32::new(u32::MAX),
+            station_external: AtomicBool::new(true),
+            station_sme: AtomicBool::new(true),
+            station_handshake: AtomicBool::new(false),
+            settings_seen: AtomicBool::new(false),
+            control_sends: AtomicU32::new(0),
             rx: IrqSafeSpinLock::new(None),
             tx: IrqSafeSpinLock::new(None),
         }
@@ -63,7 +87,7 @@ impl WirelessNetIface for Radio {
             base_name: self.name.clone(),
             base_mac: self.mac(),
             bands: Vec::new(),
-            modes: crate::iface::WirelessModes::AP,
+            modes: crate::iface::WirelessModes::AP | crate::iface::WirelessModes::STATION,
             hw_caps: crate::iface::HwCaps {
                 ht_supported: false,
                 vht_supported: false,
@@ -92,6 +116,173 @@ impl WirelessNetIface for Radio {
     }
     fn ap_control_generation(&self) -> Option<NonZeroU64> {
         NonZeroU64::new(self.generation.load(Ordering::Acquire))
+    }
+    fn reserve_ap_control(&self) -> Result<Option<Arc<dyn ApControlReservation>>, WirelessError> {
+        self.serial.try_reserve().map(Some)
+    }
+    fn supports_userspace_mlme(&self) -> bool {
+        self.station_sme.load(Ordering::Acquire)
+    }
+    fn supports_ap_userspace_mlme(&self) -> bool {
+        true
+    }
+    fn supports_external_supplicant(&self) -> bool {
+        self.station_external.load(Ordering::Acquire)
+    }
+    fn supports_ap_authenticator(&self) -> bool {
+        true
+    }
+    fn supports_handshake_offload(&self) -> bool {
+        self.station_handshake.load(Ordering::Acquire)
+    }
+    fn supports_control_port_tx_status(&self) -> bool {
+        true
+    }
+    async fn start_ap_with_settings_async(
+        &self,
+        authority: &ApControlAuthority,
+        config: crate::ApConfig,
+        settings: crate::ApStartSettings,
+    ) -> Result<(), WirelessError> {
+        if settings != crate::ApStartSettings::default() {
+            if settings.auth_type != Some(0)
+                || settings.wpa_versions != Some(2)
+                || settings.pairwise_ciphers != Some(alloc::vec![0x000fac04])
+                || settings.group_cipher != Some(0x000fac04)
+                || settings.akms != Some(alloc::vec![0x000fac02])
+                || !settings.control_port.enabled
+                || !settings.control_port.over_nl80211
+                || settings.control_port.no_preauth
+            {
+                return Err(WirelessError::InvalidArgs);
+            }
+            self.settings_seen.store(true, Ordering::Release);
+        }
+        self.start_ap_async(authority, config).await
+    }
+    async fn tx_control_port_ap_async(
+        &self,
+        authority: &ApControlAuthority,
+        request: crate::ControlPortTxRequest,
+    ) -> Result<bool, i32> {
+        if request.dest != [2, 0, 0, 0, 0x77, 1]
+            || request.ethertype != 0x888e
+            || request.pdu() != [2, 3, 0, 4, 1, 2, 3, 4]
+            || !request.no_encrypt
+        {
+            return Err(22);
+        }
+        struct Waiter<'a>(&'a AtomicU32);
+        impl Drop for Waiter<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let _waiter = Waiter(&self.start_drops);
+        core::future::poll_fn(|cx| {
+            authority.check_for(self).map_err(|_| 1)?;
+            self.start_polls.fetch_add(1, Ordering::AcqRel);
+            if self.start_ready.load(Ordering::Acquire) {
+                self.control_sends.fetch_add(1, Ordering::AcqRel);
+                core::task::Poll::Ready(Ok(
+                    request.wait_for_ack && self.mgmt_acked.load(Ordering::Acquire)
+                ))
+            } else {
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        })
+        .await
+    }
+    async fn add_key_ap_async(
+        &self,
+        authority: &ApControlAuthority,
+        key: crate::OwnedKey,
+    ) -> Result<(), i32> {
+        struct Waiter<'a>(&'a AtomicU32);
+        impl Drop for Waiter<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let _waiter = Waiter(&self.start_drops);
+        core::future::poll_fn(|cx| {
+            authority.check_for(self).map_err(|_| 1)?;
+            self.start_polls.fetch_add(1, Ordering::AcqRel);
+            if self.start_ready.load(Ordering::Acquire) {
+                core::task::Poll::Ready(Ok::<(), i32>(()))
+            } else {
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        })
+        .await?;
+        let params = key.params();
+        if params.cipher != 0x000fac04
+            || params.key != [0x5a; 16]
+            || params.idx > 1
+            || params.default_mgmt
+        {
+            return Err(22);
+        }
+        let errno = self.key_errno.load(Ordering::Acquire) as i32;
+        if errno != 0 {
+            return Err(errno);
+        }
+        self.key_installs.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+    async fn default_key_ap_async(
+        &self,
+        authority: &ApControlAuthority,
+        index: u8,
+        _unicast: bool,
+        multicast: bool,
+        management: bool,
+        beacon: bool,
+    ) -> Result<(), i32> {
+        authority.check_for(self).map_err(|_| 1)?;
+        if !multicast || management || beacon {
+            return Err(95);
+        }
+        self.default_key.store(u32::from(index), Ordering::Release);
+        Ok(())
+    }
+    async fn mgmt_tx_ap_async(
+        &self,
+        authority: &ApControlAuthority,
+        cookie: u64,
+        request: crate::MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        if request.frame.len() != 30
+            || request.frame[0] != 0xb0
+            || request.frame[10..16] != self.mac()
+            || request.frequency_mhz != 2412
+            || request.offchannel_ok
+            || request.duration != 0
+        {
+            return Err(WirelessError::InvalidArgs);
+        }
+        struct Waiter<'a>(&'a AtomicU32);
+        impl Drop for Waiter<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let _waiter = Waiter(&self.start_drops);
+        core::future::poll_fn(|cx| {
+            authority.check_for(self)?;
+            self.start_polls.fetch_add(1, Ordering::AcqRel);
+            if self.start_ready.load(Ordering::Acquire) {
+                self.starts.fetch_add(1, Ordering::AcqRel);
+                self.mgmt_cookie.store(cookie, Ordering::Release);
+                core::task::Poll::Ready(Ok(self.mgmt_acked.load(Ordering::Acquire)))
+            } else {
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        })
+        .await
     }
     async fn start_ap_async(
         &self,
@@ -364,4 +555,153 @@ fn ap_admission_cannot_follow_a_transferred_interface_into_another_namespace() -
 kernel_test_in!(
     "wireless/ap_control",
     ap_admission_cannot_follow_a_transferred_interface_into_another_namespace
+);
+
+fn ap_authority_and_completed_identity_reject_namespace_and_down_up_aba() -> TestResult {
+    for namespace in [false, true] {
+        let fixture = match fixture() {
+            Ok(f) => f,
+            Err(e) => return TestResult::Fail(e),
+        };
+        let guard = match ApControlAuthority::bind(
+            fixture.admin.clone(),
+            &fixture.iface,
+            0,
+            fixture.ifindex,
+            fixture.source.clone(),
+        ) {
+            Ok(g) => g,
+            Err(_) => return TestResult::Fail("AP ABA fixture current actual grant"),
+        };
+        let identity = match guard.identity() {
+            Ok(i) => i,
+            Err(_) => return TestResult::Fail("AP current UP identity"),
+        };
+        let before = narf_net::iface::lookup(fixture.radio.name())
+            .unwrap()
+            .ownership_epoch;
+        if namespace {
+            if fixture.admin.move_to_net_ns(0x7641).is_err()
+                || fixture.admin.move_to_net_ns(0).is_err()
+            {
+                return TestResult::Fail("AP actual namespace away/back transition");
+            }
+        } else if fixture.admin.set_link(false).is_err() || fixture.admin.set_link(true).is_err() {
+            return TestResult::Fail("AP actual DOWN/UP transition");
+        }
+        let after = narf_net::iface::lookup(fixture.radio.name())
+            .unwrap()
+            .ownership_epoch;
+        if before == 0
+            || after == 0
+            || after == before
+            || guard.current() != Err(WirelessError::Denied)
+            || identity.current() != Err(WirelessError::Denied)
+        {
+            return TestResult::Fail(
+                "AP interface ABA resurrected old request or completed identity",
+            );
+        }
+        if ApControlAuthority::bind(
+            fixture.admin.clone(),
+            &fixture.iface,
+            0,
+            fixture.ifindex,
+            fixture.source.clone(),
+        )
+        .is_err()
+        {
+            return TestResult::Fail("AP ABA fence refused a new actual administration operation");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/ap_control",
+    ap_authority_and_completed_identity_reject_namespace_and_down_up_aba
+);
+
+fn ap_completed_identity_survives_request_socket_but_never_new_device_binding() -> TestResult {
+    let fixture = match fixture() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let guard = match ApControlAuthority::bind(
+        fixture.admin.clone(),
+        &fixture.iface,
+        0,
+        fixture.ifindex,
+        fixture.source.clone(),
+    ) {
+        Ok(g) => g,
+        Err(_) => return TestResult::Fail("AP completed identity source grant"),
+    };
+    let identity = match guard.identity() {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("AP actual completed identity"),
+    };
+    fixture.source.0.store(false, Ordering::Release);
+    if guard.current() != Err(WirelessError::Denied)
+        || identity.current() != Ok(())
+        || identity.check_for(fixture.radio.as_ref()) != Ok(())
+        || identity.mac() != fixture.radio.mac()
+    {
+        return TestResult::Fail(
+            "completed AP identity inherited a request socket lifetime or changed device",
+        );
+    }
+    // The same ifindex/name/driver Arc still cannot reuse a replaced net
+    // device binding. Registration mints the observation epoch, not a cap.
+    let rebound = narf_net::iface::register(fixture.radio.name(), fixture.radio.mac(), reject);
+    if rebound != fixture.radio.name() || identity.current() != Err(WirelessError::Denied) {
+        return TestResult::Fail("completed AP identity survived a net-device rebind");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/ap_control",
+    ap_completed_identity_survives_request_socket_but_never_new_device_binding
+);
+
+fn ap_admission_reservation_is_retained_until_every_native_owner_retires() -> TestResult {
+    let fixture = match fixture() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let bind = || {
+        ApControlAuthority::bind(
+            fixture.admin.clone(),
+            &fixture.iface,
+            0,
+            fixture.ifindex,
+            fixture.source.clone(),
+        )
+    };
+    let request = match bind().and_then(ApControlAuthority::reserve) {
+        Ok(g) => g,
+        Err(_) => return TestResult::Fail("actual AP reservation admission"),
+    };
+    let native_owner = request.clone();
+    drop(request); // only the caller's borrowed waiter disappears
+    if bind().and_then(ApControlAuthority::reserve).err() != Some(WirelessError::Busy)
+        || native_owner.current() != Ok(())
+    {
+        return TestResult::Fail("AP caller drop released a native-owned control reservation");
+    }
+    drop(native_owner);
+    let successor = match bind().and_then(ApControlAuthority::reserve) {
+        Ok(g) => g,
+        Err(_) => return TestResult::Fail("AP terminal cleanup did not release admission"),
+    };
+    fixture.daemon.revoke();
+    if successor.current() != Err(WirelessError::Denied) {
+        return TestResult::Fail(
+            "serialization lease substituted for current administrative authority",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/ap_control",
+    ap_admission_reservation_is_retained_until_every_native_owner_retires
 );

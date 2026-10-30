@@ -14,7 +14,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 mod deferred;
 pub use deferred::{
     register_deferred_context_handler, DeferredAckFuture, DeferredAuthority,
-    DeferredContextHandler, DeferredReplySink, DeferredRequest,
+    DeferredContextHandler, DeferredReplyFuture, DeferredReplySink, DeferredRequest,
 };
 
 const NLMSG_HDRLEN: usize = 16;
@@ -476,6 +476,7 @@ fn build_one(
                     zeroize::Zeroizing::new(request.to_vec()),
                     options,
                     cookie.get(),
+                    family.version,
                 );
                 return Ok(Vec::new());
             }

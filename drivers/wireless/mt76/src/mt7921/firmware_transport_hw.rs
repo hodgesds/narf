@@ -4,13 +4,16 @@ use super::{
     Backend, CapturedData, Error, Firmware, RadioInfo, Report, Retained, Session, State, MAX_FRAME,
 };
 use crate::mt7921::{packet_tx, registers, regs::*};
-use alloc::{collections::VecDeque, vec, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 #[cfg(not(target_arch = "aarch64"))]
 use core::sync::atomic::fence;
 use core::sync::atomic::Ordering;
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_io::DmaBuffer;
+
+#[path = "ap_timing.rs"]
+mod ap_timing;
 
 #[path = "wowlan_hardware.rs"]
 mod wake;
@@ -913,6 +916,12 @@ impl Backend for Hardware {
     fn fw_state(&mut self) -> Result<u32, Error> {
         self.read(0x7c0600f0)
     }
+    fn pause_ap_timing(&mut self) -> Result<(), Error> {
+        Hardware::pause_ap_timing(self)
+    }
+    fn finish_ap_timing(&mut self, five: bool, short_slot: bool) -> Result<(), Error> {
+        Hardware::finish_ap_timing(self, five, short_slot)
+    }
     fn configure_mac(&mut self) -> Result<(), Error> {
         self.update(0x820cd004, 0xfff8, 1536 << 3)?;
         self.update(0x820cd000, 0, (1 << 15) | (1 << 19))?;
@@ -1043,6 +1052,49 @@ impl Backend for Hardware {
     fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error> {
         self.submit_data(frame, protected, qos)
     }
+    fn submit_ap_frame(
+        &mut self,
+        frame: &[u8],
+        wcid: u8,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error> {
+        self.submit_80211(frame, None, |payload, token| {
+            super::ap_packet::descriptor(frame, payload, token, wcid, rate)
+        })
+    }
+    fn arm_ap_management(&mut self, wcid: u8) -> Result<(), Error> {
+        self.check()?;
+        if !self.owner.published {
+            return Err(Error::Busy);
+        }
+        let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
+        if !storage.tokens.is_empty() {
+            return Err(Error::Busy);
+        }
+        storage.tx_sequence.arm_ap_management(wcid)
+    }
+    fn submit_ap_management(
+        &mut self,
+        frame: &[u8],
+        wcid: u8,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error> {
+        self.submit_80211(frame, Some(0), |payload, token| {
+            super::ap_packet::descriptor(frame, payload, token, wcid, rate)
+        })
+    }
+    fn poll_ap_management_ack(&mut self) -> Result<Option<bool>, Error> {
+        self.check()?;
+        for _ in 0..3 {
+            let _ = self.route_rx(None)?;
+        }
+        self.owner
+            .storage
+            .as_mut()
+            .ok_or(Error::Busy)?
+            .tx_sequence
+            .take_ap_ack()
+    }
     fn submit_data_pipelined(
         &mut self,
         frame: &[u8],
@@ -1142,6 +1194,49 @@ pub struct Transport {
 #[path = "firmware_transport_hw_tests.rs"]
 mod tests;
 impl Transport {
+    pub(crate) async fn run_ap_request(
+        &mut self,
+        iface: alloc::sync::Weak<crate::iface::Mt76Iface>,
+        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        request: super::boot_ap::Request,
+        alive: Arc<core::sync::atomic::AtomicBool>,
+        expected_mac: [u8; 6],
+    ) -> Result<super::boot_ap::Reply, Error> {
+        super::boot_ap::run_session(
+            &mut self.session,
+            iface,
+            authority,
+            request,
+            alive,
+            expected_mac,
+        )
+        .await
+    }
+    pub(crate) fn ap_owned(&self) -> bool {
+        self.session.ap_owner.is_some()
+    }
+    pub(crate) fn ap_retired(&self) -> bool {
+        self.session.ap_owner.is_none()
+            && matches!(
+                self.session.state,
+                State::RadioReady(_) | State::ScanReady(_)
+            )
+    }
+    pub(crate) async fn stop_ap_owned(&mut self) -> Result<(), Error> {
+        self.session.stop_ap_owned().await
+    }
+    pub(crate) async fn cleanup_ap(&mut self, expected_mac: [u8; 6]) -> Result<(), Error> {
+        if self.session.ap_owner.is_some() {
+            return self.session.stop_ap_owned().await;
+        }
+        match self.session.state {
+            State::RadioReady(_) | State::ScanReady(_) => Ok(()),
+            State::Failed { .. } | State::Running(_) | State::Stopped => {
+                self.session.recover(expected_mac).await.map(|_| ())
+            }
+            _ => Err(Error::Busy),
+        }
+    }
     /// Allocate all rings without device writes.
     ///
     /// # Safety
@@ -1226,6 +1321,159 @@ impl Transport {
     /// This does not yet enable packet transmission or register an interface.
     pub async fn initialize_radio(&mut self) -> Result<RadioInfo, Error> {
         self.session.initialize_radio().await
+    }
+    /// Configure a native AP BSS/beacon under the actual current delegated
+    /// request. Cancellation retains the transport owner until cleanup.
+    /// Host peer/packet admission is a separate interface publication.
+    pub async fn start_ap(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        config: narf_wireless::ApConfig,
+    ) -> Result<(), Error> {
+        self.session.start_ap(authority, config).await
+    }
+    pub(crate) async fn start_ap_with_settings(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        config: narf_wireless::ApConfig,
+        settings: narf_wireless::ApStartSettings,
+    ) -> Result<(), Error> {
+        self.session
+            .start_ap_with_settings(authority, config, settings)
+            .await
+    }
+    /// Stop the AP and verify a fresh MAC/FW generation before returning.
+    pub async fn stop_ap(
+        &mut self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+    ) -> Result<(), Error> {
+        self.session.stop_ap(authority).await
+    }
+    /// Concrete registered interface commits capture only after native START
+    /// and its own current authority/identity check; no peer port opens here.
+    pub(crate) fn commit_ap_start(
+        &mut self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+    ) -> Result<u64, Error> {
+        self.session.commit_ap_start(authority)
+    }
+    pub(crate) async fn add_ap_station(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        config: narf_wireless::StationConfig,
+    ) -> Result<(), Error> {
+        self.session.ap_add_station(authority, config).await
+    }
+    pub(crate) fn authorize_ap_station(
+        &mut self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        peer: [u8; 6],
+        authorized: bool,
+    ) -> Result<(), Error> {
+        self.session
+            .ap_authorize_station(authority, peer, authorized)
+    }
+    pub(crate) async fn delete_ap_station(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        peer: Option<[u8; 6]>,
+    ) -> Result<(), Error> {
+        self.session.ap_delete_station(authority, peer).await
+    }
+    /// Secret staging happens before construction of the returned future.
+    /// Even a never-polled operation erases the moved temporal key.
+    pub(crate) fn add_ap_key(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        key: narf_wireless::KeyParams,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + '_ {
+        let key = super::ap_crypto::Install::prepare(key).map_err(|_| Error::Bounds);
+        async move { self.session.ap_install_key(authority, key?).await }
+    }
+    pub(crate) fn add_owned_ap_key(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        key: narf_wireless::OwnedKey,
+    ) -> impl core::future::Future<Output = Result<(), Error>> + '_ {
+        let key = super::ap_crypto::Install::from_params(key.params()).map_err(|_| Error::Bounds);
+        async move { self.session.ap_install_key(authority, key?).await }
+    }
+    pub(crate) async fn delete_ap_key(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<(), Error> {
+        self.session
+            .ap_delete_key(authority, index, pairwise, peer)
+            .await
+    }
+    pub(crate) async fn default_ap_key(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        index: u8,
+    ) -> Result<(), Error> {
+        self.session.ap_default_key(authority, index).await
+    }
+    pub(crate) fn step_ap_network(
+        &mut self,
+        frame: Option<&[u8]>,
+    ) -> Result<super::PacketStep, Error> {
+        self.session.step_ap_network(frame)
+    }
+    pub(crate) fn ap_receive_current(&self, epoch: u64) -> Result<bool, Error> {
+        self.session.ap_receive_current(epoch)
+    }
+    pub(crate) fn ap_station_macs(&self) -> Result<Vec<[u8; 6]>, Error> {
+        if !self
+            .session
+            .ap_receive_current(self.session.receive_epoch)?
+        {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .session
+            .ap_owner
+            .as_ref()
+            .ok_or(Error::Busy)?
+            .peers
+            .addresses())
+    }
+    pub(crate) fn pop_ap_event(&mut self) -> Result<Option<super::ApRxEvent>, Error> {
+        self.session.pop_ap_event()
+    }
+    pub(crate) async fn transmit_ap_management(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        frame: &[u8],
+    ) -> Result<bool, Error> {
+        self.session.ap_send_management(authority, frame).await
+    }
+    pub(crate) async fn transmit_ap_control(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        request: narf_wireless::ControlPortTxRequest,
+    ) -> Result<bool, Error> {
+        self.session.ap_send_control(authority, request).await
+    }
+    pub(crate) async fn update_ap_station(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        config: narf_wireless::StationConfig,
+    ) -> Result<(), Error> {
+        self.session.ap_update_station(authority, config).await
+    }
+    pub(crate) async fn update_ap_beacon(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::ApControlAuthority>,
+        head: Option<Vec<u8>>,
+        tail: Option<Vec<u8>>,
+        probe: Option<Vec<u8>>,
+    ) -> Result<(), Error> {
+        self.session
+            .ap_update_beacon(authority, head, tail, probe)
+            .await
     }
     /// Perform a bounded, receive-only scan on world 2.4 GHz channels 1..=11.
     pub async fn scan_passive(&mut self, channels: &[u8]) -> Result<super::ScanReport, Error> {

@@ -1085,10 +1085,13 @@ fn wiphy_attrs(
             38,  // ASSOCIATE
             39,  // DEAUTHENTICATE
             40,  // DISASSOCIATE
-            58,  // REGISTER_FRAME
-            59,  // FRAME
             127, // EXTERNAL_AUTH
         ]);
+    }
+    if iface
+        .is_some_and(|iface| iface.supports_userspace_mlme() || iface.supports_ap_userspace_mlme())
+    {
+        command_list.extend_from_slice(&[58, 59]); // REGISTER_FRAME / FRAME.
     }
     if iface.is_some_and(|iface| iface.max_remain_on_channel_duration_ms() != 0) {
         command_list.extend_from_slice(&[
@@ -1097,7 +1100,9 @@ fn wiphy_attrs(
         ]);
     }
     // An external-supplicant driver has `add_key` (CMD(add_key, NEW_KEY)).
-    if iface.is_some_and(|iface| iface.supports_external_supplicant()) {
+    if iface.is_some_and(|iface| {
+        iface.supports_external_supplicant() || iface.supports_ap_authenticator()
+    }) {
         command_list.push(11); // NEW_KEY
     }
     if iface.is_some_and(|iface| iface.supports_gtk_rekey_offload()) {
@@ -1206,9 +1211,11 @@ fn wiphy_security_attrs(attrs: &mut Vec<u8>, iface: &dyn crate::WirelessNetIface
     if iface.supports_sae_offload() && !sme {
         bits.push(38); // SAE_OFFLOAD
     }
-    if external {
+    if external || iface.supports_ap_authenticator() {
         bits.push(26); // CONTROL_PORT_OVER_NL80211
-        bits.push(42); // CONTROL_PORT_NO_PREAUTH
+        if iface.supports_control_port_no_preauth() {
+            bits.push(42);
+        } // CONTROL_PORT_NO_PREAUTH
         if iface.supports_control_port_tx_status() {
             bits.push(48); // CONTROL_PORT_OVER_NL80211_TX_STATUS
         }

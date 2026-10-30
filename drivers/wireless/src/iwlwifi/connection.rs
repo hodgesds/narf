@@ -22,6 +22,22 @@ pub struct Beacon {
     pub information_elements: Vec<u8>,
 }
 
+/// RSS selects a physical queue before CCMP/reorder admission. Linux keeps
+/// pairwise PN and BA reorder state separately on each such queue; a lower
+/// packet number arriving later on another queue must not corrupt that queue.
+struct QueueRx {
+    replay: frame_api::Replay,
+    ba: [Option<super::aggregation::Window>; super::aggregation::MAX_TIDS],
+}
+impl Default for QueueRx {
+    fn default() -> Self {
+        Self {
+            replay: frame_api::Replay::default(),
+            ba: core::array::from_fn(|_| None),
+        }
+    }
+}
+
 pub struct Connection {
     pub beacon: Beacon,
     local: [u8; 6],
@@ -31,6 +47,7 @@ pub struct Connection {
     sequence: u16,
     security: Option<security::Session>,
     replay: frame_api::Replay,
+    extra_rx: Vec<QueueRx>,
     receive_epoch: u64,
     pub authorized: bool,
     pub last_beacon: u64,
@@ -124,6 +141,7 @@ impl Connection {
             sequence: 0,
             security: None,
             replay: frame_api::Replay::default(),
+            extra_rx: Vec::new(),
             receive_epoch: 0, // explicit post-association RAM fixture owner
             authorized: true,
             last_beacon: narf_time::now_cycles(),
@@ -242,6 +260,7 @@ impl Connection {
         // Reserve before any native await. Neither old notifications nor
         // descriptors copied while this port is closed belong to the new key.
         let receive_epoch = hw.close_receive_epoch()?;
+        hw.prepare_receive_queues().await?;
         let secure = !matches!(auth, AuthMethod::Open);
         let mut profile = super::sc_security::Profile::negotiate(&beacon, local, &auth, local_phy)?;
         let akm = profile.akm;
@@ -380,6 +399,9 @@ impl Connection {
             // Set once the PMK is known (after SAE for WPA3).
             security: None,
             replay: frame_api::Replay::default(),
+            extra_rx: (1..hw.receive_queue_count())
+                .map(|_| QueueRx::default())
+                .collect(),
             receive_epoch,
             authorized: false,
             last_beacon: narf_time::now_cycles(),
@@ -427,6 +449,8 @@ impl Connection {
         };
         // With the PMK in hand, arm the 4-way handshake session.
         if let (Some(pmk), Some(akm)) = (pmk, akm) {
+            let (station_rsnxe, ap_rsnxe) =
+                profile.rsn_extensions(&this.beacon.information_elements)?;
             this.security = Some(
                 security::Session::new(
                     akm,
@@ -437,7 +461,8 @@ impl Connection {
                     this.beacon.rsn.clone().ok_or("AP has no RSN IE")?,
                 )
                 .with_pmf(profile.pmf)
-                .with_station_rsn(profile.rsne.clone().ok_or("MLD station RSNE missing")?),
+                .with_station_rsn(profile.rsne.clone().ok_or("MLD station RSNE missing")?)
+                .with_rsn_extensions(station_rsnxe, ap_rsnxe)?,
             );
         }
         let rsn = profile.rsne.clone();
@@ -630,7 +655,10 @@ impl Connection {
                 let activity = hw.activity();
                 hw.poll()?;
                 while let Some(packet) = hw.notifications.pop_front() {
-                    if packet.header.group_id != 0 || packet.header.cmd != 0xc1 {
+                    if packet.receive_queue != 0
+                        || packet.header.group_id != 0
+                        || packet.header.cmd != 0xc1
+                    {
                         continue;
                     }
                     let Some(mpdu) = scan_api::mpdu(&packet.payload) else {
@@ -679,7 +707,10 @@ impl Connection {
             let activity = hw.activity();
             hw.poll()?;
             while let Some(packet) = hw.notifications.pop_front() {
-                if packet.header.group_id != 0 || packet.header.cmd != 0xc1 {
+                if packet.receive_queue != 0
+                    || packet.header.group_id != 0
+                    || packet.header.cmd != 0xc1
+                {
                     continue;
                 }
                 let Some(mpdu) = scan_api::mpdu(&packet.payload) else {
@@ -919,14 +950,50 @@ impl Connection {
         Ok(true)
     }
 
+    fn replay_for(&mut self, queue: usize) -> &mut frame_api::Replay {
+        if queue == 0 {
+            &mut self.replay
+        } else {
+            &mut self.extra_rx[queue - 1].replay
+        }
+    }
+    fn windows_for(
+        &mut self,
+        queue: usize,
+    ) -> &mut [Option<super::aggregation::Window>; super::aggregation::MAX_TIDS] {
+        if queue == 0 {
+            &mut self.rx_ba
+        } else {
+            &mut self.extra_rx[queue - 1].ba
+        }
+    }
+    fn windows(&self) -> impl Iterator<Item = &super::aggregation::Window> {
+        self.rx_ba
+            .iter()
+            .chain(self.extra_rx.iter().flat_map(|rx| rx.ba.iter()))
+            .flatten()
+    }
+    fn windows_mut(&mut self) -> impl Iterator<Item = &mut super::aggregation::Window> {
+        self.rx_ba
+            .iter_mut()
+            .chain(self.extra_rx.iter_mut().flat_map(|rx| rx.ba.iter_mut()))
+            .flatten()
+    }
+    fn ba_expired(&self, tid: usize, now: u64) -> bool {
+        // One native BA session spans the physical queues. Reorder holes
+        // remain per queue, while any queue's valid traffic refreshes the
+        // session's inactivity timeout.
+        let mut windows = self
+            .windows()
+            .filter(|window| usize::from(window.tid) == tid);
+        windows.next().is_some_and(|first| first.expired(now))
+            && windows.all(|window| window.expired(now))
+    }
     pub(super) fn maintenance_pending(&self) -> bool {
         self.power_pending
             || !self.actions.is_empty()
-            || self
-                .rx_ba
-                .iter()
-                .flatten()
-                .any(|window| window.expired(narf_time::now_cycles()))
+            || (0..super::aggregation::MAX_TIDS)
+                .any(|tid| self.ba_expired(tid, narf_time::now_cycles()))
     }
 
     fn ethernet_frame(
@@ -1044,6 +1111,13 @@ impl Connection {
         includes_snap: Option<bool>,
     ) -> Result<Vec<(Vec<u8>, narf_net::RxMeta)>, &'static str> {
         let mut output = Vec::new();
+        let queue = usize::from(packet.receive_queue);
+        if queue > self.extra_rx.len() {
+            return Err("Sc packet belongs to an unowned physical RFH queue");
+        }
+        if queue != 0 && !self.authorized {
+            return Ok(output);
+        }
         if packet.header.group_id != 0 {
             return Ok(output);
         }
@@ -1065,6 +1139,27 @@ impl Connection {
                     return Ok(output);
                 }
                 let frame = mpdu.frame;
+                if queue != 0 {
+                    // The configured RSS classes hash IP flows. Multicast,
+                    // management and EAPOL stay on fallback0 and cannot acquire per-RSS PN
+                    // ownership by appearing in an additional physical ring.
+                    if frame.len() < 24 || frame[0] & 12 != 8 || frame[4..10] != self.local {
+                        return Ok(output);
+                    }
+                    let mut replay = self.replay_for(queue).clone();
+                    let Some(ethernet) = frame_api::receive(
+                        &mpdu,
+                        self.local,
+                        self.beacon.bssid,
+                        self.security.is_some(),
+                        &mut replay,
+                    ) else {
+                        return Ok(output);
+                    };
+                    if ethernet.get(12..14) == Some(&[0x88, 0x8e]) {
+                        return Ok(output);
+                    }
+                }
                 if !self.admits_data_header(&mpdu) {
                     return Ok(output);
                 }
@@ -1103,22 +1198,25 @@ impl Connection {
                                 self.local,
                                 self.beacon.bssid,
                                 self.security.is_some(),
-                                &mut self.replay.clone(),
+                                &mut self.replay_for(queue).clone(),
                             )
                             .is_none()
                         {
                             return Ok(output);
                         }
-                        if let Some(window) =
-                            self.rx_ba.iter_mut().flatten().find(|w| w.baid == baid)
+                        if let Some(window) = self
+                            .windows_for(queue)
+                            .iter_mut()
+                            .flatten()
+                            .find(|w| w.baid == baid)
                         {
                             let released = window.push(&packet.payload, now);
-                            self.deliver_reordered(released, &mut output)?;
+                            self.deliver_reordered(queue, released, &mut output)?;
                         }
                         return Ok(output);
                     }
                 }
-                if let Some(frame) = self.receive_frame(&mpdu)? {
+                if let Some(frame) = self.receive_frame_on(&mpdu, queue)? {
                     // FH_RSCSR_RPA_EN: v3 descriptor `raw_xsum` (big-endian,
                     // offset 32) is valid (`iwl_mld_rx_csum`).
                     let meta = match includes_snap {
@@ -1141,9 +1239,14 @@ impl Connection {
             0xc3 if packet.payload.len() == 4 => {
                 let baid = packet.payload[0];
                 let nssn = u16::from_le_bytes(packet.payload[2..4].try_into().unwrap());
-                if let Some(window) = self.rx_ba.iter_mut().flatten().find(|w| w.baid == baid) {
+                if let Some(window) = self
+                    .windows_for(queue)
+                    .iter_mut()
+                    .flatten()
+                    .find(|w| w.baid == baid)
+                {
                     let released = window.release(nssn, now);
-                    self.deliver_reordered(released, &mut output)?;
+                    self.deliver_reordered(queue, released, &mut output)?;
                 }
             }
             0xc2 if packet.payload.len() == 8 => {
@@ -1151,13 +1254,13 @@ impl Connection {
                 let info = u32::from_le_bytes(packet.payload[4..8].try_into().unwrap());
                 if sta_tid & 0x1f0 == 0 {
                     if let Some(window) = self
-                        .rx_ba
+                        .windows_for(queue)
                         .get_mut((sta_tid & 15) as usize)
                         .and_then(Option::as_mut)
                     {
                         if window.baid == ((info >> 24) & 63) as u8 {
                             let released = window.release((info & 4095) as u16, now);
-                            self.deliver_reordered(released, &mut output)?;
+                            self.deliver_reordered(queue, released, &mut output)?;
                         }
                     }
                 }
@@ -1169,12 +1272,13 @@ impl Connection {
 
     fn deliver_reordered(
         &mut self,
+        queue: usize,
         packets: Vec<Vec<u8>>,
         output: &mut Vec<(Vec<u8>, narf_net::RxMeta)>,
     ) -> Result<(), &'static str> {
         for packet in packets {
             if let Some(mpdu) = scan_api::mpdu(&packet) {
-                if let Some(frame) = self.receive_frame(&mpdu)? {
+                if let Some(frame) = self.receive_frame_on(&mpdu, queue)? {
                     // Reordered copies no longer carry len_n_flags.
                     output.push((frame, narf_net::RxMeta::default()));
                 }
@@ -1186,10 +1290,12 @@ impl Connection {
     pub fn reorder_tick(&mut self) -> Result<Vec<Vec<u8>>, &'static str> {
         let mut output = Vec::new();
         let now = narf_time::now_cycles();
-        for tid in 0..self.rx_ba.len() {
-            if let Some(window) = &mut self.rx_ba[tid] {
-                let packets = window.tick(now);
-                self.deliver_reordered(packets, &mut output)?;
+        for queue in 0..=self.extra_rx.len() {
+            for tid in 0..super::aggregation::MAX_TIDS {
+                if let Some(window) = &mut self.windows_for(queue)[tid] {
+                    let packets = window.tick(now);
+                    self.deliver_reordered(queue, packets, &mut output)?;
+                }
             }
         }
         Ok(output.into_iter().map(|(frame, _)| frame).collect())
@@ -1283,16 +1389,20 @@ impl Connection {
                                 self.stop_rx_ba(hw, tid).await?;
                             }
                             // Allocate host storage before publishing the FW command.
-                            let mut state = aggregation::Window::new(
-                                0,
-                                tid,
-                                token,
-                                ssn,
-                                window,
-                                timeout,
-                                narf_time::now_cycles(),
-                            )?;
-                            state.reserve_response();
+                            let mut states = Vec::with_capacity(1 + self.extra_rx.len());
+                            for _ in 0..=self.extra_rx.len() {
+                                let mut state = aggregation::Window::new(
+                                    0,
+                                    tid,
+                                    token,
+                                    ssn,
+                                    window,
+                                    timeout,
+                                    narf_time::now_cycles(),
+                                )?;
+                                state.reserve_response();
+                                states.push(state);
+                            }
                             let response = hw
                                 .command(5, 0x16, &aggregation::allocate(tid, ssn, window))
                                 .await?;
@@ -1310,8 +1420,10 @@ impl Connection {
                             {
                                 return Err("firmware reused/returned invalid BAID");
                             }
-                            state.baid = baid as u8;
-                            self.rx_ba[tid as usize] = Some(state);
+                            for (queue, mut state) in states.into_iter().enumerate() {
+                                state.baid = baid as u8;
+                                self.windows_for(queue)[tid as usize] = Some(state);
+                            }
                             status = 0;
                         }
                     }
@@ -1321,10 +1433,12 @@ impl Connection {
                     hw.transmit(self.management_queue, &frame, 24, self.rate())
                         .await?;
                     if status == 0 {
-                        self.rx_ba[tid as usize]
-                            .as_mut()
-                            .ok_or("RX BAID response lost reservation")?
-                            .activate_response(narf_time::now_cycles())?;
+                        for queue in 0..=self.extra_rx.len() {
+                            self.windows_for(queue)[tid as usize]
+                                .as_mut()
+                                .ok_or("RX BAID response lost physical queue reservation")?
+                                .activate_response(narf_time::now_cycles())?;
+                        }
                     }
                 }
                 Some(Action::Delete {
@@ -1337,10 +1451,7 @@ impl Connection {
             }
         }
         for tid in 0..self.rx_ba.len() {
-            if self.rx_ba[tid]
-                .as_ref()
-                .is_some_and(|w| w.expired(narf_time::now_cycles()))
-            {
+            if self.ba_expired(tid, narf_time::now_cycles()) {
                 self.stop_rx_ba(hw, tid as u8).await?;
                 self.service_power(hw).await?;
                 let frame = self.management(0xd0, &aggregation::delete(tid as u8));
@@ -1352,9 +1463,17 @@ impl Connection {
     }
 
     async fn stop_rx_ba(&mut self, hw: &mut Hardware, tid: u8) -> Result<(), &'static str> {
-        if let Some(window) = self.rx_ba[tid as usize].as_mut() {
+        if let Some(window) = self.rx_ba[tid as usize].as_ref() {
             let baid = window.baid;
-            window.reserve_retirement()?;
+            for queue in 0..=self.extra_rx.len() {
+                let window = self.windows_for(queue)[tid as usize]
+                    .as_mut()
+                    .ok_or("RX BAID lost physical queue reservation")?;
+                if window.baid != baid {
+                    return Err("RX BAID physical queue binding changed");
+                }
+                window.reserve_retirement()?;
+            }
             let receipt = hw
                 .command(5, 0x16, &super::aggregation::remove(tid))
                 .await?;
@@ -1369,13 +1488,15 @@ impl Connection {
                 // merely because they preceded a native retirement marker.
                 let _ = self.receive_packet(&packet)?;
             }
-            self.rx_ba[tid as usize] = None;
+            for queue in 0..=self.extra_rx.len() {
+                self.windows_for(queue)[tid as usize] = None;
+            }
         }
         Ok(())
     }
 
     fn discard_reorder(&mut self) {
-        for window in self.rx_ba.iter_mut().flatten() {
+        for window in self.windows_mut() {
             window.discard();
         }
     }
@@ -1390,7 +1511,9 @@ impl Connection {
         }
         if frame.len() < 24
             || (mpdu.rate_n_flags >> 8) & 7 >= 4
-                && self.he.is_none_or(|he| !he.admits_rx_rate(mpdu.rate_n_flags))
+                && self
+                    .he
+                    .is_none_or(|he| !he.admits_rx_rate(mpdu.rate_n_flags))
         {
             return false;
         }
@@ -1405,6 +1528,13 @@ impl Connection {
     pub fn receive_frame(
         &mut self,
         mpdu: &scan_api::Mpdu<'_>,
+    ) -> Result<Option<Vec<u8>>, &'static str> {
+        self.receive_frame_on(mpdu, 0)
+    }
+    fn receive_frame_on(
+        &mut self,
+        mpdu: &scan_api::Mpdu<'_>,
+        queue: usize,
     ) -> Result<Option<Vec<u8>>, &'static str> {
         let frame = mpdu.frame;
         if mpdu.channel != self.beacon.channel || !self.admits_data_header(mpdu) {
@@ -1503,7 +1633,7 @@ impl Connection {
             self.local,
             self.beacon.bssid,
             self.security.is_some(),
-            &mut self.replay,
+            self.replay_for(queue),
         ) else {
             return Ok(None);
         };
@@ -1604,6 +1734,9 @@ impl Connection {
                     }
                     self.pairwise_key = Some(*pairwise);
                     self.replay.reset_pairwise();
+                    for rx in &mut self.extra_rx {
+                        rx.replay.reset_pairwise();
+                    }
                     self.management_pn = 0;
                     self.discard_reorder();
                 }
@@ -1632,6 +1765,9 @@ impl Connection {
                 self.replay.group[id].fill(keys.group_rx_pn);
                 self.replay.group_valid[id] = true;
                 self.replay.reset_subframes();
+                for rx in &mut self.extra_rx {
+                    rx.replay.reset_subframes();
+                }
                 self.discard_reorder();
             }
             // New IGTKs are native keys too. Adopt the authenticated KDE

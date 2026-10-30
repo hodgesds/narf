@@ -200,6 +200,27 @@ impl Profile {
         })
     }
 
+    pub(super) fn rsn_extensions(
+        &self,
+        mut ies: &[u8],
+    ) -> Result<security::RsnExtensions, &'static str> {
+        let station = self.sae.as_ref().and_then(SaeJoin::station_rsnxe);
+        let mut ap = None;
+        while !ies.is_empty() {
+            if ies.len() < 2 || ies.len() < 2 + usize::from(ies[1]) {
+                return Err("truncated AP RSNXE information elements");
+            }
+            if ies[0] == 244 {
+                if ap.is_some() {
+                    return Err("duplicate AP RSNXE");
+                }
+                ap = Some(ies[2..2 + usize::from(ies[1])].to_vec());
+            }
+            ies = &ies[2 + usize::from(ies[1])..];
+        }
+        Ok((station, ap))
+    }
+
     /// Optional response RSNEs cannot silently change the negotiated AKM,
     /// cipher or PMF facts. SAE responses may omit the SAE PMKID.
     pub fn check_response(&self, mut ies: &[u8]) -> Result<(), &'static str> {

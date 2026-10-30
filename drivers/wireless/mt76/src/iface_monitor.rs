@@ -12,10 +12,11 @@ impl Mt76Iface {
         }
     }
     pub(super) fn change_iftype(&self, iftype: u32) -> Result<(), WirelessError> {
-        if ![2, 6].contains(&iftype) {
+        if ![2, 3, 6].contains(&iftype) {
             return Err(WirelessError::NotSupported);
         }
         let _control = self.control.try_lock().ok_or(WirelessError::Busy)?;
+        let _reservation = self.ap_serial.try_reserve()?;
         if self.sleeping.load(Ordering::Acquire) {
             return Err(WirelessError::Busy);
         }
@@ -24,6 +25,11 @@ impl Mt76Iface {
             || entry.carrier
             || self.associated_bssid.lock().is_some()
             || self.monitor_started.load(Ordering::Acquire)
+            || self.ap_owned.load(Ordering::Acquire)
+            || matches!(
+                crate::mt7921::firmware_transport::boot_status(),
+                crate::mt7921::firmware_transport::BootStatus::Running
+            )
             || radio_needs_recovery()
         {
             return Err(WirelessError::Busy);
@@ -33,7 +39,16 @@ impl Mt76Iface {
         } else {
             narf_net::iface::LinkLayer::Ethernet
         };
+        let generation = (iftype != self.current_iftype())
+            .then(|| self.ap_generation.load(Ordering::Acquire).checked_add(1));
+        if generation == Some(None) {
+            return Err(WirelessError::Denied);
+        }
         narf_net::iface::set_link_layer(&self.name, layer).map_err(|_| WirelessError::Busy)?;
+        if let Some(Some(generation)) = generation {
+            self.ap_generation.store(generation, Ordering::Release);
+            self.reset_ap_registrations();
+        }
         self.iftype.store(iftype, Ordering::Release);
         self.wowlan.lock().take();
         self.scan_cache.lock().clear();

@@ -301,6 +301,18 @@ retain registry-only behavior. `try_set_mtu`/`try_set_mac` preserve driver
 errnos; bool wrappers remain available. `AdminError::DeviceError(errno)` carries
 hardware failures through administrative handles to rtnetlink and ioctl
 callers, rather than treating a hardware rejection as a missing interface.
+`set_link_metadata_for(snapshot, carrier, speed_mbps, duplex)` additionally
+compares the original name, namespace, ifindex and nonzero ownership epoch
+under the same IFACES publication lock. DOWN/UP, namespace-away/back and
+same-name/index rebind cannot revive a stale physical-link observation or let
+it clear a successor's carrier. This snapshot is no device/admin grant: the
+trusted driver separately supplies actual native receipts/current authority.
+No callback or capability invocation runs under this comparison/publication.
+`withdraw_link_metadata_for(snapshot)` is a teardown-only complement: an
+immutable, nonwrapping registration identity permits carrier withdrawal after
+administrative DOWN or namespace changes, but rejects a replacement registration
+even with the same name/index/MAC. It can only clear carrier/speed/duplex and
+provides no packet, administrative or carrier-up authority.
 
 `stack::control_registered(&StackAttach)` validates the registered interface
 handle and daemon identity through `Cap::invoke`, returning an interface-bound
@@ -504,6 +516,14 @@ interface identity and mode generation throughout native work/publication.
 `defer_checked` additionally retains a family's `DeferredAuthority` through
 the final ACK edge. Revocation stops polling and converts a would-be success
 to `EPERM`, including revocation at the native terminal-result boundary.
+`defer_replies_checked` additionally accepts an owned `DeferredReplyFuture`
+returning terminal `GenlReply` payloads. The core frames these only after native
+completion, using the admitted family/version and original sequence. It rechecks
+the exact sink and retained family authority before each payload and after any
+reentrant delivery before the next payload/final ACK. Revocation suppresses
+remaining payloads and reports `EPERM` to a still-current original socket;
+closing that socket suppresses all further output. This is a unicast response
+path, with no dump/multipart admission and no success response to queued work.
 Drivers retain hardware resources until their own terminal cancellation or
 cleanup receipt even if the netlink waiter disappears. Existing synchronous
 handlers and context-only builders retain their existing behavior.
@@ -911,6 +931,16 @@ those bytes before the error or EOF.
 Deviation: `iface::for_dst` falls back to the primary interface when no
 route matches, so `ENETUNREACH` is reported only when no interface exists,
 not for every destination without a route.
+
+`NetIfaceEntry::ownership_epoch` and the corresponding snapshot field are
+an additive nonzero identity fence for retained interface controls. A fresh net
+device registration, namespace transfer, actual administrative DOWN or changed
+MAC receives a fresh epoch under the interface lock. No-change operations retain
+it. Zero marks counter exhaustion and consumers must refuse it; epochs never
+wrap or revive an earlier identity. Observing an epoch grants no capability or
+frame admission. Ordinary Ethernet link, carrier, routing and send behavior is
+unchanged. Native asynchronous wireless controls use this fence so a namespace
+away/back or DOWN/UP cycle cannot revive a prior socket/mode operation.
 
 ## 4. Invariants & safety properties
 

@@ -9,6 +9,9 @@ use core::{
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+#[path = "ap_runtime_tests.rs"]
+mod ap_runtime_tests;
+
 #[path = "active_scan_tests.rs"]
 mod active_scan_tests;
 
@@ -190,6 +193,9 @@ fn event(cmd: u8, seq: u8, status: u8) -> Vec<u8> {
 struct Model {
     chip_id: u16,
     phy_capability: Option<[u8; 12]>,
+    ap_hold: Option<Arc<ap_runtime_tests::Hold>>,
+    ap_timing_pause: Option<u64>,
+    ap_timing: Option<(u32, u32, u32, u16)>,
     receive_epoch: u64,
     receive_open: bool,
     captured_packets: VecDeque<CapturedData>,
@@ -319,6 +325,9 @@ impl Model {
         Self {
             chip_id: 0,
             phy_capability: None,
+            ap_hold: None,
+            ap_timing_pause: None,
+            ap_timing: None,
             receive_epoch: 0,
             receive_open: false,
             captured_packets: VecDeque::new(),
@@ -602,6 +611,8 @@ impl Backend for Model {
                     || cmd == 0xb0
                     || cmd == 0x61
                     || cmd == 0x62
+                    || cmd == 0x16
+                    || cmd == 0x17
                     || cmd == 3 && self.scan_stall)
                 {
                     self.replies.push_back(reply);
@@ -634,6 +645,19 @@ impl Backend for Model {
         }
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        if self.frames.last().is_some_and(|(_, f)| {
+            f.len() >= 54
+                && f[43] == 7
+                && (f.len() == 578 && f[34..36] == [2, 0] && f[52..54] == [7, 0]
+                    || f.len() == 88 && f[34..36] == [3, 0] && f[50] == 2)
+        }) {
+            if let Some(hold) = &self.ap_hold {
+                hold.seen.store(true, Ordering::Release);
+                if !hold.release.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+            }
+        }
         if self.pm.wow.hold_offload_ack.load(Ordering::Acquire)
             && self.frames.last().is_some_and(|(_, frame)| {
                 frame.len() >= 48 && frame[43] == 7 && frame[34..36] == [6, 0]
@@ -798,6 +822,8 @@ impl Backend for Model {
             return Err(Error::Busy);
         }
         self.recovery_trace.push(("recycle", self.ticks.get()));
+        self.ap_timing = None;
+        self.ap_timing_pause = None;
         self.sequence.firmware_reset();
         self.tx_status.clear();
         self.active = false;
@@ -807,6 +833,31 @@ impl Backend for Model {
         self.tx_stall = false;
         self.rx_stall = false;
         self.management_resume = None;
+        Ok(())
+    }
+    fn pause_ap_timing(&mut self) -> Result<(), Error> {
+        self.check()?;
+        self.ap_timing_pause = Some(self.ticks.get());
+        Ok(())
+    }
+    fn finish_ap_timing(&mut self, five: bool, short_slot: bool) -> Result<(), Error> {
+        self.check()?;
+        if self
+            .ap_timing_pause
+            .is_none_or(|began| self.ticks.get().saturating_sub(began) < 1_000)
+        {
+            return Err(Error::Timeout);
+        }
+        let short = five || short_slot;
+        self.ap_timing = Some((
+            231 | 48 << 16,
+            60 | 28 << 16,
+            360 | 2 << 10
+                | if five { 16 << 16 } else { 10 << 16 }
+                | if short { 9 << 24 } else { 20 << 24 },
+            if short { 0x49 } else { 3 },
+        ));
+        self.ap_timing_pause = None;
         Ok(())
     }
     fn configure_mac(&mut self) -> Result<(), Error> {
@@ -1081,6 +1132,48 @@ impl Backend for Model {
     }
     fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error> {
         self.model_data(frame, protected, qos, 0)
+    }
+    fn submit_ap_frame(
+        &mut self,
+        frame: &[u8],
+        wcid: u8,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error> {
+        self.check()?;
+        let header = super::ap_packet::descriptor(frame, 0x1000, 1, wcid, rate)?;
+        self.data_headers.push(header);
+        self.frames.push((false, frame.to_vec()));
+        Ok(())
+    }
+    fn arm_ap_management(&mut self, wcid: u8) -> Result<(), Error> {
+        self.check()?;
+        self.sequence.arm_ap_management(wcid)
+    }
+    fn submit_ap_management(
+        &mut self,
+        frame: &[u8],
+        wcid: u8,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error> {
+        self.check()?;
+        let mut header = super::ap_packet::descriptor(frame, 0x1000, 1, wcid, rate)?;
+        if let Some(pid) = self.sequence.pid(0)? {
+            crate::mt7921::tx_sequence::request(&mut header, pid)?;
+            self.sequence.begin(0, 1)?;
+        }
+        self.data_headers.push(header);
+        self.frames.push((false, frame.to_vec()));
+        Ok(())
+    }
+    fn poll_ap_management_ack(&mut self) -> Result<Option<bool>, Error> {
+        self.check()?;
+        for _ in 0..8 {
+            let Some(report) = self.tx_status.pop_front() else {
+                break;
+            };
+            self.sequence.receive(&report)?;
+        }
+        self.sequence.take_ap_ack()
     }
     fn arm_transmit_sequence(&mut self, tid: u8) -> Result<(), Error> {
         self.check()?;

@@ -96,6 +96,7 @@ pub mod regs;
 pub mod rekey;
 pub mod runtime;
 pub mod rx;
+mod rx_multi;
 pub mod rx_rfh;
 mod sc_he;
 mod sc_security;
