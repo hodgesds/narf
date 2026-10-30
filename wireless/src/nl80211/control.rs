@@ -1264,6 +1264,10 @@ fn set_wiphy_handle(bytes: &[u8], context: RequestContext<'_>) -> Result<Vec<Gen
             ATTR_RTS_THRESHOLD,
             ATTR_ANTENNA_TX,
             ATTR_ANTENNA_RX,
+            38,  // WIPHY_FREQ
+            159, // CHANNEL_WIDTH
+            160, // CENTER_FREQ1
+            161, // CENTER_FREQ2
         ],
     )?;
     let interfaces = crate::registry::list();
@@ -1273,6 +1277,22 @@ fn set_wiphy_handle(bytes: &[u8], context: RequestContext<'_>) -> Result<Vec<Gen
         .cloned()
         .ok_or(ENODEV)?;
     let _admin = authority(&context, iface.as_ref())?;
+
+    if let Some(frequency_mhz) = u32_attr(&attrs, 38)? {
+        if iface.current_iftype() != 6 {
+            return Err(EOPNOTSUPP);
+        }
+        iface
+            .set_monitor_channel(crate::monitor::Channel {
+                frequency_mhz,
+                width: u32_attr(&attrs, 159)?.unwrap_or(0),
+                center1_mhz: u32_attr(&attrs, 160)?.unwrap_or(frequency_mhz),
+                center2_mhz: u32_attr(&attrs, 161)?.unwrap_or(0),
+            })
+            .map_err(mlme_errno)?;
+    } else if [159, 160, 161].iter().any(|id| attr(&attrs, *id).is_some()) {
+        return Err(EINVAL);
+    }
 
     let tx = u32_attr(&attrs, ATTR_ANTENNA_TX)?;
     let rx = u32_attr(&attrs, ATTR_ANTENNA_RX)?;
@@ -2260,8 +2280,19 @@ fn interface_handle(
             }
             // NL80211_ATTR_MNTR_FLAGS needs a monitor interface.
             const MONITOR: u32 = 6;
-            if attr(&attrs, 23).is_some() && new != MONITOR {
-                return Err(EINVAL);
+            if let Some(raw) = attr(&attrs, 23) {
+                if new != MONITOR {
+                    return Err(EINVAL);
+                }
+                let nested = attributes(raw)?;
+                let mut flags = 0u32;
+                for (kind, data) in nested {
+                    if !(1..=7).contains(&kind) || !data.is_empty() {
+                        return Err(EINVAL);
+                    }
+                    flags |= 1 << kind;
+                }
+                iface.validate_monitor_flags(flags).map_err(mlme_errno)?;
             }
             if new != current {
                 iface.set_iftype(new).map_err(mlme_errno)?;

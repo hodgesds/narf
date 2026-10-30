@@ -461,7 +461,7 @@ fn smoke_ath11k_int_wpas_sme_wpa2_control_port() -> TestResult {
         );
         ensure!(u.netdev.link_up(), "carrier on at association");
         ensure!(
-            !run(u.shared.lock()).vdev(0).unwrap().link.authorized,
+            !run!(u.shared.lock()).vdev(0).unwrap().link.authorized,
             "port closed"
         );
         // Only the owner may tear it down.
@@ -495,7 +495,7 @@ fn smoke_ath11k_int_wpas_sme_wpa2_control_port() -> TestResult {
             .ok()
             .flatten()
             .ok_or("frame on the ring")?;
-        let _ = run(u.netdev.tx_one(&f));
+        let _ = run!(u.netdev.tx_one(&f));
         pump(&u, 2);
         ensure!(
             data_on_air(&u) == 0,
@@ -577,7 +577,7 @@ fn smoke_ath11k_int_wpas_sme_wpa2_control_port() -> TestResult {
             "the supplicant's TK then GTK"
         );
         {
-            let g = run(u.shared.lock());
+            let g = run!(u.shared.lock());
             let vdev = g.vdev(0).unwrap();
             ensure!(vdev.link.authorized && vdev.link.ptk, "authorized, PTK in");
         }
@@ -610,7 +610,7 @@ fn smoke_ath11k_int_wpas_sme_wpa2_control_port() -> TestResult {
             .ok()
             .flatten()
             .ok_or("frame on the ring")?;
-        run(u.netdev.tx_one(&f)).map_err(|_| "authorized data")?;
+        run!(u.netdev.tx_one(&f)).map_err(|_| "authorized data")?;
         pump(&u, 2);
         ensure!(data_on_air(&u) == 1, "authorized data on the air");
         // GET_STATION: the AP's signal.
@@ -703,8 +703,8 @@ fn smoke_ath11k_int_wpas_connect_pf_packet() -> TestResult {
         let shared = u.shared.clone();
         let step = || {
             for _ in 0..2 {
-                run(netdev.service_once());
-                run(shared.irq.wait(10));
+                run!(netdev.service_once());
+                run!(shared.irq.wait(10));
             }
         };
         let tx_netdev = u.netdev.clone();
@@ -722,7 +722,7 @@ fn smoke_ath11k_int_wpas_connect_pf_packet() -> TestResult {
                 .ok()
                 .flatten()
                 .ok_or("EAPOL on the TX ring")?;
-            run(tx_netdev.tx_one(&f)).map_err(|_| "EAPOL TX before authorization")?;
+            run!(tx_netdev.tx_one(&f)).map_err(|_| "EAPOL TX before authorization")?;
             Ok(())
         };
         let (tk, (gidx, gtk, rsc), _) = four_way(step, &mut sup, rx, tx)?;
@@ -746,7 +746,7 @@ fn smoke_ath11k_int_wpas_connect_pf_packet() -> TestResult {
         );
         ensure!(install_keys(&u).len() == 2, "PTK + GTK installed");
         ensure!(
-            run(u.shared.lock()).vdev(0).unwrap().link.authorized,
+            run!(u.shared.lock()).vdev(0).unwrap().link.authorized,
             "port open"
         );
         sock.release();
@@ -908,7 +908,7 @@ fn smoke_ath11k_int_wpas_sae_authenticate() -> TestResult {
         );
         drop(st);
         ensure!(install_keys(&u).len() == 2, "IGTK not sent to the firmware");
-        let m = run(u.netdev.mac.lock());
+        let m = run!(u.netdev.mac.lock());
         ensure!(
             m.link().is_some_and(|l| l.sta.mfp && l.authorized),
             "PMF association, port open"
@@ -930,7 +930,7 @@ fn smoke_ath11k_int_recover_nl80211_origin() -> TestResult {
         let u = up(wpa2_cfg())?;
         scan6(&u)?;
         // The trait's `associate` is nl80211 CONNECT's entry point.
-        let (r, err, _, _) = latched(|| run(u.netdev.associate(wpa2_req())));
+        let (r, err, _, _) = latched(|| run!(u.netdev.associate(wpa2_req())));
         ensure!(r.is_ok() && err == 0, "connected over nl80211's path");
         LINK_SEEN.lock().clear();
         DISC_SEEN.lock().clear();

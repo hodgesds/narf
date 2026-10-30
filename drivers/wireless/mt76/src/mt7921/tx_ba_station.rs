@@ -5,7 +5,26 @@ impl<B: Backend> Session<B> {
     /// First fresh-peer TID0 agreement only. Existing QoS sequence state is
     /// never guessed or reset by a midstream retry of this entry point.
     pub(super) async fn negotiate_transmit_ba(&mut self) -> Result<bool, Error> {
+        self.negotiate_transmit_ba_tid(0).await
+    }
+    /// A separate immediate agreement for each admitted QoS TID. A TID
+    /// whose hardware sequence has already advanced is still refused.
+    pub(super) async fn negotiate_transmit_ba_tid(&mut self, tid: u8) -> Result<bool, Error> {
         let associated = self.state;
+        self.negotiate_transmit_ba_tid_at(associated, associated, tid, None)
+            .await
+    }
+    /// `ssn` exists only after the retained native sample owner completed.
+    pub(super) async fn negotiate_transmit_ba_tid_at(
+        &mut self,
+        associated: State,
+        restore: State,
+        tid: u8,
+        ssn: Option<u16>,
+    ) -> Result<bool, Error> {
+        if tid >= 8 {
+            return Err(Error::Bounds);
+        }
         let State::Associated {
             info,
             peer,
@@ -18,50 +37,68 @@ impl<B: Backend> Session<B> {
         if self.ht20_profile.is_none() || self.wmm.is_none() {
             return Ok(false);
         }
-        if self.tid0_used || !self.data_pending.is_empty() || self.data_controls_pending() {
+        if (ssn.is_none() && self.used_tids & (1 << tid) != 0)
+            || !self.data_pending.is_empty()
+            || self.data_controls_pending()
+        {
             return Err(Error::Busy);
         }
         self.check_station_tx()?;
-        if !self.tx_ba.start(info.capabilities.mac, peer, channel)? {
+        let started = match ssn {
+            Some(ssn) => {
+                self.tx_ba
+                    .get_mut(tid)?
+                    .restart(info.capabilities.mac, peer, channel, ssn)?
+            }
+            None => self
+                .tx_ba
+                .get_mut(tid)?
+                .start(info.capabilities.mac, peer, channel)?,
+        };
+        if !started {
             return Ok(false);
         }
         self.stage(Stage::StaRecord);
         let result = async {
-            self.send_management(&self.tx_ba.request(), 1).await?;
+            self.send_management(&self.tx_ba.get(tid)?.request(), 1)
+                .await?;
             let started = self.backend.now_ns();
             for _ in 0..2500 {
                 self.check_station_tx()?;
                 self.poll_originator_frames(associated)?;
                 if self.security.as_ref().is_some_and(|s| s.has_pending()) {
-                    self.tx_ba.abandon();
+                    self.tx_ba.get_mut(tid)?.abandon();
                     break;
                 }
-                if self.tx_ba.offered() || self.tx_ba.abandoned() {
+                if self.tx_ba.get(tid)?.offered() || self.tx_ba.get(tid)?.abandoned() {
                     break;
                 }
                 if self.backend.now_ns().saturating_sub(started) >= 1_000_000_000 {
-                    self.tx_ba.abandon();
+                    self.tx_ba.get_mut(tid)?.abandon();
                     break;
                 }
                 narf_scheduler::yield_now().await;
             }
-            if !self.tx_ba.offered() {
-                self.retire_transmit_ba(true).await?;
+            if !self.tx_ba.get(tid)?.offered() {
+                self.retire_transmit_ba_tid(tid, true).await?;
                 return Ok(false);
             }
-            self.tx_ba.configuring(); // retain uncertainty before first native wait.
-            self.exchange_station(Command::Unified { id: 3 }, &self.tx_ba.wtbl(true))
+            self.tx_ba.get_mut(tid)?.configuring(); // retain uncertainty before first native wait.
+            self.exchange_station(Command::Unified { id: 3 }, &self.tx_ba.get(tid)?.wtbl(true))
                 .await?;
-            self.exchange_station(Command::Unified { id: 3 }, &self.tx_ba.station(true))
-                .await?;
-            self.tx_ba.activate(self.backend.now_ns())?;
+            self.exchange_station(
+                Command::Unified { id: 3 },
+                &self.tx_ba.get(tid)?.station(true),
+            )
+            .await?;
+            self.tx_ba.get_mut(tid)?.activate(self.backend.now_ns())?;
             // Control waits may have collected a later peer close, DELBA or
             // key challenge. Process those before handing packets to firmware.
             self.poll_originator_frames(associated)?;
-            if self.tx_ba.pending(self.backend.now_ns())
+            if self.tx_ba.get(tid)?.pending(self.backend.now_ns())
                 || self.security.as_ref().is_some_and(|s| s.has_pending())
             {
-                self.retire_transmit_ba(true).await?;
+                self.retire_transmit_ba_tid(tid, true).await?;
                 return Ok(false);
             }
             self.check_station_tx()?;
@@ -70,13 +107,13 @@ impl<B: Backend> Session<B> {
         .await;
         match result {
             Ok(active) => {
-                self.state = associated;
+                self.state = restore;
                 Ok(active)
             }
             Err(error) => Err(self.fail_data(error)),
         }
     }
-    fn poll_originator_frames(&mut self, associated: State) -> Result<(), Error> {
+    pub(super) fn poll_originator_frames(&mut self, associated: State) -> Result<(), Error> {
         let running = self.state;
         // Exclusive borrowed owner: this transient state is never held over
         // an await or published to another producer. RX uses the same genuine
@@ -96,32 +133,52 @@ impl<B: Backend> Session<B> {
     }
     pub(super) async fn service_transmit_ba(&mut self) -> Result<(), Error> {
         self.tx_ba.tick(self.backend.now_ns());
-        if self.tx_ba.pending(self.backend.now_ns()) {
-            let notify = self.tx_ba.notify();
-            self.retire_transmit_ba(notify).await?;
+        for tid in 0..8 {
+            if self.tx_ba.get(tid)?.pending(self.backend.now_ns()) {
+                let notify = self.tx_ba.get(tid)?.notify();
+                self.retire_transmit_ba_tid(tid, notify).await?;
+            }
         }
         Ok(())
     }
     pub(super) async fn retire_transmit_ba(&mut self, notify: bool) -> Result<(), Error> {
-        if !self.tx_ba.published() && !self.tx_ba.remote() {
-            self.tx_ba.fallback();
+        for tid in 0..8 {
+            self.retire_transmit_ba_tid(tid, notify).await?;
+        }
+        Ok(())
+    }
+    pub(super) async fn retire_transmit_ba_tid(
+        &mut self,
+        tid: u8,
+        notify: bool,
+    ) -> Result<(), Error> {
+        let agreement = self.tx_ba.get_mut(tid)?;
+        if !agreement.published() && !agreement.remote() {
+            agreement.fallback();
             return Ok(());
         }
-        self.tx_ba.stop(notify);
+        agreement.stop(notify);
         // Caller has stopped replenishment and drained every packet proof.
         if !self.data_pending.is_empty() {
             return Err(Error::Busy);
         }
-        if self.tx_ba.published() {
-            self.exchange(Command::Unified { id: 3 }, &self.tx_ba.wtbl(false))
-                .await?;
-            self.exchange(Command::Unified { id: 3 }, &self.tx_ba.station(false))
+        if self.tx_ba.get(tid)?.published() {
+            self.exchange(
+                Command::Unified { id: 3 },
+                &self.tx_ba.get(tid)?.wtbl(false),
+            )
+            .await?;
+            self.exchange(
+                Command::Unified { id: 3 },
+                &self.tx_ba.get(tid)?.station(false),
+            )
+            .await?;
+        }
+        if self.tx_ba.get(tid)?.notify() && self.tx_ba.get(tid)?.remote() {
+            self.send_management(&self.tx_ba.get(tid)?.delba(), 1)
                 .await?;
         }
-        if self.tx_ba.notify() && self.tx_ba.remote() {
-            self.send_management(&self.tx_ba.delba(), 1).await?;
-        }
-        self.tx_ba.fallback();
+        self.tx_ba.get_mut(tid)?.fallback();
         Ok(())
     }
 }

@@ -56,6 +56,7 @@ pub(super) struct Prepared {
     pub(super) aggregate: super::amsdu::Receiver,
     /// PMF receive owner (IGTKs, management PN) when `status.pmf`.
     pub(super) pmf: super::pmf::PmfRx,
+    pub(super) tx_amsdu: super::tx_amsdu::Limits,
 }
 
 /// 802.1D user priority of an Ethernet frame, as Linux
@@ -158,6 +159,21 @@ fn legacy_rx_rate(payload: &[u8], status: LegacyDataStatus) -> bool {
 }
 
 impl Owner {
+    /// Firmware feedback only. A sender additionally needs its signed
+    /// emitting program, peer/SMEM bounds and current data-port admission.
+    pub(in crate::iwlwifi) fn firmware_amsdu_limit(&self, tid: u8) -> Option<u16> {
+        if self.phase != Phase::DataPrepared || self.hardware.is_failed() {
+            return None;
+        }
+        self.power
+            .prepared
+            .as_ref()?
+            .mlme
+            .data
+            .as_ref()?
+            .tx_amsdu
+            .get(tid)
+    }
     pub fn prepared_legacy_data(&self) -> Option<LegacyDataStatus> {
         if self.phase != Phase::DataPrepared || self.prepared_transmit_power().is_none() {
             return None;
@@ -196,7 +212,10 @@ impl Owner {
         }
     }
 
-    fn data_ready(&self, policy: &RegulatoryDomain) -> Result<LegacyDataStatus, &'static str> {
+    pub(super) fn data_ready(
+        &self,
+        policy: &RegulatoryDomain,
+    ) -> Result<LegacyDataStatus, &'static str> {
         let status = self
             .prepared_legacy_data()
             .ok_or("MVM data owner is not terminal/ready")?;
@@ -278,7 +297,7 @@ impl Owner {
         let chains = self.nvm.as_ref().unwrap().tx_chains;
         // SISO uses one antenna; TX STBC and MIMO2 use every valid TX chain
         // (rs_fw_set_active_chains of iwl_mvm_get_valid_tx_ant).
-        let chains = if phy.is_some_and(|p| p.tx_stbc || p.tx_mcs2 != 0) {
+        let chains = if phy.is_some_and(|p| p.tx_stbc || p.multiple_tx_streams()) {
             chains as u8
         } else {
             (chains & chains.wrapping_neg()) as u8
@@ -314,6 +333,7 @@ impl Owner {
             last_peer: narf_time::now_cycles(),
             aggregate: super::amsdu::Receiver::default(),
             pmf: super::pmf::PmfRx::default(),
+            tx_amsdu: super::tx_amsdu::Limits::default(),
         });
         self.phase = Phase::PreparingData;
         let result = self.prepare_data_inner(&edca, &payload, &mut policy).await;
@@ -345,6 +365,13 @@ impl Owner {
         policy: &mut impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
         self.fresh_data_policy(policy).await?;
+        if self.power.phy.features & super::power::feature::TX_AMSDU != 0 {
+            self.prepare_shared_memory_using(policy).await?;
+        }
+        self.hardware.poll()?;
+        self.hardware
+            .notifications
+            .retain(|packet| packet.header.group_id != 5 || packet.header.cmd != 0xf7);
         for (group, command, payload) in [(3, 9, edca), (5, 15, tlc)] {
             if !self
                 .qualified_link_command(group, command, payload, policy)
@@ -724,6 +751,30 @@ impl Owner {
             }
         }
         self.hardware.poll()?;
+        // TLC rate/aggregate reports share RFH with MPDUs. Consume them
+        // before ordinary receive selection so they cannot accumulate in
+        // the notification queue or get mistaken for an Ethernet frame.
+        for _ in 0..32 {
+            let Some(index) = self
+                .hardware
+                .notifications
+                .iter()
+                .position(|p| p.header.group_id == 5 && p.header.cmd == 0xf7)
+            else {
+                break;
+            };
+            let packet = self.hardware.notifications.remove(index).unwrap();
+            self.power
+                .prepared
+                .as_mut()
+                .unwrap()
+                .mlme
+                .data
+                .as_mut()
+                .unwrap()
+                .tx_amsdu
+                .observe(&packet.payload);
+        }
         self.power.phy.ba.tick()?;
         for _ in 0..256 {
             self.check_link_power(&policy()?)?;
@@ -820,7 +871,12 @@ impl Owner {
             // the retained response-bound profile. Reject unsupported header,
             // PHY, reorder and crypto shapes before any replay publication.
             let qos = f[0] == 0x88;
-            let header = if qos { 26 } else { 24 };
+            let htc = qos && f[1] & 0x80 != 0;
+            let header = if qos {
+                26 + if htc { 4 } else { 0 }
+            } else {
+                24
+            };
             // Group-addressed data is never under a Block Ack agreement
             // (IEEE 802.11-2020 10.25) and Linux mvm/rxmq.c::iwl_mvm_reorder
             // never reorders multicast: any reported BAID is ignored and the
@@ -831,7 +887,13 @@ impl Owner {
             let group = f[4] & 1 != 0;
             if !matches!(f[0], 8 | 0x88)
                 || qos && phy.is_none()
-                || f[1] & 0x87 != 2
+                || f[1] & 7 != 2
+                || !qos && f[1] & 0x80 != 0
+                || htc
+                    && (!phy
+                        .and_then(|p| p.he)
+                        .is_some_and(|he| he.negotiation.htc_he())
+                        || f.get(26..30).is_none_or(|control| control[0] & 3 != 3))
                 || f[22] & 15 != 0
                 || mpdu.status & (1 << 22) != 0
                 || qos
@@ -839,7 +901,10 @@ impl Owner {
                         !(if group {
                             q[0] & 15 < 8 && matches!(q[0] & 0x60, 0 | 0x20)
                         } else {
-                            self.power.phy.ba.qos_policy(q[0], mpdu.reorder)
+                            self.power
+                                .phy
+                                .ba
+                                .qos_policy(if htc { q[0] & !0x10 } else { q[0] }, mpdu.reorder)
                         }) || q[1] != 0
                             || (q[0] & 0x80 != 0) != mpdu.amsdu
                     })

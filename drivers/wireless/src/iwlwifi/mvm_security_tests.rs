@@ -204,6 +204,40 @@ fn ap_ethernet(pdu: &[u8]) -> Vec<u8> {
     bytes
 }
 impl Device {
+    pub(in crate::iwlwifi) fn decode_amsdu(mut body: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
+        let mut frames = Vec::new();
+        while !body.is_empty() {
+            if body.len() < 22 || body[6..12] != OWN {
+                return Err("AP A-MSDU subframe address/extent");
+            }
+            let length = usize::from(u16::from_be_bytes([body[12], body[13]]));
+            if !(8..=1508).contains(&length)
+                || body.len() < 14 + length
+                || body[14..20] != [0xaa, 0xaa, 3, 0, 0, 0]
+            {
+                return Err("AP A-MSDU LLC or length");
+            }
+            let mut ethernet = body[..12].to_vec();
+            ethernet.extend_from_slice(&body[20..14 + length]);
+            if ethernet[12..14] == [0x88, 0x8e] {
+                return Err("AP A-MSDU aggregated EAPOL");
+            }
+            frames.push(ethernet);
+            let extent = 14 + length;
+            if extent == body.len() {
+                break;
+            }
+            let aligned = (extent + 3) & !3;
+            if aligned > body.len() || body[extent..aligned].iter().any(|byte| *byte != 0) {
+                return Err("AP A-MSDU padding");
+            }
+            body = &body[aligned..];
+        }
+        if frames.len() < 2 {
+            return Err("AP A-MSDU has no batch");
+        }
+        Ok(frames)
+    }
     pub(in crate::iwlwifi) fn restart_authenticator(
         &mut self,
         expected_group_floor: u64,
@@ -501,10 +535,11 @@ impl Device {
             let flags = u32::from_le_bytes(p.bytes[8..12].try_into().unwrap());
             let mut frame = p.bytes[24..].to_vec();
             let header = if frame[0] == 0x88 { 26 } else { 24 };
+            let amsdu = header == 26 && frame[24] & 0x80 != 0;
             if header == 26 {
-                if p.bytes[6..8] != [0, 0x2d]
+                if p.bytes[6..8] != [0, if amsdu { 0x6d } else { 0x2d }]
                     || frame.get(26..28) != Some(&[0, 0])
-                    || frame[24..26] != [0, 0]
+                    || frame[24..26] != [if amsdu { 0x80 } else { 0 }, 0]
                 {
                     return Err("native QoS TX-v9 padding/TID/offload geometry");
                 }
@@ -678,10 +713,14 @@ impl Device {
                 if !encrypted || flags != 0 || self.ap.phase() != ApPhase::Authorized {
                     return Err("ordinary secured Ethernet lacked native key/authorization");
                 }
-                let mut ethernet = frame[16..22].to_vec();
-                ethernet.extend_from_slice(&frame[10..16]);
-                ethernet.extend_from_slice(&frame[header + 6..]);
-                self.data.push(ethernet);
+                if amsdu {
+                    self.data.extend(Self::decode_amsdu(&frame[header..])?);
+                } else {
+                    let mut ethernet = frame[16..22].to_vec();
+                    ethernet.extend_from_slice(&frame[10..16]);
+                    ethernet.extend_from_slice(&frame[header + 6..]);
+                    self.data.push(ethernet);
+                }
                 kind = Kind::Data;
             }
             let mut complete = vec![0; 48];

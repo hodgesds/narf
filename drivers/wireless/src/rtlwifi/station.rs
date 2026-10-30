@@ -1119,12 +1119,17 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         };
         // Ordinary DATA may clear DISFB only under a current NEFB grant;
         // without it the base programs' fixed USE_RATE + DISFB applies.
-        let fallback = matches!(kind, Kind::Data) && self.station.fallback_current();
+        let sgi_profile = self.station.ht_profile.is_some_and(|p| p.tx_sgi20());
+        let short_gi = matches!(kind, Kind::Data) && rate > 12 && sgi_profile;
+        // Even MCS0's LGI descriptor must stay fixed when its firmware RA
+        // mask advertises SGI. NEFB v1 did not qualify that firmware mode.
+        let fallback =
+            matches!(kind, Kind::Data) && !sgi_profile && self.station.fallback_current();
         let mut publish = || {
             let op = || {
                 self.check_station_policy(environment)
                     .map_err(|_| RadioError::Power(super::super::channel_power::Error::Policy))?;
-                self.submit_aggregate(&bytes, rate, aggregate, fallback)
+                self.submit_aggregate(&bytes, rate, aggregate, fallback, short_gi)
             };
             if let Some(ht) = &ht {
                 ht.invoke(op)
@@ -1258,11 +1263,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         self.packet.qos = true;
                     }
                     if let Some(profile) = self.station.ht_profile {
-                        if self.station.wmm.is_none()
-                            || profile.operation().protection() != 0
-                            || profile.tx_sgi20()
-                            || profile.rx_sgi20()
-                        {
+                        if self.station.wmm.is_none() || profile.operation().protection() != 0 {
                             return Err(Error::Profile);
                         }
                         let ht = self.station.ht.as_ref().ok_or(Error::Profile)?;
@@ -1466,6 +1467,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             let Some(frame) = step.packet else {
                 continue;
             };
+            if frame.short_gi() && !self.station.ht_profile.is_some_and(|p| p.rx_sgi20()) {
+                continue;
+            }
             // _rtl88ee_translate_rx_signal_stuff → rtl_process_phyinfo.
             if let (Some(pwdb), Some(bssid)) = (frame.pwdb(), peer) {
                 if super::super::rate_adaptive::matches_bssid(frame.bytes(), bssid) {
@@ -1760,17 +1764,26 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         {
                             continue;
                         }
+                        let limit = self.station.ht_profile.unwrap().rx_amsdu_limit();
                         let frames = if let Some(security) = &mut self.station.security {
-                            security.receive_amsdu(&frame).map_err(Error::Security)?
+                            security
+                                .receive_amsdu_with(
+                                    &frame,
+                                    narf_wireless::packet_key::AmsduAdmission::new()
+                                        .with_limit(limit),
+                                )
+                                .map_err(Error::Security)?
+                                .map(|r| r.frames)
                         } else {
                             if bytes[1] & 0xc7 != 2 || bytes[16..22] == [0; 6] || bytes[16] & 1 != 0
                             {
                                 continue;
                             }
-                            narf_wireless::amsdu::decode(
+                            narf_wireless::amsdu::decode_with_limit(
                                 &bytes[26..],
                                 own,
                                 bytes[4..10].try_into().unwrap(),
+                                limit,
                             )
                             .ok()
                         };
@@ -1835,8 +1848,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     }
     /// `rtl88ee_update_hal_rate_mask` for the bound AP at `level`, from
     /// the association's legacy intersection (`supp_rates[0]`) and HT
-    /// TX MCS set (`ht_cap.mcs.rx_mask[0]`). SGI is never offered: the
-    /// LGI-only profile refuses an AP SGI20 join.
+    /// TX MCS set (`ht_cap.mcs.rx_mask[0]`) and the actual negotiated SGI20
+    /// peer receive promise. SGI DATA keeps DISFB under the NEHT v2 grant.
     async fn install_station_rate_mask(
         &mut self,
         level: u8,
@@ -1849,7 +1862,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .ok_or(Error::State)?
             .legacy_rates();
         let mcs = self.station.ht_profile.map(|profile| profile.tx_mcs()[0]);
-        let payload = super::super::rate_adaptive::rate_mask(rates, mcs, level, false);
+        let payload = super::super::rate_adaptive::rate_mask(
+            rates,
+            mcs,
+            level,
+            self.station.ht_profile.is_some_and(|p| p.tx_sgi20()),
+        );
         let base = self
             .station
             .calibration

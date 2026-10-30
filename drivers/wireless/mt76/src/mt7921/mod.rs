@@ -54,6 +54,7 @@ mod registers_tests;
 pub mod regs;
 pub(crate) mod six_ghz;
 pub(crate) mod tx_priority;
+mod tx_sequence;
 pub mod txrx;
 pub(crate) mod vht;
 

@@ -17,8 +17,6 @@
 //! builders, `wmi.c::ath11k_init_cmd_send` via `wmi_tests`' WCN6855
 //! resource-config golden), never re-encoded with the code under test.
 
-#![cfg(target_arch = "x86_64")]
-
 extern crate alloc;
 
 use alloc::collections::VecDeque;
@@ -27,7 +25,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::future::Future;
-use core::pin::pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
@@ -58,7 +55,7 @@ macro_rules! ensure {
 }
 
 fn run<F: Future>(f: F) -> F::Output {
-    let mut f = pin!(f);
+    let mut f = alloc::boxed::Box::pin(f);
     let mut cx = Context::from_waker(Waker::noop());
     for _ in 0..100_000 {
         if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {

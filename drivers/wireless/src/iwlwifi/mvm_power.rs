@@ -34,6 +34,9 @@ pub(in crate::iwlwifi) enum Emission {
     /// own externally qualified program, bound by name, binding domain and
     /// record bytes 62..64; one set never authorizes another.
     Features(u16),
+    /// Firmware probe requests before a station/PHY exists. The exact
+    /// requested scan-channel list is additionally included in the binding.
+    ActiveScan,
 }
 
 /// Emitting-feature bits of a tag5 program.
@@ -63,9 +66,23 @@ pub(in crate::iwlwifi) mod feature {
     /// Contiguous 160MHz VHT (requires `VHT`): a 160MHz PHY context, TLC
     /// 160MHz width, SGI160 and the `IWL_TLC_MCS_PER_BW_160` map.
     pub const WIDTH_160: u16 = 1 << 8;
+    /// Host-built plaintext A-MSDU under current firmware TLC/FIFO limits,
+    /// with firmware key/PN ownership and TX_CMD_OFFLD_AMSDU.
+    pub const TX_AMSDU: u16 = 1 << 9;
+    /// Native HE MAC/link/station/TLC profile and HE-variant HT Control RX.
+    pub const HE: u16 = 1 << 10;
     /// Every bit this driver can emit; other bits are refused.
-    pub const KNOWN: u16 =
-        BA | NESTED_BA | QOS_TIDS | TX_LDPC | TX_STBC | HT40 | NSS2 | VHT | WIDTH_160;
+    pub const KNOWN: u16 = BA
+        | NESTED_BA
+        | QOS_TIDS
+        | TX_LDPC
+        | TX_STBC
+        | HT40
+        | NSS2
+        | VHT
+        | WIDTH_160
+        | TX_AMSDU
+        | HE;
 }
 
 impl Emission {
@@ -77,12 +94,13 @@ impl Emission {
             Emission::Ht20Ba => 3,
             Emission::Ht20NestedBa => 4,
             Emission::Features(_) => 5,
+            Emission::ActiveScan => 6,
         }
     }
     /// Feature bits granted by this program (tag3/4 imply their BA bits).
     pub(in crate::iwlwifi) fn features(self) -> u16 {
         match self {
-            Emission::Legacy | Emission::Ht20 => 0,
+            Emission::Legacy | Emission::Ht20 | Emission::ActiveScan => 0,
             Emission::Ht20Ba => feature::BA,
             Emission::Ht20NestedBa => feature::BA | feature::NESTED_BA,
             Emission::Features(bits) => bits,
@@ -108,6 +126,8 @@ pub(super) struct Context {
     pub(super) nvm_permissions: Option<Vec<u32>>,
     pub(super) prepared: Option<Prepared>,
     pub(super) phy: super::phy::Context,
+    /// Opaque FIFO geometry returned by this firmware generation.
+    pub(super) shared_memory: Option<super::SharedMemory>,
 }
 impl Context {
     pub(super) fn new(api: &FirmwareApi<'_>) -> Self {
@@ -116,6 +136,7 @@ impl Context {
             nvm_permissions: None,
             prepared: None,
             phy: super::phy::Context::default(),
+            shared_memory: None,
         }
     }
 }
@@ -215,6 +236,7 @@ fn request(binding: [u8; 32], mac: [u8; 6], emission: Emission) -> PowerRequest 
         Emission::Ht20 => "mvm-api77-ht20-siso-wmm-power-v2",
         Emission::Ht20Ba => "mvm-api77-ht20-siso-wmm-ba-power-v3",
         Emission::Ht20NestedBa => "mvm-api77-ht20-siso-wmm-nested-ba-power-v4",
+        Emission::ActiveScan => "mvm-api77-active-scan-power-v6",
         Emission::Features(bits) => {
             features = format!("mvm-api77-ht20-siso-wmm-features-{bits:04x}-power-v5");
             &features
@@ -225,6 +247,19 @@ fn request(binding: [u8; 32], mac: [u8; 6], emission: Emission) -> PowerRequest 
             "iwlwifi/{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
             program, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         ),
+        binding,
+    }
+}
+fn bind_scan_program(base: [u8; 32], channels: &[u8]) -> PowerRequest {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"NARF Intel MVM exact active-scan channel program v6");
+    hash.update(&base);
+    hash.update(&[channels.len() as u8]);
+    hash.update(channels);
+    let binding = hash.finalize();
+    let digest: String = binding.iter().map(|b| format!("{b:02x}")).collect();
+    PowerRequest {
+        name: format!("iwlwifi/mvm-api77-active-scan-power-v6-{digest}.bin"),
         binding,
     }
 }
@@ -264,6 +299,110 @@ pub(super) struct Values {
     sar: [[u8; 5]; 2],
     maximum: i16,
     gain: i16,
+}
+
+/// Retained qualification and device-wide ceiling for one firmware scan.
+/// A command/future is polled inside current capability invocation; neither
+/// an earlier power receipt nor a copied policy can authorize later probes.
+pub(super) struct ScanFence {
+    cap: narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+    channels: Vec<u8>,
+    active: Vec<bool>,
+    maximum: i16,
+    gain: i16,
+    applied: i16,
+}
+impl ScanFence {
+    fn ceiling(&self, domain: &RegulatoryDomain) -> Result<i16, &'static str> {
+        if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
+            return Err("MVM active-scan current country unavailable");
+        }
+        let mut ceiling = self.maximum;
+        for (&channel, &active) in self.channels.iter().zip(&self.active) {
+            if !super::scan::passive_permitted(domain, channel) {
+                return Err("MVM active-scan receive policy tightened");
+            }
+            if active {
+                let host = super::super::connection::host_channel_power(domain, channel, true)
+                    .ok_or("MVM active-scan probe policy tightened")?;
+                ceiling = ceiling.min(i16::from(host) * 8 - self.gain);
+            }
+        }
+        if !(-1024..=1016).contains(&ceiling) {
+            return Err("MVM active-scan power ceiling out of range");
+        }
+        Ok(ceiling)
+    }
+    pub(super) fn invoke<T>(
+        &self,
+        domain: &RegulatoryDomain,
+        operation: impl FnOnce() -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        use narf_capabilities::{Cap, CapError, CapOp, Read};
+        struct Live<'a, F> {
+            fence: &'a ScanFence,
+            domain: &'a RegulatoryDomain,
+            operation: F,
+        }
+        impl<T, F: FnOnce() -> Result<T, &'static str>> CapOp<narf_firmware::FirmwareBlob, Read>
+            for Live<'_, F>
+        {
+            type Output = Result<T, &'static str>;
+            fn execute(
+                self,
+                _: &Cap<narf_firmware::FirmwareBlob, Read>,
+            ) -> Result<Self::Output, CapError> {
+                Ok((|| {
+                    if self.fence.ceiling(self.domain)? < self.fence.applied {
+                        return Err("MVM active-scan ceiling tightened below applied power");
+                    }
+                    (self.operation)()
+                })())
+            }
+        }
+        self.cap
+            .invoke(Live {
+                fence: self,
+                domain,
+                operation,
+            })
+            .map_err(|_| "MVM active-scan qualification revoked")?
+    }
+    pub(super) fn device_command(&self) -> [u8; 44] {
+        let mut body = [0; 44];
+        put32(&mut body, 0, 1); // IWL_TX_POWER_MODE_SET_DEVICE, no PHY/link.
+        body[8..10].copy_from_slice(&self.applied.to_le_bytes());
+        body
+    }
+}
+impl Prepared {
+    pub(super) fn scan_fence(
+        &self,
+        channels: &[u8],
+        active: &[bool],
+        domain: &RegulatoryDomain,
+    ) -> Result<ScanFence, &'static str> {
+        if self.emission != Emission::ActiveScan
+            || channels.len() != active.len()
+            || !active.iter().any(|active| *active)
+        {
+            return Err("MVM active-scan has no qualified probe channel");
+        }
+        let mut fence = ScanFence {
+            cap: self.source.cap,
+            channels: channels.to_vec(),
+            active: active.to_vec(),
+            maximum: self.maximum,
+            gain: self.gain,
+            applied: -1024,
+        };
+        fence.applied = fence.ceiling(domain)?;
+        fence.invoke(domain, || Ok(()))?;
+        Ok(fence)
+    }
+    pub(super) fn scan_chain_command(&self) -> [u8; 44] {
+        chain_command(self.sar)
+    }
 }
 pub(super) fn validate_record(
     source: &Asset,
@@ -489,6 +628,9 @@ impl Owner {
             Emission::Features(_) => {
                 &b"NARF Intel MVM API77 qualified HT20 SISO MCS0-7 SGI20 WMM feature program power v5"[..]
             }
+            Emission::ActiveScan => {
+                &b"NARF Intel MVM API77 qualified active-scan legacy probe rates24+5 raw26 SSIDs20 dwell30TU SET_CHAINS+SET_DEVICE power v6"[..]
+            }
         });
         if let Emission::Features(bits) = emission {
             hash.update(&bits.to_le_bytes());
@@ -501,6 +643,27 @@ impl Owner {
         hash.update(&image.finalize());
         hash.update(&platform_digest()?);
         Ok(request(hash.finalize(), mac, emission))
+    }
+
+    /// Exact scan-emission qualification name and binding for the retained
+    /// MAC, firmware, platform, chain facts and ordered channel list. This
+    /// does not authorize association or reuse a station's power program.
+    pub fn scan_power_request(&mut self, channels: &[u8]) -> Result<PowerRequest, &'static str> {
+        if channels.is_empty()
+            || channels.len() > 51
+            || channels.iter().enumerate().any(|(i, ch)| {
+                super::super::station_api::channel_index(*ch).is_none()
+                    || channels[..i].contains(ch)
+            })
+        {
+            return Err("invalid MVM active-scan qualification channels");
+        }
+        let base = self.transmit_power_request_for(Emission::ActiveScan)?;
+        Ok(bind_scan_program(base.binding, channels))
+    }
+
+    pub(super) fn scan_power_api(&self) -> bool {
+        self.power.reduced_v5 && self.hardware.version(1, REDUCE_TX_POWER) == Some((5, 0))
     }
 
     pub fn prepared_transmit_power(&self) -> Option<PowerStatus> {
@@ -607,6 +770,9 @@ impl Owner {
     }
 
     pub(super) fn current_power(&self, domain: &RegulatoryDomain) -> Result<i16, &'static str> {
+        if self.power.phy.features & feature::HE != 0 && !self.scan_he_permitted() {
+            return Err("MVM current MCC profile prohibits HE operation");
+        }
         let prepared = self
             .power
             .prepared

@@ -290,17 +290,41 @@ impl Owner {
                 52,
                 u32::from(status.erp_protection) | p.protection,
             );
+            if let Some(he) = p.he {
+                he.apply_link(&mut link);
+            }
         }
-        for (group, id, body) in [
-            (3, 9, link.to_vec()),
-            (3, 8, mac(local, Some(status.aid)).to_vec()),
-        ] {
+        let he = self.power.phy.negotiated.and_then(|p| p.he);
+        let mut mac = mac(local, Some(status.aid));
+        if he.is_some() {
+            put32(&mut mac, 24, 1); // wifi_gen.he_support, MAC_CONFIG v1
+            put32(&mut mac, 32, 1); // NIC not ACK-enabled
+        }
+        let commands = if he.is_some() {
+            alloc::vec![(3, 8, mac.to_vec()), (3, 9, link.to_vec())]
+        } else {
+            alloc::vec![(3, 9, link.to_vec()), (3, 8, mac.to_vec())]
+        };
+        for (group, id, body) in commands {
             if !self
                 .qualified_link_command(group, id, &body, policy)
                 .await?
                 .is_empty()
             {
                 return Err("associated link/MAC receipt invalid");
+            }
+        }
+        if let Some(he) = he {
+            let bytes = he.context(
+                self.he_context_version()
+                    .ok_or("MVM HE context API disappeared")?,
+            )?;
+            if !self
+                .qualified_link_command(5, 7, &bytes, policy)
+                .await?
+                .is_empty()
+            {
+                return Err("MVM HE station context receipt invalid");
             }
         }
         self.check_link_power(&policy()?)?;

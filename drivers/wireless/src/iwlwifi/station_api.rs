@@ -20,6 +20,8 @@ pub struct Nvm {
     pub rx_chains: u32,
     pub channels: Vec<u8>,
     pub phy: super::ht_vht::Local,
+    /// Actual NVM_MAC_SKU_FLAGS_802_11AX_ENABLED, not a PCI inference.
+    pub he: bool,
 }
 
 impl Nvm {
@@ -62,6 +64,7 @@ impl Nvm {
                 tx_chains,
                 rx_chains,
             ),
+            he: u32::from_le_bytes(bytes[8..12].try_into().unwrap()) & (1 << 4) != 0,
         })
     }
 }

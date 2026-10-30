@@ -327,7 +327,7 @@ pub fn prepare_header(
     }
     let fc = u16::from_le_bytes([frame[0], frame[1]]);
     // Initial transport profile: native management or ordinary non-QoS
-    // three-address data, without fragmentation/HT-control extras. Only B's
+    // three-address data, without fragmentation. Only B's
     // retained ordinary station path admits already encrypted host CCMP.
     if !matches!(
         fc & 0x00fc,
@@ -345,7 +345,8 @@ pub fn prepare_header(
             | 0x00d0
             | 0x0008
             | 0x0088
-    ) || fc & (0x8000 | 0x0400) != 0
+    ) || fc & 0x0400 != 0
+        || fc & 0x8000 != 0 && (chip != ChipId::Rtl8852B || fc & 0xfc != 0x88)
         || fc & 0x0300 == 0x0300
         || frame[22] & 0xf != 0
     {
@@ -355,14 +356,23 @@ pub fn prepare_header(
         return Err(Error::BadFrame);
     }
     let header_length = if fc & 0xfc == 0x88 {
-        // TID0..7 with normal ack policy; EOSP/A-MSDU/TXOP bits unsupported.
+        // TID0..7, normal ack policy; EOSP belongs to the HE +HTC form.
         if chip != ChipId::Rtl8852B
-            || frame.get(24).is_none_or(|control| control & 0xf8 != 0)
+            || frame.get(24).is_none_or(|control| {
+                control & 0xe8 != 0 || (control & 0x10 != 0) != (fc & 0x8000 != 0)
+            })
             || frame.get(25) != Some(&0)
         {
             return Err(Error::BadFrame);
         }
-        26
+        if fc & 0x8000 != 0 {
+            if frame.get(26..30).is_none_or(|control| control[0] & 3 != 3) {
+                return Err(Error::BadFrame);
+            }
+            30
+        } else {
+            26
+        }
     } else {
         24
     };

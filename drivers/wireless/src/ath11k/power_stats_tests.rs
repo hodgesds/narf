@@ -34,7 +34,7 @@ fn smoke_ath11k_int_firmware_power_native_readback() -> TestResult {
     check(|| {
         for rev in [HwRev::Wcn6855Hw21, HwRev::Qca6390Hw20] {
             let u = rig(rev)?;
-            let pdev = run(u.netdev.mac.lock())
+            let pdev = run!(u.netdev.mac.lock())
                 .tx_power_query_pdev()
                 .ok_or("missing live power query context")?;
             // Unsolicited target statistics cannot overwrite the fallback.
@@ -49,7 +49,7 @@ fn smoke_ath11k_int_firmware_power_native_readback() -> TestResult {
                 u.shared.firmware_tx_power_dbm().is_none(),
                 "unsolicited pdev stats ignored"
             );
-            let fallback = run(u.netdev.mac.lock()).tx_power_dbm();
+            let fallback = run!(u.netdev.mac.lock()).tx_power_dbm();
             ensure!(
                 u.netdev.tx_power_dbm() == fallback,
                 "GET_INTERFACE retains bss_conf fallback"
@@ -91,7 +91,7 @@ fn smoke_ath11k_int_firmware_power_native_readback() -> TestResult {
                 u.shared.firmware_tx_power_dbm().is_none(),
                 "foreign/truncated firmware stats do not publish"
             );
-            run(u.shared.refresh_tx_power(pdev)).map_err(|_| "coalesced query")?;
+            run!(u.shared.refresh_tx_power(pdev)).map_err(|_| "coalesced query")?;
             pump(&u, 1);
             ensure!(
                 count(&u) == 1,
@@ -125,12 +125,12 @@ fn smoke_ath11k_int_firmware_power_native_readback() -> TestResult {
 fn smoke_ath11k_int_power_query_cancelled_lock_retains_owner() -> TestResult {
     check(|| {
         let u = rig(HwRev::Wcn6855Hw21)?;
-        let pdev = run(u.netdev.mac.lock())
+        let pdev = run!(u.netdev.mac.lock())
             .tx_power_query_pdev()
             .ok_or("power context")?;
-        let held = run(u.shared.lock());
+        let held = run!(u.shared.lock());
         {
-            let mut future = pin!(u.shared.refresh_tx_power(pdev));
+            let mut future = heap_future(|| u.shared.refresh_tx_power(pdev));
             ensure!(
                 future
                     .as_mut()
@@ -140,7 +140,7 @@ fn smoke_ath11k_int_power_query_cancelled_lock_retains_owner() -> TestResult {
             );
         }
         drop(held);
-        run(u.shared.refresh_tx_power(pdev)).map_err(|_| "cancelled query coalescing")?;
+        run!(u.shared.refresh_tx_power(pdev)).map_err(|_| "cancelled query coalescing")?;
         pump(&u, 1);
         ensure!(
             count(&u) == 0,
@@ -166,26 +166,26 @@ fn smoke_ath11k_int_power_query_cancelled_lock_retains_owner() -> TestResult {
 fn smoke_ath11k_int_power_query_native_failure_and_late_receipt() -> TestResult {
     check(|| {
         let u = rig(HwRev::Wcn6855Hw21)?;
-        let pdev = run(u.netdev.mac.lock())
+        let pdev = run!(u.netdev.mac.lock())
             .tx_power_query_pdev()
             .ok_or("power context")?;
         let endpoint = {
-            let mut rt = run(u.shared.lock());
+            let mut rt = run!(u.shared.lock());
             rt.core.wmi_ep.take()
         };
         ensure!(
-            run(u.shared.refresh_tx_power(pdev)).is_err(),
+            run!(u.shared.refresh_tx_power(pdev)).is_err(),
             "missing native WMI endpoint fails send"
         );
-        run(u.shared.lock()).core.wmi_ep = endpoint;
-        run(u.shared.refresh_tx_power(pdev)).map_err(|_| "known unpublished failure retry")?;
+        run!(u.shared.lock()).core.wmi_ep = endpoint;
+        run!(u.shared.refresh_tx_power(pdev)).map_err(|_| "known unpublished failure retry")?;
         pump(&u, 1);
         ensure!(
             count(&u) == 1,
             "failed native send releases only unpublished reservation"
         );
         NOW.fetch_add(1001, Ordering::Relaxed);
-        run(u.shared.refresh_tx_power(pdev)).map_err(|_| "expired transaction remains owned")?;
+        run!(u.shared.refresh_tx_power(pdev)).map_err(|_| "expired transaction remains owned")?;
         pump(&u, 1);
         ensure!(count(&u) == 1, "timeout cannot reuse untagged request");
         u.dev
@@ -199,14 +199,14 @@ fn smoke_ath11k_int_power_query_native_failure_and_late_receipt() -> TestResult 
             u.shared.firmware_tx_power_dbm().is_none(),
             "late native response not published as fresh power"
         );
-        run(u.shared.refresh_tx_power(pdev))
+        run!(u.shared.refresh_tx_power(pdev))
             .map_err(|_| "actual terminal response permits next query")?;
         pump(&u, 1);
         ensure!(
             count(&u) == 2,
             "actual terminal receipt retires expired request"
         );
-        run(u.shared.lock()).pre_reconfigure_recovery();
+        run!(u.shared.lock()).pre_reconfigure_recovery();
         ensure!(
             u.shared.firmware_tx_power_dbm().is_none(),
             "crash closes target power cache"
@@ -230,11 +230,11 @@ kernel_test_in!(
 fn smoke_ath11k_int_power_query_old_waiter_cannot_post_after_reset() -> TestResult {
     check(|| {
         let u = rig(HwRev::Wcn6855Hw21)?;
-        let pdev = run(u.netdev.mac.lock())
+        let pdev = run!(u.netdev.mac.lock())
             .tx_power_query_pdev()
             .ok_or("power context")?;
-        let held = run(u.shared.lock());
-        let mut old = pin!(u.shared.refresh_tx_power(pdev));
+        let held = run!(u.shared.lock());
+        let mut old = heap_future(|| u.shared.refresh_tx_power(pdev));
         ensure!(
             old.as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))
@@ -251,10 +251,10 @@ fn smoke_ath11k_int_power_query_old_waiter_cannot_post_after_reset() -> TestResu
             "physical reset/native MAC reconstruction"
         );
         ensure!(
-            run(u.netdev.mac.lock()).tx_power_query_pdev() == Some(pdev),
+            run!(u.netdev.mac.lock()).tx_power_query_pdev() == Some(pdev),
             "successor query uses actually restored MAC channel context"
         );
-        run(u.shared.refresh_tx_power(pdev)).map_err(|_| "successor stats request")?;
+        run!(u.shared.refresh_tx_power(pdev)).map_err(|_| "successor stats request")?;
         pump(&u, 1);
         ensure!(
             count(&u) == 1,

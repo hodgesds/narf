@@ -1998,7 +1998,11 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
                 bssid: [0; 6],
             }));
         }
-        let dev = match self.shared.recover_device(notice).await {
+        // Keep transport reconstruction in its own heap-backed poll. Fat
+        // LTO otherwise merges its large state/move temporaries into this
+        // MAC recovery poll and can consume the ARM64 kernel stack before
+        // a nested transport or console call gets a chance to run.
+        let dev = match super::future_heap::build(|| self.shared.recover_device(notice)).await {
             Ok(d) => d,
             Err(_) => return false,
         };

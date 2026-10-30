@@ -183,11 +183,22 @@ fn reset(io: &mut impl RegisterIo) -> Result<(), BringUpError> {
 /// followed by the forced `hw.c::ath9k_set_power_sleep` FULL_SLEEP entry:
 /// STA_ID1 PWR_SAV, RTC force-wake clear, AR_RC AHB|HOSTIF held in reset and
 /// the active-low RTC reset asserted. Resume needs a full power-on reset.
+#[cfg(any(test, feature = "kernel-test"))]
 pub(super) fn disable_and_sleep(io: &mut impl RegisterIo) -> Result<(), BringUpError> {
+    disable_and_sleep_with_pcie(io, None)
+}
+
+fn disable_and_sleep_with_pcie(
+    io: &mut impl RegisterIo,
+    pcie_xe2: Option<bool>,
+) -> Result<(), BringUpError> {
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
     reset(io)?;
+    if let Some(xe2) = pcie_xe2 {
+        super::pcie_pm::configure(io, true, xe2, true)?;
+    }
     let id1 = io.read32(AR_STA_ID1);
     let wake = io.read32(AR_RTC_FORCE_WAKE);
     let rtc = io.read32(AR_RTC_RESET);
@@ -205,8 +216,9 @@ pub(super) fn disable_and_sleep(io: &mut impl RegisterIo) -> Result<(), BringUpE
 pub(super) fn sleep(
     mmio: narf_bus::MmioRegion,
     cap: Cap<BusDeviceCap, Write>,
+    pcie_xe2: Option<bool>,
 ) -> Result<(), BringUpError> {
-    disable_and_sleep(&mut Registers::new(mmio, cap))
+    disable_and_sleep_with_pcie(&mut Registers::new(mmio, cap), pcie_xe2)
 }
 
 fn decode_identity(

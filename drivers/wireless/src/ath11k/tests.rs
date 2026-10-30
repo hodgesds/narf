@@ -7,8 +7,6 @@
 //! is exercised by the probe-bound-or-skip smoke at the bottom —
 //! that one Skips cleanly on QEMU.
 
-#![cfg(target_arch = "x86_64")]
-
 extern crate alloc;
 
 use alloc::vec::Vec;

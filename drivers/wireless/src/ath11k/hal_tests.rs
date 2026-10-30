@@ -5,8 +5,6 @@
 //! for WCN6855 (`wcn6855_regs`), not from the code under test. Register
 //! programming is replayed against [`RecIo`], a recording [`ChipIo`].
 
-#![cfg(target_arch = "x86_64")]
-
 extern crate alloc;
 
 use alloc::collections::BTreeMap;

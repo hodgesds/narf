@@ -3,6 +3,39 @@ use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 include!("golden.rs");
 const OWN: [u8; 6] = [2, 1, 2, 3, 4, 5];
+fn smoke_rtw89_he_htc_txwd_uses_full_header_and_checks_control() -> TestResult {
+    let mut bytes = frame(100, false);
+    bytes[..2].copy_from_slice(&[0x88, 0xc1]);
+    bytes[24..30].copy_from_slice(&[0x10, 0, 0x1b, 0, 0, 0]);
+    bytes[30..38].copy_from_slice(&[1, 0, 0, 0x20, 0, 0, 0, 0]);
+    let Ok((header, _)) = transmit_rate(&bytes, OWN, 0, 0, 0x1000, true, FIRMWARE_RA) else {
+        return TestResult::Fail("native HE +HTC host CCMP rejected");
+    };
+    let body0 = u32::from_le_bytes(header[..4].try_into().unwrap());
+    if (body0 >> 11) & 31 != 15
+        || header[16..24] != [0; 8]
+        || u32::from_le_bytes(header[28..32].try_into().unwrap()) & (1 << 14) == 0
+    {
+        return TestResult::Fail("TXWD +HTC header length or hardware security fields");
+    }
+    for (index, value) in [(0, 8), (24, 0), (26, 0), (32, 1), (33, 0)] {
+        let mut bad = bytes.clone();
+        bad[index] = value;
+        if transmit_rate(&bad, OWN, 0, 0, 0x1000, true, FIRMWARE_RA).is_ok() {
+            return TestResult::Fail("malformed HE +HTC or wrong CCMP offset admitted");
+        }
+    }
+    if transmit_rate(&bytes, OWN, 0, 0, 0x1000, true, 0).is_ok()
+        || classify(&bytes[..29], OWN).is_ok()
+    {
+        return TestResult::Fail("fixed legacy rate or incomplete +HTC admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/htc",
+    smoke_rtw89_he_htc_txwd_uses_full_header_and_checks_control
+);
 fn frame(length: usize, management: bool) -> Vec<u8> {
     let mut bytes = vec![0; length];
     bytes[..2].copy_from_slice(if management { &[0xb0, 0] } else { &[8, 1] });

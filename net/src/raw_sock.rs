@@ -71,6 +71,7 @@ pub const PACKET_MR_UNICAST: u16 = 3;
 /// `ARPHRD_ETHER` / `ARPHRD_LOOPBACK`.
 pub const ARPHRD_ETHER: u16 = 1;
 pub const ARPHRD_LOOPBACK: u16 = 772;
+pub const ARPHRD_IEEE80211_RADIOTAP: u16 = 803;
 
 /// Socket types `packet_create` accepts.
 pub const SOCK_DGRAM: u32 = 2;
@@ -122,6 +123,7 @@ pub struct NetDev {
     pub dev_addr: [u8; 6],
     /// `dev->type`.
     pub hatype: u16,
+    pub packet_generation: u64,
     /// `dev->flags & IFF_UP`.
     pub up: bool,
     pub mtu: u32,
@@ -136,6 +138,7 @@ impl NetDev {
             name: snap.name.clone(),
             dev_addr: snap.mac,
             hatype: snap.hatype(),
+            packet_generation: snap.packet_generation,
             up: snap.link_up,
             mtu: snap.mtu,
             net_ns_id: snap.net_ns_id,
@@ -242,6 +245,7 @@ struct Inner {
     ifindex: i32,
     /// `po->prot_hook.dev`: the device the hook is bound to.
     bound_dev: Option<u32>,
+    bound_generation: Option<u64>,
     /// `PACKET_SOCK_RUNNING`: the hook is registered.
     running: bool,
     filter: Option<Arc<cbpf::Program>>,
@@ -294,6 +298,7 @@ impl PacketSock {
                 num,
                 ifindex: 0,
                 bound_dev: None,
+                bound_generation: None,
                 running: false,
                 filter: None,
                 queue: VecDeque::new(),
@@ -409,7 +414,9 @@ impl PacketSock {
         };
         let dev_index = dev.as_ref().map(|d| d.ifindex);
         // `po->prot_hook.type` always equals `po->num` outside this function.
-        let need_rehook = g.num != proto || g.bound_dev != dev_index;
+        let generation = dev.as_ref().map(|dev| dev.packet_generation);
+        let need_rehook =
+            g.num != proto || g.bound_dev != dev_index || g.bound_generation != generation;
         if need_rehook {
             if g.running {
                 g.num = 0;
@@ -417,6 +424,7 @@ impl PacketSock {
             }
             g.num = proto;
             g.bound_dev = dev_index;
+            g.bound_generation = generation;
             g.ifindex = dev_index.map_or(0, |i| i as i32);
         }
         if proto == 0 || !need_rehook {
@@ -610,6 +618,13 @@ impl PacketSock {
         };
         let len = skb.frame.len().saturating_sub(data_off);
         let mut g = self.inner.lock();
+        if !g.running
+            || g.bound_dev.is_some_and(|index| index != dev.ifindex)
+            || g.bound_generation
+                .is_some_and(|generation| generation != dev.packet_generation)
+        {
+            return;
+        }
         let view = cbpf::SkbView {
             frame: skb.frame,
             data_off,
@@ -645,7 +660,9 @@ impl PacketSock {
         let data = skb.frame[data_off..data_off + snaplen].to_vec();
         let mut addr = [0u8; 8];
         // `dev_parse_header` → `eth_header_parse`: the source MAC.
-        addr[..6].copy_from_slice(&skb.frame[6..12]);
+        if dev.hatype != ARPHRD_IEEE80211_RADIOTAP {
+            addr[..6].copy_from_slice(&skb.frame[6..12]);
+        }
         let mut dev_name = [0u8; 14];
         // `strscpy(spkt_device, dev->name, sizeof(spkt_device))`.
         let n = dev.name.len().min(13);
@@ -680,7 +697,11 @@ impl PacketSock {
             ifindex: dev.ifindex,
             hatype: dev.hatype,
             pkttype: skb.pkt_type,
-            halen: 6,
+            halen: if dev.hatype == ARPHRD_IEEE80211_RADIOTAP {
+                0
+            } else {
+                6
+            },
             addr,
             protocol,
             net_off: (skb.net_off - data_off) as u16,
@@ -1099,6 +1120,30 @@ fn hooks(net_ns_id: u64, ifindex: u32, matches: impl Fn(u16) -> bool) -> Vec<Arc
         .collect()
 }
 
+/// mac80211 monitor ingress: no Ethernet header or protocol-stack delivery.
+/// Only the generation-checked iface monitor publisher calls this function.
+pub(crate) fn monitor_receive(dev: &NetIfaceSnapshot, frame: &[u8]) {
+    if !dev.link_up
+        || dev.hatype() != ARPHRD_IEEE80211_RADIOTAP
+        || RUNNING.load(Ordering::Acquire) == 0
+    {
+        return;
+    }
+    let dev = NetDev::from_snapshot(dev);
+    let skb = Skb {
+        frame,
+        net_off: 0,
+        protocol: ETH_P_802_2,
+        pkt_type: PACKET_OTHERHOST,
+        vlan: None,
+    };
+    for sock in hooks(dev.net_ns_id, dev.ifindex, |num| {
+        num == ETH_P_ALL || num == ETH_P_802_2
+    }) {
+        sock.rcv(&dev, &skb);
+    }
+}
+
 /// Receive-side tap: `__netif_receive_skb_core` from the packet-socket
 /// point of view. `dev` is the ingress device; `frame` starts at the MAC
 /// header.
@@ -1106,7 +1151,10 @@ pub fn netif_receive(dev: &NetIfaceSnapshot, frame: &[u8]) {
     netif_receive_timestamped(dev, frame, None)
 }
 pub fn netif_receive_timestamped(dev: &NetIfaceSnapshot, frame: &[u8], timestamp: Option<u64>) {
-    if RUNNING.load(Ordering::Acquire) == 0 || frame.len() < ETH_HDR_LEN {
+    if dev.link_layer != crate::iface::LinkLayer::Ethernet
+        || RUNNING.load(Ordering::Acquire) == 0
+        || frame.len() < ETH_HDR_LEN
+    {
         return;
     }
     let dev = NetDev::from_snapshot(dev);
@@ -1319,6 +1367,7 @@ fn netdev_event_inner(
                 if event == NetdevEvent::Unregister {
                     g.ifindex = -1;
                     g.bound_dev = None;
+                    g.bound_generation = None;
                 }
             }
             NetdevEvent::Up => {

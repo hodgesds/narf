@@ -31,12 +31,15 @@ use zeroize::{Zeroize, Zeroizing};
 type Policy = Arc<dyn Fn() -> Result<RegulatoryDomain, &'static str> + Send + Sync>;
 type Nonce = Arc<dyn Fn() -> Result<[u8; 32], &'static str> + Send + Sync>;
 type Power = Arc<dyn Fn(&mut Owner) -> Result<(Asset, [u8; 32]), &'static str> + Send + Sync>;
+type ScanPower =
+    Arc<dyn Fn(&mut Owner, &[u8]) -> Result<(Asset, [u8; 32]), &'static str> + Send + Sync>;
 #[derive(Clone)]
 struct Environment {
     observation_clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     policy: Policy,
     nonce: Nonce,
     power: Power,
+    scan_power: ScanPower,
 }
 impl Environment {
     fn native() -> Self {
@@ -46,6 +49,15 @@ impl Environment {
                 narf_wireless::reg::db::get_domain().ok_or("MVM authenticated policy unavailable")
             }),
             nonce: Arc::new(super::security::fresh_nonce),
+            scan_power: Arc::new(|owner, channels| {
+                let request = owner.scan_power_request(channels)?;
+                let authority = narf_firmware::trusted_loader_authority()
+                    .and_then(|c| c.derive().ok())
+                    .ok_or("MVM active-scan power loader authority unavailable")?;
+                let source = crate::firmware_asset::load(&authority, &request.name, 64, true)
+                    .map_err(|_| "MVM signed active-scan power source unavailable")?;
+                Ok((source, request.binding))
+            }),
             power: Arc::new(|owner| {
                 let authority = narf_firmware::trusted_loader_authority()
                     .and_then(|c| c.derive().ok())
@@ -95,7 +107,7 @@ struct State {
     scan_time: Option<u64>,
 }
 enum Operation {
-    Scan(Vec<u8>, Vec<Vec<u8>>),
+    Scan(Vec<u8>, Vec<Vec<u8>>, bool),
     Join(Join),
     Maintain,
     Transmit,
@@ -104,6 +116,7 @@ enum Operation {
     Recover,
     /// System-suspend transport stop (`Owner::suspend_transport`).
     Suspend,
+    QuerySharedMemory,
 }
 struct Join {
     bssid: [u8; 6],
@@ -116,6 +129,7 @@ enum Outcome {
     Scan(Vec<BssInfo>),
     Joined([u8; 6]),
     Done,
+    SharedMemory(super::mvm_boot::SharedMemory),
 }
 struct Completion {
     result: Option<Result<Outcome, &'static str>>,
@@ -160,6 +174,26 @@ impl core::fmt::Debug for Device {
     }
 }
 impl Device {
+    pub(super) async fn shared_memory(&self) -> Result<super::Gen2SharedMemory, &'static str> {
+        let reply = self.begin(Operation::QuerySharedMemory)?;
+        match self.wait(reply).await? {
+            Outcome::SharedMemory(memory) => Ok(memory),
+            _ => Err("MVM shared-memory operation returned another outcome"),
+        }
+    }
+    pub(super) async fn scan_power_request(
+        &self,
+        channels: &[u8],
+    ) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+        let mut state = self.state.lock().await;
+        self.source.invoke(|| {
+            state
+                .owner
+                .as_mut()
+                .ok_or("MVM native owner absent")?
+                .scan_power_request(channels)
+        })
+    }
     pub(super) async fn power_request(
         &self,
     ) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
@@ -376,8 +410,10 @@ impl Device {
             let state = self.state.try_lock().ok_or("MVM control busy")?;
             let owner = state.owner.as_ref().ok_or("MVM native owner absent")?;
             let phase = owner.phase();
-            if (matches!(operation, Operation::Scan(..) | Operation::Join(_))
-                && phase != Phase::Configured)
+            if (matches!(
+                operation,
+                Operation::Scan(..) | Operation::Join(_) | Operation::QuerySharedMemory
+            ) && phase != Phase::Configured)
                 || (matches!(operation, Operation::Maintain | Operation::Transmit)
                     && phase != Phase::DataPrepared)
                 || (recovering && !owner.station_failed())
@@ -396,9 +432,10 @@ impl Device {
         }));
         let result_slot = reply.clone();
         let closing = matches!(operation, Operation::Close);
+        let reading_geometry = matches!(operation, Operation::QuerySharedMemory);
         let port_commit = matches!(operation, Operation::Join(_) | Operation::Maintain);
         let channels = match &operation {
-            Operation::Scan(channels, _) => channels.clone(),
+            Operation::Scan(channels, _, _) => channels.clone(),
             Operation::Join(request) => alloc::vec![request.channel],
             _ => Vec::new(),
         };
@@ -420,7 +457,7 @@ impl Device {
                         };
                     }
                     match device.source.invoke(|| {
-                        if closing || suspending {
+                        if closing || suspending || reading_geometry {
                             return Ok(future.as_mut().poll(cx));
                         }
                         let domain = (device.environment.policy)()?;
@@ -452,6 +489,13 @@ impl Device {
                 .await
             };
             let owner = state.owner.as_mut().unwrap();
+            if result.is_err() && owner.phase() == Phase::Scanning {
+                // The outer executable/PCI/receive-policy fence can stop
+                // polling execute while firmware still owns a scan. Retain
+                // and stop that owner before reporting its terminal error.
+                owner.station_fail();
+                let _ = owner.suspend_transport().await;
+            }
             let result = match result {
                 Ok(_) if !closing && device.stopping.load(Ordering::Acquire) => Ok(Outcome::Done),
                 Ok(Outcome::Joined(bssid)) => {
@@ -589,15 +633,24 @@ impl Device {
         } = state;
         let owner = owner.as_mut().ok_or("MVM native owner absent")?;
         match operation {
-            Operation::Scan(channels, ssids) => {
+            Operation::Scan(channels, ssids, active) => {
                 // A beacon can arrive at any point during this bounded scan.
                 // Start time conservatively bounds every retained observation;
                 // completion must not refresh an early beacon's age.
                 let started = (self.environment.observation_clock)();
                 *scan_time = None;
-                let mut result = owner
-                    .station_scan(&channels, &(self.environment.policy)()?)
-                    .await?;
+                let mut result = if active {
+                    let (source, binding) = (self.environment.scan_power)(owner, &channels)?;
+                    owner
+                        .active_scan_using(&channels, &ssids, source, binding, || {
+                            (self.environment.policy)()
+                        })
+                        .await?
+                } else {
+                    owner
+                        .station_scan(&channels, &(self.environment.policy)()?)
+                        .await?
+                };
                 let current = (self.environment.policy)()?;
                 if channels
                     .iter()
@@ -664,7 +717,9 @@ impl Device {
                 };
                 // The BA pipeline carries only BE/TID0; other QoS TIDs use
                 // their own DQA queue singly.
-                if owner.station_can_pipeline() && owner.data_tid(frame.payload()) == 0 {
+                let tid = owner.data_tid(frame.payload());
+                let amsdu = owner.station_can_amsdu_batch(tid);
+                if (owner.station_can_pipeline() && tid == 0) || amsdu {
                     let mut packets = alloc::vec![prepare(&frame)?];
                     if let Some(tx) = transmit.as_mut() {
                         for _ in 1..8 {
@@ -676,7 +731,7 @@ impl Device {
                             if !admitted(next.payload(), self.mac, next.tx_meta()) {
                                 continue;
                             }
-                            if owner.data_tid(next.payload()) != 0 {
+                            if owner.data_tid(next.payload()) != tid {
                                 // Keep order within this TID: it is the next
                                 // single send.
                                 *pending = Some(next);
@@ -685,9 +740,15 @@ impl Device {
                             packets.push(prepare(&next)?);
                         }
                     }
-                    owner
-                        .transmit_data_batch_using(&packets, || (self.environment.policy)())
-                        .await?;
+                    if amsdu {
+                        owner
+                            .transmit_amsdu_batch_using(&packets, || (self.environment.policy)())
+                            .await?;
+                    } else {
+                        owner
+                            .transmit_data_batch_using(&packets, || (self.environment.policy)())
+                            .await?;
+                    }
                 } else {
                     let (bytes, assist) = prepare(&frame)?;
                     owner
@@ -735,6 +796,9 @@ impl Device {
                 }
                 owner.suspend_transport().await?;
                 Ok(Outcome::Done)
+            }
+            Operation::QuerySharedMemory => {
+                owner.query_shared_memory().await.map(Outcome::SharedMemory)
             }
         }
     }
@@ -1099,8 +1163,7 @@ impl WirelessNetIface for Device {
             .station_information(bssid)
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        if request.active
-            || request.random_mac.is_some()
+        if request.random_mac.is_some()
             || request.colocated_6ghz
             || request.duration_mandatory
             || !request.extra_ies.is_empty()
@@ -1149,7 +1212,7 @@ impl WirelessNetIface for Device {
         };
         self.recover_failed().await.map_err(error)?;
         let reply = self
-            .begin(Operation::Scan(channels, request.ssids))
+            .begin(Operation::Scan(channels, request.ssids, request.active))
             .map_err(error)?;
         match self.wait(reply).await.map_err(error)? {
             Outcome::Scan(result) => Ok(result),

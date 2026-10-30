@@ -140,6 +140,7 @@ struct Storage {
     data: Ring,
     data_dma: usize,
     tokens: packet_tx::Tokens,
+    tx_sequence: crate::mt7921::tx_sequence::Owner,
     pending_events: VecDeque<Vec<u8>>,
     pending_data: VecDeque<CapturedData>,
     receive_epoch: u64,
@@ -169,6 +170,7 @@ impl Storage {
             }
         }
         self.tokens = packet_tx::Tokens::new();
+        self.tx_sequence.clear_after_quiescence();
         self.data_dma = 0;
         self.pending_events.clear();
         self.pending_data.clear();
@@ -176,6 +178,13 @@ impl Storage {
         self.receive_open = false;
         dma_barrier();
     }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SequenceReset {
+    None,
+    Asserted,
+    Released,
+    Ready,
 }
 #[derive(Debug)]
 struct Hardware {
@@ -185,6 +194,7 @@ struct Hardware {
     owner: Retained<Storage>,
     /// Linux `wcid->amsdu` for the station peer (TXD7 HW_AMSDU).
     hw_amsdu: bool,
+    sequence_reset: SequenceReset,
 }
 impl Hardware {
     fn receive_ring(&mut self, which: usize) -> Result<Option<Vec<u8>>, Error> {
@@ -270,6 +280,8 @@ impl Hardware {
             storage
                 .tokens
                 .firmware_done(&packet_tx::releases(&bytes)?)?;
+        } else if kind == 1 {
+            storage.tx_sequence.receive(&bytes)?;
         } else if normal {
             let packet = CapturedData {
                 bytes,
@@ -345,12 +357,22 @@ impl Hardware {
         wcid: u16,
         rate: crate::mt7921::association::LegacyRate,
     ) -> Result<(), Error> {
-        self.submit_80211(frame, |payload, token| {
+        self.submit_80211(frame, None, |payload, token| {
             packet_tx::management(frame, payload, token, wcid, rate)
         })
     }
     fn submit_fragment(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error> {
-        self.submit_80211(frame, |payload, token| {
+        // A final real QoS fragment has the actual MSDU sequence. Every
+        // predecessor already retired in the serialized fragment owner.
+        let sample_tid = if frame.first() == Some(&0x88)
+            && frame.get(1).is_some_and(|flags| flags & 4 == 0)
+            && frame.get(22).is_some_and(|sc| sc & 15 != 0)
+        {
+            frame.get(24).map(|tid| tid & 7)
+        } else {
+            None
+        };
+        self.submit_80211(frame, sample_tid, |payload, token| {
             packet_tx::fragment(frame, payload, token, wcid)
         })
     }
@@ -359,6 +381,7 @@ impl Hardware {
     fn submit_80211(
         &mut self,
         frame: &[u8],
+        sample_tid: Option<u8>,
         encode: impl FnOnce(u64, u16) -> Result<[u8; packet_tx::HEADER], Error>,
     ) -> Result<(), Error> {
         self.check()?;
@@ -367,6 +390,10 @@ impl Hardware {
         }
         let storage = self.owner.storage.as_ref().ok_or(Error::Busy)?;
         let token = storage.tokens.available()?;
+        let sample_pid = match sample_tid {
+            Some(tid) => storage.tx_sequence.pid(tid)?,
+            None => None,
+        };
         let ring = &storage.data;
         let slot = ring.index;
         if ring.pending || ring.word(slot, 1) & DONE == 0 {
@@ -376,7 +403,10 @@ impl Hardware {
         let payload = address
             .checked_add(packet_tx::HEADER as u64)
             .ok_or(Error::DmaAddress)?;
-        let header = encode(payload, token)?;
+        let mut header = encode(payload, token)?;
+        if let Some(pid) = sample_pid {
+            crate::mt7921::tx_sequence::request(&mut header, pid)?;
+        }
         // SAFETY: fully validated lengths; this slot has neither DMA nor
         // firmware ownership until the publication below.
         unsafe {
@@ -393,6 +423,9 @@ impl Hardware {
         }
         let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
         storage.tokens.begin_at(token, slot)?;
+        if sample_pid.is_some() {
+            storage.tx_sequence.begin(sample_tid.unwrap(), token)?;
+        }
         let ring = &mut storage.data;
         ring.pending = true; // conservative on any later doorbell failure
         ring.index = (slot + 1) % DEPTH;
@@ -435,7 +468,7 @@ impl Hardware {
         aggregated: bool,
         tid: u8,
     ) -> Result<(), Error> {
-        if tid >= 8 || tid != 0 && (aggregated || !qos) {
+        if tid >= 8 || tid != 0 && !qos {
             return Err(Error::Bounds);
         }
         if aggregated && (!qos || !pipelined) {
@@ -454,6 +487,14 @@ impl Hardware {
         } else {
             storage.tokens.available()?
         };
+        let sample_pid = if qos {
+            storage.tx_sequence.pid(tid)?
+        } else {
+            None
+        };
+        if sample_pid.is_some() && !storage.tokens.is_empty() {
+            return Err(Error::Busy);
+        }
         let ring = &storage.data;
         let slot = ring.index;
         if storage.tokens.owns_slot(slot) || ring.word(slot, 1) & DONE == 0 {
@@ -464,7 +505,7 @@ impl Hardware {
             .checked_add(packet_tx::HEADER as u64)
             .ok_or(Error::DmaAddress)?;
         let mut header = if aggregated {
-            packet_tx::ethernet_aggregated(frame, payload, token, protected)?
+            packet_tx::ethernet_tid_aggregated(frame, payload, token, protected, tid)?
         } else if qos {
             packet_tx::ethernet_tid(frame, payload, token, 1, protected, tid)?
         } else {
@@ -472,6 +513,9 @@ impl Hardware {
         };
         if qos && self.hw_amsdu {
             packet_tx::set_hw_amsdu(&mut header);
+        }
+        if let Some(pid) = sample_pid {
+            crate::mt7921::tx_sequence::request(&mut header, pid)?;
         }
         // SAFETY: fully validated lengths; this slot has neither DMA nor
         // firmware ownership until the publication below.
@@ -489,6 +533,9 @@ impl Hardware {
         }
         let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
         storage.tokens.begin_at(token, slot)?;
+        if sample_pid.is_some() {
+            storage.tx_sequence.begin(tid, token)?;
+        }
         let ring = &mut storage.data;
         ring.pending = true; // conservative on any later doorbell failure
         ring.index = (slot + 1) % DEPTH;
@@ -540,8 +587,9 @@ impl Hardware {
             let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
             result = storage.tokens.finish();
         }
-        if result.is_some() {
+        if let Some(completion) = result {
             let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
+            storage.tx_sequence.terminal(completion);
             storage.data.pending = !storage.tokens.is_empty();
         }
         Ok(result)
@@ -690,10 +738,12 @@ impl Backend for Hardware {
         Ok(())
     }
     fn assert_reset(&mut self) -> Result<(), Error> {
+        self.sequence_reset = SequenceReset::None;
         self.update(MT_WFSYS_SW_RST_B, 1, 0)?;
         if self.read(MT_WFSYS_SW_RST_B)? & 1 != 0 {
             return Err(Error::Register);
         }
+        self.sequence_reset = SequenceReset::Asserted;
         Ok(())
     }
     fn request_link_own(&mut self) -> Result<(), Error> {
@@ -707,10 +757,19 @@ impl Backend for Hardware {
         if self.read(MT_WFSYS_SW_RST_B)? & 1 == 0 {
             return Err(Error::Register);
         }
+        self.sequence_reset = if self.sequence_reset == SequenceReset::Asserted {
+            SequenceReset::Released
+        } else {
+            SequenceReset::None
+        };
         Ok(())
     }
     fn reset_done(&mut self) -> Result<bool, Error> {
-        Ok(self.read(MT_WFSYS_SW_RST_B)? & (1 << 4) != 0)
+        let ready = self.read(MT_WFSYS_SW_RST_B)? & (1 << 4) != 0;
+        if ready && self.sequence_reset == SequenceReset::Released {
+            self.sequence_reset = SequenceReset::Ready;
+        }
+        Ok(ready)
     }
     fn recycle(&mut self) -> Result<(), Error> {
         if self.owner.published || !self.idle()? || self.read(GLOBAL)? & ENABLE != 0 {
@@ -719,7 +778,12 @@ impl Backend for Hardware {
         if self.command(0, 0)? & narf_bus::pci::cmd::BUS_MASTER != 0 {
             return Err(Error::Busy);
         }
-        self.owner.storage.as_mut().ok_or(Error::Busy)?.recycle();
+        let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
+        storage.recycle();
+        if self.sequence_reset == SequenceReset::Ready {
+            storage.tx_sequence.firmware_reset();
+            self.sequence_reset = SequenceReset::None;
+        }
         Ok(())
     }
     fn quiesce(&mut self) -> Result<(), Error> {
@@ -950,6 +1014,14 @@ impl Backend for Hardware {
     fn submit_data_aggregated(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
         self.submit_data_profile(frame, protected, true, true, true)
     }
+    fn submit_data_tid_aggregated(
+        &mut self,
+        frame: &[u8],
+        protected: bool,
+        tid: u8,
+    ) -> Result<(), Error> {
+        self.submit_data_txd(frame, protected, true, true, true, tid)
+    }
     fn submit_data_tid(
         &mut self,
         frame: &[u8],
@@ -961,6 +1033,41 @@ impl Backend for Hardware {
             return Err(Error::Bounds);
         }
         self.submit_data_txd(frame, protected, true, pipelined, false, tid)
+    }
+    fn arm_transmit_sequence(&mut self, tid: u8) -> Result<(), Error> {
+        self.check()?;
+        if !self.owner.published {
+            return Err(Error::Busy);
+        }
+        let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
+        if !storage.tokens.is_empty() {
+            return Err(Error::Busy);
+        }
+        storage.tx_sequence.arm(tid)
+    }
+    fn transmit_sequence_published(&self, tid: u8) -> bool {
+        self.owner
+            .storage
+            .as_ref()
+            .is_some_and(|storage| storage.tx_sequence.published(tid))
+    }
+    fn poll_transmit_sequence(&mut self, tid: u8) -> Result<Option<u16>, Error> {
+        self.check()?;
+        // Bounded native report progress, preserving data/MCU ownership.
+        for _ in 0..3 {
+            let _ = self.route_rx(None)?;
+        }
+        self.owner
+            .storage
+            .as_mut()
+            .ok_or(Error::Busy)?
+            .tx_sequence
+            .take(tid)
+    }
+    fn cancel_transmit_sequence(&mut self) {
+        if let Some(storage) = self.owner.storage.as_mut() {
+            storage.tx_sequence.cancel();
+        }
     }
     fn set_hw_amsdu(&mut self, enabled: bool) {
         self.hw_amsdu = enabled;
@@ -1036,6 +1143,7 @@ impl Transport {
                 data: Ring::allocate(TX_DATA, false)?,
                 data_dma: 0,
                 tokens: packet_tx::Tokens::new(),
+                tx_sequence: crate::mt7921::tx_sequence::Owner::new(),
                 pending_events: VecDeque::new(),
                 pending_data: VecDeque::new(),
                 receive_epoch: 0,
@@ -1057,6 +1165,7 @@ impl Transport {
                             published: false,
                         },
                         hw_amsdu: false,
+                        sequence_reset: SequenceReset::None,
                     },
                     firmware,
                 ),
@@ -1174,6 +1283,15 @@ impl Transport {
     pub async fn negotiate_transmit_ba(&mut self) -> Result<bool, Error> {
         self.session.negotiate_transmit_ba().await
     }
+    /// Negotiate an independent originator agreement for an unused TID0..7.
+    pub async fn negotiate_transmit_ba_tid(&mut self, tid: u8) -> Result<bool, Error> {
+        self.session.negotiate_transmit_ba_tid(tid).await
+    }
+    pub fn transmit_ba_tid_active(&self, tid: u8) -> bool {
+        matches!(self.session.state, State::Associated { .. })
+            && !self.session.peer_lost
+            && self.session.tx_ba.active_tid(tid)
+    }
     pub fn transmit_ba_active(&self) -> bool {
         matches!(self.session.state, State::Associated { .. })
             && !self.session.peer_lost
@@ -1212,6 +1330,35 @@ impl Transport {
     pub(super) async fn recover_unregistered(&mut self) -> Result<RadioInfo, Error> {
         self.session.recover_unregistered().await
     }
+    /// Retire the old originator and queue one true-user-MPDU sequence
+    /// sample, then let the ordinary service owner perform ADDBA at SN+1.
+    pub async fn request_transmit_ba_restart_tid(&mut self, tid: u8) -> Result<(), Error> {
+        self.session.request_transmit_ba_restart_tid(tid).await
+    }
+
+    /// Enable native passive sniffer and channel configuration with current
+    /// policy checks. Monitor mode owns no station frame/key grant.
+    pub async fn start_monitor(
+        &mut self,
+        channel: narf_wireless::monitor::Channel,
+    ) -> Result<(), Error> {
+        narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
+        self.session
+            .start_monitor_with_policy(channel, || {
+                narf_wireless::reg::db::get_domain().ok_or(Error::Authority)
+            })
+            .await
+    }
+    pub(super) fn step_monitor(
+        &mut self,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<super::MonitorCapture, Error> {
+        self.session.step_monitor(domain)
+    }
+    pub async fn stop_monitor(&mut self) -> Result<(), Error> {
+        self.session.stop_monitor().await
+    }
+
     /// Last observed boot stage/result, also preserved after cancellation.
     pub fn state(&self) -> State {
         self.session.state

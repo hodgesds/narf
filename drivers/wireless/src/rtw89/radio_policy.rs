@@ -106,7 +106,7 @@ impl Program {
                 hash.update(&super::station_control::ht_fingerprint());
             }
             Self::He => {
-                hash.update(b"NARF RTL8852B HE20 optional operating recipe v1");
+                hash.update(b"NARF RTL8852B HE20 optional operating recipe v2");
                 hash.update(&identity);
                 hash.update(&super::station_control::he_fingerprint());
             }

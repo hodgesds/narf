@@ -88,6 +88,13 @@ read-modify-writes PCIe Link Control and returns the prior value (Linux
 `pcie_capability_clear_and_set_word(PCI_EXP_LNKCTL)`); `LNKCTL_ASPMC` names
 the ASPM L0s/L1 field.
 
+`pci_express::parent_link_control(child_cap, child) -> Result<Option<u16>,
+PcieCapError>` reads the immediate registered upstream bridge's Link Control
+inside the child's current `Read` capability invocation. `None` denotes no
+parent, no PCIe capability or an all-ones unavailable register; a revoked
+child capability fails before config access. This read-only relationship
+query grants no bridge capability and cannot change either end's ASPM policy.
+
 ### 3.1 Device descriptor
 
 ```rust

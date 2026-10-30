@@ -88,8 +88,9 @@ pub(super) fn capture(
 ) -> Option<Bundle> {
     let f = m.frame;
     let sn = u16::from_le_bytes([f[22], f[23]]) >> 4;
+    let header = 26 + if f[1] & 0x80 != 0 { 4 } else { 0 };
     let iv = if f[1] & 0x40 != 0 {
-        <[u8; 8]>::try_from(f.get(26..34)?).ok()?
+        <[u8; 8]>::try_from(f.get(header..header + 8)?).ok()?
     } else {
         [0; 8]
     };
@@ -113,7 +114,7 @@ pub(super) fn capture(
         });
     }
     let p = pending.as_mut().unwrap();
-    let Some(body) = m.body(26, if f[1] & 0x40 != 0 { 8 } else { 0 }) else {
+    let Some(body) = m.body(header, if f[1] & 0x40 != 0 { 8 } else { 0 }) else {
         *pending = None;
         return None;
     };

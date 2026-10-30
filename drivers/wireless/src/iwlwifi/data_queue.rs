@@ -214,7 +214,17 @@ impl DataQueue {
         assist: u32,
     ) -> Result<u16, &'static str> {
         use super::csum::{OFFLD_IP_HDR, OFFLD_L4_EN};
-        if assist & !(1 << OFFLD_L4_EN | 0x3f << OFFLD_IP_HDR) != 0 {
+        let amsdu = assist & (1 << 14) != 0;
+        if assist & !(1 << OFFLD_L4_EN | 0x3f << OFFLD_IP_HDR | 1 << 14) != 0
+            || amsdu
+                && (assist != 1 << 14
+                    || header_len != 26
+                    || frame.first() != Some(&0x88)
+                    || frame.get(24).is_none_or(|qos| qos & 0x80 == 0))
+            || !amsdu
+                && frame.first() == Some(&0x88)
+                && frame.get(24).is_some_and(|qos| qos & 0x80 != 0)
+        {
             return Err("unsupported TX offload_assist request");
         }
         if !mmio.authorized() {

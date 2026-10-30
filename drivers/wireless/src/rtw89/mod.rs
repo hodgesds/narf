@@ -79,6 +79,7 @@ mod firmware_registry;
 pub mod fw;
 pub mod fwdl;
 pub mod h2c;
+mod he_htc;
 mod interface;
 mod iqk;
 mod irq;

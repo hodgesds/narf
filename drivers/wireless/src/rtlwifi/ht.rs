@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! RTL8188EE-only parked HT20/LGI program. Linux rtl8188ee/{hw,phy,rf,trx}.c.
+//! RTL8188EE-only parked HT20/LGI+SGI program. Linux rtl8188ee/{hw,phy,rf,trx}.c.
 //! The optional signed measurement extends the exact retained legacy record;
 //! no factory gain, reporting dBm estimate or elapsed wait is a measurement.
 use super::{
@@ -28,23 +28,25 @@ pub(super) fn request(
 ) -> Request {
     let f = base.factory();
     let mut h = narf_crypto::sha256::Sha256::new();
-    h.update(b"NARF RTL8188EE PCI8179 HT20 LGI 1T1R MCS0-7 channel1 program v1");
+    h.update(b"NARF RTL8188EE PCI8179 HT20 LGI+SGI20 1T1R MCS0-7 channel1 program v2");
     h.update(&super::radio::factory_identity(f));
     h.update(&base.digest);
     h.update(super::fw::FW_8188EE.as_bytes());
     h.update(&firmware.digest);
-    h.update(b"EFUSE1b signed high nibble; BW40base16; pathA PG8-row groups; TXAGCe10/e14; unusede18/e1c0; BW603.2=1 BB800/900.0=0 RF18 preserveupper+c01; SIFS14 EDCA16+9*AIFSN; fixedTXD5c..13 LGI USE_RATE DISFB QOS TID0-7 AC rings/QSEL=TID; QoS DATA peer AMPDU_DENSITY, AGG_EN+MAX_AGG_NUM0x14 only on operational originator BA TID (rtl_tx_status start after cnt_after_linked3, timeout5000TU, noRTS); softwareCCMP CAM0 rawRX3839; bound HT45/61/WMM; ADDBA37 nativeOWN; noRTS CTS tracking PM");
+    h.update(b"EFUSE1b signed high nibble; BW40base16; pathA PG8-row groups; TXAGCe10/e14; unusede18/e1c0; BW603.2=1 BB800/900.0=0 RF18 preserveupper+c01; SIFS14 EDCA16+9*AIFSN; fixedTXD5c..13 LGI USE_RATE DISFB QOS TID0-7 AC rings/QSEL=TID; QoS DATA peer AMPDU_DENSITY, AGG_EN+MAX_AGG_NUM0x14 only on operational originator BA TID (rtl_tx_status start after cnt_after_linked3, timeout5000TU, noRTS); softwareCCMP CAM0 rawRX7935 RXslots9100 HT_MAX_AMSDU; atomic full-body validation before PN; bound HT45/61/WMM; ADDBA37 nativeOWN; noRTS CTS tracking PM");
     h.update(b"full static factory antenna/IQK/LCK/thermal0..63 supply envelope; all legacy+automaticresponse+decline and8MCS conducted peaks; no measured data supplied; exact capture/key/IPC/callback epochs");
+    h.update(b"HT SGI20 local RX; native RXD3 SPLCP8 and PHYsgi27.1 before PN; actual peer RX_SGI20 offer+response gates DATA TXD5.6 on MCS1..7, MCS0 LGI per rtl88ee_tx_fill_desc; H2C RA_MASK byte4 SGI5, no mixed-GI fallback under NEFBv1; each measured MCS peak covers LGI and SGI, all BA/protection/response/transient emissions");
     Request {
         name: format!(
-            "rtlwifi/rtl8188ee-ht20-lgi-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+            "rtlwifi/rtl8188ee-ht20-v2-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
             f.mac[0], f.mac[1], f.mac[2], f.mac[3], f.mac[4], f.mac[5]
         ),
         binding: h.finalize(),
     }
 }
 pub(super) fn local() -> LocalPhy {
-    LocalPhy::ht20(LocalHt::siso20(false, false)).expect("fixed mandatory HT20 MCS0..7 profile")
+    LocalPhy::ht20(LocalHt::siso20(true, true).with_rx_amsdu_7935(true))
+        .expect("fixed mandatory HT20 MCS0..7 profile")
 }
 pub(crate) struct Grant {
     base: Arc<Calibration>,
@@ -92,14 +94,14 @@ impl Grant {
         }
         if b.len() != LENGTH
             || b[..4] != *b"NEHT"
-            || b[4..8] != [1, 0, HEADER as u8, 0]
+            || b[4..8] != [2, 0, HEADER as u8, 0]
             || u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize != LENGTH
             || b[12..16] != [0xec, 0x10, 0x79, 0x81]
             || b[16..48] != request(&base, firmware).binding
             || b[48..80] != super::radio::factory_identity(f)
             || b[80..112] != base.digest
             || b[112..118] != f.mac
-            || b[118..124] != [1, 20, 1, 0, 0, 0]
+            || b[118..124] != [1, 20, 1, 1, 0, 0]
             || b[128..HEADER] != [0; 32]
         {
             return Err(bad());

@@ -88,9 +88,12 @@ impl<B: Backend> Session<B> {
         self.backend.release()?;
         self.stage(Stage::RecoveryRearm);
         self.backend.recycle()?;
+        self.cancel_transmit_ba_restart();
         self.rx_ba.reset_after_quiescence();
         self.tx_ba.reset_after_quiescence();
-        self.tid0_used = false;
+        self.scan_packets.clear();
+        self.scanning = false;
+        self.used_tids = 0;
         self.security = None;
         self.wmm = None;
         self.wmm_pending = None;

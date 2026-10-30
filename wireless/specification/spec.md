@@ -105,6 +105,11 @@ mlme.c ieee80211_add_vht_ie does. HT TxBF stays zero, as in mac80211.
 Native NDPA/NDP feedback, steering, STBC encoding and the single MU-MIMO
 owner are backend responsibilities. Large A-MSDU limits are described with
 the shared A-MSDU owner below.
+`LocalHt::with_rx_amsdu_7935(enabled)` advertises bit11 only when the
+native RX owner can retain and atomically decode the entire7935-byte body.
+`HtNegotiation::rx_amsdu_limit()` preserves this local promise independently
+of the AP's receive capacity. Existing constructors retain3839; TX owners
+must continue to use the peer's separately advertised capacity.
 `LocalVht::with_160mhz(rx_sgi160, tx_sgi160)` opts into contiguous160 and
 directional SGI160. Existing constructors retain their80MHz ceiling;
 `LocalPhy::vht160` requires both this explicit promise and an HT40 companion,
@@ -707,6 +712,33 @@ transition restores the retained template/color and emits `ABORTED`.
 an empty supplied vector clears that template piece). `WirelessNetIface`
 provides a down-only `set_iftype(NL80211_IFTYPE_*)` hook for drivers with
 multiple WMI vdev roles; it must reject a type change while a vdev exists.
+
+`WirelessNetIface::set_monitor_channel(monitor::Channel)` is an optional,
+synchronous down-only channel-selection hook. `Channel` carries the exact
+primary MHz, nl80211 width value, center1 MHz and center2 MHz; an unsupported
+geometry is refused rather than narrowed. `SET_WIPHY` routes WIPHY_FREQ,
+CHANNEL_WIDTH and CENTER_FREQ1/2 to this hook only in MONITOR iftype, under
+the same live delegated interface-admin authority used for SET_INTERFACE.
+An explicitly supplied MONITOR_FLAGS nested mask is passed to
+`validate_monitor_flags` before a type change; the default is unsupported,
+so active/injection, FCS/control and cooked-frame requests cannot be silently
+accepted by a driver which implements only its default capture profile.
+Admin UP starts the native capture asynchronously and carrier appears only
+after native sniffer/configuration receipts. A driver must close capture
+before role, down, removal, suspend or recovery transitions and must not
+reuse its station frame rings or station port/epoch for raw delivery.
+
+`monitor::encode(original_mpdu, Metadata)` produces version-0 radiotap plus
+the exact original MPDU. Metadata contains an observed primary frequency and
+optional observed dBm signal. The header has FLAGS and CHANNEL and includes
+dBm signal only when present; timestamp, PHY rate/GI, decryption and FCS
+validity are not fabricated. Minimum management/control/data headers,
+optional four-address/QoS/HT-Control bounds, frequency and allocation extents
+are checked. The adapter supplies an MPDU without trailing FCS and refuses
+translated, stripped or split representations that it cannot preserve.
+Radiotap formatting grants no device, mode or raw-socket authority. The
+consumable capture path is `narf_net::iface::on_monitor_frame_from` under its
+current monitor token; only already authorized AF_PACKET sockets can read.
 
 ### 3.1.1 Physical wiphys and virtual interfaces
 
@@ -1368,6 +1400,13 @@ the MPDU as the equivalent 26-octet header with Order clear, which gives the
 same AAD and nonce, and drops the HT Control field. The `RawFrame` contract
 therefore keeps HT Control and Order unmodified, and advertising HTC_HE
 loses no AP traffic. Order on non-QoS DATA is still refused.
+`Security::transmit_ethernet_qos_htc(ethernet, tid, control)` builds the
+30-octet HE-variant QoS header, setting Order and EOSP before software CCMP
+protection. The four control octets follow QoS Control; they are excluded
+from AAD, while the ordinary key PN and per-TID sequence are shared with
+`transmit_ethernet_qos`. Invalid TIDs, non-HE control variants, EAPOL and
+closed ports are refused. Callers own HE negotiation, control contents,
+rate-fallback fencing and native RF/queue admission.
 `build_nonce` includes the transmitter address and big-endian 48-bit PN.
 `protect` / `unprotect` take an `AesCcm` backend and are both fallible: a
 backend seal/open refusal propagates as `CcmpError` (`TooLong` for a body

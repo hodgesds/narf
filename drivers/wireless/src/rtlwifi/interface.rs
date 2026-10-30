@@ -738,7 +738,8 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
         (band == 2400 && self.ht.load(Ordering::Acquire)).then(|| {
             narf_wireless::iface::PhyCapabilities {
-                ht: narf_wireless::association::phy::LocalHt::siso20(false, false)
+                ht: narf_wireless::association::phy::LocalHt::siso20(true, true)
+                    .with_rx_amsdu_7935(true)
                     .capability_body(),
                 vht: None,
             }

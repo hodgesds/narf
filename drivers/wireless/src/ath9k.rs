@@ -19,6 +19,7 @@ mod irq;
 mod mac;
 mod packet;
 mod packet_native;
+mod pcie_pm;
 mod phy;
 mod qos;
 mod rates;
@@ -69,6 +70,9 @@ pub struct Ath9k {
     pinned: bool,
     /// System suspend parked the chip in FULL_SLEEP; only resume reopens it.
     suspended: bool,
+    /// Device-local D0 workarounds were enabled by upstream ASPM policy.
+    /// Retain the matching D3 obligation if platform policy later changes.
+    pcie_aspm: bool,
 }
 
 impl Ath9k {
@@ -229,6 +233,13 @@ async fn calibrate_owner(owner: &Retained) -> Result<RadioCalibration, BringUpEr
     let mut io = identity::Registers::new(controller._mmio, controller._cap);
     let image = controller.calibration;
     let xe2 = controller.baseband.xe2_gain;
+    let aspm = controller.pcie_aspm;
+    pcie_pm::configure(
+        &mut io,
+        aspm,
+        xe2 && controller.identity.revision >= 2,
+        false,
+    )?;
     // SAFETY: the retained native probe identified this single-chain AR9285,
     // completed full INI/modal/detector preparation, and never allocated or
     // published packet DMA. Current PCI parking was verified above; an async
@@ -343,6 +354,12 @@ async fn reset_owner(owner: &Retained) -> Result<RadioCalibration, BringUpError>
             return Err(BringUpError::BadIdentity);
         }
         controller.baseband = phy::program(controller._mmio, controller._cap, &image)?;
+        controller.pcie_aspm = pcie_pm::restore(
+            &controller._device,
+            controller._cap,
+            controller._mmio,
+            controller.baseband.xe2_gain && controller.identity.revision >= 2,
+        )?;
         controller.generation = controller
             .generation
             .checked_add(1)
@@ -437,7 +454,13 @@ fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
     // Blocks initialization until resume re-identifies the chip.
     controller.packet_attempted = true;
     controller.suspended = true;
-    identity::sleep(controller._mmio, controller._cap).map_err(|_| DeviceSuspendError::DriverError)
+    let aspm = controller.pcie_aspm;
+    identity::sleep(
+        controller._mmio,
+        controller._cap,
+        aspm.then_some(controller.baseband.xe2_gain && controller.identity.revision >= 2),
+    )
+    .map_err(|_| DeviceSuspendError::DriverError)
 }
 
 /// `pci.c::ath_pci_resume`: re-disable PCI RETRY_TIMEOUT (config 0x41) that
@@ -561,6 +584,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         );
         narf_bus::ProbeError::BadDevice
     })?;
+    let pcie_aspm = pcie_pm::restore(
+        &device,
+        cap,
+        mmio,
+        baseband.xe2_gain && identity.revision >= 2,
+    )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     let _ = writeln!(
         narf_console::Writer,
         "  ath9k: AR9285 rev {} MAC {:02x?}, EEPROM {:#x}; INI/PLL/RF registers prepared, calibration and packet runtime pending",
@@ -584,6 +614,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             generation: 0,
             pinned: false,
             suspended: false,
+            pcie_aspm,
         }),
         removed: core::sync::atomic::AtomicBool::new(false),
     });

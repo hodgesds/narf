@@ -18,7 +18,7 @@ fn sibling_ap(u: &Up) -> Result<Sibling, &'static str> {
         "native sibling AP slot"
     );
     let (mut caps, reg) = {
-        let rt = run(u.shared.lock());
+        let rt = run!(u.shared.lock());
         (
             rt.device_caps().map_err(|_| "sibling caps")?,
             rt.core.reg_info.clone(),
@@ -53,7 +53,7 @@ fn sibling_ap(u: &Up) -> Result<Sibling, &'static str> {
     let dev = Arc::new(nd);
     narf_net::iface::register(name, own, test_send);
     dev.request_admin(true);
-    run(dev.service_once());
+    run!(dev.service_once());
     // A minimal legacy5GHz AP template, independently authored.
     let mut head = vec![0x80, 0, 0, 0];
     head.extend_from_slice(&[255; 6]);
@@ -89,9 +89,9 @@ fn sibling_ap(u: &Up) -> Result<Sibling, &'static str> {
         he_bss_color: None,
     })
     .map_err(|_| "native AP request")?;
-    let (_, error, _, _) = latched(|| run(dev.service_once()));
+    let (_, error, _, _) = latched(|| run!(dev.service_once()));
     ensure!(
-        error == 0 && dev.link_up() && run(dev.mac.lock()).ap_active(),
+        error == 0 && dev.link_up() && run!(dev.mac.lock()).ap_active(),
         "native sibling AP start"
     );
     Ok(Sibling {
@@ -113,21 +113,21 @@ fn reservations(u: &Up) -> R {
 }
 fn reset_root(u: &Up) -> R {
     crash(u, FwNotice::Reset(MhiNotify::SysError));
-    run(u.shared.irq.wait(10));
-    run(u.shared.lock()).service();
-    let notice = run(u.shared.take_fw_notice()).ok_or("missing native reset notice")?;
+    run!(u.shared.irq.wait(10));
+    run!(u.shared.lock()).service();
+    let notice = run!(u.shared.take_fw_notice()).ok_or("missing native reset notice")?;
     ensure!(
-        run(u.netdev.recover_one(notice, false)),
+        run!(u.netdev.recover_one(notice, false)),
         "native coordinator STA replay"
     );
     Ok(())
 }
 fn replay_ap(u: &Up, s: &Sibling) -> bool {
     let (caps, reg) = {
-        let rt = run(u.shared.lock());
+        let rt = run!(u.shared.lock());
         (rt.device_caps().unwrap(), rt.core.reg_info.clone())
     };
-    run(s.dev.rebuild_after_radio_recovery(caps, reg))
+    run!(s.dev.rebuild_after_radio_recovery(caps, reg))
 }
 fn smoke_ath11k_native_recovery_retains_shared_sta_ap_channel_claims() -> TestResult {
     check(|| {
@@ -139,20 +139,20 @@ fn smoke_ath11k_native_recovery_retains_shared_sta_ap_channel_claims() -> TestRe
         reservations(&u)?;
         ensure!(replay_ap(&u, &s), "native sibling AP replay");
         reservations(&u)?;
-        run(u.shared.reconfig_complete());
+        run!(u.shared.reconfig_complete());
         ensure!(
             u.netdev.link_up() && s.dev.link_up(),
             "native STA/AP replay preserved carrier"
         );
         ensure!(
-            run(u.netdev.mac.lock())
+            run!(u.netdev.mac.lock())
                 .vif()
                 .and_then(|v| v.chanctx)
                 .is_some_and(|c| c.freq == 2437),
             "actual STA channel replay"
         );
         ensure!(
-            run(s.dev.mac.lock())
+            run!(s.dev.mac.lock())
                 .vif()
                 .and_then(|v| v.chanctx)
                 .is_some_and(|c| c.freq == 5180),
@@ -197,7 +197,7 @@ fn smoke_ath11k_native_recovery_cancelled_sibling_keeps_its_claim_and_dma() -> T
         reset_root(&u)?;
         reservations(&u)?;
         let (caps, reg, before) = {
-            let mut rt = run(u.shared.lock());
+            let mut rt = run!(u.shared.lock());
             let eid = rt.core.wmi_ep.unwrap().eid as usize;
             rt.core.htc.endpoints[eid].tx_credits = 1;
             (
@@ -208,7 +208,7 @@ fn smoke_ath11k_native_recovery_cancelled_sibling_keeps_its_claim_and_dma() -> T
         };
         u.dev.pause_wait.store(true, Ordering::Release);
         {
-            let mut replay = pin!(s.dev.rebuild_after_radio_recovery(caps, reg));
+            let mut replay = heap_future(|| s.dev.rebuild_after_radio_recovery(caps, reg));
             ensure!(
                 replay
                     .as_mut()
@@ -219,7 +219,7 @@ fn smoke_ath11k_native_recovery_cancelled_sibling_keeps_its_claim_and_dma() -> T
         }
         reservations(&u)?;
         ensure!(
-            run(u.shared.lock()).core.stats.wmi_cmds == before + 1,
+            run!(u.shared.lock()).core.stats.wmi_cmds == before + 1,
             "cancel fixture did not publish exactly one real CE/WMI command"
         );
         u.dev.pause_wait.store(false, Ordering::Release);
@@ -232,7 +232,7 @@ fn smoke_ath11k_native_recovery_cancelled_sibling_keeps_its_claim_and_dma() -> T
             // Linux's four ACs map to hardware queues [0,1,2,0]; queue3
             // is not a producer for this profile. Check every actual AC,
             // including BK's shared queue, rather than an unused queue.
-            [0, 1, 2, 0].into_iter().all(|q| run(u.shared.lock())
+            [0, 1, 2, 0].into_iter().all(|q| run!(u.shared.lock())
                 .vdev(1)
                 .unwrap()
                 .txq

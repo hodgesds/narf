@@ -4,6 +4,8 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 #[path = "tx_pipeline_hw_tests.rs"]
 mod tx_pipeline_hw_tests;
+#[path = "tx_sequence_hw_tests.rs"]
+mod tx_sequence_hw_tests;
 
 fn rig() -> Result<(Vec<u32>, Hardware), Error> {
     let mut words = vec![0u32; 0x100000 / 4];
@@ -36,6 +38,7 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
         data: Ring::allocate(TX_DATA, false)?,
         data_dma: 0,
         tokens: packet_tx::Tokens::new(),
+        tx_sequence: crate::mt7921::tx_sequence::Owner::new(),
         pending_events: VecDeque::new(),
         pending_data: VecDeque::new(),
         receive_epoch: 0,
@@ -57,6 +60,7 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
                 published: false,
             },
             hw_amsdu: false,
+            sequence_reset: SequenceReset::None,
         },
     ))
 }
@@ -874,4 +878,45 @@ fn smoke_mt76_native_revocation_precedes_current_config_bar_and_dma_start() -> T
 kernel_test_in!(
     "drivers/wireless/mt7921/transport",
     smoke_mt76_native_revocation_precedes_current_config_bar_and_dma_start
+);
+
+fn mt76_native_addba_descriptor_names_actual_tid_and_add_ba_metadata() -> TestResult {
+    for tid in 0..8u8 {
+        let mut frame = vec![0; 33];
+        frame[0] = 0xd0;
+        frame[24..26].copy_from_slice(&[3, 0]);
+        frame[26] = 1;
+        frame[27..29].copy_from_slice(&(0x1003u16 | u16::from(tid) << 2).to_le_bytes());
+        let header = packet_tx::management(
+            &frame,
+            0x12345040,
+            7,
+            1,
+            crate::mt7921::association::LegacyRate::ONE_MBPS,
+        )
+        .unwrap();
+        if header[4..8] != (0x8002_6001u32 | u32::from(tid) << 20).to_le_bytes()
+            || header[20..24] != [0, 0x40, 0, 0]
+            || header[12..16] != (1u32 << 28 | 15 << 11).to_le_bytes()
+        {
+            return TestResult::Fail("ADDBA management TXD omitted target TID/ADD_BA or changed native sequence ownership");
+        }
+        frame[25] = 1;
+        let response = packet_tx::management(
+            &frame,
+            0x12345040,
+            7,
+            1,
+            crate::mt7921::association::LegacyRate::ONE_MBPS,
+        )
+        .unwrap();
+        if response[20..24] != [0; 4] || response[4..8] != 0x8002_6001u32.to_le_bytes() {
+            return TestResult::Fail("ADDBA response inherited originator-only native metadata");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/tx_ba",
+    mt76_native_addba_descriptor_names_actual_tid_and_add_ba_metadata
 );

@@ -401,6 +401,8 @@ pub(super) struct State {
     ht: bool,
     /// HE20 was negotiated for this association.
     he: bool,
+    /// A current MACID0 RA report has ruled out legacy fallback.
+    htc_rate: bool,
     /// Data TXWD `DATA_ER` (Linux `er_cap`: HE operation allows ER SU).
     er: bool,
     /// Random scan address live in the address CAM during an active scan.
@@ -464,6 +466,7 @@ impl State {
             firmware_ra: false,
             ht: false,
             he: false,
+            htc_rate: false,
             er: false,
             scan: None,
             ba: core::array::from_fn(|_| None),
@@ -542,6 +545,7 @@ impl State {
         self.firmware_ra = false;
         self.ht = false;
         self.he = false;
+        self.htc_rate = false;
         self.er = false;
         self.scan = None;
         self.clear_block_ack();
@@ -580,6 +584,7 @@ impl State {
         self.firmware_ra = false;
         self.ht = false;
         self.he = false;
+        self.htc_rate = false;
         self.er = false;
         self.scan = None;
         self.clear_block_ack();
@@ -1212,6 +1217,11 @@ impl State {
         let mut idle = false;
         for _ in 0..32 {
             let step = io.packet_poll()?;
+            if self.phase == Phase::Open {
+                if let Some(allowed) = step.c2h.as_deref().and_then(super::he_htc::rate_allows) {
+                    self.htc_rate = allowed;
+                }
+            }
             if let Some(rssi) = step.rssi {
                 self.track.sample(self.linked(), rssi);
             }
@@ -1871,9 +1881,14 @@ impl State {
         {
             return Err(Error::Busy);
         }
+        let htc = self.he && self.htc_rate && super::he_htc::packet_allows(frame);
         let native = if let Some(security) = &mut self.security {
             if self.wmm.is_some() {
-                security.transmit_ethernet_qos(frame, tid)?
+                if htc {
+                    security.transmit_ethernet_qos_htc(frame, tid, super::he_htc::CONTROL)?
+                } else {
+                    security.transmit_ethernet_qos(frame, tid)?
+                }
             } else {
                 security.transmit_ethernet(frame)?
             }
@@ -1888,7 +1903,11 @@ impl State {
             bytes.extend_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
             if self.wmm.is_some() {
-                bytes.extend_from_slice(&[tid, 0]);
+                bytes.extend_from_slice(&[tid | if htc { 0x10 } else { 0 }, 0]);
+            }
+            if htc {
+                bytes[1] |= 0x80;
+                bytes.extend_from_slice(&super::he_htc::CONTROL);
             }
             bytes.extend_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0]);
             bytes.extend_from_slice(&frame[12..]);
@@ -1915,9 +1934,10 @@ pub(super) fn admitted(frame: &[u8], own: [u8; 6]) -> bool {
         )
 }
 fn ethernet(frame: &[u8], own: [u8; 6], peer: [u8; 6]) -> Option<Vec<u8>> {
-    if !(32..=1534).contains(&frame.len())
+    if !(32..=1538).contains(&frame.len())
         || !matches!(frame[0], 8 | 0x88)
-        || frame[1] & 0xc7 != 2
+        || frame[1] & 0x47 != 2
+        || frame[1] & 0x80 != 0 && frame[0] != 0x88
         || frame[22] & 15 != 0
         || frame[10..16] != peer
         || (frame[4..10] != own && frame[4] & 1 == 0)
@@ -1928,10 +1948,10 @@ fn ethernet(frame: &[u8], own: [u8; 6], peer: [u8; 6]) -> Option<Vec<u8>> {
     }
     let offset = if frame[0] == 0x88 {
         let qos = frame.get(24..26)?;
-        if qos[0] & 0xf0 != 0 || qos[1] != 0 {
+        if qos[0] & 0xe0 != 0 || qos[1] != 0 {
             return None;
         }
-        26
+        26 + if frame[1] & 0x80 != 0 { 4 } else { 0 }
     } else {
         24
     };

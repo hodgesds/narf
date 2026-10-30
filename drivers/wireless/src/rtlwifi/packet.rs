@@ -147,6 +147,7 @@ pub struct Mpdu {
     bytes: Vec<u8>,
     channel: u8,
     ht: bool,
+    short_gi: bool,
     /// Native RXD DW1 PAGGR/FAGGR: this MPDU arrived inside an A-MPDU.
     aggregated: bool,
     /// `_rtl88ee_query_rxphystatus` `rx_pwdb_all` when RXD PHYST carried
@@ -168,6 +169,9 @@ impl Mpdu {
     }
     pub(super) fn ht(&self) -> bool {
         self.ht
+    }
+    pub(super) fn short_gi(&self) -> bool {
+        self.short_gi
     }
     /// Only the station's recipient BA owner may admit such an MPDU.
     pub(super) fn pwdb(&self) -> Option<u8> {
@@ -774,7 +778,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// One outstanding native frame is retained across all active queues.
     /// A free descriptor alone cannot substitute a different pending payload.
     pub(crate) fn submit(&mut self, frame: &[u8], rate: u8) -> Result<u64, Error> {
-        self.submit_aggregate(frame, rate, None, false)
+        self.submit_aggregate(frame, rate, None, false, false)
     }
     /// `submit` with `rtl8188ee_tx_fill_desc` aggregation fields for QoS
     /// DATA to an HT station: `aggregate = (ampdu_density, ampdu)` sets
@@ -792,12 +796,25 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         rate: u8,
         aggregate: Option<(u8, bool)>,
         adaptive: bool,
+        short_gi: bool,
     ) -> Result<u64, Error> {
         if self.phase != Phase::Running || self.packet.pending.is_some() {
             return Err(Error::State);
         }
         if aggregate.is_some_and(|(density, _)| density > 7)
             || aggregate.is_some() && !(self.packet.ht && frame.first() == Some(&0x88))
+        {
+            return Err(Error::Packet);
+        }
+        // rtl8188ee/trx.c selects use_shortgi only above DESC92C_RATEMCS0.
+        // Legacy/management/control frames and the MCS0 source case retain
+        // the existing long-GI/long-preamble form. SGI fallback needs its own
+        // signed continuation; NEFB v1 does not cover mixed-GI retries.
+        if short_gi
+            && !(self.packet.ht
+                && (13..=19).contains(&rate)
+                && frame.first() == Some(&0x88)
+                && !adaptive)
         {
             return Err(Error::Packet);
         }
@@ -858,7 +875,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 prefix[6] |= MAX_AGG_NUM << 11;
             }
         }
-        prefix[5] = u32::from(rate) | (0x1f << 8) | (15 << 13);
+        prefix[5] = u32::from(rate) | (u32::from(short_gi) << 6) | (0x1f << 8) | (15 << 13);
         prefix[7] = frame.len() as u32;
         prefix[8] = address;
         // Fill through the actual live DMA mapping before it can be named
@@ -1007,7 +1024,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             let ht_profile = self.packet.ht
                 && ht
                 && (12..=19).contains(&(report & 63))
-                && report & ((1 << 7) | (1 << 8) | (1 << 9)) == 0;
+                && report & ((1 << 7) | (1 << 9)) == 0;
             let legacy_profile = !ht && report & (1 << 9) == 0 && report & 63 <= 11;
             // DW1 PAGGR/FAGGR (rtl8188ee trx.h): A-MPDU membership is only
             // admissible on the HT profile, where the station BA owner gates it.
@@ -1020,7 +1037,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 && sequence & 0xf000 == 0
                 && (legacy_profile || ht_profile)
                 && (24..=if self.packet.ht {
-                    26 + 16 + narf_wireless::amsdu::MAX_BYTES + 4
+                    26 + 16 + narf_wireless::amsdu::Limit::Ht7935.bytes() + 4
                 } else {
                     MAX_MPDU + 4
                 })
@@ -1030,6 +1047,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 // EE's PHY info is its own28-byte structure inside drvinfo,
                 // not rtw88 page1. RXD owns rate/BW; no channel field exists.
                 let mut pwdb = None;
+                let mut short_gi = ht && report & (1 << 8) != 0;
                 if status & (1 << 26) != 0 {
                     let info = (((status >> 16) & 15) * 8) as usize;
                     if info < 28 {
@@ -1037,17 +1055,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     }
                     let mut phy = [0; 28];
                     buffer.read_bytes(((status >> 24) & 3) as usize, &mut phy)?;
-                    if ht && phy[27] & 2 != 0 {
-                        // sgi_en: LGI-only receive profile.
-                        for word in 0..6 {
-                            ring.write32(offset + word * 4, 0)?;
-                        }
-                        buffer.sync();
-                        ring.sync();
-                        ring.write32(offset, RX_BUFFER as u32 | end | OWN)?;
-                        ring.sync();
-                        return Ok((true, None));
-                    }
+                    short_gi |= ht && phy[27] & 2 != 0;
                     // RX_HAL_IS_CCK_RATE(rxmcs): DESC92C_RATE1M..11M.
                     let cck = !ht && report & 63 < 4;
                     // trx.c reads RFPGA0_XA_HSSIPARAMETER2 BIT(9) with RF on.
@@ -1071,6 +1079,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             bytes,
                             channel,
                             ht,
+                            short_gi,
                             aggregated,
                             pwdb,
                         });
@@ -1086,6 +1095,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         bytes,
                         channel,
                         ht,
+                        short_gi,
                         aggregated,
                         pwdb,
                     });

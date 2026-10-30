@@ -1093,7 +1093,7 @@ association request, HT RA mask, RA data TXWD, MCS7 RX, non-HT drop).
 join adds `station_control::local_he()` through the shared
 `LocalPhy::with_he`: Linux `core.c::rtw89_init_he_cap` for a 2.4GHz station,
 restricted to this TX-A/RX-AB 20MHz profile. MAC: TF MAC padding 16us,
-ALL_ACK, A-MPDU length exponent extension 2, HT/VHT trigger-frame RX. PHY:
+HTC_HE, ALL_ACK, A-MPDU length exponent extension 2, HT/VHT trigger-frame RX. PHY:
 20MHz-only width set, device class A, LDPC, HE SU/MU 1x/2xLTF+0.8us GI,
 NDP 4xLTF+3.2us, STBC RX, Doppler TX, DCM 16QAM (TX NSS1), partial-BW
 extended range, power boost, 4xLTF+0.8us SU/MU, ER SU 4xLTF/1xLTF+0.8us,
@@ -1101,7 +1101,7 @@ DCM max RU996, >16 SIG-B symbols, TX/RX 1024QAM below 242-tone RU, full-BW
 SU in MU (compressed and non-compressed SIG-B) and 16us nominal padding;
 RX HE-MCS0..11 on two streams and TX HE-MCS0..11 on one. Linux bits that
 need 40MHz (`wide_channels`), a second TX path (STBC TX, DCM TX NSS2),
-HE +HTC (`HTC_HE`, `BSR`; `he_htc`), power save (`OPS`), RX A-MSDU
+buffer-status capability (`BSR`), power save (`OPS`), RX A-MSDU
 (`AMSDU_IN_AMPDU`; `aggregation`) or beamforming feedback
 (`rtw89_mac_bf_assoc` sounding: SU beamformee, NG16, codebook sizes,
 triggered SU feedback, MaxNc) are cleared.
@@ -1137,13 +1137,38 @@ mask with/without DCM, DATA_ER with/without ER SU Disable, HE MCS11 1xLTF
 and NSS2 4xLTF RX, invalid GI/LTF and NSS3 drop, disconnect, HT-only AP
 fallback, program-not-granted).
 
-HE +HTC (`he_htc`) stays open: advertising `HTC_HE` lets the AP send +HTC
-QoS DATA, but the shared `station_security::Security::normalize` rejects
-the Order bit (`b[1] & 0x87 != 2`) and only knows 24/26-byte headers, and
-the `RawFrame` contract forbids the driver from stripping the HT Control
-field. Linux `__rtw89_core_tx_check_he_qos_htc` also needs the RA report's
-`might_fallback_legacy` (`rtw89_phy_c2h_ra_rpt_iter`), which this station
-does not yet consume.
+HE +HTC uses the HE operating recipe revision2. The recipe identity now
+binds HTC_HE advertisement, the HE/CAS control template `1b 00 00 00`,
+30-octet QoS headers with Order/EOSP, TXWD `INFO1_A_CTRL_BSR`, and
+`BODY3_BK` whenever the A-Control form changes, so a hardware aggregate
+cannot mix forms. Earlier signed HE recipe identities are refused.
+`he_htc::rate_allows` consumes current MACID0 AX OUTSRC/RA status C2Hs;
+insertion stays off until a well-formed report rules out legacy fallback
+at MCS >2. Lower/legacy rates or malformed matching reports suppress it;
+another MACID's report cannot enable it. Disconnect/failure clears that
+state. HE negotiation and the current signed program remain independent
+requirements. EAPOL, ARP, DHCP and ICMP keep ordinary headers, matching
+Linux `__rtw89_core_tx_check_he_qos_htc`'s interoperability exclusions.
+The retained peer binding admits the extra header only after HE RA
+configuration completes under the same association admission, preserves its
+TID mask while checking EOSP, and clears HE admission on invalidation.
+
+The shared `Security::transmit_ethernet_qos_htc` builds the complete header
+before host CCMP, using the ordinary key PN and TID sequence. CCMP AAD
+excludes HT Control, Order and EOSP but authenticates the TID, addresses
+and payload. The native packet owner enforces the HE grant and firmware
+rate adaptation, checks the header/control/CCMP offsets, and programs
+the full 30-octet descriptor header length. Open and protected downlinks
+both preserve original RX bytes through native admission and remove HT
+Control only when converting an accepted MSDU to Ethernet. The 2.4GHz
+40MHz OM override remains part of the separate wider-channel work.
+
+Native regressions cover rate transitions, unrelated/truncated reports,
+special packets, descriptor bits and offsets, controlled-port and
+PN/sequence ownership, actual AP CCMP verification, bidirectional Ethernet
+and disconnect. The four native `drivers/wireless/rtw89/htc` regressions
+and two shared `wireless/station_security/htc` regressions pass on x86_64
+and aarch64 (six passed per architecture, no failures or skips).
 
 ### Recipient Block Ack and RX reordering
 
@@ -1621,8 +1646,8 @@ The per-chip source `rtw_chip_info` inventories are broader than this station:
 with its distinct BE generation. B now has signed-program HT20, HE20 (with
 firmware GI/LTF selection), all-AC/TID QoS, firmware RA, recipient
 BA/reorder, MSI delivery, live EDCA and active channel-1 scans (section 3);
-it still needs HE +HTC and wider widths, TX
-aggregation/originator BA, other channels, tracking, runtime sleep/WoW and
+HE +HTC and originator TX A-MPDU are now implemented. It still needs wider
+widths, TX A-MSDU, other channels, tracking, runtime sleep/WoW and
 in-place SER L1 recovery. A/C/51 need complete chip-specific
 firmware/security, BB/RF/power/packet/station composition;8922A additionally
 needs BE EFUSE/container/descriptor/transport and EHT operation. Source band
@@ -1643,7 +1668,7 @@ Each blocker below was re-checked against this tree.
 | `eht` | Needs the RTL8922A chip row first. `efuse.rs` returns `UnsupportedChip` for 8922A, `irq::Mask::config` rejects the `_v2` layout, there is no BE TXD/RXD (`txrx.h` `BE_TXD_*`) or BE RA H2C (`rtw89_h2c_ra_v1`, `RTW89_H2C_RA_V1_W4_MODE_EHT`), and `station_control::Controller::new` plus the `N52B` qualification record are RTL8852B-only. The shared `association::eht` API is not the gap. |
 | `aggregation` | TX A-MPDU now exists (section "Originator Block Ack and TX A-MPDU"). What is left is TX A-MSDU and A-MSDU-in-A-MPDU (Linux v7.2 `core.c::rtw89_core_register_hw` `TX_AMSDU`/`SUPPORTS_AMSDU_IN_AMPDU`, mac80211 `tx.c::ieee80211_amsdu_aggregate`). `interface.rs` drains one Ethernet frame per `State::send`, with no per-TID txq batching to hand `Security::transmit_amsdu_qos` several frames. `packet_format::classify` refuses the QoS A-MSDU-present bit (`frame[24] & 0xf8`) and any MPDU above `MAX_MPDU` 2304, below the peer HT 3839/7935-byte A-MSDU limit. The ADDBA Response A-MSDU bit (`IEEE80211_TXQ_NO_AMSDU`) is parsed but unused. The aggregate program fingerprint excludes A-MSDU, so it needs its own measured `Program`. |
 
-| `he_htc` | TX insertion has two missing producers (re-checked 2026-10-28). First, Linux v7.2 `core.c::__rtw89_core_tx_check_he_qos_htc` refuses +HTC while `rtwsta_link->ra_report.might_fallback_legacy` is set, and `phy.c::rtw89_phy_c2h_ra_rpt_iter` sets that from the firmware RA-report C2H (`mcs <= 2`). Here `station.rs::progress` discards `packet_core::Step::c2h`, so no RA report is decoded. Second, shared `station_security::Security::transmit_ethernet_qos` always builds the 26-octet QoS header. It has no +HTC transmit form (Order bit, four-octet HT Control, Order-masked AAD, `__rtw89_core_tx_adjust_he_qos_htc`), and the shared crate is outside rtw89. RX admission plus HTC_HE advertisement alone would not close a TX-insertion row, so `local_he` keeps `IEEE80211_HE_MAC_CAP0_HTC_HE` clear. `station::ethernet` also keeps refusing Order on unprotected QoS DATA (the shared `Security` already accepts it on protected links). |
+| `he_htc` | Implemented in HE recipe revision2 above; six native/shared regressions pass on both architectures. Row closed2026-10-29. |
 
 ### Upstream applicability triage (2026-10-27)
 
@@ -1680,3 +1705,26 @@ diagnostics. `antenna_diversity_tracking` is removed:
 `rtw89_mac_setup_phycap` sets `hal->ant_diversity` only for one-path chips
 with `rfe_type % 3 == 2`, i.e. RTL8851B (folded into the `rtl8851b` chip
 row).
+
+### Additional named blockers (2026-10-29)
+
+These paragraphs name the remaining native owners; upstream applicability
+triage above remains separate from implementation.
+
+| Row | Concrete blocker |
+|---|---|
+| `additional_operating_channels` | The retained native radio, scan/association owner and signed N52B/HT/HE operating programs bind channel1/2412MHz. Noninitial operation needs a current per-channel occupied-power qualification and a drain/retune owner for the actual MAC/BB/RF program before queues resume. |
+| `five_ghz_operation` | RTL8852B supports5GHz, but the retained radio/power recipe and station admission select the channel1 2.4GHz program. Native5GHz RF/BB/power setup, permitted scan/retune and exact signed operating programs remain missing; discovery of the band alone grants no station profile. |
+| `wide_channels` | The retained HT/HE profile and descriptor/program identities fix20MHz. HT40/80 and applicable160 need real MAC/BB/RF width/secondary/center programming, full occupied-span power admission and matching host PHY/TX/RX/control-field owners. Shared JoinPlan width encoders already exist. |
+| `fragmentation` | Native packet admission still refuses nonzero fragment numbers/More-Fragments. Host split/reassembly, per-fragment PN and terminal receipt ownership, bounded reassembly lifetimes and matching signed emission programs must be added; the shared fragmentation-threshold control API alone does not implement them. |
+| `monitor_mode` | The retained station facade has no native monitor transition or raw/radiotap publication owner. It needs original MPDUs plus actual PHY-status/PPDU metadata and generation-fenced capture under the shared monitor/AF_PACKET API, with station/key/queue teardown before mode changes. |
+| `multiple_live_functions` | Bootstrap/controller, station publication and IRQ dispatch currently retain a single live function. Multiple functions need independent firmware/DMA/IRQ/PHY/key lifetimes and netdev generations rather than another discovery-table entry. |
+| `rf_power_tracking` | One-shot RF calibration and the completed EDCCA/DIG/CFO tracking do not implement periodic IQK/TSSI/DPK or thermal TX-power adjustment on the retained RF owner. Live RF tracking needs its own source sequence, current policy/queue fences and measured gain/transient envelope. |
+| `runtime_sleep` | The fresh-FLR operating recipe remains continuously awake and never requests LPS/RPWM transitions. Runtime sleep needs firmware power-mode commands, current wake/use-count ownership and exact resumed packet/radio state; system suspend/reset is a different implemented lifecycle. |
+| `six_ghz_operation` | Only RTL8852C/RTL8922A have6GHz applicability; their complete native chip/station owners remain missing. The retained B profile is2.4GHz-only in software. Six-GHz operation additionally needs per-band RF/power qualification, actual HE6GHz context and current LPI/VLP/AFC client admission through the existing shared6GHz APIs. |
+| `uapsd` | Station U-APSD is source-inapplicable (no IEEE80211_VIF_SUPPORTS_UAPSD). This row covers AP-side WIPHY_FLAG_AP_UAPSD only; there is no retained AP peer/queue/beacon/service-period owner. |
+| `wow` | No native WoW firmware/context/pattern/GTK/wake-source owner exists. The implemented non-WoW suspend path retires the generation and rebuilds it after resume; this does not preserve an associated wake-capable firmware context. |
+| `rtl8852a` | AX identity, power and firmware scaffolds do not establish this chip's native station. The retained Controller and N52B qualification admit RTL8852B only; A still needs its exact security/firmware, BB/RF/calibration/power and packet/station composition. |
+| `rtl8851b` | Source identifies the1TX/1RX dual-band chip, but the retained B-only operating/qualification owner cannot be reused as its runtime. Complete chip-specific firmware/security, RF/power and packet/station ownership remain missing. |
+| `rtl8852c` | The advertised AX-v1/three-band hardware description is not a native station profile. C needs the exact generation-specific PCI/descriptor transport plus firmware/security, RF/calibration/power and station composition; the current retained Controller/N52B profile is B-only. |
+| `rtl8922a` | BE EFUSE/block/container, BE descriptor/PCI transport and the complete firmware/RF/power/station profile remain absent. Native EHT/320MHz cannot be enabled by shared IE encoders before that owner exists. |

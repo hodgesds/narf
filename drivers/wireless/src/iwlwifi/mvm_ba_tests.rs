@@ -1,6 +1,8 @@
 //! Actual retained Gen2 worker + TFH/RFH BA conversations; no caller receipt
 //! or decrypted flag substitutes for native DMA and the independent CCM/AP.
 use super::*;
+#[path = "mvm_ml_baid_tests.rs"]
+mod ml_baid_tests;
 #[path = "mvm_nested_tests.rs"]
 mod nested_tests;
 fn fixture(protected: bool) -> Result<Harness, &'static str> {
@@ -776,20 +778,19 @@ kernel_test_in!(
     smoke_mvm_ba_bad_native_allocation_remove_or_delba_marker_is_terminal
 );
 
-fn smoke_mvm_ba_alternate_ml_baid_contract_stays_unaggregated() -> TestResult {
+fn smoke_mvm_ba_alternate_ml_baid_requires_distinct_ba_program() -> TestResult {
     check(|| {
         let h = Harness::build_profile_caps(true, true, 2, 3, true, true)?;
-        h.join()?;
-        add(&h, 0, 100, 32);
-        h.pump()?;
-        enqueue(&h, 8)?;
-        h.pump()?;
-        if !h.device.link_up()
+        // The alternate allocator is now implemented. Its offer selects
+        // the tag3 BA program just as ADD_STA does: tag2 cannot authorize
+        // that emitting program, even when the hardware supports it.
+        if h.join().is_ok()
+            || h.device.link_up()
             || h.actor
                 .lock()
                 .commands
                 .iter()
-                .any(|(g, c, b)| *g == 1 && *c == 0x18 && b[17] == 8)
+                .any(|(g, c, b)| (*g == 1 && *c == 0x18 && b[17] == 8) || (*g == 5 && *c == 0x16))
             || h.actor.lock().tx_ba_enabled
             || h.actor
                 .lock()
@@ -797,14 +798,14 @@ fn smoke_mvm_ba_alternate_ml_baid_contract_stays_unaggregated() -> TestResult {
                 .iter()
                 .any(|b| b[3..5] == [0, 0])
         {
-            return Err("unsupported alternate BAID profile fell back to legacy BA ABI");
+            return Err("tag2 authorized the alternate allocator's distinct BA program");
         }
         Ok(())
     })
 }
 kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2/ba",
-    smoke_mvm_ba_alternate_ml_baid_contract_stays_unaggregated
+    smoke_mvm_ba_alternate_ml_baid_requires_distinct_ba_program
 );
 
 fn smoke_mvm_ba_c5_debug_and_failed_aggregate_never_create_completion_credit() -> TestResult {

@@ -441,6 +441,7 @@ pub fn to_ethernet(frame: &[u8]) -> Option<Vec<u8>> {
 
 impl<B: Backend> Session<B> {
     pub(super) fn renew_receive_epoch(&mut self) -> Result<(), Error> {
+        self.cancel_transmit_ba_restart();
         // No partial MSDU survives a key or association change.
         self.rx_fragments.clear();
         self.backend.close_receive_capture(0);
@@ -666,6 +667,9 @@ impl<B: Backend> Session<B> {
                 || self.rx_ba.pending(self.backend.now_ns())
                 || self.tx_ba.pending(self.backend.now_ns())
                 || self
+                    .tx_restart
+                    .is_some_and(|request| request.waiting_receipt())
+                || self
                     .security
                     .as_ref()
                     .is_some_and(|security| !security.pending.is_empty()))
@@ -700,8 +704,22 @@ impl<B: Backend> Session<B> {
     /// The supplicant only reports a key when it differs from the installed
     /// one, so retransmissions cannot reset packet-number replay windows.
     pub(super) async fn service_keys(&mut self) -> Result<(), Error> {
-        self.service_control().await?;
         let associated = self.state;
+        self.service_keys_in(associated, associated).await
+    }
+    /// A scanning caller retains Running across every nested control/key
+    /// await. The associated context is local input, never public state.
+    pub(super) async fn service_keys_during_scan(
+        &mut self,
+        associated: State,
+    ) -> Result<(), Error> {
+        self.service_keys_in(associated, State::Running(Stage::ScanWait))
+            .await
+    }
+    async fn service_keys_in(&mut self, associated: State, restore: State) -> Result<(), Error> {
+        self.service_transmit_ba_restart(associated, restore)
+            .await?;
+        self.service_control_in(associated, restore).await?;
         let State::Associated { info, peer, .. } = associated else {
             return Ok(());
         };
@@ -796,7 +814,7 @@ impl<B: Backend> Session<B> {
             return Err(error);
         }
         self.security = Some(security);
-        self.state = associated;
+        self.state = restore;
         if let Err(error) = self.sync_receive_capture() {
             return Err(self.fail_data(error));
         }
@@ -837,7 +855,14 @@ impl<B: Backend> Session<B> {
         }
         for _ in 0..16 {
             self.backend.check()?;
-            let Some(packet) = self.backend.receive_data_captured()? else {
+            let packet = if let Some(packet) = self.scan_packets.pop_front() {
+                Some(packet)
+            } else if self.scanning {
+                None
+            } else {
+                self.backend.receive_data_captured()?
+            };
+            let Some(packet) = packet else {
                 return Ok(None);
             };
             if packet.epoch != self.receive_epoch {
@@ -1250,23 +1275,40 @@ impl<B: Backend> Session<B> {
             return Err(Error::Busy);
         }
         self.start_ethernet(frame)?;
-        let result = self
-            .wait(TIMEOUT_MS, |backend| backend.management_complete())
-            .await;
-        match result {
-            Ok(completion) => {
-                self.data_pending.pop_front();
-                if completion.status == 0 {
-                    Ok(completion)
-                } else {
-                    Err(self.fail_data(Error::Rejected(completion.status)))
+        loop {
+            let result = self
+                .wait(TIMEOUT_MS, |backend| backend.management_complete())
+                .await;
+            match result {
+                Ok(completion) => {
+                    self.data_pending.pop_front();
+                    if completion.status != 0 {
+                        return Err(self.fail_data(Error::Rejected(completion.status)));
+                    }
+                    let Some(next) = self.tx_fragments.pop_front() else {
+                        return Ok(completion);
+                    };
+                    self.check_station_tx()?;
+                    if let Err(error) = self.backend.submit_fragment(&next, 1) {
+                        return Err(self.fail_data(error));
+                    }
+                    self.data_pending.push_back(self.backend.now_ns());
+                    let tid = if next.first() == Some(&0x88) {
+                        next[24] & 7
+                    } else {
+                        0
+                    };
+                    self.note_sequence_publication(tid);
                 }
+                Err(error) => return Err(self.fail_data(error)),
             }
-            Err(error) => Err(self.fail_data(error)),
         }
     }
 
     pub(super) fn fail_data(&mut self, error: Error) -> Error {
+        self.cancel_transmit_ba_restart();
+        self.scan_packets.clear();
+        self.scanning = false;
         self.tx_fragments.clear();
         self.backend.close_receive_capture(self.receive_epoch);
         self.security = None;
@@ -1289,11 +1331,8 @@ impl<B: Backend> Session<B> {
     }
 
     fn data_capacity(&self) -> usize {
-        if self.tx_ba.active() {
-            return self.tx_ba.capacity();
-        }
         if self.ht20_profile.is_some() && self.wmm.is_some() {
-            packet_tx::PIPELINE
+            self.tx_ba.capacity()
         } else {
             1
         }
@@ -1334,25 +1373,28 @@ impl<B: Backend> Session<B> {
         let tid = self
             .wmm
             .map_or(0, |wmm| super::super::tx_priority::select(frame, wmm.acm()));
+        if self.restart_blocks(tid) {
+            return Err(Error::Busy);
+        }
         // wcid->amsdu: set by the STA_REC_HW_AMSDU record of an HT peer and
         // cleared by a TX BA agreement without the A-MSDU bit.
         let amsdu = self.wmm.is_some()
             && self.ht20_profile.is_some()
-            && (!self.tx_ba.active() || self.tx_ba.amsdu());
+            && (!self.tx_ba.active_tid(tid) || self.tx_ba.amsdu_tid(tid));
         self.backend.set_hw_amsdu(amsdu);
         if let Some(fragments) = self.fragments(frame, tid) {
             return self.start_fragments(fragments, tid);
         }
-        let result = if tid != 0 {
+        let result = if self.tx_ba.active_tid(tid) {
+            self.backend
+                .submit_data_tid_aggregated(frame, self.security.is_some(), tid)
+        } else if tid != 0 {
             self.backend.submit_data_tid(
                 frame,
                 self.security.is_some(),
                 tid,
                 self.data_capacity() > 1,
             )
-        } else if self.tx_ba.active() {
-            self.backend
-                .submit_data_aggregated(frame, self.security.is_some())
         } else if self.data_capacity() > 1 {
             self.backend
                 .submit_data_pipelined(frame, self.security.is_some(), true)
@@ -1366,10 +1408,11 @@ impl<B: Backend> Session<B> {
             Err(error) => return Err(self.fail_data(error)),
         }
         self.data_pending.push_back(self.backend.now_ns());
-        if self.wmm.is_some() && tid == 0 {
-            self.tid0_used = true;
+        self.note_sequence_publication(tid);
+        if self.wmm.is_some() {
+            self.used_tids |= 1 << tid;
         }
-        self.tx_ba.touch(self.backend.now_ns());
+        self.tx_ba.touch_tid(tid, self.backend.now_ns());
         Ok(())
     }
 
@@ -1392,7 +1435,7 @@ impl<B: Backend> Session<B> {
         let body = frame.len() - 14 + 8;
         if self.frag_threshold == u32::MAX
             || header + body + 4 <= threshold
-            || tid == 0 && self.tx_ba.active()
+            || self.tx_ba.active_tid(tid)
         {
             return None;
         }
@@ -1433,8 +1476,9 @@ impl<B: Backend> Session<B> {
         }
         self.tx_fragments = fragments;
         self.data_pending.push_back(self.backend.now_ns());
-        if self.wmm.is_some() && tid == 0 {
-            self.tid0_used = true;
+        self.note_sequence_publication(tid);
+        if self.wmm.is_some() {
+            self.used_tids |= 1 << tid;
         }
         Ok(())
     }
@@ -1465,6 +1509,12 @@ impl<B: Backend> Session<B> {
                         return Err(self.fail_data(error));
                     }
                     self.data_pending.push_back(self.backend.now_ns());
+                    let tid = if next.first() == Some(&0x88) {
+                        next[24] & 7
+                    } else {
+                        0
+                    };
+                    self.note_sequence_publication(tid);
                 }
                 continue;
             }
@@ -1628,7 +1678,7 @@ impl<B: Backend> Session<B> {
             return Err(Error::Busy);
         }
         self.renew_receive_epoch()?;
-        self.tid0_used = false;
+        self.used_tids = 0;
 
         self.management_rate = plan.management_rate();
         // Discard idle receive preparation. Any HT activation below must be
@@ -2054,6 +2104,7 @@ impl<B: Backend> Session<B> {
             }
             _ => return Err(Error::Busy),
         };
+        self.cancel_transmit_ba_restart();
         self.backend.close_receive_capture(self.receive_epoch);
         self.boot_started = Some(self.backend.now_ns());
         // ieee80211_set_disassoc sends the deauthentication before the
@@ -2266,7 +2317,7 @@ impl<B: Backend> Session<B> {
 
     /// Advance recipient BA and declined requests under the retained control
     /// owner. Dropping this future cannot restore an associated producer.
-    async fn service_control(&mut self) -> Result<(), Error> {
+    async fn service_control_in(&mut self, associated: State, restore: State) -> Result<(), Error> {
         if self.wmm_pending.is_none()
             && self.control_pending.is_empty()
             && !self.rx_ba.pending(self.backend.now_ns())
@@ -2275,7 +2326,6 @@ impl<B: Backend> Session<B> {
         {
             return Ok(());
         }
-        let associated = self.state;
         let State::Associated { info, peer, .. } = associated else {
             return Ok(());
         };
@@ -2324,7 +2374,7 @@ impl<B: Backend> Session<B> {
             };
             return Err(error);
         }
-        self.state = associated;
+        self.state = restore;
         Ok(())
     }
 
@@ -2369,7 +2419,7 @@ impl<B: Backend> Session<B> {
     /// Linux drains the SKU command through MCU's PSE register read. Match
     /// the actual register identity and exact native receipt, not merely any
     /// command reply. The same bounded operation orders EDCA before QoS TX.
-    async fn confirm_command_progress(&mut self) -> Result<(), Error> {
+    pub(super) async fn confirm_command_progress(&mut self) -> Result<(), Error> {
         let mut request = [0; 8];
         request[..4].copy_from_slice(&0x820c8000u32.to_le_bytes());
         let reply = self

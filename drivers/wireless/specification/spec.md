@@ -149,17 +149,40 @@ environment monitor) are implemented and their rows closed; rtw89 `tspec`,
 inapplicable or folded into chip rows, and `uapsd` narrowed to AP-side
 (`rtw89.md`).
 
+**Recount 2026-10-29** (current continuation): the inventory holds
+**132 `feature`** rows (131 driver,1 shared), **35 `chip`** and
+**0 `unknown`**. New software continuations close RTW89 HE +HTC;
+ath9k host-bus PM; RTL8188EE SGI20 and7935-byte RX A-MSDU; Intel active
+probes and alternate ML BAID; and MT76 associated/off-channel active scan
+and passive monitor/radiotap capture, all-TID transmit BA and native
+sequence-sampled midstream BA restart. They pass the coordinated native
+x86_64/aarch64 suites; signed deployment inputs and physical acceptance
+remain separate. Gen2 Intel HE and TX A-MSDU also pass, with their retained
+Gen3/Sc residuals still tracked. The audit also adds two previously omitted
+Gen2 security rows (WPA2-PSK with PMF and SAE-EXT-KEY), explicitly refused by
+the existing native profile despite Linux/shared support (§3.33). The corrected MT76 BA subgroup passes24
+native tests on each architecture. The all-Wi-Fi suites complete2939/0/9
+on x86_64 and2713/0/5 on aarch64 (pass/fail/environment skip).
+
+Intel cross-boot persistent key history is inapplicable: Linux retains live
+key/PN state for runtime restart and establishes fresh authenticated keys/RSC
+after reboot; the shared NARF invariant requires owner-lifetime history
+(§3.30 in `iwlwifi.md`). Existing in-boot history fences remain. The ath11k
+architecture unknown is resolved: its full subtree completes367/0/2
+(pass/fail/skip) on x86_64 and366/0/3 on aarch64 after reducing transient
+fixture/recovery stack use. Full branch build/validation gates remain separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 18 | Gen2 active probes, broader rejoin/key history, PMF/richer PHY/QoS/BA/TX LDPC/STBC/recovery; remaining Gen3 command profiles and unlisted PCI IDs; 6 GHz/HE/EHT, additional roles, checksum/scheduled-scan offload, RX/RSS and system PM |
-| ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles; device-tree board variants and aarch64 composition |
-| mt76 | 12 | Associated/off-channel and richer scans, 6 GHz/HE and broader VHT beyond the retained20/40/80/actual7922-160 profile, richer TX/RX BA and TX A-MSDU, PMF/WPA3, TX fragmentation, QoS beyond BE/TID0 and U-APSD/TSPEC, PM/removal/reprobe, IOMMU/non-coherent DMA and loadable packet ABI |
+| iwlwifi | 17 | Retained Gen3/Sc live regulatory and measured platform-power owners, HE/TX A-MSDU and wider bands/widths; AP/P2P/WoW, scheduled scan, multiple RX queues/RSS; additional chip profiles are tracked separately |
+| ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
+| mt76 | 7 | AP/P2P and wake; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA and loadable packet ABI |
 | ath10k | 19 | Broader HT40 pairs/bands, multiple streams/VHT/TX aggregation and richer RX profiles, PFC, alternate calibration sources, associated/off-channel scanning, IRQ operation, automatic/stable-interface recovery, DMA reclamation and host-bus/system PM |
-| ath9k | 10 | Other chip/EEPROM/descriptor variants, channel retune, periodic calibration, HT/BA/aggregation and richer rates, IRQs, reset/rejoin, removal and PM |
-| rtlwifi | 17 | Other matched chips; wider channel/rate profiles, IRQ/C2H expansion, multiple radios, reset/recovery, removal and suspend |
+| ath9k | 9 | Channel/retune and HT40/SGI40 profiles, factory selection, periodic calibration, larger TX aggregates and idle/station sleep; other chips are separate rows |
+| rtlwifi | 15 | Other matched chips, broader channels/HT40/VHT, antenna/gain/coexistence, multiple radios, reset/IPS/system PM, RTS/CTS and PCIe ASPM |
 | rtl8xxxu | 9 | Other matched USB chips, SGI20/HT40 and wider channels/rates, RX/TX A-MPDU, TX A-MSDU, both BA directions and RX reorder, coexistence, EP0/halted reset, safe rejoin, FIFO retune and PM |
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
-| rtw89 | 14 | Other AX/BE profiles and BE transport/EFUSE, wider PHY/channel/rate/role/security profiles, periodic RF tracking, IRQs, reset/rejoin/removal/suspend and multiple functions |
+| rtw89 | 13 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW, periodic RF tracking/runtime LPS and multiple functions; other AX/BE chips are separate rows |
 | brcmfmac | 12 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
 | cyw43439 | 12 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
 

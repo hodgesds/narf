@@ -125,6 +125,8 @@ impl Context {
         let mut profile = Profile {
             wmm,
             ht: false,
+            he: None,
+            tx_amsdu: false,
             tx_mcs: 0,
             tx_mcs2: 0,
             rx_nss2: false,
@@ -198,6 +200,7 @@ impl Context {
             profile.tx_sgi40 = profile.width40 && ht.tx_sgi40();
             profile.rx_sgi40 = profile.width40 && ht.rx_sgi40();
             profile.ht = true;
+            profile.tx_amsdu = self.features & feature::TX_AMSDU != 0;
             profile.tx_mcs = ht.tx_mcs()[0];
             // MCS 8..15 only with a granted NSS2 program (the local TX
             // mask) toward a peer that receives them; a static-SMPS peer
@@ -226,6 +229,22 @@ impl Context {
                 0
             };
             profile.operation = ht.operation().body();
+            if let Some(he) = phy.he() {
+                if self.features & feature::HE == 0 || he.width() != expected || he.discontiguous()
+                {
+                    return Err("MVM HE response lacks its exact qualified width/profile");
+                }
+                profile.he = Some(super::he::Profile::new(
+                    *he,
+                    response_ies,
+                    (ht.peer_capability() >> 2) & 3 == 0,
+                )?);
+                profile.tx_ldpc = self.features & feature::TX_LDPC != 0 && he.tx_ldpc();
+                profile.tx_stbc = self.features & feature::TX_STBC != 0 && he.tx_stbc();
+            }
+        }
+        if self.features & feature::HE != 0 && profile.he.is_none() {
+            return Err("MVM HE program requires response-bound HE negotiation");
         }
         self.negotiated = Some(profile);
         Ok(())
@@ -235,6 +254,8 @@ impl Context {
 pub(super) struct Profile {
     pub wmm: Parameters,
     pub ht: bool,
+    pub he: Option<super::he::Profile>,
+    pub tx_amsdu: bool,
     pub tx_mcs: u8,
     /// Negotiated HT MCS 8..15 toward the peer (granted `NSS2` only).
     pub tx_mcs2: u8,
@@ -358,7 +379,8 @@ impl Profile {
         let (Some(cap), Some(op)) = (ap.ht_capability(), ap.ht_operation()) else {
             return false;
         };
-        op == self.operation
+        self.he.is_none_or(|he| he.matches(ies))
+            && op == self.operation
             && cap[3] & self.tx_mcs == self.tx_mcs
             && cap[4] & self.tx_mcs2 == self.tx_mcs2
             && (self.tx_mcs2 == 0 || (u16::from_le_bytes([cap[0], cap[1]]) >> 2) & 3 != 0)
@@ -415,7 +437,7 @@ impl Profile {
                 // and falls through to FAT_EN_40 for an 80MHz peer (3 << 26).
                 | (u32::from(self.width40) << 26)
                 | (u32::from(self.width80) << 27)
-                | (u32::from(self.tx_mcs2 != 0) << 28) // STA_FLG_MIMO_EN_MIMO2
+                | (u32::from(self.multiple_tx_streams()) << 28) // STA_FLG_MIMO_EN_MIMO2
                 | if self.ht {
                     (u32::from(self.dynamic_smps) << 17)
                         | (u32::from(self.ampdu_exp) << 19)
@@ -444,6 +466,12 @@ impl Profile {
         // IWL_TLC_MNG_MODE_HT (1) / IWL_TLC_MNG_MODE_VHT (2).
         out[5] = if self.vht { 2 } else { u8::from(self.ht) };
         out[6] = chains;
+        if self.tx_amsdu {
+            if version < 4 {
+                out[7] = 1;
+            } // v2/v3 explicit amsdu enable.
+            put16(&mut out, if version == 4 { 24 } else { 20 }, 3839);
+        }
         // rs_fw_get_config_flags: STBC bit0, LDPC bit1.
         put16(
             &mut out,
@@ -459,7 +487,7 @@ impl Profile {
             if version == 4 { 18 } else { 16 },
             u16::from(self.tx_mcs2),
         );
-        // v2/3 SGI byte22; v4 byte7. A-MSDU and all NSS2/width>20 rates0.
+        // v2/3 SGI byte22; v4 byte7.
         // rs_fw_sgi_cw_support: BIT(20MHz) | BIT(40MHz).
         out[if version == 4 { 7 } else { 22 }] = u8::from(self.tx_sgi)
             | u8::from(self.tx_sgi40) << 1
@@ -490,7 +518,28 @@ impl Profile {
                 }
             }
         }
+        if let Some(he) = self.he {
+            out[5] = 3; // IWL_TLC_MNG_MODE_HE
+            out[if version == 4 { 7 } else { 22 }] = 0; // HE GI is firmware-owned.
+            let row = if version == 4 { 6 } else { 4 };
+            for stream in 0..2 {
+                let at = 12 + row * stream;
+                let rates = match (he.tx_map >> (2 * stream)) & 3 {
+                    0 => 0xff,
+                    1 => 0x3ff,
+                    2 => 0xfff,
+                    _ => 0,
+                };
+                put16(&mut out, at, rates);
+                if self.width160 {
+                    put16(&mut out, at + 2, rates);
+                }
+            }
+        }
         Ok(out)
+    }
+    pub fn multiple_tx_streams(&self) -> bool {
+        self.he.map_or(self.tx_mcs2 != 0, |he| he.tx_map & 12 != 12)
     }
     pub fn rx_rate(&self, payload: &[u8]) -> bool {
         let Some(raw) = payload.get(28..32) else {
@@ -503,6 +552,29 @@ impl Profile {
         // RATE_MCS_CHAN_WIDTH (bits 11..13): 20MHz, or 40MHz on a granted
         // HT40 channel; SGI is accepted per the advertised width.
         let wide = (r >> 11) & 7;
+        if let Some(he) = self.he.filter(|_| (r >> 8) & 7 == 4) {
+            let map = he.negotiation.rx_mcs_map();
+            let nss = (r >> 4) & 1;
+            let max = match (map >> (2 * nss)) & 3 {
+                0 => 7,
+                1 => 9,
+                2 => 11,
+                _ => return false,
+            };
+            let kind = (r >> 23) & 3;
+            let gi = (r >> 20) & 7;
+            let coding = (u32::from(he.negotiation.rx_ldpc()) << 16)
+                | (u32::from(wide <= 2 && he.negotiation.rx_stbc()) << 17);
+            return r & 15 <= max
+                && wide
+                    <= u32::from(self.width40)
+                        + u32::from(self.width80)
+                        + u32::from(self.width160)
+                && kind <= 2
+                && (kind != 1 || gi != 0)
+                && gi <= if kind == 2 { 3 } else { 4 }
+                && r & ((0xe0 | ((15 << 16) & !coding)) | (1 << 25) | (1 << 26)) == 0;
+        }
         let sgi = match wide {
             1 => self.rx_sgi40,
             2 => self.rx_sgi80,
@@ -634,7 +706,7 @@ impl super::Owner {
             return Err("MVM native HT20 contract unavailable");
         }
         let local = local_ht_for(self.power.phy.features);
-        if self.power.phy.features & feature::WIDTH_160 != 0 {
+        let phy = if self.power.phy.features & feature::WIDTH_160 != 0 {
             LocalPhy::vht160(local, local_vht_for(self.power.phy.features))
         } else if self.power.phy.features & feature::VHT != 0 {
             LocalPhy::vht80(local, local_vht_for(self.power.phy.features))
@@ -643,7 +715,16 @@ impl super::Owner {
         } else {
             LocalPhy::ht20(local)
         }
-        .map_err(|_| "MVM local HT profile invalid")
+        .map_err(|_| "MVM local HT profile invalid")?;
+        if self.power.phy.features & feature::HE != 0 {
+            phy.with_he(super::he::local(
+                self.power.phy.features,
+                self.power.phy.primary,
+            )?)
+            .map_err(|_| "MVM local HE profile invalid")
+        } else {
+            Ok(phy)
+        }
     }
     pub(super) fn station_plan(
         &self,
@@ -721,9 +802,18 @@ impl super::Owner {
         if vht160_center.is_some() {
             available |= feature::WIDTH_160;
         }
+        if selected
+            && self.supports_native_he()
+            && (channel <= 14 || vht_center.is_some())
+            && narf_wireless::association::phy::ApElements::parse(&bss.information_elements)
+                .is_ok_and(|ap| ap.he_capability().is_some() && ap.he_operation().is_some())
+        {
+            available |= feature::HE;
+        }
         if selected {
             available |= feature::QOS_TIDS;
             if let Some(cap) = ap_ht {
+                available |= feature::TX_AMSDU;
                 // rs_fw_get_config_flags: LDPC to an LDPC-capable peer;
                 // STBC needs more than one valid TX antenna and peer Rx STBC.
                 if cap[0] & 1 != 0 {
@@ -972,6 +1062,9 @@ impl super::Owner {
             // VHT80 is built on the HT 20/40 profile.
             .filter(|bits| bits & feature::VHT == 0 || bits & feature::HT40 != 0)
             .filter(|bits| bits & feature::WIDTH_160 == 0 || bits & feature::VHT != 0)
+            .filter(|bits| {
+                self.power.phy.primary <= 14 || bits & feature::HE == 0 || bits & feature::VHT != 0
+            })
             .map(|bits| bits | ba)
             .collect();
         sets.sort_by_key(|bits| core::cmp::Reverse(bits.count_ones()));

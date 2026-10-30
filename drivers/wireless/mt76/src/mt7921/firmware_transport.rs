@@ -26,15 +26,20 @@ mod fragment;
 mod join;
 #[path = "tx_ba.rs"]
 mod tx_ba;
+#[path = "tx_ba_restart.rs"]
+mod tx_ba_restart;
 #[path = "tx_ba_station.rs"]
 mod tx_ba_station;
 pub use amsdu::Ht20ReceiveInfo;
 pub use join::to_ethernet;
+#[path = "monitor.rs"]
+mod monitor;
 #[path = "recovery.rs"]
 mod recovery;
 #[path = "system_pm.rs"]
 mod system_pm;
 pub(super) use join::{extract_eapol, wrap_eapol_frame};
+pub use monitor::{validate_channel as validate_monitor_channel, Capture as MonitorCapture};
 
 #[path = "firmware_transport_hw.rs"]
 mod hardware;
@@ -341,6 +346,76 @@ pub async fn scan_boot_with_options(
         .await
 }
 
+/// Start passive capture through the retained native owner. Cancellation
+/// retains Running and requires recovery before another role can start.
+pub async fn start_boot_monitor(channel: narf_wireless::monitor::Channel) -> Result<(), Error> {
+    finish_boot_keys().await?;
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .start_monitor(channel)
+        .await
+}
+pub async fn stop_boot_monitor() -> Result<(), Error> {
+    finish_boot_keys().await?;
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .stop_monitor()
+        .await
+}
+pub fn step_boot_monitor() -> Result<MonitorCapture, Error> {
+    let domain = narf_wireless::reg::db::get_domain().ok_or(Error::Authority)?;
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .step_monitor(&domain)
+}
+
+/// Explicit originator control on the same retained registered radio. The
+/// requested TID must still have its fresh native sequence; the packet owner
+/// rejects queued DATA, pending key/control work and any used TID.
+pub async fn negotiate_boot_transmit_ba_tid(tid: u8) -> Result<bool, Error> {
+    if tid >= 8 {
+        return Err(Error::Bounds);
+    }
+    finish_boot_keys().await?;
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .negotiate_transmit_ba_tid(tid)
+        .await
+}
+
+/// Queue midstream BA restart on the actual retained radio. No fabricated
+/// packet is sent: the next real user MPDU supplies a native TXS sample.
+pub async fn request_boot_transmit_ba_restart_tid(tid: u8) -> Result<(), Error> {
+    if tid >= 8 {
+        return Err(Error::Bounds);
+    }
+    finish_boot_keys().await?;
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .request_transmit_ba_restart_tid(tid)
+        .await
+}
+
 /// Dispatch station association using the retained boot owner.
 pub async fn associate_boot_station(
     bss: &ScanBss,
@@ -464,6 +539,7 @@ pub(crate) static BOOT_FRAG_THRESHOLD: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
 
 pub fn step_boot_network(tx: Option<&[u8]>) -> Result<PacketStep, Error> {
+    prepare_boot_keys()?;
     let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
     match poll_boot_keys(&mut cx) {
         Poll::Ready(result) => result?,
@@ -475,7 +551,7 @@ pub fn step_boot_network(tx: Option<&[u8]>) -> Result<PacketStep, Error> {
     owner.as_mut().ok_or(Error::DeviceGone)?.step_network(tx)
 }
 
-pub async fn service_boot_keys() -> Result<(), Error> {
+fn prepare_boot_keys() -> Result<(), Error> {
     {
         let Some(mut work) = KEY_WORK.try_lock() else {
             return Err(Error::Busy);
@@ -498,6 +574,10 @@ pub async fn service_boot_keys() -> Result<(), Error> {
             });
         }
     }
+    Ok(())
+}
+pub async fn service_boot_keys() -> Result<(), Error> {
+    prepare_boot_keys()?;
     finish_boot_keys().await
 }
 
@@ -801,6 +881,8 @@ pub enum Stage {
     EapolHandshake,
     StaRecord,
     Shutdown,
+    MonitorStart,
+    MonitorStop,
 }
 /// Firmware observations, not an operational WLAN interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -823,6 +905,11 @@ pub enum State {
         peer: [u8; 6],
         channel: u8,
         aid: u16,
+    },
+    /// Native passive sniffer acknowledged; ordinary station RX/TX stays closed.
+    Monitor {
+        info: RadioInfo,
+        channel: narf_wireless::monitor::Channel,
     },
     /// PCIe low-power handoff completed; firmware owns LPCTL and DMA is off.
     Suspended(RadioInfo),
@@ -1088,10 +1175,24 @@ trait Backend {
     fn submit_data_aggregated(&mut self, _frame: &[u8], _protected: bool) -> Result<(), Error> {
         Err(Error::UnsupportedFirmware)
     }
+    /// Reserve a currently free, non-quarantined host-TXS PID after every older native packet
+    /// has DMA and TX_FREE terminal receipts. The next true user MPDU (or
+    /// final fragment) on this TID acquires that retained sample owner.
+    fn arm_transmit_sequence(&mut self, _tid: u8) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn transmit_sequence_published(&self, _tid: u8) -> bool {
+        false
+    }
+    fn poll_transmit_sequence(&mut self, _tid: u8) -> Result<Option<u16>, Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn cancel_transmit_sequence(&mut self) {}
+
     /// Linux `wcid->amsdu`: hardware TX A-MSDU (TXD7 HW_AMSDU) for this peer.
     fn set_hw_amsdu(&mut self, _enabled: bool) {}
     /// QoS data on user priority `tid` 1..=7 (TID 0 uses the BE paths above).
-    /// Never BA-aggregated: the originator agreement is TID0-only.
+    /// The non-BA path; agreement eligibility is supplied separately.
     fn submit_data_tid(
         &mut self,
         _frame: &[u8],
@@ -1100,6 +1201,20 @@ trait Backend {
         _pipelined: bool,
     ) -> Result<(), Error> {
         Err(Error::UnsupportedFirmware)
+    }
+    /// QoS DATA under the independently completed originator agreement for
+    /// `tid`. No BA or sequence authority follows from calling this method.
+    fn submit_data_tid_aggregated(
+        &mut self,
+        frame: &[u8],
+        protected: bool,
+        tid: u8,
+    ) -> Result<(), Error> {
+        if tid == 0 {
+            self.submit_data_aggregated(frame, protected)
+        } else {
+            Err(Error::UnsupportedFirmware)
+        }
     }
 }
 
@@ -1130,8 +1245,9 @@ struct Session<B: Backend> {
     security: Option<join::StationSecurity>,
     management_rate: crate::mt7921::association::LegacyRate,
     data_pending: VecDeque<u64>,
-    tid0_used: bool,
+    used_tids: u8,
     tx_ba: tx_ba::Owner,
+    tx_restart: Option<tx_ba_restart::Request>,
     peer_lost: bool,
     station_bss: Option<ScanBss>,
     station_permission: Option<crate::mt7921::association::TxPermission>,
@@ -1152,6 +1268,12 @@ struct Session<B: Backend> {
     received_msdu: VecDeque<Vec<u8>>,
     rx_fragments: fragment::Cache,
     receive_epoch: u64,
+    /// Original copy-time native packets handed from the scan collector to
+    /// the associated station's parsers; never re-stamped at delivery.
+    scan_packets: VecDeque<CapturedData>,
+    /// During an associated scan, RX consumes only the hand-off queue so
+    /// station service cannot swallow off-channel scan observations.
+    scanning: bool,
 }
 impl<B: Backend> Session<B> {
     fn new(backend: B, firmware: Firmware) -> Self {
@@ -1167,8 +1289,9 @@ impl<B: Backend> Session<B> {
             security: None,
             management_rate: crate::mt7921::association::LegacyRate::ONE_MBPS,
             data_pending: VecDeque::with_capacity(crate::mt7921::packet_tx::PIPELINE),
-            tid0_used: false,
+            used_tids: 0,
             tx_ba: tx_ba::Owner::default(),
+            tx_restart: None,
             peer_lost: false,
             station_bss: None,
             station_permission: None,
@@ -1186,6 +1309,8 @@ impl<B: Backend> Session<B> {
             received_msdu: VecDeque::new(),
             rx_fragments: fragment::Cache::default(),
             receive_epoch: 0,
+            scan_packets: VecDeque::new(),
+            scanning: false,
         }
     }
     fn stage(&mut self, stage: Stage) {

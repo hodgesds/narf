@@ -46,6 +46,12 @@ AR9285-specific writes follow a checked silicon revision.
 - `probe()` reads the complete factory calibration image after Linux's
   bounded power-on/warm-reset sequence. It retains the controller instead
   of constructing and immediately discarding an `Arc`.
+  It reads the upstream bridge's existing ASPM policy through the current
+  child device capability and applies AR9285 device-local SerDes/WA/PM
+  workarounds only when L0s/L1 is enabled. Reset/resume repeats that
+  discovery; the retained D0 obligation supplies the D3 workaround half
+  after cold reset and before FULL_SLEEP during system suspend. Neither
+  endpoint nor shared-bridge Link Control is changed.
 - `with_controller()` provides read-only `Ath9k` inspection; it returns `None`
   while the retained async mutex is busy. Address ownership remains retained
   independently of that inspection lock, including after a failed probe.
@@ -731,15 +737,24 @@ rows and the tree facts that keep each open:
   `ps_enable=1` (`init.c`, default off). Natively there is no beacon-timer
   programming (`ath9k_hw_set_sta_beacon_timers`), TIM parsing, PS-Poll or
   NULL-data PM signalling, and IMR_S5 TIM_TIMER stays cleared (`irq.rs`).
-- `host_bus_pm`: `narf_bus::pci::upstream_bridge` now finds the parent
-  bridge, but no API lets a function driver read it: `pci_express::read_status`
-  needs a `Cap<BusDeviceCap, Read>` for the bridge itself (only the TCB
-  registry authority can mint one, by claiming the bridge) and omits Link
-  Control. The missing shared API is a read-only parent `PCI_EXP_LNKCTL`
-  accessor derived from the child's capability. The AR9285 power-off half
-  cannot land alone: `hw-ops.h::ath9k_hw_configpcipowersave` returns unless
-  `ah->aspm_enabled`, which only `pci.c::ath_pci_aspm_init` sets from that
-  parent read.
+- `host_bus_pm`: native implementation and x86_64/aarch64 software
+  validation completed2026-10-29. The family subtree passes114 native
+  smokes per architecture; bus/pcie also covers current child authority,
+  scoped ECAM fixtures and an absent parent capability list.
+  The read-only `narf_bus::pci_express::parent_link_control` runs inside
+  the child's current capability invocation and reads its immediate
+  registered bridge, without minting bridge authority or changing platform
+  ASPM policy. A nonzero parent L0s/L1 field enables the exact AR9285
+  `ar9280PciePhy_clkreq_always_on_L1_9280` table, 1ms settle and D0 WA/PM
+  settings during probe, reset/resume and pre-calibration start. Disabled,
+  missing or unavailable parent ASPM never causes these device-local writes.
+  The retained owner remembers whether it applied D0 workarounds, keeping the
+  D3 half paired even if platform link policy changes before suspend.
+  After the cold-reset half of system suspend, before FULL_SLEEP, the owner
+  clears PM_CTRL L1 enable and WA bits6/7; the actual retained SYNTH9 XE2
+  fact controls WA bit23. Native tests assert source-literal D0/D3 programs,
+  preservation of unrelated bits, authority loss, and reset/workaround/sleep
+  ordering. No endpoint or shared-bridge Link Control is written.
 
 Interrupt-driven service (`irq.rs`) follows Linux `pci.c` with
 `ath9k_use_msi`: one MSI vector is discovered, programmed and installed with

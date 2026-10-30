@@ -836,7 +836,7 @@ fn smoke_rtw8852b_he_capability_and_ra_codec_match_linux_profile() -> TestResult
     // ext35 + MAC6 + PHY11 + rx80/tx80 only (20MHz, no PPE).
     if body.len() != 1 + 6 + 11 + 4
         || body[0] != 35
-        || body[1] & 0x01 != 0
+        || body[1] & 0x01 != 1
         || body[7] & 0x0e != 0
         || body[11] & 0x01 != 0
         || body[18..22] != [0xfa, 0xff, 0xfe, 0xff]
@@ -874,6 +874,73 @@ fn smoke_rtw8852b_he_capability_and_ra_codec_match_linux_profile() -> TestResult
     }
     TestResult::Pass
 }
+
+fn smoke_rtw8852b_he_htc_peer_requires_completed_he_ra_and_bound_tid() -> TestResult {
+    const WMM: [u8; 26] = [
+        221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0x81, 0, 0x62, 0x32, 47, 0, 3, 0xa4, 0, 0, 0x42, 0x43, 94,
+        0, 0x27, 0xa4, 0, 0,
+    ];
+    let mut controller = Controller::new(&factory(false)).unwrap();
+    let admission = Admission::new();
+    let mut model = Model::new();
+    narf_scheduler::block_on(controller.initialize(&mut model, &admission)).unwrap();
+    let peer =
+        narf_scheduler::block_on(controller.prepare_peer(&mut model, AP, &admission)).unwrap();
+    narf_scheduler::block_on(controller.commit_peer(&mut model, AP, 42, false, &admission))
+        .unwrap();
+    let wmm = narf_wireless::wmm::Parameters::parse(&WMM)
+        .unwrap()
+        .unwrap();
+    narf_scheduler::block_on(controller.configure_wmm(&mut model, wmm, false, &admission)).unwrap();
+    let mut frame = vec![0; 30];
+    frame[..2].copy_from_slice(&[0x88, 0x81]);
+    frame[4..10].copy_from_slice(&AP);
+    frame[10..16].copy_from_slice(&OWN);
+    frame[24..30].copy_from_slice(&[0x10, 0, 0x1b, 0, 0, 0]);
+    if peer.admits(&frame) {
+        return TestResult::Fail("WMM alone admitted an HE +HTC header");
+    }
+    let ht = HtRa {
+        peer_rx_mcs: [0xff, 0, 0, 0],
+        sgi20: false,
+        ldpc: false,
+    };
+    let he = HeRa {
+        peer_rx_mcs: 0xfffe,
+        ldpc: true,
+        dcm: false,
+    };
+    narf_scheduler::block_on(controller.configure_ra(
+        &mut model,
+        0xfff,
+        Some(ht),
+        Some(he),
+        &admission,
+    ))
+    .unwrap();
+    if !peer.admits(&frame) {
+        return TestResult::Fail("completed HE RA did not admit bound +HTC TID0");
+    }
+    for (index, value) in [(0, 8), (24, 0x13), (24, 0), (26, 3)] {
+        let mut bad = frame.clone();
+        bad[index] = value;
+        if peer.admits(&bad) {
+            return TestResult::Fail("HE peer broadened TID/control/header admission");
+        }
+    }
+    if peer.admits(&frame[..29]) {
+        return TestResult::Fail("HE peer admitted an incomplete control field");
+    }
+    controller.invalidate();
+    if peer.admits(&frame) {
+        return TestResult::Fail("invalidated HE peer retained +HTC admission");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/htc",
+    smoke_rtw8852b_he_htc_peer_requires_completed_he_ra_and_bound_tid
+);
 kernel_test_in!(
     "drivers/wireless/rtw89/station",
     smoke_rtw8852b_he_capability_and_ra_codec_match_linux_profile

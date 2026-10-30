@@ -45,9 +45,20 @@ pub(super) fn management(
     if protected && (multicast || !is_mgmt) {
         return Err(Error::Bounds);
     }
+    // mt76_connac2_mac_write_txwi_80211: ADDBA needs its target
+    // QoS TID and ADD_BA metadata even though the frame is management.
+    let add_ba = is_mgmt && subtype == 13 && frame.len() >= 33 && frame[24..26] == [3, 0];
+    let tid = if add_ba {
+        (u16::from_le_bytes([frame[27], frame[28]]) >> 2) & 15
+    } else {
+        0
+    };
+    if tid >= 8 {
+        return Err(Error::Bounds);
+    }
     let words = [
         (frame.len() as u32 + 32) | (0x10 << 25), // CT, LMAC ALTX0.
-        (1 << 31) | (2 << 16) | (12 << 11) | u32::from(wcid),
+        (1 << 31) | (u32::from(tid) << 20) | (2 << 16) | (12 << 11) | u32::from(wcid),
         (1 << 31)
             | (1 << 13)
             | (u32::from(multicast) << 10)
@@ -55,7 +66,7 @@ pub(super) fn management(
             | if is_data { 2 << 4 } else { 0 },
         (1 << 28) | (15 << 11) | (u32::from(protected) << 1) | u32::from(multicast),
         0,
-        0,
+        if add_ba { 1 << 14 } else { 0 },
         4 | (u32::from(rate.hardware()) << 16),
         (if is_data { 2 << 20 } else { 0 }) | (subtype << 16),
     ];
@@ -261,7 +272,16 @@ pub(super) fn ethernet_aggregated(
     token: u16,
     protected: bool,
 ) -> Result<[u8; HEADER], Error> {
-    let mut out = ethernet_qos(frame, payload, token, 1, protected, true)?;
+    ethernet_tid_aggregated(frame, payload, token, protected, 0)
+}
+pub(super) fn ethernet_tid_aggregated(
+    frame: &[u8],
+    payload: u64,
+    token: u16,
+    protected: bool,
+    tid: u8,
+) -> Result<[u8; HEADER], Error> {
+    let mut out = ethernet_tid(frame, payload, token, 1, protected, tid)?;
     let word = u32::from_le_bytes(out[12..16].try_into().unwrap()) & !(1 << 28);
     out[12..16].copy_from_slice(&word.to_le_bytes());
     Ok(out)

@@ -376,6 +376,40 @@ pub async fn provision() -> Result<(), &'static str> {
 pub fn provision_state() -> Option<ProvisionState> {
     Some(NATIVE.lock().as_ref()?.phase())
 }
+/// Read-only live Gen2 firmware geometry. These opaque FIFO sizes do not
+/// supply transmit, calibration or DMA mapping authority.
+pub async fn gen2_shared_memory_configuration() -> Result<super::Gen2SharedMemory, &'static str> {
+    let startup = NATIVE.lock().clone().ok_or("Intel native binding absent")?;
+    if startup.phase() != ProvisionState::Ready {
+        return Err("MVM native firmware not configured");
+    }
+    let device = startup
+        .state
+        .lock()
+        .await
+        .mvm
+        .clone()
+        .ok_or("native Intel binding is not Gen2")?;
+    device.shared_memory().await
+}
+/// Metadata for an externally measured signed active-scan program. The
+/// exact ordered channel list is included in the firmware/platform binding.
+pub async fn gen2_scan_transmit_power_request(
+    channels: &[u8],
+) -> Result<super::Gen2TransmitPowerRequest, &'static str> {
+    let startup = NATIVE.lock().clone().ok_or("Intel native binding absent")?;
+    if startup.phase() != ProvisionState::Ready {
+        return Err("MVM native firmware not configured");
+    }
+    let device = startup
+        .state
+        .lock()
+        .await
+        .mvm
+        .clone()
+        .ok_or("native Intel binding is not Gen2")?;
+    device.scan_power_request(channels).await
+}
 /// Current physical/firmware/SMBIOS binding for an externally measured signed
 /// input. This metadata supplies no calibration, transmit or station grant.
 pub async fn gen2_transmit_power_request() -> Result<super::Gen2TransmitPowerRequest, &'static str>

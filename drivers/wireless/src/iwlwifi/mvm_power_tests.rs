@@ -15,6 +15,63 @@ const NAME: &str = "narf-test/intel/mvm-power-v1";
 // Explicit test-only qualification values; never used by platform discovery.
 const SAR: [[u8; 5]; 2] = [[80, 81, 82, 83, 84], [72, 73, 74, 75, 76]];
 
+fn smoke_mvm_scan_program_binds_channels_and_never_reuses_station_power() -> TestResult {
+    (|| {
+        let exact = bind_scan_program(BINDING, &[1, 6]);
+        for other in [
+            bind_scan_program(BINDING, &[1]),
+            bind_scan_program(BINDING, &[6, 1]),
+            bind_scan_program(BINDING, &[1, 11]),
+            bind_scan_program([4; 32], &[1, 6]),
+        ] {
+            if exact.binding == other.binding || exact.name == other.name {
+                return Err("active scan aliased another channel/physical program");
+            }
+        }
+        let mut record = record();
+        record[46] = 6;
+        record[8..40].copy_from_slice(&exact.binding);
+        let signed = source(&record, true)?;
+        if parse_for(
+            copy(&signed),
+            exact.binding,
+            [2; 6],
+            1,
+            Emission::ActiveScan,
+        )
+        .is_err()
+            || parse_for(copy(&signed), BINDING, [2; 6], 1, Emission::ActiveScan).is_ok()
+            || parse_for(copy(&signed), exact.binding, [2; 6], 1, Emission::Legacy).is_ok()
+            || parse_for(copy(&signed), exact.binding, [2; 6], 1, Emission::Ht20Ba).is_ok()
+        {
+            return Err("scan qualification crossed channel binding or station tag");
+        }
+        let prepared = parse_for(
+            copy(&signed),
+            exact.binding,
+            [2; 6],
+            1,
+            Emission::ActiveScan,
+        )?;
+        let mut host = domain();
+        host.rules[0].freq_end_mhz = 2447;
+        let fence = prepared.scan_fence(&[1, 6], &[true, true], &host)?;
+        if fence.device_command()[..10] != [1, 0, 0, 0, 0, 0, 0, 0, 64, 0] {
+            return Err("scan device power is not global host EIRP minus measured gain");
+        }
+        signed.cap.revoke();
+        if fence.invoke(&host, || Ok(())).is_ok() {
+            return Err("revoked scan program retained native publication authority");
+        }
+        Ok(())
+    })()
+    .map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/active_scan",
+    smoke_mvm_scan_program_binds_channels_and_never_reuses_station_power
+);
+
 fn poll<T>(future: Pin<&mut impl Future<Output = T>>) -> Poll<T> {
     let result = future.poll(&mut TaskContext::from_waker(Waker::noop()));
     if result.is_pending() {

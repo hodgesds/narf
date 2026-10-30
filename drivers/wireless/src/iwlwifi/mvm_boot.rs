@@ -10,6 +10,7 @@ pub enum Phase {
     Starting,
     Configured,
     Scanning,
+    ReadingSharedMemory,
     PreparingChannel,
     ChannelPrepared,
     ReleasingChannel,
@@ -201,8 +202,17 @@ fn configuration(profile: Profile) -> Configuration {
 #[path = "mvm_boot_tests.rs"]
 mod tests;
 
+#[path = "mvm_active_scan.rs"]
+mod active_scan;
+#[path = "mvm_smem.rs"]
+mod smem;
+pub type SharedMemory = smem::SharedMemory;
+#[path = "mvm_he.rs"]
+mod he;
 #[path = "mvm_scan.rs"]
 mod scan;
+#[path = "mvm_tx_amsdu.rs"]
+mod tx_amsdu;
 
 #[path = "mvm_channel.rs"]
 mod channel;

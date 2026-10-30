@@ -101,3 +101,34 @@ pub fn ptr_for(phys: PhysAddr, offset: u64) -> Option<*mut u8> {
 pub fn __reset_for_test() {
     *SEGMENTS.lock() = [None; MAX_SEGMENTS];
 }
+
+/// Scoped config-space fixtures. The owned RAM must outlive the guard;
+/// dropping the guard restores the real ECAM registrations before it is freed.
+#[cfg(feature = "kernel-test")]
+pub(crate) struct TestWindows([Option<Segment>; MAX_SEGMENTS]);
+
+#[cfg(feature = "kernel-test")]
+impl Drop for TestWindows {
+    fn drop(&mut self) {
+        *SEGMENTS.lock() = self.0;
+    }
+}
+
+/// # Safety
+/// Every pointer must cover its declared length until the returned guard is
+/// dropped. Run only with exclusive ownership of the test's PCI registry.
+#[cfg(feature = "kernel-test")]
+pub(crate) unsafe fn __test_windows(windows: &[(PhysAddr, *mut u8, u64)]) -> TestWindows {
+    assert!(windows.len() <= MAX_SEGMENTS);
+    let mut segments = SEGMENTS.lock();
+    let restore = TestWindows(*segments);
+    *segments = [None; MAX_SEGMENTS];
+    for (slot, &(phys, ptr, len)) in segments.iter_mut().zip(windows) {
+        *slot = Some(Segment {
+            phys: phys.raw(),
+            virt: ptr as u64,
+            len,
+        });
+    }
+    restore
+}

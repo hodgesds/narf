@@ -1,5 +1,6 @@
 //! Native Qu/API77 Block Ack ownership. TLC43 owns TX negotiation/retries;
-//! recipient agreements are host-owned ADD_STA48 BAIDs (Linux mvm/sta.c).
+//! recipient agreements use ADD_STA48 or BAID_ML_SUPPORT CONFIG v1/v2,
+//! with the same host reorder and retirement owner (Linux mvm/sta.c).
 use super::super::{boot_context::put16, scan_api};
 use super::{Owner, Phase};
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
@@ -9,6 +10,8 @@ use narf_wireless::{reg::RegulatoryDomain, reorder::Reorder};
 #[path = "mvm_ba_bundle.rs"]
 mod bundle;
 use bundle::{Bundle, Partial, Raw};
+#[path = "mvm_baid.rs"]
+mod baid;
 
 const TIDS: usize = 8;
 const WINDOW: u16 = 32;
@@ -51,22 +54,6 @@ pub(super) struct Context {
 }
 fn now() -> u64 {
     narf_time::wall::cycles_to_ns(narf_time::now_cycles())
-}
-fn add(request: Request) -> [u8; 48] {
-    let mut b = [0; 48];
-    b[0] = 1;
-    b[17] = 8;
-    b[28] = request.tid;
-    put16(&mut b, 30, request.ssn);
-    put16(&mut b, 44, request.window);
-    b
-}
-fn remove(tid: u8) -> [u8; 48] {
-    let mut b = [0; 48];
-    b[0] = 1;
-    b[17] = 16;
-    b[29] = tid;
-    b
 }
 fn permission(enabled: bool) -> [u8; 48] {
     let mut b = [0; 48];
@@ -173,7 +160,7 @@ impl Context {
             || f[4] & 1 != 0
             || f[4..10] != local
             || f[24] & 15 != s.request.tid
-            || f[24] & 0x10 != 0
+            || f[24] & 0x10 != 0 && f[1] & 0x80 == 0
             || !matches!(f[24] & 0x60, 0 | 0x60)
             || f[25] != 0
             || (f[24] & 0x80 != 0) != m.amsdu
@@ -287,6 +274,18 @@ impl Context {
     }
 }
 impl Owner {
+    fn baid_profile(&self) -> Option<baid::Profile> {
+        let parsed = super::super::parse_ucode(&self.firmware).ok()?;
+        if !parsed.api.has_capability(63) {
+            return Some(baid::Profile::Station);
+        }
+        // Linux lookup defaults this command to v1, including UNKNOWN.
+        match self.hardware.version(5, 0x16).map(|v| v.0).unwrap_or(1) {
+            1 | 99 => Some(baid::Profile::ConfigV1),
+            2 => Some(baid::Profile::ConfigV2),
+            _ => None,
+        }
+    }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::iwlwifi) fn model_expire_ba_partials(&mut self) {
         for s in &mut self.power.phy.ba.sessions {
@@ -303,7 +302,7 @@ impl Owner {
                 .is_some_and(|v| matches!(v.1, 4 | 6 | 7))
             && self.hardware.version(0, 0xc2).is_some_and(|v| v.1 == 1)
             && self.hardware.version(0, 0xc3).is_some_and(|v| v.1 == 1)
-            && super::super::parse_ucode(&self.firmware).is_ok_and(|p| !p.api.has_capability(63))
+            && self.baid_profile().is_some()
     }
     pub(super) fn ba_qualified(&self) -> bool {
         self.power.phy.ba.selected
@@ -499,28 +498,29 @@ impl Owner {
                             .position(|s| s.request == request)
                             .ok_or("MVM BA reservation lost")?;
                         if self.power.phy.ba.sessions[index].baid.is_none() {
+                            let profile = self.baid_profile().ok_or("MVM BAID profile changed")?;
+                            let command = profile.add(request.tid, request.ssn, request.window);
                             let reply = self
-                                .qualified_link_command(1, 0x18, &add(request), policy)
+                                .qualified_link_command(
+                                    command.group,
+                                    command.command,
+                                    &command.bytes,
+                                    policy,
+                                )
                                 .await?;
-                            if reply.len() == 4
-                                && u32::from_le_bytes(reply[..].try_into().unwrap()) & 255 == 4
-                            {
+                            let Some(id) = profile.allocated(&reply)? else {
                                 self.ba_management(&response(request, 37), policy).await?;
                                 self.power.phy.ba.sessions.remove(index);
                                 self.power.phy.ba.work.pop_front();
                                 continue;
-                            }
-                            let receipt = status(&reply)?;
-                            let id = ((receipt >> 8) & 127) as u8;
-                            if receipt & 0x8000 == 0
-                                || id >= 32
-                                || self
-                                    .power
-                                    .phy
-                                    .ba
-                                    .sessions
-                                    .iter()
-                                    .any(|s| s.baid == Some(id))
+                            };
+                            if self
+                                .power
+                                .phy
+                                .ba
+                                .sessions
+                                .iter()
+                                .any(|s| s.baid == Some(id))
                             {
                                 return Err("MVM allocated BAID missing/foreign/reused");
                             }
@@ -575,16 +575,18 @@ impl Owner {
         self.power.phy.ba.sessions[index].partial = None;
         self.power.phy.ba.sessions[index].reorder.clear();
         if self.power.phy.ba.sessions[index].baid.is_some() {
+            let profile = self.baid_profile().ok_or("MVM BAID profile changed")?;
+            let command = profile.remove(tid, self.power.phy.ba.sessions[index].baid.unwrap());
             let reply = if let Some(p) = policy.as_deref_mut() {
-                self.qualified_link_command(1, 0x18, &remove(tid), p)
+                self.qualified_link_command(command.group, command.command, &command.bytes, p)
                     .await?
             } else {
                 self.hardware
-                    .command_with_header_version(1, 0x18, &remove(tid), 0)
+                    .command_with_header_version(command.group, command.command, &command.bytes, 0)
                     .await?
                     .payload
             };
-            status(&reply)?;
+            profile.removed(&reply)?;
             // Do not reuse a firmware BAID/reorder map on command ACK alone.
             self.sync_ba_rx(self.power.phy.ba.sessions[index].baid.unwrap(), policy)
                 .await?;

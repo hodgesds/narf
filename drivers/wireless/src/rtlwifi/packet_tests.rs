@@ -581,7 +581,7 @@ pub(crate) fn smoke_rtl8188ee_native_receive_offset_fcs_profiles_and_repost() ->
         return TestResult::Fail("native RX offset/FCS boundary differs");
     }
     let ring = port.region(u64::from(port.radio.word(LINUX_RX_BASE)));
-    if word(&ring.bytes.lock(), 0) != OWN | 4096 {
+    if word(&ring.bytes.lock(), 0) != OWN | 9100 {
         return TestResult::Fail("consumed native RX buffer not reposted");
     }
     // Distinct raw descriptor failures, including non-MPDU reports and an
@@ -1151,7 +1151,7 @@ pub(crate) fn smoke_rtl8188ee_native_rate_mask_enables_data_fallback() -> TestRe
     // Before the mask: DATA keeps USE_RATE|DISDATAFB and RATE_ID 0.
     let slot = owner.packet.next[4];
     owner
-        .submit_aggregate(&frame(true), 11, None, true)
+        .submit_aggregate(&frame(true), 11, None, true, false)
         .unwrap();
     let before = port.descriptor(4, slot);
     if word(&before, 16) & (1 << 10) == 0 || word(&before, 4) & (15 << 16) != 0 {
@@ -1170,7 +1170,7 @@ pub(crate) fn smoke_rtl8188ee_native_rate_mask_enables_data_fallback() -> TestRe
     // DATA: RATE_ID = ratr_index, DISDATAFB clear, USE_RATE kept.
     let slot = owner.packet.next[4];
     owner
-        .submit_aggregate(&frame(true), 11, None, true)
+        .submit_aggregate(&frame(true), 11, None, true, false)
         .unwrap();
     let data = port.descriptor(4, slot);
     if word(&data, 16) & (1 << 10) != 0
@@ -1186,7 +1186,7 @@ pub(crate) fn smoke_rtl8188ee_native_rate_mask_enables_data_fallback() -> TestRe
         let queue = if data { 4 } else { 1 };
         let slot = owner.packet.next[queue];
         owner
-            .submit_aggregate(&frame(data), 0, None, adaptive)
+            .submit_aggregate(&frame(data), 0, None, adaptive, false)
             .unwrap();
         let other = port.descriptor(queue, slot);
         if word(&other, 16) & (1 << 10) == 0 || word(&other, 4) & (15 << 16) != 0 {

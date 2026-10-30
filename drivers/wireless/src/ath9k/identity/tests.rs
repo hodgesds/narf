@@ -109,6 +109,34 @@ impl RegisterIo for Fake {
     }
 }
 
+fn smoke_ath9k_pcie_d3_workarounds_follow_reset_before_full_sleep() -> TestResult {
+    let mut io = Fake::new();
+    io.registers.insert(0x4014, 0x80023);
+    io.registers.insert(0x4004, 0x00ca05cb);
+    if disable_and_sleep_with_pcie(&mut io, Some(true)).is_err() {
+        return TestResult::Fail("AR9285 ASPM-aware FULL_SLEEP failed");
+    }
+    let reset_done = io.ops.iter().rposition(|op| *op == Op::Write(AR_RC, 0));
+    let pcie_off = io.ops.iter().position(|op| *op == Op::Write(0x4014, 0x23));
+    let workaround = io
+        .ops
+        .iter()
+        .position(|op| *op == Op::Write(0x4004, 0x00ca050b));
+    let sleep = io.ops.iter().position(
+        |op| matches!(op, Op::Write(AR_STA_ID1, value) if value & AR_STA_ID1_PWR_SAV != 0),
+    );
+    if !matches!((reset_done, pcie_off, workaround, sleep),
+        (Some(reset), Some(off), Some(wa), Some(sleep)) if reset < off && off < wa && wa < sleep)
+    {
+        return TestResult::Fail("PCIe D3 workarounds were reset away or applied after FULL_SLEEP");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/pcie_pm",
+    smoke_ath9k_pcie_d3_workarounds_follow_reset_before_full_sleep
+);
+
 fn smoke_ath9k_ar9285_reset_and_complete_eeprom() -> TestResult {
     let mut io = Fake::new();
     let (identity, calibration) = match identify(&mut io) {

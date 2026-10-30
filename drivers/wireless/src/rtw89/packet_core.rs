@@ -167,6 +167,8 @@ pub(super) struct Core {
     completions: VecDeque<Receipt>,
     /// Signed aggregate emitter granted (`Program::Ampdu`).
     aggregate: bool,
+    /// Last published A-Control form (`rtwvif_link->last_a_ctrl`).
+    last_a_ctrl: bool,
 }
 const STOP: u32 = 1 << 8 | 1 << 16 | 1 << 19;
 /// Receive PHY admission granted by the signed operating programs.
@@ -298,6 +300,7 @@ impl Core {
                 pending: Vec::new(),
                 completions: VecDeque::new(),
                 aggregate: false,
+                last_a_ctrl: false,
             };
             for ring in &mut owner.rings {
                 let regs = ring.kind.regs();
@@ -409,7 +412,9 @@ impl Core {
             return Err(Error::Packet);
         }
         // HE extended-range SU TX belongs to the signed HE program only.
-        if rate & format::DATA_ER != 0 && self.rx < RxPhy::He {
+        if (rate & format::DATA_ER != 0 || bytes.get(1).is_some_and(|fc| fc & 0x80 != 0))
+            && self.rx < RxPhy::He
+        {
             return Err(Error::Packet);
         }
         if if agg.is_some() {
@@ -426,6 +431,8 @@ impl Core {
             _ => self.own,
         };
         let kind = format::classify(bytes, source)?;
+        let a_ctrl = bytes[1] & 0x80 != 0;
+        let break_aggregation = a_ctrl != self.last_a_ctrl;
         let id = self.next_id;
         let next_id = id.checked_add(1).ok_or(Error::State)?;
         let result = port.current(|port| {
@@ -456,7 +463,7 @@ impl Core {
             }
             let packet = ring.queue.reserved_mut(ticket)?;
             let preparation = (|| {
-                let (header, actual) = format::transmit_agg(
+                let (mut header, actual) = format::transmit_agg(
                     bytes,
                     source,
                     self.mac_id,
@@ -468,6 +475,12 @@ impl Core {
                 )?;
                 if actual != kind {
                     return Err(Error::Packet);
+                }
+                // A-Control form changes must begin a fresh hardware
+                // aggregate (rtw89_core_tx_update_he_qos_htc desc_bk).
+                if break_aggregation {
+                    let body3 = u32::from_le_bytes(header[12..16].try_into().unwrap());
+                    header[12..16].copy_from_slice(&(body3 | 1 << 13).to_le_bytes());
                 }
                 copy_to(&packet.body, 0, bytes)?;
                 copy_to(&packet.header, 0, &header)?;
@@ -506,6 +519,7 @@ impl Core {
                 return Err(Error::Access);
             }
             self.next_id = next_id;
+            self.last_a_ctrl = a_ctrl;
             Ok(id)
         });
         if result.is_err() {

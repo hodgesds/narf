@@ -14,6 +14,13 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use narf_io::pool::DmaPool;
 use narf_lib::sync::IrqSafeSpinLock;
 
+#[path = "iface_monitor.rs"]
+mod monitor;
+pub use monitor::{
+    begin_monitor_rx, end_monitor_rx, monitor_rx_current, on_monitor_frame_from, set_link_layer,
+    LinkLayer, MonitorRxToken,
+};
+
 /// Function pointer the driver supplies to send a single Ethernet frame.
 /// `meta` carries the per-frame transmit offloads the stack is requesting
 /// (L4 checksum, TSO, VLAN); a driver that advertises no offloads in
@@ -157,6 +164,10 @@ pub enum LinkDuplex {
 pub struct NetIfaceEntry {
     pub name: String,
     pub mac: [u8; 6],
+    pub link_layer: LinkLayer,
+    /// Binding generation for devices whose link representation can change.
+    pub packet_generation: u64,
+    monitor_epoch: u64,
     pub send: SendFn,
     send_context: Option<(u64, SendCtxFn)>,
     /// The interface's primary IPv4 address (the stack's source address),
@@ -526,6 +537,7 @@ static RETIRED: IrqSafeSpinLock<Vec<NetIfaceEntry>> = IrqSafeSpinLock::new(Vec::
 /// The old generation's send hook and cookie are dropped with the entry.
 /// Returns false when `name` is not registered.
 pub fn retire_for_rebind(name: &str) -> bool {
+    let _capture = monitor::PUBLISH.lock();
     let mut g = IFACES.lock();
     let Some(entries) = g.as_mut() else {
         return false;
@@ -533,7 +545,12 @@ pub fn retire_for_rebind(name: &str) -> bool {
     let Some(at) = entries.iter().position(|entry| entry.name == name) else {
         return false;
     };
-    let entry = entries.remove(at);
+    let mut entry = entries.remove(at);
+    let retired_snapshot = snapshot(&entry);
+    entry.monitor_epoch = 0;
+    if entry.link_layer == LinkLayer::Ieee80211Radiotap {
+        monitor::carrier(&mut entry, false);
+    }
     {
         let mut reserved = RESERVED.lock();
         if !reserved.iter().any(|held| held == name) {
@@ -545,6 +562,7 @@ pub fn retire_for_rebind(name: &str) -> bool {
     retired.push(entry);
     drop(retired);
     drop(g);
+    monitor::invalidate(&retired_snapshot);
     // The netdev persists across the rebind, so its IPv4 binding, UDP
     // sockets and ARP work are kept (unlike `unregister`).
     true
@@ -694,6 +712,7 @@ fn register_inner(
     send: SendFn,
     send_context: Option<(u64, SendCtxFn)>,
 ) -> String {
+    let _capture = monitor::PUBLISH.lock();
     let enumerated_name = name.contains("%d");
     let mut g = IFACES.lock();
     let v = g.get_or_insert_with(Vec::new);
@@ -756,7 +775,10 @@ fn register_inner(
     let napi_defer_hard_irqs = old.as_ref().map_or(0, |old| old.napi_defer_hard_irqs);
     let proto_down = old.as_ref().is_some_and(|old| old.proto_down);
     let threaded = old.as_ref().is_some_and(|old| old.threaded);
-    let carrier = old.as_ref().is_some_and(|old| old.carrier) || name == "lo";
+    let carrier = old
+        .as_ref()
+        .is_some_and(|old| old.carrier && old.link_layer == LinkLayer::Ethernet)
+        || name == "lo";
     let carrier_changes = old.as_ref().map_or(0, |old| old.carrier_changes);
     let carrier_up_count = old.as_ref().map_or(0, |old| old.carrier_up_count);
     let carrier_down_count = old.as_ref().map_or(0, |old| old.carrier_down_count);
@@ -775,6 +797,17 @@ fn register_inner(
     v.push(NetIfaceEntry {
         name: name.clone(),
         mac,
+        link_layer: old
+            .as_ref()
+            .map_or(LinkLayer::Ethernet, |old| old.link_layer),
+        monitor_epoch: 0,
+        packet_generation: old.as_ref().map_or(0, |old| {
+            if old.packet_generation != 0 {
+                monitor::next_epoch().unwrap_or(u64::MAX)
+            } else {
+                0
+            }
+        }),
         send,
         send_context,
         ipv4,
@@ -825,6 +858,10 @@ fn register_inner(
         tx_headroom: old.as_ref().map_or(0, |old| old.tx_headroom),
     });
     drop(g);
+    if let Some(old) = old.as_ref() {
+        monitor::invalidate(&snapshot(old));
+    }
+    drop(_capture);
     // Publish this interface's `net.ipv4.conf.<dev>.*` keys and seed its
     // forwarding value from `conf.default`. Done with IFACES released: the
     // hook reaches into the procfs registry, which must not be entered under
@@ -837,14 +874,23 @@ fn register_inner(
 /// call retain only the permanent in-tree dispatch trampoline; their cookie
 /// resolves fail-closed once the owning device context is removed.
 pub fn unregister(name: &str) -> bool {
+    let _capture = monitor::PUBLISH.lock();
     let mut g = IFACES.lock();
     let Some(entries) = g.as_mut() else {
         return false;
     };
+    let old = entries
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(snapshot);
     let before = entries.len();
     entries.retain(|entry| entry.name != name);
     let removed = entries.len() != before;
     drop(g);
+    if let Some(old) = old.as_ref() {
+        monitor::invalidate(old);
+    }
+    drop(_capture);
     if removed {
         crate::ipv4::remove_interface_binding(name);
         crate::udp_sock::remove_interface(name);
@@ -968,7 +1014,9 @@ pub fn snapshot_all_in(net_ns_id: u64) -> Vec<NetIfaceSnapshot> {
 pub fn primary() -> Option<NetIfaceSnapshot> {
     let g = IFACES.lock();
     let v = g.as_ref()?;
-    let e = v.first()?;
+    let e = v
+        .iter()
+        .find(|entry| entry.link_layer == LinkLayer::Ethernet)?;
     Some(snapshot(e))
 }
 
@@ -1100,6 +1148,9 @@ pub fn send_on(iface_name: &str, frame: &[u8]) -> Result<(), ()> {
         let g = IFACES.lock();
         let v = g.as_ref().ok_or(())?;
         let e = v.iter().find(|e| e.name == iface_name).ok_or(())?;
+        if e.link_layer != LinkLayer::Ethernet {
+            return Err(());
+        }
         (send_dispatch(e), e.name.clone())
     };
     let result = send.call(frame, crate::TxMeta::plain());
@@ -1120,6 +1171,9 @@ pub fn send_on_ifindex(ifindex: u32, frame: &[u8]) -> Result<(), ()> {
         let g = IFACES.lock();
         let v = g.as_ref().ok_or(())?;
         let entry = v.iter().find(|e| e.ifindex == ifindex).ok_or(())?;
+        if entry.link_layer != LinkLayer::Ethernet {
+            return Err(());
+        }
         (send_dispatch(entry), entry.name.clone())
     };
     let result = send.call(frame, crate::TxMeta::plain());
@@ -1150,7 +1204,7 @@ pub fn primary_in(net_ns_id: u64) -> Option<NetIfaceSnapshot> {
     let entry = g
         .as_ref()?
         .iter()
-        .find(|entry| entry.net_ns_id == net_ns_id)?;
+        .find(|entry| entry.net_ns_id == net_ns_id && entry.link_layer == LinkLayer::Ethernet)?;
     Some(snapshot(entry))
 }
 
@@ -1167,6 +1221,7 @@ pub fn lookup_in(net_ns_id: u64, name: &str) -> Option<NetIfaceSnapshot> {
 /// Move an interface between network namespaces. Callers must gate this with
 /// the interface's live `AdminHandle`; this primitive only changes ownership.
 pub(crate) fn set_net_ns(name: &str, net_ns_id: u64) -> bool {
+    let _capture = monitor::PUBLISH.lock();
     let mut g = IFACES.lock();
     let Some(entry) = g
         .as_mut()
@@ -1176,6 +1231,15 @@ pub(crate) fn set_net_ns(name: &str, net_ns_id: u64) -> bool {
     };
     let old_ns = entry.net_ns_id;
     entry.net_ns_id = net_ns_id;
+    if old_ns != net_ns_id {
+        entry.monitor_epoch = 0;
+        if entry.packet_generation != 0 {
+            entry.packet_generation = monitor::next_epoch().unwrap_or(u64::MAX);
+        }
+        if entry.link_layer == LinkLayer::Ieee80211Radiotap {
+            monitor::carrier(entry, false);
+        }
+    }
     let moved = snapshot(entry);
     drop(g);
     crate::route::move_iface_routes(name, net_ns_id);
@@ -1194,7 +1258,8 @@ pub(crate) fn set_net_ns(name: &str, net_ns_id: u64) -> bool {
 }
 
 pub(crate) fn release_namespace(net_ns_id: u64) {
-    let names: Vec<String> = {
+    let _capture = monitor::PUBLISH.lock();
+    let moved: Vec<NetIfaceSnapshot> = {
         let mut interfaces = IFACES.lock();
         let Some(entries) = interfaces.as_mut() else {
             return;
@@ -1204,12 +1269,20 @@ pub(crate) fn release_namespace(net_ns_id: u64) {
             .filter(|entry| entry.net_ns_id == net_ns_id)
             .map(|entry| {
                 entry.net_ns_id = 0;
-                entry.name.clone()
+                entry.monitor_epoch = 0;
+                if entry.link_layer == LinkLayer::Ieee80211Radiotap {
+                    monitor::carrier(entry, false);
+                }
+                if entry.packet_generation != 0 {
+                    entry.packet_generation = monitor::next_epoch().unwrap_or(u64::MAX);
+                }
+                snapshot(entry)
             })
             .collect()
     };
-    for name in names {
-        crate::route::move_iface_routes(&name, 0);
+    for entry in moved {
+        crate::raw_sock::netdev_unregister_moved(net_ns_id, &entry);
+        crate::route::move_iface_routes(&entry.name, 0);
     }
 }
 
@@ -1225,7 +1298,9 @@ pub fn for_dst(dst: [u8; 4]) -> Option<NetIfaceSnapshot> {
 pub fn for_dst_in(net_ns_id: u64, dst: [u8; 4]) -> Option<NetIfaceSnapshot> {
     if let Some(r) = crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(dst)) {
         if let Some(s) = lookup_in(net_ns_id, &r.iface) {
-            return Some(s);
+            if s.link_layer == LinkLayer::Ethernet {
+                return Some(s);
+            }
         }
     }
     primary_in(net_ns_id)
@@ -1244,6 +1319,9 @@ pub fn send_for_dst(dst: [u8; 4], frame: &[u8]) -> Result<(), ()> {
 pub struct NetIfaceSnapshot {
     pub name: String,
     pub mac: [u8; 6],
+    pub link_layer: LinkLayer,
+    /// Binding generation for devices whose link representation can change.
+    pub packet_generation: u64,
     /// The driver's transmit hook. Private: every kernel transmit goes
     /// through [`NetIfaceSnapshot::xmit`] so packet taps see it.
     driver_send: SendDispatch,
@@ -1357,6 +1435,9 @@ impl NetIfaceSnapshot {
         origin: Option<&crate::raw_sock::PacketSock>,
         bypass: bool,
     ) -> Result<(), ()> {
+        if self.link_layer != LinkLayer::Ethernet {
+            return Err(());
+        }
         if frame.tx_timing() != crate::TxTiming::default() && self.send_frame_context.is_none() {
             return Err(());
         }
@@ -1385,6 +1466,8 @@ impl NetIfaceSnapshot {
     pub fn hatype(&self) -> u16 {
         if self.ifindex == 1 || self.name == "lo" {
             crate::raw_sock::ARPHRD_LOOPBACK
+        } else if self.link_layer == LinkLayer::Ieee80211Radiotap {
+            crate::raw_sock::ARPHRD_IEEE80211_RADIOTAP
         } else {
             crate::raw_sock::ARPHRD_ETHER
         }
@@ -1402,6 +1485,9 @@ impl NetIfaceSnapshot {
     /// only when [`Self::offloads`] advertises support; otherwise it hands a
     /// fully-formed frame and [`crate::TxMeta::plain`].
     pub fn xmit_meta(&self, frame: &[u8], meta: crate::TxMeta) -> Result<(), ()> {
+        if self.link_layer != LinkLayer::Ethernet {
+            return Err(());
+        }
         crate::raw_sock::dev_queue_xmit_nit(self, frame, crate::raw_sock::tx_protocol(frame), None);
         let result = self.driver_send.call(frame, meta);
         record_tx_result(&self.name, frame.len(), result.is_ok());
@@ -1418,6 +1504,9 @@ impl NetIfaceSnapshot {
         protocol: u16,
         origin: Option<&crate::raw_sock::PacketSock>,
     ) -> Result<(), ()> {
+        if self.link_layer != LinkLayer::Ethernet {
+            return Err(());
+        }
         crate::raw_sock::dev_queue_xmit_nit(self, frame, protocol, origin);
         let result = self.driver_send.call(frame, crate::TxMeta::plain());
         record_tx_result(&self.name, frame.len(), result.is_ok());
@@ -1427,6 +1516,9 @@ impl NetIfaceSnapshot {
     /// `dev_direct_xmit`: hand the frame straight to the driver, with no
     /// packet taps (`PACKET_QDISC_BYPASS`).
     pub fn xmit_direct(&self, frame: &[u8]) -> Result<(), ()> {
+        if self.link_layer != LinkLayer::Ethernet {
+            return Err(());
+        }
         let result = self.driver_send.call(frame, crate::TxMeta::plain());
         record_tx_result(&self.name, frame.len(), result.is_ok());
         result
@@ -1437,6 +1529,8 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
     NetIfaceSnapshot {
         name: entry.name.clone(),
         mac: entry.mac,
+        link_layer: entry.link_layer,
+        packet_generation: entry.packet_generation,
         driver_send: send_dispatch(entry),
         ipv4: entry.ipv4,
         gateway: entry.gateway,
@@ -1708,6 +1802,7 @@ pub fn dev_promisc_counts(net_ns_id: u64, ifindex: u32) -> Option<(u32, u32)> {
 }
 
 pub fn set_link_state(name: &str, up: bool) -> bool {
+    let _capture = monitor::PUBLISH.lock();
     let mut g = IFACES.lock();
     let Some(entry) = g
         .as_mut()
@@ -1717,8 +1812,20 @@ pub fn set_link_state(name: &str, up: bool) -> bool {
     };
     let changed = entry.link_up != up;
     entry.link_up = up;
+    if changed && !up {
+        entry.monitor_epoch = 0;
+        if entry.link_layer == LinkLayer::Ieee80211Radiotap {
+            entry.packet_generation = monitor::next_epoch().unwrap_or(u64::MAX);
+            monitor::carrier(entry, false);
+        }
+    }
+    let retired_capture = (changed && !up).then(|| snapshot(entry));
     let (net_ns_id, ifindex, open_stop) = (entry.net_ns_id, entry.ifindex, entry.open_stop);
     drop(g);
+    if let Some(old) = retired_capture.as_ref() {
+        monitor::invalidate(old);
+    }
+    drop(_capture);
     // `dev_open` / `dev_close` raise NETDEV_UP / NETDEV_DOWN only on a real
     // transition. Delivered with IFACES released: the notifier reads it.
     if changed {
@@ -1748,6 +1855,7 @@ pub fn set_link_metadata(
     speed_mbps: Option<u32>,
     duplex: Option<LinkDuplex>,
 ) -> bool {
+    let _capture = monitor::PUBLISH.lock();
     let mut guard = IFACES.lock();
     let Some(entry) = guard
         .as_mut()
@@ -2042,6 +2150,11 @@ pub fn on_native_rx_timestamped(name: &str, frame: &mut [u8], timestamp: Option<
     handler(name, frame, timestamp);
 }
 pub fn on_rx_frame_from(iface_name: &str, frame: &mut [u8]) {
+    if monitor::HAS_MONITOR.load(Ordering::Acquire)
+        && lookup(iface_name).is_some_and(|entry| entry.link_layer != LinkLayer::Ethernet)
+    {
+        return;
+    }
     if !iface_name.is_empty() {
         record_rx_frame(iface_name, frame);
     }

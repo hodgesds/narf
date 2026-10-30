@@ -28,8 +28,8 @@ pub enum Width {
 }
 
 /// Local encoding supports equal-modulation MCS0..31, optional directional LDPC
-/// and one-stream RX STBC, no TX STBC,
-/// HT-control, beamforming or optional large A-MSDU. RX/TX must include
+/// and one-stream RX STBC, explicit TX STBC and large RX A-MSDU,
+/// without HT-control or beamforming. RX/TX must include
 /// mandatory MCS0..7 (IEEE20.3.5; Linux ath10k/mac.c peer HT-rate check).
 /// An optional subset bounds TX selection without changing capability IEs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +47,7 @@ pub struct LocalHt {
     rx_greenfield: bool,
     tx_greenfield: bool,
     tx_stbc: bool,
+    rx_amsdu_7935: bool,
 }
 impl LocalHt {
     pub fn new(
@@ -80,6 +81,7 @@ impl LocalHt {
             rx_greenfield: false,
             tx_greenfield: false,
             tx_stbc: false,
+            rx_amsdu_7935: false,
         })
     }
     pub fn siso20(rx_sgi20: bool, tx_sgi20: bool) -> Self {
@@ -102,6 +104,7 @@ impl LocalHt {
             rx_greenfield: false,
             tx_greenfield: false,
             tx_stbc: false,
+            rx_amsdu_7935: false,
         }
     }
     /// Advertised LDPC is a local RX promise. TX coding additionally needs
@@ -132,6 +135,13 @@ impl LocalHt {
         self.tx_stbc = enabled;
         self
     }
+    /// Advertise HT Capability Information bit11: the local RX owner can
+    /// retain and atomically decode an entire 7935-byte A-MSDU body. This is
+    /// independent of the AP's receive limit and grants no TX permission.
+    pub fn with_rx_amsdu_7935(mut self, enabled: bool) -> Self {
+        self.rx_amsdu_7935 = enabled;
+        self
+    }
     /// Bound TX rate selection to a subset of actual implemented TX support.
     /// This expresses policy facts only; native power/radio proofs remain
     /// mandatory at every enabling/publication boundary.
@@ -154,6 +164,7 @@ impl LocalHt {
             | (u16::from(self.rx_greenfield) << 4)
             | (u16::from(self.tx_stbc) << 7)
             | (u16::from(self.rx_stbc) << 8)
+            | (u16::from(self.rx_amsdu_7935) << 11)
             | if self.width == HtWidth::TwentyForty { 2 } else { 0 }
             | if self.gi.rx20 { 0x20 } else { 0 }
             | if self.gi.rx40 { 0x40 } else { 0 };
@@ -679,6 +690,14 @@ pub struct HtNegotiation {
     basic: [u8; 10],
 }
 impl HtNegotiation {
+    /// Our advertised RX capacity, independent of the peer's RX capacity.
+    pub fn rx_amsdu_limit(&self) -> crate::amsdu::Limit {
+        if self.local.rx_amsdu_7935 {
+            crate::amsdu::Limit::Ht7935
+        } else {
+            crate::amsdu::Limit::Ht3839
+        }
+    }
     pub fn rx_greenfield(&self) -> bool {
         self.local.rx_greenfield
     }

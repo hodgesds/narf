@@ -29,6 +29,8 @@ mod ht20_tests;
 mod ht40_tests;
 #[path = "ht_protection_tests.rs"]
 mod ht_protection_tests;
+#[path = "monitor_tests.rs"]
+mod monitor_tests;
 #[path = "pmf_tests.rs"]
 mod pmf_tests;
 #[path = "receive_epoch_tests.rs"]
@@ -41,6 +43,8 @@ mod rx_fragment_tests;
 mod six_ghz_tests;
 #[path = "system_pm_tests.rs"]
 mod system_pm_tests;
+#[path = "tx_ba_restart_tests.rs"]
+mod tx_ba_restart_tests;
 #[path = "tx_ba_tests.rs"]
 mod tx_ba_tests;
 #[path = "tx_nss_tests.rs"]
@@ -197,6 +201,7 @@ struct Model {
     tx_ba_status: u16,
     tx_ba_fault: u8,
     tx_ba_native: bool,
+    tx_ba_native_tids: u8,
     tx_ba_late_rx: VecDeque<Vec<u8>>,
     data_aggregation: Vec<bool>,
     data_ba_disabled: Vec<bool>,
@@ -249,7 +254,12 @@ struct Model {
     data_tids: Vec<u8>,
     hw_amsdu: bool,
     data_amsdu: Vec<bool>,
+    sequence: crate::mt7921::tx_sequence::Owner,
+    tx_status: VecDeque<Vec<u8>>,
+    data_headers: Vec<[u8; 64]>,
 }
+#[path = "associated_scan_tests.rs"]
+mod associated_scan_tests;
 /// Low-power state of the model device, for system suspend/resume.
 #[derive(Debug, Default)]
 struct PowerModel {
@@ -262,6 +272,43 @@ struct PowerModel {
     driver_own_stall: bool,
 }
 impl Model {
+    fn model_data(
+        &mut self,
+        frame: &[u8],
+        protected: bool,
+        qos: bool,
+        tid: u8,
+    ) -> Result<(), Error> {
+        self.check()?;
+        if self.access_point.as_ref().is_some_and(|ap| {
+            ap.phase() != narf_wifi_fixtures::ApPhase::Authorized || ap.protected() != protected
+        }) {
+            return Err(Error::Bounds);
+        }
+        let mut header = if qos {
+            crate::mt7921::packet_tx::ethernet_tid(frame, 0x1000, 1, 1, protected, tid)?
+        } else {
+            crate::mt7921::packet_tx::ethernet(frame, 0x1000, 1, 1, protected)?
+        };
+        if qos && self.hw_amsdu {
+            crate::mt7921::packet_tx::set_hw_amsdu(&mut header);
+        }
+        if qos {
+            if let Some(pid) = self.sequence.pid(tid)? {
+                crate::mt7921::tx_sequence::request(&mut header, pid)?;
+                self.sequence.begin(tid, 1)?;
+            }
+        }
+        self.data_amsdu
+            .push(u32::from_le_bytes(header[28..32].try_into().unwrap()) & (1 << 10) != 0);
+        self.data_headers.push(header);
+        self.frames.push((false, frame.to_vec()));
+        self.data_protection.push(protected);
+        self.data_qos.push(qos);
+        self.data_aggregation.push(false);
+        self.data_ba_disabled.push(header[15] & 0x10 != 0);
+        Ok(())
+    }
     fn new() -> Self {
         let resources = Arc::new(AtomicUsize::new(1));
         Self {
@@ -278,6 +325,7 @@ impl Model {
             tx_ba_status: 0,
             tx_ba_fault: 0,
             tx_ba_native: false,
+            tx_ba_native_tids: 0,
             tx_ba_late_rx: VecDeque::new(),
             data_aggregation: Vec::new(),
             data_ba_disabled: Vec::new(),
@@ -333,6 +381,9 @@ impl Model {
             data_tids: Vec::new(),
             hw_amsdu: false,
             data_amsdu: Vec::new(),
+            sequence: crate::mt7921::tx_sequence::Owner::new(),
+            tx_status: VecDeque::new(),
+            data_headers: Vec::new(),
         }
     }
 }
@@ -470,10 +521,16 @@ impl Backend for Model {
                     if frame[34..36] == [3, 0]
                         && frame
                             .get(56..64)
-                            .is_some_and(|b| b[..6] == [6, 0, 12, 0, 0, 1])
+                            .is_some_and(|b| b[..4] == [6, 0, 12, 0] && b[4] < 8 && b[5] == 1)
                         && result[4..] == [0; 4]
                     {
-                        self.tx_ba_native = frame[63] == 1;
+                        let tid = frame[60];
+                        if frame[63] != 0 {
+                            self.tx_ba_native_tids |= 1 << tid;
+                        } else {
+                            self.tx_ba_native_tids &= !(1 << tid);
+                        }
+                        self.tx_ba_native = self.tx_ba_native_tids & 1 != 0;
                         if self.tx_ba_native {
                             self.packets.append(&mut self.tx_ba_late_rx);
                         }
@@ -689,6 +746,8 @@ impl Backend for Model {
             return Err(Error::Busy);
         }
         self.recovery_trace.push(("recycle", self.ticks.get()));
+        self.sequence.firmware_reset();
+        self.tx_status.clear();
         self.active = false;
         self.loaded = false;
         self.replies.clear();
@@ -770,13 +829,19 @@ impl Backend for Model {
                     if frame[24..26] != [3, 2]
                         || parameters & 0x7ff != 0
                         || parameters >> 12 >= 8
-                        || parameters & 0x800 != 0 && parameters >> 12 != 0
                         || frame[28..30] != [39, 0]
                     {
                         return Err(Error::Bounds);
                     }
                 } else if frame[24..26] == [3, 0] {
-                    if frame[26] == 0 || frame[27..33] != [3, 16, 0, 0, 0, 0] {
+                    let parameters = u16::from_le_bytes([frame[27], frame[28]]);
+                    let tid = (parameters >> 2) & 15;
+                    if frame[26] == 0
+                        || tid >= 8
+                        || parameters & !0x3c != 0x1003
+                        || frame[29..31] != [0; 2]
+                        || frame[31] & 15 != 0
+                    {
                         return Err(Error::Bounds);
                     }
                     if let Some((window, timeout)) = self.tx_ba_offer {
@@ -787,11 +852,11 @@ impl Backend for Model {
                         reply[16..22].copy_from_slice(&frame[16..22]);
                         reply[24..27].copy_from_slice(&[3, 1, frame[26]]);
                         reply[27..29].copy_from_slice(&self.tx_ba_status.to_le_bytes());
-                        reply[29..31].copy_from_slice(&(2 | window << 6).to_le_bytes());
+                        reply[29..31].copy_from_slice(&(2 | tid << 2 | window << 6).to_le_bytes());
                         reply[31..33].copy_from_slice(&timeout.to_le_bytes());
                         match self.tx_ba_fault {
                             1 => reply[26] = reply[26].wrapping_add(1),
-                            2 => reply[29] |= 4,
+                            2 => reply[29] ^= 4,
                             3 => reply[29] |= 1,
                             4 => reply[29] &= !2,
                             5 => reply[4] ^= 2,
@@ -950,25 +1015,40 @@ impl Backend for Model {
     }
     fn submit_fragment(&mut self, frame: &[u8], wcid: u16) -> Result<(), Error> {
         self.check()?;
-        crate::mt7921::packet_tx::fragment(frame, 0x1000, 1, wcid)?;
+        let mut header = crate::mt7921::packet_tx::fragment(frame, 0x1000, 1, wcid)?;
+        if frame[0] == 0x88 && frame[1] & 4 == 0 {
+            let tid = frame[24] & 7;
+            if let Some(pid) = self.sequence.pid(tid)? {
+                crate::mt7921::tx_sequence::request(&mut header, pid)?;
+                self.sequence.begin(tid, 1)?;
+            }
+        }
+        self.data_headers.push(header);
         self.frames.push((false, frame.to_vec()));
         Ok(())
     }
     fn submit_data(&mut self, frame: &[u8], protected: bool, qos: bool) -> Result<(), Error> {
+        self.model_data(frame, protected, qos, 0)
+    }
+    fn arm_transmit_sequence(&mut self, tid: u8) -> Result<(), Error> {
         self.check()?;
-        if self.access_point.as_ref().is_some_and(|ap| {
-            ap.phase() != narf_wifi_fixtures::ApPhase::Authorized || ap.protected() != protected
-        }) {
-            return Err(Error::Bounds);
+        self.sequence.arm(tid)
+    }
+    fn transmit_sequence_published(&self, tid: u8) -> bool {
+        self.sequence.published(tid)
+    }
+    fn poll_transmit_sequence(&mut self, tid: u8) -> Result<Option<u16>, Error> {
+        self.check()?;
+        for _ in 0..8 {
+            let Some(report) = self.tx_status.pop_front() else {
+                break;
+            };
+            self.sequence.receive(&report)?;
         }
-        let header = crate::mt7921::packet_tx::ethernet_qos(frame, 0x1000, 1, 1, protected, qos)?;
-        self.data_amsdu.push(qos && self.hw_amsdu);
-        self.frames.push((false, frame.to_vec()));
-        self.data_protection.push(protected);
-        self.data_qos.push(qos);
-        self.data_aggregation.push(false);
-        self.data_ba_disabled.push(header[15] & 0x10 != 0);
-        Ok(())
+        self.sequence.take(tid)
+    }
+    fn cancel_transmit_sequence(&mut self) {
+        self.sequence.cancel();
     }
     fn set_hw_amsdu(&mut self, enabled: bool) {
         self.hw_amsdu = enabled;
@@ -983,18 +1063,28 @@ impl Backend for Model {
         if tid == 0 {
             return Err(Error::Bounds);
         }
-        self.submit_data(frame, protected, true)?;
+        self.model_data(frame, protected, true, tid)?;
         let header = crate::mt7921::packet_tx::ethernet_tid(frame, 0x1000, 1, 1, protected, tid)?;
         self.data_tids.push(tid);
         *self.data_ba_disabled.last_mut().unwrap() = header[15] & 0x10 != 0;
         Ok(())
     }
     fn submit_data_aggregated(&mut self, frame: &[u8], protected: bool) -> Result<(), Error> {
-        if !self.tx_ba_native {
+        self.submit_data_tid_aggregated(frame, protected, 0)
+    }
+    fn submit_data_tid_aggregated(
+        &mut self,
+        frame: &[u8],
+        protected: bool,
+        tid: u8,
+    ) -> Result<(), Error> {
+        if tid >= 8 || self.tx_ba_native_tids & (1 << tid) == 0 {
             return Err(Error::Bounds);
         }
-        self.submit_data(frame, protected, true)?;
-        let header = crate::mt7921::packet_tx::ethernet_aggregated(frame, 0x1000, 1, protected)?;
+        self.model_data(frame, protected, true, tid)?;
+        let header =
+            crate::mt7921::packet_tx::ethernet_tid_aggregated(frame, 0x1000, 1, protected, tid)?;
+        self.data_tids.push(tid);
         *self.data_aggregation.last_mut().unwrap() = true;
         *self.data_ba_disabled.last_mut().unwrap() = header[15] & 0x10 != 0;
         Ok(())
@@ -1026,10 +1116,12 @@ impl Backend for Model {
             }
             *budget -= 1;
         }
-        Ok(Some(crate::mt7921::packet_tx::Completion {
+        let completion = crate::mt7921::packet_tx::Completion {
             token: 1,
             status: self.completion_status,
-        }))
+        };
+        self.sequence.terminal(completion);
+        Ok(Some(completion))
     }
 }
 fn run<T>(future: impl Future<Output = T>) -> T {

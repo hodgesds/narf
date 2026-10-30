@@ -230,3 +230,6 @@ kernel_test_in!(
     "wireless/nl80211",
     smoke_nl80211_frag_threshold_sched_scan_and_random_sn
 );
+
+#[path = "monitor_control_tests.rs"]
+mod monitor_control_tests;

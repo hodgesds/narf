@@ -6,6 +6,14 @@ use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_wifi_fixtures::{udp_ipv4, DhcpServer, FakeAp, NetworkPlan};
 use narf_wireless::reg::{db::Database, RegFlags, RegRule};
+#[path = "mvm_active_scan_tests.rs"]
+mod active_scan_tests;
+#[path = "mvm_he_tests.rs"]
+mod he_tests;
+#[path = "mvm_smem_tests.rs"]
+mod smem_tests;
+#[path = "mvm_tx_amsdu_tests.rs"]
+mod tx_amsdu_tests;
 const OWN: [u8; 6] = [2; 6];
 const AP: [u8; 6] = [2, 4, 6, 8, 10, 12];
 const PMK: [u8; 32] = [0x55; 32];
@@ -136,7 +144,13 @@ fn ht_ies() -> Vec<u8> {
 }
 struct Actor {
     ht: bool,
+    he: bool,
     ba: bool,
+    /// BAID_ML_SUPPORT selects CONFIG v1/v2 instead of ADD_STA48.
+    ml_baid_version: u8,
+    tx_amsdu: bool,
+    amsdu_packets: Vec<Vec<u8>>,
+    hold_amsdu: bool,
     nested_downlink: bool,
     rx_ba: [Option<(u8, u16, u16)>; 8],
     retiring_baid: Option<u8>,
@@ -209,6 +223,13 @@ impl Actor {
             (1, 0x18) if b[17] == 8 => Some(4),
             (1, 0x18) if b[17] == 2 => Some(5),
             (1, 0x18) if b[17] == 16 => Some(6),
+            (1, 0x9f) if b[0] == 2 => Some(10),
+            (1, 0x9f) if b[0] == 1 => Some(11),
+            (1, 0xd) => Some(12),
+            (5, 0x16) if b[0] == 0 => Some(1),
+            (5, 0x16) if b[0] == 2 => Some(5),
+            (2, 0) | (0, 0x25) => Some(13),
+            (5, 7) => Some(14),
             _ => None,
         });
         if stage.is_some() && self.fail_phy == stage {
@@ -409,6 +430,9 @@ impl Actor {
                     if self.ht {
                         nvm[8] = 4;
                     }
+                    if self.he {
+                        nvm[8] |= 16;
+                    }
                     if self.wide_nvm >= 2 {
                         // NVM_SKU_CAP_11N | 11AC; channels 36..=48 (indices
                         // 14..=17) VALID|IBSS|ACTIVE|20|40|80MHZ; profile 3
@@ -494,9 +518,45 @@ impl Actor {
                     }
                     vec![]
                 }
+                (2, 0) | (0, 0x25) => {
+                    if !b.is_empty() {
+                        return Err("shared-memory query has a payload");
+                    }
+                    let mut memory = vec![0; 260];
+                    memory[32] = 2;
+                    memory[44..64].copy_from_slice(&[
+                        0, 12, 0, 0, 0, 16, 0, 0, 0, 20, 0, 0, 0, 24, 0, 0, 0, 28, 0, 0,
+                    ]);
+                    memory[116..132]
+                        .copy_from_slice(&[0, 4, 0, 0, 0, 8, 0, 0, 0, 12, 0, 0, 0, 16, 0, 0]);
+                    memory
+                }
                 (1, 0xd) => {
                     if b.len() != 1940 {
                         return Err("MVM native scan request extent");
+                    }
+                    if b[8] & 0x08 == 0 && b[9] & 0x08 == 0 {
+                        // Active v15: PASS_ALL, dwell30TU, SSID bitmap1,
+                        // initial channel1, native probe SA and direct SSID.
+                        if b[8..10] != [2, 0]
+                            || b[12..14] != [30, 30]
+                            || b[48..52] != [1, 0, 0, 0]
+                            || b[52] != 1
+                            || b[626..632] != OWN
+                            || b[1132..1137] != [0, 3, b'n', b'e', b't']
+                            || self.data_added
+                        {
+                            return Err("MVM active probe template/default-power profile");
+                        }
+                        let previous = self
+                            .commands
+                            .iter()
+                            .rev()
+                            .nth(1)
+                            .ok_or("MVM scan lacks device power")?;
+                        if previous.0 != 1 || previous.1 != 0x9f || previous.2[0] != 1 {
+                            return Err("MVM active scan preceded global power programming");
+                        }
                     }
                     let mut beacon = self.security.ap.beacon();
                     if self.ht {
@@ -573,6 +633,66 @@ impl Actor {
                         vec![1, 0, 0, 0]
                     }
                 }
+                (5, 0x16) => {
+                    if !self.ba || !matches!(self.ml_baid_version, 1 | 2) || b.len() != 16 {
+                        return Err("ML BAID command profile or extent");
+                    }
+                    if b[..4] == [0; 4] {
+                        let tid = usize::from(b[8]);
+                        let ssn = u16::from_le_bytes([b[12], b[13]]);
+                        let window = u16::from_le_bytes([b[14], b[15]]);
+                        let mut expected = [0; 16];
+                        expected[4] = 1; // exact AP station0 mask.
+                        expected[8] = tid as u8;
+                        expected[12..14].copy_from_slice(&ssn.to_le_bytes());
+                        expected[14..16].copy_from_slice(&window.to_le_bytes());
+                        if b != expected
+                            || tid > 7
+                            || self.rx_ba[tid].is_some()
+                            || ssn >= 4096
+                            || !(1..=32).contains(&window)
+                        {
+                            return Err("ML BAID ADD native masks/identity/window");
+                        }
+                        let id = tid as u8 + 1;
+                        self.rx_ba[tid] = Some((id, ssn, window));
+                        u32::from(id).to_le_bytes().to_vec()
+                    } else if b[..4] == [2, 0, 0, 0] {
+                        let tid = if self.ml_baid_version == 1 {
+                            let id = u32::from_le_bytes(b[4..8].try_into().unwrap());
+                            self.rx_ba
+                                .iter()
+                                .position(|entry| {
+                                    entry.is_some_and(|entry| u32::from(entry.0) == id)
+                                })
+                                .ok_or("ML BAID v1 REMOVE unknown identity")?
+                        } else {
+                            usize::try_from(u32::from_le_bytes(b[8..12].try_into().unwrap()))
+                                .map_err(|_| "ML BAID v2 REMOVE TID width")?
+                        };
+                        if tid > 7 {
+                            return Err("ML BAID REMOVE TID outside map");
+                        }
+                        let id = self.rx_ba[tid]
+                            .ok_or("ML BAID REMOVE without allocation")?
+                            .0;
+                        let mut expected = [0; 16];
+                        expected[0] = 2;
+                        if self.ml_baid_version == 1 {
+                            expected[4] = id;
+                        } else {
+                            expected[4] = 1;
+                            expected[8] = tid as u8;
+                        }
+                        if b != expected {
+                            return Err("ML BAID REMOVE native geometry");
+                        }
+                        self.retiring_baid = self.rx_ba[tid].take().map(|entry| entry.0);
+                        vec![0; 4]
+                    } else {
+                        return Err("unsupported ML BAID operation");
+                    }
+                }
                 (5, 2) if self.ba && !self.protected => {
                     if b.len() != 20 || b[..16] != [0, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 1, 0]
                     {
@@ -623,7 +743,7 @@ impl Actor {
                                 return Err("MVM real signed SAR limit differs");
                             }
                         }
-                    } else if b[0] != 0 || b[8..10] != 64i16.to_le_bytes() {
+                    } else if !matches!(b[0], 0 | 1) || b[8..10] != 64i16.to_le_bytes() {
                         return Err("MVM real link power ceiling differs");
                     }
                     vec![]
@@ -639,6 +759,28 @@ impl Actor {
                         || self.channel <= 14 && b[10..12] != [1, 0]
                     {
                         return Err("MVM native response-bound TLC profile");
+                    }
+                    if self.tx_amsdu {
+                        let at = if self.tlc_version == 4 { 24 } else { 20 };
+                        if b[at..at + 2] != 3839u16.to_le_bytes()
+                            || self.tlc_version < 4 && b[7] != 1
+                        {
+                            return Err("TLC did not enable the qualified TX A-MSDU profile");
+                        }
+                        self.inject(
+                            0xf7,
+                            5,
+                            0x8000,
+                            &[
+                                0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xe, 0, 0, 0xff, 0, 0, 0,
+                            ],
+                        );
+                    }
+                    vec![]
+                }
+                (5, 7) => {
+                    if !self.he || b.len() != 80 || b[..4] != [0, 1, 0, 0] {
+                        return Err("MVM HE station context native identity/extent");
                     }
                     vec![]
                 }
@@ -729,6 +871,13 @@ impl Actor {
             return Ok(());
         }
         if self.protected {
+            if p.queue != 23 && frame[0] == 0x88 && frame.get(24).is_some_and(|qos| qos & 0x80 != 0)
+            {
+                if !self.tx_amsdu {
+                    return Err("unqualified A-MSDU in native fixture");
+                }
+                self.amsdu_packets.push(p.bytes.clone());
+            }
             let m4 = p.queue == 23
                 && frame
                     .get(36..)
@@ -744,20 +893,27 @@ impl Actor {
                 self.security.react(p, &mut self.firmware, held, None)?;
             }
             if self.security.data.len() > before {
-                let frame = self.security.data.last().unwrap().clone();
-                if let Some(reply) = self.server.receive(&frame) {
-                    self.downlink(&reply)?;
+                let received = self.security.data[before..].to_vec();
+                for frame in received {
+                    if let Some(reply) = self.server.receive(&frame) {
+                        self.downlink(&reply)?;
+                    }
                 }
             }
         } else {
             let mut frame = frame.to_vec();
             let header = if self.ht { 26 } else { 24 };
             let mut tid = 0;
+            let mut amsdu = false;
             if self.ht {
-                tid = frame.get(24).copied().unwrap_or(0xff);
+                let qc = frame.get(24).copied().unwrap_or(0xff);
+                tid = qc & 15;
+                amsdu = qc & 0x80 != 0;
                 if frame.get(26..28) != Some(&[0, 0])
                     || frame.get(25) != Some(&0)
                     || tid > 7
+                    || qc & 0x70 != 0
+                    || amsdu && !self.tx_amsdu
                     || tid != 0 && !self.qos_tids
                 {
                     return Err("Open QoS padding/TID");
@@ -768,18 +924,37 @@ impl Actor {
                 || frame[0..2] != [if self.ht { 0x88 } else { 8 }, 1]
                 || frame[4..10] != AP
                 || frame[10..16] != OWN
-                || frame.get(header..header + 6) != Some(&[0xaa, 0xaa, 3, 0, 0, 0])
+                || !amsdu && frame.get(header..header + 6) != Some(&[0xaa, 0xaa, 3, 0, 0, 0])
             {
                 return Err("MVM actual Open Ethernet header");
             }
-            let mut ethernet = frame[16..22].to_vec();
-            ethernet.extend_from_slice(&OWN);
-            ethernet.extend_from_slice(&frame[header + 6..]);
-            self.security.data.push(ethernet.clone());
-            if self.qos_tids {
-                self.tid_frames.push((tid, p.queue, ethernet.clone()));
+            let ethernet = if amsdu {
+                if p.bytes[6..8] != [0, 0x6d] {
+                    return Err("native A-MSDU TX offload flag");
+                }
+                self.amsdu_packets.push(p.bytes.clone());
+                super::super::mvm_boot::SecurityModel::decode_amsdu(&frame[header..])?
+            } else {
+                let mut ethernet = frame[16..22].to_vec();
+                ethernet.extend_from_slice(&OWN);
+                ethernet.extend_from_slice(&frame[header + 6..]);
+                vec![ethernet]
+            };
+            for frame in &ethernet {
+                self.security.data.push(frame.clone());
+                if self.qos_tids {
+                    self.tid_frames.push((tid, p.queue, frame.clone()));
+                }
             }
-            if tid != 0 {
+            if amsdu && self.hold_amsdu {
+                self.hold_amsdu = false;
+                let mut receipt = vec![0; 48];
+                receipt[0] = 1;
+                receipt[36..38].copy_from_slice(&p.queue.to_le_bytes());
+                receipt[40] = 1;
+                receipt[44..48].copy_from_slice(&u32::from(p.pointer).to_le_bytes());
+                self.held = Some((0x1c, 0, 0x8000, receipt));
+            } else if tid != 0 {
                 self.firmware.tx_complete(p.queue, p.pointer);
             } else if self.ba && self.tx_ba_enabled {
                 self.batch_dma.push((p.dma_base, p.pointer));
@@ -787,8 +962,10 @@ impl Actor {
             } else {
                 self.firmware.tx_complete(24, p.pointer);
             }
-            if let Some(reply) = self.server.receive(&ethernet) {
-                self.downlink(&reply)?;
+            for frame in ethernet {
+                if let Some(reply) = self.server.receive(&frame) {
+                    self.downlink(&reply)?;
+                }
             }
         }
         Ok(())
@@ -800,6 +977,7 @@ struct Harness {
     db: Arc<Database>,
     firmware: Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
     power: Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+    scan_power: Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
     available: Arc<AtomicBool>,
     clock: Arc<AtomicU64>,
 }
@@ -913,14 +1091,68 @@ impl Harness {
         features: u16,
         wide_nvm: u8,
     ) -> Result<Self, &'static str> {
+        Self::build_nvm_baid(
+            protected,
+            ht,
+            emission,
+            tlc_version,
+            ba,
+            ml_baid,
+            features,
+            wide_nvm,
+            1,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn build_nvm_baid(
+        protected: bool,
+        ht: bool,
+        emission: u8,
+        tlc_version: u8,
+        ba: bool,
+        ml_baid: bool,
+        features: u16,
+        wide_nvm: u8,
+        ml_baid_version: u8,
+    ) -> Result<Self, &'static str> {
+        Self::build_nvm_he(
+            protected,
+            ht,
+            emission,
+            tlc_version,
+            ba,
+            ml_baid,
+            features,
+            wide_nvm,
+            ml_baid_version,
+            features & super::super::mvm_boot::feature_bits::HE != 0,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn build_nvm_he(
+        protected: bool,
+        ht: bool,
+        emission: u8,
+        tlc_version: u8,
+        ba: bool,
+        ml_baid: bool,
+        features: u16,
+        wide_nvm: u8,
+        ml_baid_version: u8,
+        he_enabled: bool,
+    ) -> Result<Self, &'static str> {
         if CURRENT.lock().is_some() {
             return Err("MVM interface fixture already owned");
         }
         let mut image = image();
         let parsed = super::super::parse_ucode(&image).unwrap();
         let mut versions = parsed.api.commands.to_vec();
+        versions.extend_from_slice(&[7, 5, 1, 0]);
         if ba {
             versions.extend_from_slice(&[0xc2, 0, 0, 1, 0xc3, 0, 0, 1, 0xc5, 0, 0, 7]);
+        }
+        if ml_baid {
+            versions.extend_from_slice(&[0x16, 5, ml_baid_version, 0]);
         }
         for entry in versions.chunks_exact_mut(4) {
             if entry[0] == 15 && entry[1] == 5 {
@@ -944,7 +1176,12 @@ impl Harness {
         security.ap = ap(protected)?;
         let mut actor = Actor {
             ht,
+            he: he_enabled,
             ba,
+            ml_baid_version: if ml_baid { ml_baid_version } else { 0 },
+            tx_amsdu: features & super::super::mvm_boot::feature_bits::TX_AMSDU != 0,
+            amsdu_packets: Vec::new(),
+            hold_amsdu: false,
             nested_downlink: false,
             rx_ba: [None; 8],
             retiring_baid: None,
@@ -1009,6 +1246,10 @@ impl Harness {
             limits[62..64].copy_from_slice(&features.to_le_bytes());
         }
         let signed = asset("narf-test/mvm-interface/power", &limits, true)?;
+        let mut scan_limits = power();
+        scan_limits[46] = 6;
+        let scan_signed = asset("narf-test/mvm-interface/scan-power", &scan_limits, true)?;
+        let scan_cap = scan_signed.cap;
         let cap = signed.cap;
         let digest = signed.digest;
         let signer = signed.signer;
@@ -1019,9 +1260,24 @@ impl Harness {
         let nonce = Arc::new(AtomicU64::new(0));
         let available = Arc::new(AtomicBool::new(true));
         let staged = available.clone();
+        let scan_staged = available.clone();
         let clock = Arc::new(AtomicU64::new(narf_time::now_cycles()));
         let observation_clock = clock.clone();
         let environment = Environment {
+            scan_power: Arc::new(move |_, _| {
+                if !scan_staged.load(Ordering::Acquire) {
+                    return Err("fixture measured scan power asset not staged");
+                }
+                Ok((
+                    Asset {
+                        bytes: scan_signed.bytes.clone(),
+                        cap: scan_signed.cap,
+                        signer: scan_signed.signer,
+                        digest: scan_signed.digest,
+                    },
+                    BINDING,
+                ))
+            }),
             observation_clock: Arc::new(move || observation_clock.load(Ordering::Acquire)),
             policy: Arc::new(move || {
                 policy
@@ -1079,6 +1335,7 @@ impl Harness {
             db,
             firmware: executable.cap,
             power: cap,
+            scan_power: scan_cap,
             available,
             clock,
         })

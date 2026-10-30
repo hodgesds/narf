@@ -29,7 +29,7 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use narf_capabilities::{Cap, CapError, Read, Write};
+use narf_capabilities::{Cap, CapError, CapOp, Read, Write};
 use narf_memory::PhysAddr;
 
 use crate::device::{BusDevice, BusKind};
@@ -106,6 +106,45 @@ impl PcieStatus {
     pub fn link_width(&self) -> u8 {
         ((self.link_status >> 4) & 0x3F) as u8
     }
+}
+
+/// Read only the immediate upstream bridge's Link Control through the
+/// child's current device authority. Drivers use this to follow an existing
+/// platform ASPM policy without claiming or changing the shared bridge.
+/// `None` means no upstream bridge or an unavailable PCIe Link Control.
+pub fn parent_link_control(
+    cap: &Cap<BusDeviceCap, Read>,
+    child: &BusDevice,
+) -> Result<Option<u16>, PcieCapError> {
+    struct ParentLink<'a>(&'a BusDevice);
+    impl CapOp<BusDeviceCap, Read> for ParentLink<'_> {
+        type Output = Result<Option<u16>, PcieCapError>;
+        fn execute(self, _: &Cap<BusDeviceCap, Read>) -> Result<Self::Output, CapError> {
+            let read = || {
+                pcie_cfg_phys(self.0)?;
+                let Some(parent) = crate::pci::upstream_bridge(self.0) else {
+                    return Ok(None);
+                };
+                // SAFETY: the registry supplies the actual parent config
+                // window; the standard capability walker bounds every read.
+                let offset = match unsafe { pci_cap::find_cap(&parent, PCIE_CAP_ID) } {
+                    Ok(Some(offset)) => offset,
+                    Ok(None) | Err(pci_cap::CapError::NoCapList) => return Ok(None),
+                    Err(pci_cap::CapError::NotPcie) => return Err(PcieCapError::NotPcie),
+                };
+                if offset > 0xec {
+                    return Ok(None);
+                }
+                let cfg = pcie_cfg_phys(&parent)?;
+                // SAFETY: aligned standard PCIe Link Control, read only,
+                // enclosed by the child's current capability invocation.
+                let value = unsafe { cfg_read16(cfg, offset + 0x10) };
+                Ok((value != u16::MAX).then_some(value))
+            };
+            Ok(read())
+        }
+    }
+    cap.invoke(ParentLink(child)).map_err(PcieCapError::from)?
 }
 
 /// Read the PCI Express capability snapshot for `device`.

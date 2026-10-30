@@ -105,6 +105,8 @@ pub(super) struct Peer {
     valid: Arc<AtomicBool>,
     admission: Admission,
     qos: Arc<AtomicBool>,
+    /// HE peer RA completed under the current association admission.
+    he: Arc<AtomicBool>,
     /// QoS DATA TIDs admitted after WMM setup: bit0 (BE/TID0) for the WMM
     /// recipe, all eight for the signed all-AC program.
     tids: Arc<core::sync::atomic::AtomicU8>,
@@ -132,17 +134,23 @@ impl Peer {
             && frame.len() >= 24
             && frame[4..10] == self.peer
             && frame[10..16] == self.own
+            && (frame[1] & 0x80 == 0
+                || frame[0] == 0x88
+                    && self.he.load(Ordering::Acquire)
+                    && frame.get(26..30) == Some(&super::he_htc::CONTROL))
             && (frame[0] != 0x88
                 || self.qos.load(Ordering::Acquire)
                     && frame.get(25) == Some(&0)
                     && frame.get(24).is_some_and(|control| {
-                        control & 0xf8 == 0
-                            && self.tids.load(Ordering::Acquire) & (1 << control) != 0
+                        control & 0xe8 == 0
+                            && (control & 0x10 != 0) == (frame[1] & 0x80 != 0)
+                            && self.tids.load(Ordering::Acquire) & (1 << (control & 7)) != 0
                     }))
     }
     fn invalidate(&self) {
         self.tids.store(0, Ordering::Release);
         self.qos.store(false, Ordering::Release);
+        self.he.store(false, Ordering::Release);
         self.valid.store(false, Ordering::Release);
     }
 }
@@ -290,6 +298,7 @@ impl Controller {
             valid: Arc::new(AtomicBool::new(false)),
             admission: admission.clone(),
             qos: Arc::new(AtomicBool::new(false)),
+            he: Arc::new(AtomicBool::new(false)),
             tids: Arc::new(core::sync::atomic::AtomicU8::new(0)),
         };
         self.peer = Some(peer.clone());
@@ -532,6 +541,7 @@ impl Controller {
         io.command(2, 1, 0, &body, false, Some(admission)).await?;
         admission.run(|| {
             peer.current()?;
+            peer.he.store(he.is_some(), Ordering::Release);
             self.phase = Phase::Associated;
             Ok(())
         })?;
@@ -816,7 +826,9 @@ pub(super) fn ht_fingerprint() -> [u8; 32] {
 /// Emitter program added by `radio_policy::Program::He`.
 pub(super) fn he_fingerprint() -> [u8; 32] {
     let mut hash = narf_crypto::sha256::Sha256::new();
-    hash.update(b"B HE20 v1; rtw89_init_he_cap 2.4GHz STA restricted: no 40MHz/HTC-HE/BSR/OPS/A-MSDU-in-A-MPDU/STBC-TX/DCM-NSS2/beamformee/NG16/codebook/MaxNc; RX 2SS TX 1SS HE-MCS0..11");
+    hash.update(b"B HE20 v2; rtw89_init_he_cap 2.4GHz STA restricted: HTC-HE; no 40MHz/BSR/OPS/A-MSDU-in-A-MPDU/STBC-TX/DCM-NSS2/beamformee/NG16/codebook/MaxNc; RX 2SS TX 1SS HE-MCS0..11");
+    hash.update(b"HE +HTC raw30 Order+EOSP CAS 0x1b; host CCMP excludes HT Control/Order/EOSP from AAD; MACID0 AX RA report gates insertion at MCS>2; no EAPOL/ARP/DHCP/ICMP; reset clears RA state");
+    hash.update(b"TXWD INFO1 A_CTRL_BSR for +HTC, BODY3 BK on every A-Control form change; no mixed-header hardware aggregates");
     hash.update(b"RA mode HE|CCK|OFDM mask HE1SS|SUBOFDM|SUBCCK from peer RX map, SGI20 from HT, LDPC/DCM from peer HE PHY, STBC0, SS1, ER0, no fixed GI/LTF");
     hash.update(b"data TXWD INFO0 DATA_ER when HE operation allows ER SU; RX HE NSS1/NSS2 MCS0..11 20MHz GI/LTF 0..5; HE TB/ER SU autonomous responses measured");
     hash.update(
@@ -837,12 +849,12 @@ pub(super) fn ampdu_fingerprint() -> [u8; 32] {
 /// Local HE capability: Linux `rtw89_init_he_cap` for a 2.4GHz station,
 /// restricted to the retained TX-A/RX-AB 20MHz profile. Bits needing
 /// 40MHz (`wide_channels`), a second TX path (STBC TX, DCM TX NSS2), HE
-/// +HTC (`he_htc`: BSR, HTC_HE), power save (OPS), RX A-MSDU (`aggregation`)
+/// buffer-status reports (BSR), power save (OPS), RX A-MSDU (`aggregation`)
 /// or beamforming feedback (`rtw89_mac_bf_assoc` sounding: SU beamformee,
 /// NG16, codebook, triggered SU feedback, MaxNc) are clear.
 pub(super) fn local_he() -> Option<narf_wireless::association::he::LocalHe> {
     const MAC: [u8; 6] = [
-        0x00, // no HTC_HE (he_htc)
+        0x01, // HTC_HE; host TX/RX admit HE A-Control
         0x08, // TF_MAC_PAD_DUR_16US
         0x02, // ALL_ACK
         0x10, // MAX_AMPDU_LEN_EXP_EXT_2

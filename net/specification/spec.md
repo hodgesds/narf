@@ -128,6 +128,42 @@ registration restores the retired entry's ifindex, admin state, addresses,
 MTU, namespace and counters, as an in-place same-name re-registration does,
 so the interface keeps its `wlan%d` name and ifindex across generations.
 
+### 3.1a Receive-only monitor link representation
+
+`iface::LinkLayer` defaults to `Ethernet`; `Ieee80211Radiotap` is a separate
+receive-only representation (`ARPHRD_IEEE80211_RADIOTAP = 803` in rtnetlink
+and packet socket metadata). `set_link_layer(name, kind)` requires the caller
+to hold live interface-control authority and accepts a change only while the
+interface is administratively down with no carrier. It invalidates existing
+bound packet hooks. All monitor transmit entry points return an error;
+primary/FIB egress selection excludes monitor devices. Ordinary Ethernet
+registrations and link transitions retain their existing behavior.
+
+A retained native driver calls `begin_monitor_rx(expected_snapshot)` only after its
+sniffer/channel receipts. This returns an opaque `MonitorRxToken` containing
+an ifindex, namespace and unique epoch, conditional on current monitor type,
+administrative UP and the same pre-start name/ifindex/namespace/packet
+generation. Its carrier publication is atomic with that identity check;
+reused names cannot accept an old native setup or its carrier update. `monitor_rx_current(token)` also requires carrier.
+`on_monitor_frame_from(token, radiotap_and_mpdu)` verifies that current owner
+and bounded version-0 radiotap extent, then delivers only to AF_PACKET. It
+never invokes Ethernet/IP/XDP ingress or station frame-ring publication.
+The native adapter must validate the original frame and metadata before this
+boundary. `end_monitor_rx(token)` retires only that current generation and withdraws
+its carrier. Monitor DOWN and namespace/rebind transitions also withdraw
+carrier before another native owner can start.
+
+Mode changes, monitor DOWN, native capture stop, unregister, driver rebind
+and namespace changes fence capture publication. Bound AF_PACKET hooks must
+be explicitly rebound after ownership/representation retirement; UP alone
+cannot resurrect an old monitor or station binding. A binding records the
+device's packet generation and checks it again at receive, including a bind
+or hook snapshot racing retirement. An unbound namespace-wide raw socket
+retains its explicitly granted namespace-wide capture scope. Packet socket
+creation continues to require the existing raw-socket authority; a monitor
+RX token grants no userspace permission. Driver control and administrative
+open/stop callbacks never execute under the capture publication lock.
+
 ### 3.2 Frame rings
 
 ```rust
@@ -720,6 +756,15 @@ and `set_net_ns` raise `netdev_event` (`NETDEV_UP`/`DOWN`/`UNREGISTER`).
 reference counts (`NetIfaceSnapshot::promisc`/`allmulti`) and the device
 address lists. LINUX-GAP: NIC drivers do not reprogram their receive filters
 from those counts (`ndo_set_rx_mode`).
+
+Monitor capture takes a separate `raw_sock::monitor_receive` path from the
+current `MonitorRxToken` publisher. It uses `ETH_P_802_2`, `PACKET_OTHERHOST`,
+`ARPHRD_IEEE80211_RADIOTAP` and network offset zero. Both RAW and DGRAM
+receivers obtain the complete radiotap plus MPDU; no Ethernet source address,
+VLAN or protocol dissection is invented (`sll_halen = 0`). ETH_P_ALL and
+ETH_P_802_2 hooks receive it, with normal socket filters, queue bounds,
+readiness and namespace matching. The ordinary Ethernet tap refuses monitor
+devices. Injection is unsupported.
 
 `cbpf::Program::from_bytes` is `bpf_check_classic` + `check_load_and_stores`
 (`None` = `EINVAL`); `cbpf::run(prog, skb)` interprets the program with the

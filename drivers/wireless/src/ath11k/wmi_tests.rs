@@ -9,8 +9,6 @@
 //! (`ath11k_wmi_tlv_iter`, the per-event `tb[]` lookups, HTC header /
 //! trailer checks, credit exhaustion).
 
-#![cfg(target_arch = "x86_64")]
-
 extern crate alloc;
 
 use alloc::vec;

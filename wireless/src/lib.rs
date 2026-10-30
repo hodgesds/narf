@@ -17,6 +17,7 @@ pub mod iface;
 pub mod mfp;
 pub mod mgmt_defrag;
 pub mod mlme;
+pub mod monitor;
 pub mod nl80211;
 pub mod packet_key;
 pub mod reg;
@@ -765,6 +766,21 @@ pub trait WirelessNetIface: Interface {
     /// role must reject an in-place active-vdev change rather than silently
     /// retagging station state as AP state.
     fn set_iftype(&self, _iftype: u32) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Validate an explicitly supplied nl80211 MONITOR_FLAGS mask before
+    /// changing mode. Absence uses the driver's documented default capture
+    /// profile. Unsupported active/injection or error-frame requests must
+    /// fail rather than silently accepting a weaker/different profile.
+    fn validate_monitor_flags(&self, _flags: u32) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Configure a receive-only monitor channel while administratively down.
+    /// Existing interface-control authority gates the caller. The driver
+    /// retains the selection; admin-UP starts native capture asynchronously.
+    fn set_monitor_channel(&self, _channel: monitor::Channel) -> Result<(), WirelessError> {
         Err(WirelessError::NotSupported)
     }
 

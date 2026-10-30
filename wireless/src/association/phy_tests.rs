@@ -41,6 +41,47 @@ fn ht40() -> LocalHt {
 fn local_ht() -> LocalPhy {
     LocalPhy::ht20(LocalHt::siso20(true, true)).unwrap()
 }
+fn rx_amsdu_capacity() -> Result<(), &'static str> {
+    for large in [false, true] {
+        let local = LocalHt::siso20(false, false).with_rx_amsdu_7935(large);
+        check!(
+            (u16::from_le_bytes(local.capability_body()[..2].try_into().unwrap()) & 0x800 != 0)
+                == large,
+            "local RX capacity did not drive HT bit11"
+        );
+        // The AP advertises only mandatory3839 reception. Its TX can still
+        // send our advertised7935; do not intersect these directional facts.
+        let mut ht_op = [0; 22];
+        ht_op[0] = 1;
+        ht_op[6] = 255;
+        let peer = bss(
+            LocalHt::siso20(false, false).capability_body(),
+            ht_op,
+            None,
+            None,
+        );
+        let mut plan = ready(&peer, LocalPhy::ht20(local).unwrap());
+        check!(
+            plan.association_response(&response(&peer)) == Ok(Some(7)),
+            "directional RX capacity association refused"
+        );
+        let ht = plan.negotiated_phy().ok_or("missing HT negotiation")?.ht();
+        check!(
+            ht.rx_amsdu_limit().bytes() == if large { 7935 } else { 3839 }
+                && ht.peer_capability() & 0x800 == 0,
+            "peer RX capacity narrowed the independent local RX promise"
+        );
+    }
+    check!(
+        LocalHt::siso20(false, false).capability_body()[1] & 8 == 0,
+        "default HT constructors enlarged their RX promise"
+    );
+    Ok(())
+}
+smoke!(
+    smoke_phy_rx_amsdu_capacity_is_directional,
+    rx_amsdu_capacity
+);
 fn local_vht() -> LocalPhy {
     LocalPhy::vht80(
         ht40(),

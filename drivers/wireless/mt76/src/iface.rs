@@ -15,6 +15,9 @@ use narf_wireless::{
     scan::BssInfo, AssociateRequest, ScanRequest, WirelessConfig, WirelessError, WirelessNetIface,
 };
 
+#[path = "iface_monitor.rs"]
+mod monitor;
+
 /// Publish physical carrier while preserving operator-controlled IFF_UP.
 /// No administrative open/stop callback runs under the caller's driver locks.
 /// Shared by production and its composition fixture.
@@ -61,6 +64,10 @@ pub struct Mt76Iface {
     recovery_attempts: AtomicU32,
     recovery_after_ns: AtomicU64,
     receive_epoch: AtomicU64,
+    iftype: AtomicU32,
+    monitor_channel: IrqSafeSpinLock<Option<narf_wireless::monitor::Channel>>,
+    monitor_started: AtomicBool,
+    monitor_token: IrqSafeSpinLock<Option<narf_net::iface::MonitorRxToken>>,
 }
 impl Mt76Iface {
     /// Build from validated radio identity, without disconnected frame rings.
@@ -86,6 +93,10 @@ impl Mt76Iface {
             recovery_attempts: AtomicU32::new(0),
             recovery_after_ns: AtomicU64::new(0),
             receive_epoch: AtomicU64::new(0),
+            iftype: AtomicU32::new(2),
+            monitor_channel: IrqSafeSpinLock::new(None),
+            monitor_started: AtomicBool::new(false),
+            monitor_token: IrqSafeSpinLock::new(None),
         })
     }
     /// Legacy 20 MHz channels on firmware-reported bands.
@@ -132,6 +143,50 @@ impl Mt76Iface {
         }
     }
 
+    /// Negotiate a fresh per-TID originator agreement on this registered
+    /// radio under the same control mutex used for scan and association.
+    pub async fn negotiate_transmit_ba_tid(&self, tid: u8) -> Result<bool, WirelessError> {
+        if tid >= 8 {
+            return Err(WirelessError::InvalidArgs);
+        }
+        let _control = self.control.lock().await;
+        if !self.link_up() {
+            return Err(WirelessError::Denied);
+        }
+        use crate::mt7921::firmware_transport::{negotiate_boot_transmit_ba_tid, Error};
+        negotiate_boot_transmit_ba_tid(tid)
+            .await
+            .map_err(|error| match error {
+                Error::Bounds => WirelessError::InvalidArgs,
+                Error::Busy => WirelessError::Busy,
+                Error::Authority => WirelessError::Denied,
+                Error::Timeout => WirelessError::Timeout,
+                _ => WirelessError::HardwareError,
+            })
+    }
+
+    /// Restart an originator after real midstream traffic. The next queued
+    /// user MPDU supplies the sequence sample; no extra RF traffic is made.
+    pub async fn request_transmit_ba_restart_tid(&self, tid: u8) -> Result<(), WirelessError> {
+        if tid >= 8 {
+            return Err(WirelessError::InvalidArgs);
+        }
+        let _control = self.control.lock().await;
+        if !self.link_up() {
+            return Err(WirelessError::Denied);
+        }
+        use crate::mt7921::firmware_transport::{request_boot_transmit_ba_restart_tid, Error};
+        request_boot_transmit_ba_restart_tid(tid)
+            .await
+            .map_err(|error| match error {
+                Error::Bounds => WirelessError::InvalidArgs,
+                Error::Busy | Error::EventOverflow => WirelessError::Busy,
+                Error::Authority => WirelessError::Denied,
+                Error::Timeout => WirelessError::Timeout,
+                _ => WirelessError::HardwareError,
+            })
+    }
+
     /// Receive an 802.3 Ethernet frame from the wireless datapath.
     pub async fn receive_frame(&self) -> Result<Option<Vec<u8>>, WirelessError> {
         if !self.link_up() {
@@ -148,6 +203,9 @@ impl Mt76Iface {
     /// Advance bounded packet work, then service authenticated rekeys. No
     /// IRQ-safe lock survives an await; hardware ownership uses a regular mutex.
     pub async fn poll_data(&self) -> Result<(), WirelessError> {
+        if self.current_iftype() == 6 {
+            return self.poll_monitor().await;
+        }
         {
             if self.teardown_needed.load(Ordering::Acquire) || radio_needs_recovery() {
                 let Some(_control) = self.control.try_lock() else {
@@ -292,6 +350,7 @@ impl Mt76Iface {
     }
 
     fn clear_link(&self) {
+        self.close_monitor();
         self.receive_epoch.store(0, Ordering::Release);
         *self.associated_bssid.lock() = None;
         publish_link(&self.name, false);
@@ -363,6 +422,13 @@ impl Mt76Iface {
     /// generated DEAUTH_LEAVING), then the PCIe low-power handoff.
     async fn prepare_suspend(&self) -> Result<(), WirelessError> {
         let _control = self.control.lock().await;
+        if self.monitor_started.load(Ordering::Acquire) {
+            self.close_monitor();
+            crate::mt7921::firmware_transport::stop_boot_monitor()
+                .await
+                .map_err(|_| WirelessError::HardwareError)?;
+            self.monitor_started.store(false, Ordering::Release);
+        }
         let connected = self.associated_bssid.lock().is_some();
         if connected {
             self.teardown_needed.store(true, Ordering::Release);
@@ -386,6 +452,9 @@ impl Mt76Iface {
     }
 
     fn enqueue(&self, bytes: &[u8]) -> Result<(), ()> {
+        if self.current_iftype() != 2 {
+            return Err(());
+        }
         if !self.link_up() || !transmit_admitted(bytes, self.mac()) {
             return Err(());
         }
@@ -481,6 +550,18 @@ impl Interface for Mt76Iface {
 }
 #[async_trait]
 impl WirelessNetIface for Mt76Iface {
+    fn current_iftype(&self) -> u32 {
+        self.iftype.load(Ordering::Acquire)
+    }
+    fn set_iftype(&self, iftype: u32) -> Result<(), WirelessError> {
+        self.change_iftype(iftype)
+    }
+    fn set_monitor_channel(
+        &self,
+        channel: narf_wireless::monitor::Channel,
+    ) -> Result<(), WirelessError> {
+        self.configure_monitor(channel)
+    }
     fn max_scan_ssids(&self) -> u8 {
         4
     }
@@ -495,7 +576,7 @@ impl WirelessNetIface for Mt76Iface {
             base_name: self.name.clone(),
             base_mac: self.mac(),
             bands: self.bands(),
-            modes: WirelessModes::STATION,
+            modes: WirelessModes::STATION | WirelessModes::MONITOR,
             hw_caps: HwCaps {
                 ht_supported: self.radio.capabilities.phy.ht,
                 vht_supported: crate::mt7921::vht::qualified(self.radio),
@@ -528,6 +609,9 @@ impl WirelessNetIface for Mt76Iface {
     }
 
     async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+        if self.current_iftype() != 2 {
+            return Err(WirelessError::NotSupported);
+        }
         let six = crate::mt7921::six_ghz::qualified(self.radio);
         let mut channels = scan_channels(&req, self.radio.capabilities.phy.bands, six)?;
         // WIPHY_FLAG_SPLIT_SCAN_6GHZ (mt792x_core.c:711): the 2.4/5 GHz
@@ -549,10 +633,13 @@ impl WirelessNetIface for Mt76Iface {
         };
         let _control = self.control.lock().await;
         if self.link_up() {
-            return Err(WirelessError::Busy);
+            if req.random_mac.is_some() {
+                return Err(WirelessError::Busy);
+            }
+        } else {
+            self.finish_teardown(true).await?;
         }
-        self.finish_teardown(true).await?;
-        {
+        let result = async {
             use crate::mt7921::firmware_transport::{scan_boot_with_options, Error, ScanOptions};
             let map_error = |error| match error {
                 Error::Bounds => WirelessError::InvalidArgs,
@@ -604,6 +691,11 @@ impl WirelessNetIface for Mt76Iface {
             *self.scan_cache.lock() = found;
             Ok(results)
         }
+        .await;
+        if result.is_err() && radio_needs_recovery() {
+            self.lose_link();
+        }
+        result
     }
 
     fn connected_bssid(&self) -> Option<[u8; 6]> {
@@ -633,6 +725,9 @@ impl WirelessNetIface for Mt76Iface {
 
     async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError> {
         let _control = self.control.lock().await;
+        if self.current_iftype() != 2 {
+            return Err(WirelessError::NotSupported);
+        }
         let channel = u8::try_from(req.channel).map_err(|_| WirelessError::InvalidArgs)?;
         // A 6 GHz request is identified by its frequency: channel numbers
         // alone collide with 2.4/5 GHz.

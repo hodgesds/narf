@@ -2,6 +2,10 @@
 use super::super::super::super::super::super::ht;
 use super::*;
 use core::sync::atomic::AtomicUsize;
+#[path = "rx_amsdu_tests.rs"]
+mod rx_amsdu_tests;
+#[path = "sgi20_tests.rs"]
+mod sgi20_tests;
 fn check(f: impl FnOnce() -> Result<(), &'static str>) -> TestResult {
     f().map_or_else(TestResult::Fail, |()| TestResult::Pass)
 }
@@ -274,13 +278,13 @@ fn smoke_rtl8188ee_ht20_native_rx_phy_width_rate_aggregate_before_pn() -> TestRe
             let raw = h.peer.lock().downlink(&e)?;
             let (report, extra, phy) = match fault {
                 0 => (0x253, 0, None),
-                1 => (0x153, 0, None),
+                1 => (0x154, 0, None), // unsupported MCS8 even with SGI.
                 2 => (0xd3, 0, None),
                 3 => (0x54, 0, None),
                 4 => (19, 0, None),
                 5 => (0x53, 1 << 14, None),
                 6 => (
-                    0x53,
+                    0x253, // PHY SGI does not authorize40MHz.
                     0,
                     Some({
                         let mut p = [0; 28];

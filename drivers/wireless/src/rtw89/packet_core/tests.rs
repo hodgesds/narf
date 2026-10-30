@@ -184,6 +184,11 @@ impl Model {
     pub(in crate::rtw89) fn inject(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.inject_rate(bytes, 0)
     }
+    pub(in crate::rtw89) fn inject_c2h(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let event = rx_packet::C2h::parse(bytes.to_vec()).map_err(|_| Error::Packet)?;
+        self.incoming.push_back(rx_packet::Event::Firmware(event));
+        Ok(())
+    }
     /// Inject with an RXWD DWORD1 rate (e.g. `0x80` = HT MCS0).
     pub(in crate::rtw89) fn inject_rate(&mut self, bytes: &[u8], rate: u16) -> Result<(), Error> {
         self.inject_phy(bytes, rate, 0)
@@ -286,11 +291,17 @@ impl Model {
             return Err(Error::Packet);
         }
         let body = self.bytes(body_dma, packet_len)?;
+        let a_ctrl = body[1] & 0x80 != 0;
+        let previous_a_ctrl = self
+            .transmitted
+            .last()
+            .is_some_and(|frame| frame[1] & 0x80 != 0);
         // Decode independently from the descriptor: the raw QoS data header
         // contributes its two actual control bytes to ieee80211_hdrlen/2.
         let header_words = if body[0] & 0xfc == 0x88 {
             // Independent decode of the QoS TID -> AC -> ACH mapping.
-            let tid = body.get(24).copied().ok_or(Error::Packet)?;
+            let qc = body.get(24).copied().ok_or(Error::Packet)?;
+            let tid = qc & 15;
             let expected = match tid {
                 0 | 3 => format::Queue::Data,
                 1 | 2 => format::Queue::Background,
@@ -300,11 +311,18 @@ impl Model {
             };
             if kind != expected
                 || body.get(25) != Some(&0)
+                || qc & 0xe8 != 0
+                || (qc & 0x10 != 0) != a_ctrl
+                || a_ctrl && body.get(26..30) != Some(&[0x1b, 0, 0, 0])
                 || (word(8) >> 23 & 1 == 1) != matches!(tid, 2 | 3 | 5 | 7)
             {
                 return Err(Error::Packet);
             }
-            13
+            if a_ctrl {
+                15
+            } else {
+                13
+            }
         } else {
             12
         };
@@ -331,11 +349,13 @@ impl Model {
                 && word(28) == 0
                 || kind != format::Queue::Management
                     && word(24) & !(1 << 15) == 0
-                    && word(28) & !(0x1ff << 16 | 0xff) == 0
+                    && word(28) & !(0x1ff << 16 | 0xff | 1 << 14) == 0
                     && (word(28) >> 16) & 0x1ff <= 11)
             || kind == format::Queue::Management && word(24) & (0x1ff << 16) != 0
             // A-MPDU fields only together on firmware-RA QoS DATA.
-            || word(12) & !(0xfff | 1 << 12) != 0
+            || word(12) & !(0xfff | 1 << 12 | 1 << 13) != 0
+            || (word(12) & (1 << 13) != 0) != (a_ctrl != previous_a_ctrl)
+            || (word(28) & (1 << 14) != 0) != a_ctrl
             || !(word(12) & 1 << 12 == 0 && word(28) & 0xff == 0 && word(32) == 0
                 || word(12) & 1 << 12 != 0
                     && body[0] == 0x88

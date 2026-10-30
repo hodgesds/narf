@@ -161,7 +161,7 @@ pub(crate) fn smoke_rtl8188ee_distinct_linked_rings_and_rx_storage_before_public
         let receive = owner.receive.as_ref().unwrap();
         for slot in 0..depth {
             let end = if slot == depth - 1 { 1 << 30 } else { 0 };
-            if word(receive, slot * 32) != 4096 | end | (1 << 31)
+            if word(receive, slot * 32) != 9100 | end | (1 << 31)
                 || word(receive, slot * 32 + 24) != owner.buffers[slot].address as u32
                 || word(receive, slot * 32 + 28) != 0
             {

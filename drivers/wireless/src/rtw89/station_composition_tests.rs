@@ -1,5 +1,7 @@
 //! Actual source controller and native packet model through public Device/DHCP.
 //! This fixture grants no production full-RF receipt or physical readiness.
+#[path = "station_htc_tests.rs"]
+mod htc_tests;
 use crate::rtw89::{interface::Device, station::Environment, station_lifecycle::Lifecycle};
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::{
@@ -291,12 +293,22 @@ impl Peer {
         let mut priority = 0;
         let header = if self.qos {
             let tid = frame.get(24).copied().ok_or("AP QoS control")?;
-            priority = tid;
-            if frame.get(25) != Some(&0) || tid > 7 || (!self.qos_all && tid != 0) {
+            priority = tid & 15;
+            let htc = frame[1] & 0x80 != 0;
+            if frame.get(25) != Some(&0)
+                || tid & 0xe8 != 0
+                || (!self.qos_all && priority != 0)
+                || (tid & 0x10 != 0) != htc
+                || htc && (!self.station_he || frame.get(26..30) != Some(&[0x1b, 0, 0, 0]))
+            {
                 return Err("AP BE/TID0 QoS control");
             }
-            self.tids.push(tid);
-            26
+            self.tids.push(priority);
+            if htc {
+                30
+            } else {
+                26
+            }
         } else {
             24
         };

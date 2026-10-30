@@ -7,14 +7,14 @@ pub(crate) fn artifact(
 ) -> Vec<u8> {
     let mut b = alloc::vec![0;LENGTH];
     b[..4].copy_from_slice(b"NEHT");
-    b[4..8].copy_from_slice(&[1, 0, 160, 0]);
+    b[4..8].copy_from_slice(&[2, 0, 160, 0]);
     b[8..12].copy_from_slice(&(LENGTH as u32).to_le_bytes());
     b[12..16].copy_from_slice(&[0xec, 0x10, 0x79, 0x81]);
     b[16..48].copy_from_slice(&request(base, firmware).binding);
     b[48..80].copy_from_slice(&super::super::radio::factory_identity(base.factory()));
     b[80..112].copy_from_slice(&base.digest);
     b[112..118].copy_from_slice(&base.factory().mac);
-    b[118..124].copy_from_slice(&[1, 20, 1, 0, 0, 0]);
+    b[118..124].copy_from_slice(&[1, 20, 1, 1, 0, 0]);
     b[124..126].copy_from_slice(&8i16.to_le_bytes());
     b[126..128].copy_from_slice(&80i16.to_le_bytes());
     // Inert synthetic upper bounds, never registered or supplied to PCI.
@@ -87,6 +87,11 @@ fn smoke_rtl8188ee_ht20_signed_program_exact_legacy_identity_and_curves() -> Tes
         Err(_) => return TestResult::Fail("valid inert HT measurement rejected"),
     };
     let permission = base.permission(&p::domain(17), 1).unwrap();
+    let mut old = bytes.clone();
+    old[4..6].copy_from_slice(&1u16.to_le_bytes());
+    if Grant::parse(base.clone(), firmware, &old, Some([7; 32]), cap).is_ok() {
+        return TestResult::Fail("NEHT v1 authorized SGI20 or enlarged RX promise");
+    }
     if grant.gains(&p::domain(17), permission) != Ok([30, 30, 30, 30, 29, 28, 25, 23]) {
         return TestResult::Fail("actual HT per-rate upper envelopes changed selected gains");
     }

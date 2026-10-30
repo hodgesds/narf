@@ -61,7 +61,9 @@ pub unsafe trait Memory: Send {
 }
 const TX_BYTES: usize = 64;
 const RX_BYTES: usize = 32;
-const RX_BUFFER: usize = 4096;
+// Linux rtlwifi/pci.c uses 9100-byte slots for the 7935-byte HT A-MSDU
+// body plus raw QoS/CCMP/FCS and native driver-info/shift prefixes.
+const RX_BUFFER: usize = 9100;
 // Exact RTL8188EE linked-ring map. The unused generic mac.rs/dma.rs
 // scaffolds carry the different RTL8192EE TXBD map and cannot authorize
 // this retained EE transport. Every queue has a distinct linked ring.

@@ -10,8 +10,6 @@
 //! ones Linux `drivers/bus/mhi/host/` writes for ath11k's QCA6390 /
 //! WCN6855 configuration.
 
-#![cfg(target_arch = "x86_64")]
-
 extern crate alloc;
 
 use alloc::collections::{BTreeMap, VecDeque};
@@ -21,7 +19,6 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::fmt::Write as _;
 use core::future::Future;
-use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -43,7 +40,7 @@ macro_rules! check {
 /// Drive a future whose every await is immediately ready (the fake's
 /// waits only advance its clock).
 fn run<F: Future>(f: F) -> F::Output {
-    let mut f = pin!(f);
+    let mut f = alloc::boxed::Box::pin(f);
     let mut cx = Context::from_waker(Waker::noop());
     for _ in 0..16 {
         if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {

@@ -121,7 +121,8 @@ pub(super) fn classify(frame: &[u8], own: [u8; 6]) -> Result<Queue, Error> {
         || !unicast(&own)
         || frame[10..16] != own
         || frame[0] & 3 != 0
-        || frame[1] & (4 | 16 | 32 | 128) != 0
+        || frame[1] & (4 | 16 | 32) != 0
+        || frame[1] & 128 != 0 && frame[0] != 0x88
         || frame[22] & 15 != 0
     {
         return Err(Error::Frame);
@@ -139,11 +140,15 @@ pub(super) fn classify(frame: &[u8], own: [u8; 6]) -> Result<Queue, Error> {
         // Broadcast probe request of an active scan (see probe_request).
         0x40 if probe_request(frame, own) => Ok(Queue::Management),
         0x08 if frame[1] & 3 == 1 && unicast(&frame[4..10]) => Ok(Queue::Data),
-        // QoS DATA: TID0..7, normal ack policy, no EOSP/A-MSDU/TXOP bits.
+        // QoS DATA: TID0..7, normal ack policy; HE +HTC carries EOSP.
         0x88 if frame[1] & 3 == 1
             && unicast(&frame[4..10])
-            && frame.get(24).is_some_and(|b| b & 0xf8 == 0)
-            && frame.get(25) == Some(&0) =>
+            && frame
+                .get(24)
+                .is_some_and(|b| b & 0xe8 == 0 && (b & 0x10 != 0) == (frame[1] & 128 != 0))
+            && frame.get(25) == Some(&0)
+            && (frame[1] & 128 == 0
+                || frame.get(26..30).is_some_and(|control| control[0] & 3 == 3)) =>
         {
             Ok(Queue::for_tid(frame[24]))
         }
@@ -209,6 +214,9 @@ pub(super) fn transmit_agg(
         return Err(Error::Metadata);
     }
     let adaptive = rate & FIRMWARE_RA != 0;
+    if frame[1] & 0x80 != 0 && !adaptive {
+        return Err(Error::Metadata);
+    }
     let er = rate & DATA_ER != 0;
     let index = rate & !(FIRMWARE_RA | DATA_ER);
     if mac_id != 0
@@ -254,7 +262,11 @@ pub(super) fn transmit_agg(
         // INFO1 DATA_RTY_LOWEST_RATE[24:16] bounds hardware retry fallback.
         put(&mut bytes, 24, u32::from(er) << 15);
         let num = agg.map_or(0, |agg| u32::from(agg.num));
-        put(&mut bytes, 28, u32::from(index) << 16 | num);
+        put(
+            &mut bytes,
+            28,
+            u32::from(index) << 16 | num | u32::from(frame[1] & 0x80 != 0) << 14,
+        );
     } else {
         put(&mut bytes, 24, 1 << 30 | 1 << 10 | u32::from(rate) << 16); // Source DATA_RATE[24:16].
     }
