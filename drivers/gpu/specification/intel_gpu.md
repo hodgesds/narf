@@ -1482,6 +1482,25 @@ globally distinct mmap offsets; foreign attachments/sync-file imports are
 unavailable. Both primary and render nodes route these requests
 before shared DRM/KMS dispatch and acquire mmap backing atomically.
 
+Native terminal fences now back the shared per-object dma-buf reservation.
+GuC and Gen12 resident admission check the whole residency list before adding
+READ/WRITE fences; readers can overlap, conflicting writers return busy, and
+kernel CPU copies use the same admission gate. Cache publication follows
+reservation. Failure after reservation releases the graph before signalling;
+uncertain DMA lifetime keeps reservations through timeout/cancel until proven
+full reset. Independent GuC LRCs do not share an ordered dma-fence context.
+GEM_BUSY exposes render-class reader/writer bits. Async GEM_WAIT preserves one
+relative timeout deadline across parking and writes remaining nanoseconds;
+PREAD/PWRITE and CPU-domain waits respect reservations. PRIME SYNC START waits
+for conflicting access, END orders coherent RAM, and shared names and
+EXPORT_SYNC_FILE use the generic dma-buf fd/copyout protocol. Existing mappings
+still require caller exclusion; this does not enable external fence import,
+isolated userspace execution or Mesa acceleration. Linux references are
+`i915_gem_busy.c`, `i915_gem_wait.c`, `dma-resv.c` and `dma-buf.c` at the pinned
+source revision below. Native smokes exercise alias/PRIME lifetime, independent
+readers, all-or-nothing conflict admission, async deadlines/cancellation,
+CPU-copy exclusion, sync-file copy faults and GuC terminal/reset boundaries.
+
 Validated execbuffer requests still return NotImplemented. No userspace engines
 or acceleration capabilities are advertised. Gen12 production execlists helpers
 refuse Meteor/Arrow Lake before MMIO. The physical GuC owner now supplies

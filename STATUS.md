@@ -1155,6 +1155,31 @@ host default/Intel-only/AMD-only/no-vendor all-target checks, Intel-only debug
 builds and formatting pass. Both production boots and both btrfs postflights
 per architecture pass. Physical Intel/Mesa acceptance remains untested.
 
+The same Intel branch now connects native terminal fences to each GEM object's
+shared PRIME reservation. GuC and legacy Gen12 resident paths admit overlapping
+readers and reject conflicting writers transactionally before cache publication.
+Kernel CPU copies respect those reservations; GEM_BUSY reports actual render
+reader/writer bits, and async GEM_WAIT retains its relative timeout deadline
+while parked. PREAD/PWRITE retry waiting chunks without replaying a prefix.
+PRIME CPU-access synchronization, shared names and sync-file export observe the
+same terminal fences across aliases. Cancellation/timeouts retain reservations
+until verified completion or reset; failed copies publish no sync-file fd.
+External fence import, raw-mapping exclusion, isolated user submission and
+physical Intel/Mesa acceptance remain open.
+Four new native smokes cover reservation conflicts/rollback and aliases,
+relative wait deadlines/cancellation and retained CPU-domain requests,
+PRIME synchronization/export copy faults, and pre-publication cache failure.
+Extended GuC conversations check real terminal/reset reservation boundaries.
+The final focused x86_64 selection passes 83 tests. The aarch64 Intel/DRM
+selection passes 360 tests, with all 15 render tests rerun after the final
+CPU-domain lifetime correction; all runs have zero failures/skips. GPU CI
+Clippy passes three contexts on each architecture; host default, Intel-only,
+AMD-only and no-vendor all-target checks, Intel debug builds and formatting pass.
+Both architectures pass production boot and both btrfs interoperability
+postflights. The refreshed standalone x86_64 boot uses the dedicated test
+virtio-blk image through NARF_VBLK_IMG; the default Alpine image is not writable
+by the current user.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

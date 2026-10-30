@@ -382,6 +382,14 @@ impl<A: BootAllocator> GuCScheduler<A> {
             ring.write32(i as u64 * 4, word);
         }
         image.write32(REGS + 7 * 4, tail);
+        let completion = Arc::new(CompletionFence::new());
+        if let Some(batch) = &resident {
+            if let Err(error) = batch.reserve(&completion) {
+                r.allocator.free(ring);
+                r.allocator.free(image);
+                return Err(SchedulingError::Residency(error));
+            }
+        }
         if r.allocator.sync_for_device(&image).is_err()
             || r.allocator.sync_for_device(&ring).is_err()
             || resident
@@ -390,9 +398,10 @@ impl<A: BootAllocator> GuCScheduler<A> {
         {
             r.allocator.free(ring);
             r.allocator.free(image);
+            drop(resident);
+            completion.signal(Err(JobError::Reset));
             return Err(SchedulingError::Cache);
         }
-        let completion = Arc::new(CompletionFence::new());
         r.contexts.push(Context {
             id,
             image,

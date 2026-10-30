@@ -850,6 +850,43 @@ fn smoke_hardware_ppgtt_store_and_retirement() -> TestResult {
         assert!(probe.result.verify().is_err());
         let weak = probe.result.weak_objects();
         assert!(weak.iter().all(|o| o.strong_count() == 2));
+        assert_eq!(weak[0].upgrade().unwrap().busy(), 0x10000);
+        assert_eq!(weak[1].upgrade().unwrap().busy(), 0x10001);
+        {
+            use crate::intel_gpu_exec::{ExecObject, ExecRequest};
+            let count = arena.live_allocations();
+            let batch = ExecRequest {
+                context_id: 0,
+                batch_va: 0x1234_0000_0000,
+                batch_len: 24,
+                objects: alloc::vec![
+                    ExecObject {
+                        object: weak[0].upgrade().unwrap(),
+                        va: 0x1234_0000_0000,
+                        writable: false
+                    },
+                    ExecObject {
+                        object: weak[1].upgrade().unwrap(),
+                        va: 0x2345_0000_0000,
+                        writable: true
+                    },
+                ],
+            }
+            .prepare_for_gt(platform)
+            .unwrap();
+            // SAFETY: the fixed private probe is unchanged; its conflicting
+            // writer must be rejected before any context reaches firmware.
+            let rejected = unsafe { gt.submit_kernel_batch(26, batch) };
+            assert!(matches!(
+                rejected,
+                Err(GtError::Scheduling(
+                    crate::intel_gpu_guc_sched::SchedulingError::Residency(
+                        narf_filesystem::FsError::WouldBlock
+                    )
+                ))
+            ));
+            assert_eq!(arena.live_allocations(), count);
+        }
         let mut registered = BTreeMap::new();
         for now in 27..48 {
             assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
@@ -859,6 +896,7 @@ fn smoke_hardware_ppgtt_store_and_retirement() -> TestResult {
             }
         }
         assert_eq!(probe.completion.result(), Some(Ok(())));
+        assert!(weak.iter().all(|o| o.upgrade().unwrap().busy() == 0));
         assert_eq!(probe.result.verify(), Ok(()));
         assert_eq!(arena.live_allocations(), count);
         // Priming after a resident job could capture that job's graphics
@@ -876,6 +914,72 @@ fn smoke_hardware_ppgtt_store_and_retirement() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_guc_gt",
     smoke_hardware_ppgtt_store_and_retirement
+);
+
+fn smoke_hardware_reservation_cache_failure_releases_before_retry() -> TestResult {
+    use crate::intel_gpu_exec::{ExecObject, ExecRequest, PpgttProbeResult};
+    let platform = GtPlatform::Battlemage;
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    hardware_discovery(&mut gt, &w, 0xdfc);
+    hardware_scheduling(&mut gt, &w);
+    let baseline = arena.live_allocations();
+    let (batch, result) = PpgttProbeResult::prepare(platform).unwrap();
+    let weak = result.weak_objects();
+    w.0.borrow_mut().fail_sync = true;
+    // SAFETY: the fixed private probe is trusted and has no mapped aliases.
+    let failed = unsafe { gt.submit_kernel_batch(26, batch) };
+    assert!(matches!(
+        failed,
+        Err(GtError::Scheduling(
+            crate::intel_gpu_guc_sched::SchedulingError::Cache
+        ))
+    ));
+    assert_eq!(arena.live_allocations(), baseline);
+    assert!(weak
+        .iter()
+        .all(|object| object.strong_count() == 1 && object.upgrade().unwrap().busy() == 0));
+    w.0.borrow_mut().fail_sync = false;
+    let batch = ExecRequest {
+        context_id: 0,
+        batch_va: 0x1234_0000_0000,
+        batch_len: 24,
+        objects: alloc::vec![
+            ExecObject {
+                object: weak[0].upgrade().unwrap(),
+                va: 0x1234_0000_0000,
+                writable: false
+            },
+            ExecObject {
+                object: weak[1].upgrade().unwrap(),
+                va: 0x2345_0000_0000,
+                writable: true
+            },
+        ],
+    }
+    .prepare_for_gt(platform)
+    .unwrap();
+    // SAFETY: unchanged private probe, with failed submission fully released.
+    let (id, completion) = unsafe { gt.submit_kernel_batch(26, batch) }.unwrap();
+    assert_eq!(
+        id, 1,
+        "failed pre-publication submission consumed an identity"
+    );
+    assert_eq!(weak[1].upgrade().unwrap().busy(), 0x10001);
+    hardware_stop(&mut gt, &w, 0xdfc);
+    assert_eq!(
+        completion.result(),
+        Some(Err(crate::intel_gpu_fence::JobError::Reset))
+    );
+    assert!(weak
+        .iter()
+        .all(|object| object.upgrade().unwrap().busy() == 0));
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_reservation_cache_failure_releases_before_retry
 );
 
 fn smoke_hardware_ppgtt_cancel_and_reset() -> TestResult {
@@ -910,6 +1014,7 @@ fn smoke_hardware_ppgtt_cancel_and_reset() -> TestResult {
         Poll::Ready(Err(GtError::Scheduling(_)))
     ));
     assert!(completion.result().is_none());
+    assert_eq!(weak[1].upgrade().unwrap().busy(), 0x10001);
     gt.begin_stop(10_000_000_000).unwrap();
     reset_done(&w);
     w.0.borrow_mut().regs.insert(0xc314, 0);

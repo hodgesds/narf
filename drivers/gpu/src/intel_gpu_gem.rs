@@ -6,6 +6,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+use narf_filesystem::dma_buf::{dma_resv_usage_rw, DmaBufObject, DmaResvUsage};
 use narf_filesystem::{FsError, MmapBacking};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::frame::{alloc_frame, free_frame, PhysFrame};
@@ -17,6 +18,9 @@ const MAX_OBJECTS: usize = 4096;
 const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 static LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 static NEXT_MMAP: AtomicU64 = AtomicU64::new(MMAP_BASE);
+// All native reservation writers and kernel CPU copies take this gate. No
+// foreign fence imports are exposed. Never retain the gate across an await.
+static RESERVATIONS: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 
 #[derive(Debug)]
 pub struct GemObject {
@@ -25,6 +29,7 @@ pub struct GemObject {
     offset: u64,
     /// Serializes kernel CPU copies; never forms references to mapped data.
     cpu: IrqSafeSpinLock<()>,
+    pub(crate) dma_buf: DmaBufObject,
 }
 
 impl GemObject {
@@ -42,6 +47,7 @@ impl GemObject {
             size,
             offset,
             cpu: IrqSafeSpinLock::new(()),
+            dma_buf: DmaBufObject::new(),
         };
         object
             .frames
@@ -68,6 +74,45 @@ impl GemObject {
 
     pub fn pages(&self) -> impl Iterator<Item = u64> + '_ {
         self.frames.iter().map(|frame| frame.start_address().raw())
+    }
+
+    /// i915 render-class reader (upper bits) and writer (lower bits).
+    pub fn busy(&self) -> u32 {
+        let _gate = RESERVATIONS.lock();
+        if !self.dma_buf.resv.fences(DmaResvUsage::Write).is_empty() {
+            0x10001
+        } else if !self.dma_buf.resv.fences(DmaResvUsage::Read).is_empty() {
+            0x10000
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn idle(&self, write: bool) -> bool {
+        self.dma_buf
+            .resv
+            .fences(dma_resv_usage_rw(write))
+            .is_empty()
+    }
+
+    /// Wait without holding any IRQ-safe guard or restarting a relative
+    /// timeout. A terminal reset releases reservations just like completion.
+    pub(crate) async fn wait_idle(
+        &self,
+        write: bool,
+        deadline: Option<u64>,
+    ) -> Result<(), FsError> {
+        loop {
+            if self.idle(write) {
+                return Ok(());
+            }
+            let now = narf_time::monotonic_ns();
+            if deadline.is_some_and(|deadline| now >= deadline) {
+                return Err(FsError::TimedOut);
+            }
+            let delay = deadline.map_or(100_000, |end| (end - now).min(100_000));
+            narf_time::SleepUntil::new(narf_time::Deadline::after_ns(delay).as_instant()).await;
+        }
     }
 
     pub(crate) fn publish_for_device(&self) -> bool {
@@ -104,6 +149,10 @@ impl GemObject {
 
     pub fn read(&self, offset: u64, bytes: &mut [u8]) -> Result<(), FsError> {
         self.range(offset, bytes.len())?;
+        let _reservation = RESERVATIONS.lock();
+        if !self.idle(false) {
+            return Err(FsError::WouldBlock);
+        }
         let _guard = self.cpu.lock();
         for (i, byte) in bytes.iter_mut().enumerate() {
             let at = offset + i as u64;
@@ -119,6 +168,10 @@ impl GemObject {
 
     pub fn write(&self, offset: u64, bytes: &[u8]) -> Result<(), FsError> {
         self.range(offset, bytes.len())?;
+        let _reservation = RESERVATIONS.lock();
+        if !self.idle(true) {
+            return Err(FsError::WouldBlock);
+        }
         let _guard = self.cpu.lock();
         for (i, byte) in bytes.iter().enumerate() {
             let at = offset + i as u64;
@@ -130,6 +183,30 @@ impl GemObject {
         }
         Ok(())
     }
+}
+
+/// Atomic all-or-nothing conflict check followed by publication of the job's
+/// terminal fence on every leaf. Read-only jobs may overlap; writes are
+/// exclusive. The caller retains the residency graph until signalling it.
+pub(crate) fn reserve_gpu(
+    objects: &[(Arc<GemObject>, bool)],
+    completion: &Arc<crate::intel_gpu_fence::CompletionFence>,
+) -> Result<(), FsError> {
+    let _gate = RESERVATIONS.lock();
+    if objects.iter().any(|(object, write)| !object.idle(*write)) {
+        return Err(FsError::WouldBlock);
+    }
+    for (object, write) in objects {
+        object.dma_buf.resv.add_fence(
+            completion.clone(),
+            if *write {
+                DmaResvUsage::Write
+            } else {
+                DmaResvUsage::Read
+            },
+        );
+    }
+    Ok(())
 }
 
 impl Drop for GemObject {
@@ -271,4 +348,60 @@ impl GemState {
         let (object, within) = self.mapping_object(offset, len)?;
         object.backing(within, len)
     }
+}
+
+#[cfg(feature = "kernel-test")]
+mod tests {
+    use super::*;
+    use crate::intel_gpu_fence::{CompletionFence, JobError};
+    use narf_filesystem::DrmFence;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_reservations_conflicts_aliases_and_rollback() -> TestResult {
+        let gem = GemState::new();
+        let a = gem
+            .object(gem.create(PAGE, |_, _| Ok(())).unwrap())
+            .unwrap();
+        let b = gem
+            .object(gem.create(PAGE, |_, _| Ok(())).unwrap())
+            .unwrap();
+        let reader = Arc::new(CompletionFence::new());
+        let reader2 = Arc::new(CompletionFence::new());
+        let writer = Arc::new(CompletionFence::new());
+        reserve_gpu(&[(a.clone(), false)], &reader).unwrap();
+        reserve_gpu(&[(a.clone(), false)], &reader2).unwrap();
+        assert_eq!(a.busy(), 0x10000);
+        assert_eq!(a.read(0, &mut [0]), Ok(()));
+        assert_eq!(a.write(0, &[1]), Err(FsError::WouldBlock));
+        // The first object must not acquire a fence if a later one conflicts.
+        let before = b.dma_buf.resv.generation();
+        assert_eq!(
+            reserve_gpu(&[(b.clone(), true), (a.clone(), true)], &writer),
+            Err(FsError::WouldBlock)
+        );
+        assert_eq!(b.dma_buf.resv.generation(), before);
+        assert_eq!(b.busy(), 0);
+        reader2.signal(Ok(()));
+        assert_eq!(a.busy(), 0x10000, "independent contexts collapsed");
+        reader.signal(Err(JobError::Reset));
+        assert!(DrmFence::wait(&*reader, 0));
+        // Aliases requesting different access must retain the stronger usage.
+        reserve_gpu(&[(a.clone(), false), (a.clone(), true)], &writer).unwrap();
+        assert_eq!(a.busy(), 0x10001);
+        assert_eq!(a.read(0, &mut [0]), Err(FsError::WouldBlock));
+        let importer = GemState::new();
+        let imported = importer.import(&a).unwrap();
+        let alias = importer.object(imported).unwrap();
+        assert_eq!(alias.busy(), 0x10001);
+        assert!(!DrmFence::wait(&*writer, 0));
+        assert_eq!(writer.context(), None);
+        writer.signal(Ok(()));
+        assert_eq!(alias.busy(), 0);
+        assert_eq!(alias.write(0, &[7]), Ok(()));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gem",
+        smoke_reservations_conflicts_aliases_and_rollback
+    );
 }

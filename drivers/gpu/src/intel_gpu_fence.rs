@@ -67,6 +67,40 @@ impl CompletionFence {
     }
 }
 
+impl narf_filesystem::DrmFence for CompletionFence {
+    fn is_signalled(&self) -> bool {
+        self.result().is_some()
+    }
+
+    fn wait(&self, timeout_ms: u64) -> bool {
+        // The synchronous fence ABI is used by kernel callers and sync_file
+        // fallbacks. Never nest block_on inside an executor poll: the GT owner
+        // is another task. Intel ioctls use the async reservation wait instead.
+        let deadline =
+            narf_time::monotonic_ns().saturating_add(timeout_ms.saturating_mul(1_000_000));
+        loop {
+            if self.result().is_some() {
+                return true;
+            }
+            if narf_time::monotonic_ns() >= deadline {
+                return false;
+            }
+            narf_scheduler::sleep_pumps::run();
+            core::hint::spin_loop();
+        }
+    }
+
+    // Separate GuC LRCs may finish out of order. They must never share an
+    // ordered dma_fence context, or dma_resv would discard a live dependency.
+    fn driver_name(&self) -> &str {
+        "intel-gpu"
+    }
+
+    fn timeline_name(&self) -> &str {
+        "rcs0"
+    }
+}
+
 #[derive(Debug)]
 pub struct FenceWait<'a> {
     fence: &'a CompletionFence,

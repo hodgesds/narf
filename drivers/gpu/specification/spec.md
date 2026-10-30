@@ -109,7 +109,7 @@ to identify as `intel-gpu`; it does not yet advertise Mesa-ready acceleration.
 
 Implemented storage operations are GEM_CREATE/CREATE_EXT (system region only),
 CLOSE, PREAD/PWRITE, MMAP_OFFSET (WB system RAM only), linear GET/SET_TILING,
-cached GET/SET_CACHING, MADVISE, CPU SET_DOMAIN and idle BUSY/WAIT/SW_FINISH.
+cached GET/SET_CACHING, MADVISE, CPU SET_DOMAIN and BUSY/WAIT/SW_FINISH.
 GEM_MMAP_GTT, legacy GEM_MMAP and GET_APERTURE are unavailable. Handles are local
 to an open. Each object owns zeroed scattered frames; a mapping atomically
 acquires frames and an Arc retaining their owner. Close removes only the handle.
@@ -119,9 +119,37 @@ Creation-copy failure publishes no handle and releases its pages/accounting.
 Same-card PRIME export/import shares the existing object and deduplicates
 reimports on an open. Globally unique stable fake mmap offsets avoid collisions
 with the importer's existing objects. Exported fd mappings retain the same
-pages after all GEM handles and fds close. DMA_BUF_IOCTL_SYNC validates CPU
-access flags and orders coherent RAM access; foreign attachments and external
-sync-file imports are unavailable while the render backend is closed.
+pages after all GEM handles and fds close. Each object also owns one shared
+`DmaBufObject` reservation/name across handles and exports. DMA_BUF_IOCTL_SYNC
+START waits for conflicting native GPU accesses (a CPU reader waits for writers;
+a CPU writer waits for readers and writers); END orders coherent RAM access.
+DMA_BUF_SET_NAME and EXPORT_SYNC_FILE use that shared state and the common
+fd reservation/copyout/install protocol. Foreign attachments and external
+sync-file imports remain unavailable.
+
+Both GuC and legacy Gen12 resident submissions atomically check every leaf's
+reservation, reject conflicting work without partial reservation publication,
+then attach their terminal CompletionFence as READ or WRITE before cache
+publication. Read-only jobs may overlap. Independent LRCs have no shared ordered
+dma-fence context: completing one cannot elide another's live dependency.
+Resources release before terminal signalling, including failures after
+reservation and verified reset. Unproven stop, timeout and cancelled waiters
+retain reservations. Scheduling acknowledgments are not terminal events.
+Kernel CPU copies check conflicts under the same admission gate; async
+PREAD/PWRITE wait and retry individual chunks without replaying a copied prefix.
+Existing raw CPU/user mappings still require the trusted submitter's exclusion
+contract; a reservation cannot revoke an already installed mapping.
+
+GEM_BUSY reports render-class readers as 0x10000 and a writer as 0x10001.
+GEM_WAIT waits for readers and writers: zero polls with ETIME if busy, negative
+waits indefinitely, and positive nanoseconds use one monotonic deadline retained
+across async parking. Positive waits write back remaining time; timeout writes
+zero. A terminal reset counts as completion for busy/wait. CPU SET_DOMAIN and
+SW_FINISH also wait for conflicting reservations. Synchronous kernel dispatch
+returns WouldBlock for a pending nonzero wait; primary/render `ioctl_user`
+awaits without retaining IRQ-safe locks. Indefinite side-effect-free user waits
+use `restart_after` when available; finite waits retain their copied deadline.
+Full userspace submission and its signal/recovery acceptance remain gated.
 
 Context/VM create, destroy and scalar GET/SETPARAM have per-open namespaces,
 bounded extension chains and retained VM identity after VM-handle destruction.

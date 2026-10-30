@@ -1583,7 +1583,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// covered together when the context is next loaded.
     /// Returns the engine-wide request id.
     pub fn submit(&mut self, id: ContextId, batch: BatchBuf<A>) -> Result<u64, SubmitError> {
-        self.submit_inner(id, RequestBatch::Ggtt(batch), false)
+        self.submit_inner(id, RequestBatch::Ggtt(batch), false, None)
             .map(|s| s.request)
     }
 
@@ -1612,7 +1612,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
                 return Err(e);
             }
         }
-        self.submit_inner(id, RequestBatch::Ggtt(batch), true)
+        self.submit_inner(id, RequestBatch::Ggtt(batch), true, None)
             .map(|s| s.request)
     }
 
@@ -1640,15 +1640,31 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         if self.ctx_covered(slot) || self.queue.iter().any(|r| r.ctx_slot == slot) {
             return Err(SubmitError::ContextBusy);
         }
-        if !batch.publish_for_device() {
-            return Err(SubmitError::CacheUnavailable);
+        let completion = Arc::new(CompletionFence::new());
+        batch
+            .reserve(&completion)
+            .map_err(|_| SubmitError::ContextBusy)?;
+        let ready = if !batch.publish_for_device() {
+            Err(SubmitError::CacheUnavailable)
+        } else {
+            self.attach_ppgtt(id, batch.space().root_phys())
+        };
+        if let Err(error) = ready {
+            drop(batch);
+            completion.signal(Err(JobError::Reset));
+            return Err(error);
         }
-        self.attach_ppgtt(id, batch.space().root_phys())?;
-        let result = self.submit_inner(id, RequestBatch::Resident(ManuallyDrop::new(batch)), true);
+        let result = self.submit_inner(
+            id,
+            RequestBatch::Resident(ManuallyDrop::new(batch)),
+            true,
+            Some(completion.clone()),
+        );
         if result.is_err() {
             let ctx = self.context_mut(id)?;
             Self::patch_pdp_values(&ctx.image, previous);
             ctx.ppgtt_root = previous;
+            completion.signal(Err(JobError::Reset));
         }
         result
     }
@@ -1658,6 +1674,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
         id: ContextId,
         batch: RequestBatch<A>,
         ppgtt_form: bool,
+        completion: Option<Arc<CompletionFence>>,
     ) -> Result<ResidentSubmission, SubmitError> {
         if self.completion_lost {
             batch.release(&mut self.alloc);
@@ -1726,7 +1743,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
             seqno
         };
         self.next_request_id += 1;
-        let completion = Arc::new(CompletionFence::new());
+        let completion = completion.unwrap_or_else(|| Arc::new(CompletionFence::new()));
         self.queue.push_back(Request {
             ctx_slot: slot,
             ctx_gen: generation,

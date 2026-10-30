@@ -228,6 +228,135 @@ impl RenderFile {
         self.dispatch(&info, cmd, arg, user)
     }
 
+    pub(crate) async fn dispatch_card_user(
+        &self,
+        card: u32,
+        cmd: u32,
+        arg: u64,
+        user: &dyn IoctlContext,
+    ) -> Option<Result<u64, FsError>> {
+        if crate::drm_registry::driver_name(card) != Some("intel-gpu") {
+            return None;
+        }
+        let Some(info) = DeviceInfo::for_card(card) else {
+            return Some(Err(FsError::NoDevice));
+        };
+        self.dispatch_user(&info, cmd, arg, user).await
+    }
+
+    /// User waits retain one future and its original relative deadline while
+    /// the stackful syscall parks. No reservation/handle lock spans a sleep.
+    pub async fn dispatch_user(
+        &self,
+        info: &DeviceInfo,
+        cmd: u32,
+        arg: u64,
+        user: &dyn IoctlContext,
+    ) -> Option<Result<u64, FsError>> {
+        if cmd == abi::GEM_WAIT {
+            return Some(self.wait_ioctl(arg, user).await.map(|()| 0));
+        }
+        if matches!(cmd, abi::GEM_PREAD | abi::GEM_PWRITE) {
+            return Some(self.copy_ioctl(cmd, arg, user).await.map(|()| 0));
+        }
+        if matches!(cmd, abi::GEM_SET_DOMAIN | abi::GEM_SW_FINISH) {
+            return Some(self.domain_ioctl(cmd, arg, user).await.map(|()| 0));
+        }
+        self.dispatch(info, cmd, arg, user)
+    }
+
+    async fn domain_ioctl(
+        &self,
+        cmd: u32,
+        arg: u64,
+        user: &dyn IoctlContext,
+    ) -> Result<(), FsError> {
+        let request = read(user, arg, if cmd == abi::GEM_SET_DOMAIN { 12 } else { 4 })?;
+        let object = self.gem.object(u32_at(&request, 0))?;
+        let write = cpu_domain_write(cmd, &request)?;
+        if !object.idle(write) && user.restart_after(1_000_000) {
+            return Err(FsError::WouldBlock);
+        }
+        object.wait_idle(write, None).await
+    }
+
+    async fn wait_ioctl(&self, arg: u64, user: &dyn IoctlContext) -> Result<(), FsError> {
+        let mut request = read(user, arg, 16)?;
+        if u32_at(&request, 4) != 0 {
+            return Err(FsError::InvalidData);
+        }
+        let object = self.gem.object(u32_at(&request, 0))?;
+        let timeout = u64_at(&request, 8) as i64;
+        if timeout < 0 && !object.idle(true) && user.restart_after(1_000_000) {
+            return Err(FsError::WouldBlock);
+        }
+        let deadline =
+            (timeout >= 0).then(|| narf_time::monotonic_ns().saturating_add(timeout as u64));
+        let result = object.wait_idle(true, deadline).await;
+        if let Some(deadline) = deadline {
+            put64(
+                &mut request,
+                8,
+                deadline
+                    .saturating_sub(narf_time::monotonic_ns())
+                    .min(timeout as u64),
+            );
+            // Copy only the output field; a copy fault never changes residency.
+            user.write(
+                arg.checked_add(8).ok_or(FsError::BadAddress)?,
+                &request[8..16],
+            )?;
+        }
+        result
+    }
+
+    async fn copy_ioctl(&self, cmd: u32, arg: u64, user: &dyn IoctlContext) -> Result<(), FsError> {
+        let request = read(user, arg, 32)?;
+        if u32_at(&request, 4) != 0 {
+            return Err(FsError::InvalidData);
+        }
+        let object = self.gem.object(u32_at(&request, 0))?;
+        let offset = u64_at(&request, 8);
+        let size = usize::try_from(u64_at(&request, 16)).map_err(|_| FsError::InvalidData)?;
+        object.range(offset, size)?;
+        if size == 0 {
+            return Ok(());
+        }
+        let pointer = u64_at(&request, 24);
+        pointer
+            .checked_add(size as u64)
+            .ok_or(FsError::BadAddress)?;
+        let write = cmd == abi::GEM_PWRITE;
+        let mut done = 0;
+        while done < size {
+            let count = (size - done).min(16 * 1024);
+            let mut data = if write {
+                read(user, pointer + done as u64, count)?
+            } else {
+                vec![0; count]
+            };
+            loop {
+                object.wait_idle(write, None).await?;
+                let result = if write {
+                    object.write(offset + done as u64, &data)
+                } else {
+                    object.read(offset + done as u64, &mut data)
+                };
+                // A new job may win the reservation gate after the wait. Retry
+                // this chunk without replaying an already copied prefix.
+                if result != Err(FsError::WouldBlock) {
+                    result?;
+                    break;
+                }
+            }
+            if !write {
+                user.write(pointer + done as u64, &data)?;
+            }
+            done += count;
+        }
+        Ok(())
+    }
+
     /// `None` means a generic DRM command, not an error from an Intel ioctl.
     /// Once recognized, a malformed Intel command cannot fall through to KMS.
     pub fn dispatch(
@@ -344,28 +473,22 @@ impl RenderFile {
                     _ => 4,
                 };
                 let mut request = read(user, arg, size)?;
-                self.gem.object(u32_at(&request, 0))?;
+                let object = self.gem.object(u32_at(&request, 0))?;
                 if cmd == abi::GEM_WAIT && u32_at(&request, 4) != 0 {
                     return Err(FsError::InvalidData);
                 }
-                if cmd == abi::GEM_SET_DOMAIN {
-                    let reads = u32_at(&request, 4);
-                    let write = u32_at(&request, 8);
-                    if reads & !0xc1 != 0
-                        || write & !0xc1 != 0
-                        || write.count_ones() > 1
-                        || (write != 0 && reads != write)
-                    {
-                        return Err(FsError::InvalidData);
-                    }
-                }
+                let write = cpu_domain_write(cmd, &request)?;
                 if cmd == abi::GEM_BUSY {
-                    put32(&mut request, 4, 0);
+                    put32(&mut request, 4, object.busy());
                     return user.write(arg, &request);
                 }
-                // There is no admitted userspace submitter yet: these objects
-                // cannot have outstanding GPU work. Add fence waits with submit.
-                Ok(())
+                if object.idle(write) {
+                    Ok(())
+                } else if cmd == abi::GEM_WAIT && u64_at(&request, 8) == 0 {
+                    Err(FsError::TimedOut)
+                } else {
+                    Err(FsError::WouldBlock)
+                }
             }
             abi::GEM_GET_TILING
             | abi::GEM_SET_TILING
@@ -542,6 +665,22 @@ impl RenderFile {
         }
         result
     }
+}
+
+fn cpu_domain_write(cmd: u32, request: &[u8]) -> Result<bool, FsError> {
+    if cmd != abi::GEM_SET_DOMAIN {
+        return Ok(true);
+    }
+    let reads = u32_at(request, 4);
+    let write = u32_at(request, 8);
+    if reads & !0xc1 != 0
+        || write & !0xc1 != 0
+        || write.count_ones() > 1
+        || (write != 0 && reads != write)
+    {
+        return Err(FsError::InvalidData);
+    }
+    Ok(write != 0)
 }
 
 /// Synchronous kernel callers use the same guarded copy seam as other DRM
@@ -1758,4 +1897,6 @@ pub(crate) mod tests {
         "drivers/gpu/intel_gpu_render",
         smoke_intel_prime_import_identity_offsets_and_mapping_owner
     );
+
+    include!("intel_gpu_sync_tests.rs");
 }

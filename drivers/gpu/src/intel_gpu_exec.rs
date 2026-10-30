@@ -232,7 +232,7 @@ impl ExecRequest {
             objects: Vec::new(),
         };
         for entry in &self.objects {
-            space.objects.push(entry.object.clone());
+            space.objects.push((entry.object.clone(), entry.writable));
             for (i, phys) in entry.object.pages().enumerate() {
                 space
                     .tables
@@ -281,6 +281,13 @@ impl ResidentBatch {
         self.platform
     }
 
+    pub(crate) fn reserve(
+        &self,
+        completion: &Arc<crate::intel_gpu_fence::CompletionFence>,
+    ) -> Result<(), FsError> {
+        crate::intel_gpu_gem::reserve_gpu(&self.space.objects, completion)
+    }
+
     /// Tables are private and immutable; CPU WB mappings therefore need a
     /// one-time clean, even on Xe-LPG's non-snooping table walker. The caller
     /// must also prevent writes to the leaf objects until terminal completion.
@@ -290,7 +297,7 @@ impl ResidentBatch {
                 .space
                 .objects
                 .iter()
-                .all(|object| object.publish_for_device())
+                .all(|(object, _)| object.publish_for_device())
     }
 }
 
@@ -404,7 +411,7 @@ fn map_error(error: PpgttError) -> FsError {
 pub struct AddressSpace {
     tables: Option<Ppgtt>,
     memory: FramePtMemory,
-    objects: Vec<Arc<GemObject>>,
+    objects: Vec<(Arc<GemObject>, bool)>,
 }
 
 impl AddressSpace {

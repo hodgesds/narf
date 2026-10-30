@@ -568,7 +568,11 @@ impl FileOps for DriCardFile {
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
             #[cfg(feature = "intel")]
-            if let Some(result) = self.intel.dispatch_card(self.index, cmd, arg, context) {
+            if let Some(result) = self
+                .intel
+                .dispatch_card_user(self.index, cmd, arg, context)
+                .await
+            {
                 return result;
             }
             // amdgpu_drm_ioctl: pm_runtime_get_sync … put_autosuspend.
@@ -974,8 +978,14 @@ impl FileOps for IntelPrimeDmaBufFile {
         context: &'a dyn narf_filesystem::IoctlContext,
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
-            // DMA_BUF_IOCTL_SYNC, CPU-coherent RAM with no admitted GPU work.
-            if cmd != 0x4008_6200 {
+            use narf_filesystem::dma_buf::*;
+            if matches!(
+                cmd,
+                DMA_BUF_SET_NAME_A | DMA_BUF_SET_NAME_B | DMA_BUF_IOCTL_EXPORT_SYNC_FILE
+            ) {
+                return dma_buf_ioctl(&self.object.dma_buf, cmd, arg, context);
+            }
+            if cmd != DMA_BUF_IOCTL_SYNC {
                 return Err(FsError::Unsupported);
             }
             let mut bytes = [0; 8];
@@ -983,6 +993,16 @@ impl FileOps for IntelPrimeDmaBufFile {
             let flags = u64::from_le_bytes(bytes);
             if flags & !7 != 0 || flags & 3 == 0 {
                 return Err(FsError::InvalidData);
+            }
+            if flags & DMA_BUF_SYNC_END == 0 {
+                if !self.object.idle(flags & DMA_BUF_SYNC_WRITE != 0)
+                    && context.restart_after(1_000_000)
+                {
+                    return Err(FsError::WouldBlock);
+                }
+                self.object
+                    .wait_idle(flags & DMA_BUF_SYNC_WRITE != 0, None)
+                    .await?;
             }
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             Ok(0)
@@ -1592,7 +1612,11 @@ impl FileOps for DriRenderFile {
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
             #[cfg(feature = "intel")]
-            if let Some(result) = self.intel.dispatch_card(self.index, cmd, arg, context) {
+            if let Some(result) = self
+                .intel
+                .dispatch_card_user(self.index, cmd, arg, context)
+                .await
+            {
                 return result;
             }
             // amdgpu_drm_ioctl: pm_runtime_get_sync … put_autosuspend.
