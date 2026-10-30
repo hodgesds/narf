@@ -16,7 +16,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::{
@@ -32,6 +32,8 @@ mod rebuild_native;
 pub(crate) mod recovery;
 #[path = "supervisor.rs"]
 pub(crate) mod supervisor;
+#[path = "system_sleep.rs"]
+mod system_sleep;
 type Error = station::Error;
 struct EndpointState {
     rx: narf_ipc::Producer<Frame, RX_RING_N>,
@@ -89,6 +91,11 @@ const WATCHDOG_MS: u64 = 2_000;
 /// Linux `rtl88ee_mod_params.fwctrl_lps` (module parameter `fwlps`),
 /// default off exactly like the upstream RTL8188EE driver.
 static FW_LPS: AtomicBool = AtomicBool::new(false);
+static INACTIVE_PS: AtomicBool = AtomicBool::new(true);
+/// Equivalent to Linux rtl8188ee's default-on `ips` parameter.
+pub fn set_inactive_power_save(enabled: bool) {
+    INACTIVE_PS.store(enabled, Ordering::Release);
+}
 /// Module-parameter equivalent of `rtl8188ee fwlps=`.
 pub fn set_leisure_power_save(enabled: bool) {
     FW_LPS.store(enabled, Ordering::Release);
@@ -337,6 +344,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     fn progress(&self) -> Vec<Received> {
         if self.lifecycle.rebuilding.load(Ordering::Acquire)
             || self.lifecycle.suspended.load(Ordering::Acquire)
+            || self.lifecycle.inactive.load(Ordering::Acquire)
         {
             return Vec::new();
         }
@@ -700,6 +708,14 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     pub(crate) fn environment_for_test(&self) -> &E {
         &self.environment
     }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn power_flags_for_test(&self) -> (bool, bool, bool) {
+        (
+            self.lifecycle.suspended.load(Ordering::Acquire),
+            self.lifecycle.inactive.load(Ordering::Acquire),
+            self.lifecycle.sleep_complete.load(Ordering::Acquire),
+        )
+    }
 }
 fn admitted(bytes: &[u8], own: [u8; 6]) -> bool {
     (14..=1514).contains(&bytes.len())
@@ -804,6 +820,9 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
         let dwell = scan_dwell(&request)?;
+        self.lifecycle
+            .activity_ms
+            .store(self.environment.now_ms(), Ordering::Release);
         if self.admission.closed.load(Ordering::Acquire) {
             self.environment
                 .recovery()
@@ -1156,6 +1175,8 @@ pub(super) struct NativeEnvironment {
     admission: Arc<station::Admission>,
     firmware: IrqSafeSpinLock<Arc<super::firmware_transport::Owner<super::firmware_native::PciIo>>>,
     device: IrqSafeSpinLock<Weak<Native>>,
+    /// 0 active, 1 verified card-disabled, 2 unacknowledged transition.
+    power_state: AtomicU8,
 }
 /// Live station work consumes only the current installation. The explicit
 /// native preparation boundary owns signed-policy bootstrap.
@@ -1174,6 +1195,7 @@ impl NativeEnvironment {
             firmware: IrqSafeSpinLock::new(firmware),
             admission: Arc::new(station::Admission::new()),
             device: IrqSafeSpinLock::new(Weak::new()),
+            power_state: AtomicU8::new(0),
         }
     }
     pub(super) fn firmware(
@@ -1281,6 +1303,12 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
     device.published.store(true, Ordering::Release);
     narf_net::iface::install_rx_drain(drain);
     narf_wireless::registry::register(device.clone());
+    let pm = Arc::new(system_sleep::SystemPm {
+        device: Arc::downgrade(&device),
+        config: IrqSafeSpinLock::new(None),
+    });
+    narf_power::system_pm::register_async_system_pm(&device.name, pm.clone());
+    narf_power::device_pm::register_device_pm_ops(&device.name, pm);
     // Linux `rtl_pci_intr_mode_decide`: MSI first. Without a vector the
     // owner keeps every IMR clear and this worker polls at 1 ms.
     device.environment.firmware().native().arm_msi();
@@ -1293,6 +1321,7 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
                 core::task::Poll::Ready(())
             })
             .await;
+            device.service_sleep_rollback();
             let working = device.work.try_lock().is_none_or(|slot| slot.is_some());
             if device.removed.load(Ordering::Acquire) && !working {
                 break;
@@ -1300,6 +1329,7 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
             if !working
                 && !device.removed.load(Ordering::Acquire)
                 && !device.lifecycle.suspended.load(Ordering::Acquire)
+                && !device.lifecycle.inactive.load(Ordering::Acquire)
             {
                 if !device.admission.closed.load(Ordering::Acquire) {
                     retries = 0;
@@ -1309,6 +1339,31 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
                         retry_at = device.environment.now_ms().saturating_add(1000);
                     }
                 }
+            }
+            if !working
+                && !INACTIVE_PS.load(Ordering::Acquire)
+                && device.lifecycle.inactive.load(Ordering::Acquire)
+                && !device.lifecycle.suspended.load(Ordering::Acquire)
+                && !device.removed.load(Ordering::Acquire)
+            {
+                let _ = device.schedule(supervisor::Operation::Resume);
+            }
+            if !working
+                && INACTIVE_PS.load(Ordering::Acquire)
+                && !device.removed.load(Ordering::Acquire)
+                && !device.admission.closed.load(Ordering::Acquire)
+                && device
+                    .environment
+                    .now_ms()
+                    .saturating_sub(device.lifecycle.activity_ms.load(Ordering::Acquire))
+                    >= WATCHDOG_MS
+                && device.prepared.try_lock().is_some_and(|owner| {
+                    owner
+                        .as_ref()
+                        .is_some_and(|owner| owner.station_phase() == station::Phase::Passive)
+                })
+            {
+                let _ = device.schedule(supervisor::Operation::Idle);
             }
             // Snapshot before servicing so a vector raised mid-pass is seen.
             let signal = device.environment.interrupt();

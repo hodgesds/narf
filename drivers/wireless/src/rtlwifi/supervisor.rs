@@ -11,6 +11,9 @@ use core::{
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Operation {
     Recover,
+    Suspend,
+    Resume,
+    Idle,
 }
 struct Completion {
     result: Option<Result<bool, Error>>,
@@ -42,6 +45,7 @@ where
                 work.result.clone()
             } else {
                 let device = self.clone();
+                let activity = self.lifecycle.activity_ms.load(Ordering::Acquire);
                 let result = Arc::new(IrqSafeSpinLock::new(Completion {
                     result: None,
                     waiters: Vec::new(),
@@ -52,6 +56,12 @@ where
                     future: Box::pin(async move {
                         match operation {
                             Operation::Recover => device.recover_once().await,
+                            Operation::Suspend => device.sleep_once(true, None).await,
+                            Operation::Idle => device.sleep_once(false, Some(activity)).await,
+                            Operation::Resume => {
+                                device.lifecycle.suspended.store(false, Ordering::Release);
+                                device.recover_once().await
+                            }
                         }
                     }),
                 });

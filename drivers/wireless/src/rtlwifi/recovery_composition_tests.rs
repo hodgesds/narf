@@ -8,6 +8,16 @@ use super::super::super::super::super::super::{
 use super::*;
 
 impl Rebuild<PacketIo<BootPort>, Block> for DeviceEnvironment {
+    async fn power_down(&self) -> Result<(), StationError> {
+        let firmware = self.firmware.lock().clone();
+        if firmware.native().powered_off.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        power_runtime::disable(firmware.native(), firmware.status().stage == Stage::Ready)
+            .await
+            .map_err(Error::Access)?;
+        Ok(())
+    }
     async fn rebuild(
         &self,
         retained: Arc<Mutex<Option<Prepared<PacketIo<BootPort>, Block>>>>,
@@ -18,9 +28,7 @@ impl Rebuild<PacketIo<BootPort>, Block> for DeviceEnvironment {
         if io.packet.model.lock().master {
             return Err(StationError::State);
         }
-        power_runtime::disable(&io, old.status().stage == Stage::Ready)
-            .await
-            .map_err(Error::Access)?;
+        self.power_down().await?;
         power_runtime::enable(&io).await.map_err(Error::Access)?;
         let firmware = Arc::new(Firmware::new(io, 0x8179));
         *self.firmware.lock() = firmware.clone();

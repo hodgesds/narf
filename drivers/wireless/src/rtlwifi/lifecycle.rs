@@ -12,6 +12,12 @@ pub(super) struct Lifecycle {
     publications: AtomicUsize,
     pub(super) rebuilding: AtomicBool,
     pub(super) suspended: AtomicBool,
+    pub(super) inactive: AtomicBool,
+    pub(super) sleep_complete: AtomicBool,
+    pub(super) activity_ms: AtomicU64,
+    pub(super) pm_requests: Mutex<()>,
+    pub(super) pm_preparing: AtomicBool,
+    pub(super) pm_rollback: AtomicBool,
 }
 
 impl Lifecycle {
@@ -22,6 +28,12 @@ impl Lifecycle {
             publications: AtomicUsize::new(0),
             rebuilding: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
+            inactive: AtomicBool::new(false),
+            sleep_complete: AtomicBool::new(false),
+            activity_ms: AtomicU64::new(0),
+            pm_requests: Mutex::new(()),
+            pm_preparing: AtomicBool::new(false),
+            pm_rollback: AtomicBool::new(false),
         }
     }
     pub(super) fn generation(&self) -> u64 {

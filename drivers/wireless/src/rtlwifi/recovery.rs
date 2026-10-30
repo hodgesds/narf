@@ -7,6 +7,9 @@ use core::future::Future;
 /// executes LLT/radio calibration and installs current signed channel policy.
 /// No previous RSNA, packet ring or receive epoch is restored by this hook.
 pub(crate) trait Rebuild<I: Port<Buffer = M>, M: Memory>: Environment {
+    fn power_down(&self) -> impl Future<Output = Result<(), Error>> + Send {
+        core::future::ready(Err(Error::State))
+    }
     fn rebuild(
         &self,
         retained: Arc<Mutex<Option<Prepared<I, M>>>>,
@@ -46,6 +49,9 @@ where
         if !self.admission.closed.load(Ordering::Acquire) {
             return Ok(false);
         }
+        self.lifecycle
+            .sleep_complete
+            .store(false, Ordering::Release);
         let generation = {
             let publication = self.admission.publication.lock();
             // Closing precedes advancing the generation. A new generation
@@ -80,6 +86,10 @@ where
                     // ring owner or firmware publication can replace them.
                     return Err(Error::State);
                 }
+            } else {
+                // MSI is armed at frontend publication, before firmware and
+                // Prepared exist. Bootstrap failure still owns that vector.
+                self.environment.deliver(false);
             }
             // Old callbacks may still be completing from owned packet
             // copies. Drain them before clearing the TX queue or reopening
@@ -130,6 +140,7 @@ where
             return Err(reason);
         }
         attempt.committed = true;
+        self.lifecycle.inactive.store(false, Ordering::Release);
         Ok(true)
     }
 

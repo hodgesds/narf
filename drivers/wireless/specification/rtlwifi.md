@@ -1047,6 +1047,42 @@ Native regressions compose the production generation supervisor with real
 firmware, LLT, radio, station and DHCP code, using inert MMIO/DMA/peer models.
 Acceptance on both architectures remains pending; the inventory row stays open.
 
+### RTL8188EE system suspend and IPS (implemented, native acceptance pending)
+
+The native frontend registers both `AsyncSystemPm` and synchronous device-PM
+hooks. Async preparation closes the station, retires real DMA and interrupts,
+drains logical publications and runs the actual card-disable flow. A separate
+completion bit becomes true only after the hardware transition completes;
+duplicate or failed preparation cannot turn an absent receipt into success.
+The synchronous hook saves the parked PCI type-0 header. Resume checks the
+current function identity, clears BME/MEM before restoring BARs, restores only
+parked MEM/INTx-disabled configuration, then checks exact BAR identity again.
+MSI vectors and firmware state are recreated by the async fresh-owner path;
+no old MSI enable, key, PN or receive ring is restored.
+
+The retained work slot survives a dropped suspend waiter. If the actual
+system-PM preparation future is abandoned, its cancellation guard requests
+resume after that same in-flight transition finishes. A short request mutex
+and exclusive preparation flag keep a competing preparation from reviving
+an abandoned request. Failed preparation attempts rollback through the same
+fresh-owner path. Source loss or missing hardware receipts remain closed;
+no cleanup grants DMA reclamation or host carrier without the required proof.
+
+`set_inactive_power_save(bool)` mirrors the default-on rtl8188ee `ips`
+parameter (`inactiveps` field); disabling it wakes an IPS-disabled owner.
+The existing two-second watchdog requests IPS only for an idle
+Passive station, serialized against scan/join/provisioning. A request retains
+its activity stamp so a queued old idle decision cannot power down a recent
+scan. IPS retires the native owner and physically disables the card; a later
+valid scan wakes through fresh firmware/LLT/radio/MAC and policy validation.
+An associated station uses the separately controlled firmware LPS path.
+System suspend can adopt an already verified IPS-disabled state; system
+resume returns to a fresh Passive owner with the same name/MAC/IFF_UP.
+
+Four native composed power cases cover retained suspend, fresh WPA2/DHCP,
+IPS scan wake and system handoff, absent DMA receipts, and cancellation-driven
+resume. Both system-PM and IPS inventory rows remain open pending acceptance.
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE
@@ -1203,12 +1239,12 @@ runtimes remain separate from the retained RTL8188EE owner.
 | `dynamic_antenna_selection` | Dynamic antenna selection/tracking; blocked on per-antenna signed board measurements (NEPC binds one static factory antenna) |
 | `five_ghz_operation` | 5GHz band operation on RTL8192DE/RTL8821AE; blocked on the rtl8192de/rtl8821ae chip runtimes (RTL8188EE is 2.4GHz-only) |
 | `ht40` | HT40; blocked on a signed NEHT v2 record covering 40MHz emissions (NEHT v1 binds width20) and 40MHz BW programming |
-| `inactive_power_save` | Inactive power save (IPS, inactiveps default on); blocked on operating_reset: IPS powers RF/BB off and re-runs radio configuration on the retained owner |
+| `inactive_power_save` | IPS implemented pending native acceptance: default-on Passive-only watchdog, activity-stamped retained card disable, fresh-owner scan wake and verified IPS/system-sleep handoff |
 | `multi_radio` | Multiple live radios; blocked on per-device owners replacing the singleton controller (interface ACTIVE/CLAIMED and firmware_native MSI SIGNAL statics) |
 | `operating_reset` | Operating reset implemented pending native acceptance: retained generation supervisor, publication-lease drain, verified DMA/IRQ retirement, actual card-disable/enable, current PCI/factory identity and fresh authenticated firmware/LLT/radio/station owner. Old firmware claims stay one-shot; old keys, PNs, packets and cancellation never migrate to the replacement. |
 | `pcie_aspm` | PCIe ASPM link power management; blocked on bus/ PCIe link-control ASPM programming coordinated with the upstream bridge (outside family scope) |
 | `rf_gain_tracking` | RF gain/power tracking; blocked on a thermal-indexed signed gain envelope (thermal power tracking moves gains outside the fixed NEPC/NEHT envelope) |
 | `rts_cts_protection` | RTS/CTS protection; blocked on signed qualification of RTS/CTS-to-self emissions (NEPC/NEHT exclude them) and TXD RTS fields driven by bss use_cts_prot/use_rts |
-| `system_suspend` | System suspend; blocked on operating_reset: resume must re-run card enable, firmware download, LLT and radio/MAC configuration on a fresh owner (no supervisor/rebuild path yet). Suspend itself can reuse Prepared::retire (stop + quiescence) and Device::remove-style interrupt withdrawal; no narf_power::system_pm::register_async_system_pm registration exists for rtlwifi |
+| `system_suspend` | System suspend implemented pending native acceptance: retained async DMA/IRQ/card-disable preparation, parked PCI type-0 save/restore and fresh authenticated firmware/LLT/radio/MAC resume; cancelled PM preparation finishes then requests fresh-owner rollback |
 | `vht` | VHT operation including TX/RX STBC on RTL8821AE; blocked on the rtl8821ae runtime |
 | `wowlan` | WoWLAN magic-packet/pattern wake on RTL8821AE/8812AE; blocked on the rtl8821ae runtime and system_suspend |

@@ -197,15 +197,10 @@ impl PciIo {
         .map_err(|_| Error::Access)?
     }
     fn check_identity(&self) -> Result<(), Error> {
+        self.check_function_identity()?;
         let read = |at| {
             narf_bus::pci::read_config32(&self.cap, &self.device, at).map_err(|_| Error::Access)
         };
-        let id = u32::from(self.device.id.vendor) | (u32::from(self.device.id.device) << 16);
-        let subsystem = u32::from(self.device.id.subsystem_vendor)
-            | (u32::from(self.device.id.subsystem_id) << 16);
-        if read(0)? != id || read(0x2c)? != subsystem {
-            return Err(Error::Gone);
-        }
         let low = read(0x18)?;
         if low & 1 != 0 || low == u32::MAX {
             return Err(Error::Gone);
@@ -219,6 +214,64 @@ impl PciIo {
             return Err(Error::Gone);
         }
         Ok(())
+    }
+    fn check_function_identity(&self) -> Result<(), Error> {
+        let read = |at| {
+            narf_bus::pci::read_config32(&self.cap, &self.device, at).map_err(|_| Error::Access)
+        };
+        let id = u32::from(self.device.id.vendor) | (u32::from(self.device.id.device) << 16);
+        let subsystem = u32::from(self.device.id.subsystem_vendor)
+            | (u32::from(self.device.id.subsystem_id) << 16);
+        if read(0)? != id || read(0x2c)? != subsystem {
+            return Err(Error::Gone);
+        }
+        Ok(())
+    }
+    pub(super) fn suspend_config(&self) -> Result<narf_bus::pci::SavedPciConfig, Error> {
+        if self.quarantined.load(Ordering::Acquire) || self.msi.lock().is_some() {
+            return Err(Error::Gate);
+        }
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            self.check_identity()?;
+            let saved =
+                narf_bus::pci::save_config(&self.cap, &self.device).map_err(|_| Error::Access)?;
+            command_gate(saved.command, false)?;
+            Ok(saved)
+        })
+        .map_err(|_| Error::Access)?
+    }
+    pub(super) fn resume_config(&self, saved: &narf_bus::pci::SavedPciConfig) -> Result<(), Error> {
+        if self.quarantined.load(Ordering::Acquire) || self.msi.lock().is_some() {
+            return Err(Error::Gate);
+        }
+        command_gate(saved.command, false)?;
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            self.check_function_identity()?;
+            // Config decoding may have been lost in S3. Disable DMA and MEM
+            // before restoring BARs; the saved command restores only parked
+            // MEM+INTx-disabled state. Fresh rings enable BME much later.
+            narf_bus::pci::clear_command(
+                &self.cap,
+                &self.device,
+                narf_bus::pci::cmd::BUS_MASTER | narf_bus::pci::cmd::MEM_SPACE,
+            )
+            .map_err(|_| Error::Access)?;
+            let command =
+                narf_bus::pci::read_command(&self.cap, &self.device).map_err(|_| Error::Access)?;
+            if command == u16::MAX
+                || command & (narf_bus::pci::cmd::BUS_MASTER | narf_bus::pci::cmd::MEM_SPACE) != 0
+            {
+                return Err(Error::Gate);
+            }
+            narf_bus::pci::restore_config(&self.cap, &self.device, saved)
+                .map_err(|_| Error::Access)?;
+            command_gate(
+                narf_bus::pci::read_command(&self.cap, &self.device).map_err(|_| Error::Access)?,
+                false,
+            )?;
+            self.check_identity()
+        })
+        .map_err(|_| Error::Access)?
     }
     pub(super) fn verify_factory(&self, expected: &super::efuse::Factory) -> Result<(), Error> {
         self.access(0xcf, 1, || {
