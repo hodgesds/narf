@@ -1603,8 +1603,23 @@ contexts copy opaque saved state, clear their status, enable restore and assign
 their own ring/root/timestamp. The physical service primes between its GGTT
 and PPGTT probes. Cancellation or missing save/synchronization proof retains
 all uncertain backing until GuC plus full-engine reset; it cannot complete the
-priming fence early. Global GT/engine workarounds, user isolation and
-synchronization remain prerequisites for EXECBUFFER2 and Mesa acceptance.
+priming fence early. User isolation and synchronization remain prerequisites
+for EXECBUFFER2 and Mesa acceptance.
+
+Graphics-GT/RCS0 MMIO workarounds now run in `PreparingScheduling` before
+ring publication and the scheduling GuC reload. Linux's GT/engine tables and
+tunings select DG2 G10/G11/G12, Xe-LPG IP and stepping, and Battlemage
+20.01/20.02. Battlemage compression tunings follow the observed flat-CCS
+enable bit, and the EU-stall workaround follows gaps in live DSS groups.
+Non-masked fields use host read/modify/write through live MCR targets; DG2
+implicit SF/SQIDI steering is initialized independently. Masked registers
+preserve unrelated fields. Modern steering semaphore contention yields with
+a deadline, and selector/semaphore ownership is restored on every outcome.
+Readable registers are preflighted before WA writes and verified afterward;
+DG2 CACHE_MODE_SS follows Linux's no-readback exception. Failure closes
+scheduling admission, retaining owned storage until full reset. Media GT,
+other engine classes, out-of-band workarounds, nonprivileged register policy
+and coordinated reset recovery remain separate work.
 
 `intel_gpu_topology::GtTopology` reads main-GT geometry/compute DSS and EU fuses
 after initial quiescence, with two matching samples and current wake checks
@@ -1721,7 +1736,7 @@ acceptance or a claim of complete acceleration.
 
 | Area | Current checkpoint | Still required |
 | --- | --- | --- |
-| GuC execution | Owned GGTT/PPGTT jobs, primed default/golden RCS state and context workarounds on MTL/Arrow, DG2 and BMG | Complete global GT/engine workarounds and isolated user state |
+| GuC execution | Owned GGTT/PPGTT jobs, primed RCS state, graphics-GT/RCS MMIO and context workarounds on MTL/Arrow, DG2 and BMG | Other engines, out-of-band workarounds, coordinated recovery and isolated user state |
 | Render UAPI | Per-open GEM, VM/context namespaces, topology/HWCONFIG and softpin admission | EXECBUFFER2 dispatch, busy/wait/domain synchronization, implicit and explicit fences, context loss/banning and recovery |
 | Engines and platforms | Main-GT DSS/EU discovery and RCS0 kernel scheduling; separate Gen12 foundations | Fused engine/cache/media inventory, compute/copy/media submission and independently sourced profiles for other IP |
 | Memory and presentation | Owned system RAM, private tables and same-card CPU PRIME mappings | Local VRAM, accelerated PRIME/presentation and GPU/KMS synchronization |

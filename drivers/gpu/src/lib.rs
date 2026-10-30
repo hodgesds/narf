@@ -722,6 +722,8 @@ pub mod intel_gpu_gt;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gt_hw;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_gt_registers;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_gt_runtime;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gtt;

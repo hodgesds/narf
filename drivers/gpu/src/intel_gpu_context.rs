@@ -23,10 +23,13 @@ pub enum ContextError {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ContextSeed {
     platform: GtPlatform,
-    dss: u32,
-    l3: u32,
+    pub(crate) dss: u32,
+    pub(crate) l3: u32,
     disable_wmtp: bool,
-    graphics: u16,
+    pub(crate) graphics: u16,
+    pub(crate) step: u8,
+    pub(crate) mslice: u8,
+    pub(crate) per_group: u8,
 }
 
 impl ContextSeed {
@@ -40,8 +43,8 @@ impl ContextSeed {
         if topology.platform() != platform || !topology.has_render() {
             return Err(ContextError::Topology);
         }
-        let graphics = if platform == GtPlatform::Alchemist {
-            1255
+        let (graphics, step) = if platform == GtPlatform::Alchemist {
+            (1255, 0)
         } else {
             let a = mmio.read32(0xd8c);
             let b = mmio.read32(0xd8c);
@@ -59,7 +62,7 @@ impl ContextSeed {
             if !supported {
                 return Err(ContextError::Unsupported);
             }
-            version as u16
+            (version as u16, (a & 63) as u8)
         };
         let slices = config.lookup_u32(1).map_err(|_| ContextError::Hwconfig)?;
         let subs = config.lookup_u32(70).map_err(|_| ContextError::Hwconfig)?;
@@ -103,6 +106,9 @@ impl ContextSeed {
             l3,
             disable_wmtp: a[0] & (1 << 20) != 0,
             graphics,
+            step,
+            mslice: (a[1] & 15).trailing_zeros() as u8,
+            per_group: per_group as u8,
         })
     }
 

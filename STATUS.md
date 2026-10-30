@@ -1119,6 +1119,24 @@ precede it, preventing a previous batch from contaminating the saved template.
 Global GT/engine workarounds, user isolation/synchronization and physical
 acceptance remain open; acceleration and autonomous engine reset stay gated.
 
+The follow-up now applies Linux-derived graphics-GT and RCS0 MMIO workarounds
+and tunings before publishing the ring and reloading scheduling firmware.
+Selection distinguishes DG2 dies, Xe-LPG IP/stepping and Battlemage 20.01/20.02,
+including flat-CCS enable and sparse DSS groups. Reads use live steering
+targets and writes preserve unrelated bits. A firmware-owned steering
+semaphore yields until its deadline, and failure retains the owned graph
+through full reset. Native register vectors and hardware conversations cover
+selection, steering, contention, failed reads/readback and cancellation.
+Media/additional engines, out-of-band workarounds, nonprivileged register
+policy, isolated user execution and hardware/Mesa acceptance remain open.
+The ten new native smokes across context priming and register initialization
+pass in the final Intel/DRM selections: 526 tests on x86_64 and 353 on aarch64,
+with zero failures/skips. GPU CI Clippy passes all three resolved contexts on
+both architectures; host default/Intel-only/AMD-only/no-vendor all-target
+Clippy, Intel-only debug builds and formatting pass. Both architectures also
+pass production boot and both btrfs interoperability postflights. These are
+register/DMA models and QEMU checks, not physical Intel or Mesa acceptance.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

@@ -248,7 +248,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
     /// global/transport/context/ring state and completion evidence untouched.
     /// No CPU, userspace mapping or peer may modify any leaf until the fence
     /// completes or full-engine reset is proven. This does not grant isolated
-    /// user 3D execution; engine workarounds and user isolation remain gated.
+    /// user 3D execution; isolated user state and coordinated recovery remain gated.
     pub(crate) unsafe fn submit_resident(
         &mut self,
         now: u64,

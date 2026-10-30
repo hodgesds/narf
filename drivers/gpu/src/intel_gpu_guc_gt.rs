@@ -8,6 +8,7 @@
 
 use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_gt_hw::{HardwareError, HardwareInit};
+use crate::intel_gpu_gt_registers::{RegisterError, RegisterInit};
 use crate::intel_gpu_guc::GuCMessage;
 use crate::intel_gpu_guc_boot::{BootAllocator, BootConfig, BootError, BootState, GuCBoot};
 use crate::intel_gpu_guc_firmware::GuCFirmware;
@@ -33,6 +34,7 @@ pub enum GtState {
     CopyingHwconfig,
     EnablingCt,
     CtReady,
+    PreparingScheduling,
     StartingScheduling,
     SchedulingReady,
     Recovering,
@@ -56,6 +58,7 @@ pub enum GtError {
     Transport(TransportError),
     Poisoned,
     Hardware(HardwareError),
+    Registers(RegisterError),
     Scheduling(SchedulingError),
     Topology(TopologyError),
 }
@@ -78,6 +81,7 @@ pub struct GuCGt<M: MmioWindow, A: BootAllocator> {
     requested: bool,
     released: bool,
     hardware: Option<HardwareInit>,
+    registers: Option<RegisterInit>,
 }
 
 impl<M: MmioWindow, A: BootAllocator> core::fmt::Debug for GuCGt<M, A> {
@@ -142,6 +146,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             requested: false,
             released: false,
             hardware: None,
+            registers: None,
         }
     }
 
@@ -375,20 +380,19 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         if !self.topology().is_some_and(GtTopology::has_render) {
             return Err(GtError::Topology(TopologyError::NoRender));
         }
+        let registers = RegisterInit::new(
+            self.parts.boot.window(),
+            self.parts.boot.platform(),
+            self.parts.boot.device_id(),
+            self.topology().ok_or(GtError::State)?,
+            self.hwconfig().ok_or(GtError::State)?,
+            now,
+        )
+        .map_err(GtError::Registers)?;
         let scheduler = self.parts.boot.scheduler().map_err(GtError::Boot)?;
         self.parts.scheduler = Some(scheduler);
-        self.state = GtState::Lost;
-        let parts = &mut *self.parts;
-        let scheduler = parts.scheduler.as_mut().expect("owned scheduler");
-        scheduler
-            .enable_engine(parts.boot.window())
-            .map_err(GtError::Scheduling)?;
-        let ads = scheduler.ads();
-        self.parts
-            .boot
-            .begin_scheduling(ads, now)
-            .map_err(GtError::Boot)?;
-        self.state = GtState::StartingScheduling;
+        self.registers = Some(registers);
+        self.state = GtState::PreparingScheduling;
         Ok(())
     }
 
@@ -622,6 +626,31 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         self.awake()?;
         match self.state {
+            GtState::PreparingScheduling => {
+                match self
+                    .registers
+                    .as_ref()
+                    .expect("owned register initialization")
+                    .poll(self.parts.boot.window(), now)
+                {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result.map_err(GtError::Registers)?,
+                }
+                self.awake()?;
+                self.registers = None;
+                let parts = &mut *self.parts;
+                let scheduler = parts.scheduler.as_mut().expect("owned scheduler");
+                scheduler
+                    .enable_engine(parts.boot.window())
+                    .map_err(GtError::Scheduling)?;
+                let ads = scheduler.ads();
+                parts
+                    .boot
+                    .begin_scheduling(ads, now)
+                    .map_err(GtError::Boot)?;
+                self.state = GtState::StartingScheduling;
+                return Poll::Pending;
+            }
             GtState::PreparingHardware | GtState::RecoveringRender => {
                 let policy = match self
                     .hardware

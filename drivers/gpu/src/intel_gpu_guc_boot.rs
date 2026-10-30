@@ -357,6 +357,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         self.platform
     }
 
+    pub(crate) fn device_id(&self) -> u16 {
+        self.config.device_id
+    }
+
     pub(crate) fn configure_cache(
         &mut self,
         policy: crate::intel_gpu_gt_hw::CachePolicy,
@@ -833,7 +837,8 @@ mod tests {
             let actual = match offset {
                 0xd8c => *device.regs.get(&offset).unwrap_or(&0), // read-only GMD_ID
                 0xc050 | 0xc340 if !device.reject_wopcm => value | 1,
-                0xc314 | 0xa188 | 0xa278 => {
+                0xc314 | 0xa188 | 0xa278 | 0x20ec | 0x83b4 | 0xe48c | 0xe18c | 0xe4f4 | 0xe5f0
+                | 0xe420 | 0xe49c | 0xe4f0 | 0x20d4 | 0xe194 | 0xe4c4 | 0xe5f4 | 0x2050 => {
                     let mask = value >> 16;
                     let old = *device.regs.get(&offset).unwrap_or(&0);
                     if value == 0x00110011 {

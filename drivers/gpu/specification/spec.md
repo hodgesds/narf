@@ -363,7 +363,20 @@ deadlines and async timer/yield progression.
 `GuCGt::begin_scheduling` requires awake authenticated Ready, validated HWCONFIG,
 observed nonempty geometry DSS, supported submission ABI and no CT. A compute-only
 GT cannot authorize RCS0 programming or allocation. It allocates owned HWS and golden-LRC
-storage, enables RCS0 under both wake holds, then stops GuC before rewriting
+storage, enters `PreparingScheduling`, and applies graphics-GT/RCS0 MMIO
+workarounds and tunings before enabling the ring. `intel_gpu_gt_registers`
+selects exact DG2 G10/G11/G12 IDs, Xe-LPG 12.70/12.71/12.74 with pre-B0
+differences, and Battlemage 20.01/20.02 with flat-CCS and DSS-group fuse rules.
+Ordinary registers preserve unrelated bits; masked writes use hardware masks.
+Reads target live DSS/L3/MSLICE instances, DG2 implicit targets, or the
+source-defined modern instance zero. Modern firmware steering contention
+yields with a deadline; every acquired semaphore is released and the selector
+restored on success or error. Preflight refuses unavailable registers before
+WA writes; readback failures close admission and retain owned storage through
+full reset. DG2 CACHE_MODE_SS is not read back (Wa_14012342262).
+This covers the graphics GT and admitted RCS0; media and additional engine
+classes require their own tables before admission. The owner then enables
+RCS0 under both wake holds and stops GuC before rewriting
 ADS. The reload enables only RCS0, installs engine mapping, HWS/register saves
 and source-defined context sizes, selects LiteRestore and disables autonomous
 engine resets until coordinated recovery is implemented. Firmware is then uploaded
@@ -401,7 +414,7 @@ ID, completion fence and read-only `PpgttProbeResult`; `verify()` checks the
 entire result and unchanged code pages after successful completion. Physical
 startup requires the original GGTT probe, context priming below, and this PPGTT
 probe to retire and validate before logging readiness. User EXECBUFFER2 remains
-unavailable pending global GT/engine workarounds, isolation and synchronization.
+unavailable pending remaining engine workarounds, isolation and synchronization.
 
 `GuCGt::begin_context_defaults(now)` requires an awake SchedulingReady GT with
 no pending contexts, no prior resident work and no existing default image.

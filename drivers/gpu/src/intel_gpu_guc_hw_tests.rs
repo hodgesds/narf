@@ -242,6 +242,8 @@ kernel_test_in!(
 
 fn hardware_scheduling(gt: &mut GuCGt<Window, Arena>, w: &Window) {
     gt.begin_scheduling(12).unwrap();
+    assert_eq!(gt.state(), GtState::PreparingScheduling);
+    assert!(gt.poll(12).is_pending());
     assert_eq!(gt.state(), GtState::StartingScheduling);
     assert!(gt.poll(13).is_pending());
     reset_done(w);
@@ -260,6 +262,61 @@ fn hardware_scheduling(gt: &mut GuCGt<Window, Arena>, w: &Window) {
     w.0.borrow_mut().regs.insert(0x190240, 0xf0000000);
     assert_eq!(gt.poll(25), Poll::Ready(Ok(GtState::SchedulingReady)));
 }
+
+fn smoke_hardware_register_initialization_gates_scheduling() -> TestResult {
+    use crate::intel_gpu_gt_registers::RegisterError;
+    for failure in 0..4 {
+        let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+        hardware_discovery(&mut gt, &w, 0xdfc);
+        let before = arena.live_allocations();
+        if failure == 0 {
+            w.0.borrow_mut().regs.insert(0xd8c, (20 << 22) | (4 << 14));
+            assert!(matches!(
+                gt.begin_scheduling(12),
+                Err(GtError::Registers(_))
+            ));
+            assert_eq!(gt.state(), GtState::Ready);
+            assert_eq!(arena.live_allocations(), before);
+        } else {
+            gt.begin_scheduling(12).unwrap();
+            let count = arena.live_allocations();
+            assert_eq!(count, before + 2);
+            if failure == 1 {
+                w.0.borrow_mut().regs.insert(0xe7cc, u32::MAX);
+                assert_eq!(
+                    gt.poll(13),
+                    Poll::Ready(Err(GtError::Registers(RegisterError::Unavailable)))
+                );
+                assert_eq!(gt.state(), GtState::Lost);
+                assert_eq!(w.0.borrow().regs[&0xfd0], 1);
+                assert!(!w.0.borrow().writes.iter().any(|p| p.0 == 0xb0c8));
+            } else {
+                w.0.borrow_mut().regs.insert(0xfd0, 0);
+                for now in 13..17 {
+                    assert!(gt.poll(now).is_pending());
+                }
+                assert_eq!(gt.state(), GtState::PreparingScheduling);
+                if failure == 2 {
+                    assert_eq!(
+                        gt.poll(50_000_012),
+                        Poll::Ready(Err(GtError::Registers(RegisterError::Timeout)))
+                    );
+                    assert_eq!(gt.state(), GtState::Lost);
+                }
+            }
+            assert_eq!(arena.live_allocations(), count);
+        }
+        assert!(!w.0.borrow().writes.iter().any(|p| p.0 == 0x2080));
+        hardware_stop(&mut gt, &w, 0xdfc);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_register_initialization_gates_scheduling
+);
 
 fn hardware_stop(gt: &mut GuCGt<Window, Arena>, w: &Window, ack: u64) {
     gt.begin_stop(10_000_000_000).unwrap();
