@@ -411,6 +411,59 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             .map_err(GtError::Scheduling)
     }
 
+    /// Seed and save a default RCS0 context, force a different context to run,
+    /// then publish the retired image. No external submission is admitted while
+    /// the returned fence is pending. Dropping its waiter never cancels DMA.
+    /// The owner must keep driving `poll`; the fence does not drive the GT.
+    pub fn begin_context_defaults(
+        &mut self,
+        now: u64,
+    ) -> Result<Arc<crate::intel_gpu_fence::CompletionFence>, GtError> {
+        if self.state != GtState::SchedulingReady {
+            return Err(GtError::State);
+        }
+        if let Err(error) = self.awake() {
+            self.state = GtState::Lost;
+            return Err(error);
+        }
+        if !self
+            .parts
+            .scheduler
+            .as_ref()
+            .expect("owned scheduler")
+            .can_prime()
+        {
+            return Err(GtError::Busy);
+        }
+        let seed = crate::intel_gpu_context::ContextSeed::read(
+            self.parts.boot.window(),
+            self.parts.boot.platform(),
+            self.topology().ok_or(GtError::State)?,
+            self.hwconfig().ok_or(GtError::State)?,
+        )
+        .map_err(|error| GtError::Scheduling(SchedulingError::Defaults(error)))?;
+        // Revalidate current authority and both wake holds after fuse reads.
+        if let Err(error) = self.awake() {
+            self.state = GtState::Lost;
+            return Err(error);
+        }
+        self.parts
+            .scheduler
+            .as_mut()
+            .expect("owned scheduler")
+            .begin_defaults(seed, now)
+            .map_err(GtError::Scheduling)
+    }
+
+    pub fn context_defaults_ready(&self) -> bool {
+        self.state == GtState::SchedulingReady
+            && self
+                .parts
+                .scheduler
+                .as_ref()
+                .is_some_and(GuCScheduler::defaults_ready)
+    }
+
     /// Queue a trusted kernel PPGTT batch, retaining its tables and every BO
     /// through verified retirement or full-engine reset.
     ///

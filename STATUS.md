@@ -1103,6 +1103,22 @@ builds, formatting, both production boots and both btrfs checks per architecture
 pass. The upstream USB Result fix is retained; its routing smoke now checks
 detach success instead of ignoring the returned Result.
 
+The same Intel branch now primes and captures default RCS state before the
+physical service's PPGTT probe. The context workaround/tuning stream covers
+DG2, Xe-LPG 12.70/12.71/12.74 and separate Battlemage 20.01/20.02 selections.
+Stable GMD/fuse observations and observed DSS/HWCONFIG layout select live MCR
+targets; GPU read/modify/write preserves non-masked fields, and scratch state
+is cleared. DG2 explicitly seeds all fifty SVG headers to avoid inherited
+state through missing restore instructions. An exclusive two-context sequence
+fully retires the seed, retains its image through a forced switch, then
+synchronizes and copies the saved body into the golden template. New contexts
+restore it with fresh status, ring and root identity. Cancellation, bad save
+evidence and failed synchronization retain uncertain backing until full reset.
+Priming refuses prior resident kernel work; only the fixed GGTT diagnostic may
+precede it, preventing a previous batch from contaminating the saved template.
+Global GT/engine workarounds, user isolation/synchronization and physical
+acceptance remain open; acceleration and autonomous engine reset stay gated.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

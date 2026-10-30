@@ -1546,7 +1546,7 @@ resources without an unbounded reset retry.
 Scheduling requires CSS submission-interface major 1 (byte 68), separately from
 the firmware release. After HWCONFIG, the owner stops GuC, updates ADS for RCS0,
 reloads/authenticates with LiteRestore, and enables coherent CT. Autonomous
-engine reset is disabled while the golden image is unprimed. The scheduler
+engine reset remains disabled pending coordinated recovery. The scheduler
 owns HWS plus a distinct LRC and 8-KiB ring for each of at most 64 kernel probe
 contexts. MTL/DG2 use 14-page LRCs, BMG four pages, with Xe register-state groups.
 The original safe submission entry admits a fixed owned GGTT breadcrumb.
@@ -1584,8 +1584,27 @@ every guard byte and the unchanged code page. Startup runs this after the
 original GGTT probe before reporting readiness. Native Rust models walk the
 real production tables, check literal command/PAT vectors, execute the store
 through translated physical pages and verify retirement/reset ownership.
-Golden/default 3D state, engine workarounds and isolated userspace scheduling
-remain prerequisites for EXECBUFFER2 and Mesa acceptance.
+The RCS default-context priming path now selects Linux's context workaround
+and tuning tables using stable GMD ID and fuse observations: Xe-LPG
+12.70/12.71/12.74 and Xe2 HPG 20.01/20.02 remain distinct. Non-masked registers
+use GPU MI_MATH read/modify/write through a non-terminated MCR instance;
+HWCONFIG physical maxima select the DSS layout, while observed L3 fuses select
+the cache bank. Temporary GPRs and CS selective-read steering are reset after
+use. DG2 explicitly seeds all fifty SVG command headers (Wa_14019789679).
+
+`begin_context_defaults` owns an exclusive seed → complete retirement →
+different-context execution/retirement → CPU synchronization → golden copy →
+device synchronization transaction. The seed image stays owned through the
+switch; submission is Busy while the priming fence is pending. Priming is
+refused after any resident kernel batch has been accepted, so its state cannot
+contaminate the template. The fixed GGTT diagnostic may precede priming. Only the
+successfully published template makes `context_defaults_ready()` true. New
+contexts copy opaque saved state, clear their status, enable restore and assign
+their own ring/root/timestamp. The physical service primes between its GGTT
+and PPGTT probes. Cancellation or missing save/synchronization proof retains
+all uncertain backing until GuC plus full-engine reset; it cannot complete the
+priming fence early. Global GT/engine workarounds, user isolation and
+synchronization remain prerequisites for EXECBUFFER2 and Mesa acceptance.
 
 `intel_gpu_topology::GtTopology` reads main-GT geometry/compute DSS and EU fuses
 after initial quiescence, with two matching samples and current wake checks
@@ -1681,11 +1700,13 @@ checkout at `b90c984d615e8ce2af96f5b1411a962d83fed2ad`: MIT-licensed
 `include/drm/intel/pciids.h`, `drivers/gpu/drm/xe/{xe_uc_fw.c,xe_guc.c,xe_wopcm.c,
 xe_guc_ads.c,xe_guc_fwif.h,xe_guc_tlb_inval.c,xe_ggtt.c,xe_force_wake.c,
 xe_guc_hwconfig.c,xe_mocs.c,xe_pat.c,xe_gt_mcr.c,xe_bo.c,xe_lrc.c,
-xe_hw_engine.c,xe_guc_submit.c,xe_gt_topology.c,xe_vm.c,xe_ring_ops.c}`,
+xe_hw_engine.c,xe_guc_submit.c,xe_gt_topology.c,xe_vm.c,xe_ring_ops.c,
+xe_gt.c,xe_wa.c,xe_tuning.c}`,
 `drivers/gpu/drm/i915/gt/{uc/intel_guc_hwconfig.c,intel_sseu.c}`,
 `drivers/gpu/drm/i915/i915_query.c`, `include/uapi/drm/i915_drm.h` and
 `drivers/gpu/drm/xe/regs/{xe_guc_regs.h,xe_gt_regs.h,xe_irq_regs.h,xe_lrc_layout.h}`,
-`drivers/gpu/drm/xe/instructions/{xe_mi_commands.h,xe_gpu_commands.h}` and the
+`drivers/gpu/drm/xe/instructions/{xe_mi_commands.h,xe_gpu_commands.h,
+xe_alu_commands.h,xe_gfxpipe_commands.h}` and the
 GuC actions/KLV/CSS ABI headers. Native Rust models pin register/ADS values,
 reset/DMA/full-engine stop proofs, cache-policy publication, current authority,
 two-context execution, 64-context pressure/CT backpressure, context retirement,
@@ -1700,7 +1721,7 @@ acceptance or a claim of complete acceleration.
 
 | Area | Current checkpoint | Still required |
 | --- | --- | --- |
-| GuC execution | Owned RCS0 GGTT and private PPGTT kernel jobs on MTL/Arrow, DG2 and BMG | Primed default/golden contexts, complete GT/engine/context workarounds and isolated user state |
+| GuC execution | Owned GGTT/PPGTT jobs, primed default/golden RCS state and context workarounds on MTL/Arrow, DG2 and BMG | Complete global GT/engine workarounds and isolated user state |
 | Render UAPI | Per-open GEM, VM/context namespaces, topology/HWCONFIG and softpin admission | EXECBUFFER2 dispatch, busy/wait/domain synchronization, implicit and explicit fences, context loss/banning and recovery |
 | Engines and platforms | Main-GT DSS/EU discovery and RCS0 kernel scheduling; separate Gen12 foundations | Fused engine/cache/media inventory, compute/copy/media submission and independently sourced profiles for other IP |
 | Memory and presentation | Owned system RAM, private tables and same-card CPU PRIME mappings | Local VRAM, accelerated PRIME/presentation and GPU/KMS synchronization |

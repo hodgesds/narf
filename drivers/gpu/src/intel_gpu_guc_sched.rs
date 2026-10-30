@@ -7,6 +7,7 @@
 
 use crate::{
     intel_gpu_aux::MmioWindow,
+    intel_gpu_context::{ContextError, ContextSeed},
     intel_gpu_exec::ResidentBatch,
     intel_gpu_fence::{CompletionFence, JobError},
     intel_gpu_gt::GtPlatform,
@@ -29,11 +30,13 @@ const MAX_CONTEXTS: usize = 64;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SchedulingError {
     State,
+    Busy,
     Full,
     Allocation(SubmitError),
     Address,
     Cache,
     Residency(narf_filesystem::FsError),
+    Defaults(ContextError),
     Protocol,
     Timeout,
     Transport(TransportError),
@@ -63,6 +66,14 @@ enum Phase {
     RetireInvalidating,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Defaults {
+    Empty,
+    Seed(u16),
+    Switch(u16),
+    Ready,
+}
+
 struct Context<B: GpuBacking> {
     id: u16,
     image: B,
@@ -79,6 +90,8 @@ struct Resources<A: BootAllocator> {
     hwsp: A::Backing,
     golden: A::Backing,
     contexts: Vec<Context<A::Backing>>,
+    seed_image: Option<A::Backing>,
+    defaults_completion: Option<Arc<CompletionFence>>,
 }
 
 pub(crate) struct GuCScheduler<A: BootAllocator> {
@@ -88,6 +101,8 @@ pub(crate) struct GuCScheduler<A: BootAllocator> {
     published: bool,
     lost: bool,
     released: bool,
+    defaults: Defaults,
+    pristine: bool,
 }
 
 impl<A: BootAllocator> GuCScheduler<A> {
@@ -112,7 +127,11 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 return Err(SchedulingError::Allocation(e));
             }
         };
-        if !valid(&golden) || !golden.coherent_for_device() || overlap(&hwsp, &golden) {
+        if !valid(&golden)
+            || golden.size_pages() != pages
+            || !golden.coherent_for_device()
+            || overlap(&hwsp, &golden)
+        {
             allocator.free(golden);
             allocator.free(hwsp);
             return Err(SchedulingError::Address);
@@ -131,12 +150,16 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 hwsp,
                 golden,
                 contexts: Vec::new(),
+                seed_image: None,
+                defaults_completion: None,
             }),
             platform,
             next_id: 1,
             published: false,
             lost: false,
             released: false,
+            defaults: Defaults::Empty,
+            pristine: true,
         })
     }
 
@@ -178,7 +201,45 @@ impl<A: BootAllocator> GuCScheduler<A> {
         &mut self,
         now: u64,
     ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
-        self.submit(now, None)
+        self.admit()?;
+        self.submit(now, None, None)
+    }
+
+    fn admit(&self) -> Result<(), SchedulingError> {
+        if matches!(self.defaults, Defaults::Seed(_) | Defaults::Switch(_)) {
+            return Err(SchedulingError::Busy);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn defaults_ready(&self) -> bool {
+        self.defaults == Defaults::Ready && !self.lost
+    }
+
+    pub(crate) fn can_prime(&self) -> bool {
+        self.published
+            && !self.lost
+            && self.pristine
+            && self.defaults == Defaults::Empty
+            && self.resources.contexts.is_empty()
+    }
+
+    pub(crate) fn begin_defaults(
+        &mut self,
+        seed: ContextSeed,
+        now: u64,
+    ) -> Result<Arc<CompletionFence>, SchedulingError> {
+        if !self.can_prime() {
+            return Err(SchedulingError::Busy);
+        }
+        if self.next_id >= 65534 {
+            return Err(SchedulingError::Full);
+        }
+        let (id, _) = self.submit(now, None, Some(seed.commands()))?;
+        let completion = Arc::new(CompletionFence::new());
+        self.resources.defaults_completion = Some(completion.clone());
+        self.defaults = Defaults::Seed(id);
+        Ok(completion)
     }
 
     /// # Safety
@@ -187,22 +248,24 @@ impl<A: BootAllocator> GuCScheduler<A> {
     /// global/transport/context/ring state and completion evidence untouched.
     /// No CPU, userspace mapping or peer may modify any leaf until the fence
     /// completes or full-engine reset is proven. This does not grant isolated
-    /// user 3D execution; default LRC state and engine workarounds are pending.
+    /// user 3D execution; engine workarounds and user isolation remain gated.
     pub(crate) unsafe fn submit_resident(
         &mut self,
         now: u64,
         batch: ResidentBatch,
     ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
+        self.admit()?;
         if batch.platform() != Some(self.platform) {
             return Err(SchedulingError::Address);
         }
-        self.submit(now, Some(batch))
+        self.submit(now, Some(batch), None)
     }
 
     fn submit(
         &mut self,
         now: u64,
         resident: Option<ResidentBatch>,
+        prefix: Option<Vec<u32>>,
     ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
         if !self.published || self.lost {
             return Err(SchedulingError::State);
@@ -238,6 +301,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
             || !image.coherent_for_device()
             || !ring.coherent_for_device()
             || overlap(&image, &ring)
+            || r.seed_image
+                .as_ref()
+                .is_some_and(|old| overlap(old, &image) || overlap(old, &ring))
             || [&r.hwsp, &r.golden]
                 .into_iter()
                 .any(|old| overlap(old, &image) || overlap(old, &ring))
@@ -254,8 +320,33 @@ impl<A: BootAllocator> GuCScheduler<A> {
         image.zero_fill();
         ring.zero_fill();
         let id = self.next_id as u16;
-        context_image(&image, self.platform, ring.ggtt_offset());
-        let words: Vec<u32> = if let Some(batch) = &resident {
+        if self.defaults == Defaults::Ready {
+            for off in (REGS..u64::from(pages) * 4096).step_by(4) {
+                image.write32(off, r.golden.read32(off));
+            }
+            image.write32(REGS + 3 * 4, 0x00090008);
+            image.write32(REGS + 5 * 4, 0);
+            image.write32(REGS + 9 * 4, ring.ggtt_offset());
+            image.write32(REGS + 11 * 4, 0x1001);
+            image.write32(REGS + 0x23 * 4, 0);
+            for slot in (0x25..=0x33).step_by(2) {
+                image.write32(REGS + slot * 4, 0);
+            }
+        } else {
+            context_image(&image, self.platform, ring.ggtt_offset());
+        }
+        let mutating = resident.is_some() || prefix.is_some();
+        let mut words: Vec<u32> = if let Some(prefix) = prefix {
+            let mut words = alloc::vec![0x04000001];
+            words.extend_from_slice(&prefix);
+            render_completion(
+                self.platform,
+                image.ggtt_offset(),
+                u32::from(id),
+                &mut words,
+            );
+            words
+        } else if let Some(batch) = &resident {
             let root = batch.space().root_descriptor();
             // xe_lrc.c::xe_lrc_set_ppgtt: PDP0 on DG2/MTL, PTBP on Xe2.
             image.write32(REGS + 0x31 * 4, (root >> 32) as u32);
@@ -278,6 +369,14 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 0,
             ]
         };
+        if words.len() % 2 != 0 {
+            words.push(0);
+        }
+        if words.len() > ring.size_pages() as usize * 1024 {
+            r.allocator.free(ring);
+            r.allocator.free(image);
+            return Err(SchedulingError::Full);
+        }
         let tail = words.len() as u32 * 4;
         for (i, word) in words.into_iter().enumerate() {
             ring.write32(i as u64 * 4, word);
@@ -304,6 +403,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
             resident,
             tail,
         });
+        if mutating {
+            self.pristine = false;
+        }
         self.next_id += 1;
         Ok((id, completion))
     }
@@ -334,6 +436,10 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 break;
             };
             self.event(message)?;
+        }
+        if matches!(self.defaults, Defaults::Seed(_)) && self.resources.seed_image.is_some() {
+            let (id, _) = self.submit(now, None, None)?;
+            self.defaults = Defaults::Switch(id);
         }
         for context in &mut self.resources.contexts {
             if now >= context.deadline {
@@ -437,11 +543,18 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 let c = self.resources.contexts.remove(index);
                 let r = &mut *self.resources;
                 r.allocator.free(c.ring);
-                r.allocator.free(c.image);
+                if self.defaults == Defaults::Seed(c.id) {
+                    r.seed_image = Some(c.image);
+                } else {
+                    r.allocator.free(c.image);
+                }
                 // Drop all PPGTT tables and BO references before terminal
                 // publication. Deregistration and the final TLB ACK are proven.
                 drop(c.resident);
                 c.fence.signal(Ok(()));
+                if self.defaults == Defaults::Switch(c.id) {
+                    self.capture_defaults()?;
+                }
             }
             (0x1002, Phase::Enabling, Some(1)) => c.phase = Phase::Running,
             (0x1002, Phase::Disabling, Some(0)) => c.phase = Phase::Deregister,
@@ -456,6 +569,41 @@ impl<A: BootAllocator> GuCScheduler<A> {
             }
             _ => return Err(SchedulingError::Protocol),
         }
+        Ok(())
+    }
+
+    fn capture_defaults(&mut self) -> Result<(), SchedulingError> {
+        let r = &mut *self.resources;
+        let image = r.seed_image.as_ref().ok_or(SchedulingError::State)?;
+        r.allocator
+            .sync_for_cpu(image)
+            .map_err(|_| SchedulingError::Cache)?;
+        // The seed was fully retired, then a different context executed and
+        // retired. The image cannot still be resident in the engine.
+        if image.read32(REGS + 4) != 0x1108101d
+            || image.read32(REGS + 0x33 * 4) != 0
+            || image.read32(REGS + 0x31 * 4) != 0
+        {
+            return Err(SchedulingError::Protocol);
+        }
+        r.golden.zero_fill();
+        for off in (REGS..u64::from(image.size_pages()) * 4096).step_by(4) {
+            r.golden.write32(off, image.read32(off));
+        }
+        r.golden.write32(REGS + 3 * 4, 0x00090008);
+        for slot in [5, 7, 9, 0x23] {
+            r.golden.write32(REGS + slot * 4, 0);
+        }
+        r.allocator
+            .sync_for_device(&r.golden)
+            .map_err(|_| SchedulingError::Cache)?;
+        self.defaults = Defaults::Ready;
+        r.allocator
+            .free(r.seed_image.take().expect("owned retired seed"));
+        r.defaults_completion
+            .as_ref()
+            .expect("owned priming fence")
+            .signal(Ok(()));
         Ok(())
     }
 
@@ -480,8 +628,14 @@ impl<A: BootAllocator> GuCScheduler<A> {
             drop(c.resident);
             c.fence.signal(Err(JobError::Reset));
         }
+        if let Some(image) = r.seed_image.take() {
+            r.allocator.free(image);
+        }
         r.allocator.free(r.golden);
         r.allocator.free(r.hwsp);
+        if let Some(completion) = r.defaults_completion {
+            completion.signal(Err(JobError::Reset));
+        }
     }
 }
 
@@ -521,6 +675,11 @@ fn resident_ring(platform: GtPlatform, batch: u64, image: u32, seq: u32) -> Vec<
         (batch >> 32) as u32,
         0x04000000,
     ]);
+    render_completion(platform, image, seq, &mut words);
+    words
+}
+
+fn render_completion(platform: GtPlatform, image: u32, seq: u32, words: &mut Vec<u32>) {
     if platform == GtPlatform::Alchemist {
         words.extend_from_slice(&[0x7a000004, 1, 0xd0, 0, 0, 0]);
     }
@@ -544,7 +703,6 @@ fn resident_ring(platform: GtPlatform, batch: u64, image: u32, seq: u32) -> Vec<
     if words.len() % 2 != 0 {
         words.push(0);
     }
-    words
 }
 
 fn context_image(image: &impl GpuBacking, platform: GtPlatform, ring: u32) {

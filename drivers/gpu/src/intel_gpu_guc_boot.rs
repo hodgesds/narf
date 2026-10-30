@@ -831,6 +831,7 @@ mod tests {
             let mut device = self.0.borrow_mut();
             device.writes.push((offset, value));
             let actual = match offset {
+                0xd8c => *device.regs.get(&offset).unwrap_or(&0), // read-only GMD_ID
                 0xc050 | 0xc340 if !device.reject_wopcm => value | 1,
                 0xc314 | 0xa188 | 0xa278 => {
                     let mask = value >> 16;

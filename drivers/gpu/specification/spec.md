@@ -366,7 +366,7 @@ GT cannot authorize RCS0 programming or allocation. It allocates owned HWS and g
 storage, enables RCS0 under both wake holds, then stops GuC before rewriting
 ADS. The reload enables only RCS0, installs engine mapping, HWS/register saves
 and source-defined context sizes, selects LiteRestore and disables autonomous
-engine resets because the golden image is not primed. Firmware is then uploaded
+engine resets until coordinated recovery is implemented. Firmware is then uploaded
 and authenticated again; ADS is never rewritten while live. GuC GGTT TLB
 invalidation precedes CT registration. `SchedulingReady` gives the scheduler
 exclusive CT receive ownership; raw `send`/`receive` remain limited to CtReady.
@@ -399,9 +399,37 @@ fixed store batch with private, unexported read-only code and writable result
 BOs at separate 48-bit GPU addresses. `PpgttProbeSubmission` returns its context
 ID, completion fence and read-only `PpgttProbeResult`; `verify()` checks the
 entire result and unchanged code pages after successful completion. Physical
-startup requires both the original GGTT probe and this PPGTT probe to retire
-and validate before logging readiness. User EXECBUFFER2 remains unavailable
-pending default LRC state, workarounds, isolation and synchronization.
+startup requires the original GGTT probe, context priming below, and this PPGTT
+probe to retire and validate before logging readiness. User EXECBUFFER2 remains
+unavailable pending global GT/engine workarounds, isolation and synchronization.
+
+`GuCGt::begin_context_defaults(now)` requires an awake SchedulingReady GT with
+no pending contexts, no prior resident work and no existing default image.
+Only the fixed GGTT probe can precede priming on a fresh GT. It returns an owned fence;
+the caller/worker must continue `poll` until that fence completes. During
+priming, external submission returns Busy. `intel_gpu_context` selects the
+source-defined RCS context workarounds and tunings for DG2, Xe-LPG graphics
+12.70/12.71/12.74 and Battlemage 20.01/20.02. Modern GMD ID, L3 and preemption
+fuses require matching available samples. DSS steering uses observed live
+units and HWCONFIG layout maxima (the source's four-DSS fallback for absent
+maxima); L3 steering selects a live bank. Masked writes preserve unrelated
+bits; non-masked tuning uses steered GPU MI_MATH read/modify/write and clears
+its GPRs and selective-read selector afterward. DG2's Wa_14019789679 explicitly
+seeds all fifty SVG commands with zero payloads to prevent omitted restore
+headers. This table covers context state, not global GT/engine initialization.
+
+The priming scheduler fully retires the seed context while retaining its
+image, then executes and fully retires a different context to force a save.
+Only afterward does it synchronize the seed image for CPU access, copy the
+opaque device-saved body into the owned golden image, clear status/ring/root
+identity, and synchronize the template for GPU reads. Successful publication
+sets `context_defaults_ready()` and signals the fence; cancellation releases
+only waiters. New contexts copy this body, enable restoration, clear status
+and assign their own ring, timestamp and PDP0/PTBP. Malformed save evidence,
+allocation/synchronization failure, timeout or wake loss closes admission and
+retains uncertain images until proven full reset. The normal stop/reset proof
+also covers a retained seed and an in-flight switch context. Autoscheduled
+engine resets and userspace acceleration remain disabled.
 
 Before context registration and after deregistration, a heavy GuC GGTT TLB
 invalidation (0x7000, operation 0x80000003) requires its matching 0x7001 cookie.

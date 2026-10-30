@@ -40,6 +40,7 @@ enum Phase {
     Reloading,
     Ct,
     Probe,
+    Defaults,
     PpgttProbe,
     Running,
     Stopped,
@@ -348,6 +349,16 @@ impl Owner {
             (Phase::Probe, GtState::SchedulingReady) => {
                 if let Some(result) = state.probe.as_ref().expect("owned probe").result() {
                     result.map_err(|_| RuntimeError::State)?;
+                    state.probe = Some(gt.begin_context_defaults(now).map_err(RuntimeError::Gt)?);
+                    state.phase = Phase::Defaults;
+                }
+            }
+            (Phase::Defaults, GtState::SchedulingReady) => {
+                if let Some(result) = state.probe.as_ref().expect("owned defaults fence").result() {
+                    result.map_err(|_| RuntimeError::State)?;
+                    if !gt.context_defaults_ready() {
+                        return Err(RuntimeError::State);
+                    }
                     let probe = gt.submit_ppgtt_probe(now).map_err(RuntimeError::Gt)?;
                     state.probe = Some(probe.completion);
                     state.probe_result = Some(probe.result);
@@ -367,7 +378,7 @@ impl Owner {
                     state.phase = Phase::Running;
                     log(
                         self.pending.index,
-                        "GuC ready; kernel context, private PPGTT store and retirement verified",
+                        "GuC ready; default RCS state, private PPGTT store and retirement verified",
                     );
                 }
             }

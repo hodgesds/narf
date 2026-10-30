@@ -696,6 +696,8 @@ pub mod intel_gpu_audio;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_aux;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_context;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_ddi;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_dmc;

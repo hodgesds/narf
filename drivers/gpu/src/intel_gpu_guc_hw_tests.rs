@@ -21,6 +21,16 @@ fn hardware_model_with_interface(
         d.regs.insert(0x913c, 5);
         d.regs.insert(0x9144, 6);
         d.regs.insert(0x9134, 5);
+        d.regs.insert(0x9114, 0x10);
+        d.regs.insert(0x9118, 1);
+        d.regs.insert(
+            0xd8c,
+            if platform == GtPlatform::Battlemage {
+                (20 << 22) | (1 << 14)
+            } else {
+                (12 << 22) | (70 << 14)
+            },
+        );
     }
     let mut boot = stage(window.clone(), arena.clone(), platform);
     boot.submission_version = (version, 0, 0);
@@ -338,7 +348,7 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 let id = request[1];
                 let base = registered[&id];
                 if request[2] == 1 && execute {
-                    let d = w.0.borrow();
+                    let mut d = w.0.borrow_mut();
                     assert!(d.synced.contains(&base));
                     let image = d.memory[&base].clone();
                     let ring_base = image.borrow()[1024 + 9];
@@ -346,8 +356,9 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                         let data = image.borrow();
                         assert_eq!(
                             &data[1024..1031],
-                            &[0, 0x1108101d, 0x2244, 0x00090009, 0x2034, 0, 0x2030]
+                            &[0, 0x1108101d, 0x2244, data[1027], 0x2034, 0, 0x2030]
                         );
+                        assert!(matches!(data[1027], 0x00090009 | 0x00090008));
                         assert_eq!(data[1032], 0x2038);
                         assert_eq!(data[1024 + 33], 0x11081011);
                         assert_eq!(data[1024 + 65], 0x11080001);
@@ -357,10 +368,20 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                         assert_eq!(data[1024 + 0x72], 0);
                     }
                     assert!(d.synced.contains(&ring_base));
-                    let ring = d.memory[&ring_base].borrow();
+                    let ring_backing = d.memory[&ring_base].clone();
+                    let ring = ring_backing.borrow();
                     let tail = image.borrow()[1024 + 7];
                     if image.borrow()[1024 + 0x33] != 0 {
-                        execute_ppgtt_probe(w, &image.borrow(), &ring, id, base);
+                        execute_ppgtt_probe(&d.regs, &image.borrow(), &ring, id, base);
+                    } else if tail != 32 {
+                        let (_, used) =
+                            crate::intel_gpu_context::tests::execute(&ring[1..], &mut d.regs);
+                        assert_eq!(ring[0], 0x04000001);
+                        assert_eq!(ring[used + 1] & 0xfffffdff, 0x7a000004);
+                        // Opaque device-saved state, outside the hand-written
+                        // register restore groups. The driver must copy it.
+                        image.borrow_mut()[0x2000 / 4] = 0xc01dcafe;
+                        image.borrow_mut()[0x2004 / 4] = d.regs[&0x7044];
                     } else {
                         assert_eq!(
                             &ring[..8],
@@ -395,16 +416,16 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
 // Independent fixed-command device model. It follows the actual production
 // table pages, verifies their PAT/permissions, fetches the private batch via
 // four hardware-style reads and writes the translated destination page.
-fn execute_ppgtt_probe(w: &Window, image: &[u32], ring: &[u32], id: u32, base: u32) {
-    let pat = if w.0.borrow().regs.get(&0x480c) == Some(&2) {
+fn execute_ppgtt_probe(regs: &BTreeMap<u64, u32>, image: &[u32], ring: &[u32], id: u32, base: u32) {
+    let pat = if regs.get(&0x480c) == Some(&2) {
         3
-    } else if w.0.borrow().regs.get(&0x4808) == Some(&0xf) {
+    } else if regs.get(&0x4808) == Some(&0xf) {
         2
     } else {
         0
     };
     let table_pat = if pat == 3 {
-        assert_eq!(w.0.borrow().regs.get(&0x4808), Some(&0xc));
+        assert_eq!(regs.get(&0x4808), Some(&0xc));
         2
     } else {
         pat
@@ -470,6 +491,204 @@ fn execute_ppgtt_probe(w: &Window, image: &[u32], ring: &[u32], id: u32, base: u
     unsafe { core::ptr::write_volatile(target, 0x4e415246) };
 }
 
+fn golden_memory(w: &Window) -> Words {
+    let d = w.0.borrow();
+    let base = d.memory[&0x20001000].borrow()[0x1014 / 4];
+    d.memory[&base].clone()
+}
+
+fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
+    for (platform, ack, gmd) in [
+        (GtPlatform::Alchemist, 0x130044, 0),
+        (GtPlatform::Battlemage, 0xdfc, (20 << 22) | (1 << 14)),
+        (GtPlatform::Battlemage, 0xdfc, (20 << 22) | (2 << 14)),
+        (
+            GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
+            0xdfc,
+            (12 << 22) | (74 << 14),
+        ),
+    ] {
+        let (w, arena, mut gt) = hardware_model(platform, ack);
+        if gmd != 0 {
+            w.0.borrow_mut().regs.insert(0xd8c, gmd);
+        }
+        hardware_discovery(&mut gt, &w, ack);
+        hardware_scheduling(&mut gt, &w);
+        let count = arena.live_allocations();
+        let golden = golden_memory(&w);
+        assert!(golden.borrow().iter().all(|word| *word == 0));
+        let completion = gt.begin_context_defaults(26).unwrap();
+        assert!(!gt.context_defaults_ready());
+        assert!(matches!(gt.begin_context_defaults(26), Err(GtError::Busy)));
+        assert!(matches!(
+            gt.submit_kernel_probe(26),
+            Err(GtError::Scheduling(
+                crate::intel_gpu_guc_sched::SchedulingError::Busy
+            ))
+        ));
+        {
+            use core::{
+                future::Future,
+                task::{Context, Waker},
+            };
+            let mut wait = core::pin::pin!(completion.wait());
+            assert!(wait
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        }
+        let mut registered = BTreeMap::new();
+        let mut registrations = 0;
+        for now in 27..90 {
+            assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+            if completion.result().is_some() {
+                break;
+            }
+            assert!(!gt.context_defaults_ready());
+            assert!(golden.borrow().iter().all(|word| *word == 0));
+            registrations += service_contexts(&w, &mut registered, true)
+                .iter()
+                .filter(|a| **a == 0x4502)
+                .count();
+        }
+        assert_eq!(registrations, 2);
+        assert_eq!(completion.result(), Some(Ok(())));
+        assert!(gt.context_defaults_ready());
+        assert_eq!(arena.live_allocations(), count);
+        {
+            let data = golden.borrow();
+            assert!(data[..1024].iter().all(|word| *word == 0));
+            assert_eq!(data[1027], 0x00090008);
+            assert_eq!((data[1029], data[1031], data[1033]), (0, 0, 0));
+            assert_eq!(data[0x2000 / 4], 0xc01dcafe);
+            assert_ne!(data[0x2004 / 4] & 0x20, 0);
+        }
+        // A fresh PPGTT context must inherit the device's saved opaque state,
+        // restore it rather than inhibit, and receive its own ring and root.
+        let probe = gt.submit_ppgtt_probe(100).unwrap();
+        for now in 101..125 {
+            assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+            service_contexts(&w, &mut registered, true);
+            for base in registered.values() {
+                let image = w.0.borrow().memory[base].clone();
+                assert_eq!(image.borrow()[1027], 0x00090008);
+                assert_eq!(image.borrow()[0x2000 / 4], 0xc01dcafe);
+                assert_ne!(image.borrow()[1033], 0);
+            }
+            if probe.completion.result().is_some() {
+                break;
+            }
+        }
+        assert_eq!(probe.completion.result(), Some(Ok(())));
+        assert_eq!(probe.result.verify(), Ok(()));
+        hardware_stop(&mut gt, &w, ack);
+        assert!(!gt.context_defaults_ready());
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_default_context_capture_and_clone
+);
+
+fn smoke_hardware_defaults_failures_wait_for_full_reset() -> TestResult {
+    for cpu_sync in [false, true] {
+        let (w, arena, mut gt) = hardware_model(GtPlatform::Alchemist, 0x130044);
+        hardware_discovery(&mut gt, &w, 0x130044);
+        hardware_scheduling(&mut gt, &w);
+        let count = arena.live_allocations();
+        let completion = gt.begin_context_defaults(26).unwrap();
+        let mut registered = BTreeMap::new();
+        let mut corrupted = false;
+        let mut lost = false;
+        for now in 27..90 {
+            if let Poll::Ready(Err(GtError::Scheduling(_))) = gt.poll(now) {
+                lost = true;
+                break;
+            }
+            service_contexts(&w, &mut registered, true);
+            if !corrupted {
+                for base in registered.values() {
+                    let image = w.0.borrow().memory[base].clone();
+                    if image.borrow()[0x2000 / 4] == 0xc01dcafe {
+                        if cpu_sync {
+                            w.0.borrow_mut().fail_cpu_sync = true;
+                        } else {
+                            image.borrow_mut()[1025] = u32::MAX;
+                        }
+                        corrupted = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(corrupted && lost);
+        assert_eq!(gt.state(), GtState::Lost);
+        assert!(completion.result().is_none());
+        assert!(!gt.context_defaults_ready());
+        assert!(arena.live_allocations() > count);
+        hardware_stop(&mut gt, &w, 0x130044);
+        assert_eq!(
+            completion.result(),
+            Some(Err(crate::intel_gpu_fence::JobError::Reset))
+        );
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_defaults_failures_wait_for_full_reset
+);
+
+fn smoke_hardware_default_switch_cancel_requires_full_reset() -> TestResult {
+    let (w, arena, mut gt) = hardware_model(GtPlatform::Alchemist, 0x130044);
+    hardware_discovery(&mut gt, &w, 0x130044);
+    hardware_scheduling(&mut gt, &w);
+    let baseline = arena.live_allocations();
+    let completion = gt.begin_context_defaults(26).unwrap();
+    let mut registered = BTreeMap::new();
+    for now in 27..60 {
+        assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+        if arena.live_allocations() == baseline + 3 {
+            break;
+        }
+        service_contexts(&w, &mut registered, true);
+    }
+    // The seed is fully retired but deliberately retained; the second
+    // context has been allocated. A GuC-only reset cannot free either one.
+    assert_eq!(arena.live_allocations(), baseline + 3);
+    assert!(completion.result().is_none());
+    gt.begin_stop(10_000_000_000).unwrap();
+    reset_done(&w);
+    w.0.borrow_mut().regs.insert(0xc314, 0);
+    assert!(gt.poll(10_000_000_001).is_pending());
+    assert_eq!(gt.state(), GtState::ResettingEngines);
+    assert!(completion.result().is_none());
+    assert!(arena.live_allocations() >= baseline + 2);
+    assert!(gt.poll(10_000_000_002).is_pending());
+    reset_done(&w);
+    assert!(gt.poll(10_000_000_003).is_pending());
+    assert_eq!(
+        completion.result(),
+        Some(Err(crate::intel_gpu_fence::JobError::Reset))
+    );
+    w.0.borrow_mut().regs.insert(0xd84, 0);
+    assert!(gt.poll(10_000_000_004).is_pending());
+    w.0.borrow_mut().regs.insert(0x130044, 0);
+    assert_eq!(gt.poll(10_000_000_005), Poll::Ready(Ok(GtState::Stopped)));
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_default_switch_cancel_requires_full_reset
+);
+
 fn smoke_hardware_ppgtt_store_and_retirement() -> TestResult {
     for (platform, ack) in [
         (
@@ -498,6 +717,9 @@ fn smoke_hardware_ppgtt_store_and_retirement() -> TestResult {
         assert_eq!(probe.completion.result(), Some(Ok(())));
         assert_eq!(probe.result.verify(), Ok(()));
         assert_eq!(arena.live_allocations(), count);
+        // Priming after a resident job could capture that job's graphics
+        // state, even after complete retirement. It requires a fresh GT.
+        assert!(matches!(gt.begin_context_defaults(100), Err(GtError::Busy)));
         assert!(weak.iter().all(|o| o.strong_count() == 1));
         drop(probe);
         assert!(weak.iter().all(|o| o.upgrade().is_none()));
