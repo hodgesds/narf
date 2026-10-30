@@ -11,6 +11,8 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 #[path = "ap_runtime_tests.rs"]
 mod ap_runtime_tests;
+#[path = "p2p_native_tests.rs"]
+mod p2p;
 
 #[path = "active_scan_tests.rs"]
 mod active_scan_tests;

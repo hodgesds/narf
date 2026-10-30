@@ -986,6 +986,7 @@ pub struct Firmware {
     version: [u8; 10],
     build_date: [u8; 15],
     override_addr: u32,
+    release_features: Result<Option<super::fw_features::Features>, super::fw_features::Error>,
 }
 impl Firmware {
     /// Validate every table, range and mode before any firmware command.
@@ -1093,6 +1094,7 @@ impl Firmware {
             version: tail.fw_ver,
             build_date: tail.build_date,
             override_addr,
+            release_features: super::fw_features::parse(ram),
         })
     }
     /// Copy verified registry payloads into this session's immutable ownership.
@@ -1104,6 +1106,15 @@ impl Firmware {
         let patch = super::firmware_assets::load(auth, patch)?;
         let ram = super::firmware_assets::load(auth, ram)?;
         Self::prepare(&patch, &ram)
+    }
+    /// Optional WM release metadata, retained from this immutable artifact.
+    /// Missing metadata gives no CNM capability; malformed metadata remains
+    /// distinguishable without breaking legacy firmware boot. This grants
+    /// no started device, channel, packet or RF permission.
+    pub fn cnm_capability(&self) -> Result<bool, Error> {
+        self.release_features
+            .map(|feature| feature.is_some_and(|feature| feature.cnm()))
+            .map_err(|_| Error::InvalidFirmware)
     }
 }
 
