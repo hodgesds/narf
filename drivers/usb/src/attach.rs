@@ -539,10 +539,14 @@ pub async fn try_attach_via_hub(
 /// a genuine unplug the device is gone either way, and a slot whose
 /// reclaim refuses (Disable Slot failed) stays retired rather than
 /// returning to the pool half-alive. Classes the supervisor does
-/// not pump (MSC / UAC / UVC / CDC-NCM / btusb / CCID) have no
+/// not pump (MSC / UAC / CDC-NCM / btusb / CCID) have no
 /// per-class binding removal yet — their slot is disabled and
 /// reclaimed here, but their class-level registries are a
-/// documented follow-up in #748.
+/// documented follow-up in #748. UVC is no longer in that set: its
+/// unbind hook (`uvc::detach_uvc`, registered in
+/// `uvc::register_initcalls`) runs via `dispatch_unbind` in step 1
+/// above, dropping the slot's UVC binding and unregistering its
+/// `/dev/video<N>` node.
 pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
     // 1. Class bindings.
     hid::detach_boot_keyboard(slot_id);
@@ -598,12 +602,14 @@ pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
 /// `msc::unbind_all_msc`, and the hub registry is cleared.
 /// Registered class drivers' per-slot unbind hooks are NOT called
 /// on this path, and classes with neither a pumped clear nor a
-/// wholesale unbind here (UAC / UVC / CDC-NCM / btusb / CCID)
-/// keep their class-level registries across recovery — the
-/// documented remainder of #748. The MSC call is load-bearing,
-/// not symmetry: a surviving `MSC_DEVICES` entry would make
-/// re-enumeration append a second live adapter for the same BOT
-/// device (queue 16, Concern C).
+/// wholesale unbind here (UAC / CDC-NCM / btusb / CCID) keep their
+/// class-level registries across recovery — the documented remainder
+/// of #748. UVC left that list: `uvc::detach_all_uvc` drops every
+/// UVC binding and unregisters every video node, so re-enumeration
+/// cannot append a second live node for the same camera. The MSC
+/// call is load-bearing, not symmetry: a surviving `MSC_DEVICES`
+/// entry would make re-enumeration append a second live adapter for
+/// the same BOT device (queue 16, Concern C).
 pub fn detach_all_bindings() {
     hid::clear_boot_keyboards();
     hid::keyboard::unregister_all_keyboards();
@@ -615,6 +621,7 @@ pub fn detach_all_bindings() {
     crate::serial::port::clear_serial();
     crate::xpad::clear_xpad();
     crate::msc::unbind_all_msc();
+    crate::uvc::detach_all_uvc();
     HUBS.lock().clear();
 }
 
