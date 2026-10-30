@@ -1190,6 +1190,7 @@ kernel_test_in!(
 
 fn fams2_stream() -> Fams2StreamConfig {
     Fams2StreamConfig {
+        drr: None,
         base: crate::amdgpu_dcn401_dml::pstate::Fams2Stream {
             kind: 2,
             otg_vline_time_ns: 14814,
@@ -1209,6 +1210,7 @@ fn fams2_stream() -> Fams2StreamConfig {
             clamp_vtotal_min: true,
             min_ttu_vblank_usable: true,
             vactive_det_fill_delay_otg_vlines: 27,
+            drr_state: None,
         },
         otg_inst: 2,
         pipe_mask: 0b0110,
@@ -1274,16 +1276,15 @@ fn dmub_navi48_fams2_config_matches_dmub_cmd_layout() -> TestResult {
     if half(&on[3], 0) != 27 || on[3][4 + 2..].iter().any(|&x| x != 0) {
         return TestResult::Fail("FAMS2 legacy sub-state");
     }
-    // The owner posts the single disabled command, and refuses a chain it
-    // cannot mark pending.
+    // The owner posts a disabled command or the entire enabled chain.
     let (_pool, mut e) = ready_fams(0x41);
     let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
     if run(e.fams2_update_config(&off)).is_err() || e.io.slot(offset) != golden {
         return TestResult::Fail("FAMS2 disable posted");
     }
     let next = e.io.regs[&(DCN + 0x1d6 * 4)];
-    if run(e.fams2_update_config(&on)) != Err(Error::Unsupported)
-        || e.io.regs[&(DCN + 0x1d6 * 4)] != next
+    if run(e.fams2_update_config(&on)).is_err()
+        || e.io.regs[&(DCN + 0x1d6 * 4)] != (next + 5 * 64) % 8192
         || e.mailbox.state != MailboxState::Ready
     {
         return TestResult::Fail("FAMS2 chain posted");
@@ -1336,6 +1337,7 @@ fn dmub_navi48_fams2_config_replays_linux_vectors() -> TestResult {
         let streams: Vec<Fams2StreamConfig> = v[8..]
             .chunks(25)
             .map(|s| Fams2StreamConfig {
+                drr: None,
                 base: crate::amdgpu_dcn401_dml::pstate::Fams2Stream {
                     kind: s[0] as u8,
                     otg_vline_time_ns: s[1],
@@ -1355,6 +1357,7 @@ fn dmub_navi48_fams2_config_replays_linux_vectors() -> TestResult {
                     clamp_vtotal_min: bit(s[14], 1),
                     min_ttu_vblank_usable: bit(s[14], 2),
                     vactive_det_fill_delay_otg_vlines: half(s[24]),
+                    drr_state: None,
                 },
                 otg_inst: s[15] as u8,
                 pipe_mask: s[16] as u8,
@@ -1381,4 +1384,127 @@ fn dmub_navi48_fams2_config_replays_linux_vectors() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dmub-navi48",
     dmub_navi48_fams2_config_replays_linux_vectors
+);
+
+fn dmub_navi48_fams2_chain_wrap_failure_and_cancellation_preserve_ownership() -> TestResult {
+    let off = fams2_config_commands(false, &Fams2Global::default(), &[]);
+    let on = fams2_config_commands(
+        true,
+        &Fams2Global {
+            num_streams: 1,
+            features: Fams2Features {
+                enable: true,
+                ..Fams2Features::default()
+            },
+            ..Fams2Global::default()
+        },
+        &[fams2_stream()],
+    );
+    let (_pool, mut e) = ready_fams(0x41);
+    // Start the three-command chain at the final ring slot.
+    while e.io.regs[&(DCN + 0x1d6 * 4)] != 8128 {
+        run(e.fams2_update_config(&off)).unwrap();
+    }
+    let count = e.io.writes.len();
+    run(e.fams2_update_config(&on)).unwrap();
+    assert_eq!(e.io.regs[&(DCN + 0x1d6 * 4)], 128);
+    assert_eq!(
+        e.io.writes[count..]
+            .iter()
+            .filter(|&&(a, _)| a == DCN + 0x1d6 * 4)
+            .count(),
+        1
+    );
+    assert_eq!(e.io.slot(e.io.mailbox + 8128), on[0]);
+    assert_eq!(e.io.slot(e.io.mailbox), on[1]);
+    assert_eq!(e.io.slot(e.io.mailbox + 64), on[2]);
+    let (_pool, mut e) = ready_fams(0x21);
+    let before = e.io.writes.len();
+    assert_eq!(run(e.fams2_update_config(&on)), Err(Error::Unsupported));
+    assert_eq!(e.io.writes.len(), before);
+    assert_eq!(e.mailbox.state, MailboxState::Ready);
+    for cancel in [false, true] {
+        let (_pool, mut e) = ready_fams(0x41);
+        e.io.commands = false;
+        if cancel {
+            {
+                let mut f = core::pin::pin!(e.fams2_update_config(&on));
+                assert!(f
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending());
+            }
+            assert_eq!(e.mailbox.state, MailboxState::InFlight);
+        } else {
+            assert_eq!(run(e.fams2_update_config(&on)), Err(Error::CommandTimeout));
+            assert_eq!(e.mailbox.state, MailboxState::Failed);
+        }
+        let count = e.io.writes.len();
+        assert_eq!(run(e.fams2_update_config(&off)), Err(Error::Busy));
+        assert_eq!(e.io.writes.len(), count);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_fams2_chain_wrap_failure_and_cancellation_preserve_ownership
+);
+fn dmub_navi48_fams2_drr_uses_minus_one_totals_and_typed_substates() -> TestResult {
+    let limits = crate::amdgpu_freesync::Drr {
+        v_total_min: 1125,
+        v_total_max: 1406,
+    };
+    let c = fams2_drr_command(2, Some(limits)).unwrap();
+    assert_eq!(
+        &c[..24],
+        &[76, 5, 0, 20, 0x64, 4, 0, 0, 0x7d, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0]
+    );
+    assert!(c[24..].iter().all(|&b| b == 0));
+    assert!(fams2_drr_command(4, None).is_err());
+    assert!(fams2_drr_command(
+        0,
+        Some(crate::amdgpu_freesync::Drr {
+            v_total_min: 0,
+            ..limits
+        })
+    )
+    .is_err());
+    let mut stream = fams2_stream();
+    stream.base.kind = 3;
+    stream.base.drr_state = Some(crate::amdgpu_dcn401_dml::pstate::DrrSubstate {
+        stretched_vtotal: 1406,
+        programming_delay: 3,
+    });
+    let commands = fams2_config_commands(true, &Fams2Global::default(), &[stream]);
+    assert_eq!(&commands[2][4..12], &[0x7e, 5, 3, 0, 1, 0, 0, 0]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_fams2_drr_uses_minus_one_totals_and_typed_substates
+);
+
+fn dmub_navi48_missing_hw_lock_ack_cannot_admit_a_later_fams2_schedule() -> TestResult {
+    let (_pool, mut e) = ready_fams(0x41);
+    e.io.inbox0 = false;
+    assert_eq!(run(e.fams2_hw_lock(true)), Ok(false));
+    assert!(e.hw_lock_uncertain);
+    assert_eq!(e.mailbox.state, MailboxState::Ready);
+    // A possible late ACK (or a later successful release) must not reopen
+    // strict scheduling admission on this owner.
+    e.io.inbox0 = true;
+    e.io.regs.insert(DCN + 0x1f4 * 4, 1);
+    let count = e.io.writes.len();
+    assert_eq!(run(e.fams2_hw_lock(true)), Err(Error::Busy));
+    assert_eq!(e.io.writes.len(), count);
+    assert_eq!(run(e.fams2_hw_lock(false)), Ok(false));
+    assert!(e.hw_lock_uncertain);
+    let (_pool, mut fresh) = ready_fams(0x41);
+    assert_eq!(run(fresh.fams2_hw_lock(true)), Ok(true));
+    assert!(!fresh.hw_lock_uncertain);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_missing_hw_lock_ack_cannot_admit_a_later_fams2_schedule
 );

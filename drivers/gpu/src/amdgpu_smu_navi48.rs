@@ -11,7 +11,7 @@ use crate::{
 use alloc::vec::Vec;
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
-pub use profile::PowerProfile;
+pub use profile::{ActivityCoefficients, CustomCoefficients, PowerProfile, ProfileCoefficients};
 
 const MESSAGE: u32 = 0x82;
 const ARGUMENT: u32 = 0x92;
@@ -320,6 +320,8 @@ struct Engine<I: Io> {
     protection: u64,
     gfx_level: GfxLevel,
     profile: PowerProfile,
+    coefficients: Option<ProfileCoefficients>,
+    custom_coefficients: Option<[ActivityCoefficients; 2]>,
     /// `smu_baco->state`.
     baco: BacoState,
     /// The features running after boot configuration (Linux's SUPPORTED
@@ -1084,6 +1086,8 @@ impl Smu {
                 protection: 0,
                 gfx_level: GfxLevel::Auto,
                 profile: PowerProfile::BootupDefault,
+                coefficients: None,
+                custom_coefficients: None,
                 baco: BacoState::Exit,
                 boot_enabled: 0,
             },

@@ -1241,8 +1241,13 @@ kernel_test_in!(
 struct PinOwner {
     e: Engine<Fake>,
     steps: Vec<&'static str>,
+    firmware: bool,
+    refuse_firmware: bool,
 }
 impl crate::amdgpu_navi48_boot::bandwidth::UclkPin for PinOwner {
+    fn firmware_active(&self) -> bool {
+        self.firmware
+    }
     fn clock_status(&self) -> Result<Status, crate::amdgpu_dcn401_otg::Error> {
         Ok(self.e.status)
     }
@@ -1258,8 +1263,13 @@ impl crate::amdgpu_navi48_boot::bandwidth::UclkPin for PinOwner {
             .map(|_| ())
             .map_err(crate::amdgpu_dcn401_otg::Error::Clocks)
     }
-    async fn disable_fams2(&mut self) {
+    async fn disable_fams2(&mut self) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
         self.steps.push("fams2");
+        if self.refuse_firmware {
+            return Err(crate::amdgpu_dcn401_otg::Error::Busy);
+        }
+        self.firmware = false;
+        Ok(())
     }
 }
 /// A pin's result, the DAL messages it sent and the owner steps it ran.
@@ -1294,6 +1304,8 @@ fn dcn401_fresh_display_owners_pin_like_linux_prepare_bandwidth() -> TestResult 
     let fresh = || PinOwner {
         e: engine(),
         steps: Vec::new(),
+        firmware: false,
+        refuse_firmware: false,
     };
     // retire_inherited_display on cold boot: the clocks not started.
     let mut o = fresh();
@@ -1548,4 +1560,39 @@ fn dcn401_no_display_release_tracks_actual_rates_and_fails_closed() -> TestResul
 kernel_test_in!(
     "drivers/gpu/dcn401-clk",
     dcn401_no_display_release_tracks_actual_rates_and_fails_closed
+);
+
+fn dcn401_pin_retires_a_firmware_schedule_before_any_new_configuration() -> TestResult {
+    let mut o = PinOwner {
+        e: engine(),
+        steps: Vec::new(),
+        firmware: true,
+        refuse_firmware: true,
+    };
+    start(&mut o.e);
+    run(o.e.prepare(request())).unwrap();
+    assert!(!o.e.status.uclk_switching());
+    let (result, messages, steps) = pin(&mut o);
+    assert_eq!(result, Err(crate::amdgpu_dcn401_otg::Error::Busy));
+    assert!(messages.is_empty());
+    assert_eq!(steps, ["fams2"]);
+    assert!(o.firmware);
+    o.refuse_firmware = false;
+    assert_eq!(pin(&mut o), (Ok(()), Vec::new(), vec!["fams2"]));
+    assert!(!o.firmware);
+    o.firmware = true;
+    o.e.status.state = State::Applying;
+    assert_eq!(
+        pin(&mut o),
+        (
+            Err(crate::amdgpu_dcn401_otg::Error::Busy),
+            Vec::new(),
+            Vec::new()
+        )
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_pin_retires_a_firmware_schedule_before_any_new_configuration
 );

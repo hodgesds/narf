@@ -1159,7 +1159,13 @@ impl ColdBoot {
 
 /// The last configuration DML21's search left pinned: its board inputs,
 /// UCLK levels, FAMS2 and modes. The search is a pure function of them.
-type PinnedSearch = (dml::Soc, dml::pstate::UclkLevels, bool, Vec<dml::Mode>);
+type PinnedSearch = (
+    dml::Soc,
+    dml::pstate::UclkLevels,
+    bool,
+    Vec<dml::Mode>,
+    [Option<crate::amdgpu_freesync::Drr>; 4],
+);
 static PINNED_SEARCH: narf_lib::sync::IrqSafeSpinLock<Option<PinnedSearch>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
@@ -4764,9 +4770,9 @@ impl ColdBoot {
         Ok(())
     }
     /// DML21's UCLK P-state answer for the running configuration, when it
-    /// is one this port switches UCLK under: every display scanning out at
-    /// fixed refresh (`drr` false: none wanted), their plans one admitted
-    /// configuration on the current board inputs. `None` keeps it pinned.
+    /// is one this port switches UCLK under: every display scanning out,
+    /// with live DRR limits, their plans one admitted configuration on the
+    /// current board inputs. Native LFC/MID retains its pinned policy.
     fn running_pstate(
         &mut self,
         running: &[Modeset],
@@ -4775,16 +4781,21 @@ impl ColdBoot {
         let Some(first) = running.first() else {
             return Ok(None);
         };
+        let mut live_drr = [None; 4];
         for m in running {
             match self.display_status(m.pipe) {
                 Ok(Some(st))
-                    if st.state == otg::State::ScanoutRunning(m.pipe) && st.drr.is_none() => {}
+                    if st.state == otg::State::ScanoutRunning(m.pipe)
+                        && st.drr.is_none_or(|a| !a.lfc_enabled() && a.mid.is_none()) =>
+                {
+                    live_drr[usize::from(m.plan.stream)] = st.drr.map(|a| a.drr);
+                }
                 _ => return Ok(None),
             }
         }
         let modes = first.plan.joint_modes();
         let streams = running.iter().fold(0u8, |acc, m| acc | 1 << m.plan.stream);
-        if drr
+        if drr != live_drr.iter().any(Option::is_some)
             || running.len() != modes.len()
             || streams.count_ones() as usize != modes.len()
             || running
@@ -4813,12 +4824,12 @@ impl ColdBoot {
         let fams2 = self.display_fams2();
         // Every monitor pass asks again: answer a configuration already
         // running its P-state plans, or already found pinned, from memory.
-        let key = (first.plan.soc, uclk, fams2, modes);
+        let key = (first.plan.soc, uclk, fams2, modes, live_drr);
         if PINNED_SEARCH.lock().as_ref() == Some(&key) {
             return Ok(None);
         }
-        let (soc, uclk, fams2, modes) = &key;
-        match dml::pstate::admit(soc, uclk, modes, *fams2) {
+        let (soc, uclk, fams2, modes, live_drr) = &key;
+        match dml::pstate::admit_with_drr(soc, uclk, modes, *fams2, *live_drr) {
             Ok(dml::pstate::Pstate::Supported(s))
                 if running
                     .iter()
@@ -4837,10 +4848,9 @@ impl ColdBoot {
     /// (DML21's search on the running modes and the board's UCLK levels):
     /// clocks raised only with switching still disallowed, every display
     /// moved to its P-state plan with raise-only watermarks, FAMS2
-    /// disabled; then FAMS2 disabled again (no firmware method is in use),
-    /// the exact watermarks, and UCLK switching allowed with UCLK and FCLK
-    /// lowered to DPMM's minimums.
-    /// Not supported, or `drr` (a display that should run DRR): pinned.
+    /// disabled; then exact watermarks and any required acknowledged FAMS2
+    /// configuration, before allowing switching and lowering UCLK/FCLK.
+    /// Unadmitted or not-yet-applied DRR configurations stay pinned.
     /// No display left (and no teardown in flight): the no-stream optimize
     /// (`release_display_bandwidth`), once.
     /// Returns the displays whose plans moved, in pipe order.
@@ -4869,13 +4879,19 @@ impl ColdBoot {
             return Ok(Vec::new());
         }
         // Already switching under this configuration's P-state plans.
-        if !drr
-            && self.uclk_switching()
+        if self.uclk_switching()
+            && self.fams2_active()
+                == running
+                    .iter()
+                    .any(|m| m.plan.pstate.is_some_and(|p| p.method.firmware()))
             && running.iter().all(|m| {
                 m.plan.pstate.is_some()
                     && self.display_status(m.pipe).is_ok_and(|s| {
                         s.is_some_and(|s| {
-                            s.state == otg::State::ScanoutRunning(m.pipe) && s.drr.is_none()
+                            s.state == otg::State::ScanoutRunning(m.pipe)
+                                && m.plan.pstate.is_some_and(|p| {
+                                    p.drr[usize::from(m.plan.stream)] == s.drr.map(|a| a.drr)
+                                })
                         })
                     })
             })
@@ -4886,6 +4902,30 @@ impl ColdBoot {
             self.pin_display_uclk().await?;
             return Ok(Vec::new());
         };
+        let mut configs = [None; 4];
+        if s.fams2_required {
+            let pool = crate::amdgpu_rdna4::pipe_pool();
+            for m in &running {
+                let index = usize::from(m.plan.stream);
+                let status = self.display_status(m.pipe)?.ok_or(otg::Error::Busy)?;
+                let requestor = status.requestor.ok_or(otg::Error::Busy)?;
+                let mut masks = [0; 6];
+                masks[0] = pool.hw_mask(requestor.surface.request.pipe_mask());
+                let mut count = 1;
+                for overlay in requestor.overlays.into_iter().flatten() {
+                    masks[count] = pool.hw_mask(overlay.request.pipe_mask());
+                    count += 1;
+                }
+                configs[index] = Some(crate::amdgpu_dmub_navi48::Fams2StreamConfig {
+                    base: s.fams2_streams[index],
+                    drr: status.drr.map(|a| a.drr),
+                    otg_inst: pool.hw(m.pipe),
+                    pipe_mask: masks.iter().fold(0, |all, mask| all | mask),
+                    num_planes: count as u8,
+                    plane_pipe_masks: masks,
+                });
+            }
+        }
         let plans: Vec<dml::Plan> = running
             .iter()
             .map(|m| s.plans[usize::from(m.plan.stream)])
@@ -4904,7 +4944,10 @@ impl ColdBoot {
                 .unwrap_or(0),
         };
         let current = self.display_clock_status().map_err(ModesetError::Clocks)?;
-        if current.bandwidth == bandwidth && running.iter().zip(&plans).all(|(m, p)| m.plan == *p) {
+        if current.bandwidth == bandwidth
+            && self.fams2_active() == s.fams2_required
+            && running.iter().zip(&plans).all(|(m, p)| m.plan == *p)
+        {
             return Ok(Vec::new());
         }
         // dcn401_prepare_bandwidth: p_state_change_support forced false, so
@@ -4914,23 +4957,26 @@ impl ColdBoot {
             uclk_pstate: false,
             ..bandwidth
         };
+        self.pin_display_uclk().await?;
         self.update_live_display_bandwidth(prepare, false).await?;
         let old: Vec<_> = running.iter().map(|m| m.plan).collect();
         for k in det_update_order(&old, &plans) {
             // SAFETY: the caller's obligations; the scanout stays live.
             unsafe { self.update_live_display_plan(running[k].pipe, &plans[k], true) }.await?;
         }
-        self.disable_display_fams2().await;
-        // dcn401_optimize_bandwidth: FAMS2 off (no firmware method is
-        // required), the exact watermarks, then the clocks lowered and UCLK
-        // switching allowed.
-        self.disable_display_fams2().await;
+        self.disable_display_fams2().await?;
+        // Exact watermarks precede the acknowledged firmware configuration
+        // and clock relaxation. Hardware-only methods leave FAMS2 disabled.
         for (m, plan) in running.iter_mut().zip(&plans) {
             // SAFETY: the caller's obligations; the scanout stays live.
             let d = unsafe { self.update_live_display_plan(m.pipe, plan, false) }.await?;
             m.plan = d.plan;
             m.scanout.plan = d.plan;
             self.modesets.retain(*m);
+        }
+        if s.fams2_required {
+            let configs: Vec<_> = configs.into_iter().flatten().collect();
+            self.enable_display_fams2(&configs).await?;
         }
         self.update_live_display_bandwidth(bandwidth, true).await?;
         Ok(running)

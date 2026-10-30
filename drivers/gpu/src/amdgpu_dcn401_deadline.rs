@@ -498,6 +498,7 @@ type PstateAdmitted = (
     dml::Soc,
     dml::pstate::UclkLevels,
     bool,
+    [Option<crate::amdgpu_freesync::Drr>; 4],
     alloc::vec::Vec<dml::Mode>,
     alloc::vec::Vec<dml::Plan>,
 );
@@ -513,15 +514,16 @@ fn readmits(plan: &dml::Plan) -> bool {
     };
     let modes = plan.joint_modes();
     let stream = usize::from(plan.stream);
-    if let Some((soc, uclk, fams2, m, plans)) = PSTATE_ADMITTED.lock().as_ref() {
-        if *soc == plan.soc && *uclk == p.uclk && *fams2 == p.fams2 && *m == modes {
+    if let Some((soc, uclk, fams2, drr, m, plans)) = PSTATE_ADMITTED.lock().as_ref() {
+        if *soc == plan.soc && *uclk == p.uclk && *fams2 == p.fams2 && *drr == p.drr && *m == modes
+        {
             return plans.get(stream) == Some(plan);
         }
     }
-    match dml::pstate::admit(&plan.soc, &p.uclk, &modes, p.fams2) {
+    match dml::pstate::admit_with_drr(&plan.soc, &p.uclk, &modes, p.fams2, p.drr) {
         Ok(dml::pstate::Pstate::Supported(s)) => {
             let ok = s.plans.get(stream) == Some(plan);
-            *PSTATE_ADMITTED.lock() = Some((plan.soc, p.uclk, p.fams2, modes, s.plans));
+            *PSTATE_ADMITTED.lock() = Some((plan.soc, p.uclk, p.fams2, p.drr, modes, s.plans));
             ok
         }
         _ => false,

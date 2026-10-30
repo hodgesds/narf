@@ -52,20 +52,28 @@ impl ColdBoot {
             Some(unsafe { smu.admit_sleep(false, true).await }.map_err(clocks::Error::Power)?);
         Ok(())
     }
+    pub(crate) fn profile_coefficients(&self) -> Option<smu::ProfileCoefficients> {
+        self.sequence
+            .backend
+            .smu
+            .as_ref()
+            .and_then(smu::Smu::profile_coefficients)
+    }
     pub(crate) fn power_profile(&self) -> smu::PowerProfile {
         self.power_profile
     }
-    pub(crate) async fn set_power_profile(
+    pub(crate) async fn set_profile_tuned(
         &mut self,
         profile: smu::PowerProfile,
+        custom: smu::CustomCoefficients,
     ) -> Result<(), Error> {
         // Resume replays the selection before the fresh IRQ proofs. This
         // PPSMC-only operation requires stable display owners, not proof-ready
         // client queues; their sleep admission is a later, separate step.
-        if self
-            .dccg
-            .as_ref()
-            .is_ok_and(|d| !matches!(d.status().state, dccg::State::Ready | dccg::State::Applied))
+        if self.fams2_pending
+            || self.dccg.as_ref().is_ok_and(|d| {
+                !matches!(d.status().state, dccg::State::Ready | dccg::State::Applied)
+            })
             || self.otg.as_ref().is_ok_and(|o| !o.status().state.settled())
             || self.clocks.as_ref().is_ok_and(|c| {
                 matches!(
@@ -77,11 +85,12 @@ impl ColdBoot {
             return Err(Error::Busy);
         }
         self.power_owner()?
-            .set_power_profile(profile)
+            .set_profile_tuned(profile, custom)
             .await
             .map_err(Error::Smu)?;
         // The retained selection is also what a reset/resume successor replays.
         self.power_profile = profile;
+        self.custom_profile = self.power_owner()?.custom_coefficients();
         self.sequence.backend.power = self
             .sequence
             .backend

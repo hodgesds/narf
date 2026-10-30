@@ -585,6 +585,9 @@ impl Backend for Hardware {
 #[derive(Debug)]
 pub struct ColdBoot {
     power_profile: smu::PowerProfile,
+    custom_profile: smu::CustomCoefficients,
+    fams2_active: bool,
+    fams2_pending: bool,
     sequence: alloc::boxed::Box<Sequence<Hardware>>,
     reset: Option<crate::amdgpu_reset_navi22::Reset>,
     /// PMFW acknowledged the BACO exit of a runtime resume: SMU firmware
@@ -843,6 +846,9 @@ impl ColdBoot {
             unmapped_vram: unmapped.clone(),
             display_power_policy: None,
             power_profile: smu::PowerProfile::BootupDefault,
+            custom_profile: [None; 2],
+            fams2_active: false,
+            fams2_pending: false,
             reset: None,
             baco_exited: false,
             sequence: alloc::boxed::Box::new(Sequence {
@@ -1001,6 +1007,7 @@ impl ColdBoot {
             )
         }?;
         new.power_profile = self.power_profile();
+        new.custom_profile = self.custom_profile;
         new.client_heap = self.client_heap.take();
         if let Some(heap) = &mut new.client_heap {
             heap.unmapped = None;
@@ -1714,6 +1721,7 @@ impl ColdBoot {
             limits: smu.limits(),
             gfx_level: smu.gfx_level(),
             profile: smu.power_profile(),
+            coefficients: smu.profile_coefficients(),
         })
     }
     /// PPT only; display and memory constraints stay with the display owner.
@@ -2646,7 +2654,7 @@ impl ColdBoot {
         }) {
             return Ok(());
         }
-        self.disable_display_fams2().await;
+        self.disable_display_fams2().await?;
         let otg = self.otg.as_mut().map_err(|e| *e)?;
         let clocks = self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?;
         let dccg = self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?;
@@ -2660,34 +2668,7 @@ impl ColdBoot {
     /// Whether DC keeps FAMS2 on for the running DMCUB firmware (FAMS 2.1).
     pub fn display_fams2(&self) -> bool {
         self.sequence.backend.dmub.fams2() == Some(true)
-    }
-    /// dcn401_prepare/optimize_bandwidth's FAMS2 step for a configuration
-    /// that needs no firmware method (fams2_required false): under the
-    /// driver's inbox0 HW lock, FAMS2_CONFIG with FAMS2 disabled. Only with
-    /// FAMS 2.1 firmware, as DC clears fams2_config.enable otherwise. As in
-    /// Linux, where dcn401_dmub_hw_control_lock and
-    /// dc_dmub_srv_fams2_update_config return nothing (an unacknowledged
-    /// lock or a failed command is only logged), nothing here fails the
-    /// caller: each step is tried in turn, the lock released whatever the
-    /// update did, and a failure is logged. The port never enables FAMS2,
-    /// so firmware only ever holds it disabled.
-    pub async fn disable_display_fams2(&mut self) {
-        if !self.display_fams2() {
-            return;
-        }
-        let commands = dmub::fams2_config_commands(false, &dmub::Fams2Global::default(), &[]);
-        let dmub = &mut self.sequence.backend.dmub;
-        let locked = dmub.hw_lock(true).await;
-        let sent = dmub.fams2_update_config(&commands).await;
-        let released = dmub.hw_lock(false).await;
-        if locked.is_err() || sent.is_err() || released.is_err() {
-            let _ = core::fmt::Write::write_fmt(
-                &mut narf_console::Writer,
-                format_args!(
-                    "amdgpu: navi48 FAMS2 disable: lock {locked:?}, config {sent:?}, release {released:?}\n"
-                ),
-            );
-        }
+            && self.sequence.backend.dmub.fams2_lock_ready()
     }
     /// dcn401_prepare_bandwidth before a configuration change
     /// (`bandwidth::pin_uclk`): when PMFW may switch UCLK, UCLK and FCLK
@@ -2887,23 +2868,28 @@ impl ColdBoot {
         pipe: u8,
         planes: u8,
     ) -> Result<[Option<otg::FlipDone>; 1 + otg::MAX_OVERLAYS], otg::Error> {
-        let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
-        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
-        // SAFETY: matching retained owners are serialized; caller excludes writers.
-        unsafe {
-            self.otg
-                .as_mut()
-                .map_err(|e| *e)?
-                .flip_planes(
-                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
-                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
-                    gmc,
-                    pipe,
-                    planes,
-                    crystal,
-                )
-                .await
+        let locked = self.begin_fams2_io().await?;
+        let result = async {
+            let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
+            let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+            // SAFETY: matching retained owners are serialized; caller excludes writers.
+            unsafe {
+                self.otg
+                    .as_mut()
+                    .map_err(|e| *e)?
+                    .flip_planes(
+                        self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                        self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                        gmc,
+                        pipe,
+                        planes,
+                        crystal,
+                    )
+                    .await
+            }
         }
+        .await;
+        self.finish_fams2_io(locked, result).await
     }
     /// `flip_display_planes` with each plane's source: its back buffer or a
     /// client framebuffer scanned out in place (`otg::FlipSource`).
@@ -2916,24 +2902,29 @@ impl ColdBoot {
         pipe: u8,
         sources: [Option<otg::FlipSource>; 1 + otg::MAX_OVERLAYS],
     ) -> Result<[Option<otg::FlipDone>; 1 + otg::MAX_OVERLAYS], otg::Error> {
-        let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
-        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
-        // SAFETY: matching retained owners are serialized; caller excludes
-        // writers and keeps every client framebuffer pinned.
-        unsafe {
-            self.otg
-                .as_mut()
-                .map_err(|e| *e)?
-                .flip_sources(
-                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
-                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
-                    gmc,
-                    pipe,
-                    sources,
-                    crystal,
-                )
-                .await
+        let locked = self.begin_fams2_io().await?;
+        let result = async {
+            let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
+            let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+            // SAFETY: matching retained owners are serialized; caller excludes
+            // writers and keeps every client framebuffer pinned.
+            unsafe {
+                self.otg
+                    .as_mut()
+                    .map_err(|e| *e)?
+                    .flip_sources(
+                        self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                        self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                        gmc,
+                        pipe,
+                        sources,
+                        crystal,
+                    )
+                    .await
+            }
         }
+        .await;
+        self.finish_fams2_io(locked, result).await
     }
     /// What display `pipe`'s HUBPs fetch, when known (`Otg::fetched_addresses`);
     /// none without a display owner.
@@ -2978,27 +2969,58 @@ impl ColdBoot {
     /// until the next flip. Exclude firmware/FAMS and concurrent display/hub/
     /// VM/IRQ/clock/reset/power writers; a failure quarantines the pipe.
     pub async unsafe fn flip_display(&mut self, pipe: u8) -> Result<otg::FlipDone, otg::Error> {
-        let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
-        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
-        // SAFETY: matching retained owners are serialized; caller excludes writers.
-        unsafe {
-            self.otg
-                .as_mut()
-                .map_err(|e| *e)?
-                .flip(
-                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
-                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
-                    gmc,
-                    pipe,
-                    crystal,
-                )
-                .await
+        let locked = self.begin_fams2_io().await?;
+        let result = async {
+            let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
+            let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+            // SAFETY: matching retained owners are serialized; caller excludes writers.
+            unsafe {
+                self.otg
+                    .as_mut()
+                    .map_err(|e| *e)?
+                    .flip(
+                        self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                        self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                        gmc,
+                        pipe,
+                        crystal,
+                    )
+                    .await
+            }
         }
+        .await;
+        self.finish_fams2_io(locked, result).await
     }
     /// Show a premultiplied ARGB8888 cursor (at most 64x64) on a live pipe.
     /// # Safety
     /// Exclude firmware/FAMS and concurrent display/HDP writers.
     pub unsafe fn set_display_cursor(
+        &mut self,
+        pipe: u8,
+        image: (u32, u32, &[u32]),
+        position: (i32, i32),
+    ) -> Result<otg::CursorApplied, otg::Error> {
+        if self.fams2_active || self.fams2_pending {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: no firmware scheduling, and the caller retains the display.
+        unsafe { self.set_cursor_inner(pipe, image, position) }
+    }
+    /// Await firmware exclusion before changing cursor registers.
+    /// # Safety
+    /// As for [`Self::set_display_cursor`].
+    pub async unsafe fn set_display_cursor_async(
+        &mut self,
+        pipe: u8,
+        image: (u32, u32, &[u32]),
+        position: (i32, i32),
+    ) -> Result<otg::CursorApplied, otg::Error> {
+        let locked = self.begin_fams2_io().await?;
+        // SAFETY: the acknowledged lock excludes firmware; caller excludes writers.
+        let result = unsafe { self.set_cursor_inner(pipe, image, position) };
+        self.finish_fams2_io(locked, result).await
+    }
+    unsafe fn set_cursor_inner(
         &mut self,
         pipe: u8,
         image: (u32, u32, &[u32]),
@@ -3027,6 +3049,30 @@ impl ColdBoot {
         pipe: u8,
         position: (i32, i32),
     ) -> Result<otg::CursorApplied, otg::Error> {
+        if self.fams2_active || self.fams2_pending {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: no firmware scheduling, and the caller retains the display.
+        unsafe { self.move_cursor_inner(pipe, position) }
+    }
+    /// Await firmware exclusion before changing cursor registers.
+    /// # Safety
+    /// As for [`Self::move_display_cursor`].
+    pub async unsafe fn move_display_cursor_async(
+        &mut self,
+        pipe: u8,
+        position: (i32, i32),
+    ) -> Result<otg::CursorApplied, otg::Error> {
+        let locked = self.begin_fams2_io().await?;
+        // SAFETY: the acknowledged lock excludes firmware; caller excludes writers.
+        let result = unsafe { self.move_cursor_inner(pipe, position) };
+        self.finish_fams2_io(locked, result).await
+    }
+    unsafe fn move_cursor_inner(
+        &mut self,
+        pipe: u8,
+        position: (i32, i32),
+    ) -> Result<otg::CursorApplied, otg::Error> {
         if self.state() != State::MemoryReady {
             return Err(otg::Error::Busy);
         }
@@ -3047,8 +3093,12 @@ impl ColdBoot {
         pipe: u8,
         drr: Option<crate::amdgpu_freesync::Drr>,
     ) -> Result<Option<otg::DrrApplied>, otg::Error> {
-        // DRR runs only pinned: the port has no UCLK P-state plan for it.
-        if self.state() != State::MemoryReady || (drr.is_some() && self.uclk_switching()) {
+        // Changing refresh limits invalidates any existing P-state plan.
+        if self.fams2_active
+            || self.fams2_pending
+            || self.state() != State::MemoryReady
+            || self.uclk_switching()
+        {
             return Err(otg::Error::Busy);
         }
         // SAFETY: serialized retained owner; caller excludes writers.
@@ -3063,7 +3113,11 @@ impl ColdBoot {
         pipe: u8,
         config: Option<crate::amdgpu_freesync::LfcConfig>,
     ) -> Result<(), otg::Error> {
-        if self.state() != State::MemoryReady || (config.is_some() && self.uclk_switching()) {
+        if self.fams2_active
+            || self.fams2_pending
+            || self.state() != State::MemoryReady
+            || (config.is_some() && self.uclk_switching())
+        {
             return Err(otg::Error::Busy);
         }
         // SAFETY: serialized retained owner; caller excludes timing writers.
@@ -3073,7 +3127,11 @@ impl ColdBoot {
     /// # Safety
     /// As for `set_display_cursor`; no cancelled display operation may be serviced.
     pub unsafe fn display_lfc_progress(&mut self, pipe: u8, lost: bool) -> Result<(), otg::Error> {
-        if self.state() != State::MemoryReady || self.uclk_switching() {
+        if self.fams2_active
+            || self.fams2_pending
+            || self.state() != State::MemoryReady
+            || self.uclk_switching()
+        {
             return Err(otg::Error::Busy);
         }
         // SAFETY: serialized retained owner; caller excludes timing writers.
@@ -3087,7 +3145,11 @@ impl ColdBoot {
         pipe: u8,
         mid: Option<otg::DrrMid>,
     ) -> Result<(), otg::Error> {
-        if self.state() != State::MemoryReady || self.uclk_switching() {
+        if self.fams2_active
+            || self.fams2_pending
+            || self.state() != State::MemoryReady
+            || self.uclk_switching()
+        {
             return Err(otg::Error::Busy);
         }
         // SAFETY: serialized retained owner; caller excludes timing writers.
@@ -3102,7 +3164,11 @@ impl ColdBoot {
         drr: Option<crate::amdgpu_freesync::Drr>,
         packet: crate::amdgpu_hdr::InfoPacket,
     ) -> Result<Option<otg::DrrApplied>, otg::Error> {
-        if self.state() != State::MemoryReady || (drr.is_some() && self.uclk_switching()) {
+        if self.fams2_active
+            || self.fams2_pending
+            || self.state() != State::MemoryReady
+            || self.uclk_switching()
+        {
             return Err(otg::Error::Busy);
         }
         // SAFETY: serialized retained owner; caller excludes writers.
@@ -3123,11 +3189,16 @@ impl ColdBoot {
         pipe: u8,
         program: Option<alloc::sync::Arc<otg::ColorProgram>>,
     ) -> Result<(), otg::Error> {
-        if self.state() != State::MemoryReady {
-            return Err(otg::Error::Busy);
+        let locked = self.begin_fams2_io().await?;
+        let result = async {
+            if self.state() != State::MemoryReady {
+                return Err(otg::Error::Busy);
+            }
+            // SAFETY: serialized retained owner; caller excludes writers.
+            unsafe { self.otg.as_mut().map_err(|e| *e)?.set_color(pipe, program) }.await
         }
-        // SAFETY: serialized retained owner; caller excludes writers.
-        unsafe { self.otg.as_mut().map_err(|e| *e)?.set_color(pipe, program) }.await
+        .await;
+        self.finish_fams2_io(locked, result).await
     }
     /// New HDR metadata on display `pipe`'s running stream (no modeset).
     /// # Safety
@@ -3137,11 +3208,16 @@ impl ColdBoot {
         pipe: u8,
         packet: crate::amdgpu_hdr::InfoPacket,
     ) -> Result<(), otg::Error> {
-        if self.state() != State::MemoryReady {
-            return Err(otg::Error::Busy);
+        let locked = self.begin_fams2_io().await?;
+        let result = async {
+            if self.state() != State::MemoryReady {
+                return Err(otg::Error::Busy);
+            }
+            // SAFETY: serialized retained owner; caller excludes writers.
+            unsafe { self.otg.as_mut().map_err(|e| *e)?.set_hdr(pipe, packet) }.await
         }
-        // SAFETY: serialized retained owner; caller excludes writers.
-        unsafe { self.otg.as_mut().map_err(|e| *e)?.set_hdr(pipe, packet) }.await
+        .await;
+        self.finish_fams2_io(locked, result).await
     }
     /// The HDR packet display `pipe`'s running stream sends.
     pub fn display_hdr(&self, pipe: u8) -> Option<crate::amdgpu_hdr::InfoPacket> {
@@ -4194,7 +4270,8 @@ impl ColdBoot {
         }
     }
     fn display_retirement_busy(&self) -> bool {
-        self.state() != State::MemoryReady
+        self.fams2_pending
+            || self.state() != State::MemoryReady
             || self.queue_state() != Some(queues::State::InterruptVerified)
             || self.sdma_state() != Some(sdma::State::InterruptVerified)
             || self.dccg.as_ref().is_ok_and(|d| {
@@ -4283,7 +4360,14 @@ impl ColdBoot {
         let report = self.sequence.run().await?;
         // Restore before fresh queue/media/display power admission or clients.
         let profile = self.power_profile;
-        self.set_power_profile(profile).await?;
+        self.set_profile_tuned(profile, self.custom_profile).await?;
+        if let Err(error) = self.power_owner()?.read_profiles().await {
+            log_policy(format_args!("workload coefficients unavailable: {error:?}"));
+            // Clean firmware refusal is optional. An interrupted mailbox is not.
+            if !matches!(error, smu::Error::Rejected(_)) {
+                return Err(Error::Smu(error));
+            }
+        }
         Ok(report)
     }
     /// Access the live display mailbox while retaining this session's PSP/TMR.
@@ -4312,12 +4396,15 @@ impl bandwidth::UclkPin for ColdBoot {
     fn clock_status(&self) -> Result<clocks::Status, otg::Error> {
         self.display_clock_status().map_err(otg::Error::Clocks)
     }
+    fn firmware_active(&self) -> bool {
+        self.fams2_active || self.fams2_pending
+    }
     async fn raise_bandwidth(&mut self, bandwidth: clocks::Bandwidth) -> Result<(), otg::Error> {
         self.update_live_display_bandwidth(bandwidth, false)
             .await
             .map(|_| ())
     }
-    async fn disable_fams2(&mut self) {
+    async fn disable_fams2(&mut self) -> Result<(), otg::Error> {
         self.disable_display_fams2().await
     }
 }
@@ -4364,3 +4451,6 @@ mod tests;
 
 #[path = "amdgpu_navi48_boot_power.rs"]
 mod power_policy;
+
+#[path = "amdgpu_navi48_fams2.rs"]
+mod fams2;

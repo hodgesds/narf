@@ -460,11 +460,18 @@ retention and reset/resume acceptance on both dies remain pending.
 
 RX 9000 also exposes factory workload presets through
 `card<N>/device/pp_power_profile_mode` (0 default, 1 fullscreen 3D, 2 power
-saving, 3 video, 4 VR, 5 compute, 7 windowed 3D). The applied preset has `*`;
-custom coefficients are unsupported. COMPUTE suppresses only admitted sleep
+saving, 3 video, 4 VR, 5 compute, 6 custom, 7 windowed 3D). The applied preset
+has `*`; reads include firmware GFXCLK/FCLK coefficients when available.
+Custom writes use `6 <clock 0=GFX/1=FCLK> <fps> <min_type> <min_mhz>
+<booster_type> <booster_mhz> <limit> <error> <error_rate>`. Accepted tuning
+preserves unexposed table fields and both clock values survive reset/resume. COMPUTE suppresses only admitted sleep
 features, and selection survives reset/resume. Memory/fabric relaxation uses
 the existing DML plans with acknowledged watermark/clock admission and strict
-runtime floor replies. Board-supported GFX_ULV and DS_DCFCLK have separate
+runtime floor replies. DCC plans now include metadata-row blackout bandwidth;
+VRR plans carry live limits, with FAMS2 scheduling for admitted multiple-stream
+configurations. Firmware chains and hardware locks must acknowledge before
+clock relaxation. SubVP phantom/MALL ownership, LFC/MID switching and DPMM
+clock raises beyond the planned state remain pinned. Board-supported GFX_ULV and DS_DCFCLK have separate
 native GC and display-floor admission; `amdgpu.rdna4_gfx_ulv=0` and
 `amdgpu.rdna4_dcf_sleep=0` disable them for comparison. These paths remain
 software-model tested until acceptance on Navi48 and Navi44.

@@ -107,7 +107,7 @@ pub fn populate_drm_class() {
 }
 
 /// `power_dpm_force_performance_level` and (where the card has a PMFW
-/// feature mask) `pp_features` and factory `pp_power_profile_mode` where
+/// feature mask) `pp_features` and `pp_power_profile_mode` where
 /// supported. Values are queried at read time.
 fn add_power_controls(kobj: &Kobject, card: &Arc<dyn crate::drm_registry::DrmCard>) {
     let utf8 = |data: &[u8]| {

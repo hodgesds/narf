@@ -52,6 +52,7 @@ struct Fake {
     uploaded: Vec<u8>,
     metrics: Vec<u8>,
     dpm_count: u32,
+    activity: [[u8; 140]; 8],
 }
 impl Io for Fake {
     fn wait_poll_limit(&self) -> Option<u32> {
@@ -93,8 +94,12 @@ impl Io for Fake {
                 0
             }
             0x12 => {
-                self.violation |= !matches!(p, 1 | 5) || self.dirty || self.address != 0x8_00003000;
-                if p == 5 {
+                self.violation |= !matches!(p, 1 | 5) && p & 0xffff != 7
+                    || self.dirty
+                    || self.address != 0x8_00003000;
+                if p & 0xffff == 7 {
+                    self.memory[..140].copy_from_slice(&self.activity[(p >> 16) as usize]);
+                } else if p == 5 {
                     // Stale staging must have been cleared before PMFW writes.
                     self.violation |= self.memory[..METRICS_BYTES].iter().any(|&b| b != 0);
                     self.memory[..METRICS_BYTES].copy_from_slice(&self.metrics);
@@ -104,8 +109,12 @@ impl Io for Fake {
                 0
             }
             0x13 => {
-                self.violation |= p != 0 || self.dirty;
-                self.uploaded = self.memory[..POWER_BYTES].to_vec();
+                self.violation |= (p != 0 && p != ((6 << 16) | 7)) || self.dirty;
+                if p & 0xffff == 7 {
+                    self.activity[6].copy_from_slice(&self.memory[..140]);
+                } else {
+                    self.uploaded = self.memory[..POWER_BYTES].to_vec();
+                }
                 0
             }
             5 => {
@@ -211,6 +220,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
                 uploaded: Vec::new(),
                 metrics: vec![0; METRICS_BYTES],
                 dpm_count: 0x8000_0002,
+                activity: [[0x5a; 140]; 8],
             },
             authority: Cap::bootstrap(),
             memory,
@@ -223,6 +233,8 @@ fn fixture() -> (Pool, Engine<Fake>) {
             protection: 0,
             gfx_level: GfxLevel::Auto,
             profile: PowerProfile::BootupDefault,
+            coefficients: None,
+            custom_coefficients: None,
             baco: BacoState::Exit,
             boot_enabled: 0,
         },

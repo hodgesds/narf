@@ -244,6 +244,27 @@ impl<I: Io> Engine<I> {
         self.status.drr = None;
         Ok(())
     }
+    pub(super) fn restore_drr(&mut self, pipe: u8) -> Result<(), Error> {
+        let Some(a) = self.status.drr.filter(|a| a.pipe == pipe) else {
+            return Ok(());
+        };
+        self.drr_timing(pipe)?;
+        let l = self.layout;
+        let result = (|| {
+            self.update(l.otg(pipe, V_TOTAL_MAX), 0x7fff, a.adjust.v_total_max - 1)?;
+            self.update(l.otg(pipe, V_MIN), 0x7fff, a.adjust.v_total_min - 1)?;
+            self.update(l.otg(pipe, V_CONTROL), DRR_FIELDS, a.control())?;
+            self.update(
+                l.otg(pipe, STATIC_SCREEN),
+                STATIC_SCREEN_FIELDS,
+                STATIC_SCREEN_TRIGA,
+            )
+        })();
+        if let Err(e) = result {
+            self.status.state = State::Failed(e);
+        }
+        result
+    }
     /// Apply the retained actual timing. Record-before-write lets stop or
     /// recovery restore fixed timing after any partial hardware failure.
     fn drr_adjust(
@@ -513,6 +534,15 @@ impl<I: Io> Engine<I> {
 }
 
 impl Otg {
+    /// Restore native refresh limits after an acknowledged FAMS2 disable.
+    /// # Safety
+    /// Firmware no longer schedules this timing; caller holds its HW lock
+    /// and pinned clocks, and retains the scanout owner.
+    pub(crate) unsafe fn restore_drr(&mut self, pipe: u8) -> Result<(), Error> {
+        self.0.select_display(pipe)?;
+        self.0.restore_drr(pipe)
+    }
+
     /// Stretch (`Some`) or fix (`None`) the vertical total of display
     /// `pipe`'s live scanout. `Busy` unless the pipe is `ScanoutRunning`;
     /// totals outside [mode total, 32767] are `Invalid` without writes. A

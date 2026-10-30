@@ -80,7 +80,7 @@ pub trait DrmCard: Send + Sync {
         Err(narf_filesystem::FsError::Unsupported)
     }
 
-    /// Linux `pp_power_profile_mode`: factory profiles and the applied marker.
+    /// Linux `pp_power_profile_mode`: workload profiles, coefficients and applied marker.
     fn power_profiles(&self) -> Option<alloc::string::String> {
         None
     }

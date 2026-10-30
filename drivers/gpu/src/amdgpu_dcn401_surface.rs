@@ -787,7 +787,7 @@ impl SurfaceRequest {
         )
     }
     /// Every pipe the surface's fetch occupies, by bit.
-    pub(in crate::amdgpu_dcn401_otg) fn pipe_mask(self) -> u8 {
+    pub(crate) fn pipe_mask(self) -> u8 {
         self.segments().fold(0, |m, (p, _, _)| m | bit(p))
     }
 }

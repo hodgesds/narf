@@ -150,6 +150,7 @@ pub struct Snapshot {
     pub protected: bool,
     pub gfx_level: smu::GfxLevel,
     pub profile: smu::PowerProfile,
+    pub coefficients: Option<smu::ProfileCoefficients>,
     /// Error of the latest refresh, cleared by the next success.
     pub error: Option<smu::Error>,
     pub samples: u64,
@@ -163,6 +164,7 @@ pub struct Sample {
     pub protected: bool,
     pub gfx_level: smu::GfxLevel,
     pub profile: smu::PowerProfile,
+    pub coefficients: Option<smu::ProfileCoefficients>,
 }
 
 static SNAPSHOT: IrqSafeSpinLock<Option<Snapshot>> = IrqSafeSpinLock::new(None);
@@ -297,6 +299,7 @@ pub(crate) fn update(previous: Option<Snapshot>, sample: Sample) -> (Snapshot, E
         protected,
         gfx_level: sample.gfx_level,
         profile: sample.profile,
+        coefficients: sample.coefficients,
         error,
         samples: previous.map_or(0, |p| p.samples) + u64::from(error.is_none()),
     };
@@ -493,6 +496,7 @@ pub(crate) fn start(limits: Option<Limits>, gfx_level: smu::GfxLevel, profile: s
             protected: false,
             gfx_level,
             profile,
+            coefficients: None,
             error: None,
             samples: 0,
         });
@@ -524,6 +528,7 @@ pub(crate) fn restart(
         protected: false,
         gfx_level,
         profile,
+        coefficients: None,
         error: None,
         samples: 0,
     });
@@ -537,5 +542,5 @@ mod tests;
 
 #[path = "amdgpu_navi48_profile.rs"]
 mod profile;
-pub(crate) use profile::applied as applied_profile;
+pub(crate) use profile::{applied as applied_profile, ProfileRequest};
 pub use profile::{profiles, request_profile};

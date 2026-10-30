@@ -1993,7 +1993,7 @@ Physical power-transition and session-retention acceptance remain pending.
 
 RX 9000 runtime power now also has seven factory workload presets through
 `pp_power_profile_mode`, including COMPUTE's sleep suppression. Selection
-changes are serialized, coalesced and bound to their admitting owner; reset
+changes are serialized and bound to their admitting owner; reset
 and resume restore the last accepted profile before fresh client proofs.
 Memory/fabric DPM already had DML admission and P-state convergence; its
 runtime path now requires acknowledged watermark ranges and a strict replay
@@ -2006,6 +2006,19 @@ acknowledged DML deep-sleep floor. Independent `amdgpu.rdna4_gfx_ulv=0` and
 factory masks, compute/display/media interactions, reset selection replay,
 per-die thresholds, partial failures and cancellation; physical acceptance
 remains pending on both dies.
+
+RX 9000 custom workload profile 6 now reads firmware GFXCLK/FCLK coefficients
+and accepts width-checked coefficient updates while preserving the rest of
+TABLE_ACTIVITY_MONITOR_COEFF. Ordered owner-bound requests retain consecutive
+clock edits; reset/resume replays both accepted clock values. DCC P-state
+plans now include MRQ metadata rows and native mcache splits. Live VRR bounds
+join planning and readmission caches, with FAMS2 schedules for admitted
+multistream configurations. Chained DMUB commands publish once; acknowledged
+hardware locks cover schedule changes, flips, cursor and colour/HDR updates.
+Native DRR limits restore when scheduling stops, before the hardware lock is
+released. SubVP needs a phantom-pipe/MALL owner; native LFC/MID and DPMM clock
+raises outside the latency state still use pinned clocks. Hardware acceptance
+remains pending on Navi48 and Navi44.
 
 Navi22 third-review fixes (software-model tested only): DRM ioctl user copies
 apply `access_ok` and fault-guarded copies (EFAULT); NVMe/AHCI bring-up

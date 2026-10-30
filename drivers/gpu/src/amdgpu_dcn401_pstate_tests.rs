@@ -500,19 +500,18 @@ fn dcn401_pstate_refuses_what_the_port_does_not_plan() -> TestResult {
     {
         return TestResult::Fail("UCLK table validation");
     }
-    // A DCC plane stays on the pinned policy (its meta rows would count in
-    // the blackout's bytes).
+    // DCC P-state plans include MRQ metadata rows and preserve cache placement.
     let mut dcc = hd();
     dcc.planes[0] = Some(Plane {
         swizzle: Swizzle::S64K2D,
         dcc: true,
         ..Plane::full(&dcc.timing, 1920, 4)
     });
-    if admit_native(&soc, &[dcc]).is_ok()
-        && admit(&soc, &uclk, &[dcc], false) != Ok(Pstate::Pinned(Pinned::Port))
-    {
-        return TestResult::Fail("DCC plane not pinned");
-    }
+    let Ok(Pstate::Supported(s)) = admit(&soc, &uclk, &[dcc], false) else {
+        return TestResult::Fail("DCC plane not admitted for switching");
+    };
+    assert!(s.plans[0].readmits());
+    assert!(s.plans[0].mode.plane_list().all(|p| p.dcc));
     // A mode the pinned policy refuses is refused here too.
     let mut short = hd();
     short.timing.v_total = 1083;
@@ -526,4 +525,83 @@ fn dcn401_pstate_refuses_what_the_port_does_not_plan() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-pstate",
     dcn401_pstate_refuses_what_the_port_does_not_plan
+);
+
+fn dcn401_pstate_vrr_limits_are_admitted_and_bound_to_the_plan() -> TestResult {
+    let (soc, uclk) = board();
+    let limits = crate::amdgpu_freesync::Drr {
+        v_total_min: 1125,
+        v_total_max: 1406,
+    };
+    for fams2 in [false, true] {
+        let Ok(Pstate::Supported(s)) = admit_with_drr(
+            &soc,
+            &uclk,
+            &[hd()],
+            fams2,
+            [Some(limits), None, None, None],
+        ) else {
+            return TestResult::Fail("one VRR stream lost hardware vactive");
+        };
+        assert_eq!(s.methods[0], Method::Vactive);
+        assert!(s.fams2_streams[0].is_drr);
+        assert_eq!(s.fams2_streams[0].max_vtotal, 1406);
+        assert!(s.plans[0].readmits());
+        let mut forged = s.plans[0];
+        forged.pstate.as_mut().unwrap().drr[0] = Some(crate::amdgpu_freesync::Drr {
+            v_total_min: 1124,
+            ..limits
+        });
+        assert!(!forged.readmits());
+    }
+    let pair = [Some(limits), Some(limits), None, None];
+    assert!(matches!(
+        admit_with_drr(&soc, &uclk, &[hd(), hd()], false, pair),
+        Ok(Pstate::Pinned(_))
+    ));
+    let Ok(Pstate::Supported(s)) = admit_with_drr(&soc, &uclk, &[hd(), hd()], true, pair) else {
+        return TestResult::Fail("FAMS2 clamped pair not admitted");
+    };
+    assert_eq!(s.methods[..2], [Method::FwVactiveDrr; 2]);
+    assert!(s.fams2_required);
+    assert!(s.plans.iter().all(Plan::readmits));
+    let invalid = crate::amdgpu_freesync::Drr {
+        v_total_min: 1124,
+        ..limits
+    };
+    assert_eq!(
+        admit_with_drr(
+            &soc,
+            &uclk,
+            &[hd()],
+            true,
+            [Some(invalid), None, None, None]
+        ),
+        Err(Error::Invalid)
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-pstate",
+    dcn401_pstate_vrr_limits_are_admitted_and_bound_to_the_plan
+);
+fn dcn401_pstate_dcc_blackout_includes_metadata_rows() -> TestResult {
+    let (soc, _) = board();
+    let mut mode = hd();
+    mode.planes[0] = Some(Plane {
+        swizzle: Swizzle::S64K2D,
+        dcc: true,
+        ..Plane::full(&mode.timing, 1920, 4)
+    });
+    let shapes = mcache_shapes(&soc, &[mode], Policy::NATIVE).unwrap();
+    let mut plain = shapes[0];
+    plain.plane.dcc = false;
+    // 1920px row rounds to 1984 at the 64x64 metadata request. One row
+    // is 1984*64*4/256=1984 bytes, in addition to blackout pixel swaths.
+    assert_eq!(shapes[0].pstate_bytes()[0], plain.pstate_bytes()[0] + 1984);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-pstate",
+    dcn401_pstate_dcc_blackout_includes_metadata_rows
 );

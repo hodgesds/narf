@@ -1602,15 +1602,33 @@ memory and fabric floors remain with their existing admission owners.
 The card and PCI-device sysfs `pp_power_profile_mode` use
 `DrmCard::{power_profiles, set_power_profile}` (defaults None/Unsupported),
 backed on both RDNA4 dies by `amdgpu_navi48_power::{profiles, request_profile}`.
-Reads list factory names and mark the applied profile with `*`; they issue no
-mailbox transaction. Stores accept one decimal factory ID (surrounding
-whitespace allowed); malformed values are EINVAL and custom profile 6 with
-or without coefficient arguments is EOPNOTSUPP. A separate async mutex and
-request counter coalesce pending profile writes. After runtime-PM access,
+Reads list factory presets plus CUSTOM (6), mark the applied profile with `*`
+and show firmware-read GFXCLK/FCLK coefficients when the table query succeeded.
+They issue no mailbox transaction. Stores accept one decimal profile ID or
+`6 <clock> <fps> <min_type> <min_mhz> <booster_type> <booster_mhz> <limit>
+<error> <error_rate>`; clock 0 is GFXCLK and 1 FCLK. Surrounding whitespace is
+allowed. The three byte fields, two 16-bit frequencies and three 32-bit PD
+values must fit their wire types, with decimal unsigned syntax; malformed
+inputs and unknown IDs are EINVAL. Firmware enforces coefficient policy.
+Profile writes enter a bounded FIFO with one async consumer, so consecutive
+GFX/FCLK updates and same-clock edits retain store order. A full 64-entry
+pending queue reports EBUSY; no IRQ-safe lock is held across an await. After runtime-PM access,
 the task checks its original power-owner generation under OWNER before any
-policy write. No GC lease or GC MMIO is needed. Successful application updates
-the published profile synchronously under OWNER; telemetry carries the same
-selection. Other power-policy feature-mask controls are unchanged.
+policy write. No GC lease or GC MMIO is needed.
+
+SMU14 reads and writes TABLE_ACTIVITY_MONITOR_COEFF (7), with workload ID in
+the upper half of the transfer argument, in its retained transfer buffer.
+The 140-byte external table is read fresh; only the selected clock's exposed
+fields change. Hysteresis, time constants, PD a/b, memory thresholds and PMFW
+padding are preserved. Upload acknowledgement and exposed-field readback
+precede SetWorkloadMask and cache publication. Failure after a policy/table
+mutation closes the owner; cancellation retains Runtime and the DMA backing.
+The last accepted selection and both custom clock values are retained for
+reset/resume replay before client proofs. The seven factory presets retain
+their existing masks and COMPUTE sleep suppression; custom coefficients never
+change the board PPT, clock limits, protections or display floors. Telemetry
+carries the applied selection and coefficient cache. Other power-policy
+feature-mask controls are unchanged.
 
 `amdgpu_navi48_power::thermal` retains THM/MP1 interrupt-register ownership
 in the independent IH service. Native THM14.0.2/3 bank0 and MP1 bank1 are
@@ -2256,7 +2274,7 @@ it (`tests/dcn401_dml21/format_vectors.txt`, checked against Linux with
 DCFCLK/FCLK above the pinned UCLK's state is `ClockState`: the port plans
 only at that state. VUpdate/VReady widths at the programmed clocks are
 rounded up from their exact value. GPUVM/HostVM,
-DCC, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback and immediate
+MALL/SubVP, cursor, tdlut, dynamic metadata, writeback and immediate
 flip are excluded rather than approximated.
 
 ODM follows DML's `dml2_odm_mode_auto` (DecideODMMode,
@@ -6550,13 +6568,19 @@ stream's `pstate::Method`; `Plan::readmits` repeats this search), the
 methods, the level, the active and idle `MinClocks`, FCLK P-state support and
 each stream's FAMS2 static base state (`Fams2Stream`, as
 dml2_core_calcs_get_stream_fams2_programming fills it). The port programs
-the hardware-exclusive methods only: `Pstate::Pinned(Pinned::Firmware(m))`
-when Linux's search would reach a firmware method first (SubVP unless its
-phantom planes or streams certainly do not fit; DRR never arises, every
-native stream has `drr_config` disabled), `Pinned::Unsupported` when Linux
-finds no strategy, and `Pinned::Port` for a DCC plane (MRQ meta rows) or a
-DPMM clock above the latency state. Native admission (`admit_native`) is
-unchanged and never carries a P-state record.
+hardware vactive/vblank and FAMS2 DRR methods. `admit_with_drr` additionally
+accepts each stream's admitted `Option<Drr>` bounds, recorded in PlanPstate
+and both admission caches. One variable-refresh stream can keep hardware
+vactive; multiple active VRR streams require a schedulable firmware variant.
+DRR stretches must fit the sink's maximum total and PMO's refresh bounds.
+DCC uses the native mcache split/placement and adds MRQ metadata rows to the
+blackout fetch bytes before calculating excess-fill bandwidth. Native
+LFC/BTR or finite MID sequences keep clocks pinned. SubVP remains unavailable
+without phantom-pipe/MALL ownership: fixed-refresh search reports
+`Pinned::Firmware`, while DRR search skips those unavailable candidates.
+`Pinned::Unsupported` records no valid strategy; `Pinned::Port` still covers
+DPMM clocks above the latency state. Native admission (`admit_native`) never
+carries a P-state record.
 
 `pstate_strategies.txt` holds PMO's
 expanded lists (`dcn401_pstate_strategy_lists_match_linux`).
@@ -6573,27 +6597,29 @@ authority-failed watermark transaction retains an unusable clock owner,
 which subsequent preparation refuses. Every refusal or error is logged in
 `ColdBoot::display_power_policy()` (`DisplayPowerPolicy { wm_ranges,
 deep_sleep }`). `ColdBoot::converge_uclk_pstate(drr)`, from every display monitor
-pass before DRR converges, searches the running configuration (every
-display scanning out without DRR, their plans one admission on the current
-`Soc`, the clock owner's UCLK levels, `display_fams2()`); a configuration
-found pinned is remembered and not searched again. Supported, in
-dcn401_hwseq.c's order: prepare_bandwidth's
-`update_live_display_bandwidth(bandwidth, false)` with `uclk_pstate` forced
-false (Linux forces p_state_change_support false there, so clocks are only
-raised and switching stays disallowed), every display moved to its P-state
-plan with raise-only watermarks (`update_live_display_plan`), then FAMS2
-disabled (`disable_display_fams2`: HW lock, the disabled FAMS2_CONFIG,
-release; only with FAMS 2.1 firmware); then optimize_bandwidth's FAMS2
-disabled again (no firmware method is required), the exact watermarks and
-`update_live_display_bandwidth(bandwidth, true)` allowing switching with
-UCLK/FCLK at DPMM's active and idle minimums; it returns the displays whose
-plans moved. Otherwise, or with `drr` (a display that should run DRR: the
-port plans DRR only pinned), `pin_display_uclk` (`bandwidth::pin_uclk`):
-while `uclk_switching()`, UCLK and FCLK raised to their maxima with
-switching disallowed and then FAMS2 disabled, as prepare_bandwidth orders
-update_clocks before the FAMS2 update; nothing otherwise (Linux sends the
-disabled FAMS2 config on every prepare_bandwidth; the port only ever sends
-it disabled, so a pinned owner skips the repeat). Every configuration-change
+pass after DRR converges, searches the running configuration on the current
+board clocks, live refresh ranges and FAMS version. A pinned configuration is
+cached with all those inputs. Prepare raises/pins clocks with switching off,
+programs raise-only watermarks and disables any old FAMS2 schedule. Optimize
+programs exact watermarks, acknowledges the new firmware configuration when
+required, then allows UCLK switching with DPMM's active/idle floors.
+FAMS2_CONFIG is a bounded chain of at most nine commands, all copied and
+flushed before one ring write-pointer publication; firmware can defer
+consumption until the final multi_cmd_pending bit clears. Pointer progress,
+reply headers, timeout, revocation and cancellation are checked. FAMS 2.1 is
+required for chains. The global constants follow the DCN401 IP caps; native
+flips remain driver-controlled (firmware flip offload is disabled).
+Before the config, FAMS2_DRR_UPDATE supplies the live minus-one totals for
+each stream. Enable and subsequent disable require acknowledged HW lock,
+config and release; any interrupted operation retains a pending display owner
+and cannot publish relaxed clocks. Disable restores the retained native DRR
+registers before releasing the lock. Flips, colour/HDR and async cursor writes
+acquire the firmware hardware lock while scheduling is active. The console
+pointer callback defers such cursor writes to a generation-bound async task
+without waiting in the callback; superseded requests are skipped.
+Refresh/LFC changes first pin and disable the old schedule. Unadmitted
+configurations call `pin_display_uclk`: raise UCLK/FCLK to their maxima with
+switching disallowed, then disable FAMS2. Every configuration-change
 entry point pins in prepare_bandwidth's position, before its first clock,
 watermark, pipe or link change: `modeset_display`, `modeset_display_mode`,
 `modeset_displays`, `modeset_routed`, `modeset_beside`, `replan_displays`,
@@ -6607,15 +6633,13 @@ link-loss retraining (dp_handle_link_loss: dpms off, then on, on the
 running state) takes no prepare_bandwidth, a conservative extra; on a
 pinned or fresh owner that pin sends nothing. A teardown pins best-effort
 (`pin_display_uclk_for_teardown`): Linux's prepare_bandwidth is void, so a
-pin that fails (a failed clock owner) is logged and the stream is still
-disabled; every other entry point returns the failure before any change.
-`disable_display_fams2` never fails its caller either, as
-dcn401_dmub_hw_control_lock and the FAMS2 update return nothing in Linux:
-lock, disabled config and release are each tried (the release whatever the
-update did) and a failure is logged. Flips, cursor, colour/HDR and DRR updates are
-DC fast or stream updates, which Linux commits without prepare_bandwidth,
-and do not pin (DRR is refused while switching). The step primitives those
-entry points are built from (`start_display_scanout`, `stop_display_scanout`,
+pin failure is logged and the teardown journal attempts retirement; an
+interrupted firmware owner still blocks further display writes until reset.
+Every other entry point returns the failure before any change.
+Before FAMS2 is ever enabled, a disabled-config failure remains optional and
+logged, matching the old pinned bootstrap behavior. Once firmware scheduling
+is active, failed or missing acknowledgements prevent subsequent changes.
+The step primitives those entry points are built from (`start_display_scanout`, `stop_display_scanout`,
 `update_live_display_plan`, `update_live_display_clocks`, the
 `prepare_display_*` and `retire_display_*` steps, ...) do not pin by
 themselves: a caller composing them must pin first. A P-state plan stays
@@ -7751,7 +7775,13 @@ sub-type 4: the global command, then every stream's base and sub-state,
 `multi_cmd_pending` on all but the last; disabled, the global command
 alone; `global` carries DC's static feature overrides, which the caller
 applies: dcn401's debug defaults turn stall recovery and offload flip on and
-debug off). As in Linux's
+debug off). The native runtime deliberately leaves flip offload disabled.
+`Dmub::fams2_update_config` posts at most nine slots in one bounded chain;
+`fams2_drr_update` supplies the admitted minus-one native totals (no MID).
+Only FAMS 2.1 admits the enabled chain. A missing inbox0 acknowledgement
+permanently closes strict FAMS2 lock admission on that owner, so a late ACK
+cannot prove a later lock; optional disabled-config traffic stays usable. A timed-out or cancelled chain remains
+failed/in flight, with its VRAM backing retained. As in Linux's
 `dc_dmub_srv_query_caps_cmd`, firmware must clear the request's `ret_status`
 bit to acknowledge this query; an unchanged bit leaves capabilities absent.
 This does not initialize a native mode.

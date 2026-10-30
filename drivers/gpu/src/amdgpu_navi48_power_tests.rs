@@ -52,6 +52,7 @@ fn navi48_power_cap_writes_follow_amdgpu_hwmon_units_and_range() -> TestResult {
         protected: true,
         gfx_level: smu::GfxLevel::Auto,
         profile: smu::PowerProfile::BootupDefault,
+        coefficients: None,
         error: None,
         samples: 0,
     };
@@ -92,6 +93,7 @@ fn sample(telemetry: Result<Telemetry, smu::Error>, protected: bool) -> Sample {
         protected,
         gfx_level: smu::GfxLevel::Auto,
         profile: smu::PowerProfile::BootupDefault,
+        coefficients: None,
     }
 }
 
@@ -102,6 +104,7 @@ fn navi48_power_snapshot_reports_transitions_once() -> TestResult {
         protected: false,
         gfx_level: smu::GfxLevel::Auto,
         profile: smu::PowerProfile::BootupDefault,
+        coefficients: None,
         error: None,
         samples: 0,
     };
@@ -155,6 +158,7 @@ fn navi48_hwmon_follows_linux_amdgpu_units_and_visibility() -> TestResult {
         protected: false,
         gfx_level: smu::GfxLevel::Auto,
         profile: smu::PowerProfile::BootupDefault,
+        coefficients: None,
         error: None,
         samples: 0,
     };

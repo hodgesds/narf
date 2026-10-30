@@ -2006,23 +2006,39 @@ impl Shape {
     /// calculate_bytes_to_fetch_required_to_hide_latency for the UCLK
     /// blackout (dram_clk_change_blackout_us), luma then chroma: the source
     /// lines its destination lines need, rounded up to whole swaths, over
-    /// every DPP's swath, in Linux's doubles. A DCC plane (MRQ: its meta
-    /// rows also count) is refused before this is used.
+    /// every DPP's swath, plus DCC metadata rows on DCN4's MRQ path.
+    /// CalculateVMAndRowBytes uses nonstationary viewports and GPUVM off.
     fn pstate_bytes(&self) -> [u32; 2] {
         let line_us = f64::from(self.t.h_total) / f64::from(self.t.pixel_clock_khz) * 1000.0;
         let dst = (DRAM_CLK_CHANGE_US as f64 / line_us + 0.99999) as i32 as u32;
-        let bytes = |u: &Surf| {
+        let blocks = Blocks::of(&self.plane);
+        let bytes = |u: &Surf, index: usize| {
             let h = f64::from(u.height);
             if h == 0.0 {
                 return 0;
             }
             let src =
                 ((ratio_f(u.v_ratio) * f64::from(dst) / h + 0.99999) as i32 as f64 * h) as u32;
-            src.wrapping_mul(self.dpps)
+            let pixels = src
+                .wrapping_mul(self.dpps)
                 .wrapping_mul(u.swath)
-                .wrapping_mul(u.bpp)
+                .wrapping_mul(u.bpp);
+            if !self.plane.dcc {
+                return pixels;
+            }
+            let (height, width) = if self.plane.vertical_scan {
+                (8 * blocks.block_w[index], 8 * blocks.block_h[index])
+            } else {
+                (8 * blocks.block_h[index], 8 * blocks.block_w[index])
+            };
+            let row_width = (u.swath - 1).div_ceil(width) * width + width;
+            let row_bytes = row_width * height * u.bpp / 256;
+            pixels + src.div_ceil(height) * row_bytes
         };
-        [bytes(&self.y), self.c.as_ref().map_or(0, bytes)]
+        [
+            bytes(&self.y, 0),
+            self.c.as_ref().map_or(0, |c| bytes(c, 1)),
+        ]
     }
     /// The surfaces of the plane: luma, then a 4:2:0 plane's chroma.
     fn surfaces(&self) -> impl Iterator<Item = &Surf> {
@@ -2862,6 +2878,15 @@ fn ss_khz(khz: u32) -> u64 {
 ///   descriptor past num_streams, which mode support never reads: the
 ///   configuration cannot change and is rejected.
 pub fn admit_all_with(soc: &Soc, modes: &[Mode], policy: Policy) -> Result<Vec<Plan>, Error> {
+    let shapes = mcache_shapes(soc, modes, policy)?;
+    let shapes = optimize_vmin(soc, modes, shapes, |candidate| {
+        plan_shapes(soc, modes, candidate.to_vec(), true).is_ok()
+    });
+    plan_shapes(soc, modes, shapes, false)
+}
+
+/// Phase 2's supported mcache placement, also used before the P-state phase.
+fn mcache_shapes(soc: &Soc, modes: &[Mode], policy: Policy) -> Result<Vec<Shape>, Error> {
     soc.validate()?;
     if modes.is_empty() || modes.len() > MAX_STREAMS {
         return Err(Error::Invalid);
@@ -2874,10 +2899,7 @@ pub fn admit_all_with(soc: &Soc, modes: &[Mode], policy: Policy) -> Result<Vec<P
         let shapes = shapes_for(soc, modes, policy, &split, odm)?;
         if shapes.iter().all(|s| s.mcache_fits) {
             plan_shapes(soc, modes, shapes.clone(), true)?;
-            let shapes = optimize_vmin(soc, modes, shapes, |candidate| {
-                plan_shapes(soc, modes, candidate.to_vec(), true).is_ok()
-            });
-            return plan_shapes(soc, modes, shapes, false);
+            return Ok(shapes);
         }
         // The mcache phase starts from a configuration mode support takes.
         plan_shapes(soc, modes, shapes.clone(), true)?;

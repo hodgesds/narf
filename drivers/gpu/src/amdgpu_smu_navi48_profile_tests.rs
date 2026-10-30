@@ -188,3 +188,100 @@ kernel_test_in!(
     "drivers/gpu/rdna4-policy",
     smu14_profile_cancellation_revocation_and_lost_protection_close_the_owner
 );
+
+fn tuning() -> ActivityCoefficients {
+    ActivityCoefficients {
+        fps: 60,
+        min_type: 1,
+        min_mhz: 500,
+        booster_type: 0,
+        booster_mhz: 1200,
+        limit: 0x12345678,
+        error: 0xaabbccdd,
+        error_rate: 0x01020304,
+    }
+}
+fn smu14_custom_coefficients_preserve_firmware_fields_and_replay_both_clocks() -> TestResult {
+    let (_pool, mut e) = powered();
+    run(e.read_profiles()).unwrap();
+    let factory = e.coefficients.unwrap();
+    let before = e.io.activity[6];
+    run(e.set_profile_tuned(PowerProfile::Custom, [Some(tuning()), None])).unwrap();
+    assert_eq!(e.profile, PowerProfile::Custom);
+    assert_eq!(&e.io.activity[6][32..], &before[32..]);
+    // Literal wire fields, independent of the encoder/decoder under test.
+    assert_eq!(
+        &e.io.activity[6][..12],
+        &[0x5a, 0x5a, 60, 1, 0, 0x5a, 0xf4, 1, 0xb0, 4, 0x5a, 0x5a]
+    );
+    assert_eq!(&e.io.activity[6][12..20], &before[12..20]);
+    assert_eq!(
+        &e.io.activity[6][20..32],
+        &[0x78, 0x56, 0x34, 0x12, 0xdd, 0xcc, 0xbb, 0xaa, 4, 3, 2, 1]
+    );
+    let gfx = e.io.activity[6][..32].to_vec();
+    let fclk = ActivityCoefficients {
+        fps: 30,
+        ..tuning()
+    };
+    run(e.set_profile_tuned(PowerProfile::Custom, [None, Some(fclk)])).unwrap();
+    assert_eq!(&e.io.activity[6][..32], gfx.as_slice());
+    assert_eq!(e.coefficients.unwrap()[6], [tuning(), fclk]);
+    assert_eq!(e.coefficients.unwrap()[3], factory[3]);
+    assert!(e.io.commands.contains(&(0x24, 64)));
+    assert!(!e.io.violation);
+    let (_pool, mut resumed) = powered();
+    run(resumed.set_profile_tuned(PowerProfile::Custom, [Some(tuning()), Some(fclk)])).unwrap();
+    run(resumed.read_profiles()).unwrap();
+    assert_eq!(resumed.coefficients.unwrap()[6], [tuning(), fclk]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4-policy",
+    smu14_custom_coefficients_preserve_firmware_fields_and_replay_both_clocks
+);
+fn smu14_custom_rejection_and_cancel_do_not_publish_partial_tuning() -> TestResult {
+    for message in [0x12, 0x13, 0x24] {
+        let (_pool, mut e) = powered();
+        run(e.read_profiles()).unwrap();
+        let cache = e.coefficients;
+        e.io.reject = Some(message);
+        assert_eq!(
+            run(e.set_profile_tuned(PowerProfile::Custom, [Some(tuning()), None])),
+            Err(Error::Rejected(0xfd))
+        );
+        assert_eq!(e.profile, PowerProfile::BootupDefault);
+        assert_eq!(e.coefficients, cache);
+        assert_eq!(
+            e.state,
+            if message == 0x24 {
+                State::Failed
+            } else {
+                State::PowerReady
+            }
+        );
+    }
+    let (_pool, mut e) = powered();
+    e.io.stall = Some(0x13);
+    {
+        let mut f =
+            core::pin::pin!(e.set_profile_tuned(PowerProfile::Custom, [Some(tuning()), None]));
+        assert!(f
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(e.state, State::Runtime);
+    assert_eq!(e.profile, PowerProfile::BootupDefault);
+    let count = e.io.commands.len();
+    assert_eq!(
+        run(e.set_power_profile(PowerProfile::Video)),
+        Err(Error::Busy)
+    );
+    assert_eq!(e.io.commands.len(), count);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4-policy",
+    smu14_custom_rejection_and_cancel_do_not_publish_partial_tuning
+);

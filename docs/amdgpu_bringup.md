@@ -125,8 +125,13 @@ IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
   before relaxation. Runtime refusals or missing hard-min ACKs close the
   owner. Newer per-die PMFW uses paired active/idle floors; older firmware
   pins FCLK until the last display retires. `pp_power_profile_mode` exposes
-  factory presets 0/1/2/3/4/5/7, including compute sleep suppression, and
-  restores the last accepted preset on reset/resume. Board-supported GFX_ULV
+  factory presets plus custom profile 6, including GFX/FCLK coefficient
+  read/modify/write and compute sleep suppression. Both accepted custom clock
+  values and the selected preset replay on reset/resume. DCC P-state budgets
+  include MRQ metadata rows; live VRR bounds join the search and its cache.
+  Admitted FAMS2 schedules use acknowledged command chains and hardware locks
+  before relaxation. SubVP phantom/MALL, native LFC/MID and clocks raised
+  beyond the latency state retain the pinned fallback. Board-supported GFX_ULV
   follows native GC proofs; DS_DCFCLK follows a checked DML deep-sleep floor.
   `amdgpu.rdna4_gfx_ulv=0` and `amdgpu.rdna4_dcf_sleep=0` skip those features.
   All of these RX 9000 transitions still need physical acceptance.
