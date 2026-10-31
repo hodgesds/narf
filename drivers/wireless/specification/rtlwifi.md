@@ -1239,7 +1239,7 @@ additional-operating-channels and multi-radio inventory rows are closed for
 the retained factory-qualified1–11 profiles. Physical board RF qualification
 remains separate; the later Intel command-group correction has its own gates.
 
-### PCIe ASPM (implemented, native acceptance pending)
+### PCIe ASPM (software-validated)
 
 The retained RTL8188EE owner follows Linux's default-on `aspm` policy for
 L0s/L1 and CLKREQ. `set_pcie_aspm(bool)` sets the policy for the next cold
@@ -1269,8 +1269,13 @@ parked owner failed; packet admission requires a fresh recovery. Each fresh
 physical owner redoes internal preparation, including after suspend/IPS.
 Six native cases cover literal hardware transactions, actual policy limits,
 timeouts/readback/source loss, cancellation, the native revoked-cap path,
-and Open/WPA2 kernel DHCP with fresh-owner parent-policy withdrawal. Native
-acceptance remains pending; other chip runtimes retain their own rows.
+and Open/WPA2 kernel DHCP with fresh-owner parent-policy withdrawal. All six
+native Rust cases pass on both architectures in fixture checkpoint `ab09f5d73`.
+The full integration passes 4259/0/13 on x86_64 and 3900/0/7 on aarch64.
+Release CI, formatting, ordinary boots and both btrfs postflights pass on
+production checkpoint `6e89e3ab3`; the successor changes only native fixtures,
+whose scoped release CI also passes. Physical acceptance and other chip
+runtimes remain separate.
 
 ## 4. Invariants
 
@@ -1312,7 +1317,7 @@ Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
 
 | Chip | Source hardware scope | Remaining native software |
 |---|---|---|
-| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. NEHT v2 additionally implements SGI20 and7935-byte reception; four native composed regressions pass on both architectures. Reset/recovery, system suspend and IPS are software-validated. Remaining software: HT40, antenna/gain tracking, RTS/CTS and PCIe ASPM (MSI delivery, fwlps leisure power save and DMA quiescence are implemented). Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
+| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. NEHT v2 additionally implements SGI20 and7935-byte reception; four native composed regressions pass on both architectures. Reset/recovery, system suspend and IPS are software-validated. Remaining software: HT40, antenna/gain tracking and RTS/CTS (PCIe ASPM, MSI delivery, fwlps leisure power save and DMA quiescence are implemented). Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
 | RTL8192CE family aliases / RTL8192EE |2.4GHz HT; CE aliases need exact RF-type qualification, including the8176/8188CE variant; EE is2T2R |Retained chip firmware/MAC/PHY/RF/calibration/power/packet/station chain, then full HT/QoS/lifecycle. The8179/8188EE HT path does not admit these IDs. |
 | RTL8192DE |Dual-band dual-MAC HT |Exact per-function reset/power/firmware/DMA/radio ownership and station chains, then bands/HT/QoS/lifecycle |
 | RTL8723AE/BE |2.4GHz1T1R HT with BT |Chip-specific retained chain, antenna/BT coexistence and HT/QoS/lifecycle |
@@ -1410,8 +1415,8 @@ firmware LPS `reg_fwctrl_lps = 2` MAX mode on by default on 8821AE, enabling
 `const_pci_aspm = 3`) and WoWLAN on RTL8821AE/8812AE (`wo_wlan_mode =
 WAKE_ON_MAGIC_PACKET | WAKE_ON_PATTERN_MATCH` with
 `rtlwifi/rtl8821aefw_wowlan.bin`). RTL8188EE has no WoWLAN. Each is now a
-named feature; IPS is implemented and software-validated above, while ASPM
-and the other chip-specific power paths retain their remaining rows.
+named feature; IPS and PCIe ASPM are implemented and software-validated
+above. Other chip-specific power paths retain their remaining rows.
 
 References: Linux `rtlwifi/efuse.c`, per-chip `sw.c`/`reg.h`,
 `rtl8192d/hw_common.c` dual-MAC selection, and per-chip firmware/HW code.
@@ -1427,7 +1432,6 @@ runtimes remain separate from the retained RTL8188EE owner.
 | `dynamic_antenna_selection` | Dynamic antenna selection/tracking; blocked on per-antenna signed board measurements (NEPC binds one static factory antenna) |
 | `five_ghz_operation` | 5GHz band operation on RTL8192DE/RTL8821AE; blocked on the rtl8192de/rtl8821ae chip runtimes (RTL8188EE is 2.4GHz-only) |
 | `ht40` | HT40; blocked on a signed NEHT v2 record covering 40MHz emissions (NEHT v1 binds width20) and 40MHz BW programming |
-| `pcie_aspm` | RTL8188EE source-matched MDIO/DBI and current-platform-policy endpoint L0s/L1/CLKREQ preparation implemented pending native acceptance |
 | `rf_gain_tracking` | RF gain/power tracking; blocked on a thermal-indexed signed gain envelope (thermal power tracking moves gains outside the fixed NEPC/NEHT envelope) |
 | `rts_cts_protection` | RTS/CTS protection; blocked on signed qualification of RTS/CTS-to-self emissions (NEPC/NEHT exclude them) and TXD RTS fields driven by bss use_cts_prot/use_rts |
 | `vht` | VHT operation including TX/RX STBC on RTL8821AE; blocked on the rtl8821ae runtime |

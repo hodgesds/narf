@@ -240,14 +240,26 @@ retained factory-qualified1–11 profiles. Intel queue/RSS rows remain open
 until the separately corrected wide-header command graph passes refreshed
 native and final gates; the earlier fixture graph alone is insufficient.
 
+**Recount 2026-10-30** (accepted native RFH/RSS and PCIe ASPM): the ledger
+holds **116 `feature`** rows (115 driver, 1 shared), **35 `chip`** and
+**0 `unknown`**. Production checkpoint `6e89e3ab3` passes both architectures'
+release CI, formatting, ordinary boots and both btrfs postflights. Its
+fixture-only successor `ab09f5d73` passes x86_64 **4259/0/13** and aarch64
+**3900/0/7**, including the corrected common heap-owned MT fixtures and
+refreshed Intel 505-case coverage; changed-fixture release CI also passes.
+Gen2/Sc physical RFH queues, per-queue replay/reorder and immutable RSS,
+plus RTL8188EE endpoint ASPM, close three rows. New exact API89 profiles,
+RTL8 channel continuations and independent P2P contexts retain their own
+pending native acceptance; these counts do not credit those drafts.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 13 | Parked Gen3 HE/TX A-MSDU and wider bands/widths; AP/P2P/WoW, scheduled scan and Gen2 multiple RX queues/RSS; additional chip profiles are tracked separately |
+| iwlwifi | 11 | Remaining exact-profile HE/TX A-MSDU acceptance and wider bands/widths; AP/P2P/WoW and scheduled-scan continuations; additional chip profiles are tracked separately |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 5 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA and loadable packet ABI |
 | ath10k | 18 | 2.4-GHz HT40/coexistence, additional streams/TX STBC and VHT160/80+80, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload |
 | ath9k | 9 | Channel/retune and HT40/SGI40 profiles, factory selection, periodic calibration, larger TX aggregates and idle/station sleep; other chips are separate rows |
-| rtlwifi | 9 | Other matched chips, HT40/VHT, antenna/gain/coexistence, RTS/CTS and PCIe ASPM |
+| rtlwifi | 8 | Other matched chips, HT40/VHT, antenna/gain/coexistence and RTS/CTS |
 | rtl8xxxu | 9 | Other matched USB chips, SGI20/HT40 and wider channels/rates, RX/TX A-MPDU, TX A-MSDU, both BA directions and RX reorder, coexistence, EP0/halted reset, safe rejoin, FIFO retune and PM |
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
 | rtw89 | 13 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW, periodic RF tracking/runtime LPS and multiple functions; other AX/BE chips are separate rows |
@@ -904,7 +916,7 @@ PCI, frontend, context-send and MSI ownership, software-validated above.
 `rtlwifi::set_pcie_aspm(bool)` selects next-preparation PCIe L0s/L1/CLKREQ
 policy. Actual enabled parent policy, endpoint capabilities and native
 hardware receipts gate endpoint entry; the shared bridge/common-clock
-configuration remains platform-owned. This continuation awaits native gates.
+configuration remains platform-owned. Software acceptance is recorded above.
 
 ## 4. Interaction with `narf-wireless`
 
