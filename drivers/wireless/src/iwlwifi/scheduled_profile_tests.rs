@@ -62,7 +62,9 @@ fn smoke_native_api89_bz_idle_periodic_profiles_actual_results_and_terminal_stop
                         .ok_or("native source periodic profile absent")?;
                     profiles < scan
                         && wire.queues.is_empty()
-                        && wire.rx_queues.len() == 2
+                        // Idle PNO is fallback0-only. Additional RFH/RSS rings
+                        // belong to Connection::associate, not idle configure.
+                        && wire.rx_queues.is_empty()
                         && (!active
                             || wire
                                 .commands
@@ -88,7 +90,7 @@ fn smoke_native_api89_bz_idle_periodic_profiles_actual_results_and_terminal_stop
                     s.scheduled.is_none()
                         && !s.needs_reset
                         && !s.hardware.is_failed()
-                        && s.hardware.receive_queue_count() == 3
+                        && s.hardware.receive_queue_count() == 1
                 });
                 require(
                     stopped
