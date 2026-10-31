@@ -867,9 +867,10 @@ mod tests {
     impl CaseInsensitiveDir {
         fn canonical_name(&self, name: &str) -> Option<String> {
             self.inner
-                .iter()
-                .find(|entry| entry.name.eq_ignore_ascii_case(name))
-                .map(|entry| entry.name.into_owned())
+                .enumerate(0, usize::MAX)
+                .into_iter()
+                .find(|(entry, _)| entry.eq_ignore_ascii_case(name))
+                .map(|(entry, _)| entry)
         }
     }
 

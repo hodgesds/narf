@@ -68,6 +68,7 @@ pub const RTM_GETNEIGH: u16 = 30;
 pub const RTM_NEWRULE: u16 = 32;
 pub const RTM_GETRULE: u16 = 34;
 pub const RTM_NEWQDISC: u16 = 36;
+pub const RTM_DELQDISC: u16 = 37;
 pub const RTM_GETQDISC: u16 = 38;
 pub const RTM_GETTCLASS: u16 = 42;
 pub const RTM_GETTFILTER: u16 = 46;
@@ -143,7 +144,39 @@ pub const FRA_PRIORITY: u16 = 6;
 pub const FRA_TABLE: u16 = 15;
 
 pub const TCA_KIND: u16 = 1;
+pub const TCA_OPTIONS: u16 = 2;
 pub const TC_H_ROOT: u32 = 0xFFFF_FFFF;
+
+pub const TCA_TAPRIO_ATTR_PRIOMAP: u16 = 1;
+pub const TCA_TAPRIO_ATTR_SCHED_ENTRY_LIST: u16 = 2;
+pub const TCA_TAPRIO_ATTR_SCHED_BASE_TIME: u16 = 3;
+pub const TCA_TAPRIO_ATTR_SCHED_CLOCKID: u16 = 5;
+pub const TCA_TAPRIO_ATTR_SCHED_CYCLE_TIME: u16 = 8;
+pub const TCA_TAPRIO_ATTR_SCHED_CYCLE_TIME_EXTENSION: u16 = 9;
+pub const TCA_TAPRIO_ATTR_FLAGS: u16 = 10;
+pub const TCA_TAPRIO_ATTR_TXTIME_DELAY: u16 = 11;
+pub const TCA_TAPRIO_ATTR_TC_ENTRY: u16 = 12;
+
+pub const TCA_TAPRIO_SCHED_ENTRY: u16 = 1;
+pub const TCA_TAPRIO_SCHED_ENTRY_INDEX: u16 = 1;
+pub const TCA_TAPRIO_SCHED_ENTRY_CMD: u16 = 2;
+pub const TCA_TAPRIO_SCHED_ENTRY_GATE_MASK: u16 = 3;
+pub const TCA_TAPRIO_SCHED_ENTRY_INTERVAL: u16 = 4;
+
+pub const TCA_TAPRIO_TC_ENTRY_INDEX: u16 = 1;
+pub const TCA_TAPRIO_TC_ENTRY_MAX_SDU: u16 = 2;
+pub const TCA_TAPRIO_TC_ENTRY_FP: u16 = 3;
+pub const TC_FP_EXPRESS: u32 = 1;
+pub const TC_FP_PREEMPTIBLE: u32 = 2;
+
+pub const TCA_TAPRIO_ATTR_FLAG_TXTIME_ASSIST: u32 = 1 << 0;
+pub const TCA_TAPRIO_ATTR_FLAG_FULL_OFFLOAD: u32 = 1 << 1;
+
+pub const TCA_CBS_PARMS: u16 = 1;
+pub const TCA_ETF_PARMS: u16 = 1;
+pub const TC_ETF_DEADLINE_MODE_ON: u32 = 1 << 0;
+pub const TC_ETF_OFFLOAD_ON: u32 = 1 << 1;
+pub const TC_ETF_SKIP_SOCK_CHECK: u32 = 1 << 2;
 
 // ── interface flags (net_device_flags, if.h) ────────────────────────────
 
@@ -600,7 +633,15 @@ fn build_newrule(family: u8, table: u8, priority: u32, seq: u32, pid: u32) -> Ve
     frame_message(RTM_NEWRULE, NLM_F_MULTI, seq, pid, &body)
 }
 
-fn build_newqdisc(ifindex: u32, seq: u32, pid: u32) -> Vec<u8> {
+fn build_qdisc_msg(
+    ifindex: u32,
+    handle: u32,
+    parent: u32,
+    kind: &[u8],
+    options: Option<&[u8]>,
+    seq: u32,
+    pid: u32,
+) -> Vec<u8> {
     // struct tcmsg: family(u8), pad1(u8), pad2(u16), ifindex(i32),
     // handle(u32), parent(u32), info(u32).
     let mut body = Vec::new();
@@ -608,11 +649,143 @@ fn build_newqdisc(ifindex: u32, seq: u32, pid: u32) -> Vec<u8> {
     body.push(0);
     body.extend_from_slice(&0u16.to_ne_bytes());
     body.extend_from_slice(&(ifindex as i32).to_ne_bytes());
+    body.extend_from_slice(&handle.to_ne_bytes());
+    body.extend_from_slice(&parent.to_ne_bytes());
     body.extend_from_slice(&0u32.to_ne_bytes());
-    body.extend_from_slice(&TC_H_ROOT.to_ne_bytes());
-    body.extend_from_slice(&0u32.to_ne_bytes());
-    push_rtattr(&mut body, TCA_KIND, b"noqueue\0");
+    push_rtattr(&mut body, TCA_KIND, kind);
+    if let Some(opts) = options {
+        push_rtattr(&mut body, TCA_OPTIONS | 0x8000, opts);
+    }
     frame_message(RTM_NEWQDISC, NLM_F_MULTI, seq, pid, &body)
+}
+
+fn build_newqdisc(ifindex: u32, seq: u32, pid: u32) -> Vec<u8> {
+    build_qdisc_msg(ifindex, 0, TC_H_ROOT, b"noqueue\0", None, seq, pid)
+}
+
+fn build_qdisc_messages(link: &LinkInfo, seq: u32, pid: u32) -> Vec<Vec<u8>> {
+    let Ok(sched) = crate::nic::with_control(&link.name, |nic| nic.traffic_schedule()) else {
+        return alloc::vec![build_newqdisc(link.ifindex, seq, pid)];
+    };
+    let active = !sched.gates.is_empty()
+        || !sched.shapers.is_empty()
+        || sched.launch_time_queues != 0
+        || sched.preemptible_queues != 0;
+    if !active {
+        return alloc::vec![build_newqdisc(link.ifindex, seq, pid)];
+    }
+    let mut out = Vec::new();
+    if !sched.gates.is_empty() || sched.preemptible_queues != 0 || sched.base_time_ns != 0 {
+        let mut opts = Vec::new();
+        push_rtattr(
+            &mut opts,
+            TCA_TAPRIO_ATTR_SCHED_BASE_TIME,
+            &(sched.base_time_ns as i64).to_ne_bytes(),
+        );
+        push_rtattr(
+            &mut opts,
+            TCA_TAPRIO_ATTR_SCHED_CYCLE_TIME,
+            &(u64::from(sched.cycle_ns) as i64).to_ne_bytes(),
+        );
+        let flags = TCA_TAPRIO_ATTR_FLAG_FULL_OFFLOAD
+            | if sched.launch_time_queues != 0 {
+                TCA_TAPRIO_ATTR_FLAG_TXTIME_ASSIST
+            } else {
+                0
+            };
+        push_rtattr(&mut opts, TCA_TAPRIO_ATTR_FLAGS, &flags.to_ne_bytes());
+        if !sched.gates.is_empty() {
+            let mut entries = Vec::new();
+            for (index, gate) in sched.gates.iter().enumerate() {
+                let mut entry = Vec::new();
+                push_rtattr(
+                    &mut entry,
+                    TCA_TAPRIO_SCHED_ENTRY_INDEX,
+                    &(index as u32).to_ne_bytes(),
+                );
+                push_rtattr(&mut entry, TCA_TAPRIO_SCHED_ENTRY_CMD, &[0u8]);
+                push_rtattr(
+                    &mut entry,
+                    TCA_TAPRIO_SCHED_ENTRY_GATE_MASK,
+                    &u32::from(gate.mask).to_ne_bytes(),
+                );
+                push_rtattr(
+                    &mut entry,
+                    TCA_TAPRIO_SCHED_ENTRY_INTERVAL,
+                    &gate.interval_ns.to_ne_bytes(),
+                );
+                push_rtattr(&mut entries, TCA_TAPRIO_SCHED_ENTRY | 0x8000, &entry);
+            }
+            push_rtattr(
+                &mut opts,
+                TCA_TAPRIO_ATTR_SCHED_ENTRY_LIST | 0x8000,
+                &entries,
+            );
+        }
+        if sched.preemptible_queues != 0 {
+            for q in 0..4u32 {
+                let mut tc_entry = Vec::new();
+                push_rtattr(&mut tc_entry, TCA_TAPRIO_TC_ENTRY_INDEX, &q.to_ne_bytes());
+                let fp = if sched.preemptible_queues & (1 << q) != 0 {
+                    TC_FP_PREEMPTIBLE
+                } else {
+                    TC_FP_EXPRESS
+                };
+                push_rtattr(&mut tc_entry, TCA_TAPRIO_TC_ENTRY_FP, &fp.to_ne_bytes());
+                push_rtattr(&mut opts, TCA_TAPRIO_ATTR_TC_ENTRY | 0x8000, &tc_entry);
+            }
+        }
+        out.push(build_qdisc_msg(
+            link.ifindex,
+            0x0100_0000,
+            TC_H_ROOT,
+            b"taprio\0",
+            Some(&opts),
+            seq,
+            pid,
+        ));
+    }
+    for shaper in &sched.shapers {
+        let mut qopt = [0u8; 20];
+        qopt[0] = 1;
+        qopt[4..8].copy_from_slice(&shaper.high_credit.to_ne_bytes());
+        qopt[8..12].copy_from_slice(&shaper.low_credit.to_ne_bytes());
+        qopt[12..16].copy_from_slice(&(shaper.idle_slope_kbps as i32).to_ne_bytes());
+        qopt[16..20].copy_from_slice(&shaper.send_slope_kbps.to_ne_bytes());
+        let mut opts = Vec::new();
+        push_rtattr(&mut opts, TCA_CBS_PARMS, &qopt);
+        out.push(build_qdisc_msg(
+            link.ifindex,
+            (0x8001 + u32::from(shaper.queue)) << 16,
+            0x0100_0000 | (u32::from(shaper.queue) + 1),
+            b"cbs\0",
+            Some(&opts),
+            seq,
+            pid,
+        ));
+    }
+    for q in 0..8u8 {
+        if sched.launch_time_queues & (1 << q) != 0 {
+            let mut qopt = [0u8; 12];
+            qopt[4..8].copy_from_slice(&11i32.to_ne_bytes()); // CLOCK_TAI
+            qopt[8..12].copy_from_slice(&TC_ETF_OFFLOAD_ON.to_ne_bytes());
+            let mut opts = Vec::new();
+            push_rtattr(&mut opts, TCA_ETF_PARMS, &qopt);
+            out.push(build_qdisc_msg(
+                link.ifindex,
+                (0x8010 + u32::from(q)) << 16,
+                0x0100_0000 | (u32::from(q) + 1),
+                b"etf\0",
+                Some(&opts),
+                seq,
+                pid,
+            ));
+        }
+    }
+    if out.is_empty() {
+        out.push(build_newqdisc(link.ifindex, seq, pid));
+    }
+    out
 }
 
 /// Build an `NLMSG_ERROR` message carrying `-errno` (negated per netlink
@@ -1053,7 +1226,8 @@ fn find_attr(request: &[u8], fixed_len: usize, kind: u16) -> Option<&[u8]> {
     let mut offset = NLMSG_HDRLEN + fixed_len;
     while offset + 4 <= request.len() {
         let len = u16::from_ne_bytes(request[offset..offset + 2].try_into().ok()?) as usize;
-        let attr_kind = u16::from_ne_bytes(request[offset + 2..offset + 4].try_into().ok()?);
+        let attr_kind =
+            u16::from_ne_bytes(request[offset + 2..offset + 4].try_into().ok()?) & 0x3FFF;
         if len < 4 || offset + len > request.len() {
             return None;
         }
@@ -1063,6 +1237,364 @@ fn find_attr(request: &[u8], fixed_len: usize, kind: u16) -> Option<&[u8]> {
         offset += rta_align(len);
     }
     None
+}
+
+fn for_each_nla(raw: &[u8], mut f: impl FnMut(u16, &[u8]) -> Result<(), i32>) -> Result<(), i32> {
+    let mut offset = 0usize;
+    while offset < raw.len() {
+        if offset + 4 > raw.len() {
+            return Err(EINVAL);
+        }
+        let len =
+            u16::from_ne_bytes(raw[offset..offset + 2].try_into().map_err(|_| EINVAL)?) as usize;
+        let kind = u16::from_ne_bytes(raw[offset + 2..offset + 4].try_into().map_err(|_| EINVAL)?)
+            & 0x3FFF;
+        if len < 4 || offset + len > raw.len() {
+            return Err(EINVAL);
+        }
+        f(kind, &raw[offset + 4..offset + len])?;
+        offset = offset.saturating_add(rta_align(len));
+    }
+    Ok(())
+}
+
+fn queue_from_tcmsg(parent: u32, handle: u32) -> Result<u8, i32> {
+    let q = if parent != TC_H_ROOT && (parent & 0xFFFF) >= 1 {
+        (parent & 0xFFFF) - 1
+    } else if handle != 0 && (handle & 0xFFFF) >= 1 {
+        (handle & 0xFFFF) - 1
+    } else {
+        0
+    };
+    u8::try_from(q).ok().filter(|&q| q < 8).ok_or(EINVAL)
+}
+
+fn parse_taprio_options(
+    options: &[u8],
+    existing: &crate::nic::TrafficSchedule,
+) -> Result<crate::nic::TrafficSchedule, i32> {
+    let mut base_time_ns = existing.base_time_ns;
+    let mut cycle_ns: Option<u32> = None;
+    let mut flags: u32 = 0;
+    let mut gates = Vec::new();
+    let mut tc_queues = [0u8; 16];
+    for (tc, mask) in tc_queues.iter_mut().enumerate() {
+        if tc < 8 {
+            *mask = 1u8 << tc;
+        }
+    }
+    let mut preemptible_queues = 0u8;
+    let mut saw_tc_entries = false;
+
+    for_each_nla(options, |kind, payload| {
+        match kind {
+            TCA_TAPRIO_ATTR_PRIOMAP => {
+                // struct tc_mqprio_qopt (82 bytes): num_tc(u8), prio_tc_map([u8;16]),
+                // hw(u8), count([u16;16] at 18..50), offset([u16;16] at 50..82).
+                if payload.len() < 82 {
+                    return Err(EINVAL);
+                }
+                let num_tc = usize::from(payload[0]);
+                if num_tc > 16 {
+                    return Err(EINVAL);
+                }
+                let mut any_count = false;
+                for tc in 0..num_tc {
+                    let count = u16::from_ne_bytes(
+                        payload[18 + tc * 2..20 + tc * 2]
+                            .try_into()
+                            .map_err(|_| EINVAL)?,
+                    );
+                    let off = u16::from_ne_bytes(
+                        payload[50 + tc * 2..52 + tc * 2]
+                            .try_into()
+                            .map_err(|_| EINVAL)?,
+                    );
+                    if count > 0 {
+                        any_count = true;
+                        let mut mask = 0u8;
+                        for q in off..off.saturating_add(count) {
+                            if q >= 8 {
+                                return Err(EINVAL);
+                            }
+                            mask |= 1u8 << q;
+                        }
+                        tc_queues[tc] = mask;
+                    }
+                }
+                if !any_count {
+                    for (tc, mask) in tc_queues.iter_mut().enumerate() {
+                        *mask = if tc < num_tc && tc < 8 { 1u8 << tc } else { 0 };
+                    }
+                }
+            }
+            TCA_TAPRIO_ATTR_SCHED_BASE_TIME => {
+                if payload.len() != 8 {
+                    return Err(EINVAL);
+                }
+                let raw = i64::from_ne_bytes(payload.try_into().map_err(|_| EINVAL)?);
+                if raw < 0 {
+                    return Err(EINVAL);
+                }
+                base_time_ns = raw as u64;
+            }
+            TCA_TAPRIO_ATTR_SCHED_CYCLE_TIME => {
+                if payload.len() != 8 {
+                    return Err(EINVAL);
+                }
+                let raw = i64::from_ne_bytes(payload.try_into().map_err(|_| EINVAL)?);
+                if raw < 0 || raw > i64::from(u32::MAX) {
+                    return Err(EINVAL);
+                }
+                cycle_ns = Some(raw as u32);
+            }
+            TCA_TAPRIO_ATTR_SCHED_CLOCKID | TCA_TAPRIO_ATTR_TXTIME_DELAY => {
+                if payload.len() != 4 {
+                    return Err(EINVAL);
+                }
+            }
+            TCA_TAPRIO_ATTR_SCHED_CYCLE_TIME_EXTENSION => {
+                if payload.len() != 8 {
+                    return Err(EINVAL);
+                }
+            }
+            TCA_TAPRIO_ATTR_FLAGS => {
+                if payload.len() != 4 {
+                    return Err(EINVAL);
+                }
+                flags = u32::from_ne_bytes(payload.try_into().map_err(|_| EINVAL)?);
+                if flags & !(TCA_TAPRIO_ATTR_FLAG_TXTIME_ASSIST | TCA_TAPRIO_ATTR_FLAG_FULL_OFFLOAD)
+                    != 0
+                {
+                    return Err(EINVAL);
+                }
+            }
+            TCA_TAPRIO_ATTR_SCHED_ENTRY_LIST => {
+                for_each_nla(payload, |entry_kind, entry_payload| {
+                    if entry_kind != TCA_TAPRIO_SCHED_ENTRY {
+                        return Err(EINVAL);
+                    }
+                    let mut mask: Option<u8> = None;
+                    let mut interval_ns: Option<u32> = None;
+                    for_each_nla(entry_payload, |sub_kind, sub_payload| {
+                        match sub_kind {
+                            TCA_TAPRIO_SCHED_ENTRY_INDEX => {
+                                if sub_payload.len() != 4 {
+                                    return Err(EINVAL);
+                                }
+                            }
+                            TCA_TAPRIO_SCHED_ENTRY_CMD => {
+                                if sub_payload.len() != 1 || sub_payload[0] > 2 {
+                                    return Err(EINVAL);
+                                }
+                            }
+                            TCA_TAPRIO_SCHED_ENTRY_GATE_MASK => {
+                                if sub_payload.len() != 4 {
+                                    return Err(EINVAL);
+                                }
+                                let raw =
+                                    u32::from_ne_bytes(sub_payload.try_into().map_err(|_| EINVAL)?);
+                                mask = Some(u8::try_from(raw).map_err(|_| EINVAL)?);
+                            }
+                            TCA_TAPRIO_SCHED_ENTRY_INTERVAL => {
+                                if sub_payload.len() != 4 {
+                                    return Err(EINVAL);
+                                }
+                                interval_ns = Some(u32::from_ne_bytes(
+                                    sub_payload.try_into().map_err(|_| EINVAL)?,
+                                ));
+                            }
+                            _ => return Err(EINVAL),
+                        }
+                        Ok(())
+                    })?;
+                    gates.push(crate::nic::Gate {
+                        mask: mask.ok_or(EINVAL)?,
+                        interval_ns: interval_ns.ok_or(EINVAL)?,
+                    });
+                    Ok(())
+                })?;
+            }
+            TCA_TAPRIO_ATTR_TC_ENTRY => {
+                saw_tc_entries = true;
+                let mut tc_index: Option<usize> = None;
+                let mut fp: Option<u32> = None;
+                for_each_nla(payload, |sub_kind, sub_payload| {
+                    match sub_kind {
+                        TCA_TAPRIO_TC_ENTRY_INDEX => {
+                            if sub_payload.len() != 4 {
+                                return Err(EINVAL);
+                            }
+                            let idx =
+                                u32::from_ne_bytes(sub_payload.try_into().map_err(|_| EINVAL)?)
+                                    as usize;
+                            if idx >= 16 {
+                                return Err(EINVAL);
+                            }
+                            tc_index = Some(idx);
+                        }
+                        TCA_TAPRIO_TC_ENTRY_MAX_SDU => {
+                            if sub_payload.len() != 4 {
+                                return Err(EINVAL);
+                            }
+                        }
+                        TCA_TAPRIO_TC_ENTRY_FP => {
+                            if sub_payload.len() != 4 {
+                                return Err(EINVAL);
+                            }
+                            let val =
+                                u32::from_ne_bytes(sub_payload.try_into().map_err(|_| EINVAL)?);
+                            if !matches!(val, TC_FP_EXPRESS | TC_FP_PREEMPTIBLE) {
+                                return Err(EINVAL);
+                            }
+                            fp = Some(val);
+                        }
+                        _ => return Err(EINVAL),
+                    }
+                    Ok(())
+                })?;
+                let idx = tc_index.ok_or(EINVAL)?;
+                if fp == Some(TC_FP_PREEMPTIBLE) {
+                    preemptible_queues |= tc_queues[idx];
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+
+    let computed_cycle = gates
+        .iter()
+        .try_fold(0u32, |acc, g| acc.checked_add(g.interval_ns))
+        .ok_or(EINVAL)?;
+    let cycle_ns = match cycle_ns {
+        Some(0) | None => computed_cycle,
+        Some(c) => c,
+    };
+    let mut launch_time_queues = existing.launch_time_queues;
+    if flags & TCA_TAPRIO_ATTR_FLAG_TXTIME_ASSIST != 0 && launch_time_queues == 0 {
+        launch_time_queues = 0x01;
+    }
+    Ok(crate::nic::TrafficSchedule {
+        base_time_ns,
+        cycle_ns,
+        gates,
+        shapers: existing.shapers.clone(),
+        launch_time_queues,
+        preemptible_queues: if saw_tc_entries {
+            preemptible_queues
+        } else {
+            existing.preemptible_queues
+        },
+    })
+}
+
+fn apply_qdisc_mutation(
+    request: &[u8],
+    msg_type: u16,
+    authority: &MutationAuthority<'_>,
+) -> Result<(), i32> {
+    if request.len() < NLMSG_HDRLEN + 20 {
+        return Err(EINVAL);
+    }
+    let ifindex = i32::from_ne_bytes(request[20..24].try_into().map_err(|_| EINVAL)?);
+    if ifindex <= 0 {
+        return Err(EINVAL);
+    }
+    let handle = u32::from_ne_bytes(request[24..28].try_into().map_err(|_| EINVAL)?);
+    let parent = u32::from_ne_bytes(request[28..32].try_into().map_err(|_| EINVAL)?);
+    let iface_name = iface_name_for_index(ifindex as u32).ok_or(ENODEV)?;
+    let admin = authority.for_iface(&iface_name)?;
+    let target = admin.iface_name();
+    let kind = find_attr(request, 20, TCA_KIND).map(|raw| raw.strip_suffix(&[0]).unwrap_or(raw));
+    let mut sched = crate::nic::with_control(target, |nic| nic.traffic_schedule())?;
+
+    if msg_type == RTM_DELQDISC {
+        match kind {
+            Some(b"cbs") => {
+                let queue = queue_from_tcmsg(parent, handle)?;
+                sched.shapers.retain(|s| s.queue != queue);
+            }
+            Some(b"etf") => {
+                let queue = queue_from_tcmsg(parent, handle)?;
+                sched.launch_time_queues &= !(1u8 << queue);
+            }
+            Some(b"taprio") | None => {
+                if parent == TC_H_ROOT || kind == Some(b"taprio") {
+                    sched = crate::nic::TrafficSchedule::default();
+                } else {
+                    let queue = queue_from_tcmsg(parent, handle)?;
+                    sched.shapers.retain(|s| s.queue != queue);
+                    sched.launch_time_queues &= !(1u8 << queue);
+                }
+            }
+            Some(_) => return Err(EOPNOTSUPP),
+        }
+        return crate::nic::with_control(target, |nic| nic.schedule(sched));
+    }
+
+    let kind = kind.ok_or(EINVAL)?;
+    let options = find_attr(request, 20, TCA_OPTIONS).ok_or(EINVAL)?;
+    match kind {
+        b"taprio" => {
+            sched = parse_taprio_options(options, &sched)?;
+        }
+        b"cbs" => {
+            let queue = queue_from_tcmsg(parent, handle)?;
+            let mut parms: Option<[u8; 20]> = None;
+            for_each_nla(options, |sub_kind, sub_payload| {
+                if sub_kind == TCA_CBS_PARMS {
+                    if sub_payload.len() < 20 {
+                        return Err(EINVAL);
+                    }
+                    parms = Some(sub_payload[..20].try_into().map_err(|_| EINVAL)?);
+                }
+                Ok(())
+            })?;
+            let raw = parms.ok_or(EINVAL)?;
+            let hicredit = i32::from_ne_bytes(raw[4..8].try_into().map_err(|_| EINVAL)?);
+            let locredit = i32::from_ne_bytes(raw[8..12].try_into().map_err(|_| EINVAL)?);
+            let idleslope = i32::from_ne_bytes(raw[12..16].try_into().map_err(|_| EINVAL)?);
+            let sendslope = i32::from_ne_bytes(raw[16..20].try_into().map_err(|_| EINVAL)?);
+            if idleslope <= 0 {
+                return Err(EINVAL);
+            }
+            let shaper = crate::nic::Shaper {
+                queue,
+                idle_slope_kbps: idleslope as u32,
+                send_slope_kbps: sendslope,
+                high_credit: hicredit,
+                low_credit: locredit,
+            };
+            sched.shapers.retain(|s| s.queue != queue);
+            sched.shapers.push(shaper);
+        }
+        b"etf" => {
+            let queue = queue_from_tcmsg(parent, handle)?;
+            let mut parms: Option<[u8; 12]> = None;
+            for_each_nla(options, |sub_kind, sub_payload| {
+                if sub_kind == TCA_ETF_PARMS {
+                    if sub_payload.len() < 12 {
+                        return Err(EINVAL);
+                    }
+                    parms = Some(sub_payload[..12].try_into().map_err(|_| EINVAL)?);
+                }
+                Ok(())
+            })?;
+            let raw = parms.ok_or(EINVAL)?;
+            let delta = i32::from_ne_bytes(raw[0..4].try_into().map_err(|_| EINVAL)?);
+            let flags = u32::from_ne_bytes(raw[8..12].try_into().map_err(|_| EINVAL)?);
+            if delta < 0
+                || flags & !(TC_ETF_DEADLINE_MODE_ON | TC_ETF_OFFLOAD_ON | TC_ETF_SKIP_SOCK_CHECK)
+                    != 0
+            {
+                return Err(EINVAL);
+            }
+            sched.launch_time_queues |= 1u8 << queue;
+        }
+        _ => return Err(EOPNOTSUPP),
+    }
+    crate::nic::with_control(target, |nic| nic.schedule(sched))
 }
 
 pub fn iface_name_for_index(ifindex: u32) -> Option<alloc::string::String> {
@@ -1084,6 +1616,7 @@ pub fn ifindex_for_name(name: &str) -> Option<u32> {
 
 fn admin_errno(error: crate::AdminError) -> i32 {
     match error {
+        crate::AdminError::DeviceError(code) => code,
         crate::AdminError::AuthorityRevoked => EPERM,
         crate::AdminError::NoIface => ENODEV,
         crate::AdminError::InvalidMtu
@@ -1681,6 +2214,7 @@ fn apply_mutation(
                 _ => Err(EINVAL),
             }
         }
+        RTM_NEWQDISC | RTM_DELQDISC => apply_qdisc_mutation(request, hdr.msg_type, authority),
         RTM_DELLINK => Err(EOPNOTSUPP),
         _ => Err(EOPNOTSUPP),
     }
@@ -1698,6 +2232,8 @@ fn is_mutation(msg_type: u16) -> bool {
             | RTM_DELROUTE
             | RTM_NEWNEIGH
             | RTM_DELNEIGH
+            | RTM_NEWQDISC
+            | RTM_DELQDISC
     )
 }
 

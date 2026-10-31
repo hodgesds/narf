@@ -51,6 +51,40 @@ impl SendDispatch {
 /// [`set_link_state`] when the open fails.
 pub type OpenStopFn = fn(&str, bool);
 
+/// Hardware configuration applied before registry metadata is committed.
+/// Calls run without the registry lock. Drivers must reject unsupported
+/// changes before touching hardware; an error leaves metadata unchanged.
+#[derive(Clone, Debug)]
+pub struct DeviceConfig {
+    pub mac: [u8; 6],
+    pub mtu: u32,
+    pub promiscuous: bool,
+    pub all_multicast: bool,
+    pub addresses: Vec<HwAddr>,
+}
+
+pub trait DeviceControl: core::fmt::Debug + Send + Sync {
+    fn configure(&self, config: &DeviceConfig) -> Result<(), i32>;
+    fn nic(&self) -> Option<&dyn crate::nic::NicControl> {
+        None
+    }
+}
+
+#[derive(Debug)]
+struct Control {
+    ops: Arc<dyn DeviceControl>,
+    busy: core::sync::atomic::AtomicBool,
+}
+
+struct ControlGuard(Arc<Control>);
+impl Drop for ControlGuard {
+    fn drop(&mut self) {
+        self.0
+            .busy
+            .store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Zero-copy transmit hook (P-F). A driver that opts in via
 /// [`enable_zero_copy_tx`] supplies this: it takes ownership of a
 /// [`crate::Frame`] the stack built directly into a DMA buffer drawn from the
@@ -58,6 +92,7 @@ pub type OpenStopFn = fn(&str, bool);
 /// the pool (via [`tx_release`]) on completion. Returns Ok on enqueue, Err on
 /// driver failure (the buffer is still the driver's to recycle on Err).
 pub type SendFrameFn = fn(crate::Frame, crate::TxMeta) -> Result<(), ()>;
+pub type SendFrameCtxFn = fn(u64, crate::Frame, crate::TxMeta) -> Result<(), ()>;
 
 /// Queue-local DMA pools behind a zero-copy interface. Selection happens once
 /// at frame construction; the selected queue is carried in [`crate::Frame`]
@@ -136,6 +171,7 @@ pub struct NetIfaceEntry {
     /// The driver's `ndo_open` / `ndo_stop` ([`set_open_stop`]); `None` for
     /// a device that is always running.
     pub open_stop: Option<OpenStopFn>,
+    control: Option<Arc<Control>>,
     /// Owning network namespace. Zero is the initial namespace.
     pub net_ns_id: u64,
     /// Linux ifindex, fixed at registration (`dev_new_index`): `lo` is 1, the
@@ -200,6 +236,7 @@ pub struct NetIfaceEntry {
     /// directly into a buffer from `tx_pools` and hands ownership here instead
     /// of copying a slice through [`send`]. `None` ⇒ the classic copy path.
     pub send_frame: Option<SendFrameFn>,
+    send_frame_context: Option<(u64, SendFrameCtxFn)>,
     /// Queue-local recycling pools backing zero-copy TX (`Some` iff
     /// `send_frame` is). The stack chooses a pool once in [`tx_acquire`] and
     /// records that queue in the returned frame; the driver returns the buffer
@@ -350,8 +387,31 @@ pub fn enable_zero_copy_tx_pools_with_affinity(
         .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == name))
     {
         entry.send_frame = Some(send_frame);
+        entry.send_frame_context = None;
         entry.tx_pools = Some(pools);
         entry.tx_headroom = headroom;
+    }
+}
+
+/// Owned-frame dispatch retaining a device cookie for multi-controller drivers.
+pub fn enable_zero_copy_tx_context(
+    name: &str,
+    cookie: u64,
+    send: SendFrameCtxFn,
+    pools: Vec<Arc<DmaPool>>,
+    headroom: usize,
+    flow_affine: bool,
+) {
+    fn placeholder(_: crate::Frame, _: crate::TxMeta) -> Result<(), ()> {
+        Err(())
+    }
+    enable_zero_copy_tx_pools_with_affinity(name, placeholder, pools, headroom, flow_affine);
+    if let Some(e) = IFACES
+        .lock()
+        .as_mut()
+        .and_then(|v| v.iter_mut().find(|e| e.name == name))
+    {
+        e.send_frame_context = Some((cookie, send));
     }
 }
 
@@ -723,6 +783,7 @@ fn register_inner(
         link_up,
         // Installed by the driver after every (re-)registration.
         open_stop: None,
+        control: None,
         net_ns_id,
         ifindex,
         driver: "",
@@ -759,6 +820,7 @@ fn register_inner(
         // A re-probe preserves any zero-copy TX opt-in (hook + pool + headroom)
         // so the stack keeps the same recycling pool across a driver reset.
         send_frame: old.as_ref().and_then(|old| old.send_frame),
+        send_frame_context: old.as_ref().and_then(|old| old.send_frame_context),
         tx_pools: old.as_ref().and_then(|old| old.tx_pools.clone()),
         tx_headroom: old.as_ref().map_or(0, |old| old.tx_headroom),
     });
@@ -1009,6 +1071,14 @@ pub fn note_rx_overrun(name: &str, n: u64) {
     });
 }
 
+/// Hardware CRC failures, reported separately from software packet counters.
+pub fn note_rx_crc_error(name: &str, n: u64) {
+    with_stats_mut(name, |stats| {
+        stats.rx_crc_errors = stats.rx_crc_errors.saturating_add(n);
+        stats.rx_errs = stats.rx_errs.saturating_add(n);
+    });
+}
+
 fn send_dispatch(entry: &NetIfaceEntry) -> SendDispatch {
     match entry.send_context {
         Some((cookie, send)) => SendDispatch::Context { cookie, send },
@@ -1217,6 +1287,7 @@ pub struct NetIfaceSnapshot {
     /// an owned [`crate::Frame`] to [`Self::xmit_frame`]; private so every
     /// transmit still passes through the snapshot's tap-aware methods.
     send_frame: Option<SendFrameFn>,
+    send_frame_context: Option<(u64, SendFrameCtxFn)>,
     /// Queue-local TX recyclers retained by value with this route snapshot.
     /// Keeping the `Arc` here lets the TCP fast path acquire a build buffer
     /// without re-entering the global interface registry lock per packet.
@@ -1277,16 +1348,34 @@ impl NetIfaceSnapshot {
     /// back to a slice copy through the classic send fn if the iface somehow
     /// lost its hook between acquire and xmit.
     pub fn xmit_frame(&self, frame: crate::Frame, meta: crate::TxMeta) -> Result<(), ()> {
+        self.xmit_frame_from(frame, meta, None, false)
+    }
+    pub fn xmit_frame_from(
+        &self,
+        frame: crate::Frame,
+        meta: crate::TxMeta,
+        origin: Option<&crate::raw_sock::PacketSock>,
+        bypass: bool,
+    ) -> Result<(), ()> {
+        if frame.tx_timing() != crate::TxTiming::default() && self.send_frame_context.is_none() {
+            return Err(());
+        }
         let len = frame.len() as usize;
-        crate::raw_sock::dev_queue_xmit_nit(
-            self,
-            frame.payload(),
-            crate::raw_sock::tx_protocol(frame.payload()),
-            None,
-        );
-        let result = match self.send_frame {
-            Some(send_frame) => send_frame(frame, meta),
-            None => self.driver_send.call(frame.payload(), meta),
+        if !bypass {
+            crate::raw_sock::dev_queue_xmit_nit(
+                self,
+                frame.payload(),
+                crate::raw_sock::tx_protocol(frame.payload()),
+                origin,
+            );
+        }
+        let result = if let Some((cookie, send)) = self.send_frame_context {
+            send(cookie, frame, meta)
+        } else {
+            match self.send_frame {
+                Some(send_frame) => send_frame(frame, meta),
+                None => self.driver_send.call(frame.payload(), meta),
+            }
         };
         record_tx_result(&self.name, len, result.is_ok());
         result
@@ -1381,6 +1470,7 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
         offloads: entry.offloads,
         software_gro: entry.software_gro,
         send_frame: entry.send_frame,
+        send_frame_context: entry.send_frame_context,
         tx_pools: entry.tx_pools.clone(),
         tx_headroom: entry.tx_headroom,
     }
@@ -1406,36 +1496,150 @@ fn with_dev<R>(net_ns_id: u64, ifindex: u32, f: impl FnOnce(&mut NetIfaceEntry) 
     Some(f(entry))
 }
 
+/// Install a driver's MTU, MAC and receive-filter control after registration.
+/// Re-registration deliberately clears the old device's control hook.
+pub fn set_device_control(name: &str, ops: Arc<dyn DeviceControl>) -> bool {
+    let mut g = IFACES.lock();
+    let Some(e) = g
+        .as_mut()
+        .and_then(|v| v.iter_mut().find(|e| e.name == name))
+    else {
+        return false;
+    };
+    e.control = Some(Arc::new(Control {
+        ops,
+        busy: core::sync::atomic::AtomicBool::new(false),
+    }));
+    true
+}
+
+pub fn device_control(name: &str) -> Option<Arc<dyn DeviceControl>> {
+    let g = IFACES.lock();
+    g.as_ref()?
+        .iter()
+        .find(|e| e.name == name)?
+        .control
+        .as_ref()
+        .map(|c| c.ops.clone())
+}
+
+fn configure_device(
+    select: impl Fn(&NetIfaceEntry) -> bool,
+    change: impl FnOnce(&mut NetIfaceEntry) -> Result<(), i32>,
+) -> Result<(), i32> {
+    const ENODEV: i32 = 19;
+    const EBUSY: i32 = 16;
+    let control = {
+        let g = IFACES.lock();
+        g.as_ref()
+            .and_then(|v| v.iter().find(|e| select(e)))
+            .ok_or(ENODEV)?
+            .control
+            .clone()
+    };
+    if control.is_none() {
+        let mut g = IFACES.lock();
+        let e = g
+            .as_mut()
+            .and_then(|v| v.iter_mut().find(|e| select(e)))
+            .ok_or(ENODEV)?;
+        // Drivers without a hook retain their existing atomic registry-only
+        // behavior. Do not overwrite unrelated concurrent metadata changes.
+        if e.control.is_some() {
+            return Err(EBUSY);
+        }
+        return change(e);
+    }
+    // Serialize control transactions without disabling IRQs across the
+    // callback. A reentrant or concurrent mutation returns EBUSY.
+    let _busy = if let Some(c) = &control {
+        if c.busy.swap(true, core::sync::atomic::Ordering::Acquire) {
+            return Err(EBUSY);
+        }
+        Some(ControlGuard(c.clone()))
+    } else {
+        None
+    };
+    let mut proposed = {
+        let g = IFACES.lock();
+        g.as_ref()
+            .and_then(|v| v.iter().find(|e| select(e)))
+            .ok_or(ENODEV)?
+            .clone()
+    };
+    if !proposed
+        .control
+        .as_ref()
+        .zip(control.as_ref())
+        .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+    {
+        return Err(ENODEV);
+    }
+    change(&mut proposed)?;
+    if let Some(c) = &control {
+        c.ops.configure(&DeviceConfig {
+            mac: proposed.mac,
+            mtu: proposed.mtu,
+            promiscuous: proposed.promiscuity != 0,
+            all_multicast: proposed.allmulti != 0,
+            addresses: proposed.hw_addrs.clone(),
+        })?;
+    }
+    let mut g = IFACES.lock();
+    let entry = g
+        .as_mut()
+        .and_then(|v| v.iter_mut().find(|e| select(e)))
+        .ok_or(ENODEV)?;
+    let same_owner = match (&entry.control, &control) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    if !same_owner || entry.ifindex != proposed.ifindex {
+        return Err(ENODEV);
+    }
+    entry.mac = proposed.mac;
+    entry.mtu = proposed.mtu;
+    entry.addr_assign_type = proposed.addr_assign_type;
+    entry.promiscuity = proposed.promiscuity;
+    entry.allmulti = proposed.allmulti;
+    entry.hw_addrs = proposed.hw_addrs;
+    Ok(())
+}
+
 /// `dev_set_promiscuity(dev, inc)`. Errors are Linux errnos (positive).
 ///
-/// LINUX-GAP: `__dev_set_rx_mode` / `ndo_set_rx_mode` — NARF NIC drivers do
-/// not reprogram their receive filters from this count; only the reference
-/// count and `IFF_PROMISC` in `dev->flags` (sysfs `flags`) change.
+/// Drivers with a DeviceControl hook apply hardware filters before the
+/// reference count and IFF_PROMISC metadata change.
 pub fn dev_set_promiscuity(net_ns_id: u64, ifindex: u32, inc: i32) -> Result<(), i32> {
-    with_dev(net_ns_id, ifindex, |e| {
-        let next = e.promiscuity.wrapping_add_signed(inc);
-        if next == 0 && inc > 0 {
-            // "promiscuity touches roof".
-            return Err(crate::raw_sock::errno::EOVERFLOW);
-        }
-        e.promiscuity = next;
-        Ok(())
-    })
-    .unwrap_or(Err(crate::raw_sock::errno::ENODEV))
+    configure_device(
+        |e| e.net_ns_id == net_ns_id && e.ifindex == ifindex,
+        |e| {
+            let next = e.promiscuity.wrapping_add_signed(inc);
+            if next == 0 && inc > 0 {
+                // "promiscuity touches roof".
+                return Err(crate::raw_sock::errno::EOVERFLOW);
+            }
+            e.promiscuity = next;
+            Ok(())
+        },
+    )
 }
 
 /// `dev_set_allmulti(dev, inc)`; see [`dev_set_promiscuity`] for the
-/// driver-programming gap.
+/// receive-mode hardware transaction.
 pub fn dev_set_allmulti(net_ns_id: u64, ifindex: u32, inc: i32) -> Result<(), i32> {
-    with_dev(net_ns_id, ifindex, |e| {
-        let next = e.allmulti.wrapping_add_signed(inc);
-        if next == 0 && inc > 0 {
-            return Err(crate::raw_sock::errno::EOVERFLOW);
-        }
-        e.allmulti = next;
-        Ok(())
-    })
-    .unwrap_or(Err(crate::raw_sock::errno::ENODEV))
+    configure_device(
+        |e| e.net_ns_id == net_ns_id && e.ifindex == ifindex,
+        |e| {
+            let next = e.allmulti.wrapping_add_signed(inc);
+            if next == 0 && inc > 0 {
+                return Err(crate::raw_sock::errno::EOVERFLOW);
+            }
+            e.allmulti = next;
+            Ok(())
+        },
+    )
 }
 
 /// `dev_mc_add` / `dev_uc_add`: take a reference on a hardware address.
@@ -1445,22 +1649,24 @@ pub fn dev_hw_addr_add(
     addr: [u8; 6],
     unicast: bool,
 ) -> Result<(), i32> {
-    with_dev(net_ns_id, ifindex, |e| {
-        match e
-            .hw_addrs
-            .iter_mut()
-            .find(|h| h.addr == addr && h.unicast == unicast)
-        {
-            Some(h) => h.refcount += 1,
-            None => e.hw_addrs.push(HwAddr {
-                addr,
-                unicast,
-                refcount: 1,
-            }),
-        }
-        Ok(())
-    })
-    .unwrap_or(Err(crate::raw_sock::errno::ENODEV))
+    configure_device(
+        |e| e.net_ns_id == net_ns_id && e.ifindex == ifindex,
+        |e| {
+            match e
+                .hw_addrs
+                .iter_mut()
+                .find(|h| h.addr == addr && h.unicast == unicast)
+            {
+                Some(h) => h.refcount += 1,
+                None => e.hw_addrs.push(HwAddr {
+                    addr,
+                    unicast,
+                    refcount: 1,
+                }),
+            }
+            Ok(())
+        },
+    )
 }
 
 /// `dev_mc_del` / `dev_uc_del`: drop a reference; `-ENOENT` when absent.
@@ -1470,21 +1676,23 @@ pub fn dev_hw_addr_del(
     addr: [u8; 6],
     unicast: bool,
 ) -> Result<(), i32> {
-    with_dev(net_ns_id, ifindex, |e| {
-        let Some(pos) = e
-            .hw_addrs
-            .iter()
-            .position(|h| h.addr == addr && h.unicast == unicast)
-        else {
-            return Err(crate::raw_sock::errno::ENOENT);
-        };
-        e.hw_addrs[pos].refcount -= 1;
-        if e.hw_addrs[pos].refcount == 0 {
-            e.hw_addrs.remove(pos);
-        }
-        Ok(())
-    })
-    .unwrap_or(Err(crate::raw_sock::errno::ENODEV))
+    configure_device(
+        |e| e.net_ns_id == net_ns_id && e.ifindex == ifindex,
+        |e| {
+            let Some(pos) = e
+                .hw_addrs
+                .iter()
+                .position(|h| h.addr == addr && h.unicast == unicast)
+            else {
+                return Err(crate::raw_sock::errno::ENOENT);
+            };
+            e.hw_addrs[pos].refcount -= 1;
+            if e.hw_addrs[pos].refcount == 0 {
+                e.hw_addrs.remove(pos);
+            }
+            Ok(())
+        },
+    )
 }
 
 /// The hardware addresses on a device's lists (tests and diagnostics).
@@ -1562,28 +1770,34 @@ pub fn set_link_metadata(
 }
 
 pub fn set_mtu(name: &str, mtu: u32) -> bool {
-    let mut g = IFACES.lock();
-    let Some(entry) = g
-        .as_mut()
-        .and_then(|ifaces| ifaces.iter_mut().find(|iface| iface.name == name))
-    else {
-        return false;
-    };
-    entry.mtu = mtu;
-    true
+    try_set_mtu(name, mtu).is_ok()
+}
+
+/// Hardware-aware MTU mutation, preserving the driver's Linux errno.
+pub fn try_set_mtu(name: &str, mtu: u32) -> Result<(), i32> {
+    configure_device(
+        |e| e.name == name,
+        |e| {
+            e.mtu = mtu;
+            Ok(())
+        },
+    )
 }
 
 pub fn set_mac(name: &str, mac: [u8; 6]) -> bool {
-    let mut g = IFACES.lock();
-    let Some(entry) = g
-        .as_mut()
-        .and_then(|ifaces| ifaces.iter_mut().find(|iface| iface.name == name))
-    else {
-        return false;
-    };
-    entry.mac = mac;
-    entry.addr_assign_type = 3; // NET_ADDR_SET
-    true
+    try_set_mac(name, mac).is_ok()
+}
+
+/// Hardware-aware MAC mutation, preserving the driver's Linux errno.
+pub fn try_set_mac(name: &str, mac: [u8; 6]) -> Result<(), i32> {
+    configure_device(
+        |e| e.name == name,
+        |e| {
+            e.mac = mac;
+            e.addr_assign_type = 3;
+            Ok(())
+        },
+    )
 }
 
 /// Replace the IPv4 / gateway pair on the primary iface (boot-time
@@ -1807,6 +2021,26 @@ pub fn install_rx_handler(h: RxHandler) {
 /// the buffer afterwards; mutating it before the stack copies the payload out
 /// (or the driver reflects it for `XDP_TX`) is the whole point of a writable
 /// XDP surface.
+static NATIVE_RX_HANDLER: AtomicUsize = AtomicUsize::new(0);
+pub fn install_native_rx_handler(h: fn(&str, &mut [u8], Option<u64>)) {
+    NATIVE_RX_HANDLER.store(h as usize, Ordering::Release);
+}
+/// Deliver a packet whose native XDP action was PASS. The native handler
+/// performs software claims and protocol dispatch without executing XDP twice.
+pub fn on_native_rx_frame(name: &str, frame: &mut [u8]) {
+    on_native_rx_timestamped(name, frame, None)
+}
+pub fn on_native_rx_timestamped(name: &str, frame: &mut [u8], timestamp: Option<u64>) {
+    let ptr = NATIVE_RX_HANDLER.load(Ordering::Acquire);
+    if ptr == 0 {
+        on_rx_frame_from(name, frame);
+        return;
+    }
+    record_rx_frame(name, frame);
+    // SAFETY: the pointer was installed with the exact RxHandler signature.
+    let handler: fn(&str, &mut [u8], Option<u64>) = unsafe { core::mem::transmute(ptr) };
+    handler(name, frame, timestamp);
+}
 pub fn on_rx_frame_from(iface_name: &str, frame: &mut [u8]) {
     if !iface_name.is_empty() {
         record_rx_frame(iface_name, frame);
@@ -2077,5 +2311,90 @@ mod zc_tx_tests {
     kernel_test_in!(
         "net/iface",
         smoke_iface_retire_for_rebind_keeps_name_and_ifindex
+    );
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod device_control_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    #[derive(Debug)]
+    struct ControlModel {
+        name: String,
+        observed: IrqSafeSpinLock<Option<DeviceConfig>>,
+        reentrant_rejected: core::sync::atomic::AtomicBool,
+    }
+    impl DeviceControl for ControlModel {
+        fn configure(&self, config: &DeviceConfig) -> Result<(), i32> {
+            // A registry lookup and reentrant mutation inside the callback
+            // exercise lock release and the per-device transaction gate.
+            if lookup(&self.name).is_none() {
+                return Err(19);
+            }
+            self.reentrant_rejected
+                .store(!set_mtu(&self.name, 1400), Ordering::Release);
+            if config.mtu > 9000 {
+                return Err(22);
+            }
+            *self.observed.lock() = Some(config.clone());
+            Ok(())
+        }
+    }
+    fn send(_: &[u8], _: crate::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+
+    fn smoke_iface_device_control_commit_reject_and_reentrancy() -> TestResult {
+        let name = register("ctl-test%d", [2, 0, 0, 0, 0, 1], send);
+        let model = Arc::new(ControlModel {
+            name: name.clone(),
+            observed: IrqSafeSpinLock::new(None),
+            reentrant_rejected: core::sync::atomic::AtomicBool::new(false),
+        });
+        if !set_device_control(&name, model.clone()) || !set_mtu(&name, 9000) {
+            return TestResult::Fail("accepted hardware MTU was not committed");
+        }
+        if set_mtu(&name, 9001) || lookup(&name).unwrap().mtu != 9000 {
+            return TestResult::Fail("rejected hardware MTU changed metadata");
+        }
+        if !model.reentrant_rejected.load(Ordering::Acquire) {
+            return TestResult::Fail("reentrant control transaction was not rejected");
+        }
+        let mac = [2, 0, 0, 0, 0, 2];
+        if !set_mac(&name, mac) || model.observed.lock().as_ref().unwrap().mac != mac {
+            return TestResult::Fail("MAC change bypassed driver");
+        }
+        let index = lookup(&name).unwrap().ifindex;
+        if dev_set_promiscuity(0, index, 1).is_err()
+            || !model.observed.lock().as_ref().unwrap().promiscuous
+        {
+            return TestResult::Fail("promiscuity change bypassed driver");
+        }
+        let address = [0x33, 0x33, 0, 0, 0, 1];
+        if dev_hw_addr_add(0, index, address, false).is_err()
+            || model
+                .observed
+                .lock()
+                .as_ref()
+                .unwrap()
+                .addresses
+                .first()
+                .map(|a| a.addr)
+                != Some(address)
+        {
+            return TestResult::Fail("multicast add bypassed driver");
+        }
+        if dev_hw_addr_del(0, index, address, false).is_err()
+            || !model.observed.lock().as_ref().unwrap().addresses.is_empty()
+        {
+            return TestResult::Fail("multicast delete bypassed driver");
+        }
+        unregister(&name);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "net/iface",
+        smoke_iface_device_control_commit_reject_and_reentrancy
     );
 }

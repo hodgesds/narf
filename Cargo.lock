@@ -1810,6 +1810,7 @@ dependencies = [
  "narf-driver-runtime",
  "narf-drivers",
  "narf-drivers-net-core",
+ "narf-filesystem",
  "narf-firmware",
  "narf-interrupts",
  "narf-io",
@@ -1818,6 +1819,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-net",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
 ]

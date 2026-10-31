@@ -1,5 +1,44 @@
 # NARF status
 
+**2026-10-31 — I225/I226 wired Ethernet software expansion:** the built-in
+IGC driver now implements independent MSI-X queue routing and CPU-pinned RX
+workers, configurable rings/channels/RSS/coalescing, ethtool controls and
+read-only diagnostics/NVM, negotiated pause/EEE, WoL and runtime/system PM.
+The PHC is exposed through `/dev/ptpN`, dynamic clock syscalls and AF_PACKET
+hardware timestamp/error-queue reports. Native controls add Qbv/CBS/launch
+times, verified MAC Merge preemption and receive steering; native XDP and
+exclusive direct-UMEM queues retain DMA ownership through completion and
+failed recovery. Admin state, multiple built-in controllers, AER/removal and
+the `.ko` copy datapath are integrated. The control/data protocols use
+`~/git/linux` at `ecd997b0189a` as their reference.
+
+Native scheduling/MAC Merge controls and NARF's capability-based UMEM rings
+are paired with Linux `NETLINK_ROUTE` `tc` qdisc configuration (`taprio`,
+`cbs`, `etf`), `SO_TXTIME`/`SCM_TXTIME` hardware launch-time ancillary
+messages, `NETLINK_GENERIC` `ethtool` MAC Merge (`ETHTOOL_MSG_MM_GET`/`SET`),
+and `AF_XDP` user-page `XDP_UMEM_REG` + `mmap` ring support (`XDP_PGOFF_*`,
+`XDP_MMAP_OFFSETS`, `XDP_STATISTICS`). Module instances use
+the copy-mode device C ABI. Physical acceptance on this host's I225-V
+(`8086:15f3`, rev 01) remains open; see the
+[driver contract](drivers/net/specification/spec.md#3-public-interface).
+
+Validation: the broad QEMU suites pass **4,371 tests on x86_64** and
+**4,098 on aarch64**, with zero failures and 13 skips each (including the
+physical-I225 smoke). Both use two vCPUs and select network drivers/stack,
+bus, power, time, filesystem, syscall ABI and modules; ARM additionally runs
+the existing `userspace/perf` cache regressions. Debug/release and `.ko`
+builds, targeted Clippy on both architectures and formatting pass. Production
+boot and both filesystem postflights pass on each architecture. Logs are under
+`target/host-narf/igc-all-features-20261030/`.
+
+The expanded checks cover queue/timestamp/TSN/UMEM ownership and Linux ABI
+regressions. The broad ARM run exposed a retained file-cache collision across
+filesystem devices; the cache now namespaces anchors by device. The
+deterministic cross-device regression fails on base commit `1096f6b7b` with
+only the test added and passes with the fix. The standalone FAT test on the
+pristine base also passes, confirming the order-sensitive retained-cache
+collision rather than a FAT image-construction failure.
+
 This page tracks milestone progress and the boundaries of its proof.
 Subsystem specifications define the contracts; run the commands below for
 current test results.

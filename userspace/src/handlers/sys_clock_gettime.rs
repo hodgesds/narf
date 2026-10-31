@@ -5,6 +5,10 @@ pub(crate) fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let id = args.arg0;
     let buf = args.arg1;
+    if let Some(result) = super::phc::gettime(id as i32, buf) {
+        ctx.set_return(SyscallReturn::ok(result as u64));
+        return;
+    }
     // `clockid_t` is an `int`. A negative id that is not CLOCKFD is a POSIX
     // CPU clock (`clockid_to_kclock`): `posix_cpu_clock_get` resolves its
     // target with `pid_for_clock(clock, true)` and answers -EINVAL — never

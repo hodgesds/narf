@@ -22,6 +22,7 @@ builtin = [
     "dep:narf-drivers", "dep:narf-firmware", "dep:narf-interrupts",
     "dep:narf-io", "dep:narf-ipc", "dep:narf-kernel-test", "dep:narf-lib",
     "dep:narf-memory", "dep:narf-net", "dep:narf-scheduler", "dep:narf-time",
+    "dep:narf-power", "dep:narf-filesystem",
 ]
 module = []
 
@@ -44,6 +45,8 @@ narf-memory       = { path = "../../../memory", optional = true }
 narf-net          = { path = "../../../net", optional = true }
 narf-scheduler    = { path = "../../../scheduler", optional = true }
 narf-time         = { path = "../../../time", optional = true }
+narf-power        = { path = "../../../power", optional = true }
+narf-filesystem   = { path = "../../../filesystem", optional = true }
 
 [lints]
 workspace = true

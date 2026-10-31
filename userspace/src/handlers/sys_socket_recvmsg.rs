@@ -149,9 +149,9 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                 // even when SO_PASSCRED is disabled so it cannot leak into a
                 // later recvmsg on the same socket.
                 let user_cred = sock.take_netlink_user_recv_cred();
-                let cred = sock.passcred().then(|| {
-                    report_ucred_to(current_task_id(), user_cred.unwrap_or_default())
-                });
+                let cred = sock
+                    .passcred()
+                    .then(|| report_ucred_to(current_task_id(), user_cred.unwrap_or_default()));
                 let ancillary_truncated =
                     install_netlink_ancillary(msg_ptr, cred, sock.netlink_pktinfo());
                 if ancillary_truncated {
@@ -163,8 +163,10 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                     sock.take_packet_recv_ancillary(),
                     sock.rcv_timestamp_mode(),
                 );
-                if ancillary_truncated {
-                    write_user_u32(msg_ptr + 48, 0x8); // MSG_CTRUNC
+                let report_flags = if ancillary_truncated { 0x8 } else { 0 }
+                    | (flags & crate::socket::MSG_ERRQUEUE);
+                if report_flags != 0 {
+                    write_user_u32(msg_ptr + 48, report_flags);
                 }
             } else {
                 // SCM_RIGHTS: install any passed file objects into this task's
@@ -222,12 +224,7 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                         sock.udp_gro_enabled(),
                     )
                 } else {
-                    install_recv_ancillary(
-                        msg_ptr,
-                        recv_fds,
-                        cred,
-                        flags & MSG_CMSG_CLOEXEC != 0,
-                    )
+                    install_recv_ancillary(msg_ptr, recv_fds, cred, flags & MSG_CMSG_CLOEXEC != 0)
                 };
                 // Preserve these for the msg_flags OR below (MSG_TRUNC is added
                 // there). A bare write matches the prior MSG_CTRUNC behaviour.

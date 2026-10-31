@@ -1992,3 +1992,29 @@ kernel_test_in!(
     "modules/domain",
     smoke_module_scope_scrubs_dead_stack_on_exit
 );
+
+fn smoke_lifecycle_exit_preserves_device_kabi_owner() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static OBSERVED: AtomicU64 = AtomicU64::new(0);
+    extern "C" fn exit() {
+        OBSERVED.store(crate::symbols::current_execution_id().0, Ordering::Relaxed);
+    }
+    let mut module = arc_test_module("exit_device_owner", 0x1225);
+    Arc::get_mut(&mut module).unwrap().exit_addr = Some(exit as usize);
+    // SAFETY: fixture init and exit addresses are real resident C functions.
+    if unsafe { crate::loader::invoke_init(&module) }.is_err() {
+        return TestResult::Fail("fixture init");
+    }
+    let previous = crate::symbols::swap_execution_context(crate::symbols::ModuleId(0xdead));
+    // SAFETY: module is live, has no refs and exit points to the resident fixture.
+    let result = unsafe { crate::loader::invoke_exit(&module) };
+    let restored = crate::symbols::swap_execution_context(previous);
+    if result.is_err() || OBSERVED.load(Ordering::Relaxed) != module.id.0 || restored.0 != 0xdead {
+        return TestResult::Fail("module exit lost/restored wrong KABI owner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "modules/lifecycle",
+    smoke_lifecycle_exit_preserves_device_kabi_owner
+);

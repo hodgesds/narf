@@ -13180,6 +13180,8 @@ struct ScmSendAncillary {
     /// of the first malformed one. A UDP send path applies it after its
     /// address checks, where Linux parses it.
     udp_gso: Option<Result<u16, i64>>,
+    /// Hardware launch time in nanoseconds supplied via `SCM_TXTIME` (61).
+    txtime: Option<u64>,
 }
 
 /// Parse Linux `SOL_SOCKET` send control messages. `SCM_RIGHTS` descriptors
@@ -13192,6 +13194,7 @@ fn parse_scm_send_ancillary(
     const SOL_SOCKET: i32 = 1;
     const SCM_RIGHTS: i32 = 1;
     const SCM_CREDENTIALS: i32 = 2;
+    const SCM_TXTIME: i32 = 61;
     const SCM_MAX_FD: usize = 253;
     const SOL_UDP: i32 = 17;
     // struct cmsghdr { u64 cmsg_len; i32 cmsg_level; i32 cmsg_type; } = 16 B.
@@ -13200,6 +13203,7 @@ fn parse_scm_send_ancillary(
         cred: None,
         src_override: None,
         udp_gso: None,
+        txtime: None,
     };
     if ctrl_len == 0 {
         return Ok(out);
@@ -13269,6 +13273,14 @@ fn parse_scm_send_ancillary(
                         gid: u32::from_ne_bytes(ctrl[off + 24..off + 28].try_into().unwrap()),
                     };
                     out.cred = Some(validate_scm_ucred(supplied)?);
+                }
+                SCM_TXTIME => {
+                    if cmsg_len != 24 {
+                        return Err(EINVAL);
+                    }
+                    out.txtime = Some(u64::from_ne_bytes(
+                        ctrl[off + 16..off + 24].try_into().unwrap(),
+                    ));
                 }
                 _ => return Err(EINVAL),
             }
@@ -13562,6 +13574,17 @@ fn install_packet_ancillary(
                 (true, true) => SCM_TIMESTAMPNS_NEW,
             };
             records.push((SOL_SOCKET, kind, value));
+        }
+        let flags=ancillary.timestamping_flags;
+        if flags&0x50!=0 && (ancillary.hardware_ns.is_some() || flags&0x10!=0){
+            let mut times=[0u8;48];
+            if flags&0x10!=0{times[..8].copy_from_slice(&ancillary.tstamp_secs.to_ne_bytes());times[8..16].copy_from_slice(&i64::from(ancillary.tstamp_nanos).to_ne_bytes());}
+            if flags&0x40!=0{if let Some(ns)=ancillary.hardware_ns{times[32..40].copy_from_slice(&((ns/1_000_000_000)as i64).to_ne_bytes());times[40..48].copy_from_slice(&((ns%1_000_000_000)as i64).to_ne_bytes());}}
+            records.push((SOL_SOCKET,if ancillary.timestamping_new{65}else{37},times.to_vec()));
+        }
+        if let Some(error)=ancillary.timestamp_error{
+            let mut extended=[0u8;16];extended[..4].copy_from_slice(&error.to_ne_bytes());extended[4]=4;
+            records.push((SOL_PACKET,16,extended.to_vec()));
         }
         if let Some(auxdata) = ancillary.auxdata {
             records.push((SOL_PACKET, PACKET_AUXDATA, auxdata.to_vec()));

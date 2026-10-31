@@ -66,8 +66,10 @@ There are already bootloader entries (`/boot/narf-frame-grub`,
   `grub-image --root-policy root-ro` command is in
   [BOOTING_ON_CACHYOS.md](BOOTING_ON_CACHYOS.md#booting-the-installed-root-narfdisksroot-ro--root-rw).
 - **Use wired networking** for SSH: the I225-V and its `igc` driver,
-  which is built by default. The MT7922 Wi-Fi driver has only been
-  tested against models.
+  which is built by default. Its software profile and outstanding physical
+  acceptance checks are in [the networking driver contract](../drivers/net/specification/spec.md#3-public-interface).
+  The host I225-V and MT7922 still require physical NARF validation; model
+  coverage alone does not establish that SSH works on this motherboard.
 
 Not covered by the VFIO bench: the host's own ACPI, interrupt routing,
 IOMMU and timers; xHCI keyboard input; NVMe on the real controller.

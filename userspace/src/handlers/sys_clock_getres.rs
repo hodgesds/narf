@@ -25,6 +25,10 @@ use super::*;
 /// apart again without a test failing.
 pub(crate) fn sys_clock_getres(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    if let Some(result) = super::phc::getres(args.arg0 as i32, args.arg1) {
+        ctx.set_return(SyscallReturn::ok(result as u64));
+        return;
+    }
     let id = args.arg0;
     let buf = args.arg1;
     // A POSIX CPU clock: `posix_cpu_clock_getres` → `validate_clock_permissions`

@@ -656,6 +656,7 @@ struct DeviceCtx {
     /// stable for the lifetime of the context and are never reused, so a
     /// handle remains stale after free instead of aliasing a later allocation.
     dmabufs: Vec<Option<Cap<narf_io::DmaBuffer, Write>>>,
+    retain_dma_on_teardown: bool,
     /// MSI-X objects remain kernel-owned; modules see only bounded vector
     /// numbers and callback cookies.
     msix: Option<crate::msix::MsixTable>,
@@ -740,6 +741,7 @@ fn install_device_ctx(owner: u64, token: u64, device: BusDevice, cap: Cap<BusDev
         cap,
         bars: Vec::new(),
         dmabufs: Vec::new(),
+        retain_dma_on_teardown: false,
         msix: None,
         irqs: Vec::new(),
         poller: None,
@@ -799,11 +801,31 @@ fn teardown_device_ctx(mut ctx: DeviceCtx) {
     // Full DMA-ring teardown must additionally drain device-owned descriptors
     // once a module begins submitting them to hardware.
     for cap in ctx.dmabufs.iter().flatten().copied() {
-        narf_io::unregister(cap);
+        if !ctx.retain_dma_on_teardown {
+            narf_io::unregister(cap);
+        }
     }
     // Epoch revocation invalidates every copied token retained after this
     // device context is removed.
     ctx.cap.revoke();
+}
+
+/// Retain coherent allocations when a module cannot prove terminal DMA
+/// completion. Set before posting addresses; clear only after a hardware
+/// drain/reset. Retained registry objects outlive context revocation.
+pub fn module_dma_retain_on_teardown(owner: u64, token: u64, retain: bool) -> i32 {
+    let mut contexts = DEVICE_CTXS.lock();
+    let Some(ctx) = contexts
+        .iter_mut()
+        .find(|c| c.owner == owner && c.token == token)
+    else {
+        return -19;
+    };
+    if ctx.cap.invoke(DeviceOp(|| ())).is_err() {
+        return -19;
+    }
+    ctx.retain_dma_on_teardown = retain;
+    0
 }
 
 /// Enable PCI command bits (e.g. MEM_SPACE | BUS_MASTER) on a module-owned
@@ -1844,3 +1866,62 @@ pub fn __reset_for_test() {
     REMOVE_FNS.lock().clear();
     BOUND.lock().clear();
 }
+
+fn smoke_module_dma_quarantine_survives_context_teardown() -> narf_kernel_test::TestResult {
+    use crate::{BusAddr, BusKind, DeviceId};
+    use narf_kernel_test::TestResult;
+    use narf_memory::PhysAddr;
+    let owner = 0x1_2250;
+    let token = 0x1_2251;
+    let device = BusDevice {
+        addr: BusAddr::Mmio(PhysAddr::new(0)),
+        kind: BusKind::VirtioMmio {
+            base: PhysAddr::new(0),
+            len: 0x200,
+            device_id: 1,
+        },
+        id: DeviceId {
+            vendor: 0xffff,
+            device: 0xffff,
+            class: 0,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+    };
+    // No address from this test is ever exposed to hardware. Therefore it is
+    // safe to clean up the deliberately quarantined allocation after checking
+    // the real teardown path retained it.
+    for retain in [false, true] {
+        install_device_ctx(
+            owner,
+            token,
+            device,
+            Cap::<BusDeviceCap, Write>::bootstrap(),
+        );
+        let handle = module_dma_alloc(owner, token, 4096, narf_lib::id::DomainId::DRIVER_0);
+        if handle == 0 {
+            return TestResult::Fail("module DMA fixture allocation");
+        }
+        let cap = {
+            let contexts = DEVICE_CTXS.lock();
+            contexts.iter().find(|c| c.token == token).unwrap().dmabufs[(handle - 1) as usize]
+                .unwrap()
+        };
+        if module_dma_retain_on_teardown(owner + 1, token, true) != -19 {
+            return TestResult::Fail("foreign module changed DMA retention");
+        }
+        if module_dma_retain_on_teardown(owner, token, retain) != 0 {
+            return TestResult::Fail("owner cannot set DMA retention");
+        }
+        remove_device_ctx(token);
+        let kept = narf_io::resolve(cap.slot().index).is_some();
+        if retain {
+            narf_io::unregister(cap);
+        }
+        if kept != retain {
+            return TestResult::Fail("DMA quarantine did not survive context teardown");
+        }
+    }
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!("bus", smoke_module_dma_quarantine_survives_context_teardown);

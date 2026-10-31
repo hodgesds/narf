@@ -12,7 +12,7 @@ Network device drivers. Exports frames via the `HwNic` trait and the
 |---|---|---|
 | `e1000` | Intel 8254x family | clean-room from public Intel datasheet; TX + RX descriptor rings, polled. |
 | `e1000e` | Intel 8257x family | shares the `e1000` core, extension VID/DIDs. |
-| `igc` | Intel I225 / I226 family — 2.5 GbE | clean-room from public Intel datasheets; CTRL.RST + RAL/RAH MAC + legacy TX/RX descriptor rings + tx/rx (Stage cut: MSI-X + advanced descriptors are follow-ups). |
+| `igc` | Intel I225 / I226 family — 2.5 GbE | Per-function multi-queue MSI-X/RSS, checked checksum/SCTP/TSO/VLAN offloads, jumbo RX, ethtool controls/stats, pause/EEE/WoL, PHC/packet timestamps, native TSN/MAC Merge and XDP/direct UMEM, PCI recovery/removal, PM and a functional copy-mode `.ko`. Linux reference: `~/git/linux` at `ecd997b0189a`. Physical I225-V acceptance remains open; see the [driver contract](specification/spec.md#3-public-interface). |
 | `rtl8139` | Realtek RTL8139 10/100 Mbps | clean-room from public Realtek programming guide; CONFIG1 unlock + CR.RST + IDR0..5 MAC + 64 KiB cyclic RX ring + 4 × 2 KiB TX buffers + tx/rx + link status. |
 | `r8169` | Realtek RTL81xx 1 GbE family | clean-room TX/RX descriptor rings + MSI-X. |
 | `rtl8125` | Realtek RTL8125 / 8125B 2.5 GbE | clean-room PCI match + reset + MAC decode + TX descriptor layout (stages 1-3). |

@@ -75,7 +75,9 @@ hardware match before PCI probing. It is an explicit image list, not a
 dependency or device-alias resolver; signatures, ABI and capability checks,
 and the runtime-text ban on `FRAME` remain unchanged.
 
-`invoke_init` / `invoke_exit` bracket lifecycle code with that domain. Bus
+`invoke_init` / `invoke_exit` bracket lifecycle code with that domain. Exit also
+sets and restores the module execution owner so device KABI operations can
+quiesce its resources before removal. Bus
 callbacks go through an owner-aware call gate that looks the module up by its
 non-reused `ModuleId`, pins it while Live, enters the same domain, records the
 per-CPU callback owner for handle checks, invokes the C-ABI thunk, and restores

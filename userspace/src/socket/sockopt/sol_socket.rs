@@ -299,6 +299,29 @@ impl SocketFile {
                 self.options.lock().ext.reserve_mem = (pages * 4096) as i32;
                 OK
             }
+            SO_TXTIME => {
+                if value.len() != 8 {
+                    return Some(EINVAL_R);
+                }
+                let clockid = i32::from_ne_bytes(value[0..4].try_into().unwrap_or([0; 4]));
+                let flags = u32::from_ne_bytes(value[4..8].try_into().unwrap_or([0; 4]));
+                if flags & !0x3 != 0 {
+                    return Some(EINVAL_R);
+                }
+                if clockid != 1 && !capable(crate::handlers::CAP_NET_ADMIN) {
+                    return Some(EPERM_R);
+                }
+                let valid_clock = matches!(clockid, 0 | 1 | 11)
+                    || crate::handlers::phc::clock(clockid, false).is_ok();
+                if !valid_clock {
+                    return Some(EINVAL_R);
+                }
+                let mut o = self.options.lock();
+                o.ext.txtime_enabled = true;
+                o.ext.txtime_clockid = clockid;
+                o.ext.txtime_flags = flags;
+                OK
+            }
             SO_INQ if self.domain == AF_UNIX => {
                 // `unix_setsockopt`: exactly an int, stream only, 0 or 1.
                 if value.len() != 4 || self.kind != SOCK_STREAM || !(0..=1).contains(&val) {
@@ -403,8 +426,17 @@ impl SocketFile {
                 put_bytes(buf, &(self.net_ns_id() + 1).to_ne_bytes())
             }
             SO_ZEROCOPY => put_int(buf, 0),
-            SO_TXTIME => put_bytes(buf, &[0u8; 8]),
-            SO_TIMESTAMPING_OLD | SO_TIMESTAMPING_NEW => put_bytes(buf, &[0u8; 8]),
+            SO_TXTIME => {
+                let mut raw = [0u8; 8];
+                raw[0..4].copy_from_slice(&o.ext.txtime_clockid.to_ne_bytes());
+                raw[4..8].copy_from_slice(&o.ext.txtime_flags.to_ne_bytes());
+                put_bytes(buf, &raw)
+            }
+            SO_TIMESTAMPING_OLD | SO_TIMESTAMPING_NEW => {
+                let mut value = [0u8; 8];
+                value[..4].copy_from_slice(&o.timestamping_flags.to_ne_bytes());
+                put_bytes(buf, &value)
+            }
             SO_BINDTOIFINDEX => put_int(buf, o.bindtodevice_index as i32),
             SO_BUF_LOCK => put_int(buf, o.ext.buf_lock),
             SO_RESERVE_MEM => put_int(buf, o.ext.reserve_mem),
