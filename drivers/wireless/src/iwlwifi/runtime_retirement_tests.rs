@@ -121,7 +121,7 @@ fn smoke_iwl_host_command_long_group_and_metadata_leave_data_and_notifications_d
                     .trace
                     .take()
                     .ok_or("native HostCommand TFH publication absent")?;
-                let expected = [opcode, wire, index as u8, 0, 2, 0, version, 0, 0x76, 0x5a];
+                let expected = [opcode, wire, index as u8, 0, 2, 0, 0, version, 0x76, 0x5a];
                 if packet.bytes != expected {
                     return Err("native HostCommand literal wide group/header/version extent");
                 }
