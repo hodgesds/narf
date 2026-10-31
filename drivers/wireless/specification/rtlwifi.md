@@ -316,7 +316,8 @@ frames imply no peer ACK. Probe responses enter the same raw RX/BSS path.
 Cancellation and source loss close this generation and retain uncertain DMA.
 Four native composed scan cases cover Open/WPA2 conversations, literal probe
 and descriptor bytes, held completion/cancellation and prevalidation without
-radio mutation. A single-channel request can select a qualified channel1–11
+radio mutation. All four active-probe cases pass on both architectures at
+`73b90b62d`. A single-channel request can select a qualified channel1–11
 through the fresh-owner transition below. Multi-channel dwell aggregation
 and broader qualified HT/fallback profiles remain separate work (randomized scan addresses are
 source-inapplicable, section 8). Without the distinct HT record,
@@ -422,8 +423,8 @@ follow the dynamic-EDCA rules below. Four native Rust smokes cover literal EDCA/
 Open/WPA2 DMA and exact bidirectional data, malformed/downgraded responses,
 ignored register writes, actual signed/device epoch loss, isolated installed-policy
 clear/reinstall, retained mappings and cancelled M4. Physical WMM/RF acceptance
-remains unrecorded; broader HT, power management and reset/rejoin remain
-separate work.
+remains unrecorded; broader HT profiles remain separate work. Operating reset,
+system suspend and inactive power save are implemented and software-validated below.
 
 #### Traffic classification and all-AC/TID routing (implemented)
 
@@ -554,7 +555,8 @@ Malformed, unsigned, mismatched, unknown-curve or revoked inputs are rejected
 before HT writes and leave the parked owner retryable. Programming installs
 terminal failure before its first register write and commits only after exact
 readbacks. A running legacy owner cannot reload this profile or call the parked
-channel configurator; reset/rejoin remains unimplemented.
+channel configurator; the retained fresh-generation reset path below replaces
+that running owner before reconfiguration and requires fresh association.
 
 Linux `rtl8188ee/hw.c::read_power_value_fromprom` selects the signed high nibble
 of EFUSE0x1b for HT20; `phy.c::handle_path_a` adds it to the BW40 base.
@@ -1021,7 +1023,7 @@ fresh AP session, a new reserved-page upload on the reused descriptor,
 exact uplink, second disconnect) and the HT20 and paused-publisher
 regressions (stale publisher still fenced, Passive after close).
 
-### RTL8188EE operating-owner replacement (implemented, native acceptance pending)
+### RTL8188EE operating-owner replacement (implemented and software-validated)
 
 The persistent `interface::Device` now retains generation-tagged reset work.
 Its worker detects a closed owner and makes up to three automatic recovery
@@ -1060,9 +1062,11 @@ MAC and operator-controlled IFF_UP survive a successful replacement.
 
 Native regressions compose the production generation supervisor with real
 firmware, LLT, radio, station and DHCP code, using inert MMIO/DMA/peer models.
-Acceptance on both architectures remains pending; the inventory row stays open.
+All four recovery cases pass on x86_64 and aarch64 at native checkpoint
+`73b90b62d`; the operating-reset inventory row is closed. These fixtures prove
+the software protocol and lifecycle; physical board acceptance remains separate.
 
-### RTL8188EE system suspend and IPS (implemented, native acceptance pending)
+### RTL8188EE system suspend and IPS (implemented and software-validated)
 
 The native frontend registers both `AsyncSystemPm` and synchronous device-PM
 hooks. Async preparation closes the station, retires real DMA and interrupts,
@@ -1096,7 +1100,11 @@ resume returns to a fresh Passive owner with the same name/MAC/IFF_UP.
 
 Four native composed power cases cover retained suspend, fresh WPA2/DHCP,
 IPS scan wake and system handoff, absent DMA receipts, and cancellation-driven
-resume. Both system-PM and IPS inventory rows remain open pending acceptance.
+resume. All four pass on x86_64 and aarch64 at native checkpoint `73b90b62d`,
+alongside the four existing power cases. The system-PM and IPS inventory rows
+are closed. Final release Clippy and ordinary boot gates pass at the
+behavior-preserving lint successor `127744339`; physical board acceptance
+remains separate.
 
 ### Qualified legacy20 channel changes (implemented, native acceptance pending)
 
@@ -1156,17 +1164,17 @@ implemented and software-validated. Physical board qualification remains.
 | Correct BAR2/read-only EFUSE lifecycle and per-chip identity | Implemented; shared-path regressions |
 | Complete source-matched per-chip power/reset qualification | RTL8188EE PCI enable prefix/flow implemented; other families remain incomplete |
 | Authenticated image/header selection and runtime firmware loading | RTL8188EE retained probe owner implemented; other profiles missing |
-| DMA allocation/publication/quiesce, IRQ ownership, H2C/C2H | RTL8188EE retained DMA32 rings/LLT, one-shot polled service, terminal host delivery, demonstrated awake/keepalive/reserved-page/JOIN mailbox and terminal close/retention implemented. MSI interrupt delivery with W1C recognition (polling fallback) and the card-disable DMA quiescence proof are implemented; reset/recovery remain |
+| DMA allocation/publication/quiesce, IRQ ownership, H2C/C2H | RTL8188EE retained DMA32 rings/LLT, one-shot polled service, terminal host delivery, demonstrated awake/keepalive/reserved-page/JOIN mailbox and terminal close/retention implemented. MSI interrupt delivery with W1C recognition (polling fallback), card-disable DMA quiescence and fresh-generation reset/recovery are implemented and software-validated |
 | RF/BB tables, calibration, channel/power and rate control | RTL8188EE tables/retained1T IQK/LCK, static factory antenna, signed board/factory/regulatory legacy20 power, operational MAC and negotiated legacy peer/rate/filter integration implemented. Measured board envelope and silicon qualification remain; optional gain tracking is excluded by measured profile |
 | Scan, management RX/TX, authentication/association and WPA2 | Retained EE channel1 passive scan, Open MLME, shared WPA2/CCMP and exact M4 receipt implemented; Device/composition regressions pass native suites. Other matched chips remain missing |
 | Ethernet packet path and terminal TX completion ownership | EE same-owner native Device/Narf-Ring/stack and Open/WPA2 real-kernel DHCP/exact bidirectional IP fixtures pass software gates; actual board testing remains |
-| Multi-radio, removal, suspend/reset/recovery | RTL8188EE PCI removal (quiescence-gated DMA release) implemented; multi-radio, suspend and reset missing |
+| Multi-radio, removal, suspend/reset/recovery | RTL8188EE PCI removal (quiescence-gated DMA release), retained reset, system suspend and IPS implemented and software-validated; multi-radio remains |
 
 Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
 
 | Chip | Source hardware scope | Remaining native software |
 |---|---|---|
-| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. NEHT v2 additionally implements SGI20 and7935-byte reception; four native composed regressions pass on both architectures. Remaining software: HT40, broader scan/channels, gain tracking, IPS and reset/rejoin (MSI delivery, fwlps leisure power save and DMA quiescence are implemented). Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
+| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. NEHT v2 additionally implements SGI20 and7935-byte reception; four native composed regressions pass on both architectures. Reset/recovery, system suspend and IPS are software-validated. Remaining software: HT40, broader scan/channels and gain tracking (MSI delivery, fwlps leisure power save and DMA quiescence are implemented). Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
 | RTL8192CE family aliases / RTL8192EE |2.4GHz HT; CE aliases need exact RF-type qualification, including the8176/8188CE variant; EE is2T2R |Retained chip firmware/MAC/PHY/RF/calibration/power/packet/station chain, then full HT/QoS/lifecycle. The8179/8188EE HT path does not admit these IDs. |
 | RTL8192DE |Dual-band dual-MAC HT |Exact per-function reset/power/firmware/DMA/radio ownership and station chains, then bands/HT/QoS/lifecycle |
 | RTL8723AE/BE |2.4GHz1T1R HT with BT |Chip-specific retained chain, antenna/BT coexistence and HT/QoS/lifecycle |
@@ -1264,30 +1272,28 @@ firmware LPS `reg_fwctrl_lps = 2` MAX mode on by default on 8821AE, enabling
 `const_pci_aspm = 3`) and WoWLAN on RTL8821AE/8812AE (`wo_wlan_mode =
 WAKE_ON_MAGIC_PACKET | WAKE_ON_PATTERN_MATCH` with
 `rtlwifi/rtl8821aefw_wowlan.bin`). RTL8188EE has no WoWLAN. Each is now a
-named remaining feature row.
+named feature; IPS is implemented and software-validated above, while ASPM
+and the other chip-specific power paths retain their remaining rows.
 
 References: Linux `rtlwifi/efuse.c`, per-chip `sw.c`/`reg.h`,
 `rtl8192d/hw_common.c` dual-MAC selection, and per-chip firmware/HW code.
 
-### Current remaining feature blockers (2026-10-29)
+### Current remaining feature blockers (2026-10-30)
 
 These named rows retain the source/profile limits described above. Chip-specific
 runtimes remain separate from the retained RTL8188EE owner.
 
 | Row | Concrete blocker |
 |---|---|
-| `active_scanning` | Native single-channel active Probe Requests and qualified cold retune1–11 implemented pending acceptance; multi-channel dwell aggregation remains |
+| `active_scanning` | Native single-channel active Probe Requests software-validated; qualified cold retune1–11 implemented pending acceptance, and multi-channel dwell aggregation remains |
 | `additional_operating_channels` | Legacy20 cold retune1–11 under current signed per-channel NEPC implemented pending acceptance; broader qualified HT/fallback channel profiles remain |
 | `bt_coexistence` | Bluetooth coexistence on RTL8723AE/BE; blocked on the rtl8723ae/rtl8723be chip runtimes |
 | `dynamic_antenna_selection` | Dynamic antenna selection/tracking; blocked on per-antenna signed board measurements (NEPC binds one static factory antenna) |
 | `five_ghz_operation` | 5GHz band operation on RTL8192DE/RTL8821AE; blocked on the rtl8192de/rtl8821ae chip runtimes (RTL8188EE is 2.4GHz-only) |
 | `ht40` | HT40; blocked on a signed NEHT v2 record covering 40MHz emissions (NEHT v1 binds width20) and 40MHz BW programming |
-| `inactive_power_save` | IPS implemented pending native acceptance: default-on Passive-only watchdog, activity-stamped retained card disable, fresh-owner scan wake and verified IPS/system-sleep handoff |
 | `multi_radio` | Multiple live radios; blocked on per-device owners replacing the singleton controller (interface ACTIVE/CLAIMED and firmware_native MSI SIGNAL statics) |
-| `operating_reset` | Operating reset implemented pending native acceptance: retained generation supervisor, publication-lease drain, verified DMA/IRQ retirement, actual card-disable/enable, current PCI/factory identity and fresh authenticated firmware/LLT/radio/station owner. Old firmware claims stay one-shot; old keys, PNs, packets and cancellation never migrate to the replacement. |
 | `pcie_aspm` | PCIe ASPM link power management; blocked on bus/ PCIe link-control ASPM programming coordinated with the upstream bridge (outside family scope) |
 | `rf_gain_tracking` | RF gain/power tracking; blocked on a thermal-indexed signed gain envelope (thermal power tracking moves gains outside the fixed NEPC/NEHT envelope) |
 | `rts_cts_protection` | RTS/CTS protection; blocked on signed qualification of RTS/CTS-to-self emissions (NEPC/NEHT exclude them) and TXD RTS fields driven by bss use_cts_prot/use_rts |
-| `system_suspend` | System suspend implemented pending native acceptance: retained async DMA/IRQ/card-disable preparation, parked PCI type-0 save/restore and fresh authenticated firmware/LLT/radio/MAC resume; cancelled PM preparation finishes then requests fresh-owner rollback |
 | `vht` | VHT operation including TX/RX STBC on RTL8821AE; blocked on the rtl8821ae runtime |
 | `wowlan` | WoWLAN magic-packet/pattern wake on RTL8821AE/8812AE; blocked on the rtl8821ae runtime and system_suspend |

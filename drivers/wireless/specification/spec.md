@@ -206,17 +206,29 @@ and MT76 AP22. Both production release boots, two btrfs postflight images
 per architecture, release Clippy contexts and formatting pass. Debug builds
 are omitted by the explicit release-by-default task instruction. These are
 software model/QEMU results; board RF acceptance remains separate.
-RTL8188EE operating-owner replacement is implemented on the branch and
-remains open pending its own native recovery/DHCP acceptance.
+RTL8188EE operating-owner replacement was subsequently validated below.
+
+**Recount 2026-10-30** (validated RTL8188EE reset, system suspend and IPS):
+the ledger now holds **122 `feature`** rows (121 driver,1 shared),
+**35 `chip`** and **0 `unknown`**. Native checkpoint `73b90b62d` passes
+x86_64 **4174/0/13** and aarch64 **3815/0/7**, including four RTL recovery
+cases, eight RTL power cases, four active-probe cases and all Intel485 on
+each architecture. Sc TX A-MSDU is validated; its row retains parked Gen3.
+The behavior-preserving lint successor `127744339` passes both release
+Clippy contexts, formatting, ordinary production release boots and both
+btrfs postflight images per architecture. Release-only validation follows
+the explicit task instruction. Channel retune, broader scanning and later
+P2P/MQ batches retain separate pending checkpoints; software acceptance does
+not assert physical board RF qualification.
 
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 13 | Parked Gen3 HE, Sc TX A-MSDU and wider bands/widths; AP/P2P/WoW, scheduled scan and Gen2 multiple RX queues/RSS; additional chip profiles are tracked separately |
+| iwlwifi | 13 | Parked Gen3 HE/TX A-MSDU and wider bands/widths; AP/P2P/WoW, scheduled scan and Gen2 multiple RX queues/RSS; additional chip profiles are tracked separately |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 5 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA and loadable packet ABI |
 | ath10k | 18 | 2.4-GHz HT40/coexistence, additional streams/TX STBC and VHT160/80+80, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload |
 | ath9k | 9 | Channel/retune and HT40/SGI40 profiles, factory selection, periodic calibration, larger TX aggregates and idle/station sleep; other chips are separate rows |
-| rtlwifi | 15 | Other matched chips, broader channels/HT40/VHT, antenna/gain/coexistence, multiple radios, reset/IPS/system PM, RTS/CTS and PCIe ASPM |
+| rtlwifi | 12 | Other matched chips, broader scan/channels/HT40/VHT, antenna/gain/coexistence, multiple radios, RTS/CTS and PCIe ASPM |
 | rtl8xxxu | 9 | Other matched USB chips, SGI20/HT40 and wider channels/rates, RX/TX A-MPDU, TX A-MSDU, both BA directions and RX reorder, coexistence, EP0/halted reset, safe rejoin, FIFO retune and PM |
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
 | rtw89 | 13 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW, periodic RF tracking/runtime LPS and multiple functions; other AX/BE chips are separate rows |
