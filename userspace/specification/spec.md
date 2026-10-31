@@ -952,6 +952,17 @@ the signal before the selected interruptible sleeper resumes. Mask changes
 retarget pending work or notify a thread that unblocks it; SIGKILL/SIGSTOP
 remain unblockable. Explicit sigwait and signalfd consumers still inspect and
 dequeue shared pending independently of handler selection.
+Handlers, ptrace signal stops, sigwait and signalfd atomically select and dequeue each pending
+instance with its queued payload. A stale selection does not manufacture an
+SI_USER delivery. Queue locks are released before writing a user signal frame;
+the dequeued instance cannot be consumed by another thread during that write.
+If frame construction fails, the instance remains consumed and the task takes
+forced SIGSEGV, matching Linux `signal_setup_done` / `force_sigsegv`. A blocked
+or ignored SIGSEGV is reset to default and unblocked; failure to construct a
+SIGSEGV frame resets its disposition to default rather than retrying it.
+Ptrace captures queued siginfo from that owned instance and preserves later
+private/shared instances. Synchronous fault and forced seccomp stops carry
+their supplied siginfo without consuming an unrelated pending signal.
 `signal_mask_for_delivery() -> u64` gives frame writers the interrupted mask,
 including the original mask of a suspended wait without consuming its record.
 Restorer-based Linux frames contain that mask in `uc_sigmask`; `rt_sigreturn`

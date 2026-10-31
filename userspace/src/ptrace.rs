@@ -27,8 +27,7 @@
 use crate::errno::to_ret as errno_ret;
 use crate::errno::*;
 use crate::handlers::{
-    clear_pending_signal_bits, copy_from_user, copy_to_user, current_task_id, push_stopcont_report,
-    raise_signal_pending,
+    copy_from_user, copy_to_user, current_task_id, push_stopcont_report, raise_signal_pending,
 };
 use crate::syscall::{SyscallReturn, TrapContext};
 use alloc::collections::BTreeMap;
@@ -745,7 +744,8 @@ pub fn ptrace_intercept_signal(ctx: &mut dyn TrapContext, signum: u32) -> bool {
 
 /// [`ptrace_intercept_signal`] for a signal whose siginfo the caller already
 /// built (a synchronous fault: `si_code` and `si_addr` come from the trap,
-/// not from a queue). `None` takes the signal's queued payload.
+/// not from a queue). `None` atomically takes one pending instance with its
+/// queued payload. A synchronous fault does not consume pending signals.
 pub fn ptrace_intercept_signal_info(
     ctx: &mut dyn TrapContext,
     signum: u32,
@@ -767,33 +767,30 @@ pub fn ptrace_intercept_signal_info(
             return false;
         }
 
-        // Dequeue the signal so it is not processed again — from BOTH sets,
-        // the way `dequeue_signal` does, because a signal sent to the PROCESS
-        // lives in the thread group's shared set and not in this thread's
-        // private one. Clearing only the private bit left a process-directed
-        // signal pending forever: it was re-delivered at every signal-delivery
-        // point, so a tracer stepping a tracee saw a signal-stop for it after
-        // every single syscall. `kill(getpid(), SIGSTOP)` is the ordinary way
-        // to raise one — it is how strace's own startup handshake works — so
-        // this hit the most common case there is.
-        //
-        // The siginfo is captured first: PTRACE_GETSIGINFO at this stop must
-        // describe the signal being delivered.
-        let info = info.unwrap_or_else(|| crate::handlers::ptrace_signal_siginfo(task, signum));
+        let (info, payload) = match info {
+            Some(info) => (info, None),
+            None => {
+                // Another thread may have consumed the selected signal.
+                // Own its payload before capturing GETSIGINFO or stopping;
+                // preserve every remaining private/shared queued instance.
+                let Some((_, queued)) =
+                    crate::handlers::sigwait_take(task, crate::handlers::sig_bit(signum))
+                else {
+                    return false;
+                };
+                let payload =
+                    queued.map(|info| (info.code, info.value, info.poll_band.unwrap_or(info.pid)));
+                (
+                    crate::handlers::ptrace_signal_siginfo(signum, queued),
+                    payload,
+                )
+            }
+        };
         set_last_siginfo(pid, info);
         // `dequeue_signal` takes the siginfo with the signal; it travels with
         // the stop and comes back if the tracer resumes with the same signal
         // (`ptrace_signal` delivers `current->last_siginfo`). Left queued, a
         // re-injected sigqueue() signal reached its handler without its value.
-        let src = if crate::handlers::signal_pending_private(task)
-            & crate::handlers::sig_bit(signum)
-            != 0
-        {
-            task
-        } else {
-            crate::handlers::shared_pending_key(task)
-        };
-        let payload = crate::handlers::take_sigqueue_info(src, signum);
         {
             let mut g = PTRACE_STATE.lock();
             if let Some(r) = g.as_mut() {
@@ -803,12 +800,6 @@ pub fn ptrace_intercept_signal_info(
                 };
             }
         }
-        clear_pending_signal_bits(task, crate::handlers::sig_bit(signum));
-        clear_pending_signal_bits(
-            crate::handlers::shared_pending_key(task),
-            crate::handlers::sig_bit(signum),
-        );
-
         let tracer_tid = pid_to_tid(tracer_pid);
         // Put the task into ptrace stop!
         enter_ptrace_stopped(ctx, task, tracer_tid, signum);
@@ -875,7 +866,7 @@ pub fn ptrace_report_exec(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
     ptrace_syscall_stop(ctx, false, u64::from(crate::syscall::Syscall::Execve.raw()));
     if !trace_exec {
-        set_last_siginfo(pid, crate::handlers::ptrace_signal_siginfo(task, SIGTRAP));
+        set_last_siginfo(pid, crate::handlers::ptrace_signal_siginfo(SIGTRAP, None));
         enter_ptrace_stopped(ctx, task, tracer_tid, SIGTRAP);
     }
 }
@@ -1024,7 +1015,7 @@ pub fn attach_new_child(
         r.stopped.insert(child, true);
         r.stop_signal.insert(child, SIGSTOP);
     }
-    let info = crate::handlers::ptrace_signal_siginfo(child_task, SIGSTOP);
+    let info = crate::handlers::ptrace_signal_siginfo(SIGSTOP, None);
     set_last_siginfo(child, info);
     // `(SIGSTOP << 8) | 0x7f`: the stop the tracer's wait4 sees first.
     push_stopcont_report(child_task, ((SIGSTOP as i32) << 8) | 0x7f, false);
