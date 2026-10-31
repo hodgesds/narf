@@ -11,7 +11,7 @@ fn execute_one(w: &Window, registered: &BTreeMap<u32, u32>, id: u32) {
         .windows(6)
         .find(|w| w[..4] == [0x7a000004, 0x01104080, base + 0x800, 0])
         .unwrap()[4];
-    execute_ppgtt_probe(&d.regs, &image.borrow(), &ring, stamp, base);
+    execute_ppgtt_probe(&d.regs, &image.borrow(), &ring, stamp, base, false);
     let mut image = image.borrow_mut();
     image[0x800 / 4] = stamp;
     image[1024 + 5] = tail;

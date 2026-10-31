@@ -269,7 +269,14 @@ impl XeFile {
         let instance = read(user, u64_at(&wire, 24), 8)?;
         zero(&instance[2..8])?;
         let class = u16::from_le_bytes(instance[..2].try_into().unwrap());
-        let engine = crate::intel_gpu_engine::Engine::from_xe_class(class);
+        // Only the GT's published (fused-in) engines are addressable.
+        let present = info
+            .backend
+            .as_ref()
+            .and_then(|b| b.status())
+            .map_or_else(Default::default, |status| status.engines);
+        let engine = crate::intel_gpu_engine::Engine::from_xe_class(class)
+            .filter(|engine| present.contains(*engine));
         if class != 5 && engine.is_none() {
             return Err(FsError::InvalidData);
         }

@@ -157,9 +157,13 @@ VM_CREATE/DESTROY and EXEC_QUEUE_CREATE/DESTROY/GET_PROPERTY have independent
 per-open namespaces bounded at 64 VMs and 64 queues. Destroying a VM with open
 queues returns EBUSY. Queue destruction removes the handle and refuses pending
 admission while retaining every submitted residency until terminal completion.
-Width 1 RCS0, width 1 BCS0 and software VM_BIND queues are supported; a COPY
-queue's `UserContext::for_engine(Engine::Bcs0)` saves and restores only BCS
-LRC state. VIDEO/COMPUTE classes return EINVAL. Property extension
+Width 1 RCS0, BCS0 and (when fused in) CCS0 queues, plus software VM_BIND
+queues, are supported; each queue's `UserContext::for_engine` saves and
+restores only its engine's LRC state. VIDEO classes, and COMPUTE on a GT
+without CCS0, return EINVAL. `UserStatus::engines` carries the GT's
+published `EngineSet`; ENGINES lists exactly that set in xe_hw_engine order
+and engine-cycle queries for an unpublished class return EINVAL after the
+syntax and readiness checks. Property extension
 chains are bounded at 16 unique links. Low/normal Xe priorities map to GuC 3/2;
 elevated priority requires authority this interface does not grant (EPERM).
 Timeslices are bounded to 1..100000 microseconds; unknown properties, flags,

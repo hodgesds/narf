@@ -30,6 +30,12 @@ const RCS0: u32 = 1;
 const BCS0: u32 = 1 << 15; // INTR_BCS(0)
 const GUC_BIT: u32 = 1 << 25;
 const OWNED: u32 = RCS0 | BCS0 | GUC_BIT; // bank zero
+                                          // CCS0 pairs with CCS1: ENGINE1 (high) halves of CCS_RSVD_INTR_ENABLE and
+                                          // CCS0_CCS1_INTR_MASK, bank-zero INTR_CCS(0), identity class COMPUTE (5).
+const CCS_ENABLE: u64 = 0x190048;
+const CCS_MASK: u64 = 0x190100;
+const CCS_RING_MASK: u64 = 0x1a0a8;
+const CCS0: u32 = 1 << 4;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum IrqError {
@@ -50,11 +56,16 @@ struct Saved {
     guc_mask: u32,
     ring: u32,
     bcs_ring: u32,
+    ccs_enable: u32,
+    ccs: u32,
+    ccs_ring: u32,
 }
 
 struct State<M> {
     mmio: M,
     saved: Saved,
+    /// CCS0 is a published engine and owns its sources.
+    compute: bool,
     active: bool,
     pending: bool,
     bits: u32,
@@ -79,7 +90,7 @@ fn restore_bits(mmio: &impl MmioWindow, offset: u64, mask: u32, saved: u32) {
 }
 
 impl<M: MmioWindow> Controller<M> {
-    pub(crate) fn new(mmio: M) -> Result<Self, IrqError> {
+    pub(crate) fn new(mmio: M, compute: bool) -> Result<Self, IrqError> {
         // No other owner may have delivery enabled. Never commandeer firmware
         // MSI or enable a master with an unhandled display/media indication.
         let tile = read(&mmio, TILE)?;
@@ -96,10 +107,18 @@ impl<M: MmioWindow> Controller<M> {
             guc_mask: mmio.read32(GUC_MASK),
             ring: mmio.read32(RING_MASK),
             bcs_ring: mmio.read32(BCS_RING_MASK),
+            ccs_enable: if compute { read(&mmio, CCS_ENABLE)? } else { 0 },
+            ccs: if compute { mmio.read32(CCS_MASK) } else { 0 },
+            ccs_ring: if compute {
+                mmio.read32(CCS_RING_MASK)
+            } else {
+                0
+            },
         };
         Ok(Self(IrqSafeSpinLock::new(State {
             mmio,
             saved,
+            compute,
             active: false,
             pending: true, // drain pre-existing owned status before enabling
             bits: 0,
@@ -112,7 +131,7 @@ impl<M: MmioWindow> Controller<M> {
         let mut s = self.0.lock();
         read(&s.mmio, MASTER)?;
         s.active = true;
-        let routes = [
+        let mut routes = alloc::vec![
             (RENDER_ENABLE, ENGINE_EVENTS, ENGINE_EVENTS),
             (RCS_MASK, RCS_EVENTS, 0),
             (BCS_MASK, RCS_EVENTS, 0),
@@ -121,7 +140,14 @@ impl<M: MmioWindow> Controller<M> {
             (RING_MASK, RCS, 0),
             (BCS_RING_MASK, RCS, 0),
         ];
-        for (offset, mask, value) in routes {
+        if s.compute {
+            routes.extend_from_slice(&[
+                (CCS_ENABLE, RCS_EVENTS, RCS_EVENTS),
+                (CCS_MASK, RCS_EVENTS, 0),
+                (CCS_RING_MASK, RCS, 0),
+            ]);
+        }
+        for &(offset, mask, value) in &routes {
             restore_bits(&s.mmio, offset, mask, value);
         }
         for (offset, mask, expected) in routes {
@@ -171,6 +197,7 @@ impl<M: MmioWindow> Controller<M> {
             let (expected, class) = match s.selected {
                 RCS0 => (RCS, 0),
                 BCS0 => (RCS, 3),
+                CCS0 => (RCS, 5),
                 _ => (0x8000, 4),
             };
             if (identity >> 20) & 0x3f != 0
@@ -197,7 +224,8 @@ impl<M: MmioWindow> Controller<M> {
             }
             if master & 1 != 0 {
                 let bits = read(&s.mmio, DW)?;
-                if bits & !OWNED != 0 {
+                let owned = OWNED | if s.compute { CCS0 } else { 0 };
+                if bits & !owned != 0 {
                     return Err(IrqError::Conflict);
                 }
                 // GFX master is RW1C status plus its persistent enable bit.
@@ -242,6 +270,15 @@ impl<M: MmioWindow> Controller<M> {
         ] {
             restore_bits(&s.mmio, offset, mask, saved);
         }
+        if s.compute {
+            for (offset, mask, saved) in [
+                (CCS_RING_MASK, RCS, s.saved.ccs_ring),
+                (CCS_MASK, RCS_EVENTS, s.saved.ccs),
+                (CCS_ENABLE, RCS_EVENTS, s.saved.ccs_enable),
+            ] {
+                restore_bits(&s.mmio, offset, mask, saved);
+            }
+        }
         // The primary/media GuCs share this enable bit. An independently
         // unmasked media GuC still needs it, even if it was clear at takeover.
         if s.mmio.read32(GUC_MASK) & (1 << 15) != 0 {
@@ -273,8 +310,13 @@ fn handler<M: MmioWindow + Send + 'static>(cookie: u64) -> narf_interrupts::disp
 }
 
 impl<M: MmioWindow + Send + 'static, R: MessageRoute> Delivery<M, R> {
-    fn install(mmio: M, mut route: R) -> Result<Self, IrqError> {
-        let controller = Arc::new(Controller::new(mmio)?);
+    #[cfg(feature = "kernel-test")]
+    fn install(mmio: M, route: R) -> Result<Self, IrqError> {
+        Self::install_with(mmio, route, false)
+    }
+
+    fn install_with(mmio: M, mut route: R, compute: bool) -> Result<Self, IrqError> {
+        let controller = Arc::new(Controller::new(mmio, compute)?);
         let vector = narf_interrupts::vector::alloc().map_err(|_| IrqError::Route)?;
         if let Err(error) = route.program(vector) {
             if route.disable() {
@@ -501,13 +543,14 @@ impl GtIrq {
         mmio: crate::intel_gpu_gt_hw::AuthorizedWindow,
         cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
         device: narf_bus::BusDevice,
+        compute: bool,
     ) -> Result<Self, IrqError> {
         // The GT's production DMA path currently admits coherent x86 only.
         // Do not program ARM MSI without an ITS DeviceID/event owner.
         if !cfg!(target_arch = "x86_64") {
             return Err(IrqError::Route);
         }
-        Self::install(mmio, PciMsi::new(cap, device)?)
+        Self::install_with(mmio, PciMsi::new(cap, device)?, compute)
     }
 }
 

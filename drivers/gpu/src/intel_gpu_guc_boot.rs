@@ -388,7 +388,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         Ok(())
     }
 
-    pub(crate) fn scheduler(&self) -> Result<crate::intel_gpu_guc_sched::GuCScheduler<A>, BootError>
+    pub(crate) fn scheduler(
+        &self,
+        engines: crate::intel_gpu_engine::EngineSet,
+    ) -> Result<crate::intel_gpu_guc_sched::GuCScheduler<A>, BootError>
     where
         A: Clone,
     {
@@ -401,6 +404,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         crate::intel_gpu_guc_sched::GuCScheduler::allocate(
             self.resources.allocator.clone(),
             self.platform,
+            engines,
         )
         .map_err(BootError::Scheduling)
     }
@@ -741,8 +745,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                         // its post-register state size, and per-engine saves.
                         ads.write32(POLICIES + 76, 1); // no autonomous engine reset
                         for engine in crate::intel_gpu_engine::Engine::ALL {
+                            let Some(state) = config.engines[engine.index()] else {
+                                continue;
+                            };
                             let class = u64::from(engine.guc_class());
-                            let state = config.engines[engine.index()];
                             let base_reg = engine.base();
                             let saves = 0x2000 + engine.index() as u64 * 48;
                             ads.write32(SYSINFO + class * 32, 0x20202000);

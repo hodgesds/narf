@@ -122,6 +122,7 @@ fn setup(
             epoch: gt.user_epoch().unwrap(),
             platform,
             submission_version: gt.submission_version(),
+            engines: gt.engines().unwrap(),
         })),
         pending: IrqSafeSpinLock::new(Vec::new()),
     });
@@ -320,16 +321,27 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
         ),
     ]
     .into_iter()
-    .flat_map(|(platform, ack)| [0u16, 1].map(|class| (platform, ack, class)))
+    .flat_map(|(platform, ack)| [0u16, 1, 4].map(|class| (platform, ack, class)))
     {
         let (w, arena, mut gt) = hardware_model(platform, ack);
         prime(&mut gt, &w, ack);
+        let ccs = gt
+            .engines()
+            .unwrap()
+            .contains(crate::intel_gpu_engine::Engine::Ccs0);
+        // Xe-LPG always has CCS0, so the compute path is exercised.
+        assert!(ccs || !matches!(platform, GtPlatform::Integrated(_)));
+        if class == 4 && !ccs {
+            hardware_stop(&mut gt, &w, ack);
+            continue;
+        }
         let (mailbox, info) = setup(&mut gt, &w, platform);
         let file = RenderFile::new();
         let user = Cpu::new();
         let vm = create_vm(&file, &info, &user);
-        // VIDEO_DECODE, VIDEO_ENHANCE and COMPUTE are not admitted engines.
-        for refused in [2u8, 3, 4, 6] {
+        // VIDEO_DECODE, VIDEO_ENHANCE, unknown classes, and COMPUTE when
+        // CCS0 is fused off are not admitted engines.
+        for refused in [2u8, 3, 6].into_iter().chain((!ccs).then_some(4)) {
             user.wire.store(512, &[refused, 0, 0, 0, 0, 0, 0, 0]);
             let mut wire = [0; 48];
             put32(&mut wire, 8, 0x00010001);
@@ -396,7 +408,11 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
         assert_eq!(user.read_u64_acquire(0x4090), Ok(value));
         // The batch's MI_STORE_DATA_IMM executed on the selected engine.
         assert_eq!(user.read_u64_acquire(0x4080), Ok(0x4e415246));
-        let engine_base = if class == 1 { 0x22244 } else { 0x2244 };
+        let engine_base = match class {
+            1 => 0x22244,
+            4 => 0x1a244,
+            _ => 0x2244,
+        };
         assert!(registered.values().all(|base| {
             w.0.borrow().memory[base].borrow()[1024 + 2] == engine_base
         }));

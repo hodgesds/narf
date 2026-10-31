@@ -37,6 +37,9 @@ impl Window {
             (0x1900e8, 0xffff9234),
             (0x20a8, 0xffffffff),
             (0x220a8, 0xfffffffe),
+            (0x190048, 0x0000_0003),
+            (0x190100, 0xffff_0004),
+            (0x1a0a8, 0xffff_ffff),
         ]
         .into_iter()
         .collect();
@@ -97,6 +100,7 @@ impl MmioWindow for Window {
                 r.identity = match value {
                     1 => 0x80000001,          // valid RCS0 MI_USER_INTERRUPT
                     0x8000 => 0x80030010,     // valid COPY0 FLUSH_COMPLETE
+                    0x10 => 0x80050001,       // valid COMPUTE0 MI_USER_INTERRUPT
                     0x02000000 => 0x80048000, // valid OTHER0 GUC2HOST
                     _ => panic!("selected an unowned interrupt"),
                 };
@@ -236,6 +240,39 @@ fn smoke_gt_irq_route_decode_wait_and_teardown() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_gt_irq",
     smoke_gt_irq_route_decode_wait_and_teardown
+);
+
+fn smoke_gt_irq_compute_routes_decode_and_teardown() -> TestResult {
+    let w = Window::new();
+    let saved = w.0.lock().words.clone();
+    let irq = Delivery::install_with(w.clone(), Route(w.clone()), true).unwrap();
+    assert_eq!(irq.service(0), Ok(false));
+    // ENGINE1 (CCS0) halves only; CCS1 bits and unrelated bits preserved.
+    assert_eq!(w.read32(0x190048), 0x0011_0003);
+    assert_eq!(w.read32(0x190100), 0xffee_0004);
+    assert_eq!(w.read32(0x1a0a8), 0xffff_ffee);
+    // INTR_CCS(0) decodes as COMPUTE class instance 0.
+    w.raise(0x10);
+    assert_eq!(irq.service(1), Ok(true));
+    assert_eq!(irq.service(2), Ok(false));
+    assert_eq!(w.read32(0x190018), 0);
+    drop(irq);
+    for offset in [0x190048, 0x190100, 0x1a0a8] {
+        assert_eq!(w.read32(offset), saved[&offset]);
+    }
+    // Without a published CCS0, its bank bit is a foreign cause.
+    let w = Window::new();
+    let irq = install(&w);
+    irq.service(0).unwrap();
+    w.raise(0x10);
+    assert_eq!(irq.service(1), Err(IrqError::Conflict));
+    drop(irq);
+    assert_eq!(w.read32(0x190048), 3, "unowned CCS sources were enabled");
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gt_irq",
+    smoke_gt_irq_compute_routes_decode_and_teardown
 );
 
 fn smoke_gt_irq_delayed_identity_timeout_and_foreign_causes() -> TestResult {

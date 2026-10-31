@@ -35,6 +35,8 @@ pub struct UserStatus {
     pub epoch: u64,
     pub platform: GtPlatform,
     pub submission_version: (u8, u8, u8),
+    /// Engines userspace may name: always RCS0/BCS0, CCS0 when fused in.
+    pub engines: crate::intel_gpu_engine::EngineSet,
 }
 
 /// Observed PF/graphics-GT facts for the native Xe discovery ABI. Published

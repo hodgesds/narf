@@ -1841,6 +1841,25 @@ described in `spec.md`. The i915 compatibility profile reaches BCS0 through
 the legacy BLT ring and proto-context engine maps. BCS8 on BMG and
 migration-style kernel copies remain unadmitted.
 
+### Compute engine (CCS0)
+
+CCS0 (MMIO 0x1a000, GuC class 4, Xe/i915 COMPUTE) is published when fused in:
+always on Xe-LPG, from DSS quadrant 0 on DG2 (8-DSS quadrants of the
+geometry|compute union) and from XEHP_FUSE4 CCS_EN on BMG. `EngineSet`
+records the fused set before scheduling; the scheduler, ADS, NONPRIV
+policy, IRQ routing, priming and UAPI all follow it. As Linux's default
+`ccs_mode` 1, only CCS0 is exposed and every present compute slice is
+assigned to it. Multi-CCS parts program fixed-slice RCU_MODE and CCS_MODE;
+enabling CCS0 sets RCU_MODE_CCS_ENABLE. The LRC uses `dg2_xcs_offsets`
+(14 pages) or `xe2_xcs_offsets` (3 pages on BMG). Jobs use the render
+stream with PIPE_CONTROL_3D_ENGINE_FLAGS masked (no VF invalidate,
+tile/render-target/depth flush). Default state is only the Xe2
+WMTP-disabled preemption level. NONPRIV grants the RCS OAG triple, BMG
+applies the engine-base CSFE/PSMI entries, and Xe2 dGFX compute reads use
+the WB MOCS index. The global LSC/ROW/TDL workarounds stay with RCS0, the
+first render/compute engine. CCS1-3 and other ccs_mode values are not
+admitted.
+
 ### Remaining accelerated-driver completion work
 
 Continue these dependencies on the current Intel branch. Existing native
@@ -1851,7 +1870,7 @@ acceptance or a claim of complete acceleration.
 | --- | --- | --- |
 | GuC execution | Owned GGTT/PPGTT jobs, primed/persistent user RCS0 and BCS0 state, verified register policy, graphics-GT/RCS/BCS workarounds on MTL/Arrow, DG2 and BMG | Compute/media engines, remaining out-of-band workarounds and silicon qualification |
 | Render UAPI | Native Xe queries/GEM/VM_BIND (incl. snapshot-pinned MAP_USERPTR)/RCS and COPY queues/EXEC/user fences/per-engine cycles; i915 compatibility with legacy BLT ring, context engine maps and explicit fences; context loss and fresh-epoch rebuild | USERPTR invalidation (MMU notifier), i915 GEM_USERPTR, fault/long-running VMs, i915 load balancing/parallel submission, more queue/query families and Mesa interoperability |
-| Engines and platforms | Main-GT DSS/EU discovery; RCS0 and never-fused BCS0 scheduling; separate Gen12 foundations | BMG BCS8, CCS (DSS-quadrant/fuse-register inventory), media GT, compute/media submission and independently sourced profiles for other IP |
+| Engines and platforms | Main-GT DSS/EU discovery; RCS0, never-fused BCS0 and fuse-derived CCS0 (ccs_mode 1) scheduling; separate Gen12 foundations | BMG BCS8, CCS1-3/ccs_mode > 1, media GT and media submission, independently sourced profiles for other IP |
 | Memory and presentation | Owned system RAM, private tables, same-card CPU PRIME mappings; Battlemage visible VRAM (zeroed pool, DM PTEs, WC BAR mmap, placement fallback) | DG2 VRAM (64K pages + CCS clear), small-BAR/unmapped VRAM, eviction, GPU clears, VRAM PRIME/P2P, accelerated presentation and GPU/KMS synchronization |
 | Display | Gen12 paths and owned Xe-LPG internal-panel modeset | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |
 | Power and faults | Owned GuC/RCS0/BCS0 MSI wakeups with timer fallback, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery; idle D3hot runtime autosuspend for display-less discrete GTs with epoch-continuing resume; GuC SLPC with firmware-controlled RC6 (optional, fail-open) | Finer engine recovery, autosuspend with live VRAM (mapping revocation/eviction) or an active iGPU panel (display power wells/DC states), D3cold, SLPC frequency bounds/power profiles and MTL Wa_22019338487 |

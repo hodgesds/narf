@@ -44,8 +44,14 @@ pub(crate) async fn query_user(
         .filter(|_| input[2..6] == [0; 4])
         .ok_or(FsError::InvalidData)?;
     let destination = data.checked_add(12).ok_or(FsError::BadAddress)?;
-    if !info.submission_ready() {
-        return Err(FsError::NoDevice);
+    let status = info
+        .backend
+        .as_ref()
+        .and_then(|b| b.status())
+        .ok_or(FsError::NoDevice)?;
+    // A known class this GT did not publish (fused-off CCS0) is EINVAL.
+    if !status.engines.contains(engine) {
+        return Err(FsError::InvalidData);
     }
     let stamp = info
         .backend
@@ -71,12 +77,15 @@ fn query_wire(
     zero(&wire[24..40])?;
     let payload = match u32_at(wire, 8) {
         0 => {
-            // drm_xe_query_engines in xe_hw_engine id order: RCS0, BCS0.
-            let engines: &[Engine] = if info.submission_ready() {
-                &Engine::ALL
-            } else {
-                &[]
-            };
+            // drm_xe_query_engines in xe_hw_engine id order: RCS0, BCS0, CCS0.
+            let engines: alloc::vec::Vec<Engine> = info
+                .backend
+                .as_ref()
+                .and_then(|b| b.status())
+                .filter(|status| status.platform == info.platform)
+                .map_or_else(alloc::vec::Vec::new, |status| {
+                    status.engines.iter().collect()
+                });
             let mut reply = vec![0; 8 + engines.len() * 32];
             put32(&mut reply, 0, engines.len() as u32);
             for (i, engine) in engines.iter().enumerate() {

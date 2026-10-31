@@ -18,7 +18,7 @@ fn smoke_hardware_irq_notification_requires_actual_retirement() -> TestResult {
         let (w, arena, mut gt) = hardware_model(platform, ack);
         hardware_discovery(&mut gt, &w, ack);
         hardware_scheduling(&mut gt, &w);
-        let irq = crate::intel_gpu_gt_irq::Controller::new(w.clone()).unwrap();
+        let irq = crate::intel_gpu_gt_irq::Controller::new(w.clone(), false).unwrap();
         irq.activate().unwrap();
         assert_eq!(irq.service(0), Ok(false));
         let baseline = arena.live_allocations();
@@ -852,14 +852,18 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 event(&memory, 0x7001, &[request[1]]);
             }
             0x4502 => {
-                // GUC_RENDER_CLASS for RCS0, GUC_BLITTER_CLASS for BCS0.
-                assert!(matches!(request[3], 0 | 3));
+                // GUC_RENDER/BLITTER/COMPUTE_CLASS for RCS0/BCS0/CCS0.
+                assert!(matches!(request[3], 0 | 3 | 4));
                 assert_eq!(&request[1..10], &[1, request[2], request[3], 1, 0, 0, 0, 0, 0]);
                 assert_eq!(request.len(), 12);
                 assert!(matches!(request[10] & 0xfff, 0x19 | 0x119));
                 let image = w.0.borrow().memory[&(request[10] & !0xfff)].clone();
                 assert_eq!(image.borrow()[1024 + 0x33] != 0, request[10] & 0x100 != 0);
-                let base = if request[3] == 3 { 0x22244 } else { 0x2244 };
+                let base = match request[3] {
+                    3 => 0x22244,
+                    4 => 0x1a244,
+                    _ => 0x2244,
+                };
                 assert_eq!(image.borrow()[1024 + 2], base);
                 assert_eq!(request[11], 0);
                 assert!(registered
@@ -877,9 +881,11 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
             0x1001 => {
                 let id = request[1];
                 let base = registered[&id];
-                let copy = w.0.borrow().memory[&base].borrow()[1024 + 2] == 0x22244;
-                if request[2] == 1 && execute && copy {
+                let first = w.0.borrow().memory[&base].borrow()[1024 + 2];
+                if request[2] == 1 && execute && first == 0x22244 {
                     execute_copy(w, base);
+                } else if request[2] == 1 && execute && first == 0x1a244 {
+                    execute_compute(w, base);
                 } else if request[2] == 1 && execute {
                     let mut d = w.0.borrow_mut();
                     assert!(d.synced.contains(&base));
@@ -914,7 +920,7 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     };
                     assert_ne!(stamp, 0);
                     if image.borrow()[1024 + 0x33] != 0 {
-                        execute_ppgtt_probe(&d.regs, &image.borrow(), &ring, stamp, base);
+                        execute_ppgtt_probe(&d.regs, &image.borrow(), &ring, stamp, base, false);
                     } else if tail != 32 {
                         let (svg, used) =
                             crate::intel_gpu_context::tests::execute(&ring[1..], &mut d.regs);
@@ -1121,7 +1127,61 @@ fn execute_copy_ppgtt(root: u64, words: &[u32]) {
 /// with XE_PPGTT_PTE_DM resolve through it, as the GPU reaches local memory.
 static FIXTURE_VRAM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-fn execute_ppgtt_probe(regs: &BTreeMap<u64, u32>, image: &[u32], ring: &[u32], id: u32, base: u32) {
+// Independent CCS0 model: dg2_xcs/xe2_xcs image, compute PIPE_CONTROL
+// masks (xe_ring_ops.c PIPE_CONTROL_3D_ENGINE_FLAGS) and the default seed.
+fn execute_compute(w: &Window, base: u32) {
+    let d = w.0.borrow();
+    assert!(d.synced.contains(&base));
+    let image = d.memory[&base].clone();
+    let (tail, ring_base, root) = {
+        let data = image.borrow();
+        assert_eq!(
+            &data[1024..1031],
+            &[0, 0x1108101d, 0x1a244, data[1027], 0x1a034, 0, 0x1a030]
+        );
+        assert!(matches!(data[1027], 0x00090009 | 0x00090008));
+        assert_eq!((data[1032], data[1024 + 0x1c], data[1024 + 0x21]), (0x1a038, 0x1a120, 0x11081011));
+        assert_eq!(data[1024 + 0x71], 0x01000000);
+        (
+            data[1024 + 7],
+            data[1024 + 9],
+            u64::from(data[1024 + 0x31]) << 32 | u64::from(data[1024 + 0x33]),
+        )
+    };
+    assert!(d.synced.contains(&ring_base));
+    let ring = d.memory[&ring_base].borrow().clone();
+    let words = &ring[..tail as usize / 4];
+    let stamp = if tail == 32 {
+        words[5]
+    } else {
+        words
+            .windows(6)
+            .find(|v| v[..4] == [0x7a000004, 0x01104080, base + 0x800, 0])
+            .expect("compute GGTT post-sync immediate")[4]
+    };
+    if root != 0 {
+        let regs = d.regs.clone();
+        execute_ppgtt_probe(&regs, &image.borrow(), &ring, stamp, base, true);
+    } else if tail != 32 {
+        // ARB_ON, then the optional Xe2 WMTP level, then the compute flush.
+        let seed = &words[1..];
+        let flush = seed.iter().position(|w| *w == 0x7a000204).expect("compute flush");
+        let commands = &seed[..flush - if d.regs[&0xd8c] >> 22 == 20 { 0 } else { 6 }];
+        assert!(commands.is_empty() || commands == [0x11000001, 0x1a580, 0x00060002]);
+        assert_eq!(seed[flush + 1], 0x001000a0);
+    }
+    image.borrow_mut()[0x800 / 4] = stamp;
+    image.borrow_mut()[1024 + 5] = tail;
+}
+
+fn execute_ppgtt_probe(
+    regs: &BTreeMap<u64, u32>,
+    image: &[u32],
+    ring: &[u32],
+    id: u32,
+    base: u32,
+    compute: bool,
+) {
     let pat = if regs.get(&0x480c) == Some(&2) {
         3
     } else if regs.get(&0x4808) == Some(&0xf) {
@@ -1160,7 +1220,12 @@ fn execute_ppgtt_probe(regs: &BTreeMap<u64, u32>, image: &[u32], ring: &[u32], i
         }
         page | (va & 4095)
     };
-    let mut expected = alloc::vec![0x04000001, 0x02800101, 0x7a000404, 0x20344c1c, 0xd0, 0, 0, 0,];
+    let (header, flags) = if compute {
+        (0x7a000004, 0x20344c0c)
+    } else {
+        (0x7a000404, 0x20344c1c)
+    };
+    let mut expected = alloc::vec![0x04000001, 0x02800101, header, flags, 0xd0, 0, 0, 0,];
     if pat == 3 {
         expected.extend_from_slice(&[0x11020001, 0x4208, 1, 0]);
     }
@@ -1171,7 +1236,14 @@ fn execute_ppgtt_probe(regs: &BTreeMap<u64, u32>, image: &[u32], ring: &[u32], i
     if pat == 0 || pat == 3 {
         expected.extend_from_slice(&[0x7a000004, 1, 0xd0, 0, 0, 0]);
     }
-    expected.extend_from_slice(&[0x7a000204, 0x101010a1, 0, 0, 0, 0]);
+    expected.extend_from_slice(&[
+        0x7a000204,
+        if compute { 0x001000a0 } else { 0x101010a1 },
+        0,
+        0,
+        0,
+        0,
+    ]);
     let user_store = ring.windows(6).find(|w| w[0] == 0x10200003);
     if let Some(store) = user_store {
         assert_eq!(store[5], 0); // qword alignment NOP
@@ -1283,26 +1355,33 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
         }
         let mut registered = BTreeMap::new();
         let mut registrations = 0;
-        let mut rcs_first = false;
-        for now in 27..150 {
+        // Engines prime in order: the k-th publishes its golden image after
+        // its seed and switch contexts, i.e. after 2(k+1) registrations.
+        let engines: Vec<_> = gt.engines().unwrap().iter().collect();
+        let goldens: Vec<_> = engines
+            .iter()
+            .map(|e| golden_for_class(&w, e.guc_class() as usize))
+            .collect();
+        let mut published = alloc::vec![None; engines.len()];
+        for now in 27..200 {
             assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+            for (k, golden) in goldens.iter().enumerate() {
+                if published[k].is_none() && golden.borrow().iter().any(|word| *word != 0) {
+                    published[k] = Some(registrations);
+                }
+            }
             if completion.result().is_some() {
                 break;
             }
             assert!(!gt.context_defaults_ready());
-            // RCS publishes before BCS's seed; BCS publishes only at the end.
-            assert!(copy_golden.borrow().iter().all(|word| *word == 0));
-            if !rcs_first && golden.borrow().iter().any(|word| *word != 0) {
-                rcs_first = true;
-                assert_eq!(registrations, 2);
-            }
             registrations += service_contexts(&w, &mut registered, true)
                 .iter()
                 .filter(|a| **a == 0x4502)
                 .count();
         }
-        assert!(rcs_first);
-        assert_eq!(registrations, 4);
+        let expected: Vec<_> = (0..engines.len()).map(|k| Some(2 * (k + 1))).collect();
+        assert_eq!(published, expected, "engines published out of order");
+        assert_eq!(registrations, 2 * engines.len());
         assert_eq!(completion.result(), Some(Ok(())));
         assert!(gt.context_defaults_ready());
         assert_eq!(arena.live_allocations(), count);
@@ -1347,9 +1426,33 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
             let saves = (ads[0x300 / 4] - 0x20001000) as usize / 4;
             assert_eq!(
                 [ads[saves], ads[saves + 2], ads[saves + 4], ads[saves + 8], ads[saves + 12]],
-                [0x2229c, 1, 0x22080, 0x220a8, 0]
+                [
+                    0x2229c,
+                    1,
+                    0x22080,
+                    0x220a8,
+                    // CCS0's saves follow BCS0's when it is published.
+                    if gt.engines().unwrap().contains(crate::intel_gpu_engine::Engine::Ccs0) {
+                        0x1a29c
+                    } else {
+                        0
+                    }
+                ]
             );
             assert_eq!(ads[saves + 5], w.0.borrow().regs[&0x22080]);
+        }
+        if engines.contains(&crate::intel_gpu_engine::Engine::Ccs0) {
+            let compute_golden = golden_for_class(&w, 4);
+            let data = compute_golden.borrow();
+            let xe2 = platform == GtPlatform::Battlemage;
+            assert_eq!(data.len(), if xe2 { 3 * 1024 } else { 14 * 1024 });
+            assert_eq!((data[1025], data[1026], data[1027]), (0x1108101d, 0x1a244, 0x00090008));
+            assert_eq!((data[1029], data[1031], data[1033]), (0, 0, 0));
+            let ads = w.0.borrow().memory[&0x20001000].clone();
+            let ads = ads.borrow();
+            assert_eq!((ads[(0x123c + 128) / 4], ads[(0x123c + 528) / 4]), (0x20202000, 1));
+            assert_eq!(ads[0x400 / 4 + 1], 3);
+            assert_eq!(w.0.borrow().regs[&0x14800] & 1, 1, "RCU_MODE_CCS_ENABLE");
         }
         // A fresh PPGTT context must inherit the device's saved opaque state,
         // restore it rather than inhibit, and receive its own ring and root.

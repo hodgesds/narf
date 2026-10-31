@@ -121,6 +121,7 @@ fn setup(platform: GtPlatform, gt: &GuCGt<Window, Arena>) -> (Arc<Mailbox>, Devi
             epoch: gt.user_epoch().unwrap(),
             platform,
             submission_version: gt.submission_version(),
+            engines: gt.engines().unwrap(),
         })),
         pending: IrqSafeSpinLock::new(Vec::new()),
     });

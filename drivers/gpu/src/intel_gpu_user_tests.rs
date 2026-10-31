@@ -334,6 +334,7 @@ fn smoke_userspace_execbuffer_ioctl_order_close_and_completion() -> TestResult {
             epoch: gt.user_epoch().unwrap(),
             platform,
             submission_version: gt.submission_version(),
+            engines: gt.engines().unwrap(),
         })),
         pending: IrqSafeSpinLock::new(Vec::new()),
     });
@@ -362,7 +363,7 @@ fn smoke_userspace_execbuffer_ioctl_order_close_and_completion() -> TestResult {
     }
     // Live engine/version discovery uses Linux's exact sizes and field order.
     for (id, size) in [
-        (abi::QUERY_ENGINES, 128),
+        (abi::QUERY_ENGINES, 184),
         (abi::QUERY_GUC_SUBMISSION_VERSION, 16),
     ] {
         let mut query = [0; 16];
@@ -380,10 +381,11 @@ fn smoke_userspace_execbuffer_ioctl_order_close_and_completion() -> TestResult {
         invoke(&file, &info, &user, abi::QUERY);
         let data = user.load(2048, size as usize);
         if id == abi::QUERY_ENGINES {
-            // drm_i915_engine_info: RENDER/0 then COPY/0, HAS_LOGICAL_INSTANCE.
-            assert_eq!(u32_at(&data, 0), 2);
+            // drm_i915_engine_info: RENDER/0, COPY/0, COMPUTE/0 (MTL has CCS0),
+            // each with HAS_LOGICAL_INSTANCE.
+            assert_eq!(u32_at(&data, 0), 3);
             assert!(data[4..16].iter().all(|v| *v == 0));
-            for (i, class) in [0u8, 1].into_iter().enumerate() {
+            for (i, class) in [0u8, 1, 4].into_iter().enumerate() {
                 let entry = &data[16 + i * 56..16 + (i + 1) * 56];
                 assert_eq!(&entry[..4], &[class, 0, 0, 0]);
                 assert_eq!(u64_at(entry, 8), 1);
@@ -522,6 +524,7 @@ fn smoke_userspace_i915_copy_engine_legacy_ring_and_engine_map() -> TestResult {
             epoch: gt.user_epoch().unwrap(),
             platform,
             submission_version: gt.submission_version(),
+            engines: gt.engines().unwrap(),
         })),
         pending: IrqSafeSpinLock::new(Vec::new()),
     });
@@ -653,7 +656,7 @@ fn smoke_userspace_i915_copy_engine_legacy_ring_and_engine_map() -> TestResult {
         );
     }
     // An unknown entry is ENOENT before a later entry's copy can fault.
-    let mut param = engines_param(&user, proto, &[(4, 0)], 32756);
+    let mut param = engines_param(&user, proto, &[(2, 0)], 32756); // no VCS0
     put32(&mut param, 4, 16);
     user.store(64, &param);
     assert_eq!(
@@ -805,6 +808,7 @@ fn smoke_userspace_primary_render_nodes_and_context_namespaces() -> TestResult {
             epoch: gt.user_epoch().unwrap(),
             platform,
             submission_version: gt.submission_version(),
+            engines: gt.engines().unwrap(),
         })),
         pending: IrqSafeSpinLock::new(Vec::new()),
     });

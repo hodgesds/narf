@@ -90,6 +90,7 @@ struct Owner {
     suspended: AtomicBool,
     user_epoch: Arc<AtomicU64>,
     user_version: Arc<AtomicU32>,
+    user_engines: Arc<core::sync::atomic::AtomicU8>,
     user_facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
 }
 
@@ -98,6 +99,7 @@ struct Backend {
     owner: Weak<Owner>,
     epoch: Arc<AtomicU64>,
     version: Arc<AtomicU32>,
+    engines: Arc<core::sync::atomic::AtomicU8>,
     platform: GtPlatform,
     facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
 }
@@ -146,6 +148,9 @@ impl crate::intel_gpu_user::UserBackend for Backend {
             epoch,
             platform: self.platform,
             submission_version: ((version >> 16) as u8, (version >> 8) as u8, version as u8),
+            engines: crate::intel_gpu_engine::EngineSet::from_bits(
+                self.engines.load(Ordering::Acquire),
+            ),
         })
     }
     fn submit<'a>(
@@ -350,6 +355,7 @@ pub(crate) fn start_pending() {
             suspended: AtomicBool::new(false),
             user_epoch: Arc::new(AtomicU64::new(0)),
             user_version: Arc::new(AtomicU32::new(0)),
+            user_engines: Arc::new(core::sync::atomic::AtomicU8::new(0)),
             user_facts: Arc::new(IrqSafeSpinLock::new(None)),
         });
         *ops.0.lock() = Arc::downgrade(&owner);
@@ -357,6 +363,7 @@ pub(crate) fn start_pending() {
             owner: Arc::downgrade(&owner),
             epoch: owner.user_epoch.clone(),
             version: owner.user_version.clone(),
+            engines: owner.user_engines.clone(),
             platform: GtPlatform::from_pci(
                 owner.pending.device.id.vendor,
                 owner.pending.device.id.device,
@@ -619,6 +626,10 @@ impl Owner {
                         u32::from(major) << 16 | u32::from(minor) << 8 | u32::from(patch),
                         Ordering::Relaxed,
                     );
+                    self.user_engines.store(
+                        gt.engines().ok_or(RuntimeError::State)?.bits(),
+                        Ordering::Release,
+                    );
                     if let Some(epoch) = state.parked_epoch.take() {
                         gt.adopt_user_epoch(epoch).map_err(RuntimeError::Gt)?;
                     }
@@ -711,10 +722,16 @@ impl Owner {
                 }
                 if state.phase == Phase::Running && !state.irq_tried {
                     state.irq_tried = true;
+                    let compute = state
+                        .gt
+                        .as_ref()
+                        .and_then(GuCGt::engines)
+                        .is_some_and(|set| set.contains(crate::intel_gpu_engine::Engine::Ccs0));
                     state.irq = crate::intel_gpu_gt_irq::GtIrq::for_device(
                         AuthorizedWindow::new(self.pending.bar, self.pending.cap),
                         self.pending.cap,
                         self.pending.device,
+                        compute,
                     )
                     .ok();
                     if state.irq.is_some() {

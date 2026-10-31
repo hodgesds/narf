@@ -243,6 +243,31 @@ mod tests {
         smoke_global_register_xe2_fuse_and_ip_vectors
     );
 
+    // xe_hw_engine.c compute fuses and __xe_gt_apply_ccs_mode(ccs_mode 1).
+    fn smoke_global_register_ccs_inventory_and_mode() -> TestResult {
+        use crate::intel_gpu_engine::Engine;
+        // DG2 quadrants are 8 DSS: CCSn exists iff quadrant n has a DSS.
+        for (live, ccs0, multi) in [
+            (0x0101_0101, true, true),
+            (0x0000_00ff, true, false),
+            (0x0000_0100, false, false),
+        ] {
+            let (w, init) = fixture(GtPlatform::Alchemist, 0x56a0, 0, 0, false, live);
+            assert_eq!(init.engines().contains(Engine::Ccs0), ccs0);
+            assert!(matches!(init.poll(&w, 11), Poll::Ready(Ok(None))));
+            let writes = w.writes.borrow();
+            assert_eq!(writes.contains(&(0x14800, 0x0002_0002)), multi);
+            assert_eq!(writes.contains(&(0x14804, 0x0fff_0000)), multi);
+            // CCS0 receives the OAG grants only when published.
+            assert_eq!(writes.contains(&(0x1a4d0, 0x1000_dafc)), ccs0);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt_registers",
+        smoke_global_register_ccs_inventory_and_mode
+    );
+
     fn smoke_global_register_wait_and_failure_cleanup() -> TestResult {
         for failure in 0..4 {
             let (w, init) = fixture(GtPlatform::Battlemage, 0xe20b, 1, 0, false, 1);
@@ -310,6 +335,8 @@ pub(crate) struct RegisterInit {
     device: u16,
     seed: ContextSeed,
     discontiguous: bool,
+    /// Physically present CCS instances (bit n = CCSn).
+    compute: u8,
     deadline: u64,
 }
 
@@ -342,13 +369,29 @@ impl RegisterInit {
                 last = Some(group);
             }
         }
+        let compute = crate::intel_gpu_engine::compute_instances(
+            platform,
+            topology.geometry_dss() | topology.compute_dss(),
+            seed.fuse4,
+        );
         Ok(Self {
             platform,
             device,
             seed,
             discontiguous,
+            compute,
             deadline: now.checked_add(50_000_000).ok_or(RegisterError::Timeout)?,
         })
+    }
+
+    /// RCS0 and BCS0 always; CCS0 when its instance is fused present.
+    pub(crate) fn engines(&self) -> crate::intel_gpu_engine::EngineSet {
+        use crate::intel_gpu_engine::{Engine, EngineSet};
+        if self.compute & 1 != 0 {
+            EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs0])
+        } else {
+            EngineSet::of(&[Engine::Rcs0, Engine::Bcs0])
+        }
     }
 
     /// Ready(Ok(Some)) also returns BMG's local-memory layout registers,
@@ -492,7 +535,8 @@ impl RegisterInit {
                 }
             }
         }
-        crate::intel_gpu_nonpriv::EnginePolicy::new(self.platform)?.install(mmio)?;
+        crate::intel_gpu_nonpriv::EnginePolicy::new(self.platform, self.engines())?
+            .install(mmio)?;
         Ok(vram)
     }
 
@@ -509,6 +553,12 @@ impl RegisterInit {
                 target,
             })
         };
+        // Multi-CCS parts: fixed-slice RCU mode and all slices on CCS0
+        // (xe_hw_engine_match_fixed_cslice_mode, __xe_gt_apply_ccs_mode).
+        if let Some(mode) = crate::intel_gpu_engine::ccs_mode(self.compute) {
+            add(0x14800, 2, 2, true, Direct);
+            add(0x14804, 0xfff, mode & 0xfff, true, Direct);
+        }
         match self.platform {
             GtPlatform::Alchemist => {
                 add(0x9424, 2, 0, false, Direct); // 14015795083
@@ -615,6 +665,10 @@ impl RegisterInit {
                                                            // FOREACH_ENGINE/ENGINE_BASE entries reach BCS0 as well.
                 add(0x220d4, 0xc080, 0xc080, true, Direct); // 16021639441 + priority reads
                 add(0x22050, 0x1000, 0x1000, true, Direct); // 16023105232
+                if self.compute & 1 != 0 {
+                    add(0x1a0d4, 0xc080, 0xc080, true, Direct); // 16021639441 + priority reads
+                    add(0x1a050, 0x1000, 0x1000, true, Direct); // 16023105232
+                }
                 add(0xe530, 0x400, 0x400, false, Dss); // AnyHit null-query tuning
             }
         }

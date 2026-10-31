@@ -5,7 +5,9 @@
 //! applies only to PVC and Xe3+), xe_hw_engine.c, xe_lrc.c
 //! {gen12_xcs,xe2_bcs}_offsets, xe_ring_ops.c::__emit_job_gen12_simple,
 //! xe_gt.c::emit_wa_job, xe_hw_engine_setup_default_lrc_state and
-//! regs/xe_engine_regs.h. BCS8 and compute/media engines remain unadmitted.
+//! regs/xe_engine_regs.h. CCS0 follows xe_gt_ccs_mode.c's default ccs_mode 1
+//! (all compute slices on CCS0; CCS1-3 never exposed) and xe_hw_engine.c's
+//! compute fuses. BCS8 and media engines remain unadmitted.
 
 use crate::{intel_gpu_gt::GtPlatform, intel_gpu_rcs::GpuBacking};
 use alloc::vec::Vec;
@@ -20,10 +22,73 @@ const START: u64 = BREADCRUMB + 8;
 pub enum Engine {
     Rcs0,
     Bcs0,
+    Ccs0,
+}
+
+/// The engines a GT publishes, decided from fuses before scheduling starts.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct EngineSet(u8);
+
+impl EngineSet {
+    pub const fn of(engines: &[Engine]) -> Self {
+        let mut bits = 0;
+        let mut i = 0;
+        while i < engines.len() {
+            bits |= 1 << engines[i] as u8;
+            i += 1;
+        }
+        Self(bits)
+    }
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits & 0b111)
+    }
+    pub fn contains(self, engine: Engine) -> bool {
+        self.0 & 1 << engine as u8 != 0
+    }
+    /// Present engines in `Engine::ALL` (xe_hw_engine id) order.
+    pub fn iter(self) -> impl Iterator<Item = Engine> {
+        Engine::ALL.into_iter().filter(move |e| self.contains(*e))
+    }
+}
+
+/// Physically present compute instances (bit n = CCSn), from
+/// xe_hw_engine.c::read_compute_fuses. Xe-LPG has exactly one CCS; Xe-HPG
+/// infers CCSn from DSS in quadrant n; Xe2 reads XEHP_FUSE4 CCS_EN.
+pub(crate) fn compute_instances(platform: GtPlatform, dss: u32, fuse4: u32) -> u8 {
+    match platform {
+        GtPlatform::Integrated(_) => 1,
+        GtPlatform::Alchemist => {
+            // get_num_dss_regs: one geometry and one compute register, so
+            // each quadrant is 8 DSS of the geometry|compute union.
+            (0..4)
+                .filter(|q| dss >> (q * 8) & 0xff != 0)
+                .fold(0, |m, q| m | 1 << q)
+        }
+        GtPlatform::Battlemage => ((fuse4 >> 16) & 0xf) as u8,
+    }
+}
+
+/// xe_gt_ccs_mode.c::__xe_gt_apply_ccs_mode with one exposed engine: every
+/// present compute slice is assigned to CCS0, absent slices stay disabled.
+/// `None` when at most one CCS exists (CCS mode is not enabled).
+pub(crate) fn ccs_mode(instances: u8) -> Option<u32> {
+    if instances.count_ones() <= 1 {
+        return None;
+    }
+    let mut mode = 0xfff; // CCS_MODE_CSLICE_0_3_MASK: all disabled
+    for slice in 0..4 {
+        if instances & 1 << slice != 0 {
+            mode &= !(7 << (slice * 3)); // CCS0
+        }
+    }
+    Some(mode | 0xfff << 16)
 }
 
 impl Engine {
-    pub const ALL: [Engine; 2] = [Engine::Rcs0, Engine::Bcs0];
+    pub const ALL: [Engine; 3] = [Engine::Rcs0, Engine::Bcs0, Engine::Ccs0];
 
     pub(crate) fn index(self) -> usize {
         self as usize
@@ -32,20 +97,23 @@ impl Engine {
         match self {
             Engine::Rcs0 => 0x2000,
             Engine::Bcs0 => 0x22000,
+            Engine::Ccs0 => 0x1a000,
         }
     }
-    /// GUC_RENDER_CLASS / GUC_BLITTER_CLASS.
+    /// GUC_RENDER_CLASS / GUC_BLITTER_CLASS / GUC_COMPUTE_CLASS.
     pub(crate) fn guc_class(self) -> u32 {
         match self {
             Engine::Rcs0 => 0,
             Engine::Bcs0 => 3,
+            Engine::Ccs0 => 4,
         }
     }
-    /// DRM_XE_ENGINE_CLASS_RENDER / _COPY.
+    /// DRM_XE_ENGINE_CLASS_RENDER / _COPY / _COMPUTE (also i915 UABI).
     pub fn xe_class(self) -> u16 {
         match self {
             Engine::Rcs0 => 0,
             Engine::Bcs0 => 1,
+            Engine::Ccs0 => 4,
         }
     }
     pub(crate) fn from_xe_class(class: u16) -> Option<Self> {
@@ -57,6 +125,8 @@ impl Engine {
             (Engine::Rcs0, GtPlatform::Battlemage) => 4,
             (Engine::Rcs0, _) => 14,
             (Engine::Bcs0, _) => 2,
+            (Engine::Ccs0, GtPlatform::Battlemage) => 3,
+            (Engine::Ccs0, _) => 14,
         }
     }
     /// First MI_LOAD_REGISTER_IMM header of the hardware-saved image.
@@ -79,7 +149,16 @@ pub(crate) fn enable_ring(
 ) {
     let base = u64::from(engine.base());
     let uc = uncached_mocs(platform);
-    mmio.write32(base + 0xc4, 0x3f7e0000 | uc << 8 | uc << 1);
+    // hw_engine_setup_default_state: discrete Xe2 compute reads use WB.
+    let read = if engine == Engine::Ccs0 && platform == GtPlatform::Battlemage {
+        4
+    } else {
+        uc
+    };
+    if engine == Engine::Ccs0 {
+        mmio.write32(0x14800, 0x00010001); // RCU_MODE_CCS_ENABLE
+    }
+    mmio.write32(base + 0xc4, 0x3f7e0000 | uc << 8 | read << 1);
     mmio.write32(base + 0xa8, u32::MAX); // runtime owner enables IRQs after startup probes
     mmio.write32(base + 0x98, u32::MAX);
     mmio.write32(base + 0x80, hwsp);
@@ -130,6 +209,17 @@ pub(crate) fn copy_seed(platform: GtPlatform) -> Vec<u32> {
         0x610,
         0,
     ]
+}
+
+/// Default CCS LRC state: xe_hw_engine_setup_default_lrc_state's only
+/// compute entry on these platforms, the Xe2 WMTP-disabled preemption level
+/// (CS_CHICKEN1 PREEMPT_GPGPU_THREAD_GROUP_LEVEL, masked). No 3D state.
+pub(crate) fn compute_seed(platform: GtPlatform, disable_wmtp: bool) -> Vec<u32> {
+    if platform == GtPlatform::Battlemage && disable_wmtp {
+        alloc::vec![0x11000001, Engine::Ccs0.base() + 0x580, 0x00060002]
+    } else {
+        Vec::new()
+    }
 }
 
 /// MI_FLUSH_DW post-sync GGTT store, then MI_USER_INTERRUPT. Tails stay
@@ -188,13 +278,21 @@ pub(crate) fn copy_ring(
 }
 
 /// Inhibited initial BCS image from the class's Linux offset table.
+#[cfg(feature = "kernel-test")]
 pub(crate) fn copy_image(image: &impl GpuBacking, platform: GtPlatform, ring: u32) {
-    let base = Engine::Bcs0.base();
+    xcs_image(Engine::Bcs0, image, platform, ring)
+}
+
+/// Inhibited initial non-render image (reg_offsets for COPY/COMPUTE):
+/// BCS uses gen12_xcs before Xe2 and xe2_bcs on BMG; CCS uses dg2_xcs
+/// (graphics >= 12.55) and xe2_xcs. Only xe2_bcs has a third LRI group.
+pub(crate) fn xcs_image(engine: Engine, image: &impl GpuBacking, platform: GtPlatform, ring: u32) {
+    let base = engine.base();
     let xe2 = platform == GtPlatform::Battlemage;
     let mut first: Vec<u32> = alloc::vec![
         0x244, 0x034, 0x030, 0x038, 0x03c, 0x168, 0x140, 0x110, 0x1c0, 0x1c4, 0x1c8, 0x180, 0x2b4,
     ];
-    if xe2 {
+    if xe2 || engine == Engine::Ccs0 {
         first.extend_from_slice(&[0x120, 0x124]);
     }
     let second: &[u32] = if xe2 {
@@ -207,7 +305,7 @@ pub(crate) fn copy_image(image: &impl GpuBacking, platform: GtPlatform, ring: u3
         ]
     };
     let mut groups: Vec<(u64, &[u32])> = alloc::vec![(1, first.as_slice()), (0x21, second)];
-    if xe2 {
+    if xe2 && engine == Engine::Bcs0 {
         groups.push((0x41, &[0x200, 0x204]));
     }
     let mut end = 0;
@@ -253,10 +351,33 @@ pub(crate) mod tests {
     fn smoke_engine_identity_table() -> TestResult {
         assert_eq!(
             Engine::ALL.map(|e| (e.base(), e.guc_class(), e.xe_class())),
-            [(0x2000, 0, 0), (0x22000, 3, 1)]
+            [(0x2000, 0, 0), (0x22000, 3, 1), (0x1a000, 4, 4)]
         );
+        assert_eq!(Engine::Ccs0.lrc_pages(GtPlatform::Battlemage), 3);
+        assert_eq!(Engine::Ccs0.lrc_pages(GtPlatform::Alchemist), 14);
+        assert_eq!(Engine::Ccs0.first_lri(GtPlatform::Alchemist), 0x1108101d);
+        let set = EngineSet::of(&[Engine::Rcs0, Engine::Ccs0]);
+        assert!(set.contains(Engine::Ccs0) && !set.contains(Engine::Bcs0));
+        assert_eq!(set.iter().collect::<Vec<_>>(), [Engine::Rcs0, Engine::Ccs0]);
+        let mtl = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+        assert_eq!(compute_instances(mtl, 0, 0), 1);
+        assert_eq!(
+            compute_instances(GtPlatform::Alchemist, 0x0100_0001, 0),
+            0b1001
+        );
+        assert_eq!(compute_instances(GtPlatform::Alchemist, 0x100, 0), 0b10);
+        // Xe2: XEHP_FUSE4 CCS_EN (19:16), independent of DSS.
+        assert_eq!(
+            compute_instances(GtPlatform::Battlemage, 1, 0xa << 16 | 0x10),
+            0b1010
+        );
+        // __xe_gt_apply_ccs_mode with ccs_mode 1: present slices -> CCS0.
+        assert_eq!(ccs_mode(1), None);
+        assert_eq!(ccs_mode(0xf), Some(0x0fff_0000));
+        assert_eq!(ccs_mode(0b1010), Some(0x0fff_0000 | 0b111_000_111));
         assert_eq!(Engine::from_xe_class(1), Some(Engine::Bcs0));
-        assert_eq!(Engine::from_xe_class(4), None);
+        assert_eq!(Engine::from_xe_class(4), Some(Engine::Ccs0));
+        assert_eq!(Engine::from_xe_class(2), None);
         for platform in [
             GtPlatform::Alchemist,
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),

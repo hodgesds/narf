@@ -44,43 +44,60 @@ const BCS: Slots = Slots {
     base: 0x22000,
     allowed: &[],
 };
-const BANKS: [Slots; 2] = [RCS, BCS];
+/// xe_reg_whitelist.c oag_mmio_trg_ccs: the same OAG grants as RCS0.
+const CCS: Slots = Slots {
+    base: 0x1a000,
+    allowed: &ALLOWED,
+};
 
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct EnginePolicy;
+pub(crate) struct EnginePolicy {
+    compute: bool,
+}
 
 impl EnginePolicy {
     /// The enclosing GT has already validated live GMD IP/stepping and PCI
     /// identity. Gen12 execlists, media and future IPs need separate policies.
-    pub(crate) fn new(platform: GtPlatform) -> Result<Self, RegisterError> {
+    pub(crate) fn new(
+        platform: GtPlatform,
+        engines: crate::intel_gpu_engine::EngineSet,
+    ) -> Result<Self, RegisterError> {
         match platform {
             GtPlatform::Alchemist
             | GtPlatform::Battlemage
-            | GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => Ok(Self),
+            | GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => Ok(Self {
+                compute: engines.contains(crate::intel_gpu_engine::Engine::Ccs0),
+            }),
             _ => Err(RegisterError::Identity),
         }
+    }
+
+    fn banks(self) -> impl Iterator<Item = Slots> {
+        [Some(RCS), Some(BCS), self.compute.then_some(CCS)]
+            .into_iter()
+            .flatten()
     }
 
     /// Engine must be idle and exclusively owned with both forcewake holds.
     /// No new grant is written until every inherited slot is cleared and its
     /// posted readback verified. Any failure blocks engine publication.
     pub(crate) fn install(self, mmio: &impl MmioWindow) -> Result<(), RegisterError> {
-        for slots in BANKS {
+        for slots in self.banks() {
             for slot in 0..SLOTS {
                 if mmio.read32(slots.register(slot)) == u32::MAX {
                     return Err(RegisterError::Unavailable);
                 }
             }
         }
-        for slots in BANKS {
+        for slots in self.banks() {
             for slot in 0..SLOTS {
                 mmio.write32(slots.register(slot), slots.nopid());
             }
         }
-        for slots in BANKS {
+        for slots in self.banks() {
             verify_words(mmio, slots, |_| slots.nopid())?;
         }
-        for slots in BANKS {
+        for slots in self.banks() {
             for (slot, word) in slots.allowed.iter().enumerate() {
                 mmio.write32(slots.register(slot), *word);
             }
@@ -90,7 +107,7 @@ impl EnginePolicy {
 
     /// Validate without repairing a potentially live engine's access policy.
     pub(crate) fn verify(self, mmio: &impl MmioWindow) -> Result<(), RegisterError> {
-        for slots in BANKS {
+        for slots in self.banks() {
             verify_words(mmio, slots, |slot| slots.expected(slot))?;
         }
         Ok(())
@@ -122,8 +139,13 @@ mod tests {
     use core::cell::{Cell, RefCell};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
+    fn rcs_bcs() -> crate::intel_gpu_engine::EngineSet {
+        use crate::intel_gpu_engine::{Engine, EngineSet};
+        EngineSet::of(&[Engine::Rcs0, Engine::Bcs0])
+    }
+
     struct Window {
-        slots: RefCell<[u32; 24]>,
+        slots: RefCell<[u32; 36]>,
         writes: RefCell<Vec<(u64, u32)>>,
         unavailable: Cell<Option<usize>>,
         reject: Cell<Option<(usize, bool)>>,
@@ -132,7 +154,7 @@ mod tests {
     impl Window {
         fn new() -> Self {
             Self {
-                slots: RefCell::new([0x2030; 24]),
+                slots: RefCell::new([0x2030; 36]),
                 writes: RefCell::new(Vec::new()),
                 unavailable: Cell::new(None),
                 reject: Cell::new(None),
@@ -144,14 +166,15 @@ mod tests {
             match reg {
                 0x24d0..=0x24fc => (reg as usize - 0x24d0) / 4,
                 0x224d0..=0x224fc => 12 + (reg as usize - 0x224d0) / 4,
+                0x1a4d0..=0x1a4fc => 24 + (reg as usize - 0x1a4d0) / 4,
                 _ => panic!("unexpected NONPRIV register {reg:x}"),
             }
         }
         fn nopid(slot: usize) -> u32 {
-            if slot < 12 {
-                0x2094
-            } else {
-                0x22094
+            match slot {
+                0..12 => 0x2094,
+                12..24 => 0x22094,
+                _ => 0x1a094,
             }
         }
     }
@@ -184,7 +207,7 @@ mod tests {
             GtPlatform::Battlemage,
         ] {
             let w = Window::new();
-            let policy = EnginePolicy::new(platform).unwrap();
+            let policy = EnginePolicy::new(platform, rcs_bcs()).unwrap();
             policy.install(&w).unwrap();
             assert_eq!(
                 w.slots.borrow()[..12],
@@ -193,7 +216,8 @@ mod tests {
                     0x2094, 0x2094, 0x2094
                 ]
             );
-            assert!(w.slots.borrow()[12..].iter().all(|word| *word == 0x22094));
+            assert!(w.slots.borrow()[12..24].iter().all(|word| *word == 0x22094));
+            assert!(w.slots.borrow()[24..].iter().all(|word| *word == 0x2030));
             let writes = w.writes.borrow();
             assert_eq!(writes.len(), 27);
             for slot in 0..12 {
@@ -206,13 +230,28 @@ mod tests {
             );
             policy.verify(&w).unwrap();
         }
+        // With CCS0 present, its bank receives the RCS OAG grants as well.
+        let w = Window::new();
+        let policy = EnginePolicy::new(
+            GtPlatform::Battlemage,
+            crate::intel_gpu_engine::EngineSet::of(&[
+                crate::intel_gpu_engine::Engine::Rcs0,
+                crate::intel_gpu_engine::Engine::Bcs0,
+                crate::intel_gpu_engine::Engine::Ccs0,
+            ]),
+        )
+        .unwrap();
+        policy.install(&w).unwrap();
+        assert_eq!(w.slots.borrow()[24..27], [0x1000dafc, 0x1000db01, 0xdb1c]);
+        assert!(w.slots.borrow()[27..].iter().all(|word| *word == 0x1a094));
+        policy.verify(&w).unwrap();
         for generation in [
             crate::intel_gpu::Generation::TigerLake,
             crate::intel_gpu::Generation::AlderLake,
             crate::intel_gpu::Generation::PantherLake,
         ] {
             assert!(matches!(
-                EnginePolicy::new(GtPlatform::Integrated(generation)),
+                EnginePolicy::new(GtPlatform::Integrated(generation), rcs_bcs()),
                 Err(RegisterError::Identity)
             ));
         }
@@ -253,7 +292,7 @@ mod tests {
                 }
             };
             assert_eq!(
-                EnginePolicy::new(GtPlatform::Battlemage)
+                EnginePolicy::new(GtPlatform::Battlemage, rcs_bcs())
                     .unwrap()
                     .install(&w),
                 Err(expected)
@@ -280,7 +319,7 @@ mod tests {
 
     fn smoke_nonpriv_verification_never_repairs_live_policy() -> TestResult {
         let w = Window::new();
-        let policy = EnginePolicy::new(GtPlatform::Alchemist).unwrap();
+        let policy = EnginePolicy::new(GtPlatform::Alchemist, rcs_bcs()).unwrap();
         policy.install(&w).unwrap();
         let expected = *w.slots.borrow();
         let writes = w.writes.borrow().len();
@@ -288,6 +327,9 @@ mod tests {
             // Address, range, RD/WR, DENY and reserved bits must all match.
             for bit in [1, 4, 1 << 28, 1 << 29, 1 << 30, 1 << 27] {
                 w.slots.borrow_mut()[slot] = word ^ bit;
+                if slot >= 24 {
+                    continue; // no CCS bank in this policy
+                }
                 let reg = if slot < 12 {
                     0x24d0 + slot as u64 * 4
                 } else {

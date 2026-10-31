@@ -183,14 +183,14 @@ fn read_engines(
             map.push(None);
             continue;
         }
-        let engine = match (class, instance) {
-            (abi::ENGINE_RENDER, 0) => Engine::Rcs0,
-            (abi::ENGINE_COPY, 0) => Engine::Bcs0,
-            _ => return Err(FsError::NotFound),
-        };
-        if !info.submission_ready() {
-            return Err(FsError::NotFound);
-        }
+        let present = info
+            .user_status()
+            .map_or_else(Default::default, |status| status.engines);
+        let engine = Engine::ALL
+            .into_iter()
+            .find(|engine| engine.xe_class() == class && instance == 0)
+            .filter(|engine| present.contains(*engine))
+            .ok_or(FsError::NotFound)?;
         map.push(Some(engine));
     }
     let extensions_at = u64_at(&read(user, value, 8)?, 0);
@@ -1194,11 +1194,10 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
                 abi::QUERY_ENGINES => {
                     // i915_query.c::query_engine_info in uabi class order:
                     // RENDER then COPY, logical instance 0, no capabilities.
-                    let engines: &[u16] = if info.submission_ready() {
-                        &[abi::ENGINE_RENDER, abi::ENGINE_COPY]
-                    } else {
-                        &[]
-                    };
+                    // RENDER, COPY, COMPUTE share i915 and Xe class numbers.
+                    let engines: Vec<u16> = info.user_status().map_or_else(Vec::new, |status| {
+                        status.engines.iter().map(|e| e.xe_class()).collect()
+                    });
                     let mut reply = vec![0; 16 + engines.len() * 56];
                     put32(&mut reply, 0, engines.len() as u32);
                     for (i, class) in engines.iter().enumerate() {

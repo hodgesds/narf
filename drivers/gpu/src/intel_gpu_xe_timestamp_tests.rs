@@ -87,6 +87,9 @@ fn smoke_xe_engine_cycles_live_owner_and_query_snapshot() -> TestResult {
         w.0.borrow_mut().regs.insert(0x2358, 0x12345678);
         w.0.borrow_mut().regs.insert(0x2235c, upper ^ 1);
         w.0.borrow_mut().regs.insert(0x22358, 0x0badf00d);
+        w.0.borrow_mut().regs.insert(0x1a35c, upper ^ 2);
+        w.0.borrow_mut().regs.insert(0x1a358, 0x0c0ffee0);
+        let present: Vec<Engine> = gt.engines().unwrap().iter().collect();
         let file = RenderFile::new();
         let user = Cpu::new();
         query(&user, 0);
@@ -95,12 +98,12 @@ fn smoke_xe_engine_cycles_live_owner_and_query_snapshot() -> TestResult {
         assert_eq!(u32_at(&user.wire.load(64, 40), 12), 40);
         for (engine, clock) in [0, 1, 4, 7]
             .into_iter()
-            .flat_map(|clock| Engine::ALL.map(|engine| (engine, clock)))
+            .flat_map(|clock| present.iter().map(move |engine| (*engine, clock)))
         {
-            let expected = if engine == Engine::Rcs0 {
-                expected
-            } else {
-                u64::from(upper ^ 1) << 32 | 0x0badf00d
+            let expected = match engine {
+                Engine::Rcs0 => expected,
+                Engine::Bcs0 => u64::from(upper ^ 1) << 32 | 0x0badf00d,
+                Engine::Ccs0 => u64::from(upper ^ 2) << 32 | 0x0c0ffee0,
             };
             let mut payload = [0xa5; 40];
             payload[..6].fill(0);

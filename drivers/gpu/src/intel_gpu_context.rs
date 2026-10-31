@@ -25,7 +25,9 @@ pub(crate) struct ContextSeed {
     platform: GtPlatform,
     pub(crate) dss: u32,
     pub(crate) l3: u32,
-    disable_wmtp: bool,
+    pub(crate) disable_wmtp: bool,
+    /// XEHP_FUSE4, sampled stably with MIRROR_FUSE3.
+    pub(crate) fuse4: u32,
     pub(crate) graphics: u16,
     pub(crate) step: u8,
     pub(crate) mslice: u8,
@@ -91,6 +93,7 @@ impl ContextSeed {
             dss,
             l3,
             disable_wmtp: a[0] & (1 << 20) != 0,
+            fuse4: a[0],
             graphics,
             step,
             mslice: (a[1] & 15).trailing_zeros() as u8,

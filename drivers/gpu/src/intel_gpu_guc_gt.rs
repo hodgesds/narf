@@ -165,6 +165,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         self.parts.boot.hwconfig()
     }
 
+    /// Engines this GT schedules, once scheduling has been prepared.
+    pub fn engines(&self) -> Option<crate::intel_gpu_engine::EngineSet> {
+        self.parts.scheduler.as_ref().map(|s| s.engines())
+    }
+
     pub fn vram_layout(&self) -> Option<crate::intel_gpu_vram::VramLayout> {
         self.vram
     }
@@ -346,7 +351,13 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     fn verify_register_policy(&self) -> Result<(), GtError> {
-        EnginePolicy::new(self.parts.boot.platform())
+        let engines = self
+            .engines()
+            .unwrap_or(crate::intel_gpu_engine::EngineSet::of(&[
+                crate::intel_gpu_engine::Engine::Rcs0,
+                crate::intel_gpu_engine::Engine::Bcs0,
+            ]));
+        EnginePolicy::new(self.parts.boot.platform(), engines)
             .and_then(|policy| policy.verify(self.parts.boot.window()))
             .map_err(GtError::Registers)
     }
@@ -484,7 +495,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             now,
         )
         .map_err(GtError::Registers)?;
-        let scheduler = self.parts.boot.scheduler().map_err(GtError::Boot)?;
+        let scheduler = self
+            .parts
+            .boot
+            .scheduler(registers.engines())
+            .map_err(GtError::Boot)?;
         self.parts.scheduler = Some(scheduler);
         self.registers = Some(registers);
         self.state = GtState::PreparingScheduling;
