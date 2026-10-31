@@ -298,7 +298,8 @@ impl RenderFile {
         if info.native_xe() {
             if matches!(
                 cmd,
-                crate::intel_gpu_xe_uapi::VM_BIND
+                crate::intel_gpu_xe_uapi::DEVICE_QUERY
+                    | crate::intel_gpu_xe_uapi::VM_BIND
                     | crate::intel_gpu_xe_uapi::EXEC
                     | crate::intel_gpu_xe_uapi::WAIT_USER_FENCE
             ) {

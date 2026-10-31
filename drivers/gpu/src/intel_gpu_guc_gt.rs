@@ -194,6 +194,44 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         })
     }
 
+    /// A current RCS counter observation, serialized with reset by the PCI
+    /// owner. Clock IDs match NARF clock_gettime; CLOCK_TAI is unavailable.
+    pub fn engine_cycles(
+        &mut self,
+        clock: i32,
+    ) -> Result<crate::intel_gpu_timestamp::EngineCycles, GtError> {
+        if self.user_epoch().is_none() {
+            return Err(GtError::State);
+        }
+        if !matches!(clock, 0 | 1 | 4 | 7) {
+            return Err(GtError::Unavailable);
+        }
+        if let Err(error) = self.awake() {
+            self.state = GtState::Lost;
+            return Err(error);
+        }
+        crate::intel_gpu_timestamp::sample(
+            self.parts.boot.window(),
+            if self.parts.boot.platform() == crate::intel_gpu_gt::GtPlatform::Battlemage {
+                64
+            } else {
+                36
+            },
+            || {
+                if clock == 0 {
+                    narf_time::now_wall().as_nanos() as u64
+                } else {
+                    narf_time::monotonic_ns()
+                }
+            },
+            narf_time::monotonic_ns,
+        )
+        .map_err(|error| match error {
+            crate::intel_gpu_timestamp::SampleError::Unavailable => GtError::Unavailable,
+            crate::intel_gpu_timestamp::SampleError::Unstable => GtError::Busy,
+        })
+    }
+
     pub(crate) fn topology_for_device(
         &mut self,
         device_id: u16,

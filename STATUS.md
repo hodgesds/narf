@@ -950,13 +950,28 @@ terminal reservations for every CPU conflict while allowing explicitly ordered
 queues to overlap. GPU user fences use an owned PPGTT qword store after cache
 flush; CPU bind fences and masked waits use guarded atomic qword access on both
 architectures. Discovery reports observed engines, memory, GT/IP/clock facts,
-HWCONFIG, topology and the loaded GuC submission-interface version. Queue
+HWCONFIG, topology and the loaded GuC submission-interface version. Correlated
+RCS engine-cycle queries use current forcewake and the reset mutex, bounded
+rollover-safe MMIO observations, actual 36/64-bit counters and NARF CPU clocks.
+They retain inputs across waits and copy only output fields.
+Infinite user-fence waits also use the existing interruptible syscall restart
+hook, while finite waits retain their original deadlines. Queue
 priority/timeslice policies reach the actual GuC KLV request. Native Rust tests
 exercise the ioctl-to-hardware ownership path, bind cancellation, handle close,
 concurrent queues, user-fence visibility and transactional copyout failures.
 This does not establish Mesa or physical Intel acceptance. USERPTR, fault/LR
 VMs, iGPU WC/incoherent mappings, other engines, local VRAM, accelerated
 presentation, IRQ completion and runtime autosuspend remain outstanding.
+
+Final native Xe regression runs pass 136 distinct Intel/DRM tests on x86_64
+and 124 on aarch64, including all 15 new tests, with zero failures/skips.
+Deadline tests use a controlled clock and fixture
+progress uses bounded polling, avoiding short host-dependent timing guards.
+GPU, arch, filesystem and userspace CI Clippy pass all three feature contexts
+on both targets; host default, Intel-only, AMD-only and no-vendor all-target
+checks pass. Intel-only debug and release builds, formatting, both production
+boots and both btrfs postflights per architecture pass. These are native Rust
+models and QEMU checks; physical Intel and Mesa acceptance remain unverified.
 
 The existing compatibility profile implements userspace RCS0 submission on
 MTL/Arrow Xe-LPG, Alchemist and Battlemage. Async i915 EXECBUFFER2/WR uses copied softpin

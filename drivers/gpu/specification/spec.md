@@ -115,7 +115,8 @@ cannot be decoded under a different ABI. Internal routing remains `intel-gpu`.
 #### Native Xe profile
 
 DEVICE_QUERY implements engines, system-memory regions, configuration, GT
-list, raw HWCONFIG, topology masks and GuC submission-interface version.
+list, raw HWCONFIG, topology masks, correlated engine cycles and GuC
+submission-interface version.
 It uses Xe's size-only/exact-size
 protocol; size-only calls never touch the payload pointer. Engine discovery
 publishes only live RCS0. Unavailable query types return EINVAL. DeviceFacts
@@ -124,6 +125,18 @@ RPM_CONFIG0-derived timestamp clock. The GT owner samples it with current
 forcewake after its startup execution probes and publishes it before readiness.
 The firmware query validates its input subtype/reserved fields and reports
 the loaded CSS compatibility tuple; unavailable HuC remains ENODEV.
+Engine-cycle queries retain their input engine/clock and destination before
+awaiting UserBackend::engine_cycles. The live GT owner samples RCS0 under its
+async reset mutex, PCI D0 and current render forcewake; loss clears admission.
+EngineCycles contains width (36 bits before BMG; 64 on BMG), the actual
+RING_TIMESTAMP counter and CPU timestamp/delta around its lower-register read.
+At most three high/low/high observations handle rollover; unstable observations
+return EAGAIN and unavailable registers return an I/O error. CPU clocks are
+REALTIME, MONOTONIC, MONOTONIC_RAW and BOOTTIME using NARF clock_gettime sources;
+CLOCK_TAI and unadvertised engines are refused. Size-only queries need no
+payload pointer. Copyout touches only width/cycles/timestamp/delta, preserving
+the input fields even if userspace changes them while waiting. Sync kernel
+dispatch returns EAGAIN for a sample that needs the async owner.
 No usable VRAM, low-latency, protected execution or fault-mode capability is
 advertised. BMG accepts/reports NO_COMPRESSION because every admitted binding
 uses an uncompressed coherent policy.
@@ -182,6 +195,12 @@ releases terminal reservations or page tables. WAIT_USER_FENCE uses atomic
 acquire reads, six masked comparisons, queue reset status and one retained
 relative/absolute monotonic deadline; relative timeouts write back remaining
 time. Polling awaits timers and holds no IRQ-safe guard across a sleep.
+An unsatisfied infinite user wait can request the existing interruptible
+syscall park/reexecute hook with a 100-microsecond repoll. It returns EAGAIN
+without changing the request or publishing GPU work; the syscall bridge handles
+signal delivery and SA_RESTART. Completed/failed waits never request a park.
+Finite waits retain their original future/deadline instead of restarting a
+relative timeout on each repoll. Kernel callers without the hook await timers.
 USERPTR, long-running/fault VMs, multi-engine/parallel queues, scanout/WC iGPU
 allocations, observation and additional native Xe query/property families
 remain refused until their ownership and hardware contracts are implemented.

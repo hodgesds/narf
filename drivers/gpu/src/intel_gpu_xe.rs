@@ -312,6 +312,11 @@ impl XeFile {
         syncobjs: &IrqSafeSpinLock<SyncObjTable>,
     ) -> Option<Result<u64, FsError>> {
         match cmd {
+            abi::DEVICE_QUERY => Some(
+                crate::intel_gpu_xe_query::query_user(info, address, user)
+                    .await
+                    .map(|_| 0),
+            ),
             abi::VM_BIND => Some(
                 self.bind(info, address, user, gem, syncobjs)
                     .await
@@ -451,6 +456,15 @@ impl XeFile {
         }
     }
     async fn wait_user(&self, address: u64, user: &dyn IoctlContext) -> Result<(), FsError> {
+        self.wait_user_clock(address, user, narf_time::monotonic_ns)
+            .await
+    }
+    pub(crate) async fn wait_user_clock(
+        &self,
+        address: u64,
+        user: &dyn IoctlContext,
+        clock: impl Fn() -> u64,
+    ) -> Result<(), FsError> {
         let wire = read(user, address, 72)?;
         zero(&wire[..8])?;
         zero(&wire[20..24])?;
@@ -467,7 +481,7 @@ impl XeFile {
             None
         };
         let timeout = u64_at(&wire, 40) as i64;
-        let start = narf_time::monotonic_ns();
+        let start = clock();
         let deadline = (timeout >= 0).then(|| {
             if flags == 1 {
                 timeout as u64
@@ -495,14 +509,16 @@ impl XeFile {
             if queue.as_ref().is_some_and(|q| q.context.banned()) {
                 break Err(crate::intel_gpu_user::io_error());
             }
-            if deadline.is_some_and(|end| narf_time::monotonic_ns() >= end) {
+            if deadline.is_some_and(|end| clock() >= end) {
                 break Err(FsError::TimedOut);
+            }
+            if timeout < 0 && user.restart_after(100_000) {
+                break Err(FsError::WouldBlock);
             }
             narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
         };
         if flags == 0 && timeout >= 0 {
-            let remaining =
-                (timeout as u64).saturating_sub(narf_time::monotonic_ns().saturating_sub(start));
+            let remaining = (timeout as u64).saturating_sub(clock().saturating_sub(start));
             user.write(
                 address.checked_add(40).ok_or(FsError::BadAddress)?,
                 &remaining.to_le_bytes(),

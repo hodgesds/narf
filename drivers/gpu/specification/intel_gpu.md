@@ -1475,6 +1475,7 @@ not claimed.
 
 Production GuC owners now select native Xe on both render and primary opens.
 The new path implements Xe engine/memory/config/GT/HWCONFIG/topology queries,
+correlated RCS engine/CPU timestamps through the live reset/forcewake owner,
 system GEM creation/mmap, persistent VM binding metadata, RCS0 and software
 bind queues, binary/timeline syncs, GPU and CPU user fences and masked waits.
 Its immutable per-execution PPGTT roots retain partial BO ranges and aliases;

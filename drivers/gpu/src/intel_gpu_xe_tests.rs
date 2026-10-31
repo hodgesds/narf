@@ -262,20 +262,16 @@ fn finish(
 }
 
 fn ready<F: Future + ?Sized>(mut future: core::pin::Pin<&mut F>) -> F::Output {
-    let deadline = narf_time::monotonic_ns() + 10_000_000;
-    loop {
+    for _ in 0..1_000_000 {
         if let Poll::Ready(result) = future
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
         {
             return result;
         }
-        assert!(
-            narf_time::monotonic_ns() < deadline,
-            "native Xe future did not resume"
-        );
         narf_scheduler::sleep_pumps::run();
     }
+    panic!("native Xe future did not resume within its poll budget");
 }
 
 fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
@@ -626,13 +622,16 @@ fn smoke_xe_zero_batch_user_fence_and_wait_timeout() -> TestResult {
     put64(&mut wire, 32, u32::MAX as u64);
     put64(&mut wire, 40, 100_000);
     user.wire.store(64, &wire);
-    let mut wait = core::pin::pin!(file.dispatch_user(&info, xe::WAIT_USER_FENCE, 64, &user));
+    let clock = core::cell::Cell::new(0u64);
+    let waits = crate::intel_gpu_xe::XeFile::new();
+    let mut wait = core::pin::pin!(waits.wait_user_clock(64, &user, || clock.get()));
     assert!(wait
         .as_mut()
         .poll(&mut Context::from_waker(Waker::noop()))
         .is_pending());
     user.wire.store(104, &u64::MAX.to_le_bytes());
-    assert_eq!(ready(wait.as_mut()), Some(Err(FsError::TimedOut)));
+    clock.set(100_000);
+    assert_eq!(ready(wait.as_mut()), Err(FsError::TimedOut));
     assert_eq!(u64_at(&user.wire.load(104, 8), 0), 0);
     hardware_stop(&mut gt, &w, 0xdfc);
     drop(gt);
@@ -645,4 +644,10 @@ kernel_test_in!(
 );
 mod queues {
     include!("intel_gpu_xe_queue_tests.rs");
+}
+mod timestamps {
+    include!("intel_gpu_xe_timestamp_tests.rs");
+}
+mod waits {
+    include!("intel_gpu_xe_wait_tests.rs");
 }

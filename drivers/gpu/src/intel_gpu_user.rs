@@ -56,6 +56,11 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn device_facts(&self) -> Option<DeviceFacts> {
         None
     }
+    /// Correlate a live RCS0 counter with one supported CPU clock while the
+    /// owner retains PCI D0, render forcewake and its reset mutex.
+    fn engine_cycles(&self, _clock: i32) -> FsFuture<'_, crate::intel_gpu_timestamp::EngineCycles> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
     /// Err means nothing was queued. Ok transfers ownership to the GT even
     /// if the calling future/fd/context handle is subsequently dropped.
     fn submit<'a>(

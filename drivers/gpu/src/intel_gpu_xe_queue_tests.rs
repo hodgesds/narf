@@ -229,15 +229,17 @@ fn smoke_xe_sync_snapshots_barrier_firmware_and_closed_queue() -> TestResult {
     user.wire.store(64, &[0; 56]);
     let mut registered = BTreeMap::new();
     finish(&mut gt, &w, &producer, &mut registered, 101);
-    let deadline = narf_time::monotonic_ns() + 10_000_000;
-    while mailbox.pending.lock().is_empty() {
+    for _ in 0..1_000_000 {
+        if !mailbox.pending.lock().is_empty() {
+            break;
+        }
         assert!(call
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending());
-        assert!(narf_time::monotonic_ns() < deadline);
         narf_scheduler::sleep_pumps::run();
     }
+    assert!(!mailbox.pending.lock().is_empty(), "consumer never queued");
     let (_, consumer) = mailbox.accept(&mut gt, 200);
     assert_eq!(
         call.as_mut().poll(&mut Context::from_waker(Waker::noop())),

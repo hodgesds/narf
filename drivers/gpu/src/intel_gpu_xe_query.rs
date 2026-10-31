@@ -14,9 +14,58 @@ pub(crate) fn query(
     user: &dyn IoctlContext,
 ) -> Result<(), FsError> {
     let wire = read(user, address, 40)?;
+    query_wire(info, address, user, &wire)
+}
+
+pub(crate) async fn query_user(
+    info: &DeviceInfo,
+    address: u64,
+    user: &dyn IoctlContext,
+) -> Result<(), FsError> {
+    let wire = read(user, address, 40)?;
+    if u32_at(&wire, 8) != 6 || u32_at(&wire, 12) == 0 {
+        return query_wire(info, address, user, &wire);
+    }
     zero(&wire[..8])?;
     zero(&wire[24..40])?;
-    let payload = match u32_at(&wire, 8) {
+    if u32_at(&wire, 12) != 40 {
+        return Err(FsError::InvalidData);
+    }
+    let data = u64_at(&wire, 16);
+    let input = read(user, data, 40)?;
+    // Only the advertised RCS0 on main GT0 can be sampled.
+    zero(&input[..8])?;
+    let clock = u32_at(&input, 8) as i32;
+    if !matches!(clock, 0 | 1 | 4 | 7) {
+        return Err(FsError::InvalidData);
+    }
+    let destination = data.checked_add(12).ok_or(FsError::BadAddress)?;
+    if !info.submission_ready() {
+        return Err(FsError::NoDevice);
+    }
+    let stamp = info
+        .backend
+        .as_ref()
+        .ok_or(FsError::NoDevice)?
+        .engine_cycles(clock)
+        .await?;
+    let mut output = [0; 28];
+    put32(&mut output, 0, stamp.width);
+    put64(&mut output, 4, stamp.engine_cycles);
+    put64(&mut output, 12, stamp.cpu_timestamp);
+    put64(&mut output, 20, stamp.cpu_delta);
+    user.write(destination, &output)
+}
+
+fn query_wire(
+    info: &DeviceInfo,
+    address: u64,
+    user: &dyn IoctlContext,
+    wire: &[u8],
+) -> Result<(), FsError> {
+    zero(&wire[..8])?;
+    zero(&wire[24..40])?;
+    let payload = match u32_at(wire, 8) {
         0 => {
             let mut reply = vec![0; if info.submission_ready() { 40 } else { 8 }];
             put32(&mut reply, 0, u32::from(info.submission_ready()));
@@ -102,15 +151,24 @@ pub(crate) fn query(
             }
             reply
         }
+        6 => {
+            if u32_at(wire, 12) != 0 {
+                if u32_at(wire, 12) != 40 {
+                    return Err(FsError::InvalidData);
+                }
+                return Err(FsError::WouldBlock);
+            }
+            vec![0; 40]
+        }
         7 => {
-            let size = u32_at(&wire, 12);
+            let size = u32_at(wire, 12);
             let mut reply = if size == 0 {
                 vec![0; 32]
             } else {
                 if size != 32 {
                     return Err(FsError::InvalidData);
                 }
-                let reply = read(user, u64_at(&wire, 16), 32)?;
+                let reply = read(user, u64_at(wire, 16), 32)?;
                 zero(&reply[2..4])?;
                 zero(&reply[20..32])?;
                 let kind = u16::from_le_bytes(reply[..2].try_into().unwrap());
@@ -138,14 +196,14 @@ pub(crate) fn query(
         }
         _ => return Err(FsError::InvalidData),
     };
-    if u32_at(&wire, 12) == 0 {
+    if u32_at(wire, 12) == 0 {
         user.write(
             address.checked_add(12).ok_or(FsError::BadAddress)?,
             &(payload.len() as u32).to_le_bytes(),
         )
-    } else if u32_at(&wire, 12) as usize != payload.len() {
+    } else if u32_at(wire, 12) as usize != payload.len() {
         Err(FsError::InvalidData)
     } else {
-        user.write(u64_at(&wire, 16), &payload)
+        user.write(u64_at(wire, 16), &payload)
     }
 }

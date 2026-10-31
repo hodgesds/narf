@@ -98,6 +98,34 @@ impl crate::intel_gpu_user::UserBackend for Backend {
     fn device_facts(&self) -> Option<crate::intel_gpu_user::DeviceFacts> {
         *self.facts.lock()
     }
+    fn engine_cycles(
+        &self,
+        clock: i32,
+    ) -> narf_filesystem::FsFuture<'_, crate::intel_gpu_timestamp::EngineCycles> {
+        Box::pin(async move {
+            let owner = self
+                .owner
+                .upgrade()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let mut state = owner.state.lock().await;
+            if state.phase != Phase::Running || owner.suspended.load(Ordering::Acquire) {
+                return Err(narf_filesystem::FsError::NoDevice);
+            }
+            let gt = state
+                .gt
+                .as_mut()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let result = gt.engine_cycles(clock);
+            if gt.state() == GtState::Lost {
+                owner.user_epoch.store(0, Ordering::Release);
+            }
+            result.map_err(|error| match error {
+                GtError::Busy => narf_filesystem::FsError::WouldBlock,
+                GtError::State => narf_filesystem::FsError::NoDevice,
+                _ => crate::intel_gpu_user::io_error(),
+            })
+        })
+    }
     fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
         let epoch = self.epoch.load(Ordering::Acquire);
         let version = self.version.load(Ordering::Relaxed);

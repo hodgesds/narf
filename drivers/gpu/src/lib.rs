@@ -778,6 +778,8 @@ pub mod intel_gpu_regions;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_render;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_timestamp;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_topology;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_uapi;
