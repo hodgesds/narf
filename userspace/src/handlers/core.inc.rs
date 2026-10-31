@@ -84,6 +84,9 @@ pub(crate) fn signal_wake_up(task_id: u64, deliverable: bool) {
     // Deref the ctx UNDER the registry lock (see `with_user_task_ctx`) so a
     // concurrent task-exit + box-drop on another CPU can't free it mid-deref.
     let task_state = crate::user_task::with_user_task_ctx(task_id, |uctx| {
+        if deliverable {
+            uctx.signal_delivery_notified.store(true, Ordering::Release);
+        }
         let deadline = uctx.sleep_deadline_ns.load(Ordering::Acquire);
         let sigwait_set = uctx.sigwait_set.load(Ordering::Acquire);
         if signal_wake_cuts_deadline(deadline, sigwait_set, deliverable) {

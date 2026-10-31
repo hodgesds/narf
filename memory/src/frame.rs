@@ -26,6 +26,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering}
 
 use alloc::vec::Vec;
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
+use narf_lib::percpu::current_cpu;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::buddy::{self, BuddyZone, MAX_ORDER};
@@ -259,21 +260,25 @@ static REBALANCE_LOCK: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 
 const FRAME_CACHE_CAPACITY: usize = 16;
 const FRAME_CACHE_BATCH: usize = 8;
+// Small kernel buffers above the slab's 4 KiB limit repeatedly allocate and
+// free order-1 blocks. Keep a bounded set of complete pairs per CPU/node.
+const PAIR_CACHE_CAPACITY: usize = 8;
+const PAIR_CACHE_BATCH: usize = 4;
 /// Maximum final-owner returns published during one cache/zone transaction.
 /// The fixed bound keeps IRQ-masked work finite and permits stack-backed spill
 /// storage: freeing memory must not allocate memory after ownership reaches 0.
 const FRAME_RETURN_CHUNK: usize = 64;
 
 #[derive(Copy, Clone)]
-struct NodeFrameCache {
-    frames: [u64; FRAME_CACHE_CAPACITY],
+struct NodeFrameCache<const CAPACITY: usize = FRAME_CACHE_CAPACITY> {
+    frames: [u64; CAPACITY],
     len: usize,
 }
 
-impl NodeFrameCache {
+impl<const CAPACITY: usize> NodeFrameCache<CAPACITY> {
     const fn new() -> Self {
         Self {
-            frames: [0; FRAME_CACHE_CAPACITY],
+            frames: [0; CAPACITY],
             len: 0,
         }
     }
@@ -281,12 +286,14 @@ impl NodeFrameCache {
 
 struct CpuFrameCache {
     nodes: [NodeFrameCache; MAX_NUMA_NODES],
+    pairs: [NodeFrameCache<PAIR_CACHE_CAPACITY>; MAX_NUMA_NODES],
 }
 
 impl CpuFrameCache {
     const fn new() -> Self {
         Self {
             nodes: [NodeFrameCache::new(); MAX_NUMA_NODES],
+            pairs: [NodeFrameCache::<PAIR_CACHE_CAPACITY>::new(); MAX_NUMA_NODES],
         }
     }
 }
@@ -304,6 +311,12 @@ static FRAME_CACHES: [CpuFrameCacheLock; narf_lib::percpu::MAX_CPUS] =
     [const { CpuFrameCacheLock::new() }; narf_lib::percpu::MAX_CPUS];
 static FRAME_CACHE_FREE: [AtomicUsize; MAX_NUMA_NODES] =
     [const { AtomicUsize::new(0) }; MAX_NUMA_NODES];
+// Counts free order-1 blocks, not base pages. The ordinary per-node free-page
+// totals already include both frames in every cached pair.
+static PAIR_CACHE_FREE: [AtomicUsize; MAX_NUMA_NODES] =
+    [const { AtomicUsize::new(0) }; MAX_NUMA_NODES];
+#[cfg(feature = "kernel-test")]
+static PAIR_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "kernel-test")]
 static FRAME_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "kernel-test")]
@@ -1269,6 +1282,84 @@ fn free_order0_to_cache(node: usize, frame: u64) -> bool {
     true
 }
 
+/// Claim a complete UNMOVABLE order-1 block. Misses retain the ordinary buddy
+/// path; this cache only holds blocks returned by their previous owners.
+fn alloc_cached_pair(node: usize) -> Option<PhysFrame> {
+    if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) || frame_cache_bypassed(node) {
+        return None;
+    }
+    let cpu = current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+    let mut cache = FRAME_CACHES[cpu].0.lock();
+    if frame_cache_bypassed(node) {
+        return None;
+    }
+    let local = &mut cache.pairs[node];
+    if local.len == 0 {
+        return None;
+    }
+    local.len -= 1;
+    let frame = local.frames[local.len];
+    PAIR_CACHE_FREE[node].fetch_sub(1, Ordering::Relaxed);
+    account_allocated_frames(node, 2);
+    buddy::audit_cached_alloc(frame);
+    buddy::audit_cached_alloc(frame + 1);
+    #[cfg(feature = "kernel-test")]
+    PAIR_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    Some(buddy::frame_from_no(frame))
+}
+
+/// Return a complete UNMOVABLE order-1 block. Keep the CPU cache locked until
+/// every spilled pair is visible in the buddy, matching the base-page drain
+/// and hot-remove exclusion protocol. No allocation occurs after owner release.
+fn free_pair_to_cache(node: usize, frame: u64) -> bool {
+    if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) || frame_cache_bypassed(node) {
+        return false;
+    }
+    let cpu = current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+    let mut cache = FRAME_CACHES[cpu].0.lock();
+    if frame_cache_bypassed(node) {
+        return false;
+    }
+    let local = &mut cache.pairs[node];
+    buddy::audit_cached_free(frame);
+    buddy::audit_cached_free(frame + 1);
+    if local.len == PAIR_CACHE_CAPACITY {
+        let mut zone = ZONES[node].0.lock();
+        for _ in 0..PAIR_CACHE_BATCH {
+            local.len -= 1;
+            zone.free_cached(local.frames[local.len], 1);
+        }
+        PAIR_CACHE_FREE[node].fetch_sub(PAIR_CACHE_BATCH, Ordering::Relaxed);
+    }
+    local.frames[local.len] = frame;
+    local.len += 1;
+    PAIR_CACHE_FREE[node].fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Caller holds this CPU's cache lock, with the node's bypass already
+/// published. Both cache classes share the cache -> zone publication order.
+fn drain_cpu_node_cache(cache: &mut CpuFrameCache, node: usize) {
+    if cache.nodes[node].len == 0 && cache.pairs[node].len == 0 {
+        return;
+    }
+    let mut zone = ZONES[node].0.lock();
+    let local = &mut cache.nodes[node];
+    let drained = local.len;
+    while local.len != 0 {
+        local.len -= 1;
+        zone.free_cached(local.frames[local.len], 0);
+    }
+    FRAME_CACHE_FREE[node].fetch_sub(drained, Ordering::Relaxed);
+    let local = &mut cache.pairs[node];
+    let drained = local.len;
+    while local.len != 0 {
+        local.len -= 1;
+        zone.free_cached(local.frames[local.len], 1);
+    }
+    PAIR_CACHE_FREE[node].fetch_sub(drained, Ordering::Relaxed);
+}
+
 /// Publish a bounded set of final-owner order-0 frames for one NUMA node.
 ///
 /// No allocation is permitted here: callers have already removed the final
@@ -1347,17 +1438,7 @@ fn with_node_frame_caches_drained<R>(node: usize, f: impl FnOnce(&mut BuddyZone)
     drain.bypass.store(true, Ordering::Release);
     for cpu_cache in &FRAME_CACHES {
         let mut cache = cpu_cache.0.lock();
-        let local = &mut cache.nodes[node];
-        if local.len == 0 {
-            continue;
-        }
-        let mut zone = ZONES[node].0.lock();
-        let drained = local.len;
-        while local.len != 0 {
-            local.len -= 1;
-            zone.free_cached(local.frames[local.len], 0);
-        }
-        FRAME_CACHE_FREE[node].fetch_sub(drained, Ordering::Relaxed);
+        drain_cpu_node_cache(&mut cache, node);
     }
     let result = f(&mut ZONES[node].0.lock());
     drain.bypass.store(false, Ordering::Release);
@@ -1381,17 +1462,7 @@ pub fn with_node_cache_bypassed<R>(node: usize, f: impl FnOnce() -> R) -> R {
     drain.bypass.store(true, Ordering::Release);
     for cpu_cache in &FRAME_CACHES {
         let mut cache = cpu_cache.0.lock();
-        let local = &mut cache.nodes[node];
-        if local.len == 0 {
-            continue;
-        }
-        let mut zone = ZONES[node].0.lock();
-        let drained = local.len;
-        while local.len != 0 {
-            local.len -= 1;
-            zone.free_cached(local.frames[local.len], 0);
-        }
-        FRAME_CACHE_FREE[node].fetch_sub(drained, Ordering::Relaxed);
+        drain_cpu_node_cache(&mut cache, node);
     }
     // The zone lock is released here; `f` takes it per operation as needed.
     let result = f();
@@ -1747,6 +1818,12 @@ fn alloc_pages_on_inner(
             z.alloc_below_mt(order, ceil, mt)
         }
     };
+    if order == 1 && mt == buddy::MigrateType::Unmovable {
+        if let Some(frame) = alloc_cached_pair(zone_idx) {
+            account_numa_allocation(preferred, zone_idx, 2);
+            return Ok(frame);
+        }
+    }
     let first_try = {
         let mut zone = ZONES[zone_idx].0.lock();
         try_alloc(&mut zone)
@@ -1765,6 +1842,12 @@ fn alloc_pages_on_inner(
     let mut fallback_nodes = [0usize; MAX_NUMA_NODES];
     let n = fallback_order(preferred, &mut fallback_nodes);
     for &i in &fallback_nodes[..n] {
+        if order == 1 && mt == buddy::MigrateType::Unmovable {
+            if let Some(frame) = alloc_cached_pair(i) {
+                account_numa_allocation(preferred, i, 2);
+                return Ok(frame);
+            }
+        }
         let first_try = {
             let mut zone = ZONES[i].0.lock();
             try_alloc(&mut zone)
@@ -1882,6 +1965,10 @@ pub fn free_pages_ctx(frame: PhysFrame, order: u8, ctx: AllocContext) {
         account_freed_frames(zone_idx, 1);
         return;
     }
+    if order == 1 && ctx == AllocContext::Kernel && free_pair_to_cache(zone_idx, frame_no) {
+        account_freed_frames(zone_idx, 2);
+        return;
+    }
     ZONES[zone_idx]
         .0
         .lock()
@@ -1920,6 +2007,14 @@ pub fn reserve_frame_range(base: PhysAddr, count: u64) -> bool {
     let first_frame = base.raw() >> 12;
     let removed = ZONES[node].0.lock().remove_free_range(first_frame, count);
     if removed {
+        // Exact-range reservation claims free pages just like allocation.
+        // Compaction may publish them as live migration destinations; leaving
+        // their audit bits free makes that owner's eventual release look like
+        // a double free. Hot-remove uses remove_free_range directly instead.
+        #[cfg(feature = "frame-alloc-audit")]
+        for offset in 0..count {
+            buddy::audit_cached_alloc(first_frame + offset);
+        }
         account_allocated_frames(node, count as usize);
     }
     removed
@@ -3743,6 +3838,7 @@ pub fn node_free_blocks(node: usize) -> [usize; BUDDY_ORDER_COUNT] {
         *count = zone.free_block_count(order as u8);
     }
     counts[0] += FRAME_CACHE_FREE[node].load(Ordering::Relaxed);
+    counts[1] += PAIR_CACHE_FREE[node].load(Ordering::Relaxed);
     counts
 }
 
@@ -3872,6 +3968,129 @@ fn smoke_order0_frame_cache_round_trip() -> narf_kernel_test::TestResult {
 }
 #[cfg(feature = "kernel-test")]
 narf_kernel_test::kernel_test_in!("memory/frame", smoke_order0_frame_cache_round_trip);
+
+#[cfg(feature = "kernel-test")]
+fn smoke_order1_frame_cache_ownership_and_accounting() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+
+    if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) {
+        return TestResult::Skip("frame caches not published");
+    }
+    narf_lib::sync::without_interrupts(|| {
+        let node = if ALLOC.numa_aware.load(Ordering::Acquire) {
+            current_cpu_node()
+        } else {
+            0
+        };
+        if frame_cache_bypassed(node) {
+            return TestResult::Skip("frame cache bypass is active");
+        }
+        let before = node_free(node);
+        let first = match alloc_pages_on(node, 1) {
+            Ok(frame) => frame,
+            Err(_) => return TestResult::Fail("cannot allocate an order-1 block"),
+        };
+        let address = first.start_address().raw();
+        if ALLOC.numa_aware.load(Ordering::Acquire) && phys_to_node(address) != node {
+            free_pages(first, 1);
+            return TestResult::Skip("order-1 allocation used a fallback node");
+        }
+        let charged = node_free(node).saturating_add(2) == before;
+        free_pages(first, 1);
+        let hits = PAIR_CACHE_HITS.load(Ordering::Relaxed);
+        let second = match alloc_pages_on(node, 1) {
+            Ok(frame) => frame,
+            Err(_) => return TestResult::Fail("cached order-1 block was not reusable"),
+        };
+        let reused = second.start_address().raw() == address
+            && PAIR_CACHE_HITS.load(Ordering::Relaxed) > hits;
+        let other = match alloc_pages_on(node, 1) {
+            Ok(frame) => frame,
+            Err(_) => {
+                free_pages(second, 1);
+                return TestResult::Fail("cannot allocate a second live pair");
+            }
+        };
+        let distinct = other.start_address().raw() != second.start_address().raw();
+        let pair_mask = PAGE_SIZE * 2 - 1;
+        let aligned = address & pair_mask == 0 && other.start_address().raw() & pair_mask == 0;
+        free_pages(other, 1);
+        free_pages(second, 1);
+        if !charged || node_free(node) != before {
+            return TestResult::Fail("pair cache changed free-page accounting");
+        }
+        if !reused || !distinct || !aligned {
+            return TestResult::Fail("pair cache lost alignment or exclusive ownership");
+        }
+        TestResult::Pass
+    })
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!(
+    "memory/frame",
+    smoke_order1_frame_cache_ownership_and_accounting
+);
+
+#[cfg(feature = "kernel-test")]
+fn smoke_order1_frame_cache_spill_and_drain() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+
+    if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) {
+        return TestResult::Skip("frame caches not published");
+    }
+    narf_lib::sync::without_interrupts(|| {
+        let node = if ALLOC.numa_aware.load(Ordering::Acquire) {
+            current_cpu_node()
+        } else {
+            0
+        };
+        if frame_cache_bypassed(node) {
+            return TestResult::Skip("frame cache bypass is active");
+        }
+        let before = node_free(node);
+        let mut held = [0u64; PAIR_CACHE_CAPACITY * 2 + 1];
+        let mut count = 0;
+        for slot in &mut held {
+            let frame = match alloc_pages_on(node, 1) {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            *slot = frame.start_address().raw();
+            count += 1;
+        }
+        for &physical in &held[..count] {
+            free_pages(PhysFrame::new(PhysAddr::new(physical)), 1);
+        }
+        if count != held.len() {
+            return TestResult::Fail("cannot allocate enough pairs to exercise spill");
+        }
+        let cpu = current_cpu();
+        let bounded = FRAME_CACHES[cpu].0.lock().pairs[node].len <= PAIR_CACHE_CAPACITY;
+        let cached_before = PAIR_CACHE_FREE[node].load(Ordering::Relaxed);
+        let drained = with_node_frame_caches_drained(node, |zone| {
+            PAIR_CACHE_FREE[node].load(Ordering::Relaxed) == 0
+                && FRAME_CACHE_FREE[node].load(Ordering::Relaxed) == 0
+                && zone.validate_no_overlap().is_ok()
+        });
+        let bypassed = with_node_cache_bypassed(node, || {
+            let frame = match alloc_pages_on(node, 1) {
+                Ok(frame) => frame,
+                Err(_) => return false,
+            };
+            free_pages(frame, 1);
+            PAIR_CACHE_FREE[node].load(Ordering::Relaxed) == 0
+        });
+        if !bounded || cached_before == 0 || !drained || !bypassed {
+            return TestResult::Fail("pair spill/drain did not preserve the bypass protocol");
+        }
+        if node_free(node) != before {
+            return TestResult::Fail("pair spill/drain changed free-page accounting");
+        }
+        TestResult::Pass
+    })
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!("memory/frame", smoke_order1_frame_cache_spill_and_drain);
 
 #[cfg(feature = "kernel-test")]
 fn smoke_order0_frame_cache_batch_free_is_bounded() -> narf_kernel_test::TestResult {

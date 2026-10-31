@@ -1,6 +1,284 @@
 //! Linux syscall ABI conformance — signal group.
 use crate::abi_test_support::*;
 
+/// Interleave a competing shared-set consumer with signal-frame construction.
+/// The frame must own the first instance before the competitor takes the next.
+fn smoke_signal_handler_and_waiter_dequeue_distinct_instances() -> TestResult {
+    struct RacingContext {
+        args: SyscallArgs,
+        source: u64,
+        delivered: u64,
+        waited: Option<u64>,
+    }
+    impl TrapContext for RacingContext {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, _: SyscallReturn) {}
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _: u64) {}
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+            false
+        }
+        fn returning_to_user(&self) -> bool {
+            true
+        }
+        fn deliver_signal(&mut self, params: &crate::SigDeliveryParams) -> bool {
+            self.delivered = params.si_value;
+            self.waited = crate::handlers::sigwait_take_locked(
+                self.source,
+                crate::handlers::sig_bit(params.signum),
+            )
+            .and_then(|(_, info)| info.map(|info| info.value));
+            true
+        }
+    }
+    with_setup(|| {
+        const SIG: u32 = 38;
+        if call(Syscall::Sigaction.raw(), a1(SIG as u64, 0x400000)) != Some(0) {
+            return Err("cannot install queued-signal handler");
+        }
+        let source = crate::handlers::shared_pending_key(FAKE_TASK);
+        for value in [11, 22] {
+            if crate::handlers::sigqueue_store_and_raise_bit(source, SIG, -1, value, 1).is_none() {
+                return Err("cannot queue signal instance");
+            }
+        }
+        let mut ctx = RacingContext {
+            args: SyscallArgs::default(),
+            source,
+            delivered: 0,
+            waited: None,
+        };
+        if !crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE)
+            || ctx.delivered != 11
+            || ctx.waited != Some(22)
+        {
+            return Err("handler and competing waiter did not own distinct queued instances");
+        }
+        if crate::signal_pending_of(FAKE_TASK) & crate::handlers::sig_bit(SIG) != 0
+            || crate::handlers::sigwait_take_locked(source, crate::handlers::sig_bit(SIG)).is_some()
+        {
+            return Err("dequeued signal left a phantom pending instance");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "userspace/signals",
+    smoke_signal_handler_and_waiter_dequeue_distinct_instances
+);
+
+struct FailingSignalFrame {
+    args: SyscallArgs,
+    attempts: usize,
+}
+
+impl TrapContext for FailingSignalFrame {
+    fn args(&self) -> &SyscallArgs {
+        &self.args
+    }
+    fn set_return(&mut self, _: SyscallReturn) {}
+    fn user_rsp(&self) -> u64 {
+        0
+    }
+    fn rip(&self) -> u64 {
+        0
+    }
+    fn set_rip(&mut self, _: u64) {}
+    fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+        false
+    }
+    fn returning_to_user(&self) -> bool {
+        true
+    }
+    fn deliver_signal(&mut self, _: &crate::SigDeliveryParams) -> bool {
+        self.attempts += 1;
+        false
+    }
+}
+
+fn check_failed_signal_frame(signum: u32, block_and_ignore_segv: bool) -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static FAULT: AtomicU64 = AtomicU64::new(0);
+    fn fault_hook(_: &mut dyn TrapContext, vector: u64, info: crate::SyncFaultInfo) -> bool {
+        FAULT.store(
+            if info.addr == 0 { vector } else { u64::MAX },
+            Ordering::Relaxed,
+        );
+        true
+    }
+    with_setup(|| {
+        if call(Syscall::Sigaction.raw(), a1(signum as u64, 0x400000)) != Some(0) {
+            return Err("cannot install failing-frame handler");
+        }
+        if block_and_ignore_segv {
+            if call(Syscall::Sigaction.raw(), a1(11, 1)) != Some(0) {
+                return Err("cannot ignore SIGSEGV for forced-fault regression");
+            }
+            crate::handlers::set_signal_mask_for_task(FAKE_TASK, crate::handlers::sig_bit(11));
+        }
+        let source = crate::handlers::shared_pending_key(FAKE_TASK);
+        let values: &[u64] = if signum >= 32 { &[11, 22] } else { &[11] };
+        for &value in values {
+            if crate::handlers::sigqueue_store_and_raise_bit(source, signum, -1, value, 1).is_none()
+            {
+                return Err("cannot queue failing-frame signal");
+            }
+        }
+        let previous = crate::sync_signal_hook().ok_or("missing sync-signal hook")?;
+        FAULT.store(0, Ordering::Relaxed);
+        crate::install_sync_signal_hook(fault_hook);
+        let mut ctx = FailingSignalFrame {
+            args: SyscallArgs::default(),
+            attempts: 0,
+        };
+        let delivered = crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
+        crate::install_sync_signal_hook(previous);
+        if !delivered || ctx.attempts != 1 || FAULT.load(Ordering::Relaxed) != 13 {
+            return Err("failed signal frame did not force exactly one SIGSEGV");
+        }
+        if crate::handlers::sigaction_lookup_full(FAKE_TASK, 11).is_some()
+            || crate::signal_mask_of(FAKE_TASK) & crate::handlers::sig_bit(11) != 0
+        {
+            return Err("forced frame-failure SIGSEGV was still caught, ignored or blocked");
+        }
+        let next = crate::handlers::sigwait_take_locked(source, crate::handlers::sig_bit(signum))
+            .and_then(|(_, info)| info.map(|info| info.value));
+        if next != (signum >= 32).then_some(22)
+            || crate::handlers::sigwait_take_locked(source, crate::handlers::sig_bit(signum))
+                .is_some()
+        {
+            return Err("failed frame retried its consumed instance or consumed the following one");
+        }
+        Ok(())
+    })
+}
+
+fn smoke_signal_bad_frame_forces_unblocked_default_segv() -> TestResult {
+    check_failed_signal_frame(38, true)
+}
+kernel_test_in!(
+    "userspace/signals",
+    smoke_signal_bad_frame_forces_unblocked_default_segv
+);
+
+fn smoke_signal_bad_segv_frame_resets_handler() -> TestResult {
+    check_failed_signal_frame(11, false)
+}
+kernel_test_in!(
+    "userspace/signals",
+    smoke_signal_bad_segv_frame_resets_handler
+);
+
+fn smoke_signal_ignored_queue_has_no_phantom_pending_bit() -> TestResult {
+    with_setup(|| {
+        const SIG: u32 = 38;
+        if call(Syscall::Sigaction.raw(), a1(SIG as u64, 1)) != Some(0) {
+            return Err("cannot install SIG_IGN");
+        }
+        let source = crate::handlers::shared_pending_key(FAKE_TASK);
+        for value in [11, 22] {
+            if crate::handlers::sigqueue_store_and_raise_bit(source, SIG, -1, value, 1).is_none() {
+                return Err("cannot seed ignored queued signals");
+            }
+        }
+        let mut ctx = FailingSignalFrame {
+            args: SyscallArgs::default(),
+            attempts: 0,
+        };
+        if !crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE)
+            || ctx.attempts != 0
+            || crate::signal_pending_of(FAKE_TASK) & crate::handlers::sig_bit(SIG) != 0
+            || crate::handlers::sigwait_take_locked(source, crate::handlers::sig_bit(SIG)).is_some()
+        {
+            return Err("ignored queue retained a payload or phantom pending bit");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "userspace/signals",
+    smoke_signal_ignored_queue_has_no_phantom_pending_bit
+);
+
+fn smoke_signal_ptrace_owns_only_its_pending_instance() -> TestResult {
+    struct Detach;
+    impl Drop for Detach {
+        fn drop(&mut self) {
+            crate::ptrace::__test_set_tracer(FAKE_TASK, None);
+            if let Some(state) = crate::ptrace::PTRACE_STATE.lock().as_mut() {
+                state.stopped.remove(&FAKE_TASK);
+                state.stop_signal.remove(&FAKE_TASK);
+                state.stop_payload.remove(&FAKE_TASK);
+                state.last_siginfo.remove(&FAKE_TASK);
+            }
+        }
+    }
+    with_setup(|| {
+        const SIG: u32 = 38;
+        let shared = crate::handlers::shared_pending_key(FAKE_TASK);
+        for (source, value) in [(FAKE_TASK, 11), (shared, 22), (shared, 33)] {
+            if crate::handlers::sigqueue_store_and_raise_bit(source, SIG, -1, value, 1).is_none() {
+                return Err("cannot queue ptrace regression signals");
+            }
+        }
+        crate::ptrace::__test_set_tracer(FAKE_TASK, Some(FAKE_TASK + 1));
+        let _detach = Detach;
+        let mut ctx = FailingSignalFrame {
+            args: SyscallArgs::default(),
+            attempts: 0,
+        };
+        if !crate::ptrace::ptrace_intercept_signal(&mut ctx, SIG) {
+            return Err("queued signal did not enter ptrace stop");
+        }
+        let captured = {
+            let state = crate::ptrace::PTRACE_STATE.lock();
+            state
+                .as_ref()
+                .and_then(|state| state.last_siginfo.get(&FAKE_TASK))
+                .copied()
+        }
+        .ok_or("ptrace did not capture owned siginfo")?;
+        if u64::from_ne_bytes(captured[24..32].try_into().unwrap()) != 11 {
+            return Err("ptrace captured a different instance's payload");
+        }
+        for expected in [22, 33] {
+            let value = crate::handlers::sigwait_take_locked(shared, crate::handlers::sig_bit(SIG))
+                .and_then(|(_, info)| info.map(|info| info.value));
+            if value != Some(expected) {
+                return Err("ptrace stop discarded another pending queued instance");
+            }
+        }
+        if crate::handlers::sigwait_take(FAKE_TASK, crate::handlers::sig_bit(SIG)).is_some() {
+            return Err("ptrace stop left its consumed instance pending");
+        }
+        // A synchronous fault has supplied siginfo and owns no queued send.
+        if crate::handlers::sigqueue_store_and_raise_bit(shared, 11, -1, 44, 1).is_none() {
+            return Err("cannot queue signal alongside synchronous fault");
+        }
+        let fault_info = crate::handlers::ptrace_fault_siginfo(11, 0x80, 0x1234, 0);
+        if !crate::ptrace::ptrace_intercept_signal_info(&mut ctx, 11, Some(fault_info)) {
+            return Err("synchronous fault did not enter ptrace stop");
+        }
+        let pending = crate::handlers::sigwait_take_locked(shared, crate::handlers::sig_bit(11))
+            .and_then(|(_, info)| info.map(|info| info.value));
+        if pending != Some(44) {
+            return Err("synchronous ptrace stop consumed an unrelated pending signal");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "userspace/signals",
+    smoke_signal_ptrace_owns_only_its_pending_instance
+);
+
 // ── Kill ────────────────────────────────────────────────────────────
 // sys_kill(pid, sig): sig>=32 → invalid_op(); else ORs the pending bit
 // and returns ok(0). FAKE_TASK targeting itself is reachable.
@@ -868,7 +1146,7 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_sigchld_signalfd_names_child);
 // slot) must surface its SI_QUEUE payload (ssi_code=-1, ssi_int=value), never
 // degrade to a payload-less SI_USER, and must leave no stranded pending bit —
 // the signalfd consumer pops the payload and clears/re-arms the bit together
-// under the sigqueue bucket lock (sigqueue_take_and_clear), the same invariant
+// under the sigqueue bucket lock (sigwait_take_locked), the same invariant
 // the sigwait and handler-delivery consumers hold. Back to back, so a
 // per-cycle strand would surface as a wrong ssi_code/ssi_int on the next read.
 fn smoke_abi_signal_signalfd_sigqueue_payload() -> TestResult {

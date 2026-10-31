@@ -430,7 +430,8 @@ pub(crate) fn audit_cached_free(frame: u64) {
     let _ = frame;
 }
 
-/// Transition one frame from a per-CPU free cache back to caller ownership.
+/// Transition one frame from an external free pool (a per-CPU cache or an
+/// exact-range reservation) back to caller ownership.
 #[inline]
 pub(crate) fn audit_cached_alloc(frame: u64) {
     #[cfg(feature = "frame-alloc-audit")]
@@ -914,8 +915,8 @@ impl BuddyZone {
 
     /// Return a block that was already recorded free while resident in a
     /// per-CPU cache. This updates/coalesces buddy metadata without emitting a
-    /// second audit transition. Cached frames are order-0 base pages fed by
-    /// the order-0 fast path; they rejoin the `Unmovable` partition.
+    /// second audit transition. Cached base pages and complete order-1 pairs
+    /// have already emitted one transition per page and rejoin `Unmovable`.
     pub(crate) fn free_cached(&mut self, frame: u64, order: u8) {
         debug_assert!(order <= MAX_ORDER);
         debug_assert_eq!(frame & (order_frames(order) - 1), 0);

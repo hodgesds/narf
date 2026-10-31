@@ -922,7 +922,7 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
                     fpctx: 0,
                     reserved: [0; 8],
                 },
-                uc_sigmask: 0,
+                uc_sigmask: narf_userspace::signal_mask_for_delivery(),
             };
 
             // SAFETY: user stack is mapped in the active EL1 page tables

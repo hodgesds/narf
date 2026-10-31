@@ -163,6 +163,11 @@ pub struct UserTaskCtx {
     /// that would otherwise fall to the ~10 ms backstop. Edge, not level, so a
     /// standing blocked-pending signal never spins. Mirrors `futex_park_gen`.
     pub signal_park_gen: AtomicU64,
+    /// A deliverable signal selected this thread for handler delivery
+    /// (Linux TIF_SIGPENDING). Shared pending bits alone must not let a busy
+    /// sibling steal the signal from an interruptible sleeper selected by
+    /// complete_group_signal. Sigwait and signalfd still read the shared set.
+    pub(crate) signal_delivery_notified: AtomicBool,
     /// epoll fd currently entering the park handshake, encoded as fd+1 (zero
     /// means this I/O wait is not epoll). After registering the task waker,
     /// the park path passively re-scans this instance before switching out.
@@ -785,6 +790,7 @@ impl UserTaskCtx {
             msg_wait_pending: AtomicBool::new(false),
             epoll_park_gen: AtomicU64::new(0),
             signal_park_gen: AtomicU64::new(0),
+            signal_delivery_notified: AtomicBool::new(false),
             epoll_wait_fd: AtomicU64::new(0),
             epoll_wait_node: crate::epoll::EpollWaitNode::new(),
             futex_uaddr: AtomicU64::new(0),
@@ -1064,7 +1070,13 @@ pub fn current_user_task() -> Option<*mut UserTaskCtx> {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let (own_stack, owner) = (false, core::ptr::null::<crate::task::Task>());
 
-    let legacy = current_slot().load(Ordering::Acquire);
+    // Own-stack source selection never uses the legacy cell. Avoid another
+    // CPU-id lookup and atomic load on every syscall/accounting hook.
+    let legacy = if own_stack {
+        core::ptr::null_mut()
+    } else {
+        current_slot().load(Ordering::Acquire)
+    };
     match current_user_task_source(own_stack, owner.is_null(), legacy.is_null()) {
         CurrentTaskSource::None => None,
         CurrentTaskSource::OwnerContext => {

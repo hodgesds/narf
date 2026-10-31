@@ -6310,7 +6310,7 @@ fn task_rss_bytes(pid: u64) -> u64 {
 /// `SIGNAL_PENDING` still carries one bit per signum; consumers re-arm the
 /// bit after draining one instance while more remain queued (atomically, in
 /// the same bucket-locked step that pops the payload — see
-/// `sigqueue_take_and_clear` / `sigwait_take_locked`), so N queued RT signals
+/// `sigwait_take_locked`), so N queued RT signals
 /// produce N deliveries instead of collapsing to one.
 ///
 /// Drained on delivery (`default_signal_delivery`), by `rt_sigtimedwait`,
@@ -6600,55 +6600,6 @@ pub(crate) fn take_sigqueue_info(task: u64, signum: u32) -> Option<SigqueuePaylo
     v.map(QueuedSiginfo::public_fields)
 }
 
-/// Read (WITHOUT removing) the OLDEST queued payload for `(task, signum)`.
-/// The handler-delivery path builds the signal frame from this, then commits
-/// the dequeue via [`sigqueue_commit_delivery`] only AFTER the frame write
-/// succeeds — so a failed `deliver_signal` (bad user stack) leaves the payload
-/// AND the pending bit intact for a clean retry, instead of draining the
-/// siginfo before delivery is confirmed (which made the retry deliver a
-/// payload-less SI_USER sival=0).
-pub(crate) fn peek_sigqueue_info(task: u64, signum: u32) -> Option<QueuedSiginfo> {
-    SIGQUEUE_INFO[sigqueue_bucket(task)]
-        .values
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&(task, signum)).and_then(|q| q.front().copied()))
-}
-
-/// Pop the oldest queued payload for `(task, signum)` AND clear (or re-arm, if
-/// more RT instances remain) its pending bit — BOTH under the sigqueue bucket
-/// lock, so the pop and the bit update are atomic against a racing
-/// `sigqueue_store_and_raise_bit` (the same invariant the sigwait consumer
-/// holds via [`sigwait_take_locked`]): a concurrent sender can never strand the
-/// bit over an emptied queue nor lose its payload behind a cleared bit. Used by
-/// both the handler-delivery commit and the signalfd read — the two consumers
-/// that already know which `signum` they are draining. Returns the popped
-/// payload (`None` for a bit set with no siginfo, i.e. a kill(2)-style
-/// SI_USER signal). Lock order: SIGQUEUE bucket (outer) → SIGNAL_PENDING
-/// (inner).
-pub(crate) fn sigqueue_take_and_clear(task: u64, signum: u32) -> Option<QueuedSiginfo> {
-    let mut g = SIGQUEUE_INFO[sigqueue_bucket(task)].values.lock();
-    let payload = g.as_mut().and_then(|m| {
-        let q = m.get_mut(&(task, signum))?;
-        let v = q.pop_front();
-        if q.is_empty() {
-            m.remove(&(task, signum));
-        }
-        v
-    });
-    let more = g
-        .as_ref()
-        .is_some_and(|m| m.get(&(task, signum)).is_some_and(|q| !q.is_empty()));
-    let _ = pending_signal_bits_update_existing(task, |slot| {
-        if more {
-            *slot |= sig_bit(signum);
-        } else {
-            *slot &= !(sig_bit(signum));
-        }
-    });
-    payload
-}
-
 /// True when more queued instances of `(task, signum)` remain after a
 /// `take_sigqueue_info` pop.
 pub(crate) fn sigqueue_more_queued(task: u64, signum: u32) -> bool {
@@ -6660,14 +6611,18 @@ pub(crate) fn sigqueue_more_queued(task: u64, signum: u32) -> bool {
 }
 
 
-/// Drop every queued payload for `(task, signum)` — used when the signal
-/// is consumed by an ignoring disposition (SIG_IGN / default-Ignore):
+/// Drop every queued payload and its pending bit for `(task, signum)` when
+/// the signal is consumed by an ignoring disposition (SIG_IGN / default-Ignore):
 /// Linux "delivers" each queued ignored instance by discarding it, which
 /// collapses to discarding the whole queue.
 pub(crate) fn purge_sigqueue(task: u64, signum: u32) {
-    if let Some(m) = SIGQUEUE_INFO[sigqueue_bucket(task)].values.lock().as_mut() {
+    let mut queue = SIGQUEUE_INFO[sigqueue_bucket(task)].values.lock();
+    if let Some(m) = queue.as_mut() {
         m.remove(&(task, signum));
     }
+    // Match the sender/consumer queue -> pending lock order. Clearing these
+    // separately could leave a newly raised bit over a discarded payload.
+    let _ = pending_signal_bits_update_existing(task, |slot| *slot &= !sig_bit(signum));
 }
 
 /// Wake condition for a task parked in `rt_sigtimedwait` on userspace
@@ -6679,11 +6634,11 @@ pub(crate) fn purge_sigqueue(task: u64, signum: u32) {
 /// return-to-user hook delivers it).
 pub(crate) fn sigwait_should_wake(task: u64, set: u64) -> bool {
     let pending = signal_pending_of(task);
-    (pending & set) != 0 || (pending & !signal_mask_of(task)) != 0
+    (pending & set) != 0 || is_signal_pending(task)
 }
 
 pub fn is_signal_pending(task_id: u64) -> bool {
-    let pending = signal_pending_of(task_id);
+    let pending = signal_pending_for_delivery(task_id);
     let mask = signal_bits_get(&SIGNAL_MASK, task_id);
     (pending & !mask) != 0
 }
@@ -6697,7 +6652,7 @@ pub fn is_signal_pending(task_id: u64) -> bool {
 /// action. Keep `is_signal_pending` as the raw deliverability probe used by
 /// diagnostics and signal consumption; blocking waits use this filtered form.
 pub(crate) fn has_interrupting_signal(task_id: u64) -> bool {
-    let pending = signal_pending_of(task_id);
+    let pending = signal_pending_for_delivery(task_id);
     let mut deliverable = pending & !signal_mask_of(task_id);
     while deliverable != 0 {
         let signum = sig_from_bit(deliverable);
@@ -6955,6 +6910,37 @@ fn take_suspend_saved_mask(task: u64) -> Option<u64> {
     g.as_mut().and_then(|m| m.remove(&task))
 }
 
+/// Mask to place in the current thread's user signal frame. A suspended wait
+/// restores its original mask, rather than the temporary wait mask. Peek here:
+/// only a successfully installed frame consumes the suspend record.
+pub fn signal_mask_for_delivery() -> u64 {
+    let task = current_task_id();
+    let suspended = SUSPEND_SAVED_MASK.lock().as_ref()
+        .and_then(|m| m.get(&task).copied());
+    suspended.unwrap_or_else(|| signal_mask_of(task))
+}
+
+#[cfg(feature = "kernel-test")]
+fn smoke_delivery_mask_preserves_suspend_record() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    let task = current_task_id();
+    let old = signal_mask_of(task);
+    let prior_suspend = take_suspend_saved_mask(task);
+    set_signal_mask_for_task(task, sig_bit(15));
+    set_suspend_saved_mask(task, sig_bit(12));
+    let selected = signal_mask_for_delivery();
+    let retained = take_suspend_saved_mask(task);
+    let ordinary = signal_mask_for_delivery();
+    set_signal_mask_for_task(task, old);
+    if let Some(prior) = prior_suspend { set_suspend_saved_mask(task, prior); }
+    if selected != sig_bit(12) || retained != Some(sig_bit(12)) || ordinary != sig_bit(15) {
+        return TestResult::Fail("frame mask did not preserve the original suspended-wait mask");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!("userspace/signals", smoke_delivery_mask_preserves_suspend_record);
+
 /// Install a syscall-scoped temporary signal mask while preserving the mask
 /// from the syscall's first entry across RIP-rewind park/re-executions.
 ///
@@ -7056,11 +7042,117 @@ pub(crate) fn signal_pending_shared(task: u64) -> u64 {
 }
 
 /// Every signal pending for `task`: its private set plus its group's
-/// shared set — what `sigpending()` and every "is a signal pending" check
-/// see on Linux.
+/// shared set — what `sigpending()`, sigwait and signalfd observe on Linux.
 pub fn signal_pending_of(task: u64) -> u64 {
     signal_pending_private(task) | signal_pending_shared(task)
 }
+
+/// Signals that can interrupt this thread's syscall. A shared signal wakes
+/// one selected thread; other runnable siblings must not observe it as their
+/// own handler work on every syscall exit. Explicit sigwait/signalfd consumers
+/// use signal_pending_of instead. Forced stop/kill remain eligible everywhere.
+fn signal_pending_for_delivery(task: u64) -> u64 {
+    let private = signal_pending_private(task);
+    let shared = signal_pending_shared(task);
+    if shared == 0 {
+        return private;
+    }
+    let notified = crate::user_task::with_user_task_ctx(task, |ctx| {
+        ctx.signal_delivery_notified.load(Ordering::Acquire)
+    }).unwrap_or(true);
+    private | if notified { shared } else { shared & UNBLOCKABLE_MASK }
+}
+
+#[cfg(feature = "kernel-test")]
+fn smoke_shared_signal_selected_thread_and_consumers() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    const LEADER: u64 = 0x5A77_0000;
+    const SIBLING: u64 = LEADER + 1;
+    const PID: u64 = LEADER + 2;
+    let leader = crate::task::Task::new_registered(LEADER, PID);
+    let sibling = crate::task::Task::new_registered(SIBLING, PID);
+    register_pid_task_mapping(PID, LEADER);
+    register_task_to_pid(SIBLING, PID);
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            release_shared_pending(LEADER);
+            for tid in [SIBLING, LEADER] {
+                release_task_tables(tid);
+                crate::task::release_task(tid);
+                let _identity = PID_TASK_MUTATION.lock();
+                if let Some(map) = TASK_TO_PID[pid_task_shard(tid)].map.lock().as_mut() {
+                    map.remove(&tid);
+                }
+                tgid_member_remove(tid, PID);
+            }
+            let _identity = PID_TASK_MUTATION.lock();
+            if let Some(map) = PID_TO_TASK[pid_task_shard(PID)].map.lock().as_mut() {
+                map.remove(&PID);
+            }
+        }
+    }
+    let _cleanup = Cleanup;
+    // These synthetic tasks bypass boot's signal_init and clone inheritance.
+    // Seed each private bucket explicitly: a focused suite may never have
+    // initialised the sibling's shard before raise_signal_pending uses it.
+    for tid in [LEADER, SIBLING] {
+        pending_signal_bits_update_or_init(tid, |_| {});
+    }
+    let alarm = sig_bit(14);
+    let _ = raise_group_signal(LEADER, 14, GroupSigInfo::None);
+    if signal_pending_of(SIBLING) & alarm == 0 {
+        return TestResult::Fail("shared pending must remain visible to the sibling");
+    }
+    if !has_interrupting_signal(LEADER) || has_interrupting_signal(SIBLING) {
+        return TestResult::Fail("only the selected thread may take the shared handler");
+    }
+    // Explicit consumers are allowed to dequeue the shared signal even when
+    // another thread was selected for handler delivery.
+    if !sigwait_should_wake(SIBLING, alarm) || sigwait_take(SIBLING, alarm).is_none() {
+        return TestResult::Fail("selection hid shared pending from sigwait");
+    }
+    if signal_pending_of(LEADER) & alarm != 0 {
+        return TestResult::Fail("sigwait did not consume the process-wide instance");
+    }
+    leader.uctx.signal_delivery_notified.store(false, Ordering::Release);
+    sibling.uctx.signal_delivery_notified.store(false, Ordering::Release);
+    ensure_signal_pending_slot(LEADER);
+    if !raise_group_signal_irq(LEADER, 14)
+        || !has_interrupting_signal(LEADER)
+        || has_interrupting_signal(SIBLING)
+    {
+        return TestResult::Fail("IRQ timer raise did not preserve thread selection");
+    }
+    // Blocking the selected signal retargets the pending instance; unblocking
+    // it makes the original thread eligible again, as recalc_sigpending does.
+    set_signal_mask_for_task(LEADER, alarm);
+    if has_interrupting_signal(LEADER) || !has_interrupting_signal(SIBLING) {
+        return TestResult::Fail("mask change did not retarget the shared signal");
+    }
+    leader.uctx.signal_delivery_notified.store(false, Ordering::Release);
+    set_signal_mask_for_task(LEADER, 0);
+    if !has_interrupting_signal(LEADER) {
+        return TestResult::Fail("unblocking pending shared work did not notify the thread");
+    }
+    flush_group_pending_signal(LEADER, 14);
+    sibling.uctx.signal_delivery_notified.store(false, Ordering::Release);
+    // Thread-directed pending is independent of the shared notification gate.
+    raise_signal_pending(SIBLING, 10);
+    sibling.uctx.signal_delivery_notified.store(false, Ordering::Release);
+    if !has_interrupting_signal(SIBLING) {
+        return TestResult::Fail("private pending was suppressed by shared selection");
+    }
+    clear_signal_pending(SIBLING, 10);
+    let _ = raise_group_signal(LEADER, 19, GroupSigInfo::None);
+    sibling.uctx.signal_delivery_notified.store(false, Ordering::Release);
+    if !is_signal_pending(SIBLING) {
+        return TestResult::Fail("unnotified sibling suppressed an uncatchable stop");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!("userspace/signals", smoke_shared_signal_selected_thread_and_consumers);
 
 
 /// Consume one instance of the lowest pending signal in `set` for a
@@ -7103,7 +7195,6 @@ pub(crate) fn release_shared_pending(task: u64) {
 /// blocked").
 pub(crate) fn flush_group_pending_signal(task: u64, signum: u32) {
     let key = shared_pending_key(task);
-    clear_pending_signal_bits(key, sig_bit(signum));
     purge_sigqueue(key, signum);
     let pid = task_to_pid_raw(task).unwrap_or(task);
     let mut members = thread_group_members(pid);
@@ -7111,7 +7202,6 @@ pub(crate) fn flush_group_pending_signal(task: u64, signum: u32) {
         members.push(task);
     }
     for t in members {
-        clear_pending_signal_bits(t, sig_bit(signum));
         purge_sigqueue(t, signum);
     }
 }
@@ -7121,6 +7211,11 @@ pub(crate) fn flush_group_pending_signal(task: u64, signum: u32) {
 /// that can still take them.
 #[inline]
 pub(crate) fn note_mask_change(task: u64, old: u64, new: u64) {
+    if old & !new & signal_pending_shared(task) != 0 {
+        crate::user_task::with_user_task_ctx(task, |ctx| {
+            ctx.signal_delivery_notified.store(true, Ordering::Release);
+        });
+    }
     let newly_blocked = new & !old;
     if newly_blocked != 0 && signal_pending_shared(task) & newly_blocked != 0 {
         retarget_shared_pending(task, newly_blocked);
@@ -11593,13 +11688,34 @@ pub(crate) fn default_signal_delivery_restricted(
     if !ctx.returning_to_user() {
         return false;
     }
+    // Take the notification BEFORE testing the global empty fast path. A
+    // later raise sets it again and survives this return; clearing it after
+    // the empty check could erase that raise. Clear stale notifications even
+    // when sigwait/signalfd on another thread consumed the final shared bit.
+    let user = crate::user_task::current_user_task();
+    let notified = user.map(|ptr| {
+        // SAFETY: the in-flight task owns this poller-pinned context.
+        let task = unsafe { &*ptr };
+        task.signal_delivery_notified.load(Ordering::Acquire)
+            && task.signal_delivery_notified.swap(false, Ordering::AcqRel)
+    }).unwrap_or(true);
     // The common syscall-return case has no pending signals anywhere. Avoid
     // resolving the current task and locking its sharded B-tree until a writer
     // has published a non-empty pending bitmap.
     if SIGNAL_PENDING_TASKS.load(Ordering::Acquire) == 0 && !group_stops_active() {
         return false;
     }
-    default_signal_delivery_restricted_active(ctx, syscall_no, restrict, prerewound)
+    let task = current_task_id();
+    let selected = notified || signal_pending_private(task) & !signal_mask_of(task) != 0;
+    let allowed = if selected { restrict } else { restrict & UNBLOCKABLE_MASK };
+    let delivered = default_signal_delivery_restricted_active(ctx, syscall_no, allowed, prerewound);
+    if selected && signal_pending_of(task) & !signal_mask_of(task) != 0 {
+        if let Some(ptr) = user {
+            // SAFETY: as above; only the atomic notification is touched.
+            unsafe { &*ptr }.signal_delivery_notified.store(true, Ordering::Release);
+        }
+    }
+    delivered
 }
 
 #[inline(never)]
@@ -11697,15 +11813,20 @@ fn default_signal_delivery_restricted_active(
         return true;
     }
 
+    // Own this exact instance before looking up its action or writing user
+    // memory. Selection above is only a hint: a sibling sigwait/signalfd may
+    // have consumed it in the meantime. The outer None means the hint went
+    // stale; an inner None is a real pending signal without queued siginfo.
+    // No queue or pending-set lock remains held across frame construction.
+    let Some((_, queued)) = sigwait_take_locked(src, sig_bit(signum)) else {
+        return false;
+    };
+
     let action = match sigaction_lookup_full(task, signum as usize) {
         Some(a) => a,
         None => {
             // No user handler installed → POSIX default action.
-            // Clear the pending bit before applying the action so a
-            // retry trap doesn't re-fire the same signal.
-            let _ = pending_signal_bits_update_existing(src, |slot| {
-                *slot &= !(sig_bit(signum));
-            });
+            // The instance was already dequeued with its payload above.
             match default_signal_action(signum) {
                 DefaultAction::Ignore => {
                     // Silently consumed (existing behaviour). Discard any
@@ -11746,20 +11867,13 @@ fn default_signal_delivery_restricted_active(
     // stored as `None`, so it never reaches here (the None arm above applies
     // the default action); a SIG_IGN slot is the only `handler <= 1` case.
     if action.handler <= 1 {
-        let _ = pending_signal_bits_update_existing(src, |slot| {
-            *slot &= !(sig_bit(signum));
-        });
         // SIG_IGN consumes every queued RT instance with the bit.
         purge_sigqueue(src, signum);
         return true;
     }
     // Async signals: si_code = SI_USER (0), si_addr = 0 — unless this
     // instance was queued by rt_sigqueueinfo/sigqueue, in which case
-    // honour its si_code (SI_QUEUE) + si_value (the sigval payload). PEEK the
-    // payload (don't dequeue yet): the commit below pops it only after the
-    // frame write succeeds, so a failed delivery retries with the payload
-    // still queued instead of draining it into a payload-less SI_USER retry.
-    let queued = peek_sigqueue_info(src, signum);
+    // honour the si_code (SI_QUEUE) + si_value owned by the atomic dequeue.
     let (si_code, si_value, si_pid, si_addr) =
         queued.map_or((0, 0, 0, 0), |info| match info.poll_band {
             Some(band) => {
@@ -11799,7 +11913,10 @@ fn default_signal_delivery_restricted_active(
     }
     let interrupted_rsp = ctx.user_rsp();
     if !ctx.deliver_signal(&params) {
-        return false;
+        // Linux signal_setup_done -> force_sigsegv: this instance is already
+        // consumed. Retrying a peeked payload is not safe against another
+        // consumer, and an unwritable frame must not silently lose a signal.
+        return force_signal_frame_fault(ctx, signum);
     }
     // The frame builder just converted a restart-pending syscall to a
     // completed -EINTR (prerewound + no SA_RESTART keep). The re-execution
@@ -11842,14 +11959,6 @@ fn default_signal_delivery_restricted_active(
         interrupted_rsp,
         params.altstack_sp != 0,
     );
-    // Commit only after the rewrite succeeded — a failed delivery (handled
-    // above) leaves the payload AND the pending bit intact so the next trap
-    // retries cleanly. Pop the delivered instance and clear (or re-arm, if
-    // more RT instances remain) the pending bit atomically under the sigqueue
-    // bucket lock, so a concurrent sender can neither strand the bit over an
-    // emptied queue nor lose its payload behind a cleared bit. (The peek above
-    // read this same front instance to build the frame.)
-    let _ = sigqueue_take_and_clear(src, signum);
     // Save the pre-handler mask so `sys_sigreturn` restores it (POSIX),
     // undoing the auto-block below. Captured BEFORE the SA_NODEFER OR so the
     // restored value is the mask in effect when the handler was entered.
@@ -11877,6 +11986,30 @@ fn default_signal_delivery_restricted_active(
             h.lock()[signum as usize] = None;
         }
     }
+    true
+}
+
+/// Linux force_sigsegv: a failed SIGSEGV frame is fatal; an ignored or
+/// blocked SIGSEGV also becomes default/unblocked so bad stacks cannot evade
+/// termination. A usable SIGSEGV handler may recover using its altstack.
+fn force_signal_frame_fault(ctx: &mut dyn TrapContext, failed_signal: u32) -> bool {
+    let task = current_task_id();
+    let mask = signal_mask_of(task);
+    let blocked = mask & sig_bit(SIGSEGV) != 0;
+    let ignored = sigaction_lookup_full(task, SIGSEGV as usize)
+        .is_some_and(|action| action.handler <= 1);
+    if failed_signal == SIGSEGV || blocked || ignored {
+        if let Some(actions) = task_map_get(&SIGACTION_TABLE, task) {
+            actions.lock()[SIGSEGV as usize] = None;
+        }
+    }
+    if blocked {
+        set_signal_mask_for_task(task, mask & !sig_bit(SIGSEGV));
+    }
+    if sync_signal_hook().is_some_and(|hook| hook(ctx, 13, SyncFaultInfo { addr: 0, bus: false })) {
+        return true;
+    }
+    terminate_current_task(ctx, task, SIGSEGV, true);
     true
 }
 
@@ -12405,16 +12538,10 @@ pub(crate) fn ptrace_notify_siginfo(task: u64, exit_code: u32) -> [u8; 128] {
 }
 
 /// The `last_siginfo` of a signal-delivery stop for `signum`: the siginfo the
-/// signal would have been delivered with — its queued payload when it has one
-/// (sigqueue, SIGCHLD, a kernel-generated code), else `SI_USER` from an
-/// unknown sender.
-pub(crate) fn ptrace_signal_siginfo(task: u64, signum: u32) -> [u8; 128] {
-    let src = if signal_pending_private(task) & sig_bit(signum) != 0 {
-        task
-    } else {
-        shared_pending_key(task)
-    };
-    let (si_code, si_value, si_pid, si_addr) = match peek_sigqueue_info(src, signum) {
+/// signal would have been delivered with, built from its already-dequeued
+/// payload. A queue snapshot is not ownership: another consumer may take it.
+pub(crate) fn ptrace_signal_siginfo(signum: u32, queued: Option<QueuedSiginfo>) -> [u8; 128] {
+    let (si_code, si_value, si_pid, si_addr) = match queued {
         Some(info) => match info.poll_band {
             Some(band) => (info.code, info.value, band, u64::from(band)),
             None => (info.code, info.value, info.pid, 0),
@@ -12493,7 +12620,18 @@ pub(crate) fn force_sigsys_seccomp(
     force_coredump: bool,
 ) {
     const SIGSYS: u32 = 31;
+    const SYS_SECCOMP: i32 = 1;
     let bit = sig_bit(SIGSYS);
+    // This forced, synchronous signal has no pending-queue instance to take.
+    // Pass its own siginfo to ptrace instead of consuming an unrelated send.
+    let ptrace_info = SigDeliveryParams {
+        signum: SIGSYS,
+        si_code: SYS_SECCOMP,
+        si_addr: ctx.rip(),
+        si_value: u64::from(nr) | (u64::from(arch) << 32),
+        si_pid: u32::from(data),
+        ..Default::default()
+    }.siginfo_bytes();
     let action = sigaction_lookup_full(task, SIGSYS as usize);
     let blocked = signal_mask_of(task) & bit != 0;
     let usable = action.filter(|a| a.handler > 1 && !blocked && !force_coredump);
@@ -12506,16 +12644,15 @@ pub(crate) fn force_sigsys_seccomp(
         if blocked {
             let _ = set_signal_mask_for_task(task, signal_mask_of(task) & !bit);
         }
-        if crate::ptrace::ptrace_intercept_signal(ctx, SIGSYS) {
+        if crate::ptrace::ptrace_intercept_signal_info(ctx, SIGSYS, Some(ptrace_info)) {
             return;
         }
         terminate_current_task(ctx, task, SIGSYS, true);
         return;
     };
-    if crate::ptrace::ptrace_intercept_signal(ctx, SIGSYS) {
+    if crate::ptrace::ptrace_intercept_signal_info(ctx, SIGSYS, Some(ptrace_info)) {
         return;
     }
-    const SYS_SECCOMP: i32 = 1;
     // SiginfoLayout::Sys carries `si_syscall` / `si_arch` in `si_value` (the
     // two ints at offsets 24 and 28) and `si_errno` in `si_pid`.
     let mut params = build_delivery_params(

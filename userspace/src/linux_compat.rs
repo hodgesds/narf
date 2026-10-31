@@ -127,23 +127,19 @@ impl FileOps for SignalFdFile {
             // group's shared set (`signalfd_dequeue` -> `dequeue_signal`).
             let reader = crate::handlers::signalfd_reader(self.owner_task);
             let mask = self.mask.load(Ordering::Acquire);
-            let Some((signum, src)) = crate::handlers::next_deliverable(reader, mask) else {
+            let Some((signum, queued)) = crate::handlers::sigwait_take(reader, mask) else {
                 return Err(FsError::WouldBlock);
             };
-            // Pop the payload and clear/re-arm the pending bit together under
-            // the sigqueue bucket lock (atomic against a racing sender's
-            // store+set), so a queued standard signal is never read as a
-            // payload-less SI_USER nor left stranded — same invariant as the
-            // sigwait and handler-delivery consumers. A bit with no payload
-            // reads as SI_USER with zeroed fields.
-            let (si_code, si_value, si_pid, si_addr) =
-                match crate::handlers::sigqueue_take_and_clear(src, signum) {
-                    Some(info) => match info.poll_band {
-                        Some(band) => (info.code, info.value, band, u64::from(band)),
-                        None => (info.code, info.value, info.pid, 0),
-                    },
-                    None => (0, 0, 0, 0),
-                };
+            // Selection, payload ownership and the pending-bit update share
+            // one queue transaction. Another consumer winning the race must
+            // produce WouldBlock, never a fabricated payload-less SI_USER.
+            let (si_code, si_value, si_pid, si_addr) = match queued {
+                Some(info) => match info.poll_band {
+                    Some(band) => (info.code, info.value, band, u64::from(band)),
+                    None => (info.code, info.value, info.pid, 0),
+                },
+                None => (0, 0, 0, 0),
+            };
             let ssi = crate::SigDeliveryParams {
                 signum,
                 si_code,
