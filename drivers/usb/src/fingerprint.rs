@@ -741,4 +741,293 @@ mod tests {
         assert_eq!(require_full_transfer(64, 64), Ok(()));
         assert_eq!(require_full_transfer(63, 64), Err(FpError::EndpointConfig));
     }
+
+    // ── Endpoint-discovery masking defeats ────────────────────
+    // The walk clears endpoints accumulated for a prior interface
+    // when a new matching interface appears; these cases pin that
+    // the resolved pair always belongs to the LAST matching
+    // interface, never to an earlier HID or vendor interface.
+
+    fn make_cfg_composite() -> alloc::vec::Vec<u8> {
+        // Config (9) + HID iface (9) + intr endpoint (7)
+        // + vendor iface (9) + bulk-IN (7) + bulk-OUT (7) = 48.
+        let mut v = alloc::vec![0u8; 48];
+        v[0] = 9;
+        v[1] = 0x02;
+        v[2] = 48;
+        v[4] = 2;
+        v[5] = 1;
+        // HID iface 0, class 0x03, with an interrupt-IN endpoint.
+        v[9] = 9;
+        v[10] = 0x04;
+        v[11] = 0;
+        v[13] = 1;
+        v[14] = 0x03;
+        v[18] = 7;
+        v[19] = 0x05;
+        v[20] = 0x82;
+        v[21] = 0x03;
+        v[22] = 0x40;
+        v[23] = 0x00;
+        // Vendor iface 1, class 0xFF, bulk pair 0x81 / 0x02.
+        v[25] = 9;
+        v[26] = 0x04;
+        v[27] = 1;
+        v[29] = 2;
+        v[30] = 0xFF;
+        v[34] = 7;
+        v[35] = 0x05;
+        v[36] = 0x81;
+        v[37] = 0x02;
+        v[38] = 0x00;
+        v[39] = 0x02;
+        v[41] = 7;
+        v[42] = 0x05;
+        v[43] = 0x02;
+        v[44] = 0x02;
+        v[45] = 0x00;
+        v[46] = 0x02;
+        v
+    }
+
+    fn make_cfg_two_vendor_ifaces() -> alloc::vec::Vec<u8> {
+        // Config (9) + vendor iface 0 (9) + bulk pair (14)
+        // + vendor iface 1 (9) + bulk pair (14) = 55.
+        let mut v = alloc::vec![0u8; 55];
+        v[0] = 9;
+        v[1] = 0x02;
+        v[2] = 55;
+        v[4] = 2;
+        v[5] = 1;
+        // Vendor iface 0, bulk 0x81 / 0x01.
+        v[9] = 9;
+        v[10] = 0x04;
+        v[11] = 0;
+        v[13] = 2;
+        v[14] = 0xFF;
+        v[18] = 7;
+        v[19] = 0x05;
+        v[20] = 0x81;
+        v[21] = 0x02;
+        v[22] = 0x00;
+        v[23] = 0x02;
+        v[25] = 7;
+        v[26] = 0x05;
+        v[27] = 0x01;
+        v[28] = 0x02;
+        v[29] = 0x00;
+        v[30] = 0x02;
+        // Vendor iface 1, bulk 0x83 / 0x03.
+        v[32] = 9;
+        v[33] = 0x04;
+        v[34] = 1;
+        v[36] = 2;
+        v[37] = 0xFF;
+        v[41] = 7;
+        v[42] = 0x05;
+        v[43] = 0x83;
+        v[44] = 0x02;
+        v[45] = 0x00;
+        v[46] = 0x02;
+        v[48] = 7;
+        v[49] = 0x05;
+        v[50] = 0x03;
+        v[51] = 0x02;
+        v[52] = 0x00;
+        v[53] = 0x02;
+        v
+    }
+
+    #[test]
+    fn endpoint_discovery_hid_first_then_vendor() {
+        // The HID interface's interrupt endpoint must not leak
+        // into the vendor interface's resolution.
+        let cfg = make_cfg_composite();
+        let eps = find_fp_endpoints(&cfg, FpVendor::Goodix).expect("vendor pair");
+        match eps {
+            FpEndpoints::Bulk {
+                bulk_in, bulk_out, ..
+            } => {
+                assert_eq!(bulk_in.ep_addr, 0x81);
+                assert_eq!(bulk_out.ep_addr, 0x02);
+            }
+            _ => panic!("expected Bulk endpoints"),
+        }
+        // ELAN on the same blob: the HID interrupt endpoint is on
+        // a non-matching interface, so ELAN finds nothing.
+        assert!(matches!(
+            find_fp_endpoints(&cfg, FpVendor::Elan),
+            Err(FpError::EndpointsMissing)
+        ));
+    }
+
+    #[test]
+    fn endpoint_discovery_second_vendor_iface_wins() {
+        // The second matching interface clears the first pair.
+        let cfg = make_cfg_two_vendor_ifaces();
+        let eps = find_fp_endpoints(&cfg, FpVendor::Goodix).expect("vendor pair");
+        match eps {
+            FpEndpoints::Bulk {
+                bulk_in,
+                bulk_out,
+                interface,
+                ..
+            } => {
+                assert_eq!(bulk_in.ep_addr, 0x83);
+                assert_eq!(bulk_out.ep_addr, 0x03);
+                // Interface number stays the first matching one;
+                // only the endpoints reset.
+                assert_eq!(interface, 0);
+            }
+            _ => panic!("expected Bulk endpoints"),
+        }
+    }
+
+    #[test]
+    fn endpoint_discovery_second_iface_intr_only_fails_bulk() {
+        // Vendor iface 0 (bulk pair) then vendor iface 1
+        // (interrupt-IN only): the clear discards pair A, and
+        // Synaptics still needs bulk, so this must fail — not
+        // silently resolve pair A.
+        let mut cfg = make_cfg_bulk(0xFF);
+        // Append a second vendor interface with only interrupt-IN.
+        cfg.extend_from_slice(&[
+            9, 0x04, 1, 0, 1, 0xFF, 0, 0, 0, // iface 1, vendor
+            7, 0x05, 0x81, 0x03, 0x40, 0x00, 0, // intr-IN
+        ]);
+        assert!(matches!(
+            find_fp_endpoints(&cfg, FpVendor::Synaptics),
+            Err(FpError::EndpointsMissing)
+        ));
+        // ELAN on the same blob resolves the second iface's intr.
+        let eps = find_fp_endpoints(&cfg, FpVendor::Elan).expect("intr");
+        match eps {
+            FpEndpoints::InterruptIn { intr_in, .. } => {
+                assert_eq!(intr_in.ep_addr, 0x81);
+            }
+            _ => panic!("expected InterruptIn endpoints"),
+        }
+    }
+
+    #[test]
+    fn endpoint_discovery_elan_prefers_interrupt_over_bulk() {
+        // One vendor iface carrying both a bulk pair and an
+        // interrupt-IN endpoint: ELAN takes interrupt-IN.
+        let mut cfg = make_cfg_bulk(0xFF);
+        cfg.extend_from_slice(&[7, 0x05, 0x82, 0x03, 0x40, 0x00, 0]);
+        let eps = find_fp_endpoints(&cfg, FpVendor::Elan).expect("intr");
+        match eps {
+            FpEndpoints::InterruptIn { intr_in, .. } => {
+                assert_eq!(intr_in.ep_addr, 0x82);
+                assert_eq!(intr_in.kind, EndpointKind::InterruptIn);
+            }
+            _ => panic!("expected InterruptIn endpoints"),
+        }
+    }
+
+    #[test]
+    fn endpoint_discovery_truncated_descriptor_no_panic() {
+        // Endpoint descriptor header claims 7 bytes but only 3
+        // remain: the walk breaks, it must not panic or over-read.
+        let mut cfg = make_cfg_bulk(0xFF);
+        cfg.truncate(28); // cuts inside the bulk-OUT descriptor
+        assert!(matches!(
+            find_fp_endpoints(&cfg, FpVendor::Goodix),
+            Err(FpError::EndpointsMissing)
+        ));
+    }
+
+    #[test]
+    fn endpoint_discovery_rejects_non_config() {
+        // First descriptor is not a Configuration descriptor.
+        let mut cfg = make_cfg_bulk(0xFF);
+        cfg[1] = 0x04;
+        assert!(matches!(
+            find_fp_endpoints(&cfg, FpVendor::Goodix),
+            Err(FpError::NotFingerprint)
+        ));
+        // Shorter than a config header.
+        assert!(matches!(
+            find_fp_endpoints(&[9, 0x02], FpVendor::Goodix),
+            Err(FpError::NotFingerprint)
+        ));
+    }
+
+    // ── DCI encoding pins (xHCI §4.8.1) ──────────────────────
+
+    #[test]
+    fn dci_encoding_pins() {
+        assert_eq!(ep_dci(0x81, true), 3);
+        assert_eq!(ep_dci(0x01, false), 2);
+        assert_eq!(ep_dci(0x02, false), 4);
+        assert_eq!(ep_dci(0x8F, true), 31);
+        assert_eq!(ep_dci(0x0F, false), 30);
+    }
+
+    // ── FpFileNode pure surface ───────────────────────────────
+    // stat/ino need no controller; read/write without a bound
+    // controller must fail closed (Io), never panic. Transfer
+    // conversations themselves need a transport seam (PR #1238's
+    // FpTransport) and are NOT simulated here — see the PR body.
+
+    fn make_test_device(slot_id: u8) -> Arc<FingerprintDevice> {
+        Arc::new(FingerprintDevice {
+            slot_id,
+            vendor: FpVendor::Goodix,
+            bulk_in_ep: 3,
+            bulk_out_ep: 2,
+            in_max_packet: 512,
+            armed: AtomicBool::new(false),
+        })
+    }
+
+    #[test]
+    fn fp_node_stat_and_ino() {
+        use narf_filesystem::{FileType, Mode};
+        let node = FpFileNode {
+            dev: make_test_device(0),
+        };
+        let stat = node.stat();
+        assert_eq!(
+            stat.mode,
+            Mode {
+                file_type: FileType::Special,
+                perms: 0o660,
+            }
+        );
+        assert_eq!(node.ino(), 0xf9_0001);
+        let node1 = FpFileNode {
+            dev: make_test_device(1),
+        };
+        assert_eq!(node1.ino(), 0xf9_0002);
+    }
+
+    struct NoopWaker;
+    impl core::task::Wake for NoopWaker {
+        fn wake(self: Arc<Self>) {}
+        fn wake_by_ref(self: &Arc<Self>) {}
+    }
+
+    #[test]
+    fn fp_node_io_without_controller_fails_closed() {
+        use core::task::{Context, Poll, Waker};
+        // No host test binds a controller, so the global
+        // controller() is None and both directions fail with Io.
+        let node = FpFileNode {
+            dev: make_test_device(0),
+        };
+        let waker = Waker::from(Arc::new(NoopWaker));
+        let mut cx = Context::from_waker(&waker);
+        let mut buf = [0u8; 64];
+        let mut read_fut = node.read(0, &mut buf);
+        assert!(matches!(
+            read_fut.as_mut().poll(&mut cx),
+            Poll::Ready(Err(narf_filesystem::FsError::Io(_)))
+        ));
+        let mut write_fut = node.write(0, b"cmd");
+        assert!(matches!(
+            write_fut.as_mut().poll(&mut cx),
+            Poll::Ready(Err(narf_filesystem::FsError::Io(_)))
+        ));
+    }
 }

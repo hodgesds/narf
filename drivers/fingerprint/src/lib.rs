@@ -688,4 +688,101 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/fingerprint", smoke_family_labels_are_kebab_case);
+
+    // ── probe_from_descriptors directly ───────────────────────
+    // The probe entry point has zero production callers on main
+    // (only the table is wired, via the USB crate's classify);
+    // these smokes pin its logic so the wiring decision stays
+    // separable from the logic. Counter reset at start AND end
+    // so cases never bleed into each other.
+
+    fn make_device_desc(vid: u16, pid: u16) -> [u8; 18] {
+        // USB 2.0 §9.6.1: idVendor @8, idProduct @10, LE.
+        let mut d = [0u8; 18];
+        d[0] = 18;
+        d[1] = 0x01;
+        d[8..10].copy_from_slice(&vid.to_le_bytes());
+        d[10..12].copy_from_slice(&pid.to_le_bytes());
+        d
+    }
+
+    fn make_cfg_desc(num_ifaces: u8) -> [u8; 9] {
+        let mut c = [0u8; 9];
+        c[0] = 9;
+        c[1] = 0x02;
+        c[4] = num_ifaces;
+        c
+    }
+
+    fn smoke_probe_known_reader() -> TestResult {
+        __reset_for_test();
+        let entry =
+            match probe_from_descriptors(&make_device_desc(0x06CB, 0x00BD), &make_cfg_desc(2)) {
+                Some(e) => e,
+                None => {
+                    __reset_for_test();
+                    return TestResult::Fail("known Synaptics reader not probed");
+                }
+            };
+        if entry.family != Family::SynapticsPrometheus {
+            __reset_for_test();
+            return TestResult::Fail("known reader wrong family");
+        }
+        if probed_count() != 1 {
+            __reset_for_test();
+            return TestResult::Fail("probe counter did not increment exactly once");
+        }
+        __reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/fingerprint", smoke_probe_known_reader);
+
+    fn smoke_probe_unknown_reader() -> TestResult {
+        __reset_for_test();
+        if probe_from_descriptors(&make_device_desc(0x1234, 0x5678), &make_cfg_desc(1)).is_some() {
+            __reset_for_test();
+            return TestResult::Fail("unknown VID/PID probed as a reader");
+        }
+        if probed_count() != 0 {
+            __reset_for_test();
+            return TestResult::Fail("probe counter moved on unknown device");
+        }
+        __reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/fingerprint", smoke_probe_unknown_reader);
+
+    fn smoke_probe_rejects_short_device_desc() -> TestResult {
+        __reset_for_test();
+        // Fewer than 12 bytes: no VID/PID fields to read.
+        if probe_from_descriptors(&[0u8; 8], &make_cfg_desc(1)).is_some() {
+            __reset_for_test();
+            return TestResult::Fail("short device descriptor probed");
+        }
+        if probed_count() != 0 {
+            __reset_for_test();
+            return TestResult::Fail("probe counter moved on malformed descriptor");
+        }
+        __reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/fingerprint", smoke_probe_rejects_short_device_desc);
+
+    fn smoke_probe_short_cfg_still_matches() -> TestResult {
+        // A short config header degrades bNumInterfaces to 0
+        // (unwrap_or) rather than failing the match: the VID/PID
+        // decision does not depend on the config header.
+        __reset_for_test();
+        if probe_from_descriptors(&make_device_desc(0x27C6, 0x55B4), &[0u8; 2]).is_none() {
+            __reset_for_test();
+            return TestResult::Fail("short config header blocked a known reader");
+        }
+        if probed_count() != 1 {
+            __reset_for_test();
+            return TestResult::Fail("probe counter wrong on short config header");
+        }
+        __reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/fingerprint", smoke_probe_short_cfg_still_matches);
 }
