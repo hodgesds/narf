@@ -4271,6 +4271,190 @@ fn smoke_fp_no_reader_on_qemu() -> TestResult {
 }
 kernel_test_in!("drivers/usb/fingerprint", smoke_fp_no_reader_on_qemu);
 
+/// Endpoint discovery against composite descriptors: the resolved
+/// pair must always belong to the LAST matching interface, never
+/// to an earlier HID or vendor interface (host unit tests pin the
+/// same cases; this smoke runs them on both arches in CI).
+fn smoke_fp_endpoint_discovery_composite() -> TestResult {
+    use crate::fingerprint::{find_fp_endpoints, FpEndpoints, FpVendor};
+    use crate::xhci::EndpointKind;
+
+    // HID iface (intr 0x82) then vendor iface (bulk 0x81/0x02):
+    // Goodix must resolve the vendor pair, not the HID endpoint.
+    let mut cfg: alloc::vec::Vec<u8> = alloc::vec![0u8; 48];
+    cfg[0] = 9;
+    cfg[1] = 0x02;
+    cfg[2] = 48;
+    cfg[4] = 2;
+    cfg[5] = 1;
+    cfg[9] = 9;
+    cfg[10] = 0x04;
+    cfg[11] = 0;
+    cfg[13] = 1;
+    cfg[14] = 0x03;
+    cfg[18] = 7;
+    cfg[19] = 0x05;
+    cfg[20] = 0x82;
+    cfg[21] = 0x03;
+    cfg[22] = 0x40;
+    cfg[25] = 9;
+    cfg[26] = 0x04;
+    cfg[27] = 1;
+    cfg[29] = 2;
+    cfg[30] = 0xFF;
+    cfg[34] = 7;
+    cfg[35] = 0x05;
+    cfg[36] = 0x81;
+    cfg[37] = 0x02;
+    cfg[38] = 0x00;
+    cfg[39] = 0x02;
+    cfg[41] = 7;
+    cfg[42] = 0x05;
+    cfg[43] = 0x02;
+    cfg[44] = 0x02;
+    cfg[45] = 0x00;
+    cfg[46] = 0x02;
+    match find_fp_endpoints(&cfg, FpVendor::Goodix) {
+        Ok(FpEndpoints::Bulk {
+            bulk_in, bulk_out, ..
+        }) => {
+            if bulk_in.ep_addr != 0x81 || bulk_in.kind != EndpointKind::BulkIn {
+                return TestResult::Fail("composite: bulk-IN not from vendor iface");
+            }
+            if bulk_out.ep_addr != 0x02 || bulk_out.kind != EndpointKind::BulkOut {
+                return TestResult::Fail("composite: bulk-OUT not from vendor iface");
+            }
+        }
+        _ => return TestResult::Fail("composite: vendor pair not found"),
+    }
+    // ELAN on the same blob: the HID interrupt endpoint is on a
+    // non-matching interface, so nothing resolves.
+    if find_fp_endpoints(&cfg, FpVendor::Elan).is_ok() {
+        return TestResult::Fail("composite: ELAN resolved a HID endpoint");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/fingerprint",
+    smoke_fp_endpoint_discovery_composite
+);
+
+/// WBDI descriptor-set walk masking defeats (pure logic, no
+/// controller). The plain-WINUSB-first case lives in PR #1237 and
+/// is not duplicated here.
+fn smoke_fp_wbdi_set_masking() -> TestResult {
+    use crate::wbdi::is_wbdi_descriptor_set;
+
+    fn compat(cid: &[u8; 8], sub: &[u8; 8]) -> [u8; 20] {
+        let mut f = [0u8; 20];
+        f[0..2].copy_from_slice(&20u16.to_le_bytes());
+        f[2..4].copy_from_slice(&3u16.to_le_bytes());
+        f[4..12].copy_from_slice(cid);
+        f[12..20].copy_from_slice(sub);
+        f
+    }
+    fn set(features: &[&[u8]], total_override: Option<u16>) -> alloc::vec::Vec<u8> {
+        let actual: usize = 10 + features.iter().map(|f| f.len()).sum::<usize>();
+        let total = total_override.unwrap_or(actual as u16);
+        let mut blob = alloc::vec![0u8; actual];
+        blob[0..2].copy_from_slice(&10u16.to_le_bytes());
+        blob[4..8].copy_from_slice(&0x06030000u32.to_le_bytes());
+        blob[8..10].copy_from_slice(&total.to_le_bytes());
+        let mut off = 10;
+        for f in features {
+            blob[off..off + f.len()].copy_from_slice(f);
+            off += f.len();
+        }
+        blob
+    }
+
+    let wbdi = compat(b"WINUSB\0\0", b"WBDI\0\0\0\0");
+    let wrong_sub = compat(b"WINUSB\0\0", b"MTP\0\0\0\0\0");
+    if is_wbdi_descriptor_set(&set(&[&wrong_sub], None)) {
+        return TestResult::Fail("wrong sub-id accepted as WBDI");
+    }
+    // 24-byte Compatible-ID feature: length != 20, must be skipped.
+    let mut long = [0u8; 24];
+    long[0..2].copy_from_slice(&24u16.to_le_bytes());
+    long[2..4].copy_from_slice(&3u16.to_le_bytes());
+    long[4..12].copy_from_slice(b"WINUSB\0\0");
+    long[12..20].copy_from_slice(b"WBDI\0\0\0\0");
+    if is_wbdi_descriptor_set(&set(&[&long], None)) {
+        return TestResult::Fail("wrong-length Compatible-ID accepted");
+    }
+    if is_wbdi_descriptor_set(&set(&[&wbdi], Some(100))) {
+        return TestResult::Fail("total-overrun set accepted");
+    }
+    let mut bad_header = set(&[&wbdi], None);
+    bad_header[0..2].copy_from_slice(&9u16.to_le_bytes());
+    if is_wbdi_descriptor_set(&bad_header) {
+        return TestResult::Fail("bad header length accepted");
+    }
+    let plain = compat(b"WINUSB\0\0", b"\0\0\0\0\0\0\0\0");
+    if !is_wbdi_descriptor_set(&set(&[&wbdi, &plain], None)) {
+        return TestResult::Fail("WBDI-first set not recognised");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/fingerprint", smoke_fp_wbdi_set_masking);
+
+/// BOS platform-capability walk (pure logic, no controller).
+/// MS OS 2.0 §3.4 Table 4 layout.
+fn smoke_fp_bos_platform_cap() -> TestResult {
+    use crate::wbdi::find_ms_os_20_platform_cap;
+
+    const MS_UUID: [u8; 16] = [
+        0xDF, 0x60, 0xDD, 0xD8, 0x89, 0x45, 0xC7, 0x4C, 0x9C, 0xD2, 0x65, 0x9D, 0x9E, 0x64, 0x8A,
+        0x9F,
+    ];
+    fn cap(uuid: &[u8; 16], total_set: u16, vendor_code: u8) -> [u8; 28] {
+        let mut c = [0u8; 28];
+        c[0] = 28;
+        c[1] = 0x10;
+        c[2] = 0x05;
+        c[4..20].copy_from_slice(uuid);
+        c[20..24].copy_from_slice(&0x06030000u32.to_le_bytes());
+        c[24..26].copy_from_slice(&total_set.to_le_bytes());
+        c[26] = vendor_code;
+        c
+    }
+    fn bos(caps: &[&[u8]]) -> alloc::vec::Vec<u8> {
+        let total: usize = 5 + caps.iter().map(|c| c.len()).sum::<usize>();
+        let mut blob = alloc::vec![0u8; total];
+        blob[0] = 5;
+        blob[1] = 0x0F;
+        blob[2..4].copy_from_slice(&(total as u16).to_le_bytes());
+        blob[4] = 1;
+        let mut off = 5;
+        for c in caps {
+            blob[off..off + c.len()].copy_from_slice(c);
+            off += c.len();
+        }
+        blob
+    }
+
+    let ms = cap(&MS_UUID, 30, 0x42);
+    if find_ms_os_20_platform_cap(&bos(&[&ms])) != Some((0x42, 30)) {
+        return TestResult::Fail("MS platform cap not found");
+    }
+    let other = cap(&[0u8; 16], 30, 0x42);
+    if find_ms_os_20_platform_cap(&bos(&[&other])).is_some() {
+        return TestResult::Fail("non-MS UUID accepted");
+    }
+    if find_ms_os_20_platform_cap(&bos(&[&other, &ms])) != Some((0x42, 30)) {
+        return TestResult::Fail("MS cap second not found");
+    }
+    let mut truncated = [0u8; 20];
+    truncated[0] = 20;
+    truncated[1] = 0x10;
+    truncated[2] = 0x05;
+    if find_ms_os_20_platform_cap(&bos(&[&truncated])).is_some() {
+        return TestResult::Fail("truncated cap accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/fingerprint", smoke_fp_bos_platform_cap);
+
 /// xHCI control helpers reject a method/SETUP direction mismatch. This is
 /// load-bearing for payload-carrying host-to-device requests such as HID
 /// SET_REPORT: routing one through `control_in` would otherwise DMA in the

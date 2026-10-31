@@ -123,6 +123,42 @@ fn find_vendor_interface(cfg: &[u8]) -> Option<u8> {
     None
 }
 
+/// Pure walk of a BOS blob for an MS OS 2.0 Platform Capability
+/// descriptor. Split out of [`fetch_ms_os_20_platform_cap`] verbatim
+/// (no logic change) so the conversation's descriptor walk is
+/// fixture-testable without a controller: the walk is the part
+/// that decides MS-OS-awareness, the transfers only fetch bytes.
+/// Returns `(vendor_code, ms_os_desc_total_length)` on match.
+///
+/// `pub(crate)` for kernel-test smokes; the walk itself is pure.
+pub(crate) fn find_ms_os_20_platform_cap(blob: &[u8]) -> Option<(u8, u16)> {
+    // Walk Device Capability descriptors after the 5-byte BOS header.
+    // Platform Capability (sub-type 0x05) carries a 16-byte UUID at
+    // +4..20. For MS OS 2.0 the descriptor data following the UUID is:
+    //   +20..24: dwWindowsVersion
+    //   +24..26: wMSOSDescriptorSetTotalLength
+    //   +26:     bMS_VendorCode
+    //   +27:     bAltEnumCode
+    let mut i = 5usize;
+    while i + 2 <= blob.len() {
+        let len = blob[i] as usize;
+        if len < 2 || i + len > blob.len() {
+            break;
+        }
+        if blob[i + 1] == DESC_TYPE_DEVICE_CAPABILITY
+            && len >= 28
+            && blob[i + 2] == DEV_CAP_TYPE_PLATFORM
+            && blob[i + 4..i + 20] == MS_OS_20_PLATFORM_CAPABILITY_UUID
+        {
+            let total_set = u16::from_le_bytes([blob[i + 24], blob[i + 25]]);
+            let vendor_code = blob[i + 26];
+            return Some((vendor_code, total_set));
+        }
+        i += len;
+    }
+    None
+}
+
 /// Issue GET_DESCRIPTOR(BOS) and search the returned blob for an
 /// MS OS 2.0 Platform Capability descriptor. Returns
 /// `(vendor_code, ms_os_desc_total_length)` on match.
@@ -160,36 +196,14 @@ async fn fetch_ms_os_20_platform_cap(xhci_dev: &Xhci, slot_id: u8) -> Option<(u8
         )
         .await
         .ok()?;
-    // Walk Device Capability descriptors after the 5-byte BOS header.
-    // Platform Capability (sub-type 0x05) carries a 16-byte UUID at
-    // +4..20. For MS OS 2.0 the descriptor data following the UUID is:
-    //   +20..24: dwWindowsVersion
-    //   +24..26: wMSOSDescriptorSetTotalLength
-    //   +26:     bMS_VendorCode
-    //   +27:     bAltEnumCode
-    let mut i = 5usize;
-    while i + 2 <= blob.len() {
-        let len = blob[i] as usize;
-        if len < 2 || i + len > blob.len() {
-            break;
-        }
-        if blob[i + 1] == DESC_TYPE_DEVICE_CAPABILITY
-            && len >= 28
-            && blob[i + 2] == DEV_CAP_TYPE_PLATFORM
-            && blob[i + 4..i + 20] == MS_OS_20_PLATFORM_CAPABILITY_UUID
-        {
-            let total_set = u16::from_le_bytes([blob[i + 24], blob[i + 25]]);
-            let vendor_code = blob[i + 26];
-            return Some((vendor_code, total_set));
-        }
-        i += len;
-    }
-    None
+    find_ms_os_20_platform_cap(&blob)
 }
 
 /// Walk an MS OS 2.0 descriptor-set blob for any Compatible-ID
 /// feature whose (compatible_id, sub_compatible_id) names WBDI.
-fn is_wbdi_descriptor_set(blob: &[u8]) -> bool {
+///
+/// `pub(crate)` for kernel-test smokes; the walk itself is pure.
+pub(crate) fn is_wbdi_descriptor_set(blob: &[u8]) -> bool {
     if blob.len() < 10 {
         return false;
     }
@@ -336,5 +350,202 @@ mod tests {
             0x09, 0x04, 0x07, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00,
         ];
         assert_eq!(find_vendor_interface(&cfg), Some(0x07));
+    }
+
+    // ── BOS platform-capability walk ──────────────────────────
+    // MS OS 2.0 §3.4 Table 4 layout, pinned byte-for-byte:
+    // 28-byte Platform Capability: bLength, bDescriptorType=0x10,
+    // bDevCapabilityType=0x05, bReserved, 16-byte UUID,
+    // dwWindowsVersion, wMSOSDescriptorSetTotalLength,
+    // bMS_VendorCode, bAltEnumCode.
+
+    fn make_platform_cap(uuid: &[u8; 16], total_set: u16, vendor_code: u8) -> [u8; 28] {
+        let mut cap = [0u8; 28];
+        cap[0] = 28;
+        cap[1] = DESC_TYPE_DEVICE_CAPABILITY;
+        cap[2] = DEV_CAP_TYPE_PLATFORM;
+        cap[4..20].copy_from_slice(uuid);
+        cap[20..24].copy_from_slice(&0x06030000u32.to_le_bytes());
+        cap[24..26].copy_from_slice(&total_set.to_le_bytes());
+        cap[26] = vendor_code;
+        cap
+    }
+
+    fn make_bos_with_caps(caps: &[&[u8]]) -> alloc::vec::Vec<u8> {
+        let total: usize = 5 + caps.iter().map(|c| c.len()).sum::<usize>();
+        let mut blob = alloc::vec![0u8; total];
+        blob[0] = 5;
+        blob[1] = DESC_TYPE_BOS as u8;
+        blob[2..4].copy_from_slice(&(total as u16).to_le_bytes());
+        blob[4] = 1;
+        let mut off = 5;
+        for cap in caps {
+            blob[off..off + cap.len()].copy_from_slice(cap);
+            off += cap.len();
+        }
+        blob
+    }
+
+    #[test]
+    fn bos_walk_finds_ms_cap() {
+        let cap = make_platform_cap(&MS_OS_20_PLATFORM_CAPABILITY_UUID, 30, 0x42);
+        let blob = make_bos_with_caps(&[&cap]);
+        assert_eq!(find_ms_os_20_platform_cap(&blob), Some((0x42, 30)));
+    }
+
+    #[test]
+    fn bos_walk_rejects_other_uuid() {
+        let cap = make_platform_cap(&[0u8; 16], 30, 0x42);
+        let blob = make_bos_with_caps(&[&cap]);
+        assert_eq!(find_ms_os_20_platform_cap(&blob), None);
+    }
+
+    #[test]
+    fn bos_walk_rejects_tampered_uuid_byte() {
+        let mut uuid = MS_OS_20_PLATFORM_CAPABILITY_UUID;
+        uuid[0] ^= 0x01;
+        let cap = make_platform_cap(&uuid, 30, 0x42);
+        let blob = make_bos_with_caps(&[&cap]);
+        assert_eq!(find_ms_os_20_platform_cap(&blob), None);
+    }
+
+    #[test]
+    fn bos_walk_finds_ms_cap_second() {
+        // Masking defeat: the walk must not stop at the first
+        // (non-MS) platform capability.
+        let other = make_platform_cap(&[0xAAu8; 16], 30, 0x11);
+        let ms = make_platform_cap(&MS_OS_20_PLATFORM_CAPABILITY_UUID, 30, 0x42);
+        let blob = make_bos_with_caps(&[&other, &ms]);
+        assert_eq!(find_ms_os_20_platform_cap(&blob), Some((0x42, 30)));
+    }
+
+    #[test]
+    fn bos_walk_rejects_truncated_cap() {
+        // 20-byte cap: below the 28-byte floor for a platform cap.
+        let mut cap = [0u8; 20];
+        cap[0] = 20;
+        cap[1] = DESC_TYPE_DEVICE_CAPABILITY;
+        cap[2] = DEV_CAP_TYPE_PLATFORM;
+        let blob = make_bos_with_caps(&[&cap]);
+        assert_eq!(find_ms_os_20_platform_cap(&blob), None);
+    }
+
+    #[test]
+    fn bos_walk_rejects_length_overrun() {
+        // Cap claims 60 bytes but the blob ends after 28.
+        let mut cap = make_platform_cap(&MS_OS_20_PLATFORM_CAPABILITY_UUID, 30, 0x42);
+        cap[0] = 60;
+        let blob = make_bos_with_caps(&[&cap]);
+        assert_eq!(find_ms_os_20_platform_cap(&blob), None);
+    }
+
+    #[test]
+    fn bos_walk_rejects_short_blob() {
+        assert_eq!(find_ms_os_20_platform_cap(&[]), None);
+        assert_eq!(
+            find_ms_os_20_platform_cap(&[5, DESC_TYPE_BOS as u8, 5, 0, 0]),
+            None
+        );
+    }
+
+    // ── Descriptor-set walk masking defeats ───────────────────
+    // (The plain-WINUSB-first case is covered by PR #1237's
+    // is_wbdi_set_finds_wbdi_after_other_feature and is not
+    // duplicated here.)
+
+    fn make_compat_feature(cid: &[u8; 8], sub: &[u8; 8]) -> [u8; 20] {
+        let mut f = [0u8; 20];
+        f[0..2].copy_from_slice(&20u16.to_le_bytes());
+        f[2..4].copy_from_slice(&FEATURE_COMPATIBLE_ID.to_le_bytes());
+        f[4..12].copy_from_slice(cid);
+        f[12..20].copy_from_slice(sub);
+        f
+    }
+
+    fn make_set(features: &[&[u8]], total_override: Option<u16>) -> alloc::vec::Vec<u8> {
+        let actual: usize = 10 + features.iter().map(|f| f.len()).sum::<usize>();
+        let total = total_override.unwrap_or(actual as u16);
+        let mut blob = alloc::vec![0u8; actual];
+        blob[0..2].copy_from_slice(&10u16.to_le_bytes());
+        blob[2..4].copy_from_slice(&0u16.to_le_bytes());
+        blob[4..8].copy_from_slice(&0x06030000u32.to_le_bytes());
+        blob[8..10].copy_from_slice(&total.to_le_bytes());
+        let mut off = 10;
+        for f in features {
+            blob[off..off + f.len()].copy_from_slice(f);
+            off += f.len();
+        }
+        blob
+    }
+
+    #[test]
+    fn set_rejects_wrong_sub_id() {
+        let f = make_compat_feature(b"WINUSB\0\0", b"MTP\0\0\0\0\0");
+        assert!(!is_wbdi_descriptor_set(&make_set(&[&f], None)));
+    }
+
+    #[test]
+    fn set_rejects_tampered_compat_id() {
+        let f = make_compat_feature(b"WINUSX\0\0", b"WBDI\0\0\0\0");
+        assert!(!is_wbdi_descriptor_set(&make_set(&[&f], None)));
+    }
+
+    #[test]
+    fn set_skips_wrong_length_compat() {
+        // 24-byte Compatible-ID feature carrying WINUSB/WBDI:
+        // length != 20, so it must be skipped, not matched.
+        let mut f = [0u8; 24];
+        f[0..2].copy_from_slice(&24u16.to_le_bytes());
+        f[2..4].copy_from_slice(&FEATURE_COMPATIBLE_ID.to_le_bytes());
+        f[4..12].copy_from_slice(b"WINUSB\0\0");
+        f[12..20].copy_from_slice(b"WBDI\0\0\0\0");
+        assert!(!is_wbdi_descriptor_set(&make_set(&[&f], None)));
+    }
+
+    #[test]
+    fn set_rejects_total_overrun() {
+        let f = make_compat_feature(b"WINUSB\0\0", b"WBDI\0\0\0\0");
+        assert!(!is_wbdi_descriptor_set(&make_set(&[&f], Some(100))));
+    }
+
+    #[test]
+    fn set_rejects_bad_header() {
+        let f = make_compat_feature(b"WINUSB\0\0", b"WBDI\0\0\0\0");
+        let mut blob = make_set(&[&f], None);
+        blob[0..2].copy_from_slice(&9u16.to_le_bytes());
+        assert!(!is_wbdi_descriptor_set(&blob));
+        let mut blob = make_set(&[&f], None);
+        blob[2..4].copy_from_slice(&1u16.to_le_bytes());
+        assert!(!is_wbdi_descriptor_set(&blob));
+        let mut blob = make_set(&[&f], None);
+        blob[8..10].copy_from_slice(&9u16.to_le_bytes());
+        assert!(!is_wbdi_descriptor_set(&blob));
+    }
+
+    #[test]
+    fn set_rejects_feature_overrun() {
+        // Feature claims 40 bytes inside a 30-byte set.
+        let mut f = [0u8; 20];
+        f[0..2].copy_from_slice(&40u16.to_le_bytes());
+        f[2..4].copy_from_slice(&FEATURE_COMPATIBLE_ID.to_le_bytes());
+        f[4..12].copy_from_slice(b"WINUSB\0\0");
+        f[12..20].copy_from_slice(b"WBDI\0\0\0\0");
+        assert!(!is_wbdi_descriptor_set(&make_set(&[&f], None)));
+    }
+
+    #[test]
+    fn set_wbdi_first_then_plain_is_true() {
+        let wbdi = make_compat_feature(b"WINUSB\0\0", b"WBDI\0\0\0\0");
+        let plain = make_compat_feature(b"WINUSB\0\0", b"\0\0\0\0\0\0\0\0");
+        assert!(is_wbdi_descriptor_set(&make_set(&[&wbdi, &plain], None)));
+    }
+
+    #[test]
+    fn set_ignores_bytes_beyond_total() {
+        // Trailing garbage past wTotalLength must not affect the walk.
+        let f = make_compat_feature(b"WINUSB\0\0", b"WBDI\0\0\0\0");
+        let mut blob = make_set(&[&f], None);
+        blob.extend_from_slice(&[0xFFu8; 20]);
+        assert!(is_wbdi_descriptor_set(&blob));
     }
 }
