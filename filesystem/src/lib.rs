@@ -1081,6 +1081,15 @@ pub trait DrmFence: Send + Sync {
     fn is_signalled(&self) -> bool;
     fn wait(&self, timeout_ms: u64) -> bool;
 
+    /// Ready for an i915 EXEC_FENCE_SUBMIT dependency. Native Intel fences
+    /// may report scheduling admission before terminal completion; foreign
+    /// fences conservatively wait for completion, as Linux i915 does.
+    /// A terminal failure also satisfies the dependency. This never implies
+    /// readiness for CPU access, resource reclamation, or ordinary fence waits.
+    fn is_submit_ready(&self) -> bool {
+        self.is_signalled()
+    }
+
     /// Driver-private execution context used to elide a self-dependency wait:
     /// work submitted later to the same ordered ring already depends on this
     /// fence. Foreign contexts return a different key (or `None`) and wait.

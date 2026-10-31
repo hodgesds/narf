@@ -385,3 +385,7 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_user",
     smoke_explicit_wire_failures_leave_syncobjs_untouched
 );
+
+mod submit {
+    include!("intel_gpu_submit_tests.rs");
+}

@@ -1373,6 +1373,13 @@ carries Linux `dma_fence` identity for `SYNC_IOC_FILE_INFO` and merging:
 `seqno` (ordering within `context`), `driver_name`/`timeline_name`, and the
 signal `timestamp_ns` when the driver records one.
 
+`DrmFence::is_submit_ready()` defaults to `is_signalled()`, so foreign
+sync_file leaves require completion for i915 EXEC_FENCE_SUBMIT. Native Intel
+fences may report the earlier scheduling-enable acknowledgement or a terminal
+result, including reset before submission. This optional milestone does not
+change poll, bounded wait, reservation/CPU-access ordering or reclamation.
+syncobj imports/exports preserve the original native leaf and its milestone.
+
 `dma_buf` is the generic dma-buf core, mirroring Linux `drivers/dma-buf/`.
 An exporter owns one `DmaBufObject` per underlying buffer, shared by every fd
 and handle naming that buffer, and forwards `FileOps::ioctl_user` to

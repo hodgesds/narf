@@ -172,9 +172,9 @@ interface is admitted; live replies contain branch=0 and the loaded CSS's
 submission major/minor/patch, independently of its firmware release.
 HAS_EXECBUF2/NO_RELOC/HANDLE_LUT/SOFTPIN/BATCH_FIRST/CONTEXT_ISOLATION and
 HAS_ALIASING_PPGTT=3 follow live admission. HAS_EXEC_FENCE,
-HAS_EXEC_FENCE_ARRAY and HAS_EXEC_TIMELINE_FENCES, plus DRM_CAP_SYNCOBJ and
-DRM_CAP_SYNCOBJ_TIMELINE, also follow live admission. Unsupported engines and
-FENCE_SUBMIT are never advertised.
+HAS_EXEC_FENCE_ARRAY, HAS_EXEC_SUBMIT_FENCE and HAS_EXEC_TIMELINE_FENCES,
+plus DRM_CAP_SYNCOBJ and DRM_CAP_SYNCOBJ_TIMELINE, also follow live admission.
+Unsupported engines and their capabilities are never advertised.
 
 `drm_registry::driver_name` recognizes `intel-gpu` so both primary and render
 nodes reach Intel dispatch and retain their GEM mmap/PRIME namespaces.
@@ -201,9 +201,23 @@ never replayed. Dropping a waiter, context handle, GEM handle or fd does not
 cancel hardware ownership. Synchronous kernel dispatch returns WouldBlock for
 a live backend; it cannot bridge a wait that depends on the GT worker.
 
-The userspace path accepts EXEC_FENCE_IN/OUT, EXEC_FENCE_ARRAY, and the
+The userspace path accepts EXEC_FENCE_IN/OUT/SUBMIT, EXEC_FENCE_ARRAY, and the
 TIMELINE_FENCES extension through EXEC_USE_EXTENSIONS. FENCE_IN resolves this
 process's sync_file fd (low32 of rsvd2); invalid/non-sync-file fds return EINVAL.
+FENCE_SUBMIT uses the same fd field and is mutually exclusive with FENCE_IN.
+It waits for each native Intel leaf's scheduling-enable acknowledgement,
+without waiting for its terminal breadcrumb/retirement. Foreign leaves still
+require completion. A terminal reset also satisfies the submit dependency,
+including when enable was never acknowledged. The default
+DrmFence::is_submit_ready is terminal readiness; only the native Intel fence
+opts into the earlier milestone, preserved through syncobj/sync_file adapters.
+Registration, policy and CT enqueue alone do not publish submit readiness.
+FENCE_OUT may accompany either input mode and still exports a terminal fence.
+GEM reservations, same-context ordering, binary/timeline WAIT and ordinary
+fence polling/waits retain their completion requirements. Submit readiness
+never releases resources or proves CPU visibility. Loss before acknowledgement
+keeps the dependency pending until proven full reset; failure alone cannot
+release uncertain GPU ownership.
 Every input leaf and syncobj payload is retained before waiting, so close,
 destroy, replacement or user-memory edits cannot retarget a pending request.
 Each render open owns an independent SyncObjTable and routes the common DRM

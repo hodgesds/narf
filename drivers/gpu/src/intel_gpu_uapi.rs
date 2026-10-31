@@ -56,6 +56,7 @@ pub const EXEC_FENCE_IN: u64 = 1 << 16;
 pub const EXEC_FENCE_OUT: u64 = 1 << 17;
 pub const EXEC_BATCH_FIRST: u64 = 1 << 18;
 pub const EXEC_FENCE_ARRAY: u64 = 1 << 19;
+pub const EXEC_FENCE_SUBMIT: u64 = 1 << 20;
 pub const EXEC_USE_EXTENSIONS: u64 = 1 << 21;
 pub const OBJECT_WRITE: u64 = 1 << 2;
 pub const OBJECT_SUPPORTS_48B: u64 = 1 << 3;

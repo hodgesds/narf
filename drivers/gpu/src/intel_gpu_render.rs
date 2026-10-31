@@ -913,7 +913,7 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
     Ok(match param {
         4 => info.device_id as i32,
         5 => 1, // GEM storage is available independently of acceleration.
-        9 | 25 | 26 | 37 | 44 | 48 | 49 | 50 | 55 => i32::from(info.submission_ready()),
+        9 | 25 | 26 | 37 | 44 | 48 | 49 | 50 | 53 | 55 => i32::from(info.submission_ready()),
         18 => {
             if info.submission_ready() {
                 3
@@ -936,7 +936,8 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
         | 38..=39
         | 41..=43
         | 45..=47
-        | 52..=54
+        | 52
+        | 54
         | 56..=59 => 0,
         _ => return Err(FsError::InvalidData),
     })
@@ -1781,7 +1782,7 @@ pub(crate) mod tests {
             }
             let file = RenderFile::new();
             let user = User::new();
-            for param in [9, 18, 35, 37, 44, 50, 55] {
+            for param in [9, 18, 35, 37, 44, 50, 53, 55] {
                 let mut request = [0; 16];
                 put32(&mut request, 0, param);
                 put64(&mut request, 8, 256);

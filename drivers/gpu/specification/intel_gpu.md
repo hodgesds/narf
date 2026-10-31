@@ -1525,6 +1525,19 @@ own binary/timeline syncobj table; dependencies and signal objects survive
 handle/fd close. Output fd reservation and rsvd2 copyout precede non-failing
 enqueue, so EMFILE/EFAULT cannot queue an unreported job. Array/extension
 bounds, flags, cycles and timeline WAIT|SIGNAL conflicts fail before publication.
+FENCE_SUBMIT now accepts the same input sync_file fd as FENCE_IN, with those
+two input flags mutually exclusive. Native Intel leaves satisfy SUBMIT after
+the owner observes GuC's scheduling-enable ACK; foreign leaves require
+completion. Syncobj/sync_file round trips retain the native leaf. FENCE_OUT
+still exports terminal completion, and GEM reservations, same-context ordering
+and syncobj WAIT retain terminal gates. Loss before enable ACK keeps SUBMIT
+pending until proven full reset publishes a terminal error. Native Rust smokes
+cover ACK timing before any GPU breadcrumb, ioctl admission before completion,
+fd close/wire edits, mixed foreign/native timeline chains, binary/timeline WAIT,
+invalid flag/fd combinations and reset ownership. Linux references are
+`i915_gem_execbuffer.c::eb_fences_add`,
+`i915_request.c::i915_request_await_execution` and `__await_execution` at the
+pinned revision below. These model checks do not establish silicon/Mesa acceptance.
 Other engine/media/cache inventory, accelerated presentation and Intel
 silicon/Mesa acceptance remain open.
 
@@ -1805,7 +1818,7 @@ acceptance or a claim of complete acceleration.
 | Area | Current checkpoint | Still required |
 | --- | --- | --- |
 | GuC execution | Owned GGTT/PPGTT jobs, primed/persistent user RCS state, verified register policy, graphics-GT/RCS workarounds on MTL/Arrow, DG2 and BMG | Other engines, remaining out-of-band workarounds and silicon qualification |
-| Render UAPI | Per-open GEM/contexts/syncobjs, live RCS0 EXECBUFFER2/WR, implicit and explicit fd/binary/timeline fences, context loss/banning and fresh-epoch rebuild | FENCE_SUBMIT and Mesa interoperability |
+| Render UAPI | Per-open GEM/contexts/syncobjs, live RCS0 EXECBUFFER2/WR, implicit and explicit fd/binary/timeline fences including FENCE_SUBMIT, context loss/banning and fresh-epoch rebuild | Mesa interoperability |
 | Engines and platforms | Main-GT DSS/EU discovery and RCS0 kernel scheduling; separate Gen12 foundations | Fused engine/cache/media inventory, compute/copy/media submission and independently sourced profiles for other IP |
 | Memory and presentation | Owned system RAM, private tables and same-card CPU PRIME mappings | Local VRAM, accelerated PRIME/presentation and GPU/KMS synchronization |
 | Display | Gen12 paths and owned Xe-LPG internal-panel modeset | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |

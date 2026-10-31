@@ -953,7 +953,7 @@ without replaying their batches. Failed cleanup remains closed.
 Native Rust models exercise the actual ioctl -> GT -> CT -> PPGTT execution
 and retirement chain, context save/restore/isolation across six IP variants,
 cache failure rollback, cancellation, handle/fd close and reset/epoch ownership.
-The next continuation adds explicit sync_file IN/OUT fences, per-open binary
+The branch also implements explicit sync_file IN/OUT fences, per-open binary
 and timeline syncobj submission, transactional output-fd publication and
 retained dependency snapshots. Native tests cover fd/handle close, cancellation,
 timeline order and publication failures. A round-robin GuC ID pool now reuses
@@ -961,12 +961,19 @@ identities only after verified retirement, with independent request stamps and
 TLB cookies, removing the 65534-request limit. Priming holds the seed ID until
 the distinct switch/capture completes. Native conversations exercise more than
 65534 requests, stale evidence after reuse, pool exhaustion and stamp wrap.
-Intel silicon and Mesa OpenGL/Vulkan acceptance, FENCE_SUBMIT, other engines,
+FENCE_SUBMIT now waits for native Intel scheduling-enable ACKs while foreign
+leaves retain terminal waits. Syncobj round trips preserve native milestones;
+GEM reservations, context order, syncobj WAIT and output fences still require
+terminal completion. Loss before ACK retains ownership and blocks submit
+dependencies until proven reset. Invalid input-flag combinations and bad fds
+fail before publication; HAS_EXEC_SUBMIT_FENCE follows live readiness.
+Intel silicon and Mesa OpenGL/Vulkan acceptance, other engines,
 local VRAM and accelerated presentation remain outstanding.
-Validation passes 107 selected Intel/DRM tests on x86_64 and 95 on aarch64,
-including seven new explicit-fence/ID-recycling smokes and twelve existing
-DRM synchronization tests on x86_64, with zero failures/skips. GPU CI Clippy passes all
-three feature contexts on x86_64 and aarch64; host default, Intel-only, AMD-only
+Validation passes 112 selected Intel/DRM tests on x86_64 and 100 on aarch64,
+including five FENCE_SUBMIT smokes, seven explicit-fence/ID-recycling smokes
+and twelve existing DRM synchronization tests on x86_64, with zero
+failures/skips. GPU and filesystem CI Clippy pass all three feature contexts
+on x86_64 and aarch64; host default, Intel-only, AMD-only
 and no-vendor all-target checks pass. Intel-only debug builds, formatting,
 both production boots and both btrfs postflights per architecture pass.
 The following paragraphs record earlier implementation checkpoints.

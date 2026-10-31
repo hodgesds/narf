@@ -17,14 +17,18 @@ struct Entry {
     point: u64,
     timeline: bool,
 }
+struct Dependency {
+    fence: Arc<dyn DrmFence>,
+    submit: bool,
+}
 pub(crate) struct SyncRequest {
     pub output: bool,
     pub input_word: u32,
     entries: Vec<Entry>,
-    dependencies: Vec<Arc<dyn DrmFence>>,
+    dependencies: Vec<Dependency>,
 }
 pub(crate) struct Resolved {
-    dependencies: Vec<Arc<dyn DrmFence>>,
+    dependencies: Vec<Dependency>,
     signals: Vec<(Arc<SyncObjCore>, u64)>,
 }
 
@@ -53,19 +57,30 @@ impl SyncRequest {
             return Err(FsError::InvalidData);
         }
         let input_word = u64_at(wire, 56) as u32;
+        let inputs = flags & (abi::EXEC_FENCE_IN | abi::EXEC_FENCE_SUBMIT);
+        if inputs == abi::EXEC_FENCE_IN | abi::EXEC_FENCE_SUBMIT {
+            return Err(FsError::InvalidData);
+        }
         let mut result = Self {
             output: flags & abi::EXEC_FENCE_OUT != 0,
             input_word,
             entries: Vec::new(),
             dependencies: Vec::new(),
         };
-        if flags & abi::EXEC_FENCE_IN != 0 {
-            result.dependencies = user
+        if inputs != 0 {
+            let fences = user
                 .sync_file_fences(input_word as i32)
                 .ok_or(FsError::InvalidData)?;
-            if result.dependencies.len() > MAX_FENCES {
+            if fences.len() > MAX_FENCES {
                 return Err(FsError::OutOfMemory);
             }
+            result.dependencies = fences
+                .into_iter()
+                .map(|fence| Dependency {
+                    fence,
+                    submit: inputs == abi::EXEC_FENCE_SUBMIT,
+                })
+                .collect();
         } else if !result.output && u64_at(wire, 56) != 0 {
             return Err(FsError::InvalidData);
         }
@@ -155,7 +170,16 @@ impl SyncRequest {
                 None
             };
             if let Some(fence) = dependency {
-                result.dependencies.extend(so::to_drm_leaves(&fence));
+                result
+                    .dependencies
+                    .extend(
+                        so::to_drm_leaves(&fence)
+                            .into_iter()
+                            .map(|fence| Dependency {
+                                fence,
+                                submit: false,
+                            }),
+                    );
                 if result.dependencies.len() > MAX_FENCES {
                     return Err(FsError::OutOfMemory);
                 }
@@ -169,7 +193,13 @@ impl SyncRequest {
 }
 impl Resolved {
     pub async fn wait(&self) {
-        while self.dependencies.iter().any(|f| !f.is_signalled()) {
+        while self.dependencies.iter().any(|dependency| {
+            if dependency.submit {
+                !dependency.fence.is_submit_ready()
+            } else {
+                !dependency.fence.is_signalled()
+            }
+        }) {
             narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant()).await;
         }
     }

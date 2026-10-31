@@ -146,6 +146,7 @@ impl ExecRequest {
             supported |= abi::EXEC_FENCE_IN
                 | abi::EXEC_FENCE_OUT
                 | abi::EXEC_FENCE_ARRAY
+                | abi::EXEC_FENCE_SUBMIT
                 | abi::EXEC_USE_EXTENSIONS;
         }
         if count == 0

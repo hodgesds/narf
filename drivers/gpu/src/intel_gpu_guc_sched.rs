@@ -666,6 +666,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             }
             (0x1002, Phase::Enabling, Some(1)) => {
                 c.phase = Phase::Running;
+                c.fence.mark_submitted();
             }
             (0x1002, Phase::Disabling, Some(0)) => c.phase = Phase::Deregister,
             (0x4600, Phase::Deregistering, None) => {
