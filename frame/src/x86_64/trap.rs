@@ -2295,7 +2295,7 @@ impl<'a> TrapContext for X86TrapContext<'a> {
                     fpstate: fpstate_vaddr,
                     reserved: [0; 8],
                 },
-                uc_sigmask: 0,
+                uc_sigmask: narf_userspace::signal_mask_for_delivery(),
             };
 
             let info = params.siginfo_bytes();

@@ -87,7 +87,7 @@ pub(super) fn deliver(
     put64(
         &mut bytes,
         UC + 40,
-        narf_userspace::signal_mask_of(narf_scheduler::current_task_id().raw()),
+        narf_userspace::signal_mask_for_delivery(),
     );
     put64(&mut bytes, MC, params.si_addr);
     for (i, value) in saved.x.iter().enumerate() {

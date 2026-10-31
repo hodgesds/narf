@@ -91,6 +91,11 @@ records and EL0-only PSTATE before restoring GPR/FP state. It never restores
 kernel domain-control state from user memory. The existing NARF non-restorer
 signal entry remains separate. A syscall already rewound for a blocking park
 uses restart-pending signal delivery; completed syscalls are not restarted.
+Both architectures' frame writers obtain the pre-handler signal mask from
+`narf_userspace::signal_mask_for_delivery` and publish it in `uc_sigmask`.
+The userspace sigreturn layer imports the user-edited mask with guarded access
+before requesting register restoration; domain-control state is never imported
+from that mask or any user signal frame.
 
 The bare `zram` kernel-command-line flag explicitly installs memory's built-in
 compressed-RAM swap backend during userspace bootstrap. Without it, NARF boots

@@ -39,7 +39,30 @@ pub(crate) fn sys_sigreturn(ctx: &mut dyn TrapContext) {
     // user memory (which could pull a selector field into RIP → #UD). Default
     // `true`: modern (rt_sigaction + SA_SIGINFO/restorer) is the overwhelming case.
     let is_rt = rec.map(|r| r.is_rt).unwrap_or(true);
-    if !ctx.perform_sigreturn(sc_vaddr, is_rt) {
+    // Linux restores uc_sigmask from the user frame: handlers may edit it.
+    // musl's deferred-cancellation handler blocks SIGCANCEL in that mask and
+    // requeues it until a cancellation point. Restoring the kernel's original
+    // copy instead redelivers it immediately, livelocking pthread_cancel/join.
+    // Read before restoring registers so a fault is a bad frame throughout.
+    let saved_mask = if use_rsp && is_rt {
+        #[cfg(target_arch = "x86_64")]
+        let mask_address = sc_vaddr.checked_sub(8); // siginfo follows uc_sigmask
+        #[cfg(target_arch = "aarch64")]
+        let mask_address = sc_vaddr.checked_add(128 + 40); // rt_sigframe.uc.uc_sigmask
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let mask_address = None;
+        let mut mask = [0u8; 8];
+        mask_address.ok_or(()).and_then(|address| {
+            // SAFETY: fixed-size local destination; guarded, range-checked
+            // user read. Arbitrary frame contents grant no kernel authority.
+            unsafe { copy_from_user(&mut mask, address) }
+                .map(|_| Some(u64::from_ne_bytes(mask))).map_err(|_| ())
+        })
+    } else {
+        // NARF's compact non-restorer ABI keeps the kernel-side mask record.
+        Ok(rec.and_then(|r| r.saved_mask))
+    };
+    if saved_mask.is_err() || !ctx.perform_sigreturn(sc_vaddr, is_rt) {
         // A frame that will not restore is `badframe:` in
         // `arch/x86/kernel/signal_64.c::SYSCALL_DEFINE0(rt_sigreturn)`. Every
         // validation failure there jumps to it, and it ends in
@@ -79,12 +102,59 @@ pub(crate) fn sys_sigreturn(ctx: &mut dyn TrapContext) {
         }
         return;
     }
-    // POSIX: restore the signal mask that was in effect before the handler ran,
-    // undoing the auto-block of the delivered signal. Only the async delivery
-    // path records a saved mask; a `None` (e.g. a sync-fault handler return)
-    // leaves the mask untouched. Without this the delivered signal stays blocked
-    // forever and a second occurrence is never taken.
-    if let Some(saved) = rec.and_then(|r| r.saved_mask) {
+    // The common setter strips SIGKILL/SIGSTOP even from a forged user mask
+    // and retargets shared pending work after the restored mask changes.
+    if let Ok(Some(saved)) = saved_mask {
         let _ = set_signal_mask_for_task(task, saved);
     }
 }
+
+#[cfg(feature = "kernel-test")]
+fn smoke_rt_sigreturn_restores_edited_user_mask() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    let _buffers = kernel_buffers_guard();
+    #[repr(align(16))]
+    struct UserFrame([u8; 512]);
+    let mut frame = UserFrame([0; 512]);
+    #[cfg(target_arch = "x86_64")]
+    const MASK_OFFSET: usize = 296; // RSP points at ucontext after pretcode pops
+    #[cfg(target_arch = "aarch64")]
+    const MASK_OFFSET: usize = 168;
+    let edited = sig_bit(10) | sig_bit(12) | UNBLOCKABLE_MASK;
+    frame.0[MASK_OFFSET..MASK_OFFSET + 8].copy_from_slice(&edited.to_ne_bytes());
+    struct ReturnContext {
+        args: SyscallArgs,
+        rsp: u64,
+        restored: bool,
+    }
+    impl TrapContext for ReturnContext {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, _: SyscallReturn) {}
+        fn user_rsp(&self) -> u64 { self.rsp }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+        fn rip(&self) -> u64 { 0 }
+        fn set_rip(&mut self, _: u64) {}
+        fn perform_sigreturn(&mut self, _: u64, _: bool) -> bool {
+            self.restored = true;
+            true
+        }
+    }
+    let task = current_task_id();
+    let old = signal_mask_of(task);
+    push_sigreturn_record(task, true, true, u64::MAX, false);
+    set_sigreturn_saved_mask(task, sig_bit(15));
+    let mut ctx = ReturnContext {
+        args: SyscallArgs::default(),
+        rsp: frame.0.as_ptr() as u64,
+        restored: false,
+    };
+    sys_sigreturn(&mut ctx);
+    let restored = signal_mask_of(task);
+    set_signal_mask_for_task(task, old);
+    if !ctx.restored || restored != edited & !UNBLOCKABLE_MASK {
+        return TestResult::Fail("rt_sigreturn ignored edited uc_sigmask or restored unblockable bits");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!("userspace/signals", smoke_rt_sigreturn_restores_edited_user_mask);

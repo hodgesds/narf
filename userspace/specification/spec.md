@@ -945,6 +945,19 @@ because another event joined an already-readable queue.
 Signalfd uses a per-task pending-set generation that advances only when the
 set changes from empty to nonempty, including the allocation-free IRQ raise
 path.
+Process-directed signals retain a group-shared pending set, while a per-thread
+delivery notification selects which runnable thread may enter a handler.
+Syscall and interrupt returns do not let an unnotified busy sibling consume
+the signal before the selected interruptible sleeper resumes. Mask changes
+retarget pending work or notify a thread that unblocks it; SIGKILL/SIGSTOP
+remain unblockable. Explicit sigwait and signalfd consumers still inspect and
+dequeue shared pending independently of handler selection.
+`signal_mask_for_delivery() -> u64` gives frame writers the interrupted mask,
+including the original mask of a suspended wait without consuming its record.
+Restorer-based Linux frames contain that mask in `uc_sigmask`; `rt_sigreturn`
+reads it with guarded user access before register restoration and honors
+handler edits, always stripping SIGKILL/SIGSTOP. Compact non-restorer frames
+retain their recorded kernel mask.
 Queued-signal syscalls import the complete native kernel `siginfo` prefix before
 publishing pending state. `rt_sigqueueinfo` and `rt_tgsigqueueinfo` require a
 readable non-null info pointer and preserve Linux's `EFAULT`-before-argument

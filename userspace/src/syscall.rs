@@ -5028,7 +5028,7 @@ mod sigframe {
                     fpstate: fpstate_vaddr,
                     reserved: [0; 8],
                 },
-                uc_sigmask: 0,
+                uc_sigmask: crate::handlers::signal_mask_for_delivery(),
             };
 
             let siginfo = params.siginfo_bytes();

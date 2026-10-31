@@ -1,7 +1,23 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-6"
-prompt_hash = "4f90e67227e60f894dcadd05ef88dac4aaeed36d563318d94c7de3a6a113f381"
+prompt_hash = "0244d8def79b6f07cb9805ae86385c9d7eaba67ba9216e6ad092f74ed38ccc77"
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The signal compatibility changes remain in existing userspace and frame members. Per-thread handler notification does not change the shared pending set visible to explicit consumers. Own-stack current-context lookup skips the unused legacy cell while retaining the scheduler-published owner as its sole authority. Frame writers publish the pre-handler userspace mask in the existing user signal-frame field; no new TCB member, capability, domain or authority is introduced."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Restorer-based sigreturn reads the fixed-width user mask through guarded, range-checked user access before committing register restoration. It uses the existing mask setter, which strips SIGKILL/SIGSTOP and retargets pending signals. A mask read fault follows the existing bad-frame SIGSEGV path. Existing register, address, privilege and FP-state validation remains unchanged; PKRS/TCF, capabilities and kernel mappings are not restored from user signal data."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The allocator portion of the performance sweep changes only physical allocator free-pool representation for complete kernel/UNMOVABLE order-1 blocks. It adds no TCB member, capability, mapping or domain-rights transition. Public allocation entry points retain their current cgroup admission/refund and NUMA selection; user/MOVABLE blocks do not enter the pair cache."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "A cached pair is exclusively owned by one IRQ-safe CPU/node cache until both page audit states and free-page accounting transfer it to one caller. Freeing publishes the complete aligned pair; bounded spills retain the CPU cache lock until buddy publication. Existing drain/hotplug bypass is rechecked under that same lock and drains base pages plus pairs before compaction/high-order retry, so no returned frame disappears between locations or becomes doubly allocatable. Cache moves do not change free-page totals, and block statistics attribute pairs to order 1. Capability checks, frame domain assignment and translation retirement remain at their existing owners."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -2057,4 +2073,5 @@ argument = "Virtio-rng entropy class (issue #1074). The frame/ diff is limited t
 
 [[invariants_preserved]]
 agent = "Muse Spark 1.3"
+ref = "security-model/specification/spec.md#L39"
 argument = "The #1057 composition change adds no TCB member: frame/'s only edits are one line in the bare_main composition enumeration (narf_drivers_watchdog::register_initcalls(), alongside the existing driver-crate calls), one path-dependency edge in frame/Cargo.toml (+ the matching Cargo.lock edge, purely additive), and one best-effort boot-time parse_wddt call beside the ECDT/GPE parses. narf-drivers-watchdog is a drivers/ crate, outside the TCB set this invariant fixes; frame's role stays 'enumerate the crates once + run every stage in order', and the set {frame/, memory/ domain manager, capabilities/ table code, scheduler/ executor core} is unchanged. parse_wddt only fills the WDDT_DATA cache from the already-validated RSDP chain; it creates no mapping, capability, or domain transition, and a missing table leaves wddt_info() empty so the watchdog probe reports NotPresent. The watchdog driver itself performs x86 I/O-port reads/writes only within the WDDT-provided TCO block, its probe writes no registers, and it never touches NO_REBOOT, SMI routing, or the SMBus message registers."
