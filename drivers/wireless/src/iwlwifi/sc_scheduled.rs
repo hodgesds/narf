@@ -63,6 +63,10 @@ pub(super) struct Publication {
     results: Option<Vec<(BssInfo, Vec<u8>)>>,
 }
 impl Publication {
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn epoch_for_test(&self) -> u64 {
+        self.epoch
+    }
     pub(super) fn publish(self) {
         let _ = self.generation.publish(self.epoch, || {
             self.source.invoke(|| {
@@ -294,6 +298,18 @@ impl Device {
         });
         state.needs_reset = false;
         Ok(())
+    }
+
+    /// Forced transport retirement must close copied passive results too:
+    /// their firmware/caller grants can remain current after the scanner is
+    /// stopped. Cancellation and the private gate precede dropping ownership.
+    pub(super) fn abandon_scheduled(&self, state: &mut State) {
+        if let Some(owner) = state.scheduled.take() {
+            owner.cancel.store(true, Ordering::Release);
+            // A live START reserved its retirement before publication. Even
+            // exhaustion cannot reopen a copy because cancellation is sticky.
+            let _ = self.scan_generation.retire();
+        }
     }
 
     /// RF authority may have vanished. Stopping does not need permission

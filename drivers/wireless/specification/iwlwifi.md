@@ -3586,6 +3586,25 @@ extend the accepted Sc/API77 results to API89/Bz by analogy. No production
 periodic runtime changes are included. Linux MVM's API89 path remains
 idle-only; associated MLD periodic coexistence is separate remaining work.
 
+### 3.60 Forced transport retirement of periodic publications
+
+The native forced-stop owner cancels a live periodic request and retires its
+private publication epoch before dropping the scheduled owner. A passive
+result has no transmit-policy fence; stopping the transport alone does not
+prove that its retained caller, executable or PCI capability was revoked.
+The same cancellation/gate rule therefore closes already copied results
+even while those actual grants remain current. Natural UID completion keeps
+its separate terminal-publication path; an inactive forced stop does not
+advance the private epoch again. The existing bounded DMA/reset/BME attempt
+and uncertain-allocation ownership remain unchanged.
+
+One native regression holds an actual passive RFH result before shared
+cache insertion, runs the forced transport stop, and verifies retained
+rings/closed capture. It invokes the actual source and caller again to
+exclude a revoked-grant false positive, checks the copy's real private
+epoch is retired, then proves no source callback/cache insertion or GET_SCAN
+target survives the late publication. Execution remains pending.
+
 ## 4. References
 
 - Linux `drivers/net/wireless/intel/iwlwifi/`

@@ -821,5 +821,90 @@ kernel_test_in!(
     smoke_sc_scheduled_cache_callback_is_linearized_with_native_uid_retirement
 );
 
+fn smoke_sc_scheduled_forced_transport_stop_retires_held_passive_publication() -> TestResult {
+    check(|| {
+        let control = Control::new(configured(false))?;
+        control.start()?;
+        let target = [2, 0x7a, 2, 3, 4, 6];
+        let held = copied_result(&control, target)?;
+        require(held.len() == 1, "forced-stop actual passive copy absent")?;
+        let epoch = held[0].epoch_for_test();
+        let before = dispatch(&control, 32, 0x7f01)?;
+        require(
+            !before.iter().any(|r| r.windows(6).any(|v| v == target)),
+            "forced-stop target was cached before its held publication",
+        )?;
+        require(
+            control.device().source.invoke(|| Ok(())).is_ok(),
+            "forced-stop fixture executable/PCI grant already absent",
+        )?;
+        run(
+            async {
+                let mut state = control.device().state.lock().await;
+                control.device().stop_locked(&mut state).await;
+            },
+            service,
+        )?;
+        let stopped = control.device().state.try_lock().is_some_and(|state| {
+            state.stop_completed
+                && state.scheduled.is_none()
+                && state.hardware.is_failed()
+                && state.hardware.receive_capture_epoch().is_none()
+                && state.hardware.receive_queue_count() == 1
+        });
+        require(
+            stopped,
+            "forced transport stop did not retain rings and close capture",
+        )?;
+        // Prove non-vacuity with actual invokes, not an inference from the
+        // failed flag. The same source/admin/up/generation is still current;
+        // private retirement must independently reject this old copied result.
+        require(
+            control.device().source.invoke(|| Ok(())).is_ok(),
+            "forced-stop fixture lost actual source grant and masked epoch test",
+        )?;
+        let authority = control.authority()?;
+        authority
+            .check_for(control.device().as_ref())
+            .map_err(|_| "forced-stop actual caller no longer current")?;
+        authority
+            .require_link()
+            .map_err(|_| "forced-stop actual administrative UP changed")?;
+        drop(authority);
+        require(
+            control
+                .device()
+                .scan_generation
+                .publish(epoch, || Ok(()))
+                .is_err(),
+            "forced transport stop left old private scan epoch current",
+        )?;
+        let weak = Arc::downgrade(control.device());
+        let audit = Arc::new(super::super::super::scheduled_epoch::Audit::new(
+            control.device().scan_generation.clone(),
+            move || weak.upgrade().is_some_and(|d| d.state.try_lock().is_some()),
+        ));
+        *control.source.2.lock() = Some(audit.clone());
+        let calls = audit.calls();
+        for publication in held {
+            publication.publish();
+        }
+        *control.source.2.lock() = None;
+        require(
+            audit.calls() == calls,
+            "forced-stop stale copy reentered shared source/cache",
+        )?;
+        let after = dispatch(&control, 32, 0x7f02)?;
+        require(
+            !after.iter().any(|r| r.windows(6).any(|v| v == target)),
+            "forced-stop stale passive result reached actual GET_SCAN cache",
+        )
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/sc/scheduled",
+    smoke_sc_scheduled_forced_transport_stop_retires_held_passive_publication
+);
+
 #[path = "scheduled_profile_tests.rs"]
 mod native_profiles;

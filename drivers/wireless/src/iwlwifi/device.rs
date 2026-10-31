@@ -342,7 +342,7 @@ impl Device {
         state.needs_reset = true;
         state.stop_completed = false;
         state.connection = None;
-        state.scheduled = None;
+        self.abandon_scheduled(state);
         state.clear_transmit();
         state.eapol.clear();
         // RAM fixture: no PCI function or embedded CPU to restart.
@@ -588,7 +588,7 @@ impl Device {
         self.set_link(false);
         self.retire_receive_ipc(state);
         state.needs_reset = true;
-        state.scheduled = None;
+        self.abandon_scheduled(state);
         state.clear_transmit();
         state.eapol.clear();
         if let Some(connection) = state.connection.as_mut() {
