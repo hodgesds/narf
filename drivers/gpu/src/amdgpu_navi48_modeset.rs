@@ -1165,6 +1165,7 @@ type PinnedSearch = (
     bool,
     Vec<dml::Mode>,
     [Option<crate::amdgpu_freesync::Drr>; 4],
+    u8,
 );
 static PINNED_SEARCH: narf_lib::sync::IrqSafeSpinLock<Option<PinnedSearch>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
@@ -4769,10 +4770,57 @@ impl ColdBoot {
             .await?;
         Ok(())
     }
+    /// Whether frame extension is covered by the current native P-state
+    /// plan. Check the live owner as well as the retained modeset: a failed
+    /// or cancelled transaction never authorizes a timing write.
+    pub(super) fn native_refresh_pstate(&self, pipe: u8) -> bool {
+        if self.fams2_active || self.fams2_pending || self.teardowns.check_idle().is_err() {
+            return false;
+        }
+        let mut running = self.modesets.0.iter().flatten();
+        let Some(m) = running.next() else {
+            return false;
+        };
+        m.pipe == pipe
+            && running.next().is_none()
+            && self.display_status(pipe).is_ok_and(|s| {
+                s.is_some_and(|s| {
+                    s.state == otg::State::ScanoutRunning(pipe)
+                        && s.scanout.is_some_and(|a| a.plan == m.plan)
+                        && s.drr.is_some_and(|a| m.plan.native_refresh_pstate(a.drr))
+                })
+            })
+    }
+    pub(super) fn refresh_pstate(&self, pipe: u8) -> bool {
+        if !self.fams2_active {
+            return self.native_refresh_pstate(pipe);
+        }
+        if self.fams2_pending || self.teardowns.check_idle().is_err() {
+            return false;
+        }
+        let Some(m) = self
+            .modesets
+            .0
+            .get(usize::from(pipe))
+            .and_then(Option::as_ref)
+        else {
+            return false;
+        };
+        self.display_status(pipe).is_ok_and(|s| {
+            s.is_some_and(|s| {
+                s.state == otg::State::ScanoutRunning(pipe)
+                    && s.scanout.is_some_and(|a| a.plan == m.plan)
+                    && s.drr.is_some_and(|a| {
+                        a.firmware_owned() && m.plan.firmware_refresh_pstate(a.drr)
+                    })
+            })
+        })
+    }
     /// DML21's UCLK P-state answer for the running configuration, when it
     /// is one this port switches UCLK under: every display scanning out,
     /// with live DRR limits, their plans one admitted configuration on the
-    /// current board inputs. Native LFC/MID retains its pinned policy.
+    /// current board inputs. LFC/MID can use a single native DRR stream;
+    /// a firmware or multi-stream timing schedule stays pinned.
     fn running_pstate(
         &mut self,
         running: &[Modeset],
@@ -4782,13 +4830,21 @@ impl ColdBoot {
             return Ok(None);
         };
         let mut live_drr = [None; 4];
+        let mut local_refresh = 0u8;
         for m in running {
             match self.display_status(m.pipe) {
-                Ok(Some(st))
-                    if st.state == otg::State::ScanoutRunning(m.pipe)
-                        && st.drr.is_none_or(|a| !a.lfc_enabled() && a.mid.is_none()) =>
-                {
+                Ok(Some(st)) if st.state == otg::State::ScanoutRunning(m.pipe) => {
+                    if st
+                        .drr
+                        .is_some_and(|a| a.mid.is_some() && !a.firmware_owned())
+                        && running.len() > 1
+                    {
+                        return Ok(None);
+                    }
                     live_drr[usize::from(m.plan.stream)] = st.drr.map(|a| a.drr);
+                    if st.drr.is_some_and(|a| a.lfc_enabled() || a.mid.is_some()) {
+                        local_refresh |= 1 << m.plan.stream;
+                    }
                 }
                 _ => return Ok(None),
             }
@@ -4821,17 +4877,34 @@ impl ColdBoot {
         let Ok(uclk) = dml::pstate::UclkLevels::new(&khz) else {
             return Ok(None);
         };
-        let fams2 = self.display_fams2();
+        let native_mid = running.iter().any(|m| {
+            self.display_status(m.pipe).is_ok_and(|s| {
+                s.is_some_and(|s| {
+                    s.drr
+                        .is_some_and(|a| a.mid.is_some() && !a.firmware_owned())
+                })
+            })
+        });
+        let fams2 = self.display_fams2() && !native_mid;
         // Every monitor pass asks again: answer a configuration already
         // running its P-state plans, or already found pinned, from memory.
-        let key = (first.plan.soc, uclk, fams2, modes, live_drr);
+        let key = (first.plan.soc, uclk, fams2, modes, live_drr, local_refresh);
         if PINNED_SEARCH.lock().as_ref() == Some(&key) {
             return Ok(None);
         }
-        let (soc, uclk, fams2, modes, live_drr) = &key;
+        let (soc, uclk, fams2, modes, live_drr, local_refresh) = &key;
         match dml::pstate::admit_with_drr(soc, uclk, modes, *fams2, *live_drr) {
             Ok(dml::pstate::Pstate::Supported(s))
-                if running
+                if s.plans.iter().all(|p| {
+                    local_refresh & (1 << p.stream) == 0
+                        || live_drr[usize::from(p.stream)].is_some_and(|d| {
+                            if s.fams2_required {
+                                p.firmware_refresh_pstate(d)
+                            } else {
+                                p.native_refresh_pstate(d)
+                            }
+                        })
+                }) && running
                     .iter()
                     .all(|m| keeps_pipes(m, &s.plans[usize::from(m.plan.stream)])) =>
             {

@@ -80,8 +80,7 @@ pub enum Error {
     /// ODM split cannot divide as ValidateODMMode requires.
     Unsupported,
     /// The clock tables cannot supply DML's fabric/DCF state for this UCLK,
-    /// or the configuration's SDP bandwidth would make DPMM raise DCFCLK or
-    /// FCLK above that state, which this port does not plan at.
+    /// or DPMM's bandwidth floors exceed the board's DCFCLK/FCLK maxima.
     ClockState,
     /// The pixel rate needs more DISPCLK/DPPCLK than the board provides.
     PixelClock,
@@ -2691,28 +2690,33 @@ fn clock_state(soc: &Soc) -> Result<(u64, u64, u64), Error> {
     Ok((dcfclk, fclk, bw_kbps))
 }
 
-/// dml2_dpmm_dcn4's calculate_system_active_minimums and
-/// calculate_svp_prefetch_minimums: DPMM raises DCFCLK and FCLK above the
-/// pinned UCLK's state (`clock_state`) when the mode-support average or
-/// urgent SDP bandwidth, in whole kB/s over the 64-byte return path and
-/// derated, needs more. Every value this port plans is computed at that
-/// state, so a configuration that raises it is not planned here.
-fn bandwidth_raises_clocks(e: &Evaluation, read: Fx, dcfclk_khz: u64, fclk_khz: u64) -> bool {
-    // math_ceil2(bandwidth * 1000, 1).
+/// DPMM's active/prefetch SDP floors for the pinned-UCLK policy. Mode
+/// support uses the latency table; programming uses the actual raised clocks.
+fn bandwidth_clocks(e: &Evaluation, read: Fx, ctx: Ctx, soc: &Soc) -> Result<Ctx, Error> {
     let kbps = |bw: Fx| bw.times(fx(1000)).ceil().max(0) as u128;
     let (urgent, average) = (kbps(e.urgent_sdp), kbps(read));
-    // round_up(bw / 64 / (derate / 100)) > state, for a whole-kHz state.
-    let over = |bw: u128, derate: i64, state: u64| {
-        bw * 100 > u128::from(state) * RETURN_BUS_BYTES as u128 * derate as u128
+    let required = |i: usize, floor: u32| {
+        let clock =
+            |bw: u128, derate: i64| (bw * 100).div_ceil(RETURN_BUS_BYTES as u128 * derate as u128);
+        u128::from(floor)
+            .max(clock(urgent, URGENT_ACTIVE[i]))
+            .max(clock(average, AVERAGE_ACTIVE[i]))
+            .max(clock(urgent, URGENT_PREFETCH[i]))
+            .max(clock(average, AVERAGE_PREFETCH[i]))
     };
-    [(0, dcfclk_khz), (1, fclk_khz)]
-        .into_iter()
-        .any(|(i, state)| {
-            over(urgent, URGENT_ACTIVE[i], state)
-                || over(average, AVERAGE_ACTIVE[i], state)
-                || over(urgent, URGENT_PREFETCH[i], state)
-                || over(average, AVERAGE_PREFETCH[i], state)
-        })
+    let dcfclk = required(0, ctx.level.dcfclk_khz);
+    let fclk = required(1, ctx.level.fclk_khz);
+    if dcfclk > u128::from(soc.dcfclk_khz[1]) || fclk > u128::from(soc.fclk_khz[1]) {
+        return Err(Error::ClockState);
+    }
+    Ok(Ctx {
+        level: Level {
+            dcfclk_khz: dcfclk as u32,
+            fclk_khz: fclk as u32,
+            ..ctx.level
+        },
+        ..ctx
+    })
 }
 
 /// `add_margin_and_round_to_dfs_grainularity` for a rational kHz request
@@ -3074,7 +3078,8 @@ pub(crate) struct Level {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Ctx {
     pub level: Level,
-    /// The level's min-clock-table index.
+    /// The latency level's UCLK index during support; the actual active
+    /// UCLK's index during programming (zero for a fine-grained non-entry).
     pub index: usize,
     pub max_dram_bw_kbps: u64,
     /// The UCLK table's highest level and the min-clock table's lowest
@@ -3375,15 +3380,8 @@ fn plan_shapes(
     if support_only {
         return Ok(Vec::new());
     }
-    if bandwidth_raises_clocks(
-        &supported,
-        p.read,
-        u64::from(ctx.level.dcfclk_khz),
-        u64::from(ctx.level.fclk_khz),
-    ) {
-        return Err(Error::ClockState);
-    }
-    program(soc, modes, &shapes, &p, &ctx, &ov, None)
+    let programmed = bandwidth_clocks(&supported, p.read, ctx, soc)?;
+    program(soc, modes, &shapes, &p, &programmed, &ov, None)
 }
 
 /// dml2_pmo_dcn4_fams2 stutter candidate (no Z8 on DCN401): every
@@ -3396,9 +3394,9 @@ fn stutter_allowed(shapes: &[Shape]) -> bool {
     })
 }
 
-/// DPMM's display clocks and mode programming of `shapes` at `ctx` (DPMM
-/// left every fabric and memory clock at the latency state) with the final
-/// overrides `ov`; `pstate` is recorded in every plan.
+/// DPMM's display clocks and mode programming of `shapes` at the actual
+/// active clocks in `ctx`, with the final overrides `ov`; `pstate` is
+/// recorded in every plan.
 fn program(
     soc: &Soc,
     modes: &[Mode],
@@ -3739,6 +3737,26 @@ fn program(
 }
 
 impl Plan {
+    pub(crate) fn firmware_refresh_pstate(&self, drr: crate::amdgpu_freesync::Drr) -> bool {
+        self.pstate.is_some_and(|p| {
+            matches!(
+                p.method,
+                pstate::Method::FwVactiveDrr | pstate::Method::FwVblankDrr | pstate::Method::FwDrr
+            ) && p.drr.get(usize::from(self.stream)) == Some(&Some(drr))
+        })
+    }
+    /// A single native Vactive/Vblank stream may extend frames inside its
+    /// admitted DRR range without changing the blackout or fill window.
+    /// Firmware methods and synchronized multi-stream schedules need a new
+    /// timing owner before LFC or MID can change their frame lengths.
+    pub(crate) fn native_refresh_pstate(&self, drr: crate::amdgpu_freesync::Drr) -> bool {
+        self.stream == 0
+            && self.streams.iter().all(Option::is_none)
+            && self.pstate.is_some_and(|p| {
+                matches!(p.method, pstate::Method::Vactive | pstate::Method::Vblank)
+                    && p.drr[0] == Some(drr)
+            })
+    }
     /// The DLG of the stream's pipe `pipe` (0-based, in ODM segment order,
     /// left to right), or `None` past the stream's pipes.
     pub fn pipe_dlg(&self, pipe: u8) -> Option<Dlg> {

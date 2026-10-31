@@ -6273,14 +6273,17 @@ fn kick_lfc_service() {
                 {
                     continue;
                 }
-                enabled = true;
                 // SAFETY: OWNER retains the admitted scanout and excludes writers;
                 // only ScanoutRunning is serviced, never a cancelled transaction.
-                if let Err(e) = unsafe { boot.display_lfc_progress(m.pipe, reset) } {
-                    let _ = core::fmt::Write::write_fmt(
-                        &mut narf_console::Writer,
-                        format_args!("amdgpu: navi48 LFC frame service refused: {e:?}\n"),
-                    );
+                match unsafe { boot.display_lfc_progress(m.pipe, reset) }.await {
+                    Ok(()) => enabled = true,
+                    Err(crate::amdgpu_dcn401_otg::Error::Busy) => {}
+                    Err(e) => {
+                        let _ = core::fmt::Write::write_fmt(
+                            &mut narf_console::Writer,
+                            format_args!("amdgpu: navi48 LFC frame service refused: {e:?}\n"),
+                        );
+                    }
                 }
             }
             if !enabled {

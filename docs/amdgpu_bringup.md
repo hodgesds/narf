@@ -130,8 +130,12 @@ IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
   values and the selected preset replay on reset/resume. DCC P-state budgets
   include MRQ metadata rows; live VRR bounds join the search and its cache.
   Admitted FAMS2 schedules use acknowledged command chains and hardware locks
-  before relaxation. SubVP phantom/MALL, native LFC/MID and clocks raised
-  beyond the latency state retain the pinned fallback. Board-supported GFX_ULV
+  before relaxation. DPMM raises now program actual active clocks within
+  board limits; LFC/MID can retain switching on one native DRR stream or
+  admitted FAMS2 DRR streams through acknowledged MIN/MAX/MID requests. Real
+  flips and idle frame updates borrow the serialized firmware transport;
+  cancellation retains timing and scanout ownership. SubVP without phantom/MALL
+  ownership retains the pinned fallback. Board-supported GFX_ULV
   follows native GC proofs; DS_DCFCLK follows a checked DML deep-sleep floor.
   `amdgpu.rdna4_gfx_ulv=0` and `amdgpu.rdna4_dcf_sleep=0` skip those features.
   All of these RX 9000 transitions still need physical acceptance.

@@ -470,8 +470,10 @@ the existing DML plans with acknowledged watermark/clock admission and strict
 runtime floor replies. DCC plans now include metadata-row blackout bandwidth;
 VRR plans carry live limits, with FAMS2 scheduling for admitted multiple-stream
 configurations. Firmware chains and hardware locks must acknowledge before
-clock relaxation. SubVP phantom/MALL ownership, LFC/MID switching and DPMM
-clock raises beyond the planned state remain pinned. Board-supported GFX_ULV and DS_DCFCLK have separate
+clock relaxation. DPMM raises now program actual active clocks within board
+limits. Native LFC/MID can retain switching on one admitted native DRR stream;
+matching FAMS2 DRR methods also admit multiple streams through acknowledged
+firmware timing requests. SubVP still pins without phantom/MALL ownership. Board-supported GFX_ULV and DS_DCFCLK have separate
 native GC and display-floor admission; `amdgpu.rdna4_gfx_ulv=0` and
 `amdgpu.rdna4_dcf_sleep=0` disable them for comparison. These paths remain
 software-model tested until acceptance on Navi48 and Navi44.

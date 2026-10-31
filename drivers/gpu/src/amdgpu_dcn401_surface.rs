@@ -917,6 +917,18 @@ struct Surface {
 #[derive(Debug)]
 pub(in super::super) struct Surfaces([Option<Surface>; 4], alloc::vec::Vec<Surface>);
 impl Surfaces {
+    #[cfg(feature = "kernel-test")]
+    pub(in super::super) fn retained_buffers(
+        &self,
+        pipe: u8,
+    ) -> Option<(u64, Option<u64>, Option<u64>)> {
+        let s = self.0.get(usize::from(pipe))?.as_ref()?;
+        Some((
+            s.memory.address(),
+            s.back.as_ref().map(Reservation::address),
+            s.cursor.as_ref().map(Reservation::address),
+        ))
+    }
     pub(in super::super) fn new() -> Self {
         Self(core::array::from_fn(|_| None), alloc::vec::Vec::new())
     }

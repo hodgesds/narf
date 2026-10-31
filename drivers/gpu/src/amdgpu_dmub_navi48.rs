@@ -1485,10 +1485,17 @@ impl<I: Io> Engine<I> {
     }
 }
 
-/// optc401_set_drr -> dc_dmub_srv_fams2_drr_update. Native LFC/MID
-/// remains pinned, so this firmware request has no MID sequence.
-fn fams2_drr_command(otg: u8, drr: Option<crate::amdgpu_freesync::Drr>) -> Result<[u8; 64], Error> {
+/// optc401_set_drr -> dc_dmub_srv_fams2_drr_update, including MID.
+fn fams2_drr_command(
+    otg: u8,
+    drr: Option<crate::amdgpu_freesync::Drr>,
+    mid: Option<crate::amdgpu_dcn401_otg::DrrMid>,
+) -> Result<[u8; 64], Error> {
     if otg >= 4
+        || mid.is_some_and(|m| {
+            m.frames == 0
+                || drr.is_none_or(|d| m.v_total < d.v_total_min || m.v_total > d.v_total_max)
+        })
         || drr.is_some_and(|d| {
             d.v_total_min == 0 || d.v_total_min > d.v_total_max || d.v_total_max > 0x7fff
         })
@@ -1502,6 +1509,10 @@ fn fams2_drr_command(otg: u8, drr: Option<crate::amdgpu_freesync::Drr>) -> Resul
         command[8..12].copy_from_slice(&(d.v_total_max - 1).to_le_bytes());
         command[20] = 1;
     }
+    if let Some(m) = mid {
+        command[12..16].copy_from_slice(&(m.v_total - 1).to_le_bytes());
+        command[16..20].copy_from_slice(&u32::from(m.frames).to_le_bytes());
+    }
     command[21] = otg;
     Ok(command)
 }
@@ -1511,11 +1522,12 @@ impl Dmub {
         &mut self,
         otg: u8,
         drr: Option<crate::amdgpu_freesync::Drr>,
+        mid: Option<crate::amdgpu_dcn401_otg::DrrMid>,
     ) -> Result<(), Error> {
         if self.fams2() != Some(true) {
             return Err(Error::Unsupported);
         }
-        self.engine.send(fams2_drr_command(otg, drr)?).await
+        self.engine.send(fams2_drr_command(otg, drr, mid)?).await
     }
     /// Whether DC keeps FAMS2 enabled for this firmware (dcn401_init_hw's
     /// FAMS version check): `None` until QUERY_FEATURE_CAPS answered.

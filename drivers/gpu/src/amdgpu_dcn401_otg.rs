@@ -1002,6 +1002,12 @@ impl Layout {
     }
 }
 trait Io {
+    fn firmware_timing(&self) -> bool {
+        false
+    }
+    async fn drr_update(&mut self, _otg: u8, _timing: drr::DrrTiming) -> Result<(), Error> {
+        Err(Error::Busy)
+    }
     fn read(&mut self, at: u64) -> u32;
     fn write(&mut self, at: u64, value: u32);
     /// Source ownership is independent of this timing owner. Native code
@@ -1618,8 +1624,15 @@ impl<I: Io> Engine<I> {
         }
     }
 }
+#[path = "amdgpu_dcn401_firmware_timing.rs"]
+mod firmware_timing;
+
 #[derive(Debug)]
-pub struct Otg(Engine<Mmio>, fetch::Surfaces);
+pub struct Otg(
+    Engine<Mmio>,
+    fetch::Surfaces,
+    Option<firmware_timing::Spare>,
+);
 impl Otg {
     /// # Safety
     /// Retain permanent mappings and exclusive display/PM/reset ownership.
@@ -1638,6 +1651,7 @@ impl Otg {
                 displays: Displays::new(),
             },
             fetch::Surfaces::new(),
+            Some(firmware_timing::Spare::new()),
         ))
     }
     pub fn status(&self) -> Status {

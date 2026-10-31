@@ -5304,8 +5304,9 @@ mask the stream-owned bit. The DCN401 stream encoder's MSA is unchanged.
 
 DML21 admission is unchanged and evaluated at the nominal timing. DCN4's
 mode-support and programming calculations do not read `drr_config`; only
-the PMO's UCLK p-state strategies (FAMS2/DRR) do, and this owner disables
-memory clock switching so those strategies are never searched. DRR only
+the PMO's UCLK p-state strategies (FAMS2/DRR) do. Changing the base range
+first pins UCLK and retires any firmware schedule, then the runtime search
+may admit switching against the new live range. DRR only
 lengthens the vertical blank (`v_total_min` is at least the mode's total)
 at the same line time, so every per-line, prefetch, DET and watermark bound
 admitted at the nominal timing still holds, and the stutter budget (taken
@@ -5341,7 +5342,11 @@ apply_below_the_range's multiplier choice and 2000us drift preference;
 `Lfc::vupdate` fixes MIN=MAX for the inserted duration on the first
 observed update and restores the configured variable range at count zero.
 DP floors and HDMI ceilings duration-to-total, clamped to nominal timing.
-DML admission remains at nominal timing, and UCLK must stay pinned.
+DML admission remains at nominal timing. UCLK may switch under a single
+native Vactive/Vblank DRR plan bound to that range: BTR and MID only extend
+the nominal blank, leaving its blackout/fill window intact. Matching FAMS2
+DRR plans can also retain switching, including multiple streams; their
+requested BTR/MID totals go through firmware under the hardware lock.
 
 `unsafe async Otg::set_lfc` / `ColdBoot::set_display_lfc` attach that state to
 the matching ScanoutRunning timing and configured DRR range. The platform
@@ -5359,7 +5364,12 @@ fetch ownership retained. A cancelled transaction stays quarantined;
 `lfc_progress`'s public idle entry accepts only ScanoutRunning. No address,
 surface lease or nominal DML plan is changed by repeating the retained
 surface. Disabling DRR, stopping scanout and recovery remove BTR state and
-restore fixed timing before releasing timing/fetch ownership. This
+restore fixed timing before releasing timing/fetch ownership. Firmware timing
+must first be disabled with clocks pinned. The top-level health check probes underflow read-only and, when observed,
+first pins clocks and acknowledges firmware disable before the native drain
+and return to black. Refused retirement, or a low-level recovery while
+firmware still owns timing, fails closed with the scanout retained for device
+recovery; native recovery cannot overwrite firmware-owned timing. This
 service uses the real FRAME_COUNT witness after notification; precise
 physical cadence and interrupt delivery still require hardware acceptance.
 
@@ -5419,6 +5429,15 @@ Removing MID or DRR clears its selectors/count; fixed teardown also
 clears owned MID storage. The current primary FreeSync BTR module has no
 MID producer: native BTR follows its MIN/MAX sequence, while MID remains
 an explicit finite timing operation with its own owner.
+
+`ColdBoot::display_lfc_progress` and `set_display_drr_mid` are async so they
+can await strict firmware locking and timing replies. The low-level Otg
+LFC/progress/MID and flip/color/HDR entry points accept an optional mutable
+DMUB borrower: Some requires its acknowledged firmware HW lock for the
+whole operation, None excludes firmware timing. Flip entry points group
+the mutable clock/DCCG/GMC owners as one tuple. No IRQ-safe lock spans these
+awaits. Firmware flip offload remains disabled; native code still owns
+address publication, fences, buffer retention and completion.
 
 Native tests replay
 1286 DP/HDMI steps and exercise frame wrap, repeat timing, missed/uncertain
@@ -6562,7 +6581,7 @@ the SVP-prefetch ones, idle minimums from the idle average derates, UCLK
 rounded up to its DPM table, FCLK/DCFCLK fine-grained, FCLK P-state from the
 planes' vactive hiding (clamped to the FCLK maximum when unsupported).
 
-`Pstate::Supported` carries each stream's plan at the chosen latency level
+`Pstate::Supported` carries each stream's plan at DPMM's actual active clocks
 (`Plan::pstate: Some(PlanPstate)` records the table, `fams2` and the
 stream's `pstate::Method`; `Plan::readmits` repeats this search), the
 methods, the level, the active and idle `MinClocks`, FCLK P-state support and
@@ -6575,12 +6594,24 @@ vactive; multiple active VRR streams require a schedulable firmware variant.
 DRR stretches must fit the sink's maximum total and PMO's refresh bounds.
 DCC uses the native mcache split/placement and adds MRQ metadata rows to the
 blackout fetch bytes before calculating excess-fill bandwidth. Native
-LFC/BTR or finite MID sequences keep clocks pinned. SubVP remains unavailable
-without phantom-pipe/MALL ownership: fixed-refresh search reports
-`Pinned::Firmware`, while DRR search skips those unavailable candidates.
-`Pinned::Unsupported` records no valid strategy; `Pinned::Port` still covers
-DPMM clocks above the latency state. Native admission (`admit_native`) never
-carries a P-state record.
+LFC/BTR or finite MID sequences may switch on one admitted native
+Vactive/Vblank DRR stream, or a matching firmware DRR method on any admitted
+stream. The applied range, live/retained plan and idle transaction owner must
+agree; native methods additionally require the sole retained modeset. The
+runtime pinned cache records the per-stream LFC/MID mask, so a refused
+firmware schedule cannot hide a later native admission: a multi-stream result must give every locally adjusted stream a
+firmware DRR method, or it remains pinned.
+SubVP remains unavailable without phantom-pipe/MALL ownership: fixed-refresh
+search reports `Pinned::Firmware`, while DRR search skips those unavailable
+candidates. `Pinned::Unsupported` records no valid strategy.
+
+Support and candidate selection retain the latency-table clocks. Programming
+then uses DPMM's raised active UCLK/FCLK/DCFCLK, its actual DRAM bandwidth and
+actual UCLK QoS index (zero for a fine-grained clock outside the table).
+Clock floors above the board maxima are refused. Native pinned-UCLK admission
+likewise raises its programmed DCFCLK/FCLK for active/prefetch SDP bandwidth
+within those maxima. No `Pinned::Port` fallback remains for bounded raises.
+Native admission (`admit_native`) never carries a P-state record.
 
 `pstate_strategies.txt` holds PMO's
 expanded lists (`dcn401_pstate_strategy_lists_match_linux`).
@@ -6609,15 +6640,20 @@ consumption until the final multi_cmd_pending bit clears. Pointer progress,
 reply headers, timeout, revocation and cancellation are checked. FAMS 2.1 is
 required for chains. The global constants follow the DCN401 IP caps; native
 flips remain driver-controlled (firmware flip offload is disabled).
-Before the config, FAMS2_DRR_UPDATE supplies the live minus-one totals for
-each stream. Enable and subsequent disable require acknowledged HW lock,
+Before the config, FAMS2_DRR_UPDATE supplies the live requested minus-one
+MIN/MAX and optional MID/frame count for each stream. Enable and subsequent disable require acknowledged HW lock,
 config and release; any interrupted operation retains a pending display owner
-and cannot publish relaxed clocks. Disable restores the retained native DRR
-registers before releasing the lock. Flips, colour/HDR and async cursor writes
+and cannot publish relaxed clocks. Disable first clears any finite firmware MID sequence through an acknowledged
+timing request, then restores native DRR registers before releasing the lock.
+A running native MID sequence keeps native policy until explicitly cleared;
+its unknown remaining count is never replayed across a firmware handoff. Flips, colour/HDR and async cursor writes
 acquire the firmware hardware lock while scheduling is active. The console
 pointer callback defers such cursor writes to a generation-bound async task
 without waiting in the callback; superseded requests are skipped.
-Refresh/LFC changes first pin and disable the old schedule. Unadmitted
+Base refresh-range changes first pin and disable the old schedule. LFC/MID
+changes retain switching on a matching single native DRR plan or firmware
+DRR plan. The latter use acknowledged FAMS2_DRR_UPDATE commands rather than
+native MIN/MAX/MID writes. Unadmitted
 configurations call `pin_display_uclk`: raise UCLK/FCLK to their maxima with
 switching disallowed, then disable FAMS2. Every configuration-change
 entry point pins in prepare_bandwidth's position, before its first clock,
@@ -6654,7 +6690,38 @@ test the bandwidth sequence, the watermark table and the FAMS2 commands, and
 `pin_uclk` over a real clock owner from the fresh states
 `retire_inherited_display`, the first modeset and a relight after resume
 start from.
+The scanout-chain suite also exercises native DRR P-state plans with LFC,
+actual flips, source retirement and finite MID sequences; foreign ranges,
+firmware methods and multi-stream records cannot authorize native timing
+changes. A firmware timing borrower is used by flips, color/HDR, LFC updates
+and MID sequences, with the same engine and retained surfaces. Preallocated
+spare status/display boxes allow a scoped transport loan without per-flip
+allocation; Drop restores the actual boxes even on cancellation. Every DMUB
+borrower must match the display mapping, with current capabilities checked
+before/after the submitted timing request. Source verification compares the
+acknowledged request, since firmware may clamp MIN/MAX/control/MID; all other
+source fields remain checked. Requests complete before address publication
+and after every real frame sampled by latch waits. Idle service samples the
+read-only frame counter before requesting the firmware lock, so timer wakes
+without a new frame submit nothing. Missing replies retain UpdatingStream or
+Flipping, failures retain Failed, and no independent retirement is inferred.
+Disable acknowledges MID clear before the config, then restores requested
+native MIN/MAX and control with MID disabled under lock. Changing timing
+owners cannot restart a finite MID sequence.
+Owner tests cover real flips with firmware-clamped registers, typed MID wire
+bytes, missing/failed timing replies before address writes, cancelled idle
+updates, native restoration, and refusal to retire firmware timing. Raised-clock
+regressions cover board maxima and forged old floors.
 Hardware switching under a lit display is unvalidated.
+
+SubVP follow-up must expand main/phantom timing and planes in DML (including
+phantom DLG/TTU, zero DET and separate mcache IDs), reserve spare unfused
+pipes/OTGs and MALL capacity, program phantom fetch and timing without an
+external link, and retire those owners before reuse. The DMUB SubVP static
+state and saved surface addresses must follow the same owner through flips,
+cancellation, modeset, suspend and reset. Existing normal requestor setup
+explicitly disables MALL and is not a phantom setup path. Merely allowing
+FAMS2 stream type 4 would not establish these prerequisites.
 
 **No display left.** `converge_uclk_pstate` with no display and no
 teardown in flight runs `ColdBoot::release_display_bandwidth` once: Linux
@@ -7777,7 +7844,9 @@ alone; `global` carries DC's static feature overrides, which the caller
 applies: dcn401's debug defaults turn stall recovery and offload flip on and
 debug off). The native runtime deliberately leaves flip offload disabled.
 `Dmub::fams2_update_config` posts at most nine slots in one bounded chain;
-`fams2_drr_update` supplies the admitted minus-one native totals (no MID).
+`fams2_drr_update` supplies the requested minus-one MIN/MAX, optional MID and
+nonzero 8-bit frame count. The wire carries that count as u32; invalid or
+foreign totals and MID without a DRR range are refused before submission.
 Only FAMS 2.1 admits the enabled chain. A missing inbox0 acknowledgement
 permanently closes strict FAMS2 lock admission on that owner, so a late ACK
 cannot prove a later lock; optional disabled-config traffic stays usable. A timed-out or cancelled chain remains

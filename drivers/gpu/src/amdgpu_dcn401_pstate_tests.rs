@@ -225,7 +225,6 @@ fn check_line(line: &str) -> Result<bool, &'static str> {
     match got {
         Pstate::Pinned(Pinned::Firmware(_)) if !supported || firmware || svp_first => Ok(false),
         Pstate::Pinned(Pinned::Unsupported) if !supported => Ok(true),
-        Pstate::Pinned(Pinned::Port) => Ok(false),
         Pstate::Supported(s) => {
             if !supported || firmware {
                 return Err(report(line, "port supported"));
@@ -565,6 +564,7 @@ fn dcn401_pstate_vrr_limits_are_admitted_and_bound_to_the_plan() -> TestResult {
     assert_eq!(s.methods[..2], [Method::FwVactiveDrr; 2]);
     assert!(s.fams2_required);
     assert!(s.plans.iter().all(Plan::readmits));
+    assert!(s.plans.iter().all(|p| p.firmware_refresh_pstate(limits)));
     let invalid = crate::amdgpu_freesync::Drr {
         v_total_min: 1124,
         ..limits
@@ -604,4 +604,85 @@ fn dcn401_pstate_dcc_blackout_includes_metadata_rows() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-pstate",
     dcn401_pstate_dcc_blackout_includes_metadata_rows
+);
+
+fn dcn401_pstate_programs_active_clocks_after_latency_selection() -> TestResult {
+    let mut raised = 0;
+    for line in VECTORS
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+    {
+        let mut words = line.split_whitespace();
+        let input = inputs(&mut words).unwrap();
+        let Ok(Pstate::Supported(s)) = admit(&input.soc, &input.uclk, &input.modes, input.fams2)
+        else {
+            continue;
+        };
+        let latency = min_clock_table(&input.soc, &input.uclk)[usize::from(s.level)];
+        if s.active.uclk_khz == latency.uclk_khz
+            && s.active.fclk_khz == latency.fclk_khz
+            && s.active.dcfclk_khz == latency.dcfclk_khz
+        {
+            continue;
+        }
+        raised += 1;
+        for plan in &s.plans {
+            assert_eq!(plan.clocks.uclk_khz, s.active.uclk_khz);
+            assert_eq!(plan.clocks.fclk_khz, s.active.fclk_khz);
+            assert_eq!(plan.clocks.dcfclk_khz, s.active.dcfclk_khz);
+            assert!(plan.readmits());
+        }
+    }
+    assert!(raised > 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-pstate",
+    dcn401_pstate_programs_active_clocks_after_latency_selection
+);
+
+fn dcn401_pstate_replans_bandwidth_raises_before_programming() -> TestResult {
+    let (soc, uclk) = board();
+    let mut mode = timing([1_075_000, 3840, 4000, 48, 32, 2160, 3240, 3, 5]);
+    mode.pitch = 11_520;
+    mode.bytes_per_pixel = 8;
+    mode.planes[0] = Some(Plane {
+        surface_width: 11_520,
+        surface_height: 6480,
+        pitch: 11_520,
+        bytes_per_pixel: 8,
+        viewport_width: 11_520,
+        viewport_height: 6480,
+        h_ratio: 1_572_864,
+        v_ratio: 1_572_864,
+        h_taps: 4,
+        v_taps: 4,
+        ..Plane::default()
+    });
+    let Ok(Pstate::Supported(s)) = admit(&soc, &uclk, &[mode], false) else {
+        return TestResult::Fail("MPC bandwidth raise not admitted");
+    };
+    let latency = min_clock_table(&soc, &uclk)[usize::from(s.level)];
+    if s.active.dcfclk_khz == latency.dcfclk_khz
+        && s.active.uclk_khz == latency.uclk_khz
+        && (!s.fclk_pstate || s.active.fclk_khz == latency.fclk_khz)
+    {
+        return TestResult::Fail("MPC bandwidth did not raise a DPMM floor");
+    }
+    assert!(s.active.dcfclk_khz <= soc.dcfclk_khz[1]);
+    assert!(s.active.fclk_khz <= soc.fclk_khz[1]);
+    assert_eq!(s.plans[0].clocks.dcfclk_khz, s.active.dcfclk_khz);
+    assert_eq!(s.plans[0].clocks.fclk_khz, s.active.fclk_khz);
+    assert_eq!(s.plans[0].clocks.uclk_khz, s.active.uclk_khz);
+    assert!(s.plans[0].readmits());
+    let mut forged = s.plans[0];
+    forged.clocks.dcfclk_khz = latency.dcfclk_khz;
+    forged.clocks.fclk_khz = latency.fclk_khz;
+    forged.clocks.uclk_khz = latency.uclk_khz;
+    assert!(!forged.readmits());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-pstate",
+    dcn401_pstate_replans_bandwidth_raises_before_programming
 );

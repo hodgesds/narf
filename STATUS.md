@@ -2016,9 +2016,15 @@ join planning and readmission caches, with FAMS2 schedules for admitted
 multistream configurations. Chained DMUB commands publish once; acknowledged
 hardware locks cover schedule changes, flips, cursor and colour/HDR updates.
 Native DRR limits restore when scheduling stops, before the hardware lock is
-released. SubVP needs a phantom-pipe/MALL owner; native LFC/MID and DPMM clock
-raises outside the latency state still use pinned clocks. Hardware acceptance
-remains pending on Navi48 and Navi44.
+released. DPMM bandwidth raises now program actual active clocks and the
+corresponding UCLK QoS index within board limits. Native LFC/MID can retain
+switching on one native Vactive/Vblank DRR stream, and matching FAMS2 DRR
+methods admit firmware timing on multiple streams. Requested BTR/MID totals
+use acknowledged DMUB updates under HW lock, including during real flips;
+firmware-clamped registers are distinguished from the accepted request.
+Cancellation retains timing, IRQ sources and scanout storage. SubVP still needs phantom-pipe/MALL ownership; its DML,
+requestor, cache-ID, timing and retirement prerequisites are recorded in the
+GPU spec. Hardware acceptance remains pending on Navi48 and Navi44.
 
 Navi22 third-review fixes (software-model tested only): DRM ioctl user copies
 apply `access_ok` and fault-guarded copies (EFAULT); NVMe/AHCI bring-up

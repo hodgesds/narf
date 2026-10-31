@@ -1,12 +1,13 @@
 //! Native DCN401 dynamic refresh (DRR) on a live scanout's timing generator.
-//! Linux: dcn10_set_drr -> optc401_set_drr (the non-FAMS branch, since this
-//! owner excludes DMUB FAMS) -> optc1_set_vtotal_min_max and
+//! Linux: dcn10_set_drr -> optc401_set_drr. Native ownership uses
+//! optc1_set_vtotal_min_max and
 //! optc401_setup_manual_trigger, then optc1_set_static_screen_control with
 //! the TRIGA event; flips fire optc2_program_manual_trigger after the
 //! address update is unlocked (commit_planes_for_stream), so a stretched
 //! vertical blank ends at the flip. BTR follows real observed frame updates;
 //! MID has its own retained, bounded hardware sequence. FreeSync SPD has a
-//! retained publication owner.
+//! retained publication owner. Under acknowledged FAMS2 ownership, timing
+//! requests go through DMUB; live firmware-clamped totals are not native proofs.
 use super::*;
 
 const V_TOTAL_MAX: u64 = 0x1b31;
@@ -41,6 +42,16 @@ pub struct DrrApplied {
     pub adjust: crate::amdgpu_freesync::Drr,
     pub mid: Option<DrrMid>,
     lfc: Option<LfcRuntime>,
+    firmware: bool,
+    acknowledged: Option<DrrTiming>,
+}
+
+/// Desired timing submitted to firmware; an acknowledged request is distinct
+/// from registers which firmware may clamp while scheduling memory changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DrrTiming {
+    pub totals: crate::amdgpu_freesync::Drr,
+    pub mid: Option<DrrMid>,
 }
 
 /// DCN401's finite MID-for-MAX sequence. This is a hardware timing
@@ -59,6 +70,15 @@ struct LfcRuntime {
 }
 
 impl DrrApplied {
+    pub fn firmware_owned(self) -> bool {
+        self.firmware
+    }
+    pub(super) fn timing(self) -> DrrTiming {
+        DrrTiming {
+            totals: self.adjust,
+            mid: self.mid,
+        }
+    }
     pub fn lfc_enabled(self) -> bool {
         self.lfc.is_some()
     }
@@ -83,6 +103,8 @@ impl DrrApplied {
             adjust: drr,
             mid: None,
             lfc: None,
+            firmware: false,
+            acknowledged: None,
         }
     }
 }
@@ -114,6 +136,13 @@ impl<I: Io> Engine<I> {
         drr: Option<crate::amdgpu_freesync::Drr>,
     ) -> Result<Option<DrrApplied>, Error> {
         let timing = self.drr_timing(pipe)?;
+        if self
+            .status
+            .drr
+            .is_some_and(|a| a.firmware && drr != Some(a.drr))
+        {
+            return Err(Error::Busy);
+        }
         let Some(d) = drr else {
             return match self.drr_fixed(pipe) {
                 Ok(()) => Ok(None),
@@ -146,6 +175,8 @@ impl<I: Io> Engine<I> {
             adjust: d,
             mid: None,
             lfc: None,
+            firmware: false,
+            acknowledged: None,
         };
         // Recorded first: a partial failure still restores fixed refresh.
         self.status.drr = Some(applied);
@@ -218,6 +249,13 @@ impl<I: Io> Engine<I> {
     /// V_TOTAL_MAX/MIN equal to V_TOTAL again (Linux writes zero, unused
     /// once the selectors are clear) and the replaced static-screen control.
     pub(in crate::amdgpu_dcn401_otg) fn drr_fixed(&mut self, pipe: u8) -> Result<(), Error> {
+        if self
+            .status
+            .drr
+            .is_some_and(|a| a.pipe == pipe && a.firmware)
+        {
+            return Err(Error::Busy);
+        }
         self.freesync_off(pipe)?;
         let Some(a) = self.status.drr.filter(|a| a.pipe == pipe) else {
             return Ok(());
@@ -251,6 +289,11 @@ impl<I: Io> Engine<I> {
         self.drr_timing(pipe)?;
         let l = self.layout;
         let result = (|| {
+            self.update(
+                l.otg(pipe, V_TOTAL_MID),
+                0x7fff,
+                a.mid.map_or(0, |m| m.v_total - 1),
+            )?;
             self.update(l.otg(pipe, V_TOTAL_MAX), 0x7fff, a.adjust.v_total_max - 1)?;
             self.update(l.otg(pipe, V_MIN), 0x7fff, a.adjust.v_total_min - 1)?;
             self.update(l.otg(pipe, V_CONTROL), DRR_FIELDS, a.control())?;
@@ -275,7 +318,7 @@ impl<I: Io> Engine<I> {
         let changed = a.adjust != next;
         a.adjust = next;
         self.status.drr = Some(a);
-        if !changed {
+        if !changed || a.firmware {
             return Ok(());
         }
         let result = (|| {
@@ -292,6 +335,13 @@ impl<I: Io> Engine<I> {
         result
     }
     fn verify_drr_adjust(&mut self, a: DrrApplied) -> Result<(), Error> {
+        if a.firmware {
+            return if a.acknowledged == Some(a.timing()) {
+                Ok(())
+            } else {
+                Err(Error::Busy)
+            };
+        }
         for (reg, mask, expected) in [
             (V_MIN, 0x7fff, a.adjust.v_total_min - 1),
             (V_TOTAL_MAX, 0x7fff, a.adjust.v_total_max - 1),
@@ -305,7 +355,8 @@ impl<I: Io> Engine<I> {
         }
         self.verify_drr_mid(a.pipe)
     }
-    /// Start/stop BTR on an admitted, pinned variable-refresh stream.
+    /// Start/stop BTR on an admitted variable-refresh stream. The display
+    /// owner pins clocks or binds an admitted native/firmware DRR plan.
     /// Same configuration preserves render cadence and pending repeats.
     pub(in crate::amdgpu_dcn401_otg) fn set_lfc(
         &mut self,
@@ -328,6 +379,9 @@ impl<I: Io> Engine<I> {
         }
         if a.lfc.map(|r| r.math.config) == config {
             return Ok(());
+        }
+        if a.firmware && !self.io.firmware_timing() {
+            return Err(Error::Busy);
         }
         if let Err(e) = self.verify_drr_adjust(a) {
             self.status.state = State::Failed(e);
@@ -359,6 +413,9 @@ impl<I: Io> Engine<I> {
         else {
             return Ok(());
         };
+        if a.firmware && !self.io.firmware_timing() {
+            return Err(Error::Busy);
+        }
         let result = (|| {
             self.verify_drr_adjust(a)?;
             let mut runtime = a.lfc.unwrap();
@@ -400,6 +457,9 @@ impl<I: Io> Engine<I> {
         else {
             return Ok(());
         };
+        if a.firmware && !self.io.firmware_timing() {
+            return Err(Error::Busy);
+        }
         let result = (|| {
             self.verify_drr_adjust(a)?;
             let mut runtime = a.lfc.unwrap();
@@ -466,8 +526,14 @@ impl<I: Io> Engine<I> {
         if a.mid == mid {
             return Ok(());
         }
+        if a.firmware && !self.io.firmware_timing() {
+            return Err(Error::Busy);
+        }
         a.mid = mid;
         self.status.drr = Some(a);
+        if a.firmware {
+            return Ok(());
+        }
         let result = (|| {
             if let Some(m) = mid {
                 self.update(self.layout.otg(pipe, V_TOTAL_MID), 0x7fff, m.v_total - 1)?;
@@ -484,6 +550,9 @@ impl<I: Io> Engine<I> {
         result
     }
     pub(super) fn verify_drr_mid(&mut self, pipe: u8) -> Result<(), Error> {
+        if let Some(a) = self.status.drr.filter(|a| a.pipe == pipe && a.firmware) {
+            return self.verify_drr_adjust(a);
+        }
         if let Some(m) = self
             .status
             .drr
@@ -495,6 +564,84 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Readback(at));
             }
         }
+        Ok(())
+    }
+    pub(super) fn lfc_pending(&mut self, pipe: u8, lost: bool) -> Result<bool, Error> {
+        self.drr_timing(pipe)?;
+        let Some(runtime) = self
+            .status
+            .drr
+            .filter(|a| a.pipe == pipe)
+            .and_then(|a| a.lfc)
+        else {
+            return Ok(false);
+        };
+        match self.read(self.layout.otg(pipe, FRAME_COUNT)) {
+            Ok(frame) => Ok(lost || (frame & FRAME_MASK) != runtime.frame),
+            Err(e) => {
+                self.status.state = State::Failed(e);
+                Err(e)
+            }
+        }
+    }
+    pub(super) fn firmware_mid_cleared(&mut self, pipe: u8) -> Result<(), Error> {
+        self.drr_timing(pipe)?;
+        let Some(mut a) = self.status.drr.filter(|a| a.pipe == pipe && a.firmware) else {
+            return Err(Error::Busy);
+        };
+        a.mid = None;
+        a.acknowledged = Some(a.timing());
+        self.status.drr = Some(a);
+        Ok(())
+    }
+    pub(super) fn handoff_drr(&mut self, pipe: u8, enable: bool) -> Result<(), Error> {
+        self.drr_timing(pipe)?;
+        if let Some(mut a) = self.status.drr.filter(|a| a.pipe == pipe) {
+            // A finite hardware sequence cannot be replayed on a new owner:
+            // its remaining count is not observable from the command ACK.
+            if a.mid.is_some() && a.firmware != enable {
+                return Err(Error::Busy);
+            }
+            a.firmware = enable;
+            a.acknowledged = enable.then_some(a.timing());
+            self.status.drr = Some(a);
+            if !enable {
+                self.restore_drr(pipe)?;
+            }
+        }
+        Ok(())
+    }
+    pub(super) async fn flush_drr(&mut self, pipe: u8) -> Result<(), Error> {
+        let Some(mut a) = self.status.drr.filter(|a| a.pipe == pipe && a.firmware) else {
+            return Ok(());
+        };
+        let desired = a.timing();
+        if a.acknowledged == Some(desired) {
+            return Ok(());
+        }
+        if !self.io.firmware_timing() {
+            return Err(Error::Busy);
+        }
+        // Intent precedes publication; cancellation cannot manufacture an ACK.
+        let before = self.status.state;
+        if before == State::ScanoutRunning(pipe) {
+            self.status.state = State::UpdatingStream(pipe);
+        }
+        a.acknowledged = None;
+        self.status.drr = Some(a);
+        self.access(|_| Ok(()))?;
+        let result = self.io.drr_update(self.layout.inst(pipe), desired).await;
+        if let Err(e) = result {
+            self.status.state = State::Failed(e);
+            return Err(e);
+        }
+        if let Err(e) = self.access(|_| Ok(())) {
+            self.status.state = State::Failed(e);
+            return Err(e);
+        }
+        a.acknowledged = Some(desired);
+        self.status.drr = Some(a);
+        self.status.state = before;
         Ok(())
     }
     /// optc2_program_manual_trigger after a flip's address update was
@@ -534,15 +681,21 @@ impl<I: Io> Engine<I> {
 }
 
 impl Otg {
-    /// Restore native refresh limits after an acknowledged FAMS2 disable.
     /// # Safety
-    /// Firmware no longer schedules this timing; caller holds its HW lock
-    /// and pinned clocks, and retains the scanout owner.
-    pub(crate) unsafe fn restore_drr(&mut self, pipe: u8) -> Result<(), Error> {
+    /// The caller holds the matching firmware HW lock and has acknowledged
+    /// a DRR update with these requested totals and MID disabled.
+    pub(crate) unsafe fn firmware_mid_cleared(&mut self, pipe: u8) -> Result<(), Error> {
         self.0.select_display(pipe)?;
-        self.0.restore_drr(pipe)
+        self.0.firmware_mid_cleared(pipe)
     }
-
+    /// Transfer timing ownership after an acknowledged config and DRR request,
+    /// or restore native registers after acknowledged firmware disable.
+    /// # Safety
+    /// Caller holds the firmware HW lock, live scanout and pinned clocks.
+    pub(crate) unsafe fn firmware_drr(&mut self, pipe: u8, enable: bool) -> Result<(), Error> {
+        self.0.select_display(pipe)?;
+        self.0.handoff_drr(pipe, enable)
+    }
     /// Stretch (`Some`) or fix (`None`) the vertical total of display
     /// `pipe`'s live scanout. `Busy` unless the pipe is `ScanoutRunning`;
     /// totals outside [mode total, 32767] are `Invalid` without writes. A
@@ -560,23 +713,51 @@ impl Otg {
         self.0.select_display(pipe)?;
         self.0.configure_drr(pipe, drr).await
     }
-    /// Configure admitted BTR frame insertion; UCLK must remain pinned.
+    /// Configure admitted BTR frame insertion. The caller must pin UCLK
+    /// or retain a matching DRR P-state plan. Firmware-owned timing requires
+    /// the matching DMUB borrower and acknowledged firmware HW lock.
     /// # Safety
-    /// As for `set_drr`; retain the scanout owner across every frame update.
+    /// Retain the scanout owner and exclude native timing writers. None
+    /// requires firmware timing inactive; Some requires its matching HW lock.
     pub async unsafe fn set_lfc(
         &mut self,
         pipe: u8,
         config: Option<crate::amdgpu_freesync::LfcConfig>,
+        firmware: Option<&mut crate::amdgpu_dmub_navi48::Dmub>,
     ) -> Result<(), Error> {
         self.0.select_display(pipe)?;
-        self.0.configure_lfc(pipe, config).await
+        if let Some(dmub) = firmware {
+            let mut loan = firmware_timing::Loan::native(&mut self.0, &mut self.2, dmub)?;
+            loan.configure_lfc(pipe, config).await?;
+            loan.flush_drr(pipe).await
+        } else {
+            self.0.configure_lfc(pipe, config).await
+        }
+    }
+    pub(crate) fn lfc_pending(&mut self, pipe: u8, lost: bool) -> Result<bool, Error> {
+        self.0.select_display(pipe)?;
+        self.0.lfc_pending(pipe, lost)
     }
     /// Service a real frame transition while the retained owner is idle.
     /// # Safety
-    /// As for `set_drr`; call only for ScanoutRunning, never a cancelled operation.
-    pub unsafe fn lfc_progress(&mut self, pipe: u8, lost: bool) -> Result<(), Error> {
+    /// Exclude native timing writers; a supplied firmware transport requires
+    /// its matching acknowledged HW lock. Call only for ScanoutRunning.
+    pub async unsafe fn lfc_progress(
+        &mut self,
+        pipe: u8,
+        lost: bool,
+        firmware: Option<&mut crate::amdgpu_dmub_navi48::Dmub>,
+    ) -> Result<(), Error> {
         self.0.select_display(pipe)?;
-        if lost {
+        if let Some(dmub) = firmware {
+            let mut loan = firmware_timing::Loan::native(&mut self.0, &mut self.2, dmub)?;
+            if lost {
+                loan.lfc_resync(pipe)?;
+            } else {
+                loan.lfc_idle(pipe)?;
+            }
+            loan.flush_drr(pipe).await
+        } else if lost {
             self.0.lfc_resync(pipe)
         } else {
             self.0.lfc_idle(pipe)
@@ -584,10 +765,22 @@ impl Otg {
     }
     /// Program a finite hardware MID sequence independently of BTR.
     /// # Safety
-    /// As for `set_drr`; the same owner must retain the timing until cleared.
-    pub unsafe fn set_drr_mid(&mut self, pipe: u8, mid: Option<DrrMid>) -> Result<(), Error> {
+    /// Exclude native timing writers and retain timing until cleared. A supplied
+    /// firmware transport requires its matching acknowledged HW lock.
+    pub async unsafe fn set_drr_mid(
+        &mut self,
+        pipe: u8,
+        mid: Option<DrrMid>,
+        firmware: Option<&mut crate::amdgpu_dmub_navi48::Dmub>,
+    ) -> Result<(), Error> {
         self.0.select_display(pipe)?;
-        self.0.set_drr_mid(pipe, mid)
+        if let Some(dmub) = firmware {
+            let mut loan = firmware_timing::Loan::native(&mut self.0, &mut self.2, dmub)?;
+            loan.set_drr_mid(pipe, mid)?;
+            loan.flush_drr(pipe).await
+        } else {
+            self.0.set_drr_mid(pipe, mid)
+        }
     }
 }
 

@@ -15,8 +15,8 @@
 //! native mcache placement. `admit_with_drr` carries live refresh limits and
 //! permits hardware vactive/vblank or FAMS2 clamped/stretch strategies.
 //! SubVP remains pinned without a phantom-pipe/MALL owner; the runtime DRR
-//! search skips those unavailable candidates. Raised DPMM clocks beyond the
-//! latency state remain outside this port.
+//! search skips those unavailable candidates. Mode programming uses DPMM's
+//! actual active clocks, including bounded raises beyond the latency state.
 use super::*;
 
 /// `enum dml2_pstate_method` (dml_top_types.h) values PMO assigns.
@@ -761,7 +761,7 @@ pub struct DrrSubstate {
 /// A configuration with UCLK P-state switching.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Supported {
-    /// Each stream's plan at the chosen level, in admission order.
+    /// Each stream's plan at DPMM's active clocks, in admission order.
     pub plans: Vec<Plan>,
     pub methods: [Method; MAX_STREAMS],
     /// The min-clock-table index the plans' latencies come from.
@@ -784,9 +784,6 @@ pub enum Pinned {
     /// Linux's search would try SubVP before a native method, but the
     /// port has no phantom-pipe/MALL owner.
     Firmware(Method),
-    /// The configuration is outside what this port plans with P-state
-    /// support (a DPMM clock above the latency state).
-    Port,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1227,10 +1224,6 @@ fn admit_config(
     ) else {
         return Ok(Pstate::Pinned(Pinned::Unsupported));
     };
-    // The port plans only at the latency state's clocks.
-    if au != level.uclk_khz || af != level.fclk_khz || ad != level.dcfclk_khz {
-        return Ok(Pstate::Pinned(Pinned::Port));
-    }
     // FCLK P-state: planes whose vactive cannot hide a zero FCLK blackout
     // must be synchronizable (each stream's reserved vblank at least zero).
     let hiding_short = (0..shapes.len())
@@ -1258,7 +1251,25 @@ fn admit_config(
         idle.fclk_khz = soc.fclk_khz[1];
     }
 
-    let ctx = ctx_at(&table, uclk, lat);
+    // core_dcn4_mode_programming uses DPMM's active clocks and its actual
+    // UCLK index. The latency index remains the candidate-search result.
+    let ctx = Ctx {
+        level: Level {
+            uclk_khz: active.uclk_khz,
+            fclk_khz: active.fclk_khz,
+            dcfclk_khz: active.dcfclk_khz,
+            dram_bw_kbps: u64::from(active.uclk_khz)
+                * u64::from(soc.umc_channels)
+                * CHANNEL_BYTES
+                * TRANSACTIONS_PER_CLOCK,
+        },
+        index: uclk
+            .levels()
+            .iter()
+            .position(|&clock| clock == active.uclk_khz)
+            .unwrap_or(0),
+        ..ctx_at(&table, uclk, lat)
+    };
     let mut plans = Vec::with_capacity(n);
     let mut fams2_streams = [Fams2Stream::default(); MAX_STREAMS];
     let (programmed, usable) =

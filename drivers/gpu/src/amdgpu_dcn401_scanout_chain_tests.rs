@@ -1680,19 +1680,34 @@ kernel_test_in!(
 /// both the P-state plan and the pinned plan run again.
 fn dcn401_scanout_chain_runs_a_uclk_pstate_plan() -> TestResult {
     let (t, s, p) = ROUTES[2];
-    pstate_plan(chain(t, s, p), p)
+    pstate_plan(chain(t, s, p), p, false)
 }
 #[inline(never)]
-fn pstate_plan(mut c: alloc::boxed::Box<Chain>, p: u8) -> TestResult {
+fn pstate_plan(mut c: alloc::boxed::Box<Chain>, p: u8, variable: bool) -> TestResult {
     use crate::amdgpu_dcn401_otg::WatermarkUpdate;
-    use dml::pstate::{admit, Method, Pstate, UclkLevels};
+    use dml::pstate::{admit_with_drr, Method, Pstate, UclkLevels};
     if run(c.start()).is_err() {
         return TestResult::Fail("start");
     }
     let pinned = plan();
+    let lfc = variable.then(|| {
+        crate::amdgpu_freesync::LfcConfig::new(
+            &pinned.mode.timing,
+            crate::amdgpu_freesync::VrrRange {
+                min_hz: 20,
+                max_hz: 61,
+            },
+        )
+        .unwrap()
+    });
+    if let Some(lfc) = lfc {
+        run(c.e.configure_drr(p, Some(lfc.base()))).unwrap();
+        run(c.e.configure_lfc(p, Some(lfc))).unwrap();
+    }
+    let drr = [lfc.map(|c| c.base()), None, None, None];
     let uclk = UclkLevels::new(&[96_000, 456_000, 772_000, 1_250_000]).unwrap();
     let Ok(Pstate::Supported(s)) =
-        run_boxed(|| async { admit(&soc(), &uclk, &[pinned.mode], false) })
+        run_boxed(|| async { admit_with_drr(&soc(), &uclk, &[pinned.mode], false, drr) })
     else {
         return TestResult::Fail("640x480 P-state support");
     };
@@ -1703,6 +1718,18 @@ fn pstate_plan(mut c: alloc::boxed::Box<Chain>, p: u8) -> TestResult {
         || pstate.mode != pinned.mode
     {
         return TestResult::Fail("vactive plan");
+    }
+    if let Some(lfc) = lfc {
+        assert!(pstate.native_refresh_pstate(lfc.base()));
+        let mut forged = pstate;
+        forged.pstate.as_mut().unwrap().method = Method::FwVactiveDrr;
+        assert!(!forged.native_refresh_pstate(lfc.base()));
+        forged = pstate;
+        forged.streams[0] = Some(pinned.mode);
+        assert!(!forged.native_refresh_pstate(lfc.base()));
+        let mut foreign = lfc.base();
+        foreign.v_total_max -= 1;
+        assert!(!pstate.native_refresh_pstate(foreign));
     }
     let update = |c: &mut Chain, plan: &dml::Plan, wm| {
         let clock = c.clock;
@@ -1739,6 +1766,37 @@ fn pstate_plan(mut c: alloc::boxed::Box<Chain>, p: u8) -> TestResult {
     if run(c.check()).is_err() {
         return TestResult::Fail("P-state plan while switching");
     }
+    if let Some(lfc) = lfc {
+        run(c.surfaces.prepare_back(&mut c.e, &c.pool, p, config())).unwrap();
+        // The real flip samples frame transitions and updates BTR under the
+        // same owner while the retained clock contract allows UCLK switching.
+        run(c.flip()).unwrap();
+        c.e.lfc_idle(p).unwrap();
+        assert!(c.e.status.drr.unwrap().lfc_enabled());
+        run(c.check()).unwrap();
+        run(c.e.configure_lfc(p, None)).unwrap();
+        let mid = crate::amdgpu_dcn401_otg::DrrMid {
+            v_total: lfc.base().v_total_min + 1,
+            frames: 3,
+        };
+        c.e.set_drr_mid(p, Some(mid)).unwrap();
+        run(c.check()).unwrap();
+        let writes = c.e.io.writes;
+        assert_eq!(
+            c.e.set_drr_mid(
+                p,
+                Some(crate::amdgpu_dcn401_otg::DrrMid {
+                    v_total: lfc.base().v_total_min - 1,
+                    ..mid
+                })
+            ),
+            Err(Error::Invalid)
+        );
+        assert_eq!(writes, c.e.io.writes);
+        c.e.set_drr_mid(p, None).unwrap();
+        run(c.e.configure_lfc(p, Some(lfc))).unwrap();
+        run(c.check()).unwrap();
+    }
     let writes = c.e.io.writes;
     if update(&mut c, &pinned, WatermarkUpdate::Raise) != Err(Error::Invalid)
         || c.e.io.writes != writes
@@ -1767,6 +1825,14 @@ fn pstate_plan(mut c: alloc::boxed::Box<Chain>, p: u8) -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_scanout_chain_runs_a_uclk_pstate_plan
+);
+
+fn dcn401_scanout_chain_native_drr_pstate_preserves_lfc_and_mid() -> TestResult {
+    pstate_plan(chain(1, 3, 2), 2, true)
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_chain_native_drr_pstate_preserves_lfc_and_mid
 );
 
 fn dcn401_scanout_chain_vrr_lfc_uses_actual_flip_and_cancellation_owner() -> TestResult {
@@ -1944,4 +2010,244 @@ fn dcn401_lfc_source_configuration_cancel_and_lost_events_keep_owner() -> TestRe
 kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_lfc_source_configuration_cancel_and_lost_events_keep_owner
+);
+
+struct TimingWriter {
+    requests: Vec<(u8, super::super::drr::DrrTiming)>,
+    fail: bool,
+    pause: bool,
+    started: Arc<AtomicBool>,
+}
+impl super::super::firmware_timing::TimingTransport for TimingWriter {
+    async fn drr(&mut self, otg: u8, timing: super::super::drr::DrrTiming) -> Result<(), Error> {
+        self.requests.push((otg, timing));
+        self.started.store(true, Ordering::SeqCst);
+        if self.pause {
+            core::future::pending::<()>().await;
+        }
+        if self.fail {
+            return Err(Error::Firmware(crate::amdgpu_dmub_navi48::Error::Busy));
+        }
+        Ok(())
+    }
+}
+fn timing_writer() -> TimingWriter {
+    TimingWriter {
+        requests: Vec::new(),
+        fail: false,
+        pause: false,
+        started: Arc::new(AtomicBool::new(false)),
+    }
+}
+fn firmware_lfc(c: &mut Chain) -> crate::amdgpu_freesync::LfcConfig {
+    let p = c.pipe;
+    let timing = c.e.status.pipes[usize::from(p)].unwrap().request.timing;
+    let config = crate::amdgpu_freesync::LfcConfig::new(
+        &timing,
+        crate::amdgpu_freesync::VrrRange {
+            min_hz: 20,
+            max_hz: 61,
+        },
+    )
+    .unwrap();
+    run(c.e.configure_drr(p, Some(config.base()))).unwrap();
+    run(c.e.configure_lfc(p, Some(config))).unwrap();
+    // The caller supplied the same acknowledged request to FAMS2 before
+    // handing over ownership. Firmware subsequently clamps these registers.
+    c.e.handoff_drr(p, true).unwrap();
+    for (r, v) in [
+        (0x1b30, 1000),
+        (0x1b31, 1001),
+        (0x1b32, 17),
+        (0x1b33, 0x40003),
+    ] {
+        c.e.io.put(otg(p, r), v);
+    }
+    config
+}
+fn dcn401_firmware_lfc_and_mid_use_requests_through_the_real_flip_owner() -> TestResult {
+    use super::super::firmware_timing::{Loan, Spare};
+    let mut c = chain(1, 3, 2);
+    run(c.start()).unwrap();
+    let lfc_config = firmware_lfc(&mut c);
+    let p = c.pipe;
+    let clock = c.clock;
+    run(c.surfaces.prepare_back(&mut c.e, &c.pool, p, config())).unwrap();
+    assert_eq!(c.e.lfc_idle(p), Err(Error::Busy));
+    let identity = (&*c.e.status as *const _, &*c.e.displays as *const _);
+    let mut spare = Some(Spare::new());
+    let mut writer = timing_writer();
+    {
+        let mut loan = Loan::new(&mut c.e, &mut spare, &mut writer).unwrap();
+        loan.lfc_preflip(p, 0).unwrap();
+        loan.lfc_preflip(p, 100_000).unwrap();
+        loan.lfc_idle(p).unwrap();
+        run(loan.flush_drr(p)).unwrap();
+        run(c
+            .surfaces
+            .flip(&mut *loan, p, CRYSTAL_KHZ, || Ok((clock, config()))))
+        .unwrap();
+        run(c.surfaces.set_color(&mut *loan, p, None)).unwrap();
+        run(loan.configure_lfc(p, None)).unwrap();
+        run(loan.flush_drr(p)).unwrap();
+        loan.set_drr_mid(
+            p,
+            Some(crate::amdgpu_dcn401_otg::DrrMid {
+                v_total: lfc_config.base().v_total_min + 1,
+                frames: 3,
+            }),
+        )
+        .unwrap();
+        run(loan.flush_drr(p)).unwrap();
+    }
+    assert_eq!(
+        identity,
+        (&*c.e.status as *const _, &*c.e.displays as *const _)
+    );
+    assert!(spare.is_some());
+    assert!(writer.requests.len() >= 3);
+    assert!(writer.requests.iter().all(|(otg, _)| *otg == 2));
+    assert_eq!(writer.requests.last().unwrap().1.mid.unwrap().frames, 3);
+    for (r, v) in [
+        (0x1b30, 1000),
+        (0x1b31, 1001),
+        (0x1b32, 17),
+        (0x1b33, 0x40003),
+    ] {
+        assert_eq!(
+            c.e.io.get(otg(p, r)),
+            v,
+            "native write replaced firmware timing"
+        );
+    }
+    let writes = c.e.io.writes;
+    assert_eq!(run(c.stop()), Err(Error::Busy));
+    assert_eq!(c.e.io.writes, writes);
+    assert_eq!(c.e.handoff_drr(p, false), Err(Error::Busy));
+    // An acknowledged firmware clear cancels the finite sequence before
+    // ownership changes; replaying its original count would start it again.
+    {
+        let mut loan = Loan::new(&mut c.e, &mut spare, &mut writer).unwrap();
+        loan.set_drr_mid(p, None).unwrap();
+        run(loan.flush_drr(p)).unwrap();
+    }
+    c.e.handoff_drr(p, false).unwrap();
+    assert!(!c.e.status.drr.unwrap().firmware_owned());
+    assert_eq!(c.e.io.get(otg(p, 0x1b32)), 0);
+    run(c.check()).unwrap();
+    c.e.handoff_drr(p, true).unwrap();
+    let writes = c.e.io.writes;
+    let held = c.e.status.scanout;
+    let control = c.e.io.get(h(p, HUBP_CONTROL));
+    c.e.io.put(h(p, HUBP_CONTROL), control | HUBP_UNDERFLOW);
+    assert!(matches!(run(c.check()), Err(Error::Underflow(_))));
+    assert_eq!(c.e.io.writes, writes);
+    assert_eq!(c.e.status.scanout, held);
+    assert!(matches!(c.e.status.state, State::Failed(_)));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_firmware_lfc_and_mid_use_requests_through_the_real_flip_owner
+);
+
+fn dcn401_firmware_timing_cancel_restores_the_quarantined_owner() -> TestResult {
+    use super::super::firmware_timing::{Loan, Spare};
+    let mut c = chain(1, 3, 2);
+    run(c.start()).unwrap();
+    let lfc_config = firmware_lfc(&mut c);
+    let p = c.pipe;
+    let mut spare = Some(Spare::new());
+    let mut writer = timing_writer();
+    writer.pause = true;
+    let started = writer.started.clone();
+    let held = c.e.status.scanout;
+    let writes = c.e.io.writes;
+    cancel_at(
+        || async {
+            let mut loan = Loan::new(&mut c.e, &mut spare, &mut writer).unwrap();
+            loan.configure_lfc(p, None).await.unwrap();
+            loan.set_drr_mid(
+                p,
+                Some(crate::amdgpu_dcn401_otg::DrrMid {
+                    v_total: lfc_config.base().v_total_min + 1,
+                    frames: 3,
+                }),
+            )
+            .unwrap();
+            loan.flush_drr(p).await
+        },
+        || started.load(Ordering::SeqCst),
+    );
+    assert!(spare.is_some());
+    assert_eq!(c.e.status.state, State::UpdatingStream(p));
+    assert_eq!(c.e.status.scanout, held);
+    assert_eq!(c.e.lfc_idle(p), Err(Error::Busy));
+    assert_eq!(c.e.io.writes, writes);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_firmware_timing_cancel_restores_the_quarantined_owner
+);
+
+fn dcn401_firmware_flip_cannot_publish_before_timing_ack() -> TestResult {
+    use super::super::firmware_timing::{Loan, Spare};
+    for pause in [false, true] {
+        let mut c = chain(1, 3, 2);
+        run(c.start()).unwrap();
+        firmware_lfc(&mut c);
+        let p = c.pipe;
+        let clock = c.clock;
+        run(c.surfaces.prepare_back(&mut c.e, &c.pool, p, config())).unwrap();
+        let mut spare = Some(Spare::new());
+        let mut writer = timing_writer();
+        writer.pause = pause;
+        writer.fail = !pause;
+        let started = writer.started.clone();
+        let writes = c.e.io.inner.inner.writes.len();
+        let held = c.e.status.scanout.map(|a| (a.pipe, a.plan));
+        let buffers = c.surfaces.retained_buffers(p);
+        let flip = {
+            let c = &mut *c;
+            let spare = &mut spare;
+            let writer = &mut writer;
+            move || async move {
+                let mut loan = Loan::new(&mut c.e, spare, writer).unwrap();
+                loan.io.io.frozen = true;
+                loan.lfc_resync(p).unwrap();
+                loan.lfc_preflip(p, 0).unwrap();
+                loan.lfc_preflip(p, 100_000).unwrap();
+                loan.io.io.frame += 1;
+                c.surfaces
+                    .flip(&mut *loan, p, CRYSTAL_KHZ, || Ok((clock, config())))
+                    .await
+            }
+        };
+        if pause {
+            cancel_at(flip, || started.load(Ordering::SeqCst));
+        } else {
+            assert!(run(flip()).is_err());
+        }
+        assert!(started.load(Ordering::SeqCst));
+        assert_eq!(
+            &c.e.io.inner.inner.writes[writes..],
+            &[(0x7f000, 0)],
+            "only an HDP flush may precede the timing ACK"
+        );
+        assert_eq!(c.e.status.scanout.map(|a| (a.pipe, a.plan)), held);
+        assert_eq!(c.surfaces.retained_buffers(p), buffers);
+        assert!(spare.is_some());
+        if pause {
+            assert_eq!(c.e.status.state, State::Flipping(p));
+        } else {
+            assert!(matches!(c.e.status.state, State::Failed(_)));
+        }
+        assert_eq!(c.e.lfc_idle(p), Err(Error::Busy));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_firmware_flip_cannot_publish_before_timing_ack
 );

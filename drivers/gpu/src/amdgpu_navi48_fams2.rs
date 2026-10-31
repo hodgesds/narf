@@ -48,6 +48,16 @@ impl ColdBoot {
         {
             return Err(otg::Error::Busy);
         }
+        if self.display_modesets().into_iter().flatten().any(|m| {
+            self.display_status(m.pipe).is_ok_and(|s| {
+                s.is_some_and(|s| {
+                    s.drr
+                        .is_some_and(|a| a.mid.is_some() && !a.firmware_owned())
+                })
+            })
+        }) {
+            return Err(otg::Error::Busy);
+        }
         let (mut pipes, mut otgs) = (0u8, 0u8);
         for stream in streams {
             let count = usize::from(stream.num_planes);
@@ -103,11 +113,50 @@ impl ColdBoot {
             if locked != Ok(true) {
                 return Err(dmub::Error::Busy);
             }
+            if !enable {
+                for m in self.display_modesets().into_iter().flatten() {
+                    let applied = self
+                        .display_status(m.pipe)
+                        .map_err(|_| dmub::Error::Busy)?
+                        .and_then(|s| s.drr);
+                    if let Some(a) = applied.filter(|a| a.firmware_owned() && a.mid.is_some()) {
+                        self.sequence
+                            .backend
+                            .dmub
+                            .fams2_drr_update(
+                                crate::amdgpu_rdna4::pipe_pool().hw(m.pipe),
+                                Some(a.adjust),
+                                None,
+                            )
+                            .await?;
+                        // SAFETY: request acknowledged under matching HW lock.
+                        unsafe {
+                            self.otg
+                                .as_mut()
+                                .map_err(|_| dmub::Error::Busy)?
+                                .firmware_mid_cleared(m.pipe)
+                        }
+                        .map_err(|_| dmub::Error::Busy)?;
+                    }
+                }
+            }
             for stream in streams {
+                let pool = crate::amdgpu_rdna4::pipe_pool();
+                let pipe = (0..pool.count())
+                    .find(|&p| pool.hw(p) == stream.otg_inst)
+                    .ok_or(dmub::Error::Invalid)?;
+                let applied = self
+                    .display_status(pipe)
+                    .map_err(|_| dmub::Error::Busy)?
+                    .and_then(|s| s.drr);
                 self.sequence
                     .backend
                     .dmub
-                    .fams2_drr_update(stream.otg_inst, stream.drr)
+                    .fams2_drr_update(
+                        stream.otg_inst,
+                        applied.map(|a| a.adjust),
+                        applied.and_then(|a| a.mid),
+                    )
                     .await?;
             }
             self.sequence
@@ -117,7 +166,7 @@ impl ColdBoot {
                 .await
         }
         .await;
-        let restore = if !enable && sent.is_ok() {
+        let restore = if sent.is_ok() {
             let pipes: Vec<_> = self
                 .display_modesets()
                 .into_iter()
@@ -125,9 +174,14 @@ impl ColdBoot {
                 .map(|m| m.pipe)
                 .collect();
             pipes.into_iter().try_for_each(|pipe| {
-                // SAFETY: FAMS2 is disabled under its acknowledged lock and
-                // OWNER retains the live stream, now running pinned clocks.
-                unsafe { self.otg.as_mut().map_err(|e| *e)?.restore_drr(pipe) }
+                // SAFETY: the matching DRR request/config was acknowledged under
+                // HW lock; OWNER retains timing, scanout and pinned clocks.
+                unsafe {
+                    self.otg
+                        .as_mut()
+                        .map_err(|e| *e)?
+                        .firmware_drr(pipe, enable)
+                }
             })
         } else {
             Ok(())

@@ -1454,21 +1454,35 @@ fn dmub_navi48_fams2_drr_uses_minus_one_totals_and_typed_substates() -> TestResu
         v_total_min: 1125,
         v_total_max: 1406,
     };
-    let c = fams2_drr_command(2, Some(limits)).unwrap();
+    let c = fams2_drr_command(2, Some(limits), None).unwrap();
     assert_eq!(
         &c[..24],
         &[76, 5, 0, 20, 0x64, 4, 0, 0, 0x7d, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0]
     );
     assert!(c[24..].iter().all(|&b| b == 0));
-    assert!(fams2_drr_command(4, None).is_err());
+    assert!(fams2_drr_command(4, None, None).is_err());
     assert!(fams2_drr_command(
         0,
         Some(crate::amdgpu_freesync::Drr {
             v_total_min: 0,
             ..limits
-        })
+        }),
+        None
     )
     .is_err());
+    let mid = crate::amdgpu_dcn401_otg::DrrMid {
+        v_total: 1200,
+        frames: 3,
+    };
+    let c = fams2_drr_command(2, Some(limits), Some(mid)).unwrap();
+    assert_eq!(&c[12..24], &[0xaf, 4, 0, 0, 3, 0, 0, 0, 1, 2, 0, 0]);
+    assert!(fams2_drr_command(
+        2,
+        Some(limits),
+        Some(crate::amdgpu_dcn401_otg::DrrMid { frames: 0, ..mid })
+    )
+    .is_err());
+    assert!(fams2_drr_command(2, None, Some(mid)).is_err());
     let mut stream = fams2_stream();
     stream.base.kind = 3;
     stream.base.drr_state = Some(crate::amdgpu_dcn401_dml::pstate::DrrSubstate {

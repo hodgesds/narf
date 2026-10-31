@@ -485,6 +485,7 @@ impl<I: Io> Engine<I> {
         let mut polls = self.io.wait_poll_limit();
         loop {
             self.lfc_progress(p.pipe)?;
+            self.flush_drr(p.pipe).await?;
             if p.watch {
                 self.underflow(p.pipe)?;
             }
@@ -634,6 +635,7 @@ impl<I: Io> Engine<I> {
         let l = self.layout;
         let pipe = p.pipe;
         self.lfc_preflip(pipe, (narf_time::wall::monotonic_ns() / 1000) as u32)?;
+        self.flush_drr(pipe).await?;
         self.lock(pipe).await?;
         // Both ODM halves of every flipping plane re-address under the one
         // master lock.
@@ -1123,7 +1125,7 @@ impl Surfaces {
         owners: &mut impl FnMut() -> Result<(dccg::Applied, DisplayContext), Error>,
         err: Error,
     ) -> Error {
-        if !matches!(err, Error::Underflow(_)) {
+        if !matches!(err, Error::Underflow(_)) || e.status.drr.is_some_and(|a| a.firmware_owned()) {
             e.status.state = State::Failed(err);
             return err;
         }
@@ -1192,6 +1194,11 @@ impl Surfaces {
         crystal_khz: u32,
         mut owners: impl FnMut() -> Result<(dccg::Applied, DisplayContext), Error>,
     ) -> Result<(), Error> {
+        // Firmware timing must first be disabled with clocks pinned. An
+        // interrupted firmware owner never falls through to native retirement.
+        if e.status.drr.is_some_and(|a| a.firmware_owned()) {
+            return Err(Error::Busy);
+        }
         let running = e.status.scanout.ok_or(Error::Invalid)?;
         if e.status.state != State::ScanoutRunning(pipe) || running.pipe != pipe {
             return Err(Error::Busy);
@@ -1378,6 +1385,19 @@ impl Otg {
                 ))
             })
             .await
+    }
+    /// Read-only underflow probe. A firmware owner can pin/disable its
+    /// schedule before calling the native drain-and-black recovery path.
+    pub(crate) fn underflow_pending(&mut self, pipe: u8) -> Result<bool, Error> {
+        self.0.select_display(pipe)?;
+        if self.0.status.state != State::ScanoutRunning(pipe) {
+            return Err(Error::Busy);
+        }
+        match self.0.underflow(pipe) {
+            Ok(()) => Ok(false),
+            Err(Error::Underflow(_)) => Ok(true),
+            Err(e) => Err(e),
+        }
     }
     /// Re-verify a live scanout and its stream against the current owners and
     /// return the frame count. An underflow returns the pipe to black video

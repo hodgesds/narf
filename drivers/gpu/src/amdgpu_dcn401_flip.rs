@@ -599,28 +599,37 @@ impl Otg {
     /// Flip a live scanout to its back buffer at the next VUPDATE.
     /// # Safety
     /// The back buffer must hold the complete next frame and no CPU writer
-    /// may touch it until another flip. Exclude firmware/FAMS and concurrent
-    /// display/hub/VM/IRQ/clock/reset/power writers.
+    /// may touch it until another flip. Exclude concurrent native
+    /// display/hub/VM/IRQ/clock/reset/power writers. With firmware timing,
+    /// supply the matching DMUB transport under its acknowledged HW lock;
+    /// retain that lock across this operation and its reply.
     pub async unsafe fn flip(
         &mut self,
-        clocks: &mut clocks::ClockManager,
-        dccg: &mut dccg::Dccg,
-        gmc: &mut Gmc,
+        owners: (&mut clocks::ClockManager, &mut dccg::Dccg, &mut Gmc),
         pipe: u8,
         crystal_khz: u32,
+        firmware: Option<&mut crate::amdgpu_dmub_navi48::Dmub>,
     ) -> Result<FlipDone, Error> {
         // Display k scans out on pipe k: address that display's records.
+        let (clocks, dccg, gmc) = owners;
         self.0.select_display(pipe)?;
         let regs = self.0.io.0;
-        self.1
-            .flip(&mut self.0, pipe, crystal_khz, || {
-                Ok((
-                    dccg.retained_timing_clock(regs, clocks, pipe)
-                        .map_err(Error::PipeClocks)?,
-                    gmc.display_context(regs).map_err(Error::Memory)?,
-                ))
-            })
-            .await
+        let current = || {
+            Ok((
+                dccg.retained_timing_clock(regs, clocks, pipe)
+                    .map_err(Error::PipeClocks)?,
+                gmc.display_context(regs).map_err(Error::Memory)?,
+            ))
+        };
+        if let Some(dmub) = firmware {
+            if !dmub.matches_display(regs, self.0.layout.base) {
+                return Err(Error::Invalid);
+            }
+            let mut loan = firmware_timing::Loan::native(&mut self.0, &mut self.2, dmub)?;
+            self.1.flip(&mut *loan, pipe, crystal_khz, current).await
+        } else {
+            self.1.flip(&mut self.0, pipe, crystal_khz, current).await
+        }
     }
     /// Flip the planes in `planes` (bit 0 the primary, bit k the k-th
     /// overlay) of display `pipe`'s live scanout to their back buffers at
@@ -629,24 +638,35 @@ impl Otg {
     /// As for `flip`, for every flipping plane's back buffer.
     pub async unsafe fn flip_planes(
         &mut self,
-        clocks: &mut clocks::ClockManager,
-        dccg: &mut dccg::Dccg,
-        gmc: &mut Gmc,
+        owners: (&mut clocks::ClockManager, &mut dccg::Dccg, &mut Gmc),
         pipe: u8,
         planes: u8,
         crystal_khz: u32,
+        firmware: Option<&mut crate::amdgpu_dmub_navi48::Dmub>,
     ) -> Result<[Option<FlipDone>; 1 + MAX_OVERLAYS], Error> {
+        let (clocks, dccg, gmc) = owners;
         self.0.select_display(pipe)?;
         let regs = self.0.io.0;
-        self.1
-            .flip_planes(&mut self.0, pipe, planes, crystal_khz, || {
-                Ok((
-                    dccg.retained_timing_clock(regs, clocks, pipe)
-                        .map_err(Error::PipeClocks)?,
-                    gmc.display_context(regs).map_err(Error::Memory)?,
-                ))
-            })
-            .await
+        let current = || {
+            Ok((
+                dccg.retained_timing_clock(regs, clocks, pipe)
+                    .map_err(Error::PipeClocks)?,
+                gmc.display_context(regs).map_err(Error::Memory)?,
+            ))
+        };
+        if let Some(dmub) = firmware {
+            if !dmub.matches_display(regs, self.0.layout.base) {
+                return Err(Error::Invalid);
+            }
+            let mut loan = firmware_timing::Loan::native(&mut self.0, &mut self.2, dmub)?;
+            self.1
+                .flip_planes(&mut *loan, pipe, planes, crystal_khz, current)
+                .await
+        } else {
+            self.1
+                .flip_planes(&mut self.0, pipe, planes, crystal_khz, current)
+                .await
+        }
     }
     /// Flip display `pipe`'s planes to what `sources` names (`flip_sources`):
     /// back buffers and client framebuffers scanned out in place, at the
@@ -658,24 +678,35 @@ impl Otg {
     /// fetched.
     pub async unsafe fn flip_sources(
         &mut self,
-        clocks: &mut clocks::ClockManager,
-        dccg: &mut dccg::Dccg,
-        gmc: &mut Gmc,
+        owners: (&mut clocks::ClockManager, &mut dccg::Dccg, &mut Gmc),
         pipe: u8,
         sources: [Option<FlipSource>; 1 + MAX_OVERLAYS],
         crystal_khz: u32,
+        firmware: Option<&mut crate::amdgpu_dmub_navi48::Dmub>,
     ) -> Result<[Option<FlipDone>; 1 + MAX_OVERLAYS], Error> {
+        let (clocks, dccg, gmc) = owners;
         self.0.select_display(pipe)?;
         let regs = self.0.io.0;
-        self.1
-            .flip_sources(&mut self.0, pipe, sources, crystal_khz, || {
-                Ok((
-                    dccg.retained_timing_clock(regs, clocks, pipe)
-                        .map_err(Error::PipeClocks)?,
-                    gmc.display_context(regs).map_err(Error::Memory)?,
-                ))
-            })
-            .await
+        let current = || {
+            Ok((
+                dccg.retained_timing_clock(regs, clocks, pipe)
+                    .map_err(Error::PipeClocks)?,
+                gmc.display_context(regs).map_err(Error::Memory)?,
+            ))
+        };
+        if let Some(dmub) = firmware {
+            if !dmub.matches_display(regs, self.0.layout.base) {
+                return Err(Error::Invalid);
+            }
+            let mut loan = firmware_timing::Loan::native(&mut self.0, &mut self.2, dmub)?;
+            self.1
+                .flip_sources(&mut *loan, pipe, sources, crystal_khz, current)
+                .await
+        } else {
+            self.1
+                .flip_sources(&mut self.0, pipe, sources, crystal_khz, current)
+                .await
+        }
     }
     /// What display `pipe`'s HUBPs fetch, when that is known: each plane's
     /// address while it scans out (index 0 the primary, k the k-th overlay

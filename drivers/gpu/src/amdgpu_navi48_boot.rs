@@ -2738,6 +2738,14 @@ impl ColdBoot {
     /// # Safety
     /// As for `start_display_scanout`.
     pub async unsafe fn check_display_scanout(&mut self, pipe: u8) -> Result<u32, otg::Error> {
+        if self.fams2_pending || self.state() != State::MemoryReady {
+            return Err(otg::Error::Busy);
+        }
+        // The low-level recovery drains native timing. First retire firmware
+        // only when an actual underflow was observed; healthy checks stay read-only.
+        if self.fams2_active && self.otg.as_mut().map_err(|e| *e)?.underflow_pending(pipe)? {
+            self.pin_display_uclk().await?;
+        }
         let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
         let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
         // SAFETY: matching retained owners are serialized; caller excludes external writers.
@@ -2878,12 +2886,15 @@ impl ColdBoot {
                     .as_mut()
                     .map_err(|e| *e)?
                     .flip_planes(
-                        self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
-                        self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
-                        gmc,
+                        (
+                            self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                            self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                            gmc,
+                        ),
                         pipe,
                         planes,
                         crystal,
+                        locked.then_some(&mut self.sequence.backend.dmub),
                     )
                     .await
             }
@@ -2913,12 +2924,15 @@ impl ColdBoot {
                     .as_mut()
                     .map_err(|e| *e)?
                     .flip_sources(
-                        self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
-                        self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
-                        gmc,
+                        (
+                            self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                            self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                            gmc,
+                        ),
                         pipe,
                         sources,
                         crystal,
+                        locked.then_some(&mut self.sequence.backend.dmub),
                     )
                     .await
             }
@@ -2979,11 +2993,14 @@ impl ColdBoot {
                     .as_mut()
                     .map_err(|e| *e)?
                     .flip(
-                        self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
-                        self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
-                        gmc,
+                        (
+                            self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                            self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                            gmc,
+                        ),
                         pipe,
                         crystal,
+                        locked.then_some(&mut self.sequence.backend.dmub),
                     )
                     .await
             }
@@ -3104,8 +3121,8 @@ impl ColdBoot {
         // SAFETY: serialized retained owner; caller excludes writers.
         unsafe { self.otg.as_mut().map_err(|e| *e)?.set_drr(pipe, drr) }.await
     }
-    /// Configure LFC from the admitted variable-refresh range. Nominal
-    /// DML and the pinned memory-clock contract remain unchanged.
+    /// Configure LFC from the admitted variable-refresh range. Switching
+    /// requires a matching single native or firmware DRR P-state plan.
     /// # Safety
     /// As for `set_display_cursor`.
     pub async unsafe fn set_display_lfc(
@@ -3113,47 +3130,80 @@ impl ColdBoot {
         pipe: u8,
         config: Option<crate::amdgpu_freesync::LfcConfig>,
     ) -> Result<(), otg::Error> {
-        if self.fams2_active
-            || self.fams2_pending
+        if self.fams2_pending
             || self.state() != State::MemoryReady
-            || (config.is_some() && self.uclk_switching())
+            || ((self.uclk_switching() || self.fams2_active) && !self.refresh_pstate(pipe))
         {
             return Err(otg::Error::Busy);
         }
-        // SAFETY: serialized retained owner; caller excludes timing writers.
-        unsafe { self.otg.as_mut().map_err(|e| *e)?.set_lfc(pipe, config) }.await
+        let locked = self.begin_fams2_io().await?;
+        // SAFETY: OWNER and the acknowledged HW lock exclude timing writers.
+        let result = unsafe {
+            self.otg.as_mut().map_err(|e| *e)?.set_lfc(
+                pipe,
+                config,
+                locked.then_some(&mut self.sequence.backend.dmub),
+            )
+        }
+        .await;
+        self.finish_fams2_io(locked, result).await
     }
     /// Advance LFC only from a real observed frame transition.
     /// # Safety
     /// As for `set_display_cursor`; no cancelled display operation may be serviced.
-    pub unsafe fn display_lfc_progress(&mut self, pipe: u8, lost: bool) -> Result<(), otg::Error> {
-        if self.fams2_active
-            || self.fams2_pending
+    pub async unsafe fn display_lfc_progress(
+        &mut self,
+        pipe: u8,
+        lost: bool,
+    ) -> Result<(), otg::Error> {
+        if self.fams2_pending
             || self.state() != State::MemoryReady
-            || self.uclk_switching()
+            || ((self.uclk_switching() || self.fams2_active) && !self.refresh_pstate(pipe))
         {
             return Err(otg::Error::Busy);
         }
-        // SAFETY: serialized retained owner; caller excludes timing writers.
-        unsafe { self.otg.as_mut().map_err(|e| *e)?.lfc_progress(pipe, lost) }
+        // FRAME_COUNT is read-only. Empty timer wakes need no firmware lock;
+        // the locked path samples again and treats missed frames conservatively.
+        if !self.otg.as_mut().map_err(|e| *e)?.lfc_pending(pipe, lost)? {
+            return Ok(());
+        }
+        let locked = self.begin_fams2_io().await?;
+        // SAFETY: OWNER and the acknowledged HW lock retain the admitted timing.
+        let result = unsafe {
+            self.otg.as_mut().map_err(|e| *e)?.lfc_progress(
+                pipe,
+                lost,
+                locked.then_some(&mut self.sequence.backend.dmub),
+            )
+        }
+        .await;
+        self.finish_fams2_io(locked, result).await
     }
-    /// Apply a finite native MID-for-MAX sequence independently of BTR.
+    /// Apply a finite MID-for-MAX sequence independently of BTR.
     /// # Safety
-    /// As for `set_display_cursor`; keep UCLK pinned until DRR is disabled.
-    pub unsafe fn set_display_drr_mid(
+    /// As for `set_display_cursor`; switching requires an admitted DRR plan.
+    pub async unsafe fn set_display_drr_mid(
         &mut self,
         pipe: u8,
         mid: Option<otg::DrrMid>,
     ) -> Result<(), otg::Error> {
-        if self.fams2_active
-            || self.fams2_pending
+        if self.fams2_pending
             || self.state() != State::MemoryReady
-            || self.uclk_switching()
+            || ((self.uclk_switching() || self.fams2_active) && !self.refresh_pstate(pipe))
         {
             return Err(otg::Error::Busy);
         }
-        // SAFETY: serialized retained owner; caller excludes timing writers.
-        unsafe { self.otg.as_mut().map_err(|e| *e)?.set_drr_mid(pipe, mid) }
+        let locked = self.begin_fams2_io().await?;
+        // SAFETY: OWNER and the acknowledged HW lock retain the admitted timing.
+        let result = unsafe {
+            self.otg.as_mut().map_err(|e| *e)?.set_drr_mid(
+                pipe,
+                mid,
+                locked.then_some(&mut self.sequence.backend.dmub),
+            )
+        }
+        .await;
+        self.finish_fams2_io(locked, result).await
     }
     /// Apply the live FreeSync timing and SPD under the same display owner.
     /// # Safety
@@ -3195,7 +3245,14 @@ impl ColdBoot {
                 return Err(otg::Error::Busy);
             }
             // SAFETY: serialized retained owner; caller excludes writers.
-            unsafe { self.otg.as_mut().map_err(|e| *e)?.set_color(pipe, program) }.await
+            unsafe {
+                self.otg.as_mut().map_err(|e| *e)?.set_color(
+                    pipe,
+                    program,
+                    locked.then_some(&mut self.sequence.backend.dmub),
+                )
+            }
+            .await
         }
         .await;
         self.finish_fams2_io(locked, result).await
@@ -3214,7 +3271,14 @@ impl ColdBoot {
                 return Err(otg::Error::Busy);
             }
             // SAFETY: serialized retained owner; caller excludes writers.
-            unsafe { self.otg.as_mut().map_err(|e| *e)?.set_hdr(pipe, packet) }.await
+            unsafe {
+                self.otg.as_mut().map_err(|e| *e)?.set_hdr(
+                    pipe,
+                    packet,
+                    locked.then_some(&mut self.sequence.backend.dmub),
+                )
+            }
+            .await
         }
         .await;
         self.finish_fams2_io(locked, result).await
@@ -3238,6 +3302,9 @@ impl ColdBoot {
     /// # Safety
     /// As for `start_display_scanout`; on failure the surface stays allocated.
     pub async unsafe fn stop_display_scanout(&mut self, pipe: u8) -> Result<(), otg::Error> {
+        if self.fams2_active || self.fams2_pending {
+            return Err(otg::Error::Busy);
+        }
         let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
         let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
         // SAFETY: matching retained owners are serialized; caller excludes external writers.
