@@ -640,6 +640,9 @@ pub struct Hardware {
     receive_queues: rx_multi::State,
     sources: Option<source::Assets>,
     rf_policy: Option<super::mld_policy::Authority>,
+    /// Retained firmware scan ownership. A received CHUB/MCC change must
+    /// break a command wait even while its SCAN_REQ receipt is still held.
+    scan_mcc_watch: bool,
 }
 
 impl core::fmt::Debug for Hardware {
@@ -743,6 +746,7 @@ impl Hardware {
             receive_queues: rx_multi::State::new(parsed),
             sources: None,
             rf_policy: None,
+            scan_mcc_watch: false,
         })
     }
 
@@ -1166,6 +1170,9 @@ impl Hardware {
                     policy.invalidate();
                     return Err("Intel native MCC changed during retained RF policy");
                 }
+                if self.scan_mcc_watch {
+                    return Err("Intel native MCC changed during retained firmware scan");
+                }
             }
             if packet.header.group_id == 0 && packet.header.cmd == 0xc5 {
                 if !matches!(self.version(0, 0xc5).map(|v| v.1), Some(4 | 6 | 7)) {
@@ -1413,6 +1420,9 @@ impl Hardware {
     pub(super) fn rf_policy_clone(&self) -> Option<super::mld_policy::Authority> {
         self.rf_policy.clone()
     }
+    pub(super) fn watch_scan_mcc(&mut self, active: bool) {
+        self.scan_mcc_watch = active;
+    }
 
     pub(super) fn clear_rf_policy(&mut self) {
         if let Some(policy) = self.rf_policy.take() {
@@ -1469,7 +1479,7 @@ impl Hardware {
         let authority = self.authority(false);
         let device = self.device;
         let cap = self.cap;
-        self.finish_stop(stopped, || {
+        let result = self.finish_stop(stopped, || {
             if authority.native {
                 super::mmio::set_master(&device, &cap, false)
             } else {
@@ -1477,7 +1487,11 @@ impl Hardware {
                 // the fixture owns no physical config space or bus master.
                 authority.invoke(|| Ok(()))
             }
-        })
+        });
+        if result.is_ok() {
+            self.scan_mcc_watch = false;
+        }
+        result
     }
 
     fn finish_stop(
@@ -1548,6 +1562,7 @@ impl Hardware {
         self.shared_memory = smem::State::new(parsed);
         self.receive_queues = rx_multi::State::new(parsed);
         self.rx_epoch.reset_after_dma_stop();
+        self.scan_mcc_watch = false;
         self.armed = false;
         self.failed = false;
         self.notifications.clear();

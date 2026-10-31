@@ -166,12 +166,24 @@ fn smoke_iwlwifi_authored_tlv_truncation_and_invalid_shapes() -> TestResult {
             return TestResult::Fail("truncated TLV header, payload or padding admitted");
         }
     }
-    for (tag, payload) in [(48, &[1, 2, 3][..]), (30, &[0; 7][..]), (52, &[][..])] {
+    for (tag, payload) in [
+        (18, &[][..]),
+        (18, &[1, 2, 3][..]),
+        (18, &[0; 5][..]),
+        (48, &[1, 2, 3][..]),
+        (30, &[0; 7][..]),
+        (52, &[][..]),
+    ] {
         let mut bad = mvm_image();
         tlv(&mut bad, tag, payload);
         if parse_ucode(&bad).is_ok() {
             return TestResult::Fail("malformed known firmware API record admitted");
         }
+    }
+    let mut flags = mvm_image();
+    tlv(&mut flags, 18, &[128, 0, 0, 0, 255, 255, 255, 255]);
+    if !parse_ucode(&flags).is_ok_and(|parsed| parsed.api.flags == 128) {
+        return TestResult::Fail("firmware SHORT_BL flags used reserved future words");
     }
     TestResult::Pass
 }

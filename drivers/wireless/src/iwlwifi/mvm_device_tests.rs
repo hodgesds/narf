@@ -12,6 +12,8 @@ mod active_scan_tests;
 mod he_tests;
 #[path = "mvm_rx_multi_tests.rs"]
 mod rx_multi_tests;
+#[path = "mvm_scheduled_tests.rs"]
+mod scheduled_tests;
 #[path = "mvm_smem_tests.rs"]
 mod smem_tests;
 #[path = "mvm_tx_amsdu_tests.rs"]
@@ -144,6 +146,7 @@ fn ht_ies() -> Vec<u8> {
     out
 }
 struct Actor {
+    pno: Option<Box<scheduled_tests::Model>>,
     multi_receive: bool,
     rx_configuration: Vec<rx_multi_tests::Receipt>,
     rx_queues: Vec<model::ReceiveFirmware>,
@@ -390,6 +393,9 @@ impl Actor {
             let s = u16::from_le_bytes([p.bytes[2], p.bytes[3]]);
             let b = &p.bytes[8..];
             self.commands.push((g, c, b.to_vec()));
+            if self.pno.is_some() && self.scheduled_command(g, c, s, b)? {
+                return Ok(());
+            }
             if self.multi_receive && self.receive_command(g, c, s, b)? {
                 return Ok(());
             }
@@ -1181,6 +1187,36 @@ impl Harness {
         he_enabled: bool,
         multi_receive: bool,
     ) -> Result<Self, &'static str> {
+        Self::build_nvm_scheduled(
+            protected,
+            ht,
+            emission,
+            tlc_version,
+            ba,
+            ml_baid,
+            features,
+            wide_nvm,
+            ml_baid_version,
+            he_enabled,
+            multi_receive,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn build_nvm_scheduled(
+        protected: bool,
+        ht: bool,
+        emission: u8,
+        tlc_version: u8,
+        ba: bool,
+        ml_baid: bool,
+        features: u16,
+        wide_nvm: u8,
+        ml_baid_version: u8,
+        he_enabled: bool,
+        multi_receive: bool,
+        pno: Option<scheduled_tests::Model>,
+    ) -> Result<Self, &'static str> {
         if CURRENT.lock().is_some() {
             return Err("MVM interface fixture already owned");
         }
@@ -1188,6 +1224,11 @@ impl Harness {
         let parsed = super::super::parse_ucode(&image).unwrap();
         let mut versions = parsed.api.commands.to_vec();
         versions.extend_from_slice(&[7, 5, 1, 0]);
+        if let Some(model) = &pno {
+            if let Some(version) = model.profile.command {
+                versions.extend_from_slice(&[0x6e, 1, version, 0]);
+            }
+        }
         // Real API77 reports capability68 and omits the fixed-layout
         // RFH/RSS command entries. Native tests must exercise that default.
         if ba {
@@ -1202,6 +1243,10 @@ impl Harness {
             }
         }
         tlv(&mut image, 48, &versions);
+        if let Some(model) = &pno {
+            let flags = 0xfbfb4b7fu32 | if model.profile.short { 1 << 7 } else { 0 };
+            tlv(&mut image, 18, &flags.to_le_bytes());
+        }
         if multi_receive {
             tlv(&mut image, 30, &[2, 0, 0, 0, 0x10, 0, 0, 0]);
         }
@@ -1220,6 +1265,7 @@ impl Harness {
         let mut security = super::super::mvm_boot::SecurityModel::new(3)?;
         security.ap = ap(protected)?;
         let mut actor = Actor {
+            pno: pno.map(Box::new),
             multi_receive,
             rx_configuration: Vec::new(),
             rx_queues: Vec::new(),

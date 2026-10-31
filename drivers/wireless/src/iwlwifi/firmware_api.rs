@@ -5,6 +5,9 @@
 /// negotiated from the image rather than inferred from its filename.
 #[derive(Clone, Debug, Default)]
 pub struct FirmwareApi<'a> {
+    /// TLV18 first word, as Linux iwl-drv.c consumes it. Later complete
+    /// words are reserved; SHORT_BL selects the actual scan blocklist ABI.
+    pub flags: u32,
     pub iml: Option<&'a [u8]>,
     pub pnvm: Option<&'a [u8]>,
     pub commands: &'a [u8],
@@ -20,6 +23,9 @@ impl<'a> FirmwareApi<'a> {
     /// Known malformed TLVs are errors, not silently absent features.
     pub fn consume(&mut self, tag: u32, data: &'a [u8]) -> Result<bool, &'static str> {
         match tag {
+            18 if data.len() >= 4 && data.len() % 4 == 0 => {
+                self.flags = u32::from_le_bytes(data[..4].try_into().unwrap());
+            }
             22 if data.len() == 12 => {
                 // iwl_tlv_calib_data: ucode type, flow, event. Regular=0.
                 if data[..4] == [0; 4] {
@@ -55,7 +61,7 @@ impl<'a> FirmwareApi<'a> {
                 self.bios_commands = Some(data);
             }
             74 if !data.is_empty() => self.pnvm = Some(data),
-            22 | 23 | 29 | 30 | 48 | 52 | 73 | 74 => return Err("malformed firmware API TLV"),
+            18 | 22 | 23 | 29 | 30 | 48 | 52 | 73 | 74 => return Err("malformed firmware API TLV"),
             _ => return Ok(false),
         }
         Ok(true)

@@ -205,6 +205,8 @@ mod tests;
 
 #[path = "mvm_active_scan.rs"]
 mod active_scan;
+#[path = "mvm_scheduled.rs"]
+pub(super) mod scheduled;
 #[path = "mvm_smem.rs"]
 mod smem;
 pub type SharedMemory = smem::SharedMemory;

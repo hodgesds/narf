@@ -4,8 +4,7 @@ use super::*;
 use narf_wireless::ap_control::{RadioControlAuthority, RadioEventAuthority};
 use narf_wireless::SchedScanRequest;
 
-#[path = "sc_scheduled_wire.rs"]
-mod wire;
+use super::super::scheduled_wire as wire;
 
 pub(super) struct Owner {
     event: RadioEventAuthority,
@@ -179,7 +178,7 @@ impl Device {
                     .channels
                     .iter()
                     .copied()
-                    .find(|&channel| frequency(channel) == Some(requested_frequency))
+                    .find(|&channel| wire::frequency(channel) == Some(requested_frequency))
                     .ok_or(22)?;
                 if !channels.contains(&channel) {
                     channels.push(channel);
@@ -402,7 +401,9 @@ impl Device {
                 }
                 0xd9 => publish = true,
                 0xc1 if packet.receive_queue == 0 => {
-                    if let Some((beacon, bss)) = copied_bss(&packet, owner) {
+                    if let Some((beacon, bss)) =
+                        wire::copied_bss(&packet, false, &owner.channels, &owner.request)
+                    {
                         if let Some(old) = state
                             .beacons
                             .iter_mut()
@@ -474,61 +475,4 @@ fn discard_notifications(hw: &mut Hardware) {
     hw.notifications.retain(|p| {
         !(p.header.group_id == 0 && matches!(p.header.cmd, 0xf | 0xc1 | 0xb2 | 0xb5 | 0xd9))
     });
-}
-fn copied_bss(packet: &super::super::runtime::Packet, owner: &Owner) -> Option<(Beacon, BssInfo)> {
-    let mpdu = scan_api::mpdu(&packet.payload)?;
-    if !owner.channels.contains(&mpdu.channel)
-        || mpdu.frame.len() < 36
-        || !matches!(mpdu.frame[0], 0x80 | 0x50)
-    {
-        return None;
-    }
-    let bssid = mpdu.frame[16..22].try_into().ok()?;
-    let body = mpdu.body(24, 0)?;
-    let parsed = super::super::mlme::parse_beacon_to_bss(bssid, body)?;
-    if !owner.request.matches.is_empty()
-        && !owner.request.matches.iter().any(|m| {
-            (m.ssid.is_empty() || m.ssid == parsed.ssid)
-                && m.rssi_threshold_dbm
-                    .is_none_or(|r| i32::from(mpdu.rssi) >= r)
-        })
-    {
-        return None;
-    }
-    let beacon = Beacon {
-        bssid,
-        ssid: parsed.ssid.clone(),
-        channel: mpdu.channel,
-        interval: u16::from_le_bytes(body[8..10].try_into().ok()?),
-        dtim: scan_api::dtim_period(body),
-        rsn: parsed.rsn_ie_body.clone(),
-        privacy: body[10] & 0x10 != 0,
-        capabilities: u16::from_le_bytes(body[10..12].try_into().ok()?),
-        information_elements: body[12..].to_vec(),
-    };
-    let security = if beacon.rsn.is_some() {
-        narf_wireless::scan::BssSecurity::Wpa2
-    } else if beacon.privacy {
-        narf_wireless::scan::BssSecurity::Wep
-    } else {
-        narf_wireless::scan::BssSecurity::Open
-    };
-    let bss = BssInfo {
-        bssid,
-        ssid: parsed.ssid,
-        channel: u32::from(mpdu.channel),
-        frequency_mhz: frequency(mpdu.channel)?,
-        rssi: mpdu.rssi,
-        security,
-    };
-    Some((beacon, bss))
-}
-
-fn frequency(channel: u8) -> Option<u32> {
-    match channel {
-        14 => Some(2484),
-        1..=13 => Some(2407 + 5 * u32::from(channel)),
-        15..=196 => Some(5000 + 5 * u32::from(channel)),
-        _ => None,
-    }
 }

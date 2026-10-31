@@ -105,8 +105,11 @@ struct State {
     transmit: Option<Consumer<Frame, TX_RING_N>>,
     pending: Option<Frame>,
     scan_time: Option<u64>,
+    scheduled: Option<scheduled::Control>,
 }
 enum Operation {
+    StartScheduled(Box<scheduled::Start>),
+    StopScheduled,
     Scan(Vec<u8>, Vec<Vec<u8>>, bool),
     Join(Join),
     Maintain,
@@ -141,6 +144,9 @@ pub(super) struct Device {
     me: Weak<Self>,
     state: Mutex<State>,
     control: Mutex<Option<Work>>,
+    radio_control: Arc<narf_wireless::ap_control::ExclusiveControl>,
+    scan_generation: Arc<AtomicU64>,
+    schedule_profiles: u8,
     source: Source,
     environment: Environment,
     mac: [u8; 6],
@@ -278,6 +284,7 @@ impl Device {
         let ht20 = owner.supports_native_ht20();
         let vht = ht20 && nvm.phy.vht;
         let he = owner.supports_native_he_contract();
+        let schedule_profiles = owner.scheduled_profile()?.0 as u8;
         let stopping = Arc::new(AtomicBool::new(false));
         owner.bind_station_stop(stopping.clone());
         Ok(Arc::new_cyclic(|me| Self {
@@ -288,8 +295,12 @@ impl Device {
                 transmit: None,
                 pending: None,
                 scan_time: None,
+                scheduled: None,
             }),
             control: Mutex::new(None),
+            radio_control: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
+            scan_generation: Arc::new(AtomicU64::new(0)),
+            schedule_profiles,
             source,
             environment,
             mac,
@@ -418,7 +429,10 @@ impl Device {
             let phase = owner.phase();
             if (matches!(
                 operation,
-                Operation::Scan(..) | Operation::Join(_) | Operation::QuerySharedMemory
+                Operation::Scan(..)
+                    | Operation::Join(_)
+                    | Operation::QuerySharedMemory
+                    | Operation::StartScheduled(_)
             ) && phase != Phase::Configured)
                 || (matches!(operation, Operation::Maintain | Operation::Transmit)
                     && phase != Phase::DataPrepared)
@@ -438,10 +452,18 @@ impl Device {
         }));
         let result_slot = reply.clone();
         let closing = matches!(operation, Operation::Close);
+        let stopping_schedule = matches!(operation, Operation::StopScheduled);
+        let scheduled_request = match &operation {
+            Operation::StartScheduled(start) => {
+                Some((start.authority.clone(), start.cancel.clone()))
+            }
+            _ => None,
+        };
         let reading_geometry = matches!(operation, Operation::QuerySharedMemory);
         let port_commit = matches!(operation, Operation::Join(_) | Operation::Maintain);
         let channels = match &operation {
             Operation::Scan(channels, _, _) => channels.clone(),
+            Operation::StartScheduled(start) => start.channels.clone(),
             Operation::Join(request) => alloc::vec![request.channel],
             _ => Vec::new(),
         };
@@ -456,6 +478,16 @@ impl Device {
             let result = {
                 let mut future = pin!(device.execute(&mut state, operation));
                 poll_fn(|cx| {
+                    if scheduled_request
+                        .as_ref()
+                        .is_some_and(|(authority, cancel)| {
+                            cancel.load(Ordering::Acquire)
+                                || authority.check_for(device.as_ref()).is_err()
+                                || authority.require_link().is_err()
+                        })
+                    {
+                        return Poll::Ready(Err("MVM scheduled start request retired"));
+                    }
                     if let Some(boot) = restart.as_ref() {
                         return match boot.invoke(|| Ok(future.as_mut().poll(cx))) {
                             Ok(result) => result,
@@ -463,7 +495,7 @@ impl Device {
                         };
                     }
                     match device.source.invoke(|| {
-                        if closing || suspending || reading_geometry {
+                        if closing || suspending || reading_geometry || stopping_schedule {
                             return Ok(future.as_mut().poll(cx));
                         }
                         let domain = (device.environment.policy)()?;
@@ -494,8 +526,9 @@ impl Device {
                 })
                 .await
             };
+            let scheduled_failed = stopping_schedule && state.scheduled.is_some();
             let owner = state.owner.as_mut().unwrap();
-            if result.is_err() && owner.phase() == Phase::Scanning {
+            if result.is_err() && (owner.phase() == Phase::Scanning || scheduled_failed) {
                 // The outer executable/PCI/receive-policy fence can stop
                 // polling execute while firmware still owns a scan. Retain
                 // and stop that owner before reporting its terminal error.
@@ -527,6 +560,7 @@ impl Device {
                     owner.station_fail();
                     device.down(true);
                     state.pending = None;
+                    state.scheduled = None;
                 }
             } else if closing {
                 let _publication = device.admission.lock();
@@ -635,10 +669,19 @@ impl Device {
             pending,
             scan_time,
             transmit,
+            scheduled,
             ..
         } = state;
         let owner = owner.as_mut().ok_or("MVM native owner absent")?;
         match operation {
+            Operation::StartScheduled(start) => {
+                let result = self
+                    .execute_scheduled_start(owner, scheduled, *start)
+                    .await?;
+                *scan_time = None;
+                Ok(result)
+            }
+            Operation::StopScheduled => self.execute_scheduled_stop(owner, scheduled).await,
             Operation::Scan(channels, ssids, active) => {
                 // A beacon can arrive at any point during this bounded scan.
                 // Start time conservatively bounds every retained observation;
@@ -764,6 +807,7 @@ impl Device {
                 Ok(Outcome::Done)
             }
             Operation::Close => {
+                self.execute_scheduled_stop(owner, scheduled).await?;
                 *pending = None;
                 if let Some(tx) = transmit.as_mut() {
                     for _ in 0..TX_RING_N {
@@ -776,6 +820,7 @@ impl Device {
                 Ok(Outcome::Done)
             }
             Operation::Recover => {
+                *scheduled = None;
                 // Host frames queued for the failed station never reach the
                 // restarted instance (mac80211 drops them on restart).
                 *pending = None;
@@ -831,6 +876,17 @@ impl Device {
         let Some(mut state) = self.state.try_lock() else {
             return Vec::new();
         };
+        if state.scheduled.is_some() {
+            let (deliveries, retire) = self.scheduled_tick(&mut state);
+            drop(state);
+            if retire {
+                let _ = self.begin(Operation::StopScheduled);
+            }
+            for delivery in deliveries {
+                delivery.publish();
+            }
+            return Vec::new();
+        }
         let result = (|| {
             let owner = state.owner.as_mut().ok_or("MVM retained owner missing")?;
             self.source.invoke(|| Ok(()))?;
@@ -1116,6 +1172,37 @@ fn error(error: &'static str) -> WirelessError {
 }
 #[async_trait::async_trait]
 impl WirelessNetIface for Device {
+    fn radio_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        core::num::NonZeroU64::new(self.generation.load(Ordering::Acquire).checked_add(1)?)
+    }
+    fn reserve_radio_control(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        self.radio_control.try_reserve().map(Some)
+    }
+    fn sched_scan_support(&self) -> Option<narf_wireless::SchedScanSupport> {
+        self.scheduled_support()
+    }
+    fn async_sched_scan_control(&self) -> bool {
+        true
+    }
+    fn sched_scan_pass_all(&self) -> bool {
+        true
+    }
+    async fn start_sched_scan_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        request: narf_wireless::SchedScanRequest,
+    ) -> Result<(), i32> {
+        self.scheduled_control(authority, Some(request)).await
+    }
+    async fn stop_sched_scan_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+    ) -> Result<(), i32> {
+        self.scheduled_control(authority, None).await
+    }
     fn supports_handshake_offload(&self) -> bool {
         self.wpa2
     }
@@ -1222,6 +1309,7 @@ impl WirelessNetIface for Device {
             }
             channels
         };
+        self.ensure_scheduled_stopped().await.map_err(error)?;
         self.recover_failed().await.map_err(error)?;
         let reply = self
             .begin(Operation::Scan(channels, request.ssids, request.active))
@@ -1264,6 +1352,7 @@ impl WirelessNetIface for Device {
             elements: request.ie,
             credential,
         };
+        self.ensure_scheduled_stopped().await.map_err(error)?;
         let reply = self.begin(Operation::Join(join)).map_err(error)?;
         self.wait(reply).await.map_err(error).map(|_| ())
     }
@@ -1368,3 +1457,6 @@ fn drain_network() -> bool {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "mvm_device_tests.rs"]
 mod tests;
+
+#[path = "mvm_scheduled_device.rs"]
+mod scheduled;

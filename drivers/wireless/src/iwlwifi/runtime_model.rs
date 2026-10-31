@@ -356,6 +356,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         receive_queues: rx_multi::State::default(),
         sources: None,
         rf_policy: None,
+        scan_mcc_watch: false,
     };
     (hardware, firmware)
 }

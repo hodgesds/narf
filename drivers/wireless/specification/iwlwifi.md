@@ -75,15 +75,17 @@ discrete flag and has no integrated LTR delay. Unknown PCI profiles or
 command versions fail initialization instead of choosing defaults from the
 RX descriptor format. Recovery replays these commands before recreating
 the station interface. RX queue zero is configured by the boot context;
-additional RX queues and RSS remain disabled for this single-queue profile.
+source-advertised additional RX rings and RSS use §§3.50/3.52, with per-ring
+key/replay/reorder and all-ring retirement ownership.
 
 The supported software profile is a single station with Open/WPA2-PSK or
 WPA3-SAE security, 2.4/5 GHz, and legacy/HT/VHT operation up to 80 MHz.
 Gen2's separate §§3.17–3.19 profiles implement legacy20 and WMM/HT20/SISO
 Open/WPA2 station operation with distinct emitting-program qualifications.
-AP mode and 6 GHz/HE/EHT still require separate software implementations;
-non-WoWLAN system suspend/resume is §3.29. They are not hardware-only
-acceptance gates and are not enabled by this profile's station tests.
+Sc HE20/40/80 is §3.49; the qualified Gen2 continuation is §3.44. AP mode,
+6 GHz and EHT still require separate native implementations; non-WoWLAN
+system suspend/resume is §3.29. Those remaining native paths are separate
+from physical acceptance of the enabled software profiles.
 
 ## 3. Public interface and stage progression
 
@@ -1555,7 +1557,7 @@ each feature; a Linux chip name or helper structure does not grant a capability.
 
 | Profile | Implemented reachable software | Remaining software gates |
 |---|---|---|
-| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), §3.33 host WPA3-SAE with PMF, §3.34 tag5 HT TX LDPC/TX STBC, §3.36 tag5 HT40, §3.37 tag5 NSS2, §3.38 tag5 VHT80, §3.39 tag5 VHT160, signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced reconnect restoration, extended in §3.30 to cross-peer/cross-index GTK restore, safe same-peer PTK reuse and a radio-scoped ledger across native owners; §3.31 generic tag5 feature programs with per-TID QoS queues for all four ACs; §3.29 firmware/transport recovery and non-WoWLAN system suspend/resume. Also software-validated on both architectures: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Qualified active probes are in §3.40; alternate ML BAID (§3.41) and bounded Gen2 TX A-MSDU (§3.43), plus Gen2 HE (§3.44), passed coordinated native tests on both architectures. The §3.45 SAE-EXT-KEY (AKM24), WPA2 PMF and public HE/VHT metadata additions passed full native tests on both architectures (234 Gen2 cases each). The reboot-persistent history proposal is inapplicable (§3.30). AP/P2P, WoW (with its D3 ARP/NS/GTK offloads) and the §3.27 scheduled-scan offload remain unimplemented even where hardware supports them; the Gen2 multiple-RX/RSS continuation in §3.52 awaits native acceptance. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
+| AX200 CC / exact AX201 Qu/QuZ API77 MAC/RF profiles (Linux Qu PCI IDs 0x02f0/0x06f0/0x34f0/0x3df0/0x4df0/0x43f0/0xa0f0, §3.26) | Exact deferred native PCI/API77 source selection, context-v1 boot, NVM/defaults, published station netdev/worker and current-authority IPC/stack integration; passive scan, real Open/WPA2 MLME, separately qualified legacy20 or WMM/HT20/SISO (with §3.28 RX LDPC/STBC1), §3.33 host WPA3-SAE with PMF, §3.34 tag5 HT TX LDPC/TX STBC, §3.36 tag5 HT40, §3.37 tag5 NSS2, §3.38 tag5 VHT80, §3.39 tag5 VHT160, signed v5 SAR/power, DCF/EDCA/TLC, native staged RX A-MSDU, M4/native keys/RX epochs/rekeys and encrypted data, beacon-loss/AP-close detection, local receipt-fenced retirement preceded by §3.25 over-air leaving deauthentication. Software-validated continuation: tag3 BE/TID0 firmware-managed TX BA/eight-packet pipeline, recipient BAID TIDs0–7/window32/native reorder/DEL_BA key/close fences; bounded native GTK replay history and receipt-fenced reconnect restoration, extended in §3.30 to cross-peer/cross-index GTK restore, safe same-peer PTK reuse and a radio-scoped ledger across native owners; §3.31 generic tag5 feature programs with per-TID QoS queues for all four ACs; §3.29 firmware/transport recovery and non-WoWLAN system suspend/resume. Also software-validated on both architectures: §3.24 tag4 negotiated unicast-local nested recipient A-MSDU-in-A-MPDU with complete bundles before sequence/PN ownership. | Qualified active probes are in §3.40; alternate ML BAID (§3.41) and bounded Gen2 TX A-MSDU (§3.43), plus Gen2 HE (§3.44), passed coordinated native tests on both architectures. The §3.45 SAE-EXT-KEY (AKM24), WPA2 PMF and public HE/VHT metadata additions passed full native tests on both architectures (234 Gen2 cases each). The reboot-persistent history proposal is inapplicable (§3.30). AP/P2P and WoW (with its D3 ARP/NS/GTK offloads) remain unimplemented even where hardware supports them. Gen2 idle periodic-scan offload is wired in §3.55 with native execution pending; the multiple-RX/RSS continuation in §3.52 passed refreshed normalized native tests, with final release gates pending. Exact command contracts, distinct measured emitting-program inputs and physical acceptance remain required. |
 | AX210/AX211/AX411 and Bz/BE200 Gen3 transports | Context-v2, generation-selected completion layouts, firmware/PNVM/native boot and MLD helpers. Software-validated continuation: source-selected command-ID header0/explicit RLC2, receipt-fenced TVQM/BAID retirement, retained actual executable/PNVM/PCI authority and immutable DMA-copy receive/publication epochs. | Station admission remains dependent on the exact negotiated MAC/link/STA/TLC/key payload profile; no new payload profile is enabled by the header/source audit. Sc conversation tests do not establish another family's ABI or hardware. The common current-policy owner is §3.46 and optional native BIOS/AP power is §3.47; exact chip ABI and execution of its supplied platform facts remain separate. |
 | Sc c103/BE211 MLD station profile | Deferred retained native publication, actual station/management/data/Open-WPA2-SAE conversations, legacy/HT/VHT to80MHz, key/BA/reorder and userspace SME/port ownership in the existing profile. Native optional BIOS/AP power (§3.47), negotiated PMF/AKM24 (§3.48) and HE20/40/80 (§3.49) passed native tests on both architectures within 476 Intel cases; bounded native TX A-MSDU (§3.51) passed within 485 Intel cases on each architecture. §§3.21–3.22 header/TVQM, positive BA response/RX-marker retirement, retained executable/PNVM/current-PCI publication and copy-time key epochs passed coordinated native tests on both architectures. | The §3.46 current host-policy/MCC/EDCA and retained stop/close owners passed native tests on both architectures. Native optional BIOS/AP-power, Sc PMF/AKM24 and HE passed on both architectures; Gen2 §3.45 retains its independent owner evidence. Physical RF acceptance remains separate. EHT/6GHz and MLO,160/320MHz, AP/P2P and the §3.27 scheduled-scan offload remain separate (non-WoWLAN system suspend/resume is §3.29) implementations and must not be inferred from single-link Sc fixtures. |
 | Other advertised PCI/firmware combinations | Identification/firmware selection where defined, including the Linux So/Ma/Bz IDs added in §3.26; 0x7df0 is identification-only (Linux 7.3 `pcie/drv.c` claims no 0x7DF0) and exact admission rejects it | No fallback admits an unknown command table, calibration profile, topology or PHY width. They need their exact source-backed authority/command/receipt/lifetime path. |
@@ -2179,7 +2181,9 @@ describe the remaining native paths.
   admission. Deployment qualification and physical RF acceptance remain.
 - **multiple_rx_queues, rss.** §3.50 wires Sc/MLD RFH/RSS and all-queue
   replay/reorder/epoch ownership; native tests passed on both architectures.
-  Gen2's distinct MVM key/BA/PN owner is wired in §3.52; native acceptance remains pending.
+  Gen2's distinct MVM key/BA/PN owner is implemented in §3.52. The normalized
+  HostCommand graph passed all496 Intel cases on both architectures; final
+  release integration gates remain pending.
 - **ap.** There is no AP/GO MAC context, beacon template
   (`BEACON_TEMPLATE_CMD`) or multi-station key/queue owner, although the
   shared `WirelessNetIface::start_ap` exists.
@@ -2197,11 +2201,11 @@ describe the remaining native paths.
 
 **Shared contracts, external inputs and scope corrections.**
 
-- **sched_scan_offload.** §3.53 connects the shared deferred interface to
-  idle Sc native periodic profiles, retained emission/stop ownership and
-  current-source results; coordinated native execution is pending. Linux
-  MLD associated coexistence, Gen2 API77 idle PNO and parked Gen3 profiles
-  remain open. Linux MVM explicitly refuses non-idle scheduled scans.
+- **sched_scan_offload.** §3.53 validates idle Sc native periodic profiles,
+  retained emission/stop ownership and current-source results. §3.55 wires
+  Gen2 API77 idle PNO with native execution pending. Linux MLD associated
+  coexistence and parked Gen3 profiles remain open. Linux MVM explicitly
+  refuses non-idle scheduled scans.
 - **persistent_key_history** is inapplicable (§3.30): Linux and the shared
   NARF contract establish a fresh authenticated RSNA after reboot and
   retain replay/history state for the active owner lifetime. The existing
@@ -3140,9 +3144,9 @@ the native configuration receipt is held. A literal wire test checks the
 RFH/RSS layouts and correlated all-queue prefix. All five cases passed
 within 481 Intel tests per architecture, without failures or skips;
 both affected release Clippy contexts and formatting passed on each
-architecture. Gen2's distinct
-MVM key/BA/PN owner remains a separate residual; this MLD continuation
-cannot close the whole multiple-RX-queues row or enable parked chips.
+architecture. Gen2's distinct MVM key/BA/PN continuation is §3.52;
+the combined normalized graph passed all496 Intel cases on both architectures,
+with final release gates pending. Neither continuation enables parked chips.
 
 
 ### 3.51 Sc native TX A-MSDU batching
@@ -3242,8 +3246,10 @@ release lint/ordinary gates are consolidated on `bd18` with unchanged Intel
 runtime; they remain separate from this native result. Physical RF acceptance
 and CPU/throughput scaling are separate; the retained worker services these
 rings serially.
-The later HostCommand/metadata normalization in §3.54 requires fresh native
-integration; the490-case result above records its preceding software graph.
+After the HostCommand/metadata normalization in §3.54, all496 Intel cases
+passed on both architectures at `fbe407764`, including the ten MQ cases.
+Final release integration gates remain pending; the490-case result above
+records the preceding software graph.
 Primary contracts are Linux `fw/init.c::iwl_configure_rxq`,
 `mvm/fw.c::iwl_send_rss_cfg_cmd`, `mvm/mac80211.c::__iwl_mvm_sync_rx_queues`,
 and `mvm/rxmq.c::{iwl_mvm_check_pn,iwl_mvm_reorder,iwl_mvm_rx_queue_notif}`.
@@ -3295,8 +3301,9 @@ Five native Sc cases and three shared deferred-dispatch cases are wired,
 covering literal native profiles/plans/probe segments, actual deferred ACK and
 GET_SCAN results, dropped START/STOP waiters, foreign completion UIDs, source/
 policy loss, malformed abort receipts, passive/pass-all matching and random
-probe source bits. Coordinated execution is pending. This first continuation
-covers idle Sc station mode. Linux MLD associated scheduled-scan coexistence,
+probe source bits. All five and all496 Intel cases passed on x86_64 and
+aarch64 at `fbe407764`; final release integration gates remain separate.
+This first continuation covers idle Sc station mode. Linux MLD associated scheduled-scan coexistence,
 actual Gen2 API77 idle scheduled scans and parked Gen3 profiles remain open;
 Linux MVM explicitly refuses non-idle scheduled scans, so an associated Gen2
 PNO owner is not an additional reference requirement. Physical RF acceptance
@@ -3336,9 +3343,87 @@ A new independent native literal regression covers all three completion
 formats, RSS/profile/SMEM/IGTK HostCommands, REPLY_ERROR, an existing wide
 group, explicit header version and exact legacy reply correlation. Its
 metadata input deliberately distinguishes raw group0 and normalized group1.
-Existing native data-TX literals retain group0 unchanged. Native integration
-of this normalization plus the Sc scheduled continuation is pending; the
-preceding490-case MQ acceptance is not evidence for this changed graph.
+Existing native data-TX literals retain group0 unchanged. The literal and
+all496 Intel cases passed on x86_64 and aarch64 at `fbe407764`; final release
+gates remain separate. The preceding490-case MQ acceptance records its
+earlier software graph.
+
+### 3.55 API77 idle scheduled scans
+
+The Gen2 interface uses the shared current-source deferred scheduled-scan
+controls with its actual radio generation and native reservation. Linux
+`mvm/mac80211.c::iwl_mvm_mac_sched_scan_start` refuses a non-idle vif with
+EBUSY; the native owner likewise admits START only from Configured, without
+an associated peer, PHY, data queue or authorized port. Native Work retains
+all command futures and cancellation independently of a dropped caller.
+After accepted START, the actual periodic program, source event authority,
+cancellation flag and private nonwrapping scan generation remain owned by
+the Device. The command reservation is released after its terminal result,
+so an actual STOP can acquire it.
+
+The profile shape comes from the retained executable. Normalized group1
+SCAN_OFFLOAD_UPDATE_PROFILES command3 uses eight profiles; a genuinely
+absent/unknown/pre3 entry follows Linux's eleven-profile fallback. TLV18's
+first word selects the native16- or64-entry empty blocklist through
+SHORT_BL; malformed known records fail parsing and complete future words
+are ignored as in Linux. All seven installed API77 images report command3
+and flags0xfbfb4b7f, selecting eight profiles and64 blocklist rows. The
+native UMAC v14–17 body carries firmware slot1 and the shared two-plan
+periodic schedule, infinite final iteration, clamped initial delay, match
+profiles, direct SSIDs and bounded probe IEs. The shared direct-SSID
+builder retains Linux's sparse slots after duplicate probes, first-empty
+lookup, wildcard behavior and20-slot bound. Match-only SSIDs do not gain
+permission to probe.
+
+An empty frequency list uses NVM channels permitted by the current host
+receive policy. Every operation refreshes native MCC. Passive PNO requires
+no transmit qualifier. Active probes reuse the existing signed tag6 binding
+to the actual hardware MAC, executable/platform and exact ordered channel
+set, with the same legacy rates, raw26-byte header and30TU active dwell.
+Only the intersection of current NVM/MCC and host policy sets active bits.
+SET_CHAINS SAR and SET_DEVICE power receipts precede native profiles and
+SCAN_REQ. Optional randomized probe source bits change neither hardware
+identity nor the qualified PHY/rate/header-length contract. The existing
+secure RNG and fixed-bit mask supply them; no clock-based entropy or new
+board prerequisite is added. The supplied per-chain and global limits
+continue to bound every periodic iteration. The signed schema encodes no
+separate iteration, duration or duty-cycle ceiling.
+
+A queued native MCC change is checked throughout startup before scanner
+publication. Once SCAN_REQ may be owned by firmware, the transport retains
+a scan watch: CHUB/MCC0xc9 breaks a held command wait immediately rather
+than waiting for an unrelated scan receipt or command timeout. The actual
+owner then makes the independent bounded DMA/reset/BME stop attempt;
+unproven command/RFH allocations stay pinned. A copied result's cancellation
+fence closes immediately on this error, while native retirement continues.
+The watch clears only after actual UID termination or a proven transport
+stop. During a healthy STOP, SUCCESS/IN_PROGRESS still requires exact UID1
+completion and NOT_FOUND supplies firmware absence proof. A missing or
+malformed status is an error, never a substitute for terminal retirement.
+
+The idle worker processes actual fallback0 Gen2 MPDUs with the48-byte
+prefix, applies channel/SSID/RSSI filters and publishes an admitted snapshot
+to the current source's GET_SCAN cache before RESULTS. Host observation
+bounds are recorded before each actual copy poll, retained per BSSID and
+expired after the existing10-second limit; a later match or terminal
+notification cannot refresh an earlier beacon's age. The oldest retained
+observation bounds the station handoff. An ordinary scan or association
+first retires the periodic UID through retained Work, so a discovered BSS
+can enter the existing WPA2/SAE/PHY path without leaving a second emitter
+live. Dropping that transition's waiter cannot drop its native STOP work.
+Disconnect and system suspend use the same retirement path; firmware
+recovery discards the old slot and requires fresh native configuration.
+
+Six native Gen2 cases plus an independent shared-wire literal are wired.
+They cover actual command3 and Linux fallback/SHORT_BL profiles, global
+qualified power before probes, random source masks, missing-qualifier
+passive discovery followed by actual WPA2/DHCP, non-idle refusal, source/
+policy/power loss, dropped START/STOP waiters, exact UID and malformed
+status handling, observation expiry and MCC loss during held profile or
+SCAN_REQ receipts. Coordinated execution is pending. This completes the
+intended API77 idle scope only after those gates; Sc associated coexistence
+and parked Gen3 payload profiles remain distinct open work. Physical RF
+acceptance remains separate from native QEMU software evidence.
 
 ## 4. References
 

@@ -31,7 +31,7 @@ async fn checked<T>(
 }
 
 impl Owner {
-    fn active_scan_mask(
+    pub(super) fn active_scan_mask(
         &self,
         channels: &[u8],
         domain: &RegulatoryDomain,
