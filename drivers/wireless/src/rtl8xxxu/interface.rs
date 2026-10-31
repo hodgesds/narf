@@ -566,7 +566,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
             base_mac: self.mac,
             bands: vec![WirelessBand {
                 freq_mhz: 2400,
-                channels: vec![1],
+                channels: (1..=13).collect(),
             }],
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
@@ -587,31 +587,30 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
         })
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        let dwell = validate_scan(&request)?;
+        let (mut channels, dwell) = validate_scan(&request)?;
         let mut state = self.state.lock().await;
         if state.service.phase() != service_runtime::Phase::Passive {
             return Err(WirelessError::Busy);
         }
-        let deadline = narf_time::Deadline::after_ms(dwell);
-        // Own native poll drives USB completions while this logical owner is
-        // held. No IRQ-safe guard, executor bridge or worker dependency exists.
-        loop {
-            state.service.poll().map_err(wireless_error)?;
-            if deadline.expired() {
-                break;
-            }
-            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(1_000_000)).await;
+        if channels.is_empty() {
+            channels = state.service.scan_channels().map_err(wireless_error)?;
         }
+        state
+            .service
+            .passive_scan(&channels, dwell)
+            .await
+            .map_err(wireless_error)?;
         Ok(state
             .service
             .candidates()
             .into_iter()
             .filter(|b| {
-                request.ssids.is_empty()
-                    || request
-                        .ssids
-                        .iter()
-                        .any(|ssid| ssid.is_empty() || ssid == b.ssid())
+                channels.contains(&b.channel())
+                    && (request.ssids.is_empty()
+                        || request
+                            .ssids
+                            .iter()
+                            .any(|ssid| ssid.is_empty() || ssid == b.ssid()))
             })
             .map(bss_info)
             .collect())
@@ -620,7 +619,9 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
         if self.closed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
         }
-        if request.frequency_mhz != 2412 || request.channel != 1 {
+        if !(1..=13).contains(&request.channel)
+            || request.frequency_mhz != 2407 + request.channel * 5
+        {
             return Err(WirelessError::NotSupported);
         }
         let (mode, pmk) = match request.security {
@@ -631,6 +632,13 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
         let mut state = self.state.lock().await;
         if state.service.phase() != service_runtime::Phase::Passive {
             return Err(WirelessError::Busy);
+        }
+        if !state.service.candidates().iter().any(|bss| {
+            bss.bssid() == request.bssid
+                && u32::from(bss.channel()) == request.channel
+                && bss.ssid() == request.ssid
+        }) {
+            return Err(WirelessError::InvalidArgs);
         }
         state.clear_transmit();
         let result = state
@@ -679,11 +687,15 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
         result
     }
     async fn set_config(&self, cfg: WirelessConfig) -> Result<(), WirelessError> {
-        if cfg.channel == 1 && cfg.tx_power_dbm.is_none() {
-            Ok(())
-        } else {
-            Err(WirelessError::NotSupported)
+        if cfg.tx_power_dbm.is_some() || !(1..=13).contains(&cfg.channel) {
+            return Err(WirelessError::NotSupported);
         }
+        let mut state = self.state.lock().await;
+        state
+            .service
+            .select_channel(u8::try_from(cfg.channel).map_err(|_| WirelessError::InvalidArgs)?)
+            .await
+            .map_err(wireless_error)
     }
 }
 
@@ -727,24 +739,45 @@ pub(super) mod publication_test {
             .map_err(|_| "EU interleaved USB disconnect")
     }
 }
-fn validate_scan(request: &ScanRequest) -> Result<u64, WirelessError> {
+fn validate_scan(request: &ScanRequest) -> Result<(Vec<u8>, u64), WirelessError> {
     if request.active
         || request.random_mac.is_some()
         || request.colocated_6ghz
         || !request.extra_ies.is_empty()
-        || request.frequencies_mhz.iter().any(|&f| f != 2412)
-        || request.frequencies_mhz.is_empty() && request.channels.iter().any(|&c| c != 1)
         || request.ssids.iter().any(|s| s.len() > 32)
         || request.ssids.len() > 32
     {
         return Err(WirelessError::NotSupported);
     }
-    match request.duration_tu {
-        Some(duration @ 1..=1000) => Ok((u64::from(duration) * 1024).div_ceil(1000)),
-        Some(_) => Err(WirelessError::InvalidArgs),
-        None if request.duration_mandatory => Err(WirelessError::InvalidArgs),
-        None => Ok(200),
+    let mut channels = Vec::<u8>::new();
+    if request.frequencies_mhz.is_empty() {
+        for channel in &request.channels {
+            if !(1..=13).contains(channel) {
+                return Err(WirelessError::NotSupported);
+            }
+            let channel = u8::try_from(*channel).map_err(|_| WirelessError::InvalidArgs)?;
+            if !channels.contains(&channel) {
+                channels.push(channel);
+            }
+        }
+    } else {
+        for frequency in &request.frequencies_mhz {
+            if !(2412..=2472).contains(frequency) || (*frequency - 2407) % 5 != 0 {
+                return Err(WirelessError::NotSupported);
+            }
+            let channel = ((*frequency - 2407) / 5) as u8;
+            if !channels.contains(&channel) {
+                channels.push(channel);
+            }
+        }
     }
+    let dwell = match request.duration_tu {
+        Some(duration @ 1..=1000) => (u64::from(duration) * 1024).div_ceil(1000),
+        Some(_) => return Err(WirelessError::InvalidArgs),
+        None if request.duration_mandatory => return Err(WirelessError::InvalidArgs),
+        None => 200,
+    };
+    Ok((channels, dwell))
 }
 fn bss_info(b: Candidate) -> BssInfo {
     let security = if b.ap_rsne().is_some() {
@@ -757,8 +790,8 @@ fn bss_info(b: Candidate) -> BssInfo {
     BssInfo {
         bssid: b.bssid(),
         ssid: b.ssid().to_vec(),
-        frequency_mhz: 2412,
-        channel: 1,
+        frequency_mhz: 2407 + u32::from(b.channel()) * 5,
+        channel: u32::from(b.channel()),
         rssi: i8::MIN,
         security,
     }

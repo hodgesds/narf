@@ -1,8 +1,9 @@
 # rtl8xxxu — Specification
 
 > Status: runtime RTL8188EU factory/FIFO/firmware/MAC/BB/RF + LC/IQK implemented;
-> retained channel1 Open/WPA2 station service implemented; broader software
-> profiles, reset/rejoin and physical acceptance remain incomplete. A separately
+> retained channel1 Open/WPA2 station service implemented; qualified legacy
+> channels1–13 and idle passive scans are implemented pending native acceptance.
+> Broader profiles and physical acceptance remain incomplete. A separately
 > qualified RTL8188EU HT20/LGI SISO continuation passes14 native regressions
 > on both architectures; exact-device qualification remains external.
 
@@ -122,16 +123,18 @@ the caller-authenticated regulatory profile and grants no TX gain authority.
 Construction requires radio-ready/full IQK, snapshots checked descriptors,
 and permanently claims the radio once. `start` posts persistent USB RX before
 opening and verifying MAC RX with TX still closed; `stop` verifies MAC closure
-before proven USB Stop/SetDeq. Only successful same-channel stop permits
-restart. Cancellation/transport failure is terminal without cleanup or a
+before proven USB Stop/SetDeq. Successful same-channel stop permits restart;
+qualified channel changes use the complete cold MAC restart described below.
+Cancellation/transport failure is terminal without cleanup or a
 new claim; unretired USB receipts stay owned. Quiet polls preserve the TD.
 Unexpected hardware-decrypted metadata and non-MPDU reports do not reach
 native management/data dispatch. Firmware status adds starting-receive,
-receiving and receive-stopped states. This entry point is now bound to
+receiving, receive-stopped and restarting states. This entry point is now bound to
 the probe's network service worker only after signed board/deployment admission.
 
 `management_runtime::{Candidate, Join}` admits native channel1 beacon/probe
-identity and strictly bounded IEs, requiring a basic 1Mbps rate matching the
+identity initially, and qualified channels1–13 through the cold transition
+below, with strictly bounded IEs and a basic 1Mbps rate matching the
 actual Realtek descriptor's rate0. It uses the shared
 `narf_wireless::association::JoinPlan` for Open/WPA2 frame preparation and
 peer/phase/status/AID transitions, stamps software sequence numbers, and
@@ -173,10 +176,11 @@ radio reserves one station service; cancellation cannot silently replace it.
 No physical board qualification data is included in the repository.
 
 The admitted service publishes `WirelessNetIface` and Ethernet Narf-Rings
-with channel1/20MHz/basic1Mbps, Open or WPA2-PSK/CCMP and PMF disabled. The
+initially on channel1/20MHz/basic1Mbps, with qualified idle channel changes
+below, Open or WPA2-PSK/CCMP and PMF disabled. The
 distinct optional HT20/LGI program below supplies factual HT capability only
 after its parked native programming succeeds. VHT, HE, EHT, external EAPOL,
-packet offloads, live retune and power overrides are not advertised. Passive scans poll the same persistent native RX owner,
+packet offloads, connected retune and power overrides are not advertised. Passive scans poll the retained native RX owner,
 cache at most32 peer-bound candidates for10s and honor bounded passive dwell;
 unknown RSSI is represented by `i8::MIN`, never a fabricated measurement.
 Optional SME elements are validated and forwarded through the shared join
@@ -275,9 +279,9 @@ and serializes TX through descriptor-derived management/BE endpoint mapping.
 USB completion means host delivery, not a radio ACK. Every transfer/extent
 failure is terminal without buffer reuse. `Owner::stop` uses the USB proven
 Stop Endpoint/Set TR Dequeue contract; drop/error keeps unretired receipts and
-fails the owner. Successful stop permits a restart only on its immutable
-channel. RF/FIFO quiescence before retune is separate software work: changing
-a channel label cannot qualify queued RX bytes. Production service composition
+fails the owner. Successful stop permits a same-channel restart. An idle
+channel change additionally requires the completed cold MAC/FIFO restart below;
+changing a channel label cannot qualify queued RX bytes. Production service composition
 opens MAC admission only after signed channel/power qualification and opens
 the WPA2 controlled port only through retained shared RSNA.
 
@@ -308,6 +312,11 @@ ECWmin>=5, ECWmax>=10, TXOP0); BK/VI/VO use the AP rows. As in
 (`wmm_runtime::acm_bits`; BE ACM is refused). Only then may the retained bulk
 owner admit QoS DATA with TXDESC32_QOS. This WMM grant keeps HT/BA, U-APSD,
 TSPEC and QoS Null closed; the distinct HT grant below cannot be inferred from it.
+
+QoS Null remains a scanning dependency: mac80211 uses its off-channel
+power-save nullfunc when leaving an associated channel, while rtl8xxxu
+advertises neither PS nor REPORTS_TX_ACK_STATUS. The current idle scan owner
+does not implement scanning while associated, so it does not emit that frame.
 
 #### Traffic classification and all-AC/TID routing (implemented)
 
@@ -668,6 +677,53 @@ uplink, second disconnect), `smoke_rtl8188eu_disconnect_overrides_waiting_old_li
 (stale publisher still fenced) and the failed USB stop smoke (teardown
 failure stays closed; no rejoin).
 
+### Qualified legacy channels and idle passive scans (native acceptance pending)
+
+The retained owner selects legacy 20MHz channels1–13 from the existing signed N8PC
+rows. `Calibration::permission` intersects the actual selected 20MHz occupied
+band with every authenticated rule and chooses gains below the source factory
+group ceiling:1–2,3–5,6–8,9–11 and12–13 (`8188f.c::rtl8188f_channel_to_group`).
+Missing/unmeasured rows and unsupported rule flags remain refused. No default
+curve, interpolation or additional qualification format is introduced.
+
+`Device::set_config` changes an idle owner's channel, and passive scan accepts
+bounded explicit channel/frequency lists or the currently qualified set. Every
+requested row is checked before the first hardware transition. Each successful
+scan restores its original home channel. Connected scans remain busy. Noninitial
+channels use the legacy profile; the retained N8HT continuation remains bound to
+channel1 and is reprogrammed only when returning to that exact qualified profile.
+Default channel enumeration rechecks current authority after each target row
+and before returning, so revocation cannot be hidden as a missing target row.
+
+Channel changes retire the physical receive stream. MAC RX/TX and filter maps
+close first; RXDMA is paused while its current USB receive TD still runs, and
+old completed copies are discarded. Observed RXDMA idle precedes actual USB
+Stop/SetDeq. RXDMA idle alone cannot empty queued device FIFO data. The cold
+path therefore performs the source card-off/firmware reset sequence and the
+explicit hardware MAC-off handshake in the pinned
+[RTL8188EU power-state table](https://android.googlesource.com/kernel/common/+/c13159a588818/drivers/staging/rtl8188eu/include/pwrseq.h):
+`RTL8188E_TRANS_ACT_TO_CARDEMU` writes APS_FSMCO[9] and polls its terminal
+self-clear after RF-off/LDO sleep. Neither an MCU-only reset nor an elapsed
+delay substitutes for this MAC-off receipt.
+
+The same physical USB and firmware owner remains retained. A cold restart
+invokes the original executable capability and reuses its exact bounded owned
+image, compares fresh factory/endpoints with the original identity before RF
+calibration, and restores the complete source FIFO/LLT, firmware, tables and
+LC/IQK program. The home-channel1 calibration envelope and target operating
+envelope stay current through every await. The selected RF channel/width is
+read back before a new receive TD acquires its channel label. A failed or
+cancelled EP0 transition stays terminal with its original receipts retained;
+failed owners cannot enter this restart path or acquire another receive claim.
+
+Copied BSS entries retain observation time and receive-stream generation.
+CONNECT after a cold transition requires a fresh actual target-channel beacon,
+without refreshing an old cache entry's age. Eight native cases cover actual
+Open/WPA2 channel6 DHCP, multi-channel dwell/home restoration, old device FIFO
+copies, fresh-observation admission, cancellation/source loss, missing row and
+RXDMA/MAC-off receipts, and literal factory/occupied-band limits. Their native
+execution and physical-board acceptance remain pending.
+
 ## 4. Invariants
 
 - Linux's disabled→EMU→active handshake precedes firmware writes. MAC TX/RX
@@ -699,8 +755,9 @@ registry blobs; scheduler/time provide async execution and bounded waits.
 RTL8188EU now reaches the retained channel1 Open/WPA2 station service through
 the production probe when exact-device signed qualification/deployment data
 is present. No real board curve has been acquired, qualified or installed by
-this software work. The initial profile needs physical validation; broader
-channels/rates, reset/rejoin and PM still need software implementation.
+this software work. The initial profile needs physical validation. Qualified
+legacy idle channel changes and passive scans await native acceptance; broader
+rates, active or connected scanning, endpoint reset and PM remain software work.
 
 ## 8. Open questions / remaining software
 
@@ -715,22 +772,22 @@ channels/rates, reset/rejoin and PM still need software implementation.
 | Initial channel/crystal and retained RX activation | Implemented channel1 owner and admitted probe/service binding |
 | Signed board power artifact and checked native TX gate | Implemented software contract; real qualified per-device data must be acquired/signed/installed |
 | Native USB descriptor/packet ownership | Implemented dependency; persistent receipt/stop and Linux descriptor regressions |
-| Native beacon/management preparation and peer-bound transitions | Implemented narrow channel1/basic1Mbps dependency using shared plan |
-| Production passive scan/MLME service and policy-admitted management TX | Implemented narrow channel1/basic1Mbps profile, signed board/deployment admission required |
+| Native beacon/management preparation and peer-bound transitions | Implemented basic1Mbps shared plan; qualified channels1–13 await native acceptance |
+| Production passive scan/MLME service and policy-admitted management TX | Qualified idle passive multi-channel scan/home restoration implemented pending native acceptance; signed board/deployment admission required; active and connected scans remain missing |
 | Software AES-CCM + strict CCMP/key/TID ownership | Implemented dependency; independent ciphertext/forgery/role/PN regressions |
 | WPA2 key installation/controlled port and Ethernet transport | Implemented retained shared RSNA/software CCMP, exact native delivery, Narf-Rings and synchronous stack progress |
-| Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX. Separate N8HT HT20/LGI MCS0..7/whole A-MSDU/decline/capture-publication continuation passes native software gates above. Management/basic1Mbps and channel1 remain required. SGI/HT40, retune, broader bands/adaptation and coexistence remain missing |
+| Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX. Qualified legacy channels1–13 and cold idle FIFO retuning await native acceptance. Separate N8HT HT20/LGI MCS0..7/whole A-MSDU/decline/capture-publication continuation passes native software gates above and stays channel1-bound. Management/basic1Mbps remains required. SGI/HT40, broader bands/adaptation and coexistence remain missing |
 | USB transfer ownership / stale handles | EP0 + bulk claims, retained command DMA and generation rejection implemented; slot reuse stays gated |
 | Non-stream bulk stop/drain | Implemented in USB; exact commands/context/event-prefix proof |
 | Disconnect/peer-loss callbacks and normal bulk stop | Implemented; a completed disconnect returns to Passive (safe rejoin) |
-| EP0/Halted reset, safe rejoin, FIFO retune and PM recovery | Bulk halt recovery and safe rejoin implemented; EP0 reset, FIFO retune and PM missing |
+| EP0/Halted reset, safe rejoin, FIFO retune and PM recovery | Bulk halt recovery and safe rejoin implemented; qualified idle cold FIFO retune awaits native acceptance; EP0 reset and PM remain missing |
 
 Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 `8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional
 BT/S0S1. EU's separately qualified HT20/LGI continuation is software-validated above;
-SGI20/HT40,
-broader active/passive scanning, runtime PM and
-reset/rejoin remain software work. Full WMM AC/TID routing is implemented.
+SGI20/HT40, active scanning and scanning while associated, runtime PM and
+controller-proven EP0 reset remain software work. Qualified idle passive
+multi-channel scanning awaits native acceptance. Full WMM AC/TID routing is implemented.
 
 Power-management inventory (upstream `rtl8xxxu/core.c`): `rtl8xxxu_probe`
 sets only SIGNAL_DBM, HAS_RATE_CONTROL, SUPPORT_FAST_XMIT, AMPDU_AGGREGATION

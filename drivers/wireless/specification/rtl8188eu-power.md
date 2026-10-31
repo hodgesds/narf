@@ -56,12 +56,13 @@ The artifact is tied to every retained Factory field plus USB VID/PID,
 chip/cut/profile; another chip or a replacement device cannot reuse it.
 
 `Calibration::permission(authenticated_domain, channel)` returns an opaque
-fixed-channel gain token. Current runtime channel1 only is admitted. Every
-regulatory rule overlapping 2402..2422MHz must cover the complete 20MHz
-channel, allow 20MHz and contain no unsupported flags. The most restrictive
+fixed-channel gain token for a qualified channel1–13 row. Every regulatory
+rule overlapping that channel's center frequency minus/plus10MHz must cover
+the complete 20MHz channel, allow 20MHz and contain no unsupported flags. The most restrictive
 rule's dBm ceiling is treated conservatively as an EIRP ceiling and intersected
 with board-qualified EIRP. For each modulation class the driver selects only
-an explicitly qualified index at or below the exact factory base, whose
+an explicitly qualified index at or below the exact factory base for channel
+groups1–2,3–5,6–8,9–11 and12–13 (`rtl8188f_channel_to_group`), whose
 conducted upper bound plus maximum antenna gain does not exceed that ceiling.
 Quarter-dB arithmetic never rounds power down. Missing curves, unmeasured
 points, identity mismatch, unsigned/missing artifacts, unsupported policy or

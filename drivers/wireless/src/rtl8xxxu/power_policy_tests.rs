@@ -172,8 +172,8 @@ fn smoke_rtl8188eu_power_intersects_all_regulatory_restrictions() -> TestResult 
             return TestResult::Fail("unsupported rule flag ignored");
         }
     }
-    if c.permission(&domain(20), 6).err() != Some(Error::Policy) {
-        return TestResult::Fail("runtime profile silently retuned");
+    if c.permission(&domain(20), 6).err() != Some(Error::NoMeasuredGain) {
+        return TestResult::Fail("missing channel row acquired a measured power envelope");
     }
     TestResult::Pass
 }

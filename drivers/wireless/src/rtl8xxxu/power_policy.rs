@@ -252,16 +252,19 @@ impl Calibration {
             cap.invoke(NoopOp)
                 .map_err(|_| Error::Firmware(FirmwareError::AuthorityRevoked))?;
         }
-        if channel != 1 || !domain.country_code.iter().all(u8::is_ascii_uppercase) {
+        if !(1..=13).contains(&channel) || !domain.country_code.iter().all(u8::is_ascii_uppercase) {
             return Err(Error::Policy);
         }
+        let center = 2407 + u32::from(channel) * 5;
+        let lower = center - 10;
+        let upper = center + 10;
         let mut ceiling = None;
         for rule in &domain.rules {
-            if rule.freq_start_mhz < 2422 && rule.freq_end_mhz > 2402 {
+            if rule.freq_start_mhz < upper && rule.freq_end_mhz > lower {
                 // A broad permissive rule must not override a narrower
                 // overlapping restriction. Unsupported flags fail closed.
-                if rule.freq_start_mhz > 2402
-                    || rule.freq_end_mhz < 2422
+                if rule.freq_start_mhz > lower
+                    || rule.freq_end_mhz < upper
                     || rule.max_bandwidth_mhz < 20
                     || !rule.flags.is_empty()
                 {
@@ -288,8 +291,18 @@ impl Calibration {
                 })
                 .ok_or(Error::NoMeasuredGain)
         };
-        let cck = select(&curve.cck, self.factory.cck_power[0])?;
-        let ofdm = select(&curve.ofdm, self.factory.ht40_power[0])?;
+        // Linux 8188f.c::rtl8188f_channel_to_group. 8188EU uses the
+        // same source set_tx_power callback; channel14/CCK-only is excluded.
+        let group = match channel {
+            1..=2 => 0,
+            3..=5 => 1,
+            6..=8 => 2,
+            9..=11 => 3,
+            12..=13 => 4,
+            _ => return Err(Error::Policy),
+        };
+        let cck = select(&curve.cck, self.factory.cck_power[group])?;
+        let ofdm = select(&curve.ofdm, self.factory.ht40_power[group])?;
         Ok(Permission {
             factory: self.factory,
             vid: self.vid,

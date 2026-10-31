@@ -26,6 +26,9 @@ const REG_LPLDO_CTRL: u16 = 0x23;
 const REG_AFE_XTAL_CTRL: u16 = 0x24;
 const MCU_RAM_SELECT: u8 = 1 << 7;
 
+#[path = "runtime_restart.rs"]
+mod runtime_restart;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     UnsupportedChip,
@@ -66,6 +69,7 @@ pub enum Stage {
     StartingReceive,
     Receiving,
     ReceiveStopped,
+    Restarting,
     Failed,
 }
 
@@ -186,6 +190,8 @@ pub struct Owner<I: ControlIo> {
     endpoints: IrqSafeSpinLock<Option<super::device_init::Endpoints>>,
     runtime_taken: AtomicBool,
     executable: IrqSafeSpinLock<Option<Executable>>,
+    // Exact uploaded image; a restart invokes its original executable cap.
+    runtime_image: IrqSafeSpinLock<Option<Arc<[u8]>>>,
 }
 
 /// Identity of the exact immutable image uploaded by this retained owner.
@@ -288,6 +294,7 @@ impl<I: ControlIo> Owner<I> {
             endpoints: IrqSafeSpinLock::new(None),
             runtime_taken: AtomicBool::new(false),
             executable: IrqSafeSpinLock::new(None),
+            runtime_image: IrqSafeSpinLock::new(None),
             status: IrqSafeSpinLock::new(Status {
                 stage: Stage::Detected,
                 error: None,
@@ -478,6 +485,15 @@ impl<I: ControlIo> Owner<I> {
         blob: &[u8],
         deadline: narf_time::Deadline,
     ) -> Result<FirmwareInfo, Error> {
+        self.run_device_expected(blob, deadline, None).await
+    }
+
+    async fn run_device_expected(
+        &self,
+        blob: &[u8],
+        deadline: narf_time::Deadline,
+        expected: Option<(super::device_init::Factory, super::device_init::Endpoints)>,
+    ) -> Result<FirmwareInfo, Error> {
         let (info, payload) = parse_image(self.chip, blob)?;
         if self.executable.lock().is_none() {
             #[cfg(any(test, feature = "kernel-test"))]
@@ -485,6 +501,9 @@ impl<I: ControlIo> Owner<I> {
             #[cfg(not(any(test, feature = "kernel-test")))]
             let inert = false;
             *self.executable.lock() = Some(Executable::new(blob, None, inert));
+        }
+        if self.runtime_image.lock().is_none() {
+            *self.runtime_image.lock() = Some(Arc::from(blob));
         }
         self.stage(Stage::Validated);
         narf_time::timeout(deadline, async {
@@ -498,8 +517,11 @@ impl<I: ControlIo> Owner<I> {
                 return Err(Error::BadEndpoints);
             }
             let endpoints = super::device_init::endpoints(&config[..count])?;
-            *self.endpoints.lock() = Some(endpoints);
             let factory = super::device_init::factory(self).await?;
+            if expected.is_some_and(|old| old != (factory, endpoints)) {
+                return Err(Error::BadEfuse);
+            }
+            *self.endpoints.lock() = Some(endpoints);
             *self.factory.lock() = Some(factory);
             self.stage(Stage::FactoryReady);
             self.power_on().await?;

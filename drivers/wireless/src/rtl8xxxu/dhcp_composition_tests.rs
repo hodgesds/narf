@@ -40,6 +40,9 @@ macro_rules! ensure {
         }
     };
 }
+#[path = "channel_composition_tests.rs"]
+mod channel_composition_tests;
+
 fn plan(station: [u8; 6]) -> NetworkPlan {
     NetworkPlan {
         station,

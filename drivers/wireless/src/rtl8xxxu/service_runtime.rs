@@ -13,6 +13,9 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 use zeroize::Zeroizing;
+
+#[path = "service_channels.rs"]
+mod service_channels;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     State,
@@ -40,6 +43,7 @@ pub trait Environment: Send + Sync {
 struct Entry {
     candidate: Candidate,
     seen: u64,
+    generation: u64,
 }
 struct Attempt {
     failed: Arc<AtomicBool>,
@@ -63,6 +67,7 @@ pub struct Service<C: ControlIo, B: packet_transport::Io, E: Environment> {
     own: [u8; 6],
     last_now: u64,
     retire: Option<Arc<dyn Fn() + Send + Sync>>,
+    generation: u64,
 }
 impl<C: ControlIo, B: packet_transport::Io, E: Environment> core::fmt::Debug for Service<C, B, E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -98,6 +103,7 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
             own,
             last_now: now,
             retire: None,
+            generation: 1,
         })
     }
     pub fn phase(&self) -> Phase {
@@ -178,10 +184,19 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
         Ok(now)
     }
     pub fn candidates(&self) -> Vec<Candidate> {
+        if self.current().is_err() {
+            self.failed.store(true, Ordering::Release);
+            return Vec::new();
+        }
         let now = self.environment.now_ms();
         self.cache
             .iter()
-            .filter(|e| now >= e.seen && now - e.seen < 10000)
+            .filter(|e| {
+                now >= e.seen
+                    && now - e.seen < 10000
+                    && (self.radio.is_none()
+                        || self.channel_permission(e.candidate.channel()).is_ok())
+            })
             .map(|e| e.candidate.clone())
             .collect()
     }
@@ -217,6 +232,7 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
                             *entry = Entry {
                                 candidate,
                                 seen: now,
+                                generation: self.generation,
                             };
                         } else {
                             if self.cache.len() == 32 {
@@ -232,6 +248,7 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
                             self.cache.push(Entry {
                                 candidate,
                                 seen: now,
+                                generation: self.generation,
                             });
                         }
                     }
@@ -276,11 +293,50 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
         if self.phase() != Phase::Passive {
             return Err(Error::State);
         }
-        let candidate = self
+        let mut candidate = self
             .candidates()
             .into_iter()
             .find(|b| b.bssid() == bssid && b.ssid() == ssid)
             .ok_or(Error::Profile)?;
+        // Reject malformed caller input before changing the physical stream.
+        let mut preflight =
+            Join::prepare(candidate.clone(), self.own, ssid, mode).map_err(Error::Management)?;
+        preflight.append_sme_ies(ies).map_err(Error::Management)?;
+        if mode.is_wpa2() != pmk.is_some() {
+            return Err(Error::Profile);
+        }
+        if candidate.channel() != self.channel()? {
+            self.select_channel(candidate.channel()).await?;
+        }
+        if !self.cache.iter().any(|entry| {
+            entry.candidate.bssid() == bssid
+                && entry.candidate.ssid() == ssid
+                && entry.generation == self.generation
+        }) {
+            let deadline = self.now()?.checked_add(2_000).ok_or(Error::State)?;
+            for _ in 0..20_000 {
+                self.poll()?;
+                if let Some(entry) = self.cache.iter().find(|entry| {
+                    entry.candidate.bssid() == bssid
+                        && entry.candidate.ssid() == ssid
+                        && entry.generation == self.generation
+                }) {
+                    candidate = entry.candidate.clone();
+                    break;
+                }
+                if self.now()? >= deadline {
+                    return Err(Error::Profile);
+                }
+                self.environment.pause().await;
+            }
+            if !self.cache.iter().any(|entry| {
+                entry.candidate.bssid() == bssid
+                    && entry.candidate.ssid() == ssid
+                    && entry.generation == self.generation
+            }) {
+                return Err(Error::Profile);
+            }
+        }
         let mut plan = Join::prepare_with_phy(
             candidate.clone(),
             self.own,

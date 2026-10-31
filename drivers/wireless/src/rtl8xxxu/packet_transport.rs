@@ -164,6 +164,23 @@ impl<I: Io> Owner<I> {
     pub fn channel(&self) -> u8 {
         self.channel
     }
+    /// Called only after the radio's cold MAC restart, with both old USB
+    /// receipts actually stopped. A channel label never changes under a TD.
+    pub(super) fn retarget_stopped(&mut self, channel: u8) -> Result<(), Error> {
+        self.check_live()?;
+        if !(1..=13).contains(&channel) {
+            return Err(Error::Channel);
+        }
+        if self.receive.is_some() || self.transmit.is_some() || self.is_halted() {
+            return Err(Error::Busy);
+        }
+        self.qos = false;
+        self.ht = false;
+        self.ampdu = None;
+        self.scratch.fill(0);
+        self.channel = channel;
+        Ok(())
+    }
     pub fn is_failed(&self) -> bool {
         self.failed
     }

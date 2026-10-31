@@ -92,8 +92,11 @@ pub(super) struct Model {
     cam_stalled: bool,
     iq_failure: bool,
     rf_read: u8,
-    rf: [u32; 256],
+    pub(super) rf: [u32; 256],
     pub(super) pending_write: Option<u16>,
+    pub(super) cold_generation: u64,
+    pub(super) rx_dma_stalled: bool,
+    pub(super) mac_off_stalled: bool,
 }
 
 impl Model {
@@ -127,6 +130,9 @@ impl Model {
             rf_read: 0,
             rf: [0; 256],
             pending_write: None,
+            cold_generation: 0,
+            rx_dma_stalled: false,
+            mac_off_stalled: false,
         }
     }
 }
@@ -163,8 +169,27 @@ impl ControlIo for Fake {
             g.unsafe_reuses += 1;
         }
         g.ops.push(Op::Read(addr, out.len()));
+        if addr == 0x284 && out.len() == 4 && !g.rx_dma_stalled && g.regs[0x286] & 4 != 0 {
+            g.regs[0x286] |= 2;
+        }
         if addr == REG_APS_FSMCO && out.len() == 4 {
             g.regs[addr as usize + 1] &= !1; // MAC enable handshake completes.
+            if g.regs[addr as usize + 1] & 2 != 0
+                && !g.mac_off_stalled
+                && g.regs[0x1f] == 0
+                && g.regs[0x23] & 16 != 0
+                && g.regs[REG_SYS_FUNC as usize + 1] & 4 == 0
+            {
+                // The real power-FSM terminal, not an MCU reset or host epoch,
+                // invalidates MAC/RX FIFO ownership before cold reinitialization.
+                g.regs[addr as usize + 1] &= !2;
+                g.cold_generation += 1;
+                g.rf.fill(0);
+                for page in &mut g.pages {
+                    page.clear();
+                }
+                g.regs[0x284..0x288].fill(0);
+            }
         }
         if addr == REG_MCU_FW_DL && g.regs[addr as usize] & MCU_FW_DL_ENABLE == 0 {
             if g.checksum && g.pages.iter().any(|page| !page.is_empty()) {

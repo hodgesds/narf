@@ -1,12 +1,15 @@
-//! Retained first-channel native radio owner. TX starts only through the
-//! private signed-power path; the controlled port remains closed. Reusing
-//! this owner never changes the channel label.
+//! Retained native radio owner. TX starts only through the private signed
+//! power path; the controlled port remains closed. An idle channel change
+//! requires complete MAC/FIFO/USB retirement before a new receive stream.
 use super::{
     firmware_transport::{ControlIo, Error as ControlError, Owner as Firmware, Stage},
     packet_codec::{Mpdu, Record},
     packet_transport::{self, Io as PacketIo, Owner as Packets},
 };
 use alloc::{sync::Arc, vec::Vec};
+
+#[path = "receive_retune.rs"]
+mod receive_retune;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -29,7 +32,8 @@ pub enum Phase {
 }
 /// The caller authenticates the deployment regulatory domain; this value
 /// bounds the supported receive profile and grants no TX gain/power authority. The initial
-/// profile receives on channel1 only; no hot retune is implemented.
+/// profile receives on channel1. Later idle channel changes need the separate
+/// signed operating profile and actual cold MAC/FIFO/USB retirement.
 #[derive(Debug, Clone, Copy)]
 pub struct Permission {
     channel: u8,
@@ -56,6 +60,7 @@ pub struct Receiver<C: ControlIo, B: PacketIo> {
     peer: Option<[u8; 6]>,
     wmm: Option<Arc<super::wmm_runtime::Proof>>,
     ht: Option<Arc<super::ht_runtime::Grant>>,
+    home_ht: Option<Arc<super::ht_runtime::Grant>>,
     ht_gains: Option<[u8; 8]>,
     /// `priv->ra_info` while a station association is bound.
     ra: Option<super::rate_adaptation::RateAdaptation>,
@@ -137,6 +142,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
             peer: None,
             wmm: None,
             ht: None,
+            home_ht: None,
             ht_gains: None,
             ra: None,
             report_time: None,
@@ -209,6 +215,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
             self.fail();
             return result;
         }
+        self.home_ht = Some(grant.clone());
         self.ht = Some(grant);
         self.ht_gains = Some(gains);
         self.phase = Phase::Prepared;

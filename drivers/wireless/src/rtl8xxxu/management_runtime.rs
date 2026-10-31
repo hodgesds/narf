@@ -64,7 +64,7 @@ impl Candidate {
         local: [u8; 6],
         phy: Option<&association::phy::LocalPhy>,
     ) -> Result<Self, Error> {
-        if channel != 1 || !unicast(&local) || !native(frame) {
+        if !(1..=13).contains(&channel) || !unicast(&local) || !native(frame) {
             return Err(Error::Profile);
         }
         let bytes = &frame.bytes;
