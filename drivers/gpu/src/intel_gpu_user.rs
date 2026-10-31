@@ -9,9 +9,10 @@ use crate::{
     intel_gpu_exec::ResidentBatch, intel_gpu_fence::CompletionFence, intel_gpu_gt::GtPlatform,
     intel_gpu_rcs::GpuBacking,
 };
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use narf_filesystem::{FsError, FsFuture};
+use core::{future::Future, pin::Pin};
+use narf_filesystem::{FsError, FsFuture, InstallFdError, IoctlContext};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -45,6 +46,55 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
         context: Arc<UserContext>,
         batch: UserBatch,
     ) -> FsFuture<'a, Arc<CompletionFence>>;
+
+    fn submit_with_output<'a>(
+        &'a self,
+        _context: Arc<UserContext>,
+        _batch: UserBatch,
+        _output: UserOutput<'a>,
+    ) -> OutputFuture<'a> {
+        Box::pin(async { Err(OutputError::Io(FsError::Unsupported)) })
+    }
+}
+
+pub type OutputFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Arc<CompletionFence>, OutputError>> + Send + 'a>>;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum OutputError {
+    Io(FsError),
+    Install(InstallFdError),
+}
+impl From<FsError> for OutputError {
+    fn from(error: FsError) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// A borrowed fault-aware output transaction. Install/copyout happens after
+/// all fallible GT preparation and immediately before non-failing enqueue.
+pub struct UserOutput<'a> {
+    pub user: &'a dyn IoctlContext,
+    pub address: u64,
+    pub input: u32,
+}
+impl core::fmt::Debug for UserOutput<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UserOutput")
+            .field("address", &self.address)
+            .field("input", &self.input)
+            .finish_non_exhaustive()
+    }
+}
+impl UserOutput<'_> {
+    pub(crate) fn install(&self, fence: Arc<CompletionFence>) -> Result<(), InstallFdError> {
+        self.user
+            .install_sync_file(vec![fence], &mut |fd| {
+                let value = u64::from(self.input) | ((fd as u32 as u64) << 32);
+                self.user.write(self.address, &value.to_le_bytes())
+            })
+            .map(|_| ())
+    }
 }
 
 /// Untrusted instructions can name only this immutable private PPGTT graph.

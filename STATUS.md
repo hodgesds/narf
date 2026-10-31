@@ -953,12 +953,19 @@ without replaying their batches. Failed cleanup remains closed.
 Native Rust models exercise the actual ioctl -> GT -> CT -> PPGTT execution
 and retirement chain, context save/restore/isolation across six IP variants,
 cache failure rollback, cancellation, handle/fd close and reset/epoch ownership.
-Intel silicon and Mesa OpenGL/Vulkan acceptance, explicit submission fences,
-other engines, local VRAM and accelerated presentation remain outstanding.
-The conservative scheduler also requires a restart after 65534 request IDs;
-transparent identity recycling remains open for sustained workloads.
-Validation passes 88 selected native Intel tests on each architecture, including
-five new userspace smokes, with zero failures/skips. GPU CI Clippy passes all
+The next continuation adds explicit sync_file IN/OUT fences, per-open binary
+and timeline syncobj submission, transactional output-fd publication and
+retained dependency snapshots. Native tests cover fd/handle close, cancellation,
+timeline order and publication failures. A round-robin GuC ID pool now reuses
+identities only after verified retirement, with independent request stamps and
+TLB cookies, removing the 65534-request limit. Priming holds the seed ID until
+the distinct switch/capture completes. Native conversations exercise more than
+65534 requests, stale evidence after reuse, pool exhaustion and stamp wrap.
+Intel silicon and Mesa OpenGL/Vulkan acceptance, FENCE_SUBMIT, other engines,
+local VRAM and accelerated presentation remain outstanding.
+Validation passes 107 selected Intel/DRM tests on x86_64 and 95 on aarch64,
+including seven new explicit-fence/ID-recycling smokes and twelve existing
+DRM synchronization tests on x86_64, with zero failures/skips. GPU CI Clippy passes all
 three feature contexts on x86_64 and aarch64; host default, Intel-only, AMD-only
 and no-vendor all-target checks pass. Intel-only debug builds, formatting,
 both production boots and both btrfs postflights per architecture pass.

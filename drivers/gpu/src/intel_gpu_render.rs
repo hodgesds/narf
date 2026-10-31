@@ -207,6 +207,7 @@ impl Namespaces {
 #[derive(Debug)]
 pub struct RenderFile {
     pub gem: GemState,
+    pub(crate) syncobjs: IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>,
     namespaces: IrqSafeSpinLock<Namespaces>,
 }
 
@@ -220,6 +221,7 @@ impl RenderFile {
     pub const fn new() -> Self {
         Self {
             gem: GemState::new(),
+            syncobjs: IrqSafeSpinLock::new(crate::drm::syncobj::SyncObjTable::new()),
             namespaces: IrqSafeSpinLock::new(Namespaces {
                 next_context: 1,
                 next_vm: 1,
@@ -272,7 +274,19 @@ impl RenderFile {
         user: &dyn IoctlContext,
     ) -> Option<Result<u64, FsError>> {
         if matches!(cmd, abi::GEM_EXECBUFFER2 | abi::GEM_EXECBUFFER2_WR) {
-            return Some(self.exec_ioctl(info, arg, user).await.map(|()| 0));
+            return Some(self.exec_ioctl(info, arg, user).await);
+        }
+        if crate::drm_uapi::ioc_type(cmd) == b'd' as u32
+            && crate::drm::syncobj_ioctl::is_syncobj_ioctl(crate::drm_uapi::ioc_nr(cmd))
+        {
+            return crate::drm::syncobj_ioctl::dispatch(
+                crate::drm_uapi::ioc_nr(cmd),
+                arg as usize,
+                &self.syncobjs,
+                true,
+                user,
+            )
+            .await;
         }
         if cmd == abi::GEM_THROTTLE {
             let fences: Vec<_> = {
@@ -307,8 +321,13 @@ impl RenderFile {
         info: &DeviceInfo,
         arg: u64,
         user: &dyn IoctlContext,
-    ) -> Result<(), FsError> {
-        let request = crate::intel_gpu_exec::ExecRequest::read(user, arg, &self.gem)?;
+    ) -> Result<u64, FsError> {
+        use crate::intel_gpu_user::{OutputError, UserOutput};
+        let (request, sync) =
+            crate::intel_gpu_exec::ExecRequest::read_submission(user, arg, &self.gem)?;
+        let output = sync.output;
+        let input_word = sync.input_word;
+        let sync = sync.resolve(&self.syncobjs)?;
         let context = {
             let mut namespaces = self.namespaces.lock();
             namespaces.initialize();
@@ -321,6 +340,7 @@ impl RenderFile {
         };
         let backend = info.backend.as_ref().ok_or(FsError::NotImplemented)?;
         let _order = context.serial.lock().await;
+        sync.wait().await;
         if let Some(previous) = context.last() {
             previous
                 .wait()
@@ -337,13 +357,41 @@ impl RenderFile {
                 entry.object.wait_idle(entry.writable, None).await?;
             }
             let batch = request.prepare_user(status.platform)?;
-            match backend.submit(context.clone(), batch).await {
-                Ok(_) => return Ok(()),
-                Err(FsError::WouldBlock) => {
+            let result = if output {
+                let address = arg.checked_add(56).ok_or(FsError::BadAddress)?;
+                backend
+                    .submit_with_output(
+                        context.clone(),
+                        batch,
+                        UserOutput {
+                            user,
+                            address,
+                            input: input_word,
+                        },
+                    )
+                    .await
+            } else {
+                backend
+                    .submit(context.clone(), batch)
+                    .await
+                    .map_err(OutputError::Io)
+            };
+            match result {
+                Ok(fence) => {
+                    sync.publish(fence);
+                    return Ok(0);
+                }
+                Err(OutputError::Io(FsError::WouldBlock)) => {
                     narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant())
                         .await;
                 }
-                Err(error) => return Err(error),
+                Err(OutputError::Io(error)) => return Err(error),
+                Err(OutputError::Install(narf_filesystem::InstallFdError::NoDescriptor)) => {
+                    return Ok((-24i64) as u64)
+                }
+                Err(OutputError::Install(narf_filesystem::InstallFdError::Report(error))) => {
+                    return Err(error)
+                }
             }
         }
     }
@@ -451,6 +499,22 @@ impl RenderFile {
     ) -> Option<Result<u64, FsError>> {
         if cmd == crate::drm_uapi::DRM_IOCTL_VERSION && info.submission_ready() {
             return Some(version(arg, user).map(|()| 0));
+        }
+        if cmd == crate::drm_uapi::DRM_IOCTL_GET_CAP {
+            let result = (|| {
+                let mut request = read(user, arg, 16)?;
+                if !matches!(u64_at(&request, 0), 0x13 | 0x14) {
+                    return Ok(None);
+                }
+                put64(&mut request, 8, u64::from(info.submission_ready()));
+                user.write(arg, &request)?;
+                Ok(Some(0))
+            })();
+            match result {
+                Ok(None) => return None,
+                Ok(Some(value)) => return Some(Ok(value)),
+                Err(error) => return Some(Err(error)),
+            }
         }
         let nr = crate::drm_uapi::ioc_nr(cmd);
         if crate::drm_uapi::ioc_type(cmd) != b'd' as u32 {
@@ -849,7 +913,7 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
     Ok(match param {
         4 => info.device_id as i32,
         5 => 1, // GEM storage is available independently of acceleration.
-        9 | 25 | 26 | 37 | 48 | 50 => i32::from(info.submission_ready()),
+        9 | 25 | 26 | 37 | 44 | 48 | 49 | 50 | 55 => i32::from(info.submission_ready()),
         18 => {
             if info.submission_ready() {
                 3
@@ -870,9 +934,10 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
         | 31
         | 35..=36
         | 38..=39
-        | 41..=47
-        | 49
-        | 52..=59 => 0,
+        | 41..=43
+        | 45..=47
+        | 52..=54
+        | 56..=59 => 0,
         _ => return Err(FsError::InvalidData),
     })
 }

@@ -6,6 +6,97 @@ mod userspace {
     include!("intel_gpu_user_tests.rs");
 }
 
+fn smoke_hardware_id_recycling_beyond_16bit_request_limit() -> TestResult {
+    let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+    hardware_discovery(&mut gt, &w, 0xdfc);
+    hardware_scheduling(&mut gt, &w);
+    let baseline = arena.live_allocations();
+    let mut registered = BTreeMap::new();
+    for request in 0..65540u64 {
+        let start = 100 + request * 50;
+        let (id, fence) = gt.submit_kernel_probe(start).unwrap();
+        assert_eq!(u64::from(id), request % 64 + 1);
+        for now in start + 1..start + 40 {
+            assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+            service_contexts(&w, &mut registered, true);
+            if fence.result().is_some() {
+                break;
+            }
+        }
+        assert_eq!(fence.result(), Some(Ok(())));
+        assert!(registered.is_empty());
+        assert_eq!(arena.live_allocations(), baseline);
+    }
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_id_recycling_beyond_16bit_request_limit
+);
+
+fn smoke_hardware_recycled_id_rejects_stale_cookie_and_breadcrumb() -> TestResult {
+    for stale_cookie in [true, false] {
+        let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+        hardware_discovery(&mut gt, &w, 0xdfc);
+        hardware_scheduling(&mut gt, &w);
+        let mut registered = BTreeMap::new();
+        for request in 0..64u64 {
+            let start = 100 + request * 50;
+            let (_, fence) = gt.submit_kernel_probe(start).unwrap();
+            for now in start + 1..start + 40 {
+                assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+                service_contexts(&w, &mut registered, true);
+                if fence.result().is_some() {
+                    break;
+                }
+            }
+            assert_eq!(fence.result(), Some(Ok(())));
+        }
+        let (id, fence) = gt.submit_kernel_probe(4000).unwrap();
+        assert_eq!(id, 1);
+        if stale_cookie {
+            assert_eq!(gt.poll(4001), Poll::Ready(Ok(GtState::SchedulingReady)));
+            event(&ct_memory(&w), 0x7001, &[1]);
+        } else {
+            for now in 4001..4010 {
+                assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+                service_contexts(&w, &mut registered, false);
+                if let Some(base) = registered.get(&1) {
+                    w.0.borrow().memory[base].borrow_mut()[0x800 / 4] = 1;
+                    break;
+                }
+            }
+        }
+        let baseline = arena.live_allocations();
+        let mut lost = false;
+        for now in 4010..4020 {
+            if matches!(gt.poll(now), Poll::Ready(Err(_))) {
+                lost = true;
+                break;
+            }
+            service_contexts(&w, &mut registered, false);
+        }
+        assert!(lost);
+        assert!(fence.result().is_none());
+        assert_eq!(arena.live_allocations(), baseline);
+        hardware_stop(&mut gt, &w, 0xdfc);
+        assert_eq!(
+            fence.result(),
+            Some(Err(crate::intel_gpu_fence::JobError::Reset))
+        );
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_recycled_id_rejects_stale_cookie_and_breadcrumb
+);
+
 fn hardware_model(platform: GtPlatform, ack: u64) -> (Window, Arena, GuCGt<Window, Arena>) {
     hardware_model_with_interface(platform, ack, 1)
 }
@@ -675,8 +766,17 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     let ring_backing = d.memory[&ring_base].clone();
                     let ring = ring_backing.borrow();
                     let tail = image.borrow()[1024 + 7];
+                    let stamp = if tail == 32 {
+                        ring[5]
+                    } else {
+                        ring[..tail as usize / 4]
+                            .windows(6)
+                            .find(|v| v[..4] == [0x7a000004, 0x01104080, base + 0x800, 0])
+                            .expect("GGTT post-sync immediate")[4]
+                    };
+                    assert_ne!(stamp, 0);
                     if image.borrow()[1024 + 0x33] != 0 {
-                        execute_ppgtt_probe(&d.regs, &image.borrow(), &ring, id, base);
+                        execute_ppgtt_probe(&d.regs, &image.borrow(), &ring, stamp, base);
                     } else if tail != 32 {
                         let (svg, used) =
                             crate::intel_gpu_context::tests::execute(&ring[1..], &mut d.regs);
@@ -707,14 +807,14 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                                 0x10400002,
                                 base + 0x800,
                                 0,
-                                id,
+                                stamp,
                                 0x01000000,
                                 0
                             ]
                         );
                         assert_eq!(tail, 32);
                     }
-                    image.borrow_mut()[0x800 / 4] = id;
+                    image.borrow_mut()[0x800 / 4] = stamp;
                     image.borrow_mut()[1024 + 5] = tail;
                 }
                 event(&memory, 0x1002, &[id, request[2]]);
@@ -1518,7 +1618,7 @@ fn smoke_hardware_context_pressure_and_identity() -> TestResult {
     assert!(fences.iter().all(|f| f.result() == Some(Ok(()))));
     assert_eq!(arena.live_allocations(), baseline);
     let (id, _) = gt.submit_kernel_probe(61).unwrap();
-    assert_eq!(id, 65);
+    assert_eq!(id, 1, "fully retired identities are recyclable");
     hardware_stop(&mut gt, &w, 0x130044);
     drop(gt);
     assert_eq!(arena.live_allocations(), 0);

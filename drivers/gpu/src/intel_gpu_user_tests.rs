@@ -604,3 +604,7 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_user",
     smoke_userspace_primary_render_nodes_and_context_namespaces
 );
+
+mod explicit {
+    include!("intel_gpu_explicit_tests.rs");
+}

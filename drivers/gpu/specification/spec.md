@@ -150,7 +150,7 @@ SW_FINISH also wait for conflicting reservations. Synchronous kernel dispatch
 returns WouldBlock for a pending nonzero wait; primary/render `ioctl_user`
 awaits without retaining IRQ-safe locks. Indefinite side-effect-free user waits
 use `restart_after` when available; finite waits retain their copied deadline.
-External explicit-fence import and accelerated presentation remain unavailable.
+Accelerated presentation and dma-buf IMPORT_SYNC_FILE remain unavailable.
 
 Context/VM create, destroy and scalar GET/SETPARAM have per-open namespaces,
 bounded extension chains and retained VM identity after VM-handle destruction.
@@ -171,8 +171,10 @@ absence returns -ENODEV. GuC submission-version returns -ENODEV until the usersp
 interface is admitted; live replies contain branch=0 and the loaded CSS's
 submission major/minor/patch, independently of its firmware release.
 HAS_EXECBUF2/NO_RELOC/HANDLE_LUT/SOFTPIN/BATCH_FIRST/CONTEXT_ISOLATION and
-HAS_ALIASING_PPGTT=3 follow live admission. Unsupported engines and explicit
-fence/syncobj submission extensions are never advertised.
+HAS_ALIASING_PPGTT=3 follow live admission. HAS_EXEC_FENCE,
+HAS_EXEC_FENCE_ARRAY and HAS_EXEC_TIMELINE_FENCES, plus DRM_CAP_SYNCOBJ and
+DRM_CAP_SYNCOBJ_TIMELINE, also follow live admission. Unsupported engines and
+FENCE_SUBMIT are never advertised.
 
 `drm_registry::driver_name` recognizes `intel-gpu` so both primary and render
 nodes reach Intel dispatch and retain their GEM mmap/PRIME namespaces.
@@ -185,8 +187,9 @@ RAM as system RAM; no local-memory region or Arc display binding is inferred.
 `intel_gpu_exec::ExecRequest::read` admits a bounded softpin/no-relocation
 residency plan: this file's unique handles, valid canonical GPU addresses,
 alignment, non-overlap, first/last batch selection and in-object batch extent.
-Secure execution, relocations, sync/fence extensions and unsupported flags are
-refused. `address_space(format, pat_index)` constructs immutable private PPGTT
+Secure execution, relocations and unsupported flags are refused.
+`read_submission` additionally copies explicit synchronization once;
+`address_space(format, pat_index)` constructs immutable private PPGTT
 tables retaining every referenced object; failed construction tears down all
 tables. An existing VM/engine is never changed by admission. The plan's WRITE
 bit selects writable leaves in this restricted path. Async EXECBUFFER2 and its
@@ -197,6 +200,38 @@ after reservation/queue contention reuses the copied request; a queued job is
 never replayed. Dropping a waiter, context handle, GEM handle or fd does not
 cancel hardware ownership. Synchronous kernel dispatch returns WouldBlock for
 a live backend; it cannot bridge a wait that depends on the GT worker.
+
+The userspace path accepts EXEC_FENCE_IN/OUT, EXEC_FENCE_ARRAY, and the
+TIMELINE_FENCES extension through EXEC_USE_EXTENSIONS. FENCE_IN resolves this
+process's sync_file fd (low32 of rsvd2); invalid/non-sync-file fds return EINVAL.
+Every input leaf and syncobj payload is retained before waiting, so close,
+destroy, replacement or user-memory edits cannot retarget a pending request.
+Each render open owns an independent SyncObjTable and routes the common DRM
+binary/timeline create/destroy/wait/signal/fd/query/transfer ioctls to it.
+Binary arrays use num_cliprects entries of {handle:u32, flags:u32}; WAIT=1,
+SIGNAL=2. Timeline extensions use the 32-byte i915 base, count:u64,
+handles_ptr:u64 and values_ptr:u64. Arrays and extensions are mutually
+exclusive; flags, reserved fields, unknown extensions, cycles and same-point
+timeline WAIT|SIGNAL fail before publication. Limits are 16 extension links
+and 4096 entries/dependencies per request. Existing timeline payloads preserve
+ordering, including when a SIGNAL point has not yet been submitted.
+Explicit waits use timer awaits without holding IRQ-safe locks or restarting
+a copied ioctl. After admission, output syncobjs reference the exact terminal
+job fence, with binary replacement or timeline chain publication; retained
+object Arcs survive handle destruction. Software syncobj signal cannot signal
+the underlying hardware job.
+
+`UserBackend::submit_with_output` and
+`GuCGt::submit_user_batch_with_output` use a borrowed `UserOutput` transaction.
+After allocation, reservation and cache publication succeed, install_sync_file
+reserves an O_CLOEXEC descriptor, reports it in high32 of rsvd2 while preserving
+low32, and installs the exact CompletionFence. Only then does the GT perform
+its non-failing enqueue, with no await between fd installation and publication.
+Descriptor exhaustion returns EMFILE; copyout/install failure rolls back the
+context claim and all backing/reservations without queueing work or installing
+a descriptor. No failed output transaction consumes a GuC ID or request stamp.
+Reset completion is terminal for the exported fence; dropping/closing an
+output fd cannot abandon hardware ownership.
 
 `intel_gpu_user::UserBackend` exposes a live `UserStatus` and async `submit`:
 Err guarantees no job was queued; Ok returns the GT's terminal fence and
@@ -484,11 +519,21 @@ contexts, each with its own coherent 8-KiB ring and 14-page MTL/DG2 or 4-page
 BMG LRC. Literal register-state groups follow the platform's Xe LRC layout.
 `GuCGt::submit_kernel_probe` and async `intel_gpu_gt_runtime::kernel_probe(card)`
 return a completion fence for a fixed owned command stream that writes its
-context ID to its own breadcrumb. They accept no user GPU instructions or
-external addresses. IDs are never reused within a GT lifetime: IDs 1..65534
-are available across diagnostics and user jobs. Exhaustion returns
-IdentityExhausted/EIO rather than retrying forever; transparent ID recycling
-remains outstanding.
+request stamp to its own breadcrumb. They accept no user GPU instructions or
+external addresses. A round-robin pool reuses GuC IDs 1..64 only after
+disable/deregister, exact head/breadcrumb and final TLB acknowledgement; all
+unretired IDs remain leased, including during failed cleanup. Priming retains
+the seed's ID until the different switch context retires and capture succeeds.
+There is no lifetime request-count limit. Independent nonzero 31-bit stamps
+identify requests; pre-invalidation cookies carry the stamp and retirement
+cookies add bit31. On wrap, every live stamp is skipped. Breadcrumbs compare
+the request stamp rather than the recyclable context ID. Old generation-bearing
+TLB ACKs and breadcrumbs close admission without completing a replacement job.
+Full-width cookies follow `intel_guc_submission.c::guc_send_invalidate_tlb`'s
+32-bit lookup allocation; no context-ID bits are interpreted as a generation.
+Scheduling/deregister responses carry only the ID: reuse depends on GuC's
+deregistration contract (as in Xe), which ends the old context's messages.
+The final TLB ACK additionally proves our backing reclamation barrier.
 
 `GuCGt::submit_kernel_batch` consumes a `ResidentBatch` prepared for that exact
 GT profile. This is an unsafe trusted-kernel interface: all instructions and

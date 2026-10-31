@@ -1519,8 +1519,14 @@ batch replay. Gen12 production execlists helpers
 refuse Meteor/Arrow Lake before MMIO. The physical GuC owner now supplies
 per-card startup, kernel context scheduling, completion and full-engine reset
 ownership. Live geometry/compute DSS and EU fuses now feed per-card topology
-queries. Other engine/media/cache inventory, explicit fence extensions,
-accelerated presentation and Intel silicon/Mesa acceptance remain open.
+queries. Explicit sync_file IN/OUT fences, binary syncobj arrays and timeline
+extensions now connect to the exact terminal job fence. Each open owns its
+own binary/timeline syncobj table; dependencies and signal objects survive
+handle/fd close. Output fd reservation and rsvd2 copyout precede non-failing
+enqueue, so EMFILE/EFAULT cannot queue an unreported job. Array/extension
+bounds, flags, cycles and timeline WAIT|SIGNAL conflicts fail before publication.
+Other engine/media/cache inventory, accelerated presentation and Intel
+silicon/Mesa acceptance remain open.
 
 `intel_gpu_guc` now supplies validated CSS component ranges and coherent CTB
 send/receive primitives. `intel_gpu_guc_firmware` acquires a bounded immutable
@@ -1582,13 +1588,14 @@ engine reset remains disabled pending coordinated recovery. The scheduler
 owns HWS plus a distinct LRC and 8-KiB ring for each of at most 64 kernel probe
 contexts. MTL/DG2 use 14-page LRCs, BMG four pages, with Xe register-state groups.
 The original safe submission entry admits a fixed owned GGTT breadcrumb.
-The resident interface below adds trusted kernel PPGTT work; user commands
-remain unavailable.
+The resident interface below adds trusted kernel PPGTT work; the separate
+nonsecure userspace entry requires the startup probes and live backend.
 
 `intel_gpu_guc_sched` sends GGTT invalidation, context registration, policy,
 enable, disable and deregistration through real CT rings. Full rings retry
 without losing phase; stale/foreign events and deadlines close admission.
-Context IDs are never reused within the GT lifetime. Fences require the GPU
+Context IDs are reused only after verified retirement, with independent
+request stamps and TLB cookies. Fences require the GPU
 breadcrumb, saved ring head, deregistration ACK and correlated final TLB
 completion; scheduling ACKs alone cannot complete a job. A canceled waiter
 leaves the context owned. Uncertain jobs survive until GuC reset/DMA idle plus
@@ -1798,17 +1805,20 @@ acceptance or a claim of complete acceleration.
 | Area | Current checkpoint | Still required |
 | --- | --- | --- |
 | GuC execution | Owned GGTT/PPGTT jobs, primed/persistent user RCS state, verified register policy, graphics-GT/RCS workarounds on MTL/Arrow, DG2 and BMG | Other engines, remaining out-of-band workarounds and silicon qualification |
-| Render UAPI | Per-open GEM/contexts, live RCS0 EXECBUFFER2/WR, busy/wait/domain synchronization, implicit fences, context loss/banning and fresh-epoch rebuild | Explicit submission fence/syncobj extensions and Mesa interoperability |
+| Render UAPI | Per-open GEM/contexts/syncobjs, live RCS0 EXECBUFFER2/WR, implicit and explicit fd/binary/timeline fences, context loss/banning and fresh-epoch rebuild | FENCE_SUBMIT and Mesa interoperability |
 | Engines and platforms | Main-GT DSS/EU discovery and RCS0 kernel scheduling; separate Gen12 foundations | Fused engine/cache/media inventory, compute/copy/media submission and independently sourced profiles for other IP |
 | Memory and presentation | Owned system RAM, private tables and same-card CPU PRIME mappings | Local VRAM, accelerated PRIME/presentation and GPU/KMS synchronization |
 | Display | Gen12 paths and owned Xe-LPG internal-panel modeset | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |
 | Power and faults | Bounded polling, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery | IRQ delivery, finer engine recovery and safe runtime autosuspend |
 | Acceptance | Native register/CT/page-walk and ownership models on both kernel architectures | Intel silicon execution, suspend/resume and Mesa OpenGL/Vulkan interoperability |
 
-The conservative scheduler still consumes a unique GuC ID per request and
-refuses admission after ID 65534 rather than recycling an identity that might
-match stale events. Transparent ID reuse remains required for sustained
-long-running workloads.
+The scheduler now recycles a round-robin pool of 64 GuC IDs after verified
+retirement, removing the 65534-request lifetime limit. Request stamps and TLB
+cookies are independent of those IDs; wrap skips live stamps and old
+generation-bearing evidence cannot retire a replacement job. The seed ID stays
+leased through the forced switch/capture sequence. As in Linux Xe, ID-only
+scheduling responses rely on GuC's deregistration contract; the final TLB ACK
+also proves our reclamation barrier. Failed stop/capture retains leased IDs.
 
 Graphics APIs, shader compilation and application state generation belong in
 userspace; the kernel must supply the supported execution and memory contracts.

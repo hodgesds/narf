@@ -490,12 +490,32 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         context: Arc<crate::intel_gpu_user::UserContext>,
         batch: crate::intel_gpu_user::UserBatch,
     ) -> Result<(u16, Arc<crate::intel_gpu_fence::CompletionFence>), GtError> {
+        self.submit_user_inner(now, context, batch, None)
+    }
+
+    pub fn submit_user_batch_with_output(
+        &mut self,
+        now: u64,
+        context: Arc<crate::intel_gpu_user::UserContext>,
+        batch: crate::intel_gpu_user::UserBatch,
+        output: &crate::intel_gpu_user::UserOutput<'_>,
+    ) -> Result<(u16, Arc<crate::intel_gpu_fence::CompletionFence>), GtError> {
+        self.submit_user_inner(now, context, batch, Some(output))
+    }
+
+    fn submit_user_inner(
+        &mut self,
+        now: u64,
+        context: Arc<crate::intel_gpu_user::UserContext>,
+        batch: crate::intel_gpu_user::UserBatch,
+        output: Option<&crate::intel_gpu_user::UserOutput<'_>>,
+    ) -> Result<(u16, Arc<crate::intel_gpu_fence::CompletionFence>), GtError> {
         self.admit_scheduling()?;
         self.parts
             .scheduler
             .as_mut()
             .ok_or(GtError::State)?
-            .submit_user(now, context, batch)
+            .submit_user(now, context, batch, output)
             .map_err(GtError::Scheduling)
     }
 

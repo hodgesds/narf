@@ -710,6 +710,8 @@ pub mod intel_gpu_edp;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_exec;
 #[cfg(feature = "intel")]
+mod intel_gpu_exec_sync;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_fence;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_forcewake;

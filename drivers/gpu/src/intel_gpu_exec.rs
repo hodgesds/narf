@@ -116,29 +116,57 @@ impl ExecRequest {
     pub fn read(user: &dyn IoctlContext, address: u64, gem: &GemState) -> Result<Self, FsError> {
         let mut request = [0; 64];
         user.read(address, &mut request)?;
-        let count = u32_at(&request, 8) as usize;
-        let start = u32_at(&request, 12) as u64;
-        let length = u32_at(&request, 16) as u64;
-        let flags = u64_at(&request, 40);
-        let supported = 0x3f | abi::EXEC_NO_RELOC | abi::EXEC_HANDLE_LUT | abi::EXEC_BATCH_FIRST;
+        Self::read_wire(user, &request, gem, false)
+    }
+
+    pub(crate) fn read_submission(
+        user: &dyn IoctlContext,
+        address: u64,
+        gem: &GemState,
+    ) -> Result<(Self, crate::intel_gpu_exec_sync::SyncRequest), FsError> {
+        let mut request = [0; 64];
+        user.read(address, &mut request)?;
+        let sync = crate::intel_gpu_exec_sync::SyncRequest::read(user, &request)?;
+        Ok((Self::read_wire(user, &request, gem, true)?, sync))
+    }
+
+    fn read_wire(
+        user: &dyn IoctlContext,
+        request: &[u8; 64],
+        gem: &GemState,
+        explicit: bool,
+    ) -> Result<Self, FsError> {
+        let count = u32_at(request, 8) as usize;
+        let start = u32_at(request, 12) as u64;
+        let length = u32_at(request, 16) as u64;
+        let flags = u64_at(request, 40);
+        let mut supported =
+            0x3f | abi::EXEC_NO_RELOC | abi::EXEC_HANDLE_LUT | abi::EXEC_BATCH_FIRST;
+        if explicit {
+            supported |= abi::EXEC_FENCE_IN
+                | abi::EXEC_FENCE_OUT
+                | abi::EXEC_FENCE_ARRAY
+                | abi::EXEC_USE_EXTENSIONS;
+        }
         if count == 0
             || count > MAX_OBJECTS
             || flags & !supported != 0
             || flags & abi::EXEC_NO_RELOC == 0
             || flags & 0x3f > abi::EXEC_RENDER
-            || u32_at(&request, 20) != 0
-            || u32_at(&request, 24) != 0
-            || u32_at(&request, 28) != 0
-            || u64_at(&request, 32) != 0
-            || u64_at(&request, 48) > u32::MAX as u64
-            || u64_at(&request, 56) != 0
+            || u32_at(request, 20) != 0
+            || u32_at(request, 24) != 0
+            || (!explicit
+                && (u32_at(request, 28) != 0
+                    || u64_at(request, 32) != 0
+                    || u64_at(request, 56) != 0))
+            || u64_at(request, 48) > u32::MAX as u64
             || start % 8 != 0
             || length % 8 != 0
         {
             return Err(FsError::InvalidData);
         }
         let mut wire = vec![0; count * 56];
-        user.read(u64_at(&request, 0), &mut wire)?;
+        user.read(u64_at(request, 0), &mut wire)?;
         let mut handles = BTreeSet::new();
         let mut objects = Vec::new();
         objects
@@ -211,7 +239,7 @@ impl ExecRequest {
             return Err(FsError::InvalidData);
         }
         Ok(Self {
-            context_id: u64_at(&request, 48) as u32,
+            context_id: u64_at(request, 48) as u32,
             batch_va: batch.va + start,
             batch_len,
             objects,

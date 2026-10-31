@@ -105,34 +105,70 @@ impl crate::intel_gpu_user::UserBackend for Backend {
         batch: crate::intel_gpu_user::UserBatch,
     ) -> narf_filesystem::FsFuture<'a, Arc<CompletionFence>> {
         Box::pin(async move {
-            let owner = self
-                .owner
-                .upgrade()
-                .ok_or(narf_filesystem::FsError::NoDevice)?;
-            let mut state = owner.state.lock().await;
-            if state.phase != Phase::Running || owner.suspended.load(Ordering::Acquire) {
-                return Err(narf_filesystem::FsError::NoDevice);
+            self.submit_request(context, batch, None)
+                .await
+                .map_err(|error| match error {
+                    crate::intel_gpu_user::OutputError::Io(error) => error,
+                    crate::intel_gpu_user::OutputError::Install(_) => {
+                        crate::intel_gpu_user::io_error()
+                    }
+                })
+        })
+    }
+
+    fn submit_with_output<'a>(
+        &'a self,
+        context: Arc<crate::intel_gpu_user::UserContext>,
+        batch: crate::intel_gpu_user::UserBatch,
+        output: crate::intel_gpu_user::UserOutput<'a>,
+    ) -> crate::intel_gpu_user::OutputFuture<'a> {
+        Box::pin(async move { self.submit_request(context, batch, Some(&output)).await })
+    }
+}
+
+impl Backend {
+    async fn submit_request(
+        &self,
+        context: Arc<crate::intel_gpu_user::UserContext>,
+        batch: crate::intel_gpu_user::UserBatch,
+        output: Option<&crate::intel_gpu_user::UserOutput<'_>>,
+    ) -> Result<Arc<CompletionFence>, crate::intel_gpu_user::OutputError> {
+        use crate::intel_gpu_user::OutputError;
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or(narf_filesystem::FsError::NoDevice)?;
+        let mut state = owner.state.lock().await;
+        if state.phase != Phase::Running || owner.suspended.load(Ordering::Acquire) {
+            return Err(narf_filesystem::FsError::NoDevice.into());
+        }
+        let gt = state
+            .gt
+            .as_mut()
+            .ok_or(narf_filesystem::FsError::NoDevice)?;
+        let epoch = gt.user_epoch().ok_or(narf_filesystem::FsError::NoDevice)?;
+        context.check_epoch(epoch)?;
+        let result = match output {
+            Some(output) => {
+                gt.submit_user_batch_with_output(narf_time::monotonic_ns(), context, batch, output)
             }
-            let gt = state
-                .gt
-                .as_mut()
-                .ok_or(narf_filesystem::FsError::NoDevice)?;
-            let epoch = gt.user_epoch().ok_or(narf_filesystem::FsError::NoDevice)?;
-            context.check_epoch(epoch)?;
-            let result = gt.submit_user_batch(narf_time::monotonic_ns(), context, batch);
-            if gt.state() == GtState::Lost {
-                owner.user_epoch.store(0, Ordering::Release);
+            None => gt.submit_user_batch(narf_time::monotonic_ns(), context, batch),
+        };
+        if gt.state() == GtState::Lost {
+            owner.user_epoch.store(0, Ordering::Release);
+        }
+        result.map(|(_, fence)| fence).map_err(|error| match error {
+            GtError::Scheduling(crate::intel_gpu_guc_sched::SchedulingError::Residency(error)) => {
+                OutputError::Io(error)
             }
-            result.map(|(_, fence)| fence).map_err(|error| match error {
-                GtError::Scheduling(crate::intel_gpu_guc_sched::SchedulingError::Residency(
-                    error,
-                )) => error,
-                GtError::Scheduling(
-                    crate::intel_gpu_guc_sched::SchedulingError::Busy
-                    | crate::intel_gpu_guc_sched::SchedulingError::Full,
-                ) => narf_filesystem::FsError::WouldBlock,
-                _ => crate::intel_gpu_user::io_error(),
-            })
+            GtError::Scheduling(crate::intel_gpu_guc_sched::SchedulingError::Output(error)) => {
+                OutputError::Install(error)
+            }
+            GtError::Scheduling(
+                crate::intel_gpu_guc_sched::SchedulingError::Busy
+                | crate::intel_gpu_guc_sched::SchedulingError::Full,
+            ) => OutputError::Io(narf_filesystem::FsError::WouldBlock),
+            _ => OutputError::Io(crate::intel_gpu_user::io_error()),
         })
     }
 }

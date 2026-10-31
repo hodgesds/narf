@@ -27,16 +27,53 @@ const BREADCRUMB: u64 = 0x800;
 const TIMEOUT: u64 = 5_000_000_000;
 const MAX_CONTEXTS: usize = 64;
 
+/// Firmware context identities are reusable after deregistration. Request
+/// stamps are independent, so a prior TLB ACK/breadcrumb cannot complete a
+/// new incarnation. The final TLB ACK is our reclamation/reuse barrier.
+struct Identities {
+    used: u64,
+    next_id: u16,
+    next_stamp: u32,
+}
+impl Identities {
+    const fn new() -> Self {
+        Self {
+            used: 0,
+            next_id: 1,
+            next_stamp: 1,
+        }
+    }
+    fn candidate(&self, live: impl Fn(u32) -> bool) -> Result<(u16, u32), SchedulingError> {
+        let id = (0..64)
+            .map(|n| (self.next_id - 1 + n) % 64 + 1)
+            .find(|id| self.used & (1u64 << (id - 1)) == 0)
+            .ok_or(SchedulingError::Full)?;
+        let mut stamp = self.next_stamp;
+        while live(stamp) {
+            stamp = ((stamp + 1) & 0x7fffffff).max(1);
+        }
+        Ok((id, stamp))
+    }
+    fn claim(&mut self, id: u16, stamp: u32) {
+        self.used |= 1u64 << (id - 1);
+        self.next_id = id % 64 + 1;
+        self.next_stamp = ((stamp + 1) & 0x7fffffff).max(1);
+    }
+    fn retire(&mut self, id: u16) {
+        self.used &= !(1u64 << (id - 1));
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SchedulingError {
     State,
     Busy,
     Full,
-    IdentityExhausted,
     Allocation(SubmitError),
     Address,
     Cache,
     Residency(narf_filesystem::FsError),
+    Output(narf_filesystem::InstallFdError),
     Defaults(ContextError),
     Protocol,
     Timeout,
@@ -77,6 +114,7 @@ enum Defaults {
 
 struct Context<B: GpuBacking> {
     id: u16,
+    stamp: u32,
     image: B,
     ring: B,
     phase: Phase,
@@ -93,13 +131,14 @@ struct Resources<A: BootAllocator> {
     golden: A::Backing,
     contexts: Vec<Context<A::Backing>>,
     seed_image: Option<A::Backing>,
+    seed_id: Option<u16>,
     defaults_completion: Option<Arc<CompletionFence>>,
 }
 
 pub(crate) struct GuCScheduler<A: BootAllocator> {
     resources: ManuallyDrop<Resources<A>>,
     platform: GtPlatform,
-    next_id: u32,
+    identities: Identities,
     published: bool,
     lost: bool,
     released: bool,
@@ -155,10 +194,11 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 golden,
                 contexts: Vec::new(),
                 seed_image: None,
+                seed_id: None,
                 defaults_completion: None,
             }),
             platform,
-            next_id: 1,
+            identities: Identities::new(),
             published: false,
             lost: false,
             released: false,
@@ -229,6 +269,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
         now: u64,
         context: Arc<crate::intel_gpu_user::UserContext>,
         batch: crate::intel_gpu_user::UserBatch,
+        output: Option<&crate::intel_gpu_user::UserOutput<'_>>,
     ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
         if self.user_epoch().is_none() || batch.0.platform() != Some(self.platform) {
             return Err(SchedulingError::State);
@@ -241,7 +282,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
         let claim = context
             .claim(self.epoch, pages)
             .map_err(SchedulingError::Residency)?;
-        self.submit_inner(now, Some(batch.0), None, Some(claim))
+        self.submit_inner(now, Some(batch.0), None, Some(claim), output)
     }
 
     pub(crate) fn can_prime(&self) -> bool {
@@ -259,9 +300,6 @@ impl<A: BootAllocator> GuCScheduler<A> {
     ) -> Result<Arc<CompletionFence>, SchedulingError> {
         if !self.can_prime() {
             return Err(SchedulingError::Busy);
-        }
-        if self.next_id >= 65534 {
-            return Err(SchedulingError::Full);
         }
         let (id, _) = self.submit(now, None, Some(seed.commands()))?;
         let completion = Arc::new(CompletionFence::new());
@@ -295,7 +333,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
         resident: Option<ResidentBatch>,
         prefix: Option<Vec<u32>>,
     ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
-        self.submit_inner(now, resident, prefix, None)
+        self.submit_inner(now, resident, prefix, None, None)
     }
 
     fn submit_inner(
@@ -304,16 +342,17 @@ impl<A: BootAllocator> GuCScheduler<A> {
         resident: Option<ResidentBatch>,
         prefix: Option<Vec<u32>>,
         user: Option<crate::intel_gpu_user::ContextClaim>,
+        output: Option<&crate::intel_gpu_user::UserOutput<'_>>,
     ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
         if !self.published || self.lost {
             return Err(SchedulingError::State);
         }
-        if self.next_id >= 65535 {
-            return Err(SchedulingError::IdentityExhausted);
-        }
         if self.resources.contexts.len() == MAX_CONTEXTS {
             return Err(SchedulingError::Full);
         }
+        let (id, stamp) = self
+            .identities
+            .candidate(|stamp| self.resources.contexts.iter().any(|c| c.stamp == stamp))?;
         let deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
         let r = &mut *self.resources;
         r.contexts
@@ -360,7 +399,6 @@ impl<A: BootAllocator> GuCScheduler<A> {
         }
         image.zero_fill();
         ring.zero_fill();
-        let id = self.next_id as u16;
         if self.defaults == Defaults::Ready {
             for off in (REGS..u64::from(pages) * 4096).step_by(4) {
                 image.write32(off, r.golden.read32(off));
@@ -383,24 +421,14 @@ impl<A: BootAllocator> GuCScheduler<A> {
         let mut words: Vec<u32> = if let Some(prefix) = prefix {
             let mut words = alloc::vec![0x04000001];
             words.extend_from_slice(&prefix);
-            render_completion(
-                self.platform,
-                image.ggtt_offset(),
-                u32::from(id),
-                &mut words,
-            );
+            render_completion(self.platform, image.ggtt_offset(), stamp, &mut words);
             words
         } else if let Some(batch) = &resident {
             let root = batch.space().root_descriptor();
             // xe_lrc.c::xe_lrc_set_ppgtt: PDP0 on DG2/MTL, PTBP on Xe2.
             image.write32(REGS + 0x31 * 4, (root >> 32) as u32);
             image.write32(REGS + 0x33 * 4, root as u32);
-            resident_ring(
-                self.platform,
-                batch.address(),
-                image.ggtt_offset(),
-                u32::from(id),
-            )
+            resident_ring(self.platform, batch.address(), image.ggtt_offset(), stamp)
         } else {
             alloc::vec![
                 0x04000001,
@@ -408,7 +436,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 0x10400002,
                 image.ggtt_offset() + BREADCRUMB as u32,
                 0,
-                u32::from(id),
+                stamp,
                 0x01000000,
                 0,
             ]
@@ -446,9 +474,19 @@ impl<A: BootAllocator> GuCScheduler<A> {
             completion.signal(Err(JobError::Reset));
             return Err(SchedulingError::Cache);
         }
+        if let Some(output) = output {
+            if let Err(error) = output.install(completion.clone()) {
+                r.allocator.free(ring);
+                r.allocator.free(image);
+                drop(resident);
+                completion.signal(Err(JobError::Reset));
+                return Err(SchedulingError::Output(error));
+            }
+        }
         r.contexts.push(Context {
             user: user.map(|claim| claim.publish(completion.clone())),
             id,
+            stamp,
             image,
             ring,
             phase: Phase::Invalidate,
@@ -460,7 +498,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
         if mutating {
             self.pristine = false;
         }
-        self.next_id += 1;
+        self.identities.claim(id, stamp);
         Ok((id, completion))
     }
 
@@ -502,7 +540,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             if context.phase == Phase::Running {
                 fence(Ordering::Acquire);
                 let seq = context.image.read32(BREADCRUMB);
-                if seq != 0 && seq != u32::from(context.id) {
+                if seq != 0 && seq != context.stamp {
                     return Err(SchedulingError::Protocol);
                 }
                 if seq != 0 {
@@ -511,10 +549,14 @@ impl<A: BootAllocator> GuCScheduler<A> {
             }
             let id = u32::from(context.id);
             let (action, payload, next): (u16, Vec<u32>, Phase) = match context.phase {
-                Phase::Invalidate => (0x7000, alloc::vec![id, 0x80000003], Phase::Invalidating),
+                Phase::Invalidate => (
+                    0x7000,
+                    alloc::vec![context.stamp, 0x80000003],
+                    Phase::Invalidating,
+                ),
                 Phase::RetireInvalidate => (
                     0x7000,
-                    alloc::vec![id | 0x10000, 0x80000003],
+                    alloc::vec![context.stamp | 0x80000000, 0x80000003],
                     Phase::RetireInvalidating,
                 ),
                 Phase::Register => (
@@ -571,26 +613,25 @@ impl<A: BootAllocator> GuCScheduler<A> {
             return Err(SchedulingError::Protocol);
         }
         let cookie = message.payload[0];
-        let context_id = if action == 0x7001 {
-            cookie & 0xffff
-        } else {
-            cookie
-        };
         let index = self
             .resources
             .contexts
             .iter()
-            .position(|c| u32::from(c.id) == context_id)
+            .position(|c| {
+                if action == 0x7001 {
+                    c.stamp == cookie & 0x7fffffff
+                } else {
+                    u32::from(c.id) == cookie
+                }
+            })
             .ok_or(SchedulingError::Protocol)?;
         let resources = &mut *self.resources;
         let c = &mut resources.contexts[index];
         match (action, c.phase, message.payload.get(1).copied()) {
-            (0x7001, Phase::Invalidating, None) if cookie == u32::from(c.id) => {
-                c.phase = Phase::Register
-            }
-            (0x7001, Phase::RetireInvalidating, None) if cookie == (u32::from(c.id) | 0x10000) => {
+            (0x7001, Phase::Invalidating, None) if cookie == c.stamp => c.phase = Phase::Register,
+            (0x7001, Phase::RetireInvalidating, None) if cookie == (c.stamp | 0x80000000) => {
                 fence(Ordering::Acquire);
-                if c.image.read32(BREADCRUMB) != u32::from(c.id)
+                if c.image.read32(BREADCRUMB) != c.stamp
                     || c.image.read32(REGS + 5 * 4) & 0x1ffffc != c.tail
                 {
                     return Err(SchedulingError::Protocol);
@@ -607,8 +648,10 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 r.allocator.free(c.ring);
                 if self.defaults == Defaults::Seed(c.id) {
                     r.seed_image = Some(c.image);
+                    r.seed_id = Some(c.id);
                 } else {
                     r.allocator.free(c.image);
+                    self.identities.retire(c.id);
                 }
                 // Drop all PPGTT tables and BO references before terminal
                 // publication. Deregistration and the final TLB ACK are proven.
@@ -627,7 +670,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             (0x1002, Phase::Disabling, Some(0)) => c.phase = Phase::Deregister,
             (0x4600, Phase::Deregistering, None) => {
                 fence(Ordering::Acquire);
-                if c.image.read32(BREADCRUMB) != u32::from(c.id)
+                if c.image.read32(BREADCRUMB) != c.stamp
                     || c.image.read32(REGS + 5 * 4) & 0x1ffffc != c.tail
                 {
                     return Err(SchedulingError::Protocol);
@@ -665,6 +708,8 @@ impl<A: BootAllocator> GuCScheduler<A> {
             .sync_for_device(&r.golden)
             .map_err(|_| SchedulingError::Cache)?;
         self.defaults = Defaults::Ready;
+        self.identities
+            .retire(r.seed_id.take().expect("retired seed identity"));
         r.allocator
             .free(r.seed_image.take().expect("owned retired seed"));
         r.defaults_completion
@@ -825,4 +870,41 @@ fn context_image(image: &impl GpuBacking, platform: GtPlatform, ring: u32) {
                                           // reset_stop_ring() sets the masked STOP_RING disable in value slot
                                           // 0x71 of the later register block; the initial inhibited restore skips it.
     image.write32(REGS + 0x71 * 4, 0x01000000);
+}
+
+#[cfg(feature = "kernel-test")]
+mod identity_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    fn smoke_identity_pool_full_wrap_and_failed_preview() -> TestResult {
+        let mut ids = Identities::new();
+        assert_eq!(ids.candidate(|_| false), Ok((1, 1)));
+        assert_eq!(
+            ids.candidate(|_| false),
+            Ok((1, 1)),
+            "a failed preparation must not consume an identity"
+        );
+        for expected in 1..=64 {
+            let (id, stamp) = ids.candidate(|_| false).unwrap();
+            assert_eq!(id, expected);
+            ids.claim(id, stamp);
+        }
+        assert_eq!(ids.candidate(|_| false), Err(SchedulingError::Full));
+        ids.retire(7);
+        ids.next_stamp = 0x7fffffff;
+        assert_eq!(
+            ids.candidate(|s| s == 0x7fffffff || s == 1 || s == 2),
+            Ok((7, 3))
+        );
+        ids.claim(7, 0x7fffffff);
+        assert_eq!(ids.next_stamp, 1);
+        assert_eq!(ids.candidate(|_| false), Err(SchedulingError::Full));
+        ids.retire(7);
+        assert_eq!(ids.candidate(|s| s == 1), Ok((7, 2)));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_gt",
+        smoke_identity_pool_full_wrap_and_failed_preview
+    );
 }
