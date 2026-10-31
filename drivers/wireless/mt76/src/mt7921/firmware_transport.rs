@@ -7,6 +7,8 @@ use core::{future::poll_fn, ops::Range, task::Poll};
 
 #[path = "ap_session.rs"]
 mod ap;
+#[path = "p2p_device.rs"]
+mod p2p;
 pub(crate) use ap::ApRxEvent;
 pub(crate) type ApEvent = ap::ApEvent;
 #[path = "ap_crypto.rs"]
@@ -287,7 +289,7 @@ pub async fn provision_boot_radio() -> Result<RadioInfo, Error> {
             return Err(Error::Busy);
         };
         match owner.as_ref().map(Transport::state) {
-            Some(State::RadioReady(info) | State::ScanReady(info))
+            Some(State::RadioReady(info) | State::ScanReady(info) | State::P2pDevice(info))
             | Some(State::Associated { info, .. } | State::AccessPoint { info, .. }) => info,
             Some(State::Failed { error, .. }) => return Err(error),
             _ => return Err(Error::Busy),
@@ -913,6 +915,8 @@ pub enum Stage {
     ApStart,
     ApStop,
     ApPeer,
+    P2pDeviceStart,
+    P2pDeviceStop,
 }
 /// Firmware observations, not an operational WLAN interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -938,6 +942,9 @@ pub enum State {
     Ready(Report),
     RadioReady(RadioInfo),
     ScanReady(RadioInfo),
+    /// Native P2P-device DEV/BSS receipts. No RF grant, ordinary carrier
+    /// or Ethernet/controlled-port permission follows from this state.
+    P2pDevice(RadioInfo),
     Associated {
         info: RadioInfo,
         peer: [u8; 6],
@@ -1389,6 +1396,7 @@ struct Session<B: Backend> {
     /// station service cannot swallow off-channel scan observations.
     scanning: bool,
     ap_owner: Option<ap::Owner>,
+    p2p_owner: Option<p2p::Owner>,
     // Keep retired AP temporal-key evidence across verified role resets.
     ap_keys: ap_crypto::Keys,
     wow_config: Option<narf_wireless::WowlanConfig>,
@@ -1431,6 +1439,7 @@ impl<B: Backend> Session<B> {
             scan_packets: VecDeque::new(),
             scanning: false,
             ap_owner: None,
+            p2p_owner: None,
             ap_keys: ap_crypto::Keys::default(),
             wow_config: None,
             wow_nlo: None,
@@ -1464,6 +1473,18 @@ impl<B: Backend> Session<B> {
                     }
                     if let Err(error) = self.backend.check_tx_permission(owner.plan.permission) {
                         return Poll::Ready(Err(error));
+                    }
+                }
+            }
+            if matches!(self.state, State::Running(Stage::P2pDeviceStart)) {
+                if let Some(owner) = self.p2p_owner.as_ref() {
+                    if owner
+                        .pending
+                        .as_ref()
+                        .is_none_or(|authority| authority.current().is_err())
+                        || owner.identity.current().is_err()
+                    {
+                        return Poll::Ready(Err(Error::Authority));
                     }
                 }
             }
@@ -1664,6 +1685,16 @@ impl<B: Backend> Session<B> {
             .ap_owner
             .as_ref()
             .and_then(|owner| owner.pending.clone());
+        let _p2p_request = self
+            .p2p_owner
+            .as_ref()
+            .and_then(|owner| owner.pending.clone());
+        if self.p2p_owner.is_some() {
+            let result = self.stop_p2p_device_owned().await;
+            if self.p2p_owner.is_some() {
+                return result;
+            }
+        }
         // WFDMA shutdown alone cannot stop autonomous firmware beacons.
         // Retain the AP owner unless its verified reset actually completes.
         if self.ap_owner.is_some() {

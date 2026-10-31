@@ -104,7 +104,7 @@ kernel_test_in!(
     "drivers/wireless/mt7921/p2p",
     mt76_cnm_grant_timer_abort_and_no_token_wrap_before_verified_reset
 );
-fn wm_features(bits: u8) -> Vec<u8> {
+pub(super) fn wm_features(bits: u8) -> Vec<u8> {
     let payload = 32usize;
     let mut ram = vec![
         0;

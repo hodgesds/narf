@@ -717,6 +717,10 @@ mode-generation checks are shared; public AP binding remains limited to AP/GO.
 Radio binding permits actual station, AP, P2P-client/GO/device modes and exports
 no administrative/device cap or arbitrary evaluation callback. A physical owner
 shared with AP must share its actual serialization lease.
+`require_mode` checks the actual admitted role, and `check_identity` additionally
+matches a current request to the retained concrete interface, namespace/index,
+ownership epoch and mode generation. A valid grant for another same-MAC radio
+cannot commit or stop an existing native wdev through that observation.
 
 `require_link` and `RadioInterfaceIdentity` require administrative UP for netdev
 roles. A P2P-device wdev has no synthetic IFF_UP requirement: its native owner must

@@ -125,7 +125,17 @@ fn revocation() -> Result<(), &'static str> {
         .event_authority()
         .map_err(|_| "native radio typed event source")?;
     let other = super::fixture()?;
-    if authority.check_for(other.radio.as_ref()) != Err(WirelessError::Denied) {
+    let identity = authority
+        .identity()
+        .map_err(|_| "actual retained radio identity")?;
+    let other_identity = radio(&other)
+        .and_then(|source| source.identity())
+        .map_err(|_| "other actual radio identity")?;
+    if authority.check_for(other.radio.as_ref()) != Err(WirelessError::Denied)
+        || authority.check_identity(&identity).is_err()
+        || authority.check_identity(&other_identity) != Err(WirelessError::Denied)
+        || authority.require_mode(10) != Err(WirelessError::Denied)
+    {
         return Err("radio authority retargeted another registered concrete receiver");
     }
     fixture.daemon.revoke();

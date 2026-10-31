@@ -506,6 +506,7 @@ fn smoke_mt7921_firmware_radio_ready_or_skip() -> TestResult {
     let info = match boot_status() {
         BootStatus::Retained(State::RadioReady(info))
         | BootStatus::Retained(State::ScanReady(info))
+        | BootStatus::Retained(State::P2pDevice(info))
         | BootStatus::Retained(
             State::Associated { info, .. }
             | State::AccessPoint { info, .. }

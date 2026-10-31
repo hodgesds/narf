@@ -30,6 +30,10 @@ impl<B: Backend> Session<B> {
             .ap_owner
             .as_ref()
             .and_then(|owner| owner.pending.clone());
+        let _p2p_request = self
+            .p2p_owner
+            .as_ref()
+            .and_then(|owner| owner.pending.clone());
         self.boot_started = None;
         self.rx_ba.fence();
         self.tx_ba.fence();
@@ -105,6 +109,7 @@ impl<B: Backend> Session<B> {
         self.security = None;
         // Only verified MAC/FW reset plus DMA retirement releases AP owners.
         self.ap_owner = None;
+        self.p2p_owner = None;
         self.ap_keys.clear_active();
         self.wow_config = None;
         self.wow_nlo = None;

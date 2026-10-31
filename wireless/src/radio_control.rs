@@ -28,6 +28,15 @@ impl RadioControlAuthority {
     pub fn check_for<I: WirelessNetIface + ?Sized>(&self, iface: &I) -> Result<(), WirelessError> {
         self.guard.check_for(iface)
     }
+    /// Require the actual admitted role without exporting its underlying
+    /// grant. A current station/AP request cannot start a P2P-device BSS.
+    pub fn require_mode(&self, mode: u32) -> Result<(), WirelessError> {
+        self.current()?;
+        if self.guard.mode != mode {
+            return Err(WirelessError::Denied);
+        }
+        Ok(())
+    }
     pub fn reserve(self) -> Result<Self, WirelessError> {
         Ok(Self {
             guard: self.guard.reserve()?,
@@ -53,6 +62,23 @@ impl RadioControlAuthority {
         };
         identity.current()?;
         Ok(identity)
+    }
+    /// Bind a new current request to the same completed native interface.
+    /// Neither a same-MAC namesake nor another valid radio grant suffices.
+    pub fn check_identity(&self, identity: &RadioInterfaceIdentity) -> Result<(), WirelessError> {
+        self.require_link()?;
+        identity.current()?;
+        let retained = &identity.identity;
+        if !Weak::ptr_eq(&self.guard.iface, &retained.iface)
+            || self.guard.namespace != retained.namespace
+            || self.guard.ifindex != retained.ifindex
+            || self.guard.mode != retained.mode
+            || self.guard.generation != retained.generation
+            || self.guard.ownership_epoch != retained.ownership_epoch
+        {
+            return Err(WirelessError::Denied);
+        }
+        Ok(())
     }
     pub fn event_authority(&self) -> Result<RadioEventAuthority, WirelessError> {
         self.current()?;

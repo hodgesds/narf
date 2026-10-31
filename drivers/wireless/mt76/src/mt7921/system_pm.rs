@@ -73,6 +73,9 @@ impl<B: Backend> Session<B> {
         if self.ap_owner.is_some() {
             self.stop_ap_owned().await?;
         }
+        if self.p2p_owner.is_some() {
+            self.stop_p2p_device_owned().await?;
+        }
         let (info, vif) = match self.state {
             State::Suspended(_) => return Ok(()),
             State::Associated { info, .. } => {

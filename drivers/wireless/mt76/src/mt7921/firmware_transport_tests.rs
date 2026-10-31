@@ -196,6 +196,7 @@ struct Model {
     chip_id: u16,
     phy_capability: Option<[u8; 12]>,
     ap_hold: Option<Arc<ap_runtime_tests::Hold>>,
+    p2p_hold: Option<Arc<ap_runtime_tests::Hold>>,
     ap_timing_pause: Option<u64>,
     ap_timing: Option<(u32, u32, u32, u16)>,
     receive_epoch: u64,
@@ -328,6 +329,7 @@ impl Model {
             chip_id: 0,
             phy_capability: None,
             ap_hold: None,
+            p2p_hold: None,
             ap_timing_pause: None,
             ap_timing: None,
             receive_epoch: 0,
@@ -647,6 +649,16 @@ impl Backend for Model {
         }
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        if self.frames.last().is_some_and(|(_, f)| {
+            f.len() == 84 && f[43] == 7 && f[34..36] == [2, 0] && f[52..56] == [0, 0, 32, 0]
+        }) {
+            if let Some(hold) = &self.p2p_hold {
+                hold.seen.store(true, Ordering::Release);
+                if !hold.release.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+            }
+        }
         if self.frames.last().is_some_and(|(_, f)| {
             f.len() >= 54
                 && f[43] == 7

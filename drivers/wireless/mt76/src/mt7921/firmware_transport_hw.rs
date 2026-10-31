@@ -1194,6 +1194,24 @@ pub struct Transport {
 #[path = "firmware_transport_hw_tests.rs"]
 mod tests;
 impl Transport {
+    pub(crate) async fn start_p2p_device(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::RadioControlAuthority>,
+    ) -> Result<(), Error> {
+        self.session.start_p2p_device(authority).await
+    }
+    pub(crate) fn commit_p2p_device(
+        &mut self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+    ) -> Result<narf_wireless::ap_control::RadioInterfaceIdentity, Error> {
+        self.session.commit_p2p_device(authority)
+    }
+    pub(crate) async fn stop_p2p_device(
+        &mut self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+    ) -> Result<(), Error> {
+        self.session.stop_p2p_device(authority).await
+    }
     pub(crate) async fn run_ap_request(
         &mut self,
         iface: alloc::sync::Weak<crate::iface::Mt76Iface>,

@@ -18,6 +18,8 @@ mod concrete;
 mod control;
 #[path = "ap_management_tests.rs"]
 mod management;
+#[path = "p2p_device_tests.rs"]
+mod p2p_device;
 #[path = "ap_packet_tests.rs"]
 mod packets;
 #[path = "ap_receive_tests.rs"]
@@ -40,11 +42,11 @@ struct Radio {
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 impl Radio {
-    fn new(name: String, mac: [u8; 6]) -> Self {
+    fn new(name: String, mac: [u8; 6], mode: u32) -> Self {
         Self {
             name,
             mac,
-            mode: AtomicU32::new(3),
+            mode: AtomicU32::new(mode),
             generation: AtomicU64::new(1),
             serial: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
             rx: IrqSafeSpinLock::new(None),
@@ -118,6 +120,15 @@ impl WirelessNetIface for Radio {
     {
         self.serial.try_reserve().map(Some)
     }
+    fn radio_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        core::num::NonZeroU64::new(self.generation.load(Ordering::Acquire))
+    }
+    fn reserve_radio_control(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        self.serial.try_reserve().map(Some)
+    }
 }
 struct Registered(Arc<Radio>);
 impl Interface for Registered {
@@ -180,9 +191,12 @@ fn reject(_: &[u8], _: narf_net::TxMeta) -> Result<(), ()> {
     Err(())
 }
 fn fixture(mac: [u8; 6]) -> Result<Fixture, &'static str> {
+    fixture_for(mac, 3, true)
+}
+fn fixture_for(mac: [u8; 6], mode: u32, up: bool) -> Result<Fixture, &'static str> {
     let name = narf_net::iface::register("mt76-ap-native-proof%d", mac, reject);
     let binding = Binding(name.clone());
-    let radio = Arc::new(Radio::new(name.clone(), mac));
+    let radio = Arc::new(Radio::new(name.clone(), mac, mode));
     let iface: Arc<dyn WirelessNetIface> = radio.clone();
     let authority = narf_net::bootstrap_authority();
     let cap = narf_net::registry()
@@ -194,7 +208,7 @@ fn fixture(mac: [u8; 6]) -> Result<Fixture, &'static str> {
             .map_err(|_| "AP grant fixture actual delegated administration")?
             .admin;
     narf_wireless::registry::register(iface.clone());
-    if !narf_net::iface::set_link_state(&name, true) {
+    if !narf_net::iface::set_link_state(&name, up) {
         return Err("AP fixture administrative UP");
     }
     let ifindex = narf_net::iface::lookup(&name)
