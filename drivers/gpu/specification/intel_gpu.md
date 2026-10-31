@@ -1824,6 +1824,22 @@ two-context execution, 64-context pressure/CT backpressure, context retirement,
 allocation rollback, coherence refusal and per-card query lifetime. These tests
 do not establish firmware boot or context execution on Intel silicon.
 
+### Copy engine (BCS0)
+
+BCS0 (MMIO 0x22000, GuC class 3, Xe COPY) is part of every admitted graphics
+IP's Linux engine mask and is never fused: Linux `read_copy_fuses` applies only
+to PVC and Xe3+. `intel_gpu_engine` owns the literal per-engine table. Its LRC
+is two pages; the register image follows `gen12_xcs_offsets` on DG2 and
+Xe-LPG (Linux selects it for COPY before Xe2, not `dg2_xcs_offsets`) and
+`xe2_bcs_offsets` on BMG, whose third LRI saves BCS_SWCTRL/BLIT_CCTL. Ring
+enable mirrors `xe_hw_engine_enable_ring` with RING_CMD_CCTL's uncached MOCS.
+Default state is the source's BLIT_CCTL RMW only: no render 3D state and, on
+these platforms, no LRC workaround. BCS0 shares RCS0's render forcewake
+domain. BMG 20.01/20.02 also apply the ENGINE_BASE engine entries for BCS0.
+The NONPRIV deny fill, ADS publication, priming order and Xe UAPI surface are
+described in `spec.md`. BCS8 on BMG, i915 BLT execbuffer and migration-style
+kernel copies remain unadmitted.
+
 ### Remaining accelerated-driver completion work
 
 Continue these dependencies on the current Intel branch. Existing native
@@ -1832,18 +1848,18 @@ acceptance or a claim of complete acceleration.
 
 | Area | Current checkpoint | Still required |
 | --- | --- | --- |
-| GuC execution | Owned GGTT/PPGTT jobs, primed/persistent user RCS state, verified register policy, graphics-GT/RCS workarounds on MTL/Arrow, DG2 and BMG | Other engines, remaining out-of-band workarounds and silicon qualification |
-| Render UAPI | Native Xe queries/GEM/VM_BIND/RCS queues/EXEC/user fences; i915 compatibility with explicit fences; context loss and fresh-epoch rebuild | USERPTR, fault/long-running VMs, more queue/query families and Mesa interoperability |
-| Engines and platforms | Main-GT DSS/EU discovery and RCS0 kernel scheduling; separate Gen12 foundations | Fused engine/cache/media inventory, compute/copy/media submission and independently sourced profiles for other IP |
+| GuC execution | Owned GGTT/PPGTT jobs, primed/persistent user RCS0 and BCS0 state, verified register policy, graphics-GT/RCS/BCS workarounds on MTL/Arrow, DG2 and BMG | Compute/media engines, remaining out-of-band workarounds and silicon qualification |
+| Render UAPI | Native Xe queries/GEM/VM_BIND/RCS and COPY queues/EXEC/user fences/per-engine cycles; i915 compatibility (RCS only) with explicit fences; context loss and fresh-epoch rebuild | USERPTR, fault/long-running VMs, i915 BLT ring, more queue/query families and Mesa interoperability |
+| Engines and platforms | Main-GT DSS/EU discovery; RCS0 and never-fused BCS0 scheduling; separate Gen12 foundations | BMG BCS8, CCS (DSS-quadrant/fuse-register inventory), media GT, compute/media submission and independently sourced profiles for other IP |
 | Memory and presentation | Owned system RAM, private tables and same-card CPU PRIME mappings | Local VRAM, accelerated PRIME/presentation and GPU/KMS synchronization |
 | Display | Gen12 paths and owned Xe-LPG internal-panel modeset | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |
-| Power and faults | Owned GuC/RCS MSI wakeups with timer fallback, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery | Finer engine recovery and safe runtime autosuspend |
+| Power and faults | Owned GuC/RCS0/BCS0 MSI wakeups with timer fallback, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery | Finer engine recovery and safe runtime autosuspend |
 | Acceptance | Native register/CT/page-walk and ownership models on both kernel architectures | Intel silicon execution, suspend/resume and Mesa OpenGL/Vulkan interoperability |
 
 After the GT's execution probes, the physical worker attempts single-vector
-MSI for primary GuC and RCS0, preserving unrelated enable/mask halves. The
-hard handler masks/posts the tile master; bounded task-context identity
-decoding acknowledges only owned RCS0/OTHER0 causes before rearming. Dispatch
+MSI for primary GuC, RCS0 and BCS0, preserving unrelated enable/mask halves.
+The hard handler masks/posts the tile master; bounded task-context identity
+decoding acknowledges only owned RCS0/COPY0/OTHER0 causes before rearming. Dispatch
 epoch capture precedes servicing, avoiding lost wakes around waiter polling.
 The actual GuC/retirement path runs on the IRQ or a 10 ms watchdog; refused or
 failed IRQ routing retains the 500 us timer path. Unrelated display/media

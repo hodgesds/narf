@@ -940,6 +940,23 @@ interfaces and limits.
 
 ## Current work
 
+The Intel GuC path now schedules BCS0, the copy engine that every admitted
+MTL/Arrow, DG2 and BMG graphics IP carries unfused (Linux `read_copy_fuses`
+applies only to PVC/Xe3+). The scheduler owns per-engine HWS and golden LRCs;
+the reload ADS publishes RCS0/BCS0 mapping, enable masks, golden state sizes
+and register saves. BCS0 uses the source `gen12_xcs`/`xe2_bcs` LRC layouts, the
+simple MI_FLUSH_DW job and breadcrumb, a BLIT_CCTL uncached-MOCS default-state
+RMW primed after RCS0, BMG's ENGINE_BASE workarounds and a verified all-NOPID
+NONPRIV policy. Native Xe publishes RENDER+COPY engines, admits width-1 COPY
+queues with per-engine saved state, samples either engine's RING_TIMESTAMP and
+routes BCS0 MI_USER/FLUSH interrupts through the owned MSI path. A native
+device model executes copy-queue PPGTT batches and user fences, and checks the
+saved LRC and ADS words. The selected Intel GuC/user/Xe tests pass on x86_64
+(143) and aarch64 (145), the other Intel groups pass on x86_64 (142 + 70), and
+the production boot-smoke and both btrfs postflights pass on x86_64. Clippy
+(both feature contexts, both architectures) and formatting pass. BCS8,
+CCS/media engines, i915 BLT execbuffer and silicon/Mesa acceptance remain.
+
 The Intel continuation now selects the native Xe ABI on production GuC cards.
 Per-open VM and execution-queue namespaces support transactional vector/inline
 binds, partial-object mappings, overlap replacement, UNMAP_ALL, sparse NULL
