@@ -252,15 +252,27 @@ plus RTL8188EE endpoint ASPM, close three rows. New exact API89 profiles,
 RTL8 channel continuations and independent P2P contexts retain their own
 pending native acceptance; these counts do not credit those drafts.
 
+**Recount 2026-10-31** (accepted exact Intel profiles and RTL channel scans):
+the ledger holds **112 `feature`** rows (111 driver,1 shared), **31 `chip`**
+and **0 `unknown`**. Exact checkpoint `62b62ea68` passes x86_64
+**4294/0/13** and aarch64 **3935/0/7**, all521 Intel cases and the eight
+RTL channel/passive cases included. All five affected packages' resolved
+release CI contexts pass on both architectures, as do formatting, ordinary
+boots and both btrfs postflights. Qualified Intel HE/TX A-MSDU, RTL legacy
+channels/passive scans and four exact Intel station chip rows close.
+Later administrative-PM, active-scan, periodic-scan and control-lifecycle
+changes retain separate pending gates. Physical RF/silicon acceptance is
+separate from these software results.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 11 | Remaining exact-profile HE/TX A-MSDU acceptance and wider bands/widths; AP/P2P/WoW and scheduled-scan continuations; additional chip profiles are tracked separately |
+| iwlwifi | 9 | Wider bands/widths and EHT/MLO; AP/P2P/WoW and scheduled-scan continuations; exact admitted station/HE/TX A-MSDU profiles are software-validated |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 5 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA and loadable packet ABI |
 | ath10k | 18 | 2.4-GHz HT40/coexistence, additional streams/TX STBC and VHT160/80+80, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload |
 | ath9k | 9 | Channel/retune and HT40/SGI40 profiles, factory selection, periodic calibration, larger TX aggregates and idle/station sleep; other chips are separate rows |
 | rtlwifi | 8 | Other matched chips, HT40/VHT, antenna/gain/coexistence and RTS/CTS |
-| rtl8xxxu | 9 | Other matched USB chips, SGI20/HT40 and wider channels/rates, RX/TX A-MPDU, TX A-MSDU, both BA directions and RX reorder, coexistence, EP0/halted reset, safe rejoin, FIFO retune and PM |
+| rtl8xxxu | 7 | Other matched USB chips, HT40, active/associated scanning and QoS Null, Bluetooth coexistence, broader bands/VHT and administrative PM |
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
 | rtw89 | 13 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW, periodic RF tracking/runtime LPS and multiple functions; other AX/BE chips are separate rows |
 | brcmfmac | 12 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |

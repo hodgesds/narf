@@ -2131,14 +2131,12 @@ describe the remaining native paths.
   negotiates at most VHT80. `ht_vht.rs` advertises no 160/80+80 and
   uses only the primary 80MHz of a wider BSS, and
   `connection.rs::channel_power_width` refuses width code 3. The row's "applicable profiles" also include the Gen3
-  AX210/AX211/AX411/BE200 families, whose station admission is itself
-  open (see the `*_station_enablement` rows).
-- **he.** §3.49 implements Sc HE20/40/80 MAC/link/STA/PPE/TLC and original
-  +HTC receive ownership; native tests passed on both architectures. Exact Gen3
-  Ty/So/Ma API89 station and HE paths are wired in §3.57 with native acceptance
-  pending. Exact BzB0 FM/WH core103 is wired in §3.58 with its own native
-  execution pending; other Bz profiles remain refused. The qualified Gen2 continuation (§3.44)
-  and public capability reporting (§3.45) passed on both architectures.
+  AX210/AX211/AX411/BE200 families. Their exact station profiles below are
+  software-validated; native160MHz remains this separate continuation.
+- **he (closed).** Qualified Gen2, Sc, exact API89 Ty/So/Ma and BzB0
+  FM/WH core103 HE20/40/80 are software-validated at `62b62ea68`, including
+  the source-correct MLD/MVM rate namespaces. All521 Intel native cases
+  pass on both architectures. Physical qualification remains separate.
 - **eht, width_320, mlo.** Wi-Fi7 Bz/Sc still lacks native EHT capability,
   link/STA/TLC maps,320MHz admission and multiple live link/peer owners.
   Each needs the applicable native firmware contract and qualified radio
@@ -2175,10 +2173,10 @@ describe the remaining native paths.
   PN to the complete MPDU. The sender intersects the negotiated peer,
   live TLC and actual FIFO bounds from §3.42, and requires tag5 bit512.
   NARF's net stack delivers single ≤MTU frames with no GSO, so this implements
-  queue batching. Sc's continuation (§3.51) also passed native tests on both architectures;
-  API89 Ty/So/Ma TX aggregation is wired in §3.57 with native acceptance
-  pending. Exact BzB0 FM/WH core103 is wired in §3.58 with its own native
-  execution pending; other Bz profiles remain refused. Stack TSO/GSO is separate.
+  queue batching. Sc, exact API89 Ty/So/Ma and BzB0 FM/WH core103 senders are now
+  software-validated at `62b62ea68` within all521 Intel cases on both
+  architectures. This row is closed for admitted profiles; refused source
+  variants remain explicit. Stack TSO/GSO is separate.
 - **active_scan_probes** is implemented for Gen2 by §3.40: a distinct
   exact-channel-set signed emitting program, native SAR and device-wide
   limits before scan publication, and per-channel NVM/MCC plus host-policy
@@ -2194,11 +2192,12 @@ describe the remaining native paths.
   RX_BAID_ALLOCATION_CONFIG v1/v2 (§3.41), retaining the existing host
   reorder and RX-marker retirement contract.
 - **ax210_station_enablement, ax211_station_enablement,
-  ax411_station_enablement, be200_station_enablement.** §3.57 wires actual
-  API89 Ty/So/Ma baseline stations, including CDB AX411 source selection;
-  native acceptance is pending. §3.58 wires exact BzB0 FM/WH core103
-  station admission and eight native cases, also pending execution. Older
-  Bz100, A0/GL/CDB and other unqualified source profiles remain refused.
+  ax411_station_enablement, be200_station_enablement (closed).** §§3.57/3.58
+  establish exact API89 Ty/So/Ma stations, including CDB AX411, and BzB0
+  FM/WH core103. All sixteen new cases and the full521 Intel scope pass
+  on both architectures at `62b62ea68`; these four software chip rows close.
+  Older Bz100, A0/GL/CDB and other unqualified source profiles remain refused.
+  Physical RF/silicon acceptance remains separate.
 
 **Shared contracts, external inputs and scope corrections.**
 
@@ -3471,7 +3470,7 @@ successor's actual GET_SCAN BSSID. Passive scans intentionally supply no
 transmit-policy fence that could mask a private-epoch error. Both cases
 passed on both architectures within the accepted505-case checkpoint in §3.52.
 
-### 3.57 API89 retained Ty/So/Ma station continuation (native proof pending)
+### 3.57 API89 retained Ty/So/Ma station continuation (software-validated)
 
 The Gen3 bootstrap now selects the API89 Ty/So/Ma GF source from the actual
 CSR MAC/RF identity and CDB bit before resolving assets. Ty/So use Linux's
@@ -3513,15 +3512,18 @@ The production paths and eight native cases are wired: heap-owned actual
 Ty/So/CDB/Ma conversations, literal STA1/TLC4/RLC2 and ordered multi-ring
 keys, HE/A-MSDU/FIFO bounds, global MCC narrowing for API89 and Sc, ALIVE6
 unified receipts, missing-PNVM refusal and exact/current native identity
-selection. Coordinated execution and broad existing-family regressions
-remain pending before any chip or feature closure.
+selection. All eight cases pass on both architectures at `62b62ea68`,
+including the repaired MLD consumer and actual programmed-rate fixtures.
+The full521 Intel scope passes within integration results4294/0/13 on
+x86_64 and3935/0/7 on aarch64; release CI, formatting, ordinary boots and
+both btrfs postflights pass on that exact source checkpoint.
 Physical RF and silicon acceptance remain separate from native software
 fixtures. The common retained idle PNO owner already selects actual API89
 UMAC17, eight profiles and64 blocklist entries (actual TLV18 flags0xdbfb4b7f);
 that profile still needs its own native periodic conversation validation.
 Associated MLD PNO and band-qualified6GHz/EHT/MLO are separate continuations.
 
-### 3.58 Exact BzB0 FM/WH core103 continuation (native proof pending)
+### 3.58 Exact BzB0 FM/WH core103 continuation (software-validated)
 
 Bz production admission now reads and retains the actual CSR MAC/RF/step
 before source resolution. The initial profile accepts BZ/BZ_W B0 with
@@ -3563,9 +3565,9 @@ and plaintext aggregates, PSK-PMF and SAE-EXT-KEY native key/DHCP receipts,
 source loss while the final real RX marker is held, actual ALIVE7/INIT_PHY
 command literals, incompatible/old ABI refusal before commands, exact
 native source selection and denied/revoked identity. They model firmware
-execution over owned RAM RFH/TFH; coordinated execution and broad native
-regressions are pending. These cases grant no physical RF or silicon
-acceptance. EHT/320MHz, band-qualified6GHz, MLO and associated periodic-scan
+execution over owned RAM RFH/TFH. All eight cases and the full521 Intel
+scope pass on both architectures at `62b62ea68`, with the release gates
+recorded in §3.57. These cases grant no physical RF or silicon acceptance. EHT/320MHz, band-qualified6GHz, MLO and associated periodic-scan
 coexistence remain separate native continuations.
 
 ### 3.59 Profile-specific idle periodic-scan regression scope

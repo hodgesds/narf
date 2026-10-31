@@ -678,7 +678,7 @@ uplink, second disconnect), `smoke_rtl8188eu_disconnect_overrides_waiting_old_li
 (stale publisher still fenced) and the failed USB stop smoke (teardown
 failure stays closed; no rejoin).
 
-### Qualified legacy channels and idle passive scans (native acceptance pending)
+### Qualified legacy channels and idle passive scans (software-validated)
 
 The retained owner selects legacy 20MHz channels1–13 from the existing signed N8PC
 rows. `Calibration::permission` intersects the actual selected 20MHz occupied
@@ -722,8 +722,12 @@ CONNECT after a cold transition requires a fresh actual target-channel beacon,
 without refreshing an old cache entry's age. Eight native cases cover actual
 Open/WPA2 channel6 DHCP, multi-channel dwell/home restoration, old device FIFO
 copies, fresh-observation admission, cancellation/source loss, missing row and
-RXDMA/MAC-off receipts, and literal factory/occupied-band limits. Their native
-execution and physical-board acceptance remain pending.
+RXDMA/MAC-off receipts, and literal factory/occupied-band limits. All eight
+native cases pass on both architectures at `62b62ea68`, within full integration
+results of4294/0/13 on x86_64 and3935/0/7 on aarch64. Release CI, formatting,
+ordinary boots and both btrfs postflights also pass on that exact checkpoint.
+Physical-board acceptance remains separate. Later administrative-PM and active
+scan continuations retain their own pending native gates.
 
 ### Administrative radio park/wake (native acceptance pending)
 
