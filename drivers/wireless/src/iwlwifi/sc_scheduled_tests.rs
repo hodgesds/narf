@@ -674,7 +674,11 @@ fn smoke_sc_scheduled_live_policy_source_and_malformed_abort_cannot_leave_emitte
                     .device()
                     .state
                     .try_lock()
-                    .is_some_and(|s| s.scheduled.is_none())
+                    // Repair admission withdraws the private publication owner
+                    // before its retained physical worker has finished.
+                    .is_some_and(|s| {
+                        s.scheduled.is_none() && (!matches!(boundary, 0 | 3) || s.stop_completed)
+                    })
             })?;
             if boundary == 0 || boundary == 3 {
                 require(
@@ -908,3 +912,6 @@ kernel_test_in!(
 
 #[path = "scheduled_profile_tests.rs"]
 mod native_profiles;
+
+#[path = "scheduled_associated_tests.rs"]
+mod associated;

@@ -2206,8 +2206,8 @@ describe the remaining native paths.
   results. Exact API89 Ty/So/Ma UMAC17 and Bz core103 idle profiles and forced
   publication retirement pass at `0eb084197` within all524 Intel cases on
   both architectures (§§3.59/3.60).
-  Associated MLD coexistence and other exact-profile enablement remain
-  open. Linux MVM refuses non-idle PNO.
+  Associated Sc/Bz MLD coexistence is wired in §3.61 with its own native
+  acceptance pending. Linux MVM refuses non-idle PNO.
 - **persistent_key_history** is inapplicable (§3.30): Linux and the shared
   NARF contract establish a fresh authenticated RSNA after reboot and
   retain replay/history state for the active owner lifetime. The existing
@@ -3315,9 +3315,10 @@ policy loss, malformed abort receipts, passive/pass-all matching and random
 probe source bits. All five and all496 Intel cases passed on x86_64 and
 aarch64 at `fbe407764`; the accepted505-case checkpoint and release gates
 are recorded in §3.52. This first continuation covers idle Sc station mode.
-Gen2 API77 idle scheduled scans are §3.55. Linux MLD associated scheduled-scan
-coexistence and parked Gen3 profiles remain open;
-Linux MVM explicitly refuses non-idle scheduled scans, so an associated Gen2
+Gen2 API77 idle scheduled scans are §3.55. Exact API89/Bz profile-specific
+idle regression cases are §3.59; associated MLD coexistence is wired in
+§3.61 with native acceptance pending. Linux MVM explicitly refuses non-idle
+scheduled scans, so an associated Gen2
 PNO owner is not an additional reference requirement. Physical RF acceptance
 remains separate from native QEMU software fixtures.
 
@@ -3567,8 +3568,10 @@ command literals, incompatible/old ABI refusal before commands, exact
 native source selection and denied/revoked identity. They model firmware
 execution over owned RAM RFH/TFH. All eight cases and the full521 Intel
 scope pass on both architectures at `62b62ea68`, with the release gates
-recorded in §3.57. These cases grant no physical RF or silicon acceptance. EHT/320MHz, band-qualified6GHz, MLO and associated periodic-scan
-coexistence remain separate native continuations.
+recorded in §3.57. These cases grant no physical RF or silicon acceptance.
+EHT/320MHz, band-qualified6GHz and MLO remain separate continuations;
+associated periodic-scan coexistence is wired with native acceptance
+pending in §3.61.
 
 ### 3.59 Profile-specific idle periodic-scan regression scope
 
@@ -3610,6 +3613,65 @@ epoch is retired, then proves no source callback/cache insertion or GET_SCAN
 target survives the late publication. This regression passes on both
 architectures at `0eb084197`, within all524 Intel cases and the complete
 release gates recorded in §3.59.
+
+
+### 3.61 Associated MLD periodic-scan ownership
+
+The retained Sc/Bz MLD owner now accepts active or passive periodic scans
+while its original station is authorized. API89 MVM keeps Linux
+`mvm/mac80211.c::iwl_mvm_mac_sched_scan_start`'s non-idle `EBUSY` rule;
+producer metadata or RFH descriptor format cannot switch that namespace.
+MLD uses its actual serving firmware link0 and `mld/scan.c`'s low-load
+WILD timing (max-out120TU, serving-channel suspend30TU), without creating
+another station/PHY, replacing keys or retuning the host PHY. Existing
+host/MCC channel restrictions, optional platform receipts and completed
+SET_DEVICE limits continue to bound actual probes. A scanner's global
+power bound also intersects the already applied home ceiling and remains
+a bound after STOP; no new board qualification or duty-cycle input exists.
+
+Native authority combines the unchanged home program with the exact
+periodic requester, source socket and scan-policy transaction. A serving
+program retains its original width/center/HE/QoS/power and capture epoch;
+its shared current-MCC cell updates only from the actual correlated MCC
+response. Looser facts cannot expand any issued grant. Width, HE, channel,
+power or WMM facts that invalidate home permanently retire its copied
+proofs before SCAN_REQ can publish. The short fact-cell lock covers pure
+checks only, with no capability/source callback or native await inside it.
+Steady-state requester checks run outside native State and match the same
+private owner/epoch after reacquisition. Retained key/BA/command waits also
+check the typed requester through their native RF fence, so socket loss
+cannot hide behind a held maintenance future. Those existing currentness
+callbacks acquire neither native State nor the private publication gate.
+
+The worker polls hardware once and keeps ordinary MPDU, beacon, TLC,
+EAPOL/rekey, replay/reorder and transmit progress while PNO is live. A
+bounded scan pass removes only its own control records, parses BSS facts
+without copying ordinary data, and gives the station only its inspected
+FIFO prefix; a later UID terminal cannot fall through the unrelated
+station decoder. Radio/cache callbacks run after native State/control
+release on every outcome. START/STOP waits preserve associated MPDUs.
+Healthy explicit or natural exact-UID retirement restores the existing
+home policy and invalidates only the scanner. A dropped STOP waiter still
+retains the native receipt/UID owner. Source-socket loss follows that same
+healthy stop when proved; forbidden home facts, malformed/ambiguous stop
+or source loss during uncertain native maintenance use the existing
+bounded physical retirement and retain uncertain DMA. Repair admission
+cancels the scanner and retires its private publication epoch immediately,
+before any already copied radio callback or later physical-stop poll.
+
+Six native fixtures are wired for Sc and Bz associated active/passive
+WPA2 DHCP/data/BSS/cache/terminal stop, actual wider or forbidding MCC
+responses with held home proofs, group rekey across all physical receive
+rings, source-close and dropped STOP/foreign UID, live MCC and uncertain
+abort/rekey failure plus API89 idle-only refusal, and a64-packet fairness
+prefix with the native UID terminal behind it. A separate policy fixture
+checks sticky current-MCC retirement and fixed original bounds. All seven
+new cases, including actual current native key-material witnesses and the
+repair-admission/passive-deauthentication refinement, pass coordinated
+parent release Clippy (`/tmp/wifi-associated-pno-release-clippy-x86-r6.log`,
+2026-10-31). All seven native executions remain pending; the accepted524
+Intel scope in §§3.59/3.60 remains separate. Firmware execution and RF
+continue to be fixture supplied.
 
 ## 4. References
 

@@ -958,6 +958,12 @@ whole basic1 frame airtime bound mandatory dwell admission; actual USB
 delivery and subsequent device TX-state retirement remain distinct. The
 family §3 records software acceptance of this private emitter at `0eb084197`.
 
+Sc/Bz MLD periodic scanning can retain the authorized serving station while
+its exact delegated requester owns the scan. Native link0 timing, current
+correlated MCC facts and unchanged home bounds fence data/key maintenance;
+healthy exact-UID termination restores home ownership. API89 MVM remains
+idle-only. Family §3.61 records seven new native cases pending execution.
+
 ## 4. Interaction with `narf-wireless`
 
 - **Registration**: Drivers register via `bus::register_wireless_driver(MatchEntry { ... })`.

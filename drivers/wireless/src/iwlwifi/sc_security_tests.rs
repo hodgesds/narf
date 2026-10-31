@@ -424,7 +424,7 @@ kernel_test_in!(
 
 /// Authenticator Group Message1 under the actual AKM2 exchange's KCK/KEK.
 /// Replay counters always advance even when retired key material is offered.
-fn rotation(gtk: (u8, [u8; 16]), igtk: Option<([u8; 16], u16, u64)>, counter: u64) -> R {
+pub(super) fn rotation(gtk: (u8, [u8; 16]), igtk: Option<([u8; 16], u16, u64)>, counter: u64) -> R {
     use narf_wireless::eapol::KeyFrame;
     let mut slot = HARNESS.lock();
     let wire = &mut slot.as_mut().unwrap().1;
@@ -477,7 +477,7 @@ fn key_commands() -> usize {
         .filter(|(group, command, _)| (*group, *command) == (5, 0x18))
         .count()
 }
-fn acknowledged_rotation(
+pub(super) fn acknowledged_rotation(
     gtk: (u8, [u8; 16]),
     igtk: Option<([u8; 16], u16, u64)>,
     counter: u64,

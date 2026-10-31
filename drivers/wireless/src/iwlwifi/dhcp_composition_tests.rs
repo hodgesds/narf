@@ -738,6 +738,40 @@ impl Wire {
         Ok(())
     }
 
+    /// Real native key commands, rather than the total number of historical
+    /// installs, determine the current data key after authenticated rotation.
+    fn native_data_keys(&self) -> bool {
+        let installed = |flags: u32, id: u32, material: &[u8]| {
+            self.commands
+                .iter()
+                .rev()
+                .find(|(group, command, body)| {
+                    (*group, *command) == (5, 0x18)
+                        && body.len() == 80
+                        && word(body, 8) == id
+                        && word(body, 12) == flags
+                })
+                .is_some_and(|(_, _, body)| word(body, 0) == 1 && body[16..32] == *material)
+        };
+        let gtk = self.gtk_expected.unwrap_or((1, [0x77; 16]));
+        let ptk = self
+            .key
+            .as_deref()
+            .is_some_and(|material| installed(if self.ap.pmf() { 0x22 } else { 2 }, 0, material));
+        let igtk = !self.ap.pmf()
+            || self
+                .igtk_expected
+                .map(|(material, id, _)| (material, id))
+                .or_else(|| self.ap.igtk())
+                .is_some_and(|(material, id)| installed(0x6a, u32::from(id), &material));
+        self.keys >= if self.ap.pmf() { 3 } else { 2 }
+            && ptk
+            && installed(0x4a, u32::from(gtk.0), &gtk.1)
+            && igtk
+            && (!self.group_rekey || self.group_reply)
+            && self.held_tx.is_none()
+    }
+
     fn transmit(&mut self, p: Published) -> R {
         require(
             self.queues
@@ -976,7 +1010,7 @@ impl Wire {
             require(
                 self.ap.phase() == ApPhase::Authorized
                     && protected == self.ap.protected()
-                    && (!protected || self.keys == if self.ap.pmf() { 3 } else { 2 }),
+                    && (!protected || self.native_data_keys()),
                 "Sc controlled port/protection",
             )?;
             require(

@@ -85,6 +85,12 @@ struct State {
     tx_progress: bool,
 }
 
+#[derive(Default)]
+struct StepOutcome {
+    data: Vec<Delivery>,
+    radio: Vec<scheduled::Publication>,
+}
+
 #[derive(Clone)]
 struct Delivery {
     bytes: Vec<u8>,
@@ -576,9 +582,8 @@ impl Device {
             .ok_or("Intel station policy lacks association")?
             .regulatory_program();
         let fence = self.policy.bind(program)?;
-        state
-            .hardware
-            .install_rf_policy(super::mld_policy::Authority::Station(fence.clone()))?;
+        let authority = self.station_policy_with_scan(state, fence.clone());
+        state.hardware.install_rf_policy(authority)?;
         *self.policy_fence.lock() = Some(fence);
         Ok(())
     }
@@ -604,6 +609,9 @@ impl Device {
     }
     fn start_repair(self: &Arc<Self>, state: &mut State) {
         self.set_link(false);
+        // Copied scan callbacks leave State before the retained physical
+        // stop runs. Close their private owner at repair admission too.
+        self.abandon_scheduled(state);
         self.retire_receive_ipc(state);
         state.needs_reset = true;
         state.hardware.fail();
@@ -778,18 +786,29 @@ impl Device {
     /// Nonblocking drain used both by the executor and synchronous IP
     /// waits. Dispatch to the network stack only after releasing state:
     /// an ARP/ICMP response can call send_frame synchronously.
-    fn step(self: &Arc<Self>, mut cx: Option<&mut Context<'_>>) -> Vec<Delivery> {
+    fn step(self: &Arc<Self>, cx: Option<&mut Context<'_>>) -> Vec<Delivery> {
+        let outcome = self.step_owned(cx);
+        // Every native State/control guard is gone before a source/cache
+        // callback can run, including receive/transport error paths.
+        for publication in outcome.radio {
+            publication.publish();
+        }
+        outcome.data
+    }
+
+    fn step_owned(self: &Arc<Self>, mut cx: Option<&mut Context<'_>>) -> StepOutcome {
+        let mut outcome = StepOutcome::default();
         let mut output = Vec::new();
         let epoch = self.generation.load(Ordering::Acquire);
         if !self.current_owner() {
-            return Vec::new();
+            return outcome;
         }
         let mut fallback = Context::from_waker(Waker::noop());
         if self
             .poll_control(cx.as_deref_mut().unwrap_or(&mut fallback))
             .is_pending()
         {
-            return Vec::new();
+            return outcome;
         }
         let source_lost = self.source.invoke(|| Ok(())).is_err();
         let policy_lost = self.policy_current().is_err();
@@ -800,7 +819,7 @@ impl Device {
             self.set_link(false);
         }
         let Some(mut state) = self.state.try_lock() else {
-            return Vec::new();
+            return outcome;
         };
         if source_lost
             || policy_lost
@@ -808,23 +827,42 @@ impl Device {
             || self.quarantined.load(Ordering::Acquire)
         {
             self.start_repair(&mut state);
-            return Vec::new();
+            return outcome;
         }
         if self.closing.load(Ordering::Acquire) {
             self.start_close(&mut state);
-            return Vec::new();
+            return outcome;
         }
-        if state.scheduled.is_some() {
-            if state.hardware.poll().is_err() {
-                self.start_repair(&mut state);
-                return Vec::new();
-            }
-            let publications = self.scheduled_step(&mut state);
+        if let Some(check) = self.scheduled_currentness(&state) {
+            // Source/socket callbacks may consult shared state. Never invoke
+            // them under the native owner mutex; revalidate the exact private
+            // owner and device generation after reacquiring it.
             drop(state);
-            for publication in publications {
-                publication.publish();
+            let current = check.current(self.as_ref());
+            let Some(reacquired) = self.state.try_lock() else {
+                return outcome;
+            };
+            state = reacquired;
+            if self.generation.load(Ordering::Acquire) != epoch || !check.matches(&state) {
+                return outcome;
             }
-            return Vec::new();
+            if !current {
+                self.start_scheduled_retirement();
+                return outcome;
+            }
+        }
+        if state.hardware.poll().is_err() {
+            self.start_repair(&mut state);
+            return outcome;
+        }
+        let mut receive_budget = 64;
+        if state.scheduled.is_some() {
+            let (publications, inspected) = self.scheduled_step_with_budget(&mut state);
+            outcome.radio = publications;
+            receive_budget = inspected;
+            if state.connection.is_none() || state.needs_reset {
+                return outcome;
+            }
         }
         let mut receive_failed = false;
         let State {
@@ -833,13 +871,9 @@ impl Device {
             eapol,
             ..
         } = &mut *state;
-        if hardware.poll().is_err() {
-            self.start_repair(&mut state);
-            return Vec::new();
-        }
         hardware.retire_transmits();
         if let Some(connection) = connection {
-            for _ in 0..64 {
+            for _ in 0..receive_budget {
                 let Some(packet) = hardware.notifications.pop_front() else {
                     break;
                 };
@@ -889,7 +923,7 @@ impl Device {
             // and DMA alive. The retained owner must perform the ordinary
             // bounded transport stop, preserving allocations on ambiguity.
             self.start_repair(&mut state);
-            return Vec::new();
+            return outcome;
         }
         let maintenance = !state.needs_reset
             && !state.hardware.is_failed()
@@ -909,7 +943,7 @@ impl Device {
         }
         if self.refresh_receive_ipc(&mut state).is_err() {
             self.source_failed(epoch);
-            return Vec::new();
+            return outcome;
         }
         let mut deliveries = Vec::new();
         let receive = state.hardware.receive_publication();
@@ -965,9 +999,9 @@ impl Device {
         if maintenance {
             let _ = self.poll_control(cx.unwrap_or(&mut fallback));
         }
-        deliveries
+        outcome.data = deliveries;
+        outcome
     }
-
     /// The slot owns the complete future, including its device-state guard.
     /// Polling an external waiter is never required for firmware progress.
     fn poll_control(&self, cx: &mut Context<'_>) -> Poll<()> {

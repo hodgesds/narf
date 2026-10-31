@@ -13,6 +13,28 @@ pub(super) struct Owner {
     cancel: Arc<AtomicBool>,
     epoch: u64,
     results: Vec<(BssInfo, Vec<u8>)>,
+    // MVM periodic scan remains idle-only; MLD uses the existing home link.
+    associated: bool,
+    scan: Option<super::super::mld_policy::ScanAuthority>,
+}
+
+/// Clone under State, check the actual source without State, then match the
+/// same private owner after reacquiring State. No shared callback can recurse
+/// into a native lock, and a successor can never inherit an earlier result.
+pub(super) struct Currentness {
+    event: RadioEventAuthority,
+    cancel: Arc<AtomicBool>,
+    epoch: u64,
+}
+impl Currentness {
+    pub(super) fn current(&self, device: &Device) -> bool {
+        !self.cancel.load(Ordering::Acquire) && self.event.check_for(device).is_ok()
+    }
+    pub(super) fn matches(&self, state: &State) -> bool {
+        state.scheduled.as_ref().is_some_and(|owner| {
+            owner.epoch == self.epoch && Arc::ptr_eq(&owner.cancel, &self.cancel)
+        })
+    }
 }
 
 struct Reply {
@@ -164,10 +186,16 @@ impl Device {
     ) -> Result<(), i32> {
         authority.check_for(self).map_err(|_| 1)?;
         authority.require_link().map_err(|_| 1)?;
-        if self.closing.load(Ordering::Acquire)
-            || state.connection.is_some()
-            || state.scheduled.is_some()
+        if self.closing.load(Ordering::Acquire) || state.scheduled.is_some() {
+            return Err(16);
+        }
+        let associated = state.connection.is_some();
+        if associated
+            && (!state.hardware.uses_mld_station_protocol()
+                || state.connection.as_ref().is_some_and(|c| !c.authorized))
         {
+            // Linux mvm/mac80211 requires cfg.idle. Only the admitted MLD
+            // consumer supports concurrent serving-link periodic scanning.
             return Err(16);
         }
         if state.needs_reset || state.hardware.is_failed() {
@@ -221,22 +249,57 @@ impl Device {
         .map_err(|_| 22)?;
         let epoch = self.scan_generation.begin().map_err(|_| 1)?;
         let event = authority.event_authority().map_err(|_| 1)?;
+        let home = state
+            .connection
+            .as_ref()
+            .map(Connection::regulatory_program);
+        let scan = if associated {
+            let domain = self.policy.snapshot().map_err(|_| 1)?;
+            Some(
+                super::super::mld_policy::ScanAuthority::new(
+                    self.policy.transaction(&domain).map_err(|_| 1)?,
+                    self.me.clone(),
+                    event.clone(),
+                    cancel.clone(),
+                )
+                .map_err(|_| 1)?,
+            )
+        } else {
+            None
+        };
         state.needs_reset = true;
         state.stop_completed = false;
         let result = {
             let native = async {
                 let hw = &mut state.hardware;
-                hw.clear_rf_policy();
+                if let (Some(home), Some(scan)) = (&home, &scan) {
+                    let fence = self.policy.bind(home.clone())?;
+                    hw.install_rf_policy(super::super::mld_policy::Authority::StationAndScan {
+                        home: fence,
+                        scan: scan.clone(),
+                    })?;
+                } else {
+                    hw.clear_rf_policy();
+                }
                 let mut permitted = alloc::vec![false;channels.len()];
                 let mut phy = self.phy;
                 if !request.probe_ssids.is_empty() {
                     if let Ok(domain) = self.policy.snapshot() {
-                        hw.install_rf_policy(super::super::mld_policy::Authority::Transaction(
-                            self.policy.transaction(&domain)?,
-                        ))?;
+                        if !associated {
+                            hw.install_rf_policy(
+                                super::super::mld_policy::Authority::Transaction(
+                                    self.policy.transaction(&domain)?,
+                                ),
+                            )?;
+                        }
                         let mcc =
                             super::super::connection::regulatory_channels_in_domain(hw, &domain)
                                 .await?;
+                        if let Some(home) = &home {
+                            // A correlated response updates current facts for every
+                            // old home capture, preserving its original geometry.
+                            home.refresh_mcc(&domain, mcc.clone())?;
+                        }
                         let powers: Vec<_> = channels
                             .iter()
                             .map(|&channel| {
@@ -249,12 +312,17 @@ impl Device {
                             })
                             .collect();
                         if let Some(power) = powers.iter().flatten().min() {
+                            // SET_DEVICE is a lasting additional global bound.
+                            // Never loosen the existing serving-link ceiling.
+                            let power = home
+                                .as_ref()
+                                .map_or(*power, |home| (*power).min(home.power()));
                             hw.ensure_platform_power().await?;
                             let mut body = station_api::tx_power(
                                 hw.version(1, 0x9f)
                                     .ok_or("scheduled TX power version absent")?
                                     .0,
-                                *power,
+                                power,
                             )?;
                             body[0] = 1;
                             hw.command(1, 0x9f, &body).await?;
@@ -263,8 +331,16 @@ impl Device {
                         phy.he &= mcc.he_allowed;
                     }
                 }
-                let body = wire::request(version, &channels, &permitted, local, phy, &request)?;
-                discard_notifications(hw);
+                let mut body = wire::request(version, &channels, &permitted, local, phy, &request)?;
+                if associated {
+                    // scan.h GENERAL_PARAMS_API_VER_12: link0 is our actual
+                    // single serving link; WILD timing for the current low-load
+                    // owner, with no additional host PHY or channel switch.
+                    body[11] = 0;
+                    body[20..24].copy_from_slice(&120u32.to_le_bytes());
+                    body[28..32].copy_from_slice(&30u32.to_le_bytes());
+                }
+                discard_notifications(hw, associated);
                 // Linux MLD sends this fixed API3 layout. The narrow ID is
                 // normalized to LONG_GROUP by the HostCommand owner; actual
                 // Sc metadata reports command3 in that normalized group.
@@ -295,6 +371,8 @@ impl Device {
             cancel,
             epoch,
             results: Vec::new(),
+            associated,
+            scan,
         });
         state.needs_reset = false;
         Ok(())
@@ -320,8 +398,19 @@ impl Device {
             return Ok(());
         };
         owner.cancel.store(true, Ordering::Release);
-        state.hardware.clear_rf_policy();
+        // Removing scan authority must not invalidate live home captures. The
+        // original serving program still proves every unchanged station fact.
+        let restored = if owner.associated {
+            self.install_station_policy(state)
+        } else {
+            state.hardware.clear_rf_policy();
+            Ok(())
+        };
+        if let Some(scan) = &owner.scan {
+            scan.invalidate();
+        }
         let result = async {
+            restored?;
             let mut abort = [0; 8];
             abort[..4].copy_from_slice(&wire::UID.to_le_bytes());
             let reply = state.hardware.command(1, 0xe, &abort).await?;
@@ -346,7 +435,7 @@ impl Device {
                     activity.await;
                 }
             }
-            discard_notifications(&mut state.hardware);
+            discard_notifications(&mut state.hardware, owner.associated);
             Ok(())
         }
         .await;
@@ -360,32 +449,79 @@ impl Device {
         result
     }
 
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn scheduled_step(self: &Arc<Self>, state: &mut State) -> Vec<Publication> {
+        self.scheduled_step_with_budget(state).0
+    }
+    pub(super) fn scheduled_step_with_budget(
+        self: &Arc<Self>,
+        state: &mut State,
+    ) -> (Vec<Publication>, usize) {
         let mut publications = Vec::new();
         let Some(owner) = state.scheduled.as_mut() else {
-            return publications;
+            return (publications, 0);
         };
-        let lost = owner.cancel.load(Ordering::Acquire)
-            || owner.event.check_for(self.as_ref()).is_err()
-            || state
-                .hardware
-                .source_fence()
-                .and_then(|s| s.invoke(|| Ok(())))
-                .is_err();
+        // The actual event/socket check ran outside State in step_owned and
+        // was matched to this exact epoch after reacquiring State.
+        let lost = owner.cancel.load(Ordering::Acquire);
         if lost {
             self.start_scheduled_retirement();
-            return publications;
+            return (publications, 0);
         }
         let mut stopped = false;
         let mut publish = false;
         let mut malformed = false;
+        let mut index = 0;
         for _ in 0..64 {
-            let Some(packet) = state.hardware.notifications.pop_front() else {
+            let Some(packet) = state.hardware.notifications.get(index) else {
                 break;
             };
-            if packet.header.group_id != 0 {
+            let consumed = packet.header.group_id == 0
+                && matches!(packet.header.cmd, 0xf | 0xb2 | 0xb5 | 0xd9);
+            let copy = packet.header.group_id == 0
+                && packet.header.cmd == 0xc1
+                && packet.receive_queue == 0;
+            if !consumed && !copy {
+                if owner.associated {
+                    index += 1;
+                } else {
+                    state.hardware.notifications.remove(index);
+                }
                 continue;
             }
+            if copy {
+                // Parse only scan facts from the borrowed fallback MPDU. Data
+                // packets incur no duplicate allocation or owner replacement.
+                let copied = wire::copied_bss(packet, false, &owner.channels, &owner.request);
+                if owner.associated {
+                    index += 1;
+                } else {
+                    state.hardware.notifications.remove(index);
+                }
+                if let Some((beacon, bss)) = copied {
+                    if let Some(old) = state
+                        .beacons
+                        .iter_mut()
+                        .find(|old| old.bssid == beacon.bssid)
+                    {
+                        *old = beacon.clone();
+                    } else if state.beacons.len() < 256 {
+                        state.beacons.push(beacon.clone());
+                    }
+                    let entry = (bss, beacon.information_elements);
+                    if let Some(old) = owner
+                        .results
+                        .iter_mut()
+                        .find(|old| old.0.bssid == entry.0.bssid)
+                    {
+                        *old = entry;
+                    } else if owner.results.len() < 256 {
+                        owner.results.push(entry);
+                    }
+                }
+                continue;
+            }
+            let packet = state.hardware.notifications.remove(index).unwrap();
             match packet.header.cmd {
                 0xf => match wire::complete(&packet.payload) {
                     Ok(Some(_)) => stopped = true,
@@ -411,44 +547,19 @@ impl Device {
                     }
                 }
                 0xd9 => publish = true,
-                0xc1 if packet.receive_queue == 0 => {
-                    if let Some((beacon, bss)) =
-                        wire::copied_bss(&packet, false, &owner.channels, &owner.request)
-                    {
-                        if let Some(old) = state
-                            .beacons
-                            .iter_mut()
-                            .find(|old| old.bssid == beacon.bssid)
-                        {
-                            *old = beacon.clone();
-                        } else if state.beacons.len() < 256 {
-                            state.beacons.push(beacon.clone());
-                        }
-                        let entry = (bss, beacon.information_elements);
-                        if let Some(old) = owner
-                            .results
-                            .iter_mut()
-                            .find(|old| old.0.bssid == entry.0.bssid)
-                        {
-                            *old = entry;
-                        } else if owner.results.len() < 256 {
-                            owner.results.push(entry);
-                        }
-                    }
-                }
                 _ => {}
             }
         }
         if malformed {
             self.start_repair(state);
-            return publications;
+            return (publications, 0);
         }
         let epoch = if stopped {
             match self.scan_generation.retire() {
                 Ok(epoch) => epoch,
                 Err(_) => {
                     self.start_repair(state);
-                    return publications;
+                    return (publications, 0);
                 }
             }
         } else {
@@ -474,12 +585,50 @@ impl Device {
             });
         }
         if stopped {
-            state.scheduled = None;
-            state.hardware.clear_rf_policy();
+            let owner = state.scheduled.take().unwrap();
+            let restored = if owner.associated {
+                self.install_station_policy(state)
+            } else {
+                state.hardware.clear_rf_policy();
+                Ok(())
+            };
+            if let Some(scan) = &owner.scan {
+                scan.invalidate();
+            }
+            if restored.is_err() {
+                publications.clear();
+                self.start_repair(state);
+            }
         }
-        publications
+        // Only this preserved prefix has been inspected for scan records.
+        // The station may consume that prefix; a later UID notification or
+        // BSS must stay queued for the next scan pass, never fall through to
+        // Connection's unrelated packet decoder.
+        (publications, index)
     }
-    fn start_scheduled_retirement(self: &Arc<Self>) {
+    pub(super) fn scheduled_currentness(&self, state: &State) -> Option<Currentness> {
+        state.scheduled.as_ref().map(|owner| Currentness {
+            event: owner.event.clone(),
+            cancel: owner.cancel.clone(),
+            epoch: owner.epoch,
+        })
+    }
+    pub(super) fn station_policy_with_scan(
+        &self,
+        state: &State,
+        home: super::super::mld_policy::Fence,
+    ) -> super::super::mld_policy::Authority {
+        if let Some(scan) = state
+            .scheduled
+            .as_ref()
+            .and_then(|owner| owner.scan.clone())
+        {
+            super::super::mld_policy::Authority::StationAndScan { home, scan }
+        } else {
+            super::super::mld_policy::Authority::Station(home)
+        }
+    }
+    pub(super) fn start_scheduled_retirement(self: &Arc<Self>) {
         let Some(mut control) = self.control.try_lock() else {
             return;
         };
@@ -494,8 +643,10 @@ impl Device {
     }
 }
 
-fn discard_notifications(hw: &mut Hardware) {
+fn discard_notifications(hw: &mut Hardware, associated: bool) {
     hw.notifications.retain(|p| {
-        !(p.header.group_id == 0 && matches!(p.header.cmd, 0xf | 0xc1 | 0xb2 | 0xb5 | 0xd9))
+        !(p.header.group_id == 0
+            && (matches!(p.header.cmd, 0xf | 0xb2 | 0xb5 | 0xd9)
+                || !associated && p.header.cmd == 0xc1))
     });
 }

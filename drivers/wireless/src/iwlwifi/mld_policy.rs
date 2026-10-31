@@ -2,8 +2,9 @@
 //! Current host policy for native MLD station publication. A cached MCC
 //! map is bound to its host country and already-programmed span/ceiling;
 //! it is never a replacement for SAR or measured platform qualification.
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicI8, Ordering};
+use narf_lib::sync::IrqSafeSpinLock;
 use narf_wireless::reg::RegulatoryDomain;
 
 #[derive(Clone)]
@@ -46,6 +47,9 @@ pub(super) struct Transaction {
     validity: Validity,
 }
 impl Transaction {
+    pub fn invalidate(&self) {
+        self.validity.invalidate();
+    }
     pub fn check(&self) -> Result<(), &'static str> {
         self.validity.check()?;
         if !Arc::ptr_eq(&self.initial, &self.source.snapshot()?) {
@@ -72,10 +76,58 @@ impl Validity {
         self.0.store(false, Ordering::Release);
     }
 }
+/// Actual scanner requester and policy retained by native MLD ownership.
+/// Currentness validation does not acquire native state; no user callback
+/// runs while the short MCC fact cell is locked.
+#[derive(Clone)]
+pub(super) struct ScanAuthority(Arc<ScanProof>);
+struct ScanProof {
+    policy: Transaction,
+    device: Weak<super::device::Device>,
+    event: narf_wireless::ap_control::RadioEventAuthority,
+    cancel: Arc<AtomicBool>,
+}
+impl ScanAuthority {
+    pub fn new(
+        policy: Transaction,
+        device: Weak<super::device::Device>,
+        event: narf_wireless::ap_control::RadioEventAuthority,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self, &'static str> {
+        let proof = Self(Arc::new(ScanProof {
+            policy,
+            device,
+            event,
+            cancel,
+        }));
+        proof.check()?;
+        Ok(proof)
+    }
+    pub fn check(&self) -> Result<(), &'static str> {
+        if self.0.cancel.load(Ordering::Acquire) {
+            return Err("Intel periodic request canceled");
+        }
+        self.0.policy.check()?;
+        let device = self
+            .0
+            .device
+            .upgrade()
+            .ok_or("Intel periodic device retired")?;
+        self.0
+            .event
+            .check_for(device.as_ref())
+            .map_err(|_| "Intel periodic caller/source retired")
+    }
+    pub fn invalidate(&self) {
+        self.0.policy.invalidate();
+    }
+}
+
 #[derive(Clone)]
 pub(super) enum Authority {
     Transaction(Transaction),
     Station(Fence),
+    StationAndScan { home: Fence, scan: ScanAuthority },
 }
 impl Authority {
     pub fn domain(&self) -> Result<Arc<RegulatoryDomain>, &'static str> {
@@ -83,22 +135,31 @@ impl Authority {
         match self {
             Self::Transaction(t) => Ok(t.initial.clone()),
             Self::Station(f) => f.source.snapshot(),
+            Self::StationAndScan { scan, .. } => Ok(scan.0.policy.initial.clone()),
         }
     }
     pub fn check(&self) -> Result<(), &'static str> {
         match self {
             Self::Transaction(t) => t.check(),
             Self::Station(f) => f.check(),
+            Self::StationAndScan { home, scan } => {
+                home.check()?;
+                scan.check()
+            }
         }
     }
     pub fn validity(&self) -> Validity {
         match self {
             Self::Transaction(t) => t.validity.clone(),
             Self::Station(f) => f.program.validity.clone(),
+            Self::StationAndScan { home, .. } => home.program.validity.clone(),
         }
     }
     pub fn invalidate(&self) {
         self.validity().invalidate();
+        if let Self::StationAndScan { scan, .. } = self {
+            scan.invalidate();
+        }
     }
 }
 
@@ -108,7 +169,7 @@ impl Authority {
 pub(super) struct Program {
     country: [u8; 2],
     validity: Validity,
-    firmware: super::mld_regulatory::Mcc,
+    firmware: Arc<IrqSafeSpinLock<super::mld_regulatory::Mcc>>,
     pub primary: u8,
     width: u8,
     center: u8,
@@ -131,7 +192,7 @@ impl Program {
         let program = Self {
             country: domain.country_code,
             validity,
-            firmware,
+            firmware: Arc::new(IrqSafeSpinLock::new(firmware)),
             primary,
             width,
             center,
@@ -143,7 +204,7 @@ impl Program {
         Ok(program)
     }
     pub fn with_he(mut self, he: bool) -> Result<Self, &'static str> {
-        if he && !self.firmware.he_allowed {
+        if he && !self.firmware.lock().he_allowed {
             return Err("Intel native MCC prohibits HE operation");
         }
         self.he = he;
@@ -153,13 +214,14 @@ impl Program {
         self.applied_dbm.load(Ordering::Acquire)
     }
     pub fn ceiling(&self, domain: &RegulatoryDomain) -> Result<i8, &'static str> {
-        self.check(domain)?;
+        let firmware = self.firmware.lock();
+        self.check_firmware(domain, &firmware)?;
         super::connection::channel_power_width(
             domain,
             self.primary,
             self.width,
             self.center,
-            &self.firmware.channels,
+            &firmware.channels,
         )
         .ok_or("Intel current policy has no station power ceiling")
     }
@@ -171,25 +233,46 @@ impl Program {
     pub fn commit_power(&self, power: i8) {
         self.applied_dbm.store(power, Ordering::Release);
     }
+    /// Only the native owner calls this with its actual correlated MCC
+    /// response. Program geometry/features/applied power remain fixed; all
+    /// copied proofs see current facts, and forbidden home state is sticky.
+    pub fn refresh_mcc(
+        &self,
+        domain: &RegulatoryDomain,
+        current: super::mld_regulatory::Mcc,
+    ) -> Result<(), &'static str> {
+        let mut firmware = self.firmware.lock();
+        *firmware = current;
+        let result = self.check_firmware(domain, &firmware);
+        if result.is_err() {
+            self.validity.invalidate();
+        }
+        result
+    }
     fn check(&self, domain: &RegulatoryDomain) -> Result<(), &'static str> {
+        let firmware = self.firmware.lock();
+        self.check_firmware(domain, &firmware)
+    }
+    fn check_firmware(
+        &self,
+        domain: &RegulatoryDomain,
+        firmware: &super::mld_regulatory::Mcc,
+    ) -> Result<(), &'static str> {
         self.validity.check()?;
         if domain.country_code != self.country
-            || !self.firmware.widths.permits(self.width)
-            || self.he && !self.firmware.he_allowed
+            || !firmware.widths.permits(self.width)
+            || self.he && !firmware.he_allowed
             || self.country != *b"00" && !self.country.iter().all(u8::is_ascii_uppercase)
             || super::connection::channel_power_width(
                 domain,
                 self.primary,
                 self.width,
                 self.center,
-                &self.firmware.channels,
+                &firmware.channels,
             )
             .is_none_or(|ceiling| ceiling < self.power())
-            || self.firmware.country != *b"00"
-                && !self.firmware.country.iter().all(u8::is_ascii_uppercase)
-            || self
-                .firmware
-                .limit_qos(domain, self.primary, self.width, self.center, self.qos)
+            || firmware.country != *b"00" && !firmware.country.iter().all(u8::is_ascii_uppercase)
+            || firmware.limit_qos(domain, self.primary, self.width, self.center, self.qos)
                 != self.qos
         {
             return Err("Intel current regulatory policy forbids the programmed station span");
@@ -312,5 +395,69 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/iwlwifi/policy",
         smoke_iwl_mld_current_policy_span_country_ceiling_and_replacement_fences
+    );
+    fn smoke_iwl_mld_current_mcc_cell_keeps_program_bounds_and_retires_stickily() -> TestResult {
+        (|| {
+            let db = Arc::new(Database::new());
+            let original = domain();
+            db.install(original.clone());
+            let source = Source::database(db);
+            let mut permissions = alloc::vec![0; 51];
+            for channel in [36, 40, 44, 48] {
+                permissions[super::super::station_api::channel_index(channel).unwrap()] = 0x70d;
+            }
+            let initial = super::super::mld_regulatory::Mcc {
+                channels: permissions.into(),
+                country: *b"US",
+                etsi_5ghz: false,
+                he_allowed: true,
+                widths: super::super::gen3_wire::Widths {
+                    forty: true,
+                    eighty: true,
+                    one_sixty: false,
+                },
+            };
+            for he_prohibition in [false, true] {
+                let program = Program::new(
+                    &original,
+                    initial.clone(),
+                    36,
+                    2,
+                    42,
+                    17,
+                    None,
+                    Validity::new(),
+                )?
+                .with_he(true)?;
+                let held = source.bind(program.clone())?;
+                let mut looser = initial.clone();
+                looser.widths.one_sixty = true;
+                program.refresh_mcc(&original, looser.clone())?;
+                held.invoke(|| Ok(()))?;
+                if program.width != 2 || program.center != 42 || program.power() != 17 {
+                    return Err("MLD refreshed MCC enlarged an already issued station program");
+                }
+                let mut forbidden = initial.clone();
+                if he_prohibition {
+                    forbidden.he_allowed = false;
+                } else {
+                    forbidden.widths.eighty = false;
+                }
+                if program.refresh_mcc(&original, forbidden).is_ok()
+                    || held.invoke(|| Ok(())).is_ok()
+                {
+                    return Err("MLD held home proof ignored actual tighter MCC facts");
+                }
+                if program.refresh_mcc(&original, looser).is_ok() || held.check().is_ok() {
+                    return Err("MLD later looser MCC resurrected a retired home proof");
+                }
+            }
+            Ok(())
+        })()
+        .map_or_else(TestResult::Fail, |()| TestResult::Pass)
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/policy",
+        smoke_iwl_mld_current_mcc_cell_keeps_program_bounds_and_retires_stickily
     );
 }
