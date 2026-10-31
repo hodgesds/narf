@@ -19,6 +19,7 @@ struct ChannelLink {
     control: Fake,
     seen_reset: Arc<AtomicU64>,
     beacon: Arc<AtomicBool>,
+    beacon_generation: Arc<AtomicU64>,
 }
 impl ChannelLink {
     fn synchronize_reset(&self) -> Result<(), UsbError> {
@@ -52,11 +53,20 @@ impl Io for ChannelLink {
     fn poll_receive(&self, receipt: &u64, out: &mut [u8]) -> Result<Option<usize>, UsbError> {
         self.synchronize_reset()?;
         let (channel, receiving, _) = self.physical();
-        if channel == 6 && receiving && self.beacon.load(Ordering::Acquire) {
+        let generation = self.control.0.lock().cold_generation;
+        if channel == 6
+            && receiving
+            && self.beacon.load(Ordering::Acquire)
+            && self.beacon_generation.load(Ordering::Acquire) != generation
+        {
             let mut peer = self.bulk.0.lock();
             if peer.queue.is_empty() && peer.raw_queue.is_empty() {
+                // A finite beacon on each physical receive stream leaves an
+                // actual quiet poll after EAPOL delivery. An infinite beacon
+                // on every empty poll would never retire that RX prefix.
                 let beacon = peer.ap.beacon();
                 peer.queue.push_back(beacon);
+                self.beacon_generation.store(generation, Ordering::Release);
             }
         }
         self.bulk.poll_receive(receipt, out)
@@ -165,6 +175,7 @@ impl Fixture {
             control: control.clone(),
             seen_reset: Arc::new(AtomicU64::new(control.0.lock().cold_generation)),
             beacon: Arc::new(AtomicBool::new(true)),
+            beacon_generation: Arc::new(AtomicU64::new(u64::MAX)),
         };
         let mut receiver = Receiver::new(
             firmware.clone(),
@@ -303,11 +314,21 @@ fn cancellation() -> Result<(), &'static str> {
         let h = Fixture::new(false)?;
         h.control.0.lock().pending_write = Some(0x284);
         let mut scan = Box::pin(h.device.scan(h.scan()));
+        let mut published = false;
+        for _ in 0..64 {
+            ensure!(
+                scan.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending(),
+                "EU retune ended before its held EP0 publication"
+            );
+            if h.control.0.lock().active_td {
+                published = true;
+                break;
+            }
+        }
         ensure!(
-            scan.as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-                && h.control.0.lock().active_td,
+            published && h.control.0.lock().active_td,
             "EU retune did not retain its published EP0 wait"
         );
         if revoked {
