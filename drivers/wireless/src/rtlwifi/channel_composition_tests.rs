@@ -19,6 +19,9 @@ pub(super) fn peer_channel(h: &Harness, channel: u8) {
     let mut peer = h.peer.lock();
     let protected = peer.ap.protected();
     peer.channel = channel;
+    if let Some(ht) = &mut peer.ht {
+        ht[30] = channel;
+    }
     peer.ap = if protected {
         FakeAp::wpa2(peer.plan, SSID, channel, 42, PMK, ANONCE)
     } else {

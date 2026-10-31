@@ -1174,31 +1174,39 @@ impl Environment for NativeEnvironment {
         &self,
         base: Arc<super::channel_power::Calibration>,
     ) -> Result<Option<Arc<super::ht::Grant>>, Error> {
-        if self
+        let channel = self
             .device
             .lock()
             .upgrade()
-            .is_some_and(|device| device.lifecycle.channel.load(Ordering::Acquire) != 1)
-        {
-            return Ok(None);
-        }
-        super::ht::Grant::registered(base, self.firmware().identity().ok_or(Error::State)?)
-            .map_err(Error::Radio)
+            .ok_or(Error::State)?
+            .lifecycle
+            .channel
+            .load(Ordering::Acquire);
+        super::ht::Grant::registered(
+            base,
+            self.firmware().identity().ok_or(Error::State)?,
+            channel,
+        )
+        .map_err(Error::Radio)
     }
     fn fallback(
         &self,
         base: Arc<super::channel_power::Calibration>,
     ) -> Result<Option<Arc<super::fallback::Grant>>, Error> {
-        if self
+        let channel = self
             .device
             .lock()
             .upgrade()
-            .is_some_and(|device| device.lifecycle.channel.load(Ordering::Acquire) != 1)
-        {
-            return Ok(None);
-        }
-        super::fallback::Grant::registered(base, self.firmware().identity().ok_or(Error::State)?)
-            .map_err(Error::Radio)
+            .ok_or(Error::State)?
+            .lifecycle
+            .channel
+            .load(Ordering::Acquire);
+        super::fallback::Grant::registered(
+            base,
+            self.firmware().identity().ok_or(Error::State)?,
+            channel,
+        )
+        .map_err(Error::Radio)
     }
     fn admission(&self) -> Option<&Arc<station::Admission>> {
         Some(&self.admission)

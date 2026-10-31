@@ -65,6 +65,7 @@ mod ht;
 mod interface;
 mod power_runtime;
 mod probe_scan;
+pub use fallback::Request as RateFallbackRequest;
 pub use ht::Request as Ht20Request;
 pub mod irq;
 pub mod mac;

@@ -286,7 +286,7 @@ it preserves that owner for a live generation; verified recovery replaces the
 retained slot with a fresh owner. Current net authority
 is required before production publication admits station DMA. Only
 the selected qualified channel in1–11, legacy20/1T or the separately qualified
-channel1 HT20/LGI profile below,
+HT20/LGI profile below under its exact channel qualification,
 mandatory basic1Mbps, software crypto and one peer at a time are admitted.
 MSI drives the native owner when available, with polling fallback;
 a bounded synchronous drain serves the real stack even while a synchronous
@@ -496,7 +496,7 @@ cancellation test now negotiates this richer offer before terminal closure.
 `RtlwifiDevice::ht20_request()` returns the optional program's filename and
 binding after resolving the current exact legacy NEPC record and the actual
 ready executable identity. It supplies no
-measured gain or radio permission. This continuation applies only to
+measured gain or radio permission. The original v2 continuation applies only to
 `10ec:8179`, channel1/2412MHz, one TX/RX stream, mandatory MCS0–7, LGI+SGI20,
 response-bound WMM (classified TID0..7 on its AC ring) and Open or WPA2-PSK/software CCMP. It adds no
 HT40, LDPC/STBC, RTS/CTS protection, extra AC,
@@ -1127,7 +1127,8 @@ the public waiter preserves the transition. IPS and system resume rebuild the
 last requested channel only under fresh current permission.
 
 Channel1 NEHT/NEFB records do not authorize HT or adaptive fallback on another
-channel; those channels use the qualified fixed legacy20 path. Discovery
+channel; absent their separate per-channel continuations, those channels use
+the qualified fixed legacy20 path. Discovery
 reports only channels permitted by the current NEPC and host policy. Other
 bands/widths remain separate.
 Four native composed cases exercise actual1→6→11→1 RF18 and distinct gain
@@ -1160,6 +1161,40 @@ actual DHCP, default passive scanning with physical off-channel filtering,
 whole-plan prevalidation, stale display metadata and cancelled retained work.
 Acceptance remains pending. The dwell/probe/channel progression follows
 Linux [mac80211 scan.c](https://github.com/torvalds/linux/blob/master/net/mac80211/scan.c).
+
+### Per-channel HT20 and DATA fallback (implemented, native acceptance pending)
+
+`RtlwifiDevice::ht20_request_on_channel(channel)` and
+`rate_fallback_request(channel)` return provisioning filenames and bindings
+for channels1–11 after resolving the current factory, NEPC and executable
+identity. They grant no transmit permission. The existing `ht20_request()`
+continues selecting the channel1 v2 program.
+
+Noninitial channels use signed NEHT v3 files named
+`rtlwifi/rtl8188ee-ht20-v3-ch<channel>-<MAC>.bin`. The160-byte header retains
+the v2 curve geometry, but version3 and byte118 bind the exact channel2–11;
+the program hash also binds that channel. HT gain selection follows Linux's
+EFUSE BW40 base group at0x16+group, the signed high nibble at0x1b, and the
+per-regulatory channel group's pathA MCS PG offsets. It intersects that
+factory ceiling with the exact channel's signed HT curves and current NEPC
+permission. Channel1 v2 records retain their existing bytes, name and hash.
+No channel1 record or another channel's program authorizes these gains.
+
+Noninitial-channel fallback uses signed NEFB v2 files named
+`rtlwifi/rtl8188ee-fallback-v2-ch<channel>-<MAC>.bin`. Byte118 remains the
+enable bit; byte119 binds channel2–11, and bytes120–127 remain zero. Version,
+program hash, factory, NEPC and actual firmware identity must agree. Channel1
+retains the existing NEFB v1 contract. Installation additionally matches the
+physical station permission's channel. SGI transmissions retain DISFB, as
+neither fallback version qualifies mixed-GI retries. Missing optional files
+preserve legacy or fixed-rate operation; malformed/revoked files cannot
+authorize the richer profile.
+
+Five native cases cover literal factory-group bounds, version/channel/source
+substitution and revocation, and composed channel6/channel11 HT Open/WPA2
+MLME, actual kernel DHCP, real TXAGC readbacks and native fallback descriptors.
+They remain pending acceptance. Wider widths and thermal gain tracking remain
+separate rows.
 
 ## 4. Invariants
 
@@ -1313,7 +1348,7 @@ runtimes remain separate from the retained RTL8188EE owner.
 | Row | Concrete blocker |
 |---|---|
 | `active_scanning` | Native single-channel active Probe Requests software-validated; qualified cold retune1–11 and multi-channel dwell aggregation with owned metadata/fresh physical join observation implemented pending acceptance |
-| `additional_operating_channels` | Legacy20 cold retune1–11 under current signed per-channel NEPC implemented pending acceptance; broader qualified HT/fallback channel profiles remain |
+| `additional_operating_channels` | Legacy20 cold retune1–11 under current signed per-channel NEPC and per-channel HT20/NEFB continuations implemented pending acceptance |
 | `bt_coexistence` | Bluetooth coexistence on RTL8723AE/BE; blocked on the rtl8723ae/rtl8723be chip runtimes |
 | `dynamic_antenna_selection` | Dynamic antenna selection/tracking; blocked on per-antenna signed board measurements (NEPC binds one static factory antenna) |
 | `five_ghz_operation` | 5GHz band operation on RTL8192DE/RTL8821AE; blocked on the rtl8192de/rtl8821ae chip runtimes (RTL8188EE is 2.4GHz-only) |

@@ -137,6 +137,11 @@ impl Default for IrqFixture {
         }
     }
 }
+type ChannelFixtureSource = (
+    u8,
+    Vec<u8>,
+    narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+);
 struct DeviceEnvironment {
     firmware: IrqSafeSpinLock<Arc<Firmware<BootPort>>>,
     device: IrqSafeSpinLock<alloc::sync::Weak<TestDevice>>,
@@ -146,6 +151,8 @@ struct DeviceEnvironment {
     packet: PacketPort,
     beacon: AtomicBool,
     ht: Option<HtFixtureSource>,
+    ht_channel: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
+    fallback_channel: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
 }
 impl Environment for DeviceEnvironment {
     fn allow_channel(
@@ -192,13 +199,29 @@ impl Environment for DeviceEnvironment {
         &self,
         base: Arc<super::super::super::super::super::channel_power::Calibration>,
     ) -> Result<Option<Arc<super::super::super::super::super::fallback::Grant>>, StationError> {
-        if self
+        let channel = self
             .device
             .lock()
             .upgrade()
-            .is_some_and(|device| device.channel_for_test() != 1)
-        {
-            return Ok(None);
+            .ok_or(StationError::State)?
+            .channel_for_test();
+        if channel != 1 {
+            let source = self.fallback_channel.lock();
+            let Some((expected, bytes, cap)) = source.as_ref() else {
+                return Ok(None);
+            };
+            if *expected != channel {
+                return Ok(None);
+            }
+            return super::super::super::super::super::fallback::Grant::parse(
+                base,
+                self.firmware.lock().identity().ok_or(StationError::State)?,
+                bytes,
+                Some([0x77; 32]),
+                *cap,
+            )
+            .map(|grant| Some(Arc::new(grant)))
+            .map_err(StationError::Radio);
         }
         self.base.fallback(base)
     }
@@ -206,13 +229,29 @@ impl Environment for DeviceEnvironment {
         &self,
         base: Arc<super::super::super::super::super::channel_power::Calibration>,
     ) -> Result<Option<Arc<super::super::super::super::super::ht::Grant>>, StationError> {
-        if self
+        let channel = self
             .device
             .lock()
             .upgrade()
-            .is_some_and(|device| device.channel_for_test() != 1)
-        {
-            return Ok(None);
+            .ok_or(StationError::State)?
+            .channel_for_test();
+        if channel != 1 {
+            let source = self.ht_channel.lock();
+            let Some((expected, bytes, cap)) = source.as_ref() else {
+                return Ok(None);
+            };
+            if *expected != channel {
+                return Ok(None);
+            }
+            return super::super::super::super::super::ht::Grant::parse(
+                base,
+                self.firmware.lock().identity().ok_or(StationError::State)?,
+                bytes,
+                Some([0x77; 32]),
+                *cap,
+            )
+            .map(|grant| Some(Arc::new(grant)))
+            .map_err(StationError::Radio);
         }
         self.ht
             .as_ref()
@@ -413,6 +452,8 @@ impl Harness {
                 packet: packet.clone(),
                 beacon: AtomicBool::new(false),
                 ht: ht_source.clone(),
+                ht_channel: IrqSafeSpinLock::new(None),
+                fallback_channel: IrqSafeSpinLock::new(None),
             },
         ));
         *device.environment_for_test().device.lock() = Arc::downgrade(&device);
@@ -519,6 +560,8 @@ impl Harness {
 }
 #[path = "channel_composition_tests.rs"]
 mod channel_tests;
+#[path = "ht_channel_composition_tests.rs"]
+mod ht_channels;
 #[path = "ht_composition_tests.rs"]
 mod ht_tests;
 #[path = "power_composition_tests.rs"]

@@ -870,6 +870,13 @@ passed all 66 tests; trusted-key build-parser tests passed both cases.
 Formatting and Clippy on the affected kernel libraries and xtask passed.
 These results validate software contracts, not target-radio operation.
 
+RTL8188EE provisioning metadata exposes `ht20_request_on_channel(channel)`
+and `rate_fallback_request(channel)` for channels1–11. These return exact
+factory/NEPC/executable program bindings; they confer no transmit permission.
+Channel1 retains NEHT v2/NEFB v1, while channels2–11 require separately bound
+NEHT v3/NEFB v2 records as specified in `rtlwifi.md` §3. These continuations
+are implemented pending native acceptance.
+
 ## 4. Interaction with `narf-wireless`
 
 - **Registration**: Drivers register via `bus::register_wireless_driver(MatchEntry { ... })`.

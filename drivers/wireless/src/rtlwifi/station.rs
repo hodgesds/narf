@@ -1360,7 +1360,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     self.station.native_associated = true;
                     self.station.fallback = None;
                     if let Some(grant) = environment.fallback(base_for_fallback.clone())? {
-                        if !grant.matches(&base_for_fallback) {
+                        if !grant.matches(
+                            &base_for_fallback,
+                            self.permission.ok_or(Error::State)?.channel(),
+                        ) {
                             return Err(Error::Profile);
                         }
                         self.station.fallback = Some(grant);

@@ -64,6 +64,16 @@ impl RtlwifiDevice {
     }
     /// Provisioning metadata only; no measured gain or transmit permission.
     pub fn ht20_request(&self) -> Result<super::Ht20Request, super::channel_power::Error> {
+        self.ht20_request_on_channel(1)
+    }
+    /// Per-channel provisioning metadata; this grants no RF permission.
+    pub fn ht20_request_on_channel(
+        &self,
+        channel: u8,
+    ) -> Result<super::Ht20Request, super::channel_power::Error> {
+        if !(1..=11).contains(&channel) {
+            return Err(super::channel_power::Error::Policy);
+        }
         let factory = self
             .factory
             .as_ref()
@@ -76,7 +86,37 @@ impl RtlwifiDevice {
         firmware
             .invoke(|| Ok(()))
             .map_err(|_| super::channel_power::Error::Authority)?;
-        Ok(super::ht::request(&base, firmware))
+        Ok(if channel == 1 {
+            super::ht::request(&base, firmware)
+        } else {
+            super::ht::request_on_channel(&base, firmware, channel)
+        })
+    }
+    /// Exact-channel fallback provisioning metadata; grants no radio permission.
+    pub fn rate_fallback_request(
+        &self,
+        channel: u8,
+    ) -> Result<super::RateFallbackRequest, super::channel_power::Error> {
+        if !(1..=11).contains(&channel) {
+            return Err(super::channel_power::Error::Policy);
+        }
+        let factory = self
+            .factory
+            .as_ref()
+            .ok_or(super::channel_power::Error::Identity)?;
+        let base = super::channel_power::Calibration::load_registered(factory)?;
+        let firmware = self
+            .current_firmware()
+            .and_then(|firmware| firmware.identity())
+            .ok_or(super::channel_power::Error::Identity)?;
+        firmware
+            .invoke(|| Ok(()))
+            .map_err(|_| super::channel_power::Error::Authority)?;
+        Ok(if channel == 1 {
+            super::fallback::request(&base, firmware)
+        } else {
+            super::fallback::request_on_channel(&base, firmware, channel)
+        })
     }
     /// Firmware-ready is diagnostic CPU readiness, never station readiness.
     pub fn firmware_status(&self) -> Option<super::firmware_transport::Status> {
