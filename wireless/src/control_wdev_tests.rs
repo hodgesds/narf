@@ -9,6 +9,32 @@ struct ControlRadio {
     namespace: u64,
     physical: u64,
 }
+impl ControlRadio {
+    async fn terminal_callback(
+        &self,
+        authority: &RadioControlAuthority,
+    ) -> Result<(), WirelessError> {
+        struct Borrowed<'a>(&'a AtomicU32);
+        impl Drop for Borrowed<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let _borrowed = Borrowed(&self.inner.start_drops);
+        core::future::poll_fn(|cx| {
+            authority.check_for(self)?;
+            self.inner.start_polls.fetch_add(1, Ordering::AcqRel);
+            if self.inner.start_ready.load(Ordering::Acquire) {
+                self.inner.starts.fetch_add(1, Ordering::AcqRel);
+                core::task::Poll::Ready(Ok(()))
+            } else {
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        })
+        .await
+    }
+}
 impl Interface for ControlRadio {
     fn name(&self) -> &str {
         self.inner.name()
@@ -64,6 +90,43 @@ impl WirelessNetIface for ControlRadio {
         &self,
     ) -> Result<Option<Arc<dyn ApControlReservation>>, WirelessError> {
         self.inner.serial.try_reserve().map(Some)
+    }
+    fn async_p2p_device_control(&self) -> bool {
+        true
+    }
+    fn async_roc_control(&self) -> bool {
+        true
+    }
+    fn max_remain_on_channel_duration_ms(&self) -> u32 {
+        5000
+    }
+    async fn start_p2p_device_async(
+        &self,
+        authority: &RadioControlAuthority,
+    ) -> Result<(), WirelessError> {
+        self.terminal_callback(authority).await
+    }
+    async fn stop_p2p_device_async(
+        &self,
+        authority: &RadioControlAuthority,
+    ) -> Result<(), WirelessError> {
+        self.terminal_callback(authority).await
+    }
+    async fn remain_on_channel_async(
+        &self,
+        authority: &RadioControlAuthority,
+        _: u64,
+        _: u32,
+        _: u32,
+    ) -> Result<(), WirelessError> {
+        self.terminal_callback(authority).await
+    }
+    async fn cancel_remain_on_channel_async(
+        &self,
+        authority: &RadioControlAuthority,
+        _: u64,
+    ) -> Result<(), WirelessError> {
+        self.terminal_callback(authority).await
     }
 }
 struct RegisteredControl(Arc<ControlRadio>);
@@ -385,3 +448,6 @@ kernel_test_in!(
     "wireless/control_wdev",
     control_only_wdev_actual_nl80211_discovery_has_no_fabricated_ifindex
 );
+
+#[path = "p2p_dispatch_tests.rs"]
+mod dispatch;

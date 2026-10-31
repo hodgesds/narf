@@ -736,6 +736,22 @@ acquire nor no-response abort becomes native success through this API. Closing
 or rebinding a source cannot retarget these notifications. The interface alone
 advertises no ROC or P2P role.
 
+`async_p2p_device_control` opts an actual control-only WDEV into
+`START_P2P_DEVICE`/`STOP_P2P_DEVICE` (89/90) and their async callbacks.
+The request names its real namespace-bound WDEV and carries no IFINDEX or
+IFF_UP substitute. `async_roc_control` independently selects terminal native
+`remain_on_channel_async`/`cancel_remain_on_channel_async`; legacy ROC callbacks
+keep their queued-work contract. Both selectors, when supplied for a netdev,
+must identify that exact same interface. Native ROC cookies never wrap.
+These opt-ins use the retained current Radio authority, real serialization
+lease and exact source socket. START/STOP ACKs and a ROC cookie reply follow
+the actual awaited completion, with authority rechecked on every poll and
+again at publication. A driver still proves its actual started native BSS,
+matching CNM event, channel policy and terminal cancellation/expiry ownership.
+Closed/rebound sockets, deleted/replaced registrations or revoked grants
+cannot publish old success or events to a successor. These shared defaults
+advertise no P2P mode and refuse unsupported native operations.
+
 The additive `start_ap_async`, `stop_ap_async`, `set_beacon_async` and
 `add_station_async`/`set_station_async`/`del_station_async` methods represent
 actual native terminal results. Their defaults adapt existing synchronous

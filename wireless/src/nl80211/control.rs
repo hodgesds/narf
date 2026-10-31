@@ -16,6 +16,8 @@ use zeroize::Zeroizing;
 
 #[path = "ap_async.rs"]
 mod ap_async;
+#[path = "p2p_async.rs"]
+mod p2p_async;
 #[path = "sched_async.rs"]
 mod sched_async;
 
@@ -84,6 +86,8 @@ const FRAME_TX_STATUS: u8 = 60;
 const EXTERNAL_AUTH: u8 = 127;
 const REMAIN_ON_CHANNEL: u8 = 55;
 const CANCEL_REMAIN_ON_CHANNEL: u8 = 56;
+const START_P2P_DEVICE: u8 = 89;
+const STOP_P2P_DEVICE: u8 = 90;
 // Access-Point command numbers (nl80211_commands).
 const SET_BEACON: u8 = 14;
 const START_AP: u8 = 15;
@@ -1115,8 +1119,11 @@ fn route(
     if command == GET_SURVEY {
         return survey_handle(bytes, dump, context.net_ns_id);
     }
+    if matches!(command, START_P2P_DEVICE | STOP_P2P_DEVICE) {
+        return p2p_async::device(command, bytes, context, deferred);
+    }
     if matches!(command, REMAIN_ON_CHANNEL | CANCEL_REMAIN_ON_CHANNEL) {
-        return roc_handle(command, bytes, context);
+        return roc_handle(command, bytes, context, deferred);
     }
     if matches!(
         command,
@@ -1601,21 +1608,19 @@ fn roc_handle(
     command: u8,
     bytes: &[u8],
     context: RequestContext<'_>,
+    deferred: Option<&narf_net::netlink_generic::DeferredRequest>,
 ) -> Result<Vec<GenlReply>, i32> {
     let attrs = attributes(bytes)?;
-    let index = u32_attr(&attrs, 3)?.ok_or(EINVAL)?;
-    let iface = crate::registry::list()
-        .into_iter()
-        .find(|iface| {
-            narf_net::netlink_route::ifindex_for_name(iface.name()) == Some(index)
-                && super::in_namespace(iface.as_ref(), context.net_ns_id)
-        })
-        .ok_or(ENODEV)?;
-    let _admin = authority(&context, iface.as_ref())?;
-    station::netdev_up(iface.as_ref())?;
+    let (iface, index) = p2p_async::interface(&attrs, context.net_ns_id)?;
+    let admin = authority(&context, iface.as_ref())?;
+    let native = iface.async_roc_control();
+    if !native {
+        index.ok_or(EOPNOTSUPP)?;
+        station::netdev_up(iface.as_ref())?;
+    }
     match command {
         REMAIN_ON_CHANNEL => {
-            reject_unknown(&attrs, &[3, 38, 87])?;
+            reject_unknown(&attrs, &[3, 38, 87, 153])?;
             let frequency_mhz = u32_attr(&attrs, 38)?.ok_or(EINVAL)?;
             channel(frequency_mhz)?;
             let duration_ms = u32_attr(&attrs, 87)?.ok_or(EINVAL)?;
@@ -1626,7 +1631,27 @@ fn roc_handle(
             if duration_ms == 0 || duration_ms > max {
                 return Err(EINVAL);
             }
-            let cookie = ROC_COOKIE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let cookie = ROC_COOKIE
+                .fetch_update(
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Acquire,
+                    |value| value.checked_add(1),
+                )
+                .map_err(|_| EBUSY)?;
+            if native {
+                return p2p_async::defer(
+                    iface,
+                    admin,
+                    context.net_ns_id,
+                    index,
+                    deferred,
+                    p2p_async::Operation::Roc {
+                        cookie,
+                        frequency_mhz,
+                        duration_ms,
+                    },
+                );
+            }
             iface
                 .remain_on_channel(cookie, frequency_mhz, duration_ms)
                 .map_err(mlme_errno)?;
@@ -1638,8 +1663,21 @@ fn roc_handle(
             }])
         }
         CANCEL_REMAIN_ON_CHANNEL => {
-            reject_unknown(&attrs, &[3, 88])?;
+            reject_unknown(&attrs, &[3, 88, 153])?;
             let cookie = u64_attr(&attrs, 88)?.ok_or(EINVAL)?;
+            if cookie == 0 {
+                return Err(EINVAL);
+            }
+            if native {
+                return p2p_async::defer(
+                    iface,
+                    admin,
+                    context.net_ns_id,
+                    index,
+                    deferred,
+                    p2p_async::Operation::Cancel(cookie),
+                );
+            }
             iface.cancel_remain_on_channel(cookie).map_err(mlme_errno)?;
             Ok(Vec::new())
         }

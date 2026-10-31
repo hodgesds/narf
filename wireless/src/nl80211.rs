@@ -1094,6 +1094,9 @@ fn wiphy_attrs(
             NL80211_CMD_DEL_INTERFACE as u32,
         ]);
     }
+    if iface.is_some_and(|iface| iface.async_p2p_device_control()) {
+        command_list.extend_from_slice(&[89, 90]); // START/STOP_P2P_DEVICE
+    }
     // A userspace-SME driver additionally advertises the low-level MLME /
     // management-frame commands wpa_supplicant uses when it runs its own SME.
     if iface.is_some_and(|iface| iface.supports_userspace_mlme()) {
@@ -1559,6 +1562,10 @@ pub(crate) const OPERATIONS: &[GenlOperation] = &[
     op(NL80211_CMD_SET_WOWLAN, DO, UNS),
     op(75, DO, UNS),         // START_SCHED_SCAN
     op(76, DO, UNS),         // STOP_SCHED_SCAN
+    op(89, DO, UNS),         // START_P2P_DEVICE
+    op(90, DO, UNS),         // STOP_P2P_DEVICE
+    op(55, DO, UNS),         // REMAIN_ON_CHANNEL
+    op(56, DO, UNS),         // CANCEL_REMAIN_ON_CHANNEL
     op(6, DO, UNS),          // SET_INTERFACE
     op(17, DO | DUMP, OPEN), // GET_STATION
     op(32, DUMP, OPEN),      // GET_SCAN

@@ -869,6 +869,46 @@ pub trait WirelessNetIface: Interface {
         Ok(None)
     }
 
+    /// A real control-only P2P-device supports explicit native start/stop.
+    /// Creating/discovering its WDEV supplies neither a started BSS nor RF
+    /// permission. The exact current request remains required throughout.
+    fn async_p2p_device_control(&self) -> bool {
+        false
+    }
+    async fn start_p2p_device_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+    ) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+    async fn stop_p2p_device_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+    ) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+    /// Native ROC completion is independent of P2P-device creation/start.
+    /// Legacy drivers keep their existing synchronous queued-ROC contract.
+    fn async_roc_control(&self) -> bool {
+        false
+    }
+    async fn remain_on_channel_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+        _cookie: u64,
+        _frequency_mhz: u32,
+        _duration_ms: u32,
+    ) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+    async fn cancel_remain_on_channel_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+        _cookie: u64,
+    ) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
     /// Opt into scheduled-scan acknowledgements after native completion.
     /// This flag supplies no grant: radio_control_generation and the actual
     /// serialized reserve_radio_control lease still bind every request.
