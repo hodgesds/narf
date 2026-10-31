@@ -20,10 +20,12 @@ struct Msi {
     vector: u8,
     signal: alloc::sync::Arc<super::irq::Signal>,
 }
-static SIGNAL: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::irq::Signal>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
-fn vector_irq(_cookie: u64) -> narf_interrupts::IrqStatus {
-    let signal = { SIGNAL.lock().clone() };
+#[path = "irq_routes.rs"]
+mod irq_routes;
+static SIGNALS: narf_lib::sync::IrqSafeSpinLock<irq_routes::Routes> =
+    narf_lib::sync::IrqSafeSpinLock::new(irq_routes::Routes::new());
+fn vector_irq(cookie: u64) -> narf_interrupts::IrqStatus {
+    let signal = { SIGNALS.lock().get(cookie) };
     match signal {
         Some(signal) => {
             signal.raise();
@@ -40,16 +42,14 @@ fn quarantine(msi: &Msi) {
 /// Disabled delivery: drain the handler and return the vector.
 fn teardown(msi: Msi) {
     narf_interrupts::disable_irq(msi.vector);
-    let _ = narf_interrupts::remove_handler(msi.vector, "rtlwifi", 0);
+    let _ = narf_interrupts::remove_handler(msi.vector, "rtlwifi", u64::from(msi.vector));
     narf_interrupts::dispatch::clear_all_wakers(msi.vector);
     narf_interrupts::synchronize_irq(msi.vector);
-    let _ = narf_interrupts::vector::free(msi.vector);
-    let mut signal = SIGNAL.lock();
-    if signal
-        .as_ref()
-        .is_some_and(|s| alloc::sync::Arc::ptr_eq(s, &msi.signal))
-    {
-        *signal = None;
+    // Withdraw the old route before the allocator may reuse its vector.
+    // The drained handler's snapshots retain only their original Arc.
+    let removed = SIGNALS.lock().remove(msi.vector, &msi.signal);
+    if removed {
+        let _ = narf_interrupts::vector::free(msi.vector);
     }
 }
 fn command_gate(command: u16, packet_mode: bool) -> Result<(), Error> {
@@ -98,7 +98,7 @@ impl PciIo {
     /// disabled. Any failure leaves the owner on scheduled polling; a
     /// vector whose source cannot be proven disabled stays quarantined.
     pub(super) fn arm_msi(&self) -> bool {
-        if self.msi.lock().is_some() || SIGNAL.lock().is_some() {
+        if self.msi.lock().is_some() {
             return false;
         }
         let Ok(Ok(mut config)) = crate::rtw88::pci_park::invoke(&self.cap, || {
@@ -109,6 +109,11 @@ impl PciIo {
         let Ok(vector) = narf_interrupts::vector::alloc() else {
             return false;
         };
+        if SIGNALS.lock().get(u64::from(vector)).is_some() {
+            // An occupied route cannot become another function's vector.
+            // Retain this inconsistent allocation rather than reuse it.
+            return false;
+        }
         // SAFETY: this sole retained function owns its cfg space; delivery
         // is disabled again below before any chip interrupt is unmasked.
         let programmed = crate::rtw88::pci_park::invoke(&self.cap, || unsafe {
@@ -119,8 +124,12 @@ impl PciIo {
             return false;
         }
         let signal = super::irq::Signal::new();
-        *SIGNAL.lock() = Some(signal.clone());
-        narf_interrupts::install_handler_named(vector, "rtlwifi", 0, vector_irq);
+        if !SIGNALS.lock().insert(vector, signal.clone()) {
+            // Vector allocation is exclusive. A conflicting route is a
+            // terminal allocator inconsistency, never permission to reuse it.
+            return false;
+        }
+        narf_interrupts::install_handler_named(vector, "rtlwifi", u64::from(vector), vector_irq);
         let msi = Msi {
             config,
             vector,

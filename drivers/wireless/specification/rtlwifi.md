@@ -1196,6 +1196,36 @@ MLME, actual kernel DHCP, real TXAGC readbacks and native fallback descriptors.
 They remain pending acceptance. Wider widths and thermal gain tracking remain
 separate rows.
 
+### Multiple retained radios (implemented, native acceptance pending)
+
+Each PCI function now has its own retained controller, interface name, native
+frontend and MSI signal. Probe reserves the exact BDF before hardware access;
+repeat bound probes leave that owner intact, concurrent probes of that same
+function cannot create another owner, and another function can initialize
+independently. Removal quarantines only the retiring BDF until its actual
+DMA/IRQ/publication retirement completes. Missing proof leaves that function
+blocked without withdrawing another radio.
+
+Stack sends use the existing context-send hook with a checked, nonwrapping
+cookie for the logical device. The callback resolves and clones that exact
+endpoint before releasing the route lock; it cannot reinterpret a removed
+cookie as another interface. Receive draining snapshots all retained endpoints
+and invokes each outside the table lock. MSI handler cookies identify the
+actual allocated vector, whose signal is removed after handler synchronization
+and before vector reuse. Quarantined vectors and signals remain retained.
+
+`pci::with_controller_at(BusAddr, callback)` and async `provision_at(BusAddr)`
+select an exact bound function. Existing `with_controller` and `provision`
+remain compatibility helpers for the first bound controller. Probe's staged
+worker captures its own native owner rather than provisioning another device
+after a BDF is reused. PM, reset, scan and packet publication remain serialized
+by that device's control mutex and generation.
+
+Six native cases cover independent and stale stack/IRQ routes, checked cookie
+exhaustion, exact PCI reservations/quarantine, and two composed Open/WPA2
+firmware/radio owners using actual context-routed kernel DHCP and native data
+through removal of one radio. Acceptance remains pending.
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE
@@ -1230,7 +1260,7 @@ implemented and software-validated. Physical board qualification remains.
 | RF/BB tables, calibration, channel/power and rate control | RTL8188EE tables/retained1T IQK/LCK, static factory antenna, signed board/factory/regulatory legacy20 power, operational MAC and negotiated legacy peer/rate/filter integration implemented. Measured board envelope and silicon qualification remain; optional gain tracking is excluded by measured profile |
 | Scan, management RX/TX, authentication/association and WPA2 | Retained EE channel1 passive scan, Open MLME, shared WPA2/CCMP and exact M4 receipt implemented; Device/composition regressions pass native suites. Other matched chips remain missing |
 | Ethernet packet path and terminal TX completion ownership | EE same-owner native Device/Narf-Ring/stack and Open/WPA2 real-kernel DHCP/exact bidirectional IP fixtures pass software gates; actual board testing remains |
-| Multi-radio, removal, suspend/reset/recovery | RTL8188EE PCI removal (quiescence-gated DMA release), retained reset, system suspend and IPS implemented and software-validated; multi-radio remains |
+| Multi-radio, removal, suspend/reset/recovery | RTL8188EE PCI removal (quiescence-gated DMA release), retained reset, system suspend and IPS implemented and software-validated; independent retained radios implemented pending native acceptance |
 
 Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
 
@@ -1353,7 +1383,7 @@ runtimes remain separate from the retained RTL8188EE owner.
 | `dynamic_antenna_selection` | Dynamic antenna selection/tracking; blocked on per-antenna signed board measurements (NEPC binds one static factory antenna) |
 | `five_ghz_operation` | 5GHz band operation on RTL8192DE/RTL8821AE; blocked on the rtl8192de/rtl8821ae chip runtimes (RTL8188EE is 2.4GHz-only) |
 | `ht40` | HT40; blocked on a signed NEHT v2 record covering 40MHz emissions (NEHT v1 binds width20) and 40MHz BW programming |
-| `multi_radio` | Multiple live radios; blocked on per-device owners replacing the singleton controller (interface ACTIVE/CLAIMED and firmware_native MSI SIGNAL statics) |
+| `multi_radio` | Independent retained PCI/frontend/MSI owners implemented pending native acceptance; exact per-function probe/quarantine and never-reused context-send cookies preserve device identity through removal/reprobe |
 | `pcie_aspm` | PCIe ASPM link power management; blocked on bus/ PCIe link-control ASPM programming coordinated with the upstream bridge (outside family scope) |
 | `rf_gain_tracking` | RF gain/power tracking; blocked on a thermal-indexed signed gain envelope (thermal power tracking moves gains outside the fixed NEPC/NEHT envelope) |
 | `rts_cts_protection` | RTS/CTS protection; blocked on signed qualification of RTS/CTS-to-self emissions (NEPC/NEHT exclude them) and TXD RTS fields driven by bss use_cts_prot/use_rts |

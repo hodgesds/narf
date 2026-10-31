@@ -352,8 +352,22 @@ impl Harness {
         ht: bool,
         policy: Option<Arc<narf_wireless::reg::db::Database>>,
     ) -> Self {
-        assert!(ACTIVE_TEST.lock().is_none());
+        Self::with_routes(protected, ht, policy, false)
+    }
+    fn with_routes(
+        protected: bool,
+        ht: bool,
+        policy: Option<Arc<narf_wireless::reg::db::Database>>,
+        context: bool,
+    ) -> Self {
+        if !context {
+            assert!(ACTIVE_TEST.lock().is_none());
+        }
         let packet = PacketPort::new();
+        if context {
+            static NEXT_DMA: AtomicU64 = AtomicU64::new(0x100000);
+            packet.model.lock().next = NEXT_DMA.fetch_add(0x100000, Ordering::AcqRel);
+        }
         let factory = Arc::new(power::factory());
         packet.radio.w1c(0x20a);
         packet.radio.hardware_word(0x6c, 1 << 31);
@@ -458,8 +472,12 @@ impl Harness {
         ));
         *device.environment_for_test().device.lock() = Arc::downgrade(&device);
         device.admit_for_test();
-        *ACTIVE_TEST.lock() = Some(device.clone());
-        narf_net::iface::register(name, device.mac(), send);
+        if context {
+            device.attach_stack_for_test().unwrap();
+        } else {
+            *ACTIVE_TEST.lock() = Some(device.clone());
+            narf_net::iface::register(name, device.mac(), send);
+        }
         narf_net::iface::set_link_state(name, true); // operator IFF_UP
         narf_net::iface::set_link_metadata(name, false, None, None);
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
@@ -564,6 +582,8 @@ mod channel_tests;
 mod ht_channels;
 #[path = "ht_composition_tests.rs"]
 mod ht_tests;
+#[path = "multi_radio_composition_tests.rs"]
+mod multi_radio;
 #[path = "power_composition_tests.rs"]
 mod power_tests;
 #[path = "probe_composition_tests.rs"]
@@ -574,8 +594,16 @@ mod recovery_tests;
 mod scans;
 impl Drop for Harness {
     fn drop(&mut self) {
-        *ACTIVE_TEST.lock() = None;
-        narf_net::iface::unregister(self.device.name());
+        {
+            let mut active = ACTIVE_TEST.lock();
+            if active
+                .as_ref()
+                .is_some_and(|device| Arc::ptr_eq(device, &self.device))
+            {
+                *active = None;
+            }
+        }
+        self.device.withdraw_stack_for_test();
     }
 }
 fn composition(protected: bool) -> TestResult {

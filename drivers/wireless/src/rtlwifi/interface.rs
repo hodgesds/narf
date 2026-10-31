@@ -26,6 +26,8 @@ use narf_wireless::{
 use zeroize::Zeroizing;
 #[path = "channel_runtime.rs"]
 mod channel_runtime;
+#[path = "endpoint_routes.rs"]
+mod endpoint_routes;
 #[path = "lifecycle.rs"]
 mod lifecycle;
 #[path = "rebuild_native.rs"]
@@ -67,6 +69,7 @@ pub(crate) struct Device<I: Port<Buffer = M>, M: Memory, E: Environment> {
     environment: E,
     name: String,
     published: AtomicBool,
+    route: AtomicU64,
     admission: Arc<station::Admission>,
     up: AtomicBool,
     bssid: AtomicU64,
@@ -215,6 +218,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             environment,
             name: name.into(),
             published: AtomicBool::new(false),
+            route: AtomicU64::new(0),
             admission,
             up: AtomicBool::new(false),
             bssid: AtomicU64::new(0),
@@ -582,23 +586,11 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         if !self.published.swap(false, Ordering::AcqRel) {
             return;
         }
-        let was_active = {
-            let mut active = ACTIVE.lock();
-            let this = Arc::as_ptr(self) as *const ();
-            let matches = active
-                .as_ref()
-                .is_some_and(|a| Arc::as_ptr(a) as *const () == this);
-            if matches {
-                *active = None;
-            }
-            matches
-        };
+        let cookie = self.route.swap(0, Ordering::AcqRel);
+        ROUTES.lock().remove(cookie, Arc::as_ptr(self) as *const ());
         narf_wireless::registry::unregister(&self.name);
         narf_net::registry().unregister(&self.name);
         narf_net::iface::unregister(&self.name);
-        if was_active {
-            CLAIMED.store(false, Ordering::Release);
-        }
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn removed_for_test(&self) -> bool {
@@ -699,6 +691,34 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn pending_for_test(&self) -> Option<bool> {
         self.state.try_lock().map(|state| state.pending.is_some())
+    }
+    fn attach_route(self: &Arc<Self>) -> Result<u64, Error> {
+        if self.removed.load(Ordering::Acquire) {
+            return Err(Error::State);
+        }
+        let cookie = ROUTES.lock().insert(self.clone())?;
+        if self
+            .route
+            .compare_exchange(0, cookie, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            ROUTES.lock().remove(cookie, Arc::as_ptr(self) as *const ());
+            return Err(Error::State);
+        }
+        Ok(cookie)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn attach_stack_for_test(self: &Arc<Self>) -> Result<(), Error> {
+        let cookie = self.attach_route()?;
+        narf_net::iface::register_with_context(&self.name, self.factory.mac, cookie, send);
+        narf_net::iface::install_rx_drain(drain);
+        self.published.store(true, Ordering::Release);
+        Ok(())
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn withdraw_stack_for_test(self: &Arc<Self>) {
+        self.request_abort();
+        self.withdraw();
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn admit_for_test(&self) {
@@ -1265,29 +1285,37 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         Device::drain(self)
     }
 }
-static ACTIVE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
-static CLAIMED: AtomicBool = AtomicBool::new(false);
-fn send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-    let owner = ACTIVE.lock().clone().ok_or(())?;
+static ROUTES: IrqSafeSpinLock<endpoint_routes::Routes> =
+    IrqSafeSpinLock::new(endpoint_routes::Routes::new());
+fn send(cookie: u64, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    let owner = ROUTES.lock().get(cookie).ok_or(())?;
     owner.send(bytes, meta)
 }
 fn drain() -> bool {
-    let owner = ACTIVE.lock().clone();
-    owner.is_some_and(|owner| owner.drain())
+    let owners = ROUTES.lock().snapshot();
+    let mut received = false;
+    for owner in owners {
+        received |= owner.drain();
+    }
+    received
 }
 pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
     let authority = narf_net::trusted_net_authority()
         .and_then(|cap| cap.derive().ok())
         .ok_or(Error::Profile)?;
-    CLAIMED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| Error::State)?;
+    let cookie = device.attach_route()?;
     *device.environment.device.lock() = Arc::downgrade(&device);
-    narf_net::registry()
+    if narf_net::registry()
         .register(&authority, Registered(device.clone()))
-        .map_err(|_| Error::Profile)?;
-    *ACTIVE.lock() = Some(device.clone());
-    narf_net::iface::register(&device.name, device.factory.mac, send);
+        .is_err()
+    {
+        ROUTES
+            .lock()
+            .remove(cookie, Arc::as_ptr(&device) as *const ());
+        device.route.store(0, Ordering::Release);
+        return Err(Error::Profile);
+    }
+    narf_net::iface::register_with_context(&device.name, device.factory.mac, cookie, send);
     device.link(None);
     device.published.store(true, Ordering::Release);
     narf_net::iface::install_rx_drain(drain);

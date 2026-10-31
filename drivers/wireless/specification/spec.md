@@ -877,6 +877,11 @@ Channel1 retains NEHT v2/NEFB v1, while channels2–11 require separately bound
 NEHT v3/NEFB v2 records as specified in `rtlwifi.md` §3. These continuations
 are implemented pending native acceptance.
 
+RTL8188EE also exposes exact-function `pci::with_controller_at(BusAddr, f)`
+and async `pci::provision_at(BusAddr)`; the existing helpers select the first
+bound controller for compatibility. Independent radios retain per-function
+PCI, frontend, context-send and MSI ownership, pending native acceptance.
+
 ## 4. Interaction with `narf-wireless`
 
 - **Registration**: Drivers register via `bus::register_wireless_driver(MatchEntry { ... })`.
