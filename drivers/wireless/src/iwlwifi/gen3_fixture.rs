@@ -65,6 +65,8 @@ impl Case {
             out.resize(out.len().next_multiple_of(4), 0);
         }
         tlv(&mut bytes, 48, &self.commands());
+        // Actual API89 and Bz c103 TLV18 first word: SHORT_BL is clear.
+        tlv(&mut bytes, 18, &0xdbfb4b7fu32.to_le_bytes());
         let api = API89_API_WORDS;
         let caps = match self {
             Self::Ty => TY_CAPS,

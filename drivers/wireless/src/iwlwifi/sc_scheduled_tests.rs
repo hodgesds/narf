@@ -10,6 +10,7 @@ use narf_wireless::{NetDetectMatch, NetDetectScanPlan, SchedScanRequest};
 
 pub(super) struct Model {
     request: SchedScanRequest,
+    version: u8,
     profiles_seen: bool,
     pub(super) hold_start: bool,
     pub(super) hold_stop: bool,
@@ -18,9 +19,10 @@ pub(super) struct Model {
     pub(super) live: bool,
 }
 impl Model {
-    fn new(request: SchedScanRequest) -> Self {
+    fn new(request: SchedScanRequest, version: u8) -> Self {
         Self {
             request,
+            version,
             profiles_seen: false,
             hold_start: false,
             hold_stop: false,
@@ -68,10 +70,17 @@ impl Model {
         Ok(())
     }
     pub(super) fn start(&mut self, body: &[u8]) -> R {
+        // Independent source ABI extents: UMAC17 has67 channel records;
+        // UMAC18 has68. All following literal offsets differ by eight.
+        let (extent, periodic, probe) = match self.version {
+            17 => (1940, 584, 596),
+            18 => (1948, 592, 604),
+            _ => return Err("native periodic fixture source version unavailable"),
+        };
         require(
             self.profiles_seen
                 && !self.live
-                && body.len() == 1948
+                && body.len() == extent
                 && word(body, 0) == 1
                 && word(body, 4) == 2
                 && body[45] == 1
@@ -95,15 +104,15 @@ impl Model {
         // Independent native schedule offsets: header48 +68 channel8.
         for (i, plan) in self.request.plans.iter().enumerate() {
             require(
-                half(body, 592 + 4 * i) == plan.interval_secs as u16
-                    && body[594 + 4 * i] == plan.iterations.map_or(255, |n| n as u8)
-                    && body[595 + 4 * i] == 0,
+                half(body, periodic + 4 * i) == plan.interval_secs as u16
+                    && body[periodic + 2 + 4 * i] == plan.iterations.map_or(255, |n| n as u8)
+                    && body[periodic + 3 + 4 * i] == 0,
                 "Sc PNO literal periodic plan",
             )?;
         }
         require(
-            half(body, 600) == self.request.delay_secs.min(65535) as u16
-                && body[602..604] == [0, 0],
+            half(body, periodic + 8) == self.request.delay_secs.min(65535) as u16
+                && body[periodic + 10..periodic + 12] == [0, 0],
             "Sc PNO delay clamp/reserved",
         )?;
         let active = word(body, 48) & 0xfffff != 0;
@@ -113,10 +122,10 @@ impl Model {
         )?;
         if active {
             require(
-                flags & (1 << 11) == 0 && half(body, 606) == 26,
+                flags & (1 << 11) == 0 && half(body, probe + 2) == 26,
                 "Sc PNO active MAC segment",
             )?;
-            let mac = &body[634..640]; // probe604 + data20 + SA10
+            let mac = &body[probe + 30..probe + 36]; // data20 + SA10
             if let Some(random) = self.request.random_mac {
                 require(
                     mac[0] & 3 == 2
@@ -131,18 +140,18 @@ impl Model {
             }
             require(
                 self.request.matches.iter().rev().enumerate().all(|(i, m)| {
-                    body[1141 + i * 34] as usize == m.ssid.len()
-                        && body[1142 + i * 34..1142 + i * 34 + m.ssid.len()] == m.ssid
+                    body[probe + 537 + i * 34] as usize == m.ssid.len()
+                        && body[probe + 538 + i * 34..probe + 538 + i * 34 + m.ssid.len()] == m.ssid
                 }),
                 "Sc PNO reverse direct-SSID match table",
             )?;
             if !self.request.probe_ies.is_empty() {
-                let at = half(body, 620) as usize;
-                let len = half(body, 622) as usize;
+                let at = half(body, probe + 16) as usize;
+                let len = half(body, probe + 18) as usize;
                 require(
                     len == self.request.probe_ies.len()
                         && at + len <= 512
-                        && body[624 + at..624 + at + len] == self.request.probe_ies,
+                        && body[probe + 20 + at..probe + 20 + at + len] == self.request.probe_ies,
                     "Sc PNO common probe IE segment",
                 )?;
             }
@@ -206,6 +215,17 @@ impl Control {
     }
     fn with_guard(request: SchedScanRequest, guard: Guard) -> R<Self> {
         let device = guard.device();
+        let version = device
+            .state
+            .try_lock()
+            .ok_or("native PNO startup state")?
+            .hardware
+            .version(1, 0xd)
+            .ok_or("native PNO source command absent")?
+            .0;
+        if !matches!(version, 17 | 18) {
+            return Err("native PNO fixture producer unsupported");
+        }
         let authority = narf_net::bootstrap_authority();
         let cap = narf_net::registry()
             .register(&authority, RegisteredDevice(device.clone()))
@@ -222,7 +242,7 @@ impl Control {
         let ifindex = narf_net::iface::lookup(device.name())
             .ok_or("Sc PNO actual netdev")?
             .ifindex;
-        HARNESS.lock().as_mut().unwrap().1.scheduled = Some(Model::new(request));
+        HARNESS.lock().as_mut().unwrap().1.scheduled = Some(Model::new(request, version));
         Ok(Self {
             fixture: Some(guard),
             source: Arc::new(Source(
@@ -800,3 +820,6 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/sc/scheduled",
     smoke_sc_scheduled_cache_callback_is_linearized_with_native_uid_retirement
 );
+
+#[path = "scheduled_profile_tests.rs"]
+mod native_profiles;

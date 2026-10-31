@@ -3568,6 +3568,24 @@ regressions are pending. These cases grant no physical RF or silicon
 acceptance. EHT/320MHz, band-qualified6GHz, MLO and associated periodic-scan
 coexistence remain separate native continuations.
 
+### 3.59 Profile-specific idle periodic-scan regression scope
+
+Two additional native fixtures are wired for the common idle PNO owner
+with exact API89 Ty/So/IMR/CDB/Ma and BzB0 FM/WH metadata. The factual
+command/capability inventories carry their actual TLV18 flags0xdbfb4b7f;
+independent UMAC17/18 literals check1940/1948-byte commands, periodic
+offsets584/592 and probe offsets596/604, with eight profiles and64 empty
+blocklist entries. The same real delegated Admin/radio lease, retained
+START/STOP worker, RFH BSS copy and GET_SCAN cache are exercised for active
+and passive requests, terminal stop and subsequent healthy ordinary scans.
+A dropped STOP waiter retains the exact firmware UID while a foreign
+completion is refused; actual UID termination permits a healthy successor.
+
+These fixtures are pending coordinated compilation/execution and do not
+extend the accepted Sc/API77 results to API89/Bz by analogy. No production
+periodic runtime changes are included. Linux MVM's API89 path remains
+idle-only; associated MLD periodic coexistence is separate remaining work.
+
 ## 4. References
 
 - Linux `drivers/net/wireless/intel/iwlwifi/`
