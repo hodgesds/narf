@@ -83,6 +83,9 @@ pub struct GuCGt<M: MmioWindow, A: BootAllocator> {
     released: bool,
     hardware: Option<HardwareInit>,
     registers: Option<RegisterInit>,
+    /// Battlemage tile-0 local memory, probed under register steering. A
+    /// malformed layout leaves VRAM unpublished, never guessed.
+    vram: Option<crate::intel_gpu_vram::VramLayout>,
 }
 
 impl<M: MmioWindow, A: BootAllocator> core::fmt::Debug for GuCGt<M, A> {
@@ -148,6 +151,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             released: false,
             hardware: None,
             registers: None,
+            vram: None,
         }
     }
 
@@ -159,6 +163,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     /// active engine/fuse masks or permission to admit userspace submissions.
     pub fn hwconfig(&self) -> Option<&HardwareConfig> {
         self.parts.boot.hwconfig()
+    }
+
+    pub fn vram_layout(&self) -> Option<crate::intel_gpu_vram::VramLayout> {
+        self.vram
     }
 
     pub fn topology(&self) -> Option<&GtTopology> {
@@ -748,7 +756,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                     .poll(self.parts.boot.window(), now)
                 {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(result) => result.map_err(GtError::Registers)?,
+                    Poll::Ready(result) => {
+                        let registers = result.map_err(GtError::Registers)?;
+                        self.vram =
+                            registers.and_then(|r| crate::intel_gpu_vram::VramLayout::xe2(r).ok());
+                    }
                 }
                 self.awake()?;
                 self.registers = None;

@@ -274,6 +274,11 @@ impl ExecRequest {
             objects: Vec::new(),
         };
         for entry in &self.objects {
+            // The compatibility residency plan only maps host pages; a VRAM
+            // device address must never become a system-memory PTE.
+            if entry.object.is_vram() {
+                return Err(FsError::InvalidData);
+            }
             space.objects.push((entry.object.clone(), entry.writable));
             for (i, phys) in entry.object.pages().enumerate() {
                 space
@@ -417,18 +422,26 @@ impl ResidentBatch {
                     .take((mapping.length / PAGE) as usize)
                     .enumerate()
                 {
-                    space
-                        .tables
-                        .as_mut()
-                        .expect("owned tables")
-                        .map_with_pat(
+                    let tables = space.tables.as_mut().expect("owned tables");
+                    let va = mapping.va + i as u64 * PAGE;
+                    if object.is_vram() {
+                        tables.map_device_with_pat(
                             &mut space.memory,
-                            mapping.va + i as u64 * PAGE,
+                            va,
                             phys,
                             mapping.pat,
                             mapping.writable,
                         )
-                        .map_err(map_error)?;
+                    } else {
+                        tables.map_with_pat(
+                            &mut space.memory,
+                            va,
+                            phys,
+                            mapping.pat,
+                            mapping.writable,
+                        )
+                    }
+                    .map_err(map_error)?;
                 }
             } else if !scratch {
                 for page in 0..mapping.length / PAGE {

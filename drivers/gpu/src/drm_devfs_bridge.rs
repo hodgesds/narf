@@ -2106,6 +2106,9 @@ pub struct IntelGpuCard {
         narf_lib::sync::IrqSafeSpinLock<Option<Arc<crate::intel_gpu_hwconfig::HardwareConfig>>>,
     topology: narf_lib::sync::IrqSafeSpinLock<Option<Arc<crate::intel_gpu_topology::GtTopology>>>,
     backend: narf_lib::sync::IrqSafeSpinLock<Option<Arc<dyn crate::intel_gpu_user::UserBackend>>>,
+    /// The function's LMEM BAR, mapped write-combining at discrete probe.
+    lmem_bar: narf_lib::sync::IrqSafeSpinLock<Option<narf_bus::MmioRegion>>,
+    vram: narf_lib::sync::IrqSafeSpinLock<Option<Arc<crate::intel_gpu_vram::Vram>>>,
 }
 
 #[cfg(feature = "intel")]
@@ -2126,6 +2129,38 @@ impl IntelGpuCard {
             hwconfig: narf_lib::sync::IrqSafeSpinLock::new(None),
             topology: narf_lib::sync::IrqSafeSpinLock::new(None),
             backend: narf_lib::sync::IrqSafeSpinLock::new(None),
+            lmem_bar: narf_lib::sync::IrqSafeSpinLock::new(None),
+            vram: narf_lib::sync::IrqSafeSpinLock::new(None),
+        }
+    }
+
+    /// # Safety
+    /// `bar` is this card's own LMEM BAR (BAR2), mapped write-combining,
+    /// exclusively owned by this driver apart from the boot framebuffer.
+    pub(crate) unsafe fn install_lmem_bar(&self, bar: narf_bus::MmioRegion) {
+        self.lmem_bar.lock().get_or_insert(bar);
+    }
+
+    /// Build the VRAM pool once from the GT's probed layout. The pool, and
+    /// every allocation in it, outlives GT resets: local memory persists.
+    pub fn publish_gt_vram<M, A>(&self, gt: &crate::intel_gpu_guc_gt::GuCGt<M, A>)
+    where
+        M: crate::intel_gpu_aux::MmioWindow,
+        A: crate::intel_gpu_guc_boot::BootAllocator,
+    {
+        let Some(layout) = gt.vram_layout() else {
+            return;
+        };
+        let Some(bar) = *self.lmem_bar.lock() else {
+            return;
+        };
+        let mut slot = self.vram.lock();
+        if slot.as_ref().is_some_and(|old| old.layout != layout) {
+            return; // never re-derive ownership from a changed probe
+        }
+        if slot.is_none() {
+            // SAFETY: install_lmem_bar's ownership contract for this card.
+            *slot = unsafe { crate::intel_gpu_vram::Vram::new(bar, layout) }.ok();
         }
     }
 
@@ -2214,6 +2249,9 @@ impl crate::drm_registry::DrmCard for IntelGpuCard {
     }
     fn intel_topology(&self) -> Option<Arc<crate::intel_gpu_topology::GtTopology>> {
         self.topology.lock().clone()
+    }
+    fn intel_vram(&self) -> Option<Arc<crate::intel_gpu_vram::Vram>> {
+        self.vram.lock().clone()
     }
     fn intel_user_backend(&self) -> Option<Arc<dyn crate::intel_gpu_user::UserBackend>> {
         self.backend.lock().clone()

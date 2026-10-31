@@ -130,6 +130,7 @@ fn setup(platform: GtPlatform, gt: &GuCGt<Window, Arena>) -> (Arc<Mailbox>, Devi
         memory_bytes: 0x80000000,
         hwconfig: None,
         topology: None,
+        vram: None,
         backend: Some(backend.clone()),
     };
     (backend, info)

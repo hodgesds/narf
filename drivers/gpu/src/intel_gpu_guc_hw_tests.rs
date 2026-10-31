@@ -1000,6 +1000,11 @@ fn execute_copy_ppgtt(root: u64, words: &[u32]) {
                 unsafe { core::ptr::read_volatile(address.add(((va >> shift) & 511) as usize)) };
             assert_eq!(entry & 1, 1);
             page = entry & 0x0000_3fff_ffff_f000;
+            if shift == 12 && entry & (1 << 11) != 0 {
+                let base = FIXTURE_VRAM.load(core::sync::atomic::Ordering::Relaxed);
+                assert_ne!(base, 0, "DM leaf without fixture VRAM");
+                page += base;
+            }
         }
         page | (va & 4095)
     };
@@ -1033,6 +1038,10 @@ fn execute_copy_ppgtt(root: u64, words: &[u32]) {
 // Independent fixed-command device model. It follows the actual production
 // table pages, verifies their PAT/permissions, fetches the private batch via
 // four hardware-style reads and writes the translated destination page.
+/// Fixture LMEM: CPU physical address of device address zero. PPGTT leaves
+/// with XE_PPGTT_PTE_DM resolve through it, as the GPU reaches local memory.
+static FIXTURE_VRAM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 fn execute_ppgtt_probe(regs: &BTreeMap<u64, u32>, image: &[u32], ring: &[u32], id: u32, base: u32) {
     let pat = if regs.get(&0x480c) == Some(&2) {
         3
@@ -1064,6 +1073,11 @@ fn execute_ppgtt_probe(regs: &BTreeMap<u64, u32>, image: &[u32], ring: &[u32], i
             );
             assert_eq!(entry & 2 != 0, shift != 12 || writable);
             page = entry & 0x0000_3fff_ffff_f000;
+            if shift == 12 && entry & (1 << 11) != 0 {
+                let base = FIXTURE_VRAM.load(core::sync::atomic::Ordering::Relaxed);
+                assert_ne!(base, 0, "DM leaf without fixture VRAM");
+                page += base;
+            }
         }
         page | (va & 4095)
     };

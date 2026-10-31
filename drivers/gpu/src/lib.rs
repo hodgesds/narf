@@ -664,7 +664,9 @@ pub mod amdgpu_vm;
 pub mod amdgpu_vmhub_regs;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_vmid;
-#[cfg(feature = "amdgpu")]
+// Shared by the Intel discrete local-memory pool.
+#[cfg(any(feature = "amdgpu", feature = "intel"))]
+#[cfg_attr(not(feature = "amdgpu"), allow(dead_code))]
 pub mod amdgpu_vram;
 #[cfg(feature = "amdgpu")]
 mod amdgpu_vram_access;
@@ -789,6 +791,8 @@ pub mod intel_gpu_topology;
 pub mod intel_gpu_uapi;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_user;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_vram;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_wm;
 #[cfg(feature = "intel")]

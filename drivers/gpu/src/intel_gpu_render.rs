@@ -51,6 +51,7 @@ pub struct DeviceInfo {
     pub memory_bytes: u64,
     pub hwconfig: Option<Arc<HardwareConfig>>,
     pub topology: Option<Arc<crate::intel_gpu_topology::GtTopology>>,
+    pub vram: Option<Arc<crate::intel_gpu_vram::Vram>>,
     pub backend: Option<Arc<dyn crate::intel_gpu_user::UserBackend>>,
 }
 
@@ -68,6 +69,7 @@ impl DeviceInfo {
             memory_bytes: narf_memory::frame::stats().total as u64 * 4096,
             hwconfig: card.intel_hwconfig(),
             topology: card.intel_topology(),
+            vram: card.intel_vram(),
             backend: card.intel_user_backend(),
         })
     }
@@ -1335,6 +1337,7 @@ pub(crate) mod tests {
             memory_bytes: 0x8000_0000,
             hwconfig: None,
             topology: None,
+            vram: None,
             backend: None,
         }
     }

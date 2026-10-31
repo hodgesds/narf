@@ -104,6 +104,12 @@ pub trait DrmCard: Send + Sync {
         None
     }
 
+    /// Owned, zero-on-allocate local memory of a discrete card.
+    #[cfg(feature = "intel")]
+    fn intel_vram(&self) -> Option<Arc<crate::intel_gpu_vram::Vram>> {
+        None
+    }
+
     #[cfg(feature = "intel")]
     fn intel_user_backend(&self) -> Option<Arc<dyn crate::intel_gpu_user::UserBackend>> {
         None

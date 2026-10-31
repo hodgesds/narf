@@ -77,6 +77,7 @@ pub const LEVEL_PT: u8 = 3;
 /// Non-leaf entries have PRESENT, RW, two PAT bits and a physical address.
 const TABLE_ENTRY_ALLOWED: u64 = PTE_PRESENT | PTE_RW | PTE_PHYS_MASK | PTE_PAT0 | PTE_PAT1;
 const PTE_NULL: u64 = 1 << 9; // MIT xe_gtt_defs.h: reads zero, writes discarded.
+pub(crate) const PTE_DM: u64 = 1 << 11; // XE_PPGTT_PTE_DM: device (local) memory.
 /// Bits a well-formed *leaf* entry may carry: every flag the
 /// GFX PTE definition assigns, plus the physical address.
 const LEAF_ENTRY_ALLOWED: u64 =
@@ -470,6 +471,29 @@ impl Ppgtt {
         // Encode first: a bad physical address fails before any
         // table is created, leaving the tree untouched.
         let leaf = self.format.encode_ppgtt(phys, pat_index, writable)?;
+        self.map_encoded(mem, va, leaf)
+    }
+
+    /// As [`Self::map_with_pat`] for a local-memory (VRAM) device address:
+    /// sets XE_PPGTT_PTE_DM (bit 11), outside the PAT and address fields.
+    pub fn map_device_with_pat<M: PtMemory>(
+        &mut self,
+        mem: &mut M,
+        va: u64,
+        device_address: u64,
+        pat_index: u8,
+        writable: bool,
+    ) -> Result<(), PpgttError> {
+        if va >= PPGTT_VA_SIZE {
+            return Err(PpgttError::VaOutOfRange);
+        }
+        if va % GTT_PAGE_SIZE != 0 {
+            return Err(PpgttError::Unaligned);
+        }
+        let leaf = self
+            .format
+            .encode_ppgtt(device_address, pat_index, writable)?
+            | PTE_DM;
         self.map_encoded(mem, va, leaf)
     }
 

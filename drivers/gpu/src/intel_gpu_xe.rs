@@ -106,21 +106,30 @@ impl XeFile {
                 zero(&wire[..8])?;
                 zero(&wire[34..56])?;
                 let size = u64_at(&wire, 8);
+                let placement = u32_at(&wire, 16);
                 let flags = u32_at(&wire, 20);
+                // Region bit 0 is system memory, bit 1 the published VRAM.
+                let regions = if info.vram.is_some() { 3 } else { 1 };
                 let supported_flags =
                     if info.platform == crate::intel_gpu_gt::GtPlatform::Battlemage {
-                        8
+                        8 | if info.vram.is_some() { 4 } else { 0 }
                     } else {
                         0
                     };
+                // xe_gem_create_ioctl's EINVAL classes, then refused features.
                 if size == 0
                     || size % 4096 != 0
-                    || u32_at(&wire, 16) != 1
+                    || placement == 0
+                    || placement & !regions != 0
                     || flags & !supported_flags != 0
+                    || (flags & 4 != 0 && placement & 2 == 0)
                 {
                     return Err(FsError::InvalidData);
                 }
                 let caching = u16::from_le_bytes(wire[32..34].try_into().unwrap());
+                if caching == 0 || caching > 2 || (placement & 2 != 0 && caching != 2) {
+                    return Err(FsError::InvalidData);
+                }
                 // Linux overrides system-memory CPU mappings to WB on dGPU.
                 if caching != 1 && !(caching == 2 && info.platform.is_discrete()) {
                     return Err(FsError::NotImplemented);
@@ -141,10 +150,20 @@ impl XeFile {
                 if let Some(vm) = &vm {
                     vm.check()?;
                 }
-                gem.create_for_vm(size, vm.as_ref().map(|vm| vm.identity), |handle, _| {
-                    put32(&mut wire, 28, handle);
-                    user.write(address, &wire)
-                })
+                let local = info
+                    .vram
+                    .as_ref()
+                    .filter(|_| placement & 2 != 0)
+                    .map(|vram| (vram, placement & 1 != 0));
+                gem.create_placed(
+                    size,
+                    vm.as_ref().map(|vm| vm.identity),
+                    local,
+                    |handle, _| {
+                        put32(&mut wire, 28, handle);
+                        user.write(address, &wire)
+                    },
+                )
                 .map(|_| ())
             }
             abi::GEM_MMAP_OFFSET => {

@@ -541,6 +541,8 @@ impl Owner {
                         .map_err(|_| RuntimeError::State)?;
                     state.probe_result = None;
                     *self.user_facts.lock() = Some(gt.device_facts().map_err(RuntimeError::Gt)?);
+                    // Before the epoch: discovery sees VRAM with the engines.
+                    self.pending.card.publish_gt_vram(gt);
                     state.phase = Phase::Running;
                     let (major, minor, patch) = gt.submission_version();
                     self.user_version.store(
@@ -826,6 +828,10 @@ pub(crate) fn probe_discrete(
     // SAFETY: the PCI probe grants exclusive ownership of this function's BAR0.
     let bar = unsafe { narf_bus::bar::map_bar(&device, 0) }
         .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    // LMEM BAR: write-combining for the prefetchable window. A failed or
+    // conflicting mapping leaves VRAM unpublished rather than refusing the GT.
+    // SAFETY: the same exclusive probe ownership covers BAR2.
+    let lmem = unsafe { narf_bus::bar::map_bar(&device, 2) }.ok();
     let index = crate::drm_registry::count() as u32;
     let card = Arc::new(IntelGpuCard::new(
         alloc::format!("card{index}"),
@@ -834,6 +840,10 @@ pub(crate) fn probe_discrete(
         device.id.subsystem_vendor,
         device.id.subsystem_id,
     ));
+    if let Some(lmem) = lmem {
+        // SAFETY: this card's own BAR2, owned exclusively by this probe.
+        unsafe { card.install_lmem_bar(lmem) };
+    }
     let assigned = crate::drm_registry::register_drm_card(card.clone());
     install(assigned, card, device, cap, bar, None);
     narf_drivers::record_bound(narf_drivers::BoundDriver {

@@ -28,7 +28,11 @@ pub struct GemObject {
     /// USERPTR: retained caller pages instead of owned frames. Such objects
     /// have no handle, mmap offset, CPU copy path or PRIME export.
     pins: Vec<narf_memory::address_space::UserPagePin>,
+    /// Zeroed local memory; reached by the CPU only through the LMEM BAR.
+    vram: Option<crate::intel_gpu_vram::VramAllocation>,
     size: u64,
+    /// `size` is charged to the system-memory LIVE_BYTES bound.
+    charged: bool,
     offset: u64,
     vm_owner: Option<u64>,
     /// Serializes kernel CPU copies; never forms references to mapped data.
@@ -49,7 +53,9 @@ impl GemObject {
         let mut object = Self {
             frames: Vec::new(),
             pins: Vec::new(),
+            vram: None,
             size,
+            charged: true,
             offset,
             vm_owner: None,
             cpu: IrqSafeSpinLock::new(()),
@@ -100,6 +106,18 @@ impl GemObject {
         !self.pins.is_empty()
     }
 
+    /// Device-memory pages carry the PPGTT DM bit and a VRAM address.
+    pub(crate) fn is_vram(&self) -> bool {
+        self.vram.is_some()
+    }
+
+    /// Kernel WC alias of byte `offset` of a VRAM object.
+    fn vram_byte(&self, offset: u64) -> Option<*mut u8> {
+        self.vram
+            .as_ref()
+            .map(|vram| (vram.kernel_virt() + offset) as *mut u8)
+    }
+
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -113,6 +131,9 @@ impl GemObject {
             .iter()
             .map(|frame| frame.start_address().raw())
             .chain(self.pins.iter().map(|pin| pin.phys().raw()))
+            .chain(self.vram.iter().flat_map(|vram| {
+                (0..vram.size() / PAGE).map(move |page| vram.device_address() + page * PAGE)
+            }))
     }
 
     /// i915 render-class reader (upper bits) and writer (lower bits).
@@ -178,11 +199,19 @@ impl GemObject {
             return Err(FsError::InvalidData);
         }
         self.range(offset, len)?;
-        let frames = self
-            .pages()
-            .skip((offset / PAGE) as usize)
-            .take(len.div_ceil(PAGE as usize))
-            .collect();
+        let pages =
+            (offset / PAGE) as usize..(offset / PAGE) as usize + len.div_ceil(PAGE as usize);
+        if let Some(vram) = &self.vram {
+            // LMEM BAR frames, write-combining as Linux's VRAM mmap.
+            return Ok(MmapBacking {
+                frames: pages
+                    .map(|page| vram.cpu_address() + page as u64 * PAGE)
+                    .collect(),
+                lifetime: Some(self.clone()),
+                memory_type: narf_memory::MemoryType::WriteCombining,
+            });
+        }
+        let frames = self.pages().skip(pages.start).take(pages.len()).collect();
         Ok(MmapBacking {
             frames,
             lifetime: Some(self.clone()),
@@ -199,6 +228,11 @@ impl GemObject {
         let _guard = self.cpu.lock();
         for (i, byte) in bytes.iter_mut().enumerate() {
             let at = offset + i as u64;
+            if let Some(alias) = self.vram_byte(at) {
+                // SAFETY: range checked; the allocation's WC alias is live.
+                *byte = unsafe { core::ptr::read_volatile(alias) };
+                continue;
+            }
             let base = self.frames[(at / PAGE) as usize]
                 .start_address()
                 .kernel_ptr::<u8>();
@@ -218,6 +252,11 @@ impl GemObject {
         let _guard = self.cpu.lock();
         for (i, byte) in bytes.iter().enumerate() {
             let at = offset + i as u64;
+            if let Some(alias) = self.vram_byte(at) {
+                // SAFETY: range checked; the allocation's WC alias is live.
+                unsafe { core::ptr::write_volatile(alias, *byte) };
+                continue;
+            }
             let base = self.frames[(at / PAGE) as usize]
                 .start_address()
                 .kernel_mut_ptr::<u8>();
@@ -276,7 +315,9 @@ impl Drop for GemObject {
         for frame in self.frames.drain(..) {
             free_frame(frame);
         }
-        LIVE_BYTES.fetch_sub(self.size, Ordering::AcqRel);
+        if self.charged {
+            LIVE_BYTES.fetch_sub(self.size, Ordering::AcqRel);
+        }
     }
 }
 
@@ -324,6 +365,19 @@ impl GemState {
         owner: Option<u64>,
         report: impl FnOnce(u32, u64) -> Result<(), FsError>,
     ) -> Result<u32, FsError> {
+        self.create_placed(size, owner, None, report)
+    }
+
+    /// As `create_for_vm`, optionally in zeroed local memory, which is tried
+    /// first; `fallback` permits system memory when VRAM is exhausted. A
+    /// VRAM object is not charged to the system-memory object limit.
+    pub(crate) fn create_placed(
+        &self,
+        size: u64,
+        owner: Option<u64>,
+        vram: Option<(&Arc<crate::intel_gpu_vram::Vram>, bool)>,
+        report: impl FnOnce(u32, u64) -> Result<(), FsError>,
+    ) -> Result<u32, FsError> {
         let size = size.checked_add(PAGE - 1).ok_or(FsError::InvalidData)? & !(PAGE - 1);
         if size == 0 || size > MAX_FILE_BYTES {
             return Err(FsError::InvalidData);
@@ -342,7 +396,24 @@ impl GemState {
                     .filter(|next| *next < 1 << 63)
             })
             .map_err(|_| FsError::OutOfMemory)?;
-        let mut object = GemObject::allocate(size, offset)?;
+        let local = match vram {
+            Some((vram, fallback)) => match vram.allocate(size) {
+                Ok(allocation) => Some(allocation),
+                Err(FsError::OutOfMemory) if fallback => None,
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        let mut object = match local {
+            Some(allocation) => {
+                let mut object = GemObject::allocate(0, offset)?;
+                object.vram = Some(allocation);
+                object.size = size;
+                object.charged = false;
+                object
+            }
+            None => GemObject::allocate(size, offset)?,
+        };
         object.vm_owner = owner;
         let object = Arc::new(object);
         let handle = handles.next;
@@ -366,6 +437,10 @@ impl GemState {
         let object = self.object(handle)?;
         if object.vm_owner.is_some() {
             return Err(FsError::InvalidData);
+        }
+        // Importers expect host pages; VRAM would need migration or P2P.
+        if object.is_vram() {
+            return Err(FsError::NotImplemented);
         }
         Ok(object)
     }

@@ -165,6 +165,26 @@ elevated priority requires authority this interface does not grant (EPERM).
 Timeslices are bounded to 1..100000 microseconds; unknown properties, flags,
 instances and malformed reserved fields fail before publication.
 
+Battlemage local memory: `RegisterInit` captures SG_TILE_ADDR_RANGE(0), the
+Xe2 flat-CCS base range (steered) with MIRROR_FUSE3, and a stable 2x32
+GSMBASE. `intel_gpu_vram::VramLayout::xe2` derives usable VRAM up to the
+flat-CCS base (rejecting a hole before GSMBASE) or GSMBASE without flat CCS;
+a malformed layout publishes nothing. `IntelGpuCard::publish_gt_vram` builds
+one card-lifetime pool (the shared `amdgpu_vram::Pool`) over the
+write-combining LMEM BAR prefix that is both visible and usable, and protects
+any recorded boot framebuffer (`record_boot_framebuffer`). Allocations are
+zeroed through the BAR before publication and become reusable only when their
+GEM object, and so every VM snapshot, job and CPU mapping, is gone. GEM_CREATE
+admits placement bit 1 (VRAM) with xe_gem_create_ioctl's EINVAL classes:
+unknown regions, VRAM without WC caching, cpu_caching 0 or above 2, and
+NEEDS_VISIBLE_VRAM without VRAM. VRAM is tried before system memory; VRAM-only
+exhaustion is ENOMEM. MEM_REGIONS reports VRAM/1 (4 KiB pages, total, used,
+visible), CONFIG sets HAS_VRAM and GT_LIST reports near VRAM and far system
+memory. VRAM PPGTT leaves set XE_PPGTT_PTE_DM; mmap uses LMEM BAR frames as
+write-combining. PRIME export of VRAM objects and their use by the i915
+residency plan are refused. DG2 VRAM (64K pages, surface-state compression
+needing a CCS clear) and memory beyond a small BAR are not admitted.
+
 VM_BIND supports vector or inline MAP, UNMAP, UNMAP_ALL and MAP_USERPTR,
 partial-object mappings, overlap replacement and split ranges with retained
 object offsets. Ops above PREFETCH are EINVAL; PREFETCH is NotImplemented.

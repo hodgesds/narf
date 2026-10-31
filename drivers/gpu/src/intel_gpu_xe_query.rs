@@ -85,10 +85,22 @@ fn query_wire(
             reply
         }
         1 if info.memory_bytes != 0 => {
-            let mut reply = vec![0; 96]; // header8 + drm_xe_mem_region88
-            put32(&mut reply, 0, 1);
+            // header8 + drm_xe_mem_region88 per region: SYSMEM/0, VRAM/1.
+            let regions = 1 + usize::from(info.vram.is_some());
+            let mut reply = vec![0; 8 + regions * 88];
+            put32(&mut reply, 0, regions as u32);
             put32(&mut reply, 12, 4096);
             put64(&mut reply, 16, info.memory_bytes);
+            if let Some(vram) = &info.vram {
+                let used = vram.used();
+                reply[96..98].copy_from_slice(&1u16.to_le_bytes());
+                reply[98..100].copy_from_slice(&1u16.to_le_bytes());
+                put32(&mut reply, 100, 4096); // BMG has no NEED64K VRAM flag
+                put64(&mut reply, 104, vram.total());
+                put64(&mut reply, 112, used);
+                put64(&mut reply, 120, vram.visible());
+                put64(&mut reply, 128, used); // every allocation is CPU-visible
+            }
             reply
         }
         2 => {
@@ -104,9 +116,14 @@ fn query_wire(
                 8,
                 u64::from(info.device_id) | u64::from(facts.revision) << 16,
             );
+            let mut config_flags = 0;
             if info.platform == crate::intel_gpu_gt::GtPlatform::Battlemage {
-                put64(&mut reply, 16, 8);
+                config_flags |= 8;
             }
+            if info.vram.is_some() {
+                config_flags |= 1; // DRM_XE_QUERY_CONFIG_FLAG_HAS_VRAM
+            }
+            put64(&mut reply, 16, config_flags);
             put64(&mut reply, 24, 4096);
             put64(&mut reply, 32, 48);
             put64(&mut reply, 40, 1); // highest unprivileged Xe priority: normal
@@ -121,11 +138,17 @@ fn query_wire(
             let mut reply = vec![0; 104];
             put32(&mut reply, 0, 1);
             put32(&mut reply, 20, facts.reference_clock);
-            put64(
-                &mut reply,
-                if info.platform.is_discrete() { 32 } else { 24 },
-                1,
-            );
+            // query_gt_list: near is the tile's VRAM bit on dGFX, far the rest.
+            if info.vram.is_some() {
+                put64(&mut reply, 24, 2);
+                put64(&mut reply, 32, 1);
+            } else {
+                put64(
+                    &mut reply,
+                    if info.platform.is_discrete() { 32 } else { 24 },
+                    1,
+                );
+            }
             reply[40..42].copy_from_slice(&(facts.graphics_version / 100).to_le_bytes());
             reply[42..44].copy_from_slice(&(facts.graphics_version % 100).to_le_bytes());
             reply[44..46].copy_from_slice(&u16::from(facts.graphics_step).to_le_bytes());

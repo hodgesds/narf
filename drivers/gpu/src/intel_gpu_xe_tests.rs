@@ -139,6 +139,7 @@ fn setup(
             )
         }),
         topology: gt.topology().cloned().map(Arc::new),
+        vram: None,
         backend: Some(Arc::new(Native {
             mailbox: mailbox.clone(),
             facts,
@@ -568,6 +569,174 @@ fn smoke_xe_userptr_bind_exec_validation_and_retirement() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_user",
     smoke_xe_userptr_bind_exec_validation_and_retirement
+);
+
+fn xe_query(file: &RenderFile, info: &DeviceInfo, user: &Cpu, id: u32) -> Vec<u8> {
+    let mut wire = [0; 40];
+    put32(&mut wire, 8, id);
+    user.wire.store(64, &wire);
+    assert_eq!(invoke(file, info, user, xe::DEVICE_QUERY), Ok(0));
+    let size = u32_at(&user.wire.load(64, 40), 12);
+    put32(&mut wire, 12, size);
+    put64(&mut wire, 16, 4096);
+    user.wire.store(64, &wire);
+    assert_eq!(invoke(file, info, user, xe::DEVICE_QUERY), Ok(0));
+    user.wire.load(4096, size as usize)
+}
+
+fn create_placed(
+    file: &RenderFile,
+    info: &DeviceInfo,
+    user: &Cpu,
+    size: u64,
+    placement: u32,
+    flags: u32,
+    caching: u16,
+) -> Result<u32, FsError> {
+    let mut wire = [0; 56];
+    put64(&mut wire, 8, size);
+    put32(&mut wire, 16, placement);
+    put32(&mut wire, 20, flags);
+    wire[32..34].copy_from_slice(&caching.to_le_bytes());
+    user.wire.store(64, &wire);
+    invoke(file, info, user, xe::GEM_CREATE).map(|_| u32_at(&user.wire.load(64, 56), 28))
+}
+
+fn smoke_xe_vram_placement_queries_mmap_execution_and_reuse() -> TestResult {
+    let platform = GtPlatform::Battlemage;
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    let (mailbox, mut info) = setup(&mut gt, &w, platform);
+    // Fake LMEM BAR: 16 contiguous RAM pages; device address 0 is its base.
+    let frame = narf_memory::frame::alloc_pages_on(0, 4).unwrap();
+    let base = frame.start_address().raw();
+    let bytes = 16 * 4096;
+    // SAFETY: the fixture owns these frames until after the pool is gone.
+    unsafe { core::ptr::write_bytes(frame.start_address().kernel_mut_ptr::<u8>(), 0xa5, bytes) };
+    let bar = narf_bus::MmioRegion {
+        phys: frame.start_address(),
+        virt: frame.start_address().kernel_ptr::<u8>() as u64,
+        len: bytes as u64,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    let layout = crate::intel_gpu_vram::VramLayout {
+        tile_size: bytes as u64,
+        tile_offset: 0,
+        usable: bytes as u64,
+    };
+    // SAFETY: the frames are exclusively owned by this fixture pool.
+    let vram = unsafe { crate::intel_gpu_vram::Vram::new(bar, layout) }.unwrap();
+    info.vram = Some(vram.clone());
+    FIXTURE_VRAM.store(base, core::sync::atomic::Ordering::Relaxed);
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    // MEM_REGIONS: SYSMEM/0 then VRAM/1; CONFIG HAS_VRAM; GT near=VRAM.
+    let regions = xe_query(&file, &info, &user, 1);
+    assert_eq!(regions.len(), 8 + 2 * 88);
+    assert_eq!(u32_at(&regions, 0), 2);
+    assert_eq!(&regions[96..100], &[1, 0, 1, 0]);
+    assert_eq!(u32_at(&regions, 100), 4096);
+    assert_eq!(
+        [u64_at(&regions, 104), u64_at(&regions, 112), u64_at(&regions, 120)],
+        [bytes as u64, 0, bytes as u64]
+    );
+    assert_eq!(u64_at(&xe_query(&file, &info, &user, 2), 16), 9);
+    let gt_list = xe_query(&file, &info, &user, 3);
+    assert_eq!((u64_at(&gt_list, 24), u64_at(&gt_list, 32)), (2, 1));
+    // xe_gem_create_ioctl EINVAL classes.
+    for (placement, flags, caching) in [
+        (4, 0, 2), // no such region
+        (0, 0, 2),
+        (2, 0, 1), // VRAM requires WC
+        (2, 0, 0),
+        (2, 0, 3),
+        (1, 4, 2), // NEEDS_VISIBLE_VRAM without VRAM placement
+    ] {
+        assert_eq!(
+            create_placed(&file, &info, &user, 8192, placement, flags, caching),
+            Err(FsError::InvalidData)
+        );
+    }
+    assert_eq!(vram.used(), 0);
+    let handle = create_placed(&file, &info, &user, 8192, 2, 4, 2).unwrap();
+    let object = file.gem.object(handle).unwrap();
+    assert!(object.is_vram());
+    assert_eq!(vram.used(), 8192);
+    // Prior owner bytes never reach the new object.
+    let mut prior = [0xffu8; 8192];
+    object.read(0, &mut prior).unwrap();
+    assert!(prior.iter().all(|b| *b == 0));
+    let cpu_view = object.backing(0, 8192).unwrap();
+    assert_eq!(
+        cpu_view.memory_type,
+        narf_memory::MemoryType::WriteCombining
+    );
+    let dpa = object.pages().next().unwrap();
+    assert_eq!(cpu_view.frames, [base + dpa, base + dpa + 4096]);
+    drop(cpu_view);
+    assert_eq!(file.gem.export_object(handle).err(), Some(FsError::NotImplemented));
+    assert_eq!(u64_at(&xe_query(&file, &info, &user, 1), 112), 8192);
+    // Execute: the batch's store lands in VRAM through a DM-bit PPGTT leaf.
+    let vm = create_vm(&file, &info, &user);
+    let queue = create_queue(&file, &info, &user, vm, 1);
+    buffers(&file, &info, &user, vm);
+    bind_wire(
+        &user,
+        vm,
+        &[mapping(handle, 0x2345_0000_0000, 0, 4096, 2, 0)],
+        &[],
+    );
+    assert_eq!(bind_now(&file, &info, &user), Ok(0));
+    exec_wire(&user, queue, true, &[]);
+    let fence = {
+        let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
+        assert!(call
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        let (_, fence) = mailbox.accept(&mut gt, 100);
+        assert_eq!(
+            call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Some(Ok(0)))
+        );
+        fence
+    };
+    let mut registered = BTreeMap::new();
+    finish(&mut gt, &w, &fence, &mut registered, 101);
+    let mut stored = [0; 4];
+    object.read(0x80, &mut stored).unwrap();
+    assert_eq!(u32_at(&stored, 0), 0x4e415246);
+    // Exhaustion: VRAM-only is ENOMEM; VRAM|SYSTEM falls back to system.
+    let rest = bytes as u64 - 8192 + 4096;
+    assert_eq!(
+        create_placed(&file, &info, &user, rest, 2, 0, 2),
+        Err(FsError::OutOfMemory)
+    );
+    let fallback = create_placed(&file, &info, &user, rest, 3, 0, 2).unwrap();
+    assert!(!file.gem.object(fallback).unwrap().is_vram());
+    // Release returns VRAM only after the VM, queue and handle drop it.
+    drop(object);
+    assert_eq!(close(&file, &info, &user, abi::GEM_CLOSE, handle), Ok(0));
+    assert_eq!(vram.used(), 8192, "VM bindings still retain the object");
+    assert_eq!(
+        close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, queue),
+        Ok(0)
+    );
+    assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, vm), Ok(0));
+    drop(file);
+    assert_eq!(vram.used(), 0);
+    FIXTURE_VRAM.store(0, core::sync::atomic::Ordering::Relaxed);
+    drop(info);
+    drop(vram);
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    narf_memory::frame::free_pages(frame, 4);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_xe_vram_placement_queries_mmap_execution_and_reuse
 );
 
 fn smoke_xe_vm_slices_nulls_private_objects_and_transactions() -> TestResult {

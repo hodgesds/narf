@@ -448,6 +448,9 @@ static BOOT_GENERIC: narf_lib::sync::IrqSafeSpinLock<
 pub fn register_generic(fb: narf_graphics_driver::generic::GenericFb) {
     #[cfg(feature = "amdgpu")]
     narf_drivers_gpu::amdgpu_platform::record_boot_framebuffer(fb);
+    // A GOP console inside an Intel LMEM BAR stays out of the VRAM pool.
+    #[cfg(feature = "intel")]
+    narf_drivers_gpu::intel_gpu_vram::record_boot_framebuffer(fb);
     {
         let mut boot = BOOT_GENERIC.lock();
         if boot.is_none() {

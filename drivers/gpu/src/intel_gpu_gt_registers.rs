@@ -147,7 +147,7 @@ mod tests {
         ] {
             let (w, init) = fixture(GtPlatform::Alchemist, device, 55, 0, false, 1 << 18);
             w.regs.borrow_mut().insert(0xe7cc, 0x12345678);
-            assert_eq!(init.poll(&w, 11), Poll::Ready(Ok(())));
+            assert_eq!(init.poll(&w, 11), Poll::Ready(Ok(None)));
             let r = w.regs.borrow();
             assert_eq!(r[&0xfdc], 0x81000000);
             assert_eq!((r[&0xfd0], r[&0xfd8]), (0x02000000, 0x02000000));
@@ -190,7 +190,7 @@ mod tests {
                 false,
                 1 << 18,
             );
-            assert_eq!(init.poll(&w, 11), Poll::Ready(Ok(())));
+            assert!(matches!(init.poll(&w, 11), Poll::Ready(Ok(_))));
             let r = w.regs.borrow();
             assert_eq!(r.contains_key(&0x9424), clock);
             assert_eq!(r.contains_key(&0xe5f0), atomic);
@@ -214,7 +214,10 @@ mod tests {
             (1, false, 1 << 8, true),
         ] {
             let (w, init) = fixture(GtPlatform::Battlemage, 0xe20b, release, 0, flat, live);
-            assert_eq!(init.poll(&w, 11), Poll::Ready(Ok(())));
+            let Poll::Ready(Ok(Some(vram))) = init.poll(&w, 11) else {
+                return TestResult::Fail("BMG did not capture local-memory registers");
+            };
+            assert_eq!(vram.ccs_lower & 1 != 0, flat);
             let r = w.regs.borrow();
             assert_eq!(r.contains_key(&0xb0c8), release == 1);
             if release == 1 {
@@ -348,7 +351,13 @@ impl RegisterInit {
         })
     }
 
-    pub(crate) fn poll(&self, mmio: &impl MmioWindow, now: u64) -> Poll<Result<(), RegisterError>> {
+    /// Ready(Ok(Some)) also returns BMG's local-memory layout registers,
+    /// read under the same steering semaphore as the workaround writes.
+    pub(crate) fn poll(
+        &self,
+        mmio: &impl MmioWindow,
+        now: u64,
+    ) -> Poll<Result<Option<crate::intel_gpu_vram::Xe2VramRegisters>, RegisterError>> {
         if now >= self.deadline {
             return Poll::Ready(Err(RegisterError::Timeout));
         }
@@ -408,7 +417,11 @@ impl RegisterInit {
         Ok(())
     }
 
-    fn apply(&self, mmio: &impl MmioWindow, selector: u64) -> Result<(), RegisterError> {
+    fn apply(
+        &self,
+        mmio: &impl MmioWindow,
+        selector: u64,
+    ) -> Result<Option<crate::intel_gpu_vram::Xe2VramRegisters>, RegisterError> {
         if self.platform == GtPlatform::Alchemist {
             // DG2 SF/SQIDI implicit ranges use instance two. GAM ranges
             // retain their separate hardware-default instance-one selector.
@@ -418,6 +431,7 @@ impl RegisterInit {
                 return Err(RegisterError::Verify(0xfd0));
             }
         }
+        let mut vram = None;
         let flat = if self.platform == GtPlatform::Battlemage {
             self.steer(mmio, selector, Target::Instance0)?;
             let a = mmio.read32(0x8800);
@@ -428,6 +442,21 @@ impl RegisterInit {
             if a != b {
                 return Err(RegisterError::Verify(0x8800));
             }
+            // xe_vram.c: flat-CCS upper range (MCR), MIRROR_FUSE3, GSMBASE
+            // as a stable 2x32 read, and SG_TILE_ADDR_RANGE(0).
+            let upper = mmio.read32(0x8804);
+            let gsm = || u64::from(mmio.read32(0x108104)) << 32 | u64::from(mmio.read32(0x108100));
+            let gsm_base = gsm();
+            if gsm_base != gsm() {
+                return Err(RegisterError::Verify(0x108100));
+            }
+            vram = Some(crate::intel_gpu_vram::Xe2VramRegisters {
+                tile_range: mmio.read32(0x1083a0),
+                ccs_lower: a,
+                ccs_upper: upper,
+                fuse3: mmio.read32(0x9118),
+                gsm_base,
+            });
             a & 1 != 0
         } else {
             false
@@ -463,7 +492,8 @@ impl RegisterInit {
                 }
             }
         }
-        crate::intel_gpu_nonpriv::EnginePolicy::new(self.platform)?.install(mmio)
+        crate::intel_gpu_nonpriv::EnginePolicy::new(self.platform)?.install(mmio)?;
+        Ok(vram)
     }
 
     fn entries(&self, flat: bool) -> Vec<Entry> {
