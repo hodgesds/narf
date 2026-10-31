@@ -201,6 +201,7 @@ struct Wire {
     held_data: Vec<(u16, u16)>,
     scheduled: Option<scheduled_tests::Model>,
     api89: Option<gen3_station_tests::Case>,
+    bz: Option<super::super::bz_fixture::Case>,
     mcc_caps_override: Option<u32>,
 }
 
@@ -642,9 +643,13 @@ impl Wire {
             )?,
             (1, 0x9b) => require(body == [1, 0, 0, 0, 17, 0, 0, 0], "Sc coexistence defaults")?,
             (2, 1) => require(
-                body == self
-                    .api89
-                    .map_or([10, 0, 0, 0, 224, 46, 0, 0], gen3_station_tests::Case::soc),
+                body == self.bz.map_or_else(
+                    || {
+                        self.api89
+                            .map_or([10, 0, 0, 0, 224, 46, 0, 0], gen3_station_tests::Case::soc)
+                    },
+                    super::super::bz_fixture::Case::soc,
+                ),
                 "Sc integrated SoC defaults",
             )?,
             (1, 0xc) => require(
@@ -1102,6 +1107,7 @@ struct NativeModel {
     receive_model: ReceiveModel,
     tx_model: Option<TxModel>,
     api89: Option<gen3_station_tests::Case>,
+    bz: Option<super::super::bz_fixture::Case>,
 }
 struct Guard {
     device: Option<Arc<Device>>,
@@ -1162,6 +1168,7 @@ impl Guard {
                 receive_model: receive_model.into(),
                 tx_model,
                 api89: None,
+                bz: None,
             },
         )
     }
@@ -1178,6 +1185,7 @@ impl Guard {
             receive_model,
             tx_model,
             api89,
+            bz,
         } = model;
         let multi_receive = receive_model.enabled();
         require(
@@ -1190,13 +1198,16 @@ impl Guard {
             super::super::firmware_parser_tests::mld_commands,
             gen3_station_tests::Case::commands,
         );
-        if api89.is_none() {
+        if let Some(case) = bz {
+            versions = case.commands();
+        }
+        if api89.is_none() && bz.is_none() {
             if let Some(phy) = phy {
                 he_tests::versions(&mut versions, phy.rates);
             }
             receive_model.commands(&mut versions);
         }
-        if api89.is_none() {
+        if api89.is_none() && bz.is_none() {
             if let Some(tx) = &tx_model {
                 versions.extend_from_slice(&[0, 2, 0, tx.version]);
             }
@@ -1204,12 +1215,19 @@ impl Guard {
         let (mut hardware, firmware, trace) = if let Some(case) = api89 {
             let (mut hw, fw, trace) =
                 model::station_model_for_format(super::super::rx_rfh::CompletionFormat::Ax210);
-            model::api89_identity(&mut hw, case.did(), case.revision(), case.radio())?;
+            model::native_station_identity(&mut hw, case.did(), case.revision(), case.radio())?;
+            (hw, fw, trace)
+        } else if let Some(case) = bz {
+            let (mut hw, fw, trace) =
+                model::station_model_for_format(super::super::rx_rfh::CompletionFormat::Bz);
+            model::native_station_identity(&mut hw, case.did(), case.revision(), case.radio())?;
             (hw, fw, trace)
         } else {
             model::station_model()
         };
         let mut authored = if let Some(case) = api89 {
+            case.image()
+        } else if let Some(case) = bz {
             case.image()
         } else {
             tx_amsdu_tests::image(&versions, tx_model.as_ref())?
@@ -1218,7 +1236,7 @@ impl Guard {
         let parsed = super::super::parse_ucode(&authored)
             .map_err(|_| "Sc fixture firmware metadata parse")?;
         model::firmware_profile(&mut hardware, &parsed)?;
-        if api89.is_some() {
+        if api89.is_some() || bz.is_some() {
             hardware.prepare_station_profile(&parsed)?;
         }
         if let Some((firmware, pnvm)) = sources {
@@ -1282,6 +1300,7 @@ impl Guard {
             held_data: Vec::new(),
             scheduled: None,
             api89,
+            bz,
             mcc_caps_override: None,
         });
         let configured = run(Device::configure(&mut hardware, OWN), || wire.service());
@@ -2307,3 +2326,6 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/policy",
     smoke_sc_dropped_close_waiter_after_m4_request_still_retires_native_station
 );
+
+#[path = "bz_station_tests.rs"]
+mod bz_station_tests;

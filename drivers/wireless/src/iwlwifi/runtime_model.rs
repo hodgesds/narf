@@ -358,6 +358,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         rf_policy: None,
         scan_mcc_watch: false,
         api89: None,
+        bz: None,
     };
     (hardware, firmware)
 }
@@ -560,7 +561,7 @@ mod trace_tests {
 /// RAM identity supplied by the native fixture's device side. Production
 /// profile admission still reads these actual owned MMIO registers and its
 /// retained executable; this creates no physical PCI or calibration grant.
-pub(in crate::iwlwifi) fn api89_identity(
+pub(in crate::iwlwifi) fn native_station_identity(
     hardware: &mut Hardware,
     did: u16,
     revision: u32,

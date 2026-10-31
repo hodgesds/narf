@@ -28,7 +28,7 @@ fn fixture(
 ) -> Result<alloc::boxed::Box<Fixture>, &'static str> {
     let (mut hardware, mut firmware, trace) =
         model::station_model_for_format(rx_rfh::CompletionFormat::Ax210);
-    model::api89_identity(&mut hardware, case.did(), case.revision(), case.radio())?;
+    model::native_station_identity(&mut hardware, case.did(), case.revision(), case.radio())?;
     model::firmware_profile(&mut hardware, parsed)?;
     hardware.prepare_station_profile(parsed)?;
     firmware.register(0x388, 0x02020202);

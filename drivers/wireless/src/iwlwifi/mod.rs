@@ -63,6 +63,9 @@ pub use bootstrap::gen2_transmit_power_request;
 pub use bootstrap::{provision, provision_state, ProvisionState};
 pub use mvm_boot::PowerRequest as Gen2TransmitPowerRequest;
 pub use mvm_boot::SharedMemory as Gen2SharedMemory;
+#[cfg(any(test, feature = "kernel-test"))]
+mod bz_fixture;
+mod bz_profile;
 pub mod connection;
 mod context_v1;
 pub mod csum;

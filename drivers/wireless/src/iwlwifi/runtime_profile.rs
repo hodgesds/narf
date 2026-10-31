@@ -6,6 +6,9 @@ impl Hardware {
         &mut self,
         parsed: &ParsedUcode<'_>,
     ) -> Result<(), &'static str> {
+        if self.prepare_bz_profile(parsed)? {
+            return Ok(());
+        }
         if super::super::gen2_profile::firmware_api(parsed) != 89 {
             if self.api89.is_some() {
                 return Err("API89 restart changed its executable protocol");

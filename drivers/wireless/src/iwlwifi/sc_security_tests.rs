@@ -7,20 +7,20 @@ const IGTK: [u8; 16] = [0x6b; 16];
 const IPN: u64 = 0x0102_0304_0506;
 const PASSWORD: &[u8] = b"Sc-native-SAE-password";
 
-fn psk_ap(akm: u8) -> R<FakeAp> {
+pub(super) fn psk_ap(akm: u8) -> R<FakeAp> {
     FakeAp::wpa2(NETWORK, SSID, 6, 7, PMK, ANONCE)
         .and_then(|ap| ap.with_pmf(ApPmf::Required))
         .and_then(|ap| ap.with_akms(&[akm]))
         .and_then(|ap| ap.with_igtk(IGTK, 5, IPN))
         .map_err(|_| "Sc PMF peer setup")
 }
-fn sae_ap(akm: u8, pwe: ApSaePwe) -> R<FakeAp> {
+pub(super) fn sae_ap(akm: u8, pwe: ApSaePwe) -> R<FakeAp> {
     FakeAp::wpa3_sae(NETWORK, SSID, 6, 7, PASSWORD, pwe, ANONCE)
         .and_then(|ap| ap.with_akms(&[akm]))
         .and_then(|ap| ap.with_igtk(IGTK, 5, IPN))
         .map_err(|_| "Sc SAE peer setup")
 }
-fn install_ap(ap: FakeAp) {
+pub(super) fn install_ap(ap: FakeAp) {
     HARNESS.lock().as_mut().unwrap().1.ap = ap;
 }
 fn tick() {
@@ -45,7 +45,7 @@ fn until(mut condition: impl FnMut() -> bool) -> R {
         }
     }
 }
-fn associate(guard: &Guard, sae: bool) -> R {
+pub(super) fn associate(guard: &Guard, sae: bool) -> R {
     let mut request = request(true);
     if sae {
         request.security = narf_wireless::SecurityConfig::Wpa3 {
@@ -60,7 +60,7 @@ fn associate(guard: &Guard, sae: bool) -> R {
     .map_err(|_| "Sc negotiated native security association")?;
     carrier(guard.device(), true)
 }
-fn native_keys(akm: u8) -> R {
+pub(super) fn native_keys(akm: u8) -> R {
     let slot = HARNESS.lock();
     let wire = &slot.as_ref().unwrap().1;
     require(
@@ -96,7 +96,7 @@ fn native_keys(akm: u8) -> R {
         "Sc PMF peer lacked native MFP configuration",
     )
 }
-fn data_after_keys(guard: &Guard) -> R {
+pub(super) fn data_after_keys(guard: &Guard) -> R {
     let lease = narf_net::dhcp::dhcp_acquire(guard.device().name(), 0)
         .map_err(|_| "Sc PMF actual DHCP failed")?;
     require(NETWORK.matches_lease(&lease), "Sc PMF lease terms")?;

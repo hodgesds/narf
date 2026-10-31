@@ -23,6 +23,7 @@ struct State {
     discovery: Option<narf_bus::MmioRegion>,
     gen2: Option<super::gen2_profile::Profile>,
     gen3: Option<super::gen3_profile::Profile>,
+    bz: Option<super::bz_profile::Profile>,
     mvm: Option<Arc<super::mvm_device::Device>>,
 }
 pub(super) struct Owner {
@@ -44,6 +45,7 @@ impl Owner {
                 discovery: None,
                 gen2: None,
                 gen3: None,
+                bz: None,
                 mvm: None,
             }),
         }
@@ -131,6 +133,23 @@ impl Owner {
                 None,
             ));
         }
+        if self.chip.mac == super::MacFamily::BzA0 {
+            let region = match state.discovery {
+                Some(region) => region,
+                None => {
+                    let region = super::mmio::map(&self.device, &self.cap)?;
+                    state.discovery = Some(region);
+                    region
+                }
+            };
+            let mut io = super::IwlMmioImpl::new(region, self.cap);
+            let profile = super::bz_profile::Profile::read(self.device.id.device, &mut io)?;
+            state.bz = Some(profile);
+            return Ok((
+                alloc::vec![alloc::format!("iwlwifi/{}-c103.ucode", profile.prefix)],
+                None,
+            ));
+        }
         if matches!(
             self.chip.mac,
             super::MacFamily::TyA0
@@ -204,6 +223,14 @@ impl Owner {
         let _ = narf_wireless::reg::db::ensure_domain();
         if !input.firmware.current() || input.pnvm.as_ref().is_some_and(|asset| !asset.current()) {
             return Err("Intel selected asset authority revoked before attempt");
+        }
+        if let Some(profile) = state.bz {
+            profile.validate(&parsed)?;
+            let mut io = super::IwlMmioImpl::new(
+                state.discovery.ok_or("Bz discovery mapping absent")?,
+                self.cap,
+            );
+            profile.check(self.device.id.device, &mut io)?;
         }
         if let Some(profile) = state.gen3 {
             profile.validate(&parsed)?;

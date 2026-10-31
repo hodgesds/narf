@@ -20,6 +20,7 @@ fn setup(
             receive_model: true.into(),
             tx_model: tx,
             api89: Some(case),
+            bz: None,
         },
     )?;
     Ok(Box::new(guard))

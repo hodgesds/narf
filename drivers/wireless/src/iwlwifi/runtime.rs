@@ -644,6 +644,7 @@ pub struct Hardware {
     /// break a command wait even while its SCAN_REQ receipt is still held.
     scan_mcc_watch: bool,
     api89: Option<(super::gen3_profile::Profile, super::gen3_profile::Abi)>,
+    bz: Option<super::bz_profile::Profile>,
 }
 
 impl core::fmt::Debug for Hardware {
@@ -749,6 +750,7 @@ impl Hardware {
             rf_policy: None,
             scan_mcc_watch: false,
             api89: None,
+            bz: None,
         })
     }
 
@@ -828,6 +830,9 @@ impl Hardware {
     ) -> Result<super::station_api::RuntimeConfiguration, &'static str> {
         if let Some((profile, _)) = self.api89 {
             return Ok(self.api89_runtime(profile));
+        }
+        if let Some(profile) = self.bz {
+            return Ok(self.bz_runtime(profile));
         }
         super::station_api::runtime_configuration(
             self.device.id.device,
@@ -2009,3 +2014,10 @@ mod station_profile;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "runtime_gen3_tests.rs"]
 mod gen3_tests;
+
+#[path = "runtime_bz.rs"]
+mod bz_profile;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "runtime_bz_tests.rs"]
+mod bz_tests;
