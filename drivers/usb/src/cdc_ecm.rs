@@ -1033,7 +1033,9 @@ pub fn register_initcalls() {
         &CDC_ECM_MATCH,
         probe,
         |slot| {
-            detach_ecm_slot(slot);
+            // detach_ecm_slot is infallible Ok(()) by construction (#1241);
+            // the explicit discard keeps -D warnings clean.
+            let _ = detach_ecm_slot(slot);
             Ok(())
         },
     );
