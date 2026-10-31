@@ -32,6 +32,8 @@ use crate::{Interface, NetIface};
 #[cfg(feature = "kernel-test")]
 #[path = "stack_identity_tests.rs"]
 mod identity_tests;
+#[path = "stack_metadata.rs"]
+pub(crate) mod metadata;
 
 /// Cap-type marker for per-interface admin authority.
 /// `Cap<AdminCap, Invoke>` gates `set_link_up` / `set_mtu` /
@@ -215,9 +217,7 @@ impl AdminHandle {
         if self.iface_name == "lo" && up {
             return Ok(());
         }
-        crate::iface::set_link_state(&self.iface_name, up)
-            .then_some(())
-            .ok_or(AdminError::NoIface)
+        crate::iface::admin::apply(self, crate::iface::admin::Change::Link(up))
     }
 
     /// Transfer this interface to a network namespace. The interface-bound
@@ -234,11 +234,7 @@ impl AdminHandle {
         if !(68..=65_535).contains(&mtu) {
             return Err(AdminError::InvalidMtu);
         }
-        crate::iface::try_set_mtu(&self.iface_name, mtu).map_err(|code| match code {
-            19 => AdminError::NoIface,
-            22 => AdminError::InvalidMtu,
-            other => AdminError::DeviceError(other),
-        })
+        crate::iface::admin::apply(self, crate::iface::admin::Change::Mtu(mtu))
     }
 
     pub fn set_mac(&self, mac: [u8; 6]) -> Result<(), AdminError> {
@@ -246,11 +242,7 @@ impl AdminHandle {
         if mac[0] & 1 != 0 || mac == [0; 6] {
             return Err(AdminError::InvalidMac);
         }
-        crate::iface::try_set_mac(&self.iface_name, mac).map_err(|code| match code {
-            19 => AdminError::NoIface,
-            22 => AdminError::InvalidMac,
-            other => AdminError::DeviceError(other),
-        })
+        crate::iface::admin::apply(self, crate::iface::admin::Change::Mac(mac))
     }
 
     pub fn add_ipv4(&self, addr: [u8; 4], prefix_len: u8) -> Result<(), AdminError> {

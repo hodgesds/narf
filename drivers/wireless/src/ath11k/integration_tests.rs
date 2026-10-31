@@ -90,6 +90,8 @@ fn heap_future<F: Future>(
     alloc::boxed::Box::pin(super::future_heap::build(build))
 }
 
+#[path = "admin_target_tests.rs"]
+mod admin_target;
 #[path = "power_stats_tests.rs"]
 mod power_stats_tests;
 #[path = "recovery_channel_tests.rs"]

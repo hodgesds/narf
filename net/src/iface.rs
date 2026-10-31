@@ -14,8 +14,11 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use narf_io::pool::DmaPool;
 use narf_lib::sync::IrqSafeSpinLock;
 
+#[path = "iface_admin.rs"]
+pub(crate) mod admin;
 #[path = "iface_monitor.rs"]
 mod monitor;
+pub use admin::{set_open_stop_target, OpenStopEvent, OpenStopTarget};
 pub use monitor::{
     begin_monitor_rx, end_monitor_rx, monitor_rx_current, on_monitor_frame_from, set_link_layer,
     LinkLayer, MonitorRxToken,
@@ -187,6 +190,7 @@ pub struct NetIfaceEntry {
     /// a device that is always running.
     pub open_stop: Option<OpenStopFn>,
     control: Option<Arc<Control>>,
+    open_stop_target: Option<Arc<dyn OpenStopTarget>>,
     /// Owning network namespace. Zero is the initial namespace.
     pub net_ns_id: u64,
     /// Linux ifindex, fixed at registration (`dev_new_index`): `lo` is 1, the
@@ -318,6 +322,7 @@ pub fn set_open_stop(name: &str, hook: OpenStopFn) -> bool {
         return false;
     };
     entry.open_stop = Some(hook);
+    entry.open_stop_target = None;
     true
 }
 
@@ -832,6 +837,7 @@ fn register_inner(
         // Installed by the driver after every (re-)registration.
         open_stop: None,
         control: None,
+        open_stop_target: None,
         net_ns_id,
         ifindex,
         driver: "",
@@ -1823,49 +1829,7 @@ pub fn dev_promisc_counts(net_ns_id: u64, ifindex: u32) -> Option<(u32, u32)> {
 }
 
 pub fn set_link_state(name: &str, up: bool) -> bool {
-    let _capture = monitor::PUBLISH.lock();
-    let mut g = IFACES.lock();
-    let Some(entry) = g
-        .as_mut()
-        .and_then(|ifaces| ifaces.iter_mut().find(|iface| iface.name == name))
-    else {
-        return false;
-    };
-    let changed = entry.link_up != up;
-    entry.link_up = up;
-    if changed && !up {
-        entry.ownership_epoch = next_ownership_epoch();
-        entry.monitor_epoch = 0;
-        if entry.link_layer == LinkLayer::Ieee80211Radiotap {
-            entry.packet_generation = monitor::next_epoch().unwrap_or(u64::MAX);
-            monitor::carrier(entry, false);
-        }
-    }
-    let retired_capture = (changed && !up).then(|| snapshot(entry));
-    let (net_ns_id, ifindex, open_stop) = (entry.net_ns_id, entry.ifindex, entry.open_stop);
-    drop(g);
-    if let Some(old) = retired_capture.as_ref() {
-        monitor::invalidate(old);
-    }
-    drop(_capture);
-    // `dev_open` / `dev_close` raise NETDEV_UP / NETDEV_DOWN only on a real
-    // transition. Delivered with IFACES released: the notifier reads it.
-    if changed {
-        // `__dev_open` → `ndo_open`, `__dev_close_many` → `ndo_stop`.
-        if let Some(hook) = open_stop {
-            hook(name, up);
-        }
-        crate::raw_sock::netdev_event(
-            net_ns_id,
-            ifindex,
-            if up {
-                crate::raw_sock::NetdevEvent::Up
-            } else {
-                crate::raw_sock::NetdevEvent::Down
-            },
-        );
-    }
-    true
+    admin::apply_name(name, admin::Change::Link(up))
 }
 
 /// Publish a driver's latest physical-link sample. Administrative IFF_UP is

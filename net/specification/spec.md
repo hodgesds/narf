@@ -301,6 +301,20 @@ retain registry-only behavior. `try_set_mtu`/`try_set_mac` preserve driver
 errnos; bool wrappers remain available. `AdminError::DeviceError(errno)` carries
 hardware failures through administrative handles to rtnetlink and ioctl
 callers, rather than treating a hardware rejection as a missing interface.
+`set_open_stop_target(snapshot, Arc<dyn OpenStopTarget>)` adds a registration-owned
+callback receiver. Installation compares the original immutable registration;
+re-registration clears both hook forms. `OpenStopEvent` carries the original
+transition and exposes `name`, `up` and a current-registration/namespace/ownership
+epoch observation. A trusted target captures its original concrete driver and
+uses that driver's actual current device capability; it must not resolve a new
+receiver by name. UP additionally requires the original event generation;
+retired DOWN may clean up only the captured old device. This event is no grant.
+Callbacks run after Registry, IFACES and PUBLISH locks are released. Reentrant
+retirement or reversal fences the later packet-socket UP/DOWN notification.
+The legacy `fn(name, up)` hook retains its original-device binding precondition;
+a check immediately before that function does not make a fresh name lookup safe
+against concurrent replacement.
+
 `set_link_metadata_for(snapshot, carrier, speed_mbps, duplex)` additionally
 compares the original name, namespace, ifindex and nonzero ownership epoch
 under the same IFACES publication lock. DOWN/UP, namespace-away/back and
@@ -333,6 +347,19 @@ current namespace. Retired binding returns `NoIface`; revoked grants return
 `AuthorityRevoked`. Kernel namespace/name administrative handles retain their
 existing independent scope. Native async drivers still recheck current authority
 and actual device/interface generations at every awaited/publication boundary.
+
+`AdminHandle::set_link`, `set_mtu` and `set_mac` additionally perform their actual
+metadata mutation inside the Admin/source-daemon/source-interface invocations.
+The exact typed registry handle remains selected while IFACES compares the
+original nonzero registration and changes that same entry. Retirement/rebind
+after initial admission therefore cannot retarget these mutations. The outer
+PUBLISH fence precedes Registry/IFACES acquisition; monitor invalidation and
+detached driver/notifier effects occur after the typed Registry lock is released.
+No driver callback runs under any registry/IRQ lock. Kernel namespace/name
+handles retain their existing independent name scope. This mutation fence does
+not yet change namespace transfer, address, route or neighbor table ownership;
+those paths retain their existing operation boundaries and require separate
+generation-aware side-effect work.
 
 ### 3.4 Loopback
 

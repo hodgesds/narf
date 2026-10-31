@@ -7,6 +7,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use narf_ipc::{Consumer, Producer};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
+#[path = "stack_metadata_tests.rs"]
+mod metadata;
 
 struct Device {
     name: String,

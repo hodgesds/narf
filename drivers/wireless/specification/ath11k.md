@@ -1700,8 +1700,13 @@ stop path → 3 (`DEAUTH_LEAVING`), locally generated. The reason
 attribute is omitted for 0, as `nl80211_send_disconnected`.
 
 **Open / stop** (`ieee80211_do_open` / `ieee80211_do_stop`):
-`register_pci` installs `narf_net::iface::set_open_stop(name, hook)`;
-the hook (sync, lock-free) records the requested `IFF_UP`
+`register_pci` installs a registration-fenced
+`narf_net::iface::set_open_stop_target` containing a weak reference to that
+actual netdev. The callback never resolves a fresh receiver through ACTIVE/name.
+UP requires its original current registration/namespace/ownership generation;
+a retired DOWN may clean up only the captured old netdev. The event supplies no
+device grant: the existing native runtime checks remain required. The callback
+(sync, lock-free) records the requested `IFF_UP`
 (`request_admin`), and whichever task next holds the mac layer — the
 runtime loop, or a scan / associate / disassociate — applies it
 (`sync_admin`). Open: `ath11k_mac_op_start` when not started, then

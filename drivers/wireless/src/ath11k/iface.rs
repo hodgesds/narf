@@ -37,7 +37,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
@@ -930,6 +930,13 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
     /// it under the mac layer ([`Self::sync_admin`]).
     pub fn request_admin(&self, up: bool) {
         self.admin_up.store(up, Ordering::Release);
+    }
+
+    /// Capture this actual receiver for ndo open/stop. The event observes
+    /// the original registration; native device authority remains in the
+    /// existing runtime operation that later services `request_admin`.
+    pub(crate) fn admin_target(self: &Arc<Self>) -> Arc<dyn narf_net::iface::OpenStopTarget> {
+        Arc::new(AdminTarget(Arc::downgrade(self)))
     }
 
     /// `IFF_UP` as requested.
@@ -4001,9 +4008,23 @@ fn pci_admin(name: &str, up: bool) {
     narf_net::iface::set_link_state(name, up);
 }
 
-fn pci_open_stop(name: &str, up: bool) {
-    if let Some(dev) = ACTIVE.lock().iter().find(|dev| dev.name() == name).cloned() {
-        dev.request_admin(up);
+struct AdminTarget<Io: RtIo, Irq: DpIrq, Q: RtQmi>(Weak<Ath11kNetdev<Io, Irq, Q>>);
+impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> core::fmt::Debug for AdminTarget<Io, Irq, Q> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AdminTarget").finish_non_exhaustive()
+    }
+}
+impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> narf_net::iface::OpenStopTarget for AdminTarget<Io, Irq, Q> {
+    fn transition(&self, event: narf_net::iface::OpenStopEvent) {
+        let Some(dev) = self.0.upgrade() else {
+            return;
+        };
+        if dev.name() != event.name() || event.up() && !event.current() {
+            return;
+        }
+        // A retired DOWN may clean up only this captured old receiver.
+        // No lookup through ACTIVE/name can address a successor here.
+        dev.request_admin(event.up());
     }
 }
 
@@ -4249,7 +4270,9 @@ fn register_pci_netdev(
     narf_net::iface::set_offloads(name, super::tx_offload::OFFLOADS);
     // register_netdevice: down, no carrier; IFF_UP opens the hardware.
     narf_net::iface::set_link_metadata(name, false, None, None);
-    narf_net::iface::set_open_stop(name, pci_open_stop);
+    if let Some(registration) = narf_net::iface::lookup(name) {
+        narf_net::iface::set_open_stop_target(&registration, dev.admin_target());
+    }
     narf_net::iface::install_rx_drain(pci_drain);
     match narf_net::trusted_net_authority().and_then(|a| a.derive().ok()) {
         Some(authority) => {
