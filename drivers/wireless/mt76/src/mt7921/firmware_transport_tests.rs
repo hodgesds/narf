@@ -4,7 +4,7 @@ use core::{
     cell::Cell,
     future::Future,
     pin::pin,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     task::{Context, Waker},
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -191,12 +191,20 @@ fn event(cmd: u8, seq: u8, status: u8) -> Vec<u8> {
     event[32] = status;
     event
 }
+#[derive(Debug, Default)]
+struct RocModel {
+    hold: AtomicBool,
+    seen: AtomicBool,
+    fault: AtomicU32,
+    interval_ms: AtomicU32,
+}
 #[derive(Debug)]
 struct Model {
     chip_id: u16,
     phy_capability: Option<[u8; 12]>,
     ap_hold: Option<Arc<ap_runtime_tests::Hold>>,
     p2p_hold: Option<Arc<ap_runtime_tests::Hold>>,
+    roc: Option<Arc<RocModel>>,
     ap_timing_pause: Option<u64>,
     ap_timing: Option<(u32, u32, u32, u16)>,
     receive_epoch: u64,
@@ -330,6 +338,7 @@ impl Model {
             phy_capability: None,
             ap_hold: None,
             p2p_hold: None,
+            roc: None,
             ap_timing_pause: None,
             ap_timing: None,
             receive_epoch: 0,
@@ -623,6 +632,49 @@ impl Backend for Model {
                 }
             }
         }
+        if frame.len() == 76
+            && frame[43] == 7
+            && frame[34..36] == [0x27, 0]
+            && frame[52..56] == [0, 0, 24, 0]
+        {
+            if let Some(model) = &self.roc {
+                let fault = model.fault.load(Ordering::Acquire);
+                if fault != 5 {
+                    let mut grant = vec![0; 24];
+                    grant[6..8].copy_from_slice(&20u16.to_le_bytes());
+                    grant[8] = frame[56];
+                    grant[9] = frame[57];
+                    grant[11] = frame[58];
+                    grant[13] = frame[60];
+                    grant[15] = frame[62];
+                    grant[17] = frame[67];
+                    grant[18] = 0xff;
+                    let reported = model.interval_ms.load(Ordering::Acquire);
+                    let interval = if reported == 0 {
+                        u32::from_le_bytes(frame[68..72].try_into().unwrap())
+                    } else {
+                        reported
+                    };
+                    grant[20..24].copy_from_slice(&interval.to_le_bytes());
+                    if fault == 2 {
+                        grant[11] ^= 1;
+                    }
+                    let mut event = runtime_event(0x27, 0, 0, &grant);
+                    if fault != 3 {
+                        event[30] |= 4;
+                    }
+                    if fault == 4 {
+                        event.truncate(59);
+                    }
+                    if fault == 1 {
+                        let mut old = event.clone();
+                        old[45] ^= 0x80;
+                        self.replies.push_back(old);
+                    }
+                    self.replies.push_back(event);
+                }
+            }
+        }
         if self
             .tx_stall_after
             .is_some_and(|limit| self.frames.len() >= limit)
@@ -649,6 +701,18 @@ impl Backend for Model {
         }
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        if self
+            .replies
+            .front()
+            .is_some_and(|event| event.get(28) == Some(&0x27))
+        {
+            if let Some(model) = &self.roc {
+                model.seen.store(true, Ordering::Release);
+                if model.hold.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+            }
+        }
         if self.frames.last().is_some_and(|(_, f)| {
             f.len() == 84 && f[43] == 7 && f[34..36] == [2, 0] && f[52..56] == [0, 0, 32, 0]
         }) {

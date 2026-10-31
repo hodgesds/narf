@@ -5,6 +5,9 @@ use super::{station::Command, Backend, Error, RadioInfo, Session, Stage, State};
 use alloc::sync::Arc;
 use core::future::Future;
 use narf_wireless::ap_control::{RadioControlAuthority, RadioInterfaceIdentity};
+#[path = "p2p_roc.rs"]
+mod roc;
+pub(super) use roc::Receipt as RocReceipt;
 
 #[derive(Debug)]
 pub(super) struct Owner {
@@ -13,6 +16,7 @@ pub(super) struct Owner {
     pub cnm: crate::mt7921::p2p_cnm::Cnm,
     pub pending: Option<Arc<RadioControlAuthority>>,
     pub activated: bool,
+    roc: Option<roc::Roc>,
 }
 impl<B: Backend> Session<B> {
     pub(super) async fn start_p2p_device(
@@ -40,6 +44,7 @@ impl<B: Backend> Session<B> {
             cnm: Default::default(),
             pending: Some(authority.clone()),
             activated: false,
+            roc: None,
         });
         // Actual WFSYS/DMA retirement precedes a new role/key/FIFO owner.
         // This does not manufacture a scan or CNM/packet receipt.
@@ -52,6 +57,7 @@ impl<B: Backend> Session<B> {
             cnm: Default::default(),
             pending: Some(authority.clone()),
             activated: false,
+            roc: None,
         });
         self.stage(Stage::P2pDeviceStart);
         self.boot_started = Some(self.backend.now_ns());
@@ -115,6 +121,25 @@ impl<B: Backend> Session<B> {
         self.renew_receive_epoch()?;
         self.stage(Stage::P2pDeviceStop);
         let result = async {
+            let abort = self
+                .p2p_owner
+                .as_ref()
+                .and_then(|owner| owner.cnm.lease())
+                .map(|lease| (lease.cookie, lease.request.abort()));
+            if let Some((cookie, abort)) = abort {
+                self.p2p_owner
+                    .as_mut()
+                    .ok_or(Error::Busy)?
+                    .cnm
+                    .abort(cookie)?;
+                self.notify(
+                    Command::Unified {
+                        id: crate::mt7921::p2p_wire::UNIFIED_ROC,
+                    },
+                    &abort,
+                )
+                .await?;
+            }
             let (device, bss) = device_payloads(info.capabilities.mac, false)?;
             // Linux uni_add_dev disables BSS before DEV. No fresh admin
             // grant is required to clean up an already-owned native wdev.

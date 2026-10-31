@@ -917,6 +917,8 @@ pub enum Stage {
     ApPeer,
     P2pDeviceStart,
     P2pDeviceStop,
+    P2pRocAcquire,
+    P2pRocExpire,
 }
 /// Firmware observations, not an operational WLAN interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1486,6 +1488,11 @@ impl<B: Backend> Session<B> {
                     {
                         return Poll::Ready(Err(Error::Authority));
                     }
+                }
+            }
+            if matches!(self.state, State::Running(Stage::P2pRocAcquire)) {
+                if let Err(error) = self.check_p2p_roc_pending() {
+                    return Poll::Ready(Err(error));
                 }
             }
             if let Err(error) = self.backend.check() {

@@ -39,6 +39,12 @@ impl Cnm {
     pub fn pending(&self) -> bool {
         self.owner.is_some()
     }
+    pub fn lease(&self) -> Option<&Lease> {
+        self.owner.as_ref()
+    }
+    pub fn exhausted(&self) -> bool {
+        self.owner.is_none() && self.next > u16::from(u8::MAX)
+    }
     pub fn reserve(
         &mut self,
         bss: u8,

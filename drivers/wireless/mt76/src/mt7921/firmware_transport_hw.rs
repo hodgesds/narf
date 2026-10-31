@@ -1212,6 +1212,36 @@ impl Transport {
     ) -> Result<(), Error> {
         self.session.stop_p2p_device(authority).await
     }
+    pub(crate) async fn acquire_p2p_roc(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::RadioControlAuthority>,
+        cookie: u64,
+        frequency_mhz: u32,
+        duration_ms: u32,
+    ) -> Result<u32, Error> {
+        self.session
+            .acquire_p2p_roc(authority, cookie, frequency_mhz, duration_ms)
+            .await
+    }
+    pub(crate) fn commit_p2p_roc(
+        &mut self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+    ) -> Result<super::p2p::RocReceipt, Error> {
+        self.session.commit_p2p_roc(authority)
+    }
+    pub(crate) fn p2p_roc_current(&self, cookie: u64, frequency_mhz: u32) -> Result<bool, Error> {
+        self.session.p2p_roc_current(cookie, frequency_mhz)
+    }
+    pub(crate) async fn expire_p2p_roc(&mut self) -> Result<bool, Error> {
+        self.session.expire_p2p_roc().await
+    }
+    pub(crate) async fn cancel_p2p_roc(
+        &mut self,
+        authority: Arc<narf_wireless::ap_control::RadioControlAuthority>,
+        cookie: u64,
+    ) -> Result<(), Error> {
+        self.session.cancel_p2p_roc(authority, cookie).await
+    }
     pub(crate) async fn run_ap_request(
         &mut self,
         iface: alloc::sync::Weak<crate::iface::Mt76Iface>,

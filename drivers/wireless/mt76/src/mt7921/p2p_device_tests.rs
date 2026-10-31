@@ -2,6 +2,8 @@
 //! The model implements hardware receipts; it cannot grant a radio role.
 use super::*;
 use narf_wireless::ap_control::RadioControlAuthority;
+#[path = "p2p_roc_tests.rs"]
+mod roc;
 
 fn radio(fixture: &Fixture) -> Result<RadioControlAuthority, WirelessError> {
     RadioControlAuthority::bind(
