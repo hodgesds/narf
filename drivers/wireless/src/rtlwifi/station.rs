@@ -49,13 +49,12 @@ pub(crate) enum Phase {
     Stopped,
     Failed,
 }
+pub(crate) type TransitionFuture =
+    core::pin::Pin<alloc::boxed::Box<dyn Future<Output = Result<(), Error>> + Send>>;
 pub(crate) trait Environment: Send + Sync {
     /// Request replacement before taking the public control lock. The future
     /// is a waiter for driver-owned work; dropping it cannot cancel card power.
-    fn recovery(
-        &self,
-    ) -> Option<core::pin::Pin<alloc::boxed::Box<dyn Future<Output = Result<(), Error>> + Send>>>
-    {
+    fn recovery(&self) -> Option<TransitionFuture> {
         None
     }
     fn now_ms(&self) -> u64;

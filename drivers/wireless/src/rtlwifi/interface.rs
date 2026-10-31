@@ -1341,11 +1341,12 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
             {
                 if !device.admission.closed.load(Ordering::Acquire) {
                     retries = 0;
-                } else if retries < 3 && device.environment.now_ms() >= retry_at {
-                    if device.schedule(supervisor::Operation::Recover).is_ok() {
-                        retries += 1;
-                        retry_at = device.environment.now_ms().saturating_add(1000);
-                    }
+                } else if retries < 3
+                    && device.environment.now_ms() >= retry_at
+                    && device.schedule(supervisor::Operation::Recover).is_ok()
+                {
+                    retries += 1;
+                    retry_at = device.environment.now_ms().saturating_add(1000);
                 }
             }
             if !working
