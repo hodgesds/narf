@@ -5,7 +5,8 @@ use alloc::{vec, vec::Vec};
 
 #[derive(Clone, Debug)]
 pub struct RadioControlAuthority {
-    guard: ApControlAuthority,
+    pub(super) guard: ApControlAuthority,
+    pub(super) terminal: Arc<super::lifecycle::TerminalSlot>,
 }
 impl RadioControlAuthority {
     /// Native station/client/GO/device controls use the actual delegated
@@ -20,6 +21,7 @@ impl RadioControlAuthority {
     ) -> Result<Self, WirelessError> {
         Ok(Self {
             guard: ApControlAuthority::bind_radio(admin, iface, namespace, ifindex, reply)?,
+            terminal: Arc::new(super::lifecycle::TerminalSlot::default()),
         })
     }
     /// Bind an actual control-only P2P-device registration. There is no
@@ -33,6 +35,7 @@ impl RadioControlAuthority {
     ) -> Result<Self, WirelessError> {
         Ok(Self {
             guard: ApControlAuthority::bind_control_wdev(admin, iface, namespace, wdev, reply)?,
+            terminal: Arc::new(super::lifecycle::TerminalSlot::default()),
         })
     }
     pub fn current(&self) -> Result<(), WirelessError> {
@@ -89,6 +92,7 @@ impl RadioControlAuthority {
     pub fn reserve(self) -> Result<Self, WirelessError> {
         Ok(Self {
             guard: self.guard.reserve()?,
+            terminal: self.terminal,
         })
     }
     pub fn has_reservation(&self) -> bool {

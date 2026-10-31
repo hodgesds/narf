@@ -1223,6 +1223,16 @@ impl Transport {
     ) -> Result<(), Error> {
         super::boot_p2p::maintain_session(&mut self.session, iface, expected_mac).await
     }
+    pub(crate) async fn run_p2p_delete(
+        &mut self,
+        iface: alloc::sync::Weak<crate::iface::p2p::P2pDeviceIface>,
+        authority: Arc<narf_wireless::ap_control::RadioControlAuthority>,
+        alive: Arc<core::sync::atomic::AtomicBool>,
+        expected_mac: [u8; 6],
+    ) -> Result<narf_wireless::ap_control::RadioControlRetirement, Error> {
+        super::boot_p2p::delete_session(&mut self.session, iface, authority, alive, expected_mac)
+            .await
+    }
     pub(crate) async fn start_p2p_device(
         &mut self,
         authority: Arc<narf_wireless::ap_control::RadioControlAuthority>,

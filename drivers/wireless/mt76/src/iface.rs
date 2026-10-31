@@ -628,6 +628,21 @@ impl Interface for Mt76Iface {
 }
 #[async_trait]
 impl WirelessNetIface for Mt76Iface {
+    fn async_control_interfaces(&self) -> bool {
+        self.p2p_profile.is_some()
+    }
+    async fn new_control_interface_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        name: &str,
+        iftype: u32,
+        mac: Option<[u8; 6]>,
+    ) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+        if iftype != 10 {
+            return Err(WirelessError::NotSupported);
+        }
+        self.new_p2p_device(authority, name, mac)
+    }
     fn radio_control_generation(&self) -> Option<core::num::NonZeroU64> {
         self.ap_generation()
     }

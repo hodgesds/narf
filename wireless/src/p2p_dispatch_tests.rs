@@ -3,7 +3,7 @@
 use super::*;
 use narf_net::netlink_generic::{build_replies_with_endpoint, ReplyOptions, RequestContext};
 
-fn attr(out: &mut Vec<u8>, kind: u16, value: &[u8]) {
+pub(super) fn attr(out: &mut Vec<u8>, kind: u16, value: &[u8]) {
     out.extend_from_slice(&((value.len() + 4) as u16).to_ne_bytes());
     out.extend_from_slice(&kind.to_ne_bytes());
     out.extend_from_slice(value);

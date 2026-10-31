@@ -539,3 +539,130 @@ kernel_test_in!(
     "net/generic_deferred",
     each_deferred_reply_and_final_ack_rechecks_after_reentrant_delivery
 );
+
+#[derive(Debug, Default)]
+struct Publication {
+    lost: AtomicBool,
+    committed: AtomicU32,
+}
+impl DeferredAuthority for Publication {
+    fn current(&self) -> bool {
+        !self.lost.load(Ordering::Acquire)
+    }
+    fn delivered(&self) {
+        self.committed.fetch_add(1, Ordering::AcqRel);
+    }
+}
+#[derive(Debug)]
+struct PublicationSink {
+    sink: Arc<Sink>,
+    calls: AtomicU32,
+    fail_on: u32,
+    lose_on: u32,
+    publication: Arc<Publication>,
+}
+impl DeferredReplySink for PublicationSink {
+    fn current(&self) -> bool {
+        self.sink.current()
+    }
+    fn deliver(&self, message: Vec<u8>) -> Result<(), i32> {
+        let number = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
+        if number == self.fail_on {
+            return Err(125);
+        }
+        let delivered = self.sink.deliver(message);
+        if number == self.lose_on {
+            self.publication.lost.store(true, Ordering::Release);
+        }
+        delivered
+    }
+}
+fn terminal_publication_commits_only_after_successful_replies_and_requested_ack() -> TestResult {
+    for (flags, fail_on, native_errno, expected) in [
+        (1, 0, 0, 1),
+        (5, 0, 0, 1),
+        (5, 1, 0, 0),
+        (5, 2, 0, 0),
+        (5, 0, 5, 0),
+    ] {
+        let publication = Arc::new(Publication::default());
+        let sink = Arc::new(PublicationSink {
+            sink: Sink::new(),
+            calls: AtomicU32::new(0),
+            fail_on,
+            lose_on: 0,
+            publication: publication.clone(),
+        });
+        let mut future = Box::pin(run_replies(
+            Box::pin(async move {
+                if native_errno != 0 {
+                    Err(native_errno)
+                } else {
+                    Ok(alloc::vec![GenlReply {
+                        command: 7,
+                        attrs: alloc::vec![4, 0, 1, 0]
+                    }])
+                }
+            }),
+            Some(publication.clone()),
+            sink,
+            Zeroizing::new(request(7, flags)),
+            ReplyOptions::default(),
+            None,
+            1,
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        if future.as_mut().poll(&mut cx).is_pending()
+            || publication.committed.load(Ordering::Acquire) != expected
+        {
+            return TestResult::Fail("terminal publication committed before every successful response/ACK, or missed no-ACK success");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/generic_deferred",
+    terminal_publication_commits_only_after_successful_replies_and_requested_ack
+);
+fn terminal_publication_rechecks_family_authority_after_a_response_delivery() -> TestResult {
+    let publication = Arc::new(Publication::default());
+    let sink = Sink::new();
+    let endpoint = Arc::new(PublicationSink {
+        sink: sink.clone(),
+        calls: AtomicU32::new(0),
+        fail_on: 0,
+        lose_on: 1,
+        publication: publication.clone(),
+    });
+    let mut future = Box::pin(run_replies(
+        Box::pin(async {
+            Ok(alloc::vec![GenlReply {
+                command: 7,
+                attrs: Vec::new()
+            }])
+        }),
+        Some(publication.clone()),
+        endpoint,
+        Zeroizing::new(request(7, 5)),
+        ReplyOptions::default(),
+        None,
+        1,
+    ));
+    let mut cx = Context::from_waker(Waker::noop());
+    if future.as_mut().poll(&mut cx).is_pending()
+        || publication.committed.load(Ordering::Acquire) != 0
+    {
+        return TestResult::Fail(
+            "lost authority committed lifecycle metadata after response delivery",
+        );
+    }
+    let messages = sink.messages.lock();
+    if messages.len() != 2 || messages[1].get(16..20) != Some(&(-EPERM).to_ne_bytes()) {
+        return TestResult::Fail("authority loss at final publication became a successful ACK");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/generic_deferred",
+    terminal_publication_rechecks_family_authority_after_a_response_delivery
+);

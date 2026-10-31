@@ -13,8 +13,11 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 struct Entry {
     iface: Arc<dyn WirelessNetIface>,
+    name: alloc::string::String,
+    wiphy: u64,
     control: Option<ControlWdev>,
     parent: Option<Weak<dyn WirelessNetIface>>,
+    retired: bool,
 }
 static REGISTRY: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
 static NEXT_CONTROL: AtomicU64 = AtomicU64::new(1);
@@ -59,10 +62,15 @@ pub enum ControlRegistrationError {
 /// A control-only owner must use `register_control` instead.
 pub fn register(iface: Arc<dyn WirelessNetIface>) {
     if iface.control_namespace().is_none() {
+        let name = iface.name().into();
+        let wiphy = iface.wiphy_id();
         REGISTRY.lock().push(Entry {
             iface,
+            name,
+            wiphy,
             control: None,
             parent: None,
+            retired: false,
         });
     }
 }
@@ -77,6 +85,8 @@ pub fn register_control(
     let namespace = iface
         .control_namespace()
         .ok_or(ControlRegistrationError::Invalid)?;
+    let name = alloc::string::String::from(iface.name());
+    let wiphy = iface.wiphy_id();
     if iface.name() == "lo"
         || iface.name().is_empty()
         || narf_net::iface::lookup(iface.name()).is_some()
@@ -93,10 +103,7 @@ pub fn register_control(
     {
         return Err(ControlRegistrationError::ParentGone);
     }
-    if registry
-        .iter()
-        .any(|entry| entry.iface.name() == iface.name())
-    {
+    if registry.iter().any(|entry| entry.name == name) {
         return Err(ControlRegistrationError::Duplicate);
     }
     let next = NEXT_CONTROL
@@ -114,8 +121,11 @@ pub fn register_control(
     };
     registry.push(Entry {
         iface,
+        name,
+        wiphy,
         control: Some(control),
         parent: Some(Arc::downgrade(parent)),
+        retired: false,
     });
     Ok(control)
 }
@@ -131,6 +141,7 @@ pub(crate) fn control_parent_matches(
         .any(|entry| entry.control.is_none() && Arc::ptr_eq(&entry.iface, parent))
         && registry.iter().any(|entry| {
             Arc::ptr_eq(&entry.iface, child)
+                && !entry.retired
                 && entry.control.is_some()
                 && entry
                     .parent
@@ -154,6 +165,7 @@ pub fn control_by_id(id: u64, namespace: u64) -> Option<Arc<dyn WirelessNetIface
         .iter()
         .find(|entry| {
             parent_current(&registry, entry)
+                && !entry.retired
                 && entry
                     .control
                     .is_some_and(|control| control.id() == id && control.namespace == namespace)
@@ -168,18 +180,50 @@ pub fn control_by_id(id: u64, namespace: u64) -> Option<Arc<dyn WirelessNetIface
 /// cannot remove a same-name replacement, even with the same MAC/mode.
 pub fn unregister_control<I: WirelessNetIface + ?Sized>(expected: ControlWdev, iface: &I) -> bool {
     let receiver = core::ptr::from_ref(iface).cast::<()>();
+    let removed = {
+        let mut registry = REGISTRY.lock();
+        registry
+            .iter()
+            .position(|entry| {
+                entry.control == Some(expected)
+                    && Arc::as_ptr(&entry.iface).cast::<()>() == receiver
+            })
+            .map(|index| registry.remove(index))
+    };
+    removed.is_some()
+}
+/// Hide the exact natively retired object from every public selector while
+/// retaining its observation identity for its original terminal ACK only.
+pub(crate) fn retire_control(expected: ControlWdev, iface: &Arc<dyn WirelessNetIface>) -> bool {
     let mut registry = REGISTRY.lock();
-    let before = registry.len();
-    registry.retain(|entry| {
-        entry.control != Some(expected) || Arc::as_ptr(&entry.iface).cast::<()>() != receiver
-    });
-    before != registry.len()
+    let Some(index) = registry.iter().position(|entry| {
+        entry.control == Some(expected)
+            && Arc::ptr_eq(&entry.iface, iface)
+            && !entry.retired
+            && parent_current(&registry, entry)
+    }) else {
+        return false;
+    };
+    registry[index].retired = true;
+    true
+}
+pub(crate) fn retired_control_current(
+    expected: ControlWdev,
+    iface: &Arc<dyn WirelessNetIface>,
+) -> bool {
+    let registry = REGISTRY.lock();
+    registry.iter().any(|entry| {
+        entry.control == Some(expected)
+            && Arc::ptr_eq(&entry.iface, iface)
+            && entry.retired
+            && parent_current(&registry, entry)
+    })
 }
 pub fn list() -> Vec<Arc<dyn WirelessNetIface>> {
     let registry = REGISTRY.lock();
     registry
         .iter()
-        .filter(|entry| parent_current(&registry, entry))
+        .filter(|entry| !entry.retired && parent_current(&registry, entry))
         .map(|entry| entry.iface.clone())
         .collect()
 }
@@ -191,7 +235,7 @@ pub fn wiphys() -> Vec<Arc<dyn WirelessNetIface>> {
         if entry.control.is_some() {
             continue;
         }
-        let id = entry.iface.wiphy_id();
+        let id = entry.wiphy;
         if !ids.contains(&id) {
             ids.push(id);
             out.push(entry.iface.clone());
@@ -209,5 +253,18 @@ pub fn wiphy_index(id: u64) -> Option<u32> {
         .filter(|index| *index <= i32::MAX as u32)
 }
 pub fn unregister(name: &str) {
-    REGISTRY.lock().retain(|entry| entry.iface.name() != name);
+    let removed = {
+        let mut registry = REGISTRY.lock();
+        let mut removed = Vec::new();
+        let mut index = 0;
+        while index < registry.len() {
+            if registry[index].name == name {
+                removed.push(registry.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        removed
+    };
+    drop(removed);
 }

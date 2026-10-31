@@ -752,6 +752,40 @@ Closed/rebound sockets, deleted/replaced registrations or revoked grants
 cannot publish old success or events to a successor. These shared defaults
 advertise no P2P mode and refuse unsupported native operations.
 
+`async_control_interfaces` independently opts into control-only
+`new_control_interface_async` / `delete_control_interface_async`. NEW names the
+real physical wiphy and returns an actual registered P2P-device WDEV, without
+an IFINDEX, Ethernet entry or synthetic UP state. The current parent request
+reserves control order before polling and explicitly delegates the actual
+fresh child grant to its original source. Its publication guard retains that
+lease through successful response/ACK delivery; a lost or failed publication
+calls `release_control_metadata` for only the unpublished idle child, outside
+all registry locks. That trusted callback is idempotent metadata cleanup and
+may neither wait for hardware nor retire an uncertain native owner.
+
+DEL accepts the actual control WDEV and its explicit current child grant
+(including the creating socket's retained grant). Its native owner must retain
+stop/cancellation through actual firmware/RF/packet retirement even if the API
+waiter disappears. Only then may `RadioControlAuthority::retire_control` invoke
+`AdminHandle::retire_control_child` and produce `RadioControlRetirement`.
+Withdrawal immediately ends normal administration and hides the exact object
+from GET/list/selectors. A hidden exact WDEV/object/mode-generation entry and
+the original serialization lease remain until terminal ACK/drop. The receipt's
+only operation, `current`, checks that hidden identity, original grants and
+parent ownership epoch plus the exact current source socket. It cannot submit
+commands, administer a successor or use names/port ids for rebinding. Clones of
+that exact request share a private weak terminal-receipt observation, published
+at withdrawal before retained transport republication can become pending.
+Only the outstanding DEL waiter consults it; normal current/admin/native-command
+checks stay denied. The synchronous withdrawal transition may keep that waiter
+pending while its exact sink/lease remain current, but cannot produce success:
+the callback must still return the actual typed retirement receipt before ACK.
+Final
+receipt drop removes the old hidden entry and calls the driver's metadata-only
+cleanup outside registry/driver spinlocks. Legacy synchronous virtual-netdev
+callbacks preserve their existing behavior; these hooks advertise no full P2P
+roles and prove no native started wdev, CNM grant or management/data authority.
+
 The additive `start_ap_async`, `stop_ap_async`, `set_beacon_async` and
 `add_station_async`/`set_station_async`/`del_station_async` methods represent
 actual native terminal results. Their defaults adapt existing synchronous

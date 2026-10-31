@@ -236,7 +236,7 @@ impl P2pDeviceIface {
         // interface callback. Retirement takes these same locks separately;
         // keeping one across current_for() would invert its lock order.
         let slot_current = { parent.vif_slots.lock().current(self.allocation) };
-        let registered = { self.registration.lock().as_ref().map(|r| r.wdev) };
+        let registered = { self.registration.lock().as_ref().map(|r| (r.net, r.wdev)) };
         let physical_current = {
             ACTIVE
                 .lock()
@@ -258,7 +258,8 @@ impl P2pDeviceIface {
             })
             || !physical_current
             || !child_current
-            || !registered.is_some_and(|wdev| wdev.current_for(self))
+            || !registered
+                .is_some_and(|(cap, wdev)| cap.invoke(Observed).is_ok() && wdev.current_for(self))
         {
             return Err(WirelessError::Denied);
         }
@@ -302,6 +303,41 @@ impl P2pDeviceIface {
     pub(crate) fn commit_stopped(&self) {
         self.identity.lock().take();
         self.owned.store(false, Ordering::Release);
+    }
+    pub(crate) fn retire_metadata(
+        &self,
+        authority: &RadioControlAuthority,
+    ) -> Result<narf_wireless::ap_control::RadioControlRetirement, WirelessError> {
+        if self.owned.load(Ordering::Acquire) {
+            return Err(WirelessError::Busy);
+        }
+        let cap = self
+            .registration
+            .lock()
+            .as_ref()
+            .map(|r| r.net)
+            .ok_or(WirelessError::Denied)?;
+        authority.retire_control(&cap)
+    }
+    pub(crate) fn release_retired_metadata(&self) {
+        if self.owned.load(Ordering::Acquire) {
+            return;
+        }
+        self.withdraw();
+        if let Some(parent) = self.parent.upgrade() {
+            let removed = {
+                let mut child = parent.p2p_device.lock();
+                if child
+                    .as_ref()
+                    .is_some_and(|child| core::ptr::eq(child.as_ref(), self))
+                {
+                    child.take()
+                } else {
+                    None
+                }
+            };
+            drop(removed);
+        }
     }
     /// Software-only exact-registration cleanup; native ownership must have
     /// been retired first. A failed native reset never reaches this function.
@@ -389,6 +425,26 @@ impl Interface for Registered {
 }
 #[async_trait]
 impl WirelessNetIface for P2pDeviceIface {
+    fn async_control_interfaces(&self) -> bool {
+        true
+    }
+    fn release_control_metadata(&self) {
+        self.release_retired_metadata();
+    }
+    async fn delete_control_interface_async(
+        &self,
+        authority: &RadioControlAuthority,
+    ) -> Result<narf_wireless::ap_control::RadioControlRetirement, WirelessError> {
+        let parent = self.current()?;
+        let _control = parent.control.lock().await;
+        self.request_current(authority)?;
+        crate::mt7921::firmware_transport::boot_p2p::delete(
+            self.weak()?,
+            Arc::new(authority.clone()),
+        )
+        .await
+        .map_err(map_error)
+    }
     fn wiphy_id(&self) -> u64 {
         self.physical
     }
@@ -502,6 +558,16 @@ impl WirelessNetIface for P2pDeviceIface {
     }
     async fn set_config(&self, _: WirelessConfig) -> Result<(), WirelessError> {
         Err(WirelessError::NotSupported)
+    }
+}
+struct Observed;
+impl narf_capabilities::CapOp<narf_net::NetIface, Write> for Observed {
+    type Output = ();
+    fn execute(
+        self,
+        _: &Cap<narf_net::NetIface, Write>,
+    ) -> Result<(), narf_capabilities::CapError> {
+        Ok(())
     }
 }
 fn map_error(error: crate::mt7921::firmware_transport::Error) -> WirelessError {

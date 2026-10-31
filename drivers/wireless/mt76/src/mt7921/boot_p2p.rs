@@ -94,6 +94,99 @@ pub(crate) async fn request(
     completed.unwrap_or(status)
 }
 
+/// DEL owns both native stop and exact metadata withdrawal in KEY_WORK.
+/// Cancellation drops only the borrowed waiter; it cannot strand a stopped
+/// or uncertain native owner between the two phases.
+pub(crate) async fn delete(
+    iface: Weak<crate::iface::p2p::P2pDeviceIface>,
+    authority: Arc<RadioControlAuthority>,
+) -> Result<narf_wireless::ap_control::RadioControlRetirement, Error> {
+    let concrete = iface.upgrade().ok_or(Error::Authority)?;
+    concrete
+        .request_current(&authority)
+        .map_err(|_| Error::Authority)?;
+    let expected_mac = concrete.physical_mac().map_err(|_| Error::Authority)?;
+    drop(concrete);
+    let alive = Arc::new(AtomicBool::new(true));
+    let mut caller = Caller {
+        alive: alive.clone(),
+        terminal: false,
+    };
+    let _ = finish_boot_keys().await;
+    let result = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(None));
+    let generation;
+    {
+        let Some(mut work) = KEY_WORK.try_lock() else {
+            return Err(Error::Busy);
+        };
+        if work.is_some() {
+            return Err(Error::Busy);
+        }
+        let Some(mut slot) = BOOT_OWNER.try_lock() else {
+            return Err(Error::Busy);
+        };
+        let concrete = iface.upgrade().ok_or(Error::Authority)?;
+        concrete
+            .request_current(&authority)
+            .map_err(|_| Error::Authority)?;
+        let mut transport = slot.take().ok_or(Error::DeviceGone)?;
+        generation = transport.generation();
+        concrete.work_started();
+        let target = result.clone();
+        *work = Some(KeyWork {
+            future: Some(Box::pin(async move {
+                let completed = transport
+                    .run_p2p_delete(iface, authority, alive, expected_mac)
+                    .await;
+                let status = completed.as_ref().map(|_| ()).map_err(|error| *error);
+                *target.lock() = Some(completed);
+                (transport, status)
+            })),
+            completed: None,
+        });
+    }
+    let status = finish_boot_keys().await;
+    let completed = result.lock().take();
+    caller.terminal = true;
+    if generation != super::super::pci::generation() {
+        return Err(Error::DeviceGone);
+    }
+    completed.unwrap_or_else(|| Err(status.err().unwrap_or(Error::DeviceGone)))
+}
+/// This exact body is shared by Hardware and native command/DMA fixtures.
+pub(super) async fn delete_session<B: Backend>(
+    session: &mut Session<B>,
+    iface: Weak<crate::iface::p2p::P2pDeviceIface>,
+    authority: Arc<RadioControlAuthority>,
+    alive: Arc<AtomicBool>,
+    expected_mac: [u8; 6],
+) -> Result<narf_wireless::ap_control::RadioControlRetirement, Error> {
+    let completed = run_session(
+        session,
+        iface.clone(),
+        authority.clone(),
+        Request::Stop,
+        alive,
+        expected_mac,
+    )
+    .await;
+    let concrete = iface.upgrade().ok_or(Error::Authority)?;
+    if let Err(error) = completed {
+        if session.p2p_owner.is_none() {
+            concrete.commit_stopped();
+            concrete.release_retired_metadata();
+        }
+        return Err(error);
+    }
+    let result = concrete
+        .retire_metadata(&authority)
+        .map_err(|_| Error::Authority);
+    if result.is_err() {
+        concrete.release_retired_metadata();
+    }
+    result
+}
+
 pub(crate) async fn maintenance(
     iface: Weak<crate::iface::p2p::P2pDeviceIface>,
 ) -> Result<(), Error> {

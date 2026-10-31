@@ -5,6 +5,8 @@ use crate::mt7921::firmware_transport::boot_p2p::{self, Request as P2pRequest};
 use narf_wireless::ap_control::RadioControlAuthority;
 #[path = "p2p_coexist_tests.rs"]
 mod coexist;
+#[path = "p2p_delete_tests.rs"]
+mod deletion;
 #[derive(Debug)]
 struct Source {
     live: AtomicBool,

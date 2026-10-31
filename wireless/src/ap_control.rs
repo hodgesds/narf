@@ -20,6 +20,9 @@ pub use event::ApEventAuthority;
 #[path = "radio_control.rs"]
 mod radio;
 pub use radio::{RadioControlAuthority, RadioEventAuthority, RadioInterfaceIdentity};
+#[path = "control_lifecycle.rs"]
+mod lifecycle;
+pub use lifecycle::RadioControlRetirement;
 
 #[derive(Clone, Copy, Debug)]
 enum ControlKind {

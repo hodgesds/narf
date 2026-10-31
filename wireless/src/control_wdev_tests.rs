@@ -8,6 +8,12 @@ struct ControlRadio {
     inner: Radio,
     namespace: u64,
     physical: u64,
+    metadata: IrqSafeSpinLock<Option<(Cap<narf_net::NetIface, Write>, ControlWdev)>>,
+    metadata_releases: AtomicU32,
+    retirement_hook: IrqSafeSpinLock<Option<lifecycle::RetirementHook>>,
+    successor: IrqSafeSpinLock<Option<lifecycle::Successor>>,
+    post_retirement_hold: AtomicBool,
+    post_retirement_seen: AtomicBool,
 }
 impl ControlRadio {
     async fn terminal_callback(
@@ -60,6 +66,45 @@ impl Interface for ControlRadio {
 }
 #[async_trait::async_trait]
 impl WirelessNetIface for ControlRadio {
+    fn async_control_interfaces(&self) -> bool {
+        true
+    }
+    async fn delete_control_interface_async(
+        &self,
+        authority: &RadioControlAuthority,
+    ) -> Result<RadioControlRetirement, WirelessError> {
+        self.terminal_callback(authority).await?;
+        let cap = self
+            .metadata
+            .lock()
+            .as_ref()
+            .map(|(cap, _)| *cap)
+            .ok_or(WirelessError::Denied)?;
+        let retired = authority.retire_control(&cap)?;
+        let hook = { self.retirement_hook.lock().take() };
+        if let Some(hook) = hook {
+            hook(self)?;
+        }
+        core::future::poll_fn(|cx| {
+            self.post_retirement_seen.store(true, Ordering::Release);
+            if self.post_retirement_hold.load(Ordering::Acquire) {
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            } else {
+                core::task::Poll::Ready(())
+            }
+        })
+        .await;
+        Ok(retired)
+    }
+    fn release_control_metadata(&self) {
+        let metadata = { self.metadata.lock().take() };
+        if let Some((cap, wdev)) = metadata {
+            crate::registry::unregister_control(wdev, self);
+            narf_net::registry().unregister_for_handle(&cap);
+            self.metadata_releases.fetch_add(1, Ordering::AcqRel);
+        }
+    }
     fn wiphy_id(&self) -> u64 {
         self.physical
     }
@@ -186,6 +231,12 @@ fn child_at(
         inner: Radio::new(name),
         namespace,
         physical: parent.iface.wiphy_id(),
+        metadata: IrqSafeSpinLock::new(None),
+        metadata_releases: AtomicU32::new(0),
+        retirement_hook: IrqSafeSpinLock::new(None),
+        successor: IrqSafeSpinLock::new(None),
+        post_retirement_hold: AtomicBool::new(false),
+        post_retirement_seen: AtomicBool::new(false),
     });
     radio.inner.mode.store(10, Ordering::Release);
     let grant = narf_net::bootstrap_authority();
@@ -202,6 +253,7 @@ fn child_at(
     let iface: Arc<dyn WirelessNetIface> = radio.clone();
     let registration = crate::registry::register_control(&parent.iface, iface.clone())
         .map_err(|_| "actual parent-bound control wdev registration")?;
+    *radio.metadata.lock() = Some((cap, registration));
     let admin = if paired {
         parent
             .admin
@@ -477,3 +529,5 @@ kernel_test_in!(
 mod delegation;
 #[path = "p2p_dispatch_tests.rs"]
 mod dispatch;
+#[path = "control_lifecycle_tests.rs"]
+pub(super) mod lifecycle;

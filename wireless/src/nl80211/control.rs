@@ -20,6 +20,8 @@ mod ap_async;
 mod p2p_async;
 #[path = "sched_async.rs"]
 mod sched_async;
+#[path = "virtual_async.rs"]
+mod virtual_async;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "control_tests.rs"]
@@ -1096,7 +1098,7 @@ fn route(
     deferred: Option<&narf_net::netlink_generic::DeferredRequest>,
 ) -> Result<Vec<GenlReply>, i32> {
     if matches!(command, NEW_INTERFACE | DEL_INTERFACE) {
-        return virtual_interface_handle(command, bytes, context);
+        return virtual_interface_handle(command, bytes, context, deferred);
     }
     if matches!(command, GET_WOWLAN | SET_WOWLAN) {
         return wowlan_handle(command, bytes, context);
@@ -2295,6 +2297,7 @@ fn virtual_interface_handle(
     command: u8,
     bytes: &[u8],
     context: RequestContext<'_>,
+    deferred: Option<&narf_net::netlink_generic::DeferredRequest>,
 ) -> Result<Vec<GenlReply>, i32> {
     let attrs = attributes(bytes)?;
     match command {
@@ -2332,7 +2335,18 @@ fn virtual_interface_handle(
                 .find(|iface| crate::registry::wiphy_index(iface.wiphy_id()) == Some(wiphy))
                 .filter(|iface| super::in_namespace(iface.as_ref(), context.net_ns_id))
                 .ok_or(ENODEV)?;
-            let _admin = authority(&context, radio.as_ref())?;
+            let admin = authority(&context, radio.as_ref())?;
+            if radio.async_control_interfaces() {
+                return virtual_async::create(
+                    radio,
+                    admin,
+                    context.net_ns_id,
+                    name.into(),
+                    iftype,
+                    mac,
+                    deferred,
+                );
+            }
             if !radio.supports_virtual_interfaces() {
                 return Err(EOPNOTSUPP);
             }
@@ -2346,7 +2360,18 @@ fn virtual_interface_handle(
             }])
         }
         DEL_INTERFACE => {
-            if attrs.iter().any(|(kind, _)| *kind != 3) {
+            if attrs.iter().any(|(kind, _)| ![3, 153].contains(kind)) {
+                return Err(EOPNOTSUPP);
+            }
+            let (selected, index) = p2p_async::interface(&attrs, context.net_ns_id)?;
+            if selected.control_namespace().is_some() && selected.async_control_interfaces() {
+                if index.is_some() {
+                    return Err(EINVAL);
+                }
+                let admin = p2p_async::source_authority(&context, selected.as_ref(), deferred)?;
+                return virtual_async::delete(selected, admin, context.net_ns_id, deferred);
+            }
+            if attr(&attrs, 153).is_some() {
                 return Err(EOPNOTSUPP);
             }
             let (_ifindex, iface) = netdev_from_attrs(&attrs, context.net_ns_id)?;

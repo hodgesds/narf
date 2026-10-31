@@ -627,6 +627,14 @@ reentrant delivery before the next payload/final ACK. Revocation suppresses
 remaining payloads and reports `EPERM` to a still-current original socket;
 closing that socket suppresses all further output. This is a unicast response
 path, with no dump/multipart admission and no success response to queued work.
+`DeferredAuthority::delivered()` is an optional terminal publication notice.
+It runs only after all successful replies and the requested successful ACK
+reach the original sink; a successful no-ACK request runs it after its replies.
+Native errors, authority loss, failed delivery, cancellation and drop never
+commit that notice. A family's creation guard may therefore keep its exact
+serialization lease and remove an unpublished metadata child on failure.
+The notice grants no capability and the family still rechecks its own current
+source/registration before committing publication.
 Drivers retain hardware resources until their own terminal cancellation or
 cleanup receipt even if the netlink waiter disappears. Existing synchronous
 handlers and context-only builders retain their existing behavior.

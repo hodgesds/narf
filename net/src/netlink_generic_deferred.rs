@@ -35,6 +35,11 @@ pub trait DeferredReplySink: fmt::Debug + Send + Sync {
 /// only deny completion; it does not replace that family's native checks.
 pub trait DeferredAuthority: fmt::Debug + Send + Sync {
     fn current(&self) -> bool;
+    /// Called only after the successful result's responses and requested
+    /// ACK have reached this exact source. A lifecycle owner may commit
+    /// metadata publication here; rejection, socket loss or drop never
+    /// invokes it. This notification grants no interface authority.
+    fn delivered(&self) {}
 }
 
 pub(super) struct PendingAck {
@@ -275,7 +280,12 @@ async fn run_replies(
         result = Err(EPERM);
     }
     let errno = match result {
-        Ok(_) if flags & NLM_F_ACK == 0 => return,
+        Ok(_) if flags & NLM_F_ACK == 0 => {
+            if let Some(authority) = authority.as_ref() {
+                authority.delivered();
+            }
+            return;
+        }
         Ok(_) => 0,
         Err(errno) => errno,
     };
@@ -297,5 +307,9 @@ async fn run_replies(
     if options.ext_ack {
         append_extended_ack(&mut ack);
     }
-    let _ = sink.deliver(ack);
+    if sink.deliver(ack).is_ok() && errno == 0 {
+        if let Some(authority) = authority.as_ref() {
+            authority.delivered();
+        }
+    }
 }

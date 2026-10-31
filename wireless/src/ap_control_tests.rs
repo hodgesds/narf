@@ -40,6 +40,7 @@ struct Radio {
     sched_stopped: AtomicU32,
     sched_request: IrqSafeSpinLock<Option<crate::SchedScanRequest>>,
     control_sends: AtomicU32,
+    control_factory: IrqSafeSpinLock<Option<control_wdev::lifecycle::Factory>>,
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
@@ -69,6 +70,7 @@ impl Radio {
             sched_stopped: AtomicU32::new(0),
             sched_request: IrqSafeSpinLock::new(None),
             control_sends: AtomicU32::new(0),
+            control_factory: IrqSafeSpinLock::new(None),
             rx: IrqSafeSpinLock::new(None),
             tx: IrqSafeSpinLock::new(None),
         }
@@ -96,6 +98,18 @@ impl Interface for Radio {
 }
 #[async_trait::async_trait]
 impl WirelessNetIface for Radio {
+    fn async_control_interfaces(&self) -> bool {
+        self.control_factory.lock().is_some()
+    }
+    async fn new_control_interface_async(
+        &self,
+        authority: &RadioControlAuthority,
+        name: &str,
+        iftype: u32,
+        mac: Option<[u8; 6]>,
+    ) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+        control_wdev::lifecycle::create(self, authority, name, iftype, mac).await
+    }
     fn get_wireless_info(&self) -> crate::WirelessIfaceInfo {
         crate::WirelessIfaceInfo {
             base_name: self.name.clone(),

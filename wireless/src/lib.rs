@@ -513,6 +513,34 @@ pub trait WirelessNetIface: Interface {
         Err(WirelessError::NotSupported)
     }
 
+    /// Opt into source-bound, receipt-complete control-only NEW/DEL. Legacy
+    /// virtual-netdev callbacks retain their existing synchronous path.
+    fn async_control_interfaces(&self) -> bool {
+        false
+    }
+    async fn new_control_interface_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+        _name: &str,
+        _iftype: u32,
+        _mac: Option<[u8; 6]>,
+    ) -> Result<Arc<dyn WirelessNetIface>, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+    /// Native teardown must be retained beyond cancellation of this borrowed
+    /// waiter. Only actual native retirement may produce the typed receipt.
+    async fn delete_control_interface_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+    ) -> Result<ap_control::RadioControlRetirement, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+    /// Trusted metadata cleanup after unpublished NEW or completed native
+    /// DEL. No hardware wait, RF action or native-resource retirement is
+    /// permitted here. Called outside registry locks and idempotent for the
+    /// exact object, never a same-name successor.
+    fn release_control_metadata(&self) {}
+
     /// Actual supported HT/VHT capabilities for a band (2400, 5000, or
     /// 6000 MHz). Six-GHz devices expose HE through their driver-specific
     /// capability path until this generic interface gains an HE body.
