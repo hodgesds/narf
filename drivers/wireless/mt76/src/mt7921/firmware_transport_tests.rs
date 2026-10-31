@@ -218,6 +218,7 @@ struct Model {
     receive_epoch: u64,
     receive_open: bool,
     captured_packets: VecDeque<CapturedData>,
+    p2p_capture: super::p2p_management_capture::Queue,
     ticks: Cell<u64>,
     tick_step_ns: u64,
     management_stall_after: Option<usize>,
@@ -354,6 +355,7 @@ impl Model {
             receive_epoch: 0,
             receive_open: false,
             captured_packets: VecDeque::new(),
+            p2p_capture: super::p2p_management_capture::Queue::new(),
             ticks: Cell::new(0),
             tick_step_ns: 1_000_000,
             management_stall_after: None,
@@ -767,21 +769,66 @@ impl Backend for Model {
         }
     }
     fn receive_data(&mut self) -> Result<Option<Vec<u8>>, Error> {
-        Ok(self
-            .captured_packets
-            .pop_front()
-            .map(|packet| packet.bytes)
-            .or_else(|| self.packets.pop_front()))
+        Ok(self.receive_data_captured()?.map(|packet| packet.bytes))
     }
     fn receive_data_captured(&mut self) -> Result<Option<CapturedData>, Error> {
         if let Some(packet) = self.captured_packets.pop_front() {
             return Ok(Some(packet));
         }
-        Ok(self.packets.pop_front().map(|bytes| CapturedData {
-            bytes,
-            epoch: self.receive_epoch,
-            port_open: self.receive_open,
+        Ok(self.packets.pop_front().map(|bytes| {
+            self.p2p_capture.copy(&bytes, self.ticks.get());
+            CapturedData {
+                bytes,
+                epoch: self.receive_epoch,
+                port_open: self.receive_open,
+            }
         }))
+    }
+    fn close_p2p_capture(&mut self) {
+        self.p2p_capture.close();
+    }
+    fn configure_p2p_capture(
+        &mut self,
+        spec: Option<super::p2p_management_capture::Spec>,
+    ) -> Result<(), Error> {
+        self.p2p_capture.close();
+        let Some(spec) = spec else {
+            return Ok(());
+        };
+        self.check()?;
+        let cut = self.packets.len();
+        for _ in 0..cut {
+            let bytes = self.packets.pop_front().ok_or(Error::Ring)?;
+            self.captured_packets.push_back(CapturedData {
+                bytes,
+                epoch: self.receive_epoch,
+                port_open: self.receive_open,
+            });
+        }
+        self.p2p_capture.open_after_cut(spec, self.ticks.get())
+    }
+    fn receive_p2p_management(
+        &mut self,
+    ) -> Result<Option<super::p2p_management_capture::Captured>, Error> {
+        self.check()?;
+        if let Some(packet) = self.p2p_capture.pop() {
+            return Ok(Some(packet));
+        }
+        for _ in 0..16 {
+            let Some(bytes) = self.packets.pop_front() else {
+                break;
+            };
+            self.p2p_capture.copy(&bytes, self.ticks.get());
+            if self.captured_packets.len() == 32 {
+                self.captured_packets.pop_front();
+            }
+            self.captured_packets.push_back(CapturedData {
+                bytes,
+                epoch: self.receive_epoch,
+                port_open: self.receive_open,
+            });
+        }
+        Ok(self.p2p_capture.pop())
     }
     fn close_receive_capture(&mut self, epoch: u64) {
         self.receive_epoch = epoch;
@@ -868,6 +915,7 @@ impl Backend for Model {
         self.active = false;
         self.replies.clear();
         self.packets.clear();
+        self.p2p_capture.close();
         self.pm.dma_enabled = true;
         Ok(())
     }

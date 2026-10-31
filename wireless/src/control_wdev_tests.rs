@@ -66,6 +66,26 @@ impl Interface for ControlRadio {
 }
 #[async_trait::async_trait]
 impl WirelessNetIface for ControlRadio {
+    fn async_p2p_management_rx_control(&self) -> bool {
+        true
+    }
+    async fn register_mgmt_frame_radio_async(
+        &self,
+        authority: &RadioControlAuthority,
+        frame_type: u16,
+        prefix: &[u8],
+    ) -> Result<(), i32> {
+        if !matches!(frame_type, 0x40 | 0xb0 | 0xd0) {
+            return Err(22);
+        }
+        self.terminal_callback(authority).await.map_err(|_| 1)?;
+        let errno = self.inner.management_errno.load(Ordering::Acquire);
+        if errno != 0 {
+            return Err(errno as i32);
+        }
+        *self.inner.management_registration.lock() = Some((frame_type, prefix.to_vec()));
+        Ok(())
+    }
     fn async_control_interfaces(&self) -> bool {
         true
     }
@@ -531,3 +551,5 @@ mod delegation;
 mod dispatch;
 #[path = "control_lifecycle_tests.rs"]
 pub(super) mod lifecycle;
+#[path = "p2p_management_dispatch_tests.rs"]
+mod management;

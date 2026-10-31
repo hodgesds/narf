@@ -903,6 +903,19 @@ pub trait WirelessNetIface: Interface {
     fn async_p2p_device_control(&self) -> bool {
         false
     }
+    /// Register host management filters on an actual control WDEV. This
+    /// metadata operation may precede START and grants no RF/capture owner.
+    fn async_p2p_management_rx_control(&self) -> bool {
+        false
+    }
+    async fn register_mgmt_frame_radio_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+        _frame_type: u16,
+        _prefix: &[u8],
+    ) -> Result<(), i32> {
+        Err(95)
+    }
     async fn start_p2p_device_async(
         &self,
         _authority: &ap_control::RadioControlAuthority,

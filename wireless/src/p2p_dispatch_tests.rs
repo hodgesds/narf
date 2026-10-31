@@ -9,7 +9,7 @@ pub(super) fn attr(out: &mut Vec<u8>, kind: u16, value: &[u8]) {
     out.extend_from_slice(value);
     out.resize((out.len() + 3) & !3, 0);
 }
-fn send(
+pub(super) fn send(
     child: &Child,
     source: Arc<dyn narf_net::netlink_generic::DeferredReplySink>,
     command: u8,

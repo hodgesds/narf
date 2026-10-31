@@ -1,5 +1,7 @@
 //! Exercise the production descriptor/doorbell backend on owned memory.
 use super::*;
+#[path = "p2p_management_hw_tests.rs"]
+mod p2p_management;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 #[path = "ap_management_hw_tests.rs"]
@@ -50,6 +52,7 @@ fn rig() -> Result<(Vec<u32>, Hardware), Error> {
         pending_data: VecDeque::new(),
         receive_epoch: 0,
         receive_open: false,
+        p2p_capture: super::super::p2p_management_capture::Queue::new(),
         rx: [
             Ring::allocate(RX_PRE, true)?,
             Ring::allocate(RX_POST, true)?,

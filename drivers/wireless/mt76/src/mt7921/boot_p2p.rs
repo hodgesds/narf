@@ -10,6 +10,8 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 use narf_wireless::ap_control::RadioControlAuthority;
+#[path = "boot_p2p_management.rs"]
+pub(crate) mod management;
 
 pub(crate) enum Request {
     Start,
@@ -315,6 +317,7 @@ pub(super) async fn run_session<B: Backend>(
             .map_err(|_| Error::Authority)?;
         if start {
             let identity = session.commit_p2p_device(&authority)?;
+            session.bind_p2p_management(&authority, concrete.management_subscriptions())?;
             concrete
                 .commit_started(&authority, identity)
                 .map_err(|_| Error::Authority)?;
@@ -374,6 +377,8 @@ pub(super) async fn maintain_session<B: Backend>(
     }
     if session.p2p_owner.is_none() {
         concrete.commit_stopped();
+    } else {
+        session.service_p2p_management_receive()?;
     }
     Ok(())
 }

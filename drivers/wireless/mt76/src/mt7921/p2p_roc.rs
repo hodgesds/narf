@@ -260,9 +260,6 @@ impl<B: Backend> Session<B> {
             frequency_mhz: roc.channel.frequency_mhz,
             duration_ms,
         };
-        roc.source
-            .roc_ready(receipt.cookie, receipt.frequency_mhz, receipt.duration_ms)
-            .map_err(|_| Error::Authority)?;
         // The same current source still owns terminal publication after a
         // possible reentrant event sink. Only then shed serialization.
         authority.current().map_err(|_| Error::Authority)?;
@@ -278,6 +275,16 @@ impl<B: Backend> Session<B> {
         }
         roc.activated = true;
         owner.pending = None;
+        let source = roc.source.clone();
+        self.refresh_p2p_management_capture()?;
+        source
+            .roc_ready(receipt.cookie, receipt.frequency_mhz, receipt.duration_ms)
+            .map_err(|_| Error::Authority)?;
+        authority.current().map_err(|_| Error::Authority)?;
+        source.current().map_err(|_| Error::Authority)?;
+        if !self.p2p_roc_current(receipt.cookie, receipt.frequency_mhz)? {
+            return Err(Error::Authority);
+        }
         Ok(receipt)
     }
     pub(in crate::mt7921::firmware_transport) async fn expire_p2p_roc(
@@ -369,6 +376,7 @@ impl<B: Backend> Session<B> {
     pub(in crate::mt7921::firmware_transport) async fn retire_p2p_roc_owned(
         &mut self,
     ) -> Result<(), Error> {
+        self.close_p2p_management_capture();
         let Some(lease) = self.p2p_owner.as_ref().and_then(|owner| owner.cnm.lease()) else {
             return Ok(());
         };

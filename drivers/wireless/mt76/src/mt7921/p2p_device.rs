@@ -18,6 +18,7 @@ pub(super) struct Owner {
     pub activated: bool,
     pub ready: bool,
     pub vif: crate::mt7921::vif_slots::Vif,
+    pub management: super::p2p_management::Management,
     roc: Option<roc::Roc>,
 }
 impl<B: Backend> Session<B> {
@@ -62,6 +63,7 @@ impl<B: Backend> Session<B> {
             activated: false,
             ready: false,
             vif,
+            management: Default::default(),
             roc: None,
         });
         // BSS0 takeover retires the previous role. A separately allocated
@@ -82,6 +84,7 @@ impl<B: Backend> Session<B> {
             activated: false,
             ready: false,
             vif,
+            management: Default::default(),
             roc: None,
         });
         self.stage(Stage::P2pDeviceStart);
@@ -151,6 +154,7 @@ impl<B: Backend> Session<B> {
         self.stop_p2p_device_owned().await
     }
     pub(super) async fn stop_p2p_device_owned(&mut self) -> Result<(), Error> {
+        self.close_p2p_management_capture();
         let owner = self.p2p_owner.as_ref().ok_or(Error::Busy)?;
         let info = owner.info;
         let sidecar = owner.vif.index() != 0;

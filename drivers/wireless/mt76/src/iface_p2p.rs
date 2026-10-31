@@ -19,6 +19,7 @@ pub(crate) struct P2pDeviceIface {
     registration: IrqSafeSpinLock<Option<Registration>>,
     identity: IrqSafeSpinLock<Option<RadioInterfaceIdentity>>,
     owned: AtomicBool,
+    management: crate::mt7921::firmware_transport::p2p_management_filters::Shared,
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
@@ -101,6 +102,7 @@ impl Mt76Iface {
             registration: IrqSafeSpinLock::new(None),
             identity: IrqSafeSpinLock::new(None),
             owned: AtomicBool::new(false),
+            management: Arc::new(Default::default()),
             rx: IrqSafeSpinLock::new(None),
             tx: IrqSafeSpinLock::new(None),
         });
@@ -207,6 +209,11 @@ impl Mt76Iface {
     }
 }
 impl P2pDeviceIface {
+    pub(crate) fn management_subscriptions(
+        &self,
+    ) -> crate::mt7921::firmware_transport::p2p_management_filters::Shared {
+        self.management.clone()
+    }
     pub(crate) fn cleanup_current(&self) -> Result<(), WirelessError> {
         let parent = self.parent.upgrade().ok_or(WirelessError::Denied)?;
         if !ACTIVE
@@ -425,6 +432,26 @@ impl Interface for Registered {
 }
 #[async_trait]
 impl WirelessNetIface for P2pDeviceIface {
+    fn async_p2p_management_rx_control(&self) -> bool {
+        true
+    }
+    async fn register_mgmt_frame_radio_async(
+        &self,
+        authority: &RadioControlAuthority,
+        frame_type: u16,
+        prefix: &[u8],
+    ) -> Result<(), i32> {
+        let parent = self.current().map_err(|_| 1)?;
+        let _control = parent.control.lock().await;
+        self.request_current(authority).map_err(|_| 1)?;
+        crate::mt7921::firmware_transport::boot_p2p::management::register(
+            self.weak().map_err(|_| 1)?,
+            Arc::new(authority.clone()),
+            frame_type,
+            prefix.to_vec(),
+        )
+        .await
+    }
     fn async_control_interfaces(&self) -> bool {
         true
     }

@@ -14,6 +14,7 @@ pub(super) enum Operation {
         duration_ms: u32,
     },
     Cancel(u64),
+    RegisterFrame(u16, Vec<u8>),
 }
 /// Only these explicitly opted-in control-only operations may consult a
 /// fresh child grant retained on the actual creating socket. Legacy callers
@@ -45,6 +46,32 @@ fn errno(error: crate::WirelessError) -> i32 {
         crate::WirelessError::HardwareError => 5,
         other => mlme_errno(other),
     }
+}
+pub(super) fn register_frame(
+    bytes: &[u8],
+    context: RequestContext<'_>,
+    slot: Option<&DeferredRequest>,
+) -> Result<Vec<GenlReply>, i32> {
+    let attrs = attributes(bytes)?;
+    reject_unknown(&attrs, &[153, 91, 101])?;
+    let (iface, index) = interface(&attrs, context.net_ns_id)?;
+    if index.is_some() || iface.current_iftype() != 10 || !iface.async_p2p_management_rx_control() {
+        return Err(EOPNOTSUPP);
+    }
+    let admin = source_authority(&context, iface.as_ref(), slot)?;
+    let frame_type = u16_attr(&attrs, 101)?.ok_or(EINVAL)?;
+    if frame_type & !0xf0 != 0 {
+        return Err(EINVAL);
+    }
+    let prefix = attr(&attrs, 91).ok_or(EINVAL)?.to_vec();
+    defer(
+        iface,
+        admin,
+        context.net_ns_id,
+        None,
+        slot,
+        Operation::RegisterFrame(frame_type, prefix),
+    )
 }
 
 /// Resolve the original request once. Both selectors, if supplied, must
@@ -149,10 +176,16 @@ pub(super) fn defer(
             let mut native = Box::pin(async move {
                 let mut replies = Vec::new();
                 match operation {
-                    Operation::Start => iface.start_p2p_device_async(&call).await,
-                    Operation::Stop => iface.stop_p2p_device_async(&call).await,
-                    Operation::Cancel(cookie) => {
-                        iface.cancel_remain_on_channel_async(&call, cookie).await
+                    Operation::Start => iface.start_p2p_device_async(&call).await.map_err(errno),
+                    Operation::Stop => iface.stop_p2p_device_async(&call).await.map_err(errno),
+                    Operation::Cancel(cookie) => iface
+                        .cancel_remain_on_channel_async(&call, cookie)
+                        .await
+                        .map_err(errno),
+                    Operation::RegisterFrame(frame_type, prefix) => {
+                        iface
+                            .register_mgmt_frame_radio_async(&call, frame_type, &prefix)
+                            .await
                     }
                     Operation::Roc {
                         cookie,
@@ -170,10 +203,9 @@ pub(super) fn defer(
                                 attrs,
                             });
                         }
-                        result
+                        result.map_err(errno)
                     }
-                }
-                .map_err(errno)?;
+                }?;
                 call.check_for(iface.as_ref()).map_err(errno)?;
                 Ok(replies)
             });

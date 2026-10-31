@@ -76,10 +76,10 @@ iwlwifi	width_160	160MHz operation on applicable profiles	feature	drivers/wirele
 iwlwifi	width_320	320MHz operation on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	2140
 iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	2189
 mt76	loadable_packet_abi	Loadable wireless packet ABI	feature	drivers/wireless/specification/mt7921.md	18
-mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	2225
-mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/specification/mt7921.md	2110
-mt76	p2p_mode	P2P client / GO / device roles	feature	drivers/wireless/specification/mt7921.md	2250
-mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	2118
+mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	2253
+mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/specification/mt7921.md	2138
+mt76	p2p_mode	Independent device BSS/CNM/finite ROC and control NEW/DEL have software acceptance. Source-bound REGISTER_FRAME and native management RX now retain separate physical-copy epochs; seven new native cases await execution. Management TX and independent client/GO peer/key/data contexts remain.	feature	drivers/wireless/specification/mt7921.md	2278
+mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	2146
 rtl8xxxu	bt_coexistence	Bluetooth coexistence on RTL8723BU; blocked on the rtl8723bu chip runtime	feature	drivers/wireless/specification/rtl8xxxu.md	1022
 rtl8xxxu	five_ghz_operation	Broader band operation including VHT-profile 5GHz; RTL8188EU is 2.4GHz-only; 5GHz exists only on RTL8821CU/RTL8822BU, blocked on those chip rows	feature	drivers/wireless/specification/rtl8xxxu.md	1043
 rtl8xxxu	ht40	HT40; blocked on a signed HT40 qualification record (N8HT v1 binds 20MHz/LGI) and 40MHz BW/secondary-channel programming in the retained channel owner	feature	drivers/wireless/specification/rtl8xxxu.md	1015

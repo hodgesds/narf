@@ -41,6 +41,8 @@ struct Radio {
     sched_request: IrqSafeSpinLock<Option<crate::SchedScanRequest>>,
     control_sends: AtomicU32,
     control_factory: IrqSafeSpinLock<Option<control_wdev::lifecycle::Factory>>,
+    management_registration: IrqSafeSpinLock<Option<(u16, Vec<u8>)>>,
+    management_errno: AtomicU32,
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
@@ -71,6 +73,8 @@ impl Radio {
             sched_request: IrqSafeSpinLock::new(None),
             control_sends: AtomicU32::new(0),
             control_factory: IrqSafeSpinLock::new(None),
+            management_registration: IrqSafeSpinLock::new(None),
+            management_errno: AtomicU32::new(0),
             rx: IrqSafeSpinLock::new(None),
             tx: IrqSafeSpinLock::new(None),
         }

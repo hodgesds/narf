@@ -752,6 +752,23 @@ Closed/rebound sockets, deleted/replaced registrations or revoked grants
 cannot publish old success or events to a successor. These shared defaults
 advertise no P2P mode and refuse unsupported native operations.
 
+`async_p2p_management_rx_control` opts an actual control WDEV into the
+source-bound `REGISTER_FRAME` path and `register_mgmt_frame_radio_async`.
+The caller supplies its WDEV and explicit current child authority, without
+an IFINDEX or fabricated UP state. The callback returns its actual positive
+errno (including cfg80211 `EALREADY`) and receives a reserved Radio authority;
+the ACK follows completion with the same source/grant/mode checks as other
+native radio operations. Registration is host subscription metadata and may
+precede native START. It establishes no started BSS, channel/RF/capture grant,
+encryption or controlled port. Existing netdev SME/AP registration paths keep
+their existing behavior. Native raw RX publication additionally requires the
+driver's actual started WDEV, matching native channel owner and copy-time
+capture generation, valid RX metadata/header and current exact source filter.
+Old queued descriptors cannot acquire a new registration/source by late
+decoding. Typed `RadioEventAuthority::management_received` delivers only those
+actual raw bytes and observations to the original source; it grants no peer
+authentication, data interface or management-TX authority.
+
 `async_control_interfaces` independently opts into control-only
 `new_control_interface_async` / `delete_control_interface_async`. NEW names the
 real physical wiphy and returns an actual registered P2P-device WDEV, without

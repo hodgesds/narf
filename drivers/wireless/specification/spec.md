@@ -971,6 +971,13 @@ ownership; native USB/device terminals remain distinct from AP reception.
 Eight composed driver cases and one shared sequence/CCMP case await native
 release acceptance in the family §3.
 
+MT76's control-only P2P WDEV accepts source-bound REGISTER_FRAME before
+START as host subscription metadata. Native management RX additionally
+requires its actual started independent BSS, current finite ROC and a new
+capture epoch after the completed native RX-prefix cut. Home data owners
+remain separate. Five native MT cases and two shared dispatcher cases await
+execution; management TX and client/GO data contexts remain open.
+
 ## 4. Interaction with `narf-wireless`
 
 - **Registration**: Drivers register via `bus::register_wireless_driver(MatchEntry { ... })`.

@@ -14,6 +14,8 @@ use narf_io::DmaBuffer;
 
 #[path = "ap_timing.rs"]
 mod ap_timing;
+#[path = "p2p_management_hw.rs"]
+mod p2p_management;
 
 #[path = "wowlan_hardware.rs"]
 mod wake;
@@ -151,6 +153,7 @@ struct Storage {
     pending_data: VecDeque<CapturedData>,
     receive_epoch: u64,
     receive_open: bool,
+    p2p_capture: super::p2p_management_capture::Queue,
 }
 impl Storage {
     // Caller has proved device quiescence and retired every hardware ring reference.
@@ -182,6 +185,7 @@ impl Storage {
         self.pending_data.clear();
         self.receive_epoch = 0;
         self.receive_open = false;
+        self.p2p_capture.close();
         dma_barrier();
     }
 }
@@ -279,6 +283,7 @@ impl Hardware {
         bytes: Vec<u8>,
         event: Option<bool>,
     ) -> Result<Option<CapturedData>, Error> {
+        let now = self.now_ns();
         let rxd = u32::from_le_bytes(bytes[..4].try_into().unwrap());
         let kind = rxd >> 27;
         let normal = kind == 2 || kind == 7 && (rxd >> 16) & 15 == 1;
@@ -290,6 +295,7 @@ impl Hardware {
         } else if kind == 1 {
             storage.tx_sequence.receive(&bytes)?;
         } else if normal {
+            storage.p2p_capture.copy(&bytes, now);
             let packet = CapturedData {
                 bytes,
                 epoch: storage.receive_epoch,
@@ -673,6 +679,22 @@ impl Hardware {
     }
 }
 impl Backend for Hardware {
+    fn close_p2p_capture(&mut self) {
+        if let Some(storage) = self.owner.storage.as_mut() {
+            storage.p2p_capture.close();
+        }
+    }
+    fn configure_p2p_capture(
+        &mut self,
+        spec: Option<super::p2p_management_capture::Spec>,
+    ) -> Result<(), Error> {
+        Hardware::configure_p2p_capture(self, spec)
+    }
+    fn receive_p2p_management(
+        &mut self,
+    ) -> Result<Option<super::p2p_management_capture::Captured>, Error> {
+        Hardware::receive_p2p_management(self)
+    }
     fn progress(&mut self, stage: super::Stage) {
         use core::fmt::Write;
         let _ = writeln!(narf_console::Writer, "mt76: firmware {stage:?}");
@@ -1194,6 +1216,23 @@ pub struct Transport {
 #[path = "firmware_transport_hw_tests.rs"]
 mod tests;
 impl Transport {
+    pub(crate) fn register_p2p_management(
+        &mut self,
+        iface: alloc::sync::Weak<crate::iface::p2p::P2pDeviceIface>,
+        authority: Arc<narf_wireless::ap_control::RadioControlAuthority>,
+        frame_type: u16,
+        prefix: &[u8],
+        expected_mac: [u8; 6],
+    ) -> Result<(), i32> {
+        super::boot_p2p::management::register_session(
+            &mut self.session,
+            iface,
+            authority,
+            frame_type,
+            prefix,
+            expected_mac,
+        )
+    }
     pub(crate) fn p2p_profile(&self) -> Result<super::P2pProfile, Error> {
         self.session.backend.check()?;
         self.session.firmware.p2p_profile()
@@ -1373,6 +1412,7 @@ impl Transport {
                 pending_data: VecDeque::new(),
                 receive_epoch: 0,
                 receive_open: false,
+                p2p_capture: super::p2p_management_capture::Queue::new(),
                 rx: [
                     Ring::allocate(RX_PRE, true)?,
                     Ring::allocate(RX_POST, true)?,

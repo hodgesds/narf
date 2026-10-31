@@ -23,6 +23,14 @@ mod ap_rx;
 pub(crate) mod boot_ap;
 #[path = "boot_p2p.rs"]
 pub(crate) mod boot_p2p;
+#[path = "p2p_management.rs"]
+mod p2p_management;
+#[path = "p2p_management_capture.rs"]
+mod p2p_management_capture;
+#[path = "p2p_management_filters.rs"]
+pub(crate) mod p2p_management_filters;
+#[path = "p2p_management_wire.rs"]
+mod p2p_management_wire;
 #[path = "p2p_profile.rs"]
 mod p2p_profile;
 pub(crate) use p2p_profile::P2pProfile;
@@ -1167,6 +1175,22 @@ struct CapturedData {
 }
 
 trait Backend {
+    fn close_p2p_capture(&mut self) {}
+    fn configure_p2p_capture(
+        &mut self,
+        spec: Option<p2p_management_capture::Spec>,
+    ) -> Result<(), Error> {
+        if spec.is_some() {
+            Err(Error::UnsupportedFirmware)
+        } else {
+            Ok(())
+        }
+    }
+    fn receive_p2p_management(
+        &mut self,
+    ) -> Result<Option<p2p_management_capture::Captured>, Error> {
+        Err(Error::UnsupportedFirmware)
+    }
     /// Actual hardware chip ID; zero means no identity proof in a pure model.
     /// Wider chip-specific profiles must not infer this from firmware max_bw.
     fn chip_id(&self) -> Result<u16, Error> {
