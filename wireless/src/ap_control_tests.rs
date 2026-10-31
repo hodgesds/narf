@@ -405,6 +405,7 @@ impl DeferredReplySink for Source {
     }
 }
 struct Fixture {
+    cap: Cap<narf_net::NetIface, narf_capabilities::Write>,
     _binding: Binding,
     ifindex: u32,
     radio: Arc<Radio>,
@@ -446,6 +447,7 @@ fn fixture() -> Result<Fixture, &'static str> {
         .ok_or("AP fixture ifindex")?
         .ifindex;
     Ok(Fixture {
+        cap,
         _binding: binding,
         ifindex,
         radio,

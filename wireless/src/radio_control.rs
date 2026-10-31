@@ -38,6 +38,42 @@ impl RadioControlAuthority {
     pub fn current(&self) -> Result<(), WirelessError> {
         self.guard.current()
     }
+    /// Explicitly retain this newly created child's actual current grant on
+    /// the exact creating socket. The typed net operation also proves the
+    /// registered parent-cap relation inside its parent/daemon/child invokes.
+    /// A source sink, name or observed WDEV cannot manufacture authority.
+    pub fn retain_control_child(
+        &self,
+        child: &Arc<dyn WirelessNetIface>,
+        cap: &narf_capabilities::Cap<narf_net::NetIface, narf_capabilities::Write>,
+    ) -> Result<(), WirelessError> {
+        self.current()?;
+        let parent = self.guard.iface.upgrade().ok_or(WirelessError::Denied)?;
+        if !crate::registry::control_parent_matches(&parent, child)
+            || child.control_namespace() != Some(self.guard.namespace)
+        {
+            return Err(WirelessError::Denied);
+        }
+        let admin = self
+            .guard
+            .admin
+            .control_registered_child(cap)
+            .map_err(|_| WirelessError::Denied)?;
+        self.current()?;
+        if !crate::registry::control_parent_matches(&parent, child) {
+            return Err(WirelessError::Denied);
+        }
+        if let Some(admin) = admin {
+            admin
+                .authorize_interface(child.name(), self.guard.namespace)
+                .map_err(|_| WirelessError::Denied)?;
+            self.guard
+                .reply
+                .retain_control_admin(admin)
+                .map_err(|_| WirelessError::Denied)?;
+        }
+        self.current()
+    }
     pub fn check_for<I: WirelessNetIface + ?Sized>(&self, iface: &I) -> Result<(), WirelessError> {
         self.guard.check_for(iface)
     }

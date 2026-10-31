@@ -1052,6 +1052,9 @@ pub struct SocketFile {
     /// Explicitly delegated NARF network-control authority. Never inferred
     /// from uid or Linux ambient capability bits.
     netlink_admin: IrqSafeSpinLock<Option<narf_net::AdminHandle>>,
+    /// Explicit fresh control-child grants from this exact socket's
+    /// authorized create operation; never a namespace/port-id registry.
+    netlink_controls: IrqSafeSpinLock<Vec<narf_net::AdminHandle>>,
     /// The opener held CAP_NET_ADMIN over this socket's network namespace when
     /// it created the socket — the `file_ns_capable(file, ...)` half of Linux
     /// `netlink_net_capable`, which judges the socket's `f_cred`, not only the
@@ -2044,6 +2047,7 @@ impl SocketFile {
             netlink_recv_groups: IrqSafeSpinLock::new(BTreeMap::new()),
             netlink_user_recv_creds: IrqSafeSpinLock::new(BTreeMap::new()),
             netlink_admin: IrqSafeSpinLock::new(None),
+            netlink_controls: IrqSafeSpinLock::new(Vec::new()),
             opener_net_admin: AtomicBool::new(false),
             opener_init_net_admin: AtomicBool::new(false),
             netfilter_admin: IrqSafeSpinLock::new(None),
@@ -2289,6 +2293,7 @@ impl SocketFile {
             return Err(SockError::InvalidArg);
         }
         *self.netlink_admin.lock() = Some(admin);
+        self.netlink_controls.lock().clear();
         Ok(())
     }
 
@@ -3566,11 +3571,20 @@ struct GenericReplyEndpoint {
     portid: u32,
 }
 
+#[path = "socket_control_admin.rs"]
+mod control_admin;
+
 #[cfg(feature = "kernel-test")]
 #[path = "socket_deferred_tests.rs"]
 mod deferred_tests;
 
 impl narf_net::netlink_generic::DeferredReplySink for GenericReplyEndpoint {
+    fn retain_control_admin(&self, admin: narf_net::AdminHandle) -> Result<(), i32> {
+        self.retain_child_admin(admin)
+    }
+    fn control_admin(&self, name: &str, namespace: u64) -> Option<narf_net::AdminHandle> {
+        self.child_admin(name, namespace)
+    }
     fn current(&self) -> bool {
         self.socket.upgrade().is_some_and(|socket| {
             socket.protocol == NETLINK_GENERIC

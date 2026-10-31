@@ -3243,6 +3243,7 @@ dependencies = [
  "narf-initramfs",
  "narf-input",
  "narf-interrupts",
+ "narf-ipc",
  "narf-kernel-test",
  "narf-lib",
  "narf-linux-perf-uapi",

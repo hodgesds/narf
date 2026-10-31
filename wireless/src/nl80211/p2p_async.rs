@@ -15,6 +15,30 @@ pub(super) enum Operation {
     },
     Cancel(u64),
 }
+/// Only these explicitly opted-in control-only operations may consult a
+/// fresh child grant retained on the actual creating socket. Legacy callers
+/// retain the existing RequestContext authority path.
+pub(super) fn source_authority(
+    context: &RequestContext<'_>,
+    iface: &dyn crate::WirelessNetIface,
+    slot: Option<&DeferredRequest>,
+) -> Result<narf_net::AdminHandle, i32> {
+    authority(context, iface).or_else(|error| {
+        if iface.control_namespace() != Some(context.net_ns_id) {
+            return Err(error);
+        }
+        slot.and_then(|slot| {
+            slot.reply_sink()
+                .control_admin(iface.name(), context.net_ns_id)
+        })
+        .filter(|admin| {
+            admin
+                .authorize_interface(iface.name(), context.net_ns_id)
+                .is_ok()
+        })
+        .ok_or(error)
+    })
+}
 fn errno(error: crate::WirelessError) -> i32 {
     match error {
         crate::WirelessError::Timeout => 110,
@@ -66,9 +90,9 @@ pub(super) fn device(
     slot: Option<&DeferredRequest>,
 ) -> Result<Vec<GenlReply>, i32> {
     let attrs = attributes(bytes)?;
-    reject_unknown(&attrs, &[153])?;
+    reject_unknown(&attrs, &[3, 153])?;
     let (iface, index) = interface(&attrs, context.net_ns_id)?;
-    let admin = authority(&context, iface.as_ref())?;
+    let admin = source_authority(&context, iface.as_ref(), slot)?;
     if index.is_some() || iface.current_iftype() != 10 || !iface.async_p2p_device_control() {
         return Err(EOPNOTSUPP);
     }

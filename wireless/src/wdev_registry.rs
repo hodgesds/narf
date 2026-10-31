@@ -1,7 +1,10 @@
 //! Registered wireless objects. A control-only P2P wdev has an actual
 //! typed interface/control grant, but no fabricated netdev or ifindex.
 use crate::*;
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::{
     num::NonZeroU64,
     sync::atomic::{AtomicU64, Ordering},
@@ -11,10 +14,19 @@ use narf_lib::sync::IrqSafeSpinLock;
 struct Entry {
     iface: Arc<dyn WirelessNetIface>,
     control: Option<ControlWdev>,
+    parent: Option<Weak<dyn WirelessNetIface>>,
 }
 static REGISTRY: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
 static NEXT_CONTROL: AtomicU64 = AtomicU64::new(1);
 const CONTROL_ID: u64 = 1 << 63;
+fn parent_current(registry: &[Entry], entry: &Entry) -> bool {
+    entry.control.is_none()
+        || entry.parent.as_ref().is_some_and(|parent| {
+            registry.iter().any(|actual| {
+                actual.control.is_none() && Weak::ptr_eq(parent, &Arc::downgrade(&actual.iface))
+            })
+        })
+}
 
 /// Registration/namespace observation only: no admin, device or RF grant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +62,7 @@ pub fn register(iface: Arc<dyn WirelessNetIface>) {
         REGISTRY.lock().push(Entry {
             iface,
             control: None,
+            parent: None,
         });
     }
 }
@@ -102,27 +115,51 @@ pub fn register_control(
     registry.push(Entry {
         iface,
         control: Some(control),
+        parent: Some(Arc::downgrade(parent)),
     });
     Ok(control)
 }
+/// The actual registered parent-child objects, not matching names/MACs or
+/// merely a shared wiphy number. This observation creates no grant.
+pub(crate) fn control_parent_matches(
+    parent: &Arc<dyn WirelessNetIface>,
+    child: &Arc<dyn WirelessNetIface>,
+) -> bool {
+    let registry = REGISTRY.lock();
+    registry
+        .iter()
+        .any(|entry| entry.control.is_none() && Arc::ptr_eq(&entry.iface, parent))
+        && registry.iter().any(|entry| {
+            Arc::ptr_eq(&entry.iface, child)
+                && entry.control.is_some()
+                && entry
+                    .parent
+                    .as_ref()
+                    .is_some_and(|actual| Weak::ptr_eq(actual, &Arc::downgrade(parent)))
+        })
+}
 pub fn control_for<I: WirelessNetIface + ?Sized>(iface: &I) -> Option<ControlWdev> {
     let expected = core::ptr::from_ref(iface).cast::<()>();
-    REGISTRY
-        .lock()
+    let registry = REGISTRY.lock();
+    registry
         .iter()
-        .find(|entry| Arc::as_ptr(&entry.iface).cast::<()>() == expected)
+        .find(|entry| {
+            Arc::as_ptr(&entry.iface).cast::<()>() == expected && parent_current(&registry, entry)
+        })
         .and_then(|entry| entry.control)
 }
 pub fn control_by_id(id: u64, namespace: u64) -> Option<Arc<dyn WirelessNetIface>> {
-    let iface = REGISTRY
-        .lock()
+    let registry = REGISTRY.lock();
+    let iface = registry
         .iter()
         .find(|entry| {
-            entry
-                .control
-                .is_some_and(|control| control.id() == id && control.namespace == namespace)
+            parent_current(&registry, entry)
+                && entry
+                    .control
+                    .is_some_and(|control| control.id() == id && control.namespace == namespace)
         })
         .map(|entry| entry.iface.clone());
+    drop(registry);
     iface.filter(|iface| {
         iface.control_namespace() == Some(namespace) && iface.current_iftype() == 10
     })
@@ -139,9 +176,10 @@ pub fn unregister_control<I: WirelessNetIface + ?Sized>(expected: ControlWdev, i
     before != registry.len()
 }
 pub fn list() -> Vec<Arc<dyn WirelessNetIface>> {
-    REGISTRY
-        .lock()
+    let registry = REGISTRY.lock();
+    registry
         .iter()
+        .filter(|entry| parent_current(&registry, entry))
         .map(|entry| entry.iface.clone())
         .collect()
 }
@@ -150,6 +188,9 @@ pub fn wiphys() -> Vec<Arc<dyn WirelessNetIface>> {
     let mut ids = Vec::new();
     let mut out = Vec::new();
     for entry in REGISTRY.lock().iter() {
+        if entry.control.is_some() {
+            continue;
+        }
         let id = entry.iface.wiphy_id();
         if !ids.contains(&id) {
             ids.push(id);

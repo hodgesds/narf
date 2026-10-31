@@ -11,9 +11,18 @@ fn attr(out: &mut Vec<u8>, kind: u16, value: &[u8]) {
 }
 fn send(
     child: &Child,
-    source: Arc<Source>,
+    source: Arc<dyn narf_net::netlink_generic::DeferredReplySink>,
     command: u8,
     extra: &[(u16, &[u8])],
+) -> Result<Vec<Vec<u8>>, &'static str> {
+    send_with_admin(child, source, command, extra, &child.admin)
+}
+pub(super) fn send_with_admin(
+    child: &Child,
+    source: Arc<dyn narf_net::netlink_generic::DeferredReplySink>,
+    command: u8,
+    extra: &[(u16, &[u8])],
+    admin: &AdminHandle,
 ) -> Result<Vec<Vec<u8>>, &'static str> {
     let _ = crate::nl80211::register();
     let mut attrs = Vec::new();
@@ -33,7 +42,7 @@ fn send(
         &message,
         ReplyOptions::default(),
         RequestContext {
-            admin: Some(&child.admin),
+            admin: Some(admin),
             net_ns_id: child.registration.namespace(),
             portid: 77,
             ..RequestContext::default()
@@ -48,7 +57,7 @@ fn source() -> Arc<Source> {
         IrqSafeSpinLock::new(Vec::new()),
     ))
 }
-fn complete(child: &Child) {
+pub(super) fn complete(child: &Child) {
     child.radio.inner.start_ready.store(true, Ordering::Release);
     for _ in 0..16 {
         narf_scheduler::poll_one_round();

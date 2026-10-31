@@ -397,8 +397,9 @@ registration's replacement and parent namespace transfer invalidate it; an
 away/back transfer needs a fresh explicit delegation. Registration, namespace
 and ownership epoch compare inside one invoked Registry/IFACES observation.
 Revoking the child's own Admin/Write grant does not revoke its parent.
-Kernel namespace handles retain their existing scope and return None rather
-than creating another daemon grant. `is_control_child` observes only a current
+Kernel namespace handles validate the actual current typed child/parent
+relation and retain their existing scope, returning None rather than creating
+another daemon grant. `is_control_child` observes only a current
 explicit child delegation; it cannot promote an ordinary handle.
 
 ### 3.4 Loopback
@@ -593,6 +594,12 @@ successful ACK. Closing the original socket cancels the waiter and suppresses
 its reply; a bound replacement cannot receive it. A sink grants no object
 authority: families retain and invoke their actual current admin handle,
 interface identity and mode generation throughout native work/publication.
+Its additive `retain_control_admin` / `control_admin` methods retain only an
+explicit current control-child Admin on that exact source; default sinks refuse
+retention and return no grant. The real source prunes retired/revoked child
+controls. Namespace, names, port ids and WDEV observations never create them;
+families still prove the actual registered parent-child relation inside the
+authorized creation/delegation operation before retention.
 `defer_checked` additionally retains a family's `DeferredAuthority` through
 the final ACK edge. Revocation stops polling and converts a would-be success
 to `EPERM`, including revocation at the native terminal-result boundary.

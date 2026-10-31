@@ -59,6 +59,17 @@ fn scope() -> Result<(), &'static str> {
     let parent = Fixture::new(true)?;
     let child = child(&parent, None)?;
     let admin = delegate(&parent, &child)?;
+    let kernel = kernel_admin(&parent.name).ok_or("actual namespace parent handle")?;
+    if kernel
+        .control_registered_child(&child.cap)
+        .map(|admin| admin.is_none())
+        != Ok(true)
+        || kernel.control_registered_child(&parent.iface).is_ok()
+    {
+        return Err(
+            "kernel namespace child check invented a daemon grant or accepted a nonchild cap",
+        );
+    }
     if admin.authorize_interface(&child.name, 0).is_err()
         || parent.admin.authorize_interface(&child.name, 0).is_ok()
         || admin.authorize_interface(&parent.name, 0).is_ok()

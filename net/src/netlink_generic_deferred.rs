@@ -18,6 +18,17 @@ const ECANCELED: i32 = 125;
 pub trait DeferredReplySink: fmt::Debug + Send + Sync {
     fn current(&self) -> bool;
     fn deliver(&self, message: Vec<u8>) -> Result<(), i32>;
+    /// Retain an actual fresh control-child grant on this exact source.
+    /// No name lookup, WDEV or wire bytes create administration. Legacy
+    /// sinks do not implement control-child delegation.
+    fn retain_control_admin(&self, _admin: crate::AdminHandle) -> Result<(), i32> {
+        Err(EOPNOTSUPP)
+    }
+    /// Resolve only a previously explicitly retained current child grant
+    /// on this exact source/namespace. This supplies no ambient authority.
+    fn control_admin(&self, _name: &str, _namespace: u64) -> Option<crate::AdminHandle> {
+        None
+    }
 }
 
 /// A family's retained current authority for the final ACK edge. This can

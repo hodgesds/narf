@@ -167,6 +167,17 @@ impl Drop for Child {
     }
 }
 fn child(parent: &Fixture, name: Option<&str>, namespace: u64) -> Result<Child, &'static str> {
+    child_at(parent, name, namespace, false)
+}
+fn paired_child(parent: &Fixture) -> Result<Child, &'static str> {
+    child_at(parent, None, 0, true)
+}
+fn child_at(
+    parent: &Fixture,
+    name: Option<&str>,
+    namespace: u64,
+    paired: bool,
+) -> Result<Child, &'static str> {
     static NEXT: AtomicU32 = AtomicU32::new(1);
     let name = name
         .map(String::from)
@@ -177,21 +188,34 @@ fn child(parent: &Fixture, name: Option<&str>, namespace: u64) -> Result<Child, 
         physical: parent.iface.wiphy_id(),
     });
     radio.inner.mode.store(10, Ordering::Release);
-    let cap = narf_net::registry()
-        .register_control(
-            &narf_net::bootstrap_authority(),
+    let grant = narf_net::bootstrap_authority();
+    let cap = if paired {
+        narf_net::registry().register_control_child(
+            &grant,
+            &parent.cap,
             RegisteredControl(radio.clone()),
         )
-        .map_err(|_| "actual control-interface grant registration")?;
+    } else {
+        narf_net::registry().register_control(&grant, RegisteredControl(radio.clone()))
+    }
+    .map_err(|_| "actual control-interface grant registration")?;
     let iface: Arc<dyn WirelessNetIface> = radio.clone();
     let registration = crate::registry::register_control(&parent.iface, iface.clone())
         .map_err(|_| "actual parent-bound control wdev registration")?;
-    let admin = narf_net::stack::control_registered(&narf_net::stack::StackAttach {
-        iface: cap,
-        daemon: parent.daemon,
-    })
-    .map_err(|_| "actual child-bound delegated administration")?
-    .admin;
+    let admin = if paired {
+        parent
+            .admin
+            .control_registered_child(&cap)
+            .map_err(|_| "actual parent-bound child delegation")?
+            .ok_or("actual child daemon grant missing")?
+    } else {
+        narf_net::stack::control_registered(&narf_net::stack::StackAttach {
+            iface: cap,
+            daemon: parent.daemon,
+        })
+        .map_err(|_| "actual child-bound delegated administration")?
+        .admin
+    };
     Ok(Child {
         radio,
         iface,
@@ -449,5 +473,7 @@ kernel_test_in!(
     control_only_wdev_actual_nl80211_discovery_has_no_fabricated_ifindex
 );
 
+#[path = "control_child_tests.rs"]
+mod delegation;
 #[path = "p2p_dispatch_tests.rs"]
 mod dispatch;

@@ -58,9 +58,66 @@ impl narf_capabilities::CapOp<AdminCap, Invoke> for Parent<'_> {
         _: &Cap<AdminCap, Invoke>,
     ) -> Result<Self::Output, narf_capabilities::CapError> {
         let Some(source) = self.admin.source.as_ref() else {
-            return Ok(Ok(None));
+            return self.child.invoke(KernelChild { parent: self.admin });
         };
         source.attach.daemon.invoke(self)
+    }
+}
+struct KernelChild<'a> {
+    parent: &'a AdminHandle,
+}
+impl narf_capabilities::CapOp<NetIface, Write> for KernelChild<'_> {
+    type Output = Result<Option<AdminHandle>, AdminError>;
+    fn execute(
+        self,
+        cap: &Cap<NetIface, Write>,
+    ) -> Result<Self::Output, narf_capabilities::CapError> {
+        let entries = crate::registry().inner.lock();
+        let Some(child) = entries
+            .iter()
+            .find(|entry| entry.handle.slot() == cap.slot())
+        else {
+            return Ok(Err(AdminError::NoIface));
+        };
+        let Some(parent_cap) = child.control_parent else {
+            return Ok(Err(AdminError::NoIface));
+        };
+        parent_cap.invoke(KernelParent {
+            entries: &entries,
+            parent: self.parent,
+            child,
+        })
+    }
+}
+struct KernelParent<'a> {
+    entries: &'a [crate::Entry],
+    parent: &'a AdminHandle,
+    child: &'a crate::Entry,
+}
+impl narf_capabilities::CapOp<NetIface, Write> for KernelParent<'_> {
+    type Output = Result<Option<AdminHandle>, AdminError>;
+    fn execute(
+        self,
+        cap: &Cap<NetIface, Write>,
+    ) -> Result<Self::Output, narf_capabilities::CapError> {
+        let valid = self
+            .entries
+            .iter()
+            .find(|entry| entry.handle.slot() == cap.slot())
+            .is_some_and(|parent| {
+                parent.iface.name() == self.parent.iface_name()
+                    && parent.iface.control_namespace().is_none()
+                    && crate::iface::lookup(parent.iface.name()).is_some_and(|metadata| {
+                        metadata.ownership_epoch != 0
+                            && self.child.iface.control_namespace() == Some(metadata.net_ns_id)
+                            && crate::iface::lookup(self.child.iface.name()).is_none()
+                    })
+            });
+        Ok(if valid {
+            Ok(None)
+        } else {
+            Err(AdminError::NoIface)
+        })
     }
 }
 impl narf_capabilities::CapOp<StackDaemon, Invoke> for Parent<'_> {

@@ -1612,7 +1612,7 @@ fn roc_handle(
 ) -> Result<Vec<GenlReply>, i32> {
     let attrs = attributes(bytes)?;
     let (iface, index) = p2p_async::interface(&attrs, context.net_ns_id)?;
-    let admin = authority(&context, iface.as_ref())?;
+    let admin = p2p_async::source_authority(&context, iface.as_ref(), deferred)?;
     let native = iface.async_roc_control();
     if !native {
         index.ok_or(EOPNOTSUPP)?;

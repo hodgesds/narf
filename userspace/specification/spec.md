@@ -140,6 +140,14 @@ Native asynchronous control ACKs use `GenericReplyEndpoint`, which holds a
 weak reference to the exact sending `SocketFile` and checks its namespace,
 protocol and bound port before publication. It never looks up a replacement
 socket by port id and does not keep a closed file alive across firmware waits.
+The endpoint may explicitly retain a fresh control-child Admin after its
+authorized parent/daemon/child delegation. These handles remain attached to
+that exact file, alongside its existing parent handle, and preserve actual
+parent/daemon/child grant and registration lifetimes. Lookup checks the actual
+child namespace and prunes retired/revoked controls; a same-name successor,
+closed source or reused port obtains no inherited grant. Replacing the base
+socket delegation clears its retained child controls. Ordinary endpoints keep
+their existing behavior, and no capability bytes cross the Linux wire ABI.
 Owned command replies are queued with that socket's port id and group0 only
 after actual terminal completion; multicast delivery remains independent.
 A wireless-only service obtains its reply with

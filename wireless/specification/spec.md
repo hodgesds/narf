@@ -927,6 +927,9 @@ driver registration supplies actual registration/device/current-request grants;
 the registry's observations mint no capability. `ControlWdev` carries a
 nonwrapping opaque registration identifier and namespace; `control_for`,
 `control_by_id` and `unregister_control` compare the exact original object/id.
+The stored physical-parent object must remain registered; retiring it also
+invalidates child lookup/discovery, pending control publication and identity
+observations. An orphan child is never promoted to a physical wiphy.
 Rebind with the same name/MAC/mode cannot revive an old observation or remove
 the successor. The control-id space is disjoint from existing netdev WDEV
 encoding; the existing nonnegative signed wiphy-index bound follows Linux
@@ -945,6 +948,18 @@ advertises no P2P role or native control operation.
 emits no IFINDEX attribute; retired IDs cannot select another object. WDEV-based
 physical-wiphy lookup resolves the same registered control object rather than
 interpreting its opaque identifier as a fabricated netdev index.
+
+`RadioControlAuthority::retain_control_child(child, actual_child_cap)` checks
+the registered physical-parent/child objects and namespace, then delegates
+inside net's actual parent/daemon/typed-parent/typed-child invocation. Only the
+exact creating source may retain the resulting fresh child Admin; there is no
+raw daemon-cap export, name-derived authority or wire capability. The grant
+retains parent and child registration/grant lifetimes and original parent
+ownership epoch. The control-only native P2P handlers may consult that source's
+previously explicitly retained child grants; ordinary netdev/legacy handlers
+retain their existing context behavior. A closed/rebound source, retired child
+or replaced/transferred/revoked parent cannot lend its administration to a
+successor. Kernel namespace administration keeps its existing scope.
 
 Drivers which can create firmware vdevs opt in through
 `supports_virtual_interfaces`, `new_virtual_interface(name, iftype, mac)`,

@@ -31,6 +31,7 @@ narf-filesystem   = { path = "../filesystem" }
 narf-block        = { path = "../block" }
 narf-drivers-fs-fat = { path = "../drivers/fs/fat" }
 narf-net          = { path = "../net" }
+narf-ipc          = { path = "../ipc", optional = true }
 narf-firmware     = { path = "../firmware" }
 narf-memory       = { path = "../memory" }
 narf-scheduler    = { path = "../scheduler" }
@@ -76,7 +77,7 @@ unix-latency-trace = []
 # `handlers::with_kernel_buffers` — the narrowly-scoped opt-in that lets a
 # test hand a kernel-half pointer to a syscall handler. Off (and therefore
 # a no-op, with no bypass code compiled at all) in every production build.
-kernel-test = ["narf-scheduler/kernel-test"]
+kernel-test = ["narf-scheduler/kernel-test", "dep:narf-ipc"]
 
 # Declared so `#[cfg(feature = "user-mode-e2e")]` in tests
 # don't trip the unexpected_cfgs lint. The frame crate's
