@@ -39,7 +39,9 @@ impl Owner {
             .as_mut()
             .and_then(|p| p.mlme.data.as_mut())
         {
-            d.aggregate.pop(now);
+            d.each_receiver(|_, aggregate| {
+                aggregate.pop(now);
+            });
         }
     }
     pub(in crate::iwlwifi) fn station_wpa2_supported(&self) -> bool {
@@ -85,6 +87,10 @@ impl Owner {
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::iwlwifi) async fn model_configure(&mut self) -> Result<(), &'static str> {
         self.configure([2; 6]).await
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(in crate::iwlwifi) fn model_receive_queue_count(&self) -> u8 {
+        self.hardware.receive_queue_count()
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(in crate::iwlwifi) fn model_retained(&self) -> (usize, usize, usize) {

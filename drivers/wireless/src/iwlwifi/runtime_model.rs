@@ -400,6 +400,7 @@ pub(in crate::iwlwifi) fn firmware_profile(
     }
     hardware.versions = parsed.api.commands.to_vec();
     hardware.shared_memory = smem::State::new(parsed);
+    hardware.receive_queues = rx_multi::State::new(parsed);
     Ok(())
 }
 
@@ -445,7 +446,7 @@ pub(in crate::iwlwifi) fn restart(hardware: &mut Hardware) -> Result<(), &'stati
     hardware.resources.commands = commands;
     hardware.platform_power = platform_power::State::default();
     hardware.shared_memory.reset();
-    hardware.receive_queues = rx_multi::State::default();
+    hardware.receive_queues.reset();
     // This is the fixture's terminal DMA-stop boundary. Retire observation
     // views before releasing any of the actual additional ring allocations.
     if let Some(trace) = &hardware.resources.commands.trace {

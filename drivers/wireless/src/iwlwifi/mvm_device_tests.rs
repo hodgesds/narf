@@ -10,6 +10,8 @@ use narf_wireless::reg::{db::Database, RegFlags, RegRule};
 mod active_scan_tests;
 #[path = "mvm_he_tests.rs"]
 mod he_tests;
+#[path = "mvm_rx_multi_tests.rs"]
+mod rx_multi_tests;
 #[path = "mvm_smem_tests.rs"]
 mod smem_tests;
 #[path = "mvm_tx_amsdu_tests.rs"]
@@ -143,6 +145,11 @@ fn ht_ies() -> Vec<u8> {
     out
 }
 struct Actor {
+    multi_receive: bool,
+    rx_configuration: Vec<rx_multi_tests::Receipt>,
+    rx_queues: Vec<model::ReceiveFirmware>,
+    hold_rx_queue: Option<u8>,
+    held_markers: Vec<(u8, Vec<u8>)>,
     ht: bool,
     he: bool,
     ba: bool,
@@ -313,8 +320,9 @@ impl Actor {
         if self.stopped {
             return Ok(false);
         }
-        let mut progress = false;
+        let mut progress = self.capture_receive_queues()?;
         for _ in 0..128 {
+            progress |= self.capture_receive_queues()?;
             let Some(p) = self.trace.take() else { break };
             progress = true;
             self.react(p)?;
@@ -383,6 +391,9 @@ impl Actor {
             let s = u16::from_le_bytes([p.bytes[2], p.bytes[3]]);
             let b = &p.bytes[8..];
             self.commands.push((g, c, b.to_vec()));
+            if self.multi_receive && self.receive_command(g, c, s, b)? {
+                return Ok(());
+            }
             if self.ba && g == 5 && c == 2 && b.get(12) == Some(&1) {
                 if b.len() != 24 || self.retiring_baid != Some(b[20]) {
                     return Err("DEL_BA fence without exact native removed BAID");
@@ -1143,6 +1154,34 @@ impl Harness {
         ml_baid_version: u8,
         he_enabled: bool,
     ) -> Result<Self, &'static str> {
+        Self::build_nvm_receive(
+            protected,
+            ht,
+            emission,
+            tlc_version,
+            ba,
+            ml_baid,
+            features,
+            wide_nvm,
+            ml_baid_version,
+            he_enabled,
+            false,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn build_nvm_receive(
+        protected: bool,
+        ht: bool,
+        emission: u8,
+        tlc_version: u8,
+        ba: bool,
+        ml_baid: bool,
+        features: u16,
+        wide_nvm: u8,
+        ml_baid_version: u8,
+        he_enabled: bool,
+        multi_receive: bool,
+    ) -> Result<Self, &'static str> {
         if CURRENT.lock().is_some() {
             return Err("MVM interface fixture already owned");
         }
@@ -1150,6 +1189,8 @@ impl Harness {
         let parsed = super::super::parse_ucode(&image).unwrap();
         let mut versions = parsed.api.commands.to_vec();
         versions.extend_from_slice(&[7, 5, 1, 0]);
+        // Real API77 reports capability68 and omits the fixed-layout
+        // RFH/RSS command entries. Native tests must exercise that default.
         if ba {
             versions.extend_from_slice(&[0xc2, 0, 0, 1, 0xc3, 0, 0, 1, 0xc5, 0, 0, 7]);
         }
@@ -1162,6 +1203,9 @@ impl Harness {
             }
         }
         tlv(&mut image, 48, &versions);
+        if multi_receive {
+            tlv(&mut image, 30, &[2, 0, 0, 0, 0x10, 0, 0, 0]);
+        }
         if ht {
             tlv(
                 &mut image,
@@ -1172,11 +1216,16 @@ impl Harness {
         let executable = asset("narf-test/mvm-interface/executable", &image, true)?;
         let parsed = super::super::parse_ucode(&executable.bytes).unwrap();
         let (mut hardware, firmware, trace) = model::station_model_for_format(CompletionFormat::Qu);
-        model::versions(&mut hardware, parsed.api.commands);
+        model::firmware_profile(&mut hardware, &parsed)?;
         let mut owner = Owner::model_after_alive(hardware, &executable.bytes);
         let mut security = super::super::mvm_boot::SecurityModel::new(3)?;
         security.ap = ap(protected)?;
         let mut actor = Actor {
+            multi_receive,
+            rx_configuration: Vec::new(),
+            rx_queues: Vec::new(),
+            hold_rx_queue: None,
+            held_markers: Vec::new(),
             ht,
             he: he_enabled,
             ba,

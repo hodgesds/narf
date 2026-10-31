@@ -52,6 +52,8 @@ pub(super) struct Prepared {
     pub(super) port_open: bool,
     pub(super) sequence: u16,
     pub(super) replay: frame_api::Replay,
+    pub(super) extra_rx: Vec<super::rx_multi::Queue>,
+    pub(super) receive_epoch: Option<u64>,
     pub(super) last_peer: u64,
     pub(super) aggregate: super::amsdu::Receiver,
     /// PMF receive owner (IGTKs, management PN) when `status.pmf`.
@@ -322,6 +324,11 @@ impl Owner {
         self.check_link_power(&policy()?)?;
         // Reserve before any MCC/control/queue publication. A dropped future
         // retains this phase and every uncertain DMA allocation in Hardware.
+        let receive_epoch = if self.hardware.receive_queue_count() > 1 {
+            Some(self.hardware.close_receive_epoch()?)
+        } else {
+            None
+        };
         self.power.prepared.as_mut().unwrap().mlme.data = Some(Prepared {
             status: association,
             queue: None,
@@ -330,6 +337,8 @@ impl Owner {
             port_open: false,
             sequence: 0,
             replay: frame_api::Replay::default(),
+            extra_rx: super::rx_multi::receivers(self.hardware.receive_queue_count())?,
+            receive_epoch,
             last_peer: narf_time::now_cycles(),
             aggregate: super::amsdu::Receiver::default(),
             pmf: super::pmf::PmfRx::default(),
@@ -451,6 +460,22 @@ impl Owner {
         self.check_link_power(&policy()?)?;
         if !self.hardware.idle_tx_binding(id, STATION, TID) {
             return Err("MVM data queue not idle/bound after preparation");
+        }
+        if self.hardware.receive_queue_count() > 1
+            && !self
+                .power
+                .prepared
+                .as_ref()
+                .unwrap()
+                .mlme
+                .data
+                .as_ref()
+                .unwrap()
+                .status
+                .protected
+        {
+            self.sync_security_rx(Some(policy)).await?;
+            self.commit_gen2_receive_epoch()?;
         }
         let data = self
             .power
@@ -745,7 +770,7 @@ impl Owner {
                 .data
                 .as_mut()
                 .unwrap();
-            if let Some(frame) = data.aggregate.pop(narf_time::now_cycles()) {
+            if let Some(frame) = data.pop_aggregate(narf_time::now_cycles()) {
                 data.last_peer = narf_time::now_cycles();
                 return Ok(Some(LegacyReceive::Ethernet(frame)));
             }
@@ -778,9 +803,9 @@ impl Owner {
         self.power.phy.ba.tick()?;
         for _ in 0..256 {
             self.check_link_power(&policy()?)?;
-            let (payload, released) =
-                if let Some(bytes) = self.power.phy.ba.pop() {
-                    (bytes, true)
+            let (payload, released, receive_queue, receive_epoch) =
+                if let Some((queue, epoch, bytes)) = self.power.phy.ba.pop() {
+                    (bytes, true, queue, epoch)
                 } else {
                     let Some(index) = self.hardware.notifications.iter().position(|p| {
                         p.header.group_id == 0 && matches!(p.header.cmd, 0xc1..=0xc3)
@@ -790,29 +815,40 @@ impl Owner {
                     let packet = self.hardware.notifications.remove(index).unwrap();
                     if packet.header.cmd != 0xc1 {
                         if self.ba_qualified() {
-                            self.power
-                                .phy
-                                .ba
-                                .release(packet.header.cmd, &packet.payload)?;
+                            self.power.phy.ba.release(
+                                packet.receive_queue,
+                                packet.header.cmd,
+                                &packet.payload,
+                            )?;
                         }
                         continue;
                     }
-                    (packet.payload, false)
+                    (
+                        packet.payload,
+                        false,
+                        packet.receive_queue,
+                        packet.receive_epoch,
+                    )
                 };
             let Some(mpdu) = scan_api::mpdu_gen2(&payload) else {
-                self.cancel_data_partial();
+                self.clear_data_queue(receive_queue, false);
                 continue;
             };
             let f = mpdu.frame;
+            if receive_queue >= self.hardware.receive_queue_count()
+                || receive_queue != 0 && (f.len() < 24 || f[0] & 12 != 8 || f[4] & 1 != 0)
+            {
+                continue;
+            }
             if self.receive_ba_bar(&mpdu, local, status.bssid, status.channel) {
                 continue;
             }
             if mpdu.channel != status.channel || f.len() < 24 || f[10..16] != status.bssid {
-                self.clear_data_aggregate();
+                self.clear_data_queue(receive_queue, true);
                 continue;
             }
             if self.receive_phy_action(&mpdu, local, status.bssid) {
-                self.clear_data_aggregate();
+                self.clear_data_queue(receive_queue, true);
                 continue;
             }
             let data = self
@@ -885,6 +921,20 @@ impl Owner {
             // with No Ack). mac80211 `__ieee80211_rx_h_amsdu` drops every
             // group-addressed A-MSDU (nested or not), so they stay closed.
             let group = f[4] & 1 != 0;
+            let eapol = mpdu
+                .body(header, if f[1] & 0x40 != 0 { 8 } else { 0 })
+                .is_some_and(|body| body.starts_with(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]));
+            if receive_queue != 0 && eapol {
+                continue;
+            }
+            if !eapol
+                && self.hardware.receive_queue_count() > 1
+                && (receive_epoch.is_none()
+                    || receive_epoch != data.receive_epoch
+                    || receive_epoch != self.hardware.receive_capture_epoch())
+            {
+                continue;
+            }
             if !matches!(f[0], 8 | 0x88)
                 || qos && phy.is_none()
                 || f[1] & 7 != 2
@@ -919,7 +969,7 @@ impl Owner {
                     .body(header, if f[1] & 0x40 != 0 { 8 } else { 0 })
                     .is_none_or(|b| !(8..=1508).contains(&b.len()))
             {
-                self.clear_data_aggregate();
+                self.clear_data_queue(receive_queue, true);
                 continue;
             }
             let encrypted = f[1] & 0x40 != 0;
@@ -931,18 +981,21 @@ impl Owner {
                     || !self.security.has_pairwise()
                     || mpdu.status & (0x1f000000 | 0xf4c) != 0xa4c
                 {
-                    self.clear_data_aggregate();
+                    self.clear_data_queue(receive_queue, true);
                     continue;
                 }
             } else if mpdu.status & 0xf40 != 0 {
-                self.clear_data_aggregate();
+                self.clear_data_queue(receive_queue, true);
                 continue;
             }
             if mpdu.reorder & 0x7f000000 != 0x7f000000 && !released && !group {
                 // Retain the original native packet BEFORE any host replay
                 // update or deaggregation. Released bytes traverse these same
                 // current identity/PHY/crypto checks again, then PN in order.
-                self.power.phy.ba.observe(&payload, local)?;
+                self.power
+                    .phy
+                    .ba
+                    .observe(receive_queue, receive_epoch, &payload, local)?;
                 continue;
             }
             let data = self
@@ -961,12 +1014,15 @@ impl Owner {
             } else {
                 u16::from_le_bytes([payload[10], payload[11]])
             };
-            let Some(ethernet) = data.aggregate.observe(
+            let Some((replay, aggregate)) = data.receiver(receive_queue) else {
+                return Err("MVM native physical replay owner absent");
+            };
+            let Some(ethernet) = aggregate.observe(
                 &mpdu,
                 local,
                 status.bssid,
                 status.protected,
-                &mut data.replay,
+                replay,
                 narf_time::now_cycles(),
             ) else {
                 continue;
@@ -1045,7 +1101,10 @@ impl Owner {
             .unwrap();
         let queue = data.queue.ok_or("MVM data close queue missing")?;
         data.port_open = false;
-        data.aggregate.clear();
+        data.each_receiver(|_, aggregate| aggregate.clear());
+        if self.hardware.receive_queue_count() > 1 {
+            data.receive_epoch = Some(self.hardware.close_receive_epoch()?);
+        }
         self.power.phy.actions.clear();
         self.phase = Phase::ClosingData;
         let result = async {
@@ -1103,7 +1162,7 @@ impl Owner {
             .as_mut()
             .and_then(|p| p.mlme.data.as_mut())
         {
-            data.aggregate.clear();
+            data.each_receiver(|_, aggregate| aggregate.clear());
         }
     }
     pub(super) fn cancel_data_partial(&mut self) {
@@ -1114,7 +1173,24 @@ impl Owner {
             .as_mut()
             .and_then(|p| p.mlme.data.as_mut())
         {
-            data.aggregate.cancel_pending();
+            data.each_receiver(|_, aggregate| aggregate.cancel_pending());
+        }
+    }
+    fn clear_data_queue(&mut self, queue: u8, ready: bool) {
+        self.power.phy.ba.cancel_queue(queue);
+        if let Some(data) = self
+            .power
+            .prepared
+            .as_mut()
+            .and_then(|p| p.mlme.data.as_mut())
+        {
+            if let Some((_, aggregate)) = data.receiver(queue) {
+                if ready {
+                    aggregate.clear();
+                } else {
+                    aggregate.cancel_pending();
+                }
+            }
         }
     }
 }

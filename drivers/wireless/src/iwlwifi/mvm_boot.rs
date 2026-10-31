@@ -143,8 +143,9 @@ impl Owner {
             .command(1, 0x9b, &defaults.coexistence)
             .await?;
         self.hardware.command(2, 1, &defaults.soc).await?;
-        // Queue0 is already described by context-v1. Additional RX queues/RSS and
-        // their PRPH allocations remain disabled in this single-queue boot profile.
+        // Context-v1 owns fallback0. Additional physical RFH rings/RSS
+        // require their exact reported v1 contracts and retained receipts.
+        self.hardware.prepare_receive_queues().await?;
         self.hardware.command(1, 0x77, &[0; 4]).await?;
         // DQA/LAR and the idle station MAC are owned by the scan preparation
         // transaction. SCAN_CFG is sent there after those prerequisites.
@@ -273,3 +274,6 @@ mod station;
 #[cfg(any(test, feature = "kernel-test"))]
 pub(super) use rsna::tests::Device as SecurityModel;
 pub(in crate::iwlwifi) use station::Credential;
+
+#[path = "mvm_rx_multi.rs"]
+mod rx_multi;

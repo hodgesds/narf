@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! Draft RFH_QUEUE_CONFIG v1 and RSS_CONFIG v1 codecs, not yet wired.
+//! Retained RFH_QUEUE_CONFIG v1 and RSS_CONFIG v1 wire contracts.
 //! Linux fw/init.c::iwl_configure_rxq and mld/fw.c::iwl_mld_send_rss_cfg_cmd.
 //! Callers must retain every DMA allocation through terminal stop proof;
 //! these wire bytes supply no PCI, firmware or receive-epoch authority.
@@ -69,9 +69,23 @@ pub(super) struct Prefix {
     cookie: u32,
     waiting: u16,
     baid: Option<u8>,
+    sync: bool,
 }
 impl Prefix {
     pub fn new(queues: u8, cookie: u32, baid: Option<u8>) -> Result<Self, &'static str> {
+        Self::with_sync(queues, cookie, baid, false)
+    }
+    /// MVM's internal notification contains sync1; MLD uses sync0.
+    /// The profile is a firmware wire fact, not receive/RF authority.
+    pub fn gen2(queues: u8, cookie: u32, baid: Option<u8>) -> Result<Self, &'static str> {
+        Self::with_sync(queues, cookie, baid, true)
+    }
+    fn with_sync(
+        queues: u8,
+        cookie: u32,
+        baid: Option<u8>,
+        sync: bool,
+    ) -> Result<Self, &'static str> {
         if !(1..=16).contains(&queues) || cookie == 0 || baid.is_some_and(|id| id >= 32) {
             return Err("native RFH prefix identity or queue count");
         }
@@ -79,6 +93,7 @@ impl Prefix {
             cookie,
             waiting: ((1u32 << queues) - 1) as u16,
             baid,
+            sync,
         })
     }
     pub fn mask(&self) -> u16 {
@@ -88,7 +103,17 @@ impl Prefix {
         let count = if self.baid.is_some() { 12 } else { 8 };
         if queue >= 16
             || body.len() != count + 4
-            || body[..8] != [count as u8, 0, 0, 0, u8::from(self.baid.is_some()), 0, 0, 0]
+            || body[..8]
+                != [
+                    count as u8,
+                    0,
+                    0,
+                    0,
+                    u8::from(self.baid.is_some()),
+                    0,
+                    u8::from(self.sync),
+                    0,
+                ]
         {
             return Err("native all-RFH marker queue or wire extent/type");
         }

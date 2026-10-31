@@ -104,6 +104,27 @@ impl Hardware {
         self.rx_epoch.open.store(true, Ordering::Release);
         Ok(())
     }
+    /// Called only by MVM's retained all-owned-ring sync1 receiver after
+    /// every physical queue matched the current cookie/type/BAID contract.
+    /// It records the closed copy epoch; opening still invokes the actual
+    /// source owner and cannot adopt packets copied while closed.
+    pub(in crate::iwlwifi) fn confirm_gen2_receive_prefix(
+        &mut self,
+        epoch: u64,
+    ) -> Result<(), &'static str> {
+        self.source_fence()?.invoke(|| Ok(()))?;
+        if self.failed
+            || self.format != rx_rfh::CompletionFormat::Qu
+            || self.receive_queue_count() <= 1
+            || self.rx_epoch.pending.is_some()
+            || self.rx_epoch.open.load(Ordering::Acquire)
+            || self.rx_epoch.generation.load(Ordering::Acquire) != epoch
+        {
+            return Err("MVM all-RFH proof differs from closed native epoch");
+        }
+        self.rx_epoch.proved = Some(epoch);
+        Ok(())
+    }
     /// MLD EMPTY (type0) is an ordered all-owned-RFH prefix proof, not a
     /// temporarily empty descriptor ring or a key-command acknowledgement.
     pub(in crate::iwlwifi) async fn synchronize_receive_epoch(

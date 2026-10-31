@@ -478,6 +478,7 @@ impl Owner {
             key_api,
             first_keys: true,
         });
+        self.close_gen2_receive_epoch()?;
         self.phase = Phase::SecuringData;
         let result = async {
             self.fresh_data_policy(&mut policy).await?;
@@ -523,6 +524,7 @@ impl Owner {
             .unwrap()
             .port_open = false;
         self.clear_data_aggregate();
+        self.close_gen2_receive_epoch()?;
         self.phase = Phase::SecuringData;
         let result = self.security_loop(&mut nonce, &mut policy).await;
         self.finish_security(result)
@@ -531,6 +533,9 @@ impl Owner {
     fn finish_security(&mut self, result: Result<(), &'static str>) -> Result<(), &'static str> {
         match result {
             Ok(()) => {
+                if let Err(reason) = self.commit_gen2_receive_epoch() {
+                    return self.data_failed(reason);
+                }
                 self.power
                     .prepared
                     .as_mut()
@@ -621,6 +626,12 @@ impl Owner {
                 // close or EAPOL challenge. Drain those before port commit.
                 self.receive_data_inner(policy)?;
                 if self.security.active.as_ref().unwrap().incoming.is_empty() {
+                    // A duplicate authenticated exchange may change no keys.
+                    // Its closed copy epoch still needs an all-ring prefix
+                    // before reopening; no key reinstall substitutes for it.
+                    if self.hardware.receive_queue_count() > 1 {
+                        self.sync_security_rx(Some(policy)).await?;
+                    }
                     self.check_link_power(&policy()?)?;
                     return Ok(());
                 }
@@ -808,7 +819,7 @@ impl Owner {
     }
 
     /// Snapshot only already-committed PN floors before native retirement.
-    /// The ledger remains non-reusable until the later single-RFH marker.
+    /// The ledger remains non-reusable until every owned RFH queue's marker.
     fn snapshot_key_history(&mut self, slot: usize) -> Result<usize, &'static str> {
         let key = self.security.active.as_ref().unwrap().keys[slot]
             .as_ref()
@@ -837,7 +848,7 @@ impl Owner {
         let floor = if key.group {
             data.replay.group[usize::from(key.id)]
         } else {
-            data.replay.pairwise
+            data.pairwise_floors()
         };
         let used = if key.group {
             0
@@ -988,12 +999,14 @@ impl Owner {
                 data.replay.group[usize::from(key.id)].fill(key.rsc);
                 data.replay.group_valid[usize::from(key.id)] = true;
             } else if let Some(floors) = key.restored {
-                data.replay.reset_pairwise();
-                data.replay.pairwise = floors;
+                data.each_receiver(|replay, _| {
+                    replay.reset_pairwise();
+                    replay.pairwise = floors;
+                });
                 // The AP's single per-key PN also bounds robust management.
                 data.pmf.mgmt_pn = floors.iter().copied().max().unwrap_or(0);
             } else {
-                data.replay.reset_pairwise();
+                data.each_receiver(|replay, _| replay.reset_pairwise());
                 data.pmf.mgmt_pn = 0;
             }
         }
@@ -1198,8 +1211,13 @@ impl Owner {
             .checked_add(1)
             .ok_or("MVM RX key epoch exhausted")?;
         let cookie = self.security.cookie;
+        let mut prefix = super::super::rx_multi::Prefix::gen2(
+            self.hardware.receive_queue_count(),
+            cookie,
+            baid,
+        )?;
         let mut body = alloc::vec![0; if baid.is_some(){24}else{20}];
-        put32(&mut body, 4, 1);
+        put32(&mut body, 4, u32::from(prefix.mask()));
         put32(&mut body, 8, if baid.is_some() { 12 } else { 8 });
         put16(&mut body, 12, u16::from(baid.is_some()));
         put16(&mut body, 14, 1);
@@ -1227,6 +1245,7 @@ impl Owner {
             self.hardware.poll()?;
             while let Some(packet) = self.hardware.notifications.pop_front() {
                 if bound.is_some()
+                    && packet.receive_queue == 0
                     && packet.header.group_id == 0
                     && packet.header.cmd == 0xc1
                     && super::super::scan_api::mpdu_gen2(&packet.payload).is_some_and(|mpdu| {
@@ -1242,26 +1261,24 @@ impl Owner {
                 {
                     return Err("MVM AP disconnected during native RX key epoch");
                 }
-                if packet.header.group_id == 5 && packet.header.cmd == 0xff {
-                    let bytes = packet.payload;
-                    let prefix = if baid.is_some() {
-                        [12, 0, 0, 0, 1, 0, 1, 0]
-                    } else {
-                        [8, 0, 0, 0, 0, 0, 1, 0]
-                    };
-                    let expected_length = if baid.is_some() { 16 } else { 12 };
-                    if bytes.len() != expected_length
-                        || bytes[..8] != prefix
-                        || baid.is_some_and(|id| bytes[12..16] != u32::from(id).to_le_bytes())
-                    {
-                        return Err("MVM RX key epoch marker malformed");
+                if packet.header.group_id == 5
+                    && packet.header.cmd == 0xff
+                    && prefix.observe(packet.receive_queue, &packet.payload)?
+                {
+                    if baid.is_none() && self.hardware.receive_queue_count() > 1 {
+                        let epoch = self
+                            .power
+                            .prepared
+                            .as_ref()
+                            .and_then(|p| p.mlme.data.as_ref())
+                            .and_then(|d| d.receive_epoch)
+                            .ok_or("MVM all-RFH proof lost its closed epoch")?;
+                        self.hardware.confirm_gen2_receive_prefix(epoch)?;
                     }
-                    if u32::from_le_bytes(bytes[8..12].try_into().unwrap()) == cookie {
-                        return Ok(());
-                    }
+                    return Ok(());
                 }
-                // Every earlier packet belongs to the retired RX epoch. The
-                // single owned RX queue's matching marker orders that prefix.
+                // Closed prefix copies from every owned physical ring are
+                // discarded without changing any queue's replay state.
             }
             if deadline.expired() {
                 return Err("MVM RX key epoch marker timeout");

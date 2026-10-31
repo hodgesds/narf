@@ -3,6 +3,9 @@
 use super::*;
 
 fn setup() -> R<Guard> {
+    setup_profile(ReceiveModel::ExplicitV1)
+}
+fn setup_profile(profile: ReceiveModel) -> R<Guard> {
     let phy = PhyModel {
         width: 0,
         streams: 1,
@@ -10,7 +13,7 @@ fn setup() -> R<Guard> {
         mcc_he: false,
         response_he: false,
     };
-    Guard::build_receive(true, Fault::None, None, None, Some(phy), true)
+    Guard::build_features(true, Fault::None, None, None, Some(phy), profile, None)
 }
 fn ready(guard: &Guard) -> R {
     scan(guard.device())?;
@@ -126,38 +129,40 @@ fn release_markers() -> R {
 }
 fn smoke_sc_rss_native_three_queues_keep_pairwise_pn_and_fallback_control_separate() -> TestResult {
     check(|| {
-        let guard = setup()?;
-        ready(&guard)?;
-        let lease = narf_net::dhcp::dhcp_acquire(guard.device().name(), 0)
-            .map_err(|_| "Sc RSS actual kernel DORA")?;
-        require(NETWORK.matches_lease(&lease), "Sc RSS DHCP lease terms")?;
-        for (queue, sn, pn, marker, accept) in [
-            (1, 10, 100, 1, true),
-            (2, 20, 5, 2, true),
-            (2, 21, 5, 3, false),
-            (1, 11, 99, 4, false),
-            (2, 22, 6, 5, true),
-        ] {
-            let frame = ethernet(marker);
-            inject(queue, 0xc1, 0, &payload(&frame, sn, 0, pn, 127))?;
+        for profile in [ReceiveModel::ExplicitV1, ReceiveModel::NativeSc] {
+            let guard = setup_profile(profile)?;
+            ready(&guard)?;
+            let lease = narf_net::dhcp::dhcp_acquire(guard.device().name(), 0)
+                .map_err(|_| "Sc RSS actual kernel DORA")?;
+            require(NETWORK.matches_lease(&lease), "Sc RSS DHCP lease terms")?;
+            for (queue, sn, pn, marker, accept) in [
+                (1, 10, 100, 1, true),
+                (2, 20, 5, 2, true),
+                (2, 21, 5, 3, false),
+                (1, 11, 99, 4, false),
+                (2, 22, 6, 5, true),
+            ] {
+                let frame = ethernet(marker);
+                inject(queue, 0xc1, 0, &payload(&frame, sn, 0, pn, 127))?;
+                flush()?;
+                require(
+                    seen(&frame) == accept,
+                    "Sc RSS cross-queue or same-queue PN admission",
+                )?;
+            }
+            let mut eapol = ethernet(6);
+            eapol[12..14].copy_from_slice(&[0x88, 0x8e]);
+            inject(1, 0xc1, 0, &payload(&eapol, 12, 0, 1000, 127))?;
+            let fresh = ethernet(7);
+            inject(1, 0xc1, 0, &payload(&fresh, 13, 0, 101, 127))?;
             flush()?;
             require(
-                seen(&frame) == accept,
-                "Sc RSS cross-queue or same-queue PN admission",
+                !seen(&eapol) && seen(&fresh),
+                "Sc RSS misplaced EAPOL poisoned native PN",
             )?;
+            carrier(guard.device(), true)?;
+            run(guard.device().disassociate(), service)?.map_err(|_| "Sc RSS native teardown")?;
         }
-        let mut eapol = ethernet(6);
-        eapol[12..14].copy_from_slice(&[0x88, 0x8e]);
-        inject(1, 0xc1, 0, &payload(&eapol, 12, 0, 1000, 127))?;
-        let fresh = ethernet(7);
-        inject(1, 0xc1, 0, &payload(&fresh, 13, 0, 101, 127))?;
-        flush()?;
-        require(
-            !seen(&eapol) && seen(&fresh),
-            "Sc RSS misplaced EAPOL poisoned native PN",
-        )?;
-        carrier(guard.device(), true)?;
-        run(guard.device().disassociate(), service)?.map_err(|_| "Sc RSS native teardown")?;
         Ok(())
     })
 }
@@ -345,12 +350,14 @@ kernel_test_in!(
     smoke_sc_rss_native_baid_windows_are_per_ring_and_retire_after_all_prefixes
 );
 
-fn inputs() -> R<(crate::firmware_asset::Asset, crate::firmware_asset::Asset)> {
+fn inputs(
+    profile: ReceiveModel,
+) -> R<(crate::firmware_asset::Asset, crate::firmware_asset::Asset)> {
     let (write, read) = narf_firmware::bootstrap_authority();
     let mut bytes = super::super::super::firmware_parser_tests::mld_image();
     let mut table = super::super::super::firmware_parser_tests::mld_commands();
     he_tests::versions(&mut table, 2);
-    table.extend_from_slice(&[0x0d, 5, 1, 0, 0xb3, 0, 1, 0]);
+    profile.commands(&mut table);
     require(
         word(&bytes, 88) == 48,
         "Sc RSS authored executable table tag",
@@ -358,6 +365,7 @@ fn inputs() -> R<(crate::firmware_asset::Asset, crate::firmware_asset::Asset)> {
     let old = word(&bytes, 92) as usize;
     bytes.splice(96..96 + old.next_multiple_of(4), table.iter().copied());
     bytes[92..96].copy_from_slice(&(table.len() as u32).to_le_bytes());
+    profile.capability(&mut bytes);
     for (name, payload) in [
         ("narf-test/iwl-rss/executable", bytes.as_slice()),
         ("narf-test/iwl-rss/pnvm", &[0x35u8; 32][..]),
@@ -379,73 +387,177 @@ fn inputs() -> R<(crate::firmware_asset::Asset, crate::firmware_asset::Asset)> {
 }
 fn smoke_sc_rss_native_dropped_waiter_and_revoked_config_receipt_pin_every_ring() -> TestResult {
     check(|| {
-        let (executable, pnvm) = inputs()?;
-        let phy = PhyModel {
-            width: 0,
-            streams: 1,
-            rates: 2,
-            mcc_he: false,
-            response_he: false,
-        };
-        let guard = Guard::build_receive(
-            true,
-            Fault::HoldRfh,
-            None,
-            Some((&executable, &pnvm)),
-            Some(phy),
-            true,
-        )?;
-        scan(guard.device())?;
-        let domain = he_tests::policy();
-        let mut waiter = Box::pin(guard.device().associate_in_domain(request(true), &domain));
-        let mut cx = Context::from_waker(Waker::noop());
-        progress_until(|| {
-            require(
-                waiter.as_mut().poll(&mut cx).is_pending(),
-                "Sc RSS escaped held RFH config",
+        for profile in [ReceiveModel::ExplicitV1, ReceiveModel::NativeSc] {
+            let (executable, pnvm) = inputs(profile)?;
+            let phy = PhyModel {
+                width: 0,
+                streams: 1,
+                rates: 2,
+                mcc_he: false,
+                response_he: false,
+            };
+            let guard = Guard::build_features(
+                true,
+                Fault::HoldRfh,
+                None,
+                Some((&executable, &pnvm)),
+                Some(phy),
+                profile,
+                None,
             )?;
-            Ok(HARNESS.lock().as_ref().unwrap().1.held.is_some())
-        })?;
-        drop(waiter);
-        executable.cap.revoke();
-        {
-            let mut slot = HARNESS.lock();
-            let wire = &mut slot.as_mut().unwrap().1;
-            let (cmd, group, sequence) = wire.held.take().ok_or("Sc held RFH config missing")?;
+            scan(guard.device())?;
+            let domain = he_tests::policy();
+            let mut waiter = Box::pin(guard.device().associate_in_domain(request(true), &domain));
+            let mut cx = Context::from_waker(Waker::noop());
+            progress_until(|| {
+                require(
+                    waiter.as_mut().poll(&mut cx).is_pending(),
+                    "Sc RSS escaped held RFH config",
+                )?;
+                Ok(HARNESS.lock().as_ref().unwrap().1.held.is_some())
+            })?;
+            drop(waiter);
+            executable.cap.revoke();
+            {
+                let mut slot = HARNESS.lock();
+                let wire = &mut slot.as_mut().unwrap().1;
+                let (cmd, group, sequence) =
+                    wire.held.take().ok_or("Sc held RFH config missing")?;
+                require(
+                    (group, cmd) == (5, 0x0d),
+                    "Sc RSS held another native command",
+                )?;
+                wire.fault = Fault::None;
+                wire.firmware.inject(cmd, group, sequence, &[]);
+            }
+            terminal(&guard)?;
+            carrier(guard.device(), false)?;
+            let safe = {
+                let slot = HARNESS.lock();
+                let wire = &slot.as_ref().unwrap().1;
+                !wire.m4
+                    && wire.keys == 0
+                    && wire.data.is_empty()
+                    && !wire.commands.iter().any(|(g, c, _)| (*g, *c) == (0, 0xb3))
+            };
+            let state = guard
+                .device()
+                .state
+                .try_lock()
+                .ok_or("Sc RSS failed owner retained state")?;
             require(
-                (group, cmd) == (5, 0x0d),
-                "Sc RSS held another native command",
+                safe && state.needs_reset
+                    && state.hardware.is_failed()
+                    && state.hardware.receive_queue_count() == 3
+                    && state.hardware.receive_capture_epoch().is_none()
+                    && model::retained(&state.hardware).0 != 0,
+                "Sc RSS source loss released uncertain rings or programmed RSS/keys",
             )?;
-            wire.fault = Fault::None;
-            wire.firmware.inject(cmd, group, sequence, &[]);
         }
-        terminal(&guard)?;
-        carrier(guard.device(), false)?;
-        let safe = {
-            let slot = HARNESS.lock();
-            let wire = &slot.as_ref().unwrap().1;
-            !wire.m4
-                && wire.keys == 0
-                && wire.data.is_empty()
-                && !wire.commands.iter().any(|(g, c, _)| (*g, *c) == (0, 0xb3))
-        };
-        let state = guard
-            .device()
-            .state
-            .try_lock()
-            .ok_or("Sc RSS failed owner retained state")?;
-        require(
-            safe && state.needs_reset
-                && state.hardware.is_failed()
-                && state.hardware.receive_queue_count() == 3
-                && state.hardware.receive_capture_epoch().is_none()
-                && model::retained(&state.hardware).0 != 0,
-            "Sc RSS source loss released uncertain rings or programmed RSS/keys",
-        )?;
         Ok(())
     })
 }
 kernel_test_in!(
     "drivers/wireless/iwlwifi/sc/rx_queues",
     smoke_sc_rss_native_dropped_waiter_and_revoked_config_receipt_pin_every_ring
+);
+
+fn smoke_sc_rss_native_actual_profile_unknown_version_and_malformed_receipt_stay_bounded(
+) -> TestResult {
+    check(|| {
+        {
+            let guard = setup_profile(ReceiveModel::Unsupported)?;
+            scan(guard.device())?;
+            run(
+                guard
+                    .device()
+                    .associate_in_domain(request(true), &he_tests::policy()),
+                service,
+            )?
+            .map_err(|_| "Sc unknown RX optimization blocked actual station")?;
+            carrier(guard.device(), true)?;
+            let single = {
+                let state = guard
+                    .device()
+                    .state
+                    .try_lock()
+                    .ok_or("Sc unknown RX retained state")?;
+                state.hardware.receive_queue_count() == 1
+            };
+            let quiet = {
+                let slot = HARNESS.lock();
+                !slot
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .commands
+                    .iter()
+                    .any(|(g, c, _)| matches!((*g, *c), (5, 0x0d) | (0, 0xb3)))
+            };
+            require(
+                single && quiet,
+                "Sc unsupported RX version published assumed RFH/RSS geometry",
+            )?;
+            run(guard.device().disassociate(), service)?
+                .map_err(|_| "Sc unknown RX profile teardown")?;
+        }
+        for profile in [ReceiveModel::ExplicitV1, ReceiveModel::NativeSc] {
+            let phy = PhyModel {
+                width: 0,
+                streams: 1,
+                rates: 2,
+                mcc_he: false,
+                response_he: false,
+            };
+            let guard = Guard::build_features(
+                true,
+                Fault::MalformedRfh,
+                None,
+                None,
+                Some(phy),
+                profile,
+                None,
+            )?;
+            scan(guard.device())?;
+            require(
+                run(
+                    guard
+                        .device()
+                        .associate_in_domain(request(true), &he_tests::policy()),
+                    service,
+                )?
+                .is_err(),
+                "Sc malformed actual RFH receipt enabled station",
+            )?;
+            terminal(&guard)?;
+            carrier(guard.device(), false)?;
+            let safe = {
+                let state = guard
+                    .device()
+                    .state
+                    .try_lock()
+                    .ok_or("Sc malformed RFH retained state")?;
+                state.needs_reset
+                    && state.hardware.is_failed()
+                    && state.hardware.receive_queue_count() == 3
+            };
+            let stopped = {
+                let slot = HARNESS.lock();
+                let wire = &slot.as_ref().unwrap().1;
+                !wire.m4
+                    && wire.keys == 0
+                    && wire.data.is_empty()
+                    && !wire.commands.iter().any(|(g, c, _)| (*g, *c) == (0, 0xb3))
+            };
+            require(
+                safe && stopped,
+                "Sc malformed RFH freed published rings or continued to RSS/keys",
+            )?;
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/sc/rx_queues",
+    smoke_sc_rss_native_actual_profile_unknown_version_and_malformed_receipt_stay_bounded
 );

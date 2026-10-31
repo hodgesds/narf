@@ -740,7 +740,7 @@ impl Hardware {
             station_stop: None,
             protected_tx: 0,
             rx_epoch: rx_epoch::State::default(),
-            receive_queues: rx_multi::State::default(),
+            receive_queues: rx_multi::State::new(parsed),
             sources: None,
             rf_policy: None,
         })
@@ -1535,7 +1535,7 @@ impl Hardware {
         self.resources = core::mem::ManuallyDrop::new(resources);
         self.platform_power = platform_power::State::default();
         self.shared_memory = smem::State::new(parsed);
-        self.receive_queues = rx_multi::State::default();
+        self.receive_queues = rx_multi::State::new(parsed);
         self.rx_epoch.reset_after_dma_stop();
         self.armed = false;
         self.failed = false;

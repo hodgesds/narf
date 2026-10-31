@@ -17,6 +17,20 @@ enum Phase {
 pub(super) struct State {
     phase: Phase,
     _key: Option<Zeroizing<[u8; 40]>>,
+    mq_api: bool,
+}
+impl State {
+    pub(super) fn new(parsed: &ParsedUcode<'_>) -> Self {
+        Self {
+            mq_api: parsed.api.has_capability(68),
+            ..Self::default()
+        }
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn reset(&mut self) {
+        self.phase = Phase::Idle;
+        self._key = None;
+    }
 }
 impl Hardware {
     pub(in crate::iwlwifi) fn receive_queue_count(&self) -> u8 {
@@ -36,9 +50,29 @@ impl Hardware {
             }
             Phase::Idle => {}
         }
-        if self.format == rx_rfh::CompletionFormat::Qu
-            || self.version(5, 0x0d).map(|v| v.0) != Some(1)
-            || self.version(0, 0xb3).map(|v| v.0) != Some(1)
+        let rfh = self.version(5, 0x0d).map(|v| v.0);
+        let rss = self.version(0, 0xb3).map(|v| v.0);
+        // Linux fw/init.c and mvm/mld fw.c send these fixed structs
+        // without version lookups. Shipped Qu/API77 omits both entries;
+        // Sc/c103 reports RFH2 and omits RSS. The actual capability68
+        // supplies the new-RX protocol fact when inventory is omitted.
+        let declared = self.receive_queues.mq_api
+            || self.format != rx_rfh::CompletionFormat::Qu && rfh == Some(1) && rss == Some(1);
+        let rfh_compatible = match rfh {
+            None | Some(99) => self.receive_queues.mq_api,
+            Some(1) => true,
+            Some(2) => self.format == rx_rfh::CompletionFormat::Bz,
+            _ => false,
+        };
+        let rss_compatible = match rss {
+            None | Some(99) => self.receive_queues.mq_api,
+            Some(1) => true,
+            _ => false,
+        };
+        if !declared
+            || !rfh_compatible
+            || !rss_compatible
+            || self.format == rx_rfh::CompletionFormat::Qu && !self.receive_queues.mq_api
         {
             self.receive_queues.phase = Phase::Unsupported;
             return Ok(());

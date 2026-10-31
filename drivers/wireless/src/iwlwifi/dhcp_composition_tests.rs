@@ -75,6 +75,7 @@ enum Fault {
     WrongSaeSelector,
     HoldHe,
     HoldRfh,
+    MalformedRfh,
     HoldSmem,
     HoldData,
 }
@@ -105,6 +106,44 @@ impl PhyModel {
     }
 }
 
+/// Actual reported/default receive contracts are authored into firmware
+/// metadata; no production cache/admission field is supplied separately.
+#[derive(Clone, Copy)]
+enum ReceiveModel {
+    Single,
+    ExplicitV1,
+    NativeSc,
+    Unsupported,
+}
+impl From<bool> for ReceiveModel {
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::ExplicitV1
+        } else {
+            Self::Single
+        }
+    }
+}
+impl ReceiveModel {
+    fn commands(self, versions: &mut Vec<u8>) {
+        match self {
+            Self::Single => {}
+            Self::ExplicitV1 => versions.extend_from_slice(&[0x0d, 5, 1, 0, 0xb3, 0, 1, 0]),
+            Self::NativeSc => versions.extend_from_slice(&[0x0d, 5, 2, 0]),
+            Self::Unsupported => versions.extend_from_slice(&[0x0d, 5, 3, 0]),
+        }
+    }
+    fn capability(self, image: &mut Vec<u8>) {
+        if matches!(self, Self::NativeSc | Self::Unsupported) {
+            image.extend_from_slice(&30u32.to_le_bytes());
+            image.extend_from_slice(&8u32.to_le_bytes());
+            image.extend_from_slice(&[2, 0, 0, 0, 0x10, 0, 0, 0]);
+        }
+    }
+    fn enabled(self) -> bool {
+        matches!(self, Self::ExplicitV1 | Self::NativeSc)
+    }
+}
 /// Test-authored firmware capability TLVs and the literal native SMEM
 /// response. Production cache fields are populated only by parsing/receipts.
 #[derive(Clone)]
@@ -558,6 +597,9 @@ impl Wire {
         if (group, cmd) == (1, 0xd) && self.fault == Fault::HoldScan {
             self.held = Some((cmd, group, sequence));
             return Ok(());
+        }
+        if (group, cmd) == (5, 0x0d) && self.fault == Fault::MalformedRfh {
+            response.push(1);
         }
         self.firmware
             .inject(cmd, if group == 1 { 0 } else { group }, sequence, &response);
@@ -1016,9 +1058,11 @@ impl Guard {
         name: Option<&'static str>,
         sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
         phy: Option<PhyModel>,
-        multi_receive: bool,
+        receive_model: impl Into<ReceiveModel>,
         tx_model: Option<TxModel>,
     ) -> R<Self> {
+        let receive_model = receive_model.into();
+        let multi_receive = receive_model.enabled();
         require(
             ACTIVE.lock().is_none()
                 && narf_net::iface::lookup(super::super::iwl_ifname()).is_none()
@@ -1029,14 +1073,13 @@ impl Guard {
         if let Some(phy) = phy {
             he_tests::versions(&mut versions, phy.rates);
         }
-        if multi_receive {
-            versions.extend_from_slice(&[0x0d, 5, 1, 0, 0xb3, 0, 1, 0]);
-        }
+        receive_model.commands(&mut versions);
         if let Some(tx) = &tx_model {
             versions.extend_from_slice(&[0, 2, 0, tx.version]);
         }
         let (mut hardware, firmware, trace) = model::station_model();
-        let authored = tx_amsdu_tests::image(&versions, tx_model.as_ref())?;
+        let mut authored = tx_amsdu_tests::image(&versions, tx_model.as_ref())?;
+        receive_model.capability(&mut authored);
         let parsed = super::super::parse_ucode(&authored)
             .map_err(|_| "Sc fixture firmware metadata parse")?;
         model::firmware_profile(&mut hardware, &parsed)?;
