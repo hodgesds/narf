@@ -273,7 +273,11 @@ pub(super) async fn wait<F: core::future::Future<Output = Result<(), Error>>>(
             let domain = environment
                 .domain()
                 .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
-            if base.permission(&domain, 1).map_err(Error::Power)? != permission {
+            if base
+                .permission(&domain, permission.channel())
+                .map_err(Error::Power)?
+                != permission
+            {
                 return Err(Error::State);
             }
             if let Some(ht) = &ht {
