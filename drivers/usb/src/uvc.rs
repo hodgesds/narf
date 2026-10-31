@@ -1540,6 +1540,67 @@ pub fn __reset_uvc_for_test() {
     UVC_DEVICES.lock().clear();
 }
 
+/// Detach half of UVC bind for one slot: drop every `UVC_DEVICES`
+/// entry bound to `slot_id` and unregister each entry's
+/// `/dev/video<N>` node, so a replug re-binds from scratch and a
+/// stale node can never STREAMON against a slot id the dispatcher
+/// has since handed to another device.
+///
+/// Panic-free and idempotent by the #893 hook contract: no indexing
+/// and no fallible unwraps on any path, and detaching a slot with no
+/// UVC binding (or detaching twice) is a silent no-op. The capture
+/// pump needs no explicit kill: the stop flag is set before removal,
+/// and a pump that wakes after removal exits on its own — its
+/// `take_pump_exit_request` sees the entry gone (or a different
+/// device's generation at the reused index), its next
+/// `get_device(video_node)` finds the unregistered node, and its
+/// `isoch_in` on the disabled slot errors out. Registered as the
+/// class-registry unbind hook, so the supervisor's hub-detach path
+/// (`attach::detach_slot` → `dispatch_unbind`) reaches it; see also
+/// [`detach_all_uvc`] for the controller-recovery path.
+pub fn detach_uvc(slot_id: u8) {
+    let video_nodes: Vec<usize> = {
+        let mut devices = UVC_DEVICES.lock();
+        for device in devices.iter_mut() {
+            if device.slot_id == slot_id {
+                device.capture_stop_requested = true;
+            }
+        }
+        // Collect-then-retain: the node unregister below takes the
+        // video registry lock, which must never be taken while the
+        // UVC registry lock is held.
+        let nodes: Vec<usize> = devices
+            .iter()
+            .filter(|device| device.slot_id == slot_id)
+            .map(|device| device.video_node)
+            .collect();
+        devices.retain(|device| device.slot_id != slot_id);
+        nodes
+    };
+    for node in video_nodes {
+        let _ = narf_drivers_video::devfs_bridge::unregister_video(node);
+    }
+}
+
+/// Wholesale variant of [`detach_uvc`] for controller recovery
+/// (`attach::detach_all_bindings`): drop every UVC binding and
+/// unregister every video node, regardless of slot. Infallible and
+/// idempotent, same pump-exit reasoning as [`detach_uvc`].
+pub fn detach_all_uvc() {
+    let video_nodes: Vec<usize> = {
+        let mut devices = UVC_DEVICES.lock();
+        for device in devices.iter_mut() {
+            device.capture_stop_requested = true;
+        }
+        let nodes: Vec<usize> = devices.iter().map(|device| device.video_node).collect();
+        devices.clear();
+        nodes
+    };
+    for node in video_nodes {
+        let _ = narf_drivers_video::devfs_bridge::unregister_video(node);
+    }
+}
+
 // ── V4L2 streaming hooks (VIDIOC_STREAMON / STREAMOFF composition) ────
 //
 // Installed on the bound device's /dev/video<N> node at bind time (see
@@ -2056,5 +2117,18 @@ pub fn probe(
 }
 
 pub fn register_initcalls() {
-    let _ = crate::class_registry::register_class_driver("uvcvideo", &UVC_MATCH, probe);
+    // Mirror MSC's hook registration: the probe always declines (UVC
+    // binding stays in the attach cascade), and the unbind hook adapts
+    // infallible `detach_uvc` to the fallible `UsbUnbindFn` contract
+    // with an unconditional `Ok(())` (#893: a hook reports failure
+    // with `Err(())`, never by panicking).
+    let _ = crate::class_registry::register_class_driver_with_unbind(
+        "uvcvideo",
+        &UVC_MATCH,
+        probe,
+        |slot| {
+            detach_uvc(slot);
+            Ok(())
+        },
+    );
 }
