@@ -747,6 +747,54 @@ kernel_test_in!(
     smoke_userspace_context_epoch_loss_refuses_replay
 );
 
+// Runtime autosuspend: a clean idle stop is not a context loss. The next
+// GT incarnation adopts the parked epoch, so saved user images continue.
+fn smoke_userspace_runtime_resume_continues_context_epoch() -> TestResult {
+    let platform = GtPlatform::Battlemage;
+    let context = UserContext::new();
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    assert!(gt.idle());
+    let epoch = gt.user_epoch().unwrap();
+    let (batch, _) = PpgttProbeResult::prepare(platform).unwrap();
+    let (_, fence) = gt
+        .submit_user_batch(100, context.clone(), UserBatch(batch))
+        .unwrap();
+    assert!(!gt.idle(), "an in-flight job is not idle");
+    assert!(
+        gt.adopt_user_epoch(epoch).is_err(),
+        "a scheduler that ran user work cannot change its epoch"
+    );
+    complete(&mut gt, &w, &fence, 101, 0xc01dcafe, 0x5555_6666);
+    assert!(gt.idle());
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    assert_ne!(gt.user_epoch(), Some(epoch));
+    assert!(gt.adopt_user_epoch(0).is_err());
+    gt.adopt_user_epoch(epoch).unwrap();
+    assert_eq!(gt.user_epoch(), Some(epoch));
+    assert!(context.check_epoch(epoch).is_ok(), "context was banned");
+    // The saved image from the previous incarnation is restored.
+    let (batch, _) = PpgttProbeResult::prepare(platform).unwrap();
+    let (_, fence) = gt
+        .submit_user_batch(100, context.clone(), UserBatch(batch))
+        .unwrap();
+    complete(&mut gt, &w, &fence, 101, 0x5555_6666, 0x7777_8888);
+    assert_eq!(context.reset_stats(), (0, 0));
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_userspace_runtime_resume_continues_context_epoch
+);
+
 fn smoke_userspace_primary_render_nodes_and_context_namespaces() -> TestResult {
     use narf_filesystem::DirOps;
     let platform = GtPlatform::Battlemage;

@@ -158,6 +158,8 @@ pub(crate) struct GuCScheduler<A: BootAllocator> {
     defaults: Defaults,
     pristine: bool,
     epoch: u64,
+    /// A user job ran under `epoch`; its identity can no longer change.
+    user_submitted: bool,
 }
 
 impl<A: BootAllocator> GuCScheduler<A> {
@@ -225,6 +227,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             released: false,
             defaults: Defaults::Empty,
             pristine: true,
+            user_submitted: false,
         })
     }
 
@@ -293,6 +296,22 @@ impl<A: BootAllocator> GuCScheduler<A> {
         (self.published && self.defaults_ready()).then_some(self.epoch)
     }
 
+    /// No firmware context is registered, in flight or retiring.
+    pub(crate) fn idle(&self) -> bool {
+        self.defaults_ready() && self.resources.contexts.is_empty()
+    }
+
+    /// Continue the user epoch of a previous scheduler that stopped cleanly
+    /// while idle: every user context then holds a complete saved image, so
+    /// it is not a lost context. Refused once this scheduler ran user work.
+    pub(crate) fn adopt_epoch(&mut self, epoch: u64) -> Result<(), SchedulingError> {
+        if self.user_submitted || epoch == 0 {
+            return Err(SchedulingError::State);
+        }
+        self.epoch = epoch;
+        Ok(())
+    }
+
     pub(crate) fn submit_user(
         &mut self,
         now: u64,
@@ -307,6 +326,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
         let claim = context
             .claim(self.epoch, engine.lrc_pages(self.platform))
             .map_err(SchedulingError::Residency)?;
+        self.user_submitted = true;
         self.submit_inner(now, engine, Some(batch.0), None, Some(claim), output)
     }
 

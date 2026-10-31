@@ -789,9 +789,27 @@ Late service validates exact live PCI identity, D0, readable PF registers and
 a bounded acyclic extended-capability chain; enabled SR-IOV VFs are refused.
 Each restart creates a fresh arena/cache-policy proof. MTL/Arrow starts only
 after owned scanout takeover. DG2/BMG register GT-only devices and start only
-when all inherited display planes are disabled; they do not gain display or
-VRAM support. The runtime-PM probe/forbid references hold this function and its
-upstream bridge active; autosuspend is not implemented. Async system-PM
+when all inherited display planes are disabled; they do not gain display
+support (BMG VRAM is described above). The runtime-PM probe/forbid references
+hold this function and its upstream bridge active until a published GT allows
+autosuspend. Only discrete functions without a bound display are eligible; an
+owned iGPU scanout stays forbidden, as Linux's display wakeref keeps the
+device active. Eligible owners set a 1000 ms autosuspend delay, allow runtime
+PM and drop the probe reference. User submissions and engine-cycle reads hold
+a runtime-PM usage reference (`resume_and_get`); a submission keeps it until
+its fence is terminal. `runtime_suspend` refuses (Busy) unless the GT is
+running and `GuCGt::idle` (no registered, running or retiring context), no
+VRAM object exists (CPU BAR mappings cannot be revoked) and no system sleep
+is in progress. It then masks IRQs, proves the same full stop used for reset,
+reclaims the stopped GT and parks with the user epoch still published; the
+PCI layer saves configuration and enters D3hot. `runtime_resume` (after D0 and
+configuration restore) restarts the verified cold bring-up. Callers wait while
+it runs. At publication `GuCGt::adopt_user_epoch` continues the parked epoch,
+which the scheduler refuses once it has run user work. Saved contexts then
+restore rather than ban. A failed resume clears the epoch like any loss, and
+system sleep discards a parked epoch. The owner's park/unpark sequencing is
+exercised only on hardware; native tests cover idleness and epoch
+continuity. Async system-PM
 preparation closes admission, proves stop, saves PCI configuration and reclaims
 stopped mappings in D0. The synchronous device callback only verifies that
 preparation completed and refuses legacy

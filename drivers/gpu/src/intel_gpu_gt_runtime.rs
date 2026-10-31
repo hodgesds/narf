@@ -47,6 +47,9 @@ enum Phase {
     Defaults,
     PpgttProbe,
     Running,
+    /// Runtime-suspended after a verified idle stop; D3hot is owned by the
+    /// PCI runtime-PM layer. Resume restarts from Cold under the same epoch.
+    Parked,
     Stopped,
     Failed,
     Cleaning,
@@ -63,6 +66,8 @@ struct State {
     saved: Option<narf_bus::pci::SavedPciConfig>,
     power_ready: u64,
     recover_after_stop: bool,
+    /// User epoch to continue after a runtime resume (clean idle stop only).
+    parked_epoch: Option<u64>,
 }
 
 struct Pending {
@@ -76,7 +81,9 @@ struct Pending {
 
 struct Owner {
     pending: Pending,
-    _pm: narf_power::runtime_pm_pci::PciRuntimeNode,
+    pm: narf_power::runtime_pm_pci::PciRuntimeNode,
+    /// Autosuspend has been configured and runtime PM allowed.
+    autosuspend: AtomicBool,
     state: Mutex<State>,
     suspended: AtomicBool,
     user_epoch: Arc<AtomicU64>,
@@ -110,7 +117,8 @@ impl crate::intel_gpu_user::UserBackend for Backend {
                 .owner
                 .upgrade()
                 .ok_or(narf_filesystem::FsError::NoDevice)?;
-            let mut state = owner.state.lock().await;
+            let _awake = Awake::take(&owner).await?;
+            let mut state = owner.lock_running().await;
             if state.phase != Phase::Running || owner.suspended.load(Ordering::Acquire) {
                 return Err(narf_filesystem::FsError::NoDevice);
             }
@@ -177,7 +185,8 @@ impl Backend {
             .owner
             .upgrade()
             .ok_or(narf_filesystem::FsError::NoDevice)?;
-        let mut state = owner.state.lock().await;
+        let awake = Awake::take(&owner).await?;
+        let mut state = owner.lock_running().await;
         if state.phase != Phase::Running || owner.suspended.load(Ordering::Acquire) {
             return Err(narf_filesystem::FsError::NoDevice.into());
         }
@@ -196,6 +205,9 @@ impl Backend {
         if gt.state() == GtState::Lost {
             owner.user_epoch.store(0, Ordering::Release);
         }
+        if let Ok((_, fence)) = &result {
+            awake.until(fence.clone());
+        }
         result.map(|(_, fence)| fence).map_err(|error| match error {
             GtError::Scheduling(crate::intel_gpu_guc_sched::SchedulingError::Residency(error)) => {
                 OutputError::Io(error)
@@ -212,15 +224,56 @@ impl Backend {
     }
 }
 
-// Deliberately no autosuspend yet. The probe reference and forbid reference
-// keep this PCI function and its upstream bridge in D0 for the GT lifetime.
-struct PinnedPower;
-impl RuntimePmOps for PinnedPower {
+/// Runtime-PM callbacks, bound to the owner once it exists. Until then (and
+/// after the owner is gone) suspension is refused and resume is a no-op.
+struct PmOps(IrqSafeSpinLock<Weak<Owner>>);
+impl RuntimePmOps for PmOps {
     fn runtime_suspend(&self) -> RpmFuture<'_> {
-        Box::pin(async { Err(RpmError::Busy) })
+        let owner = self.0.lock().upgrade();
+        Box::pin(async move {
+            match owner {
+                Some(owner) => owner.park().await,
+                None => Err(RpmError::Busy),
+            }
+        })
     }
     fn runtime_resume(&self) -> RpmFuture<'_> {
-        Box::pin(async { Ok(()) })
+        let owner = self.0.lock().upgrade();
+        Box::pin(async move {
+            if let Some(owner) = owner {
+                owner.unpark().await;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Linux xe's default autosuspend delay.
+const AUTOSUSPEND_MS: i32 = 1000;
+
+/// A runtime-PM usage reference: the function stays in D0 until it drops.
+struct Awake(Arc<narf_power::runtime_pm::RuntimePmDevice>);
+impl Awake {
+    async fn take(owner: &Owner) -> Result<Self, narf_filesystem::FsError> {
+        let device = owner.pm.device.clone();
+        if device.resume_and_get().await.is_err() {
+            let _ = device.put_autosuspend();
+            return Err(narf_filesystem::FsError::NoDevice);
+        }
+        Ok(Self(device))
+    }
+    /// Release when `fence` reaches a terminal state, not at ioctl return.
+    fn until(self, fence: Arc<CompletionFence>) {
+        narf_scheduler::spawn(async move {
+            let _ = fence.wait().await;
+            drop(self);
+        });
+    }
+}
+impl Drop for Awake {
+    fn drop(&mut self) {
+        self.0.mark_last_busy();
+        let _ = self.0.put_autosuspend();
     }
 }
 
@@ -257,11 +310,14 @@ pub(crate) fn start_pending() {
     let pending = core::mem::take(&mut *PENDING.lock());
     for p in pending {
         let name = alloc::format!("intel-gt-{}", p.index);
+        let ops = Arc::new(PmOps(IrqSafeSpinLock::new(Weak::new())));
+        // The probe and forbid references keep the function in D0 until a
+        // running, eligible GT explicitly allows autosuspend.
         let pm = match narf_power::runtime_pm_pci::register_pci_device(
             &name,
             p.cap,
             p.device,
-            Arc::new(PinnedPower),
+            ops.clone(),
             None,
             Arc::new(SchedulerEnv),
         ) {
@@ -273,7 +329,8 @@ pub(crate) fn start_pending() {
         };
         let owner = Arc::new(Owner {
             pending: p,
-            _pm: pm,
+            pm,
+            autosuspend: AtomicBool::new(false),
             state: Mutex::new(State {
                 irq: None,
                 irq_tried: false,
@@ -285,12 +342,14 @@ pub(crate) fn start_pending() {
                 saved: None,
                 power_ready: 0,
                 recover_after_stop: false,
+                parked_epoch: None,
             }),
             suspended: AtomicBool::new(false),
             user_epoch: Arc::new(AtomicU64::new(0)),
             user_version: Arc::new(AtomicU32::new(0)),
             user_facts: Arc::new(IrqSafeSpinLock::new(None)),
         });
+        *ops.0.lock() = Arc::downgrade(&owner);
         let backend = Arc::new(Backend {
             owner: Arc::downgrade(&owner),
             epoch: owner.user_epoch.clone(),
@@ -476,7 +535,7 @@ impl Owner {
             }
             return self.cold_start(state);
         }
-        if matches!(state.phase, Phase::Failed | Phase::Stopped) {
+        if matches!(state.phase, Phase::Failed | Phase::Stopped | Phase::Parked) {
             return Ok(());
         }
         let now = narf_time::monotonic_ns();
@@ -549,6 +608,9 @@ impl Owner {
                         u32::from(major) << 16 | u32::from(minor) << 8 | u32::from(patch),
                         Ordering::Relaxed,
                     );
+                    if let Some(epoch) = state.parked_epoch.take() {
+                        gt.adopt_user_epoch(epoch).map_err(RuntimeError::Gt)?;
+                    }
                     self.user_epoch.store(
                         gt.user_epoch().ok_or(RuntimeError::State)?,
                         Ordering::Release,
@@ -600,6 +662,7 @@ impl Owner {
                     state.irq.take(); // stop delivery before resetting the GT
                     delay_us = 500;
                     self.user_epoch.store(0, Ordering::Release);
+                    state.parked_epoch = None; // a failed resume is a real loss
                     state.recover_after_stop |= state.phase == Phase::Running;
                     use core::fmt::Write as _;
                     let _ = writeln!(
@@ -638,6 +701,7 @@ impl Owner {
                     }
                 }
             }
+            self.arm_autosuspend().await;
             narf_scheduler::yield_now().await;
             let deadline = narf_time::Deadline::after_us(delay_us);
             if let Some(wait) = wait {
@@ -645,6 +709,110 @@ impl Owner {
             } else {
                 narf_time::SleepUntil::new(deadline.as_instant()).await;
             }
+        }
+    }
+}
+
+impl Owner {
+    /// Discrete functions without a bound display may autosuspend. An iGPU
+    /// scanout keeps its function in D0, as Linux's display wakeref does.
+    fn autosuspend_eligible(&self) -> bool {
+        let platform =
+            GtPlatform::from_pci(self.pending.device.id.vendor, self.pending.device.id.device);
+        platform.is_some_and(GtPlatform::is_discrete) && self.pending.mode.is_none()
+    }
+
+    /// Once the first bring-up publishes users: configure autosuspend, allow
+    /// runtime PM and drop the probe reference. Never holds the state lock,
+    /// because allowing may immediately invoke `park`.
+    async fn arm_autosuspend(&self) {
+        if self.autosuspend.load(Ordering::Acquire)
+            || !self.autosuspend_eligible()
+            || self.user_epoch.load(Ordering::Acquire) == 0
+        {
+            return;
+        }
+        self.autosuspend.store(true, Ordering::Release);
+        let device = &self.pm.device;
+        device.set_autosuspend_delay(AUTOSUSPEND_MS).await;
+        device.use_autosuspend(true).await;
+        device.mark_last_busy();
+        device.allow();
+        let _ = device.put_autosuspend();
+    }
+
+    /// Runtime suspend: refuse unless the GT is running and provably idle,
+    /// no VRAM object exists (CPU BAR mappings cannot be revoked) and no
+    /// system sleep owns the function. Then stop the GT exactly as for
+    /// reset, keeping the user epoch published for the resume.
+    async fn park(&self) -> Result<(), RpmError> {
+        let mut state = self.state.lock().await;
+        if self.suspended.load(Ordering::Acquire)
+            || state.phase != Phase::Running
+            || !self.autosuspend_eligible()
+            || self
+                .pending
+                .card
+                .intel_vram_used()
+                .is_some_and(|used| used != 0)
+        {
+            return Err(RpmError::Busy);
+        }
+        let epoch = self.user_epoch.load(Ordering::Acquire);
+        if epoch == 0 || !state.gt.as_ref().is_some_and(GuCGt::idle) {
+            return Err(RpmError::Busy);
+        }
+        state.irq.take(); // mask and synchronize while still in D0
+        state.irq_tried = false;
+        let gt = state.gt.as_mut().expect("running GT");
+        let stopped = gt.begin_stop(narf_time::monotonic_ns()).is_ok()
+            && gt.wait().await == Ok(GtState::Stopped);
+        if !stopped {
+            // Uncertain hardware: close admission; the worker owns recovery.
+            self.user_epoch.store(0, Ordering::Release);
+            state.phase = Phase::Failed;
+            return Err(RpmError::Failed);
+        }
+        // Verified stopped: reclaim its GGTT owners before D3hot.
+        state.gt.take();
+        state.parked_epoch = Some(epoch);
+        state.phase = Phase::Parked;
+        log(self.pending.index, "runtime suspended (idle)");
+        Ok(())
+    }
+
+    /// Runtime resume: the PCI layer restored D0 and config space; restart
+    /// the verified bring-up, which adopts the parked epoch at publication.
+    async fn unpark(&self) {
+        let mut state = self.state.lock().await;
+        if state.phase == Phase::Parked {
+            state.phase = Phase::Cold;
+            state.probe = None;
+            state.probe_result = None;
+        }
+    }
+
+    /// Whether a non-running GT is resuming under a still-valid epoch, so a
+    /// caller should wait rather than see a lost device.
+    fn resuming(&self, state: &State) -> bool {
+        state.parked_epoch.is_some()
+            && !matches!(
+                state.phase,
+                Phase::Failed | Phase::Cleaning | Phase::Stopped
+            )
+            && !self.suspended.load(Ordering::Acquire)
+    }
+
+    /// The state, once any runtime-resume bring-up has finished or failed.
+    /// The lock is released between polls so the worker can progress.
+    async fn lock_running(&self) -> narf_lib::mutex::MutexGuard<'_, State> {
+        loop {
+            let state = self.state.lock().await;
+            if !self.resuming(&state) {
+                return state;
+            }
+            drop(state);
+            narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
         }
     }
 }
@@ -679,6 +847,8 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             let mut state = self.state.lock().await;
             state.irq.take(); // mask/synchronize while the function is in D0
             state.saved = None;
+            // System sleep loses context state: no runtime epoch survives it.
+            state.parked_epoch = None;
             let result = async {
                 if let Some(gt) = &mut state.gt {
                     if !matches!(gt.state(), GtState::Staged | GtState::Stopped) {

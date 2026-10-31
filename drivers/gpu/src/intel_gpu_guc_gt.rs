@@ -554,6 +554,30 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             .flatten()
     }
 
+    /// SchedulingReady with no registered, running or retiring context.
+    pub fn idle(&self) -> bool {
+        self.state == GtState::SchedulingReady
+            && self
+                .parts
+                .scheduler
+                .as_ref()
+                .is_some_and(GuCScheduler::idle)
+    }
+
+    /// Runtime resume after a clean idle stop: keep the parked user epoch so
+    /// saved contexts continue instead of being treated as reset losses.
+    pub fn adopt_user_epoch(&mut self, epoch: u64) -> Result<(), GtError> {
+        if self.state != GtState::SchedulingReady {
+            return Err(GtError::State);
+        }
+        self.parts
+            .scheduler
+            .as_mut()
+            .ok_or(GtError::State)?
+            .adopt_epoch(epoch)
+            .map_err(GtError::Scheduling)
+    }
+
     pub fn submission_version(&self) -> (u8, u8, u8) {
         self.parts.boot.submission_version()
     }

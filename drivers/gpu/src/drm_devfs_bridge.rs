@@ -2141,6 +2141,11 @@ impl IntelGpuCard {
         self.lmem_bar.lock().get_or_insert(bar);
     }
 
+    /// Bytes currently allocated from this card's VRAM pool, if published.
+    pub(crate) fn intel_vram_used(&self) -> Option<u64> {
+        self.vram.lock().as_ref().map(|vram| vram.used())
+    }
+
     /// Build the VRAM pool once from the GT's probed layout. The pool, and
     /// every allocation in it, outlives GT resets: local memory persists.
     pub fn publish_gt_vram<M, A>(&self, gt: &crate::intel_gpu_guc_gt::GuCGt<M, A>)
