@@ -8,6 +8,8 @@ use super::{
 };
 use alloc::{sync::Arc, vec::Vec};
 
+#[path = "receive_probe.rs"]
+mod receive_probe;
 #[path = "receive_retune.rs"]
 mod receive_retune;
 

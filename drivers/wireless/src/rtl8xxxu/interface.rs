@@ -553,6 +553,12 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
     fn supports_scan_dwell(&self) -> bool {
         true
     }
+    fn max_scan_ssids(&self) -> u8 {
+        1
+    }
+    fn max_scan_ie_len(&self) -> u16 {
+        super::probe_runtime::MAX_IE as u16
+    }
     fn connected_bssid(&self) -> Option<[u8; 6]> {
         let packed = self.bssid.load(Ordering::Acquire).to_le_bytes();
         (packed[7] != 0).then(|| packed[..6].try_into().unwrap())
@@ -605,11 +611,26 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
         if channels.is_empty() {
             channels = state.service.scan_channels().map_err(wireless_error)?;
         }
-        state
-            .service
-            .passive_scan(&channels, dwell)
-            .await
-            .map_err(wireless_error)?;
+        if request.active {
+            let ssid = request.ssids.first().map_or(&[][..], Vec::as_slice);
+            state
+                .service
+                .active_scan(
+                    &channels,
+                    dwell,
+                    request.duration_mandatory,
+                    ssid,
+                    &request.extra_ies,
+                )
+                .await
+                .map_err(wireless_error)?;
+        } else {
+            state
+                .service
+                .passive_scan(&channels, dwell)
+                .await
+                .map_err(wireless_error)?;
+        }
         Ok(state
             .service
             .candidates()
@@ -751,10 +772,10 @@ pub(super) mod publication_test {
     }
 }
 fn validate_scan(request: &ScanRequest) -> Result<(Vec<u8>, u64), WirelessError> {
-    if request.active
-        || request.random_mac.is_some()
+    if request.random_mac.is_some()
         || request.colocated_6ghz
-        || !request.extra_ies.is_empty()
+        || !request.active && !request.extra_ies.is_empty()
+        || request.active && request.ssids.len() > 1
         || request.ssids.iter().any(|s| s.len() > 32)
         || request.ssids.len() > 32
     {

@@ -252,6 +252,17 @@ pub(super) fn transmit_rate(frame: &[u8], kind: Kind, rate: u8) -> Result<Vec<u8
         }
         _ => (),
     }
+    Ok(encode_transmit(frame, kind, rate))
+}
+
+/// The ordinary Management entry point never accepts broadcast probes. This
+/// separate path consumes only the internally prepared scan frame type.
+pub(super) fn transmit_probe(probe: &super::probe_runtime::Prepared) -> Vec<u8> {
+    encode_transmit(probe.bytes(), Kind::Management, 0)
+}
+fn encode_transmit(frame: &[u8], kind: Kind, rate: u8) -> Vec<u8> {
+    let fc = u16::from_le_bytes([frame[0], frame[1]]);
+    let management = kind == Kind::Management;
     let mut out = alloc::vec![0;TX_DESC+frame.len()];
     out[..2].copy_from_slice(&(frame.len() as u16).to_le_bytes());
     out[2] = TX_DESC as u8;
@@ -293,7 +304,7 @@ pub(super) fn transmit_rate(frame: &[u8], kind: Kind, rate: u8) -> Result<Vec<u8
         .fold(0u16, |v, b| v ^ u16::from_le_bytes([b[0], b[1]]));
     out[28..30].copy_from_slice(&checksum.to_le_bytes());
     out[TX_DESC..].copy_from_slice(frame);
-    Ok(out)
+    out
 }
 
 /// `rtl8xxxu_tx` + `rtl8xxxu_fill_txdesc_v3` for QoS DATA to an HT peer

@@ -52,6 +52,7 @@ pub mod packet_transport;
 pub mod phy;
 pub mod phy_tables;
 pub mod power_policy;
+mod probe_runtime;
 mod radio_init;
 pub mod rate;
 pub mod rate_adaptation;

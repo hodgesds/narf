@@ -17,6 +17,12 @@ impl<I: ControlIo> Drop for Restart<'_, I> {
 }
 
 impl<I: ControlIo> Owner<I> {
+    /// RTL8188EU active_to_lps's device TX-state terminal. This is neither
+    /// a USB delivery receipt nor evidence that all device FIFO bytes vanish.
+    pub(in crate::rtl8xxxu) async fn wait_tx_idle(&self) -> Result<(), Error> {
+        self.poll(0x5f8, u32::MAX, 0, 101, 10, Error::PowerTimeout)
+            .await
+    }
     /// The one Receiver remains claimed. ReceiveStopped is published only
     /// after real endpoint Stop/SetDeq; source loss or uncertainty is terminal.
     pub(in crate::rtl8xxxu) async fn restart_stopped(&self) -> Result<(), Error> {

@@ -18,6 +18,8 @@ use zeroize::Zeroizing;
 mod service_channels;
 #[path = "service_power.rs"]
 mod service_power;
+#[path = "service_probe.rs"]
+mod service_probe;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     State,
@@ -30,6 +32,7 @@ pub enum Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Passive,
+    Scanning,
     Joining,
     Connected,
     Stopped,
@@ -71,6 +74,8 @@ pub struct Service<C: ControlIo, B: packet_transport::Io, E: Environment> {
     last_now: u64,
     retire: Option<Arc<dyn Fn() + Send + Sync>>,
     generation: u64,
+    probing: bool,
+    probe_sequence: u16,
 }
 impl<C: ControlIo, B: packet_transport::Io, E: Environment> core::fmt::Debug for Service<C, B, E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -107,6 +112,8 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
             last_now: now,
             retire: None,
             generation: 1,
+            probing: false,
+            probe_sequence: 0,
         })
     }
     pub fn phase(&self) -> Phase {
@@ -123,6 +130,7 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
         }
         match self.radio.as_ref().map(Receiver::phase) {
             Some(receive_runtime::Phase::Receiving) => Phase::Passive,
+            Some(receive_runtime::Phase::Active) if self.probing => Phase::Scanning,
             Some(receive_runtime::Phase::Parked) => Phase::Parked,
             _ => Phase::Failed,
         }
@@ -216,7 +224,7 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
     fn poll_inner(&mut self) -> Result<Vec<Vec<u8>>, Error> {
         let now = self.now()?;
         match self.phase() {
-            Phase::Passive => {
+            Phase::Passive | Phase::Scanning => {
                 let radio = self.radio.as_mut().ok_or(Error::State)?;
                 if let Some(frames) = radio.poll().map_err(Error::Radio)? {
                     for frame in frames {
@@ -317,6 +325,12 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
                 && entry.candidate.ssid() == ssid
                 && entry.generation == self.generation
         }) {
+            // A directed response can identify a hidden SSID. After a cold
+            // transition it needs a new genuine target response; an older
+            // display entry alone cannot authorize authentication.
+            if candidate.probe_response() {
+                self.probe_current(ssid, &[], 0, false).await?;
+            }
             let deadline = self.now()?.checked_add(2_000).ok_or(Error::State)?;
             for _ in 0..20_000 {
                 self.poll()?;

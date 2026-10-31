@@ -53,6 +53,7 @@ pub struct Candidate {
     bss: Bss,
     ap_rsne: Option<Vec<u8>>,
     ap_rsnxe: Option<Vec<u8>>,
+    probe_response: bool,
 }
 impl Candidate {
     pub fn from_receive(frame: &Mpdu, channel: u8, local: [u8; 6]) -> Result<Self, Error> {
@@ -151,6 +152,7 @@ impl Candidate {
             },
             ap_rsne: rsne,
             ap_rsnxe: rsnxe,
+            probe_response: bytes[0] == 0x50,
         })
     }
     pub fn bssid(&self) -> [u8; 6] {
@@ -164,6 +166,9 @@ impl Candidate {
     }
     pub fn channel(&self) -> u8 {
         self.bss.channel
+    }
+    pub(super) fn probe_response(&self) -> bool {
+        self.probe_response
     }
     pub fn information_elements(&self) -> &[u8] {
         &self.bss.information_elements

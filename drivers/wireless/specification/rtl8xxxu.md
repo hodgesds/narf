@@ -4,6 +4,7 @@
 > retained channel1 Open/WPA2 station service implemented; qualified legacy
 > channels1–13 and idle passive scans are implemented pending native acceptance.
 > Administrative cold park/wake is implemented pending its separate native acceptance.
+> Qualified idle active probe scanning is implemented pending its separate native acceptance.
 > Broader profiles and physical acceptance remain incomplete. A separately
 > qualified RTL8188EU HT20/LGI SISO continuation passes14 native regressions
 > on both architectures; exact-device qualification remains external.
@@ -790,6 +791,72 @@ registration/queued ownership, initial DOWN, Open/WPA2 down/up with native DHCP
 and fresh PTK, held EP0 reversals, caller/source loss, registration replacement
 and failed bulk Stop. Their execution and physical-board acceptance are pending.
 
+### Idle active probe scanning (native acceptance pending)
+
+Active scans use the same retained idle station owner and qualified channels
+as passive scans. Linux `rtl8xxxu/core.c` advertises `max_scan_ssids=1`; this
+driver now advertises and admits one directed SSID or one wildcard. The
+bounded optional probe-IE budget is2048 bytes. Complete IE extents are checked
+before hardware mutation, and callers cannot replace the driver's SSID,
+rates, channel or PHY capability elements. Random addressing/sequence flags,
+6GHz and scanning while associated remain unsupported.
+
+The private `probe_runtime::Prepared` type constructs a Probe Request with
+the actual local transmitter address, broadcast DA/BSSID, software sequence,
+legacy Supported/Extended Rates and actual selected DS channel. The optional
+HT20/LGI capability is included only for the already programmed current HT
+grant. A separate packet-codec/packet-owner/Receiver entry point consumes
+this type. Ordinary management submission retains its subtype and unicast
+peer checks; it cannot send a raw broadcast probe.
+
+Every requested channel's complete occupied20MHz band and signed N8PC row
+is admitted before the first retune or emission. Unsupported flags such as
+NO_IR, missing measured rows or insufficient power qualification refuse the
+plan. Current executable, board/profile and regulatory proofs fence all
+subsequent waits and native publications. The existing N8PC complete legacy
+CCK/OFDM envelope already covers the basic1Mbps probe emission; no new board
+measurement format or production fixture curve is introduced.
+
+The real MGNT/basic1/BMC descriptor and exact USB TX terminal prove native
+host delivery, not PHY drain or a broadcast ACK. MAC TX remains enabled
+through the active response dwell. Conservative millisecond ceilings of
+mac80211 `IEEE80211_PROBE_DELAY`/`IEEE80211_CHANNEL_TIME` (each HZ/33) provide
+31ms before publication and at least31ms afterward. The complete prepared
+MPDU, including up to2048 IE bytes, is also checked against the long-preamble
+CCK1 duration from `ieee80211_frame_duration`:202us plus8us per MPDU/FCS byte.
+A mandatory request below that source pre/post/airtime minimum is refused
+before hardware mutation; a nonmandatory duration is raised to the source
+minimum. Native USB/retune latency is separate from those listening windows.
+
+After that dwell, `rtl8188eu_active_to_lps` supplies the actual device TX-state
+boundary: pause queues, observe the full32-bit SCH_TX_CMD equal to zero, then
+close MAC TX with readback and restore the saved pause value. Missing device
+terminal state fails without clearing MAC TX on the strength of a host
+completion. The same physical RX stream stays posted on the same channel;
+this current-TX-state receipt does not assert an empty device FIFO. A later
+retune still requires completed old USB ownership and the actual cold MAC-off
+FIFO boundary. Observations retain their physical channel, copy time and
+receive generation, and a successful scan restores its home. Cancellation,
+short/error delivery or source/policy loss stays terminal with native receipts
+retained and no cleanup I/O.
+
+Hidden-SSID discovery retains whether the actual copied observation was a
+Probe Response. After a cold join transition such an entry triggers a new
+qualified directed probe and requires a fresh matching native response before
+authentication. Old display metadata does not become a current observation;
+the ordinary beacon-only fresh-observation path is unchanged.
+
+Eight separate `drivers/wireless/rtl8xxxu/active_scan` native cases cover
+Open/WPA2 probe/response to actual DHCP, literal wildcard/directed bytes and
+MGNT/basic1 descriptors, unsupported SSID/IE and occupied-policy refusal,
+held/cancelled/source-lost and short TX terminals, policy loss during the
+native wait, old FIFO responses and home restoration. The independent device
+model withholds its response until delayed PHY consumption while MAC TX stays
+enabled, and holds SCH_TX_CMD separately from host completion. Early MAC TX
+closure loses the response; maximum IE timing and missing device terminals
+have literal negative cases. Only physical AP/USB inputs are inert; their
+execution and physical acceptance remain pending.
+
 ## 4. Invariants
 
 - Linux's disabled→EMU→active handshake precedes firmware writes. MAC TX/RX
@@ -823,8 +890,9 @@ the production probe when exact-device signed qualification/deployment data
 is present. No real board curve has been acquired, qualified or installed by
 this software work. The initial profile needs physical validation. Qualified
 legacy idle channel changes and passive scans await native acceptance; broader
-rates, active or connected scanning and endpoint reset remain software work.
+rates, connected scanning and endpoint reset remain software work.
 Administrative cold park/wake awaits its separate native acceptance.
+Idle active probe scanning awaits its separate native acceptance.
 
 ## 8. Open questions / remaining software
 
@@ -840,7 +908,7 @@ Administrative cold park/wake awaits its separate native acceptance.
 | Signed board power artifact and checked native TX gate | Implemented software contract; real qualified per-device data must be acquired/signed/installed |
 | Native USB descriptor/packet ownership | Implemented dependency; persistent receipt/stop and Linux descriptor regressions |
 | Native beacon/management preparation and peer-bound transitions | Implemented basic1Mbps shared plan; qualified channels1–13 await native acceptance |
-| Production passive scan/MLME service and policy-admitted management TX | Qualified idle passive multi-channel scan/home restoration implemented pending native acceptance; signed board/deployment admission required; active and connected scans remain missing |
+| Production scan/MLME service and policy-admitted management TX | Qualified idle passive multi-channel scan/home restoration and active probe scan implemented pending native acceptance; signed board/deployment admission required; connected scans remain missing |
 | Software AES-CCM + strict CCMP/key/TID ownership | Implemented dependency; independent ciphertext/forgery/role/PN regressions |
 | WPA2 key installation/controlled port and Ethernet transport | Implemented retained shared RSNA/software CCMP, exact native delivery, Narf-Rings and synchronous stack progress |
 | Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX. Qualified legacy channels1–13 and cold idle FIFO retuning await native acceptance. Separate N8HT HT20/LGI MCS0..7/whole A-MSDU/decline/capture-publication continuation passes native software gates above and stays channel1-bound. Management/basic1Mbps remains required. SGI/HT40, broader bands/adaptation and coexistence remain missing |
@@ -852,7 +920,7 @@ Administrative cold park/wake awaits its separate native acceptance.
 Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 `8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional
 BT/S0S1. EU's separately qualified HT20/LGI continuation is software-validated above;
-SGI20/HT40, active scanning and scanning while associated, and
+SGI20/HT40, scanning while associated, and
 controller-proven EP0 reset remain software work. Qualified idle passive
 multi-channel scanning awaits native acceptance. Full WMM AC/TID routing is implemented.
 

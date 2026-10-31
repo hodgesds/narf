@@ -938,6 +938,13 @@ the old association before parking. Netlink IFF_UP and SIOCSIFFLAGS use
 the existing current administrative handle; scan never creates UP. The
 family §3 documents the interface and pending PM native acceptance.
 
+RTL8188EU idle active scan admits one directed SSID or a wildcard and
+up to2048 bytes of structurally checked extra IEs. Each occupied channel
+requires current transmit permission. Source pre/post-probe timing and
+whole basic1 frame airtime bound mandatory dwell admission; actual USB
+delivery and subsequent device TX-state retirement remain distinct. The
+family §3 documents this private emitter and pending native acceptance.
+
 ## 4. Interaction with `narf-wireless`
 
 - **Registration**: Drivers register via `bus::register_wireless_driver(MatchEntry { ... })`.

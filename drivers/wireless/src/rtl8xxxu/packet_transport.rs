@@ -184,6 +184,9 @@ impl<I: Io> Owner<I> {
     pub fn is_failed(&self) -> bool {
         self.failed
     }
+    pub(super) fn transmit_pending(&self) -> bool {
+        self.transmit.is_some()
+    }
     pub fn fail(&mut self) {
         self.failed = true;
     }
@@ -361,6 +364,22 @@ impl<I: Io> Owner<I> {
                 self.endpoints.output_count,
             ),
         };
+        self.submit_encoded(packet, index)
+    }
+    pub(super) fn submit_probe(
+        &mut self,
+        probe: &super::probe_runtime::Prepared,
+    ) -> Result<(), Error> {
+        self.check_pipe(true)?;
+        if self.receive.is_none() {
+            return Err(Error::NotStarted);
+        }
+        if self.transmit.is_some() {
+            return Err(Error::Busy);
+        }
+        self.submit_encoded(packet_codec::transmit_probe(probe), 0)
+    }
+    fn submit_encoded(&mut self, packet: Vec<u8>, index: usize) -> Result<(), Error> {
         let endpoint = self.endpoints.output[index];
         let dci = endpoint * 2;
         match self.io.begin_send(dci, &packet) {
