@@ -1009,8 +1009,18 @@ impl Wire {
         let mut payload = vec![0; 64];
         payload[..2].copy_from_slice(&(frame.len() as u16).to_le_bytes());
         payload[12..16].copy_from_slice(&(if protected { 0x243u32 } else { 3 }).to_le_bytes());
-        if self.phy.is_some_and(|phy| phy.mcc_he) && frame[0] & 0xc == 8 {
-            let phy = self.phy.unwrap();
+        // Firmware follows the station's actual programmed TLC, not the
+        // AP's advertised maximum. M1 may precede TLC and use a legacy rate;
+        // a narrowed/non-HE association must not receive invented HE data.
+        let he_programmed = self
+            .commands
+            .iter()
+            .rev()
+            .find(|(g, c, _)| (*g, *c) == (5, 0xf))
+            .is_some_and(|(_, _, body)| {
+                body.get(if self.api89.is_some() { 5 } else { 9 }) == Some(&3)
+            });
+        if let Some(phy) = self.phy.filter(|_| he_programmed && frame[0] & 0xc == 8) {
             let rate = 0x400u32
                 | if phy.streams == 2 {
                     if phy.rates == 3 {
@@ -1202,8 +1212,8 @@ impl Guard {
             versions = case.commands();
         }
         if api89.is_none() && bz.is_none() {
-            if let Some(phy) = phy {
-                he_tests::versions(&mut versions, phy.rates);
+            if phy.is_some() {
+                he_tests::versions(&mut versions);
             }
             receive_model.commands(&mut versions);
         }

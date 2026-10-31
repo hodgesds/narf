@@ -15,14 +15,33 @@ pub(super) fn native_supported(hw: &super::runtime::Hardware) -> bool {
         && rates_version(hw).is_some()
 }
 
-/// Linux mvm/ops.c checks every producer and consumer of rate_n_flags,
-/// rejecting partially upgraded firmware tables. Missing entries are v1,
-/// never evidence for a newer encoding. MLD's native TX body is v10/v11.
+/// Select the retained native consumer namespace before checking used wire
+/// versions. Linux MVM checks all five rate consumers; MLD directly uses
+/// v3 and has no RX_NO_DATA handler. Missing used entries prove no upgrade.
 pub(super) fn rates_version(hw: &super::runtime::Hardware) -> Option<u8> {
     if !matches!(hw.command_version(0, 0x1c), Some(10 | 11)) {
         return None;
     }
-    select_rates_version(|group, command| hw.version(group, command))
+    if hw.uses_mld_station_protocol() {
+        select_mld_rates_version(|group, command| hw.version(group, command))
+    } else {
+        select_rates_version(|group, command| hw.version(group, command))
+    }
+}
+
+/// Linux MLD has no RX_NO_DATA consumer: mld/rx.c reads the v3 NSS/code
+/// fields directly. Its actual core103 tables omit5/f5. Admit only the
+/// complete reached MLD station/TX/RX/TLC tuple; the MVM selector below
+/// retains its separate five-consumer consistency contract.
+fn select_mld_rates_version(version: impl Fn(u8, u8) -> Option<(u8, u8)>) -> Option<u8> {
+    let commands = [(3, 8, 3), (3, 9, 8), (3, 10, 2), (1, 8, 6), (5, 0xf, 6)];
+    (commands
+        .into_iter()
+        .all(|(g, c, v)| version(g, c).map(|v| v.0) == Some(v))
+        && version(1, 0x1c) == Some((11, 9))
+        && version(5, 0xf7).is_some_and(|v| v.1 == 4)
+        && version(0, 0xc1).is_some_and(|v| matches!(v.1, 6..=8)))
+    .then_some(3)
 }
 fn select_rates_version(version: impl Fn(u8, u8) -> Option<(u8, u8)>) -> Option<u8> {
     let command = |group, cmd| version(if group == 0 { 1 } else { group }, cmd).map_or(0, |v| v.0);
@@ -391,7 +410,61 @@ fn packet_extension(peer: &narf_wireless::association::he::HeCapability) -> [[[u
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+    #[inline(never)]
+    fn hardware_mld_namespace() -> Result<(), &'static str> {
+        use super::super::{runtime::model, rx_rfh};
+        let case = super::super::bz_fixture::Case::FmDiscrete;
+        let image = case.image();
+        let parsed = super::super::parse_ucode(&image)
+            .map_err(|_| "MLD hardware namespace fixture metadata")?;
+        let (mut hw, _firmware, _trace) =
+            model::station_model_for_format(rx_rfh::CompletionFormat::Bz);
+        let result = (|| {
+            model::native_station_identity(&mut hw, case.did(), case.revision(), case.radio())?;
+            model::firmware_profile(&mut hw, &parsed)?;
+            hw.prepare_station_profile(&parsed)?;
+            if !hw.uses_mld_station_protocol() || rates_version(&hw) != Some(3) {
+                return Err("exact Bz hardware lost its admitted MLD consumer");
+            }
+            for (g, c, field) in [
+                (3, 8, 2),
+                (3, 9, 2),
+                (3, 10, 2),
+                (1, 8, 2),
+                (5, 0xf, 2),
+                (1, 0x1c, 2),
+                (1, 0x1c, 3),
+                (5, 0xf7, 3),
+                (0, 0xc1, 3),
+            ] {
+                let mut table = case.commands();
+                let row = table
+                    .chunks_exact_mut(4)
+                    .find(|row| row[0] == c && row[1] == g)
+                    .ok_or("actual MLD hardware used row absent")?;
+                row[field] = 0;
+                model::versions(&mut hw, &table);
+                if rates_version(&hw).is_some() {
+                    return Err("MLD hardware admitted a malformed used native rate tuple");
+                }
+            }
+            // This is complete for MVMv2. A retained MLD consumer must not
+            // switch namespace just because that other tuple is consistent.
+            model::versions(&mut hw, &[0x1c, 1, 10, 8, 0xf7, 5, 0, 3, 0xc1, 0, 0, 5]);
+            if !hw.uses_mld_station_protocol() || rates_version(&hw).is_some() {
+                return Err("MLD hardware fell through to a valid MVMv2 namespace");
+            }
+            Ok(())
+        })();
+        // SAFETY: this fixture owns all RAM DMA and no future or physical
+        // endpoint survives; destroy Hardware before its device-side views.
+        unsafe { model::destroy(hw) };
+        result
+    }
     fn smoke_sc_he_rate_encoding_requires_every_native_producer_and_consumer() -> TestResult {
+        if let Err(reason) = hardware_mld_namespace() {
+            return TestResult::Fail(reason);
+        }
         let lookup = |table: &[[u8; 4]], g, c| {
             table
                 .iter()
@@ -409,6 +482,39 @@ mod tests {
             || select_rates_version(|g, c| lookup(&v3, g, c)) != Some(3)
         {
             return TestResult::Fail("Sc HE complete rate inventories lost their source encoding");
+        }
+        // Exact reached MLD tuple, deliberately without unconsumed5/f5.
+        let mld = [
+            [8, 3, 3, 0],
+            [9, 3, 8, 0],
+            [10, 3, 2, 0],
+            [8, 1, 6, 0],
+            [15, 5, 6, 0],
+            [0x1c, 1, 11, 9],
+            [0xf7, 5, 99, 4],
+            [0xc1, 0, 99, 8],
+        ];
+        if select_mld_rates_version(|g, c| lookup(&mld, g, c)) != Some(3) {
+            return TestResult::Fail(
+                "MLD actual rate-v3 tuple required an unconsumed notification",
+            );
+        }
+        for (row, field) in [
+            (0, 2),
+            (1, 2),
+            (2, 2),
+            (3, 2),
+            (4, 2),
+            (5, 2),
+            (5, 3),
+            (6, 3),
+            (7, 3),
+        ] {
+            let mut table = mld;
+            table[row][field] = 0;
+            if select_mld_rates_version(|g, c| lookup(&table, g, c)).is_some() {
+                return TestResult::Fail("MLD partial used native rate tuple admitted");
+            }
         }
         for index in 0..4 {
             let mut table = v2;

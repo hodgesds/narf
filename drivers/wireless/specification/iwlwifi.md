@@ -3533,6 +3533,18 @@ an attempt. Hardware repeats current executable/PNVM/PCI admission before
 BME and on an acknowledged fresh restart; a changed identity/profile is
 refused. Older100, A0/GL/CDB and other source tuples are not admitted.
 
+The retained native protocol, rather than a metadata tuple or descriptor
+format, selects MLD's rate consumer. Linux MLD reads v3 NSS/code fields
+without an RX_NO_DATA handler; real core103 inventories omit that unused
+notification. All reached MAC/link/STA/PHY/TLC and TX/RX/feedback versions
+remain checked. MVM retains its distinct full rate-consumer consistency
+check. Sc native fixture inventories use their actual MLD v3 tuple; the
+existing rate-v2 HTC/NSS/width/replay scenarios use the real API89 MVM
+profile instead. Runtime namespace dispatch is exclusive, including when
+a retained MLD owner sees an otherwise complete MVMv2 table. A fixture
+emits HE data only after the actual TLC programs HE;
+narrowed non-HE associations keep the ordinary rate path.
+
 The factual core103 producer/consumer inventory selects the existing MLD
 station owner: MAC3/link8/STA2/PHY6, TX11/reply9, RX8/rates-v3, TLC6/feedback4,
 MCC8/power10, native key1/TVQM3, RFH2, fixed absent RSS and MLD sync0. ALIVE7

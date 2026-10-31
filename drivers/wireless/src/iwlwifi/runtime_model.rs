@@ -359,6 +359,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         scan_mcc_watch: false,
         api89: None,
         bz: None,
+        mld_station: false,
     };
     (hardware, firmware)
 }
@@ -412,6 +413,7 @@ pub(in crate::iwlwifi) fn firmware_profile(
 pub(in crate::iwlwifi) fn station_model() -> (Hardware, Firmware, TxTrace) {
     let (mut hardware, firmware, trace) = station_model_for_format(rx_rfh::CompletionFormat::Bz);
     hardware.device.id.device = 0xe340;
+    hardware.mld_station = true;
     (hardware, firmware, trace)
 }
 

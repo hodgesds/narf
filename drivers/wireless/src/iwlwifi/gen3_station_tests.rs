@@ -3,7 +3,7 @@ pub(super) use super::super::super::gen3_fixture::Case;
 use super::*;
 
 #[inline(never)]
-fn setup(
+pub(super) fn setup(
     case: Case,
     secured: bool,
     phy: Option<PhyModel>,
@@ -264,7 +264,15 @@ fn smoke_api89_and_sc_global_mcc_width_caps_bound_every_programmed_station_span(
                         .commands
                         .iter()
                         .filter(|(g, c, _)| (*g, *c) == (5, 0xf))
-                        .all(|(_, _, body)| body[if api89 { 4 } else { 8 }] <= maximum)
+                        .all(|(_, _, body)| {
+                            body[if api89 { 4 } else { 8 }] <= maximum
+                                && body[if api89 { 5 } else { 9 }] != 3
+                        })
+                    && wire
+                        .commands
+                        .iter()
+                        .filter(|(g, c, _)| (*g, *c) == (3, 8))
+                        .all(|(_, _, body)| body[24] == 0)
             };
             require(
                 bounded,

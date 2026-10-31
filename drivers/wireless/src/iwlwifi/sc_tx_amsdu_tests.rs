@@ -43,7 +43,7 @@ fn phy(he: bool) -> PhyModel {
     PhyModel {
         width: if he { 2 } else { 0 },
         streams: if he { 2 } else { 1 },
-        rates: if he { 3 } else { 2 },
+        rates: 3,
         mcc_he: he,
         response_he: he,
     }
@@ -264,12 +264,9 @@ kernel_test_in!(
     smoke_sc_tx_amsdu_native_tlc_tid_fifo_and_partial_checksum_fallbacks
 );
 
-fn assets(
-    phy: PhyModel,
-    profile: &TxModel,
-) -> R<(crate::firmware_asset::Asset, crate::firmware_asset::Asset)> {
+fn assets(profile: &TxModel) -> R<(crate::firmware_asset::Asset, crate::firmware_asset::Asset)> {
     let mut versions = super::super::super::firmware_parser_tests::mld_commands();
-    he_tests::versions(&mut versions, phy.rates);
+    he_tests::versions(&mut versions);
     versions.extend_from_slice(&[0, 2, 0, profile.version]);
     let bytes = image(&versions, Some(profile))?;
     let (write, read) = narf_firmware::bootstrap_authority();
@@ -313,7 +310,7 @@ fn smoke_sc_tx_amsdu_native_credit_wrap_retains_both_frames_then_source_loss_pin
     check(|| {
         let phy = phy(false);
         let profile = profile(true, false);
-        let (executable, pnvm) = assets(phy, &profile)?;
+        let (executable, pnvm) = assets(&profile)?;
         let guard = Guard::build_features(
             true,
             Fault::None,
@@ -421,7 +418,7 @@ fn smoke_sc_tx_amsdu_native_held_smem_receipt_source_loss_never_publishes_aggreg
         for which in 0..2 {
             let phy = phy(false);
             let profile = profile(which == 1, false);
-            let (executable, pnvm) = assets(phy, &profile)?;
+            let (executable, pnvm) = assets(&profile)?;
             let guard = Guard::build_features(
                 true,
                 Fault::HoldSmem,

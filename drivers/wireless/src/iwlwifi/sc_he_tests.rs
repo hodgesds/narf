@@ -6,18 +6,10 @@ const PASSWORD: &[u8] = b"Sc-native-SAE-password";
 const IGTK: [u8; 16] = [0x6b; 16];
 const IPN: u64 = 0x0102_0304_0506;
 
-pub(super) fn versions(table: &mut Vec<u8>, rates: u8) {
-    table.extend_from_slice(&[0xf7, 5, 0, if rates == 3 { 4 } else { 3 }]);
-    table.extend_from_slice(&[0xc1, 0, 0, if rates == 3 { 6 } else { 5 }]);
-    table.extend_from_slice(&[
-        0x1c,
-        1,
-        if rates == 3 { 11 } else { 10 },
-        if rates == 3 { 9 } else { 8 },
-    ]);
-    if rates == 3 {
-        table.extend_from_slice(&[0xf5, 5, 0, 4]);
-    }
+/// Actual Sc core103 used rate tuple. MLD directly consumes v3; there is
+/// no RX_NO_DATA consumer/record. MVMv2 coverage uses the real API89 owner.
+pub(super) fn versions(table: &mut Vec<u8>) {
+    table.extend_from_slice(&[0xf7, 5, 99, 4, 0xc1, 0, 99, 8, 0x1c, 1, 11, 9]);
 }
 
 pub(super) fn policy() -> narf_wireless::reg::RegulatoryDomain {
@@ -390,7 +382,7 @@ fn data(guard: &Guard) -> R {
 fn smoke_sc_he_native_open_wpa2_sae24_he20_40_80_two_streams_and_rate_contracts() -> TestResult {
     check(|| {
         for (phy, security) in [
-            (config(0, 1, 2), 0),
+            (config(0, 1, 3), 0),
             (config(1, 2, 3), 1),
             (config(2, 2, 3), 2),
         ] {
@@ -467,7 +459,19 @@ fn smoke_sc_he_native_htc_rate_nss_width_and_replay_preserve_original_ccmp_offse
     check(|| {
         for rates in [2, 3] {
             let phy = config(0, 1, rates);
-            let guard = setup(phy, true, Fault::None)?;
+            let guard = if rates == 2 {
+                // Exercise actual MVM/API89 rate-v2, retaining every original
+                // HTC/NSS/width/PN assertion instead of inventing MLDv2.
+                *gen3_station_tests::setup(
+                    gen3_station_tests::Case::Ty,
+                    true,
+                    Some(phy),
+                    None,
+                    Fault::None,
+                )?
+            } else {
+                setup(phy, true, Fault::None)?
+            };
             discover(&guard, phy, false)?;
             join(&guard, phy, request_for(phy, true))?;
             for (index, bad, variant) in [
@@ -532,7 +536,7 @@ kernel_test_in!(
 
 fn smoke_sc_he_native_mcc_prohibition_and_missing_response_do_not_open_he_port() -> TestResult {
     check(|| {
-        let mut phy = config(0, 1, 2);
+        let mut phy = config(0, 1, 3);
         phy.mcc_he = false;
         {
             let guard = setup(phy, false, Fault::None)?;
@@ -630,11 +634,11 @@ kernel_test_in!(
     smoke_sc_he_native_mcc_prohibition_and_missing_response_do_not_open_he_port
 );
 
-fn inputs(phy: PhyModel) -> R<(crate::firmware_asset::Asset, crate::firmware_asset::Asset)> {
+fn inputs() -> R<(crate::firmware_asset::Asset, crate::firmware_asset::Asset)> {
     let (write, read) = narf_firmware::bootstrap_authority();
     let mut bytes = super::super::super::firmware_parser_tests::mld_image();
     let mut table = super::super::super::firmware_parser_tests::mld_commands();
-    versions(&mut table, phy.rates);
+    versions(&mut table);
     require(
         word(&bytes, 88) == 48,
         "Sc HE authored executable table tag",
@@ -659,8 +663,8 @@ fn inputs(phy: PhyModel) -> R<(crate::firmware_asset::Asset, crate::firmware_ass
 fn smoke_sc_he_native_dropped_waiter_and_held_sta_source_or_policy_loss_pin_dma() -> TestResult {
     check(|| {
         for which in 0..3 {
-            let phy = config(0, 1, 2);
-            let (firmware, pnvm) = inputs(phy)?;
+            let phy = config(0, 1, 3);
+            let (firmware, pnvm) = inputs()?;
             let guard = Guard::build(
                 true,
                 Fault::HoldHe,

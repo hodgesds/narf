@@ -645,6 +645,7 @@ pub struct Hardware {
     scan_mcc_watch: bool,
     api89: Option<(super::gen3_profile::Profile, super::gen3_profile::Abi)>,
     bz: Option<super::bz_profile::Profile>,
+    mld_station: bool,
 }
 
 impl core::fmt::Debug for Hardware {
@@ -751,6 +752,7 @@ impl Hardware {
             scan_mcc_watch: false,
             api89: None,
             bz: None,
+            mld_station: sc,
         })
     }
 

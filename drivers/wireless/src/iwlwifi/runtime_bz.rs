@@ -24,6 +24,7 @@ impl Hardware {
             return Err("Bz restart changed its native identity/profile");
         }
         self.bz = Some(profile);
+        self.mld_station = true;
         Ok(true)
     }
     pub(super) fn bz_runtime(

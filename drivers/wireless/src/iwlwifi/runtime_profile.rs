@@ -44,6 +44,11 @@ impl Hardware {
     pub(in crate::iwlwifi) fn is_mvm89(&self) -> bool {
         self.api89.is_some()
     }
+    /// The runtime consumer is selected by the retained native profile,
+    /// independently of command metadata and RX descriptor geometry.
+    pub(in crate::iwlwifi) fn uses_mld_station_protocol(&self) -> bool {
+        self.mld_station
+    }
     pub(in crate::iwlwifi) async fn station_peer(
         &mut self,
         peer: &[u8; 104],
