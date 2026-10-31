@@ -29,6 +29,8 @@ use narf_capabilities::{Cap, CapKind, CapType, Invoke, Write};
 
 use crate::bypass::xdp::XdpSocket;
 use crate::{Interface, NetIface};
+#[path = "stack_child.rs"]
+mod child;
 #[cfg(feature = "kernel-test")]
 #[path = "stack_identity_tests.rs"]
 mod identity_tests;
@@ -87,6 +89,7 @@ pub struct AdminHandle {
 struct AdminSource {
     attach: StackAttach,
     registration: Option<u64>,
+    parent: Option<child::ControlParent>,
 }
 
 /// Mint the kernel-held administrative handle for the initial namespace's
@@ -207,6 +210,7 @@ impl AdminHandle {
                 handle: self,
                 name,
                 net_ns_id,
+                ownership_epoch: None,
             })
             .map_err(|_| AdminError::AuthorityRevoked)?;
         if permitted {
@@ -442,6 +446,7 @@ struct AdminContext<'a> {
     handle: &'a AdminHandle,
     name: &'a str,
     net_ns_id: u64,
+    ownership_epoch: Option<u64>,
 }
 impl narf_capabilities::CapOp<AdminCap, Invoke> for AdminContext<'_> {
     type Output = bool;
@@ -454,6 +459,7 @@ impl narf_capabilities::CapOp<AdminCap, Invoke> for AdminContext<'_> {
                 source,
                 name: self.name,
                 namespace: Some(self.net_ns_id),
+                ownership_epoch: self.ownership_epoch,
             })
         } else {
             // Kernel namespace/name handles retain their existing scope.
@@ -470,6 +476,7 @@ impl narf_capabilities::CapOp<AdminCap, Invoke> for AdminLiveness<'_> {
                 source,
                 name: self.0.iface_name(),
                 namespace: None,
+                ownership_epoch: None,
             }),
             None => Ok(true),
         }
@@ -480,10 +487,19 @@ struct DelegatedAdminIdentity<'a> {
     source: &'a AdminSource,
     name: &'a str,
     namespace: Option<u64>,
+    ownership_epoch: Option<u64>,
 }
 impl narf_capabilities::CapOp<StackDaemon, Invoke> for DelegatedAdminIdentity<'_> {
     type Output = bool;
     fn execute(self, _: &Cap<StackDaemon, Invoke>) -> Result<bool, narf_capabilities::CapError> {
+        if self
+            .source
+            .parent
+            .as_ref()
+            .is_some_and(|parent| !parent.current())
+        {
+            return Ok(false);
+        }
         self.source.attach.iface.invoke(self)
     }
 }
@@ -500,10 +516,11 @@ impl narf_capabilities::CapOp<NetIface, Write> for DelegatedAdminIdentity<'_> {
                         && crate::iface::registration_matches(self.name, None, None)
                         && self.namespace.is_none_or(|expected| expected == namespace)
                 } else {
-                    crate::iface::registration_matches(
+                    crate::iface::registration_owner_matches(
                         self.name,
                         self.source.registration,
                         self.namespace,
+                        self.ownership_epoch,
                     )
                 }
             })
@@ -608,6 +625,7 @@ impl narf_capabilities::CapOp<NetIface, Write> for InterfaceControl {
                         source: Some(AdminSource {
                             attach: self.0,
                             registration,
+                            parent: None,
                         }),
                     },
                 })

@@ -1915,6 +1915,16 @@ pub(crate) fn registration_matches(
     expected: Option<u64>,
     namespace: Option<u64>,
 ) -> bool {
+    registration_owner_matches(name, expected, namespace, None)
+}
+/// Invoked parent/child delegation compares the original ownership epoch
+/// inside the same IFACES observation as registration and namespace.
+pub(crate) fn registration_owner_matches(
+    name: &str,
+    expected: Option<u64>,
+    namespace: Option<u64>,
+    ownership_epoch: Option<u64>,
+) -> bool {
     let guard = IFACES.lock();
     match guard
         .as_ref()
@@ -1924,8 +1934,13 @@ pub(crate) fn registration_matches(
             expected == Some(entry.registration_epoch)
                 && entry.registration_epoch != 0
                 && namespace.is_none_or(|namespace| entry.net_ns_id == namespace)
+                && ownership_epoch.is_none_or(|epoch| epoch != 0 && entry.ownership_epoch == epoch)
         }
-        None => expected.is_none() && namespace.is_none_or(|namespace| namespace == 0),
+        None => {
+            expected.is_none()
+                && ownership_epoch.is_none()
+                && namespace.is_none_or(|namespace| namespace == 0)
+        }
     }
 }
 

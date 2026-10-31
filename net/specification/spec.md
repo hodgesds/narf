@@ -383,6 +383,24 @@ APIs have no IFACES entry to change. Trusted driver cleanup uses
 `Registry::unregister_for_handle` to remove only its original typed registration;
 an old live handle cannot remove a same-name successor or authorize hardware.
 
+`Registry::register_control_child(grant, parent_cap, child)` additionally invokes
+the actual physical parent's typed Write grant, requires its still-registered
+ordinary interface/current namespace and records that exact cap relation.
+`AdminHandle::control_registered_child(child_cap)` performs explicit delegation
+inside the actual parent Admin, creating daemon, parent Write and fresh child
+Write invocations. The child must still carry that registered physical-parent
+relation in the same namespace; names, MACs and observed WDEV ids do not mint
+authority. The returned fresh child Admin grants only that actual child and
+retains the original parent Admin/daemon, both typed registrations and the
+parent's original ownership epoch. Parent/daemon/child revocation, either
+registration's replacement and parent namespace transfer invalidate it; an
+away/back transfer needs a fresh explicit delegation. Registration, namespace
+and ownership epoch compare inside one invoked Registry/IFACES observation.
+Revoking the child's own Admin/Write grant does not revoke its parent.
+Kernel namespace handles retain their existing scope and return None rather
+than creating another daemon grant. `is_control_child` observes only a current
+explicit child delegation; it cannot promote an ordinary handle.
+
 ### 3.4 Loopback
 
 A built-in `Loopback` implementation of the contract. Always

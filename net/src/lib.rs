@@ -545,6 +545,8 @@ impl From<CapError> for RegisterError {
 struct Entry {
     iface: Box<dyn Interface>,
     handle: Cap<NetIface, Write>,
+    /// Actual typed parent registration for a freshly created control child.
+    control_parent: Option<Cap<NetIface, Write>>,
 }
 
 /// Owned control-plane view of a driver-backed interface.
@@ -585,6 +587,7 @@ pub enum ControlRegisterError {
 struct RegisterControl<'a, I> {
     registry: &'a Registry,
     iface: I,
+    parent: Option<Cap<NetIface, Write>>,
 }
 impl<I: Interface + 'static> narf_capabilities::CapOp<NetIface, Grant> for RegisterControl<'_, I> {
     type Output = Result<Cap<NetIface, Write>, ControlRegisterError>;
@@ -592,6 +595,29 @@ impl<I: Interface + 'static> narf_capabilities::CapOp<NetIface, Grant> for Regis
         self,
         _: &Cap<NetIface, Grant>,
     ) -> Result<Self::Output, narf_capabilities::CapError> {
+        if let Some(parent) = self.parent {
+            return parent.invoke(RegisterControlChild(self));
+        }
+        self.register()
+    }
+}
+struct RegisterControlChild<'a, I>(RegisterControl<'a, I>);
+impl<I: Interface + 'static> narf_capabilities::CapOp<NetIface, Write>
+    for RegisterControlChild<'_, I>
+{
+    type Output = Result<Cap<NetIface, Write>, ControlRegisterError>;
+    fn execute(
+        self,
+        _: &Cap<NetIface, Write>,
+    ) -> Result<Self::Output, narf_capabilities::CapError> {
+        self.0.register()
+    }
+}
+impl<I: Interface + 'static> RegisterControl<'_, I> {
+    fn register(
+        self,
+    ) -> Result<Result<Cap<NetIface, Write>, ControlRegisterError>, narf_capabilities::CapError>
+    {
         if self.iface.control_namespace().is_none()
             || self.iface.name() == "lo"
             || crate::iface::lookup(self.iface.name()).is_some()
@@ -602,6 +628,21 @@ impl<I: Interface + 'static> narf_capabilities::CapOp<NetIface, Grant> for Regis
             return Ok(Err(ControlRegisterError::NotControl));
         }
         let mut entries = self.registry.inner.lock();
+        if let Some(parent) = self.parent {
+            let valid = entries
+                .iter()
+                .find(|entry| entry.handle.slot() == parent.slot())
+                .is_some_and(|entry| {
+                    entry.iface.control_namespace().is_none()
+                        && crate::iface::lookup(entry.iface.name()).is_some_and(|metadata| {
+                            metadata.ownership_epoch != 0
+                                && Some(metadata.net_ns_id) == self.iface.control_namespace()
+                        })
+                });
+            if !valid {
+                return Ok(Err(ControlRegisterError::NotControl));
+            }
+        }
         if entries
             .iter()
             .any(|entry| entry.iface.name() == self.iface.name())
@@ -612,6 +653,7 @@ impl<I: Interface + 'static> narf_capabilities::CapOp<NetIface, Grant> for Regis
         entries.push(Entry {
             iface: Box::new(self.iface),
             handle,
+            control_parent: self.parent,
         });
         Ok(Ok(handle))
     }
@@ -640,6 +682,25 @@ impl Registry {
             .invoke(RegisterControl {
                 registry: self,
                 iface,
+                parent: None,
+            })
+            .map_err(|_| ControlRegisterError::AuthorityRevoked)?
+    }
+    /// Register a freshly created control child under both the actual
+    /// registration grant and current typed physical-parent invocation.
+    /// The stored exact parent handle is consumed by scoped delegation;
+    /// a name, MAC or metadata-only WDEV never establishes this relation.
+    pub fn register_control_child<I: Interface + 'static>(
+        &self,
+        authority: &Cap<NetIface, Grant>,
+        parent: &Cap<NetIface, Write>,
+        iface: I,
+    ) -> Result<Cap<NetIface, Write>, ControlRegisterError> {
+        authority
+            .invoke(RegisterControl {
+                registry: self,
+                iface,
+                parent: Some(*parent),
             })
             .map_err(|_| ControlRegisterError::AuthorityRevoked)?
     }
@@ -662,6 +723,7 @@ impl Registry {
         q.push(Entry {
             iface: Box::new(iface),
             handle,
+            control_parent: None,
         });
         Ok(handle)
     }

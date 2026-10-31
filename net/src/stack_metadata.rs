@@ -49,6 +49,14 @@ impl narf_capabilities::CapOp<StackDaemon, Invoke> for Delegated<'_> {
         self,
         _: &Cap<StackDaemon, Invoke>,
     ) -> Result<Self::Output, narf_capabilities::CapError> {
+        if self
+            .source
+            .parent
+            .as_ref()
+            .is_some_and(|parent| !parent.current())
+        {
+            return Ok(None);
+        }
         self.source.attach.iface.invoke(self)
     }
 }
