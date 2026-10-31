@@ -211,9 +211,16 @@ impl Actor {
     }
 }
 #[derive(Debug)]
-struct Source(AtomicBool);
+struct Source(
+    AtomicBool,
+    IrqSafeSpinLock<Option<Arc<super::super::super::scheduled_epoch::Audit>>>,
+);
 impl DeferredReplySink for Source {
     fn current(&self) -> bool {
+        let audit = self.1.lock().clone();
+        if let Some(audit) = audit {
+            audit.observe();
+        }
         self.0.load(Ordering::Acquire)
     }
     fn deliver(&self, _: Vec<u8>) -> Result<(), i32> {
@@ -265,7 +272,7 @@ impl Control {
             .ifindex;
         Ok(Self {
             harness: Some(h),
-            source: Arc::new(Source(AtomicBool::new(true))),
+            source: Arc::new(Source(AtomicBool::new(true), IrqSafeSpinLock::new(None))),
             admin,
             daemon,
             ifindex,
@@ -743,4 +750,123 @@ fn smoke_mvm_scheduled_mcc_during_profile_or_held_start_stops_retained_emitter()
 kernel_test_in!(
     "drivers/wireless/iwlwifi/gen2/scheduled",
     smoke_mvm_scheduled_mcc_during_profile_or_held_start_stops_retained_emitter
+);
+
+fn copied_result(control: &Control, bssid: [u8; 6]) -> R<Vec<super::super::scheduled::Delivery>> {
+    {
+        let mut actor = control.h().actor.lock();
+        let mut beacon = actor.security.ap.beacon();
+        beacon[10..16].copy_from_slice(&bssid);
+        beacon[16..22].copy_from_slice(&bssid);
+        actor.inject(0xc1, 0, 0x8000, &envelope(&beacon));
+        actor.inject(0xd9, 0, 0x8000, &[]);
+    }
+    let mut state = control
+        .h()
+        .device
+        .state
+        .try_lock()
+        .ok_or("MVM copied result state")?;
+    let (copies, retire) = control.h().device.scheduled_tick(&mut state);
+    ensure(!retire, "MVM actual copied result failed")?;
+    Ok(copies)
+}
+fn scan_cache(control: &Control) -> R<Vec<Vec<u8>>> {
+    use narf_net::netlink_generic::{build_replies_with_endpoint, ReplyOptions, RequestContext};
+    let mut message = Vec::new();
+    message.extend_from_slice(&28u32.to_ne_bytes());
+    message.extend_from_slice(&narf_wireless::nl80211::NL80211_FAMILY_ID.to_ne_bytes());
+    message.extend_from_slice(&0x301u16.to_ne_bytes());
+    message.extend_from_slice(&0x7208u32.to_ne_bytes());
+    message.extend_from_slice(&77u32.to_ne_bytes());
+    message.extend_from_slice(&[32, 1, 0, 0]);
+    message.extend_from_slice(&8u16.to_ne_bytes());
+    message.extend_from_slice(&3u16.to_ne_bytes());
+    message.extend_from_slice(&control.ifindex.to_ne_bytes());
+    narf_wireless::nl80211::register();
+    build_replies_with_endpoint(
+        &message,
+        ReplyOptions::default(),
+        RequestContext {
+            admin: Some(&control.admin),
+            portid: 77,
+            ..RequestContext::default()
+        },
+        control.source.clone(),
+    )
+    .map_err(|_| "MVM actual GET_SCAN dispatch")
+}
+fn smoke_mvm_scheduled_cache_callback_is_linearized_with_native_uid_retirement() -> TestResult {
+    check(|| {
+        let control = Control::new(
+            Profile {
+                command: Some(3),
+                short: false,
+            },
+            false,
+            false,
+        )?;
+        control.start()?;
+        let weak = Arc::downgrade(&control.h().device);
+        let audit = Arc::new(super::super::super::scheduled_epoch::Audit::new(
+            control.h().device.scan_generation.clone(),
+            move || weak.upgrade().is_some_and(|d| d.state.try_lock().is_some()),
+        ));
+        let mut first = copied_result(&control, AP)?;
+        ensure(first.len() == 1, "MVM actual copied result missing")?;
+        *control.source.1.lock() = Some(audit.clone());
+        first.remove(0).publish();
+        *control.source.1.lock() = None;
+        ensure(
+            audit.valid() && audit.calls() >= 3,
+            "MVM shared cache/source callback escaped publication gate or held native state",
+        )?;
+        let stale = copied_result(&control, AP)?;
+        {
+            let mut actor = control.h().actor.lock();
+            let mut done = [0; 16];
+            done[0] = 1;
+            done[6] = 1;
+            actor.inject(0xf, 0, 0x8000, &done);
+            actor.pno.as_mut().unwrap().live = false;
+        }
+        let stopped = {
+            let mut state = control
+                .h()
+                .device
+                .state
+                .try_lock()
+                .ok_or("MVM terminal copy state")?;
+            let (copies, retire) = control.h().device.scheduled_tick(&mut state);
+            ensure(!retire, "MVM actual terminal copy failed")?;
+            copies
+        };
+        ensure(stopped.len() == 1, "MVM actual terminal copy missing")?;
+        control.start()?;
+        let next = [2, 4, 6, 8, 10, 13];
+        for publication in copied_result(&control, next)? {
+            publication.publish();
+        }
+        *control.source.1.lock() = Some(audit.clone());
+        let before = audit.calls();
+        for publication in stale.into_iter().chain(stopped) {
+            publication.publish();
+        }
+        *control.source.1.lock() = None;
+        ensure(
+            audit.calls() == before,
+            "MVM retired callback reentered shared source/cache",
+        )?;
+        let replies = scan_cache(&control)?;
+        ensure(
+            replies.iter().any(|r| r.windows(6).any(|b| b == next))
+                && !replies.iter().any(|r| r.windows(6).any(|b| b == AP)),
+            "MVM late result replaced successor GET_SCAN data",
+        )?;
+        control.stop()
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/gen2/scheduled",
+    smoke_mvm_scheduled_cache_callback_is_linearized_with_native_uid_retirement
 );

@@ -3414,16 +3414,47 @@ live. Dropping that transition's waiter cannot drop its native STOP work.
 Disconnect and system suspend use the same retirement path; firmware
 recovery discards the old slot and requires fresh native configuration.
 
-Six native Gen2 cases plus an independent shared-wire literal are wired.
+Seven native Gen2 cases plus an independent shared-wire literal are wired.
 They cover actual command3 and Linux fallback/SHORT_BL profiles, global
 qualified power before probes, random source masks, missing-qualifier
 passive discovery followed by actual WPA2/DHCP, non-idle refusal, source/
 policy/power loss, dropped START/STOP waiters, exact UID and malformed
 status handling, observation expiry and MCC loss during held profile or
-SCAN_REQ receipts. Coordinated execution is pending. This completes the
+SCAN_REQ receipts, plus the copied-publication ordering in §3.56.
+Coordinated execution is pending. This completes the
 intended API77 idle scope only after those gates; Sc associated coexistence
 and parked Gen3 payload profiles remain distinct open work. Physical RF
 acceptance remains separate from native QEMU software evidence.
+
+### 3.56 Periodic-result publication and native retirement ordering
+
+Sc and Gen2 use one private nonwrapping epoch gate for scheduled START,
+retirement and the complete synchronous result/STOP callback. A copied
+result holds that gate through the actual current-source checks, GET_SCAN
+cache insertion and event enqueue. Retirement and successor START advance
+under the same gate, so a callback either finishes before that transition
+or is refused before reaching the shared cache. Another pre-insert atomic
+load would not provide this ordering. Natural UID completion also retires
+the prior result epoch before stamping its STOP callback. External START
+cancellation is checked again inside publication.
+
+Native state/control locks are released before entering the callback.
+The callback's existing interface checks read constant station mode and
+atomic generation, plus shared current-source/registry metadata; they do
+not acquire native state/control. Epoch advancement calls no external code.
+No gate spans an await, hardware command or native control callback, and
+no current-source, RF-policy or qualification check is removed. Native
+retirement still resolves the actual firmware UID or retains the bounded
+physical stop attempt and all uncertain DMA.
+
+One native case per family captures real RFH BSS copies and the firmware's
+terminal UID across a successor START. The fixture's actual shared source
+checks, including the check under the real GET_SCAN cache lock, observe
+the held publication gate and verify native state is unlocked. Delayed
+result and STOP copies cannot reenter that shared source or overwrite the
+successor's actual GET_SCAN BSSID. Passive scans intentionally supply no
+transmit-policy fence that could mask a private-epoch error. Both cases
+are wired; coordinated native execution is pending.
 
 ## 4. References
 

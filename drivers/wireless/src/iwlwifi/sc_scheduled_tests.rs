@@ -172,9 +172,17 @@ impl Model {
 }
 
 #[derive(Debug)]
-struct Source(AtomicBool, IrqSafeSpinLock<Vec<Vec<u8>>>);
+struct Source(
+    AtomicBool,
+    IrqSafeSpinLock<Vec<Vec<u8>>>,
+    IrqSafeSpinLock<Option<Arc<super::super::super::scheduled_epoch::Audit>>>,
+);
 impl DeferredReplySink for Source {
     fn current(&self) -> bool {
+        let audit = self.2.lock().clone();
+        if let Some(audit) = audit {
+            audit.observe();
+        }
         self.0.load(Ordering::Acquire)
     }
     fn deliver(&self, message: Vec<u8>) -> Result<(), i32> {
@@ -220,6 +228,7 @@ impl Control {
             source: Arc::new(Source(
                 AtomicBool::new(true),
                 IrqSafeSpinLock::new(Vec::new()),
+                IrqSafeSpinLock::new(None),
             )),
             admin,
             daemon,
@@ -700,4 +709,94 @@ fn smoke_sc_scheduled_pass_all_passive_filters_not_found_and_random_probe_source
 kernel_test_in!(
     "drivers/wireless/iwlwifi/sc/scheduled",
     smoke_sc_scheduled_pass_all_passive_filters_not_found_and_random_probe_source
+);
+
+fn copied_result(
+    control: &Control,
+    bssid: [u8; 6],
+) -> R<Vec<super::super::scheduled::Publication>> {
+    {
+        let mut slot = HARNESS.lock();
+        let wire = &mut slot.as_mut().unwrap().1;
+        let mut beacon = wire.ap.beacon();
+        beacon[10..16].copy_from_slice(&bssid);
+        beacon[16..22].copy_from_slice(&bssid);
+        wire.mpdu(&beacon, false);
+        wire.firmware.inject(0xd9, 0, 0x8000, &[]);
+    }
+    let mut state = control
+        .device()
+        .state
+        .try_lock()
+        .ok_or("Sc copied result state")?;
+    state.hardware.poll()?;
+    Ok(control.device().scheduled_step(&mut state))
+}
+fn smoke_sc_scheduled_cache_callback_is_linearized_with_native_uid_retirement() -> TestResult {
+    check(|| {
+        let control = Control::new(configured(false))?;
+        control.start()?;
+        let weak = Arc::downgrade(control.device());
+        let audit = Arc::new(super::super::super::scheduled_epoch::Audit::new(
+            control.device().scan_generation.clone(),
+            move || weak.upgrade().is_some_and(|d| d.state.try_lock().is_some()),
+        ));
+        let mut first = copied_result(&control, AP)?;
+        require(first.len() == 1, "Sc actual copied result missing")?;
+        *control.source.2.lock() = Some(audit.clone());
+        first.remove(0).publish();
+        *control.source.2.lock() = None;
+        require(
+            audit.valid() && audit.calls() >= 3,
+            "Sc shared cache/source callback escaped publication gate or held native state",
+        )?;
+        let stale = copied_result(&control, AP)?;
+        {
+            let mut slot = HARNESS.lock();
+            let wire = &mut slot.as_mut().unwrap().1;
+            let mut done = [0; 16];
+            done[0] = 1;
+            done[6] = 1;
+            wire.firmware.inject(0xf, 0, 0x8000, &done);
+            wire.scheduled.as_mut().unwrap().live = false;
+        }
+        let stopped = {
+            let mut state = control
+                .device()
+                .state
+                .try_lock()
+                .ok_or("Sc terminal copy state")?;
+            state.hardware.poll()?;
+            control.device().scheduled_step(&mut state)
+        };
+        require(stopped.len() == 1, "Sc actual terminal copy missing")?;
+        control.start()?;
+        let next = [2, 0x72, 2, 3, 4, 6];
+        for publication in copied_result(&control, next)? {
+            publication.publish();
+        }
+        // Passive PNO has no transmit-policy fence to accidentally hide an
+        // old private epoch. Keep both old callbacks across a real new UID.
+        *control.source.2.lock() = Some(audit.clone());
+        let before = audit.calls();
+        for publication in stale.into_iter().chain(stopped) {
+            publication.publish();
+        }
+        *control.source.2.lock() = None;
+        require(
+            audit.calls() == before,
+            "Sc retired callback reentered shared source/cache",
+        )?;
+        let replies = dispatch(&control, 32, 0x7108)?;
+        require(
+            replies.iter().any(|r| r.windows(6).any(|b| b == next))
+                && !replies.iter().any(|r| r.windows(6).any(|b| b == AP)),
+            "Sc late result replaced successor GET_SCAN data",
+        )?;
+        control.stop()
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/sc/scheduled",
+    smoke_sc_scheduled_cache_callback_is_linearized_with_native_uid_retirement
 );

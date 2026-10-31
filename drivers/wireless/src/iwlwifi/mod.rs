@@ -102,6 +102,7 @@ mod sc_he;
 mod sc_security;
 mod sc_tx_amsdu;
 pub mod scan_api;
+mod scheduled_epoch;
 mod scheduled_wire;
 pub mod security;
 pub mod sta;

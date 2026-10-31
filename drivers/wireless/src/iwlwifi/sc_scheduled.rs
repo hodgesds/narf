@@ -57,25 +57,28 @@ pub(super) struct Publication {
     event: RadioEventAuthority,
     source: super::super::runtime::source::Fence,
     epoch: u64,
-    generation: Arc<AtomicU64>,
+    generation: Arc<super::super::scheduled_epoch::Epoch>,
+    cancel: Arc<AtomicBool>,
     policy: Option<super::super::mld_policy::Authority>,
     results: Option<Vec<(BssInfo, Vec<u8>)>>,
 }
 impl Publication {
     pub(super) fn publish(self) {
-        let _ = self.source.invoke(|| {
-            if self.generation.load(Ordering::Acquire) != self.epoch {
-                return Err("retired Intel scheduled scan result generation");
-            }
-            if let Some(policy) = &self.policy {
-                policy.check()?;
-            }
-            if let Some(results) = self.results {
-                self.event.scheduled_scan_results_with_bss(results)
-            } else {
-                self.event.scheduled_scan_stopped()
-            }
-            .map_err(|_| "Intel scheduled scan source closed before publication")
+        let _ = self.generation.publish(self.epoch, || {
+            self.source.invoke(|| {
+                if self.cancel.load(Ordering::Acquire) {
+                    return Err("Intel scheduled request canceled before publication");
+                }
+                if let Some(policy) = &self.policy {
+                    policy.check()?;
+                }
+                if let Some(results) = self.results {
+                    self.event.scheduled_scan_results_with_bss(results)
+                } else {
+                    self.event.scheduled_scan_stopped()
+                }
+                .map_err(|_| "Intel scheduled scan source closed before publication")
+            })
         });
     }
 }
@@ -212,13 +215,7 @@ impl Device {
             &request,
         )
         .map_err(|_| 22)?;
-        let epoch = self
-            .scan_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                old.checked_add(2).map(|_| old + 1)
-            })
-            .map_err(|_| 1)?
-            + 1;
+        let epoch = self.scan_generation.begin().map_err(|_| 1)?;
         let event = authority.event_authority().map_err(|_| 1)?;
         state.needs_reset = true;
         state.stop_completed = false;
@@ -306,6 +303,7 @@ impl Device {
         let Some(owner) = state.scheduled.take() else {
             return Ok(());
         };
+        owner.cancel.store(true, Ordering::Release);
         state.hardware.clear_rf_policy();
         let result = async {
             let mut abort = [0; 8];
@@ -337,11 +335,8 @@ impl Device {
         }
         .await;
         // A queued result retains an epoch, not permission after retirement.
-        self.scan_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                old.checked_add(1)
-            })
-            .ok();
+        let generation = self.scan_generation.retire();
+        let result = result.and_then(|()| generation.map(|_| ()));
         if result.is_err() {
             self.stop_locked(state).await;
         }
@@ -432,12 +427,24 @@ impl Device {
             self.start_repair(state);
             return publications;
         }
+        let epoch = if stopped {
+            match self.scan_generation.retire() {
+                Ok(epoch) => epoch,
+                Err(_) => {
+                    self.start_repair(state);
+                    return publications;
+                }
+            }
+        } else {
+            owner.epoch
+        };
         if publish && !owner.results.is_empty() || stopped {
             publications.push(Publication {
                 event: owner.event.clone(),
                 source: self.source.clone(),
-                epoch: owner.epoch,
+                epoch,
                 generation: self.scan_generation.clone(),
+                cancel: owner.cancel.clone(),
                 policy: if stopped {
                     None
                 } else {

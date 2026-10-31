@@ -28,30 +28,30 @@ pub(super) struct Delivery {
     policy: Policy,
     program: super::super::mvm_boot::scheduled::Fence,
     event: RadioEventAuthority,
-    generation: Arc<AtomicU64>,
+    generation: Arc<super::super::scheduled_epoch::Epoch>,
     epoch: u64,
     cancel: Arc<AtomicBool>,
     results: Option<Vec<(BssInfo, Vec<u8>)>>,
 }
 impl Delivery {
     pub fn publish(self) {
-        let _ = self.source.invoke(|| {
-            if self.generation.load(Ordering::Acquire) != self.epoch
-                || self.cancel.load(Ordering::Acquire)
-            {
-                return Err("MVM scheduled publication retired");
-            }
-            if let Some(results) = self.results {
-                self.program.invoke(&(self.policy)()?, || {
+        let _ = self.generation.publish(self.epoch, || {
+            self.source.invoke(|| {
+                if self.cancel.load(Ordering::Acquire) {
+                    return Err("MVM scheduled publication retired");
+                }
+                if let Some(results) = self.results {
+                    self.program.invoke(&(self.policy)()?, || {
+                        self.event
+                            .scheduled_scan_results_with_bss(results)
+                            .map_err(|_| "MVM scheduled result source retired")
+                    })
+                } else {
                     self.event
-                        .scheduled_scan_results_with_bss(results)
-                        .map_err(|_| "MVM scheduled result source retired")
-                })
-            } else {
-                self.event
-                    .scheduled_scan_stopped()
-                    .map_err(|_| "MVM scheduled stop source retired")
-            }
+                        .scheduled_scan_stopped()
+                        .map_err(|_| "MVM scheduled stop source retired")
+                }
+            })
         });
     }
 }
@@ -144,13 +144,7 @@ impl Device {
             .authority
             .event_authority()
             .map_err(|_| "MVM scheduled source retired")?;
-        let epoch = self
-            .scan_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                old.checked_add(2).map(|_| old + 1)
-            })
-            .map_err(|_| "MVM scheduled generation exhausted")?
-            + 1;
+        let epoch = self.scan_generation.begin()?;
         let source = if start.request.probe_ssids.is_empty() {
             None
         } else {
@@ -176,12 +170,7 @@ impl Device {
     ) -> Result<Outcome, &'static str> {
         if let Some(retained) = slot.take() {
             retained.cancel.store(true, Ordering::Release);
-            let generation = self
-                .scan_generation
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                    old.checked_add(1)
-                })
-                .map_err(|_| "MVM scheduled retirement generation exhausted");
+            let generation = self.scan_generation.retire();
             let result = owner.scheduled_stop().await;
             drop(retained);
             result?;
@@ -214,12 +203,8 @@ impl Device {
             Ok(report) => {
                 state.scan_time = report.oldest;
                 let epoch = if report.stopped {
-                    match self.scan_generation.fetch_update(
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                        |old| old.checked_add(1),
-                    ) {
-                        Ok(old) => old + 1,
+                    match self.scan_generation.retire() {
+                        Ok(epoch) => epoch,
                         Err(_) => {
                             control.cancel.store(true, Ordering::Release);
                             owner.station_fail();

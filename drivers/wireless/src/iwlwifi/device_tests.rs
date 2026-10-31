@@ -27,7 +27,7 @@ impl Fixture {
             test_name: None,
             me: me.clone(),
             radio_control: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
-            scan_generation: Arc::new(AtomicU64::new(0)),
+            scan_generation: Arc::new(super::super::scheduled_epoch::Epoch::new()),
             state: Mutex::new(State {
                 hardware,
                 scan_uid: 0,

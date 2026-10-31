@@ -29,7 +29,7 @@ pub struct Device {
     test_name: Option<&'static str>,
     me: Weak<Self>,
     radio_control: Arc<narf_wireless::ap_control::ExclusiveControl>,
-    scan_generation: Arc<AtomicU64>,
+    scan_generation: Arc<super::scheduled_epoch::Epoch>,
     state: Mutex<State>,
     control: Mutex<Option<Work>>,
     publication: AtomicBool,
@@ -254,7 +254,7 @@ impl Device {
             test_name: None,
             me: me.clone(),
             radio_control: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
-            scan_generation: Arc::new(AtomicU64::new(0)),
+            scan_generation: Arc::new(super::scheduled_epoch::Epoch::new()),
             state: Mutex::new(State {
                 hardware,
                 scan_uid: 0,
