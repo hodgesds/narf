@@ -230,6 +230,16 @@ ordinary boots and both btrfs postflight images per architecture. The
 canonical later scan implementation removes that redundant conversion too.
 Broader scan/HT, concrete P2P and subsequent MQ/ROC batches remain separate.
 
+**Recount 2026-10-30** (accepted RTL scans, channel profiles and multiple radios):
+the ledger holds **119 `feature`** rows (118 driver,1 shared), **35 `chip`**
+and **0 `unknown`**. The completed fixture-only `ed1946ffd` checkpoint passes
+x86_64 **4214/0/13** and aarch64 **3855/0/7**, including all39 focused radio/HE
+cases, both release Clippy contexts, formatting, ordinary boots and both
+btrfs postflight images per architecture. Three RTL rows close for the
+retained factory-qualified1–11 profiles. Intel queue/RSS rows remain open
+until the separately corrected wide-header command graph passes refreshed
+native and final gates; the earlier fixture graph alone is insufficient.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 13 | Parked Gen3 HE/TX A-MSDU and wider bands/widths; AP/P2P/WoW, scheduled scan and Gen2 multiple RX queues/RSS; additional chip profiles are tracked separately |
@@ -237,7 +247,7 @@ Broader scan/HT, concrete P2P and subsequent MQ/ROC batches remain separate.
 | mt76 | 5 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA and loadable packet ABI |
 | ath10k | 18 | 2.4-GHz HT40/coexistence, additional streams/TX STBC and VHT160/80+80, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload |
 | ath9k | 9 | Channel/retune and HT40/SGI40 profiles, factory selection, periodic calibration, larger TX aggregates and idle/station sleep; other chips are separate rows |
-| rtlwifi | 12 | Other matched chips, broader scan/channels/HT40/VHT, antenna/gain/coexistence, multiple radios, RTS/CTS and PCIe ASPM |
+| rtlwifi | 9 | Other matched chips, HT40/VHT, antenna/gain/coexistence, RTS/CTS and PCIe ASPM |
 | rtl8xxxu | 9 | Other matched USB chips, SGI20/HT40 and wider channels/rates, RX/TX A-MPDU, TX A-MSDU, both BA directions and RX reorder, coexistence, EP0/halted reset, safe rejoin, FIFO retune and PM |
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
 | rtw89 | 13 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW, periodic RF tracking/runtime LPS and multiple functions; other AX/BE chips are separate rows |
@@ -884,12 +894,12 @@ and `rate_fallback_request(channel)` for channels1–11. These return exact
 factory/NEPC/executable program bindings; they confer no transmit permission.
 Channel1 retains NEHT v2/NEFB v1, while channels2–11 require separately bound
 NEHT v3/NEFB v2 records as specified in `rtlwifi.md` §3. These continuations
-are implemented pending native acceptance.
+are implemented and software-validated in the retained profiles.
 
 RTL8188EE also exposes exact-function `pci::with_controller_at(BusAddr, f)`
 and async `pci::provision_at(BusAddr)`; the existing helpers select the first
 bound controller for compatibility. Independent radios retain per-function
-PCI, frontend, context-send and MSI ownership, pending native acceptance.
+PCI, frontend, context-send and MSI ownership, software-validated above.
 
 ## 4. Interaction with `narf-wireless`
 

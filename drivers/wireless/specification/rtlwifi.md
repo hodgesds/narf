@@ -1135,10 +1135,10 @@ Four native composed cases exercise actual1→6→11→1 RF18 and distinct gain
 receipts with Open/WPA2 DHCP, preflight/idle rejection, abandoned waiters and
 IPS wake. All four pass on both architectures at native checkpoint
 `196e0a946`; final release gates pass at its one-line lint successor
-`32504f88d`. Both family rows remain open for the later multi-channel scan
-and per-channel HT/fallback continuations.
+`32504f88d`. The later multi-channel scan and per-channel HT/fallback
+continuations are accepted below.
 
-### Multi-channel software scanning (implemented, native acceptance pending)
+### Multi-channel software scanning (implemented and software-validated)
 
 A scan now validates the complete requested channel/frequency set before its
 first hardware action. Duplicate selectors are deduplicated, conflicting
@@ -1161,10 +1161,11 @@ driver-owned transition, and incomplete scans publish no partial cache.
 Five native composed cases exercise Open/WPA2 scan-selected fresh joins and
 actual DHCP, default passive scanning with physical off-channel filtering,
 whole-plan prevalidation, stale display metadata and cancelled retained work.
-Acceptance remains pending. The dwell/probe/channel progression follows
+All five pass on both architectures with the completed release gates
+recorded below. The dwell/probe/channel progression follows
 Linux [mac80211 scan.c](https://github.com/torvalds/linux/blob/master/net/mac80211/scan.c).
 
-### Per-channel HT20 and DATA fallback (implemented, native acceptance pending)
+### Per-channel HT20 and DATA fallback (implemented and software-validated)
 
 `RtlwifiDevice::ht20_request_on_channel(channel)` and
 `rate_fallback_request(channel)` return provisioning filenames and bindings
@@ -1195,10 +1196,10 @@ authorize the richer profile.
 Five native cases cover literal factory-group bounds, version/channel/source
 substitution and revocation, and composed channel6/channel11 HT Open/WPA2
 MLME, actual kernel DHCP, real TXAGC readbacks and native fallback descriptors.
-They remain pending acceptance. Wider widths and thermal gain tracking remain
-separate rows.
+All five pass on both architectures with the completed release gates below.
+Wider widths and thermal gain tracking remain separate rows.
 
-### Multiple retained radios (implemented, native acceptance pending)
+### Multiple retained radios (implemented and software-validated)
 
 Each PCI function now has its own retained controller, interface name, native
 frontend and MSI signal. Probe reserves the exact BDF before hardware access;
@@ -1226,7 +1227,17 @@ by that device's control mutex and generation.
 Six native cases cover independent and stale stack/IRQ routes, checked cookie
 exhaustion, exact PCI reservations/quarantine, and two composed Open/WPA2
 firmware/radio owners using actual context-routed kernel DHCP and native data
-through removal of one radio. Acceptance remains pending.
+through removal of one radio. All six pass on both architectures.
+
+Acceptance checkpoint `fc0101c6e` passes all34 focused cases on both
+architectures. The fixture-only successor `ed1946ffd` additionally fixes an
+inherited HE fixture stack overflow and passes all39 focused cases, full
+wireless/foundation suites (**4214/0/13** x86_64; **3855/0/7** aarch64),
+both release Clippy contexts, formatting, ordinary production release boots
+and both btrfs postflight images per architecture. The active-scanning,
+additional-operating-channels and multi-radio inventory rows are closed for
+the retained factory-qualified1–11 profiles. Physical board RF qualification
+remains separate; the later Intel command-group correction has its own gates.
 
 ## 4. Invariants
 
@@ -1262,13 +1273,13 @@ implemented and software-validated. Physical board qualification remains.
 | RF/BB tables, calibration, channel/power and rate control | RTL8188EE tables/retained1T IQK/LCK, static factory antenna, signed board/factory/regulatory legacy20 power, operational MAC and negotiated legacy peer/rate/filter integration implemented. Measured board envelope and silicon qualification remain; optional gain tracking is excluded by measured profile |
 | Scan, management RX/TX, authentication/association and WPA2 | Retained EE channel1 passive scan, Open MLME, shared WPA2/CCMP and exact M4 receipt implemented; Device/composition regressions pass native suites. Other matched chips remain missing |
 | Ethernet packet path and terminal TX completion ownership | EE same-owner native Device/Narf-Ring/stack and Open/WPA2 real-kernel DHCP/exact bidirectional IP fixtures pass software gates; actual board testing remains |
-| Multi-radio, removal, suspend/reset/recovery | RTL8188EE PCI removal (quiescence-gated DMA release), retained reset, system suspend and IPS implemented and software-validated; independent retained radios implemented pending native acceptance |
+| Multi-radio, removal, suspend/reset/recovery | RTL8188EE PCI removal (quiescence-gated DMA release), retained reset, system suspend and IPS implemented and software-validated; independent retained radios implemented and software-validated |
 
 Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
 
 | Chip | Source hardware scope | Remaining native software |
 |---|---|---|
-| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. NEHT v2 additionally implements SGI20 and7935-byte reception; four native composed regressions pass on both architectures. Reset/recovery, system suspend and IPS are software-validated. Remaining software: HT40, broader scan/channels and gain tracking (MSI delivery, fwlps leisure power save and DMA quiescence are implemented). Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
+| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. NEHT v2 additionally implements SGI20 and7935-byte reception; four native composed regressions pass on both architectures. Reset/recovery, system suspend and IPS are software-validated. Remaining software: HT40, antenna/gain tracking, RTS/CTS and PCIe ASPM (MSI delivery, fwlps leisure power save and DMA quiescence are implemented). Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
 | RTL8192CE family aliases / RTL8192EE |2.4GHz HT; CE aliases need exact RF-type qualification, including the8176/8188CE variant; EE is2T2R |Retained chip firmware/MAC/PHY/RF/calibration/power/packet/station chain, then full HT/QoS/lifecycle. The8179/8188EE HT path does not admit these IDs. |
 | RTL8192DE |Dual-band dual-MAC HT |Exact per-function reset/power/firmware/DMA/radio ownership and station chains, then bands/HT/QoS/lifecycle |
 | RTL8723AE/BE |2.4GHz1T1R HT with BT |Chip-specific retained chain, antenna/BT coexistence and HT/QoS/lifecycle |
@@ -1379,13 +1390,10 @@ runtimes remain separate from the retained RTL8188EE owner.
 
 | Row | Concrete blocker |
 |---|---|
-| `active_scanning` | Native active probes and qualified cold retune1–11 software-validated; multi-channel dwell aggregation with owned metadata/fresh physical join observation implemented pending acceptance |
-| `additional_operating_channels` | Legacy20 cold retune1–11 under current signed per-channel NEPC software-validated; per-channel HT20/NEFB continuations implemented pending acceptance |
 | `bt_coexistence` | Bluetooth coexistence on RTL8723AE/BE; blocked on the rtl8723ae/rtl8723be chip runtimes |
 | `dynamic_antenna_selection` | Dynamic antenna selection/tracking; blocked on per-antenna signed board measurements (NEPC binds one static factory antenna) |
 | `five_ghz_operation` | 5GHz band operation on RTL8192DE/RTL8821AE; blocked on the rtl8192de/rtl8821ae chip runtimes (RTL8188EE is 2.4GHz-only) |
 | `ht40` | HT40; blocked on a signed NEHT v2 record covering 40MHz emissions (NEHT v1 binds width20) and 40MHz BW programming |
-| `multi_radio` | Independent retained PCI/frontend/MSI owners implemented pending native acceptance; exact per-function probe/quarantine and never-reused context-send cookies preserve device identity through removal/reprobe |
 | `pcie_aspm` | PCIe ASPM link power management; blocked on bus/ PCIe link-control ASPM programming coordinated with the upstream bridge (outside family scope) |
 | `rf_gain_tracking` | RF gain/power tracking; blocked on a thermal-indexed signed gain envelope (thermal power tracking moves gains outside the fixed NEPC/NEHT envelope) |
 | `rts_cts_protection` | RTS/CTS protection; blocked on signed qualification of RTS/CTS-to-self emissions (NEPC/NEHT exclude them) and TXD RTS fields driven by bss use_cts_prot/use_rts |
