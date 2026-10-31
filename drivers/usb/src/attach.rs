@@ -595,15 +595,19 @@ pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
 /// cleared from their own registries (boot + report keyboards,
 /// mouse, touchpad, consumer, generic, ACM, xpad), every bound
 /// MSC device is removed from `MSC_DEVICES` and unpublished via
-/// `msc::unbind_all_msc`, and the hub registry is cleared.
+/// `msc::unbind_all_msc`, every bound fingerprint reader and
+/// recognised WBDI sensor is removed and unpublished via
+/// `fingerprint::unbind_all_fp` / `wbdi::unbind_all_wbdi`
+/// (#922), and the hub registry is cleared.
 /// Registered class drivers' per-slot unbind hooks are NOT called
 /// on this path, and classes with neither a pumped clear nor a
-/// wholesale unbind here (UAC / UVC / CDC-NCM / btusb / CCID)
-/// keep their class-level registries across recovery — the
-/// documented remainder of #748. The MSC call is load-bearing,
+/// wholesale unbind here (UAC / UVC / CDC-NCM / btusb / CCID /
+/// CTAP) keep their class-level registries across recovery —
+/// the documented remainder of #748. The MSC call is load-bearing,
 /// not symmetry: a surviving `MSC_DEVICES` entry would make
 /// re-enumeration append a second live adapter for the same BOT
-/// device (queue 16, Concern C).
+/// device (queue 16, Concern C); the fingerprint clear serves the
+/// same purpose for re-enumerated readers.
 pub fn detach_all_bindings() {
     hid::clear_boot_keyboards();
     hid::keyboard::unregister_all_keyboards();
@@ -615,6 +619,8 @@ pub fn detach_all_bindings() {
     crate::serial::port::clear_serial();
     crate::xpad::clear_xpad();
     crate::msc::unbind_all_msc();
+    crate::fingerprint::unbind_all_fp();
+    crate::wbdi::unbind_all_wbdi();
     HUBS.lock().clear();
 }
 

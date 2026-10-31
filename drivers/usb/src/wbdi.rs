@@ -288,6 +288,64 @@ pub fn __reset_wbdi_for_test() {
     WBDI_DEVICES.lock().clear();
 }
 
+// ── Lifecycle: detach (#922) ─────────────────────────────────────────
+
+/// Detach bookkeeping for one slot: remove every registry entry
+/// for `slot_id`. Returns the removed count. Infallible and
+/// idempotent: a second call for the same slot removes nothing.
+/// WBDI entries carry no node and no volatile state, so there is
+/// no suspend/resume half here — the system-PM hook belongs to
+/// the fingerprint stack (`fingerprint::register_pm`), not to
+/// recognition.
+///
+/// Merge note: on #1237's branch this registry is deleted —
+/// recognition flows directly into binding — so this hook's
+/// merge interaction is flagged in the PR body.
+pub fn detach_wbdi(slot_id: u8) -> usize {
+    let mut g = WBDI_DEVICES.lock();
+    let before = g.len();
+    g.retain(|dev| dev.slot_id != slot_id);
+    before - g.len()
+}
+
+/// Controller-recovery teardown: drop every recognised sensor.
+/// Called from `attach::detach_all_bindings` alongside the
+/// fingerprint clear, for the same reason: stale entries must
+/// not survive to be re-enumerated alongside fresh binds.
+pub fn unbind_all_wbdi() {
+    WBDI_DEVICES.lock().clear();
+}
+
+/// Registry probe that never claims: WBDI binds through the
+/// attach cascade, never the class-registry probe — this entry
+/// exists so the registry's unbind dispatch (detach path) can
+/// reach [`detach_wbdi`], mirroring MSC.
+fn wbdi_registry_probe(
+    _device: alloc::sync::Arc<crate::device::USBDevice>,
+) -> Result<(), crate::class_registry::UsbProbeError> {
+    Err(crate::class_registry::UsbProbeError::BindFailed)
+}
+
+/// Register WBDI's unbind hook with the class registry. Called
+/// from the crate's Stage::Subsys initcalls (`lib.rs`).
+/// [`detach_wbdi`] is infallible bookkeeping, so the hook adapts
+/// it to the fallible [`UsbUnbindFn`] contract with an
+/// unconditional `Ok(())` (#893: a hook reports failure with
+/// `Err(())`, never by panicking). The matches slice is empty
+/// on purpose: the probe must never fire (the cascade binds
+/// WBDI), so the entry is hook-only.
+pub fn register_initcalls() {
+    let _ = crate::class_registry::register_class_driver_with_unbind(
+        "usb-wbdi",
+        &[],
+        wbdi_registry_probe,
+        |slot| {
+            detach_wbdi(slot);
+            Ok(())
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
