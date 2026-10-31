@@ -316,11 +316,15 @@ also consult upstream Linux GPL sources.
   binding wholesale (`attach::detach_all_bindings`) and re-enumeration
   follows; on that path the pumped classes are cleared from their
   registries and every MSC device is removed and unpublished
-  (`msc::unbind_all_msc`). On the per-slot detach path, classes the
-  supervisor does not pump (MSC / UAC / UVC / CDC-NCM / btusb / CCID)
-  get the slot disable + reclaim but no class-registry removal yet;
-  the remaining non-pumped classes keep their registries across
-  recovery as well.
+  (`msc::unbind_all_msc`), and every CDC-NCM / r8152 binding is
+  tombstoned and its net iface unregistered
+  (`cdc_ncm::detach_all_ncm`, `r8152::detach_all_r8152`). On the
+  per-slot detach path, classes the supervisor does not pump
+  (MSC / UAC / UVC / btusb / CCID) get the slot disable + reclaim
+  but no class-registry removal yet; the remaining non-pumped
+  classes keep their registries across recovery as well.
+  CDC-NCM and r8152 are not in that set: their unbind hooks run
+  on the per-slot path via `dispatch_unbind` (see below).
 - `find_video_streaming_endpoints(config)` returns each UVC bulk/isochronous IN
   endpoint with its owning interface and alternate setting.
   `select_video_streaming_iso_endpoint(endpoints, payload)` chooses the smallest
@@ -386,6 +390,25 @@ also consult upstream Linux GPL sources.
   `register_tty_usb`: it removes the port from the ttyUSB node table and
   withdraws the `/sys/class/tty/ttyUSB<N>` kobject. Indices are not
   recycled; a replugged adapter republishes under a fresh index.
+- `cdc_ncm::detach_ncm_slot(slot_id)` and
+  `r8152::detach_r8152_slot(slot_id)` are the USB-Ethernet
+  publication teardowns — tombstone every record bound to the slot
+  (pump-stop flag set first, so a running pump exits on its own;
+  the NCM pump additionally checks the tombstone at its loop top)
+  and unregister each record's net iface via
+  `narf_net::iface::unregister(name)`. Records are never removed:
+  net-registry TX cookies are record indices, so removal would
+  retarget every later device's cookie at the wrong device
+  (the ECM rule); TX/RX on a tombstoned index fail closed
+  (`NotNcm` / `None`). Both are registered as class-registry
+  unbind hooks (`register_class_driver_with_unbind`) and reached
+  via `dispatch_unbind` on the supervisor's detach path; NCM
+  binding stays in the attach cascade and r8152 binding stays in
+  its class-registry probe, and both probes decline nothing they
+  previously accepted. `cdc_ncm::detach_all_ncm()` and
+  `r8152::detach_all_r8152()` are the wholesale variants for
+  controller-recovery teardown. Indices are not recycled; a
+  replugged adapter republishes under a fresh index.
 - `serial::port` is the bind + transfer layer for vendor USB-serial
   adapters (FTDI, Silicon Labs CP210x, Prolific PL2303, WCH CH341 —
   dispatched by exact VID/PID via `serial::identify`, which no other

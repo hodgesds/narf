@@ -1117,6 +1117,7 @@ pub mod tests {
             crc_enabled: false,
             iface_name: alloc::format!("usb-ncm-model-{}", slot_id),
             pump_running: false,
+            detached: false,
         };
         {
             let mut g = CDC_NCM_DEVICES.lock();
@@ -1146,6 +1147,192 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/cdc_ncm", smoke_ncm_tx_routing_two_devices);
+
+    /// Two modelled NCM devices bind; detaching the first
+    /// tombstones exactly its record (TX fail-closes, net iface
+    /// unregisters, survivor untouched), detach is idempotent
+    /// and a no-op for unknown slots, wholesale detach clears
+    /// the rest, and a re-push of the same slot publishes under
+    /// a fresh index — never a duplicate iface, never a
+    /// retargeted TX cookie.
+    /// Masking-defeating cases: the detached record's pump had
+    /// already exited (`pump_running` false before detach) yet
+    /// detach still tombstones + unregisters; and TX state
+    /// taken before detach does not survive it (`take_tx_state`
+    /// after detach is `None` even though the sequence had
+    /// already advanced).
+    fn smoke_ncm_detach_tombstones_and_unregisters() -> TestResult {
+        __reset_ncm_for_test();
+        let mk = |slot_id: u8, out_dci: u8| CdcNcmDevice {
+            slot_id,
+            comm_iface: 0,
+            data_iface: 1,
+            bulk_in_dci: 3,
+            bulk_out_dci: out_dci,
+            tx_sequence: 0,
+            mac: [0x02, 0, 0, 0, 0, slot_id],
+            ntb_in_max_size: 4096,
+            ntb_out_max_size: 16384,
+            crc_enabled: false,
+            iface_name: alloc::format!("usb-ncm-detach{}", slot_id),
+            pump_running: true,
+            detached: false,
+        };
+        {
+            let mut g = CDC_NCM_DEVICES.lock();
+            g.push(mk(7, 4));
+            g.push(mk(9, 6));
+        }
+        // Register the net ifaces for real, capturing the
+        // assigned names, so the unregister half is asserted
+        // against the net registry, not trusted. Names follow
+        // the production rule (`usb-ncm{record index}`).
+        let (name7, name9) = {
+            let mut g = CDC_NCM_DEVICES.lock();
+            let n7 = narf_net::iface::register_with_context(
+                "usb-ncm0",
+                [0x02, 0, 0, 0, 0, 7],
+                0,
+                ncm_send_ctx,
+            );
+            let n9 = narf_net::iface::register_with_context(
+                "usb-ncm1",
+                [0x02, 0, 0, 0, 0, 9],
+                1,
+                ncm_send_ctx,
+            );
+            g[0].iface_name = n7.clone();
+            g[1].iface_name = n9.clone();
+            (n7, n9)
+        };
+        if narf_net::iface::lookup(&name7).is_none() || narf_net::iface::lookup(&name9).is_none() {
+            __reset_ncm_for_test();
+            return TestResult::Fail("net ifaces must resolve before detach");
+        }
+        if attached_ncm_count() != 2 {
+            __reset_ncm_for_test();
+            return TestResult::Fail("two devices should be bound");
+        }
+        // Advance device 0's TX sequence, then simulate its
+        // pump having already exited before detach lands.
+        if take_tx_state(0).is_none() {
+            __reset_ncm_for_test();
+            return TestResult::Fail("TX state must resolve before detach");
+        }
+        {
+            let mut g = CDC_NCM_DEVICES.lock();
+            g[0].pump_running = false;
+        }
+        if detach_ncm_slot(7).is_err() {
+            __reset_ncm_for_test();
+            return TestResult::Fail("detach must be infallible");
+        }
+        let ok = attached_ncm_count() == 1
+            && tx_target(0).is_none()
+            && take_tx_state(0).is_none()
+            && CdcNcmIface::from_idx(0).is_none()
+            && narf_net::iface::lookup(&name7).is_none()
+            && tx_target(1) == Some((9, 6))
+            && CdcNcmIface::from_idx(1).is_some()
+            && narf_net::iface::lookup(&name9).is_some();
+        if !ok {
+            __reset_ncm_for_test();
+            return TestResult::Fail("detach must tombstone exactly one binding");
+        }
+        // Idempotent, and unknown slots are a silent no-op.
+        let _ = detach_ncm_slot(7);
+        let _ = detach_ncm_slot(99);
+        if attached_ncm_count() != 1 || tx_target(1) != Some((9, 6)) {
+            __reset_ncm_for_test();
+            return TestResult::Fail("repeat/unknown detach must not change the registry");
+        }
+        detach_all_ncm();
+        if attached_ncm_count() != 0
+            || tx_target(1).is_some()
+            || narf_net::iface::lookup(&name9).is_some()
+        {
+            __reset_ncm_for_test();
+            return TestResult::Fail("wholesale detach must clear every binding");
+        }
+        // Re-push the same slot: records are never removed, so
+        // the new record lands at a fresh index with a fresh
+        // iface name — never a duplicate, never a recycled
+        // cookie. The re-bound name follows the production
+        // rule (`usb-ncm{record index}`), exactly as bind
+        // assigns it.
+        let idx = {
+            let mut g = CDC_NCM_DEVICES.lock();
+            let idx = g.len();
+            g.push(mk(7, 4));
+            g[idx].iface_name = alloc::format!("usb-ncm{}", idx);
+            idx
+        };
+        if idx != 2 {
+            __reset_ncm_for_test();
+            return TestResult::Fail("re-bind must not reuse a tombstoned index");
+        }
+        let fresh = {
+            let g = CDC_NCM_DEVICES.lock();
+            g[idx].iface_name.clone()
+        };
+        if fresh == name7 {
+            __reset_ncm_for_test();
+            return TestResult::Fail("re-bind must not recycle the detached iface name");
+        }
+        let _ = detach_ncm_slot(7);
+        if attached_ncm_count() != 0 {
+            __reset_ncm_for_test();
+            return TestResult::Fail("cleanup detach must leave no live binding");
+        }
+        __reset_ncm_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/cdc_ncm",
+        smoke_ncm_detach_tombstones_and_unregisters
+    );
+
+    /// The class-registry unbind hook installed by
+    /// `cdc_ncm::register_initcalls` must reach `detach_ncm_slot`
+    /// through the supervisor's `dispatch_unbind` path — the
+    /// wiring the hub-detach path actually uses, not just the
+    /// detach function in isolation.
+    fn smoke_ncm_dispatch_unbind_reaches_detach() -> TestResult {
+        __reset_ncm_for_test();
+        {
+            let mut g = CDC_NCM_DEVICES.lock();
+            g.push(CdcNcmDevice {
+                slot_id: 7,
+                comm_iface: 0,
+                data_iface: 1,
+                bulk_in_dci: 3,
+                bulk_out_dci: 4,
+                tx_sequence: 0,
+                mac: [0x02, 0, 0, 0, 0, 7],
+                ntb_in_max_size: 4096,
+                ntb_out_max_size: 16384,
+                crc_enabled: false,
+                iface_name: alloc::format!("usb-ncm-detach{}", 7),
+                pump_running: true,
+                detached: false,
+            });
+        }
+        register_initcalls();
+        let report = crate::class_registry::dispatch_unbind(7);
+        let live = attached_ncm_count();
+        __reset_ncm_for_test();
+        if report.invoked == 0 {
+            return TestResult::Fail("dispatch_unbind invoked no hooks");
+        }
+        if live != 0 {
+            return TestResult::Fail("unbind hook must tombstone the slot 7 binding");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/cdc_ncm",
+        smoke_ncm_dispatch_unbind_reaches_detach
+    );
 }
 
 // ── Class enumeration + bind ───────────────────────────────────────
@@ -1191,6 +1378,12 @@ pub struct CdcNcmDevice {
     pub iface_name: alloc::string::String,
     /// RX pump liveness flag (pump clears it on exit).
     pub pump_running: bool,
+    /// Detach tombstone: set by `detach_ncm_slot`. The pump exits
+    /// when it sees it; TX/RX resolve to `NotNcm`. Records are
+    /// never removed, because net-registry TX cookies are record
+    /// indices — removing a record would retarget every later
+    /// device's cookie at the wrong device (the ECM rule).
+    pub detached: bool,
 }
 
 /// System-wide registry of bound CDC-NCM devices.
@@ -1556,6 +1749,7 @@ pub async fn try_bind_ncm_already_addressed(
             crc_enabled: negotiated.crc_enabled,
             iface_name: alloc::format!("usb-ncm{}", idx),
             pump_running: false,
+            detached: false,
         });
         idx
     };
@@ -1603,6 +1797,17 @@ async fn ncm_rx_pump(idx: usize) {
     let mut buf = alloc::vec![0u8; buf_len];
     let mut errors = 0u32;
     loop {
+        // Detach check first: a tombstoned record exits before
+        // posting another transfer or delivering another frame.
+        // An NTB already in flight when detach lands may still
+        // deliver once (same window as ECM); the loop never
+        // iterates past the tombstone.
+        {
+            let g = CDC_NCM_DEVICES.lock();
+            if g.get(idx).map(|d| d.detached).unwrap_or(true) {
+                break;
+            }
+        }
         match c.bulk_in(slot_id, bulk_in_dci, &mut buf).await {
             Ok(n) if n > 0 => {
                 errors = 0;
@@ -1687,10 +1892,14 @@ pub fn find_ncm_bulk_endpoints(
 }
 
 /// Resolve a device-record index to its TX target
-/// `(slot_id, bulk_out_dci)`.
+/// `(slot_id, bulk_out_dci)`. A detached record resolves to
+/// `None`: a tombstoned index must never retarget a later
+/// device, and must never emit on a dead slot.
 pub fn tx_target(idx: usize) -> Option<(u8, u8)> {
     let g = CDC_NCM_DEVICES.lock();
-    g.get(idx).map(|d| (d.slot_id, d.bulk_out_dci))
+    g.get(idx)
+        .filter(|d| !d.detached)
+        .map(|d| (d.slot_id, d.bulk_out_dci))
 }
 
 /// Snapshot + advance the TX bookkeeping for device `idx`:
@@ -1700,7 +1909,7 @@ pub fn tx_target(idx: usize) -> Option<(u8, u8)> {
 /// a sequence number — and never touch another device's counter.
 pub fn take_tx_state(idx: usize) -> Option<(u8, u8, u16, bool, u32)> {
     let mut g = CDC_NCM_DEVICES.lock();
-    let dev = g.get_mut(idx)?;
+    let dev = g.get_mut(idx).filter(|d| !d.detached)?;
     let seq = dev.tx_sequence;
     dev.tx_sequence = dev.tx_sequence.wrapping_add(1);
     Some((
@@ -1760,7 +1969,7 @@ pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, NcmError> {
 pub fn recv_frame(idx: usize, scratch: &mut [u8]) -> Result<Option<&[u8]>, NcmError> {
     let (slot_id, bulk_in_dci) = {
         let g = CDC_NCM_DEVICES.lock();
-        let dev = g.get(idx).ok_or(NcmError::NotNcm)?;
+        let dev = g.get(idx).filter(|d| !d.detached).ok_or(NcmError::NotNcm)?;
         (dev.slot_id, dev.bulk_in_dci)
     };
     // Sync entry-point on the net RX path; bridge to async bulk_in
@@ -1821,6 +2030,64 @@ fn ncm_send_ctx(cookie: u64, frame: &[u8], _meta: narf_net::TxMeta) -> Result<()
     }
 }
 
+/// Detach hook for a slot: tombstone every NCM record bound to
+/// it and unregister its net iface. The pump exits on the
+/// tombstone at its next loop-top check; TX/RX resolve to
+/// `NotNcm` instead of retargeting a later device (records are
+/// never removed — the ECM rule: net-registry TX cookies are
+/// record indices). Unknown slots no-op; repeat detach is a
+/// silent no-op (unregister is idempotent).
+///
+/// Panic-free and idempotent by the #893 hook contract: no
+/// indexing and no fallible unwraps on any path. Tombstones are
+/// set under the registry lock and iface names collected there,
+/// but the net unregister runs after the lock is released —
+/// the net registry lock must never be taken while the NCM
+/// registry lock is held (UVC collect-then-unregister pattern).
+/// A TX already past `take_tx_state` when detach lands may
+/// still hit the wire; every later TX fail-closes.
+///
+/// Infallible bookkeeping, adapted to the [`UsbUnbindFn`]
+/// contract with an unconditional `Ok(())` (#893: a hook
+/// reports failure with `Err(())`, never by panicking).
+pub fn detach_ncm_slot(slot_id: u8) -> Result<(), ()> {
+    let ifaces: Vec<alloc::string::String> = {
+        let mut g = CDC_NCM_DEVICES.lock();
+        let mut names = Vec::new();
+        for dev in g.iter_mut().filter(|d| d.slot_id == slot_id && !d.detached) {
+            dev.detached = true;
+            dev.pump_running = false;
+            names.push(dev.iface_name.clone());
+        }
+        names
+    };
+    for name in ifaces {
+        let _ = narf_net::iface::unregister(&name);
+    }
+    Ok(())
+}
+
+/// Wholesale variant of [`detach_ncm_slot`] for controller
+/// recovery (`attach::detach_all_bindings`): tombstone every
+/// NCM binding and unregister every net iface, regardless of
+/// slot. Infallible and idempotent, same pump-exit and
+/// never-remove reasoning as [`detach_ncm_slot`].
+pub fn detach_all_ncm() {
+    let ifaces: Vec<alloc::string::String> = {
+        let mut g = CDC_NCM_DEVICES.lock();
+        let mut names = Vec::new();
+        for dev in g.iter_mut().filter(|d| !d.detached) {
+            dev.detached = true;
+            dev.pump_running = false;
+            names.push(dev.iface_name.clone());
+        }
+        names
+    };
+    for name in ifaces {
+        let _ = narf_net::iface::unregister(&name);
+    }
+}
+
 /// Register the NCM device at `idx` as a network interface under
 /// `usb-ncm{idx}`, publishing the device-supplied station
 /// address `mac`. Returns the assigned interface name.
@@ -1829,8 +2096,15 @@ fn register_ncm_iface(idx: usize, mac: [u8; 6]) -> alloc::string::String {
     narf_net::iface::register_with_context(&name, mac, idx as u64, ncm_send_ctx)
 }
 
+/// Number of live (non-detached) NCM devices. Tombstoned
+/// records still occupy their index (TX cookies are indices),
+/// so the raw registry length is not the live count.
 pub fn attached_ncm_count() -> usize {
-    CDC_NCM_DEVICES.lock().len()
+    CDC_NCM_DEVICES
+        .lock()
+        .iter()
+        .filter(|d| !d.detached)
+        .count()
 }
 
 #[doc(hidden)]
@@ -1879,10 +2153,10 @@ pub struct CdcNcmIface {
 
 impl CdcNcmIface {
     /// Construct from a bound-device index. Returns `None` if `idx`
-    /// is out of range.
+    /// is out of range or the record is detached.
     pub fn from_idx(idx: usize) -> Option<Self> {
         let g = CDC_NCM_DEVICES.lock();
-        let dev = g.get(idx)?;
+        let dev = g.get(idx).filter(|d| !d.detached)?;
         Some(Self { idx, mac: dev.mac })
     }
 
@@ -1922,5 +2196,16 @@ pub fn probe(
 }
 
 pub fn register_initcalls() {
-    let _ = crate::class_registry::register_class_driver("cdc-ncm", &CDC_NCM_MATCH, probe);
+    // Mirror ECM's hook registration: the probe always declines
+    // (NCM binding stays in the attach cascade), and the unbind
+    // hook adapts infallible `detach_ncm_slot` to the fallible
+    // `UsbUnbindFn` contract with an unconditional `Ok(())`
+    // (#893: a hook reports failure with `Err(())`, never by
+    // panicking).
+    let _ = crate::class_registry::register_class_driver_with_unbind(
+        "cdc-ncm",
+        &CDC_NCM_MATCH,
+        probe,
+        detach_ncm_slot,
+    );
 }
