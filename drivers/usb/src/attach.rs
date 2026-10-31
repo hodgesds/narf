@@ -917,7 +917,8 @@ async fn dispatch_after_address(
         {
             return AttachOutcome::Bluetooth;
         }
-        // Explicit USB-ID fingerprint match — Synaptics, Goodix, ELAN.
+        // Explicit USB-ID fingerprint match — Synaptics, Goodix,
+        // ELAN, Validity (single authority table, issue #918).
         // Runs before the WBDI cascade because many of these devices
         // expose vendor class 0xFF but omit the MS OS 2.0 descriptor,
         // so the WBDI recogniser would never fire for them. At most

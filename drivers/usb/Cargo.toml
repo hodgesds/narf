@@ -33,6 +33,7 @@ narf-net          = { path = "../../net" }
 narf-bluetooth    = { path = "../../bluetooth" }
 narf-firmware     = { path = "../../firmware" }
 narf-drivers-video = { path = "../video" }
+narf-drivers-fingerprint = { path = "../fingerprint" }
 narf-drivers-sound = { path = "../sound" }
 narf-power        = { path = "../../power" }
 narf-filesystem   = { path = "../../filesystem" }

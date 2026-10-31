@@ -9,6 +9,10 @@
 //!   Synaptics-Validity, and ELAN drivers; consulted as a public index
 //!   only (no codec internals imported).
 //!   <https://gitlab.freedesktop.org/libfprint/libfprint/-/tree/master/libfprint/drivers>
+//!   The table itself lives in exactly one place —
+//!   `narf_drivers_fingerprint::FINGERPRINT_DEVICES` (issue #918) —
+//!   and `classify_vid_pid` below only maps its families to the
+//!   transport vendor. There is no second table here to drift.
 //! - **Linux `drivers/hid/hid-ids.h`** — vendor/product IDs for cross-
 //!   reference. GPL-2.0-or-later; permitted since NARF relicense 2026-05-20.
 //!
@@ -24,8 +28,8 @@
 //!
 //! 1. Recognise the device by VID/PID (vendor class 0xFF bypasses the WBDI
 //!    cascade for devices that don't advertise MS OS 2.0 descriptors).
-//! 2. Discover the bulk-IN + bulk-OUT endpoints (Synaptics, Goodix) or
-//!    interrupt-IN endpoint (ELAN).
+//! 2. Discover the bulk-IN + bulk-OUT endpoints (Synaptics, Goodix,
+//!    Validity) or interrupt-IN endpoint (ELAN).
 //! 3. Configure those endpoints on the xHC.
 //! 4. Register a `/dev/fp0` character device in DevFs so a userspace
 //!    daemon (fprintd) can open it and drive the vendor protocol.
@@ -47,7 +51,8 @@ use crate::xhci::{EndpointConfig, EndpointKind, Xhci};
 /// Standard USB SET_CONFIGURATION request (USB 2.0 §9.4.7).
 const STD_REQ_SET_CONFIGURATION: u8 = 0x09;
 
-/// Fingerprint reader vendor family.
+/// Fingerprint reader vendor family — the transport selector for
+/// the bind path (bulk pair vs interrupt-IN).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FpVendor {
     /// Synaptics (formerly Validity Sensors). Bulk-IN + bulk-OUT.
@@ -56,43 +61,36 @@ pub enum FpVendor {
     Goodix,
     /// ELAN Microelectronics. Interrupt-IN only.
     Elan,
+    /// Validity (VID 0x138A, pre-merger silicon still shipped
+    /// under the Validity VID). Bulk-IN + bulk-OUT: the live
+    /// module's non-ELAN bulk rule covers it, and endpoint
+    /// discovery is blob-driven — a Validity device exposing no
+    /// bulk pair fails with `EndpointsMissing` and falls through
+    /// the cascade rather than mis-binding.
+    Validity,
 }
 
-/// (VID, PID, vendor) table.
+/// Look up a (VID, PID) pair in the single match authority and
+/// map its family to the transport vendor.
 ///
-/// Sources:
-///   - Synaptics: `libfprint/drivers/synaptics/synaptics.c` VID/PID list
-///   - Goodix:    `libfprint/drivers/goodixmoc/goodix.c` VID/PID list
-///   - ELAN:      `libfprint/drivers/elanmoc/elanmoc.c` VID/PID list
-const USB_ID_TABLE: &[(u16, u16, FpVendor)] = &[
-    // Synaptics / Validity
-    (0x06CB, 0x00BD, FpVendor::Synaptics),
-    (0x06CB, 0x00C2, FpVendor::Synaptics),
-    (0x06CB, 0x00C6, FpVendor::Synaptics),
-    (0x06CB, 0x00C9, FpVendor::Synaptics),
-    (0x06CB, 0x00DC, FpVendor::Synaptics),
-    (0x06CB, 0x00FF, FpVendor::Synaptics),
-    // Goodix
-    (0x27C6, 0x5110, FpVendor::Goodix),
-    (0x27C6, 0x5117, FpVendor::Goodix),
-    (0x27C6, 0x530C, FpVendor::Goodix),
-    (0x27C6, 0x533C, FpVendor::Goodix),
-    (0x27C6, 0x5395, FpVendor::Goodix),
-    (0x27C6, 0x55B4, FpVendor::Goodix),
-    (0x27C6, 0x6594, FpVendor::Goodix),
-    // ELAN
-    (0x04F3, 0x0903, FpVendor::Elan),
-    (0x04F3, 0x0907, FpVendor::Elan),
-    (0x04F3, 0x0C00, FpVendor::Elan),
-    (0x04F3, 0x0C03, FpVendor::Elan),
-];
-
-/// Look up a (VID, PID) pair in the table. Returns the vendor on hit.
+/// SINGLE MATCH AUTHORITY (issue #918): the table lives in
+/// `narf_drivers_fingerprint::FINGERPRINT_DEVICES` (31 entries:
+/// the scaffold table union the pre-#918 USB table). This
+/// function owns no table of its own — the pre-#918 tree kept a
+/// second 17-entry table here that drifted from the scaffold's
+/// 22, agreeing on only 8 of the union and leaving the whole
+/// Validity family unbindable. Deleting the second table makes
+/// drift structurally impossible: every consumer reads the one
+/// table, and `smoke_fp_classify_matches_authority_table` pins
+/// the family→vendor mapping for all 31 entries.
 pub fn classify_vid_pid(vid: u16, pid: u16) -> Option<FpVendor> {
-    USB_ID_TABLE
-        .iter()
-        .find(|&&(v, p, _)| v == vid && p == pid)
-        .map(|&(_, _, vendor)| vendor)
+    use narf_drivers_fingerprint::Family;
+    narf_drivers_fingerprint::match_vid_pid(vid, pid).map(|d| match d.family {
+        Family::SynapticsPrometheus | Family::SynapticsMisOlder => FpVendor::Synaptics,
+        Family::Goodix => FpVendor::Goodix,
+        Family::Elan => FpVendor::Elan,
+        Family::Validity => FpVendor::Validity,
+    })
 }
 
 // ── Endpoint discovery ────────────────────────────────────────────────
@@ -111,10 +109,10 @@ pub enum FpError {
 }
 
 /// Endpoints for a fingerprint device. ELAN uses interrupt-IN;
-/// Synaptics and Goodix use bulk-IN + bulk-OUT.
+/// Synaptics, Goodix, and Validity use bulk-IN + bulk-OUT.
 #[derive(Copy, Clone, Debug)]
 pub enum FpEndpoints {
-    /// bulk-IN / bulk-OUT pair (Synaptics, Goodix).
+    /// bulk-IN / bulk-OUT pair (Synaptics, Goodix, Validity).
     Bulk {
         bulk_in: EndpointConfig,
         bulk_out: EndpointConfig,
@@ -133,7 +131,7 @@ pub enum FpEndpoints {
 /// Walk a Configuration Descriptor for the first vendor-class (0xFF)
 /// interface and resolve endpoints appropriate for `vendor`.
 ///
-/// - Synaptics / Goodix: require bulk-IN + bulk-OUT.
+/// - Synaptics / Goodix / Validity: require bulk-IN + bulk-OUT.
 /// - ELAN: require interrupt-IN (may also have bulk pair; we take
 ///   interrupt-IN because that is the polling path libfprint uses).
 pub fn find_fp_endpoints(cfg: &[u8], vendor: FpVendor) -> Result<FpEndpoints, FpError> {
@@ -217,7 +215,7 @@ pub fn find_fp_endpoints(cfg: &[u8], vendor: FpVendor) -> Result<FpEndpoints, Fp
                 config_value,
             })
         }
-        FpVendor::Synaptics | FpVendor::Goodix => {
+        FpVendor::Synaptics | FpVendor::Goodix | FpVendor::Validity => {
             let bi = bulk_in.ok_or(FpError::EndpointsMissing)?;
             let bo = bulk_out.ok_or(FpError::EndpointsMissing)?;
             Ok(FpEndpoints::Bulk {
@@ -244,9 +242,9 @@ fn ep_dci(ep_addr: u8, is_in: bool) -> u8 {
 pub struct FingerprintDevice {
     pub slot_id: u8,
     pub vendor: FpVendor,
-    /// DCI of bulk-IN (Synaptics/Goodix) or interrupt-IN (ELAN).
+    /// DCI of bulk-IN (Synaptics/Goodix/Validity) or interrupt-IN (ELAN).
     pub bulk_in_ep: u8,
-    /// DCI of bulk-OUT (Synaptics/Goodix). 0 for ELAN (no bulk-OUT).
+    /// DCI of bulk-OUT (Synaptics/Goodix/Validity). 0 for ELAN (no bulk-OUT).
     pub bulk_out_ep: u8,
     /// Max packet size of the primary IN endpoint.
     in_max_packet: u16,
@@ -275,8 +273,8 @@ impl FingerprintDevice {
     /// interrupt-IN). Returns the byte count written into `buf`.
     ///
     /// For ELAN (interrupt-IN) this arms the endpoint on the first
-    /// call and thereafter polls it. For Goodix / Synaptics
-    /// (bulk-IN) it issues a bulk transfer directly.
+    /// call and thereafter polls it. For Goodix / Synaptics /
+    /// Validity (bulk-IN) it issues a bulk transfer directly.
     ///
     /// Caller must hold an `Arc<Xhci>` — call from async context or
     /// via `narf_scheduler::block_on`.
@@ -309,7 +307,7 @@ impl FingerprintDevice {
                     }
                 }
             }
-            FpVendor::Synaptics | FpVendor::Goodix => xhci
+            FpVendor::Synaptics | FpVendor::Goodix | FpVendor::Validity => xhci
                 .bulk_in(self.slot_id, self.bulk_in_ep, buf)
                 .await
                 .map_err(|_| FpError::EndpointConfig),
@@ -505,6 +503,7 @@ pub async fn try_bind_fingerprint_already_addressed(
             FpVendor::Synaptics => "Synaptics",
             FpVendor::Goodix => "Goodix",
             FpVendor::Elan => "ELAN",
+            FpVendor::Validity => "Validity",
         };
         let _ = writeln!(
             narf_console::Writer,
@@ -554,6 +553,8 @@ mod tests {
     fn classify_vid_pid_synaptics() {
         assert_eq!(classify_vid_pid(0x06CB, 0x00BD), Some(FpVendor::Synaptics));
         assert_eq!(classify_vid_pid(0x06CB, 0x00FF), Some(FpVendor::Synaptics));
+        // Scaffold-only entry (was never in the old live table).
+        assert_eq!(classify_vid_pid(0x06CB, 0x00BE), Some(FpVendor::Synaptics));
     }
 
     #[test]
@@ -561,12 +562,31 @@ mod tests {
         assert_eq!(classify_vid_pid(0x27C6, 0x5110), Some(FpVendor::Goodix));
         assert_eq!(classify_vid_pid(0x27C6, 0x55B4), Some(FpVendor::Goodix));
         assert_eq!(classify_vid_pid(0x27C6, 0x6594), Some(FpVendor::Goodix));
+        // Scaffold-only entry (was never in the old live table).
+        assert_eq!(classify_vid_pid(0x27C6, 0x609C), Some(FpVendor::Goodix));
     }
 
     #[test]
     fn classify_vid_pid_elan() {
         assert_eq!(classify_vid_pid(0x04F3, 0x0903), Some(FpVendor::Elan));
         assert_eq!(classify_vid_pid(0x04F3, 0x0C03), Some(FpVendor::Elan));
+        // Scaffold-only entry (was never in the old live table).
+        assert_eq!(classify_vid_pid(0x04F3, 0x0C42), Some(FpVendor::Elan));
+    }
+
+    #[test]
+    fn classify_vid_pid_validity() {
+        // #918: the whole Validity family was absent from the old
+        // live table, so these fell through the cascade to
+        // UnknownClass. They now classify.
+        assert_eq!(classify_vid_pid(0x138A, 0x0007), Some(FpVendor::Validity));
+        assert_eq!(classify_vid_pid(0x138A, 0x0011), Some(FpVendor::Validity));
+        assert_eq!(classify_vid_pid(0x138A, 0x0090), Some(FpVendor::Validity));
+        assert_eq!(classify_vid_pid(0x138A, 0x0091), Some(FpVendor::Validity));
+        assert_eq!(classify_vid_pid(0x138A, 0x0097), Some(FpVendor::Validity));
+        assert_eq!(classify_vid_pid(0x138A, 0x00A2), Some(FpVendor::Validity));
+        // Validity VID but wrong PID still falls through.
+        assert_eq!(classify_vid_pid(0x138A, 0x0001), None);
     }
 
     #[test]
@@ -577,10 +597,17 @@ mod tests {
     }
 
     // ── Vendor classifier ──────────────────────────────────────────
+    //
+    // These lists are the full #918 union per transport vendor:
+    // Synaptics = Prometheus + MIS-older + live carryover,
+    // Goodix = scaffold + live carryover, ELAN = scaffold + live
+    // carryover, Validity = scaffold only.
 
     #[test]
     fn vendor_covers_all_synaptics_pids() {
-        let synaptics_pids = [0x00BD, 0x00C2, 0x00C6, 0x00C9, 0x00DC, 0x00FF];
+        let synaptics_pids = [
+            0x00BD, 0x00BE, 0x00BF, 0x00C2, 0x00C9, 0x00A2, 0x00B7, 0x00C6, 0x00DC, 0x00FF,
+        ];
         for pid in synaptics_pids {
             assert_eq!(
                 classify_vid_pid(0x06CB, pid),
@@ -592,7 +619,9 @@ mod tests {
 
     #[test]
     fn vendor_covers_all_goodix_pids() {
-        let goodix_pids = [0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4, 0x6594];
+        let goodix_pids = [
+            0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4, 0x6594, 0x609C, 0x6584,
+        ];
         for pid in goodix_pids {
             assert_eq!(
                 classify_vid_pid(0x27C6, pid),
@@ -604,12 +633,24 @@ mod tests {
 
     #[test]
     fn vendor_covers_all_elan_pids() {
-        let elan_pids = [0x0903, 0x0907, 0x0C00, 0x0C03];
+        let elan_pids = [0x0903, 0x0907, 0x0C00, 0x0C03, 0x0C32, 0x0C42];
         for pid in elan_pids {
             assert_eq!(
                 classify_vid_pid(0x04F3, pid),
                 Some(FpVendor::Elan),
                 "ELAN PID 0x{pid:04x} not in table"
+            );
+        }
+    }
+
+    #[test]
+    fn vendor_covers_all_validity_pids() {
+        let validity_pids = [0x0007, 0x0011, 0x0090, 0x0091, 0x0097, 0x00A2];
+        for pid in validity_pids {
+            assert_eq!(
+                classify_vid_pid(0x138A, pid),
+                Some(FpVendor::Validity),
+                "Validity PID 0x{pid:04x} not in table"
             );
         }
     }
@@ -713,6 +754,44 @@ mod tests {
             }
             _ => panic!("expected InterruptIn endpoints"),
         }
+    }
+
+    #[test]
+    fn endpoint_discovery_bulk_validity() {
+        // #918: a Validity reader (VFS5011-class blob: vendor
+        // class + bulk pair) resolves to the bulk arm, the same
+        // transport Synaptics/Goodix use.
+        let cfg = make_cfg_bulk(0xFF);
+        let eps = find_fp_endpoints(&cfg, FpVendor::Validity).expect("should find bulk pair");
+        match eps {
+            FpEndpoints::Bulk {
+                bulk_in,
+                bulk_out,
+                interface,
+                ..
+            } => {
+                assert_eq!(bulk_in.ep_addr, 0x81);
+                assert_eq!(bulk_in.kind, EndpointKind::BulkIn);
+                assert_eq!(bulk_out.ep_addr, 0x01);
+                assert_eq!(bulk_out.kind, EndpointKind::BulkOut);
+                assert_eq!(interface, 0);
+            }
+            _ => panic!("expected Bulk endpoints for Validity"),
+        }
+    }
+
+    #[test]
+    fn endpoint_discovery_validity_without_bulk_pair_fails() {
+        // Masking defeat: the bulk mapping must not hallucinate
+        // endpoints. A Validity device exposing only interrupt-IN
+        // fails discovery (the cascade then falls through, exactly
+        // as an unclassifiable device does) instead of binding
+        // with a bogus bulk pair.
+        let cfg = make_cfg_intr(0xFF);
+        assert!(matches!(
+            find_fp_endpoints(&cfg, FpVendor::Validity),
+            Err(FpError::EndpointsMissing)
+        ));
     }
 
     #[test]

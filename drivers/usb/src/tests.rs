@@ -4135,13 +4135,23 @@ fn smoke_fp_usb_id_table_match() -> TestResult {
         // Synaptics
         (0x06CB, 0x00BD, FpVendor::Synaptics),
         (0x06CB, 0x00FF, FpVendor::Synaptics),
+        // Scaffold-only Synaptics (never in the old live table)
+        (0x06CB, 0x00BE, FpVendor::Synaptics),
         // Goodix
         (0x27C6, 0x5110, FpVendor::Goodix),
         (0x27C6, 0x55B4, FpVendor::Goodix),
         (0x27C6, 0x6594, FpVendor::Goodix),
+        // Scaffold-only Goodix (never in the old live table)
+        (0x27C6, 0x609C, FpVendor::Goodix),
         // ELAN
         (0x04F3, 0x0903, FpVendor::Elan),
         (0x04F3, 0x0C03, FpVendor::Elan),
+        // Scaffold-only ELAN (never in the old live table)
+        (0x04F3, 0x0C42, FpVendor::Elan),
+        // Validity (#918: the whole family was absent from the
+        // old live table and fell through to UnknownClass)
+        (0x138A, 0x0011, FpVendor::Validity),
+        (0x138A, 0x0090, FpVendor::Validity),
     ];
     for &(vid, pid, expected) in cases {
         match classify_vid_pid(vid, pid) {
@@ -4163,29 +4173,132 @@ fn smoke_fp_usb_id_table_match() -> TestResult {
 kernel_test_in!("drivers/usb/fingerprint", smoke_fp_usb_id_table_match);
 
 /// Vendor classifier: each VID maps to the correct FpVendor.
+/// Lists are the full #918 union per transport vendor.
 fn smoke_fp_vendor_classifier() -> TestResult {
     use crate::fingerprint::{classify_vid_pid, FpVendor};
-    // All Synaptics PIDs
-    for pid in [0x00BD, 0x00C2, 0x00C6, 0x00C9, 0x00DC, 0x00FF] {
+    // All Synaptics PIDs (Prometheus + MIS-older + live carryover)
+    for pid in [
+        0x00BD, 0x00BE, 0x00BF, 0x00C2, 0x00C9, 0x00A2, 0x00B7, 0x00C6, 0x00DC, 0x00FF,
+    ] {
         if !matches!(classify_vid_pid(0x06CB, pid), Some(FpVendor::Synaptics)) {
             return TestResult::Fail("Synaptics PID not classified");
         }
     }
-    // All Goodix PIDs
-    for pid in [0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4, 0x6594] {
+    // All Goodix PIDs (scaffold + live carryover)
+    for pid in [
+        0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4, 0x6594, 0x609C, 0x6584,
+    ] {
         if !matches!(classify_vid_pid(0x27C6, pid), Some(FpVendor::Goodix)) {
             return TestResult::Fail("Goodix PID not classified");
         }
     }
-    // All ELAN PIDs
-    for pid in [0x0903, 0x0907, 0x0C00, 0x0C03] {
+    // All ELAN PIDs (scaffold + live carryover)
+    for pid in [0x0903, 0x0907, 0x0C00, 0x0C03, 0x0C32, 0x0C42] {
         if !matches!(classify_vid_pid(0x04F3, pid), Some(FpVendor::Elan)) {
             return TestResult::Fail("ELAN PID not classified");
+        }
+    }
+    // All Validity PIDs (#918: previously unclassifiable)
+    for pid in [0x0007, 0x0011, 0x0090, 0x0091, 0x0097, 0x00A2] {
+        if !matches!(classify_vid_pid(0x138A, pid), Some(FpVendor::Validity)) {
+            return TestResult::Fail("Validity PID not classified");
         }
     }
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/fingerprint", smoke_fp_vendor_classifier);
+
+/// Anti-drift: the live classifier must agree with the single
+/// match authority for every one of its entries. If the authority
+/// table and the family→vendor mapping ever diverge, this fails —
+/// the #918 drift cannot recur silently.
+fn smoke_fp_classify_matches_authority_table() -> TestResult {
+    use crate::fingerprint::{classify_vid_pid, FpVendor};
+    use narf_drivers_fingerprint::{Family, FINGERPRINT_DEVICES};
+    if FINGERPRINT_DEVICES.len() != 31 {
+        return TestResult::Fail("authority table size drifted from union");
+    }
+    for d in FINGERPRINT_DEVICES.iter() {
+        let expected = match d.family {
+            Family::SynapticsPrometheus | Family::SynapticsMisOlder => FpVendor::Synaptics,
+            Family::Goodix => FpVendor::Goodix,
+            Family::Elan => FpVendor::Elan,
+            Family::Validity => FpVendor::Validity,
+        };
+        match classify_vid_pid(d.vid, d.pid) {
+            Some(v) if v == expected => {}
+            _ => return TestResult::Fail("classifier disagrees with authority table"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/fingerprint",
+    smoke_fp_classify_matches_authority_table
+);
+
+/// #918 bind gate: a Validity VFS5011 must pass the cascade's
+/// fingerprint decision — the `classify_vid_pid(...).is_some()`
+/// gate in `attach.rs` plus endpoint discovery, the two
+/// vendor-specific steps of `try_bind_fingerprint_already_addressed`.
+/// The remainder of try_bind (endpoint configuration,
+/// SET_CONFIGURATION, registry push) is vendor-agnostic, so it
+/// cannot vary by vendor; executing it needs a live xHCI and is
+/// silicon validation, not fixture work. Pre-#918 this smoke
+/// fails at the classify step: 0x138A was absent from the live
+/// table, so the device fell through to WBDI/UnknownClass.
+fn smoke_fp_validity_cascade_gate() -> TestResult {
+    use crate::fingerprint::{classify_vid_pid, find_fp_endpoints, FpEndpoints, FpVendor};
+    use crate::xhci::EndpointKind;
+    // Cascade gate 1: classification (attach.rs fingerprint step).
+    if classify_vid_pid(0x138A, 0x0011) != Some(FpVendor::Validity) {
+        return TestResult::Fail("VFS5011 did not classify as Validity");
+    }
+    // Cascade gate 2: endpoint discovery on a VFS5011-class blob
+    // (vendor class 0xFF + bulk-IN 0x81 + bulk-OUT 0x01).
+    let mut cfg: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
+    cfg[0] = 9;
+    cfg[1] = 0x02;
+    cfg[2] = 32;
+    cfg[4] = 1;
+    cfg[5] = 1;
+    cfg[9] = 9;
+    cfg[10] = 0x04;
+    cfg[11] = 0;
+    cfg[13] = 2;
+    cfg[14] = 0xFF;
+    cfg[18] = 7;
+    cfg[19] = 0x05;
+    cfg[20] = 0x81;
+    cfg[21] = 0x02;
+    cfg[22] = 0x00;
+    cfg[23] = 0x02;
+    cfg[25] = 7;
+    cfg[26] = 0x05;
+    cfg[27] = 0x01;
+    cfg[28] = 0x02;
+    cfg[29] = 0x00;
+    cfg[30] = 0x02;
+    match find_fp_endpoints(&cfg, FpVendor::Validity) {
+        Ok(FpEndpoints::Bulk {
+            bulk_in, bulk_out, ..
+        }) => {
+            if bulk_in.ep_addr != 0x81 || bulk_in.kind != EndpointKind::BulkIn {
+                return TestResult::Fail("Validity bulk-IN mis-decoded");
+            }
+            if bulk_out.ep_addr != 0x01 || bulk_out.kind != EndpointKind::BulkOut {
+                return TestResult::Fail("Validity bulk-OUT mis-decoded");
+            }
+        }
+        _ => return TestResult::Fail("Validity bulk endpoint discovery failed"),
+    }
+    // Masking counterpart: an unknown device still falls through.
+    if classify_vid_pid(0x1234, 0x5678).is_some() {
+        return TestResult::Fail("unknown VID/PID should return None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/fingerprint", smoke_fp_validity_cascade_gate);
 
 /// Endpoint discovery on synthetic config blobs.
 fn smoke_fp_endpoint_discovery() -> TestResult {
@@ -4255,6 +4368,25 @@ fn smoke_fp_endpoint_discovery() -> TestResult {
             }
         }
         _ => return TestResult::Fail("ELAN interrupt-IN discovery failed"),
+    }
+    // Validity (#918): same bulk blob resolves to the bulk arm.
+    match find_fp_endpoints(&cfg, FpVendor::Validity) {
+        Ok(FpEndpoints::Bulk {
+            bulk_in, bulk_out, ..
+        }) => {
+            if bulk_in.ep_addr != 0x81 || bulk_in.kind != EndpointKind::BulkIn {
+                return TestResult::Fail("Validity bulk-IN mis-decoded");
+            }
+            if bulk_out.ep_addr != 0x01 || bulk_out.kind != EndpointKind::BulkOut {
+                return TestResult::Fail("Validity bulk-OUT mis-decoded");
+            }
+        }
+        _ => return TestResult::Fail("Validity bulk discovery failed"),
+    }
+    // Masking defeat: a Validity device with only interrupt-IN
+    // must fail discovery, not bind with a bogus bulk pair.
+    if find_fp_endpoints(&cfg2, FpVendor::Validity).is_ok() {
+        return TestResult::Fail("Validity without bulk pair must not discover");
     }
     TestResult::Pass
 }
