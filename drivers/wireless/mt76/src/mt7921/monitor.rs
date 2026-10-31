@@ -420,7 +420,7 @@ fn decode(packet: &[u8], nss: u8) -> Option<(narf_wireless::monitor::Metadata, &
     if r1 & (31 << 16) != 0 && r1 & (3 << 23) == 0 {
         return None;
     }
-    let (band, channel) = channel::from_rx_channel(u8::try_from((word(12)? >> 8) & 0x1ff).ok()?)?;
+    let (band, channel) = channel::from_rx_channel(((word(12)? >> 8) & 0xff) as u8)?;
     let frequency_mhz = channel::frequency_in(band, channel)?;
     let mut offset = 24usize;
     for (flag, size) in [(14, 16), (11, 16), (12, 8)] {
@@ -460,3 +460,7 @@ fn decode(packet: &[u8], nss: u8) -> Option<(narf_wireless::monitor::Metadata, &
         frame,
     ))
 }
+
+#[path = "monitor_rxd_tests.rs"]
+#[cfg(any(test, feature = "builtin"))]
+mod rxd_tests;

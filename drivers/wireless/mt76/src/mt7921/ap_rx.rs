@@ -32,7 +32,7 @@ pub(super) fn decode(packet: &[u8], nss: u8) -> Option<Raw<'_>> {
     let packet = &packet[..length];
     let r1 = word(packet, 4)?;
     let r2 = word(packet, 8)?;
-    let channel = u8::try_from((word(packet, 12)? >> 8) & 0x1ff).ok()?;
+    let channel = ((word(packet, 12)? >> 8) & 0xff) as u8;
     let (band, channel) = channel::from_rx_channel(channel)?;
     // CM/CLM alone report an unavailable crypto key/cipher, not successful
     // authentication. ICV/TKIP-MIC/FCS, another band and translated/partial

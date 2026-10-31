@@ -118,7 +118,8 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
     let packet = &packet[..len];
     let r1 = word(packet, 4)?;
     let r2 = word(packet, 8)?;
-    let frequency = (word(packet, 12)? >> 8) & 0x1ff;
+    // CONNAC2 CH_FREQ is bits15:8. Bit16 belongs to ADDR_TYPE/U2M.
+    let frequency = (word(packet, 12)? >> 8) & 0xff;
     let channel = u8::try_from(frequency).ok()?;
     // RXD3 CH_FREQ, kept raw: 6 GHz values (181..) decode through
     // mt792x_get_status_freq_info and are compared against rx_channel().
@@ -194,10 +195,7 @@ pub(super) fn beacon(packet: &[u8], nss: u8) -> Option<ScanBss> {
     let packet = &packet[..len];
     let r1 = word(packet, 4)?;
     let r3 = word(packet, 12)?;
-    let frequency = (r3 >> 8) & 0x1ff;
-    if frequency & 0x100 != 0 {
-        return None;
-    }
+    let frequency = (r3 >> 8) & 0xff;
     // mt792x_get_status_freq_info: 6 GHz beacons arrive with CH_FREQ > 180.
     let (band, channel) = super::super::channel::from_rx_channel(frequency as u8)?;
     let mut offset = 24usize;

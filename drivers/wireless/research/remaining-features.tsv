@@ -82,10 +82,10 @@ iwlwifi	width_160	160MHz operation on applicable profiles	feature	drivers/wirele
 iwlwifi	width_320	320MHz operation on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	2142
 iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	2191
 mt76	loadable_packet_abi	Loadable wireless packet ABI	feature	drivers/wireless/specification/mt7921.md	18
-mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	2192
-mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/specification/mt7921.md	2078
-mt76	p2p_mode	P2P client / GO / device roles	feature	drivers/wireless/specification/mt7921.md	2217
-mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	2085
+mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	2202
+mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/specification/mt7921.md	2088
+mt76	p2p_mode	P2P client / GO / device roles	feature	drivers/wireless/specification/mt7921.md	2227
+mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	2095
 rtl8xxxu	additional_operating_channels	Qualified legacy channels 1–13 with source-backed MAC/FIFO/USB cold retirement and fresh observations are implemented; eight native composed cases await both-architecture acceptance; actual signed N8PC target/home rows remain required	feature	drivers/wireless/specification/rtl8xxxu.md	680
 rtl8xxxu	bt_coexistence	Bluetooth coexistence on RTL8723BU; blocked on the rtl8723bu chip runtime	feature	drivers/wireless/specification/rtl8xxxu.md	786
 rtl8xxxu	expanded_active_scanning	Active scanning beyond the initial profile; idle passive retuning is implemented pending native acceptance, while a retained per-channel probe-request emitter and terminal TX ownership remain open	feature	drivers/wireless/specification/rtl8xxxu.md	776

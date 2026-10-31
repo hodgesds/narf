@@ -21,6 +21,8 @@ mod p2p;
 
 #[path = "active_scan_tests.rs"]
 mod active_scan_tests;
+#[path = "rxd_fields_tests.rs"]
+mod rxd_fields_tests;
 
 #[path = "amsdu_rx_tests.rs"]
 mod amsdu_rx_tests;
@@ -2823,7 +2825,8 @@ fn descriptor(frame: &[u8]) -> Vec<u8> {
     let mut packet = vec![0; 24];
     packet[8..12].copy_from_slice(&(1u32 << 30).to_le_bytes()); // One MPDU, no BA aggregate.
     packet[..4].copy_from_slice(&((2u32 << 27) | (24 + frame.len()) as u32).to_le_bytes());
-    packet[12..16].copy_from_slice(&(6u32 << 8).to_le_bytes());
+    let u2m = frame.get(4).is_some_and(|byte| byte & 1 == 0);
+    packet[12..16].copy_from_slice(&((6u32 << 8) | u32::from(u2m) << 16).to_le_bytes());
     packet.extend_from_slice(frame);
     packet
 }
@@ -3468,9 +3471,13 @@ fn mt76_dual_band_scan_encodes_extension_and_rejects_6ghz_aliases() -> TestResul
     }
     for channel in [6, 36] {
         let mut packet = scan_beacon(channel, b"narf");
-        packet[14] |= 1; // RXD3 CH_FREQ bit8: 6 GHz, never a 2.4/5 GHz alias.
+        packet[14] |= 1; // Actual RXD3 ADDR_TYPE=U2M, separate from CH_FREQ.
+        if scan::beacon(&packet, 2).is_none_or(|bss| bss.channel != channel || bss.band.is_some()) {
+            return TestResult::Fail("unicast address type contaminated the native channel");
+        }
+        packet[13] = 181; // Actual 6GHz channel1 RX tag, not a ninth channel bit.
         if scan::beacon(&packet, 2).is_some() {
-            return TestResult::Fail("6 GHz RX channel truncated to legacy channel");
+            return TestResult::Fail("real6GHz RX tag aliased the legacy DS channel");
         }
     }
     let permit = test_permission_for(36);
@@ -3525,7 +3532,7 @@ fn mt76_native_rx_binds_channel_before_eapol_and_replay() -> TestResult {
         }
         for frequency in [
             if channel == 6 { 36u16 } else { 6 },
-            0x100 | u16::from(channel),
+            181, // Actual6GHz channel1 tag; RXD3 bit16 is U2M, not channel.
             0,
         ] {
             let mut invalid = ccmp_packet(100, 0, false);
@@ -3533,7 +3540,7 @@ fn mt76_native_rx_binds_channel_before_eapol_and_replay() -> TestResult {
             session.backend.packets.push_back(invalid);
         }
         let mut good = ccmp_packet(1, 0, false);
-        good[12..16].copy_from_slice(&(u32::from(channel) << 8).to_le_bytes());
+        good[12..16].copy_from_slice(&((u32::from(channel) << 8) | 1 << 16).to_le_bytes());
         session.backend.packets.push_back(good);
         if !matches!(session.receive_ethernet(), Ok(Some(_))) || !session.backend.packets.is_empty()
         {
@@ -3543,7 +3550,7 @@ fn mt76_native_rx_binds_channel_before_eapol_and_replay() -> TestResult {
         let peer = [2, 1, 2, 3, 4, 5];
         let pdu = narf_wireless::eapol::KeyFrame::empty(16).into_eapol();
         let mut eapol = descriptor(&ap_eapol_frame(own, peer, &pdu));
-        eapol[12..16].copy_from_slice(&(u32::from(channel) << 8).to_le_bytes());
+        eapol[12..16].copy_from_slice(&((u32::from(channel) << 8) | 1 << 16).to_le_bytes());
         if join::peer_eapol(&eapol, own, peer, channel) != Some(pdu.as_slice())
             || join::peer_eapol(&eapol, own, peer, if channel == 6 { 36 } else { 6 }).is_some()
         {
