@@ -2,6 +2,7 @@
 //! iwlwifi mld/{tlc,sta,link}.c, fw/api/{rs,phy-ctxt,mac-cfg}.h.
 
 use super::boot_context::{put16, put32};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use narf_wireless::iface::PhyCapabilities;
 
@@ -115,7 +116,7 @@ fn mcs_map(streams: u8) -> u16 {
     map
 }
 
-#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Negotiated {
     /// TLC mode: legacy=0, HT=1, VHT=2.
     pub mode: u8,
@@ -134,12 +135,45 @@ pub struct Negotiated {
 
 /// The original shared offer and actual response-refined VHT facts. The
 /// H2E parsing fact comes only from the already selected security plan.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct WideVht {
-    offer: narf_wireless::association::phy::Offer,
+    // Selection retains the shared HE/EHT/UHR local and response facts too.
+    // Keep that immutable snapshot out of every ordinary connection/future.
+    offer: Arc<narf_wireless::association::phy::Offer>,
     vht: narf_wireless::association::phy::VhtNegotiation,
     center: u8,
     h2e: bool,
+}
+
+impl WideVht {
+    // Only the wide path needs the full shared selection on its call stack.
+    #[inline(never)]
+    fn new(offer: &narf_wireless::association::phy::Offer, h2e: bool) -> Self {
+        Self {
+            vht: *offer.vht().unwrap(),
+            center: offer.center_channel(),
+            offer: Arc::new(*offer),
+            h2e,
+        }
+    }
+
+    #[inline(never)]
+    fn confirm(&self, ies: &[u8]) -> Result<Option<Self>, &'static str> {
+        let confirmed = self
+            .offer
+            .response_elements_with_sae_h2e(ies, self.h2e)
+            .map_err(|_| "native160 response did not confirm the original PHY offer")?;
+        Ok(
+            (confirmed.width() == narf_wireless::association::phy::Width::OneSixty
+                && !confirmed.discontiguous())
+            .then(|| Self {
+                vht: *confirmed.vht().unwrap(),
+                center: confirmed.center_channel(),
+                offer: Arc::clone(&self.offer),
+                h2e: self.h2e,
+            }),
+        )
+    }
 }
 
 /// Return singleton IEs and reject truncated or ambiguous capability data.
@@ -166,7 +200,7 @@ impl Negotiated {
     /// Association responses can omit operation IEs already received in
     /// beacons. Capabilities must be confirmed by the response itself.
     pub fn confirm(
-        self,
+        &self,
         mut local: Local,
         beacon: &[u8],
         reply: &[u8],
@@ -184,18 +218,8 @@ impl Negotiated {
                 }
             }
         }
-        let wide = if let Some(old) = self.wide {
-            let confirmed = old
-                .offer
-                .response_elements_with_sae_h2e(&ies, old.h2e)
-                .map_err(|_| "native160 response did not confirm the original PHY offer")?;
-            (confirmed.width() == narf_wireless::association::phy::Width::OneSixty
-                && !confirmed.discontiguous())
-            .then(|| WideVht {
-                vht: *confirmed.vht().unwrap(),
-                center: confirmed.center_channel(),
-                ..old
-            })
+        let wide = if let Some(old) = &self.wide {
+            old.confirm(&ies)?
         } else {
             None
         };
@@ -225,17 +249,12 @@ impl Negotiated {
         channel: u8,
         wmm: bool,
         permitted: impl Fn(u8, u8) -> bool,
-        offer: Option<(narf_wireless::association::phy::Offer, bool)>,
+        offer: Option<(&narf_wireless::association::phy::Offer, bool)>,
     ) -> Result<Self, &'static str> {
         let wide = offer.and_then(|(offer, h2e)| {
             (offer.width() == narf_wireless::association::phy::Width::OneSixty
                 && !offer.discontiguous())
-            .then(|| WideVht {
-                vht: *offer.vht().unwrap(),
-                center: offer.center_channel(),
-                offer,
-                h2e,
-            })
+            .then(|| WideVht::new(offer, h2e))
         });
         Self::parse_inner(local, ies, channel, wmm, permitted, wide)
     }
@@ -421,7 +440,7 @@ impl Negotiated {
         put16(body, 12, self.flags);
         put32(body, 16, self.mcs[0] as u32);
         put32(body, 28, self.mcs[1] as u32);
-        if let Some(wide) = self.wide {
+        if let Some(wide) = &self.wide {
             for nss in 0..2 {
                 let map = wide.vht.tx_mcs_map();
                 let bits = match (map >> (2 * nss)) & 3 {
@@ -472,7 +491,7 @@ impl Negotiated {
     /// Before CCMP/reorder mutation, bound the new native160 profile's
     /// legacy HT/VHT fallback PPDUs by the actual local RX promise. HE has
     /// its separate response-bound HE map and coding check.
-    pub(super) fn admits_wide_rx(self, local: Local, rate: u32) -> bool {
+    pub(super) fn admits_wide_rx(&self, local: Local, rate: u32) -> bool {
         if self.width != 3 {
             return true;
         }

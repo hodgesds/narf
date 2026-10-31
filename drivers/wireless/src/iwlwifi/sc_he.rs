@@ -71,7 +71,7 @@ fn select_rates_version(version: impl Fn(u8, u8) -> Option<(u8, u8)>) -> Option<
 /// without advertising HE; a mandatory HE selector then fails admission.
 pub(super) fn matches_native(
     offer: &narf_wireless::association::phy::Offer,
-    native: super::ht_vht::Negotiated,
+    native: &super::ht_vht::Negotiated,
 ) -> bool {
     use narf_wireless::association::phy::Width;
     native.mode != 0

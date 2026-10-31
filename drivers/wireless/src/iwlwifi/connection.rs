@@ -326,11 +326,12 @@ impl Connection {
             },
             profile
                 .offer
+                .as_ref()
                 .map(|offer| (offer, profile.sae.as_ref().is_some_and(|join| join.h2e()))),
         )?;
         let he_offer = profile
             .offer
-            .filter(|offer| qos.is_some() && super::sc_he::matches_native(offer, phy));
+            .filter(|offer| qos.is_some() && super::sc_he::matches_native(offer, &phy));
         if he_offer.is_none() && profile.offer.is_some_and(|offer| offer.he().is_some()) {
             local_phy.he = false;
             profile = super::sc_security::Profile::negotiate(&beacon, local, &auth, local_phy)?;

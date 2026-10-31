@@ -299,6 +299,10 @@ fn raw_nvm() -> Vec<u8> {
 }
 fn smoke_iwl_native160_needs_raw_nvm_and_every_host_mcc_constituent() -> TestResult {
     check(|| {
+        require(
+            core::mem::size_of::<ht_vht::Negotiated>() <= 128,
+            "native160 snapshot enlarged every connection and association future",
+        )?;
         let model = phy(Native::Sc, true);
         let mut ies = vec![1, 8, 0x8c, 18, 0x98, 36, 0xb0, 72, 96, 108];
         ies.extend_from_slice(&he_tests::elements(model, true));
@@ -342,7 +346,7 @@ fn smoke_iwl_native160_needs_raw_nvm_and_every_host_mcc_constituent() -> TestRes
                     connection::channel_power_width(&policy(), 36, width, center, &permissions)
                         .is_some()
                 },
-                offer.map(|offer| (offer, false)),
+                offer.as_ref().map(|offer| (offer, false)),
             )?;
             require(
                 actual.width == if missing == 8 { 3 } else { 2 },
@@ -412,7 +416,7 @@ fn smoke_iwl_native160_needs_raw_nvm_and_every_host_mcc_constituent() -> TestRes
             36,
             true,
             |_, _| true,
-            offer.map(|offer| (offer, false)),
+            offer.as_ref().map(|offer| (offer, false)),
         )?;
         let mut body = [0; 44];
         selected.apply_tlc(&mut body);
