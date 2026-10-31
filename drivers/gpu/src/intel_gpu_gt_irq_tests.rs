@@ -32,9 +32,11 @@ impl Window {
             (0x190018, 0),
             (0x190030, 0x20000001),
             (0x190090, 0xffff0001),
+            (0x1900a0, 0xffff0002),
             (0x190038, 0x10),
             (0x1900e8, 0xffff9234),
             (0x20a8, 0xffffffff),
+            (0x220a8, 0xfffffffe),
         ]
         .into_iter()
         .collect();
@@ -94,6 +96,7 @@ impl MmioWindow for Window {
             0x190070 => {
                 r.identity = match value {
                     1 => 0x80000001,          // valid RCS0 MI_USER_INTERRUPT
+                    0x8000 => 0x80030010,     // valid COPY0 FLUSH_COMPLETE
                     0x02000000 => 0x80048000, // valid OTHER0 GUC2HOST
                     _ => panic!("selected an unowned interrupt"),
                 };
@@ -164,11 +167,13 @@ fn smoke_gt_irq_route_decode_wait_and_teardown() -> TestResult {
     let irq = install(&w);
     let vector = irq.vector();
     assert_eq!(irq.service(0), Ok(false));
-    assert_eq!(w.read32(0x190030), 0x20110001);
+    assert_eq!(w.read32(0x190030), 0x20110011);
     assert_eq!(w.read32(0x190090), 0xffee0001);
+    assert_eq!(w.read32(0x1900a0), 0xffee0002);
     assert_eq!(w.read32(0x190038), 0x80000010);
     assert_eq!(w.read32(0x1900e8), 0x7fff9234);
     assert_eq!(w.read32(0x20a8), 0xffffffee);
+    assert_eq!(w.read32(0x220a8), 0xffffffee);
     let wakes = Arc::new(Wakes(core::sync::atomic::AtomicU32::new(0)));
     let waker = Waker::from(wakes.clone());
     let mut cx = Context::from_waker(&waker);
@@ -190,6 +195,16 @@ fn smoke_gt_irq_route_decode_wait_and_teardown() -> TestResult {
     assert_eq!(irq.service(40), Ok(true));
     assert_eq!(irq.service(50), Ok(false));
     drop(wait);
+    // BCS0 shares bank zero; its identity must decode as COPY instance 0.
+    let mut wait = narf_interrupts::wait_for_irq(vector);
+    assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
+    w.raise(0x8001);
+    assert!(Pin::new(&mut wait).poll(&mut cx).is_ready());
+    assert_eq!(irq.service(51), Ok(true)); // RCS0 first
+    assert_eq!(irq.service(52), Ok(true)); // then BCS0
+    assert_eq!(irq.service(53), Ok(false));
+    assert_eq!(w.read32(0x190018), 0);
+    drop(wait);
     // A missed physical MSI is still decoded and rearmed by the watchdog.
     {
         let mut r = w.0.lock();
@@ -202,7 +217,9 @@ fn smoke_gt_irq_route_decode_wait_and_teardown() -> TestResult {
     drop(irq);
     assert!(!narf_interrupts::vector::is_allocated(vector));
     assert!(!narf_interrupts::dispatch::installed_handler_names(vector).contains(&"intel-gt"));
-    for offset in [0x190010, 0x190030, 0x190090, 0x190038, 0x1900e8, 0x20a8] {
+    for offset in [
+        0x190010, 0x190030, 0x190090, 0x1900a0, 0x190038, 0x1900e8, 0x20a8, 0x220a8,
+    ] {
         assert_eq!(w.read32(offset), saved[&offset]);
     }
     assert_eq!(w.0.lock().events, ["program", "enable", "disable"]);
@@ -255,6 +272,18 @@ fn smoke_gt_irq_delayed_identity_timeout_and_foreign_causes() -> TestResult {
     assert_eq!(irq.service(1), Err(IrqError::Identity));
     drop(irq);
     assert_eq!(w.0.lock().identity, 0x81048000);
+    // A render or BCS1 identity behind the BCS0 bank bit is never acked.
+    for identity in [0x80000001, 0x80130001] {
+        let w = Window::new();
+        let irq = install(&w);
+        irq.service(0).unwrap();
+        w.raise(0x8000);
+        assert_eq!(irq.service(0), Ok(true));
+        w.0.lock().identity = identity;
+        assert_eq!(irq.service(1), Err(IrqError::Identity));
+        drop(irq);
+        assert_eq!(w.0.lock().identity, identity);
+    }
     TestResult::Pass
 }
 kernel_test_in!(

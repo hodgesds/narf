@@ -761,12 +761,13 @@ is not retried forever.
 hierarchy on the admitted MTL/Arrow, DG2 and BMG physical functions. Active
 firmware MSI/MSI-X, an enabled tile master, VMD shared routing, unavailable
 registers or unrelated master indications refuse takeover without writes.
-Graphics GuC GUC2HOST and RCS0 MI_USER/FLUSH sources are enabled with masked
+Graphics GuC GUC2HOST and RCS0/BCS0 MI_USER/FLUSH sources (RENDER_COPY
+ENGINE1/ENGINE0 halves, RCS0/BCS RSVD masks and both ring IMRs) are enabled with masked
 updates and readback checks preserving other engine/media bits; all-ones
 mask registers are valid. Hard IRQ only masks/posts the tile
 master and records pending work; task context decodes bank-zero identities.
 Identity VALID waits use 10 microsecond timer retries with a 100 microsecond
-deadline, never a register spin loop. Only exact RCS0/OTHER0 source classes,
+deadline, never a register spin loop. Only exact RCS0/COPY0/OTHER0 source classes,
 instances and admitted cause bits are acknowledged, identity before bank.
 Unrelated display/media/tile causes remain unacknowledged and close IRQ
 delivery. The worker snapshots the dispatch epoch before servicing causes,

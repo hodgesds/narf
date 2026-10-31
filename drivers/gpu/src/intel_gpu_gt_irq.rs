@@ -1,4 +1,4 @@
-//! Graphics GuC/RCS interrupt delivery for single-tile physical functions.
+//! Graphics GuC/RCS0/BCS0 interrupt delivery for single-tile physical functions.
 //! MIT Linux xe_irq.c and xe_guc.c, b90c984d615e8ce2af96f5b1411a962d83fed2ad.
 //! The hard handler only masks the tile master. Identity waits and GuC work
 //! run in task context; IRQ notification never proves DMA retirement.
@@ -14,14 +14,22 @@ const IDENTITY: u64 = 0x190060;
 const SELECTOR: u64 = 0x190070;
 const RENDER_ENABLE: u64 = 0x190030;
 const RCS_MASK: u64 = 0x190090;
+const BCS_MASK: u64 = 0x1900a0;
 const GUC_ENABLE: u64 = 0x190038;
 const GUC_MASK: u64 = 0x1900e8;
 const RING_MASK: u64 = 0x20a8;
+const BCS_RING_MASK: u64 = 0x220a8;
 const ENABLE: u32 = 1 << 31;
 const RCS: u32 = 0x11; // MI_USER_INTERRUPT and FLUSH_COMPLETE
 const RCS_EVENTS: u32 = RCS << 16;
+// RENDER_COPY_INTR_ENABLE: render in ENGINE1 (high), copy in ENGINE0 (low).
+// BCS_RSVD_INTR_MASK carries BCS0 in its ENGINE1 half, like RCS0_RSVD.
+const ENGINE_EVENTS: u32 = RCS_EVENTS | RCS;
 const GUC: u32 = 1 << 31; // primary GuC GUC2HOST (bit 15 in engine 1)
-const OWNED: u32 = 1 | (1 << 25); // bank zero: RCS0 and primary GuC
+const RCS0: u32 = 1;
+const BCS0: u32 = 1 << 15; // INTR_BCS(0)
+const GUC_BIT: u32 = 1 << 25;
+const OWNED: u32 = RCS0 | BCS0 | GUC_BIT; // bank zero
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum IrqError {
@@ -37,9 +45,11 @@ struct Saved {
     master: u32,
     render: u32,
     rcs: u32,
+    bcs: u32,
     guc_enable: u32,
     guc_mask: u32,
     ring: u32,
+    bcs_ring: u32,
 }
 
 struct State<M> {
@@ -81,9 +91,11 @@ impl<M: MmioWindow> Controller<M> {
             master: master & ENABLE,
             render: read(&mmio, RENDER_ENABLE)?,
             rcs: mmio.read32(RCS_MASK),
+            bcs: mmio.read32(BCS_MASK),
             guc_enable: read(&mmio, GUC_ENABLE)?,
             guc_mask: mmio.read32(GUC_MASK),
             ring: mmio.read32(RING_MASK),
+            bcs_ring: mmio.read32(BCS_RING_MASK),
         };
         Ok(Self(IrqSafeSpinLock::new(State {
             mmio,
@@ -100,18 +112,19 @@ impl<M: MmioWindow> Controller<M> {
         let mut s = self.0.lock();
         read(&s.mmio, MASTER)?;
         s.active = true;
-        restore_bits(&s.mmio, RENDER_ENABLE, RCS_EVENTS, RCS_EVENTS);
-        restore_bits(&s.mmio, RCS_MASK, RCS_EVENTS, 0);
-        restore_bits(&s.mmio, GUC_ENABLE, GUC, GUC);
-        restore_bits(&s.mmio, GUC_MASK, GUC, 0);
-        restore_bits(&s.mmio, RING_MASK, RCS, 0);
-        for (offset, mask, expected) in [
-            (RENDER_ENABLE, RCS_EVENTS, RCS_EVENTS),
+        let routes = [
+            (RENDER_ENABLE, ENGINE_EVENTS, ENGINE_EVENTS),
             (RCS_MASK, RCS_EVENTS, 0),
+            (BCS_MASK, RCS_EVENTS, 0),
             (GUC_ENABLE, GUC, GUC),
             (GUC_MASK, GUC, 0),
             (RING_MASK, RCS, 0),
-        ] {
+            (BCS_RING_MASK, RCS, 0),
+        ];
+        for (offset, mask, value) in routes {
+            restore_bits(&s.mmio, offset, mask, value);
+        }
+        for (offset, mask, expected) in routes {
             if s.mmio.read32(offset) & mask != expected {
                 return Err(IrqError::Route);
             }
@@ -155,8 +168,11 @@ impl<M: MmioWindow> Controller<M> {
                     Ok(true)
                 };
             }
-            let expected = if s.selected == 1 { RCS } else { 0x8000 };
-            let class = if s.selected == 1 { 0 } else { 4 };
+            let (expected, class) = match s.selected {
+                RCS0 => (RCS, 0),
+                BCS0 => (RCS, 3),
+                _ => (0x8000, 4),
+            };
             if (identity >> 20) & 0x3f != 0
                 || (identity >> 16) & 7 != class
                 || identity & 0xffff == 0
@@ -218,8 +234,10 @@ impl<M: MmioWindow> Controller<M> {
         // its separate mask half; all unrelated masks/status stay untouched.
         for (offset, mask, saved) in [
             (RING_MASK, RCS, s.saved.ring),
+            (BCS_RING_MASK, RCS, s.saved.bcs_ring),
             (RCS_MASK, RCS_EVENTS, s.saved.rcs),
-            (RENDER_ENABLE, RCS_EVENTS, s.saved.render),
+            (BCS_MASK, RCS_EVENTS, s.saved.bcs),
+            (RENDER_ENABLE, ENGINE_EVENTS, s.saved.render),
             (GUC_MASK, GUC, s.saved.guc_mask),
         ] {
             restore_bits(&s.mmio, offset, mask, saved);
