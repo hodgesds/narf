@@ -16,6 +16,7 @@ pub mod bulk;
 pub mod ccid;
 pub mod cdc;
 pub mod cdc_acm;
+pub mod cdc_acm_bridge;
 pub mod cdc_ecm;
 pub mod cdc_ncm;
 pub mod class_registry;
@@ -73,6 +74,15 @@ pub fn register_initcalls() {
         narf_filesystem::devfs::install_ccid_hooks(
             ccid::devfs_bridge::lookup_ccid,
             ccid::devfs_bridge::enumerate_ccid,
+        );
+        InitResult::Ok
+    });
+    // Install devfs hooks so /dev/ttyACM<N> nodes resolve for
+    // every CDC-ACM function the class driver binds (#753).
+    narf_init::register(Stage::Subsys, "usb-cdc-acm-devfs", || {
+        narf_filesystem::devfs::install_tty_acm_hooks(
+            cdc_acm_bridge::lookup_tty_acm,
+            cdc_acm_bridge::enumerate_tty_acm,
         );
         InitResult::Ok
     });

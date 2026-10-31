@@ -419,6 +419,13 @@ also consult upstream Linux GPL sources.
   `r8152::detach_all_r8152()` are the wholesale variants for
   controller-recovery teardown. Indices are not recycled; a
   replugged adapter republishes under a fresh index.
+- `cdc_acm_bridge::register_tty_acm(transport)` / `unregister_tty_acm(index)`
+  are the publish/withdraw pair for CDC-ACM's `/dev/ttyACM<N>` nodes
+  (major 166): the ACM bind path registers after its endpoints are
+  configured and armed, passing an `AcmTransport` seam (production:
+  `XhciAcmTransport` over the bound `CdcAcmPort`); `cdc_acm::detach_acm` /
+  `clear_acm` unregister every index the removed binding published.
+  Indices are monotonic for the boot, as with ttyUSB.
 - `serial::port` is the bind + transfer layer for vendor USB-serial
   adapters (FTDI, Silicon Labs CP210x, Prolific PL2303, WCH CH341 —
   dispatched by exact VID/PID via `serial::identify`, which no other
@@ -638,11 +645,28 @@ the USB download itself remains a target-silicon gate.
   (Header / Union / Country / ACM / NCM / ECM subtypes), CDC-Comm
   + CDC-Data class-triple constants. Used by the per-subclass
   drivers below.
-- **CDC-ACM** (`cdc_acm`): Abstract Control Model (USB serial)
-  codec + live driver. `LineCoding` builder/parser (baud + data bits + parity +
-  stop bits), `SET_LINE_CODING` / `GET_LINE_CODING` /
-  `SET_CONTROL_LINE_STATE` setup-packet builders, `SerialState`
-  notification decoder, ACM functional-descriptor capability bits.
+- **CDC-ACM** (`cdc_acm` + `cdc_acm_bridge`): Abstract Control Model
+  (USB serial) codec and live tty surface. `LineCoding` builder/parser
+  (baud + data bits + parity + stop bits), `SET_LINE_CODING` /
+  `GET_LINE_CODING` / `SET_CONTROL_LINE_STATE` / `SEND_BREAK`
+  setup-packet builders, `SerialState` notification decoder, ACM
+  functional-descriptor capability bits. Interface pairing honours the
+  Union functional descriptor when one names the Comm interface
+  (failing closed on a dangling Union); the bind path configures and
+  arms the Comm interface's interrupt-IN notification endpoint, and
+  the supervisor pump routes bulk-IN bytes to both the console input
+  ring and the device's ttyACM RX ring, drains the ttyACM TX ring
+  onto bulk-OUT (peek/skip on completion), and folds SerialState
+  reports into the node's modem state. Each bound function publishes
+  `/dev/ttyACM<N>` (major 166) through `cdc_acm_bridge` with the tty
+  ioctl surface — termios/termios2 (CBAUD table + `BOTHER`, `B0`
+  hangup drops DTR/RTS), `TIOCMGET`/`SET`/`BIS`/`BIC` (inputs from
+  SerialState: DCD/DSR/RI; PSTN has no CTS), break via native
+  `SEND_BREAK` gated on the ACM descriptor's send-break capability,
+  `TCFLSH`/`TCXONC`/`FIONREAD`, `TIOCGICOUNT`, winsize — actuating
+  through the class requests and committing user-visible state only
+  after the device accepts (a STALL surfaces as `EIO` with the
+  committed state and the device's cached line coding untouched).
   The live driver retains each bound device's line coding +
   control-line state — the `CdcAcmPort` setters commit to the
   record only on transfer success and surface failures as
