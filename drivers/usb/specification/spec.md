@@ -194,7 +194,7 @@ also consult upstream Linux GPL sources.
   `FP_IOC_CTRL_TRANSFER` (nr 0) issues one EP0 vendor control
   transfer, and `FP_IOC_GET_INFO` (nr 1) returns a packed `u64`
   (slot id bits 0..8, vendor code bits 8..16 — Synaptics 0, Goodix
-  1, ELAN 2 — IN DCI bits 16..24, OUT DCI bits 24..32) so a daemon
+  1, ELAN 2, Validity 3 — IN DCI bits 16..24, OUT DCI bits 24..32) so a daemon
   enumerating nodes can tell readers apart. The control-transfer
   argument is a 24-byte little-endian struct: `bm_request_type`
   `[0]`, `b_request` `[1]`, `w_value` `[2..4]`, `w_index`

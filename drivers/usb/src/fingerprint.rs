@@ -637,10 +637,16 @@ impl narf_filesystem::FileOps for FpFileNode {
         Box::pin(async move {
             match cmd {
                 FP_IOC_GET_INFO => {
+                    // Vendor codes follow FpVendor declaration order
+                    // (Synaptics, Goodix, Elan, Validity); Validity
+                    // arrived with main's single-authority rewrite
+                    // after this match was written, so it takes the
+                    // next code rather than colliding with Synaptics.
                     let vendor_code = match dev.vendor {
                         FpVendor::Synaptics => 0u64,
                         FpVendor::Goodix => 1u64,
                         FpVendor::Elan => 2u64,
+                        FpVendor::Validity => 3u64,
                     };
                     Ok(u64::from(dev.slot_id)
                         | (vendor_code << 8)
