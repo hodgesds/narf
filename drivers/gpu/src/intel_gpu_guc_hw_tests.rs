@@ -6,6 +6,68 @@ mod userspace {
     include!("intel_gpu_user_tests.rs");
 }
 
+fn smoke_hardware_irq_notification_requires_actual_retirement() -> TestResult {
+    for (platform, ack) in [
+        (
+            GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
+            0xdfc,
+        ),
+        (GtPlatform::Alchemist, 0x130044),
+        (GtPlatform::Battlemage, 0xdfc),
+    ] {
+        let (w, arena, mut gt) = hardware_model(platform, ack);
+        hardware_discovery(&mut gt, &w, ack);
+        hardware_scheduling(&mut gt, &w);
+        let irq = crate::intel_gpu_gt_irq::Controller::new(w.clone()).unwrap();
+        irq.activate().unwrap();
+        assert_eq!(irq.service(0), Ok(false));
+        let baseline = arena.live_allocations();
+        let (_, fence) = gt.submit_kernel_probe(100).unwrap();
+        // A valid GuC notification without a CT reply/breadcrumb must not
+        // complete this real scheduler fence or reclaim its DMA backing.
+        let live = arena.live_allocations();
+        let notify = |now| {
+            {
+                let mut d = w.0.borrow_mut();
+                d.regs.insert(0x190008, 0x80000001);
+                d.regs.insert(0x190010, 0x80000001);
+                d.regs.insert(0x190018, 0x02000001);
+            }
+            assert_eq!(
+                irq.hard_irq(),
+                narf_interrupts::dispatch::IrqStatus::Handled
+            );
+            assert_eq!(irq.service(now), Ok(true));
+            assert_eq!(irq.service(now + 1), Ok(true));
+            assert_eq!(irq.service(now + 2), Ok(false));
+        };
+        notify(101);
+        assert!(fence.result().is_none());
+        assert_eq!(arena.live_allocations(), live);
+        let mut registered = BTreeMap::new();
+        for now in 110..160 {
+            assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+            service_contexts(&w, &mut registered, true);
+            notify(now * 10);
+            if fence.result().is_some() {
+                break;
+            }
+        }
+        assert_eq!(fence.result(), Some(Ok(())));
+        assert_eq!(arena.live_allocations(), baseline);
+        assert!(irq.quiesce());
+        assert_eq!(w.read32(0x190008) & 0x80000000, 0);
+        hardware_stop(&mut gt, &w, ack);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gt_irq",
+    smoke_hardware_irq_notification_requires_actual_retirement
+);
+
 fn smoke_hardware_id_recycling_beyond_16bit_request_limit() -> TestResult {
     let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
     hardware_discovery(&mut gt, &w, 0xdfc);

@@ -230,7 +230,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             GtPlatform::Battlemage => 3,
         };
         mmio.write32(0x20c4, 0x3f7e0000 | uc << 8 | uc << 1);
-        mmio.write32(0x20a8, u32::MAX); // polling owner masks RCS interrupts
+        mmio.write32(0x20a8, u32::MAX); // runtime owner enables IRQs after startup probes
         mmio.write32(0x2098, u32::MAX);
         mmio.write32(0x2080, self.resources.hwsp.ggtt_offset());
         mmio.write32(0x229c, 0x00080008);

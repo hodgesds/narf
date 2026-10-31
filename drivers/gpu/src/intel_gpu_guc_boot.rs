@@ -877,6 +877,22 @@ mod tests {
             let mut device = self.0.borrow_mut();
             device.writes.push((offset, value));
             let actual = match offset {
+                0x190008 | 0x190010 => {
+                    let old = *device.regs.get(&offset).unwrap_or(&0);
+                    (old & !value & 0x7fffffff) | (value & 0x80000000)
+                }
+                0x190018 | 0x190060 => *device.regs.get(&offset).unwrap_or(&0) & !value,
+                0x190070 => {
+                    device.regs.insert(
+                        0x190060,
+                        match value {
+                            1 => 0x80000001,
+                            0x02000000 => 0x80048000,
+                            _ => panic!("unowned interrupt selector"),
+                        },
+                    );
+                    value
+                }
                 0xd8c => *device.regs.get(&offset).unwrap_or(&0), // read-only GMD_ID
                 0xc050 | 0xc340 if !device.reject_wopcm => value | 1,
                 0xc314 | 0xa188 | 0xa278 | 0x20ec | 0x83b4 | 0xe48c | 0xe18c | 0xe4f4 | 0xe5f0

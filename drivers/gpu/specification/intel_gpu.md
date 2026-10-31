@@ -1812,7 +1812,7 @@ checkout at `b90c984d615e8ce2af96f5b1411a962d83fed2ad`: MIT-licensed
 xe_guc_ads.c,xe_guc_fwif.h,xe_guc_tlb_inval.c,xe_ggtt.c,xe_force_wake.c,
 xe_guc_hwconfig.c,xe_mocs.c,xe_pat.c,xe_gt_mcr.c,xe_bo.c,xe_lrc.c,
 xe_hw_engine.c,xe_guc_submit.c,xe_gt_topology.c,xe_vm.c,xe_ring_ops.c,
-xe_gt.c,xe_wa.c,xe_tuning.c}`,
+xe_gt.c,xe_wa.c,xe_tuning.c,xe_irq.c,xe_userptr.c}`,
 `drivers/gpu/drm/i915/gt/{uc/intel_guc_hwconfig.c,intel_sseu.c}`,
 `drivers/gpu/drm/i915/i915_query.c`, `include/uapi/drm/i915_drm.h` and
 `drivers/gpu/drm/xe/regs/{xe_guc_regs.h,xe_gt_regs.h,xe_irq_regs.h,xe_lrc_layout.h}`,
@@ -1837,8 +1837,29 @@ acceptance or a claim of complete acceleration.
 | Engines and platforms | Main-GT DSS/EU discovery and RCS0 kernel scheduling; separate Gen12 foundations | Fused engine/cache/media inventory, compute/copy/media submission and independently sourced profiles for other IP |
 | Memory and presentation | Owned system RAM, private tables and same-card CPU PRIME mappings | Local VRAM, accelerated PRIME/presentation and GPU/KMS synchronization |
 | Display | Gen12 paths and owned Xe-LPG internal-panel modeset | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |
-| Power and faults | Bounded polling, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery | IRQ delivery, finer engine recovery and safe runtime autosuspend |
+| Power and faults | Owned GuC/RCS MSI wakeups with timer fallback, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery | Finer engine recovery and safe runtime autosuspend |
 | Acceptance | Native register/CT/page-walk and ownership models on both kernel architectures | Intel silicon execution, suspend/resume and Mesa OpenGL/Vulkan interoperability |
+
+After the GT's execution probes, the physical worker attempts single-vector
+MSI for primary GuC and RCS0, preserving unrelated enable/mask halves. The
+hard handler masks/posts the tile master; bounded task-context identity
+decoding acknowledges only owned RCS0/OTHER0 causes before rearming. Dispatch
+epoch capture precedes servicing, avoiding lost wakes around waiter polling.
+The actual GuC/retirement path runs on the IRQ or a 10 ms watchdog; refused or
+failed IRQ routing retains the 500 us timer path. Unrelated display/media
+status is left pending with delivery closed. Reset/S3 tears down routing while
+powered, and unprovable shutdown quarantines the vector/cookie instead of
+reusing it. Active firmware routes and VMD shared routing refuse takeover;
+ARM production routing still needs an ITS event owner. These native models do
+not establish physical MSI delivery or Mesa/silicon acceptance.
+
+USERPTR can reuse `memory::address_space::UserPagePin` for resident-RAM lifetime
+holds. That read-pin primitive alone does not implement Xe USERPTR: admission
+still needs writable/COW-safe pinning tied to the caller's address space and
+invalidation/repin/rebind ordering against unmap, replacement, fork and active
+GPU jobs (`xe_userptr.c`). Likewise, admitting iGPU WC allocations requires a
+cache-alias policy covering the kernel's WB mapping, rather than changing only
+the userspace PTE or silently substituting WB for the requested policy.
 
 The scheduler now recycles a round-robin pool of 64 GuC IDs after verified
 retirement, removing the 65534-request lifetime limit. Request stamps and TLB

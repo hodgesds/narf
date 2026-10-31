@@ -961,10 +961,27 @@ exercise the ioctl-to-hardware ownership path, bind cancellation, handle close,
 concurrent queues, user-fence visibility and transactional copyout failures.
 This does not establish Mesa or physical Intel acceptance. USERPTR, fault/LR
 VMs, iGPU WC/incoherent mappings, other engines, local VRAM, accelerated
-presentation, IRQ completion and runtime autosuspend remain outstanding.
+presentation and runtime autosuspend remain outstanding.
 
-Final native Xe regression runs pass 136 distinct Intel/DRM tests on x86_64
-and 124 on aarch64, including all 15 new tests, with zero failures/skips.
+The physical Intel GT worker now installs owned primary-GuC/RCS0 MSI after
+its startup probes, with task-context identity decoding, dispatch epoch waits
+and a 10 ms watchdog. Routing refusal/failure keeps the 500 us timer path.
+Display/media causes and mask halves are preserved. Reset/S3 tears down the
+powered route before GT stop; uncertain shutdown quarantines its vector and
+cookie. Native register/dispatch tests cover delayed identities, waiter races,
+route rollback and teardown; physical MSI acceptance remains unverified.
+This continuation passes 62 selected Intel tests on each architecture,
+including all five new IRQ regressions, with zero failures/skips. Source and
+master readback rejection, lost MSI recovery, shared media enable preservation,
+device-loss quarantine and real GuC retirement run in native Rust models.
+GPU CI Clippy passes all three feature contexts on both architectures;
+host default/Intel-only/AMD-only/no-vendor checks, Intel-only debug builds and
+formatting pass. Both production boots and both btrfs postflights per
+architecture pass.
+
+Before the MSI continuation, native Xe regression runs passed 136 distinct
+Intel/DRM tests on x86_64 and 124 on aarch64, including all 15 then-new tests,
+with zero failures/skips.
 Deadline tests use a controlled clock and fixture
 progress uses bounded polling, avoiding short host-dependent timing guards.
 GPU, arch, filesystem and userspace CI Clippy pass all three feature contexts

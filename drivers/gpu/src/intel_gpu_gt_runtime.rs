@@ -53,6 +53,8 @@ enum Phase {
 }
 
 struct State {
+    irq: Option<crate::intel_gpu_gt_irq::GtIrq>,
+    irq_tried: bool,
     gt: Option<ProductionGt>,
     firmware: Option<GuCFirmware>,
     probe: Option<Arc<CompletionFence>>,
@@ -272,6 +274,8 @@ pub(crate) fn start_pending() {
             pending: p,
             _pm: pm,
             state: Mutex::new(State {
+                irq: None,
+                irq_tried: false,
                 gt: None,
                 firmware: None,
                 probe: None,
@@ -390,6 +394,8 @@ fn pci_identity(
 
 impl Owner {
     fn cold_start(&self, state: &mut State) -> Result<(), RuntimeError> {
+        state.irq.take();
+        state.irq_tried = false;
         state.recover_after_stop = false;
         if state
             .gt
@@ -566,9 +572,30 @@ impl Owner {
 
     async fn run(self: Arc<Self>) {
         loop {
+            let mut wait = None;
+            let mut delay_us = 500;
             if !self.suspended.load(Ordering::Acquire) {
                 let mut state = self.state.lock().await;
+                // Snapshot the IRQ epoch before servicing any status. The
+                // waiter observes an edge even before its first poll.
+                if let Some(irq) = &state.irq {
+                    wait = Some(narf_interrupts::wait_for_irq(irq.vector()));
+                    match irq.service(narf_time::monotonic_ns()) {
+                        Ok(pending) => delay_us = if pending { 10 } else { 10_000 },
+                        Err(_) => {
+                            drop(wait.take());
+                            state.irq.take();
+                            log(
+                                self.pending.index,
+                                "IRQ delivery closed; using timer completion",
+                            );
+                        }
+                    }
+                }
                 if let Err(error) = self.step(&mut state) {
+                    drop(wait.take());
+                    state.irq.take(); // stop delivery before resetting the GT
+                    delay_us = 500;
                     self.user_epoch.store(0, Ordering::Release);
                     state.recover_after_stop |= state.phase == Phase::Running;
                     use core::fmt::Write as _;
@@ -589,9 +616,32 @@ impl Owner {
                         }
                     }
                 }
+                if state.phase == Phase::Running && !state.irq_tried {
+                    state.irq_tried = true;
+                    state.irq = crate::intel_gpu_gt_irq::GtIrq::for_device(
+                        AuthorizedWindow::new(self.pending.bar, self.pending.cap),
+                        self.pending.cap,
+                        self.pending.device,
+                    )
+                    .ok();
+                    if state.irq.is_some() {
+                        log(self.pending.index, "MSI completion delivery installed");
+                        delay_us = 10; // first drain before opening tile master
+                    } else {
+                        log(
+                            self.pending.index,
+                            "MSI unavailable; using timer completion",
+                        );
+                    }
+                }
             }
             narf_scheduler::yield_now().await;
-            narf_time::SleepUntil::new(narf_time::Deadline::after_us(500).as_instant()).await;
+            let deadline = narf_time::Deadline::after_us(delay_us);
+            if let Some(wait) = wait {
+                let _ = narf_time::timeout(deadline, wait).await;
+            } else {
+                narf_time::SleepUntil::new(deadline.as_instant()).await;
+            }
         }
     }
 }
@@ -624,6 +674,7 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             self.suspended.store(true, Ordering::Release);
             self.user_epoch.store(0, Ordering::Release);
             let mut state = self.state.lock().await;
+            state.irq.take(); // mask/synchronize while the function is in D0
             state.saved = None;
             let result = async {
                 if let Some(gt) = &mut state.gt {

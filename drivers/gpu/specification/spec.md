@@ -567,8 +567,9 @@ successful installation creates `CachePolicy`, which authorizes staged PTEs
 and coherent x86_64 backing. `BootAllocator::configure_cache` defaults to
 refusal and applies that proof to each staged backing before publication.
 BMG GGTT writes include Wa_22019338487's G-unit
-drain. GuC host and RCS interrupts are masked for the bounded polling service;
-this path does not install a GuC IRQ handler. Wake/reset/semaphore waits have
+drain. GuC host and RCS interrupts stay masked during startup. Once execution
+probes pass, the physical service attempts owned MSI delivery as described
+below. Wake/reset/semaphore waits have
 deadlines and async timer/yield progression.
 
 Before firmware DMA, `GuCBoot::begin` validates and binds two matching live
@@ -731,6 +732,33 @@ synchronous suspend while live. Paired async resume restores D0, configuration
 and any owned display mode, then rebuilds GT state using the retained firmware
 asset. No synchronous bridge waits run inside executor polls. A failed cleanup
 is not retried forever.
+
+`intel_gpu_gt_irq` owns single-vector PCI MSI and the single-tile master
+hierarchy on the admitted MTL/Arrow, DG2 and BMG physical functions. Active
+firmware MSI/MSI-X, an enabled tile master, VMD shared routing, unavailable
+registers or unrelated master indications refuse takeover without writes.
+Graphics GuC GUC2HOST and RCS0 MI_USER/FLUSH sources are enabled with masked
+updates and readback checks preserving other engine/media bits; all-ones
+mask registers are valid. Hard IRQ only masks/posts the tile
+master and records pending work; task context decodes bank-zero identities.
+Identity VALID waits use 10 microsecond timer retries with a 100 microsecond
+deadline, never a register spin loop. Only exact RCS0/OTHER0 source classes,
+instances and admitted cause bits are acknowledged, identity before bank.
+Unrelated display/media/tile causes remain unacknowledged and close IRQ
+delivery. The worker snapshots the dispatch epoch before servicing causes,
+then drains the actual GT/GuC owner and awaits that IRQ or a 10 millisecond
+watchdog. Startup, cleanup and unavailable/failed routing use 500 microsecond
+timer progression. IRQ delivery never completes a fence by itself: breadcrumb,
+saved head, deregistration and final TLB proofs still govern retirement.
+
+Reset and async suspend mask device causes, disable MSI, remove and synchronize
+the handler, then release its cookie/vector before stopping the powered GT.
+Each restart allocates a fresh route. Optional MSI per-vector masks and the
+original MSI control are restored on teardown. Unprovable shutdown after
+authority/device loss quarantines the vector, cookie, route and BAR authority
+together, preventing late messages from reaching a new driver. Production
+ARM PCI delivery remains refused without an ITS event owner; native Rust
+dispatch/register/rollback models execute on both kernel architectures.
 The card's `intel_user_backend` uses a Weak owner reference and publishes a
 nonzero unique epoch only after the GGTT/default-state/PPGTT startup probes
 retire and validate. Submission rechecks phase, suspend, epoch, authority, wake
