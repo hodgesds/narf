@@ -51,6 +51,7 @@
 
 extern crate alloc;
 
+mod aspm;
 pub mod btcoex;
 pub mod channel;
 pub mod channel_power;
@@ -93,6 +94,7 @@ pub mod rtl8821ae;
 
 pub use interface::set_inactive_power_save;
 pub use interface::set_leisure_power_save;
+pub use interface::set_pcie_aspm;
 pub use pci::{name_for, probe, register_pci_driver, RtlwifiDevice};
 pub use regs::{ALL_DEV_IDS, REALTEK_VENDOR};
 

@@ -1239,6 +1239,39 @@ additional-operating-channels and multi-radio inventory rows are closed for
 the retained factory-qualified1–11 profiles. Physical board RF qualification
 remains separate; the later Intel command-group correction has its own gates.
 
+### PCIe ASPM (implemented, native acceptance pending)
+
+The retained RTL8188EE owner follows Linux's default-on `aspm` policy for
+L0s/L1 and CLKREQ. `set_pcie_aspm(bool)` sets the policy for the next cold
+preparation. Admission intersects the endpoint's actual Link Capabilities
+with the live upstream bridge's already-enabled Link Control. CLKREQ also
+requires the endpoint's advertised Clock Power Management support. Linux's
+known Intel/ATI/AMD/SiS bridge vendor set is retained; absent/unknown parents
+authorize no endpoint ASPM entry. The shared bridge and common-clock bits
+remain platform-owned.
+
+Probe and actual card-disable/enable transitions first verify endpoint
+ASPM/CLKREQ disabled. After verified card disable, idle link policy can be
+restored only using that same owner's completed internal preparation;
+failure of this optional optimization grants no packet or DMA ownership.
+Before packet admission, the cooperative MDIO/DBI
+program follows `_rtl88ee_enable_aspm_back_door`: the actual354/358 word
+writes and70c/718 DBI read-modify-writes require observed command retirement
+and exact data readbacks. Polls yield through the native timer wait, with
+the source's bounded20 ten-microsecond waits. No pending/ignored write is a
+completion receipt. The parent policy is reread after the cooperative waits
+before committing endpoint Link Control, whose unrelated bits are preserved
+and whose actual readback is checked.
+
+Every native configuration/MMIO action executes within the current exact
+function's capability invocation. A cancelled bus preparation leaves the
+parked owner failed; packet admission requires a fresh recovery. Each fresh
+physical owner redoes internal preparation, including after suspend/IPS.
+Six native cases cover literal hardware transactions, actual policy limits,
+timeouts/readback/source loss, cancellation, the native revoked-cap path,
+and Open/WPA2 kernel DHCP with fresh-owner parent-policy withdrawal. Native
+acceptance remains pending; other chip runtimes retain their own rows.
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE
@@ -1394,7 +1427,7 @@ runtimes remain separate from the retained RTL8188EE owner.
 | `dynamic_antenna_selection` | Dynamic antenna selection/tracking; blocked on per-antenna signed board measurements (NEPC binds one static factory antenna) |
 | `five_ghz_operation` | 5GHz band operation on RTL8192DE/RTL8821AE; blocked on the rtl8192de/rtl8821ae chip runtimes (RTL8188EE is 2.4GHz-only) |
 | `ht40` | HT40; blocked on a signed NEHT v2 record covering 40MHz emissions (NEHT v1 binds width20) and 40MHz BW programming |
-| `pcie_aspm` | PCIe ASPM link power management; blocked on bus/ PCIe link-control ASPM programming coordinated with the upstream bridge (outside family scope) |
+| `pcie_aspm` | RTL8188EE source-matched MDIO/DBI and current-platform-policy endpoint L0s/L1/CLKREQ preparation implemented pending native acceptance |
 | `rf_gain_tracking` | RF gain/power tracking; blocked on a thermal-indexed signed gain envelope (thermal power tracking moves gains outside the fixed NEPC/NEHT envelope) |
 | `rts_cts_protection` | RTS/CTS protection; blocked on signed qualification of RTS/CTS-to-self emissions (NEPC/NEHT exclude them) and TXD RTS fields driven by bss use_cts_prot/use_rts |
 | `vht` | VHT operation including TX/RX STBC on RTL8821AE; blocked on the rtl8821ae runtime |

@@ -426,6 +426,13 @@ pub unsafe fn bring_up(
             return Err(ProbeError::RegisterBarMapFailed);
         }
 
+        if did == RTL_DEV_8188EE {
+            // SAFETY: this exact exclusive function owns the validated BAR2;
+            // its packet DMA is parked before any power/EFUSE access.
+            let control = unsafe { PciIo::new(*device, *cap, registers) };
+            control.disable_aspm().map_err(|_| ProbeError::PciAccess)?;
+        }
+
         // Power-on (cardemu → active).  Optional — chips not in the table
         // are tolerated for forward compat; the rest fall through to MAC
         // init unchanged.
@@ -460,10 +467,8 @@ pub unsafe fn bring_up(
     let firmware = if did == RTL_DEV_8188EE {
         // SAFETY: probe parked this exact function and exclusively owns BAR2.
         // PciIo rechecks current authority and parked BME at every access.
-        Some(Arc::new(FirmwareOwner::new(
-            unsafe { PciIo::new(*device, *cap, registers) },
-            did,
-        )))
+        let io = unsafe { PciIo::new(*device, *cap, registers) };
+        Some(Arc::new(FirmwareOwner::new(io, did)))
     } else {
         None
     };

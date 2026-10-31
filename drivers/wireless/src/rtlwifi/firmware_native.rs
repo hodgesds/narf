@@ -10,6 +10,7 @@ pub struct PciIo {
     registers: MmioRegion,
     packet_mode: AtomicBool,
     quarantined: AtomicBool,
+    aspm_prepared: AtomicBool,
     msi: narf_lib::sync::IrqSafeSpinLock<Option<Msi>>,
 }
 /// Single MSI vector (Linux `rtl_pci_intr_mode_msi`: `pci_enable_msi` +
@@ -20,6 +21,8 @@ struct Msi {
     vector: u8,
     signal: alloc::sync::Arc<super::irq::Signal>,
 }
+#[path = "aspm_native.rs"]
+mod aspm_native;
 #[path = "irq_routes.rs"]
 mod irq_routes;
 static SIGNALS: narf_lib::sync::IrqSafeSpinLock<irq_routes::Routes> =
@@ -91,6 +94,7 @@ impl PciIo {
             registers,
             packet_mode: AtomicBool::new(false),
             quarantined: AtomicBool::new(false),
+            aspm_prepared: AtomicBool::new(false),
             msi: narf_lib::sync::IrqSafeSpinLock::new(None),
         }
     }

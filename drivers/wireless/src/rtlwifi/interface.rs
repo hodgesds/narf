@@ -101,6 +101,12 @@ const WATCHDOG_MS: u64 = 2_000;
 /// default off exactly like the upstream RTL8188EE driver.
 static FW_LPS: AtomicBool = AtomicBool::new(false);
 static INACTIVE_PS: AtomicBool = AtomicBool::new(true);
+static PCIE_ASPM: AtomicBool = AtomicBool::new(true);
+/// Linux's default-on `aspm` preparation policy. Changes apply at the next
+/// cold preparation; they do not claim completion of a live PCI transition.
+pub fn set_pcie_aspm(enabled: bool) {
+    PCIE_ASPM.store(enabled, Ordering::Release);
+}
 /// Equivalent to Linux rtl8188ee's default-on `ips` parameter.
 pub fn set_inactive_power_save(enabled: bool) {
     INACTIVE_PS.store(enabled, Ordering::Release);
@@ -277,6 +283,13 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             let calibration = super::channel_power::Calibration::load_registered(&self.factory)
                 .map_err(|_| Error::Profile)?;
             owner.stage_station_calibration(calibration, &self.environment.domain()?)?;
+        }
+        if owner.station_phase() == station::Phase::Dormant && owner.phase() == Phase::MacConfigured
+        {
+            if let Err(error) = owner.prepare_station_bus_power(&self.environment).await {
+                self.close();
+                return Err(error);
+            }
         }
         if owner.station_phase() == station::Phase::Dormant {
             let rx = self.rx.clone();
@@ -1169,6 +1182,15 @@ impl NativeEnvironment {
     }
 }
 impl Environment for NativeEnvironment {
+    async fn prepare_bus_power(&self) -> Result<(), Error> {
+        self.firmware()
+            .native()
+            .prepare_aspm(PCIE_ASPM.load(Ordering::Acquire))
+            .await
+            .map_err(super::prepare::Error::Access)
+            .map_err(Error::from)
+    }
+
     fn allow_channel(&self, factory: &Factory, channel: u8) -> Result<(), Error> {
         let calibration = super::channel_power::Calibration::load_registered(factory)
             .map_err(|_| Error::Profile)?;

@@ -13,9 +13,18 @@ impl Rebuild<PacketIo<BootPort>, Block> for DeviceEnvironment {
         if firmware.native().powered_off.load(Ordering::Acquire) {
             return Ok(());
         }
+        let bus = self.bus_power.lock().clone();
+        if let Some(bus) = &bus {
+            aspm::configure(bus.as_ref(), false)
+                .await
+                .map_err(Error::Access)?;
+        }
         power_runtime::disable(firmware.native(), firmware.status().stage == Stage::Ready)
             .await
             .map_err(Error::Access)?;
+        if let Some(bus) = bus {
+            let _ = aspm::configure(bus.as_ref(), true).await;
+        }
         Ok(())
     }
     async fn rebuild(
@@ -30,6 +39,12 @@ impl Rebuild<PacketIo<BootPort>, Block> for DeviceEnvironment {
             return Err(StationError::State);
         }
         self.power_down().await?;
+        let bus = self.bus_power.lock().clone();
+        if let Some(bus) = bus {
+            aspm::configure(bus.as_ref(), false)
+                .await
+                .map_err(Error::Access)?;
+        }
         power_runtime::enable(&io).await.map_err(Error::Access)?;
         let firmware = Arc::new(Firmware::new(io, 0x8179));
         *self.firmware.lock() = firmware.clone();
@@ -40,6 +55,9 @@ impl Rebuild<PacketIo<BootPort>, Block> for DeviceEnvironment {
             *byte = (index % 251) as u8;
         }
         firmware.initialize(&image).await.map_err(Error::Access)?;
+        if let Some(bus) = self.bus_power.lock().as_ref() {
+            bus.fresh_owner();
+        }
         let mut owner = Prepared::allocate(
             firmware.claim_packet_io().map_err(Error::Access)?,
             4,

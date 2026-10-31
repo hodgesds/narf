@@ -52,6 +52,9 @@ pub(crate) enum Phase {
 pub(crate) type TransitionFuture =
     core::pin::Pin<alloc::boxed::Box<dyn Future<Output = Result<(), Error>> + Send>>;
 pub(crate) trait Environment: Send + Sync {
+    fn prepare_bus_power(&self) -> impl Future<Output = Result<(), Error>> + Send {
+        core::future::ready(Ok(()))
+    }
     fn allow_channel(
         &self,
         _factory: &super::super::efuse::Factory,
@@ -963,6 +966,20 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             expected: self.station.epoch.load(Ordering::Acquire),
             failed: self.station.failed.clone(),
         })
+    }
+    /// Bus-power changes precede packet admission. A dropped native wait
+    /// leaves a failed preparation that must be replaced through recovery.
+    pub(crate) async fn prepare_station_bus_power(
+        &mut self,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        if self.phase != Hardware::MacConfigured || self.station.phase != Phase::Dormant {
+            return Err(Error::State);
+        }
+        self.phase = Hardware::Failed;
+        environment.prepare_bus_power().await?;
+        self.phase = Hardware::MacConfigured;
+        Ok(())
     }
     pub(crate) fn prepare_station_ht(
         &mut self,

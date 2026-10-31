@@ -19,11 +19,18 @@ impl
             .native()
             .parked_control()
             .map_err(prepare::Error::Access)?;
+        io.disable_aspm().map_err(prepare::Error::Access)?;
         self.power_state.store(2, Ordering::Release);
         super::super::power_runtime::disable(&io, firmware.status().stage == Stage::Ready)
             .await
             .map_err(prepare::Error::Access)?;
         self.power_state.store(1, Ordering::Release);
+        // Card-disable proof is complete. Optional idle-link optimization
+        // cannot revoke that receipt or grant any packet/DMA ownership.
+        let _ = firmware
+            .native()
+            .idle_aspm(PCIE_ASPM.load(Ordering::Acquire))
+            .await;
         Ok(())
     }
     async fn rebuild(
@@ -39,6 +46,7 @@ impl
             .native()
             .parked_control()
             .map_err(prepare::Error::Access)?;
+        io.disable_aspm().map_err(prepare::Error::Access)?;
         self.power_state.store(2, Ordering::Release);
         super::super::power_runtime::enable(&io)
             .await

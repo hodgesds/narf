@@ -2,6 +2,7 @@
 //! DHCP client. Only MMIO, DMA and the peer are inert. No test installs a
 //! physical firmware or board-calibration registry entry.
 use super::super::super::super::super::{
+    aspm,
     firmware_transport::{Owner as Firmware, PacketIo, Stage},
     interface::Device,
 };
@@ -153,8 +154,20 @@ struct DeviceEnvironment {
     ht: Option<HtFixtureSource>,
     ht_channel: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
     fallback_channel: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
+    bus_power: IrqSafeSpinLock<Option<Arc<aspm::tests::Model>>>,
 }
 impl Environment for DeviceEnvironment {
+    async fn prepare_bus_power(&self) -> Result<(), StationError> {
+        let model = self.bus_power.lock().clone();
+        if let Some(model) = model {
+            aspm::configure(model.as_ref(), true)
+                .await
+                .map_err(Error::Access)
+                .map_err(StationError::Radio)
+        } else {
+            Ok(())
+        }
+    }
     fn allow_channel(
         &self,
         factory: &super::super::super::super::super::efuse::Factory,
@@ -468,6 +481,7 @@ impl Harness {
                 ht: ht_source.clone(),
                 ht_channel: IrqSafeSpinLock::new(None),
                 fallback_channel: IrqSafeSpinLock::new(None),
+                bus_power: IrqSafeSpinLock::new(None),
             },
         ));
         *device.environment_for_test().device.lock() = Arc::downgrade(&device);
@@ -576,6 +590,8 @@ impl Harness {
             .map_or(0, |iface| iface.rx_packets)
     }
 }
+#[path = "aspm_composition_tests.rs"]
+mod aspm_composition;
 #[path = "channel_composition_tests.rs"]
 mod channel_tests;
 #[path = "ht_channel_composition_tests.rs"]

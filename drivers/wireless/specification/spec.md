@@ -901,6 +901,11 @@ and async `pci::provision_at(BusAddr)`; the existing helpers select the first
 bound controller for compatibility. Independent radios retain per-function
 PCI, frontend, context-send and MSI ownership, software-validated above.
 
+`rtlwifi::set_pcie_aspm(bool)` selects next-preparation PCIe L0s/L1/CLKREQ
+policy. Actual enabled parent policy, endpoint capabilities and native
+hardware receipts gate endpoint entry; the shared bridge/common-clock
+configuration remains platform-owned. This continuation awaits native gates.
+
 ## 4. Interaction with `narf-wireless`
 
 - **Registration**: Drivers register via `bus::register_wireless_driver(MatchEntry { ... })`.
