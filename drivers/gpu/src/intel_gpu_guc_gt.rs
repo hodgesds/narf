@@ -471,6 +471,34 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 .is_some_and(GuCScheduler::defaults_ready)
     }
 
+    pub fn user_epoch(&self) -> Option<u64> {
+        (self.state == GtState::SchedulingReady)
+            .then(|| self.parts.scheduler.as_ref()?.user_epoch())
+            .flatten()
+    }
+
+    pub fn submission_version(&self) -> (u8, u8, u8) {
+        self.parts.boot.submission_version()
+    }
+
+    /// Submit an untrusted, nonsecure PPGTT batch. Unlike the trusted kernel
+    /// API, CPU aliases and nested commands are untrusted throughout execution.
+    /// Hardware command checking cannot reach the GGTT ring/image/table graph.
+    pub fn submit_user_batch(
+        &mut self,
+        now: u64,
+        context: Arc<crate::intel_gpu_user::UserContext>,
+        batch: crate::intel_gpu_user::UserBatch,
+    ) -> Result<(u16, Arc<crate::intel_gpu_fence::CompletionFence>), GtError> {
+        self.admit_scheduling()?;
+        self.parts
+            .scheduler
+            .as_mut()
+            .ok_or(GtError::State)?
+            .submit_user(now, context, batch)
+            .map_err(GtError::Scheduling)
+    }
+
     /// Queue a trusted kernel PPGTT batch, retaining its tables and every BO
     /// through verified retirement or full-engine reset.
     ///

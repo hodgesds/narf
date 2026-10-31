@@ -103,6 +103,11 @@ pub trait DrmCard: Send + Sync {
     fn intel_topology(&self) -> Option<Arc<crate::intel_gpu_topology::GtTopology>> {
         None
     }
+
+    #[cfg(feature = "intel")]
+    fn intel_user_backend(&self) -> Option<Arc<dyn crate::intel_gpu_user::UserBackend>> {
+        None
+    }
 }
 
 // ── Global registry ────────────────────────────────────────────────────────

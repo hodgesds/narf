@@ -228,6 +228,10 @@ fn extent(backing: &impl GpuBacking, pages: u32) -> Result<(), BootError> {
 }
 
 impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
+    pub(crate) fn submission_version(&self) -> (u8, u8, u8) {
+        self.submission_version
+    }
+
     pub fn stage(
         mmio: M,
         allocator: A,

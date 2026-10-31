@@ -37,6 +37,13 @@ pub struct ExecRequest {
 }
 
 impl ExecRequest {
+    pub fn prepare_user(
+        &self,
+        platform: GtPlatform,
+    ) -> Result<crate::intel_gpu_user::UserBatch, FsError> {
+        self.prepare_for_gt(platform)
+            .map(crate::intel_gpu_user::UserBatch)
+    }
     /// Freeze a validated request into one owned batch. Revalidate even when
     /// the request was constructed by a kernel caller rather than `read`.
     pub fn prepare(&self, format: PteFormat, pat_index: u8) -> Result<ResidentBatch, FsError> {

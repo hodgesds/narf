@@ -13,8 +13,12 @@ use crate::{
     intel_gpu_guc_gt::{GtError, GtState, GuCGt},
     intel_gpu_rcs::{GgttArena, SharedArena},
 };
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use alloc::{
+    boxed::Box,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Read, Write};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
@@ -56,6 +60,7 @@ struct State {
     phase: Phase,
     saved: Option<narf_bus::pci::SavedPciConfig>,
     power_ready: u64,
+    recover_after_stop: bool,
 }
 
 struct Pending {
@@ -72,6 +77,64 @@ struct Owner {
     _pm: narf_power::runtime_pm_pci::PciRuntimeNode,
     state: Mutex<State>,
     suspended: AtomicBool,
+    user_epoch: Arc<AtomicU64>,
+    user_version: Arc<AtomicU32>,
+}
+
+#[derive(Debug)]
+struct Backend {
+    owner: Weak<Owner>,
+    epoch: Arc<AtomicU64>,
+    version: Arc<AtomicU32>,
+    platform: GtPlatform,
+}
+
+impl crate::intel_gpu_user::UserBackend for Backend {
+    fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let version = self.version.load(Ordering::Relaxed);
+        (epoch != 0).then_some(crate::intel_gpu_user::UserStatus {
+            epoch,
+            platform: self.platform,
+            submission_version: ((version >> 16) as u8, (version >> 8) as u8, version as u8),
+        })
+    }
+    fn submit<'a>(
+        &'a self,
+        context: Arc<crate::intel_gpu_user::UserContext>,
+        batch: crate::intel_gpu_user::UserBatch,
+    ) -> narf_filesystem::FsFuture<'a, Arc<CompletionFence>> {
+        Box::pin(async move {
+            let owner = self
+                .owner
+                .upgrade()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let mut state = owner.state.lock().await;
+            if state.phase != Phase::Running || owner.suspended.load(Ordering::Acquire) {
+                return Err(narf_filesystem::FsError::NoDevice);
+            }
+            let gt = state
+                .gt
+                .as_mut()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let epoch = gt.user_epoch().ok_or(narf_filesystem::FsError::NoDevice)?;
+            context.check_epoch(epoch)?;
+            let result = gt.submit_user_batch(narf_time::monotonic_ns(), context, batch);
+            if gt.state() == GtState::Lost {
+                owner.user_epoch.store(0, Ordering::Release);
+            }
+            result.map(|(_, fence)| fence).map_err(|error| match error {
+                GtError::Scheduling(crate::intel_gpu_guc_sched::SchedulingError::Residency(
+                    error,
+                )) => error,
+                GtError::Scheduling(
+                    crate::intel_gpu_guc_sched::SchedulingError::Busy
+                    | crate::intel_gpu_guc_sched::SchedulingError::Full,
+                ) => narf_filesystem::FsError::WouldBlock,
+                _ => crate::intel_gpu_user::io_error(),
+            })
+        })
+    }
 }
 
 // Deliberately no autosuspend yet. The probe reference and forbid reference
@@ -144,9 +207,29 @@ pub(crate) fn start_pending() {
                 phase: Phase::Cold,
                 saved: None,
                 power_ready: 0,
+                recover_after_stop: false,
             }),
             suspended: AtomicBool::new(false),
+            user_epoch: Arc::new(AtomicU64::new(0)),
+            user_version: Arc::new(AtomicU32::new(0)),
         });
+        let backend = Arc::new(Backend {
+            owner: Arc::downgrade(&owner),
+            epoch: owner.user_epoch.clone(),
+            version: owner.user_version.clone(),
+            platform: GtPlatform::from_pci(
+                owner.pending.device.id.vendor,
+                owner.pending.device.id.device,
+            )
+            .expect("admitted platform"),
+        });
+        if owner.pending.card.install_user_backend(backend).is_err() {
+            log(
+                owner.pending.index,
+                "duplicate userspace backend; GT not started",
+            );
+            continue;
+        }
         OWNERS.lock().push(owner.clone());
         narf_power::device_pm::register_device_pm_ops(&name, owner.clone());
         narf_power::system_pm::register_async_system_pm(&name, owner.clone());
@@ -233,6 +316,7 @@ fn pci_identity(
 
 impl Owner {
     fn cold_start(&self, state: &mut State) -> Result<(), RuntimeError> {
+        state.recover_after_stop = false;
         if state
             .gt
             .as_ref()
@@ -376,6 +460,15 @@ impl Owner {
                         .map_err(|_| RuntimeError::State)?;
                     state.probe_result = None;
                     state.phase = Phase::Running;
+                    let (major, minor, patch) = gt.submission_version();
+                    self.user_version.store(
+                        u32::from(major) << 16 | u32::from(minor) << 8 | u32::from(patch),
+                        Ordering::Relaxed,
+                    );
+                    self.user_epoch.store(
+                        gt.user_epoch().ok_or(RuntimeError::State)?,
+                        Ordering::Release,
+                    );
                     log(
                         self.pending.index,
                         "GuC ready; default RCS state, private PPGTT store and retirement verified",
@@ -384,7 +477,12 @@ impl Owner {
             }
             (Phase::Running, GtState::SchedulingReady) => {}
             (Phase::Cleaning, GtState::Stopped) => {
-                state.phase = Phase::Failed;
+                state.phase = if state.recover_after_stop {
+                    state.recover_after_stop = false;
+                    Phase::Cold
+                } else {
+                    Phase::Failed
+                };
             }
             _ => return Err(RuntimeError::State),
         }
@@ -396,6 +494,8 @@ impl Owner {
             if !self.suspended.load(Ordering::Acquire) {
                 let mut state = self.state.lock().await;
                 if let Err(error) = self.step(&mut state) {
+                    self.user_epoch.store(0, Ordering::Release);
+                    state.recover_after_stop |= state.phase == Phase::Running;
                     use core::fmt::Write as _;
                     let _ = writeln!(
                         narf_console::Writer,
@@ -447,6 +547,7 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
         Box::pin(async move {
             use narf_power::device_pm::DeviceSuspendError as E;
             self.suspended.store(true, Ordering::Release);
+            self.user_epoch.store(0, Ordering::Release);
             let mut state = self.state.lock().await;
             state.saved = None;
             let result = async {

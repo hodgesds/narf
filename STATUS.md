@@ -940,6 +940,30 @@ interfaces and limits.
 
 ## Current work
 
+The current Intel branch now implements userspace RCS0 submission on MTL/Arrow
+Xe-LPG, Alchemist and Battlemage. Async i915 EXECBUFFER2/WR uses copied softpin
+residency, per-open ordered contexts, implicit GEM/PRIME reservations and the
+live GT owner. Private context images preserve saved state between retired
+jobs; kernel rings/images/tables remain outside user mappings. Hardware
+nonsecure PPGTT command checking and the verified RCS register policy constrain
+untrusted batches. Live engine/capability/version queries and the i915 loader
+identity publish only after startup probes pass. Loss/suspend closes admission;
+verified full stop allows rebuild with a fresh epoch, refusing old contexts
+without replaying their batches. Failed cleanup remains closed.
+Native Rust models exercise the actual ioctl -> GT -> CT -> PPGTT execution
+and retirement chain, context save/restore/isolation across six IP variants,
+cache failure rollback, cancellation, handle/fd close and reset/epoch ownership.
+Intel silicon and Mesa OpenGL/Vulkan acceptance, explicit submission fences,
+other engines, local VRAM and accelerated presentation remain outstanding.
+The conservative scheduler also requires a restart after 65534 request IDs;
+transparent identity recycling remains open for sustained workloads.
+Validation passes 88 selected native Intel tests on each architecture, including
+five new userspace smokes, with zero failures/skips. GPU CI Clippy passes all
+three feature contexts on x86_64 and aarch64; host default, Intel-only, AMD-only
+and no-vendor all-target checks pass. Intel-only debug builds, formatting,
+both production boots and both btrfs postflights per architecture pass.
+The following paragraphs record earlier implementation checkpoints.
+
 Intel render work merged through #1175 includes per-open i915-wire
 GEM storage, CPU copies/WB mmap, same-card PRIME sharing, context and VM
 namespaces, two-pass memory and

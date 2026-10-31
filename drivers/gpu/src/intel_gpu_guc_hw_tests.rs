@@ -2,6 +2,10 @@
 // Reference vectors: MIT Linux xe_guc_submit.c, xe_lrc.c, xe_guc_ads.c,
 // xe_mocs.c at b90c984d615e8ce2af96f5b1411a962d83fed2ad.
 
+mod userspace {
+    include!("intel_gpu_user_tests.rs");
+}
+
 fn hardware_model(platform: GtPlatform, ack: u64) -> (Window, Arena, GuCGt<Window, Arena>) {
     hardware_model_with_interface(platform, ack, 1)
 }

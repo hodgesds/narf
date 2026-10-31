@@ -50,6 +50,7 @@ pub struct DeviceInfo {
     pub memory_bytes: u64,
     pub hwconfig: Option<Arc<HardwareConfig>>,
     pub topology: Option<Arc<crate::intel_gpu_topology::GtTopology>>,
+    pub backend: Option<Arc<dyn crate::intel_gpu_user::UserBackend>>,
 }
 
 impl DeviceInfo {
@@ -66,13 +67,21 @@ impl DeviceInfo {
             memory_bytes: narf_memory::frame::stats().total as u64 * 4096,
             hwconfig: card.intel_hwconfig(),
             topology: card.intel_topology(),
+            backend: card.intel_user_backend(),
         })
     }
 
     /// No userspace engine is published until isolation, context setup,
     /// completion and reset/loss handling are installed by the GT owner.
-    pub const fn submission_ready(&self) -> bool {
-        false
+    pub fn submission_ready(&self) -> bool {
+        self.user_status().is_some()
+    }
+
+    fn user_status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
+        self.backend
+            .as_ref()
+            .and_then(|backend| backend.status())
+            .filter(|status| status.epoch != 0 && status.platform == self.platform)
     }
 }
 
@@ -83,6 +92,7 @@ struct Vm {
 
 #[derive(Clone, Debug)]
 struct Context {
+    user: Arc<crate::intel_gpu_user::UserContext>,
     vm: Arc<Vm>,
     no_error_capture: bool,
     bannable: bool,
@@ -93,10 +103,11 @@ struct Context {
 impl Context {
     fn new(vm: Arc<Vm>) -> Self {
         Self {
+            user: crate::intel_gpu_user::UserContext::new(),
             vm,
             no_error_capture: false,
             bannable: true,
-            recoverable: true,
+            recoverable: false,
             persistence: true,
         }
     }
@@ -144,13 +155,16 @@ impl Namespaces {
                     if param == 5 && value == 0 {
                         return Err(FsError::OperationNotPermitted);
                     }
+                    if (param == 8 && value == 1) || (param == 11 && value == 0) {
+                        return Err(FsError::NotImplemented);
+                    }
                     *target = value != 0;
                 } else {
                     put64(bytes, 16, u64::from(*target));
                 }
             }
             (6, _) => {
-                // Only normal priority is supported until a GT scheduler exists.
+                // The userspace path currently supports only normal priority.
                 if set && value != 0 {
                     return Err(FsError::InvalidData);
                 }
@@ -158,6 +172,10 @@ impl Namespaces {
             }
             (9, true) => {
                 let vm_id = u32::try_from(value).map_err(|_| FsError::NotFound)?;
+                let _idle = context.user.serial.try_lock().ok_or(FsError::Busy)?;
+                if !context.user.can_rebind() {
+                    return Err(FsError::Busy);
+                }
                 context.vm = self.vms.get(&vm_id).cloned().ok_or(FsError::NotFound)?;
             }
             (9, false) => {
@@ -253,6 +271,25 @@ impl RenderFile {
         arg: u64,
         user: &dyn IoctlContext,
     ) -> Option<Result<u64, FsError>> {
+        if matches!(cmd, abi::GEM_EXECBUFFER2 | abi::GEM_EXECBUFFER2_WR) {
+            return Some(self.exec_ioctl(info, arg, user).await.map(|()| 0));
+        }
+        if cmd == abi::GEM_THROTTLE {
+            let fences: Vec<_> = {
+                let namespaces = self.namespaces.lock();
+                namespaces
+                    .contexts
+                    .values()
+                    .filter_map(|context| context.user.last())
+                    .collect()
+            };
+            for fence in fences {
+                if fence.wait().await.is_err() {
+                    return Some(Err(crate::intel_gpu_user::io_error()));
+                }
+            }
+            return Some(Ok(0));
+        }
         if cmd == abi::GEM_WAIT {
             return Some(self.wait_ioctl(arg, user).await.map(|()| 0));
         }
@@ -263,6 +300,52 @@ impl RenderFile {
             return Some(self.domain_ioctl(cmd, arg, user).await.map(|()| 0));
         }
         self.dispatch(info, cmd, arg, user)
+    }
+
+    async fn exec_ioctl(
+        &self,
+        info: &DeviceInfo,
+        arg: u64,
+        user: &dyn IoctlContext,
+    ) -> Result<(), FsError> {
+        let request = crate::intel_gpu_exec::ExecRequest::read(user, arg, &self.gem)?;
+        let context = {
+            let mut namespaces = self.namespaces.lock();
+            namespaces.initialize();
+            namespaces
+                .contexts
+                .get(&request.context_id)
+                .ok_or(FsError::NotFound)?
+                .user
+                .clone()
+        };
+        let backend = info.backend.as_ref().ok_or(FsError::NotImplemented)?;
+        let _order = context.serial.lock().await;
+        if let Some(previous) = context.last() {
+            previous
+                .wait()
+                .await
+                .map_err(|_| crate::intel_gpu_user::io_error())?;
+        }
+        loop {
+            let status = backend
+                .status()
+                .filter(|status| status.platform == info.platform)
+                .ok_or(FsError::NoDevice)?;
+            context.check_epoch(status.epoch)?;
+            for entry in &request.objects {
+                entry.object.wait_idle(entry.writable, None).await?;
+            }
+            let batch = request.prepare_user(status.platform)?;
+            match backend.submit(context.clone(), batch).await {
+                Ok(_) => return Ok(()),
+                Err(FsError::WouldBlock) => {
+                    narf_time::SleepUntil::new(narf_time::Deadline::after_us(100).as_instant())
+                        .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn domain_ioctl(
@@ -366,6 +449,9 @@ impl RenderFile {
         arg: u64,
         user: &dyn IoctlContext,
     ) -> Option<Result<u64, FsError>> {
+        if cmd == crate::drm_uapi::DRM_IOCTL_VERSION && info.submission_ready() {
+            return Some(version(arg, user).map(|()| 0));
+        }
         let nr = crate::drm_uapi::ioc_nr(cmd);
         if crate::drm_uapi::ioc_type(cmd) != b'd' as u32 {
             return None;
@@ -587,10 +673,16 @@ impl RenderFile {
                 }
                 let mut namespaces = self.namespaces.lock();
                 namespaces.initialize();
-                if !namespaces.contexts.contains_key(&u32_at(&request, 0)) {
-                    return Err(FsError::NotFound);
-                }
-                request[8..20].fill(0);
+                let context = namespaces
+                    .contexts
+                    .get(&u32_at(&request, 0))
+                    .ok_or(FsError::NotFound)?;
+                let (active, pending) = context.user.reset_stats();
+                // Linux restricts the device-wide count to administrative
+                // callers. No such authority is granted by this render fd.
+                put32(&mut request, 8, 0);
+                put32(&mut request, 12, active);
+                put32(&mut request, 16, pending);
                 user.write(arg, &request)
             }
             abi::QUERY => query(info, arg, user),
@@ -602,10 +694,11 @@ impl RenderFile {
                 if !namespaces.contexts.contains_key(&request.context_id) {
                     return Err(FsError::NotFound);
                 }
-                // A validated residency plan does not initialize the GT or
-                // grant privileged execution. Keep it private until a backend
-                // owns context setup, cache flushes, completion and reset.
-                Err(FsError::NotImplemented)
+                if info.submission_ready() {
+                    Err(FsError::WouldBlock)
+                } else {
+                    Err(FsError::NotImplemented)
+                }
             }
             _ => Err(FsError::InvalidData),
         }
@@ -755,16 +848,55 @@ fn create_extensions(user: &dyn IoctlContext, address: u64) -> Result<(), FsErro
 fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
     Ok(match param {
         4 => info.device_id as i32,
-        5 => 1,  // GEM storage is available independently of acceleration.
-        18 => 0, // no admitted userspace address-space backend yet
+        5 => 1, // GEM storage is available independently of acceleration.
+        9 | 25 | 26 | 37 | 48 | 50 => i32::from(info.submission_ready()),
+        18 => {
+            if info.submission_ready() {
+                3
+            } else {
+                0
+            }
+        }
         19 => 1, // GEM_WAIT supports the timeout wire request
         30 => 0, // legacy GEM_MMAP returns a CPU VA: not supported
         40 => 4, // MMAP_OFFSET, WB only
         // Explicitly absent features. Never claim unimplemented submission,
         // reset, media, sync-file, cache domains, or context isolation support.
-        1..=3 | 6..=17 | 20..=29 | 31 | 35..=39 | 41..=50 | 52..=59 => 0,
+        1..=3
+        | 6..=8
+        | 10..=17
+        | 20..=24
+        | 27..=29
+        | 31
+        | 35..=36
+        | 38..=39
+        | 41..=47
+        | 49
+        | 52..=59 => 0,
         _ => return Err(FsError::InvalidData),
     })
+}
+
+// The internal registry identity remains intel-gpu. A live i915-compatible
+// render UAPI exposes the loader name through fault-aware userspace copies.
+fn version(arg: u64, user: &dyn IoctlContext) -> Result<(), FsError> {
+    let mut request = read(user, arg, 64)?;
+    put32(&mut request, 0, 1);
+    put32(&mut request, 4, 6);
+    put32(&mut request, 8, 0);
+    for (offset, value) in [
+        (16, b"i915".as_slice()),
+        (32, b"".as_slice()),
+        (48, b"NARF Intel RCS".as_slice()),
+    ] {
+        let count = u64_at(&request, offset).min(value.len() as u64) as usize;
+        let pointer = u64_at(&request, offset + 8);
+        if count != 0 && pointer != 0 {
+            user.write(pointer, &value[..count])?;
+        }
+        put64(&mut request, offset, value.len() as u64);
+    }
+    user.write(arg, &request)
 }
 
 fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsError> {
@@ -787,7 +919,15 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
                 return Err(FsError::InvalidData);
             }
             let reply: Cow<'_, [u8]> = match id {
-                abi::QUERY_ENGINES => Cow::Owned(vec![0; 16]), // no userspace queues admitted
+                abi::QUERY_ENGINES => {
+                    let ready = info.submission_ready();
+                    let mut reply = vec![0; if ready { 72 } else { 16 }];
+                    if ready {
+                        put32(&mut reply, 0, 1);
+                    }
+                    // Engine class RENDER=0 and instance 0, all capability bits zero.
+                    Cow::Owned(reply)
+                }
                 abi::QUERY_MEMORY_REGIONS if info.memory_bytes != 0 => {
                     let mut reply = vec![0; 104]; // header16 + memory_region_info88
                     put32(&mut reply, 0, 1);
@@ -808,8 +948,15 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
                     Cow::Owned(topology.i915_bytes(id == abi::QUERY_GEOMETRY_SUBSLICES))
                 }
                 // Linux reports the GuC scheduling interface, not the loaded
-                // firmware's release. No submission interface is installed yet.
-                abi::QUERY_GUC_SUBMISSION_VERSION => return Err(FsError::NoDevice),
+                // firmware's release. Branch is zero for the upstream ABI.
+                abi::QUERY_GUC_SUBMISSION_VERSION => {
+                    let status = info.user_status().ok_or(FsError::NoDevice)?;
+                    let mut reply = vec![0; 16];
+                    put32(&mut reply, 4, u32::from(status.submission_version.0));
+                    put32(&mut reply, 8, u32::from(status.submission_version.1));
+                    put32(&mut reply, 12, u32::from(status.submission_version.2));
+                    Cow::Owned(reply)
+                }
                 _ => return Err(FsError::InvalidData),
             };
             let required = reply.len() as i32;
@@ -846,23 +993,23 @@ pub(crate) mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    struct User {
+    pub(crate) struct User {
         bytes: IrqSafeSpinLock<Vec<u8>>,
         fail_write: IrqSafeSpinLock<Option<u64>>,
         fail_read: IrqSafeSpinLock<Option<u64>>,
     }
     impl User {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 bytes: IrqSafeSpinLock::new(vec![0; 32768]),
                 fail_write: IrqSafeSpinLock::new(None),
                 fail_read: IrqSafeSpinLock::new(None),
             }
         }
-        fn store(&self, address: u64, data: &[u8]) {
+        pub(crate) fn store(&self, address: u64, data: &[u8]) {
             self.write(address, data).expect("fixture store");
         }
-        fn load(&self, address: u64, len: usize) -> Vec<u8> {
+        pub(crate) fn load(&self, address: u64, len: usize) -> Vec<u8> {
             read(self, address, len).expect("fixture load")
         }
     }
@@ -906,6 +1053,7 @@ pub(crate) mod tests {
             memory_bytes: 0x8000_0000,
             hwconfig: None,
             topology: None,
+            backend: None,
         }
     }
     fn invoke(file: &RenderFile, user: &User, cmd: u32) -> Result<u64, FsError> {

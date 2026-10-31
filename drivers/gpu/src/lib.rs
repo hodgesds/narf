@@ -780,6 +780,8 @@ pub mod intel_gpu_topology;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_uapi;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_user;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_wm;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_xelpg;

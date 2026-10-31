@@ -2105,6 +2105,7 @@ pub struct IntelGpuCard {
     hwconfig:
         narf_lib::sync::IrqSafeSpinLock<Option<Arc<crate::intel_gpu_hwconfig::HardwareConfig>>>,
     topology: narf_lib::sync::IrqSafeSpinLock<Option<Arc<crate::intel_gpu_topology::GtTopology>>>,
+    backend: narf_lib::sync::IrqSafeSpinLock<Option<Arc<dyn crate::intel_gpu_user::UserBackend>>>,
 }
 
 #[cfg(feature = "intel")]
@@ -2124,7 +2125,20 @@ impl IntelGpuCard {
             subsystem_did,
             hwconfig: narf_lib::sync::IrqSafeSpinLock::new(None),
             topology: narf_lib::sync::IrqSafeSpinLock::new(None),
+            backend: narf_lib::sync::IrqSafeSpinLock::new(None),
         }
+    }
+
+    pub(crate) fn install_user_backend(
+        &self,
+        backend: Arc<dyn crate::intel_gpu_user::UserBackend>,
+    ) -> Result<(), FsError> {
+        let mut slot = self.backend.lock();
+        if slot.is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+        *slot = Some(backend);
+        Ok(())
     }
 
     /// Publish static capabilities once, after this function's GT acquired and
@@ -2200,6 +2214,9 @@ impl crate::drm_registry::DrmCard for IntelGpuCard {
     }
     fn intel_topology(&self) -> Option<Arc<crate::intel_gpu_topology::GtTopology>> {
         self.topology.lock().clone()
+    }
+    fn intel_user_backend(&self) -> Option<Arc<dyn crate::intel_gpu_user::UserBackend>> {
+        self.backend.lock().clone()
     }
     fn subsystem_vendor(&self) -> u16 {
         self.subsystem_vid

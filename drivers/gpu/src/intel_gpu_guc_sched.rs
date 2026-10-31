@@ -1,4 +1,4 @@
-//! Owned single-LRC GuC scheduling for trusted kernel GGTT/PPGTT work.
+//! Owned GuC scheduling for kernel GGTT/PPGTT and nonsecure userspace work.
 //!
 //! Linux reference: ~/git/linux b90c984d615e8ce2af96f5b1411a962d83fed2ad,
 //! MIT xe_guc_submit.c, xe_lrc.c, xe_guc_ads.c and their ABI headers.
@@ -32,6 +32,7 @@ pub enum SchedulingError {
     State,
     Busy,
     Full,
+    IdentityExhausted,
     Allocation(SubmitError),
     Address,
     Cache,
@@ -82,6 +83,7 @@ struct Context<B: GpuBacking> {
     deadline: u64,
     fence: Arc<CompletionFence>,
     resident: Option<ResidentBatch>,
+    user: Option<crate::intel_gpu_user::UserJob>,
     tail: u32,
 }
 
@@ -103,6 +105,7 @@ pub(crate) struct GuCScheduler<A: BootAllocator> {
     released: bool,
     defaults: Defaults,
     pristine: bool,
+    epoch: u64,
 }
 
 impl<A: BootAllocator> GuCScheduler<A> {
@@ -145,6 +148,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             return Err(SchedulingError::Cache);
         }
         Ok(Self {
+            epoch: crate::intel_gpu_user::next_epoch(),
             resources: ManuallyDrop::new(Resources {
                 allocator,
                 hwsp,
@@ -216,6 +220,30 @@ impl<A: BootAllocator> GuCScheduler<A> {
         self.defaults == Defaults::Ready && !self.lost
     }
 
+    pub(crate) fn user_epoch(&self) -> Option<u64> {
+        (self.published && self.defaults_ready()).then_some(self.epoch)
+    }
+
+    pub(crate) fn submit_user(
+        &mut self,
+        now: u64,
+        context: Arc<crate::intel_gpu_user::UserContext>,
+        batch: crate::intel_gpu_user::UserBatch,
+    ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
+        if self.user_epoch().is_none() || batch.0.platform() != Some(self.platform) {
+            return Err(SchedulingError::State);
+        }
+        let pages = if self.platform == GtPlatform::Battlemage {
+            4
+        } else {
+            14
+        };
+        let claim = context
+            .claim(self.epoch, pages)
+            .map_err(SchedulingError::Residency)?;
+        self.submit_inner(now, Some(batch.0), None, Some(claim))
+    }
+
     pub(crate) fn can_prime(&self) -> bool {
         self.published
             && !self.lost
@@ -267,10 +295,23 @@ impl<A: BootAllocator> GuCScheduler<A> {
         resident: Option<ResidentBatch>,
         prefix: Option<Vec<u32>>,
     ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
+        self.submit_inner(now, resident, prefix, None)
+    }
+
+    fn submit_inner(
+        &mut self,
+        now: u64,
+        resident: Option<ResidentBatch>,
+        prefix: Option<Vec<u32>>,
+        user: Option<crate::intel_gpu_user::ContextClaim>,
+    ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
         if !self.published || self.lost {
             return Err(SchedulingError::State);
         }
-        if self.resources.contexts.len() == MAX_CONTEXTS || self.next_id >= 65535 {
+        if self.next_id >= 65535 {
+            return Err(SchedulingError::IdentityExhausted);
+        }
+        if self.resources.contexts.len() == MAX_CONTEXTS {
             return Err(SchedulingError::Full);
         }
         let deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
@@ -323,6 +364,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
         if self.defaults == Defaults::Ready {
             for off in (REGS..u64::from(pages) * 4096).step_by(4) {
                 image.write32(off, r.golden.read32(off));
+            }
+            if let Some(user) = &user {
+                user.restore(&image);
             }
             image.write32(REGS + 3 * 4, 0x00090008);
             image.write32(REGS + 5 * 4, 0);
@@ -403,6 +447,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             return Err(SchedulingError::Cache);
         }
         r.contexts.push(Context {
+            user: user.map(|claim| claim.publish(completion.clone())),
             id,
             image,
             ring,
@@ -537,7 +582,8 @@ impl<A: BootAllocator> GuCScheduler<A> {
             .iter()
             .position(|c| u32::from(c.id) == context_id)
             .ok_or(SchedulingError::Protocol)?;
-        let c = &mut self.resources.contexts[index];
+        let resources = &mut *self.resources;
+        let c = &mut resources.contexts[index];
         match (action, c.phase, message.payload.get(1).copied()) {
             (0x7001, Phase::Invalidating, None) if cookie == u32::from(c.id) => {
                 c.phase = Phase::Register
@@ -549,8 +595,15 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 {
                     return Err(SchedulingError::Protocol);
                 }
-                let c = self.resources.contexts.remove(index);
-                let r = &mut *self.resources;
+                if let Some(user) = &c.user {
+                    resources
+                        .allocator
+                        .sync_for_cpu(&c.image)
+                        .map_err(|_| SchedulingError::Cache)?;
+                    user.capture(&c.image).map_err(SchedulingError::Residency)?;
+                }
+                let c = resources.contexts.remove(index);
+                let r = resources;
                 r.allocator.free(c.ring);
                 if self.defaults == Defaults::Seed(c.id) {
                     r.seed_image = Some(c.image);
@@ -560,12 +613,17 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 // Drop all PPGTT tables and BO references before terminal
                 // publication. Deregistration and the final TLB ACK are proven.
                 drop(c.resident);
+                if let Some(user) = c.user {
+                    user.finish(false);
+                }
                 c.fence.signal(Ok(()));
                 if self.defaults == Defaults::Switch(c.id) {
                     self.capture_defaults()?;
                 }
             }
-            (0x1002, Phase::Enabling, Some(1)) => c.phase = Phase::Running,
+            (0x1002, Phase::Enabling, Some(1)) => {
+                c.phase = Phase::Running;
+            }
             (0x1002, Phase::Disabling, Some(0)) => c.phase = Phase::Deregister,
             (0x4600, Phase::Deregistering, None) => {
                 fence(Ordering::Acquire);
@@ -635,6 +693,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
             r.allocator.free(c.ring);
             r.allocator.free(c.image);
             drop(c.resident);
+            if let Some(user) = c.user {
+                user.finish(true);
+            }
             c.fence.signal(Err(JobError::Reset));
         }
         if let Some(image) = r.seed_image.take() {
@@ -667,10 +728,10 @@ fn overlap(a: &impl GpuBacking, b: &impl GpuBacking) -> bool {
         && (b.ggtt_offset() as u64) < a.ggtt_offset() as u64 + a.size_pages() as u64 * 4096
 }
 
-/// Single render-engine kernel job, following xe_ring_ops.c. Preparser/TLB
+/// Single nonsecure PPGTT render job, following xe_ring_ops.c. Preparser/TLB
 /// invalidation precedes the PPGTT batch; HDC/render/depth/data cache drain
-/// precedes the separate GGTT post-sync completion write. No compression or
-/// user state is enabled. MTL needs AuxCCS invalidation; DG2 and Xe-LPG need the extra
+/// precedes the separate GGTT post-sync completion write. MTL needs AuxCCS
+/// invalidation; DG2 and Xe-LPG need the extra
 /// depth flush (Wa_14016712196). All tails are qword aligned.
 fn resident_ring(platform: GtPlatform, batch: u64, image: u32, seq: u32) -> Vec<u32> {
     let mut words = alloc::vec![0x04000001, 0x02800101, 0x7a000404, 0x20344c1c, 0xd0, 0, 0, 0,];

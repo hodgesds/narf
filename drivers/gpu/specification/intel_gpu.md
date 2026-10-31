@@ -1495,19 +1495,32 @@ PREAD/PWRITE and CPU-domain waits respect reservations. PRIME SYNC START waits
 for conflicting access, END orders coherent RAM, and shared names and
 EXPORT_SYNC_FILE use the generic dma-buf fd/copyout protocol. Existing mappings
 still require caller exclusion; this does not enable external fence import,
-isolated userspace execution or Mesa acceleration. Linux references are
+external fence import or Mesa acceptance. Linux references are
 `i915_gem_busy.c`, `i915_gem_wait.c`, `dma-resv.c` and `dma-buf.c` at the pinned
 source revision below. Native smokes exercise alias/PRIME lifetime, independent
 readers, all-or-nothing conflict admission, async deadlines/cancellation,
 CPU-copy exclusion, sync-file copy faults and GuC terminal/reset boundaries.
 
-Validated execbuffer requests still return NotImplemented. No userspace engines
-or acceleration capabilities are advertised. Gen12 production execlists helpers
+Live MTL/Arrow, DG2 and BMG owners now accept async nonsecure softpin
+EXECBUFFER2/WR on RCS0. Per-open contexts serialize submissions and preserve
+their saved LRC state across fully retired jobs; independent contexts begin
+from the golden template. The entry sets BB_START bit8 for nonsecure PPGTT,
+with kernel rings/images/tables absent from user mappings and the RCS register
+policy reverified before admission. Nested commands and mutable leaf BOs
+remain untrusted; hardware privilege checking is required throughout execution.
+The complete copied residency plan and context survive handle/fd close and
+cancelled waiters. Admission/cache failures roll back claims; uncertain saves
+retain ownership until proven full reset. Saved CPU images have a 64-MiB cap.
+The backend publishes RCS0, relevant i915 capability bits, the real CSS
+submission-interface version and i915 loader identity only after startup's
+default-state and PPGTT probes pass. Loss/suspend closes readiness; proven stop
+allows a fresh GT epoch, with old contexts refused/banned and no automatic
+batch replay. Gen12 production execlists helpers
 refuse Meteor/Arrow Lake before MMIO. The physical GuC owner now supplies
 per-card startup, kernel context scheduling, completion and full-engine reset
 ownership. Live geometry/compute DSS and EU fuses now feed per-card topology
-queries; userspace state/isolation, complete engine/media/cache inventory and
-Mesa 3D remain open.
+queries. Other engine/media/cache inventory, explicit fence extensions,
+accelerated presentation and Intel silicon/Mesa acceptance remain open.
 
 `intel_gpu_guc` now supplies validated CSS component ranges and coherent CTB
 send/receive primitives. `intel_gpu_guc_firmware` acquires a bounded immutable
@@ -1654,7 +1667,7 @@ submission/default priming. Drift closes admission without a live repair and
 keeps existing jobs/reservations until proven full reset. Native literal vectors
 and hardware conversations cover all six admitted IP profiles, failed clears,
 unavailable/cross-slot writes, reload/CT drift and reset ownership. This does not
-enable an OA stream, legacy Gen12/media policies or isolated userspace execution.
+enable an OA stream or legacy Gen12/media policies.
 
 The firmware-side workaround path binds stable graphics IP/stepping before
 GuC's first reset/DMA and refuses a different identity on scheduling reload.
@@ -1718,11 +1731,12 @@ and per-item -EFAULT for a bad copy. GuC submission-version remains -ENODEV unti
 the userspace scheduling interface is admitted. Native tests traverse both DRM
 node types, GEM/mmap ownership, the GT discovery/publication chain and snapshot
 queries after all GT DMA is freed.
-Arc identity still adds no display binding, local VRAM or userspace engines.
+Arc identity still adds no display binding or local VRAM. RCS0 availability
+comes only from the live backend after execution-tested startup.
 
 Gen12 owned resident submission, cache-flushed
 post-sync breadcrumbs, terminal fences and loss retention have native hardware
-models. Complete engine/media/cache inventory, userspace context setup, accelerated PRIME/presentation
+models. Complete engine/media/cache inventory, accelerated PRIME/presentation
 and real Mesa acceptance remain outstanding.
 
 The memory audit corrected previous x86-like GPU PTE assumptions. Gen12
@@ -1733,7 +1747,7 @@ raw-root contract; GuC PDP0/PTBP uses a complete encoded descriptor.
 No GPU NX/LRU permission is claimed.
 The common physical range is conservatively bounded to 46 bits. PAT numeric
 indices do not define cache policy: physical startup now programs the owned
-GGTT policy; userspace PPGTT policy/state admission remains separate work.
+GGTT and PPGTT policy before admitting kernel or user work.
 
 Native Rust fixtures use literal ABI/PTE vectors, fault-contained user-memory
 models, cross-open ownership failures, copy-failure rollback, extension cycles,
@@ -1783,13 +1797,18 @@ acceptance or a claim of complete acceleration.
 
 | Area | Current checkpoint | Still required |
 | --- | --- | --- |
-| GuC execution | Owned GGTT/PPGTT jobs, primed RCS state, verified RCS register policy, graphics-GT/RCS MMIO and context workarounds on MTL/Arrow, DG2 and BMG | Other engines, out-of-band workarounds, coordinated recovery and isolated user state |
-| Render UAPI | Per-open GEM, VM/context namespaces, topology/HWCONFIG and softpin admission | EXECBUFFER2 dispatch, busy/wait/domain synchronization, implicit and explicit fences, context loss/banning and recovery |
+| GuC execution | Owned GGTT/PPGTT jobs, primed/persistent user RCS state, verified register policy, graphics-GT/RCS workarounds on MTL/Arrow, DG2 and BMG | Other engines, remaining out-of-band workarounds and silicon qualification |
+| Render UAPI | Per-open GEM/contexts, live RCS0 EXECBUFFER2/WR, busy/wait/domain synchronization, implicit fences, context loss/banning and fresh-epoch rebuild | Explicit submission fence/syncobj extensions and Mesa interoperability |
 | Engines and platforms | Main-GT DSS/EU discovery and RCS0 kernel scheduling; separate Gen12 foundations | Fused engine/cache/media inventory, compute/copy/media submission and independently sourced profiles for other IP |
 | Memory and presentation | Owned system RAM, private tables and same-card CPU PRIME mappings | Local VRAM, accelerated PRIME/presentation and GPU/KMS synchronization |
 | Display | Gen12 paths and owned Xe-LPG internal-panel modeset | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |
-| Power and faults | Bounded polling, D0/wake ownership and verified full-reset teardown | IRQ delivery, recoverable engine faults/resubmission and safe runtime autosuspend |
+| Power and faults | Bounded polling, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery | IRQ delivery, finer engine recovery and safe runtime autosuspend |
 | Acceptance | Native register/CT/page-walk and ownership models on both kernel architectures | Intel silicon execution, suspend/resume and Mesa OpenGL/Vulkan interoperability |
+
+The conservative scheduler still consumes a unique GuC ID per request and
+refuses admission after ID 65534 rather than recycling an identity that might
+match stale events. Transparent ID reuse remains required for sustained
+long-running workloads.
 
 Graphics APIs, shader compilation and application state generation belong in
 userspace; the kernel must supply the supported execution and memory contracts.
