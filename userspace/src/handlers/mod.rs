@@ -50,3 +50,5 @@ pub(crate) mod mount_types;
 pub(crate) mod remote_vm;
 pub use remote_vm::proc_mem_open;
 pub(crate) use remote_vm::{process_vm_transfer, ptrace_access_vm};
+
+mod phc;

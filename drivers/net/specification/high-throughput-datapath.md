@@ -124,7 +124,7 @@ progress toward line rate.
 | Driver  | Speed | Today | Target work |
 |---------|-------|-------|-------------|
 | e1000   | 1 G   | 256-entry pipelined zero-copy TX; 64 KiB IPv4 TSO; batched RX + software GRO | reference-simple, not a high-speed target |
-| igc     | 2.5 G | 256-entry, IRQ-driven, 64-frame batched RX | async/batched TX; multi-queue/RSS |
+| igc     | 2.5 G | 1–4 256-entry queue pairs; asynchronous owned TX, RSS, checked TCP/UDP checksum and TCP TSO, scatter jumbo RX | physical I225-V acceptance; independent queue IRQ/CPU placement |
 | ixgbe   | 10 G  | TSO + csum descriptors present, unused by stack | drive TSO/csum from stack; mq/RSS; NAPI |
 | i40e    | 40 G  | caps advertise TSO/csum | same + deep rings |
 | mlx5    | 100 G | RSS RQT present | full mq/RSS + TSO/GRO + moderation; the 100G reference |

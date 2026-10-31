@@ -535,3 +535,13 @@ keep the refcount non-zero.
     `parameters/<p>`, `sections/<sec>`).
   * `/sys/kernel/abi_hash` (planned) — the kernel ABI hash a
     module's `kernel_abi=` must match.
+
+## Live DMA rings and unload
+
+Set `narf_dma_retain_on_teardown(dev, 1)` before exposing DMA addresses to a
+controller. In `narf_module_exit`, stop engines and interrupts and wait for the
+controller's documented master-request drain. Clear retention with value 0
+only when that fence succeeds. On failure, leave retention set: the kernel
+withdraws the device and quarantines its DMA allocations after unload.
+`drivers/net/igc/src/module_probe.rs` implements this pattern using the shared
+I225/I226 protocol. Clearing PCI Bus Master alone does not prove completion.

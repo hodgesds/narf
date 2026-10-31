@@ -2,8 +2,7 @@
 //!
 //! See `narf-drivers-net-e1000` for the reference pattern. The real driver in
 //! [`igc`] compiles only for the built-in build; the `module` build registers
-//! through the `narf_register_pci_driver` KSYMTAB export (registration-only
-//! until the device datapath ABI lands).
+//! through the device C ABI and shares reset, PHY and queue programming.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -19,6 +18,25 @@ pub use narf_drivers_net_core::*;
 
 #[cfg(feature = "builtin")]
 pub mod igc;
+
+#[cfg(feature = "builtin")]
+mod counters;
+#[cfg_attr(feature = "module", allow(dead_code))]
+mod hardware;
+#[cfg(feature = "builtin")]
+mod merge;
+#[cfg(feature = "builtin")]
+mod packet;
+#[cfg_attr(feature = "module", allow(dead_code))]
+mod protocol;
+#[cfg(feature = "builtin")]
+mod ptp;
+#[cfg(feature = "builtin")]
+mod queue;
+#[cfg(feature = "builtin")]
+mod tests;
+#[cfg(feature = "builtin")]
+mod traffic;
 
 #[cfg(feature = "module")]
 mod module_probe;

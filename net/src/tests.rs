@@ -9503,3 +9503,79 @@ fn smoke_route_metric_aliases_and_protocol() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net", smoke_route_metric_aliases_and_protocol);
+
+fn smoke_packet_hardware_timestamp_ingress_and_error_queue() -> TestResult {
+    fn tx(cookie: u64, frame: crate::Frame, _: crate::TxMeta) -> Result<(), ()> {
+        let name = crate::iface::snapshot_all()
+            .into_iter()
+            .find(|i| u64::from(i.ifindex) == cookie)
+            .ok_or(())?
+            .name;
+        let Some(cookie) = frame.tx_timing().timestamp_cookie else {
+            return Err(());
+        };
+        if crate::raw_sock::complete_tx_timestamp(
+            &name,
+            crate::nic::Timestamp {
+                cookie,
+                nanoseconds: 12_000_000_345,
+                transmit: true,
+                error: None,
+            },
+        ) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+    let name = crate::iface::register("timestamp-test%d", [2, 0, 0, 0, 0, 1], |_, _| Ok(()));
+    let snapshot = crate::iface::lookup(&name).unwrap();
+    crate::iface::set_link_state(&name, true);
+    crate::iface::enable_zero_copy_tx_context(
+        &name,
+        u64::from(snapshot.ifindex),
+        tx,
+        alloc::vec![],
+        0,
+        true,
+    );
+    let snapshot = crate::iface::lookup(&name).unwrap();
+    let socket = crate::raw_sock::PacketSock::create(0, crate::raw_sock::SOCK_RAW, 0, 212992);
+    socket
+        .bind(None, snapshot.ifindex as i32, 0x88f7u16.to_be())
+        .unwrap();
+    let mut bytes = [0; 60];
+    bytes[..6].copy_from_slice(&snapshot.mac);
+    bytes[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
+    bytes[12..14].copy_from_slice(&[0x88, 0xf7]);
+    crate::raw_sock::netif_receive_timestamped(&snapshot, &bytes, Some(7_000_000_123));
+    let receive = socket.recv(false);
+    let send = socket.sendmsg_timestamped(&bytes, None, true);
+    let ordinary = socket.recv(false);
+    let complete = socket.recv_timestamp();
+    let duplicate = socket.recv_timestamp();
+    let looped = socket.recv(false);
+    socket.release();
+    crate::iface::unregister(&name);
+    if receive.ok().and_then(|r| r.hardware_ns) != Some(7_000_000_123) {
+        return TestResult::Fail("RX hardware timestamp lost");
+    }
+    if send != Ok(60)
+        || complete.ok().is_none_or(|r| {
+            r.hardware_ns != Some(12_000_000_345)
+                || r.timestamp_error != Some(42)
+                || r.data != bytes
+        })
+    {
+        return TestResult::Fail("TX hardware timestamp not delivered to error queue");
+    }
+    if ordinary.err() != Some(crate::raw_sock::errno::EAGAIN) || duplicate.is_ok() || looped.is_ok()
+    {
+        return TestResult::Fail("timestamp duplicate or sender's outgoing tap not excluded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/raw",
+    smoke_packet_hardware_timestamp_ingress_and_error_queue
+);

@@ -43,6 +43,13 @@
 
 ## 3. Public interface
 
+`device_pm::unregister_device_pm(name) -> bool` withdraws a device from future
+PM fan-outs and drops its retained operations outside the registry lock.
+Already-snapshotted callbacks retain their own references; drivers must reject
+removed hardware. IGC uses the existing device callbacks for S3/runtime PM and
+restores configured wake/PHY/clock/queue state across its transitions.
+
+
 ### 3.1 Idle
 
 ```rust

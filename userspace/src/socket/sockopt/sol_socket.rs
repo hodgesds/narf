@@ -404,7 +404,11 @@ impl SocketFile {
             }
             SO_ZEROCOPY => put_int(buf, 0),
             SO_TXTIME => put_bytes(buf, &[0u8; 8]),
-            SO_TIMESTAMPING_OLD | SO_TIMESTAMPING_NEW => put_bytes(buf, &[0u8; 8]),
+            SO_TIMESTAMPING_OLD | SO_TIMESTAMPING_NEW => {
+                let mut value = [0u8; 8];
+                value[..4].copy_from_slice(&o.timestamping_flags.to_ne_bytes());
+                put_bytes(buf, &value)
+            }
             SO_BINDTOIFINDEX => put_int(buf, o.bindtodevice_index as i32),
             SO_BUF_LOCK => put_int(buf, o.ext.buf_lock),
             SO_RESERVE_MEM => put_int(buf, o.ext.reserve_mem),

@@ -50,7 +50,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use narf_capabilities::{Cap, CapType, Grant};
 use narf_lib::sync::IrqSafeSpinLock;
 
-use super::umem::{Umem, UmemError};
+use super::umem::Umem;
 use super::xdp::{UmemSlot, XdpSocket};
 
 /// 5-tuple flow key. Field values of `0` are wildcards (matches any).
@@ -136,6 +136,33 @@ impl core::fmt::Debug for DaemonClaim {
 static CLAIMS: IrqSafeSpinLock<Vec<Claim>> = IrqSafeSpinLock::new(Vec::new());
 static DAEMON_CLAIMS: IrqSafeSpinLock<Vec<DaemonClaim>> = IrqSafeSpinLock::new(Vec::new());
 
+static NATIVE_QUEUES: IrqSafeSpinLock<Vec<(String, u32, Arc<XdpSocket>)>> =
+    IrqSafeSpinLock::new(Vec::new());
+/// Reserve hardware queues before publishing a zero-copy socket. Native
+/// queue ownership is exclusive with software claims for that interface.
+pub fn reserve_native(
+    iface: &str,
+    queue: u32,
+    socket: Arc<XdpSocket>,
+) -> Result<(), ClassifyError> {
+    let mut native = NATIVE_QUEUES.lock();
+    if native.iter().any(|(n, q, _)| n == iface && *q == queue)
+        || DAEMON_CLAIMS.lock().iter().any(|c| c.iface_name == iface)
+        || CLAIMS
+            .lock()
+            .iter()
+            .any(|c| c.socket.bound_iface().is_none_or(|n| n == iface))
+    {
+        return Err(ClassifyError::AlreadyAttached);
+    }
+    native.push((String::from(iface), queue, socket));
+    Ok(())
+}
+pub fn release_native(iface: &str, queue: u32) {
+    NATIVE_QUEUES
+        .lock()
+        .retain(|(n, q, _)| n != iface || *q != queue);
+}
 static CLAIM_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// Per-iface poll-mode bit. When set, the iface's RX IRQ is masked
@@ -190,6 +217,14 @@ fn require_attach_cap<M: CapType>() -> Result<(), ClassifyError> {
 /// to revoke. Linux ref: `xsk_register_xsk_map_entry` —
 /// XDP_REDIRECT-eligible socket lookup.
 pub fn register_flow(key: FlowKey, socket: Arc<XdpSocket>) -> Result<u32, ClassifyError> {
+    let iface = socket.bound_iface();
+    let native = NATIVE_QUEUES.lock();
+    if native
+        .iter()
+        .any(|(n, _, _)| iface.as_deref().is_none_or(|iface| n == iface))
+    {
+        return Err(ClassifyError::AlreadyAttached);
+    }
     let seq = CLAIM_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut g = CLAIMS.lock();
     if g.iter()
@@ -220,6 +255,10 @@ pub fn unregister_flow(seq: u32) {
 /// Install a whole-NIC daemon claim. Only one daemon per iface;
 /// returns `AlreadyAttached` if a prior claim is live.
 pub fn attach_daemon(iface_name: String, socket: Arc<XdpSocket>) -> Result<(), ClassifyError> {
+    let native = NATIVE_QUEUES.lock();
+    if native.iter().any(|(n, _, _)| n == &iface_name) {
+        return Err(ClassifyError::AlreadyAttached);
+    }
     let mut g = DAEMON_CLAIMS.lock();
     if g.iter().any(|c| c.iface_name == iface_name) {
         return Err(ClassifyError::AlreadyAttached);
@@ -539,7 +578,7 @@ pub fn xdp_broadcasts() -> u64 {
 ///   off. That is a latency characteristic of attaching a program at all, not
 ///   something this function can fix; recorded in `bpf/specification/spec.md`
 ///   §8 rather than left for someone to discover from a jitter graph.
-fn run_xdp(iface: &str, frame: &mut [u8]) -> (XdpAction, usize) {
+pub fn run_xdp(iface: &str, frame: &mut [u8]) -> (XdpAction, usize) {
     // Fast path for the overwhelmingly common case: nothing attached. Without
     // this, every RX frame paid an IRQ-save, a `lock cmpxchg`, and a linear
     // `String == &str` scan before the existing daemon and flow-table locks —
@@ -618,32 +657,33 @@ pub fn classify(iface_name: &str, frame: &mut [u8]) -> (Verdict, usize) {
         // as `Pass` does, over the possibly-resized `frame[..len]`.
         (XdpAction::Pass | XdpAction::RedirectCpu { .. }, len) => len,
     };
-    let packet = &frame[..len];
-
+    (classify_after_xdp(iface_name, &frame[..len]), len)
+}
+/// Software claims after a native driver has already executed XDP.
+pub fn classify_after_xdp(iface_name: &str, packet: &[u8]) -> Verdict {
     // Whole-NIC daemon attach — pure forward, no L3 parse needed.
     if let Some(sock) = daemon_socket(iface_name) {
-        return (stage_into_socket(&sock, packet), len);
+        return stage_into_socket(&sock, packet);
     }
 
     // Per-flow path: extract 5-tuple. Only IPv4 today — IPv6 5-tuple
     // matching slots in here when the bypass surface grows v6.
     let key = match extract_flow_key(packet) {
         Some(k) => k,
-        None => return (Verdict::PassThrough, len),
+        None => return Verdict::PassThrough,
     };
 
     let candidate = {
         let g = CLAIMS.lock();
         // Table is pre-sorted most-specific-first; first match wins.
         g.iter()
-            .find(|c| c.key.matches(&key))
+            .find(|c| c.socket.bound_iface().is_none_or(|n| n == iface_name) && c.key.matches(&key))
             .map(|c| c.socket.clone())
     };
-    let verdict = match candidate {
+    match candidate {
         Some(sock) => stage_into_socket(&sock, packet),
         None => Verdict::PassThrough,
-    };
-    (verdict, len)
+    }
 }
 
 /// Extract the 5-tuple from an Ethernet+IPv4+UDP/TCP frame. Returns
@@ -721,22 +761,15 @@ fn stage_into_socket(socket: &Arc<XdpSocket>, frame: &[u8]) -> Verdict {
 /// practice the UMEM's backing `DmaBuffer` is page-pinned and the
 /// kernel mapping is identity so we can write directly.
 fn write_into_umem(umem: &Arc<Umem>, frame_idx: u32, frame: &[u8]) -> bool {
-    let _ = UmemError::AccessDenied; // silence unused if path simplifies later
-    if !umem.frame_in_bounds(frame_idx) {
+    let Ok(mut lease) = umem.lease(frame_idx) else {
+        return false;
+    };
+    if frame.len() > lease.capacity() as usize {
         return false;
     }
-    let frame_size = umem.frame_size() as usize;
-    // SAFETY: `base_virt` is the kernel-mapped, page-pinned VA of
-    // the UMEM's `DmaBuffer`. The kernel mapping outlives the
-    // socket (Arc holds the buffer). `frame_idx` is bounds-checked
-    // above; the write region is `[base, base + frame_size)` ⊂
-    // `[base, base + size)`. We hold no aliasing mut ref because
-    // FILL semantics say the kernel owns the slot now.
-    // SAFETY: Valid memory or trusted environment
-    unsafe {
-        let dst = (umem.desc().base_virt as *mut u8).add(frame_idx as usize * frame_size);
-        core::ptr::copy_nonoverlapping(frame.as_ptr(), dst, frame.len());
-    }
+    // SAFETY: this software path exclusively owns the frame's lease, and
+    // the checked CPU copy finishes before that ownership is published.
+    unsafe { lease.bytes_mut(frame.len()) }.copy_from_slice(frame);
     true
 }
 

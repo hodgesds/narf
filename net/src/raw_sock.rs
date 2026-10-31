@@ -31,9 +31,9 @@ extern crate alloc;
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use narf_lib::readiness::Readiness;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -192,6 +192,8 @@ pub struct PacketRecord {
     /// `skb->tstamp` (CLOCK_REALTIME) taken at enqueue.
     pub tstamp_secs: i64,
     pub tstamp_nanos: u32,
+    pub hardware_ns: Option<u64>,
+    pub timestamp_error: Option<i32>,
     /// `spkt_device` for `SOCK_PACKET` receivers.
     pub dev_name: [u8; 14],
     charge: usize,
@@ -244,6 +246,7 @@ struct Inner {
     running: bool,
     filter: Option<Arc<cbpf::Program>>,
     queue: VecDeque<PacketRecord>,
+    timestamp_queue: VecDeque<PacketRecord>,
     /// `sk_rmem_alloc`.
     rmem: usize,
     /// `sk_rcvbuf`.
@@ -294,6 +297,7 @@ impl PacketSock {
                 running: false,
                 filter: None,
                 queue: VecDeque::new(),
+                timestamp_queue: VecDeque::new(),
                 rmem: 0,
                 rcvbuf,
                 sk_err: 0,
@@ -330,7 +334,7 @@ impl PacketSock {
         if !g.queue.is_empty() {
             mask |= POLL_IN;
         }
-        if g.sk_err != 0 {
+        if g.sk_err != 0 || !g.timestamp_queue.is_empty() {
             mask |= POLL_ERR;
         }
         mask
@@ -345,7 +349,7 @@ impl PacketSock {
         } else {
             add |= POLL_IN;
         }
-        if g.sk_err != 0 {
+        if g.sk_err != 0 || !g.timestamp_queue.is_empty() {
             add |= POLL_ERR;
         } else {
             clear |= POLL_ERR;
@@ -357,10 +361,14 @@ impl PacketSock {
     /// the queue.
     pub fn release(self: &Arc<Self>) {
         SKLIST.lock().retain(|s| !Arc::ptr_eq(s, self));
+        TX_TIMESTAMPS
+            .lock()
+            .retain(|p| !p.socket.ptr_eq(&Arc::downgrade(self)));
         let mclist = {
             let mut g = self.inner.lock();
             unregister_prot_hook(&mut g);
             g.queue.clear();
+            g.timestamp_queue.clear();
             g.rmem = 0;
             core::mem::take(&mut g.mclist)
         };
@@ -679,6 +687,8 @@ impl PacketSock {
             vlan,
             tstamp_secs: wall.secs,
             tstamp_nanos: wall.nanos,
+            hardware_ns: skb.hardware_ns,
+            timestamp_error: None,
             dev_name,
             charge,
         };
@@ -700,6 +710,14 @@ impl PacketSock {
     /// the caller passed (family included) — `None` for `send(2)`/`write(2)`.
     /// Returns the byte count Linux reports (`len`).
     pub fn sendmsg(self: &Arc<Self>, data: &[u8], name: Option<&[u8]>) -> Result<usize, i32> {
+        self.sendmsg_timestamped(data, name, false)
+    }
+    pub fn sendmsg_timestamped(
+        self: &Arc<Self>,
+        data: &[u8],
+        name: Option<&[u8]>,
+        timestamp: bool,
+    ) -> Result<usize, i32> {
         if self.sock_type == SOCK_PACKET {
             return self.sendmsg_spkt(data, name);
         }
@@ -799,6 +817,61 @@ impl PacketSock {
         let Some(snap) = crate::iface::by_index_in(self.net_ns_id, dev.ifindex) else {
             return Err(errno::ENXIO);
         };
+        if timestamp {
+            let cookie = NEXT_TIMESTAMP.fetch_add(1, Ordering::Relaxed);
+            let pending = PendingTimestamp {
+                name: snap.name.clone(),
+                socket: Arc::downgrade(self),
+                cookie,
+                record: PacketRecord {
+                    data: frame.clone(),
+                    origlen: frame.len() as u32,
+                    ifindex: dev.ifindex,
+                    hatype: dev.hatype,
+                    pkttype: PACKET_OUTGOING,
+                    halen: 6,
+                    addr: [0; 8],
+                    protocol,
+                    net_off: 14,
+                    vlan: None,
+                    tstamp_secs: 0,
+                    tstamp_nanos: 0,
+                    hardware_ns: None,
+                    timestamp_error: None,
+                    dev_name: [0; 14],
+                    charge: 0,
+                },
+            };
+            {
+                let mut requests = TX_TIMESTAMPS.lock();
+                if requests.len() >= 1024 {
+                    return Err(errno::ENOBUFS);
+                }
+                requests.push(pending);
+            }
+            let mut buffer =
+                match narf_io::alloc_coherent(frame.len(), narf_lib::id::DomainId::DRIVER_0) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        cancel_tx_timestamp(cookie);
+                        return Err(errno::ENOBUFS);
+                    }
+                };
+            buffer.as_mut_slice()[..frame.len()].copy_from_slice(&frame);
+            let mut owned = crate::Frame::new(buffer, frame.len() as u32);
+            owned.set_tx_timing(crate::TxTiming {
+                timestamp_cookie: Some(cookie),
+                ..Default::default()
+            });
+            if snap
+                .xmit_frame_from(owned, crate::TxMeta::plain(), Some(self), bypass)
+                .is_err()
+            {
+                cancel_tx_timestamp(cookie);
+                return Err(errno::ENOBUFS);
+            }
+            return Ok(len);
+        }
         if bypass {
             // `packet_direct_xmit`: no taps, and a driver refusal is
             // `NET_XMIT_DROP` → -ENOBUFS.
@@ -810,6 +883,12 @@ impl PacketSock {
         Ok(len)
     }
 
+    pub fn recv_timestamp(&self) -> Result<PacketRecord, i32> {
+        let mut g = self.inner.lock();
+        let record = g.timestamp_queue.pop_front().ok_or(errno::EAGAIN)?;
+        self.sync_readiness(&g);
+        Ok(record)
+    }
     /// `packet_sendmsg_spkt`.
     fn sendmsg_spkt(self: &Arc<Self>, data: &[u8], name: Option<&[u8]>) -> Result<usize, i32> {
         let Some(sa) = name else {
@@ -914,6 +993,7 @@ pub fn eth_type_vlan(proto: u16) -> bool {
 /// the metadata `__netif_receive_skb_core` / `dev_queue_xmit_nit` set.
 #[derive(Debug)]
 struct Skb<'a> {
+    hardware_ns: Option<u64>,
     frame: &'a [u8],
     /// `skb_network_offset` from the MAC header.
     net_off: usize,
@@ -1004,6 +1084,9 @@ fn hooks(net_ns_id: u64, ifindex: u32, matches: impl Fn(u16) -> bool) -> Vec<Arc
 /// point of view. `dev` is the ingress device; `frame` starts at the MAC
 /// header.
 pub fn netif_receive(dev: &NetIfaceSnapshot, frame: &[u8]) {
+    netif_receive_timestamped(dev, frame, None)
+}
+pub fn netif_receive_timestamped(dev: &NetIfaceSnapshot, frame: &[u8], timestamp: Option<u64>) {
     if RUNNING.load(Ordering::Acquire) == 0 || frame.len() < ETH_HDR_LEN {
         return;
     }
@@ -1029,6 +1112,7 @@ pub fn netif_receive(dev: &NetIfaceSnapshot, frame: &[u8]) {
     {
         let bytes = owned.as_deref().unwrap_or(frame);
         let skb = Skb {
+            hardware_ns: timestamp,
             frame: bytes,
             net_off: ETH_HDR_LEN,
             protocol,
@@ -1063,6 +1147,7 @@ pub fn netif_receive(dev: &NetIfaceSnapshot, frame: &[u8]) {
     }
     let bytes = owned.as_deref().unwrap_or(frame);
     let skb = Skb {
+        hardware_ns: timestamp,
         frame: bytes,
         net_off: ETH_HDR_LEN,
         protocol,
@@ -1108,6 +1193,7 @@ pub fn dev_queue_xmit_nit(
         }
     }
     let skb = Skb {
+        hardware_ns: None,
         frame,
         net_off,
         protocol,
@@ -1286,4 +1372,50 @@ pub(crate) fn remove_namespace(net_ns_id: u64) {
     for sock in removed {
         unregister_prot_hook(&mut sock.inner.lock());
     }
+}
+
+#[derive(Debug)]
+struct PendingTimestamp {
+    name: String,
+    socket: Weak<PacketSock>,
+    cookie: u64,
+    record: PacketRecord,
+}
+static NEXT_TIMESTAMP: AtomicU64 = AtomicU64::new(1 << 63);
+static TX_TIMESTAMPS: IrqSafeSpinLock<Vec<PendingTimestamp>> = IrqSafeSpinLock::new(Vec::new());
+fn cancel_tx_timestamp(cookie: u64) {
+    TX_TIMESTAMPS.lock().retain(|r| r.cookie != cookie);
+}
+/// Route a driver timestamp to its AF_PACKET error queue. Unmatched cookies
+/// remain available to native users of the NIC timestamp API.
+pub fn complete_tx_timestamp(name: &str, event: crate::nic::Timestamp) -> bool {
+    let pending = {
+        let mut requests = TX_TIMESTAMPS.lock();
+        requests
+            .iter()
+            .position(|p| p.cookie == event.cookie && p.name == name)
+            .map(|i| requests.remove(i))
+    };
+    let Some(mut pending) = pending else {
+        return false;
+    };
+    let Some(socket) = pending.socket.upgrade() else {
+        return true;
+    };
+    pending.record.hardware_ns = event.error.is_none().then_some(event.nanoseconds);
+    pending.record.timestamp_error = Some(event.error.unwrap_or(42));
+    let wall = narf_scheduler::narf_time::now_wall();
+    pending.record.tstamp_secs = wall.secs;
+    pending.record.tstamp_nanos = wall.nanos;
+    {
+        let mut g = socket.inner.lock();
+        if g.timestamp_queue.len() >= 64 {
+            return true;
+        }
+        g.timestamp_queue.push_back(pending.record);
+        socket.sync_readiness(&g);
+    }
+    socket.readiness.notify(POLL_ERR);
+    crate::readiness::notify(0);
+    true
 }

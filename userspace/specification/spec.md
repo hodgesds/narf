@@ -25,6 +25,23 @@ applications above NARF.
 
 ## 3. Public interface
 
+Network device ioctls bridge bounded native NIC controls to Linux ethtool:
+link settings, rings/channels/RSS/coalescing, pause/EEE/WoL, counters/names,
+register/NVM reads, diagnostics, link restart and supported L2 flow rules.
+Existing network namespace checks and `CAP_NET_ADMIN` policy precede mutations.
+`SIOCSHWTSTAMP`/`SIOCGHWTSTAMP` report the effective ALL/NONE RX and ON/OFF TX
+configuration. AF_PACKET `SO_TIMESTAMPING` reports raw hardware RX times and
+TX `MSG_ERRQUEUE` records (`SCM_TIMESTAMPING`, `PACKET_TX_TIMESTAMP`), preserving
+error-queue readiness and Linux cmsg layouts.
+
+Dynamic CLOCKFD ids resolve the open file's `hardware_clock` interface for
+clock_gettime/getres/settime/adjtime. Writes require a writable description and
+`CAP_SYS_TIME`; offsets/times/frequency modes are validated and copied through
+guarded user access. The PHC is independent of system time. AF_BYPASS exposes
+UMEM/ring setup through SOL_XDP and direct queue binding through flag 4, with
+network administration permission for hardware binding and truthful XDP_OPTIONS.
+
+
 Blocking poll/ppoll and select/pselect distinguish providers with a durable
 readiness arm or broadcast notification from silent legacy providers (such
 as serial ttys). A set containing a silent provider sleeps to a recheck no
@@ -1522,12 +1539,14 @@ and quiesce its host resource immediately while deferring DMA-page reuse until
 the final mapping disappears.
 
 Generic filesystem mappings that cannot expose page-cache frames retain one
-canonical fallback page per open-file description and file offset, plus an
+canonical fallback page per filesystem device, anchored file identity and offset, plus an
 exact clean-byte snapshot. `fsync(2)` and `msync(2)` compare against that
 snapshot, write each changed canonical page once even when it has overlapping
 aliases, and advance the snapshot only after the full page write succeeds.
 Clean pages perform no filesystem write; the comparison is byte-exact rather
 than hash-based so collision cannot suppress persistence.
+Filesystem device identity namespaces retained anchors and generation counters:
+a different filesystem cannot reuse idle pages when an anchor address is recycled.
 
 The fallback cache is coherent with the `write(2)` family and carries a
 writeback lifecycle, matching Linux's single page cache. Every successful
@@ -1718,6 +1737,12 @@ before the device lookup (a refused caller gets `EPERM` even for an unknown
 name); a live, namespace-and-interface-matched delegated `AdminHandle` also
 authorizes its one device. Invalid MTU, hardware type, or address values
 return `EINVAL`.
+
+Device-backed MTU/MAC changes invoke the driver's `iface::DeviceControl`
+callback before publishing new metadata. A busy hardware transaction returns
+`EBUSY`, an unsupported device operation returns `EOPNOTSUPP`, and a hardware
+failure returns `EIO`; rtnetlink preserves the driver's positive Linux errno
+through `AdminError::DeviceError`.
 
 `SIOCETHTOOL` implements Linux `dev_ethtool` for `ETHTOOL_GDRVINFO` and
 `ETHTOOL_GLINK`, in its check order: copying the ifreq and the command word

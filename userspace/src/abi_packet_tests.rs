@@ -2286,3 +2286,87 @@ fn smoke_abi_packet_dhcpcd_sequence() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/packet", smoke_abi_packet_dhcpcd_sequence);
+
+fn smoke_abi_packet_hardware_timestamp_cmsgs() -> TestResult {
+    fn tx(cookie: u64, frame: narf_net::Frame, _: narf_net::TxMeta) -> Result<(), ()> {
+        let name = narf_net::iface::snapshot_all()
+            .into_iter()
+            .find(|i| u64::from(i.ifindex) == cookie)
+            .ok_or(())?
+            .name;
+        let cookie = frame.tx_timing().timestamp_cookie.ok_or(())?;
+        if narf_net::raw_sock::complete_tx_timestamp(
+            &name,
+            narf_net::nic::Timestamp {
+                cookie,
+                nanoseconds: 12_000_000_345,
+                transmit: true,
+                error: None,
+            },
+        ) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+    with_setup(|| {
+        let ifindex = nic(true)?;
+        narf_net::iface::enable_zero_copy_tx_context(
+            NIC,
+            ifindex as u64,
+            tx,
+            alloc::vec![],
+            0,
+            true,
+        );
+        let fd = open_packet(SOCK_RAW, 0x88f7)?;
+        bind_ll(fd, 0x88f7, ifindex)?;
+        expect(
+            set_int(fd, SOL_SOCKET, 37, 0x45) == Some(0),
+            "SO_TIMESTAMPING hardware flags",
+        )?;
+        let bytes = eth(NIC_MAC, PEER_MAC, 0x88f7, b"ptp");
+        let snapshot = narf_net::iface::lookup(NIC).ok_or("NIC lookup")?;
+        narf_net::raw_sock::netif_receive_timestamped(&snapshot, &bytes, Some(7_000_000_123));
+        let mut data = [0; 128];
+        let mut control = [0; 128];
+        let received = recvmsg(fd, &mut [&mut data], &mut control, MSG_DONTWAIT);
+        let messages = cmsgs(&control, received.controllen);
+        expect(
+            received.ret == Some(bytes.len() as i64)
+                && messages.len() == 1
+                && (messages[0].0, messages[0].1) == (1, 37),
+            "hardware RX timestamp cmsg absent",
+        )?;
+        expect(
+            messages[0].2.len() == 48
+                && i64::from_ne_bytes(messages[0].2[32..40].try_into().unwrap()) == 7
+                && i64::from_ne_bytes(messages[0].2[40..48].try_into().unwrap()) == 123,
+            "SCM_TIMESTAMPING raw clock slot wrong",
+        )?;
+        expect(
+            sys(
+                Syscall::SocketSend,
+                a5(fd, bytes.as_ptr() as u64, bytes.len() as u64, 0, 0, 0),
+            ) == Some(bytes.len() as i64),
+            "timestamped packet send",
+        )?;
+        let received = recvmsg(fd, &mut [&mut data], &mut control, MSG_ERRQUEUE);
+        let messages = cmsgs(&control, received.controllen);
+        expect(
+            received.ret == Some(bytes.len() as i64)
+                && received.flags & 0x2000 != 0
+                && messages.len() == 2
+                && (messages[1].0, messages[1].1) == (263, 16),
+            "TX timestamp error queue cmsg absent",
+        )?;
+        expect(
+            i64::from_ne_bytes(messages[0].2[32..40].try_into().unwrap()) == 12
+                && u32::from_ne_bytes(messages[1].2[..4].try_into().unwrap()) == 42
+                && messages[1].2[4] == 4,
+            "TX timestamp extended error layout wrong",
+        )?;
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_packet_hardware_timestamp_cmsgs);

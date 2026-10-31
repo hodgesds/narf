@@ -349,6 +349,19 @@ kernel_abi! {
         narf_bus::module_mmio_wait32(owner, dev, bar, off, mask, expected, timeout_ns)
     }
 
+    /// Keep DMA allocations pinned after teardown if drain cannot be proven.
+    /// Set retain=1 before exposing ring addresses; clear only after a terminal
+    /// hardware drain/reset. Invalid owner/token or retain>1 fails closed.
+    ///
+    /// # Safety
+    /// Clearing retention promises that no device can still access any buffer.
+    requires narf_capabilities::CapKind::DmaBuffer;
+    fn narf_dma_retain_on_teardown(dev:u64,retain:u32)->i32{
+        if retain>1{return -22;}
+        let owner=crate::symbols::current_execution_id().0;
+        narf_bus::driver_match::module_dma_retain_on_teardown(owner,dev,retain!=0)
+    }
+
     /// Allocate a coherent DMA buffer in the module's effective isolation
     /// domain. Returns a 1-based opaque handle, or 0 on failure.
     ///

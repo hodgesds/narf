@@ -21,7 +21,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Invoke};
 use narf_io::DmaBuffer;
@@ -102,6 +102,7 @@ pub struct Umem {
     /// `true` after `revoke()`. Subsequent ops short-circuit to
     /// [`UmemError::Revoked`] without going to the object table.
     revoked: AtomicBool,
+    leased: Vec<AtomicU8>,
 }
 
 impl core::fmt::Debug for Umem {
@@ -151,6 +152,7 @@ impl Umem {
             buf,
             cap,
             revoked: AtomicBool::new(false),
+            leased: (0..nb_frames).map(|_| AtomicU8::new(0)).collect(),
         }))
     }
 
@@ -194,14 +196,16 @@ impl Umem {
 
     /// Read access to the bytes of `frame_idx`. Returns `None` if
     /// the index is out of range or the cap has been revoked.
-    pub fn frame_bytes(&self, frame_idx: u32) -> Option<&[u8]> {
+    pub fn frame_bytes(&self, frame_idx: u32) -> Option<FrameRead<'_>> {
         self.check()?;
-        if !self.frame_in_bounds(frame_idx) {
-            return None;
-        }
-        let off = (frame_idx as usize) * (self.desc.frame_size as usize);
-        let end = off + (self.desc.frame_size as usize);
-        Some(&self.buf.as_slice()[off..end])
+        let state = self.leased.get(frame_idx as usize)?;
+        state
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(FrameRead {
+            umem: self,
+            index: frame_idx,
+        })
     }
 
     /// Mutable read access. Same gating as [`Self::frame_bytes`].
@@ -211,7 +215,7 @@ impl Umem {
         if self.revoked.load(Ordering::Acquire) {
             return None;
         }
-        self.cap.check_live().ok()?;
+        self.cap.invoke(LeaseAccess).ok()?;
         if !self.frame_in_bounds(frame_idx) {
             return None;
         }
@@ -225,7 +229,7 @@ impl Umem {
         if self.revoked.load(Ordering::Acquire) {
             return None;
         }
-        self.cap.check_live().ok()
+        self.cap.invoke(LeaseAccess).ok()
     }
 
     /// Verify that an externally presented cap matches the one
@@ -241,7 +245,7 @@ impl Umem {
             return Err(UmemError::AccessDenied);
         }
         presented
-            .check_live()
+            .invoke(LeaseAccess)
             .map_err(|_| UmemError::AccessDenied)?;
         Ok(())
     }
@@ -335,5 +339,92 @@ impl OwnerTracker {
     /// Read the current state of `idx`.
     pub fn state(&self, idx: u32) -> Option<FrameOwner> {
         self.states.lock().get(idx as usize).copied()
+    }
+}
+
+/// A frame retained by a DMA consumer. Drop is permitted only after DD or
+/// device-wide quiescence; revocation prevents new leases, never frees DMA.
+#[derive(Debug)]
+pub struct DmaLease {
+    umem: Arc<Umem>,
+    index: u32,
+}
+struct LeaseAccess;
+impl narf_capabilities::CapOp<UmemRegion, Invoke> for LeaseAccess {
+    type Output = ();
+    fn execute(self, _: &Cap<UmemRegion, Invoke>) -> Result<(), CapError> {
+        Ok(())
+    }
+}
+impl Umem {
+    pub fn lease(self: &Arc<Self>, index: u32) -> Result<DmaLease, UmemError> {
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(UmemError::Revoked);
+        }
+        self.cap.invoke(LeaseAccess)?;
+        let state = self
+            .leased
+            .get(index as usize)
+            .ok_or(UmemError::InvalidFrameIndex)?;
+        state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| UmemError::AccessDenied)?;
+        Ok(DmaLease {
+            umem: self.clone(),
+            index,
+        })
+    }
+}
+impl DmaLease {
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+    pub fn capacity(&self) -> u32 {
+        self.umem.frame_size()
+    }
+    pub fn address(&self) -> u64 {
+        self.umem.desc.base_phys + u64::from(self.index) * u64::from(self.capacity())
+    }
+    /// # Safety
+    /// DMA has completed and no CPU or userspace borrow may overlap this access.
+    pub unsafe fn bytes_mut(&mut self, len: usize) -> &mut [u8] {
+        assert!(len <= self.capacity() as usize);
+        // SAFETY: caller proves exclusive CPU ownership; geometry bounds checked.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                (self.umem.desc.base_virt + u64::from(self.index) * u64::from(self.capacity()))
+                    as *mut u8,
+                len,
+            )
+        }
+    }
+}
+impl Drop for DmaLease {
+    fn drop(&mut self) {
+        self.umem.leased[self.index as usize].store(0, Ordering::Release);
+    }
+}
+
+/// A CPU borrow excludes a simultaneous NIC lease of this UMEM frame.
+#[derive(Debug)]
+pub struct FrameRead<'a> {
+    umem: &'a Umem,
+    index: u32,
+}
+impl core::ops::Deref for FrameRead<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        let address =
+            self.umem.desc.base_virt + u64::from(self.index) * u64::from(self.umem.frame_size());
+        // SAFETY: checked geometry and an exclusive CPU ownership token; the
+        // backing allocation and token live at least as long as this borrow.
+        unsafe {
+            core::slice::from_raw_parts(address as *const u8, self.umem.frame_size() as usize)
+        }
+    }
+}
+impl Drop for FrameRead<'_> {
+    fn drop(&mut self) {
+        self.umem.leased[self.index as usize].store(0, Ordering::Release);
     }
 }

@@ -221,6 +221,12 @@ pub fn neigh_tick() {
 /// `XDP_REDIRECT` — retransmit), so downstream code sees the *possibly-
 /// modified* frame, which is exactly what those verdicts must reflect.
 pub fn rx_handler(iface_name: &str, frame: &mut [u8]) {
+    rx_handler_inner(iface_name, frame, false, None)
+}
+pub fn rx_handler_native(iface_name: &str, frame: &mut [u8], timestamp: Option<u64>) {
+    rx_handler_inner(iface_name, frame, true, timestamp)
+}
+fn rx_handler_inner(iface_name: &str, frame: &mut [u8], native: bool, timestamp: Option<u64>) {
     if frame.len() < ETH_HDR_LEN {
         return;
     }
@@ -258,7 +264,14 @@ pub fn rx_handler(iface_name: &str, frame: &mut [u8]) {
     // (`bpf_xdp_adjust_head`/`_tail`). The effective packet is `frame[..len]`;
     // everything below transmits or delivers that window rather than the
     // original slice.
-    let (verdict, len) = crate::bypass::classifier::classify(&bypass_iface, frame);
+    let (verdict, len) = if native {
+        (
+            crate::bypass::classifier::classify_after_xdp(&bypass_iface, frame),
+            frame.len(),
+        )
+    } else {
+        crate::bypass::classifier::classify(&bypass_iface, frame)
+    };
     match verdict {
         crate::bypass::classifier::Verdict::Consumed => return,
         crate::bypass::classifier::Verdict::Dropped => return,
@@ -324,7 +337,7 @@ pub fn rx_handler(iface_name: &str, frame: &mut [u8]) {
         .clone()
         .or_else(|| iface::lookup_in(net_ns_id, &bypass_iface))
     {
-        crate::raw_sock::netif_receive(&dev, frame);
+        crate::raw_sock::netif_receive_timestamped(&dev, frame, timestamp);
     }
 
     // Software GRO coalesces in-order TCP segments into one large frame before
@@ -760,6 +773,7 @@ fn timer_tick_pump() {
 /// Called once at boot.
 pub fn init() {
     iface::install_rx_handler(rx_handler);
+    iface::install_native_rx_handler(rx_handler_native);
     // Register default netfilter hooks: conntrack at PRE_ROUTING &
     // LOCAL_OUT, filter at all five points, NAT at PRE_ROUTING /
     // POST_ROUTING. Idempotent — calling twice double-registers, so

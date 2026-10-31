@@ -1084,6 +1084,7 @@ pub fn ifindex_for_name(name: &str) -> Option<u32> {
 
 fn admin_errno(error: crate::AdminError) -> i32 {
     match error {
+        crate::AdminError::DeviceError(code) => code,
         crate::AdminError::AuthorityRevoked => EPERM,
         crate::AdminError::NoIface => ENODEV,
         crate::AdminError::InvalidMtu

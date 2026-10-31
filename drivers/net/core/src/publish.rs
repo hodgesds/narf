@@ -259,13 +259,18 @@ pub fn dispatch_rx(
     mirror_attached: bool,
     mirror: impl FnOnce(Frame),
 ) {
+    mirror_rx(frame, mirror_attached, mirror);
+    deliver_rx(name, frame.payload_mut());
+}
+
+/// Capture the DMA packet before a native XDP program rewrites it.
+pub fn mirror_rx(frame: &Frame, mirror_attached: bool, mirror: impl FnOnce(Frame)) {
     if mirror_attached {
         if let Ok(dma_buf) = narf_io::alloc_coherent(frame.len() as usize, DomainId::DRIVER_0) {
-            let mut copy = Frame::new(dma_buf, frame.len());
+            let mut copy = Frame::with_offset_on_queue(dma_buf, 0, frame.len(), frame.queue());
             copy.payload_mut().copy_from_slice(frame.payload());
             copy.set_rx_meta(frame.rx_meta());
             mirror(copy);
         }
     }
-    deliver_rx(name, frame.payload_mut());
 }

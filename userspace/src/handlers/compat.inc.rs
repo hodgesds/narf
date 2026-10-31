@@ -13563,6 +13563,17 @@ fn install_packet_ancillary(
             };
             records.push((SOL_SOCKET, kind, value));
         }
+        let flags=ancillary.timestamping_flags;
+        if flags&0x50!=0 && (ancillary.hardware_ns.is_some() || flags&0x10!=0){
+            let mut times=[0u8;48];
+            if flags&0x10!=0{times[..8].copy_from_slice(&ancillary.tstamp_secs.to_ne_bytes());times[8..16].copy_from_slice(&i64::from(ancillary.tstamp_nanos).to_ne_bytes());}
+            if flags&0x40!=0{if let Some(ns)=ancillary.hardware_ns{times[32..40].copy_from_slice(&((ns/1_000_000_000)as i64).to_ne_bytes());times[40..48].copy_from_slice(&((ns%1_000_000_000)as i64).to_ne_bytes());}}
+            records.push((SOL_SOCKET,if ancillary.timestamping_new{65}else{37},times.to_vec()));
+        }
+        if let Some(error)=ancillary.timestamp_error{
+            let mut extended=[0u8;16];extended[..4].copy_from_slice(&error.to_ne_bytes());extended[4]=4;
+            records.push((SOL_PACKET,16,extended.to_vec()));
+        }
         if let Some(auxdata) = ancillary.auxdata {
             records.push((SOL_PACKET, PACKET_AUXDATA, auxdata.to_vec()));
         }

@@ -1272,7 +1272,12 @@ kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_printk_default);
 fn smoke_kernel_entropy_avail_default() -> TestResult {
     register_all();
     match read_sys("kernel/random/entropy_avail") {
-        Some(s) if s == "256\n" => TestResult::Pass,
+        Some(s)
+            if s == format!("{}\n", crate::csprng::entropy_avail_bits())
+                && matches!(s.as_str(), "0\n" | "4096\n") =>
+        {
+            TestResult::Pass
+        }
         _ => TestResult::Fail("kernel/random/entropy_avail mismatch"),
     }
 }

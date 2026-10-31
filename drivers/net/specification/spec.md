@@ -123,15 +123,105 @@ feature assigns the first registered NIC QEMU SLIRP's `10.0.2.15/24` lease and
 `10.0.2.2` gateway at `Stage::Late`; production networking leaves address
 selection to userspace.
 
-IGC uses the I225/I226 extended interrupt block (`ICR` 0x1500, `EIMS`/`EIMC`,
-`EIAC`/`EIAM`, `EITR0`, `IVAR0` and `IVAR_MISC`) rather than the legacy e1000
-interrupt aliases. Its current single queue has 256 RX descriptors. Queue-0
-RX, TX and other causes share MSI-X entry 0; the initial EITR interval is 648
-256-ns units (Linux's approximately 6,000 interrupts/second starting point).
-The RX worker snapshots its IRQ waiter before checking descriptors, drains at
-most 64 frames per round, rearms all consumed descriptors with one RDT write,
-then reenables and rechecks the vector before parking. A 10-ms lost-interrupt
-deadline and 1-ms no-vector polling fallback preserve forward progress.
+IGC follows `~/git/linux` at `ecd997b0189a`, under
+`drivers/net/ethernet/intel/igc/`. Each built-in I225/I226 function owns its
+queues, interface, PHY/clock/control state, interrupt routes and PM/AER hooks.
+Probe requires completed NVM auto-load, a valid unicast MAC, software/firmware
+PHY ownership and acknowledged advanced queue enable. Blank-NVM IDs match,
+but an invalid factory MAC fails probe; NVM programming is unsupported.
+I220/I221 omit 2500 Mbps. Carrier, speed and duplex come from hardware.
+
+Each function supports 1–4 queue pairs, initially bounded by online CPUs, with
+independent 64–4096-entry TX/RX rings (multiples of eight). The initial size is
+256 entries. MSI-X entry 0 handles other causes and entries 1–4 route queue
+pairs independently; reduced vector availability shares routes or uses the
+bounded poll fallback. RX workers are pinned to the selected online CPUs.
+x86_64 MSI-X destinations follow their APIC IDs; aarch64 currently uses the
+ITS's BSP collection while workers retain CPU affinity. Queue waiters arm
+before DD inspection, rearm/recheck before parking, and have a 10-ms fallback.
+A 40-byte Toeplitz key and 128-entry RETA steer RX and stable TX selection.
+Owned-frame callbacks carry a device cookie, avoiding first-controller state.
+
+`Igc::submit_frame(Frame, TxMeta)` transfers DMA ownership asynchronously.
+It validates complete headers before publication, emits advanced contexts for
+TCP/UDP checksums, SCTP CRC32c, IPv4/IPv6 TCP segmentation (up to 65535 bytes)
+and VLAN insertion, and splits data descriptors at 4-KiB boundaries. Final
+EOP/RS DD releases the entire packet. Batches flush on burst boundaries, ring
+pressure or maintenance. IPv6 extension/fragment offloads and stacked VLAN
+offloads are rejected. RX bounds DD/EOP chains, retains partial jumbo assembly
+across budgets, reconstructs stripped VLANs, and reports queue/RSS/checksum
+metadata. MTU is 68–9216; TSN and direct UMEM queues require MTU at most 1500.
+Hardware waits never retain a queue or global spinlock.
+
+`iface::DeviceControl::nic()` exposes the typed `net::nic::NicControl` API:
+ring/channel/RSS/coalescing configuration, link advertising/forced 10/100,
+pause negotiation, EEE, wake policy, cumulative hardware/per-queue counters,
+register snapshots, read-only bounded NVM access, diagnostics and link restart.
+The Linux ethtool ioctl bridge supplies these controls, names/stats, channel
+and ring queries, timestamp capabilities and Ethernet/VLAN-priority receive
+flow rules. EtherType (eight), destination-MAC (available RARs) and VLAN
+priority (eight) filters target live queues; unsupported combined/partial
+matches are rejected. MAC/MTU/receive-mode updates reach hardware before
+registry commit. Initial all-multicast acceptance is explicit because not all
+IPv6 multicast joins have per-interface bookkeeping.
+
+The adjustable I225/I226 PHC is registered as `/dev/ptpN`. Clock get/set,
+frequency/offset adjustment, timestamp configuration, capability queries and
+system/device sampling use checked interfaces. Driver reset and PM preserve
+clock time and frequency. RX timestamp prefixes are stripped and corrected
+for link latency; TX has four exclusive register slots, timeout quarantine and
+completion/cancellation reports. Native `Frame::tx_timing()` and
+`RxMeta::timestamp_ns` expose timing. AF_PACKET `SO_TIMESTAMPING` additionally
+delivers RX raw hardware times and TX `MSG_ERRQUEUE` reports with Linux cmsg
+layouts. Mutating PHC syscalls require a writable fd and `CAP_SYS_TIME`.
+`SIOCSHWTSTAMP` requires `CAP_NET_ADMIN`; effective RX filtering is ALL.
+
+`TrafficSchedule` programs Qbv gates, Qav credit shapers on queues 0/1 and
+per-queue launch times. Only one contiguous gate window per queue is
+representable; invalid schedules fail before MMIO. CBS sendSlope/lowCredit are
+validated but not independently programmable by this silicon. Launch times
+use PHC nanoseconds, support the current/next cycle and include Linux's empty
+frame workaround; out-of-horizon and near-boundary requests fail explicitly.
+MAC Merge sends/receives SMD verify/response frames, retries verification at
+most three times, resets verification on link loss and only activates TX
+preemption after verification or an explicit administrative override.
+Clock steps are refused while a TSN schedule is active. These scheduling and
+MAC Merge controls use the native typed API.
+Reconfiguration drains the previous queues. Permanently closed queues reject
+new TX, including during the transition to a future base time, so an impossible
+completion cannot trigger a watchdog reset or retain submitted DMA indefinitely.
+
+Native XDP runs on completed DMA packets before software claims/protocol
+allocation; PASS is not executed a second time in the stack. TX reuses owned
+frames, and redirect/broadcast actions finish after locks release. AF_BYPASS's
+existing capability/ring API can request direct UMEM queues with XDP_ZEROCOPY
+(flag 4). Each UMEM frame has exclusive DMA ownership, and duplicate FILL/TX
+indices cannot alias outstanding DMA. TX completion follows final DD; reset
+and detach require a proven device-wide fence. Direct queues exclude software
+claims on that interface, reject RX timestamp-prefix mode, and retain their
+UMEM/socket and exclusive queue claim across failures. Failed attachment closes
+the socket until recovery detaches it; RX backpressure recycles unpublished
+buffers rather than losing their indices. This is NARF's existing capability-based AF_XDP
+surface, not Linux's arbitrary-user-page UMEM/mmap-ring ABI.
+
+Admin up/down, multiple controllers, PCI removal, AER recovery, watchdog
+reset, S3 and runtime D3hot are integrated. Suspend programs requested Linux
+WAKE_PHY/UCAST/MCAST/BCAST/MAGIC policy and PME, retaining PHY power when wake
+is armed. Failed drain/reset never releases DMA. Removal withdraws published
+interfaces, clocks, PM/AER hooks and handlers; vectors and allocations release
+only after successful drain. The `.ko` now shares the reset/PHY/queue protocol
+and provides an advanced-descriptor copy datapath through the device C ABI,
+with an exit drain and explicit DMA retention on failed teardown. Its current
+C transmit callback has one instance per loaded module; the built-in path has
+full per-function state. Module control/offload parity is not claimed.
+
+Physical acceptance remains open on the host I225-V (`0000:0e:00.0`,
+`8086:15f3`, revision 01): probe/IRQ routing; negotiated speeds and replug;
+bidirectional IPv4/IPv6, checksum/TSO/SCTP verification at a peer; VLAN/jumbo
+and queue pressure; PHC accuracy and packet timestamps; gate/shaper/preemption
+behavior; direct UMEM traffic; WoL/runtime PM, AER/unplug and S3 under traffic.
+Native Rust register/DMA/ABI tests establish software behavior, not electrical
+link, timing accuracy or motherboard acceptance.
 
 IGB is the sole owner of the I210/I211/82576/I350 PCI IDs listed by
 `igb::SUPPORTED_DEVICE_IDS`; the legacy e1000 driver must not claim them. Its
@@ -279,8 +369,8 @@ ready when MLX5 is ready.
 **CPU-count based, capped by device support**.
 
 E1000 (single-queue legacy) → 1 queue, single-vector MSI-X.
-IGC (8 queues per direction typical) →
-`min(cpu_count, 8)` queues with MSI-X per queue.
+IGC (four queues per direction on I225/I226) →
+`min(cpu_count, 4)` initial queue pairs with MSI-X per pair.
 
 RSS hash schemes follow `net/spec` §8.3 `RssScheme` enum;
 drivers translate to hardware-specific RSS tables.

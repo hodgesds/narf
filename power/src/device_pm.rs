@@ -163,6 +163,18 @@ pub fn registered_devices() -> Vec<DevicePmEntry> {
     REGISTRY.lock().clone()
 }
 
+/// Withdraw a detached device; release the driver's Arc outside the registry lock.
+pub fn unregister_device_pm(name: &str) -> bool {
+    let removed = {
+        let mut registry = REGISTRY.lock();
+        registry
+            .iter()
+            .position(|e| e.name == name)
+            .map(|i| registry.remove(i))
+    };
+    removed.is_some()
+}
+
 /// Number of registered devices.
 pub fn device_count() -> usize {
     REGISTRY.lock().len()
@@ -249,3 +261,37 @@ pub fn resume_all_devices() -> FanoutReport {
 pub fn __reset_for_test() {
     REGISTRY.lock().clear();
 }
+
+fn smoke_device_pm_unregister_drops_outside_registry_lock() -> narf_kernel_test::TestResult {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DROPPED: AtomicBool = AtomicBool::new(false);
+    #[derive(Debug)]
+    struct Model;
+    impl DevicePmOps for Model {
+        fn suspend(&self) -> Result<(), DevicePmError> {
+            Ok(())
+        }
+        fn resume(&self) -> Result<(), DevicePmError> {
+            Ok(())
+        }
+    }
+    impl Drop for Model {
+        fn drop(&mut self) {
+            let _ = device_count();
+            DROPPED.store(true, Ordering::Release);
+        }
+    }
+    DROPPED.store(false, Ordering::Release);
+    register_device_pm_ops("test-igc-detach", Arc::new(Model));
+    if !unregister_device_pm("test-igc-detach")
+        || !DROPPED.load(Ordering::Acquire)
+        || unregister_device_pm("test-igc-detach")
+    {
+        return narf_kernel_test::TestResult::Fail("PM withdrawal lifetime failed");
+    }
+    narf_kernel_test::TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "power",
+    smoke_device_pm_unregister_drops_outside_registry_lock
+);

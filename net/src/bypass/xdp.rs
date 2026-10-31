@@ -140,6 +140,7 @@ pub struct XdpSocket {
     iface_name: IrqSafeSpinLock<Option<alloc::string::String>>,
     queue_id: core::sync::atomic::AtomicU32,
     bound: AtomicBool,
+    closed: AtomicBool,
     /// FILL ring consumer — kernel pops indices userspace posted.
     fill_cons: IrqSafeSpinLock<Option<Consumer<u64, XDP_RING_N>>>,
     /// RX ring producer — kernel pushes (frame_idx, len) for the
@@ -192,6 +193,7 @@ impl XdpSocket {
             iface_name: IrqSafeSpinLock::new(None),
             queue_id: core::sync::atomic::AtomicU32::new(0),
             bound: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
             fill_cons: IrqSafeSpinLock::new(Some(fill_cons)),
             rx_prod: IrqSafeSpinLock::new(Some(rx_prod)),
             tx_cons: IrqSafeSpinLock::new(Some(tx_cons)),
@@ -219,6 +221,9 @@ impl XdpSocket {
     /// Mark the socket as bound to (iface, queue). The classifier
     /// will only route frames here once the bind is observed.
     pub fn bind(&self, iface_name: alloc::string::String, queue_id: u32) -> Result<(), XdpError> {
+        if self.is_closed() {
+            return Err(XdpError::UmemAccessDenied);
+        }
         if self.bound.load(Ordering::Acquire) {
             return Err(XdpError::AlreadyBound);
         }
@@ -232,6 +237,17 @@ impl XdpSocket {
         Ok(())
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+    /// Roll back a failed bind before any hardware queue was attached.
+    pub fn unbind(&self) {
+        self.bound.store(false, Ordering::Release);
+        *self.iface_name.lock() = None;
+    }
     /// Currently bound iface name, if any.
     pub fn bound_iface(&self) -> Option<alloc::string::String> {
         self.iface_name.lock().clone()
@@ -253,6 +269,9 @@ impl XdpSocket {
     /// stash the frame elsewhere — in the kernel today that means
     /// drop).
     pub fn pop_fill(&self) -> Option<UmemSlot> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
         let mut g = self.fill_cons.lock();
         let cons = g.as_mut()?;
         match cons.try_recv() {
@@ -274,6 +293,9 @@ impl XdpSocket {
     /// Kernel-side: pop a TX entry the daemon queued. Used by the
     /// driver's send pump.
     pub fn pop_tx(&self) -> Option<UmemSlot> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
         let mut g = self.tx_cons.lock();
         let cons = g.as_mut()?;
         match cons.try_recv() {

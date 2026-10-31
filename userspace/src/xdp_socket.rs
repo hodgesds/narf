@@ -157,6 +157,9 @@ pub fn handle_umem_reg(state: &XdpSocketState, reg: &XdpUmemReg) -> Result<(), X
     if state.umem.lock().is_some() {
         return Err(XdpOpError::AlreadyRegistered);
     }
+    if reg.len > u64::from(u32::MAX) || reg.headroom != 0 || reg.flags != 0 {
+        return Err(XdpOpError::InvalidArg);
+    }
     let size = reg.len as u32;
     let chunk = reg.chunk_size;
     let umem = Umem::register(size, chunk).map_err(|_| XdpOpError::InvalidArg)?;
@@ -188,6 +191,9 @@ pub fn handle_ring_setup(state: &XdpSocketState, _value: u32) -> Result<(), XdpO
 /// and marks the socket bound. A more specific claim can be added
 /// later via `setsockopt(SOL_XDP, XDP_OPTIONS)` once that lands.
 pub fn handle_bind(state: &XdpSocketState, addr: &SockAddrXdp) -> Result<(), XdpOpError> {
+    if addr.flags & !6 != 0 || addr.flags & 6 == 6 {
+        return Err(XdpOpError::InvalidArg);
+    }
     if state.bound.load(Ordering::Acquire) {
         return Err(XdpOpError::AlreadyRegistered);
     }
@@ -215,14 +221,66 @@ pub fn handle_bind(state: &XdpSocketState, addr: &SockAddrXdp) -> Result<(), Xdp
         Some(s) => s,
         None => return Err(XdpOpError::RingsNotCreated),
     };
+    if let Ok(settings) = narf_net::nic::with_control(&iface_str, |d| d.settings()) {
+        if addr.queue_id >= u32::from(settings.channels) {
+            return Err(XdpOpError::InvalidArg);
+        }
+    }
+    struct Attempt {
+        socket: Arc<KernelXdpSocket>,
+        committed: bool,
+    }
+    impl Drop for Attempt {
+        fn drop(&mut self) {
+            if !self.committed {
+                self.socket.unbind();
+            }
+        }
+    }
+    let mut attempt = Attempt {
+        socket: kernel_socket.clone(),
+        committed: false,
+    };
     kernel_socket
         .bind(iface_str.clone(), addr.queue_id)
         .map_err(|_| XdpOpError::BindFailed)?;
+    if addr.flags & 4 != 0 {
+        narf_net::bypass::classifier::reserve_native(
+            &iface_str,
+            addr.queue_id,
+            kernel_socket.clone(),
+        )
+        .map_err(|_| XdpOpError::BindFailed)?;
+        if narf_net::nic::with_control(&iface_str, |c| {
+            c.bind_xsk(
+                u16::try_from(addr.queue_id).map_err(|_| 22)?,
+                Some(kernel_socket.clone()),
+            )
+        })
+        .is_err()
+        {
+            if kernel_socket.is_closed() {
+                // The driver may still own DMA leases after a failed restart.
+                // Keep its claim until recovery proves the queue stopped.
+                *state.iface_name.lock() = Some(iface_str);
+                state.bound.store(true, Ordering::Release);
+                attempt.committed = true;
+            } else {
+                narf_net::bypass::classifier::release_native(&iface_str, addr.queue_id);
+            }
+            return Err(XdpOpError::BindFailed);
+        }
+        *state.iface_name.lock() = Some(iface_str);
+        state.bound.store(true, Ordering::Release);
+        attempt.committed = true;
+        return Ok(());
+    }
     let seq = narf_net::bypass::register_flow(FlowKey::default(), kernel_socket)
         .map_err(|_| XdpOpError::BindFailed)?;
     *state.claim_seq.lock() = Some(seq);
     *state.iface_name.lock() = Some(iface_str);
     state.bound.store(true, Ordering::Release);
+    attempt.committed = true;
     Ok(())
 }
 
@@ -296,6 +354,23 @@ pub fn try_completion(state: &XdpSocketState) -> Result<Option<UmemSlot>, XdpOpE
 /// Close hook — unregister the per-flow claim before the socket
 /// goes away so a later socket can claim the same flow.
 pub fn close(state: &XdpSocketState) {
+    let socket = state.kernel_parts.lock().as_ref().map(|p| p.socket.clone());
+    if let Some(socket) = socket.as_ref() {
+        socket.close();
+    }
+    if state.bound.load(Ordering::Acquire) && state.claim_seq.lock().is_none() {
+        if let Some(socket) = socket {
+            if let Some(name) = socket.bound_iface() {
+                let detached = narf_net::nic::with_control(&name, |c| {
+                    c.bind_xsk(socket.queue_id() as u16, None)
+                })
+                .is_ok();
+                if detached {
+                    narf_net::bypass::classifier::release_native(&name, socket.queue_id());
+                }
+            }
+        }
+    }
     if let Some(seq) = state.claim_seq.lock().take() {
         narf_net::bypass::unregister_flow(seq);
     }
@@ -339,4 +414,96 @@ pub fn parse_xdp_umem_reg(body: &[u8]) -> Option<XdpUmemReg> {
         headroom,
         flags,
     })
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    #[derive(Debug)]
+    struct FailedRestart;
+    impl narf_net::iface::DeviceControl for FailedRestart {
+        fn configure(&self, _: &narf_net::iface::DeviceConfig) -> Result<(), i32> {
+            Ok(())
+        }
+        fn nic(&self) -> Option<&dyn narf_net::nic::NicControl> {
+            Some(self)
+        }
+    }
+    impl narf_net::nic::NicControl for FailedRestart {
+        fn bind_xsk(&self, _: u16, socket: Option<Arc<KernelXdpSocket>>) -> Result<(), i32> {
+            if let Some(socket) = socket {
+                socket.close();
+                Err(5)
+            } else {
+                Err(16)
+            }
+        }
+    }
+    fn send(_: &[u8], _: narf_net::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    struct Interface(String);
+    impl Drop for Interface {
+        fn drop(&mut self) {
+            narf_net::bypass::classifier::release_native(&self.0, 0);
+            narf_net::iface::unregister(&self.0);
+        }
+    }
+    fn smoke_xdp_failed_restart_preserves_queue_claim() -> TestResult {
+        let iface = Interface(narf_net::iface::register(
+            "xsk-fail%d",
+            [2, 1, 2, 3, 4, 6],
+            send,
+        ));
+        narf_net::iface::set_device_control(&iface.0, Arc::new(FailedRestart));
+        let state = XdpSocketState::new();
+        if handle_umem_reg(
+            &state,
+            &XdpUmemReg {
+                len: 4096,
+                chunk_size: 2048,
+                ..XdpUmemReg::default()
+            },
+        )
+        .is_err()
+            || handle_ring_setup(&state, 64).is_err()
+        {
+            return TestResult::Fail("UMEM setup failed");
+        }
+        let mut addr = SockAddrXdp {
+            flags: 4,
+            ..SockAddrXdp::default()
+        };
+        addr.iface_name[..iface.0.len()].copy_from_slice(iface.0.as_bytes());
+        if handle_bind(&state, &addr) != Err(XdpOpError::BindFailed) {
+            return TestResult::Fail("failed restart reported success");
+        }
+        let socket = state.kernel_parts.lock().as_ref().unwrap().socket.clone();
+        if !socket.is_closed() || socket.bound_iface().as_deref() != Some(&iface.0) {
+            return TestResult::Fail("failed DMA ownership was made reusable");
+        }
+        close(&state);
+        let challenger = KernelXdpSocket::create(state.umem.lock().as_ref().unwrap().clone());
+        if narf_net::bypass::classifier::reserve_native(&iface.0, 0, challenger.socket.clone())
+            .is_ok()
+        {
+            return TestResult::Fail("second socket stole a queue before DMA drain");
+        }
+        // Model the successful recovery fence: only now can another socket own it.
+        narf_net::bypass::classifier::release_native(&iface.0, 0);
+        if narf_net::bypass::classifier::reserve_native(&iface.0, 0, challenger.socket).is_err() {
+            return TestResult::Fail("recovered queue remained unavailable");
+        }
+        socket.unbind();
+        if socket.bind(iface.0.clone(), 0).is_ok() {
+            return TestResult::Fail("closed socket was rebound");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "syscall_abi",
+        smoke_xdp_failed_restart_preserves_queue_claim
+    );
 }
