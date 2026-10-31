@@ -2,6 +2,8 @@
 //! Real retained Device/USB/MLME/RSNA across associated passive visits.
 use super::*;
 use crate::rtl8xxxu::{ht_runtime::Grant, packet_codec, ps_null};
+#[path = "associated_active_composition_tests.rs"]
+mod active;
 
 #[derive(Default)]
 struct PowerIndications {
@@ -22,6 +24,7 @@ struct PowerIndications {
 struct AssociatedLink {
     radio: ChannelLink,
     power: Arc<IrqSafeSpinLock<PowerIndications>>,
+    probes: Arc<IrqSafeSpinLock<active::Probes>>,
     clock: Env,
 }
 impl AssociatedLink {
@@ -64,8 +67,10 @@ impl Io for AssociatedLink {
     fn poll_receive(&self, receipt: &u64, bytes: &mut [u8]) -> Result<Option<usize>, UsbError> {
         self.radio.synchronize_reset()?;
         self.advance_air();
+        self.advance_probe_air();
         let (channel, rx, _) = self.radio.physical();
         let generation = self.radio.control.0.lock().cold_generation;
+        let suppress_away_beacon = self.probes.lock().suppress_away_beacon;
         if rx {
             let mut power = self.power.lock();
             let mut peer = self.radio.bulk.0.lock();
@@ -88,7 +93,9 @@ impl Io for AssociatedLink {
                     .position(|w| w == [3, 1, 1])
                     .ok_or(UsbError::Stall)?;
                 beacon[ds + 2] = 6;
-                peer.queue.push_back(beacon);
+                if !suppress_away_beacon {
+                    peer.queue.push_back(beacon);
+                }
                 if let Some(frame) = power.inject_away_data.take() {
                     let mut raw = vec![0; 24 + frame.len()];
                     let d0 = frame.len() as u32 | 1 << 27 | 1 << 28 | 1 << 29 | 1 << 23;
@@ -104,6 +111,9 @@ impl Io for AssociatedLink {
         self.radio.bulk.poll_receive(receipt, bytes)
     }
     fn begin_send(&self, dci: u8, bytes: &[u8]) -> Result<u64, UsbError> {
+        if bytes.get(TX_DESC) == Some(&0x40) {
+            return self.begin_probe(dci, bytes);
+        }
         let (channel, _, tx) = self.radio.physical();
         if channel != 1 || !tx {
             return Err(UsbError::Stall);
@@ -159,6 +169,19 @@ impl Io for AssociatedLink {
         Ok(id)
     }
     fn poll_send(&self, receipt: &u64) -> Result<Option<usize>, UsbError> {
+        if self.is_probe_receipt(receipt) {
+            let probes = self.probes.lock();
+            if probes.hold {
+                return Ok(None);
+            }
+            let short = probes.short;
+            drop(probes);
+            return self
+                .radio
+                .bulk
+                .poll_send(receipt)
+                .map(|result| result.map(|length| if short { length - 1 } else { length }));
+        }
         if self.power.lock().hold
             && self
                 .radio
@@ -234,6 +257,7 @@ impl AssociatedFixture {
         let link = AssociatedLink {
             radio,
             clock: clock.clone(),
+            probes: Arc::new(IrqSafeSpinLock::new(Default::default())),
             power: Arc::new(IrqSafeSpinLock::new(PowerIndications {
                 home_generation: u64::MAX,
                 away_generation: u64::MAX,
@@ -529,11 +553,12 @@ fn null_literals() -> Result<(), &'static str> {
     let before = h.link.radio.bulk.0.lock().sent;
     let mut active = h.scan(&[6]);
     active.active = true;
+    active.ssids = vec![b"one".to_vec(), b"two".to_vec()];
     ensure!(
         drive(h.device.scan(active))?.is_err()
             && h.link.radio.bulk.0.lock().sent == before
             && h.device.link_up(),
-        "EU connected active scan widened private idle probe admission"
+        "EU connected active scan accepted multiple SSIDs before native effects"
     );
     let mut request = h.scan(&[6]);
     request.duration_mandatory = true;

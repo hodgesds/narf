@@ -2,6 +2,9 @@
 //! Associated passive visits over the same native station/key/BA owners.
 use super::super::{receive_runtime::ScanConfig, service_runtime::Environment};
 use super::*;
+#[path = "station_active_scan.rs"]
+mod active;
+pub(in crate::rtl8xxxu) use active::ActiveRequest;
 
 pub(in crate::rtl8xxxu) struct Observation {
     pub candidate: Candidate,
@@ -94,7 +97,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                             .map_err(Error::Radio)?;
                         let next = generation.checked_add(1).ok_or(Error::State)?;
                         self.radio
-                            .cold_retune(channel)
+                            .cold_scan_channel(channel, false)
                             .await
                             .map_err(Error::Radio)?;
                         *generation = next;
@@ -176,14 +179,8 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         let qos = self.plan.wmm().is_some();
         let sequence = if qos {
             0
-        } else if let Some(security) = &mut self.security {
-            security
-                .reserve_plain_control_sequence()
-                .map_err(Error::Security)?
         } else {
-            let sequence = self.sequence;
-            self.sequence = (sequence + 1) & 4095;
-            sequence
+            self.reserve_plain_sequence()?
         };
         let null = super::super::ps_null::Prepared::new(
             self.radio.local().ok_or(Error::State)?,
@@ -200,6 +197,18 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             deadline: now.saturating_add(1000),
         });
         Ok(())
+    }
+
+    fn reserve_plain_sequence(&mut self) -> Result<u16, Error> {
+        if let Some(security) = &mut self.security {
+            security
+                .reserve_plain_control_sequence()
+                .map_err(Error::Security)
+        } else {
+            let sequence = self.sequence;
+            self.sequence = (sequence + 1) & 4095;
+            Ok(sequence)
+        }
     }
 
     async fn scan_drain<E: Environment>(

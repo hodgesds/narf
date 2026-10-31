@@ -4,6 +4,16 @@
 //! retires the old receive stream before any new channel label is published.
 use super::*;
 
+#[derive(Clone, Copy)]
+enum Restart {
+    ChannelChange,
+    Parked,
+    /// Always retire the old physical stream, even on the same channel.
+    Scan {
+        retain_ht: bool,
+    },
+}
+
 impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
     pub(in crate::rtl8xxxu) fn permission_for_channel(
         &self,
@@ -21,13 +31,22 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         &mut self,
         channel: u8,
     ) -> Result<super::super::power_policy::Permission, Error> {
-        self.restore_channel(channel, false).await
+        self.restore_channel(channel, Restart::ChannelChange).await
+    }
+
+    pub(in crate::rtl8xxxu) async fn cold_scan_channel(
+        &mut self,
+        channel: u8,
+        retain_ht: bool,
+    ) -> Result<super::super::power_policy::Permission, Error> {
+        self.restore_channel(channel, Restart::Scan { retain_ht })
+            .await
     }
 
     pub(in crate::rtl8xxxu) async fn resume_parked(
         &mut self,
     ) -> Result<super::super::power_policy::Permission, Error> {
-        self.restore_channel(self.channel(), true).await
+        self.restore_channel(self.channel(), Restart::Parked).await
     }
 
     pub(in crate::rtl8xxxu) async fn park(&mut self) -> Result<(), Error> {
@@ -60,9 +79,9 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
     async fn restore_channel(
         &mut self,
         channel: u8,
-        parked: bool,
+        restart: Restart,
     ) -> Result<super::super::power_policy::Permission, Error> {
-        let expected = if parked {
+        let expected = if matches!(restart, Restart::Parked) {
             Phase::Parked
         } else {
             Phase::Receiving
@@ -73,14 +92,14 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         let base = self.wmm.as_ref().ok_or(Error::State)?;
         let target = base.for_channel(channel)?;
         let permission = target.permission();
-        if channel == self.channel() && !parked {
+        if channel == self.channel() && matches!(restart, Restart::ChannelChange) {
             return Ok(permission);
         }
         // The source cold LC/IQK program runs on home channel1. Both that
         // calibration program and the selected operating row must stay valid.
         let home = base.for_channel(1)?;
         let authority = self.authority();
-        let ht = if channel == 1 {
+        let ht = if channel == 1 && !matches!(restart, Restart::Scan { retain_ht: false }) {
             self.home_ht.clone()
         } else {
             None
@@ -96,7 +115,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
                     home.fence(
                         target.fence(
                             async {
-                                if parked {
+                                if matches!(restart, Restart::Parked) {
                                     self.firmware
                                         .restart_parked()
                                         .await

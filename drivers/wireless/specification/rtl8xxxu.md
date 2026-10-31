@@ -6,6 +6,7 @@
 > Administrative cold park/wake passes native software acceptance.
 > Qualified idle active probe scanning passes native software acceptance.
 > Associated passive scans and plaintext Null/QoS Null pass native software acceptance.
+> Associated active scans are implemented pending their own native acceptance.
 > Broader profiles and physical acceptance remain incomplete. A separately
 > qualified RTL8188EU HT20/LGI SISO continuation passes14 native regressions
 > on both architectures; exact-device qualification remains external.
@@ -869,7 +870,7 @@ AP/USB inputs remain inert, and physical qualification remains separate.
 the same ordinary device-state mutex as the network producer. Existing host
 Narf-Ring and pending Ethernet owners remain intact; a concurrent synchronous
 drain returns without waiting for another scheduler task. New host publication
-observes the busy state. Connected active scans remain a separate continuation.
+observes the busy state. Connected active scans use the separate continuation below.
 Invalid channels, missing signed measurement rows, current NO_IR/power policy
 or mandatory dwell above125ms are refused before the first scan I/O.
 
@@ -959,7 +960,60 @@ QoS counters. All nine pass on both architectures at `a7797583a`, within
 4,349/0/13 x86_64 and 3,990/0/7 aarch64 native results. Resolved release CI,
 formatting, ordinary boots and both btrfs postflights pass on each architecture.
 Physical RF/USB qualification remains separate. Associated active scanning
-remains an open continuation beyond this passive/Null acceptance.
+below retains its own pending native gate beyond this passive/Null acceptance.
+
+### Associated active scanning (native acceptance pending)
+
+The retained connected station now accepts an active scan with one directed
+SSID or a wildcard and up to 2048 checked extra IE bytes. Admission validates
+every selected channel's exact signed power row and current occupied-band
+policy, the complete extra IE structure and source timing before publishing
+PM1 or changing hardware. The ordinary one-SSID, random-address and band
+restrictions remain. Mandatory dwell must fit both the source probe timing
+and the 125ms listening cap; a nonmandatory request is raised to the source
+minimum and capped at 125ms. No scan grants broader channel or power rights.
+
+Each visit retains the original station and its home authority. It drains
+native DATA/control work, emits the private plaintext PM1 Null/QoS Null and
+honors the source 100ms no-flush grace. The physical receiver then performs
+an actual completed cold MAC/FIFO/USB restart, including when the requested
+channel is the current home channel. The restarted receiver has no bound
+peer, so the existing private `probe_runtime::Prepared` path can emit the
+native broadcast Probe Request without broadening ordinary management TX.
+Away visits use the qualified legacy profile; a visit on the actual home
+can retain its installed HT grant. The outer home proof remains current
+even while that HT program is temporarily absent from an away receiver.
+
+The Probe reserves one sequence number from the retained non-QoS DATA/EAPOL
+space through the existing Security helper, without consuming CCMP PN or
+changing keys/replay state. QoS Null continues to use TID7/SN0 without
+allocating a DATA sequence. The actual descriptor selects MGNT/basic1Mbps,
+software SN and no hardware encryption or hardware sequence override. Source
+pre-probe delay and the complete frame's airtime bound its response window.
+Native host USB delivery precedes a listening window with MAC TX still open;
+the subsequent actual 32-bit SCH_TX_CMD terminal precedes TX closure. Host
+delivery is neither an AP ACK nor physical FIFO retirement.
+
+Every return forces another real cold receive boundary before restoring the
+original channel, peer/media/AID, HT/EDCA, rate reporting and aggregation
+profile. PM0 and the source 200ms home grace then use ordinary data/RSNA/BA
+progress over the same software keys, replay windows, sequence owners and
+host packet rings. Away frames enter only the physical-channel scan parser.
+Cold reinitialization and USB latency remain additional to the listening
+windows; the software makes no physical switching-latency guarantee.
+Cancellation, current policy/source loss, short USB or missing device
+terminal state leaves a terminal owner with its actual receipts retained.
+
+Eight new `drivers/wireless/rtl8xxxu/associated_active_scan` native cases
+compose actual retained firmware/USB/Device/MLME/RSNA and DHCP. They cover
+Open and WPA2/HT home/away scans, same-channel cold generations, directed and
+wildcard probes, maximum extra IEs, exact private descriptors and shared SN
+ownership, retained host and buffered peer packets, pure timing/power/IE
+refusal, held Probe cancellation/source loss, independent USB/PHY/SCH
+terminals, old FIFO rejection and current home policy/HT loss during actual
+native work. Only hardware/firmware execution and peer inputs are inert.
+The eight earlier associated-passive cases remain separate registrations.
+The new active cases await coordinated release compilation and execution.
 
 ## 4. Invariants
 
@@ -994,7 +1048,8 @@ the production probe when exact-device signed qualification/deployment data
 is present. No real board curve has been acquired, qualified or installed by
 this software work. The initial profile needs physical validation. Qualified
 legacy idle channel changes and passive scans pass native software gates; broader
-rates, connected active scanning and endpoint reset remain software work.
+rates and endpoint reset remain software work. Connected active scanning
+is implemented below with its own native acceptance pending.
 Administrative cold park/wake passes native software gates at `0eb084197`.
 Idle active probe scanning passes native software gates at `0eb084197`.
 Associated passive scanning/Null functions pass native software gates at `a7797583a`.
@@ -1013,7 +1068,7 @@ Associated passive scanning/Null functions pass native software gates at `a77975
 | Signed board power artifact and checked native TX gate | Implemented software contract; real qualified per-device data must be acquired/signed/installed |
 | Native USB descriptor/packet ownership | Implemented dependency; persistent receipt/stop and Linux descriptor regressions |
 | Native beacon/management preparation and peer-bound transitions | Implemented basic1Mbps shared plan; qualified channels1–13 pass native software gates |
-| Production scan/MLME service and policy-admitted management TX | Qualified idle passive multi-channel scan/home restoration passes native gates; idle active and associated passive/Null pass native gates; signed board/deployment admission required; connected active scans remain missing |
+| Production scan/MLME service and policy-admitted management TX | Qualified idle passive multi-channel scan/home restoration passes native gates; idle active and associated passive/Null pass native gates; signed board/deployment admission required; connected active scans are implemented pending native acceptance |
 | Software AES-CCM + strict CCMP/key/TID ownership | Implemented dependency; independent ciphertext/forgery/role/PN regressions |
 | WPA2 key installation/controlled port and Ethernet transport | Implemented retained shared RSNA/software CCMP, exact native delivery, Narf-Rings and synchronous stack progress |
 | Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX. Qualified legacy channels1–13 and cold idle FIFO retuning pass native software gates. Separate N8HT HT20/LGI MCS0..7/whole A-MSDU/decline/capture-publication continuation passes native software gates above and stays channel1-bound. Management/basic1Mbps remains required. SGI/HT40, broader bands/adaptation and coexistence remain missing |
@@ -1025,8 +1080,8 @@ Associated passive scanning/Null functions pass native software gates at `a77975
 Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 `8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional
 BT/S0S1. EU's separately qualified HT20/LGI continuation is software-validated above;
-SGI20/HT40, active scanning while associated, and
-controller-proven EP0 reset remain software work. Qualified idle passive
+SGI20/HT40 and controller-proven EP0 reset remain software work.
+Associated active scanning is implemented with native acceptance pending. Qualified idle passive
 multi-channel scanning passes native software gates; associated passive scans
 and Null functions pass native software gates at `a7797583a`.
 Full WMM AC/TID routing is implemented.

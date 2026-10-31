@@ -12,6 +12,11 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
         ssid: &[u8],
         extra: &[u8],
     ) -> Result<(), Error> {
+        if self.phase() == Phase::Connected {
+            return self
+                .associated_active_scan(channels, dwell_ms, mandatory, ssid, extra)
+                .await;
+        }
         if self.phase() != Phase::Passive || channels.is_empty() || !(1..=1024).contains(&dwell_ms)
         {
             return Err(Error::State);

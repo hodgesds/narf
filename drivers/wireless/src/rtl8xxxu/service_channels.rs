@@ -197,30 +197,11 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
         match result {
             Ok(observations) => {
                 for observation in observations {
-                    let entry = Entry {
-                        candidate: observation.candidate,
-                        seen: observation.seen,
-                        generation: observation.generation,
-                    };
-                    if let Some(old) = self
-                        .cache
-                        .iter_mut()
-                        .find(|old| old.candidate.bssid() == entry.candidate.bssid())
-                    {
-                        *old = entry;
-                    } else {
-                        if self.cache.len() == 32 {
-                            let oldest = self
-                                .cache
-                                .iter()
-                                .enumerate()
-                                .min_by_key(|(_, old)| old.seen)
-                                .map(|(i, _)| i)
-                                .unwrap();
-                            self.cache.swap_remove(oldest);
-                        }
-                        self.cache.push(entry);
-                    }
+                    self.remember_scan_candidate(
+                        observation.candidate,
+                        observation.seen,
+                        observation.generation,
+                    );
                 }
                 self.check_current()
             }
@@ -228,6 +209,38 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
                 self.fail();
                 Err(error)
             }
+        }
+    }
+
+    pub(super) fn remember_scan_candidate(
+        &mut self,
+        candidate: Candidate,
+        seen: u64,
+        generation: u64,
+    ) {
+        let entry = Entry {
+            candidate,
+            seen,
+            generation,
+        };
+        if let Some(old) = self
+            .cache
+            .iter_mut()
+            .find(|old| old.candidate.bssid() == entry.candidate.bssid())
+        {
+            *old = entry;
+        } else {
+            if self.cache.len() == 32 {
+                let oldest = self
+                    .cache
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, old)| old.seen)
+                    .map(|(i, _)| i)
+                    .unwrap();
+                self.cache.swap_remove(oldest);
+            }
+            self.cache.push(entry);
         }
     }
 }

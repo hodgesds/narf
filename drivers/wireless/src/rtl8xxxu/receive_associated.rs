@@ -14,6 +14,7 @@ pub(in crate::rtl8xxxu) struct ScanConfig {
 }
 pub(in crate::rtl8xxxu) struct ScanHome {
     channel: u8,
+    profile_ht: bool,
     config: ScanConfig,
     ra: Option<super::super::rate_adaptation::RateAdaptation>,
     report_time: Option<u16>,
@@ -96,6 +97,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
                     self.phase = Phase::Receiving;
                     Ok(ScanHome {
                         channel: self.channel(),
+                        profile_ht: self.ht_enabled(),
                         config,
                         ra: self.ra.take(),
                         report_time: self.report_time.take(),
@@ -119,7 +121,11 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         if self.peer.is_some() || permission.channel() != home.channel {
             return Err(Error::State);
         }
-        if self.cold_retune(home.channel).await? != permission {
+        if self
+            .cold_scan_channel(home.channel, home.profile_ht)
+            .await?
+            != permission
+        {
             return Err(Error::State);
         }
         self.enable_transmit(permission).await?;

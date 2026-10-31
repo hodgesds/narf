@@ -614,8 +614,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
         if !matches!(
             state.service.phase(),
             service_runtime::Phase::Passive | service_runtime::Phase::Connected
-        ) || request.active && state.service.phase() == service_runtime::Phase::Connected
-        {
+        ) {
             return Err(WirelessError::Busy);
         }
         // The retained Service/Station attempts set this shared failure flag

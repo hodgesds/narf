@@ -14,6 +14,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use zeroize::Zeroizing;
 #[path = "station_scan.rs"]
 mod station_scan;
+pub(in crate::rtl8xxxu) use station_scan::ActiveRequest;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     State,

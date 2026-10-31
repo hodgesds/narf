@@ -991,6 +991,14 @@ capture epoch after the completed native RX-prefix cut. Home data owners
 remain separate. Five native MT cases and two shared dispatcher cases pass
 at `a7797583a`; management TX and client/GO data contexts remain open.
 
+RTL8188EU associated active scans retain the same home station, keys, BA
+and host rings. One directed SSID or wildcard and bounded extra IEs use the
+private native probe path after a real cold receive restart, including a
+same-channel visit. Current qualified power, source response timing and
+native USB/device terminals fence each visit; home PHY and peer state are
+restored before normal data resumes. Eight native cases await release
+acceptance in the family §3.
+
 ## 4. Interaction with `narf-wireless`
 
 - **Registration**: Drivers register via `bus::register_wireless_driver(MatchEntry { ... })`.

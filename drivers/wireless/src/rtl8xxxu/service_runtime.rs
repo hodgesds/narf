@@ -14,6 +14,8 @@ use core::{
 };
 use zeroize::Zeroizing;
 
+#[path = "service_associated_active.rs"]
+mod service_associated_active;
 #[path = "service_channels.rs"]
 mod service_channels;
 #[path = "service_power.rs"]
