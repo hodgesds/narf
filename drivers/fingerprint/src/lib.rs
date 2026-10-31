@@ -130,8 +130,31 @@ pub const VALIDITY_VID: u16 = 0x138A;
 pub const ELAN_VID: u16 = 0x04F3;
 
 /// Master VID/PID table covering the common laptop fingerprint
-/// readers (Lenovo / Dell / HP / ASUS business class). Sourced
-/// from libfprint's device list (BSD-licensed).
+/// readers (Lenovo / Dell / HP / ASUS business class).
+///
+/// SINGLE MATCH AUTHORITY (issue #918): this is the one table both
+/// the scaffold probe (`match_vid_pid`) and the live USB binder
+/// (`narf_drivers_usb::fingerprint::classify_vid_pid`, which maps
+/// `Family` to its transport vendor) read. The pre-#918 tree had
+/// two tables that drifted apart — this 22-entry scaffold table
+/// and a 17-entry table in the USB binder — agreeing on only 8
+/// of a 31-device union, which left the whole Validity family
+/// unbindable in the live path. The union below is that 31.
+///
+/// Provenance, per entry block:
+/// - Scaffold entries: libfprint's device list (BSD-licensed).
+/// - `Live-table carryover` entries: the pre-#918 USB binder
+///   table, whose own source comments cite libfprint's
+///   `synaptics.c` / `goodix.c` / `elanmoc.c` VID/PID lists.
+///   Carryover entries are flagged where their sub-family (or
+///   series) is unverified — see the Synaptics carryovers: the
+///   live table did not distinguish Prometheus vs MIS-older, so
+///   those three carry `SynapticsPrometheus` by convention and
+///   the flag says so. Both Synaptics families map to the same
+///   bulk transport arm in the USB binder, so a wrong sub-family
+///   here affects only the probe-log label, never binding.
+///   A reviewer with the libfprint source at hand can correct
+///   the three labels without touching any behaviour.
 ///
 /// Coverage targets — all four vendors are represented because a
 /// single laptop OEM frequently sources from multiple readers
@@ -168,6 +191,30 @@ pub const FINGERPRINT_DEVICES: &[FingerprintDevice] = &[
         pid: 0x00C9,
         family: Family::SynapticsPrometheus,
         name: "Prometheus (00C9)",
+    },
+    // ── Synaptics live-table carryover (#918) ─────────────────────
+    // Sub-family UNVERIFIED: the live table grouped all Synaptics
+    // under one vendor and did not distinguish Prometheus vs
+    // MIS-older. These carry SynapticsPrometheus by convention;
+    // both families map to the bulk arm in the USB binder, so a
+    // wrong label here affects only the probe-log line.
+    FingerprintDevice {
+        vid: SYNAPTICS_VID,
+        pid: 0x00C6,
+        family: Family::SynapticsPrometheus,
+        name: "Synaptics (00C6)",
+    },
+    FingerprintDevice {
+        vid: SYNAPTICS_VID,
+        pid: 0x00DC,
+        family: Family::SynapticsPrometheus,
+        name: "Synaptics (00DC)",
+    },
+    FingerprintDevice {
+        vid: SYNAPTICS_VID,
+        pid: 0x00FF,
+        family: Family::SynapticsPrometheus,
+        name: "Synaptics (00FF)",
     },
     // ── Synaptics older Match-In-Sensor (pre-Prometheus) ─────────
     FingerprintDevice {
@@ -206,6 +253,37 @@ pub const FINGERPRINT_DEVICES: &[FingerprintDevice] = &[
         pid: 0x6584,
         family: Family::Goodix,
         name: "GF series (6584)",
+    },
+    // ── Goodix live-table carryover (#918) ────────────────────────
+    FingerprintDevice {
+        vid: GOODIX_VID,
+        pid: 0x5110,
+        family: Family::Goodix,
+        name: "Goodix (5110)",
+    },
+    FingerprintDevice {
+        vid: GOODIX_VID,
+        pid: 0x530C,
+        family: Family::Goodix,
+        name: "Goodix (530C)",
+    },
+    FingerprintDevice {
+        vid: GOODIX_VID,
+        pid: 0x533C,
+        family: Family::Goodix,
+        name: "Goodix (533C)",
+    },
+    FingerprintDevice {
+        vid: GOODIX_VID,
+        pid: 0x5395,
+        family: Family::Goodix,
+        name: "Goodix (5395)",
+    },
+    FingerprintDevice {
+        vid: GOODIX_VID,
+        pid: 0x6594,
+        family: Family::Goodix,
+        name: "Goodix (6594)",
     },
     // ── Validity / Synaptics older ──────────────────────────────
     FingerprintDevice {
@@ -274,6 +352,13 @@ pub const FINGERPRINT_DEVICES: &[FingerprintDevice] = &[
         pid: 0x0C42,
         family: Family::Elan,
         name: "Elan ELAN-FP (0C42)",
+    },
+    // ── Elan live-table carryover (#918) ──────────────────────────
+    FingerprintDevice {
+        vid: ELAN_VID,
+        pid: 0x0C00,
+        family: Family::Elan,
+        name: "Elan ELAN-FP (0C00)",
     },
 ];
 
@@ -620,36 +705,40 @@ mod tests {
         smoke_probe_non_fingerprint_returns_none
     );
 
-    fn smoke_match_table_size_matches_brief() -> TestResult {
-        // Brief specifies: Synaptics 7 + Goodix 4 + Validity 6 + Elan 5 = 22.
-        if FINGERPRINT_DEVICES.len() != 22 {
-            return TestResult::Fail("match table size drifted from brief");
+    fn smoke_match_table_size_matches_union() -> TestResult {
+        // #918 union: scaffold 22 + live-table carryover 9 = 31.
+        // Synaptics Prometheus 5 + 3 carryover (sub-family
+        // unverified, flagged at the table) + MIS-older 2 +
+        // Goodix 4 + 5 carryover + Validity 6 + Elan 5 + 1
+        // carryover = 31.
+        if FINGERPRINT_DEVICES.len() != 31 {
+            return TestResult::Fail("match table size drifted from union");
         }
-        // Per-vendor counts must match the brief or the smoke breaks.
+        // Per-family counts must match the union or the smoke breaks.
         let count = |fam: Family| {
             FINGERPRINT_DEVICES
                 .iter()
                 .filter(|d| d.family == fam)
                 .count()
         };
-        if count(Family::SynapticsPrometheus) != 5 {
+        if count(Family::SynapticsPrometheus) != 8 {
             return TestResult::Fail("Synaptics Prometheus count drift");
         }
         if count(Family::SynapticsMisOlder) != 2 {
             return TestResult::Fail("Synaptics MIS-older count drift");
         }
-        if count(Family::Goodix) != 4 {
+        if count(Family::Goodix) != 9 {
             return TestResult::Fail("Goodix count drift");
         }
         if count(Family::Validity) != 6 {
             return TestResult::Fail("Validity count drift");
         }
-        if count(Family::Elan) != 5 {
+        if count(Family::Elan) != 6 {
             return TestResult::Fail("Elan count drift");
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/fingerprint", smoke_match_table_size_matches_brief);
+    kernel_test_in!("drivers/fingerprint", smoke_match_table_size_matches_union);
 
     fn smoke_match_table_no_duplicate_vid_pid_pairs() -> TestResult {
         // Linear de-dup check — table small enough not to need anything
