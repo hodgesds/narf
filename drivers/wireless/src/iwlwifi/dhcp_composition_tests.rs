@@ -33,6 +33,8 @@ mod rx_multi_tests;
 #[path = "sc_tx_amsdu_tests.rs"]
 mod tx_amsdu_tests;
 
+#[path = "gen3_station_tests.rs"]
+mod gen3_station_tests;
 #[path = "sc_scheduled_tests.rs"]
 mod scheduled_tests;
 
@@ -198,6 +200,8 @@ struct Wire {
     aggregates: Vec<Vec<Vec<u8>>>,
     held_data: Vec<(u16, u16)>,
     scheduled: Option<scheduled_tests::Model>,
+    api89: Option<gen3_station_tests::Case>,
+    mcc_caps_override: Option<u32>,
 }
 
 // SAFETY: no real device or thread accesses these fixture pointers. The sole
@@ -286,7 +290,12 @@ impl Wire {
             .map(|entry| if entry[2] == 99 { 0 } else { entry[2] })
             .unwrap_or(0);
         require(
-            bytes[7] == 0
+            bytes[7]
+                == if self.api89.is_some() && (group, cmd) == (5, 8) {
+                    2
+                } else {
+                    0
+                }
                 && usize::from(half(bytes, 4)) + 8 == bytes.len()
                 && sequence == (p.pointer.wrapping_sub(1) & 0xff),
             "Sc bare/WIDE_ID command header",
@@ -330,19 +339,43 @@ impl Wire {
                     "Sc MCC source/country",
                 )?;
                 let count = if self.phy.is_some() { 51u32 } else { 14 };
-                response.resize(24 + count as usize * 4, 0);
+                let first = if self.api89.is_some() { 20 } else { 24 };
+                response.resize(first + count as usize * 4, 0);
                 response[4..6].copy_from_slice(&body[..2]);
-                if self.phy.is_some_and(|phy| !phy.mcc_he) {
-                    response[8..12].copy_from_slice(&(1u32 << 13).to_le_bytes());
+                let capabilities = (1u32 << 4)
+                    | (1 << 3)
+                    | if self.phy.is_some_and(|phy| !phy.mcc_he) {
+                        1 << 13
+                    } else {
+                        0
+                    };
+                if self.api89.is_some() {
+                    let bits: u16 = 0x118
+                        | if self.phy.is_some_and(|phy| !phy.mcc_he) {
+                            1 << 10
+                        } else {
+                            0
+                        };
+                    let bits = if let Some(value) = self.mcc_caps_override {
+                        u16::try_from(value).map_err(|_| "fixture MCC v6 cap word")?
+                    } else {
+                        bits
+                    };
+                    response[6..8].copy_from_slice(&bits.to_le_bytes());
+                } else {
+                    response[8..12].copy_from_slice(
+                        &self.mcc_caps_override.unwrap_or(capabilities).to_le_bytes(),
+                    );
                 }
-                response[20..24].copy_from_slice(&count.to_le_bytes());
+                response[first - 4..first].copy_from_slice(&count.to_le_bytes());
                 let permission = if self.phy.is_some() {
                     13u32 | (1 << 9) | (1 << 10)
                 } else {
                     13
                 };
                 for i in 0..count as usize {
-                    response[24 + i * 4..28 + i * 4].copy_from_slice(&permission.to_le_bytes());
+                    response[first + i * 4..first + 4 + i * 4]
+                        .copy_from_slice(&permission.to_le_bytes());
                 }
             }
             (5, 0x17) => {
@@ -524,7 +557,8 @@ impl Wire {
                         && word(body, 0) == 0
                         && word(body, 4) == mask
                         && word(body, 8) == count as u32
-                        && word(body, 12) == u32::from(baid)
+                        && word(body, 12)
+                            == u32::from(baid) | if self.api89.is_some() { 1 << 16 } else { 0 }
                         && word(body, 16) != 0
                         && (!baid || self.multi_receive && word(body, 20) == 3),
                     "Sc all-owned-RFH epoch native contract",
@@ -533,7 +567,10 @@ impl Wire {
             (3, 8) => require(body.len() == 52 && body[12..18] == OWN, "Sc MAC identity")?,
             (3, 9) => require(body.len() == 208 && body[16..22] == OWN, "Sc LINK identity")?,
             (3, 10) => {
-                require(body.len() == 104 && body[8..14] == AP, "Sc peer identity")?;
+                require(
+                    body.len() == if self.api89.is_some() { 96 } else { 104 } && body[8..14] == AP,
+                    "native peer identity/extent",
+                )?;
                 if self.fault == Fault::HoldHe && word(body, 92) & 1 != 0 {
                     self.held = Some((cmd, group, sequence));
                     return Ok(());
@@ -546,7 +583,7 @@ impl Wire {
             )?,
             (1, 0x9f) => {
                 require(
-                    body.len() == 108
+                    body.len() == if self.api89.is_some() { 120 } else { 108 }
                         && half(body, 8) == self.power_expectation.unwrap_or(136) as u16,
                     "Sc TX power policy ceiling",
                 )?;
@@ -555,7 +592,22 @@ impl Wire {
                     return Ok(());
                 }
             }
-            (5, 0xf) => require(body.len() == 44, "Sc TLC ABI")?,
+            (5, 0xf) => require(
+                body.len() == if self.api89.is_some() { 28 } else { 44 },
+                "native TLC ABI",
+            )?,
+            (5, 8) if self.api89.is_some() => require(
+                body.len() == 32
+                    && body[..4] == [0; 4]
+                    && word(body, 4)
+                        == if self.phy.map_or(1, PhyModel::chains) == 3 {
+                            0x2806
+                        } else {
+                            0x1402
+                        }
+                    && body[8..].iter().all(|b| *b == 0),
+                "API89 literal RLC2 profile",
+            )?,
             (3, 0xc) => require(
                 body == [0; 4] && self.queues.iter().all(|q| !q.2),
                 "Sc peer removal before queue receipts",
@@ -578,7 +630,7 @@ impl Wire {
                 }
             }
             (1, 0xd) => require(
-                body.len() == 1948
+                body.len() == if self.api89.is_some() { 1940 } else { 1948 }
                     && (half(body, 8) == 0x802 || self.phy.is_some() && half(body, 8) == 2)
                     && body[45] == 1
                     && body[52] == self.phy.map_or(6, PhyModel::channel),
@@ -590,7 +642,9 @@ impl Wire {
             )?,
             (1, 0x9b) => require(body == [1, 0, 0, 0, 17, 0, 0, 0], "Sc coexistence defaults")?,
             (2, 1) => require(
-                body == [10, 0, 0, 0, 224, 46, 0, 0],
+                body == self
+                    .api89
+                    .map_or([10, 0, 0, 0, 224, 46, 0, 0], gen3_station_tests::Case::soc),
                 "Sc integrated SoC defaults",
             )?,
             (1, 0xc) => require(
@@ -991,7 +1045,7 @@ impl Wire {
     }
 }
 
-static HARNESS: IrqSafeSpinLock<Option<(Arc<Device>, Wire)>> = IrqSafeSpinLock::new(None);
+static HARNESS: IrqSafeSpinLock<Option<(Arc<Device>, Box<Wire>)>> = IrqSafeSpinLock::new(None);
 
 fn service() -> R<bool> {
     HARNESS
@@ -1044,6 +1098,11 @@ fn run<F: Future>(future: F, mut progress: impl FnMut() -> R<bool>) -> R<F::Outp
     }
 }
 
+struct NativeModel {
+    receive_model: ReceiveModel,
+    tx_model: Option<TxModel>,
+    api89: Option<gen3_station_tests::Case>,
+}
 struct Guard {
     device: Option<Arc<Device>>,
     policy_db: Arc<narf_wireless::reg::db::Database>,
@@ -1093,7 +1152,33 @@ impl Guard {
         receive_model: impl Into<ReceiveModel>,
         tx_model: Option<TxModel>,
     ) -> R<Self> {
-        let receive_model = receive_model.into();
+        Self::build_native_profile(
+            secured,
+            fault,
+            name,
+            sources,
+            phy,
+            NativeModel {
+                receive_model: receive_model.into(),
+                tx_model,
+                api89: None,
+            },
+        )
+    }
+    #[inline(never)]
+    fn build_native_profile(
+        secured: bool,
+        fault: Fault,
+        name: Option<&'static str>,
+        sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
+        phy: Option<PhyModel>,
+        model: NativeModel,
+    ) -> R<Self> {
+        let NativeModel {
+            receive_model,
+            tx_model,
+            api89,
+        } = model;
         let multi_receive = receive_model.enabled();
         require(
             ACTIVE.lock().is_none()
@@ -1101,20 +1186,41 @@ impl Guard {
                 && name.is_none_or(|name| narf_net::iface::lookup(name).is_none()),
             "live iwlwifi owner exists",
         )?;
-        let mut versions = super::super::firmware_parser_tests::mld_commands();
-        if let Some(phy) = phy {
-            he_tests::versions(&mut versions, phy.rates);
+        let mut versions = api89.map_or_else(
+            super::super::firmware_parser_tests::mld_commands,
+            gen3_station_tests::Case::commands,
+        );
+        if api89.is_none() {
+            if let Some(phy) = phy {
+                he_tests::versions(&mut versions, phy.rates);
+            }
+            receive_model.commands(&mut versions);
         }
-        receive_model.commands(&mut versions);
-        if let Some(tx) = &tx_model {
-            versions.extend_from_slice(&[0, 2, 0, tx.version]);
+        if api89.is_none() {
+            if let Some(tx) = &tx_model {
+                versions.extend_from_slice(&[0, 2, 0, tx.version]);
+            }
         }
-        let (mut hardware, firmware, trace) = model::station_model();
-        let mut authored = tx_amsdu_tests::image(&versions, tx_model.as_ref())?;
+        let (mut hardware, firmware, trace) = if let Some(case) = api89 {
+            let (mut hw, fw, trace) =
+                model::station_model_for_format(super::super::rx_rfh::CompletionFormat::Ax210);
+            model::api89_identity(&mut hw, case.did(), case.revision(), case.radio())?;
+            (hw, fw, trace)
+        } else {
+            model::station_model()
+        };
+        let mut authored = if let Some(case) = api89 {
+            case.image()
+        } else {
+            tx_amsdu_tests::image(&versions, tx_model.as_ref())?
+        };
         receive_model.capability(&mut authored);
         let parsed = super::super::parse_ucode(&authored)
             .map_err(|_| "Sc fixture firmware metadata parse")?;
         model::firmware_profile(&mut hardware, &parsed)?;
+        if api89.is_some() {
+            hardware.prepare_station_profile(&parsed)?;
+        }
         if let Some((firmware, pnvm)) = sources {
             let parsed = super::super::parse_ucode(&firmware.bytes)
                 .map_err(|_| "Sc source fixture parse")?;
@@ -1133,7 +1239,7 @@ impl Guard {
             FakeAp::open(NETWORK, SSID, channel, 7)
         }
         .map_err(|_| "shared Sc AP configuration")?;
-        let mut wire = Wire {
+        let mut wire = Box::new(Wire {
             firmware,
             trace,
             versions,
@@ -1175,7 +1281,9 @@ impl Guard {
             aggregates: Vec::new(),
             held_data: Vec::new(),
             scheduled: None,
-        };
+            api89,
+            mcc_caps_override: None,
+        });
         let configured = run(Device::configure(&mut hardware, OWN), || wire.service());
         let nvm = match configured {
             Ok(Ok(nvm)) => nvm,

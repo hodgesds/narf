@@ -195,6 +195,11 @@ impl Connection {
                 country: *b"US",
                 etsi_5ghz: false,
                 he_allowed: false,
+                widths: super::gen3_wire::Widths {
+                    forty: true,
+                    eighty: true,
+                    one_sixty: true,
+                },
             },
             1,
             0,
@@ -294,7 +299,14 @@ impl Connection {
             beacon.channel,
             qos.is_some(),
             |width, center| {
-                channel_power_width(domain, beacon.channel, width, center, &permissions.channels)
+                permissions.widths.permits(width)
+                    && channel_power_width(
+                        domain,
+                        beacon.channel,
+                        width,
+                        center,
+                        &permissions.channels,
+                    )
                     .is_some()
             },
         )?;
@@ -340,7 +352,7 @@ impl Connection {
         hw.ensure_platform_power().await?;
         let mut phy_command = station_api::phy(1, beacon.channel);
         phy.apply_phy(&mut phy_command, beacon.channel);
-        hw.command(1, 8, &phy_command).await?;
+        hw.station_phy(&phy_command, beacon.channel).await?;
         // PHY binding is accepted only while the link stays inactive.
         // Combining the bind with activation causes firmware to ignore
         // phy_id, leaving the link detached from its channel context.
@@ -381,7 +393,7 @@ impl Connection {
         let mut peer = station_api::peer(beacon.bssid);
         phy.apply_peer(&mut peer, 0);
         put32(&mut peer, 36, u32::from(profile.pmf));
-        hw.command(3, 0xa, &peer).await?;
+        hw.station_peer(&peer).await?;
         let management_queue = hw.allocate_tx(0, 15).await?;
         let mut data_queues = [None; 4];
         for (ac, &tid) in super::qos::TIDS.iter().enumerate() {
@@ -569,6 +581,9 @@ impl Connection {
         );
         // The response can choose a different secondary channel while
         // narrowing bandwidth. Revalidate the resulting entire span.
+        if !permissions.widths.permits(this.phy.width) {
+            return Err("association response exceeds native MCC width capability");
+        }
         let final_power = channel_power_width(
             domain,
             this.beacon.channel,
@@ -594,7 +609,7 @@ impl Connection {
         )?;
         let mut phy_command = station_api::phy(2, this.beacon.channel);
         this.phy.apply_phy(&mut phy_command, this.beacon.channel);
-        hw.command(1, 8, &phy_command).await?;
+        hw.station_phy(&phy_command, this.beacon.channel).await?;
         {
             let mut link = station_api::link(
                 2,
@@ -622,6 +637,7 @@ impl Connection {
             if let Some(he) = this.he {
                 he.apply_link(&mut link);
             }
+            hw.station_link(&mut link);
             hw.command(3, 9, &link).await?;
         }
         let mut peer = station_api::peer(this.beacon.bssid);
@@ -630,14 +646,18 @@ impl Connection {
             he.apply_sta(&mut peer);
         }
         put32(&mut peer, 36, u32::from(this.pmf_negotiated));
-        hw.command(3, 0xa, &peer).await?;
+        hw.station_peer(&peer).await?;
         let mut mac = station_api::mac(2, local, Some(response.aid));
         if let Some(he) = this.he {
             he.apply_mac(&mut mac);
         }
         hw.command(3, 8, &mac).await?;
         let mut tlc = this.rates.tlc(
-            hw.version(5, 0xf).ok_or("firmware has no TLC command")?.0,
+            if hw.is_mvm89() {
+                6
+            } else {
+                hw.version(5, 0xf).ok_or("firmware has no TLC command")?.0
+            },
             tx_chains,
         )?;
         if this.phy.mode != 0 {
@@ -647,7 +667,7 @@ impl Connection {
         if let Some(he) = this.he {
             he.apply_tlc(&mut tlc)?;
         }
-        hw.command(5, 0xf, &tlc).await?;
+        hw.station_tlc(&tlc).await?;
         // The response-refined native span/power is the handshake's owner;
         // a beacon received during M4 can update that same shared proof.
         this.regulatory = super::mld_policy::Program::new(
@@ -1905,8 +1925,11 @@ impl Connection {
             &station_api::link(2, self.local, false, self.beacon.channel, 0, 1),
         )
         .await?;
-        hw.command(1, 8, &station_api::phy(3, self.beacon.channel))
-            .await?;
+        hw.station_phy(
+            &station_api::phy(3, self.beacon.channel),
+            self.beacon.channel,
+        )
+        .await?;
         Ok(())
     }
 }
@@ -1959,14 +1982,22 @@ pub(super) async fn regulatory_channels_in_domain(
     hw: &mut Hardware,
     domain: &narf_wireless::reg::RegulatoryDomain,
 ) -> Result<super::mld_regulatory::Mcc, &'static str> {
-    if hw.version(1, 0xc8).map(|v| v.1) != Some(8) {
+    let version = hw
+        .version(1, 0xc8)
+        .map(|v| v.1)
+        .ok_or("missing regulatory response")?;
+    if !(version == 8 || hw.is_mvm89() && matches!(version, 5 | 6)) {
         return Err("unsupported regulatory response");
     }
     let mut body = [0; 28];
     put16(&mut body, 0, u16::from_be_bytes(domain.country_code));
     body[2] = 2; // MCC_SOURCE_BIOS
     let response = hw.command(1, 0xc8, &body).await?;
-    super::mld_regulatory::Mcc::parse(&response.payload)
+    if version == 8 {
+        super::mld_regulatory::Mcc::parse(&response.payload)
+    } else {
+        super::mld_regulatory::Mcc::parse_version(version, &response.payload)
+    }
 }
 
 /// Host policy is intersected with firmware permission, with the lowest

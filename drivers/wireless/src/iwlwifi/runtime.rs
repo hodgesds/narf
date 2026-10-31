@@ -643,6 +643,7 @@ pub struct Hardware {
     /// Retained firmware scan ownership. A received CHUB/MCC change must
     /// break a command wait even while its SCAN_REQ receipt is still held.
     scan_mcc_watch: bool,
+    api89: Option<(super::gen3_profile::Profile, super::gen3_profile::Abi)>,
 }
 
 impl core::fmt::Debug for Hardware {
@@ -747,6 +748,7 @@ impl Hardware {
             sources: None,
             rf_policy: None,
             scan_mcc_watch: false,
+            api89: None,
         })
     }
 
@@ -824,6 +826,9 @@ impl Hardware {
     pub fn runtime_configuration(
         &self,
     ) -> Result<super::station_api::RuntimeConfiguration, &'static str> {
+        if let Some((profile, _)) = self.api89 {
+            return Ok(self.api89_runtime(profile));
+        }
         super::station_api::runtime_configuration(
             self.device.id.device,
             self.version(1, 0x9b).ok_or("missing BT coexistence API")?.0,
@@ -885,6 +890,7 @@ impl Hardware {
     }
 
     pub async fn start(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
+        self.prepare_station_profile(parsed)?;
         use core::{
             future::{poll_fn, Future},
             pin::pin,
@@ -1050,6 +1056,7 @@ impl Hardware {
         let expected = match (self.format, alive_version) {
             (rx_rfh::CompletionFormat::Qu, Some(6)) => 144,
             (rx_rfh::CompletionFormat::Qu, _) => return Err("unsupported MVM ALIVE version"),
+            (_, Some(6)) if self.is_mvm89() => 144,
             (_, Some(7)) => 144,
             (_, Some(8)) => 152,
             _ => return Err("unsupported ALIVE notification version"),
@@ -1081,7 +1088,7 @@ impl Hardware {
                 return Err("PNVM initialization failed");
             }
         }
-        if self.format == rx_rfh::CompletionFormat::Qu {
+        if self.format == rx_rfh::CompletionFormat::Qu || self.is_mvm89() {
             // MVM unified image: allow firmware to populate NVM, then signal
             // completion. Do not send MLD's separate PHY configuration flow.
             self.command(2, 3, &2u32.to_le_bytes()).await?;
@@ -1175,7 +1182,7 @@ impl Hardware {
                 }
             }
             if packet.header.group_id == 0 && packet.header.cmd == 0xc5 {
-                if !matches!(self.version(0, 0xc5).map(|v| v.1), Some(4 | 6 | 7)) {
+                if !self.compressed_ba_supported() {
                     return Err("unsupported compressed BA notification");
                 }
                 if self.format == rx_rfh::CompletionFormat::Qu {
@@ -1244,9 +1251,7 @@ impl Hardware {
     }
 
     pub fn check_aggregation_api(&self) -> Result<(), &'static str> {
-        if self.version(5, 0x16).map(|v| v.0) != Some(2)
-            || !matches!(self.version(0, 0xc5).map(|v| v.1), Some(4 | 6 | 7))
-        {
+        if self.version(5, 0x16).map(|v| v.0) != Some(2) || !self.compressed_ba_supported() {
             return Err("firmware has no supported Block Ack API");
         }
         Ok(())
@@ -1997,3 +2002,10 @@ mod stop_tests;
 
 #[path = "runtime_smem.rs"]
 mod smem;
+
+#[path = "runtime_profile.rs"]
+mod station_profile;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "runtime_gen3_tests.rs"]
+mod gen3_tests;

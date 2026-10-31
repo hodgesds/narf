@@ -6,6 +6,9 @@ use super::boot_context::{put16, put32};
 use narf_wireless::association::he::{HeCapability, HeNegotiation, HeOperation, LocalHe};
 
 pub(super) fn native_supported(hw: &super::runtime::Hardware) -> bool {
+    if hw.is_mvm89() {
+        return rates_version(hw) == Some(2);
+    }
     [(3, 8, 3), (3, 9, 8), (3, 10, 2), (1, 8, 6), (5, 0xf, 6)]
         .into_iter()
         .all(|(group, command, version)| hw.version(group, command).map(|v| v.0) == Some(version))

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 //! MCC v8 facts and mac80211's regulatory EDCA intersection.
-use alloc::{sync::Arc, vec::Vec};
+use alloc::sync::Arc;
 use narf_wireless::reg::{RegulatoryDomain, WmmRule};
 
 #[derive(Clone)]
@@ -9,32 +9,20 @@ pub(super) struct Mcc {
     pub country: [u8; 2],
     pub etsi_5ghz: bool,
     pub he_allowed: bool,
+    pub widths: super::gen3_wire::Widths,
 }
 impl Mcc {
     pub fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
-        if bytes.len() < 24 || u32::from_le_bytes(bytes[..4].try_into().unwrap()) > 1 {
-            return Err("invalid/rejected Intel MCC v8 response");
-        }
-        let country = u16::from_le_bytes(bytes[4..6].try_into().unwrap()).to_be_bytes();
-        let count = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
-        if count == 0
-            || count > 115
-            || bytes.len() != 24 + count * 4
-            || country != *b"00" && !country.iter().all(u8::is_ascii_uppercase)
-        {
-            return Err("invalid Intel MCC v8 country/channel extent");
-        }
+        Self::parse_version(8, bytes)
+    }
+    pub fn parse_version(version: u8, bytes: &[u8]) -> Result<Self, &'static str> {
+        let native = super::gen3_wire::Mcc::parse(version, bytes)?;
         Ok(Self {
-            channels: bytes[24..]
-                .chunks_exact(4)
-                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-                .collect::<Vec<_>>()
-                .into(),
-            country,
-            etsi_5ghz: u16::from_le_bytes(bytes[14..16].try_into().unwrap()) & 1 != 0,
-            // MCC v8 carries regulatory capability v4/v5's HE prohibition.
-            // Source: iwl-nvm-parse.c::iwl_get_reg_capa.
-            he_allowed: u32::from_le_bytes(bytes[8..12].try_into().unwrap()) & (1 << 13) == 0,
+            channels: native.channels,
+            country: native.country,
+            etsi_5ghz: native.etsi_5ghz,
+            he_allowed: native.he,
+            widths: native.widths,
         })
     }
     /// Linux iwl_parse_nvm_mcc_info's GEO_WMM_ETSI_5GHZ_INFO and
@@ -84,6 +72,7 @@ impl Mcc {
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
     use narf_kernel_test::{kernel_test_in, TestResult};
     fn smoke_iwl_mld_mcc_country_geo_and_native_edca_intersection() -> TestResult {
         (|| {

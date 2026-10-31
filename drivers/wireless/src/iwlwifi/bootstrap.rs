@@ -22,6 +22,7 @@ struct State {
     interface: Option<Arc<dyn narf_wireless::WirelessNetIface>>,
     discovery: Option<narf_bus::MmioRegion>,
     gen2: Option<super::gen2_profile::Profile>,
+    gen3: Option<super::gen3_profile::Profile>,
     mvm: Option<Arc<super::mvm_device::Device>>,
 }
 pub(super) struct Owner {
@@ -42,6 +43,7 @@ impl Owner {
                 interface: None,
                 discovery: None,
                 gen2: None,
+                gen3: None,
                 mvm: None,
             }),
         }
@@ -129,6 +131,29 @@ impl Owner {
                 None,
             ));
         }
+        if matches!(
+            self.chip.mac,
+            super::MacFamily::TyA0
+                | super::MacFamily::SoA0
+                | super::MacFamily::MaA0
+                | super::MacFamily::MaB0
+        ) {
+            let region = match state.discovery {
+                Some(region) => region,
+                None => {
+                    let region = super::mmio::map(&self.device, &self.cap)?;
+                    state.discovery = Some(region);
+                    region
+                }
+            };
+            let mut io = super::IwlMmioImpl::new(region, self.cap);
+            let profile = super::gen3_profile::Profile::read(self.device.id.device, &mut io)?;
+            state.gen3 = Some(profile);
+            return Ok((
+                alloc::vec![alloc::format!("iwlwifi/{}-89.ucode", profile.prefix)],
+                None,
+            ));
+        }
         if self.chip.mac != super::MacFamily::ScA0 {
             return Ok((super::firmware_filename_ladder(&self.chip), None));
         }
@@ -179,6 +204,14 @@ impl Owner {
         let _ = narf_wireless::reg::db::ensure_domain();
         if !input.firmware.current() || input.pnvm.as_ref().is_some_and(|asset| !asset.current()) {
             return Err("Intel selected asset authority revoked before attempt");
+        }
+        if let Some(profile) = state.gen3 {
+            profile.validate(&parsed)?;
+            let mut io = super::IwlMmioImpl::new(
+                state.discovery.ok_or("API89 discovery mapping absent")?,
+                self.cap,
+            );
+            profile.check(self.device.id.device, &mut io)?;
         }
         if let Some(identity) = identity {
             let mut io = super::IwlMmioImpl::new(

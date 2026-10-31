@@ -78,7 +78,11 @@ impl Hardware {
         if input.ppag_approved {
             let ppag = input.ppag.clone().unwrap_or_else(Ppag::disabled);
             let version = self.version(4, 7).ok_or("missing MLD PPAG command ABI")?.0;
-            let maximum = self.bios_revision(ppag.source(), 4, 7, if version == 7 { 4 } else { 5 });
+            let maximum = if version == 5 {
+                u8::MAX
+            } else {
+                self.bios_revision(ppag.source(), 4, 7, if version == 7 { 4 } else { 5 })
+            };
             if let Some(body) = ppag.command(version, maximum)? {
                 commands.push((4, 7, body));
             }

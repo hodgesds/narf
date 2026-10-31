@@ -35,7 +35,8 @@ fn wifi(value: &Value, size: usize) -> Result<&[Value], &'static str> {
 }
 fn bands(version: u8) -> Result<usize, &'static str> {
     match version {
-        10 => Ok(11),
+        5 => Ok(5),
+        8 | 10 => Ok(11),
         11 => Ok(12),
         _ => Err("unsupported Intel MLD REDUCE_TX_POWER version"),
     }
@@ -104,18 +105,26 @@ impl Sar {
             // synthesize an all-zero replacement or an enabling default.
             return Ok(None);
         }
-        let mut body = alloc::vec![0; if version == 10 {108} else {116}];
+        let (length, first, flags) = match version {
+            5 => (44, 16, None),
+            8 => (120, 16, Some(112)),
+            10 => (108, 10, Some(104)),
+            11 => (116, 10, Some(112)),
+            _ => return Err("unsupported native SAR profile"),
+        };
+        let mut body = alloc::vec![0; length];
         body[0] = 2; // IWL_TX_POWER_MODE_SET_CHAINS
         for (chain, values) in self.chains[..2].iter().enumerate() {
             for (band, value) in values[..bands].iter().enumerate() {
-                let at = 10 + 2 * (chain * bands + band);
+                let at = first + 2 * (chain * bands + band);
                 body[at..at + 2].copy_from_slice(&u16::from(*value).to_le_bytes());
             }
         }
         // Linux currently fills IWL_NUM_CHAIN_TABLES=1. CDB remains zero,
         // even when the BIOS supplied the extra chains in its newer format.
-        let end = body.len();
-        body[end - 4..].copy_from_slice(&self.flags.to_le_bytes());
+        if let Some(at) = flags {
+            body[at..at + 4].copy_from_slice(&self.flags.to_le_bytes());
+        }
         Ok(Some(body))
     }
 }
@@ -308,6 +317,14 @@ impl Ppag {
         version: u8,
         supported_bios: u8,
     ) -> Result<Option<Vec<u8>>, &'static str> {
+        if version == 5 {
+            let mut body = alloc::vec![0;28];
+            body[..4].copy_from_slice(&(self.flags & 0x27).to_le_bytes());
+            for (chain, gain) in self.gain.iter().enumerate() {
+                body[4 + chain * 11..15 + chain * 11].copy_from_slice(&gain[..11]);
+            }
+            return Ok(Some(body));
+        }
         let bands = match version {
             7 => 11,
             8 => 12,

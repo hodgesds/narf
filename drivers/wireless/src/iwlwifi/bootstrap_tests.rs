@@ -560,3 +560,104 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/bootstrap",
     smoke_iwlwifi_drive_scheduled_retries_and_terminates
 );
+
+fn smoke_api89_native_discovery_selects_exact_mac_rf_cdb_and_linux_pci_profile() -> TestResult {
+    for (did, rev, rf, name) in [
+        (
+            0x2725,
+            0x42f,
+            0x10d200,
+            "iwlwifi/iwlwifi-ty-a0-gf-a0-89.ucode",
+        ),
+        (
+            0x7af0,
+            0x37a,
+            0x10d000,
+            "iwlwifi/iwlwifi-so-a0-gf-a0-89.ucode",
+        ),
+        (
+            0x54f0,
+            0x430,
+            0x10d000,
+            "iwlwifi/iwlwifi-so-a0-gf-a0-89.ucode",
+        ),
+        (
+            0x51f1,
+            0x370,
+            0x1010d000,
+            "iwlwifi/iwlwifi-so-a0-gf4-a0-89.ucode",
+        ),
+        (
+            0x7e40,
+            0x441,
+            0x10d000,
+            "iwlwifi/iwlwifi-ma-b0-gf-a0-89.ucode",
+        ),
+    ] {
+        let mut startup = owner();
+        startup.device.id.device = did;
+        startup.chip = super::super::chip_config_for_pci_id(0x8086, did).unwrap();
+        startup.parked();
+        let mut registers = [0; 0xa0 / 4];
+        registers[0x28 / 4] = rev;
+        registers[0x9c / 4] = rf;
+        discovery(&startup, &mut registers);
+        let selected = ready(async {
+            let mut state = startup.state.lock().await;
+            startup.candidates(&mut state)
+        })
+        .unwrap();
+        if !matches!(selected,Ok((names,None)) if names==[name])
+            || startup.phase() != ProvisionState::Parked
+        {
+            return TestResult::Fail(
+                "API89 native identity selected filename/API fallback or consumed startup",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/api89",
+    smoke_api89_native_discovery_selects_exact_mac_rf_cdb_and_linux_pci_profile
+);
+
+fn smoke_api89_changed_unsupported_or_revoked_native_identity_has_no_fallback() -> TestResult {
+    for fault in 0..4 {
+        let mut startup = owner();
+        startup.device.id.device = 0x51f0;
+        startup.chip = super::super::chip_config_for_pci_id(0x8086, 0x51f0).unwrap();
+        startup.parked();
+        let mut registers = [0; 0xa0 / 4];
+        registers[0x28 / 4] = 0x370;
+        registers[0x9c / 4] = 0x10d000;
+        discovery(&startup, &mut registers);
+        match fault {
+            0 => registers[0x28 / 4] = 0x480,
+            1 => registers[0x9c / 4] = 0x112200,
+            2 => startup.cap.revoke(),
+            _ => ready(async {
+                startup.state.lock().await.discovery.as_mut().unwrap().len = 0x9c;
+            })
+            .unwrap(),
+        }
+        let selected = ready(async {
+            let mut state = startup.state.lock().await;
+            startup.candidates(&mut state)
+        })
+        .unwrap();
+        if selected.is_ok()
+            || startup.phase() != ProvisionState::Parked
+            || ready(async { startup.state.lock().await.interface.is_some() }).unwrap()
+        {
+            return TestResult::Fail(
+                "API89 invalid identity borrowed another RF source or native owner",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/api89",
+    smoke_api89_changed_unsupported_or_revoked_native_identity_has_no_fallback
+);

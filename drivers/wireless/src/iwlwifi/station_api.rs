@@ -183,6 +183,9 @@ pub fn runtime_configuration(
 /// REDUCE_TX_POWER_CMD v10/v11, link 0. Firmware takes eighth-dBm
 /// units and applies this ceiling in addition to its regulatory limits.
 pub fn tx_power(version: u8, dbm: i8) -> Result<alloc::vec::Vec<u8>, &'static str> {
+    if matches!(version, 5 | 8) {
+        return super::gen3_wire::power(version, dbm, false);
+    }
     let length = match version {
         10 => 108,
         11 => 116,

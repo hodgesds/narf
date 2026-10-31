@@ -76,6 +76,10 @@ pub mod frame_api;
 pub mod fw_loader;
 mod gen2_prepare;
 mod gen2_profile;
+#[cfg(any(test, feature = "kernel-test"))]
+mod gen3_fixture;
+mod gen3_profile;
+mod gen3_wire;
 pub mod handshake;
 pub mod ht_vht;
 pub mod iwl_msix;
@@ -979,7 +983,7 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
         // AX211 family. Linux 7.3 `pcie/drv.c` "So devices" binds 0x51F0
         // and 0x7AF0/0x7F70 (`iwl_so_mac_cfg`), 0x51F1/0x7A70
         // (`iwl_so_long_latency_imr_mac_cfg`) to the same So MAC.
-        0x51f0 | 0x51f1 | 0x7a70 | 0x7af0 | 0x7f70 => ChipConfig {
+        0x51f0 | 0x51f1 | 0x54f0 | 0x7a70 | 0x7af0 | 0x7f70 => ChipConfig {
             vid,
             did,
             display_name: "AX211 (so-a0)",
@@ -990,17 +994,6 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
             api_min: 89,
             api_prefix: "",
         },
-        0x54f0 => ChipConfig {
-            vid,
-            did,
-            display_name: "AX211 (ma-a0)",
-            generation: Generation::Gen3,
-            mac: MacFamily::MaA0,
-            rf_candidates: RF_GF_OR_GF4,
-            api_max: 100,
-            api_min: 100,
-            api_prefix: "",
-        },
         // "Ma devices": 0x2729 and 0x7E40 bind `iwl_ma_mac_cfg`.
         0x2729 | 0x7e40 => ChipConfig {
             vid,
@@ -1009,8 +1002,8 @@ pub fn chip_config_for_pci_id(vid: u16, did: u16) -> Option<ChipConfig> {
             generation: Generation::Gen3,
             mac: MacFamily::MaB0,
             rf_candidates: RF_GF_OR_GF4,
-            api_max: 100,
-            api_min: 100,
+            api_max: 89,
+            api_min: 89,
             api_prefix: "",
         },
         // BE200 — Wi-Fi 7 Bz MAC + GF / GF4 / FM RF. "Bz devices" also

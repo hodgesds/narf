@@ -174,6 +174,7 @@ impl Program {
     fn check(&self, domain: &RegulatoryDomain) -> Result<(), &'static str> {
         self.validity.check()?;
         if domain.country_code != self.country
+            || !self.firmware.widths.permits(self.width)
             || self.he && !self.firmware.he_allowed
             || self.country != *b"00" && !self.country.iter().all(u8::is_ascii_uppercase)
             || super::connection::channel_power_width(
@@ -249,6 +250,11 @@ mod tests {
                     country: *b"US",
                     etsi_5ghz: false,
                     he_allowed: false,
+                    widths: super::super::gen3_wire::Widths {
+                        forty: true,
+                        eighty: true,
+                        one_sixty: true,
+                    },
                 },
                 36,
                 2,

@@ -42,7 +42,7 @@ impl Hardware {
         &mut self,
     ) -> Result<Option<super::super::Gen2SharedMemory>, &'static str> {
         self.source_fence()?.invoke(|| Ok(()))?;
-        if self.format != rx_rfh::CompletionFormat::Bz {
+        if self.format != rx_rfh::CompletionFormat::Bz && !self.is_mvm89() {
             self.shared_memory.phase = Phase::Unsupported;
             return Ok(None);
         }

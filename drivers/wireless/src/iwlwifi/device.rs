@@ -224,6 +224,9 @@ impl State {
 
 impl Device {
     fn validate_station_profile(hardware: &Hardware) -> Result<(), &'static str> {
+        if hardware.is_mvm89() {
+            return Ok(());
+        }
         for (group, command, version) in [
             (3, 8, 3),
             (3, 9, 8),
@@ -244,6 +247,7 @@ impl Device {
         parsed: &super::ParsedUcode<'_>,
         firmware: &[u8],
     ) -> Result<Arc<Self>, &'static str> {
+        hardware.prepare_station_profile(parsed)?;
         Self::validate_station_profile(&hardware)?;
         let mac = hardware.start(parsed).await?;
         let nvm = Self::configure(&mut hardware, mac).await?;
@@ -314,6 +318,7 @@ impl Device {
             .await?;
         hardware.command(1, 0x9b, &runtime.coexistence).await?;
         hardware.command(2, 1, &runtime.soc).await?;
+        hardware.station_receive_chains(nvm.rx_chains).await?;
         hardware
             .command(1, 0xc, &station_api::scan_config(&nvm))
             .await?;

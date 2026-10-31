@@ -21,7 +21,7 @@ pub(super) fn image(versions: &[u8], profile: Option<&TxModel>) -> R<Vec<u8>> {
     }
     Ok(bytes)
 }
-fn profile(extended: bool, cdb: bool) -> TxModel {
+pub(super) fn profile(extended: bool, cdb: bool) -> TxModel {
     // Literal SHARED_MEM_ALLOC_API v4. Addresses remain opaque zeros;
     // only actual reported FIFO sizes bound this software firmware model.
     let mut memory = vec![0; 260];
@@ -51,7 +51,7 @@ fn phy(he: bool) -> PhyModel {
 fn setup(secured: bool, phy: PhyModel, profile: TxModel, fault: Fault) -> R<Guard> {
     Guard::build_features(secured, fault, None, None, Some(phy), false, Some(profile))
 }
-fn ready(guard: &Guard, phy: PhyModel, secured: bool) -> R {
+pub(super) fn ready(guard: &Guard, phy: PhyModel, secured: bool) -> R {
     let mut scan = scan_request();
     scan.channels = vec![u32::from(phy.channel())];
     scan.frequencies_mhz =
@@ -96,7 +96,7 @@ fn report(size: u32, tids: u32) {
         .firmware
         .inject(0xf7, 5, 0x8000, &body);
 }
-fn enable(guard: &Guard) -> R {
+pub(super) fn enable(guard: &Guard) -> R {
     report(3839, 255);
     until(|| {
         guard
@@ -106,7 +106,7 @@ fn enable(guard: &Guard) -> R {
             .is_some_and(|state| state.connection.as_ref().is_some_and(|c| c.can_batch(1)))
     })
 }
-fn packet(marker: u8, length: usize, bk: bool) -> Vec<u8> {
+pub(super) fn packet(marker: u8, length: usize, bk: bool) -> Vec<u8> {
     let mut frame = udp_ipv4(
         AP,
         OWN,
@@ -122,7 +122,7 @@ fn packet(marker: u8, length: usize, bk: bool) -> Vec<u8> {
     }
     frame
 }
-fn pair(guard: &Guard, first: &[u8], second: &[u8]) -> R {
+pub(super) fn pair(guard: &Guard, first: &[u8], second: &[u8]) -> R {
     let state = guard
         .device()
         .state

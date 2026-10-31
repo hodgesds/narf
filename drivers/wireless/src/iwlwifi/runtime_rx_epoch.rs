@@ -173,11 +173,18 @@ impl Hardware {
     ) -> Result<Vec<Packet>, &'static str> {
         let mut body = vec![0; if baid.is_some() { 24 } else { 20 }];
         let queues = self.receive_queue_count();
-        let mut prefix = super::super::rx_multi::Prefix::new(queues, cookie, baid)?;
+        let mut prefix = if self.is_mvm89() {
+            super::super::rx_multi::Prefix::gen2(queues, cookie, baid)?
+        } else {
+            super::super::rx_multi::Prefix::new(queues, cookie, baid)?
+        };
         boot_context::put32(&mut body, 4, u32::from(prefix.mask()));
         let count = if baid.is_some() { 12 } else { 8 };
         boot_context::put32(&mut body, 8, count);
         body[12] = u8::from(baid.is_some()); // EMPTY0 / DEL_BA1
+        if self.is_mvm89() {
+            boot_context::put16(&mut body, 14, 1);
+        }
         boot_context::put32(&mut body, 16, cookie);
         if let Some(id) = baid {
             boot_context::put32(&mut body, 20, u32::from(id));

@@ -357,6 +357,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         sources: None,
         rf_policy: None,
         scan_mcc_watch: false,
+        api89: None,
     };
     (hardware, firmware)
 }
@@ -554,4 +555,28 @@ mod trace_tests {
         "drivers/wireless/iwlwifi/runtime",
         smoke_iwl_trace_reads_actual_published_dma_slot_and_body
     );
+}
+
+/// RAM identity supplied by the native fixture's device side. Production
+/// profile admission still reads these actual owned MMIO registers and its
+/// retained executable; this creates no physical PCI or calibration grant.
+pub(in crate::iwlwifi) fn api89_identity(
+    hardware: &mut Hardware,
+    did: u16,
+    revision: u32,
+    radio: u32,
+) -> Result<(), &'static str> {
+    if hardware.device.id.vendor != 0xffff
+        || hardware.armed
+        || !hardware.resources.data.is_empty()
+        || hardware.api89.is_some()
+    {
+        return Err("API89 model identity on live/native owner");
+    }
+    hardware.device.id.device = did;
+    hardware
+        .mmio
+        .write(super::super::regs::CSR_HW_REV, revision);
+    hardware.mmio.write(0x9c, radio);
+    Ok(())
 }
