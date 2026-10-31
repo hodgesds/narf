@@ -1408,6 +1408,8 @@ struct Session<B: Backend> {
     scanning: bool,
     ap_owner: Option<ap::Owner>,
     p2p_owner: Option<p2p::Owner>,
+    /// PHY-global CNM sequence survives independent wdev stop/recreation.
+    p2p_next: u8,
     // Keep retired AP temporal-key evidence across verified role resets.
     ap_keys: ap_crypto::Keys,
     wow_config: Option<narf_wireless::WowlanConfig>,
@@ -1451,6 +1453,7 @@ impl<B: Backend> Session<B> {
             scanning: false,
             ap_owner: None,
             p2p_owner: None,
+            p2p_next: 1,
             ap_keys: ap_crypto::Keys::default(),
             wow_config: None,
             wow_nlo: None,

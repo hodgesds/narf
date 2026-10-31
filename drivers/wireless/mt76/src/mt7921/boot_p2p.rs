@@ -143,6 +143,7 @@ pub(super) async fn run_session<B: Backend>(
         .request_current(&authority)
         .map_err(|_| Error::Authority)?;
     concrete.work_started();
+    let vif = concrete.native_vif().map_err(|_| Error::Authority)?;
     drop(concrete);
     let start = matches!(operation, Request::Start);
     let stop = matches!(operation, Request::Stop);
@@ -156,11 +157,11 @@ pub(super) async fn run_session<B: Backend>(
                         .p2p_owner
                         .as_ref()
                         .is_some_and(|owner| owner.activated)
-                        && matches!(session.state, State::P2pDevice(_))
+                        && session.p2p_ready()
                     {
                         session.check_p2p_request(&authority)
                     } else {
-                        session.start_p2p_device(authority.clone()).await
+                        session.start_p2p_device_on(authority.clone(), vif).await
                     }
                 }
                 Request::Stop => {
@@ -243,7 +244,17 @@ pub(super) async fn run_session<B: Backend>(
         Ok(())
     })();
     if let Err(error) = publication {
-        session.recover(expected_mac).await?;
+        // Native receipt ownership is already known at this point. A lost
+        // publication source must retire its own independent device/finite
+        // ROC, rather than resetting an unrelated live home association.
+        let independent = session.p2p_owner.as_ref().is_some_and(|owner| {
+            owner.vif.index() != 0 && owner.ready && session.check_p2p_home().is_ok()
+        });
+        if independent {
+            session.stop_p2p_device_owned().await?;
+        } else if session.p2p_owner.is_some() || session.check_p2p_home().is_err() {
+            session.recover(expected_mac).await?;
+        }
         if let Some(iface) = iface.upgrade() {
             iface.commit_stopped();
         }

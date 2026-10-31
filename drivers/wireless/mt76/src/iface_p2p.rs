@@ -14,6 +14,7 @@ pub(crate) struct P2pDeviceIface {
     parent: Weak<Mt76Iface>,
     physical: u64,
     parent_epoch: u64,
+    allocation: crate::mt7921::vif_slots::Allocation,
     cnm: bool,
     registration: IrqSafeSpinLock<Option<Registration>>,
     identity: IrqSafeSpinLock<Option<RadioInterfaceIdentity>>,
@@ -25,6 +26,21 @@ pub(crate) struct P2pDeviceIface {
 struct Registration {
     net: Cap<narf_net::NetIface, Write>,
     wdev: narf_wireless::registry::ControlWdev,
+}
+struct PendingSlot<'a> {
+    parent: &'a Mt76Iface,
+    allocation: crate::mt7921::vif_slots::Allocation,
+    committed: bool,
+}
+impl Drop for PendingSlot<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.parent
+                .vif_slots
+                .lock()
+                .release_retired(self.allocation);
+        }
+    }
 }
 impl Mt76Iface {
     /// Metadata publication only. The caller supplies the current source
@@ -44,7 +60,12 @@ impl Mt76Iface {
         if name.is_empty() || name.len() > 15 || name.as_bytes().contains(&0) {
             return Err(WirelessError::InvalidArgs);
         }
-        let mac = mac.unwrap_or_else(|| self.mac());
+        let mac = mac.unwrap_or_else(|| {
+            crate::mt7921::vif_slots::mac_candidates(self.mac())
+                .into_iter()
+                .find(|candidate| *candidate != self.mac())
+                .unwrap_or_else(|| self.mac())
+        });
         if mac == [0; 6] || mac[0] & 1 != 0 {
             return Err(WirelessError::InvalidArgs);
         }
@@ -62,6 +83,12 @@ impl Mt76Iface {
         {
             return Err(WirelessError::Denied);
         }
+        let allocation = self.vif_slots.lock().reserve().map_err(map_error)?;
+        let mut pending = PendingSlot {
+            parent: self,
+            allocation,
+            committed: false,
+        };
         let actual = Arc::new(P2pDeviceIface {
             name: name.into(),
             namespace,
@@ -69,6 +96,7 @@ impl Mt76Iface {
             parent: Arc::downgrade(self),
             physical: self.wiphy_id(),
             parent_epoch: metadata.ownership_epoch,
+            allocation,
             cnm: self.p2p_profile.is_some_and(|profile| profile.cnm()),
             registration: IrqSafeSpinLock::new(None),
             identity: IrqSafeSpinLock::new(None),
@@ -110,6 +138,7 @@ impl Mt76Iface {
             actual.withdraw();
             return Err(error);
         }
+        pending.committed = true;
         Ok(actual)
     }
     /// Concrete owner API for explicit control-device creation. The native
@@ -137,8 +166,15 @@ impl Mt76Iface {
             .map(|child| child as Arc<dyn WirelessNetIface>)
     }
     pub(super) fn withdraw_p2p_metadata(&self) {
-        if let Some(child) = self.p2p_device.lock().take() {
+        let child = { self.p2p_device.lock().take() };
+        if let Some(child) = child {
             child.withdraw();
+        }
+    }
+    pub(super) fn commit_p2p_stopped(&self) {
+        let child = { self.p2p_device.lock().clone() };
+        if let Some(child) = child {
+            child.commit_stopped();
         }
     }
     pub(super) async fn poll_p2p(&self) -> Result<bool, WirelessError> {
@@ -165,7 +201,9 @@ impl Mt76Iface {
         crate::mt7921::firmware_transport::boot_p2p::maintenance(Arc::downgrade(&child))
             .await
             .map_err(map_error)?;
-        Ok(true)
+        // The control-only child has its own BSS. Its completed maintenance
+        // must not monopolize the parent's station/AP packet service.
+        Ok(false)
     }
 }
 impl P2pDeviceIface {
@@ -194,29 +232,41 @@ impl P2pDeviceIface {
     }
     pub(crate) fn current(&self) -> Result<Arc<Mt76Iface>, WirelessError> {
         let parent = self.parent.upgrade().ok_or(WirelessError::Denied)?;
-        if parent.sleeping.load(Ordering::Acquire)
-            || narf_net::iface::lookup(parent.name()).is_none_or(|metadata| {
-                metadata.ownership_epoch != self.parent_epoch
-                    || metadata.net_ns_id != self.namespace
-            })
-            || !ACTIVE
+        // Copy local observations before entering any other registry or
+        // interface callback. Retirement takes these same locks separately;
+        // keeping one across current_for() would invert its lock order.
+        let slot_current = { parent.vif_slots.lock().current(self.allocation) };
+        let registered = { self.registration.lock().as_ref().map(|r| r.wdev) };
+        let physical_current = {
+            ACTIVE
                 .lock()
                 .as_ref()
                 .is_some_and(|active| Arc::ptr_eq(active, &parent))
-            || !parent
+        };
+        let child_current = {
+            parent
                 .p2p_device
                 .lock()
                 .as_ref()
                 .is_some_and(|child| core::ptr::eq(child.as_ref(), self))
-            || !self
-                .registration
-                .lock()
-                .as_ref()
-                .is_some_and(|registered| registered.wdev.current_for(self))
+        };
+        if parent.sleeping.load(Ordering::Acquire)
+            || !slot_current
+            || narf_net::iface::lookup(parent.name()).is_none_or(|metadata| {
+                metadata.ownership_epoch != self.parent_epoch
+                    || metadata.net_ns_id != self.namespace
+            })
+            || !physical_current
+            || !child_current
+            || !registered.is_some_and(|wdev| wdev.current_for(self))
         {
             return Err(WirelessError::Denied);
         }
         Ok(parent)
+    }
+    pub(crate) fn native_vif(&self) -> Result<crate::mt7921::vif_slots::Vif, WirelessError> {
+        self.current()?;
+        Ok(self.allocation.vif())
     }
     pub(crate) fn request_current(
         &self,
@@ -256,18 +306,18 @@ impl P2pDeviceIface {
     /// Software-only exact-registration cleanup; native ownership must have
     /// been retired first. A failed native reset never reaches this function.
     fn withdraw(&self) {
-        if let Some(registration) = self.registration.lock().take() {
+        let registration = { self.registration.lock().take() };
+        if let Some(registration) = registration {
             narf_wireless::registry::unregister_control(registration.wdev, self);
             narf_net::registry().unregister_for_handle(&registration.net);
+            if let Some(parent) = self.parent.upgrade() {
+                parent.vif_slots.lock().release_retired(self.allocation);
+            }
         }
     }
     fn started(&self) -> bool {
-        self.current().is_ok()
-            && self
-                .identity
-                .lock()
-                .as_ref()
-                .is_some_and(|identity| identity.check_for(self).is_ok())
+        let identity = { self.identity.lock().clone() };
+        self.current().is_ok() && identity.is_some_and(|identity| identity.check_for(self).is_ok())
     }
     pub(crate) fn started_current(&self) -> bool {
         self.started()

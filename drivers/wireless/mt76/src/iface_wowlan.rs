@@ -138,6 +138,9 @@ impl Mt76Iface {
             self.sleeping.store(false, Ordering::Release);
         }
         suspend_result(result)?;
+        // Both ordinary and WoW suspend have retired any independent
+        // control BSS/finite ROC before the actual low-power handoff.
+        self.commit_p2p_stopped();
         // Non-WoW AP suspend has stopped the actual autonomous BSS and
         // completed its verified reset before the PCI low-power handoff.
         if self.ap_owned.load(Ordering::Acquire) {

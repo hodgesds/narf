@@ -31,14 +31,24 @@ impl<B: Backend> Session<B> {
             _ => None,
         };
         self.p2p_owner.as_mut().ok_or(Error::Busy)?.pending = Some(authority.clone());
+        let vif = self.p2p_owner.as_ref().ok_or(Error::Busy)?.vif;
+        let home = self.state;
         let result = async {
-            // Stop sends the exact owned abort, disables the actual BSS/DEV
-            // and verifies WFSYS reset plus native DMA retirement. An abort
-            // ACK/progress record alone cannot make this return success.
-            self.stop_p2p_device_owned().await?;
-            authority.current().map_err(|_| Error::Authority)?;
-            self.start_p2p_device(authority.clone()).await?;
-            self.commit_p2p_device(&authority)?;
+            if vif.index() != 0 {
+                self.check_p2p_home()?;
+                self.stage(Stage::P2pRocExpire);
+                self.retire_p2p_roc_owned().await?;
+                self.p2p_owner.as_mut().ok_or(Error::Busy)?.pending = None;
+                self.state = home;
+            } else {
+                // Stop sends the exact owned abort, disables the actual BSS/DEV
+                // and verifies WFSYS reset plus native DMA retirement. An abort
+                // ACK/progress record alone cannot make this return success.
+                self.stop_p2p_device_owned().await?;
+                authority.current().map_err(|_| Error::Authority)?;
+                self.start_p2p_device_on(authority.clone(), vif).await?;
+                self.commit_p2p_device(&authority)?;
+            }
             if let Some((source, receipt)) = notify {
                 if source.current().is_ok() {
                     source

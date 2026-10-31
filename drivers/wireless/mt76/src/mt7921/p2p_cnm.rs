@@ -37,6 +37,12 @@ impl Default for Cnm {
     }
 }
 impl Cnm {
+    pub(super) fn from_next(next: u8) -> Self {
+        Self { next, owner: None }
+    }
+    pub(super) fn next_token(&self) -> u8 {
+        self.next
+    }
     pub fn pending(&self) -> bool {
         self.owner.is_some()
     }

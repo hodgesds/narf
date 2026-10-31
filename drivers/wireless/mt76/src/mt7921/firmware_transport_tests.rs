@@ -209,6 +209,7 @@ struct Model {
     phy_capability: Option<[u8; 12]>,
     ap_hold: Option<Arc<ap_runtime_tests::Hold>>,
     p2p_hold: Option<Arc<ap_runtime_tests::Hold>>,
+    packet_hold: Option<Arc<ap_runtime_tests::Hold>>,
     roc: Option<Arc<RocModel>>,
     ap_timing_pause: Option<u64>,
     ap_timing: Option<(u32, u32, u32, u16)>,
@@ -258,6 +259,7 @@ struct Model {
     notifications: usize,
     revoke_on_submit: bool,
     wtbl_stall: bool,
+    wtbl_clears: Vec<u8>,
     clc_result: bool,
     packets: VecDeque<Vec<u8>>,
     scan_stall: bool,
@@ -343,6 +345,7 @@ impl Model {
             phy_capability: None,
             ap_hold: None,
             p2p_hold: None,
+            packet_hold: None,
             roc: None,
             ap_timing_pause: None,
             ap_timing: None,
@@ -395,6 +398,7 @@ impl Model {
             notifications: 0,
             revoke_on_submit: false,
             wtbl_stall: false,
+            wtbl_clears: Vec::new(),
             clc_result: false,
             packets: VecDeque::new(),
             scan_stall: false,
@@ -950,7 +954,9 @@ impl Backend for Model {
         if index >= 20 {
             return Err(Error::Bounds);
         }
-        self.check()
+        self.check()?;
+        self.wtbl_clears.push(index);
+        Ok(())
     }
     fn wtbl_idle(&mut self) -> Result<bool, Error> {
         Ok(!self.wtbl_stall)
@@ -1325,6 +1331,12 @@ impl Backend for Model {
         &mut self,
     ) -> Result<Option<crate::mt7921::packet_tx::Completion>, Error> {
         self.check()?;
+        if let Some(hold) = &self.packet_hold {
+            hold.seen.store(true, Ordering::Release);
+            if !hold.release.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+        }
         if self
             .management_stall_after
             .is_some_and(|after| self.frames.len() >= after)

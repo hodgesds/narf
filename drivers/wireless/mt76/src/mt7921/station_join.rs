@@ -663,6 +663,7 @@ impl<B: Backend> Session<B> {
 
     pub(super) fn keys_pending(&self) -> bool {
         !self.peer_lost
+            && !self.p2p_rf_busy()
             && matches!(self.state, State::Associated { .. })
             && self.data_pending.is_empty()
             && (self.wmm_pending.is_some()
@@ -707,6 +708,9 @@ impl<B: Backend> Session<B> {
     /// The supplicant only reports a key when it differs from the installed
     /// one, so retransmissions cannot reset packet-number replay windows.
     pub(super) async fn service_keys(&mut self) -> Result<(), Error> {
+        if self.p2p_rf_busy() {
+            return Ok(());
+        }
         let associated = self.state;
         self.service_keys_in(associated, associated).await
     }
@@ -1540,7 +1544,7 @@ impl<B: Backend> Session<B> {
             return Err(Error::DeviceGone);
         }
         let epoch = self.receive_epoch;
-        let ready = self.poll_data_tx()?;
+        let ready = !self.p2p_rf_busy() && self.poll_data_tx()?;
         let transmitted = if let Some(frame) = tx.filter(|_| ready) {
             self.start_ethernet(frame)?;
             true
@@ -1649,6 +1653,9 @@ impl<B: Backend> Session<B> {
         permission: crate::mt7921::association::TxPermission,
         extra_ies: &[u8],
     ) -> Result<u16, Error> {
+        if self.p2p_rf_busy() {
+            return Err(Error::Busy);
+        }
         let (info, setup) = match self.state {
             State::RadioReady(info) => (info, true),
             State::ScanReady(info) => (info, false),
@@ -2104,6 +2111,9 @@ impl<B: Backend> Session<B> {
     }
 
     pub(super) async fn disassociate_station(&mut self) -> Result<(), Error> {
+        if self.p2p_rf_busy() {
+            return Err(Error::Busy);
+        }
         let (info, peer) = match self.state {
             State::Associated { info, peer, .. } => (info, peer),
             State::RadioReady(_) | State::ScanReady(_) | State::Suspended(_) | State::Stopped => {
@@ -2226,6 +2236,11 @@ impl<B: Backend> Session<B> {
     }
 
     pub(super) fn check_station_tx(&mut self) -> Result<(), Error> {
+        // A retained off-channel owner pauses home TX. It does not revoke
+        // the association, keys, BA state or controlled-port grant.
+        if self.p2p_rf_busy() {
+            return Err(Error::Busy);
+        }
         let result = self
             .station_permission
             .ok_or(Error::Authority)

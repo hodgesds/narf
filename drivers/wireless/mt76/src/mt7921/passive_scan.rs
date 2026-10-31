@@ -4,6 +4,13 @@
 use super::{station::Command, *};
 #[path = "associated_scan.rs"]
 mod associated;
+pub(super) fn occupied_domain(
+    info: RadioInfo,
+    permission: crate::mt7921::association::TxPermission,
+    six: bool,
+) -> Result<Vec<u8>, Error> {
+    associated::associated_domain(info, permission, None, &[], six)
+}
 #[path = "wowlan_nlo_station.rs"]
 pub(super) mod nlo;
 
@@ -562,6 +569,9 @@ impl<B: Backend> Session<B> {
         mut policy: impl FnMut() -> Result<narf_wireless::reg::RegulatoryDomain, Error>,
     ) -> Result<ScanReport, Error> {
         validate_scan_options(options)?;
+        if self.p2p_rf_busy() {
+            return Err(Error::Busy);
+        }
         let sequence = self.scan_seq % 127 + 1;
         let mut request = if ssids.is_empty() {
             if !options.extra_ies.is_empty() {

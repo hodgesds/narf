@@ -54,11 +54,18 @@ impl<B: Backend> Session<B> {
                 .map(Arc::new)
             })
             .transpose()?;
-        self.check_wow_tx()?;
+        // Validate the actual home/offload policy before changing an
+        // independent control BSS. A live ROC is scheduler ownership, not
+        // policy revocation; owned cleanup below retires it before TX work.
+        self.check_wow_policy()?;
         // Real endpoint caps, _PRW, strict firmware profile and installed SCI
         // are checked before radio commands. This creates no fake platform
         // grant and does not yet arm PME/GPE or put the endpoint in D3hot.
         self.backend.prepare_wake_route(target)?;
+        if self.p2p_owner.is_some() {
+            self.stop_p2p_device_owned().await?;
+        }
+        self.check_wow_tx()?;
         self.wow_config = Some(config.clone());
         self.renew_receive_epoch()?;
         self.stage(Stage::WowSuspend);
@@ -199,6 +206,12 @@ impl<B: Backend> Session<B> {
     fn check_wow_tx(&mut self) -> Result<(), Error> {
         if self.station_permission.is_some() {
             self.check_station_tx()?;
+        }
+        self.check_wow_policy()
+    }
+    fn check_wow_policy(&self) -> Result<(), Error> {
+        if let Some(permission) = self.station_permission {
+            self.backend.check_tx_permission(permission)?;
         } else if self.wow_nlo.is_none() {
             return Err(Error::Authority);
         }

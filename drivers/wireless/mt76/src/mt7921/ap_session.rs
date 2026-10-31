@@ -75,6 +75,9 @@ impl<B: Backend> Session<B> {
         authority: Arc<ApControlAuthority>,
         config: ApConfig,
     ) -> Result<(), Error> {
+        if self.p2p_rf_busy() {
+            return Err(Error::Busy);
+        }
         let info = match self.state {
             State::RadioReady(info) | State::ScanReady(info) => info,
             _ => return Err(Error::Busy),
@@ -359,6 +362,9 @@ impl<B: Backend> Session<B> {
     }
 
     fn check_ap_request(&self, authority: &ApControlAuthority) -> Result<(), Error> {
+        if self.p2p_rf_busy() {
+            return Err(Error::Busy);
+        }
         authority.current().map_err(|_| Error::Authority)?;
         let owner = self.ap_owner.as_ref().ok_or(Error::Busy)?;
         owner.identity.current().map_err(|_| Error::Authority)?;

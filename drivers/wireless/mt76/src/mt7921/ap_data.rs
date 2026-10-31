@@ -38,6 +38,9 @@ impl<B: Backend> Session<B> {
         &mut self,
         tx: Option<&[u8]>,
     ) -> Result<super::super::PacketStep, Error> {
+        if self.p2p_rf_busy() {
+            return Err(Error::Busy);
+        }
         if !self
             .ap_receive_current(self.receive_epoch)
             .map_err(|e| self.ap_data_failure(e))?

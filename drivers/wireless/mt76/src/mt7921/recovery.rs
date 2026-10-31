@@ -110,6 +110,7 @@ impl<B: Backend> Session<B> {
         // Only verified MAC/FW reset plus DMA retirement releases AP owners.
         self.ap_owner = None;
         self.p2p_owner = None;
+        self.p2p_next = 1;
         self.ap_keys.clear_active();
         self.wow_config = None;
         self.wow_nlo = None;

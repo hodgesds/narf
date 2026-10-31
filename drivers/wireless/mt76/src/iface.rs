@@ -66,6 +66,7 @@ pub struct Mt76Iface {
         Option<narf_capabilities::Cap<narf_net::NetIface, narf_capabilities::Write>>,
     >,
     p2p_device: IrqSafeSpinLock<Option<Arc<p2p::P2pDeviceIface>>>,
+    vif_slots: IrqSafeSpinLock<crate::mt7921::vif_slots::Slots>,
     scan_cache: IrqSafeSpinLock<Vec<ScanBss>>,
     rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
@@ -109,6 +110,7 @@ impl Mt76Iface {
             p2p_profile: None,
             registration_cap: IrqSafeSpinLock::new(None),
             p2p_device: IrqSafeSpinLock::new(None),
+            vif_slots: IrqSafeSpinLock::new(crate::mt7921::vif_slots::Slots::default()),
             scan_cache: IrqSafeSpinLock::new(Vec::new()),
             rx_ring: IrqSafeSpinLock::new(None),
             tx_ring: IrqSafeSpinLock::new(None),
@@ -500,6 +502,7 @@ impl Mt76Iface {
     async fn resume_from_suspend(&self) -> Result<(), WirelessError> {
         let _control = self.control.lock().await;
         suspend_result(crate::mt7921::firmware_transport::resume_boot_radio(self.mac()).await)?;
+        self.commit_p2p_stopped();
         if self.ap_owned.load(Ordering::Acquire) {
             self.commit_ap_stopped();
         }

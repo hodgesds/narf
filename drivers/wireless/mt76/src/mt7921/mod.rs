@@ -61,6 +61,7 @@ pub(crate) mod tx_priority;
 mod tx_sequence;
 pub mod txrx;
 pub(crate) mod vht;
+pub(crate) mod vif_slots;
 pub(crate) mod wowlan;
 pub(crate) mod wowlan_nlo;
 

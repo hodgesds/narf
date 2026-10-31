@@ -3,9 +3,12 @@
 use super::*;
 use crate::mt7921::firmware_transport::boot_p2p::{self, Request as P2pRequest};
 use narf_wireless::ap_control::RadioControlAuthority;
+#[path = "p2p_coexist_tests.rs"]
+mod coexist;
 #[derive(Debug)]
 struct Source {
     live: AtomicBool,
+    close_on_ready: AtomicBool,
     messages: IrqSafeSpinLock<Vec<Vec<u8>>>,
     controls: IrqSafeSpinLock<Vec<AdminHandle>>,
 }
@@ -17,7 +20,11 @@ impl DeferredReplySink for Source {
         if !self.current() {
             return Err(125);
         }
+        let ready = message.get(16) == Some(&55);
         self.messages.lock().push(message);
+        if ready && self.close_on_ready.load(Ordering::Acquire) {
+            self.live.store(false, Ordering::Release);
+        }
         Ok(())
     }
     fn retain_control_admin(&self, admin: AdminHandle) -> Result<(), i32> {
@@ -98,6 +105,7 @@ fn setup_features(features: u8) -> Result<(NativeSession, Concrete), &'static st
         .ifindex;
     let source = Arc::new(Source {
         live: AtomicBool::new(true),
+        close_on_ready: AtomicBool::new(false),
         messages: IrqSafeSpinLock::new(Vec::new()),
         controls: IrqSafeSpinLock::new(Vec::new()),
     });
@@ -169,13 +177,29 @@ fn lifecycle() -> Result<(), &'static str> {
     let first = session.backend.frames.len();
     execute(&mut session, &concrete, P2pRequest::Start).map_err(|_| "concrete native START")?;
     if !concrete.child.started_current()
-        || !matches!(session.state, State::P2pDevice(_))
+        || !matches!(session.state, State::RadioReady(_))
         || session.backend.receive_open
         || session.security.is_some()
         || !session.backend.frames[first..]
             .iter()
             .filter_map(|(_, frame)| uni(frame, 1))
-            .any(|body| body.get(10..16) == Some(&concrete.child.mac()) && body.get(8) == Some(&1))
+            .any(|body| {
+                body.get(10..16) == Some(&concrete.child.mac())
+                    && body.get(8) == Some(&1)
+                    && body.first() == Some(&1)
+            })
+        || !session.backend.frames[first..]
+            .iter()
+            .filter_map(|(_, frame)| uni(frame, 2))
+            .any(|body| {
+                body.len() == 36
+                    && body[0] == 1
+                    && body[9] == 1
+                    && body[10] == 1
+                    && body[17] == 1
+                    && body[12..16] == [2, 0, 2, 0]
+                    && body[24..26] == [0, 0]
+            })
     {
         return Err("actual START failed child-MAC DEV receipt or published packet/key authority");
     }
@@ -185,6 +209,19 @@ fn lifecycle() -> Result<(), &'static str> {
         return Err("already-started concrete wdev repeated native setup");
     }
     execute(&mut session, &concrete, P2pRequest::Stop).map_err(|_| "concrete native STOP/reset")?;
+    if !session.backend.frames[count..]
+        .iter()
+        .filter_map(|(_, frame)| uni(frame, 2))
+        .any(|body| {
+            body.len() == 36
+                && body[0] == 1
+                && body[8] == 0
+                && body[24..26] == 18u16.to_le_bytes()
+                && body[30..32] == 18u16.to_le_bytes()
+        })
+    {
+        return Err("concrete STOP used another interface's BSS or BMC WCID");
+    }
     if concrete.child.started_current()
         || session.p2p_owner.is_some()
         || !matches!(session.state, State::RadioReady(_))
@@ -328,6 +365,17 @@ fn finite_roc() -> Result<(), &'static str> {
         .count();
     if expired != 3 {
         return Err("explicit STOP lost original ROC expiry or repeated cancel's terminal event");
+    }
+    let tokens: Vec<u8> = session
+        .backend
+        .frames
+        .iter()
+        .filter_map(|(_, frame)| uni(frame, 0x27))
+        .filter(|body| body.len() == 28 && body[4..6] == [0, 0])
+        .map(|body| body[9])
+        .collect();
+    if tokens != [1, 2, 3] {
+        return Err("normal device stop/recreation reset the PHY-global native CNM sequence");
     }
     Ok(())
 }

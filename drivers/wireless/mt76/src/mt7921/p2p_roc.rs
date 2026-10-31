@@ -17,6 +17,7 @@ pub(super) struct Roc {
     cookie: u64,
     source: RadioEventAuthority,
     activated: bool,
+    home_permission: Option<crate::mt7921::association::TxPermission>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Receipt {
@@ -81,17 +82,14 @@ impl<B: Backend> Session<B> {
         if !authority.has_reservation() {
             return Err(Error::Authority);
         }
-        if !matches!(self.state, State::P2pDevice(_))
-            || self.p2p_owner.as_ref().is_none_or(|owner| !owner.activated)
-        {
+        if !self.p2p_ready() || self.p2p_owner.as_ref().is_none_or(|owner| !owner.activated) {
             return Err(Error::Busy);
         }
         // Linux gates ROC, independently of starting the P2P-device BSS.
         if !self.firmware.cnm_capability()? {
             return Err(Error::UnsupportedFirmware);
         }
-        // Validate caller inputs before a possible idle-token rebuild too;
-        // malformed requests cannot cause physical role/reset side effects.
+        // Reject invalid requests before changing the native radio owner.
         if cookie == 0 {
             return Err(Error::Bounds);
         }
@@ -99,26 +97,42 @@ impl<B: Backend> Session<B> {
         let domain = self.backend.regulatory_domain()?;
         let _ = Listen::prepare(info, &domain, frequency_mhz)?;
         let _ = p2p_wire::Request::new(0, 1, frequency_mhz, duration_ms, Kind::Remain)?;
-        let info = self.p2p_owner.as_ref().ok_or(Error::Busy)?.info;
+        if self.p2p_rf_busy() {
+            return Err(Error::Busy);
+        }
+        self.quiesce_p2p_home().await?;
+        self.check_p2p_request(&authority)?;
+        let home = self.state;
+        let home_permission = self.p2p_home_permission()?;
         let domain = self.backend.regulatory_domain()?;
         let listen = Listen::prepare(info, &domain, frequency_mhz)?;
         let source = authority.event_authority().map_err(|_| Error::Authority)?;
         let owner = self.p2p_owner.as_mut().ok_or(Error::Busy)?;
-        let request = owner
-            .cnm
-            .reserve(0, cookie, frequency_mhz, duration_ms, Kind::Remain)?;
+        let request = owner.cnm.reserve(
+            owner.vif.index(),
+            cookie,
+            frequency_mhz,
+            duration_ms,
+            Kind::Remain,
+        )?;
+        self.p2p_next = owner.cnm.next_token();
         owner.pending = Some(authority.clone());
         owner.roc = Some(Roc {
             channel: listen,
             cookie,
             source,
             activated: false,
+            home_permission,
         });
         self.stage(Stage::P2pRocAcquire);
         let result = async {
-            // Keep every firmware channel NO_IR. The CNM grant permits
-            // listening, and never substitutes for active TX power/policy.
-            let mut domain = if listen.band == crate::mt7921::channel::Band::Ghz6 {
+            // The listen grant adds no TX permission. Preserve only the
+            // actual occupied home-channel grant when another BSS is live;
+            // all other firmware channels remain NO_IR.
+            let six = listen.band == crate::mt7921::channel::Band::Ghz6;
+            let mut domain = if let Some(permission) = home_permission {
+                super::super::scan::occupied_domain(info, permission, six)?
+            } else if six {
                 super::super::scan::passive_domain_6ghz(info)
             } else {
                 super::super::scan::passive_domain(info)
@@ -185,7 +199,8 @@ impl<B: Backend> Session<B> {
                 // ABI has one outstanding acquisition and one terminal grant;
                 // successful finite retirement, unlike timeout/ambiguity,
                 // permits normal opaque-u8 recycling as Linux does.
-                if event[44] != 0 || event[45] != request.token() {
+                let bss = self.p2p_owner.as_ref().ok_or(Error::Busy)?.vif.index();
+                if event[44] != bss || event[45] != request.token() {
                     continue;
                 }
                 let now = self.backend.now_ns();
@@ -202,7 +217,7 @@ impl<B: Backend> Session<B> {
         .await;
         match result {
             Ok(duration) => {
-                self.state = State::P2pDevice(info);
+                self.state = home;
                 Ok(duration)
             }
             Err(error) => Err(self.p2p_failure(error).await),
@@ -215,6 +230,9 @@ impl<B: Backend> Session<B> {
         self.check_p2p_request(authority)?;
         let roc = owner.roc.as_ref().ok_or(Error::Busy)?;
         roc.source.current().map_err(|_| Error::Authority)?;
+        if let Some(permission) = roc.home_permission {
+            self.backend.check_tx_permission(permission)?;
+        }
         roc.channel
             .current(self.backend.regulatory_domain()?.as_ref())
     }
@@ -301,7 +319,7 @@ impl<B: Backend> Session<B> {
         if !owner.cnm.expired(now) {
             return Ok(false);
         }
-        let info = owner.info;
+        let home = self.state;
         let abort = owner.cnm.lease().ok_or(Error::Busy)?.request.abort();
         self.poll_data_tx()?;
         if !self.data_pending.is_empty() {
@@ -325,7 +343,7 @@ impl<B: Backend> Session<B> {
             let owner = self.p2p_owner.as_mut().ok_or(Error::Busy)?;
             let lease = owner.cnm.release_expired_after_packets(now)?;
             let roc = owner.roc.take().ok_or(Error::Busy)?;
-            self.state = State::P2pDevice(info);
+            self.state = home;
             if roc.activated && roc.source.current().is_ok() {
                 let duration = match lease.phase {
                     Phase::Granted { interval_ms, .. } => interval_ms,
@@ -342,6 +360,87 @@ impl<B: Backend> Session<B> {
             Ok(value) => Ok(value),
             Err(error) => Err(self.p2p_failure(error).await),
         }
+    }
+
+    /// Stop/cancel has no firmware terminal-abort event. For an actual
+    /// granted lease, retain host/RF/token ownership through its observed
+    /// finite deadline, native packet retirement and ordered owned abort.
+    /// Ambiguous acquisitions require the separate verified reset path.
+    pub(in crate::mt7921::firmware_transport) async fn retire_p2p_roc_owned(
+        &mut self,
+    ) -> Result<(), Error> {
+        let Some(lease) = self.p2p_owner.as_ref().and_then(|owner| owner.cnm.lease()) else {
+            return Ok(());
+        };
+        let Phase::Granted { expires_ns, .. } = lease.phase else {
+            return Err(Error::Busy);
+        };
+        let abort = lease.request.abort();
+        if let Some(roc) = self.p2p_owner.as_mut().and_then(|owner| owner.roc.as_mut()) {
+            roc.activated = false;
+        }
+        self.notify(
+            Command::Unified {
+                id: p2p_wire::UNIFIED_ROC,
+            },
+            &abort,
+        )
+        .await?;
+        self.confirm_command_progress().await?;
+        let left = expires_ns.saturating_sub(self.backend.now_ns());
+        self.wait(left.div_ceil(1_000_000).saturating_add(1), |backend| {
+            Ok((backend.now_ns() >= expires_ns).then_some(()))
+        })
+        .await?;
+        self.quiesce_p2p_packets().await?;
+        self.events.retain(|event| !roc_ack(event));
+        let now = self.backend.now_ns();
+        let owner = self.p2p_owner.as_mut().ok_or(Error::Busy)?;
+        owner.cnm.release_expired_after_packets(now)?;
+        owner.roc = None;
+        Ok(())
+    }
+
+    fn p2p_home_permission(
+        &self,
+    ) -> Result<Option<crate::mt7921::association::TxPermission>, Error> {
+        let permission = match self.state {
+            State::Associated { .. } => Some(self.station_permission.ok_or(Error::Authority)?),
+            State::AccessPoint { .. } => {
+                let owner = self.ap_owner.as_ref().ok_or(Error::Busy)?;
+                owner.identity.current().map_err(|_| Error::Authority)?;
+                Some(owner.plan.permission)
+            }
+            _ => None,
+        };
+        if let Some(permission) = permission {
+            self.backend.check_tx_permission(permission)?;
+        }
+        Ok(permission)
+    }
+    async fn quiesce_p2p_home(&mut self) -> Result<(), Error> {
+        self.quiesce_p2p_packets().await?;
+        if matches!(self.state, State::Associated { .. }) {
+            self.service_keys().await?;
+        }
+        self.quiesce_p2p_packets().await
+    }
+    async fn quiesce_p2p_packets(&mut self) -> Result<(), Error> {
+        let began = self.backend.now_ns();
+        core::future::poll_fn(|cx| {
+            if let Err(error) = self.poll_data_tx() {
+                return core::task::Poll::Ready(Err(error));
+            }
+            if self.data_pending.is_empty() && self.tx_fragments.is_empty() {
+                return core::task::Poll::Ready(Ok(()));
+            }
+            if self.backend.now_ns().saturating_sub(began) >= super::super::TIMEOUT_MS * 1_000_000 {
+                return core::task::Poll::Ready(Err(Error::Timeout));
+            }
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
+        })
+        .await
     }
 }
 fn roc_ack(event: &[u8]) -> bool {
