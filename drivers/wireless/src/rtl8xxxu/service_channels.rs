@@ -11,7 +11,7 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
         }
     }
 
-    fn check_current(&mut self) -> Result<(), Error> {
+    pub(super) fn check_current(&mut self) -> Result<(), Error> {
         match self.current() {
             Ok(_) => Ok(()),
             Err(error) => {

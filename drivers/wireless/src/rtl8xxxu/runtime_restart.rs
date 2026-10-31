@@ -20,9 +20,34 @@ impl<I: ControlIo> Owner<I> {
     /// The one Receiver remains claimed. ReceiveStopped is published only
     /// after real endpoint Stop/SetDeq; source loss or uncertainty is terminal.
     pub(in crate::rtl8xxxu) async fn restart_stopped(&self) -> Result<(), Error> {
+        self.park_stopped().await?;
+        self.restart_parked().await
+    }
+
+    pub(in crate::rtl8xxxu) async fn park_stopped(&self) -> Result<(), Error> {
         if self.status().stage != Stage::ReceiveStopped
             || !self.runtime_taken.load(Ordering::Acquire)
         {
+            return Err(Error::RuntimeState);
+        }
+        let executable = self.executable().ok_or(Error::RuntimeState)?;
+        executable.invoke(|| ())?;
+        let mut attempt = Restart {
+            owner: self,
+            complete: false,
+        };
+        self.stage(Stage::Parking);
+        let result = executable.fence(self.power_off_stopped()).await;
+        attempt.complete = true;
+        match result {
+            Ok(()) => self.stage(Stage::Parked),
+            Err(error) => self.runtime_failed(error),
+        }
+        result
+    }
+
+    pub(in crate::rtl8xxxu) async fn restart_parked(&self) -> Result<(), Error> {
+        if self.status().stage != Stage::Parked || !self.runtime_taken.load(Ordering::Acquire) {
             return Err(Error::RuntimeState);
         }
         let expected = (
@@ -47,7 +72,6 @@ impl<I: ControlIo> Owner<I> {
         self.stage(Stage::Restarting);
         let result = executable
             .fence(async {
-                self.power_off_stopped().await?;
                 self.run_device_expected(
                     &image,
                     narf_time::Deadline::after_ms(30_000),

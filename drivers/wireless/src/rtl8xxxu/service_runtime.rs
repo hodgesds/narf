@@ -16,6 +16,8 @@ use zeroize::Zeroizing;
 
 #[path = "service_channels.rs"]
 mod service_channels;
+#[path = "service_power.rs"]
+mod service_power;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     State,
@@ -31,6 +33,7 @@ pub enum Phase {
     Joining,
     Connected,
     Stopped,
+    Parked,
     Failed,
 }
 /// No timer-derived nonce is admissible. The native environment delegates to
@@ -120,6 +123,7 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
         }
         match self.radio.as_ref().map(Receiver::phase) {
             Some(receive_runtime::Phase::Receiving) => Phase::Passive,
+            Some(receive_runtime::Phase::Parked) => Phase::Parked,
             _ => Phase::Failed,
         }
     }
@@ -276,7 +280,7 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
                 }
                 Ok(frames)
             }
-            Phase::Stopped => Ok(Vec::new()),
+            Phase::Stopped | Phase::Parked => Ok(Vec::new()),
             _ => Err(Error::State),
         }
     }
@@ -476,7 +480,7 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
     }
     pub async fn disconnect(&mut self) -> Result<(), Error> {
         match self.phase() {
-            Phase::Passive | Phase::Stopped => return Ok(()),
+            Phase::Passive | Phase::Stopped | Phase::Parked => return Ok(()),
             Phase::Connected | Phase::Joining => (),
             _ => return Err(Error::State),
         }

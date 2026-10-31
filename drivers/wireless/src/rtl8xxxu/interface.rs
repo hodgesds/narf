@@ -18,6 +18,8 @@ use narf_wireless::{
     WirelessNetIface,
 };
 use zeroize::Zeroizing;
+#[path = "interface_power.rs"]
+mod interface_power;
 #[derive(Debug)]
 pub struct NativeEnvironment;
 impl Environment for NativeEnvironment {
@@ -103,6 +105,7 @@ pub struct Device<C: ControlIo, B: PacketIo, E: Environment> {
     ht: bool,
     rx: Arc<IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    admin: IrqSafeSpinLock<interface_power::Admin>,
 }
 impl<C: ControlIo, B: PacketIo, E: Environment> core::fmt::Debug for Device<C, B, E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -114,6 +117,7 @@ impl<C: ControlIo, B: PacketIo, E: Environment> core::fmt::Debug for Device<C, B
 }
 impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
     pub(super) fn new(name: &str, mut service: Service<C, B, E>) -> Self {
+        let parked = service.phase() == service_runtime::Phase::Parked;
         let mac = service.local();
         let (rx, rx_consumer) = narf_ipc::channel();
         let (tx_producer, tx) = narf_ipc::channel();
@@ -136,11 +140,12 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
             mac,
             up: AtomicBool::new(false),
             bssid: AtomicU64::new(0),
-            closed: AtomicBool::new(false),
+            closed: AtomicBool::new(parked),
             failed,
             ht,
             rx: rx_consumer,
             tx: IrqSafeSpinLock::new(Some(tx_producer)),
+            admin: IrqSafeSpinLock::new(interface_power::Admin::new()),
         }
     }
     fn link(&self, peer: Option<[u8; 6]>) {
@@ -158,8 +163,8 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
         let was_up = self.up.swap(up, Ordering::AcqRel);
         // Physical carrier preserves operator-controlled IFF_UP and never
         // invokes an administrative open/stop hook under retained locks.
-        narf_net::iface::set_link_metadata(&self.name, up, None, None);
-        if was_up && !up {
+        let published = self.publish_carrier(up);
+        if was_up && !up && published {
             narf_wireless::nl80211::notify_disconnect(&self.name, 1, false);
         }
     }
@@ -487,7 +492,10 @@ pub async fn attach(
         .prepare_profile(profile)
         .await
         .map_err(service_runtime::Error::Radio)?;
-    let service = Service::start(receiver, power, NativeEnvironment).await?;
+    let mut service = Service::start(receiver, power, NativeEnvironment).await?;
+    // register_netdevice starts IFF_DOWN. Finish actual USB/MAC/card park
+    // before publication, rather than leave an RX stream running under DOWN.
+    service.park().await?;
     let name = narf_net::iface::reserve_name("wlan%d");
     let device = Arc::new(Device::new(name, service));
     narf_net::registry()
@@ -496,6 +504,8 @@ pub async fn attach(
     *ACTIVE.lock() = Some(device.clone());
     narf_net::iface::register(name, device.mac, send);
     narf_net::iface::set_link_state(name, false);
+    let registration = narf_net::iface::lookup(name).ok_or(service_runtime::Error::State)?;
+    device.bind_admin(registration)?;
     narf_net::iface::install_rx_drain(drain);
     narf_wireless::registry::register(device.clone());
     let worker = device.clone();
@@ -588,7 +598,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
         let (mut channels, dwell) = validate_scan(&request)?;
-        let mut state = self.state.lock().await;
+        let mut state = self.control_state(false).await?;
         if state.service.phase() != service_runtime::Phase::Passive {
             return Err(WirelessError::Busy);
         }
@@ -629,7 +639,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
             SecurityConfig::Wpa2 { psk } => (SecurityMode::Wpa2Psk, Some(Zeroizing::new(psk))),
             _ => return Err(WirelessError::NotSupported),
         };
-        let mut state = self.state.lock().await;
+        let mut state = self.control_state(false).await?;
         if state.service.phase() != service_runtime::Phase::Passive {
             return Err(WirelessError::Busy);
         }
@@ -667,7 +677,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
         self.closed.store(true, Ordering::Release);
         *self.rx.lock() = None;
         self.link(None);
-        let mut state = self.state.lock().await;
+        let mut state = self.control_state(true).await?;
         // A previous association/progress owner may have published up while
         // this caller waited. Serialize the final close with those publishers.
         self.link(None);
@@ -680,6 +690,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
         if result.is_ok()
             && state.service.phase() == service_runtime::Phase::Passive
             && !self.failed.load(Ordering::Acquire)
+            && self.administratively_open()
         {
             state.epoch = 0;
             self.closed.store(false, Ordering::Release);
@@ -690,7 +701,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
         if cfg.tx_power_dbm.is_some() || !(1..=13).contains(&cfg.channel) {
             return Err(WirelessError::NotSupported);
         }
-        let mut state = self.state.lock().await;
+        let mut state = self.control_state(false).await?;
         state
             .service
             .select_channel(u8::try_from(cfg.channel).map_err(|_| WirelessError::InvalidArgs)?)

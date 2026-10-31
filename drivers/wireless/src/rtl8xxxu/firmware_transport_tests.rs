@@ -97,6 +97,9 @@ pub(super) struct Model {
     pub(super) cold_generation: u64,
     pub(super) rx_dma_stalled: bool,
     pub(super) mac_off_stalled: bool,
+    pub(super) delayed_write: Option<u16>,
+    pub(super) delayed_complete: bool,
+    pub(super) delayed_waker: Option<Waker>,
 }
 
 impl Model {
@@ -133,6 +136,27 @@ impl Model {
             cold_generation: 0,
             rx_dma_stalled: false,
             mac_off_stalled: false,
+            delayed_write: None,
+            delayed_complete: false,
+            delayed_waker: None,
+        }
+    }
+
+    fn register_write(&mut self, addr: u16, bytes: &[u8]) {
+        let previous_hssi = u32::from_le_bytes(self.regs[0x824..0x828].try_into().unwrap());
+        self.regs[addr as usize..addr as usize + bytes.len()].copy_from_slice(bytes);
+        if addr == 0x840 && bytes.len() == 4 {
+            let v = u32::from_le_bytes(bytes.try_into().unwrap());
+            self.rf[(v >> 20) as usize] = v & 0xfffff;
+        }
+        if addr == 0x824 && bytes.len() == 4 {
+            let v = u32::from_le_bytes(bytes.try_into().unwrap());
+            if v & 0x80000000 != 0 && previous_hssi & 0x80000000 == 0 {
+                self.rf_read = ((v >> 23) & 0xff) as u8;
+            }
+        }
+        if addr == REG_MCU_FW_DL && bytes[0] & MCU_FW_DL_CSUM_REPORT != 0 {
+            self.regs[addr as usize] &= !MCU_FW_DL_CSUM_REPORT;
         }
     }
 }
@@ -233,6 +257,36 @@ impl ControlIo for Fake {
     }
 
     async fn write(&self, addr: u16, bytes: &[u8]) -> Result<usize, UsbError> {
+        let delayed = {
+            let mut g = self.0.lock();
+            if g.delayed_write == Some(addr) {
+                if g.active_td {
+                    g.unsafe_reuses += 1;
+                }
+                g.ops.push(Op::Write(addr, bytes.to_vec()));
+                g.writes += 1;
+                g.active_td = true;
+                true
+            } else {
+                false
+            }
+        };
+        if delayed {
+            return core::future::poll_fn(|cx| {
+                let mut g = self.0.lock();
+                if !g.delayed_complete {
+                    g.delayed_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+                g.active_td = false;
+                g.delayed_write = None;
+                g.delayed_complete = false;
+                g.delayed_waker = None;
+                g.register_write(addr, bytes);
+                Poll::Ready(Ok(bytes.len()))
+            })
+            .await;
+        }
         let outcome = {
             let mut g = self.0.lock();
             if g.active_td {
@@ -274,21 +328,7 @@ impl ControlIo for Fake {
                     Some(Ok(bytes.len()))
                 }
             } else {
-                let previous_hssi = u32::from_le_bytes(g.regs[0x824..0x828].try_into().unwrap());
-                g.regs[addr as usize..addr as usize + bytes.len()].copy_from_slice(bytes);
-                if addr == 0x840 && bytes.len() == 4 {
-                    let v = u32::from_le_bytes(bytes.try_into().unwrap());
-                    g.rf[(v >> 20) as usize] = v & 0xfffff;
-                }
-                if addr == 0x824 && bytes.len() == 4 {
-                    let v = u32::from_le_bytes(bytes.try_into().unwrap());
-                    if v & 0x80000000 != 0 && previous_hssi & 0x80000000 == 0 {
-                        g.rf_read = ((v >> 23) & 0xff) as u8;
-                    }
-                }
-                if addr == REG_MCU_FW_DL && bytes[0] & MCU_FW_DL_CSUM_REPORT != 0 {
-                    g.regs[addr as usize] &= !MCU_FW_DL_CSUM_REPORT; // W1C.
-                }
+                g.register_write(addr, bytes);
                 Some(Ok(bytes.len()))
             }
         };

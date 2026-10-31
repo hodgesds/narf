@@ -28,6 +28,7 @@ pub enum Phase {
     Active,
     Configuring,
     Stopped,
+    Parked,
     Failed,
 }
 /// The caller authenticates the deployment regulatory domain; this value

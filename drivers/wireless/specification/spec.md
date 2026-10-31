@@ -918,6 +918,14 @@ policy. Actual enabled parent policy, endpoint capabilities and native
 hardware receipts gate endpoint entry; the shared bridge/common-clock
 configuration remains platform-owned. Software acceptance is recorded above.
 
+RTL8188EU registers its original receiver as an administrative open/stop
+target. Initial IFF_DOWN follows completed native USB/MAC/card park; UP
+queues retained exact-image wake, and bound control returns Busy until
+that transition finishes. DOWN closes admission immediately and retires
+the old association before parking. Netlink IFF_UP and SIOCSIFFLAGS use
+the existing current administrative handle; scan never creates UP. The
+family §3 documents the interface and pending PM native acceptance.
+
 ## 4. Interaction with `narf-wireless`
 
 - **Registration**: Drivers register via `bus::register_wireless_driver(MatchEntry { ... })`.

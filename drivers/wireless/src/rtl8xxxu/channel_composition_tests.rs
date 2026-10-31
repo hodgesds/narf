@@ -13,6 +13,9 @@ use core::sync::atomic::AtomicBool;
 use narf_capabilities::{Cap, Read};
 use narf_firmware::FirmwareBlob;
 
+#[path = "pm_composition_tests.rs"]
+mod pm_composition_tests;
+
 #[derive(Clone)]
 struct ChannelLink {
     bulk: Link,

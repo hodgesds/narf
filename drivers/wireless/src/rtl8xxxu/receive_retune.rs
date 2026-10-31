@@ -21,13 +21,59 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         &mut self,
         channel: u8,
     ) -> Result<super::super::power_policy::Permission, Error> {
+        self.restore_channel(channel, false).await
+    }
+
+    pub(in crate::rtl8xxxu) async fn resume_parked(
+        &mut self,
+    ) -> Result<super::super::power_policy::Permission, Error> {
+        self.restore_channel(self.channel(), true).await
+    }
+
+    pub(in crate::rtl8xxxu) async fn park(&mut self) -> Result<(), Error> {
         if self.phase() != Phase::Receiving || self.peer.is_some() {
+            return Err(Error::State);
+        }
+        let authority = self.authority();
+        let mut attempt = Attempt {
+            firmware: self.firmware.clone(),
+            armed: true,
+        };
+        let result = authority
+            .fence(
+                async {
+                    self.quiesce_restart().await?;
+                    self.firmware.park_stopped().await.map_err(Error::Control)?;
+                    self.phase = Phase::Parked;
+                    Ok(())
+                },
+                core::convert::identity,
+            )
+            .await;
+        attempt.armed = false;
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+
+    async fn restore_channel(
+        &mut self,
+        channel: u8,
+        parked: bool,
+    ) -> Result<super::super::power_policy::Permission, Error> {
+        let expected = if parked {
+            Phase::Parked
+        } else {
+            Phase::Receiving
+        };
+        if self.phase() != expected || self.peer.is_some() {
             return Err(Error::State);
         }
         let base = self.wmm.as_ref().ok_or(Error::State)?;
         let target = base.for_channel(channel)?;
         let permission = target.permission();
-        if channel == self.channel() {
+        if channel == self.channel() && !parked {
             return Ok(permission);
         }
         // The source cold LC/IQK program runs on home channel1. Both that
@@ -50,11 +96,18 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
                     home.fence(
                         target.fence(
                             async {
-                                self.quiesce_restart().await?;
-                                self.firmware
-                                    .restart_stopped()
-                                    .await
-                                    .map_err(Error::Control)?;
+                                if parked {
+                                    self.firmware
+                                        .restart_parked()
+                                        .await
+                                        .map_err(Error::Control)?;
+                                } else {
+                                    self.quiesce_restart().await?;
+                                    self.firmware
+                                        .restart_stopped()
+                                        .await
+                                        .map_err(Error::Control)?;
+                                }
                                 // This is a freshly booted firmware session;
                                 // old H2C/RA host bookkeeping cannot survive it.
                                 self.mailbox = 0;

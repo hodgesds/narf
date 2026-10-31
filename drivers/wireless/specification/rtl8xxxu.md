@@ -3,6 +3,7 @@
 > Status: runtime RTL8188EU factory/FIFO/firmware/MAC/BB/RF + LC/IQK implemented;
 > retained channel1 Open/WPA2 station service implemented; qualified legacy
 > channels1–13 and idle passive scans are implemented pending native acceptance.
+> Administrative cold park/wake is implemented pending its separate native acceptance.
 > Broader profiles and physical acceptance remain incomplete. A separately
 > qualified RTL8188EU HT20/LGI SISO continuation passes14 native regressions
 > on both architectures; exact-device qualification remains external.
@@ -39,7 +40,7 @@ registration compares the retained Arc identity, instead of conflating equal slo
 
 `Owner::status()` reports detected, validated, factory-ready, powered,
 downloading, firmware-ready, initializing-tables, tables-ready, calibrating,
-radio-ready or terminal failed state. Radio-ready means checked initialization
+radio-ready, parking, parked, restarting or terminal failed state. Radio-ready means checked initialization
 with MAC TX/RX still closed before the separately admitted station service. `Owner::calibration()` exposes the selected full
 TX/RX IQ coefficients only after successful completion. `Owner::factory()` returns the checked RTL8188EU factory identity
 and calibration snapshot. `initialize_device(blob)` runs the production
@@ -724,6 +725,67 @@ copies, fresh-observation admission, cancellation/source loss, missing row and
 RXDMA/MAC-off receipts, and literal factory/occupied-band limits. Their native
 execution and physical-board acceptance remain pending.
 
+### Administrative radio park/wake (native acceptance pending)
+
+The production attach path completes a physical cold park before publishing
+the initial IFF_DOWN interface. MAC RX/TX/filter closure, RXDMA terminal state,
+actual USB Stop/SetDeq and the completed hardware MAC-off FSM precede
+`Stage::Parked`; no native RX TD remains posted under initial DOWN. A parked
+owner retains its original physical USB claim, firmware image and capability,
+factory identity, selected operating permission and optional home HT profile.
+
+The actual registration installs an original-receiver `OpenStopTarget` holding
+a Weak reference to that Device. UP requires the original current event;
+retired DOWN may close only that captured old radio under its still-current
+native grants. Event observations grant no USB or firmware access. Carrier
+publication uses the captured ownership snapshot, and carrier withdrawal uses
+immutable registration identity, so a same-name replacement cannot acquire
+this radio's UP or DOWN publication.
+
+The synchronous callback immediately closes packet/control admission and old
+receive-ring publication, then queues a scheduler-owned task retaining the
+Device. No register or USB await runs in the callback. Dropping the triggering
+caller cannot drop the published PM operation. Rapid reversals complete the
+currently owned native operation and then apply the latest original event;
+every real UP performs park/wake so a coalesced DOWN/UP also retires old station
+and key state. Stale UP completion parks only its original receiver and stays
+closed. No IRQ-safe guard spans an await.
+
+DOWN retires a connected station through the existing peer/media/key and
+native Stop path, then performs the same source card-off/MAC-off sequence as
+channel changes. UP reuses the exact original authenticated firmware image,
+checks fresh factory/endpoints before RF calibration, restores source FIFO/LLT,
+tables and LC/IQK, verifies the selected channel and posts fresh RX. Current
+executable, board and home/target regulatory proofs fence every await. Carrier
+and the controlled port remain closed until a new actual association/RSNA.
+No failed or ambiguous EP0/bulk owner can be revived by another UP request.
+
+Bound scan, associate, disconnect and channel-control callers reject while PM
+is pending or state is owned; synchronous `block_on` never waits for the PM
+task to make progress. Normal synchronous drains also reject closed admission.
+The retained task independently drives its own IRQ/self-waking USB operations.
+
+Control clients first request administrative UP, then scan/associate, retrying
+Busy while the retained cold wake completes. The existing compatibility paths
+already dispatch to this current hook: `net/src/netlink_route.rs` handles
+RTM_NEWLINK/RTM_SETLINK IFF_UP through `AdminHandle::set_link`, and
+`userspace/src/socket.rs` handles SIOCSIFFLAGS through the same operation.
+`net/src/iface_admin.rs::Effects::notify` calls the captured target after
+registry locks are released. `userspace::network_daemon` installs/delegates
+the explicit interface/namespace admin grant; it does not invent UP. The
+in-tree shell has no separate Wi-Fi scan/connect builtin. Scanning a DOWN
+radio stays refused rather than changing operator policy implicitly.
+
+This implements administrative radio off/on using the stronger retained cold
+restart boundary. Linux `rtl8xxxu_start/stop` calls `enable_rf/disable_rf`, and
+`rtl8188eu_power_off` supplies the source card-off sequence; the pinned MAC-off
+FSM above supplies explicit FIFO retirement. It does not introduce LPS, IPS,
+WoWLAN, autosuspend or USB LPM modes absent from this family's source contract.
+Eight separate `drivers/wireless/rtl8xxxu/runtime_pm` native cases cover actual
+registration/queued ownership, initial DOWN, Open/WPA2 down/up with native DHCP
+and fresh PTK, held EP0 reversals, caller/source loss, registration replacement
+and failed bulk Stop. Their execution and physical-board acceptance are pending.
+
 ## 4. Invariants
 
 - Linux's disabled→EMU→active handshake precedes firmware writes. MAC TX/RX
@@ -757,7 +819,8 @@ the production probe when exact-device signed qualification/deployment data
 is present. No real board curve has been acquired, qualified or installed by
 this software work. The initial profile needs physical validation. Qualified
 legacy idle channel changes and passive scans await native acceptance; broader
-rates, active or connected scanning, endpoint reset and PM remain software work.
+rates, active or connected scanning and endpoint reset remain software work.
+Administrative cold park/wake awaits its separate native acceptance.
 
 ## 8. Open questions / remaining software
 
@@ -780,12 +843,12 @@ rates, active or connected scanning, endpoint reset and PM remain software work.
 | USB transfer ownership / stale handles | EP0 + bulk claims, retained command DMA and generation rejection implemented; slot reuse stays gated |
 | Non-stream bulk stop/drain | Implemented in USB; exact commands/context/event-prefix proof |
 | Disconnect/peer-loss callbacks and normal bulk stop | Implemented; a completed disconnect returns to Passive (safe rejoin) |
-| EP0/Halted reset, safe rejoin, FIFO retune and PM recovery | Bulk halt recovery and safe rejoin implemented; qualified idle cold FIFO retune awaits native acceptance; EP0 reset and PM remain missing |
+| EP0/Halted reset, safe rejoin, FIFO retune and PM recovery | Bulk halt recovery and safe rejoin implemented; qualified idle cold FIFO retune and administrative cold park/wake await native acceptance; controller-proven EP0 reset remains missing |
 
 Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 `8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional
 BT/S0S1. EU's separately qualified HT20/LGI continuation is software-validated above;
-SGI20/HT40, active scanning and scanning while associated, runtime PM and
+SGI20/HT40, active scanning and scanning while associated, and
 controller-proven EP0 reset remain software work. Qualified idle passive
 multi-channel scanning awaits native acceptance. Full WMM AC/TID routing is implemented.
 
@@ -798,8 +861,9 @@ and MFP_CAPABLE (no SUPPORTS_PS/DYNAMIC_PS), `rtl8xxxu_ops` has no
 `fops->enable_rf` in `rtl8xxxu_start`, `fops->disable_rf` in `rtl8xxxu_stop`
 and `fops->power_off` at disconnect. There are no PM submodes beyond that
 interface start/stop radio power path (the remaining
-`runtime_power_management` row); LPS/IPS/WoWLAN/USB autosuspend/LPM are
-inapplicable to this family. 8192EU/8723BU first need their own retained power/firmware/radio/
+`runtime_power_management` row, implemented as retained administrative cold
+park/wake above pending native acceptance); LPS/IPS/WoWLAN/USB autosuspend/LPM
+are inapplicable to this family. 8192EU/8723BU first need their own retained power/firmware/radio/
 packet/station compositions, including2-chain or coexistence dependencies.
 The repository's matched8821CU/8822BU profiles need the actual upstream
 `rtw88/rtw8821cu.c`/`rtw8822bu.c` USB transport and C21/C22B radio semantics;

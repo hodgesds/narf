@@ -69,6 +69,8 @@ pub enum Stage {
     StartingReceive,
     Receiving,
     ReceiveStopped,
+    Parking,
+    Parked,
     Restarting,
     Failed,
 }
