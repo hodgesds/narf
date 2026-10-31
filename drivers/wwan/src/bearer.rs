@@ -29,13 +29,19 @@
 // registration shape cdc_ncm and r8152 already use, so no new
 // net-stack interface is introduced.
 //
-// NDP signature constants (Linux `include/uapi/linux/usb/cdc.h`):
-// USB_CDC_MBIM_NDP16_IPS_SIGN / _DSS_SIGN are the NCM "NCM0"/"NCM1"
-// values with the session byte overlaid at wire byte 3, i.e. the low
-// three bytes spell "NCM" (little-endian 0x004D434E / 0x014D434E)
-// and the high byte is the SessionId. cdc_mbim masks RX signatures
-// with 0x00FFFFFF and reads the session from byte 3; this module
-// does the same.
+// NDP signature constants (Linux `include/uapi/linux/usb/cdc.h`,
+// verbatim from linux-libc-dev 6.8):
+//   USB_CDC_MBIM_NDP16_IPS_SIGN  0x00535049  /* IPS<sessionID> */
+//   USB_CDC_MBIM_NDP16_DSS_SIGN  0x00535344  /* DSS<sessionID> */
+// The low three bytes spell "IPS" / "DSS" and the fourth wire byte is
+// the SessionId. cdc_mbim masks RX signatures with 0x00FFFFFF and
+// reads the session from byte 3 (DSS: tci = byte 3 + 256); this
+// module does the same. The NCM signatures are SEPARATE constants
+// in the same header (NCM0 0x304D434E, NCM1 0x314D434E) and are NOT
+// MBIM signatures: an earlier revision of this module used the NCM
+// base for IPS, which real MBIM hardware would reject. Corrected
+// 2026-10-29 as the #1143 prerequisite; NDP32 variants ("ips" /
+// "dss") are out of scope — this module implements NTB-16 only.
 
 extern crate alloc;
 
@@ -47,43 +53,76 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::mbim::{ConnectSetParams, IpConfigurationInfo, Ipv4Configuration};
 use crate::session::MbimModem;
-use crate::WwanError;
+use crate::{WwanError, WwanPort, WwanPortKind};
 
 // ─── NDP signatures ──────────────────────────────────────────────────────────
 
-/// Low three bytes of the IPS NDP16 signature ("NCM"); the fourth
-/// wire byte is the SessionId. Source: Linux `cdc_mbim.c`
-/// `cdc_mbim_rx_fixup`, which switches on
-/// `dwSignature & 0x00ffffff` against `USB_CDC_MBIM_NDP16_IPS_SIGN`
-/// and takes the session from byte 3 (`tci = c[3]`).
-pub const NDP16_IPS_SIGN_BASE: u32 = 0x004D_434E;
+/// Low three bytes of the IPS NDP16 signature ("IPS"); the fourth
+/// wire byte is the SessionId. Source: Linux
+/// `include/uapi/linux/usb/cdc.h` (verbatim):
+/// `USB_CDC_MBIM_NDP16_IPS_SIGN 0x00535049 /* IPS<sessionID> */`.
+/// An earlier revision used the NCM "NCM" base (0x004D434E) here,
+/// reading that constant as the NCM value — wrong: the header
+/// defines the NCM signatures separately (NCM0 0x304D434E, NCM1
+/// 0x314D434E), and a genuine "IPS<session>" NTB from real MBIM
+/// hardware failed this module's check. Corrected 2026-10-29 as
+/// the #1143 prerequisite.
+pub const NDP16_IPS_SIGN_BASE: u32 = 0x0053_5049;
+
+/// Low three bytes of the DSS NDP16 signature ("DSS"); the fourth
+/// wire byte is the SessionId. Same source:
+/// `USB_CDC_MBIM_NDP16_DSS_SIGN 0x00535344 /* DSS<sessionID> */`.
+pub const NDP16_DSS_SIGN_BASE: u32 = 0x0053_5344;
 
 /// Compose the NDP16 signature for IP session `session`.
 pub fn ndp_signature_ips(session: u8) -> u32 {
     NDP16_IPS_SIGN_BASE | ((session as u32) << 24)
 }
 
-/// Decode an NDP16 signature into its IP session id, or `None` when
-/// it is not an MBIM IPS NDP at all. A plain NCM "NCM0" signature
-/// decodes as IPS session 0x30 — exactly as Linux's demux treats it —
-/// which no MBIM activation ever creates, so demultiplexing drops it
-/// as an unknown session, as it should: an NCM-signed NTB on an MBIM
-/// bearer is a framing confusion, not a session.
-///
-/// DSS (Device Service Stream) NDPs are NOT decoded here: this lane
-/// implements no DSS sessions (no MBIM_CID_DSS_CONNECT), and the DSS
-/// signature base could not be verified against MBIM 1.0 §6 from the
-/// sources available — Linux keys its DSS case on
-/// `USB_CDC_MBIM_NDP16_DSS_SIGN` under the same 0x00ffffff mask with
-/// `tci = c[3] + 256`, a constant whose low three bytes necessarily
-/// differ from "NCM". Rather than guess it, DSS NTBs fail the
-/// signature check and are rejected whole, never misrouted into an
-/// IP session. DSS support is a filed follow-on.
-pub fn ndp_signature_session(signature: u32) -> Option<u8> {
-    if signature & 0x00FF_FFFF == NDP16_IPS_SIGN_BASE {
-        Some((signature >> 24) as u8)
-    } else {
-        None
+/// Compose the NDP16 signature for DSS session `session`.
+pub fn ndp_signature_dss(session: u8) -> u32 {
+    NDP16_DSS_SIGN_BASE | ((session as u32) << 24)
+}
+
+/// Which stream an NDP16 belongs to, decoded from its signature.
+/// IPS and DSS sessions are separate namespaces sharing one pair of
+/// bulk endpoints: Linux's cdc_mbim demux keys IPS on
+/// `USB_CDC_MBIM_NDP16_IPS_SIGN` (`tci = c[3]`) and DSS on
+/// `USB_CDC_MBIM_NDP16_DSS_SIGN` (`tci = c[3] + 256`), both under
+/// the `dwSignature & 0x00ffffff` mask. An NCM "NCM0"/"NCM1"
+/// signature matches NEITHER: it is not an MBIM NDP at all, and an
+/// NTB signed with it is rejected whole — the earlier revision's
+/// decode of NCM0 as IPS session 0x30 was the same NCM/MBIM
+/// conflation as the IPS base error, and is gone with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NdpStream {
+    /// IP session `0` (the session id in the signature's byte 3).
+    Ips(u8),
+    /// DSS session `0` (same byte, a different namespace).
+    Dss(u8),
+}
+
+impl NdpStream {
+    /// The session id carried in the signature's fourth byte.
+    pub fn session(self) -> u8 {
+        match self {
+            NdpStream::Ips(s) | NdpStream::Dss(s) => s,
+        }
+    }
+
+    /// Whether this is a DSS stream (never an IP netdev's traffic).
+    pub fn is_dss(self) -> bool {
+        matches!(self, NdpStream::Dss(_))
+    }
+}
+
+/// Decode an NDP16 signature into its stream, or `None` when it is
+/// not an MBIM NDP at all.
+pub fn ndp_signature_stream(signature: u32) -> Option<NdpStream> {
+    match signature & 0x00FF_FFFF {
+        NDP16_IPS_SIGN_BASE => Some(NdpStream::Ips((signature >> 24) as u8)),
+        NDP16_DSS_SIGN_BASE => Some(NdpStream::Dss((signature >> 24) as u8)),
+        _ => None,
     }
 }
 
@@ -93,12 +132,12 @@ pub fn ndp_signature_session(signature: u32) -> Option<u8> {
 /// the null terminator entry.
 const SINGLE_NDP16_LEN: usize = 8 + 4 + 4;
 
-/// Build a single-datagram NTB-16 for IP session `session`:
+/// Build a single-datagram NTB-16 with an explicit NDP16 signature:
 /// NTH16 (offset 0), NDP16 (offset 12), datagram (offset 28).
 /// The layout is one of the placements NCM 1.0 §3.2 permits (the
 /// wNdpIndex in the NTH locates the NDP; datagrams live wherever
 /// their pointer entries say).
-pub fn build_mbim_ntb(sequence: u16, session: u8, datagram: &[u8]) -> Vec<u8> {
+fn build_ntb_with_signature(sequence: u16, signature: u32, datagram: &[u8]) -> Vec<u8> {
     let ndp_offset = Nth16::LEN;
     let dgram_offset = ndp_offset + SINGLE_NDP16_LEN;
     let total = dgram_offset + datagram.len();
@@ -112,7 +151,7 @@ pub fn build_mbim_ntb(sequence: u16, session: u8, datagram: &[u8]) -> Vec<u8> {
     let mut ntb = Vec::with_capacity(total);
     ntb.extend_from_slice(&nth.encode());
     // NDP16: signature (session-signed), wLength, wNextNdpIndex = 0.
-    ntb.extend_from_slice(&ndp_signature_ips(session).to_le_bytes());
+    ntb.extend_from_slice(&signature.to_le_bytes());
     ntb.extend_from_slice(&(SINGLE_NDP16_LEN as u16).to_le_bytes());
     ntb.extend_from_slice(&0u16.to_le_bytes());
     // The single datagram-pointer entry, then the null terminator.
@@ -124,12 +163,22 @@ pub fn build_mbim_ntb(sequence: u16, session: u8, datagram: &[u8]) -> Vec<u8> {
     ntb
 }
 
-/// One datagram recovered from an NTB: the IP session it belongs to
+/// Build a single-datagram NTB-16 for IP session `session`.
+pub fn build_mbim_ntb(sequence: u16, session: u8, datagram: &[u8]) -> Vec<u8> {
+    build_ntb_with_signature(sequence, ndp_signature_ips(session), datagram)
+}
+
+/// Build a single-datagram NTB-16 for DSS session `session`.
+pub fn build_mbim_dss_ntb(sequence: u16, session: u8, datagram: &[u8]) -> Vec<u8> {
+    build_ntb_with_signature(sequence, ndp_signature_dss(session), datagram)
+}
+
+/// One datagram recovered from an NTB: the stream it belongs to
 /// (from the NDP signature) and the raw datagram bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MbimDatagram<'a> {
-    /// SessionId from the NDP signature.
-    pub session: u8,
+    /// Stream from the NDP signature (IPS session or DSS session).
+    pub stream: NdpStream,
     /// The raw datagram bytes.
     pub data: &'a [u8],
 }
@@ -156,7 +205,7 @@ pub fn parse_mbim_ntb(ntb: &[u8]) -> Result<Vec<MbimDatagram<'_>>, WwanError> {
         ]);
         let ndp_len = u16::from_le_bytes([ntb[ndp_offset + 4], ntb[ndp_offset + 5]]) as usize;
         let next = u16::from_le_bytes([ntb[ndp_offset + 6], ntb[ndp_offset + 7]]) as usize;
-        let session = ndp_signature_session(signature).ok_or(WwanError::MalformedFrame)?;
+        let stream = ndp_signature_stream(signature).ok_or(WwanError::MalformedFrame)?;
         if ndp_len < 8 + 4 || ndp_len % 4 != 0 || ndp_offset + ndp_len > ntb.len() {
             return Err(WwanError::MalformedFrame);
         }
@@ -175,7 +224,7 @@ pub fn parse_mbim_ntb(ntb: &[u8]) -> Result<Vec<MbimDatagram<'_>>, WwanError> {
                 break;
             }
             out.push(MbimDatagram {
-                session,
+                stream,
                 data: &ntb[off..off + len],
             });
         }
@@ -203,6 +252,15 @@ struct SessionNet {
     ipv4: Option<Ipv4Configuration>,
 }
 
+/// One DSS stream's queued datagrams, backing its registry port.
+/// DSS payloads are service-defined byte streams (modem logs, NMEA,
+/// ...); the NTB datagram is transport framing only, so RX flattens
+/// datagrams into a per-datagram queue the port drains in order.
+struct DssStream {
+    session: u8,
+    queue: Vec<Vec<u8>>,
+}
+
 /// One registered bearer (one modem data channel).
 struct BearerRecord {
     tx: Arc<dyn BearerTxSink>,
@@ -210,6 +268,7 @@ struct BearerRecord {
     detached: bool,
     next_sequence: u16,
     sessions: Vec<SessionNet>,
+    dss_streams: Vec<DssStream>,
     /// TX frames dropped because the ethertype was not IPv4/IPv6
     /// (ARP and friends cannot cross an MBIM bearer).
     dropped_non_ip_tx: u64,
@@ -217,6 +276,9 @@ struct BearerRecord {
     dropped_unknown_session_rx: u64,
     /// RX datagrams dropped because they were not IP-shaped.
     dropped_non_ip_rx: u64,
+    /// RX DSS datagrams dropped because no DSS stream is registered
+    /// for their session. Never misrouted to an IP netdev.
+    dropped_dss_no_consumer_rx: u64,
 }
 
 static BEARERS: IrqSafeSpinLock<Vec<BearerRecord>> = IrqSafeSpinLock::new(Vec::new());
@@ -232,9 +294,11 @@ pub fn register_bearer(tx: Arc<dyn BearerTxSink>, mac: [u8; 6]) -> usize {
         detached: false,
         next_sequence: 0,
         sessions: Vec::new(),
+        dss_streams: Vec::new(),
         dropped_non_ip_tx: 0,
         dropped_unknown_session_rx: 0,
         dropped_non_ip_rx: 0,
+        dropped_dss_no_consumer_rx: 0,
     });
     g.len() - 1
 }
@@ -265,6 +329,14 @@ pub fn bearer_drop_counters(bearer: usize) -> Option<(u64, u64, u64)> {
             r.dropped_non_ip_rx,
         )
     })
+}
+
+/// RX DSS datagrams dropped for want of a registered DSS stream.
+pub fn bearer_dss_drop_counters(bearer: usize) -> Option<u64> {
+    BEARERS
+        .lock()
+        .get(bearer)
+        .map(|r| r.dropped_dss_no_consumer_rx)
 }
 
 /// Whether bearer `bearer` has been marked detached.
@@ -356,6 +428,106 @@ pub fn publish_session_netdev(bearer: usize, session: u8) -> Result<String, Wwan
     Ok(assigned)
 }
 
+/// A DSS stream surfaced as a registry port. Unlike IP bearers
+/// (netdevs), a DSS stream carries a service-defined byte stream
+/// with no IP, ethertype, or carrier semantics, so the port
+/// registry — not a netdev — is its home. TX wraps one payload in
+/// one DSS-signed NTB; RX drains queued datagrams in order,
+/// preserving datagram boundaries across partial reads.
+struct DssStreamPort {
+    bearer: usize,
+    session: u8,
+    name: String,
+}
+
+impl WwanPort for DssStreamPort {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn kind(&self) -> WwanPortKind {
+        WwanPortKind::Dss
+    }
+
+    fn send(&self, payload: &[u8]) -> Result<(), WwanError> {
+        let (tx, sequence) = {
+            let mut g = BEARERS.lock();
+            let Some(rec) = g.get_mut(self.bearer) else {
+                return Err(WwanError::NotReady);
+            };
+            if rec.detached || !rec.dss_streams.iter().any(|s| s.session == self.session) {
+                return Err(WwanError::NotReady);
+            }
+            let seq = rec.next_sequence;
+            rec.next_sequence = rec.next_sequence.wrapping_add(1);
+            (rec.tx.clone(), seq)
+        };
+        let ntb = build_mbim_dss_ntb(sequence, self.session, payload);
+        tx.send_ntb(&ntb)
+    }
+
+    fn recv(&self, buf: &mut [u8]) -> Result<usize, WwanError> {
+        let mut g = BEARERS.lock();
+        let Some(rec) = g.get_mut(self.bearer) else {
+            return Err(WwanError::NotReady);
+        };
+        let Some(stream) = rec
+            .dss_streams
+            .iter_mut()
+            .find(|s| s.session == self.session)
+        else {
+            return Err(WwanError::NotReady);
+        };
+        let Some(front) = stream.queue.first_mut() else {
+            return Ok(0);
+        };
+        let n = front.len().min(buf.len());
+        buf[..n].copy_from_slice(&front[..n]);
+        if n == front.len() {
+            stream.queue.remove(0);
+        } else {
+            front.drain(..n);
+        }
+        Ok(n)
+    }
+}
+
+/// Register a DSS stream port for `(bearer, session)`, idempotent:
+/// re-registering returns the existing port name without duplicating
+/// the port or the stream. Port name: `wwan{bearer}dss{session}`.
+///
+/// This is the DATAPATH half of #1143 only. It does not activate
+/// anything on the modem: the MBIM_CID_DSS_CONNECT command values
+/// (service UUID, CID, payload layout) did not ground from any
+/// source reachable for this lane (MBIM 1.0 §10.5.38 text and
+/// libmbim's mbim-cid.h/mbim-uuid.h DSS entries were both
+/// unobtainable), so no connect command is built here rather than
+/// a guessed one. A stream registered here still demultiplexes
+/// device-initiated DSS traffic correctly.
+pub fn register_dss_stream(bearer: usize, session: u8) -> Result<String, WwanError> {
+    let name = alloc::format!("wwan{}dss{}", bearer, session);
+    {
+        let mut g = BEARERS.lock();
+        let rec = g.get_mut(bearer).ok_or(WwanError::NotReady)?;
+        if rec.detached {
+            return Err(WwanError::NotReady);
+        }
+        if rec.dss_streams.iter().any(|s| s.session == session) {
+            return Ok(name);
+        }
+        rec.dss_streams.push(DssStream {
+            session,
+            queue: Vec::new(),
+        });
+    }
+    crate::register_port(Arc::new(DssStreamPort {
+        bearer,
+        session,
+        name: name.clone(),
+    }));
+    Ok(name)
+}
+
 /// The `SendCtxFn` trampoline for every MBIM session netdev. The
 /// cookie resolves to exactly one (bearer, session); the Ethernet
 /// header the stack put on the frame is validated and stripped, and
@@ -413,16 +585,32 @@ fn count_drop(bearer: usize, kind: DropKind) {
 
 // ─── RX delivery ─────────────────────────────────────────────────────────────
 
-/// Deliver one received NTB to its sessions' netdevs. Each datagram
-/// is wrapped in a synthesized Ethernet header — destination = the
-/// iface MAC, source = zero, ethertype from the IP version nibble —
-/// mirroring `cdc_mbim_process_dgram`. Datagrams for sessions with no
-/// published netdev and non-IP payloads are dropped and counted,
-/// never cross-delivered.
+/// Deliver one received NTB to its streams. IPS datagrams go to
+/// their session's netdev, each wrapped in a synthesized Ethernet
+/// header — destination = the iface MAC, source = zero, ethertype
+/// from the IP version nibble — mirroring
+/// `cdc_mbim_process_dgram`. DSS datagrams go ONLY to their
+/// session's registered DSS stream port, never to an IP netdev,
+/// and IPS datagrams never land in a DSS queue: the two namespaces
+/// share a wire but no delivery path. Datagrams for sessions with
+/// no published netdev (IPS) or no registered stream (DSS) and
+/// non-IP payloads are dropped and counted, never cross-delivered.
 pub fn deliver_ntb(bearer: usize, ntb: &[u8]) -> Result<(), WwanError> {
     let datagrams = parse_mbim_ntb(ntb)?;
     for dg in datagrams {
-        let Some(name) = session_iface_name(bearer, dg.session) else {
+        if let NdpStream::Dss(session) = dg.stream {
+            let mut g = BEARERS.lock();
+            if let Some(rec) = g.get_mut(bearer) {
+                if let Some(stream) = rec.dss_streams.iter_mut().find(|s| s.session == session) {
+                    stream.queue.push(dg.data.to_vec());
+                } else {
+                    rec.dropped_dss_no_consumer_rx += 1;
+                }
+            }
+            continue;
+        }
+        let session = dg.stream.session();
+        let Some(name) = session_iface_name(bearer, session) else {
             count_drop(bearer, DropKind::UnknownSessionRx);
             continue;
         };

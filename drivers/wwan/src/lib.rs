@@ -17,6 +17,9 @@
 //     class-request bring-up, control port, RX/notification pumps
 //   - Raw-IP bearer → netdev handoff over the NCM NTB-16 framing
 //     with MBIM session-signed NDPs (Linux cdc_mbim's adaptation)
+//   - DSS stream demux + registry ports (datapath only; the
+//     MBIM_CID_DSS_CONNECT command values are still ungrounded —
+//     see #1143)
 //   - QMI control-message header encode (Qualcomm QMI framing)
 //   - IOSM PCI device-ID table (XMM 7560 / 7360)
 //
@@ -59,8 +62,9 @@ pub mod tests;
 /// Classifies what protocol a WWAN port speaks.
 ///
 /// Mirrors `enum wwan_port_type` from `include/linux/wwan.h` but trimmed to
-/// the subset NARF needs for Stage-0/1.  Variants are kept exhaustive so that
-/// `match` arms can never silently miss a new kind.
+/// the subset NARF needs for Stage-0/1, plus one NARF extension.
+/// Variants are kept exhaustive so that `match` arms can never
+/// silently miss a new kind.
 ///
 /// Linux ref: `include/linux/wwan.h` — `WWAN_PORT_AT`, `WWAN_PORT_MBIM`,
 /// `WWAN_PORT_QMI`, `WWAN_PORT_FIREHOSE`.
@@ -74,6 +78,12 @@ pub enum WwanPortKind {
     Qmi,
     /// Raw IP data bearer (no control protocol framing on this port).
     Data,
+    /// MBIM Device Service Stream (DSS) byte stream. NARF extension:
+    /// Linux models DSS sessions as VLAN subdevices of the master
+    /// wwan netdev, but NARF has no VLAN layer, so DSS streams
+    /// surface as registry ports instead. They are NOT IP bearers:
+    /// no ethertype, no carrier, no netdev.
+    Dss,
 }
 
 // ─── WwanError ───────────────────────────────────────────────────────────────
@@ -131,10 +141,12 @@ pub trait WwanPort: Send + Sync {
 //
 // The registry the crate was scaffolded around: every bound modem
 // registers its control port here at bring-up (the USB MBIM binding
-// registers one Mbim port per modem). Data bearers are NOT ports —
+// registers one Mbim port per modem). IP data bearers are NOT ports —
 // they are netdevs (see bearer.rs), mirroring Linux's wwan core,
 // where bearers surface as network devices and only control channels
-// are wwan ports.
+// are wwan ports. DSS streams ARE ports: a DSS stream is a byte
+// stream with no IP semantics, so it has no netdev to surface as
+// (see bearer.rs `register_dss_stream`).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
