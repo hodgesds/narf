@@ -15,7 +15,7 @@ use crate::intel_gpu_guc_firmware::GuCFirmware;
 use crate::intel_gpu_guc_sched::{GuCScheduler, SchedulingError};
 use crate::intel_gpu_guc_transport::{Mailbox, TransportError, TransportState, XeLpgTransport};
 use crate::intel_gpu_hwconfig::HardwareConfig;
-use crate::intel_gpu_nonpriv::RcsPolicy;
+use crate::intel_gpu_nonpriv::EnginePolicy;
 use crate::intel_gpu_topology::{GtTopology, TopologyError};
 use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
@@ -336,7 +336,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     fn verify_register_policy(&self) -> Result<(), GtError> {
-        RcsPolicy::new(self.parts.boot.platform())
+        EnginePolicy::new(self.parts.boot.platform())
             .and_then(|policy| policy.verify(self.parts.boot.window()))
             .map_err(GtError::Registers)
     }

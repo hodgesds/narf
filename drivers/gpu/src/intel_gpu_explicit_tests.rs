@@ -85,7 +85,7 @@ fn smoke_explicit_output_transaction_and_real_terminal_fence() -> TestResult {
     let (id, fence) = gt
         .submit_user_batch_with_output(100, context.clone(), UserBatch(batch), &output)
         .unwrap();
-    assert_eq!(id, 3, "failed output transactions consumed an identity");
+    assert_eq!(id, 5, "failed output transactions consumed an identity"); // after RCS+BCS priming
     assert_eq!(
         u64_at(&user.user.load(120, 8), 0),
         (17u64 << 32) | 0x76543210

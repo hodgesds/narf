@@ -58,14 +58,15 @@ fn smoke_xe_explicit_queues_overlap_and_cpu_reservations_wait_for_both() -> Test
             break;
         }
     }
-    assert_eq!(registered.keys().copied().collect::<Vec<_>>(), [3, 4]);
-    execute_one(&w, &registered, 3);
+    // Priming consumed IDs 1-2 (RCS0) and 3-4 (BCS0).
+    assert_eq!(registered.keys().copied().collect::<Vec<_>>(), [5, 6]);
+    execute_one(&w, &registered, 5);
     finish(&mut gt, &w, &f1, &mut registered, 130);
     assert_eq!(f2.result(), None);
     assert_eq!(registered.len(), 1);
     assert_eq!(data.dma_buf.resv.fences(DmaResvUsage::Write).len(), 1);
     assert_eq!(data.read(128, &mut [0; 4]), Err(FsError::WouldBlock));
-    execute_one(&w, &registered, 4);
+    execute_one(&w, &registered, 6);
     finish(&mut gt, &w, &f2, &mut registered, 200);
     let mut value = [0; 4];
     data.read(128, &mut value).unwrap();

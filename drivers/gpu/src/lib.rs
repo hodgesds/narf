@@ -708,6 +708,8 @@ pub mod intel_gpu_dp_bridge;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_edp;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_engine;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_exec;
 #[cfg(feature = "intel")]
 mod intel_gpu_exec_sync;

@@ -646,7 +646,7 @@ fn smoke_hardware_register_initialization_gates_scheduling() -> TestResult {
         } else {
             gt.begin_scheduling(12).unwrap();
             let count = arena.live_allocations();
-            assert_eq!(count, before + 2);
+            assert_eq!(count, before + 4); // HWSP + golden per RCS0/BCS0
             if failure == 1 {
                 w.0.borrow_mut().regs.insert(0xe7cc, u32::MAX);
                 assert_eq!(
@@ -787,11 +787,15 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 event(&memory, 0x7001, &[request[1]]);
             }
             0x4502 => {
-                assert_eq!(&request[1..10], &[1, request[2], 0, 1, 0, 0, 0, 0, 0]);
+                // GUC_RENDER_CLASS for RCS0, GUC_BLITTER_CLASS for BCS0.
+                assert!(matches!(request[3], 0 | 3));
+                assert_eq!(&request[1..10], &[1, request[2], request[3], 1, 0, 0, 0, 0, 0]);
                 assert_eq!(request.len(), 12);
                 assert!(matches!(request[10] & 0xfff, 0x19 | 0x119));
                 let image = w.0.borrow().memory[&(request[10] & !0xfff)].clone();
                 assert_eq!(image.borrow()[1024 + 0x33] != 0, request[10] & 0x100 != 0);
+                let base = if request[3] == 3 { 0x22244 } else { 0x2244 };
+                assert_eq!(image.borrow()[1024 + 2], base);
                 assert_eq!(request[11], 0);
                 assert!(registered
                     .insert(request[2], request[10] & !0xfff)
@@ -808,7 +812,10 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
             0x1001 => {
                 let id = request[1];
                 let base = registered[&id];
-                if request[2] == 1 && execute {
+                let copy = w.0.borrow().memory[&base].borrow()[1024 + 2] == 0x22244;
+                if request[2] == 1 && execute && copy {
+                    execute_copy(w, base);
+                } else if request[2] == 1 && execute {
                     let mut d = w.0.borrow_mut();
                     assert!(d.synced.contains(&base));
                     let image = d.memory[&base].clone();
@@ -893,6 +900,134 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
         }
     }
     actions
+}
+
+// Independent BCS0 model from Linux xe_lrc.c {gen12_xcs,xe2_bcs}_offsets,
+// xe_ring_ops.c::__emit_job_gen12_simple and xe_gt.c::emit_wa_job literals.
+fn execute_copy(w: &Window, base: u32) {
+    let mut d = w.0.borrow_mut();
+    assert!(d.synced.contains(&base));
+    let xe2 = d.regs[&0xd8c] >> 22 == 20;
+    let image = d.memory[&base].clone();
+    let (tail, ring_base) = {
+        let data = image.borrow();
+        assert_eq!(data.len(), 2048);
+        assert_eq!(
+            &data[1024..1031],
+            &[
+                0,
+                if xe2 { 0x1108101d } else { 0x11081019 },
+                0x22244,
+                data[1027],
+                0x22034,
+                0,
+                0x22030
+            ]
+        );
+        assert!(matches!(data[1027], 0x00090009 | 0x00090008));
+        assert_eq!((data[1032], data[1024 + 0x21]), (0x22038, 0x11081011));
+        assert_eq!(data[1024 + 0x71], 0x01000000);
+        (data[1024 + 7], data[1024 + 9])
+    };
+    assert!(d.synced.contains(&ring_base));
+    let ring = d.memory[&ring_base].borrow().clone();
+    let words = &ring[..tail as usize / 4];
+    assert_eq!(words.len() % 2, 0);
+    let stamp = if tail == 32 {
+        assert_eq!(&words[..3], &[0x04000001, 0, 0x10400002]);
+        assert_eq!(words[3], base + 0x800);
+        words[5]
+    } else {
+        // MI_FLUSH_DW | OP_STOREDW | IMM_DW to the GGTT breadcrumb, then
+        // MI_USER_INTERRUPT, ARB_ON, ARB_CHECK.
+        let at = words
+            .windows(7)
+            .rposition(|v| {
+                v[..3] == [0x13004002, (base + 0x800) | 4, 0]
+                    && v[4..] == [0x01000000, 0x04000001, 0x02800000]
+            })
+            .expect("copy breadcrumb");
+        words[at + 3]
+    };
+    assert_ne!(stamp, 0);
+    let root = (u64::from(image.borrow()[1024 + 0x31]) << 32) | u64::from(image.borrow()[1024 + 0x33]);
+    if root != 0 {
+        // A PPGTT copy job begins with a TLB-invalidating start stamp.
+        assert_eq!(
+            &words[..7],
+            &[0x04000001, 0x02800101, 0x13044002, (base + 0x808) | 4, 0, stamp, 0x02800100]
+        );
+        execute_copy_ppgtt(root, &words[7..]);
+    } else if tail != 32 {
+        // emit_wa_job's non-MCR RMW of BLIT_CCTL to the uncached MOCS.
+        // RING_CMD_CCTL is pinned per platform by the RCS tests; BCS0's ring
+        // and BLIT_CCTL must use the same uncached MOCS index.
+        let cctl = d.regs[&0x20c4];
+        assert_eq!(d.regs[&0x220c4], cctl);
+        let uc = (cctl >> 1) & 0x3f;
+        assert_eq!(cctl, 0x3f7e0000 | uc << 8 | uc << 1);
+        assert_eq!(
+            &words[1..28],
+            &[
+                0x15080001, 0x22204, 0x600, 0x11080003, 0x608, 0x7e7e, 0x610,
+                uc << 9 | uc << 1, 0x0d000007, 0x08008000, 0x48008401, 0x10200000,
+                0x18000031, 0x08008000, 0x08008402, 0x10300000, 0x18000031, 0x15040001,
+                0x600, 0x22204, 0x11080005, 0x600, 0, 0x608, 0, 0x610, 0,
+            ]
+        );
+        let old = d.regs.get(&0x22204).copied().unwrap_or(0xffff_ffff);
+        let value = (old & !0x7e7e) | uc << 9 | uc << 1;
+        d.regs.insert(0x22204, value);
+        if xe2 {
+            // xe2_bcs_offsets saves BLIT_CCTL in the context image.
+            image.borrow_mut()[1024 + 0x45] = value;
+        }
+    }
+    image.borrow_mut()[0x800 / 4] = stamp;
+    image.borrow_mut()[1024 + 5] = tail;
+}
+
+// Walk the production page tables for a copy job: an optional PPGTT batch
+// whose literal MI_STORE_DATA_IMM is executed, then an optional user fence.
+fn execute_copy_ppgtt(root: u64, words: &[u32]) {
+    let walk = |va: u64| -> u64 {
+        let mut page = root & 0x0000_3fff_ffff_f000;
+        for shift in [39, 30, 21, 12] {
+            let address = narf_memory::PhysAddr::new(page).kernel_ptr::<u64>();
+            // SAFETY: the fixture's production tables stay resident until
+            // terminal completion; this walk never dereferences user memory.
+            let entry =
+                unsafe { core::ptr::read_volatile(address.add(((va >> shift) & 511) as usize)) };
+            assert_eq!(entry & 1, 1);
+            page = entry & 0x0000_3fff_ffff_f000;
+        }
+        page | (va & 4095)
+    };
+    let mut i = 0;
+    if words[0] == 0x18800101 {
+        let batch = u64::from(words[1]) | u64::from(words[2]) << 32;
+        let code = narf_memory::PhysAddr::new(walk(batch)).kernel_ptr::<u32>();
+        // SAFETY: translated page is an owned resident batch BO.
+        let cmd = unsafe { core::slice::from_raw_parts(code, 6) };
+        assert_eq!((cmd[0], cmd[4], cmd[5]), (0x10000002, 0x05000000, 0));
+        let dst = u64::from(cmd[1]) | u64::from(cmd[2]) << 32;
+        let target = narf_memory::PhysAddr::new(walk(dst)).kernel_mut_ptr::<u32>();
+        // SAFETY: the walk resolved one owned writable result dword.
+        unsafe { core::ptr::write_volatile(target, cmd[3]) };
+        i = 3;
+    }
+    assert_eq!(words[i], 0x04000000);
+    i += 1;
+    if words[i] == 0x13000002 {
+        assert_eq!(&words[i + 1..i + 5], &[0, 0, 0, 0x10200003]);
+        let address = u64::from(words[i + 5]) | u64::from(words[i + 6]) << 32;
+        let value = u64::from(words[i + 7]) | u64::from(words[i + 8]) << 32;
+        let target = narf_memory::PhysAddr::new(walk(address)).kernel_mut_ptr::<u64>();
+        // SAFETY: an owned, aligned, writable user-fence qword.
+        unsafe { core::ptr::write_volatile(target, value) };
+        i += 9;
+    }
+    assert_eq!(words[i], 0x13004002);
 }
 
 // Independent fixed-command device model. It follows the actual production
@@ -992,8 +1127,12 @@ fn execute_ppgtt_probe(regs: &BTreeMap<u64, u32>, image: &[u32], ring: &[u32], i
 }
 
 fn golden_memory(w: &Window) -> Words {
+    golden_for_class(w, 0)
+}
+
+fn golden_for_class(w: &Window, class: usize) -> Words {
     let d = w.0.borrow();
-    let base = d.memory[&0x20001000].borrow()[0x1014 / 4];
+    let base = d.memory[&0x20001000].borrow()[0x1014 / 4 + class];
     d.memory[&base].clone()
 }
 
@@ -1026,7 +1165,9 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
         hardware_scheduling(&mut gt, &w);
         let count = arena.live_allocations();
         let golden = golden_memory(&w);
+        let copy_golden = golden_for_class(&w, 3);
         assert!(golden.borrow().iter().all(|word| *word == 0));
+        assert!(copy_golden.borrow().iter().all(|word| *word == 0));
         let completion = gt.begin_context_defaults(26).unwrap();
         assert!(!gt.context_defaults_ready());
         assert!(matches!(gt.begin_context_defaults(26), Err(GtError::Busy)));
@@ -1049,19 +1190,26 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
         }
         let mut registered = BTreeMap::new();
         let mut registrations = 0;
-        for now in 27..90 {
+        let mut rcs_first = false;
+        for now in 27..150 {
             assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
             if completion.result().is_some() {
                 break;
             }
             assert!(!gt.context_defaults_ready());
-            assert!(golden.borrow().iter().all(|word| *word == 0));
+            // RCS publishes before BCS's seed; BCS publishes only at the end.
+            assert!(copy_golden.borrow().iter().all(|word| *word == 0));
+            if !rcs_first && golden.borrow().iter().any(|word| *word != 0) {
+                rcs_first = true;
+                assert_eq!(registrations, 2);
+            }
             registrations += service_contexts(&w, &mut registered, true)
                 .iter()
                 .filter(|a| **a == 0x4502)
                 .count();
         }
-        assert_eq!(registrations, 2);
+        assert!(rcs_first);
+        assert_eq!(registrations, 4);
         assert_eq!(completion.result(), Some(Ok(())));
         assert!(gt.context_defaults_ready());
         assert_eq!(arena.live_allocations(), count);
@@ -1082,6 +1230,33 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
                     0x79000002
                 }
             );
+        }
+        {
+            // BCS0's retired seed image: restore enabled, ring slots cleared,
+            // hardware-saved BLIT_CCTL (xe2_bcs_offsets) carried to clones.
+            let data = copy_golden.borrow();
+            assert_eq!(data.len(), 2048);
+            assert!(data[..1024].iter().all(|word| *word == 0));
+            let xe2 = platform == GtPlatform::Battlemage;
+            assert_eq!(data[1025], if xe2 { 0x1108101d } else { 0x11081019 });
+            assert_eq!((data[1026], data[1027]), (0x22244, 0x00090008));
+            assert_eq!((data[1029], data[1031], data[1033]), (0, 0, 0));
+            if xe2 {
+                // RMW of the all-ones fixture reset value keeps reserved bits.
+                assert_eq!(data[1024 + 0x45], (u32::MAX & !0x7e7e) | 3 << 9 | 3 << 1);
+            }
+            let ads = w.0.borrow().memory[&0x20001000].clone();
+            let ads = ads.borrow();
+            // Mapping, enable mask, state size and BCS0 register saves.
+            assert_eq!((ads[(0x123c + 96) / 4], ads[(0x123c + 524) / 4]), (0x20202000, 1));
+            assert_eq!(ads[0x1060 / 4], 8192 - 4096 - 384);
+            assert_eq!(ads[0x300 / 4 + 1], 3);
+            let saves = (ads[0x300 / 4] - 0x20001000) as usize / 4;
+            assert_eq!(
+                [ads[saves], ads[saves + 2], ads[saves + 4], ads[saves + 8], ads[saves + 12]],
+                [0x2229c, 1, 0x22080, 0x220a8, 0]
+            );
+            assert_eq!(ads[saves + 5], w.0.borrow().regs[&0x22080]);
         }
         // A fresh PPGTT context must inherit the device's saved opaque state,
         // restore it rather than inhibit, and receive its own ring and root.

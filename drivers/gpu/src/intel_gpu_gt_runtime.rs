@@ -552,7 +552,7 @@ impl Owner {
                     );
                     log(
                         self.pending.index,
-                        "GuC ready; default RCS state, private PPGTT store and retirement verified",
+                        "GuC ready; default RCS/BCS state, private PPGTT store and retirement verified",
                     );
                 }
             }

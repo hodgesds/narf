@@ -72,6 +72,8 @@ mod tests {
                     | 0xe4c4
                     | 0xe5f4
                     | 0x2050
+                    | 0x220d4
+                    | 0x22050
             );
             regs.insert(
                 reg,
@@ -461,7 +463,7 @@ impl RegisterInit {
                 }
             }
         }
-        crate::intel_gpu_nonpriv::RcsPolicy::new(self.platform)?.install(mmio)
+        crate::intel_gpu_nonpriv::EnginePolicy::new(self.platform)?.install(mmio)
     }
 
     fn entries(&self, flat: bool) -> Vec<Entry> {
@@ -580,6 +582,9 @@ impl RegisterInit {
                     add(0xe5f4, 0x20, 0x20, true, Dss); // 18041344222 PF only
                 }
                 add(0x2050, 0x1000, 0x1000, true, Direct); // 16023105232
+                                                           // FOREACH_ENGINE/ENGINE_BASE entries reach BCS0 as well.
+                add(0x220d4, 0xc080, 0xc080, true, Direct); // 16021639441 + priority reads
+                add(0x22050, 0x1000, 0x1000, true, Direct); // 16023105232
                 add(0xe530, 0x400, 0x400, false, Dss); // AnyHit null-query tuning
             }
         }

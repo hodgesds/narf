@@ -141,13 +141,20 @@ struct State {
 pub struct UserContext {
     /// Orders callers while allowing GT/timer tasks to run during waits.
     pub(crate) serial: Mutex<()>,
+    engine: crate::intel_gpu_engine::Engine,
     state: IrqSafeSpinLock<State>,
 }
 
 impl UserContext {
     pub fn new() -> Arc<Self> {
+        Self::for_engine(crate::intel_gpu_engine::Engine::Rcs0)
+    }
+
+    /// The engine is immutable: saved state belongs to one class's layout.
+    pub fn for_engine(engine: crate::intel_gpu_engine::Engine) -> Arc<Self> {
         Arc::new(Self {
             serial: Mutex::new(()),
+            engine,
             state: IrqSafeSpinLock::new(State {
                 epoch: 0,
                 busy: false,
@@ -161,6 +168,9 @@ impl UserContext {
         })
     }
 
+    pub fn engine(&self) -> crate::intel_gpu_engine::Engine {
+        self.engine
+    }
     pub(crate) fn last(&self) -> Option<Arc<CompletionFence>> {
         self.state.lock().last.clone()
     }
@@ -302,9 +312,9 @@ impl UserJob {
     }
     /// Called only after deregistration, exact-head/breadcrumb proof and the
     /// final TLB ACK, with device writes synchronized for the CPU.
-    pub(crate) fn capture(&self, image: &impl GpuBacking) -> Result<(), FsError> {
+    pub(crate) fn capture(&self, image: &impl GpuBacking, header: u32) -> Result<(), FsError> {
         let mut state = self.context.state.lock();
-        if state.epoch != self.epoch || !state.busy || image.read32(4100) != 0x1108101d {
+        if state.epoch != self.epoch || !state.busy || image.read32(4100) != header {
             return Err(io_error());
         }
         for (i, word) in state.image.iter_mut().enumerate() {

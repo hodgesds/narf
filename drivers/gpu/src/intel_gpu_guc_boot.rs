@@ -735,22 +735,34 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                         let config = self.scheduling.expect("scheduling reload");
                         let ads = &self.resources.ads;
                         let base = ads.ggtt_offset();
-                        // Populate only while GuC is proven stopped. RCS0 is
-                        // the only engine enabled by this kernel bring-up path.
-                        ads.write32(SYSINFO, 0x20202000);
-                        ads.write32(SYSINFO + 512, 1);
-                        ads.write32(0x1014, config.golden);
-                        ads.write32(0x1054, config.bytes - 4096 - 96 * 4);
+                        // Populate only while GuC is proven stopped: RCS0 and
+                        // BCS0, each logical instance 0 of its GuC class.
+                        // xe_guc_ads.c mapping/enable masks, golden LRCA with
+                        // its post-register state size, and per-engine saves.
                         ads.write32(POLICIES + 76, 1); // no autonomous engine reset
-                        ads.write32(0, base + 0x2000);
-                        ads.write32(4, 3);
-                        ads.write32(0x2014, config.hwsp);
-                        for (i, (reg, flags)) in [(0x229c, 1), (0x2080, 0), (0x20a8, 0)]
+                        for engine in crate::intel_gpu_engine::Engine::ALL {
+                            let class = u64::from(engine.guc_class());
+                            let state = config.engines[engine.index()];
+                            let base_reg = engine.base();
+                            let saves = 0x2000 + engine.index() as u64 * 48;
+                            ads.write32(SYSINFO + class * 32, 0x20202000);
+                            ads.write32(SYSINFO + 512 + class * 4, 1);
+                            ads.write32(0x1014 + class * 4, state.golden);
+                            ads.write32(0x1054 + class * 4, state.bytes - 4096 - 96 * 4);
+                            ads.write32(class * 256, base + saves as u32);
+                            ads.write32(class * 256 + 4, 3);
+                            for (i, (reg, value, flags)) in [
+                                (base_reg + 0x29c, 0, 1),
+                                (base_reg + 0x80, state.hwsp, 0),
+                                (base_reg + 0xa8, 0, 0),
+                            ]
                             .into_iter()
                             .enumerate()
-                        {
-                            ads.write32(0x2000 + i as u64 * 16, reg);
-                            ads.write32(0x2008 + i as u64 * 16, flags);
+                            {
+                                ads.write32(saves + i as u64 * 16, reg);
+                                ads.write32(saves + i as u64 * 16 + 4, value);
+                                ads.write32(saves + i as u64 * 16 + 8, flags);
+                            }
                         }
                         self.state = BootState::Staged;
                         self.begin(now)?;

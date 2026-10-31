@@ -350,16 +350,22 @@ output fd cannot abandon hardware ownership.
 Err guarantees no job was queued; Ok returns the GT's terminal fence and
 transfers residency regardless of caller lifetime. `ExecRequest::prepare_user`
 constructs a `UserBatch` with private immutable PPGTT tables retaining its BOs.
-`GuCGt::submit_user_batch` is the safe untrusted-command entry. RCS0 uses
-MI_BATCH_BUFFER_START bit8 (nonsecure PPGTT), independently of LRC descriptor
-bit8 (PPGTT mode). Kernel ring, HWS, LRC and page tables are absent from user
+`GuCGt::submit_user_batch` is the safe untrusted-command entry; the context's
+immutable `Engine` selects RCS0 or BCS0. Both use MI_BATCH_BUFFER_START bit8
+(nonsecure PPGTT), independently of LRC descriptor bit8 (PPGTT mode). BCS0
+follows xe_ring_ops.c's simple job: a TLB-invalidating MI_FLUSH_DW start
+stamp, the batch, MI_ARB disable, an optional MI_FLUSH_DW plus posted PPGTT
+user-fence store, then the owned MI_FLUSH_DW GGTT breadcrumb and
+MI_USER_INTERRUPT. Kernel ring, HWS, LRC and page tables are absent from user
 PPGTT/CPU mappings. Hardware command privilege checking and the reverified RCS
 register whitelist apply throughout nested batches and concurrent CPU changes
 to leaf BOs. Leaf mappings are untrusted; no software opcode whitelist or GPU
 NX bit is claimed. Secure dispatch is always refused.
 
-`UserContext` retains a private saved LRC body between jobs. First execution
-starts from the primed golden image; later executions restore that context's
+`UserContext` retains a private saved LRC body between jobs, sized and
+header-checked for its engine (BCS0: one engine-state page; gen12_xcs layout
+before Xe2, xe2_bcs on BMG). First execution starts from that engine's primed
+golden image; later executions restore that context's
 own saved state and overwrite ring/control/status/root fields with fresh owned
 values. Capture synchronizes device writes only after exact head/breadcrumb,
 deregistration and final TLB proof. Global saved-image storage is capped at
@@ -581,14 +587,15 @@ and zero-payload 16:16 ADS KLVs before cache synchronization. The KLV page at
 ADS+0x3000 is separate from engine saves/private data, with the complete
 64-bit pointer and byte size in the packed ADS ABI. DG2 G11 selects context
 isolation, Xe-LPG pre-B0 selects hold-switchout, and Battlemage 20.01/20.02
-select different KLV lists. Only RCS0 is enabled: modern DUAL_QUEUE selection
-must be extended when CCS engines are admitted. Firmware flags do not grant
+select different KLV lists. RCS0 and BCS0 are enabled: modern DUAL_QUEUE
+selection must be extended when CCS engines are admitted. Firmware flags do not grant
 userspace isolation, coordinated reset or RC6 admission.
 
 `GuCGt::begin_scheduling` requires awake authenticated Ready, validated HWCONFIG,
 observed nonempty geometry DSS, supported submission ABI and no CT. A compute-only
 GT cannot authorize RCS0 programming or allocation. It allocates owned HWS and golden-LRC
-storage, enters `PreparingScheduling`, and applies graphics-GT/RCS0 MMIO
+storage for RCS0 and BCS0 (`intel_gpu_engine::Engine::ALL`), enters
+`PreparingScheduling`, and applies graphics-GT/RCS0 MMIO
 workarounds and tunings before enabling the ring. `intel_gpu_gt_registers`
 selects exact DG2 G10/G11/G12 IDs, Xe-LPG 12.70/12.71/12.74 with pre-B0
 differences, and Battlemage 20.01/20.02 with flat-CCS and DSS-group fuse rules.
@@ -598,10 +605,15 @@ source-defined modern instance zero. Modern firmware steering contention
 yields with a deadline; every acquired semaphore is released and the selector
 restored on success or error. Preflight refuses unavailable registers before
 WA writes; readback failures close admission and retain owned storage through
-full reset. DG2 CACHE_MODE_SS is not read back (Wa_14012342262).
+full reset. DG2 CACHE_MODE_SS is not read back (Wa_14012342262). BMG also
+receives BCS0's ENGINE_BASE copies of Wa_16021639441/priority-read
+(CSFE_CHICKEN1 0x220d4) and Wa_16023105232 (RING_PSMI_CTL 0x22050).
 
-`intel_gpu_nonpriv` initializes RCS0's twelve FORCE_TO_NONPRIV slots while the
-engine is idle under the GT owner's forcewake holds. It refuses unavailable
+`intel_gpu_nonpriv::EnginePolicy` initializes RCS0's and BCS0's twelve
+FORCE_TO_NONPRIV slots each while the engines are idle under the GT owner's
+forcewake holds. Every inherited slot of both engines is cleared to its own
+RING_NOPID (0x2094 / 0x22094) and verified before any grant is written; BCS0
+has no whitelist entry on these profiles and retains NOPID in all twelve. It refuses unavailable
 slot reads, writes RING_NOPID (0x2094) to every inherited entry and verifies
 all twelve before installing the address-sorted Linux Xe policy: OAG status
 read-only (0xdafc), four read-only registers from OA head (0xdb00), and MMIO
@@ -618,11 +630,12 @@ the admitted DG2, Xe-LPG 12.70/12.71/12.74 and BMG 20.01/20.02 RCS0 profiles;
 legacy Gen12 execlists and other engine classes require their own tables.
 Installing OA register access alone does not open an OA stream or userspace queue.
 
-This covers the graphics GT and admitted RCS0; media and additional engine
+This covers the graphics GT and admitted RCS0/BCS0; media and additional engine
 classes require their own tables before admission. The owner then enables
-RCS0 under both wake holds and stops GuC before rewriting
-ADS. The reload enables only RCS0, installs engine mapping, HWS/register saves
-and source-defined context sizes, selects LiteRestore and disables autonomous
+RCS0 and BCS0 rings under both wake holds and stops GuC before rewriting
+ADS. The reload enables RCS0 (GuC class 0) and BCS0 (class 3), installs their
+mapping/enable masks, per-engine HWS/register saves (RING_MODE, HWS_PGA, IMR),
+golden LRCA and source-defined post-register state sizes, selects LiteRestore and disables autonomous
 engine resets until coordinated recovery is implemented. Firmware is then uploaded
 and authenticated again; ADS is never rewritten while live. GuC GGTT TLB
 invalidation precedes CT registration. `SchedulingReady` gives the scheduler
@@ -693,7 +706,11 @@ The priming scheduler fully retires the seed context while retaining its
 image, then executes and fully retires a different context to force a save.
 Only afterward does it synchronize the seed image for CPU access, copy the
 opaque device-saved body into the owned golden image, clear status/ring/root
-identity, and synchronize the template for GPU reads. Successful publication
+identity, and synchronize the template for GPU reads. Engines prime in
+`Engine::ALL` order: after RCS0 publishes, BCS0 seeds xe_gt.c's emit_wa_job
+equivalent (a non-MCR MI_MATH RMW of BLIT_CCTL to the platform's uncached MOCS
+index, then GPR clear), switches and publishes its own one-page golden image,
+with admission still Busy. Only the last engine's publication
 sets `context_defaults_ready()` and signals the fence; cancellation releases
 only waiters. New contexts copy this body, enable restoration, clear status
 and assign their own ring, timestamp and PDP0/PTBP. Malformed save evidence,
