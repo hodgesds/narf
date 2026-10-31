@@ -264,6 +264,19 @@ Later administrative-PM, active-scan, periodic-scan and control-lifecycle
 changes retain separate pending gates. Physical RF/silicon acceptance is
 separate from these software results.
 
+**Recount 2026-10-31** (accepted RTL PM and idle active scans):
+the ledger holds **110 `feature`** rows (109 driver,1 shared), **31 `chip`**
+and **0 `unknown`**. Exact checkpoint `0eb084197` adds32 native cases over
+`62b62ea68` and passes x86_64 **4326/0/13** and aarch64 **3967/0/7**.
+All524 Intel cases, eight RTL administrative-PM cases, eight RTL active-scan
+cases and386 MT registrations (384 pass,2 skip) are included. Resolved
+release CI for all five affected packages passes on both architectures,
+as do formatting, ordinary boots and both btrfs postflights. RTL PM and
+idle active scanning close. Exact Intel API89/Bz idle PNO and forced-stop
+publication retirement are accepted partial scopes; associated MLD PNO,
+associated RTL scanning and MT P2P management/roles retain separate gates.
+Physical qualification remains separate from these software results.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 9 | Wider bands/widths and EHT/MLO; AP/P2P/WoW and scheduled-scan continuations; exact admitted station/HE/TX A-MSDU profiles are software-validated |
@@ -272,7 +285,7 @@ separate from these software results.
 | ath10k | 18 | 2.4-GHz HT40/coexistence, additional streams/TX STBC and VHT160/80+80, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload |
 | ath9k | 9 | Channel/retune and HT40/SGI40 profiles, factory selection, periodic calibration, larger TX aggregates and idle/station sleep; other chips are separate rows |
 | rtlwifi | 8 | Other matched chips, HT40/VHT, antenna/gain/coexistence and RTS/CTS |
-| rtl8xxxu | 7 | Other matched USB chips, HT40, active/associated scanning and QoS Null, Bluetooth coexistence, broader bands/VHT and administrative PM |
+| rtl8xxxu | 5 | HT40, associated scanning and QoS Null, Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
 | rtw89 | 13 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW, periodic RF tracking/runtime LPS and multiple functions; other AX/BE chips are separate rows |
 | brcmfmac | 12 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
@@ -936,14 +949,14 @@ queues retained exact-image wake, and bound control returns Busy until
 that transition finishes. DOWN closes admission immediately and retires
 the old association before parking. Netlink IFF_UP and SIOCSIFFLAGS use
 the existing current administrative handle; scan never creates UP. The
-family §3 documents the interface and pending PM native acceptance.
+family §3 records software acceptance at `0eb084197`.
 
 RTL8188EU idle active scan admits one directed SSID or a wildcard and
 up to2048 bytes of structurally checked extra IEs. Each occupied channel
 requires current transmit permission. Source pre/post-probe timing and
 whole basic1 frame airtime bound mandatory dwell admission; actual USB
 delivery and subsequent device TX-state retirement remain distinct. The
-family §3 documents this private emitter and pending native acceptance.
+family §3 records software acceptance of this private emitter at `0eb084197`.
 
 ## 4. Interaction with `narf-wireless`
 

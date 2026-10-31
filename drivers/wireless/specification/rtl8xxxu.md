@@ -2,9 +2,9 @@
 
 > Status: runtime RTL8188EU factory/FIFO/firmware/MAC/BB/RF + LC/IQK implemented;
 > retained channel1 Open/WPA2 station service implemented; qualified legacy
-> channels1–13 and idle passive scans are implemented pending native acceptance.
-> Administrative cold park/wake is implemented pending its separate native acceptance.
-> Qualified idle active probe scanning is implemented pending its separate native acceptance.
+> channels1–13 and idle passive scans pass native software acceptance.
+> Administrative cold park/wake passes native software acceptance.
+> Qualified idle active probe scanning passes native software acceptance.
 > Broader profiles and physical acceptance remain incomplete. A separately
 > qualified RTL8188EU HT20/LGI SISO continuation passes14 native regressions
 > on both architectures; exact-device qualification remains external.
@@ -727,10 +727,10 @@ RXDMA/MAC-off receipts, and literal factory/occupied-band limits. All eight
 native cases pass on both architectures at `62b62ea68`, within full integration
 results of4294/0/13 on x86_64 and3935/0/7 on aarch64. Release CI, formatting,
 ordinary boots and both btrfs postflights also pass on that exact checkpoint.
-Physical-board acceptance remains separate. Later administrative-PM and active
-scan continuations retain their own pending native gates.
+Physical-board acceptance remains separate. Administrative-PM and idle active
+scan continuations are accepted below at their own later checkpoint.
 
-### Administrative radio park/wake (native acceptance pending)
+### Administrative radio park/wake (software-validated)
 
 The production attach path completes a physical cold park before publishing
 the initial IFF_DOWN interface. MAC RX/TX/filter closure, RXDMA terminal state,
@@ -789,9 +789,12 @@ WoWLAN, autosuspend or USB LPM modes absent from this family's source contract.
 Eight separate `drivers/wireless/rtl8xxxu/runtime_pm` native cases cover actual
 registration/queued ownership, initial DOWN, Open/WPA2 down/up with native DHCP
 and fresh PTK, held EP0 reversals, caller/source loss, registration replacement
-and failed bulk Stop. Their execution and physical-board acceptance are pending.
+and failed bulk Stop. All eight pass on both architectures at `0eb084197`,
+within integration results of4326/0/13 on x86_64 and3967/0/7 on aarch64.
+Resolved release CI, formatting, ordinary boots and both btrfs postflights
+pass at that checkpoint. Physical-board acceptance remains separate.
 
-### Idle active probe scanning (native acceptance pending)
+### Idle active probe scanning (software-validated)
 
 Active scans use the same retained idle station owner and qualified channels
 as passive scans. Linux `rtl8xxxu/core.c` advertises `max_scan_ssids=1`; this
@@ -854,8 +857,9 @@ native wait, old FIFO responses and home restoration. The independent device
 model withholds its response until delayed PHY consumption while MAC TX stays
 enabled, and holds SCH_TX_CMD separately from host completion. Early MAC TX
 closure loses the response; maximum IE timing and missing device terminals
-have literal negative cases. Only physical AP/USB inputs are inert; their
-execution and physical acceptance remain pending.
+have literal negative cases. All eight pass on both architectures at
+`0eb084197`, with the complete release gates recorded above. Physical
+AP/USB inputs remain inert, and physical qualification remains separate.
 
 ## 4. Invariants
 
@@ -889,10 +893,10 @@ RTL8188EU now reaches the retained channel1 Open/WPA2 station service through
 the production probe when exact-device signed qualification/deployment data
 is present. No real board curve has been acquired, qualified or installed by
 this software work. The initial profile needs physical validation. Qualified
-legacy idle channel changes and passive scans await native acceptance; broader
+legacy idle channel changes and passive scans pass native software gates; broader
 rates, connected scanning and endpoint reset remain software work.
-Administrative cold park/wake awaits its separate native acceptance.
-Idle active probe scanning awaits its separate native acceptance.
+Administrative cold park/wake passes native software gates at `0eb084197`.
+Idle active probe scanning passes native software gates at `0eb084197`.
 
 ## 8. Open questions / remaining software
 
@@ -907,15 +911,15 @@ Idle active probe scanning awaits its separate native acceptance.
 | Initial channel/crystal and retained RX activation | Implemented channel1 owner and admitted probe/service binding |
 | Signed board power artifact and checked native TX gate | Implemented software contract; real qualified per-device data must be acquired/signed/installed |
 | Native USB descriptor/packet ownership | Implemented dependency; persistent receipt/stop and Linux descriptor regressions |
-| Native beacon/management preparation and peer-bound transitions | Implemented basic1Mbps shared plan; qualified channels1–13 await native acceptance |
-| Production scan/MLME service and policy-admitted management TX | Qualified idle passive multi-channel scan/home restoration and active probe scan implemented pending native acceptance; signed board/deployment admission required; connected scans remain missing |
+| Native beacon/management preparation and peer-bound transitions | Implemented basic1Mbps shared plan; qualified channels1–13 pass native software gates |
+| Production scan/MLME service and policy-admitted management TX | Qualified idle passive multi-channel scan/home restoration and active probe scan pass native software gates; signed board/deployment admission required; connected scans remain missing |
 | Software AES-CCM + strict CCMP/key/TID ownership | Implemented dependency; independent ciphertext/forgery/role/PN regressions |
 | WPA2 key installation/controlled port and Ethernet transport | Implemented retained shared RSNA/software CCMP, exact native delivery, Narf-Rings and synchronous stack progress |
-| Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX. Qualified legacy channels1–13 and cold idle FIFO retuning await native acceptance. Separate N8HT HT20/LGI MCS0..7/whole A-MSDU/decline/capture-publication continuation passes native software gates above and stays channel1-bound. Management/basic1Mbps remains required. SGI/HT40, broader bands/adaptation and coexistence remain missing |
+| Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX. Qualified legacy channels1–13 and cold idle FIFO retuning pass native software gates. Separate N8HT HT20/LGI MCS0..7/whole A-MSDU/decline/capture-publication continuation passes native software gates above and stays channel1-bound. Management/basic1Mbps remains required. SGI/HT40, broader bands/adaptation and coexistence remain missing |
 | USB transfer ownership / stale handles | EP0 + bulk claims, retained command DMA and generation rejection implemented; slot reuse stays gated |
 | Non-stream bulk stop/drain | Implemented in USB; exact commands/context/event-prefix proof |
 | Disconnect/peer-loss callbacks and normal bulk stop | Implemented; a completed disconnect returns to Passive (safe rejoin) |
-| EP0/Halted reset, safe rejoin, FIFO retune and PM recovery | Bulk halt recovery and safe rejoin implemented; qualified idle cold FIFO retune and administrative cold park/wake await native acceptance; controller-proven EP0 reset remains missing |
+| EP0/Halted reset, safe rejoin, FIFO retune and PM recovery | Bulk halt recovery and safe rejoin implemented; qualified idle cold FIFO retune and administrative cold park/wake pass native software gates; controller-proven EP0 reset remains missing |
 
 Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 `8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional

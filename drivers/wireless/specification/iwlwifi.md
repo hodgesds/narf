@@ -2203,11 +2203,11 @@ describe the remaining native paths.
 
 - **sched_scan_offload.** §§3.53/3.55 implement idle Sc and Gen2 API77
   native periodic profiles, retained emission/stop ownership and current-source
-  results, accepted within505 Intel cases on both architectures. API89
-  Ty/So/Ma idle UMAC17 PNO uses the common retained owner but still needs
-  profile-specific native validation, as does exact Bz core103's common
-  idle periodic path. Associated MLD coexistence and other exact-profile
-  enablement remain open. Linux MVM refuses non-idle PNO.
+  results. Exact API89 Ty/So/Ma UMAC17 and Bz core103 idle profiles and forced
+  publication retirement pass at `0eb084197` within all524 Intel cases on
+  both architectures (§§3.59/3.60).
+  Associated MLD coexistence and other exact-profile enablement remain
+  open. Linux MVM refuses non-idle PNO.
 - **persistent_key_history** is inapplicable (§3.30): Linux and the shared
   NARF contract establish a fresh authenticated RSNA after reboot and
   retain replay/history state for the active owner lifetime. The existing
@@ -3583,10 +3583,12 @@ and passive requests, terminal stop and subsequent healthy ordinary scans.
 A dropped STOP waiter retains the exact firmware UID while a foreign
 completion is refused; actual UID termination permits a healthy successor.
 
-These fixtures are pending coordinated compilation/execution and do not
-extend the accepted Sc/API77 results to API89/Bz by analogy. No production
-periodic runtime changes are included. Linux MVM's API89 path remains
-idle-only; associated MLD periodic coexistence is separate remaining work.
+Both fixtures pass on both architectures at `0eb084197`, within all524
+Intel cases and full integration results of4326/0/13 on x86_64 and3967/0/7
+on aarch64. Resolved release CI, formatting, ordinary boots and both btrfs
+postflights also pass. No production periodic runtime changes are included.
+Linux MVM's API89 path remains idle-only; associated MLD periodic coexistence
+retains its separate native acceptance requirement.
 
 ### 3.60 Forced transport retirement of periodic publications
 
@@ -3605,7 +3607,9 @@ cache insertion, runs the forced transport stop, and verifies retained
 rings/closed capture. It invokes the actual source and caller again to
 exclude a revoked-grant false positive, checks the copy's real private
 epoch is retired, then proves no source callback/cache insertion or GET_SCAN
-target survives the late publication. Execution remains pending.
+target survives the late publication. This regression passes on both
+architectures at `0eb084197`, within all524 Intel cases and the complete
+release gates recorded in §3.59.
 
 ## 4. References
 
