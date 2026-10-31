@@ -285,7 +285,8 @@ controller, wireless registry and real Ethernet stack. It retains the same async
 it preserves that owner for a live generation; verified recovery replaces the
 retained slot with a fresh owner. Current net authority
 is required before production publication admits station DMA. Only
-channel1/2412MHz, legacy20/1T or the separately qualified HT20/LGI profile below,
+the selected qualified channel in1–11, legacy20/1T or the separately qualified
+channel1 HT20/LGI profile below,
 mandatory basic1Mbps, software crypto and one peer at a time are admitted.
 MSI drives the native owner when available, with polling fallback;
 a bounded synchronous drain serves the real stack even while a synchronous
@@ -304,7 +305,7 @@ Public scan validates channel/frequency, filters and bounded dwell;
 beacons/probe responses come only from actual consumed native RX descriptors.
 Shared `association::observe` checks raw admission, addresses, ESS/interval,
 singleton IEs, rates and DS/current-channel agreement; EE additionally requires
-channel1/basic1Mbps. Signal is unknown instead of invented RSSI. Active
+the actual qualified channel/basic1Mbps. Signal is unknown instead of invented RSSI. Active
 software scans now send actual broadcast Probe Requests on the qualified
 channel, one per requested SSID (up to mac80211's ordinary four; empty means
 wildcard), through the owned MGNT ring at basic1Mbps. Their rates and optional
@@ -315,8 +316,9 @@ frames imply no peer ACK. Probe responses enter the same raw RX/BSS path.
 Cancellation and source loss close this generation and retain uncertain DMA.
 Four native composed scan cases cover Open/WPA2 conversations, literal probe
 and descriptor bytes, held completion/cancellation and prevalidation without
-radio mutation; native acceptance is pending. Other channels remain separate
-retune work (randomized scan addresses are
+radio mutation. A single-channel request can select a qualified channel1–11
+through the fresh-owner transition below. Multi-channel dwell aggregation
+and broader qualified HT/fallback profiles remain separate work (randomized scan addresses are
 source-inapplicable, section 8). Without the distinct HT record,
 HT/VHT/HE/EHT remain unselected; VHT/HE/EHT are never admitted by this EE path.
 
@@ -1096,6 +1098,34 @@ Four native composed power cases cover retained suspend, fresh WPA2/DHCP,
 IPS scan wake and system handoff, absent DMA receipts, and cancellation-driven
 resume. Both system-PM and IPS inventory rows remain open pending acceptance.
 
+### Qualified legacy20 channel changes (implemented, native acceptance pending)
+
+The async `set_config` and a single-channel scan request can select channels
+1–11 under an actual current signed NEPC row and host policy. Permission
+preflight occurs before closure or register writes. A connected/joining peer
+requires disassociation first. The retained channel operation then closes and
+retires the old DMA/IRQ owner, drains logical publications and runs the real
+card cycle before fresh firmware, LLT/rings, radio calibration and RF18/BW/gain
+programming. No credentials, keys, packets or cached BSS migrate. A fresh
+physical beacon/probe response is required before a new association.
+
+Station admission, publication and RX channel observations use the physical
+owner's current channel permission rather than a channel1 constant. Every
+publication re-derives that exact permission against current host policy and
+the signed per-channel gain curve. Failed preflight does not mutate hardware;
+missing old-DMA retirement retains mappings and forbids replacement. Dropping
+the public waiter preserves the transition. IPS and system resume rebuild the
+last requested channel only under fresh current permission.
+
+Channel1 NEHT/NEFB records do not authorize HT or adaptive fallback on another
+channel; those channels use the qualified fixed legacy20 path. Discovery
+continues reporting the selected single-channel scan profile until multi-
+channel scan aggregation is implemented. Other bands/widths remain separate.
+Four native composed cases exercise actual1→6→11→1 RF18 and distinct gain
+receipts with Open/WPA2 DHCP, preflight/idle rejection, abandoned waiters and
+IPS wake. Both remaining family rows stay open pending native acceptance and
+their explicit broader scan/PHY residuals.
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE
@@ -1246,8 +1276,8 @@ runtimes remain separate from the retained RTL8188EE owner.
 
 | Row | Concrete blocker |
 |---|---|
-| `active_scanning` | Qualified channel1 software Probe Requests implemented pending native acceptance; broader active scans still require per-channel retune and actual signed NEPC rows (additional_operating_channels) |
-| `additional_operating_channels` | Noninitial operating channels and retuning; blocked on live retune (RF18/BW with paused DMA) and per-channel permission re-derivation from signed NEPC rows |
+| `active_scanning` | Native single-channel active Probe Requests and qualified cold retune1–11 implemented pending acceptance; multi-channel dwell aggregation remains |
+| `additional_operating_channels` | Legacy20 cold retune1–11 under current signed per-channel NEPC implemented pending acceptance; broader qualified HT/fallback channel profiles remain |
 | `bt_coexistence` | Bluetooth coexistence on RTL8723AE/BE; blocked on the rtl8723ae/rtl8723be chip runtimes |
 | `dynamic_antenna_selection` | Dynamic antenna selection/tracking; blocked on per-antenna signed board measurements (NEPC binds one static factory antenna) |
 | `five_ghz_operation` | 5GHz band operation on RTL8192DE/RTL8821AE; blocked on the rtl8192de/rtl8821ae chip runtimes (RTL8188EE is 2.4GHz-only) |

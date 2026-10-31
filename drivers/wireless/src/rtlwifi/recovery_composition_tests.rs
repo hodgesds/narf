@@ -22,6 +22,7 @@ impl Rebuild<PacketIo<BootPort>, Block> for DeviceEnvironment {
         &self,
         retained: Arc<Mutex<Option<Prepared<PacketIo<BootPort>, Block>>>>,
         factory: Arc<super::super::super::super::super::super::efuse::Factory>,
+        channel: u8,
     ) -> Result<(), StationError> {
         let old = self.firmware.lock().clone();
         let io = old.native().clone();
@@ -48,10 +49,10 @@ impl Rebuild<PacketIo<BootPort>, Block> for DeviceEnvironment {
         owner
             .configure_radio(radio::Profile::from_factory(&factory).unwrap())
             .await?;
-        let calibration = power::calibration(&factory);
+        let calibration = power::calibration_for_channel(&factory, channel);
         let domain = self.domain()?;
         owner
-            .configure_channel(calibration.permission(&domain, 1).unwrap())
+            .configure_channel(calibration.permission(&domain, channel).unwrap())
             .await?;
         owner.configure_mac(&factory)?;
         owner.stage_station_calibration(calibration, &domain)?;

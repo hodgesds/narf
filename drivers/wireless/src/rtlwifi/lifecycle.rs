@@ -3,11 +3,12 @@
 //! Leases hold no lock through a stack callback. A closed generation must
 //! drain them before its frontend can admit a replacement hardware owner.
 use super::station::{Admission, Error};
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use narf_lib::mutex::Mutex;
 
 pub(super) struct Lifecycle {
     pub(super) control: Mutex<()>,
+    pub(super) channel: AtomicU8,
     generation: AtomicU64,
     publications: AtomicUsize,
     pub(super) rebuilding: AtomicBool,
@@ -24,6 +25,7 @@ impl Lifecycle {
     pub(super) fn new() -> Self {
         Self {
             control: Mutex::new(()),
+            channel: AtomicU8::new(1),
             generation: AtomicU64::new(1),
             publications: AtomicUsize::new(0),
             rebuilding: AtomicBool::new(false),

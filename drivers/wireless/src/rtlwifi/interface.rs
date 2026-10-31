@@ -24,6 +24,8 @@ use narf_wireless::{
     WirelessNetIface,
 };
 use zeroize::Zeroizing;
+#[path = "channel_runtime.rs"]
+mod channel_runtime;
 #[path = "lifecycle.rs"]
 mod lifecycle;
 #[path = "rebuild_native.rs"]
@@ -255,7 +257,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 .map_err(|_| Error::Profile)?;
             let domain = self.environment.domain()?;
             let permission = calibration
-                .permission(&domain, 1)
+                .permission(&domain, self.lifecycle.channel.load(Ordering::Acquire))
                 .map_err(|_| Error::Profile)?;
             owner.configure_channel(permission).await?;
             owner.configure_mac(&self.factory)?;
@@ -709,6 +711,10 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         &self.environment
     }
     #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn channel_for_test(&self) -> u8 {
+        self.lifecycle.channel.load(Ordering::Acquire)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn power_flags_for_test(&self) -> (bool, bool, bool) {
         (
             self.lifecycle.suspended.load(Ordering::Acquire),
@@ -797,7 +803,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             base_mac: self.factory.mac,
             bands: vec![WirelessBand {
                 freq_mhz: 2400,
-                channels: vec![1],
+                channels: vec![u32::from(self.lifecycle.channel.load(Ordering::Acquire))],
             }],
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
@@ -819,11 +825,21 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         })
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+        let channel = channel_runtime::scan_channel(
+            &request,
+            self.lifecycle.channel.load(Ordering::Acquire),
+        )?;
         let dwell = scan_dwell(&request)?;
         self.lifecycle
             .activity_ms
             .store(self.environment.now_ms(), Ordering::Release);
-        if self.admission.closed.load(Ordering::Acquire) {
+        if channel != self.lifecycle.channel.load(Ordering::Acquire) {
+            self.environment
+                .change_channel(channel)
+                .ok_or(WirelessError::NotSupported)?
+                .await
+                .map_err(error)?;
+        } else if self.admission.closed.load(Ordering::Acquire) {
             self.environment
                 .recovery()
                 .ok_or(WirelessError::HardwareError)?
@@ -831,6 +847,9 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 .map_err(error)?;
         }
         let _control = self.lifecycle.control.lock().await;
+        if self.lifecycle.channel.load(Ordering::Acquire) != channel {
+            return Err(WirelessError::Busy);
+        }
         if self.admission.closed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
         }
@@ -883,8 +902,8 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                     .map(|candidate| BssInfo {
                         bssid: candidate.bss.bssid,
                         ssid: candidate.bss.ssid,
-                        channel: 1,
-                        frequency_mhz: 2412,
+                        channel: u32::from(candidate.bss.channel),
+                        frequency_mhz: 2407 + u32::from(candidate.bss.channel) * 5,
                         rssi: i8::MIN,
                         security: if candidate.rsne.is_some() {
                             narf_wireless::scan::BssSecurity::Wpa2
@@ -910,7 +929,9 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         if self.admission.closed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
         }
-        if request.channel != 1 || request.frequency_mhz != 2412 {
+        if request.channel != u32::from(self.lifecycle.channel.load(Ordering::Acquire))
+            || request.frequency_mhz != 2407 + u32::from(request.channel) * 5
+        {
             return Err(WirelessError::NotSupported);
         }
         let (mode, pmk) = match request.security {
@@ -1005,23 +1026,26 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         result
     }
     async fn set_config(&self, config: WirelessConfig) -> Result<(), WirelessError> {
-        if config.channel == 1 && config.tx_power_dbm.is_none() {
-            Ok(())
-        } else {
-            Err(WirelessError::NotSupported)
+        let channel = u8::try_from(config.channel).map_err(|_| WirelessError::NotSupported)?;
+        if config.tx_power_dbm.is_some() || !(1..=11).contains(&config.channel) {
+            return Err(WirelessError::NotSupported);
         }
+        if channel == self.lifecycle.channel.load(Ordering::Acquire)
+            && !self.admission.closed.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        self.environment
+            .change_channel(channel)
+            .ok_or(WirelessError::NotSupported)?
+            .await
+            .map_err(error)
     }
 }
 fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
     if request.random_mac.is_some()
         || request.colocated_6ghz
         || !request.extra_ies.is_empty()
-        || request
-            .frequencies_mhz
-            .iter()
-            .any(|frequency| *frequency != 2412)
-        || request.frequencies_mhz.is_empty()
-            && request.channels.iter().any(|channel| *channel != 1)
         || request.ssids.len() > 32
         || request.active && request.ssids.len() > super::probe_scan::MAX_SSIDS
         || request.ssids.iter().any(|ssid| ssid.len() > 32)
@@ -1213,10 +1237,39 @@ impl NativeEnvironment {
     }
 }
 impl Environment for NativeEnvironment {
+    fn allow_channel(&self, factory: &Factory, channel: u8) -> Result<(), Error> {
+        let calibration = super::channel_power::Calibration::load_registered(factory)
+            .map_err(|_| Error::Profile)?;
+        calibration
+            .permission(&self.domain()?, channel)
+            .map(|_| ())
+            .map_err(|_| Error::Profile)
+    }
+    fn change_channel(
+        &self,
+        channel: u8,
+    ) -> Option<core::pin::Pin<Box<dyn core::future::Future<Output = Result<(), Error>> + Send>>>
+    {
+        let device = self.device.lock().upgrade()?;
+        Some(
+            match device.schedule(supervisor::Operation::Retune(channel)) {
+                Ok(waiter) => Box::pin(waiter),
+                Err(reason) => Box::pin(async move { Err(reason) }),
+            },
+        )
+    }
     fn ht20(
         &self,
         base: Arc<super::channel_power::Calibration>,
     ) -> Result<Option<Arc<super::ht::Grant>>, Error> {
+        if self
+            .device
+            .lock()
+            .upgrade()
+            .is_some_and(|device| device.lifecycle.channel.load(Ordering::Acquire) != 1)
+        {
+            return Ok(None);
+        }
         super::ht::Grant::registered(base, self.firmware().identity().ok_or(Error::State)?)
             .map_err(Error::Radio)
     }
@@ -1224,6 +1277,14 @@ impl Environment for NativeEnvironment {
         &self,
         base: Arc<super::channel_power::Calibration>,
     ) -> Result<Option<Arc<super::fallback::Grant>>, Error> {
+        if self
+            .device
+            .lock()
+            .upgrade()
+            .is_some_and(|device| device.lifecycle.channel.load(Ordering::Acquire) != 1)
+        {
+            return Ok(None);
+        }
         super::fallback::Grant::registered(base, self.firmware().identity().ok_or(Error::State)?)
             .map_err(Error::Radio)
     }

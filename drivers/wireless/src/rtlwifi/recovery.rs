@@ -14,6 +14,7 @@ pub(crate) trait Rebuild<I: Port<Buffer = M>, M: Memory>: Environment {
         &self,
         retained: Arc<Mutex<Option<Prepared<I, M>>>>,
         factory: Arc<Factory>,
+        channel: u8,
     ) -> impl Future<Output = Result<(), Error>> + Send;
 }
 
@@ -42,6 +43,10 @@ where
     /// cancellation cannot discard an in-flight card-disable/enable exchange.
     pub(super) async fn recover_once(&self) -> Result<bool, Error> {
         let _control = self.lifecycle.control.lock().await;
+        self.recover_locked().await
+    }
+    /// Caller holds the control mutex, including channel-change preparation.
+    pub(super) async fn recover_locked(&self) -> Result<bool, Error> {
         if self.removed.load(Ordering::Acquire) || self.lifecycle.suspended.load(Ordering::Acquire)
         {
             return Err(Error::State);
@@ -104,7 +109,11 @@ where
 
         let prepared = self
             .environment
-            .rebuild(self.prepared.clone(), self.factory.clone())
+            .rebuild(
+                self.prepared.clone(),
+                self.factory.clone(),
+                self.lifecycle.channel.load(Ordering::Acquire),
+            )
             .await;
         if let Err(reason) = prepared {
             self.park_failed_rebuild().await;

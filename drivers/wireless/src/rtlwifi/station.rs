@@ -52,6 +52,20 @@ pub(crate) enum Phase {
 pub(crate) type TransitionFuture =
     core::pin::Pin<alloc::boxed::Box<dyn Future<Output = Result<(), Error>> + Send>>;
 pub(crate) trait Environment: Send + Sync {
+    fn allow_channel(
+        &self,
+        _factory: &super::super::efuse::Factory,
+        channel: u8,
+    ) -> Result<(), Error> {
+        if channel == 1 {
+            Ok(())
+        } else {
+            Err(Error::Profile)
+        }
+    }
+    fn change_channel(&self, _channel: u8) -> Option<TransitionFuture> {
+        None
+    }
     /// Request replacement before taking the public control lock. The future
     /// is a waiter for driver-owned work; dropping it cannot cancel card power.
     fn recovery(&self) -> Option<TransitionFuture> {
@@ -128,13 +142,14 @@ pub(crate) struct Candidate {
 }
 impl Candidate {
     fn receive(frame: &Mpdu, local: [u8; 6], ht: bool) -> Result<Self, Error> {
-        if frame.channel() != 1 {
+        let channel = frame.channel();
+        if !(1..=11).contains(&channel) {
             return Err(Error::Profile);
         }
         let observed = if ht {
-            association::observe_with_phy(frame, 1, local, None, &super::super::ht::local())
+            association::observe_with_phy(frame, channel, local, None, &super::super::ht::local())
         } else {
-            association::observe(frame, 1, local, None)
+            association::observe(frame, channel, local, None)
         }
         .map_err(Error::Management)?;
         if observed.basic_rates & 1 == 0 {
@@ -251,7 +266,12 @@ impl Publication {
             return Ok(None);
         }
         let op = || {
-            if self.base.permission(domain, 1).map_err(RadioError::Power)? != self.permission {
+            if self
+                .base
+                .permission(domain, self.permission.channel())
+                .map_err(RadioError::Power)?
+                != self.permission
+            {
                 return Err(RadioError::State);
             }
             if let Some(ht) = &self.ht {
@@ -804,7 +824,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             || self.station.phase != Phase::Dormant
             || Some(
                 calibration
-                    .permission(domain, 1)
+                    .permission(domain, self.permission.ok_or(Error::State)?.channel())
                     .map_err(|_| Error::Profile)?,
             ) != self.permission
         {
@@ -846,7 +866,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             .calibration
             .as_ref()
             .ok_or(Error::Profile)?
-            .permission(&domain, 1)
+            .permission(&domain, self.permission.ok_or(Error::State)?.channel())
             .map_err(|_| Error::Profile)?;
         if Some(permission) != self.permission {
             return Err(Error::Profile);

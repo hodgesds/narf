@@ -30,6 +30,7 @@ impl
         &self,
         retained: Arc<super::super::prepare_native::Retained>,
         factory: Arc<Factory>,
+        channel: u8,
     ) -> Result<(), Error> {
         use super::super::{firmware_transport::Owner, prepare, regs::RTL_DEV_8188EE};
         self.power_down().await?;
@@ -47,8 +48,13 @@ impl
             .map_err(prepare::Error::Access)?;
         let firmware = Arc::new(Owner::new(io, RTL_DEV_8188EE));
         *self.firmware.lock() = firmware.clone();
-        super::super::prepare_native::initialize_registered(firmware.clone(), retained, factory)
-            .await?;
+        super::super::prepare_native::initialize_registered_on_channel(
+            firmware.clone(),
+            retained,
+            factory,
+            channel,
+        )
+        .await?;
         firmware.native().arm_msi();
         Ok(())
     }
@@ -68,10 +74,11 @@ impl Native {
         {
             return Err(super::super::prepare::Error::State);
         }
-        super::super::prepare_native::initialize_registered(
+        super::super::prepare_native::initialize_registered_on_channel(
             self.environment.firmware(),
             self.prepared.clone(),
             self.factory.clone(),
+            self.lifecycle.channel.load(Ordering::Acquire),
         )
         .await
     }

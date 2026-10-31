@@ -148,6 +148,35 @@ struct DeviceEnvironment {
     ht: Option<HtFixtureSource>,
 }
 impl Environment for DeviceEnvironment {
+    fn allow_channel(
+        &self,
+        factory: &super::super::super::super::super::efuse::Factory,
+        channel: u8,
+    ) -> Result<(), StationError> {
+        if !(1..=11).contains(&channel) {
+            return Err(StationError::Profile);
+        }
+        power::calibration_for_channel(factory, channel)
+            .permission(&self.domain()?, channel)
+            .map(|_| ())
+            .map_err(|_| StationError::Profile)
+    }
+    fn change_channel(
+        &self,
+        channel: u8,
+    ) -> Option<core::pin::Pin<Box<dyn Future<Output = Result<(), StationError>> + Send>>> {
+        let device = self.device.lock().upgrade()?;
+        Some(
+            match device.schedule(
+                super::super::super::super::super::interface::supervisor::Operation::Retune(
+                    channel,
+                ),
+            ) {
+                Ok(waiter) => Box::pin(waiter),
+                Err(reason) => Box::pin(async move { Err(reason) }),
+            },
+        )
+    }
     fn recovery(
         &self,
     ) -> Option<core::pin::Pin<Box<dyn Future<Output = Result<(), StationError>> + Send>>> {
@@ -163,12 +192,28 @@ impl Environment for DeviceEnvironment {
         &self,
         base: Arc<super::super::super::super::super::channel_power::Calibration>,
     ) -> Result<Option<Arc<super::super::super::super::super::fallback::Grant>>, StationError> {
+        if self
+            .device
+            .lock()
+            .upgrade()
+            .is_some_and(|device| device.channel_for_test() != 1)
+        {
+            return Ok(None);
+        }
         self.base.fallback(base)
     }
     fn ht20(
         &self,
         base: Arc<super::super::super::super::super::channel_power::Calibration>,
     ) -> Result<Option<Arc<super::super::super::super::super::ht::Grant>>, StationError> {
+        if self
+            .device
+            .lock()
+            .upgrade()
+            .is_some_and(|device| device.channel_for_test() != 1)
+        {
+            return Ok(None);
+        }
         self.ht
             .as_ref()
             .map(|(b, cap, firmware)| {
@@ -466,6 +511,8 @@ impl Harness {
             .map_or(0, |iface| iface.rx_packets)
     }
 }
+#[path = "channel_composition_tests.rs"]
+mod channel_tests;
 #[path = "ht_composition_tests.rs"]
 mod ht_tests;
 #[path = "power_composition_tests.rs"]

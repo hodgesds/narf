@@ -156,6 +156,17 @@ pub(super) async fn initialize_registered(
     retained: Arc<Retained>,
     factory: Arc<super::efuse::Factory>,
 ) -> Result<(), Error> {
+    initialize_registered_on_channel(firmware, retained, factory, 1).await
+}
+pub(super) async fn initialize_registered_on_channel(
+    firmware: Arc<Owner<PciIo>>,
+    retained: Arc<Retained>,
+    factory: Arc<super::efuse::Factory>,
+    channel: u8,
+) -> Result<(), Error> {
+    if !(1..=11).contains(&channel) {
+        return Err(Error::State);
+    }
     let profile = super::radio::Profile::from_factory(&factory).map_err(Error::Radio)?;
     if firmware.status().stage == super::firmware_transport::Stage::Detected {
         firmware.initialize_registered().await?;
@@ -180,7 +191,9 @@ pub(super) async fn initialize_registered(
         super::channel_power::Calibration::load_registered(&factory).map_err(Error::Power)?;
     let domain = narf_wireless::reg::db::ensure_domain()
         .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
-    let permission = calibration.permission(&domain, 1).map_err(Error::Power)?;
+    let permission = calibration
+        .permission(&domain, channel)
+        .map_err(Error::Power)?;
     if prepared.phase() == super::prepare::Phase::RadioConfigured {
         prepared.configure_channel(permission).await?;
     }

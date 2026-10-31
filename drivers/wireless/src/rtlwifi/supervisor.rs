@@ -14,6 +14,7 @@ pub(crate) enum Operation {
     Suspend,
     Resume,
     Idle,
+    Retune(u8),
 }
 struct Completion {
     result: Option<Result<bool, Error>>,
@@ -58,6 +59,7 @@ where
                             Operation::Recover => device.recover_once().await,
                             Operation::Suspend => device.sleep_once(true, None).await,
                             Operation::Idle => device.sleep_once(false, Some(activity)).await,
+                            Operation::Retune(channel) => device.retune_once(channel).await,
                             Operation::Resume => {
                                 device.lifecycle.suspended.store(false, Ordering::Release);
                                 device.recover_once().await
