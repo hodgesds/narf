@@ -1801,7 +1801,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             .and_then(|p| p.negotiated_phy())
                             .map(|p| *p.ht());
                         if self.station.ht_profile.is_some_and(|p| {
-                            p.operation().primary() != 1 || p.operation().protection() != 0
+                            self.permission.is_none_or(|permission| {
+                                p.operation().primary() != permission.channel()
+                            }) || p.operation().protection() != 0
                         }) {
                             return Err(Error::Profile);
                         }
