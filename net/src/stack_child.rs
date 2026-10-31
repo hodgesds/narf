@@ -1,6 +1,8 @@
 //! Fresh control-child delegation from actual typed parent/child receipts.
 //! Neither a child name nor a WDEV observation creates authority.
 use super::*;
+#[path = "stack_retirement.rs"]
+pub(super) mod retirement;
 
 #[derive(Clone, Debug)]
 pub(super) struct ControlParent {

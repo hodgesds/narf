@@ -1,5 +1,7 @@
 //! Actual typed parent-child registration receipts and live source lineage.
 use super::*;
+#[path = "stack_retirement_tests.rs"]
+mod retirement;
 
 struct Control(Device, u64);
 impl Interface for Control {

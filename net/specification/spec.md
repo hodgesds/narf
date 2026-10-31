@@ -402,6 +402,22 @@ relation and retain their existing scope, returning None rather than creating
 another daemon grant. `is_control_child` observes only a current
 explicit child delegation; it cannot promote an ordinary handle.
 
+`AdminHandle::retire_control_child(child_cap, namespace)` withdraws only that
+exact control registration, after its driver has completed native teardown.
+The removal runs inside the current original Admin/daemon/parent/child
+invocations and checks the recorded parent registration and ownership epoch.
+Namespace kernel handles preserve their existing scope and invoke the actual
+stored parent/child too. Cached immutable registry identity avoids driver
+callbacks while its spinlock is held; removed interfaces are dropped outside
+that lock. The returned `ControlRetirement::current()` is an observation-only
+terminal-publication receipt: it rechecks the original grants and parent epoch
+plus absence of the original child registration. It exports no capability,
+administrative operation or successor lookup. Normal administration ends at
+withdrawal; a same-name child requires a new explicit grant. Wireless callers
+must additionally retain the exact retired WDEV/object/mode and original
+socket through final ACK publication. Receipt validity alone proves neither
+native retirement nor packet/RF authority.
+
 ### 3.4 Loopback
 
 A built-in `Loopback` implementation of the contract. Always

@@ -131,7 +131,7 @@ pub mod wireguard;
 pub mod ws;
 pub use stack::{
     initial_loopback_admin, kernel_admin, AdminCap, AdminError, AdminHandle, AdminIpv4Route,
-    AdminIpv6Route, AttachError, StackAttach, StackAttachReply, StackDaemon,
+    AdminIpv6Route, AttachError, ControlRetirement, StackAttach, StackAttachReply, StackDaemon,
 };
 
 // In-kernel test suites: compiled only under the `kernel-test` feature (or
@@ -544,6 +544,10 @@ impl From<CapError> for RegisterError {
 
 struct Entry {
     iface: Box<dyn Interface>,
+    // Immutable registration identity, captured before taking the registry
+    // lock. Control retirement compares these without driver callbacks.
+    name: String,
+    control_namespace: Option<u64>,
     handle: Cap<NetIface, Write>,
     /// Actual typed parent registration for a freshly created control child.
     control_parent: Option<Cap<NetIface, Write>>,
@@ -565,7 +569,7 @@ pub struct InterfaceSnapshot {
 impl fmt::Debug for Entry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Entry")
-            .field("name", &self.iface.name())
+            .field("name", &self.name)
             .finish_non_exhaustive()
     }
 }
@@ -618,9 +622,11 @@ impl<I: Interface + 'static> RegisterControl<'_, I> {
         self,
     ) -> Result<Result<Cap<NetIface, Write>, ControlRegisterError>, narf_capabilities::CapError>
     {
-        if self.iface.control_namespace().is_none()
-            || self.iface.name() == "lo"
-            || crate::iface::lookup(self.iface.name()).is_some()
+        let name = String::from(self.iface.name());
+        let namespace = self.iface.control_namespace();
+        if namespace.is_none()
+            || name == "lo"
+            || crate::iface::lookup(&name).is_some()
             || self.iface.link_up()
             || self.iface.rx_ring().lock().is_some()
             || self.iface.tx_ring().lock().is_some()
@@ -633,25 +639,23 @@ impl<I: Interface + 'static> RegisterControl<'_, I> {
                 .iter()
                 .find(|entry| entry.handle.slot() == parent.slot())
                 .is_some_and(|entry| {
-                    entry.iface.control_namespace().is_none()
-                        && crate::iface::lookup(entry.iface.name()).is_some_and(|metadata| {
-                            metadata.ownership_epoch != 0
-                                && Some(metadata.net_ns_id) == self.iface.control_namespace()
+                    entry.control_namespace.is_none()
+                        && crate::iface::lookup(&entry.name).is_some_and(|metadata| {
+                            metadata.ownership_epoch != 0 && Some(metadata.net_ns_id) == namespace
                         })
                 });
             if !valid {
                 return Ok(Err(ControlRegisterError::NotControl));
             }
         }
-        if entries
-            .iter()
-            .any(|entry| entry.iface.name() == self.iface.name())
-        {
+        if entries.iter().any(|entry| entry.name == name) {
             return Ok(Err(ControlRegisterError::DuplicateName));
         }
         let handle = Cap::<NetIface, Write>::bootstrap();
         entries.push(Entry {
             iface: Box::new(self.iface),
+            name,
+            control_namespace: namespace,
             handle,
             control_parent: self.parent,
         });
@@ -714,14 +718,17 @@ impl Registry {
         iface: I,
     ) -> Result<Cap<NetIface, Write>, RegisterError> {
         authority.check_live()?;
-
+        let name = String::from(iface.name());
+        let control_namespace = iface.control_namespace();
         let mut q = self.inner.lock();
-        if q.iter().any(|e| e.iface.name() == iface.name()) {
+        if q.iter().any(|e| e.name == name) {
             return Err(RegisterError::DuplicateName);
         }
         let handle: Cap<NetIface, Write> = Cap::<NetIface, Write>::bootstrap();
         q.push(Entry {
             iface: Box::new(iface),
+            name,
+            control_namespace,
             handle,
             control_parent: None,
         });

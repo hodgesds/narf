@@ -31,6 +31,7 @@ use crate::bypass::xdp::XdpSocket;
 use crate::{Interface, NetIface};
 #[path = "stack_child.rs"]
 mod child;
+pub use child::retirement::ControlRetirement;
 #[cfg(feature = "kernel-test")]
 #[path = "stack_identity_tests.rs"]
 mod identity_tests;
