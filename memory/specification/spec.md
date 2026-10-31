@@ -429,8 +429,11 @@ impl UserPagePin {
 
 /// Pin acquisition is serialized with authoritative mapping changes. External
 /// RAM mappings require PINNABLE_RAM in addition to LOCK_EXEMPT; device PFNs
-/// cannot be pinned. Base-page pin references are tracked separately so fork
-/// still write-protects a writable parent which was only shared with a pipe.
+/// cannot be pinned. Base-page pin references are tracked separately. Fork
+/// gives the child a private copy of every pinned writable private page
+/// (Linux page_needs_cow_for_dma) and leaves the parent's leaf writable and
+/// exclusive, so a DMA/GPU/pipe pin keeps aliasing the parent's memory and
+/// never a frame shared with the child (the CVE-2020-29374 class).
 /// Physical migration to another node rejects pinned backing with
 /// AddressSpaceError::Pinned (move_pages reports per-page EBUSY).
 
@@ -1405,7 +1408,10 @@ x86_64 is rejected at runtime.
   bug, caught by an assertion.
 - A private fork preserves each VMA's logical POSIX WRITE bit and marks it
   COW. Hardware leaves remain read-only while their backing-frame refcount is
-  greater than one. A write fault is recoverable only when both WRITE and COW
+  greater than one. Pinned writable private pages are instead copied for the
+  child (urgent allocation, as a COW break) and are not retained; copies are
+  installed only after the region succeeds and every failure path clears and
+  frees them before the retain rollback, which never sees a copied slot. A write fault is recoverable only when both WRITE and COW
   are present; `mprotect(PROT_READ)` therefore cannot be mistaken for COW.
   Fork retains all resident private backing through one batched operation
   while the parent region transaction is held. One counting-partitioned

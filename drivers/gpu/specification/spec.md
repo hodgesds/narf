@@ -194,10 +194,11 @@ every op before any page is faulted. `IoctlContext::pin_user_pages` then faults
 and pins the range, resolving private COW copies unless READONLY (unmapped
 EFAULT, write over a read-only mapping EPERM), into a VM-private handle-less
 `GemObject` charged like owned storage. Mappings and jobs retain it as any BO.
-LINUX-GAP (shared with amdgpu GEM_USERPTR): Xe faults through HMM and repins
-via an MMU interval notifier. These pins are snapshots, so a later munmap,
-remap or fork-COW split leaves the GPU on the pinned frames, never on freed
-memory.
+Fork copies pinned pages for the child (memory/ page_needs_cow_for_dma), so
+the pins keep aliasing the binder's memory. LINUX-GAP (shared with amdgpu
+GEM_USERPTR): Xe faults through HMM and repins via an MMU interval notifier.
+These pins are snapshots, so a later munmap or remap leaves the GPU on the
+pinned frames, never on freed memory.
 All handles and synchronization payloads are retained before waiting. A bind
 prepares a replacement mapping set without mutating the published VM, waits for
 its prior GPU users and then commits under an async VM mutex. Cancelled waits,
