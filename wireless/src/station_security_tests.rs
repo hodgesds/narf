@@ -169,6 +169,77 @@ fn established_with_seed(sequence: u16) -> Security {
     deliver(&mut s);
     s
 }
+fn smoke_station_plain_null_reserves_shared_sn_without_consuming_ccmp_state() -> TestResult {
+    let mut s = established_with_seed(4092);
+    let mut ethernet = vec![2, 0, 0, 0, 0, 9];
+    ethernet.extend_from_slice(&OWN);
+    ethernet.extend_from_slice(&[8, 0, 0x45, 0, 0, 0]);
+    let Ok(first) = s.transmit_ethernet(&ethernet) else {
+        return TestResult::Fail("first encrypted DATA before plaintext Null");
+    };
+    let Ok(reserved) = s.reserve_plain_control_sequence() else {
+        return TestResult::Fail("established owner refused plaintext Null SN");
+    };
+    // The native driver independently owns this exact DONT_ENCRYPT Null.
+    // Its payload-free bytes do not pass through the CCMP packet key.
+    let mut null = vec![0x48, 0x11, 0, 0];
+    null.extend_from_slice(&AP);
+    null.extend_from_slice(&OWN);
+    null.extend_from_slice(&AP);
+    null.extend_from_slice(&(reserved << 4).to_le_bytes());
+    let Ok(second) = s.transmit_ethernet(&ethernet) else {
+        return TestResult::Fail("second encrypted DATA after plaintext Null");
+    };
+    let sn = |frame: &[u8]| u16::from_le_bytes([frame[22], frame[23]]) >> 4;
+    if sn(&first) != 4094 || sn(&null) != 4095 || sn(&second) != 0 || null.len() != 24 {
+        return TestResult::Fail("plaintext Null did not share wrapping non-QoS DATA/EAPOL SN");
+    }
+    let tk = ptk(AN, SN).tk;
+    let mut replay = crate::ccmp::ReplayWindow { last_seen_pn: 0 };
+    for (index, frame) in [&first, &second].into_iter().enumerate() {
+        let mut wire = frame[24..].to_vec();
+        let plain = crate::ccmp::unprotect(
+            &Ccm,
+            &frame[..24],
+            tk.as_slice().try_into().unwrap(),
+            0,
+            false,
+            &mut replay,
+            &mut wire,
+        );
+        let mut expected = vec![0xaa, 0xaa, 3, 0, 0, 0, 8, 0];
+        expected.extend_from_slice(&ethernet[14..]);
+        if plain != Ok(expected) || replay.last_seen_pn != (index as u64 + 1) {
+            return TestResult::Fail("plaintext Null consumed PN or changed installed DATA key");
+        }
+    }
+    let mut replayed = first[24..].to_vec();
+    if crate::ccmp::unprotect(
+        &Ccm,
+        &first[..24],
+        tk.as_slice().try_into().unwrap(),
+        0,
+        false,
+        &mut replay,
+        &mut replayed,
+    ) != Err(crate::ccmp::CcmpError::Replay)
+        || replay.last_seen_pn != 2
+        || !s.port_open()
+        || s.next_qos_sequence(7) != Ok(4092)
+    {
+        return TestResult::Fail("plaintext Null changed replay, port or independent QoS SN state");
+    }
+    let mut closed = security();
+    let before = closed.sequence;
+    if closed.reserve_plain_control_sequence() != Err(Error::State) || closed.sequence != before {
+        return TestResult::Fail("closed owner consumed plaintext control SN");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/station_security",
+    smoke_station_plain_null_reserves_shared_sn_without_consuming_ccmp_state
+);
 fn smoke_station_raw_admission_precedes_nonce_and_key_state() -> TestResult {
     let mut security = security();
     let mut frame = mpdu(native(&key_frame(0x8a, 1, AN, &[], None), false));

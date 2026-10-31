@@ -12,6 +12,8 @@ use super::{
 use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use zeroize::Zeroizing;
+#[path = "station_scan.rs"]
+mod station_scan;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     State,

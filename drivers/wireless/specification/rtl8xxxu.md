@@ -5,6 +5,7 @@
 > channels1–13 and idle passive scans pass native software acceptance.
 > Administrative cold park/wake passes native software acceptance.
 > Qualified idle active probe scanning passes native software acceptance.
+> Associated passive scans and plaintext Null/QoS Null are implemented pending native acceptance.
 > Broader profiles and physical acceptance remain incomplete. A separately
 > qualified RTL8188EU HT20/LGI SISO continuation passes14 native regressions
 > on both architectures; exact-device qualification remains external.
@@ -312,13 +313,13 @@ Every EP0 write has an exact readback. BE stays conservative (AIFSN>=3,
 ECWmin>=5, ECWmax>=10, TXOP0); BK/VI/VO use the AP rows. As in
 `rtl8xxxu_conf_tx`, REG_ACM_HW_CTRL BK0/BE1/VI2/VO3 mirror each AC's ACM
 (`wmm_runtime::acm_bits`; BE ACM is refused). Only then may the retained bulk
-owner admit QoS DATA with TXDESC32_QOS. This WMM grant keeps HT/BA, U-APSD,
-TSPEC and QoS Null closed; the distinct HT grant below cannot be inferred from it.
+owner admit QoS DATA with TXDESC32_QOS. This WMM grant keeps HT/BA, U-APSD
+and TSPEC closed; the distinct HT grant below cannot be inferred from it.
 
-QoS Null remains a scanning dependency: mac80211 uses its off-channel
-power-save nullfunc when leaving an associated channel, while rtl8xxxu
-advertises neither PS nor REPORTS_TX_ACK_STATUS. The current idle scan owner
-does not implement scanning while associated, so it does not emit that frame.
+QoS Null is emitted only by the associated passive scan continuation below:
+mac80211 uses its off-channel power-save nullfunc when leaving an associated
+channel, while rtl8xxxu advertises neither PS nor REPORTS_TX_ACK_STATUS.
+This is not a station sleep, U-APSD, USB autosuspend or on-air ACK capability.
 
 #### Traffic classification and all-AC/TID routing (implemented)
 
@@ -691,7 +692,8 @@ curve, interpolation or additional qualification format is introduced.
 `Device::set_config` changes an idle owner's channel, and passive scan accepts
 bounded explicit channel/frequency lists or the currently qualified set. Every
 requested row is checked before the first hardware transition. Each successful
-scan restores its original home channel. Connected scans remain busy. Noninitial
+scan restores its original home channel. Connected active scans remain busy;
+associated passive scanning uses the separate continuation below. Noninitial
 channels use the legacy profile; the retained N8HT continuation remains bound to
 channel1 and is reprogrammed only when returning to that exact qualified profile.
 Default channel enumeration rechecks current authority after each target row
@@ -861,6 +863,100 @@ have literal negative cases. All eight pass on both architectures at
 `0eb084197`, with the complete release gates recorded above. Physical
 AP/USB inputs remain inert, and physical qualification remains separate.
 
+### Associated passive scanning and Null functions (native acceptance pending)
+
+`WirelessNetIface::scan` now accepts passive requests while connected, under
+the same ordinary device-state mutex as the network producer. Existing host
+Narf-Ring and pending Ethernet owners remain intact; a concurrent synchronous
+drain returns without waiting for another scheduler task. New host publication
+observes the busy state. Connected active scans remain a separate continuation.
+Invalid channels, missing signed measurement rows, current NO_IR/power policy
+or mandatory dwell above125ms are refused before the first scan I/O.
+
+`station_scan` drains the current native DATA/EAPOL/control receipts and any
+pending EDCA/aggregation programming before departure. An active RSNA rekey
+refuses the scan. The private `ps_null::Prepared` route then emits the exact
+plaintext ToDS PM1 Null function, with local TA and the bound AP as RA/BSSID.
+mac80211 `ieee80211_nullfunc_get` chooses26-byte QoS Null/TID7 for the actual
+WMM peer, otherwise24-byte non-QoS Null. QoS Null carries SN0 and consumes no
+DATA sequence or CCMP PN. Non-QoS Null reserves the same wrapping SN counter
+as non-QoS DATA/EAPOL through the shared Security helper, without changing
+keys, PN or replay state. Open stations use their existing non-QoS counter.
+The ordinary Ethernet/management formatters still reject both Null subtypes.
+
+Each native Null descriptor uses basic1Mbps and the real VO/TID7 or BE queue
+and USB endpoint, without aggregation or hardware encryption. The host SN is
+copied to txdw3[27:16]; TXDESC32_HW_SEQ_ENABLE (txdw4 bit7) stays clear for
+both DATA and Null before and after every cold MAC restart. The hardware
+cannot silently replace this sequence with a reset internal counter. A QoS
+Null sets only the separate TXDESC32_QOS bit6. Descriptor checksum, unicast
+addresses, original peer/profile and current occupied-power permission remain
+mandatory in the private submission path.
+
+The Linux scan/offchannel contract supplies100ms after PM1 when the driver
+has no `.flush`, one away dwell bounded by HZ/8 (125ms), and200ms on home
+return. Nonmandatory longer dwells are capped; mandatory longer dwells are
+refused. The real cold retunes take additional elapsed time, so these values
+are not a claimed physical switching-latency bound. USB terminal proves
+native host delivery; it does not prove AP reception or power-save buffering.
+MAC TX remains enabled through the source grace, followed by the real paused
+32-bit SCH_TX_CMD terminal before TX closure. rtl8xxxu sets no
+REPORTS_TX_ACK_STATUS flag: a lost Null remains best effort, without a fabricated
+on-air ACK. Missing USB/device terminals instead fail and retain ownership.
+
+The original home Authority stays current through the complete asynchronous
+visit. Away permission is checked independently through its own dwell fence.
+Before any channel label changes, the same receiver performs the existing
+MAC/filter closure, RXDMA terminal while the old TD remains posted, actual
+USB Stop/SetDeq, and completed MAC-off FIFO reset. Only then is the exact
+retained firmware/image restarted with fresh factory/endpoint comparison and
+new actual RF readback. Away MPDUs enter only the scan candidate parser;
+they cannot advance the home CCMP replay window, EAPOL or BA reorder owner.
+Observation time and generation belong to that physical receive stream.
+
+On each return the same owner cold-restores the original channel and optional
+HT grant, AP BSSID/AID/media state, current EDCA/slot settings, aggregation
+factor/density and operational TID bitmap. The retained host rate-adaptation
+object and its actual report interval are restored as well. The logical
+Station, JoinPlan, Security/key/PN/replay objects, per-TID counters, RX/TX BA
+sessions, receive epoch and host packet rings survive a successful scan.
+Ordinary BA timers may expire as they normally do while servicing home traffic.
+The return resets connection/beacon monitoring as Linux does; it never refreshes
+an old candidate's seen time without a new physical copy. The private PM0
+Null is followed by normal home DATA/RSNA/reordering during the home grace.
+Cancellation/source loss is terminal and never drops a published USB/EP0 owner
+or starts another claim as cleanup. The awaiting Device scan has a non-I/O
+publication Drop guard: the retained Service failure flag withdraws the
+original registration's carrier immediately, without waiting for a later
+network drain. Pure request refusal leaves the live station published.
+
+The pinned primary snapshot is Linux7.3-rc7, as recorded by its Makefile.
+Load-bearing entry points are `net/mac80211/offchannel.c::{ieee80211_offchannel_stop_vifs,
+ieee80211_offchannel_return}`, `mlme.c::ieee80211_send_nullfunc`,
+`tx.c::{ieee80211_nullfunc_get,ieee80211_tx_h_sequence}`,
+`scan.c::{ieee80211_scan_state_decision,ieee80211_scan_state_suspend,
+ieee80211_scan_state_resume}`, and `rtl8xxxu/core.c::rtl8xxxu_fill_txdesc_v3`.
+For exact source reproduction, SHA256 of those files is respectively
+`19da65d87aa3a622931baaf41262e1b7de8af9100248a2b4ebfc6f40a68c0625`,
+`c21da8dfbe059571692bdc75e75f5aa57e0133587afbf2c915ad73f055495011`,
+`199a2fff76dc09416866c9899d9e1e7e071532099b4d59acddc26f63d68ef4b8`,
+`93c9ba7f391b92c5dc1c113d8d5910a96f10f38ee65e8608a2c00e7584051a29`,
+and `eab41606f9e0a304012f082ff95979222d3e63780d649ed1d923938b7e97b1b1`.
+`rtl8xxxu/rtl8xxxu.h` defines the independent QoS/HW-sequence bits; its SHA256
+is `1979e54d2b5002a903c794751e31094aa414c32281459d109a1afd65178ef7f4`.
+
+Eight `drivers/wireless/rtl8xxxu/associated_scan` native cases compose actual
+firmware/USB/Device/MLME/RSNA and DHCP. They cover Open/WPA2 home restoration,
+retained host TX and AP-buffered RX, independent delayed device-air handling,
+literal Null/QoSNull and host-SN descriptors, closed ordinary frame entries,
+mandatory timing refusal, retained real USB/EP0 waits under cancellation and
+source/policy loss, best-effort unacknowledged Null versus a missing actual
+SCH terminal, preserved RX/TX BA and away high-PN/replayed home rejection.
+One focused shared Security native case encrypts DATA before/after a reserved
+plaintext Null slot across SN4094/4095/0, requires consecutive PN1/2, decrypts
+with a persistent replay window, and verifies old-PN rejection and unchanged
+QoS counters. All nine new cases await coordinated native release execution.
+
 ## 4. Invariants
 
 - Linux's disabled→EMU→active handshake precedes firmware writes. MAC TX/RX
@@ -894,9 +990,10 @@ the production probe when exact-device signed qualification/deployment data
 is present. No real board curve has been acquired, qualified or installed by
 this software work. The initial profile needs physical validation. Qualified
 legacy idle channel changes and passive scans pass native software gates; broader
-rates, connected scanning and endpoint reset remain software work.
+rates, connected active scanning and endpoint reset remain software work.
 Administrative cold park/wake passes native software gates at `0eb084197`.
 Idle active probe scanning passes native software gates at `0eb084197`.
+Associated passive scanning/Null functions await their separate native acceptance.
 
 ## 8. Open questions / remaining software
 
@@ -912,21 +1009,23 @@ Idle active probe scanning passes native software gates at `0eb084197`.
 | Signed board power artifact and checked native TX gate | Implemented software contract; real qualified per-device data must be acquired/signed/installed |
 | Native USB descriptor/packet ownership | Implemented dependency; persistent receipt/stop and Linux descriptor regressions |
 | Native beacon/management preparation and peer-bound transitions | Implemented basic1Mbps shared plan; qualified channels1–13 pass native software gates |
-| Production scan/MLME service and policy-admitted management TX | Qualified idle passive multi-channel scan/home restoration and active probe scan pass native software gates; signed board/deployment admission required; connected scans remain missing |
+| Production scan/MLME service and policy-admitted management TX | Qualified idle passive multi-channel scan/home restoration passes native gates; idle active passes native gates and associated passive/Null awaits native acceptance; signed board/deployment admission required; connected active scans remain missing |
 | Software AES-CCM + strict CCMP/key/TID ownership | Implemented dependency; independent ciphertext/forgery/role/PN regressions |
 | WPA2 key installation/controlled port and Ethernet transport | Implemented retained shared RSNA/software CCMP, exact native delivery, Narf-Rings and synchronous stack progress |
 | Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX. Qualified legacy channels1–13 and cold idle FIFO retuning pass native software gates. Separate N8HT HT20/LGI MCS0..7/whole A-MSDU/decline/capture-publication continuation passes native software gates above and stays channel1-bound. Management/basic1Mbps remains required. SGI/HT40, broader bands/adaptation and coexistence remain missing |
 | USB transfer ownership / stale handles | EP0 + bulk claims, retained command DMA and generation rejection implemented; slot reuse stays gated |
 | Non-stream bulk stop/drain | Implemented in USB; exact commands/context/event-prefix proof |
 | Disconnect/peer-loss callbacks and normal bulk stop | Implemented; a completed disconnect returns to Passive (safe rejoin) |
-| EP0/Halted reset, safe rejoin, FIFO retune and PM recovery | Bulk halt recovery and safe rejoin implemented; qualified idle cold FIFO retune and administrative cold park/wake pass native software gates; controller-proven EP0 reset remains missing |
+| EP0/Halted reset, safe rejoin, FIFO retune and PM recovery | Bulk halt recovery, safe rejoin and qualified idle cold FIFO retune pass native software gates; administrative cold park/wake passes native software gates; controller-proven EP0 reset remains missing |
 
 Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 `8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional
 BT/S0S1. EU's separately qualified HT20/LGI continuation is software-validated above;
-SGI20/HT40, scanning while associated, and
+SGI20/HT40, active scanning while associated, and
 controller-proven EP0 reset remain software work. Qualified idle passive
-multi-channel scanning awaits native acceptance. Full WMM AC/TID routing is implemented.
+multi-channel scanning passes native software gates; associated passive scans
+and Null functions await their separate native acceptance.
+Full WMM AC/TID routing is implemented.
 
 Power-management inventory (upstream `rtl8xxxu/core.c`): `rtl8xxxu_probe`
 sets only SIGNAL_DBM, HAS_RATE_CONTROL, SUPPORT_FAST_XMIT, AMPDU_AGGREGATION
@@ -936,9 +1035,9 @@ and MFP_CAPABLE (no SUPPORTS_PS/DYNAMIC_PS), `rtl8xxxu_ops` has no
 `.disable_hub_initiated_lpm = 1`. The only power transitions are
 `fops->enable_rf` in `rtl8xxxu_start`, `fops->disable_rf` in `rtl8xxxu_stop`
 and `fops->power_off` at disconnect. There are no PM submodes beyond that
-interface start/stop radio power path (the remaining
-`runtime_power_management` row, implemented as retained administrative cold
-park/wake above pending native acceptance); LPS/IPS/WoWLAN/USB autosuspend/LPM
+interface start/stop radio power path (implemented as retained administrative
+cold park/wake above and accepted by the native software gates);
+LPS/IPS/WoWLAN/USB autosuspend/LPM
 are inapplicable to this family. 8192EU/8723BU first need their own retained power/firmware/radio/
 packet/station compositions, including2-chain or coexistence dependencies.
 The repository's matched8821CU/8822BU profiles need the actual upstream

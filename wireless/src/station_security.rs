@@ -807,6 +807,19 @@ impl Security {
         }
         Ok(*sequence)
     }
+    /// Reserve the shared non-QoS DATA/EAPOL sequence number for a native
+    /// plaintext control frame, such as mac80211's off-channel Null function.
+    /// This consumes no packet-key PN and changes no key or replay state.
+    /// QoS Null uses SN0 without calling this helper. The caller must prove
+    /// the exact frame, current peer/profile/policy and native queue authority.
+    pub fn reserve_plain_control_sequence(&mut self) -> Result<u16, Error> {
+        if !self.port_open() || self.handshake_active() {
+            return Err(Error::State);
+        }
+        let sequence = self.sequence;
+        self.sequence = (sequence + 1) & 4095;
+        Ok(sequence)
+    }
     fn transmit_ethernet_inner(
         &mut self,
         ethernet: &[u8],

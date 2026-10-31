@@ -25,8 +25,16 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
         &self,
         channel: u8,
     ) -> Result<power_policy::Permission, Error> {
-        let radio = self.radio.as_ref().ok_or(Error::State)?;
-        match radio.permission_for_channel(channel) {
+        let permission = if let Some(radio) = &self.radio {
+            radio.permission_for_channel(channel).map_err(Error::Radio)
+        } else {
+            self.station
+                .as_ref()
+                .ok_or(Error::State)?
+                .channel_permission(channel)
+                .map_err(Error::Station)
+        };
+        match permission {
             Ok(permission) => Ok(permission),
             // An existing current-channel token grants no retune authority.
             Err(_) if channel == self.permission.channel() => {
@@ -99,7 +107,13 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
         &mut self,
         channels: &[u8],
         dwell_ms: u64,
+        mandatory: bool,
     ) -> Result<(), Error> {
+        if self.phase() == Phase::Connected {
+            return self
+                .associated_passive_scan(channels, dwell_ms, mandatory)
+                .await;
+        }
         if self.phase() != Phase::Passive || channels.is_empty() || !(1..=1024).contains(&dwell_ms)
         {
             return Err(Error::State);
@@ -141,5 +155,79 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
             self.fail();
         }
         result
+    }
+
+    async fn associated_passive_scan(
+        &mut self,
+        channels: &[u8],
+        dwell_ms: u64,
+        mandatory: bool,
+    ) -> Result<(), Error> {
+        self.check_current()?;
+        // Pure request admission happens before arming the terminal owner.
+        if !self.station.as_ref().is_some_and(Station::scan_admissible) {
+            return Err(Error::State);
+        }
+        if channels.is_empty() || dwell_ms == 0 || dwell_ms > 1024 || mandatory && dwell_ms > 125 {
+            return Err(Error::Profile);
+        }
+        for &channel in channels {
+            let permission = self.channel_permission(channel);
+            self.check_current()?;
+            permission?;
+        }
+        let mut attempt = Attempt {
+            failed: self.failed.clone(),
+            armed: true,
+        };
+        let result = self
+            .station
+            .as_mut()
+            .ok_or(Error::State)?
+            .passive_scan(
+                channels,
+                dwell_ms,
+                mandatory,
+                &self.environment,
+                &mut self.generation,
+            )
+            .await
+            .map_err(Error::Station);
+        attempt.armed = false;
+        match result {
+            Ok(observations) => {
+                for observation in observations {
+                    let entry = Entry {
+                        candidate: observation.candidate,
+                        seen: observation.seen,
+                        generation: observation.generation,
+                    };
+                    if let Some(old) = self
+                        .cache
+                        .iter_mut()
+                        .find(|old| old.candidate.bssid() == entry.candidate.bssid())
+                    {
+                        *old = entry;
+                    } else {
+                        if self.cache.len() == 32 {
+                            let oldest = self
+                                .cache
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, old)| old.seen)
+                                .map(|(i, _)| i)
+                                .unwrap();
+                            self.cache.swap_remove(oldest);
+                        }
+                        self.cache.push(entry);
+                    }
+                }
+                self.check_current()
+            }
+            Err(error) => {
+                self.fail();
+                Err(error)
+            }
+        }
     }
 }

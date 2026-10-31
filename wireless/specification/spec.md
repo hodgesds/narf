@@ -1875,6 +1875,14 @@ starting sequence. `transmit_ethernet_qos` consumes the selected counter while
 forming the original header before CCMP; protected headers are never rewritten.
 The sample alone grants no aggregation, native completion or transmit authority.
 
+`Security::reserve_plain_control_sequence()` reserves one slot in the same
+non-QoS DATA/EAPOL sequence space for an independently admitted plaintext
+control frame. It refuses a closed, failed or active-handshake owner, advances
+the checked 12-bit counter through wrap, and consumes no CCMP PN or key/replay
+state. A driver emitting a plaintext off-channel Null function must retain its
+own native peer, queue and current policy proofs; this helper grants none.
+QoS Null uses SN0 and does not call it, preserving all per-TID DATA counters.
+
 `Security::receive_amsdu(&impl RawFrame)` composes that aggregate key operation
 with the existing currently-open controlled port and installed pairwise/group
 slots. It returns `Option<Vec<Vec<u8>>>` of complete Ethernet-II subframes and

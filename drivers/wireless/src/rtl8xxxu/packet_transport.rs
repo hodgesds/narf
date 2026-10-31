@@ -379,6 +379,21 @@ impl<I: Io> Owner<I> {
         }
         self.submit_encoded(packet_codec::transmit_probe(probe), 0)
     }
+    pub(super) fn submit_null(&mut self, null: &super::ps_null::Prepared) -> Result<(), Error> {
+        self.check_pipe(true)?;
+        if self.receive.is_none() {
+            return Err(Error::NotStarted);
+        }
+        if self.transmit.is_some() {
+            return Err(Error::Busy);
+        }
+        if null.qos() != self.qos {
+            return Err(Error::Packet(packet_codec::Error::Header));
+        }
+        let class = packet_codec::access_category(if null.qos() { 7 } else { 0 }).1;
+        let index = packet_codec::data_endpoint(class, self.endpoints.output_count);
+        self.submit_encoded(packet_codec::transmit_null(null), index)
+    }
     fn submit_encoded(&mut self, packet: Vec<u8>, index: usize) -> Result<(), Error> {
         let endpoint = self.endpoints.output[index];
         let dci = endpoint * 2;

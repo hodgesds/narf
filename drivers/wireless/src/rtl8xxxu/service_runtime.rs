@@ -201,16 +201,22 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
             return Vec::new();
         }
         let now = self.environment.now_ms();
-        self.cache
+        let candidates = self
+            .cache
             .iter()
             .filter(|e| {
                 now >= e.seen
                     && now - e.seen < 10000
-                    && (self.radio.is_none()
-                        || self.channel_permission(e.candidate.channel()).is_ok())
+                    && self.channel_permission(e.candidate.channel()).is_ok()
             })
             .map(|e| e.candidate.clone())
-            .collect()
+            .collect();
+        if self.current().is_err() {
+            self.failed.store(true, Ordering::Release);
+            Vec::new()
+        } else {
+            candidates
+        }
     }
     /// Bounded progress from both a worker and a synchronous network waiter.
     /// No EP0 await, block_on, or dependence on another executor task occurs.

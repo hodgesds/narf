@@ -8,8 +8,11 @@ use super::{
 };
 use alloc::{sync::Arc, vec::Vec};
 
+#[path = "receive_associated.rs"]
+mod receive_associated;
 #[path = "receive_probe.rs"]
 mod receive_probe;
+pub(in crate::rtl8xxxu) use receive_associated::ScanConfig;
 #[path = "receive_retune.rs"]
 mod receive_retune;
 

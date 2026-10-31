@@ -15,6 +15,8 @@ use narf_firmware::FirmwareBlob;
 
 #[path = "active_composition_tests.rs"]
 mod active_composition_tests;
+#[path = "associated_composition_tests.rs"]
+mod associated_composition_tests;
 #[path = "pm_composition_tests.rs"]
 mod pm_composition_tests;
 

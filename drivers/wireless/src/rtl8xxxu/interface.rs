@@ -49,6 +49,12 @@ struct Delivery {
     generation: u64,
     authority: super::receive_runtime::Authority,
 }
+struct ScanPublication<F: Fn()>(F);
+impl<F: Fn()> Drop for ScanPublication<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
 impl<C: ControlIo, B: PacketIo, E: Environment> State<C, B, E> {
     fn clear_transmit(&mut self) {
         self.pending = None;
@@ -605,9 +611,22 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
         let (mut channels, dwell) = validate_scan(&request)?;
         let mut state = self.control_state(false).await?;
-        if state.service.phase() != service_runtime::Phase::Passive {
+        if !matches!(
+            state.service.phase(),
+            service_runtime::Phase::Passive | service_runtime::Phase::Connected
+        ) || request.active && state.service.phase() == service_runtime::Phase::Connected
+        {
             return Err(WirelessError::Busy);
         }
+        // The retained Service/Station attempts set this shared failure flag
+        // before the awaiting future is dropped. Withdraw the original
+        // registration immediately; never wait for a later network drain to
+        // notice cancellation. Pure request refusal leaves the flag clear.
+        let _publication = ScanPublication(|| {
+            if self.failed.load(Ordering::Acquire) {
+                self.close();
+            }
+        });
         if channels.is_empty() {
             channels = state.service.scan_channels().map_err(wireless_error)?;
         }
@@ -627,7 +646,7 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
         } else {
             state
                 .service
-                .passive_scan(&channels, dwell)
+                .passive_scan(&channels, dwell, request.duration_mandatory)
                 .await
                 .map_err(wireless_error)?;
         }

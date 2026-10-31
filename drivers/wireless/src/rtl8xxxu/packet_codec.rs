@@ -260,6 +260,12 @@ pub(super) fn transmit_rate(frame: &[u8], kind: Kind, rate: u8) -> Result<Vec<u8
 pub(super) fn transmit_probe(probe: &super::probe_runtime::Prepared) -> Vec<u8> {
     encode_transmit(probe.bytes(), Kind::Management, 0)
 }
+/// Only the internal payload-free Null type reaches this DATA exception.
+/// The descriptor preserves the supplied SN: HW_SEQ_ENABLE remains clear,
+/// including after a cold MAC restart (rtl8xxxu.h TXDESC32_HW_SEQ_ENABLE).
+pub(super) fn transmit_null(null: &super::ps_null::Prepared) -> Vec<u8> {
+    encode_transmit(null.bytes(), Kind::Data, 0)
+}
 fn encode_transmit(frame: &[u8], kind: Kind, rate: u8) -> Vec<u8> {
     let fc = u16::from_le_bytes([frame[0], frame[1]]);
     let management = kind == Kind::Management;
@@ -287,7 +293,11 @@ fn encode_transmit(frame: &[u8], kind: Kind, rate: u8) -> Vec<u8> {
     out[16..20].copy_from_slice(
         &((1u32 << 8)
             | if rate >= 12 { 1 << 10 } else { 0 }
-            | if frame[0] == 0x88 { 1 << 6 } else { 0 })
+            | if matches!(frame[0], 0x88 | 0xc8) {
+                1 << 6
+            } else {
+                0
+            })
         .to_le_bytes(),
     ); // USE_DRIVER_RATE/DISABLE_DATA_FB/QOS
     out[20..24].copy_from_slice(
@@ -342,7 +352,7 @@ pub(super) fn adaptive_fields(packet: &mut [u8], pt_stage: u8) {
 }
 /// QoS TID of a DATA frame; non-QoS DATA uses mac80211's BE priority0.
 pub(super) fn data_tid(frame: &[u8]) -> u8 {
-    if frame.first() == Some(&0x88) {
+    if matches!(frame.first(), Some(0x88 | 0xc8)) {
         frame.get(24).map_or(0, |q| q & 7)
     } else {
         0

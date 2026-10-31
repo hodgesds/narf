@@ -964,6 +964,13 @@ correlated MCC facts and unchanged home bounds fence data/key maintenance;
 healthy exact-UID termination restores home ownership. API89 MVM remains
 idle-only. Family §3.61 records seven new native cases pending execution.
 
+RTL8188EU associated passive scanning retains the same station, software
+keys/replay/BA and host rings through qualified cold channel visits. Private
+plaintext Null/QoS Null uses the peer's actual profile and shared sequence
+ownership; native USB/device terminals remain distinct from AP reception.
+Eight composed driver cases and one shared sequence/CCMP case await native
+release acceptance in the family §3.
+
 ## 4. Interaction with `narf-wireless`
 
 - **Registration**: Drivers register via `bus::register_wireless_driver(MatchEntry { ... })`.
