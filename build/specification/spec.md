@@ -68,8 +68,9 @@ and CI compiler-cache integration.
   public keys; neither tool qualifies board-power or regulatory artifacts.
 
 - `cargo xtask run --arch=x86_64 [--release]` — build + QEMU boot. Optimized
-  builds strip debug-only ELF sections by default while retaining ordinary
-  symbols; `--debug` retains full debuginfo for GDB and crash diagnosis.
+  builds omit DWARF generation and strip debug-only ELF sections by default
+  while retaining ordinary symbols; `--debug` retains full debuginfo for GDB
+  and crash diagnosis.
 - `cargo xtask cachyos-root-smoke --prebuilt ELF ...` boots an explicitly
   selected regular kernel file without rebuilding the shared target artifact.
   It reports the selected path and SHA-256. Firmware initramfs construction
