@@ -9,7 +9,7 @@ fn setup_profile(profile: ReceiveModel) -> R<Guard> {
     let phy = PhyModel {
         width: 0,
         streams: 1,
-        rates: 2,
+        rates: 3,
         mcc_he: false,
         response_he: false,
     };
@@ -356,7 +356,7 @@ fn inputs(
     let (write, read) = narf_firmware::bootstrap_authority();
     let mut bytes = super::super::super::firmware_parser_tests::mld_image();
     let mut table = super::super::super::firmware_parser_tests::mld_commands();
-    he_tests::versions(&mut table, 2);
+    he_tests::versions(&mut table);
     profile.commands(&mut table);
     require(
         word(&bytes, 88) == 48,
@@ -392,7 +392,7 @@ fn smoke_sc_rss_native_dropped_waiter_and_revoked_config_receipt_pin_every_ring(
             let phy = PhyModel {
                 width: 0,
                 streams: 1,
-                rates: 2,
+                rates: 3,
                 mcc_he: false,
                 response_he: false,
             };
@@ -505,7 +505,7 @@ fn smoke_sc_rss_native_actual_profile_unknown_version_and_malformed_receipt_stay
             let phy = PhyModel {
                 width: 0,
                 streams: 1,
-                rates: 2,
+                rates: 3,
                 mcc_he: false,
                 response_he: false,
             };
