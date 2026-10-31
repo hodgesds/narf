@@ -9,15 +9,16 @@ fn config(channel: u8) -> WirelessConfig {
         tx_power_dbm: None,
     }
 }
-fn idle_receipt(h: &Harness) {
+pub(super) fn idle_receipt(h: &Harness) {
     h.packet.radio.hardware_byte(0x286, 2);
     for reg in 0x5f8..=0x5fb {
         h.packet.radio.hardware_byte(reg, 0);
     }
 }
-fn peer_channel(h: &Harness, channel: u8) {
+pub(super) fn peer_channel(h: &Harness, channel: u8) {
     let mut peer = h.peer.lock();
     let protected = peer.ap.protected();
+    peer.channel = channel;
     peer.ap = if protected {
         FakeAp::wpa2(peer.plan, SSID, channel, 42, PMK, ANONCE)
     } else {

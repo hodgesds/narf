@@ -32,6 +32,8 @@ mod lifecycle;
 mod rebuild_native;
 #[path = "recovery.rs"]
 pub(crate) mod recovery;
+#[path = "scan_runtime.rs"]
+mod scan_runtime;
 #[path = "supervisor.rs"]
 pub(crate) mod supervisor;
 #[path = "system_sleep.rs"]
@@ -74,6 +76,8 @@ pub(crate) struct Device<I: Port<Buffer = M>, M: Memory, E: Environment> {
     leisure: IrqSafeSpinLock<Leisure>,
     lifecycle: lifecycle::Lifecycle,
     work: Mutex<Option<supervisor::Work>>,
+    scan_request: Mutex<()>,
+    scan_cache: IrqSafeSpinLock<Vec<scan_runtime::Observation>>,
     /// `rtl_pci_remove` ran: the publisher worker exits.
     removed: AtomicBool,
 }
@@ -220,6 +224,8 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             leisure: IrqSafeSpinLock::new(Leisure::default()),
             lifecycle: lifecycle::Lifecycle::new(),
             work: Mutex::new(None),
+            scan_request: Mutex::new(()),
+            scan_cache: IrqSafeSpinLock::new(Vec::new()),
             removed: AtomicBool::new(false),
         }
     }
@@ -788,13 +794,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         &[0x000fac04]
     }
     fn scan_information_elements(&self, bssid: [u8; 6]) -> Option<Vec<u8>> {
-        self.prepared
-            .try_lock()?
-            .as_ref()?
-            .station_candidates(self.environment.now_ms())
-            .into_iter()
-            .find(|candidate| candidate.bss.bssid == bssid)
-            .map(|candidate| candidate.bss.information_elements)
+        self.scan_ies(bssid)
     }
     fn get_wireless_info(&self) -> narf_wireless::WirelessIfaceInfo {
         use narf_wireless::iface::*;
@@ -803,7 +803,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             base_mac: self.factory.mac,
             bands: vec![WirelessBand {
                 freq_mhz: 2400,
-                channels: vec![u32::from(self.lifecycle.channel.load(Ordering::Acquire))],
+                channels: self.available_channels(),
             }],
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
@@ -825,120 +825,28 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         })
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        let channel = channel_runtime::scan_channel(
-            &request,
-            self.lifecycle.channel.load(Ordering::Acquire),
-        )?;
-        let dwell = scan_dwell(&request)?;
-        self.lifecycle
-            .activity_ms
-            .store(self.environment.now_ms(), Ordering::Release);
-        if channel != self.lifecycle.channel.load(Ordering::Acquire) {
-            self.environment
-                .change_channel(channel)
-                .ok_or(WirelessError::NotSupported)?
-                .await
-                .map_err(error)?;
-        } else if self.admission.closed.load(Ordering::Acquire) {
-            self.environment
-                .recovery()
-                .ok_or(WirelessError::HardwareError)?
-                .await
-                .map_err(error)?;
-        }
-        let _control = self.lifecycle.control.lock().await;
-        if self.lifecycle.channel.load(Ordering::Acquire) != channel {
-            return Err(WirelessError::Busy);
-        }
-        if self.admission.closed.load(Ordering::Acquire) {
-            return Err(WirelessError::HardwareError);
-        }
-        let mut storage = self.prepared.lock().await;
-        let owner = storage
-            .as_mut()
-            .ok_or(if self.environment.preparation_failed() {
-                WirelessError::HardwareError
-            } else {
-                WirelessError::Busy
-            })?;
-        self.ready(owner).await.map_err(error)?;
-        if owner.station_phase() != station::Phase::Passive {
-            return Err(WirelessError::Busy);
-        }
-        let mut attempt = Attempt {
-            device: self,
-            owner: Some(owner.station_cancellation()),
-            generation: self.lifecycle.generation(),
-            armed: true,
-        };
-        let result = async {
-            if request.active {
-                if request.ssids.is_empty() {
-                    owner.probe_station(&[], &self.environment).await?;
-                }
-                for ssid in &request.ssids {
-                    owner.probe_station(ssid, &self.environment).await?;
-                }
-            }
-            let deadline = self.environment.now_ms().saturating_add(dwell);
-            loop {
-                owner.progress_station(&self.environment)?;
-                if self.environment.now_ms() >= deadline {
-                    break;
-                }
-                self.environment.pause().await;
-            }
-            Ok::<_, Error>(
-                owner
-                    .station_candidates(self.environment.now_ms())
-                    .into_iter()
-                    .filter(|candidate| {
-                        request.ssids.is_empty()
-                            || request
-                                .ssids
-                                .iter()
-                                .any(|ssid| ssid.is_empty() || *ssid == candidate.bss.ssid)
-                    })
-                    .map(|candidate| BssInfo {
-                        bssid: candidate.bss.bssid,
-                        ssid: candidate.bss.ssid,
-                        channel: u32::from(candidate.bss.channel),
-                        frequency_mhz: 2407 + u32::from(candidate.bss.channel) * 5,
-                        rssi: i8::MIN,
-                        security: if candidate.rsne.is_some() {
-                            narf_wireless::scan::BssSecurity::Wpa2
-                        } else if candidate.bss.capability & 16 != 0 {
-                            narf_wireless::scan::BssSecurity::Wep
-                        } else {
-                            narf_wireless::scan::BssSecurity::Open
-                        },
-                    })
-                    .collect(),
-            )
-        }
-        .await;
-        attempt.armed = false;
-        if result.is_err() {
-            owner.abort_station();
-            self.close();
-        }
-        result.map_err(error)
+        self.scan_channels(request).await
     }
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
+        if !matches!(
+            &request.security,
+            SecurityConfig::Open | SecurityConfig::Wpa2 { .. }
+        ) {
+            return Err(WirelessError::NotSupported);
+        }
+        self.select_join_channel(&request).await?;
         let _control = self.lifecycle.control.lock().await;
         if self.admission.closed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
         }
-        if request.channel != u32::from(self.lifecycle.channel.load(Ordering::Acquire))
-            || request.frequency_mhz != 2407 + u32::from(request.channel) * 5
-        {
-            return Err(WirelessError::NotSupported);
+        if request.channel != u32::from(self.lifecycle.channel.load(Ordering::Acquire)) {
+            return Err(WirelessError::Busy);
         }
-        let (mode, pmk) = match request.security {
+        let (mode, pmk) = match &request.security {
             SecurityConfig::Open => (narf_wireless::association::SecurityMode::Open, None),
             SecurityConfig::Wpa2 { psk } => (
                 narf_wireless::association::SecurityMode::Wpa2Psk,
-                Some(Zeroizing::new(psk)),
+                Some(Zeroizing::new(*psk)),
             ),
             _ => return Err(WirelessError::NotSupported),
         };
@@ -955,16 +863,20 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             generation: self.lifecycle.generation(),
             armed: true,
         };
-        let result = owner
-            .connect_station(
-                request.bssid,
-                &request.ssid,
-                mode,
-                pmk,
-                &request.ie,
-                &self.environment,
-            )
-            .await;
+        let result = async {
+            self.observe_join_target(owner, &request).await?;
+            owner
+                .connect_station(
+                    request.bssid,
+                    &request.ssid,
+                    mode,
+                    pmk,
+                    &request.ie,
+                    &self.environment,
+                )
+                .await
+        }
+        .await;
         attempt.armed = false;
         if self.admission.closed.load(Ordering::Acquire) {
             owner.abort_station();

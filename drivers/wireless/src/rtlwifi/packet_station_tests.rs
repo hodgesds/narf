@@ -118,6 +118,7 @@ impl narf_wireless::ccmp::AesCcm for Ccm {
     }
 }
 pub(super) struct Peer {
+    pub(super) channel: u8,
     ap: FakeAp,
     plan: NetworkPlan,
     server: DhcpServer,
@@ -154,6 +155,7 @@ impl Peer {
         .with_basic_1mbps()
         .unwrap();
         Self {
+            channel: 1,
             ap,
             plan,
             server: DhcpServer::new(plan),

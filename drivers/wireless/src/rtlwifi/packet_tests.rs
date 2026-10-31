@@ -466,7 +466,14 @@ impl Port for PacketPort {
         let peer = { self.model.lock().peer.clone() };
         let mut held = false;
         if let Some(peer) = peer {
-            let result = { peer.lock().react(&bytes) };
+            let result = {
+                let mut peer = peer.lock();
+                if self.radio.rf(0x18) & 255 == u32::from(peer.channel) {
+                    peer.react(&bytes)
+                } else {
+                    Ok((Vec::new(), false))
+                }
+            };
             match result {
                 Ok((replies, hold)) => {
                     for reply in replies {

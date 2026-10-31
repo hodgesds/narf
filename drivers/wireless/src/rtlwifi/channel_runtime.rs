@@ -42,34 +42,3 @@ where
         self.recover_locked().await
     }
 }
-
-/// A single-channel scan can select a noninitial qualified channel. Multi-
-/// channel dwell aggregation is a separate public scan continuation.
-pub(super) fn scan_channel(request: &ScanRequest, current: u8) -> Result<u8, WirelessError> {
-    let mut selected = None;
-    for &frequency in &request.frequencies_mhz {
-        if !(2412..=2462).contains(&frequency) || (frequency - 2407) % 5 != 0 {
-            return Err(WirelessError::NotSupported);
-        }
-        let channel = ((frequency - 2407) / 5) as u8;
-        if selected
-            .replace(channel)
-            .is_some_and(|previous| previous != channel)
-        {
-            return Err(WirelessError::NotSupported);
-        }
-    }
-    for &raw in &request.channels {
-        let channel = u8::try_from(raw).map_err(|_| WirelessError::NotSupported)?;
-        if !(1..=11).contains(&channel) {
-            return Err(WirelessError::NotSupported);
-        }
-        if selected
-            .replace(channel)
-            .is_some_and(|previous| previous != channel)
-        {
-            return Err(WirelessError::NotSupported);
-        }
-    }
-    Ok(selected.unwrap_or(current))
-}

@@ -318,8 +318,9 @@ Four native composed scan cases cover Open/WPA2 conversations, literal probe
 and descriptor bytes, held completion/cancellation and prevalidation without
 radio mutation. All four active-probe cases pass on both architectures at
 `73b90b62d`. A single-channel request can select a qualified channel1–11
-through the fresh-owner transition below. Multi-channel dwell aggregation
-and broader qualified HT/fallback profiles remain separate work (randomized scan addresses are
+through the fresh-owner transition below. Multi-channel dwell aggregation is
+implemented pending its own native acceptance below; broader qualified
+HT/fallback profiles remain separate work (randomized scan addresses are
 source-inapplicable, section 8). Without the distinct HT record,
 HT/VHT/HE/EHT remain unselected; VHT/HE/EHT are never admitted by this EE path.
 
@@ -1127,12 +1128,38 @@ last requested channel only under fresh current permission.
 
 Channel1 NEHT/NEFB records do not authorize HT or adaptive fallback on another
 channel; those channels use the qualified fixed legacy20 path. Discovery
-continues reporting the selected single-channel scan profile until multi-
-channel scan aggregation is implemented. Other bands/widths remain separate.
+reports only channels permitted by the current NEPC and host policy. Other
+bands/widths remain separate.
 Four native composed cases exercise actual1→6→11→1 RF18 and distinct gain
 receipts with Open/WPA2 DHCP, preflight/idle rejection, abandoned waiters and
 IPS wake. Both remaining family rows stay open pending native acceptance and
 their explicit broader scan/PHY residuals.
+
+### Multi-channel software scanning (implemented, native acceptance pending)
+
+A scan now validates the complete requested channel/frequency set before its
+first hardware action. Duplicate selectors are deduplicated, conflicting
+channel/frequency sets are rejected, and an empty set selects all currently
+qualified channels in1–11. Each dwell uses the actual retained physical
+channel owner and its current permission. Active scans publish real native
+Probe Requests; passive scans only consume physical beacons/probe responses.
+An associated station must disconnect before this cold-retune scan profile.
+Successful multi-channel scans return to the original operating channel.
+
+The logical device retains at most32 owned BSS/IE observations for10seconds,
+so returning home does not discard metadata from earlier scan channels.
+The display cache carries no packet, regulatory or key authority. Selecting
+a BSS on another channel creates a fresh physical owner and requires a new
+matching physical beacon/probe response before authentication or RSNA. A
+cached scan result cannot authorize joining a peer that has moved away.
+Cancelled dwells close their generation; cancelled retunes retain the exact
+driver-owned transition, and incomplete scans publish no partial cache.
+
+Five native composed cases exercise Open/WPA2 scan-selected fresh joins and
+actual DHCP, default passive scanning with physical off-channel filtering,
+whole-plan prevalidation, stale display metadata and cancelled retained work.
+Acceptance remains pending. The dwell/probe/channel progression follows
+Linux [mac80211 scan.c](https://github.com/torvalds/linux/blob/master/net/mac80211/scan.c).
 
 ## 4. Invariants
 
@@ -1285,7 +1312,7 @@ runtimes remain separate from the retained RTL8188EE owner.
 
 | Row | Concrete blocker |
 |---|---|
-| `active_scanning` | Native single-channel active Probe Requests software-validated; qualified cold retune1–11 implemented pending acceptance, and multi-channel dwell aggregation remains |
+| `active_scanning` | Native single-channel active Probe Requests software-validated; qualified cold retune1–11 and multi-channel dwell aggregation with owned metadata/fresh physical join observation implemented pending acceptance |
 | `additional_operating_channels` | Legacy20 cold retune1–11 under current signed per-channel NEPC implemented pending acceptance; broader qualified HT/fallback channel profiles remain |
 | `bt_coexistence` | Bluetooth coexistence on RTL8723AE/BE; blocked on the rtl8723ae/rtl8723be chip runtimes |
 | `dynamic_antenna_selection` | Dynamic antenna selection/tracking; blocked on per-antenna signed board measurements (NEPC binds one static factory antenna) |

@@ -255,7 +255,13 @@ impl Environment for DeviceEnvironment {
     async fn pause(&self) {
         // The AP beacon is injected only after native packet gates opened,
         // in response to actual service progress. Nothing fills scan cache.
-        let active = { self.packet.model.lock().master };
+        let active = {
+            let model = self.packet.model.lock();
+            model.master
+                && model.peer.as_ref().is_some_and(|peer| {
+                    self.packet.radio.rf(0x18) & 255 == u32::from(peer.lock().channel)
+                })
+        };
         if active && !self.beacon.swap(true, Ordering::AcqRel) {
             let peer = self.packet.model.lock().peer.clone().unwrap();
             let beacon = {
@@ -521,6 +527,8 @@ mod power_tests;
 mod probe_tests;
 #[path = "recovery_composition_tests.rs"]
 mod recovery_tests;
+#[path = "scan_composition_tests.rs"]
+mod scans;
 impl Drop for Harness {
     fn drop(&mut self) {
         *ACTIVE_TEST.lock() = None;
