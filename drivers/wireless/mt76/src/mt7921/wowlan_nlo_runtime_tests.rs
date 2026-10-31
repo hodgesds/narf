@@ -62,11 +62,12 @@ fn current() -> Arc<CurrentPolicy> {
     current
 }
 
-fn radio(associated: bool, secure: bool) -> Result<Session<Model>, &'static str> {
+#[inline(never)]
+fn radio(associated: bool, secure: bool) -> Result<NativeSession, &'static str> {
     let mut session = if associated {
         joined(secure)?
     } else {
-        let mut session = Session::new(Model::new(), firmware(32));
+        let mut session = Box::new(Session::new(Model::new(), firmware(32)));
         run(session.run()).map_err(|_| "NLO firmware fixture")?;
         run(session.initialize_radio()).map_err(|_| "NLO actual radio identity")?;
         session.backend.pm.dma_enabled = true;

@@ -10,11 +10,12 @@ pub(super) enum Mode {
 }
 const OWN: [u8; 6] = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
 const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
+#[inline(never)]
 pub(super) fn prepared(
     mode: Mode,
     nss: u8,
     secure: bool,
-) -> (Session<Model>, ScanBss, TxPermission) {
+) -> (NativeSession, ScanBss, TxPermission) {
     let chip = if matches!(mode, Mode::Vht(3)) {
         0x7922
     } else {

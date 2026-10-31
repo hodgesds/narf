@@ -5,7 +5,6 @@ use core::cell::RefCell;
 use narf_wireless::WirelessError;
 const OWN: [u8; 6] = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
 const AP: [u8; 6] = [2, 1, 2, 3, 4, 5];
-type NativeSession = alloc::boxed::Box<Session<Model>>;
 
 // Three shadowed native Sessions plus the nested VHT/WMM return places
 // exceed the existing64KiB ARM boot stack. Keep only heap owners across
@@ -18,8 +17,7 @@ fn prepared_vht(
     ScanBss,
     crate::mt7921::association::TxPermission,
 ) {
-    let (session, bss, permission) = super::vht_tests::prepared(2, secure);
-    (alloc::boxed::Box::new(session), bss, permission)
+    super::vht_tests::prepared(2, secure)
 }
 
 fn reset_open_peer(session: &mut Session<Model>) {

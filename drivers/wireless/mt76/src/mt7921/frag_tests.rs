@@ -16,7 +16,8 @@ fn ethernet(len: usize) -> Vec<u8> {
     frame
 }
 
-fn joined(wmm: bool, wpa2: bool) -> Session<Model> {
+#[inline(never)]
+fn joined(wmm: bool, wpa2: bool) -> NativeSession {
     let (mut session, bss) = wmm_tests::prepared(wmm, wpa2);
     let security = if wpa2 {
         Security::Wpa2Psk { psk: [0x55; 32] }

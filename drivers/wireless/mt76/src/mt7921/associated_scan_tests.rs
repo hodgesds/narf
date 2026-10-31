@@ -25,7 +25,8 @@ fn policy() -> narf_wireless::reg::RegulatoryDomain {
         ],
     }
 }
-fn joined(secure: bool, wide: bool) -> Result<Session<Model>, &'static str> {
+#[inline(never)]
+fn joined(secure: bool, wide: bool) -> Result<NativeSession, &'static str> {
     let (mut session, bss) = super::ht20_tests::prepared(6, secure);
     let permission = if wide {
         super::ht40_tests::permission40(6, 10)

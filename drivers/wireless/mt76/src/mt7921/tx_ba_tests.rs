@@ -12,7 +12,8 @@ fn frame(n: u8) -> Vec<u8> {
     f[12..14].copy_from_slice(&[8, 0]);
     f
 }
-fn joined(channel: u8, wide: bool, secure: bool) -> Result<Session<Model>, &'static str> {
+#[inline(never)]
+fn joined(channel: u8, wide: bool, secure: bool) -> Result<NativeSession, &'static str> {
     let (mut session, bss) = super::ht20_tests::prepared(channel, secure);
     let permission = if wide {
         super::ht40_tests::permission40(channel, channel + 4)

@@ -2,7 +2,8 @@
 use super::*;
 use crate::mt7921::association::Security;
 use alloc::boxed::Box;
-fn joined(secure: bool) -> Result<Session<Model>, &'static str> {
+#[inline(never)]
+fn joined(secure: bool) -> Result<NativeSession, &'static str> {
     let (mut session, bss) = super::ht20_tests::prepared(6, secure);
     run(Box::pin(session.associate_station(
         &bss,

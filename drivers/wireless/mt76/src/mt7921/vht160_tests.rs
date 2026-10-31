@@ -23,13 +23,14 @@ pub(super) fn elements(primary: u8, center: u8, revised: bool) -> (Vec<u8>, Vec<
     vht[18] = if revised { center } else { 0 };
     (ht, vht)
 }
+#[inline(never)]
 fn prepared(
     primary: u8,
     center: u8,
     revised: bool,
     secure: bool,
     chip: u16,
-) -> (Session<Model>, ScanBss, TxPermission) {
+) -> (NativeSession, ScanBss, TxPermission) {
     let (mut session, mut bss) = super::wmm_tests::prepared_with_chip(true, secure, chip);
     session.backend.station_channel = primary;
     bss.channel = primary;

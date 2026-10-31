@@ -354,7 +354,7 @@ fn mt76_reprobe_generation_never_republishes_or_unclaims_stale_owner() -> TestRe
     // installed as the new binding's owner.
     let retired = Cell::new(false);
     let session = secure_model();
-    match admit_completed(session, 1, 2, |mut stale: Session<Model>| {
+    match admit_completed(session, 1, 2, |mut stale: NativeSession| {
         retired.set(stale.retire_removed() && stale.state == State::Stopped);
     }) {
         Err(Error::DeviceGone) if retired.get() => {}

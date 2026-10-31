@@ -17,7 +17,8 @@ fn domain(channel: u8) -> narf_wireless::reg::RegulatoryDomain {
 pub(super) fn permission40(channel: u8, secondary: u8) -> TxPermission {
     TxPermission::from_domain40(&domain(channel), channel, secondary).unwrap()
 }
-fn prepared(primary: u8, secondary: u8, secured: bool) -> (Session<Model>, ScanBss) {
+#[inline(never)]
+fn prepared(primary: u8, secondary: u8, secured: bool) -> (NativeSession, ScanBss) {
     let (mut session, mut bss) = super::ht20_tests::prepared(primary, secured);
     let operation = if secondary > primary { 5 } else { 7 };
     session.backend.ht_reply.as_mut().unwrap()[31] = operation;

@@ -9,6 +9,11 @@ use core::{
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+// A native model contains large packet/BA owners. All shared preparation
+// boundaries return a heap owner so nested fixtures cannot accumulate
+// several by-value Session return places on the kernel boot stack.
+type NativeSession = alloc::boxed::Box<Session<Model>>;
+
 #[path = "ap_runtime_tests.rs"]
 mod ap_runtime_tests;
 #[path = "p2p_native_tests.rs"]
@@ -2874,9 +2879,10 @@ kernel_test_in!(
     mt76_eapol_rx_requires_native_peer_and_declared_pdu
 );
 
-fn secure_model() -> Session<Model> {
+#[inline(never)]
+fn secure_model() -> NativeSession {
     use crate::mt7921::association::{JoinPlan, Security};
-    let mut session = Session::new(Model::new(), firmware(32));
+    let mut session = alloc::boxed::Box::new(Session::new(Model::new(), firmware(32)));
     run(session.run()).unwrap();
     let info = run(session.initialize_radio()).unwrap();
     let rsn = narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body();

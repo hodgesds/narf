@@ -2,15 +2,13 @@
 //! the production Session (Linux mt7921_init_he_caps / sta_he_tlv / bss_he).
 use super::*;
 use crate::mt7921::association::TxPermission;
-type NativeSession = alloc::boxed::Box<Session<Model>>;
 
 // The native Session is large. Return only a heap owner across these
 // nested fixture constructors: three shadowed by-value Sessions plus the
 // HE/VHT/WMM return places exceed the ARM64 64KiB boot stack in release.
 #[inline(never)]
 fn prepared_vht(width: u8, secure: bool) -> (NativeSession, ScanBss, TxPermission) {
-    let (session, bss, permission) = super::vht_tests::prepared(width, secure);
-    (alloc::boxed::Box::new(session), bss, permission)
+    super::vht_tests::prepared(width, secure)
 }
 
 /// AP HE Capabilities (ext 35) and HE Operation (ext 36).

@@ -22,18 +22,20 @@ pub(super) const PARAMETERS: [u8; 26] = [
     0, 0x27, 0xa4, 0, 0,
 ];
 
-pub(super) fn prepared(wmm: bool, wpa2: bool) -> (Session<Model>, ScanBss) {
+#[inline(never)]
+pub(super) fn prepared(wmm: bool, wpa2: bool) -> (NativeSession, ScanBss) {
     prepared_with_chip(wmm, wpa2, 0)
 }
-pub(super) fn prepared_with_chip(wmm: bool, wpa2: bool, chip_id: u16) -> (Session<Model>, ScanBss) {
+pub(super) fn prepared_with_chip(wmm: bool, wpa2: bool, chip_id: u16) -> (NativeSession, ScanBss) {
     prepared_with_phy(wmm, wpa2, chip_id, None)
 }
+#[inline(never)]
 pub(super) fn prepared_with_phy(
     wmm: bool,
     wpa2: bool,
     chip_id: u16,
     phy: Option<[u8; 12]>,
-) -> (Session<Model>, ScanBss) {
+) -> (NativeSession, ScanBss) {
     let mut model = Model::new();
     model.chip_id = chip_id;
     model.phy_capability = phy;
@@ -59,7 +61,7 @@ pub(super) fn prepared_with_phy(
         model.wmm_reply = Some(PARAMETERS.to_vec());
     }
     model.access_point = Some(ap);
-    let mut session = Session::new(model, firmware(32));
+    let mut session = alloc::boxed::Box::new(Session::new(model, firmware(32)));
     run(session.run()).unwrap();
     run(session.initialize_radio()).unwrap();
     (session, bss)

@@ -89,7 +89,8 @@ fn ht_rx2_basic(ies: &mut [u8], mandatory: bool) {
         offset += 2 + usize::from(ies[offset + 1]);
     }
 }
-pub(super) fn prepared(width: u8, secure: bool) -> (Session<Model>, ScanBss, TxPermission) {
+#[inline(never)]
+pub(super) fn prepared(width: u8, secure: bool) -> (NativeSession, ScanBss, TxPermission) {
     let (mut session, mut bss) = super::wmm_tests::prepared(true, secure);
     session.backend.station_channel = 36;
     bss.channel = 36;

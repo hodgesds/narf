@@ -10,7 +10,8 @@ fn frame(n: u8) -> Vec<u8> {
     bytes[12..14].copy_from_slice(&[8, 0]);
     bytes
 }
-fn joined(ht: bool, secured: bool) -> Result<Session<Model>, &'static str> {
+#[inline(never)]
+fn joined(ht: bool, secured: bool) -> Result<NativeSession, &'static str> {
     let (mut session, mut bss) = super::ht20_tests::prepared(6, secured);
     if !ht {
         session.backend.ht_reply = None;

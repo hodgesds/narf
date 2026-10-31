@@ -19,7 +19,8 @@ pub(super) fn elements(channel: u8) -> Vec<u8> {
     bytes
 }
 
-pub(super) fn prepared(channel: u8, secured: bool) -> (Session<Model>, ScanBss) {
+#[inline(never)]
+pub(super) fn prepared(channel: u8, secured: bool) -> (NativeSession, ScanBss) {
     let (mut session, mut bss) = super::wmm_tests::prepared(true, secured);
     session.backend.station_channel = channel;
     session.backend.ht_reply = Some(elements(channel));

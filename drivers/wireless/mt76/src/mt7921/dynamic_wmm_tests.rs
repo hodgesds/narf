@@ -4,7 +4,8 @@ use crate::mt7921::association::{wmm::Parameters, Security};
 
 const OWN: [u8; 6] = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
 
-fn joined(secured: bool) -> (Session<Model>, ScanBss) {
+#[inline(never)]
+fn joined(secured: bool) -> (NativeSession, ScanBss) {
     let (mut session, bss) = wmm_tests::prepared(true, secured);
     let security = if secured {
         Security::Wpa2Psk { psk: [0x55; 32] }

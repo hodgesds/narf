@@ -77,7 +77,8 @@ pub(super) fn ethernet(value: u8, length: usize) -> Vec<u8> {
     eth
 }
 
-fn model(protected: bool) -> Session<Model> {
+#[inline(never)]
+fn model(protected: bool) -> NativeSession {
     let mut session = secure_model();
     if !protected {
         session.security = None;

@@ -73,7 +73,8 @@ pub(super) fn data_on(channel: u8, tid: u8, sequence: u16, pn: Option<u64>, valu
     packet.extend_from_slice(&frame);
     packet
 }
-fn joined(channel: u8, wide: bool, secured: bool) -> Result<Session<Model>, &'static str> {
+#[inline(never)]
+fn joined(channel: u8, wide: bool, secured: bool) -> Result<NativeSession, &'static str> {
     let (mut session, bss) = super::ht20_tests::prepared(channel, secured);
     let permission = if wide {
         super::ht40_tests::permission40(channel, channel + 4)
