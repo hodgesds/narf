@@ -3,6 +3,61 @@
 use super::super::super::super::{bz_fixture, gen3_fixture};
 use super::*;
 
+// Scheduled RESULTS/STOPPED use the actual generic-netlink multicast path;
+// the request's DeferredReplySink owns only its unicast terminal ACK.
+static CAPTURING: AtomicBool = AtomicBool::new(false);
+static EVENTS: IrqSafeSpinLock<Vec<(u64, u32, Vec<u8>)>> = IrqSafeSpinLock::new(Vec::new());
+fn multicast(namespace: u64, group: u32, message: &[u8]) {
+    if CAPTURING.load(Ordering::Acquire)
+        && message.get(4..6)
+            == Some(
+                narf_wireless::nl80211::NL80211_FAMILY_ID
+                    .to_ne_bytes()
+                    .as_slice(),
+            )
+        && message.get(16).is_some_and(|cmd| matches!(cmd, 77 | 78))
+    {
+        EVENTS.lock().push((namespace, group, message.to_vec()));
+    }
+}
+struct Events(Option<fn(u64, u32, &[u8])>);
+impl Events {
+    fn install() -> Self {
+        EVENTS.lock().clear();
+        CAPTURING.store(true, Ordering::Release);
+        Self(narf_net::netlink_generic::install_event_sink(multicast))
+    }
+    fn clear(&self) {
+        EVENTS.lock().clear();
+    }
+    fn contains(&self, command: u8) -> bool {
+        EVENTS
+            .lock()
+            .iter()
+            .any(|(_, _, message)| message.get(16) == Some(&command))
+    }
+    fn check(&self, command: u8) -> R {
+        require(
+            EVENTS.lock().iter().any(|(namespace, group, message)| {
+                *namespace == 0
+                    && *group == 18
+                    && message.get(16) == Some(&command)
+                    && message.get(8..16) == Some([0; 8].as_slice())
+            }),
+            "native periodic notification lost multicast namespace/group/framing",
+        )
+    }
+}
+impl Drop for Events {
+    fn drop(&mut self) {
+        CAPTURING.store(false, Ordering::Release);
+        if let Some(previous) = self.0 {
+            narf_net::netlink_generic::install_event_sink(previous);
+        }
+        EVENTS.lock().clear();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Profile {
     Sc,
@@ -182,12 +237,14 @@ fn timing() -> R {
 }
 fn smoke_mld_associated_periodic_sc_bz_live_wpa2_dhcp_data_and_exact_home_stop() -> TestResult {
     check(|| {
+        let events = Events::install();
         for profile in [
             Profile::Sc,
             Profile::Bz(bz_fixture::Case::FmDiscrete),
             Profile::Bz(bz_fixture::Case::WhIntegrated),
         ] {
             for active in [false, true] {
+                events.clear();
                 let control = control(profile, active, None)?;
                 join(&control, None)?;
                 let before = original(&control)?;
@@ -210,14 +267,8 @@ fn smoke_mld_associated_periodic_sc_bz_live_wpa2_dhcp_data_and_exact_home_stop()
                 )?;
                 data(&control, b"associated-pno-live")?;
                 inject_result();
-                until(|| {
-                    control
-                        .source
-                        .1
-                        .lock()
-                        .iter()
-                        .any(|m| m.get(16) == Some(&77))
-                })?;
+                until(|| events.contains(77))?;
+                events.check(77)?;
                 let replies = dispatch(&control, 32, 0x7e91)?;
                 require(
                     replies
@@ -344,7 +395,9 @@ kernel_test_in!(
 
 fn smoke_mld_periodic_live_group_rekey_keeps_scan_and_all_ring_epochs_owned() -> TestResult {
     check(|| {
+        let events = Events::install();
         for profile in [Profile::Sc, Profile::Bz(bz_fixture::Case::WhIntegrated)] {
+            events.clear();
             let control = control(profile, true, None)?;
             join(&control, None)?;
             let before = original(&control)?;
@@ -372,14 +425,8 @@ fn smoke_mld_periodic_live_group_rekey_keeps_scan_and_all_ring_epochs_owned() ->
                 "actual group rotation lost live periodic scanner or RX marker owner",
             )?;
             inject_result();
-            until(|| {
-                control
-                    .source
-                    .1
-                    .lock()
-                    .iter()
-                    .any(|m| m.get(16) == Some(&77))
-            })?;
+            until(|| events.contains(77))?;
+            events.check(77)?;
             let lease = narf_net::dhcp::dhcp_acquire(control.device().name(), 0)
                 .map_err(|_| "PNO rekey blocked original DHCP port")?;
             require(NETWORK.matches_lease(&lease), "PNO rekey native lease")?;
@@ -667,6 +714,7 @@ kernel_test_in!(
 fn smoke_mld_periodic_bounded_scan_pass_preserves_data_prefix_and_later_uid_terminal() -> TestResult
 {
     check(|| {
+        let events = Events::install();
         let control = control(Profile::Sc, false, None)?;
         join(&control, None)?;
         control.start()?;
@@ -762,12 +810,7 @@ fn smoke_mld_periodic_bounded_scan_pass_preserves_data_prefix_and_later_uid_term
         )?;
         same_home(&control, before)?;
         require(
-            control
-                .source
-                .1
-                .lock()
-                .iter()
-                .any(|m| m.get(16) == Some(&78))
+            events.contains(78)
                 && control
                     .device()
                     .scan_generation
@@ -775,6 +818,7 @@ fn smoke_mld_periodic_bounded_scan_pass_preserves_data_prefix_and_later_uid_term
                     .is_err(),
             "natural periodic terminal omitted exact STOP or retained old publication",
         )?;
+        events.check(78)?;
         for publication in held {
             publication.publish();
         }

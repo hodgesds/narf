@@ -128,7 +128,7 @@ impl Io for AssociatedLink {
             || flags != 0x100 | if qos { 0x40 } else { 0 }
             || queue != if qos { 7 << 8 } else { 0 }
             || bytes[20..24] != 0x0001ff00u32.to_le_bytes()
-            || qos && (frame[22..26] != [0, 0, 7, 0] || dci != 4)
+            || qos && (frame[22..26] != [0, 0, 7, 0] || dci != 6)
             || !qos && dci != 8
             || bytes[..TX_DESC]
                 .chunks_exact(2)
