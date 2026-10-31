@@ -31,6 +31,9 @@ pub struct ExecObject {
 #[derive(Debug)]
 pub struct ExecRequest {
     pub context_id: u32,
+    /// I915_EXEC_RING_MASK: a legacy ring or an index into the context's
+    /// engine map. Selection belongs to the context, as in eb_select_engine.
+    pub ring: u32,
     pub batch_va: u64,
     pub batch_len: u64,
     pub objects: Vec<ExecObject>,
@@ -156,7 +159,6 @@ impl ExecRequest {
             || count > MAX_OBJECTS
             || flags & !supported != 0
             || flags & abi::EXEC_NO_RELOC == 0
-            || flags & 0x3f > abi::EXEC_RENDER
             || u32_at(request, 20) != 0
             || u32_at(request, 24) != 0
             || (!explicit
@@ -244,6 +246,7 @@ impl ExecRequest {
         }
         Ok(Self {
             context_id: u64_at(request, 48) as u32,
+            ring: (flags & 0x3f) as u32,
             batch_va: batch.va + start,
             batch_len,
             objects,
@@ -539,6 +542,7 @@ impl PpgttProbeResult {
             code.write(i as u64 * 4, &word.to_le_bytes())?;
         }
         let batch = ExecRequest {
+            ring: 0,
             context_id: 0,
             batch_va: PROBE_CODE,
             batch_len: PROBE_WORDS.len() as u64 * 4,

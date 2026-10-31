@@ -362,7 +362,7 @@ fn smoke_userspace_execbuffer_ioctl_order_close_and_completion() -> TestResult {
     }
     // Live engine/version discovery uses Linux's exact sizes and field order.
     for (id, size) in [
-        (abi::QUERY_ENGINES, 72),
+        (abi::QUERY_ENGINES, 128),
         (abi::QUERY_GUC_SUBMISSION_VERSION, 16),
     ] {
         let mut query = [0; 16];
@@ -380,8 +380,20 @@ fn smoke_userspace_execbuffer_ioctl_order_close_and_completion() -> TestResult {
         invoke(&file, &info, &user, abi::QUERY);
         let data = user.load(2048, size as usize);
         if id == abi::QUERY_ENGINES {
-            assert_eq!(u32_at(&data, 0), 1);
-            assert!(data[4..].iter().all(|v| *v == 0));
+            // drm_i915_engine_info: RENDER/0 then COPY/0, HAS_LOGICAL_INSTANCE.
+            assert_eq!(u32_at(&data, 0), 2);
+            assert!(data[4..16].iter().all(|v| *v == 0));
+            for (i, class) in [0u8, 1].into_iter().enumerate() {
+                let entry = &data[16 + i * 56..16 + (i + 1) * 56];
+                assert_eq!(&entry[..4], &[class, 0, 0, 0]);
+                assert_eq!(u64_at(entry, 8), 1);
+                assert!(entry[4..8].iter().chain(&entry[16..]).all(|v| *v == 0));
+            }
+            // Nonzero input num_engines/rsvd is EINVAL and leaves data untouched.
+            user.store(2048, &[0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+            invoke(&file, &info, &user, abi::QUERY);
+            assert_eq!(u32_at(&user.load(1024, 24), 8) as i32, -22);
+            assert_eq!(u32_at(&user.load(2048, 16), 8), 1);
         } else {
             assert_eq!(&data, &[0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         }
@@ -476,6 +488,223 @@ fn smoke_userspace_execbuffer_ioctl_order_close_and_completion() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_user",
     smoke_userspace_execbuffer_ioctl_order_close_and_completion
+);
+
+fn set_ring(user: &User, ring: u64) {
+    let mut request = user.load(64, 64);
+    let flags = u64_at(&request, 40) & !0x3f;
+    put64(&mut request, 40, flags | ring);
+    user.store(64, &request);
+}
+
+fn engines_param(user: &User, context: u32, entries: &[(u16, u16)], at: u64) -> [u8; 24] {
+    let mut map = alloc::vec![0; 8];
+    for (class, instance) in entries {
+        map.extend_from_slice(&class.to_le_bytes());
+        map.extend_from_slice(&instance.to_le_bytes());
+    }
+    user.store(at, &map);
+    let mut param = [0; 24];
+    put32(&mut param, 0, context);
+    put32(&mut param, 4, map.len() as u32);
+    put64(&mut param, 8, abi::CONTEXT_PARAM_ENGINES);
+    put64(&mut param, 16, at);
+    param
+}
+
+fn smoke_userspace_i915_copy_engine_legacy_ring_and_engine_map() -> TestResult {
+    use crate::intel_gpu_engine::Engine;
+    let platform = GtPlatform::Alchemist;
+    let (w, arena, mut gt) = hardware_model(platform, 0x130044);
+    prime(&mut gt, &w, 0x130044);
+    let backend = Arc::new(Mailbox {
+        status: IrqSafeSpinLock::new(Some(UserStatus {
+            epoch: gt.user_epoch().unwrap(),
+            platform,
+            submission_version: gt.submission_version(),
+        })),
+        pending: IrqSafeSpinLock::new(Vec::new()),
+    });
+    let card = Arc::new(crate::drm_devfs_bridge::IntelGpuCard::new(
+        alloc::string::String::new(),
+        0x8086,
+        0x56a0,
+        0,
+        0,
+    ));
+    card.install_user_backend(backend.clone()).unwrap();
+    let info = DeviceInfo::for_card(crate::drm_registry::register_drm_card(card)).unwrap();
+    let file = RenderFile::new();
+    let user = User::new();
+    // I915_PARAM_HAS_BLT.
+    let mut getparam = [0; 16];
+    put32(&mut getparam, 0, 11);
+    put64(&mut getparam, 8, 4096);
+    user.store(64, &getparam);
+    invoke(&file, &info, &user, abi::GETPARAM);
+    assert_eq!(u32_at(&user.load(4096, 4), 0), 1);
+    let handles = buffers(&file, &info, &user);
+    let submit = |ring: u64, context: u32, gt: &mut GuCGt<Window, Arena>, now| {
+        exec(&user, handles, context);
+        set_ring(&user, ring);
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut call = core::pin::pin!(file.dispatch_user(&info, abi::GEM_EXECBUFFER2_WR, 64, &user));
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        let submitted = backend.accept(gt, now);
+        assert_eq!(call.as_mut().poll(&mut cx), Poll::Ready(Some(Ok(0))));
+        submitted
+    };
+    let refuse = |ring: u64, context: u32| {
+        exec(&user, handles, context);
+        set_ring(&user, ring);
+        let mut call = core::pin::pin!(file.dispatch_user(&info, abi::GEM_EXECBUFFER2, 64, &user));
+        let result = call.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        assert!(backend.pending.lock().is_empty());
+        result
+    };
+    let run = |gt: &mut GuCGt<Window, Arena>, fence: &CompletionFence, start| {
+        let mut registered = BTreeMap::new();
+        for now in start..start + 60 {
+            assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+            service_contexts(&w, &mut registered, true);
+            if fence.result().is_some() {
+                break;
+            }
+        }
+        assert_eq!(fence.result(), Some(Ok(())));
+    };
+    // eb_select_legacy_ring: BLT is BCS0; BSD/VEBOX/unknown rings are EINVAL.
+    let (context, fence) = submit(abi::EXEC_BLT, 0, &mut gt, 100);
+    assert_eq!(context.engine(), Engine::Bcs0);
+    run(&mut gt, &fence, 101);
+    let mut readback = [0; 32];
+    put32(&mut readback, 0, handles[1]);
+    put64(&mut readback, 8, 0x80);
+    put64(&mut readback, 16, 4);
+    put64(&mut readback, 24, 512);
+    user.store(64, &readback);
+    invoke(&file, &info, &user, abi::GEM_PREAD);
+    assert_eq!(u32_at(&user.load(512, 4), 0), 0x4e415246);
+    let (render, fence) = submit(abi::EXEC_RENDER, 0, &mut gt, 200);
+    assert_eq!(render.engine(), Engine::Rcs0);
+    assert!(!Arc::ptr_eq(&render, &context));
+    run(&mut gt, &fence, 201);
+    for ring in [2, 4, 5, 0x3f] {
+        assert_eq!(refuse(ring, 0), Poll::Ready(Some(Err(FsError::InvalidData))));
+    }
+    // The default context is finalized at open: its map is immutable.
+    let param = engines_param(&user, 0, &[(1, 0)], 8192);
+    user.store(64, &param);
+    assert_eq!(
+        file.dispatch(&info, abi::GEM_CONTEXT_SETPARAM, 64, &user),
+        Some(Err(FsError::InvalidData))
+    );
+    // CREATE_EXT SETPARAM map: COPY, hole, RENDER.
+    let param = engines_param(&user, 0, &[(1, 0), (0xffff, 0xffff), (0, 0)], 8192);
+    let mut ext = [0; 56];
+    ext[32..].copy_from_slice(&param);
+    user.store(6144, &ext);
+    let mut create = [0; 16];
+    put32(&mut create, 4, 1);
+    put64(&mut create, 8, 6144);
+    user.store(64, &create);
+    invoke(&file, &info, &user, abi::GEM_CONTEXT_CREATE_EXT);
+    let mapped = u32_at(&user.load(64, 16), 0);
+    let (slot0, fence) = submit(0, mapped, &mut gt, 300);
+    assert_eq!(slot0.engine(), Engine::Bcs0);
+    run(&mut gt, &fence, 301);
+    let (slot2, fence) = submit(2, mapped, &mut gt, 400);
+    assert_eq!(slot2.engine(), Engine::Rcs0);
+    run(&mut gt, &fence, 401);
+    for ring in [1, 3, abi::EXEC_BLT + 8] {
+        assert_eq!(refuse(ring, mapped), Poll::Ready(Some(Err(FsError::InvalidData))));
+    }
+    // A duplicate ENGINES extension in one chain is EINVAL before its copy.
+    let mut first = ext;
+    put64(&mut first, 0, 6400);
+    let mut second = ext;
+    put64(&mut second, 48, 0x7fff_ffff_0000); // unreadable map
+    user.store(6144, &first);
+    user.store(6400, &second);
+    user.store(64, &create);
+    assert_eq!(
+        file.dispatch(&info, abi::GEM_CONTEXT_CREATE_EXT, 64, &user),
+        Some(Err(FsError::InvalidData))
+    );
+    // Proto-context setparam: errno classes follow set_proto_ctx_engines.
+    user.store(64, &[0; 8]);
+    invoke(&file, &info, &user, abi::GEM_CONTEXT_CREATE);
+    let proto = u32_at(&user.load(64, 8), 0);
+    for (entries, size, expected) in [
+        (&[(2u16, 0u16)][..], None, FsError::NotFound), // no VCS0
+        (&[(1, 1)][..], None, FsError::NotFound),
+        (&[(0, 0)][..], Some(10), FsError::InvalidData),
+        (&[(0, 0)][..], Some(4), FsError::InvalidData),
+        (&[(0, 0)][..], Some(8 + 65 * 4), FsError::InvalidData),
+    ] {
+        let mut param = engines_param(&user, proto, entries, 8192);
+        if let Some(size) = size {
+            put32(&mut param, 4, size);
+        }
+        user.store(64, &param);
+        assert_eq!(
+            file.dispatch(&info, abi::GEM_CONTEXT_SETPARAM, 64, &user),
+            Some(Err(expected))
+        );
+    }
+    // An unknown entry is ENOENT before a later entry's copy can fault.
+    let mut param = engines_param(&user, proto, &[(4, 0)], 32756);
+    put32(&mut param, 4, 16);
+    user.store(64, &param);
+    assert_eq!(
+        file.dispatch(&info, abi::GEM_CONTEXT_SETPARAM, 64, &user),
+        Some(Err(FsError::NotFound))
+    );
+    // Load-balance extension (name 0) is not admitted; unknown names are EINVAL.
+    for (name, expected) in [(0u32, FsError::NotImplemented), (3, FsError::InvalidData)] {
+        let mut extension = [0; 32];
+        put32(&mut extension, 8, name);
+        user.store(7168, &extension);
+        let param = engines_param(&user, proto, &[(1, 0)], 8192);
+        user.store(8192, &7168u64.to_le_bytes());
+        user.store(64, &param);
+        assert_eq!(
+            file.dispatch(&info, abi::GEM_CONTEXT_SETPARAM, 64, &user),
+            Some(Err(expected))
+        );
+    }
+    let param = engines_param(&user, proto, &[(1, 0)], 8192);
+    user.store(64, &param);
+    invoke(&file, &info, &user, abi::GEM_CONTEXT_SETPARAM);
+    user.store(64, &param);
+    assert_eq!(
+        file.dispatch(&info, abi::GEM_CONTEXT_SETPARAM, 64, &user),
+        Some(Err(FsError::InvalidData)),
+        "engines set twice"
+    );
+    let mut get = param;
+    put32(&mut get, 4, 0);
+    user.store(64, &get);
+    assert_eq!(
+        file.dispatch(&info, abi::GEM_CONTEXT_GETPARAM, 64, &user),
+        Some(Err(FsError::InvalidData))
+    );
+    let mut missing = param;
+    put32(&mut missing, 0, 999);
+    user.store(64, &missing);
+    assert_eq!(
+        file.dispatch(&info, abi::GEM_CONTEXT_SETPARAM, 64, &user),
+        Some(Err(FsError::NotFound))
+    );
+    *backend.status.lock() = None;
+    hardware_stop(&mut gt, &w, 0x130044);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_userspace_i915_copy_engine_legacy_ring_and_engine_map
 );
 
 fn smoke_userspace_context_epoch_loss_refuses_replay() -> TestResult {

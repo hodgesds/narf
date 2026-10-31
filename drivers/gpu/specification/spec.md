@@ -260,14 +260,26 @@ Accelerated presentation and dma-buf IMPORT_SYNC_FILE remain unavailable.
 
 Context/VM create, destroy and scalar GET/SETPARAM have per-open namespaces,
 bounded extension chains and retained VM identity after VM-handle destruction.
-Context zero is implicit. Only normal priority is admitted, disabling banning
+Context zero is implicit and, like i915 GRAPHICS_VER 12, finalized at open;
+created contexts stay proto-contexts until execbuffer, GETPARAM or reset-stats
+lookup. Each context owns legacy RCS0 and BCS0 states. CONTEXT_PARAM_ENGINES
+(0xa) follows set_proto_ctx_engines: once per proto-context (EINVAL twice or
+after finalization), 8-byte header plus 4-byte class/instance entries (at most
+64), INVALID/INVALID_NONE holes, per-entry copy with ENOENT for absent engines
+before later faults, then the extension chain (load balance/bond/parallel
+NotImplemented, unknown EINVAL). Duplicate ENGINES create extensions are EINVAL
+before their copy; GETPARAM ENGINES is EINVAL. Each map slot is its own
+`UserContext`. Execbuffer's ring field indexes the map, or selects legacy
+DEFAULT/RENDER→RCS0 and BLT→BCS0; holes, out-of-range slots, BSD and VEBOX are
+EINVAL. Only normal priority is admitted, disabling banning
 is refused, and no privilege follows from context creation. Recovery is disabled;
 enabling it or disabling persistence returns NotImplemented. VM rebinding
-requires an unused context with no concurrent submission, preserving one
-ordered context timeline. QUERY has Linux's
+requires every engine state of the context to be unused with no concurrent
+submission, preserving each ordered timeline. QUERY has Linux's
 two-pass/per-item signed-length protocol: system memory reports actual RAM;
-engine info reports RCS0 only while this card's userspace backend is live,
-otherwise zero engines. HWCONFIG returns the exact
+engine info reports RENDER/0 then COPY/0 with HAS_LOGICAL_INSTANCE while
+this card's userspace backend is live, otherwise zero engines; a nonzero input
+num_engines/rsvd header is per-item -EINVAL. HWCONFIG returns the exact
 firmware KLV bytes only after this card's GT publishes a validated snapshot;
 absence returns per-item -ENODEV. Size-only queries never access the data pointer;
 short capacity returns -EINVAL, failed data copies return -EFAULT and later
@@ -276,7 +288,7 @@ queries return per-card observed fuse snapshots using the i915 topology layout;
 absence returns -ENODEV. GuC submission-version returns -ENODEV until the userspace scheduling
 interface is admitted; live replies contain branch=0 and the loaded CSS's
 submission major/minor/patch, independently of its firmware release.
-HAS_EXECBUF2/NO_RELOC/HANDLE_LUT/SOFTPIN/BATCH_FIRST/CONTEXT_ISOLATION and
+HAS_BLT, HAS_EXECBUF2/NO_RELOC/HANDLE_LUT/SOFTPIN/BATCH_FIRST/CONTEXT_ISOLATION and
 HAS_ALIASING_PPGTT=3 follow live admission. HAS_EXEC_FENCE,
 HAS_EXEC_FENCE_ARRAY, HAS_EXEC_SUBMIT_FENCE and HAS_EXEC_TIMELINE_FENCES,
 plus DRM_CAP_SYNCOBJ and DRM_CAP_SYNCOBJ_TIMELINE, also follow live admission.

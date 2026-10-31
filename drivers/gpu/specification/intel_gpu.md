@@ -1837,8 +1837,9 @@ Default state is the source's BLIT_CCTL RMW only: no render 3D state and, on
 these platforms, no LRC workaround. BCS0 shares RCS0's render forcewake
 domain. BMG 20.01/20.02 also apply the ENGINE_BASE engine entries for BCS0.
 The NONPRIV deny fill, ADS publication, priming order and Xe UAPI surface are
-described in `spec.md`. BCS8 on BMG, i915 BLT execbuffer and migration-style
-kernel copies remain unadmitted.
+described in `spec.md`. The i915 compatibility profile reaches BCS0 through
+the legacy BLT ring and proto-context engine maps. BCS8 on BMG and
+migration-style kernel copies remain unadmitted.
 
 ### Remaining accelerated-driver completion work
 
@@ -1849,7 +1850,7 @@ acceptance or a claim of complete acceleration.
 | Area | Current checkpoint | Still required |
 | --- | --- | --- |
 | GuC execution | Owned GGTT/PPGTT jobs, primed/persistent user RCS0 and BCS0 state, verified register policy, graphics-GT/RCS/BCS workarounds on MTL/Arrow, DG2 and BMG | Compute/media engines, remaining out-of-band workarounds and silicon qualification |
-| Render UAPI | Native Xe queries/GEM/VM_BIND/RCS and COPY queues/EXEC/user fences/per-engine cycles; i915 compatibility (RCS only) with explicit fences; context loss and fresh-epoch rebuild | USERPTR, fault/long-running VMs, i915 BLT ring, more queue/query families and Mesa interoperability |
+| Render UAPI | Native Xe queries/GEM/VM_BIND/RCS and COPY queues/EXEC/user fences/per-engine cycles; i915 compatibility with legacy BLT ring, context engine maps and explicit fences; context loss and fresh-epoch rebuild | USERPTR, fault/long-running VMs, i915 load balancing/parallel submission, more queue/query families and Mesa interoperability |
 | Engines and platforms | Main-GT DSS/EU discovery; RCS0 and never-fused BCS0 scheduling; separate Gen12 foundations | BMG BCS8, CCS (DSS-quadrant/fuse-register inventory), media GT, compute/media submission and independently sourced profiles for other IP |
 | Memory and presentation | Owned system RAM, private tables and same-card CPU PRIME mappings | Local VRAM, accelerated PRIME/presentation and GPU/KMS synchronization |
 | Display | Gen12 paths and owned Xe-LPG internal-panel modeset | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |

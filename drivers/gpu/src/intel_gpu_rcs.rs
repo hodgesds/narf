@@ -2768,6 +2768,7 @@ pub mod tests {
         let weak = Arc::downgrade(&object);
         let va = 0x1234_0000_0000;
         let request = ExecRequest {
+            ring: 0,
             context_id: 0,
             batch_va: va,
             batch_len: 8,

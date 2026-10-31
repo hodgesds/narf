@@ -1411,6 +1411,7 @@ fn smoke_hardware_ppgtt_store_and_retirement() -> TestResult {
             use crate::intel_gpu_exec::{ExecObject, ExecRequest};
             let count = arena.live_allocations();
             let batch = ExecRequest {
+                ring: 0,
                 context_id: 0,
                 batch_va: 0x1234_0000_0000,
                 batch_len: 24,
@@ -1495,6 +1496,7 @@ fn smoke_hardware_reservation_cache_failure_releases_before_retry() -> TestResul
         .all(|object| object.strong_count() == 1 && object.upgrade().unwrap().busy() == 0));
     w.0.borrow_mut().fail_sync = false;
     let batch = ExecRequest {
+        ring: 0,
         context_id: 0,
         batch_va: 0x1234_0000_0000,
         batch_len: 24,

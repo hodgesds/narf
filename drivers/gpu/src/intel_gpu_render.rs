@@ -98,9 +98,18 @@ struct Vm {
     _identity: u32,
 }
 
+type EngineMap = Vec<Option<crate::intel_gpu_engine::Engine>>;
+
+/// One i915 context. Legacy rings select its RCS0/BCS0 states; a user
+/// engine map gives every slot its own hardware context, as i915 does.
 #[derive(Clone, Debug)]
 struct Context {
     user: Arc<crate::intel_gpu_user::UserContext>,
+    copy: Arc<crate::intel_gpu_user::UserContext>,
+    engines: Option<Vec<Option<Arc<crate::intel_gpu_user::UserContext>>>>,
+    /// i915 GRAPHICS_VER 12 contexts stay proto-contexts until first lookup;
+    /// only then is the engine map immutable.
+    finalized: bool,
     vm: Arc<Vm>,
     no_error_capture: bool,
     bannable: bool,
@@ -109,9 +118,13 @@ struct Context {
 }
 
 impl Context {
-    fn new(vm: Arc<Vm>) -> Self {
+    fn new(vm: Arc<Vm>, finalized: bool) -> Self {
+        use crate::intel_gpu_engine::Engine;
         Self {
             user: crate::intel_gpu_user::UserContext::new(),
+            copy: crate::intel_gpu_user::UserContext::for_engine(Engine::Bcs0),
+            engines: None,
+            finalized,
             vm,
             no_error_capture: false,
             bannable: true,
@@ -119,6 +132,72 @@ impl Context {
             persistence: true,
         }
     }
+
+    fn users(&self) -> Vec<Arc<crate::intel_gpu_user::UserContext>> {
+        let mut users = alloc::vec![self.user.clone(), self.copy.clone()];
+        users.extend(self.engines.iter().flatten().flatten().cloned());
+        users
+    }
+
+    /// i915_gem_execbuffer.c::eb_select_engine. Legacy DEFAULT/RENDER select
+    /// RCS0 and BLT selects BCS0; BSD/VEBOX name absent engines (EINVAL).
+    fn select(&mut self, ring: u32) -> Result<Arc<crate::intel_gpu_user::UserContext>, FsError> {
+        self.finalized = true;
+        match &self.engines {
+            Some(map) => map
+                .get(ring as usize)
+                .cloned()
+                .flatten()
+                .ok_or(FsError::InvalidData),
+            None => match u64::from(ring) {
+                0 | abi::EXEC_RENDER => Ok(self.user.clone()),
+                abi::EXEC_BLT => Ok(self.copy.clone()),
+                _ => Err(FsError::InvalidData),
+            },
+        }
+    }
+}
+
+/// i915_gem_context.c::set_proto_ctx_engines, after the caller has checked
+/// that the proto-context has no map. Entries are copied and resolved in
+/// order; holes are INVALID/INVALID_NONE; extensions are read last.
+fn read_engines(
+    info: &DeviceInfo,
+    user: &dyn IoctlContext,
+    size: u32,
+    value: u64,
+) -> Result<EngineMap, FsError> {
+    use crate::intel_gpu_engine::Engine;
+    if size < 8 || (size - 8) % 4 != 0 || (size - 8) / 4 > 64 {
+        return Err(FsError::InvalidData);
+    }
+    let mut map = Vec::new();
+    for n in 0..u64::from((size - 8) / 4) {
+        let address = value.checked_add(8 + n * 4).ok_or(FsError::BadAddress)?;
+        let entry = read(user, address, 4)?;
+        let class = u16::from_le_bytes([entry[0], entry[1]]);
+        let instance = u16::from_le_bytes([entry[2], entry[3]]);
+        if class == abi::ENGINE_INVALID && instance == abi::ENGINE_INVALID {
+            map.push(None);
+            continue;
+        }
+        let engine = match (class, instance) {
+            (abi::ENGINE_RENDER, 0) => Engine::Rcs0,
+            (abi::ENGINE_COPY, 0) => Engine::Bcs0,
+            _ => return Err(FsError::NotFound),
+        };
+        if !info.submission_ready() {
+            return Err(FsError::NotFound);
+        }
+        map.push(Some(engine));
+    }
+    let extensions_at = u64_at(&read(user, value, 8)?, 0);
+    extensions(user, extensions_at, |_, name| match name {
+        // Load balancing, bonding and parallel submission are not admitted.
+        0..=2 => Err(FsError::NotImplemented),
+        _ => Err(FsError::InvalidData),
+    })?;
+    Ok(map)
 }
 
 #[derive(Debug)]
@@ -133,19 +212,49 @@ impl Namespaces {
     fn initialize(&mut self) {
         self.contexts
             .entry(0)
-            .or_insert_with(|| Context::new(Arc::new(Vm { _identity: 0 })));
+            .or_insert_with(|| Context::new(Arc::new(Vm { _identity: 0 }), true));
     }
 
-    fn parameter(&mut self, bytes: &mut [u8], set: bool) -> Result<(), FsError> {
+    /// ENGINES may only be set once, on a proto-context.
+    fn engines_settable(&mut self, id: u32) -> Result<(), FsError> {
+        self.initialize();
+        let context = self.contexts.get(&id).ok_or(FsError::NotFound)?;
+        if context.finalized || context.engines.is_some() {
+            return Err(FsError::InvalidData);
+        }
+        Ok(())
+    }
+
+    fn parameter(
+        &mut self,
+        bytes: &mut [u8],
+        set: bool,
+        engines: Option<EngineMap>,
+    ) -> Result<(), FsError> {
         let id = u32_at(bytes, 0);
         let size = u32_at(bytes, 4);
         let param = u64_at(bytes, 8);
         let value = u64_at(bytes, 16);
+        if (param, set) == (abi::CONTEXT_PARAM_ENGINES, true) {
+            self.engines_settable(id)?;
+            let map = engines.ok_or(FsError::InvalidData)?;
+            let context = self.contexts.get_mut(&id).ok_or(FsError::NotFound)?;
+            context.engines = Some(
+                map.into_iter()
+                    .map(|slot| slot.map(crate::intel_gpu_user::UserContext::for_engine))
+                    .collect(),
+            );
+            return Ok(());
+        }
         if size != 0 {
             return Err(FsError::InvalidData);
         }
         self.initialize();
         let context = self.contexts.get_mut(&id).ok_or(FsError::NotFound)?;
+        if !set {
+            // i915_gem_context_lookup finalizes a proto-context.
+            context.finalized = true;
+        }
         match (param, set) {
             (3, false) => put64(bytes, 16, 1 << 48),
             (4 | 5 | 8 | 11, _) => {
@@ -180,9 +289,13 @@ impl Namespaces {
             }
             (9, true) => {
                 let vm_id = u32::try_from(value).map_err(|_| FsError::NotFound)?;
-                let _idle = context.user.serial.try_lock().ok_or(FsError::Busy)?;
-                if !context.user.can_rebind() {
-                    return Err(FsError::Busy);
+                let users = context.users();
+                let mut idle = Vec::new();
+                for user in &users {
+                    idle.push(user.serial.try_lock().ok_or(FsError::Busy)?);
+                    if !user.can_rebind() {
+                        return Err(FsError::Busy);
+                    }
                 }
                 context.vm = self.vms.get(&vm_id).cloned().ok_or(FsError::NotFound)?;
             }
@@ -319,7 +432,8 @@ impl RenderFile {
                 namespaces
                     .contexts
                     .values()
-                    .filter_map(|context| context.user.last())
+                    .flat_map(Context::users)
+                    .filter_map(|user| user.last())
                     .collect()
             };
             for fence in fences {
@@ -358,10 +472,9 @@ impl RenderFile {
             namespaces.initialize();
             namespaces
                 .contexts
-                .get(&request.context_id)
+                .get_mut(&request.context_id)
                 .ok_or(FsError::NotFound)?
-                .user
-                .clone()
+                .select(request.ring)?
         };
         let backend = info.backend.as_ref().ok_or(FsError::NotImplemented)?;
         let _order = context.serial.lock().await;
@@ -714,7 +827,7 @@ impl RenderFile {
                 Err(FsError::NotImplemented)
             }
             abi::GEM_CONTEXT_CREATE | abi::GEM_CONTEXT_CREATE_EXT => {
-                self.create_context(cmd, arg, user)
+                self.create_context(info, cmd, arg, user)
             }
             abi::GEM_CONTEXT_DESTROY => {
                 let request = read(user, arg, 8)?;
@@ -731,9 +844,24 @@ impl RenderFile {
             }
             abi::GEM_CONTEXT_GETPARAM | abi::GEM_CONTEXT_SETPARAM => {
                 let mut request = read(user, arg, 24)?;
+                let set = cmd == abi::GEM_CONTEXT_SETPARAM;
+                let engines = if set && u64_at(&request, 8) == abi::CONTEXT_PARAM_ENGINES {
+                    // Check first, then copy without the namespace spinlock.
+                    self.namespaces
+                        .lock()
+                        .engines_settable(u32_at(&request, 0))?;
+                    Some(read_engines(
+                        info,
+                        user,
+                        u32_at(&request, 4),
+                        u64_at(&request, 16),
+                    )?)
+                } else {
+                    None
+                };
                 self.namespaces
                     .lock()
-                    .parameter(&mut request, cmd == abi::GEM_CONTEXT_SETPARAM)?;
+                    .parameter(&mut request, set, engines)?;
                 user.write(arg, &request)
             }
             abi::GEM_VM_CREATE | abi::GEM_VM_DESTROY => {
@@ -769,9 +897,13 @@ impl RenderFile {
                 namespaces.initialize();
                 let context = namespaces
                     .contexts
-                    .get(&u32_at(&request, 0))
+                    .get_mut(&u32_at(&request, 0))
                     .ok_or(FsError::NotFound)?;
-                let (active, pending) = context.user.reset_stats();
+                context.finalized = true;
+                let (active, pending) = context.users().iter().fold((0u32, 0u32), |sum, user| {
+                    let (active, pending) = user.reset_stats();
+                    (sum.0.saturating_add(active), sum.1.saturating_add(pending))
+                });
                 // Linux restricts the device-wide count to administrative
                 // callers. No such authority is granted by this render fd.
                 put32(&mut request, 8, 0);
@@ -798,7 +930,13 @@ impl RenderFile {
         }
     }
 
-    fn create_context(&self, cmd: u32, arg: u64, user: &dyn IoctlContext) -> Result<(), FsError> {
+    fn create_context(
+        &self,
+        info: &DeviceInfo,
+        cmd: u32,
+        arg: u64,
+        user: &dyn IoctlContext,
+    ) -> Result<(), FsError> {
         let mut request = read(
             user,
             arg,
@@ -814,6 +952,7 @@ impl RenderFile {
         }
         let mut params = Vec::new();
         if cmd == abi::GEM_CONTEXT_CREATE_EXT && flags & 1 != 0 {
+            let mut engines_set = false;
             extensions(user, u64_at(&request, 8), |address, name| {
                 if name != 0 {
                     return Err(FsError::InvalidData);
@@ -823,7 +962,22 @@ impl RenderFile {
                 if u32_at(&param, 0) != 0 {
                     return Err(FsError::InvalidData);
                 }
-                params.push(param);
+                // set_proto_ctx_param applies each extension in chain order.
+                let engines = if u64_at(&param, 8) == abi::CONTEXT_PARAM_ENGINES {
+                    if engines_set {
+                        return Err(FsError::InvalidData);
+                    }
+                    engines_set = true;
+                    Some(read_engines(
+                        info,
+                        user,
+                        u32_at(&param, 4),
+                        u64_at(&param, 16),
+                    )?)
+                } else {
+                    None
+                };
+                params.push((param, engines));
                 Ok(())
             })?;
         }
@@ -836,11 +990,11 @@ impl RenderFile {
         let next = id.checked_add(1).ok_or(FsError::OutOfMemory)?;
         namespaces
             .contexts
-            .insert(id, Context::new(Arc::new(Vm { _identity: id })));
+            .insert(id, Context::new(Arc::new(Vm { _identity: id }), false));
         let result = (|| {
-            for mut param in params {
+            for (mut param, engines) in params {
                 put32(&mut param, 0, id);
-                namespaces.parameter(&mut param, true)?;
+                namespaces.parameter(&mut param, true, engines)?;
             }
             put32(&mut request, 0, id);
             user.write(arg, &request)
@@ -962,7 +1116,7 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
     Ok(match param {
         4 => info.device_id as i32,
         5 => 1, // GEM storage is available independently of acceleration.
-        9 | 25 | 26 | 37 | 44 | 48 | 49 | 50 | 53 | 55 => i32::from(info.submission_ready()),
+        9 | 11 | 25 | 26 | 37 | 44 | 48 | 49 | 50 | 53 | 55 => i32::from(info.submission_ready()),
         18 => {
             if info.submission_ready() {
                 3
@@ -977,7 +1131,8 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
         // reset, media, sync-file, cache domains, or context isolation support.
         1..=3
         | 6..=8
-        | 10..=17
+        | 10
+        | 12..=17
         | 20..=24
         | 27..=29
         | 31
@@ -1035,12 +1190,20 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
             }
             let reply: Cow<'_, [u8]> = match id {
                 abi::QUERY_ENGINES => {
-                    let ready = info.submission_ready();
-                    let mut reply = vec![0; if ready { 72 } else { 16 }];
-                    if ready {
-                        put32(&mut reply, 0, 1);
+                    // i915_query.c::query_engine_info in uabi class order:
+                    // RENDER then COPY, logical instance 0, no capabilities.
+                    let engines: &[u16] = if info.submission_ready() {
+                        &[abi::ENGINE_RENDER, abi::ENGINE_COPY]
+                    } else {
+                        &[]
+                    };
+                    let mut reply = vec![0; 16 + engines.len() * 56];
+                    put32(&mut reply, 0, engines.len() as u32);
+                    for (i, class) in engines.iter().enumerate() {
+                        let entry = &mut reply[16 + i * 56..16 + (i + 1) * 56];
+                        entry[..2].copy_from_slice(&class.to_le_bytes());
+                        put64(entry, 8, 1); // I915_ENGINE_INFO_HAS_LOGICAL_INSTANCE
                     }
-                    // Engine class RENDER=0 and instance 0, all capability bits zero.
                     Cow::Owned(reply)
                 }
                 abi::QUERY_MEMORY_REGIONS if info.memory_bytes != 0 => {
@@ -1083,6 +1246,10 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
                     // i915_query.c::copy_query_item requires a readable header
                     // before replacing it, even though its contents are ignored.
                     read(user, u64_at(item, 16), 16)?;
+                }
+                if id == abi::QUERY_ENGINES && read(user, u64_at(item, 16), 16)? != [0; 16] {
+                    // query_engine_info: num_engines and rsvd are input MBZ.
+                    return Err(FsError::InvalidData);
                 }
                 user.write(u64_at(item, 16), &reply)?;
             }
