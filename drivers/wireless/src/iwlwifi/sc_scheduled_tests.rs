@@ -108,7 +108,7 @@ impl Model {
         )?;
         let active = word(body, 48) & 0xfffff != 0;
         require(
-            active == !self.request.probe_ssids.is_empty(),
+            active != self.request.probe_ssids.is_empty(),
             "Sc PNO match sets wrongly authorized probes",
         )?;
         if active {
