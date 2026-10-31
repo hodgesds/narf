@@ -318,6 +318,7 @@ impl Device {
             hardware.check_aggregation_api()?;
         }
         nvm.phy.he &= super::sc_he::native_supported(hardware);
+        nvm.phy.native_rates = super::sc_he::rates_version(hardware).unwrap_or(0);
         let runtime = hardware.runtime_configuration()?;
         hardware
             .command(1, 0x98, &nvm.tx_chains.to_le_bytes())

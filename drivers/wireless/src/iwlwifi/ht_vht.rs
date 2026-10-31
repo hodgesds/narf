@@ -12,6 +12,12 @@ pub struct Local {
     pub he: bool,
     pub tx_streams: u8,
     pub rx_streams: u8,
+    /// Raw, valid 5GHz NVM_CHANNEL_160MHZ facts in station_api's channel
+    /// order. A SKU bit or later MCC response cannot create these facts.
+    pub(super) width160_channels: u64,
+    /// Actual complete native rate-consumer namespace, selected after NVM
+    /// parsing from the retained firmware metadata (zero means not proved).
+    pub(super) native_rates: u8,
 }
 
 impl Local {
@@ -23,7 +29,41 @@ impl Local {
             he: sku & 20 == 20,
             tx_streams: tx.count_ones().min(limit) as u8,
             rx_streams: rx.count_ones().min(limit) as u8,
+            width160_channels: 0,
+            native_rates: 0,
         }
+    }
+
+    pub(super) fn with_nvm_channels(mut self, flags: &[u32]) -> Self {
+        self.width160_channels = flags
+            .iter()
+            .take(51)
+            .enumerate()
+            .fold(0, |mask, (i, flags)| {
+                mask | if i >= 14 && flags & (1 | (1 << 11)) == (1 | (1 << 11)) {
+                    1u64 << i
+                } else {
+                    0
+                }
+            });
+        self
+    }
+
+    pub(super) fn supports160(self) -> bool {
+        self.vht && self.width160_channels != 0 && matches!(self.native_rates, 2 | 3)
+    }
+
+    pub(super) fn permits160(self, center: u8) -> bool {
+        self.supports160()
+            && [50, 114, 163].contains(&center)
+            && [-14i16, -10, -6, -2, 2, 6, 10, 14]
+                .into_iter()
+                .all(|offset| {
+                    u8::try_from(i16::from(center) + offset)
+                        .ok()
+                        .and_then(super::station_api::channel_index)
+                        .is_some_and(|index| self.width160_channels & (1u64 << index) != 0)
+                })
     }
 
     pub fn capabilities(self, band: u32) -> Option<PhyCapabilities> {
@@ -43,10 +83,24 @@ impl Local {
         }
         let vht = (self.vht && band == 5000).then(|| {
             let mut vht = [0; 12];
-            // 80 MHz, SGI80, 64K A-MPDU, 3895-byte MPDU. No 160/80+80.
-            put32(&mut vht, 0, (1 << 5) | (3 << 23));
+            // Linux derives contiguous160 from actual NVM channel flags.
+            // 80+80 remains absent; full per-span proof is still required.
+            put32(
+                &mut vht,
+                0,
+                (1 << 5)
+                    | (3 << 23)
+                    | if self.supports160() {
+                        (1 << 2) | (1 << 6)
+                    } else {
+                        0
+                    },
+            );
             put16(&mut vht, 4, mcs_map(self.rx_streams));
             put16(&mut vht, 8, mcs_map(self.tx_streams));
+            if self.supports160() {
+                vht[11] |= 0x20; // VHT Extended NSS BW Capable, not a wider local NSS promise.
+            }
             vht
         });
         Some(PhyCapabilities { ht, vht })
@@ -65,7 +119,7 @@ fn mcs_map(streams: u8) -> u16 {
 pub struct Negotiated {
     /// TLC mode: legacy=0, HT=1, VHT=2.
     pub mode: u8,
-    /// TLC/PHY bandwidth: 20=0, 40=1, 80=2.
+    /// TLC/PHY bandwidth: 20=0, 40=1, 80=2, contiguous160=3.
     pub width: u8,
     pub center: u8,
     pub sgi: u8,
@@ -75,6 +129,17 @@ pub struct Negotiated {
     pub ampdu_exp: u8,
     pub density: u8,
     pub protection: u32,
+    pub(super) wide: Option<WideVht>,
+}
+
+/// The original shared offer and actual response-refined VHT facts. The
+/// H2E parsing fact comes only from the already selected security plan.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(super) struct WideVht {
+    offer: narf_wireless::association::phy::Offer,
+    vht: narf_wireless::association::phy::VhtNegotiation,
+    center: u8,
+    h2e: bool,
 }
 
 /// Return singleton IEs and reject truncated or ambiguous capability data.
@@ -119,9 +184,29 @@ impl Negotiated {
                 }
             }
         }
-        Self::parse(local, &ies, channel, wmm, |width, center| {
-            width <= self.width && (width < self.width || center == self.center)
-        })
+        let wide = if let Some(old) = self.wide {
+            let confirmed = old
+                .offer
+                .response_elements_with_sae_h2e(&ies, old.h2e)
+                .map_err(|_| "native160 response did not confirm the original PHY offer")?;
+            (confirmed.width() == narf_wireless::association::phy::Width::OneSixty
+                && !confirmed.discontiguous())
+            .then(|| WideVht {
+                vht: *confirmed.vht().unwrap(),
+                center: confirmed.center_channel(),
+                ..old
+            })
+        } else {
+            None
+        };
+        Self::parse_inner(
+            local,
+            &ies,
+            channel,
+            wmm,
+            |width, center| width <= self.width && (width < self.width || center == self.center),
+            wide,
+        )
     }
 
     pub fn parse(
@@ -130,6 +215,38 @@ impl Negotiated {
         channel: u8,
         wmm: bool,
         permitted: impl Fn(u8, u8) -> bool,
+    ) -> Result<Self, &'static str> {
+        Self::parse_inner(local, ies, channel, wmm, permitted, None)
+    }
+
+    pub(super) fn parse_with_offer(
+        local: Local,
+        ies: &[u8],
+        channel: u8,
+        wmm: bool,
+        permitted: impl Fn(u8, u8) -> bool,
+        offer: Option<(narf_wireless::association::phy::Offer, bool)>,
+    ) -> Result<Self, &'static str> {
+        let wide = offer.and_then(|(offer, h2e)| {
+            (offer.width() == narf_wireless::association::phy::Width::OneSixty
+                && !offer.discontiguous())
+            .then(|| WideVht {
+                vht: *offer.vht().unwrap(),
+                center: offer.center_channel(),
+                offer,
+                h2e,
+            })
+        });
+        Self::parse_inner(local, ies, channel, wmm, permitted, wide)
+    }
+
+    fn parse_inner(
+        local: Local,
+        ies: &[u8],
+        channel: u8,
+        wmm: bool,
+        permitted: impl Fn(u8, u8) -> bool,
+        wide: Option<WideVht>,
     ) -> Result<Self, &'static str> {
         let ht = element(ies, 45, 26)?;
         let operation = element(ies, 61, 22)?;
@@ -255,6 +372,16 @@ impl Negotiated {
                 }
                 result.flags = if cap & (1 << 4) != 0 { 2 } else { 0 };
                 result.ampdu_exp = ((cap >> 23) & 7) as u8;
+                if result.width == 2 {
+                    if let Some(wide) = wide
+                        .filter(|wide| local.permits160(wide.center) && permitted(3, wide.center))
+                    {
+                        result.width = 3;
+                        result.center = wide.center;
+                        result.sgi |= u8::from(wide.vht.tx_sgi160()) << 3;
+                        result.wide = Some(wide);
+                    }
+                }
             }
         }
         if matches!(ht_protection, 1 | 3) || (ht_protection == 2 && result.width != 0) {
@@ -294,6 +421,22 @@ impl Negotiated {
         put16(body, 12, self.flags);
         put32(body, 16, self.mcs[0] as u32);
         put32(body, 28, self.mcs[1] as u32);
+        if let Some(wide) = self.wide {
+            for nss in 0..2 {
+                let map = wide.vht.tx_mcs_map();
+                let bits = match (map >> (2 * nss)) & 3 {
+                    0 => 0xff,
+                    1 => 0x1ff,
+                    2 => 0x3ff,
+                    _ => 0,
+                };
+                put32(
+                    body,
+                    20 + nss * 12,
+                    if self.mcs[nss] == 0 { 0 } else { bits },
+                );
+            }
+        }
         if self.mode != 0 {
             put16(body, 40, 3839);
         }
@@ -324,6 +467,32 @@ impl Negotiated {
             (distance.saturating_sub(2) / 4) | if primary > self.center { 4 } else { 0 }
         };
         body[28] = body[14] ^ 4;
+    }
+
+    /// Before CCMP/reorder mutation, bound the new native160 profile's
+    /// legacy HT/VHT fallback PPDUs by the actual local RX promise. HE has
+    /// its separate response-bound HE map and coding check.
+    pub(super) fn admits_wide_rx(self, local: Local, rate: u32) -> bool {
+        if self.width != 3 {
+            return true;
+        }
+        let format = (rate >> 8) & 7;
+        if format <= 1 || format == 4 {
+            return true;
+        }
+        if !matches!(format, 2 | 3) || !matches!(local.native_rates, 2 | 3) {
+            return false;
+        }
+        let nss = (rate >> if local.native_rates == 3 { 5 } else { 4 }) & 1;
+        let mcs = rate & if local.native_rates == 3 { 31 } else { 15 };
+        let width = (rate >> 11) & 7;
+        let gi = (rate >> 20) & 7;
+        let reserved = if local.native_rates == 3 { 0xc0 } else { 0xe0 };
+        nss < u32::from(local.rx_streams)
+            && mcs <= if format == 2 { 7 } else { 9 }
+            && width <= if format == 2 { 1 } else { 3 }
+            && gi <= 1
+            && rate & (reserved | (15 << 16) | (1 << 25) | (1 << 26)) == 0
     }
 }
 

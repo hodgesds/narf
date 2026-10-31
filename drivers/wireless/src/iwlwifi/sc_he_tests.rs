@@ -56,13 +56,30 @@ pub(super) fn elements(phy: PhyModel, include_he: bool) -> Vec<u8> {
     out.extend_from_slice(&operation);
     if channel > 14 {
         let mut vht = [0; 12];
-        vht[..4].copy_from_slice(&((1u32 << 5) | (3 << 23)).to_le_bytes());
+        vht[..4].copy_from_slice(
+            &((1u32 << 5)
+                | (3 << 23)
+                | if phy.width == 3 {
+                    (1 << 2) | (1 << 6)
+                } else {
+                    0
+                })
+            .to_le_bytes(),
+        );
         let map = if phy.streams == 2 { 0xfff0u16 } else { 0xfffc };
         vht[4..6].copy_from_slice(&map.to_le_bytes());
         vht[8..10].copy_from_slice(&map.to_le_bytes());
         out.extend_from_slice(&[191, 12]);
         out.extend_from_slice(&vht);
-        out.extend_from_slice(&[192, 5, 1, 42, 0, 0xfc, 0xff]);
+        out.extend_from_slice(&[
+            192,
+            5,
+            1,
+            42,
+            if phy.width == 3 { 50 } else { 0 },
+            0xfc,
+            0xff,
+        ]);
     }
     out.extend_from_slice(&super::super::super::qos::INFORMATION_IE);
     if include_he {
@@ -74,7 +91,13 @@ pub(super) fn elements(phy: PhyModel, include_he: bool) -> Vec<u8> {
             0,
             0,
             0,
-            if channel <= 14 { 2 } else { 4 },
+            if channel <= 14 {
+                2
+            } else if phy.width == 3 {
+                12
+            } else {
+                4
+            },
             0x30,
             10,
             0,
@@ -89,6 +112,12 @@ pub(super) fn elements(phy: PhyModel, include_he: bool) -> Vec<u8> {
         let map = if phy.streams == 2 { 0xfff0u16 } else { 0xfffc };
         he.extend_from_slice(&map.to_le_bytes());
         he.extend_from_slice(&map.to_le_bytes());
+        if phy.width == 3 {
+            // Distinct directional160 maps: AP RX permits only NSS1,
+            // while AP TX and the <=80 profile keep their authored NSS.
+            he.extend_from_slice(&0xfffcu16.to_le_bytes());
+            he.extend_from_slice(&map.to_le_bytes());
+        }
         out.extend_from_slice(&[255, he.len() as u8]);
         out.extend_from_slice(&he);
         out.extend_from_slice(&[255, 7, 36, 0xf2, 0x3f, 0, 7, 0xfc, 0xff]);
@@ -427,7 +456,7 @@ kernel_test_in!(
     smoke_sc_he_native_open_wpa2_sae24_he20_40_80_two_streams_and_rate_contracts
 );
 
-fn inject_data(phy: PhyModel, frame: &[u8], rate: u32, pn: u64, variant: u8) {
+pub(super) fn inject_data(phy: PhyModel, frame: &[u8], rate: u32, pn: u64, variant: u8) {
     let mut mac = vec![0; 30];
     mac[0] = 0x88;
     mac[1] = 0xc2;

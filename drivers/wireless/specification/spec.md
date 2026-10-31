@@ -999,6 +999,13 @@ native USB/device terminals fence each visit; home PHY and peer state are
 restored before normal data resumes. Eight native cases await release
 acceptance in the family §3.
 
+The admitted API89/Sc/Bz Intel owner can select contiguous 5 GHz 160 MHz
+from actual raw NVM flags and the complete eight-channel current host/MCC
+span. Original shared PHY offers, source-specific VHT/HE TLC maps and native
+RX admission retain negotiated bounds; unavailable wide spans keep a genuine
+80 MHz offer. Six native cases await execution; the combined parent release
+Clippy check passes. The family §3.62 documents the interface.
+
 ## 4. Interaction with `narf-wireless`
 
 - **Registration**: Drivers register via `bus::register_wireless_driver(MatchEntry { ... })`.

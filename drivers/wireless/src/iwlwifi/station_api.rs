@@ -46,14 +46,16 @@ impl Nvm {
         if tx_chains == 0 || rx_chains == 0 {
             return Err("NVM has no usable antennas");
         }
+        let flags: Vec<u32> = bytes[28..]
+            .chunks_exact(4)
+            .take(count)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
         let channels = CHANNELS
             .into_iter()
             .take(count)
             .enumerate()
-            .filter_map(|(i, channel)| {
-                let flags = u32::from_le_bytes(bytes[28 + 4 * i..32 + 4 * i].try_into().unwrap());
-                (flags & 1 != 0).then_some(channel)
-            })
+            .filter_map(|(i, channel)| (flags[i] & 1 != 0).then_some(channel))
             .collect();
         Ok(Self {
             tx_chains,
@@ -63,7 +65,8 @@ impl Nvm {
                 u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
                 tx_chains,
                 rx_chains,
-            ),
+            )
+            .with_nvm_channels(&flags),
             he: u32::from_le_bytes(bytes[8..12].try_into().unwrap()) & (1 << 4) != 0,
         })
     }

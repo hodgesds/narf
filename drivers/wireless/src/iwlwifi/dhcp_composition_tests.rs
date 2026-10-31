@@ -35,6 +35,9 @@ mod tx_amsdu_tests;
 
 #[path = "gen3_station_tests.rs"]
 mod gen3_station_tests;
+#[cfg(feature = "kernel-test")]
+#[path = "native_160_tests.rs"]
+mod native_160_tests;
 #[path = "sc_scheduled_tests.rs"]
 mod scheduled_tests;
 
@@ -96,7 +99,7 @@ struct PhyModel {
 }
 impl PhyModel {
     fn channel(self) -> u8 {
-        if self.width == 2 {
+        if self.width >= 2 {
             36
         } else {
             6
@@ -203,6 +206,7 @@ struct Wire {
     api89: Option<gen3_station_tests::Case>,
     bz: Option<super::super::bz_fixture::Case>,
     mcc_caps_override: Option<u32>,
+    mcc_permissions: Option<Vec<u32>>,
 }
 
 // SAFETY: no real device or thread accesses these fixture pointers. The sole
@@ -331,7 +335,13 @@ impl Wire {
                 response[16..20].copy_from_slice(&chains.to_le_bytes());
                 response[24..28].copy_from_slice(&count.to_le_bytes());
                 for i in 0..count as usize {
-                    response[28 + i * 4..32 + i * 4].copy_from_slice(&1u32.to_le_bytes());
+                    let flags = 1u32
+                        | if self.phy.is_some_and(|phy| phy.width == 3) && (14..22).contains(&i) {
+                            1 << 11
+                        } else {
+                            0
+                        };
+                    response[28 + i * 4..32 + i * 4].copy_from_slice(&flags.to_le_bytes());
                 }
             }
             (1, 0xc8) => {
@@ -370,11 +380,22 @@ impl Wire {
                 }
                 response[first - 4..first].copy_from_slice(&count.to_le_bytes());
                 let permission = if self.phy.is_some() {
-                    13u32 | (1 << 9) | (1 << 10)
+                    13u32
+                        | (1 << 9)
+                        | (1 << 10)
+                        | if self.phy.is_some_and(|phy| phy.width == 3) {
+                            1 << 11
+                        } else {
+                            0
+                        }
                 } else {
                     13
                 };
                 for i in 0..count as usize {
+                    let permission = self
+                        .mcc_permissions
+                        .as_ref()
+                        .map_or(permission, |flags| flags[i]);
                     response[first + i * 4..first + 4 + i * 4]
                         .copy_from_slice(&permission.to_le_bytes());
                 }
@@ -1056,6 +1077,17 @@ impl Wire {
             });
         if let Some(phy) = self.phy.filter(|_| he_programmed && frame[0] & 0xc == 8) {
             let rate = 0x400u32
+                | if phy.width == 3 {
+                    self.commands
+                        .iter()
+                        .rev()
+                        .find(|(g, c, _)| (*g, *c) == (5, 0xf))
+                        .map_or(0, |(_, _, body)| {
+                            u32::from(body[if self.api89.is_some() { 4 } else { 8 }]) << 11
+                        })
+                } else {
+                    0
+                }
                 | if phy.streams == 2 {
                     if phy.rates == 3 {
                         32
@@ -1066,6 +1098,30 @@ impl Wire {
                     0
                 };
             payload[36..40].copy_from_slice(&rate.to_le_bytes());
+        } else if let Some(phy) = self.phy.filter(|phy| phy.width == 3 && frame[0] & 0xc == 8) {
+            if let Some((_, _, body)) = self
+                .commands
+                .iter()
+                .rev()
+                .find(|(g, c, _)| (*g, *c) == (5, 0xf))
+            {
+                let mode = body[if self.api89.is_some() { 5 } else { 9 }];
+                if mode == 2 {
+                    let width = body[if self.api89.is_some() { 4 } else { 8 }];
+                    let rate = 0x300u32
+                        | (u32::from(width) << 11)
+                        | if phy.streams == 2 {
+                            if phy.rates == 3 {
+                                32
+                            } else {
+                                16
+                            }
+                        } else {
+                            0
+                        };
+                    payload[36..40].copy_from_slice(&rate.to_le_bytes());
+                }
+            }
         }
         payload[40] = 50;
         payload[41] = 60;
@@ -1346,6 +1402,7 @@ impl Guard {
             api89,
             bz,
             mcc_caps_override: None,
+            mcc_permissions: None,
         });
         let configured = run(Device::configure(&mut hardware, OWN), || wire.service());
         let nvm = match configured {
@@ -1382,7 +1439,9 @@ impl Guard {
         });
         let source = state.hardware.source_fence()?;
         let policy_db = Arc::new(narf_wireless::reg::db::Database::new());
-        policy_db.install(if phy.is_some() {
+        policy_db.install(if phy.is_some_and(|phy| phy.width == 3) {
+            native_160_tests::policy()
+        } else if phy.is_some() {
             he_tests::policy()
         } else {
             policy()

@@ -289,11 +289,26 @@ impl Connection {
         };
         let qos = super::qos::Parameters::parse(&beacon.information_elements)?;
         let permissions = regulatory_channels_in_domain(hw, domain).await?;
+        let original_local = local_phy;
+        // Rebuild the shared offer with the native owner's current width
+        // limit. A forbidden160 span retains a genuine HE/VHT80 fallback;
+        // an unbounded shared160 offer cannot relabel that narrower program.
+        if !permissions.widths.permits(3)
+            || ![50, 114, 163].into_iter().any(|center| {
+                local_phy.permits160(center)
+                    && channel_power_width(domain, beacon.channel, 3, center, &permissions.channels)
+                        .is_some()
+            })
+        {
+            local_phy.width160_channels = 0;
+        }
         if local_phy.he && (!permissions.he_allowed || !super::sc_he::native_supported(hw)) {
             local_phy.he = false;
+        }
+        if local_phy != original_local {
             profile = super::sc_security::Profile::negotiate(&beacon, local, &auth, local_phy)?;
         }
-        let phy = super::ht_vht::Negotiated::parse(
+        let phy = super::ht_vht::Negotiated::parse_with_offer(
             local_phy,
             &beacon.information_elements,
             beacon.channel,
@@ -309,6 +324,9 @@ impl Connection {
                     )
                     .is_some()
             },
+            profile
+                .offer
+                .map(|offer| (offer, profile.sae.as_ref().is_some_and(|join| join.h2e()))),
         )?;
         let he_offer = profile
             .offer
@@ -560,7 +578,7 @@ impl Connection {
                     narf_wireless::association::phy::Width::Twenty => this.phy.width != 0,
                     narf_wireless::association::phy::Width::Forty => this.phy.width != 1,
                     narf_wireless::association::phy::Width::Eighty => this.phy.width != 2,
-                    narf_wireless::association::phy::Width::OneSixty => true,
+                    narf_wireless::association::phy::Width::OneSixty => this.phy.width != 3,
                 }
             {
                 return Err("MLD HE response differs from native PHY/MCC span");
@@ -1546,6 +1564,7 @@ impl Connection {
             return true;
         }
         if frame.len() < 24
+            || !self.phy.admits_wide_rx(self.local_phy, mpdu.rate_n_flags)
             || (mpdu.rate_n_flags >> 8) & 7 >= 4
                 && self
                     .he
@@ -2067,13 +2086,18 @@ pub(super) fn channel_power_width(
             .then(|| channel_power(domain, primary, firmware, false))
             .flatten();
     }
-    if width > 2 || primary == 14 || (width == 2 && primary <= 14) {
+    if width > 3 || primary == 14 || (width >= 2 && primary <= 14) {
         return None;
     }
     let offsets: &[i16] = if width == 1 {
         &[-2, 2]
-    } else {
+    } else if width == 2 {
         &[-6, -2, 2, 6]
+    } else {
+        if ![50, 114, 163].contains(&center) {
+            return None;
+        }
+        &[-14, -10, -6, -2, 2, 6, 10, 14]
     };
     let mut power = i8::MAX;
     let mut contains_primary = false;

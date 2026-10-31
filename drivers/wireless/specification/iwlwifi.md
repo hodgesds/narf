@@ -2126,13 +2126,12 @@ describe the remaining native paths.
 **Implemented continuations and remaining native scope.**
 
 - HT40, NSS2, VHT80 and Gen2 160MHz landed in §§3.36–3.39.
-- **width_160** (row stays open for its Sc/Gen3 profiles). The Gen2
-  AX200/AX201 160MHz path is §3.39. The Sc c103 MLD station profile
-  negotiates at most VHT80. `ht_vht.rs` advertises no 160/80+80 and
-  uses only the primary 80MHz of a wider BSS, and
-  `connection.rs::channel_power_width` refuses width code 3. The row's "applicable profiles" also include the Gen3
-  AX210/AX211/AX411/BE200 families. Their exact station profiles below are
-  software-validated; native160MHz remains this separate continuation.
+- **width_160** (native160 acceptance pending). The Gen2 AX200/AX201
+  path remains software-validated in §3.39. §3.62 now wires contiguous160
+  for the admitted API89 Ty/So/Ma, Sc and Bz core103 station owners using
+  actual raw NVM width facts, correlated MCC/host span admission, native
+  VHT/HE160 maps and receive-rate fences. Six new native cases await
+  coordinated compilation/execution; no row closes on these drafts.
 - **he (closed).** Qualified Gen2, Sc, exact API89 Ty/So/Ma and BzB0
   FM/WH core103 HE20/40/80 are software-validated at `62b62ea68`, including
   the source-correct MLD/MVM rate namespaces. All521 Intel native cases
@@ -3673,6 +3672,53 @@ adds exactly 23 across the combined driver batch. Resolved release CI,
 formatting, ordinary boots and both btrfs postflights pass on each architecture.
 Firmware execution and RF remain fixture supplied; physical qualification is
 separate from these software results.
+
+### 3.62 Exact native contiguous160 ownership (native acceptance pending)
+
+The common station path retains raw `NVM_CHANNEL_160MHZ` bits for the
+first 51 band-unambiguous NVM channel entries. A hardware SKU flag or a
+later permissive MCC reply cannot create those facts. As in Linux
+`iwl-nvm-parse.c::iwl_init_channel_map`, factual channel bits allow the local
+VHT160 capability. Advertising and use additionally require the retained
+source's complete rates-v2 or rates-v3 consumer namespace. Each actual
+160MHz operation requires valid raw NVM facts on all eight constituents,
+the native MCC global width permission and per-channel width/active facts,
+and every overlapping current host rule over the complete occupied span.
+Only canonical contiguous centers50/114/163 are admitted. Band-qualified
+6GHz and discontiguous80+80 remain separate continuations.
+
+The existing shared security-plan `Offer` supplies actual VHT160 operation,
+Extended NSS BW/HT CCFS2 and directional peer MCS facts. The native owner
+retains that original offer and the selected SAE-H2E parsing fact through
+association-response and current-beacon confirmation. It does not derive
+160 from an RFH layout, a generic VHT SKU or an AP's primary80 label.
+A forbidden full span rebuilds the shared local offer at the genuine
+narrower capability before native programming; HE80 remains available
+where its own factual offer is valid. Later looser policy cannot enlarge
+a copied program. Changed bound operation or capability requires the
+existing reassociation/retirement path.
+
+Native PHY bandwidth3 carries the source primary/control/opposite-channel
+positions. TLC v6's160 slot (or actual API89 v4 conversion) is distinct from
+the <=80 slot for each NSS; the320 slot stays zero. VHT160 honors actual
+Extended NSS limits and SGI160. HE has separate directional80/160 maps,
+with the existing source SMPS and native STA/LINK/packet-extension owners.
+Raw RFH data is checked before CCMP/BA/reorder mutation against the actual
+rate namespace, received bandwidth, MCS/NSS and coding/header promise.
+The ordinary native DMA/source, key/replay, carrier, IPC and exact terminal
+owners remain in force. No physical curve or extra board prerequisite is
+invented; provided platform power receipts retain their existing authority.
+
+Six `drivers/wireless/iwlwifi/native160` cases are wired for actual Sc,
+API89 CDB and Bz native HE160 Open/WPA2/SAE24-PMF DHCP, a later H2E-selector
+beacon against the retained offer, VHT160 and source SGI/TLC
+literals, raw NVM and all-eight host/MCC admission including Extended NSS,
+actual narrower MCC/host HE80 fallback, bad RFH widths/MCS/NSS followed by
+valid same-PN and replay checks, and upper-channel policy loss while a
+real native STA receipt is held. They use the existing heap-owned native
+TFH/RFH firmware/AP seams. Scoped formatting and whitespace checks pass;
+coordinated compilation, native execution and the full release matrix are
+pending. The accepted531-case checkpoint in §3.61 remains separate.
 
 ## 4. References
 

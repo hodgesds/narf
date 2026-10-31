@@ -91,7 +91,11 @@ fn local_phy(local: Local, channel: u8) -> Result<Option<LocalPhy>, &'static str
         };
         let vht = LocalVht::new(map(local.rx_streams), map(local.tx_streams), true, true, 3)
             .map_err(|_| "MLD local security VHT profile invalid")?;
-        LocalPhy::vht80(ht, vht)
+        if local.supports160() {
+            LocalPhy::vht160(ht, vht.with_160mhz(true, true).with_extended_nss_bw(true))
+        } else {
+            LocalPhy::vht80(ht, vht)
+        }
     } else {
         LocalPhy::ht40(ht)
     };
@@ -113,7 +117,7 @@ impl Profile {
         local: Local,
     ) -> Result<Self, &'static str> {
         let mode = match auth {
-            AuthMethod::Open if !local.he => {
+            AuthMethod::Open if !local.he && !local.supports160() => {
                 if beacon.privacy {
                     return Err("secured AP requested as open");
                 }
