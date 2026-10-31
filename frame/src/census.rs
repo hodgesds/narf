@@ -160,6 +160,42 @@ pub fn capture() {
 // if the census smoke fails there, this correction is wrong,
 // not the snapshot.
 //
+// CORRECTION (2026-10-31, CI run 41212939162 on this branch's head
+// 0395a1333): the baseline again predates merges that landed on main
+// after the 2026-10-28 refresh — Subsys recorded 155 where the snapshot
+// composes 157, Device recorded 21 where the snapshot composes 22, and
+// Late recorded 68 where the snapshot composes 70. Each delta name is
+// accounted for by a named, already-merged PR, verified against the
+// registration sites on main and the crate call order in frame's boot
+// sequence. Correcting the working hypothesis: none of the deltas comes
+// from the #1247/#1240/#1234/#1232/#1220 merges — those five add zero
+// initcall names, proven by the register-call diff over every file
+// changed in the range. All five deltas are October 29 merges that
+// landed after the last refresh and before the wave's rebase, which did
+// not refresh the baseline: PR #1226 (CDC ECM, commit 253157b5d) added
+// `usb-cdc-ecm` at Subsys (directly after `usb-cdc-ncm`, its
+// registration order in `drivers/usb/src/lib.rs`); PR #1224 (thermal PM,
+// commit 5f6f2b131) added `platform-thermal-pm` at Subsys (directly
+// after `acpi-fan`, `drivers/platform/src/lib.rs`); PR #1221 (watchdog,
+// commit 6d2885182) added `watchdog/itco` at Device (x86_64-only;
+// frame calls the watchdog crate between hwmon and serial, so it slots
+// directly before `amd-fch-spi`); PR #1187 (hwmon power providers,
+// commit 32e24dd6f) added `hwmon-power-providers` at Late (directly
+// after `hwmon-cooling`, `drivers/hwmon/src/lib.rs`); PR #1235 (Intel GT
+// bring-up, commit 9f3cb2d06) added `intel-gpu-gt` at Late (directly
+// after `intel-gpu-dp-bridge`, `drivers/gpu/src/lib.rs`). The delta was
+// verified three ways: a full-tree multiset diff of
+// `narf_init::register` sites between the refresh base (58642a0ed) and
+// the current tip (exactly four single-line additions, no removals or
+// renames), a register-line diff over every registration-site file that
+// changed in the merge range (exactly these five additions, the fifth
+// being the multi-line watchdog registration), and a bare_main
+// call-order diff (identical except the added watchdog crate call). The
+// branch itself adds no names (the site diff between its base 09349c2e
+// and its head is empty). No other stage diverged, and no delta name is
+// unaccounted for. The entries below are updated to the verified set;
+// the fixture still asserts exact-set, exact-order equality.
+//
 // The recording is reality, not an ideal: on x86_64 the `arch` stage
 // is empty and `ipmi`, `itco_wdt`, and `usb-r8152` each register
 // twice at Subsys (pre-existing duplicate registrations; the census
@@ -246,6 +282,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "usb-uvc",
         "usb-r8152",
         "usb-cdc-ncm",
+        "usb-cdc-ecm",
         "usb-msc",
         "usb-xpad",
         "xhci",
@@ -278,6 +315,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "acpi-ac-adapter",
         "acpi-thermal",
         "acpi-fan",
+        "platform-thermal-pm",
         "acpi-lid",
         "acpi-buttons",
         "acpi-ec-hotkeys",
@@ -335,7 +373,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "itco_wdt",
         "pl011",
         "psmouse",
-    ], // subsys: 155
+    ], // subsys: 157
     &[
         "modules-sysfs",
         "devfs-mount",
@@ -353,6 +391,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "intel-vmd",
         "usb4-nhi",
         "fingerprint",
+        "watchdog/itco",
         "amd-fch-spi",
         "intel-lpss-spi",
         "cadence-spi",
@@ -366,7 +405,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "psmouse-extensions",
         "pci-probe-all",
         "jc42",
-    ], // device: 21
+    ], // device: 22
     &[
         "bpf-leds/worker",
         "virtio-input-pump",
@@ -384,7 +423,9 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "wmi-userspace-surfaces",
         "hwmon-sysfs-bridge",
         "hwmon-cooling",
+        "hwmon-power-providers",
         "intel-gpu-dp-bridge",
+        "intel-gpu-gt",
         "amdgpu-usbc",
         "virtio-gpu-drm-card",
         "bochs-drm-card",
@@ -436,7 +477,7 @@ const BASELINE_X86_64: [&[&str]; 8] = [
         "virtio-gpu-splash",
         "mt76-firmware",
         "amdgpu-discrete-firmware",
-    ], // late: 68
+    ], // late: 70
 ];
 
 /// The recorded baseline for the running arch, if one has been
