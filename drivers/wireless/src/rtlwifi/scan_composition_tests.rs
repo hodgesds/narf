@@ -133,6 +133,7 @@ fn smoke_rtl8188ee_multichannel_cancel_keeps_owned_transition_and_no_partial_cac
     let h = Harness::new(false);
     h.scan();
     idle_receipt(&h);
+    let generation = h.device.generation_for_test();
     h.packet.model.lock().wait = true;
     let mut scan = Box::pin(h.device.scan(request(&[1, 6, 11], true)));
     for _ in 0..64 {
@@ -143,9 +144,12 @@ fn smoke_rtl8188ee_multichannel_cancel_keeps_owned_transition_and_no_partial_cac
         {
             return TestResult::Fail("EE held multi-channel scan unexpectedly completed");
         }
-        if h.closed() {
+        if h.device.generation_for_test() != generation {
             break;
         }
+    }
+    if h.device.generation_for_test() == generation {
+        return TestResult::Fail("EE fixture did not enter the held physical retune");
     }
     drop(scan);
     if !h.closed() || h.device.scan_information_elements(PEER).is_some() {
