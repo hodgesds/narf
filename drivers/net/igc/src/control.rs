@@ -470,6 +470,13 @@ impl NicControl for Igc {
         }
         Ok(())
     }
+    fn kick_xsk(&self, q: u16) -> Result<(), i32> {
+        let _op = self.operation().map_err(|_| 16)?;
+        let queues = self.queues();
+        let queue = queues.get(usize::from(q)).ok_or(22)?;
+        queue.poll_xsk(&self.hw, usize::from(q), self.mtu());
+        Ok(())
+    }
     fn runtime_suspend(&self) -> Result<(), i32> {
         narf_power::device_pm::DevicePmOps::suspend(self).map_err(|_| 16)?;
         narf_bus::pci::set_power_state(

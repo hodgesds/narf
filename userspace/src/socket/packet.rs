@@ -178,8 +178,17 @@ impl SocketFile {
                     raw.extend_from_slice(&a.body);
                     raw
                 });
-                let timestamp = self.options.lock().timestamping_flags & 1 != 0;
-                match sock.sendmsg_timestamped(buf, name.as_deref(), timestamp) {
+                let (timestamp, prio) = {
+                    let opts = self.options.lock();
+                    (opts.timestamping_flags & 1 != 0, opts.ext.priority)
+                };
+                let txtime = self.take_send_txtime();
+                let queue = if (timestamp || txtime.is_some()) && prio != 0 {
+                    u16::try_from(prio).ok()
+                } else {
+                    None
+                };
+                match sock.sendmsg_timed(buf, name.as_deref(), timestamp, txtime, queue) {
                     Ok(n) => SocketOpResult::Ok(n as u64),
                     Err(e) => sock_err(e),
                 }

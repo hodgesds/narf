@@ -533,3 +533,327 @@ fn encode_rule(b: &mut [u8], r: &nic::FlowRule) {
         b[154..156].copy_from_slice(&[0xe0, 0]);
     }
 }
+
+// ── Generic Netlink "ethtool" MAC Merge (802.3br / 802.1Qbu) ───────────
+
+pub const GENL_ID_ETHTOOL: u16 = 0x14;
+pub const ETHTOOL_GENL_NAME: &str = "ethtool";
+pub const ETHTOOL_GENL_VERSION: u8 = 1;
+
+pub const ETHTOOL_MSG_MM_GET: u8 = 35;
+pub const ETHTOOL_MSG_MM_SET: u8 = 36;
+pub const ETHTOOL_MSG_MM_GET_REPLY: u8 = 44;
+
+pub const ETHTOOL_A_HEADER_DEV_INDEX: u16 = 1;
+pub const ETHTOOL_A_HEADER_DEV_NAME: u16 = 2;
+pub const ETHTOOL_A_HEADER_FLAGS: u16 = 3;
+
+pub const ETHTOOL_A_MM_HEADER: u16 = 1;
+pub const ETHTOOL_A_MM_PMAC_ENABLED: u16 = 2;
+pub const ETHTOOL_A_MM_TX_ENABLED: u16 = 3;
+pub const ETHTOOL_A_MM_TX_ACTIVE: u16 = 4;
+pub const ETHTOOL_A_MM_TX_MIN_FRAG_SIZE: u16 = 5;
+pub const ETHTOOL_A_MM_RX_MIN_FRAG_SIZE: u16 = 6;
+pub const ETHTOOL_A_MM_VERIFY_ENABLED: u16 = 7;
+pub const ETHTOOL_A_MM_VERIFY_STATUS: u16 = 8;
+pub const ETHTOOL_A_MM_VERIFY_TIME: u16 = 9;
+pub const ETHTOOL_A_MM_MAX_VERIFY_TIME: u16 = 10;
+
+pub const ETHTOOL_MM_VERIFY_STATUS_INITIAL: u8 = 0;
+pub const ETHTOOL_MM_VERIFY_STATUS_VERIFYING: u8 = 1;
+pub const ETHTOOL_MM_VERIFY_STATUS_SUCCEEDED: u8 = 2;
+pub const ETHTOOL_MM_VERIFY_STATUS_FAILED: u8 = 3;
+pub const ETHTOOL_MM_VERIFY_STATUS_DISABLED: u8 = 4;
+
+const NLA_F_NESTED: u16 = 1 << 15;
+const NLA_TYPE_MASK: u16 = !(3 << 14);
+
+static ETHTOOL_GENL_OPS: &[crate::netlink_generic::GenlOperation] = &[
+    crate::netlink_generic::GenlOperation {
+        command: ETHTOOL_MSG_MM_GET,
+        flags: 0x02 | 0x04, // GENL_CMD_CAP_DO | GENL_CMD_CAP_DUMP
+    },
+    crate::netlink_generic::GenlOperation {
+        command: ETHTOOL_MSG_MM_SET,
+        flags: 0x02 | crate::netlink_generic::GENL_UNS_ADMIN_PERM,
+    },
+];
+
+fn unsupported_genl(
+    _: u8,
+    _: &[u8],
+    _: bool,
+) -> Result<alloc::vec::Vec<crate::netlink_generic::GenlReply>, i32> {
+    Err(95)
+}
+
+pub fn ensure_genl_registered() {
+    let _ = crate::netlink_generic::register_family(crate::netlink_generic::GenlFamily {
+        id: GENL_ID_ETHTOOL,
+        name: ETHTOOL_GENL_NAME,
+        version: ETHTOOL_GENL_VERSION,
+        max_attr: 11,
+        operations: ETHTOOL_GENL_OPS,
+        groups: &[],
+        handler: unsupported_genl,
+    });
+    let _ = crate::netlink_generic::register_context_handler(GENL_ID_ETHTOOL, handle_genl);
+}
+
+fn push_nla(body: &mut alloc::vec::Vec<u8>, kind: u16, payload: &[u8]) {
+    let len = (4 + payload.len()) as u16;
+    body.extend_from_slice(&len.to_ne_bytes());
+    body.extend_from_slice(&kind.to_ne_bytes());
+    body.extend_from_slice(payload);
+    let aligned = (body.len() + 3) & !3;
+    body.resize(aligned, 0);
+}
+
+fn walk_nla<'a>(
+    raw: &'a [u8],
+    mut f: impl FnMut(u16, &'a [u8]) -> Result<(), i32>,
+) -> Result<(), i32> {
+    let mut off = 0usize;
+    while off < raw.len() {
+        if off + 4 > raw.len() {
+            return Err(22);
+        }
+        let len = u16::from_ne_bytes(raw[off..off + 2].try_into().map_err(|_| 22)?) as usize;
+        let kind =
+            u16::from_ne_bytes(raw[off + 2..off + 4].try_into().map_err(|_| 22)?) & NLA_TYPE_MASK;
+        if len < 4 || off + len > raw.len() {
+            return Err(22);
+        }
+        f(kind, &raw[off + 4..off + len])?;
+        off = off.saturating_add((len + 3) & !3);
+    }
+    Ok(())
+}
+
+fn parse_header_dev(raw: &[u8], net_ns_id: u64) -> Result<(u32, alloc::string::String), i32> {
+    let mut dev_index: Option<u32> = None;
+    let mut dev_name: Option<alloc::string::String> = None;
+    walk_nla(raw, |kind, payload| {
+        match kind {
+            ETHTOOL_A_HEADER_DEV_INDEX => {
+                if payload.len() != 4 {
+                    return Err(22);
+                }
+                dev_index = Some(u32::from_ne_bytes(payload.try_into().map_err(|_| 22)?));
+            }
+            ETHTOOL_A_HEADER_DEV_NAME => {
+                let trimmed = payload.strip_suffix(&[0]).unwrap_or(payload);
+                let s = core::str::from_utf8(trimmed).map_err(|_| 22)?;
+                if s.is_empty() {
+                    return Err(22);
+                }
+                dev_name = Some(alloc::string::String::from(s));
+            }
+            ETHTOOL_A_HEADER_FLAGS => {
+                if payload.len() != 4 {
+                    return Err(22);
+                }
+            }
+            _ => return Err(22),
+        }
+        Ok(())
+    })?;
+    if let Some(ifindex) = dev_index {
+        let name = crate::netlink_route::iface_name_for_index(ifindex).ok_or(19)?;
+        if name != "lo" && crate::iface::lookup_in(net_ns_id, &name).is_none() {
+            return Err(19);
+        }
+        return Ok((ifindex, name));
+    }
+    if let Some(name) = dev_name {
+        if name != "lo" && crate::iface::lookup_in(net_ns_id, &name).is_none() {
+            return Err(19);
+        }
+        let ifindex = crate::netlink_route::ifindex_for_name(&name).ok_or(19)?;
+        return Ok((ifindex, name));
+    }
+    Err(22)
+}
+
+fn encode_mm_reply(
+    ifindex: u32,
+    name: &str,
+    cfg: nic::Preemption,
+    status: nic::PreemptionStatus,
+) -> crate::netlink_generic::GenlReply {
+    let mut hdr = alloc::vec::Vec::new();
+    push_nla(&mut hdr, ETHTOOL_A_HEADER_DEV_INDEX, &ifindex.to_ne_bytes());
+    let mut name_bytes = name.as_bytes().to_vec();
+    name_bytes.push(0);
+    push_nla(&mut hdr, ETHTOOL_A_HEADER_DEV_NAME, &name_bytes);
+
+    let verify_status = if !cfg.verify {
+        ETHTOOL_MM_VERIFY_STATUS_DISABLED
+    } else if status.verified {
+        ETHTOOL_MM_VERIFY_STATUS_SUCCEEDED
+    } else if status.failed {
+        ETHTOOL_MM_VERIFY_STATUS_FAILED
+    } else if status.attempts > 0 {
+        ETHTOOL_MM_VERIFY_STATUS_VERIFYING
+    } else {
+        ETHTOOL_MM_VERIFY_STATUS_INITIAL
+    };
+
+    let mut attrs = alloc::vec::Vec::new();
+    push_nla(&mut attrs, ETHTOOL_A_MM_HEADER | NLA_F_NESTED, &hdr);
+    push_nla(
+        &mut attrs,
+        ETHTOOL_A_MM_PMAC_ENABLED,
+        &[u8::from(cfg.enabled)],
+    );
+    push_nla(
+        &mut attrs,
+        ETHTOOL_A_MM_TX_ENABLED,
+        &[u8::from(cfg.tx_enabled)],
+    );
+    push_nla(
+        &mut attrs,
+        ETHTOOL_A_MM_TX_ACTIVE,
+        &[u8::from(status.active)],
+    );
+    push_nla(
+        &mut attrs,
+        ETHTOOL_A_MM_TX_MIN_FRAG_SIZE,
+        &u32::from(cfg.minimum_fragment).to_ne_bytes(),
+    );
+    push_nla(
+        &mut attrs,
+        ETHTOOL_A_MM_RX_MIN_FRAG_SIZE,
+        &64u32.to_ne_bytes(),
+    );
+    push_nla(
+        &mut attrs,
+        ETHTOOL_A_MM_VERIFY_ENABLED,
+        &[u8::from(cfg.verify)],
+    );
+    push_nla(&mut attrs, ETHTOOL_A_MM_VERIFY_STATUS, &[verify_status]);
+    push_nla(
+        &mut attrs,
+        ETHTOOL_A_MM_VERIFY_TIME,
+        &u32::from(cfg.verify_ms).to_ne_bytes(),
+    );
+    push_nla(
+        &mut attrs,
+        ETHTOOL_A_MM_MAX_VERIFY_TIME,
+        &128u32.to_ne_bytes(),
+    );
+    crate::netlink_generic::GenlReply {
+        command: ETHTOOL_MSG_MM_GET_REPLY,
+        attrs,
+    }
+}
+
+fn handle_genl(
+    command: u8,
+    attrs: &[u8],
+    dump: bool,
+    context: crate::netlink_generic::RequestContext<'_>,
+) -> Result<alloc::vec::Vec<crate::netlink_generic::GenlReply>, i32> {
+    match command {
+        ETHTOOL_MSG_MM_GET => {
+            if dump {
+                let mut out = alloc::vec::Vec::new();
+                for snap in crate::iface::snapshot_all() {
+                    if snap.net_ns_id != context.net_ns_id {
+                        continue;
+                    }
+                    if let Ok((cfg, status)) = nic::with_control(&snap.name, |d| d.preemption()) {
+                        out.push(encode_mm_reply(snap.ifindex, &snap.name, cfg, status));
+                    }
+                }
+                return Ok(out);
+            }
+            let mut header_raw: Option<&[u8]> = None;
+            walk_nla(attrs, |kind, payload| {
+                if kind == ETHTOOL_A_MM_HEADER {
+                    header_raw = Some(payload);
+                    Ok(())
+                } else {
+                    Err(22)
+                }
+            })?;
+            let (ifindex, name) = parse_header_dev(header_raw.ok_or(22)?, context.net_ns_id)?;
+            let (cfg, status) = nic::with_control(&name, |d| d.preemption())?;
+            Ok(alloc::vec![encode_mm_reply(ifindex, &name, cfg, status)])
+        }
+        ETHTOOL_MSG_MM_SET => {
+            let mut header_raw: Option<&[u8]> = None;
+            let mut pmac_enabled: Option<bool> = None;
+            let mut tx_enabled: Option<bool> = None;
+            let mut verify_enabled: Option<bool> = None;
+            let mut verify_time: Option<u8> = None;
+            let mut min_frag: Option<u16> = None;
+
+            walk_nla(attrs, |kind, payload| {
+                match kind {
+                    ETHTOOL_A_MM_HEADER => header_raw = Some(payload),
+                    ETHTOOL_A_MM_PMAC_ENABLED => {
+                        if payload.len() != 1 || payload[0] > 1 {
+                            return Err(22);
+                        }
+                        pmac_enabled = Some(payload[0] != 0);
+                    }
+                    ETHTOOL_A_MM_TX_ENABLED => {
+                        if payload.len() != 1 || payload[0] > 1 {
+                            return Err(22);
+                        }
+                        tx_enabled = Some(payload[0] != 0);
+                    }
+                    ETHTOOL_A_MM_VERIFY_ENABLED => {
+                        if payload.len() != 1 || payload[0] > 1 {
+                            return Err(22);
+                        }
+                        verify_enabled = Some(payload[0] != 0);
+                    }
+                    ETHTOOL_A_MM_VERIFY_TIME => {
+                        if payload.len() != 4 {
+                            return Err(22);
+                        }
+                        let v = u32::from_ne_bytes(payload.try_into().map_err(|_| 22)?);
+                        verify_time = Some(u8::try_from(v).map_err(|_| 22)?);
+                    }
+                    ETHTOOL_A_MM_TX_MIN_FRAG_SIZE => {
+                        if payload.len() != 4 {
+                            return Err(22);
+                        }
+                        let v = u32::from_ne_bytes(payload.try_into().map_err(|_| 22)?);
+                        min_frag = Some(u16::try_from(v).map_err(|_| 22)?);
+                    }
+                    _ => return Err(22),
+                }
+                Ok(())
+            })?;
+            let (_ifindex, name) = parse_header_dev(header_raw.ok_or(22)?, context.net_ns_id)?;
+            if !context.capable {
+                let admin = context.admin.ok_or(1)?;
+                admin
+                    .authorize_interface(&name, context.net_ns_id)
+                    .map_err(|_| 1)?;
+            }
+            let (mut cfg, _) = nic::with_control(&name, |d| d.preemption())?;
+            if let Some(v) = pmac_enabled {
+                cfg.enabled = v;
+            }
+            if let Some(v) = tx_enabled {
+                cfg.tx_enabled = v;
+            }
+            if let Some(v) = verify_enabled {
+                cfg.verify = v;
+            }
+            if let Some(v) = verify_time {
+                cfg.verify_ms = v;
+            }
+            if let Some(v) = min_frag {
+                cfg.minimum_fragment = v;
+            }
+            nic::with_control(&name, |d| d.set_preemption(cfg))?;
+            Ok(alloc::vec::Vec::new())
+        }
+        _ => Err(95),
+    }
+}

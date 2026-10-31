@@ -23,8 +23,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::{
-    build_error, build_newaddr, build_newaddr_v6, build_newlink, build_newneigh, build_newqdisc,
-    build_newroute, build_newroute_v6, build_newrule, builtin_loopback_ipv6, enumerate_in,
+    build_error, build_newaddr, build_newaddr_v6, build_newlink, build_newneigh, build_newroute,
+    build_newroute_v6, build_newrule, build_qdisc_messages, builtin_loopback_ipv6, enumerate_in,
     frame_message, ifindex_for_name, nlmsg_align, parse_hdr, push_rtattr, rta_align, LinkInfo,
     NeighInfo, AF_INET, AF_INET6, EAFNOSUPPORT, EINVAL, ENODEV, ENOENT, EOPNOTSUPP,
     NLMSGERR_ATTR_MSG, NLMSG_DONE, NLMSG_HDRLEN, NLM_F_ACK_TLVS, NLM_F_MULTI, NTF_ROUTER,
@@ -1575,7 +1575,9 @@ fn dump_qdisc(d: &mut Dump<'_>) -> Result<(), i32> {
     )?;
     let links = core::mem::take(&mut d.links);
     for link in &links {
-        d.push(build_newqdisc(link.ifindex, d.seq, 0), 0);
+        for msg in build_qdisc_messages(link, d.seq, 0) {
+            d.push(msg, 0);
+        }
     }
     d.links = links;
     Ok(())

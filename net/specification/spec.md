@@ -58,7 +58,10 @@ interface; completion/error reports wake its error queue.
 frame through DMA. Revocation rejects new leases; it never frees an existing
 lease. Drivers release leases only after terminal DD or a proven quiescence.
 Direct queue claims exclude competing software claims on that interface.
-The AF_BYPASS cap/ring contract remains distinct from Linux user-page pinning.
+Both the native `AF_BYPASS` capability/ring contract and the Linux `AF_XDP`
+user-UMEM + shared `mmap` ring layout (`XDP_PGOFF_*`, `XDP_MMAP_OFFSETS`,
+`XDP_STATISTICS`) are supported, alongside `NETLINK_ROUTE` `tc` (`taprio`,
+`cbs`, `etf`) and `NETLINK_GENERIC` `ethtool` MAC Merge (`ETHTOOL_MSG_MM_*`).
 
 
 ### 3.1 Interface object

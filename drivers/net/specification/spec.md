@@ -186,23 +186,25 @@ MAC Merge sends/receives SMD verify/response frames, retries verification at
 most three times, resets verification on link loss and only activates TX
 preemption after verification or an explicit administrative override.
 Clock steps are refused while a TSN schedule is active. These scheduling and
-MAC Merge controls use the native typed API.
+MAC Merge controls are exposed through both the native typed API and Linux
+`NETLINK_ROUTE` `tc` (`taprio`, `cbs`, `etf`), `SO_TXTIME`/`SCM_TXTIME`, and
+`NETLINK_GENERIC` `ethtool` MAC Merge (`ETHTOOL_MSG_MM_GET`/`SET`).
 Reconfiguration drains the previous queues. Permanently closed queues reject
 new TX, including during the transition to a future base time, so an impossible
 completion cannot trigger a watchdog reset or retain submitted DMA indefinitely.
 
 Native XDP runs on completed DMA packets before software claims/protocol
 allocation; PASS is not executed a second time in the stack. TX reuses owned
-frames, and redirect/broadcast actions finish after locks release. AF_BYPASS's
-existing capability/ring API can request direct UMEM queues with XDP_ZEROCOPY
-(flag 4). Each UMEM frame has exclusive DMA ownership, and duplicate FILL/TX
-indices cannot alias outstanding DMA. TX completion follows final DD; reset
-and detach require a proven device-wide fence. Direct queues exclude software
-claims on that interface, reject RX timestamp-prefix mode, and retain their
-UMEM/socket and exclusive queue claim across failures. Failed attachment closes
-the socket until recovery detaches it; RX backpressure recycles unpublished
-buffers rather than losing their indices. This is NARF's existing capability-based AF_XDP
-surface, not Linux's arbitrary-user-page UMEM/mmap-ring ABI.
+frames, and redirect/broadcast actions finish after locks release. Both
+`AF_BYPASS` (capability/ring API) and `AF_XDP` (user-page `XDP_UMEM_REG` +
+shared `mmap` FILL/RX/TX/COMPLETION rings) can request direct UMEM queues with
+`XDP_ZEROCOPY` (flag 4). Each UMEM frame has exclusive DMA ownership, and
+duplicate FILL/TX indices cannot alias outstanding DMA. TX completion follows
+final DD; reset and detach require a proven device-wide fence. Direct queues
+exclude software claims on that interface, reject RX timestamp-prefix mode, and
+retain their UMEM/socket and exclusive queue claim across failures. Failed
+attachment closes the socket until recovery detaches it; RX backpressure
+recycles unpublished buffers rather than losing their indices.
 
 Admin up/down, multiple controllers, PCI removal, AER recovery, watchdog
 reset, S3 and runtime D3hot are integrated. Suspend programs requested Linux

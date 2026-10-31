@@ -275,6 +275,15 @@ pub(super) fn sendmsg_on_socket(
             sock.stash_send_udp_gso(gso);
         }
     }
+    if let Some(txtime) = ancillary.txtime {
+        if !sock.txtime_enabled() {
+            if udp_cmsg {
+                let _ = sock.take_send_udp_gso();
+            }
+            return SendMsgResult::Error(EINVAL);
+        }
+        sock.stash_send_txtime(txtime);
+    }
     let result = sock.dispatch_op(crate::socket::SocketOp::Send {
         buf: &total,
         flags,
@@ -282,6 +291,9 @@ pub(super) fn sendmsg_on_socket(
     });
     if udp_cmsg {
         let _ = sock.take_send_udp_gso();
+    }
+    if ancillary.txtime.is_some() {
+        let _ = sock.take_send_txtime();
     }
     match result {
         crate::socket::SocketOpResult::Ok(n) => SendMsgResult::Sent {

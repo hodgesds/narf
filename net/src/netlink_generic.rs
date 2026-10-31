@@ -391,6 +391,7 @@ fn build_one(
     context: RequestContext<'_>,
     options: ReplyOptions,
 ) -> Result<Vec<Vec<u8>>, ()> {
+    crate::ethtool::ensure_genl_registered();
     if request.len() < NLMSG_HDRLEN + 4 {
         return Err(());
     }

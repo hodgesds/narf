@@ -246,6 +246,9 @@ pub trait NicControl: core::fmt::Debug + Send + Sync {
     ) -> Result<()> {
         Err(95)
     }
+    fn kick_xsk(&self, _: u16) -> Result<()> {
+        Ok(())
+    }
     fn runtime_suspend(&self) -> Result<()> {
         Err(95)
     }

@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 fn dynamic(id: i32) -> bool {
     id < 0 && id & 7 == 3
 }
-fn clock(id: i32, write: bool) -> Result<Arc<dyn narf_time::phc::HardwareClock>, i64> {
+pub(crate) fn clock(id: i32, write: bool) -> Result<Arc<dyn narf_time::phc::HardwareClock>, i64> {
     let fd = (!(id >> 3)) as u32;
     let (ops, flags) = crate::fd::with_table(current_task_id(), |t| {
         t.get(fd)

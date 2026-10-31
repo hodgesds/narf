@@ -718,6 +718,17 @@ impl PacketSock {
         name: Option<&[u8]>,
         timestamp: bool,
     ) -> Result<usize, i32> {
+        self.sendmsg_timed(data, name, timestamp, None, None)
+    }
+
+    pub fn sendmsg_timed(
+        self: &Arc<Self>,
+        data: &[u8],
+        name: Option<&[u8]>,
+        timestamp: bool,
+        launch_time_ns: Option<u64>,
+        queue: Option<u16>,
+    ) -> Result<usize, i32> {
         if self.sock_type == SOCK_PACKET {
             return self.sendmsg_spkt(data, name);
         }
@@ -817,57 +828,65 @@ impl PacketSock {
         let Some(snap) = crate::iface::by_index_in(self.net_ns_id, dev.ifindex) else {
             return Err(errno::ENXIO);
         };
-        if timestamp {
-            let cookie = NEXT_TIMESTAMP.fetch_add(1, Ordering::Relaxed);
-            let pending = PendingTimestamp {
-                name: snap.name.clone(),
-                socket: Arc::downgrade(self),
-                cookie,
-                record: PacketRecord {
-                    data: frame.clone(),
-                    origlen: frame.len() as u32,
-                    ifindex: dev.ifindex,
-                    hatype: dev.hatype,
-                    pkttype: PACKET_OUTGOING,
-                    halen: 6,
-                    addr: [0; 8],
-                    protocol,
-                    net_off: 14,
-                    vlan: None,
-                    tstamp_secs: 0,
-                    tstamp_nanos: 0,
-                    hardware_ns: None,
-                    timestamp_error: None,
-                    dev_name: [0; 14],
-                    charge: 0,
-                },
-            };
-            {
+        if timestamp || launch_time_ns.is_some() {
+            let cookie = if timestamp {
+                let cookie = NEXT_TIMESTAMP.fetch_add(1, Ordering::Relaxed);
+                let pending = PendingTimestamp {
+                    name: snap.name.clone(),
+                    socket: Arc::downgrade(self),
+                    cookie,
+                    record: PacketRecord {
+                        data: frame.clone(),
+                        origlen: frame.len() as u32,
+                        ifindex: dev.ifindex,
+                        hatype: dev.hatype,
+                        pkttype: PACKET_OUTGOING,
+                        halen: 6,
+                        addr: [0; 8],
+                        protocol,
+                        net_off: 14,
+                        vlan: None,
+                        tstamp_secs: 0,
+                        tstamp_nanos: 0,
+                        hardware_ns: None,
+                        timestamp_error: None,
+                        dev_name: [0; 14],
+                        charge: 0,
+                    },
+                };
                 let mut requests = TX_TIMESTAMPS.lock();
                 if requests.len() >= 1024 {
                     return Err(errno::ENOBUFS);
                 }
                 requests.push(pending);
-            }
+                Some(cookie)
+            } else {
+                None
+            };
             let mut buffer =
                 match narf_io::alloc_coherent(frame.len(), narf_lib::id::DomainId::DRIVER_0) {
                     Ok(b) => b,
                     Err(_) => {
-                        cancel_tx_timestamp(cookie);
+                        if let Some(cookie) = cookie {
+                            cancel_tx_timestamp(cookie);
+                        }
                         return Err(errno::ENOBUFS);
                     }
                 };
             buffer.as_mut_slice()[..frame.len()].copy_from_slice(&frame);
             let mut owned = crate::Frame::new(buffer, frame.len() as u32);
             owned.set_tx_timing(crate::TxTiming {
-                timestamp_cookie: Some(cookie),
-                ..Default::default()
+                timestamp_cookie: cookie,
+                launch_time_ns,
+                queue,
             });
             if snap
                 .xmit_frame_from(owned, crate::TxMeta::plain(), Some(self), bypass)
                 .is_err()
             {
-                cancel_tx_timestamp(cookie);
+                if let Some(cookie) = cookie {
+                    cancel_tx_timestamp(cookie);
+                }
                 return Err(errno::ENOBUFS);
             }
             return Ok(len);

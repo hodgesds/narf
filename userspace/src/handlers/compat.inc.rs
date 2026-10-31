@@ -13180,6 +13180,8 @@ struct ScmSendAncillary {
     /// of the first malformed one. A UDP send path applies it after its
     /// address checks, where Linux parses it.
     udp_gso: Option<Result<u16, i64>>,
+    /// Hardware launch time in nanoseconds supplied via `SCM_TXTIME` (61).
+    txtime: Option<u64>,
 }
 
 /// Parse Linux `SOL_SOCKET` send control messages. `SCM_RIGHTS` descriptors
@@ -13192,6 +13194,7 @@ fn parse_scm_send_ancillary(
     const SOL_SOCKET: i32 = 1;
     const SCM_RIGHTS: i32 = 1;
     const SCM_CREDENTIALS: i32 = 2;
+    const SCM_TXTIME: i32 = 61;
     const SCM_MAX_FD: usize = 253;
     const SOL_UDP: i32 = 17;
     // struct cmsghdr { u64 cmsg_len; i32 cmsg_level; i32 cmsg_type; } = 16 B.
@@ -13200,6 +13203,7 @@ fn parse_scm_send_ancillary(
         cred: None,
         src_override: None,
         udp_gso: None,
+        txtime: None,
     };
     if ctrl_len == 0 {
         return Ok(out);
@@ -13269,6 +13273,14 @@ fn parse_scm_send_ancillary(
                         gid: u32::from_ne_bytes(ctrl[off + 24..off + 28].try_into().unwrap()),
                     };
                     out.cred = Some(validate_scm_ucred(supplied)?);
+                }
+                SCM_TXTIME => {
+                    if cmsg_len != 24 {
+                        return Err(EINVAL);
+                    }
+                    out.txtime = Some(u64::from_ne_bytes(
+                        ctrl[off + 16..off + 24].try_into().unwrap(),
+                    ));
                 }
                 _ => return Err(EINVAL),
             }

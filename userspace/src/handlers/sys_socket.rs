@@ -146,9 +146,9 @@ pub(super) fn validate_socket_create(
     task: u64,
 ) -> Result<(u16, u32, u32), i64> {
     use crate::socket::{
-        AF_BLUETOOTH, AF_BYPASS, AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, BTPROTO_HCI,
-        BTPROTO_L2CAP, BTPROTO_RFCOMM, BTPROTO_SCO, BT_MAX_PROTO, IPPROTO_ICMP, IPPROTO_TCP,
-        IPPROTO_UDP, SOCK_DGRAM, SOCK_PACKET, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM,
+        AF_BLUETOOTH, AF_BYPASS, AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, AF_XDP,
+        BTPROTO_HCI, BTPROTO_L2CAP, BTPROTO_RFCOMM, BTPROTO_SCO, BT_MAX_PROTO, IPPROTO_ICMP,
+        IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM, SOCK_PACKET, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM,
     };
     const NPROTO: i32 = 46; // AF_MAX, include/linux/socket.h
     const SOCK_MAX: u32 = 11; // SOCK_PACKET + 1, include/linux/net.h
@@ -262,6 +262,18 @@ pub(super) fn validate_socket_create(
                 }
                 _ => Err(EPROTONOSUPPORT),
             }
+        }
+        AF_XDP => {
+            if !task_net_raw_capable(task) {
+                return Err(EPERM);
+            }
+            if kind != SOCK_RAW {
+                return Err(ESOCKTNOSUPPORT);
+            }
+            if protocol != 0 {
+                return Err(EPROTONOSUPPORT);
+            }
+            Ok((domain, kind, raw_proto as u32))
         }
         AF_BYPASS => Ok((domain, kind, raw_proto as u32)),
         _ => Err(EAFNOSUPPORT),

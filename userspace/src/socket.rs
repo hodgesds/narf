@@ -51,6 +51,8 @@ pub const AF_UNSPEC: u16 = 0;
 pub const AF_UNIX: u16 = 1;
 pub const AF_INET: u16 = 2;
 pub const AF_INET6: u16 = 10;
+/// Standard Linux `AF_XDP` address family.
+pub const AF_XDP: u16 = 44;
 /// NARF kernel-bypass family — equivalent of Linux's AF_XDP (44).
 /// Picks 45 because Linux's number is taken; carries our four-ring
 /// model rather than mmap'd shared pages.
@@ -913,6 +915,8 @@ pub struct SocketFile {
     /// Per-task `SOL_UDP` sendmsg cmsg outcome (`udp_cmsg_send`): the GSO
     /// size a `UDP_SEGMENT` record sets, or its -EINVAL.
     send_udp_gso: IrqSafeSpinLock<BTreeMap<u64, Result<u16, i64>>>,
+    /// Per-task `SCM_TXTIME` hardware launch time (`u64` nanoseconds).
+    send_txtime: IrqSafeSpinLock<BTreeMap<u64, u64>>,
     /// `sk_shutdown`: `RCV_SHUTDOWN` / `SEND_SHUTDOWN` bits set by
     /// shutdown(2). Read by the AF_INET datagram path.
     sk_shutdown: AtomicU8,
@@ -1879,8 +1883,8 @@ impl SocketFile {
                 peer: None,
                 inbox: VecDeque::new(),
             }
-        } else if domain == AF_BYPASS && kind == SOCK_RAW {
-            // AF_BYPASS / AF_XDP-equivalent. Kernel-bypass state is
+        } else if (domain == AF_XDP || domain == AF_BYPASS) && kind == SOCK_RAW {
+            // AF_XDP / AF_BYPASS. Kernel-bypass state is
             // built lazily on setsockopt(XDP_UMEM_REG); here we just
             // stamp a fresh per-socket state record.
             SocketState::Bypass {
@@ -1997,6 +2001,7 @@ impl SocketFile {
             inet_id: core::sync::atomic::AtomicU16::new(0),
             send_pktinfo: IrqSafeSpinLock::new(BTreeMap::new()),
             send_udp_gso: IrqSafeSpinLock::new(BTreeMap::new()),
+            send_txtime: IrqSafeSpinLock::new(BTreeMap::new()),
             sk_shutdown: AtomicU8::new(0),
             net_ns_id: core::sync::atomic::AtomicU64::new(0),
             icmp_echo: IrqSafeSpinLock::new(IcmpEchoState::default()),
@@ -3179,6 +3184,22 @@ impl SocketFile {
             .remove(&crate::handlers::current_task_id())
     }
 
+    pub(crate) fn txtime_enabled(&self) -> bool {
+        self.options.lock().ext.txtime_enabled
+    }
+
+    pub(crate) fn stash_send_txtime(&self, txtime: u64) {
+        self.send_txtime
+            .lock()
+            .insert(crate::handlers::current_task_id(), txtime);
+    }
+
+    pub(crate) fn take_send_txtime(&self) -> Option<u64> {
+        self.send_txtime
+            .lock()
+            .remove(&crate::handlers::current_task_id())
+    }
+
     /// The GSO size a UDP send uses: `ipc.gso_size = up->gso_size`, then
     /// overridden by a `UDP_SEGMENT` cmsg; a malformed `SOL_UDP` cmsg is
     /// -EINVAL (`udp_sendmsg` / `udpv6_sendmsg` → `udp_cmsg_send`).
@@ -3771,6 +3792,37 @@ impl FileOps for SocketFile {
                 perms: 0o600,
             },
             mtime_cycles: 0,
+        }
+    }
+
+    fn validate_mmap(
+        &self,
+        _offset: u64,
+        _len: usize,
+        prot: u32,
+        flags: u32,
+    ) -> Result<u32, FsError> {
+        if matches!(&*self.state.lock(), SocketState::Bypass { .. }) {
+            let map_type = flags & 0x0f;
+            if map_type != 1 && map_type != 3 {
+                return Err(FsError::InvalidPath);
+            }
+        }
+        Ok(prot)
+    }
+
+    fn mmap_backing(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> Result<narf_filesystem::MmapBacking, FsError> {
+        let state = match &*self.state.lock() {
+            SocketState::Bypass { state } => Some(state.clone()),
+            _ => None,
+        };
+        match state {
+            Some(s) => crate::xdp_socket::mmap_backing(&s, offset, len),
+            None => Err(FsError::Unsupported),
         }
     }
 
@@ -4678,10 +4730,11 @@ impl SocketFile {
                 bits
             }
             SocketState::Packet { sock } => sock.poll_mask(),
-            SocketState::Bypass { .. } => {
+            SocketState::Bypass { state } => {
                 // Kernel-bypass path: readiness is managed by the XDP
-                // layer directly; report both directions so callers can
-                // always proceed and let the XDP ring buffer throttle.
+                // layer directly; drive any queued TX descriptors and report
+                // both directions so callers can proceed.
+                let _ = crate::xdp_socket::kick_tx(state);
                 narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT
             }
             SocketState::NetlinkUevent { reader } => {
@@ -4925,7 +4978,7 @@ impl SocketFile {
             (AF_UNIX, SOCK_DGRAM) => self.dispatch_unix_dgram(op),
             (AF_INET6, SOCK_STREAM) => self.dispatch_inet6_stream(op),
             (AF_INET6, SOCK_DGRAM) => self.dispatch_inet6_dgram(op),
-            (AF_BYPASS, SOCK_RAW) => self.dispatch_bypass(op),
+            (AF_XDP | AF_BYPASS, SOCK_RAW) => self.dispatch_bypass(op),
             (AF_NETLINK, _) if self.protocol == NETLINK_ROUTE => self.dispatch_netlink_route(op),
             (AF_NETLINK, _) if self.protocol == NETLINK_GENERIC => {
                 self.dispatch_netlink_generic(op)
@@ -6066,7 +6119,7 @@ impl SocketFile {
         };
         match op {
             SocketOp::Bind { addr } => {
-                if addr.family != AF_BYPASS {
+                if addr.family != AF_BYPASS && addr.family != AF_XDP {
                     return SocketOpResult::Err(SockError::InvalidArg);
                 }
                 let parsed = match crate::xdp_socket::parse_sockaddr_xdp(&addr.body) {
@@ -6082,6 +6135,10 @@ impl SocketFile {
                     Err(_) => SocketOpResult::Err(SockError::InvalidArg),
                 }
             }
+            SocketOp::Send { .. } => match crate::xdp_socket::kick_tx(&state_arc) {
+                Ok(()) => SocketOpResult::Ok(0),
+                Err(_) => SocketOpResult::Err(SockError::InvalidArg),
+            },
             SocketOp::Recv { buf, flags: _ } => match crate::xdp_socket::try_recv(&state_arc) {
                 Ok(Some((_slot, bytes))) => {
                     let n = core::cmp::min(buf.len(), bytes.len());
@@ -6095,8 +6152,8 @@ impl SocketFile {
                 crate::xdp_socket::close(&state_arc);
                 SocketOpResult::Ok(0)
             }
-            // Listen/accept/connect/send via BSD shape intentionally
-            // don't apply to AF_BYPASS.
+            // Listen/accept/connect via BSD shape intentionally
+            // don't apply to AF_BYPASS / AF_XDP.
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
     }
@@ -6110,10 +6167,14 @@ impl SocketFile {
                 SocketState::Bypass { state } => state.clone(),
                 _ => return SocketOpResult::Err(SockError::NoProtoOpt),
             };
+            let owner = self
+                .self_weak
+                .upgrade()
+                .map(|s| s as Arc<dyn narf_filesystem::FileOps>);
             let result = match name {
                 crate::xdp_socket::XDP_UMEM_REG => crate::xdp_socket::parse_xdp_umem_reg(value)
                     .ok_or(crate::xdp_socket::XdpOpError::InvalidArg)
-                    .and_then(|r| crate::xdp_socket::handle_umem_reg(&state, &r)),
+                    .and_then(|r| crate::xdp_socket::handle_umem_reg_with_owner(&state, &r, owner)),
                 crate::xdp_socket::XDP_RX_RING
                 | crate::xdp_socket::XDP_TX_RING
                 | crate::xdp_socket::XDP_UMEM_FILL_RING
@@ -6122,10 +6183,13 @@ impl SocketFile {
                         return SocketOpResult::Err(SockError::InvalidArg);
                     }
                     let entries = u32::from_ne_bytes(value.try_into().unwrap());
-                    if entries != 64 {
-                        return SocketOpResult::Err(SockError::NotSupported);
+                    if entries == 0
+                        || entries > narf_net::bypass::xdp::XDP_RING_N as u32
+                        || !entries.is_power_of_two()
+                    {
+                        return SocketOpResult::Err(SockError::InvalidArg);
                     }
-                    crate::xdp_socket::handle_ring_setup(&state, entries)
+                    crate::xdp_socket::handle_ring_setup_named(&state, name, entries)
                 }
                 _ => return SocketOpResult::Err(SockError::NoProtoOpt),
             };
@@ -6763,15 +6827,31 @@ impl SocketFile {
                 SocketState::Bypass { state } => state.clone(),
                 _ => return SocketOpResult::Err(SockError::NoProtoOpt),
             };
-            if name == crate::xdp_socket::XDP_OPTIONS {
-                let native =
-                    state.bound.load(Ordering::Acquire) && state.claim_seq.lock().is_none();
-                let bytes = u32::from(native).to_ne_bytes();
-                let n = buf.len().min(4);
-                buf[..n].copy_from_slice(&bytes[..n]);
-                return SocketOpResult::OptValue { n };
+            match name {
+                crate::xdp_socket::XDP_MMAP_OFFSETS => {
+                    return match crate::xdp_socket::write_mmap_offsets(&state, buf) {
+                        Ok(n) => SocketOpResult::OptValue { n },
+                        Err(_) => SocketOpResult::Err(SockError::InvalidArg),
+                    };
+                }
+                crate::xdp_socket::XDP_STATISTICS => {
+                    return match crate::xdp_socket::write_statistics(&state, buf) {
+                        Ok(n) => SocketOpResult::OptValue { n },
+                        Err(_) => SocketOpResult::Err(SockError::InvalidArg),
+                    };
+                }
+                crate::xdp_socket::XDP_OPTIONS => {
+                    if buf.len() < 4 {
+                        return SocketOpResult::Err(SockError::InvalidArg);
+                    }
+                    let native =
+                        state.bound.load(Ordering::Acquire) && state.claim_seq.lock().is_none();
+                    let bytes = u32::from(native).to_ne_bytes();
+                    buf[..4].copy_from_slice(&bytes);
+                    return SocketOpResult::OptValue { n: 4 };
+                }
+                _ => return SocketOpResult::Err(SockError::NotSupported),
             }
-            return SocketOpResult::Err(SockError::NotSupported);
         }
         // Linux `sk_getsockopt` / `do_tcp_getsockopt` / `ip_getsockopt` clamp
         // `len = min(len, sizeof(int))` and copy that many bytes rather than
@@ -9818,6 +9898,13 @@ impl Drop for SocketFile {
         }
         if let SocketState::Packet { sock } = &*self.state.lock() {
             sock.release();
+        }
+        let bypass_state = match &*self.state.lock() {
+            SocketState::Bypass { state } => Some(state.clone()),
+            _ => None,
+        };
+        if let Some(state) = bypass_state {
+            crate::xdp_socket::close(&state);
         }
         // An explicit close(2) calls `unregister`, which closes an
         // InetWired TCB. Process exit instead releases the fd table directly,

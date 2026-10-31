@@ -37,9 +37,13 @@ error-queue readiness and Linux cmsg layouts.
 Dynamic CLOCKFD ids resolve the open file's `hardware_clock` interface for
 clock_gettime/getres/settime/adjtime. Writes require a writable description and
 `CAP_SYS_TIME`; offsets/times/frequency modes are validated and copied through
-guarded user access. The PHC is independent of system time. AF_BYPASS exposes
-UMEM/ring setup through SOL_XDP and direct queue binding through flag 4, with
-network administration permission for hardware binding and truthful XDP_OPTIONS.
+guarded user access. The PHC is independent of system time. `SO_TXTIME` and
+`SCM_TXTIME` propagate hardware launch times (and `SO_PRIORITY` queue selection)
+onto outbound `AF_PACKET` frames. `AF_XDP` (44) and `AF_BYPASS` (45) expose
+UMEM/ring setup through `SOL_XDP` (including user-page `XDP_UMEM_REG`,
+`XDP_MMAP_OFFSETS`, `XDP_STATISTICS`, and `mmap` of RX/TX/FILL/COMPLETION rings)
+and direct queue binding through `XDP_ZEROCOPY` (flag 4), with network
+administration permission for hardware binding and truthful `XDP_OPTIONS`.
 
 
 Blocking poll/ppoll and select/pselect distinguish providers with a durable

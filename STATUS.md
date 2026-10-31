@@ -13,8 +13,11 @@ the `.ko` copy datapath are integrated. The control/data protocols use
 `~/git/linux` at `ecd997b0189a` as their reference.
 
 Native scheduling/MAC Merge controls and NARF's capability-based UMEM rings
-are the supported interfaces; Linux `tc`/MAC Merge netlink and arbitrary
-user-page AF_XDP mmap rings are outside this profile. Module instances use
+are paired with Linux `NETLINK_ROUTE` `tc` qdisc configuration (`taprio`,
+`cbs`, `etf`), `SO_TXTIME`/`SCM_TXTIME` hardware launch-time ancillary
+messages, `NETLINK_GENERIC` `ethtool` MAC Merge (`ETHTOOL_MSG_MM_GET`/`SET`),
+and `AF_XDP` user-page `XDP_UMEM_REG` + `mmap` ring support (`XDP_PGOFF_*`,
+`XDP_MMAP_OFFSETS`, `XDP_STATISTICS`). Module instances use
 the copy-mode device C ABI. Physical acceptance on this host's I225-V
 (`8086:15f3`, rev 01) remains open; see the
 [driver contract](drivers/net/specification/spec.md#3-public-interface).

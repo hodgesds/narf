@@ -21,7 +21,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Invoke};
 use narf_io::DmaBuffer;
@@ -103,6 +103,11 @@ pub struct Umem {
     /// [`UmemError::Revoked`] without going to the object table.
     revoked: AtomicBool,
     leased: Vec<AtomicU8>,
+    /// Optional kernel-space mirror address when `XDP_UMEM_REG` is called
+    /// with a non-VMA buffer (e.g. in-kernel test arenas). User-space VMAs
+    /// are remapped directly to `desc.base_phys` so they share physical RAM
+    /// without mirroring.
+    kernel_mirror_addr: AtomicU64,
 }
 
 impl core::fmt::Debug for Umem {
@@ -153,7 +158,90 @@ impl Umem {
             cap,
             revoked: AtomicBool::new(false),
             leased: (0..nb_frames).map(|_| AtomicU8::new(0)).collect(),
+            kernel_mirror_addr: AtomicU64::new(0),
         }))
+    }
+
+    /// Record a kernel-virtual mirror buffer to synchronize on TX/RX ring
+    /// transitions when the caller's `XDP_UMEM_REG` buffer is not backed by
+    /// a user VMA remapped to `base_phys`.
+    #[inline]
+    pub fn set_kernel_mirror_addr(&self, addr: u64) {
+        self.kernel_mirror_addr.store(addr, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn kernel_mirror_addr(&self) -> u64 {
+        self.kernel_mirror_addr.load(Ordering::Acquire)
+    }
+
+    /// Write `data` into frame `frame_idx` starting at `offset` when no DMA
+    /// lease is active on that frame.
+    pub fn write_frame_bytes(&self, frame_idx: u32, offset: usize, data: &[u8]) -> Option<()> {
+        self.check()?;
+        let state = self.leased.get(frame_idx as usize)?;
+        let end = offset.checked_add(data.len())?;
+        if end > self.desc.frame_size as usize {
+            return None;
+        }
+        state
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        let dst = self.desc.base_virt
+            + u64::from(frame_idx) * u64::from(self.desc.frame_size)
+            + offset as u64;
+        // SAFETY: `leased` state 2 grants exclusive CPU access to this frame
+        // and `end <= frame_size` bounds the write within `self.buf`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, data.len());
+        }
+        state.store(0, Ordering::Release);
+        Some(())
+    }
+
+    /// Copy `len` bytes at `offset` within `frame_idx` from the optional
+    /// kernel mirror buffer into the coherent DMA buffer before transmission.
+    pub fn sync_from_mirror(&self, frame_idx: u32, offset: usize, len: usize) {
+        let mirror = self.kernel_mirror_addr.load(Ordering::Acquire);
+        if mirror == 0 || !self.frame_in_bounds(frame_idx) {
+            return;
+        }
+        let Some(end) = offset.checked_add(len) else {
+            return;
+        };
+        if end > self.desc.frame_size as usize {
+            return;
+        }
+        let byte_off = u64::from(frame_idx) * u64::from(self.desc.frame_size) + offset as u64;
+        // SAFETY: `mirror` is a validated kernel buffer of at least `desc.size`
+        // bytes and `byte_off + len <= desc.size`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (mirror + byte_off) as *const u8,
+                (self.desc.base_virt + byte_off) as *mut u8,
+                len,
+            );
+        }
+    }
+
+    /// Copy `len` bytes of `frame_idx` from the coherent DMA buffer to the
+    /// optional kernel mirror buffer upon RX completion.
+    pub fn sync_to_mirror(&self, frame_idx: u32, len: u32) {
+        let mirror = self.kernel_mirror_addr.load(Ordering::Acquire);
+        if mirror == 0 || !self.frame_in_bounds(frame_idx) {
+            return;
+        }
+        let copy_len = len.min(self.desc.frame_size) as usize;
+        let byte_off = u64::from(frame_idx) * u64::from(self.desc.frame_size);
+        // SAFETY: `mirror` is a validated kernel buffer of at least `desc.size`
+        // bytes and `byte_off + copy_len <= desc.size`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (self.desc.base_virt + byte_off) as *const u8,
+                (mirror + byte_off) as *mut u8,
+                copy_len,
+            );
+        }
     }
 
     /// Region descriptor — geometry the userspace daemon needs to
