@@ -12,6 +12,8 @@ use core::{
 use narf_wireless::ap_control::RadioControlAuthority;
 #[path = "boot_p2p_management.rs"]
 pub(crate) mod management;
+#[path = "boot_p2p_management_tx.rs"]
+pub(crate) mod management_tx;
 
 pub(crate) enum Request {
     Start,

@@ -10,6 +10,7 @@ use narf_wireless::ap_control::RadioControlAuthority;
 pub(super) struct Management {
     pub filters: Option<Shared>,
     pub capture: Option<Spec>,
+    pub tx: Option<super::p2p_management_tx::Emission>,
 }
 impl<B: Backend> Session<B> {
     pub(super) fn bind_p2p_management(

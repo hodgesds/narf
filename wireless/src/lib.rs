@@ -908,6 +908,19 @@ pub trait WirelessNetIface: Interface {
     fn async_p2p_management_rx_control(&self) -> bool {
         false
     }
+    /// Source-bound native FRAME on a control-only WDEV. Native started
+    /// BSS, channel, transmit policy and actual ACK proof remain driver-owned.
+    fn async_p2p_management_tx_control(&self) -> bool {
+        false
+    }
+    async fn mgmt_tx_radio_async(
+        &self,
+        _authority: &ap_control::RadioControlAuthority,
+        _cookie: u64,
+        _request: MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
     async fn register_mgmt_frame_radio_async(
         &self,
         _authority: &ap_control::RadioControlAuthority,

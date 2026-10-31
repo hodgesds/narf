@@ -18,6 +18,8 @@ type NativeSession = alloc::boxed::Box<Session<Model>>;
 mod ap_runtime_tests;
 #[path = "p2p_native_tests.rs"]
 mod p2p;
+#[path = "p2p_management_model.rs"]
+mod p2p_management_model;
 
 #[path = "active_scan_tests.rs"]
 mod active_scan_tests;
@@ -219,6 +221,7 @@ struct Model {
     receive_open: bool,
     captured_packets: VecDeque<CapturedData>,
     p2p_capture: super::p2p_management_capture::Queue,
+    p2p_tx: Option<Arc<p2p_management_model::Observer>>,
     ticks: Cell<u64>,
     tick_step_ns: u64,
     management_stall_after: Option<usize>,
@@ -356,6 +359,7 @@ impl Model {
             receive_open: false,
             captured_packets: VecDeque::new(),
             p2p_capture: super::p2p_management_capture::Queue::new(),
+            p2p_tx: None,
             ticks: Cell::new(0),
             tick_step_ns: 1_000_000,
             management_stall_after: None,
@@ -1314,6 +1318,62 @@ impl Backend for Model {
         }
         self.sequence.take_ap_ack()
     }
+    fn arm_p2p_management(
+        &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
+        tid: u8,
+    ) -> Result<(), Error> {
+        self.check()?;
+        self.sequence.arm_p2p_management(vif, tid)
+    }
+    fn submit_p2p_management(
+        &mut self,
+        frame: &[u8],
+        vif: crate::mt7921::vif_slots::Vif,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error> {
+        self.check()?;
+        let local = frame
+            .get(10..16)
+            .ok_or(Error::Bounds)?
+            .try_into()
+            .map_err(|_| Error::Bounds)?;
+        let shape = super::p2p_management_tx_wire::Header::prepare(frame, local)?;
+        let mut header = super::p2p_management_tx_wire::descriptor(
+            frame,
+            0x1000,
+            1,
+            vif,
+            rate,
+            shape.multicast,
+        )?;
+        if let Some(pid) = if shape.multicast {
+            None
+        } else {
+            self.sequence.pid(shape.tid)?
+        } {
+            crate::mt7921::tx_sequence::request(&mut header, pid)?;
+            self.sequence.begin(shape.tid, 1)?;
+        }
+        if let Some(observer) = &self.p2p_tx {
+            observer.published.lock().push((header, frame.to_vec()));
+        }
+        self.data_headers.push(header);
+        self.frames.push((false, frame.to_vec()));
+        Ok(())
+    }
+    fn poll_p2p_management_ack(&mut self) -> Result<Option<bool>, Error> {
+        self.check()?;
+        if let Some(observer) = &self.p2p_tx {
+            for _ in 0..8 {
+                let Some(report) = observer.reports.lock().pop_front() else {
+                    break;
+                };
+                self.sequence.receive(&report)?;
+            }
+        }
+        self.sequence.take_ap_ack()
+    }
     fn arm_transmit_sequence(&mut self, tid: u8) -> Result<(), Error> {
         self.check()?;
         self.sequence.arm(tid)
@@ -1381,6 +1441,11 @@ impl Backend for Model {
         &mut self,
     ) -> Result<Option<crate::mt7921::packet_tx::Completion>, Error> {
         self.check()?;
+        if self.p2p_tx.as_ref().is_some_and(|observer| {
+            !observer.published.lock().is_empty() && !observer.terminal.load(Ordering::Acquire)
+        }) {
+            return Ok(None);
+        }
         if let Some(hold) = &self.packet_hold {
             hold.seen.store(true, Ordering::Release);
             if !hold.release.load(Ordering::Acquire) {

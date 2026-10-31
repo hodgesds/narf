@@ -409,7 +409,7 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
-    fn p2p_home_permission(
+    pub(in crate::mt7921::firmware_transport) fn p2p_home_permission(
         &self,
     ) -> Result<Option<crate::mt7921::association::TxPermission>, Error> {
         let permission = match self.state {
@@ -433,7 +433,9 @@ impl<B: Backend> Session<B> {
         }
         self.quiesce_p2p_packets().await
     }
-    async fn quiesce_p2p_packets(&mut self) -> Result<(), Error> {
+    pub(in crate::mt7921::firmware_transport) async fn quiesce_p2p_packets(
+        &mut self,
+    ) -> Result<(), Error> {
         let began = self.backend.now_ns();
         core::future::poll_fn(|cx| {
             if let Err(error) = self.poll_data_tx() {

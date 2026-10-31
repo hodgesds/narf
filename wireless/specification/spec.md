@@ -769,6 +769,17 @@ decoding. Typed `RadioEventAuthority::management_received` delivers only those
 actual raw bytes and observations to the original source; it grants no peer
 authentication, data interface or management-TX authority.
 
+`async_p2p_management_tx_control` separately opts a control-only WDEV into
+`FRAME` and `mgmt_tx_radio_async`. It uses the same exact delegated source,
+namespace/mode identity and retained Radio reservation as other native
+control requests. The driver must prove its actual started BSS, channel/RF
+owner, current transmit-power policy and terminal packet/ACK result. Cookie
+reply and `FRAME_TX_STATUS` follow that callback; status is MLME multicast
+group19 with actual WIPHY/WDEV/frame/cookie and an ACK flag only for a true
+native acknowledgement. A control WDEV adds no IFINDEX or synthetic UP bit.
+Queued work, elapsed time and token release alone are not ACK observations.
+Existing netdev SME/AP dispatch and default unsupported behavior remain.
+
 `async_control_interfaces` independently opts into control-only
 `new_control_interface_async` / `delete_control_interface_async`. NEW names the
 real physical wiphy and returns an actual registered P2P-device WDEV, without

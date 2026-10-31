@@ -1006,6 +1006,14 @@ RX admission retain negotiated bounds; unavailable wide spans keep a genuine
 80 MHz offer. Six native cases await execution; the combined parent release
 Clippy check passes. The family §3.62 documents the interface.
 
+MT76's control WDEV can transmit unkeyed management frames on its actual
+current finite 2/5 GHz ROC. Fresh occupied-power bounds, native OMAC/BMC and
+PID/TXS plus DMA/TX_FREE receipts determine transmission and ACK status;
+MLME multicast status retains the original WDEV/source/cookie. Home packet,
+key and capture owners remain separate. Four native MT cases and two shared
+control cases await execution; implicit ROC and client/GO contexts remain
+open. Combined parent release Clippy passes; the family §3 records this scope.
+
 ## 4. Interaction with `narf-wireless`
 
 - **Registration**: Drivers register via `bus::register_wireless_driver(MatchEntry { ... })`.

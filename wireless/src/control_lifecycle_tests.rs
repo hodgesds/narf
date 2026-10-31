@@ -153,6 +153,8 @@ pub(in crate::ap_control::tests) async fn create(
         successor: IrqSafeSpinLock::new(None),
         post_retirement_hold: AtomicBool::new(false),
         post_retirement_seen: AtomicBool::new(false),
+        management_tx_ack: AtomicBool::new(true),
+        management_tx: IrqSafeSpinLock::new(None),
     });
     child.inner.mode.store(10, Ordering::Release);
     let cap = narf_net::registry()

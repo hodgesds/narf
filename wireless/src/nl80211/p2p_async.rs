@@ -15,6 +15,10 @@ pub(super) enum Operation {
     },
     Cancel(u64),
     RegisterFrame(u16, Vec<u8>),
+    Frame {
+        cookie: u64,
+        request: crate::MgmtTxRequest,
+    },
 }
 /// Only these explicitly opted-in control-only operations may consult a
 /// fresh child grant retained on the actual creating socket. Legacy callers
@@ -71,6 +75,53 @@ pub(super) fn register_frame(
         None,
         slot,
         Operation::RegisterFrame(frame_type, prefix),
+    )
+}
+
+pub(super) fn frame(
+    bytes: &[u8],
+    context: RequestContext<'_>,
+    slot: Option<&DeferredRequest>,
+) -> Result<Vec<GenlReply>, i32> {
+    let attrs = attributes(bytes)?;
+    reject_unknown(&attrs, &[153, 38, 51, 87, 108])?;
+    let (iface, index) = interface(&attrs, context.net_ns_id)?;
+    if index.is_some() || iface.current_iftype() != 10 || !iface.async_p2p_management_tx_control() {
+        return Err(EOPNOTSUPP);
+    }
+    let admin = source_authority(&context, iface.as_ref(), slot)?;
+    let sent = attr(&attrs, 51).ok_or(EINVAL)?;
+    if !(24..=4096).contains(&sent.len()) || sent[0] & 15 != 0 {
+        return Err(EINVAL);
+    }
+    let frequency = u32_attr(&attrs, 38)?;
+    if let Some(frequency) = frequency {
+        channel(frequency)?;
+    }
+    let offchannel_ok = attr(&attrs, 108).is_some();
+    if offchannel_ok && !iface.supports_offchannel_mgmt_tx() {
+        return Err(EOPNOTSUPP);
+    }
+    let request = crate::MgmtTxRequest {
+        frequency_mhz: frequency.unwrap_or(0),
+        frame: sent.to_vec(),
+        offchannel_ok,
+        duration: u32_attr(&attrs, 87)?.unwrap_or(0),
+    };
+    let cookie = FRAME_COOKIE
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |value| (value != 0).then(|| value.checked_add(1)).flatten(),
+        )
+        .map_err(|_| EBUSY)?;
+    defer(
+        iface,
+        admin,
+        context.net_ns_id,
+        None,
+        slot,
+        Operation::Frame { cookie, request },
     )
 }
 
@@ -186,6 +237,44 @@ pub(super) fn defer(
                         iface
                             .register_mgmt_frame_radio_async(&call, frame_type, &prefix)
                             .await
+                    }
+                    Operation::Frame { cookie, request } => {
+                        let sent = request.frame.clone();
+                        let acked = iface
+                            .mgmt_tx_radio_async(&call, cookie, request)
+                            .await
+                            .map_err(errno)?;
+                        call.check_for(iface.as_ref()).map_err(errno)?;
+                        let wdev = crate::registry::control_for(iface.as_ref()).ok_or(ENODEV)?;
+                        let wiphy = crate::registry::wiphy_index(iface.wiphy_id()).ok_or(ENODEV)?;
+                        let mut attrs = Vec::new();
+                        push_attr(&mut attrs, 1, &wiphy.to_ne_bytes());
+                        push_attr(&mut attrs, 153, &wdev.id().to_ne_bytes());
+                        push_attr(&mut attrs, 51, &sent);
+                        push_attr(&mut attrs, 88, &cookie.to_ne_bytes());
+                        if acked {
+                            push_attr(&mut attrs, 92, &[]);
+                        }
+                        // Native ACK and packet retirement are already complete.
+                        // Linux's status is MLME multicast, with WDEV and no
+                        // fabricated IFINDEX for this control-only interface.
+                        publish_event(
+                            NL80211_FAMILY_ID,
+                            19,
+                            namespace,
+                            GenlReply {
+                                command: FRAME_TX_STATUS,
+                                attrs,
+                            },
+                        );
+                        call.require_link().map_err(errno)?;
+                        let mut attrs = Vec::new();
+                        push_attr(&mut attrs, 88, &cookie.to_ne_bytes());
+                        replies.push(GenlReply {
+                            command: FRAME,
+                            attrs,
+                        });
+                        Ok(())
                     }
                     Operation::Roc {
                         cookie,

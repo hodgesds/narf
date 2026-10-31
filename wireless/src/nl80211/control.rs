@@ -2964,6 +2964,9 @@ fn mlme_handle(
     if command == REGISTER_FRAME && attr(&attrs, 153).is_some() {
         return p2p_async::register_frame(bytes, context, deferred);
     }
+    if command == FRAME && attr(&attrs, 153).is_some() {
+        return p2p_async::frame(bytes, context, deferred);
+    }
     let index = u32_attr(&attrs, 3)?.ok_or(EINVAL)?;
     let iface = crate::registry::list()
         .into_iter()

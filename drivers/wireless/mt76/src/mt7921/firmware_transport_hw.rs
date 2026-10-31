@@ -1117,6 +1117,51 @@ impl Backend for Hardware {
             .tx_sequence
             .take_ap_ack()
     }
+    fn arm_p2p_management(
+        &mut self,
+        vif: crate::mt7921::vif_slots::Vif,
+        tid: u8,
+    ) -> Result<(), Error> {
+        self.check()?;
+        if !self.owner.published {
+            return Err(Error::Busy);
+        }
+        let storage = self.owner.storage.as_mut().ok_or(Error::Busy)?;
+        if !storage.tokens.is_empty() {
+            return Err(Error::Busy);
+        }
+        storage.tx_sequence.arm_p2p_management(vif, tid)
+    }
+    fn submit_p2p_management(
+        &mut self,
+        frame: &[u8],
+        vif: crate::mt7921::vif_slots::Vif,
+        rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error> {
+        let local = frame
+            .get(10..16)
+            .ok_or(Error::Bounds)?
+            .try_into()
+            .map_err(|_| Error::Bounds)?;
+        let header = super::p2p_management_tx_wire::Header::prepare(frame, local)?;
+        self.submit_80211(
+            frame,
+            (!header.multicast).then_some(header.tid),
+            |payload, token| {
+                super::p2p_management_tx_wire::descriptor(
+                    frame,
+                    payload,
+                    token,
+                    vif,
+                    rate,
+                    header.multicast,
+                )
+            },
+        )
+    }
+    fn poll_p2p_management_ack(&mut self) -> Result<Option<bool>, Error> {
+        self.poll_ap_management_ack()
+    }
     fn submit_data_pipelined(
         &mut self,
         frame: &[u8],
@@ -1216,6 +1261,24 @@ pub struct Transport {
 #[path = "firmware_transport_hw_tests.rs"]
 mod tests;
 impl Transport {
+    pub(crate) async fn transmit_p2p_management(
+        &mut self,
+        iface: alloc::sync::Weak<crate::iface::p2p::P2pDeviceIface>,
+        authority: Arc<narf_wireless::ap_control::RadioControlAuthority>,
+        request: narf_wireless::MgmtTxRequest,
+        alive: Arc<core::sync::atomic::AtomicBool>,
+        expected_mac: [u8; 6],
+    ) -> Result<bool, Error> {
+        super::boot_p2p::management_tx::run_session(
+            &mut self.session,
+            iface,
+            authority,
+            request,
+            alive,
+            expected_mac,
+        )
+        .await
+    }
     pub(crate) fn register_p2p_management(
         &mut self,
         iface: alloc::sync::Weak<crate::iface::p2p::P2pDeviceIface>,

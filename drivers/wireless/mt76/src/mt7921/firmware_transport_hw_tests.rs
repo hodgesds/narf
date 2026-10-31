@@ -2,6 +2,8 @@
 use super::*;
 #[path = "p2p_management_hw_tests.rs"]
 mod p2p_management;
+#[path = "p2p_management_tx_hw_tests.rs"]
+mod p2p_management_tx;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 #[path = "ap_management_hw_tests.rs"]

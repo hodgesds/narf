@@ -22,6 +22,7 @@ pub(crate) struct LegacyRate(u16);
 
 impl LegacyRate {
     pub(crate) const ONE_MBPS: Self = Self(0);
+    pub(crate) const SIX_MBPS: Self = Self(75);
 
     fn lowest(basic: u16) -> Self {
         const HARDWARE: [u16; 12] = [0, 1, 2, 3, 75, 79, 74, 78, 73, 77, 72, 76];

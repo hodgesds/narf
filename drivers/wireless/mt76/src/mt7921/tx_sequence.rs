@@ -45,6 +45,11 @@ impl Owner {
         }
         self.arm_for(0, u16::from(wcid), true)
     }
+    /// Reserve only a report identity on the actual independent VIF/BMC.
+    /// This observation grants no role, channel or transmit authority.
+    pub fn arm_p2p_management(&mut self, vif: super::vif_slots::Vif, tid: u8) -> Result<(), Error> {
+        self.arm_for(tid, u16::from(vif.bmc()), true)
+    }
     fn arm_for(&mut self, tid: u8, wcid: u16, management: bool) -> Result<(), Error> {
         if tid >= 8 {
             return Err(Error::Bounds);
@@ -207,7 +212,8 @@ pub(super) fn request(header: &mut [u8; packet_tx::HEADER], pid: u8) -> Result<(
     if pid < FIRST_PID as u8 {
         return Err(Error::Bounds);
     }
-    header[20..24].copy_from_slice(&((1u32 << 10) | u32::from(pid)).to_le_bytes());
+    let status = u32::from_le_bytes(header[20..24].try_into().unwrap());
+    header[20..24].copy_from_slice(&((status & !0xff) | (1 << 10) | u32::from(pid)).to_le_bytes());
     let word = u32::from_le_bytes(header[28..32].try_into().unwrap()) & !(1 << 10);
     header[28..32].copy_from_slice(&word.to_le_bytes());
     let word = u32::from_le_bytes(header[12..16].try_into().unwrap()) | 1 << 28;

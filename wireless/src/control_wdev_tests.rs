@@ -3,6 +3,7 @@
 use super::*;
 use crate::registry::ControlWdev;
 use narf_capabilities::Write;
+type RecordedManagementTx = (u64, u32, Vec<u8>, bool, u32);
 
 struct ControlRadio {
     inner: Radio,
@@ -14,6 +15,8 @@ struct ControlRadio {
     successor: IrqSafeSpinLock<Option<lifecycle::Successor>>,
     post_retirement_hold: AtomicBool,
     post_retirement_seen: AtomicBool,
+    management_tx_ack: AtomicBool,
+    management_tx: IrqSafeSpinLock<Option<RecordedManagementTx>>,
 }
 impl ControlRadio {
     async fn terminal_callback(
@@ -66,6 +69,28 @@ impl Interface for ControlRadio {
 }
 #[async_trait::async_trait]
 impl WirelessNetIface for ControlRadio {
+    fn async_p2p_management_tx_control(&self) -> bool {
+        true
+    }
+    fn supports_offchannel_mgmt_tx(&self) -> bool {
+        true
+    }
+    async fn mgmt_tx_radio_async(
+        &self,
+        authority: &RadioControlAuthority,
+        cookie: u64,
+        request: crate::MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        self.terminal_callback(authority).await?;
+        *self.management_tx.lock() = Some((
+            cookie,
+            request.frequency_mhz,
+            request.frame,
+            request.offchannel_ok,
+            request.duration,
+        ));
+        Ok(self.management_tx_ack.load(Ordering::Acquire))
+    }
     fn async_p2p_management_rx_control(&self) -> bool {
         true
     }
@@ -257,6 +282,8 @@ fn child_at(
         successor: IrqSafeSpinLock::new(None),
         post_retirement_hold: AtomicBool::new(false),
         post_retirement_seen: AtomicBool::new(false),
+        management_tx_ack: AtomicBool::new(true),
+        management_tx: IrqSafeSpinLock::new(None),
     });
     radio.inner.mode.store(10, Ordering::Release);
     let grant = narf_net::bootstrap_authority();
@@ -553,3 +580,5 @@ mod dispatch;
 pub(super) mod lifecycle;
 #[path = "p2p_management_dispatch_tests.rs"]
 mod management;
+#[path = "p2p_management_tx_dispatch_tests.rs"]
+mod management_tx;

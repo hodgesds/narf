@@ -29,6 +29,12 @@ mod p2p_management;
 mod p2p_management_capture;
 #[path = "p2p_management_filters.rs"]
 pub(crate) mod p2p_management_filters;
+#[path = "p2p_management_power.rs"]
+mod p2p_management_power;
+#[path = "p2p_management_tx.rs"]
+mod p2p_management_tx;
+#[path = "p2p_management_tx_wire.rs"]
+mod p2p_management_tx_wire;
 #[path = "p2p_management_wire.rs"]
 mod p2p_management_wire;
 #[path = "p2p_profile.rs"]
@@ -936,6 +942,7 @@ pub enum Stage {
     P2pDeviceStop,
     P2pRocAcquire,
     P2pRocExpire,
+    P2pManagementTx,
 }
 /// Firmware observations, not an operational WLAN interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1320,6 +1327,24 @@ trait Backend {
         rate: crate::mt7921::association::LegacyRate,
     ) -> Result<(), Error>;
     fn poll_ap_management_ack(&mut self) -> Result<Option<bool>, Error>;
+    fn arm_p2p_management(
+        &mut self,
+        _vif: crate::mt7921::vif_slots::Vif,
+        _tid: u8,
+    ) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn submit_p2p_management(
+        &mut self,
+        _frame: &[u8],
+        _vif: crate::mt7921::vif_slots::Vif,
+        _rate: crate::mt7921::association::LegacyRate,
+    ) -> Result<(), Error> {
+        Err(Error::UnsupportedFirmware)
+    }
+    fn poll_p2p_management_ack(&mut self) -> Result<Option<bool>, Error> {
+        Err(Error::UnsupportedFirmware)
+    }
     fn submit_data_pipelined(
         &mut self,
         frame: &[u8],
@@ -1528,6 +1553,11 @@ impl<B: Backend> Session<B> {
             }
             if matches!(self.state, State::Running(Stage::P2pRocAcquire)) {
                 if let Err(error) = self.check_p2p_roc_pending() {
+                    return Poll::Ready(Err(error));
+                }
+            }
+            if matches!(self.state, State::Running(Stage::P2pManagementTx)) {
+                if let Err(error) = self.check_p2p_management_tx() {
                     return Poll::Ready(Err(error));
                 }
             }

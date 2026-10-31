@@ -6,6 +6,8 @@ use crate::mt7921::association::{Security, TxPermission};
 use narf_wifi_fixtures::FakeAp;
 #[path = "p2p_management_tests.rs"]
 mod management;
+#[path = "p2p_management_tx_tests.rs"]
+mod management_tx;
 
 fn active_policy() -> narf_wireless::reg::RegulatoryDomain {
     use narf_wireless::reg::{RegFlags, RegRule, RegulatoryDomain};

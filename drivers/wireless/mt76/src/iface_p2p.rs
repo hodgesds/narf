@@ -432,6 +432,37 @@ impl Interface for Registered {
 }
 #[async_trait]
 impl WirelessNetIface for P2pDeviceIface {
+    fn async_p2p_management_tx_control(&self) -> bool {
+        self.cnm
+    }
+    fn supports_offchannel_mgmt_tx(&self) -> bool {
+        self.cnm
+    }
+    async fn mgmt_tx_radio_async(
+        &self,
+        authority: &RadioControlAuthority,
+        _cookie: u64,
+        request: narf_wireless::MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        let parent = self.current()?;
+        let _control = parent.control.lock().await;
+        self.request_current(authority)?;
+        if !self.cnm || !self.started_current() {
+            return Err(WirelessError::NotSupported);
+        }
+        crate::mt7921::firmware_transport::boot_p2p::management_tx::transmit(
+            self.weak()?,
+            Arc::new(authority.clone()),
+            request,
+        )
+        .await
+        .map_err(|error| match error {
+            crate::mt7921::firmware_transport::Error::UnsupportedFirmware => {
+                WirelessError::NotSupported
+            }
+            other => map_error(other),
+        })
+    }
     fn async_p2p_management_rx_control(&self) -> bool {
         true
     }
