@@ -277,15 +277,28 @@ publication retirement are accepted partial scopes; associated MLD PNO,
 associated RTL scanning and MT P2P management/roles retain separate gates.
 Physical qualification remains separate from these software results.
 
+**Recount 2026-10-31** (accepted associated scans and management RX):
+the ledger holds **109 `feature`** rows (108 driver, 1 shared), **31 `chip`**
+and **0 `unknown`**. Exact checkpoint `a7797583a` passes **4,349/0/13** on
+x86_64 (five disjoint QEMU boots) and **3,990/0/7** on aarch64. Named-case
+comparison retains every case from `0eb084197` and adds exactly 23, including
+all 531 Intel cases, eight RTL associated-passive cases, one shared sequence
+case, five MT management-RX cases and two shared dispatcher cases. Resolved
+release CI, formatting, ordinary boots and both btrfs postflights pass on both
+architectures. Intel scheduled scanning and RTL Null/QoS Null close. The
+`expanded_active_scanning` row remains open for associated active scanning:
+the previous acceptance covered idle operation. MT management TX and client/GO
+contexts also remain open. Physical qualification remains separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 9 | Wider bands/widths and EHT/MLO; AP/P2P/WoW and scheduled-scan continuations; exact admitted station/HE/TX A-MSDU profiles are software-validated |
+| iwlwifi | 8 | Wider bands/widths and EHT/MLO; AP/P2P/WoW; exact admitted station/HE/TX A-MSDU and idle/associated periodic-scan profiles are software-validated |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 5 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA and loadable packet ABI |
 | ath10k | 18 | 2.4-GHz HT40/coexistence, additional streams/TX STBC and VHT160/80+80, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload |
 | ath9k | 9 | Channel/retune and HT40/SGI40 profiles, factory selection, periodic calibration, larger TX aggregates and idle/station sleep; other chips are separate rows |
 | rtlwifi | 8 | Other matched chips, HT40/VHT, antenna/gain/coexistence and RTS/CTS |
-| rtl8xxxu | 5 | HT40, associated scanning and QoS Null, Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
+| rtl8xxxu | 5 | HT40, associated active scanning, Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
 | rtw89 | 13 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW, periodic RF tracking/runtime LPS and multiple functions; other AX/BE chips are separate rows |
 | brcmfmac | 12 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
@@ -962,21 +975,21 @@ Sc/Bz MLD periodic scanning can retain the authorized serving station while
 its exact delegated requester owns the scan. Native link0 timing, current
 correlated MCC facts and unchanged home bounds fence data/key maintenance;
 healthy exact-UID termination restores home ownership. API89 MVM remains
-idle-only. Family §3.61 records seven new native cases pending execution.
+idle-only. Family §3.61 records software acceptance at `a7797583a`.
 
 RTL8188EU associated passive scanning retains the same station, software
 keys/replay/BA and host rings through qualified cold channel visits. Private
 plaintext Null/QoS Null uses the peer's actual profile and shared sequence
 ownership; native USB/device terminals remain distinct from AP reception.
-Eight composed driver cases and one shared sequence/CCMP case await native
-release acceptance in the family §3.
+Eight composed driver cases and one shared sequence/CCMP case pass native
+release gates at `a7797583a` in the family §3. Associated active scans remain open.
 
 MT76's control-only P2P WDEV accepts source-bound REGISTER_FRAME before
 START as host subscription metadata. Native management RX additionally
 requires its actual started independent BSS, current finite ROC and a new
 capture epoch after the completed native RX-prefix cut. Home data owners
-remain separate. Five native MT cases and two shared dispatcher cases await
-execution; management TX and client/GO data contexts remain open.
+remain separate. Five native MT cases and two shared dispatcher cases pass
+at `a7797583a`; management TX and client/GO data contexts remain open.
 
 ## 4. Interaction with `narf-wireless`
 

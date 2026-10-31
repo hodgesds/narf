@@ -2201,13 +2201,12 @@ describe the remaining native paths.
 
 **Shared contracts, external inputs and scope corrections.**
 
-- **sched_scan_offload.** §§3.53/3.55 implement idle Sc and Gen2 API77
-  native periodic profiles, retained emission/stop ownership and current-source
-  results. Exact API89 Ty/So/Ma UMAC17 and Bz core103 idle profiles and forced
-  publication retirement pass at `0eb084197` within all524 Intel cases on
-  both architectures (§§3.59/3.60).
-  Associated Sc/Bz MLD coexistence is wired in §3.61 with its own native
-  acceptance pending. Linux MVM refuses non-idle PNO.
+- **sched_scan_offload (closed).** Idle Sc, Gen2 API77, exact API89
+  Ty/So/Ma and Bz core103 periodic profiles, plus associated Sc/Bz MLD
+  coexistence, are software-validated at `a7797583a` within all 531 Intel
+  native cases on both architectures. Retained requester/UID ownership,
+  current MCC facts, home key/data progress and copied-publication retirement
+  are covered in §§3.53–3.61. Linux MVM remains idle-only.
 - **persistent_key_history** is inapplicable (§3.30): Linux and the shared
   NARF contract establish a fresh authenticated RSNA after reboot and
   retain replay/history state for the active owner lifetime. The existing
@@ -3316,8 +3315,8 @@ probe source bits. All five and all496 Intel cases passed on x86_64 and
 aarch64 at `fbe407764`; the accepted505-case checkpoint and release gates
 are recorded in §3.52. This first continuation covers idle Sc station mode.
 Gen2 API77 idle scheduled scans are §3.55. Exact API89/Bz profile-specific
-idle regression cases are §3.59; associated MLD coexistence is wired in
-§3.61 with native acceptance pending. Linux MVM explicitly refuses non-idle
+idle regression cases are §3.59; associated MLD coexistence has software
+acceptance at `a7797583a` in §3.61. Linux MVM explicitly refuses non-idle
 scheduled scans, so an associated Gen2
 PNO owner is not an additional reference requirement. Physical RF acceptance
 remains separate from native QEMU software fixtures.
@@ -3436,10 +3435,9 @@ status handling, observation expiry and MCC loss during held profile or
 SCAN_REQ receipts, plus the copied-publication ordering in §3.56.
 All seven cases and the shared literal passed on both architectures within
 the accepted505-case checkpoint recorded in §3.52. This completes the
-intended API77 idle software scope; associated MLD coexistence, API89
-periodic-profile native validation and other exact-profile enablement remain
-separate work. Physical RF
-acceptance remains separate from native QEMU software evidence.
+intended API77 idle software scope. Exact API89/Bz idle profiles and
+associated MLD coexistence have later software acceptance in §§3.59–3.61.
+Physical RF acceptance remains separate from native QEMU software evidence.
 
 ### 3.56 Periodic-result publication and native retirement ordering
 
@@ -3570,8 +3568,8 @@ execution over owned RAM RFH/TFH. All eight cases and the full521 Intel
 scope pass on both architectures at `62b62ea68`, with the release gates
 recorded in §3.57. These cases grant no physical RF or silicon acceptance.
 EHT/320MHz, band-qualified6GHz and MLO remain separate continuations;
-associated periodic-scan coexistence is wired with native acceptance
-pending in §3.61.
+associated periodic-scan coexistence has software acceptance at
+`a7797583a` in §3.61.
 
 ### 3.59 Profile-specific idle periodic-scan regression scope
 
@@ -3591,7 +3589,7 @@ Intel cases and full integration results of4326/0/13 on x86_64 and3967/0/7
 on aarch64. Resolved release CI, formatting, ordinary boots and both btrfs
 postflights also pass. No production periodic runtime changes are included.
 Linux MVM's API89 path remains idle-only; associated MLD periodic coexistence
-retains its separate native acceptance requirement.
+has later software acceptance in §3.61.
 
 ### 3.60 Forced transport retirement of periodic publications
 
@@ -3667,11 +3665,14 @@ abort/rekey failure plus API89 idle-only refusal, and a64-packet fairness
 prefix with the native UID terminal behind it. A separate policy fixture
 checks sticky current-MCC retirement and fixed original bounds. All seven
 new cases, including actual current native key-material witnesses and the
-repair-admission/passive-deauthentication refinement, pass coordinated
-parent release Clippy (`/tmp/wifi-associated-pno-release-clippy-x86-r6.log`,
-2026-10-31). All seven native executions remain pending; the accepted524
-Intel scope in §§3.59/3.60 remains separate. Firmware execution and RF
-continue to be fixture supplied.
+repair-admission/passive-deauthentication refinement, pass on both
+architectures at `a7797583a`, within all 531 Intel cases. The integration
+selection passes 4,349/0/13 on x86_64 (five disjoint QEMU boots) and
+3,990/0/7 on aarch64; the named-case inventory retains every prior case and
+adds exactly 23 across the combined driver batch. Resolved release CI,
+formatting, ordinary boots and both btrfs postflights pass on each architecture.
+Firmware execution and RF remain fixture supplied; physical qualification is
+separate from these software results.
 
 ## 4. References
 
