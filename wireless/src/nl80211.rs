@@ -2,6 +2,8 @@
 
 mod control;
 
+pub(crate) use control::scheduled_results;
+
 #[cfg(any(test, feature = "kernel-test"))]
 pub use control::connect_for_test;
 
@@ -637,18 +639,33 @@ fn find_attr(attrs: &[u8], requested_kind: u16) -> Option<&[u8]> {
 }
 
 fn interface_attrs(wiphy: u32, iface: &dyn crate::WirelessNetIface, iftype: u32) -> Vec<u8> {
+    let control = if iface.control_namespace().is_some() {
+        match crate::registry::control_for(iface).filter(|entry| entry.current_for(iface)) {
+            Some(entry) => Some(entry),
+            None => return Vec::new(),
+        }
+    } else {
+        None
+    };
     let info = iface.get_wireless_info();
     let mut attrs = Vec::new();
     push_attr(&mut attrs, NL80211_ATTR_WIPHY, &wiphy.to_ne_bytes());
     let ifindex = narf_net::netlink_route::ifindex_for_name(&info.base_name).unwrap_or(0);
-    push_attr(&mut attrs, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    if control.is_none() {
+        push_attr(&mut attrs, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    }
     named_attr(&mut attrs, NL80211_ATTR_IFNAME, &info.base_name);
     push_attr(&mut attrs, NL80211_ATTR_IFTYPE, &iftype.to_ne_bytes());
     // nl80211_send_iface: NL80211_ATTR_WDEV = wdev_id(wdev) (u64).
     push_attr(
         &mut attrs,
         NL80211_ATTR_WDEV,
-        &control::station::wdev_id(wiphy, ifindex).to_ne_bytes(),
+        &control
+            .map_or_else(
+                || control::station::wdev_id(wiphy, ifindex),
+                |entry| entry.id(),
+            )
+            .to_ne_bytes(),
     );
     push_attr(&mut attrs, NL80211_ATTR_MAC, &info.base_mac);
     // `nl80211_send_iface` emits this unconditionally, including for
@@ -1261,10 +1278,24 @@ fn handle(command: u8, attrs: &[u8], dump: bool) -> Result<Vec<GenlReply>, i32> 
 }
 
 fn in_namespace(iface: &dyn crate::WirelessNetIface, namespace: u64) -> bool {
+    if let Some(actual) = iface.control_namespace() {
+        return actual == namespace
+            && crate::registry::control_for(iface).is_some_and(|entry| entry.current_for(iface));
+    }
     narf_net::iface::lookup(iface.name())
         .map(|i| i.net_ns_id)
         .unwrap_or(0)
         == namespace
+}
+fn interface_wdev(iface: &dyn crate::WirelessNetIface) -> Option<u64> {
+    if iface.control_namespace().is_some() {
+        return crate::registry::control_for(iface)
+            .filter(|entry| entry.current_for(iface))
+            .map(|entry| entry.id());
+    }
+    let wiphy = crate::registry::wiphy_index(iface.wiphy_id())?;
+    let ifindex = narf_net::netlink_route::ifindex_for_name(iface.name()).unwrap_or(0);
+    Some(control::station::wdev_id(wiphy, ifindex))
 }
 
 /// Resolve a registered netdev to the index of its physical wiphy.  Virtual
@@ -1283,9 +1314,10 @@ fn u32_of(raw: &[u8]) -> Result<u32, i32> {
 /// `nl80211_pre_doit` for `NL80211_FLAG_NEED_WIPHY`
 /// (`__cfg80211_rdev_from_attrs`): the wiphy named by `NL80211_ATTR_WIPHY`,
 /// `NL80211_ATTR_WDEV` or the netdev `NL80211_ATTR_IFINDEX` — wpa_supplicant
-/// asks by ifindex.  WDEV's high half is its physical wiphy and the low half
-/// is the individual netdev ifindex, and both halves must resolve to the
-/// same live wireless interface. A netdev that is not wireless, or
+/// asks by ifindex. Legacy netdev WDEV halves resolve to the same live
+/// wireless interface; an actual control-only WDEV instead resolves its
+/// exact opaque registry identity and namespace to the physical wiphy.
+/// A netdev that is not wireless, or
 /// names disagreeing on the wiphy, is -EINVAL; nothing found, or a wiphy in
 /// another namespace, is -ENODEV.
 fn wiphy_from_attrs(
@@ -1311,20 +1343,28 @@ fn wiphy_from_attrs(
     }
     let mut wiphy = by_index.filter(|index| crate::registry::wiphys().len() > *index as usize);
     if let Some(wdev) = wdev {
-        let from_wdev = (wdev >> 32) as u32;
-        let wdev_ifindex = wdev as u32;
-        let from_wdev_netdev = narf_net::netlink_route::iface_name_for_index(wdev_ifindex)
-            .filter(|name| narf_net::iface::lookup_in(namespace, name).is_some())
-            .and_then(|name| {
-                interfaces
-                    .iter()
-                    .find(|iface| iface.name() == name)
-                    .and_then(|iface| crate::registry::wiphy_index(iface.wiphy_id()))
-            })
-            .ok_or(ENODEV)?;
-        if from_wdev_netdev != from_wdev {
-            return Err(EINVAL);
-        }
+        let from_wdev = if let Some(iface) = crate::registry::control_by_id(wdev, namespace) {
+            crate::registry::wiphy_index(iface.wiphy_id()).ok_or(ENODEV)?
+        } else {
+            let from_wdev = (wdev >> 32) as u32;
+            if from_wdev > i32::MAX as u32 {
+                return Err(ENODEV);
+            }
+            let wdev_ifindex = wdev as u32;
+            let from_wdev_netdev = narf_net::netlink_route::iface_name_for_index(wdev_ifindex)
+                .filter(|name| narf_net::iface::lookup_in(namespace, name).is_some())
+                .and_then(|name| {
+                    interfaces
+                        .iter()
+                        .find(|iface| iface.name() == name)
+                        .and_then(|iface| crate::registry::wiphy_index(iface.wiphy_id()))
+                })
+                .ok_or(ENODEV)?;
+            if from_wdev_netdev != from_wdev {
+                return Err(EINVAL);
+            }
+            from_wdev
+        };
         if wiphy.is_some_and(|wiphy| wiphy != from_wdev) {
             return Err(EINVAL);
         }
@@ -1370,7 +1410,11 @@ fn dump_wiphy_filter(
         .and_then(|raw| <[u8; 8]>::try_from(raw).ok())
         .map(u64::from_ne_bytes)
     {
-        filter = Some((wdev >> 32) as u32);
+        filter = if let Some(iface) = crate::registry::control_by_id(wdev, namespace) {
+            crate::registry::wiphy_index(iface.wiphy_id())
+        } else {
+            Some((wdev >> 32) as u32)
+        };
     }
     if let Some(ifindex) = find_attr(attrs, NL80211_ATTR_IFINDEX).and_then(|raw| u32_of(raw).ok()) {
         let name = narf_net::netlink_route::iface_name_for_index(ifindex)
@@ -1425,7 +1469,11 @@ fn handle_in(command: u8, attrs: &[u8], dump: bool, namespace: u64) -> Result<Ve
             .enumerate()
             .filter(|(_, iface)| in_namespace(iface.as_ref(), namespace))
             .filter(|(_index, iface)| {
-                dump || find_attr(attrs, NL80211_ATTR_IFINDEX).is_some_and(|raw| {
+                dump || find_attr(attrs, NL80211_ATTR_WDEV).is_some_and(|raw| {
+                    raw.len() == 8
+                        && interface_wdev(iface.as_ref())
+                            == Some(u64::from_ne_bytes(raw.try_into().unwrap_or([0; 8])))
+                }) || find_attr(attrs, NL80211_ATTR_IFINDEX).is_some_and(|raw| {
                     raw.len() == 4
                         && narf_net::netlink_route::ifindex_for_name(
                             &iface.get_wireless_info().base_name,
@@ -1435,13 +1483,23 @@ fn handle_in(command: u8, attrs: &[u8], dump: bool, namespace: u64) -> Result<Ve
                         == iface.get_wireless_info().base_name.as_bytes()
                 })
             })
-            .map(|(_index, iface)| GenlReply {
-                command: NL80211_CMD_NEW_INTERFACE,
-                attrs: interface_attrs(
+            .filter(|(_, iface)| {
+                dump || find_attr(attrs, NL80211_ATTR_WDEV).is_none_or(|raw| {
+                    raw.len() == 8
+                        && interface_wdev(iface.as_ref())
+                            == Some(u64::from_ne_bytes(raw.try_into().unwrap_or([0; 8])))
+                })
+            })
+            .filter_map(|(_index, iface)| {
+                let attrs = interface_attrs(
                     crate::registry::wiphy_index(iface.wiphy_id()).unwrap_or(0),
                     iface.as_ref(),
                     iface.current_iftype(),
-                ),
+                );
+                (!attrs.is_empty()).then_some(GenlReply {
+                    command: NL80211_CMD_NEW_INTERFACE,
+                    attrs,
+                })
             })
             .collect(),
         NL80211_CMD_GET_PROTOCOL_FEATURES => {

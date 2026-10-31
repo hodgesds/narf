@@ -23,11 +23,15 @@ impl Fixture {
         hardware
             .install_rf_policy(super::super::mld_policy::Authority::Station(fence.clone()))
             .unwrap();
-        let device = Arc::new(Device {
+        let device = Arc::new_cyclic(|me| Device {
             test_name: None,
+            me: me.clone(),
+            radio_control: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
+            scan_generation: Arc::new(AtomicU64::new(0)),
             state: Mutex::new(State {
                 hardware,
                 scan_uid: 0,
+                scheduled: None,
                 beacons: Vec::new(),
                 connection: Some(connection),
                 needs_reset: false,

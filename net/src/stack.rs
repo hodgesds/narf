@@ -110,7 +110,12 @@ static KERNEL_ADMIN: narf_lib::sync::IrqSafeSpinLock<
 
 /// The kernel-held handle for `iface`, or `None` if no such interface exists.
 pub fn kernel_admin(iface: &str) -> Option<AdminHandle> {
-    if iface != "lo" && crate::iface::lookup(iface).is_none() {
+    if iface != "lo"
+        && crate::iface::lookup(iface).is_none()
+        && !crate::registry()
+            .with_interface(iface, |iface| iface.control_namespace().is_some())
+            .unwrap_or(false)
+    {
         return None;
     }
     if let Some(handle) = KERNEL_ADMIN.lock().get(iface) {
@@ -179,7 +184,9 @@ impl AdminHandle {
         if let Some(iface) = crate::iface::lookup(&self.iface_name) {
             return Some(iface.net_ns_id);
         }
-        crate::registry().with_interface(&self.iface_name, |_| 0)
+        crate::registry().with_interface(&self.iface_name, |iface| {
+            iface.control_namespace().unwrap_or(0)
+        })
     }
 
     pub fn check_live(&self) -> Result<(), AdminError> {
@@ -485,12 +492,20 @@ impl narf_capabilities::CapOp<NetIface, Write> for DelegatedAdminIdentity<'_> {
     fn execute(self, cap: &Cap<NetIface, Write>) -> Result<bool, narf_capabilities::CapError> {
         Ok(crate::registry()
             .with_interface_for_handle(cap, |iface| {
-                iface.name() == self.name
-                    && crate::iface::registration_matches(
+                if iface.name() != self.name {
+                    return false;
+                }
+                if let Some(namespace) = iface.control_namespace() {
+                    self.source.registration.is_none()
+                        && crate::iface::registration_matches(self.name, None, None)
+                        && self.namespace.is_none_or(|expected| expected == namespace)
+                } else {
+                    crate::iface::registration_matches(
                         self.name,
                         self.source.registration,
                         self.namespace,
                     )
+                }
             })
             .unwrap_or(false))
     }

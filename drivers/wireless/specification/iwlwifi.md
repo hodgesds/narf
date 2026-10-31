@@ -2197,11 +2197,11 @@ describe the remaining native paths.
 
 **Shared contracts, external inputs and scope corrections.**
 
-- **sched_scan_offload.** The shared crate exposes scheduled-scan
-  support/request/start/stop and nl80211 result/stopped notifications.
-  Native UMAC scheduled-scan configuration, autonomous-emitter power and
-  live-policy ownership, cancellation/stop receipts and result publication
-  remain to be connected to that interface.
+- **sched_scan_offload.** §3.53 connects the shared deferred interface to
+  idle Sc native periodic profiles, retained emission/stop ownership and
+  current-source results; coordinated native execution is pending. Linux
+  MLD associated coexistence, Gen2 API77 idle PNO and parked Gen3 profiles
+  remain open. Linux MVM explicitly refuses non-idle scheduled scans.
 - **persistent_key_history** is inapplicable (§3.30): Linux and the shared
   NARF contract establish a fresh authenticated RSNA after reboot and
   retain replay/history state for the active owner lifetime. The existing
@@ -3236,11 +3236,109 @@ while the final ring marker is held. Sc's native positive and retained
 source-loss cases additionally carry reported RFH2 with absent RSS;
 an added native case checks incompatible explicit versions and malformed
 actual RFH receipts without releasing published rings or reaching keys.
-Coordinated native execution remains pending. Physical RF acceptance and CPU/throughput
-scaling are separate; the retained worker services these rings serially.
+At `9e0f405ca`, all ten focused MQ cases and all490 Intel cases passed on
+both x86_64 and aarch64, including238 Gen2 cases per architecture. Final
+release lint/ordinary gates are consolidated on `bd18` with unchanged Intel
+runtime; they remain separate from this native result. Physical RF acceptance
+and CPU/throughput scaling are separate; the retained worker services these
+rings serially.
+The later HostCommand/metadata normalization in §3.54 requires fresh native
+integration; the490-case result above records its preceding software graph.
 Primary contracts are Linux `fw/init.c::iwl_configure_rxq`,
 `mvm/fw.c::iwl_send_rss_cfg_cmd`, `mvm/mac80211.c::__iwl_mvm_sync_rx_queues`,
 and `mvm/rxmq.c::{iwl_mvm_check_pn,iwl_mvm_reorder,iwl_mvm_rx_queue_notif}`.
+
+### 3.53 Native Sc periodic scheduled-scan continuation
+
+The Sc station interface opts into terminal deferred START/STOP controls
+under the actual delegated radio grant, exact source socket, administrative
+UP, mode/owner generation and serialized native control lease. The retained
+Device Work owns every native wait; dropping an external callback requests
+cancellation and cannot drop command DMA or abandon autonomous firmware
+emission. A completed START retains the source event authority and a private
+nonwrapping host scan generation without retaining the command lease forever.
+Ordinary scan/association refuse a live scheduled owner; disconnect/system
+suspend retire it through the same native stop path.
+
+The native profile follows Linux `mld/scan.c`: fixed SCAN_OFFLOAD_UPDATE_
+PROFILES_CMD API3 with an empty64-entry blocklist and up to eight match
+profiles; SCAN_REQ_UMAC v14–18 with two native periodic plans, intervals
+1–65535seconds, finite counts1–254 and an infinite final count255; an
+oversized initial delay clamps to65535seconds. Firmware UID1 is a scan slot,
+not an invented host sequence; ordinary scan keeps slot0. The direct SSID
+table follows Linux's reversed match/probe ordering, and only requested
+probe SSIDs set active channel bits. Filters alone never authorize probes.
+The probe MAC/band/common segments retain bounded PHY capabilities and
+up to256bytes of structurally valid request IEs. Optional random source
+addresses use secure entropy and honor the requested fixed-bit mask.
+
+Active channels use actual NVM plus current native MCC/host policy,
+existing Linux optional platform-power ownership and the native SET_DEVICE
+power receipt. Unavailable host policy leaves passive discovery available.
+No additional Sc board or SMBIOS qualification is invented. The live native
+owner continues checking its source, installed policy and cancellation even
+without a connected station or traffic. Native fallback-ring MPDUs supply
+BSS facts; requested SSID/RSSI filters and channels bound admission. A native
+match/iteration callback updates the exact current GET_SCAN cache before
+RESULTS outside the device mutex. Copied callbacks retain source/policy and
+host scan generation, so retirement or a successor denies stale publication.
+
+STOP sends the actual UID-bound SCAN_ABORT command. SUCCESS/IN_PROGRESS
+status requires the matching16-byte UMAC completion; NOT_FOUND is an actual
+firmware absence proof. An empty/malformed ACK, unrelated UID or elapsed
+host timer cannot prove stop. A lost RF policy does not prevent the private
+non-emitting stop attempt; loss of executable/PCI authority or ambiguous
+native stop reaches the independent bounded DMA/reset/BME attempt and keeps
+uncertain allocations pinned. A dropped STOP waiter leaves that work retained.
+
+Five native Sc cases and three shared deferred-dispatch cases are wired,
+covering literal native profiles/plans/probe segments, actual deferred ACK and
+GET_SCAN results, dropped START/STOP waiters, foreign completion UIDs, source/
+policy loss, malformed abort receipts, passive/pass-all matching and random
+probe source bits. Coordinated execution is pending. This first continuation
+covers idle Sc station mode. Linux MLD associated scheduled-scan coexistence,
+actual Gen2 API77 idle scheduled scans and parked Gen3 profiles remain open;
+Linux MVM explicitly refuses non-idle scheduled scans, so an associated Gen2
+PNO owner is not an additional reference requirement. Physical RF acceptance
+remains separate from native QEMU software fixtures.
+
+### 3.54 Wide HostCommand grouping and command metadata
+
+Linux `iwl-trans.c::iwl_trans_send_cmd` normalizes a narrow HostCommand ID
+to LONG_GROUP1 on a wide-header transport, except REPLY_ERROR0x02. The
+native Hardware command publication follows that rule before queueing its
+retained TFH command and correlates the actual legacy group0 response with
+the pending long-group request. An explicit command-ID header version stays
+explicit; payload-layout metadata never invents version bits. Existing wide
+groups keep their identity. This boundary does not change data TX command
+headers or unsolicited notification groups.
+
+Command payload lookup separately follows Linux
+`fw/img.c::iwl_fw_lookup_cmd_ver`: a narrow command consults group1 metadata.
+Raw notification metadata still uses its actual group. Gen2 authentication/
+HT and Sc rate-encoding selection use the normalized TX_CMD producer fact,
+while retaining every independently required raw RX/TLC/response consumer.
+Authored fixtures now place TX command/response versions together in the
+actual long-group row rather than inventing a group0 command entry. RSS
+reported-version admission uses this normalized command lookup; known Linux
+capability-backed missing-table defaults remain unchanged.
+
+All seven installed cc/Qu/QuZ API77 images and both installed Sc c103
+images report scheduled profile command3 in group1, selecting the eight-
+profile584-byte layout. Looking only in group0 would misclassify it as
+absent. Actual API77 TX_CMD is group1 command9 with response7; Sc reports
+command11/response9. Linux MVM's genuinely absent/pre3 profile fallback
+has11 profiles and its TLV18 SHORT_BL selects16 versus64 blocklist rows;
+those facts remain requirements for the following Gen2 PNO continuation.
+No native profile is inferred from a filename or an unrelated notification.
+
+A new independent native literal regression covers all three completion
+formats, RSS/profile/SMEM/IGTK HostCommands, REPLY_ERROR, an existing wide
+group, explicit header version and exact legacy reply correlation. Its
+metadata input deliberately distinguishes raw group0 and normalized group1.
+Existing native data-TX literals retain group0 unchanged. Native integration
+of this normalization plus the Sc scheduled continuation is pending; the
+preceding490-case MQ acceptance is not evidence for this changed graph.
 
 ## 4. References
 

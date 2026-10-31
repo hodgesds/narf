@@ -376,7 +376,7 @@ impl Ap {
                         (kind, 0, ok)
                     }
                 }
-                (0, 0x1f) => {
+                (1, 0x1f) => {
                     // Literal SEC_MGMT_MULTICAST_KEY_CMD_API_S_VER_2 layout.
                     let mut expected = [0u8; 52];
                     let kind = if b.get(..4) == Some(&[2, 0, 0, 0]) {
@@ -610,8 +610,8 @@ fn sae_fixture(h2e: bool, akm: u8) -> Result<Fixture, &'static str> {
     let parsed = super::super::super::parse_ucode(&image).unwrap();
     let mut versions = parsed.api.commands.to_vec();
     versions.extend_from_slice(&[
-        0x1c, 0, 9, 0, 0x1c, 1, 0, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 3, 15, 5, 3, 0, 0x17, 1, 3, 0, 2,
-        5, 1, 0, 0xff, 5, 0, 1,
+        0x1c, 1, 9, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 3, 15, 5, 3, 0, 0x17, 1, 3, 0, 2, 5, 1, 0, 0xff,
+        5, 0, 1,
     ]);
     runtime::model::versions(&mut owner.hardware, &versions);
     let mut caps = FirmwareApi::default();

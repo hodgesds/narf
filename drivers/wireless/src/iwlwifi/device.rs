@@ -4,7 +4,12 @@
 use super::connection::{Beacon, Connection};
 use super::progress::{PendingTx, Transmit, Work};
 use super::{runtime::Hardware, scan_api, station_api};
-use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::VecDeque,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::{
     future::{poll_fn, Future},
     pin::Pin,
@@ -22,6 +27,9 @@ use narf_wireless::{
 pub struct Device {
     #[cfg(any(test, feature = "kernel-test"))]
     test_name: Option<&'static str>,
+    me: Weak<Self>,
+    radio_control: Arc<narf_wireless::ap_control::ExclusiveControl>,
+    scan_generation: Arc<AtomicU64>,
     state: Mutex<State>,
     control: Mutex<Option<Work>>,
     publication: AtomicBool,
@@ -63,6 +71,7 @@ impl core::fmt::Debug for Device {
 struct State {
     hardware: Hardware,
     scan_uid: u32,
+    scheduled: Option<scheduled::Owner>,
     beacons: Vec<Beacon>,
     connection: Option<Connection>,
     needs_reset: bool,
@@ -240,12 +249,16 @@ impl Device {
         let nvm = Self::configure(&mut hardware, mac).await?;
         let irq_vector = hardware.irq_vector();
         let source = hardware.source_fence()?;
-        Ok(Arc::new(Self {
+        Ok(Arc::new_cyclic(|me| Self {
             #[cfg(any(test, feature = "kernel-test"))]
             test_name: None,
+            me: me.clone(),
+            radio_control: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
+            scan_generation: Arc::new(AtomicU64::new(0)),
             state: Mutex::new(State {
                 hardware,
                 scan_uid: 0,
+                scheduled: None,
                 beacons: Vec::new(),
                 connection: None,
                 needs_reset: false,
@@ -324,6 +337,7 @@ impl Device {
         state.needs_reset = true;
         state.stop_completed = false;
         state.connection = None;
+        state.scheduled = None;
         state.clear_transmit();
         state.eapol.clear();
         // RAM fixture: no PCI function or embedded CPU to restart.
@@ -463,7 +477,7 @@ impl Device {
         }
         WirelessNetIface::disassociate(self).await?;
         let mut state = self.state.lock().await;
-        if state.connection.is_some() {
+        if state.connection.is_some() || state.scheduled.is_some() {
             return Err(WirelessError::Busy);
         }
         state.needs_reset = true;
@@ -569,6 +583,7 @@ impl Device {
         self.set_link(false);
         self.retire_receive_ipc(state);
         state.needs_reset = true;
+        state.scheduled = None;
         state.clear_transmit();
         state.eapol.clear();
         if let Some(connection) = state.connection.as_mut() {
@@ -617,6 +632,9 @@ impl Device {
             && self.policy_current().is_ok()
     }
     async fn close_locked(&self, state: &mut State) -> Result<(), WirelessError> {
+        self.retire_scheduled(state)
+            .await
+            .map_err(|_| WirelessError::HardwareError)?;
         self.set_link(false);
         self.retire_receive_ipc(state);
         state.clear_transmit();
@@ -789,6 +807,18 @@ impl Device {
         }
         if self.closing.load(Ordering::Acquire) {
             self.start_close(&mut state);
+            return Vec::new();
+        }
+        if state.scheduled.is_some() {
+            if state.hardware.poll().is_err() {
+                self.start_repair(&mut state);
+                return Vec::new();
+            }
+            let publications = self.scheduled_step(&mut state);
+            drop(state);
+            for publication in publications {
+                publication.publish();
+            }
             return Vec::new();
         }
         let mut receive_failed = false;
@@ -1152,7 +1182,7 @@ impl Device {
                 return Err(WirelessError::Busy);
             }
         }
-        if state.connection.is_some() {
+        if state.connection.is_some() || state.scheduled.is_some() {
             return Err(WirelessError::Busy);
         }
         let epoch = self.generation.load(Ordering::Acquire);
@@ -1232,6 +1262,37 @@ impl Device {
 
 #[async_trait::async_trait]
 impl WirelessNetIface for Device {
+    fn radio_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        core::num::NonZeroU64::new(self.generation.load(Ordering::Acquire).checked_add(1)?)
+    }
+    fn reserve_radio_control(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        self.radio_control.try_reserve().map(Some)
+    }
+    fn sched_scan_support(&self) -> Option<narf_wireless::SchedScanSupport> {
+        Some(self.scheduled_support())
+    }
+    fn async_sched_scan_control(&self) -> bool {
+        true
+    }
+    fn sched_scan_pass_all(&self) -> bool {
+        true
+    }
+    async fn start_sched_scan_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        request: narf_wireless::SchedScanRequest,
+    ) -> Result<(), i32> {
+        self.scheduled_control(authority, Some(request)).await
+    }
+    async fn stop_sched_scan_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+    ) -> Result<(), i32> {
+        self.scheduled_control(authority, None).await
+    }
     fn max_scan_ssids(&self) -> u8 {
         20
     }
@@ -1330,7 +1391,7 @@ impl WirelessNetIface for Device {
                 return Err(WirelessError::Busy);
             }
         }
-        if state.connection.is_some() {
+        if state.connection.is_some() || state.scheduled.is_some() {
             return Err(WirelessError::Busy);
         }
         state.hardware.clear_rf_policy();
@@ -1788,3 +1849,6 @@ mod tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "dhcp_composition_tests.rs"]
 mod dhcp_composition;
+
+#[path = "sc_scheduled.rs"]
+mod scheduled;

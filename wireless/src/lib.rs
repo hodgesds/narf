@@ -869,6 +869,41 @@ pub trait WirelessNetIface: Interface {
         Ok(None)
     }
 
+    /// Opt into scheduled-scan acknowledgements after native completion.
+    /// This flag supplies no grant: radio_control_generation and the actual
+    /// serialized reserve_radio_control lease still bind every request.
+    fn async_sched_scan_control(&self) -> bool {
+        false
+    }
+    /// Native scheduled scans may return every admitted BSS without SSID
+    /// profiles. Existing network-detect-only drivers require match sets.
+    fn sched_scan_pass_all(&self) -> bool {
+        false
+    }
+    async fn start_sched_scan_async(
+        &self,
+        authority: &ap_control::RadioControlAuthority,
+        request: SchedScanRequest,
+    ) -> Result<(), i32> {
+        authority.check_for(self).map_err(|_| 1)?;
+        authority.require_link().map_err(|_| 1)?; // EPERM
+        let result = self.start_sched_scan(request);
+        authority.check_for(self).map_err(|_| 1)?;
+        authority.require_link().map_err(|_| 1)?;
+        result
+    }
+    async fn stop_sched_scan_async(
+        &self,
+        authority: &ap_control::RadioControlAuthority,
+    ) -> Result<(), i32> {
+        authority.check_for(self).map_err(|_| 1)?;
+        authority.require_link().map_err(|_| 1)?; // EPERM
+        let result = self.stop_sched_scan();
+        authority.check_for(self).map_err(|_| 1)?;
+        authority.require_link().map_err(|_| 1)?;
+        result
+    }
+
     /// Native terminal-completion counterparts. The request guard must stay
     /// current through every awaited command and final state publication;
     /// drivers retain cancellation cleanup even if the borrowed waiter is
@@ -2081,52 +2116,8 @@ pub struct StationConfig {
     pub station_tx_power: Option<StationTxPower>,
 }
 
-pub mod registry {
-    use super::*;
-    use alloc::sync::Arc;
-    use alloc::vec::Vec;
-    use narf_lib::sync::IrqSafeSpinLock;
-
-    static REGISTRY: IrqSafeSpinLock<Vec<Arc<dyn WirelessNetIface>>> =
-        IrqSafeSpinLock::new(Vec::new());
-
-    pub fn register(iface: Arc<dyn WirelessNetIface>) {
-        REGISTRY.lock().push(iface);
-    }
-
-    pub fn list() -> Vec<Arc<dyn WirelessNetIface>> {
-        REGISTRY.lock().clone()
-    }
-
-    /// One representative per physical radio, in the stable order nl80211
-    /// exposes as `phyN`.  Multiple virtual interfaces with the same
-    /// [`WirelessNetIface::wiphy_id`] must never produce duplicate wiphys.
-    pub fn wiphys() -> Vec<Arc<dyn WirelessNetIface>> {
-        let mut ids = Vec::new();
-        let mut out = Vec::new();
-        for iface in REGISTRY.lock().iter() {
-            let id = iface.wiphy_id();
-            if !ids.contains(&id) {
-                ids.push(id);
-                out.push(iface.clone());
-            }
-        }
-        out
-    }
-
-    /// Current `phyN` index of a physical radio identity.
-    pub fn wiphy_index(id: u64) -> Option<u32> {
-        wiphys()
-            .iter()
-            .position(|iface| iface.wiphy_id() == id)
-            .map(|index| index as u32)
-    }
-
-    /// Remove the interface named `name` (its netdev went away).
-    pub fn unregister(name: &str) {
-        REGISTRY.lock().retain(|i| i.name() != name);
-    }
-}
+#[path = "wdev_registry.rs"]
+pub mod registry;
 
 /// Force-link hook.
 pub fn register_initcalls() {

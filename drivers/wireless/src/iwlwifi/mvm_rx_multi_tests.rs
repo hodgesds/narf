@@ -70,7 +70,7 @@ impl Actor {
                     });
                 }
             }
-            (0, 0xb3) => {
+            (1, 0xb3) => {
                 self.capture_receive_queues()?;
                 if self.rx_queues.len() != 2
                     || body.len() != 176

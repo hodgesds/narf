@@ -18,7 +18,7 @@ fn smoke_mvm_shared_memory_native_query_retains_owner_and_reports_opaque_fifos()
         let actor = h.actor.lock();
         let new = &actor.commands[before..];
         if new.len() != 1
-            || !matches!((new[0].0, new[0].1), (2, 0) | (0, 0x25))
+            || !matches!((new[0].0, new[0].1), (2, 0) | (1, 0x25))
             || !new[0].2.is_empty()
         {
             return Err("shared-memory query synthesized another native command");

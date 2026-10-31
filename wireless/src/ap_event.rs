@@ -87,8 +87,9 @@ impl ApEventAuthority {
         let wiphy = crate::registry::wiphy_index(iface.wiphy_id()).ok_or(WirelessError::Denied)?;
         let mut attrs = Vec::new();
         attr(&mut attrs, 1, &wiphy.to_ne_bytes());
-        attr(&mut attrs, 3, &self.guard.ifindex.to_ne_bytes());
-        let wdev = (u64::from(wiphy) << 32) | u64::from(self.guard.ifindex);
+        let ifindex = self.guard.netdev_ifindex()?;
+        attr(&mut attrs, 3, &ifindex.to_ne_bytes());
+        let wdev = self.guard.target.wdev(wiphy);
         attr(&mut attrs, 153, &wdev.to_ne_bytes());
         Ok(attrs)
     }

@@ -83,8 +83,9 @@ pub fn open(id: IfaceId, rights: IfaceRights, cap: &Cap<IfaceRegistry, Bind>)
 ```
 
 The capability-gated interface registry is the canonical hardware inventory
-for the control plane. Compatibility views include every driver-backed entry,
+for the control plane. Compatibility views include every driver-backed netdev,
 even when an interface has not also joined the legacy kernel IPv4 data path.
+Control-only objects are a separate, explicitly hidden registration class.
 
 The legacy in-kernel IPv4 path also supports unload-safe, context-bearing send
 dispatch for separately compiled drivers:
@@ -360,6 +361,27 @@ handles retain their existing independent name scope. This mutation fence does
 not yet change namespace transfer, address, route or neighbor table ownership;
 those paths retain their existing operation boundaries and require separate
 generation-aware side-effect work.
+
+`Interface::control_namespace() -> Option<u64>` marks an actual control-only
+object and its immutable namespace for that registration's lifetime. Such an
+object has no frame-ring endpoints, link-up state, legacy IFACES entry or
+fabricated ifindex. `Registry::register_control` performs registration inside
+the actual `Cap<NetIface, Grant>::invoke`, validates the absent data boundary,
+and returns a real typed interface handle. `ControlRegisterError` distinguishes
+revoked authority, a data/noncontrol object and a duplicate name. Kernel
+Ethernet snapshots/sysfs/rtnetlink omit it, and stack-daemon/XDP attachment
+rejects it. Existing ordinary netdev registrations retain their behavior.
+
+Delegated administration of a control-only object invokes the actual Admin,
+daemon and still-registered typed interface grants, verifies absence of any
+same-name legacy entry, and checks the object's actual namespace. A parent
+interface's administrative handle grants no child administration. A fresh child
+grant or existing authenticated namespace authority is required. The existing
+namespace/name kernel handles can authorize that actual registered control
+object in its namespace; discovery supplies no grant. Legacy netdev mutation
+APIs have no IFACES entry to change. Trusted driver cleanup uses
+`Registry::unregister_for_handle` to remove only its original typed registration;
+an old live handle cannot remove a same-name successor or authorize hardware.
 
 ### 3.4 Loopback
 

@@ -22,6 +22,19 @@ impl RadioControlAuthority {
             guard: ApControlAuthority::bind_radio(admin, iface, namespace, ifindex, reply)?,
         })
     }
+    /// Bind an actual control-only P2P-device registration. There is no
+    /// netdev/ifindex argument and no synthetic administrative UP state.
+    pub fn bind_wdev(
+        admin: AdminHandle,
+        iface: &Arc<dyn WirelessNetIface>,
+        namespace: u64,
+        wdev: u64,
+        reply: Arc<dyn DeferredReplySink>,
+    ) -> Result<Self, WirelessError> {
+        Ok(Self {
+            guard: ApControlAuthority::bind_control_wdev(admin, iface, namespace, wdev, reply)?,
+        })
+    }
     pub fn current(&self) -> Result<(), WirelessError> {
         self.guard.current()
     }
@@ -71,10 +84,9 @@ impl RadioControlAuthority {
         let retained = &identity.identity;
         if !Weak::ptr_eq(&self.guard.iface, &retained.iface)
             || self.guard.namespace != retained.namespace
-            || self.guard.ifindex != retained.ifindex
+            || self.guard.target != retained.target
             || self.guard.mode != retained.mode
             || self.guard.generation != retained.generation
-            || self.guard.ownership_epoch != retained.ownership_epoch
         {
             return Err(WirelessError::Denied);
         }
@@ -185,6 +197,56 @@ impl RadioEventAuthority {
         attr(&mut attrs, 51, frame);
         self.deliver(59, attrs)
     }
+    /// The native scheduled request is running only after the driver's
+    /// matching firmware start receipt. Admission/queued work is insufficient.
+    pub fn scheduled_scan_started(&self) -> Result<(), WirelessError> {
+        self.scheduled_scan(75)
+    }
+    /// Report only admitted native BSS results from the retained scan UID,
+    /// after current source/channel/filter checks and outside owner locks.
+    pub fn scheduled_scan_results(&self) -> Result<(), WirelessError> {
+        self.scheduled_scan(77)
+    }
+    /// Publish the actual admitted native scan snapshot before RESULTS, so
+    /// GET_SCAN observes the same BSS records. This adds no RF authority;
+    /// the driver retains its copy-time/filter/native-UID proof throughout.
+    pub fn scheduled_scan_results_with_bss(
+        &self,
+        results: Vec<(crate::BssInfo, Vec<u8>)>,
+    ) -> Result<(), WirelessError> {
+        self.current()?;
+        let iface = self
+            .source
+            .guard
+            .iface
+            .upgrade()
+            .ok_or(WirelessError::Denied)?;
+        crate::nl80211::scheduled_results(
+            self,
+            iface.name(),
+            self.source.guard.namespace,
+            self.source.guard.netdev_ifindex()?,
+            results,
+        )?;
+        self.current()?;
+        self.scheduled_scan(77)
+    }
+    /// Actual native stop/terminal completion precedes this notification.
+    /// An ACK, abandoned waiter or expired host timer cannot prove it.
+    pub fn scheduled_scan_stopped(&self) -> Result<(), WirelessError> {
+        self.scheduled_scan(78)
+    }
+    fn scheduled_scan(&self, command: u8) -> Result<(), WirelessError> {
+        let attrs = self.base()?;
+        self.current()?;
+        narf_net::netlink_generic::publish_event(
+            crate::nl80211::NL80211_FAMILY_ID,
+            18,
+            self.source.guard.namespace,
+            narf_net::netlink_generic::GenlReply { command, attrs },
+        );
+        Ok(())
+    }
     fn base(&self) -> Result<Vec<u8>, WirelessError> {
         self.current()?;
         let iface = self
@@ -196,8 +258,10 @@ impl RadioEventAuthority {
         let wiphy = crate::registry::wiphy_index(iface.wiphy_id()).ok_or(WirelessError::Denied)?;
         let mut attrs = Vec::new();
         attr(&mut attrs, 1, &wiphy.to_ne_bytes());
-        attr(&mut attrs, 3, &self.source.guard.ifindex.to_ne_bytes());
-        let wdev = (u64::from(wiphy) << 32) | u64::from(self.source.guard.ifindex);
+        if let Ok(ifindex) = self.source.guard.netdev_ifindex() {
+            attr(&mut attrs, 3, &ifindex.to_ne_bytes());
+        }
+        let wdev = self.source.guard.target.wdev(wiphy);
         attr(&mut attrs, 153, &wdev.to_ne_bytes());
         Ok(attrs)
     }

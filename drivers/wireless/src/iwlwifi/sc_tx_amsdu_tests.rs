@@ -177,7 +177,7 @@ fn smoke_sc_tx_amsdu_native_open_wpa2_and_he_lmac_fifo_receipts() -> TestResult 
                     && wire
                         .commands
                         .iter()
-                        .filter(|(g, c, _)| (*g, *c) == if extended { (2, 0) } else { (0, 0x25) })
+                        .filter(|(g, c, _)| (*g, *c) == if extended { (2, 0) } else { (1, 0x25) })
                         .count()
                         == 1
             };
@@ -451,7 +451,7 @@ fn smoke_sc_tx_amsdu_native_held_smem_receipt_source_loss_never_publishes_aggreg
                 let (cmd, group, sequence) =
                     wire.held.take().ok_or("Sc held SMEM command missing")?;
                 require(
-                    (group, cmd) == if which == 1 { (2, 0) } else { (0, 0x25) },
+                    (group, cmd) == if which == 1 { (2, 0) } else { (1, 0x25) },
                     "Sc held another native query",
                 )?;
                 let response = wire.tx_model.as_ref().unwrap().memory.clone();

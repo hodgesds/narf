@@ -75,6 +75,14 @@ impl<'a> FirmwareApi<'a> {
             .map(|entry| (entry[2], entry[3]))
     }
 
+    /// Linux fw/img.c::iwl_fw_lookup_cmd_ver uses LONG_GROUP for narrow
+    /// command IDs. Notification metadata retains its actual group and
+    /// continues using `versions`; this does not rewrite data TX headers.
+    pub fn command_version(&self, group: u8, command: u8) -> Option<u8> {
+        self.versions(if group == 0 { 1 } else { group }, command)
+            .map(|entry| entry.0)
+    }
+
     /// TLV73's source-specific supported BIOS revision. Missing metadata,
     /// command or source uses Linux's caller-provided revision fallback.
     pub fn bios_revision(&self, source: u8, group: u8, command: u8, default: u8) -> u8 {

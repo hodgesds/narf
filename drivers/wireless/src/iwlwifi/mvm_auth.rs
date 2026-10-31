@@ -32,7 +32,7 @@ impl Owner {
         // Linux ops.c requires all four rates-v2 indicators to agree. The
         // retained producer implements the pre-AX210 v9 TX parameters and
         // unaggregated response v6/7/8; no guessed absent-version fallback.
-        if self.hardware.version(0, 0x1c).map(|v| v.0) != Some(9)
+        if self.hardware.command_version(0, 0x1c) != Some(9)
             || !matches!(self.hardware.version(1, 0x1c).map(|v| v.1), Some(6..=8))
             || self.hardware.version(0, 0xc1).map(|v| v.1) != Some(4)
             || self.hardware.version(5, 0xf7).map(|v| v.1) != Some(3)

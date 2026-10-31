@@ -72,6 +72,75 @@ fn formats() -> [rx_rfh::CompletionFormat; 3] {
         rx_rfh::CompletionFormat::Bz,
     ]
 }
+fn smoke_iwl_host_command_long_group_and_metadata_leave_data_and_notifications_distinct(
+) -> TestResult {
+    check(|| {
+        let versions = [0xb3, 0, 17, 4, 0xb3, 1, 1, 9, 0x1c, 1, 9, 7];
+        let api = super::super::firmware_api::FirmwareApi {
+            commands: &versions,
+            ..Default::default()
+        };
+        if api.command_version(0, 0xb3) != Some(1)
+            || api.versions(0, 0xb3) != Some((17, 4))
+            || api.command_version(0, 0x1c) != Some(9)
+        {
+            return Err("HostCommand metadata used raw notification group or a fabricated default");
+        }
+        for format in formats() {
+            let mut t = Transport::new(format);
+            model::versions(t.hw.as_mut().unwrap(), &versions);
+            if t.hw.as_ref().unwrap().command_version(0, 0xb3) != Some(1)
+                || t.hw.as_ref().unwrap().version(0, 0xb3) != Some((17, 4))
+            {
+                return Err("native command lookup conflated raw RX metadata");
+            }
+            // Independent Linux iwl_cmd_header_wide bytes. No layout lookup
+            // invents version bits; explicit command-ID version5 stays5.
+            for (index, (input, opcode, wire, version)) in [
+                (0, 0xb3, 1, 0), // RSS_CONFIG_CMD
+                (0, 0x25, 1, 0), // legacy SHARED_MEM_CFG
+                (0, 0x6e, 1, 0), // SCAN_OFFLOAD_UPDATE_PROFILES_CMD
+                (0, 0x1f, 1, 0), // MGMT_MCAST_KEY
+                (0, 2, 0, 0),    // REPLY_ERROR is Linux's sole exception
+                (5, 2, 5, 0),    // an existing wide group stays unchanged
+                (0, 0x6e, 1, 5), // explicit command-ID version
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut command = pin!(t.hw.as_mut().unwrap().command_with_header_version(
+                    input,
+                    opcode,
+                    &[0x76, 0x5a],
+                    version
+                ));
+                if !poll(command.as_mut()).is_pending() {
+                    return Err("native HostCommand skipped its actual receipt");
+                }
+                let packet = t
+                    .trace
+                    .take()
+                    .ok_or("native HostCommand TFH publication absent")?;
+                let expected = [opcode, wire, index as u8, 0, 2, 0, version, 0, 0x76, 0x5a];
+                if packet.bytes != expected {
+                    return Err("native HostCommand literal wide group/header/version extent");
+                }
+                // Legacy long-group replies are actually delivered on0;
+                // source/sequence/cmd correlation still owns that receipt.
+                t.firmware
+                    .inject(opcode, if wire == 1 { 0 } else { wire }, index as u16, &[]);
+                if !matches!(poll(command.as_mut()), Poll::Ready(Ok(_))) {
+                    return Err("normalized HostCommand lost its correlated legacy reply");
+                }
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/runtime",
+    smoke_iwl_host_command_long_group_and_metadata_leave_data_and_notifications_distinct
+);
 fn smoke_iwl_native_queue_remove_requires_exact_id_status_and_reserved_receipt() -> TestResult {
     check(|| {
         for format in formats() {

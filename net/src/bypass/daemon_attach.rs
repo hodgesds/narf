@@ -80,6 +80,9 @@ pub fn attach(
     req.daemon
         .check_live()
         .map_err(|_| AttachError::DaemonCapRevoked)?;
+    if iface_obj.control_namespace().is_some() {
+        return Err(AttachError::IfaceMismatch);
+    }
 
     let iface_name = alloc::string::String::from(iface_obj.name());
 

@@ -438,7 +438,7 @@ fn smoke_sc_rss_native_dropped_waiter_and_revoked_config_receipt_pin_every_ring(
                 !wire.m4
                     && wire.keys == 0
                     && wire.data.is_empty()
-                    && !wire.commands.iter().any(|(g, c, _)| (*g, *c) == (0, 0xb3))
+                    && !wire.commands.iter().any(|(g, c, _)| (*g, *c) == (1, 0xb3))
             };
             let state = guard
                 .device()
@@ -492,7 +492,7 @@ fn smoke_sc_rss_native_actual_profile_unknown_version_and_malformed_receipt_stay
                     .1
                     .commands
                     .iter()
-                    .any(|(g, c, _)| matches!((*g, *c), (5, 0x0d) | (0, 0xb3)))
+                    .any(|(g, c, _)| matches!((*g, *c), (5, 0x0d) | (1, 0xb3)))
             };
             require(
                 single && quiet,
@@ -547,7 +547,7 @@ fn smoke_sc_rss_native_actual_profile_unknown_version_and_malformed_receipt_stay
                 !wire.m4
                     && wire.keys == 0
                     && wire.data.is_empty()
-                    && !wire.commands.iter().any(|(g, c, _)| (*g, *c) == (0, 0xb3))
+                    && !wire.commands.iter().any(|(g, c, _)| (*g, *c) == (1, 0xb3))
             };
             require(
                 safe && stopped,

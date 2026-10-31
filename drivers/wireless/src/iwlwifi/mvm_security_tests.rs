@@ -949,8 +949,8 @@ fn fixture(api: u8) -> Result<(Fixture, Device), &'static str> {
     let parsed = super::super::super::parse_ucode(&image).unwrap();
     let mut versions = parsed.api.commands.to_vec();
     versions.extend_from_slice(&[
-        0x1c, 0, 9, 0, 0x1c, 1, 0, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 3, 15, 5, 3, 0, 0x17, 1, api, 0,
-        2, 5, 1, 0, 0xff, 5, 0, 1,
+        0x1c, 1, 9, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 3, 15, 5, 3, 0, 0x17, 1, api, 0, 2, 5, 1, 0,
+        0xff, 5, 0, 1,
     ]);
     runtime::model::versions(&mut owner.hardware, &versions);
     let mut caps = FirmwareApi::default();
@@ -1844,9 +1844,7 @@ fn smoke_gen2_wpa2_linux_default_key_and_unversioned_rx_sync_contract() -> TestR
             let image = firmware_parser_tests::mvm_image();
             let parsed = super::super::super::parse_ucode(&image).unwrap();
             let mut versions = parsed.api.commands.to_vec();
-            versions.extend_from_slice(&[
-                0x1c, 0, 9, 0, 0x1c, 1, 0, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 3, 15, 5, 3, 0,
-            ]);
+            versions.extend_from_slice(&[0x1c, 1, 9, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 3, 15, 5, 3, 0]);
             if unknown {
                 versions.extend_from_slice(&[0x17, 1, 99, 99, 2, 5, 99, 99, 0xff, 5, 99, 99]);
             }

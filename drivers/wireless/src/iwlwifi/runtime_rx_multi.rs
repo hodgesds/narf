@@ -50,8 +50,8 @@ impl Hardware {
             }
             Phase::Idle => {}
         }
-        let rfh = self.version(5, 0x0d).map(|v| v.0);
-        let rss = self.version(0, 0xb3).map(|v| v.0);
+        let rfh = self.command_version(5, 0x0d);
+        let rss = self.command_version(0, 0xb3);
         // Linux fw/init.c and mvm/mld fw.c send these fixed structs
         // without version lookups. Shipped Qu/API77 omits both entries;
         // Sc/c103 reports RFH2 and omits RSS. The actual capability68

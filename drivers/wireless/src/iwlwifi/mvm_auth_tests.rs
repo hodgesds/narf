@@ -42,7 +42,7 @@ pub(in crate::iwlwifi::mvm_boot) fn fixture() -> Result<Fixture, &'static str> {
     let image = firmware_parser_tests::mvm_image();
     let parsed = super::super::super::parse_ucode(&image).unwrap();
     let mut versions = parsed.api.commands.to_vec();
-    versions.extend_from_slice(&[0x1c, 0, 9, 0, 0x1c, 1, 0, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 3]);
+    versions.extend_from_slice(&[0x1c, 1, 9, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 3]);
     runtime::model::versions(&mut fixture.owner.as_mut().unwrap().hardware, &versions);
     Ok(fixture)
 }
@@ -411,8 +411,8 @@ fn smoke_gen2_authentication_rate_profile_and_preflight() -> TestResult {
             return Err("5GHz authentication accepted a required CCK basic rate");
         }
         for versions in [
-            &[0x1c, 0, 9, 0][..],
-            &[0x1c, 0, 9, 0, 0x1c, 1, 0, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 4][..],
+            &[0x1c, 1, 9, 0][..],
+            &[0x1c, 1, 9, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 4][..],
         ] {
             runtime::model::versions(&mut owner.hardware, versions);
             if owner.authentication_rate(&[1, 1, 0x82], 1).is_ok() {

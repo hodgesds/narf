@@ -10,6 +10,9 @@ use core::{
 use narf_net::{netlink_generic::DeferredReplySink, AdminHandle};
 
 use crate::{WirelessError, WirelessNetIface};
+#[path = "control_target.rs"]
+mod target;
+use target::Target;
 
 #[path = "ap_event.rs"]
 mod event;
@@ -51,8 +54,7 @@ pub struct ApControlAuthority {
     iface: Weak<dyn WirelessNetIface>,
     admin: AdminHandle,
     namespace: u64,
-    ifindex: u32,
-    ownership_epoch: NonZeroU64,
+    target: Target,
     mode: u32,
     generation: NonZeroU64,
     reply: Arc<dyn DeferredReplySink>,
@@ -64,7 +66,7 @@ impl fmt::Debug for ApControlAuthority {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ApControlAuthority")
             .field("namespace", &self.namespace)
-            .field("ifindex", &self.ifindex)
+            .field("target", &self.target)
             .field("mode", &self.mode)
             .field("generation", &self.generation)
             .finish_non_exhaustive()
@@ -112,17 +114,13 @@ impl ApControlAuthority {
         let generation = kind
             .generation(iface.as_ref())
             .ok_or(WirelessError::NotSupported)?;
-        let snapshot =
-            narf_net::iface::lookup_in(namespace, iface.name()).ok_or(WirelessError::Denied)?;
-        let ownership_epoch =
-            NonZeroU64::new(snapshot.ownership_epoch).ok_or(WirelessError::Denied)?;
+        let target = Target::netdev(iface.name(), namespace, ifindex)?;
         let authority = Self {
             kind,
             iface: Arc::downgrade(iface),
             admin,
             namespace,
-            ifindex,
-            ownership_epoch,
+            target,
             mode: iface.current_iftype(),
             generation,
             reply,
@@ -138,6 +136,36 @@ impl ApControlAuthority {
 
     pub fn current(&self) -> Result<(), WirelessError> {
         self.check(None)
+    }
+    fn bind_control_wdev(
+        admin: AdminHandle,
+        iface: &Arc<dyn WirelessNetIface>,
+        namespace: u64,
+        id: u64,
+        reply: Arc<dyn DeferredReplySink>,
+    ) -> Result<Self, WirelessError> {
+        if iface.current_iftype() != 10 {
+            return Err(WirelessError::NotSupported);
+        }
+        let authority = Self {
+            kind: ControlKind::Radio,
+            iface: Arc::downgrade(iface),
+            admin,
+            namespace,
+            target: Target::control(iface.as_ref(), namespace, id)?,
+            mode: 10,
+            generation: ControlKind::Radio
+                .generation(iface.as_ref())
+                .ok_or(WirelessError::NotSupported)?,
+            reply,
+            reservation: None,
+            reserved: false,
+        };
+        authority.current()?;
+        Ok(authority)
+    }
+    fn netdev_ifindex(&self) -> Result<u32, WirelessError> {
+        self.target.netdev_ifindex()
     }
     /// Whether a native driver actually supplied its synchronous admission
     /// lease. This is serialization metadata, never current authority.
@@ -182,9 +210,7 @@ impl ApControlAuthority {
         if receiver.is_some_and(|pointer| pointer != Arc::as_ptr(&iface).cast::<()>())
             || iface.current_iftype() != self.mode
             || self.kind.generation(iface.as_ref()) != Some(self.generation)
-            || narf_net::iface::lookup_in(self.namespace, iface.name()).is_none_or(|link| {
-                link.ifindex != self.ifindex || link.ownership_epoch != self.ownership_epoch.get()
-            })
+            || !self.target.current(iface.as_ref(), self.namespace, false)
             || !crate::registry::list()
                 .iter()
                 .any(|registered| Arc::ptr_eq(registered, &iface))
@@ -205,19 +231,17 @@ pub struct ApInterfaceIdentity {
     kind: ControlKind,
     iface: Weak<dyn WirelessNetIface>,
     namespace: u64,
-    ifindex: u32,
+    target: Target,
     mode: u32,
     generation: NonZeroU64,
-    ownership_epoch: NonZeroU64,
     mac: [u8; 6],
 }
 impl fmt::Debug for ApInterfaceIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ApInterfaceIdentity")
             .field("namespace", &self.namespace)
-            .field("ifindex", &self.ifindex)
+            .field("target", &self.target)
             .field("generation", &self.generation)
-            .field("ownership_epoch", &self.ownership_epoch)
             .finish_non_exhaustive()
     }
 }
@@ -240,10 +264,9 @@ impl ApControlAuthority {
             kind: self.kind,
             iface: self.iface.clone(),
             namespace: self.namespace,
-            ifindex: self.ifindex,
+            target: self.target,
             mode: self.mode,
             generation: self.generation,
-            ownership_epoch: self.ownership_epoch,
             mac: iface.mac(),
         };
         identity.check_with_up(None, require_up)?;
@@ -262,8 +285,8 @@ impl ApInterfaceIdentity {
         let snapshot = narf_net::iface::lookup_in(self.namespace, iface.name())
             .ok_or(WirelessError::Denied)?;
         if !snapshot.link_up
-            || snapshot.ifindex != self.ifindex
-            || snapshot.ownership_epoch != self.ownership_epoch.get()
+            || snapshot.ifindex != self.target.netdev_ifindex()?
+            || !self.target.current(iface.as_ref(), self.namespace, true)
             || snapshot.mac != self.mac
         {
             return Err(WirelessError::Denied);
@@ -289,11 +312,9 @@ impl ApInterfaceIdentity {
             || iface.current_iftype() != self.mode
             || self.kind.generation(iface.as_ref()) != Some(self.generation)
             || iface.mac() != self.mac
-            || narf_net::iface::lookup_in(self.namespace, iface.name()).is_none_or(|link| {
-                require_up && !link.link_up
-                    || link.ifindex != self.ifindex
-                    || link.ownership_epoch != self.ownership_epoch.get()
-            })
+            || !self
+                .target
+                .current(iface.as_ref(), self.namespace, require_up)
             || !crate::registry::list()
                 .iter()
                 .any(|registered| Arc::ptr_eq(registered, &iface))

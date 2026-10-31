@@ -810,6 +810,13 @@ impl Hardware {
             .map(|entry| (entry[2], entry[3]))
     }
 
+    /// Command payload lookup normalizes a narrow ID like Linux. Keep raw
+    /// notification lookup and data TX header encoding separate.
+    pub(super) fn command_version(&self, group: u8, command: u8) -> Option<u8> {
+        self.version(if group == 0 { 1 } else { group }, command)
+            .map(|entry| entry.0)
+    }
+
     pub fn runtime_configuration(
         &self,
     ) -> Result<super::station_api::RuntimeConfiguration, &'static str> {
@@ -1403,6 +1410,10 @@ impl Hardware {
             .map(super::mld_policy::Authority::validity)
             .ok_or("Intel native RF policy owner absent")
     }
+    pub(super) fn rf_policy_clone(&self) -> Option<super::mld_policy::Authority> {
+        self.rf_policy.clone()
+    }
+
     pub(super) fn clear_rf_policy(&mut self) {
         if let Some(policy) = self.rf_policy.take() {
             policy.invalidate();
@@ -1805,6 +1816,10 @@ impl Hardware {
         if self.failed {
             return Err("Wi-Fi transport failed");
         }
+        // iwl-trans.c::iwl_trans_send_cmd maps narrow HostCommands to
+        // LONG_GROUP on a wide-header transport, except REPLY_ERROR.
+        // Data TX commands and unsolicited RX packets never enter here.
+        let group = if group == 0 && command != 2 { 1 } else { group };
         let sources = self.source_fence()?;
         let sequence = sources.invoke(|| {
             self.resources

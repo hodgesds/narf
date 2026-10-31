@@ -33,6 +33,9 @@ mod rx_multi_tests;
 #[path = "sc_tx_amsdu_tests.rs"]
 mod tx_amsdu_tests;
 
+#[path = "sc_scheduled_tests.rs"]
+mod scheduled_tests;
+
 type R<T = ()> = Result<T, &'static str>;
 const OWN: [u8; 6] = [2, 0x71, 2, 3, 4, 5];
 const AP: [u8; 6] = [2, 0x72, 2, 3, 4, 5];
@@ -128,7 +131,7 @@ impl ReceiveModel {
     fn commands(self, versions: &mut Vec<u8>) {
         match self {
             Self::Single => {}
-            Self::ExplicitV1 => versions.extend_from_slice(&[0x0d, 5, 1, 0, 0xb3, 0, 1, 0]),
+            Self::ExplicitV1 => versions.extend_from_slice(&[0x0d, 5, 1, 0, 0xb3, 1, 1, 0]),
             Self::NativeSc => versions.extend_from_slice(&[0x0d, 5, 2, 0]),
             Self::Unsupported => versions.extend_from_slice(&[0x0d, 5, 3, 0]),
         }
@@ -194,6 +197,7 @@ struct Wire {
     tx_model: Option<TxModel>,
     aggregates: Vec<Vec<Vec<u8>>>,
     held_data: Vec<(u16, u16)>,
+    scheduled: Option<scheduled_tests::Model>,
 }
 
 // SAFETY: no real device or thread accesses these fixture pointers. The sole
@@ -291,12 +295,12 @@ impl Wire {
         self.commands.push((group, cmd, body.to_vec()));
         let mut response = Vec::new();
         match (group, cmd) {
-            (0, 0x25) | (2, 0) if self.tx_model.is_some() => {
+            (1, 0x25) | (2, 0) if self.tx_model.is_some() => {
                 let tx = self.tx_model.as_ref().unwrap();
                 require(
                     body.is_empty()
                         && bytes[6] == 0
-                        && ((group, cmd) == if tx.extended { (2, 0) } else { (0, 0x25) }),
+                        && ((group, cmd) == if tx.extended { (2, 0) } else { (1, 0x25) }),
                     "Sc shared-memory command ignored actual firmware TLV capability",
                 )?;
                 response = tx.memory.clone();
@@ -455,7 +459,7 @@ impl Wire {
                     )?;
                 }
             }
-            (0, 0xb3) if self.multi_receive => {
+            (1, 0xb3) if self.multi_receive => {
                 require(
                     body.len() == 176
                         && body[..8] == [1, 0, 0, 0, 0x3f, 0, 0, 0]
@@ -560,6 +564,19 @@ impl Wire {
                 body.len() == 24 && word(body, 4) == 1,
                 "Sc association residency",
             )?,
+            (1, 0x6e) if self.scheduled.is_some() => {
+                self.scheduled.as_mut().unwrap().profiles(body)?
+            }
+            (1, 0xe) if self.scheduled.is_some() => {
+                response = self.scheduled.as_mut().unwrap().abort(body)?;
+            }
+            (1, 0xd) if word(body, 0) == 1 && self.scheduled.is_some() => {
+                self.scheduled.as_mut().unwrap().start(body)?;
+                if self.scheduled.as_ref().unwrap().hold_start {
+                    self.held = Some((cmd, group, sequence));
+                    return Ok(());
+                }
+            }
             (1, 0xd) => require(
                 body.len() == 1948
                     && (half(body, 8) == 0x802 || self.phy.is_some() && half(body, 8) == 2)
@@ -629,6 +646,12 @@ impl Wire {
                 &[0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
             );
         } else if (group, cmd) == (1, 0xd) {
+            if word(body, 0) == 1 {
+                // Actual autonomous periodic owner remains live after the
+                // correlated command ACK. Test code injects real posted-ring
+                // iteration/match/completion notifications independently.
+                return Ok(());
+            }
             let mut beacon = self.ap.beacon();
             if let Some(phy) = self.phy {
                 beacon.extend_from_slice(&he_tests::elements(phy, true));
@@ -643,6 +666,15 @@ impl Wire {
             done[..4].copy_from_slice(&body[..4]);
             done[6] = 1;
             self.firmware.inject(0xf, 0, 0x8000, &done);
+        } else if (group, cmd) == (1, 0xe) && self.scheduled.is_some() {
+            let scheduled = self.scheduled.as_mut().unwrap();
+            if !scheduled.hold_stop && scheduled.abort_status <= 1 {
+                scheduled.live = false;
+                let mut done = [0; 16];
+                done[..4].copy_from_slice(&1u32.to_le_bytes());
+                done[6] = 2;
+                self.firmware.inject(0xf, 0, 0x8000, &done);
+            }
         }
         Ok(())
     }
@@ -1142,6 +1174,7 @@ impl Guard {
             tx_model,
             aggregates: Vec::new(),
             held_data: Vec::new(),
+            scheduled: None,
         };
         let configured = run(Device::configure(&mut hardware, OWN), || wire.service());
         let nvm = match configured {
@@ -1158,6 +1191,7 @@ impl Guard {
         let mut state = State {
             hardware,
             scan_uid: 0,
+            scheduled: None,
             beacons: Vec::new(),
             connection: None,
             needs_reset: false,
@@ -1182,8 +1216,11 @@ impl Guard {
         } else {
             policy()
         });
-        let device = Arc::new(Device {
+        let device = Arc::new_cyclic(|me| Device {
             test_name: name,
+            me: me.clone(),
+            radio_control: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
+            scan_generation: Arc::new(AtomicU64::new(0)),
             state: Mutex::new(state),
             control: Mutex::new(None),
             publication: AtomicBool::new(true),

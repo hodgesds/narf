@@ -16,13 +16,13 @@ pub(super) fn native_supported(hw: &super::runtime::Hardware) -> bool {
 /// rejecting partially upgraded firmware tables. Missing entries are v1,
 /// never evidence for a newer encoding. MLD's native TX body is v10/v11.
 pub(super) fn rates_version(hw: &super::runtime::Hardware) -> Option<u8> {
-    if !matches!(hw.version(0, 0x1c).map(|v| v.0), Some(10 | 11)) {
+    if !matches!(hw.command_version(0, 0x1c), Some(10 | 11)) {
         return None;
     }
     select_rates_version(|group, command| hw.version(group, command))
 }
 fn select_rates_version(version: impl Fn(u8, u8) -> Option<(u8, u8)>) -> Option<u8> {
-    let command = |group, cmd| version(group, cmd).map_or(0, |v| v.0);
+    let command = |group, cmd| version(if group == 0 { 1 } else { group }, cmd).map_or(0, |v| v.0);
     let notification = |group, cmd| version(group, cmd).map_or(0, |v| v.1);
     let v2 = [
         command(0, 0x1c) >= 8,
@@ -395,17 +395,11 @@ mod tests {
                 .find(|r| r[0] == c && r[1] == g)
                 .map(|r| (r[2], r[3]))
         };
-        let v2 = [
-            [0x1c, 0, 10, 0],
-            [0xf7, 5, 0, 3],
-            [0xc1, 0, 0, 5],
-            [0x1c, 1, 0, 8],
-        ];
+        let v2 = [[0x1c, 1, 10, 8], [0xf7, 5, 0, 3], [0xc1, 0, 0, 5]];
         let v3 = [
-            [0x1c, 0, 11, 0],
+            [0x1c, 1, 11, 9],
             [0xf7, 5, 0, 4],
             [0xc1, 0, 0, 6],
-            [0x1c, 1, 0, 9],
             [0xf5, 5, 0, 4],
         ];
         if select_rates_version(|g, c| lookup(&v2, g, c)) != Some(2)
@@ -415,18 +409,17 @@ mod tests {
         }
         for index in 0..4 {
             let mut table = v2;
-            table[index][if index == 0 { 2 } else { 3 }] = 0;
+            let (row, field) = [(0, 2), (1, 3), (2, 3), (0, 3)][index];
+            table[row][field] = 0;
             if select_rates_version(|g, c| lookup(&table, g, c)).is_some() {
                 return TestResult::Fail("Sc HE partial rates-v2 inventory admitted");
             }
         }
         for index in 0..5 {
             let mut table = v3;
-            table[index] = if index == 4 {
-                [0xf5, 5, 0, 0]
-            } else {
-                v2[index]
-            };
+            let (row, field, value) =
+                [(0, 2, 10), (1, 3, 3), (2, 3, 5), (0, 3, 8), (3, 3, 0)][index];
+            table[row][field] = value;
             if select_rates_version(|g, c| lookup(&table, g, c)).is_some() {
                 return TestResult::Fail("Sc HE partial rates-v3 inventory admitted");
             }

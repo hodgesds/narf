@@ -59,9 +59,8 @@ fn image() -> Vec<u8> {
     let parsed = super::super::parse_ucode(&bytes).unwrap();
     let mut versions = parsed.api.commands.to_vec();
     versions.extend_from_slice(&[
-        2, 12, 1, 4, 0x98, 1, 1, 0, 0x9b, 1, 6, 0, 1, 2, 2, 0, 0x77, 1, 6, 0, 0x1c, 0, 9, 0, 0x1c,
-        1, 0, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 3, 15, 5, 3, 0, 0x17, 1, 3, 0, 2, 5, 1, 0, 0xff, 5, 0,
-        1,
+        2, 12, 1, 4, 0x98, 1, 1, 0, 0x9b, 1, 6, 0, 1, 2, 2, 0, 0x77, 1, 6, 0, 0x1c, 1, 9, 6, 0xc1,
+        0, 0, 4, 0xf7, 5, 0, 3, 15, 5, 3, 0, 0x17, 1, 3, 0, 2, 5, 1, 0, 0xff, 5, 0, 1,
     ]);
     tlv(&mut bytes, 48, &versions);
     tlv(&mut bytes, 29, &[0, 0, 0, 0, 0, 0, 0x10, 0x20]);
@@ -235,7 +234,7 @@ impl Actor {
             (1, 0xd) => Some(12),
             (5, 0x16) if b[0] == 0 => Some(1),
             (5, 0x16) if b[0] == 2 => Some(5),
-            (2, 0) | (0, 0x25) => Some(13),
+            (2, 0) | (1, 0x25) => Some(13),
             (5, 7) => Some(14),
             _ => None,
         });
@@ -529,7 +528,7 @@ impl Actor {
                     }
                     vec![]
                 }
-                (2, 0) | (0, 0x25) => {
+                (2, 0) | (1, 0x25) => {
                     if !b.is_empty() {
                         return Err("shared-memory query has a payload");
                     }

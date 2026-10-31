@@ -473,6 +473,13 @@ pub trait Interface: Send + Sync {
     fn is_loopback(&self) -> bool {
         false
     }
+    /// A registered control-only object has no Ethernet/netdev boundary.
+    /// Its immutable namespace is explicit, and its frame rings stay absent.
+    /// Wireless P2P-device owners use this alongside their actual typed
+    /// interface capability, without inventing an ifindex or IFF_UP.
+    fn control_namespace(&self) -> Option<u64> {
+        None
+    }
     /// Offloads supported through the frame rings. Producers must negotiate
     /// before setting TX metadata; the default accepts plain frames only.
     fn offloads(&self) -> OffloadCapabilities {
@@ -568,6 +575,47 @@ impl fmt::Debug for Entry {
 pub struct Registry {
     inner: IrqSafeSpinLock<Vec<Entry>>,
 }
+/// Control-only interface registration has no Ethernet metadata/frame ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlRegisterError {
+    AuthorityRevoked,
+    NotControl,
+    DuplicateName,
+}
+struct RegisterControl<'a, I> {
+    registry: &'a Registry,
+    iface: I,
+}
+impl<I: Interface + 'static> narf_capabilities::CapOp<NetIface, Grant> for RegisterControl<'_, I> {
+    type Output = Result<Cap<NetIface, Write>, ControlRegisterError>;
+    fn execute(
+        self,
+        _: &Cap<NetIface, Grant>,
+    ) -> Result<Self::Output, narf_capabilities::CapError> {
+        if self.iface.control_namespace().is_none()
+            || self.iface.name() == "lo"
+            || crate::iface::lookup(self.iface.name()).is_some()
+            || self.iface.link_up()
+            || self.iface.rx_ring().lock().is_some()
+            || self.iface.tx_ring().lock().is_some()
+        {
+            return Ok(Err(ControlRegisterError::NotControl));
+        }
+        let mut entries = self.registry.inner.lock();
+        if entries
+            .iter()
+            .any(|entry| entry.iface.name() == self.iface.name())
+        {
+            return Ok(Err(ControlRegisterError::DuplicateName));
+        }
+        let handle = Cap::<NetIface, Write>::bootstrap();
+        entries.push(Entry {
+            iface: Box::new(self.iface),
+            handle,
+        });
+        Ok(Ok(handle))
+    }
+}
 
 static REGISTRY: Registry = Registry {
     inner: IrqSafeSpinLock::new(Vec::new()),
@@ -580,6 +628,21 @@ pub fn registry() -> &'static Registry {
 }
 
 impl Registry {
+    /// Register a real control-only object under the current registration
+    /// grant invocation. The immutable namespace/absent frame rings never
+    /// create an Ethernet entry or a capability from discovery metadata.
+    pub fn register_control<I: Interface + 'static>(
+        &self,
+        authority: &Cap<NetIface, Grant>,
+        iface: I,
+    ) -> Result<Cap<NetIface, Write>, ControlRegisterError> {
+        authority
+            .invoke(RegisterControl {
+                registry: self,
+                iface,
+            })
+            .map_err(|_| ControlRegisterError::AuthorityRevoked)?
+    }
     /// Register an interface. Cap-gated on a `Cap<NetIface, Grant>`
     /// authority (mirrors the drivers/ framework). On success returns
     /// a `Cap<NetIface, Write>` handle the caller can later use to
@@ -612,6 +675,15 @@ impl Registry {
         let before = q.len();
         q.retain(|entry| entry.iface.name() != name);
         q.len() != before
+    }
+    /// Trusted driver teardown of exactly its retained typed registration.
+    /// A stale original handle cannot remove a same-name successor. This
+    /// identifies cleanup only; it grants no hardware/device operation.
+    pub fn unregister_for_handle(&self, handle: &Cap<NetIface, Write>) -> bool {
+        let mut entries = self.inner.lock();
+        let before = entries.len();
+        entries.retain(|entry| entry.handle.slot() != handle.slot());
+        before != entries.len()
     }
 
     /// Number of registered interfaces.
@@ -666,6 +738,7 @@ impl Registry {
         self.inner
             .lock()
             .iter()
+            .filter(|entry| entry.iface.control_namespace().is_none())
             .map(|entry| InterfaceSnapshot {
                 name: String::from(entry.iface.name()),
                 mac: entry.iface.mac(),

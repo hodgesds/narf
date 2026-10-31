@@ -61,7 +61,7 @@ pub(in crate::iwlwifi::mvm_boot) fn associated(
     let parsed = super::super::super::parse_ucode(&image).unwrap();
     let mut versions = parsed.api.commands.to_vec();
     versions.extend_from_slice(&[
-        0x1c, 0, 9, 0, 0x1c, 1, 0, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 3, 15, 5, version, 0,
+        0x1c, 1, 9, 6, 0xc1, 0, 0, 4, 0xf7, 5, 0, 3, 15, 5, version, 0,
     ]);
     runtime::model::versions(&mut owner.hardware, &versions);
     let mut response = vec![0; 81 + usize::from(mixed_rates)];

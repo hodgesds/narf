@@ -1124,7 +1124,7 @@ impl super::Owner {
             .is_some_and(|n| n.phy.ht && n.phy.tx_streams != 0 && n.phy.rx_streams != 0)
             && self.hardware.version(1, 0x18) == Some((12, 2))
             && self.hardware.version(5, 0x17) == Some((3, 2))
-            && self.hardware.version(0, 0x1c).is_some_and(|v| v.0 == 9)
+            && self.hardware.command_version(0, 0x1c) == Some(9)
             && self
                 .hardware
                 .version(1, 0x1c)

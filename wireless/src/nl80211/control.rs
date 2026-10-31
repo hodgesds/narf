@@ -16,6 +16,8 @@ use zeroize::Zeroizing;
 
 #[path = "ap_async.rs"]
 mod ap_async;
+#[path = "sched_async.rs"]
+mod sched_async;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "control_tests.rs"]
@@ -113,6 +115,41 @@ impl Cache {
     }
 }
 static CACHE: IrqSafeSpinLock<Vec<Cache>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Called only by the typed, exact-source radio event facade after native
+/// BSS admission. A background scan never replaces another identity's cache
+/// or an in-flight foreground scan's results.
+pub(crate) fn scheduled_results(
+    source: &crate::ap_control::RadioEventAuthority,
+    name: &str,
+    namespace: u64,
+    index: u32,
+    mut results: Vec<(crate::BssInfo, Vec<u8>)>,
+) -> Result<(), crate::WirelessError> {
+    let mut caches = CACHE.lock();
+    if narf_net::iface::lookup_in(namespace, name).is_none_or(|link| link.ifindex != index) {
+        return Err(crate::WirelessError::Denied);
+    }
+    source.current()?;
+    results.truncate(256);
+    if let Some(cache) = caches.iter_mut().find(|c| c.name == name) {
+        if cache.busy {
+            return Err(crate::WirelessError::Busy);
+        }
+        cache.ifindex = index;
+        cache.namespace = namespace;
+        cache.results = results;
+    } else {
+        caches.push(Cache {
+            name: name.into(),
+            ifindex: index,
+            namespace,
+            busy: false,
+            results,
+        });
+    }
+    Ok(())
+}
 
 // Clearing on Drop also covers cancellation before the first poll.
 struct OperationGuard(String, u32, u64);
@@ -1061,7 +1098,7 @@ fn route(
         return wowlan_handle(command, bytes, context);
     }
     if matches!(command, START_SCHED_SCAN | STOP_SCHED_SCAN) {
-        return sched_scan_handle(command, bytes, context);
+        return sched_scan_handle(command, bytes, context, deferred);
     }
     if command == SET_SAR_SPECS {
         return sar_handle(bytes, context);
@@ -1735,6 +1772,7 @@ fn sched_scan_handle(
     command: u8,
     bytes: &[u8],
     context: RequestContext<'_>,
+    deferred: Option<&narf_net::netlink_generic::DeferredRequest>,
 ) -> Result<Vec<GenlReply>, i32> {
     const ATTR_IFINDEX: u16 = 3;
     const ATTR_COOKIE: u16 = 88;
@@ -1742,7 +1780,7 @@ fn sched_scan_handle(
     const ATTR_SCHED_SCAN_MULTI: u16 = 255;
     let attrs = attributes(bytes)?;
     let (index, iface) = netdev_from_attrs(&attrs, context.net_ns_id)?;
-    let _admin = authority(&context, iface.as_ref())?;
+    let admin = authority(&context, iface.as_ref())?;
     let support = iface.sched_scan_support().ok_or(EOPNOTSUPP)?;
     match command {
         START_SCHED_SCAN => {
@@ -1750,7 +1788,18 @@ fn sched_scan_handle(
                 &attrs,
                 support,
                 &[ATTR_IFINDEX, ATTR_SOCKET_OWNER, ATTR_SCHED_SCAN_MULTI],
+                iface.sched_scan_pass_all(),
             )?;
+            if iface.async_sched_scan_control() {
+                return sched_async::defer(
+                    iface,
+                    admin,
+                    deferred,
+                    context.net_ns_id,
+                    index,
+                    sched_async::Operation::Start(request),
+                );
+            }
             iface.start_sched_scan(request)?;
             super::notify_sched_scan(iface.name(), index, START_SCHED_SCAN);
         }
@@ -1760,6 +1809,16 @@ fn sched_scan_handle(
             // without multi-request support).
             if u64_attr(&attrs, ATTR_COOKIE)?.is_some_and(|cookie| cookie != 0) {
                 return Err(ENOENT);
+            }
+            if iface.async_sched_scan_control() {
+                return sched_async::defer(
+                    iface,
+                    admin,
+                    deferred,
+                    context.net_ns_id,
+                    index,
+                    sched_async::Operation::Stop,
+                );
             }
             iface.stop_sched_scan()?;
             super::notify_sched_scan(iface.name(), index, SCHED_SCAN_STOPPED);
@@ -1910,7 +1969,7 @@ fn parse_net_detect(
     let mut limits = limits.ok_or(EOPNOTSUPP)?;
     limits.max_match_sets = limits.max_match_sets.min(support.net_detect_max_match_sets);
     limits.random_mac &= support.net_detect_random_mac;
-    parse_sched_scan(&attributes(raw)?, limits, &[])
+    parse_sched_scan(&attributes(raw)?, limits, &[], false)
 }
 
 /// cfg80211 `nl80211_parse_sched_scan` over already-split attributes, with
@@ -1921,6 +1980,7 @@ fn parse_sched_scan(
     fields: &[(u16, &[u8])],
     limits: crate::SchedScanSupport,
     extra: &[u16],
+    pass_all: bool,
 ) -> Result<crate::NetDetectConfig, i32> {
     // These are the NL80211_ATTR_* values accepted by
     // nl80211_parse_sched_scan.
@@ -1996,8 +2056,9 @@ fn parse_sched_scan(
     let raw_matches = attr(fields, ATTR_SCHED_SCAN_MATCH)
         .map(attributes)
         .transpose()?
-        .ok_or(EINVAL)?;
-    if raw_matches.is_empty() || raw_matches.len() > usize::from(limits.max_match_sets) {
+        .unwrap_or_default();
+    if !pass_all && raw_matches.is_empty() || raw_matches.len() > usize::from(limits.max_match_sets)
+    {
         return Err(EINVAL);
     }
     let mut matches = Vec::with_capacity(raw_matches.len());
@@ -2008,7 +2069,7 @@ fn parse_sched_scan(
             return Err(EOPNOTSUPP);
         }
         let ssid = attr(&one, 1).ok_or(EINVAL)?;
-        if ssid.is_empty() || ssid.len() > 32 {
+        if !pass_all && ssid.is_empty() || ssid.len() > 32 {
             return Err(EINVAL);
         }
         let rssi_threshold_dbm = attr(&one, 2)

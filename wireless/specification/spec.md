@@ -902,6 +902,34 @@ each visible netdev with that group's `WIPHY` value and an interface-unique
 `WDEV` id. The default `wiphy_id` is a stable name hash for simple drivers;
 multi-vdev hardware must override it with its physical-radio identity.
 
+An actual P2P-device is a control-only registered wdev, independently of an
+Ethernet netdev. `registry::register_control(parent, child)` pairs the actual
+still-registered physical parent with a same-wiphy mode10 child whose real
+typed net interface declares its immutable control namespace. It requires no
+legacy IFACES entry, invented ifindex, IFF_UP, carrier or packet rings. Trusted
+driver registration supplies actual registration/device/current-request grants;
+the registry's observations mint no capability. `ControlWdev` carries a
+nonwrapping opaque registration identifier and namespace; `control_for`,
+`control_by_id` and `unregister_control` compare the exact original object/id.
+Rebind with the same name/MAC/mode cannot revive an old observation or remove
+the successor. The control-id space is disjoint from existing netdev WDEV
+encoding; the existing nonnegative signed wiphy-index bound follows Linux
+`wiphy_new_nm`. Existing netdev indices/WDEV values retain their shape.
+
+`RadioControlAuthority::bind_wdev(admin, iface, namespace, wdev, source)` binds
+the actual control-only identity with no ifindex parameter. The private target
+is explicitly Netdev or ControlWdev. Actual Admin/source/receiver/mode-generation
+checks still precede every native operation/publication; observations establish
+no started wdev, CNM grant, RF right, key or port. Ordinary netdev/AP/GO guards
+retain their existing UP/ownership-epoch contract. Typed control-wdev radio
+events omit IFINDEX and carry their actual WDEV id, while ordinary netdev and
+scheduled-scan event shapes remain unchanged. This registration facade itself
+advertises no P2P role or native control operation.
+`GET_INTERFACE` resolves a control-only target by its exact WDEV/namespace and
+emits no IFINDEX attribute; retired IDs cannot select another object. WDEV-based
+physical-wiphy lookup resolves the same registered control object rather than
+interpreting its opaque identifier as a fabricated netdev index.
+
 Drivers which can create firmware vdevs opt in through
 `supports_virtual_interfaces`, `new_virtual_interface(name, iftype, mac)`,
 and `delete_virtual_interface`. `NL80211_CMD_NEW_INTERFACE` is addressed to
@@ -1236,6 +1264,42 @@ userspace over AUTHENTICATE as on Linux. The external mode is:
   "scan". STOP (an optional COOKIE must be the legacy request id 0, otherwise
   -ENOENT) calls `stop_sched_scan()` and multicasts SCHED_SCAN_STOPPED. Both
   driver hooks default to -EOPNOTSUPP.
+
+  `async_sched_scan_control()` explicitly opts a driver into native terminal
+  acknowledgements through `start_sched_scan_async` / `stop_sched_scan_async`.
+  These use `RadioControlAuthority`, the actual `radio_control_generation`
+  and synchronous `reserve_radio_control` lease; a callback or support flag
+  supplies no administrative, firmware, channel or RF grant. Admission binds
+  the original delegated grant, exact source socket, namespace/ifindex and
+  mode generation before queueing. Every poll and final publication require
+  continuing authority and administrative UP. The native callback retains
+  cancellation/repair independently of a dropped external waiter, and it
+  returns success only after the actual firmware start or terminal stop.
+  The original sequence receives its deferred ACK after that result; queue
+  admission alone sends no success or scan event. Drivers without this
+  opt-in retain the existing synchronous path and its default callbacks.
+
+  `sched_scan_pass_all()` separately opts into Linux's filterless/pass-all
+  requests and empty SSID match. Its default is false, preserving existing
+  WoWLAN network-detect restrictions. It changes parsing facts only; the
+  native owner still supplies every firmware, source and radio proof.
+
+  The native owner may retain typed `RadioEventAuthority` methods
+  `scheduled_scan_started`, `scheduled_scan_results` and
+  `scheduled_scan_stopped`. They check the actual registered source and
+  generation and publish to that namespace's scan group. Only matching
+  native UID/start/result/stop receipts, current filters and current radio
+  policy justify those calls; the type does not establish those hardware
+  facts. Event publication occurs outside native owner locks. Losing the
+  source suppresses later event/ACK delivery and still requires the driver's
+  retained physical stop or repair path for an autonomous firmware scan.
+
+  `scheduled_scan_results_with_bss` accepts the native owner's admitted
+  `(BssInfo, IEs)` snapshot, bounds it to256 entries and replaces only the
+  current namespace/ifindex cache before RESULTS. The cache rechecks the
+  exact source under its lock and refuses a competing foreground operation;
+  GET_SCAN then observes the same records. A control-only WDEV cannot use
+  this netdev cache method. Legacy notification-only hooks remain available.
 
   The driver reports matches with `nl80211::notify_sched_scan_results(name)`
   (`cfg80211_sched_scan_results`, CMD 77) and a firmware-initiated end with

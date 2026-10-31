@@ -37,6 +37,7 @@ const MLD_COMMANDS: &[[u8; 4]] = &[
     [0xc, 3, 1, 0],   // STA removal
     [5, 3, 3, 0],     // association
     [0xd, 1, 18, 0],  // scan
+    [0x6e, 1, 3, 0],  // normalized scheduled-scan profiles
     [0xc5, 0, 0, 7],  // receive notification
     [0xc8, 1, 1, 8],  // MCC response used by the MLD model
 ];

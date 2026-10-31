@@ -7,10 +7,14 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 
+#[path = "control_wdev_tests.rs"]
+mod control_wdev;
 #[path = "ap_dispatch_tests.rs"]
 mod dispatch;
 #[path = "ap_event_tests.rs"]
 mod events;
+#[path = "sched_dispatch_tests.rs"]
+mod scheduled;
 
 struct Radio {
     name: String,
@@ -30,6 +34,11 @@ struct Radio {
     station_sme: AtomicBool,
     station_handshake: AtomicBool,
     settings_seen: AtomicBool,
+    sched_supported: AtomicBool,
+    sched_native: AtomicBool,
+    sched_started: AtomicU32,
+    sched_stopped: AtomicU32,
+    sched_request: IrqSafeSpinLock<Option<crate::SchedScanRequest>>,
     control_sends: AtomicU32,
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
@@ -54,6 +63,11 @@ impl Radio {
             station_sme: AtomicBool::new(true),
             station_handshake: AtomicBool::new(false),
             settings_seen: AtomicBool::new(false),
+            sched_supported: AtomicBool::new(false),
+            sched_native: AtomicBool::new(false),
+            sched_started: AtomicU32::new(0),
+            sched_stopped: AtomicU32::new(0),
+            sched_request: IrqSafeSpinLock::new(None),
             control_sends: AtomicU32::new(0),
             rx: IrqSafeSpinLock::new(None),
             tx: IrqSafeSpinLock::new(None),
@@ -127,6 +141,38 @@ impl WirelessNetIface for Radio {
     }
     fn reserve_ap_control(&self) -> Result<Option<Arc<dyn ApControlReservation>>, WirelessError> {
         self.serial.try_reserve().map(Some)
+    }
+    fn sched_scan_support(&self) -> Option<crate::SchedScanSupport> {
+        self.sched_supported
+            .load(Ordering::Acquire)
+            .then_some(crate::SchedScanSupport {
+                max_match_sets: 8,
+                ..crate::SchedScanSupport::NET_DETECT
+            })
+    }
+    fn async_sched_scan_control(&self) -> bool {
+        self.sched_native.load(Ordering::Acquire)
+    }
+    fn start_sched_scan(&self, request: crate::SchedScanRequest) -> Result<(), i32> {
+        *self.sched_request.lock() = Some(request);
+        self.sched_started.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+    fn stop_sched_scan(&self) -> Result<(), i32> {
+        self.sched_stopped.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+    async fn start_sched_scan_async(
+        &self,
+        authority: &RadioControlAuthority,
+        request: crate::SchedScanRequest,
+    ) -> Result<(), i32> {
+        self.scheduled_callback(authority).await?;
+        self.start_sched_scan(request)
+    }
+    async fn stop_sched_scan_async(&self, authority: &RadioControlAuthority) -> Result<(), i32> {
+        self.scheduled_callback(authority).await?;
+        self.stop_sched_scan()
     }
     fn supports_userspace_mlme(&self) -> bool {
         self.station_sme.load(Ordering::Acquire)

@@ -7,10 +7,14 @@ const IGTK: [u8; 16] = [0x6b; 16];
 const IPN: u64 = 0x0102_0304_0506;
 
 pub(super) fn versions(table: &mut Vec<u8>, rates: u8) {
-    table.extend_from_slice(&[0x1c, 0, if rates == 3 { 11 } else { 10 }, 0]);
     table.extend_from_slice(&[0xf7, 5, 0, if rates == 3 { 4 } else { 3 }]);
     table.extend_from_slice(&[0xc1, 0, 0, if rates == 3 { 6 } else { 5 }]);
-    table.extend_from_slice(&[0x1c, 1, 0, if rates == 3 { 9 } else { 8 }]);
+    table.extend_from_slice(&[
+        0x1c,
+        1,
+        if rates == 3 { 11 } else { 10 },
+        if rates == 3 { 9 } else { 8 },
+    ]);
     if rates == 3 {
         table.extend_from_slice(&[0xf5, 5, 0, 4]);
     }
