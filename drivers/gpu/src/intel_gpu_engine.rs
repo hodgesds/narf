@@ -48,6 +48,9 @@ impl Engine {
             Engine::Bcs0 => 1,
         }
     }
+    pub(crate) fn from_xe_class(class: u16) -> Option<Self> {
+        Self::ALL.into_iter().find(|e| e.xe_class() == class)
+    }
     /// xe_gt_lrc_size: PPHWSP plus the class's engine context image.
     pub(crate) fn lrc_pages(self, platform: GtPlatform) -> u32 {
         match (self, platform) {
@@ -252,6 +255,8 @@ pub(crate) mod tests {
             Engine::ALL.map(|e| (e.base(), e.guc_class(), e.xe_class())),
             [(0x2000, 0, 0), (0x22000, 3, 1)]
         );
+        assert_eq!(Engine::from_xe_class(1), Some(Engine::Bcs0));
+        assert_eq!(Engine::from_xe_class(4), None);
         for platform in [
             GtPlatform::Alchemist,
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),

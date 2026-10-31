@@ -119,15 +119,20 @@ list, raw HWCONFIG, topology masks, correlated engine cycles and GuC
 submission-interface version.
 It uses Xe's size-only/exact-size
 protocol; size-only calls never touch the payload pointer. Engine discovery
-publishes only live RCS0. Unavailable query types return EINVAL. DeviceFacts
+publishes live RCS0 then BCS0 (Xe RENDER/COPY, logical instance 0, GT0) in
+xe_hw_engine id order, or zero engines before readiness. Unavailable query
+types return EINVAL. DeviceFacts
 contains the actual PCI revision, validated graphics IP/step and the stable
 RPM_CONFIG0-derived timestamp clock. The GT owner samples it with current
 forcewake after its startup execution probes and publishes it before readiness.
 The firmware query validates its input subtype/reserved fields and reports
 the loaded CSS compatibility tuple; unavailable HuC remains ENODEV.
 Engine-cycle queries retain their input engine/clock and destination before
-awaiting UserBackend::engine_cycles. The live GT owner samples RCS0 under its
-async reset mutex, PCI D0 and current render forcewake; loss clears admission.
+awaiting `UserBackend::engine_cycles(engine, clock)`. As in xe_query.c the
+engine pad is ignored; classes other than RENDER/COPY, a nonzero logical
+instance or GT1 return EINVAL. The live GT owner samples the selected engine's
+RING_TIMESTAMP (RCS0 at 0x2358, BCS0 at 0x22358) under its async reset mutex,
+PCI D0 and current render forcewake; loss clears admission.
 EngineCycles contains width (36 bits before BMG; 64 on BMG), the actual
 RING_TIMESTAMP counter and CPU timestamp/delta around its lower-register read.
 At most three high/low/high observations handle rollover; unstable observations
@@ -152,7 +157,9 @@ VM_CREATE/DESTROY and EXEC_QUEUE_CREATE/DESTROY/GET_PROPERTY have independent
 per-open namespaces bounded at 64 VMs and 64 queues. Destroying a VM with open
 queues returns EBUSY. Queue destruction removes the handle and refuses pending
 admission while retaining every submitted residency until terminal completion.
-Width 1 RCS0 and software VM_BIND queues are supported. Property extension
+Width 1 RCS0, width 1 BCS0 and software VM_BIND queues are supported; a COPY
+queue's `UserContext::for_engine(Engine::Bcs0)` saves and restores only BCS
+LRC state. VIDEO/COMPUTE classes return EINVAL. Property extension
 chains are bounded at 16 unique links. Low/normal Xe priorities map to GuC 3/2;
 elevated priority requires authority this interface does not grant (EPERM).
 Timeslices are bounded to 1..100000 microseconds; unknown properties, flags,

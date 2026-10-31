@@ -1,4 +1,4 @@
-//! Native Xe per-open VM/queue ABI over the owned GuC RCS backend.
+//! Native Xe per-open VM/queue ABI over the owned GuC RCS0/BCS0 backend.
 //! MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad: xe_vm.c,
 //! xe_exec_queue.c, xe_exec.c, xe_sync.c and xe_wait_user_fence.c.
 use crate::{
@@ -250,7 +250,8 @@ impl XeFile {
         let instance = read(user, u64_at(&wire, 24), 8)?;
         zero(&instance[2..8])?;
         let class = u16::from_le_bytes(instance[..2].try_into().unwrap());
-        if !matches!(class, 0 | 5) {
+        let engine = crate::intel_gpu_engine::Engine::from_xe_class(class);
+        if class != 5 && engine.is_none() {
             return Err(FsError::InvalidData);
         }
         let mut extensions = u64_at(&wire, 0);
@@ -275,7 +276,8 @@ impl XeFile {
             }
             extensions = u64_at(&ext, 0);
         }
-        let context = UserContext::new();
+        let context =
+            UserContext::for_engine(engine.unwrap_or(crate::intel_gpu_engine::Engine::Rcs0));
         context.configure_schedule(priority, timeslice)?;
         let mut names = self.names.lock();
         let vm = names

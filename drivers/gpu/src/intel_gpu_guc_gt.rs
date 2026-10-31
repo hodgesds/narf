@@ -194,10 +194,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         })
     }
 
-    /// A current RCS counter observation, serialized with reset by the PCI
-    /// owner. Clock IDs match NARF clock_gettime; CLOCK_TAI is unavailable.
+    /// A current engine counter observation, serialized with reset by the
+    /// PCI owner. Clock IDs match NARF clock_gettime; CLOCK_TAI is unavailable.
     pub fn engine_cycles(
         &mut self,
+        engine: crate::intel_gpu_engine::Engine,
         clock: i32,
     ) -> Result<crate::intel_gpu_timestamp::EngineCycles, GtError> {
         if self.user_epoch().is_none() {
@@ -212,6 +213,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         crate::intel_gpu_timestamp::sample(
             self.parts.boot.window(),
+            engine,
             if self.parts.boot.platform() == crate::intel_gpu_gt::GtPlatform::Battlemage {
                 64
             } else {

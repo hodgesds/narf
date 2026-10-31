@@ -102,6 +102,7 @@ impl crate::intel_gpu_user::UserBackend for Backend {
     }
     fn engine_cycles(
         &self,
+        engine: crate::intel_gpu_engine::Engine,
         clock: i32,
     ) -> narf_filesystem::FsFuture<'_, crate::intel_gpu_timestamp::EngineCycles> {
         Box::pin(async move {
@@ -117,7 +118,7 @@ impl crate::intel_gpu_user::UserBackend for Backend {
                 .gt
                 .as_mut()
                 .ok_or(narf_filesystem::FsError::NoDevice)?;
-            let result = gt.engine_cycles(clock);
+            let result = gt.engine_cycles(engine, clock);
             if gt.state() == GtState::Lost {
                 owner.user_epoch.store(0, Ordering::Release);
             }

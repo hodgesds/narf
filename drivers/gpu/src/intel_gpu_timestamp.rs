@@ -1,4 +1,4 @@
-//! Correlated RCS timestamps. MIT Linux xe_query.c at
+//! Correlated RCS0/BCS0 RING_TIMESTAMP samples. MIT Linux xe_query.c at
 //! b90c984d615e8ce2af96f5b1411a962d83fed2ad.
 use crate::intel_gpu_aux::MmioWindow;
 
@@ -21,17 +21,22 @@ pub(crate) enum SampleError {
 /// CPU time brackets the lower register, matching the Xe wire contract.
 pub(crate) fn sample(
     window: &impl MmioWindow,
+    engine: crate::intel_gpu_engine::Engine,
     width: u32,
     mut clock: impl FnMut() -> u64,
     mut monotonic: impl FnMut() -> u64,
 ) -> Result<EngineCycles, SampleError> {
-    let mut upper = window.read32(0x235c);
+    let (low, high) = (
+        u64::from(engine.base()) + 0x358,
+        u64::from(engine.base()) + 0x35c,
+    );
+    let mut upper = window.read32(high);
     for _ in 0..3 {
         let before = monotonic();
         let cpu_timestamp = clock();
-        let lower = window.read32(0x2358);
+        let lower = window.read32(low);
         let after = monotonic();
-        let next = window.read32(0x235c);
+        let next = window.read32(high);
         if upper == next {
             if (upper == u32::MAX && lower == u32::MAX) || (width == 36 && upper & !0xf != 0) {
                 return Err(SampleError::Unavailable);
@@ -51,6 +56,7 @@ pub(crate) fn sample(
 #[cfg(feature = "kernel-test")]
 mod tests {
     use super::*;
+    use crate::intel_gpu_engine::Engine;
     use alloc::collections::VecDeque;
     use core::cell::{Cell, RefCell};
     use narf_kernel_test::{kernel_test_in, TestResult};
@@ -82,6 +88,7 @@ mod tests {
         let mono = Cell::new(10);
         let stamp = sample(
             &registers,
+            Engine::Rcs0,
             36,
             || {
                 let value = cpu.get();
@@ -110,12 +117,17 @@ mod tests {
             (0x2358, 0x90abcdef),
             (0x235c, 0x12345678),
         ]);
-        let stamp = sample(&registers, 64, || 200, || 300).unwrap();
+        let stamp = sample(&registers, Engine::Rcs0, 64, || 200, || 300).unwrap();
         assert_eq!(stamp.engine_cycles, 0x1234567890abcdef);
         assert_eq!(stamp.width, 64);
         assert_eq!(stamp.cpu_delta, 0);
         let registers = fixed(&[(0x235c, 0), (0x2358, 0), (0x235c, 0)]);
-        assert_eq!(sample(&registers, 36, || 0, || 0).unwrap().engine_cycles, 0);
+        assert_eq!(
+            sample(&registers, Engine::Rcs0, 36, || 0, || 0)
+                .unwrap()
+                .engine_cycles,
+            0
+        );
         TestResult::Pass
     }
     kernel_test_in!(
@@ -134,21 +146,21 @@ mod tests {
             (0x235c, 4),
         ]);
         assert_eq!(
-            sample(&registers, 36, || 0, || 0),
+            sample(&registers, Engine::Rcs0, 36, || 0, || 0),
             Err(SampleError::Unstable)
         );
         assert!(registers.0.borrow().is_empty());
         for (width, upper, lower) in [(64, u32::MAX, u32::MAX), (36, 16, 0)] {
             let registers = fixed(&[(0x235c, upper), (0x2358, lower), (0x235c, upper)]);
             assert_eq!(
-                sample(&registers, width, || 0, || 0),
+                sample(&registers, Engine::Rcs0, width, || 0, || 0),
                 Err(SampleError::Unavailable)
             );
         }
         let registers = fixed(&[(0x235c, 0), (0x2358, 1), (0x235c, 0)]);
         let mono = Cell::new(10);
         assert_eq!(
-            sample(&registers, 36, || 0, || mono.replace(9)),
+            sample(&registers, Engine::Rcs0, 36, || 0, || mono.replace(9)),
             Err(SampleError::Unstable)
         );
         TestResult::Pass

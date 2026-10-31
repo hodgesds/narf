@@ -1,5 +1,6 @@
 //! Xe query results describe observed resources, never hypothetical engines.
 use crate::{
+    intel_gpu_engine::Engine,
     intel_gpu_render::DeviceInfo,
     intel_gpu_topology::EuType,
     intel_gpu_uapi::{put32, put64, u32_at, u64_at},
@@ -33,12 +34,15 @@ pub(crate) async fn query_user(
     }
     let data = u64_at(&wire, 16);
     let input = read(user, data, 40)?;
-    // Only the advertised RCS0 on main GT0 can be sampled.
-    zero(&input[..8])?;
     let clock = u32_at(&input, 8) as i32;
     if !matches!(clock, 0 | 1 | 4 | 7) {
         return Err(FsError::InvalidData);
     }
+    // Like xe_query.c, the engine pad is ignored. Only main GT0's published
+    // logical instance 0 of RCS or BCS can be sampled.
+    let engine = Engine::from_xe_class(u16::from_le_bytes([input[0], input[1]]))
+        .filter(|_| input[2..6] == [0; 4])
+        .ok_or(FsError::InvalidData)?;
     let destination = data.checked_add(12).ok_or(FsError::BadAddress)?;
     if !info.submission_ready() {
         return Err(FsError::NoDevice);
@@ -47,7 +51,7 @@ pub(crate) async fn query_user(
         .backend
         .as_ref()
         .ok_or(FsError::NoDevice)?
-        .engine_cycles(clock)
+        .engine_cycles(engine, clock)
         .await?;
     let mut output = [0; 28];
     put32(&mut output, 0, stamp.width);
@@ -67,8 +71,17 @@ fn query_wire(
     zero(&wire[24..40])?;
     let payload = match u32_at(wire, 8) {
         0 => {
-            let mut reply = vec![0; if info.submission_ready() { 40 } else { 8 }];
-            put32(&mut reply, 0, u32::from(info.submission_ready()));
+            // drm_xe_query_engines in xe_hw_engine id order: RCS0, BCS0.
+            let engines: &[Engine] = if info.submission_ready() {
+                &Engine::ALL
+            } else {
+                &[]
+            };
+            let mut reply = vec![0; 8 + engines.len() * 32];
+            put32(&mut reply, 0, engines.len() as u32);
+            for (i, engine) in engines.iter().enumerate() {
+                reply[8 + i * 32..10 + i * 32].copy_from_slice(&engine.xe_class().to_le_bytes());
+            }
             reply
         }
         1 if info.memory_bytes != 0 => {

@@ -275,21 +275,38 @@ fn ready<F: Future + ?Sized>(mut future: core::pin::Pin<&mut F>) -> F::Output {
 }
 
 fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
-    for (platform, ack) in [
+    // RENDER, then COPY: the same PPGTT batch and user fence on BCS0.
+    for (platform, ack, class) in [
         (GtPlatform::Battlemage, 0xdfc),
         (GtPlatform::Alchemist, 0x130044),
         (
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
             0xdfc,
         ),
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|(platform, ack)| [0u16, 1].map(|class| (platform, ack, class)))
+    {
         let (w, arena, mut gt) = hardware_model(platform, ack);
         prime(&mut gt, &w, ack);
         let (mailbox, info) = setup(&mut gt, &w, platform);
         let file = RenderFile::new();
         let user = Cpu::new();
         let vm = create_vm(&file, &info, &user);
-        let queue = create_queue(&file, &info, &user, vm, 0);
+        // VIDEO_DECODE, VIDEO_ENHANCE and COMPUTE are not admitted engines.
+        for refused in [2u8, 3, 4, 6] {
+            user.wire.store(512, &[refused, 0, 0, 0, 0, 0, 0, 0]);
+            let mut wire = [0; 48];
+            put32(&mut wire, 8, 0x00010001);
+            put32(&mut wire, 12, vm);
+            put64(&mut wire, 24, 512);
+            user.wire.store(64, &wire);
+            assert_eq!(
+                invoke(&file, &info, &user, xe::EXEC_QUEUE_CREATE),
+                Err(FsError::InvalidData)
+            );
+        }
+        let queue = create_queue(&file, &info, &user, vm, class);
         let handles = buffers(&file, &info, &user, vm);
         let objects = handles.map(|handle| Arc::downgrade(&file.gem.object(handle).unwrap()));
         let output = file.syncobjs.lock().create(0).unwrap();
@@ -342,6 +359,12 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
             }
         }
         assert_eq!(user.read_u64_acquire(0x4090), Ok(value));
+        // The batch's MI_STORE_DATA_IMM executed on the selected engine.
+        assert_eq!(user.read_u64_acquire(0x4080), Ok(0x4e415246));
+        let engine_base = if class == 1 { 0x22244 } else { 0x2244 };
+        assert!(registered.values().all(|base| {
+            w.0.borrow().memory[base].borrow()[1024 + 2] == engine_base
+        }));
         assert_eq!(
             fence.result(),
             None,
@@ -484,7 +507,7 @@ fn smoke_xe_queries_abi_identity_and_clock_facts() -> TestResult {
     );
     assert_eq!(user.wire.load(4096, 2), b"xe");
     assert_eq!(u64_at(&user.wire.load(64, 64), 16), 2);
-    for (query, size) in [(0, 40), (1, 96), (2, 48), (3, 104), (5, 34)] {
+    for (query, size) in [(0, 72), (1, 96), (2, 48), (3, 104), (5, 34)] {
         let mut wire = [0; 40];
         put32(&mut wire, 8, query);
         put64(&mut wire, 16, u64::MAX);
@@ -504,8 +527,11 @@ fn smoke_xe_queries_abi_identity_and_clock_facts() -> TestResult {
         let reply = user.wire.load(1024, size as usize);
         match query {
             0 => {
-                assert_eq!(u32_at(&reply, 0), 1);
-                assert!(reply[4..].iter().all(|b| *b == 0));
+                // drm_xe_engine: RENDER then COPY, logical instance 0, GT0.
+                assert_eq!(u32_at(&reply, 0), 2);
+                assert!(reply[4..40].iter().all(|b| *b == 0));
+                assert_eq!(&reply[40..42], &[1, 0]);
+                assert!(reply[42..].iter().all(|b| *b == 0));
             }
             1 => {
                 assert_eq!(u32_at(&reply, 12), 4096);
