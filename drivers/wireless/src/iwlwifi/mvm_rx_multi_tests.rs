@@ -58,7 +58,7 @@ impl Actor {
                         qword(body, at + 20),
                     ];
                     if body[at..at + 4] != [queue, 0, 0, 0]
-                        || dma.iter().any(|address| *address == 0)
+                        || dma.contains(&0)
                         || dword(body, at + 28) != 504
                     {
                         return Err("MVM RFH_CONFIG literal queue/enable/DMA/index");
