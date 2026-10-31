@@ -112,6 +112,9 @@ impl DrrApplied {
 impl<I: Io> Engine<I> {
     /// The live scanout's prepared timing, if `pipe` scans out.
     pub(super) fn drr_timing(&self, pipe: u8) -> Result<Timing, Error> {
+        if self.subvp().is_some() {
+            return Err(Error::Busy);
+        }
         let running = self.status.scanout.ok_or(Error::Busy)?;
         if self.status.state != State::ScanoutRunning(pipe) || running.pipe != pipe {
             return Err(Error::Busy);
@@ -595,6 +598,13 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     pub(super) fn handoff_drr(&mut self, pipe: u8, enable: bool) -> Result<(), Error> {
+        if self.status.subvp.is_some() {
+            return if self.status.drr.is_none() {
+                Ok(())
+            } else {
+                Err(Error::Busy)
+            };
+        }
         self.drr_timing(pipe)?;
         if let Some(mut a) = self.status.drr.filter(|a| a.pipe == pipe) {
             // A finite hardware sequence cannot be replayed on a new owner:

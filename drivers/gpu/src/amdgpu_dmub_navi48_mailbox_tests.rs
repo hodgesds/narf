@@ -1190,6 +1190,7 @@ kernel_test_in!(
 
 fn fams2_stream() -> Fams2StreamConfig {
     Fams2StreamConfig {
+        phantom: None,
         drr: None,
         base: crate::amdgpu_dcn401_dml::pstate::Fams2Stream {
             kind: 2,
@@ -1211,6 +1212,7 @@ fn fams2_stream() -> Fams2StreamConfig {
             min_ttu_vblank_usable: true,
             vactive_det_fill_delay_otg_vlines: 27,
             drr_state: None,
+            subvp: None,
         },
         otg_inst: 2,
         pipe_mask: 0b0110,
@@ -1337,6 +1339,7 @@ fn dmub_navi48_fams2_config_replays_linux_vectors() -> TestResult {
         let streams: Vec<Fams2StreamConfig> = v[8..]
             .chunks(25)
             .map(|s| Fams2StreamConfig {
+                phantom: None,
                 drr: None,
                 base: crate::amdgpu_dcn401_dml::pstate::Fams2Stream {
                     kind: s[0] as u8,
@@ -1358,6 +1361,7 @@ fn dmub_navi48_fams2_config_replays_linux_vectors() -> TestResult {
                     min_ttu_vblank_usable: bit(s[14], 2),
                     vactive_det_fill_delay_otg_vlines: half(s[24]),
                     drr_state: None,
+                    subvp: None,
                 },
                 otg_inst: s[15] as u8,
                 pipe_mask: s[16] as u8,
@@ -1521,4 +1525,42 @@ fn dmub_navi48_missing_hw_lock_ack_cannot_admit_a_later_fams2_schedule() -> Test
 kernel_test_in!(
     "drivers/gpu/dmub-navi48",
     dmub_navi48_missing_hw_lock_ack_cannot_admit_a_later_fams2_schedule
+);
+
+fn dmub_navi48_subvp_static_state_uses_v1_physical_masks() -> TestResult {
+    let mut s = fams2_stream();
+    s.base.kind = 4;
+    s.base.subvp = Some(crate::amdgpu_dcn401_dml::pstate::SubvpSubstate {
+        phantom_vtotal: 171,
+        phantom_vactive: 130,
+        programming_delay: 4,
+        prefetch_to_mall: 2,
+    });
+    s.phantom = Some(Fams2PhantomConfig {
+        otg_inst: 3,
+        pipe_mask: 8,
+        plane_pipe_masks: [8, 0, 0],
+    });
+    let c = fams2_config_commands(
+        true,
+        &Fams2Global {
+            num_streams: 1,
+            ..Default::default()
+        },
+        &[s],
+    );
+    assert_eq!(c.len(), 3);
+    assert_eq!(
+        &c[2][4..24],
+        &[0xe8, 3, 0xe8, 3, 171, 0, 130, 0, 4, 0, 2, 0, 0, 3, 8, 0, 8, 0, 0, 0]
+    );
+    assert!(c[2][24..].iter().all(|&v| v == 0));
+    assert_eq!(c[2][2] & 2, 0);
+    assert_eq!(c[0][2] & 2, 2);
+    assert_eq!(c[1][2] & 2, 2);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_subvp_static_state_uses_v1_physical_masks
 );

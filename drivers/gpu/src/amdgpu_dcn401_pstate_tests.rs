@@ -686,3 +686,53 @@ kernel_test_in!(
     "drivers/gpu/dcn401-pstate",
     dcn401_pstate_replans_bandwidth_raises_before_programming
 );
+
+fn dcn401_subvp_expands_and_readmits_phantom_without_det() -> TestResult {
+    let (soc, uclk) = board();
+    let mut count = 0;
+    for bpp in [4, 8] {
+        for hz in [60, 90, 100, 120, 144, 165] {
+            let mut mode = uhd();
+            mode.timing.pixel_clock_khz = mode.timing.h_total * mode.timing.v_total * hz / 1000;
+            mode.bytes_per_pixel = bpp;
+            let Some(s) = admit_subvp(&soc, &uclk, &mode, 64 * 1024 * 1024).unwrap() else {
+                continue;
+            };
+            count += 1;
+            let ph = s.phantom.as_ref().unwrap();
+            assert_eq!(ph.plan.det_bytes, 0);
+            assert_eq!(s.plans[0].det_bytes, 1280 * 1024);
+            assert!(s.plans[0].readmits());
+            assert!(ph.plan.readmits());
+            assert!(ph.readmits());
+            let mut damaged_cache = ph.as_ref().clone();
+            damaged_cache.mall_ways += 1;
+            assert!(!damaged_cache.readmits());
+            assert!(ph.mall_ways > 0 && ph.mall_ways <= 16);
+            assert!(ph.mall_bytes < 64 * 1024 * 1024);
+            assert!(s.active.dcfclk_khz >= s.idle.dcfclk_khz);
+            assert_eq!(s.fams2_streams[0].kind, 4);
+            let wire = s.fams2_streams[0].subvp.unwrap();
+            assert_eq!(u32::from(wire.phantom_vtotal), ph.plan.mode.timing.v_total);
+            assert_eq!(
+                u32::from(wire.phantom_vactive),
+                ph.plan.mode.timing.v_active
+            );
+            let mut damaged = ph.plan;
+            damaged.det_bytes = 65536;
+            assert!(!damaged.readmits());
+            let mut damaged = s.plans[0];
+            damaged.watermarks.frac_urg_bw_mall += 1;
+            assert!(!damaged.readmits());
+        }
+    }
+    assert!(count > 0, "no single-stream RGB SubVP mode admitted");
+    assert!(admit_subvp(&soc, &uclk, &hd(), 64 * 1024 * 1024)
+        .unwrap()
+        .is_none());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-pstate",
+    dcn401_subvp_expands_and_readmits_phantom_without_det
+);

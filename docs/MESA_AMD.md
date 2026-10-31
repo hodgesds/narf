@@ -473,7 +473,11 @@ configurations. Firmware chains and hardware locks must acknowledge before
 clock relaxation. DPMM raises now program actual active clocks within board
 limits. Native LFC/MID can retain switching on one admitted native DRR stream;
 matching FAMS2 DRR methods also admit multiple streams through acknowledged
-firmware timing requests. SubVP still pins without phantom/MALL ownership. Board-supported GFX_ULV and DS_DCFCLK have separate
+firmware timing requests. Single-stream SubVP now admits an unscaled linear
+RGB primary at fixed refresh, with a retained phantom pipe and acknowledged
+MALL reservation. Native updates pin, disable and drain the phantom before
+changing or retiring buffers. SubVP with DRR, visible cursors, DSC, scaling,
+tiling/DCC or multiple planes/streams remains pinned. Board-supported GFX_ULV and DS_DCFCLK have separate
 native GC and display-floor admission; `amdgpu.rdna4_gfx_ulv=0` and
 `amdgpu.rdna4_dcf_sleep=0` disable them for comparison. These paths remain
 software-model tested until acceptance on Navi48 and Navi44.

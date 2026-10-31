@@ -649,11 +649,10 @@ fn rebind_display_clocks(
         let Some(status) = otg.display_status(display) else {
             continue;
         };
-        let Some(timing) = status.pipes[usize::from(display)] else {
-            continue;
-        };
-        if let Some(clock) = records[usize::from(timing.request.pipe)] {
-            otg.rebind_clock(display, clock)?;
+        for timing in status.pipes.iter().flatten() {
+            if let Some(clock) = records[usize::from(timing.request.pipe)] {
+                otg.rebind_clock(display, clock)?;
+            }
         }
     }
     Ok(())
@@ -4464,7 +4463,9 @@ impl bandwidth::UclkPin for ColdBoot {
         self.display_clock_status().map_err(otg::Error::Clocks)
     }
     fn firmware_active(&self) -> bool {
-        self.fams2_active || self.fams2_pending
+        self.fams2_active
+            || self.fams2_pending
+            || self.otg.as_ref().is_ok_and(|o| o.subvp().is_some())
     }
     async fn raise_bandwidth(&mut self, bandwidth: clocks::Bandwidth) -> Result<(), otg::Error> {
         self.update_live_display_bandwidth(bandwidth, false)

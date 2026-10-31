@@ -512,6 +512,9 @@ fn readmits(plan: &dml::Plan) -> bool {
     let Some(p) = plan.pstate else {
         return plan.readmits();
     };
+    if p.subvp.is_some() {
+        return plan.readmits();
+    }
     let modes = plan.joint_modes();
     let stream = usize::from(plan.stream);
     if let Some((soc, uclk, fams2, drr, m, plans)) = PSTATE_ADMITTED.lock().as_ref() {

@@ -238,6 +238,8 @@ pub struct Status {
     /// The runtime admission replay completed (only with State::Applied).
     /// Subsequent bandwidth/sleep commands require real acknowledgements.
     pub dynamic_power: bool,
+    /// Acknowledged SetCabForUclkPstate reservation, retained on failure.
+    pub cab_ways: u8,
 }
 impl Status {
     /// Whether PMFW may switch UCLK under running displays: a bandwidth
@@ -423,6 +425,36 @@ impl<I: Io> Engine<I> {
             }
             Ok(())
         })
+    }
+    async fn reserve_cab(&mut self, ways: u8) -> Result<(), Error> {
+        if ways > 16 {
+            return Err(Error::Invalid);
+        }
+        if self.status.state != State::Applied
+            || !self.status.dynamic_power
+            || self.status.bandwidth.uclk_pstate
+        {
+            return Err(Error::Busy);
+        }
+        self.access(|_| Ok(()))?;
+        if ways == self.status.cab_ways {
+            return Ok(());
+        }
+        self.status.state = State::Applying;
+        match self
+            .command(0x12, u32::from(ways) << 1 | u32::from(ways != 0))
+            .await
+        {
+            Ok(_) => {
+                self.status.cab_ways = ways;
+                self.status.state = State::Applied;
+                Ok(())
+            }
+            Err(e) => {
+                self.status.state = State::Failed(e);
+                Err(e)
+            }
+        }
     }
     async fn settled(&mut self, deadline: narf_time::Deadline) -> Result<u32, Error> {
         let at = self.layout.mp1 + u64::from(RESPONSE) * 4;
@@ -1242,6 +1274,7 @@ impl ClockManager {
                 ignored: Ignored::default(),
                 watermarks_ready: false,
                 dynamic_power: false,
+                cab_ways: 0,
             },
         }))
     }
@@ -1275,6 +1308,13 @@ impl ClockManager {
         }
         self.0.access(|_| Ok(()))?;
         self.0.status.applied.ok_or(Error::Invalid)
+    }
+    /// Reserve/release SubVP cache ways with UCLK switching pinned. A
+    /// cancelled request leaves the mailbox owner Applying; no release is
+    /// inferred without the firmware acknowledgement.
+    pub(crate) async fn reserve_cab(&mut self, regs: MmioRegion, ways: u8) -> Result<(), Error> {
+        self.retained_pipe_clocks(regs)?;
+        self.0.reserve_cab(ways).await
     }
     /// # Safety
     /// Matching protected SMU power is ready; all GPU engines are idle and

@@ -323,15 +323,25 @@ fn hdmi_mode(pipe: u8, plan: &dml::Plan) -> Mode {
         surface: SurfaceRequest {
             surface: Default::default(),
             pipe,
-            width: 640,
-            height: 480,
-            format: SurfaceFormat::Xrgb8888,
+            width: plan.mode.timing.h_active,
+            height: plan.mode.timing.v_active,
+            format: match plan.mode.bytes_per_pixel {
+                8 => SurfaceFormat::Xrgb16161616f,
+                2 => SurfaceFormat::Rgb565,
+                _ => SurfaceFormat::Xrgb8888,
+            },
             odm: SplitPipes::NONE,
             mpc: SplitPipes::NONE,
             plane: None,
         },
         // Room for a back buffer of the same geometry.
-        bytes: 2 * 640 * 4 * 480,
+        bytes: (if plan.pstate.is_some_and(|p| p.subvp.is_some()) {
+            1
+        } else {
+            2
+        }) * plan.mode.pitch as usize
+            * plan.mode.bytes_per_pixel as usize
+            * plan.mode.timing.v_active as usize,
         timing: t,
         clock: c,
     }
@@ -2250,4 +2260,173 @@ fn dcn401_firmware_flip_cannot_publish_before_timing_ack() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_firmware_flip_cannot_publish_before_timing_ack
+);
+
+#[inline(never)]
+fn subvp_chain() -> (
+    alloc::boxed::Box<Chain>,
+    alloc::boxed::Box<dml::pstate::Phantom>,
+) {
+    let mut mode = plan().mode;
+    mode.timing = Timing {
+        pixel_clock_khz: 533_250,
+        h_active: 3840,
+        h_total: 4000,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: 800,
+        v_total: 840,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: false,
+        v_sync_positive: false,
+    };
+    mode.pitch = 3840;
+    mode.bytes_per_pixel = 8;
+    let uclk = dml::pstate::UclkLevels::new(&[96_000, 456_000, 772_000, 1_250_000]).unwrap();
+    let s = dml::pstate::admit_subvp(&soc(), &uclk, &mode, 64 * 1024 * 1024)
+        .unwrap()
+        .expect("3840x800 FP16 SubVP");
+    let p = 2;
+    let (stage, address) = harvest::on_full_pool(|| {
+        let mut stage = staged(p, &s.plans[0]);
+        let address = stage_deadlines(&mut stage, p, &s.plans[0]);
+        (stage, address)
+    });
+    let mut c = hdmi_chain(stage, 1, 3, p, address);
+    let clock = c.clock;
+    start_hdmi(&mut c.e, 1, 3, p, clock);
+    // The single-display staging fixtures keep their selected record in
+    // slot zero even when the hardware pipe is different. Native Otg uses
+    // the stream's head pipe as its slot; model that identity here before
+    // testing selection and parked-owner lookup.
+    c.e.displays.selected = p;
+    run(c.start()).unwrap();
+    // A powered spare after an earlier plane retired. DOMAIN power-up itself
+    // is exercised by the existing gate_hubp/PGFSM suite.
+    let q = c.e.layout.pool.pipes().find(|&q| q != p).unwrap();
+    let inst = c.e.layout.inst(q);
+    c.e.io.inner.inner.forbidden_hubps &= !bit(inst);
+    for (at, value) in [
+        (BASE + (0x80 + 2 * u64::from(inst)) * 4, 0),
+        (BASE + (0x81 + 2 * u64::from(inst)) * 4, 0),
+        (h(inst, 0x5f4), 3),
+        (h(inst, 0x5f5), 0),
+        (h(inst, 0x679), 0),
+        (h(inst, 0x613), 0),
+        (h(inst, 0x614), 0),
+        (h(inst, 0x5f7), 8),
+    ] {
+        c.e.io.put(at, value);
+    }
+    (c, s.phantom.unwrap())
+}
+
+fn dcn401_subvp_retains_alias_until_firmware_off_and_phantom_drained() -> TestResult {
+    let (mut c, phantom) = subvp_chain();
+    let p = c.pipe;
+    let q = c.e.reserve_subvp(p).unwrap();
+    let before = c.surfaces.retained_buffers(p).unwrap();
+    let mut clock = c.clock;
+    clock.request.pipe = q;
+    clock.request.pixel = dccg::PixelClock::DisplayPort {
+        pixel_hz: u64::from(phantom.plan.mode.timing.pixel_clock_khz) * 1000,
+    };
+    clock.request.dpp_khz = phantom.plan.clocks.dppclk_khz;
+    let l = c.e.layout;
+    // Blank/unblank and disconnected MPCC acknowledgement for the spare;
+    // the original model covers only the main's latch group.
+    c.e.io.extra |= bit(l.inst(q));
+    run_boxed(|| c.e.program_subvp(&phantom.plan, clock)).unwrap();
+    assert_eq!(c.e.status.state, State::ScanoutRunning(p));
+    assert_eq!(c.e.io.get(h(l.inst(q), 0x60a)), c.address as u32);
+    assert_eq!(c.e.io.get(h(l.inst(q), 0x60b)), (c.address >> 32) as u32);
+    assert_eq!(c.e.io.get(h(l.inst(q), 0x5f7)) & 7, 1);
+    assert_eq!(c.e.io.get(h(l.inst(p), 0x5f7)) & 7, 2);
+    assert_eq!(c.e.io.get(otg(l.inst(q), 0x1b43)) & 0x10001, 0);
+    assert_eq!(
+        c.e.io.get(BASE + (0x4bb + u64::from(l.inst(q))) * 4) & 0x1f,
+        0
+    );
+    c.e.handoff_subvp(true).unwrap();
+    let owner = c.e.subvp().unwrap();
+    c.e.select_display(q).unwrap();
+    assert_eq!(c.e.subvp(), Some(owner));
+    c.e.select_display(p).unwrap();
+    c.e.io.put(otg(l.inst(p), 0x1b30), 17);
+    c.e.io.put(otg(l.inst(p), 0x1b31), 1800);
+    c.e.io.put(otg(l.inst(p), 0x1b33), 3);
+    assert_eq!(run_boxed(|| c.e.retire_subvp()), Err(Error::Busy));
+    assert_eq!(c.surfaces.retained_buffers(p), Some(before));
+    assert!(run(c.check()).is_ok());
+    c.e.handoff_subvp(false).unwrap();
+    assert_eq!(c.e.io.get(otg(l.inst(p), 0x1b30)), 839);
+    assert_eq!(c.e.io.get(otg(l.inst(p), 0x1b31)), 839);
+    // The spare's MPCC disconnect follows a normal OTG update in hardware.
+    c.e.io.inner.inner.disconnecting = true;
+    c.e.select_display(q).unwrap();
+    assert_eq!(run_boxed(|| c.e.retire_subvp()), Ok(Some(q)));
+    assert!(c.e.subvp().is_none());
+    assert!(c.e.status.surfaces[usize::from(q)].is_none());
+    assert_eq!(c.surfaces.retained_buffers(p), Some(before));
+    assert_eq!(c.e.io.get(h(l.inst(p), 0x5f7)) & 0x1f, 8);
+    assert!(run(c.check()).is_ok());
+    let surface = c.e.status.surfaces[usize::from(p)].unwrap();
+    let address = 0x9_0040_0000; // different high word from the retired alias
+    let external = ExternalSurface {
+        address,
+        pitch_bytes: surface.pitch_bytes,
+        chroma: None,
+        last: address + u64::from(surface.pitch_bytes) * u64::from(surface.request.height) - 1,
+        dcc_aligned: false,
+    };
+    assert!(run(c.flip_to(FlipSource::External(external))).is_ok());
+    assert_eq!(c.e.status.scanout.unwrap().address, address);
+    assert!(run(c.stop()).is_ok());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_subvp_retains_alias_until_firmware_off_and_phantom_drained
+);
+
+fn dcn401_subvp_partial_setup_keeps_main_buffer_and_spare_owned() -> TestResult {
+    for cancel in [false, true] {
+        let (mut c, phantom) = subvp_chain();
+        let p = c.pipe;
+        let q = c.e.reserve_subvp(p).unwrap();
+        let before = c.surfaces.retained_buffers(p).unwrap();
+        let mut clock = c.clock;
+        clock.request.pipe = q;
+        clock.request.pixel = dccg::PixelClock::DisplayPort {
+            pixel_hz: u64::from(phantom.plan.mode.timing.pixel_clock_khz) * 1000,
+        };
+        clock.request.dpp_khz = phantom.plan.clocks.dppclk_khz;
+        let l = c.e.layout;
+        c.e.io.extra |= bit(l.inst(q));
+        if cancel {
+            c.e.io.inner.inner.stall |= 256; // phantom counter cannot advance
+            c.e.io.pause_wait = true;
+            cancel_at(|| c.e.program_subvp(&phantom.plan, clock), || true);
+        } else {
+            let at = h(l.inst(q), 0x60b);
+            c.e.io.drop = Some(at); // lose the high address before fetch
+            assert_eq!(
+                run_boxed(|| c.e.program_subvp(&phantom.plan, clock)),
+                Err(Error::Readback(h(l.inst(q), 0x60b)))
+            );
+        }
+        assert_eq!(c.e.status.state, State::UpdatingStream(p));
+        assert_eq!(c.surfaces.retained_buffers(p), Some(before));
+        assert!(c.e.status.surfaces[usize::from(q)].is_some());
+        assert_eq!(Siblings::of(&c.e.status).pipes & bit(q), bit(q));
+        assert_eq!(c.e.reserve_subvp(p), Err(Error::Busy));
+        assert_eq!(run_boxed(|| c.e.retire_subvp()), Err(Error::Busy));
+        assert_eq!(run(c.stop()), Err(Error::Busy));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_subvp_partial_setup_keeps_main_buffer_and_spare_owned
 );

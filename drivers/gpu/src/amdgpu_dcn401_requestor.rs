@@ -565,7 +565,10 @@ impl<I: Io> Engine<I> {
                     && (a.request.format.is_video()
                         || a.request.surface.tiling != crate::amdgpu_dcn401_otg::Tiling::LINEAR)
             });
-            for (r, mut mask, value) in requestor(self.layout.inst(pipe)) {
+            for (r, mut mask, mut value) in requestor(self.layout.inst(pipe)) {
+                if r == MALL && self.status.subvp.is_some_and(|s| s.main == p) {
+                    value = 10;
+                }
                 if planned {
                     if matches!(r, 0x66d | 0x620 | 0x5f2 | 0x5f3) {
                         continue;

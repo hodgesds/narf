@@ -2022,9 +2022,12 @@ switching on one native Vactive/Vblank DRR stream, and matching FAMS2 DRR
 methods admit firmware timing on multiple streams. Requested BTR/MID totals
 use acknowledged DMUB updates under HW lock, including during real flips;
 firmware-clamped registers are distinguished from the accepted request.
-Cancellation retains timing, IRQ sources and scanout storage. SubVP still needs phantom-pipe/MALL ownership; its DML,
-requestor, cache-ID, timing and retirement prerequisites are recorded in the
-GPU spec. Hardware acceptance remains pending on Navi48 and Navi44.
+Cancellation retains timing, IRQ sources and scanout storage. Single-stream
+SubVP now expands one fixed-refresh, unscaled linear RGB primary into a
+retained phantom pipe, models its zero DET and separate MALL bandwidth,
+acknowledges cache ways and FAMS2 type 4, and drains the alias before native
+updates or buffer retirement. DRR, visible cursor scheduling, DSC,
+tiling/DCC, scaling and multiple planes/streams remain SubVP extensions. Hardware acceptance remains pending on Navi48 and Navi44.
 
 Navi22 third-review fixes (software-model tested only): DRM ioctl user copies
 apply `access_ok` and fault-guarded copies (EFAULT); NVMe/AHCI bring-up

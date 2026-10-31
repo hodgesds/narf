@@ -15,7 +15,9 @@
 //! native mcache placement. `admit_with_drr` carries live refresh limits and
 //! permits hardware vactive/vblank or FAMS2 clamped/stretch strategies.
 //! SubVP remains pinned without a phantom-pipe/MALL owner; the runtime DRR
-//! search skips those unavailable candidates. Mode programming uses DPMM's
+//! search skips those unavailable candidates. `admit_subvp` expands the
+//! single-stream linear RGB subset for the native phantom owner.
+//! Mode programming uses DPMM's
 //! actual active clocks, including bounded raises beyond the latency state.
 use super::*;
 
@@ -316,6 +318,8 @@ pub(crate) struct Meta {
     subvp_programming: i32,
     subvp_prefetch_to_mall: i32,
     phantom_vtotal: i32,
+    phantom_vactive: i32,
+    phantom_vfp: i32,
     drr: Common,
     drr_programming: i32,
 }
@@ -373,6 +377,8 @@ fn meta(t: &Timing, streams: usize, phantom: (i32, i32)) -> Meta {
     let df_throttle = lines(SUBVP_DF_THROTTLE_DELAY_US);
     m.subvp_prefetch_to_mall = lines(SUBVP_PREFETCH_TO_MALL_DELAY_US);
     let phantom_vactive = m.allow_to_target + m.min_allow_width + phantom.0;
+    m.phantom_vactive = phantom_vactive;
+    m.phantom_vfp = df_throttle;
     m.phantom_vtotal = phantom.1 + df_throttle + 1 + df_throttle + phantom_vactive;
     m.subvp.allow_start = t.v_blank_end() as i32
         + m.contention
@@ -707,6 +713,7 @@ impl UclkLevels {
 /// can be admitted again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlanPstate {
+    pub subvp: Option<SubvpProof>,
     pub uclk: UclkLevels,
     /// FAMS 2.1 firmware: SubVP, DRR and FAMS2 strategies were searched.
     pub fams2: bool,
@@ -749,6 +756,7 @@ pub struct Fams2Stream {
     /// legacy.vactive_det_fill_delay_otg_vlines (vactive only).
     pub vactive_det_fill_delay_otg_vlines: u16,
     pub drr_state: Option<DrrSubstate>,
+    pub subvp: Option<SubvpSubstate>,
 }
 
 /// FAMS2's DRR static sub-state (legacy methods use the fill-delay field).
@@ -758,9 +766,23 @@ pub struct DrrSubstate {
     pub programming_delay: u16,
 }
 
+/// DML21's single-plane RGB SubVP static sub-state. DC adds physical
+/// phantom OTG/HUBP masks at the firmware boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubvpSubstate {
+    pub phantom_vtotal: u16,
+    pub phantom_vactive: u16,
+    pub programming_delay: u16,
+    pub prefetch_to_mall: u16,
+}
+#[path = "amdgpu_dcn401_subvp.rs"]
+mod subvp;
+pub use subvp::{admit_subvp, Phantom, SubvpProof};
+
 /// A configuration with UCLK P-state switching.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Supported {
+    pub phantom: Option<alloc::boxed::Box<Phantom>>,
     /// Each stream's plan at DPMM's active clocks, in admission order.
     pub plans: Vec<Plan>,
     pub methods: [Method; MAX_STREAMS],
@@ -1290,6 +1312,7 @@ fn admit_config(
         plans.push(plan);
     }
     Ok(Pstate::Supported(Supported {
+        phantom: None,
         plans,
         methods: st.methods,
         level: lat as u8,
@@ -1321,6 +1344,7 @@ fn program_with_ttu(
     let mut usable = [true; MAX_STREAMS];
     for (i, plan) in plans.iter_mut().enumerate() {
         plan.pstate = Some(PlanPstate {
+            subvp: None,
             uclk: *uclk,
             fams2,
             method: st.methods[i],
@@ -1406,6 +1430,26 @@ impl Shape {
 
 /// [`Plan::readmits`] for a P-state plan.
 pub(super) fn readmits(plan: &Plan, p: &PlanPstate) -> bool {
+    if let Some(proof) = p.subvp {
+        let mode = if proof.phantom {
+            plan.streams[0].as_ref()
+        } else {
+            Some(&plan.mode)
+        };
+        return mode
+            .and_then(|mode| {
+                admit_subvp(&plan.soc, &p.uclk, mode, proof.mall_bytes)
+                    .ok()
+                    .flatten()
+            })
+            .is_some_and(|s| {
+                if proof.phantom {
+                    s.phantom.is_some_and(|p| p.plan == *plan)
+                } else {
+                    s.plans.first() == Some(plan)
+                }
+            });
+    }
     match admit_with_drr(&plan.soc, &p.uclk, &plan.joint_modes(), p.fams2, p.drr) {
         Ok(Pstate::Supported(s)) => s.plans.get(usize::from(plan.stream)) == Some(plan),
         _ => false,

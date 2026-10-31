@@ -12,9 +12,10 @@
 //! optionally with GFX12 DCC (no metadata plane: the mcache's DRAM overhead
 //! and placement), scaled as SPL scales it and scanned horizontally or (a
 //! tiled surface rotated 90/270) vertically, in physical VRAM:
-//! GPUVM/HostVM, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback and
+//! GPUVM/HostVM, cursor, tdlut, dynamic metadata, writeback and
 //! immediate flip are all off; a 4:4:4 DP stream may use DSC. One tiled RGB
-//! plane alone on one pipe requests unbounded.
+//! plane alone on one pipe requests unbounded. `pstate::admit_subvp` expands
+//! the supported fixed-refresh linear RGB subset into main/phantom plans.
 //!
 //! ODM starts with DML's `dml2_odm_mode_auto` (DecideODMMode):
 //! a stream takes two, three or four pipes (DPP + OPP each, one DSC each)
@@ -1336,6 +1337,8 @@ fn count_in_span(offsets: &[u32], span: i64) -> u32 {
 struct Shape {
     /// The plane's stream: its index among the admitted modes.
     stream: usize,
+    /// Phantom fetches prefill MALL without returning pixel data over SDP.
+    phantom: bool,
     t: Timing,
     pclk: Fx,
     line: Fx,
@@ -1427,6 +1430,8 @@ struct Evaluation {
     /// (urg_bandwidth_required_flip with no flip), in MB/s.
     urgent_sdp: Fx,
     urgent_dram: Fx,
+    mall_urgent: [Fx; 2],
+    mall_nonurgent: [Fx; 2],
     /// Each plane's surface_avg_vactive_required_bw and
     /// surface_peak_required_bw, `[sdp, dram]` (the SVP-prefetch state's are
     /// the same: no plane uses the MALL).
@@ -1893,6 +1898,7 @@ impl Shape {
             line: q(i64::from(t.h_total) * 1000, i64::from(t.pixel_clock_khz)),
             odm,
             dpps,
+            phantom: false,
             det_bytes: 0,
             vblank: t.v_total - t.v_active,
             ycbcr420: mode.encoding.is_420(),
@@ -1916,8 +1922,12 @@ impl Shape {
     fn set_det(&mut self, det_kbytes: u32) {
         // CalculateSwathAndDETConfiguration: the full swaths if two of them
         // fit half the DET (always for linear), else halved swaths.
-        let det = det_kbytes * 1024;
-        self.det_bytes = det;
+        let det = if self.phantom {
+            1024 * 1024
+        } else {
+            det_kbytes * 1024
+        };
+        self.det_bytes = if self.phantom { 0 } else { det };
         let plane = self.plane;
         let vertical = plane.vertical_scan;
         let y = &mut self.y;
@@ -2059,7 +2069,13 @@ impl Shape {
     fn buffers(&self) -> Result<(), Error> {
         let p = &self.plane;
         let full_c = self.c.map_or(0, |c| c.full_swath_bytes);
-        if self.y.full_swath_bytes / 2 + full_c / 2 > self.det_bytes / 2 {
+        if self.y.full_swath_bytes / 2 + full_c / 2
+            > (if self.phantom {
+                1024 * 1024
+            } else {
+                self.det_bytes
+            }) / 2
+        {
             return Err(Error::Buffer);
         }
         let support = if p.swizzle == Swizzle::Linear {
@@ -2330,6 +2346,11 @@ impl Shape {
         });
         // One-to-one schedule, against this pipe's share of the surface's
         // active bandwidth.
+        let sw_bytes = if self.phantom {
+            sw_bytes.over(fx(4))
+        } else {
+            sw_bytes
+        };
         let min_lsw_oto = q(src_max, MAX_VRATIO_PRE_OTO).max(fx(2));
         let pipes = fx(i64::from(self.dpps));
         let per_pipe = c.map_or(y.vactive_bw.over(pipes), |c| {
@@ -2339,9 +2360,13 @@ impl Shape {
         let oto_line = c.map_or(line_bytes(y).over(l), |c| {
             line_bytes(y).over(l).plus(line_bytes(c).over(l))
         });
-        let bw_oto = per_pipe
-            .max(oto_line)
-            .min(sw_bytes.over(min_lsw_oto.times(l)));
+        let bw_oto = per_pipe.max(oto_line);
+        let bw_oto = if self.phantom {
+            bw_oto.over(fx(4))
+        } else {
+            bw_oto
+        }
+        .min(sw_bytes.over(min_lsw_oto.times(l)));
         let lsw_oto = ceil_quarter(sw_bytes.over(bw_oto).over(l));
         s.prefetch_bw_max = bw_oto;
         // VM and both row trips are one quarter line each.
@@ -2459,6 +2484,8 @@ fn evaluate(
     let mut planes = [Schedule::default(); MAX_PLANES];
     let (mut urgent, mut non_urgent) = (Fx::ZERO, Fx::ZERO);
     let (mut urgent_dram, mut non_urgent_dram) = (Fx::ZERO, Fx::ZERO);
+    let mut mall_urgent = [Fx::ZERO; 2];
+    let mut mall_nonurgent = [Fx::ZERO; 2];
     let mut avg = [[Fx::ZERO; 2]; MAX_PLANES];
     let mut peak = [[Fx::ZERO; 2]; MAX_PLANES];
     let mut pstate_bytes = [[0u32; 2]; MAX_PLANES];
@@ -2558,10 +2585,17 @@ fn evaluate(
             required(Some(bursts), shape.dram_nom, shape.dram_pref),
             required(None, shape.dram_nom, shape.dram_pref),
         );
-        urgent = urgent.plus(u);
-        non_urgent = non_urgent.plus(n);
-        urgent_dram = urgent_dram.plus(ud);
-        non_urgent_dram = non_urgent_dram.plus(nd);
+        let mall_sdp = |v: Fx| if shape.phantom { v.over(fx(4)) } else { v };
+        mall_urgent[0] = mall_urgent[0].plus(mall_sdp(u));
+        mall_urgent[1] = mall_urgent[1].plus(ud);
+        mall_nonurgent[0] = mall_nonurgent[0].plus(mall_sdp(n));
+        mall_nonurgent[1] = mall_nonurgent[1].plus(nd);
+        if !shape.phantom {
+            urgent = urgent.plus(u);
+            non_urgent = non_urgent.plus(n);
+            urgent_dram = urgent_dram.plus(ud);
+            non_urgent_dram = non_urgent_dram.plus(nd);
+        }
         // The first get_urgent_bandwidth_required call (no bursts, prefetch
         // or excess fill) is the surface's average vactive bandwidth; every
         // call raises its peak.
@@ -2582,6 +2616,16 @@ fn evaluate(
     let avail = available(bw_state);
     let mut frac = [Fx::ZERO; 2];
     for (state, a) in avail.urgent.iter().enumerate() {
+        let (non_urgent, non_urgent_dram, urgent, urgent_dram) = if state == 0 {
+            (non_urgent, non_urgent_dram, urgent, urgent_dram)
+        } else {
+            (
+                mall_nonurgent[0],
+                mall_nonurgent[1],
+                mall_urgent[0],
+                mall_urgent[1],
+            )
+        };
         frac[state] = non_urgent.over(a[0]).max(non_urgent_dram.over(a[1]));
         if (state == 0 || MALL_PRESENT)
             && (urgent > a[0] || urgent_dram > a[1] || frac[state] > Fx::ONE)
@@ -2601,6 +2645,8 @@ fn evaluate(
         non_urgent_sdp: non_urgent,
         urgent_sdp: urgent,
         urgent_dram,
+        mall_urgent,
+        mall_nonurgent,
         avg,
         peak,
         pstate_bytes,
@@ -3143,6 +3189,8 @@ pub(crate) struct Support {
     pub average_dram_kbps: u64,
     pub urgent_sdp_kbps: u64,
     pub urgent_dram_kbps: u64,
+    pub mall_average: [u64; 2],
+    pub mall_urgent: [u64; 2],
 }
 
 /// The configuration-wide quantities of `shapes` no clock state changes.
@@ -3158,6 +3206,7 @@ pub(crate) struct Prepared {
     /// Average SDP and DRAM bandwidth (calculate_avg_bandwidth_required).
     read: Fx,
     read_dram: Fx,
+    mall_read: [Fx; 2],
 }
 
 /// The state-independent mode-support checks of `shapes`, assigning the
@@ -3217,12 +3266,31 @@ fn prepare(soc: &Soc, shapes: &mut [Shape]) -> Result<Prepared, Error> {
     // overhead on DRAM).
     let read = shapes
         .iter()
+        .filter(|s| !s.phantom)
         .fold(Fx::ZERO, |sum, s| sum.plus(s.vactive_bw(false)));
-    let read_dram = shapes.iter().fold(Fx::ZERO, |sum, s| {
-        let scale = |v: Fx, f: Fx| if f == Fx::ONE { v } else { v.times(f) };
-        let c = s.c.map_or(Fx::ZERO, |c| scale(c.vactive_bw, s.dram_nom[1]));
-        sum.plus(scale(s.y.vactive_bw, s.dram_nom[0]).plus(c))
+    let dram_bw = |s: &Shape| {
+        s.y.vactive_bw
+            .times(s.dram_nom[0])
+            .plus(s.c.map_or(Fx::ZERO, |c| c.vactive_bw.times(s.dram_nom[1])))
+    };
+    let mall_read = shapes.iter().fold([Fx::ZERO; 2], |sum, s| {
+        [
+            sum[0].plus(if s.phantom {
+                s.vactive_bw(false).over(fx(4))
+            } else {
+                s.vactive_bw(false)
+            }),
+            sum[1].plus(dram_bw(s)),
+        ]
     });
+    let read_dram = shapes
+        .iter()
+        .filter(|s| !s.phantom)
+        .fold(Fx::ZERO, |sum, s| {
+            let scale = |v: Fx, f: Fx| if f == Fx::ONE { v } else { v.times(f) };
+            let c = s.c.map_or(Fx::ZERO, |c| scale(c.vactive_bw, s.dram_nom[1]));
+            sum.plus(scale(s.y.vactive_bw, s.dram_nom[0]).plus(c))
+        });
     Ok(Prepared {
         unbounded,
         compbuf_kbytes,
@@ -3233,6 +3301,7 @@ fn prepare(soc: &Soc, shapes: &mut [Shape]) -> Result<Prepared, Error> {
         max_disp: shapes.iter().fold(Fx::ZERO, |max, s| max.max(s.disp_mhz())),
         read,
         read_dram,
+        mall_read,
     })
 }
 
@@ -3258,8 +3327,13 @@ fn support(
         }
     }
     // Average bandwidth at maximum clocks.
-    for a in available(max_state).average {
-        if p.read > a[0] || p.read_dram > a[1] {
+    for (state, a) in available(max_state).average.iter().enumerate() {
+        let read = if state == 0 {
+            [p.read, p.read_dram]
+        } else {
+            p.mall_read
+        };
+        if read[0] > a[0] || read[1] > a[1] {
             return Err(Error::Bandwidth);
         }
     }
@@ -3273,7 +3347,8 @@ fn support(
         })
         .collect();
     let e = evaluate(shapes, state, max_state, uclk_khz, &clk, ov)?;
-    let rob = fx((ROB_KBYTES - PIXEL_CHUNK_KBYTES) * 1024).over(e.non_urgent_sdp);
+    let rob = fx((ROB_KBYTES - PIXEL_CHUNK_KBYTES) * 1024)
+        .over(e.non_urgent_sdp.max(e.mall_nonurgent[0]));
     if rob < e.lat.max_urgent {
         return Err(Error::Latency);
     }
@@ -3282,11 +3357,21 @@ fn support(
         average_dram_kbps: kbps(p.read_dram),
         urgent_sdp_kbps: kbps(e.urgent_sdp),
         urgent_dram_kbps: kbps(e.urgent_dram),
+        mall_average: p.mall_read.map(kbps),
+        mall_urgent: e.mall_urgent.map(kbps),
         ..Support::default()
     };
     let dram_wm = fx(DRAM_CLK_CHANGE_US).plus(e.lat.urgent.plus(e.extra));
     for (k, (shape, pre)) in shapes.iter().zip(e.planes.iter()).enumerate() {
-        if !shape.temp_read_ok(&e, pre, shapes.len(), p.compbuf_bytes) {
+        if shape.phantom {
+            continue;
+        }
+        if !shape.temp_read_ok(
+            &e,
+            pre,
+            shapes.iter().filter(|s| !s.phantom).count(),
+            p.compbuf_bytes,
+        ) {
             return Err(Error::TempRead);
         }
         let hiding = shape.active_hiding(pre, shapes.len(), p.compbuf_bytes);
@@ -3737,6 +3822,11 @@ fn program(
 }
 
 impl Plan {
+    pub(crate) fn subvp_main_mode(&self) -> Option<Mode> {
+        self.pstate
+            .filter(|p| p.subvp.is_some_and(|v| v.phantom))
+            .and(self.streams[0])
+    }
     pub(crate) fn firmware_refresh_pstate(&self, drr: crate::amdgpu_freesync::Drr) -> bool {
         self.pstate.is_some_and(|p| {
             matches!(

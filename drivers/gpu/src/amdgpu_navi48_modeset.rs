@@ -1166,6 +1166,7 @@ type PinnedSearch = (
     Vec<dml::Mode>,
     [Option<crate::amdgpu_freesync::Drr>; 4],
     u8,
+    bool,
 );
 static PINNED_SEARCH: narf_lib::sync::IrqSafeSpinLock<Option<PinnedSearch>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
@@ -4888,12 +4889,43 @@ impl ColdBoot {
         let fams2 = self.display_fams2() && !native_mid;
         // Every monitor pass asks again: answer a configuration already
         // running its P-state plans, or already found pinned, from memory.
-        let key = (first.plan.soc, uclk, fams2, modes, live_drr, local_refresh);
+        let subvp = fams2
+            && !drr
+            && running.len() == 1
+            && self
+                .display_status(first.pipe)?
+                .is_some_and(|s| s.cursor.is_none_or(|c| !c.visible));
+        let key = (
+            first.plan.soc,
+            uclk,
+            fams2,
+            modes,
+            live_drr,
+            local_refresh,
+            subvp,
+        );
         if PINNED_SEARCH.lock().as_ref() == Some(&key) {
             return Ok(None);
         }
-        let (soc, uclk, fams2, modes, live_drr, local_refresh) = &key;
-        match dml::pstate::admit_with_drr(soc, uclk, modes, *fams2, *live_drr) {
+        let (soc, uclk, fams2, modes, live_drr, local_refresh, subvp) = &key;
+        let mut result = dml::pstate::admit_with_drr(soc, uclk, modes, *fams2, *live_drr);
+        if *subvp
+            && matches!(
+                result,
+                Ok(dml::pstate::Pstate::Pinned(dml::pstate::Pinned::Firmware(
+                    dml::pstate::Method::FwSvp
+                )))
+            )
+        {
+            let capacity = crate::amdgpu_rdna4::Rdna4Chip::of(&self.sequence.backend.gpu)
+                .map_or(0, |chip| {
+                    crate::amdgpu_rdna4::mall_bytes(chip, soc.umc_channels) as u32
+                });
+            if let Ok(Some(s)) = dml::pstate::admit_subvp(soc, uclk, &modes[0], capacity) {
+                result = Ok(dml::pstate::Pstate::Supported(s));
+            }
+        }
+        match result {
             Ok(dml::pstate::Pstate::Supported(s))
                 if s.plans.iter().all(|p| {
                     local_refresh & (1 << p.stream) == 0
@@ -4990,6 +5022,7 @@ impl ColdBoot {
                     count += 1;
                 }
                 configs[index] = Some(crate::amdgpu_dmub_navi48::Fams2StreamConfig {
+                    phantom: None,
                     base: s.fams2_streams[index],
                     drr: status.drr.map(|a| a.drr),
                     otg_inst: pool.hw(m.pipe),
@@ -5046,6 +5079,10 @@ impl ColdBoot {
             m.plan = d.plan;
             m.scanout.plan = d.plan;
             self.modesets.retain(*m);
+        }
+        if let Some(phantom) = &s.phantom {
+            let hw = self.stage_display_subvp(running[0].pipe, phantom).await?;
+            configs[0].as_mut().ok_or(otg::Error::Invalid)?.phantom = Some(hw);
         }
         if s.fams2_required {
             let configs: Vec<_> = configs.into_iter().flatten().collect();

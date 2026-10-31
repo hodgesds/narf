@@ -134,8 +134,12 @@ IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
   board limits; LFC/MID can retain switching on one native DRR stream or
   admitted FAMS2 DRR streams through acknowledged MIN/MAX/MID requests. Real
   flips and idle frame updates borrow the serialized firmware transport;
-  cancellation retains timing and scanout ownership. SubVP without phantom/MALL
-  ownership retains the pinned fallback. Board-supported GFX_ULV
+  cancellation retains timing and scanout ownership. SubVP now expands one
+  fixed-refresh, unscaled linear RGB primary into a main/phantom pair, reserves
+  board-sized MALL ways and a spare unfused pipe, and sends the typed FAMS2
+  SubVP state before relaxation. Native updates first disable and drain the
+  alias before normal buffer retirement. DRR, visible cursors, DSC,
+  tiling/DCC, scaling and multiple planes/streams retain the pinned fallback. Board-supported GFX_ULV
   follows native GC proofs; DS_DCFCLK follows a checked DML deep-sleep floor.
   `amdgpu.rdna4_gfx_ulv=0` and `amdgpu.rdna4_dcf_sleep=0` skip those features.
   All of these RX 9000 transitions still need physical acceptance.

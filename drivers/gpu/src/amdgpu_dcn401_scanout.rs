@@ -368,16 +368,27 @@ impl<I: Io> Engine<I> {
             (l.mpcc(pipe, UPDATE_LOCK), sel(p)),
         ]
     }
-    fn underflow(&mut self, pipe: u8) -> Result<(), Error> {
-        for p in self.plane_pipes(pipe) {
+    pub(super) fn underflow(&mut self, pipe: u8) -> Result<(), Error> {
+        let mut pipes = self.plane_pipes(pipe);
+        if let Some(vp) = self.status.subvp.filter(|vp| vp.main == pipe) {
+            pipes.push(vp.phantom);
+        }
+        for p in pipes {
             let at = self.layout.hubp(p, HUBP_CONTROL);
             if self.read(at)? & HUBP_UNDERFLOW != 0 {
                 return Err(Error::Underflow(at));
             }
         }
-        let at = self.optc_input(pipe);
-        if self.read(at)? & OPTC_UNDERFLOW != 0 {
-            return Err(Error::Underflow(at));
+        for p in core::iter::once(pipe).chain(
+            self.status
+                .subvp
+                .filter(|vp| vp.main == pipe)
+                .map(|vp| vp.phantom),
+        ) {
+            let at = self.optc_input(p);
+            if self.read(at)? & OPTC_UNDERFLOW != 0 {
+                return Err(Error::Underflow(at));
+            }
         }
         Ok(())
     }
@@ -447,6 +458,9 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     pub(super) async fn lock(&mut self, pipe: u8) -> Result<(), Error> {
+        if self.subvp().is_some() {
+            return Err(Error::Busy);
+        }
         let l = self.layout;
         // optc1_lock: OTG_MASTER_UPDATE_LOCK_SEL = optc->inst.
         self.update(

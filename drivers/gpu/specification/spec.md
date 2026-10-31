@@ -6601,9 +6601,12 @@ agree; native methods additionally require the sole retained modeset. The
 runtime pinned cache records the per-stream LFC/MID mask, so a refused
 firmware schedule cannot hide a later native admission: a multi-stream result must give every locally adjusted stream a
 firmware DRR method, or it remains pinned.
-SubVP remains unavailable without phantom-pipe/MALL ownership: fixed-refresh
-search reports `Pinned::Firmware`, while DRR search skips those unavailable
-candidates. `Pinned::Unsupported` records no valid strategy.
+The general search reports `Pinned::Firmware` for SubVP without a phantom
+owner, while DRR search skips those candidates. `admit_subvp` additionally
+expands one fixed-refresh, unscaled linear RGB primary in ODM bypass into
+main and phantom plans. It requires a board-derived MALL capacity; DSC,
+rotation, scaling, tiling/DCC, overlays, DRR and multiple streams retain the
+ordinary fallback. `Pinned::Unsupported` records no valid strategy.
 
 Support and candidate selection retain the latency-table clocks. Programming
 then uses DPMM's raised active UCLK/FCLK/DCFCLK, its actual DRAM bandwidth and
@@ -6714,14 +6717,49 @@ updates, native restoration, and refusal to retire firmware timing. Raised-clock
 regressions cover board maxima and forged old floors.
 Hardware switching under a lit display is unvalidated.
 
-SubVP follow-up must expand main/phantom timing and planes in DML (including
-phantom DLG/TTU, zero DET and separate mcache IDs), reserve spare unfused
-pipes/OTGs and MALL capacity, program phantom fetch and timing without an
-external link, and retire those owners before reuse. The DMUB SubVP static
-state and saved surface addresses must follow the same owner through flips,
-cancellation, modeset, suspend and reset. Existing normal requestor setup
-explicitly disables MALL and is not a phantom setup path. Merely allowing
-FAMS2 stream type 4 would not establish these prerequisites.
+**SubVP owner.** `admit_subvp` crops the phantom timing and viewport from
+PMO's blackout and prefetch metadata. Its requestor gets zero DET; the DML
+swath/burst model uses the native 1 MiB phantom allowance. Active bandwidth
+excludes phantom fetches; SVP-prefetch includes them with SDP factor 0.25
+and DRAM factor 1.0, including the prefetch schedule's own SDP factor.
+DPMM boosts active clocks with the separately calculated SVP minimums.
+Both plans readmit against the original main mode and MALL capacity.
+MALL bytes use the aligned phantom footprint; ways use 64-byte cache lines,
+16 ways and two extra alignment lines, bounded by the installed die's
+available UMC channels (4 MiB each).
+
+The runtime enables this path only with a spare unfused HUBP/OTG and no
+visible cursor. It first pins switching, installs main deadlines, then
+acknowledges DAL `SetCabForUclkPstate` (0x12, `(ways << 1) | (ways != 0)`).
+A retained pipe reservation precedes phantom clock/power programming. The
+phantom aliases the main's actual address and pitch; it creates no client
+allocation or external link. Its VM aperture, cropped surface, DPP/MPC,
+requestor, DLG/TTU and timing are programmed while native ownership excludes
+FAMS2. After a fresh frame it is blanked/drained and its OTG stopped, with
+MALL select 1 on the phantom, select 2 and FORCE_ONE_ROW_FOR_FRAME on the
+main. FAMS2 type 4 carries the v1 SubVP ratio/timing/delay fields and physical
+phantom OTG/plane masks; config acknowledgement precedes UCLK relaxation.
+
+This first owner disables SubVP before every native flip, cursor,
+colour/HDR or timing update. Switching is pinned, config-off acknowledges,
+the phantom OTG runs long enough to latch its disconnect, HUBP requests
+drain, and fetch/DPP clocks and native MALL selection are restored before
+releasing its DTO and cache ways. The main allocation and client pin stay
+retained throughout; normal flip retirement then applies. Missing replies,
+write loss and cancellation retain pending state and aliases. Native OTG
+lock operations refuse a retained phantom. Health checks may read the main
+while firmware temporarily drives the reserved phantom; observed underflow
+first disables/drains firmware ownership. Linux DCN401 omits the older
+`subvp_save_surf_addr` scratch callback; this path does not use those legacy
+scratch registers or permit firmware flip offload. Dynamic SubVP flips,
+visible cursor scheduling, DRR, tiled/DCC/scaled or multiple planes/streams
+remain extensions. The owner lookup covers selected and parked display slots,
+so selecting another slot cannot hide the phantom from update guards.
+Kernel tests cover typed SubVP command bytes, acknowledged/refused/cancelled
+cache reservations, readmission of both plans and their cache footprint,
+phantom setup and drain, failed address writes, cancellation, parked ownership,
+and native client flips with a different address high word after retirement.
+Physical switching acceptance remains pending.
 
 **No display left.** `converge_uclk_pstate` with no display and no
 teardown in flight runs `ColdBoot::release_display_bandwidth` once: Linux

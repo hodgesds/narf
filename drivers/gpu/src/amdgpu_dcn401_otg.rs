@@ -463,6 +463,7 @@ pub struct Applied {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Status {
+    pub subvp: Option<fetch::SubvpApplied>,
     pub state: State,
     /// Historical programming, not permission to start scanout. A clock
     /// change invalidates the recorded snapshot; failure/cancellation is sticky.
@@ -627,6 +628,7 @@ impl Status {
     fn new() -> Self {
         Self {
             state: State::Ready,
+            subvp: None,
             pipes: [None; 4],
             blanks: [None; 4],
             running_blank: None,
@@ -1097,6 +1099,9 @@ impl Siblings {
     /// while another is selected besides an idle one.
     fn of(s: &Status) -> Self {
         let mut out = Self::default();
+        if let Some(vp) = s.subvp {
+            out.pipes |= bit(vp.phantom);
+        }
         for p in 0..4u8 {
             let i = usize::from(p);
             let staged = s.pipes[i].is_some()

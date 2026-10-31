@@ -97,6 +97,10 @@ impl Io for Fake {
                 assert_eq!(arg, 2, "TABLE_WATERMARKS");
                 0
             }
+            0x12 => {
+                assert!(arg == 0 || arg & 1 == 1 && arg >> 1 <= 16);
+                0
+            }
             0xc => self.dc_limit[(arg >> 16) as usize],
             0x1c => {
                 assert_eq!(arg, 0);
@@ -134,6 +138,7 @@ fn engine() -> Engine<Fake> {
             ignored: Ignored::default(),
             watermarks_ready: false,
             dynamic_power: false,
+            cab_ways: 0,
         },
         io: Fake {
             regs: BTreeMap::from([(0x589d0, 1)]),
@@ -1595,4 +1600,56 @@ fn dcn401_pin_retires_a_firmware_schedule_before_any_new_configuration() -> Test
 kernel_test_in!(
     "drivers/gpu/dcn401-clk",
     dcn401_pin_retires_a_firmware_schedule_before_any_new_configuration
+);
+
+fn dcn401_cab_reservation_requires_pin_and_acknowledgement() -> TestResult {
+    for outcome in 0..3 {
+        let mut e = engine();
+        start(&mut e);
+        run(e.prepare(request())).unwrap();
+        e.status.dynamic_power = true;
+        e.status.bandwidth.uclk_pstate = false;
+        e.io.commands.clear();
+        assert_eq!(run(e.reserve_cab(17)), Err(Error::Invalid));
+        assert!(e.io.commands.is_empty());
+        e.status.bandwidth.uclk_pstate = true;
+        assert_eq!(run(e.reserve_cab(3)), Err(Error::Busy));
+        e.status.bandwidth.uclk_pstate = false;
+        if outcome == 1 {
+            e.io.refuse = Some(1);
+        }
+        if outcome == 2 {
+            e.io.stall = Some(1);
+        }
+        if outcome == 2 {
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut f = core::pin::pin!(e.reserve_cab(3));
+            assert!(f.as_mut().poll(&mut cx).is_pending());
+        } else {
+            assert_eq!(
+                run(e.reserve_cab(3)),
+                if outcome == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::Rejected(0xfd))
+                }
+            );
+        }
+        assert_eq!(e.io.commands, alloc::vec![(0x12, 7)]);
+        if outcome == 0 {
+            assert_eq!(e.status.cab_ways, 3);
+            run(e.reserve_cab(0)).unwrap();
+            assert_eq!(e.io.commands.last(), Some(&(0x12, 0)));
+            assert_eq!(e.status.cab_ways, 0);
+        } else {
+            assert_eq!(e.status.cab_ways, 0);
+            assert_eq!(run(e.reserve_cab(0)), Err(Error::Busy));
+            assert_ne!(e.status.state, State::Applied);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_cab_reservation_requires_pin_and_acknowledgement
 );

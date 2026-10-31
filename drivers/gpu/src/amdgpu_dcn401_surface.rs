@@ -45,6 +45,10 @@ pub use scanout::{
     LivePipe, OverlayScanout, ScanoutPosition, ScanoutRunning, ScanoutUnderflow, VblankPhase,
 };
 
+#[path = "amdgpu_dcn401_subvp_hw.rs"]
+mod subvp;
+pub use subvp::SubvpApplied;
+
 /// A scanout format: the DRM fourccs amdgpu_dm offers on DCN4.0.1 planes
 /// that this path programs, each mapped to its DC surface format as
 /// amdgpu_dm's fill_dc_plane_info_and_addr does (X and A variants share

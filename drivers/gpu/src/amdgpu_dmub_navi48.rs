@@ -1330,12 +1330,21 @@ pub struct Fams2Global {
 /// sub-state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Fams2StreamConfig {
+    pub phantom: Option<Fams2PhantomConfig>,
     pub base: crate::amdgpu_dcn401_dml::pstate::Fams2Stream,
     pub drr: Option<crate::amdgpu_freesync::Drr>,
     pub otg_inst: u8,
     pub pipe_mask: u8,
     pub num_planes: u8,
     pub plane_pipe_masks: [u8; 6],
+}
+
+/// Physical resources reserved by the SubVP owner (v1 sub-state).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fams2PhantomConfig {
+    pub otg_inst: u8,
+    pub pipe_mask: u8,
+    pub plane_pipe_masks: [u8; 3],
 }
 
 /// dc_dmub_srv_rb_based_fams2_update_config's command list for `global`
@@ -1428,7 +1437,24 @@ pub fn fams2_config_commands(
         // The legacy sub-state (dmub_fams2_cmd_legacy_stream_static_state):
         // the vactive fill delay; a vblank stream leaves it zero.
         let mut c = header(true);
-        if let Some(drr) = s.base.drr_state {
+        if let (Some(vp), Some(hw)) = (s.base.subvp, s.phantom) {
+            for (i, value) in [
+                1000u16,
+                1000,
+                vp.phantom_vtotal,
+                vp.phantom_vactive,
+                vp.programming_delay,
+                vp.prefetch_to_mall,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                c[4 + 2 * i..6 + 2 * i].copy_from_slice(&value.to_le_bytes());
+            }
+            c[17] = hw.otg_inst;
+            c[18] = hw.pipe_mask;
+            c[20..23].copy_from_slice(&hw.plane_pipe_masks);
+        } else if let Some(drr) = s.base.drr_state {
             c[4..6].copy_from_slice(&drr.stretched_vtotal.to_le_bytes());
             c[6..8].copy_from_slice(&drr.programming_delay.to_le_bytes());
             c[8] = 1; // only_stretch_if_required

@@ -2,6 +2,12 @@
 use super::*;
 impl ColdBoot {
     pub(super) async fn begin_fams2_io(&mut self) -> Result<bool, otg::Error> {
+        // Native updates never race the firmware's phantom fetch or retire
+        // a main buffer still aliased by it. Re-admission can enable SubVP
+        // again once the updated display has settled.
+        if self.otg.as_ref().is_ok_and(|o| o.subvp().is_some()) {
+            self.pin_display_uclk().await?;
+        }
         if self.fams2_pending || self.state() != State::MemoryReady {
             return Err(otg::Error::Busy);
         }
@@ -26,6 +32,98 @@ impl ColdBoot {
             self.fams2_pending = false;
         }
         result
+    }
+
+    pub(super) async fn stage_display_subvp(
+        &mut self,
+        main: u8,
+        phantom: &crate::amdgpu_dcn401_dml::pstate::Phantom,
+    ) -> Result<dmub::Fams2PhantomConfig, otg::Error> {
+        if self.fams2_active || self.fams2_pending || self.uclk_switching() {
+            return Err(otg::Error::Busy);
+        }
+        let capacity = crate::amdgpu_rdna4::Rdna4Chip::of(&self.sequence.backend.gpu)
+            .map_or(0, |chip| {
+                crate::amdgpu_rdna4::mall_bytes(chip, phantom.plan.soc.umc_channels) as u32
+            });
+        if !(1..=16).contains(&phantom.mall_ways)
+            || !phantom.readmits()
+            || phantom
+                .plan
+                .pstate
+                .and_then(|p| p.subvp)
+                .is_none_or(|p| p.mall_bytes != capacity)
+        {
+            return Err(otg::Error::Invalid);
+        }
+        // Refuse an unavailable/dirty spare before publishing any firmware
+        // intent. Once reserved, every later error retains both owners.
+        let q = self.otg.as_mut().map_err(|e| *e)?.reserve_subvp(main)?;
+        self.fams2_pending = true;
+        let regs = self.sequence.backend.gpu.regs;
+        self.clocks
+            .as_mut()
+            .map_err(|e| otg::Error::Clocks(*e))?
+            .reserve_cab(regs, phantom.mall_ways)
+            .await
+            .map_err(otg::Error::Clocks)?;
+        let otg = self.otg.as_mut().map_err(|e| *e)?;
+        let held = otg.all_held();
+        let clock = self
+            .dccg
+            .as_mut()
+            .map_err(|e| otg::Error::PipeClocks(*e))?
+            .prepare_except(
+                self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                dccg::Request {
+                    pipe: q,
+                    dpp_khz: phantom.plan.clocks.dppclk_khz,
+                    pixel: dccg::PixelClock::DisplayPort {
+                        pixel_hz: u64::from(phantom.plan.mode.timing.pixel_clock_khz) * 1000,
+                    },
+                },
+                &held,
+            )
+            .await
+            .map_err(otg::Error::PipeClocks)?;
+        otg.program_subvp(&phantom.plan, clock).await?;
+        let inst = crate::amdgpu_rdna4::pipe_pool().hw(q);
+        self.fams2_pending = false;
+        Ok(dmub::Fams2PhantomConfig {
+            otg_inst: inst,
+            pipe_mask: 1 << inst,
+            plane_pipe_masks: [1 << inst, 0, 0],
+        })
+    }
+    async fn retire_display_subvp(&mut self) -> Result<(), otg::Error> {
+        if self.otg.as_ref().is_ok_and(|o| o.subvp().is_some()) {
+            self.fams2_pending = true;
+            let otg = self.otg.as_mut().map_err(|e| *e)?;
+            let q = otg.retire_subvp().await?.ok_or(otg::Error::Busy)?;
+            let held = otg.all_held();
+            self.dccg
+                .as_mut()
+                .map_err(|e| otg::Error::PipeClocks(*e))?
+                .prepare_except(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    dccg::Request {
+                        pipe: q,
+                        dpp_khz: 0,
+                        pixel: dccg::PixelClock::Disabled,
+                    },
+                    &held,
+                )
+                .await
+                .map_err(otg::Error::PipeClocks)?;
+            self.clocks
+                .as_mut()
+                .map_err(|e| otg::Error::Clocks(*e))?
+                .reserve_cab(self.sequence.backend.gpu.regs, 0)
+                .await
+                .map_err(otg::Error::Clocks)?;
+            self.fams2_pending = false;
+        }
+        Ok(())
     }
 
     pub(crate) fn fams2_active(&self) -> bool {
@@ -58,6 +156,11 @@ impl ColdBoot {
         }) {
             return Err(otg::Error::Busy);
         }
+        if self.otg.as_ref().is_ok_and(|o| o.subvp().is_some())
+            && (streams.len() != 1 || streams[0].base.kind != 4)
+        {
+            return Err(otg::Error::Invalid);
+        }
         let (mut pipes, mut otgs) = (0u8, 0u8);
         for stream in streams {
             let count = usize::from(stream.num_planes);
@@ -67,7 +170,11 @@ impl ColdBoot {
                 || stream.pipe_mask & !0xf != 0
                 || stream.pipe_mask & pipes != 0
                 || otgs & (1 << stream.otg_inst) != 0
-                || !(1..=3).contains(&stream.base.kind)
+                || !(1..=4).contains(&stream.base.kind)
+                || (stream.base.kind == 4) != stream.phantom.is_some()
+                || (stream.base.kind == 4) != stream.base.subvp.is_some()
+                || (stream.base.kind == 4
+                    && (streams.len() != 1 || stream.drr.is_some() || count != 1))
                 || stream.base.is_drr != stream.drr.is_some()
                 || (stream.base.kind == 3 && stream.base.drr_state.is_none())
                 || stream.plane_pipe_masks[..count].contains(&0)
@@ -75,6 +182,31 @@ impl ColdBoot {
                 || stream.plane_pipe_masks.iter().fold(0, |m, p| m | p) != stream.pipe_mask
             {
                 return Err(otg::Error::Invalid);
+            }
+            if let Some(hw) = stream.phantom {
+                let pool = crate::amdgpu_rdna4::pipe_pool();
+                let owner = self
+                    .otg
+                    .as_ref()
+                    .map_err(|e| *e)?
+                    .subvp()
+                    .ok_or(otg::Error::Busy)?;
+                if self
+                    .display_status(owner.main)?
+                    .is_none_or(|s| s.state != otg::State::ScanoutRunning(owner.main))
+                    || owner.active
+                    || hw.otg_inst >= 4
+                    || hw.otg_inst == stream.otg_inst
+                    || hw.otg_inst != pool.hw(owner.phantom)
+                    || stream.otg_inst != pool.hw(owner.main)
+                    || hw.pipe_mask != 1 << hw.otg_inst
+                    || hw.pipe_mask & (pipes | stream.pipe_mask) != 0
+                    || hw.plane_pipe_masks != [hw.pipe_mask, 0, 0]
+                {
+                    return Err(otg::Error::Invalid);
+                }
+                pipes |= hw.pipe_mask;
+                otgs |= 1 << hw.otg_inst;
             }
             pipes |= stream.pipe_mask;
             otgs |= 1 << stream.otg_inst;
@@ -186,6 +318,11 @@ impl ColdBoot {
         } else {
             Ok(())
         };
+        let restore = if sent.is_ok() {
+            restore.and_then(|()| self.otg.as_mut().map_err(|e| *e)?.firmware_subvp(enable))
+        } else {
+            restore
+        };
         let released = self.sequence.backend.dmub.hw_lock(false).await;
         if locked != Ok(true) || sent.is_err() || released != Ok(true) || restore.is_err() {
             return Err(otg::Error::Busy);
@@ -195,10 +332,13 @@ impl ColdBoot {
         Ok(())
     }
     pub async fn disable_display_fams2(&mut self) -> Result<(), otg::Error> {
-        if self.fams2_active || self.fams2_pending {
-            return self
-                .configure_fams2(false, &dmub::Fams2Global::default(), &[])
-                .await;
+        if self.fams2_active
+            || self.fams2_pending
+            || self.otg.as_ref().is_ok_and(|o| o.subvp().is_some())
+        {
+            self.configure_fams2(false, &dmub::Fams2Global::default(), &[])
+                .await?;
+            return self.retire_display_subvp().await;
         }
         if !self.display_fams2() {
             return Ok(());
