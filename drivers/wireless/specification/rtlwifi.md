@@ -1107,7 +1107,7 @@ are closed. Final release Clippy and ordinary boot gates pass at the
 behavior-preserving lint successor `127744339`; physical board acceptance
 remains separate.
 
-### Qualified legacy20 channel changes (implemented, native acceptance pending)
+### Qualified legacy20 channel changes (implemented and software-validated)
 
 The async `set_config` and a single-channel scan request can select channels
 1–11 under an actual current signed NEPC row and host policy. Permission
@@ -1133,8 +1133,10 @@ reports only channels permitted by the current NEPC and host policy. Other
 bands/widths remain separate.
 Four native composed cases exercise actual1→6→11→1 RF18 and distinct gain
 receipts with Open/WPA2 DHCP, preflight/idle rejection, abandoned waiters and
-IPS wake. Both remaining family rows stay open pending native acceptance and
-their explicit broader scan/PHY residuals.
+IPS wake. All four pass on both architectures at native checkpoint
+`196e0a946`; final release gates pass at its one-line lint successor
+`32504f88d`. Both family rows remain open for the later multi-channel scan
+and per-channel HT/fallback continuations.
 
 ### Multi-channel software scanning (implemented, native acceptance pending)
 
@@ -1377,8 +1379,8 @@ runtimes remain separate from the retained RTL8188EE owner.
 
 | Row | Concrete blocker |
 |---|---|
-| `active_scanning` | Native single-channel active Probe Requests software-validated; qualified cold retune1–11 and multi-channel dwell aggregation with owned metadata/fresh physical join observation implemented pending acceptance |
-| `additional_operating_channels` | Legacy20 cold retune1–11 under current signed per-channel NEPC and per-channel HT20/NEFB continuations implemented pending acceptance |
+| `active_scanning` | Native active probes and qualified cold retune1–11 software-validated; multi-channel dwell aggregation with owned metadata/fresh physical join observation implemented pending acceptance |
+| `additional_operating_channels` | Legacy20 cold retune1–11 under current signed per-channel NEPC software-validated; per-channel HT20/NEFB continuations implemented pending acceptance |
 | `bt_coexistence` | Bluetooth coexistence on RTL8723AE/BE; blocked on the rtl8723ae/rtl8723be chip runtimes |
 | `dynamic_antenna_selection` | Dynamic antenna selection/tracking; blocked on per-antenna signed board measurements (NEPC binds one static factory antenna) |
 | `five_ghz_operation` | 5GHz band operation on RTL8192DE/RTL8821AE; blocked on the rtl8192de/rtl8821ae chip runtimes (RTL8188EE is 2.4GHz-only) |

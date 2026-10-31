@@ -221,6 +221,15 @@ the explicit task instruction. Channel retune, broader scanning and later
 P2P/MQ batches retain separate pending checkpoints; software acceptance does
 not assert physical board RF qualification.
 
+**Follow-up acceptance 2026-10-30** (counts unchanged): native checkpoint
+`196e0a946` passes **4186/0/13** on x86_64 and **3827/0/7** on aarch64.
+Both pass all23 focused retune/private-P2P/metadata/admin-target cases,
+including the four RTL legacy-channel retunes. The validation-only one-line
+lint successor `32504f88d` passes both release Clippy contexts, formatting,
+ordinary boots and both btrfs postflight images per architecture. The
+canonical later scan implementation removes that redundant conversion too.
+Broader scan/HT, concrete P2P and subsequent MQ/ROC batches remain separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 13 | Parked Gen3 HE/TX A-MSDU and wider bands/widths; AP/P2P/WoW, scheduled scan and Gen2 multiple RX queues/RSS; additional chip profiles are tracked separately |
