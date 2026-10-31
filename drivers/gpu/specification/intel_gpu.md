@@ -1484,7 +1484,7 @@ Xe GPU ordering is explicit while terminal dma_resv fences exclude CPU copies.
 VM-attached BO identities cannot be exported or rebound to a different VM.
 Native queue priorities and timeslices reach the real GuC policy KLVs.
 Legacy backends retain the i915 compatibility profile described below.
-Native USERPTR, fault/long-running VMs, other engines, VRAM, scanout allocation
+Fault/long-running VMs, compute/media engines, VRAM, scanout allocation
 and additional query/property families remain completion work. Mesa and
 physical execution remain separate acceptance gates.
 
@@ -1850,7 +1850,7 @@ acceptance or a claim of complete acceleration.
 | Area | Current checkpoint | Still required |
 | --- | --- | --- |
 | GuC execution | Owned GGTT/PPGTT jobs, primed/persistent user RCS0 and BCS0 state, verified register policy, graphics-GT/RCS/BCS workarounds on MTL/Arrow, DG2 and BMG | Compute/media engines, remaining out-of-band workarounds and silicon qualification |
-| Render UAPI | Native Xe queries/GEM/VM_BIND/RCS and COPY queues/EXEC/user fences/per-engine cycles; i915 compatibility with legacy BLT ring, context engine maps and explicit fences; context loss and fresh-epoch rebuild | USERPTR, fault/long-running VMs, i915 load balancing/parallel submission, more queue/query families and Mesa interoperability |
+| Render UAPI | Native Xe queries/GEM/VM_BIND (incl. snapshot-pinned MAP_USERPTR)/RCS and COPY queues/EXEC/user fences/per-engine cycles; i915 compatibility with legacy BLT ring, context engine maps and explicit fences; context loss and fresh-epoch rebuild | USERPTR invalidation (MMU notifier + fork copy), i915 GEM_USERPTR, fault/long-running VMs, i915 load balancing/parallel submission, more queue/query families and Mesa interoperability |
 | Engines and platforms | Main-GT DSS/EU discovery; RCS0 and never-fused BCS0 scheduling; separate Gen12 foundations | BMG BCS8, CCS (DSS-quadrant/fuse-register inventory), media GT, compute/media submission and independently sourced profiles for other IP |
 | Memory and presentation | Owned system RAM, private tables and same-card CPU PRIME mappings | Local VRAM, accelerated PRIME/presentation and GPU/KMS synchronization |
 | Display | Gen12 paths and owned Xe-LPG internal-panel modeset | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |
@@ -1870,11 +1870,15 @@ reusing it. Active firmware routes and VMD shared routing refuse takeover;
 ARM production routing still needs an ITS event owner. These native models do
 not establish physical MSI delivery or Mesa/silicon acceptance.
 
-USERPTR can reuse `memory::address_space::UserPagePin` for resident-RAM lifetime
-holds. That read-pin primitive alone does not implement Xe USERPTR: admission
-still needs writable/COW-safe pinning tied to the caller's address space and
-invalidation/repin/rebind ordering against unmap, replacement, fork and active
-GPU jobs (`xe_userptr.c`). Likewise, admitting iGPU WC allocations requires a
+Xe MAP_USERPTR is admitted with snapshot pins: the syscall boundary faults the
+range, resolves write COW copies and retains `UserPagePin`s that every mapping
+and job holds through retirement, so the GPU never reaches freed memory. Linux
+parity still needs `xe_userptr.c`'s invalidation/repin/rebind against unmap,
+replacement and fork. That requires a memory-layer MMU notifier and eager
+child copies of pinned private pages at fork (`page_needs_cow_for_dma`).
+Without the copy, a parent CPU write after fork splits away from the
+GPU-pinned frame, which then stays shared with the child. amdgpu
+GEM_USERPTR shares this gap. Likewise, admitting iGPU WC allocations requires a
 cache-alias policy covering the kernel's WB mapping, rather than changing only
 the userspace PTE or silently substituting WB for the requested policy.
 

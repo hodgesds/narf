@@ -8,6 +8,7 @@ struct Cpu {
     wire: User,
     mapping: IrqSafeSpinLock<Option<MmapBacking>>,
     fail_report: core::sync::atomic::AtomicBool,
+    pin_calls: core::sync::atomic::AtomicU32,
 }
 impl Cpu {
     fn new() -> Self {
@@ -15,6 +16,7 @@ impl Cpu {
             wire: User::new(),
             mapping: IrqSafeSpinLock::new(None),
             fail_report: core::sync::atomic::AtomicBool::new(false),
+            pin_calls: core::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -30,6 +32,38 @@ impl IoctlContext for Cpu {
     }
     fn nonblocking(&self) -> bool {
         false
+    }
+    // Modeled process: 0x4000 is the writable CPU mapping, 0x6000 a read-only
+    // alias of the same page, everything else unmapped.
+    fn pin_user_pages(
+        &self,
+        address: u64,
+        pages: u64,
+        writable: bool,
+    ) -> Result<Vec<narf_memory::address_space::UserPagePin>, FsError> {
+        self.pin_calls
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let mapping = self.mapping.lock();
+        let frame = mapping.as_ref().ok_or(FsError::BadAddress)?.frames[0];
+        (0..pages)
+            .map(|page| match address + page * 4096 {
+                0x4000 => Ok(()),
+                0x6000 if writable => Err(FsError::OperationNotPermitted),
+                0x6000 => Ok(()),
+                _ => Err(FsError::BadAddress),
+            })
+            .map(|page| {
+                page.map(|()| {
+                    // SAFETY: the mapping's BO frame is a live allocator frame
+                    // retained by `mapping` across this call.
+                    unsafe {
+                        narf_memory::address_space::UserPagePin::retain_ram(
+                            narf_memory::PhysAddr::new(frame),
+                        )
+                    }
+                })
+            })
+            .collect()
     }
     fn read_u64_acquire(&self, address: u64) -> Result<u64, FsError> {
         if address & 7 != 0 {
@@ -399,6 +433,141 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_user",
     smoke_xe_native_exec_user_fence_close_and_retirement
+);
+
+fn userptr_op(va: u64, address: u64, length: u64, pat: u16, flags: u32) -> [u8; 80] {
+    let mut op = mapping(0, va, address, length, pat, flags);
+    put32(&mut op, 40, 2); // DRM_XE_VM_BIND_OP_MAP_USERPTR
+    op
+}
+
+fn smoke_xe_userptr_bind_exec_validation_and_retirement() -> TestResult {
+    use core::sync::atomic::Ordering::Relaxed;
+    for (platform, ack) in [
+        (GtPlatform::Battlemage, 0xdfc),
+        (GtPlatform::Alchemist, 0x130044),
+        (
+            GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
+            0xdfc,
+        ),
+    ] {
+        let (w, arena, mut gt) = hardware_model(platform, ack);
+        prime(&mut gt, &w, ack);
+        let (mailbox, info) = setup(&mut gt, &w, platform);
+        let file = RenderFile::new();
+        let user = Cpu::new();
+        let vm = create_vm(&file, &info, &user);
+        let queue = create_queue(&file, &info, &user, vm, 0);
+        let handles = buffers(&file, &info, &user, vm);
+        let pat = match platform {
+            GtPlatform::Alchemist => 0,
+            GtPlatform::Battlemage => 2,
+            _ => 3,
+        };
+        // The process's own page: a separate allocation from the data BO.
+        let host = create_bo(&file, &info, &user, 4096, 0);
+        let host_object = file.gem.object(host).unwrap();
+        *user.mapping.lock() = Some(host_object.backing(0, 4096).unwrap());
+        let data = file.gem.object(handles[1]).unwrap();
+        // vm_bind_ioctl_check_args refusals, before any page is faulted.
+        for op in [
+            {
+                let mut op = userptr_op(0x2345_0000_0000, 0x4000, 4096, pat, 0);
+                put32(&mut op, 8, handles[1]); // an object with MAP_USERPTR
+                op
+            },
+            userptr_op(0x2345_0000_0000, 0x4000, 4096, pat, 4), // NULL
+            userptr_op(0x2345_0000_0000, 0x4008, 4096, pat, 0), // unaligned
+            userptr_op(0x2345_0000_0000, 0x4000, 4096, 15, 0),  // PAT
+        ] {
+            bind_wire(&user, vm, &[op], &[]);
+            assert_eq!(bind_now(&file, &info, &user), Err(FsError::InvalidData));
+        }
+        // A later op's EINVAL wins over an earlier op's unmapped range.
+        let mut bad = mapping(0, 0x3000_0000_0000, 0, 4096, pat, 0);
+        put32(&mut bad, 40, 7);
+        bind_wire(
+            &user,
+            vm,
+            &[userptr_op(0x2345_0000_0000, 0x8000, 4096, pat, 0), bad],
+            &[],
+        );
+        assert_eq!(bind_now(&file, &info, &user), Err(FsError::InvalidData));
+        assert_eq!(user.pin_calls.load(Relaxed), 0);
+        // Fault classes: unmapped is EFAULT, a write pin of a read-only page EPERM.
+        for (address, flags, expected) in [
+            (0x8000, 0, FsError::BadAddress),
+            (0x4000, 0, FsError::BadAddress), // second page unmapped
+            (0x6000, 0, FsError::OperationNotPermitted),
+        ] {
+            let length = if address == 0x4000 { 8192 } else { 4096 };
+            bind_wire(
+                &user,
+                vm,
+                &[userptr_op(0x2345_0000_0000, address, length, pat, flags)],
+                &[],
+            );
+            assert_eq!(bind_now(&file, &info, &user), Err(expected));
+        }
+        // A READONLY pin of the read-only alias is admitted.
+        bind_wire(
+            &user,
+            vm,
+            &[userptr_op(0x3000_0000_0000, 0x6000, 4096, pat, 1)],
+            &[],
+        );
+        assert_eq!(bind_now(&file, &info, &user), Ok(0));
+        // Replace the data BO's VA with the process page and execute.
+        bind_wire(
+            &user,
+            vm,
+            &[userptr_op(0x2345_0000_0000, 0x4000, 4096, pat, 0)],
+            &[],
+        );
+        assert_eq!(bind_now(&file, &info, &user), Ok(0));
+        exec_wire(&user, queue, true, &[]);
+        let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
+        assert!(call
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        let (_, fence) = mailbox.accept(&mut gt, 100);
+        assert_eq!(
+            call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Some(Ok(0)))
+        );
+        // Unbinding while the job is live keeps its pins until retirement.
+        let mut unmap = mapping(0, 0x2345_0000_0000, 0, 4096, 0, 0);
+        put32(&mut unmap, 40, 1);
+        bind_wire(&user, vm, &[unmap], &[]);
+        let mut unbind = core::pin::pin!(file.dispatch_user(&info, xe::VM_BIND, 64, &user));
+        let _ = unbind
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        let mut registered = BTreeMap::new();
+        finish(&mut gt, &w, &fence, &mut registered, 101);
+        assert_eq!(ready(unbind.as_mut()), Some(Ok(0)));
+        assert_eq!(user.read_u64_acquire(0x4080), Ok(0x4e415246));
+        let mut value = [0; 4];
+        data.read(0x80, &mut value).unwrap();
+        assert_eq!(value, [0; 4], "the store reached the replaced data BO");
+        drop(data);
+        drop(host_object);
+        user.mapping.lock().take();
+        assert_eq!(
+            close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, queue),
+            Ok(0)
+        );
+        assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, vm), Ok(0));
+        hardware_stop(&mut gt, &w, ack);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_xe_userptr_bind_exec_validation_and_retirement
 );
 
 fn smoke_xe_vm_slices_nulls_private_objects_and_transactions() -> TestResult {

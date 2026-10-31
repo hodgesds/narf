@@ -59,6 +59,9 @@ pub(crate) struct Bind {
     pub length: u64,
     pub op: u32,
     pub mapping: Option<VmMapping>,
+    /// MAP_USERPTR source address, pinned only after every op's arguments
+    /// validate (Linux checks all ops before faulting any pages).
+    pub userptr: Option<u64>,
 }
 
 pub(crate) fn pat_allowed(platform: GtPlatform, pat: u16) -> bool {
@@ -86,7 +89,9 @@ impl Bind {
         let address = u64_at(wire, 32);
         let op = u32_at(wire, 40);
         let flags = u32_at(wire, 44);
-        if flags & !0x1f != 0 || u32_at(wire, 48) != 0 {
+        // op > DRM_XE_VM_BIND_OP_PREFETCH is EINVAL; PREFETCH itself is a
+        // valid operation that this VM does not implement.
+        if flags & !0x1f != 0 || u32_at(wire, 48) != 0 || op > 4 {
             return Err(FsError::InvalidData);
         }
         if op == 3 {
@@ -99,6 +104,7 @@ impl Bind {
                 length,
                 op,
                 mapping: None,
+                userptr: None,
             });
         }
         if address % 4096 != 0
@@ -118,6 +124,30 @@ impl Bind {
                 length,
                 op,
                 mapping: None,
+                userptr: None,
+            });
+        }
+        if op == 2 {
+            // DRM_XE_VM_BIND_OP_MAP_USERPTR (vm_bind_ioctl_check_args): no
+            // object, not NULL, a coherent uncompressed PAT and an aligned
+            // address. Every admitted PAT is coherent and uncompressed.
+            if object != 0 || flags & 4 != 0 || !pat_allowed(platform, pat) || offset % 4096 != 0 {
+                return Err(FsError::InvalidData);
+            }
+            return Ok(Self {
+                object: None,
+                address,
+                length,
+                op: 0,
+                mapping: Some(VmMapping {
+                    object: None,
+                    va: address,
+                    offset: 0,
+                    length,
+                    writable: flags & 1 == 0,
+                    pat: pat as u8,
+                }),
+                userptr: Some(offset),
             });
         }
         if op != 0 {
@@ -156,7 +186,24 @@ impl Bind {
                 writable: flags & 1 == 0,
                 pat: pat as u8,
             }),
+            userptr: None,
         })
+    }
+
+    /// Fault in and pin a MAP_USERPTR range (write-resolving unless READONLY)
+    /// as a VM-private object. Pins are snapshot lifetime holds: jobs and
+    /// mappings retain them, so the GPU never reaches freed memory.
+    pub fn pin(&mut self, vm: &Vm, user: &dyn IoctlContext) -> Result<(), FsError> {
+        let Some(address) = self.userptr else {
+            return Ok(());
+        };
+        let mapping = self.mapping.as_mut().expect("userptr mapping");
+        let pins = user.pin_user_pages(address, mapping.length / 4096, mapping.writable)?;
+        mapping.object = Some(crate::intel_gpu_gem::GemObject::from_user_pins(
+            pins,
+            vm.identity,
+        )?);
+        Ok(())
     }
 }
 
@@ -283,6 +330,7 @@ mod tests {
             length: 8192,
             op: 1,
             mapping: None,
+            userptr: None,
         };
         let mapped = state.prepare(&[unmap], true).unwrap();
         assert_eq!(
@@ -311,6 +359,7 @@ mod tests {
                 writable: true,
                 pat: 0,
             }),
+            userptr: None,
         };
         let mapped = state.prepare(&[replace], true).unwrap();
         assert_eq!(mapped.len(), 3);
@@ -324,6 +373,7 @@ mod tests {
             length: 0,
             op: 3,
             mapping: None,
+            userptr: None,
         };
         gem.close(handle).unwrap();
         let mapped = state.prepare(&[all], true).unwrap();

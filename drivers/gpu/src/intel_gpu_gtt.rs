@@ -245,6 +245,12 @@ pub fn encode_table_entry_with_pat(next_level_phys: u64, pat: u8) -> Result<u64,
 pub(crate) fn publish_system_pages<'a>(
     pages: impl Iterator<Item = &'a narf_memory::frame::PhysFrame>,
 ) -> bool {
+    publish_system_phys(pages.map(|frame| frame.start_address()))
+}
+
+/// As [`publish_system_pages`] for retained pages (e.g. USERPTR pins) that
+/// the caller keeps alive until retirement.
+pub(crate) fn publish_system_phys(pages: impl Iterator<Item = narf_memory::PhysAddr>) -> bool {
     use core::sync::atomic::{compiler_fence, fence, Ordering};
     compiler_fence(Ordering::SeqCst);
     #[cfg(target_arch = "x86_64")]
@@ -256,8 +262,8 @@ pub(crate) fn publish_system_pages<'a>(
         }
         line
     };
-    for frame in pages {
-        let base = frame.start_address().kernel_ptr::<u8>();
+    for page in pages {
+        let base = page.kernel_ptr::<u8>();
         #[cfg(target_arch = "x86_64")]
         for offset in (0..4096usize).step_by(line) {
             compiler_fence(Ordering::SeqCst);

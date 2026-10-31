@@ -415,6 +415,8 @@ fn install_sync_file(
     report: &mut dyn FnMut(i32) -> Result<(), FsError>,
 ) -> Result<i32, InstallFdError>;
 fn restart_after(&self, repoll_ns: u64) -> bool; // default false
+fn pin_user_pages(&self, address: u64, pages: u64, writable: bool)
+    -> Result<Vec<narf_memory::address_space::UserPagePin>, FsError>; // default Unsupported
 
 pub trait MmapLifetime: Any + Send + Sync {} // blanket impl; providers downcast
 
@@ -1385,6 +1387,15 @@ user-fence access with fault containment. Their default is `Unsupported`;
 implementations must not replace them with potentially torn byte copies.
 The syscall boundary validates the user range and calls the architecture's
 guarded qword primitive while the caller's address space is active.
+
+`IoctlContext::pin_user_pages` gives drivers GUP-style snapshot pins of the
+caller's resident pages without exposing its address space. The syscall
+boundary checks each page's range and region permissions (unreadable or
+unmapped `BadAddress`, a write pin of a read-only mapping
+`OperationNotPermitted`). It faults lazy pages through a guarded read, resolves
+private COW copies for write pins and pins through `AddressSpace::pin_user_page`,
+which refuses device/PFN mappings. Failure releases every pin. Pins never move
+on a later remap or COW split.
 
 `dma_buf` is the generic dma-buf core, mirroring Linux `drivers/dma-buf/`.
 An exporter owns one `DmaBufObject` per underlying buffer, shared by every fd

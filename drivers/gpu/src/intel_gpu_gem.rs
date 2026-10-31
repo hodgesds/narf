@@ -25,6 +25,9 @@ static RESERVATIONS: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 #[derive(Debug)]
 pub struct GemObject {
     frames: Vec<PhysFrame>,
+    /// USERPTR: retained caller pages instead of owned frames. Such objects
+    /// have no handle, mmap offset, CPU copy path or PRIME export.
+    pins: Vec<narf_memory::address_space::UserPagePin>,
     size: u64,
     offset: u64,
     vm_owner: Option<u64>,
@@ -45,6 +48,7 @@ impl GemObject {
             .map_err(|_| FsError::OutOfMemory)?;
         let mut object = Self {
             frames: Vec::new(),
+            pins: Vec::new(),
             size,
             offset,
             vm_owner: None,
@@ -70,6 +74,32 @@ impl GemObject {
         Ok(object)
     }
 
+    /// A VM-private USERPTR object over `pins`, charged like owned storage.
+    pub(crate) fn from_user_pins(
+        pins: Vec<narf_memory::address_space::UserPagePin>,
+        vm: u64,
+    ) -> Result<Arc<Self>, FsError> {
+        let size = (pins.len() as u64)
+            .checked_mul(PAGE)
+            .filter(|size| *size != 0)
+            .ok_or(FsError::InvalidData)?;
+        let mut object = Self::allocate(0, 0)?;
+        let limit = ((narf_memory::frame::stats().total as u64 * PAGE) / 2).min(512 * 1024 * 1024);
+        LIVE_BYTES
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                live.checked_add(size).filter(|next| *next <= limit)
+            })
+            .map_err(|_| FsError::OutOfMemory)?;
+        object.size = size;
+        object.pins = pins;
+        object.vm_owner = Some(vm);
+        Ok(Arc::new(object))
+    }
+
+    pub(crate) fn is_userptr(&self) -> bool {
+        !self.pins.is_empty()
+    }
+
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -79,7 +109,10 @@ impl GemObject {
     }
 
     pub fn pages(&self) -> impl Iterator<Item = u64> + '_ {
-        self.frames.iter().map(|frame| frame.start_address().raw())
+        self.frames
+            .iter()
+            .map(|frame| frame.start_address().raw())
+            .chain(self.pins.iter().map(|pin| pin.phys().raw()))
     }
 
     /// i915 render-class reader (upper bits) and writer (lower bits).
@@ -123,9 +156,13 @@ impl GemObject {
 
     pub(crate) fn publish_for_device(&self) -> bool {
         crate::intel_gpu_gtt::publish_system_pages(self.frames.iter())
+            && crate::intel_gpu_gtt::publish_system_phys(self.pins.iter().map(|pin| pin.phys()))
     }
 
     pub fn range(&self, offset: u64, len: usize) -> Result<(), FsError> {
+        if self.is_userptr() {
+            return Err(FsError::InvalidData);
+        }
         if offset
             .checked_add(len as u64)
             .is_none_or(|end| end > self.size)

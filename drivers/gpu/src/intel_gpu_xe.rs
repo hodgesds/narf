@@ -367,6 +367,9 @@ impl XeFile {
         for op in vector.chunks_exact(80) {
             binds.push(Bind::read(op, &vm, gem, info.platform)?);
         }
+        for bind in &mut binds {
+            bind.pin(&vm, user)?;
+        }
         let sync = Sync::read(user, u64_at(&wire, 112), u32_at(&wire, 108), table)?;
         if count == 0 && sync.user_fence.is_some() {
             return Err(FsError::NotImplemented);

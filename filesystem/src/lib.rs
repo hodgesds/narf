@@ -944,6 +944,22 @@ pub trait IoctlContext: Sync {
         Err(FsError::Unsupported)
     }
     fn nonblocking(&self) -> bool;
+    /// GUP-style lifetime holds on `pages` resident pages from `address` in
+    /// the calling process: every page is faulted in and, when `writable`,
+    /// its private COW copy is resolved first, so the pins name the frames
+    /// the caller writes now. Pins are snapshots. Later munmap, remap or COW
+    /// splits do not move them, and nothing is freed under them. Unmapped or
+    /// unreadable pages are `BadAddress`; a write pin over a read-only mapping
+    /// is `OperationNotPermitted` (hmm_range_fault's -EPERM). Device/PFN
+    /// mappings are refused. All-or-nothing: an error releases every pin.
+    fn pin_user_pages(
+        &self,
+        _address: u64,
+        _pages: u64,
+        _writable: bool,
+    ) -> Result<Vec<narf_memory::address_space::UserPagePin>, FsError> {
+        Err(FsError::Unsupported)
+    }
     /// Resolve a descriptor in the calling process without exposing its table
     /// to a driver. The retained open description also handles dup/fork.
     fn file(&self, _fd: i32) -> Result<Arc<dyn FileOps>, FsError> {

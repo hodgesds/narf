@@ -165,8 +165,19 @@ elevated priority requires authority this interface does not grant (EPERM).
 Timeslices are bounded to 1..100000 microseconds; unknown properties, flags,
 instances and malformed reserved fields fail before publication.
 
-VM_BIND supports vector or inline MAP, UNMAP and UNMAP_ALL, partial-object
-mappings, overlap replacement and split ranges with retained object offsets.
+VM_BIND supports vector or inline MAP, UNMAP, UNMAP_ALL and MAP_USERPTR,
+partial-object mappings, overlap replacement and split ranges with retained
+object offsets. Ops above PREFETCH are EINVAL; PREFETCH is NotImplemented.
+MAP_USERPTR follows vm_bind_ioctl_check_args: no object, not NULL, an admitted
+(coherent, uncompressed) PAT and page-aligned address/range, all checked for
+every op before any page is faulted. `IoctlContext::pin_user_pages` then faults
+and pins the range, resolving private COW copies unless READONLY (unmapped
+EFAULT, write over a read-only mapping EPERM), into a VM-private handle-less
+`GemObject` charged like owned storage. Mappings and jobs retain it as any BO.
+LINUX-GAP (shared with amdgpu GEM_USERPTR): Xe faults through HMM and repins
+via an MMU interval notifier. These pins are snapshots, so a later munmap,
+remap or fork-COW split leaves the GPU on the pinned frames, never on freed
+memory.
 All handles and synchronization payloads are retained before waiting. A bind
 prepares a replacement mapping set without mutating the published VM, waits for
 its prior GPU users and then commits under an async VM mutex. Cancelled waits,
@@ -208,7 +219,7 @@ without changing the request or publishing GPU work; the syscall bridge handles
 signal delivery and SA_RESTART. Completed/failed waits never request a park.
 Finite waits retain their original future/deadline instead of restarting a
 relative timeout on each repoll. Kernel callers without the hook await timers.
-USERPTR, long-running/fault VMs, multi-engine/parallel queues, scanout/WC iGPU
+Long-running/fault VMs, multi-engine/parallel queues, scanout/WC iGPU
 allocations, observation and additional native Xe query/property families
 remain refused until their ownership and hardware contracts are implemented.
 
