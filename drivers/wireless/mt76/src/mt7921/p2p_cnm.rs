@@ -8,10 +8,11 @@ use super::{
 
 #[derive(Debug)]
 pub(super) struct Cnm {
-    /// No token wraps into a delayed old grant within this MAC/FW lifetime.
-    /// At exhaustion an idle device must obtain verified WFSYS reset and
-    /// reinitialize its native wdev, rather than silently recycling an ID.
-    next: u16,
+    /// Linux's PHY-global opaque u8 token includes zero. Only one request
+    /// may be outstanding; successful terminal-grant/finite-expiry/packet
+    /// retirement permits recycling. Uncertain work retains its lease until
+    /// actual verified MAC reset, never a host cancellation or timeout.
+    next: u8,
     owner: Option<Lease>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,9 +43,6 @@ impl Cnm {
     pub fn lease(&self) -> Option<&Lease> {
         self.owner.as_ref()
     }
-    pub fn exhausted(&self) -> bool {
-        self.owner.is_none() && self.next > u16::from(u8::MAX)
-    }
     pub fn reserve(
         &mut self,
         bss: u8,
@@ -59,9 +57,9 @@ impl Cnm {
         if cookie == 0 {
             return Err(Error::Bounds);
         }
-        let token = u8::try_from(self.next).map_err(|_| Error::Busy)?;
+        let token = self.next;
         let request = Request::new(bss, token, frequency_mhz, duration_ms, kind)?;
-        self.next += 1;
+        self.next = self.next.wrapping_add(1);
         // Reservation precedes the first acquire publication. A dropped
         // caller cannot erase an uncertain command or give its token back.
         self.owner = Some(Lease {
@@ -109,7 +107,8 @@ impl Cnm {
     }
     /// The firmware-specified finite dwell is observed as elapsed. The
     /// native caller must still retire actual pending management packets
-    /// before channel/role handoff; this is no DMA or plaintext-FIFO fence.
+    /// and obtain the owned abort's native command-ordering receipt before
+    /// releasing this lease/recycling tokens; this is no plaintext-FIFO fence.
     pub fn expired(&self, now_ns: u64) -> bool {
         self.owner.as_ref().is_some_and(
             |owner| matches!(owner.phase,Phase::Granted { expires_ns,.. } if now_ns>=expires_ns),

@@ -272,15 +272,16 @@ kernel_test_in!(
     mt76_p2p_roc_completed_source_closure_fences_use_and_resets_before_reuse
 );
 
-fn token_rebuild() -> Result<(), &'static str> {
-    let (mut session, fixture, _) = started(true)?;
+fn token_reuse() -> Result<(), &'static str> {
+    let (mut session, fixture, model) = started(true)?;
     let before = session
         .backend
         .recovery_trace
         .iter()
         .filter(|(stage, _)| *stage == "assert")
         .count();
-    for cookie in 1..=256 {
+    for cookie in 1..=512 {
+        model.fault.store(1, Ordering::Release); // foreign old grant precedes exact current terminal
         let authority = reserved(&fixture)?;
         run(Box::pin(session.acquire_p2p_roc(
             authority.clone(),
@@ -288,10 +289,10 @@ fn token_rebuild() -> Result<(), &'static str> {
             2437,
             50,
         )))
-        .map_err(|_| "ROC actual token lifetime exceeded without native rebuild")?;
+        .map_err(|_| "ROC failed source-correct successful opaque token reuse")?;
         session
             .commit_p2p_roc(&authority)
-            .map_err(|_| "actual ROC publication across token lifetime")?;
+            .map_err(|_| "actual ROC publication across successful token reuse")?;
         drop(authority);
         session.backend.ticks.set(expiry(&session)?);
         if run(Box::pin(session.expire_p2p_roc())) != Ok(true) {
@@ -304,21 +305,24 @@ fn token_rebuild() -> Result<(), &'static str> {
         .iter()
         .filter(|(stage, _)| *stage == "assert")
         .count();
-    if after <= before
+    if after != before
         || !matches!(session.state, State::P2pDevice(_))
         || session
             .p2p_owner
             .as_ref()
             .is_none_or(|owner| !owner.activated || owner.cnm.pending())
     {
-        return Err("native ROC silently wrapped a token or lost actual rebuilt wdev ownership");
+        return Err(
+            "successful terminal ROC reuse reset the physical radio or lost native wdev ownership",
+        );
     }
     Ok(())
 }
-fn mt76_p2p_roc_token_exhaustion_obtains_real_reset_and_wdev_receipts() -> TestResult {
-    token_rebuild().map_or_else(TestResult::Fail, |_| TestResult::Pass)
+fn mt76_p2p_roc_successful_terminal_token_reuse_never_periodically_resets_the_radio() -> TestResult
+{
+    token_reuse().map_or_else(TestResult::Fail, |_| TestResult::Pass)
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/p2p",
-    mt76_p2p_roc_token_exhaustion_obtains_real_reset_and_wdev_receipts
+    mt76_p2p_roc_successful_terminal_token_reuse_never_periodically_resets_the_radio
 );

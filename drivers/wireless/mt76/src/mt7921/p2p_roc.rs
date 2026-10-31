@@ -99,19 +99,6 @@ impl<B: Backend> Session<B> {
         let domain = self.backend.regulatory_domain()?;
         let _ = Listen::prepare(info, &domain, frequency_mhz)?;
         let _ = p2p_wire::Request::new(0, 1, frequency_mhz, duration_ms, Kind::Remain)?;
-        if self
-            .p2p_owner
-            .as_ref()
-            .is_some_and(|owner| owner.cnm.exhausted())
-        {
-            // Rebuild the actual idle wdev after verified MAC retirement,
-            // rather than wrapping into a delayed old grant or imposing a
-            // synthetic lifetime limit on successful ROC requests.
-            self.p2p_owner.as_mut().ok_or(Error::Busy)?.pending = Some(authority.clone());
-            self.stop_p2p_device_owned().await?;
-            self.start_p2p_device(authority.clone()).await?;
-            self.commit_p2p_device(&authority)?;
-        }
         let info = self.p2p_owner.as_ref().ok_or(Error::Busy)?.info;
         let domain = self.backend.regulatory_domain()?;
         let listen = Listen::prepare(info, &domain, frequency_mhz)?;
@@ -194,8 +181,10 @@ impl<B: Backend> Session<B> {
                 if length != 60 || event[30] & 4 == 0 {
                     return Err(Error::MalformedEvent);
                 }
-                // A delayed grant for an older token or different BSS is
-                // not this request. Tokens never wrap before actual reset.
+                // A foreign/delayed grant is not this request. The source
+                // ABI has one outstanding acquisition and one terminal grant;
+                // successful finite retirement, unlike timeout/ambiguity,
+                // permits normal opaque-u8 recycling as Linux does.
                 if event[44] != 0 || event[45] != request.token() {
                     continue;
                 }

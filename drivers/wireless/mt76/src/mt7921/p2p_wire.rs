@@ -40,7 +40,7 @@ impl Request {
                     .ok_or(Error::Bounds)?,
             ),
         };
-        if bss >= 4 || token == 0 || !(1..=MAX_DURATION_MS).contains(&duration_ms) {
+        if bss >= 4 || !(1..=MAX_DURATION_MS).contains(&duration_ms) {
             return Err(Error::Bounds);
         }
         Ok(Self {

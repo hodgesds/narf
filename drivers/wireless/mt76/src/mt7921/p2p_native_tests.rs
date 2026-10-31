@@ -41,10 +41,16 @@ fn mt76_cnm_roc_literal_acquire_abort_and_exact_grant_identity() -> TestResult {
     if r.grant(&grant(9, 1, 6, 0)).is_ok()
         || r.grant(&grant(9, 1, 6, 501)).is_ok()
         || r.grant(&grant(9, 1, 6, 400)[..23]).is_ok()
-        || Request::new(0, 0, 2437, 500, Kind::Remain).is_ok()
+        || Request::new(4, 0, 2437, 500, Kind::Remain).is_ok()
         || Request::new(0, 1, 2437, 5001, Kind::Remain).is_ok()
     {
-        return TestResult::Fail("CNM malformed duration/token/extent admitted");
+        return TestResult::Fail("CNM malformed BSS/duration/extent admitted");
+    }
+    let zero = Request::new(0, 0, 2437, 500, Kind::Remain).unwrap();
+    if zero.acquire()[9] != 0 || zero.grant(&grant(0, 1, 6, 400)) != Ok(400) {
+        return TestResult::Fail(
+            "native opaque zero token was incorrectly treated as a host cookie",
+        );
     }
     let two = Request::new(0, 10, 2412, 500, Kind::Remain).unwrap();
     let six = Request::new(0, 10, 5955, 500, Kind::Remain).unwrap();
@@ -62,47 +68,54 @@ kernel_test_in!(
     "drivers/wireless/mt7921/p2p",
     mt76_cnm_roc_literal_acquire_abort_and_exact_grant_identity
 );
-fn mt76_cnm_grant_timer_abort_and_no_token_wrap_before_verified_reset() -> TestResult {
+fn mt76_cnm_terminal_grants_recycle_opaque_tokens_but_uncertain_abort_requires_reset() -> TestResult
+{
     let mut cnm = Cnm::default();
-    for i in 1..=255 {
-        let request = cnm
-            .reserve(0, u64::from(i), 2437, 500, Kind::Remain)
-            .unwrap();
-        if request.token() != i
-            || cnm.current(u64::from(i), 2437, 0)
+    for i in 1u64..=512 {
+        let request = cnm.reserve(0, i, 2437, 500, Kind::Remain).unwrap();
+        let token = i as u8;
+        if request.token() != token
+            || cnm.current(i, 2437, 0)
             || cnm.reserve(0, 999, 2437, 500, Kind::Remain) != Err(Error::Busy)
         {
             return TestResult::Fail("CNM queued acquire fabricated a current lease");
         }
-        if cnm.grant(&grant(i, 1, 6, 400), 1_000_000) != Ok(400)
-            || cnm.grant(&grant(i, 1, 6, 400), 1_000_000).is_ok()
-            || !cnm.current(u64::from(i), 2437, 400_999_999)
-            || cnm.current(u64::from(i), 2437, 401_000_000)
+        if cnm.grant(&grant(token, 1, 6, 400), 1_000_000) != Ok(400)
+            || cnm.grant(&grant(token, 1, 6, 400), 1_000_000).is_ok()
+            || !cnm.current(i, 2437, 400_999_999)
+            || cnm.current(i, 2437, 401_000_000)
             || cnm.release_expired_after_packets(400_999_999).is_ok()
             || cnm.release_expired_after_packets(401_000_000).is_err()
         {
             return TestResult::Fail("CNM grant identity/timer changed its finite receipt");
         }
     }
-    if cnm.reserve(0, 256, 2437, 500, Kind::Remain) != Err(Error::Busy) {
-        return TestResult::Fail("CNM late old grant can match a silently wrapped token");
-    }
-    cnm.reset_after_verified_mac();
-    let r = cnm.reserve(0, 257, 2437, 500, Kind::Remain).unwrap();
+    let r = cnm.reserve(0, 513, 2437, 500, Kind::Remain).unwrap();
     if r.token() != 1
-        || cnm.abort(257) != Ok(r)
-        || cnm.current(257, 2437, 0)
+        || cnm.abort(513) != Ok(r)
+        || cnm.current(513, 2437, 0)
         || !cnm.pending()
         || cnm.release_expired_after_packets(u64::MAX).is_ok()
         || cnm.grant(&grant(1, 1, 6, 400), 0).is_ok()
+        || cnm.reserve(0, 514, 2437, 500, Kind::Remain) != Err(Error::Busy)
     {
         return TestResult::Fail("unconfirmed abort released or resurrected a native CNM owner");
+    }
+    cnm.reset_after_verified_mac();
+    if cnm
+        .reserve(0, 514, 2437, 500, Kind::Remain)
+        .map(|request| request.token())
+        != Ok(1)
+    {
+        return TestResult::Fail(
+            "verified native reset failed to retire uncertain acquisition/token state",
+        );
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/p2p",
-    mt76_cnm_grant_timer_abort_and_no_token_wrap_before_verified_reset
+    mt76_cnm_terminal_grants_recycle_opaque_tokens_but_uncertain_abort_requires_reset
 );
 pub(super) fn wm_features(bits: u8) -> Vec<u8> {
     let payload = 32usize;
