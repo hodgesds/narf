@@ -2606,6 +2606,144 @@ fn smoke_aml_evaluate_object_name_and_method_shapes() -> TestResult {
 }
 kernel_test_in!("aml", smoke_aml_evaluate_object_name_and_method_shapes);
 
+fn smoke_aml_pr0_name_form_powers_resource() -> TestResult {
+    // Issue #1178: `power_on_all_devices` routed _PR0 through
+    // `evaluate_method`, which rejects Name nodes with
+    // MethodNotFound — so every device whose _PR0 is Name-form
+    // was silently skipped and its power resource never driven
+    // to ON. The fix routes _PR0 through `evaluate_object`,
+    // which reads both shapes. This fixture proves the
+    // Name-form path end to end: a device with a static
+    // Name(_PR0, Package(...)) must have its resource's _ON
+    // method executed, while a Method-form _PR0 device keeps
+    // working (regression guard for the shape that already
+    // worked). Observation is via flag Names the _ON methods
+    // Store(One) into — no hardware, no new harness.
+    //
+    // Hand-encoded AML (PkgLength counts itself + everything
+    // after it, NOT the leading opcode byte — the convention
+    // the evaluate_object fixture above pins):
+    //   Name(FLG0, Zero) / Name(FLG1, Zero) — _ON witnesses.
+    //   PowerResource(PR00, 0, 0) { Method(_ON, 0) {
+    //     Store(One, \FLG0) } } — and the same for PR01/FLG1.
+    //   Device(DEV0) { Name(_PR0, Package(1) { "\PR00" }) }
+    //   Device(DEV1) { Method(_PR0, 0) {
+    //     Return(Package(1) { "\PR01" }) } }
+    // _PR0 entries are fully-qualified NameStrings per ACPI
+    // 6.5 §7.3 (a Package of PowerResource references); the
+    // code appends "._ON" and evaluates the method.
+    use crate::Value;
+    crate::__reset_for_test();
+
+    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    // Name(FLG0, Zero).
+    body.push(0x08);
+    body.extend_from_slice(b"FLG0");
+    body.push(0x00);
+    // Name(FLG1, Zero).
+    body.push(0x08);
+    body.extend_from_slice(b"FLG1");
+    body.push(0x00);
+    // PowerResource(PR00, SystemLevel 0, ResourceOrder 0):
+    //   0x5B 0x84, PkgLength 22 = 1 (len) + 4 (name) + 3
+    //   (level + order) + 14 (method bytes below).
+    body.extend_from_slice(&[0x5B, 0x84, 22]);
+    body.extend_from_slice(b"PR00");
+    body.extend_from_slice(&[0x00, 0x00, 0x00]);
+    // Method(_ON, 0) { Store(One, \FLG0) }:
+    //   0x14, PkgLength 13 = 1 + 4 (name "_ON_") + 1 (flags)
+    //   + 7 (StoreOp + OneOp + rooted "FLG0" target).
+    body.extend_from_slice(&[0x14, 13]);
+    body.extend_from_slice(b"_ON_");
+    body.push(0x00);
+    body.extend_from_slice(&[0x70, 0x01, b'\\']);
+    body.extend_from_slice(b"FLG0");
+    // PowerResource(PR01, 0, 0) { Method(_ON, 0) {
+    //   Store(One, \FLG1) } } — same shape as PR00.
+    body.extend_from_slice(&[0x5B, 0x84, 22]);
+    body.extend_from_slice(b"PR01");
+    body.extend_from_slice(&[0x00, 0x00, 0x00]);
+    body.extend_from_slice(&[0x14, 13]);
+    body.extend_from_slice(b"_ON_");
+    body.push(0x00);
+    body.extend_from_slice(&[0x70, 0x01, b'\\']);
+    body.extend_from_slice(b"FLG1");
+    // Device(DEV0) { Name(_PR0, Package(1) { "\PR00" }) }:
+    //   Name bytes = 1 (op) + 4 (name) + 1 (PackageOp)
+    //   + 1 (PkgLength 9) + 1 (NumElements) + 7 (StringOp
+    //   + rooted "\PR00" + NUL) = 15.
+    //   Device PkgLength 20 = 1 + 4 (name) + 15.
+    body.extend_from_slice(&[0x5B, 0x82, 20]);
+    body.extend_from_slice(b"DEV0");
+    body.push(0x08);
+    body.extend_from_slice(b"_PR0");
+    body.extend_from_slice(&[0x12, 9, 1, 0x0D, b'\\']);
+    body.extend_from_slice(b"PR00");
+    body.push(0x00);
+    // Device(DEV1) { Method(_PR0, 0) {
+    //   Return(Package(1) { "\PR01" }) } }:
+    //   Method body = 1 (ReturnOp) + 1 (PackageOp) + 1
+    //   (PkgLength 9) + 1 (NumElements) + 7 (string) = 11.
+    //   Method PkgLength 17 = 1 + 4 (name) + 1 (flags) + 11.
+    //   Device PkgLength 23 = 1 + 4 (name) + 18 (method).
+    body.extend_from_slice(&[0x5B, 0x82, 23]);
+    body.extend_from_slice(b"DEV1");
+    body.extend_from_slice(&[0x14, 17]);
+    body.extend_from_slice(b"_PR0");
+    body.push(0x00);
+    body.push(0xA4);
+    body.extend_from_slice(&[0x12, 9, 1, 0x0D, b'\\']);
+    body.extend_from_slice(b"PR01");
+    body.push(0x00);
+
+    if crate::__parse_body_for_test(&body, "\\").is_err() {
+        return TestResult::Fail("_PR0 fixture parse failed");
+    }
+
+    // The gap itself, pinned at the fixture's own node:
+    // evaluate_method must still reject the Name-form _PR0 —
+    // that rejection is exactly what the old code tripped on.
+    match crate::eval::evaluate_method("\\DEV0._PR0", &[]) {
+        Err(crate::AmlError::MethodNotFound) => {}
+        _ => return TestResult::Fail("evaluate_method must reject Name-form _PR0"),
+    }
+    // And evaluate_object must read it as the Package it is.
+    match crate::eval::evaluate_object("\\DEV0._PR0", &[]) {
+        Ok(Value::Package(p)) => {
+            if p.len() != 1 || p[0] != Value::String(alloc::string::String::from("\\PR00")) {
+                return TestResult::Fail("Name-form _PR0 decoded to wrong package");
+            }
+        }
+        _ => return TestResult::Fail("evaluate_object must return the Name-form _PR0 package"),
+    }
+
+    // Flags start at zero: neither resource has been powered.
+    match crate::eval::evaluate_object("\\FLG0", &[]) {
+        Ok(Value::Integer(0)) => {}
+        _ => return TestResult::Fail("FLG0 must start at 0"),
+    }
+    match crate::eval::evaluate_object("\\FLG1", &[]) {
+        Ok(Value::Integer(0)) => {}
+        _ => return TestResult::Fail("FLG1 must start at 0"),
+    }
+
+    crate::eval::power_on_all_devices();
+
+    // Name-form device powered its resource: before the fix
+    // this stayed 0 (the device was silently skipped).
+    match crate::eval::evaluate_object("\\FLG0", &[]) {
+        Ok(Value::Integer(1)) => {}
+        _ => return TestResult::Fail("Name-form _PR0 device did not drive its resource _ON"),
+    }
+    // Method-form device still powered (regression guard).
+    match crate::eval::evaluate_object("\\FLG1", &[]) {
+        Ok(Value::Integer(1)) => {}
+        _ => return TestResult::Fail("Method-form _PR0 device stopped driving its resource _ON"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_pr0_name_form_powers_resource);
+
 // ── EC transaction-gate proof (#913) ─────────────────────────────
 //
 // Fake EC command-state machine, spec-shaped (ACPI 6.5 §12.3):

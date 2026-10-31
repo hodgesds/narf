@@ -338,9 +338,12 @@ pub fn power_on_all_devices() {
         // _PR0 returns a Package of NameStrings (PowerResources
         // we depend on). Some firmware emits it as a Method,
         // others as a Name(_PR0, Package(...)). evaluate_method
-        // handles both shapes — for Name it returns the package
-        // directly; for Method it runs the body.
-        let pkg = match evaluate_method(&pr0_path, &[]) {
+        // alone rejects the Name shape with MethodNotFound (it
+        // requires a Method node), which silently skipped every
+        // Name-form _PR0 device (issue #1178). evaluate_object
+        // reads both shapes: Method delegates to evaluate_method,
+        // Name decodes the stored Package.
+        let pkg = match evaluate_object(&pr0_path, &[]) {
             Ok(crate::Value::Package(p)) => p,
             _ => continue,
         };
