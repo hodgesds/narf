@@ -22,6 +22,8 @@ mod ap;
 pub(crate) mod ap_tests;
 #[path = "iface_monitor.rs"]
 mod monitor;
+#[path = "iface_p2p.rs"]
+pub(crate) mod p2p;
 #[path = "iface_wowlan.rs"]
 mod wowlan;
 
@@ -59,6 +61,11 @@ pub(crate) fn deliver_received_batch(
 pub struct Mt76Iface {
     name: String,
     radio: RadioInfo,
+    p2p_profile: Option<crate::mt7921::firmware_transport::P2pProfile>,
+    registration_cap: IrqSafeSpinLock<
+        Option<narf_capabilities::Cap<narf_net::NetIface, narf_capabilities::Write>>,
+    >,
+    p2p_device: IrqSafeSpinLock<Option<Arc<p2p::P2pDeviceIface>>>,
     scan_cache: IrqSafeSpinLock<Vec<ScanBss>>,
     rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
@@ -99,6 +106,9 @@ impl Mt76Iface {
         Ok(Self {
             name,
             radio,
+            p2p_profile: None,
+            registration_cap: IrqSafeSpinLock::new(None),
+            p2p_device: IrqSafeSpinLock::new(None),
             scan_cache: IrqSafeSpinLock::new(Vec::new()),
             rx_ring: IrqSafeSpinLock::new(None),
             tx_ring: IrqSafeSpinLock::new(None),
@@ -242,6 +252,9 @@ impl Mt76Iface {
             Ok(true) => (),
             Err(_) if self.ap_owned.load(Ordering::Acquire) => return self.poll_ap().await,
             Err(_) => (),
+        }
+        if !self.sleeping.load(Ordering::Acquire) && self.poll_p2p().await? {
+            return Ok(());
         }
         if self.ap_owned.load(Ordering::Acquire) || self.current_iftype() == 3 {
             return self.poll_ap().await;
@@ -1295,12 +1308,19 @@ fn scan_security(
 /// Register one boot-owned radio with both network registries. The same
 /// bounded packet step services executor and synchronous network callers.
 pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, WirelessError> {
+    register_scan_iface_profile(info, None)
+}
+pub(crate) fn register_scan_iface_profile(
+    info: RadioInfo,
+    profile: Option<crate::mt7921::firmware_transport::P2pProfile>,
+) -> Result<Arc<Mt76Iface>, WirelessError> {
     // Reusing our retained interface grants no new registry access and must
     // not depend on the authority used for its original publication.
     if let Some(existing) = ACTIVE.lock().as_ref() {
         return if existing.radio.chip_id == info.chip_id
             && existing.radio.capabilities == info.capabilities
             && existing.radio.hardware_type == info.hardware_type
+            && profile.is_none_or(|profile| existing.p2p_profile == Some(profile))
         {
             Ok(existing.clone())
         } else {
@@ -1311,6 +1331,7 @@ pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, Wir
         .and_then(|a| a.derive().ok())
         .ok_or(WirelessError::Denied)?;
     let mut iface = Mt76Iface::new(String::new(), info)?;
+    iface.p2p_profile = profile;
     // Bootstrap before control-plane discovery/association can query the
     // domain. Missing deployment policy still permits the receive-only scan
     // interface; TX admission retries the same signed bootstrap and fails shut.
@@ -1321,13 +1342,14 @@ pub(crate) fn register_scan_iface(info: RadioInfo) -> Result<Arc<Mt76Iface>, Wir
     iface.name = narf_net::iface::register("wlan%d", info.capabilities.mac, send_frame);
     publish_link(&iface.name, false);
     let iface = Arc::new(iface);
-    if narf_net::registry()
-        .register(&authority, RegisteredIface(iface.clone()))
-        .is_err()
-    {
-        narf_net::iface::unregister(&iface.name);
-        return Err(WirelessError::HardwareError);
-    }
+    let cap = match narf_net::registry().register(&authority, RegisteredIface(iface.clone())) {
+        Ok(cap) => cap,
+        Err(_) => {
+            narf_net::iface::unregister(&iface.name);
+            return Err(WirelessError::HardwareError);
+        }
+    };
+    *iface.registration_cap.lock() = Some(cap);
     *ACTIVE.lock() = Some(iface.clone());
     narf_wireless::registry::register(iface.clone());
     narf_net::iface::install_rx_drain(drain_network);
@@ -1354,9 +1376,12 @@ pub(crate) fn remove_scan_iface() {
         return;
     };
     iface.lose_link();
+    iface.withdraw_p2p_metadata();
     iface.scan_cache.lock().clear();
     narf_wireless::registry::unregister(&iface.name);
-    narf_net::registry().unregister(&iface.name);
+    if let Some(cap) = iface.registration_cap.lock().take() {
+        narf_net::registry().unregister_for_handle(&cap);
+    }
     narf_net::iface::unregister(&iface.name);
 }
 

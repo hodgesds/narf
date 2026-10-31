@@ -32,7 +32,7 @@ impl<B: Backend> Session<B> {
             return Err(Error::Authority);
         }
         let identity = authority.identity().map_err(|_| Error::Authority)?;
-        if identity.mac() != info.capabilities.mac {
+        if identity.mac() == [0; 6] || identity.mac()[0] & 1 != 0 {
             return Err(Error::Authority);
         }
         // Retain the actual request before the first native await. Even a
@@ -62,7 +62,11 @@ impl<B: Backend> Session<B> {
         self.stage(Stage::P2pDeviceStart);
         self.boot_started = Some(self.backend.now_ns());
         let result = async {
-            let (device, bss) = device_payloads(info.capabilities.mac, true)?;
+            // The actual registered P2P wdev may have its own address.
+            // Concrete retained work separately checks the physical radio's
+            // device/PCI identity; local MAC equality is no such grant.
+            let local = self.p2p_owner.as_ref().ok_or(Error::Busy)?.identity.mac();
+            let (device, bss) = device_payloads(local, true)?;
             self.p2p_exchange(&authority, Command::Unified { id: 1 }, &device)
                 .await?;
             self.p2p_exchange(&authority, Command::Unified { id: 2 }, &bss)
@@ -140,7 +144,8 @@ impl<B: Backend> Session<B> {
                 )
                 .await?;
             }
-            let (device, bss) = device_payloads(info.capabilities.mac, false)?;
+            let local = self.p2p_owner.as_ref().ok_or(Error::Busy)?.identity.mac();
+            let (device, bss) = device_payloads(local, false)?;
             // Linux uni_add_dev disables BSS before DEV. No fresh admin
             // grant is required to clean up an already-owned native wdev.
             self.exchange(Command::Unified { id: 2 }, &bss).await?;

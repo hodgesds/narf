@@ -21,6 +21,11 @@ mod ap_peer;
 mod ap_rx;
 #[path = "boot_ap.rs"]
 pub(crate) mod boot_ap;
+#[path = "boot_p2p.rs"]
+pub(crate) mod boot_p2p;
+#[path = "p2p_profile.rs"]
+mod p2p_profile;
+pub(crate) use p2p_profile::P2pProfile;
 
 #[path = "station_mcu.rs"]
 mod station;
@@ -284,18 +289,22 @@ pub async fn provision_boot_radio() -> Result<RadioInfo, Error> {
         }
     }
     finish_boot_keys().await?;
-    let info = {
+    let (info, profile) = {
         let Some(owner) = BOOT_OWNER.try_lock() else {
             return Err(Error::Busy);
         };
-        match owner.as_ref().map(Transport::state) {
+        let info = match owner.as_ref().map(Transport::state) {
             Some(State::RadioReady(info) | State::ScanReady(info) | State::P2pDevice(info))
             | Some(State::Associated { info, .. } | State::AccessPoint { info, .. }) => info,
             Some(State::Failed { error, .. }) => return Err(error),
             _ => return Err(Error::Busy),
-        }
+        };
+        (
+            info,
+            owner.as_ref().and_then(|owner| owner.p2p_profile().ok()),
+        )
     };
-    crate::iface::register_scan_iface(info).map_err(|_| Error::Authority)?;
+    crate::iface::register_scan_iface_profile(info, profile).map_err(|_| Error::Authority)?;
     Ok(info)
 }
 

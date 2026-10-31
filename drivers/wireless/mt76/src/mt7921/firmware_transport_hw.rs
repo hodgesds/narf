@@ -1194,6 +1194,35 @@ pub struct Transport {
 #[path = "firmware_transport_hw_tests.rs"]
 mod tests;
 impl Transport {
+    pub(crate) fn p2p_profile(&self) -> Result<super::P2pProfile, Error> {
+        self.session.backend.check()?;
+        self.session.firmware.p2p_profile()
+    }
+    pub(crate) async fn run_p2p_request(
+        &mut self,
+        iface: alloc::sync::Weak<crate::iface::p2p::P2pDeviceIface>,
+        authority: Arc<narf_wireless::ap_control::RadioControlAuthority>,
+        operation: super::boot_p2p::Request,
+        alive: Arc<core::sync::atomic::AtomicBool>,
+        expected_mac: [u8; 6],
+    ) -> Result<(), Error> {
+        super::boot_p2p::run_session(
+            &mut self.session,
+            iface,
+            authority,
+            operation,
+            alive,
+            expected_mac,
+        )
+        .await
+    }
+    pub(crate) async fn maintain_p2p_device(
+        &mut self,
+        iface: alloc::sync::Weak<crate::iface::p2p::P2pDeviceIface>,
+        expected_mac: [u8; 6],
+    ) -> Result<(), Error> {
+        super::boot_p2p::maintain_session(&mut self.session, iface, expected_mac).await
+    }
     pub(crate) async fn start_p2p_device(
         &mut self,
         authority: Arc<narf_wireless::ap_control::RadioControlAuthority>,

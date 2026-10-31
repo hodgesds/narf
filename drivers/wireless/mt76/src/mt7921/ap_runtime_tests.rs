@@ -18,6 +18,8 @@ mod concrete;
 mod control;
 #[path = "ap_management_tests.rs"]
 mod management;
+#[path = "p2p_concrete_tests.rs"]
+mod p2p_concrete;
 #[path = "p2p_device_tests.rs"]
 mod p2p_device;
 #[path = "ap_packet_tests.rs"]

@@ -25,6 +25,28 @@ pub(crate) struct Receipt {
     pub duration_ms: u32,
 }
 impl<B: Backend> Session<B> {
+    /// Retained facts only; callers may notify expiry solely after proving
+    /// native stop/reset. This is not an abort or terminal receipt itself.
+    pub(in crate::mt7921::firmware_transport) fn p2p_stop_roc_notification(
+        &self,
+    ) -> Option<(RadioEventAuthority, Receipt)> {
+        let owner = self.p2p_owner.as_ref()?;
+        let roc = owner.roc.as_ref()?;
+        let lease = owner.cnm.lease()?;
+        let Phase::Granted { interval_ms, .. } = lease.phase else {
+            return None;
+        };
+        (owner.activated && roc.activated).then(|| {
+            (
+                roc.source.clone(),
+                Receipt {
+                    cookie: lease.cookie,
+                    frequency_mhz: lease.frequency_mhz,
+                    duration_ms: interval_ms,
+                },
+            )
+        })
+    }
     pub(in crate::mt7921::firmware_transport) fn p2p_roc_current(
         &self,
         cookie: u64,

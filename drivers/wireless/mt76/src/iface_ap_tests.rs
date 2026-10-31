@@ -15,12 +15,19 @@ impl Drop for Binding {
         }
         drop(active);
         self.iface.close_ap_host();
+        self.iface.withdraw_p2p_metadata();
         narf_wireless::registry::unregister(self.iface.name());
         narf_net::registry().unregister(self.iface.name());
         narf_net::iface::unregister(self.iface.name());
     }
 }
 pub(crate) fn bind(info: RadioInfo) -> Result<Binding, &'static str> {
+    bind_profile(info, None)
+}
+pub(crate) fn bind_profile(
+    info: RadioInfo,
+    profile: Option<crate::mt7921::firmware_transport::P2pProfile>,
+) -> Result<Binding, &'static str> {
     if ACTIVE.lock().is_some() {
         return Err("active physical radio cannot be displaced");
     }
@@ -40,12 +47,14 @@ pub(crate) fn bind(info: RadioInfo) -> Result<Binding, &'static str> {
         }
     }
     let mut unpublished = Unpublished(Some(name.clone()));
-    let iface =
-        Arc::new(Mt76Iface::new(name.clone(), info).map_err(|_| "concrete iface identity")?);
+    let mut iface = Mt76Iface::new(name.clone(), info).map_err(|_| "concrete iface identity")?;
+    iface.p2p_profile = profile;
+    let iface = Arc::new(iface);
     let authority = narf_net::bootstrap_authority();
     let cap = narf_net::registry()
         .register(&authority, RegisteredIface(iface.clone()))
         .map_err(|_| "concrete registry grant")?;
+    *iface.registration_cap.lock() = Some(cap);
     let daemon = Cap::<narf_net::stack::StackDaemon, Invoke>::bootstrap();
     let admin =
         narf_net::stack::control_registered(&narf_net::stack::StackAttach { iface: cap, daemon })
