@@ -445,6 +445,43 @@ after moving to GTT.
 
 ## Open items
 
+RX 9000 idle-power software now covers independent VCN5/JPEG5 static idle
+and resume plus board-supported GC12 GFXOFF. Idle retains codec context,
+JPEG copies and fence sequences; normal media traffic uses cached GC
+configuration so the graphics island can remain idle. Reset/suspend replace
+the GFXOFF controller epoch after fresh native proofs. Use
+`amdgpu.rdna4_gfxoff=0` to compare with graphics power gating disabled.
+After the native proofs, VCN5 DPG is available on both dies and JPEG5 DPG
+on Navi48; Navi44 keeps static JPEG gating. Every DPG restore requires a
+new physical fence probe. Board-supported media DPM and DS_VCN follow DPG
+activation; recovery returns to static policy for re-proof. Use
+`amdgpu.rdna4_media_dpg=0` for static media idle. Physical idle-power, session
+retention and reset/resume acceptance on both dies remain pending.
+
+RX 9000 also exposes factory workload presets through
+`card<N>/device/pp_power_profile_mode` (0 default, 1 fullscreen 3D, 2 power
+saving, 3 video, 4 VR, 5 compute, 6 custom, 7 windowed 3D). The applied preset
+has `*`; reads include firmware GFXCLK/FCLK coefficients when available.
+Custom writes use `6 <clock 0=GFX/1=FCLK> <fps> <min_type> <min_mhz>
+<booster_type> <booster_mhz> <limit> <error> <error_rate>`. Accepted tuning
+preserves unexposed table fields and both clock values survive reset/resume. COMPUTE suppresses only admitted sleep
+features, and selection survives reset/resume. Memory/fabric relaxation uses
+the existing DML plans with acknowledged watermark/clock admission and strict
+runtime floor replies. DCC plans now include metadata-row blackout bandwidth;
+VRR plans carry live limits, with FAMS2 scheduling for admitted multiple-stream
+configurations. Firmware chains and hardware locks must acknowledge before
+clock relaxation. DPMM raises now program actual active clocks within board
+limits. Native LFC/MID can retain switching on one admitted native DRR stream;
+matching FAMS2 DRR methods also admit multiple streams through acknowledged
+firmware timing requests. Single-stream SubVP now admits an unscaled linear
+RGB primary at fixed refresh, with a retained phantom pipe and acknowledged
+MALL reservation. Native updates pin, disable and drain the phantom before
+changing or retiring buffers. SubVP with DRR, visible cursors, DSC, scaling,
+tiling/DCC or multiple planes/streams remains pinned. Board-supported GFX_ULV and DS_DCFCLK have separate
+native GC and display-floor admission; `amdgpu.rdna4_gfx_ulv=0` and
+`amdgpu.rdna4_dcf_sleep=0` disable them for comparison. These paths remain
+software-model tested until acceptance on Navi48 and Navi44.
+
 - The Fedora image runs Fedora's Mesa (glibc), not this build; the musl
   build is the reference that the smoke and ioctl traces describe.
 - How the ext2 image reaches the board (USB/NVMe partition vs. the QEMU

@@ -1,7 +1,7 @@
-//! Navi48 VCN5 unified queue, Linux vcn_v5_0_0.c's static-power path.
+//! RDNA4 VCN5 unified queue with static bootstrap and proved DPG restore.
 //! PSP owns the image in TMR. This owner retains stack/context/shared/ring
 //! memory across cancellation and failure; a successful stop proves retirement.
-//! DPG and media deep sleep remain disabled during bring-up.
+//! Runtime DPG is installed only after the static native codec/IRQ proofs.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip,
@@ -86,6 +86,7 @@ pub enum Error {
     Readback,
     Timeout,
     BootFailed,
+    Sram(crate::amdgpu_psp_ring::Error),
     PowerPolicy(u64),
     DecodeChecksum(u64),
     DecodePixel(u32),
@@ -125,6 +126,9 @@ pub enum State {
     EncodeVerified,
     Stopping,
     Stopped,
+    IdleStopping,
+    Idle,
+    IdleStarting,
     Failed(Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,7 +238,7 @@ impl Layout {
                 ip::HW_ID_GC,
                 crate::amdgpu_rdna4::GC_VERSIONS,
                 0,
-                0x263e,
+                0x13de,
             )
             .map_err(|_| Error::Unsupported)?,
             mm: bank(gpu, ip::HW_ID_MMHUB, &[(4, 1, 0)], 0, 0x62e)
@@ -245,6 +249,7 @@ impl Layout {
     }
 }
 pub(crate) trait Io {
+    fn media_idle(&mut self, _jpeg: bool, _gated: bool) {}
     fn read(&mut self, at: u64) -> u32;
     fn write(&mut self, at: u64, value: u32);
     fn memory_read(&mut self, map: MmioRegion, at: u64) -> u32;
@@ -262,6 +267,9 @@ pub(crate) struct Mmio {
     pub(crate) doorbells: MmioRegion,
 }
 impl Io for Mmio {
+    fn media_idle(&mut self, jpeg: bool, gated: bool) {
+        crate::amdgpu_navi48_platform::set_media_idle_reader(jpeg, gated);
+    }
     fn read(&mut self, at: u64) -> u32 {
         // SAFETY: Layout bounds every register; Engine invokes live authority.
         unsafe { self.regs.read32(at) }
@@ -357,6 +365,9 @@ struct Engine<I: Io> {
     firmware_bytes: u32,
     encode_interface: Option<u32>,
     state: State,
+    idle_state: Option<State>,
+    addr_config: Option<u32>,
+    dpg: bool,
     proof: Option<Proof>,
     interrupt_result: Option<Result<InterruptProof, Error>>,
     ib_result: Option<Result<InterruptProof, Error>>,
@@ -457,10 +468,15 @@ impl<I: Io> Engine<I> {
         result
     }
     async fn start_inner(&mut self, image: u64) -> Result<(), Error> {
+        self.dpg = false;
+        self.io.media_idle(false, false);
+        self.restore(image, true).await
+    }
+    async fn restore(&mut self, image: u64, cold: bool) -> Result<(), Error> {
         let map = self.memory.mapping();
         // Yield between pages; cancellation conservatively retains the whole
         // allocation before even the first VCPU address is published.
-        for page in (0..BYTES).step_by(4096) {
+        for page in (0..if cold { BYTES } else { 0 }).step_by(4096) {
             self.access(|io, l| {
                 for at in (page..page + 4096).step_by(4) {
                     io.memory_write(map, at, 0);
@@ -469,11 +485,13 @@ impl<I: Io> Engine<I> {
             })?;
             self.io.delay(1).await;
         }
-        self.access(|io, l| {
-            io.memory_write(map, SHARED, 0x804); // unified queue + dGPU SMU interface
-            io.memory_write(map, SHARED + 16, 1); // sq.is_enabled, queue_mode=0
-            flush(io, l)
-        })?;
+        if cold {
+            self.access(|io, l| {
+                io.memory_write(map, SHARED, 0x804); // unified queue + dGPU SMU interface
+                io.memory_write(map, SHARED + 16, 1); // sq.is_enabled, queue_mode=0
+                flush(io, l)
+            })?;
+        }
         // !AMD_PG_SUPPORT_VCN branch: power ONO2..5 on, no DPG script.
         for (config, status) in [(6, 3), (8, 4), (10, 5), (12, 6)] {
             self.set(DLDO_CONFIG, u32::MAX, 1 << config)?;
@@ -506,7 +524,14 @@ impl<I: Io> Engine<I> {
         self.set(NC_LO + 1, u32::MAX, ((base + SHARED) >> 32) as u32)?;
         self.set(NC_OFFSET, u32::MAX, 0)?;
         self.set(NC_SIZE, u32::MAX, 4096)?;
-        let addr_config = self.access(|io, l| checked(io.read(l.gc + 0x263e * 4)))?;
+        let addr_config = if cold {
+            // gc_12_0_0_offset.h: regGB_ADDR_CONFIG, BASE_IDX 0.
+            let value = self.access(|io, l| checked(io.read(l.gc + 0x13de * 4)))?;
+            self.addr_config = Some(value);
+            value
+        } else {
+            self.addr_config.ok_or(Error::Invalid)?
+        };
         self.set(ADDR_CONFIG, u32::MAX, addr_config)?;
         self.set(ARB, 8, 0)?;
         self.set(VCPU, VCPU_RESET, 0)?;
@@ -548,12 +573,14 @@ impl<I: Io> Engine<I> {
         self.shared_mode(3, 0)?;
         self.access(|io, l| {
             const MASK: u32 = 1 | 0x3e | 0x1ff80 | 0x1fe0000 | 0xf0000000;
-            update(
-                io,
-                l.nbio + u64::from(NBIO_RANGE) * 4,
-                MASK,
-                1 | 4 << 1 | DOORBELL_BASE << 7 | 8 << 17 | 4 << 28,
-            )?;
+            if cold {
+                update(
+                    io,
+                    l.nbio + u64::from(NBIO_RANGE) * 4,
+                    MASK,
+                    1 | 4 << 1 | DOORBELL_BASE << 7 | 8 << 17 | 4 << 28,
+                )?;
+            }
             checked(io.read(l.vcn + u64::from(STATUS) * 4))?;
             Ok(())
         })
@@ -570,6 +597,7 @@ impl<I: Io> Engine<I> {
         if !matches!(
             self.state,
             State::Ready
+                | State::IdleStarting
                 | State::Testing
                 | State::Verified
                 | State::InterruptTesting
@@ -766,9 +794,23 @@ impl<I: Io> Engine<I> {
         result
     }
     async fn stop_inner(&mut self) -> Result<(), Error> {
+        self.stop_hardware(true).await
+    }
+    async fn stop_hardware(&mut self, shared: bool) -> Result<(), Error> {
         // JPEG shares the NBIO media range; never disable it under a live JRBC.
-        if self.reg(JPEG_DB_CTRL)? & (1 << 30) != 0 {
+        if shared && self.reg(JPEG_DB_CTRL)? & (1 << 30) != 0 {
             return Err(Error::Busy);
+        }
+        if self.dpg {
+            // A full stop must wake and drain LMI, not merely clear PG_MODE.
+            self.pause_dpg().await?;
+            self.set(POWER_STATUS, 4, 0)?;
+            self.dpg_pause_request(false)?;
+            for (config, status) in [(6, 3), (8, 4), (10, 5), (12, 6)] {
+                self.set(DLDO_CONFIG, u32::MAX, 1 << config)?;
+                self.wait(DLDO_STATUS, 1 << status, 0).await?;
+            }
+            self.set(POWER_STATUS, 0x103, 0)?;
         }
         self.shared_mode(2, 2)?;
         self.wait(RPTR, 1023, self.wptr).await?;
@@ -787,7 +829,9 @@ impl<I: Io> Engine<I> {
         self.set(RESET, 0x2000, 0x2000)?;
         self.set(RESET, 4, 4)?;
         self.set(DB_CTRL, 1 << 30, 0)?;
-        self.access(|io, l| update(io, l.nbio + u64::from(NBIO_RANGE) * 4, 1 | 0x1fe0000, 0))?;
+        if shared {
+            self.access(|io, l| update(io, l.nbio + u64::from(NBIO_RANGE) * 4, 1 | 0x1fe0000, 0))?;
+        }
         self.set(STATUS, u32::MAX, 0)?;
         self.reg(STATUS)?;
         Ok(())
@@ -864,6 +908,9 @@ impl Vcn {
                 firmware_bytes: firmware_bytes as u32,
                 encode_interface: hevc_encode_words::interface(firmware_version),
                 state: State::Prepared,
+                idle_state: None,
+                addr_config: None,
+                dpg: false,
                 proof: None,
                 interrupt_result: None,
                 ib_result: None,
@@ -1084,7 +1131,7 @@ impl Vcn {
     /// Retain this owner/backing and exclude reset/PM while using the reader.
     pub fn fence_reader(&self) -> Option<FenceReader> {
         matches!(
-            self.engine.state,
+            self.engine.active_state(),
             State::InterruptVerified
                 | State::IbVerified
                 | State::Av1Verified
@@ -1112,6 +1159,10 @@ mod irq;
 
 #[path = "amdgpu_vcn_navi48_cs.rs"]
 mod cs;
+#[path = "amdgpu_vcn_navi48_dpg.rs"]
+mod dpg;
+#[path = "amdgpu_vcn_navi48_idle.rs"]
+mod idle;
 
 #[derive(Clone, Copy, Debug)]
 pub struct FenceReader {
@@ -1124,7 +1175,13 @@ impl FenceReader {
     pub fn completed(&self) -> Result<u32, Error> {
         let mut io = self.io;
         let (l, map) = (self.layout, self.map);
-        cs::client_fence(&mut io, self.authority, l, map)
+        cs::retained_fence(
+            &mut io,
+            self.authority,
+            l,
+            map,
+            !crate::amdgpu_navi48_platform::media_idle_reader(false),
+        )
     }
 }
 

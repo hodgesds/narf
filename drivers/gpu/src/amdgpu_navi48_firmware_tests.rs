@@ -58,6 +58,25 @@ fn navi48_firmware_selection_and_complete_set() -> TestResult {
     }
     TestResult::Pass
 }
+fn rdna4_media_sram_type_rejects_jpeg_dpg_on_navi44() -> TestResult {
+    for gc_revision in [0, 1] {
+        let mut gpu = gpu();
+        gpu.ip_blocks[0].revision = gc_revision;
+        gpu.ip_blocks[1].revision = 2;
+        gpu.ip_blocks[2].revision = 0;
+        let target = Target::resolve(&gpu).unwrap();
+        assert_eq!(target.media_sram_type(false), Some(49));
+        assert_eq!(
+            target.media_sram_type(true),
+            if gc_revision == 1 { Some(128) } else { None }
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4-dpg",
+    rdna4_media_sram_type_rejects_jpeg_dpg_on_navi44
+);
 kernel_test_in!(
     "drivers/gpu/navi48",
     navi48_firmware_selection_and_complete_set

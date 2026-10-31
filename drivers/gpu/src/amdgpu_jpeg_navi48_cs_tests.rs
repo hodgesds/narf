@@ -2,7 +2,7 @@ use super::*;
 use crate::amdgpu_gfx12_queue::Job;
 
 const SEM: u64 = MM + (0x575 + 1) * 4;
-fn mesa_ib() -> Vec<u32> {
+pub(super) fn mesa_ib() -> Vec<u32> {
     // radeon_vcn_dec_jpeg V3 shapes: a pitch write, IB-local condition
     // registers, a COND3 type-3 soft reset poll and NOP padding.
     vec![
@@ -18,7 +18,7 @@ fn mesa_ib() -> Vec<u32> {
         0,
     ]
 }
-fn clients() -> (Pool, Engine<Fake>, Irqs) {
+pub(super) fn clients() -> (Pool, Engine<Fake>, Irqs) {
     let (pool, mut e, mut irq) = fixture_capacity(BYTES * 2 + cs::CLIENT_BYTES);
     e.io.regs.insert(SEM, 1);
     run(e.start(power())).unwrap();
@@ -27,6 +27,91 @@ fn clients() -> (Pool, Engine<Fake>, Irqs) {
     assert_eq!(e.state, State::Clients);
     (pool, e, irq)
 }
+fn jpeg5_idle_keeps_slots_sequences_and_proof_without_gc_access() -> TestResult {
+    let (_pool, mut e, _) = clients();
+    let ibs = e.stage(0, &[mesa_ib()]).unwrap();
+    let seq = e.submit(job(3, &ibs)).unwrap();
+    assert!(run(e.idle()).unwrap());
+    assert_eq!(e.state, State::Idle);
+    assert!(!e.memory.reusable_for_test());
+    assert!(!e.client_memory.as_ref().unwrap().reusable_for_test());
+    e.io.regs.insert(GC + 0x13de * 4, u32::MAX);
+    run(e.resume_idle(power(), &mut ())).unwrap();
+    assert_eq!(e.state, State::Clients);
+    assert_eq!(e.seq, seq);
+    assert_eq!(e.io.regs[&(VCN + u64::from(IRQ) * 4)] & 0x100, 0x100);
+    // Idle never discards the staged copies; reuse the original IB address.
+    assert_eq!(e.submit(job(3, &ibs)), Ok(seq.wrapping_add(1)));
+    assert!(run(e.idle()).unwrap());
+    // Navi44 keeps static JPEG gating while board-admitted VCN/media clock
+    // sleep runs. Static JPEG warm restore never uploads a DPG program.
+    let mut clock_sleep = power();
+    clock_sleep.enabled |= crate::amdgpu_navi48_media_power::FEATURES;
+    clock_sleep.allowed |= crate::amdgpu_navi48_media_power::FEATURES;
+    run(e.resume_idle(clock_sleep, &mut ())).unwrap();
+    assert_eq!(e.seq, seq.wrapping_add(1));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4-idle",
+    jpeg5_idle_keeps_slots_sequences_and_proof_without_gc_access
+);
+fn jpeg5_idle_requires_completed_work_and_failed_resume_keeps_backing() -> TestResult {
+    let (_pool, mut e, _) = clients();
+    let ibs = e.stage(0, &[mesa_ib()]).unwrap();
+    e.io.advance = false;
+    e.submit(job(3, &ibs)).unwrap();
+    let writes = e.io.writes.len();
+    assert!(!run(e.idle()).unwrap());
+    assert!(e.io.writes[writes..].iter().all(|&(at, _)| at == 0x7f000));
+    // A separate drained owner exercises failed restoration.
+    let (_pool, mut e, _) = clients();
+    assert!(run(e.idle()).unwrap());
+    e.io.ignored = Some(VCN + u64::from(DB) * 4);
+    assert!(run(e.resume_idle(power(), &mut ())).is_err());
+    let writes = e.io.writes.len();
+    assert_eq!(run(e.resume_idle(power(), &mut ())), Err(Error::DeviceGone));
+    assert_eq!(e.io.writes.len(), writes);
+    assert!(!e.memory.reusable_for_test());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4-idle",
+    jpeg5_idle_requires_completed_work_and_failed_resume_keeps_backing
+);
+fn jpeg5_cancelled_idle_or_restore_never_replays_or_releases_backing() -> TestResult {
+    for wake in [false, true] {
+        let (_pool, mut e, _) = clients();
+        if wake {
+            assert!(run(e.idle()).unwrap());
+            e.io.power_stuck = true;
+            let mut sram = ();
+            let mut future = core::pin::pin!(e.resume_idle(power(), &mut sram));
+            assert!(future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        } else {
+            e.io.regs.insert(VCN + u64::from(CLEAN) * 4, 0);
+            let mut future = core::pin::pin!(e.idle());
+            assert!(future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        }
+        let writes = e.io.writes.len();
+        assert_eq!(run(e.idle()), Err(Error::DeviceGone));
+        assert_eq!(run(e.resume_idle(power(), &mut ())), Err(Error::DeviceGone));
+        assert_eq!(run(e.stop()), Err(Error::Busy));
+        assert_eq!(e.io.writes.len(), writes);
+        assert!(!e.memory.reusable_for_test());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4-idle",
+    jpeg5_cancelled_idle_or_restore_never_replays_or_releases_backing
+);
 fn job(vmid: u8, ibs: &[(u64, u32)]) -> Job {
     let mut job = Job::new(vmid, 0x8001, 0x1_2345_6000, ibs).unwrap();
     job.vmid = vmid;

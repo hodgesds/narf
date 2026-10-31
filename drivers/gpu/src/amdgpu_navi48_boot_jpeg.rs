@@ -103,6 +103,8 @@ impl Hardware {
     /// OWNER excludes publishers/PM, the JPEG ledger is frozen, and every
     /// pending job's mappings and staged slot remain retained afterwards.
     pub(crate) async unsafe fn retire_client_jpeg(&mut self) -> Result<(), Error> {
+        self.begin_media_use(true).await?;
+        self.static_media_power().await?;
         if self.jpeg_owner.is_none() || !self.media_jpeg_clients {
             return Err(Error::Busy);
         }

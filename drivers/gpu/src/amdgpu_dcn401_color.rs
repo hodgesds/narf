@@ -625,15 +625,21 @@ impl Otg {
     /// (`Surfaces::set_color`); otherwise the next scanout start programs
     /// it. A failure on a live scanout leaves `Failed`.
     /// # Safety
-    /// Exclude firmware/FAMS and concurrent display writers.
+    /// Exclude concurrent display writers. Firmware timing requires the matching
+    /// DMUB borrower under its acknowledged HW lock throughout this operation.
     pub async unsafe fn set_color(
         &mut self,
         pipe: u8,
         program: Option<Arc<ColorProgram>>,
+        firmware: Option<&mut crate::amdgpu_dmub_navi48::Dmub>,
     ) -> Result<(), Error> {
-        // Display k scans out on pipe k: address that display's records.
         self.0.select_display(pipe)?;
-        self.1.set_color(&mut self.0, pipe, program).await
+        if let Some(dmub) = firmware {
+            let mut loan = firmware_timing::Loan::native(&mut self.0, &mut self.2, dmub)?;
+            self.1.set_color(&mut *loan, pipe, program).await
+        } else {
+            self.1.set_color(&mut self.0, pipe, program).await
+        }
     }
     /// The color display `pipe` was last asked for.
     pub fn color(&self, pipe: u8) -> Option<Arc<ColorProgram>> {
@@ -652,60 +658,21 @@ impl Otg {
     /// stream without HDR packets (entering or leaving HDR is a modeset)
     /// or a packet of the other kind; `Busy` without running video.
     /// # Safety
-    /// Exclude firmware/FAMS and concurrent display writers.
+    /// Exclude concurrent display writers. Firmware timing requires the matching
+    /// DMUB borrower under its acknowledged HW lock throughout this operation.
     pub async unsafe fn set_hdr(
         &mut self,
         pipe: u8,
         packet: crate::amdgpu_hdr::InfoPacket,
+        firmware: Option<&mut crate::amdgpu_dmub_navi48::Dmub>,
     ) -> Result<(), Error> {
         self.0.select_display(pipe)?;
-        let e = &mut self.0;
-        let live = match e.status.state {
-            State::ScanoutRunning(p) => p == pipe,
-            State::HdmiVideoRunning(s) => e
-                .status
-                .hdmi_video_running
-                .is_some_and(|v| v.link.request.stream == s && v.link.request.pipe == pipe),
-            State::DpVideoRunning(s) => e
-                .status
-                .dp_video_running
-                .is_some_and(|v| v.frontend.request.stream == s && v.frontend.request.pipe == pipe),
-            State::UhbrVideoRunning(s) => e
-                .status
-                .uhbr_video_running
-                .is_some_and(|v| v.stream == s && v.timing.blank.request.pipe == pipe),
-            State::FrlVideoRunning(p) => p == pipe && e.status.frl_video_running.is_some(),
-            _ => false,
-        };
-        if !live {
-            return Err(Error::Busy);
+        if let Some(dmub) = firmware {
+            let mut loan = firmware_timing::Loan::native(&mut self.0, &mut self.2, dmub)?;
+            loan.set_hdr(pipe, packet).await
+        } else {
+            self.0.set_hdr(pipe, packet).await
         }
-        // The DRM InfoFrame's type sits in HB0; the SDP's in HB1.
-        let hdmi = packet.hb[0] == 0x87;
-        let s = &e.status;
-        let tmds = s
-            .hdmi_video_running
-            .is_some_and(|v| v.link.request.pipe == pipe);
-        let frl = s.frl_video_running.is_some_and(|v| v.request.pipe == pipe);
-        let dio = s
-            .dp_video_running
-            .is_some_and(|v| v.frontend.request.pipe == pipe);
-        let hpo = s
-            .uhbr_video_running
-            .is_some_and(|v| v.timing.blank.request.pipe == pipe);
-        let result = match (hdmi, tmds, frl, dio, hpo) {
-            (true, true, ..) => e.hdmi_update_hdr(packet).await,
-            (true, _, true, ..) => e.frl_update_hdr(packet).await,
-            (false, _, _, true, _) => e.dp_update_hdr(packet).await,
-            (false, .., true) => e.uhbr_update_hdr(packet).await,
-            _ => return Err(Error::Invalid),
-        };
-        if let Err(err) = result {
-            if err != Error::Invalid {
-                e.status.state = State::Failed(err);
-            }
-        }
-        result
     }
     /// The HDR packet display `pipe`'s running stream sends, if any.
     pub fn hdr(&self, pipe: u8) -> Option<crate::amdgpu_hdr::InfoPacket> {
@@ -733,3 +700,58 @@ impl Otg {
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_dcn401_color_tests.rs"]
 mod tests;
+
+impl<I: Io> Engine<I> {
+    async fn set_hdr(
+        &mut self,
+        pipe: u8,
+        packet: crate::amdgpu_hdr::InfoPacket,
+    ) -> Result<(), Error> {
+        let live = match self.status.state {
+            State::ScanoutRunning(p) => p == pipe,
+            State::HdmiVideoRunning(s) => self
+                .status
+                .hdmi_video_running
+                .is_some_and(|v| v.link.request.stream == s && v.link.request.pipe == pipe),
+            State::DpVideoRunning(s) => self
+                .status
+                .dp_video_running
+                .is_some_and(|v| v.frontend.request.stream == s && v.frontend.request.pipe == pipe),
+            State::UhbrVideoRunning(s) => self
+                .status
+                .uhbr_video_running
+                .is_some_and(|v| v.stream == s && v.timing.blank.request.pipe == pipe),
+            State::FrlVideoRunning(p) => p == pipe && self.status.frl_video_running.is_some(),
+            _ => false,
+        };
+        if !live {
+            return Err(Error::Busy);
+        }
+        // The DRM InfoFrame's type sits in HB0; the SDP's in HB1.
+        let hdmi = packet.hb[0] == 0x87;
+        let s = &self.status;
+        let tmds = s
+            .hdmi_video_running
+            .is_some_and(|v| v.link.request.pipe == pipe);
+        let frl = s.frl_video_running.is_some_and(|v| v.request.pipe == pipe);
+        let dio = s
+            .dp_video_running
+            .is_some_and(|v| v.frontend.request.pipe == pipe);
+        let hpo = s
+            .uhbr_video_running
+            .is_some_and(|v| v.timing.blank.request.pipe == pipe);
+        let result = match (hdmi, tmds, frl, dio, hpo) {
+            (true, true, ..) => self.hdmi_update_hdr(packet).await,
+            (true, _, true, ..) => self.frl_update_hdr(packet).await,
+            (false, _, _, true, _) => self.dp_update_hdr(packet).await,
+            (false, .., true) => self.uhbr_update_hdr(packet).await,
+            _ => return Err(Error::Invalid),
+        };
+        if let Err(err) = result {
+            if err != Error::Invalid {
+                self.status.state = State::Failed(err);
+            }
+        }
+        result
+    }
+}

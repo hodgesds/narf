@@ -46,6 +46,15 @@ pub(crate) struct Target {
     set: crate::amdgpu_rdna4::FirmwareSet,
 }
 impl Target {
+    pub(crate) fn media_sram_type(self, jpeg: bool) -> Option<u32> {
+        if !jpeg {
+            Some(49)
+        } else if self.set.gc == crate::amdgpu_rdna4::GC_12_0_1_FW {
+            Some(128)
+        } else {
+            None
+        }
+    }
     pub(crate) fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
         let die = crate::amdgpu_rdna4::Rdna4Chip::of(gpu).ok_or(Error::Unsupported)?;
         for (id, versions) in [

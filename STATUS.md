@@ -1964,12 +1964,70 @@ allocations pinned; old readers cannot fail a replacement device.
 Still open: physical MSI delivery and reset/replay acceptance, GC12 rendering
 and application shader execution, GPU VM/userspace and DCN4
 clock/bandwidth/link/scanout hardware acceptance, VCN5 known-stream video,
-THM/SMU thermal interrupts and software-CTF shutdown,
-memory/fabric DPM relaxation (display admission/watermark rework first),
-reset/suspend/resume, and physical RX 9070 XT testing.
+thermal/CTF and reset/suspend/resume hardware acceptance, memory/fabric DPM
+and low-power transition hardware acceptance, and physical RX 9000
+testing on both Navi48 and Navi44. Thermal interrupts/shutdown, system/runtime
+PM and training replay already have software implementations; older entries
+above are historical, not a current missing-feature list.
 The verified DMA proof covers only two kernel-owned VRAM pages. The driver
 continues to report acceleration unavailable; model/QEMU tests do not prove
 working silicon, native modesetting or Mesa/Vulkan support.
+
+RX 9000 now also has VCN5/JPEG5 static idle power and GC12 GFXOFF ownership.
+Independent media idle waits for physical fences, RPTR drain and DMA-clean
+shutdown before SMU power-down. Warm resume preserves codec context, JPEG
+copy slots, proofs and sequences, restores IRQs and keeps the shared media
+doorbell range owned. Gated fence reads retain capability/HDP/NBIO checks;
+fixed-clock static engines still check their status registers. Board-supported SMU14
+GFXOFF uses RLC handshakes and disable references around GC MMIO, with fresh
+epochs after reset/suspend and no graphics wake for normal media traffic.
+Failed/cancelled transitions cannot replay or free unconfirmed resources.
+`amdgpu.rdna4_gfxoff=0` disables GFXOFF startup. Proved retained media owners
+now enter VCN5 DPG on both dies and JPEG5 DPG on Navi48; Navi44 keeps static
+JPEG gating. PSP14 uses separate VCN/JPEG SRAM types and every restore
+requires a new physical fence probe without changing client sequences.
+Board-supported MM_DPM and DS_VCN follow DPG activation. Recovery disables
+media sleep before static re-proof, and JPEG hang retirement keeps its
+JMI reset/power cycle. `amdgpu.rdna4_media_dpg=0` retains static media policy.
+Physical power-transition and session-retention acceptance remain pending.
+
+RX 9000 runtime power now also has seven factory workload presets through
+`pp_power_profile_mode`, including COMPUTE's sleep suppression. Selection
+changes are serialized and bound to their admitting owner; reset
+and resume restore the last accepted profile before fresh client proofs.
+Memory/fabric DPM already had DML admission and P-state convergence; its
+runtime path now requires acknowledged watermark ranges and a strict replay
+of clock constraints before relaxation. Refused or incomplete runtime floors
+cannot be published as applied. Newer per-die PMFW uses active/idle UCLK/FCLK
+pairs; older PMFW retains a checked FCLK maximum until the last display leaves.
+Board-supported GFX_ULV follows native GC proofs, and DS_DCFCLK follows the
+acknowledged DML deep-sleep floor. Independent `amdgpu.rdna4_gfx_ulv=0` and
+`amdgpu.rdna4_dcf_sleep=0` switches skip those features. Software models cover
+factory masks, compute/display/media interactions, reset selection replay,
+per-die thresholds, partial failures and cancellation; physical acceptance
+remains pending on both dies.
+
+RX 9000 custom workload profile 6 now reads firmware GFXCLK/FCLK coefficients
+and accepts width-checked coefficient updates while preserving the rest of
+TABLE_ACTIVITY_MONITOR_COEFF. Ordered owner-bound requests retain consecutive
+clock edits; reset/resume replays both accepted clock values. DCC P-state
+plans now include MRQ metadata rows and native mcache splits. Live VRR bounds
+join planning and readmission caches, with FAMS2 schedules for admitted
+multistream configurations. Chained DMUB commands publish once; acknowledged
+hardware locks cover schedule changes, flips, cursor and colour/HDR updates.
+Native DRR limits restore when scheduling stops, before the hardware lock is
+released. DPMM bandwidth raises now program actual active clocks and the
+corresponding UCLK QoS index within board limits. Native LFC/MID can retain
+switching on one native Vactive/Vblank DRR stream, and matching FAMS2 DRR
+methods admit firmware timing on multiple streams. Requested BTR/MID totals
+use acknowledged DMUB updates under HW lock, including during real flips;
+firmware-clamped registers are distinguished from the accepted request.
+Cancellation retains timing, IRQ sources and scanout storage. Single-stream
+SubVP now expands one fixed-refresh, unscaled linear RGB primary into a
+retained phantom pipe, models its zero DET and separate MALL bandwidth,
+acknowledges cache ways and FAMS2 type 4, and drains the alias before native
+updates or buffer retirement. DRR, visible cursor scheduling, DSC,
+tiling/DCC, scaling and multiple planes/streams remain SubVP extensions. Hardware acceptance remains pending on Navi48 and Navi44.
 
 Navi22 third-review fixes (software-model tested only): DRM ioctl user copies
 apply `access_ok` and fault-guarded copies (EFAULT); NVMe/AHCI bring-up

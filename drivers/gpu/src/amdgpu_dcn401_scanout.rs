@@ -368,16 +368,27 @@ impl<I: Io> Engine<I> {
             (l.mpcc(pipe, UPDATE_LOCK), sel(p)),
         ]
     }
-    fn underflow(&mut self, pipe: u8) -> Result<(), Error> {
-        for p in self.plane_pipes(pipe) {
+    pub(super) fn underflow(&mut self, pipe: u8) -> Result<(), Error> {
+        let mut pipes = self.plane_pipes(pipe);
+        if let Some(vp) = self.status.subvp.filter(|vp| vp.main == pipe) {
+            pipes.push(vp.phantom);
+        }
+        for p in pipes {
             let at = self.layout.hubp(p, HUBP_CONTROL);
             if self.read(at)? & HUBP_UNDERFLOW != 0 {
                 return Err(Error::Underflow(at));
             }
         }
-        let at = self.optc_input(pipe);
-        if self.read(at)? & OPTC_UNDERFLOW != 0 {
-            return Err(Error::Underflow(at));
+        for p in core::iter::once(pipe).chain(
+            self.status
+                .subvp
+                .filter(|vp| vp.main == pipe)
+                .map(|vp| vp.phantom),
+        ) {
+            let at = self.optc_input(p);
+            if self.read(at)? & OPTC_UNDERFLOW != 0 {
+                return Err(Error::Underflow(at));
+            }
         }
         Ok(())
     }
@@ -447,6 +458,9 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     pub(super) async fn lock(&mut self, pipe: u8) -> Result<(), Error> {
+        if self.subvp().is_some() {
+            return Err(Error::Busy);
+        }
         let l = self.layout;
         // optc1_lock: OTG_MASTER_UPDATE_LOCK_SEL = optc->inst.
         self.update(
@@ -485,6 +499,7 @@ impl<I: Io> Engine<I> {
         let mut polls = self.io.wait_poll_limit();
         loop {
             self.lfc_progress(p.pipe)?;
+            self.flush_drr(p.pipe).await?;
             if p.watch {
                 self.underflow(p.pipe)?;
             }
@@ -634,6 +649,7 @@ impl<I: Io> Engine<I> {
         let l = self.layout;
         let pipe = p.pipe;
         self.lfc_preflip(pipe, (narf_time::wall::monotonic_ns() / 1000) as u32)?;
+        self.flush_drr(pipe).await?;
         self.lock(pipe).await?;
         // Both ODM halves of every flipping plane re-address under the one
         // master lock.
@@ -1123,7 +1139,7 @@ impl Surfaces {
         owners: &mut impl FnMut() -> Result<(dccg::Applied, DisplayContext), Error>,
         err: Error,
     ) -> Error {
-        if !matches!(err, Error::Underflow(_)) {
+        if !matches!(err, Error::Underflow(_)) || e.status.drr.is_some_and(|a| a.firmware_owned()) {
             e.status.state = State::Failed(err);
             return err;
         }
@@ -1192,6 +1208,11 @@ impl Surfaces {
         crystal_khz: u32,
         mut owners: impl FnMut() -> Result<(dccg::Applied, DisplayContext), Error>,
     ) -> Result<(), Error> {
+        // Firmware timing must first be disabled with clocks pinned. An
+        // interrupted firmware owner never falls through to native retirement.
+        if e.status.drr.is_some_and(|a| a.firmware_owned()) {
+            return Err(Error::Busy);
+        }
         let running = e.status.scanout.ok_or(Error::Invalid)?;
         if e.status.state != State::ScanoutRunning(pipe) || running.pipe != pipe {
             return Err(Error::Busy);
@@ -1378,6 +1399,19 @@ impl Otg {
                 ))
             })
             .await
+    }
+    /// Read-only underflow probe. A firmware owner can pin/disable its
+    /// schedule before calling the native drain-and-black recovery path.
+    pub(crate) fn underflow_pending(&mut self, pipe: u8) -> Result<bool, Error> {
+        self.0.select_display(pipe)?;
+        if self.0.status.state != State::ScanoutRunning(pipe) {
+            return Err(Error::Busy);
+        }
+        match self.0.underflow(pipe) {
+            Ok(()) => Ok(false),
+            Err(Error::Underflow(_)) => Ok(true),
+            Err(e) => Err(e),
+        }
     }
     /// Re-verify a live scanout and its stream against the current owners and
     /// return the frame count. An underflow returns the pipe to black video

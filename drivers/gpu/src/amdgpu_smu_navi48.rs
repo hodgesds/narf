@@ -11,6 +11,7 @@ use crate::{
 use alloc::vec::Vec;
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
+pub use profile::{ActivityCoefficients, CustomCoefficients, PowerProfile, ProfileCoefficients};
 
 const MESSAGE: u32 = 0x82;
 const ARGUMENT: u32 = 0x92;
@@ -52,7 +53,7 @@ const PROTECTION: u64 =
     (1 << 23) | (1 << 25) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29) | (1 << 57);
 // smu_v14_0_deep_sleep_control's walk as smu_v14_0_2_ppt.c maps it, in its
 // order: DS_GFXCLK, DS_UCLK, DS_FCLK, DS_SOCCLK, DS_LCLK (then DS_VCN, left
-// out: the static media policy requires it off; DS_MP0CLK and DS_MP1CLK have
+// out until the proved media DPG transition; DS_MP0CLK and DS_MP1CLK have
 // no SMU 14.0.2 bit).
 const DEEP_SLEEP_WALK: [(u64, &str); 5] = [
     (1 << 10, "GFXCLK"),
@@ -318,6 +319,9 @@ struct Engine<I: Io> {
     /// PROTECTION bits running when boot power configuration completed.
     protection: u64,
     gfx_level: GfxLevel,
+    profile: PowerProfile,
+    coefficients: Option<ProfileCoefficients>,
+    custom_coefficients: Option<[ActivityCoefficients; 2]>,
     /// `smu_baco->state`.
     baco: BacoState,
     /// The features running after boot configuration (Linux's SUPPORTED
@@ -539,7 +543,9 @@ impl<I: Io> Engine<I> {
             let allowed = previous.allowed | DISPLAY;
             self.command(5, (allowed >> 32) as u32).await?;
             self.command(4, allowed as u32).await?;
-            self.command(6, 0).await?;
+            // Preserve intentionally disabled sleep features (COMPUTE).
+            // EnableAll would re-enable every previously admitted sleep bit.
+            self.command(8, DISPLAY as u32).await?;
             let low = u64::from(self.command(0xc, 0).await?);
             let enabled = low | (u64::from(self.command(0xd, 0).await?) << 32);
             if enabled & (REQUIRED | DISPLAY) != REQUIRED | DISPLAY || enabled & !allowed != 0 {
@@ -817,7 +823,8 @@ impl<I: Io> Engine<I> {
         result
     }
     /// Linux smu_v14_0_set_vcn_enable, dGPU instance 0. Static media keeps
-    /// MM_DPM/DS_VCN disabled and every autonomous protection running.
+    /// MM_DPM/DS_VCN disabled until the explicit DPG policy transition; every
+    /// autonomous protection must remain running.
     async fn set_vcn_power(&mut self, enabled: bool) -> Result<PowerStatus, Error> {
         self.set_media_power(enabled, false).await
     }
@@ -829,7 +836,9 @@ impl<I: Io> Engine<I> {
         let resume = self.begin_runtime()?;
         let result = async {
             let running = self.running().await?;
-            if !self.protected(running) || running & ((1 << 20) | (1 << 44)) != 0 {
+            if !self.protected(running)
+                || running & crate::amdgpu_navi48_media_power::FEATURES & !power.allowed != 0
+            {
                 return Err(Error::Features(running));
             }
             let command = match (jpeg, enabled) {
@@ -938,8 +947,13 @@ impl<I: Io> Engine<I> {
             if refused.is_none() {
                 for (bit, feature) in walk {
                     let sent = async {
-                        self.command(8, bit as u32).await?;
-                        self.command(9, (bit >> 32) as u32).await
+                        self.command(if self.profile.compute() { 0xa } else { 8 }, bit as u32)
+                            .await?;
+                        self.command(
+                            if self.profile.compute() { 0xb } else { 9 },
+                            (bit >> 32) as u32,
+                        )
+                        .await
                     }
                     .await;
                     match sent {
@@ -954,7 +968,10 @@ impl<I: Io> Engine<I> {
             }
             let enabled = self.running().await?;
             // Nothing outside the allowed mask and the walk may run.
-            if enabled & required != required || enabled & !(allowed | bits) != 0 {
+            if enabled & required != required
+                || enabled & !(allowed | bits) != 0
+                || (self.profile.compute() && enabled & bits != 0)
+            {
                 return Err(Error::Features(enabled));
             }
             Ok(DeepSleep {
@@ -1068,6 +1085,9 @@ impl Smu {
                 limits: None,
                 protection: 0,
                 gfx_level: GfxLevel::Auto,
+                profile: PowerProfile::BootupDefault,
+                coefficients: None,
+                custom_coefficients: None,
                 baco: BacoState::Exit,
                 boot_enabled: 0,
             },
@@ -1205,6 +1225,12 @@ impl Smu {
     }
 }
 
+#[path = "amdgpu_smu_navi48_gfxoff.rs"]
+mod gfxoff;
+#[path = "amdgpu_smu_navi48_media.rs"]
+mod media;
+#[path = "amdgpu_smu_navi48_profile.rs"]
+mod profile;
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_smu_navi48_tests.rs"]
 mod tests;

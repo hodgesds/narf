@@ -80,6 +80,14 @@ pub trait DrmCard: Send + Sync {
         Err(narf_filesystem::FsError::Unsupported)
     }
 
+    /// Linux `pp_power_profile_mode`: workload profiles, coefficients and applied marker.
+    fn power_profiles(&self) -> Option<alloc::string::String> {
+        None
+    }
+    fn set_power_profile(&self, _profile: &str) -> Result<(), narf_filesystem::FsError> {
+        Err(narf_filesystem::FsError::Unsupported)
+    }
+
     /// `pp_features` show, or `None` when the card has no PMFW feature mask.
     /// Linux ref: `amdgpu_get_pp_features`.
     fn pp_features(&self) -> Option<alloc::string::String> {

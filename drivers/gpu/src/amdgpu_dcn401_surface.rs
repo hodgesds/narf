@@ -45,6 +45,10 @@ pub use scanout::{
     LivePipe, OverlayScanout, ScanoutPosition, ScanoutRunning, ScanoutUnderflow, VblankPhase,
 };
 
+#[path = "amdgpu_dcn401_subvp_hw.rs"]
+mod subvp;
+pub use subvp::SubvpApplied;
+
 /// A scanout format: the DRM fourccs amdgpu_dm offers on DCN4.0.1 planes
 /// that this path programs, each mapped to its DC surface format as
 /// amdgpu_dm's fill_dc_plane_info_and_addr does (X and A variants share
@@ -787,7 +791,7 @@ impl SurfaceRequest {
         )
     }
     /// Every pipe the surface's fetch occupies, by bit.
-    pub(in crate::amdgpu_dcn401_otg) fn pipe_mask(self) -> u8 {
+    pub(crate) fn pipe_mask(self) -> u8 {
         self.segments().fold(0, |m, (p, _, _)| m | bit(p))
     }
 }
@@ -917,6 +921,18 @@ struct Surface {
 #[derive(Debug)]
 pub(in super::super) struct Surfaces([Option<Surface>; 4], alloc::vec::Vec<Surface>);
 impl Surfaces {
+    #[cfg(feature = "kernel-test")]
+    pub(in super::super) fn retained_buffers(
+        &self,
+        pipe: u8,
+    ) -> Option<(u64, Option<u64>, Option<u64>)> {
+        let s = self.0.get(usize::from(pipe))?.as_ref()?;
+        Some((
+            s.memory.address(),
+            s.back.as_ref().map(Reservation::address),
+            s.cursor.as_ref().map(Reservation::address),
+        ))
+    }
     pub(in super::super) fn new() -> Self {
         Self(core::array::from_fn(|_| None), alloc::vec::Vec::new())
     }

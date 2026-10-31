@@ -8,13 +8,18 @@ use super::{clocks, otg};
 pub(crate) trait UclkPin {
     /// The DCN401 clock owner's status (`Err` without one).
     fn clock_status(&self) -> Result<clocks::Status, otg::Error>;
+    /// A previous acknowledged firmware schedule may still need retirement,
+    /// even if its following clock relaxation did not finish.
+    fn firmware_active(&self) -> bool {
+        false
+    }
     /// dcn401_update_clocks in prepare_bandwidth (`safe_to_lower` false)
     /// towards `bandwidth` while the displays run.
     async fn raise_bandwidth(&mut self, bandwidth: clocks::Bandwidth) -> Result<(), otg::Error>;
     /// dcn401_dmub_hw_control_lock(true), dcn401_fams2_update_config with
-    /// FAMS2 disabled, dcn401_dmub_hw_control_lock(false): void, as in
-    /// Linux.
-    async fn disable_fams2(&mut self);
+    /// FAMS2 disabled, dcn401_dmub_hw_control_lock(false). Once firmware
+    /// scheduling has been enabled, a missing ACK blocks configuration changes.
+    async fn disable_fams2(&mut self) -> Result<(), otg::Error>;
 }
 
 /// dcn401_prepare_bandwidth for a configuration change while PMFW may switch
@@ -26,16 +31,26 @@ pub(crate) trait UclkPin {
 /// started and not yet prepared) or one already pinned.
 pub(crate) async fn pin_uclk<P: UclkPin>(owner: &mut P) -> Result<(), otg::Error> {
     let Ok(status) = owner.clock_status() else {
-        return Ok(());
+        return if owner.firmware_active() {
+            Err(otg::Error::Busy)
+        } else {
+            Ok(())
+        };
     };
     if !status.uclk_switching() {
+        if owner.firmware_active() {
+            if status.state != clocks::State::Applied {
+                return Err(otg::Error::Busy);
+            }
+            return owner.disable_fams2().await;
+        }
         return Ok(());
     }
     let levels = status.levels.ok_or(otg::Error::Busy)?;
     owner
         .raise_bandwidth(clocks::Bandwidth::pinned(&levels))
         .await?;
-    owner.disable_fams2().await;
+    owner.disable_fams2().await?;
     Ok(())
 }
 

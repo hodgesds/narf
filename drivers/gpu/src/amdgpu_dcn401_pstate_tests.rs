@@ -225,7 +225,6 @@ fn check_line(line: &str) -> Result<bool, &'static str> {
     match got {
         Pstate::Pinned(Pinned::Firmware(_)) if !supported || firmware || svp_first => Ok(false),
         Pstate::Pinned(Pinned::Unsupported) if !supported => Ok(true),
-        Pstate::Pinned(Pinned::Port) => Ok(false),
         Pstate::Supported(s) => {
             if !supported || firmware {
                 return Err(report(line, "port supported"));
@@ -500,19 +499,18 @@ fn dcn401_pstate_refuses_what_the_port_does_not_plan() -> TestResult {
     {
         return TestResult::Fail("UCLK table validation");
     }
-    // A DCC plane stays on the pinned policy (its meta rows would count in
-    // the blackout's bytes).
+    // DCC P-state plans include MRQ metadata rows and preserve cache placement.
     let mut dcc = hd();
     dcc.planes[0] = Some(Plane {
         swizzle: Swizzle::S64K2D,
         dcc: true,
         ..Plane::full(&dcc.timing, 1920, 4)
     });
-    if admit_native(&soc, &[dcc]).is_ok()
-        && admit(&soc, &uclk, &[dcc], false) != Ok(Pstate::Pinned(Pinned::Port))
-    {
-        return TestResult::Fail("DCC plane not pinned");
-    }
+    let Ok(Pstate::Supported(s)) = admit(&soc, &uclk, &[dcc], false) else {
+        return TestResult::Fail("DCC plane not admitted for switching");
+    };
+    assert!(s.plans[0].readmits());
+    assert!(s.plans[0].mode.plane_list().all(|p| p.dcc));
     // A mode the pinned policy refuses is refused here too.
     let mut short = hd();
     short.timing.v_total = 1083;
@@ -526,4 +524,215 @@ fn dcn401_pstate_refuses_what_the_port_does_not_plan() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-pstate",
     dcn401_pstate_refuses_what_the_port_does_not_plan
+);
+
+fn dcn401_pstate_vrr_limits_are_admitted_and_bound_to_the_plan() -> TestResult {
+    let (soc, uclk) = board();
+    let limits = crate::amdgpu_freesync::Drr {
+        v_total_min: 1125,
+        v_total_max: 1406,
+    };
+    for fams2 in [false, true] {
+        let Ok(Pstate::Supported(s)) = admit_with_drr(
+            &soc,
+            &uclk,
+            &[hd()],
+            fams2,
+            [Some(limits), None, None, None],
+        ) else {
+            return TestResult::Fail("one VRR stream lost hardware vactive");
+        };
+        assert_eq!(s.methods[0], Method::Vactive);
+        assert!(s.fams2_streams[0].is_drr);
+        assert_eq!(s.fams2_streams[0].max_vtotal, 1406);
+        assert!(s.plans[0].readmits());
+        let mut forged = s.plans[0];
+        forged.pstate.as_mut().unwrap().drr[0] = Some(crate::amdgpu_freesync::Drr {
+            v_total_min: 1124,
+            ..limits
+        });
+        assert!(!forged.readmits());
+    }
+    let pair = [Some(limits), Some(limits), None, None];
+    assert!(matches!(
+        admit_with_drr(&soc, &uclk, &[hd(), hd()], false, pair),
+        Ok(Pstate::Pinned(_))
+    ));
+    let Ok(Pstate::Supported(s)) = admit_with_drr(&soc, &uclk, &[hd(), hd()], true, pair) else {
+        return TestResult::Fail("FAMS2 clamped pair not admitted");
+    };
+    assert_eq!(s.methods[..2], [Method::FwVactiveDrr; 2]);
+    assert!(s.fams2_required);
+    assert!(s.plans.iter().all(Plan::readmits));
+    assert!(s.plans.iter().all(|p| p.firmware_refresh_pstate(limits)));
+    let invalid = crate::amdgpu_freesync::Drr {
+        v_total_min: 1124,
+        ..limits
+    };
+    assert_eq!(
+        admit_with_drr(
+            &soc,
+            &uclk,
+            &[hd()],
+            true,
+            [Some(invalid), None, None, None]
+        ),
+        Err(Error::Invalid)
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-pstate",
+    dcn401_pstate_vrr_limits_are_admitted_and_bound_to_the_plan
+);
+fn dcn401_pstate_dcc_blackout_includes_metadata_rows() -> TestResult {
+    let (soc, _) = board();
+    let mut mode = hd();
+    mode.planes[0] = Some(Plane {
+        swizzle: Swizzle::S64K2D,
+        dcc: true,
+        ..Plane::full(&mode.timing, 1920, 4)
+    });
+    let shapes = mcache_shapes(&soc, &[mode], Policy::NATIVE).unwrap();
+    let mut plain = shapes[0];
+    plain.plane.dcc = false;
+    // 1920px row rounds to 1984 at the 64x64 metadata request. One row
+    // is 1984*64*4/256=1984 bytes, in addition to blackout pixel swaths.
+    assert_eq!(shapes[0].pstate_bytes()[0], plain.pstate_bytes()[0] + 1984);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-pstate",
+    dcn401_pstate_dcc_blackout_includes_metadata_rows
+);
+
+fn dcn401_pstate_programs_active_clocks_after_latency_selection() -> TestResult {
+    let mut raised = 0;
+    for line in VECTORS
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+    {
+        let mut words = line.split_whitespace();
+        let input = inputs(&mut words).unwrap();
+        let Ok(Pstate::Supported(s)) = admit(&input.soc, &input.uclk, &input.modes, input.fams2)
+        else {
+            continue;
+        };
+        let latency = min_clock_table(&input.soc, &input.uclk)[usize::from(s.level)];
+        if s.active.uclk_khz == latency.uclk_khz
+            && s.active.fclk_khz == latency.fclk_khz
+            && s.active.dcfclk_khz == latency.dcfclk_khz
+        {
+            continue;
+        }
+        raised += 1;
+        for plan in &s.plans {
+            assert_eq!(plan.clocks.uclk_khz, s.active.uclk_khz);
+            assert_eq!(plan.clocks.fclk_khz, s.active.fclk_khz);
+            assert_eq!(plan.clocks.dcfclk_khz, s.active.dcfclk_khz);
+            assert!(plan.readmits());
+        }
+    }
+    assert!(raised > 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-pstate",
+    dcn401_pstate_programs_active_clocks_after_latency_selection
+);
+
+fn dcn401_pstate_replans_bandwidth_raises_before_programming() -> TestResult {
+    let (soc, uclk) = board();
+    let mut mode = timing([1_075_000, 3840, 4000, 48, 32, 2160, 3240, 3, 5]);
+    mode.pitch = 11_520;
+    mode.bytes_per_pixel = 8;
+    mode.planes[0] = Some(Plane {
+        surface_width: 11_520,
+        surface_height: 6480,
+        pitch: 11_520,
+        bytes_per_pixel: 8,
+        viewport_width: 11_520,
+        viewport_height: 6480,
+        h_ratio: 1_572_864,
+        v_ratio: 1_572_864,
+        h_taps: 4,
+        v_taps: 4,
+        ..Plane::default()
+    });
+    let Ok(Pstate::Supported(s)) = admit(&soc, &uclk, &[mode], false) else {
+        return TestResult::Fail("MPC bandwidth raise not admitted");
+    };
+    let latency = min_clock_table(&soc, &uclk)[usize::from(s.level)];
+    if s.active.dcfclk_khz == latency.dcfclk_khz
+        && s.active.uclk_khz == latency.uclk_khz
+        && (!s.fclk_pstate || s.active.fclk_khz == latency.fclk_khz)
+    {
+        return TestResult::Fail("MPC bandwidth did not raise a DPMM floor");
+    }
+    assert!(s.active.dcfclk_khz <= soc.dcfclk_khz[1]);
+    assert!(s.active.fclk_khz <= soc.fclk_khz[1]);
+    assert_eq!(s.plans[0].clocks.dcfclk_khz, s.active.dcfclk_khz);
+    assert_eq!(s.plans[0].clocks.fclk_khz, s.active.fclk_khz);
+    assert_eq!(s.plans[0].clocks.uclk_khz, s.active.uclk_khz);
+    assert!(s.plans[0].readmits());
+    let mut forged = s.plans[0];
+    forged.clocks.dcfclk_khz = latency.dcfclk_khz;
+    forged.clocks.fclk_khz = latency.fclk_khz;
+    forged.clocks.uclk_khz = latency.uclk_khz;
+    assert!(!forged.readmits());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-pstate",
+    dcn401_pstate_replans_bandwidth_raises_before_programming
+);
+
+fn dcn401_subvp_expands_and_readmits_phantom_without_det() -> TestResult {
+    let (soc, uclk) = board();
+    let mut count = 0;
+    for bpp in [4, 8] {
+        for hz in [60, 90, 100, 120, 144, 165] {
+            let mut mode = uhd();
+            mode.timing.pixel_clock_khz = mode.timing.h_total * mode.timing.v_total * hz / 1000;
+            mode.bytes_per_pixel = bpp;
+            let Some(s) = admit_subvp(&soc, &uclk, &mode, 64 * 1024 * 1024).unwrap() else {
+                continue;
+            };
+            count += 1;
+            let ph = s.phantom.as_ref().unwrap();
+            assert_eq!(ph.plan.det_bytes, 0);
+            assert_eq!(s.plans[0].det_bytes, 1280 * 1024);
+            assert!(s.plans[0].readmits());
+            assert!(ph.plan.readmits());
+            assert!(ph.readmits());
+            let mut damaged_cache = ph.as_ref().clone();
+            damaged_cache.mall_ways += 1;
+            assert!(!damaged_cache.readmits());
+            assert!(ph.mall_ways > 0 && ph.mall_ways <= 16);
+            assert!(ph.mall_bytes < 64 * 1024 * 1024);
+            assert!(s.active.dcfclk_khz >= s.idle.dcfclk_khz);
+            assert_eq!(s.fams2_streams[0].kind, 4);
+            let wire = s.fams2_streams[0].subvp.unwrap();
+            assert_eq!(u32::from(wire.phantom_vtotal), ph.plan.mode.timing.v_total);
+            assert_eq!(
+                u32::from(wire.phantom_vactive),
+                ph.plan.mode.timing.v_active
+            );
+            let mut damaged = ph.plan;
+            damaged.det_bytes = 65536;
+            assert!(!damaged.readmits());
+            let mut damaged = s.plans[0];
+            damaged.watermarks.frac_urg_bw_mall += 1;
+            assert!(!damaged.readmits());
+        }
+    }
+    assert!(count > 0, "no single-stream RGB SubVP mode admitted");
+    assert!(admit_subvp(&soc, &uclk, &hd(), 64 * 1024 * 1024)
+        .unwrap()
+        .is_none());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-pstate",
+    dcn401_subvp_expands_and_readmits_phantom_without_det
 );

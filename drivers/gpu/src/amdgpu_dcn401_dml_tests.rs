@@ -133,6 +133,26 @@ pub(super) fn values(p: &Plan) -> [u32; 62] {
         p.stutter_reserved_us,
     ]
 }
+/// Historical ClockState raised fixtures (and MPC's generic REJECT rows)
+/// carried no register image for DPMM raises. Admit only a reproducible plan
+/// with clocks above that old floor and within the board's actual maxima.
+fn raised_plan(soc: &Soc, result: &Result<Vec<Plan>, Error>) -> bool {
+    let (Ok((dcf, fabric, _)), Ok(plans)) = (clock_state(soc), result) else {
+        return false;
+    };
+    !plans.is_empty()
+        && plans.iter().all(|plan| {
+            plan.soc == *soc
+                && plan.clocks.uclk_khz == soc.uclk_khz
+                && u64::from(plan.clocks.dcfclk_khz) >= dcf
+                && plan.clocks.dcfclk_khz <= soc.dcfclk_khz[1]
+                && u64::from(plan.clocks.fclk_khz) >= fabric
+                && plan.clocks.fclk_khz <= soc.fclk_khz[1]
+                && (u64::from(plan.clocks.dcfclk_khz) > dcf
+                    || u64::from(plan.clocks.fclk_khz) > fabric)
+                && plan.readmits()
+        })
+}
 fn error_name(e: Error) -> &'static str {
     match e {
         Error::Invalid => "Invalid",
@@ -594,6 +614,10 @@ fn check_vectors_policy(
                         return Err("Linux's 3:1/4:1 configuration not admitted");
                     }
                     rejects += 1;
+                    continue;
+                }
+                if name == Some("ClockState") && raised_plan(&soc, &result) {
+                    rejects += 1; // historical fixture classification
                     continue;
                 }
                 let (Some(name), Err(e)) = (name, result) else {
@@ -1169,7 +1193,12 @@ fn check_plane_vectors_policy(
                 plans += 1;
             }
             Some("!") => {
-                let (Some(name), Err(e)) = (words.next(), result) else {
+                let name = words.next();
+                if matches!(name, Some("ClockState" | "REJECT")) && raised_plan(&soc, &result) {
+                    rejects += 1;
+                    continue;
+                }
+                let (Some(name), Err(e)) = (name, result) else {
                     return Err("rejected plane configuration admitted");
                 };
                 if name != "REJECT" && error_name(e) != name {
@@ -1806,4 +1835,56 @@ fn dcn401_dml_matches_linux_hdmi_simple422_outputs() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-dml",
     dcn401_dml_matches_linux_hdmi_simple422_outputs
+);
+
+fn dcn401_dml_replans_bandwidth_raises_within_board_clock_limits() -> TestResult {
+    let soc = Soc {
+        dcfclk_khz: [200_000, 600_000],
+        fclk_khz: [300_000, 800_000],
+        uclk_khz: 456_000,
+        dispclk_max_khz: 1_000_000,
+        dppclk_max_khz: 1_000_000,
+        socclk_khz: 300_000,
+        umc_channels: 16,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    };
+    // format_vectors.txt's dual FP16 5120x2880 configuration, previously
+    // ClockState raised. The four-DPP configuration needs extra fabric.
+    let mode = Mode::new(
+        Timing {
+            pixel_clock_khz: 1_306_000,
+            h_active: 5120,
+            h_total: 5280,
+            h_front_porch: 48,
+            h_sync_width: 32,
+            v_active: 2880,
+            v_total: 2970,
+            v_front_porch: 3,
+            v_sync_width: 5,
+            h_sync_positive: true,
+            v_sync_positive: true,
+        },
+        5120,
+        8,
+    );
+    let plans = admit_all(&soc, &[mode, mode]);
+    if !raised_plan(&soc, &plans) {
+        return TestResult::Fail("dual FP16 configuration did not raise clocks");
+    }
+    let plan = plans.unwrap()[0];
+    assert!(plan.clocks.fclk_khz > 528_000);
+    let mut forged = plan;
+    forged.clocks.fclk_khz = 528_000;
+    assert!(!forged.readmits());
+    let tight = Soc {
+        fclk_khz: [300_000, 528_000],
+        ..soc
+    };
+    assert!(admit_all(&tight, &[mode, mode]).is_err());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_replans_bandwidth_raises_within_board_clock_limits
 );

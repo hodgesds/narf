@@ -93,7 +93,7 @@ impl ColdBoot {
         }
         let vcn = self.sequence.backend.vcn.as_mut().ok_or(vcn::Error::Busy)?;
         if !matches!(
-            vcn.state(),
+            vcn.active_state(),
             vcn::State::IbVerified
                 | vcn::State::DecodeVerified
                 | vcn::State::Av1Verified
@@ -118,6 +118,8 @@ impl ColdBoot {
     /// return proves old media work retired, but does not permit replay or
     /// retirement until global re-arm and a fresh media interrupt proof.
     pub(crate) async unsafe fn retire_client_media(&mut self) -> Result<(), Error> {
+        self.wake_media().await?;
+        self.sequence.backend.static_media_power().await?;
         if self.sequence.backend.vcn_owner.is_none() {
             return Err(Error::Busy);
         }
@@ -217,6 +219,7 @@ impl ColdBoot {
                 // SAFETY: registered media, retained GMC and active IH route.
                 unsafe { hw.prove_jpeg(doorbells, jpeg_decode, jpeg_clients).await }?;
             }
+            hw.configure_media_power().await?;
             Ok(proof)
         }
         .await;
@@ -262,7 +265,13 @@ impl ColdBoot {
             && !crate::amdgpu_navi48_interrupts::blocked()
             && self.client_jpeg_owner().is_some()
             && self.sequence.backend.jpeg_test.is_some_and(|r| r.is_ok())
-            && self.media_jpeg_state() == Some(crate::amdgpu_jpeg_navi48::State::Clients)
+            && self
+                .sequence
+                .backend
+                .jpeg
+                .as_ref()
+                .map(crate::amdgpu_jpeg_navi48::Jpeg::active_state)
+                == Some(crate::amdgpu_jpeg_navi48::State::Clients)
     }
     /// # Safety
     /// OWNER serializes staging; the slot's previous job has completed and
@@ -306,6 +315,7 @@ impl ColdBoot {
     /// OWNER excludes publishers/PM, the JPEG ledger is frozen and keeps
     /// every pending job's slot and mappings through failure/cancellation.
     pub(crate) async unsafe fn recover_client_jpeg(&mut self) -> Result<u32, Error> {
+        self.begin_media_use(true).await?;
         // SAFETY: forwarded exclusion and retention.
         unsafe { self.sequence.backend.retire_client_jpeg().await }?;
         let hw = &mut self.sequence.backend;
@@ -315,6 +325,7 @@ impl ColdBoot {
             unsafe { mes::map_doorbells(&hw.pci, &hw.authority) }.map_err(Error::Mes)?;
         // SAFETY: retained registration and IH route; ring retirement proved.
         let proof = unsafe { hw.prove_jpeg(doorbells, decode, true).await }?;
+        hw.configure_media_power().await?;
         Ok(proof.sequence)
     }
 }

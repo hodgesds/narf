@@ -1,4 +1,6 @@
 use super::*;
+#[path = "amdgpu_smu_navi48_profile_tests.rs"]
+mod profile_tests;
 use alloc::vec;
 use core::{
     future::Future,
@@ -40,6 +42,7 @@ struct Fake {
     reject_arg: Option<(u32, u32)>,
     interface: u32,
     enabled: u64,
+    allowed: u64,
     reported: Option<u64>,
     revoke: Option<(u32, Cap<BusDeviceCap, Write>)>,
     dirty: bool,
@@ -49,6 +52,7 @@ struct Fake {
     uploaded: Vec<u8>,
     metrics: Vec<u8>,
     dpm_count: u32,
+    activity: [[u8; 140]; 8],
 }
 impl Io for Fake {
     fn wait_poll_limit(&self) -> Option<u32> {
@@ -90,8 +94,12 @@ impl Io for Fake {
                 0
             }
             0x12 => {
-                self.violation |= !matches!(p, 1 | 5) || self.dirty || self.address != 0x8_00003000;
-                if p == 5 {
+                self.violation |= !matches!(p, 1 | 5) && p & 0xffff != 7
+                    || self.dirty
+                    || self.address != 0x8_00003000;
+                if p & 0xffff == 7 {
+                    self.memory[..140].copy_from_slice(&self.activity[(p >> 16) as usize]);
+                } else if p == 5 {
                     // Stale staging must have been cleared before PMFW writes.
                     self.violation |= self.memory[..METRICS_BYTES].iter().any(|&b| b != 0);
                     self.memory[..METRICS_BYTES].copy_from_slice(&self.metrics);
@@ -101,16 +109,20 @@ impl Io for Fake {
                 0
             }
             0x13 => {
-                self.violation |= p != 0 || self.dirty;
-                self.uploaded = self.memory[..POWER_BYTES].to_vec();
+                self.violation |= (p != 0 && p != ((6 << 16) | 7)) || self.dirty;
+                if p & 0xffff == 7 {
+                    self.activity[6].copy_from_slice(&self.memory[..140]);
+                } else {
+                    self.uploaded = self.memory[..POWER_BYTES].to_vec();
+                }
                 0
             }
             5 => {
-                self.enabled = (p as u64) << 32;
+                self.allowed = (self.allowed & 0xffff_ffff) | (u64::from(p) << 32);
                 0
             }
             4 => {
-                self.enabled |= p as u64;
+                self.allowed = (self.allowed & !0xffff_ffff) | u64::from(p);
                 0
             }
             0xc => self.reported.unwrap_or(self.enabled) as u32,
@@ -123,13 +135,25 @@ impl Io for Fake {
             0x1f if p & 0xffff == 0xff => self.dpm_count,
             0x1f if p >> 16 == 2 => 1258,
             0x1f => 3100,
-            0x4d | 0x36 | 6 | 0x19 | 0x1a | 0x2a..=0x2d | 0x32 | 0x15..=0x17 => 0,
+            0x4d | 0x36 | 0x24 | 0x19 | 0x1a | 0x28..=0x2d | 0x32 | 0x15..=0x17 => 0,
+            6 => {
+                self.enabled = self.allowed;
+                0
+            }
             8 => {
                 self.enabled |= p as u64;
                 0
             }
             9 => {
                 self.enabled |= (p as u64) << 32;
+                0
+            }
+            0xa => {
+                self.enabled &= !u64::from(p);
+                0
+            }
+            0xb => {
+                self.enabled &= !(u64::from(p) << 32);
                 0
             }
             0x33 => {
@@ -186,6 +210,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
                 reject_arg: None,
                 interface: DRIVER_INTERFACE,
                 enabled: 0,
+                allowed: 0,
                 reported: None,
                 revoke: None,
                 dirty: false,
@@ -195,6 +220,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
                 uploaded: Vec::new(),
                 metrics: vec![0; METRICS_BYTES],
                 dpm_count: 0x8000_0002,
+                activity: [[0x5a; 140]; 8],
             },
             authority: Cap::bootstrap(),
             memory,
@@ -206,6 +232,9 @@ fn fixture() -> (Pool, Engine<Fake>) {
             limits: None,
             protection: 0,
             gfx_level: GfxLevel::Auto,
+            profile: PowerProfile::BootupDefault,
+            coefficients: None,
+            custom_coefficients: None,
             baco: BacoState::Exit,
             boot_enabled: 0,
         },
@@ -583,6 +612,10 @@ fn display_engine() -> (Pool, Engine<Fake>) {
     let (pool, mut e) = fixture();
     e.state = State::PowerReady;
     e.features = ALLOWED | DISPLAY;
+    // Startup already enabled the baseline. Allowed-mask writes alone must
+    // never manufacture running features in this display-only fixture.
+    e.io.allowed = ALLOWED;
+    e.io.enabled = ALLOWED;
     e.power = Some(PowerStatus {
         allowed: ALLOWED,
         enabled: ALLOWED,
@@ -611,7 +644,7 @@ fn smu14_display_policy_enables_only_required_clocks_and_preserves_protection() 
         [
             (5, (power.allowed >> 32) as u32),
             (4, power.allowed as u32),
-            (6, 0),
+            (8, DISPLAY as u32),
             (12, 0),
             (13, 0),
             (0x1d, 2 << 16),
@@ -685,7 +718,7 @@ kernel_test_in!(
 );
 
 fn smu14_display_power_partial_failures_cancellation_and_revocation_are_terminal() -> TestResult {
-    for (i, message) in [5, 4, 6, 12, 13].into_iter().enumerate() {
+    for (i, message) in [5, 4, 8, 12, 13].into_iter().enumerate() {
         for case in 0..3 {
             let (_, mut e) = display_engine();
             let old = e.power;
@@ -796,6 +829,142 @@ fn powered() -> (Pool, Engine<Fake>) {
     e.io.commands.clear();
     (pool, e)
 }
+fn smu14_media_dpm_and_deep_sleep_follow_board_masks_and_restore_static_policy() -> TestResult {
+    use crate::amdgpu_navi48_media_power::FEATURES;
+    for bits in [0, 1 << 20, 1 << 44, FEATURES] {
+        let (_pool, mut e) = powered();
+        e.features = (e.features & !FEATURES) | bits;
+        let previous = e.power.unwrap();
+        let power = run(e.configure_media_power(true)).unwrap();
+        assert_eq!(power.enabled & FEATURES, bits);
+        assert_eq!(power.enabled & previous.enabled, previous.enabled);
+        assert_eq!(power.allowed, previous.allowed | bits);
+        assert!(e.io.commands.contains(&(8, bits as u32)));
+        assert!(e.io.commands.contains(&(9, (bits >> 32) as u32)));
+        run(e.set_vcn_power(false)).unwrap();
+        run(e.set_jpeg_power(true)).unwrap();
+        let restored = run(e.configure_media_power(false)).unwrap();
+        assert_eq!(restored, previous);
+        assert!(e.io.commands.contains(&(0xa, bits as u32)));
+        assert!(e.io.commands.contains(&(0xb, (bits >> 32) as u32)));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4-dpg",
+    smu14_media_dpm_and_deep_sleep_follow_board_masks_and_restore_static_policy
+);
+
+fn smu14_media_policy_checks_protections_and_quarantines_cancelled_mailboxes() -> TestResult {
+    use crate::amdgpu_navi48_media_power::FEATURES;
+    let (_pool, mut e) = powered();
+    e.features |= FEATURES;
+    e.io.reported = Some(e.io.enabled & !(1 << 28));
+    assert!(matches!(
+        run(e.configure_media_power(true)),
+        Err(Error::Features(_))
+    ));
+    assert!(!e
+        .io
+        .commands
+        .iter()
+        .any(|&(cmd, _)| matches!(cmd, 4 | 5 | 8 | 9)));
+    for message in [9, 0xb] {
+        let (_pool, mut e) = powered();
+        e.features |= FEATURES;
+        if message == 0xb {
+            run(e.configure_media_power(true)).unwrap();
+        }
+        e.io.stall = Some(message);
+        {
+            let mut future = core::pin::pin!(e.configure_media_power(message != 0xb));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(e.state, State::Runtime);
+        let count = e.io.commands.len();
+        assert_eq!(run(e.configure_media_power(false)), Err(Error::Busy));
+        assert_eq!(run(e.set_vcn_power(true)), Err(Error::Busy));
+        assert_eq!(e.io.commands.len(), count);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4-dpg",
+    smu14_media_policy_checks_protections_and_quarantines_cancelled_mailboxes
+);
+fn smu14_gfxoff_admits_only_board_features_and_keeps_protections() -> TestResult {
+    let (_pool, mut e) = powered();
+    let old = e.power.unwrap();
+    e.features &= !(1 << 18);
+    assert_eq!(run(e.configure_gfxoff()), Ok(false));
+    assert!(e.io.commands.is_empty());
+    e.features |= 1 << 18;
+    assert_eq!(run(e.configure_gfxoff()), Ok(true));
+    let allowed = old.allowed | 0x40000;
+    assert_eq!(
+        e.io.commands,
+        [
+            (0xc, 0),
+            (0xd, 0),
+            (5, (allowed >> 32) as u32),
+            (4, allowed as u32),
+            (8, 0x40000),
+            (9, 0),
+            (0xc, 0),
+            (0xd, 0),
+            (0x29, 0)
+        ]
+    );
+    assert_eq!(e.power.unwrap().enabled & old.enabled, old.enabled);
+    e.io.commands.clear();
+    run(e.gfx_off_control(true)).unwrap();
+    run(e.gfx_off_control(false)).unwrap();
+    assert_eq!(
+        e.io.commands,
+        [(0xc, 0), (0xd, 0), (0x28, 0), (0xc, 0), (0xd, 0), (0x29, 0)]
+    );
+    e.io.commands.clear();
+    e.io.reported = Some(e.io.enabled & !(1 << 23));
+    assert!(matches!(
+        run(e.gfx_off_control(true)),
+        Err(Error::Features(_))
+    ));
+    assert_eq!(e.io.commands, [(0xc, 0), (0xd, 0)]);
+    assert_eq!(e.state, State::Failed);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4-idle",
+    smu14_gfxoff_admits_only_board_features_and_keeps_protections
+);
+fn smu14_gfxoff_rejection_and_cancellation_never_replay_transport() -> TestResult {
+    let (_pool, mut e) = powered();
+    run(e.configure_gfxoff()).unwrap();
+    e.io.reject = Some(0x28);
+    assert_eq!(run(e.gfx_off_control(true)), Err(Error::Rejected(0xfd)));
+    assert_eq!(e.state, State::PowerReady);
+    e.io.reject = None;
+    e.io.stall = Some(0x28);
+    {
+        let mut future = core::pin::pin!(e.gfx_off_control(true));
+        assert!(future
+            .as_mut()
+            .poll(&mut core::task::Context::from_waker(
+                core::task::Waker::noop()
+            ))
+            .is_pending());
+    }
+    let commands = e.io.commands.len();
+    assert_eq!(e.state, State::Runtime);
+    assert_eq!(run(e.gfx_off_control(false)), Err(Error::Busy));
+    assert_eq!(e.io.commands.len(), commands);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4-idle",
+    smu14_gfxoff_rejection_and_cancellation_never_replay_transport
+);
 /// After the display power transition, with boot's protection recorded.
 fn displayed() -> (Pool, Engine<Fake>) {
     let (pool, mut e) = display_engine();

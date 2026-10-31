@@ -34,6 +34,7 @@ pub enum Error {
     DeviceGone,
     Readback,
     Timeout,
+    Sram(crate::amdgpu_psp_ring::Error),
     PowerPolicy(u64),
     DecodeChecksum(u64),
     Interrupts(crate::amdgpu_ih7::Error),
@@ -51,6 +52,9 @@ pub enum State {
     Clients,
     Stopping,
     Stopped,
+    IdleStopping,
+    Idle,
+    IdleStarting,
     Failed(Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,7 +143,7 @@ impl Layout {
                 ip::HW_ID_GC,
                 crate::amdgpu_rdna4::GC_VERSIONS,
                 0,
-                0x263e,
+                0x13de,
             )
             .map_err(|_| Error::Unsupported)?,
         })
@@ -176,6 +180,9 @@ struct Engine<I: Io> {
     /// Kernel VMID0 copies of validated client IBs (`cs::SLOTS` slots).
     client_memory: Option<Reservation>,
     state: State,
+    idle_state: Option<State>,
+    addr_config: Option<u32>,
+    dpg: bool,
     result: Option<Result<Proof, Error>>,
     decode_result: Option<Result<DecodeProof, Error>>,
     seq: u32,
@@ -249,8 +256,13 @@ impl<I: Io> Engine<I> {
         result
     }
     async fn start_inner(&mut self) -> Result<(), Error> {
+        self.dpg = false;
+        self.io.media_idle(true, false);
+        self.restore(true).await
+    }
+    async fn restore(&mut self, cold: bool) -> Result<(), Error> {
         let map = self.memory.mapping();
-        for page in (0..BYTES).step_by(4096) {
+        for page in (0..if cold { BYTES } else { 0 }).step_by(4096) {
             self.access(|io, l| {
                 let value = if page == 0 || page == END_GUARD {
                     GUARD
@@ -269,7 +281,14 @@ impl<I: Io> Engine<I> {
         self.set(POWER, 1, 0)?;
         self.set(CG_GATE, u32::MAX, 0)?;
         self.set(CG_CTRL, CG_MODES, 0)?;
-        let config = self.access(|io, l| checked(io.read(l.gc + 0x263e * 4)))?;
+        let config = if cold {
+            // GC12's segment-relative address, before caching for warm use.
+            let value = self.access(|io, l| checked(io.read(l.gc + 0x13de * 4)))?;
+            self.addr_config = Some(value);
+            value
+        } else {
+            self.addr_config.ok_or(Error::Invalid)?
+        };
         self.set(ADDR_CONFIG, u32::MAX, config)?;
         self.set(IRQ, 0x100, 0)?;
         self.set(JMI, 1, 1)?;
@@ -288,8 +307,10 @@ impl<I: Io> Engine<I> {
         self.shared_range()
     }
     fn emit(&mut self, words: &[u32]) -> Result<u32, Error> {
-        if !matches!(self.state, State::Testing | State::DecodeTesting)
-            || words.is_empty()
+        if !matches!(
+            self.state,
+            State::Testing | State::DecodeTesting | State::IdleStarting
+        ) || words.is_empty()
             || words.len() % 2 != 0
         {
             return Err(Error::Invalid);
@@ -352,6 +373,7 @@ impl<I: Io> Engine<I> {
         result
     }
     async fn stop_inner(&mut self) -> Result<(), Error> {
+        self.wake_dpg().await?;
         self.shared_range()?;
         self.wait(RPTR, u32::MAX, self.wptr).await?;
         self.wait(STATUS, 1, 1).await?;
@@ -448,6 +470,9 @@ impl Jpeg {
                 decode_memory: None,
                 client_memory: None,
                 state: State::Prepared,
+                idle_state: None,
+                addr_config: None,
+                dpg: false,
                 result: None,
                 decode_result: None,
                 seq: 0,
@@ -534,7 +559,7 @@ impl Jpeg {
     }
     /// Retain this owner/backing and exclude reset/PM while using the reader.
     pub fn fence_reader(&self) -> Option<FenceReader> {
-        (self.engine.state == State::Clients).then_some(FenceReader {
+        (self.engine.active_state() == State::Clients).then_some(FenceReader {
             io: self.engine.io,
             authority: self.engine.authority,
             layout: self.engine.layout,
@@ -543,6 +568,10 @@ impl Jpeg {
     }
 }
 pub use cs::{validate_ib, SLOTS, SLOT_BYTES};
+#[path = "amdgpu_jpeg_navi48_dpg.rs"]
+mod dpg;
+#[path = "amdgpu_jpeg_navi48_idle.rs"]
+mod idle;
 #[derive(Clone, Copy, Debug)]
 pub struct FenceReader {
     io: Mmio,
@@ -554,7 +583,13 @@ impl FenceReader {
     /// The last physical sequence the JPEG ring's GPCOM fence wrote.
     pub fn completed(&self) -> Result<u32, Error> {
         let mut io = self.io;
-        cs::client_fence(&mut io, self.authority, self.layout, self.map)
+        cs::retained_fence(
+            &mut io,
+            self.authority,
+            self.layout,
+            self.map,
+            !crate::amdgpu_navi48_platform::media_idle_reader(true),
+        )
     }
 }
 #[cfg(feature = "kernel-test")]
