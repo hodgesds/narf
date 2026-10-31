@@ -771,6 +771,20 @@ also covers a retained seed and an in-flight switch context. Autoscheduled
 engine resets remain disabled. Userspace publication additionally requires
 the runtime's verified PPGTT probe and backend installation.
 
+GuC power management follows xe_guc_pc_start. When scheduling becomes ready
+and before the kernel probe, `GuCGt::begin_slpc` allocates an 8 KiB SLPC
+shared buffer (coherent GGTT, no overlap with scheduler storage), zeroes it,
+publishes its size and sends the fast request
+HOST2GUC_PC_SLPC_REQUEST(SLPC_EVENT_RESET, address). Polling observes
+`global_state` RUNNING (3) within 1005 ms and then sends SETUP_PC_GUCRC
+(GUCRC_FIRMWARE_CONTROL), so GuC owns GT frequency and RC6; the host
+programs no RC6 registers. A RESPONSE_FAILURE carrying the SLPC fence, an
+ERROR state or the deadline marks SLPC `Unavailable` without closing
+scheduling. A refused start (allocation, cache, CT) frees the buffer, which
+GuC never saw. Once sent, the buffer is retained until proven reset, like all
+GuC-reachable storage. Frequency bounds, the MTL media cap
+(Wa_22019338487) and power profiles keep GuC defaults.
+
 Before context registration and after deregistration, a heavy GuC GGTT TLB
 invalidation (0x7000, operation 0x80000003) requires its matching 0x7001 cookie.
 Scheduling advances REGISTER_CONTEXT, scheduling policy, enable/ACK, execution,

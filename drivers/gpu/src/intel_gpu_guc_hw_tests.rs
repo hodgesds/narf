@@ -718,6 +718,59 @@ kernel_test_in!(
     smoke_hardware_workaround_ip_change_blocks_reload
 );
 
+fn smoke_hardware_slpc_gucrc_and_optional_failures() -> TestResult {
+    use crate::intel_gpu_guc_sched::SlpcState;
+    for mode in 0..4 {
+        let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+        hardware_discovery(&mut gt, &w, 0xdfc);
+        hardware_scheduling(&mut gt, &w);
+        SLPC_FIXTURE_MODE.store(mode, core::sync::atomic::Ordering::Relaxed);
+        let before = arena.live_allocations();
+        gt.begin_slpc(30).unwrap();
+        assert!(matches!(gt.slpc(), SlpcState::Resetting { .. }));
+        assert!(gt.begin_slpc(30).is_err(), "SLPC started twice");
+        assert_eq!(arena.live_allocations(), before + 1);
+        let mut registered = BTreeMap::new();
+        let mut gucrc = 0;
+        for now in 31..40 {
+            gucrc += service_contexts(&w, &mut registered, true)
+                .iter()
+                .filter(|action| **action == 0x3004)
+                .count();
+            assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+        }
+        if mode == 3 {
+            assert!(matches!(gt.slpc(), SlpcState::Resetting { .. }));
+            assert_eq!(
+                gt.poll(30 + 1_005_000_000),
+                Poll::Ready(Ok(GtState::SchedulingReady))
+            );
+        }
+        gucrc += service_contexts(&w, &mut registered, true)
+            .iter()
+            .filter(|action| **action == 0x3004)
+            .count();
+        let expected = if mode == 0 {
+            SlpcState::Running
+        } else {
+            SlpcState::Unavailable
+        };
+        assert_eq!(gt.slpc(), expected);
+        assert_eq!(gucrc, usize::from(mode == 0));
+        // An optional power component never closes scheduling.
+        assert!(gt.submit_kernel_probe(2_000_000_000).is_ok());
+        hardware_stop(&mut gt, &w, 0xdfc);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    SLPC_FIXTURE_MODE.store(0, core::sync::atomic::Ordering::Relaxed);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_slpc_gucrc_and_optional_failures
+);
+
 fn hardware_stop(gt: &mut GuCGt<Window, Arena>, w: &Window, ack: u64) {
     gt.begin_stop(10_000_000_000).unwrap();
     assert!(gt.poll(10_000_000_001).is_pending());
@@ -757,6 +810,18 @@ fn event(memory: &Words, action: u32, payload: &[u32]) {
     }
     words[513] = (tail + 2 + payload.len() as u32) & 4095;
 }
+/// GuC SLPC model: 0 publishes RUNNING, 1 ERROR, 2 a RESPONSE_FAILURE to
+/// the reset request, 3 never answers.
+static SLPC_FIXTURE_MODE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn failure_response(memory: &Words, fence: u16) {
+    let mut words = memory.borrow_mut();
+    let tail = words[513];
+    words[2048 + (tail & 4095) as usize] = 1 | u32::from(fence) << 16;
+    words[2048 + ((tail + 1) & 4095) as usize] = 0xe000_0030; // GuC FAILURE
+    words[513] = (tail + 2) & 4095;
+}
+
 fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bool) -> Vec<u16> {
     let memory = ct_memory(w);
     let mut requests = Vec::new();
@@ -896,6 +961,20 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 assert!(registered.remove(&request[1]).is_some());
                 event(&memory, 0x4600, &[request[1]]);
             }
+            0x3003 => {
+                // SLPC_EVENT(RESET, 2): shared-data GGTT address, high dword.
+                assert_eq!((request.len(), request[1], request[3]), (4, 2, 0));
+                let shared = w.0.borrow().memory[&request[2]].clone();
+                assert_eq!(shared.borrow().len(), 2048);
+                assert_eq!(shared.borrow()[0], 8192);
+                match SLPC_FIXTURE_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+                    0 => shared.borrow_mut()[1] = 3,
+                    1 => shared.borrow_mut()[1] = 5,
+                    2 => failure_response(&memory, 0xfffe),
+                    _ => {}
+                }
+            }
+            0x3004 => assert_eq!(&request[1..], &[1]), // GUCRC_FIRMWARE_CONTROL
             _ => panic!("unexpected action {action:x}"),
         }
     }

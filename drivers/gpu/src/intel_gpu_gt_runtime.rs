@@ -68,6 +68,8 @@ struct State {
     recover_after_stop: bool,
     /// User epoch to continue after a runtime resume (clean idle stop only).
     parked_epoch: Option<u64>,
+    /// The SLPC outcome of this GT incarnation has been logged.
+    slpc_reported: bool,
 }
 
 struct Pending {
@@ -343,6 +345,7 @@ pub(crate) fn start_pending() {
                 power_ready: 0,
                 recover_after_stop: false,
                 parked_epoch: None,
+                slpc_reported: false,
             }),
             suspended: AtomicBool::new(false),
             user_epoch: Arc::new(AtomicU64::new(0)),
@@ -566,6 +569,14 @@ impl Owner {
                 state.phase = Phase::Ct;
             }
             (Phase::Ct, GtState::SchedulingReady) => {
+                // Optional GuC frequency/RC6 management, as xe_guc_pc_start.
+                state.slpc_reported = gt.begin_slpc(now).is_err();
+                if state.slpc_reported {
+                    log(
+                        self.pending.index,
+                        "GuC SLPC not started; static GT frequency",
+                    );
+                }
                 let (_, completion) = gt.submit_kernel_probe(now).map_err(RuntimeError::Gt)?;
                 state.probe = Some(completion);
                 state.phase = Phase::Probe;
@@ -621,7 +632,23 @@ impl Owner {
                     );
                 }
             }
-            (Phase::Running, GtState::SchedulingReady) => {}
+            (Phase::Running, GtState::SchedulingReady) => {
+                use crate::intel_gpu_guc_sched::SlpcState;
+                match gt.slpc() {
+                    SlpcState::Running if !state.slpc_reported => {
+                        state.slpc_reported = true;
+                        log(self.pending.index, "GuC SLPC running; GuC controls RC6");
+                    }
+                    SlpcState::Unavailable if !state.slpc_reported => {
+                        state.slpc_reported = true;
+                        log(
+                            self.pending.index,
+                            "GuC SLPC unavailable; static GT frequency",
+                        );
+                    }
+                    _ => {}
+                }
+            }
             (Phase::Cleaning, GtState::Stopped) => {
                 state.phase = if state.recover_after_stop {
                     state.recover_after_stop = false;

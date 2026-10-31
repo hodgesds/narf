@@ -25,6 +25,20 @@ use core::{
 
 const TIMEOUT: u64 = 5_000_000_000;
 const MAX_CONTEXTS: usize = 64;
+/// CT fence of SLPC fast requests; a failure response names it.
+const SLPC_FENCE: u16 = 0xfffe;
+/// xe_guc_pc.c: SLPC_RESET_TIMEOUT_MS + SLPC_RESET_EXTENDED_TIMEOUT_MS.
+const SLPC_TIMEOUT: u64 = 1_005_000_000;
+
+/// GuC SLPC (frequency management) and firmware-controlled RC6 (GUCRC).
+/// Optional: failure leaves the GT running at its static frequency.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SlpcState {
+    Off,
+    Resetting { deadline: u64 },
+    Running,
+    Unavailable,
+}
 
 /// Firmware context identities are reusable after deregistration. Request
 /// stamps are independent, so a prior TLB ACK/breadcrumb cannot complete a
@@ -146,6 +160,8 @@ struct Resources<A: BootAllocator> {
     seed_image: Option<A::Backing>,
     seed_id: Option<u16>,
     defaults_completion: Option<Arc<CompletionFence>>,
+    /// SLPC shared data; GuC may reach it until a proven reset.
+    slpc: Option<A::Backing>,
 }
 
 pub(crate) struct GuCScheduler<A: BootAllocator> {
@@ -160,6 +176,7 @@ pub(crate) struct GuCScheduler<A: BootAllocator> {
     epoch: u64,
     /// A user job ran under `epoch`; its identity can no longer change.
     user_submitted: bool,
+    slpc: SlpcState,
 }
 
 impl<A: BootAllocator> GuCScheduler<A> {
@@ -219,6 +236,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 seed_image: None,
                 seed_id: None,
                 defaults_completion: None,
+                slpc: None,
             }),
             platform,
             identities: Identities::new(),
@@ -228,6 +246,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             defaults: Defaults::Empty,
             pristine: true,
             user_submitted: false,
+            slpc: SlpcState::Off,
         })
     }
 
@@ -294,6 +313,85 @@ impl<A: BootAllocator> GuCScheduler<A> {
 
     pub(crate) fn user_epoch(&self) -> Option<u64> {
         (self.published && self.defaults_ready()).then_some(self.epoch)
+    }
+
+    pub(crate) fn slpc(&self) -> SlpcState {
+        self.slpc
+    }
+
+    /// xe_guc_pc_start: zero the 8 KiB shared data, publish its size and
+    /// request SLPC_EVENT_RESET. Completion is observed in `poll`.
+    pub(crate) fn begin_slpc<M: MmioWindow>(
+        &mut self,
+        ct: &mut XeLpgTransport<M, A>,
+        now: u64,
+    ) -> Result<(), SchedulingError> {
+        if !self.published || self.lost || self.slpc != SlpcState::Off {
+            return Err(SchedulingError::State);
+        }
+        let deadline = now
+            .checked_add(SLPC_TIMEOUT)
+            .ok_or(SchedulingError::Timeout)?;
+        let r = &mut *self.resources;
+        let shared = r.allocator.alloc(2).map_err(SchedulingError::Allocation)?;
+        let clashes = r
+            .engines
+            .iter()
+            .flat_map(|e| [&e.hwsp, &e.golden])
+            .chain(r.seed_image.iter())
+            .chain(r.contexts.iter().flat_map(|c| [&c.image, &c.ring]))
+            .any(|old| overlap(old, &shared));
+        if !valid(&shared) || shared.size_pages() != 2 || clashes {
+            r.allocator.free(shared);
+            return Err(SchedulingError::Address);
+        }
+        if !shared.coherent_for_device() {
+            r.allocator.free(shared);
+            return Err(SchedulingError::Cache);
+        }
+        shared.zero_fill();
+        shared.write32(0, 8192);
+        if r.allocator.sync_for_device(&shared).is_err() {
+            r.allocator.free(shared);
+            return Err(SchedulingError::Cache);
+        }
+        let address = shared.ggtt_offset();
+        // GuC never saw the address if the request is refused.
+        if let Err(error) = ct.send(SLPC_FENCE, 0x3003, 0, &[2, address, 0], true) {
+            r.allocator.free(shared);
+            return Err(SchedulingError::Transport(error));
+        }
+        r.slpc = Some(shared);
+        self.slpc = SlpcState::Resetting { deadline };
+        Ok(())
+    }
+
+    fn progress_slpc<M: MmioWindow>(
+        &mut self,
+        ct: &mut XeLpgTransport<M, A>,
+        now: u64,
+    ) -> Result<(), SchedulingError> {
+        let SlpcState::Resetting { deadline } = self.slpc else {
+            return Ok(());
+        };
+        let r = &mut *self.resources;
+        let shared = r.slpc.as_ref().expect("SLPC shared data");
+        r.allocator
+            .sync_for_cpu(shared)
+            .map_err(|_| SchedulingError::Cache)?;
+        fence(Ordering::Acquire);
+        match shared.read32(4) {
+            // SLPC_GLOBAL_STATE_RUNNING: hand RC6 to firmware (GUCRC).
+            3 => match ct.send(SLPC_FENCE, 0x3004, 0, &[1], true) {
+                Ok(()) => self.slpc = SlpcState::Running,
+                Err(TransportError::Ct(crate::intel_gpu_guc::GuCError::Full)) => {}
+                Err(error) => return Err(SchedulingError::Transport(error)),
+            },
+            5 => self.slpc = SlpcState::Unavailable, // SLPC_GLOBAL_STATE_ERROR
+            _ if now >= deadline => self.slpc = SlpcState::Unavailable,
+            _ => {}
+        }
+        Ok(())
     }
 
     /// No firmware context is registered, in flight or retiring.
@@ -629,6 +727,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             };
             self.event(message)?;
         }
+        self.progress_slpc(ct, now)?;
         if let Defaults::Seed(engine, _) = self.defaults {
             if self.resources.seed_image.is_some() {
                 let (id, _) = self.submit(now, engine, None, None)?;
@@ -720,6 +819,12 @@ impl<A: BootAllocator> GuCScheduler<A> {
     }
 
     fn event(&mut self, message: GuCMessage) -> Result<(), SchedulingError> {
+        // RESPONSE_FAILURE to an SLPC fast request: the optional power
+        // component is unavailable, not a lost scheduler.
+        if message.kind == 6 && message.fence == SLPC_FENCE && self.slpc != SlpcState::Off {
+            self.slpc = SlpcState::Unavailable;
+            return Ok(());
+        }
         if message.kind != 1 || message.auxiliary >> 16 != 0 {
             return Err(SchedulingError::Protocol);
         }
@@ -871,6 +976,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
         }
         if let Some(image) = r.seed_image.take() {
             r.allocator.free(image);
+        }
+        if let Some(shared) = r.slpc.take() {
+            r.allocator.free(shared);
         }
         for engine in r.engines.drain(..).rev() {
             r.allocator.free(engine.golden);

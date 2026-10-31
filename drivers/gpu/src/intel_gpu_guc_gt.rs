@@ -554,6 +554,25 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             .flatten()
     }
 
+    /// Start GuC SLPC/GUCRC. Optional: errors leave scheduling untouched.
+    pub fn begin_slpc(&mut self, now: u64) -> Result<(), GtError> {
+        self.admit_scheduling()?;
+        let parts = &mut *self.parts;
+        parts
+            .scheduler
+            .as_mut()
+            .ok_or(GtError::State)?
+            .begin_slpc(parts.ct.as_mut().ok_or(GtError::State)?, now)
+            .map_err(GtError::Scheduling)
+    }
+
+    pub fn slpc(&self) -> crate::intel_gpu_guc_sched::SlpcState {
+        self.parts
+            .scheduler
+            .as_ref()
+            .map_or(crate::intel_gpu_guc_sched::SlpcState::Off, |s| s.slpc())
+    }
+
     /// SchedulingReady with no registered, running or retiring context.
     pub fn idle(&self) -> bool {
         self.state == GtState::SchedulingReady
