@@ -2,6 +2,16 @@
 //! the production Session (Linux mt7921_init_he_caps / sta_he_tlv / bss_he).
 use super::*;
 use crate::mt7921::association::TxPermission;
+type NativeSession = alloc::boxed::Box<Session<Model>>;
+
+// The native Session is large. Return only a heap owner across these
+// nested fixture constructors: three shadowed by-value Sessions plus the
+// HE/VHT/WMM return places exceed the ARM64 64KiB boot stack in release.
+#[inline(never)]
+fn prepared_vht(width: u8, secure: bool) -> (NativeSession, ScanBss, TxPermission) {
+    let (session, bss, permission) = super::vht_tests::prepared(width, secure);
+    (alloc::boxed::Box::new(session), bss, permission)
+}
 
 /// AP HE Capabilities (ext 35) and HE Operation (ext 36).
 pub(super) fn he_elements(five: bool, color: Option<u8>) -> Vec<u8> {
@@ -30,15 +40,16 @@ fn mu_edca() -> Vec<u8> {
         255, 14, 38, 0, 0x03, 0xa4, 8, 0x27, 0xa4, 9, 0x42, 0x43, 10, 0x62, 0x32, 11,
     ]
 }
-fn prepared5(color: Option<u8>, edca: bool) -> (Session<Model>, ScanBss, TxPermission) {
+fn prepared5(color: Option<u8>, edca: bool) -> (NativeSession, ScanBss, TxPermission) {
     prepared5_with(color, edca, true)
 }
+#[inline(never)]
 fn prepared5_with(
     color: Option<u8>,
     edca: bool,
     secure: bool,
-) -> (Session<Model>, ScanBss, TxPermission) {
-    let (mut s, mut b, p) = super::vht_tests::prepared(2, secure);
+) -> (NativeSession, ScanBss, TxPermission) {
+    let (mut s, mut b, p) = prepared_vht(2, secure);
     let he = he_elements(true, color);
     b.information_elements.extend_from_slice(&he);
     let reply = s.backend.vht_reply.as_mut().unwrap();
@@ -175,7 +186,7 @@ kernel_test_in!(
 
 fn fallback() -> Result<(), &'static str> {
     // AP without HE: no request element, no HE records, HE PPDUs dropped.
-    let (mut s, b, p) = super::vht_tests::prepared(2, true);
+    let (mut s, b, p) = prepared_vht(2, true);
     if super::vht_tests::join(&mut s, &b, p, true) != Ok(42) || s.he_profile.is_some() {
         return Err("VHT-only association");
     }
@@ -359,7 +370,7 @@ fn windows() -> Result<(), &'static str> {
         run(s.disassociate_station()).map_err(|_| "HE oversize BA teardown")?;
     }
     // A non-HE (VHT) peer is bounded by IEEE80211_MAX_AMPDU_BUF_HT.
-    let (mut s, b, p) = super::vht_tests::prepared(2, false);
+    let (mut s, b, p) = prepared_vht(2, false);
     if super::vht_tests::join(&mut s, &b, p, false) != Ok(42) {
         return Err("VHT BA association");
     }
