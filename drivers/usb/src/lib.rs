@@ -76,6 +76,17 @@ pub fn register_initcalls() {
         );
         InitResult::Ok
     });
+    // Install devfs hooks so /dev/fp<N> nodes resolve for every
+    // bound fingerprint reader (#920). The provider lookup builds
+    // nodes on demand from the fingerprint registry, so no
+    // first-only special case remains.
+    narf_init::register(Stage::Subsys, "usb-fp-devfs", || {
+        narf_filesystem::devfs::install_fp_hooks(
+            crate::fingerprint::lookup_fp,
+            crate::fingerprint::enumerate_fp,
+        );
+        InitResult::Ok
+    });
     narf_init::register(Stage::Subsys, "usb-uac", || {
         uac::register_initcalls();
         InitResult::Ok

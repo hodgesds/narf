@@ -27,8 +27,13 @@
 //! 2. Discover the bulk-IN + bulk-OUT endpoints (Synaptics, Goodix) or
 //!    interrupt-IN endpoint (ELAN).
 //! 3. Configure those endpoints on the xHC.
-//! 4. Register a `/dev/fp0` character device in DevFs so a userspace
-//!    daemon (fprintd) can open it and drive the vendor protocol.
+//! 4. Publish one `/dev/fp<N>` character device per bound reader in
+//!    DevFs (provider registry, `lookup_fp` / `enumerate_fp`) so a
+//!    userspace daemon (fprintd) can open a reader by registry index
+//!    and drive the vendor protocol, including EP0 vendor control
+//!    transfers through the `FP_IOC_CTRL_TRANSFER` ioctl. Opens are
+//!    gated on the caller's `CAP_SYS_RAWIO` capability (see the
+//!    FileOps bridge below); the data plane is unchanged.
 //!
 //! Out of scope: enrolment, matching, image decoding, any vendor command.
 
@@ -361,17 +366,184 @@ pub fn with_device<R>(idx: usize, f: impl FnOnce(&FingerprintDevice) -> R) -> Op
 #[doc(hidden)]
 pub fn __reset_fp_for_test() {
     FP_DEVICES.lock().clear();
-    narf_filesystem::devfs::unregister_fp();
 }
 
-// ── /dev/fp0 FileOps bridge ───────────────────────────────────────────
+/// Test-only: construct a bound-reader record and push it into
+/// [`FP_DEVICES`], returning its registry index. The record carries
+/// no xHCI state; smokes drive the node through a fake transport
+/// (see `__test_fp_node`). Callers must pair this with
+/// `__reset_fp_for_test` — the registry is process-global and a
+/// leftover entry breaks the no-reader-on-QEMU smoke.
+#[doc(hidden)]
+pub fn __test_register_device(
+    slot_id: u8,
+    vendor: FpVendor,
+    bulk_in_ep: u8,
+    bulk_out_ep: u8,
+) -> usize {
+    let dev = Arc::new(FingerprintDevice {
+        slot_id,
+        vendor,
+        bulk_in_ep,
+        bulk_out_ep,
+        in_max_packet: 64,
+        armed: AtomicBool::new(false),
+    });
+    let mut g = FP_DEVICES.lock();
+    g.push(dev);
+    g.len() - 1
+}
 
-/// `FileOps` bridge for `/dev/fp0`. Reads map to `read_response`
-/// (one bulk-IN or interrupt-IN packet), writes map to
-/// `send_command` (one bulk-OUT packet). Offset is unused — the
-/// endpoint is a stream, not a seekable file.
+/// Test-only: build a `/dev/fp<N>` node for `dev` over an explicit
+/// transport, so smokes can drive the ioctl surface without silicon
+/// (production nodes come from `lookup_fp` with `XhciFpTransport`).
+#[doc(hidden)]
+pub fn __test_fp_node(
+    dev: Arc<FingerprintDevice>,
+    transport: Arc<dyn FpTransport>,
+) -> Arc<dyn narf_filesystem::FileOps> {
+    Arc::new(FpFileNode { dev, transport })
+}
+
+// ── Control-transfer transport seam ───────────────────────────────────
+
+/// The control-transfer operations the `/dev/fp<N>` ioctl surface
+/// needs from a bound reader. Production implements it over the
+/// global xHCI controller; fixtures implement it with a modelled
+/// device so the published surface is exercised without silicon
+/// (the CCID bridge's `CcidTransport` seam, same shape).
+pub trait FpTransport: Send + Sync {
+    /// EP0 control-IN transfer (device-to-host). `out` length must
+    /// equal the requested `w_length`; returns bytes actually read.
+    fn control_in<'a>(
+        &'a self,
+        slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        out: &'a mut [u8],
+    ) -> FpFuture<'a, Result<usize, FpError>>;
+    /// EP0 control-OUT transfer (host-to-device). Returns bytes
+    /// actually written; a short transfer is an error at the call
+    /// site, mirroring `send_command`'s full-transfer rule.
+    fn control_out<'a>(
+        &'a self,
+        slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        data: &'a [u8],
+    ) -> FpFuture<'a, Result<usize, FpError>>;
+}
+
+/// Boxed future returned by [`FpTransport`] methods.
+pub type FpFuture<'a, T> = core::pin::Pin<Box<dyn core::future::Future<Output = T> + Send + 'a>>;
+
+/// Production transport: bound reader driven over `xhci::controller()`.
+#[derive(Debug)]
+struct XhciFpTransport;
+
+impl FpTransport for XhciFpTransport {
+    fn control_in<'a>(
+        &'a self,
+        slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        out: &'a mut [u8],
+    ) -> FpFuture<'a, Result<usize, FpError>> {
+        Box::pin(async move {
+            let xhci = crate::xhci::controller().ok_or(FpError::EndpointConfig)?;
+            xhci.control_in(slot_id, bm_request_type, b_request, w_value, w_index, out)
+                .await
+                .map_err(|_| FpError::EndpointConfig)
+        })
+    }
+
+    fn control_out<'a>(
+        &'a self,
+        slot_id: u8,
+        bm_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        data: &'a [u8],
+    ) -> FpFuture<'a, Result<usize, FpError>> {
+        Box::pin(async move {
+            let xhci = crate::xhci::controller().ok_or(FpError::EndpointConfig)?;
+            xhci.control_out(slot_id, bm_request_type, b_request, w_value, w_index, data)
+                .await
+                .map_err(|_| FpError::EndpointConfig)
+        })
+    }
+}
+
+// ── /dev/fp<N> ioctl surface ──────────────────────────────────────────
+
+/// Linux capability number for raw hardware access
+/// (`include/uapi/linux/capability.h`: `CAP_SYS_RAWIO` = 17,
+/// "perform I/O port operations"). DESIGN CHOICE, not a spec claim:
+/// no Linux capability names fingerprint sensors; the raw sensor
+/// command channel — arbitrary vendor commands plus biometric image
+/// reads — is raw-hardware access, so it takes the raw-hardware
+/// capability rather than the catch-all `CAP_SYS_ADMIN` the PTY
+/// bridge uses for terminal administration.
+const CAP_SYS_RAWIO: u32 = 17;
+
+/// NARF-local ioctls, Linux `_IOC` encoding, type 'P' (0x50).
+/// 'C' is the CCID bridge's type and 'F' the ALSA helper's; 'P'
+/// collides with no in-tree ioctl family.
+const fn fp_ioc(nr: u32) -> u32 {
+    (0x50 << 8) | nr
+}
+
+/// EP0 vendor control transfer (see `FP_CTRL_ARG` layout below).
+/// Direction comes from `bm_request_type` bit 7. Returns the actual
+/// byte count; for IN transfers the count is also written back
+/// into the argument's `data_len` field.
+pub const FP_IOC_CTRL_TRANSFER: u32 = fp_ioc(0);
+
+/// Identify the reader behind this node. Returns a packed `u64`:
+/// bits 0..8 slot id, bits 8..16 vendor code (Synaptics = 0,
+/// Goodix = 1, ELAN = 2, in `FpVendor` declaration order),
+/// bits 16..24 bulk/interrupt-IN DCI, bits 24..32 bulk-OUT DCI
+/// (0 for ELAN). A daemon enumerating `/dev/fp<N>` nodes uses this
+/// to tell readers apart; the kernel does not store VID/PID on the
+/// device record, so those are not reported.
+pub const FP_IOC_GET_INFO: u32 = fp_ioc(1);
+
+/// Wire layout of the `FP_IOC_CTRL_TRANSFER` argument (24 bytes,
+/// little-endian, read through the ioctl context — never
+/// transmuted):
+/// `[0]` bm_request_type, `[1]` b_request, `[2..4]` w_value,
+/// `[4..6]` w_index, `[6..8]` reserved (ignored),
+/// `[8..12]` data_len (in: requested length; out: actual length),
+/// `[12..16]` reserved (ignored), `[16..24]` data_ptr (userspace
+/// buffer holding `data_len` bytes on entry for OUT, receiving the
+/// response for IN).
+const FP_CTRL_ARG_LEN: usize = 24;
+
+/// xHCI control data-stage cap: `control_in` / `control_out`
+/// reject longer buffers (`CmdFailed(0xF9)`), so the ioctl rejects
+/// longer requests up front with `InvalidData` instead of issuing
+/// a transfer the controller would refuse.
+const FP_CTRL_MAX_LEN: u32 = 4096;
+
+// ── /dev/fp<N> FileOps bridge ─────────────────────────────────────────
+
+/// `FileOps` bridge for one `/dev/fp<N>` node. Reads map to
+/// `read_response` (one bulk-IN or interrupt-IN packet), writes map
+/// to `send_command` (one bulk-OUT packet). Offset is unused — the
+/// endpoint is a stream, not a seekable file. Control transfers go
+/// through `ioctl_user` (async: they await USB transfers, so the
+/// synchronous `ioctl` keeps the trait default `Unsupported`,
+/// exactly like the CCID bridge).
 struct FpFileNode {
     dev: Arc<FingerprintDevice>,
+    transport: Arc<dyn FpTransport>,
 }
 
 impl core::fmt::Debug for FpFileNode {
@@ -429,6 +601,175 @@ impl narf_filesystem::FileOps for FpFileNode {
             mtime_cycles: 0,
         }
     }
+
+    /// Capability gate (audit §3: the scaffold's stated design is a
+    /// "cap-gated syscall/ioctl surface", but the shipped bridge had
+    /// no check — any opener could issue raw sensor commands).
+    /// Runs after DAC checks in `sys_open`: the caller must hold
+    /// `CAP_SYS_RAWIO`, for reads as well as writes, because reads
+    /// return biometric images and writes issue sensor commands.
+    /// Fail-closed: the hook answers false while userspace has not
+    /// installed it, so an ungated open can never slip through.
+    /// Returning `Ok(None)` keeps this node (no per-open clone
+    /// state: the device record is shared, as before).
+    fn open_instance_checked(
+        &self,
+        _write: bool,
+    ) -> Result<Option<Arc<dyn narf_filesystem::FileOps>>, narf_filesystem::FsError> {
+        if narf_filesystem::caller_capable(CAP_SYS_RAWIO) {
+            Ok(None)
+        } else {
+            Err(narf_filesystem::FsError::PermissionDenied)
+        }
+    }
+
+    /// Async ioctl surface: `FP_IOC_CTRL_TRANSFER` /
+    /// `FP_IOC_GET_INFO` (constants above carry the contract).
+    /// Validation order matters: the SETUP fields are checked
+    /// before any transfer is issued, so a malformed request can
+    /// never reach the device.
+    fn ioctl_user<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        ctx: &'a dyn narf_filesystem::IoctlContext,
+    ) -> narf_filesystem::FsFuture<'a, u64> {
+        let dev = self.dev.clone();
+        let transport = self.transport.clone();
+        Box::pin(async move {
+            match cmd {
+                FP_IOC_GET_INFO => {
+                    let vendor_code = match dev.vendor {
+                        FpVendor::Synaptics => 0u64,
+                        FpVendor::Goodix => 1u64,
+                        FpVendor::Elan => 2u64,
+                    };
+                    Ok(u64::from(dev.slot_id)
+                        | (vendor_code << 8)
+                        | (u64::from(dev.bulk_in_ep) << 16)
+                        | (u64::from(dev.bulk_out_ep) << 24))
+                }
+                FP_IOC_CTRL_TRANSFER => {
+                    use narf_filesystem::FsError;
+                    let mut raw = [0u8; FP_CTRL_ARG_LEN];
+                    ctx.read(arg, &mut raw)?;
+                    let bm_request_type = raw[0];
+                    let b_request = raw[1];
+                    let w_value = u16::from_le_bytes([raw[2], raw[3]]);
+                    let w_index = u16::from_le_bytes([raw[4], raw[5]]);
+                    let data_len = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+                    let data_ptr = u64::from_le_bytes([
+                        raw[16], raw[17], raw[18], raw[19], raw[20], raw[21], raw[22], raw[23],
+                    ]);
+                    // Only EP0 VENDOR requests to the DEVICE are
+                    // issuable here. Standard requests (including
+                    // SET_CONFIGURATION / SET_INTERFACE, which the
+                    // driver owns) and class/other-recipient
+                    // requests are rejected before any transfer:
+                    // the daemon must not reconfigure the device
+                    // out from under the driver.
+                    if bm_request_type & 0x60 != 0x40 || bm_request_type & 0x1F != 0x00 {
+                        return Err(FsError::Unsupported);
+                    }
+                    if data_len > FP_CTRL_MAX_LEN {
+                        return Err(FsError::InvalidData);
+                    }
+                    let fs_err = |_| FsError::Io(narf_block::BlockError::IOError);
+                    if bm_request_type & 0x80 != 0 {
+                        // IN: device-to-host. Short reads are normal
+                        // (the device returns fewer bytes); the
+                        // actual count goes back both as the return
+                        // value and in the argument's data_len.
+                        let mut buf = alloc::vec![0u8; data_len as usize];
+                        let n = transport
+                            .control_in(
+                                dev.slot_id,
+                                bm_request_type,
+                                b_request,
+                                w_value,
+                                w_index,
+                                &mut buf,
+                            )
+                            .await
+                            .map_err(fs_err)?;
+                        // A zero-length transfer has no data stage, so
+                        // the data pointer is never dereferenced (it
+                        // may be null for a length-0 request).
+                        if n > 0 {
+                            ctx.write(data_ptr, &buf[..n])?;
+                        }
+                        ctx.write(arg + 8, &(n as u32).to_le_bytes())?;
+                        Ok(n as u64)
+                    } else {
+                        // OUT: host-to-device. A short transfer is
+                        // an error, mirroring `send_command`'s
+                        // full-transfer rule.
+                        let mut data = alloc::vec![0u8; data_len as usize];
+                        if !data.is_empty() {
+                            ctx.read(data_ptr, &mut data)?;
+                        }
+                        let n = transport
+                            .control_out(
+                                dev.slot_id,
+                                bm_request_type,
+                                b_request,
+                                w_value,
+                                w_index,
+                                &data,
+                            )
+                            .await
+                            .map_err(fs_err)?;
+                        if n != data.len() {
+                            return Err(FsError::Io(narf_block::BlockError::IOError));
+                        }
+                        ctx.write(arg + 8, &(n as u32).to_le_bytes())?;
+                        Ok(n as u64)
+                    }
+                }
+                _ => Err(narf_filesystem::FsError::Unsupported),
+            }
+        })
+    }
+}
+
+/// Parse a devfs leaf name into a fingerprint registry index:
+/// exactly `fp<N>` with all-digit `N` (the CCID bridge's
+/// `ccid<N>` parse, same shape). Anything else is not a
+/// fingerprint node.
+fn parse_fp_name(name: &str) -> Option<usize> {
+    let digits = name.strip_prefix("fp")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Devfs provider lookup: `/dev/fp<N>` resolves to the bound
+/// reader at registry index `N`, or nothing when no such reader
+/// is bound. Nodes are built on demand from the registry, so
+/// every bound reader publishes — the first-only `/dev/fp0`
+/// special case is gone (#920).
+pub fn lookup_fp(name: &str) -> Option<Arc<dyn narf_filesystem::FileOps>> {
+    let idx = parse_fp_name(name)?;
+    let dev = FP_DEVICES.lock().get(idx)?.clone();
+    Some(Arc::new(FpFileNode {
+        dev,
+        transport: Arc::new(XhciFpTransport),
+    }) as Arc<dyn narf_filesystem::FileOps>)
+}
+
+/// Devfs provider enumeration: one `fp<N>` per bound reader, in
+/// registry order. Agrees with `lookup_fp` by construction, so
+/// readdir never advertises a phantom node.
+pub fn enumerate_fp() -> Vec<(alloc::string::String, narf_filesystem::FileType)> {
+    (0..FP_DEVICES.lock().len())
+        .map(|i| {
+            (
+                alloc::format!("fp{}", i),
+                narf_filesystem::FileType::Special,
+            )
+        })
+        .collect()
 }
 
 // ── Bind entry point ──────────────────────────────────────────────────
@@ -527,17 +868,13 @@ pub async fn try_bind_fingerprint_already_addressed(
         armed: AtomicBool::new(false),
     });
 
-    // Register /dev/fp0 (first device only for now — a dynamic
-    // naming scheme is deferred until devfs supports per-device
-    // lookup callbacks).
-    {
-        let idx = FP_DEVICES.lock().len();
-        if idx == 0 {
-            let node: Arc<dyn narf_filesystem::FileOps> = Arc::new(FpFileNode { dev: dev.clone() });
-            narf_filesystem::devfs::register_fp(node);
-        }
-    }
-
+    // No per-device registration here: publication is via the
+    // devfs provider registry (`lookup_fp` / `enumerate_fp`,
+    // installed by the `usb-fp-devfs` initcall), which resolves
+    // every bound reader as /dev/fp<N> by registry index. The
+    // provider mechanism is the per-device lookup callback the old
+    // first-only code was waiting on — it already existed for
+    // ccid/ttyUSB, so the deferred scheme is just fp joining it.
     FP_DEVICES.lock().push(dev);
     Ok(())
 }
