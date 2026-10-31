@@ -934,6 +934,15 @@ pub struct FsIoctlReply {
 pub trait IoctlContext: Sync {
     fn read(&self, address: u64, destination: &mut [u8]) -> Result<(), FsError>;
     fn write(&self, address: u64, source: &[u8]) -> Result<(), FsError>;
+    /// Atomic aligned user-fence access; byte-copy implementations must not
+    /// silently substitute a potentially torn qword. The syscall boundary
+    /// validates the range and contains faults on concurrent unmaps.
+    fn read_u64_acquire(&self, _address: u64) -> Result<u64, FsError> {
+        Err(FsError::Unsupported)
+    }
+    fn write_u64_release(&self, _address: u64, _value: u64) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
     fn nonblocking(&self) -> bool;
     /// Resolve a descriptor in the calling process without exposing its table
     /// to a driver. The retained open description also handles dup/fork.

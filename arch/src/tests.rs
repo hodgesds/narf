@@ -22,6 +22,31 @@ fn smoke_arch_backend() -> TestResult {
 }
 kernel_test_in!("arch", smoke_arch_backend);
 
+fn smoke_guarded_qword_ordering_alignment_and_faults() -> TestResult {
+    let mut value = 0x0123_4567_89ab_cdefu64;
+    let address = &mut value as *mut u64;
+    // SAFETY: owned aligned storage; raw invalid addresses below deliberately
+    // exercise fault containment in the kernel test's active address space.
+    unsafe {
+        assert_eq!(crate::access_user_u64_guarded(address, None), Ok(value));
+        assert_eq!(
+            crate::access_user_u64_guarded(address, Some(0xfedc_ba98_7654_3210)),
+            Ok(0xfedc_ba98_7654_3210)
+        );
+        assert_eq!(value, 0xfedc_ba98_7654_3210);
+        assert_eq!(crate::access_user_u64_guarded(address, None), Ok(value));
+        assert!(crate::access_user_u64_guarded((address as usize + 1) as *mut u64, None).is_err());
+        assert!(crate::access_user_u64_guarded(core::ptr::null_mut(), None).is_err());
+        assert!(crate::access_user_u64_guarded(core::ptr::null_mut(), Some(1)).is_err());
+        assert_eq!(crate::access_user_u64_guarded(address, None), Ok(value));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "arch/uaccess",
+    smoke_guarded_qword_ordering_alignment_and_faults
+);
+
 /// The *reported* backend matches what is actually enforced.
 ///
 /// `BACKEND` above is the architecture's nominal backend, a compile-time

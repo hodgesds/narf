@@ -1473,6 +1473,20 @@ not claimed.
 
 ## 19. Render UAPI and 3D admission (in progress)
 
+Production GuC owners now select native Xe on both render and primary opens.
+The new path implements Xe engine/memory/config/GT/HWCONFIG/topology queries,
+system GEM creation/mmap, persistent VM binding metadata, RCS0 and software
+bind queues, binary/timeline syncs, GPU and CPU user fences and masked waits.
+Its immutable per-execution PPGTT roots retain partial BO ranges and aliases;
+scratch/NULL mappings use shared hardware NULL tables with private path copies.
+Xe GPU ordering is explicit while terminal dma_resv fences exclude CPU copies.
+VM-attached BO identities cannot be exported or rebound to a different VM.
+Native queue priorities and timeslices reach the real GuC policy KLVs.
+Legacy backends retain the i915 compatibility profile described below.
+Native USERPTR, fault/long-running VMs, other engines, VRAM, scanout allocation
+and additional query/property families remain completion work. Mesa and
+physical execution remain separate acceptance gates.
+
 The public contract is `spec.md` §3, "Intel render UAPI and address-space
 admission". The modules are `intel_gpu_uapi` (wire definitions),
 `intel_gpu_gem` (owned system memory), `intel_gpu_render` (per-open dispatcher,
@@ -1818,7 +1832,7 @@ acceptance or a claim of complete acceleration.
 | Area | Current checkpoint | Still required |
 | --- | --- | --- |
 | GuC execution | Owned GGTT/PPGTT jobs, primed/persistent user RCS state, verified register policy, graphics-GT/RCS workarounds on MTL/Arrow, DG2 and BMG | Other engines, remaining out-of-band workarounds and silicon qualification |
-| Render UAPI | Per-open GEM/contexts/syncobjs, live RCS0 EXECBUFFER2/WR, implicit and explicit fd/binary/timeline fences including FENCE_SUBMIT, context loss/banning and fresh-epoch rebuild | Mesa interoperability |
+| Render UAPI | Native Xe queries/GEM/VM_BIND/RCS queues/EXEC/user fences; i915 compatibility with explicit fences; context loss and fresh-epoch rebuild | USERPTR, fault/long-running VMs, more queue/query families and Mesa interoperability |
 | Engines and platforms | Main-GT DSS/EU discovery and RCS0 kernel scheduling; separate Gen12 foundations | Fused engine/cache/media inventory, compute/copy/media submission and independently sourced profiles for other IP |
 | Memory and presentation | Owned system RAM, private tables and same-card CPU PRIME mappings | Local VRAM, accelerated PRIME/presentation and GPU/KMS synchronization |
 | Display | Gen12 paths and owned Xe-LPG internal-panel modeset | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |

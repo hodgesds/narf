@@ -782,7 +782,7 @@ impl FileOps for DriCardFile {
         if crate::drm_registry::driver_name(self.index) == Some("intel-gpu") {
             return Ok(intel_dma_buf_file(
                 self.index,
-                self.intel.gem.object(gem_handle)?,
+                self.intel.gem.export_object(gem_handle)?,
             ));
         }
         #[cfg(feature = "amdgpu")]
@@ -1717,7 +1717,7 @@ impl FileOps for DriRenderFile {
         if crate::drm_registry::driver_name(self.index) == Some("intel-gpu") {
             return Ok(intel_dma_buf_file(
                 self.index,
-                self.intel.gem.object(gem_handle)?,
+                self.intel.gem.export_object(gem_handle)?,
             ));
         }
         #[cfg(feature = "amdgpu")]

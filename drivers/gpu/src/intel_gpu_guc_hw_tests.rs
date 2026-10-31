@@ -735,10 +735,14 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     .insert(request[2], request[10] & !0xfff)
                     .is_none());
             }
-            0x100b => assert_eq!(
-                &request[2..],
-                &[0x20030001, 3, 0x20010001, 1000, 0x20020001, 500000]
-            ),
+            0x100b => {
+                assert!(matches!(request[3], 2 | 3));
+                assert!((1..=100_000).contains(&request[5]));
+                assert_eq!(
+                    [request[2], request[4], request[6], request[7]],
+                    [0x20030001, 0x20010001, 0x20020001, 500000]
+                );
+            }
             0x1001 => {
                 let id = request[1];
                 let base = registered[&id];
@@ -870,17 +874,20 @@ fn execute_ppgtt_probe(regs: &BTreeMap<u64, u32>, image: &[u32], ring: &[u32], i
     if pat == 3 {
         expected.extend_from_slice(&[0x11020001, 0x4208, 1, 0]);
     }
-    expected.extend_from_slice(&[0x02800100, 0x18800101, 0, 0x1234, 0x04000000]);
+    let has_batch = ring.windows(2).any(|w| w == [0x02800100, 0x18800101]);
+    if has_batch {
+        expected.extend_from_slice(&[0x02800100, 0x18800101, 0, 0x1234, 0x04000000]);
+    }
     if pat == 0 || pat == 3 {
         expected.extend_from_slice(&[0x7a000004, 1, 0xd0, 0, 0, 0]);
     }
+    expected.extend_from_slice(&[0x7a000204, 0x101010a1, 0, 0, 0, 0]);
+    let user_store = ring.windows(6).find(|w| w[0] == 0x10200003);
+    if let Some(store) = user_store {
+        assert_eq!(store[5], 0); // qword alignment NOP
+        expected.extend_from_slice(store);
+    }
     expected.extend_from_slice(&[
-        0x7a000204,
-        0x101010a1,
-        0,
-        0,
-        0,
-        0,
         0x7a000004,
         0x01104080,
         base + 0x800,
@@ -891,20 +898,35 @@ fn execute_ppgtt_probe(regs: &BTreeMap<u64, u32>, image: &[u32], ring: &[u32], i
         0x04000001,
         0x02800000,
     ]);
+    if expected.len() % 2 != 0 {
+        expected.push(0);
+    }
     assert_eq!(image[1031] as usize, expected.len() * 4);
     assert_eq!(&ring[..expected.len()], expected.as_slice());
     // Literal batch from xe_mi_commands.h, independent of the producer's codec.
-    let code = narf_memory::PhysAddr::new(walk(0x1234_0000_0000, false)).kernel_ptr::<u32>();
-    for (i, word) in [0x10000002, 0x80, 0x2345, 0x4e415246, 0x05000000, 0]
-        .into_iter()
-        .enumerate()
-    {
-        // SAFETY: translated page is owned by the resident fixture.
-        assert_eq!(unsafe { core::ptr::read_volatile(code.add(i)) }, word);
+    if has_batch {
+        let code = narf_memory::PhysAddr::new(walk(0x1234_0000_0000, false)).kernel_ptr::<u32>();
+        for (i, word) in [0x10000002, 0x80, 0x2345, 0x4e415246, 0x05000000, 0]
+            .into_iter()
+            .enumerate()
+        {
+            // SAFETY: translated page is owned by the resident fixture.
+            assert_eq!(unsafe { core::ptr::read_volatile(code.add(i)) }, word);
+        }
+        let target =
+            narf_memory::PhysAddr::new(walk(0x2345_0000_0080, true)).kernel_mut_ptr::<u32>();
+        // SAFETY: the validated writable leaf is an owned private result page.
+        unsafe { core::ptr::write_volatile(target, 0x4e415246) };
     }
-    let target = narf_memory::PhysAddr::new(walk(0x2345_0000_0080, true)).kernel_mut_ptr::<u32>();
-    // SAFETY: the validated writable leaf is an owned private result page.
-    unsafe { core::ptr::write_volatile(target, 0x4e415246) };
+    if let Some(store) = user_store {
+        let address = u64::from(store[1]) | u64::from(store[2]) << 32;
+        let value = u64::from(store[3]) | u64::from(store[4]) << 32;
+        assert_eq!(address & 7, 0);
+        let target = narf_memory::PhysAddr::new(walk(address, true)).kernel_mut_ptr::<u64>();
+        // SAFETY: the independent hardware walk resolved one owned aligned
+        // writable qword. This models the actual ring's PPGTT store.
+        unsafe { core::ptr::write_volatile(target, value) };
+    }
 }
 
 fn golden_memory(w: &Window) -> Words {

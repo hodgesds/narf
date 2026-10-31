@@ -786,6 +786,16 @@ pub mod intel_gpu_user;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_wm;
 #[cfg(feature = "intel")]
+mod intel_gpu_xe;
+#[cfg(feature = "intel")]
+mod intel_gpu_xe_query;
+#[cfg(feature = "intel")]
+mod intel_gpu_xe_sync;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_xe_uapi;
+#[cfg(feature = "intel")]
+mod intel_gpu_xe_vm;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_xelpg;
 pub mod nvidia_gpu;
 pub mod nvidia_gpu_disp;

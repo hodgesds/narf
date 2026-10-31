@@ -37,8 +37,25 @@ pub struct UserStatus {
     pub submission_version: (u8, u8, u8),
 }
 
+/// Observed PF/graphics-GT facts for the native Xe discovery ABI. Published
+/// before live admission; a PCI ID alone cannot supply the clock or GMD step.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DeviceFacts {
+    pub revision: u8,
+    pub graphics_version: u16,
+    pub graphics_step: u8,
+    pub reference_clock: u32,
+}
+
 pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn status(&self) -> Option<UserStatus>;
+    /// Stable ABI selection for this card, independent of temporary readiness.
+    fn native_xe(&self) -> bool {
+        false
+    }
+    fn device_facts(&self) -> Option<DeviceFacts> {
+        None
+    }
     /// Err means nothing was queued. Ok transfers ownership to the GT even
     /// if the calling future/fd/context handle is subsequently dropped.
     fn submit<'a>(
@@ -112,6 +129,7 @@ struct State {
     image: Vec<u32>,
     last: Option<Arc<CompletionFence>>,
     lost_pending: u32,
+    policy: (u32, u32),
 }
 
 #[derive(Debug)]
@@ -133,12 +151,31 @@ impl UserContext {
                 image: Vec::new(),
                 last: None,
                 lost_pending: 0,
+                policy: (3, 1000),
             }),
         })
     }
 
     pub(crate) fn last(&self) -> Option<Arc<CompletionFence>> {
         self.state.lock().last.clone()
+    }
+    pub(crate) fn configure_schedule(&self, priority: u32, timeslice: u32) -> Result<(), FsError> {
+        if !matches!(priority, 2 | 3) || !(1..=100_000).contains(&timeslice) {
+            return Err(FsError::InvalidData);
+        }
+        let mut state = self.state.lock();
+        if state.epoch != 0 || state.busy {
+            return Err(FsError::Busy);
+        }
+        state.policy = (priority, timeslice);
+        Ok(())
+    }
+    pub(crate) fn banned(&self) -> bool {
+        self.state.lock().banned
+    }
+    /// Close admission without fabricating terminal GPU completion.
+    pub(crate) fn request_ban(&self) {
+        self.state.lock().banned = true;
     }
     #[cfg(feature = "kernel-test")]
     pub(crate) fn busy(&self) -> bool {
@@ -255,6 +292,9 @@ pub(crate) struct UserJob {
     epoch: u64,
 }
 impl UserJob {
+    pub(crate) fn policy(&self) -> (u32, u32) {
+        self.context.state.lock().policy
+    }
     /// Called only after deregistration, exact-head/breadcrumb proof and the
     /// final TLB ACK, with device writes synchronized for the CPU.
     pub(crate) fn capture(&self, image: &impl GpuBacking) -> Result<(), FsError> {

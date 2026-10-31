@@ -24,6 +24,15 @@ That lives in `frame/`, `memory/`, `interrupts/`.
 
 ## 3. Public interface
 
+`access_user_u64_guarded(address, write)` performs one aligned atomic user
+qword access: `None` loads with acquire ordering, `Some(value)` stores with
+release ordering and returns that value. The unsafe caller validates the
+entire user range and owns the active syscall address space. Racing unmaps
+and unrecoverable page faults return `Err`; misalignment is rejected before
+access. The helper uses the existing per-CPU probe and IRQ restoration
+contract, including re-resolving the CPU after a healed x86 page fault.
+It never substitutes byte copies or a modifying operation for a load.
+
 Sketched shape:
 
 ```rust

@@ -100,13 +100,93 @@ suspend/resume acceptance remain separate hardware work.
 
 ### Intel render UAPI and address-space admission
 
-`intel_gpu_uapi` defines the Linux i915 ioctl wire numbers on both supported
-64-bit architectures. `intel_gpu_render::RenderFile` is per open on both the
+`intel_gpu_uapi` and `intel_gpu_xe_uapi` define Linux i915 and native Xe ioctl
+wire numbers on both supported 64-bit architectures.
+`intel_gpu_render::RenderFile` is per open on both the
 primary and render nodes; nested pointers use `IoctlContext`. Driver-private
 requests require the complete ioctl encoding (including direction and size).
 Generic DRM/KMS requests retain their existing dispatcher except VERSION:
-an execution-tested live userspace backend reports the i915 loader identity
-through fault-aware copies. Internal registry routing remains `intel-gpu`.
+an execution-tested live backend reports its selected loader identity through
+fault-aware copies. Production GuC cards select native `xe`; legacy backends
+retain the i915 compatibility profile. The selection is fixed by the backend,
+independent of temporary suspend/loss readiness, so colliding ioctl numbers
+cannot be decoded under a different ABI. Internal routing remains `intel-gpu`.
+
+#### Native Xe profile
+
+DEVICE_QUERY implements engines, system-memory regions, configuration, GT
+list, raw HWCONFIG, topology masks and GuC submission-interface version.
+It uses Xe's size-only/exact-size
+protocol; size-only calls never touch the payload pointer. Engine discovery
+publishes only live RCS0. Unavailable query types return EINVAL. DeviceFacts
+contains the actual PCI revision, validated graphics IP/step and the stable
+RPM_CONFIG0-derived timestamp clock. The GT owner samples it with current
+forcewake after its startup execution probes and publishes it before readiness.
+The firmware query validates its input subtype/reserved fields and reports
+the loaded CSS compatibility tuple; unavailable HuC remains ENODEV.
+No usable VRAM, low-latency, protected execution or fault-mode capability is
+advertised. BMG accepts/reports NO_COMPRESSION because every admitted binding
+uses an uncompressed coherent policy.
+
+GEM_CREATE uses system placement bit0, aligned nonzero sizes, WB CPU mappings
+and the common per-open/global storage limits below. As in Linux, a dGPU
+system-memory WC request uses WB mappings. VM-attached BOs carry a globally
+unique VM identity, bind only to that VM, and cannot be PRIME-exported. Other
+BOs retain same-card PRIME sharing. MMAP_OFFSET and common GEM_CLOSE preserve
+the common owned-frame lifetime; creation-copy faults publish no handle.
+
+VM_CREATE/DESTROY and EXEC_QUEUE_CREATE/DESTROY/GET_PROPERTY have independent
+per-open namespaces bounded at 64 VMs and 64 queues. Destroying a VM with open
+queues returns EBUSY. Queue destruction removes the handle and refuses pending
+admission while retaining every submitted residency until terminal completion.
+Width 1 RCS0 and software VM_BIND queues are supported. Property extension
+chains are bounded at 16 unique links. Low/normal Xe priorities map to GuC 3/2;
+elevated priority requires authority this interface does not grant (EPERM).
+Timeslices are bounded to 1..100000 microseconds; unknown properties, flags,
+instances and malformed reserved fields fail before publication.
+
+VM_BIND supports vector or inline MAP, UNMAP and UNMAP_ALL, partial-object
+mappings, overlap replacement and split ranges with retained object offsets.
+All handles and synchronization payloads are retained before waiting. A bind
+prepares a replacement mapping set without mutating the published VM, waits for
+its prior GPU users and then commits under an async VM mutex. Cancelled waits,
+bad vectors and failed user-fence copyout preserve the prior mapping set and
+do not publish output syncobjs. Zero-bind barriers support syncobj ordering.
+Limits are 4096 operations/mappings and 512 MiB of materialized VA per VM;
+scratch NULL intervals do not allocate one table per virtual page.
+
+SCRATCH_PAGE uses a private root and three shared NULL scratch levels; mapping
+a real page copies only its path. Missing VA reads zero and discards writes.
+BMG enables scratch by default, following Xe. NULL MAPs are supported; ordinary
+READONLY mappings retain hardware write protection. Only installed coherent WB
+PATs are admitted for BOs (DG2: 0; MTL/Arrow: 3/4; BMG: 1/2/4/5/7). NULL mappings
+do not resolve to host frame zero. The PPGTT walker reports WalkOutcome::Null,
+and reclamation frees shared scratch levels once, after private paths.
+
+EXEC snapshots the VM's bindings into private immutable PPGTT tables, retains
+all BOs and uses the same nonsecure GuC entry and context-state ownership as
+the compatibility profile. A zero-batch execution can still signal a user
+fence. Distinct queues may overlap on the same VM and BOs: Xe clients provide
+explicit GPU ordering. Every job still installs its terminal READ/WRITE fence
+in dma_resv under the shared CPU-admission gate, so kernel CPU copies wait for
+all conflicting GPU users. Compatibility submissions retain implicit conflict
+checks. Same-queue jobs remain ordered through the saved UserContext.
+
+Sync arrays admit at most 1024 binary/timeline/user entries. Inputs retain
+exact fence payloads; outputs retain the core after handle destruction.
+One output user fence is permitted. EXEC writes its qword GPU VA using the
+owned PPGTT MI_STORE_DATA_IMM after cache flush and before the private GGTT
+breadcrumb; VM_BIND reports a CPU user VA with the atomic release syscall hook
+immediately before its non-failing commit, under the VM mutex. Neither marker
+releases terminal reservations or page tables. WAIT_USER_FENCE uses atomic
+acquire reads, six masked comparisons, queue reset status and one retained
+relative/absolute monotonic deadline; relative timeouts write back remaining
+time. Polling awaits timers and holds no IRQ-safe guard across a sleep.
+USERPTR, long-running/fault VMs, multi-engine/parallel queues, scanout/WC iGPU
+allocations, observation and additional native Xe query/property families
+remain refused until their ownership and hardware contracts are implemented.
+
+#### i915 compatibility profile
 
 Implemented storage operations are GEM_CREATE/CREATE_EXT (system region only),
 CLOSE, PREAD/PWRITE, MMAP_OFFSET (WB system RAM only), linear GET/SET_TILING,
@@ -128,7 +208,7 @@ DMA_BUF_SET_NAME and EXPORT_SYNC_FILE use that shared state and the common
 fd reservation/copyout/install protocol. Foreign attachments and external
 sync-file imports remain unavailable.
 
-Both GuC and legacy Gen12 resident submissions atomically check every leaf's
+Compatibility-profile GuC and legacy Gen12 resident submissions check every leaf's
 reservation, reject conflicting work without partial reservation publication,
 then attach their terminal CompletionFence as READ or WRITE before cache
 publication. Read-only jobs may overlap. Independent LRCs have no shared ordered
@@ -5449,7 +5529,7 @@ terminate assembly; trailing spaces/NULs are trimmed only afterward, with
 wire offsets unchanged and interior NUL rejected (as ddcutil's reader).
 Concatenated two-hex feature codes and balanced structured value lists are
 accepted; nested values never establish feature support. Responses are at
-most38 bytes, capabilities at most1024 bytes; NULL/NACK/bad-frame retries
+most38 bytes, capabilities at most 1024 bytes; NULL/NACK/bad-frame retries
 are bounded to three, with scheduler delays respecting40ms Get and50ms
 capabilities/Set intervals. A new owner waits50ms before its first packet
 so local GPU reset never substitutes for the remote command interval.

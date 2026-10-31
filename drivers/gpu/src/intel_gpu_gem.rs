@@ -27,6 +27,7 @@ pub struct GemObject {
     frames: Vec<PhysFrame>,
     size: u64,
     offset: u64,
+    vm_owner: Option<u64>,
     /// Serializes kernel CPU copies; never forms references to mapped data.
     cpu: IrqSafeSpinLock<()>,
     pub(crate) dma_buf: DmaBufObject,
@@ -46,6 +47,7 @@ impl GemObject {
             frames: Vec::new(),
             size,
             offset,
+            vm_owner: None,
             cpu: IrqSafeSpinLock::new(()),
             dma_buf: DmaBufObject::new(),
         };
@@ -70,6 +72,10 @@ impl GemObject {
 
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    pub(crate) fn vm_owner(&self) -> Option<u64> {
+        self.vm_owner
     }
 
     pub fn pages(&self) -> impl Iterator<Item = u64> + '_ {
@@ -209,6 +215,25 @@ pub(crate) fn reserve_gpu(
     Ok(())
 }
 
+/// Xe GPU clients supply explicit ordering. Multiple GPU writers may overlap,
+/// but every terminal fence remains in dma_resv to exclude kernel CPU copies.
+pub(crate) fn reserve_gpu_explicit(
+    objects: &[(Arc<GemObject>, bool)],
+    completion: &Arc<crate::intel_gpu_fence::CompletionFence>,
+) {
+    let _gate = RESERVATIONS.lock();
+    for (object, write) in objects {
+        object.dma_buf.resv.add_fence(
+            completion.clone(),
+            if *write {
+                DmaResvUsage::Write
+            } else {
+                DmaResvUsage::Read
+            },
+        );
+    }
+}
+
 impl Drop for GemObject {
     fn drop(&mut self) {
         for frame in self.frames.drain(..) {
@@ -253,6 +278,15 @@ impl GemState {
         size: u64,
         report: impl FnOnce(u32, u64) -> Result<(), FsError>,
     ) -> Result<u32, FsError> {
+        self.create_for_vm(size, None, report)
+    }
+
+    pub(crate) fn create_for_vm(
+        &self,
+        size: u64,
+        owner: Option<u64>,
+        report: impl FnOnce(u32, u64) -> Result<(), FsError>,
+    ) -> Result<u32, FsError> {
         let size = size.checked_add(PAGE - 1).ok_or(FsError::InvalidData)? & !(PAGE - 1);
         if size == 0 || size > MAX_FILE_BYTES {
             return Err(FsError::InvalidData);
@@ -271,7 +305,9 @@ impl GemState {
                     .filter(|next| *next < 1 << 63)
             })
             .map_err(|_| FsError::OutOfMemory)?;
-        let object = Arc::new(GemObject::allocate(size, offset)?);
+        let mut object = GemObject::allocate(size, offset)?;
+        object.vm_owner = owner;
+        let object = Arc::new(object);
         let handle = handles.next;
         report(handle, size)?;
         handles.objects.insert(handle, object);
@@ -287,6 +323,14 @@ impl GemState {
             .get(&handle)
             .cloned()
             .ok_or(FsError::NotFound)
+    }
+
+    pub(crate) fn export_object(&self, handle: u32) -> Result<Arc<GemObject>, FsError> {
+        let object = self.object(handle)?;
+        if object.vm_owner.is_some() {
+            return Err(FsError::InvalidData);
+        }
+        Ok(object)
     }
 
     /// Same-card PRIME import. Reimporting the same object on an open returns

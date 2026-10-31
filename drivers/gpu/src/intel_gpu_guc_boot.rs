@@ -370,6 +370,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         self.config.device_id
     }
 
+    pub(crate) fn revision(&self) -> u8 {
+        self.config.revision
+    }
+
     pub(crate) fn configure_cache(
         &mut self,
         policy: crate::intel_gpu_gt_hw::CachePolicy,

@@ -608,3 +608,6 @@ kernel_test_in!(
 mod explicit {
     include!("intel_gpu_explicit_tests.rs");
 }
+mod xe {
+    include!("intel_gpu_xe_tests.rs");
+}

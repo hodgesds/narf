@@ -165,6 +165,35 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         self.parts.topology.as_deref()
     }
 
+    /// Sample the timestamp clock with current wake and stable GMD identity.
+    /// MIT xe_gt_clock.c: crystal selector[5:3], timestamp divisor[2:1].
+    pub fn device_facts(&mut self) -> Result<crate::intel_gpu_user::DeviceFacts, GtError> {
+        if self.user_epoch().is_none() {
+            return Err(GtError::State);
+        }
+        self.awake()?;
+        let window = self.parts.boot.window();
+        let ip = crate::intel_gpu_gt::GraphicsIp::read(window, self.parts.boot.platform())
+            .map_err(|_| GtError::Unavailable)?;
+        let rpm = window.read32(0xd00);
+        if rpm == u32::MAX || rpm != window.read32(0xd00) {
+            return Err(GtError::Unavailable);
+        }
+        let crystal = match (rpm >> 3) & 7 {
+            0 => 24_000_000,
+            1 => 19_200_000,
+            2 => 38_400_000,
+            3 => 25_000_000,
+            _ => return Err(GtError::Unavailable),
+        };
+        Ok(crate::intel_gpu_user::DeviceFacts {
+            revision: self.parts.boot.revision(),
+            graphics_version: ip.version,
+            graphics_step: ip.step,
+            reference_clock: crystal >> (3 - ((rpm >> 1) & 3)),
+        })
+    }
+
     pub(crate) fn topology_for_device(
         &mut self,
         device_id: u16,

@@ -12,6 +12,26 @@ struct DeviceIoctlContext {
 }
 
 impl narf_filesystem::IoctlContext for DeviceIoctlContext {
+    fn read_u64_acquire(&self, address: u64) -> Result<u64, narf_filesystem::FsError> {
+        validate_user_range(address, 8).map_err(|_| narf_filesystem::FsError::BadAddress)?;
+        if address & 7 != 0 {
+            return Err(narf_filesystem::FsError::InvalidData);
+        }
+        // SAFETY: validated user range, active syscall address space, guarded
+        // aligned access survives faults and concurrent unmaps.
+        unsafe { narf_arch::access_user_u64_guarded(address as *mut u64, None) }
+            .map_err(|_| narf_filesystem::FsError::BadAddress)
+    }
+    fn write_u64_release(&self, address: u64, value: u64) -> Result<(), narf_filesystem::FsError> {
+        validate_user_range(address, 8).map_err(|_| narf_filesystem::FsError::BadAddress)?;
+        if address & 7 != 0 {
+            return Err(narf_filesystem::FsError::InvalidData);
+        }
+        // SAFETY: same validated, fault-contained syscall contract as the load.
+        unsafe { narf_arch::access_user_u64_guarded(address as *mut u64, Some(value)) }
+            .map(|_| ())
+            .map_err(|_| narf_filesystem::FsError::BadAddress)
+    }
     fn read(&self, address: u64, destination: &mut [u8]) -> Result<(), narf_filesystem::FsError> {
         // SAFETY: this context is used only inside the calling syscall while
         // its address space is active. The helper validates and guards faults.

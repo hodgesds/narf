@@ -241,8 +241,9 @@ impl HardwareInit {
                 // Xe-LPG PAT3: WB L4, one-way coherent. PAT0, used by the
                 // inherited display, is deliberately not redefined.
                 mmio.write32(0x480c, 2);
-                // xe_pat.c: PAT2 is UC. Non-snooping Xe-LPG PPGTT walks
-                // use this policy independently of coherent WB leaf BOs.
+                mmio.write32(0x4810, 3); // Xe-LPG PAT4: two-way coherent WB
+                                         // xe_pat.c: PAT2 is UC. Non-snooping Xe-LPG PPGTT walks
+                                         // use this policy independently of coherent WB leaf BOs.
                 mmio.write32(0x4808, 0xc);
                 let global = [
                     0, 0x100, 0x100, 0x10c, 0x100, 0x10c, 0x100, 0x10c, 0x100, 0x10c, 0x100, 0x100,
@@ -271,7 +272,11 @@ impl HardwareInit {
                 0
             }
             GtPlatform::Battlemage => {
+                mmio.write32(0x4804, 0xe); // Xe2 coherent PAT1,4,5,7
                 mmio.write32(0x4808, 0xf); // Xe2 default WB PAT2: L3 WB, L4 UC, two-way coherent
+                mmio.write32(0x4810, 0x32);
+                mmio.write32(0x4814, 0x3e);
+                mmio.write32(0x481c, 0x33);
                 let table = [0xc, 0x10c, 0x130, 0x13c, 0x100];
                 for i in 0..16 {
                     mmio.write32(0x4000 + i as u64 * 4, *table.get(i).unwrap_or(&0x100));

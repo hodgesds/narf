@@ -108,6 +108,9 @@ impl ExecRequest {
             platform,
             address: self.batch_va,
             length: self.batch_len,
+            user_fence: None,
+            skip_batch: false,
+            implicit_sync: true,
         })
     }
 
@@ -297,9 +300,162 @@ pub struct ResidentBatch {
     platform: Option<GtPlatform>,
     address: u64,
     length: u64,
+    user_fence: Option<(u64, u64)>,
+    skip_batch: bool,
+    implicit_sync: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VmMapping {
+    pub object: Option<Arc<GemObject>>,
+    pub va: u64,
+    pub offset: u64,
+    pub length: u64,
+    pub writable: bool,
+    pub pat: u8,
 }
 
 impl ResidentBatch {
+    pub(crate) fn from_vm(
+        platform: GtPlatform,
+        mappings: &[VmMapping],
+        address: Option<u64>,
+        scratch: bool,
+        user_fence: Option<(u64, u64)>,
+    ) -> Result<Self, FsError> {
+        let (format, leaf_pat, table_pat) = match platform {
+            GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => {
+                (PteFormat::XeLpg, 3, 2)
+            }
+            GtPlatform::Alchemist => (PteFormat::Gen12, 0, 0),
+            GtPlatform::Battlemage => (PteFormat::XeLpg, 2, 2),
+            _ => return Err(FsError::NotImplemented),
+        };
+        if mappings.len() > 4096 {
+            return Err(FsError::OutOfMemory);
+        }
+        let mut bytes = 0u64;
+        for m in mappings {
+            if m.va % PAGE != 0
+                || m.length == 0
+                || m.length % PAGE != 0
+                || m.offset % PAGE != 0
+                || m.va.checked_add(m.length).is_none_or(|end| end > VA_SIZE)
+            {
+                return Err(FsError::InvalidData);
+            }
+            if let Some(object) = &m.object {
+                if m.offset
+                    .checked_add(m.length)
+                    .is_none_or(|end| end > object.size())
+                {
+                    return Err(FsError::InvalidData);
+                }
+            }
+            if m.object.is_some() || !scratch {
+                bytes = bytes.checked_add(m.length).ok_or(FsError::OutOfMemory)?;
+            }
+        }
+        if bytes > 512 * 1024 * 1024 {
+            return Err(FsError::OutOfMemory);
+        }
+        let length = if let Some(address) = address {
+            if address & 7 != 0 {
+                return Err(FsError::InvalidData);
+            }
+            let batch = mappings
+                .iter()
+                .find(|m| m.object.is_some() && address >= m.va && address < m.va + m.length)
+                .ok_or(FsError::InvalidData)?;
+            batch.va + batch.length - address
+        } else {
+            0
+        };
+        if let Some((addr, _)) = user_fence {
+            if addr & 7 != 0
+                || !mappings.iter().any(|m| {
+                    m.object.is_some()
+                        && m.writable
+                        && addr >= m.va
+                        && addr
+                            .checked_add(8)
+                            .is_some_and(|end| end <= m.va + m.length)
+                })
+            {
+                return Err(FsError::InvalidData);
+            }
+        }
+        let mut memory = FramePtMemory::new();
+        let tables = if scratch {
+            Ppgtt::with_scratch(&mut memory, format, table_pat, leaf_pat)
+        } else {
+            Ppgtt::with_table_pat(&mut memory, format, table_pat)
+        }
+        .map_err(map_error)?;
+        let mut space = AddressSpace {
+            tables: Some(tables),
+            memory,
+            objects: Vec::new(),
+        };
+        for mapping in mappings {
+            if let Some(object) = &mapping.object {
+                if let Some((_, writable)) = space
+                    .objects
+                    .iter_mut()
+                    .find(|(old, _)| Arc::ptr_eq(old, object))
+                {
+                    *writable |= mapping.writable;
+                } else {
+                    space.objects.push((object.clone(), mapping.writable));
+                }
+                for (i, phys) in object
+                    .pages()
+                    .skip((mapping.offset / PAGE) as usize)
+                    .take((mapping.length / PAGE) as usize)
+                    .enumerate()
+                {
+                    space
+                        .tables
+                        .as_mut()
+                        .expect("owned tables")
+                        .map_with_pat(
+                            &mut space.memory,
+                            mapping.va + i as u64 * PAGE,
+                            phys,
+                            mapping.pat,
+                            mapping.writable,
+                        )
+                        .map_err(map_error)?;
+                }
+            } else if !scratch {
+                for page in 0..mapping.length / PAGE {
+                    space
+                        .tables
+                        .as_mut()
+                        .expect("owned tables")
+                        .map_null(&mut space.memory, mapping.va + page * PAGE, mapping.pat)
+                        .map_err(map_error)?;
+                }
+            }
+        }
+        Ok(Self {
+            space,
+            format,
+            platform: Some(platform),
+            address: address.unwrap_or(0),
+            length,
+            user_fence,
+            skip_batch: address.is_none(),
+            implicit_sync: false,
+        })
+    }
+
+    pub(crate) fn user_fence(&self) -> Option<(u64, u64)> {
+        self.user_fence
+    }
+    pub(crate) fn skip_batch(&self) -> bool {
+        self.skip_batch
+    }
     pub fn format(&self) -> PteFormat {
         self.format
     }
@@ -321,7 +477,12 @@ impl ResidentBatch {
         &self,
         completion: &Arc<crate::intel_gpu_fence::CompletionFence>,
     ) -> Result<(), FsError> {
-        crate::intel_gpu_gem::reserve_gpu(&self.space.objects, completion)
+        if self.implicit_sync {
+            crate::intel_gpu_gem::reserve_gpu(&self.space.objects, completion)
+        } else {
+            crate::intel_gpu_gem::reserve_gpu_explicit(&self.space.objects, completion);
+            Ok(())
+        }
     }
 
     /// Tables are private and immutable; CPU WB mappings therefore need a

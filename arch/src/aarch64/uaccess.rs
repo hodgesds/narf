@@ -314,3 +314,55 @@ pub unsafe fn cmpxchg_user_guarded(uaddr: *mut u32, old: u32, new: u32) -> Resul
     }
     Ok(observed)
 }
+
+/// One aligned, fault-contained user qword load-acquire or store-release.
+/// `None` loads; `Some(value)` stores and returns that value.
+///
+/// # Safety
+/// The caller must validate the entire user range and run in the trapping
+/// task's address space, outside IRQ context. Racing unmaps return `Err`.
+pub unsafe fn access_user_u64_guarded(address: *mut u64, write: Option<u64>) -> Result<u64, ()> {
+    if address as usize & 7 != 0 {
+        return Err(());
+    }
+    let saved_daif: u64;
+    let recovery: u64;
+    // SAFETY: EL1 IRQ posture and the local recovery address.
+    unsafe {
+        asm!("mrs {d}, daif", d = out(reg) saved_daif, options(nomem, nostack, preserves_flags));
+        crate::aarch64::asm::disable_interrupts();
+        asm!("adr {r}, 96f", r = out(reg) recovery, options(nostack, preserves_flags));
+    }
+    set_guarded_copy_armed(true);
+    probe::arm(recovery);
+    let mut value = write.unwrap_or(0);
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: one aligned atomic access; an abort resumes at96 and the
+    // probe result discards the value. LDAR/STLR supply the ordering.
+    unsafe {
+        asm!(
+            "cbz {store:w}, 95f",
+            "stlr {v}, [{p}]",
+            "b 96f",
+            "95:",
+            "ldar {v}, [{p}]",
+            "96:",
+            p = in(reg) address,
+            store = in(reg) u32::from(write.is_some()),
+            v = inout(reg) value,
+            options(nostack),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+    let caught = probe::disarm();
+    set_guarded_copy_armed(false);
+    if saved_daif & (1 << 7) == 0 {
+        // SAFETY: restore the caller's IRQ posture.
+        unsafe { crate::aarch64::asm::enable_interrupts() };
+    }
+    if caught.fired {
+        Err(())
+    } else {
+        Ok(value)
+    }
+}

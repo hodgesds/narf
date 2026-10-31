@@ -79,6 +79,7 @@ struct Owner {
     suspended: AtomicBool,
     user_epoch: Arc<AtomicU64>,
     user_version: Arc<AtomicU32>,
+    user_facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
 }
 
 #[derive(Debug)]
@@ -87,9 +88,16 @@ struct Backend {
     epoch: Arc<AtomicU64>,
     version: Arc<AtomicU32>,
     platform: GtPlatform,
+    facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
 }
 
 impl crate::intel_gpu_user::UserBackend for Backend {
+    fn native_xe(&self) -> bool {
+        true
+    }
+    fn device_facts(&self) -> Option<crate::intel_gpu_user::DeviceFacts> {
+        *self.facts.lock()
+    }
     fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
         let epoch = self.epoch.load(Ordering::Acquire);
         let version = self.version.load(Ordering::Relaxed);
@@ -248,6 +256,7 @@ pub(crate) fn start_pending() {
             suspended: AtomicBool::new(false),
             user_epoch: Arc::new(AtomicU64::new(0)),
             user_version: Arc::new(AtomicU32::new(0)),
+            user_facts: Arc::new(IrqSafeSpinLock::new(None)),
         });
         let backend = Arc::new(Backend {
             owner: Arc::downgrade(&owner),
@@ -258,6 +267,7 @@ pub(crate) fn start_pending() {
                 owner.pending.device.id.device,
             )
             .expect("admitted platform"),
+            facts: owner.user_facts.clone(),
         });
         if owner.pending.card.install_user_backend(backend).is_err() {
             log(
@@ -495,6 +505,7 @@ impl Owner {
                         .verify()
                         .map_err(|_| RuntimeError::State)?;
                     state.probe_result = None;
+                    *self.user_facts.lock() = Some(gt.device_facts().map_err(RuntimeError::Gt)?);
                     state.phase = Phase::Running;
                     let (major, minor, patch) = gt.submission_version();
                     self.user_version.store(

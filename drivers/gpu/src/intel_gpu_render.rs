@@ -1,7 +1,8 @@
 //! Intel render-node UAPI over per-open GEM/context/VM namespaces.
 //!
-//! Xe-LP and Xe-LPG share the i915 userspace wire ABI. Submission admission is
-//! independent of display admission: a working panel is not an initialized GT.
+//! Production GuC cards select the native Xe ABI; the i915 compatibility
+//! profile remains available to legacy backends. Submission admission is
+//! independent of display admission.
 //! Unsupported acceleration is reported as such, never as a completed job.
 
 use alloc::borrow::Cow;
@@ -75,6 +76,13 @@ impl DeviceInfo {
     /// completion and reset/loss handling are installed by the GT owner.
     pub fn submission_ready(&self) -> bool {
         self.user_status().is_some()
+    }
+    pub fn native_xe(&self) -> bool {
+        self.platform.guc().is_some()
+            && self
+                .backend
+                .as_ref()
+                .is_some_and(|backend| backend.native_xe())
     }
 
     fn user_status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
@@ -209,6 +217,7 @@ pub struct RenderFile {
     pub gem: GemState,
     pub(crate) syncobjs: IrqSafeSpinLock<crate::drm::syncobj::SyncObjTable>,
     namespaces: IrqSafeSpinLock<Namespaces>,
+    xe: crate::intel_gpu_xe::XeFile,
 }
 
 impl Default for RenderFile {
@@ -221,6 +230,7 @@ impl RenderFile {
     pub const fn new() -> Self {
         Self {
             gem: GemState::new(),
+            xe: crate::intel_gpu_xe::XeFile::new(),
             syncobjs: IrqSafeSpinLock::new(crate::drm::syncobj::SyncObjTable::new()),
             namespaces: IrqSafeSpinLock::new(Namespaces {
                 next_context: 1,
@@ -273,9 +283,6 @@ impl RenderFile {
         arg: u64,
         user: &dyn IoctlContext,
     ) -> Option<Result<u64, FsError>> {
-        if matches!(cmd, abi::GEM_EXECBUFFER2 | abi::GEM_EXECBUFFER2_WR) {
-            return Some(self.exec_ioctl(info, arg, user).await);
-        }
         if crate::drm_uapi::ioc_type(cmd) == b'd' as u32
             && crate::drm::syncobj_ioctl::is_syncobj_ioctl(crate::drm_uapi::ioc_nr(cmd))
         {
@@ -287,6 +294,23 @@ impl RenderFile {
                 user,
             )
             .await;
+        }
+        if info.native_xe() {
+            if matches!(
+                cmd,
+                crate::intel_gpu_xe_uapi::VM_BIND
+                    | crate::intel_gpu_xe_uapi::EXEC
+                    | crate::intel_gpu_xe_uapi::WAIT_USER_FENCE
+            ) {
+                return self
+                    .xe
+                    .dispatch_user(info, cmd, arg, user, &self.gem, &self.syncobjs)
+                    .await;
+            }
+            return self.dispatch(info, cmd, arg, user);
+        }
+        if matches!(cmd, abi::GEM_EXECBUFFER2 | abi::GEM_EXECBUFFER2_WR) {
+            return Some(self.exec_ioctl(info, arg, user).await);
         }
         if cmd == abi::GEM_THROTTLE {
             let fences: Vec<_> = {
@@ -498,7 +522,9 @@ impl RenderFile {
         user: &dyn IoctlContext,
     ) -> Option<Result<u64, FsError>> {
         if cmd == crate::drm_uapi::DRM_IOCTL_VERSION && info.submission_ready() {
-            return Some(version(arg, user).map(|()| 0));
+            return Some(
+                version(arg, user, if info.native_xe() { b"xe" } else { b"i915" }).map(|()| 0),
+            );
         }
         if cmd == crate::drm_uapi::DRM_IOCTL_GET_CAP {
             let result = (|| {
@@ -515,6 +541,9 @@ impl RenderFile {
                 Ok(Some(value)) => return Some(Ok(value)),
                 Err(error) => return Some(Err(error)),
             }
+        }
+        if info.native_xe() {
+            return self.xe.dispatch(info, cmd, arg, user, &self.gem);
         }
         let nr = crate::drm_uapi::ioc_nr(cmd);
         if crate::drm_uapi::ioc_type(cmd) != b'd' as u32 {
@@ -844,6 +873,12 @@ fn cpu_domain_write(cmd: u32, request: &[u8]) -> Result<bool, FsError> {
 /// ioctls. Userspace FileOps::ioctl_user supplies its fault-contained context.
 pub(crate) struct GuardedIoctl;
 impl IoctlContext for GuardedIoctl {
+    fn read_u64_acquire(&self, address: u64) -> Result<u64, FsError> {
+        atomic_user(address, None)
+    }
+    fn write_u64_release(&self, address: u64, value: u64) -> Result<(), FsError> {
+        atomic_user(address, Some(value)).map(|_| ())
+    }
     fn read(&self, address: u64, destination: &mut [u8]) -> Result<(), FsError> {
         // SAFETY: called only in the ioctl trap context, like the shared bridge.
         let bytes =
@@ -858,6 +893,19 @@ impl IoctlContext for GuardedIoctl {
     fn nonblocking(&self) -> bool {
         false
     }
+}
+
+fn atomic_user(address: u64, write: Option<u64>) -> Result<u64, FsError> {
+    if address == 0 || address.checked_add(8).is_none_or(|end| end > 1 << 47) {
+        return Err(FsError::BadAddress);
+    }
+    if address & 7 != 0 {
+        return Err(FsError::InvalidData);
+    }
+    // SAFETY: the internal ioctl adapter is used only in the trapping task's
+    // address space; range/alignment are validated and the access is guarded.
+    unsafe { narf_arch::access_user_u64_guarded(address as *mut u64, write) }
+        .map_err(|_| FsError::BadAddress)
 }
 
 fn read(user: &dyn IoctlContext, address: u64, size: usize) -> Result<Vec<u8>, FsError> {
@@ -945,13 +993,13 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
 
 // The internal registry identity remains intel-gpu. A live i915-compatible
 // render UAPI exposes the loader name through fault-aware userspace copies.
-fn version(arg: u64, user: &dyn IoctlContext) -> Result<(), FsError> {
+fn version(arg: u64, user: &dyn IoctlContext, name: &[u8]) -> Result<(), FsError> {
     let mut request = read(user, arg, 64)?;
     put32(&mut request, 0, 1);
     put32(&mut request, 4, 6);
     put32(&mut request, 8, 0);
     for (offset, value) in [
-        (16, b"i915".as_slice()),
+        (16, name),
         (32, b"".as_slice()),
         (48, b"NARF Intel RCS".as_slice()),
     ] {

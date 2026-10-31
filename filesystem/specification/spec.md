@@ -1380,6 +1380,12 @@ result, including reset before submission. This optional milestone does not
 change poll, bounded wait, reservation/CPU-access ordering or reclamation.
 syncobj imports/exports preserve the original native leaf and its milestone.
 
+`IoctlContext::read_u64_acquire` / `write_u64_release` provide aligned atomic
+user-fence access with fault containment. Their default is `Unsupported`;
+implementations must not replace them with potentially torn byte copies.
+The syscall boundary validates the user range and calls the architecture's
+guarded qword primitive while the caller's address space is active.
+
 `dma_buf` is the generic dma-buf core, mirroring Linux `drivers/dma-buf/`.
 An exporter owns one `DmaBufObject` per underlying buffer, shared by every fd
 and handle naming that buffer, and forwards `FileOps::ioctl_user` to

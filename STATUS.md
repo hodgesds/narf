@@ -940,8 +940,26 @@ interfaces and limits.
 
 ## Current work
 
-The current Intel branch now implements userspace RCS0 submission on MTL/Arrow
-Xe-LPG, Alchemist and Battlemage. Async i915 EXECBUFFER2/WR uses copied softpin
+The Intel continuation now selects the native Xe ABI on production GuC cards.
+Per-open VM and execution-queue namespaces support transactional vector/inline
+binds, partial-object mappings, overlap replacement, UNMAP_ALL, sparse NULL
+scratch trees and VM-private BOs. Explicit binary/timeline syncs retain payloads
+through handle destruction; zero-bind barriers and zero-batch executions are
+supported. Executions preserve private PPGTT/context ownership and publish
+terminal reservations for every CPU conflict while allowing explicitly ordered
+queues to overlap. GPU user fences use an owned PPGTT qword store after cache
+flush; CPU bind fences and masked waits use guarded atomic qword access on both
+architectures. Discovery reports observed engines, memory, GT/IP/clock facts,
+HWCONFIG, topology and the loaded GuC submission-interface version. Queue
+priority/timeslice policies reach the actual GuC KLV request. Native Rust tests
+exercise the ioctl-to-hardware ownership path, bind cancellation, handle close,
+concurrent queues, user-fence visibility and transactional copyout failures.
+This does not establish Mesa or physical Intel acceptance. USERPTR, fault/LR
+VMs, iGPU WC/incoherent mappings, other engines, local VRAM, accelerated
+presentation, IRQ completion and runtime autosuspend remain outstanding.
+
+The existing compatibility profile implements userspace RCS0 submission on
+MTL/Arrow Xe-LPG, Alchemist and Battlemage. Async i915 EXECBUFFER2/WR uses copied softpin
 residency, per-open ordered contexts, implicit GEM/PRIME reservations and the
 live GT owner. Private context images preserve saved state between retired
 jobs; kernel rings/images/tables remain outside user mappings. Hardware
@@ -969,7 +987,8 @@ dependencies until proven reset. Invalid input-flag combinations and bad fds
 fail before publication; HAS_EXEC_SUBMIT_FENCE follows live readiness.
 Intel silicon and Mesa OpenGL/Vulkan acceptance, other engines,
 local VRAM and accelerated presentation remain outstanding.
-Validation passes 112 selected Intel/DRM tests on x86_64 and 100 on aarch64,
+The preceding FENCE_SUBMIT checkpoint passed 112 selected Intel/DRM tests on
+x86_64 and 100 on aarch64,
 including five FENCE_SUBMIT smokes, seven explicit-fence/ID-recycling smokes
 and twelve existing DRM synchronization tests on x86_64, with zero
 failures/skips. GPU and filesystem CI Clippy pass all three feature contexts

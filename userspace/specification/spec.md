@@ -25,6 +25,12 @@ applications above NARF.
 
 ## 3. Public interface
 
+Device ioctl contexts implement the filesystem's atomic aligned qword
+load-acquire/store-release hooks using `narf_arch::access_user_u64_guarded`.
+The syscall boundary validates the full user range before entering the
+fault-contained access, including on racing unmaps. User-fence reads and
+writes do not pass through the byte-copy helpers.
+
 Blocking poll/ppoll and select/pselect distinguish providers with a durable
 readiness arm or broadcast notification from silent legacy providers (such
 as serial ttys). A set containing a silent provider sleeps to a recheck no

@@ -428,7 +428,33 @@ impl<A: BootAllocator> GuCScheduler<A> {
             // xe_lrc.c::xe_lrc_set_ppgtt: PDP0 on DG2/MTL, PTBP on Xe2.
             image.write32(REGS + 0x31 * 4, (root >> 32) as u32);
             image.write32(REGS + 0x33 * 4, root as u32);
-            resident_ring(self.platform, batch.address(), image.ggtt_offset(), stamp)
+            let mut words = resident_ring(
+                self.platform,
+                (!batch.skip_batch()).then_some(batch.address()),
+                image.ggtt_offset(),
+                stamp,
+            );
+            if let Some((address, value)) = batch.user_fence() {
+                // MIT xe_ring_ops.c::emit_store_imm_ppgtt_posted: qword
+                // PPGTT store after the render-cache flush, before the owned
+                // GGTT breadcrumb. ResidentBatch validated writable residency.
+                let before_breadcrumb = words
+                    .windows(2)
+                    .position(|v| v == [0x7a000004, 0x01104080])
+                    .expect("owned completion stream");
+                words.splice(
+                    before_breadcrumb..before_breadcrumb,
+                    [
+                        0x10200003,
+                        address as u32,
+                        (address >> 32) as u32,
+                        value as u32,
+                        (value >> 32) as u32,
+                        0,
+                    ],
+                );
+            }
+            words
         } else {
             alloc::vec![
                 0x04000001,
@@ -583,7 +609,15 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 ),
                 Phase::Policy => (
                     0x100b,
-                    alloc::vec![id, 0x20030001, 3, 0x20010001, 1000, 0x20020001, 500000],
+                    {
+                        let (priority, timeslice) = context
+                            .user
+                            .as_ref()
+                            .map_or((3, 1000), |user| user.policy());
+                        alloc::vec![
+                            id, 0x20030001, priority, 0x20010001, timeslice, 0x20020001, 500000
+                        ]
+                    },
                     Phase::Enable,
                 ),
                 Phase::Enable => (0x1001, alloc::vec![id, 1], Phase::Enabling),
@@ -779,18 +813,20 @@ fn overlap(a: &impl GpuBacking, b: &impl GpuBacking) -> bool {
 /// precedes the separate GGTT post-sync completion write. MTL needs AuxCCS
 /// invalidation; DG2 and Xe-LPG need the extra
 /// depth flush (Wa_14016712196). All tails are qword aligned.
-fn resident_ring(platform: GtPlatform, batch: u64, image: u32, seq: u32) -> Vec<u32> {
+fn resident_ring(platform: GtPlatform, batch: Option<u64>, image: u32, seq: u32) -> Vec<u32> {
     let mut words = alloc::vec![0x04000001, 0x02800101, 0x7a000404, 0x20344c1c, 0xd0, 0, 0, 0,];
     if matches!(platform, GtPlatform::Integrated(_)) {
         words.extend_from_slice(&[0x11020001, 0x4208, 1, 0]);
     }
-    words.extend_from_slice(&[
-        0x02800100,
-        0x18800101,
-        batch as u32,
-        (batch >> 32) as u32,
-        0x04000000,
-    ]);
+    if let Some(batch) = batch {
+        words.extend_from_slice(&[
+            0x02800100,
+            0x18800101,
+            batch as u32,
+            (batch >> 32) as u32,
+            0x04000000,
+        ]);
+    }
     render_completion(platform, image, seq, &mut words);
     words
 }
