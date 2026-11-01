@@ -1518,6 +1518,102 @@ narf_kernel_test::kernel_test_in!(
     smoke_evdev_identity_aliases_and_uinput_setup
 );
 
+// ── USB identity publication (issue #874) ───────────────────────────────────
+// A USB HID device whose caps carry descriptor identity (BUS_USB +
+// idVendor/idProduct/bcdDevice, product name, usb-{port} phys) must
+// surface by-id / by-path aliases built from that identity — not from
+// the synthetic fallback. Two identical devices on different ports
+// share one by-id alias (uniq is empty, mirroring I2C-HID) but must
+// get DISTINCT by-path aliases: a name-only identity would collide.
+fn smoke_evdev_usb_identity_aliases() -> narf_kernel_test::TestResult {
+    use narf_input::evdev::{bus, DeviceCaps, InputId, ROUTER};
+    use narf_kernel_test::TestResult;
+
+    // Mouse 1: Logitech receiver on root port 2.
+    let mut caps = DeviceCaps::new();
+    caps.set_identity(
+        "Logitech USB Receiver",
+        "usb-2",
+        "",
+        InputId::new(bus::USB, 0x046D, 0xC52B, 0x0111),
+    );
+    caps.add_rel(narf_input::evdev::rel::REL_X);
+    caps.add_rel(narf_input::evdev::rel::REL_Y);
+    caps.add_key(narf_input::evdev::key::BTN_LEFT);
+    let (id1, _node) = ROUTER.register_device(caps);
+
+    // Mouse 2: identical vendor/product/name, different port.
+    let mut caps2 = DeviceCaps::new();
+    caps2.set_identity(
+        "Logitech USB Receiver",
+        "usb-3",
+        "",
+        InputId::new(bus::USB, 0x046D, 0xC52B, 0x0111),
+    );
+    caps2.add_rel(narf_input::evdev::rel::REL_X);
+    caps2.add_rel(narf_input::evdev::rel::REL_Y);
+    caps2.add_key(narf_input::evdev::key::BTN_LEFT);
+    let (id2, _node) = ROUTER.register_device(caps2);
+
+    let mut fail: Option<&str> = None;
+    let dir = DevInputDir;
+    let names: Vec<String> = dir.enumerate(0, 64).into_iter().map(|(n, _)| n).collect();
+    if !names.iter().any(|n| n == "by-id") || !names.iter().any(|n| n == "by-path") {
+        fail = Some("/dev/input must enumerate by-id and by-path");
+    }
+    let mut by_id_alias: Option<String> = None;
+    if fail.is_none() {
+        match dir.lookup_dir("by-id") {
+            Some(d) => {
+                let aliases: Vec<String> = d.enumerate(0, 64).into_iter().map(|(n, _)| n).collect();
+                by_id_alias = aliases
+                    .iter()
+                    .find(|n| n.contains("046d-c52b") && n.ends_with("-event-mouse"))
+                    .cloned();
+                if by_id_alias.is_none() {
+                    fail = Some("by-id USB mouse alias missing");
+                }
+            }
+            None => fail = Some("by-id directory missing"),
+        }
+    }
+    if fail.is_none() {
+        match dir.lookup_dir("by-path") {
+            Some(d) => {
+                let by_path_aliases: Vec<String> =
+                    d.enumerate(0, 64).into_iter().map(|(n, _)| n).collect();
+                if !by_path_aliases
+                    .iter()
+                    .any(|n| n.starts_with("usb-2") && n.ends_with("-event-mouse"))
+                {
+                    fail = Some("by-path alias for port-2 mouse missing");
+                } else if !by_path_aliases
+                    .iter()
+                    .any(|n| n.starts_with("usb-3") && n.ends_with("-event-mouse"))
+                {
+                    fail = Some("by-path alias for port-3 mouse missing");
+                }
+            }
+            None => fail = Some("by-path directory missing"),
+        }
+    }
+    if fail.is_none() {
+        // The shared by-id alias must resolve to a symlink.
+        let by_id = dir.lookup_dir("by-id").expect("by-id checked above");
+        match by_id.lookup(by_id_alias.as_deref().unwrap_or("")) {
+            Some(f) if f.stat().mode.file_type == FileType::Symlink => {}
+            _ => fail = Some("by-id alias must resolve to a symlink"),
+        }
+    }
+    ROUTER.unregister_device(id1);
+    ROUTER.unregister_device(id2);
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+narf_kernel_test::kernel_test_in!("filesystem/devfs_input", smoke_evdev_usb_identity_aliases);
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

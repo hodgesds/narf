@@ -43,6 +43,7 @@ use narf_input::{
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::hid::{
+    identity::{apply_identity, resolve_usb_identity},
     usage_to_keycode, HidError, HID_BOOT_PROTOCOL, HID_REPORT_PROTOCOL, HID_REQ_SET_IDLE,
     HID_REQ_SET_PROTOCOL,
 };
@@ -407,6 +408,8 @@ pub async fn try_bind_keyboard_already_addressed(
     slot_id: u8,
     interface_num: u8,
     interrupt_in_dci: u8,
+    port: u8,
+    hub_port: Option<(u8, u8)>,
 ) -> Result<(), HidError> {
     // SET_PROTOCOL(Boot): wValue=0.
     xhci_dev
@@ -439,7 +442,18 @@ pub async fn try_bind_keyboard_already_addressed(
         .map_err(HidError::Xhci)?;
 
     // Register with the evdev ROUTER. Mirrors i8042.rs::init().
-    let (evdev_id, evdev_node) = ROUTER.register_device(keyboard_evdev_caps());
+    // Identity (#874) is best-effort: on descriptor-fetch failure
+    // the synthetic caps below stand and the bind proceeds. Note
+    // the live boot-keyboard path (hid::BootKeyboard) feeds the
+    // shared input ring and owns no evdev node by design, so this
+    // evdev-registering path is the only keyboard caps site.
+    let mut caps = keyboard_evdev_caps();
+    if let Some(id) =
+        resolve_usb_identity(xhci_dev, slot_id, port, hub_port, "USB HID Keyboard").await
+    {
+        apply_identity(&mut caps, &id);
+    }
+    let (evdev_id, evdev_node) = ROUTER.register_device(caps);
 
     let kbd = UsbKeyboard {
         slot_id,
