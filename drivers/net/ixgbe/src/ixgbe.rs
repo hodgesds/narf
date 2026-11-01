@@ -17,7 +17,15 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 
+use crate::ixgbe::queues::RegBank;
+
+pub mod ethtool;
+pub mod pm;
+pub mod queues;
+pub mod rss;
 mod tests;
+pub mod vlan;
+pub mod wol;
 
 // ── PCI device IDs ─────────────────────────────────────────────────
 
@@ -51,10 +59,8 @@ pub(crate) const REG_EERD: u64 = 0x10010;
 pub(crate) const REG_EICR: u64 = 0x00800;
 pub(crate) const REG_EIMS: u64 = 0x00880;
 pub(crate) const REG_EIMC: u64 = 0x00888;
-pub(crate) const REG_GPIE: u64 = 0x00A50;
-pub(crate) const REG_EIAM: u64 = 0x00A90;
-pub(crate) const REG_IVAR0: u64 = 0x01000; // 64 IVARs, stride 4
-pub(crate) const REG_IVAR_MISC: u64 = 0x011E0; // OTHER_CAUSES_IVAR
+pub(crate) const REG_GPIE: u64 = 0x00898;
+pub(crate) const REG_EIAM: u64 = 0x00890;
 
 pub(crate) const REG_FCTRL: u64 = 0x05080;
 pub(crate) const REG_RAL0: u64 = 0x0A200; // 82599 receive-address regs §8.2.3.7.9
@@ -62,21 +68,11 @@ pub(crate) const REG_RAH0: u64 = 0x0A204;
 pub(crate) const REG_RXCTRL: u64 = 0x03000;
 pub(crate) const REG_LINKS: u64 = 0x04200;
 
-// 82599 RX queue 0 register block. §8.2.3.8 — stride 0x40 per queue.
-pub(crate) const RX_RDBAL: u64 = 0x01000;
-pub(crate) const RX_RDBAH: u64 = 0x01004;
-pub(crate) const RX_RDLEN: u64 = 0x01008;
-pub(crate) const RX_RDH: u64 = 0x01010;
+// Queue-0 tail pointers still used directly by the tx/rx paths; all
+// other queue registers come from queues::rx_queue_regs/tx_queue_regs
+// (datasheet §8.2, stride 0x40 per queue).
 pub(crate) const RX_RDT: u64 = 0x01018;
-pub(crate) const RX_RXDCTL: u64 = 0x01028;
-pub(crate) const RX_SRRCTL: u64 = 0x01014;
-
-pub(crate) const TX_TDBAL: u64 = 0x06000;
-pub(crate) const TX_TDBAH: u64 = 0x06004;
-pub(crate) const TX_TDLEN: u64 = 0x06008;
-pub(crate) const TX_TDH: u64 = 0x06010;
 pub(crate) const TX_TDT: u64 = 0x06018;
-pub(crate) const TX_TXDCTL: u64 = 0x06028;
 
 // CTRL bits (§8.2.3.1.1).
 pub(crate) const CTRL_RST_MASK: u32 = (1 << 26) | (1 << 3); // RST | LRST
@@ -321,10 +317,22 @@ pub struct Ixgbe {
     /// MAC read from the EEPROM at bring-up.
     pub mac: [u8; 6],
     /// True after the MAC was successfully programmed into RAH/RAL
-    /// and LINKS reports up.
-    pub link_up: bool,
+    /// and LINKS reports up. Locked: resume() refreshes it via &self.
+    pub link_up: IrqSafeSpinLock<bool>,
     /// Recorded device id (drives `name()`).
     pub did: u16,
+    /// Live queue configuration (multi-queue keystone: 1/1 at
+    /// bring-up; register addressing + IVAR routing cover up to 64).
+    pub queue_config: queues::QueueConfig,
+    /// Programmed RSS state, if `configure_rss` ran.
+    pub rss_cfg: IrqSafeSpinLock<Option<rss::IxgbeRss>>,
+    /// Programmed VLAN filter, if `configure_vlan` ran.
+    pub vlan_filter: IrqSafeSpinLock<Option<vlan::VlanFilter>>,
+    /// Armed WoL config, if `configure_wol` ran and was not disarmed.
+    pub wol_armed: IrqSafeSpinLock<Option<wol::WolConfig>>,
+    /// True while the datapath is quiesced (suspend/detach): tx/rx
+    /// paths refuse work instead of feeding a stopped device.
+    pub quiesced: IrqSafeSpinLock<bool>,
     /// Stage 5: MSI-X table once enabled.
     pub(crate) msix: Option<MsixTable>,
     pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -335,7 +343,7 @@ impl core::fmt::Debug for Ixgbe {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Ixgbe")
             .field("mac", &self.mac)
-            .field("link_up", &self.link_up)
+            .field("link_up", &*self.link_up.lock())
             .field("did", &format_args!("0x{:04X}", self.did))
             .finish_non_exhaustive()
     }
@@ -356,6 +364,13 @@ impl Ixgbe {
     ) -> Result<Arc<Self>, IxgbeError> {
         // SAFETY: caller-authority over the device.
         let mmio = unsafe { map_bar(device, 0) }.map_err(|_| IxgbeError::BarMapFailed)?;
+        // The single-queue config is valid by construction; validate
+        // anyway so a future multi-queue bring-up cannot silently
+        // program an out-of-range queue count.
+        let queue_config = queues::QueueConfig::single();
+        queue_config
+            .validate()
+            .map_err(|_| IxgbeError::Other("invalid queue config"))?;
 
         // 1. Mask all extended interrupts (§4.6.3.2 — driver should
         //    own EIMC before firmware moves on).
@@ -429,16 +444,20 @@ impl Ixgbe {
                 core::ptr::write_volatile(tx_ring.cpu_mut_ptr_at::<u8>(i as u64), 0);
             }
         }
+        // Queue-0 registers come from the multi-queue addressing
+        // helpers (queues.rs), which the fixtures prove equal to the
+        // datasheet queue-0 addresses.
+        let txq = queues::tx_queue_regs(0).expect("queue 0 is in range");
         // SAFETY: identity-mapped MMIO.
         unsafe {
-            mmio.write32(TX_TDBAL, tx_phys as u32);
-            mmio.write32(TX_TDBAH, (tx_phys >> 32) as u32);
-            mmio.write32(TX_TDLEN, (TX_RING_LEN * 16) as u32);
-            mmio.write32(TX_TDH, 0);
-            mmio.write32(TX_TDT, 0);
+            mmio.write32(txq.tdbal, tx_phys as u32);
+            mmio.write32(txq.tdbah, (tx_phys >> 32) as u32);
+            mmio.write32(txq.tdlen, (TX_RING_LEN * 16) as u32);
+            mmio.write32(txq.tdh, 0);
+            mmio.write32(txq.tdt, 0);
             // Enable TX queue.
-            let dctl = mmio.read32(TX_TXDCTL);
-            mmio.write32(TX_TXDCTL, dctl | TXDCTL_ENABLE);
+            let dctl = mmio.read32(txq.txdctl);
+            mmio.write32(txq.txdctl, dctl | TXDCTL_ENABLE);
         }
         // Poll for queue-enable to take effect (§7.2.3.4.1).
         // responsive_spin_until ticks sleep_pumps; failure is
@@ -446,7 +465,7 @@ impl Ixgbe {
         // behaviour. 100 ms wall-clock budget.
         let _ = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
-            || unsafe { mmio.read32(TX_TXDCTL) } & TXDCTL_ENABLE != 0,
+            || unsafe { mmio.read32(txq.txdctl) } & TXDCTL_ENABLE != 0,
             narf_time::Deadline::after_ms(100),
         );
 
@@ -475,18 +494,21 @@ impl Ixgbe {
             }
             rx_pool.push(buf);
         }
+        // Queue-0 registers come from the multi-queue addressing
+        // helpers (queues.rs).
+        let rxq = queues::rx_queue_regs(0).expect("queue 0 is in range");
         // SAFETY: identity-mapped MMIO.
         unsafe {
-            mmio.write32(RX_RDBAL, rx_ring_phys as u32);
-            mmio.write32(RX_RDBAH, (rx_ring_phys >> 32) as u32);
-            mmio.write32(RX_RDLEN, (RX_RING_LEN * 16) as u32);
-            mmio.write32(RX_RDH, 0);
-            mmio.write32(RX_RDT, (RX_RING_LEN - 1) as u32);
+            mmio.write32(rxq.rdbal, rx_ring_phys as u32);
+            mmio.write32(rxq.rdbah, (rx_ring_phys >> 32) as u32);
+            mmio.write32(rxq.rdlen, (RX_RING_LEN * 16) as u32);
+            mmio.write32(rxq.rdh, 0);
+            mmio.write32(rxq.rdt, (RX_RING_LEN - 1) as u32);
             // SRRCTL: 2K legacy buffers.
-            mmio.write32(RX_SRRCTL, SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_LEGACY);
+            mmio.write32(rxq.srrctl, SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_LEGACY);
             // Enable RX queue.
-            let dctl = mmio.read32(RX_RXDCTL);
-            mmio.write32(RX_RXDCTL, dctl | RXDCTL_ENABLE);
+            let dctl = mmio.read32(rxq.rxdctl);
+            mmio.write32(rxq.rxdctl, dctl | RXDCTL_ENABLE);
             // Promiscuous + broadcast accept.
             mmio.write32(REG_FCTRL, FCTRL_BAM | FCTRL_UPE | FCTRL_MPE);
             // Master RX enable.
@@ -510,8 +532,13 @@ impl Ixgbe {
             tx_tail: IrqSafeSpinLock::new(0),
             rx_head: IrqSafeSpinLock::new(0),
             mac,
-            link_up,
+            link_up: IrqSafeSpinLock::new(link_up),
             did: device.id.device,
+            queue_config,
+            rss_cfg: IrqSafeSpinLock::new(None),
+            vlan_filter: IrqSafeSpinLock::new(None),
+            wol_armed: IrqSafeSpinLock::new(None),
+            quiesced: IrqSafeSpinLock::new(false),
             msix: None,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
@@ -531,6 +558,9 @@ impl Ixgbe {
 
     /// Transmit a single frame, polling the descriptor's DD bit.
     pub fn tx(&self, frame: &[u8], meta: &TxMeta) -> Result<(), IxgbeError> {
+        if *self.quiesced.lock() {
+            return Err(IxgbeError::Other("device quiesced"));
+        }
         if frame.is_empty() || frame.len() > 1518 {
             return Err(IxgbeError::FrameTooLong);
         }
@@ -597,6 +627,9 @@ impl Ixgbe {
     /// synchronous (polls DD), so the device is done the moment this returns
     /// and the caller may drop or recycle the buffer immediately.
     pub fn tx_frame(&self, frame: &Frame) -> Result<(), IxgbeError> {
+        if *self.quiesced.lock() {
+            return Err(IxgbeError::Other("device quiesced"));
+        }
         let len = frame.len() as usize;
         if len == 0 || len > 1518 {
             return Err(IxgbeError::FrameTooLong);
@@ -648,6 +681,9 @@ impl Ixgbe {
 
     /// Drain one RX frame into `out`. Returns 0 if nothing pending.
     pub fn rx_recv(&self, out: &mut [u8]) -> usize {
+        if *self.quiesced.lock() {
+            return 0;
+        }
         let mut head_g = self.rx_head.lock();
         let head = (*head_g) as usize;
         let ring_phys = self.rx_ring.dma_addr().raw();
@@ -706,6 +742,9 @@ impl Ixgbe {
     /// case the received frame is left in its descriptor (head not advanced) to
     /// be retried, rather than dropped with no buffer to replace it.
     pub fn rx_recv_frame(&self) -> Option<Frame> {
+        if *self.quiesced.lock() {
+            return None;
+        }
         let mut head_g = self.rx_head.lock();
         let head = (*head_g) as usize;
         let ring_phys = self.rx_ring.dma_addr().raw();
@@ -752,6 +791,9 @@ impl Ixgbe {
     }
 
     pub fn rx_has_pending(&self) -> bool {
+        if *self.quiesced.lock() {
+            return false;
+        }
         let head = (*self.rx_head.lock()) as usize;
         let ring_phys = self.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (head * 16) as u64;
@@ -763,11 +805,13 @@ impl Ixgbe {
     }
 
     /// Stage 5: enable MSI-X on this device. Allocates a single
-    /// shared "misc" vector and routes RX queue 0 + the OTHER cause
-    /// onto it via the IVAR registers. Stage 5 stops at table
-    /// programming; the actual ISR wire-up happens once the
-    /// `narf-interrupts` MSI delivery side is consumed by the net
-    /// stack.
+    /// shared "misc" vector and routes RX queue 0 + TX queue 0 + the
+    /// OTHER cause onto it via the IVAR registers. Corrected
+    /// 2026-10-31 against datasheet §8.2.3.5.16/.17: IVAR[0] is at
+    /// 0x00900 (not 0x01000, which is RDBAL[0]) and packs RX0/TX0 as
+    /// `0x8080` (vector 0 + both valid bits); IVAR_MISC is at
+    /// 0x00A00 with the OTHER cause at bits 14:8 + valid bit 15
+    /// (`0x8000` for vector 0), not `0x80`.
     pub fn enable_msix_vector(
         &mut self,
         cap: &Cap<BusDeviceCap, Write>,
@@ -776,24 +820,165 @@ impl Ixgbe {
         let table = enable_msix(cap, device).map_err(|_| IxgbeError::MsixUnavailable)?;
         // Take vector 0 for "misc" (link / RX0 / TX0 collapsed).
         let _ = table.size(); // probed for completeness
-                              // SAFETY: identity-mapped MMIO.
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            queues::route_queue_vector(&mut bank, 0, 0);
+            queues::route_misc_vector(&mut bank, 0);
+        }
+        // SAFETY: identity-mapped MMIO.
         unsafe {
-            // Route RX queue 0 RX cause to vector 0:
-            //   IVAR[0]: bit 7 = valid, bits[6:0] = vector.
-            // RX uses low byte; TX uses byte 2.
-            let ivar = (0x80u32) | (0x80u32 << 16);
-            self.mmio.write32(REG_IVAR0, ivar);
-            // OTHER_CAUSES_IVAR — link-state etc. → vector 0.
-            self.mmio.write32(REG_IVAR_MISC, 0x80);
             // GPIE: enable multiple-MSIX, auto-mask, no EIAME yet.
+            // Offset corrected to 0x00898 (datasheet §8.2.3.5.18).
             self.mmio.write32(REG_GPIE, (1 << 4) | (1 << 5) | (1 << 6));
             // EIAM: auto-clear vector 0 on read of EICR.
+            // Offset corrected to 0x00890 (datasheet §8.2).
             self.mmio.write32(REG_EIAM, 1);
             // Unmask vector 0.
             self.mmio.write32(REG_EIMS, 1);
         }
         self.msix = Some(table);
         Ok(())
+    }
+
+    /// Program RSS for `queues` RX queues (1..=16, MRQE = 0001
+    /// mode). Callers must have RX disabled while reprogramming
+    /// filters; bring-up leaves RSS off until this runs.
+    pub fn configure_rss(&self, queues: usize) -> Result<(), IxgbeError> {
+        let cfg = rss::IxgbeRss::standard(queues)
+            .map_err(|_| IxgbeError::Other("bad RSS queue count"))?;
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            cfg.apply(&mut bank);
+        }
+        *self.rss_cfg.lock() = Some(cfg);
+        Ok(())
+    }
+
+    /// Program VLAN filtering (VFTA + VLNCTRL). Callers must have
+    /// RX disabled while reprogramming filters.
+    pub fn configure_vlan(&self, filter: vlan::VlanFilter) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            filter.apply(&mut bank);
+        }
+        *self.vlan_filter.lock() = Some(filter);
+        Ok(())
+    }
+
+    /// Arm Wake-on-LAN. 82599EB only (`wol_supported`); other
+    /// parts return `UnsupportedDevice` — X540 is ungrounded and
+    /// X550 WoL is LOM/board-gated (see wol.rs header).
+    pub fn configure_wol(&self, cfg: wol::WolConfig) -> Result<(), IxgbeError> {
+        if !wol::wol_supported(self.did) {
+            return Err(IxgbeError::UnsupportedDevice);
+        }
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            cfg.arm(&mut bank);
+        }
+        *self.wol_armed.lock() = Some(cfg);
+        Ok(())
+    }
+
+    /// Suspend: quiesce the datapath (mask interrupts, RXEN off,
+    /// queue 0 disabled, wake status cleared) and arm WoL if
+    /// given. The platform PM layer owns the PCI D-state step.
+    pub fn suspend(&self, wol_cfg: Option<wol::WolConfig>) -> Result<(), IxgbeError> {
+        if let Some(cfg) = wol_cfg {
+            if !wol::wol_supported(self.did) {
+                return Err(IxgbeError::UnsupportedDevice);
+            }
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            pm::suspend_plan(&mut bank, Some(cfg));
+            *self.wol_armed.lock() = Some(cfg);
+        } else {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            pm::suspend_plan(&mut bank, None);
+        }
+        *self.quiesced.lock() = true;
+        Ok(())
+    }
+
+    /// Resume: re-enable queue 0 + RX + the misc vector, refresh
+    /// link state. Ring contents are NOT rebuilt here — a suspend
+    /// that lost DMA state needs a full re-probe (caller decision).
+    pub fn resume(&self) {
+        let mut bank = queues::MmioBank::new(&self.mmio);
+        pm::resume_plan(&mut bank);
+        *self.quiesced.lock() = false;
+        // SAFETY: identity-mapped MMIO.
+        let links = unsafe { self.mmio.read32(REG_LINKS) };
+        *self.link_up.lock() = links & LINKS_UP != 0;
+    }
+
+    /// Prepare detach: suspend with no WoL + clear DRV_LOAD, and
+    /// mark quiesced. The framework half (CONTROLLER slot, mirror
+    /// note, iface unregister) is `detach_controller`.
+    pub fn prepare_detach(&self) {
+        let mut bank = queues::MmioBank::new(&self.mmio);
+        pm::detach_plan(&mut bank);
+        *self.quiesced.lock() = true;
+    }
+
+    /// Build the ethtool-visible snapshot: identity, queues,
+    /// caps word, filter state, and the interval counters
+    /// (GPRC/GPTC are read-clear — see ethtool.rs header).
+    pub fn ethtool_info(&self) -> ethtool::EthtoolInfo {
+        let bank = queues::MmioBank::new(&self.mmio);
+        ethtool::EthtoolInfo {
+            driver: ethtool::ETHTOOL_DRIVER,
+            version: ethtool::ETHTOOL_VERSION,
+            mac: self.mac,
+            mtu: 1500,
+            link_up: *self.link_up.lock(),
+            num_tx_queues: self.queue_config.num_tx as u16,
+            num_rx_queues: self.queue_config.num_rx as u16,
+            caps: <Self as crate::HwNic>::caps(self).0,
+            rss_enabled: self.rss_cfg.lock().is_some(),
+            vlan_filter_enabled: self.vlan_filter.lock().is_some(),
+            wol_supported: wol::wol_supported(self.did),
+            wol_armed: self.wol_armed.lock().is_some(),
+            stats: ethtool::read_stats(&bank),
+        }
+    }
+
+    /// Disarm Wake-on-LAN.
+    pub fn disarm_wol(&self) {
+        let mut bank = queues::MmioBank::new(&self.mmio);
+        wol::WolConfig::disarm(&mut bank);
+        *self.wol_armed.lock() = None;
+    }
+
+    /// Read the latched wake status (WUS, RW1C — the read itself
+    /// does not clear; use `configure_wol`/`disarm_wol` to clear).
+    pub fn wol_status(&self) -> wol::WakeStatus {
+        // SAFETY: identity-mapped MMIO.
+        let raw = unsafe { self.mmio.read32(wol::REG_WUS) };
+        wol::WakeStatus { raw }
+    }
+
+    /// Clear VLAN filtering (empty table, VFE off).
+    pub fn clear_vlan(&self) {
+        let mut bank = queues::MmioBank::new(&self.mmio);
+        vlan::VlanFilter::clear(&mut bank);
+        *self.vlan_filter.lock() = None;
+    }
+
+    /// Enable/disable VLAN tag stripping (RXDCTL.VME) on RX queue `q`.
+    pub fn set_vlan_strip(&self, q: usize, enable: bool) -> Result<(), IxgbeError> {
+        let regs = queues::rx_queue_regs(q).ok_or(IxgbeError::Other("bad RX queue"))?;
+        let mut bank = queues::MmioBank::new(&self.mmio);
+        if enable {
+            bank.set_bits(regs.rxdctl, vlan::RXDCTL_VME);
+        } else {
+            bank.clear_bits(regs.rxdctl, vlan::RXDCTL_VME);
+        }
+        Ok(())
+    }
+
+    /// The stack-visible RSS config, if programmed.
+    pub fn rss_config(&self) -> Option<narf_net::rss::RssConfig> {
+        self.rss_cfg.lock().as_ref().map(|c| c.as_net_config())
     }
 
     pub fn read_status(&self) -> u32 {
@@ -827,7 +1012,16 @@ impl narf_net::Interface for Ixgbe {
         1500
     }
     fn link_up(&self) -> bool {
-        self.link_up
+        *self.link_up.lock()
+    }
+    fn num_rx_queues(&self) -> u16 {
+        self.queue_config.num_rx as u16
+    }
+    fn num_tx_queues(&self) -> u16 {
+        self.queue_config.num_tx as u16
+    }
+    fn rss(&self) -> Option<narf_net::rss::RssConfig> {
+        self.rss_config()
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         &self.rx_ipc_ring
@@ -853,13 +1047,29 @@ impl crate::HwNic for Ixgbe {
         1500
     }
     fn link_up(&self) -> bool {
-        self.link_up
+        *self.link_up.lock()
     }
     fn model(&self) -> crate::NicModel {
         crate::NicModel::IntelIxgbe
     }
     fn caps(&self) -> crate::NicCaps {
-        crate::NicCaps::PROMISC | crate::NicCaps::MULTICAST_HASH
+        let mut caps = crate::NicCaps::PROMISC | crate::NicCaps::MULTICAST_HASH;
+        if self.rss_cfg.lock().is_some() {
+            caps = caps | crate::NicCaps::RSS;
+        }
+        if self.vlan_filter.lock().is_some() {
+            caps = caps | crate::NicCaps::VLAN_TAGGING;
+        }
+        caps
+    }
+    fn num_rx_queues(&self) -> u16 {
+        self.queue_config.num_rx as u16
+    }
+    fn num_tx_queues(&self) -> u16 {
+        self.queue_config.num_tx as u16
+    }
+    fn rss(&self) -> Option<narf_net::rss::RssConfig> {
+        self.rss_config()
     }
     fn ring_capacity(&self) -> usize {
         TX_RING_LEN
@@ -897,7 +1107,16 @@ impl narf_net::Interface for IxgbeNic {
         1500
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| c.link_up).unwrap_or(false)
+        with_controller(|c| *c.link_up.lock()).unwrap_or(false)
+    }
+    fn num_rx_queues(&self) -> u16 {
+        with_controller(|c| c.queue_config.num_rx as u16).unwrap_or(1)
+    }
+    fn num_tx_queues(&self) -> u16 {
+        with_controller(|c| c.queue_config.num_tx as u16).unwrap_or(1)
+    }
+    fn rss(&self) -> Option<narf_net::rss::RssConfig> {
+        with_controller(|c| c.rss_config()).flatten()
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
@@ -988,6 +1207,22 @@ fn read_mac_from_rar(mmio: &MmioRegion) -> [u8; 6] {
 
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<Ixgbe>>> = IrqSafeSpinLock::new(None);
 
+/// Detach the controller: quiesce + clear DRV_LOAD on the device,
+/// drop the CONTROLLER slot, clear the RX mirror note, and
+/// unregister the iface so its eth%d name can be reused. Pumps
+/// hold Arc clones and cannot be cancelled; the quiesced flag
+/// makes their tx/rx paths refuse work instead.
+pub fn detach_controller() {
+    if let Some(dev) = CONTROLLER.lock().take() {
+        dev.prepare_detach();
+    }
+    let name = ixgbe_ifname();
+    if !name.is_empty() {
+        crate::publish::clear_rx_mirror_attached(name);
+        let _ = narf_net::iface::unregister(name);
+    }
+}
+
 /// The interface name `iface::register` gave this NIC (`eth%d`, Linux
 /// `dev_alloc_name`). Set once at probe; the device lives as long as
 /// the kernel, so the name is leaked into a `&'static str`.
@@ -1055,6 +1290,23 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         dev.mac,
         ixgbe_send_frame,
         ixgbe_link_sample(dev.read_links()),
+    );
+
+    // Ethtool surface (what ETHTOOL_GDRVINFO reports): driver,
+    // version, bus address, and the offloads the send path
+    // actually honors (TX checksum only — see ethtool.rs).
+    // Runs before IXGBE_IFNAME.set moves `name`.
+    let bus_info = match device.addr {
+        narf_bus::BusAddr::Pcie(pci) => alloc::format!("{:?}", pci),
+        narf_bus::BusAddr::Mmio(_) => alloc::string::String::new(),
+    };
+    narf_net::iface::set_driver_info(&name, "ixgbe", Some("0.1.0"), bus_info);
+    narf_net::iface::set_offloads(
+        &name,
+        narf_net::OffloadCapabilities {
+            tx_checksum: true,
+            ..Default::default()
+        },
     );
     IXGBE_IFNAME.set(name);
 
