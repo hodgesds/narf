@@ -1,63 +1,59 @@
-//! narf-drivers-sound — Intel/AMD HDA controller + Realtek codec + ALSA surface.
+//! narf-drivers-sound — sound card registry, PCM substream model,
+//! mixer surface, and the ALSA/filesystem bridges.
 //!
-//! Targets the AMD HDA controllers that ship on the user's two
-//! bring-up laptops (Zen2 Renoir `1022:15E3`, Phoenix HawkPoint1
-//! `1022:15E3`) and the Realtek ALC-family codec on the codec link.
-//! Also probes Intel PCH HDA — the programming model is identical;
-//! only PCI IDs change.
+//! This crate is the card-level surface the native audio engines
+//! register into: `narf-audio` owns the actual HDA controller and
+//! ACP 6.3 engines (PCI probe, CORB/RIRB, codec runtime) and
+//! registers hardware PCM/mixer backends here; userspace reaches
+//! the cards through the ALSA ioctl bridge (`alsa`) and the
+//! devfs/procfs/sysfs bridges.
 //!
-//! Layered like Linux's `sound/hda/`:
+//! Modules:
 //!
-//! - `hda::controller`  — PCI probe, BAR map, GCAP/GCTL/INTCTL reset
-//!   sequence, INTSTS path.
-//! - `hda::corb`        — Command Output Ring Buffer (verb send).
-//! - `hda::rirb`        — Response Input Ring Buffer (verb response).
-//! - `hda::streams`     — Stream descriptors + Buffer Descriptor List.
-//! - `hda::widget`      — Codec widget graph + node walking.
-//! - `codec::generic`   — Vendor-agnostic AFG bring-up (any compliant
-//!   codec — power, unmute, default routing).
-//! - `codec::realtek`   — ALC233/235/236/255/256/270/280/282/283/285/
-//!   286/287/289/290/292/293/294/295/298/3204/
-//!   3225/3236/3254/3266/3268/3286/3287 init
-//!   verb sequences.
-//! - `codec::quirks`    — Per-laptop-model widget connection quirks
-//!   (Lenovo, Dell, HP, ASUS, MSI laptop tables).
+//! - card registry (this file) — `SoundCard` publication, probe
+//!   finalisation, suspend/resume quiesce hooks.
+//! - `hda::streams`     — Stream descriptors + Buffer Descriptor
+//!   List entry types the PCM model is built on.
 //! - `pcm`              — PCM substream model (open/hw_params/prepare/
 //!   trigger/pointer/close).
 //! - `mixer`            — ALSA-style mixer control surface (volume,
 //!   mute, jack-sense).
 //! - `format`           — Sample formats (S16/S24/S32 LE,
 //!   44.1/48/96/192 kHz).
+//! - `hardware`         — Hardware PCM backend registration.
+//! - `alsa`             — Linux ALSA ioctl/mmap compatibility bridge.
+//! - `devfs_bridge` / `procfs_bridge` / `sysfs_bridge` — filesystem
+//!   publication of the card registry.
 //!
 //! ## What this crate is for
 //!
-//! Without this driver, the laptop speakers + mic + headphone jack
+//! Without this surface, the laptop speakers + mic + headphone jack
 //! are dead. The boot chime, system beep, and any userspace audio
 //! goes nowhere.
 //!
 //! ## Relationship to other audio code in NARF
 //!
 //! - `narf-audio` owns the active native HDA and ACP 6.3 engines and
-//!   registers hardware PCM/mixer backends here. This crate's older
-//!   HDA/codec/software-PCM models remain for compatibility and tests.
-//! - The file bridge exposes NARF's PCM protocol. Linux ALSA ioctl/mmap
-//!   compatibility is separate work; these are ALSA-style interfaces.
+//!   registers hardware PCM/mixer backends here. This crate formerly
+//!   carried its own HDA controller/codec models; they were never
+//!   wired to a caller and were excised in #783. The Realtek codec
+//!   fixup tables they held were rescued into
+//!   `narf_audio::hda::quirks`, staged for the codec-fixup work in
+//!   #776.
+//! - The ALSA bridge in `alsa` is the live Linux-compatibility
+//!   surface; the file bridges expose the same registry to
+//!   devfs/procfs/sysfs.
 //! - USB Audio Class is a separate driver under `drivers/usb/` and is
 //!   not in this scope.
 //!
 //! ## Linux source citations (post-2026-05-20 relicense)
 //!
-//! - `sound/hda/controllers/intel.c` — `azx_first_init`, GCAP/GCTL
-//!   reset sequence, CORB/RIRB ring setup.
-//! - `sound/hda/core/controller.c` — generic HDA controller state
-//!   machine (reset, codec mask scan, stream alloc).
-//! - `sound/hda/codecs/realtek/realtek.c` + per-`alc<N>.c` —
-//!   `alc_init`, `alc_subsystem_id`, `alc269_quirks[]`, per-chip
-//!   `alc<N>_setup_*` verb sequences.
-//! - `sound/hda/codecs/generic.c` — `snd_hda_gen_parse_auto_config`
-//!   widget-graph walker.
 //! - `sound/core/pcm_native.c` — `snd_pcm_kernel_ioctl`,
 //!   `snd_pcm_hw_params`, `snd_pcm_trigger`.
+//! - `sound/hda/codecs/realtek/realtek.c` + per-`alc<N>.c` — the
+//!   historical source of the Realtek fixup tables now staged in
+//!   `narf_audio::hda::quirks` (`alc269_quirks[]`, per-chip
+//!   `alc<N>_setup_*` coef sequences).
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -66,19 +62,14 @@
 extern crate alloc;
 
 mod alsa;
-pub mod codec;
 pub mod devfs_bridge;
 pub mod display_audio;
 pub mod format;
 pub mod hardware;
 pub mod hda;
-pub mod intel8x0;
-pub mod max98357a;
 pub mod mixer;
 pub mod pcm;
 pub mod procfs_bridge;
-pub mod rt5645;
-pub mod snd_sof;
 pub mod sysfs_bridge;
 
 mod tests;
@@ -159,14 +150,14 @@ impl From<MixerError> for SoundError {
 
 // ── Card registry ──────────────────────────────────────────────────
 
-/// A registered sound card. Wraps an `HdaController` instance plus
-/// the codec(s) discovered on its codec link.
+/// A registered sound card: identity plus the hardware PCM backend
+/// a native engine (`narf-audio`) registered for it.
 #[derive(Debug)]
 pub struct SoundCard {
     info: CardInfo,
-    /// Pointer to the controller in the controller registry. The
-    /// controller is owned by `hda::controller::REGISTRY` so the
-    /// card entry is `Copy`-safe (it doesn't own MMIO state).
+    /// Index of the owning controller in the native engine's own
+    /// registry. This crate never owns controller MMIO state, so the
+    /// card entry doesn't own hardware directly.
     controller_index: usize,
     hardware: Option<alloc::sync::Arc<dyn hardware::PcmDevice>>,
     parent: Option<narf_bus::BusAddr>,
@@ -194,9 +185,9 @@ static CARD_PUBLICATION: narf_lib::sync::IrqSafeSpinLock<()> =
 static FILESYSTEM_READY: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Register a probed controller as a card. Called from
-/// `hda::controller::probe` after the controller is brought out of
-/// reset and its codecs enumerated.
+/// Register a probed controller as a card. Called from a native
+/// engine's probe path (`narf-audio` HDA/ACP) after the controller
+/// is brought out of reset and its codecs enumerated.
 pub fn register_card(
     driver: &'static str,
     id: &'static str,
@@ -605,8 +596,8 @@ pub fn pcm_capabilities(card: u32, capture: bool) -> Result<hardware::PcmCapabil
     })
 }
 
-/// Probe-time entry point. Called by `hda::controller::probe` once
-/// the controller is fully brought up.
+/// Probe-time entry point. Called by a native engine's probe path
+/// once the controller is fully brought up.
 pub fn finalize_probe(
     driver: &'static str,
     id: &'static str,
@@ -654,13 +645,6 @@ pub fn sound_fs_initcall() {
     for (info, parent) in cards {
         crate::sysfs_bridge::register_card_sysfs_at(&info, parent);
     }
-}
-
-pub fn register_initcalls() {
-    intel8x0::register_pci_driver();
-    max98357a::register_initcalls();
-    rt5645::register_initcalls();
-    snd_sof::register_pci_driver();
 }
 
 // ── Test support ────────────────────────────────────────────────────────
