@@ -27,7 +27,7 @@
 //! remainder, not a value to guess — directed-IP wake-up works
 //! without it on the 82599 path the driver enables (magic packet
 //! + link change), and IP4AT/IP6AT programming below is provided
-//! for the caller that supplies the addresses.
+//!   for the caller that supplies the addresses.
 
 use super::queues::RegBank;
 

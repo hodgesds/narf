@@ -1,6 +1,6 @@
 # ixgbe — Specification
 
-> Status: **v0.2 in progress** (Stages 1-6 as v0.1, plus §9
+> Status: **v0.2 — multi-queue, RSS, VLAN, WoL, PM, ethtool** (Stages 1-6 as v0.1, plus §9
 > multi-queue addressing; RSS/VLAN/WoL/PM/ethtool land in later
 > commits of the same stream).
 >
@@ -228,9 +228,22 @@ this driver. Ring contents are NOT rebuilt on resume — a
 suspend that lost DMA state needs a full re-probe, which is
 a caller decision recorded as a follow-up (§14).
 
-## 13. Ethtool surface (v0.2 — see §14)
+## 13. Ethtool surface
 
-Placeholder for the ethtool commit: driver info + stats snapshot.
+Probe records `ETHTOOL_GDRVINFO` data via
+`narf_net::iface::set_driver_info` (driver "ixgbe", version
+"0.1.0", PCIe bus address per the igb pattern) and the honest
+offload set via `set_offloads` (TX checksum only). The
+driver-side snapshot is `drivers/net/ixgbe/src/ixgbe/
+ethtool.rs`: `EthtoolInfo` (identity, MTU, link, queue counts,
+caps word, RSS/VLAN/WoL state) plus `read_stats`, which reads
+GPRC (0x04074) / GPTC (0x04080) — both RC, so snapshots are
+interval counters, not lifetime totals. `Ixgbe::ethtool_info`
+builds the snapshot on demand. Honest advertisement: RX
+checksum is NOT claimed (the decoder exists but is not plumbed
+into frame metadata), TSO claims no bound (the send path caps
+frames at 1518 bytes), and VLAN insertion is NOT claimed (RX
+filtering only).
 
 ## 14. Sequenced follow-ups (not silently dropped)
 

@@ -720,3 +720,49 @@ fn smoke_ixgbe_pm_plans() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_pm_plans);
+
+// ── Ethtool fixtures (commit 6) ──────────────────────────────────
+
+fn smoke_ixgbe_ethtool_snapshot() -> TestResult {
+    use super::ethtool::{read_stats, EthtoolInfo, NicStats, ETHTOOL_DRIVER, ETHTOOL_VERSION};
+    use super::queues::RegBank;
+    if ETHTOOL_DRIVER != "ixgbe" || ETHTOOL_VERSION != "0.1.0" {
+        return TestResult::Fail("ethtool driver identity wrong");
+    }
+    let mut bank = FakeBank::new();
+    bank.write32(0x04074, 123);
+    bank.write32(0x04080, 456);
+    let stats = read_stats(&bank);
+    if stats
+        != (NicStats {
+            rx_good_packets: 123,
+            tx_good_packets: 456,
+        })
+    {
+        return TestResult::Fail("stats snapshot wrong");
+    }
+    let info = EthtoolInfo {
+        driver: ETHTOOL_DRIVER,
+        version: ETHTOOL_VERSION,
+        mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+        mtu: 1500,
+        link_up: true,
+        num_tx_queues: 1,
+        num_rx_queues: 1,
+        caps: 0xC0,
+        rss_enabled: false,
+        vlan_filter_enabled: true,
+        wol_supported: true,
+        wol_armed: false,
+        stats,
+    };
+    let summary = info.summary();
+    if !summary.contains("ixgbe 0.1.0")
+        || !summary.contains("rx_pkts=123")
+        || !summary.contains("tx_pkts=456")
+    {
+        return TestResult::Fail("ethtool summary missing fields");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_ethtool_snapshot);

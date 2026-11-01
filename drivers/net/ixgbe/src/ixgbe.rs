@@ -17,6 +17,9 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 
+use crate::ixgbe::queues::RegBank;
+
+pub mod ethtool;
 pub mod pm;
 pub mod queues;
 pub mod rss;
@@ -917,6 +920,28 @@ impl Ixgbe {
         *self.quiesced.lock() = true;
     }
 
+    /// Build the ethtool-visible snapshot: identity, queues,
+    /// caps word, filter state, and the interval counters
+    /// (GPRC/GPTC are read-clear — see ethtool.rs header).
+    pub fn ethtool_info(&self) -> ethtool::EthtoolInfo {
+        let bank = queues::MmioBank::new(&self.mmio);
+        ethtool::EthtoolInfo {
+            driver: ethtool::ETHTOOL_DRIVER,
+            version: ethtool::ETHTOOL_VERSION,
+            mac: self.mac,
+            mtu: 1500,
+            link_up: *self.link_up.lock(),
+            num_tx_queues: self.queue_config.num_tx as u16,
+            num_rx_queues: self.queue_config.num_rx as u16,
+            caps: <Self as crate::HwNic>::caps(self).0,
+            rss_enabled: self.rss_cfg.lock().is_some(),
+            vlan_filter_enabled: self.vlan_filter.lock().is_some(),
+            wol_supported: wol::wol_supported(self.did),
+            wol_armed: self.wol_armed.lock().is_some(),
+            stats: ethtool::read_stats(&bank),
+        }
+    }
+
     /// Disarm Wake-on-LAN.
     pub fn disarm_wol(&self) {
         let mut bank = queues::MmioBank::new(&self.mmio);
@@ -1265,6 +1290,23 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         dev.mac,
         ixgbe_send_frame,
         ixgbe_link_sample(dev.read_links()),
+    );
+
+    // Ethtool surface (what ETHTOOL_GDRVINFO reports): driver,
+    // version, bus address, and the offloads the send path
+    // actually honors (TX checksum only — see ethtool.rs).
+    // Runs before IXGBE_IFNAME.set moves `name`.
+    let bus_info = match device.addr {
+        narf_bus::BusAddr::Pcie(pci) => alloc::format!("{:?}", pci),
+        narf_bus::BusAddr::Mmio(_) => alloc::string::String::new(),
+    };
+    narf_net::iface::set_driver_info(&name, "ixgbe", Some("0.1.0"), bus_info);
+    narf_net::iface::set_offloads(
+        &name,
+        narf_net::OffloadCapabilities {
+            tx_checksum: true,
+            ..Default::default()
+        },
     );
     IXGBE_IFNAME.set(name);
 

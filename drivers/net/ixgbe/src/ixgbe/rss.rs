@@ -19,8 +19,6 @@
 //! over the queue count), so a flow's hardware queue equals
 //! `RssConfig::rx_queue` for the same frame.
 
-use alloc::vec::Vec;
-
 use super::queues::RegBank;
 
 /// MRQC register (datasheet §8.2.3.7.12).
