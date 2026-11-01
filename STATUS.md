@@ -1428,8 +1428,14 @@ bounded raw GuC logs from an already-awake coherent GT, with actual firmware
 identity and per-read authority checks; it does not consume firmware cursors
 or provide a lossless stream. Read-only `xe` hwmon nodes expose cached DG2/BMG
 temperatures and DG2 voltage/extended energy without read-triggered MMIO or
-wake. Writable controls and BMG PMT energy remain open. Native regression and
-cross-target build/lint validation for this checkpoint is in progress.
+wake. Writable controls and BMG PMT energy remain open. This checkpoint adds
+36 native fixtures; all pass on x86_64. Selected Intel/DRM/fb regression groups
+pass 709 unique tests with no failures or skips. GPU/fb target CI Clippy passes
+all three contexts on both architectures; all four host GPU vendor contexts
+pass all-target Clippy. Debug/release compilation passes on both architectures,
+as do the x86_64 production boot, both btrfs postflights, formatting and diff
+checks. aarch64 QEMU is intentionally omitted for this architecture-neutral
+iteration. Intel silicon and Mesa acceptance remain unrun.
 
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI

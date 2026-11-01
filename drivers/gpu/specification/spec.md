@@ -6703,8 +6703,9 @@ changes refuses until coordinated cross-resource arming exists. Gamma LUT
 properties are not advertised or accepted by this path.
 
 Takeover requires a full-RGB bypass pipeline: no pipe/output CSC, pre/post
-gamma, per-plane transforms or active plane gamma LUT. In particular the
-inherited plane must set `PLANE_COLOR_PLANE_GAMMA_DISABLE` (bit 13).
+gamma, per-plane transforms, active plane gamma LUT or nonzero CUS_CTL. In
+particular the inherited plane must set `PLANE_COLOR_PLANE_GAMMA_DISABLE`
+(bit 13).
 The full owned Xe-LPG modeset establishes this RGB bypass after disabling
 Pipe A: it verifies primary and pipe enable/state are off, clears Pipe-A
 bottom color, gamma mode, pipe/output CSC mode and primary CUS_CTL, sets

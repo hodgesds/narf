@@ -2129,10 +2129,10 @@ production feature. Unsupported functionality remains unadvertised.
 | Display reset recovery | Fresh post-reset console latch independently retires old GEM fetch; clear failures retain owners; status/epoch ownership preserved | Implemented; native fixtures pass |
 | First-error diagnostics | Bounded immutable per-card reports captured before isolated/full reset; stable read-only exposure and explicit unavailable data | Implemented; native fixtures pass |
 | Userspace SLPC policy | Bounded sysfs mailbox; live-epoch admission; acknowledged range/profile publication; confirmed policy replay after resume | Implemented; native fixtures pass |
-| BMG COPY1 | Physical BCS8 scheduling, shared-class ADS, per-instance saves/defaults, IRQ policy, PPGTT startup proof and native Xe/i915 selection | Integration validation in progress |
-| Pipe-A CTM | Fixed-mode MTL/Arrow CTM-only commits, retained blobs/original state, latch evidence, cancellation and full console restoration | Integration validation in progress |
-| Passive GuC logs | Default-off CAP_SYSLOG-gated read-only descriptors; bounded immutable raw snapshots with actual firmware identity and live ownership checks | Integration validation in progress |
-| Read-only dGPU hwmon | DG2/BMG cached temperatures, DG2 voltage/extended energy, live-epoch admission and stale/loss refusal without read-triggered MMIO | Integration validation in progress |
+| BMG COPY1 | Physical BCS8 scheduling, shared-class ADS, per-instance saves/defaults, IRQ policy, PPGTT startup proof and native Xe/i915 selection | Implemented; native fixtures pass |
+| Pipe-A CTM | Fixed-mode MTL/Arrow CTM-only commits, retained blobs/original state, latch evidence, cancellation and full console restoration | Implemented; native fixtures pass |
+| Passive GuC logs | Default-off CAP_SYSLOG-gated read-only descriptors; bounded immutable raw snapshots with actual firmware identity and live ownership checks | Implemented; native fixtures pass |
+| Read-only dGPU hwmon | DG2/BMG cached temperatures, DG2 voltage/extended energy, live-epoch admission and stale/loss refusal without read-triggered MMIO | Implemented; native fixtures pass |
 | VM/address mirrors | USERPTR invalidation/MMU notifier, i915 GEM_USERPTR, fault-mode and long-running VMs, CPU address mirrors | Open; memory/VM dependency |
 | Local-memory management | DG2 64 KiB pages and CCS clear; small-BAR/unmapped VRAM; eviction/migration and GPU clear/copy jobs; VRAM PRIME/P2P | Open; VM and copy-job dependencies |
 | Engine scheduling | CCS1–3 and configurable ccs_mode; load-balanced and parallel queues | Open; generation-qualified state/IRQ/probe paths |
@@ -2189,6 +2189,19 @@ reference `b90c984d615e8ce2af96f5b1411a962d83fed2ad`):
   energy are supported. Writable controls, fan/mailbox limits and BMG PMT
   energy remain open.
 
-Final native regression and cross-target build/lint validation for this
-checkpoint is in progress. These paths do not close the broader VM, media,
-local-memory, atomic-display, output or platform workstreams above.
+This second checkpoint adds 36 native fixtures, all passing on x86_64.
+Selected Intel/DRM/framebuffer groups pass 709 unique tests with no failures
+or skips; a seven-test hwmon repeat is excluded from that unique total.
+The queue-overlap fixture observes live job identities rather than assuming
+priming consumed a fixed number of IDs; output rollback still verifies that
+failed transactions consume none. First-error access-loss coverage checks all
+28 register boundaries, including BCS8 and CCS0.
+
+GPU/fb target CI Clippy passes all three feature contexts on both
+architectures, and all four host GPU vendor configurations pass all-target
+Clippy. Debug/release compilation passes on both architectures. The x86_64
+production boot, both btrfs postflights, formatting and diff checks pass.
+aarch64 QEMU was intentionally omitted because this checkpoint changes no
+architecture-specific code or behavior. These native models do not establish
+Intel silicon or Mesa acceptance. The broader VM, media, local-memory,
+atomic-display, output and platform workstreams above remain open.
