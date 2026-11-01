@@ -282,6 +282,47 @@ fn smoke_rtl8125_chip_kind_classification() -> TestResult {
     if chip_kind_from_xid(0x681) != ChipKind::Rtl8125Bp {
         return TestResult::Fail("0x681 should classify as RTL8125BP");
     }
+    if chip_kind_from_xid(0x708) != ChipKind::Rtl8125Cp {
+        return TestResult::Fail("0x708 should classify as RTL8125CP");
+    }
+    if chip_kind_from_xid(0x68a) != ChipKind::Rtl8125K {
+        return TestResult::Fail("0x68a should classify as RTL8125K");
+    }
+    if chip_kind_from_xid(0x68b) != ChipKind::Rtl9151A {
+        return TestResult::Fail("0x68b should classify as RTL9151A");
+    }
+    if chip_kind_from_xid(0x689) != ChipKind::Rtl8125D {
+        return TestResult::Fail("0x689 should classify as RTL8125D");
+    }
+    // Firmware blob per XID (Linux `rtl_firmware` table).
+    if super::firmware_name_for(0x609) != Some("rtl_nic/rtl8125a-3.fw") {
+        return TestResult::Fail("0x609 firmware name is wrong");
+    }
+    if super::firmware_name_for(0x688) != Some("rtl_nic/rtl8125d-1.fw") {
+        return TestResult::Fail("0x688 firmware name is wrong");
+    }
+    if super::firmware_name_for(0x689) != Some("rtl_nic/rtl8125d-2.fw") {
+        return TestResult::Fail("0x689 firmware name is wrong");
+    }
+    if super::firmware_name_for(0x123).is_some() {
+        return TestResult::Fail("unknown XID must have no firmware name");
+    }
+    // Only 8125A splits its table: firmware runs mid-table in
+    // Linux, so the pre part must be non-empty and the post part
+    // must start after the firmware point; every other variant
+    // runs firmware first (empty pre part).
+    let (pre_a, post_a) = super::phy_table_for(ChipKind::Rtl8125A);
+    if pre_a.is_empty() || post_a.is_empty() {
+        return TestResult::Fail("8125A must split its PHY table");
+    }
+    let (pre_b, post_b) = super::phy_table_for(ChipKind::Rtl8125B);
+    if !pre_b.is_empty() || post_b.is_empty() {
+        return TestResult::Fail("8125B must run firmware first");
+    }
+    let (pre_u, post_u) = super::phy_table_for(ChipKind::Unknown(0x123));
+    if !pre_u.is_empty() || !post_u.is_empty() {
+        return TestResult::Fail("unknown kind must have no PHY table");
+    }
     // 0x123 is reserved / unknown. Driver still attempts bring-up.
     match chip_kind_from_xid(0x123) {
         ChipKind::Unknown(0x123) => {}

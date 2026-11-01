@@ -68,3 +68,11 @@ fn do_register() {
 pub fn configure_rtl8127_phy_late() {
     rtl8127::configure_phy_late();
 }
+
+/// The RTL8125 late PHY-firmware pass. Same ordering constraint as
+/// the 8127 pass: the firmware registry is populated only by the
+/// `Stage::Late` initramfs and rootfs scans.
+#[cfg(feature = "builtin")]
+pub fn configure_rtl8125_phy_late() {
+    rtl8125::configure_phy_late();
+}
