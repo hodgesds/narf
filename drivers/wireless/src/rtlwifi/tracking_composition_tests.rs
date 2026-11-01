@@ -24,7 +24,7 @@ type Sources = (
     Option<Arc<ht::Grant>>,
     Option<Arc<protection::Grant>>,
 );
-fn sources(h: &Harness) -> Result<Sources, &'static str> {
+pub(super) fn sources(h: &Harness) -> Result<Sources, &'static str> {
     let (base, ht) = super::protection_tests::source(h)?;
     let source = h.device.environment_for_test().protection.lock().clone();
     let protection = source
@@ -44,7 +44,7 @@ fn sources(h: &Harness) -> Result<Sources, &'static str> {
         .map_err(|_| "NETH actual preceding NERT")?;
     Ok((base, ht, protection))
 }
-fn qualify(h: &Harness) -> Result<Cap<FirmwareBlob, Read>, &'static str> {
+pub(super) fn qualify(h: &Harness) -> Result<Cap<FirmwareBlob, Read>, &'static str> {
     let (base, ht, protection) = sources(h)?;
     let cap = Cap::bootstrap();
     let bytes = tracking::artifact(

@@ -89,6 +89,21 @@ impl RtlwifiDevice {
             super::ht::request_on_channel(&base, firmware, channel)
         })
     }
+    /// Exact selected automatic-diversity program qualification metadata.
+    /// This request performs no radio I/O and supplies no antenna permission.
+    pub fn antenna_diversity_request(
+        &self,
+    ) -> Result<super::AntennaDiversityRequest, super::channel_power::Error> {
+        let firmware = self
+            .current_firmware()
+            .and_then(|f| f.identity())
+            .ok_or(super::channel_power::Error::Identity)?;
+        self.native
+            .as_ref()
+            .ok_or(super::channel_power::Error::Identity)?
+            .antenna_diversity_request(firmware)
+            .map_err(|_| super::channel_power::Error::Authority)
+    }
     /// Exact retained full-program thermal qualification request. This is
     /// provisioning metadata and grants no gain, calibration or RF authority.
     pub fn thermal_tracking_request(

@@ -69,6 +69,8 @@ mod probe_scan;
 pub use fallback::Request as RateFallbackRequest;
 pub use ht::Request as Ht20Request;
 pub use ht::Request as Ht40Request;
+mod antenna;
+pub use antenna::Request as AntennaDiversityRequest;
 mod tracking;
 pub use tracking::Request as ThermalTrackingRequest;
 mod protection;

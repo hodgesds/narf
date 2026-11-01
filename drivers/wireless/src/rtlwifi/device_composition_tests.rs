@@ -156,6 +156,7 @@ struct DeviceEnvironment {
     ht_wide: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
     protection: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
     tracking: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
+    antenna: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
     fallback_channel: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
     bus_power: IrqSafeSpinLock<Option<Arc<aspm::tests::Model>>>,
 }
@@ -310,6 +311,29 @@ impl Environment for DeviceEnvironment {
         )
         .map(|g| Some(Arc::new(g)))
         .map_err(StationError::Radio)
+    }
+    fn antenna(
+        &self,
+        base: Arc<crate::rtlwifi::channel_power::Calibration>,
+        ht: Option<Arc<crate::rtlwifi::ht::Grant>>,
+        protection: Option<Arc<crate::rtlwifi::protection::Grant>>,
+        tracking: Option<Arc<crate::rtlwifi::tracking::Grant>>,
+    ) -> Result<Option<Arc<crate::rtlwifi::antenna::Grant>>, StationError> {
+        let source = self.antenna.lock();
+        let Some((channel, bytes, cap)) = source.as_ref() else {
+            return Ok(None);
+        };
+        let program = crate::rtlwifi::antenna::Program {
+            base,
+            ht,
+            protection,
+            tracking,
+            channel: *channel,
+            firmware: self.firmware.lock().identity().ok_or(StationError::State)?,
+        };
+        crate::rtlwifi::antenna::Grant::parse(program, bytes, Some([0x77; 32]), *cap)
+            .map(|g| Some(Arc::new(g)))
+            .map_err(StationError::Radio)
     }
     fn tracking(
         &self,
@@ -576,6 +600,7 @@ impl Harness {
                 ht_wide: IrqSafeSpinLock::new(None),
                 protection: IrqSafeSpinLock::new(None),
                 tracking: IrqSafeSpinLock::new(None),
+                antenna: IrqSafeSpinLock::new(None),
                 fallback_channel: IrqSafeSpinLock::new(None),
                 bus_power: IrqSafeSpinLock::new(None),
             },

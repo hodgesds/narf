@@ -116,8 +116,15 @@ pub(crate) struct Grant {
     // Column maxima over all64 signed thermal rows. Unknown in ANY row
     // keeps that index unknown, including between watchdog observations.
     worst: [[i16; 64]; 10],
+    measurement: [u8; 32],
 }
 impl Grant {
+    pub(super) fn measurement_digest(&self) -> [u8; 32] {
+        self.measurement
+    }
+    pub(super) fn program_limits(&self) -> (i16, i16) {
+        (self.ceiling, self.antenna)
+    }
     pub(super) fn registered(
         base: Arc<Calibration>,
         firmware: Identity,
@@ -238,6 +245,11 @@ impl Grant {
             antenna,
             ceiling,
             worst,
+            measurement: {
+                let mut hash = narf_crypto::sha256::Sha256::new();
+                hash.update(b);
+                hash.finalize()
+            },
         };
         q.invoke(|| Ok(()))?;
         Ok(q)
@@ -294,7 +306,18 @@ impl Grant {
         permission: Permission,
         actual: Gains,
     ) -> Result<(), Error> {
+        self.check_extension(domain, permission, actual, self.ceiling, self.antenna)
+    }
+    pub(super) fn check_extension(
+        &self,
+        domain: &RegulatoryDomain,
+        permission: Permission,
+        actual: Gains,
+        extension_limit: i16,
+        extension_antenna: i16,
+    ) -> Result<(), Error> {
         self.invoke(|| {
+            let antenna = self.antenna.max(extension_antenna);
             if self
                 .base
                 .permission(domain, self.channel)
@@ -319,6 +342,7 @@ impl Grant {
                 .unwrap_or(80);
             let limit = self
                 .ceiling
+                .min(extension_limit)
                 .min(permission.eirp_limit_qdbm())
                 .min(full_span)
                 .min(self.ht.as_ref().map_or(80, |q| q.program_limits().0))
@@ -328,33 +352,20 @@ impl Grant {
                         .map_or(80, |q| q.program_limits().0),
                 );
             let selected = permission.with_gains(actual.cck, actual.ofdm);
-            if !self.base.within(selected, limit, self.antenna) {
+            if !self.base.within(selected, limit, antenna) {
                 return Err(Error::Power(super::channel_power::Error::NoMeasuredGain));
             }
             if let Some(ht) = &self.ht {
-                ht.check_selected(
-                    domain,
-                    permission,
-                    selected,
-                    actual.mcs,
-                    limit,
-                    self.antenna,
-                )?;
+                ht.check_selected(domain, permission, selected, actual.mcs, limit, antenna)?;
             }
             if let Some(protection) = &self.protection {
-                protection.check_selected(
-                    domain,
-                    permission,
-                    selected,
-                    actual.mcs,
-                    limit,
-                    self.antenna,
-                )?;
+                protection
+                    .check_selected(domain, permission, selected, actual.mcs, limit, antenna)?;
             }
             let fits = |row: usize, gain: u8| {
                 gain < 64
                     && self.worst[row][usize::from(gain)] != UNKNOWN
-                    && i32::from(self.worst[row][usize::from(gain)]) + i32::from(self.antenna)
+                    && i32::from(self.worst[row][usize::from(gain)]) + i32::from(antenna)
                         <= i32::from(limit)
             };
             if actual.cck.iter().any(|g| !fits(0, *g))
@@ -493,28 +504,36 @@ impl State {
 /// encloses that actual poll in every retained source capability invocation.
 pub(super) async fn wait<T, F: core::future::Future<Output = Result<T, Error>>>(
     grant: Arc<Grant>,
+    antenna: Option<Arc<super::antenna::Grant>>,
     permission: Permission,
     environment: &impl super::prepare::station::Environment,
     future: F,
 ) -> Result<T, Error> {
     let mut future = core::pin::pin!(future);
     core::future::poll_fn(|cx| {
-        grant
-            .invoke(|| {
-                if environment.preparation_failed()
-                    || environment
-                        .admission()
-                        .is_some_and(|a| a.closed.load(core::sync::atomic::Ordering::Acquire))
-                {
-                    return Err(Error::State);
-                }
-                let domain = environment
-                    .domain()
-                    .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
-                grant.check_sources(&domain, permission)?;
-                Ok(future.as_mut().poll(cx))
-            })
-            .unwrap_or_else(|e| core::task::Poll::Ready(Err(e)))
+        let operation = || {
+            if environment.preparation_failed()
+                || environment
+                    .admission()
+                    .is_some_and(|a| a.closed.load(core::sync::atomic::Ordering::Acquire))
+            {
+                return Err(Error::State);
+            }
+            let domain = environment
+                .domain()
+                .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
+            grant.check_sources(&domain, permission)?;
+            if let Some(antenna) = &antenna {
+                antenna.check_sources(&domain, permission)?;
+            }
+            Ok(future.as_mut().poll(cx))
+        };
+        (if let Some(antenna) = &antenna {
+            antenna.invoke(operation)
+        } else {
+            grant.invoke(operation)
+        })
+        .unwrap_or_else(|e| core::task::Poll::Ready(Err(e)))
     })
     .await
 }

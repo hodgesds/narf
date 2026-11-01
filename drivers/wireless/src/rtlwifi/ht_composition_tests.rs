@@ -2,6 +2,8 @@
 use super::super::super::super::super::super::ht;
 use super::*;
 use core::sync::atomic::AtomicUsize;
+#[path = "antenna_composition_tests.rs"]
+mod antenna_tests;
 #[path = "ht40_composition_tests.rs"]
 mod ht40_tests;
 #[path = "protection_composition_tests.rs"]

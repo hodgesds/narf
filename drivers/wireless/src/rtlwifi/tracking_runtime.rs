@@ -103,12 +103,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let grant = state.grant.clone();
         let sample = state.needs_sample();
         let permission = self.permission.ok_or(Error::State)?;
+        let antenna = self.station.antenna.as_ref().map(|s| s.grant.clone());
         self.phase = Hardware::Failed;
         let mut attempt = Attempt {
             failed: self.station.failed.clone(),
             armed: true,
         };
-        let result = tracking::wait(grant, permission, environment, async {
+        let result = tracking::wait(grant, antenna, permission, environment, async {
             self.io.authority(true, || Ok(()))?;
             let value = radio::rf_read(&self.io, 0x42)
                 .await
@@ -180,6 +181,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .clone();
         let permission = self.permission.ok_or(Error::State)?;
         grant.check(&environment.domain()?, permission, update.gains)?;
+        let antenna = self.station.antenna.as_ref().map(|s| s.grant.clone());
+        if let Some(q) = &antenna {
+            q.check(&environment.domain()?, permission, update.gains)?;
+        }
         let ht = self.station.ht.clone();
         // This changes TX gain only, not peer/channel/key/receive identity.
         // Captured frames retain the same current full-program authority;
@@ -190,81 +195,99 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             failed: self.station.failed.clone(),
             armed: true,
         };
-        let result = tracking::wait(grant.clone(), permission, environment, async {
-            self.io.authority(true, || Ok(()))?;
-            let pause = self.io.read8(0x522)?;
-            self.io.write8(0x522, 0xff)?;
-            if self.io.read8(0x522)? != 0xff {
-                return Err(RadioError::Readback);
-            }
-            let mut idle = false;
-            for _ in 0..101 {
-                if self.io.read32(0x5f8)? == 0 {
-                    idle = true;
-                    break;
-                }
-                self.io.delay_us(10).await;
-            }
-            if !idle {
-                return Err(RadioError::PacketTimeout);
-            }
-            let cr = self.io.read8(0x100)?;
-            if cr & 0xc0 != 0xc0 {
-                return Err(RadioError::State);
-            }
-            self.io.write8(0x100, cr & !0xc0)?;
-            if self.io.read8(0x100)? & 0xc0 != 0 {
-                return Err(RadioError::Readback);
-            }
-            let expected_rf = self.radio.as_ref().ok_or(RadioError::State)?.channel_rf;
-            if radio::rf_read(&self.io, 0x18)
-                .await
-                .map_err(RadioError::Radio)?
-                != expected_rf
-            {
-                return Err(RadioError::Readback);
-            }
-            if update.lck || update.iqk {
-                let report = self.radio.as_mut().ok_or(RadioError::State)?;
-                radio::recalibrate(&self.io, report, update.lck, update.iqk)
-                    .await
-                    .map_err(RadioError::Radio)?;
-                // Existing native LCK/IQK owns its source MAC pause sequences;
-                // ordinary MAC TX/RX stays closed throughout and we re-pause
-                // all queues before touching final gains or opening either gate.
+        let result = tracking::wait(
+            grant.clone(),
+            antenna.clone(),
+            permission,
+            environment,
+            async {
+                self.io.authority(true, || Ok(()))?;
+                let pause = self.io.read8(0x522)?;
                 self.io.write8(0x522, 0xff)?;
-                if self.io.read8(0x522)? != 0xff || self.io.read8(0x100)? & 0xc0 != 0 {
+                if self.io.read8(0x522)? != 0xff {
                     return Err(RadioError::Readback);
                 }
-            }
-            tracking::program(&self.io, update.gains)?;
-            if radio::rf_read(&self.io, 0x18)
-                .await
-                .map_err(RadioError::Radio)?
-                != expected_rf
-            {
-                return Err(RadioError::Readback);
-            }
-            if let Some(ht) = &ht {
-                ht.readback_width(
-                    &self.io,
-                    update.gains.mcs,
-                    self.packet.ht,
-                    self.packet.width,
+                let mut idle = false;
+                for _ in 0..101 {
+                    if self.io.read32(0x5f8)? == 0 {
+                        idle = true;
+                        break;
+                    }
+                    self.io.delay_us(10).await;
+                }
+                if !idle {
+                    return Err(RadioError::PacketTimeout);
+                }
+                let cr = self.io.read8(0x100)?;
+                if cr & 0xc0 != 0xc0 {
+                    return Err(RadioError::State);
+                }
+                self.io.write8(0x100, cr & !0xc0)?;
+                if self.io.read8(0x100)? & 0xc0 != 0 {
+                    return Err(RadioError::Readback);
+                }
+                let expected_rf = self.radio.as_ref().ok_or(RadioError::State)?.channel_rf;
+                if radio::rf_read(&self.io, 0x18)
+                    .await
+                    .map_err(RadioError::Radio)?
+                    != expected_rf
+                {
+                    return Err(RadioError::Readback);
+                }
+                if update.lck || update.iqk {
+                    let report = self.radio.as_mut().ok_or(RadioError::State)?;
+                    radio::recalibrate(&self.io, report, update.lck, update.iqk)
+                        .await
+                        .map_err(RadioError::Radio)?;
+                    // Existing native LCK/IQK owns its source MAC pause sequences;
+                    // ordinary MAC TX/RX stays closed throughout and we re-pause
+                    // all queues before touching final gains or opening either gate.
+                    self.io.write8(0x522, 0xff)?;
+                    if self.io.read8(0x522)? != 0xff || self.io.read8(0x100)? & 0xc0 != 0 {
+                        return Err(RadioError::Readback);
+                    }
+                }
+                tracking::program(&self.io, update.gains)?;
+                if radio::rf_read(&self.io, 0x18)
+                    .await
+                    .map_err(RadioError::Radio)?
+                    != expected_rf
+                {
+                    return Err(RadioError::Readback);
+                }
+                if let Some(ht) = &ht {
+                    ht.readback_width(
+                        &self.io,
+                        update.gains.mcs,
+                        self.packet.ht,
+                        self.packet.width,
+                    )?;
+                }
+                grant.check(
+                    &environment.domain().map_err(|_| RadioError::State)?,
+                    permission,
+                    update.gains,
                 )?;
-            }
-            grant.check(
-                &environment.domain().map_err(|_| RadioError::State)?,
-                permission,
-                update.gains,
-            )?;
-            self.io.write8(0x100, cr)?;
-            self.io.write8(0x522, pause)?;
-            if self.io.read8(0x100)? != cr || self.io.read8(0x522)? != pause {
-                return Err(RadioError::Readback);
-            }
-            Ok(())
-        })
+                if let Some(q) = &antenna {
+                    q.check(
+                        &environment.domain().map_err(|_| RadioError::State)?,
+                        permission,
+                        update.gains,
+                    )?;
+                    self.station
+                        .antenna
+                        .as_ref()
+                        .ok_or(RadioError::State)?
+                        .readback(&self.io)?;
+                }
+                self.io.write8(0x100, cr)?;
+                self.io.write8(0x522, pause)?;
+                if self.io.read8(0x100)? != cr || self.io.read8(0x522)? != pause {
+                    return Err(RadioError::Readback);
+                }
+                Ok(())
+            },
+        )
         .await;
         attempt.armed = false;
         if let Err(e) = result {

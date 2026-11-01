@@ -432,11 +432,13 @@ pub(crate) mod tests;
 
 /// Every poll of a retained native command earns the same current sources
 /// and policy. A credit/mailbox wait cannot resume into an unqualified write.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn wait<F: core::future::Future<Output = Result<(), Error>>>(
     base: Arc<Calibration>,
     ht: Option<Arc<Grant>>,
     protection: Option<Arc<super::protection::Grant>>,
     tracking: Option<Arc<super::tracking::Grant>>,
+    antenna: Option<Arc<super::antenna::Grant>>,
     permission: Permission,
     environment: &impl super::prepare::station::Environment,
     future: F,
@@ -460,7 +462,10 @@ pub(super) async fn wait<F: core::future::Future<Output = Result<(), Error>>>(
             if let Some(protection) = &protection {
                 protection.check(&domain, permission)?;
             }
-            if let Some(tracking) = &tracking {
+            if let Some(antenna) = &antenna {
+                antenna.check_sources(&domain, permission)?;
+                antenna.invoke(|| Ok(future.as_mut().poll(cx)))
+            } else if let Some(tracking) = &tracking {
                 tracking.check_sources(&domain, permission)?;
                 tracking.invoke(|| Ok(future.as_mut().poll(cx)))
             } else {

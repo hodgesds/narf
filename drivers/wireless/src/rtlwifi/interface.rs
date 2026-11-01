@@ -634,6 +634,33 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             self.close();
         }
     }
+    pub(super) async fn antenna_diversity(&self) {
+        let mut storage = self.prepared.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            return;
+        };
+        if self.admission.closed.load(Ordering::Acquire) {
+            return;
+        }
+        if owner
+            .progress_station_antenna(&self.environment)
+            .await
+            .is_err()
+        {
+            owner.abort_station();
+            self.close();
+        }
+    }
+    pub(crate) fn antenna_diversity_request(
+        &self,
+        firmware: super::firmware_transport::Identity,
+    ) -> Result<super::AntennaDiversityRequest, Error> {
+        let storage = self.prepared.try_lock().ok_or(Error::Busy)?;
+        storage
+            .as_ref()
+            .ok_or(Error::State)?
+            .station_antenna_request(firmware, &self.environment)
+    }
     pub(crate) fn thermal_tracking_request(
         &self,
         firmware: super::firmware_transport::Identity,
@@ -1083,6 +1110,34 @@ pub(super) mod publication_test {
         task::{Context, Waker},
     };
 
+    pub(in crate::rtlwifi) fn copied_then_revoke<
+        I: Port<Buffer = M> + 'static,
+        M: Memory + 'static,
+        E: Environment + 'static,
+    >(
+        device: &Device<I, M, E>,
+        source: narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+    ) -> Result<(), &'static str> {
+        let frame = device
+            .progress()
+            .pop()
+            .ok_or("EE fixture lacks real native copied RX")?;
+        source.revoke();
+        let mut invoked = false;
+        let domain = device
+            .environment
+            .domain()
+            .map_err(|_| "EE copied policy")?;
+        let result = frame.publication.invoke(&domain, || {
+            invoked = true;
+            Ok(())
+        });
+        if invoked || matches!(result, Ok(Some(_))) {
+            return Err("EE revoked source reached copied callback");
+        }
+        device.abort_generation(frame.generation);
+        Ok(())
+    }
     pub(in crate::rtlwifi) async fn old_copy_and_error_across_rebuild<
         I: Port<Buffer = M> + 'static,
         M: Memory + 'static,
@@ -1327,6 +1382,31 @@ impl Environment for NativeEnvironment {
         )
         .map_err(Error::Radio)
     }
+    fn antenna(
+        &self,
+        base: Arc<super::channel_power::Calibration>,
+        ht: Option<Arc<super::ht::Grant>>,
+        protection: Option<Arc<super::protection::Grant>>,
+        tracking: Option<Arc<super::tracking::Grant>>,
+    ) -> Result<Option<Arc<super::antenna::Grant>>, Error> {
+        let channel = self
+            .device
+            .lock()
+            .upgrade()
+            .ok_or(Error::State)?
+            .lifecycle
+            .channel
+            .load(Ordering::Acquire);
+        super::antenna::Grant::registered(super::antenna::Program {
+            base,
+            ht,
+            protection,
+            tracking,
+            channel,
+            firmware: self.firmware().identity().ok_or(Error::State)?,
+        })
+        .map_err(Error::Radio)
+    }
     fn tracking(
         &self,
         base: Arc<super::channel_power::Calibration>,
@@ -1548,6 +1628,7 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
             let seen = signal.as_ref().map(|s| s.count());
             device.drain();
             device.gain_tracking().await;
+            device.antenna_diversity().await;
             device.power_save(FW_LPS.load(Ordering::Acquire)).await;
             device.rate_adaptive().await;
             match (signal, seen) {

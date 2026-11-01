@@ -134,3 +134,9 @@ continuation retains the current static factory/OEM path and grants no
 per-antenna selection authority. Exact per-antenna measurements and the
 antenna descriptor/receive-statistics/calibration owner remain necessary
 for that separate continuation.
+
+The separate [NEAN antenna continuation](rtl8188ee-antenna.md) can qualify
+this exact NETH payload for actual automatic selector0/1 behavior. NETH v1
+alone retains its static antenna program and unchanged recipe. Combined
+thermal polls/programming invoke NEAN too, and every actual candidate gain
+must fit both signed antenna/thermal envelopes before any write/reopen.

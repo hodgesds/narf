@@ -323,6 +323,15 @@ facts, MCC/host span, TPE/PSD and native PHY/TLC/RFH rules are implemented;
 six new native cases are written. This credits implementation without
 claiming their deferred compile/native/release matrix passed.
 
+**Source implementation recount 2026-10-31** (automatic antenna selection written):
+the remaining ledger holds **99 `feature`** rows (98 driver, 1 shared),
+**31 `chip`** and **0 `unknown`**. Eight source-complete implementations
+await validation in `research/implemented-pending-validation.tsv`. The
+RTL8188EE automatic source paths for factory types1/2 and SMART4 are now
+implemented with native PHY/TXD/training and per-mux/thermal qualification;
+no manual antenna control is advertised. Compilation/native/release gates
+remain deferred, and physical measurements are externally supplied.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 5 | 6GHz discovery/periodic/refinement and MLO; AP/P2P/WoW; exact admitted station/HE/TX A-MSDU and idle/associated periodic-scan profiles are software-validated |
@@ -330,7 +339,7 @@ claiming their deferred compile/native/release matrix passed.
 | mt76 | 4 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA; hosted loadable packet ABI is implemented pending validation |
 | ath10k | 18 | 2.4-GHz HT40/coexistence, additional streams/TX STBC and VHT160/80+80, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload |
 | ath9k | 9 | Channel/retune and HT40/SGI40 profiles, factory selection, periodic calibration, larger TX aggregates and idle/station sleep; other chips are separate rows |
-| rtlwifi | 5 | Other matched chips, VHT, dynamic antenna selection/coexistence and WoWLAN; HT40, RTS/CTS and gain tracking are implemented pending validation |
+| rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are implemented pending validation |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
 | rtw89 | 13 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW, periodic RF tracking/runtime LPS and multiple functions; other AX/BE chips are separate rows |

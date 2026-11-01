@@ -91,6 +91,7 @@ pub(super) struct State<M: Memory> {
     pub(super) ht: bool,
     pub(super) width: Option<super::super::ht::Geometry>,
     pub(super) protection: super::super::protection::Mode,
+    pub(super) antenna: Option<u8>,
     /// HIMR/HIMRE/HSIMR currently carry the Linux 88EE masks.
     interrupts: bool,
     /// Firmware leisure power save (fw_current_inpsmode) is active.
@@ -118,6 +119,7 @@ impl<M: Memory> State<M> {
             ht: false,
             width: None,
             protection: super::super::protection::Mode::None,
+            antenna: None,
             interrupts: false,
             leisure: false,
             rate_mask: None,
@@ -158,6 +160,7 @@ pub struct Mpdu {
     /// `_rtl88ee_query_rxphystatus` `rx_pwdb_all` when RXD PHYST carried
     /// the 28-byte EE PHY status.
     pwdb: Option<u8>,
+    antenna_mux: Option<u8>,
 }
 /// Consuming a rejected packet/report is progress, never a receive-idle
 /// proof. Station output waits for a genuine OWN-owned next descriptor.
@@ -184,6 +187,9 @@ impl Mpdu {
     /// Only the station's recipient BA owner may admit such an MPDU.
     pub(super) fn pwdb(&self) -> Option<u8> {
         self.pwdb
+    }
+    pub(super) fn antenna_mux(&self) -> Option<u8> {
+        self.antenna_mux
     }
     pub(super) fn aggregated(&self) -> bool {
         self.aggregated
@@ -895,6 +901,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         prefix[5] = u32::from(rate) | (u32::from(short_gi) << 6) | (0x1f << 8) | (15 << 13);
         prefix[7] = frame.len() as u32;
+        if let Some(mux) = self.packet.antenna {
+            if mux > 1 {
+                return Err(Error::Packet);
+            }
+            prefix[2] |= (u32::from(mux & 1) << 24) | (u32::from((mux >> 1) & 1) << 25);
+            prefix[7] |= u32::from((mux >> 2) & 1) << 29;
+        }
         prefix[8] = address;
         // Fill through the actual live DMA mapping before it can be named
         // by OWN. Retain its owner before the first descriptor mutation.
@@ -1066,6 +1079,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 // EE's PHY info is its own28-byte structure inside drvinfo,
                 // not rtw88 page1. RXD owns rate/BW; no channel field exists.
                 let mut pwdb = None;
+                let mut antenna_mux = None;
                 let mut short_gi = ht && report & (1 << 8) != 0;
                 if status & (1 << 26) != 0 {
                     let info = (((status >> 16) & 15) * 8) as usize;
@@ -1075,6 +1089,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     let mut phy = [0; 28];
                     buffer.read_bytes(((status >> 24) & 3) as usize, &mut phy)?;
                     short_gi |= ht && phy[27] & 2 != 0;
+                    antenna_mux = Some(
+                        ((phy[27] >> 7) & 1) | (((phy[27] >> 6) & 1) << 1) | ((phy[27] & 1) << 2),
+                    );
                     // RX_HAL_IS_CCK_RATE(rxmcs): DESC92C_RATE1M..11M.
                     let cck = !ht && report & 63 < 4;
                     // trx.c reads RFPGA0_XA_HSSIPARAMETER2 BIT(9) with RF on.
@@ -1102,6 +1119,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             width40: report & (1 << 9) != 0,
                             aggregated,
                             pwdb,
+                            antenna_mux,
                         });
                     }
                 } else if bytes.len() >= 24
@@ -1119,6 +1137,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         width40: report & (1 << 9) != 0,
                         aggregated,
                         pwdb,
+                        antenna_mux,
                     });
                 }
             }

@@ -98,6 +98,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let fence = target.clone();
         let protection = self.station.protection.clone();
         let tracking = self.station.tracking.as_ref().map(|s| s.grant.clone());
+        let antenna = self.station.antenna.as_ref().map(|s| s.grant.clone());
         let operation = async {
             self.io.authority(true, || Ok(()))?;
             let pause = self.io.read8(0x522)?;
@@ -189,6 +190,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             Some(fence),
             protection,
             tracking,
+            antenna,
             permission,
             environment,
             operation,

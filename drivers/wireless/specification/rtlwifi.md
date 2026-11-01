@@ -1391,6 +1391,37 @@ and native execution remain pending. Board measurement/signing and physical
 thermal/RF acceptance remain external. Linux EE supports dynamic antenna
 diversity, which stays a separate measured-antenna continuation.
 
+### Separately qualified RTL8188EE automatic antenna selection (implemented, acceptance pending)
+
+The [NEAN v1 contract](rtl8188ee-antenna.md) adds actual automatic diversity
+for factory types1/2 and SMART type4. It binds exact current firmware/NEPC
+and measured NEHT/NERT/NETH payloads, with separately signed two-selector
+x64-thermal x10-rate-family x64-gain full-program envelopes and antenna
+bounds. Every possible path and temperature must admit actual gains under
+all preceding/current limits; no static board curve authorizes another
+antenna. No board measurements or signed physical deployment assets are
+supplied. `RtlwifiDevice::antenna_diversity_request()` is pure provisioning
+metadata; the source EE driver has no manual nl80211 antenna setter.
+
+Complete real PHY records supply the mux and PWDB. AP-bound statistics drive
+source type1/2 averages/ties; SMART uses actual own-MAC-directed samples,
+source two-combination mapping and a real2s training deadline. Actual RX/
+response/default controls and TXD2[24,25]/DW7[29] select qualified paths.
+Initialization forces/readbacks factory-type MAIN/AUX mux codes, resolving
+the pinned Linux prior-logical-selector/type alias. Every transition uses
+real host receipts, scheduler idle, MAC/queue pause and antenna/gain/RF/gate
+readbacks. Current NEAN sources enclose polling, native TX and copied final
+publication, including combined thermal updates. A subsequent peer restores
+the exact static antenna program and repeats IQK/LCK before retiring NEAN.
+Key/PN/BA/DMA ownership and original OWN receipts are preserved.
+
+Six new native `drivers/wireless/rtlwifi/antenna` cases cover factory/full-
+dimensional identity, type1/2/HP actual PHY and DHCP, SMART timing/target/
+selection, HT40+RTS+thermal composition, failed readbacks/idle/cancellation/
+static restore, copied-source loss and held M4. Compilation and native
+execution remain pending. Physical antenna mapping, full-program per-path
+measurements, trusted signing and silicon/RF acceptance remain external.
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE
@@ -1431,7 +1462,7 @@ Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
 
 | Chip | Source hardware scope | Remaining native software |
 |---|---|---|
-| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. NEHT v2 additionally implements SGI20 and7935-byte reception; four native composed regressions pass on both architectures. Reset/recovery, system suspend and IPS are software-validated. HT20/40 NEHT v4 is implemented pending native acceptance above. RTS/CTS NERT continuation is implemented pending native acceptance above. Thermal TXAGC NETH continuation is implemented pending native acceptance above. Remaining software: dynamic antenna selection (PCIe ASPM, MSI delivery, fwlps leisure power save and DMA quiescence are implemented). Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
+| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. NEHT v2 additionally implements SGI20 and7935-byte reception; four native composed regressions pass on both architectures. Reset/recovery, system suspend and IPS are software-validated. HT20/40 NEHT v4 is implemented pending native acceptance above. RTS/CTS NERT continuation is implemented pending native acceptance above. Thermal TXAGC NETH continuation is implemented pending native acceptance above. Automatic antenna NEAN continuation is implemented pending native acceptance above. The retained EE source feature rows are implemented; other chip runtimes remain separate (PCIe ASPM, MSI delivery, fwlps leisure power save and DMA quiescence are implemented). Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
 | RTL8192CE family aliases / RTL8192EE |2.4GHz HT; CE aliases need exact RF-type qualification, including the8176/8188CE variant; EE is2T2R |Retained chip firmware/MAC/PHY/RF/calibration/power/packet/station chain, then full HT/QoS/lifecycle. The8179/8188EE HT path does not admit these IDs. |
 | RTL8192DE |Dual-band dual-MAC HT |Exact per-function reset/power/firmware/DMA/radio ownership and station chains, then bands/HT/QoS/lifecycle |
 | RTL8723AE/BE |2.4GHz1T1R HT with BT |Chip-specific retained chain, antenna/BT coexistence and HT/QoS/lifecycle |
@@ -1543,7 +1574,7 @@ runtimes remain separate from the retained RTL8188EE owner.
 | Row | Concrete blocker |
 |---|---|
 | `bt_coexistence` | Bluetooth coexistence on RTL8723AE/BE; blocked on the rtl8723ae/rtl8723be chip runtimes |
-| `dynamic_antenna_selection` | Dynamic antenna selection/tracking; blocked on per-antenna signed board measurements (NEPC binds one static factory antenna) |
+| `dynamic_antenna_selection` | Native factory type1/2 hardware diversity and SMART type4, actual PHY mux/descriptor/training/restore and separate signed NEAN per-selector/thermal full-program qualification are implemented above, pending release compilation/native acceptance. Original static records remain unchanged; board measurements and physical mapping/RF acceptance remain external |
 | `five_ghz_operation` | 5GHz band operation on RTL8192DE/RTL8821AE; blocked on the rtl8192de/rtl8821ae chip runtimes (RTL8188EE is 2.4GHz-only) |
 | `ht40` | Source-correct native HT20/40/secondary selection and signed NEHT v4 full-program qualification are implemented above, pending coordinated native acceptance. Existing NEHT v2/v3 remain20MHz. Measured per-device board data and physical acceptance remain external |
 | `rf_gain_tracking` | Native thermal TXAGC, actual IQK/LCK/restore and separate signed NETH full-dimensional qualification are implemented above, pending coordinated release compilation/native acceptance. Original NEPC/NEHT/NERT formats remain unchanged; measured board envelopes and physical thermal acceptance remain external |

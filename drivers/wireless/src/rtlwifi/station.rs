@@ -49,6 +49,8 @@ pub(crate) enum Phase {
     Stopped,
     Failed,
 }
+#[path = "antenna_runtime.rs"]
+mod antenna_runtime;
 #[path = "ht_width.rs"]
 mod ht_width;
 #[path = "tracking_runtime.rs"]
@@ -116,6 +118,15 @@ pub(crate) trait Environment: Send + Sync {
         _ht: Option<Arc<super::super::ht::Grant>>,
         _protection: Option<Arc<super::super::protection::Grant>>,
     ) -> Result<Option<Arc<super::super::tracking::Grant>>, Error> {
+        Ok(None)
+    }
+    fn antenna(
+        &self,
+        _base: Arc<super::super::channel_power::Calibration>,
+        _ht: Option<Arc<super::super::ht::Grant>>,
+        _protection: Option<Arc<super::super::protection::Grant>>,
+        _tracking: Option<Arc<super::super::tracking::Grant>>,
+    ) -> Result<Option<Arc<super::super::antenna::Grant>>, Error> {
         Ok(None)
     }
     /// The separately signed DATA rate fallback continuation (`NEFB`)
@@ -283,6 +294,10 @@ pub(crate) struct Publication {
         Arc<super::super::tracking::Grant>,
         super::super::tracking::Gains,
     )>,
+    antenna: Option<(
+        Arc<super::super::antenna::Grant>,
+        super::super::tracking::Gains,
+    )>,
     permission: super::super::channel_power::Permission,
     indices: [u8; 8],
     epoch: Arc<AtomicU64>,
@@ -321,6 +336,9 @@ impl Publication {
             if let Some((tracking, gains)) = &self.tracking {
                 tracking.check(domain, self.permission, *gains)?;
             }
+            if let Some((antenna, gains)) = &self.antenna {
+                antenna.check(domain, self.permission, *gains)?;
+            }
             let publish = || {
                 self.pci.invoke(|| {
                     if self.current() {
@@ -330,7 +348,9 @@ impl Publication {
                     }
                 })
             };
-            if let Some((tracking, _)) = &self.tracking {
+            if let Some((antenna, _)) = &self.antenna {
+                antenna.invoke(publish)
+            } else if let Some((tracking, _)) = &self.tracking {
                 tracking.invoke(publish)
             } else if let Some(protection) = &self.protection {
                 protection.invoke(publish)
@@ -374,6 +394,7 @@ pub(super) struct State {
     wide_profiles: Vec<Arc<super::super::ht::Grant>>,
     protection: Option<Arc<super::super::protection::Grant>>,
     tracking: Option<super::super::tracking::State>,
+    antenna: Option<super::super::antenna::State>,
     erp: bool,
     rx_idle: bool,
     ht_indices: [u8; 8],
@@ -430,6 +451,7 @@ impl State {
             wide_profiles: Vec::new(),
             protection: None,
             tracking: None,
+            antenna: None,
             erp: false,
             rx_idle: false,
             ht_indices: [0; 8],
@@ -898,6 +920,41 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             protection.as_deref(),
         ))
     }
+    pub(crate) fn station_antenna_request(
+        &self,
+        firmware: super::super::firmware_transport::Identity,
+        environment: &impl Environment,
+    ) -> Result<super::super::AntennaDiversityRequest, Error> {
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .ok_or(Error::State)?
+            .clone();
+        base.with_current(|| firmware.invoke(|| Ok(())))?;
+        if let Some(ht) = &self.station.ht {
+            ht.invoke(|| Ok(()))?;
+        }
+        let protection = match &self.station.protection {
+            Some(q) => Some(q.clone()),
+            None => environment.protection(base.clone(), self.station.ht.clone())?,
+        };
+        let tracking = match &self.station.tracking {
+            Some(s) => Some(s.grant.clone()),
+            None => {
+                environment.tracking(base.clone(), self.station.ht.clone(), protection.clone())?
+            }
+        };
+        let program = super::super::antenna::Program {
+            base,
+            ht: self.station.ht.clone(),
+            protection,
+            tracking,
+            firmware,
+            channel: self.permission.ok_or(Error::State)?.channel(),
+        };
+        super::super::antenna::request(&program).map_err(Error::Radio)
+    }
     pub(crate) fn station_ht40_supported(&self) -> bool {
         !self.station.wide_profiles.is_empty()
     }
@@ -1010,6 +1067,14 @@ impl<I: Io, M: Memory> Prepared<I, M> {
                 .check(&domain, permission, tracking.applied)?;
             super::super::tracking::readback(&self.io, tracking.applied)?;
         }
+        if let Some(antenna) = &self.station.antenna {
+            antenna.grant.check(
+                &domain,
+                permission,
+                self.station_operating_gains(environment)?,
+            )?;
+            antenna.readback(&self.io)?;
+        }
         if let Some(protection) = &self.station.protection {
             protection.check(&domain, permission)?;
         }
@@ -1026,7 +1091,9 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             }
             super::super::wmm::program(&self.io, p, self.station.capability & 0x400 != 0)
         };
-        if let Some(tracking) = &self.station.tracking {
+        if let Some(antenna) = &self.station.antenna {
+            antenna.grant.invoke(program)?;
+        } else if let Some(tracking) = &self.station.tracking {
             tracking.grant.invoke(program)?;
         } else if let Some(ht) = &self.station.ht {
             ht.invoke(program)?;
@@ -1093,7 +1160,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         let operation = || {
             self.check_station_policy(environment)
                 .map_err(|_| RadioError::State)?;
-            if let Some(tracking) = &self.station.tracking {
+            if let Some(antenna) = &self.station.antenna {
+                antenna.grant.invoke(|| self.io.authority(true, operation))
+            } else if let Some(tracking) = &self.station.tracking {
                 tracking.grant.invoke(|| self.io.authority(true, operation))
             } else if let Some(protection) = &self.station.protection {
                 protection.invoke(|| self.io.authority(true, operation))
@@ -1113,6 +1182,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         environment: &impl Environment,
     ) -> Result<Publication, Error> {
         self.check_station_policy(environment)?;
+        let operating_gains = self.station_operating_gains(environment)?;
         Ok(Publication {
             pci: self.io.publication()?,
             base: self
@@ -1128,6 +1198,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 .tracking
                 .as_ref()
                 .map(|s| (s.grant.clone(), s.applied)),
+            antenna: self
+                .station
+                .antenna
+                .as_ref()
+                .map(|s| (s.grant.clone(), operating_gains)),
             permission: self.permission.ok_or(Error::State)?,
             indices: self.station.ht_indices,
             epoch: self.station.epoch.clone(),
@@ -1220,6 +1295,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 self.station.ht.clone(),
                 self.station.protection.clone(),
                 self.station.tracking.as_ref().map(|s| s.grant.clone()),
+                self.station.antenna.as_ref().map(|s| s.grant.clone()),
                 self.permission.ok_or(Error::State)?,
                 environment,
                 self.awake_station(),
@@ -1373,6 +1449,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         // mask advertises SGI. NEFB v1 did not qualify that firmware mode.
         let fallback = matches!(kind, Kind::Data)
             && self.station.tracking.is_none()
+            && self.station.antenna.is_none()
             && protection == super::super::protection::Mode::None
             && !sgi_profile
             && self
@@ -1383,6 +1460,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             && self.station.fallback_current();
         let protection_source = self.station.protection.clone();
         let tracking_source = self.station.tracking.as_ref().map(|s| s.grant.clone());
+        let antenna_source = self.station.antenna.as_ref().map(|s| s.grant.clone());
         let mut publish = || {
             let op = || {
                 self.check_station_policy(environment)
@@ -1408,6 +1486,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     return Err(RadioError::State);
                 }
                 self.packet.protection = current;
+                self.packet.antenna = self.station.antenna.as_ref().and_then(|s| s.descriptor());
                 let mut send = || {
                     self.submit_aggregate(
                         &bytes,
@@ -1417,7 +1496,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         short_gi,
                     )
                 };
-                if let Some(grant) = &tracking_source {
+                if let Some(grant) = &antenna_source {
+                    grant.invoke(send)
+                } else if let Some(grant) = &tracking_source {
                     grant.invoke(send)
                 } else if let Some(grant) = &protection_source {
                     grant.invoke(send)
@@ -1549,6 +1630,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 .map(|p| Self::offered_width(p.width(), p.ht().operation()))
                 .transpose()?
                 .flatten();
+            self.restore_station_antenna(environment).await?;
             self.restore_station_tracking(environment).await?;
             self.select_station_width(width, environment).await?;
             let base = self
@@ -1584,6 +1666,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             }
             self.station.protection = protection;
             self.install_station_tracking(environment)?;
+            self.install_station_antenna(environment).await?;
             super::super::ht::wait(
                 self.station
                     .calibration
@@ -1593,6 +1676,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 self.station.ht.clone(),
                 self.station.protection.clone(),
                 self.station.tracking.as_ref().map(|s| s.grant.clone()),
+                self.station.antenna.as_ref().map(|s| s.grant.clone()),
                 self.permission.ok_or(Error::State)?,
                 environment,
                 self.prepare_station_peer(bssid, rates, basic, capability),
@@ -1647,7 +1731,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             return Err(Error::Profile);
                         }
                         let ht = self.station.ht.as_ref().ok_or(Error::Profile)?;
-                        ht.invoke(|| super::super::station_control::ht_timing(&self.io))?;
+                        let timing = || super::super::station_control::ht_timing(&self.io);
+                        if let Some(antenna) = &self.station.antenna {
+                            antenna.grant.invoke(timing)?;
+                        } else if let Some(tracking) = &self.station.tracking {
+                            tracking.grant.invoke(timing)?;
+                        } else {
+                            ht.invoke(timing)?;
+                        }
                         ht.readback_width(
                             &self.io,
                             self.station.ht_indices,
@@ -1671,6 +1762,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         ht,
                         self.station.protection.clone(),
                         self.station.tracking.as_ref().map(|s| s.grant.clone()),
+                        self.station.antenna.as_ref().map(|s| s.grant.clone()),
                         permission,
                         environment,
                         self.complete_station_peer_admitted(
@@ -1862,6 +1954,14 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 && (frame.width40() || !self.station.ht_profile.is_some_and(|p| p.rx_sgi20()))
             {
                 continue;
+            }
+            if let (Some(antenna), Some(mux), Some(pwdb), Some(bssid)) = (
+                &mut self.station.antenna,
+                frame.antenna_mux(),
+                frame.pwdb(),
+                peer,
+            ) {
+                antenna.sample(frame.bytes(), own, bssid, mux, pwdb);
             }
             // _rtl88ee_translate_rx_signal_stuff → rtl_process_phyinfo.
             if let (Some(pwdb), Some(bssid)) = (frame.pwdb(), peer) {
@@ -2283,6 +2383,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             ht,
             self.station.protection.clone(),
             self.station.tracking.as_ref().map(|s| s.grant.clone()),
+            self.station.antenna.as_ref().map(|s| s.grant.clone()),
             permission,
             environment,
             self.install_rate_mask(payload, environment.admission().map(Arc::as_ref)),
