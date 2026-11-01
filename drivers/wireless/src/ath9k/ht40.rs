@@ -262,7 +262,7 @@ impl Grant {
                 })())
             }
         }
-        self.facts.base.invoke(|| {
+        self.facts.base.invoke_twenty(|| {
             self.cap
                 .invoke(Current(self, operation))
                 .map_err(|_| Error::Access)?

@@ -255,6 +255,18 @@ impl Grant {
         if let Some((grant, _)) = &self.wide {
             return grant.invoke(operation);
         }
+        self.invoke_twenty(operation)
+    }
+    /// Current nominal H1/2 authority only. A wide grant nests this exact
+    /// base before its own full-span checks; redispatching through invoke
+    /// here would recursively instantiate ever-growing closure types.
+    pub(super) fn invoke_twenty<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        if self.wide.is_some() {
+            return Err(Error::State);
+        }
         struct Live<'a, F>(&'a Grant, F);
         impl<T, F: FnOnce() -> Result<T, Error>> CapOp<FirmwareBlob, Read> for Live<'_, F> {
             type Output = Result<T, Error>;
