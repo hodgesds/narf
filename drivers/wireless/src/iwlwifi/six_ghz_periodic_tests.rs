@@ -5,8 +5,15 @@ use super::*;
 fn smoke_iwl_six_ghz_periodic_psc_passive_typed_results_and_retirement() -> TestResult {
     check(|| {
         for associated in [false, true] {
+            let events = super::associated::Events::install();
             let model = six::model();
             let guard = six::setup(six::Native::Sc, model, Fault::None)?;
+            if associated {
+                // The helper's exact transaction is the installed6GHz
+                // policy. Add the scan's legacy rule only after that
+                // current serving-link owner has completed association.
+                six::join(&guard, model)?;
+            }
             let mut domain = six::policy();
             domain.rules.push(narf_wireless::reg::RegRule {
                 freq_start_mhz: 2400,
@@ -16,9 +23,6 @@ fn smoke_iwl_six_ghz_periodic_psc_passive_typed_results_and_retirement() -> Test
                 flags: narf_wireless::reg::RegFlags::empty(),
             });
             guard.policy_db.install(domain);
-            if associated {
-                six::join(&guard, model)?;
-            }
             let mut request = configured(true);
             // Same numeric channel5 on two physical bands, plus nonPSC1
             // which Linux removes before emitting the native periodic job.
@@ -36,22 +40,21 @@ fn smoke_iwl_six_ghz_periodic_psc_passive_typed_results_and_retirement() -> Test
                 wire.firmware.inject(0xd9, 0, 0x8000, &[]);
             }
             until(|| {
-                control.device().state.try_lock().is_some_and(|s| {
-                    s.beacons.iter().any(|b| {
-                        b.bssid == AP
-                            && b.band == super::super::super::super::native_band::Band::Six
-                    }) && s.beacons.iter().any(|b| {
-                        b.bssid == AP
-                            && b.band == super::super::super::super::native_band::Band::Two
+                events.contains(77)
+                    && control.device().state.try_lock().is_some_and(|s| {
+                        s.beacons.iter().any(|b| {
+                            b.bssid == AP
+                                && b.band == super::super::super::super::native_band::Band::Six
+                        }) && s.beacons.iter().any(|b| {
+                            b.bssid == AP
+                                && b.band == super::super::super::super::native_band::Band::Two
+                        })
                     })
-                })
             })?;
-            let source = control.source.1.lock();
-            require(
-                !source.is_empty(),
-                "periodic6GHz never published a current result event",
-            )?;
-            drop(source);
+            // RESULTS is multicast; only a generic-netlink request's
+            // terminal ACK belongs to the DeferredReplySink. Direct START
+            // has no such ACK. Observe the actual current event boundary.
+            events.check(77)?;
             let state = control
                 .device()
                 .state

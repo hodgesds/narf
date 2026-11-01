@@ -439,6 +439,10 @@ fn admission_and_packet_loss() -> Result<(), &'static str> {
         );
     }
     session.backend.sequence.cancel();
+    // Finish this physical fixture before the independent legacy-profile
+    // subcase. Shadowing `concrete` alone retains its Binding until scope end.
+    drop(concrete);
+    drop(session);
     let (mut legacy, concrete) = setup_features(0)?;
     legacy
         .backend
@@ -461,6 +465,8 @@ fn admission_and_packet_loss() -> Result<(), &'static str> {
     {
         return Err("private FRAME inferred optional CNM ABI from legacy native device metadata");
     }
+    drop(concrete);
+    drop(legacy);
     for cause in 0..4 {
         let (mut session, concrete) = started(Some(true))?;
         let policy = session.backend.tx_policy.as_ref().unwrap().clone();

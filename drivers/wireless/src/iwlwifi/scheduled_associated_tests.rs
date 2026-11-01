@@ -20,9 +20,9 @@ fn multicast(namespace: u64, group: u32, message: &[u8]) {
         EVENTS.lock().push((namespace, group, message.to_vec()));
     }
 }
-struct Events(Option<fn(u64, u32, &[u8])>);
+pub(super) struct Events(Option<fn(u64, u32, &[u8])>);
 impl Events {
-    fn install() -> Self {
+    pub(super) fn install() -> Self {
         EVENTS.lock().clear();
         CAPTURING.store(true, Ordering::Release);
         Self(narf_net::netlink_generic::install_event_sink(multicast))
@@ -30,13 +30,13 @@ impl Events {
     fn clear(&self) {
         EVENTS.lock().clear();
     }
-    fn contains(&self, command: u8) -> bool {
+    pub(super) fn contains(&self, command: u8) -> bool {
         EVENTS
             .lock()
             .iter()
             .any(|(_, _, message)| message.get(16) == Some(&command))
     }
-    fn check(&self, command: u8) -> R {
+    pub(super) fn check(&self, command: u8) -> R {
         require(
             EVENTS.lock().iter().any(|(namespace, group, message)| {
                 *namespace == 0

@@ -259,6 +259,10 @@ fn smoke_ath10k_vht_denied_segment_or_no_vht_fact_falls_back_without_vht_element
             h.model(|m| {
                 let f = m.data.as_mut().unwrap();
                 f.vht = None;
+                // The remaining actual HT AP map is MCS0..7 only. Its
+                // HT-only PEER_ASSOC has NSS1 even though local chains and
+                // the discarded VHT map legitimately support two streams.
+                f.ht_peer_nss = 1;
                 f.rx_phy = Some((8, 0x87, 0));
             });
             h.join()?;
@@ -345,10 +349,11 @@ fn smoke_ath10k_vht80_response_without_vht_or_changed_width_never_publishes_peer
                         v[op] = 0;
                         v[op + 1] = 0;
                     }
-                    // Basic VHT-MCS set requiring two streams.
+                    // Basic VHT-MCS set requiring three streams. The
+                    // actual initialized two-stream source admits0xfff0.
                     _ => {
                         let basic = v.len() - 2;
-                        v[basic] = 0xf0;
+                        v[basic] = 0xc0;
                     }
                 }
             });

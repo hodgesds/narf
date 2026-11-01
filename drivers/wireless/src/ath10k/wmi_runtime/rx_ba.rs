@@ -45,6 +45,15 @@ impl Owner {
             ppdu: None,
         })
     }
+    pub(super) fn narrow_coexistence(&mut self, primary: u16) -> Result<(), Error> {
+        let profile = self
+            .profile
+            .ok_or(Error::Failed)?
+            .coexistence_twenty(primary)?;
+        self.flush();
+        self.profile = Some(profile);
+        Ok(())
+    }
     pub(super) fn ht(&self) -> bool {
         self.profile.is_some()
     }

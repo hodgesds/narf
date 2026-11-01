@@ -54,7 +54,7 @@ fn scan_fields() -> Result<(), &'static str> {
         }
     }
     let mut invalid = scan_beacon(6, b"invalid-channel");
-    for tag in [0u32, 240, 255] {
+    for tag in core::iter::once(0u32).chain(240..=255) {
         invalid[12..16].copy_from_slice(&((tag << 8) | 1 << 16).to_le_bytes());
         if scan::rx_native(&invalid).is_some() {
             return Err("invalid native channel tag became a U2M alias");

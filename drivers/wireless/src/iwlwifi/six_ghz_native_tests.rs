@@ -229,6 +229,23 @@ pub(super) fn release_power() -> R {
     wire.firmware.inject(cmd, group, sequence, &[]);
     Ok(())
 }
+fn power_progress(mut complete: impl FnMut() -> bool, reason: &'static str) -> R {
+    // A copied command receipt still waits on the actual production1ms
+    // no-IRQ Activity fallback. Tight iteration counts do not establish
+    // that elapsed-time contract on every release/QEMU schedule.
+    let deadline = narf_time::Deadline::after_ms(3000);
+    loop {
+        service()?;
+        drain();
+        if complete() {
+            return Ok(());
+        }
+        if deadline.expired() {
+            return Err(reason);
+        }
+        narf_scheduler::sleep_pumps::run();
+    }
+}
 #[inline(never)]
 fn queued_tpe_blocks_native_data(batch: bool) -> R {
     let six = model();
@@ -269,13 +286,10 @@ fn queued_tpe_blocks_native_data(batch: bool) -> R {
         wire.mpdu(&beacon, false);
         (wire.data.len(), wire.aggregates.len())
     };
-    for _ in 0..256 {
-        service()?;
-        drain();
-        if HARNESS.lock().as_ref().unwrap().1.held.is_some() {
-            break;
-        }
-    }
+    power_progress(
+        || HARNESS.lock().as_ref().unwrap().1.held.is_some(),
+        "6GHz queued TPE did not reach actual native power receipt owner",
+    )?;
     {
         let slot = HARNESS.lock();
         let wire = &slot.as_ref().unwrap().1;
@@ -287,13 +301,14 @@ fn queued_tpe_blocks_native_data(batch: bool) -> R {
         )?;
     }
     release_power()?;
-    for _ in 0..256 {
-        service()?;
-        drain();
-        if HARNESS.lock().as_ref().unwrap().1.data.len() > before_data {
-            break;
-        }
-    }
+    power_progress(
+        || {
+            let slot = HARNESS.lock();
+            let wire = &slot.as_ref().unwrap().1;
+            wire.data.len() > before_data && (!batch || wire.aggregates.len() > before_aggregate)
+        },
+        "6GHz native DATA did not resume after current tighter TPE receipt",
+    )?;
     carrier(guard.device(), true)?;
     let resumed = {
         let slot = HARNESS.lock();
@@ -343,7 +358,8 @@ fn credit_poll_copies_stricter_tpe_before_publication() -> R {
     // still-unpublished frame must wait for the fresh AP constraint receipt.
     let mut future = Box::pin(state.hardware.transmit(queue, &frame, 26, None));
     let mut cx = Context::from_waker(Waker::noop());
-    for _ in 0..256 {
+    let deadline = narf_time::Deadline::after_ms(3000);
+    loop {
         require(
             future.as_mut().poll(&mut cx).is_pending(),
             "6GHz credit-wait TPE receipt escaped",
@@ -352,6 +368,10 @@ fn credit_poll_copies_stricter_tpe_before_publication() -> R {
         if HARNESS.lock().as_ref().unwrap().1.held.is_some() {
             break;
         }
+        if deadline.expired() {
+            return Err("6GHz credit-wait power owner did not reach native receipt");
+        }
+        narf_scheduler::sleep_pumps::run();
     }
     let unpublished = HARNESS.lock().as_ref().unwrap().1.data.len() == before;
     require(
@@ -839,7 +859,8 @@ fn smoke_iwl_six_ghz_held_ap_power_tightening_and_dropped_policy_owner_close_tx(
                     .associate_in_domain(request_six(six), &domain),
             ));
             let mut cx = Context::from_waker(Waker::noop());
-            for _ in 0..256 {
+            let deadline = narf_time::Deadline::after_ms(3000);
+            loop {
                 require(
                     future.as_mut().unwrap().as_mut().poll(&mut cx).is_pending(),
                     "6GHz held AP power receipt escaped",
@@ -848,6 +869,10 @@ fn smoke_iwl_six_ghz_held_ap_power_tightening_and_dropped_policy_owner_close_tx(
                 if HARNESS.lock().as_ref().unwrap().1.held.is_some() {
                     break;
                 }
+                if deadline.expired() {
+                    return Err("6GHz initial power owner did not reach native receipt");
+                }
+                narf_scheduler::sleep_pumps::run();
             }
             require(
                 HARNESS.lock().as_ref().unwrap().1.air.is_empty(),
@@ -898,10 +923,16 @@ fn smoke_iwl_six_ghz_held_ap_power_tightening_and_dropped_policy_owner_close_tx(
                 close(&guard)?;
                 continue;
             } else {
-                for _ in 0..32 {
-                    service()?;
-                    drain();
-                }
+                power_progress(
+                    || {
+                        guard
+                            .device()
+                            .state
+                            .try_lock()
+                            .is_some_and(|state| state.needs_reset && state.hardware.is_failed())
+                    },
+                    "6GHz dropped power owner did not retire native transport",
+                )?;
             }
             carrier(guard.device(), false)?;
             let state = guard

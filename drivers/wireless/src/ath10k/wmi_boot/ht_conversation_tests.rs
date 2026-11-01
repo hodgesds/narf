@@ -67,6 +67,9 @@ fn smoke_ath10k_ht_response_mcs_guard_density_are_bound_to_native_peer() -> Test
             response[2] = 0x0c;
             response[4] = 0x08;
             response[5] = 0x15;
+            // AP TX is explicitly different from its narrowed RX mask.
+            // One advertised TX stream still promises MCS0..7.
+            response[17] = 3;
             f.ht_sgi = false;
             f.ht_ampdu = 0x08;
             f.ht_mcs = 0x15;
@@ -113,7 +116,9 @@ fn smoke_ath10k_ht_malformed_offer_fails_before_native_station_publication() -> 
             match case {
                 0 => ie.extend_from_slice(&elements(1)),
                 1 => ie[30] = 6,
-                2 => ie[37] = 1,
+                // MCS16 requires a third stream; MCS8 is valid now that
+                // the native source profile initializes two actual chains.
+                2 => ie[38] = 1,
                 3 => ie[5] = 0,
                 4 => {
                     ie[29] = 21;

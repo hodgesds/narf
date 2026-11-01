@@ -647,9 +647,18 @@ impl Wire {
             (3, 9) => require(body.len() == 208 && body[16..22] == OWN, "Sc LINK identity")?,
             (3, 10) => {
                 require(
-                    body.len() == if self.api89.is_some() { 96 } else { 104 } && body[8..14] == AP,
+                    body.len() == if self.api89.is_some() { 96 } else { 104 },
                     "native peer identity/extent",
                 )?;
+                if let Some(mld) = self.mld {
+                    // An MLD STA carries logical AP-MLD at8 and the actual
+                    // physical AP link at16. Require the exact authored
+                    // context plus prior native MAC/LINK setup; never accept
+                    // either address as an interchangeable ordinary peer.
+                    mld.observed(&self.commands)?;
+                } else {
+                    require(body[8..14] == AP, "native ordinary peer identity")?;
+                }
                 if self.fault == Fault::HoldHe && word(body, 92) & 1 != 0 {
                     self.held = Some((cmd, group, sequence));
                     return Ok(());

@@ -152,9 +152,17 @@ fn unit() -> Result<(), &'static str> {
     if channel::rx_channel(Band::Ghz6, 1) != Some(181)
         || channel::rx_channel(Band::Ghz6, 233) != Some(239)
         || channel::rx_channel(Band::Ghz6, 3).is_some()
+        || [237, 241, 245, 249, 253]
+            .iter()
+            .any(|ch| channel::rx_channel(Band::Ghz6, *ch).is_some())
         || channel::from_rx_channel(222) != Some((Band::Ghz6, 165))
         || channel::from_rx_channel(36) != Some((Band::Ghz5, 36))
-        || channel::from_rx_channel(240).is_some()
+        || (240..=255).any(|tag| channel::from_rx_channel(tag).is_some())
+        || channel::channels_6ghz().any(|ch| {
+            let tag = 181 + (ch - 1) / 4;
+            channel::rx_channel(Band::Ghz6, ch) != Some(tag)
+                || channel::from_rx_channel(tag) != Some((Band::Ghz6, ch))
+        })
         || channel::rx_channel(Band::Ghz5, 165) != Some(165)
         || channel::channels_6ghz().count() != 59
         || Band::Ghz6.scan_tag() != 3

@@ -570,6 +570,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.discard_coexistence_receive()?;
         let source = self.htt.wmi.htc.transport.current_sources();
         crate::ath10k::firmware_source::invoke(source.as_ref(), || {
+            self.narrow_coexistence_receive(permission.frequency)?;
             let peer = self.peer.as_mut().ok_or(Error::Failed)?;
             peer.permission = permission;
             peer.ht = Some(profile);

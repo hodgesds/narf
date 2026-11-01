@@ -60,9 +60,12 @@ pub(crate) fn channels_6ghz() -> impl Iterator<Item = u8> {
 /// `mt792x_get_status_freq_info`: 6 GHz channel n is `181 + (n - 1) / 4`.
 pub(crate) fn rx_channel(band: Band, channel: u8) -> Option<u8> {
     match band {
-        Band::Ghz6 => (narf_wireless::association::channel::valid_6ghz(channel)
-            && channel % 4 == 1)
-            .then(|| 181 + (channel - 1) / 4),
+        // This CONNAC2 profile has59 primary20MHz channels through233.
+        // Shared chandef validation also accepts wider centers and future
+        // channel numbers through253; those are not this NIC's RXD tags.
+        Band::Ghz6 => {
+            ((1..=233).contains(&channel) && channel % 4 == 1).then(|| 181 + (channel - 1) / 4)
+        }
         _ => (self::band(channel) == Some(band)).then_some(channel),
     }
 }
@@ -71,8 +74,11 @@ pub(crate) fn rx_channel(band: Band, channel: u8) -> Option<u8> {
 /// 180 are 6 GHz, above 14 are 5 GHz, the rest 2.4 GHz.
 pub(crate) fn from_rx_channel(value: u8) -> Option<(Band, u8)> {
     if value > 180 {
+        if value > 239 {
+            return None;
+        }
         let channel = (value - 181).checked_mul(4)?.checked_add(1)?;
-        narf_wireless::association::channel::valid_6ghz(channel).then_some((Band::Ghz6, channel))
+        Some((Band::Ghz6, channel))
     } else {
         band(value).map(|band| (band, value))
     }

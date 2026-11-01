@@ -251,6 +251,10 @@ fn conversation(protected: bool, primary: u8, secondary: u8) -> Result<(), &'sta
         "EE40 actual basic20 management primary subcarrier",
     )?;
     drop(model);
+    // DHCP already delivered its real OFFER/ACK into this same IPC ring.
+    // Consume that completed phase before asserting an exact one-frame
+    // native downlink window; retain strict equality for the injected IP.
+    let _ = w.h.received();
     let down = packet(&w.h, 8, false);
     let raw = w.h.peer.lock().downlink(&down)?;
     w.h.packet

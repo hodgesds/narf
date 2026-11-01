@@ -437,6 +437,17 @@ fn smoke_rtl8188ee_antenna_unknown_measurement_ignored_mmio_cancel_and_static_re
         service(&h)?;
         let before = h.packet.radio.word(0x860) & 0x7000;
         complete(h.device.disassociate()).map_err(|_| "NEAN disassociate")?;
+        // The previous real AP session is Authorized and owns its old PTK/
+        // replay state. A new MLME/RSNA exchange needs a fresh peer session,
+        // as in the pre-existing native Device rejoin composition.
+        {
+            let mut peer = h.peer.lock();
+            let fresh = Peer::new(true);
+            peer.ap = fresh.ap;
+            peer.ptk = fresh.ptk;
+            peer.replay = fresh.replay;
+            peer.pn = fresh.pn;
+        }
         join(&h)?;
         require(
             h.device.link_up() && h.packet.radio.word(0x860) & 0x7000 == before,

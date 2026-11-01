@@ -1349,6 +1349,16 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .ok_or(Error::Failed)?
             .protection_receipt(receipt)
     }
+    pub(super) fn narrow_coexistence_receive(&mut self, primary: u16) -> Result<(), Error> {
+        let data = self.data.as_mut().ok_or(Error::Failed)?;
+        if !data.protection_allowed() {
+            return Err(Error::Failed);
+        }
+        // The receive owner caches its own original PHY profile. Rebind it
+        // only with the terminal-proven narrowed peer, retaining key/PN and
+        // BA session ownership while discarding the old PPDU/reorder epoch.
+        data.rx_ba.narrow_coexistence(primary)
+    }
     pub(super) fn discard_coexistence_receive(&mut self) -> Result<(), Error> {
         let data = self.data.as_mut().ok_or(Error::Failed)?;
         if !data.protection_allowed() {

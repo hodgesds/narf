@@ -343,8 +343,10 @@ fn smoke_rtl8188ee_thermal_unknown_asset_sensor_and_native_write_faults_fail_clo
             let h = harness(true, true);
             qualify(&h)?;
             if fault == 0 {
-                let mut source = h.device.environment_for_test().tracking.lock();
-                source.as_mut().unwrap().1[256..256 + 10 * 128].fill(0x7f);
+                {
+                    let mut source = h.device.environment_for_test().tracking.lock();
+                    source.as_mut().unwrap().1[256..256 + 10 * 128].fill(0x7f);
+                }
                 h.scan();
                 let kicks = h.packet.model.lock().kicks.len();
                 require(

@@ -37,6 +37,17 @@ pub(super) fn source(
     Ok((base, ht))
 }
 pub(super) fn qualify(h: &Harness) -> Result<Cap<FirmwareBlob, Read>, &'static str> {
+    // The fixed source protection program uses24Mbps RTS. Its positive
+    // peer must actually advertise that rate before discovery/negotiation;
+    // the default legacy fixture advertises only CCK1 and is inadmissible.
+    {
+        let mut peer = h.peer.lock();
+        let protected = peer.ap.protected();
+        let ap = core::mem::replace(&mut peer.ap, Peer::new(protected).ap);
+        peer.ap = ap
+            .with_legacy_rates(&LEGACY_RATES)
+            .map_err(|_| "NERT actual RTS24 peer rate offer")?;
+    }
     let (base, ht) = source(h)?;
     let cap = Cap::bootstrap();
     let channel = h.device.channel_for_test();
