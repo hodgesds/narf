@@ -718,6 +718,8 @@ pub mod intel_gpu_edp;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_engine;
 #[cfg(feature = "intel")]
+mod intel_gpu_error;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_exec;
 #[cfg(feature = "intel")]
 mod intel_gpu_exec_sync;
@@ -781,6 +783,8 @@ pub mod intel_gpu_pipes;
 pub mod intel_gpu_pll;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_pm;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_power_controls;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_ppgtt;
 #[cfg(feature = "intel")]

@@ -352,6 +352,20 @@ impl SyncPoint {
     }
 }
 
+// dma_fence_array is pending until every leaf terminates. Once complete,
+// preserve the first error in leaf order rather than inventing success.
+fn combine_fence_status(current: i32, leaf: i32) -> i32 {
+    if current == 0 || leaf == 0 {
+        0
+    } else if current < 0 {
+        current
+    } else if leaf < 0 {
+        leaf
+    } else {
+        1
+    }
+}
+
 /// `strscpy(dst, src, dst.len())` over byte strings: copy up to the first
 /// NUL of `src`, truncate to leave room for one, NUL-terminate, and leave the
 /// rest of `dst` untouched (strscpy does not pad).
@@ -476,6 +490,15 @@ impl DrmSyncFile {
         self.points
             .iter()
             .fold(true, |all, point| point.signalled() && all)
+    }
+
+    fn fence_status(&self) -> i32 {
+        // dma_fence_get_status(array) remains pending until every leaf ends.
+        // The detailed query below instead uses sync_file.c leaf ordering.
+        self.points.iter().fold(1, |status, point| {
+            point.signalled();
+            combine_fence_status(status, point.fence.status())
+        })
     }
 
     /// `sync_file_merge` → `dma_fence_unwrap_merge(a, b)`
@@ -630,9 +653,7 @@ impl DrmSyncFile {
         let num_fences = self.points.len() as u32;
         let requested = u32::from_ne_bytes(info[40..44].try_into().unwrap());
         let status: i32 = if requested == 0 {
-            // dma_fence_get_status(sync_file->fence); NARF fences carry no
-            // error, so it is 1 or 0.
-            i32::from(self.signalled())
+            self.fence_status()
         } else {
             if requested < num_fences {
                 return sync_neg(EINVAL);
@@ -653,10 +674,12 @@ impl DrmSyncFile {
                 };
                 strscpy(&mut entry[0..32], timeline.as_bytes());
                 strscpy(&mut entry[32..64], driver.as_bytes());
-                let fence_status = i32::from(signalled);
+                let fence_status = point.fence.status();
                 entry[64..68].copy_from_slice(&fence_status.to_ne_bytes());
                 let timestamp = if signalled { point.timestamp_ns() } else { 0 };
                 entry[72..80].copy_from_slice(&timestamp.to_ne_bytes());
+                // sync_file_ioctl_fence_info deliberately retains its first
+                // non-positive leaf status, even if another leaf is pending.
                 status = if status <= 0 { status } else { fence_status };
             }
             let user_array = u64::from_ne_bytes(info[48..56].try_into().unwrap());
@@ -798,6 +821,10 @@ impl narf_filesystem::FileOps for DrmSyncFile {
         Some(self)
     }
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "sync_file_status_tests.rs"]
+mod status_tests;
 
 #[cfg(target_arch = "x86_64")]
 mod tests {
@@ -2281,11 +2308,17 @@ mod pin_tests {
                 ) {
                     return Err("write pin of a read-only mapping was not EPERM");
                 }
-                if !matches!(context.pin_user_pages(rw + 8, 1, true), Err(FsError::InvalidData)) {
+                if !matches!(
+                    context.pin_user_pages(rw + 8, 1, true),
+                    Err(FsError::InvalidData)
+                ) {
                     return Err("unaligned pin accepted");
                 }
                 // The second page is the hole: all-or-nothing EFAULT.
-                if !matches!(context.pin_user_pages(rw + 4096, 2, true), Err(FsError::BadAddress)) {
+                if !matches!(
+                    context.pin_user_pages(rw + 4096, 2, true),
+                    Err(FsError::BadAddress)
+                ) {
                     return Err("partially unmapped range was not EFAULT");
                 }
                 let alias = narf_memory::PhysAddr::new(pins[0].phys().raw()).kernel_mut_ptr::<u8>();
@@ -2311,5 +2344,8 @@ mod pin_tests {
             result
         })
     }
-    kernel_test_in!("userspace/ioctl", smoke_ioctl_pin_user_pages_classes_and_lifetime);
+    kernel_test_in!(
+        "userspace/ioctl",
+        smoke_ioctl_pin_user_pages_classes_and_lifetime
+    );
 }

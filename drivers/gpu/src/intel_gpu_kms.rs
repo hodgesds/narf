@@ -24,7 +24,7 @@ use crate::{
     },
     intel_gpu_pipes::Pipe,
     intel_gpu_scanout::{Geometry, Presenter, ScanoutError, SurfaceId},
-    intel_gpu_scanout_io::{DisplayAccess, PollIo},
+    intel_gpu_scanout_io::{DisplayAccess, PollIo, SavedStatus},
 };
 
 type Wait<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
@@ -45,6 +45,9 @@ pub(crate) trait Platform:
     fn reset_lost(&self) -> bool {
         false
     }
+    /// A fresh, checked view used only after GT startup and outside its lock.
+    fn recovery_platform(&self) -> Result<Self, FsError>;
+    fn recovery_complete(&self);
 }
 
 #[derive(Clone, Debug)]
@@ -58,17 +61,18 @@ pub(crate) struct Physical {
     /// Shared by every retained PollIo clone. A GT reset invalidates all
     /// outstanding display/cache witnesses; reset alone never retires DMA.
     reset_lost: Arc<AtomicBool>,
+    recovering: bool,
 }
 impl MmioWindow for Physical {
     fn read32(&self, offset: u64) -> u32 {
-        if self.reset_lost() {
+        if self.reset_lost() && !self.recovering {
             u32::MAX
         } else {
             self.window.read32(offset)
         }
     }
     fn write32(&self, offset: u64, value: u32) {
-        if !self.reset_lost() {
+        if !self.reset_lost() || self.recovering {
             self.window.write32(offset, value);
         }
     }
@@ -124,7 +128,7 @@ impl Platform for Physical {
         ))
     }
     fn console_access_ok(&self) -> bool {
-        if self.reset_lost() {
+        if self.reset_lost() && !self.recovering {
             return false;
         }
         if narf_bus::pci::power_state(&self.cap, &self.device)
@@ -137,6 +141,23 @@ impl Platform for Physical {
     }
     fn reset_lost(&self) -> bool {
         self.reset_lost.load(Ordering::Acquire)
+    }
+    fn recovery_platform(&self) -> Result<Self, FsError> {
+        let mut fresh = self.clone();
+        fresh.recovering = true;
+        if !fresh.access_ok() {
+            return Err(FsError::NoDevice);
+        }
+        inherited_fetchers_idle(&fresh, fresh.generation)?;
+        if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(fresh.bar.phys) {
+            return Err(FsError::NoDevice);
+        }
+        crate::intel_gpu_edp::kms_inhibit_psr(&fresh)
+            .map_err(|_| crate::intel_gpu_user::io_error())?;
+        Ok(fresh)
+    }
+    fn recovery_complete(&self) {
+        self.reset_lost.store(false, Ordering::Release);
     }
 }
 
@@ -208,6 +229,7 @@ struct State<M: Platform> {
     paused: bool,
     blocked: bool,
     failed: bool,
+    recovery_status: Option<SavedStatus>,
 }
 
 #[derive(Debug)]
@@ -216,9 +238,21 @@ pub(crate) struct Device<M: Platform> {
     generation: Generation,
     bar_len: u64,
     state: Mutex<State<M>>,
+    geometry: IrqSafeSpinLock<Geometry>,
 }
 pub(crate) type Display = Device<Physical>;
 pub(crate) type Session<'a> = Guard<'a, Physical>;
+
+impl Display {
+    /// Admission epoch is published by the GT owner after reset recovery;
+    /// reading it never acquires the GT or display transaction mutex.
+    pub(crate) fn epoch(&self) -> u64 {
+        crate::drm_registry::card(self.platform.index)
+            .and_then(|card| card.intel_user_backend())
+            .and_then(|backend| backend.status())
+            .map_or(0, |status| status.epoch)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct Guard<'a, M: Platform> {
@@ -230,6 +264,7 @@ pub(crate) struct Guard<'a, M: Platform> {
 pub(crate) struct LegacyGuard<'a, M: Platform = Physical> {
     state: MutexGuard<'a, State<M>>,
     platform: &'a M,
+    geometry: &'a IrqSafeSpinLock<Geometry>,
 }
 impl<M: Platform> LegacyGuard<'_, M> {
     pub(crate) fn suspend(&mut self) {
@@ -242,6 +277,7 @@ impl<M: Platform> LegacyGuard<'_, M> {
             return;
         }
         self.state.console = console.clone();
+        *self.geometry.lock() = scanout_geometry(console);
         self.state.blocked = false;
     }
 }
@@ -267,6 +303,7 @@ pub(crate) fn install(
         window: crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap),
         generation,
         reset_lost: Arc::new(AtomicBool::new(false)),
+        recovering: false,
     };
     let display = Arc::new(Device::new(platform, generation, bar.len, console));
     let mut displays = DISPLAYS.lock();
@@ -311,8 +348,8 @@ pub(crate) fn active(index: u32) -> bool {
 /// Called after publishing backend epoch zero and before an automatic GT
 /// reset, while the GT reset mutex is held. Never await or wait for display
 /// ownership here: a display transaction may itself await a GT fence.
-/// A busy/owned display loses its witnesses permanently; GEM pages and the
-/// paused console remain quarantined until reboot. GT reset is no fetch-stop
+/// A busy/owned display loses its witnesses; GEM pages and the paused console
+/// remain quarantined until an independent fresh console latch. GT reset is no fetch-stop
 /// proof, and this path must neither unpin a front nor restore status bits.
 pub(crate) fn quarantine_for_gt_reset(bar: &narf_bus::MmioRegion) {
     if let Some(display) = display_for_bar(bar) {
@@ -343,12 +380,28 @@ pub(crate) async fn quiesce_for_legacy(bar: &narf_bus::MmioRegion) -> Result<(),
     Ok(())
 }
 
+pub(crate) async fn recover_after_gt_reset(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {
+    if let Some(display) = display_for_bar(bar) {
+        display.recover().await?;
+    }
+    Ok(())
+}
+
+fn scanout_geometry(console: &ActiveScanout) -> Geometry {
+    Geometry {
+        width: console.width,
+        height: console.height,
+        pitch: console.stride_bytes,
+    }
+}
+
 impl<M: Platform> Device<M> {
     fn new(platform: M, generation: Generation, bar_len: u64, console: ActiveScanout) -> Self {
         Self {
             platform,
             generation,
             bar_len,
+            geometry: IrqSafeSpinLock::new(scanout_geometry(&console)),
             state: Mutex::new(State {
                 console,
                 presenter: None,
@@ -358,8 +411,102 @@ impl<M: Platform> Device<M> {
                 paused: false,
                 blocked: false,
                 failed: false,
+                recovery_status: None,
             }),
         }
+    }
+    pub(crate) fn reset_lost(&self) -> bool {
+        self.platform.reset_lost()
+    }
+    pub(crate) fn console_geometry(&self) -> Geometry {
+        *self.geometry.lock()
+    }
+
+    /// Called by the GT worker only after its reset/startup probes, with its
+    /// mutex released and backend epoch still zero. No GT fence is awaited.
+    async fn recover(&self) -> Result<(), FsError> {
+        let mut state = self.state.lock().await;
+        if !self.platform.reset_lost() {
+            return Ok(());
+        }
+        state.blocked = true;
+        state.failed = true;
+        state.paused = true;
+        self.platform.pause_console().await;
+        if let Some(old) = &state.presenter {
+            old.retained_io().poison();
+        }
+        let fresh = self.platform.recovery_platform()?;
+        let saved = match state.recovery_status {
+            Some(saved) => saved,
+            None => {
+                let saved = if let Some(old) = &state.presenter {
+                    old.retained_io().saved_status()
+                } else {
+                    PollIo::snapshot_status(&fresh, self.generation)
+                        .map_err(|_| FsError::NoDevice)?
+                };
+                state.recovery_status = Some(saved);
+                saved
+            }
+        };
+        // SAFETY: the old owner remains retained and poisoned. The GT worker
+        // owns D0 and verified PAT policy; this mutex excludes every display
+        // transition. Only the fresh view can observe/arm hardware now.
+        let io =
+            unsafe { PollIo::after_reset(fresh, self.generation, Pipe::A, self.bar_len, saved) }
+                .map_err(|_| crate::intel_gpu_user::io_error())?;
+        let format = io.format();
+        let pat = if self.generation == Generation::MeteorLake {
+            1
+        } else {
+            0
+        };
+        // SAFETY: all old current/pending owners remain in state.presenter;
+        // retained console pages are outside their arena. No pre-reset
+        // completion is consumed by this independent fresh transaction.
+        let mut console = unsafe {
+            Presenter::recover_console(
+                io,
+                self.bar_len,
+                Pipe::A,
+                format,
+                pat,
+                (
+                    state.console.gtt_offset,
+                    scanout_geometry(&state.console),
+                    self.platform.now(),
+                ),
+            )
+        }
+        .map_err(scanout_error)?;
+        loop {
+            match console.poll(self.platform.now()).map_err(scanout_error)? {
+                Some(_) => break,
+                None => self.platform.tick().await,
+            }
+        }
+        if let Some(old) = state.presenter.as_mut() {
+            // SAFETY: the fresh console flip-done, SURFLIVE and changed
+            // stable frame independently retired every old GEM fetch. Clear
+            // with fresh IO; never re-enable the old poisoned adapter.
+            unsafe { old.shutdown_retired_with(console.retained_io()) }.map_err(scanout_error)?;
+        } else {
+            console.shutdown_restored_console().map_err(scanout_error)?;
+        }
+        state.presenter = None;
+        state.current = None;
+        state.pending = None;
+        state.recovery_status = None;
+        // All old IO and mappings are closed before making normal accesses
+        // valid again; only this new console witness reopens admission.
+        drop(console);
+        self.platform.recovery_complete();
+        state.failed = false;
+        state.blocked = false;
+        self.platform.resume_console();
+        state.paused = false;
+        Ok(())
     }
     pub(crate) async fn session(&self) -> Result<Guard<'_, M>, FsError> {
         let state = self.state.lock().await;
@@ -391,6 +538,7 @@ impl<M: Platform> Device<M> {
         Ok(LegacyGuard {
             state,
             platform: &self.platform,
+            geometry: &self.geometry,
         })
     }
 }
@@ -403,6 +551,18 @@ fn scanout_error(error: ScanoutError) -> FsError {
     }
 }
 impl<M: Platform> Guard<'_, M> {
+    /// Recheck before publishing a hardware transaction. The synchronous GT
+    /// loss path can poison a busy session without acquiring this mutex.
+    pub(crate) fn ownership_valid(&self) -> Result<(), FsError> {
+        if self.state.failed
+            || self.state.blocked
+            || self.device.platform.reset_lost()
+            || !self.device.platform.console_access_ok()
+        {
+            return Err(FsError::NoDevice);
+        }
+        Ok(())
+    }
     pub(crate) fn console_geometry(&self) -> Geometry {
         Geometry {
             width: self.state.console.width,
@@ -504,6 +664,12 @@ impl<M: Platform> Guard<'_, M> {
             }
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.state.recovery_status = Some(
+            PollIo::snapshot_status(platform, self.device.generation).map_err(|_| {
+                self.state.failed = true;
+                crate::intel_gpu_user::io_error()
+            })?,
+        );
         // SAFETY: the per-card mutex owns the running internal plane and all
         // reserved PTEs. CPU epochs retired above; power/modeset/PSR cannot
         // transition before quiesce obtains this same mutex.
@@ -635,6 +801,7 @@ impl<M: Platform> Guard<'_, M> {
                 .map_err(scanout_error)?;
             self.state.presenter = None;
             self.state.current = None;
+            self.state.recovery_status = None;
         }
         if self.state.paused {
             self.device.platform.resume_console();

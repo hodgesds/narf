@@ -1384,19 +1384,39 @@ verified fetch stop. The following KMS continuation installs that owner for
 fixed-mode MTL/Arrow Pipe A WC GEM flips, with console epoch handoff, PSR
 inhibition, modeset/PM exclusion and transactional hardware events/out-fences.
 Unsupported pre-arm states restore the retained console for checked-copy
-fallback and observed hardware vblank. NONBLOCK currently waits for latch.
-Gen12 production direct flips, extra planes/modifiers and full recovery of
-quarantined display owners remain open. Automatic GT recovery invalidates
-active display access before reset and retains uncertain owners; system
-suspend restores the console before power teardown.
+fallback and observed hardware vblank. The software-completion branch adds
+a bounded owned FIFO so NONBLOCK returns before dependency waits or latch;
+native out-fences preserve errors through sync_file. Automatic GT recovery
+invalidates old display access, then uses fresh authority and a verified
+console latch to retire GEM mappings. Failed latch/clear/status restoration
+keeps owners quarantined. System suspend restores the console before power
+teardown. Gen12 production direct flips and extra planes/modifiers remain open.
+Bounded first-error reports are readable at `/sys/class/drm/cardN/error`.
+Userspace SLPC stores enqueue validated range/profile policy; only firmware
+acknowledgment publishes values, and confirmed policy replays in a fresh epoch.
 Intel silicon and Mesa acceptance remain untested.
 The foundation's 25 native fixtures and KMS integration's 35 fixtures pass
 on both architectures, including real mapped-console copying and cancellation,
-PSR, event publication and reset quarantine. Latest selected Intel/DRM/fb
-regression groups pass 648 tests on x86_64 and 520 on aarch64, with zero
-failures/skips. All three GPU/fb CI Clippy contexts pass per architecture;
+PSR, event publication and reset quarantine. Selected Intel/DRM/fb groups at
+that preceding checkpoint pass 648 tests on x86_64 and 520 on aarch64, with
+zero failures/skips. All three GPU/fb CI Clippy contexts pass per architecture;
 host default/Intel-only/AMD-only/no-vendor all-target Clippy, Intel debug
 builds, formatting, both production boots and both btrfs postflights pass.
+
+The `codex/intel-software-completion` integration adds 27 native fixtures:
+all pass on x86_64, and all 25 GPU fixtures also pass on aarch64. Selected
+Intel/DRM/fb groups pass 673 and 545 tests respectively, with no failures or
+skips. The x86_64 syscall ABI group passes 2252 with four existing harness
+skips; its redundant aarch64 run was stopped at the maintainer's request.
+Architecture-neutral iterations now use x86_64 tests; aarch64 reruns cover
+changes to its code or behavior, while cross-target build/lint checks remain.
+GPU/filesystem/userspace/fb target CI Clippy passes all three feature contexts
+on both architectures; all four host GPU vendor configurations pass all-target
+Clippy. Intel debug builds, production boots, both btrfs postflights per
+architecture, formatting and diff checks pass.
+The full software campaign and remaining dependencies are tracked in
+`drivers/gpu/specification/intel_gpu.md` §20; these four workstreams do not
+complete Linux-xe parity.
 
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI

@@ -801,7 +801,29 @@ The source-qualified conservative bounds retain BMG G21's 1200 MHz floor
 (Wa_14022085890) and graphics IP 20.01's 2133 MHz MERT cap
 (Wa_22019338487). The latter is not an MTL graphics workaround. Dynamic cap
 removal, the L2-flush frequency protocol and media-GT power management remain
-unowned. No userspace frequency-control ABI is added.
+unowned.
+
+`intel_gpu_power_controls::PowerControls` supplies a bounded per-card mailbox
+through `UserBackend::power_controls`. The GT owner explicitly activates a
+ready user epoch and closes admission before suspend, park or reset. Stores
+never wait for firmware; one queued/in-flight request is permitted, and
+further requests return Busy. The owner services native GuC controls under
+its existing GT mutex. Confirmed values disappear during update and return
+only after the native matched-reply/readback protocol completes. Failed
+commands expose failure through `slpc_status`; unavailable clock values are
+empty rather than fabricated zero.
+
+Intel card sysfs nodes expose writable `gt_min_freq_mhz`, `gt_max_freq_mhz`,
+`slpc_frequency_range` (two decimal MHz values), and `slpc_power_profile`
+(`base` or `power-saving`). Read-only `gt_RPn_freq_mhz`, `gt_RP1_freq_mhz`,
+`gt_RP0_freq_mhz` and `slpc_status` report confirmed limits and mailbox state.
+The gt_* names follow i915; slpc_* files and asynchronous store acceptance
+are NARF extensions, not the Xe freq0 sysfs ABI. Callbacks resolve the current
+per-card backend and perform no MMIO. Only confirmed user policy survives
+close; a newly activated GT revalidates it against fresh limits and replays
+range then profile with acknowledgments. Queued/unacknowledged old-epoch
+requests are discarded, and a stale worker observation cannot reopen a
+closed mailbox.
 
 User-job timeout accounting follows `xe_lrc_timestamp` and `check_timeout`:
 a trusted per-context restore batch marks the saved CTX_TIMESTAMP active, and
@@ -814,6 +836,26 @@ counter still triggers isolated context recovery. An engine making no GPU
 progress for three watchdog intervals requires full GT reset, without blaming
 an unstarted queue. Unavailable clock/MMIO or cache synchronization fails closed;
 kernel jobs and protocol/retirement transitions retain wall-clock bounds.
+
+`intel_gpu_error` captures the first per-card failure before isolated-job
+disable or full-GT teardown. Reports are fixed-size and allocation-free at
+capture: at most eight scalar context records and 22 whitelisted status
+reads; formatted output is at most 4 KiB. The isolated-timeout path uses the
+live GT poll's D0/reset owner, while fatal runtime capture explicitly checks
+PCI D0 before wake/status reads. Every MMIO sample still requires current
+capability and wake ownership; capture never wakes, writes, waits or retries.
+Loss stops further reads. Unexpected firmware reset notifications retain
+software facts without pretending that pre-reset MMIO was captured.
+Sequential register samples do not claim an atomic device freeze. Context,
+ring-relative head/tail and scalar fault/status data exclude kernel/physical
+pointers, batch/user memory, LRC bodies and instruction contents.
+
+The read-only `/sys/class/drm/cardN/error` projection exposes
+`narf-intel-error-v1`, a bounded NARF report rather than the complete Linux
+devcoredump ABI. Sixty-four fixed card slots retain the first report and count
+suppressed later failures. Each reader owns an immutable snapshot and performs
+no MMIO; internal generation-matched clear cannot invalidate an in-flight
+read or clear a newer report. Sysfs writes cannot clear the report.
 
 Before context registration and after deregistration, a heavy GuC GGTT TLB
 invalidation (0x7000, operation 0x80000003) requires its matching 0x7001 cookie.
@@ -6485,14 +6527,25 @@ may not be VM-bound (`GemObject::vm_bound`, maintained by
 (`IntelFb`: the object, which the framebuffer holds, and the owning open)
 is removed by RMFB or `Card::release_file_framebuffers`; `gem_owner` is
 the shared owner test. A registered owned Intel internal panel installs
-`intel_gpu_kms`, whose per-card async mutex serializes SETCRTC, PAGE_FLIP,
-SETPLANE, atomic/property updates, DIRTYFB, master changes, cursor updates
-and removal. User arrays are copied before waiting; no Card, controller or
-IRQ-safe lock survives a latch/fence await. A Card transaction defers close-time
-framebuffer destruction, revalidates master and framebuffer identity, then
-publishes state, events and out-fences together after hardware completion.
-Cancellation refunds uncompleted event reservations while retaining every
-armed display owner for the next session to drain.
+`intel_gpu_kms`. Its per-card bounded FIFO (`intel_gpu_kms_queue`, at most
+32 waiting jobs) serializes SETCRTC, PAGE_FLIP, SETPLANE, atomic/property
+updates, DIRTYFB, master changes, cursor updates and removal. Foreground
+admission copies all user arrays, resolves input fences, retains GEM/dumb
+backing, reserves event capacity and installs any native out-fence fd before
+publishing the owned job. No user address or ioctl context enters the worker.
+Each job stages against its queued predecessor's projected state; failure of
+that predecessor fails dependent work instead of applying a stale projection.
+NONBLOCK returns after publication; blocking requests await the same worker's
+completion. Input/implicit WRITE fence waits precede acquisition of the display
+session. No Card, controller or IRQ-safe lock survives a latch/fence await.
+A Card transaction defers close-time framebuffer destruction, revalidates
+master/framebuffer identity and display reset ownership, then publishes state
+and reserved events at witnessed hardware completion. The native completion
+fence carries success or a terminal negative errno; elapsed time never creates
+success. Worker cancellation fails and refunds outstanding jobs; cancellation
+of a blocking caller leaves its independently owned job running. Close,
+master loss and reset invalidate queued work while every armed display owner
+stays retained until retirement evidence permits release.
 
 Exact retained mode/geometry/pitch, zero-offset LINEAR XRGB8888 WC system
 SCANOUT objects can be presented directly through GGTT. Production admission
@@ -6530,7 +6583,10 @@ and retired surface. Its timestamp is the observation time. `release` never
 unmaps the current/pending object; window reuse follows verified clears and
 invalidation. Uncertain writes, faults, timeout and Drop retain object pages
 and the MMIO/power owner. Only unsafe `shutdown_stopped`, after independently
-proven fetch stop, permits complete reclamation.
+proven fetch stop, permits complete reclamation. After GT reset, an independent
+fresh console latch can prove retirement without a full pipe stop: matching
+SURFLIVE, stable changed frame count and new flip-done must all be observed
+through fresh power/capability/cache-policy authority.
 
 `intel_gpu_scanout_io::PollIo` uses a UC BAR and capability invocation on
 every access. It verifies Pipe A/D0, installed MTL non-coherent WT PAT1 and
@@ -6550,16 +6606,24 @@ PTEs and owners are retired; `shutdown_restored_console` then restores only
 owned interrupt-mask/enable bits. Legacy modeset/HPD and display PM acquire
 the same mutex and refuse live or uncertain ownership. Async system suspend
 restores the console before GT or PCI teardown, and only verified console
-relight reopens admission. Automatic GT recovery invalidates any active/busy
-presentation access before reset/cache-policy changes; pending/front pages
-remain quarantined without claiming fetch stop.
+relight reopens admission. Automatic GT recovery invalidates active/busy
+presentation access before reset/cache-policy changes; old access remains
+poisoned. Once GT policy and startup probes are ready, recovery drops the GT
+mutex before acquiring the display session and constructing a fresh authorized
+I/O owner. It verifies the retained console geometry and freshly latches that
+console before clearing old GEM PTEs and restoring the original owned IER/IMR
+bits. Only successful clears and status restoration release old front/pending
+owners and publish a new display epoch. Failed authority, geometry, latch,
+clear or interrupt restoration keeps them quarantined and display admission
+closed; GT execution may recover independently. Recovery does not wait for a
+separately retained GPU job fence to retire display mappings.
 
 Page-flip events carry the witnessed frame sequence and observation timestamp;
-out-fences become signalled only after that completion. This first fixed-mode
-path also awaits latch for NONBLOCK commits, so NONBLOCK does not yet promise
-an immediate ioctl return. ASYNC flips, tiled/compressed modifiers, arbitrary
-modesets, extra planes and full recovery of quarantined display owners remain
-open. These contracts have native register/ownership tests; Intel hardware
+out-fences become successful only after that completion, while failed jobs
+signal their terminal error without an event. NONBLOCK returns before the
+worker's fence waits and latch. ASYNC flips, tiled/compressed modifiers,
+arbitrary modesets and extra planes remain open. These contracts have native
+register/ownership tests; Intel hardware
 and Mesa rendering-to-scanout acceptance are separate gates.
 
 **Client framebuffers scanned out in place.** On the native card ADDFB2

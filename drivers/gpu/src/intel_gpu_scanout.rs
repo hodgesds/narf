@@ -239,6 +239,65 @@ impl<M: ScanoutIo> Presenter<M> {
     fn io(&self) -> &M {
         self.io.as_ref().expect("scanout owner")
     }
+    pub(crate) fn retained_io(&self) -> &M {
+        self.io()
+    }
+
+    /// Start a fresh console transaction without accepting any pre-loss
+    /// SURF/SURFLIVE sample as retirement of the previous owner's pages.
+    /// This temporary owner never allocates or adopts the old arena.
+    ///
+    /// # Safety
+    /// The caller retains every old current/pending allocation and the
+    /// console allocation, exclusively owns this plane/arena, has restored
+    /// and verified GT cache policy and supplies a new live status owner.
+    /// Only a successful fresh console latch permits reclaiming old pages.
+    pub(crate) unsafe fn recover_console(
+        io: M,
+        bar_len: u64,
+        pipe: Pipe,
+        format: PteFormat,
+        pat: u8,
+        target: (u32, Geometry, u64),
+    ) -> Result<Self, ScanoutError> {
+        let (console, geometry, now) = target;
+        check_ggtt_range(
+            bar_len,
+            GEM_SCANOUT_GTT_START,
+            GEM_SCANOUT_GTT_END - GEM_SCANOUT_GTT_START,
+        )
+        .map_err(|_| ScanoutError::Bounds)?;
+        geometry.extent()?;
+        format
+            .encode_ggtt(0, pat)
+            .map_err(|_| ScanoutError::Unsupported)?;
+        if console % 4096 != 0
+            || (GEM_SCANOUT_GTT_START..GEM_SCANOUT_GTT_END).contains(&u64::from(console))
+        {
+            return Err(ScanoutError::Bounds);
+        }
+        let mut owner = Self {
+            io: Some(io),
+            pipe,
+            format,
+            pat,
+            free: alloc::vec![],
+            surfaces: BTreeMap::new(),
+            next_id: 1,
+            current: None,
+            console_surface: console,
+            console_geometry: Some(geometry),
+            expected_surface: console,
+            pending: None,
+            failed: false,
+            closed: false,
+        };
+        if !owner.geometry_matches(geometry) {
+            return Err(ScanoutError::Unsupported);
+        }
+        owner.arm_observed(SurfaceId(0), console, geometry, 0, now)?;
+        Ok(owner)
+    }
     fn plane(&self) -> u64 {
         self.pipe.base() + PLANE_PRIMARY_OFFSET
     }
@@ -433,6 +492,17 @@ impl<M: ScanoutIo> Presenter<M> {
             self.failed = true;
             return Err(ScanoutError::Unavailable);
         }
+        self.arm_observed(id, offset, geometry, ticket, now)
+    }
+
+    fn arm_observed(
+        &mut self,
+        id: SurfaceId,
+        offset: u32,
+        geometry: Geometry,
+        ticket: u64,
+        now: u64,
+    ) -> Result<(), ScanoutError> {
         let iir = self.io().read32(self.iir());
         let frame = self.io().read32(self.pipe.base() + FRAMECOUNT_OFFSET);
         if frame == u32::MAX || iir & self.faults() != 0 {
@@ -545,16 +615,52 @@ impl<M: ScanoutIo> Presenter<M> {
     }
 
     fn clear(&self, offset: u32, pages: u32) -> bool {
+        Self::clear_with(self.io(), offset, pages)
+    }
+    fn clear_with(io: &M, offset: u32, pages: u32) -> bool {
         for page in 0..pages {
-            self.write_pte(offset + page * 4096, 0);
+            let reg = GGTT_ARRAY_BASE + u64::from(offset / 4096 + page) * 8;
+            io.write32(reg, 0);
+            io.write32(reg + 4, 0);
         }
-        if !self.post_ptes(offset + (pages - 1) * 4096) {
+        compiler_fence(Ordering::SeqCst);
+        if !io.invalidate_ggtt() {
             return false;
         }
         (0..pages).all(|page| {
             let reg = GGTT_ARRAY_BASE + u64::from(offset / 4096 + page) * 8;
-            self.io().read32(reg) == 0 && self.io().read32(reg + 4) == 0
+            io.read32(reg) == 0 && io.read32(reg + 4) == 0
         })
+    }
+
+    /// Reclaim a poisoned owner using an independent fresh console latch.
+    /// Its original IO remains lost and is never revived or used to clear
+    /// mappings. Failed posting or status restoration retains *all* pages.
+    ///
+    /// # Safety
+    /// `replacement` has independently latched the retained console after
+    /// loss, proving no old current/pending surface is still fetched. It
+    /// owns the same arena/status and inherited original IRQ ownership.
+    pub(crate) unsafe fn shutdown_retired_with(
+        &mut self,
+        replacement: &M,
+    ) -> Result<(), ScanoutError> {
+        for surface in self.surfaces.values() {
+            if !Self::clear_with(replacement, surface.offset, surface.pages) {
+                self.failed = true;
+                return Err(ScanoutError::Unavailable);
+            }
+        }
+        // SAFETY: the caller supplies the independent fresh-latch proof.
+        if !unsafe { replacement.finish_stopped() } {
+            self.failed = true;
+            return Err(ScanoutError::Unavailable);
+        }
+        self.current = None;
+        self.pending = None;
+        self.surfaces.clear();
+        self.closed = true;
+        Ok(())
     }
 
     /// Release all resources only after display fetch is independently proven

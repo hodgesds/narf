@@ -51,9 +51,14 @@ pub(super) fn prefix(image: u32, stamp: u32, engine: Engine, words: &mut Vec<u32
 pub(super) struct Runtime {
     previous_active: Option<u32>,
     previous_timestamp: Option<u32>,
+    last_running_ticks: Option<u32>,
 }
 
 impl Runtime {
+    pub(super) fn diagnostic_ticks(&self) -> Option<u32> {
+        self.last_running_ticks
+    }
+
     /// Called at a wall-clock watchdog interval, after CPU cache visibility
     /// has been established. Queuing/preemption costs no job runtime. A live
     /// timestamp stuck across two watchdog observations still identifies a
@@ -125,6 +130,7 @@ impl Runtime {
         let progressed = self.previous_timestamp != Some(current);
         self.previous_timestamp = Some(current);
         let ticks = current.wrapping_sub(image.read32(JOB_TIMESTAMP));
+        self.last_running_ticks = Some(ticks);
         // Five seconds is far below the shortest supported 32-bit wrap
         // interval (112 s). Match Linux's 5% GuC scheduling tolerance.
         let running_ns = u64::from(ticks) * 1_000_000_000 / frequency;

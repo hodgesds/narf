@@ -405,6 +405,7 @@ pub trait FileOps {
 
 pub trait DrmFence: Send + Sync {
     fn is_signalled(&self) -> bool;
+    fn status(&self) -> i32;          // default: pending 0 / success 1
     fn wait(&self, timeout_ms: u64) -> bool;
     fn context(&self) -> Option<u64>;
     fn seqno(&self) -> u64;            // default 0
@@ -1383,6 +1384,17 @@ without a synchronous wait. Drivers that do not produce device fences return
 carries Linux `dma_fence` identity for `SYNC_IOC_FILE_INFO` and merging:
 `seqno` (ordering within `context`), `driver_name`/`timeline_name`, and the
 signal `timestamp_ns` when the driver records one.
+
+`DrmFence::status()` is zero while pending, one after success, or a negative
+errno after terminal failure. Its default preserves existing fence behavior;
+native asynchronous KMS fences override it. Terminal errors are signalled
+for poll/wait purposes and remain errors in per-leaf SYNC_IOC_FILE_INFO.
+Poll and count-only FILE_INFO use the aggregate fence status: pending until
+every leaf terminates, then the first negative status or success. Detailed
+FILE_INFO follows Linux's ordered leaf iteration: the first nonpositive leaf
+status wins, so an error preceding a pending leaf is visible before aggregate
+readiness; a preceding pending leaf keeps detailed status zero. A completed
+failed display transaction never becomes a successful fence by elapsed time.
 
 `DrmFence::is_submit_ready()` defaults to `is_signalled()`, so foreign
 sync_file leaves require completion for i915 EXEC_FENCE_SUBMIT. Native Intel

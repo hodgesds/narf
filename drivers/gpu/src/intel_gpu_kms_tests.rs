@@ -41,9 +41,11 @@ struct Hardware {
     pte_installs: usize,
     pte_clears: usize,
     refuse_ptes: bool,
+    refuse_console: bool,
+    refuse_status_restore: bool,
 }
 #[derive(Clone, Debug)]
-struct MockPlatform(Arc<IrqSafeSpinLock<Hardware>>, Arc<AtomicBool>);
+struct MockPlatform(Arc<IrqSafeSpinLock<Hardware>>, Arc<AtomicBool>, bool);
 impl MockPlatform {
     fn new() -> Self {
         Self(
@@ -76,8 +78,11 @@ impl MockPlatform {
                 pte_installs: 0,
                 pte_clears: 0,
                 refuse_ptes: false,
+                refuse_console: false,
+                refuse_status_restore: false,
             })),
             Arc::new(AtomicBool::new(false)),
+            false,
         )
     }
     fn step(&self) {
@@ -120,14 +125,14 @@ impl MockPlatform {
 impl MmioWindow for MockPlatform {
     fn read32(&self, offset: u64) -> u32 {
         let hw = self.0.lock();
-        if self.reset_lost() || !hw.allowed || !hw.powered {
+        if (self.reset_lost() && !self.2) || !hw.allowed || !hw.powered {
             return u32::MAX;
         }
         hw.regs.get(&offset).copied().unwrap_or(0)
     }
     fn write32(&self, offset: u64, value: u32) {
         let mut hw = self.0.lock();
-        if self.reset_lost() || !hw.allowed || !hw.powered {
+        if (self.reset_lost() && !self.2) || !hw.allowed || !hw.powered {
             return;
         }
         if offset >= PTE_START {
@@ -147,6 +152,11 @@ impl MmioWindow for MockPlatform {
         } else if offset == IIR {
             *hw.regs.get_mut(&IIR).unwrap() &= !value;
         } else {
+            if (offset == SURF && value == CONSOLE && hw.refuse_console)
+                || (offset == IER && value & 8 == 0 && hw.refuse_status_restore)
+            {
+                return;
+            }
             hw.regs.insert(offset, value);
             if offset == SURF {
                 hw.pending_surface = Some(value);
@@ -160,7 +170,7 @@ impl MmioWindow for MockPlatform {
 unsafe impl DisplayAccess for MockPlatform {
     fn access_ok(&self) -> bool {
         let hw = self.0.lock();
-        !self.reset_lost() && hw.allowed && hw.powered
+        (!self.reset_lost() || self.2) && hw.allowed && hw.powered
     }
 }
 impl Platform for MockPlatform {
@@ -193,6 +203,17 @@ impl Platform for MockPlatform {
     }
     fn reset_lost(&self) -> bool {
         self.1.load(Ordering::Acquire)
+    }
+    fn recovery_platform(&self) -> Result<Self, FsError> {
+        let mut fresh = self.clone();
+        fresh.2 = true;
+        if !fresh.access_ok() {
+            return Err(FsError::NoDevice);
+        }
+        Ok(fresh)
+    }
+    fn recovery_complete(&self) {
+        self.1.store(false, Ordering::Release);
     }
     fn tick(&self) -> Wait<'_> {
         let mut yielded = false;
@@ -489,6 +510,201 @@ fn smoke_kms_gt_reset_quarantines_owned_or_busy_state_without_waiting() -> TestR
 kernel_test_in!(
     "drivers/gpu/intel_gpu_kms",
     smoke_kms_gt_reset_quarantines_owned_or_busy_state_without_waiting
+);
+
+fn smoke_kms_gt_recovery_waits_for_fresh_console_before_reclaim() -> TestResult {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let platform = MockPlatform::new();
+        // Original owned bits and foreign sources must survive two status
+        // acquisitions. Our already-enabled bits are not firmware state.
+        platform.0.lock().regs.insert(IER, (1 << 7) | 1);
+        let device = device(&platform);
+        let first = object(true).unwrap();
+        let first_weak = Arc::downgrade(&first);
+        let second = object(true).unwrap();
+        let second_weak = Arc::downgrade(&second);
+        let mut session = complete(device.session()).unwrap();
+        complete(session.present(first, geometry())).unwrap();
+        let mut pending = Box::pin(session.present(second, geometry()));
+        assert!(once(pending.as_mut()).is_pending());
+        platform.0.lock().flips = false;
+        quarantine_reset_state(&device.state, &platform.1);
+        assert!(complete(pending).is_err());
+        drop(session);
+        platform.0.lock().flips = true;
+        // The pre-reset pending write differs from SURFLIVE. Recovery must
+        // overwrite it and prove a new console latch, never retire by either
+        // pre-reset sample or a successful GT reset alone.
+        let mapped = platform.mapping_count();
+        assert_eq!(mapped, 4);
+        {
+            let hw = platform.0.lock();
+            assert_ne!(hw.regs[&SURF], hw.regs[&LIVE]);
+        }
+        let mut recovery = Box::pin(device.recover());
+        assert!(once(recovery.as_mut()).is_pending());
+        assert!(device.reset_lost());
+        assert!(first_weak.upgrade().is_some() && second_weak.upgrade().is_some());
+        assert_eq!(platform.mapping_count(), mapped);
+        assert!(!platform.actions().contains(&Action::Resume));
+        complete(recovery).unwrap();
+        assert!(!device.reset_lost());
+        assert!(first_weak.upgrade().is_none() && second_weak.upgrade().is_none());
+        assert_eq!(platform.mapping_count(), 0);
+        assert_eq!(platform.read32(LIVE), CONSOLE);
+        assert_eq!(platform.read32(IER), (1 << 7) | 1);
+        assert_eq!(platform.read32(IMR), u32::MAX);
+        let actions = platform.actions();
+        assert!(
+            actions
+                .iter()
+                .rposition(|a| *a == Action::Latch(CONSOLE))
+                .unwrap()
+                < actions.iter().position(|a| *a == Action::Resume).unwrap()
+        );
+        let mut next = complete(device.session()).unwrap();
+        complete(next.present(object(true).unwrap(), geometry())).unwrap();
+        complete(next.restore_console()).unwrap();
+        assert_eq!(platform.read32(IER), (1 << 7) | 1);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_gt_recovery_waits_for_fresh_console_before_reclaim
+);
+
+fn smoke_kms_gt_recovery_waits_for_busy_owner_and_retires_pause() -> TestResult {
+    let platform = MockPlatform::new();
+    let device = device(&platform);
+    let session = complete(device.session()).unwrap();
+    assert!(session.ownership_valid().is_ok());
+    quarantine_reset_state(&device.state, &platform.1);
+    assert_eq!(session.ownership_valid(), Err(FsError::NoDevice));
+    let mut recovery = Box::pin(device.recover());
+    assert!(once(recovery.as_mut()).is_pending());
+    assert!(
+        platform.actions().is_empty(),
+        "recovery overtook the busy display owner"
+    );
+    drop(session);
+    assert!(once(recovery.as_mut()).is_pending());
+    assert!(device.reset_lost());
+    complete(recovery).unwrap();
+    assert!(!device.reset_lost());
+    assert!(device.legacy().is_ok());
+    assert_eq!(
+        platform.actions(),
+        [
+            Action::Pause,
+            Action::Arm(CONSOLE),
+            Action::Latch(CONSOLE),
+            Action::Resume
+        ]
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_gt_recovery_waits_for_busy_owner_and_retires_pause
+);
+
+fn smoke_kms_gt_recovery_does_not_wait_for_retained_gpu_fences() -> TestResult {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let platform = MockPlatform::new();
+        let device = device(&platform);
+        let gpu_owner = object(true).unwrap();
+        let weak = Arc::downgrade(&gpu_owner);
+        let mut session = complete(device.session()).unwrap();
+        complete(session.present(gpu_owner.clone(), geometry())).unwrap();
+        drop(session);
+        let fence = Arc::new(crate::intel_gpu_fence::CompletionFence::new());
+        crate::intel_gpu_gem::reserve_gpu_explicit(&[(gpu_owner.clone(), true)], &fence);
+        assert!(!gpu_owner.idle(false));
+        quarantine_reset_state(&device.state, &platform.1);
+        // The independent GPU residency owner remains responsible for its
+        // fence/pages. Display recovery must neither await that fence while
+        // holding its mutex nor consume somebody else's residency owner.
+        complete(device.recover()).unwrap();
+        assert!(fence.result().is_none());
+        assert_eq!(platform.mapping_count(), 0);
+        assert!(weak.upgrade().is_some());
+        fence.signal(Err(crate::intel_gpu_fence::JobError::Reset));
+        drop(gpu_owner);
+        assert!(weak.upgrade().is_none());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_gt_recovery_does_not_wait_for_retained_gpu_fences
+);
+
+fn smoke_kms_gt_recovery_failure_retains_front_and_pending() -> TestResult {
+    #[cfg(target_arch = "x86_64")]
+    for failure in 0..6 {
+        let platform = MockPlatform::new();
+        let device = device(&platform);
+        let front = object(true).unwrap();
+        let weak = Arc::downgrade(&front);
+        let pending_object = object(true).unwrap();
+        let pending_weak = Arc::downgrade(&pending_object);
+        let mut session = complete(device.session()).unwrap();
+        complete(session.present(front, geometry())).unwrap();
+        let mut pending = Box::pin(session.present(pending_object, geometry()));
+        assert!(once(pending.as_mut()).is_pending());
+        platform.0.lock().flips = false;
+        quarantine_reset_state(&device.state, &platform.1);
+        assert!(complete(pending).is_err());
+        drop(session);
+        {
+            let mut hw = platform.0.lock();
+            hw.flips = true;
+            match failure {
+                0 => hw.allowed = false,
+                1 => {
+                    hw.flips = false;
+                    hw.tick_ns = 500_000_000;
+                }
+                2 => hw.refuse_ptes = true,
+                3 => {
+                    hw.regs.insert(0x70188, 5);
+                }
+                4 => hw.refuse_status_restore = true,
+                _ => hw.refuse_console = true,
+            }
+        }
+        assert!(complete(device.recover()).is_err());
+        assert!(device.reset_lost());
+        assert!(weak.upgrade().is_some() && pending_weak.upgrade().is_some());
+        // Even when every PTE cleared, failed original-status restoration
+        // conservatively retains all pages and keeps admission closed.
+        assert_eq!(platform.mapping_count(), if failure == 4 { 0 } else { 4 });
+        assert!(device.legacy().is_err());
+        assert!(complete(device.session()).is_err());
+        assert!(!platform.actions().contains(&Action::Resume));
+        // Give the fixture an independently verified fresh latch to avoid
+        // leaking native pages during test teardown. Production retry is
+        // initiated only by a subsequent verified GT restart.
+        {
+            let mut hw = platform.0.lock();
+            hw.allowed = true;
+            hw.flips = true;
+            hw.refuse_ptes = false;
+            hw.refuse_console = false;
+            hw.refuse_status_restore = false;
+            hw.regs.insert(0x70188, 4);
+        }
+        complete(device.recover()).unwrap();
+        assert!(weak.upgrade().is_none() && pending_weak.upgrade().is_none());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_gt_recovery_failure_retains_front_and_pending
 );
 
 fn smoke_kms_public_wc_flip_restore_and_retirement() -> TestResult {

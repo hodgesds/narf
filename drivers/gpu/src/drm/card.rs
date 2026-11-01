@@ -467,6 +467,8 @@ impl CrtcColor {
 pub(crate) struct DrmEventQueue {
     events: VecDeque<QueuedEvent>,
     event_space: usize,
+    #[cfg(feature = "intel")]
+    closed: bool,
 }
 
 /// One queued `drm_event`, deliverable at `deliver_at_ns` or when what it
@@ -599,7 +601,19 @@ impl DrmEventQueue {
         Self {
             events: VecDeque::new(),
             event_space: Self::EVENT_SPACE_BYTES,
+            #[cfg(feature = "intel")]
+            closed: false,
         }
+    }
+
+    #[cfg(feature = "intel")]
+    pub(crate) fn close(&mut self) {
+        self.closed = true;
+    }
+
+    #[cfg(feature = "intel")]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
     }
 
     fn push(&mut self, event: QueuedEvent) -> Result<(), DrmEventQueueFull> {
@@ -694,23 +708,35 @@ pub(crate) struct DrmEventQueueFull;
 /// ioctl consume the space this transaction needs after its hardware latch.
 #[cfg(feature = "intel")]
 #[derive(Debug)]
-pub(crate) struct FlipEventReservation<'a> {
-    queue: &'a narf_lib::sync::IrqSafeSpinLock<DrmEventQueue>,
+pub(crate) struct FlipEventReservation {
+    queue: Arc<narf_lib::sync::IrqSafeSpinLock<DrmEventQueue>>,
     pending: bool,
 }
 
 #[cfg(feature = "intel")]
-impl<'a> FlipEventReservation<'a> {
+impl FlipEventReservation {
     pub(crate) fn reserve(
-        queue: &'a narf_lib::sync::IrqSafeSpinLock<DrmEventQueue>,
+        queue: &Arc<narf_lib::sync::IrqSafeSpinLock<DrmEventQueue>>,
     ) -> Result<Self, DrmEventQueueFull> {
         {
             let mut events = queue.lock();
+            if events.closed {
+                return Err(DrmEventQueueFull);
+            }
             events.ensure_flip_event_space(1)?;
+            // Reserve storage for every charged event, including reservations
+            // not yet published by the asynchronous display worker.
+            let charged = (DrmEventQueue::EVENT_SPACE_BYTES - events.event_space)
+                / DrmEventQueue::FLIP_EVENT_BYTES
+                + 1;
+            events
+                .events
+                .try_reserve(charged)
+                .map_err(|_| DrmEventQueueFull)?;
             events.event_space -= DrmEventQueue::FLIP_EVENT_BYTES;
         }
         Ok(Self {
-            queue,
+            queue: queue.clone(),
             pending: true,
         })
     }
@@ -724,7 +750,13 @@ impl<'a> FlipEventReservation<'a> {
         bytes[8..16].copy_from_slice(&user_data.to_le_bytes());
         bytes[28..32].copy_from_slice(&crtc_id.to_le_bytes());
         patch_vblank_event(&mut bytes, stamp.ns, stamp.sequence);
-        self.queue.lock().events.push_back(QueuedEvent {
+        let mut queue = self.queue.lock();
+        if queue.closed {
+            queue.event_space += DrmEventQueue::FLIP_EVENT_BYTES;
+            self.pending = false;
+            return;
+        }
+        queue.events.push_back(QueuedEvent {
             deliver_at_ns: stamp.ns,
             wait: Wait::Time,
             bytes,
@@ -734,7 +766,7 @@ impl<'a> FlipEventReservation<'a> {
 }
 
 #[cfg(feature = "intel")]
-impl Drop for FlipEventReservation<'_> {
+impl Drop for FlipEventReservation {
     fn drop(&mut self) {
         if self.pending {
             self.queue.lock().event_space += DrmEventQueue::FLIP_EVENT_BYTES;

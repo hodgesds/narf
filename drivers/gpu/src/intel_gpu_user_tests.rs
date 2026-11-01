@@ -951,6 +951,23 @@ fn smoke_userspace_hung_job_is_retired_alone() -> TestResult {
             let base = registered[&u32::from(id)];
             model_runtime(&w, base, 0, 15_000_000, true);
             ready(&mut gt, HANG_TIMEOUT + 130);
+            // The snapshot precedes servicing the disable request, which can
+            // induce firmware engine reset. It owns no LRC/command addresses.
+            let diagnostic = gt.take_error_report().expect("timeout capture before disable");
+            assert!(gt.take_error_report().is_none(), "capture was not consumed once");
+            let index = (0..crate::intel_gpu_error::MAX_CARDS as u32).rev()
+                .find(|index| crate::intel_gpu_error::snapshot(*index).is_none()).expect("free diagnostic slot");
+            let stored = crate::intel_gpu_error::record(index, diagnostic);
+            let crate::intel_gpu_error::RecordResult::Stored(generation) = stored else { panic!("diagnostic publication refused"); };
+            let report = crate::intel_gpu_error::snapshot(index).unwrap();
+            let text = report.text();
+            assert!(text.contains("reason=Timeout\n"));
+            assert!(text.contains(&alloc::format!("epoch={}\n", epoch.unwrap())));
+            assert!(text.contains(&alloc::format!("id={id} ")));
+            assert!(text.contains("phase=Running timed_out=1 reset=0 runtime_ticks=15000000"));
+            assert!(text.contains("register_access=Complete\n"));
+            assert!(!text.contains("lrca") && !text.contains("bbaddr"));
+            assert!(crate::intel_gpu_error::clear(index, generation));
             if reset {
                 event(&ct_memory(&w), 0x1008, &[u32::from(id)]);
             }

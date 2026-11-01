@@ -58,6 +58,10 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn device_facts(&self) -> Option<DeviceFacts> {
         None
     }
+    /// Nonblocking policy requests serviced only by the retained GT owner.
+    fn power_controls(&self) -> Option<Arc<crate::intel_gpu_power_controls::PowerControls>> {
+        None
+    }
     /// Correlate a live engine counter with one supported CPU clock while the
     /// owner retains PCI D0, render forcewake and its reset mutex.
     fn engine_cycles(

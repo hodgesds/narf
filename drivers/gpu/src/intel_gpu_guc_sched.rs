@@ -5,6 +5,7 @@
 //! Scheduling acknowledgments are not job completion. Retirement additionally
 //! requires the GPU breadcrumb and exact saved ring head after deregistration.
 
+use crate::intel_gpu_error::{Capture, ContextInfo, ContextPhase, Contexts, Reason, Report};
 use crate::{
     intel_gpu_aux::MmioWindow,
     intel_gpu_context::{ContextError, ContextSeed},
@@ -145,6 +146,34 @@ struct Context<B: GpuBacking> {
     reset: bool,
 }
 
+impl<B: GpuBacking> Context<B> {
+    fn diagnostic(&self) -> ContextInfo {
+        ContextInfo {
+            engine: self.engine,
+            id: self.id,
+            request_stamp: self.stamp,
+            phase: match self.phase {
+                Phase::Invalidate => ContextPhase::Invalidate,
+                Phase::Invalidating => ContextPhase::Invalidating,
+                Phase::Register => ContextPhase::Register,
+                Phase::Policy => ContextPhase::Policy,
+                Phase::Enable => ContextPhase::Enable,
+                Phase::Enabling => ContextPhase::Enabling,
+                Phase::Running => ContextPhase::Running,
+                Phase::Disable => ContextPhase::Disable,
+                Phase::Disabling => ContextPhase::Disabling,
+                Phase::Deregister => ContextPhase::Deregister,
+                Phase::Deregistering => ContextPhase::Deregistering,
+                Phase::RetireInvalidate => ContextPhase::RetireInvalidate,
+                Phase::RetireInvalidating => ContextPhase::RetireInvalidating,
+            },
+            timed_out: self.timed_out,
+            reset: self.reset,
+            observed_runtime_ticks: self.runtime.diagnostic_ticks(),
+        }
+    }
+}
+
 struct EngineState<B: GpuBacking> {
     engine: Engine,
     hwsp: B,
@@ -187,6 +216,8 @@ pub(crate) struct GuCScheduler<A: BootAllocator> {
     engines: EngineSet,
     /// Default CCS state commands, captured with the render seed's fuses.
     compute_seed: Vec<u32>,
+    /// Captured only on an actual failure, before disable can provoke reset.
+    pending_error: Option<Report>,
 }
 
 impl<A: BootAllocator> GuCScheduler<A> {
@@ -269,6 +300,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             slpc: Slpc::new(),
             engines,
             compute_seed: Vec::new(),
+            pending_error: None,
         })
     }
 
@@ -286,6 +318,31 @@ impl<A: BootAllocator> GuCScheduler<A> {
 
     pub(crate) fn engines(&self) -> EngineSet {
         self.engines
+    }
+
+    pub(crate) fn diagnostic_contexts(&self) -> Contexts {
+        let mut contexts = Contexts::new(self.resources.contexts.len());
+        // Guilty/reset contexts precede innocent queued contexts if capped.
+        for context in self
+            .resources
+            .contexts
+            .iter()
+            .filter(|c| c.timed_out || c.reset)
+            .chain(
+                self.resources
+                    .contexts
+                    .iter()
+                    .filter(|c| !c.timed_out && !c.reset),
+            )
+            .take(crate::intel_gpu_error::MAX_CONTEXTS)
+        {
+            contexts.push(context.diagnostic());
+        }
+        contexts
+    }
+
+    pub(crate) fn take_error_report(&mut self) -> Option<Report> {
+        self.pending_error.take()
     }
 
     pub(crate) fn enable_engine(&mut self, mmio: &impl MmioWindow) -> Result<(), SchedulingError> {
@@ -814,6 +871,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             }
         }
         let resources = &mut *self.resources;
+        let diagnostic_total = resources.contexts.len();
         for context in &mut resources.contexts {
             if context.phase == Phase::Running {
                 fence(Ordering::Acquire);
@@ -867,6 +925,41 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     // GuC preempts this context alone or resets its engine
                     // if it cannot preempt within the firmware policy bound.
                     context.timed_out = true;
+                    if self.pending_error.is_none() {
+                        let mut contexts = Contexts::new(diagnostic_total);
+                        contexts.push(context.diagnostic());
+                        self.pending_error = Some(Report::capture(
+                            Capture {
+                                platform: self.platform,
+                                reason: Reason::Timeout,
+                                epoch: self.epoch,
+                                now_ns: now,
+                                state: crate::intel_gpu_guc_gt::GtState::SchedulingReady,
+                                engines: self.engines,
+                            },
+                            contexts,
+                            |offset| {
+                                // GuCGt checked awake before this poll; its PCI
+                                // owner retains D0/reset ownership throughout. The
+                                // authorized window rechecks current cap per read.
+                                let mmio = ct.window();
+                                let request = mmio.read32(0xa188);
+                                let render = mmio.read32(0xd84);
+                                let ack = mmio.read32(self.platform.guc_forcewake_ack()?);
+                                if request == u32::MAX
+                                    || render == u32::MAX
+                                    || ack == u32::MAX
+                                    || request & 1 == 0
+                                    || render & 1 == 0
+                                    || ack & 1 == 0
+                                {
+                                    return None;
+                                }
+                                let value = mmio.read32(offset);
+                                (value != u32::MAX).then_some(value)
+                            },
+                        ));
+                    }
                     context.phase = Phase::Disable;
                 }
             }
@@ -984,6 +1077,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             })
             .ok_or(SchedulingError::Protocol)?;
         let resources = &mut *self.resources;
+        let diagnostic_total = resources.contexts.len();
         let c = &mut resources.contexts[index];
         match (action, c.phase, message.payload.get(1).copied()) {
             (0x7001, Phase::Invalidating, None) if cookie == c.stamp => c.phase = Phase::Register,
@@ -1068,6 +1162,24 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     c.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
                 }
                 c.reset = true;
+                if !c.timed_out && self.pending_error.is_none() {
+                    let mut contexts = Contexts::new(diagnostic_total);
+                    contexts.push(c.diagnostic());
+                    // GuC's notification follows its engine reset. Preserve
+                    // software facts, without claiming a pre-reset MMIO image.
+                    self.pending_error = Some(Report::capture(
+                        Capture {
+                            platform: self.platform,
+                            reason: Reason::EngineReset,
+                            epoch: self.epoch,
+                            now_ns: now,
+                            state: crate::intel_gpu_guc_gt::GtState::SchedulingReady,
+                            engines: self.engines,
+                        },
+                        contexts,
+                        |_| None,
+                    ));
+                }
                 if c.phase == Phase::Running {
                     c.phase = Phase::Disable;
                 }

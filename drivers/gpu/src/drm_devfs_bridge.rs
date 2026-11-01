@@ -149,7 +149,7 @@ pub struct DriCardFile {
     /// Per-open flip-complete queue. The event's opaque `user_data` belongs to
     /// this opener's address space, so it must never be visible to another
     /// compositor across a greeter-to-session handoff.
-    events: narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>,
+    events: Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>>,
     /// `OUT_FENCE_PTR` results of the last atomic commit: (user pointer,
     /// vblank deadline ns) pairs. The syscall layer drains these via
     /// [`FileOps::drm_take_out_fences`] right after the ioctl returns and
@@ -202,7 +202,9 @@ impl DriCardFile {
             #[cfg(feature = "amdgpu")]
             amdgpu_bo_lists: crate::amdgpu_bo_list::BoListTable::new(),
             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
-            events: narf_lib::sync::IrqSafeSpinLock::new(crate::drm::card::DrmEventQueue::new()),
+            events: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+                crate::drm::card::DrmEventQueue::new(),
+            )),
             pending_out_fences: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
         })
     }
@@ -225,6 +227,8 @@ impl DriCardFile {
 
 impl Drop for DriCardFile {
     fn drop(&mut self) {
+        #[cfg(feature = "intel")]
+        self.events.lock().close();
         // Quiesce any virtio-gpu host resources this open created (Mesa may
         // build its render context + resources on the card node, not just the
         // render node — see the `virtgpu` field). Mirrors DriRenderFile::drop:

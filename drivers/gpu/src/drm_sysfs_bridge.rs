@@ -367,6 +367,12 @@ fn populate_card_node(
         );
     }
 
+    #[cfg(feature = "intel")]
+    if card.vendor_id() == 0x8086 {
+        crate::intel_gpu_error::populate_card(idx, &kobj);
+        crate::intel_gpu_power_controls::populate_card(idx, &kobj);
+    }
+
     // ── Optional AMDGPU-specific attrs ───────────────────────────────────
     if let Some(ver) = card.vbios_version() {
         let ver_owned = String::from(ver);
@@ -572,6 +578,117 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/drm_sysfs",
         smoke_drm_canonical_ancestry_reaches_pci
+    );
+
+    #[cfg(feature = "intel")]
+    #[derive(Debug)]
+    struct IntelFixture;
+    #[cfg(feature = "intel")]
+    impl crate::drm_registry::DrmCard for IntelFixture {
+        fn name(&self) -> &str {
+            "intel-error-fixture"
+        }
+        fn driver(&self) -> &str {
+            "xe"
+        }
+        fn vendor_id(&self) -> u16 {
+            0x8086
+        }
+        fn device_id(&self) -> u16 {
+            0x7d55
+        }
+        fn subsystem_vendor(&self) -> u16 {
+            0
+        }
+        fn subsystem_device(&self) -> u16 {
+            0
+        }
+        fn vbios_version(&self) -> Option<&str> {
+            None
+        }
+        fn gpu_busy_percent(&self) -> Option<u32> {
+            None
+        }
+        fn power_state(&self) -> &str {
+            "D0"
+        }
+    }
+
+    #[cfg(feature = "intel")]
+    fn smoke_drm_intel_error_file_is_card_scoped_and_read_only() -> TestResult {
+        use crate::intel_gpu_error::{
+            self as error, Capture, Contexts, Reason, RecordResult, Report,
+        };
+        let Some(index) = (1..error::MAX_CARDS as u32)
+            .rev()
+            .find(|index| error::snapshot(*index).is_none())
+        else {
+            return TestResult::Skip("all first-error slots are occupied");
+        };
+        narf_filesystem::sysfs::__reset_for_test();
+        let class = class_register("drm");
+        populate_card_node(class.clone(), Arc::new(IntelFixture), index);
+        populate_card_node(class, Arc::new(PciFixture), 0);
+        let host = get_root()
+            .get_child("devices")
+            .unwrap()
+            .get_child("pci0000:00")
+            .unwrap();
+        let bdf = format!(
+            "0000:00:{:02x}.0",
+            0x10u8.saturating_add(index as u8).min(0x1e)
+        );
+        let drm = host.get_child(&bdf).unwrap().get_child("drm").unwrap();
+        let card = drm.get_child(&format!("card{index}")).unwrap();
+        assert!(card.has_attr("error"));
+        assert!(!card.attr_is_writable("error"));
+        assert!(card.attr_store("error", b"clear").is_none());
+        assert!(!drm
+            .get_child(&format!("renderD{}", index + 128))
+            .unwrap()
+            .has_attr("error"));
+        let other = host
+            .get_child("0000:00:10.0")
+            .unwrap()
+            .get_child("drm")
+            .unwrap()
+            .get_child("card0")
+            .unwrap();
+        assert!(!other.has_attr("error"));
+        assert_eq!(
+            card.attr_show("error").as_deref(),
+            Some("narf-intel-error-v1\nstate=none\n")
+        );
+        let report = Report::capture(
+            Capture {
+                platform: crate::intel_gpu_gt::GtPlatform::Alchemist,
+                reason: Reason::Unavailable,
+                epoch: 42,
+                now_ns: 9000,
+                state: crate::intel_gpu_guc_gt::GtState::Lost,
+                engines: crate::intel_gpu_engine::EngineSet::of(&[]),
+            },
+            Contexts::new(0),
+            |_| None,
+        );
+        let RecordResult::Stored(generation) = error::record(index, report) else {
+            return TestResult::Fail("free fixture slot was not retained");
+        };
+        let text = card.attr_show("error").unwrap();
+        assert!(text.contains("reason=Unavailable\nepoch=42\n"));
+        assert!(text.contains("register_access=Unavailable\n"));
+        assert!(error::clear(index, generation));
+        assert_eq!(
+            card.attr_show("error").as_deref(),
+            Some("narf-intel-error-v1\nstate=none\n")
+        );
+        narf_filesystem::sysfs::__reset_for_test();
+        TestResult::Pass
+    }
+    #[cfg(feature = "intel")]
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_error",
+        smoke_drm_intel_error_file_is_card_scoped_and_read_only
     );
 
     /// `card<N>/device/subsystem` must resolve to `/sys/bus/pci`.

@@ -46,6 +46,8 @@ enum Phase {
     Probe,
     Defaults,
     PpgttProbe,
+    /// Fresh GT is ready; display retirement runs outside the GT mutex.
+    DisplayRecovery,
     Running,
     /// Runtime-suspended after a verified idle stop; D3hot is owned by the
     /// PCI runtime-PM layer. Resume restarts from Cold under the same epoch.
@@ -92,6 +94,7 @@ struct Owner {
     user_version: Arc<AtomicU32>,
     user_engines: Arc<core::sync::atomic::AtomicU8>,
     user_facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
+    power_controls: Arc<crate::intel_gpu_power_controls::PowerControls>,
 }
 
 #[derive(Debug)]
@@ -102,9 +105,13 @@ struct Backend {
     engines: Arc<core::sync::atomic::AtomicU8>,
     platform: GtPlatform,
     facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
+    power_controls: Arc<crate::intel_gpu_power_controls::PowerControls>,
 }
 
 impl crate::intel_gpu_user::UserBackend for Backend {
+    fn power_controls(&self) -> Option<Arc<crate::intel_gpu_power_controls::PowerControls>> {
+        Some(self.power_controls.clone())
+    }
     fn native_xe(&self) -> bool {
         true
     }
@@ -132,6 +139,7 @@ impl crate::intel_gpu_user::UserBackend for Backend {
                 .ok_or(narf_filesystem::FsError::NoDevice)?;
             let result = gt.engine_cycles(engine, clock);
             if gt.state() == GtState::Lost {
+                owner.power_controls.close();
                 owner.user_epoch.store(0, Ordering::Release);
             }
             result.map_err(|error| match error {
@@ -210,6 +218,7 @@ impl Backend {
             None => gt.submit_user_batch(narf_time::monotonic_ns(), context, batch),
         };
         if gt.state() == GtState::Lost {
+            owner.power_controls.close();
             owner.user_epoch.store(0, Ordering::Release);
         }
         if let Ok((_, fence)) = &result {
@@ -357,6 +366,7 @@ pub(crate) fn start_pending() {
             user_version: Arc::new(AtomicU32::new(0)),
             user_engines: Arc::new(core::sync::atomic::AtomicU8::new(0)),
             user_facts: Arc::new(IrqSafeSpinLock::new(None)),
+            power_controls: Arc::new(crate::intel_gpu_power_controls::PowerControls::new()),
         });
         *ops.0.lock() = Arc::downgrade(&owner);
         let backend = Arc::new(Backend {
@@ -370,6 +380,7 @@ pub(crate) fn start_pending() {
             )
             .expect("admitted platform"),
             facts: owner.user_facts.clone(),
+            power_controls: owner.power_controls.clone(),
         });
         if owner.pending.card.install_user_backend(backend).is_err() {
             log(
@@ -550,7 +561,11 @@ impl Owner {
         }
         let now = narf_time::monotonic_ns();
         let gt = state.gt.as_mut().ok_or(RuntimeError::State)?;
-        let current = match gt.poll(now) {
+        let polled = gt.poll(now);
+        if let Some(report) = gt.take_error_report() {
+            crate::intel_gpu_error::record(self.pending.index, report);
+        }
+        let current = match polled {
             core::task::Poll::Pending => return Ok(()),
             core::task::Poll::Ready(result) => result.map_err(RuntimeError::Gt)?,
         };
@@ -620,7 +635,7 @@ impl Owner {
                     *self.user_facts.lock() = Some(gt.device_facts().map_err(RuntimeError::Gt)?);
                     // Before the epoch: discovery sees VRAM with the engines.
                     self.pending.card.publish_gt_vram(gt);
-                    state.phase = Phase::Running;
+                    state.phase = Phase::DisplayRecovery;
                     let (major, minor, patch) = gt.submission_version();
                     self.user_version.store(
                         u32::from(major) << 16 | u32::from(minor) << 8 | u32::from(patch),
@@ -633,10 +648,9 @@ impl Owner {
                     if let Some(epoch) = state.parked_epoch.take() {
                         gt.adopt_user_epoch(epoch).map_err(RuntimeError::Gt)?;
                     }
-                    self.user_epoch.store(
-                        gt.user_epoch().ok_or(RuntimeError::State)?,
-                        Ordering::Release,
-                    );
+                    // Epoch publication follows an independent console
+                    // recovery attempt, outside this GT mutex. A display
+                    // waiter may itself still depend on our failed fences.
                     log(
                         self.pending.index,
                         "GuC ready; default RCS/BCS state, private PPGTT store and retirement verified",
@@ -699,6 +713,55 @@ impl Owner {
                     drop(wait.take());
                     state.irq.take(); // stop delivery before resetting the GT
                     delay_us = 500;
+                    if let Some(gt) = state.gt.as_ref() {
+                        use crate::intel_gpu_error::Reason;
+                        let reason = match error {
+                            RuntimeError::Gt(GtError::WakeLost | GtError::WakeTimeout) => {
+                                Reason::WakeLost
+                            }
+                            RuntimeError::Gt(GtError::Unavailable) => Reason::Unavailable,
+                            RuntimeError::Gt(GtError::Scheduling(
+                                crate::intel_gpu_guc_sched::SchedulingError::Timeout,
+                            )) => Reason::Timeout,
+                            RuntimeError::Gt(GtError::Scheduling(
+                                crate::intel_gpu_guc_sched::SchedulingError::Protocol,
+                            )) => Reason::Protocol,
+                            RuntimeError::Gt(
+                                GtError::Scheduling(
+                                    crate::intel_gpu_guc_sched::SchedulingError::Transport(_),
+                                )
+                                | GtError::Transport(_),
+                            ) => Reason::Transport,
+                            RuntimeError::Gt(GtError::Boot(_)) | RuntimeError::Firmware(_) => {
+                                Reason::Boot
+                            }
+                            RuntimeError::Gt(_) => Reason::Recovery,
+                            _ => Reason::State,
+                        };
+                        let window = AuthorizedWindow::new(self.pending.bar, self.pending.cap);
+                        let report = gt.error_report(
+                            reason,
+                            self.user_epoch.load(Ordering::Acquire),
+                            narf_time::monotonic_ns(),
+                            || {
+                                narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
+                                    == Ok(Some(narf_bus::pci::PciPowerState::D0))
+                            },
+                            |offset| {
+                                if narf_bus::pci::power_state(
+                                    &self.pending.cap,
+                                    &self.pending.device,
+                                ) != Ok(Some(narf_bus::pci::PciPowerState::D0))
+                                {
+                                    return None;
+                                }
+                                let value = window.read32(offset);
+                                (value != u32::MAX).then_some(value)
+                            },
+                        );
+                        crate::intel_gpu_error::record(self.pending.index, report);
+                    }
+                    self.power_controls.close();
                     self.user_epoch.store(0, Ordering::Release);
                     // A display waiter can depend on one of our fences.
                     // Poison its proofs synchronously before reset; never
@@ -722,6 +785,37 @@ impl Owner {
                         {
                             state.phase = Phase::Cleaning;
                         }
+                    }
+                }
+                if state.phase == Phase::DisplayRecovery {
+                    drop(state);
+                    if crate::intel_gpu_kms::recover_after_gt_reset(&self.pending.bar)
+                        .await
+                        .is_err()
+                    {
+                        log(
+                            self.pending.index,
+                            "display recovery failed; retained scanout remains quarantined",
+                        );
+                    }
+                    state = self.state.lock().await;
+                    if state.phase == Phase::DisplayRecovery
+                        && !self.suspended.load(Ordering::Acquire)
+                    {
+                        if let Some(epoch) = state.gt.as_ref().and_then(GuCGt::user_epoch) {
+                            self.power_controls.activate(epoch);
+                            self.user_epoch.store(epoch, Ordering::Release);
+                            state.phase = Phase::Running;
+                        }
+                    }
+                }
+                if state.phase == Phase::Running {
+                    if let Some(gt) = state.gt.as_mut() {
+                        self.power_controls.service(
+                            gt,
+                            self.user_epoch.load(Ordering::Acquire),
+                            narf_time::monotonic_ns(),
+                        );
                     }
                 }
                 if state.phase == Phase::Running && !state.irq_tried {
@@ -811,6 +905,7 @@ impl Owner {
             return Err(RpmError::Busy);
         }
         state.irq.take(); // mask and synchronize while still in D0
+        self.power_controls.close();
         state.irq_tried = false;
         let gt = state.gt.as_mut().expect("running GT");
         let stopped = gt.begin_stop(narf_time::monotonic_ns()).is_ok()
@@ -896,9 +991,12 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             crate::intel_gpu_kms::quiesce_for_legacy(&self.pending.bar)
                 .await
                 .map_err(|_| E::Busy)?;
+            // Serialize closing admission with the worker's ready-epoch
+            // activation. Display quiescence remains outside this lock.
+            let mut state = self.state.lock().await;
+            self.power_controls.close();
             self.suspended.store(true, Ordering::Release);
             self.user_epoch.store(0, Ordering::Release);
-            let mut state = self.state.lock().await;
             state.irq.take(); // mask/synchronize while the function is in D0
             state.saved = None;
             // System sleep loses context state: no runtime epoch survives it.

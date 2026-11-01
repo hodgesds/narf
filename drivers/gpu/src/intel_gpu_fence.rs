@@ -84,6 +84,15 @@ impl narf_filesystem::DrmFence for CompletionFence {
         self.result().is_some()
     }
 
+    fn status(&self) -> i32 {
+        match self.result() {
+            None => 0,
+            Some(Ok(())) => 1,
+            Some(Err(JobError::Hang)) => -62, // ETIME: isolated user hang.
+            Some(Err(JobError::Reset)) => -5, // EIO: lost GT incarnation.
+        }
+    }
+
     fn is_submit_ready(&self) -> bool {
         let state = self.state.lock();
         state.submitted || state.result.is_some()
@@ -206,6 +215,7 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         let mut wait = fence.wait();
         assert!(!fence.is_submit_ready());
+        assert_eq!(fence.status(), 0);
         assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
         fence.mark_submitted();
         fence.mark_submitted();
@@ -215,12 +225,18 @@ mod tests {
         assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
         assert_eq!(counter.0.load(Ordering::Relaxed), 0);
         fence.signal(Ok(()));
+        assert_eq!(fence.status(), 1);
         assert_eq!(counter.0.load(Ordering::Relaxed), 1);
         assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(Ok(())));
         let reset = CompletionFence::new();
         reset.signal(Err(JobError::Reset));
         assert!(reset.is_submit_ready());
         assert!(reset.is_signalled());
+        assert_eq!(reset.status(), -5);
+        let hang = CompletionFence::new();
+        hang.signal(Err(JobError::Hang));
+        assert!(hang.is_signalled());
+        assert_eq!(hang.status(), -62);
         TestResult::Pass
     }
     kernel_test_in!(

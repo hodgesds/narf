@@ -51,6 +51,12 @@ pub(crate) enum IoError {
     Unavailable,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct SavedStatus {
+    ier: u32,
+    imr: u32,
+}
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum State {
     Initializing,
@@ -167,6 +173,62 @@ impl<M: DisplayAccess> PollIo<M> {
 
     pub(crate) fn format(&self) -> PteFormat {
         self.format
+    }
+
+    pub(crate) fn saved_status(&self) -> SavedStatus {
+        SavedStatus {
+            ier: self.saved_ier,
+            imr: self.saved_imr,
+        }
+    }
+
+    pub(crate) fn snapshot_status(
+        mmio: &M,
+        generation: Generation,
+    ) -> Result<SavedStatus, IoError> {
+        if !mmio.access_ok() {
+            return Err(IoError::Unavailable);
+        }
+        let ier = mmio.read32(IER);
+        let imr = mmio.read32(IMR);
+        if ier == u32::MAX || !mmio.access_ok() {
+            return Err(IoError::Unavailable);
+        }
+        let status = COMMON_STATUS
+            | if generation == Generation::MeteorLake {
+                MTL_ATS_STATUS
+            } else {
+                0
+            };
+        Ok(SavedStatus {
+            ier: ier & status,
+            imr: imr & status,
+        })
+    }
+
+    /// Acquire a new status observation after reset while preserving the
+    /// original firmware ownership, rather than treating our old IER/IMR
+    /// bits as inherited state. The old adapter remains permanently lost.
+    ///
+    /// # Safety
+    /// Same exclusion/current cache-policy requirements as `new`. Old DMA
+    /// owners remain retained; this acquisition is no fetch-stop proof.
+    pub(crate) unsafe fn after_reset(
+        mmio: M,
+        generation: Generation,
+        pipe: Pipe,
+        bar_len: u64,
+        saved: SavedStatus,
+    ) -> Result<Self, IoError> {
+        // SAFETY: caller supplies the constructor's current ownership proof.
+        let mut owner = unsafe { Self::new(mmio, generation, pipe, bar_len) }?;
+        owner.saved_ier = saved.ier;
+        owner.saved_imr = saved.imr;
+        Ok(owner)
+    }
+
+    pub(crate) fn poison(&self) {
+        self.state.set(State::Lost);
     }
 
     fn fail<T>(&self) -> Result<T, IoError> {

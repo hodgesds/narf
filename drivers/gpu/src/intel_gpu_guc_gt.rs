@@ -159,6 +159,48 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         self.state
     }
 
+    /// Allocation-free scalar/status capture under this owner's reset lock.
+    /// The access predicate checks current D0/PCI authority before even the
+    /// wake-proof MMIO reads. Each status read requires current GT/render wake. Failure to
+    /// establish that proof preserves the software facts without MMIO data.
+    pub(crate) fn error_report(
+        &self,
+        reason: crate::intel_gpu_error::Reason,
+        epoch: u64,
+        now_ns: u64,
+        mut current_access_ok: impl FnMut() -> bool,
+        mut read: impl FnMut(u64) -> Option<u32>,
+    ) -> crate::intel_gpu_error::Report {
+        crate::intel_gpu_error::Report::capture(
+            crate::intel_gpu_error::Capture {
+                platform: self.parts.boot.platform(),
+                reason,
+                epoch,
+                now_ns,
+                state: self.state,
+                engines: self.engines().unwrap_or_default(),
+            },
+            self.parts.scheduler.as_ref().map_or_else(
+                || crate::intel_gpu_error::Contexts::new(0),
+                GuCScheduler::diagnostic_contexts,
+            ),
+            |offset| {
+                if !current_access_ok() || self.awake().is_err() {
+                    None
+                } else {
+                    read(offset)
+                }
+            },
+        )
+    }
+
+    pub(crate) fn take_error_report(&mut self) -> Option<crate::intel_gpu_error::Report> {
+        self.parts
+            .scheduler
+            .as_mut()
+            .and_then(GuCScheduler::take_error_report)
+    }
+
     /// Last validated firmware table. It describes hardware capabilities, not
     /// active engine/fuse masks or permission to admit userspace submissions.
     pub fn hwconfig(&self) -> Option<&HardwareConfig> {

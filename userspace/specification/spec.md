@@ -25,6 +25,14 @@ applications above NARF.
 
 ## 3. Public interface
 
+Sync-file FILE_INFO preserves native `DrmFence::status` errors for each leaf.
+Poll and count-only FILE_INFO remain pending until all leaves terminate;
+terminal errors then make the aggregate readable. Detailed FILE_INFO follows
+Linux's ordered first-nonpositive leaf rule, which can expose an earlier error
+while a later sibling is pending. Intel NONBLOCK presentation exports its native
+completion fence in the calling ioctl before the owned background job is
+published; no user address or ioctl context escapes into that worker.
+
 Device ioctl contexts implement the filesystem's atomic aligned qword
 load-acquire/store-release hooks using `narf_arch::access_user_u64_guarded`.
 The syscall boundary validates the full user range before entering the

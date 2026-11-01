@@ -8,7 +8,7 @@ use crate::intel_gpu_scanout::Geometry;
 use narf_filesystem::FsFuture;
 
 type ModeState = Arc<narf_lib::sync::IrqSafeSpinLock<Card>>;
-type Events = narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>;
+type Events = Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>>;
 type OutFences = narf_lib::sync::IrqSafeSpinLock<Vec<(u64, u64)>>;
 const EVENT: u32 = 1;
 const TEST_ONLY: u32 = 0x100;
@@ -250,6 +250,7 @@ enum Action {
     Restore,
     Remove(u32),
     DropMaster,
+    SetMaster,
     Cursor(Vec<u8>),
     Noop,
 }
@@ -264,6 +265,7 @@ struct Plan {
     out: Option<u64>,
     fence: Option<i32>,
     test: bool,
+    nonblock: bool,
 }
 
 fn same_timing(
@@ -319,7 +321,17 @@ fn legacy_wire(m: crate::drm_uapi::DrmModeModeInfoUapi) -> crate::drm::ioctl::Dr
 }
 
 impl Plan {
+    #[cfg(any(test, feature = "kernel-test"))]
     fn stage(card: &Card, request: Request, geometry: Geometry) -> Result<Self, FsError> {
+        Self::stage_from(card, request, geometry, None)
+    }
+
+    fn stage_from(
+        card: &Card,
+        request: Request,
+        geometry: Geometry,
+        previous: Option<Crtc>,
+    ) -> Result<Self, FsError> {
         let request = match request {
             Request::Property {
                 object,
@@ -339,7 +351,9 @@ impl Plan {
             }
             other => other,
         };
-        let previous = card.crtcs.first().ok_or(FsError::NoDevice)?.clone();
+        let previous = previous
+            .or_else(|| card.crtcs.first().cloned())
+            .ok_or(FsError::NoDevice)?;
         let fixed = previous
             .mode
             .or_else(|| {
@@ -362,6 +376,7 @@ impl Plan {
             out: None,
             fence: None,
             test: false,
+            nonblock: false,
         };
         let mut fb = p.next.primary_fb;
         let mut route = fb.map(|_| p.next.id);
@@ -379,7 +394,7 @@ impl Plan {
         match request {
             Request::Property { .. } => unreachable!("property request normalized before staging"),
             Request::SetMaster => {
-                p.action = Action::Noop;
+                p.action = Action::SetMaster;
                 return Ok(p);
             }
             Request::DropMaster => {
@@ -464,6 +479,7 @@ impl Plan {
                 p.event = a.flags & EVENT != 0;
                 p.cookie = a.cookie;
                 p.test = a.flags & TEST_ONLY != 0;
+                p.nonblock = a.flags & NONBLOCK != 0;
                 if a.objects.len() != a.counts.len() {
                     return Err(FsError::InvalidData);
                 }
@@ -687,6 +703,10 @@ impl Plan {
 }
 
 trait Backend {
+    fn valid(&self) -> Result<(), FsError> {
+        Ok(())
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
     fn geometry(&self) -> Geometry;
     fn console_fb(&self) -> narf_graphics_driver::generic::GenericFb;
     fn check(&self, g: Geometry) -> Result<(), FsError>;
@@ -702,6 +722,10 @@ trait Backend {
     }
 }
 impl Backend for crate::intel_gpu_kms::Session<'_> {
+    fn valid(&self) -> Result<(), FsError> {
+        self.ownership_valid()
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
     fn geometry(&self) -> Geometry {
         self.console_geometry()
     }
@@ -726,6 +750,7 @@ impl Backend for crate::intel_gpu_kms::Session<'_> {
     }
 }
 
+#[cfg(any(test, feature = "kernel-test"))]
 async fn wait_fences(fences: Vec<Arc<dyn narf_filesystem::DrmFence>>) -> Result<(), FsError> {
     let deadline = narf_time::monotonic_ns().saturating_add(15_000_000_000);
     while fences.iter().any(|f| !f.is_signalled()) {
@@ -779,7 +804,9 @@ where
     let mut pages = None;
     let mut phys = None;
     let size = if let Some(intel) = &frame.intel {
-        wait_fences(intel.object.dma_buf.resv.fences(DmaResvUsage::Write)).await?;
+        // The transaction owner resolves writer dependencies before obtaining
+        // the display session, so reset recovery never waits behind a fence.
+
         if !intel.object.sync_for_cpu_read() {
             return Err(crate::intel_gpu_user::io_error());
         }
@@ -840,6 +867,7 @@ where
     Ok(())
 }
 
+#[cfg(any(test, feature = "kernel-test"))]
 #[allow(clippy::too_many_arguments)]
 async fn execute<B: Backend>(
     backend: &mut B,
@@ -850,21 +878,13 @@ async fn execute<B: Backend>(
     events: Option<&Events>,
     out: Option<&OutFences>,
 ) -> Result<u64, FsError> {
-    let (plan, transaction) = {
-        let mut card = mode.lock();
+    let plan = {
+        let card = mode.lock();
         if !card.is_master(open) {
             return Err(FsError::PermissionDenied);
         }
-        let plan = Plan::stage(&card, request, backend.geometry())?;
-        let transaction = if plan.test {
-            None
-        } else {
-            card.intel_begin_transaction(open)?;
-            Some(Transaction(mode.clone()))
-        };
-        (plan, transaction)
+        Plan::stage(&card, request, backend.geometry())?
     };
-    let _transaction = transaction;
     if plan.test {
         if let Some(fd) = plan.fence {
             context.sync_file_fences(fd).ok_or(FsError::InvalidData)?;
@@ -888,9 +908,41 @@ async fn execute<B: Backend>(
     if let Some(fd) = plan.fence {
         wait_fences(context.sync_file_fences(fd).ok_or(FsError::InvalidData)?).await?;
     }
+    wait_fences(plan_dependencies(&plan, mode)?).await?;
+    let out_ptr = plan.out;
+    let stamp = execute_plan(backend, mode, open, &plan, reservation).await?;
+    if let (Some(ptr), Some(sink)) = (out_ptr, out) {
+        sink.lock().push((ptr, stamp.ns));
+    }
+    Ok(0)
+}
+
+async fn execute_plan<B: Backend>(
+    backend: &mut B,
+    mode: &ModeState,
+    open: u64,
+    plan: &Plan,
+    reservation: Option<FlipEventReservation>,
+) -> Result<FlipStamp, FsError> {
+    if matches!(plan.action, Action::SetMaster) {
+        mode.lock().set_master(open).map_err(|_| FsError::Busy)?;
+        return Ok(FlipStamp {
+            ns: narf_time::monotonic_ns(),
+            sequence: 0,
+        });
+    }
+    {
+        let mut card = mode.lock();
+        if !plan.still_valid(&card, open) {
+            return Err(FsError::Busy);
+        }
+        card.intel_begin_transaction(open)?;
+    }
+    let _transaction = Transaction(mode.clone());
     let mut stamp = None;
     match &plan.action {
         Action::Noop => {}
+        Action::SetMaster => unreachable!("handled before transaction"),
         Action::DropMaster => {
             backend.restore().await?;
         }
@@ -923,7 +975,6 @@ async fn execute<B: Backend>(
             };
             if direct {
                 let object = direct_object(fb)?;
-                wait_fences(object.dma_buf.resv.fences(DmaResvUsage::Write)).await?;
                 stamp = Some(match backend.present(object.clone(), plan.geometry).await {
                     Ok(stamp) => stamp,
                     // The display owner uses Unsupported only for admission
@@ -967,6 +1018,9 @@ async fn execute<B: Backend>(
             }
         }
     }
+    // This is the completion linearization witness. A reset/loss after the
+    // final await must not turn an abandoned surface into a success event.
+    backend.valid()?;
     let published = {
         let mut card = mode.lock();
         if !plan.still_valid(&card, open) {
@@ -984,7 +1038,7 @@ async fn execute<B: Backend>(
                         );
                     }
                 }
-                Action::Noop | Action::Observe | Action::Cursor(_) => {}
+                Action::Noop | Action::Observe | Action::Cursor(_) | Action::SetMaster => {}
                 Action::Present | Action::Restore => {
                     *card.crtc_mut(plan.next.id).map_err(|_| FsError::NotFound)? =
                         plan.next.clone();
@@ -997,10 +1051,6 @@ async fn execute<B: Backend>(
                     stamp.ok_or(FsError::InvalidData)?,
                 );
             }
-            if let (Some(ptr), Some(sink)) = (plan.out, out) {
-                sink.lock()
-                    .push((ptr, stamp.ok_or(FsError::InvalidData)?.ns));
-            }
             true
         }
     };
@@ -1008,8 +1058,32 @@ async fn execute<B: Backend>(
         backend.restore().await?;
         return Err(FsError::Busy);
     }
-    Ok(0)
+    Ok(stamp.unwrap_or(FlipStamp {
+        ns: narf_time::monotonic_ns(),
+        sequence: 0,
+    }))
 }
+
+fn plan_dependencies(
+    plan: &Plan,
+    mode: &ModeState,
+) -> Result<Vec<Arc<dyn narf_filesystem::DrmFence>>, FsError> {
+    let Some(fb) = &plan.framebuffer else {
+        return Ok(Vec::new());
+    };
+    if let Some(intel) = &fb.intel {
+        Ok(intel.object.dma_buf.resv.fences(DmaResvUsage::Write))
+    } else {
+        Ok(mode
+            .lock()
+            .dumb_backing(fb.gem_handle)
+            .ok_or(FsError::NotFound)?
+            .dma_buf
+            .resv
+            .fences(DmaResvUsage::Write))
+    }
+}
+
 fn direct_object(frame: &Framebuffer) -> Result<Arc<crate::intel_gpu_gem::GemObject>, FsError> {
     frame
         .intel
@@ -1040,19 +1114,39 @@ pub(crate) async fn dispatch(
                 return Err(FsError::PermissionDenied);
             }
             let request = Request::copy(cmd, arg, context)?;
-            let mut session = display.session().await?;
-            if matches!(request, Request::SetMaster) {
-                return mode
-                    .lock()
-                    .set_master(open)
-                    .map(|_| 0)
-                    .map_err(|_| FsError::Busy);
+            let queue = queue::for_card(index, mode.clone());
+            let geometry = display.console_geometry();
+            let submitted = match queue
+                .submit(open, request, geometry, display.epoch(), context, events)
+                .await
+            {
+                Ok(submitted) => submitted,
+                Err(queue::SubmitError::Io(error)) => return Err(error),
+                Err(queue::SubmitError::NoDescriptor) => return Ok((-24i64) as u64),
+            };
+            if let Some((completion, start, nonblock)) = submitted {
+                if start {
+                    let queue = queue.clone();
+                    // Scheduler admission is infallible (TaskId, not Result);
+                    // the independent task survives cancellation of this ioctl.
+                    let _worker = narf_scheduler::spawn_stackful(async move {
+                        let mut worker = queue::DisplayWorker { display, mode };
+                        queue.run(&mut worker).await;
+                    });
+                }
+                if !nonblock {
+                    completion.result_async().await?;
+                }
             }
-            execute(&mut session, &mode, open, request, context, events, out).await
+            let _ = out; // Other vendors retain the legacy deadline export sink.
+            Ok(0)
         }
         .await,
     )
 }
+
+#[path = "intel_gpu_kms_queue.rs"]
+mod queue;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_kms_ioctl_tests.rs"]
