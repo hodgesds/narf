@@ -1025,6 +1025,16 @@ native cases await release execution; source review and the combined release
 Clippy probe pass. The family §3 and `rtl8188eu-ht40.md` specify the contract;
 real per-device qualification data remains externally supplied.
 
+MT76 management FRAME can acquire a private native CNM lease when no public
+ROC is active. Only its exact unsolicited grant authorizes publication, and
+the granted finite response window survives TX status and borrower loss
+until native abort/packet retirement completes. This private lease publishes
+no public ROC events. Control-WDEV FRAME accepts the validated empty NO_CCK
+flag and retains its choice through the actual 2.4 GHz descriptor rate;
+legacy netdev/AP acceptance remains unchanged. Four additional native cases
+are wired for this continuation and await release acceptance. Independent
+client/GO contexts and qualified 6 GHz management TX remain open.
+
 ## 4. Interaction with `narf-wireless`
 
 - **Registration**: Drivers register via `bus::register_wireless_driver(MatchEntry { ... })`.

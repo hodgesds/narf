@@ -17,6 +17,7 @@ pub(super) struct Roc {
     cookie: u64,
     source: RadioEventAuthority,
     activated: bool,
+    public_events: bool,
     home_permission: Option<crate::mt7921::association::TxPermission>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,7 +38,7 @@ impl<B: Backend> Session<B> {
         let Phase::Granted { interval_ms, .. } = lease.phase else {
             return None;
         };
-        (owner.activated && roc.activated).then(|| {
+        (owner.activated && roc.activated && roc.public_events).then(|| {
             (
                 roc.source.clone(),
                 Receipt {
@@ -77,6 +78,28 @@ impl<B: Backend> Session<B> {
         frequency_mhz: u32,
         duration_ms: u32,
     ) -> Result<u32, Error> {
+        self.acquire_p2p_roc_inner(authority, cookie, frequency_mhz, duration_ms, true, false)
+            .await
+    }
+    pub(in crate::mt7921::firmware_transport) async fn acquire_p2p_frame_roc(
+        &mut self,
+        authority: Arc<RadioControlAuthority>,
+        cookie: u64,
+        frequency_mhz: u32,
+        duration_ms: u32,
+    ) -> Result<u32, Error> {
+        self.acquire_p2p_roc_inner(authority, cookie, frequency_mhz, duration_ms, false, true)
+            .await
+    }
+    async fn acquire_p2p_roc_inner(
+        &mut self,
+        authority: Arc<RadioControlAuthority>,
+        cookie: u64,
+        frequency_mhz: u32,
+        duration_ms: u32,
+        public_events: bool,
+        quiesced: bool,
+    ) -> Result<u32, Error> {
         self.check_p2p_request(&authority)?;
         authority.require_mode(10).map_err(|_| Error::Authority)?;
         if !authority.has_reservation() {
@@ -100,7 +123,9 @@ impl<B: Backend> Session<B> {
         if self.p2p_rf_busy() {
             return Err(Error::Busy);
         }
-        self.quiesce_p2p_home().await?;
+        if !quiesced {
+            self.quiesce_p2p_home().await?;
+        }
         self.check_p2p_request(&authority)?;
         let home = self.state;
         let home_permission = self.p2p_home_permission()?;
@@ -122,6 +147,7 @@ impl<B: Backend> Session<B> {
             cookie,
             source,
             activated: false,
+            public_events,
             home_permission,
         });
         self.stage(Stage::P2pRocAcquire);
@@ -234,17 +260,43 @@ impl<B: Backend> Session<B> {
             self.backend.check_tx_permission(permission)?;
         }
         roc.channel
-            .current(self.backend.regulatory_domain()?.as_ref())
+            .current(self.backend.regulatory_domain()?.as_ref())?;
+        if let Some(implicit) = owner.management.implicit {
+            if roc.public_events
+                || implicit.cookie != roc.cookie
+                || implicit.plan.frequency_mhz != roc.channel.frequency_mhz
+            {
+                return Err(Error::Authority);
+            }
+            self.check_p2p_management_plan(implicit.plan, implicit.home)?;
+        }
+        Ok(())
     }
     pub(in crate::mt7921::firmware_transport) fn commit_p2p_roc(
         &mut self,
         authority: &RadioControlAuthority,
+    ) -> Result<Receipt, Error> {
+        self.commit_p2p_roc_inner(authority, true)
+    }
+    pub(in crate::mt7921::firmware_transport) fn commit_p2p_frame_roc(
+        &mut self,
+        authority: &RadioControlAuthority,
+    ) -> Result<Receipt, Error> {
+        self.commit_p2p_roc_inner(authority, false)
+    }
+    fn commit_p2p_roc_inner(
+        &mut self,
+        authority: &RadioControlAuthority,
+        public_events: bool,
     ) -> Result<Receipt, Error> {
         self.check_p2p_request(authority)?;
         self.check_p2p_roc_pending()?;
         let now = self.backend.now_ns();
         let owner = self.p2p_owner.as_mut().ok_or(Error::Busy)?;
         let roc = owner.roc.as_mut().ok_or(Error::Busy)?;
+        if roc.public_events != public_events {
+            return Err(Error::Authority);
+        }
         if !owner
             .cnm
             .current(roc.cookie, roc.channel.frequency_mhz, now)
@@ -277,9 +329,11 @@ impl<B: Backend> Session<B> {
         owner.pending = None;
         let source = roc.source.clone();
         self.refresh_p2p_management_capture()?;
-        source
-            .roc_ready(receipt.cookie, receipt.frequency_mhz, receipt.duration_ms)
-            .map_err(|_| Error::Authority)?;
+        if public_events {
+            source
+                .roc_ready(receipt.cookie, receipt.frequency_mhz, receipt.duration_ms)
+                .map_err(|_| Error::Authority)?;
+        }
         authority.current().map_err(|_| Error::Authority)?;
         source.current().map_err(|_| Error::Authority)?;
         if !self.p2p_roc_current(receipt.cookie, receipt.frequency_mhz)? {
@@ -301,7 +355,7 @@ impl<B: Backend> Session<B> {
             .is_ok_and(|domain| roc.channel.current(&domain).is_ok());
         if owner.identity.current().is_err() || roc.source.current().is_err() || !policy_current {
             let notify = owner.cnm.lease().and_then(|lease| match lease.phase {
-                Phase::Granted { interval_ms, .. } if roc.activated => Some((
+                Phase::Granted { interval_ms, .. } if roc.activated && roc.public_events => Some((
                     roc.source.clone(),
                     Receipt {
                         cookie: lease.cookie,
@@ -351,7 +405,7 @@ impl<B: Backend> Session<B> {
             let lease = owner.cnm.release_expired_after_packets(now)?;
             let roc = owner.roc.take().ok_or(Error::Busy)?;
             self.state = home;
-            if roc.activated && roc.source.current().is_ok() {
+            if roc.activated && roc.public_events && roc.source.current().is_ok() {
                 let duration = match lease.phase {
                     Phase::Granted { interval_ms, .. } => interval_ms,
                     _ => return Err(Error::Busy),
@@ -426,7 +480,9 @@ impl<B: Backend> Session<B> {
         }
         Ok(permission)
     }
-    async fn quiesce_p2p_home(&mut self) -> Result<(), Error> {
+    pub(in crate::mt7921::firmware_transport) async fn quiesce_p2p_home(
+        &mut self,
+    ) -> Result<(), Error> {
         self.quiesce_p2p_packets().await?;
         if matches!(self.state, State::Associated { .. }) {
             self.service_keys().await?;

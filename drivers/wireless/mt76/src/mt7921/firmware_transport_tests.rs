@@ -815,6 +815,9 @@ impl Backend for Model {
         &mut self,
     ) -> Result<Option<super::p2p_management_capture::Captured>, Error> {
         self.check()?;
+        if let Some(observer) = &self.p2p_tx {
+            self.packets.append(&mut observer.received.lock());
+        }
         if let Some(packet) = self.p2p_capture.pop() {
             return Ok(Some(packet));
         }

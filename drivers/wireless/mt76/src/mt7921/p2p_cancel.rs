@@ -20,7 +20,7 @@ impl<B: Backend> Session<B> {
             .ok_or(Error::Bounds)?;
         let roc = owner.roc.as_ref().ok_or(Error::Busy)?;
         let notify = match lease.phase {
-            Phase::Granted { interval_ms, .. } if roc.activated => Some((
+            Phase::Granted { interval_ms, .. } if roc.activated && roc.public_events => Some((
                 roc.source.clone(),
                 Receipt {
                     cookie,

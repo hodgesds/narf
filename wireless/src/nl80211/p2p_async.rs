@@ -84,7 +84,7 @@ pub(super) fn frame(
     slot: Option<&DeferredRequest>,
 ) -> Result<Vec<GenlReply>, i32> {
     let attrs = attributes(bytes)?;
-    reject_unknown(&attrs, &[153, 38, 51, 87, 108])?;
+    reject_unknown(&attrs, &[153, 38, 51, 87, 108, 135])?;
     let (iface, index) = interface(&attrs, context.net_ns_id)?;
     if index.is_some() || iface.current_iftype() != 10 || !iface.async_p2p_management_tx_control() {
         return Err(EOPNOTSUPP);
@@ -102,11 +102,23 @@ pub(super) fn frame(
     if offchannel_ok && !iface.supports_offchannel_mgmt_tx() {
         return Err(EOPNOTSUPP);
     }
+    let no_cck = attr(&attrs, 135);
+    if no_cck.is_some_and(|flag| !flag.is_empty()) {
+        return Err(EINVAL);
+    }
+    let duration = u32_attr(&attrs, 87)?;
+    if duration.is_some_and(|duration| {
+        !iface.supports_offchannel_mgmt_tx()
+            || !(10..=iface.max_remain_on_channel_duration_ms()).contains(&duration)
+    }) {
+        return Err(EINVAL);
+    }
     let request = crate::MgmtTxRequest {
         frequency_mhz: frequency.unwrap_or(0),
         frame: sent.to_vec(),
         offchannel_ok,
-        duration: u32_attr(&attrs, 87)?.unwrap_or(0),
+        duration: duration.unwrap_or(0),
+        no_cck: no_cck.is_some(),
     };
     let cookie = FRAME_COOKIE
         .fetch_update(

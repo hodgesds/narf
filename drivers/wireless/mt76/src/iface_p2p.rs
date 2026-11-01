@@ -441,7 +441,7 @@ impl WirelessNetIface for P2pDeviceIface {
     async fn mgmt_tx_radio_async(
         &self,
         authority: &RadioControlAuthority,
-        _cookie: u64,
+        cookie: u64,
         request: narf_wireless::MgmtTxRequest,
     ) -> Result<bool, WirelessError> {
         let parent = self.current()?;
@@ -453,6 +453,7 @@ impl WirelessNetIface for P2pDeviceIface {
         crate::mt7921::firmware_transport::boot_p2p::management_tx::transmit(
             self.weak()?,
             Arc::new(authority.clone()),
+            cookie,
             request,
         )
         .await

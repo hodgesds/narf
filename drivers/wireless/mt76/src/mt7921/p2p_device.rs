@@ -274,6 +274,15 @@ impl<B: Backend> Session<B> {
         Ok(result)
     }
     pub(super) async fn p2p_failure(&mut self, error: Error) -> Error {
+        if let Some(cleanup) = self
+            .p2p_owner
+            .as_ref()
+            .and_then(|owner| owner.management.worker_cleanup.as_ref())
+        {
+            // Only a native failure/retirement edge sets this observation.
+            // A lost borrower may not drop an already published reset body.
+            cleanup.store(true, core::sync::atomic::Ordering::Release);
+        }
         if let Some(info) = self.p2p_owner.as_ref().map(|owner| owner.info) {
             let stage = match self.state {
                 State::Running(stage) | State::Failed { stage, .. } => stage,

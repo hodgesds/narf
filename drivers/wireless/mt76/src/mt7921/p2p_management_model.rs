@@ -5,6 +5,7 @@ use super::*;
 pub(super) struct Observer {
     pub published: narf_lib::sync::IrqSafeSpinLock<Vec<([u8; 64], Vec<u8>)>>,
     pub reports: narf_lib::sync::IrqSafeSpinLock<VecDeque<Vec<u8>>>,
+    pub received: narf_lib::sync::IrqSafeSpinLock<VecDeque<Vec<u8>>>,
     pub terminal: AtomicBool,
 }
 impl Default for Observer {
@@ -12,6 +13,7 @@ impl Default for Observer {
         Self {
             published: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
             reports: narf_lib::sync::IrqSafeSpinLock::new(VecDeque::new()),
+            received: narf_lib::sync::IrqSafeSpinLock::new(VecDeque::new()),
             terminal: AtomicBool::new(false),
         }
     }

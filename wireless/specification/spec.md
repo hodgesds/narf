@@ -778,6 +778,20 @@ reply and `FRAME_TX_STATUS` follow that callback; status is MLME multicast
 group19 with actual WIPHY/WDEV/frame/cookie and an ACK flag only for a true
 native acknowledgement. A control WDEV adds no IFINDEX or synthetic UP bit.
 Queued work, elapsed time and token release alone are not ACK observations.
+`MgmtTxRequest::no_cck` retains the requested management no-CCK policy. The
+control-WDEV FRAME route accepts `NL80211_ATTR_TX_NO_CCK_RATE` (135) only as an
+empty flag; a driver must honor it in the actual 2.4GHz rate rather than using
+the unrelated home station's basic-rate state. An explicitly supplied
+`DURATION` must be between 10ms and the interface's actual maximum ROC duration.
+Omission preserves request duration 0; a driver's private management ROC uses
+the source ABI's finite default (MT76 requests 10ms). Legacy netdev/AP parsers
+continue their previous attribute acceptance and initialize no_cck=false.
+If the driver acquires a private management ROC, the exact native grant and
+finite lease remain owned through abort ordering, expiry and terminal packet
+retirement; host acquisition or abort progress establishes no RF/terminal
+receipt. Such a lease emits no public ROC-ready/expired events. A lost caller
+may suppress final FRAME publication while the retained no-transmit cleanup
+continues under the actual native owner and original home-power facts.
 Existing netdev SME/AP dispatch and default unsupported behavior remain.
 
 `async_control_interfaces` independently opts into control-only

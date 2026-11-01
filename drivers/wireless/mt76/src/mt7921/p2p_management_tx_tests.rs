@@ -4,6 +4,8 @@ use super::*;
 use crate::mt7921::firmware_transport::{
     boot_p2p::management_tx, tests::p2p_management_model::Observer,
 };
+#[path = "p2p_management_implicit_tests.rs"]
+mod implicit;
 
 fn request(concrete: &Concrete, multicast: bool) -> narf_wireless::MgmtTxRequest {
     let mut frame = vec![0; 30];
@@ -21,6 +23,7 @@ fn request(concrete: &Concrete, multicast: bool) -> narf_wireless::MgmtTxRequest
         frame,
         offchannel_ok: true,
         duration: 0,
+        no_cck: false,
     }
 }
 fn report(pid: u8, ack: bool) -> Vec<u8> {
@@ -51,6 +54,7 @@ fn tx<'a>(
         session,
         Arc::downgrade(&concrete.child),
         concrete.authority()?,
+        0xabc1,
         request,
         alive,
         concrete.binding.iface.mac(),
@@ -106,10 +110,25 @@ fn home_and_ack() -> Result<(), &'static str> {
             let mut operation = tx(
                 &mut session,
                 &concrete,
-                request(&concrete, false),
+                {
+                    let mut request = request(&concrete, false);
+                    request.no_cck = ack;
+                    request
+                },
                 Arc::new(AtomicBool::new(true)),
             )?;
             let pid = published(&mut operation, &observer)?;
+            let rate = observer
+                .published
+                .lock()
+                .last()
+                .map(|(header, _)| u32::from_le_bytes(header[24..28].try_into().unwrap()))
+                .ok_or("actual explicit-ROC FRAME fixed-rate descriptor")?;
+            if rate != if ack { 0x004b0004 } else { 4 } {
+                return Err(
+                    "explicit native ROC FRAME ignored requested OFDM6 or unflagged CCK fallback",
+                );
+            }
             observer.reports.lock().push_back(report(pid, ack));
             let mut cx = Context::from_waker(Waker::noop());
             if operation.as_mut().poll(&mut cx).is_ready() {
@@ -214,15 +233,17 @@ fn admission() -> Result<(), &'static str> {
     execute(&mut session, &concrete, P2pRequest::Start)
         .map_err(|_| "native device before pure TX admission")?;
     let count = session.backend.frames.len();
+    let mut unspecified = request(&concrete, false);
+    unspecified.frequency_mhz = 0;
     if run(tx(
         &mut session,
         &concrete,
-        request(&concrete, false),
+        unspecified,
         Arc::new(AtomicBool::new(true)),
-    )?) != Err(Error::Busy)
+    )?) != Err(Error::Bounds)
         || session.backend.frames.len() != count
     {
-        return Err("started host metadata fabricated an actual management channel lease");
+        return Err("started host metadata supplied an unspecified implicit management channel");
     }
     execute(
         &mut session,

@@ -3,7 +3,7 @@
 use super::*;
 use crate::registry::ControlWdev;
 use narf_capabilities::Write;
-type RecordedManagementTx = (u64, u32, Vec<u8>, bool, u32);
+type RecordedManagementTx = (u64, u32, Vec<u8>, bool, u32, bool);
 
 struct ControlRadio {
     inner: Radio,
@@ -88,6 +88,7 @@ impl WirelessNetIface for ControlRadio {
             request.frame,
             request.offchannel_ok,
             request.duration,
+            request.no_cck,
         ));
         Ok(self.management_tx_ack.load(Ordering::Acquire))
     }

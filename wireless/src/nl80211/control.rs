@@ -3037,6 +3037,7 @@ fn mlme_handle(
                 frame: frame.to_vec(),
                 offchannel_ok: attr(&attrs, 108).is_some(),
                 duration: u32_attr(&attrs, 87)?.unwrap_or(0),
+                no_cck: false,
             };
             let cookie = FRAME_COOKIE
                 .fetch_update(

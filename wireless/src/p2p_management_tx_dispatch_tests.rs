@@ -62,17 +62,70 @@ fn frame(child: &Child) -> Vec<u8> {
     bytes
 }
 fn request(child: &Child, source: Arc<Source>, frame: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
-    dispatch::send(
-        child,
-        source,
-        59,
-        &[
-            (38, &2412u32.to_ne_bytes()),
-            (51, frame),
-            (87, &25u32.to_ne_bytes()),
-            (108, &[]),
-        ],
-    )
+    request_options(child, source, frame, false, Some(25))
+}
+fn request_options(
+    child: &Child,
+    source: Arc<Source>,
+    frame: &[u8],
+    no_cck: bool,
+    duration: Option<u32>,
+) -> Result<Vec<Vec<u8>>, &'static str> {
+    let frequency = 2412u32.to_ne_bytes();
+    let duration = duration.map(u32::to_ne_bytes);
+    let mut attrs: Vec<(u16, &[u8])> = alloc::vec![(38, &frequency), (51, frame), (108, &[])];
+    if let Some(duration) = &duration {
+        attrs.push((87, duration));
+    }
+    if no_cck {
+        attrs.push((135, &[]));
+    }
+    dispatch::send(child, source, 59, &attrs)
+}
+fn pure_options() -> Result<(), &'static str> {
+    let parent = fixture()?;
+    let child = paired_child(&parent)?;
+    let frame = frame(&child);
+    for duration in [0u32, 1, 9, 5001, u32::MAX] {
+        let source = Arc::new(Source::new());
+        let refused = request_options(&child, source.clone(), &frame, true, Some(duration))?;
+        if refused.len() != 1
+            || refused[0].get(16..20) != Some((-22i32).to_ne_bytes().as_slice())
+            || !source.1.lock().is_empty()
+            || child.radio.inner.start_polls.load(Ordering::Acquire) != 0
+            || child.radio.management_tx.lock().is_some()
+        {
+            return Err(
+                "invalid explicit FRAME duration reached callback or reserved deferred work",
+            );
+        }
+    }
+    for payload in [&[0u8][..], &[1u8][..], &[0u8; 4][..]] {
+        let source = Arc::new(Source::new());
+        let refused = dispatch::send(
+            &child,
+            source.clone(),
+            59,
+            &[
+                (38, &2412u32.to_ne_bytes()),
+                (51, &frame),
+                (108, &[]),
+                (135, payload),
+            ],
+        )?;
+        if refused.len() != 1
+            || refused[0].get(16..20) != Some((-22i32).to_ne_bytes().as_slice())
+            || !source.1.lock().is_empty()
+            || child.radio.inner.start_polls.load(Ordering::Acquire) != 0
+            || child.radio.management_tx.lock().is_some()
+        {
+            return Err("nonempty NO_CCK NLA_FLAG reached native/deferred management callback");
+        }
+    }
+    if !EVENTS.lock().is_empty() {
+        return Err("pure invalid management options fabricated a status event");
+    }
+    Ok(())
 }
 // The preceding SME suite may leave an ordinary FRAME status queued on the
 // global executor. A scheduler round is neither a request-specific phase
@@ -108,7 +161,14 @@ fn foreign_status(parent: &Fixture, target: &Child) -> Result<(), &'static str> 
 }
 fn terminal() -> Result<(), &'static str> {
     let capture = Capture::new();
-    for ack in [false, true] {
+    pure_options()?;
+    for (ack, no_cck, duration) in [
+        (false, false, Some(25)),
+        (true, true, Some(25)),
+        (true, false, None),
+        (false, true, Some(10)),
+        (true, true, Some(5000)),
+    ] {
         EVENTS.lock().clear();
         let parent = fixture()?;
         let child = child(&parent, None, 27)?;
@@ -116,7 +176,7 @@ fn terminal() -> Result<(), &'static str> {
         let source = Arc::new(Source::new());
         capture.select(&child);
         let frame = frame(&child);
-        if !request(&child, source.clone(), &frame)?.is_empty() {
+        if !request_options(&child, source.clone(), &frame, no_cck, duration)?.is_empty() {
             return Err("FRAME returned cookie before actual callback completed");
         }
         foreign_status(&parent, &child)?;
@@ -137,7 +197,13 @@ fn terminal() -> Result<(), &'static str> {
             .lock()
             .clone()
             .ok_or("real management callback missing")?;
-        if sent.0 == 0 || sent.1 != 2412 || sent.2 != frame || !sent.3 || sent.4 != 25 {
+        if sent.0 == 0
+            || sent.1 != 2412
+            || sent.2 != frame
+            || !sent.3
+            || sent.4 != duration.unwrap_or(0)
+            || sent.5 != no_cck
+        {
             return Err("WDEV FRAME lost exact cookie/frame/channel/options");
         }
         let events = EVENTS.lock().clone();

@@ -19,18 +19,28 @@ impl<B: Backend> Session<B> {
         if !self.p2p_roc_current(emission.cookie, emission.plan.frequency_mhz)? {
             return Err(Error::Authority);
         }
+        self.check_p2p_management_plan(emission.plan, emission.home)
+    }
+    pub(super) fn check_p2p_management_plan(&self, plan: Plan, home: State) -> Result<(), Error> {
         let domain = self.backend.regulatory_domain()?;
-        if !emission.plan.current(domain.as_ref()) {
+        if !plan.current(domain.as_ref()) {
             return Err(Error::Authority);
         }
-        if let Some(home) = emission.plan.home {
-            self.backend.check_tx_permission(home)?;
-            match emission.home {
-                State::Associated { .. } if self.station_permission == Some(home) => {}
+        self.check_p2p_management_home(plan.home, home)
+    }
+    pub(super) fn check_p2p_management_home(
+        &self,
+        permission: Option<crate::mt7921::association::TxPermission>,
+        home: State,
+    ) -> Result<(), Error> {
+        if let Some(permission) = permission {
+            self.backend.check_tx_permission(permission)?;
+            match home {
+                State::Associated { .. } if self.station_permission == Some(permission) => {}
                 State::AccessPoint { .. } => {
                     let ap = self.ap_owner.as_ref().ok_or(Error::Authority)?;
                     ap.identity.current().map_err(|_| Error::Authority)?;
-                    if !ap.activated || ap.plan.permission != home {
+                    if !ap.activated || ap.plan.permission != permission {
                         return Err(Error::Authority);
                     }
                 }
@@ -39,7 +49,7 @@ impl<B: Backend> Session<B> {
         }
         Ok(())
     }
-    pub(super) async fn send_p2p_management(
+    pub(super) async fn emit_p2p_management_on_roc(
         &mut self,
         authority: Arc<RadioControlAuthority>,
         request: &narf_wireless::MgmtTxRequest,
@@ -55,8 +65,9 @@ impl<B: Backend> Session<B> {
             return Err(Error::Busy);
         };
         // No host channel label or queued ROC request can grant emission.
-        // This first TX profile reuses a real finite lease; it never creates
-        // a hidden implicit ROC or extends its firmware-granted deadline.
+        // Explicit and private acquisition both reach this body only after
+        // the actual unsolicited grant. Neither extends its native deadline.
+        let implicit = owner.management.implicit;
         let frequency = if request.frequency_mhz == 0 {
             lease.frequency_mhz
         } else {
@@ -66,8 +77,9 @@ impl<B: Backend> Session<B> {
             || request.duration > crate::mt7921::p2p_wire::MAX_DURATION_MS
             || frequency != lease.frequency_mhz
             || !self.p2p_roc_current(lease.cookie, frequency)?
-            || u64::from(request.duration) * 1_000_000
-                > expires_ns.saturating_sub(self.backend.now_ns())
+            || implicit.is_none()
+                && u64::from(request.duration) * 1_000_000
+                    > expires_ns.saturating_sub(self.backend.now_ns())
         {
             return Err(Error::Bounds);
         }
@@ -78,17 +90,22 @@ impl<B: Backend> Session<B> {
         let cookie = lease.cookie;
         let home = self.state;
         let domain = self.backend.regulatory_domain()?;
-        let plan = Plan::prepare(
-            info,
-            domain.as_ref(),
-            frequency,
-            self.p2p_home_permission()?,
-            false,
-        )?;
+        let plan = if let Some(implicit) = implicit {
+            self.check_p2p_management_plan(implicit.plan, implicit.home)?;
+            implicit.plan
+        } else {
+            Plan::prepare(
+                info,
+                domain.as_ref(),
+                frequency,
+                self.p2p_home_permission()?,
+                request.no_cck,
+            )?
+        };
         // All pure request and occupied-channel admission precedes I/O.
         self.quiesce_p2p_packets().await?;
         self.check_p2p_request(&authority)?;
-        if !header.multicast {
+        if !header.multicast && !implicit.is_some_and(|owner| owner.report_armed) {
             // A pending home BA sample cannot be borrowed or reset merely
             // to send management. Refuse before any power/domain command.
             self.backend.arm_p2p_management(vif, header.tid)?;

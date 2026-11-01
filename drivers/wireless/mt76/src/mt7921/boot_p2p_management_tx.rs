@@ -4,6 +4,7 @@ use super::*;
 pub(crate) async fn transmit(
     iface: Weak<crate::iface::p2p::P2pDeviceIface>,
     authority: Arc<RadioControlAuthority>,
+    cookie: u64,
     request: narf_wireless::MgmtTxRequest,
 ) -> Result<bool, Error> {
     let concrete = iface.upgrade().ok_or(Error::Authority)?;
@@ -26,7 +27,7 @@ pub(crate) async fn transmit(
                 return (transport, Err(Error::DeviceGone));
             }
             let completed = transport
-                .transmit_p2p_management(iface, authority, request, alive, expected_mac)
+                .transmit_p2p_management(iface, authority, cookie, request, alive, expected_mac)
                 .await;
             let status = completed.as_ref().map(|_| ()).map_err(|error| *error);
             *target.lock() = Some(completed);
@@ -48,6 +49,7 @@ pub(in crate::mt7921::firmware_transport) async fn run_session<B: Backend>(
     session: &mut Session<B>,
     iface: Weak<crate::iface::p2p::P2pDeviceIface>,
     authority: Arc<RadioControlAuthority>,
+    cookie: u64,
     request: narf_wireless::MgmtTxRequest,
     alive: Arc<AtomicBool>,
     expected_mac: [u8; 6],
@@ -68,17 +70,27 @@ pub(in crate::mt7921::firmware_transport) async fn run_session<B: Backend>(
         return Err(Error::Busy);
     }
     drop(concrete);
+    let cleanup = Arc::new(AtomicBool::new(false));
     let result = {
-        let mut native = Box::pin(session.send_p2p_management(authority.clone(), &request));
+        let mut native = Box::pin(session.send_p2p_management(
+            authority.clone(),
+            cookie,
+            &request,
+            cleanup.clone(),
+        ));
         core::future::poll_fn(|cx| {
-            if !alive.load(Ordering::Acquire) {
-                return Poll::Ready(Err(Error::Cancelled));
-            }
-            if iface
-                .upgrade()
-                .is_none_or(|iface| iface.request_current(&authority).is_err())
-            {
-                return Poll::Ready(Err(Error::Authority));
+            // Only a native terminal/failure edge enables retained cleanup.
+            // No caller/source check can turn this into new RF permission.
+            if !cleanup.load(Ordering::Acquire) {
+                if !alive.load(Ordering::Acquire) {
+                    return Poll::Ready(Err(Error::Cancelled));
+                }
+                if iface
+                    .upgrade()
+                    .is_none_or(|iface| iface.request_current(&authority).is_err())
+                {
+                    return Poll::Ready(Err(Error::Authority));
+                }
             }
             native.as_mut().poll(cx)
         })

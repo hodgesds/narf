@@ -1790,6 +1790,7 @@ fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
                 frame: mgmt.clone(),
                 offchannel_ok: false,
                 duration: 0,
+                no_cck: false,
             },
         },
     ));

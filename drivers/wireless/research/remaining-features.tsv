@@ -75,10 +75,10 @@ iwlwifi	width_160	Gen2 contiguous160 is software-validated. API89/Sc/Bz now reta
 iwlwifi	width_320	320MHz operation on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	2139
 iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	2188
 mt76	loadable_packet_abi	Loadable wireless packet ABI	feature	drivers/wireless/specification/mt7921.md	18
-mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	2304
-mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/specification/mt7921.md	2189
-mt76	p2p_mode	Independent device/CNM/finite ROC, control NEW/DEL and native management RX are software-validated. Management TX on an actual current 2/5GHz ROC now joins source/power, PID/TXS and DMA/TX_FREE ownership; six new native cases await execution. Implicit ROC acquisition and independent client/GO peer/key/data contexts remain.	feature	drivers/wireless/specification/mt7921.md	2329
-mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	2197
+mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	2344
+mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/specification/mt7921.md	2229
+mt76	p2p_mode	Independent device/CNM/finite ROC, control NEW/DEL and native management RX are software-validated. Current-ROC management TX joins source/power, PID/TXS and DMA/TX_FREE ownership with six native cases awaiting release acceptance. Private native management ROC and requested NO_CCK are implemented with four additional native cases pending. Qualified6GHz emission and independent client/GO peer/key/data contexts remain.	feature	drivers/wireless/specification/mt7921.md	484
+mt76	per_domain_iommu	Per-domain IOMMU mappings	feature	drivers/wireless/specification/mt7921.md	2230
 rtl8xxxu	bt_coexistence	Bluetooth coexistence on RTL8723BU; blocked on the rtl8723bu chip runtime	feature	drivers/wireless/specification/rtl8xxxu.md	1122
 rtl8xxxu	expanded_active_scanning	Idle active scanning is software-validated. Associated active scanning now retains actual home peer/key/BA/ring owners through private probe publication and cold receive/FIFO transitions, including same-channel visits; eight new native cases await release acceptance.	feature	drivers/wireless/specification/rtl8xxxu.md	965
 rtl8xxxu	five_ghz_operation	Broader band operation including VHT-profile 5GHz; RTL8188EU is 2.4GHz-only; 5GHz exists only on RTL8821CU/RTL8822BU, blocked on those chip rows	feature	drivers/wireless/specification/rtl8xxxu.md	1143

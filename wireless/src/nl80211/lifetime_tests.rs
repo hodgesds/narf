@@ -204,6 +204,7 @@ fn execution(case: u8) -> MlmeExec {
                 frame: alloc::vec![0xd0; 24],
                 offchannel_ok: false,
                 duration: 0,
+                no_cck: false,
             },
         },
         _ => MlmeExec::ExternalAuth {

@@ -1898,12 +1898,14 @@ pub struct MlmeAssocRequest {
 /// A management frame to transmit (NL80211_CMD_FRAME). `frequency_mhz` 0
 /// means the current operating channel; otherwise it preserves the exact
 /// `NL80211_ATTR_WIPHY_FREQ` identity. `offchannel_ok` permits off-channel
-/// transmission for the given `duration` (milliseconds).
+/// transmission for the given `duration` (milliseconds). `no_cck` preserves
+/// `NL80211_ATTR_TX_NO_CCK_RATE`: management TX must avoid CCK at 2.4GHz.
 pub struct MgmtTxRequest {
     pub frequency_mhz: u32,
     pub frame: Vec<u8>,
     pub offchannel_ok: bool,
     pub duration: u32,
+    pub no_cck: bool,
 }
 
 /// Access-Point configuration for NL80211_CMD_START_AP. `beacon_head` is the

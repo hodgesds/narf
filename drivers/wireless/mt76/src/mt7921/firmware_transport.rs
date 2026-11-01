@@ -29,6 +29,8 @@ mod p2p_management;
 mod p2p_management_capture;
 #[path = "p2p_management_filters.rs"]
 pub(crate) mod p2p_management_filters;
+#[path = "p2p_management_implicit.rs"]
+mod p2p_management_implicit;
 #[path = "p2p_management_power.rs"]
 mod p2p_management_power;
 #[path = "p2p_management_tx.rs"]
@@ -1559,6 +1561,19 @@ impl<B: Backend> Session<B> {
             if matches!(self.state, State::Running(Stage::P2pManagementTx)) {
                 if let Err(error) = self.check_p2p_management_tx() {
                     return Poll::Ready(Err(error));
+                }
+            }
+            if matches!(self.state, State::Running(Stage::P2pRocExpire)) {
+                if let Some(implicit) = self
+                    .p2p_owner
+                    .as_ref()
+                    .and_then(|owner| owner.management.implicit)
+                {
+                    if let Err(error) =
+                        self.check_p2p_management_home(implicit.plan.home, implicit.home)
+                    {
+                        return Poll::Ready(Err(error));
+                    }
                 }
             }
             if let Err(error) = self.backend.check() {
