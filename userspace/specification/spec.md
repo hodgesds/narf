@@ -338,6 +338,10 @@ past EOF. Resident pages follow the ordinary private COW rules across fork,
 and untouched pages remain absent in both parent and child. Explicit
 `MAP_LOCKED` or blocking `MAP_POPULATE` retains eager best-effort population;
 `MAP_NONBLOCK` suppresses prefaulting.
+Generic file-owner publication installs the same truncate-revocation hook as
+direct file mappings, independently of any earlier mappings. A filesystem
+shrink can therefore revoke tracked pages wholly past EOF before retiring
+their backing, including pages already made resident by a private demand fault.
 `MAP_FIXED_NOREPLACE` publishes its exact address non-destructively under the
 address-space VMA transaction. An occupied target returns `EEXIST`, including
 when a `CLONE_VM` peer claims the range after the syscall's initial fast probe;

@@ -1035,6 +1035,12 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 return;
             }
         };
+        // Generic mappings need EOF revocation just as direct page-cache
+        // mappings do. Install before publishing any generic owner, even
+        // when all its pages are already cached or eagerly populated.
+        narf_filesystem::install_mmap_truncate_hook(
+            crate::mapped_file::truncate_file_mappings,
+        );
         if shared_file_fallback {
             shared_cache_generation = ops.mmap_cache_generation();
             shared_file_ops = Some(Arc::clone(&ops));
