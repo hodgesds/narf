@@ -368,6 +368,101 @@ failed reset DMA retention, failed rebuild retry, stable publication/IPC and
 post-recovery traffic without touching a physical NIC. Physical reset recovery
 and packet distribution still require validation on a dedicated test adapter.
 
+### 3.2 Realtek family feature surface
+
+The `narf-drivers-net-realtek` crate (`r8169` + `rtl8125` + `rtl8126` +
+`rtl8127`) implements the Linux compared feature set for the family, as
+several driver-local pieces plus one shared model in `features.rs`. No
+shared TX-path code is touched; each driver's `transmit` parses the
+frame itself and builds its descriptors from the shared builders.
+
+- **MAC version decode.** Each driver decodes its MAC version from
+  the reset-default TxConfig XID (`(TxConfig >> 20) & 0xfcf`,
+  first-match against Linux's `rtl_chip_infos` table order) before
+  overwriting TCR. The version selects the TX offload layout
+  (v1 on VER_02..06 and VER_10..17, v2 otherwise, including unknown
+  XIDs per Linux's default arm), the jumbo maximum, the EEE LPI
+  capabilities, and the WoL PME register.
+- **TX offload.** `Interface::offloads` and `HwNic::caps` advertise
+  TX checksum (TCP/UDP, IPv4/IPv6), RX checksum reporting, TSO up
+  to the 16 KiB TX slot buffer, and VLAN insertion on all four
+  drivers. The v2 layout is GTSENV + GTTCPHO in word0 and MSS +
+  IP/TCP/UDP checksum bits + TCPHO in word1; the v1 layout carries
+  LSO + MSS + csum bits in word0. The transport offset comes from
+  a driver-local frame parser (Ethernet + up to two VLAN tags,
+  IPv4 IHL, IPv6 fixed header + Hop-by-Hop / Routing / Fragment /
+  Destination Options / AH / Mobility headers); fragmented frames,
+  non-IP frames, truncated frames, SCTP, and MSS/offset overflows
+  are rejected as `UnsupportedOffload`, never programmed with a
+  guessed offset.
+- **RX checksum.** The RX pump decodes the chip-returned word0
+  with Linux's PID/fail rule (checksum trusted only when exactly
+  one protocol-ID bit is set and no fail bit is set) and reports
+  it in `Frame::rx_meta` (`csum_l3` / `csum_l4` on `Ok`, clear
+  otherwise so the stack re-checks).
+- **VLAN.** TX insertion is always available via
+  `TxMeta::vlan_tag`. RX stripping stays OFF: `Frame::rx_meta`
+  has no VLAN-tag field, so stripping would discard tags the
+  stack needs; tags stay in the frame for the stack to parse.
+- **Jumbo.** RX buffers are 16 KiB − 1, RMS is the buffer bound
+  (16383), TX slots are 16 KiB, and MTPS is sized from the
+  chip's jumbo tagged frame (with Linux's VER_31..33 override).
+  Jumbo frames are therefore receivable and transmittable
+  through the driver API. The interface MTU stays 1500 with
+  offloads advertised: Linux's `rtl8169_fix_features` disables
+  CSUM + TSO when MTU > 1500 on MAC > VER_06, so a jumbo MTU
+  and TX offload cannot coexist on this family; a runtime MTU
+  switch is future work.
+- **WoL.** Each driver exposes `set_wol_opts` programming
+  Linux's `__rtl8169_set_wol` shape: Config3 LinkUp/MagicPacket,
+  Config5 UWF/BWF/MWF/LanWake, and the version-selected PME
+  register (Config1 for VER_02..06, Config2 for VER_34/37/39..,
+  none otherwise), under the 9346CR unlock. The 8125 family
+  additionally programs the MAC-OCP steps (0xe0c6 LinkUp,
+  0xc0b6 magic bit) through the shared OCP accessor, so nothing
+  is left pending there. On 8168evl (VER_34) the magic bit lives
+  in ERI space, which NARF has no accessor for yet; `set_wol_opts`
+  reports that step as pending instead of silently dropping it.
+- **EEE.** Each driver exposes its LPI capabilities
+  (`eee_caps`, Linux's `rtl8169_get_lpi_caps` shape: 100/1000FD
+  everywhere EEE is supported, +2500FD from VER_63, +5000FD
+  from VER_70, +10000FD on VER_80 only). The 8125 family
+  programs the TX LPI idle timer register (0x6048 =
+  MTU + 14 + 0x20) at bring-up. EEE PHY advertisement through
+  the OCP window is future work; the PHY tables already contain
+  the EEE PHY clears.
+- **PHY configuration.** The shared OCP accessor
+  (`phy_access.rs`: paged C22 access, MMD VEND2 parameters,
+  firmware interpreter) serves the whole family. RTL8125 has
+  per-variant tables (A/B/D/CP/BP, plus K/9151A sharing D's
+  function with their own blobs) applied from a `Stage::Late`
+  hook, firmware first except 8125A where Linux runs firmware
+  mid-table, so its table splits into pre/post parts. RTL8126
+  applies its existing 6-entry table from a `Stage::Late` hook
+  (firmware first; unknown XIDs skip with a log line). RTL8127
+  keeps its existing table and late hook. Per-revision 8168
+  PHY tables are future work; r8169 decodes the version but
+  transcribes no 8168 revision table.
+- **RSS (RTL8127 only).** Linux enables RSS only on VER_80.
+  The steering register programming (key / indirection /
+  control / queue-count / descriptor-type, via
+  `features::apply_rss`) is implemented and wired as a dormant
+  `Rtl8127Nic::configure_rss` method, but it is NOT enabled at
+  bring-up: enabling it needs a multi-ring datapath (per-queue
+  descriptor bases, RSS descriptor format, per-queue pumps,
+  30 MSI-X vectors) that the current single-consumer
+  `Interface` cannot express. Bring-up keeps Linux's
+  single-queue behavior (`RSS_CTRL` = 0), and RSS is not
+  advertised in caps/offloads. The other three drivers hold
+  RSS off, matching Linux.
+- **Tests.** The shared model carries register-conversation
+  fixtures (`RegLog`-backed smokes) for C+CR, VLAN, WoL, EEE,
+  jumbo, RSS programming, XID decode, transport parsing, RX
+  checksum decode, and offload word layout; each driver keeps
+  its existing kernel-test smokes plus PHY-table/firmware
+  coverage where it has tables. No silicon testing was
+  possible; QEMU does not emulate these chips.
+
 ## 4. Invariants & safety properties
 
 - Received frames are placed into buffers the driver domain *owns*; no

@@ -1,7 +1,21 @@
-//! Realtek RTL8125 / RTL8125B 2.5 Gigabit Ethernet driver — Stage-2
-//! cut: probe + reset + TX/RX rings + one MSI-X vector. No PHY-config
-//! tables yet (RTL8125 ships with a usable PHY default after reset),
-//! no EEE quirks, no jumbo, no checksum offload, no multi-queue.
+//! Realtek RTL8125 family 2.5 Gigabit Ethernet driver — Stage-2 cut,
+//! extended with the Linux compared feature set: probe + reset +
+//! TX/RX rings + one MSI-X vector, plus TX checksum (TCP/UDP,
+//! v4/v6) and TSO
+//! (v2 layout — every 8125-family chip is csum-v2), VLAN tag
+//! insertion on TX, RX checksum decode, jumbo-sized rings / RMS /
+//! MTPS, WoL register programming (including the 8125-family
+//! MAC-OCP steps), the EEE TX LPI idle timer, and per-variant
+//! PHY-config tables applied from a `Stage::Late` hook (firmware
+//! first, except 8125A where Linux runs firmware mid-table —
+//! see [`phy_table_for`]). Deliberate asymmetries, shared with
+//! the r8169 driver: RX VLAN stripping stays OFF (no VLAN-tag
+//! field in `Frame::rx_meta`), the interface MTU stays 1500
+//! with offloads advertised (Linux's `rtl8169_fix_features`
+//! disables CSUM + TSO when MTU > 1500 on MAC > VER_06), and
+//! RSS stays off (Linux enables RSS only on VER_80). Still
+//! missing: EEE PHY advertisement (Clause 45 MMD through the
+//! OCP window) and GMII auto-negotiation tuning.
 //!
 //! ## Reference
 //!
@@ -343,8 +357,8 @@ pub const fn cr_reset_value() -> u8 {
 // Stage 2 because the bring-up steps are 99% identical; later stages
 // branch the PHY-config table here.
 
-/// Sub-family classification. Drives the future PHY-config table
-/// pick; Stage 2 only logs the value.
+/// Sub-family classification. Drives the PHY-config table and
+/// firmware-blob pick in [`phy_table_for`] / [`firmware_name_for`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ChipKind {
     /// 0x609 / MAC_VER_61. Original RTL8125 silicon.
@@ -352,12 +366,21 @@ pub enum ChipKind {
     /// 0x641 / MAC_VER_63. Refreshed RTL8125B silicon (most common
     /// laptop variant as of 2024).
     Rtl8125B,
-    /// 0x688/0x689 / MAC_VER_64. RTL8125D and RTL9151A close cousin.
+    /// 0x688/0x689 / MAC_VER_64. RTL8125D.
     Rtl8125D,
+    /// 0x68a / MAC_VER_64. RTL8125K (same PHY function as D,
+    /// different blob).
+    Rtl8125K,
+    /// 0x68b / MAC_VER_64. RTL9151A (same PHY function as D,
+    /// different blob).
+    Rtl9151A,
+    /// 0x708 / MAC_VER_65. RTL8125CP.
+    Rtl8125Cp,
     /// 0x681 / MAC_VER_66. RTL8125BP.
     Rtl8125Bp,
-    /// XID didn't match any known 8125. Stage 2 still attempts
-    /// bring-up — the common path doesn't depend on the sub-rev.
+    /// XID didn't match any known 8125. Bring-up still attempts —
+    /// the common path doesn't depend on the sub-rev — but no
+    /// PHY table or firmware blob is known for it.
     Unknown(u32),
 }
 
@@ -367,14 +390,15 @@ pub const fn decode_xid(txconfig: u32) -> u32 {
     (txconfig >> 20) & 0xfcf
 }
 
-/// Classify an XID into `ChipKind`. Sub-revisions inside a family
-/// (e.g. RTL8125D vs RTL9151A) collapse to the same variant when the
-/// driver doesn't need to distinguish them at Stage 2.
+/// Classify an XID into `ChipKind`.
 pub const fn chip_kind_from_xid(xid: u32) -> ChipKind {
     match xid {
         0x609 => ChipKind::Rtl8125A,
         0x641 => ChipKind::Rtl8125B,
-        0x688..=0x68b => ChipKind::Rtl8125D,
+        0x688 | 0x689 => ChipKind::Rtl8125D,
+        0x68a => ChipKind::Rtl8125K,
+        0x68b => ChipKind::Rtl9151A,
+        0x708 => ChipKind::Rtl8125Cp,
         0x681 => ChipKind::Rtl8125Bp,
         other => ChipKind::Unknown(other),
     }
@@ -455,19 +479,16 @@ pub(crate) const RXD_LS_LOCAL: u32 = 1 << 28;
 /// word0 length field mask — 14 bits per §3.1.2.
 pub(crate) const RXD_LEN_MASK_LOCAL: u32 = 0x3FFF;
 
-/// RX buffer size. 2 KiB is plenty for non-jumbo Ethernet (1518 byte
-/// max frame + slack) and aligns to a 2 KiB DMA boundary so the
-/// controller can DMA without crossing a page in the typical case.
-pub const RX_BUF_LEN: usize = 2048;
+/// RX buffer size. Linux sizes every RX buffer on this family to
+/// `R8169_RX_BUF_SIZE` (16 KiB − 1) and programs RMS to the
+/// buffer bound, independent of MTU; jumbo frames are therefore
+/// receivable even while the interface MTU stays 1500.
+pub const RX_BUF_LEN: usize = 16383;
 
-/// MTPS units are 128 bytes. 0x3B → 7552 bytes; gives the chip headroom
-/// to spill a single large TX into multiple back-to-back bursts. The
-/// driver clamps frames to 1518 in `transmit`. MTPS == 0 is illegal.
-const MTPS_DEFAULT: u8 = 0x3B;
-
-/// Max RX packet length (RMS register). 1536 covers a 1518-byte
-/// Ethernet frame + alignment slack.
-const RMS_DEFAULT: u16 = 1536;
+/// TX slot buffer size: one slot must hold the largest frame this
+/// driver will transmit — the 8125-family jumbo tagged frame
+/// (16384 bytes), which is also the family buffer bound.
+pub const TX_BUF_LEN: usize = 16384;
 
 /// Build the 14-bit-length RX descriptor for slot `slot` pointing at
 /// `phys` with buffer size `buf_size`. OWN is set so the chip owns it;
@@ -490,18 +511,26 @@ pub const fn build_rx_desc(slot: usize, phys: u64, buf_size: u32) -> TxDesc {
     }
 }
 
-// v2 offload bits in TxDesc.vlan (word1). RTL8125 always uses v2 path.
-pub const TD1_GTSENV4: u32 = 1 << 26;
-pub const TD1_MSS_SHIFT: u32 = 18;
-#[allow(non_upper_case_globals)] // TODO(narf): mirrors the datasheet register/bit name
-pub const TD1_IPv4_CS: u32 = 1 << 29;
-pub const TD1_TCP_CS: u32 = 1 << 30;
-pub const RX_IPOK: u32 = 1 << 5;
-pub const RX_TCPOK: u32 = 1 << 6;
-pub const RX_UDPOK: u32 = 1 << 7;
-pub const RX_IPFAIL: u32 = 1 << 16;
-pub const RX_TCPFAIL: u32 = 1 << 14;
-pub const RX_UDPFAIL: u32 = 1 << 15;
+// TX offload bits — canonical definitions live in
+// `crate::features` (corrected placement: v2 GTSENV/GTTCPHO in
+// word0, MSS/csum bits/TCPHO in word1). The previous in-tree
+// comments placed the v2 bits in word1, which was wrong and
+// would have corrupted the MSS field. Re-exported so existing
+// users of these names keep compiling.
+/// Historic spelling of [`TD1_IPV4_CS`].
+pub use crate::features::TD1_IPV4_CS as TD1_IPv4_CS;
+pub use crate::features::{
+    TD1_GTSENV4, TD1_GTSENV6, TD1_IPV4_CS, TD1_IPV6_CS, TD1_MSS_SHIFT, TD1_TCP_CS, TD1_UDP_CS,
+};
+
+// RX status bits — see `crate::features::rx_csum_decode`. The
+// previous in-tree "OK" bits (RX_IPOK / RX_TCPOK / RX_UDPOK,
+// bits 5/6/7) were frame-length bits, not protocol bits, and are
+// deleted; decode through [`TxDesc::rx_csum_result`].
+pub use crate::features::{
+    RX_FAIL_IP as RX_IPFAIL, RX_FAIL_TCP as RX_TCPFAIL, RX_FAIL_UDP as RX_UDPFAIL,
+};
+pub use crate::features::{RX_PID_TCP, RX_PID_UDP};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RxCsumResult {
@@ -511,31 +540,32 @@ pub enum RxCsumResult {
 }
 
 impl TxDesc {
-    pub fn with_csum(addr_lo: u32, addr_hi: u32, len: u16) -> Self {
+    /// Build a TX descriptor from pre-computed offload words (see
+    /// `crate::features::v2_csum_words` / `v2_tso_words`).
+    pub fn with_offload(
+        addr_lo: u32,
+        addr_hi: u32,
+        len: u16,
+        words: crate::features::OffloadWords,
+    ) -> Self {
         TxDesc {
-            flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32 & TXD_LEN_MASK),
-            vlan: TD1_IPv4_CS | TD1_TCP_CS,
+            flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32 & TXD_LEN_MASK) | words.word0,
+            vlan: words.word1,
             addr_lo,
             addr_hi,
         }
     }
-    pub fn with_tso(addr_lo: u32, addr_hi: u32, len: u16, mss: u16) -> Self {
-        TxDesc {
-            flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32 & TXD_LEN_MASK),
-            vlan: TD1_GTSENV4 | TD1_IPv4_CS | TD1_TCP_CS | ((mss as u32) << TD1_MSS_SHIFT),
-            addr_lo,
-            addr_hi,
-        }
-    }
+
+    /// Decode the RX checksum result from a chip-returned
+    /// descriptor, using the Linux PID/fail rule.
     pub fn rx_csum_result(&self) -> RxCsumResult {
-        let done = self.flags_len & (RX_IPOK | RX_TCPOK | RX_UDPOK) != 0;
-        if !done {
-            return RxCsumResult::None;
-        }
-        if self.flags_len & (RX_IPFAIL | RX_TCPFAIL | RX_UDPFAIL) != 0 {
+        let decoded = crate::features::rx_csum_decode(self.flags_len);
+        if decoded.l4_ok {
+            RxCsumResult::Ok
+        } else if self.flags_len & (RX_IPFAIL | RX_TCPFAIL | RX_UDPFAIL) != 0 {
             RxCsumResult::Fail
         } else {
-            RxCsumResult::Ok
+            RxCsumResult::None
         }
     }
 }
@@ -557,7 +587,7 @@ use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 pub enum NicError {
     BarMapFailed,
     NoMemory,
-    /// Frame outside [1, 1518].
+    /// Frame outside [1, chip max frame].
     FrameTooLong,
     /// `transmit` couldn't find a free TX descriptor.
     TxRingFull,
@@ -565,6 +595,10 @@ pub enum NicError {
     TxTimeout,
     /// MSI-X table couldn't be brought up.
     MsixSetup,
+    /// The requested TX offload cannot be programmed for this
+    /// frame (unparseable transport header, SCTP, MSS/offset
+    /// overflow).
+    UnsupportedOffload,
     /// Catch-all.
     Other(&'static str),
 }
@@ -593,9 +627,14 @@ pub struct RtlNic {
     rx_head: IrqSafeSpinLock<u32>,
     /// MAC address read from IDR0..5 at bring-up.
     pub mac: [u8; 6],
-    /// Sub-family detected from TxConfig.XID at bring-up. Later
-    /// stages branch the PHY-config table on this.
+    /// Raw chip XID from TxConfig at bring-up (drives the
+    /// firmware-blob pick for the D variants).
+    pub xid: u32,
+    /// Sub-family detected from TxConfig.XID at bring-up. Drives
+    /// the PHY-config table pick in [`phy_table_for`].
     pub chip_kind: ChipKind,
+    /// Last WoL option set programmed via [`RtlNic::set_wol_opts`].
+    wol_opts: IrqSafeSpinLock<crate::features::WolOpts>,
     /// True when PHYStatus.LinkSts read 1 at bring-up. We don't yet
     /// re-poll on LinkChg interrupts.
     pub link_up: bool,
@@ -679,14 +718,14 @@ impl RtlNic {
             ]
         };
 
-        // 3. Detect sub-family from TxConfig XID. The chip drives a
-        //    consistent XID across silicon revisions (RTL8125A=0x609,
-        //    8125B=0x641, 8125D=0x688/9, BP=0x681) so later stages
-        //    can branch the PHY-config tables. Stage 2 still attempts
-        //    bring-up on any XID — the common path works.
+        // 3. Detect sub-family from TxConfig XID. Read BEFORE step
+        //    6a overwrites TCR: the reset-default TCR carries the
+        //    chip's XID in bits 29:20 (Linux `rtl_read_mac_version`
+        //    reads the same register at probe).
         // SAFETY: identity-mapped MMIO.
         let txcfg = unsafe { mmio.read32(REG_TCR) };
-        let chip_kind = chip_kind_from_xid(decode_xid(txcfg));
+        let xid = decode_xid(txcfg);
+        let chip_kind = chip_kind_from_xid(xid);
 
         // 4. Allocate descriptor rings + per-slot buffers. zeroed
         //    pages give us "host-owned (OWN=0)" descriptors, which
@@ -704,15 +743,25 @@ impl RtlNic {
         }
         let mut tx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
         for _ in 0..RING_LEN {
-            tx_pool.push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?);
+            tx_pool.push(
+                alloc_coherent(TX_BUF_LEN, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
+            );
         }
 
-        // 5. C+CR first per the Linux bring-up order. VLAN-detag + RX
-        //    checksum offload disabled — Stage 2 doesn't yet consume
-        //    these.
-        // SAFETY: identity-mapped.
+        // 5. C+CR first per the Linux bring-up order. Enable RX
+        //    checksum offload (the RX pump decodes it into
+        //    `Frame::rx_meta`) and keep RX VLAN stripping OFF:
+        //    NARF's `Frame::rx_meta` has no VLAN-tag field, so
+        //    stripping would discard tags the stack needs. TX
+        //    VLAN insertion is independent of this bit. Then
+        //    program the EEE TX LPI idle timer (Linux's
+        //    `rtl_set_eee_txidle_timer` VER_61..LAST arm: the whole
+        //    8125 family takes the 0x6048 register).
+        // SAFETY: bring_up owns the BAR exclusively.
         unsafe {
-            mmio.write16(REG_CPLUSCR, 0);
+            let mut regs = crate::features::MmioRegs(&mmio);
+            crate::features::apply_cplus(&mut regs, false, true);
+            crate::features::apply_eee_txidle(&mut regs, 1500);
         }
 
         // 6. CR enables both TE + RE. Datasheet §2.7 + §2.8 require
@@ -728,12 +777,16 @@ impl RtlNic {
         //     datasheet §2.3. EOR set lazily on the last slot at
         //     first `transmit`.
         let tx_phys = tx_ring.dma_addr().raw();
+        // MTPS from the family jumbo tagged frame (16384 bytes →
+        // 128 units of 128 bytes). The whole 8125 family needs no
+        // jumbo Config-register writes (Linux's `rtl_jumbo_config`
+        // default arm), so MTPS is the only jumbo sizing here.
         // SAFETY: identity-mapped MMIO.
         unsafe {
             mmio.write32(REG_TNPDS, tx_phys as u32);
             mmio.write32(REG_TNPDS + 4, (tx_phys >> 32) as u32);
             mmio.write32(REG_TCR, TCR_MXDMA_UNLIMITED | TCR_IFG_STD);
-            mmio.write8(REG_MTPS, MTPS_DEFAULT);
+            mmio.write8(REG_MTPS, crate::features::mtps_for_frame(TX_BUF_LEN as u32));
         }
 
         // 6b. Pre-fill RX descriptors: each points at its pooled
@@ -761,11 +814,13 @@ impl RtlNic {
                 );
             }
         }
+        // RMS is the buffer bound (16383), not the MTU bound —
+        // Linux's `rtl_set_rx_max_size` shape.
         // SAFETY: identity-mapped MMIO.
         unsafe {
             mmio.write32(REG_RDSAR, rx_ring_phys as u32);
             mmio.write32(REG_RDSAR + 4, (rx_ring_phys >> 32) as u32);
-            mmio.write16(REG_RMS, RMS_DEFAULT);
+            mmio.write16(REG_RMS, RX_BUF_LEN as u16);
         }
 
         // 6c. RCR — 8125 variant uses `RX_FETCH_DFLT_8125 = 8 << 27`
@@ -831,7 +886,9 @@ impl RtlNic {
             rx_pool,
             rx_head: IrqSafeSpinLock::new(0),
             mac,
+            xid,
             chip_kind,
+            wol_opts: IrqSafeSpinLock::new(crate::features::WolOpts::NONE),
             link_up,
             irq_vector: None,
             msix: None,
@@ -886,11 +943,11 @@ impl RtlNic {
     }
 
     /// Transmit a single Ethernet frame. Polled completion: spins on
-    /// the slot's OWN bit until the NIC clears it. Frame must be in
-    /// `[1, 1518]` bytes (no jumbo); the chip pads frames < 64 bytes
-    /// itself.
+    /// the slot's OWN bit until the NIC clears it. Frames up to the
+    /// family jumbo tagged frame (16384 bytes) are accepted; the
+    /// chip pads frames < 64 bytes itself.
     pub fn transmit(&self, frame: &[u8], meta: &TxMeta) -> Result<(), NicError> {
-        if frame.is_empty() || frame.len() > 1518 {
+        if frame.is_empty() || frame.len() > TX_BUF_LEN {
             return Err(NicError::FrameTooLong);
         }
         let mut head_g = self.tx_head.lock();
@@ -914,30 +971,39 @@ impl RtlNic {
         }
 
         // Select descriptor format based on offload request.
-        let d = if let Some(mss) = meta.tso_mss {
-            let mut d = TxDesc::with_tso(phys as u32, (phys >> 32) as u32, frame.len() as u16, mss);
-            if slot == RING_LEN - 1 {
-                d.flags_len |= TXD_EOR;
+        // Every 8125-family chip is csum-v2, so only the v2
+        // builders are used. Offload words are computed
+        // driver-locally (frame parsing + `crate::features`
+        // builders); no shared TX-path code is touched. An offload
+        // the chip cannot take for this frame is
+        // `UnsupportedOffload`, never a descriptor with a guessed
+        // offset. Plain frames still get VLAN insertion.
+        let mut d = if let Some(mss) = meta.tso_mss {
+            if mss == 0 || mss > crate::features::MSS_MAX {
+                return Err(NicError::UnsupportedOffload);
             }
-            d
-        } else if meta.csum_l4.is_some() {
-            let mut d = TxDesc::with_csum(phys as u32, (phys >> 32) as u32, frame.len() as u16);
-            if slot == RING_LEN - 1 {
-                d.flags_len |= TXD_EOR;
-            }
-            d
+            let info =
+                crate::features::parse_transport(frame).ok_or(NicError::UnsupportedOffload)?;
+            let words = crate::features::v2_tso_words(info.ip, mss, info.offset, meta.vlan_tag)
+                .ok_or(NicError::UnsupportedOffload)?;
+            TxDesc::with_offload(phys as u32, (phys >> 32) as u32, frame.len() as u16, words)
+        } else if let Some(kind) = meta.csum_l4 {
+            let info =
+                crate::features::parse_transport(frame).ok_or(NicError::UnsupportedOffload)?;
+            let words = crate::features::v2_csum_words(kind, info.ip, info.offset, meta.vlan_tag)
+                .ok_or(NicError::UnsupportedOffload)?;
+            TxDesc::with_offload(phys as u32, (phys >> 32) as u32, frame.len() as u16, words)
         } else {
-            let mut flags = TXD_OWN | TXD_FS | TXD_LS | (frame.len() as u32 & TXD_LEN_MASK);
-            if slot == RING_LEN - 1 {
-                flags |= TXD_EOR;
-            }
             TxDesc {
-                flags_len: flags,
-                vlan: 0,
+                flags_len: TXD_OWN | TXD_FS | TXD_LS | (frame.len() as u32 & TXD_LEN_MASK),
+                vlan: crate::features::tx_vlan_word(meta.vlan_tag),
                 addr_lo: phys as u32,
                 addr_hi: (phys >> 32) as u32,
             }
         };
+        if slot == RING_LEN - 1 {
+            d.flags_len |= TXD_EOR;
+        }
         // The NIC sees OWN=1 once we publish word0; the addr / vlan
         // / length-without-OWN fields must already be visible. Write
         // them first, fence, then publish OWN.
@@ -996,6 +1062,12 @@ impl RtlNic {
     /// when a descriptor's OWN bit reads 0 (NIC handed it back) and
     /// `None` when the ring head is still NIC-owned.
     pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
+        self.receive_with_meta().map(|(buf, _)| buf)
+    }
+
+    /// Like [`RtlNic::receive`], plus the chip's RX checksum
+    /// verification result decoded from the returned descriptor.
+    pub fn receive_with_meta(&self) -> Option<(alloc::vec::Vec<u8>, RxCsumResult)> {
         let mut head_g = self.rx_head.lock();
         let slot = (*head_g) as usize % RING_LEN;
         let ring_phys = self.rx_ring.dma_addr().raw();
@@ -1008,6 +1080,16 @@ impl RtlNic {
         if flags_len & RXD_OWN_LOCAL != 0 {
             return None;
         }
+
+        // Decode the RX checksum result now, before rearming
+        // overwrites the descriptor.
+        let csum = TxDesc {
+            flags_len,
+            vlan: 0,
+            addr_lo: 0,
+            addr_hi: 0,
+        }
+        .rx_csum_result();
 
         // Status layout per §3.1.2: bits[13:0] = received frame
         // length (incl. CRC unless RCR.SECRC strips it; Stage 2
@@ -1054,7 +1136,89 @@ impl RtlNic {
         compiler_fence(Ordering::SeqCst);
 
         *head_g = (*head_g + 1) % (RING_LEN as u32);
-        Some(out)
+        Some((out, csum))
+    }
+
+    /// Largest frame this driver will transmit: the family jumbo
+    /// tagged frame, which is also the TX slot buffer size.
+    pub fn max_frame(&self) -> u32 {
+        TX_BUF_LEN as u32
+    }
+
+    /// EEE LPI capabilities for this chip's MAC version (Linux's
+    /// `rtl8169_get_lpi_caps` shape; 8125A gets 100/1000 only,
+    /// later variants add 2500FD).
+    pub fn eee_caps(&self) -> crate::features::EeeCaps {
+        crate::features::eee_lpi_caps(match self.chip_kind {
+            ChipKind::Rtl8125A => 61,
+            ChipKind::Rtl8125B => 63,
+            ChipKind::Rtl8125D | ChipKind::Rtl8125K | ChipKind::Rtl9151A => 64,
+            ChipKind::Rtl8125Cp => 65,
+            ChipKind::Rtl8125Bp => 66,
+            ChipKind::Unknown(_) => 0,
+        })
+    }
+
+    /// Program Wake-on-LAN options (Linux's `__rtl8169_set_wol`
+    /// 8125-family shape). Config registers are unlocked for the
+    /// sequence and re-locked after. Unlike the r8169 driver,
+    /// nothing is left pending: the 8125 magic step (MAC-OCP
+    /// 0xc0b6 bit 0) and the LinkUp step (MAC-OCP 0xe0c6, mask
+    /// 0x3f, value 0x13 when PHY wake is on, else 0) are both
+    /// performed here through the shared OCP accessor.
+    pub fn set_wol_opts(&self, opts: crate::features::WolOpts) -> Result<(), NicError> {
+        if !opts.is_valid() {
+            return Err(NicError::UnsupportedOffload);
+        }
+        // SAFETY: bring_up owns the BAR; `set_wol_opts` is called
+        // only on the live controller, whose MMIO is exclusively
+        // owned by this instance.
+        unsafe {
+            self.mmio.write8(REG_9346CR, EEM_CONFIG_WRITE);
+            let mut regs = crate::features::MmioRegs(&self.mmio);
+            let pending = crate::features::apply_wol(
+                &mut regs,
+                opts,
+                crate::features::WolMagic::MacOcpC0b6,
+                crate::features::WolPmeReg::Config2,
+            );
+            self.mmio.write8(REG_9346CR, EEM_NORMAL);
+            *self.wol_opts.lock() = opts;
+            // Consume the pending 8125-family steps. The OCP
+            // window is not a config register, so it stays usable
+            // after the lock.
+            let access = crate::phy_access::PhyAccess::new(&self.mmio);
+            let linkup_val: u16 = if opts.contains(crate::features::WolOpts::PHY) {
+                0x13
+            } else {
+                0
+            };
+            let cur_e0c6 = access
+                .mac_ocp_read(0xe0c6)
+                .map_err(|_| NicError::Other("OCP read failed"))?;
+            access
+                .mac_ocp_write(0xe0c6, (cur_e0c6 & !0x3f) | linkup_val)
+                .map_err(|_| NicError::Other("OCP write failed"))?;
+            if let crate::features::WolPendingMagic::MacOcpC0b6(magic_on) = pending {
+                let cur_c0b6 = access
+                    .mac_ocp_read(0xc0b6)
+                    .map_err(|_| NicError::Other("OCP read failed"))?;
+                let new_c0b6 = if magic_on {
+                    cur_c0b6 | 0x0001
+                } else {
+                    cur_c0b6 & !0x0001
+                };
+                access
+                    .mac_ocp_write(0xc0b6, new_c0b6)
+                    .map_err(|_| NicError::Other("OCP write failed"))?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Last WoL option set programmed via [`RtlNic::set_wol_opts`].
+    pub fn wol_opts(&self) -> crate::features::WolOpts {
+        *self.wol_opts.lock()
     }
 
     /// Read the PHY-status register. Useful for tests; bit 1 = link.
@@ -1086,6 +1250,377 @@ impl RtlNic {
         self.link_up = up;
         up
     }
+}
+
+// ── PHY-config tables ────────────────────────────────────────────────
+// Transcriptions of the `rtl8125*_hw_phy_config` functions in
+// Linux `drivers/net/ethernet/realtek/r8169_phy_config.c`, in
+// source order, with the helper calls expanded inline. Entry
+// constructors: `mp` = `phy_modify_paged`, `wp` =
+// `phy_write_paged`, `gp` = `r8168g_phy_param`, `rp` =
+// `rtl8125_phy_param` (see `crate::phy_access` for the exact
+// register each form touches).
+
+use crate::phy_access::{PhyConfigEntry, PhyConfigKind};
+
+const fn mp(page: u16, reg: u16, mask: u16, val: u16) -> PhyConfigEntry {
+    PhyConfigEntry {
+        page,
+        reg,
+        mask,
+        val,
+        kind: PhyConfigKind::ModifyPaged,
+    }
+}
+
+const fn wp(page: u16, reg: u16, val: u16) -> PhyConfigEntry {
+    PhyConfigEntry {
+        page,
+        reg,
+        mask: 0xFFFF,
+        val,
+        kind: PhyConfigKind::WritePaged,
+    }
+}
+
+const fn gp(parm: u16, mask: u16, val: u16) -> PhyConfigEntry {
+    PhyConfigEntry {
+        page: parm,
+        reg: 0x14,
+        mask,
+        val,
+        kind: PhyConfigKind::R8168gParam,
+    }
+}
+
+const fn rp(parm: u16, mask: u16, val: u16) -> PhyConfigEntry {
+    PhyConfigEntry {
+        page: parm,
+        reg: 0xb87e,
+        mask,
+        val,
+        kind: PhyConfigKind::Rtl8125Param,
+    }
+}
+
+/// `rtl8168g_enable_gphy_10m`: `phy_modify_paged(0x0a44, 0x11,
+/// 0, BIT(11))`.
+const fn enable_gphy_10m() -> PhyConfigEntry {
+    mp(0x0a44, 0x11, 0x0000, 0x0800)
+}
+
+/// `rtl8125_legacy_force_mode`: `phy_modify_paged(0xa5b, 0x12,
+/// BIT(15), 0)`.
+const fn legacy_force_mode() -> PhyConfigEntry {
+    mp(0xa5b, 0x12, 0x8000, 0x0000)
+}
+
+/// `rtl8168g_disable_aldps`: `phy_modify_paged(0x0a43, 0x10,
+/// BIT(2), 0)`.
+const fn disable_aldps() -> PhyConfigEntry {
+    mp(0x0a43, 0x10, 0x0004, 0x0000)
+}
+
+/// RTL8125A (VER_61) table, part 1: everything Linux's
+/// `rtl8125a_2_hw_phy_config` writes BEFORE `r8169_apply_firmware`
+/// — including the 0x0a43 burst (selector 0x81B3, then 15 values,
+/// then 25 zeroes) and the page-0 restore. The burst's trailing
+/// `phy_write(0x1f, 0x0000)` is encoded as `wp(0, 0x1f, 0)`:
+/// selecting page 0 and then writing the page-select register
+/// itself to 0 leaves page 0 selected, which is the same state.
+const PHY_TABLE_A_PRE: &[PhyConfigEntry] = &[
+    mp(0xad4, 0x17, 0x0000, 0x0010),
+    mp(0xad1, 0x13, 0x03ff, 0x03ff),
+    mp(0xad3, 0x11, 0x003f, 0x0006),
+    mp(0xac0, 0x14, 0x1100, 0x0000),
+    mp(0xacc, 0x10, 0x0003, 0x0002),
+    mp(0xad4, 0x10, 0x00e7, 0x0044),
+    mp(0xac1, 0x12, 0x0080, 0x0000),
+    mp(0xac8, 0x10, 0x0300, 0x0000),
+    mp(0xac5, 0x17, 0x0007, 0x0002),
+    wp(0xad4, 0x16, 0x00a8),
+    wp(0xac5, 0x16, 0x01ff),
+    mp(0xac8, 0x15, 0x00f0, 0x0030),
+    rp(0x80a2, 0xffff, 0x0153),
+    rp(0x809c, 0xffff, 0x0153),
+    wp(0x0a43, 0x13, 0x81b3),
+    wp(0x0a43, 0x14, 0x0043),
+    wp(0x0a43, 0x14, 0x00a7),
+    wp(0x0a43, 0x14, 0x00d6),
+    wp(0x0a43, 0x14, 0x00ec),
+    wp(0x0a43, 0x14, 0x00f6),
+    wp(0x0a43, 0x14, 0x00fb),
+    wp(0x0a43, 0x14, 0x00fd),
+    wp(0x0a43, 0x14, 0x00ff),
+    wp(0x0a43, 0x14, 0x00bb),
+    wp(0x0a43, 0x14, 0x0058),
+    wp(0x0a43, 0x14, 0x0029),
+    wp(0x0a43, 0x14, 0x0013),
+    wp(0x0a43, 0x14, 0x0009),
+    wp(0x0a43, 0x14, 0x0004),
+    wp(0x0a43, 0x14, 0x0002),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0x0a43, 0x14, 0x0000),
+    wp(0, 0x1f, 0x0000),
+    gp(0x8257, 0xffff, 0x020f),
+    gp(0x80ea, 0xffff, 0x7843),
+];
+
+/// RTL8125A (VER_61) table, part 2: everything Linux writes AFTER
+/// `r8169_apply_firmware`, in order, ending with the helper calls.
+const PHY_TABLE_A_POST: &[PhyConfigEntry] = &[
+    mp(0xd06, 0x14, 0x0000, 0x2000),
+    gp(0x81a2, 0x0000, 0x0100),
+    mp(0xb54, 0x16, 0xff00, 0xdb00),
+    mp(0xa45, 0x12, 0x0001, 0x0000),
+    mp(0xa5d, 0x12, 0x0000, 0x0020),
+    mp(0xad4, 0x17, 0x0010, 0x0000),
+    mp(0xa86, 0x15, 0x0001, 0x0000),
+    enable_gphy_10m(),
+    disable_aldps(),
+    // `rtl8125_config_eee_phy` = g-config + common clears.
+    mp(0x0a43, 0x11, 0x0000, 0x0010),
+    mp(0xa6d, 0x14, 0x0010, 0x0000),
+    mp(0xa42, 0x14, 0x0080, 0x0000),
+    mp(0xa4a, 0x11, 0x0200, 0x0000),
+];
+
+/// RTL8125B (VER_63) table: firmware runs first in Linux, so the
+/// whole table is the post-firmware part.
+const PHY_TABLE_B: &[PhyConfigEntry] = &[
+    enable_gphy_10m(),
+    mp(0xac4, 0x13, 0x00f0, 0x0090),
+    mp(0xad3, 0x10, 0x0003, 0x0001),
+    rp(0x80f5, 0xffff, 0x760e),
+    rp(0x8107, 0xffff, 0x360e),
+    rp(0x8551, 0xff00, 0x0800),
+    mp(0xbf0, 0x10, 0xe000, 0xa000),
+    mp(0xbf4, 0x13, 0x0f00, 0x0300),
+    gp(0x8044, 0xffff, 0x2417),
+    gp(0x804a, 0xffff, 0x2417),
+    gp(0x8050, 0xffff, 0x2417),
+    gp(0x8056, 0xffff, 0x2417),
+    gp(0x805c, 0xffff, 0x2417),
+    gp(0x8062, 0xffff, 0x2417),
+    gp(0x8068, 0xffff, 0x2417),
+    gp(0x806e, 0xffff, 0x2417),
+    gp(0x8074, 0xffff, 0x2417),
+    gp(0x807a, 0xffff, 0x2417),
+    mp(0xa4c, 0x15, 0x0000, 0x0040),
+    mp(0xbf8, 0x12, 0xe000, 0xa000),
+    legacy_force_mode(),
+    disable_aldps(),
+    mp(0x0a43, 0x11, 0x0000, 0x0010),
+    mp(0xa6d, 0x14, 0x0010, 0x0000),
+    mp(0xa42, 0x14, 0x0080, 0x0000),
+    mp(0xa4a, 0x11, 0x0200, 0x0000),
+];
+
+/// RTL8125D / RTL8125K / RTL9151A (VER_64) table: firmware first,
+/// then four helper calls only — Linux's `rtl8125d_hw_phy_config`
+/// has no other register writes.
+const PHY_TABLE_D: &[PhyConfigEntry] = &[
+    enable_gphy_10m(),
+    legacy_force_mode(),
+    disable_aldps(),
+    mp(0x0a43, 0x11, 0x0000, 0x0010),
+    mp(0xa6d, 0x14, 0x0010, 0x0000),
+    mp(0xa42, 0x14, 0x0080, 0x0000),
+    mp(0xa4a, 0x11, 0x0200, 0x0000),
+];
+
+/// RTL8125CP (VER_65) table: firmware first. `LINK_SPEED_10M_PLL_OFF
+/// | ALDPS_PLL_OFF` = BIT(0) | BIT(1) = 0x0003 (Linux
+/// `r8169_phy_config.c` lines 17–18).
+const PHY_TABLE_CP: &[PhyConfigEntry] = &[
+    enable_gphy_10m(),
+    mp(0xad0, 0x17, 0x007f, 0x000b),
+    mp(0xad7, 0x14, 0x0000, 0x0010),
+    rp(0x807f, 0xff00, 0x5300),
+    gp(0x81b8, 0xffff, 0x00b4),
+    gp(0x81ba, 0xffff, 0x00e4),
+    gp(0x81c5, 0xffff, 0x0104),
+    gp(0x81d0, 0xffff, 0x054d),
+    mp(0x0a43, 0x10, 0x0000, 0x0003),
+    mp(0x0a44, 0x11, 0x0000, 0x0080),
+    legacy_force_mode(),
+    disable_aldps(),
+    mp(0x0a43, 0x11, 0x0000, 0x0010),
+    mp(0xa6d, 0x14, 0x0010, 0x0000),
+    mp(0xa42, 0x14, 0x0080, 0x0000),
+    mp(0xa4a, 0x11, 0x0200, 0x0000),
+];
+
+/// RTL8125BP (VER_66) table: firmware first.
+const PHY_TABLE_BP: &[PhyConfigEntry] = &[
+    enable_gphy_10m(),
+    gp(0x8010, 0x0800, 0x0000),
+    rp(0x8088, 0xff00, 0x9000),
+    rp(0x808f, 0xff00, 0x9000),
+    gp(0x8174, 0x2000, 0x1800),
+    legacy_force_mode(),
+    disable_aldps(),
+    mp(0x0a43, 0x11, 0x0000, 0x0010),
+    mp(0xa6d, 0x14, 0x0010, 0x0000),
+    mp(0xa42, 0x14, 0x0080, 0x0000),
+    mp(0xa4a, 0x11, 0x0200, 0x0000),
+];
+
+/// Firmware blob name for a chip XID, from Linux's
+/// `rtl_firmware` table (`rtl8125a-3.fw`, `rtl8125b-2.fw`,
+/// `rtl8125d-1.fw` / `rtl8125d-2.fw`, `rtl8125k-1.fw`,
+/// `rtl9151a-1.fw`, `rtl8125cp-1.fw`, `rtl8125bp-2.fw`).
+/// `None` for an XID with no known blob.
+pub fn firmware_name_for(xid: u32) -> Option<&'static str> {
+    Some(match xid {
+        0x609 => "rtl_nic/rtl8125a-3.fw",
+        0x641 => "rtl_nic/rtl8125b-2.fw",
+        0x688 => "rtl_nic/rtl8125d-1.fw",
+        0x689 => "rtl_nic/rtl8125d-2.fw",
+        0x68a => "rtl_nic/rtl8125k-1.fw",
+        0x68b => "rtl_nic/rtl9151a-1.fw",
+        0x708 => "rtl_nic/rtl8125cp-1.fw",
+        0x681 => "rtl_nic/rtl8125bp-2.fw",
+        _ => return None,
+    })
+}
+
+/// PHY-config tables for a chip kind, as `(pre_firmware,
+/// post_firmware)` slices. Only 8125A splits: Linux runs its
+/// firmware mid-table, so the pre part must land first. Every
+/// other variant runs firmware first, so its pre part is empty.
+/// Unknown kinds get no tables at all.
+pub fn phy_table_for(kind: ChipKind) -> (&'static [PhyConfigEntry], &'static [PhyConfigEntry]) {
+    match kind {
+        ChipKind::Rtl8125A => (PHY_TABLE_A_PRE, PHY_TABLE_A_POST),
+        ChipKind::Rtl8125B => (&[], PHY_TABLE_B),
+        ChipKind::Rtl8125D | ChipKind::Rtl8125K | ChipKind::Rtl9151A => (&[], PHY_TABLE_D),
+        ChipKind::Rtl8125Cp => (&[], PHY_TABLE_CP),
+        ChipKind::Rtl8125Bp => (&[], PHY_TABLE_BP),
+        ChipKind::Unknown(_) => (&[], &[]),
+    }
+}
+
+/// Run the PHY bring-up sequence once the firmware registry exists.
+/// Mirrors the 8127 late hook: take an `Arc` clone and drop the
+/// registry lock before touching the PHY (a firmware delay opcode
+/// can spin for up to `MAX_FIRMWARE_DELAY_MS`). A missing blob is
+/// a log line, not an error — the tables still program the
+/// registers they name. A blob that fails mid-stream is logged
+/// and the tables still run (same shape as the 8127 hook).
+pub fn configure_phy_late() {
+    let controller = CONTROLLER.lock().clone();
+    let Some(controller) = controller else {
+        return;
+    };
+    configure_phy(&controller.mmio, controller.xid, controller.chip_kind);
+}
+
+fn configure_phy(mmio: &MmioRegion, xid: u32, kind: ChipKind) {
+    use core::fmt::Write as _;
+
+    let (pre, post) = phy_table_for(kind);
+    let mut access = crate::phy_access::PhyAccess::new(mmio);
+
+    if let Err(e) = access.apply_config_table(pre) {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  rtl8125: pre-firmware PHY table aborted: {:?}",
+            e
+        );
+        return;
+    }
+
+    match load_phy_firmware(xid) {
+        Some(code) => match access.run_firmware(&code) {
+            Ok(()) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtl8125: applied firmware ({} opcodes)",
+                    code.len(),
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtl8125: firmware aborted at an opcode: {:?}; PHY may be partly patched",
+                    e,
+                );
+            }
+        },
+        None => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8125: no firmware blob for XID {:#x}; applying PHY config without it",
+                xid,
+            );
+        }
+    }
+
+    if let Err(e) = access.apply_config_table(post) {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  rtl8125: PHY config table aborted: {:?}",
+            e
+        );
+    }
+}
+
+/// Fetch and parse this chip's firmware blob, if the firmware
+/// registry has it.
+fn load_phy_firmware(xid: u32) -> Option<alloc::vec::Vec<u32>> {
+    use core::fmt::Write as _;
+
+    let name = firmware_name_for(xid)?;
+    let auth = narf_firmware::trusted_loader_authority()?.derive().ok()?;
+    let cap = narf_firmware::open(name, &auth).ok()?;
+    let view = narf_firmware::view_of(&cap).ok()?;
+
+    let code = match crate::phy_access::parse_firmware(view.bytes) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8125: {} failed its format check: {:?}",
+                name,
+                e,
+            );
+            return None;
+        }
+    };
+    if let Err(e) = crate::phy_access::validate_firmware(&code) {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  rtl8125: {} rejected: {:?}",
+            name,
+            e,
+        );
+        return None;
+    }
+    Some(code)
 }
 
 // ── Driver-match registration ────────────────────────────────────────
@@ -1235,11 +1770,20 @@ async fn rtl8125_rx_pump(device: Arc<RtlNic>, mut rx_prod: Producer<Frame, RX_RI
             last_sample = sample;
             crate::publish::publish_link(rtl8125_ifname(), sample);
         }
-        if let Some(pkt) = device.receive() {
+        if let Some((pkt, csum)) = device.receive_with_meta() {
             let dma_buf =
                 alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, pkt.len() as u32);
             frame.payload_mut().copy_from_slice(&pkt);
+            // RX checksum verification from the descriptor: only
+            // `Ok` marks the checksums verified; `Fail` and `None`
+            // both leave the flags clear so the stack re-checks.
+            let mut rx_meta = narf_net::RxMeta::default();
+            if csum == RxCsumResult::Ok {
+                rx_meta.csum_l3 = true;
+                rx_meta.csum_l4 = true;
+            }
+            frame.set_rx_meta(rx_meta);
             // RX fan-out (issue #784), e1000's `dispatch_rx_frame`
             // shape via the shared helper: an attached ring consumer
             // gets a pristine pre-dispatch copy; the original goes to
@@ -1306,6 +1850,16 @@ impl narf_net::Interface for Rtl8125Nic {
     fn link_up(&self) -> bool {
         with_controller(|c| c.link_up).unwrap_or(false)
     }
+    fn offloads(&self) -> narf_net::OffloadCapabilities {
+        // The TSO byte cap is the TX slot buffer: a TSO packet is
+        // one frame copied into one slot.
+        narf_net::OffloadCapabilities {
+            tx_checksum: true,
+            rx_checksum: true,
+            max_tso_bytes: TX_BUF_LEN as u32,
+            vlan_insert: true,
+        }
+    }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
             IrqSafeSpinLock::new(None);
@@ -1357,7 +1911,10 @@ impl crate::HwNic for Rtl8125Nic {
         crate::NicModel::RealtekRtl8168
     }
     fn caps(&self) -> crate::NicCaps {
-        crate::NicCaps::NONE
+        crate::NicCaps::TX_CSUM
+            | crate::NicCaps::RX_CSUM
+            | crate::NicCaps::TSO
+            | crate::NicCaps::VLAN_TAGGING
     }
     fn ring_capacity(&self) -> usize {
         RING_LEN

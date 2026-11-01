@@ -19,6 +19,10 @@ extern crate alloc;
 pub use narf_drivers_net_core::*;
 
 #[cfg(feature = "builtin")]
+pub mod features;
+#[cfg(feature = "builtin")]
+pub mod phy_access;
+#[cfg(feature = "builtin")]
 pub mod r8169;
 #[cfg(feature = "builtin")]
 pub mod rtl8125;
@@ -63,4 +67,18 @@ fn do_register() {
 #[cfg(feature = "builtin")]
 pub fn configure_rtl8127_phy_late() {
     rtl8127::configure_phy_late();
+}
+
+/// The RTL8125 late PHY-firmware pass. Same ordering constraint as
+/// the 8127 pass: the firmware registry is populated only by the
+/// `Stage::Late` initramfs and rootfs scans.
+#[cfg(feature = "builtin")]
+pub fn configure_rtl8125_phy_late() {
+    rtl8125::configure_phy_late();
+}
+
+/// The RTL8126 late PHY-firmware pass. Same ordering constraint.
+#[cfg(feature = "builtin")]
+pub fn configure_rtl8126_phy_late() {
+    rtl8126::configure_phy_late();
 }
