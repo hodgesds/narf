@@ -14,6 +14,13 @@ impl Rates {
         // membership selectors remain forbidden on the HE-only6GHz path.
         Self::parse_for_profiles(ies, 36, 0, sae_h2e, true)
     }
+    pub(super) fn parse_six_eht(
+        ies: &[u8],
+        sae_h2e: bool,
+        eht: bool,
+    ) -> Result<Self, &'static str> {
+        Self::parse_for_native_profiles(ies, 36, 0, sae_h2e, true, eht)
+    }
     pub fn parse(ies: &[u8], channel: u8) -> Result<Self, &'static str> {
         Self::parse_for_phy(ies, channel, 0)
     }
@@ -32,11 +39,21 @@ impl Rates {
         Self::parse_for_profiles(ies, channel, mode, sae_h2e, false)
     }
     pub(super) fn parse_for_profiles(
+        ies: &[u8],
+        channel: u8,
+        mode: u8,
+        sae_h2e: bool,
+        he: bool,
+    ) -> Result<Self, &'static str> {
+        Self::parse_for_native_profiles(ies, channel, mode, sae_h2e, he, false)
+    }
+    pub(super) fn parse_for_native_profiles(
         mut ies: &[u8],
         channel: u8,
         mode: u8,
         sae_h2e: bool,
         he: bool,
+        eht: bool,
     ) -> Result<Self, &'static str> {
         let allowed = if channel == 14 {
             0xf
@@ -61,6 +78,7 @@ impl Rates {
                         || (rate == 0xfe && mode >= 2)
                         || (rate == 0xfb && sae_h2e)
                         || (rate == 0xfa && he)
+                        || (rate == 0xf9 && eht)
                     {
                         continue;
                     }

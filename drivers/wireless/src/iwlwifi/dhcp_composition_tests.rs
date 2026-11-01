@@ -224,6 +224,7 @@ struct Wire {
     mcc_caps_override: Option<u32>,
     mcc_permissions: Option<Vec<u32>>,
     six: Option<SixModel>,
+    eht: Option<eht_tests::Model>,
 }
 
 // SAFETY: no real device or thread accesses these fixture pointers. The sole
@@ -829,6 +830,9 @@ impl Wire {
             } else if let Some(phy) = self.phy {
                 beacon.extend_from_slice(&he_tests::elements(phy, true));
             }
+            if let Some(eht) = self.eht {
+                beacon.extend_from_slice(&eht.elements(self.phy.unwrap(), false));
+            }
             if self.sae_h2e_only {
                 // Actual BSS membership selector123; the AP's RSNXE and
                 // SAE Commit must independently confirm H2E.
@@ -1102,6 +1106,9 @@ impl Wire {
                         } else if let Some(phy) = self.phy {
                             response.extend_from_slice(&he_tests::elements(phy, phy.response_he));
                         }
+                        if let Some(eht) = self.eht {
+                            response.extend_from_slice(&eht.elements(self.phy.unwrap(), true));
+                        }
                     }
                     if self.fault == Fault::WrongSaeSelector
                         && response[0] == 0xb0
@@ -1181,36 +1188,38 @@ impl Wire {
         // Firmware follows the station's actual programmed TLC, not the
         // AP's advertised maximum. M1 may precede TLC and use a legacy rate;
         // a narrowed/non-HE association must not receive invented HE data.
-        let he_programmed = self
+        let programmed_mode = self
             .commands
             .iter()
             .rev()
             .find(|(g, c, _)| (*g, *c) == (5, 0xf))
-            .is_some_and(|(_, _, body)| {
-                body.get(if self.api89.is_some() { 5 } else { 9 }) == Some(&3)
-            });
+            .and_then(|(_, _, body)| body.get(if self.api89.is_some() { 5 } else { 9 }))
+            .copied();
+        let he_programmed = matches!(programmed_mode, Some(3 | 4));
         if let Some(phy) = self.phy.filter(|_| he_programmed && frame[0] & 0xc == 8) {
-            let rate = 0x400u32
-                | if phy.width == 3 {
-                    self.commands
-                        .iter()
-                        .rev()
-                        .find(|(g, c, _)| (*g, *c) == (5, 0xf))
-                        .map_or(0, |(_, _, body)| {
-                            u32::from(body[if self.api89.is_some() { 4 } else { 8 }]) << 11
-                        })
+            let rate = (if programmed_mode == Some(4) {
+                0x500u32
+            } else {
+                0x400u32
+            }) | if phy.width == 3 {
+                self.commands
+                    .iter()
+                    .rev()
+                    .find(|(g, c, _)| (*g, *c) == (5, 0xf))
+                    .map_or(0, |(_, _, body)| {
+                        u32::from(body[if self.api89.is_some() { 4 } else { 8 }]) << 11
+                    })
+            } else {
+                0
+            } | if phy.streams == 2 {
+                if phy.rates == 3 {
+                    32
                 } else {
-                    0
+                    16
                 }
-                | if phy.streams == 2 {
-                    if phy.rates == 3 {
-                        32
-                    } else {
-                        16
-                    }
-                } else {
-                    0
-                };
+            } else {
+                0
+            };
             payload[36..40].copy_from_slice(&rate.to_le_bytes());
         } else if let Some(phy) = self.phy.filter(|phy| phy.width == 3 && frame[0] & 0xc == 8) {
             if let Some((_, _, body)) = self
@@ -1397,6 +1406,19 @@ impl Guard {
         phy: Option<PhyModel>,
         model: NativeModel,
     ) -> R<Self> {
+        Self::build_native_eht(secured, fault, name, sources, phy, model, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn build_native_eht(
+        secured: bool,
+        fault: Fault,
+        name: Option<&'static str>,
+        sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
+        phy: Option<PhyModel>,
+        model: NativeModel,
+        eht: Option<eht_tests::Model>,
+    ) -> R<Self> {
         let NativeModel {
             receive_model,
             tx_model,
@@ -1427,6 +1449,11 @@ impl Guard {
         if six.is_some() {
             versions.extend_from_slice(&[0xc, 4, 1, 0]);
         }
+        if eht.is_some() && api89.is_none() && bz.is_none() {
+            // Actual Sc core103 ALIVE7 notification; omitted by the old
+            // deliberately post-ready station-only command inventory.
+            versions.extend_from_slice(&[1, 0, 99, 7]);
+        }
         if api89.is_none() && bz.is_none() {
             if let Some(tx) = &tx_model {
                 versions.extend_from_slice(&[0, 2, 0, tx.version]);
@@ -1453,6 +1480,12 @@ impl Guard {
             tx_amsdu_tests::image(&versions, tx_model.as_ref())?
         };
         receive_model.capability(&mut authored);
+        if let Some(eht) = eht {
+            if bz.is_none() && api89.is_none() {
+                model::native_station_identity(&mut hardware, 0xe340, 0x480, eht.radio())?;
+            }
+            eht.pnvm_image(&mut authored, bz.map_or(0x48, |_| 0x46));
+        }
         if six.is_some() {
             if six.is_some_and(|six| !six.api59) {
                 // A factual API89 fixture may already carry API59. Remove
@@ -1487,6 +1520,9 @@ impl Guard {
         if api89.is_some() || bz.is_some() {
             hardware.prepare_station_profile(&parsed)?;
         }
+        if let Some(eht) = eht {
+            model::eht_boot(&mut hardware, &parsed, eht.subsystem, &eht.alive())?;
+        }
         if let Some((firmware, pnvm)) = sources {
             let parsed = super::super::parse_ucode(&firmware.bytes)
                 .map_err(|_| "Sc source fixture parse")?;
@@ -1495,6 +1531,9 @@ impl Guard {
                 "Sc source fixture executable/command table mismatch",
             )?;
             model::firmware_profile(&mut hardware, &parsed)?;
+            if let Some(eht) = eht {
+                model::eht_boot(&mut hardware, &parsed, eht.subsystem, &eht.alive())?;
+            }
             hardware.bind_sources(firmware, Some(pnvm))?;
         }
         Device::validate_station_profile(&hardware)?;
@@ -1552,6 +1591,7 @@ impl Guard {
             mcc_caps_override: None,
             mcc_permissions: None,
             six,
+            eht,
         });
         let configured = run(Device::configure(&mut hardware, OWN), || wire.service());
         let nvm = match configured {
@@ -2584,3 +2624,5 @@ kernel_test_in!(
 
 #[path = "bz_station_tests.rs"]
 mod bz_station_tests;
+#[path = "sc_eht_native_tests.rs"]
+mod eht_tests;

@@ -9,6 +9,7 @@ pub(super) struct Mcc {
     pub country: [u8; 2],
     pub etsi_5ghz: bool,
     pub he_allowed: bool,
+    pub eht_allowed: bool,
     pub widths: super::gen3_wire::Widths,
 }
 impl Mcc {
@@ -22,6 +23,7 @@ impl Mcc {
             country: native.country,
             etsi_5ghz: native.etsi_5ghz,
             he_allowed: native.he,
+            eht_allowed: native.eht,
             widths: native.widths,
         })
     }

@@ -72,6 +72,7 @@ pub struct Connection {
     management_pn: u64,
     key_history: super::sc_security::KeyHistory,
     he: Option<super::sc_he::Profile>,
+    eht: Option<alloc::sync::Arc<super::sc_eht::Profile>>,
     six: Option<alloc::sync::Arc<super::six_ghz_station::Profile>>,
     tx_amsdu: super::sc_tx_amsdu::Limits,
     amsdu_memory: Option<super::Gen2SharedMemory>,
@@ -177,6 +178,7 @@ impl Connection {
             management_pn: 0,
             key_history: super::sc_security::KeyHistory::default(),
             he: None,
+            eht: None,
             six: None,
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
             amsdu_memory: None,
@@ -206,6 +208,7 @@ impl Connection {
                 country: *b"US",
                 etsi_5ghz: false,
                 he_allowed: false,
+                eht_allowed: false,
                 widths: super::gen3_wire::Widths {
                     forty: true,
                     eighty: true,
@@ -283,6 +286,7 @@ impl Connection {
     ) -> Result<Self, &'static str> {
         //6GHz admission precedes even receive-queue I/O. MVM API59 and
         // AP-power API1 are source facts, never inferred from the channel.
+        local_phy.eht &= hw.eht_supported();
         let six_preflight = if beacon.band == super::native_band::Band::Six {
             if !hw.band_in_rx_supported()
                 || !super::sc_he::native_supported(hw)
@@ -362,6 +366,7 @@ impl Connection {
         {
             local_phy.he = false;
         }
+        local_phy.eht &= local_phy.he && permissions.eht_allowed && hw.eht_supported();
         if local_phy != original_local {
             profile = super::sc_security::Profile::negotiate(&beacon, local, &auth, local_phy)?;
         }
@@ -398,14 +403,19 @@ impl Connection {
             profile = super::sc_security::Profile::negotiate(&beacon, local, &auth, local_phy)?;
         }
         let rates = if six.is_some() {
-            super::rates::Rates::parse_six(&beacon.information_elements, true)?
+            super::rates::Rates::parse_six_eht(
+                &beacon.information_elements,
+                true,
+                six.as_ref().is_some_and(|six| six.plan.eht().is_some()),
+            )?
         } else {
-            super::rates::Rates::parse_for_profiles(
+            super::rates::Rates::parse_for_native_profiles(
                 &beacon.information_elements,
                 beacon.channel,
                 phy.mode,
                 profile.sae.as_ref().is_some_and(|join| join.h2e()),
                 he_offer.is_some(),
+                he_offer.is_some_and(|offer| offer.eht().is_some()),
             )?
         };
         let max_power = if let Some(six) = &six {
@@ -589,6 +599,7 @@ impl Connection {
             management_pn: 0,
             key_history: super::sc_security::KeyHistory::default(),
             he: None,
+            eht: None,
             six,
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
             amsdu_memory: None,
@@ -676,6 +687,11 @@ impl Connection {
             request.extend_from_slice(&[255, capability.len() as u8]);
             request.extend_from_slice(&capability);
         }
+        if let Some(eht) = he_offer.as_ref().and_then(|offer| offer.eht()) {
+            let capability = eht.local_capability();
+            request.extend_from_slice(&[255, capability.len() as u8]);
+            request.extend_from_slice(&capability);
+        }
         this.sequence = this.sequence.wrapping_add(1);
         this.check_six_pending(hw)?;
         hw.transmit(management_queue, &request, 24, this.rate())
@@ -703,6 +719,14 @@ impl Connection {
                 six.plan.peer_capability().sm_ps() == 0,
                 super::sc_he::rates_version(hw).ok_or("6GHz native HE rate ABI changed")?,
             )?);
+            if let Some(eht) = six.plan.eht() {
+                this.eht = Some(super::sc_eht::Profile::new(
+                    *eht,
+                    eht,
+                    this.he.as_ref().unwrap(),
+                    six.plan.peer_capability().sm_ps() == 0,
+                )?);
+            }
         } else {
             this.phy = this.phy.confirm(
                 local_phy,
@@ -735,6 +759,16 @@ impl Connection {
                     (negotiated.ht().peer_capability() >> 2) & 3 == 0,
                     super::sc_he::rates_version(hw).ok_or("MLD HE rate ABI changed")?,
                 )?);
+                if let Some(eht) = negotiated.eht() {
+                    this.eht = Some(super::sc_eht::Profile::new(
+                        *eht,
+                        offer
+                            .eht()
+                            .ok_or("MLD response invented an unoffered EHT profile")?,
+                        this.he.as_ref().unwrap(),
+                        (negotiated.ht().peer_capability() >> 2) & 3 == 0,
+                    )?);
+                }
             }
         }
         this.qos = permissions.limit_qos_band(
@@ -774,14 +808,19 @@ impl Connection {
         }
         // Recheck membership selectors after a response downgrades PHY.
         this.rates = if this.six.is_some() {
-            super::rates::Rates::parse_six(&this.beacon.information_elements, true)?
+            super::rates::Rates::parse_six_eht(
+                &this.beacon.information_elements,
+                true,
+                this.eht.is_some(),
+            )?
         } else {
-            super::rates::Rates::parse_for_profiles(
+            super::rates::Rates::parse_for_native_profiles(
                 &this.beacon.information_elements,
                 this.beacon.channel,
                 this.phy.mode,
                 profile.sae.as_ref().is_some_and(|join| join.h2e()),
                 this.he.is_some(),
+                this.eht.is_some(),
             )?
         };
         let mut phy_command = station_api::phy_channel(
@@ -831,11 +870,17 @@ impl Connection {
         if let Some(he) = this.he {
             he.apply_sta(&mut peer);
         }
+        if let Some(eht) = &this.eht {
+            eht.apply_sta(&mut peer);
+        }
         put32(&mut peer, 36, u32::from(this.pmf_negotiated));
         hw.station_peer(&peer).await?;
         let mut mac = station_api::mac(2, local, Some(response.aid));
         if let Some(he) = this.he {
             he.apply_mac(&mut mac);
+        }
+        if let Some(eht) = &this.eht {
+            eht.apply_mac(&mut mac);
         }
         hw.command(3, 8, &mac).await?;
         let mut tlc = this.rates.tlc(
@@ -852,6 +897,9 @@ impl Connection {
         this.phy.apply_tlc(&mut tlc);
         if let Some(he) = this.he {
             he.apply_tlc(&mut tlc)?;
+        }
+        if let Some(eht) = &this.eht {
+            eht.apply_tlc(&mut tlc);
         }
         hw.station_tlc(&tlc).await?;
         // The response-refined native span/power is the handshake's owner;
@@ -877,7 +925,8 @@ impl Connection {
                 hw.rf_policy_validity()?,
             )?
             .with_he(this.he.is_some())?
-        };
+        }
+        .with_eht(this.eht.is_some())?;
         if secure {
             let deadline = narf_time::Deadline::after_ms(8000);
             while !this.security.as_ref().unwrap().complete() {
@@ -1769,9 +1818,14 @@ impl Connection {
             return true;
         }
         if frame.len() < 24
-            || self.six.is_some() && !matches!((mpdu.rate_n_flags >> 8) & 7, 1 | 4)
+            || self.six.is_some() && !matches!((mpdu.rate_n_flags >> 8) & 7, 1 | 4 | 5)
             || !self.phy.admits_wide_rx(self.local_phy, mpdu.rate_n_flags)
-            || (mpdu.rate_n_flags >> 8) & 7 >= 4
+            || (mpdu.rate_n_flags >> 8) & 7 >= 5
+                && self
+                    .eht
+                    .as_ref()
+                    .is_none_or(|eht| !eht.admits_rx_rate(mpdu.rate_n_flags))
+            || (mpdu.rate_n_flags >> 8) & 7 == 4
                 && self
                     .he
                     .is_none_or(|he| !he.admits_rx_rate(mpdu.rate_n_flags))
@@ -1848,6 +1902,12 @@ impl Connection {
                             self.qos.is_some(),
                         )? != self.phy
                             || self.he.is_some_and(|he| !he.matches(ies))
+                            || self.eht.as_ref().is_some_and(|eht| {
+                                !eht.matches(
+                                    ies,
+                                    self.he.as_ref().unwrap().negotiation.peer_capability(),
+                                )
+                            })
                         {
                             self.authorized = false;
                             return Err("AP changed PHY operation; reassociation required");

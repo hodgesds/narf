@@ -171,18 +171,23 @@ pub fn register_pci_driver() {
 /// its uncertain DMA forever), end the binding generation and stop PCI
 /// decoding. Synchronous and never awaits: the caller context is unknown.
 fn remove(device: BusDevice, cap: Cap<BusDeviceCap, Write>) {
-    let bound = FIRMWARE_BINDING
-        .lock()
-        .as_ref()
-        .is_some_and(|(bound, _)| bound.addr == device.addr);
-    if !bound {
-        return;
-    }
+    remove_expected(device, cap, None);
+}
+
+fn remove_expected(device: BusDevice, cap: Cap<BusDeviceCap, Write>, expected: Option<u64>) {
     // Close discovery first: no claim or probe of this generation may race
     // the teardown, and every stale owner now fails its generation check.
     let retired_generation = {
         let mut controller = CONTROLLER.lock();
-        *FIRMWARE_BINDING.lock() = None;
+        let mut binding = FIRMWARE_BINDING.lock();
+        if !binding
+            .as_ref()
+            .is_some_and(|(bound, _)| bound.addr == device.addr)
+            || expected.is_some_and(|expected| generation() != expected)
+        {
+            return;
+        }
+        *binding = None;
         *controller = None;
         GENERATION.fetch_add(1, Ordering::AcqRel)
     };
@@ -214,6 +219,17 @@ fn remove(device: BusDevice, cap: Cap<BusDeviceCap, Write>) {
 /// PCI probe entry. Called by the bus dispatch layer when one of our
 /// registered (vendor, device) pairs is enumerated.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    if narf_bus::driver_match::module_pci_driver_registered(device.id.vendor, device.id.device) {
+        return Err(narf_bus::ProbeError::NotForThisDriver);
+    }
+    probe_with_policy(device, cap, true)
+}
+
+fn probe_with_policy(
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+    reprovision: bool,
+) -> Result<(), narf_bus::ProbeError> {
     cap.check_live()
         .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     if FIRMWARE_BINDING
@@ -297,7 +313,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     }
     // A reprobe after the boot-time firmware initcall starts provisioning
     // itself (Linux queues mt7921_init_work from every probe).
-    super::firmware_transport::provision_after_reprobe();
+    if reprovision {
+        super::firmware_transport::provision_after_reprobe();
+    }
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(did)),
@@ -314,6 +332,36 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         "  mt7921: discovery complete; firmware startup deferred until firmware scan"
     );
     Ok(())
+}
+
+/// Loadable frontend discovery uses the exact existing bus probe cap. It may
+/// not alias a built-in binding, and firmware starts only from its retained
+/// INITIALIZE operation. No module-supplied address manufactures a PCI grant.
+pub(crate) fn module_discover(
+    device: BusDevice,
+    cap: Cap<BusDeviceCap, Write>,
+) -> Result<u64, i32> {
+    if is_probed() || FIRMWARE_BINDING.lock().is_some() {
+        return Err(-16);
+    }
+    probe_with_policy(device, cap, false).map_err(|_| -5)?;
+    let binding = *FIRMWARE_BINDING.lock();
+    if !binding.is_some_and(|(bound, authority)| {
+        bound.addr == device.addr && authority.slot() == cap.slot()
+    }) {
+        return Err(-19);
+    }
+    Ok(generation())
+}
+
+pub(crate) fn module_generation_current(expected: u64) -> bool {
+    expected & 1 != 0 && generation() == expected
+}
+
+/// Close only this exact generation. The established remove path withdraws
+/// publication first and either proves retirement or retains uncertain DMA.
+pub(crate) fn module_remove(device: BusDevice, cap: Cap<BusDeviceCap, Write>, expected: u64) {
+    remove_expected(device, cap, Some(expected));
 }
 
 /// Stage-0 + Stage-1: BAR0 map, chip-ID read, driver-own latch,

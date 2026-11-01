@@ -631,6 +631,7 @@ pub struct Hardware {
     /// The actual installed6GHz AP power/HE snapshot. This constraint
     /// gate is checked after native credit waits at every TX publication.
     six_tx_profile: Option<alloc::sync::Arc<super::six_ghz_station::Profile>>,
+    eht_source: Option<super::sc_eht::Source>,
     bios_versions: Vec<u8>,
     platform_power: platform_power::State,
     shared_memory: smem::State,
@@ -746,6 +747,7 @@ impl Hardware {
             band_in_rx: parsed.api.api_changes[1] & (1 << 27) != 0,
             scan_fixed_antenna: parsed.api.has_capability(111),
             six_tx_profile: None,
+            eht_source: None,
             bios_versions: parsed.api.bios_commands.unwrap_or(&[]).to_vec(),
             platform_power: platform_power::State::default(),
             shared_memory: smem::State::new(parsed),
@@ -1065,6 +1067,7 @@ impl Hardware {
     }
     async fn finish_boot(&mut self, parsed: &ParsedUcode<'_>) -> Result<[u8; 6], &'static str> {
         use super::regs::*;
+        self.eht_source = None;
         let alive = self.wait_notification(0, 1, 2000).await?;
         let alive_version = self
             .version(0, 1)
@@ -1105,6 +1108,7 @@ impl Hardware {
                 return Err("PNVM initialization failed");
             }
         }
+        self.retain_eht_boot(parsed, &alive.payload)?;
         if self.format == rx_rfh::CompletionFormat::Qu || self.is_mvm89() {
             // MVM unified image: allow firmware to populate NVM, then signal
             // completion. Do not send MLD's separate PHY configuration flow.

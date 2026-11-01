@@ -7,9 +7,9 @@
 //!
 //! The real driver in [`mt7921`] (L1 remap, MCU framing, WFDMA rings, firmware
 //! download, the [`iface`] `WirelessNetIface` scaffold) compiles only for the
-//! built-in build. The `module` build registers through the
-//! `narf_register_pci_driver` KSYMTAB export (registration-only until the
-//! wireless datapath ABI lands).
+//! permanent host build. The `module` build owns probe/service/control
+//! handles and a domain-gated poller through the versioned copy-mode C ABI;
+//! native MCU/WFDMA execution remains in that permanent host.
 //!
 //! ## Hardware validation is gated
 //!
@@ -25,6 +25,11 @@
 extern crate alloc;
 
 use narf_driver_macros::narf_driver;
+
+pub mod module_protocol;
+
+#[cfg(feature = "builtin")]
+mod module_host;
 
 #[cfg(feature = "builtin")]
 pub mod mt7921;
@@ -54,13 +59,21 @@ narf_driver! {
         author: "narf",
         description: "MediaTek CONNAC2 Wi-Fi (MT7921/MT7922/MT7961/MT7920)",
         target_domain: "net",
+        required_caps: "BusDevice:Write,NetIface:Write",
     },
     register: do_register,
 }
 
 #[cfg(feature = "builtin")]
 fn do_register() {
+    module_host::register();
     mt7921::register();
+}
+
+#[cfg(feature = "module")]
+#[unsafe(no_mangle)]
+pub extern "C" fn narf_module_exit() {
+    module_probe::exit();
 }
 
 #[cfg(feature = "module")]

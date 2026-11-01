@@ -98,7 +98,6 @@ pub(super) fn prepare(
     firmware: Option<&super::mld_regulatory::Mcc>,
 ) -> Result<(super::sc_security::Profile, Arc<Profile>), &'static str> {
     forbid_legacy(&beacon.information_elements)?;
-    super::rates::Rates::parse_six(&beacon.information_elements, true)?;
     let channel = Channel::six(beacon.channel)
         .filter(|ch| beacon.band == ch.band)
         .ok_or("6GHz association has no explicit native channel")?;
@@ -118,6 +117,8 @@ pub(super) fn prepare(
         };
     let rule =
         rule(domain, channel, nvm_flags, firmware).ok_or("6GHz host/NVM/MCC channel prohibited")?;
+    let mut source_phy = local;
+    source_phy.eht &= firmware.is_none_or(|mcc| mcc.eht_allowed);
     let local = SixGhzLocal::new(
         super::sc_he::local_six(local)?,
         // Actual shared HE source profile: min spacing4, A-MPDU exp3,
@@ -126,6 +127,13 @@ pub(super) fn prepare(
         rule,
     )
     .map_err(|_| "invalid native6GHz local HE profile")?;
+    let local = if source_phy.eht {
+        local
+            .with_eht(super::sc_eht::local(source_phy, None)?)
+            .map_err(|_| "invalid native6GHz local EHT profile")?
+    } else {
+        local
+    };
     let mode = match auth {
         AuthMethod::Wpa3Sae { .. } => SecurityMode::Wpa3Sae {
             pwe: association::SaePwe::HashToElement,
@@ -157,10 +165,14 @@ pub(super) fn prepare(
     if selected.width() != SixGhzWidth::Twenty
         || announced.channel.width != association::phy::Width::Twenty
         || selected.channel().discontiguous
-        || selected.eht().is_some()
     {
         return Err("native6GHz owner currently requires an AP20/STA20 HE span");
     }
+    super::rates::Rates::parse_six_eht(
+        &beacon.information_elements,
+        true,
+        selected.eht().is_some(),
+    )?;
     let power = super::six_ghz_power::Constraints::parse(
         selected.power_type(),
         &beacon.information_elements,
@@ -187,6 +199,11 @@ impl Profile {
         let capability = self.plan.he().local_capability();
         out.extend_from_slice(&[255, capability.len() as u8]);
         out.extend_from_slice(&capability);
+        if let Some(eht) = self.plan.eht() {
+            let capability = eht.local_capability();
+            out.extend_from_slice(&[255, capability.len() as u8]);
+            out.extend_from_slice(&capability);
+        }
         out.extend_from_slice(&self.plan.local_capability().element());
         out.extend_from_slice(&[
             255,
@@ -200,7 +217,7 @@ impl Profile {
     #[inline(never)]
     pub fn confirm(&self, ies: &[u8]) -> Result<(), &'static str> {
         forbid_legacy(ies)?;
-        super::rates::Rates::parse_six(ies, true)?;
+        super::rates::Rates::parse_six_eht(ies, true, self.plan.eht().is_some())?;
         let actual = six_ghz::admit(ies, self.channel().number)
             .map_err(|_| "6GHz response omitted HE/band/operation facts")?;
         if actual.he_capability != *self.plan.he().peer_capability()
@@ -208,6 +225,10 @@ impl Profile {
             || actual.capability != self.plan.peer_capability()
             || actual.operation != *self.plan.operation()
             || super::six_ghz_power::Constraints::parse(self.power_type(), ies)? != self.power
+            || self
+                .plan
+                .eht()
+                .is_some_and(|eht| !super::sc_eht::matches(eht, ies, &actual.he_capability))
         {
             return Err("6GHz AP changed HE/channel/power facts; reassociation required");
         }

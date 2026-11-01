@@ -143,6 +143,21 @@ Per-symbol CRCs still apply — they catch the harder case where the
 kernel ABI hash matches but a single subsystem's signature
 changed.
 
+The copy-mode wireless additions are `narf_wireless_open`,
+`narf_wireless_submit`, `narf_wireless_poll`, `narf_wireless_cancel` and
+`narf_wireless_close`. They preserve all older export signatures and use
+the same CRC/whole-table hash machinery. Each requires the existing
+`NetIface` manifest declaration; runtime authority still comes from the
+invoking module's exact current PCI probe context. Protocol payloads have
+their own explicit family/version and bounded little-endian records; no
+Rust trait, firmware view, DMA pointer or future crosses this ABI.
+See [the datapath contract](DATAPATH_ABI_DESIGN.md#wireless-copy-mode-host-services)
+for completion, cancellation and unload ownership.
+The exit hook now saves/sets/restores the same execution-owner context as
+probe/poller gates, so owner-scoped cleanup addresses the exiting module's
+existing resources. State/refcount/domain admission is unchanged; mandatory
+bus teardown still supplies cleanup when an exit hook omits it.
+
 ## Where module memory lives
 
 Physical provenance is irrelevant — `module_text::alloc` takes ordinary

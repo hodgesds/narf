@@ -4,10 +4,14 @@ use super::*;
 use core::sync::atomic::AtomicUsize;
 #[path = "ht40_composition_tests.rs"]
 mod ht40_tests;
+#[path = "protection_composition_tests.rs"]
+mod protection_tests;
 #[path = "rx_amsdu_tests.rs"]
 mod rx_amsdu_tests;
 #[path = "sgi20_tests.rs"]
 mod sgi20_tests;
+#[path = "tracking_composition_tests.rs"]
+mod tracking_tests;
 fn check(f: impl FnOnce() -> Result<(), &'static str>) -> TestResult {
     f().map_or_else(TestResult::Fail, |()| TestResult::Pass)
 }

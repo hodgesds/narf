@@ -341,6 +341,22 @@ fn widths() -> Result<(), &'static str> {
         ch.width == SixGhzWidth::OneSixty && ch.center == 47 && ch.center_mhz == 6185,
         "160MHz channel"
     );
+    for (maximum, expected_center) in [
+        (SixGhzWidth::Twenty, 37),
+        (SixGhzWidth::Forty, 35),
+        (SixGhzWidth::Eighty, 39),
+    ] {
+        let limited = me.clone().with_max_width(maximum);
+        let capped =
+            prepare(&he160, SAE_H2E, &limited).map_err(|_| "HE explicit native width ceiling")?;
+        let capped = capped.six_ghz().ok_or("HE capped plan absent")?;
+        check!(
+            capped.width() == maximum
+                && capped.channel().center == expected_center
+                && capped.he().width() == maximum.phy_width(),
+            "HE ceiling relabelled a wider channel"
+        );
+    }
     // A station without HE160 narrows to the primary 80MHz.
     let plan = prepare(&he160, SAE_H2E, &local(0x04, false, RegFlags::empty()))
         .map_err(|_| "160MHz AP refused by an 80MHz station")?;
@@ -404,6 +420,25 @@ fn eht_plan() -> Result<(), &'static str> {
     let e = six.eht().ok_or("EHT not negotiated")?;
     check!(e.width320() && e.tx_max_nss()[0] == 2, "EHT 320 facts");
     check!(six.he().width() == Width::OneSixty, "HE width under EHT320");
+    for (maximum, center) in [
+        (SixGhzWidth::Forty, 35),
+        (SixGhzWidth::Eighty, 39),
+        (SixGhzWidth::OneSixty, 47),
+    ] {
+        let limited = me.clone().with_max_width(maximum);
+        let capped =
+            prepare(&bss, SAE_H2E, &limited).map_err(|_| "EHT explicit native width ceiling")?;
+        let capped = capped.six_ghz().ok_or("EHT capped plan absent")?;
+        check!(
+            capped.width() == maximum
+                && capped.channel().center == center
+                && capped.he().width() == maximum.phy_width()
+                && capped
+                    .eht()
+                    .is_some_and(|eht| !eht.width320() && eht.width() == maximum.phy_width()),
+            "EHT ceiling retained wide selection or relabelled channel"
+        );
+    }
     let order: Vec<_> = request_ids(&plan)
         .iter()
         .filter_map(|(_, ext, _)| *ext)

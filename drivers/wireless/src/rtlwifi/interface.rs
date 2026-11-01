@@ -16,7 +16,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::{
@@ -75,6 +75,7 @@ pub(crate) struct Device<I: Port<Buffer = M>, M: Memory, E: Environment> {
     bssid: AtomicU64,
     ht: AtomicBool,
     ht40: AtomicBool,
+    rts_threshold: AtomicU32,
     rx: Arc<IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
     leisure: IrqSafeSpinLock<Leisure>,
@@ -195,6 +196,9 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     }
 }
 impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'static> Device<I, M, E> {
+    pub(crate) fn configured_rts_threshold(&self) -> Option<u16> {
+        u16::try_from(self.rts_threshold.load(Ordering::Acquire)).ok()
+    }
     fn commit_close(&self, _publication: narf_lib::sync::IrqSafeSpinLockGuard<'_, ()>) {
         self.admission.closed.store(true, Ordering::Release);
         self.ht.store(false, Ordering::Release);
@@ -232,6 +236,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             bssid: AtomicU64::new(0),
             ht: AtomicBool::new(false),
             ht40: AtomicBool::new(false),
+            rts_threshold: AtomicU32::new(u32::MAX),
             rx: Arc::new(IrqSafeSpinLock::new(Some(consumer))),
             tx: IrqSafeSpinLock::new(Some(producer)),
             leisure: IrqSafeSpinLock::new(Leisure::default()),
@@ -614,6 +619,35 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     pub(crate) fn removed_for_test(&self) -> bool {
         self.removed.load(Ordering::Acquire)
     }
+    /// Thermal source watchdog; an unavailable/revoked qualification never
+    /// substitutes a default gain curve and a failed transition closes carrier.
+    pub(super) async fn gain_tracking(&self) {
+        let mut storage = self.prepared.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            return;
+        };
+        if self.admission.closed.load(Ordering::Acquire) {
+            return;
+        }
+        if owner.track_station_gain(&self.environment).await.is_err() {
+            owner.abort_station();
+            self.close();
+        }
+    }
+    pub(crate) fn thermal_tracking_request(
+        &self,
+        firmware: super::firmware_transport::Identity,
+    ) -> Result<super::ThermalTrackingRequest, Error> {
+        let storage = self.prepared.try_lock().ok_or(Error::Busy)?;
+        storage
+            .as_ref()
+            .ok_or(Error::State)?
+            .station_tracking_request(firmware, &self.environment)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn factory_for_test(&self) -> &Factory {
+        &self.factory
+    }
     /// `rtl88e_dm_watchdog` RA step: refresh the firmware rate mask from
     /// the smoothed RX PWDB. A failed H2C aborts the station (the next
     /// service pass reports it like every other terminal hardware error).
@@ -812,6 +846,30 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
 impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'static> WirelessNetIface
     for Device<I, M, E>
 {
+    fn rts_threshold(&self) -> Option<u32> {
+        (!self.removed.load(Ordering::Acquire)).then(|| self.rts_threshold.load(Ordering::Acquire))
+    }
+    fn set_rts_threshold(&self, threshold: u32) -> Result<(), i32> {
+        if threshold != u32::MAX && threshold > 2347 {
+            return Err(-22); // EINVAL, cfg80211 maximum MPDU threshold.
+        }
+        if self.removed.load(Ordering::Acquire) {
+            return Err(-19); // ENODEV.
+        }
+        // Same owner -> publication order as ordinary TX. No await or
+        // interrupt-disabling lock surrounds the regular owner lock.
+        let storage = self.prepared.try_lock().ok_or(-16)?; // EBUSY.
+        let owner = storage.as_ref().ok_or(-16)?;
+        owner
+            .admit_station_rts_threshold(threshold != u32::MAX, &self.environment)
+            .map_err(|_| -95)?; // EOPNOTSUPP: no current exact NERT program.
+        let _publication = self.admission.publication.lock();
+        if self.removed.load(Ordering::Acquire) {
+            return Err(-19);
+        }
+        self.rts_threshold.store(threshold, Ordering::Release);
+        Ok(())
+    }
     fn supports_handshake_offload(&self) -> bool {
         true
     }
@@ -1242,6 +1300,56 @@ impl Environment for NativeEnvironment {
         )
         .map_err(Error::Radio)
     }
+    fn rts_threshold(&self) -> Option<u16> {
+        self.device
+            .lock()
+            .upgrade()
+            .and_then(|d| d.configured_rts_threshold())
+    }
+    fn protection(
+        &self,
+        base: Arc<super::channel_power::Calibration>,
+        ht: Option<Arc<super::ht::Grant>>,
+    ) -> Result<Option<Arc<super::protection::Grant>>, Error> {
+        let channel = self
+            .device
+            .lock()
+            .upgrade()
+            .ok_or(Error::State)?
+            .lifecycle
+            .channel
+            .load(Ordering::Acquire);
+        super::protection::Grant::registered(
+            base,
+            self.firmware().identity().ok_or(Error::State)?,
+            channel,
+            ht,
+        )
+        .map_err(Error::Radio)
+    }
+    fn tracking(
+        &self,
+        base: Arc<super::channel_power::Calibration>,
+        ht: Option<Arc<super::ht::Grant>>,
+        protection: Option<Arc<super::protection::Grant>>,
+    ) -> Result<Option<Arc<super::tracking::Grant>>, Error> {
+        let channel = self
+            .device
+            .lock()
+            .upgrade()
+            .ok_or(Error::State)?
+            .lifecycle
+            .channel
+            .load(Ordering::Acquire);
+        super::tracking::Grant::registered(
+            base,
+            self.firmware().identity().ok_or(Error::State)?,
+            channel,
+            ht,
+            protection,
+        )
+        .map_err(Error::Radio)
+    }
     fn ht40(
         &self,
         base: Arc<super::channel_power::Calibration>,
@@ -1439,6 +1547,7 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
             let signal = device.environment.interrupt();
             let seen = signal.as_ref().map(|s| s.count());
             device.drain();
+            device.gain_tracking().await;
             device.power_save(FW_LPS.load(Ordering::Acquire)).await;
             device.rate_adaptive().await;
             match (signal, seen) {

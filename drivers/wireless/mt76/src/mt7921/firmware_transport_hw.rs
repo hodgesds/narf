@@ -1302,6 +1302,36 @@ impl Transport {
         self.session.backend.check()?;
         self.session.firmware.p2p_profile()
     }
+
+    pub(crate) fn module_firmware_chunk(
+        &self,
+        image: u8,
+        offset: usize,
+        len: usize,
+    ) -> Result<Vec<u8>, Error> {
+        self.session.backend.check()?;
+        if !crate::mt7921::pci::module_generation_current(self.generation) {
+            return Err(Error::DeviceGone);
+        }
+        let bytes = match image {
+            0 => &self.session.firmware.patch,
+            1 => &self.session.firmware.ram,
+            _ => return Err(Error::Bounds),
+        };
+        if len == 0 || len > crate::module_protocol::MAX_FIRMWARE_CHUNK || offset > bytes.len() {
+            return Err(Error::Bounds);
+        }
+        let end = offset.saturating_add(len).min(bytes.len());
+        let mut reply = Vec::with_capacity(40 + end - offset);
+        reply.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        reply.extend_from_slice(&(offset as u32).to_le_bytes());
+        let mut digest = narf_crypto::sha256::Sha256::new();
+        digest.update(bytes);
+        reply.extend_from_slice(&digest.finalize());
+        reply.extend_from_slice(&bytes[offset..end]);
+        self.session.backend.check()?;
+        Ok(reply)
+    }
     pub(crate) async fn run_p2p_request(
         &mut self,
         iface: alloc::sync::Weak<crate::iface::p2p::P2pDeviceIface>,

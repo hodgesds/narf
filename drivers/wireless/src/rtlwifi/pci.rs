@@ -89,6 +89,43 @@ impl RtlwifiDevice {
             super::ht::request_on_channel(&base, firmware, channel)
         })
     }
+    /// Exact retained full-program thermal qualification request. This is
+    /// provisioning metadata and grants no gain, calibration or RF authority.
+    pub fn thermal_tracking_request(
+        &self,
+    ) -> Result<super::ThermalTrackingRequest, super::channel_power::Error> {
+        let firmware = self
+            .current_firmware()
+            .and_then(|f| f.identity())
+            .ok_or(super::channel_power::Error::Identity)?;
+        self.native
+            .as_ref()
+            .ok_or(super::channel_power::Error::Identity)?
+            .thermal_tracking_request(firmware)
+            .map_err(|_| super::channel_power::Error::Authority)
+    }
+    /// Pure request for the currently selected private NEPC/NEHT program.
+    /// Provision in Passive after initial service selected its actual profile.
+    pub fn rts_cts_request(&self) -> Result<super::ProtectionRequest, super::channel_power::Error> {
+        let native = self
+            .native
+            .as_ref()
+            .ok_or(super::channel_power::Error::Identity)?;
+        let storage = native
+            .prepared
+            .try_lock()
+            .ok_or(super::channel_power::Error::Authority)?;
+        let owner = storage
+            .as_ref()
+            .ok_or(super::channel_power::Error::Identity)?;
+        let firmware = self
+            .current_firmware()
+            .and_then(|f| f.identity())
+            .ok_or(super::channel_power::Error::Identity)?;
+        owner
+            .station_protection_request(firmware)
+            .map_err(|_| super::channel_power::Error::Authority)
+    }
     /// Exact full20/40 qualification request; no radio I/O or permission.
     pub fn ht40_request(
         &self,
@@ -181,6 +218,15 @@ impl Interface for RtlwifiDevice {
 
 #[async_trait::async_trait]
 impl WirelessNetIface for RtlwifiDevice {
+    fn rts_threshold(&self) -> Option<u32> {
+        self.native.as_ref()?.rts_threshold()
+    }
+    fn set_rts_threshold(&self, threshold: u32) -> Result<(), i32> {
+        self.native
+            .as_ref()
+            .ok_or(-95)?
+            .set_rts_threshold(threshold)
+    }
     fn supports_handshake_offload(&self) -> bool {
         self.native
             .as_ref()

@@ -176,6 +176,7 @@ pub(super) struct Program {
     applied_dbm: Arc<AtomicI8>,
     qos: Option<super::qos::Parameters>,
     he: bool,
+    eht: bool,
     band: super::native_band::Band,
     six: Option<(narf_wireless::reg::PowerType6Ghz, u32)>,
 }
@@ -201,6 +202,7 @@ impl Program {
             applied_dbm: Arc::new(AtomicI8::new(applied_dbm)),
             qos,
             he: false,
+            eht: false,
             band: super::native_band::Channel::legacy(primary)
                 .ok_or("Intel legacy policy channel absent")?
                 .band,
@@ -229,6 +231,7 @@ impl Program {
             applied_dbm: Arc::new(AtomicI8::new(applied_dbm)),
             qos,
             he: true,
+            eht: false,
             band: channel.band,
             six: Some((profile.power_type(), profile.nvm_flags)),
         };
@@ -240,6 +243,13 @@ impl Program {
             return Err("Intel native MCC prohibits HE operation");
         }
         self.he = he;
+        Ok(self)
+    }
+    pub fn with_eht(mut self, eht: bool) -> Result<Self, &'static str> {
+        if eht && (!self.he || !self.firmware.lock().eht_allowed) {
+            return Err("Intel native MCC prohibits EHT operation");
+        }
+        self.eht = eht;
         Ok(self)
     }
     pub fn power(&self) -> i8 {
@@ -314,6 +324,7 @@ impl Program {
         if domain.country_code != self.country
             || !firmware.widths.permits(self.width)
             || self.he && !firmware.he_allowed
+            || self.eht && !firmware.eht_allowed
             || self.country != *b"00" && !self.country.iter().all(u8::is_ascii_uppercase)
             || self
                 .allowed_power(domain, firmware)
@@ -386,6 +397,7 @@ mod tests {
                     country: *b"US",
                     etsi_5ghz: false,
                     he_allowed: false,
+                    eht_allowed: false,
                     widths: super::super::gen3_wire::Widths {
                         forty: true,
                         eighty: true,
@@ -464,6 +476,7 @@ mod tests {
                 country: *b"US",
                 etsi_5ghz: false,
                 he_allowed: true,
+                eht_allowed: false,
                 widths: super::super::gen3_wire::Widths {
                     forty: true,
                     eighty: true,

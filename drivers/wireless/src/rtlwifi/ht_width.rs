@@ -96,6 +96,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.station.retire_receive();
         self.phase = Hardware::Failed;
         let fence = target.clone();
+        let protection = self.station.protection.clone();
+        let tracking = self.station.tracking.as_ref().map(|s| s.grant.clone());
         let operation = async {
             self.io.authority(true, || Ok(()))?;
             let pause = self.io.read8(0x522)?;
@@ -182,7 +184,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             }
             Ok(())
         };
-        ht::wait(base, Some(fence), permission, environment, operation).await?;
+        ht::wait(
+            base,
+            Some(fence),
+            protection,
+            tracking,
+            permission,
+            environment,
+            operation,
+        )
+        .await?;
         self.phase = Hardware::Running;
         self.check_station_policy(environment)
     }

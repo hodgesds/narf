@@ -272,6 +272,17 @@ async fn finish_boot_keys() -> Result<(), Error> {
 /// requires the separate verified-reset recovery path, never a fresh claim.
 /// Repeating this on an initialized radio preserves its current station state.
 pub async fn provision_boot_radio() -> Result<RadioInfo, Error> {
+    if crate::module_host::owns_discovery() {
+        return Err(Error::Busy);
+    }
+    provision_radio_inner().await
+}
+
+pub(crate) async fn provision_module_radio_once() -> Result<RadioInfo, Error> {
+    provision_radio_inner().await
+}
+
+async fn provision_radio_inner() -> Result<RadioInfo, Error> {
     let Some(_provision) = PROVISION.try_lock() else {
         return Err(Error::Busy);
     };
@@ -344,6 +355,21 @@ pub fn boot_status() -> BootStatus {
             BootStatus::Retained(owner.state())
         }),
     }
+}
+
+/// Copy only the executable images already opened and validated for the
+/// current native transport. There is no arbitrary registry name or new
+/// registry authority at the module boundary.
+pub(crate) fn module_firmware_chunk(
+    image: u8,
+    offset: usize,
+    len: usize,
+) -> Result<Vec<u8>, Error> {
+    let owner = BOOT_OWNER.try_lock().ok_or(Error::Busy)?;
+    owner
+        .as_ref()
+        .ok_or(Error::DeviceGone)?
+        .module_firmware_chunk(image, offset, len)
 }
 
 /// Run a receive-only hardware diagnostic using the retained boot owner.
@@ -567,8 +593,8 @@ pub(crate) fn boot_refresh_receive_epoch(refresh: impl FnOnce(Option<u64>)) -> R
     refresh(epoch);
     Ok(())
 }
-/// Non-reentrant IPC publication only: no callback or await may occur while
-/// the native owner serializes this final epoch check with key replacement.
+/// Non-reentrant IPC/module-byte publication only: no reentrant driver/module
+/// callback or await may occur while this final epoch check holds key ownership.
 pub(crate) fn boot_receive_publish(epoch: u64, publish: impl FnOnce()) -> Result<bool, Error> {
     let Some(owner) = BOOT_OWNER.try_lock() else {
         return Ok(false);
@@ -782,6 +808,9 @@ pub(super) fn start_boot() -> narf_init::InitResult {
     use core::fmt::Write;
     use narf_init::InitResult;
     BOOT_STARTED.store(true, core::sync::atomic::Ordering::Release);
+    if crate::module_host::owns_discovery() {
+        return InitResult::Ok;
+    }
     // Before executor polling, regular Mutex (no IRQ spinlock) retained.
     // This future is self-waking and never depends on another executor task.
     let result = narf_scheduler::block_on_spin(provision_boot_radio());

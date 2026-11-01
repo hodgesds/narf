@@ -321,6 +321,7 @@ impl Device {
         }
         nvm.phy.he &= super::sc_he::native_supported(hardware);
         nvm.phy.native_rates = super::sc_he::rates_version(hardware).unwrap_or(0);
+        nvm.phy.eht = nvm.phy.he && hardware.eht_supported();
         if !nvm.phy.he || !hardware.band_in_rx_supported() {
             nvm.six_channels.clear();
         }
@@ -1415,7 +1416,7 @@ impl WirelessNetIface for Device {
                 ht_supported: self.phy.ht,
                 vht_supported: self.phy.vht,
                 he_supported: self.phy.he,
-                eht_supported: false,
+                eht_supported: self.phy.eht,
             },
         }
     }

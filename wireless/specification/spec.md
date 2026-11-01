@@ -380,6 +380,12 @@ station-side admission facts.
   mac80211 `ieee80211_put_he_6ghz_cap` with SMPS off (SM PS = disabled).
   `regulatory_connectivity()` is `ieee80211_put_reg_conn` (LPI valid/set, SP
   valid, SP set unless `NO_6GHZ_AFC_CLIENT`).
+  `with_max_width(SixGhzWidth)` optionally limits actual HE/EHT channel
+  selection for native host/NVM/MCC planning. Omission preserves the previous
+  selection; an explicit40MHz ceiling downgrades to the real primary40 block
+  even though the HE capability bit jointly describes40/80. It grants no
+  regulatory or transmit authority: the native owner must validate the full
+  selected channel's actual constituent rules before I/O/publication.
 - `eht::LocalEht::with_320mhz([u8; 3])` adds the 6 GHz 320 MHz set and PHY
   B1 (it needs the 160 MHz set). `width320()` reports it, and
   `phy::LocalPhy::with_eht` (2.4/5 GHz) refuses such a profile.

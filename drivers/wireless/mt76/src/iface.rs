@@ -335,6 +335,7 @@ impl Mt76Iface {
             |epoch| self.receive_current(epoch),
             |data| narf_net::iface::on_rx_frame_from(&self.name, data),
             |data, epoch| {
+                crate::module_host::capture_receive(&self.name, &data, epoch);
                 if let Ok(mut buffer) =
                     narf_io::alloc_coherent(data.len(), narf_lib::id::DomainId::DRIVER_0)
                 {
@@ -1385,6 +1386,12 @@ pub(crate) fn register_scan_iface_profile(
 
 static ACTIVE: IrqSafeSpinLock<Option<Arc<Mt76Iface>>> = IrqSafeSpinLock::new(None);
 
+/// The permanent module host retains this exact publication, never a name
+/// which could be reused by a later native binding.
+pub(crate) fn module_active() -> Option<Arc<Mt76Iface>> {
+    ACTIVE.lock().clone()
+}
+
 /// PCI removal (Linux `mt76_unregister_device` → `ieee80211_unregister_hw`):
 /// close carrier, report the lost link, and withdraw every publication of
 /// this generation's interface. Its service worker exits on its next turn.
@@ -1403,7 +1410,7 @@ pub(crate) fn remove_scan_iface() {
     narf_net::iface::unregister(&iface.name);
 }
 
-fn is_active(iface: &Arc<Mt76Iface>) -> bool {
+pub(crate) fn is_active(iface: &Arc<Mt76Iface>) -> bool {
     ACTIVE
         .lock()
         .as_ref()

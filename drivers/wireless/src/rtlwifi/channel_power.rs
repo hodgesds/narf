@@ -64,6 +64,13 @@ impl Permission {
     pub fn eirp_limit_qdbm(&self) -> i16 {
         self.eirp
     }
+    /// Internal operating point; the thermal owner must re-prove every
+    /// factory/preceding/new measured bound before using it for MMIO.
+    pub(super) fn with_gains(mut self, cck: [u8; 4], ofdm: [u8; 8]) -> Self {
+        self.cck = cck;
+        self.ofdm = ofdm;
+        self
+    }
     pub(super) fn check(&self, identity: [u8; 32]) -> Result<(), Error> {
         if self.identity == identity {
             Ok(())

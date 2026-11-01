@@ -11,6 +11,8 @@ pub struct Local {
     pub ht: bool,
     pub vht: bool,
     pub he: bool,
+    /// Exact boot RF/core103 source, independent of NVM HE SKU facts.
+    pub(super) eht: bool,
     pub tx_streams: u8,
     pub rx_streams: u8,
     /// Raw, valid 5GHz NVM_CHANNEL_160MHZ facts in station_api's channel
@@ -30,6 +32,7 @@ impl Local {
             ht: sku & 4 != 0,
             vht: sku & 12 == 12,
             he: sku & 20 == 20,
+            eht: false,
             tx_streams: tx.count_ones().min(limit) as u8,
             rx_streams: rx.count_ones().min(limit) as u8,
             width160_channels: 0,
@@ -520,7 +523,7 @@ impl Negotiated {
             return true;
         }
         let format = (rate >> 8) & 7;
-        if format <= 1 || format == 4 {
+        if format <= 1 || matches!(format, 4 | 5) {
             return true;
         }
         if !matches!(format, 2 | 3) || !matches!(local.native_rates, 2 | 3) {

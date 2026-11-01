@@ -1318,6 +1318,79 @@ coordinated release compilation/native execution remain pending. All prior
 NEHT/scan/power/recovery cases remain required; physical acceptance remains
 external.
 
+### Separately qualified RTL8188EE RTS/CTS (implemented, acceptance pending)
+
+The [NERT v1 contract](rtl8188ee-protection.md) separately qualifies RTS/CTS
+emissions over the exact current NEPC/firmware and measured NEHT payload.
+New full-program CCK/OFDM/MCS peak rows must cover the existing unchanged
+raw gains and automatic control retries; NERT cannot increase preceding
+channel/width/factory/EIRP rights. `RtlwifiDevice::rts_cts_request()` returns
+exact Passive-program provisioning metadata. No real measurements or
+signed board artifacts are supplied.
+
+Native ERP Use_Protection requests CTS-to-self for OFDM/MCS. The per-device
+`WirelessNetIface::set_rts_threshold(bytes)` implements nl80211 SET_WIPHY
+and selects RTS/CTS when DATA MPDU+FCS exceeds the threshold; `u32::MAX`
+preserves the source disabled default. GET_WIPHY reports the retained
+physical setting across station reset and owner recovery. RTS takes
+precedence, including threshold-selected EAPOL DATA. Source DW4 CTS11 or
+RTS12 uses initial OFDM24 rate8, with HW-RTS/RTS-short/BW/SC/STBC clear and
+existing RTS fallback limit15; ordinary DATA width/SC/GI/QoS/BA/CCMP and
+terminal OWN remain unchanged. Old NEFB stays excluded from protected DATA.
+Previously unsupported numeric HT protection modes remain refused.
+
+Exact current NERT sources enclose asynchronous M4/RA/peer polls, actual
+OWN/doorbell and copied IPC/stack publication. Live bound beacons update
+ERP, and ordinary DATA waits for actual receive-idle so a queued later ERP
+fact cannot be overtaken. Required missing, unknown or revoked qualification
+fails closed; it never silently removes protection. Threshold updates use
+the publication gate and mode is reread inside that gate. Failed/held DMA
+receipts remain retained.
+
+Six new native `drivers/wireless/rtlwifi/protection` regressions cover signed
+identity/known peaks, legacy/HT Open/WPA2 DHCP and exact IP, source RTS/CTS
+descriptors, thresholds/precedence, HT40 composition, pre-auth qualification
+refusal, live ERP and held M4 revocation. They await coordinated release
+compilation and final native execution. Physical measurements and RF
+control-frame/peer acceptance remain external.
+
+### Separately qualified RTL8188EE thermal tracking (implemented, acceptance pending)
+
+The [NETH v1 contract](rtl8188ee-tracking.md) adds the actual source EE
+thermal TXAGC path over the exact retained firmware/NEPC, measured NEHT
+and optional measured NERT payloads. `RtlwifiDevice::thermal_tracking_request()`
+returns the selected private provisioning recipe without radio I/O. It
+requires real factory thermal EFUSE0xba1–63; no erased default substitutes
+for board data. No real measurements or signed deployment assets are supplied.
+
+The actual RF42 trigger/read alternates on the2s watchdog, averages four
+nonzero readings, and follows the pinned source CCK swing-index delta for
+CCK/OFDM/MCS TXAGC. Per-rate signed arithmetic avoids packed-word wrap.
+Tracking reduces gains and restores them within the original qualified
+indices; every preceding factory/curve/antenna/current-policy bound still
+applies. A64-thermal x10-rate-family x64-gain signed full-program envelope
+covers calibration tones, all transition states, responses, sampling gaps
+and the full static antenna/supply/thermal operating range. All64 peaks must
+be known at an admitted index; no interpolation or sample creates authority.
+Old NEFB remains excluded from this combined program.
+
+Average drift>=8 repeats actual retained IQK/LCK. Native host receipts,
+full scheduler idle, all-queue pause and MAC TX/RX closure precede updates;
+RF18/RF0, saved BB/MAC/IQK, actual gains and reopened gates are read back.
+Per-poll/current-publication source checks remain in force. Peer/channel/
+key/PN/BA/DMA ownership and original OWN receipts are retained. Source loss,
+bad samples, unknown bounds, failed readbacks and cancelled RF waits fail
+closed. A subsequent peer selection restores the original current qualified
+program before selecting its new width and measurements.
+
+Six new native `drivers/wireless/rtlwifi/tracking` cases are written for signed
+full-dimensional identity/holes, Open/WPA2 legacy/HT DHCP/IP and exact gain
+reduction/restoration, plus/minus HT40 and response20 fallback with RTS,
+real IQK/LCK, failure closure and held M4/cancelled RF ownership. Compilation
+and native execution remain pending. Board measurement/signing and physical
+thermal/RF acceptance remain external. Linux EE supports dynamic antenna
+diversity, which stays a separate measured-antenna continuation.
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE
@@ -1349,7 +1422,7 @@ implemented and software-validated. Physical board qualification remains.
 | Complete source-matched per-chip power/reset qualification | RTL8188EE PCI enable prefix/flow implemented; other families remain incomplete |
 | Authenticated image/header selection and runtime firmware loading | RTL8188EE retained probe owner implemented; other profiles missing |
 | DMA allocation/publication/quiesce, IRQ ownership, H2C/C2H | RTL8188EE retained DMA32 rings/LLT, one-shot polled service, terminal host delivery, demonstrated awake/keepalive/reserved-page/JOIN mailbox and terminal close/retention implemented. MSI interrupt delivery with W1C recognition (polling fallback), card-disable DMA quiescence and fresh-generation reset/recovery are implemented and software-validated |
-| RF/BB tables, calibration, channel/power and rate control | RTL8188EE tables/retained1T IQK/LCK, static factory antenna, signed board/factory/regulatory legacy20 power, operational MAC and negotiated legacy peer/rate/filter integration implemented. Measured board envelope and silicon qualification remain; optional gain tracking is excluded by measured profile |
+| RF/BB tables, calibration, channel/power and rate control | RTL8188EE tables/retained1T IQK/LCK, static factory antenna, signed board/factory/regulatory legacy20 power, operational MAC and negotiated legacy peer/rate/filter integration implemented. Measured board envelope and silicon qualification remain; optional NETH thermal tracking is implemented pending native acceptance; the original NEPC profile still excludes tracking |
 | Scan, management RX/TX, authentication/association and WPA2 | Retained EE channel1 passive scan, Open MLME, shared WPA2/CCMP and exact M4 receipt implemented; Device/composition regressions pass native suites. Other matched chips remain missing |
 | Ethernet packet path and terminal TX completion ownership | EE same-owner native Device/Narf-Ring/stack and Open/WPA2 real-kernel DHCP/exact bidirectional IP fixtures pass software gates; actual board testing remains |
 | Multi-radio, removal, suspend/reset/recovery | RTL8188EE PCI removal (quiescence-gated DMA release), retained reset, system suspend and IPS implemented and software-validated; independent retained radios implemented and software-validated |
@@ -1358,7 +1431,7 @@ Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
 
 | Chip | Source hardware scope | Remaining native software |
 |---|---|---|
-| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. NEHT v2 additionally implements SGI20 and7935-byte reception; four native composed regressions pass on both architectures. Reset/recovery, system suspend and IPS are software-validated. HT20/40 NEHT v4 is implemented pending native acceptance above. Remaining software: antenna/gain tracking and RTS/CTS (PCIe ASPM, MSI delivery, fwlps leisure power save and DMA quiescence are implemented). Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
+| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. NEHT v2 additionally implements SGI20 and7935-byte reception; four native composed regressions pass on both architectures. Reset/recovery, system suspend and IPS are software-validated. HT20/40 NEHT v4 is implemented pending native acceptance above. RTS/CTS NERT continuation is implemented pending native acceptance above. Thermal TXAGC NETH continuation is implemented pending native acceptance above. Remaining software: dynamic antenna selection (PCIe ASPM, MSI delivery, fwlps leisure power save and DMA quiescence are implemented). Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
 | RTL8192CE family aliases / RTL8192EE |2.4GHz HT; CE aliases need exact RF-type qualification, including the8176/8188CE variant; EE is2T2R |Retained chip firmware/MAC/PHY/RF/calibration/power/packet/station chain, then full HT/QoS/lifecycle. The8179/8188EE HT path does not admit these IDs. |
 | RTL8192DE |Dual-band dual-MAC HT |Exact per-function reset/power/firmware/DMA/radio ownership and station chains, then bands/HT/QoS/lifecycle |
 | RTL8723AE/BE |2.4GHz1T1R HT with BT |Chip-specific retained chain, antenna/BT coexistence and HT/QoS/lifecycle |
@@ -1473,7 +1546,7 @@ runtimes remain separate from the retained RTL8188EE owner.
 | `dynamic_antenna_selection` | Dynamic antenna selection/tracking; blocked on per-antenna signed board measurements (NEPC binds one static factory antenna) |
 | `five_ghz_operation` | 5GHz band operation on RTL8192DE/RTL8821AE; blocked on the rtl8192de/rtl8821ae chip runtimes (RTL8188EE is 2.4GHz-only) |
 | `ht40` | Source-correct native HT20/40/secondary selection and signed NEHT v4 full-program qualification are implemented above, pending coordinated native acceptance. Existing NEHT v2/v3 remain20MHz. Measured per-device board data and physical acceptance remain external |
-| `rf_gain_tracking` | RF gain/power tracking; blocked on a thermal-indexed signed gain envelope (thermal power tracking moves gains outside the fixed NEPC/NEHT envelope) |
-| `rts_cts_protection` | RTS/CTS protection; blocked on signed qualification of RTS/CTS-to-self emissions (NEPC/NEHT exclude them) and TXD RTS fields driven by bss use_cts_prot/use_rts |
+| `rf_gain_tracking` | Native thermal TXAGC, actual IQK/LCK/restore and separate signed NETH full-dimensional qualification are implemented above, pending coordinated release compilation/native acceptance. Original NEPC/NEHT/NERT formats remain unchanged; measured board envelopes and physical thermal acceptance remain external |
+| `rts_cts_protection` | Native ERP CTS-to-self and per-device RTS threshold, exact source TXD fields and separate signed NERT full-program qualification are implemented above, pending compilation/native acceptance; physical board measurements remain external |
 | `vht` | VHT operation including TX/RX STBC on RTL8821AE; blocked on the rtl8821ae runtime |
 | `wowlan` | WoWLAN magic-packet/pattern wake on RTL8821AE/8812AE; blocked on the rtl8821ae runtime and system_suspend |

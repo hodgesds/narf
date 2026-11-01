@@ -106,6 +106,7 @@ pub mod runtime;
 pub mod rx;
 mod rx_multi;
 pub mod rx_rfh;
+mod sc_eht;
 mod sc_he;
 mod sc_security;
 mod sc_tx_amsdu;

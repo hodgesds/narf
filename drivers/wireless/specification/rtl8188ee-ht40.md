@@ -106,8 +106,9 @@ management/EAPOL/control stays20MHz on the actual primary subcarrier; the
 source direction chooses1 (primary lower) or2 (primary upper). Sequence,
 QoS/AC, software CCMP, BA/A-MPDU and terminal OWN receipts remain owned by
 the existing paths. The source HT40 INIT/LOW RA mask includes legacy OFDM6;
-SGI40, MCS32,2SS, RTS/CTS and old NEFB fallback under v4 are not advertised
-or granted. Native BW/SGI checks precede PN/BA mutation; a raw BW40 bit
+SGI40, MCS32,2SS, RTS/CTS and old NEFB fallback are not granted by NEHT v4.
+The separate [NERT continuation](rtl8188ee-protection.md) qualifies RTS/CTS;
+its source/gain checks must also remain current. Native BW/SGI checks precede PN/BA mutation; a raw BW40 bit
 cannot admit40 under an actual20 receiver.
 
 Eight cases under `drivers/wireless/rtlwifi/ht40` cover exact signed identity,
@@ -118,3 +119,8 @@ v4 revocation while DATA OWN is held; cancellation/source loss at actual
 RF HSSI waits; and actual BB readback/full32-bit scheduler terminal failure.
 Only hardware/MMIO/DMA and AP inputs are inert. These cases require root's
 coordinated native execution; they establish no physical RF measurements.
+
+The separate [NETH thermal continuation](rtl8188ee-tracking.md) can extend
+this exact measured v4 payload with bounded gain reductions and restoration,
+actual thermal IQK/LCK and a new signed full-program thermal envelope. NEHT
+v4 alone retains its original static gain program and unchanged recipe.

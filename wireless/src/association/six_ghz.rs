@@ -377,6 +377,7 @@ pub struct SixGhzLocal {
     capability: He6GhzCapability,
     eht: Option<LocalEht>,
     rule: RegRule,
+    max_width: Option<SixGhzWidth>,
 }
 impl SixGhzLocal {
     /// A zero band capability is refused: mac80211
@@ -391,6 +392,7 @@ impl SixGhzLocal {
             capability,
             eht: None,
             rule,
+            max_width: None,
         })
     }
     /// Opt into EHT, including 320MHz (`LocalEht::with_320mhz`). The set
@@ -401,6 +403,13 @@ impl SixGhzLocal {
         }
         self.eht = Some(eht);
         Ok(self)
+    }
+    /// Native planning ceiling (host/NVM/MCC limits), independent of the
+    /// capability's joint40/80 bit. This grants no regulatory TX authority.
+    /// The selected full channel still needs the native owner's actual rules.
+    pub fn with_max_width(mut self, width: SixGhzWidth) -> Self {
+        self.max_width = Some(width);
+        self
     }
     pub fn he(&self) -> &LocalHe {
         &self.he
@@ -634,12 +643,21 @@ pub fn plan(ies: &[u8], primary: u8, local: &SixGhzLocal) -> Result<SixGhzPlan, 
         center2: ap.discontiguous.then_some(bss.operation.ccfs1),
         center2_mhz: ap.center2_mhz,
     };
+    let he_width = match local.max_width {
+        Some(SixGhzWidth::Twenty) => Width::Twenty,
+        Some(SixGhzWidth::Forty) if ap.width != Width::Twenty => Width::Forty,
+        Some(SixGhzWidth::Eighty) if ap.width == Width::OneSixty => Width::Eighty,
+        _ => ap.width,
+    };
     let he = he::negotiate_6ghz(
         local.he,
         bss.he_capability,
         bss.he_operation,
-        ap.width,
-        ap.discontiguous,
+        he_width,
+        ap.discontiguous
+            && local
+                .max_width
+                .is_none_or(|width| width >= SixGhzWidth::OneSixty),
     )
     .ok_or(Error::UnsupportedRates)?;
     let he_operating = if he.discontiguous() {
@@ -680,7 +698,7 @@ pub fn plan(ies: &[u8], primary: u8, local: &SixGhzLocal) -> Result<SixGhzPlan, 
                     SixGhzWidth::Forty | SixGhzWidth::Eighty => both_he(0x04),
                     SixGhzWidth::Twenty => true,
                 };
-                if ok {
+                if ok && local.max_width.is_none_or(|maximum| width <= maximum) {
                     break;
                 }
                 width = width.narrower();

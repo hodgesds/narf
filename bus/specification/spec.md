@@ -479,6 +479,39 @@ the demux re-dispatches each recorded child vector through
 spurious. Legacy MSI collapses onto one entry, as the remap
 ignores message data — MSI's only per-vector signal.
 
+### 3.12 Loadable wireless host services
+
+`module_wireless::register(&'static Host)` installs a permanent family host,
+identified by family and protocol version. Bus retains no firmware/wireless
+Rust dependency. Its `open/submit/poll/cancel/close` adapters accept opaque
+module owner, exact probe-device token, session/operation ids and copied byte
+slices. The five `narf_wireless_*` C exports (§modules ABI) obtain owner from
+the module call gate, never from a module-supplied argument. Open borrows the
+existing device context's exact `Cap<BusDeviceCap, Write>`; every subsequent
+operation invokes that same current grant and checks its slot/generation
+against the current context. No address lookup claims an ungranted device.
+
+Session ids never repeat in a boot. One service may own a module/device at
+a time; a different owner, token, stale session, unsupported family/version,
+or request over4096 bytes fails before native work. Replies are bounded to
+65536 bytes, retained in host memory, and copied during a final current
+device invocation while exact service/context presence is held. Host hooks
+run outside bus registry locks. A kernel-only non-reentrant copy closure lets
+the native host hold its receive epoch through the actual module-byte copy.
+`-EAGAIN` is pending; `-ENOBUFS` reports required size and
+retains a completed reply. Cancellation requests never release native DMA.
+Closing remains reachable after revocation and removes the exact old session.
+Device teardown calls the permanent host's close hook before revoking the
+probe grant; the host must withdraw publication and retain uncertain native
+work/storage independently of unloadable module text.
+
+`driver_match::module_pci_driver_registered(vendor, device)` is a read-only
+exact-match query. MT76's permanent engine declines its ordinary built-in
+probe when an explicit module match exists, allowing that frontend to bind
+through its own probe grant. This query never detaches an existing binding.
+The permanent native host's discovery bypasses that preference check, while
+still refusing to alias an already bound radio.
+
 ## 4. Invariants & safety properties
 
 - The device registry is read-mostly and uses RCU for lookups.

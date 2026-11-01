@@ -12,7 +12,8 @@
 #     `cargo xtask build-module --package narf-drivers-wireless-mt76 \
 #        --no-default-features --features module`. The kernel crates drop from
 #     the graph; the driver registers through the `narf_register_pci_driver`
-#     KSYMTAB export (registration-only until the wireless datapath ABI lands).
+#     KSYMTAB exports. The loadable frontend owns service/control operation
+#     handles; the versioned copy-mode host retains native MCU/WFDMA execution.
 #
 # Named `mt76` (the upstream mt76-*family* driver) rather than `mt7921`, so the
 # sibling CONNAC2/CONNAC3 parts (MT7925/MT7996) can land in the same crate. The

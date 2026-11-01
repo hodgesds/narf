@@ -25,6 +25,7 @@ pub(super) struct Mcc {
     pub channels: Arc<[u32]>,
     pub etsi_5ghz: bool,
     pub he: bool,
+    pub eht: bool,
     pub widths: Widths,
 }
 impl Mcc {
@@ -84,6 +85,7 @@ impl Mcc {
                 .into(),
             etsi_5ghz: u16::from_le_bytes(bytes[geo_at..geo_at + 2].try_into().unwrap()) & 1 != 0,
             he: capability & (1 << if version == 8 { 13 } else { 10 }) == 0,
+            eht: version == 8 && capability & (1 << 8) == 0,
             widths,
         })
     }

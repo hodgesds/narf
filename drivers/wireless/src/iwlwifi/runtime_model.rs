@@ -346,6 +346,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         band_in_rx: false,
         scan_fixed_antenna: false,
         six_tx_profile: None,
+        eht_source: None,
         bios_versions: Vec::new(),
         platform_power: platform_power::State::default(),
         shared_memory: smem::State::default(),
@@ -408,6 +409,8 @@ pub(in crate::iwlwifi) fn firmware_profile(
     hardware.versions = parsed.api.commands.to_vec();
     hardware.band_in_rx = parsed.api.api_changes[1] & (1 << 27) != 0;
     hardware.scan_fixed_antenna = parsed.api.has_capability(111);
+    // A metadata inventory alone is not a new ALIVE/PNVM source proof.
+    hardware.eht_source = None;
     hardware.shared_memory = smem::State::new(parsed);
     hardware.receive_queues = rx_multi::State::new(parsed);
     Ok(())
@@ -455,6 +458,7 @@ pub(in crate::iwlwifi) fn restart(hardware: &mut Hardware) -> Result<(), &'stati
     commands.trace = trace;
     hardware.resources.commands = commands;
     hardware.platform_power = platform_power::State::default();
+    hardware.eht_source = None;
     hardware.shared_memory.reset();
     hardware.receive_queues.reset();
     // This is the fixture's terminal DMA-stop boundary. Retire observation
@@ -587,4 +591,20 @@ pub(in crate::iwlwifi) fn native_station_identity(
         .write(super::super::regs::CSR_HW_REV, revision);
     hardware.mmio.write(0x9c, radio);
     Ok(())
+}
+
+/// Post-ready source fixture: supplied ALIVE/PNVM bytes pass the same
+/// production RF/SKU parser as native boot. No feature boolean is injected.
+pub(in crate::iwlwifi) fn eht_boot(
+    hardware: &mut Hardware,
+    parsed: &ParsedUcode<'_>,
+    subsystem: u16,
+    alive: &[u8],
+) -> Result<(), &'static str> {
+    if hardware.device.id.vendor != 0xffff || hardware.armed || !hardware.resources.data.is_empty()
+    {
+        return Err("model EHT source on live/native owner");
+    }
+    hardware.device.id.subsystem_id = subsystem;
+    hardware.retain_eht_boot(parsed, alive)
 }

@@ -272,6 +272,13 @@ impl Port {
     pub(crate) fn word(&self, reg: u16) -> u32 {
         value(&self.0.lock(), reg)
     }
+    /// Independent inert hardware response, never a host RF programming path.
+    pub(crate) fn hardware_rf(&self, reg: u8, value: u32) {
+        self.0.lock().rf[usize::from(reg)] = value;
+    }
+    pub(crate) fn bad_calibration(&self) {
+        self.0.lock().mode = Mode::BadRx;
+    }
     pub(crate) fn rf(&self, reg: u8) -> u32 {
         self.0.lock().rf[usize::from(reg)]
     }

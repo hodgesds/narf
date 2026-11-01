@@ -303,15 +303,26 @@ management TX is accepted partial P2P scope; private ROC/NO_CCK, native
 client/GO contexts and the separately qualified RTL HT40 continuation retain
 their own gates. Physical qualification remains separate.
 
+**Source implementation recount 2026-10-31** (validation deferred by request):
+source-complete features now count as implemented before validation. The
+remaining ledger holds **101 `feature`** rows (100 driver, 1 shared),
+**31 `chip`** and **0 `unknown`**. Six implementations are tracked separately
+in `research/implemented-pending-validation.tsv`: Intel EHT for admitted
+Sc/Bz profiles; MT76 hosted loadable packet ABI; RTL8188EU HT40; and
+RTL8188EE HT40, RTS/CTS and RF gain tracking. This is an implementation
+count, not a claim that their deferred release/native gates passed. Partial
+6 GHz/P2P/MLO work remains in the remaining ledger. Full validation and the
+recorded ARM regression investigation remain outstanding.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 7 | Wider bands/widths and EHT/MLO; AP/P2P/WoW; exact admitted station/HE/TX A-MSDU and idle/associated periodic-scan profiles are software-validated |
+| iwlwifi | 6 | Wider bands/widths and MLO; AP/P2P/WoW; exact admitted station/HE/TX A-MSDU and idle/associated periodic-scan profiles are software-validated |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
-| mt76 | 5 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA and loadable packet ABI |
+| mt76 | 4 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA; hosted loadable packet ABI is implemented pending validation |
 | ath10k | 18 | 2.4-GHz HT40/coexistence, additional streams/TX STBC and VHT160/80+80, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload |
 | ath9k | 9 | Channel/retune and HT40/SGI40 profiles, factory selection, periodic calibration, larger TX aggregates and idle/station sleep; other chips are separate rows |
-| rtlwifi | 8 | Other matched chips, HT40/VHT, antenna/gain/coexistence and RTS/CTS |
-| rtl8xxxu | 4 | HT40, Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
+| rtlwifi | 5 | Other matched chips, VHT, dynamic antenna selection/coexistence and WoWLAN; HT40, RTS/CTS and gain tracking are implemented pending validation |
+| rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
 | rtw89 | 13 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW, periodic RF tracking/runtime LPS and multiple functions; other AX/BE chips are separate rows |
 | brcmfmac | 12 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
@@ -1070,6 +1081,15 @@ Eight native cases are written; source review and the quick release compile
 probe pass. Native execution is deferred to the combined validation pass.
 The family §3 and `rtl8188ee-ht40.md` specify the contract and external
 per-device qualification requirement.
+
+The admitted Sc/Bz EHT station, RTL8188EE RTS/CTS and conservative thermal
+gain tracking, and hosted MT76 module packet/control lifecycle are source-
+complete. Their immutable source snapshots retain actual native admission,
+current publication and terminal ownership. Optional unadvertised EHT
+capabilities and separate320/MLO work grant no additional operation. The
+MT76 native MCU/WFDMA engine remains permanently resident while the loadable
+frontend owns its real probe/service/control lifecycle. Full native, module
+and cross-architecture validation is deferred to the combined final pass.
 
 ## 4. Interaction with `narf-wireless`
 

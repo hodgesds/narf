@@ -106,6 +106,12 @@ fn local_phy(local: Local, channel: u8) -> Result<Option<LocalPhy>, &'static str
     } else {
         phy
     };
+    let phy = if local.eht && local.he {
+        phy.with_eht(super::sc_eht::local(local, Some(channel))?)
+            .map_err(|_| "MLD local EHT security profile invalid")?
+    } else {
+        phy
+    };
     Ok(Some(phy))
 }
 
@@ -114,7 +120,7 @@ impl Profile {
         beacon: &Beacon,
         own: [u8; 6],
         auth: &AuthMethod,
-        local: Local,
+        mut local: Local,
     ) -> Result<Self, &'static str> {
         let mode = match auth {
             AuthMethod::Open if !local.he && !local.supports160() => {
@@ -151,6 +157,9 @@ impl Profile {
             .as_deref()
             .and_then(narf_wireless::rsn::RsnIe::decode_body)
             .is_some_and(|rsn| rsn.rsn_capabilities & narf_wireless::rsn::RSN_CAP_MFP_CAPABLE != 0);
+        // Native EHT is admitted only with the actual WPA3/MFP hierarchy.
+        // Optional EHT on another security mode retains the genuine HE path.
+        local.eht &= local.he && peer_mfpc && matches!(auth, AuthMethod::Wpa3Sae { .. });
         let physical = match local_phy(local, beacon.channel) {
             Ok(physical) => physical,
             Err(_) if local.he => {

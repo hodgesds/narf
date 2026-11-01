@@ -85,8 +85,15 @@ pub(crate) struct Grant {
     curves: [[i16; 64]; 8],
     firmware: super::firmware_transport::Identity,
     wide: Option<wide::Qualification>,
+    measurement: [u8; 32],
 }
 impl Grant {
+    pub(super) fn measurement_digest(&self) -> [u8; 32] {
+        self.measurement
+    }
+    pub(super) fn program_limits(&self) -> (i16, i16) {
+        (self.ceiling, self.antenna)
+    }
     pub(super) fn matches(&self, base: &Arc<Calibration>) -> bool {
         Arc::ptr_eq(&self.base, base)
     }
@@ -172,6 +179,7 @@ impl Grant {
             curves,
             firmware,
             wide: None,
+            measurement: digest(b),
         };
         grant.invoke(|| Ok(()))?;
         Ok(grant)
@@ -265,6 +273,54 @@ impl Grant {
                     .ok_or(Error::Power(super::channel_power::Error::NoMeasuredGain))?;
             }
             Ok(indices)
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn check_selected(
+        &self,
+        domain: &RegulatoryDomain,
+        nominal: Permission,
+        selected: Permission,
+        mcs: [u8; 8],
+        limit: i16,
+        antenna: i16,
+    ) -> Result<(), Error> {
+        self.invoke(|| {
+            let maxima = self.gains(domain, nominal)?;
+            let limit = limit.min(self.ceiling).min(nominal.eirp_limit_qdbm()).min(
+                self.wide
+                    .as_ref()
+                    .map(|q| q.geometry.ceiling(domain))
+                    .transpose()?
+                    .unwrap_or(80),
+            );
+            let antenna = antenna.max(self.antenna);
+            if !self.base.within(selected, limit, antenna)
+                || mcs.iter().zip(maxima).any(|(g, max)| *g > max)
+            {
+                return Err(Error::Power(super::channel_power::Error::NoMeasuredGain));
+            }
+            for (row, gain) in self.curves.iter().zip(mcs) {
+                if row[usize::from(gain)] == UNKNOWN
+                    || i32::from(row[usize::from(gain)]) + i32::from(antenna) > i32::from(limit)
+                {
+                    return Err(Error::Power(super::channel_power::Error::NoMeasuredGain));
+                }
+            }
+            if let Some(wide) = &self.wide {
+                let limit = limit.min(wide.geometry.ceiling(domain)?);
+                let (cck, ofdm) = selected.gains();
+                for (row, indices) in wide.legacy.iter().zip([cck.as_slice(), ofdm.as_slice()]) {
+                    if indices.iter().any(|g| {
+                        row[usize::from(*g)] == UNKNOWN
+                            || i32::from(row[usize::from(*g)]) + i32::from(antenna)
+                                > i32::from(limit)
+                    }) {
+                        return Err(Error::Power(super::channel_power::Error::NoMeasuredGain));
+                    }
+                }
+            }
+            Ok(())
         })
     }
     pub(super) fn program(&self, io: &impl Io, indices: [u8; 8]) -> Result<(), Error> {
@@ -379,13 +435,15 @@ pub(crate) mod tests;
 pub(super) async fn wait<F: core::future::Future<Output = Result<(), Error>>>(
     base: Arc<Calibration>,
     ht: Option<Arc<Grant>>,
+    protection: Option<Arc<super::protection::Grant>>,
+    tracking: Option<Arc<super::tracking::Grant>>,
     permission: Permission,
     environment: &impl super::prepare::station::Environment,
     future: F,
 ) -> Result<(), Error> {
     let mut future = core::pin::pin!(future);
     core::future::poll_fn(|cx| {
-        let operation = || {
+        let mut operation = || {
             let domain = environment
                 .domain()
                 .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
@@ -399,14 +457,35 @@ pub(super) async fn wait<F: core::future::Future<Output = Result<(), Error>>>(
             if let Some(ht) = &ht {
                 ht.gains(&domain, permission)?;
             }
-            Ok(future.as_mut().poll(cx))
+            if let Some(protection) = &protection {
+                protection.check(&domain, permission)?;
+            }
+            if let Some(tracking) = &tracking {
+                tracking.check_sources(&domain, permission)?;
+                tracking.invoke(|| Ok(future.as_mut().poll(cx)))
+            } else {
+                Ok(future.as_mut().poll(cx))
+            }
+        };
+        let protected = || {
+            if let Some(protection) = &protection {
+                protection.invoke(operation)
+            } else {
+                operation()
+            }
         };
         let checked = if let Some(ht) = &ht {
-            ht.invoke(operation)
+            ht.invoke(protected)
         } else {
-            base.with_current(operation)
+            base.with_current(protected)
         };
         checked.unwrap_or_else(|e| core::task::Poll::Ready(Err(e)))
     })
     .await
+}
+
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    let mut h = narf_crypto::sha256::Sha256::new();
+    h.update(bytes);
+    h.finalize()
 }

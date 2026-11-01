@@ -154,6 +154,8 @@ struct DeviceEnvironment {
     ht: Option<HtFixtureSource>,
     ht_channel: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
     ht_wide: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
+    protection: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
+    tracking: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
     fallback_channel: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
     bus_power: IrqSafeSpinLock<Option<Arc<aspm::tests::Model>>>,
 }
@@ -282,6 +284,56 @@ impl Environment for DeviceEnvironment {
             })
             .transpose()
     }
+    fn rts_threshold(&self) -> Option<u16> {
+        self.device
+            .lock()
+            .upgrade()
+            .and_then(|d| d.configured_rts_threshold())
+    }
+    fn protection(
+        &self,
+        base: Arc<crate::rtlwifi::channel_power::Calibration>,
+        ht: Option<Arc<crate::rtlwifi::ht::Grant>>,
+    ) -> Result<Option<Arc<crate::rtlwifi::protection::Grant>>, StationError> {
+        let source = self.protection.lock();
+        let Some((channel, bytes, cap)) = source.as_ref() else {
+            return Ok(None);
+        };
+        crate::rtlwifi::protection::Grant::parse(
+            base,
+            self.firmware.lock().identity().ok_or(StationError::State)?,
+            *channel,
+            ht,
+            bytes,
+            Some([0x77; 32]),
+            *cap,
+        )
+        .map(|g| Some(Arc::new(g)))
+        .map_err(StationError::Radio)
+    }
+    fn tracking(
+        &self,
+        base: Arc<crate::rtlwifi::channel_power::Calibration>,
+        ht: Option<Arc<crate::rtlwifi::ht::Grant>>,
+        protection: Option<Arc<crate::rtlwifi::protection::Grant>>,
+    ) -> Result<Option<Arc<crate::rtlwifi::tracking::Grant>>, StationError> {
+        let source = self.tracking.lock();
+        let Some((channel, bytes, cap)) = source.as_ref() else {
+            return Ok(None);
+        };
+        crate::rtlwifi::tracking::Grant::parse(
+            base,
+            self.firmware.lock().identity().ok_or(StationError::State)?,
+            *channel,
+            ht,
+            protection,
+            bytes,
+            Some([0x77; 32]),
+            *cap,
+        )
+        .map(|g| Some(Arc::new(g)))
+        .map_err(StationError::Radio)
+    }
     fn ht40(
         &self,
         base: Arc<super::super::super::super::super::channel_power::Calibration>,
@@ -348,6 +400,9 @@ impl Environment for DeviceEnvironment {
             let beacon = {
                 let p = peer.lock();
                 let mut b = p.ap.beacon();
+                if p.erp {
+                    b.extend_from_slice(&[42, 1, 2]);
+                }
                 if let Some(w) = &p.wmm {
                     b.extend_from_slice(w);
                 }
@@ -402,6 +457,15 @@ impl Harness {
         policy: Option<Arc<narf_wireless::reg::db::Database>>,
         context: bool,
     ) -> Self {
+        Self::with_factory(protected, ht, policy, context, power::factory())
+    }
+    fn with_factory(
+        protected: bool,
+        ht: bool,
+        policy: Option<Arc<narf_wireless::reg::db::Database>>,
+        context: bool,
+        factory: crate::rtlwifi::efuse::Factory,
+    ) -> Self {
         if !context {
             assert!(ACTIVE_TEST.lock().is_none());
         }
@@ -410,7 +474,7 @@ impl Harness {
             static NEXT_DMA: AtomicU64 = AtomicU64::new(0x100000);
             packet.model.lock().next = NEXT_DMA.fetch_add(0x100000, Ordering::AcqRel);
         }
-        let factory = Arc::new(power::factory());
+        let factory = Arc::new(factory);
         packet.radio.w1c(0x20a);
         packet.radio.hardware_word(0x6c, 1 << 31);
         packet.radio.hardware_byte(3, 0xff);
@@ -510,6 +574,8 @@ impl Harness {
                 ht: ht_source.clone(),
                 ht_channel: IrqSafeSpinLock::new(None),
                 ht_wide: IrqSafeSpinLock::new(None),
+                protection: IrqSafeSpinLock::new(None),
+                tracking: IrqSafeSpinLock::new(None),
                 fallback_channel: IrqSafeSpinLock::new(None),
                 bus_power: IrqSafeSpinLock::new(None),
             },

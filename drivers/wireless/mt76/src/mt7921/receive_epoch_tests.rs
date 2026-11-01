@@ -100,6 +100,27 @@ fn reentrant() -> Result<(), &'static str> {
         let (mut session, bss, permission) = joined(secure)?;
         let step = batch(&mut session, secure)?;
         let old_epoch = step.receive_epoch;
+        // Retain a real native Ethernet copy behind an undersized module
+        // output, then rotate its actual peer/key generation below.
+        let module_bytes = step.received[0].clone();
+        let module_calls = Cell::new(0);
+        let module_copy = RefCell::new(Vec::new());
+        let mut copy = |bytes: &[u8]| {
+            module_calls.set(module_calls.get() + 1);
+            module_copy.borrow_mut().extend_from_slice(bytes);
+            Ok(())
+        };
+        if crate::module_host::publish_received(
+            &module_bytes,
+            old_epoch,
+            0,
+            &mut copy,
+            |epoch, publish| session.publish_receive(epoch, publish),
+        ) != (-105, module_bytes.len())
+            || module_calls.get() != 0
+        {
+            return Err("module short-buffer reply copied or consumed native data prematurely");
+        }
         let native = RefCell::new(session);
         let callbacks = Cell::new(0);
         let published = Cell::new(0);
@@ -158,6 +179,20 @@ fn reentrant() -> Result<(), &'static str> {
                 "old batch reached IPC/second callback or closed a replacement peer/key owner",
             );
         }
+        if crate::module_host::publish_received(
+            &module_bytes,
+            old_epoch,
+            module_bytes.len(),
+            &mut copy,
+            |epoch, publish| session.publish_receive(epoch, publish),
+        ) != (-19, 0)
+            || module_calls.get() != 0
+            || !module_copy.borrow().is_empty()
+        {
+            return Err(
+                "retained module reply crossed the real native peer/key retirement at actual copy",
+            );
+        }
         session
             .backend
             .packets
@@ -167,6 +202,18 @@ fn reentrant() -> Result<(), &'static str> {
             .map_err(|_| "new owner native data step")?;
         if fresh.received.len() != 1 || fresh.receive_epoch == old_epoch {
             return Err("fresh key/peer inherited an old batch or replay epoch");
+        }
+        if crate::module_host::publish_received(
+            &fresh.received[0],
+            fresh.receive_epoch,
+            fresh.received[0].len(),
+            &mut copy,
+            |epoch, publish| session.publish_receive(epoch, publish),
+        ) != (0, fresh.received[0].len())
+            || module_calls.get() != 1
+            || *module_copy.borrow() != fresh.received[0]
+        {
+            return Err("actual current native module copy lost its exact Ethernet payload");
         }
     }
     Ok(())

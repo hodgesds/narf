@@ -2136,10 +2136,17 @@ describe the remaining native paths.
   FM/WH core103 HE20/40/80 are software-validated at `62b62ea68`, including
   the source-correct MLD/MVM rate namespaces. All521 Intel native cases
   pass on both architectures. Physical qualification remains separate.
-- **eht, width_320, mlo.** Wi-Fi7 Bz/Sc still lacks native EHT capability,
-  link/STA/TLC maps,320MHz admission and multiple live link/peer owners.
-  Each needs the applicable native firmware contract and qualified radio
-  program. These features do not apply to AX200/AX201 hardware.
+- **eht (bounded source draft; acceptance pending).** §3.64 implements
+  single-link native EHT on actual admitted Sc/Bz FM/WH core103 sources,
+  with directional TLC/STA/RFH contracts and WPA3/PMF on existing native
+  spans, including6GHz20. The new source and six native compositions have
+  not yet passed coordinated compilation/native/release acceptance.
+  Optional EHT features and physical qualification remain continuations.
+- **width_320, mlo (open).** §3.64 keeps320MHz and multiple live link/peer
+  owners disabled.320 needs actual raw NVM/MCC/AP span and native extended
+  control-position/rate ownership. MLO needs shared ML association/security
+  and per-link native lifetime/control ownership. These features and EHT
+  do not apply to AX200/AX201 hardware.
 - **six_ghz (open; HE20 draft pending acceptance).** §3.63 implements
   explicit NVM/UMAC/RFH/cache/policy band identity and a shared6GHz
   JoinPlan for AP20/STA20 SAE-H2E/PMF on admitted Sc/API89/Bz profiles,
@@ -3813,3 +3820,82 @@ owned by `wireless/src/association/{six_ghz,he,sae_join}.rs`.
 - Linux `drivers/net/wireless/intel/iwlwifi/`
 - Intel product briefs for AX200, AX210, etc.
 - IEEE Std 802.11-2020.
+
+
+### 3.64 Bounded native single-link EHT continuation (acceptance pending)
+
+**Source contract.** `sc_eht` admits only the already supported Sc A0 and
+Bz B0 non-CDB core103 station producer/consumer profiles with actual FM/WH
+RF/stepping facts. EHT comes from Linux's RF configuration, independently
+of the HE NVM SKU and raw channel/stream facts: there is no invented NVM
+11be bit. GF, API89 and Gen2 do not acquire EHT through an enum, firmware
+name or a generic VHT/HE SKU. Actual WH subsystems0514/4514 select Linux's
+non-EHT AX221 configuration. Bandwidth-limited subsystem bit9 and exact
+Killer1730/1731/1735/1736 matches cap160; the more-specific full-bandwidth
+Killer matches retain their actual source limit. No320 capability is emitted
+by this continuation, including on a source whose hardware can support it.
+
+The native boot owner retains the actual ALIVE7/8 SKU after the existing
+PNVM selection and initialization boundary. A nonzero SKU must match all
+three PNVM words and the actual CSR MAC/RF selector. The FM reduced-SKU
+bit25 is retained independently of WH and PCI bandwidth limits; the bounded
+MCS0..11/no320 local profile remains valid on reduced FM. Zero SKU follows
+the existing boot contract without inventing a board-data requirement.
+Current source/capability and native RF policy proofs still govern I/O and
+publication. EHT admission rechecks the retained PCI/subsystem/CSR identity.
+
+**Native station path.** The shared non-MLO EHT plan is used only with
+WPA3 and actual PMF. Mandatory membership selector121 requires EHT; Open
+and WPA2 can retain a genuine HE path only when the peer does not mandate
+EHT. The native MCCv8 `REG_CAPA_V5_11BE_DISABLED` bit8 is separate from HE
+bit13. Initial and current copied regulatory programs preserve this fact,
+so a later EHT prohibition retires an EHT program even when HE remains legal.
+
+The bounded profile carries MCS0..11 and at most two streams on existing
+2.4/5GHz20/40/80/160 and AP20/STA20 six-GHz spans, with actual raw NVM and
+full MCC/host span checks retained from §§3.62–3.63. The station emits its
+actual EHT capability and keeps the original shared offer across response
+refinement. TLCv6 uses native EHT mode4, independently intersects local TX
+with AP RX in every <=80/160 slot, caps response changes by the original
+offer, and applies static-SMPS limits. The320 matrix stays zero. Actual
+negotiated HE coding flags remain applicable; optional EHT extra-LTF and
+beamforming promises remain absent.
+
+The response-bound MAC_CONFIGv3 also sets its byte-sized EHT support field
+at byte26, alongside actual HE at byte24; HE AP, UHR and reserved fields
+remain zero. The native fixture observes the complete52-byte payload and
+asserts those literal fields. TLC mode4 alone does not enable the MAC's
+EHT interpretation.
+
+STA_CONFIGv2 adds the actual EHT A-MPDU exponent extension and EHT packet
+extension thresholds. EHT PPE inherits absent RU widths within each NSS;
+missing EHT PPE uses HE thresholds with EHT nominal-padding handling,
+instead of treating an HE matrix as an EHT alias. PHY_CONTEXTv6 retains a
+zero puncture mask only for an unpunctured shared selection. LINK_CONFIGv8
+keeps the proven HE color/UORA/MU-EDCA facts; enum/MLD address fields do not
+create multi-link ownership. Original native rate-v3 EHT format5, width,
+NSS, MCS and coding/GI/LTF bounds are checked before PN/BA/reorder mutation.
+UHR,320 and unsupported extra-LTF/beamforming/duplicate forms are refused.
+Current bound AP EHT capability/operation changes require reassociation.
+
+**Written evidence; acceptance pending.** Six new cases in
+`drivers/wireless/iwlwifi/eht` compose native Sc/Bz FM/WH scan, SAE24/PMF,
+keys and encrypted DHCP with literal request/TLC/STA assertions; actual
+ALIVE/PNVM/SKU/RF/subsystem boundaries; security, MCC, missing-response and
+puncturing refusal; distinct directional width maps and response limits;
+EHT PPE inheritance; original RFH invalid-rate/same-PN behavior; and held
+STA/drop plus current-MCC copied-proof retirement. The source audit and
+pinned Linux file hashes are in `target/wifi-validation-evidence/`.
+Standalone formatting/static review has run. Coordinated compilation,
+both-architecture native execution, ordinary boots and release gates are
+pending; no physical Wi-Fi qualification is claimed.
+
+**Remaining continuations.**320MHz needs source-qualified NVM/MCC and all
+sixteen20MHz constituents, actual EHT operation/control-position/rate
+contracts and native6GHz wider power ownership. MLO needs Basic ML parse
+and association, MLD/link address and key/EAPOL scope, multiple retained
+PHY/LINK/STA/queue owners, per-link power/PN/reorder lifetimes and public
+control teardown semantics. Optional EHT4096QAM/MCS12–13, extra-LTF,
+beamforming and dynamic puncturing remain explicit follow-on scope. This
+source-complete admitted EHT profile is implemented with validation pending;
+`width_320` and `mlo` retain their separate implementation rows.

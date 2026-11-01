@@ -2,6 +2,41 @@
 use super::super::gen3_profile::Profile;
 use super::*;
 impl Hardware {
+    /// Called only after actual ALIVE and required PNVM initialization.
+    /// The post-ready RAM fixture exercises the identical parsed-source seam.
+    pub(super) fn retain_eht_boot(
+        &mut self,
+        parsed: &ParsedUcode<'_>,
+        alive: &[u8],
+    ) -> Result<(), &'static str> {
+        self.eht_source = if self.uses_mld_station_protocol()
+            && super::super::sc_he::native_supported(self)
+            && super::super::sc_he::rates_version(self) == Some(3)
+        {
+            super::super::sc_eht::Source::boot(
+                self.device.id.device,
+                self.device.id.subsystem_id,
+                self.mmio.read(super::super::regs::CSR_HW_REV),
+                self.mmio.read(0x9c),
+                parsed,
+                alive,
+            )?
+        } else {
+            None
+        };
+        Ok(())
+    }
+    pub(in crate::iwlwifi) fn eht_supported(&mut self) -> bool {
+        self.eht_source.is_some_and(|source| {
+            source.matches(
+                self.device.id.device,
+                self.device.id.subsystem_id,
+                self.mmio.read(super::super::regs::CSR_HW_REV),
+                self.mmio.read(0x9c),
+            )
+        }) && self.uses_mld_station_protocol()
+            && super::super::sc_he::rates_version(self) == Some(3)
+    }
     pub(in crate::iwlwifi) fn prepare_station_profile(
         &mut self,
         parsed: &ParsedUcode<'_>,

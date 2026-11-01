@@ -90,6 +90,7 @@ pub(super) struct State<M: Memory> {
     pub(super) qos: bool,
     pub(super) ht: bool,
     pub(super) width: Option<super::super::ht::Geometry>,
+    pub(super) protection: super::super::protection::Mode,
     /// HIMR/HIMRE/HSIMR currently carry the Linux 88EE masks.
     interrupts: bool,
     /// Firmware leisure power save (fw_current_inpsmode) is active.
@@ -116,6 +117,7 @@ impl<M: Memory> State<M> {
             qos: false,
             ht: false,
             width: None,
+            protection: super::super::protection::Mode::None,
             interrupts: false,
             leisure: false,
             rate_mask: None,
@@ -870,6 +872,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         {
             prefix[1] |= u32::from(index) << 16;
             prefix[4] &= !(1 << 10);
+        }
+        if frame[0] & 0x0c == 8 && frame[4] & 1 == 0 {
+            prefix[4] |= self.packet.protection.fields();
         }
         if let Some(g) = self.packet.width {
             prefix[4] |= if frame[0] == 0x88 && rate >= 12 {

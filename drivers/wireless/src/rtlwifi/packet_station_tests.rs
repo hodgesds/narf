@@ -132,6 +132,7 @@ pub(super) struct Peer {
     ht: Option<Vec<u8>>,
     response_ht: Option<Vec<u8>>,
     pub(super) ht40: bool,
+    erp: bool,
     controls: Vec<Vec<u8>>,
     hold_control: bool,
     probes: Vec<Vec<u8>>,
@@ -171,6 +172,7 @@ impl Peer {
             ht: None,
             response_ht: None,
             ht40: false,
+            erp: false,
             controls: Vec::new(),
             hold_control: false,
             probes: Vec::new(),
@@ -245,6 +247,9 @@ impl Peer {
                 response[35] |= 4;
                 response.extend_from_slice(ht);
             }
+            if self.erp {
+                response.extend_from_slice(&[42, 1, 2]);
+            }
             return Ok((vec![response], self.hold_probe));
         }
         if frame.len() < 24 || frame[4..10] != PEER || frame[10..16] != self.plan.station {
@@ -268,6 +273,9 @@ impl Peer {
                 .map_err(|_| "shared AP rejected real native MLME/EAPOL")?;
             for reply in &mut replies {
                 if reply.first() == Some(&0x10) {
+                    if self.erp {
+                        reply.extend_from_slice(&[42, 1, 2]);
+                    }
                     if let Some(parameters) = &self.wmm {
                         reply.extend_from_slice(parameters);
                     }

@@ -50,24 +50,32 @@ fn require(ok: bool, why: &'static str) -> Result<(), &'static str> {
         Err(why)
     }
 }
-struct Wide {
-    h: Harness,
+pub(super) struct Wide {
+    pub(super) h: Harness,
     g: Geometry,
     db: Arc<narf_wireless::reg::db::Database>,
     cap: Cap<FirmwareBlob, Read>,
 }
 impl Wide {
     #[inline(never)]
-    fn new(protected: bool, primary: u8, secondary: u8) -> Result<Self, &'static str> {
+    pub(super) fn new(protected: bool, primary: u8, secondary: u8) -> Result<Self, &'static str> {
+        Self::with_factory(protected, primary, secondary, power::factory())
+    }
+    pub(super) fn with_factory(
+        protected: bool,
+        primary: u8,
+        secondary: u8,
+        factory: crate::rtlwifi::efuse::Factory,
+    ) -> Result<Self, &'static str> {
         let g = Geometry::new(primary, secondary).map_err(|_| "EE40 geometry")?;
         let db = Arc::new(narf_wireless::reg::db::Database::new());
         db.install(domain());
-        let h = Harness::with_policy(protected, true, Some(db.clone()));
         let base = if primary == 1 {
-            power::calibration(&power::factory())
+            power::calibration(&factory)
         } else {
-            power::calibration_for_channel(&power::factory(), primary)
+            power::calibration_for_channel(&factory, primary)
         };
+        let h = Harness::with_factory(protected, true, Some(db.clone()), false, factory);
         let cap = Cap::bootstrap();
         *h.device.environment_for_test().ht_wide.lock() = Some((
             primary,
@@ -90,7 +98,7 @@ impl Wide {
         }
         Ok(Self { h, g, db, cap })
     }
-    fn join(&self) -> Result<(), &'static str> {
+    pub(super) fn join(&self) -> Result<(), &'static str> {
         complete(self.h.device.scan(ScanRequest {
             channels: vec![u32::from(self.g.primary())],
             frequencies_mhz: Vec::new(),

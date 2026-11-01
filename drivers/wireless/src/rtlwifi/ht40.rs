@@ -175,6 +175,7 @@ pub(super) fn parse(
         ceiling,
         curves: core::array::from_fn(|i| rows[i + 2]),
         firmware,
+        measurement: super::digest(b),
         wide: Some(Qualification {
             geometry: g,
             legacy: [rows[0], rows[1]],
