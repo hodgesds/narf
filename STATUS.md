@@ -1511,6 +1511,30 @@ wave introduces no aarch64-specific production code.
 The x86_64 production boot, both btrfs postflights, formatting, diff and final
 source-integrity checks pass.
 
+The sixth Intel checkpoint connects the supported i915 compatibility subset
+and LOAD_BALANCE contexts to live GuC cards through exact Xe-first ioctl
+routing, shared WB handles/reservations/syncobjs and native migration/lifetime
+ownership. WC/VRAM cannot inherit WB compatibility mappings or cache claims.
+Bounded MTL/Arrow primary panning uses integer source origins with unchanged
+visible geometry/stride/bandwidth, common DSB OFFSET/SURF arms, both hardware
+witnesses and complete console/reset restoration. BMG adds firmware-selected
+I1 power/current thresholds; DG2 adds PL1 intervals. Fresh readback, retained
+ceilings, fair shared PCODE transaction scheduling and no replay bound writes.
+GuC LFD export uses the same protected immutable snapshots with checked
+state/LIC/event/crash framing; lossless streaming remains open. Parallel queues,
+Gen12 direct flips, cursors and MERT cap lifting retain their multi-lane, GT,
+watermark and frequency/flush prerequisites. Broader software parity and
+Intel silicon/Mesa acceptance remain open.
+
+All 31 new fixtures pass on x86_64. Selected Intel/DRM/fb groups pass 832 unique
+tests with zero failures/skips; the repeated 230-test main group is excluded.
+GPU/fb target CI Clippy passes all three contexts on both architectures,
+all four host GPU vendor configurations pass all-target Clippy, and both
+targets pass debug/release compilation. aarch64 QEMU is intentionally omitted
+because this wave introduces no aarch64-specific production code. The x86_64
+production boot, both btrfs postflights, formatting, diff and final source-
+integrity checks pass.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

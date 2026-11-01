@@ -1,6 +1,7 @@
 //! DG2 PL1 controls. MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad
 //! xe_hwmon.c::{xe_hwmon_power_max_read,xe_hwmon_power_max_write,
-//! xe_hwmon_power_rated_max_read}, regs/xe_mchbar_regs.h. Only DG2 uses
+//! xe_hwmon_power_rated_max_read,xe_hwmon_power_max_interval_show,
+//! xe_hwmon_power_max_interval_store}, regs/xe_mchbar_regs.h. Only DG2 uses
 //! this direct register protocol; BMG's mailbox power-source switch is absent.
 
 use super::{Io, INTERVAL_NS, MAX_AGE_NS};
@@ -15,6 +16,7 @@ const PL1: u64 = 0x1459a0;
 const VALUE: u32 = 0x7fff;
 const ENABLE: u32 = 1 << 15;
 const MASK: u32 = VALUE | ENABLE;
+const TIME: u32 = 0x7f << 17;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Boot {
@@ -24,6 +26,7 @@ struct Boot {
 #[derive(Clone, Copy, Debug)]
 struct Observation {
     shift: u8,
+    time_shift: u8,
     min: u32,
     max: u32,
     rated: u32,
@@ -45,6 +48,7 @@ impl Observation {
         let rated = low & VALUE;
         (min != 0 && min <= max && rated != 0).then_some(Self {
             shift: (unit & 0xf) as u8,
+            time_shift: ((unit >> 16) & 0xf) as u8,
             min,
             max,
             rated,
@@ -56,6 +60,16 @@ impl Observation {
     }
     fn enabled(self) -> bool {
         self.pl1 & ENABLE != 0 && self.pl1 & VALUE != 0
+    }
+    fn interval(self, bits: u32) -> u64 {
+        let x = (bits >> 22) & 3;
+        let y = (bits >> 17) & 31;
+        (((4 | u64::from(x)) << y) * 1000) >> (self.time_shift + 2)
+    }
+    fn interval_max(self) -> u64 {
+        // Pinned xe_hwmon.c uses x=0,y=18: existing dGPU SKU MAX_WIN
+        // is unreliable. 256 seconds applies only to time unit shift10.
+        self.interval(18 << 17)
     }
     fn bounds(self, boot: Boot) -> Option<(u32, u32)> {
         let max = self.max.min(boot.ceiling);
@@ -81,7 +95,12 @@ enum Outcome {
 #[derive(Clone, Copy, Debug)]
 struct Request {
     id: u64,
-    raw: u32,
+    setting: Setting,
+}
+#[derive(Clone, Copy, Debug)]
+enum Setting {
+    Power(u32),
+    Interval { bits: u32, shift: u8 },
 }
 #[derive(Debug)]
 struct State {
@@ -183,15 +202,25 @@ impl Power {
             failure = Some(Failure::Access);
             if let (Some(observed), Some(boot)) = (observation, boot) {
                 failure = Some(Failure::Bounds);
-                if observed
+                let wanted = observed
                     .bounds(boot)
-                    .is_some_and(|(min, max)| (min..=max).contains(&request.raw))
-                    && self.current(epoch)
-                {
-                    // Preserve time window, clamp and all unrelated fields.
+                    .and_then(|(min, max)| match request.setting {
+                        Setting::Power(raw) if (min..=max).contains(&raw) => {
+                            Some((observed.pl1 & !MASK) | ENABLE | raw)
+                        }
+                        Setting::Interval { bits, shift }
+                            if shift == observed.time_shift
+                                && observed.interval(bits) != 0
+                                && observed.interval(bits) <= observed.interval_max() =>
+                        {
+                            Some((observed.pl1 & !TIME) | bits)
+                        }
+                        _ => None,
+                    });
+                if let Some(wanted) = wanted.filter(|_| self.current(epoch)) {
+                    // Preserve every field outside the selected value/window.
                     // The pinned DG2 source defines no PL1 lock bit. Refuse
                     // a non-sticking/locked write through exact readback.
-                    let wanted = (observed.pl1 & !MASK) | ENABLE | request.raw;
                     failure = Some(Failure::Access);
                     if io.write(PL1, wanted) {
                         if let Some(readback) = io.read(PL1) {
@@ -280,7 +309,55 @@ impl Power {
         }
         let id = state.next;
         state.next = id.checked_add(1).ok_or(FsError::Busy)?;
-        state.queued = Some(Request { id, raw });
+        state.queued = Some(Request {
+            id,
+            setting: Setting::Power(raw),
+        });
+        state.outcome = Outcome::Queued(id);
+        Ok(())
+    }
+    pub(super) fn store_interval(&self, bytes: &[u8], now: u64) -> Result<(), FsError> {
+        if !narf_filesystem::caller_capable(21) {
+            return Err(FsError::OperationNotPermitted);
+        }
+        let milliseconds = super::decimal(bytes)?;
+        let mut state = self.state.lock();
+        if !self.current(state.epoch) {
+            return Err(FsError::NoDevice);
+        }
+        if state.queued.is_some() || state.applying.is_some() {
+            return Err(FsError::Busy);
+        }
+        let observed = fresh(&state, now).ok_or(FsError::NoDevice)?;
+        observed
+            .bounds(state.boot.ok_or(FsError::Unsupported)?)
+            .ok_or(FsError::Unsupported)?;
+        if milliseconds == 0 || milliseconds > observed.interval_max() {
+            return Err(FsError::InvalidData);
+        }
+        // Exact pinned Xe algorithm: nearest hardware units plus one, then
+        // the 1.x * 2^y encoding (x has two fractional bits).
+        let units = milliseconds
+            .checked_shl(u32::from(observed.time_shift))
+            .and_then(|v| v.checked_add(500))
+            .map(|v| v / 1000)
+            .and_then(|v| v.checked_add(1))
+            .ok_or(FsError::InvalidData)?;
+        let y = units.ilog2();
+        let x = ((units - (1u64 << y)) << 2) >> y;
+        let bits = (x as u32) << 22 | y << 17;
+        if observed.interval(bits) == 0 || observed.interval(bits) > observed.interval_max() {
+            return Err(FsError::InvalidData);
+        }
+        let id = state.next;
+        state.next = id.checked_add(1).ok_or(FsError::Busy)?;
+        state.queued = Some(Request {
+            id,
+            setting: Setting::Interval {
+                bits,
+                shift: observed.time_shift,
+            },
+        });
         state.outcome = Outcome::Queued(id);
         Ok(())
     }
@@ -303,6 +380,9 @@ impl Power {
             return String::new();
         };
         let value = match attribute {
+            "power2_max_interval" => Some(observed.interval(observed.pl1)),
+            "power2_max_interval_min" => Some((1000u64 >> observed.time_shift).max(1)),
+            "power2_max_interval_max" => Some(observed.interval_max()),
             "power2_max" => Some(if observed.enabled() {
                 observed.microwatts((observed.pl1 & VALUE).clamp(observed.min, observed.max))
             } else {

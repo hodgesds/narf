@@ -52,6 +52,7 @@ pub const QUERY_GUC_SUBMISSION_VERSION: u64 = 7;
 pub const EXEC_RENDER: u64 = 1;
 pub const EXEC_BLT: u64 = 3;
 pub const CONTEXT_PARAM_ENGINES: u64 = 0xa;
+pub const CONTEXT_ENGINES_EXT_LOAD_BALANCE: u32 = 0;
 /// I915_ENGINE_CLASS_INVALID with I915_ENGINE_CLASS_INVALID_NONE: an empty
 /// engine-map slot.
 pub const ENGINE_INVALID: u16 = 0xffff;
@@ -67,6 +68,44 @@ pub const OBJECT_WRITE: u64 = 1 << 2;
 pub const OBJECT_SUPPORTS_48B: u64 = 1 << 3;
 pub const OBJECT_PINNED: u64 = 1 << 4;
 pub const OBJECT_PAD_TO_SIZE: u64 = 1 << 5;
+
+/// Exact wire encodings accepted alongside Xe on a production GuC card.
+/// Number-only routing is ambiguous (for example GETPARAM/QUEUE_CREATE).
+pub(crate) fn compatibility_ioctl(cmd: u32) -> bool {
+    matches!(
+        cmd,
+        GETPARAM
+            | GEM_BUSY
+            | GEM_THROTTLE
+            | GEM_CREATE
+            | GEM_CREATE_EXT
+            | GEM_PREAD
+            | GEM_PWRITE
+            | GEM_SET_DOMAIN
+            | GEM_SW_FINISH
+            | GEM_SET_TILING
+            | GEM_GET_TILING
+            | GEM_GET_APERTURE
+            | GEM_MMAP_GTT
+            | GEM_MMAP_OFFSET
+            | GEM_MADVISE
+            | GEM_EXECBUFFER2
+            | GEM_EXECBUFFER2_WR
+            | GEM_WAIT
+            | GEM_CONTEXT_CREATE
+            | GEM_CONTEXT_CREATE_EXT
+            | GEM_CONTEXT_DESTROY
+            | GEM_SET_CACHING
+            | GEM_GET_CACHING
+            | GET_RESET_STATS
+            | GEM_CONTEXT_GETPARAM
+            | GEM_CONTEXT_SETPARAM
+            | QUERY
+            | GEM_VM_CREATE
+            | GEM_VM_DESTROY
+            | GEM_CLOSE
+    )
+}
 
 /// Fixed little-endian wire accessors avoid Rust layout/padding in user copies.
 pub(crate) fn u32_at(bytes: &[u8], at: usize) -> u32 {

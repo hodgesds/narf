@@ -4570,14 +4570,23 @@ fn handle_obj_getproperties(
             };
             let crtc = &card.crtcs[crtc_idx as usize];
             let fb = crtc.primary_fb.and_then(|id| card.framebuffer(id).ok());
-            let width = fb
+            #[cfg(feature = "intel")]
+            let fixed_intel_view = card.intel_display;
+            #[cfg(not(feature = "intel"))]
+            let fixed_intel_view = false;
+            let source_width = fb
                 .map(|f| f.width)
                 .or_else(|| crtc.mode.map(|m| m.width))
                 .unwrap_or(0);
-            let height = fb
+            let source_height = fb
                 .map(|f| f.height)
                 .or_else(|| crtc.mode.map(|m| m.height))
                 .unwrap_or(0);
+            let (width, height) = if fixed_intel_view {
+                crtc.mode.map_or((0, 0), |mode| (mode.width, mode.height))
+            } else {
+                (source_width, source_height)
+            };
             let (props, values) = (
                 vec![
                     PLANE_TYPE_PROP_ID,
@@ -4605,8 +4614,8 @@ fn handle_obj_getproperties(
                     (crtc.y as u64) << 16,
                     (width as u64) << 16,
                     (height as u64) << 16,
-                    crtc.x as u64,
-                    crtc.y as u64,
+                    if fixed_intel_view { 0 } else { crtc.x as u64 },
+                    if fixed_intel_view { 0 } else { crtc.y as u64 },
                     width as u64,
                     height as u64,
                     // IN_FENCE_FD reads back as -1 (never a live fd),

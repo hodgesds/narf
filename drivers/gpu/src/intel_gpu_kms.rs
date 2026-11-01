@@ -258,6 +258,11 @@ struct Joint {
     staged: bool,
     completion: Option<crate::intel_gpu_scanout::Completion>,
 }
+struct PrimaryTarget {
+    object: Arc<GemObject>,
+    geometry: Geometry,
+    viewport: crate::intel_gpu_scanout::Viewport,
+}
 
 #[derive(Debug)]
 struct State<M: Platform> {
@@ -832,9 +837,17 @@ impl<M: Platform> Guard<'_, M> {
         &mut self,
         object: Arc<GemObject>,
         geometry: Geometry,
+        viewport: crate::intel_gpu_scanout::Viewport,
     ) -> Result<SurfaceId, FsError> {
         if let Some((current, id)) = &self.state.current {
-            if Arc::ptr_eq(current, &object) {
+            if Arc::ptr_eq(current, &object)
+                && self
+                    .state
+                    .presenter
+                    .as_ref()
+                    .expect("presenter")
+                    .matches_view(*id, geometry, viewport)
+            {
                 return Ok(*id);
             }
         }
@@ -842,7 +855,7 @@ impl<M: Platform> Guard<'_, M> {
             .presenter
             .as_mut()
             .expect("presenter")
-            .prepare(object, geometry)
+            .prepare_view(object, geometry, viewport)
             .map_err(scanout_error)
     }
     fn rollback_joint_before_arm(&mut self) -> Result<(), FsError> {
@@ -894,7 +907,7 @@ impl<M: Platform> Guard<'_, M> {
         self.finish_color().await?;
         self.finish_pending().await?;
         self.start().await?;
-        let id = self.prepare_surface(object.clone(), geometry)?;
+        let id = self.prepare_surface(object.clone(), geometry, Default::default())?;
         let ticket = self.ticket()?;
         // Record the new owner before arming. Cancellation never unpins it.
         self.state.pending = Some((object, id));
@@ -1114,6 +1127,7 @@ impl<M: Platform> Guard<'_, M> {
         &mut self,
         object: Arc<GemObject>,
         geometry: Geometry,
+        viewport: crate::intel_gpu_scanout::Viewport,
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
         timing: crate::intel_gpu_dsb::Timing,
@@ -1125,15 +1139,28 @@ impl<M: Platform> Guard<'_, M> {
         if !object.is_wc() || !object.scanout() || object.is_vram() || object.is_userptr() {
             return Err(FsError::Unsupported);
         }
-        self.color_transaction(coefficients, lut, Some(timing), Some((object, geometry)))
-            .await
+        let (_, _, extent) = viewport.layout(geometry).map_err(scanout_error)?;
+        if extent > object.size() {
+            return Err(FsError::InvalidData);
+        }
+        self.color_transaction(
+            coefficients,
+            lut,
+            Some(timing),
+            Some(PrimaryTarget {
+                object,
+                geometry,
+                viewport,
+            }),
+        )
+        .await
     }
     async fn color_transaction(
         &mut self,
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
         dsb_timing: Option<crate::intel_gpu_dsb::Timing>,
-        primary: Option<(Arc<GemObject>, Geometry)>,
+        primary: Option<PrimaryTarget>,
     ) -> Result<FlipStamp, FsError> {
         self.ownership_valid()?;
         self.finish_color().await?;
@@ -1186,9 +1213,14 @@ impl<M: Platform> Guard<'_, M> {
                     })?;
                     self.state.dsb = Some(dsb);
                 }
-                let surface = if let Some((object, geometry)) = &primary {
+                let surface = if let Some(PrimaryTarget {
+                    object,
+                    geometry,
+                    viewport,
+                }) = &primary
+                {
                     self.start().await?;
-                    let id = self.prepare_surface(object.clone(), *geometry)?;
+                    let id = self.prepare_surface(object.clone(), *geometry, *viewport)?;
                     let ticket = self.ticket()?;
                     self.state.pending = Some((object.clone(), id));
                     self.state.mixed_unpublished = true;
@@ -1215,7 +1247,7 @@ impl<M: Platform> Guard<'_, M> {
                     .expect("color owner")
                     .prepare_dsb(&self.device.platform, coefficients, lut.clone())?;
                 if let Some(surface) = surface {
-                    update.registers.push(surface);
+                    update.registers.extend(surface);
                 }
                 self.state.dsb_update = Some(update);
                 let state = &mut *self.state;

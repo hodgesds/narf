@@ -93,6 +93,10 @@ impl MmioWindow for Punit {
             self.writes.borrow_mut().push((offset, value));
             self.set(offset, value);
             if offset == 0x138124 {
+                if value == 0x8000_047c {
+                    self.set(0x138124, 1); // optional I1 unsupported, no data
+                    return;
+                }
                 let data = match value {
                     0x8000_047d => [0, 0], // no fans
                     0x8000_0025 => [0x5f69_646e, 97],
@@ -316,20 +320,39 @@ fn smoke_hwmon_bmg_pmt_known_sibling_loss_between_ticks_revokes_energy_immediate
     let monitor = monitor(BAR_LEN);
     let io = Punit::new();
     io.enable_pcode();
-    for now in [0, 10_000, 20_000, 30_000, 40_000, 50_000] {
+    // Drain fan/thermal/PL1 discovery and the independent optional I1
+    // refusal, so the next eligible control turn is the intended PL1 read.
+    for now in [0, 10_000, 20_000, 30_000, 40_000, 50_000, 70_000, 80_000] {
         monitor.service_mmio(7, now, &io, || true);
     }
-    assert_eq!(monitor.show("energy2_input", 60_000), "1000000\n");
+    assert_eq!(monitor.show("i1_status", 80_000), "failed 0 Status(1)\n");
+    assert_eq!(monitor.show("energy2_input", 80_000), "1000000\n");
     // Passive PCODE refresh posts at its actual1Hz deadline. Energy has a
     // fresh sample from this same tick; the reply then loses authority1ns later.
     let now = SECOND + 40_000;
     monitor.service_mmio(7, now, &io, || true);
+    assert_eq!(
+        io.writes
+            .borrow()
+            .iter()
+            .rev()
+            .find(|&&(offset, _)| offset == 0x138124)
+            .copied(),
+        Some((0x138124, 0x8001_087c)),
+        "loss injection must target the pending firmware-source PL1 read"
+    );
+    {
+        let state = monitor.state.lock();
+        assert!(state.mailbox.fault().is_none());
+        assert!(!state.mailbox.available(), "PL1 transfer was not pending");
+    }
     assert_eq!(monitor.show("energy1_input", now), "2000000\n");
     let mut checks = 0;
     monitor.service_mmio(7, now + 1, &io, || {
         checks += 1;
         checks < 2
     });
+    assert_eq!(checks, 2, "PL1 reply never reached the denied DATA read");
     assert_eq!(
         monitor.show("power2_max_status", now + 1),
         "failed 0 Access\n"

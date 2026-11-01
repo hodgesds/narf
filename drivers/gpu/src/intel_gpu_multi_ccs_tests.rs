@@ -375,3 +375,7 @@ mod dynamic {
 mod virtual_queues {
     include!("intel_gpu_virtual_queue_tests.rs");
 }
+
+mod i915_balance {
+    include!("intel_gpu_i915_balance_tests.rs");
+}

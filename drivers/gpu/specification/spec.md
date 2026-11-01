@@ -107,10 +107,12 @@ primary and render nodes; nested pointers use `IoctlContext`. Driver-private
 requests require the complete ioctl encoding (including direction and size).
 Generic DRM/KMS requests retain their existing dispatcher except VERSION:
 an execution-tested live backend reports its selected loader identity through
-fault-aware copies. Production GuC cards select native `xe`; legacy backends
-retain the i915 compatibility profile. The selection is fixed by the backend,
-independent of temporary suspend/loss readiness, so colliding ioctl numbers
-cannot be decoded under a different ABI. Internal routing remains `intel-gpu`.
+fault-aware copies. Production GuC cards identify as native `xe` and accept
+the explicit i915 compatibility subset below. Exact Xe encodings take
+precedence; only explicitly supported, noncolliding full i915 encodings reach
+the compatibility dispatcher. Unknown encodings never select an ABI by number
+alone. This routing is independent of temporary suspend/loss readiness.
+Legacy backends retain their i915 profile. Internal routing remains `intel-gpu`.
 
 #### Native Xe profile
 
@@ -328,8 +330,15 @@ can additionally select advertised COPY1/BCS8 and dense COMPUTE instances. CONTE
 (0xa) follows set_proto_ctx_engines: once per proto-context (EINVAL twice or
 after finalization), 8-byte header plus 4-byte class/instance entries (at most
 64), INVALID/INVALID_NONE holes, per-entry copy with ENOENT for absent engines
-before later faults, then the extension chain (load balance/bond/parallel
-NotImplemented, unknown EINVAL). Duplicate ENGINES create extensions are EINVAL
+before later faults, then a bounded extension chain. LOAD_BALANCE fills an
+INVALID hole with copied same-class, published dense logical siblings;
+duplicate siblings, mixed/unpublished engines and malformed reserved fields
+refuse before proto-map publication. An existing/out-of-range destination is
+checked before sibling-body copies. Zero siblings leave a hole. Each virtual
+slot uses the existing persistent GuC placement context, private physical-engine
+receipt and migration-aware retirement/watchdog ownership. Bonding/parallel
+remain NotImplemented; unknown extensions return EINVAL.
+Duplicate ENGINES create extensions are EINVAL
 before their copy; GETPARAM ENGINES is EINVAL. Each map slot is its own
 `UserContext`. Execbuffer's ring field indexes the map, or selects legacy
 DEFAULT/RENDER→RCS0 and BLT→BCS0; holes, out-of-range slots, BSD and VEBOX are
@@ -393,7 +402,15 @@ Secure execution, relocations and unsupported flags are refused.
 `read_submission` additionally copies explicit synchronization once;
 `address_space(format, pat_index)` constructs immutable private PPGTT
 tables retaining every referenced object; failed construction tears down all
-tables. An existing VM/engine is never changed by admission. The plan's WRITE
+tables. This compatibility planner has a single WB host PAT: WC and VRAM
+objects shared from Xe refuse before admission. VM-associated native BOs also
+refuse: their unique Xe VM restriction cannot be bypassed by private softpin
+tables. The WB-only compatibility
+MMAP_OFFSET and GET/SET_CACHING commands also refuse those native placements
+rather than claiming WB or successful retyping; Xe's mapping interface remains
+available. Shared WB handles, reservations and sync objects retain their
+existing identity across the exact-command ABI dispatcher. An existing
+VM/engine is never changed by admission. The plan's WRITE
 bit selects writable leaves in this restricted path. Async EXECBUFFER2 and its
 WR encoding copy the complete plan once, retain the per-open context, serialize
 same-context callers with an async Mutex, await the prior context fence and
@@ -980,6 +997,34 @@ Read-only `power2_rated_max`, `power2_max_default`, `power2_max_min`,
 ready, queued, applying, applied and failed requests.
 Missing/stale/closed/access-lost measurements read empty.
 
+DG2 also exposes CAP_SYS_ADMIN-gated `power2_max_interval` in milliseconds,
+with read-only `power2_max_interval_min`/`power2_max_interval_max`. Interval
+and PL1 writes share one request slot and `power2_max_status`. The owner
+freshly rechecks units, encodes the source's rounded 1.x*2^y time window,
+updates only bits23:17 and requires exact whole-register readback. Power,
+enable, clamp and all other fields are preserved. Nonzero requests and
+represented intervals must fit the source's x0/y18 maximum (256000 ms only
+with time-unit shift10). Sub-millisecond/zero representations refuse. Closing
+discards queued requests; no pending interval is replayed after activation.
+
+BMG additionally exposes the firmware-selected I1 threshold: `power1_crit`
+(card microWatts) or `curr2_crit` (package milliamps). Potential attributes are
+registered statically; incompatible/unavailable values and labels read empty,
+and incompatible stores return Unsupported. Matching `power1_label`/`curr2_label`
+and `*_crit_default`/`*_crit_min`/`*_crit_max` are read-only; `i1_status` reports
+asynchronous outcomes. The first valid nonzero mode/threshold is retained as
+a conservative ceiling, not a SKU guarantee. U10.6 values use nearest input
+quantization; the minimum exported reading is 15625 microWatts or 15 mA.
+Every store requires current CAP_SYS_ADMIN and a fresh observation, then
+queues a fresh READ_I1, data-only WRITE_I1 and exact mode/data readback through
+the existing shared PCODE owner. Firmware clamping or a changed mode is a
+failure, never silently accepted. Administrative transactions retain the port
+across their read/write/verify commands and give a queued peer first choice
+at completion; passive reads also rotate preference. Ambiguous shared-port
+loss closes both power actors. Close/reset discards queued/in-flight work
+without replay and retains the original ceiling/mode. DG2 explicitly refuses
+I1 in the pinned source; it never receives these commands.
+
 DG2 has two fan counters (`fan1_input`/`fan2_input`); BMG additionally exposes
 `fan3_input` where present after owned firmware fan-count discovery. RPM extends
 observed pulse deltas with source scaling and wrap/gap/refusal checks.
@@ -1101,6 +1146,24 @@ for diagnostic metadata; no firmware-provided size/pointer controls a copy.
 Unknown/corrupt headers remain opaque captured data. Sequential observations
 do not claim an atomic or lossless image. Capture changes no log verbosity,
 notifications, cursors or CT flush protocol; streaming is separate work.
+
+The same opt-in and capability policy also exposes `/dev/dri/guc-log-lfdN`.
+It retains the same immutable capture and two-per-card permit pool, and exports
+the pinned GuC LFD1.0 file magic, typed scalar LIC records, OTHER/NARF OS
+identity, event-format version plus ordered linear/wrapped events, and a
+nonzero crash region. A host comment identifies passive sequential capture;
+neither atomicity nor losslessness is implied. The 1 MiB state-capture region
+is excluded, as in Xe's LFD exporter. All three fixed state headers must be
+valid/unchanged; LIC1.0 requires all five known single-DWORD keys exactly once.
+Unknown/malformed framing remains available through raw NARFGLOG, while LFD
+refuses it before returning data. Firmware sizes and pointers only index the
+already-copied, checked fixed extents; they never drive live backing reads.
+The output is bounded to 0x15000 bytes with no second large allocation.
+Stat size is zero before capture, exact after capture, and hidden after
+capability revocation. Empty/EOF reads still recheck authority. Reset, partial
+reads, duplication and cancellation retain/release the same snapshot permits
+as raw captures. This adds source-format export, not the CT flush/ack protocol
+required for lossless log streaming.
 
 Before context registration and after deregistration, a heavy GuC GGTT TLB
 invalidation (0x7000, operation 0x80000003) requires its matching 0x7001 cookie.
@@ -6881,10 +6944,12 @@ retain their existing contracts. Admission copies all color data and retains
 both resulting blob identities through queued/projected state and native
 completion; destroying blobs cannot substitute data under an admitted job.
 
-Geometry, route and mode changes mixed with color refuse before MMIO,
+Visible geometry, route and mode changes mixed with color refuse before MMIO,
 including TEST_ONLY. A primary framebuffer may join a color transaction only
 on the fixed progressive MTL/Arrow Pipe-A direct profile: WC SCANOUT system
-pages, linear XRGB8888, zero offsets and exactly the existing width/height/pitch.
+pages, linear XRGB8888, zero ADDFB2 byte offsets and exactly the existing
+visible width/height/pitch. The source viewport may be a bounded integer
+rectangle inside a larger framebuffer, as described below.
 The queue retains the framebuffer and both color blobs; mixed requests never
 fall back to a CPU copy. The primary target is staged with fresh completion
 status but no CPU SURF write. DSB0 emits the primary SURF arm after the color
@@ -6904,6 +6969,24 @@ mode and copies blobs without acquiring the hardware owner. Execution also
 checks live fixed timing, disabled VRR/DCB/interlace, PSR inhibition and source-
 qualified MTL DEwake latencies; unsupported live state refuses before arming.
 Same-LUT CTM changes and ordinary surface flips do not write palette data.
+
+The same fixed MTL/Arrow profile admits integer primary panning through
+atomic SRC_X/Y and legacy SETCRTC x/y. Visible source/destination dimensions,
+destination origin0, stride, format, mode and route remain unchanged; source
+extent must fit both framebuffer dimensions and retained BO/GGTT bounds.
+Subpixel coordinates, scaling and nonzero ADDFB2 offsets refuse. Source byte
+addresses split into a source-qualified 4 KiB-aligned SURF and residual
+PLANE_OFFSET. Linear visible bandwidth and the inherited watermark/DDB
+requirements remain unchanged. Nonzero/changed origins, inherited panned
+PAGE_FLIP and returning to origin0 use the retained joint DSB owner: OFFSET
+arms after evasion, before SURF, in the common color/primary safe window.
+Both primary and DSB witnesses precede publication or old-window release.
+The queue projects source x/y independently from visible mode dimensions and
+destination0; plane property readback reflects that distinction. Console
+restore and fresh reset recovery restore and verify OFFSET0 together with
+console SURF; abandoned/cancelled panning retains the same unpublished marker
+and DMA owners. Panning never falls back to a CPU copy. Hardware cursors and
+Gen12 direct admission still require their separate watermark/GT owners.
 
 The DSB0 command stream programs non-arming coefficients before hardware
 scanline evasion, jointly arms the color controls and starts DSB1 at vblank.

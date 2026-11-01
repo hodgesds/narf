@@ -333,6 +333,7 @@ impl Backend {
         Node {
             index,
             backend: self.clone(),
+            format: Format::Raw,
             gate: Gate {
                 enabled: test_enabled,
                 capable,
@@ -558,3 +559,6 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_guc_log",
     smoke_guc_log_cancelled_waiters_release_only_their_copy
 );
+
+#[path = "intel_gpu_guc_lfd_tests.rs"]
+mod lfd_tests;

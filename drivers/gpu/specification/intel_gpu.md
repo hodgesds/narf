@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.23** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.24** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -13,8 +13,9 @@
 > recovery, first-error diagnostics, userspace SLPC, BMG BCS8, Pipe-A CTM,
 > protected passive GuC logs, dGPU telemetry, boot-selected multi-CCS,
 > native gamma activation, client-free CCS reconfiguration, BMG package PL1,
-> DSB color/primary transactions, GuC virtual queues, BMG PMT energy
-> and PRIME sync-file imports — see §20).
+> DSB color/primary transactions, GuC virtual queues, BMG PMT energy,
+> PRIME sync-file imports, i915 virtual contexts, fixed-mode panning,
+> additional power thresholds/intervals and GuC LFD export — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -1518,19 +1519,23 @@ not claimed.
 
 ## 19. Render UAPI and 3D admission (in progress)
 
-Production GuC owners now select native Xe on both render and primary opens.
-The new path implements Xe engine/memory/config/GT/HWCONFIG/topology queries,
-correlated RCS engine/CPU timestamps through the live reset/forcewake owner,
-system GEM creation/mmap, persistent VM binding metadata, RCS0 and software
-bind queues, binary/timeline syncs, GPU and CPU user fences and masked waits.
+Production GuC owners identify as native Xe on both render and primary opens.
+Exact Xe command encodings take precedence over the explicit supported i915
+compatibility subset; unknown encodings never select an ABI by number alone.
+The native path implements engine/memory/config/GT/HWCONFIG/topology queries,
+correlated per-engine/CPU timestamps through the live reset/forcewake owner,
+system/visible-BMG GEM creation/mmap, persistent VM binding metadata, published
+render/copy/compute placement queues and software bind queues, binary/timeline
+syncs, GPU and CPU user fences and masked waits.
 Its immutable per-execution PPGTT roots retain partial BO ranges and aliases;
 scratch/NULL mappings use shared hardware NULL tables with private path copies.
 Xe GPU ordering is explicit while terminal dma_resv fences exclude CPU copies.
 VM-attached BO identities cannot be exported or rebound to a different VM.
 Native queue priorities and timeslices reach the real GuC policy KLVs.
 Legacy backends retain the i915 compatibility profile described below.
-Fault/long-running VMs, compute/media engines, VRAM, scanout allocation
-and additional query/property families remain completion work. Mesa and
+Fault/long-running VMs, USERPTR invalidation, remaining local-memory management,
+media GT, parallel submission and additional query/property families remain
+completion work. Mesa and
 physical execution remain separate acceptance gates.
 
 The public contract is `spec.md` §3, "Intel render UAPI and address-space
@@ -1919,8 +1924,9 @@ set and partition remain invariant during a scheduling lifetime; drift closes
 admission without repair. Same-epoch idle resume additionally compares the
 parked physical set and compute configuration. Every published engine's
 private store must retire and validate before userspace epoch publication.
-The detailed contract is in `spec.md` §3. Dynamic client-free sysfs mode changes,
-load-balanced/parallel queues and media GTs remain open.
+The detailed contract is in `spec.md` §3. Later checkpoints below add dynamic
+client-free sysfs mode changes and width-one load-balanced contexts;
+parallel queues and media GTs remain open.
 
 ### Remaining accelerated-driver completion work
 
@@ -1978,7 +1984,7 @@ and both btrfs postflights per architecture.
 | Area | Current checkpoint | Still required |
 | --- | --- | --- |
 | GuC execution | Owned GGTT/PPGTT jobs, primed/persistent user RCS0, BCS0, BMG BCS8 and selected CCS0–3 state, verified register policy, graphics-GT/engine workarounds on MTL/Arrow, DG2 and BMG | Media engines, remaining out-of-band workarounds and silicon qualification |
-| Render UAPI | Native Xe queries/GEM/VM_BIND (incl. snapshot-pinned MAP_USERPTR), width-one GuC placement queues, EXEC/user fences/per-engine cycles; i915 compatibility with legacy BLT ring, context engine maps and explicit fences; context loss and fresh-epoch rebuild | USERPTR invalidation (MMU notifier), i915 GEM_USERPTR, fault/long-running VMs, i915 load balancing/parallel submission, more queue/query families and Mesa interoperability |
+| Render UAPI | Native Xe queries/GEM/VM_BIND (incl. snapshot-pinned MAP_USERPTR), width-one GuC placement queues, EXEC/user fences/per-engine cycles; explicit i915 compatibility on GuC cards with load-balanced context maps, WB softpin and explicit fences; context loss and fresh-epoch rebuild | USERPTR invalidation (MMU notifier), i915 GEM_USERPTR, fault/long-running VMs, parallel submission, more queue/query families and Mesa interoperability |
 | Engines and platforms | Main-GT DSS/EU discovery; RCS0, never-fused BCS0, BMG BCS8 and fuse-derived CCS0–3 scheduling with dense logical instances and client-free reset reconfiguration; separate Gen12 foundations | Media GT and media submission, independently sourced profiles for other IP |
 | Memory and presentation | Owned system RAM, private tables, same-card CPU PRIME mappings and explicit fence imports; iGPU write-combining objects (retyped kernel aliases, WC mmap, SCANOUT, non-coherent PAT1/PAT2 binds); Battlemage visible VRAM (zeroed pool, DM PTEs, WC BAR mmap, placement fallback); fixed-mode MTL/Arrow WC GEM KMS flips with console handoff, PM exclusion, queued NONBLOCK return, native error fences and hardware latch events; checked-copy fallback and bounded console/GEM GGTT windows; fresh-console retirement after GT reset | DG2 VRAM (64K pages + CCS clear), small-BAR/unmapped VRAM, eviction, GPU clears, VRAM PRIME/P2P, Gen12 production direct-flip admission, tiled/compressed modifiers and extra planes |
 | Display | Gen12 paths and owned Xe-LPG internal-panel modeset; fixed-mode MTL/Arrow Pipe-A native CTM/gamma with DSB active replacement and joint primary/color arms, retained state and dual hardware completion | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |
@@ -2146,20 +2152,24 @@ production feature. Unsupported functionality remains unadvertised.
 | Boot-selected multi-CCS | Frozen fuse-qualified N-way partition; sparse physical/dense logical mapping, per-instance ownership and startup execution proofs; exact clean-resume identity | Implemented; native fixtures pass |
 | Native gamma activation/bypass | 1024-entry Pipe-A LUT, owned copies/blobs, safe inactive preload, preserved flips and later-frame restoration | Implemented; native fixtures pass |
 | Extended dGPU controls/telemetry | Bounded admin-gated DG2 PL1 actor with retained boot ceiling/readback, cached fan RPM and owned BMG thermal discovery | Implemented; native fixtures pass |
-| Compatibility dispatcher | Observed revision/DSS/EU/clock, scheduler-enabled discovery, readonly default SSEU copies and exact lookup/errno/refusal behavior | Native fixtures pass; production GuC cards still select Xe, legacy backend admission remains open |
+| Compatibility dispatcher | Exact Xe-first wire routing on live GuC cards, shared WB GEM/PRIME/syncobj identity, observed discovery/SSEU and WB-only compatibility cache/mmap/softpin policy | Implemented; native fixtures pass |
 | VM/address mirrors | USERPTR invalidation/MMU notifier, i915 GEM_USERPTR, fault-mode and long-running VMs, CPU address mirrors | Open; memory/VM dependency |
 | Local-memory management | DG2 64 KiB pages and CCS clear; small-BAR/unmapped VRAM; eviction/migration and GPU clear/copy jobs; VRAM PRIME/P2P | Open; VM and copy-job dependencies |
 | Client-free CCS reconfiguration | Card-lifetime primary/render leases; admin-gated asynchronous reset, all-engine startup proofs and fresh-epoch publication | Implemented; native fixtures pass |
 | GuC width-one load balancing | Same-class placement mask, private per-restore hardware engine receipt, migration-aware watchdog, retained LRC/VM/retirement ownership | Implemented; native fixtures pass |
+| i915 virtual contexts | LOAD_BALANCE proto-map extension through the production GuC backend, copied distinct same-class placements, transactional namespace and migration/retirement ownership | Implemented; native fixtures pass |
 | Engine scheduling | Parallel queues | Open; queue dependencies |
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; separate GT lifecycle |
 | Diagnostics/performance | Lossless GuC log streaming, full devcoredump, OA and EU-stall streams, remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
 | Atomic display | Watermarks/DBUF/CDCLK/pcode, multi-pipe and bigjoiner, DSC and VRR, tiled/compressed buffers and additional planes | Open; modeset resource transactions |
 | Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; per-platform display profiles |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
+| Linear primary panning | Fixed MTL/Arrow visible geometry/stride, bounded integer source viewport, aligned SURF/residual OFFSET in common DSB arm and full console/reset retirement | Implemented; native fixtures pass |
 | Display services | Display runtime PM/DC states/DMC, FBC, broader color profiles/transforms, HDCP and Arc display | Open; display/firmware dependencies |
 | BMG package PL1 | Shared PCODE owner; passive firmware defaults, admin-gated pair-preserving write and exact current-source readback | Implemented; native fixtures pass |
 | BMG PMT energy | Qualified bounded BAR0 PUNIT discovery and exclusive remapper owner; cached checked card/package energy, units/wrap and loss/reset handling | Implemented; native fixtures pass |
+| Additional hwmon controls | BMG firmware-selected I1 power/current thresholds and DG2 PL1 intervals, fresh observations/readback, retained ceilings and fair shared PCODE transaction ownership | Implemented; native fixtures pass |
+| GuC LFD export | Protected immutable source-format export, checked LIC/event/crash framing, shared raw-snapshot permits and capability revocation | Implemented; native fixtures pass |
 | PRIME explicit-fence import | Shared same-card reservation, actual fd/flag validation, foreign callbacks/drops outside locks and generation-checked CPU/implicit admission | Implemented; native fixtures pass |
 | GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, dynamic MERT/L2-flush coordination, media power and writable fan/thermal controls | Open; mapping revocation and platform PM |
 | Additional platforms | Gen12 GuC admission, Lunar Lake and Panther Lake profiles and their execution/display probes | Open; primary-source register/firmware contracts |
@@ -2370,3 +2380,70 @@ production code; cross-target builds and lint still run.
 The x86_64 production boot and both btrfs postflights pass, as do formatting,
 diff and final source-integrity checks. The broader open workstreams above
 remain open.
+
+The sixth parallel checkpoint connects i915 LOAD_BALANCE contexts to the
+production GuC backend on both primary and render nodes. Full Xe command
+encodings win; only the explicit supported i915 encodings reach compatibility
+dispatch, sharing WB GEM/PRIME/reservation/syncobj identity with separate VM
+metadata. VERSION remains xe through temporary loss. Proto-map extension
+validation copies immutable distinct same-class placements before publication;
+actual EXECBUFFER jobs use firmware engine selection, saved state, private
+PPGTT roots and existing migration/retirement/reset ownership. Native WC/VRAM
+handles cannot silently inherit the compatibility path's WB PTE/cache/mmap
+policy, and VM-associated BOs cannot escape their unique native VM through
+softpin. Bonding and parallel submission remain refused.
+
+Fixed MTL/Arrow primary panning retains visible mode dimensions, stride,
+linear XRGB format and destination0, with an integer source rectangle inside
+the framebuffer and BO. The aligned SURF/residual OFFSET decomposition follows
+the TGL+ 4 KiB linear rule; full mapped prefixes fit the 96 MiB reservation.
+The linear watermark/DDB parameters remain unchanged. Panned PAGE_FLIP,
+SETCRTC and atomic source updates use common DSB evasion/arming, both hardware
+witnesses and queued/projected source x/y. OFFSET precedes SURF in that safe
+window. Console/master/reset restoration proves OFFSET0 and the original
+surface before releasing old DMA owners. Nonzero framebuffer byte offsets,
+scaling, copy fallback and hardware cursor admission remain refused.
+
+BMG I1 exports the firmware-selected card power or package current threshold
+through a data-only PCODE write and exact mode/data readback. A retained
+nonzero boot threshold is a conservative ceiling; no mode switching or silent
+firmware clamp is admitted. DG2 PL1 intervals share its bounded power request
+slot, revalidate units, preserve unrelated fields and require exact whole-
+register readback. Shared BMG PCODE transactions rotate fairly at completion;
+new PL1 work cannot starve an already queued I1 request. Ambiguous port loss
+closes both actors, and close/reset never replays pending writes. DG2 I1 is
+explicitly unsupported by the source and receives no such commands.
+
+Protected GuC LFD1.0 export uses the existing immutable raw capture and permit
+pool. It validates copied state/LIC framing and orders bounded event/crash
+payloads for source-format tooling; NARF OS identity and a host comment describe
+passive capture. It retains no live BO and performs no cursor/verbosity/flush
+writes. Changed or malformed framing refuses before output while the raw file
+remains available. This is not lossless or atomic streaming.
+
+Source review makes four prerequisites explicit: parallel queues need a
+multi-lane owner with contiguous GuC IDs, protected parent/child WQ scratch,
+tail publication/enable/schedule handshakes and all-lane fences/retirement;
+Gen12 direct presentation needs a production inherited-GT retirement/arena
+owner; hardware cursors need owned DBUF/watermarks/SAGV policy; lifting BMG's
+2133 MHz MERT cap needs coordinated actual-frequency, host L2-flush and unload
+transitions. Those gates remain intact rather than being advertised by a codec.
+
+All 31 new native fixtures pass on x86_64: six i915 interop/lifetime, six
+viewport, fourteen hwmon and five LFD conversations. Selected Intel/DRM/
+framebuffer groups pass 832 unique tests with no failures or skips, excluding
+the repeated 230-test main group. Actual ioctl/sysfs paths, GuC selection and
+private PPGTT execution, DSB command fetch through programmed GGTT PTEs, native
+primary/color witnesses and retained failure/reset owners are exercised.
+The mailbox regression distinguishes denied/all-ones final reply reads from
+readable identity changes while preserving shared-port quarantine.
+
+GPU/fb target CI Clippy passes all three feature contexts on both targets;
+all four host GPU vendor configurations pass all-target Clippy, including
+final default/Intel checks after fixture corrections. Debug/release builds
+pass on both architectures. aarch64 QEMU is intentionally omitted because
+this wave introduces no aarch64-specific production code. Intel silicon and
+Mesa execution acceptance remain unrun; the broader software backlog remains
+open.
+The x86_64 production boot and both btrfs postflights pass. Formatting, diff
+and final source-integrity checks pass as well.

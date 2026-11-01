@@ -18,7 +18,7 @@ use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_gtt::{
     check_ggtt_range, PteFormat, GEM_SCANOUT_GTT_END, GEM_SCANOUT_GTT_START, GGTT_ARRAY_BASE,
 };
-use crate::intel_gpu_pipes::{Pipe, PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET};
+use crate::intel_gpu_pipes::{Pipe, PLANE_OFFSET_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET};
 use crate::intel_gpu_scanout::ScanoutIo;
 
 const IMR: u64 = 0x44404;
@@ -369,7 +369,15 @@ impl<M: DisplayAccess> MmioWindow for PollIo<M> {
         let pte_end = GGTT_ARRAY_BASE + GEM_SCANOUT_GTT_END / 4096 * 8;
         let pte = (pte_start..pte_end).contains(&offset);
         let surface = Pipe::A.base() + PLANE_PRIMARY_OFFSET + PLANE_SURF_OFFSET;
-        if self.state.get() != State::Active || !(pte || offset == surface || offset == IIR) {
+        // Only the original console's zero source origin may be restored
+        // through CPU IO. Client panning is emitted by the owned DSB in its
+        // hardware safe window, never through this register adapter.
+        let console_origin =
+            offset == Pipe::A.base() + PLANE_PRIMARY_OFFSET + PLANE_OFFSET_OFFSET && value == 0;
+        if self.state.get() != State::Active
+            || !(pte || offset == surface || offset == IIR || console_origin)
+            || (console_origin && self.owned_status_ready().is_err())
+        {
             self.state.set(State::Lost);
             return;
         }

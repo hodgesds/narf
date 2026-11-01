@@ -1949,6 +1949,7 @@ impl DirOps for DriDir {
             #[cfg(feature = "intel")]
             if crate::intel_gpu_guc_log::visible(idx) {
                 all.push((format!("guc-log{idx}"), FileType::File));
+                all.push((format!("guc-log-lfd{idx}"), FileType::File));
             }
         }
         all.into_iter().skip(cursor).take(max).collect()

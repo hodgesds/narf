@@ -1,4 +1,4 @@
-//! One BMG PCODE port owner for discovery and package PL1 transactions.
+//! One BMG PCODE port owner for discovery, package PL1 and I1 transactions.
 //! MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad xe_pcode.c,
 //! xe_pcode_api.h and xe_hwmon.c. One bounded post OR poll per service.
 //!
@@ -29,6 +29,7 @@ pub(super) enum Client {
     Fan,
     Thermal,
     Power,
+    I1,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Reply {
@@ -147,8 +148,14 @@ impl Mailbox {
         if matches!(pending.command.reply, Reply::Two) {
             data[1] = io.read(DATA1).ok_or(Fault::Access)?;
         }
-        if !matches!(pending.command.reply, Reply::None) && io.read(MAILBOX) != Some(mailbox) {
-            return Err(Fault::Identity);
+        if !matches!(pending.command.reply, Reply::None) {
+            let verified = io
+                .read(MAILBOX)
+                .filter(|&value| value != u32::MAX)
+                .ok_or(Fault::Access)?;
+            if verified != mailbox {
+                return Err(Fault::Identity);
+            }
         }
         if data.contains(&u32::MAX) {
             return Err(Fault::Data);

@@ -1452,3 +1452,6 @@ kernel_test_in!(
 
 #[path = "intel_gpu_mixed_ioctl_tests.rs"]
 mod mixed;
+
+#[path = "intel_gpu_viewport_ioctl_tests.rs"]
+mod viewport;

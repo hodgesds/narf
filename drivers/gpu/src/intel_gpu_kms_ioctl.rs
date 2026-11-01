@@ -4,7 +4,7 @@
 //! intel_display_irq.c at b90c984d615e8ce2af96f5b1411a962d83fed2ad.
 use super::*;
 use crate::drm::card::{Card, Crtc, FlipEventReservation, FlipStamp, Framebuffer, PixelFormat};
-use crate::intel_gpu_scanout::Geometry;
+use crate::intel_gpu_scanout::{Geometry, Viewport};
 use alloc::boxed::Box;
 use narf_filesystem::FsFuture;
 
@@ -406,8 +406,8 @@ impl Plan {
         let mut color_compatible = true;
         let mut color_primary = false;
         let mut rect = [
-            0,
-            0,
+            p.next.x << 16,
+            p.next.y << 16,
             geometry.width << 16,
             geometry.height << 16,
             0,
@@ -440,6 +440,9 @@ impl Plan {
                 return Ok(p);
             }
             Request::Cursor(bytes) => {
+                if p.next.x != 0 || p.next.y != 0 {
+                    return Err(FsError::Unsupported);
+                }
                 let w = words(&bytes);
                 if w[0] == 0 || w[0] & !3 != 0 || w[1] != p.next.id {
                     return Err(FsError::InvalidData);
@@ -486,7 +489,7 @@ impl Plan {
                 if r.crtc_id != p.next.id {
                     return Err(FsError::NotFound);
                 }
-                if r.x != 0 || r.y != 0 || r.mode_valid > 1 {
+                if r.x > 0xffff || r.y > 0xffff || r.mode_valid > 1 {
                     return Err(FsError::InvalidData);
                 }
                 if let Some(id) = connector {
@@ -499,6 +502,8 @@ impl Plan {
                 route = fb.map(|_| p.next.id);
                 p.next.enabled = fb.is_some();
                 p.next.mode = fb.map(|_| fixed);
+                rect[0] = r.x << 16;
+                rect[1] = r.y << 16;
             }
             Request::Atomic(a) => {
                 if !atomic_card(card) {
@@ -658,15 +663,37 @@ impl Plan {
                 }
             }
         }
-        if color.is_some() || gamma.is_some() {
+        if !p.next.enabled || fb.is_none() || route.is_none() {
+            // Full restoration selects the retained origin-zero console;
+            // an inherited panned rectangle must not prevent disabling it.
+            rect[0] = 0;
+            rect[1] = 0;
+        }
+        // Every panned primary arm uses the retained DSB owner, even if the
+        // client changes no color properties. This also covers returning to
+        // origin zero and PAGE_FLIP inheriting its queued source rectangle.
+        let viewport = Viewport {
+            x: rect[0] >> 16,
+            y: rect[1] >> 16,
+        };
+        let panning = (primary_changed || color_primary || (color.is_none() && gamma.is_none()))
+            && (viewport != Viewport::default() || p.previous.x != 0 || p.previous.y != 0)
+            && p.next.enabled
+            && fb.is_some()
+            && route.is_some();
+        color_primary |= panning;
+        if color.is_some() || gamma.is_some() || panning {
+            if !card.intel_color(p.next.id) {
+                return Err(FsError::Unsupported);
+            }
             if !color_compatible || !p.previous.enabled || p.previous.mode.is_none() {
                 return Err(FsError::Unsupported);
             }
             if color_primary {
                 if rect
                     != [
-                        0,
-                        0,
+                        rect[0],
+                        rect[1],
                         geometry.width << 16,
                         geometry.height << 16,
                         0,
@@ -681,9 +708,7 @@ impl Plan {
                 let id = fb.ok_or(FsError::Unsupported)?;
                 let target = card.framebuffer(id).map_err(|_| FsError::NotFound)?;
                 let object = target.intel.as_ref().ok_or(FsError::Unsupported)?;
-                if target.width != geometry.width
-                    || target.height != geometry.height
-                    || target.pitch != geometry.pitch
+                if target.pitch != geometry.pitch
                     || target.format != PixelFormat::Xrgb8888
                     || target.modifier != 0
                     || target.offsets != [0, 0]
@@ -695,13 +720,27 @@ impl Plan {
                 {
                     return Err(FsError::Unsupported);
                 }
-                if u64::from(target.pitch) * u64::from(geometry.height) > object.object.size() {
+                if viewport
+                    .x
+                    .checked_add(geometry.width)
+                    .is_none_or(|x| x > target.width)
+                    || viewport
+                        .y
+                        .checked_add(geometry.height)
+                        .is_none_or(|y| y > target.height)
+                {
+                    return Err(FsError::NoSpace);
+                }
+                let (_, _, extent) = viewport
+                    .layout(geometry)
+                    .map_err(|_| FsError::InvalidData)?;
+                if extent > object.object.size() {
                     return Err(FsError::InvalidData);
                 }
                 p.framebuffer = Some(target.clone());
                 p.next.primary_fb = Some(id);
-                p.next.x = 0;
-                p.next.y = 0;
+                p.next.x = viewport.x;
+                p.next.y = viewport.y;
             }
             if let Some(blob) = color {
                 p.next_ctm = blob;
@@ -783,6 +822,8 @@ impl Plan {
             p.next.primary_fb = None;
             p.next.enabled = false;
             p.next.mode = None;
+            p.next.x = 0;
+            p.next.y = 0;
             p.action = Action::Restore;
         } else {
             if p.next.mode.is_none() {
@@ -917,6 +958,7 @@ trait Backend {
         &mut self,
         _object: Arc<crate::intel_gpu_gem::GemObject>,
         _geometry: Geometry,
+        _viewport: Viewport,
         _coefficients: Option<[u64; 9]>,
         _lut: Option<Arc<crate::intel_gpu_color::Lut>>,
         _timing: crate::intel_gpu_dsb::Timing,
@@ -970,11 +1012,12 @@ impl<M: crate::intel_gpu_kms::Platform> Backend for crate::intel_gpu_kms::Guard<
         &mut self,
         object: Arc<crate::intel_gpu_gem::GemObject>,
         geometry: Geometry,
+        viewport: Viewport,
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
         timing: crate::intel_gpu_dsb::Timing,
     ) -> FsFuture<'_, FlipStamp> {
-        Box::pin(self.present_color(object, geometry, coefficients, lut, timing))
+        Box::pin(self.present_color(object, geometry, viewport, coefficients, lut, timing))
     }
     fn vblank(&mut self) -> FsFuture<'_, FlipStamp> {
         alloc::boxed::Box::pin(self.wait_vblank())
@@ -1225,6 +1268,10 @@ async fn execute_plan<B: Backend>(
                     .present_color(
                         object,
                         plan.geometry,
+                        Viewport {
+                            x: plan.next.x,
+                            y: plan.next.y,
+                        },
                         *coefficients,
                         lut.clone(),
                         dsb.ok_or(FsError::Unsupported)?,

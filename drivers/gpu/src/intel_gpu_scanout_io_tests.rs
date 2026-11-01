@@ -227,7 +227,7 @@ kernel_test_in!(
 );
 
 fn smoke_scanout_io_revocation_power_loss_and_stolen_delivery_fail_closed() -> TestResult {
-    for case in 0..5 {
+    for case in 0..7 {
         let access = Access::new();
         let io = adapter(access.clone(), Generation::TigerLake);
         let writes = access.0.borrow().writes.len();
@@ -238,7 +238,9 @@ fn smoke_scanout_io_revocation_power_loss_and_stolen_delivery_fail_closed() -> T
                 access.0.borrow_mut().regs.insert(0x44404, !(1 << 3));
             }
             3 => io.write32(0x44404, 0), // Clients cannot unmask delivery.
-            _ => io.write32(0x800000, 1), // Nor touch another GGTT arena.
+            4 => io.write32(0x800000, 1), // Nor touch another GGTT arena.
+            5 => io.write32(0x701a4, 1), // Client viewport arms require DSB.
+            _ => io.write32(0x711a4, 0), // No other pipe's origin is owned.
         }
         assert_eq!(io.read32(0x44408), u32::MAX);
         assert!(!io.invalidate_ggtt());
@@ -262,6 +264,12 @@ fn smoke_scanout_io_restores_owned_bits_and_preserves_new_foreign_changes() -> T
     // enabling IER, restoration must disable IER before unmasking delivery.
     access.0.borrow_mut().regs.insert(0x44404, !(1 << 3));
     let io = adapter(access.clone(), Generation::TigerLake);
+    // The full production KMS fixtures restore a panned primary through this
+    // adapter and Presenter latch. Pin its narrow CPU write permission here
+    // on both arches too: a zero origin, still under current status ownership.
+    access.0.borrow_mut().regs.insert(0x701a4, 0x10003);
+    io.write32(0x701a4, 0);
+    assert_eq!(io.read32(0x701a4), 0);
     {
         let mut hw = access.0.borrow_mut();
         *hw.regs.get_mut(&0x4440c).unwrap() |= 1 << 10;

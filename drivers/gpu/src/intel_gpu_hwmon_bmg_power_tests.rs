@@ -18,6 +18,9 @@ struct Firmware {
     error: Cell<Option<(usize, u8)>>,
     clamp: Cell<bool>,
     change_pl2: Cell<bool>,
+    i1: Cell<Option<u32>>,
+    i1_clamp: Cell<bool>,
+    i1_mode_flip: Cell<bool>,
 }
 impl Firmware {
     fn new() -> Self {
@@ -30,6 +33,9 @@ impl Firmware {
             error: Cell::new(None),
             clamp: Cell::new(false),
             change_pl2: Cell::new(false),
+            i1: Cell::new(None),
+            i1_clamp: Cell::new(false),
+            i1_mode_flip: Cell::new(false),
         }
     }
     fn tick(&self) {
@@ -47,6 +53,28 @@ impl Firmware {
             return;
         }
         let output = match command {
+            0x047c => {
+                if let Some(word) = self.i1.get() {
+                    [word, 0]
+                } else {
+                    // Older PL1 cases model a board without optional I1.
+                    self.hw.complete(1, 0, 0);
+                    return;
+                }
+            }
+            0x057c => {
+                assert_eq!(input[0] & !0xffff, 0, "I1 writes cannot select mode");
+                assert_eq!(input[1], 0);
+                let mut word = (self.i1.get().unwrap() & 0x8000_0000) | input[0];
+                if self.i1_clamp.get() {
+                    word += 1;
+                }
+                if self.i1_mode_flip.get() {
+                    word ^= 1 << 31;
+                }
+                self.i1.set(Some(word));
+                [0, 0]
+            }
             0x047d => [2, 0],
             0x25 => [0x5f69_646e, 97],
             READ_FW => self.defaults.get(),
@@ -85,7 +113,7 @@ impl Firmware {
         *now += 10_000;
     }
     fn defaults_ready(&self, monitor: &Monitor, epoch: u64, now: &mut u64) {
-        for _ in 0..6 {
+        for _ in 0..8 {
             self.step(monitor, epoch, now);
         }
         assert_eq!(monitor.show("power2_max_status", *now), "default-only\n");
@@ -135,7 +163,7 @@ fn smoke_hwmon_bmg_passive_defaults_and_periodic_reads_never_switch_source() -> 
     fw.defaults_ready(&monitor, 7, &mut now);
     assert_eq!(
         fw.commands.borrow().iter().map(|c| c.0).collect::<Vec<_>>(),
-        [0x047d, 0x25, 0x01087c]
+        [0x047d, 0x25, 0x01087c, 0x047c]
     );
     for (name, value) in [
         ("power2_max_default", "200000000\n"),
@@ -152,7 +180,7 @@ fn smoke_hwmon_bmg_passive_defaults_and_periodic_reads_never_switch_source() -> 
     fw.step(&monitor, 7, &mut now);
     assert_eq!(
         fw.commands.borrow().len(),
-        3,
+        4,
         "package period fired a nanosecond early"
     );
     assert!(fw.pending.get().is_none());
@@ -160,7 +188,7 @@ fn smoke_hwmon_bmg_passive_defaults_and_periodic_reads_never_switch_source() -> 
     fw.step(&monitor, 7, &mut now);
     assert_eq!(
         fw.commands.borrow().len(),
-        4,
+        5,
         "eligible refresh was never posted"
     );
     assert_eq!(fw.pending.get(), Some((READ_FW, [0; 2])));
@@ -205,7 +233,7 @@ fn smoke_hwmon_bmg_admin_pl1_pair_preservation_and_status_then_exact_readback() 
     assert_eq!(monitor.show("power2_rated_max", now), "100125000\n");
     assert_eq!(monitor.show("power2_max_default", now), "200000000\n");
     assert_eq!(
-        &fw.commands.borrow()[3..]
+        &fw.commands.borrow()[4..]
             .iter()
             .map(|c| c.0)
             .collect::<Vec<_>>(),
@@ -213,7 +241,7 @@ fn smoke_hwmon_bmg_admin_pl1_pair_preservation_and_status_then_exact_readback() 
     );
     fw.apply(&monitor, &mut now, b"125000000");
     assert_eq!(
-        &fw.commands.borrow()[6..]
+        &fw.commands.borrow()[7..]
             .iter()
             .map(|c| c.0)
             .collect::<Vec<_>>(),
@@ -290,13 +318,13 @@ fn smoke_hwmon_bmg_shared_mailbox_serializes_discovery_background_and_control() 
     assert_eq!(fw.commands.borrow().len(), 1);
     monitor.service_mmio(7, now, &fw, || true); // still busy before timeout
     assert_eq!(fw.commands.borrow().len(), 1);
-    for _ in 0..5 {
+    for _ in 0..7 {
         fw.step(&monitor, 7, &mut now);
     }
     assert_eq!(monitor.show("power2_max_status", now), "default-only\n");
     now += SECOND; // first package post followed fan/thermal discovery
     fw.step(&monitor, 7, &mut now); // passive metadata refresh owns port
-    assert_eq!(fw.commands.borrow().len(), 4);
+    assert_eq!(fw.commands.borrow().len(), 5);
     assert_eq!(fw.pending.get(), Some((READ_FW, [0; 2])));
     assert_eq!(
         monitor.bmg_power.store(b"100000000", now),
@@ -320,7 +348,7 @@ fn smoke_hwmon_bmg_error_statuses_and_failed_rmw_reads_never_write() -> TestResu
         let fw = Firmware::new();
         let mut now = 0;
         fw.defaults_ready(&monitor, 7, &mut now);
-        fw.error.set(Some((3, status))); // fresh admin RMW read, not the metadata read
+        fw.error.set(Some((4, status))); // fresh admin RMW read, not the metadata read
         monitor.bmg_power.store(b"100000000", now).unwrap();
         fw.step(&monitor, 7, &mut now);
         fw.tick();
@@ -497,7 +525,7 @@ fn smoke_hwmon_bmg_reset_discards_pending_source_and_retains_firmware_boot_ceili
     for _ in 0..6 {
         fw.step(&monitor, 8, &mut now);
     }
-    assert_eq!(fw.commands.borrow()[count + 3].0, READ_FW);
+    assert_eq!(fw.commands.borrow()[count + 4].0, READ_FW);
     assert_eq!(monitor.show("power2_max", now), "200000000\n");
     TestResult::Pass
 }
@@ -524,7 +552,7 @@ fn smoke_hwmon_bmg_disabled_invalid_metadata_and_write_error_are_explicit() -> T
     let fw = Firmware::new();
     let mut now = 0;
     fw.defaults_ready(&monitor, 7, &mut now);
-    fw.error.set(Some((4, 6))); // firmware Locked on the actual write
+    fw.error.set(Some((5, 6))); // firmware Locked on the actual write
     fw.apply(&monitor, &mut now, b"100000000");
     assert_eq!(
         monitor.show("power2_max_status", now),
@@ -533,7 +561,7 @@ fn smoke_hwmon_bmg_disabled_invalid_metadata_and_write_error_are_explicit() -> T
     assert!(monitor.show("power2_max", now).is_empty());
     assert_eq!(
         fw.commands.borrow().len(),
-        5,
+        6,
         "write error incorrectly queued a verify/source switch"
     );
     TestResult::Pass
@@ -589,3 +617,6 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_hwmon",
     smoke_hwmon_bmg_real_sysfs_uses_cached_default_only_and_admin_queue
 );
+
+#[path = "intel_gpu_hwmon_threshold_tests.rs"]
+mod threshold_tests;

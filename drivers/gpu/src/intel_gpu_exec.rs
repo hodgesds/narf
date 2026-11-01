@@ -274,9 +274,11 @@ impl ExecRequest {
             objects: Vec::new(),
         };
         for entry in &self.objects {
-            // The compatibility residency plan only maps host pages; a VRAM
-            // device address must never become a system-memory PTE.
-            if entry.object.is_vram() {
+            // Compatibility owns a separate private VM and uses one WB host
+            // PAT for every leaf. Shared Xe handles retain explicit native
+            // cache placement and optional VM ownership; passing a handle
+            // through softpin cannot grant a different VM or cache policy.
+            if entry.object.is_vram() || entry.object.is_wc() || entry.object.vm_owner().is_some() {
                 return Err(FsError::InvalidData);
             }
             space.objects.push((entry.object.clone(), entry.writable));

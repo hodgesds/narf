@@ -26,6 +26,7 @@ enum Action {
     Latch(u32),
     Resume,
     ColorArm(u64),
+    SourceOffset(u32),
 }
 #[derive(Debug)]
 struct Hardware {
@@ -114,6 +115,24 @@ impl MockPlatform {
     }
     pub(crate) fn meteor(&self) -> Device<Self> {
         Device::new(self.clone(), Generation::MeteorLake, 0x1000000, console())
+    }
+    pub(crate) fn meteor_pitch(&self, pitch: u32) -> Device<Self> {
+        self.set(0x70188, pitch / 64);
+        let mut saved = console();
+        saved.stride_bytes = pitch;
+        Device::new(self.clone(), Generation::MeteorLake, 0x1000000, saved)
+    }
+    pub(crate) fn primary_updates(&self) -> Vec<(u64, u32)> {
+        self.0
+            .lock()
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SourceOffset(value) => Some((0x701a4, *value)),
+                Action::Arm(value) => Some((SURF, *value)),
+                _ => None,
+            })
+            .collect()
     }
     pub(crate) fn set(&self, register: u64, value: u32) {
         self.0.lock().regs.insert(register, value);
@@ -335,6 +354,9 @@ impl Hardware {
                 return;
             }
             self.regs.insert(offset, value);
+            if offset == 0x701a4 {
+                self.actions.push(Action::SourceOffset(value));
+            }
             if offset == SURF {
                 self.pending_surface = Some(value);
                 self.actions.push(Action::Arm(value));

@@ -92,6 +92,9 @@ impl MmioWindow for Hardware {
         if offset == pcode::MAILBOX && value == 0x8001_087c {
             self.set(offset, 1);
         }
+        if offset == pcode::MAILBOX && value == 0x8000_047c {
+            self.set(offset, 1); // optional I1 unavailable on this legacy model
+        }
     }
 }
 struct Admin(Option<fn(u32) -> bool>);
@@ -384,6 +387,10 @@ fn smoke_hwmon_bmg_owned_mailbox_fans_and_thermal_limit_wire_cases() -> TestResu
         9,
         "two discovery reads plus one refused package read expected"
     );
+    // Finish the independent optional I1 refusal before the sensor-only
+    // authority budget below; a mailbox post itself needs four accesses.
+    monitor.service_mmio(7, 2 * SECOND + 1, &hw, || true);
+    monitor.service_mmio(7, 2 * SECOND + 2, &hw, || true);
     assert!(monitor.show("temp2_crit", 4 * SECOND + 1).is_empty());
     hw.reads.borrow_mut().clear();
     let mut checks = 0;

@@ -1294,10 +1294,21 @@ fn smoke_xe_queries_abi_identity_and_clock_facts() -> TestResult {
             }
         }
     }
-    // Full command encoding and stable Xe profile prevent i915/Xe number
-    // collisions from decoding a malformed Xe request as legacy GETPARAM.
+    // Exact encodings distinguish i915 GETPARAM from Xe QUEUE_CREATE, both
+    // numbered 0x46. Unknown sizes cannot fall through into compatibility.
+    let mut getparam = [0; 16];
+    put32(&mut getparam, 0, 11);
+    put64(&mut getparam, 8, 1024);
+    user.wire.store(64, &getparam);
+    assert_eq!(invoke(&file, &info, &user, abi::GETPARAM), Ok(0));
+    assert_eq!(u32_at(&user.wire.load(1024, 4), 0), 1);
     assert_eq!(
-        invoke(&file, &info, &user, abi::GETPARAM),
+        invoke(
+            &file,
+            &info,
+            &user,
+            crate::drm_uapi::iowr(b'd' as u32, 0x46, 24)
+        ),
         Err(FsError::InvalidData)
     );
     *mailbox.status.lock() = None;

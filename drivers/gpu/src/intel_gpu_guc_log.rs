@@ -1,6 +1,7 @@
-//! Opt-in, capability-gated passive GuC log snapshots. This is a NARF file
-//! format, not Xe's DRM ABI or Linux debugfs/LFD. Payloads are opaque firmware
-//! diagnostics and can disclose GPU addresses and instruction state.
+//! Opt-in, capability-gated passive GuC log snapshots. The raw file uses
+//! NARFGLOG framing; a separate descriptor exports source-qualified LFD1.0.
+//! Neither is a Xe DRM ioctl. Payloads are opaque firmware diagnostics and
+//! can disclose GPU addresses and instruction state.
 //!
 //! MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad:
 //! xe_guc_log.{c,h}::{xe_guc_log_snapshot_capture,GUC_LOG_SIZE},
@@ -11,6 +12,9 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{fence, AtomicU64, AtomicU8, Ordering};
 use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
 use narf_lib::mutex::Mutex;
+
+#[path = "intel_gpu_guc_lfd.rs"]
+mod lfd;
 
 use crate::{intel_gpu_gt::GtPlatform, intel_gpu_rcs::GpuBacking, intel_gpu_user::UserBackend};
 
@@ -301,10 +305,48 @@ impl Snapshot {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+enum Format {
+    Raw,
+    Lfd,
+}
+impl Format {
+    fn limit(self) -> usize {
+        match self {
+            Self::Raw => SNAPSHOT_BYTES,
+            Self::Lfd => lfd::MAX_BYTES,
+        }
+    }
+    fn initial_size(self) -> u64 {
+        match self {
+            Self::Raw => SNAPSHOT_BYTES as u64,
+            Self::Lfd => 0, // seq-file style: exact size is known after capture.
+        }
+    }
+}
+enum Captured {
+    Raw(Snapshot),
+    Lfd(lfd::Export),
+}
+impl Captured {
+    fn len(&self) -> usize {
+        match self {
+            Self::Raw(_) => SNAPSHOT_BYTES,
+            Self::Lfd(export) => export.len(),
+        }
+    }
+    fn read(&self, offset: u64, output: &mut [u8]) -> usize {
+        match self {
+            Self::Raw(snapshot) => snapshot.read(offset, output),
+            Self::Lfd(export) => export.read(offset, output),
+        }
+    }
+}
 struct Node {
     index: u32,
     backend: Arc<dyn UserBackend>,
     gate: Gate,
+    format: Format,
 }
 impl core::fmt::Debug for Node {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -317,7 +359,9 @@ struct File {
     index: u32,
     backend: Arc<dyn UserBackend>,
     gate: Gate,
-    snapshot: Mutex<Option<Snapshot>>,
+    format: Format,
+    size: AtomicU64,
+    snapshot: Mutex<Option<Captured>>,
 }
 impl core::fmt::Debug for File {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -326,9 +370,9 @@ impl core::fmt::Debug for File {
             .finish()
     }
 }
-fn stat() -> Stat {
+fn stat(size: u64) -> Stat {
     Stat {
-        size: SNAPSHOT_BYTES as u64,
+        size,
         blocks: 0,
         mode: Mode {
             file_type: FileType::File,
@@ -347,6 +391,8 @@ impl FileOps for Node {
             index: self.index,
             backend: self.backend.clone(),
             gate: self.gate,
+            format: self.format,
+            size: AtomicU64::new(self.format.initial_size()),
             snapshot: Mutex::new(None),
         })))
     }
@@ -357,14 +403,14 @@ impl FileOps for Node {
         Box::pin(async { Err(FsError::ReadOnly) })
     }
     fn stat(&self) -> Stat {
-        stat()
+        stat(self.format.initial_size())
     }
 }
 impl FileOps for File {
     fn read<'a>(&'a self, offset: u64, output: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             self.gate.check()?;
-            if output.is_empty() || offset >= SNAPSHOT_BYTES as u64 {
+            if output.is_empty() || offset >= self.format.limit() as u64 {
                 return Ok(0);
             }
             let mut snapshot = self.snapshot.lock().await;
@@ -377,6 +423,11 @@ impl FileOps for File {
                 }
                 // Revocation while awaiting the GT never releases raw bytes.
                 self.gate.check()?;
+                let captured = match self.format {
+                    Format::Raw => Captured::Raw(captured),
+                    Format::Lfd => Captured::Lfd(lfd::Export::new(captured)?),
+                };
+                self.size.store(captured.len() as u64, Ordering::Release);
                 *snapshot = Some(captured);
             }
             self.gate.check()?;
@@ -390,7 +441,14 @@ impl FileOps for File {
         Box::pin(async { Err(FsError::ReadOnly) })
     }
     fn stat(&self) -> Stat {
-        stat()
+        // Variable LFD size reveals event/crash presence; a revoked
+        // descriptor must not retain that metadata disclosure either.
+        let size = if matches!(self.format, Format::Lfd) && self.gate.check().is_err() {
+            0
+        } else {
+            self.size.load(Ordering::Acquire)
+        };
+        stat(size)
     }
 }
 
@@ -401,8 +459,13 @@ pub(crate) fn visible(index: u32) -> bool {
             .is_some_and(|card| card.vendor_id() == 0x8086 && card.intel_user_backend().is_some())
 }
 pub(crate) fn lookup(name: &str) -> Option<Arc<dyn FileOps>> {
-    let index = name.strip_prefix("guc-log")?.parse::<u32>().ok()?;
-    if name != alloc::format!("guc-log{index}") || !visible(index) {
+    let (prefix, format) = if name.starts_with("guc-log-lfd") {
+        ("guc-log-lfd", Format::Lfd)
+    } else {
+        ("guc-log", Format::Raw)
+    };
+    let index = name.strip_prefix(prefix)?.parse::<u32>().ok()?;
+    if name != alloc::format!("{prefix}{index}") || !visible(index) {
         return None;
     }
     let backend = crate::drm_registry::card(index)?.intel_user_backend()?;
@@ -410,6 +473,7 @@ pub(crate) fn lookup(name: &str) -> Option<Arc<dyn FileOps>> {
         index,
         backend,
         gate: Gate::PHYSICAL,
+        format,
     }))
 }
 

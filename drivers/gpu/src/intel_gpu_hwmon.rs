@@ -18,6 +18,8 @@ use crate::{intel_gpu_aux::MmioWindow, intel_gpu_gt::GtPlatform};
 
 #[path = "intel_gpu_hwmon_bmg_power.rs"]
 mod bmg_power;
+#[path = "intel_gpu_hwmon_i1.rs"]
+mod i1;
 #[path = "intel_gpu_hwmon_pcode.rs"]
 mod pcode;
 #[path = "intel_gpu_hwmon_pmt.rs"]
@@ -128,6 +130,8 @@ struct State {
     pmt_reading: Option<[u64; 2]>,
     discovery: pcode::Discovery,
     mailbox: pcode::Mailbox,
+    control_owner: Option<pcode::Client>,
+    control_next: pcode::Client,
     fan_sampled: Option<u64>,
     fans: [Option<Fan>; 3],
     fan_rpm: [Option<u64>; 3],
@@ -143,6 +147,7 @@ pub(crate) struct Monitor {
     state: IrqSafeSpinLock<State>,
     power: power::Power,
     bmg_power: bmg_power::Power,
+    i1: i1::I1,
 }
 impl Monitor {
     fn new(platform: GtPlatform, bar_len: u64) -> Option<Self> {
@@ -164,12 +169,15 @@ impl Monitor {
                 pmt_reading: None,
                 discovery: pcode::Discovery::default(),
                 mailbox: pcode::Mailbox::default(),
+                control_owner: None,
+                control_next: pcode::Client::Power,
                 fan_sampled: None,
                 fans: [None; 3],
                 fan_rpm: [None; 3],
             }),
             power: power::Power::new(),
             bmg_power: bmg_power::Power::new(),
+            i1: i1::I1::new(),
         })
     }
 
@@ -191,11 +199,14 @@ impl Monitor {
         state.pmt_reading = None;
         state.discovery = pcode::Discovery::default();
         state.mailbox = pcode::Mailbox::default();
+        state.control_owner = None;
+        state.control_next = pcode::Client::Power;
         state.fan_sampled = None;
         state.fans = [None; 3];
         state.fan_rpm = [None; 3];
         self.power.activate(epoch);
         self.bmg_power.activate(epoch);
+        self.i1.activate(epoch);
         self.admission.store(epoch, Ordering::Release);
     }
 
@@ -212,11 +223,14 @@ impl Monitor {
         state.pmt_reading = None;
         state.discovery = pcode::Discovery::default();
         state.mailbox = pcode::Mailbox::default();
+        state.control_owner = None;
+        state.control_next = pcode::Client::Power;
         state.fan_sampled = None;
         state.fans = [None; 3];
         state.fan_rpm = [None; 3];
         self.power.close();
         self.bmg_power.close();
+        self.i1.close();
     }
 
     /// The caller holds the GT reset/power mutex and checks current PCI D0
@@ -271,6 +285,7 @@ impl Monitor {
         if self.platform == GtPlatform::Battlemage {
             state.mailbox.access_lost();
             self.bmg_power.access_lost(epoch);
+            self.i1.access_lost(epoch);
         }
     }
 
@@ -281,23 +296,34 @@ impl Monitor {
         if self.platform == GtPlatform::Alchemist {
             self.power.service(epoch, now, io);
         } else {
-            let (mut discovery, mut mailbox) = {
+            let (mut discovery, mut mailbox, mut control_owner, mut control_next) = {
                 let state = self.state.lock();
-                (state.discovery, state.mailbox)
+                (
+                    state.discovery,
+                    state.mailbox,
+                    state.control_owner,
+                    state.control_next,
+                )
             };
             let next = if mailbox.available() {
-                discovery
-                    .command()
-                    .or_else(|| self.bmg_power.command(epoch, now))
+                discovery.command().or_else(|| {
+                    self.control_command(epoch, now, &mut control_owner, &mut control_next)
+                })
             } else {
                 None
             };
             if let Some((client, result)) = mailbox.step(next, now, io) {
-                if client == pcode::Client::Power {
-                    self.bmg_power.complete(epoch, now, result)
-                } else {
-                    discovery.complete(client, result)
+                match client {
+                    pcode::Client::Power => self.bmg_power.complete(epoch, now, result),
+                    pcode::Client::I1 => self.i1.complete(epoch, now, result),
+                    _ => discovery.complete(client, result),
                 }
+            }
+            if let Some(fault) = mailbox.fault() {
+                // A shared hardware port with ambiguous ownership cannot
+                // accept requests or retain measurements for either actor.
+                self.bmg_power.port_lost(epoch, fault);
+                self.i1.port_lost(epoch, fault);
             }
             let mut state = self.state.lock();
             if state.epoch != epoch || self.admission.load(Ordering::Acquire) != epoch {
@@ -305,12 +331,62 @@ impl Monitor {
             }
             state.discovery = discovery;
             state.mailbox = mailbox;
+            state.control_owner = control_owner;
+            state.control_next = control_next;
         }
         self.sample(epoch, now, |offset| io.read(offset));
         self.sample_fans(epoch, now, io);
         if self.platform == GtPlatform::Battlemage {
             self.sample_pmt(epoch, now, io)
         }
+    }
+
+    fn control_command(
+        &self,
+        epoch: u64,
+        now: u64,
+        owner: &mut Option<pcode::Client>,
+        next: &mut pcode::Client,
+    ) -> Option<pcode::Command> {
+        use pcode::Client;
+        let other = |client| {
+            if client == Client::Power {
+                Client::I1
+            } else {
+                Client::Power
+            }
+        };
+        let active = |client| match client {
+            Client::Power => self.bmg_power.in_transaction(epoch),
+            Client::I1 => self.i1.in_transaction(epoch),
+            _ => false,
+        };
+        let command = |client| match client {
+            Client::Power => self.bmg_power.command(epoch, now),
+            Client::I1 => self.i1.command(epoch, now),
+            _ => None,
+        };
+        // A read/write/verify sequence retains ownership. Once terminal, a
+        // newly queued request from that same client cannot bypass the peer.
+        if let Some(client) = *owner {
+            if active(client) {
+                return command(client);
+            }
+            *owner = None;
+            *next = other(client);
+        }
+        for client in [*next, other(*next)] {
+            if let Some(command) = command(client) {
+                if active(client) {
+                    *owner = Some(client);
+                } else {
+                    // Passive reads consist of one transfer only.
+                    *next = other(client);
+                }
+                return Some(command);
+            }
+        }
+        None
     }
 
     fn sample_pmt(&self, epoch: u64, now: u64, io: &mut impl Io) {
@@ -493,6 +569,13 @@ impl Monitor {
     }
 
     fn show(&self, attribute: &str, now: u64) -> String {
+        if self.platform == GtPlatform::Battlemage
+            && (attribute.starts_with("power1_")
+                || attribute.starts_with("curr2_")
+                || attribute == "i1_status")
+        {
+            return self.i1.show(attribute, now);
+        }
         if self.platform == GtPlatform::Battlemage {
             let index = match attribute {
                 "energy1_label" => return "card\n".into(),
@@ -675,6 +758,49 @@ impl Monitor {
                 }
             },
         );
+        if self.platform == GtPlatform::Alchemist {
+            for attribute in ["power2_max_interval_min", "power2_max_interval_max"] {
+                let monitor = self.clone();
+                kobject_add_attr(&node, attribute, move || {
+                    monitor.show(attribute, narf_time::monotonic_ns())
+                });
+            }
+            let show = self.clone();
+            let store = self.clone();
+            kobject_add_writable_attr(
+                &node,
+                "power2_max_interval",
+                move || show.show("power2_max_interval", narf_time::monotonic_ns()),
+                move |bytes| store.power.store_interval(bytes, narf_time::monotonic_ns()),
+            );
+        } else {
+            for attribute in [
+                "i1_status",
+                "power1_label",
+                "power1_crit_default",
+                "power1_crit_min",
+                "power1_crit_max",
+                "curr2_label",
+                "curr2_crit_default",
+                "curr2_crit_min",
+                "curr2_crit_max",
+            ] {
+                let monitor = self.clone();
+                kobject_add_attr(&node, attribute, move || {
+                    monitor.show(attribute, narf_time::monotonic_ns())
+                });
+            }
+            for attribute in ["power1_crit", "curr2_crit"] {
+                let show = self.clone();
+                let store = self.clone();
+                kobject_add_writable_attr(
+                    &node,
+                    attribute,
+                    move || show.show(attribute, narf_time::monotonic_ns()),
+                    move |bytes| store.i1.store(attribute, bytes, narf_time::monotonic_ns()),
+                );
+            }
+        }
         for attribute in if self.platform == GtPlatform::Alchemist {
             &["fan1_input", "fan2_input"][..]
         } else {
@@ -686,6 +812,20 @@ impl Monitor {
             });
         }
     }
+}
+
+fn decimal(bytes: &[u8]) -> Result<u64, narf_filesystem::FsError> {
+    use narf_filesystem::FsError;
+    if bytes.len() > 32 {
+        return Err(FsError::InvalidData);
+    }
+    let text = core::str::from_utf8(bytes)
+        .map_err(|_| FsError::InvalidData)?
+        .trim();
+    if text.is_empty() || !text.bytes().all(|c| c.is_ascii_digit()) {
+        return Err(FsError::InvalidData);
+    }
+    text.parse().map_err(|_| FsError::InvalidData)
 }
 
 fn degrees(value: u32) -> Option<i64> {

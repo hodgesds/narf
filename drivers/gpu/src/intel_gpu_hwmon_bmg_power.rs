@@ -135,6 +135,9 @@ impl Power {
         };
     }
     pub(super) fn access_lost(&self, epoch: u64) {
+        self.port_lost(epoch, Fault::Access);
+    }
+    pub(super) fn port_lost(&self, epoch: u64, fault: Fault) {
         let mut state = self.state.lock();
         if !self.current(epoch) || state.epoch != epoch {
             return;
@@ -145,7 +148,7 @@ impl Power {
         state.phase = Phase::Idle;
         state.disabled = true;
         if id != 0 || !matches!(state.outcome, Outcome::Failed(_, _)) {
-            state.outcome = Outcome::Failed(id, Error::Mailbox(Fault::Access))
+            state.outcome = Outcome::Failed(id, Error::Mailbox(fault))
         }
     }
     pub(super) fn command(&self, epoch: u64, now: u64) -> Option<Command> {
@@ -188,6 +191,10 @@ impl Power {
             input,
             reply,
         })
+    }
+    pub(super) fn in_transaction(&self, epoch: u64) -> bool {
+        let state = self.state.lock();
+        self.current(epoch) && state.epoch == epoch && state.phase.id() != 0
     }
     pub(super) fn complete(&self, epoch: u64, now: u64, result: Result<[u32; 2], Fault>) {
         let mut state = self.state.lock();

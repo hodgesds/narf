@@ -670,8 +670,13 @@ fn smoke_userspace_i915_copy_engine_legacy_ring_and_engine_map() -> TestResult {
         file.dispatch(&info, abi::GEM_CONTEXT_SETPARAM, 64, &user),
         Some(Err(FsError::NotFound))
     );
-    // Load-balance extension (name 0) is not admitted; unknown names are EINVAL.
-    for (name, expected) in [(0u32, FsError::NotImplemented), (3, FsError::InvalidData)] {
+    // Balancing may fill only a hole; bonding/parallel are still refused.
+    for (name, expected) in [
+        (0u32, FsError::AlreadyExists),
+        (1, FsError::NotImplemented),
+        (2, FsError::NotImplemented),
+        (3, FsError::InvalidData),
+    ] {
         let mut extension = [0; 32];
         put32(&mut extension, 8, name);
         user.store(7168, &extension);
