@@ -81,6 +81,12 @@ accepted changes durable, leaving any unreaped orphan record for recovery.
 
 ## 4. Invariants
 
+Free-space bitmap edits accumulate only in a private logical leaf. Each
+changed block group's free-run count is recomputed after all allocations and
+releases for that fixed-point round, before packing or publishing any node.
+Bitmap ranges are found by their ordered keys, with coverage and body bounds
+checked across every bitmap boundary. The on-disk format is unchanged.
+
 Filesystem constructors execute without the registry lock held. Missing
 sources return `FsError::NotFound`; failed construction publishes no mount.
 Device ownership remains pinned by the returned filesystem instance.

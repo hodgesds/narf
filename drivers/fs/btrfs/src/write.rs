@@ -61,6 +61,9 @@ use crate::allocator::Allocator;
 
 pub(crate) mod chunk_alloc;
 pub(crate) mod fileops;
+#[cfg(feature = "kernel-test")]
+#[path = "write/free_space_tests.rs"]
+mod free_space_tests;
 use crate::block_group::{self, BgHome};
 use crate::btree::{
     self, internal_blockptr, internal_child_slot, internal_key, leaf_item_data, leaf_item_key,
@@ -385,36 +388,38 @@ fn block_group_of(buf: &[u8], addr: u64) -> Result<Option<(u64, u64)>, FsError> 
 /// bitmaps (`BTRFS_FREE_SPACE_USING_BITMAPS`).
 const FREE_SPACE_USING_BITMAPS: u32 = 1;
 
-/// Adjust an extent-mode block group's `FREE_SPACE_INFO.extent_count` by `delta`.
-fn fst_info_adjust(fst_leaf: &mut [u8], bg_start: u64, delta: i64) -> Result<(), FsError> {
+/// Find one group's info item without walking every group and free extent.
+fn fst_info_slot(fst_leaf: &[u8], bg_start: u64) -> Result<usize, FsError> {
     let n = nritems(fst_leaf)? as usize;
-    for i in 0..n {
-        let k = leaf_item_key(fst_leaf, i)?;
-        if k.item_type == format::FREE_SPACE_INFO_KEY && k.objectid == bg_start {
-            let (off, _s) = leaf_item_span(fst_leaf, i)?;
-            let start = HEADER_SIZE + off;
-            let count = format::le32(fst_leaf, start)?;
-            let new = (count as i64 + delta) as u32;
-            fst_leaf[start..start + 4].copy_from_slice(&new.to_le_bytes());
-            return Ok(());
+    let slot = leaf_lower_bound(
+        fst_leaf,
+        n,
+        &BtrfsKey::new(bg_start, format::FREE_SPACE_INFO_KEY, 0),
+    )?;
+    if slot < n {
+        let key = leaf_item_key(fst_leaf, slot)?;
+        if key.objectid == bg_start && key.item_type == format::FREE_SPACE_INFO_KEY {
+            return Ok(slot);
         }
     }
     Err(FsError::InvalidData)
 }
 
+/// Adjust an extent-mode block group's `FREE_SPACE_INFO.extent_count` by `delta`.
+fn fst_info_adjust(fst_leaf: &mut [u8], bg_start: u64, delta: i64) -> Result<(), FsError> {
+    let slot = fst_info_slot(fst_leaf, bg_start)?;
+    let count = format::le32(leaf_item_data(fst_leaf, slot)?, 0)?;
+    let (off, _) = leaf_item_span(fst_leaf, slot)?;
+    let count = (i64::from(count) + delta) as u32;
+    fst_leaf[HEADER_SIZE + off..HEADER_SIZE + off + 4].copy_from_slice(&count.to_le_bytes());
+    Ok(())
+}
+
 /// Whether the block group at `bg_start` tracks free space with bitmaps.
 fn fst_bg_uses_bitmaps(fst_leaf: &[u8], bg_start: u64) -> Result<bool, FsError> {
-    let n = nritems(fst_leaf)? as usize;
-    for i in 0..n {
-        let k = leaf_item_key(fst_leaf, i)?;
-        if k.item_type == format::FREE_SPACE_INFO_KEY && k.objectid == bg_start {
-            let (off, _) = leaf_item_span(fst_leaf, i)?;
-            // FREE_SPACE_INFO body: extent_count@0, flags@4.
-            let flags = format::le32(fst_leaf, HEADER_SIZE + off + 4)?;
-            return Ok(flags & FREE_SPACE_USING_BITMAPS != 0);
-        }
-    }
-    Err(FsError::InvalidData)
+    let slot = fst_info_slot(fst_leaf, bg_start)?;
+    let flags = format::le32(leaf_item_data(fst_leaf, slot)?, 4)?;
+    Ok(flags & FREE_SPACE_USING_BITMAPS != 0)
 }
 
 /// Set (`free`) or clear the bit for every sector of `[start, start+len)` in the
@@ -428,34 +433,49 @@ fn fst_bitmap_set(
     len: u64,
     free: bool,
 ) -> Result<(), FsError> {
+    if sectorsize == 0 || start % sectorsize != 0 || len % sectorsize != 0 {
+        return Err(FsError::InvalidData);
+    }
+    let end = start.checked_add(len).ok_or(FsError::InvalidData)?;
+    let n = nritems(fst_leaf)? as usize;
     let mut addr = start;
-    while addr < start + len {
-        let n = nritems(fst_leaf)? as usize;
-        let mut hit: Option<(usize, u64)> = None;
-        for i in 0..n {
-            let k = leaf_item_key(fst_leaf, i)?;
-            if k.item_type == format::FREE_SPACE_BITMAP_KEY
-                && k.objectid <= addr
-                && addr < k.objectid.saturating_add(k.offset)
-            {
-                hit = Some((i, k.objectid));
-                break;
-            }
-        }
-        let (slot, range_start) = hit.ok_or(FsError::InvalidData)?;
-        let (off, size) = leaf_item_span(fst_leaf, slot)?;
-        let bit = ((addr - range_start) / sectorsize) as usize;
-        if bit / 8 >= size {
+    while addr < end {
+        // The last key at/below addr must be the containing bitmap. Info
+        // sorts before a bitmap with the same start; other item kinds or
+        // gaps are errors, never an invitation to alter a neighbouring map.
+        let after = leaf_lower_bound(fst_leaf, n, &BtrfsKey::new(addr, u8::MAX, u64::MAX))?;
+        let slot = after.checked_sub(1).ok_or(FsError::InvalidData)?;
+        let key = leaf_item_key(fst_leaf, slot)?;
+        let map_end = key
+            .objectid
+            .checked_add(key.offset)
+            .ok_or(FsError::InvalidData)?;
+        if key.item_type != format::FREE_SPACE_BITMAP_KEY
+            || addr < key.objectid
+            || addr >= map_end
+            || key.objectid % sectorsize != 0
+            || key.offset % sectorsize != 0
+        {
             return Err(FsError::InvalidData);
         }
-        let byte = HEADER_SIZE + off + bit / 8;
-        let mask = 1u8 << (bit % 8);
-        if free {
-            fst_leaf[byte] |= mask;
-        } else {
-            fst_leaf[byte] &= !mask;
+        let (off, size) = leaf_item_span(fst_leaf, slot)?;
+        let body = leaf_item_data(fst_leaf, slot)?;
+        if key.offset / sectorsize > body.len() as u64 * 8 {
+            return Err(FsError::InvalidData);
         }
-        addr += sectorsize;
+        let part_end = end.min(map_end);
+        let first = ((addr - key.objectid) / sectorsize) as usize;
+        let limit = ((part_end - key.objectid) / sectorsize) as usize;
+        let body = &mut fst_leaf[HEADER_SIZE + off..HEADER_SIZE + off + size];
+        for bit in first..limit {
+            let mask = 1u8 << (bit % 8);
+            if free {
+                body[bit / 8] |= mask;
+            } else {
+                body[bit / 8] &= !mask;
+            }
+        }
+        addr = part_end;
     }
     Ok(())
 }
@@ -472,14 +492,19 @@ fn fst_bitmap_recount(
     let bg_end = bg_start + bg_len;
     let mut maps: Vec<(u64, usize, usize)> = Vec::new(); // (range_start, off, nbits)
     let n = nritems(fst_leaf)? as usize;
-    for i in 0..n {
+    let first = leaf_lower_bound(fst_leaf, n, &BtrfsKey::new(bg_start, 0, 0))?;
+    for i in first..n {
         let k = leaf_item_key(fst_leaf, i)?;
-        if k.item_type == format::FREE_SPACE_BITMAP_KEY
-            && k.objectid >= bg_start
-            && k.objectid < bg_end
-        {
-            let (off, _size) = leaf_item_span(fst_leaf, i)?;
-            maps.push((k.objectid, off, (k.offset / sectorsize) as usize));
+        if k.objectid >= bg_end {
+            break;
+        }
+        if k.item_type == format::FREE_SPACE_BITMAP_KEY {
+            let (off, size) = leaf_item_span(fst_leaf, i)?;
+            let nbits = (k.offset / sectorsize) as usize;
+            if nbits > size * 8 {
+                return Err(FsError::InvalidData);
+            }
+            maps.push((k.objectid, off, nbits));
         }
     }
     maps.sort_unstable_by_key(|m| m.0);
@@ -499,16 +524,24 @@ fn fst_bitmap_recount(
         }
         prev_end = range_start + nbits as u64 * sectorsize;
     }
-    let n = nritems(fst_leaf)? as usize;
-    for i in 0..n {
-        let k = leaf_item_key(fst_leaf, i)?;
-        if k.item_type == format::FREE_SPACE_INFO_KEY && k.objectid == bg_start {
-            let (off, _) = leaf_item_span(fst_leaf, i)?;
-            fst_leaf[HEADER_SIZE + off..HEADER_SIZE + off + 4].copy_from_slice(&runs.to_le_bytes());
-            return Ok(());
-        }
+    let slot = fst_info_slot(fst_leaf, bg_start)?;
+    let _ = format::le32(leaf_item_data(fst_leaf, slot)?, 0)?;
+    let (off, _) = leaf_item_span(fst_leaf, slot)?;
+    fst_leaf[HEADER_SIZE + off..HEADER_SIZE + off + 4].copy_from_slice(&runs.to_le_bytes());
+    Ok(())
+}
+
+/// The logical leaf is private commit scratch. Recount each changed bitmap
+/// group once after all allocations/frees, before any node is packed/written.
+fn fst_finish_bitmaps(
+    fst_leaf: &mut [u8],
+    sectorsize: u64,
+    dirty: &BTreeSet<(u64, u64)>,
+) -> Result<(), FsError> {
+    for &(start, len) in dirty {
+        fst_bitmap_recount(fst_leaf, sectorsize, start, len)?;
     }
-    Err(FsError::InvalidData)
+    Ok(())
 }
 
 /// Mark `[start, start+len)` USED in the free-space tree. In a bitmap block group
@@ -521,10 +554,12 @@ fn fst_mark_used(
     bg_len: u64,
     start: u64,
     len: u64,
+    dirty_bitmaps: &mut BTreeSet<(u64, u64)>,
 ) -> Result<(), FsError> {
     if fst_bg_uses_bitmaps(fst_leaf, bg_start)? {
         fst_bitmap_set(fst_leaf, sectorsize, start, len, false)?;
-        return fst_bitmap_recount(fst_leaf, sectorsize, bg_start, bg_len);
+        dirty_bitmaps.insert((bg_start, bg_len));
+        return Ok(());
     }
     let end = start + len;
     let n = nritems(fst_leaf)? as usize;
@@ -572,10 +607,12 @@ fn fst_mark_free(
     bg_len: u64,
     start: u64,
     len: u64,
+    dirty_bitmaps: &mut BTreeSet<(u64, u64)>,
 ) -> Result<(), FsError> {
     if fst_bg_uses_bitmaps(fst_leaf, bg_start)? {
         fst_bitmap_set(fst_leaf, sectorsize, start, len, true)?;
-        return fst_bitmap_recount(fst_leaf, sectorsize, bg_start, bg_len);
+        dirty_bitmaps.insert((bg_start, bg_len));
+        return Ok(());
     }
     let bg_end = bg_start + bg_len;
     let mut new_start = start;
@@ -5517,22 +5554,24 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
         let (fst_final, fst_groups) = match &fst_base {
             Some(fb) => {
                 let mut ff = fb.clone();
+                let mut dirty_bitmaps = BTreeSet::new();
                 for &(a, _, _) in &new_meta {
                     let (s, l) = bg_of(&bgs, a).ok_or(FsError::InvalidData)?;
-                    fst_mark_used(&mut ff, ss, s, l, a, nodesize)?;
+                    fst_mark_used(&mut ff, ss, s, l, a, nodesize, &mut dirty_bitmaps)?;
                 }
                 for d in &txn.new_data {
                     let (s, l) = bg_of(&bgs, d.id.bytenr).ok_or(FsError::InvalidData)?;
-                    fst_mark_used(&mut ff, ss, s, l, d.id.bytenr, d.id.len)?;
+                    fst_mark_used(&mut ff, ss, s, l, d.id.bytenr, d.id.len, &mut dirty_bitmaps)?;
                 }
                 for &(a, _) in &freed_meta {
                     let (s, l) = bg_of(&bgs, a).ok_or(FsError::InvalidData)?;
-                    fst_mark_free(&mut ff, ss, s, l, a, nodesize)?;
+                    fst_mark_free(&mut ff, ss, s, l, a, nodesize, &mut dirty_bitmaps)?;
                 }
                 for &(b, l2) in &data_changes.released {
                     let (s, l) = bg_of(&bgs, b).ok_or(FsError::InvalidData)?;
-                    fst_mark_free(&mut ff, ss, s, l, b, l2)?;
+                    fst_mark_free(&mut ff, ss, s, l, b, l2, &mut dirty_bitmaps)?;
                 }
+                fst_finish_bitmaps(&mut ff, ss, &dirty_bitmaps)?;
                 let mut g = group_items(vol, &ff)?;
                 // The leaf count feeds back into the allocation (its blocks
                 // are this round's), and the allocation into the free-space
@@ -9899,6 +9938,7 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
         // Free-space tree: full DATA groups, the METADATA group's remaining
         // suffix, carved system blocks, and every freed old block.
         let mut fst_final = fst_base.clone();
+        let mut dirty_bitmaps = BTreeSet::new();
         for chunk in &chunks {
             let used = if chunk.logical == meta_chunk.logical {
                 newbg_used
@@ -9920,7 +9960,15 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
         for &(blk, _) in &freed_meta {
             let bg_leaf = bgt_base.as_deref().unwrap_or(&ext_final);
             let (s, l) = block_group_of(bg_leaf, blk)?.ok_or(FsError::InvalidData)?;
-            fst_mark_free(&mut fst_final, vol.sectorsize() as u64, s, l, blk, nodesize)?;
+            fst_mark_free(
+                &mut fst_final,
+                vol.sectorsize() as u64,
+                s,
+                l,
+                blk,
+                nodesize,
+                &mut dirty_bitmaps,
+            )?;
         }
         if !added_system_chunk {
             for &addr in &chunk_addrs {
@@ -9931,9 +9979,11 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
                     system_chunk.length,
                     addr,
                     nodesize,
+                    &mut dirty_bitmaps,
                 )?;
             }
         }
+        fst_finish_bitmaps(&mut fst_final, vol.sectorsize() as u64, &dirty_bitmaps)?;
         let fst_groups = group_items(vol, &fst_final)?;
 
         if ext_groups.len() == ext_leaves && fst_groups.len() == fst_leaves {
