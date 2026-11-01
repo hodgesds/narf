@@ -16,7 +16,9 @@
 //!   Public.
 //!   <https://www.usb.org/document-library/class-definitions-communication-devices-12>
 //!
-//! No GPL Linux source consulted.
+//! No GPL Linux source consulted for the NTB-16 core; the NTB-32
+//! addition follows NCM 1.0 §3.3 directly (its constant values
+//! match the public Linux uapi header, which restates the spec).
 //!
 //! ## Why NCM
 //!
@@ -29,11 +31,11 @@
 //!    MAC address (string-descriptor index) + supported features.
 //! 2. Issues `GET_NTB_PARAMETERS` to learn max NTB sizes,
 //!    alignment, NDP type (NDP16 / NDP32), and datagram counts.
-//! 3. RX: reads NTBs from bulk IN, parses the NTH16 header, walks
-//!    the NDP16 datagram-pointer table, hands each Ethernet
-//!    frame to the network stack.
-//! 4. TX: batches Ethernet frames into NTBs, builds an NDP16
-//!    pointer table, ships the NTB on bulk OUT.
+//! 3. RX: reads NTBs from bulk IN, parses the NTH16/NTH32
+//!    header, walks the NDP16/NDP32 datagram-pointer table,
+//!    hands each Ethernet frame to the network stack.
+//! 4. TX: batches Ethernet frames into NTBs, builds an
+//!    NDP16/NDP32 pointer table, ships the NTB on bulk OUT.
 //!
 //! ## NTB-16 layout (§3.2)
 //!
@@ -88,6 +90,11 @@ pub const NTH32_SIGNATURE: u32 = 0x686D_636E;
 /// `NDP16` signature — "NCM0" (no CRC) or "NCM1" (CRC).
 pub const NDP16_SIGNATURE_NO_CRC: u32 = 0x304D_434E;
 pub const NDP16_SIGNATURE_CRC: u32 = 0x314D_434E;
+/// `NDP32` signature — "ncm0" (no CRC) or "ncm1" (CRC).
+/// Lowercase, unlike NDP16's uppercase signatures (NCM 1.0
+/// §3.3).
+pub const NDP32_SIGNATURE_NO_CRC: u32 = 0x306D_636E;
+pub const NDP32_SIGNATURE_CRC: u32 = 0x316D_636E;
 
 // ── GET_NTB_PARAMETERS response (NCM 1.0 §6.2.1) ─────────────────
 
@@ -616,6 +623,293 @@ impl<'a> ParsedNtb<'a> {
     }
 }
 
+// ── NTB-32 framing (NCM 1.0 §3.3) ────────────────────────────────
+//
+// Same shape as NTB-16 with 32-bit fields: a 16-byte NTH32
+// (signature, header length, sequence, block length, NDP
+// index) followed by datagrams and a 16-byte-header NDP32
+// (signature, length, reserved, next-NDP index, reserved) with
+// 8-byte entries (offset, length) and a trailing `{0,0}`
+// sentinel. `SET_NTB_FORMAT` selects it with wValue 1.
+
+/// NTB-32 transfer-header (NTH32) — 16 bytes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Nth32 {
+    /// `dwSignature` — must be [`NTH32_SIGNATURE`].
+    pub signature: u32,
+    /// `wHeaderLength` — must be 16 for NTB-32.
+    pub header_length: u16,
+    /// `wSequence` — host-monotonic, echoed in responses.
+    pub sequence: u16,
+    /// `dwBlockLength` — total NTB size in bytes (header +
+    /// datagrams + NDP).
+    pub block_length: u32,
+    /// `dwNdpIndex` — byte offset of the first NDP32 within
+    /// this NTB.
+    pub ndp_index: u32,
+}
+
+impl Nth32 {
+    pub const LEN: usize = 16;
+
+    pub fn encode(&self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[0..4].copy_from_slice(&self.signature.to_le_bytes());
+        b[4..6].copy_from_slice(&self.header_length.to_le_bytes());
+        b[6..8].copy_from_slice(&self.sequence.to_le_bytes());
+        b[8..12].copy_from_slice(&self.block_length.to_le_bytes());
+        b[12..16].copy_from_slice(&self.ndp_index.to_le_bytes());
+        b
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, NcmError> {
+        if bytes.len() < Self::LEN {
+            return Err(NcmError::Truncated);
+        }
+        let signature = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        if signature != NTH32_SIGNATURE {
+            return Err(NcmError::BadSignature(signature));
+        }
+        let header_length = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        if header_length as usize != Self::LEN {
+            return Err(NcmError::BadFieldLength);
+        }
+        Ok(Self {
+            signature,
+            header_length,
+            sequence: u16::from_le_bytes(bytes[6..8].try_into().unwrap()),
+            block_length: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            ndp_index: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+        })
+    }
+}
+
+/// NDP32 datagram-pointer entry — `(offset, length)` pair.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DatagramPtr32 {
+    pub offset: u32,
+    pub length: u32,
+}
+
+/// NDP32 — 16 bytes of header + N+1 entries (the trailing
+/// entry is `{0,0}` as a sentinel).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ndp32 {
+    /// `dwSignature` — `ncm0` (no CRC) or `ncm1` (CRC).
+    pub signature: u32,
+    /// `wLength` — total NDP length including trailing zero
+    /// sentinel.
+    pub length: u16,
+    /// `dwNextNdpIndex` — offset of next NDP in this NTB, or
+    /// 0 if none.
+    pub next_ndp_index: u32,
+    pub entries: Vec<DatagramPtr32>,
+}
+
+impl Ndp32 {
+    /// Header length (signature + length + reserved +
+    /// next-NDP index + reserved).
+    pub const HEADER_LEN: usize = 16;
+    /// Per-entry size (offset + length).
+    pub const ENTRY_LEN: usize = 8;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let body = Self::HEADER_LEN + (self.entries.len() + 1) * Self::ENTRY_LEN;
+        let mut b = alloc::vec![0u8; body];
+        b[0..4].copy_from_slice(&self.signature.to_le_bytes());
+        b[4..6].copy_from_slice(&(body as u16).to_le_bytes());
+        // b[6..8] = wReserved6, zero.
+        b[8..12].copy_from_slice(&self.next_ndp_index.to_le_bytes());
+        // b[12..16] = dwReserved12, zero.
+        for (i, entry) in self.entries.iter().enumerate() {
+            let off = Self::HEADER_LEN + i * Self::ENTRY_LEN;
+            b[off..off + 4].copy_from_slice(&entry.offset.to_le_bytes());
+            b[off + 4..off + 8].copy_from_slice(&entry.length.to_le_bytes());
+        }
+        // Trailing {0,0} sentinel was zeroed by initial vec
+        // allocation; nothing more to do.
+        b
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, NcmError> {
+        if bytes.len() < Self::HEADER_LEN {
+            return Err(NcmError::Truncated);
+        }
+        let signature = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        if signature != NDP32_SIGNATURE_NO_CRC && signature != NDP32_SIGNATURE_CRC {
+            return Err(NcmError::BadSignature(signature));
+        }
+        let length = u16::from_le_bytes(bytes[4..6].try_into().unwrap()) as usize;
+        if length < Self::HEADER_LEN + Self::ENTRY_LEN || length > bytes.len() {
+            return Err(NcmError::BadFieldLength);
+        }
+        let next_ndp_index = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let entries_bytes = &bytes[Self::HEADER_LEN..length];
+        if entries_bytes.len() % Self::ENTRY_LEN != 0 {
+            return Err(NcmError::BadFieldLength);
+        }
+        let mut entries = Vec::with_capacity(entries_bytes.len() / Self::ENTRY_LEN);
+        for chunk in entries_bytes.chunks_exact(Self::ENTRY_LEN) {
+            let off = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+            let len = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+            // Stop at the first sentinel — entries past it are
+            // padding only.
+            if off == 0 && len == 0 {
+                break;
+            }
+            entries.push(DatagramPtr32 {
+                offset: off,
+                length: len,
+            });
+        }
+        Ok(Self {
+            signature,
+            length: length as u16,
+            next_ndp_index,
+            entries,
+        })
+    }
+}
+
+/// Negotiated NTB format, from `bmNtbFormatsSupported`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NtbFormat {
+    Ntb16,
+    Ntb32,
+}
+
+/// Select the NTB format for bind negotiation: NTB-32 when the
+/// device offers it (bit 1), else NTB-16 (bit 0), else `None`
+/// (no usable format offered — the caller keeps defaults and
+/// sends no `SET_NTB_FORMAT`). Preferring 32 when offered is
+/// the point of completing the format: 32-bit block lengths
+/// lift the 64 KiB NTB ceiling NTB-16's `wBlockLength` imposes.
+pub fn select_ntb_format(formats_supported: u16) -> Option<NtbFormat> {
+    if formats_supported & 0x02 != 0 {
+        Some(NtbFormat::Ntb32)
+    } else if formats_supported & 0x01 != 0 {
+        Some(NtbFormat::Ntb16)
+    } else {
+        None
+    }
+}
+
+/// Build a complete NTB-32 from `datagrams`. The output layout
+/// is:
+///
+/// ```text
+///   NTH32 (16 bytes)
+///   datagram 0
+///   ...
+///   datagram N-1
+///   NDP32 (16 bytes header + (N+1) * 8 bytes entries)
+/// ```
+///
+/// `sequence` is the host-monotonic counter the receiver echoes
+/// back. `crc` selects the NDP32 signature (ncm0 vs ncm1).
+pub fn build_ntb32(sequence: u16, datagrams: &[&[u8]], crc: bool) -> Result<Vec<u8>, NcmError> {
+    let mut datagram_block_size = 0usize;
+    for d in datagrams {
+        datagram_block_size += d.len();
+    }
+    let ndp_size = Ndp32::HEADER_LEN + (datagrams.len() + 1) * Ndp32::ENTRY_LEN;
+    if ndp_size > u16::MAX as usize {
+        return Err(NcmError::NtbTooLarge);
+    }
+    let total = Nth32::LEN + datagram_block_size + ndp_size;
+    if total > u32::MAX as usize {
+        return Err(NcmError::NtbTooLarge);
+    }
+    let ndp_index = (Nth32::LEN + datagram_block_size) as u32;
+
+    let mut buf = alloc::vec![0u8; total];
+    let nth = Nth32 {
+        signature: NTH32_SIGNATURE,
+        header_length: Nth32::LEN as u16,
+        sequence,
+        block_length: total as u32,
+        ndp_index,
+    };
+    buf[0..Nth32::LEN].copy_from_slice(&nth.encode());
+
+    let mut entries = Vec::with_capacity(datagrams.len());
+    let mut cursor = Nth32::LEN;
+    for d in datagrams {
+        if d.is_empty() {
+            return Err(NcmError::DatagramOutOfBounds);
+        }
+        buf[cursor..cursor + d.len()].copy_from_slice(d);
+        entries.push(DatagramPtr32 {
+            offset: cursor as u32,
+            length: d.len() as u32,
+        });
+        cursor += d.len();
+    }
+    let ndp = Ndp32 {
+        signature: if crc {
+            NDP32_SIGNATURE_CRC
+        } else {
+            NDP32_SIGNATURE_NO_CRC
+        },
+        length: ndp_size as u16,
+        next_ndp_index: 0,
+        entries,
+    };
+    let ndp_bytes = ndp.encode();
+    buf[ndp_index as usize..ndp_index as usize + ndp_bytes.len()].copy_from_slice(&ndp_bytes);
+    Ok(buf)
+}
+
+/// Parsed NTB-32 ready for datagram-by-datagram extraction.
+#[derive(Debug)]
+pub struct ParsedNtb32<'a> {
+    pub nth: Nth32,
+    pub ndp: Ndp32,
+    raw: &'a [u8],
+}
+
+impl<'a> ParsedNtb32<'a> {
+    pub fn parse(ntb: &'a [u8]) -> Result<Self, NcmError> {
+        let nth = Nth32::decode(ntb)?;
+        if nth.block_length as usize > ntb.len() {
+            return Err(NcmError::Truncated);
+        }
+        if nth.ndp_index as usize >= nth.block_length as usize {
+            return Err(NcmError::BadFieldLength);
+        }
+        let ndp_slice = &ntb[nth.ndp_index as usize..nth.block_length as usize];
+        let ndp = Ndp32::decode(ndp_slice)?;
+        Ok(Self { nth, ndp, raw: ntb })
+    }
+
+    /// Borrow the `i`-th datagram from the NTB. Bounds-checked
+    /// against `nth.block_length`.
+    pub fn datagram(&self, i: usize) -> Option<&'a [u8]> {
+        let entry = self.ndp.entries.get(i)?;
+        let off = entry.offset as usize;
+        let end = off.checked_add(entry.length as usize)?;
+        if end > self.nth.block_length as usize {
+            return None;
+        }
+        self.raw.get(off..end)
+    }
+
+    /// Number of datagrams in this NTB.
+    pub fn len(&self) -> usize {
+        self.ndp.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ndp.entries.is_empty()
+    }
+
+    /// True when the NDP signature marks CRC mode (`ncm1`): each
+    /// datagram in this NTB carries a trailing CRC-32.
+    pub fn uses_crc(&self) -> bool {
+        self.ndp.signature == NDP32_SIGNATURE_CRC
+    }
+}
+
 // ── CRC mode support (NCM 1.0 §3.2) ──────────────────────────────
 //
 // When CRC mode is negotiated on, the sender appends a CRC-32
@@ -681,6 +975,51 @@ pub fn for_each_frame(ntb: &[u8], f: &mut dyn FnMut(&[u8])) -> Result<(usize, us
         delivered += 1;
     }
     Ok((delivered, dropped))
+}
+
+/// NTB-32 mirror of [`for_each_frame`]: same walk, CRC, and
+/// drop semantics over a parsed NTB-32.
+pub fn for_each_frame32(ntb: &[u8], f: &mut dyn FnMut(&[u8])) -> Result<(usize, usize), NcmError> {
+    let parsed = ParsedNtb32::parse(ntb)?;
+    let crc = parsed.uses_crc();
+    let mut delivered = 0usize;
+    let mut dropped = 0usize;
+    for i in 0..parsed.len() {
+        let Some(dg) = parsed.datagram(i) else {
+            continue;
+        };
+        if crc {
+            if dg.len() < 4 {
+                dropped += 1;
+                continue;
+            }
+            let (frame, tail) = dg.split_at(dg.len() - 4);
+            let want = u32::from_le_bytes(tail.try_into().unwrap());
+            if crc32_ieee(frame) != want {
+                dropped += 1;
+                continue;
+            }
+            f(frame);
+        } else {
+            f(dg);
+        }
+        delivered += 1;
+    }
+    Ok((delivered, dropped))
+}
+
+/// Format-dispatched walk for the RX pump: NTB-32 when the
+/// device negotiated it, NTB-16 otherwise.
+pub fn for_each_frame_ntb(
+    ntb: &[u8],
+    ntb32: bool,
+    f: &mut dyn FnMut(&[u8]),
+) -> Result<(usize, usize), NcmError> {
+    if ntb32 {
+        for_each_frame32(ntb, f)
+    } else {
+        for_each_frame(ntb, f)
+    }
 }
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -1115,6 +1454,7 @@ pub mod tests {
             ntb_in_max_size: 4096,
             ntb_out_max_size: 16384,
             crc_enabled: false,
+            ntb32: false,
             iface_name: alloc::format!("usb-ncm-model-{}", slot_id),
             pump_running: false,
             detached: false,
@@ -1135,9 +1475,9 @@ pub mod tests {
         }
         match (s1a, s1b, s0) {
             (
-                Some((9, 6, 0, false, 4096)),
-                Some((9, 6, 1, false, 4096)),
-                Some((7, 4, 0, false, 4096)),
+                Some((9, 6, 0, false, 4096, false)),
+                Some((9, 6, 1, false, 4096, false)),
+                Some((7, 4, 0, false, 4096, false)),
             ) => {}
             _ => return TestResult::Fail("per-device TX state wrong or shared"),
         }
@@ -1174,6 +1514,7 @@ pub mod tests {
             ntb_in_max_size: 4096,
             ntb_out_max_size: 16384,
             crc_enabled: false,
+            ntb32: false,
             iface_name: alloc::format!("usb-ncm-detach{}", slot_id),
             pump_running: true,
             detached: false,
@@ -1312,6 +1653,7 @@ pub mod tests {
                 ntb_in_max_size: 4096,
                 ntb_out_max_size: 16384,
                 crc_enabled: false,
+                ntb32: false,
                 iface_name: alloc::format!("usb-ncm-detach{}", 7),
                 pump_running: true,
                 detached: false,
@@ -1333,6 +1675,299 @@ pub mod tests {
         "drivers/usb/cdc_ncm",
         smoke_ncm_dispatch_unbind_reaches_detach
     );
+
+    /// #789 remainder (a): rebind-on-redock proof. Two modelled
+    /// NCM devices bind with real net ifaces; the supervisor's
+    /// `dispatch_unbind` path detaches the first; a re-push of
+    /// the same slot — the shape bind takes on replug, after
+    /// the supervisor cleared the port claim — lands at a fresh
+    /// index with a fresh iface name, TX state resolves to the
+    /// NEW device (with a fresh sequence counter), and the old
+    /// cookie fail-closes.
+    fn smoke_ncm_redock_rebind_via_dispatch() -> TestResult {
+        __reset_ncm_for_test();
+        let mk = |slot_id: u8, out_dci: u8| CdcNcmDevice {
+            slot_id,
+            comm_iface: 0,
+            data_iface: 1,
+            bulk_in_dci: 3,
+            bulk_out_dci: out_dci,
+            tx_sequence: 0,
+            mac: [0x02, 0, 0, 0, 0, slot_id],
+            ntb_in_max_size: 4096,
+            ntb_out_max_size: 16384,
+            crc_enabled: false,
+            ntb32: false,
+            iface_name: alloc::format!("usb-ncm-detach{}", slot_id),
+            pump_running: true,
+            detached: false,
+        };
+        {
+            let mut g = CDC_NCM_DEVICES.lock();
+            g.push(mk(7, 4));
+            g.push(mk(9, 6));
+        }
+        let (name7, name9) = {
+            let mut g = CDC_NCM_DEVICES.lock();
+            let n7 = narf_net::iface::register_with_context(
+                "usb-ncm0",
+                [0x02, 0, 0, 0, 0, 7],
+                0,
+                ncm_send_ctx,
+            );
+            let n9 = narf_net::iface::register_with_context(
+                "usb-ncm1",
+                [0x02, 0, 0, 0, 0, 9],
+                1,
+                ncm_send_ctx,
+            );
+            g[0].iface_name = n7.clone();
+            g[1].iface_name = n9.clone();
+            (n7, n9)
+        };
+        if narf_net::iface::lookup(&name7).is_none() || narf_net::iface::lookup(&name9).is_none() {
+            __reset_ncm_for_test();
+            return TestResult::Fail("net ifaces must resolve before detach");
+        }
+        register_initcalls();
+        let report = crate::class_registry::dispatch_unbind(7);
+        if report.invoked == 0 {
+            __reset_ncm_for_test();
+            return TestResult::Fail("dispatch_unbind invoked no hooks");
+        }
+        if tx_target(0).is_some()
+            || take_tx_state(0).is_some()
+            || narf_net::iface::lookup(&name7).is_some()
+            || tx_target(1) != Some((9, 6))
+        {
+            __reset_ncm_for_test();
+            return TestResult::Fail("dispatch detach must tombstone exactly one binding");
+        }
+        // Re-plug: fresh record, published under the production
+        // name rule with a real net iface, fresh TX sequence —
+        // never a recycled cookie or name.
+        let idx = {
+            let mut g = CDC_NCM_DEVICES.lock();
+            let idx = g.len();
+            g.push(mk(7, 4));
+            let requested = alloc::format!("usb-ncm{}", idx);
+            let assigned = narf_net::iface::register_with_context(
+                &requested,
+                [0x02, 0, 0, 0, 0, 7],
+                idx as u64,
+                ncm_send_ctx,
+            );
+            g[idx].iface_name = assigned;
+            idx
+        };
+        if idx != 2 {
+            __reset_ncm_for_test();
+            return TestResult::Fail("re-bind must not reuse a tombstoned index");
+        }
+        let fresh = {
+            let g = CDC_NCM_DEVICES.lock();
+            g[idx].iface_name.clone()
+        };
+        // take_tx_state takes the registry lock itself, so it
+        // must run with no guard held here. A fresh record
+        // means a fresh sequence counter (0), not the detached
+        // record's advanced counter.
+        let state = take_tx_state(idx);
+        if fresh == name7
+            || tx_target(idx) != Some((7, 4))
+            || tx_target(0).is_some()
+            || narf_net::iface::lookup(&fresh).is_none()
+            || state != Some((7, 4, 0, false, 4096, false))
+        {
+            __reset_ncm_for_test();
+            return TestResult::Fail("re-bind must publish fresh and keep the old cookie dead");
+        }
+        let _ = detach_ncm_slot(7);
+        __reset_ncm_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_ncm_redock_rebind_via_dispatch);
+
+    fn smoke_ncm_ntb_format_selection() -> TestResult {
+        if select_ntb_format(0x0003) != Some(NtbFormat::Ntb32) {
+            return TestResult::Fail("both formats offered must select NTB-32");
+        }
+        if select_ntb_format(0x0002) != Some(NtbFormat::Ntb32) {
+            return TestResult::Fail("NTB-32-only must select NTB-32");
+        }
+        if select_ntb_format(0x0001) != Some(NtbFormat::Ntb16) {
+            return TestResult::Fail("NTB-16-only must select NTB-16");
+        }
+        if select_ntb_format(0x0000).is_some() {
+            return TestResult::Fail("no format offered must select nothing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_ncm_ntb_format_selection);
+
+    fn smoke_ncm_ntb32_exact_layout() -> TestResult {
+        // One 3-byte datagram: NTH32 (16) + "abc" + NDP32
+        // (16 header + 2 entries * 8) = 51 bytes total,
+        // NDP at offset 19.
+        let ntb = match build_ntb32(7, &[b"abc"], false) {
+            Ok(n) => n,
+            Err(_) => return TestResult::Fail("clean NTB-32 build rejected"),
+        };
+        if ntb.len() != 51 {
+            return TestResult::Fail("NTB-32 total length wrong");
+        }
+        // NTH32 header bytes, field by field.
+        if ntb[0..4] != NTH32_SIGNATURE.to_le_bytes()
+            || ntb[4..6] != 16u16.to_le_bytes()
+            || ntb[6..8] != 7u16.to_le_bytes()
+            || ntb[8..12] != 51u32.to_le_bytes()
+            || ntb[12..16] != 19u32.to_le_bytes()
+        {
+            return TestResult::Fail("NTH32 header bytes wrong");
+        }
+        if &ntb[16..19] != b"abc" {
+            return TestResult::Fail("NTB-32 datagram bytes wrong");
+        }
+        // NDP32 header: "ncm0", length 32, reserved 0, next 0,
+        // reserved 0; entry (offset 16, length 3); sentinel.
+        let ndp = &ntb[19..];
+        if ndp[0..4] != NDP32_SIGNATURE_NO_CRC.to_le_bytes()
+            || ndp[4..6] != 32u16.to_le_bytes()
+            || ndp[6..8] != [0, 0]
+            || ndp[8..12] != 0u32.to_le_bytes()
+            || ndp[12..16] != 0u32.to_le_bytes()
+            || ndp[16..20] != 16u32.to_le_bytes()
+            || ndp[20..24] != 3u32.to_le_bytes()
+            || ndp[24..32] != [0u8; 8]
+        {
+            return TestResult::Fail("NDP32 bytes wrong");
+        }
+        // Parse round-trip recovers the header and datagram.
+        let parsed = match ParsedNtb32::parse(&ntb) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("clean NTB-32 parse rejected"),
+        };
+        if parsed.nth.sequence != 7
+            || parsed.nth.block_length != 51
+            || parsed.nth.ndp_index != 19
+            || parsed.len() != 1
+            || parsed.datagram(0) != Some(b"abc".as_slice())
+            || parsed.uses_crc()
+        {
+            return TestResult::Fail("NTB-32 parse round-trip wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_ncm_ntb32_exact_layout);
+
+    fn smoke_ncm_ntb32_multi_and_crc() -> TestResult {
+        // Two datagrams, CRC mode: the NDP32 signature flips
+        // to "ncm1" and for_each_frame32 verifies + strips the
+        // trailing CRC-32 of each datagram.
+        let d1 = append_crc(b"hello");
+        let d2 = append_crc(b"world!");
+        let ntb = match build_ntb32(3, &[&d1, &d2], true) {
+            Ok(n) => n,
+            Err(_) => return TestResult::Fail("CRC NTB-32 build rejected"),
+        };
+        let parsed = match ParsedNtb32::parse(&ntb) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("CRC NTB-32 parse rejected"),
+        };
+        if !parsed.uses_crc() || parsed.len() != 2 {
+            return TestResult::Fail("CRC NTB-32 must report CRC + 2 datagrams");
+        }
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let r = for_each_frame32(&ntb, &mut |f| got.push(f.to_vec()));
+        match r {
+            Ok((2, 0)) => {}
+            _ => return TestResult::Fail("CRC NTB-32 walk must deliver 2, drop 0"),
+        }
+        if got != alloc::vec![b"hello".to_vec(), b"world!".to_vec()] {
+            return TestResult::Fail("CRC NTB-32 delivered bytes wrong");
+        }
+        // Corrupt the second datagram's CRC: it drops, the
+        // first still delivers. Layout: NTH32 (16) + d1 (5+4)
+        // + d2 (6+4) + NDP32, so d2's CRC occupies bytes
+        // 31..35 — flip its last byte (34), not the NTB's last
+        // byte (that is the NDP sentinel).
+        let mut bad = ntb.clone();
+        bad[34] ^= 0xFF;
+        let mut got2: Vec<Vec<u8>> = Vec::new();
+        let r2 = for_each_frame32(&bad, &mut |f| got2.push(f.to_vec()));
+        match r2 {
+            Ok((1, 1)) => {}
+            _ => return TestResult::Fail("corrupt CRC must deliver 1, drop 1"),
+        }
+        if got2 != alloc::vec![b"hello".to_vec()] {
+            return TestResult::Fail("corrupt-CRC walk delivered wrong frames");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_ncm_ntb32_multi_and_crc);
+
+    fn smoke_ncm_ntb32_rejections() -> TestResult {
+        let good = build_ntb32(1, &[b"abc"], false).expect("clean inputs");
+        // Bad NTH32 signature.
+        let mut bad = good.clone();
+        bad[0] ^= 0xFF;
+        if ParsedNtb32::parse(&bad).is_ok() {
+            return TestResult::Fail("bad NTH32 signature accepted");
+        }
+        // Block length past the buffer.
+        let mut bad = good.clone();
+        bad[8..12].copy_from_slice(&9999u32.to_le_bytes());
+        if ParsedNtb32::parse(&bad).is_ok() {
+            return TestResult::Fail("over-long block length accepted");
+        }
+        // NDP index at/past the block length.
+        let mut bad = good.clone();
+        bad[12..16].copy_from_slice(&51u32.to_le_bytes());
+        if ParsedNtb32::parse(&bad).is_ok() {
+            return TestResult::Fail("NDP index past block accepted");
+        }
+        // NDP length past the NTB.
+        let mut bad = good.clone();
+        bad[19 + 4..19 + 6].copy_from_slice(&999u16.to_le_bytes());
+        if ParsedNtb32::parse(&bad).is_ok() {
+            return TestResult::Fail("over-long NDP length accepted");
+        }
+        // Out-of-bounds datagram entry resolves to None, never
+        // a slice past the buffer.
+        let mut bad = good.clone();
+        bad[19 + 16..19 + 20].copy_from_slice(&5000u32.to_le_bytes());
+        match ParsedNtb32::parse(&bad) {
+            Ok(p) => {
+                if p.datagram(0).is_some() {
+                    return TestResult::Fail("out-of-bounds entry resolved");
+                }
+            }
+            Err(_) => return TestResult::Fail("parse must succeed, entry must not resolve"),
+        }
+        // Format dispatch: NTB-16 bytes walk under false,
+        // NTB-32 bytes under true, and each rejects the other
+        // format's signature.
+        let ntb16 = build_ntb16(1, &[b"xy"], false).expect("clean inputs");
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        if for_each_frame_ntb(&ntb16, false, &mut |f| got.push(f.to_vec())).is_err()
+            || got != alloc::vec![b"xy".to_vec()]
+        {
+            return TestResult::Fail("NTB-16 dispatch walk wrong");
+        }
+        if for_each_frame_ntb(&ntb16, true, &mut |_| {}).is_ok()
+            || for_each_frame_ntb(&good, false, &mut |_| {}).is_ok()
+        {
+            return TestResult::Fail("format dispatch must reject the other signature");
+        }
+        let mut got32: Vec<Vec<u8>> = Vec::new();
+        if for_each_frame_ntb(&good, true, &mut |f| got32.push(f.to_vec())).is_err()
+            || got32 != alloc::vec![b"abc".to_vec()]
+        {
+            return TestResult::Fail("NTB-32 dispatch walk wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_ncm_ntb32_rejections);
 }
 
 // ── Class enumeration + bind ───────────────────────────────────────
@@ -1374,6 +2009,10 @@ pub struct CdcNcmDevice {
     /// datagrams carry an appended CRC-32 and RX datagrams are
     /// CRC-verified and stripped.
     pub crc_enabled: bool,
+    /// NTB-32 negotiated on (`SET_NTB_FORMAT` 1): TX builds
+    /// NTH32/NDP32 and the RX pump parses them; false means
+    /// NTB-16 throughout.
+    pub ntb32: bool,
     /// Assigned `narf_net::iface` name (`usb-ncm{N}`).
     pub iface_name: alloc::string::String,
     /// RX pump liveness flag (pump clears it on exit).
@@ -1552,14 +2191,16 @@ struct Negotiated {
     ntb_in_max_size: u32,
     ntb_out_max_size: u32,
     crc_enabled: bool,
+    ntb32: bool,
 }
 
 /// Run the NCM class-request negotiation against the Comm
 /// interface: GET_NTB_PARAMETERS, then — as the parameters and
-/// the functional descriptor's capabilities offer — select
-/// NTB-16, set the input size, and enable CRC mode. Individual
-/// SET failures are tolerated (the device keeps its defaults);
-/// only the returned sizes/CRC state reflect what stuck.
+/// the functional descriptor's capabilities offer — select the
+/// NTB format (NTB-32 when offered, else NTB-16), set the
+/// input size, and enable CRC mode. Individual SET failures
+/// are tolerated (the device keeps its defaults); only the
+/// returned sizes/CRC/format state reflect what stuck.
 async fn negotiate_ncm(
     xhci_dev: &crate::xhci::Xhci,
     slot_id: u8,
@@ -1572,6 +2213,7 @@ async fn negotiate_ncm(
         ntb_in_max_size: 0,
         ntb_out_max_size: 16 * 1024,
         crc_enabled: false,
+        ntb32: false,
     };
     let mut raw = [0u8; NtbParameters::WIRE_LEN];
     let params = match xhci_dev
@@ -1595,11 +2237,29 @@ async fn negotiate_ncm(
     if params.ntb_out_max_size > 0 {
         out.ntb_out_max_size = params.ntb_out_max_size;
     }
-    // Select NTB-16 (format index 0) when the device offers it.
-    if params.formats_supported & 0x01 != 0 {
-        let _ = xhci_dev
-            .control_out(slot_id, 0x21, REQ_SET_NTB_FORMAT, 0, comm_iface as u16, &[])
-            .await;
+    // Select the NTB format: NTB-32 (format index 1) when the
+    // device offers it, else NTB-16 (format index 0). A SET
+    // failure leaves the device on its default; only a
+    // successful selection records the format on the device.
+    if let Some(format) = select_ntb_format(params.formats_supported) {
+        let value = match format {
+            NtbFormat::Ntb16 => 0,
+            NtbFormat::Ntb32 => 1,
+        };
+        if xhci_dev
+            .control_out(
+                slot_id,
+                0x21,
+                REQ_SET_NTB_FORMAT,
+                value,
+                comm_iface as u16,
+                &[],
+            )
+            .await
+            .is_ok()
+        {
+            out.ntb32 = format == NtbFormat::Ntb32;
+        }
     }
     // Tell the device the largest NTB we will send: the device's
     // own cap, clamped to what this TX path builds (single-frame
@@ -1747,6 +2407,7 @@ pub async fn try_bind_ncm_already_addressed(
             ntb_in_max_size: negotiated.ntb_in_max_size,
             ntb_out_max_size: negotiated.ntb_out_max_size,
             crc_enabled: negotiated.crc_enabled,
+            ntb32: negotiated.ntb32,
             iface_name: alloc::format!("usb-ncm{}", idx),
             pump_running: false,
             detached: false,
@@ -1770,12 +2431,13 @@ pub async fn try_bind_ncm_already_addressed(
 
 /// Supervised RX pump for one bound NCM device: post bulk-IN
 /// reads sized by the negotiated OUT NTB maximum, walk each NTB
-/// with [`for_each_frame`], and hand every datagram to the stack
-/// as its own frame. Stops after a bounded run of consecutive
+/// with [`for_each_frame_ntb`] (NTB-32 when negotiated, else
+/// NTB-16), and hand every datagram to the stack as its own
+/// frame. Stops after a bounded run of consecutive
 /// transfer errors (a removed device surfaces as persistent
 /// errors) or when the record vanishes.
 async fn ncm_rx_pump(idx: usize) {
-    let (slot_id, bulk_in_dci, name, buf_len) = {
+    let (slot_id, bulk_in_dci, name, buf_len, ntb32) = {
         let g = CDC_NCM_DEVICES.lock();
         let Some(dev) = g.get(idx) else {
             return;
@@ -1785,6 +2447,7 @@ async fn ncm_rx_pump(idx: usize) {
             dev.bulk_in_dci,
             dev.iface_name.clone(),
             (dev.ntb_out_max_size as usize).clamp(4096, 64 * 1024),
+            dev.ntb32,
         )
     };
     let Some(c) = crate::xhci::controller() else {
@@ -1811,7 +2474,7 @@ async fn ncm_rx_pump(idx: usize) {
         match c.bulk_in(slot_id, bulk_in_dci, &mut buf).await {
             Ok(n) if n > 0 => {
                 errors = 0;
-                let _ = for_each_frame(&buf[..n], &mut |frame| {
+                let _ = for_each_frame_ntb(&buf[..n], ntb32, &mut |frame| {
                     let mut owned = frame.to_vec();
                     narf_net::iface::on_rx_frame_from(&name, &mut owned);
                 });
@@ -1904,10 +2567,11 @@ pub fn tx_target(idx: usize) -> Option<(u8, u8)> {
 
 /// Snapshot + advance the TX bookkeeping for device `idx`:
 /// `(slot_id, bulk_out_dci, sequence, crc_enabled,
-/// ntb_in_max_size)`. The sequence bump happens here, under the
-/// registry lock, so concurrent sends on one device never reuse
-/// a sequence number — and never touch another device's counter.
-pub fn take_tx_state(idx: usize) -> Option<(u8, u8, u16, bool, u32)> {
+/// ntb_in_max_size, ntb32)`. The sequence bump happens here,
+/// under the registry lock, so concurrent sends on one device
+/// never reuse a sequence number — and never touch another
+/// device's counter.
+pub fn take_tx_state(idx: usize) -> Option<(u8, u8, u16, bool, u32, bool)> {
     let mut g = CDC_NCM_DEVICES.lock();
     let dev = g.get_mut(idx).filter(|d| !d.detached)?;
     let seq = dev.tx_sequence;
@@ -1918,16 +2582,18 @@ pub fn take_tx_state(idx: usize) -> Option<(u8, u8, u16, bool, u32)> {
         seq,
         dev.crc_enabled,
         dev.ntb_in_max_size,
+        dev.ntb32,
     ))
 }
 
 /// Send one Ethernet frame over the bound NCM device at `idx` —
 /// and only that device: the endpoint comes from the device's
-/// own record via [`take_tx_state`]. Wraps the frame in an
-/// NTB-16 (single-datagram NDP; CRC appended when CRC mode was
-/// negotiated) and ships it on the bulk-OUT endpoint.
+/// own record via [`take_tx_state`]. Wraps the frame in an NTB
+/// (single-datagram NDP; NTB-32 when negotiated, else NTB-16;
+/// CRC appended when CRC mode was negotiated) and ships it on
+/// the bulk-OUT endpoint.
 pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, NcmError> {
-    let (slot_id, bulk_out_dci, sequence, crc, in_max) =
+    let (slot_id, bulk_out_dci, sequence, crc, in_max, ntb32) =
         take_tx_state(idx).ok_or(NcmError::NotNcm)?;
     let with_crc;
     let datagram: &[u8] = if crc {
@@ -1936,7 +2602,11 @@ pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, NcmError> {
     } else {
         eth_frame
     };
-    let ntb = build_ntb16(sequence, &[datagram], crc)?;
+    let ntb = if ntb32 {
+        build_ntb32(sequence, &[datagram], crc)?
+    } else {
+        build_ntb16(sequence, &[datagram], crc)?
+    };
     if in_max > 0 && ntb.len() > in_max as usize {
         return Err(NcmError::NtbTooLarge);
     }
@@ -1956,9 +2626,32 @@ pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, NcmError> {
     }
 }
 
+/// First deliverable datagram under the pump path's semantics:
+/// out-of-bounds entries are already excluded by the caller,
+/// and under CRC mode a too-short or CRC-failing datagram is
+/// skipped, never delivered with the FCS still attached.
+fn first_deliverable<'a>(datagrams: &[&'a [u8]], crc: bool) -> Option<&'a [u8]> {
+    for dg in datagrams {
+        if crc {
+            if dg.len() < 4 {
+                continue;
+            }
+            let (frame, tail) = dg.split_at(dg.len() - 4);
+            let want = u32::from_le_bytes(tail.try_into().unwrap());
+            if crc32_ieee(frame) != want {
+                continue;
+            }
+            return Some(frame);
+        }
+        return Some(dg);
+    }
+    None
+}
+
 /// Pull one Ethernet frame off the bound NCM device's bulk-IN
-/// endpoint. Reads an NTB into `scratch`, parses it, returns the
-/// first deliverable datagram (if any). CRC handling matches the
+/// endpoint. Reads an NTB into `scratch`, parses it (NTB-32
+/// when negotiated, else NTB-16), returns the first
+/// deliverable datagram (if any). CRC handling matches the
 /// production pump path ([`for_each_frame`]): under CRC mode each
 /// datagram's trailing CRC-32 is verified and stripped, and a
 /// CRC-failing datagram is skipped in favour of the next one
@@ -1967,10 +2660,10 @@ pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, NcmError> {
 /// continuously holds an NTB-sized read posted so frames stream
 /// in.
 pub fn recv_frame(idx: usize, scratch: &mut [u8]) -> Result<Option<&[u8]>, NcmError> {
-    let (slot_id, bulk_in_dci) = {
+    let (slot_id, bulk_in_dci, ntb32) = {
         let g = CDC_NCM_DEVICES.lock();
         let dev = g.get(idx).filter(|d| !d.detached).ok_or(NcmError::NotNcm)?;
-        (dev.slot_id, dev.bulk_in_dci)
+        (dev.slot_id, dev.bulk_in_dci, dev.ntb32)
     };
     // Sync entry-point on the net RX path; bridge to async bulk_in
     // via block_on. Called from non-executor contexts.
@@ -1987,36 +2680,26 @@ pub fn recv_frame(idx: usize, scratch: &mut [u8]) -> Result<Option<&[u8]>, NcmEr
     if n == 0 {
         return Ok(None);
     }
-    let ntb = ParsedNtb::parse(&scratch[..n])?;
-    // Walk the datagrams with the pump path's semantics
-    // (for_each_frame): out-of-bounds entries are skipped, and
-    // under CRC mode the trailing CRC-32 is verified and stripped
-    // — a too-short or CRC-failing datagram is skipped, never
-    // delivered with the FCS still attached.
-    for i in 0..ntb.len() {
-        let Some(dg) = ntb.datagram(i) else {
-            continue;
-        };
-        let frame: &[u8] = if ntb.uses_crc() {
-            if dg.len() < 4 {
-                continue;
-            }
-            let (frame, tail) = dg.split_at(dg.len() - 4);
-            let want = u32::from_le_bytes(tail.try_into().unwrap());
-            if crc32_ieee(frame) != want {
-                continue;
-            }
-            frame
-        } else {
-            dg
-        };
-        // Re-borrow against the scratch lifetime — Ntb16 borrows
-        // immutably; the lifetime path is straightforward here
-        // because frame points into &scratch[..n].
-        let off = frame.as_ptr() as usize - scratch.as_ptr() as usize;
-        return Ok(Some(&scratch[off..off + frame.len()]));
-    }
-    Ok(None)
+    // Parse in the negotiated format, collect the in-bounds
+    // datagrams, and take the first deliverable one. Only
+    // (offset, length) pairs escape the parse scope, so the
+    // returned slice re-borrows from `scratch` directly.
+    let found: Option<(usize, usize)> = if ntb32 {
+        let parsed = ParsedNtb32::parse(&scratch[..n])?;
+        let dgs: Vec<&[u8]> = (0..parsed.len())
+            .filter_map(|i| parsed.datagram(i))
+            .collect();
+        first_deliverable(&dgs, parsed.uses_crc())
+            .map(|f| (f.as_ptr() as usize - scratch.as_ptr() as usize, f.len()))
+    } else {
+        let parsed = ParsedNtb::parse(&scratch[..n])?;
+        let dgs: Vec<&[u8]> = (0..parsed.len())
+            .filter_map(|i| parsed.datagram(i))
+            .collect();
+        first_deliverable(&dgs, parsed.uses_crc())
+            .map(|f| (f.as_ptr() as usize - scratch.as_ptr() as usize, f.len()))
+    };
+    Ok(found.map(|(off, len)| &scratch[off..off + len]))
 }
 
 /// `SendCtxFn` trampoline for [`narf_net::iface`]: the cookie is
@@ -2037,6 +2720,16 @@ fn ncm_send_ctx(cookie: u64, frame: &[u8], _meta: narf_net::TxMeta) -> Result<()
 /// never removed — the ECM rule: net-registry TX cookies are
 /// record indices). Unknown slots no-op; repeat detach is a
 /// silent no-op (unregister is idempotent).
+///
+/// RX-mirror obligation (#789, from the #872-review note):
+/// RESOLVED as not owed here — same verdict as ECM/r8152:
+/// this family's pumps deliver via
+/// `narf_net::iface::on_rx_frame_from` directly and never call
+/// `publish::note_rx_mirror_attached`, and its `usb-ncm{N}`
+/// names cannot collide with the `eth%d` keys the mirror
+/// registry can ever hold. No clear call is owed; if this
+/// family ever dual-publishes, its detach paths must call
+/// `publish::clear_rx_mirror_attached` alongside unregister.
 ///
 /// Panic-free and idempotent by the #893 hook contract: no
 /// indexing and no fallible unwraps on any path. Tombstones are
@@ -2071,7 +2764,8 @@ pub fn detach_ncm_slot(slot_id: u8) -> Result<(), ()> {
 /// recovery (`attach::detach_all_bindings`): tombstone every
 /// NCM binding and unregister every net iface, regardless of
 /// slot. Infallible and idempotent, same pump-exit and
-/// never-remove reasoning as [`detach_ncm_slot`].
+/// never-remove reasoning as [`detach_ncm_slot`], and the same
+/// #789 mirror verdict (no clear call owed).
 pub fn detach_all_ncm() {
     let ifaces: Vec<alloc::string::String> = {
         let mut g = CDC_NCM_DEVICES.lock();
@@ -2161,7 +2855,8 @@ impl CdcNcmIface {
     }
 
     /// Send `eth_frame` via the bound NCM device. Wraps the frame
-    /// in a single-datagram NTB-16 and ships it on bulk-OUT.
+    /// in a single-datagram NTB (32 when negotiated, else 16)
+    /// and ships it on bulk-OUT.
     pub fn send(&self, eth_frame: &[u8]) -> Result<usize, NcmError> {
         send_frame(self.idx, eth_frame)
     }

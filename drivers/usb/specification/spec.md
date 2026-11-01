@@ -279,6 +279,22 @@ also consult upstream Linux GPL sources.
   from the device at bind (never synthesised); a device that reports no
   valid address fails the bind. Link state is republished through
   `iface::set_link_metadata` as the driver samples it.
+- `r8152` binds with a version-switched PHY init: the chip version
+  decoded from the `PLA_TCR1` field selects a table of OCP/SRAM/MDIO
+  register writes (EEE/ALDPS configuration, flow-control
+  advertisement) executed before CR RE/TE enable; RTL8153
+  VER_03–VER_06 tables are implemented, other versions run on
+  reset defaults. After bind it advertises TX checksum, TSO and
+  VLAN-insert offloads via `iface::set_offloads`; TX metadata the
+  hardware cannot encode is rejected, and TCP super-frames fall
+  back to the stack's software GSO splitter. RX VLAN tags are
+  delivered in-band: with VLAN receive enabled the driver splices
+  the tag reported in the RX descriptor back into the frame for
+  the stack. Wake-on-LAN options are snapshotted from the device
+  at bind and programmed through the `PLA_CRWECR` config window
+  (`MAGIC` / link-on-wake / unicast / broadcast / multicast);
+  USB remote-wakeup arming is not yet wired (per-NIC suspend
+  remainder).
 - Address Device reserves a slot before DMA setup, retains Input/Device
   Contexts plus EP0 ring/page before DCBAA publication, and adopts them only
   after the exact command TRB succeeds. Address, Configure, Evaluate, Disable
@@ -369,9 +385,10 @@ also consult upstream Linux GPL sources.
   binding wholesale (`attach::detach_all_bindings`) and re-enumeration
   follows; on that path the pumped classes are cleared from their
   registries and every MSC device is removed and unpublished
-  (`msc::unbind_all_msc`), every CDC-NCM / r8152 binding is
+  (`msc::unbind_all_msc`), every CDC-NCM / r8152 / CDC-ECM binding is
   tombstoned and its net iface unregistered
-  (`cdc_ncm::detach_all_ncm`, `r8152::detach_all_r8152`), and
+  (`cdc_ncm::detach_all_ncm`, `r8152::detach_all_r8152`,
+  `cdc_ecm::detach_all_ecm`), and
   every UVC binding is dropped and its video node unregistered
   (`uvc::detach_all_uvc`). On the per-slot detach path, classes
   the supervisor does not pump (MSC / UAC / btusb / CCID) get
@@ -463,7 +480,12 @@ also consult upstream Linux GPL sources.
   its class-registry probe, and both probes decline nothing they
   previously accepted. `cdc_ncm::detach_all_ncm()` and
   `r8152::detach_all_r8152()` are the wholesale variants for
-  controller-recovery teardown. Indices are not recycled; a
+  controller-recovery teardown. `cdc_ecm::detach_ecm_slot(slot_id)`
+  is ECM's equivalent slot teardown (same tombstone +
+  unregister contract, collect-then-unregister so the net
+  registry lock is never taken under the ECM registry lock)
+  with `cdc_ecm::detach_all_ecm()` as its wholesale variant.
+  Indices are not recycled; a
   replugged adapter republishes under a fresh index.
 - `uvc::detach_uvc(slot_id)` is UVC's publication teardown — drop
   every `UVC_DEVICES` entry bound to the slot (capture-stop flag
@@ -729,6 +751,11 @@ the USB download itself remains a target-silicon gate.
   table with per-datagram offset + length entries). Encoder
   packs N Ethernet datagrams into a single NTB; decoder validates
   signatures + bounds and yields a borrow per datagram.
+  NTB-32 is negotiated when the device offers it
+  (`SET_NTB_FORMAT` 1; NTH32/NDP32 with 32-bit block lengths
+  and datagram pointers, lowercase `ncm0`/`ncm1` NDP
+  signatures) and used for TX and RX alike; otherwise the
+  driver stays on NTB-16 (`SET_NTB_FORMAT` 0).
   `NCM_NTB_PARAMETERS_STRUCTURE` decoder for the device-reported
   size limits.
 - **CDC-ECM** (`cdc_ecm`): Ethernet Control Model 1.2 live driver

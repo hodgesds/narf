@@ -542,9 +542,10 @@ pub async fn try_attach_via_hub(
 /// not pump (MSC / UAC / btusb / CCID) have no
 /// per-class binding removal yet — their slot is disabled and
 /// reclaimed here, but their class-level registries are a
-/// documented follow-up in #748. CDC-NCM + r8152 are NOT in
-/// that set: their unbind hooks (`cdc_ncm::detach_ncm_slot`,
-/// `r8152::detach_r8152_slot`, registered in their
+/// documented follow-up in #748. CDC-NCM + r8152 + CDC-ECM are
+/// NOT in that set: their unbind hooks
+/// (`cdc_ncm::detach_ncm_slot`, `r8152::detach_r8152_slot`,
+/// `cdc_ecm::detach_ecm_slot`, registered in their
 /// `register_initcalls` / `register`) run via `dispatch_unbind`
 /// in step 1 above, tombstoning the slot's binding and
 /// unregistering its net iface. UVC is not in that set either: its
@@ -609,12 +610,12 @@ pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
 /// on this path, and classes with neither a pumped clear nor a
 /// wholesale unbind here (UAC / btusb / CCID)
 /// keep their class-level registries across recovery — the
-/// documented remainder of #748. CDC-NCM + r8152 are NOT in
-/// that set: `cdc_ncm::detach_all_ncm` and
-/// `r8152::detach_all_r8152` tombstone every binding and
-/// unregister every net iface, so re-enumeration cannot append
-/// a second live iface for the same adapter. UVC is not in that
-/// set either: `uvc::detach_all_uvc` drops every
+/// documented remainder of #748. CDC-NCM + r8152 + CDC-ECM are
+/// NOT in that set: `cdc_ncm::detach_all_ncm`,
+/// `r8152::detach_all_r8152` and `cdc_ecm::detach_all_ecm`
+/// tombstone every binding and unregister every net iface, so
+/// re-enumeration cannot append a second live iface for the
+/// same adapter. UVC is not in that set either: `uvc::detach_all_uvc` drops every
 /// UVC binding and unregisters every video node, so re-enumeration
 /// cannot append a second live node for the same camera. The MSC
 /// call is load-bearing, not symmetry: a surviving `MSC_DEVICES`
@@ -633,6 +634,7 @@ pub fn detach_all_bindings() {
     crate::msc::unbind_all_msc();
     crate::cdc_ncm::detach_all_ncm();
     crate::r8152::detach_all_r8152();
+    crate::cdc_ecm::detach_all_ecm();
     crate::uvc::detach_all_uvc();
     HUBS.lock().clear();
 }
