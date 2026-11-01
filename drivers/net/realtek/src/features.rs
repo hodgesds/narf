@@ -889,6 +889,331 @@ pub unsafe fn apply_rss_single_queue<R: RegFile>(regs: &mut R) {
     unsafe { regs.write32(REG_RSS_CTRL_8125, 0) };
 }
 
+// ── RX checksum decode (default descriptor type) ────────────────────
+
+/// RX word0 protocol-ID bit for TCP (PID0, bit 17).
+pub const RX_PID_TCP: u32 = 1 << 17;
+/// RX word0 protocol-ID bit for UDP (PID1, bit 18).
+pub const RX_PID_UDP: u32 = 1 << 18;
+/// RX word0 IP checksum-failed bit (bit 16).
+pub const RX_FAIL_IP: u32 = 1 << 16;
+/// RX word0 UDP checksum-failed bit (bit 15).
+pub const RX_FAIL_UDP: u32 = 1 << 15;
+/// RX word0 TCP checksum-failed bit (bit 14).
+pub const RX_FAIL_TCP: u32 = 1 << 14;
+
+/// Decoded RX checksum verification for one chip-returned descriptor.
+///
+/// This corrects the previous in-tree decode, which read bits 5/6/7
+/// of word0 as protocol-OK bits. Those bits are inside the
+/// 14-bit frame-length field; Linux's `rtl8169_rx_csum` instead
+/// masks word0 with the protocol-ID bits (17/18) and the fail bits
+/// (14/15/16) and trusts the checksum only when the PID is exactly
+/// TCP or exactly UDP with no fail bit set.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RxCsum {
+    /// The chip verified the IP header checksum and it passed.
+    pub l3_ok: bool,
+    /// The chip verified the L4 checksum and it passed.
+    pub l4_ok: bool,
+}
+
+/// Decode the RX checksum result from a chip-returned word0.
+pub const fn rx_csum_decode(flags_len: u32) -> RxCsum {
+    let fail = flags_len & (RX_FAIL_IP | RX_FAIL_UDP | RX_FAIL_TCP);
+    let pid = flags_len & (RX_PID_TCP | RX_PID_UDP);
+    RxCsum {
+        l3_ok: fail & RX_FAIL_IP == 0 && pid != 0,
+        l4_ok: fail == 0 && (pid == RX_PID_TCP || pid == RX_PID_UDP),
+    }
+}
+
+// ── TX frame parsing: transport offset + IP version ─────────────────
+
+/// IP version of a frame's network header, as parsed by
+/// [`parse_transport`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IpVersion {
+    V4,
+    V6,
+}
+
+/// Where the transport header starts in a frame, for the TX
+/// offload descriptor fields (`TCPHO` / `GTTCPHO`): the offset is
+/// measured from the start of the Ethernet frame, exactly as
+/// Linux's `skb_transport_offset` measures it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TransportInfo {
+    /// Network-header version.
+    pub ip: IpVersion,
+    /// Byte offset of the transport header from the frame start.
+    pub offset: u16,
+}
+
+fn be16(frame: &[u8], at: usize) -> Option<u16> {
+    if at + 2 <= frame.len() {
+        Some(u16::from_be_bytes([frame[at], frame[at + 1]]))
+    } else {
+        None
+    }
+}
+
+/// Parse a frame far enough to fill a TX offload descriptor:
+/// skip up to two VLAN tags, then the IP header (IPv4 IHL, or the
+/// IPv6 fixed header plus extension headers). Returns `None` when
+/// the frame is not an unfragmented IPv4/IPv6 packet, is
+/// truncated, or carries an extension header the chip cannot be
+/// told about (ESP, or an unknown next-header value) — the caller
+/// must then reject the offload request rather than program a
+/// descriptor with a guessed offset.
+pub fn parse_transport(frame: &[u8]) -> Option<TransportInfo> {
+    if frame.len() < 14 {
+        return None;
+    }
+    let mut ethertype = be16(frame, 12)?;
+    let mut pos = 14usize;
+    let mut tags = 0;
+    while ethertype == 0x8100 || ethertype == 0x88A8 {
+        if tags >= 2 || pos + 4 > frame.len() {
+            return None;
+        }
+        ethertype = be16(frame, pos + 2)?;
+        pos += 4;
+        tags += 1;
+    }
+    match ethertype {
+        0x0800 => {
+            if pos + 20 > frame.len() {
+                return None;
+            }
+            let ihl = (frame[pos] as usize & 0x0F) * 4;
+            if ihl < 20 || pos + ihl > frame.len() {
+                return None;
+            }
+            let frag = be16(frame, pos + 6)?;
+            if frag & 0x2000 != 0 || frag & 0x1FFF != 0 {
+                return None;
+            }
+            let offset = pos + ihl;
+            if offset >= frame.len() {
+                return None;
+            }
+            Some(TransportInfo {
+                ip: IpVersion::V4,
+                offset: offset as u16,
+            })
+        }
+        0x86DD => {
+            if pos + 40 > frame.len() {
+                return None;
+            }
+            let mut next = frame[pos + 6];
+            let mut off = pos + 40;
+            let mut hops = 0;
+            loop {
+                match next {
+                    6 | 17 => {
+                        if off >= frame.len() || off > u16::MAX as usize {
+                            return None;
+                        }
+                        return Some(TransportInfo {
+                            ip: IpVersion::V6,
+                            offset: off as u16,
+                        });
+                    }
+                    0 | 43 | 60 | 135 => {
+                        if off + 2 > frame.len() {
+                            return None;
+                        }
+                        let hdr_len = (frame[off + 1] as usize + 1) * 8;
+                        next = frame[off];
+                        off += hdr_len;
+                        if off > frame.len() {
+                            return None;
+                        }
+                    }
+                    44 => {
+                        if off + 8 > frame.len() {
+                            return None;
+                        }
+                        let frag = be16(frame, off + 2)?;
+                        if frag >> 3 != 0 || frag & 1 != 0 {
+                            return None;
+                        }
+                        next = frame[off];
+                        off += 8;
+                    }
+                    51 => {
+                        if off + 2 > frame.len() {
+                            return None;
+                        }
+                        let hdr_len = (frame[off + 1] as usize + 2) * 4;
+                        next = frame[off];
+                        off += hdr_len;
+                        if off > frame.len() {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+                hops += 1;
+                if hops > 8 {
+                    return None;
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+// ── TX offload descriptor words (corrected placement) ───────────────
+
+/// TX word0: v2 giant-send enable, IPv4 (bit 26).
+pub const TD1_GTSENV4: u32 = 1 << 26;
+/// TX word0: v2 giant-send enable, IPv6 (bit 25).
+pub const TD1_GTSENV6: u32 = 1 << 25;
+/// TX word0 (TSO) / word1 (csum): header-offset shift (bits 24:18
+/// for `GTTCPHO`, bits 27:18 for `TCPHO`).
+pub const TCPHO_SHIFT: u32 = 18;
+/// Maximum `GTTCPHO` value (TSO case, 7 bits).
+pub const GTTCPHO_MAX: u16 = 0x7F;
+/// Maximum `TCPHO` value (csum case, 10 bits).
+pub const TCPHO_MAX: u16 = 0x3FF;
+/// TX word1: v2 MSS shift (bits 28:18, 11 bits).
+pub const TD1_MSS_SHIFT: u32 = 18;
+/// Maximum MSS encodable in a v2/v1 descriptor (11 bits).
+pub const MSS_MAX: u16 = 0x7FF;
+/// TX word1: v2 IPv6 header-checksum bit (bit 28).
+pub const TD1_IPV6_CS: u32 = 1 << 28;
+/// TX word1: v2 IPv4 header-checksum bit (bit 29).
+pub const TD1_IPV4_CS: u32 = 1 << 29;
+/// TX word1: v2 TCP checksum bit (bit 30).
+pub const TD1_TCP_CS: u32 = 1 << 30;
+/// TX word1: v2 UDP checksum bit (bit 31).
+pub const TD1_UDP_CS: u32 = 1 << 31;
+
+/// TX word0: v1 large-send enable (bit 27).
+pub const TD_LSO: u32 = 1 << 27;
+/// TX word0: v1 MSS shift (bits 26:16, 11 bits).
+pub const TD0_MSS_SHIFT: u32 = 16;
+/// TX word0: v1 TCP checksum bit (bit 16).
+pub const TD0_TCP_CS: u32 = 1 << 16;
+/// TX word0: v1 UDP checksum bit (bit 17).
+pub const TD0_UDP_CS: u32 = 1 << 17;
+/// TX word0: v1 IP checksum bit (bit 18).
+pub const TD0_IP_CS: u32 = 1 << 18;
+
+/// The two offload-carrying words of a TX descriptor (word0 =
+/// `flags_len` extras without OWN/FS/LS/length; word1 = `vlan`
+/// word). The caller ORs `word0` into its flags word and `word1`
+/// into its vlan word, alongside the VLAN-insert field from
+/// [`tx_vlan_word`] — the fields do not overlap.
+///
+/// Placement correction: the previous in-tree v2 builders put
+/// `GTSENV` in word1. Linux's `rtl_tx_desc_bit_1` enum labels
+/// `GTSENV`/`GTTCPHO` the *first* doubleword (word0) and
+/// `MSS`/`IP_CS`/`TCP_CS`/`UDP_CS`/`TCPHO` the *second* (word1);
+/// `rtl8169_start_xmit` confirms it (`opts[0]` → `opts1`,
+/// `opts[1]` → `opts2`). A word1 `GTSENV` bit would have landed
+/// inside the MSS field and no TSO would ever have engaged.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct OffloadWords {
+    /// Extra bits for word0 (flags word).
+    pub word0: u32,
+    /// Word1 (vlan word).
+    pub word1: u32,
+}
+
+fn v2_ip_cs(ip: IpVersion) -> u32 {
+    match ip {
+        IpVersion::V4 => TD1_IPV4_CS,
+        IpVersion::V6 => TD1_IPV6_CS,
+    }
+}
+
+fn v2_l4_cs(kind: narf_net::L4CsumKind) -> Option<u32> {
+    match kind {
+        narf_net::L4CsumKind::Tcp => Some(TD1_TCP_CS),
+        narf_net::L4CsumKind::Udp => Some(TD1_UDP_CS),
+        narf_net::L4CsumKind::Sctp => None,
+    }
+}
+
+/// Build the v2 checksum-offload words for a frame whose transport
+/// header is at `tcpho` (from [`parse_transport`]). `None` when
+/// the offset does not fit the 10-bit `TCPHO` field, or the L4
+/// kind is SCTP (no hardware support on this family).
+pub fn v2_csum_words(
+    kind: narf_net::L4CsumKind,
+    ip: IpVersion,
+    tcpho: u16,
+    vlan: Option<u16>,
+) -> Option<OffloadWords> {
+    if tcpho > TCPHO_MAX {
+        return None;
+    }
+    Some(OffloadWords {
+        word0: 0,
+        word1: v2_ip_cs(ip)
+            | v2_l4_cs(kind)?
+            | ((tcpho as u32) << TCPHO_SHIFT)
+            | tx_vlan_word(vlan),
+    })
+}
+
+/// Build the v2 TSO words: `GTSENV` + `GTTCPHO` in word0, MSS +
+/// IP/TCP checksum bits in word1. Mirrors
+/// `rtl8169_tso_csum_v2`, including its OR of the IPv6 checksum
+/// bit into the MSS field for IPv6 (the bit doubles as MSS bit
+/// 10 there; Linux ORs it unconditionally, so this builder does
+/// too rather than inventing a different layout). `None` when
+/// `mss` exceeds [`MSS_MAX`] or `gt_tcpho` exceeds
+/// [`GTTCPHO_MAX`].
+pub fn v2_tso_words(
+    ip: IpVersion,
+    mss: u16,
+    gt_tcpho: u16,
+    vlan: Option<u16>,
+) -> Option<OffloadWords> {
+    if mss > MSS_MAX || gt_tcpho > GTTCPHO_MAX {
+        return None;
+    }
+    let gtsenv = match ip {
+        IpVersion::V4 => TD1_GTSENV4,
+        IpVersion::V6 => TD1_GTSENV6,
+    };
+    Some(OffloadWords {
+        word0: gtsenv | ((gt_tcpho as u32) << TCPHO_SHIFT),
+        word1: v2_ip_cs(ip) | TD1_TCP_CS | ((mss as u32) << TD1_MSS_SHIFT) | tx_vlan_word(vlan),
+    })
+}
+
+/// Build the v1 checksum-offload words (word0 carries the csum
+/// bits on pre-csum-v2 chips). `None` for SCTP.
+pub fn v1_csum_words(kind: narf_net::L4CsumKind, vlan: Option<u16>) -> Option<OffloadWords> {
+    let l4 = match kind {
+        narf_net::L4CsumKind::Tcp => TD0_TCP_CS,
+        narf_net::L4CsumKind::Udp => TD0_UDP_CS,
+        narf_net::L4CsumKind::Sctp => return None,
+    };
+    Some(OffloadWords {
+        word0: TD0_IP_CS | l4,
+        word1: tx_vlan_word(vlan),
+    })
+}
+
+/// Build the v1 TSO words (word0: `LSO` + MSS). `None` when `mss`
+/// exceeds [`MSS_MAX`].
+pub fn v1_tso_words(mss: u16, vlan: Option<u16>) -> Option<OffloadWords> {
+    if mss > MSS_MAX {
+        return None;
+    }
+    Some(OffloadWords {
+        word0: TD_LSO | ((mss as u32) << TD0_MSS_SHIFT),
+        word1: tx_vlan_word(vlan),
+    })
+}
+
 // ── Fixtures ────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
@@ -1149,4 +1474,173 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/realtek-features", smoke_features_rss_ver80);
+
+    fn eth_ipv4_frame() -> [u8; 60] {
+        // Ethernet (dst/src/type 0x0800) + IPv4 IHL 5 + TCP header.
+        let mut f = [0u8; 60];
+        f[12] = 0x08;
+        f[13] = 0x00;
+        f[14] = 0x45;
+        f[23] = 0x06; // protocol TCP (not read by the parser, but realistic)
+        f
+    }
+
+    fn smoke_features_transport_parse() -> TestResult {
+        let f = eth_ipv4_frame();
+        match parse_transport(&f) {
+            Some(t) if t.ip == IpVersion::V4 && t.offset == 34 => {}
+            _ => return TestResult::Fail("IPv4/TCP transport offset is not 34"),
+        }
+        // One VLAN tag shifts the offset by 4.
+        let mut v = [0u8; 64];
+        v[12] = 0x81;
+        v[13] = 0x00;
+        v[16] = 0x08;
+        v[17] = 0x00;
+        v[18] = 0x45;
+        match parse_transport(&v) {
+            Some(t) if t.offset == 38 => {}
+            _ => return TestResult::Fail("VLAN-tagged IPv4 offset is not 38"),
+        }
+        // IPv4 options (IHL 6) shift it by 4 more.
+        let mut o = eth_ipv4_frame();
+        o[14] = 0x46;
+        match parse_transport(&o) {
+            Some(t) if t.offset == 38 => {}
+            _ => return TestResult::Fail("IPv4-options offset is not 38"),
+        }
+        // IPv6 fixed header: offset 54.
+        let mut v6 = [0u8; 74];
+        v6[12] = 0x86;
+        v6[13] = 0xDD;
+        v6[20] = 0x06; // next header TCP
+        match parse_transport(&v6) {
+            Some(t) if t.ip == IpVersion::V6 && t.offset == 54 => {}
+            _ => return TestResult::Fail("IPv6/TCP transport offset is not 54"),
+        }
+        // IPv6 hop-by-hop (length byte 0 => 8 bytes): offset 62.
+        let mut hbh = [0u8; 82];
+        hbh[12] = 0x86;
+        hbh[13] = 0xDD;
+        hbh[20] = 0x00; // next header: hop-by-hop
+        hbh[54] = 0x06; // hop-by-hop's next: TCP
+        hbh[55] = 0x00; // hop-by-hop length byte: 0 => 8 bytes
+        match parse_transport(&hbh) {
+            Some(t) if t.offset == 62 => {}
+            _ => return TestResult::Fail("IPv6 hop-by-hop offset is not 62"),
+        }
+        // Fragmented IPv4 (MF set) and non-IP frames are rejected.
+        let mut frag = eth_ipv4_frame();
+        frag[20] = 0x20;
+        frag[21] = 0x00;
+        if parse_transport(&frag).is_some() {
+            return TestResult::Fail("fragmented IPv4 must not parse");
+        }
+        let mut arp = [0u8; 60];
+        arp[12] = 0x08;
+        arp[13] = 0x06;
+        if parse_transport(&arp).is_some() {
+            return TestResult::Fail("non-IP frame must not parse");
+        }
+        if parse_transport(&[0u8; 10]).is_some() {
+            return TestResult::Fail("truncated frame must not parse");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/realtek-features",
+        smoke_features_transport_parse
+    );
+
+    fn smoke_features_rx_csum_decode() -> TestResult {
+        // TCP-only PID, no fails: both verified.
+        let ok = rx_csum_decode(RX_PID_TCP);
+        if !ok.l3_ok || !ok.l4_ok {
+            return TestResult::Fail("TCP PID without fails must verify");
+        }
+        // UDP-only PID, no fails: both verified.
+        let uok = rx_csum_decode(RX_PID_UDP);
+        if !uok.l3_ok || !uok.l4_ok {
+            return TestResult::Fail("UDP PID without fails must verify");
+        }
+        // Any fail bit voids the L4 result; an IP fail voids L3 too.
+        let bad = rx_csum_decode(RX_PID_TCP | RX_FAIL_TCP);
+        if bad.l3_ok || bad.l4_ok {
+            return TestResult::Fail("TCP fail must void the checksum result");
+        }
+        let ipbad = rx_csum_decode(RX_PID_UDP | RX_FAIL_IP);
+        if ipbad.l3_ok || ipbad.l4_ok {
+            return TestResult::Fail("IP fail must void the checksum result");
+        }
+        // Both PID bits (IP-only, no L4): L3 verified, L4 not.
+        let iponly = rx_csum_decode(RX_PID_TCP | RX_PID_UDP);
+        if !iponly.l3_ok || iponly.l4_ok {
+            return TestResult::Fail("IP-only frame must verify L3 only");
+        }
+        // No PID bits: nothing verified.
+        let none = rx_csum_decode(0x1234);
+        if none.l3_ok || none.l4_ok {
+            return TestResult::Fail("non-IP status must verify nothing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/realtek-features",
+        smoke_features_rx_csum_decode
+    );
+
+    fn smoke_features_offload_words() -> TestResult {
+        use narf_net::L4CsumKind;
+        // v2 csum, IPv4/TCP, transport offset 34: word0 empty,
+        // word1 = IPv4 + TCP + (34 << 18).
+        let c = match v2_csum_words(L4CsumKind::Tcp, IpVersion::V4, 34, None) {
+            Some(w) => w,
+            None => return TestResult::Fail("v2_csum_words rejected a valid request"),
+        };
+        if c.word0 != 0 || c.word1 != TD1_IPV4_CS | TD1_TCP_CS | (34u32 << 18) {
+            return TestResult::Fail("v2 csum words misplaced a field");
+        }
+        // v2 TSO, IPv4, MSS 1460, offset 34: GTSENV4 + offset in
+        // word0; MSS + csum bits in word1.
+        let t = match v2_tso_words(IpVersion::V4, 1460, 34, None) {
+            Some(w) => w,
+            None => return TestResult::Fail("v2_tso_words rejected a valid request"),
+        };
+        if t.word0 != TD1_GTSENV4 | (34u32 << 18) {
+            return TestResult::Fail("v2 TSO word0 must carry GTSENV4 + GTTCPHO");
+        }
+        if t.word1 != TD1_IPV4_CS | TD1_TCP_CS | (1460u32 << 18) {
+            return TestResult::Fail("v2 TSO word1 must carry MSS + csum bits");
+        }
+        // SCTP and out-of-range values are rejected, never guessed.
+        if v2_csum_words(L4CsumKind::Sctp, IpVersion::V4, 34, None).is_some() {
+            return TestResult::Fail("SCTP csum must be rejected");
+        }
+        if v2_csum_words(L4CsumKind::Tcp, IpVersion::V4, 0x400, None).is_some() {
+            return TestResult::Fail("TCPHO overflow must be rejected");
+        }
+        if v2_tso_words(IpVersion::V4, 0x800, 34, None).is_some() {
+            return TestResult::Fail("MSS overflow must be rejected");
+        }
+        if v2_tso_words(IpVersion::V4, 1460, 0x80, None).is_some() {
+            return TestResult::Fail("GTTCPHO overflow must be rejected");
+        }
+        // v1 csum UDP: IP + UDP bits in word0; v1 TSO: LSO + MSS.
+        let v1c = match v1_csum_words(L4CsumKind::Udp, None) {
+            Some(w) => w,
+            None => return TestResult::Fail("v1_csum_words rejected UDP"),
+        };
+        if v1c.word0 != TD0_IP_CS | TD0_UDP_CS {
+            return TestResult::Fail("v1 csum word0 is wrong");
+        }
+        let v1t = match v1_tso_words(1460, None) {
+            Some(w) => w,
+            None => return TestResult::Fail("v1_tso_words rejected a valid MSS"),
+        };
+        if v1t.word0 != TD_LSO | (1460u32 << 16) {
+            return TestResult::Fail("v1 TSO word0 is wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/realtek-features", smoke_features_offload_words);
 }
