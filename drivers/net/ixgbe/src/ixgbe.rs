@@ -21,6 +21,7 @@ pub mod queues;
 pub mod rss;
 mod tests;
 pub mod vlan;
+pub mod wol;
 
 // ── PCI device IDs ─────────────────────────────────────────────────
 
@@ -323,6 +324,8 @@ pub struct Ixgbe {
     pub rss_cfg: IrqSafeSpinLock<Option<rss::IxgbeRss>>,
     /// Programmed VLAN filter, if `configure_vlan` ran.
     pub vlan_filter: IrqSafeSpinLock<Option<vlan::VlanFilter>>,
+    /// Armed WoL config, if `configure_wol` ran and was not disarmed.
+    pub wol_armed: IrqSafeSpinLock<Option<wol::WolConfig>>,
     /// Stage 5: MSI-X table once enabled.
     pub(crate) msix: Option<MsixTable>,
     pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -527,6 +530,7 @@ impl Ixgbe {
             queue_config,
             rss_cfg: IrqSafeSpinLock::new(None),
             vlan_filter: IrqSafeSpinLock::new(None),
+            wol_armed: IrqSafeSpinLock::new(None),
             msix: None,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
@@ -836,6 +840,36 @@ impl Ixgbe {
         }
         *self.vlan_filter.lock() = Some(filter);
         Ok(())
+    }
+
+    /// Arm Wake-on-LAN. 82599EB only (`wol_supported`); other
+    /// parts return `UnsupportedDevice` — X540 is ungrounded and
+    /// X550 WoL is LOM/board-gated (see wol.rs header).
+    pub fn configure_wol(&self, cfg: wol::WolConfig) -> Result<(), IxgbeError> {
+        if !wol::wol_supported(self.did) {
+            return Err(IxgbeError::UnsupportedDevice);
+        }
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            cfg.arm(&mut bank);
+        }
+        *self.wol_armed.lock() = Some(cfg);
+        Ok(())
+    }
+
+    /// Disarm Wake-on-LAN.
+    pub fn disarm_wol(&self) {
+        let mut bank = queues::MmioBank::new(&self.mmio);
+        wol::WolConfig::disarm(&mut bank);
+        *self.wol_armed.lock() = None;
+    }
+
+    /// Read the latched wake status (WUS, RW1C — the read itself
+    /// does not clear; use `configure_wol`/`disarm_wol` to clear).
+    pub fn wol_status(&self) -> wol::WakeStatus {
+        // SAFETY: identity-mapped MMIO.
+        let raw = unsafe { self.mmio.read32(wol::REG_WUS) };
+        wol::WakeStatus { raw }
     }
 
     /// Clear VLAN filtering (empty table, VFE off).

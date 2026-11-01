@@ -190,10 +190,23 @@ driver still uses legacy RX descriptors, so a stripped tag's
 VLAN field is not yet surfaced to the stack — the advanced-
 descriptor migration that reports it is a follow-up (§14).
 
-## 12. Wake-on-LAN and power management (v0.2 — see §14)
+## 12. Wake-on-LAN
 
-Placeholder for the WoL/PM commits: WUFC / WUC / WUS, suspend /
-resume / detach quiesce.
+`drivers/net/ixgbe/src/ixgbe/wol.rs` programs the 82599 wake
+filters: WUFC at 0x05808 (LNKC 0, MAG 1, EX 2, MC 3, BC 4, ARP 5,
+IPV4 6, IPV6 7, FLX0..5 16..21), WUC at 0x05800 (PME_En bit 1,
+PME_Status bit 2), WUS at 0x05810 (RW1C, same bits + MNG 8),
+IP4AT at 0x05840 + 8*n (n = 0..3) and IP6AT at 0x05880 + 4*n.
+`Ixgbe::configure_wol` arms (clear status, program WUFC, set
+PME_En) and records the config; `wol_status` decodes WUS.
+Per-part rule: 82599EB only. X540/X550EM_x are NOT armed (their
+datasheets were not consulted here); X550 is additionally
+LOM/board-gated per Intel adapter guidance, so it is not armed
+blindly either. IPAV is NOT programmed: the datasheet text
+extracted ambiguously ("0x5838"), so it is a remainder (§14),
+not a guessed value.
+
+## 12b. Power management and detach (placeholder — PM commit)
 
 ## 13. Ethtool surface (v0.2 — see §14)
 

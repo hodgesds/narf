@@ -593,3 +593,76 @@ fn smoke_ixgbe_vlan_filter() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vlan_filter);
+
+// ── WoL fixtures (commit 4) ──────────────────────────────────────
+
+fn smoke_ixgbe_wol() -> TestResult {
+    use super::queues::RegBank;
+    use super::wol::{
+        program_ipv4, program_ipv6, wol_supported, WakeStatus, WolConfig, REG_WUC, REG_WUFC,
+        REG_WUS, WUC_PME_EN,
+    };
+    if WolConfig::magic_only().wufc_word() != 0x2 {
+        return TestResult::Fail("magic-only WUFC word wrong");
+    }
+    let all = WolConfig {
+        link_change: true,
+        magic: true,
+        exact: true,
+        multicast: true,
+        broadcast: true,
+        arp: true,
+        ipv4: true,
+        ipv6: true,
+    };
+    if all.wufc_word() != 0xFF {
+        return TestResult::Fail("all-filters WUFC word wrong");
+    }
+    if !wol_supported(super::IXGBE_DEV_82599EB) {
+        return TestResult::Fail("82599EB WoL must be supported");
+    }
+    if wol_supported(super::IXGBE_DEV_X540)
+        || wol_supported(super::IXGBE_DEV_X550)
+        || wol_supported(super::IXGBE_DEV_X550EM_X)
+    {
+        return TestResult::Fail("ungrounded/LOM-gated part claims WoL support");
+    }
+    let mut bank = FakeBank::new();
+    WolConfig::magic_only().arm(&mut bank);
+    if bank.read32(REG_WUS) != 0xFFFF_FFFF {
+        return TestResult::Fail("WUS not cleared on arm");
+    }
+    if bank.read32(REG_WUFC) != 0x2 {
+        return TestResult::Fail("WUFC not programmed on arm");
+    }
+    if bank.read32(REG_WUC) & WUC_PME_EN == 0 {
+        return TestResult::Fail("WUC PME_En not set on arm");
+    }
+    WolConfig::disarm(&mut bank);
+    if bank.read32(REG_WUFC) != 0 || bank.read32(REG_WUC) & WUC_PME_EN != 0 {
+        return TestResult::Fail("disarm did not clear WUFC/PME_En");
+    }
+    let st = WakeStatus { raw: 0x1FF };
+    if !st.link_change() || !st.magic() || !st.ipv6() || !st.manageability() {
+        return TestResult::Fail("WakeStatus decode wrong");
+    }
+    if !program_ipv4(&mut bank, 0, [192, 168, 0, 1]) {
+        return TestResult::Fail("program_ipv4 slot 0 failed");
+    }
+    if bank.read32(0x05840) != 0x0100_A8C0 {
+        return TestResult::Fail("IP4AT word wrong");
+    }
+    if program_ipv4(&mut bank, 4, [10, 0, 0, 1]) {
+        return TestResult::Fail("program_ipv4 accepted slot 4");
+    }
+    let mut v6 = [0u8; 16];
+    for (i, b) in v6.iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    program_ipv6(&mut bank, v6);
+    if bank.read32(0x05880) != 0x0302_0100 {
+        return TestResult::Fail("IP6AT word 0 wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_wol);
