@@ -606,7 +606,10 @@ pub const fn jumbo_max_mtu(mac_version: u32) -> u32 {
         2..=6 => 7 * 1024 - JUMBO_OVERHEAD,
         17 => 4 * 1024 - JUMBO_OVERHEAD,
         18..=24 => 6 * 1024 - JUMBO_OVERHEAD,
-        61..=u32::MAX => 16 * 1024 - JUMBO_OVERHEAD,
+        // Bounded like Linux rtl_jumbo_max (61..=LAST, LAST = VER_80,
+        // the newest known version): unknown versions fall through
+        // to the default 9K arm below, not to 16K.
+        61..=80 => 16 * 1024 - JUMBO_OVERHEAD,
         _ => 9 * 1024 - JUMBO_OVERHEAD,
     }
 }
@@ -1444,8 +1447,11 @@ mod tests {
         let mut regs = RegLog::new();
         // SAFETY: RegLog fixture — no hardware is touched.
         unsafe { apply_eee_txidle(&mut regs, 1500) };
+        // Linux rtl_set_eee_txidle_timer: mtu + ETH_HLEN(14) + 0x20
+        // = 1546 for MTU 1500 (spec §3 documents the same); the old
+        // 1534 disagreed with the formula check above and with Linux.
         match regs.last_write_to(REG_EEE_TXIDLE_TIMER_8125) {
-            Some(w) if w.width == 2 && w.value == 1534 => {}
+            Some(w) if w.width == 2 && w.value == 1546 => {}
             _ => return TestResult::Fail("EEE timer write missing or wrong"),
         }
         TestResult::Pass
@@ -1654,9 +1660,13 @@ mod tests {
             return TestResult::Fail("UDP PID without fails must verify");
         }
         // Any fail bit voids the L4 result; an IP fail voids L3 too.
+        // A TCP fail therefore voids L4 only: no IP fail bit is set,
+        // so the IP header checksum still passed and L3 stays
+        // verified. Pinning l3_ok here defeats a decode that voids
+        // everything on any fail.
         let bad = rx_csum_decode(RX_PID_TCP | RX_FAIL_TCP);
-        if bad.l3_ok || bad.l4_ok {
-            return TestResult::Fail("TCP fail must void the checksum result");
+        if bad.l4_ok || !bad.l3_ok {
+            return TestResult::Fail("TCP fail must void L4 only, not L3");
         }
         let ipbad = rx_csum_decode(RX_PID_UDP | RX_FAIL_IP);
         if ipbad.l3_ok || ipbad.l4_ok {

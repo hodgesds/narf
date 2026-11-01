@@ -1284,8 +1284,13 @@ fn smoke_r8169_tso_desc_encode() -> TestResult {
     if d.flags_len & TD1_GTSENV4 == 0 {
         return TestResult::Fail("r8169 TSO: TD1_GTSENV4 not set in word0");
     }
-    if d.vlan & TD1_GTSENV4 != 0 {
-        return TestResult::Fail("r8169 TSO: TD1_GTSENV4 must not be in word1");
+    // Word1 bit 26 is MSS bit 8 (Linux TD1_MSS_SHIFT=18, 11-bit
+    // field spans bits 18..28), so testing the word0 GTSENV bit
+    // position against word1 is meaningless: MSS 1448 sets it
+    // legitimately. Pin the whole word instead; any stray bit
+    // (including a leaked GTSENV) fails this exact check.
+    if d.vlan != (TD1_IPv4_CS | TD1_TCP_CS | (1448u32 << TD1_MSS_SHIFT)) {
+        return TestResult::Fail("r8169 TSO: word1 is not MSS + csum bits");
     }
     if d.vlan & TD1_IPv4_CS == 0 {
         return TestResult::Fail("r8169 TSO: TD1_IPv4_CS not set");
@@ -1334,8 +1339,13 @@ fn smoke_rtl8125_tso_desc_encode() -> TestResult {
     if d.flags_len & TD1_GTSENV4 == 0 {
         return TestResult::Fail("rtl8125 TSO: TD1_GTSENV4 not set in word0");
     }
-    if d.vlan & TD1_GTSENV4 != 0 {
-        return TestResult::Fail("rtl8125 TSO: TD1_GTSENV4 must not be in word1");
+    // Word1 bit 26 is MSS bit 8 (Linux TD1_MSS_SHIFT=18, 11-bit
+    // field spans bits 18..28), so testing the word0 GTSENV bit
+    // position against word1 is meaningless: MSS 1448 sets it
+    // legitimately. Pin the whole word instead; any stray bit
+    // (including a leaked GTSENV) fails this exact check.
+    if d.vlan != (TD1_IPv4_CS | TD1_TCP_CS | (1448u32 << TD1_MSS_SHIFT)) {
+        return TestResult::Fail("rtl8125 TSO: word1 is not MSS + csum bits");
     }
     if d.vlan & TD1_IPv4_CS == 0 {
         return TestResult::Fail("rtl8125 TSO: TD1_IPv4_CS not set");
@@ -1547,8 +1557,13 @@ fn smoke_rtl8126_tso_desc_encode() -> TestResult {
     if d.flags_len & TD1_GTSENV4 == 0 {
         return TestResult::Fail("rtl8126 TSO: TD1_GTSENV4 not set in word0");
     }
-    if d.vlan & TD1_GTSENV4 != 0 {
-        return TestResult::Fail("rtl8126 TSO: TD1_GTSENV4 must not be in word1");
+    // Word1 bit 26 is MSS bit 8 (Linux TD1_MSS_SHIFT=18, 11-bit
+    // field spans bits 18..28), so testing the word0 GTSENV bit
+    // position against word1 is meaningless: MSS 1448 sets it
+    // legitimately. Pin the whole word instead; any stray bit
+    // (including a leaked GTSENV) fails this exact check.
+    if d.vlan != (TD1_IPv4_CS | TD1_TCP_CS | (1448u32 << TD1_MSS_SHIFT)) {
+        return TestResult::Fail("rtl8126 TSO: word1 is not MSS + csum bits");
     }
     if d.vlan & TD1_IPv4_CS == 0 {
         return TestResult::Fail("rtl8126 TSO: TD1_IPv4_CS not set");
