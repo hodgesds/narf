@@ -2126,12 +2126,12 @@ describe the remaining native paths.
 **Implemented continuations and remaining native scope.**
 
 - HT40, NSS2, VHT80 and Gen2 160MHz landed in §§3.36–3.39.
-- **width_160** (native160 acceptance pending). The Gen2 AX200/AX201
-  path remains software-validated in §3.39. §3.62 now wires contiguous160
-  for the admitted API89 Ty/So/Ma, Sc and Bz core103 station owners using
-  actual raw NVM width facts, correlated MCC/host span admission, native
-  VHT/HE160 maps and receive-rate fences. Six new native cases await
-  coordinated compilation/execution; no row closes on these drafts.
+- **width_160 (closed).** Gen2 AX200/AX201 remains software-validated
+  in §3.39. The admitted API89 Ty/So/Ma, Sc and Bz core103 station
+  owners in §3.62 pass release acceptance at `aa6b98463`, retaining
+  actual raw NVM width facts, correlated MCC/host span admission,
+  native VHT/HE160 maps and receive-rate fences. Physical qualification
+  remains separate from the software results.
 - **he (closed).** Qualified Gen2, Sc, exact API89 Ty/So/Ma and BzB0
   FM/WH core103 HE20/40/80 are software-validated at `62b62ea68`, including
   the source-correct MLD/MVM rate namespaces. All521 Intel native cases
@@ -3673,7 +3673,7 @@ formatting, ordinary boots and both btrfs postflights pass on each architecture.
 Firmware execution and RF remain fixture supplied; physical qualification is
 separate from these software results.
 
-### 3.62 Exact native contiguous160 ownership (native acceptance pending)
+### 3.62 Exact native contiguous160 ownership (software-validated)
 
 The common station path retains raw `NVM_CHANNEL_160MHZ` bits for the
 first 51 band-unambiguous NVM channel entries. A hardware SKU flag or a
@@ -3716,9 +3716,15 @@ literals, raw NVM and all-eight host/MCC admission including Extended NSS,
 actual narrower MCC/host HE80 fallback, bad RFH widths/MCS/NSS followed by
 valid same-PN and replay checks, and upper-channel policy loss while a
 real native STA receipt is held. They use the existing heap-owned native
-TFH/RFH firmware/AP seams. Scoped formatting and whitespace checks pass;
-coordinated compilation, native execution and the full release matrix are
-pending. The accepted531-case checkpoint in §3.61 remains separate.
+TFH/RFH firmware/AP seams. Exact checkpoint `aa6b98463` passes all537
+Intel cases on both architectures, including these six additions. The
+combined native suites pass4,369/0/13 on x86_64 and4,010/0/7 on aarch64;
+every prior named case/status is retained and exactly20 new cases pass.
+Resolved release Clippy, formatting, ordinary boots and both btrfs
+postflights pass on each architecture. The original shared PHY Offer is
+heap-retained only for160MHz, avoiding large copied negotiation state
+on the ordinary kernel stack. Firmware/AP execution remains supplied by
+the native fixtures; physical qualification remains separate.
 
 ## 4. References
 

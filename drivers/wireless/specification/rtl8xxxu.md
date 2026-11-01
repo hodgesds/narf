@@ -962,7 +962,7 @@ formatting, ordinary boots and both btrfs postflights pass on each architecture.
 Physical RF/USB qualification remains separate. Associated active scanning
 below retains its own pending native gate beyond this passive/Null acceptance.
 
-### Associated active scanning (native acceptance pending)
+### Associated active scanning (software-validated)
 
 The retained connected station now accepts an active scan with one directed
 SSID or a wildcard and up to 2048 checked extra IE bytes. Admission validates
@@ -1013,7 +1013,12 @@ refusal, held Probe cancellation/source loss, independent USB/PHY/SCH
 terminals, old FIFO rejection and current home policy/HT loss during actual
 native work. Only hardware/firmware execution and peer inputs are inert.
 The eight earlier associated-passive cases remain separate registrations.
-The new active cases await coordinated release compilation and execution.
+The eight active cases pass release acceptance at `aa6b98463` on both
+architectures. The combined suites pass4,369/0/13 on x86_64 and4,010/0/7
+on aarch64, preserving every prior named case/status and adding exactly20.
+Resolved release Clippy, formatting, ordinary boots and both btrfs
+postflights pass on each architecture. Physical qualification remains
+separate from the supplied firmware/USB/peer execution in these fixtures.
 
 ### Separately qualified RTL8188EU HT20/40/LGI (implemented, validation pending)
 
@@ -1089,7 +1094,7 @@ is present. No real board curve has been acquired, qualified or installed by
 this software work. The initial profile needs physical validation. Qualified
 legacy idle channel changes and passive scans pass native software gates; broader
 rates and endpoint reset remain software work. Connected active scanning
-is implemented below with its own native acceptance pending.
+passes native software gates at `aa6b98463`.
 Administrative cold park/wake passes native software gates at `0eb084197`.
 Idle active probe scanning passes native software gates at `0eb084197`.
 Associated passive scanning/Null functions pass native software gates at `a7797583a`.
@@ -1108,7 +1113,7 @@ Associated passive scanning/Null functions pass native software gates at `a77975
 | Signed board power artifact and checked native TX gate | Implemented software contract; real qualified per-device data must be acquired/signed/installed |
 | Native USB descriptor/packet ownership | Implemented dependency; persistent receipt/stop and Linux descriptor regressions |
 | Native beacon/management preparation and peer-bound transitions | Implemented basic1Mbps shared plan; qualified channels1–13 pass native software gates |
-| Production scan/MLME service and policy-admitted management TX | Qualified idle passive multi-channel scan/home restoration passes native gates; idle active and associated passive/Null pass native gates; signed board/deployment admission required; connected active scans are implemented pending native acceptance |
+| Production scan/MLME service and policy-admitted management TX | Qualified idle passive multi-channel scan/home restoration passes native gates; idle active and associated passive/Null pass native gates; signed board/deployment admission required; connected active scans pass native software gates at `aa6b98463` |
 | Software AES-CCM + strict CCMP/key/TID ownership | Implemented dependency; independent ciphertext/forgery/role/PN regressions |
 | WPA2 key installation/controlled port and Ethernet transport | Implemented retained shared RSNA/software CCMP, exact native delivery, Narf-Rings and synchronous stack progress |
 | Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX. Qualified legacy channels1–13 and cold idle FIFO retuning pass native software gates. Separate N8HT HT20/LGI MCS0..7/whole A-MSDU/decline/capture-publication continuation passes native software gates above and stays channel1-bound. Management/basic1Mbps remains required. The separate v2 HT20/40 LGI continuation above is implemented pending native acceptance; SGI, broader bands and coexistence remain missing |
@@ -1122,7 +1127,7 @@ Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 BT/S0S1. EU's separately qualified HT20/LGI continuation is software-validated above;
 SGI20 and controller-proven EP0 reset remain software work; the separate v2
 HT20/40 continuation above is implemented pending native acceptance.
-Associated active scanning is implemented with native acceptance pending. Qualified idle passive
+Associated active scanning passes native software gates at `aa6b98463`. Qualified idle passive
 multi-channel scanning passes native software gates; associated passive scans
 and Null functions pass native software gates at `a7797583a`.
 Full WMM AC/TID routing is implemented.

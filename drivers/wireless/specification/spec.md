@@ -290,15 +290,28 @@ architectures. Intel scheduled scanning and RTL Null/QoS Null close. The
 the previous acceptance covered idle operation. MT management TX and client/GO
 contexts also remain open. Physical qualification remains separate.
 
+**Recount 2026-10-31** (accepted native160, associated active scans and current-ROC management TX):
+the ledger holds **107 `feature`** rows (106 driver, 1 shared), **31 `chip`**
+and **0 `unknown`**. Exact checkpoint `aa6b98463` passes **4,369/0/13** on
+x86_64 and **4,010/0/7** on aarch64. Named-case comparison retains every
+case/status from `a7797583a` and adds exactly20: six Intel native160, eight
+RTL associated-active, four MT management-TX and two shared FRAME cases.
+All537 Intel cases pass on both architectures. Six resolved release Clippy
+contexts, formatting, ordinary boots and both btrfs postflights pass. Intel
+contiguous160 and RTL associated active scanning close. Current-ROC MT
+management TX is accepted partial P2P scope; private ROC/NO_CCK, native
+client/GO contexts and the separately qualified RTL HT40 continuation retain
+their own gates. Physical qualification remains separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 8 | Wider bands/widths and EHT/MLO; AP/P2P/WoW; exact admitted station/HE/TX A-MSDU and idle/associated periodic-scan profiles are software-validated |
+| iwlwifi | 7 | Wider bands/widths and EHT/MLO; AP/P2P/WoW; exact admitted station/HE/TX A-MSDU and idle/associated periodic-scan profiles are software-validated |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 5 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA and loadable packet ABI |
 | ath10k | 18 | 2.4-GHz HT40/coexistence, additional streams/TX STBC and VHT160/80+80, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload |
 | ath9k | 9 | Channel/retune and HT40/SGI40 profiles, factory selection, periodic calibration, larger TX aggregates and idle/station sleep; other chips are separate rows |
 | rtlwifi | 8 | Other matched chips, HT40/VHT, antenna/gain/coexistence and RTS/CTS |
-| rtl8xxxu | 5 | HT40, associated active scanning, Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
+| rtl8xxxu | 4 | HT40, Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
 | rtw89 | 13 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW, periodic RF tracking/runtime LPS and multiple functions; other AX/BE chips are separate rows |
 | brcmfmac | 12 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
@@ -982,7 +995,7 @@ keys/replay/BA and host rings through qualified cold channel visits. Private
 plaintext Null/QoS Null uses the peer's actual profile and shared sequence
 ownership; native USB/device terminals remain distinct from AP reception.
 Eight composed driver cases and one shared sequence/CCMP case pass native
-release gates at `a7797583a` in the family §3. Associated active scans remain open.
+release gates at `a7797583a` in the family §3. Associated active scans pass later release acceptance at `aa6b98463`.
 
 MT76's control-only P2P WDEV accepts source-bound REGISTER_FRAME before
 START as host subscription metadata. Native management RX additionally
@@ -996,23 +1009,24 @@ and host rings. One directed SSID or wildcard and bounded extra IEs use the
 private native probe path after a real cold receive restart, including a
 same-channel visit. Current qualified power, source response timing and
 native USB/device terminals fence each visit; home PHY and peer state are
-restored before normal data resumes. Eight native cases await release
-acceptance in the family §3.
+restored before normal data resumes. Eight native cases pass release
+acceptance at `aa6b98463` in the family §3.
 
 The admitted API89/Sc/Bz Intel owner can select contiguous 5 GHz 160 MHz
 from actual raw NVM flags and the complete eight-channel current host/MCC
 span. Original shared PHY offers, source-specific VHT/HE TLC maps and native
 RX admission retain negotiated bounds; unavailable wide spans keep a genuine
-80 MHz offer. Six native cases await execution; the combined parent release
-Clippy check passes. The family §3.62 documents the interface.
+80 MHz offer. Six native cases and all537 Intel cases pass release
+acceptance at `aa6b98463`. The family §3.62 documents the interface.
 
 MT76's control WDEV can transmit unkeyed management frames on its actual
 current finite 2/5 GHz ROC. Fresh occupied-power bounds, native OMAC/BMC and
 PID/TXS plus DMA/TX_FREE receipts determine transmission and ACK status;
 MLME multicast status retains the original WDEV/source/cookie. Home packet,
 key and capture owners remain separate. Four native MT cases and two shared
-control cases await execution; implicit ROC and client/GO contexts remain
-open. Combined parent release Clippy passes; the family §3 records this scope.
+control cases pass release acceptance at `aa6b98463`. Private ROC/NO_CCK
+retains separate native gates, and client/GO contexts remain open. The
+family §3 records this accepted partial scope.
 
 RTL8188EU HT20/40 LGI uses a distinct signed N8HT v2 qualification covering
 the complete radio program and both emission spans. The retained owner
