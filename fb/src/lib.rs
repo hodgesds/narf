@@ -666,7 +666,7 @@ fn boot_scanout_geom() -> Option<narf_drivers_gpu::drm_fb_hook::ScanoutGeom> {
 /// Called under the DRM copy path's scanout epoch lease, which pins the
 /// selected mapping until the CPU finishes writing it.
 fn drm_scanout_geom() -> Option<narf_drivers_gpu::drm_fb_hook::ScanoutGeom> {
-    if amdgpu_boot_paused() {
+    if drawing_paused() {
         return None;
     }
     let Some(info) = fbdev_info() else {
