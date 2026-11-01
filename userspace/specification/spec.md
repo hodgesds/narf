@@ -140,6 +140,17 @@ Native asynchronous control ACKs use `GenericReplyEndpoint`, which holds a
 weak reference to the exact sending `SocketFile` and checks its namespace,
 protocol and bound port before publication. It never looks up a replacement
 socket by port id and does not keep a closed file alive across firmware waits.
+Its optional native-emission source is a weak receipt from the actual
+`SocketFile` provider, captured only after the full socket check outside
+native device State. Final native checks use only concrete lifetime state,
+without taking the socket lock or calling the sink. Namespace changes retire
+the old source before publication, including move/back; final file Drop
+retires and wakes native cleanup before release notifications. A reused port
+never revives that weak source. Each endpoint captures its source generation
+once; an old request cannot recapture a fresh source after namespace move/back.
+A bound generic socket cannot rebind to a
+different port. The receipt grants no administration, native key or packet
+authority, and does not replace ordinary exact-source ACK/event checks.
 The endpoint may explicitly retain a fresh control-child Admin after its
 authorized parent/daemon/child delegation. These handles remain attached to
 that exact file, alongside its existing parent handle, and preserve actual

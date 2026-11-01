@@ -48,6 +48,7 @@ struct RadioModel {
     chain_mask: u8,
     chain_sent: Vec<Vec<u8>>,
     chain_stall: Option<u8>,
+    coexistence: Option<coexistence_native::Fixture>,
 }
 // SAFETY: This private firmware fixture owns its complete graph of CE-model
 // Rc/RefCell buffers; no reference-counted alias escapes the model. Moving the
@@ -368,6 +369,9 @@ impl Hif for RadioModel {
         if let Some(stage) = chains_tests::stage(self.inner.inner.dialect, &bytes[8..]) {
             return chains_tests::send(self, bytes, stage).await;
         }
+        if coexistence_native::handles(self, &bytes[8..]) {
+            return coexistence_native::send(self, bytes);
+        }
         if data_tests::protection_handles(self.inner.inner.dialect, &bytes[8..]) {
             return data_tests::protection_send(self, bytes).await;
         }
@@ -627,6 +631,7 @@ fn radio_boot_country_ht_rf(
             & if dialect == Dialect::TenFour { 15 } else { 7 }) as u8,
         chain_sent: Vec::new(),
         chain_stall: None,
+        coexistence: None,
         associated: None,
     };
     let mut htc = Session::new(model, hardware);
@@ -899,5 +904,7 @@ mod active_scan_tests;
 mod associated_scan_tests;
 #[path = "chains_tests.rs"]
 mod chains_tests;
+#[path = "coexistence_native.rs"]
+mod coexistence_native;
 #[path = "power_save_tests.rs"]
 mod power_save_tests;

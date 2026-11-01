@@ -84,6 +84,12 @@ pub(super) fn validate(frame: &[u8], own: [u8; 6], bssid: [u8; 6]) -> Result<(),
         // 2-byte transaction id; mac80211 ieee80211_process_sa_query_req).
         0xa0 | 0xc0 if protected && frame.len() == 24 + 8 + 2 + 8 => Ok(()),
         0xd0 if protected && frame.len() == 24 + 8 + 4 + 8 => Ok(()),
+        // Public Action 20/40 BSS Coexistence is non-robust (Linux
+        // ieee80211_is_robust_mgmt_frame); never CCMP-wrap or accept arbitrary
+        // public-action payloads through the initial management transport.
+        0xd0 if !protected && frame.get(24..26) == Some(&[4, 0]) => {
+            super::coexistence::validate_report(&frame[26..])
+        }
         // Association Request fixed capability/listen interval followed by IEs.
         0 if frame.len() >= 28 => {
             let mut ies = &frame[28..];

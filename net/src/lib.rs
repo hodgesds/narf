@@ -92,6 +92,7 @@ pub mod ipv6;
 pub mod ipv6_stack;
 pub mod mqtt;
 pub mod napi;
+pub mod native_emission;
 pub mod netfilter;
 pub mod netlink_audit;
 pub mod netlink_diag;
@@ -130,8 +131,9 @@ pub mod udp_sock;
 pub mod wireguard;
 pub mod ws;
 pub use stack::{
-    initial_loopback_admin, kernel_admin, AdminCap, AdminError, AdminHandle, AdminIpv4Route,
-    AdminIpv6Route, AttachError, ControlRetirement, StackAttach, StackAttachReply, StackDaemon,
+    initial_loopback_admin, kernel_admin, AdminCap, AdminEmissionAuthority, AdminError,
+    AdminHandle, AdminIpv4Route, AdminIpv6Route, AttachError, ControlRetirement, StackAttach,
+    StackAttachReply, StackDaemon,
 };
 
 // In-kernel test suites: compiled only under the `kernel-test` feature (or
@@ -551,6 +553,7 @@ struct Entry {
     handle: Cap<NetIface, Write>,
     /// Actual typed parent registration for a freshly created control child.
     control_parent: Option<Cap<NetIface, Write>>,
+    native_lifetime: native_emission::ProviderLifetime,
 }
 
 /// Owned control-plane view of a driver-backed interface.
@@ -658,6 +661,7 @@ impl<I: Interface + 'static> RegisterControl<'_, I> {
             control_namespace: namespace,
             handle,
             control_parent: self.parent,
+            native_lifetime: native_emission::ProviderLifetime::new(),
         });
         Ok(Ok(handle))
     }
@@ -731,6 +735,7 @@ impl Registry {
             control_namespace,
             handle,
             control_parent: None,
+            native_lifetime: native_emission::ProviderLifetime::new(),
         });
         Ok(handle)
     }
@@ -740,19 +745,34 @@ impl Registry {
     /// intentionally owned by the in-kernel driver teardown path, where the
     /// interface has already been selected by its authoritative netdev name.
     pub fn unregister(&self, name: &str) -> bool {
-        let mut q = self.inner.lock();
-        let before = q.len();
-        q.retain(|entry| entry.iface.name() != name);
-        q.len() != before
+        self.remove_native_registrations(|entry| entry.name == name)
     }
     /// Trusted driver teardown of exactly its retained typed registration.
     /// A stale original handle cannot remove a same-name successor. This
     /// identifies cleanup only; it grants no hardware/device operation.
     pub fn unregister_for_handle(&self, handle: &Cap<NetIface, Write>) -> bool {
+        self.remove_native_registrations(|entry| entry.handle.slot() == handle.slot())
+    }
+    fn remove_native_registrations(&self, matches: impl Fn(&Entry) -> bool) -> bool {
         let mut entries = self.inner.lock();
-        let before = entries.len();
-        entries.retain(|entry| entry.handle.slot() != handle.slot());
-        before != entries.len()
+        let mut removed = Vec::new();
+        let mut notifications = Vec::new();
+        let mut index = 0;
+        while index < entries.len() {
+            if matches(&entries[index]) {
+                notifications.push(entries[index].native_lifetime.retire());
+                removed.push(entries.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        drop(entries);
+        for retirement in notifications {
+            retirement.notify();
+        }
+        let changed = !removed.is_empty();
+        drop(removed);
+        changed
     }
 
     /// Number of registered interfaces.

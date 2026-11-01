@@ -428,7 +428,7 @@ impl Peer {
             }
             return Ok((replies, before == ApPhase::Message4 && self.hold_m4));
         }
-        if frame[0] == 0x88 && self.sender_reorder.is_some() {
+        if frame[0] == 0x88 && frame.get(24..26) == Some(&[0, 0]) && self.sender_reorder.is_some() {
             let seq = u16::from_le_bytes([frame[22], frame[23]]) >> 4;
             let released = self
                 .sender_reorder

@@ -84,7 +84,7 @@ impl Geometry {
             }
     }
     pub(super) fn ht_duration(self, short_gi: bool, air: usize, mcs: u8) -> Option<u32> {
-        if mcs > 7 || air > 8191 || short_gi && !self.is_wide() {
+        if mcs > 7 || air > 65535 || short_gi && !self.is_wide() {
             return None;
         }
         let bits = if self.is_wide() {

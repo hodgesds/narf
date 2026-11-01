@@ -191,7 +191,8 @@ impl Wire {
             put(
                 &mut out,
                 at + 12,
-                (1 << 11)
+                u32::from(frequency < 3000)
+                    | (1 << 11)
                     | if vht { 1 << 12 } else { 0 }
                     | if (frequency - low) % 40 == 0 {
                         1 << 6
@@ -484,7 +485,7 @@ pub(super) fn owned(v: &[u8]) -> Result<Vec<u8>, Error> {
     out.extend_from_slice(v);
     Ok(out)
 }
-fn tag(mut v: &[u8], wanted: u16) -> Result<&[u8], Error> {
+pub(super) fn tag(mut v: &[u8], wanted: u16) -> Result<&[u8], Error> {
     let mut found = None;
     while !v.is_empty() {
         let h = word(v, 0)?;

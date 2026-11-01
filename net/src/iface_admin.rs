@@ -74,6 +74,7 @@ pub(crate) struct Effects {
     /// `try_set_mtu`/`try_set_mac`, so the driver callback runs with no
     /// IFACES, Registry or PUBLISH lock held.
     device: Option<Change>,
+    native: Vec<crate::native_emission::Retirement>,
 }
 struct LinkEffect {
     event: OpenStopEvent,
@@ -87,6 +88,9 @@ impl Effects {
         }
     }
     fn notify(self) {
+        for native in self.native {
+            native.notify();
+        }
         let Some(LinkEffect {
             event,
             legacy,
@@ -140,6 +144,7 @@ pub(crate) fn mutate(name: &str, binding: Binding, change: Change) -> Option<Eff
         link: None,
         retired_capture: None,
         device: None,
+        native: Vec::new(),
     };
     if entry.control.is_some() && matches!(change, Change::Mtu(_) | Change::Mac(_)) {
         effects.device = Some(change);
@@ -149,6 +154,7 @@ pub(crate) fn mutate(name: &str, binding: Binding, change: Change) -> Option<Eff
         Change::Mtu(mtu) => entry.mtu = mtu,
         Change::Mac(mac) => {
             if entry.mac != mac {
+                effects.native.push(entry.retire_native());
                 entry.ownership_epoch = next_ownership_epoch();
             }
             entry.mac = mac;
@@ -156,6 +162,9 @@ pub(crate) fn mutate(name: &str, binding: Binding, change: Change) -> Option<Eff
         }
         Change::Link(up) => {
             if entry.link_up != up {
+                if !up {
+                    effects.native.push(entry.retire_native());
+                }
                 entry.link_up = up;
                 if !up {
                     entry.ownership_epoch = next_ownership_epoch();

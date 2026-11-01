@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! AR9285-only measured two-MPDU sender BA. Air protocol and original
+//! AR9285-only measured sender BA. Air protocol and original
 //! ownership precede native descriptor publication; no firmware offload exists.
 use super::{
     ht,
@@ -12,7 +12,11 @@ use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Read};
 use narf_firmware::FirmwareBlob;
 #[path = "tx_ba/protocol.rs"]
 mod protocol;
-pub(super) use protocol::{Action, Owner, PairPermit};
+pub(super) use protocol::{Action, AggregatePermit, Owner};
+#[path = "tx_ba/large.rs"]
+mod large;
+pub(super) use large::request as large_request;
+pub(super) const MAX_MEMBERS: usize = 8;
 pub(super) const MAX_AIR: usize = 4095;
 pub(super) const RETRIES: u8 = 3;
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +85,8 @@ pub(super) struct Grant {
     peak: i16,
     ceiling: i16,
     window: u8,
+    members: usize,
+    max_air: usize,
 }
 pub(super) enum Source {
     Registered,
@@ -108,7 +114,10 @@ impl Source {
                 let loader = narf_firmware::trusted_loader_authority()
                     .and_then(|c| c.derive::<Read>().ok())
                     .ok_or(Error::Access)?;
-                let cap = narf_firmware::open(&request(&base).filename, &loader)
+                // An absent v4 record retains the exact accepted two-member
+                // contract. A present malformed v4 record is never downgraded.
+                let cap = narf_firmware::open(&large::request(&base).filename, &loader)
+                    .or_else(|_| narf_firmware::open(&request(&base).filename, &loader))
                     .map_err(|_| Error::Access)?;
                 cap.invoke(Decode(base)).map_err(|_| Error::Access)??
             }
@@ -127,6 +136,9 @@ impl Grant {
         base: Arc<ht::Grant>,
     ) -> Result<Self, Error> {
         cap.invoke(NoopOp).map_err(|_| Error::Access)?;
+        if b.get(4) == Some(&4) {
+            return large::decode(b, signer, cap, base);
+        }
         let r = request(&base);
         if signer.is_none()
             || b.len() != 96
@@ -148,6 +160,8 @@ impl Grant {
             peak: i16::from_le_bytes([b[58], b[59]]),
             ceiling: i16::from_le_bytes([b[62], b[63]]),
             window: b[60],
+            members: 2,
+            max_air: MAX_AIR,
         };
         if !(-512..=256).contains(&g.peak) || !(-512..=256).contains(&g.ceiling) {
             return Err(Error::Packet);
@@ -191,6 +205,9 @@ impl Grant {
         }
         Ok(())
     }
+    pub(super) fn members(&self) -> usize {
+        self.members
+    }
     pub(super) fn window(&self) -> u8 {
         self.window
     }
@@ -198,3 +215,5 @@ impl Grant {
 #[cfg(feature = "kernel-test")]
 #[path = "tx_ba/tests.rs"]
 pub(super) mod tests;
+#[cfg(feature = "kernel-test")]
+pub(super) use large::tests as large_tests;

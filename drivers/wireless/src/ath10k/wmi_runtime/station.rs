@@ -175,14 +175,17 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             caps,
             cached,
             own,
-            if pair.is_some() {
+            if pair.is_some() || self.coexistence_wide(bssid, frequency) {
                 ht::Phy::Ht40
             } else {
                 ht::Phy::Ht20
             },
             chains,
         )?;
-        if let Some(h) = ht.filter(|h| h.secondary.is_some()) {
+        if let Some(h) = ht.filter(|h| {
+            h.secondary.is_some()
+                && (frequency >= 3000 || self.coexistence_geometry(bssid, frequency, h.secondary))
+        }) {
             if let Ok(permission) = Permission::occupied(caps, domain, frequency, h.secondary) {
                 if permission.center != h.center {
                     return Err(Error::Unsupported);
@@ -444,6 +447,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.failed || self.ready.is_none() || self.peer.is_some() {
             return Err(Error::Failed);
         }
+        self.prepare_coexistence(domain, bssid, frequency, validate)
+            .await?;
         let bss = self
             .scan_cache
             .iter()
@@ -465,12 +470,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             ies = &ies[2 + n..];
         }
+        let beacon_interval = bss.beacon_interval;
         let (permission, ht) = self.station_profile(domain, bssid, frequency)?;
+        self.bind_coexistence_width(bssid, permission)?;
         let rd = self.wire.domain(permission)?;
         let power = self.wire.power(permission)?;
-        let mut start = self
-            .wire
-            .start_station(permission, bss.beacon_interval, dtim)?;
+        let mut start = self.wire.start_station(permission, beacon_interval, dtim)?;
         if let Some(ht) = ht {
             let channel = if self.wire.dialect == Dialect::Tlv {
                 84
@@ -777,6 +782,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
     pub(super) fn station_event(&mut self, event: htt::Event) -> Result<htt::Event, Error> {
         self.observe_dwell_scan(&event)?;
+        self.observe_coexistence(&event)?;
         if let htt::Event::Wmi(bytes) = &event {
             if self.wire.dialect == Dialect::Tlv {
                 if let Some(reports) = management::completions(bytes)? {

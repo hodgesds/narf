@@ -34,9 +34,9 @@ pub(super) fn prepare(
     combining: bool,
 ) -> Result<(), BringUpError> {
     let m = &image[52..120];
-    let minor = u16::from_le_bytes(image[4..6].try_into().unwrap()) & 0xfff;
-    let chain = u32::from_le_bytes(m[..4].try_into().unwrap());
-    let common = u32::from_le_bytes(m[4..8].try_into().unwrap());
+    let minor = crate::ath9k::identity::eeprom_word(image, 4) & 0xfff;
+    let chain = crate::ath9k::identity::eeprom_dword(image, 52);
+    let common = crate::ath9k::identity::eeprom_dword(image, 56);
     io.write32(0x9964, common);
     rmw(io, 0x9960, 0, chain)?;
     rmw(

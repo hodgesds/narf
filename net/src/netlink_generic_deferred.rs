@@ -17,6 +17,12 @@ const ECANCELED: i32 = 125;
 /// grants no interface control authority.
 pub trait DeferredReplySink: fmt::Debug + Send + Sync {
     fn current(&self) -> bool;
+    /// Concrete weak source observation supplied only by the actual socket
+    /// provider after its full current check. Unknown providers cannot arm
+    /// autonomous native emission. This observation grants no administration.
+    fn native_source(&self) -> Option<crate::native_emission::Lifetime> {
+        None
+    }
     fn deliver(&self, message: Vec<u8>) -> Result<(), i32>;
     /// Retain an actual fresh control-child grant on this exact source.
     /// No name lookup, WDEV or wire bytes create administration. Legacy

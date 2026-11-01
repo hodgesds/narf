@@ -176,10 +176,8 @@ pub(in crate::ath9k) fn checked_plan_at(
     if frequency != 2412 && ceiling < image[60] {
         return Err(BringUpError::Policy);
     }
-    let factory = Factory::from_eeprom(u32::from(u16::from_le_bytes(
-        image[8..10].try_into().unwrap(),
-    )))
-    .map_err(|_| BringUpError::BadCalibration)?;
+    let factory = Factory::from_eeprom(u32::from(crate::ath9k::identity::eeprom_word(image, 8)))
+        .map_err(|_| BringUpError::BadCalibration)?;
     plan(image, frequency, initial_ctl(factory), ceiling)
 }
 pub(super) fn program(
@@ -191,10 +189,8 @@ pub(super) fn program(
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
-    let factory = Factory::from_eeprom(u32::from(u16::from_le_bytes(
-        image[8..10].try_into().unwrap(),
-    )))
-    .map_err(|_| BringUpError::BadCalibration)?;
+    let factory = Factory::from_eeprom(u32::from(crate::ath9k::identity::eeprom_word(image, 8)))
+        .map_err(|_| BringUpError::BadCalibration)?;
     let p = plan(image, frequency, initial_ctl(factory), ceiling)?;
     for (register, value) in p.registers {
         if !io.authorized() {

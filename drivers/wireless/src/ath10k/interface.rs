@@ -42,6 +42,7 @@ struct ReceiveBatch {
     permission: super::regulatory::Permission,
     source: Option<super::firmware_source::Source>,
     scan_policy: Option<Arc<wmi_runtime::ScanPolicy>>,
+    coexistence: (Arc<AtomicU64>, u64),
     frames: Vec<Vec<u8>>,
 }
 #[cfg(any(test, feature = "kernel-test"))]
@@ -583,6 +584,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                     permission,
                     source,
                     scan_policy: radio.scan_policy(),
+                    coexistence: radio.coexistence_capture(),
                     frames,
                 }))
             })()
@@ -642,6 +644,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 }
                 if self.closed.load(Ordering::Acquire) {
                     return Err(Error::Failed);
+                }
+                if batch.coexistence.0.load(Ordering::Acquire) != batch.coexistence.1 {
+                    return Ok(());
                 }
                 narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
                 Ok::<_, Error>(())
@@ -881,6 +886,28 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             return Err(WirelessError::HardwareError);
         }
         let domain = self.policy.current().map_err(error)?;
+        // OBSS may select an actual40 or actual20 owner. Complete that
+        // receive-only preflight before capturing the immutable occupied
+        // permission used by every subsequent native association wait.
+        radio
+            .prepare_coexistence(
+                &domain,
+                request.bssid,
+                request.frequency_mhz as u16,
+                &|| {
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(Error::Failed);
+                    }
+                    let current = self.policy.current()?;
+                    if current.country_code != domain.country_code || current.rules != domain.rules
+                    {
+                        return Err(Error::Unsupported);
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .map_err(error)?;
         let permission = radio
             .station_permission(&domain, request.bssid, request.frequency_mhz as u16)
             .map_err(error)?;

@@ -12,6 +12,8 @@ mod associated_scan_conversation_tests;
 mod chains_conversation_tests;
 #[path = "coding_conversation_tests.rs"]
 mod coding_conversation_tests;
+#[path = "coexistence_conversation_tests.rs"]
+mod coexistence_conversation_tests;
 #[path = "ht40_conversation_tests.rs"]
 mod ht40_conversation_tests;
 #[path = "ht_conversation_tests.rs"]
@@ -117,6 +119,25 @@ impl Harness {
         factory: u32,
         profile: (Option<u32>, u32),
     ) -> Self {
+        Self::new_on_inventory(
+            version,
+            dialect,
+            secured,
+            active_scan,
+            frequency,
+            factory,
+            (profile.0, profile.1, false),
+        )
+    }
+    fn new_on_inventory(
+        version: u32,
+        dialect: Dialect,
+        secured: bool,
+        active_scan: bool,
+        frequency: u16,
+        factory: u32,
+        profile: (Option<u32>, u32, bool),
+    ) -> Self {
         let mut radio = radio_boot_country_ht_rf(
             version,
             dialect,
@@ -142,7 +163,15 @@ impl Harness {
         } else {
             &pair
         };
-        assert!(matches!(drive(radio.start(configured)), Poll::Ready(Ok(_))));
+        if profile.2 {
+            radio.htt.wmi.htc.transport.default_channels = true;
+            assert!(matches!(
+                drive(radio.start_from_hardware()),
+                Poll::Ready(Ok(_))
+            ));
+        } else {
+            assert!(matches!(drive(radio.start(configured)), Poll::Ready(Ok(_))));
+        }
         let m = &mut radio.htt.wmi.htc.transport;
         let mut fixture = Fixture::on_channel(
             secured,

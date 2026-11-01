@@ -610,6 +610,27 @@ successful ACK. Closing the original socket cancels the waiter and suppresses
 its reply; a bound replacement cannot receive it. A sink grants no object
 authority: families retain and invoke their actual current admin handle,
 interface identity and mode generation throughout native work/publication.
+Native autonomous AP emission may capture `AdminHandle::native_emission`
+only for a real current Ethernet netdev while administratively UP. Its
+`AdminEmissionAuthority::current` invokes the original Admin capability and,
+for delegation, the actual StackDaemon and NetIface capabilities, using fixed
+operations without virtual interfaces, Registry/IFACES locks or socket
+callbacks. Unsupported control-child ancestry refuses. Exact typed-registry
+and netdev identity receipts are weak, provider-owned observations, never
+grants. Providers retire old receipts before unregister, rebind, namespace
+move/release, MAC change, representation change or administrative DOWN;
+returning the same namespace/MAC/UP state never revives them. A provider
+`Retirement` closes its fence immediately and notifies watched native cleanup
+owners only after provider/publication locks are released. Each source may
+watch up to64 distinct owners; exhaustion refuses new watches. The additive
+`DeferredReplySink::native_source` defaults to refusal for unknown providers.
+Native owners also re-invoke cap epochs on a bounded timer because generic
+capability revocation supplies no provider wake callback. Such denial must
+retire autonomous emission, not only suppress an ACK. Physical non-emitting
+flush/disable/remove cleanup uses still-current device authority after the
+original administrative/socket guard dies, retaining uncertain DMA until
+actual terminal stop. Full arbitrary authority and delivery callbacks run
+outside native State locks; a cached successful check is never authority.
 Its additive `retain_control_admin` / `control_admin` methods retain only an
 explicit current control-child Admin on that exact source; default sinks refuse
 retention and return no grant. The real source prunes retired/revoked child

@@ -164,8 +164,8 @@ fn spur(
 ) -> Result<(), BringUpError> {
     let mut selected = None;
     // offsetof(ar5416_eeprom_4k, modalHeader.spurChans)=100; 5x4 bytes.
-    for entry in image[100..120].chunks_exact(4) {
-        let value = u16::from_le_bytes(entry[..2].try_into().unwrap());
+    for index in 0..5 {
+        let value = crate::ath9k::identity::eeprom_word(image, 100 + index * 4);
         if value == 0x8000 {
             break;
         }

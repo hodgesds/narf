@@ -289,13 +289,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         &mut self,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<bool, Error> {
+        let coexistence = self.service_coexistence(domain).await?;
         if self.failed
             || self.station_link().is_none()
             || self.data.as_ref().is_none_or(|d| {
                 d.management.is_none() && d.wmm_update.is_none() && d.protection_update.is_none()
             })
         {
-            return Ok(false);
+            return Ok(coexistence);
         }
         self.check_data_policy(domain)?;
         // ath10k_bss_info_changed(BSS_CHANGED_ERP_CTS_PROT): recalc RTS/CTS
@@ -321,7 +322,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let sent = self.send_station_management().await?;
         let wmm = self.send_station_wmm(&|| Ok(())).await?;
         self.failed = false;
-        Ok(sent || wmm)
+        Ok(coexistence || sent || wmm)
     }
     pub fn has_station_data(&self) -> bool {
         self.data.is_some()
@@ -380,6 +381,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
     }
     pub fn station_link(&self) -> Option<Link> {
+        if self.coexistence_blocked() {
+            return None;
+        }
         if !self.data.as_ref()?.open() {
             return None;
         }
@@ -758,7 +762,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
             if idle {
                 let data = self.data.as_mut().ok_or(Error::Failed)?;
-                if !data.open() {
+                if !data.open() || self.coexistence.as_ref().is_some_and(|s| s.blocked()) {
                     data.received.clear();
                 }
                 let frames = data.received.drain(..).collect();
@@ -974,9 +978,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                             .iter()
                             .any(|b| b.bssid == bssid && b.ssid == beacon.ssid)
                     {
-                        if peer
-                            .ht
-                            .is_some_and(|h| !h.matches_beacon(&beacon.information_elements))
+                        if !self.coexistence.as_ref().is_some_and(|s| s.blocked())
+                            && peer
+                                .ht
+                                .is_some_and(|h| !h.matches_beacon(&beacon.information_elements))
                         {
                             return Err(Error::Unsupported);
                         }
@@ -1332,4 +1337,27 @@ fn bar(frame: &[u8], addresses: Addresses) -> Option<(u8, u16)> {
         return None;
     }
     Some(((control >> 12) as u8, sequence >> 4))
+}
+
+impl<T: Hif + HostMemory + HttMemory> Radio<T> {
+    pub(super) fn coexistence_ready(&self) -> bool {
+        self.data.as_ref().is_some_and(State::protection_allowed) && !self.scan_in_progress()
+    }
+    pub(super) fn coexistence_receipt(&mut self, receipt: htt::TxReceipt) -> Result<(), Error> {
+        self.data
+            .as_mut()
+            .ok_or(Error::Failed)?
+            .protection_receipt(receipt)
+    }
+    pub(super) fn discard_coexistence_receive(&mut self) -> Result<(), Error> {
+        let data = self.data.as_mut().ok_or(Error::Failed)?;
+        if !data.protection_allowed() {
+            return Err(Error::Failed);
+        }
+        data.incoming.clear();
+        data.received.clear();
+        data.rx_ba.flush();
+        self.pending.clear();
+        Ok(())
+    }
 }

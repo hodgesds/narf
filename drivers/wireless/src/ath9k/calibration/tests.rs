@@ -34,6 +34,7 @@ struct Model {
     pause: Option<usize>,
     gone: bool,
     eeprom: Option<[u8; EEPROM_4K_BYTES]>,
+    magic: u16,
     selected: usize,
     ignored: Option<u64>,
 }
@@ -53,6 +54,7 @@ impl Model {
             pause: None,
             gone: false,
             eeprom: None,
+            magic: 0xa55a,
             selected: 0,
             ignored: None,
         };
@@ -124,7 +126,7 @@ impl RegisterIo for Model {
             }
             if register == 0x407c {
                 return if self.selected == 0 {
-                    0xa55a
+                    u32::from(self.magic)
                 } else if (64..64 + EEPROM_4K_BYTES / 2).contains(&self.selected) {
                     let at = (self.selected - 64) * 2;
                     u32::from(u16::from_le_bytes([image[at], image[at + 1]]))
@@ -492,8 +494,24 @@ pub(in crate::ath9k) fn channel_receipt_image(
     ceiling: u8,
     image: [u8; EEPROM_4K_BYTES],
 ) -> Result<ChannelReceipt, BringUpError> {
-    let mut io = Model::new(0, false, false, 1400);
-    io.eeprom = Some(image);
+    channel_receipt_factory(frequency, ceiling, image, false, false)
+}
+pub(in crate::ath9k) fn channel_receipt_factory(
+    frequency: u16,
+    ceiling: u8,
+    image: [u8; EEPROM_4K_BYTES],
+    swapped: bool,
+    xe2: bool,
+) -> Result<ChannelReceipt, BringUpError> {
+    let mut io = Model::new(0, xe2, false, 1400);
+    io.magic = if swapped { 0x5aa5 } else { 0xa55a };
+    let mut wire = image;
+    if swapped {
+        for word in wire.chunks_exact_mut(2) {
+            word.swap(0, 1);
+        }
+    }
+    io.eeprom = Some(wire);
     let (identity, image) = crate::ath9k::identity::identify(&mut io)?;
     let prepared = crate::ath9k::phy::prepare_at(&mut io, &image, frequency)?;
     let permission = Permission {
@@ -552,8 +570,25 @@ pub(in crate::ath9k) fn wide_receipt(
     image: [u8; EEPROM_4K_BYTES],
     ignored: Option<u64>,
 ) -> Result<WideReceipt, BringUpError> {
-    let mut io = Model::new(0, false, false, 1400);
-    io.eeprom = Some(image);
+    wide_receipt_factory(geometry, ceiling, image, ignored, false, false)
+}
+pub(in crate::ath9k) fn wide_receipt_factory(
+    geometry: crate::ath9k::channel_width::Geometry,
+    ceiling: u8,
+    image: [u8; EEPROM_4K_BYTES],
+    ignored: Option<u64>,
+    swapped: bool,
+    xe2: bool,
+) -> Result<WideReceipt, BringUpError> {
+    let mut io = Model::new(0, xe2, false, 1400);
+    io.magic = if swapped { 0x5aa5 } else { 0xa55a };
+    let mut wire = image;
+    if swapped {
+        for word in wire.chunks_exact_mut(2) {
+            word.swap(0, 1);
+        }
+    }
+    io.eeprom = Some(wire);
     let (identity, image) = crate::ath9k::identity::identify(&mut io)?;
     io.ignored = ignored;
     let prepared = crate::ath9k::phy::prepare_geometry(&mut io, &image, geometry)?;
@@ -585,3 +620,6 @@ pub(in crate::ath9k) fn wide_receipt(
         registers: io.values,
     })
 }
+
+#[path = "factory_tests.rs"]
+pub(in crate::ath9k) mod factory;

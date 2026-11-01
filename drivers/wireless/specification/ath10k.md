@@ -16,6 +16,9 @@
 > architectures; physical qualification remains open.
 > A later chain/NSS/TX-STBC extension is source complete with four new
 > unexecuted cases; release compilation and native validation are pending.
+> A subsequent 2.4-GHz HT40/20–40 coexistence extension is source complete
+> with seven new cases written; its release compilation and native execution
+> are pending. Physical RF/power acceptance is still separate.
 
 ## 1. Purpose & scope
 
@@ -214,7 +217,8 @@ Host-bus/system power transitions remain separate profiles.
   capability before native publication; a narrowed negotiated width cannot leave
   an unqualified40-MHz local advertisement. A response changing an already-programmed width, center, occupied
   pair or HT40 protection mode fails; no unproved VDEV restart or header rewrite
-  relabels that owner. AP HT capability/operation changes after association close
+  relabels that owner. Apart from the separately owned one-way 2.4-GHz
+  coexistence restart below, AP HT capability/operation changes after association close
   it. Native RX accepts 20-MHz PPDUs within a selected40 profile, admits40 only
   there, and rejects an unadvertised GI, GF and unsupported MCS before replay/PN commitment.
   `SCAN_CHAN_LIST` programs the two qualified constituents with ALLOW_HT and
@@ -227,8 +231,9 @@ Host-bus/system power transitions remain separate profiles.
   `WMI_HT_CAP_HT40_SGI` (0x0800), alongside HT enablement and the checked chain
   count. `WMI_HT_CAP_HT20_SGI` (0x0002), HT40 width, the PCI tuple and a peer's
   capabilities cannot substitute for it. The per-band local HT body carries
-  IEEE SGI40 bit0x0040 only in the bounded 5-GHz HT40 profile; the 2.4-GHz/HT20
-  body never inherits it. Both GI directions follow the real firmware fact.
+  IEEE SGI40 bit0x0040 only in a source-admitted HT40 profile, including the
+  separately controlled 2.4-GHz path below; an HT20 body never inherits it.
+  Both GI directions follow the real firmware fact.
   The original scan and actual association response additionally bound TX GI;
   a response cannot restore a GI absent from the scan offer. Local RX uses the
   exact promise sent in our association request and is not narrowed by an AP's
@@ -260,6 +265,64 @@ Host-bus/system power transitions remain separate profiles.
   when exposing SGI40; ath10k has no Intel-style legacy-only measured-emitter
   record to relabel. These source-backed gates grant no physical RF or board
   interoperability claim.
+- 2.4-GHz HT40 and HT20/40 coexistence (`wmi_runtime::coexistence`) use
+  the actual initialized HT/chain/GI facts and the selected AP's HT Operation.
+  Both primary and extension must be admitted channels 1–11,20MHz apart,
+  within SERVICE_READY hardware ranges. The host receipt covers the entire
+  40MHz span and takes every overlapping rule's restrictive width, flags and
+  power; the firmware retains its factory CTL and actual vendor BDF/OTP
+  calibration. START uses MODE_11NG_HT40=7, mean RF center and two real
+  11G/ALLOW_HT inventory rows. This does not infer power from a PCI ID.
+  Before a 40MHz join, a native passive scan must cover every affected
+  receive channel, including admitted receive-only 12/13. A missing inventory
+  row, absent AP OBSS parameters or unsupported operating-class country
+  triplets selects a genuine local 20 request before native START/PEER_ASSOC.
+  A complete report tracks non-HT and 40MHz-intolerant BSSs; a truncated scan
+  cannot prove a clear band. The actual refreshed AP facts are bound again
+  before deciding whether this prepared native owner is 20 or 40MHz.
+  After association, the retained worker schedules passive OBSS scans at the
+  AP's BSS Width Trigger Scan Interval, clamped to 10 seconds as hostap does.
+  It consumes that exact scan's terminal and restores the real home inventory
+  before reporting. Public Action category 4/action 0 carries the 20/40 BSS
+  Coexistence IE 72 and distinct channel report IE 73 with operating class 0;
+  a 40MHz-intolerant observation sets the20MHz Width Request bit. This public
+  action is non-robust even with PMF; it never uses a forged protected frame.
+  Own AP width requests, its later 20MHz operation, and affected non-HT or
+  intolerant observations make the width trigger sticky for this owner.
+  A current source and exact AP/channel binding precede every observation.
+  A selected 40 owner may narrow exactly once. DATA stops before native waits;
+  outstanding original HTT IDs drain to their real terminal receipts, with no
+  key reply in flight. The driver submits PEER_PHYMODE=11NG_HT20 and
+  PEER_CHAN_WIDTH=20, actual 20 power/inventory and VDEV_RESTART with center
+  equal to primary. Only a matching native RESTART response (type 1, vdev 0,
+  requestor 0, success) can publish the new 20 receipt; old START/type 0 and
+  foreign-vdev events cannot satisfy it. The old global PDEV power ceiling
+  remains through this response; only confirmed20 hardware may receive a
+  higher20-only ceiling than the old full40-span minimum. A consumed RX prefix and cleared
+  reorder/PPDU/copy admission separate the widths; pairwise keys and PN
+  ownership stay with the original authenticated peer. A receive generation
+  check suppresses a later stack callback copied before the trigger. RX rejects
+  old 40 PPDU metadata before replay commitment, so a valid 20 retry with the
+  same PN still works. Cancellation, missing/failed response, policy/source
+  loss or peer unmap keeps the owner failed and native DMA retained for the
+  existing teardown/reset path. Parameter submission is not a firmware or air
+  ACK. This owner never widens or retries an ambiguous restart; a later wider
+  association needs a new physical owner. A response changing the initial
+  prepared geometry still fails before key/data publication.
+  The affected scan contract follows hostap SME: strict overlap of each 20MHz
+  channel with `[min(primary,secondary)-10,max(primary,secondary)+10]`, equal
+  to inclusive RF-center ±25MHz on the 5MHz raster; center ±30MHz is excluded.
+  Primary pins: Linux 7.2 `mac.c::ath10k_get_ht_cap`,
+  `ath10k_sta_rc_update_wk`, WMI native peer/start/restart structures; hostap
+  Android 15_r17 `wpa_supplicant/sme.c` blob
+  `57c9b3814f84b9402a0b6a787fe8b5a37c6645ee`, functions
+  `sme_proc_obss_scan`, `wpa_obss_scan_freqs_list`, `sme_sched_obss_scan`;
+  `hw_features_common.c::check_40mhz_2g4` at commit
+  `f43a200a87e4d4bd578de6eb56b4b527f9e01880` confirms the center ±25MHz edge.
+  Seven new native/source cases are written, including all six dialects,
+  Open/WPA2 DHCP/IP, both extension directions, timed scans/reports, initial
+  real20 fallback, exact native narrowing, same-PN admission and held restart
+  cancellation. They remain unexecuted; release compilation is pending.
 - HT LDPC and one-stream RX STBC (`wmi_runtime::ht::{ldpc,rx_stbc,Profile}`)
   follow Linux `mac.c::ath10k_get_ht_cap`: IEEE LDPC_CODING (0x0001) is
   advertised only for SERVICE_READY `WMI_HT_CAP_LDPC` (0x0040) or the pair
@@ -1360,8 +1423,11 @@ actual two-stream traffic and rejects three streams. None of these changed
 cases has been executed yet; coordinated release compile/native gates remain
 pending. No physical board or over-air STBC result is claimed.
 
-Across the reached rows, concrete remaining software packages are 2.4-GHz HT40
-coexistence/occupied-power ownership;
+The bounded 2.4-GHz HT40/HT20–40 coexistence continuation is source complete
+as described in §3; seven new cases and its release/native validation are
+pending. This makes no additional per-chip physical RF or power claim.
+
+Across the reached rows, concrete remaining software packages are
 VHT160/80+80 (VHT20/40/80 is implemented); PFC fetch/queue ownership;
 AP-side U-APSD under the AP owner; DFS/indoor/beacon-hint
 qualification; remain-on-channel/action-frame control; hardware key offload;

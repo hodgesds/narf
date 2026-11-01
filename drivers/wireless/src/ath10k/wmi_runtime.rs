@@ -21,6 +21,7 @@ pub(in crate::ath10k) use active_scan::checked as checked_policy;
 pub(in crate::ath10k) use associated_scan::receive_permission;
 pub(in crate::ath10k) use dwell_scan::ScanPolicy;
 mod chains;
+mod coexistence;
 mod data;
 mod ht;
 mod mlme;
@@ -111,6 +112,8 @@ pub(super) struct Radio<T> {
     power_save: Option<bool>,
     protection: Option<StationProtection>,
     chains: Option<chains::Chains>,
+    coexistence: Option<alloc::boxed::Box<coexistence::State>>,
+    coexistence_epoch: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
 }
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn configured_channels(&self) -> &[u16] {
@@ -142,6 +145,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             power_save: None,
             protection: None,
             chains: None,
+            coexistence: None,
+            coexistence_epoch: alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
         }
     }
     /// No country policy is inferred here: these are receive-only IEEE

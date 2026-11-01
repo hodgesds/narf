@@ -43,6 +43,8 @@ struct Spec {
     narrow_response: bool,
     wrong_receipt: bool,
     missing: bool,
+    large: bool,
+    factory: Option<calibration::tests::factory::Selection>,
 }
 struct Nominal {
     image: [u8; crate::ath9k::EEPROM_4K_BYTES],
@@ -105,7 +107,18 @@ impl Environment for WideEnvironment {
         .map_err(|_| Error::Profile)?;
         // An offline isolated model supplies a synthetic fixture asset. This
         // is not the live generation and never proves its actual calibration.
-        let oracle = wide_receipt(geometry, 40, reference.image, None).map_err(|_| Error::State)?;
+        let oracle = match owner.spec.factory {
+            Some(factory) => calibration::tests::wide_receipt_factory(
+                geometry,
+                40,
+                reference.image,
+                None,
+                factory.swapped,
+                factory.xe2,
+            ),
+            None => wide_receipt(geometry, 40, reference.image, None),
+        }
+        .map_err(|_| Error::State)?;
         let mut bytes = record(&facts, oracle.report, owner.spec.mask, owner.spec.gi);
         if owner.spec.wrong_receipt {
             bytes[64] ^= 1;
@@ -185,8 +198,17 @@ impl Owner {
     }
     fn prepare_twenty(self: &Arc<Self>, frequency: u16) -> Result<Arc<TestDevice>, Error> {
         self.physical_calibrations.fetch_add(1, Ordering::AcqRel);
-        let receipt =
-            channel_receipt_image(frequency, 40, wide_image()).map_err(|_| Error::State)?;
+        let receipt = match self.spec.factory {
+            Some(factory) => calibration::tests::channel_receipt_factory(
+                frequency,
+                40,
+                calibration::tests::factory::image(factory),
+                factory.swapped,
+                factory.xe2,
+            ),
+            None => channel_receipt_image(frequency, 40, wide_image()),
+        }
+        .map_err(|_| Error::State)?;
         let model = Model::new();
         model.frequency.set(receipt.report.frequency_mhz);
         model.channels.set(0x1fff);
@@ -219,8 +241,18 @@ impl Owner {
     fn prepare_wide(self: &Arc<Self>, grant: Arc<ht40::Grant>) -> Result<Arc<TestDevice>, Error> {
         grant.check()?;
         self.physical_calibrations.fetch_add(1, Ordering::AcqRel);
-        let receipt =
-            wide_receipt(grant.geometry(), 40, wide_image(), None).map_err(|_| Error::State)?;
+        let receipt = match self.spec.factory {
+            Some(factory) => calibration::tests::wide_receipt_factory(
+                grant.geometry(),
+                40,
+                calibration::tests::factory::image(factory),
+                None,
+                factory.swapped,
+                factory.xe2,
+            ),
+            None => wide_receipt(grant.geometry(), 40, wide_image(), None),
+        }
+        .map_err(|_| Error::State)?;
         grant.accept(receipt.report)?;
         let model = Model::new();
         model.frequency.set(receipt.report.report.frequency_mhz);
@@ -232,7 +264,11 @@ impl Owner {
         wrapped.readback(&model)?;
         *model.ht.borrow_mut() = Some(wrapped);
         crate::ath9k::rx_ba::tests::qualify(&model, 64);
-        crate::ath9k::tx_ba::tests::qualify(&model, 64);
+        if self.spec.large {
+            crate::ath9k::tx_ba::large_tests::qualify(&model, 8, 65535, 64);
+        } else {
+            crate::ath9k::tx_ba::tests::qualify(&model, 64);
+        }
         crate::ath9k::qos::tests::qualify(&model);
         self.finish(
             model,
@@ -253,7 +289,11 @@ impl Owner {
             None,
             self.spec.geometry.primary(),
         )));
-        peer.lock().ht = Some(elements(self.spec.geometry, self.spec.gi != 0));
+        let mut offer = elements(self.spec.geometry, self.spec.gi != 0);
+        if self.spec.large {
+            offer[4] = (offer[4] & 3) | 28;
+        } //16us density.
+        peer.lock().ht = Some(offer);
         peer.lock().qos_tids = true;
         if wide {
             peer.lock().expected_ht_cap = [14 | if self.spec.gi & 2 != 0 { 64 } else { 0 }, 1];
@@ -406,6 +446,8 @@ fn spec(width: Width, gi: u8, protected: bool) -> Spec {
         narrow_response: false,
         wrong_receipt: false,
         missing: false,
+        large: false,
+        factory: None,
     }
 }
 fn network(owner: &Owner) -> Result<(), &'static str> {
@@ -946,3 +988,9 @@ kernel_test_in!(
     "drivers/wireless/ath9k/ht40",
     smoke_ar9285_ht40_rx_gi_direction_cancel_and_signed_child_versions
 );
+
+#[path = "interface_aggregate_wide_tests.rs"]
+mod aggregate_tests;
+
+#[path = "interface_factory_tests.rs"]
+mod factory_tests;

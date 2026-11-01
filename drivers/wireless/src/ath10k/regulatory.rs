@@ -126,16 +126,21 @@ impl Permission {
             return Err(Error::Unsupported);
         }
         if secondary.is_some_and(|s| {
-            !matches!(
-                (frequency.min(s), frequency.max(s)),
-                (5180, 5200) | (5220, 5240) | (5745, 5765) | (5785, 5805)
-            )
+            if two_ghz {
+                !Self::profile_frequency(s) || frequency.abs_diff(s) != 20
+            } else {
+                !matches!(
+                    (frequency.min(s), frequency.max(s)),
+                    (5180, 5200) | (5220, 5240) | (5745, 5765) | (5785, 5805)
+                )
+            }
         }) {
             return Err(Error::Unsupported);
         }
         let center80 = Self::center80(frequency);
         if width80
-            && (secondary.is_none()
+            && (two_ghz
+                || secondary.is_none()
                 || center80.is_none()
                 || center80 != secondary.and_then(Self::center80))
         {

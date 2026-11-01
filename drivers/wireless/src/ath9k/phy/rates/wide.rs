@@ -17,10 +17,8 @@ pub(in crate::ath9k) fn wide_plan(
     if !geometry.is_wide() || ceiling > 40 || ceiling < image[60] {
         return Err(BringUpError::Policy);
     }
-    let factory = Factory::from_eeprom(u32::from(u16::from_le_bytes(
-        image[8..10].try_into().unwrap(),
-    )))
-    .map_err(|_| BringUpError::BadCalibration)?;
+    let factory = Factory::from_eeprom(u32::from(crate::ath9k::identity::eeprom_word(image, 8)))
+        .map_err(|_| BringUpError::BadCalibration)?;
     let ctl = initial_ctl(factory);
     let primary = plan(image, geometry.control(), ctl, ceiling)?;
     let conducted = ceiling - image[60];
@@ -43,7 +41,7 @@ pub(in crate::ath9k) fn wide_plan(
         2,
         conducted,
     )?);
-    let minor = u16::from_le_bytes(image[4..6].try_into().unwrap()) & 0xfff;
+    let minor = crate::ath9k::identity::eeprom_word(image, 4) & 0xfff;
     let increment = if minor >= 2 { image[82] } else { 2 };
     let pack = |power: [u8; 4], increment: u8| -> Result<u32, BringUpError> {
         let mut word = 0;

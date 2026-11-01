@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! One source-bound BE/TID0 sender. No key, PN or radio authority is created.
-use super::{Grant, MAX_AIR, RETRIES};
+use super::{Grant, MAX_MEMBERS, RETRIES};
 use crate::ath9k::packet::Error;
 use alloc::{sync::Arc, vec, vec::Vec};
 use narf_wireless::association::phy::{Negotiated, Offer};
 const SETUP_NS: u64 = 100_000_000;
 #[derive(Clone, Copy)]
-pub(in crate::ath9k) struct PairPermit {
-    pub seq: [u16; 2],
+pub(in crate::ath9k) struct AggregatePermit {
+    pub seq: [u16; MAX_MEMBERS],
+    pub count: usize,
     pub air: usize,
-    pub delims: u8,
+    pub delims: [u8; MAX_MEMBERS],
     pub generation: u64,
 }
 pub(in crate::ath9k) enum Action {
@@ -37,8 +38,8 @@ struct Flight {
     ticket: u64,
     epoch: u64,
     end: u16,
-    originals: [Option<Vec<u8>>; 2],
-    tries: [u8; 2],
+    originals: Vec<Option<Vec<u8>>>,
+    tries: Vec<u8>,
     awaiting_pair: bool,
     retry: Option<usize>,
 }
@@ -93,7 +94,7 @@ impl Owner {
         Ok(Self {
             geometry,
             short_gi: geometry.is_wide() && n.ht().tx_sgi40(),
-            grant,
+            grant: grant.clone(),
             serial: 0,
             dialog: 0,
             proposal: None,
@@ -104,8 +105,26 @@ impl Owner {
             delba: None,
             disabled: false,
             density: [0, 1, 1, 1, 2, 4, 8, 16][usize::from(density)],
-            max_air: MAX_AIR.min((1usize << (13 + factor)) - 1),
+            max_air: grant.max_air.min((1usize << (13 + factor)) - 1),
         })
+    }
+    /// Current accepted beacon facts may only narrow this established
+    /// sender. Match the actual installed TX mode after Packet::observe_ht.
+    pub(in crate::ath9k) fn observe(
+        &mut self,
+        offer: &Offer,
+        profile: crate::ath9k::ht::Profile,
+    ) -> Result<(), Error> {
+        if profile.geometry() != self.geometry {
+            return Err(Error::Packet);
+        }
+        self.short_gi &= profile.tx_sgi40();
+        let density = [0, 1, 1, 1, 2, 4, 8, 16][usize::from(offer.ht().peer_mpdu_density())];
+        self.density = self.density.max(density);
+        self.max_air = self
+            .max_air
+            .min((1usize << (13 + offer.ht().peer_ampdu_factor())) - 1);
+        Ok(())
     }
     fn ticket(&mut self) -> Result<u64, Error> {
         self.serial = self.serial.checked_add(1).ok_or(Error::State)?;
@@ -161,7 +180,7 @@ impl Owner {
             if f.awaiting_pair || f.retry.is_some() {
                 return Ok(None);
             }
-            if let Some(i) = f.originals.iter().position(Option::is_some) {
+            while let Some(i) = f.originals.iter().position(Option::is_some) {
                 if f.tries[i] < RETRIES {
                     f.tries[i] += 1;
                     f.retry = Some(i);
@@ -169,7 +188,12 @@ impl Owner {
                     frame[1] |= 8;
                     return Ok(Some(Action::Retry(f.ticket, i, frame)));
                 }
-                f.originals = [None, None];
+                if self.grant.members > 2 {
+                    f.originals[i] = None;
+                } else {
+                    // Preserve the accepted v1/v2/v3 recovery recipe.
+                    f.originals.iter_mut().for_each(|original| *original = None);
+                }
                 self.recovery = Some(f.end);
             }
             self.finish_flight(now)?;
@@ -272,58 +296,64 @@ impl Owner {
         }
         Ok(true)
     }
-    pub(in crate::ath9k) fn permit(
-        &self,
-        frames: [&[u8]; 2],
-        own: [u8; 6],
-        ap: [u8; 6],
-        mcs: u8,
-    ) -> Result<PairPermit, Error> {
+    /// Bound a prefix before the caller consumes any QoS SN or CCMP PN.
+    pub(in crate::ath9k) fn prefix(&self, lengths: &[usize], mcs: u8) -> usize {
+        let mut count = 1;
+        for end in 2..=lengths.len().min(self.grant.members) {
+            if self.layout(&lengths[..end], mcs).is_err() {
+                break;
+            }
+            count = end;
+        }
+        count
+    }
+    fn layout(&self, lengths: &[usize], mcs: u8) -> Result<AggregatePermit, Error> {
         if !self.paired() || mcs > 7 {
             return Err(Error::State);
         }
         let s = self.session.as_ref().ok_or(Error::State)?;
-        let mut seq = [0; 2];
-        let mut lengths = [0; 2];
-        for i in 0..2 {
-            let f = frames[i];
-            if !(34..=1550).contains(&f.len())
-                || f[0] != 0x88
-                || f[1] & !0x48 != 1
-                || f[4..10] != ap
-                || f[10..16] != own
-                || f[22] & 15 != 0
-                || f[24..26] != [0, 0]
-            {
-                return Err(Error::Packet);
-            }
-            seq[i] = u16::from_le_bytes([f[22], f[23]]) >> 4;
-            lengths[i] = f.len() + 4;
-        }
-        if seq != [s.head, (s.head + 1) & 4095] {
-            return Err(Error::State);
+        let count = lengths.len();
+        // ath_tx_form_aggr limits one chain to half the current BAW.
+        if count < 2
+            || count > self.grant.members
+            || count > usize::from(s.window) / 2
+            || lengths.iter().any(|length| !(34..=1550).contains(length))
+        {
+            return Err(Error::Packet);
         }
         let bits = if self.geometry.is_wide() {
             [54usize, 108, 162, 216, 324, 432, 486, 540]
         } else {
             [26usize, 52, 78, 104, 156, 208, 234, 260]
         }[usize::from(mcs)];
-        let base = 256usize.saturating_sub(lengths[0]).div_ceil(4);
-        let symbols = if self.short_gi {
-            (usize::from(self.density) * 5).saturating_sub(4) / 18
-        } else {
-            usize::from(self.density >> 2)
+        let mut air = 0usize;
+        let mut delims = [0; MAX_MEMBERS];
+        for (index, original) in lengths.iter().enumerate() {
+            let length = original + 4; // FCS, excluding native transport pad2.
+            air += 4 + length;
+            if index + 1 == count {
+                continue; // No final alignment or padding on air.
+            }
+            let base = 256usize.saturating_sub(length).div_ceil(4);
+            let symbols = if self.short_gi {
+                (usize::from(self.density) * 5).saturating_sub(4) / 18
+            } else {
+                usize::from(self.density >> 2)
+            }
+            .max(1);
+            let density = if self.density == 0 {
+                0
+            } else {
+                (symbols * bits / 8).saturating_sub(length) / 4
+            };
+            let padding = base.max(density);
+            if padding > 255 {
+                return Err(Error::Packet);
+            }
+            delims[index] = padding as u8;
+            air = air.next_multiple_of(4) + padding * 4;
         }
-        .max(1);
-        let density = if self.density == 0 {
-            0
-        } else {
-            (symbols * bits / 8).saturating_sub(lengths[0]) / 4
-        };
-        let delims = base.max(density);
-        let air = (4 + lengths[0]).next_multiple_of(4) + delims * 4 + 4 + lengths[1];
-        if delims > 255
-            || air > self.max_air
+        if air > self.max_air
             || self
                 .geometry
                 .ht_duration(self.short_gi, air, mcs)
@@ -331,30 +361,57 @@ impl Owner {
         {
             return Err(Error::Packet);
         }
-        Ok(PairPermit {
+        let mut seq = [0; MAX_MEMBERS];
+        for (index, value) in seq[..count].iter_mut().enumerate() {
+            *value = (s.head + index as u16) & 4095;
+        }
+        Ok(AggregatePermit {
             seq,
+            count,
             air,
-            delims: delims as u8,
+            delims,
             generation: self.serial,
         })
     }
+    pub(in crate::ath9k) fn permit(
+        &self,
+        frames: &[&[u8]],
+        own: [u8; 6],
+        ap: [u8; 6],
+        mcs: u8,
+    ) -> Result<AggregatePermit, Error> {
+        let lengths: Vec<usize> = frames.iter().map(|frame| frame.len()).collect();
+        let permit = self.layout(&lengths, mcs)?;
+        for (index, f) in frames.iter().enumerate() {
+            if f[0] != 0x88
+                || f[1] & !0x48 != 1
+                || f[4..10] != ap
+                || f[10..16] != own
+                || f[22] & 15 != 0
+                || f[24..26] != [0, 0]
+                || u16::from_le_bytes([f[22], f[23]]) >> 4 != permit.seq[index]
+            {
+                return Err(Error::Packet);
+            }
+        }
+        Ok(permit)
+    }
     pub(in crate::ath9k) fn begin_pair(
         &mut self,
-        permit: PairPermit,
-        frames: [Vec<u8>; 2],
+        permit: AggregatePermit,
+        frames: Vec<Vec<u8>>,
         epoch: u64,
     ) -> Result<(), Error> {
-        if !self.paired() || permit.generation != self.serial {
+        if !self.paired() || permit.generation != self.serial || frames.len() != permit.count {
             return Err(Error::State);
         }
         let ticket = self.ticket()?;
-        let [a, b] = frames;
         self.flight = Some(Flight {
             ticket,
             epoch,
-            end: (permit.seq[1] + 1) & 4095,
-            originals: [Some(a), Some(b)],
-            tries: [0; 2],
+            end: (permit.seq[permit.count - 1] + 1) & 4095,
+            originals: frames.into_iter().map(Some).collect(),
+            tries: vec![0; permit.count],
             awaiting_pair: true,
             retry: None,
         });
@@ -362,19 +419,19 @@ impl Owner {
     }
     pub(in crate::ath9k) fn pair_delivered(
         &mut self,
-        acked: [bool; 2],
+        acked: Vec<bool>,
         now: u64,
         epoch: u64,
     ) -> Result<(), Error> {
         let Some(f) = &mut self.flight else {
             return Ok(());
         };
-        if !f.awaiting_pair {
+        if !f.awaiting_pair || acked.len() != f.originals.len() {
             return Err(Error::State);
         }
         f.awaiting_pair = false;
         if epoch != f.epoch {
-            f.originals = [None, None];
+            f.originals.iter_mut().for_each(|original| *original = None);
             self.recovery = Some(f.end);
         } else {
             for (i, ok) in acked.into_iter().enumerate() {
@@ -401,7 +458,7 @@ impl Owner {
         }
         f.retry = None;
         if epoch != f.epoch {
-            f.originals = [None, None];
+            f.originals.iter_mut().for_each(|original| *original = None);
             self.recovery = Some(f.end);
         } else if delivered {
             f.originals[index] = None;
@@ -486,7 +543,7 @@ impl Owner {
             self.bar = None;
         }
         if let Some(f) = &mut self.flight {
-            f.originals = [None, None];
+            f.originals.iter_mut().for_each(|original| *original = None);
             f.end = next;
         }
         self.finish_flight(now)

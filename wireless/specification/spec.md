@@ -913,6 +913,28 @@ epoch/current RF owner, registered frame filter, peer/cipher/replay facts and
 control-port configuration. The type supplies none of those hardware or packet
 receipts, and neither authorizes ordinary Ethernet/IP delivery nor injection.
 
+`ApControlAuthority::native_emission_for` and its event counterpart capture
+`ApEmissionAuthority` outside native State, while the full original request,
+UP identity and concrete receiver are current. Only an actual socket provider
+with a concrete native source is admitted; default/unknown providers and
+unsupported control-only ancestry refuse. Its final `current` invokes actual
+retained Admin/daemon/NetIface grants and weak exact source, wireless
+registration and netdev identity receipts, without arbitrary sink/interface
+callbacks or Registry/IFACES/socket locks. `matches_role` additionally compares
+the concrete receiver and supplied actual native mode/generation; drivers must
+retain their own concrete role-generation owner and retire it before role
+changes. No cached successful validation creates current authority. Provider
+retirement closes receipts before mutation/removal, then wakes the retained
+native owner outside provider locks. Native owners recheck on a bounded timer
+for capability-epoch revocation as well, and stop autonomous beacons when
+authority dies. Non-emitting flush/disable/remove or physical transport stop
+continues under the original current device authority even after START's
+admin/socket guard is dead; cancellation and a dropped borrowed waiter cannot
+release that owner or uncertain DMA before terminal stop. Full ACK/event
+callbacks remain outside native State, and native PCI/RF/copy/peer/key/port
+checks remain independently mandatory. These shared fences do not implement
+any firmware AP adapter by themselves.
+
 Native AP NEW/DEL/SET_KEY use `add_key_ap_async`, `del_key_ap_async` and
 `default_key_ap_async` under the same current exact-source guard/reservation.
 `OwnedKey` holds synchronous zeroizing key/RSC staging before constructing the

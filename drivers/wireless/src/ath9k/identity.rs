@@ -143,6 +143,32 @@ impl RegisterIo for Registers {
     }
 }
 
+/// Read a multibyte EEPROM field from the raw, checksum-verified image.
+/// Magic-driven word normalization and the EEPMISC field-byte order are
+/// separate facts. Never rewrite the retained raw image or its source hash.
+/// All callers use statically bounded offsets in the complete376-byte map.
+pub(in crate::ath9k) fn eeprom_word(image: &[u8; EEPROM_4K_BYTES], offset: usize) -> u16 {
+    let bytes = [image[offset], image[offset + 1]];
+    if image[7] & 1 != 0 {
+        u16::from_be_bytes(bytes)
+    } else {
+        u16::from_le_bytes(bytes)
+    }
+}
+pub(in crate::ath9k) fn eeprom_dword(image: &[u8; EEPROM_4K_BYTES], offset: usize) -> u32 {
+    let bytes = [
+        image[offset],
+        image[offset + 1],
+        image[offset + 2],
+        image[offset + 3],
+    ];
+    if image[7] & 1 != 0 {
+        u32::from_be_bytes(bytes)
+    } else {
+        u32::from_le_bytes(bytes)
+    }
+}
+
 fn read_eeprom(io: &mut impl RegisterIo, word: usize) -> Result<u16, BringUpError> {
     if word >= 256 {
         return Err(BringUpError::BadLength);

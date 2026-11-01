@@ -503,7 +503,19 @@ impl Port for Native {
         })
     }
     fn allocate(&self, bytes: usize) -> Result<narf_io::DmaBuffer, Error> {
-        self.access(false, || {
+        let active = self.active.load(Ordering::Acquire);
+        if active {
+            // Only the distinct larger sender can extend retained TX storage
+            // after BME/RX activation. Packet owns all-QCU-idle admission and
+            // retains the old ring; no fresh mapping is reachable until its
+            // separately checked descriptor publication.
+            let source = self.tx_ba.lock().clone().ok_or(Error::Access)?;
+            if source.members() <= 2 {
+                return Err(Error::Access);
+            }
+            source.check()?;
+        }
+        self.access(active, || {
             if narf_io::iommu::mode() == narf_io::iommu::IommuMode::PerDomain {
                 return Err(Error::Access);
             }

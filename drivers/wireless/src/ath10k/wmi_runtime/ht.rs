@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Typed response-bound HT20/5GHz HT40 and 5GHz VHT20/40/80 with initialized
+//! Typed response-bound HT20/HT40 and 5GHz VHT20/40/80 with initialized
 //! and natively submitted chain/NSS limits. Linux
 //! mac.c's get_ht_cap advertises20/40 with HT, and each GI from its distinct
 //! SERVICE_READY bit; ath10k_create_vht_cap builds the VHT element.
@@ -34,6 +34,7 @@ pub(super) struct Profile {
     pub(super) vht: Option<Vht>,
     local: LocalPhy,
     offered: Offer,
+    coexistence_narrowed: bool,
 }
 /// Requested local PHY: the HT20/HT40 profiles, or VHT (HT20/40 plus a
 /// VHT80-capable element) that only a 5GHz 80 MHz-qualified BSS reaches.
@@ -252,6 +253,7 @@ impl Profile {
             vht: offered.vht().map(|v| vht(v, offered.width(), chains)),
             local,
             offered,
+            coexistence_narrowed: false,
         }))
     }
     pub(super) fn local(self) -> LocalPhy {
@@ -350,13 +352,18 @@ impl Profile {
         }
     }
     /// VDEV_START channel mode: Linux `mac.c::chan_to_phymode` maps the
-    /// chandef width only, so 5GHz 20/40 stay `MODE_11NA_HT20/HT40` (4/6)
-    /// for a VHT peer and only 80 MHz selects `MODE_11AC_VHT80` (10).
+    /// chandef width only: 2.4GHz20/40 uses MODE_11NG_HT20/HT40 (5/7),
+    /// 5GHz20/40 uses MODE_11NA_HT20/HT40 (4/6) even for a VHT peer;
+    /// only80 MHz selects MODE_11AC_VHT80 (10).
     pub(super) fn start_mode(self, frequency: u16) -> u32 {
         if self.vht.is_some_and(|v| v.eighty) {
             10
         } else if self.secondary.is_some() {
-            6
+            if frequency < 3000 {
+                7
+            } else {
+                6
+            }
         } else if frequency < 3000 {
             5
         } else {
@@ -378,13 +385,29 @@ impl Profile {
     pub(super) fn matches_beacon(self, ies: &[u8]) -> bool {
         ApElements::parse(ies).is_ok_and(|p| {
             p.ht_capability() == Some(self.offered.ht().peer_capability_body())
-                && p.ht_operation() == Some(self.offered.ht().operation().body())
+                && (p.ht_operation() == Some(self.offered.ht().operation().body())
+                    || self.coexistence_narrowed && p.ht_operation().is_some_and(|op| {
+                        let old = self.offered.ht().operation().body();
+                        op[0] == old[0] && op[1] & 7 == 0
+                    }))
                 // An HT-only profile never bound the AP's VHT elements.
                 && self.offered.vht().is_none_or(|v| {
                     p.vht_capability() == Some(v.peer_capability_body())
                         && p.vht_operation() == Some(v.operation_body())
                 })
         })
+    }
+    pub(super) fn coexistence_twenty(mut self, primary: u16) -> Result<Self, Error> {
+        if primary >= 3000 || self.secondary.is_none() || self.vht.is_some() {
+            return Err(Error::Unsupported);
+        }
+        self.center = primary;
+        self.secondary = None;
+        self.capabilities &= !0x42;
+        self.short_gi = self.capabilities & 0x20 != 0;
+        self.receive_sgi40 = false;
+        self.coexistence_narrowed = true;
+        Ok(self)
     }
     pub(super) fn accepts(self, descriptor: &[u8]) -> bool {
         if descriptor.len() < 116 {

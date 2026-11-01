@@ -372,6 +372,10 @@ impl<T> Scheduler<T> {
         }
         None
     }
+    /// Borrow queued originals for aggregate sizing without consuming them.
+    pub(super) fn tid_prefix(&self, tid: u8) -> impl Iterator<Item = &T> {
+        self.tids[usize::from(tid & 7)].iter()
+    }
     /// Take the next frame of one TID (aggregation partner).
     pub(super) fn pop_tid(&mut self, tid: u8) -> Option<T> {
         self.tids[usize::from(tid & 7)].pop_front()

@@ -5,7 +5,7 @@ use alloc::{vec, vec::Vec};
 
 #[derive(Clone, Debug)]
 pub struct ApEventAuthority {
-    guard: ApControlAuthority,
+    pub(super) guard: ApControlAuthority,
 }
 impl ApControlAuthority {
     /// Retain actual notification authority after a completed registration

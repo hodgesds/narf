@@ -64,6 +64,7 @@ pub(in crate::ath9k) struct Model {
     pub(in crate::ath9k) pair_tail: Cell<Option<u32>>,
     pair_seq: Cell<u16>,
     pub(in crate::ath9k) last_pair: Cell<Option<(u32, u32)>>,
+    pub(in crate::ath9k) last_chain: RefCell<Vec<u32>>,
     pub(in crate::ath9k) pair_received: Cell<u8>,
     pub(in crate::ath9k) ba_bitmap: Cell<Option<u64>>,
     pub(in crate::ath9k) ba_flag: Cell<bool>,
@@ -127,6 +128,7 @@ impl Model {
             pair_tail: Cell::new(None),
             pair_seq: Cell::new(0),
             last_pair: Cell::new(None),
+            last_chain: RefCell::new(Vec::new()),
             pair_received: Cell::new(3),
             ba_bitmap: Cell::new(None),
             ba_flag: Cell::new(true),
@@ -466,26 +468,53 @@ impl Port for Arc<Model> {
             self.tx_queue.set(queue);
             self.queues.borrow_mut().push(queue);
             let descriptor = self.read(QTXDP + queue * 4)?;
-            let tail = self.word(descriptor)?;
-            if tail != 0
-                && (self.word(tail)? != 0
-                    || self.word(descriptor + 12)? & 0x6000_0000 != 0x6000_0000
-                    || self.word(tail + 12)? & 0x6000_0000 != 0x4000_0000
-                    || self.word(tail + 16)? != 0
-                    || self.word(tail + 20)? != 0)
+            // Follow only the actual native links, with cycle/extent bounds.
+            // Payloads are read through the retained DMA maps below.
+            let mut chain = vec![descriptor];
+            while let Some(next) = chain
+                .last()
+                .map(|address| self.word(*address))
+                .transpose()?
             {
-                return Err(Error::Descriptor);
+                if next == 0 {
+                    break;
+                }
+                if chain.len() >= crate::ath9k::tx_ba::MAX_MEMBERS || chain.contains(&next) {
+                    return Err(Error::Descriptor);
+                }
+                chain.push(next);
             }
+            let tail = if chain.len() > 1 {
+                *chain.last().ok_or(Error::Descriptor)?
+            } else {
+                0
+            };
             if tail != 0 {
+                for (index, member) in chain.iter().enumerate() {
+                    let flags = if index + 1 == chain.len() {
+                        0x4000_0000
+                    } else {
+                        0x6000_0000
+                    };
+                    if self.word(*member + 12)? & 0x6000_0000 != flags
+                        || index != 0
+                            && [16, 20, 24, 28, 36]
+                                .into_iter()
+                                .any(|offset| self.word(*member + offset) != Ok(0))
+                    {
+                        return Err(Error::Descriptor);
+                    }
+                }
                 self.pair_tail.set(Some(tail));
                 self.last_pair.set(Some((descriptor, tail)));
+                *self.last_chain.borrow_mut() = chain.clone();
             }
             self.tx.set(Some(descriptor));
             self.registers.borrow_mut().insert(QSTS + queue * 4, 1);
             let reaction = { self.reaction.borrow().clone() };
             let mut held = reaction.is_none() || tail != 0 && self.hold_pair.get();
             let mut ack = true;
-            for (i, d) in [descriptor, tail].into_iter().enumerate() {
+            for (i, d) in chain.into_iter().enumerate() {
                 if d == 0 {
                     continue;
                 }
@@ -568,6 +597,15 @@ impl Port for Arc<Model> {
     }
     fn allocate(&self, bytes: usize) -> Result<DmaBuffer, Error> {
         self.as_ref().access()?;
+        // Match the native adapter: ordinary ring allocation is inactive;
+        // only a current distinct larger source permits running expansion.
+        if self.master.get() {
+            let source = self.tx_ba.borrow().clone().ok_or(Error::Access)?;
+            if source.members() <= 2 {
+                return Err(Error::Access);
+            }
+            source.check()?;
+        }
         let memory = narf_io::alloc_coherent_masked(
             bytes,
             narf_lib::id::DomainId::DRIVER_0,

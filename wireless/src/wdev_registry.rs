@@ -18,6 +18,7 @@ struct Entry {
     control: Option<ControlWdev>,
     parent: Option<Weak<dyn WirelessNetIface>>,
     retired: bool,
+    native_lifetime: narf_net::native_emission::ProviderLifetime,
 }
 static REGISTRY: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
 static NEXT_CONTROL: AtomicU64 = AtomicU64::new(1);
@@ -71,6 +72,7 @@ pub fn register(iface: Arc<dyn WirelessNetIface>) {
             control: None,
             parent: None,
             retired: false,
+            native_lifetime: narf_net::native_emission::ProviderLifetime::new(),
         });
     }
 }
@@ -126,6 +128,7 @@ pub fn register_control(
         control: Some(control),
         parent: Some(Arc::downgrade(parent)),
         retired: false,
+        native_lifetime: narf_net::native_emission::ProviderLifetime::new(),
     });
     Ok(control)
 }
@@ -188,9 +191,18 @@ pub fn unregister_control<I: WirelessNetIface + ?Sized>(expected: ControlWdev, i
                 entry.control == Some(expected)
                     && Arc::as_ptr(&entry.iface).cast::<()>() == receiver
             })
-            .map(|index| registry.remove(index))
+            .map(|index| {
+                let native = registry[index].native_lifetime.retire();
+                (registry.remove(index), native)
+            })
     };
-    removed.is_some()
+    if let Some((entry, native)) = removed {
+        native.notify();
+        drop(entry);
+        true
+    } else {
+        false
+    }
 }
 /// Hide the exact natively retired object from every public selector while
 /// retaining its observation identity for its original terminal ACK only.
@@ -204,7 +216,10 @@ pub(crate) fn retire_control(expected: ControlWdev, iface: &Arc<dyn WirelessNetI
     }) else {
         return false;
     };
+    let native = registry[index].native_lifetime.retire();
     registry[index].retired = true;
+    drop(registry);
+    native.notify();
     true
 }
 pub(crate) fn retired_control_current(
@@ -259,12 +274,33 @@ pub fn unregister(name: &str) {
         let mut index = 0;
         while index < registry.len() {
             if registry[index].name == name {
-                removed.push(registry.remove(index));
+                let native = registry[index].native_lifetime.retire();
+                removed.push((registry.remove(index), native));
             } else {
                 index += 1;
             }
         }
         removed
     };
-    drop(removed);
+    for (entry, native) in removed {
+        native.notify();
+        drop(entry);
+    }
+}
+
+/// Exact registration observation captured outside the native owner lock.
+/// No name, MAC or newly registered successor can revive this weak receipt.
+pub(crate) fn native_registration<I: WirelessNetIface + ?Sized>(
+    iface: &I,
+) -> Option<narf_net::native_emission::Lifetime> {
+    let receiver = core::ptr::from_ref(iface).cast::<()>();
+    REGISTRY
+        .lock()
+        .iter()
+        .find(|entry| {
+            !entry.retired
+                && entry.control.is_none()
+                && Arc::as_ptr(&entry.iface).cast::<()>() == receiver
+        })
+        .map(|entry| entry.native_lifetime.observe())
 }

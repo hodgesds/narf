@@ -98,6 +98,17 @@ impl Ath9k {
             .and_then(|r| r.tx_ba_request())
             .ok_or(BringUpError::BadState)
     }
+    /// Factual bounded variable-member sender request; v4 is distinct from
+    /// accepted two-member records and grants no emission or agreement.
+    pub fn tx_aggregate_qualification_request(
+        &self,
+    ) -> Result<TxBaQualificationRequest, BringUpError> {
+        self.station
+            .as_ref()
+            .and_then(|radio| radio.try_lock())
+            .and_then(|radio| radio.tx_aggregate_request())
+            .ok_or(BringUpError::BadState)
+    }
     /// Optional recipient-BA request from the same current HT source/owner.
     pub fn rx_ba_qualification_request(&self) -> Result<RxBaQualificationRequest, BringUpError> {
         self.station

@@ -52,6 +52,7 @@ pub fn set_link_layer(name: &str, layer: LinkLayer) -> Result<(), ()> {
     }
     let old = snapshot(entry);
     let generation = next_epoch().ok_or(())?;
+    let native = entry.retire_native();
     entry.link_layer = layer;
     entry.packet_generation = generation;
     if layer == LinkLayer::Ieee80211Radiotap {
@@ -59,6 +60,8 @@ pub fn set_link_layer(name: &str, layer: LinkLayer) -> Result<(), ()> {
     }
     entry.monitor_epoch = 0;
     drop(interfaces);
+    drop(_publish);
+    native.notify();
     crate::raw_sock::netdev_event(
         old.net_ns_id,
         old.ifindex,

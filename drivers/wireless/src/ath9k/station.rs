@@ -143,7 +143,7 @@ struct Pending {
 }
 struct PairPending {
     id: u64,
-    originals: [Vec<u8>; 2],
+    originals: Vec<Vec<u8>>,
 }
 struct Entry {
     candidate: ObservedBss,
@@ -394,6 +394,11 @@ impl<P: Port, E: Environment> Radio<P, E> {
     pub(super) fn tx_ba_request(&self) -> Option<super::tx_ba::Request> {
         self.packet.ht_grant().map(|g| super::tx_ba::request(&g))
     }
+    pub(super) fn tx_aggregate_request(&self) -> Option<super::tx_ba::Request> {
+        self.packet
+            .ht_grant()
+            .map(|g| super::tx_ba::large_request(&g))
+    }
     pub(super) fn can_aggregate(&self) -> bool {
         self.ready() && self.tx_ba.as_ref().is_some_and(super::tx_ba::Owner::paired)
     }
@@ -585,6 +590,12 @@ impl<P: Port, E: Environment> Radio<P, E> {
                     &candidate.bss.information_elements,
                     self.rates.ok_or(Error::State)?.basic(),
                 )?;
+                if let Some(owner) = &mut self.tx_ba {
+                    owner.observe(
+                        plan.offered_phy().ok_or(Error::Profile)?,
+                        self.packet.ht_profile().ok_or(Error::State)?,
+                    )?;
+                }
             }
             self.last_peer = now;
         }
@@ -685,7 +696,12 @@ impl<P: Port, E: Environment> Radio<P, E> {
                     self.last_now.saturating_mul(1_000_000),
                     self.epoch,
                 )?;
-            } else if pending.kind == Kind::Data {
+            } else if pending.kind == Kind::Data
+                && pending.bytes.first() == Some(&0x88)
+                && pending.bytes.get(24..26) == Some(&[0, 0])
+            {
+                // This agreement owns TID0 only. N85Q singles on other
+                // queues consume an independent SC and cannot advance it.
                 ba.single_delivered(
                     u16::from_le_bytes([pending.bytes[22], pending.bytes[23]]) >> 4,
                     delivery.delivered,
@@ -1558,7 +1574,34 @@ impl<P: Port, E: Environment> Radio<P, E> {
         }
         Ok(native)
     }
+    /// Exact Ethernet prefix capacity before any shared QoS SN/CCMP PN is
+    /// consumed. Does not manufacture a packet or grant native publication.
+    pub(super) fn aggregate_count(&self, frames: &[&[u8]]) -> Result<usize, Error> {
+        if !self.can_aggregate() {
+            return Ok(1);
+        }
+        self.packet.check_transmit()?;
+        let mut lengths = Vec::new();
+        for frame in frames.iter().take(super::tx_ba::MAX_MEMBERS) {
+            if !admitted(frame, self.own) || self.transmit_tid(frame) != 0 {
+                break;
+            }
+            // QoS26 + SNAP8 - Ethernet14; CCMP ExtIV8 + MIC8 only
+            // when the retained shared security owner protects the original.
+            lengths.push(frame.len() + 20 + if self.security.is_some() { 16 } else { 0 });
+        }
+        let mcs = 7 - self.ht.ok_or(Error::State)?.leading_zeros() as u8;
+        Ok(self
+            .tx_ba
+            .as_ref()
+            .ok_or(Error::State)?
+            .prefix(&lengths, mcs))
+    }
+    #[cfg(feature = "kernel-test")]
     pub(super) fn send_pair(&mut self, a: &[u8], b: &[u8]) -> Result<(), Error> {
+        self.send_aggregate(&[a, b])
+    }
+    pub(super) fn send_aggregate(&mut self, ethernet: &[&[u8]]) -> Result<(), Error> {
         let result = {
             let publication = self.publication.clone();
             let _publication = publication.lock();
@@ -1566,21 +1609,26 @@ impl<P: Port, E: Environment> Radio<P, E> {
                 if !self.can_aggregate() {
                     return Err(Error::Busy);
                 }
-                self.packet.check_transmit()?;
-                if !admitted(a, self.own) || !admitted(b, self.own) {
+                if ethernet.len() < 2
+                    || ethernet.len() > super::tx_ba::MAX_MEMBERS
+                    || self.aggregate_count(ethernet)? != ethernet.len()
+                {
                     return Err(Error::Profile);
                 }
-                // The measured sender agreement owns BE/TID0 only.
-                if self.transmit_tid(a) != 0 || self.transmit_tid(b) != 0 {
-                    return Err(Error::Profile);
-                }
-                let frames = [self.native_data(a)?, self.native_data(b)?];
+                // Preflight all lengths/TIDs/source bounds before the first
+                // reservation. Encoding failure is terminal; consumed PNs and
+                // sequence numbers are never reused or silently retried fresh.
+                let frames: Vec<Vec<u8>> = ethernet
+                    .iter()
+                    .map(|frame| self.native_data(frame))
+                    .collect::<Result<_, _>>()?;
                 let mcs = 7 - self.ht.ok_or(Error::State)?.leading_zeros() as u8;
                 let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
                 let ba = self.tx_ba.as_mut().ok_or(Error::State)?;
-                let permit = ba.permit([&frames[0], &frames[1]], self.own, peer, mcs)?;
+                let refs: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
+                let permit = ba.permit(&refs, self.own, peer, mcs)?;
                 ba.begin_pair(permit, frames.clone(), self.epoch)?;
-                let id = self.packet.submit_pair(
+                let id = self.packet.submit_aggregate(
                     &frames,
                     mcs,
                     self.rates.ok_or(Error::State)?.basic(),
@@ -1595,7 +1643,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
         };
         if result
             .as_ref()
-            .is_err_and(|e| !matches!(e, Error::Busy | Error::Profile))
+            .is_err_and(|error| !matches!(error, Error::Busy | Error::Profile))
         {
             self.fail();
         }

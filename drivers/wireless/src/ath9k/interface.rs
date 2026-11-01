@@ -455,22 +455,28 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
             }
             if radio.ready() {
                 if let Some((tid, frame)) = state.pending.pop() {
-                    // The measured two-MPDU sender aggregates BE/TID0 only.
-                    // Frames queued before N85Q activation are re-classified.
-                    let mut second = None;
-                    if tid == 0 && radio.can_aggregate() && radio.transmit_tid(frame.payload()) == 0
+                    // Form only an already available, source-qualified prefix.
+                    // Sizing precedes all shared QoS SN/CCMP PN reservations.
+                    let count = if tid == 0
+                        && radio.can_aggregate()
+                        && radio.transmit_tid(frame.payload()) == 0
                     {
-                        if let Some(next) = state.pending.pop_tid(0) {
-                            let now = radio.transmit_tid(next.payload());
-                            if now == 0 {
-                                second = Some(next);
-                            } else {
-                                let _ = state.pending.push(now, next);
-                            }
+                        let available: Vec<&[u8]> = core::iter::once(frame.payload())
+                            .chain(state.pending.tid_prefix(0).map(|next| next.payload()))
+                            .take(super::tx_ba::MAX_MEMBERS)
+                            .collect();
+                        radio.aggregate_count(&available)?
+                    } else {
+                        1
+                    };
+                    if count >= 2 {
+                        let mut members = vec![frame];
+                        for _ in 1..count {
+                            members.push(state.pending.pop_tid(0).ok_or(station::Error::State)?);
                         }
-                    }
-                    if let Some(second) = second {
-                        radio.send_pair(frame.payload(), second.payload())?;
+                        let originals: Vec<&[u8]> =
+                            members.iter().map(|member| member.payload()).collect();
+                        radio.send_aggregate(&originals)?;
                     } else {
                         radio.send(frame.payload())?;
                     }

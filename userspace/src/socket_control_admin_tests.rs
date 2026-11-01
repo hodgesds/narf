@@ -102,11 +102,8 @@ fn socket(portid: u32) -> Result<(Arc<SocketFile>, GenericReplyEndpoint), &'stat
     ) {
         return Err("actual control source socket bind");
     }
-    let endpoint = GenericReplyEndpoint {
-        socket: Arc::downgrade(&socket),
-        namespace: socket.net_ns_id(),
-        portid: socket.netlink_portid.load(Ordering::Acquire),
-    };
+    let endpoint =
+        GenericReplyEndpoint::capture(&socket, socket.netlink_portid.load(Ordering::Acquire));
     Ok((socket, endpoint))
 }
 fn retains() -> Result<(), &'static str> {

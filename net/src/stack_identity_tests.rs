@@ -11,6 +11,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 mod child;
 #[path = "stack_metadata_tests.rs"]
 mod metadata;
+#[path = "stack_native_tests.rs"]
+mod native;
 
 struct Device {
     name: String,

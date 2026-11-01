@@ -162,3 +162,73 @@ kernel_test_in!(
     "drivers/wireless/ath10k/regulatory",
     smoke_ath10k_regulatory_vht80_receipt_closes_on_policy_change
 );
+
+fn smoke_ath10k_2ghz_ht40_occupied_edges_and_stricter_overlap_power() -> TestResult {
+    let factory = Factory::from_eeprom(0x64).unwrap();
+    let mut domain = us_domain(40);
+    domain.rules = alloc::vec![narf_wireless::reg::RegRule {
+        freq_start_mhz: 2402,
+        freq_end_mhz: 2482,
+        max_bandwidth_mhz: 40,
+        max_power_dbm: 17,
+        flags: narf_wireless::reg::RegFlags::empty()
+    }];
+    for primary in (2412..=2462u16).step_by(5) {
+        for secondary in [primary.saturating_sub(20), primary + 20] {
+            let valid = (2412..=2462).contains(&secondary);
+            let result =
+                Permission::from_factory_width(factory, &domain, primary, Some(secondary), false);
+            if result.is_ok() != valid {
+                return TestResult::Fail(
+                    "2.4GHz actual40 admitted an unsupported primary/extension pair",
+                );
+            }
+            if let Ok(receipt) = result {
+                if receipt.center != (primary + secondary) / 2
+                    || receipt.half_dbm != 34
+                    || receipt.width80
+                    || receipt.check(&domain).is_err()
+                {
+                    return TestResult::Fail("2.4GHz actual occupied center/power receipt");
+                }
+            }
+        }
+    }
+    for (flags, width, power) in [
+        (narf_wireless::reg::RegFlags::NO_IR, 40, 17),
+        (narf_wireless::reg::RegFlags::empty(), 20, 17),
+        (narf_wireless::reg::RegFlags::empty(), 40, -1),
+    ] {
+        let mut tightened = domain.clone();
+        tightened.rules.push(narf_wireless::reg::RegRule {
+            freq_start_mhz: 2439,
+            freq_end_mhz: 2441,
+            max_bandwidth_mhz: width,
+            max_power_dbm: power,
+            flags,
+        });
+        if Permission::from_factory_width(factory, &tightened, 2412, Some(2432), false).is_ok() {
+            return TestResult::Fail("extension-edge restriction erased by broad40 rule");
+        }
+    }
+    let mut limited = domain.clone();
+    limited.rules.push(narf_wireless::reg::RegRule {
+        freq_start_mhz: 2439,
+        freq_end_mhz: 2441,
+        max_bandwidth_mhz: 40,
+        max_power_dbm: 8,
+        flags: narf_wireless::reg::RegFlags::empty(),
+    });
+    if Permission::from_factory_width(factory, &limited, 2412, Some(2432), false)
+        .map(|p| p.half_dbm)
+        != Ok(16)
+        || Permission::from_factory_width(factory, &domain, 2412, Some(2432), true).is_ok()
+    {
+        return TestResult::Fail("2.4GHz full-span power minimum or VHT80 boundary");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/coexistence",
+    smoke_ath10k_2ghz_ht40_occupied_edges_and_stricter_overlap_power
+);

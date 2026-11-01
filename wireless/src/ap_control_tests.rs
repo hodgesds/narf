@@ -11,6 +11,8 @@ use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 mod control_wdev;
 #[path = "ap_dispatch_tests.rs"]
 mod dispatch;
+#[path = "ap_emission_tests.rs"]
+mod emission;
 #[path = "ap_event_tests.rs"]
 mod events;
 #[path = "sched_dispatch_tests.rs"]

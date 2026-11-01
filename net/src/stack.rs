@@ -37,6 +37,9 @@ pub use child::retirement::ControlRetirement;
 mod identity_tests;
 #[path = "stack_metadata.rs"]
 pub(crate) mod metadata;
+#[path = "stack_native.rs"]
+mod native;
+pub use native::AdminEmissionAuthority;
 
 /// Cap-type marker for per-interface admin authority.
 /// `Cap<AdminCap, Invoke>` gates `set_link_up` / `set_mtu` /

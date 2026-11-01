@@ -10,13 +10,16 @@
 > six new native cases have not run. Its coordinated seven-package release
 > Clippy/module checks passed before the separate full20/40 draft.
 > The distinct measured full20/40/SGI40 continuation (§3.6) is source-complete
-> with another six native cases written; release/native validation is pending.
+> with another six native cases written; coordinated release Clippy passed,
+> while native validation remains pending.
 > The additional bounded two-MPDU sender BA/A-MPDU continuation below is
 > implemented with ten new native smokes passing the coordinated validation
 > on both architectures. AR2427 (`168c:002c`, AR9285 silicon with HT bonded
 > out) shares the legacy owner with every HT/BA source closed.
 > The optional measured `N85Q` continuation (§3.4) adds four-AC EDCA on
 > QCU0..3 and eight-TID classification/scheduling on the same owner.
+> Distinct N85T4 larger3–8-member sender programs (§3.7) are source-complete;
+> seven new native cases, release compilation and physical acceptance are pending.
 
 ## 1. Purpose & scope
 
@@ -695,6 +698,63 @@ lookup-center separation, signed/unknown/ignored-write rejection, directional
 RX GI, cancellation and revocation after actual copy. These cases are written,
 not executed. No physical RF or interoperability result is claimed.
 
+### 3.7 Optional measured larger sender aggregates
+
+`Ath9k::tx_aggregate_qualification_request()` returns a factual distinct
+N85T4 request, with no emission or BA authority. The exact128-byte contract
+and Linux source chain are [AR9285 larger TX qualification](ar9285-larger-tx-aggregates.md).
+All accepted N85T1/T2/T3 requests,96-byte records and their two-map/4095-air
+program remain unchanged. Missing larger qualification keeps that behavior.
+The new record binds the complete current H1/H2/H3 body and geometry, measured
+full-program peak, signed3–8 member maximum and air/window/retry bounds;
+current base/source caps, full-span policy and real native readbacks remain
+mandatory at publication, completion and copy boundaries.
+
+For v4 only, the TX owner expands to the signed count after all queues are
+proven idle, retaining the original ring until the final full DMA stop proof.
+Real per-member links, FIRST/MIDDLE/LAST flags, padding and whole-PPDU duration
+replace fixed pair arrays. The maximal already-queued BE/TID0 prefix is sized
+before reserving any shared QoS sequence or CCMP PN. It fits the signed bound,
+peer factor, **half the accepted BAW**, hardware65535-air limit and actual4ms
+20/40/GI duration. Current accepted beacons narrow factor/density/GI in step
+with the installed packet profile. Unfitting suffixes stay queued; singleton
+heads use ordinary normal ACK. No TX A-MSDU or other-TID sender is inferred.
+
+Actual NULL-tail TxDone plus QCU idle and all-member immutable descriptor/
+padded-payload proof precede the native64-bit BA bitmap receipt. Every v4 hole
+owns at most three immutable original normal-ACK retries, after which a real
+BAR to the full chain's end must prove native BA status and fresh RX idle.
+Rekey/source/cancel/retune closure preserves DMA until terminal proof and
+invalidates every CPU retry and copied-packet authority. Failed DMA stop pins
+all original and expanded storage. No association or generation preservation
+is inferred.
+
+The source-complete eight-member baseline has seven additional native cases
+written, including real public IPC/kernel DHCP/IP and fresh actual H3
+calibration/40MHz/SGI40 composition. Release/native execution and external
+board measurements/signatures/physical acceptance remain pending.
+
+### 3.8 Factory field order and complete admitted profile selection
+
+The admitted AR9285 factory-profile matrix is source-complete. Linux selects
+only `eep_4k_ops` for this chip; all four normal/high/XE2 gain-table choices
+already use actual TXGAIN/SYNTH9. The additional concrete same-map path now
+handles big-endian EEPROM fields throughout live PHY/modal/detector/CTL/rate/
+spur preparation and actual20/40 calibration, alongside ordinary and
+magic-word-swapped storage. Exact layout/source facts and pending validation
+are [AR9285 factory fields](ar9285-factory-fields.md).
+
+The raw checksum-verified376-byte image, EEPMISC flag and source-hashed bytes
+are retained unchanged. Private factual word/dword readers honor field byte
+order at each multibyte consumer; MAC/U8 tables, derived PDADC packing, air
+headers and signed body byte order keep their independent meanings. Existing
+LE writes and all H/B/T/Q qualification formats/request recipes remain.
+Foreign LE bodies cannot qualify a raw BE identity. Current calibration,
+power/policy/source/readback and terminal packet/copy/key/BA/DMA controls apply
+through the same real owner. No new generic board profile or chip is inferred.
+Five additional native cases are written; release/native and physical
+acceptance remain pending.
+
 ## 4. Invariants
 
 - PCI parking is verified by command-register readback before BAR sizing: BME
@@ -827,12 +887,12 @@ rows and the tree facts that keep each open:
   accepted20-only v1/v2 contract; actual fresh40 calibration and real20
   fallback before keys/DATA are mandatory. Release/native and physical
   acceptance are pending.
-- `factory_profile_selection`: the production owner accepts only the AR9285
-  `eeprom_4k.c` 376-byte map, version 14.1+, chain masks 1/1 and the
-  admitted channel1–13/full-rate20 plan (`identity.rs::decode_identity`,
-  `phy/`). The spec line names
-  no further Linux variant to select; the enumerated variants are the chip
-  rows below.
+- `factory_profile_selection` is source-complete for the admitted AR9285
+  `eeprom_4k` map and all four TXGAIN/SYNTH9 gain choices in §3.8. The concrete
+  raw big-field consumer gap is repaired through actual20/40 factory/PHY/cal/
+  native paths; five new cases await execution. Linux names no additional
+  AR9285 map selector; other layouts remain separate chip rows. External
+  measured assets and physical acceptance are pending.
 - `periodic_calibration`: Linux `link.c::ath_ani_calibrate` runs a short IQ
   calibration (`ATH_STA_SHORT_CALINTERVAL` 1 s) until done and a 30 s
   (`ATH_LONG_CALINTERVAL`) long calibration
@@ -843,12 +903,12 @@ rows and the tree facts that keep each open:
   rings run; PA tracking changes live transmit gain, which the `N85H`
   envelope explicitly excludes ("Periodic tracking is not inferred"). It needs
   a live-owner calibration hook and its own measured tracking record.
-- `larger_tx_aggregates`: the sender owns exactly two maps/descriptors
-  (`packet.rs` `TX_DEPTH = 2`, `submit_pair(&[Vec<u8>; 2])`,
-  `tx_ba/protocol.rs` pair state and two-bit BA accounting) and `N85T` v1
-  fixes member count 2 and 4095 air bytes. Linux `xmit.c::ath_tx_form_aggr`
-  builds up to the BAW/`ATH_AMPDU_LIMIT_MAX`/4 ms limit. It needs N-slot TX
-  storage, an N-member chain/retry/bitmap owner and an `N85T` v2 member count.
+- `larger_tx_aggregates` is source-complete for distinct signed N85T4
+  bounded3–8-member AR9285 sender programs in §3.7. Actual N-slot DMA,
+  half-BAW/factor/air/4ms sizing, per-member BA/retry/BAR/key-epoch ownership
+  and public IPC are implemented. Legacy1/2/3 stay two-member;64-member
+  aggregation is unadvertised. Seven new native cases are written, with
+  release/native and physical qualification pending.
 - `tx_amsdu` (inapplicable, row removed 2026-10-28): Linux ath9k never sets `IEEE80211_HW_TX_AMSDU`
   (`init.c::ath9k_set_hw_capab`), so mac80211 forms no TX A-MSDU for this
   driver and there is no Linux reference path. Natively the TX maps are

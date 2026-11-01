@@ -216,6 +216,7 @@ struct Storage {
     rx: Memory,
     tx_bytes: Vec<Memory>,
     rx_bytes: Vec<Memory>,
+    retired_tx: Option<Memory>,
 }
 impl Storage {
     fn allocate(port: &impl Port) -> Result<Self, Error> {
@@ -248,7 +249,54 @@ impl Storage {
             rx: blocks.next().ok_or(Error::Memory)?,
             tx_bytes: blocks.by_ref().take(TX_DEPTH).collect(),
             rx_bytes: blocks.collect(),
+            retired_tx: None,
         })
+    }
+    /// Grow only under a current v4 source and a completely idle TX owner.
+    /// Retain the old QTXDP-reachable ring until the final full DMA proof.
+    fn expand(&mut self, port: &impl Port, depth: usize) -> Result<(), Error> {
+        if depth <= self.tx_bytes.len() {
+            return Ok(());
+        }
+        if depth > super::tx_ba::MAX_MEMBERS || self.retired_tx.is_some() {
+            return Err(Error::State);
+        }
+        let mut fresh: Vec<Memory> = Vec::new();
+        for length in core::iter::once(depth * STRIDE).chain(core::iter::repeat_n(
+            descriptor::MAX_MPDU + 2,
+            depth - self.tx_bytes.len(),
+        )) {
+            let buffer = port.allocate(length)?;
+            let address = buffer.dma_addr().raw();
+            if buffer.len() < length
+                || address == 0
+                || address & 127 != 0
+                || address
+                    .checked_add(buffer.len() as u64 - 1)
+                    .is_none_or(|end| end > u64::from(u32::MAX))
+                || core::iter::once(&self.tx)
+                    .chain(core::iter::once(&self.rx))
+                    .chain(self.tx_bytes.iter())
+                    .chain(self.rx_bytes.iter())
+                    .chain(fresh.iter())
+                    .any(|old| {
+                        address < u64::from(old.address()) + old.0.len() as u64
+                            && u64::from(old.address()) < address + buffer.len() as u64
+                    })
+            {
+                return Err(Error::Address);
+            }
+            fresh.push(Memory(buffer));
+        }
+        let mut fresh = fresh.into_iter();
+        let ring = fresh.next().ok_or(Error::Memory)?;
+        for slot in 0..depth {
+            ring.put_words(slot, &[0; WORDS])?;
+        }
+        ring.sync();
+        self.retired_tx = Some(core::mem::replace(&mut self.tx, ring));
+        self.tx_bytes.extend(fresh);
+        Ok(())
     }
 }
 struct Pending {
@@ -263,18 +311,18 @@ struct Pending {
     queue: u64,
 }
 struct PairPending {
-    slots: [usize; 2],
+    slots: Vec<usize>,
     id: u64,
-    words: [[u32; WORDS]; 2],
-    originals: [Vec<u8>; 2],
-    dma: [Vec<u8>; 2],
-    seq: [u16; 2],
+    words: Vec<[u32; WORDS]>,
+    originals: Vec<Vec<u8>>,
+    dma: Vec<Vec<u8>>,
+    seq: Vec<u16>,
     deadline: u64,
 }
 pub(super) struct PairDelivery {
     pub id: u64,
-    pub originals: [Vec<u8>; 2],
-    pub acked: [bool; 2],
+    pub originals: Vec<Vec<u8>>,
+    pub acked: Vec<bool>,
     pub feedback: super::rates::Feedback,
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -488,6 +536,18 @@ impl<P: Port> Packet<P> {
             return Err(Error::Descriptor);
         }
         grant.readback(&self.port)?;
+        if grant.members() > TX_DEPTH {
+            for queue in 0..QUEUES {
+                if !self.tx_idle(queue)? {
+                    return Err(Error::Descriptor);
+                }
+            }
+            let storage = self.storage.as_mut().ok_or(Error::State)?;
+            grant.invoke(|| {
+                self.port
+                    .access(true, || storage.expand(&self.port, grant.members()))
+            })?;
+        }
         self.tx_ba = true;
         self.phase = Phase::Running;
         Ok(())
@@ -591,6 +651,9 @@ impl<P: Port> Packet<P> {
             Some(u32::from(be.cw_min()) | u32::from(be.cw_max()) << 10 | u32::from(be.aifsn) << 20);
         self.phase = Phase::Running;
         Ok(())
+    }
+    pub(super) fn ht_profile(&self) -> Option<super::ht::Profile> {
+        self.ht
     }
     pub(super) fn observe_ht(
         &mut self,
@@ -750,12 +813,12 @@ impl<P: Port> Packet<P> {
             super::descriptor::transmit_bar(frame, local, address, basic)
         })
     }
-    pub(super) fn submit_pair(
+    pub(super) fn submit_aggregate(
         &mut self,
-        frames: &[Vec<u8>; 2],
+        frames: &[Vec<u8>],
         mcs: u8,
         basic: usize,
-        permit: super::tx_ba::PairPermit,
+        permit: super::tx_ba::AggregatePermit,
     ) -> Result<u64, Error> {
         if self.phase != Phase::Running || !self.tx_ba {
             return Err(Error::State);
@@ -764,13 +827,26 @@ impl<P: Port> Packet<P> {
             return Err(Error::Busy);
         }
         let storage = self.storage.as_ref().ok_or(Error::State)?;
-        let slots = [self.next_tx, (self.next_tx + 1) % TX_DEPTH];
-        let words = descriptor::transmit_pair(
-            [&frames[0], &frames[1]],
+        if frames.len() != permit.count || frames.len() > storage.tx_bytes.len() {
+            return Err(Error::State);
+        }
+        let slots: Vec<usize> = (0..frames.len())
+            .map(|offset| (self.next_tx + offset) % storage.tx_bytes.len())
+            .collect();
+        let payloads: Vec<u64> = slots
+            .iter()
+            .map(|s| u64::from(storage.tx_bytes[*s].address()))
+            .collect();
+        let descriptors: Vec<u64> = slots
+            .iter()
+            .map(|s| u64::from(storage.tx.address()) + (*s * STRIDE) as u64)
+            .collect();
+        let words = descriptor::transmit_aggregate(
+            frames,
             self.local,
-            descriptor::PairAddresses {
-                payloads: slots.map(|s| u64::from(storage.tx_bytes[s].address())),
-                tail: u64::from(storage.tx.address()) + (slots[1] * STRIDE) as u64,
+            descriptor::AggregateAddresses {
+                payloads: &payloads,
+                descriptors: &descriptors,
             },
             mcs,
             basic,
@@ -778,11 +854,11 @@ impl<P: Port> Packet<P> {
             permit,
         )
         .map_err(|_| Error::Packet)?;
-        let dma = [
-            descriptor::dma_bytes(&frames[0]).map_err(|_| Error::Packet)?,
-            descriptor::dma_bytes(&frames[1]).map_err(|_| Error::Packet)?,
-        ];
-        let originals = frames.clone();
+        let dma: Vec<Vec<u8>> = frames
+            .iter()
+            .map(|frame| descriptor::dma_bytes(frame).map_err(|_| Error::Packet))
+            .collect::<Result<_, _>>()?;
+        let originals = frames.to_vec();
         let id = self.serial.checked_add(1).ok_or(Error::State)?;
         let deadline = self
             .port
@@ -795,7 +871,7 @@ impl<P: Port> Packet<P> {
             return Err(Error::Descriptor);
         }
         self.port.access(true, || {
-            for i in 0..2 {
+            for i in 0..frames.len() {
                 storage.tx_bytes[slots[i]].write_bytes(&dma[i])?;
                 storage.tx_bytes[slots[i]].sync();
                 storage.tx.put_words(slots[i], &words[i])?;
@@ -805,12 +881,12 @@ impl<P: Port> Packet<P> {
         })?;
         self.serial = id;
         self.pair = Some(PairPending {
-            slots,
+            slots: slots.clone(),
             id,
             words,
             originals,
             dma,
-            seq: permit.seq,
+            seq: permit.seq[..permit.count].to_vec(),
             deadline,
         });
         let address = storage.tx.address() + (slots[0] * STRIDE) as u32;
@@ -837,7 +913,7 @@ impl<P: Port> Packet<P> {
             storage.tx.sync();
             if storage
                 .tx
-                .word(p.slots[1] * STRIDE + descriptor::TX_DONE * 4)?
+                .word(*p.slots.last().ok_or(Error::State)? * STRIDE + descriptor::TX_DONE * 4)?
                 & 1
                 == 0
             {
@@ -847,7 +923,11 @@ impl<P: Port> Packet<P> {
                 return Ok(None);
             }
             storage.tx.sync();
-            let words = [storage.tx.words(p.slots[0])?, storage.tx.words(p.slots[1])?];
+            let words: Vec<[u32; WORDS]> = p
+                .slots
+                .iter()
+                .map(|slot| storage.tx.words(*slot))
+                .collect::<Result<_, _>>()?;
             for (i, w) in words.iter().enumerate() {
                 if w[..14] != p.words[i][..14] {
                     return Err(Error::Descriptor);
@@ -863,8 +943,9 @@ impl<P: Port> Packet<P> {
                 }
                 return Ok(None);
             }
-            let (acked, feedback) = descriptor::pair_status(&words[0], &words[1], p.seq)
-                .map_err(|_| Error::Descriptor)?;
+            let (acked, feedback) =
+                descriptor::aggregate_status(&words[0], words.last().ok_or(Error::State)?, &p.seq)
+                    .map_err(|_| Error::Descriptor)?;
             Ok(Some(PairDelivery {
                 id: p.id,
                 originals: p.originals.clone(),
@@ -873,8 +954,8 @@ impl<P: Port> Packet<P> {
             }))
         })?;
         if result.is_some() {
+            self.next_tx = (self.next_tx + p.slots.len()) % storage.tx_bytes.len();
             self.pair = None;
-            self.next_tx = (self.next_tx + 2) % TX_DEPTH;
         }
         self.phase = Phase::Running;
         Ok(result)
@@ -1293,9 +1374,11 @@ impl<P: Port> Packet<P> {
                 rx,
                 tx_bytes,
                 rx_bytes,
+                retired_tx,
             } = storage;
             buffers.push(tx.0);
             buffers.push(rx.0);
+            buffers.extend(retired_tx.into_iter().map(|memory| memory.0));
             buffers.extend(tx_bytes.into_iter().map(|m| m.0));
             buffers.extend(rx_bytes.into_iter().map(|m| m.0));
             self.port.release(buffers);

@@ -57,14 +57,22 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
                     || word(at + 4) != u32::from(f)
                     || word(at + 8) != 0
                     || word(at + 12)
-                        != (0x800
+                        != (u32::from(f < 3000)
+                            | 0x800
                             | if vht.is_some() { 0x1000 } else { 0 }
-                            | if matches!(f, 5180 | 5220 | 5745 | 5785) {
+                            | if f < 3000 && f == m.frequency.min(secondary)
+                                || matches!(f, 5180 | 5220 | 5745 | 5785)
+                            {
                                 0x40
                             } else {
                                 0
                             })
-                    || command[at + 16..at + 24] != [0, 54, 54, 0, 0, 54, 0, 0]
+                    || command[at + 16..at + 24]
+                        != if f < 3000 {
+                            [0, 34, 34, 0, 0, 34, 0, 0]
+                        } else {
+                            [0, 54, 54, 0, 0, 54, 0, 0]
+                        }
                 {
                     return Err(BmiError::BadResponse);
                 }
@@ -148,6 +156,8 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
     }
     if phase == 2 && m.data.as_ref().is_some_and(|data| data.ht_expected) {
         let channel = if dialect == Dialect::Tlv { 84 } else { 4 };
+        u32at(&mut expected, channel, u32::from(m.frequency));
+        u32at(&mut expected, channel + 4, u32::from(m.frequency));
         let vht = m.data.as_ref().unwrap().vht.as_ref().map(|v| v.width);
         u32at(
             &mut expected,
@@ -155,7 +165,11 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
             if vht == Some(2) {
                 0x180a // MODE_11AC_VHT80 | ALLOW_HT | ALLOW_VHT
             } else if m.data.as_ref().unwrap().ht_secondary.is_some() {
-                0x806
+                if m.frequency < 3000 {
+                    0x807
+                } else {
+                    0x806
+                }
             } else if m.frequency < 3000 {
                 0x805
             } else {

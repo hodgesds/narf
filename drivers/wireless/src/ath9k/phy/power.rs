@@ -184,7 +184,7 @@ pub(super) fn program(
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
-    let minor = u16::from_le_bytes(image[4..6].try_into().unwrap()) & 0xfff;
+    let minor = crate::ath9k::identity::eeprom_word(image, 4) & 0xfff;
     let overlap = if minor >= 2 {
         image[76]
     } else {

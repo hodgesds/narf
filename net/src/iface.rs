@@ -174,6 +174,7 @@ pub struct NetIfaceEntry {
     pub ownership_epoch: u64,
     // Immutable for this registration, distinct from administrative/RX epochs.
     registration_epoch: u64,
+    native_lifetime: crate::native_emission::ProviderLifetime,
     monitor_epoch: u64,
     pub send: SendFn,
     send_context: Option<(u64, SendCtxFn)>,
@@ -267,6 +268,15 @@ pub struct NetIfaceEntry {
     /// (virtio-net's 12-byte header). 0 for a device that DMAs from offset 0
     /// (e1000). [`tx_acquire`] returns a `Frame` whose payload starts after it.
     pub tx_headroom: usize,
+}
+
+impl NetIfaceEntry {
+    /// Permanently close old native emission identities before publishing
+    /// a metadata change. Notify only after every provider lock is gone.
+    fn retire_native(&mut self) -> crate::native_emission::Retirement {
+        let old = core::mem::take(&mut self.native_lifetime);
+        old.retire()
+    }
 }
 
 /// One `netdev_hw_addr` on a device's multicast or unicast list.
@@ -554,6 +564,7 @@ pub fn retire_for_rebind(name: &str) -> bool {
     let Some(at) = entries.iter().position(|entry| entry.name == name) else {
         return false;
     };
+    let native = entries[at].retire_native();
     let mut entry = entries.remove(at);
     let retired_snapshot = snapshot(&entry);
     entry.monitor_epoch = 0;
@@ -572,6 +583,8 @@ pub fn retire_for_rebind(name: &str) -> bool {
     drop(retired);
     drop(g);
     monitor::invalidate(&retired_snapshot);
+    drop(_capture);
+    native.notify();
     // The netdev persists across the rebind, so its IPv4 binding, UDP
     // sockets and ARP work are kept (unlike `unregister`).
     true
@@ -749,6 +762,7 @@ fn register_inner(
         let at = retired.iter().position(|entry| entry.name == name)?;
         Some(retired.remove(at))
     });
+    let retired_native = old.as_ref().map(|entry| entry.native_lifetime.retire());
     let ifindex = if name == "lo" {
         1
     } else if let Some(old) = old.as_ref() {
@@ -820,6 +834,7 @@ fn register_inner(
             .map_or(LinkLayer::Ethernet, |old| old.link_layer),
         ownership_epoch: next_ownership_epoch(),
         registration_epoch: next_ownership_epoch(),
+        native_lifetime: crate::native_emission::ProviderLifetime::new(),
         monitor_epoch: 0,
         packet_generation: old.as_ref().map_or(0, |old| {
             if old.packet_generation != 0 {
@@ -883,6 +898,9 @@ fn register_inner(
         monitor::invalidate(&snapshot(old));
     }
     drop(_capture);
+    if let Some(retired) = retired_native {
+        retired.notify();
+    }
     // Publish this interface's `net.ipv4.conf.<dev>.*` keys and seed its
     // forwarding value from `conf.default`. Done with IFACES released: the
     // hook reaches into the procfs registry, which must not be entered under
@@ -900,6 +918,11 @@ pub fn unregister(name: &str) -> bool {
     let Some(entries) = g.as_mut() else {
         return false;
     };
+    let native: Vec<_> = entries
+        .iter_mut()
+        .filter(|entry| entry.name == name)
+        .map(NetIfaceEntry::retire_native)
+        .collect();
     let old = entries
         .iter()
         .find(|entry| entry.name == name)
@@ -912,6 +935,9 @@ pub fn unregister(name: &str) -> bool {
         monitor::invalidate(old);
     }
     drop(_capture);
+    for retirement in native {
+        retirement.notify();
+    }
     if removed {
         crate::ipv4::remove_interface_binding(name);
         crate::udp_sock::remove_interface(name);
@@ -1251,6 +1277,7 @@ pub(crate) fn set_net_ns(name: &str, net_ns_id: u64) -> bool {
         return false;
     };
     let old_ns = entry.net_ns_id;
+    let native = (old_ns != net_ns_id).then(|| entry.retire_native());
     entry.net_ns_id = net_ns_id;
     if old_ns != net_ns_id {
         entry.ownership_epoch = next_ownership_epoch();
@@ -1276,12 +1303,16 @@ pub(crate) fn set_net_ns(name: &str, net_ns_id: u64) -> bool {
         crate::arp_cache::remove_interface_pending(name);
         crate::raw_sock::netdev_unregister_moved(old_ns, &moved);
     }
+    drop(_capture);
+    if let Some(retirement) = native {
+        retirement.notify();
+    }
     true
 }
 
 pub(crate) fn release_namespace(net_ns_id: u64) {
     let _capture = monitor::PUBLISH.lock();
-    let moved: Vec<NetIfaceSnapshot> = {
+    let moved: Vec<(NetIfaceSnapshot, crate::native_emission::Retirement)> = {
         let mut interfaces = IFACES.lock();
         let Some(entries) = interfaces.as_mut() else {
             return;
@@ -1290,7 +1321,9 @@ pub(crate) fn release_namespace(net_ns_id: u64) {
             .iter_mut()
             .filter(|entry| entry.net_ns_id == net_ns_id)
             .map(|entry| {
+                let native = entry.retire_native();
                 entry.net_ns_id = 0;
+                entry.ownership_epoch = next_ownership_epoch();
                 entry.monitor_epoch = 0;
                 if entry.link_layer == LinkLayer::Ieee80211Radiotap {
                     monitor::carrier(entry, false);
@@ -1298,13 +1331,17 @@ pub(crate) fn release_namespace(net_ns_id: u64) {
                 if entry.packet_generation != 0 {
                     entry.packet_generation = monitor::next_epoch().unwrap_or(u64::MAX);
                 }
-                snapshot(entry)
+                (snapshot(entry), native)
             })
             .collect()
     };
-    for entry in moved {
-        crate::raw_sock::netdev_unregister_moved(net_ns_id, &entry);
+    for (entry, _) in &moved {
+        crate::raw_sock::netdev_unregister_moved(net_ns_id, entry);
         crate::route::move_iface_routes(&entry.name, 0);
+    }
+    drop(_capture);
+    for (_, retirement) in moved {
+        retirement.notify();
     }
 }
 
@@ -1907,6 +1944,30 @@ pub(crate) fn registration_identity(name: &str) -> Option<u64> {
         .as_ref()
         .and_then(|entries| entries.iter().find(|entry| entry.name == name))
         .map(|entry| entry.registration_epoch)
+}
+/// Capture after actual administration was invoked, while this exact native
+/// Ethernet registration is administratively UP. This is only an identity
+/// observation and grants no operation without the original capability chain.
+pub(crate) fn native_identity(
+    name: &str,
+    namespace: u64,
+    ifindex: u32,
+    ownership_epoch: u64,
+    mac: [u8; 6],
+) -> Option<(crate::native_emission::Lifetime, u64)> {
+    let interfaces = IFACES.lock();
+    let entry = interfaces.as_ref()?.iter().find(|entry| {
+        entry.name == name
+            && entry.net_ns_id == namespace
+            && entry.ifindex == ifindex
+            && ownership_epoch != 0
+            && entry.ownership_epoch == ownership_epoch
+            && entry.mac == mac
+            && entry.link_up
+            && entry.link_layer == LinkLayer::Ethernet
+            && entry.registration_epoch != 0
+    })?;
+    Some((entry.native_lifetime.observe(), entry.registration_epoch))
 }
 /// Called after the actual registered NetIface capability was invoked.
 /// No callback/capability operation runs under this short comparison lock.

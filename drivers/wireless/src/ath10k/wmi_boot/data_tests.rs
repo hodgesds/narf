@@ -100,10 +100,10 @@ pub(super) struct Fixture {
     pub(super) ht_peer_nss: u32,
     ht_sgi: bool,
     ht_request_sgi: bool,
-    ht_request_sgi40: bool,
+    pub(super) ht_request_sgi40: bool,
     pub(super) ht_request_nss: u8,
     ht_ampdu: u8,
-    ht_capabilities: u16,
+    pub(super) ht_capabilities: u16,
     // Source-cited coding bits beyond the base request IE: IEEE LDPC 0x0001
     // and one-stream RX STBC 0x0100; native PEER_LDPC/PEER_STBC flags and
     // WMI_RC_TX_STBC_FLAG expected in PEER_ASSOC.
@@ -116,7 +116,7 @@ pub(super) struct Fixture {
     /// Robust management frames the host sent after authorization (SA
     /// Query responses, the PMF teardown deauthentication).
     pub(super) management_tx: Vec<Vec<u8>>,
-    rx_phy: Option<(u8, u32, u32)>,
+    pub(super) rx_phy: Option<(u8, u32, u32)>,
     // Authored native descriptors per actual DMA frame, including invalid
     // stale middle PHY words that the host must never reinterpret.
     rx_descriptors: VecDeque<(u8, u8, u32, u32)>,
@@ -584,7 +584,11 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
                     8 + u32::from(v.width)
                 } else if ht {
                     if f.ht_secondary.is_some() {
-                        6
+                        if m.frequency < 3000 {
+                            7
+                        } else {
+                            6
+                        }
                     } else if m.frequency < 3000 {
                         5
                     } else {
