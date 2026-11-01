@@ -304,7 +304,11 @@ fn smoke_iwl_native160_needs_raw_nvm_and_every_host_mcc_constituent() -> TestRes
             "native160 snapshot enlarged every connection and association future",
         )?;
         let model = phy(Native::Sc, true);
-        let mut ies = vec![1, 8, 0x8c, 18, 0x98, 36, 0xb0, 72, 96, 108];
+        // This complete AP snapshot goes through the real shared JoinPlan,
+        // which confirms its singleton SSID against Beacon::ssid too.
+        let mut ies = vec![0, SSID.len() as u8];
+        ies.extend_from_slice(SSID);
+        ies.extend_from_slice(&[1, 8, 0x8c, 18, 0x98, 36, 0xb0, 72, 96, 108]);
         ies.extend_from_slice(&he_tests::elements(model, true));
         let beacon = super::super::super::connection::Beacon {
             bssid: AP,
