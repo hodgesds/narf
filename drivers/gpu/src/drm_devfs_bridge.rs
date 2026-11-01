@@ -2070,6 +2070,16 @@ impl crate::drm_registry::DrmCard for AmdgpuCard {
         self.rdna2()
             .then(crate::amdgpu_rdna2_power_controls::features)
     }
+    fn power_profiles(&self) -> Option<String> {
+        self.rdna4().then(crate::amdgpu_navi48_power::profiles)
+    }
+    fn set_power_profile(&self, profile: &str) -> Result<(), FsError> {
+        if self.rdna4() {
+            crate::amdgpu_navi48_power::request_profile(profile)
+        } else {
+            Err(FsError::Unsupported)
+        }
+    }
     fn set_pp_features(&self, mask: &str) -> Result<(), FsError> {
         if !self.rdna2() {
             return Err(FsError::Unsupported);

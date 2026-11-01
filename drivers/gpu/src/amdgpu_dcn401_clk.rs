@@ -233,6 +233,13 @@ pub struct Status {
     pub bandwidth: Bandwidth,
     /// DAL messages PMFW refused or timed out whose result Linux ignores.
     pub ignored: Ignored,
+    /// All three watermark-table messages completed without an ignored reply.
+    pub watermarks_ready: bool,
+    /// The runtime admission replay completed (only with State::Applied).
+    /// Subsequent bandwidth/sleep commands require real acknowledgements.
+    pub dynamic_power: bool,
+    /// Acknowledged SetCabForUclkPstate reservation, retained on failure.
+    pub cab_ways: u8,
 }
 impl Status {
     /// Whether PMFW may switch UCLK under running displays: a bandwidth
@@ -418,6 +425,36 @@ impl<I: Io> Engine<I> {
             }
             Ok(())
         })
+    }
+    async fn reserve_cab(&mut self, ways: u8) -> Result<(), Error> {
+        if ways > 16 {
+            return Err(Error::Invalid);
+        }
+        if self.status.state != State::Applied
+            || !self.status.dynamic_power
+            || self.status.bandwidth.uclk_pstate
+        {
+            return Err(Error::Busy);
+        }
+        self.access(|_| Ok(()))?;
+        if ways == self.status.cab_ways {
+            return Ok(());
+        }
+        self.status.state = State::Applying;
+        match self
+            .command(0x12, u32::from(ways) << 1 | u32::from(ways != 0))
+            .await
+        {
+            Ok(_) => {
+                self.status.cab_ways = ways;
+                self.status.state = State::Applied;
+                Ok(())
+            }
+            Err(e) => {
+                self.status.state = State::Failed(e);
+                Err(e)
+            }
+        }
     }
     async fn settled(&mut self, deadline: narf_time::Deadline) -> Result<u32, Error> {
         let at = self.layout.mp1 + u64::from(RESPONSE) * 4;
@@ -688,6 +725,9 @@ impl<I: Io> Engine<I> {
         }
     }
     async fn command_ignored(&mut self, message: u32, parameter: u32) -> Result<(), Error> {
+        if self.status.dynamic_power {
+            return self.command(message, parameter).await.map(|_| ());
+        }
         if let Err(e) = self.optional_result(message, parameter).await? {
             self.ignore(message, e);
         }
@@ -711,7 +751,17 @@ impl<I: Io> Engine<I> {
         #[cfg(feature = "kernel-test")]
         let mut polls = self.io.wait_poll_limit();
         loop {
-            let bits = match self.optional_result(0x15, 0).await? {
+            let bits = match if self.status.dynamic_power {
+                Ok(self.command_until(0x15, 0, deadline).await.map_err(|e| {
+                    if e == Error::Timeout {
+                        Error::HardMinTimeout(clock)
+                    } else {
+                        e
+                    }
+                })?)
+            } else {
+                self.optional_result(0x15, 0).await?
+            } {
                 Ok(bits) => bits,
                 Err(Error::Timeout) => {
                     // The result of the floor's acknowledgement is unread by
@@ -729,6 +779,9 @@ impl<I: Io> Engine<I> {
             #[cfg(feature = "kernel-test")]
             if let Some(left) = &mut polls {
                 if *left == 0 {
+                    if self.status.dynamic_power {
+                        return Err(Error::HardMinTimeout(clock));
+                    }
                     self.ignore(message, Error::HardMinTimeout(clock));
                     return Ok(());
                 }
@@ -737,6 +790,9 @@ impl<I: Io> Engine<I> {
                 continue;
             }
             if deadline.expired() {
+                if self.status.dynamic_power {
+                    return Err(Error::HardMinTimeout(clock));
+                }
                 self.ignore(message, Error::HardMinTimeout(clock));
                 return Ok(());
             }
@@ -768,7 +824,7 @@ impl<I: Io> Engine<I> {
         let (mut uclk_active, mut uclk_idle) = (false, false);
         let (mut fclk_active, mut fclk_idle) = (false, false);
         // FCLK P-state support: DCN401 has no FCLK switch message.
-        let fclk = new.fclk_pstate || !planes;
+        let fclk = (new.fclk_pstate && (!self.status.dynamic_power || idle_dpm)) || !planes;
         if should_update_pstate(safe_to_lower, fclk, cur.fclk_pstate) {
             next.fclk_pstate = fclk;
             fclk_active = true;
@@ -874,6 +930,10 @@ impl<I: Io> Engine<I> {
         } else {
             levels.range(Clock::Memory).max_khz()
         };
+        if self.status.dynamic_power && planes && !next.fclk_pstate {
+            next.fclk_khz = levels.range(Clock::Fabric).max_khz();
+            next.idle_fclk_khz = next.fclk_khz;
+        }
         Ok((next, floor))
     }
     /// The bandwidth sequence towards `new` while the display owner's
@@ -890,6 +950,20 @@ impl<I: Io> Engine<I> {
             return Err(Error::Busy);
         }
         let current = self.status.applied.ok_or(Error::Invalid)?;
+        if self.status.dynamic_power {
+            let levels = self.status.levels.ok_or(Error::Invalid)?;
+            for (clock, active, idle) in [
+                (Clock::Memory, new.dramclk_khz, new.idle_dramclk_khz),
+                (Clock::Fabric, new.fclk_khz, new.idle_fclk_khz),
+            ] {
+                if active == 0 || active > levels.range(clock).max_khz() || idle > active {
+                    return Err(Error::Invalid);
+                }
+            }
+            if new.deep_sleep_dcfclk_khz > levels.range(Clock::Dcf).max_khz() {
+                return Err(Error::Invalid);
+            }
+        }
         self.idle_except(held)?;
         self.status.state = State::Applying;
         let result = self.bandwidth(new, safe_to_lower, true).await;
@@ -948,6 +1022,9 @@ impl<I: Io> Engine<I> {
             }
             let memory = levels.range(Clock::Memory);
             let fabric = levels.range(Clock::Fabric);
+            if self.status.dynamic_power && !self.idle_dpm(&levels) {
+                self.hard_min(Clock::Fabric, fabric.min_khz()).await?;
+            }
             let none = Bandwidth {
                 uclk_pstate: true,
                 fclk_pstate: true,
@@ -1009,20 +1086,29 @@ impl<I: Io> Engine<I> {
             return Err(Error::Busy);
         }
         let previous = self.status.state;
+        self.status.watermarks_ready = false;
         self.status.state = State::Applying;
         // dcn401_smu_set_dram_addr_high/low and
         // dcn401_smu_transfer_wm_table_dram_2_smu return nothing. Retain the
         // applying state on cancellation so a partial mailbox is not reused.
+        let mut accepted = true;
         let result = async {
-            self.command_ignored(5, (address >> 32) as u32).await?;
-            self.command_ignored(6, address as u32).await?;
-            self.command_ignored(8, 2).await
+            for (message, parameter) in [(5, (address >> 32) as u32), (6, address as u32), (8, 2)] {
+                if self.status.dynamic_power {
+                    self.command(message, parameter).await?;
+                } else if let Err(error) = self.optional_result(message, parameter).await? {
+                    accepted = false;
+                    self.ignore(message, error);
+                }
+            }
+            Ok(())
         }
         .await;
         self.status.state = match result {
             Ok(()) => previous,
             Err(e) => State::Failed(e),
         };
+        self.status.watermarks_ready = result.is_ok() && accepted && !self.unanswered_ignored;
         result
     }
     async fn prepare(&mut self, request: Request) -> Result<Applied, Error> {
@@ -1186,6 +1272,9 @@ impl ClockManager {
                 applied: None,
                 bandwidth: Bandwidth::INIT,
                 ignored: Ignored::default(),
+                watermarks_ready: false,
+                dynamic_power: false,
+                cab_ways: 0,
             },
         }))
     }
@@ -1219,6 +1308,13 @@ impl ClockManager {
         }
         self.0.access(|_| Ok(()))?;
         self.0.status.applied.ok_or(Error::Invalid)
+    }
+    /// Reserve/release SubVP cache ways with UCLK switching pinned. A
+    /// cancelled request leaves the mailbox owner Applying; no release is
+    /// inferred without the firmware acknowledgement.
+    pub(crate) async fn reserve_cab(&mut self, regs: MmioRegion, ways: u8) -> Result<(), Error> {
+        self.retained_pipe_clocks(regs)?;
+        self.0.reserve_cab(ways).await
     }
     /// # Safety
     /// Matching protected SMU power is ready; all GPU engines are idle and
@@ -1317,6 +1413,8 @@ impl ClockManager {
 
 /// sizeof(WatermarksExternal_t).
 pub const WM_TABLE_BYTES: usize = 112;
+#[path = "amdgpu_dcn401_power.rs"]
+mod power;
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_dcn401_clk_tests.rs"]
 mod tests;

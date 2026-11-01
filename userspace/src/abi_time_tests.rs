@@ -2430,3 +2430,122 @@ fn smoke_abi_time_timer_getoverrun_is_routed() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_timer_getoverrun_is_routed);
+
+fn smoke_abi_time_precision_clock_fd_and_permissions() -> TestResult {
+    use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+    #[derive(Debug)]
+    struct Clock {
+        ns: AtomicU64,
+        ppb: AtomicI32,
+        alive: AtomicBool,
+    }
+    impl narf_time::phc::HardwareClock for Clock {
+        fn read_ns(&self) -> Result<u64, i32> {
+            if self.alive.load(Ordering::Acquire) {
+                Ok(self.ns.load(Ordering::Relaxed))
+            } else {
+                Err(19)
+            }
+        }
+        fn set_ns(&self, n: u64) -> Result<(), i32> {
+            self.read_ns()?;
+            self.ns.store(n, Ordering::Relaxed);
+            Ok(())
+        }
+        fn adjust(&self, d: i64, p: i32) -> Result<(), i32> {
+            self.read_ns()?;
+            self.ns.fetch_add(d as u64, Ordering::Relaxed);
+            self.ppb.store(p, Ordering::Relaxed);
+            Ok(())
+        }
+        fn frequency_ppb(&self) -> i32 {
+            self.ppb.load(Ordering::Relaxed)
+        }
+        fn max_adjust_ppb(&self) -> u32 {
+            62_499_999
+        }
+    }
+    struct Registered(u32);
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            narf_time::phc::unregister(self.0);
+        }
+    }
+    with_setup(|| {
+        let clock = alloc::sync::Arc::new(Clock {
+            ns: AtomicU64::new(7_000_000_123),
+            ppb: AtomicI32::new(0),
+            alive: AtomicBool::new(true),
+        });
+        let index = narf_time::phc::register(clock.clone());
+        let _registered = Registered(index);
+        let file =
+            narf_filesystem::devfs_ptp::PtpFile::open(index).ok_or("registered PHC unavailable")?;
+        let fd = crate::fd::install(
+            FAKE_TASK,
+            crate::fd::FdEntry {
+                ops: file.clone(),
+                offset: 0,
+                flags: 0,
+                status_flags: 2,
+            },
+        )
+        .ok_or("PHC fd allocation")?;
+        let id = ((!(fd as i32) << 3) | 3) as i64 as u64;
+        let mut ts = [0u64; 2];
+        if call(Syscall::ClockGetTime.raw(), a1(id, ts.as_mut_ptr() as u64)) != Some(0)
+            || ts != [7, 123]
+        {
+            return Err("dynamic clock fd did not read hardware time");
+        }
+        let input = [9u64, 456];
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+        if call(Syscall::ClockSetTime.raw(), a1(id, input.as_ptr() as u64)) != Some(EPERM)
+            || clock.ns.load(Ordering::Relaxed) != 7_000_000_123
+        {
+            return Err("PHC settime bypassed CAP_SYS_TIME");
+        }
+        crate::handlers::__test_set_caps(FAKE_TASK, u64::MAX, u64::MAX);
+        if call(Syscall::ClockSetTime.raw(), a1(id, input.as_ptr() as u64)) != Some(0)
+            || clock.ns.load(Ordering::Relaxed) != 9_000_000_456
+        {
+            return Err("PHC settime failed");
+        }
+        let ro = crate::fd::install(
+            FAKE_TASK,
+            crate::fd::FdEntry {
+                ops: file,
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            },
+        )
+        .ok_or("read-only PHC fd")?;
+        let roid = ((!(ro as i32) << 3) | 3) as i64 as u64;
+        if call(Syscall::ClockSetTime.raw(), a1(roid, input.as_ptr() as u64)) != Some(EACCES) {
+            return Err("read-only PHC descriptor allowed settime");
+        }
+        let mut tx = [0u64; 26];
+        tx[0] = 2;
+        tx[2] = 65536;
+        if call(Syscall::ClockAdjtime.raw(), a1(id, tx.as_mut_ptr() as u64)) != Some(0)
+            || clock.ppb.load(Ordering::Relaxed) != 1000
+        {
+            return Err("PHC scaled frequency conversion wrong");
+        }
+        clock.alive.store(false, Ordering::Release);
+        narf_time::phc::unregister(index);
+        if call(Syscall::ClockGetTime.raw(), a1(id, ts.as_mut_ptr() as u64)) != Some(-19) {
+            return Err("removed PHC still answered");
+        }
+        crate::fd::with_table(FAKE_TASK, |table| table.close(fd));
+        if call(Syscall::ClockGetTime.raw(), a1(id, ts.as_mut_ptr() as u64)) != Some(EINVAL) {
+            return Err("closed PHC fd remained a clock");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_precision_clock_fd_and_permissions
+);

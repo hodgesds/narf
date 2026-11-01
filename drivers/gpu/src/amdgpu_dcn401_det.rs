@@ -6,6 +6,21 @@ use super::*;
 /// Call on the ForceSingleDPP geometry before choosing MPC, and again on
 /// the final geometry before any latency or mode-programming calculation.
 pub(super) fn allocate(shapes: &mut [Shape]) -> (bool, u32) {
+    if shapes.iter().any(|s| s.phantom) {
+        // CalculateDETBufferSize excludes phantoms from the budgets. Their
+        // swath/burst model uses 1 MiB; the actual HUBP gets zero DET.
+        let mut main: Vec<Shape> = shapes.iter().copied().filter(|s| !s.phantom).collect();
+        let result = allocate(&mut main);
+        let mut main = main.into_iter();
+        for s in shapes {
+            if s.phantom {
+                s.set_det(0);
+            } else {
+                *s = main.next().unwrap();
+            }
+        }
+        return result;
+    }
     let pipes: u32 = shapes.iter().map(|s| s.dpps).sum();
     let unbounded = pipes == 1
         && shapes

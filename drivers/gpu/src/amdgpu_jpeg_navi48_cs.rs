@@ -345,13 +345,22 @@ impl<I: Io> Engine<I> {
     pub(super) async fn reset_stop(&mut self) -> Result<(), Error> {
         if matches!(
             self.state,
-            State::Prepared | State::Stopped | State::Stopping | State::Starting
+            State::Prepared
+                | State::Stopped
+                | State::Stopping
+                | State::Starting
+                | State::Idle
+                | State::IdleStarting
+                | State::IdleStopping
         ) {
             return Err(Error::Busy);
         }
         self.state = State::Stopping;
         let result = async {
             self.shared_range()?;
+            // PG_MODE alone cannot retire a hung JRBC. Force ONO1 on, then
+            // retain the existing JMI reset/clean/power-cycle recovery.
+            self.wake_dpg().await?;
             self.set(IRQ, 0x100, 0)?;
             self.set(JMI, 1, 1)?;
             self.wait(CLEAN, CLEAN_MASK, CLEAN_VALUE).await?;
@@ -387,18 +396,35 @@ impl<I: Io> Engine<I> {
         result
     }
 }
+#[cfg(feature = "kernel-test")]
 pub(super) fn client_fence(
     io: &mut impl Io,
     authority: Cap<BusDeviceCap, Write>,
     l: Layout,
     map: MmioRegion,
 ) -> Result<u32, Error> {
+    retained_fence(io, authority, l, map, true)
+}
+pub(super) fn retained_fence(
+    io: &mut impl Io,
+    authority: Cap<BusDeviceCap, Write>,
+    l: Layout,
+    map: MmioRegion,
+    active: bool,
+) -> Result<u32, Error> {
     let value = authority
         .invoke(Op(|| {
-            checked(io.read(l.vcn + u64::from(STATUS) * 4))?;
+            // Use always-on presence around VRAM fence reads, including
+            // periods when JPEG is power-gated by its retained idle owner.
+            checked(io.read(l.nbio + 0xc3 * 4))?;
+            if active {
+                checked(io.read(l.vcn + u64::from(STATUS) * 4))?;
+            }
             flush(io, l)?;
             let value = io.memory_read(map, FENCE);
-            checked(io.read(l.vcn + u64::from(STATUS) * 4))?;
+            if active {
+                checked(io.read(l.vcn + u64::from(STATUS) * 4))?;
+            }
             checked(io.read(l.nbio + 0xc3 * 4))?;
             Ok(value)
         }))

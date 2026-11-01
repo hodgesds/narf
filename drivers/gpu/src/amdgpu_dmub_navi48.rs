@@ -280,6 +280,8 @@ struct Engine<I: Io> {
     state: State,
     status: Option<Status>,
     mailbox: mailbox::Mailbox,
+    /// A late inbox0 ACK must never satisfy a later strict FAMS2 lock.
+    hw_lock_uncertain: bool,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -744,6 +746,7 @@ impl Dmub {
                 state: State::Prepared,
                 status: None,
                 mailbox: mailbox::Mailbox::new(),
+                hw_lock_uncertain: false,
             },
         })
     }
@@ -1327,11 +1330,21 @@ pub struct Fams2Global {
 /// sub-state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Fams2StreamConfig {
+    pub phantom: Option<Fams2PhantomConfig>,
     pub base: crate::amdgpu_dcn401_dml::pstate::Fams2Stream,
+    pub drr: Option<crate::amdgpu_freesync::Drr>,
     pub otg_inst: u8,
     pub pipe_mask: u8,
     pub num_planes: u8,
     pub plane_pipe_masks: [u8; 6],
+}
+
+/// Physical resources reserved by the SubVP owner (v1 sub-state).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fams2PhantomConfig {
+    pub otg_inst: u8,
+    pub pipe_mask: u8,
+    pub plane_pipe_masks: [u8; 3],
 }
 
 /// dc_dmub_srv_rb_based_fams2_update_config's command list for `global`
@@ -1424,7 +1437,30 @@ pub fn fams2_config_commands(
         // The legacy sub-state (dmub_fams2_cmd_legacy_stream_static_state):
         // the vactive fill delay; a vblank stream leaves it zero.
         let mut c = header(true);
-        c[4..6].copy_from_slice(&s.base.vactive_det_fill_delay_otg_vlines.to_le_bytes());
+        if let (Some(vp), Some(hw)) = (s.base.subvp, s.phantom) {
+            for (i, value) in [
+                1000u16,
+                1000,
+                vp.phantom_vtotal,
+                vp.phantom_vactive,
+                vp.programming_delay,
+                vp.prefetch_to_mall,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                c[4 + 2 * i..6 + 2 * i].copy_from_slice(&value.to_le_bytes());
+            }
+            c[17] = hw.otg_inst;
+            c[18] = hw.pipe_mask;
+            c[20..23].copy_from_slice(&hw.plane_pipe_masks);
+        } else if let Some(drr) = s.base.drr_state {
+            c[4..6].copy_from_slice(&drr.stretched_vtotal.to_le_bytes());
+            c[6..8].copy_from_slice(&drr.programming_delay.to_le_bytes());
+            c[8] = 1; // only_stretch_if_required
+        } else {
+            c[4..6].copy_from_slice(&s.base.vactive_det_fill_delay_otg_vlines.to_le_bytes());
+        }
         out.push(c);
     }
     if let Some(last) = out.last_mut() {
@@ -1434,18 +1470,91 @@ pub fn fams2_config_commands(
 }
 
 impl<I: Io> Engine<I> {
-    /// dcn401_fams2_update_config for the hardware-exclusive methods: the
-    /// single global FAMS2_CONFIG command. A configuration with streams
-    /// needs a chained command list, which this owner does not post.
+    async fn fams2_hw_lock(&mut self, lock: bool) -> Result<bool, Error> {
+        if lock && self.hw_lock_uncertain {
+            return Err(Error::Busy);
+        }
+        let result = self
+            .inbox0(HW_LOCK | if lock { HW_LOCK_LOCK } else { HW_LOCK_RELEASE })
+            .await;
+        if result != Ok(true) {
+            self.hw_lock_uncertain = true;
+        }
+        // Release is still attempted after a missing ACK, but its own ACK
+        // can no longer prove exclusion: it might belong to an older command.
+        if self.hw_lock_uncertain && result.is_ok() {
+            return Ok(false);
+        }
+        result
+    }
+    /// FAMS2_CONFIG is one atomic command list, with a single publication.
     async fn fams2_update_config(&mut self, commands: &[[u8; 64]]) -> Result<(), Error> {
-        let [command] = commands else {
+        if commands.is_empty()
+            || commands.len() > 9
+            || commands
+                .iter()
+                .any(|c| c[..2] != [FW_ASSISTED_MCLK_SWITCH, FAMS2_CONFIG] || c[3] != FAMS2_PAYLOAD)
+        {
+            return Err(Error::Invalid);
+        }
+        if commands.len() > 1
+            && self
+                .status
+                .and_then(|s| s.capabilities)
+                .is_none_or(|c| !c.fams2())
+        {
             return Err(Error::Unsupported);
-        };
-        self.send(*command).await
+        }
+        self.begin_mailbox()?;
+        let result = self.command_list(commands).await;
+        self.finish_mailbox(result)
     }
 }
 
+/// optc401_set_drr -> dc_dmub_srv_fams2_drr_update, including MID.
+fn fams2_drr_command(
+    otg: u8,
+    drr: Option<crate::amdgpu_freesync::Drr>,
+    mid: Option<crate::amdgpu_dcn401_otg::DrrMid>,
+) -> Result<[u8; 64], Error> {
+    if otg >= 4
+        || mid.is_some_and(|m| {
+            m.frames == 0
+                || drr.is_none_or(|d| m.v_total < d.v_total_min || m.v_total > d.v_total_max)
+        })
+        || drr.is_some_and(|d| {
+            d.v_total_min == 0 || d.v_total_min > d.v_total_max || d.v_total_max > 0x7fff
+        })
+    {
+        return Err(Error::Invalid);
+    }
+    let mut command = [0; 64];
+    command[..4].copy_from_slice(&[76, 5, 0, 20]);
+    if let Some(d) = drr {
+        command[4..8].copy_from_slice(&(d.v_total_min - 1).to_le_bytes());
+        command[8..12].copy_from_slice(&(d.v_total_max - 1).to_le_bytes());
+        command[20] = 1;
+    }
+    if let Some(m) = mid {
+        command[12..16].copy_from_slice(&(m.v_total - 1).to_le_bytes());
+        command[16..20].copy_from_slice(&u32::from(m.frames).to_le_bytes());
+    }
+    command[21] = otg;
+    Ok(command)
+}
+
 impl Dmub {
+    pub(crate) async fn fams2_drr_update(
+        &mut self,
+        otg: u8,
+        drr: Option<crate::amdgpu_freesync::Drr>,
+        mid: Option<crate::amdgpu_dcn401_otg::DrrMid>,
+    ) -> Result<(), Error> {
+        if self.fams2() != Some(true) {
+            return Err(Error::Unsupported);
+        }
+        self.engine.send(fams2_drr_command(otg, drr, mid)?).await
+    }
     /// Whether DC keeps FAMS2 enabled for this firmware (dcn401_init_hw's
     /// FAMS version check): `None` until QUERY_FEATURE_CAPS answered.
     pub fn fams2(&self) -> Option<bool> {
@@ -1454,12 +1563,15 @@ impl Dmub {
             .and_then(|s| s.capabilities)
             .map(|c| c.fams2())
     }
+    /// False until a fresh owner replaces one with an unanswered inbox0 lock.
+    pub(crate) fn fams2_lock_ready(&self) -> bool {
+        !self.engine.hw_lock_uncertain
+    }
     /// dcn401_dmub_hw_control_lock: the driver's inbox0 HW lock, taken
     /// (`lock`) or released. `Ok(false)`: firmware never acknowledged it,
     /// which Linux logs and goes on from.
     pub(crate) async fn hw_lock(&mut self, lock: bool) -> Result<bool, Error> {
-        let command = HW_LOCK | if lock { HW_LOCK_LOCK } else { HW_LOCK_RELEASE };
-        self.engine.inbox0(command).await
+        self.engine.fams2_hw_lock(lock).await
     }
     /// Post dc_dmub_srv_fams2_update_config's commands
     /// ([`fams2_config_commands`]).

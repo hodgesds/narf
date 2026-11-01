@@ -1,4 +1,6 @@
 use super::*;
+#[path = "amdgpu_navi48_profile_tests.rs"]
+mod profile_tests;
 use crate::amdgpu_smu_navi48_telemetry::Metrics;
 use alloc::format;
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -49,6 +51,8 @@ fn navi48_power_cap_writes_follow_amdgpu_hwmon_units_and_range() -> TestResult {
         limits: l,
         protected: true,
         gfx_level: smu::GfxLevel::Auto,
+        profile: smu::PowerProfile::BootupDefault,
+        coefficients: None,
         error: None,
         samples: 0,
     };
@@ -88,6 +92,8 @@ fn sample(telemetry: Result<Telemetry, smu::Error>, protected: bool) -> Sample {
         limits: Some(limits(true)),
         protected,
         gfx_level: smu::GfxLevel::Auto,
+        profile: smu::PowerProfile::BootupDefault,
+        coefficients: None,
     }
 }
 
@@ -97,6 +103,8 @@ fn navi48_power_snapshot_reports_transitions_once() -> TestResult {
         limits: Some(limits(true)),
         protected: false,
         gfx_level: smu::GfxLevel::Auto,
+        profile: smu::PowerProfile::BootupDefault,
+        coefficients: None,
         error: None,
         samples: 0,
     };
@@ -149,6 +157,8 @@ fn navi48_hwmon_follows_linux_amdgpu_units_and_visibility() -> TestResult {
         limits: None,
         protected: false,
         gfx_level: smu::GfxLevel::Auto,
+        profile: smu::PowerProfile::BootupDefault,
+        coefficients: None,
         error: None,
         samples: 0,
     };

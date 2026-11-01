@@ -130,8 +130,31 @@ pub const VALIDITY_VID: u16 = 0x138A;
 pub const ELAN_VID: u16 = 0x04F3;
 
 /// Master VID/PID table covering the common laptop fingerprint
-/// readers (Lenovo / Dell / HP / ASUS business class). Sourced
-/// from libfprint's device list (BSD-licensed).
+/// readers (Lenovo / Dell / HP / ASUS business class).
+///
+/// SINGLE MATCH AUTHORITY (issue #918): this is the one table both
+/// the scaffold probe (`match_vid_pid`) and the live USB binder
+/// (`narf_drivers_usb::fingerprint::classify_vid_pid`, which maps
+/// `Family` to its transport vendor) read. The pre-#918 tree had
+/// two tables that drifted apart — this 22-entry scaffold table
+/// and a 17-entry table in the USB binder — agreeing on only 8
+/// of a 31-device union, which left the whole Validity family
+/// unbindable in the live path. The union below is that 31.
+///
+/// Provenance, per entry block:
+/// - Scaffold entries: libfprint's device list (BSD-licensed).
+/// - `Live-table carryover` entries: the pre-#918 USB binder
+///   table, whose own source comments cite libfprint's
+///   `synaptics.c` / `goodix.c` / `elanmoc.c` VID/PID lists.
+///   Carryover entries are flagged where their sub-family (or
+///   series) is unverified — see the Synaptics carryovers: the
+///   live table did not distinguish Prometheus vs MIS-older, so
+///   those three carry `SynapticsPrometheus` by convention and
+///   the flag says so. Both Synaptics families map to the same
+///   bulk transport arm in the USB binder, so a wrong sub-family
+///   here affects only the probe-log label, never binding.
+///   A reviewer with the libfprint source at hand can correct
+///   the three labels without touching any behaviour.
 ///
 /// Coverage targets — all four vendors are represented because a
 /// single laptop OEM frequently sources from multiple readers
@@ -168,6 +191,30 @@ pub const FINGERPRINT_DEVICES: &[FingerprintDevice] = &[
         pid: 0x00C9,
         family: Family::SynapticsPrometheus,
         name: "Prometheus (00C9)",
+    },
+    // ── Synaptics live-table carryover (#918) ─────────────────────
+    // Sub-family UNVERIFIED: the live table grouped all Synaptics
+    // under one vendor and did not distinguish Prometheus vs
+    // MIS-older. These carry SynapticsPrometheus by convention;
+    // both families map to the bulk arm in the USB binder, so a
+    // wrong label here affects only the probe-log line.
+    FingerprintDevice {
+        vid: SYNAPTICS_VID,
+        pid: 0x00C6,
+        family: Family::SynapticsPrometheus,
+        name: "Synaptics (00C6)",
+    },
+    FingerprintDevice {
+        vid: SYNAPTICS_VID,
+        pid: 0x00DC,
+        family: Family::SynapticsPrometheus,
+        name: "Synaptics (00DC)",
+    },
+    FingerprintDevice {
+        vid: SYNAPTICS_VID,
+        pid: 0x00FF,
+        family: Family::SynapticsPrometheus,
+        name: "Synaptics (00FF)",
     },
     // ── Synaptics older Match-In-Sensor (pre-Prometheus) ─────────
     FingerprintDevice {
@@ -206,6 +253,37 @@ pub const FINGERPRINT_DEVICES: &[FingerprintDevice] = &[
         pid: 0x6584,
         family: Family::Goodix,
         name: "GF series (6584)",
+    },
+    // ── Goodix live-table carryover (#918) ────────────────────────
+    FingerprintDevice {
+        vid: GOODIX_VID,
+        pid: 0x5110,
+        family: Family::Goodix,
+        name: "Goodix (5110)",
+    },
+    FingerprintDevice {
+        vid: GOODIX_VID,
+        pid: 0x530C,
+        family: Family::Goodix,
+        name: "Goodix (530C)",
+    },
+    FingerprintDevice {
+        vid: GOODIX_VID,
+        pid: 0x533C,
+        family: Family::Goodix,
+        name: "Goodix (533C)",
+    },
+    FingerprintDevice {
+        vid: GOODIX_VID,
+        pid: 0x5395,
+        family: Family::Goodix,
+        name: "Goodix (5395)",
+    },
+    FingerprintDevice {
+        vid: GOODIX_VID,
+        pid: 0x6594,
+        family: Family::Goodix,
+        name: "Goodix (6594)",
     },
     // ── Validity / Synaptics older ──────────────────────────────
     FingerprintDevice {
@@ -274,6 +352,13 @@ pub const FINGERPRINT_DEVICES: &[FingerprintDevice] = &[
         pid: 0x0C42,
         family: Family::Elan,
         name: "Elan ELAN-FP (0C42)",
+    },
+    // ── Elan live-table carryover (#918) ──────────────────────────
+    FingerprintDevice {
+        vid: ELAN_VID,
+        pid: 0x0C00,
+        family: Family::Elan,
+        name: "Elan ELAN-FP (0C00)",
     },
 ];
 
@@ -620,36 +705,40 @@ mod tests {
         smoke_probe_non_fingerprint_returns_none
     );
 
-    fn smoke_match_table_size_matches_brief() -> TestResult {
-        // Brief specifies: Synaptics 7 + Goodix 4 + Validity 6 + Elan 5 = 22.
-        if FINGERPRINT_DEVICES.len() != 22 {
-            return TestResult::Fail("match table size drifted from brief");
+    fn smoke_match_table_size_matches_union() -> TestResult {
+        // #918 union: scaffold 22 + live-table carryover 9 = 31.
+        // Synaptics Prometheus 5 + 3 carryover (sub-family
+        // unverified, flagged at the table) + MIS-older 2 +
+        // Goodix 4 + 5 carryover + Validity 6 + Elan 5 + 1
+        // carryover = 31.
+        if FINGERPRINT_DEVICES.len() != 31 {
+            return TestResult::Fail("match table size drifted from union");
         }
-        // Per-vendor counts must match the brief or the smoke breaks.
+        // Per-family counts must match the union or the smoke breaks.
         let count = |fam: Family| {
             FINGERPRINT_DEVICES
                 .iter()
                 .filter(|d| d.family == fam)
                 .count()
         };
-        if count(Family::SynapticsPrometheus) != 5 {
+        if count(Family::SynapticsPrometheus) != 8 {
             return TestResult::Fail("Synaptics Prometheus count drift");
         }
         if count(Family::SynapticsMisOlder) != 2 {
             return TestResult::Fail("Synaptics MIS-older count drift");
         }
-        if count(Family::Goodix) != 4 {
+        if count(Family::Goodix) != 9 {
             return TestResult::Fail("Goodix count drift");
         }
         if count(Family::Validity) != 6 {
             return TestResult::Fail("Validity count drift");
         }
-        if count(Family::Elan) != 5 {
+        if count(Family::Elan) != 6 {
             return TestResult::Fail("Elan count drift");
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/fingerprint", smoke_match_table_size_matches_brief);
+    kernel_test_in!("drivers/fingerprint", smoke_match_table_size_matches_union);
 
     fn smoke_match_table_no_duplicate_vid_pid_pairs() -> TestResult {
         // Linear de-dup check — table small enough not to need anything
@@ -688,4 +777,101 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/fingerprint", smoke_family_labels_are_kebab_case);
+
+    // ── probe_from_descriptors directly ───────────────────────
+    // The probe entry point has zero production callers on main
+    // (only the table is wired, via the USB crate's classify);
+    // these smokes pin its logic so the wiring decision stays
+    // separable from the logic. Counter reset at start AND end
+    // so cases never bleed into each other.
+
+    fn make_device_desc(vid: u16, pid: u16) -> [u8; 18] {
+        // USB 2.0 §9.6.1: idVendor @8, idProduct @10, LE.
+        let mut d = [0u8; 18];
+        d[0] = 18;
+        d[1] = 0x01;
+        d[8..10].copy_from_slice(&vid.to_le_bytes());
+        d[10..12].copy_from_slice(&pid.to_le_bytes());
+        d
+    }
+
+    fn make_cfg_desc(num_ifaces: u8) -> [u8; 9] {
+        let mut c = [0u8; 9];
+        c[0] = 9;
+        c[1] = 0x02;
+        c[4] = num_ifaces;
+        c
+    }
+
+    fn smoke_probe_known_reader() -> TestResult {
+        __reset_for_test();
+        let entry =
+            match probe_from_descriptors(&make_device_desc(0x06CB, 0x00BD), &make_cfg_desc(2)) {
+                Some(e) => e,
+                None => {
+                    __reset_for_test();
+                    return TestResult::Fail("known Synaptics reader not probed");
+                }
+            };
+        if entry.family != Family::SynapticsPrometheus {
+            __reset_for_test();
+            return TestResult::Fail("known reader wrong family");
+        }
+        if probed_count() != 1 {
+            __reset_for_test();
+            return TestResult::Fail("probe counter did not increment exactly once");
+        }
+        __reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/fingerprint", smoke_probe_known_reader);
+
+    fn smoke_probe_unknown_reader() -> TestResult {
+        __reset_for_test();
+        if probe_from_descriptors(&make_device_desc(0x1234, 0x5678), &make_cfg_desc(1)).is_some() {
+            __reset_for_test();
+            return TestResult::Fail("unknown VID/PID probed as a reader");
+        }
+        if probed_count() != 0 {
+            __reset_for_test();
+            return TestResult::Fail("probe counter moved on unknown device");
+        }
+        __reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/fingerprint", smoke_probe_unknown_reader);
+
+    fn smoke_probe_rejects_short_device_desc() -> TestResult {
+        __reset_for_test();
+        // Fewer than 12 bytes: no VID/PID fields to read.
+        if probe_from_descriptors(&[0u8; 8], &make_cfg_desc(1)).is_some() {
+            __reset_for_test();
+            return TestResult::Fail("short device descriptor probed");
+        }
+        if probed_count() != 0 {
+            __reset_for_test();
+            return TestResult::Fail("probe counter moved on malformed descriptor");
+        }
+        __reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/fingerprint", smoke_probe_rejects_short_device_desc);
+
+    fn smoke_probe_short_cfg_still_matches() -> TestResult {
+        // A short config header degrades bNumInterfaces to 0
+        // (unwrap_or) rather than failing the match: the VID/PID
+        // decision does not depend on the config header.
+        __reset_for_test();
+        if probe_from_descriptors(&make_device_desc(0x27C6, 0x55B4), &[0u8; 2]).is_none() {
+            __reset_for_test();
+            return TestResult::Fail("short config header blocked a known reader");
+        }
+        if probed_count() != 1 {
+            __reset_for_test();
+            return TestResult::Fail("probe counter wrong on short config header");
+        }
+        __reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/fingerprint", smoke_probe_short_cfg_still_matches);
 }

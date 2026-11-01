@@ -1,10 +1,10 @@
 # amdgpu bring-up: remaining work
 
-Status as of 2026-10-29, based on `main` at `0a0a8c90c` (#1209), plus the
-recovery/GFXOFF/VCN idle changes on `codex/amdgpu-recovery-and-idle`.
+Status as of 2026-10-29, based on `main` at `eb9c6c8a1` (#1236), plus
+RX 9000 idle-power and workload-policy changes on
+`codex/amdgpu-rdna4-idle-power`.
 Evidence below the "Verified on hardware" section comes from code review
-and software tests, including QEMU
-and register/fake-engine models.
+and software tests, including QEMU and register/fake-engine models.
 
 ## Verified on hardware (RX 6750 XT, Navi22, VFIO bench)
 
@@ -45,6 +45,11 @@ Rebuild from the checkout being validated and run
    of idle. VCN must resume without losing sessions or fence progress;
    JPEG must remain usable. Repeat with `amdgpu.rdna2_vcn_dpg=0` and, when
    opted in, `amdgpu.rdna2_vcn_smu_pg=1` for PMFW power messages.
+   On RX 9000, exercise separate and simultaneous VCN5/JPEG5 workloads
+   across idle intervals. Sessions, JPEG copy slots and fence progress must
+   survive resume. Check graphics-idle power while media runs, then repeated
+   render/idle, reset and suspend/resume cycles. Compare against
+   `amdgpu.rdna4_gfxoff=0`; repeat on Navi48 and Navi44.
 
 ## Bare-metal boot
 
@@ -61,8 +66,10 @@ There are already bootloader entries (`/boot/narf-frame-grub`,
   `grub-image --root-policy root-ro` command is in
   [BOOTING_ON_CACHYOS.md](BOOTING_ON_CACHYOS.md#booting-the-installed-root-narfdisksroot-ro--root-rw).
 - **Use wired networking** for SSH: the I225-V and its `igc` driver,
-  which is built by default. The MT7922 Wi-Fi driver has only been
-  tested against models.
+  which is built by default. Its software profile and outstanding physical
+  acceptance checks are in [the networking driver contract](../drivers/net/specification/spec.md#3-public-interface).
+  The host I225-V and MT7922 still require physical NARF validation; model
+  coverage alone does not establish that SSH works on this motherboard.
 
 Not covered by the VFIO bench: the host's own ACPI, interrupt routing,
 IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
@@ -99,12 +106,51 @@ IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
   activation/reset epoch before GC access, closing the enable race. Native
   registration now declares these paths guarded; other policy prerequisites
   still apply. Physical transitions remain unverified.
+- **RX 9000 idle power.** VCN5 and JPEG5 independently drain physical work,
+  stop and power down after idle; begin-use restores their hardware, IRQs,
+  codec context and sequences. The shared media doorbell range stays owned.
+  Fence reads use always-on presence while an island is gated. SMU14/RLC
+  GFXOFF is board-gated, with GC references around runtime register access
+  and fresh controller epochs after reset/suspend. Media traffic alone does
+  not keep GC awake. Failed/cancelled transitions stay closed. Physical
+  transitions remain unverified. After static native proofs, VCN5 DPG runs
+  on both dies; JPEG5 DPG is Navi48-only, while Navi44 keeps static JPEG
+  gating. Board-supported MM_DPM and DS_VCN follow successful DPG setup.
+  Every SRAM restore needs a new physical fence probe before publication.
+  Recovery disables media clock sleep for static re-proof and keeps JPEG
+  JMI reset/power-cycle retirement. `amdgpu.rdna4_media_dpg=0` retains
+  static media idle and disables this media DPM/deep-sleep transition. Cold
+  media setup now reads GC12's
+  segment-relative GB_ADDR_CONFIG at 0x13de; fixtures poison the older offset.
+- **RX 9000 runtime power.** The existing DML UCLK/FCLK convergence now
+  requires acknowledged watermark ranges and a strict clock-constraint replay
+  before relaxation. Runtime refusals or missing hard-min ACKs close the
+  owner. Newer per-die PMFW uses paired active/idle floors; older firmware
+  pins FCLK until the last display retires. `pp_power_profile_mode` exposes
+  factory presets plus custom profile 6, including GFX/FCLK coefficient
+  read/modify/write and compute sleep suppression. Both accepted custom clock
+  values and the selected preset replay on reset/resume. DCC P-state budgets
+  include MRQ metadata rows; live VRR bounds join the search and its cache.
+  Admitted FAMS2 schedules use acknowledged command chains and hardware locks
+  before relaxation. DPMM raises now program actual active clocks within
+  board limits; LFC/MID can retain switching on one native DRR stream or
+  admitted FAMS2 DRR streams through acknowledged MIN/MAX/MID requests. Real
+  flips and idle frame updates borrow the serialized firmware transport;
+  cancellation retains timing and scanout ownership. SubVP now expands one
+  fixed-refresh, unscaled linear RGB primary into a main/phantom pair, reserves
+  board-sized MALL ways and a spare unfused pipe, and sends the typed FAMS2
+  SubVP state before relaxation. Native updates first disable and drain the
+  alias before normal buffer retirement. DRR, visible cursors, DSC,
+  tiling/DCC, scaling and multiple planes/streams retain the pinned fallback. Board-supported GFX_ULV
+  follows native GC proofs; DS_DCFCLK follows a checked DML deep-sleep floor.
+  `amdgpu.rdna4_gfx_ulv=0` and `amdgpu.rdna4_dcf_sleep=0` skip those features.
+  All of these RX 9000 transitions still need physical acceptance.
 - **RX 6000 VCN3 idle power.** After one second of inactivity and physical
   fence completion, idle work releases encode DPG pause, stops VCN and sends
   PowerDownVcn when MM_DPM_PG is enabled. Begin-use restores power/hardware
   while preserving context and fence sequences; JPEG stays independent.
   Cancelled/failed transitions prevent replay. PMFW media gating keeps its
-  existing opt-in. These changes do not add RX 9000 VCN5 idle work.
+  existing opt-in.
 - **Statistics on RX 6000 and RX 9000.** Native primary/render nodes answer
   TIMESTAMP and the supported Linux SENSOR selectors, including all four
   stable/peak GFX/MCLK queries. Measurements use fresh SMU telemetry; P-states
@@ -136,15 +182,33 @@ IOMMU and timers; xHCI keyboard input; NVMe on the real controller.
 
 Validation for statistics, memory, recovery and idle changes: native ioctl,
 MMIO and SMU model regressions cover both families.
-`cargo xtask test --subsystem drivers/gpu` reports 2,661 pass / 0 fail /
-5 skip with `--arch x86_64`, and 2,115 pass / 0 fail / 1 skip with
+The full GPU suites report 2,724 pass / 0 fail /
+5 skip with `--arch x86_64`, and 2,178 pass / 0 fail / 1 skip with
 `--arch aarch64`. Coverage includes sensor/hwmon units and missing data,
 refresh cancellation, timestamp loss, original fence errors across engine
 replacement, GFXOFF activation/cancellation, physical VCN drain and static/DPG
-idle/resume failure paths. Focused reruns cover the final shutdown guard.
-GPU Clippy passes in all three feature contexts on both architectures;
+idle/resume failure paths. RX 9000 idle/DPG regressions cover separate PSP
+SRAM types, per-die JPEG admission, physical restore probes, retained
+sessions/IB slots, board feature masks, full hang recovery, cancellation and
+failed SRAM uploads. Fourteen new runtime-policy regressions cover workload
+masks, compute/display/media ordering, selection replay, per-die clock
+admission, missing/refused ACKs, custom-profile refusal and sysfs dispatch;
+the focused x86 policy run reports 61 pass / 0 fail / 0 skip.
+GPU and framebuffer Clippy pass in all three feature contexts on both architectures;
 `cargo fmt --all -- --check` passes. Production boot-smoke and btrfs
 interoperability checks also pass on both architectures.
+
+For RX 9000 hardware acceptance, repeat separate and simultaneous VCN/JPEG
+workloads with `amdgpu.rdna4_media_dpg=0` and the default policy. Check
+repeated idle/use, GC sleeping during video, lost-device waits and media
+hang recovery, then system/runtime suspend and resume on both dies. Navi44
+must keep JPEG static while VCN uses DPG.
+Also change factory profiles at idle and under graphics/video/compute load;
+check the applied marker and running sleep bits, and verify the selected
+profile survives GPU reset, S3 and runtime resume. Exercise low-bandwidth,
+high-bandwidth, multi-display and no-display configurations, including
+hotplug while clocks can switch. Compare with GFX_ULV and DCF sleep disabled
+independently; capture clocks, underruns and recovery results on both dies.
 
 ## Not amdgpu, but seen during bring-up
 

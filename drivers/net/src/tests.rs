@@ -2090,7 +2090,7 @@ fn smoke_netdev_rx_dispatch_mirror_contract() -> TestResult {
     }
     let build = |pattern: &[u8; 64]| -> Option<narf_net::Frame> {
         let buf = narf_io::alloc_coherent(pattern.len(), narf_lib::id::DomainId::DRIVER_0).ok()?;
-        let mut frame = narf_net::Frame::new(buf, pattern.len() as u32);
+        let mut frame = narf_net::Frame::with_offset_on_queue(buf, 0, pattern.len() as u32, 3);
         frame.payload_mut().copy_from_slice(pattern);
         Some(frame)
     };
@@ -2129,7 +2129,9 @@ fn smoke_netdev_rx_dispatch_mirror_contract() -> TestResult {
         return TestResult::Fail("fixture frame allocation failed (case 2)");
     };
     let mut mirrored2: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    let mut mirrored_queue = None;
     dispatch_rx(&name, &mut frame, true, |mirror| {
+        mirrored_queue = Some(mirror.queue());
         mirrored2.push(alloc::vec::Vec::from(mirror.payload()));
     });
     if FIXTURE_RX_CALLS.load(Ordering::SeqCst) != 2 {
@@ -2140,6 +2142,9 @@ fn smoke_netdev_rx_dispatch_mirror_contract() -> TestResult {
     }
     if mirrored2.len() != 1 {
         return TestResult::Fail("attached dispatch did not mirror exactly once");
+    }
+    if mirrored_queue != Some(3) {
+        return TestResult::Fail("mirror lost hardware queue ownership");
     }
     if mirrored2[0][..] != pattern[..] {
         return TestResult::Fail("ring mirror does not hold the pristine pre-dispatch bytes");

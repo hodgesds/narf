@@ -756,6 +756,66 @@ kernel_test_in!(
     smoke_select_dynamic_fdtable_and_prefix_copy
 );
 
+/// Sparse sets cross the native-word boundary and contain ignored bits above
+/// nfds inside the copied prefix. Each requested ready result bit counts once.
+fn smoke_select_sparse_word_boundary_and_ignored_tail() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task = setup_poll_test();
+    let source = install_ready_file(
+        task,
+        narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT | narf_filesystem::POLL_PRI,
+    );
+    crate::fd::with_table(task, |table| {
+        let entry = table.get(source).unwrap().clone();
+        table.set(63, entry.clone());
+        table.set(64, entry);
+    });
+    let mut read = [0xA5u8; 24];
+    let mut write = read;
+    let mut except = read;
+    for set in [&mut read, &mut write, &mut except] {
+        set[..8].fill(0);
+        set[8..16].fill(0xFF); // fd 64 valid; fds 65..127 must be ignored
+    }
+    read[7] = 0x80; // fd 63
+    write[7] = 0x80;
+    let tv = [0i64, 0];
+    let result = call(
+        Syscall::Select,
+        SyscallArgs {
+            arg0: 65,
+            arg1: read.as_mut_ptr() as u64,
+            arg2: write.as_mut_ptr() as u64,
+            arg3: except.as_mut_ptr() as u64,
+            arg4: tv.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    let mut expected = [0u8; 16];
+    expected[7] = 0x80;
+    expected[8] = 1;
+    let mut expected_except = [0u8; 16];
+    expected_except[8] = 1;
+    if result.value != 5
+        || read[..16] != expected
+        || write[..16] != expected
+        || except[..16] != expected_except
+        || [read, write, except]
+            .iter()
+            .any(|set| set[16..] != [0xA5; 8])
+    {
+        return TestResult::Fail(
+            "sparse select lost a boundary bit, counted ignored tail, or overwrote prefix tail",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/select",
+    smoke_select_sparse_word_boundary_and_ignored_tail
+);
+
 /// A fresh Linux fdtable has max_fds=64: bits beyond that snapshot are not
 /// read or cleared, and nfds is a C int whose high 32 bits are discarded.
 fn smoke_select_initial_clamp_and_int_truncation() -> TestResult {

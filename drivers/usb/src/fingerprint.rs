@@ -9,6 +9,10 @@
 //!   Synaptics-Validity, and ELAN drivers; consulted as a public index
 //!   only (no codec internals imported).
 //!   <https://gitlab.freedesktop.org/libfprint/libfprint/-/tree/master/libfprint/drivers>
+//!   The table itself lives in exactly one place —
+//!   `narf_drivers_fingerprint::FINGERPRINT_DEVICES` (issue #918) —
+//!   and `classify_vid_pid` below only maps its families to the
+//!   transport vendor. There is no second table here to drift.
 //! - **Linux `drivers/hid/hid-ids.h`** — vendor/product IDs for cross-
 //!   reference. GPL-2.0-or-later; permitted since NARF relicense 2026-05-20.
 //!
@@ -24,8 +28,8 @@
 //!
 //! 1. Recognise the device by VID/PID (vendor class 0xFF bypasses the WBDI
 //!    cascade for devices that don't advertise MS OS 2.0 descriptors).
-//! 2. Discover the bulk-IN + bulk-OUT endpoints (Synaptics, Goodix) or
-//!    interrupt-IN endpoint (ELAN).
+//! 2. Discover the bulk-IN + bulk-OUT endpoints (Synaptics, Goodix,
+//!    Validity) or interrupt-IN endpoint (ELAN).
 //! 3. Configure those endpoints on the xHC.
 //! 4. Register a `/dev/fp0` character device in DevFs so a userspace
 //!    daemon (fprintd) can open it and drive the vendor protocol.
@@ -47,7 +51,8 @@ use crate::xhci::{EndpointConfig, EndpointKind, Xhci};
 /// Standard USB SET_CONFIGURATION request (USB 2.0 §9.4.7).
 const STD_REQ_SET_CONFIGURATION: u8 = 0x09;
 
-/// Fingerprint reader vendor family.
+/// Fingerprint reader vendor family — the transport selector for
+/// the bind path (bulk pair vs interrupt-IN).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FpVendor {
     /// Synaptics (formerly Validity Sensors). Bulk-IN + bulk-OUT.
@@ -56,43 +61,36 @@ pub enum FpVendor {
     Goodix,
     /// ELAN Microelectronics. Interrupt-IN only.
     Elan,
+    /// Validity (VID 0x138A, pre-merger silicon still shipped
+    /// under the Validity VID). Bulk-IN + bulk-OUT: the live
+    /// module's non-ELAN bulk rule covers it, and endpoint
+    /// discovery is blob-driven — a Validity device exposing no
+    /// bulk pair fails with `EndpointsMissing` and falls through
+    /// the cascade rather than mis-binding.
+    Validity,
 }
 
-/// (VID, PID, vendor) table.
+/// Look up a (VID, PID) pair in the single match authority and
+/// map its family to the transport vendor.
 ///
-/// Sources:
-///   - Synaptics: `libfprint/drivers/synaptics/synaptics.c` VID/PID list
-///   - Goodix:    `libfprint/drivers/goodixmoc/goodix.c` VID/PID list
-///   - ELAN:      `libfprint/drivers/elanmoc/elanmoc.c` VID/PID list
-const USB_ID_TABLE: &[(u16, u16, FpVendor)] = &[
-    // Synaptics / Validity
-    (0x06CB, 0x00BD, FpVendor::Synaptics),
-    (0x06CB, 0x00C2, FpVendor::Synaptics),
-    (0x06CB, 0x00C6, FpVendor::Synaptics),
-    (0x06CB, 0x00C9, FpVendor::Synaptics),
-    (0x06CB, 0x00DC, FpVendor::Synaptics),
-    (0x06CB, 0x00FF, FpVendor::Synaptics),
-    // Goodix
-    (0x27C6, 0x5110, FpVendor::Goodix),
-    (0x27C6, 0x5117, FpVendor::Goodix),
-    (0x27C6, 0x530C, FpVendor::Goodix),
-    (0x27C6, 0x533C, FpVendor::Goodix),
-    (0x27C6, 0x5395, FpVendor::Goodix),
-    (0x27C6, 0x55B4, FpVendor::Goodix),
-    (0x27C6, 0x6594, FpVendor::Goodix),
-    // ELAN
-    (0x04F3, 0x0903, FpVendor::Elan),
-    (0x04F3, 0x0907, FpVendor::Elan),
-    (0x04F3, 0x0C00, FpVendor::Elan),
-    (0x04F3, 0x0C03, FpVendor::Elan),
-];
-
-/// Look up a (VID, PID) pair in the table. Returns the vendor on hit.
+/// SINGLE MATCH AUTHORITY (issue #918): the table lives in
+/// `narf_drivers_fingerprint::FINGERPRINT_DEVICES` (31 entries:
+/// the scaffold table union the pre-#918 USB table). This
+/// function owns no table of its own — the pre-#918 tree kept a
+/// second 17-entry table here that drifted from the scaffold's
+/// 22, agreeing on only 8 of the union and leaving the whole
+/// Validity family unbindable. Deleting the second table makes
+/// drift structurally impossible: every consumer reads the one
+/// table, and `smoke_fp_classify_matches_authority_table` pins
+/// the family→vendor mapping for all 31 entries.
 pub fn classify_vid_pid(vid: u16, pid: u16) -> Option<FpVendor> {
-    USB_ID_TABLE
-        .iter()
-        .find(|&&(v, p, _)| v == vid && p == pid)
-        .map(|&(_, _, vendor)| vendor)
+    use narf_drivers_fingerprint::Family;
+    narf_drivers_fingerprint::match_vid_pid(vid, pid).map(|d| match d.family {
+        Family::SynapticsPrometheus | Family::SynapticsMisOlder => FpVendor::Synaptics,
+        Family::Goodix => FpVendor::Goodix,
+        Family::Elan => FpVendor::Elan,
+        Family::Validity => FpVendor::Validity,
+    })
 }
 
 // ── Endpoint discovery ────────────────────────────────────────────────
@@ -111,10 +109,10 @@ pub enum FpError {
 }
 
 /// Endpoints for a fingerprint device. ELAN uses interrupt-IN;
-/// Synaptics and Goodix use bulk-IN + bulk-OUT.
+/// Synaptics, Goodix, and Validity use bulk-IN + bulk-OUT.
 #[derive(Copy, Clone, Debug)]
 pub enum FpEndpoints {
-    /// bulk-IN / bulk-OUT pair (Synaptics, Goodix).
+    /// bulk-IN / bulk-OUT pair (Synaptics, Goodix, Validity).
     Bulk {
         bulk_in: EndpointConfig,
         bulk_out: EndpointConfig,
@@ -133,7 +131,7 @@ pub enum FpEndpoints {
 /// Walk a Configuration Descriptor for the first vendor-class (0xFF)
 /// interface and resolve endpoints appropriate for `vendor`.
 ///
-/// - Synaptics / Goodix: require bulk-IN + bulk-OUT.
+/// - Synaptics / Goodix / Validity: require bulk-IN + bulk-OUT.
 /// - ELAN: require interrupt-IN (may also have bulk pair; we take
 ///   interrupt-IN because that is the polling path libfprint uses).
 pub fn find_fp_endpoints(cfg: &[u8], vendor: FpVendor) -> Result<FpEndpoints, FpError> {
@@ -217,7 +215,7 @@ pub fn find_fp_endpoints(cfg: &[u8], vendor: FpVendor) -> Result<FpEndpoints, Fp
                 config_value,
             })
         }
-        FpVendor::Synaptics | FpVendor::Goodix => {
+        FpVendor::Synaptics | FpVendor::Goodix | FpVendor::Validity => {
             let bi = bulk_in.ok_or(FpError::EndpointsMissing)?;
             let bo = bulk_out.ok_or(FpError::EndpointsMissing)?;
             Ok(FpEndpoints::Bulk {
@@ -244,9 +242,9 @@ fn ep_dci(ep_addr: u8, is_in: bool) -> u8 {
 pub struct FingerprintDevice {
     pub slot_id: u8,
     pub vendor: FpVendor,
-    /// DCI of bulk-IN (Synaptics/Goodix) or interrupt-IN (ELAN).
+    /// DCI of bulk-IN (Synaptics/Goodix/Validity) or interrupt-IN (ELAN).
     pub bulk_in_ep: u8,
-    /// DCI of bulk-OUT (Synaptics/Goodix). 0 for ELAN (no bulk-OUT).
+    /// DCI of bulk-OUT (Synaptics/Goodix/Validity). 0 for ELAN (no bulk-OUT).
     pub bulk_out_ep: u8,
     /// Max packet size of the primary IN endpoint.
     in_max_packet: u16,
@@ -275,8 +273,8 @@ impl FingerprintDevice {
     /// interrupt-IN). Returns the byte count written into `buf`.
     ///
     /// For ELAN (interrupt-IN) this arms the endpoint on the first
-    /// call and thereafter polls it. For Goodix / Synaptics
-    /// (bulk-IN) it issues a bulk transfer directly.
+    /// call and thereafter polls it. For Goodix / Synaptics /
+    /// Validity (bulk-IN) it issues a bulk transfer directly.
     ///
     /// Caller must hold an `Arc<Xhci>` — call from async context or
     /// via `narf_scheduler::block_on`.
@@ -309,7 +307,7 @@ impl FingerprintDevice {
                     }
                 }
             }
-            FpVendor::Synaptics | FpVendor::Goodix => xhci
+            FpVendor::Synaptics | FpVendor::Goodix | FpVendor::Validity => xhci
                 .bulk_in(self.slot_id, self.bulk_in_ep, buf)
                 .await
                 .map_err(|_| FpError::EndpointConfig),
@@ -505,6 +503,7 @@ pub async fn try_bind_fingerprint_already_addressed(
             FpVendor::Synaptics => "Synaptics",
             FpVendor::Goodix => "Goodix",
             FpVendor::Elan => "ELAN",
+            FpVendor::Validity => "Validity",
         };
         let _ = writeln!(
             narf_console::Writer,
@@ -554,6 +553,8 @@ mod tests {
     fn classify_vid_pid_synaptics() {
         assert_eq!(classify_vid_pid(0x06CB, 0x00BD), Some(FpVendor::Synaptics));
         assert_eq!(classify_vid_pid(0x06CB, 0x00FF), Some(FpVendor::Synaptics));
+        // Scaffold-only entry (was never in the old live table).
+        assert_eq!(classify_vid_pid(0x06CB, 0x00BE), Some(FpVendor::Synaptics));
     }
 
     #[test]
@@ -561,12 +562,31 @@ mod tests {
         assert_eq!(classify_vid_pid(0x27C6, 0x5110), Some(FpVendor::Goodix));
         assert_eq!(classify_vid_pid(0x27C6, 0x55B4), Some(FpVendor::Goodix));
         assert_eq!(classify_vid_pid(0x27C6, 0x6594), Some(FpVendor::Goodix));
+        // Scaffold-only entry (was never in the old live table).
+        assert_eq!(classify_vid_pid(0x27C6, 0x609C), Some(FpVendor::Goodix));
     }
 
     #[test]
     fn classify_vid_pid_elan() {
         assert_eq!(classify_vid_pid(0x04F3, 0x0903), Some(FpVendor::Elan));
         assert_eq!(classify_vid_pid(0x04F3, 0x0C03), Some(FpVendor::Elan));
+        // Scaffold-only entry (was never in the old live table).
+        assert_eq!(classify_vid_pid(0x04F3, 0x0C42), Some(FpVendor::Elan));
+    }
+
+    #[test]
+    fn classify_vid_pid_validity() {
+        // #918: the whole Validity family was absent from the old
+        // live table, so these fell through the cascade to
+        // UnknownClass. They now classify.
+        assert_eq!(classify_vid_pid(0x138A, 0x0007), Some(FpVendor::Validity));
+        assert_eq!(classify_vid_pid(0x138A, 0x0011), Some(FpVendor::Validity));
+        assert_eq!(classify_vid_pid(0x138A, 0x0090), Some(FpVendor::Validity));
+        assert_eq!(classify_vid_pid(0x138A, 0x0091), Some(FpVendor::Validity));
+        assert_eq!(classify_vid_pid(0x138A, 0x0097), Some(FpVendor::Validity));
+        assert_eq!(classify_vid_pid(0x138A, 0x00A2), Some(FpVendor::Validity));
+        // Validity VID but wrong PID still falls through.
+        assert_eq!(classify_vid_pid(0x138A, 0x0001), None);
     }
 
     #[test]
@@ -577,10 +597,17 @@ mod tests {
     }
 
     // ── Vendor classifier ──────────────────────────────────────────
+    //
+    // These lists are the full #918 union per transport vendor:
+    // Synaptics = Prometheus + MIS-older + live carryover,
+    // Goodix = scaffold + live carryover, ELAN = scaffold + live
+    // carryover, Validity = scaffold only.
 
     #[test]
     fn vendor_covers_all_synaptics_pids() {
-        let synaptics_pids = [0x00BD, 0x00C2, 0x00C6, 0x00C9, 0x00DC, 0x00FF];
+        let synaptics_pids = [
+            0x00BD, 0x00BE, 0x00BF, 0x00C2, 0x00C9, 0x00A2, 0x00B7, 0x00C6, 0x00DC, 0x00FF,
+        ];
         for pid in synaptics_pids {
             assert_eq!(
                 classify_vid_pid(0x06CB, pid),
@@ -592,7 +619,9 @@ mod tests {
 
     #[test]
     fn vendor_covers_all_goodix_pids() {
-        let goodix_pids = [0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4, 0x6594];
+        let goodix_pids = [
+            0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4, 0x6594, 0x609C, 0x6584,
+        ];
         for pid in goodix_pids {
             assert_eq!(
                 classify_vid_pid(0x27C6, pid),
@@ -604,12 +633,24 @@ mod tests {
 
     #[test]
     fn vendor_covers_all_elan_pids() {
-        let elan_pids = [0x0903, 0x0907, 0x0C00, 0x0C03];
+        let elan_pids = [0x0903, 0x0907, 0x0C00, 0x0C03, 0x0C32, 0x0C42];
         for pid in elan_pids {
             assert_eq!(
                 classify_vid_pid(0x04F3, pid),
                 Some(FpVendor::Elan),
                 "ELAN PID 0x{pid:04x} not in table"
+            );
+        }
+    }
+
+    #[test]
+    fn vendor_covers_all_validity_pids() {
+        let validity_pids = [0x0007, 0x0011, 0x0090, 0x0091, 0x0097, 0x00A2];
+        for pid in validity_pids {
+            assert_eq!(
+                classify_vid_pid(0x138A, pid),
+                Some(FpVendor::Validity),
+                "Validity PID 0x{pid:04x} not in table"
             );
         }
     }
@@ -716,6 +757,44 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_discovery_bulk_validity() {
+        // #918: a Validity reader (VFS5011-class blob: vendor
+        // class + bulk pair) resolves to the bulk arm, the same
+        // transport Synaptics/Goodix use.
+        let cfg = make_cfg_bulk(0xFF);
+        let eps = find_fp_endpoints(&cfg, FpVendor::Validity).expect("should find bulk pair");
+        match eps {
+            FpEndpoints::Bulk {
+                bulk_in,
+                bulk_out,
+                interface,
+                ..
+            } => {
+                assert_eq!(bulk_in.ep_addr, 0x81);
+                assert_eq!(bulk_in.kind, EndpointKind::BulkIn);
+                assert_eq!(bulk_out.ep_addr, 0x01);
+                assert_eq!(bulk_out.kind, EndpointKind::BulkOut);
+                assert_eq!(interface, 0);
+            }
+            _ => panic!("expected Bulk endpoints for Validity"),
+        }
+    }
+
+    #[test]
+    fn endpoint_discovery_validity_without_bulk_pair_fails() {
+        // Masking defeat: the bulk mapping must not hallucinate
+        // endpoints. A Validity device exposing only interrupt-IN
+        // fails discovery (the cascade then falls through, exactly
+        // as an unclassifiable device does) instead of binding
+        // with a bogus bulk pair.
+        let cfg = make_cfg_intr(0xFF);
+        assert!(matches!(
+            find_fp_endpoints(&cfg, FpVendor::Validity),
+            Err(FpError::EndpointsMissing)
+        ));
+    }
+
+    #[test]
     fn endpoint_discovery_no_vendor_iface() {
         // HID class (0x03) interface — should not match.
         let cfg = make_cfg_bulk(0x03);
@@ -740,5 +819,294 @@ mod tests {
     fn command_write_requires_the_full_transfer() {
         assert_eq!(require_full_transfer(64, 64), Ok(()));
         assert_eq!(require_full_transfer(63, 64), Err(FpError::EndpointConfig));
+    }
+
+    // ── Endpoint-discovery masking defeats ────────────────────
+    // The walk clears endpoints accumulated for a prior interface
+    // when a new matching interface appears; these cases pin that
+    // the resolved pair always belongs to the LAST matching
+    // interface, never to an earlier HID or vendor interface.
+
+    fn make_cfg_composite() -> alloc::vec::Vec<u8> {
+        // Config (9) + HID iface (9) + intr endpoint (7)
+        // + vendor iface (9) + bulk-IN (7) + bulk-OUT (7) = 48.
+        let mut v = alloc::vec![0u8; 48];
+        v[0] = 9;
+        v[1] = 0x02;
+        v[2] = 48;
+        v[4] = 2;
+        v[5] = 1;
+        // HID iface 0, class 0x03, with an interrupt-IN endpoint.
+        v[9] = 9;
+        v[10] = 0x04;
+        v[11] = 0;
+        v[13] = 1;
+        v[14] = 0x03;
+        v[18] = 7;
+        v[19] = 0x05;
+        v[20] = 0x82;
+        v[21] = 0x03;
+        v[22] = 0x40;
+        v[23] = 0x00;
+        // Vendor iface 1, class 0xFF, bulk pair 0x81 / 0x02.
+        v[25] = 9;
+        v[26] = 0x04;
+        v[27] = 1;
+        v[29] = 2;
+        v[30] = 0xFF;
+        v[34] = 7;
+        v[35] = 0x05;
+        v[36] = 0x81;
+        v[37] = 0x02;
+        v[38] = 0x00;
+        v[39] = 0x02;
+        v[41] = 7;
+        v[42] = 0x05;
+        v[43] = 0x02;
+        v[44] = 0x02;
+        v[45] = 0x00;
+        v[46] = 0x02;
+        v
+    }
+
+    fn make_cfg_two_vendor_ifaces() -> alloc::vec::Vec<u8> {
+        // Config (9) + vendor iface 0 (9) + bulk pair (14)
+        // + vendor iface 1 (9) + bulk pair (14) = 55.
+        let mut v = alloc::vec![0u8; 55];
+        v[0] = 9;
+        v[1] = 0x02;
+        v[2] = 55;
+        v[4] = 2;
+        v[5] = 1;
+        // Vendor iface 0, bulk 0x81 / 0x01.
+        v[9] = 9;
+        v[10] = 0x04;
+        v[11] = 0;
+        v[13] = 2;
+        v[14] = 0xFF;
+        v[18] = 7;
+        v[19] = 0x05;
+        v[20] = 0x81;
+        v[21] = 0x02;
+        v[22] = 0x00;
+        v[23] = 0x02;
+        v[25] = 7;
+        v[26] = 0x05;
+        v[27] = 0x01;
+        v[28] = 0x02;
+        v[29] = 0x00;
+        v[30] = 0x02;
+        // Vendor iface 1, bulk 0x83 / 0x03.
+        v[32] = 9;
+        v[33] = 0x04;
+        v[34] = 1;
+        v[36] = 2;
+        v[37] = 0xFF;
+        v[41] = 7;
+        v[42] = 0x05;
+        v[43] = 0x83;
+        v[44] = 0x02;
+        v[45] = 0x00;
+        v[46] = 0x02;
+        v[48] = 7;
+        v[49] = 0x05;
+        v[50] = 0x03;
+        v[51] = 0x02;
+        v[52] = 0x00;
+        v[53] = 0x02;
+        v
+    }
+
+    #[test]
+    fn endpoint_discovery_hid_first_then_vendor() {
+        // The HID interface's interrupt endpoint must not leak
+        // into the vendor interface's resolution.
+        let cfg = make_cfg_composite();
+        let eps = find_fp_endpoints(&cfg, FpVendor::Goodix).expect("vendor pair");
+        match eps {
+            FpEndpoints::Bulk {
+                bulk_in, bulk_out, ..
+            } => {
+                assert_eq!(bulk_in.ep_addr, 0x81);
+                assert_eq!(bulk_out.ep_addr, 0x02);
+            }
+            _ => panic!("expected Bulk endpoints"),
+        }
+        // ELAN on the same blob: the HID interrupt endpoint is on
+        // a non-matching interface, so ELAN finds nothing.
+        assert!(matches!(
+            find_fp_endpoints(&cfg, FpVendor::Elan),
+            Err(FpError::EndpointsMissing)
+        ));
+    }
+
+    #[test]
+    fn endpoint_discovery_second_vendor_iface_wins() {
+        // The second matching interface clears the first pair.
+        let cfg = make_cfg_two_vendor_ifaces();
+        let eps = find_fp_endpoints(&cfg, FpVendor::Goodix).expect("vendor pair");
+        match eps {
+            FpEndpoints::Bulk {
+                bulk_in,
+                bulk_out,
+                interface,
+                ..
+            } => {
+                assert_eq!(bulk_in.ep_addr, 0x83);
+                assert_eq!(bulk_out.ep_addr, 0x03);
+                // Interface number stays the first matching one;
+                // only the endpoints reset.
+                assert_eq!(interface, 0);
+            }
+            _ => panic!("expected Bulk endpoints"),
+        }
+    }
+
+    #[test]
+    fn endpoint_discovery_second_iface_intr_only_fails_bulk() {
+        // Vendor iface 0 (bulk pair) then vendor iface 1
+        // (interrupt-IN only): the clear discards pair A, and
+        // Synaptics still needs bulk, so this must fail — not
+        // silently resolve pair A.
+        let mut cfg = make_cfg_bulk(0xFF);
+        // Append a second vendor interface with only interrupt-IN.
+        cfg.extend_from_slice(&[
+            9, 0x04, 1, 0, 1, 0xFF, 0, 0, 0, // iface 1, vendor
+            7, 0x05, 0x81, 0x03, 0x40, 0x00, 0, // intr-IN
+        ]);
+        assert!(matches!(
+            find_fp_endpoints(&cfg, FpVendor::Synaptics),
+            Err(FpError::EndpointsMissing)
+        ));
+        // ELAN on the same blob resolves the second iface's intr.
+        let eps = find_fp_endpoints(&cfg, FpVendor::Elan).expect("intr");
+        match eps {
+            FpEndpoints::InterruptIn { intr_in, .. } => {
+                assert_eq!(intr_in.ep_addr, 0x81);
+            }
+            _ => panic!("expected InterruptIn endpoints"),
+        }
+    }
+
+    #[test]
+    fn endpoint_discovery_elan_prefers_interrupt_over_bulk() {
+        // One vendor iface carrying both a bulk pair and an
+        // interrupt-IN endpoint: ELAN takes interrupt-IN.
+        let mut cfg = make_cfg_bulk(0xFF);
+        cfg.extend_from_slice(&[7, 0x05, 0x82, 0x03, 0x40, 0x00, 0]);
+        let eps = find_fp_endpoints(&cfg, FpVendor::Elan).expect("intr");
+        match eps {
+            FpEndpoints::InterruptIn { intr_in, .. } => {
+                assert_eq!(intr_in.ep_addr, 0x82);
+                assert_eq!(intr_in.kind, EndpointKind::InterruptIn);
+            }
+            _ => panic!("expected InterruptIn endpoints"),
+        }
+    }
+
+    #[test]
+    fn endpoint_discovery_truncated_descriptor_no_panic() {
+        // Endpoint descriptor header claims 7 bytes but only 3
+        // remain: the walk breaks, it must not panic or over-read.
+        let mut cfg = make_cfg_bulk(0xFF);
+        cfg.truncate(28); // cuts inside the bulk-OUT descriptor
+        assert!(matches!(
+            find_fp_endpoints(&cfg, FpVendor::Goodix),
+            Err(FpError::EndpointsMissing)
+        ));
+    }
+
+    #[test]
+    fn endpoint_discovery_rejects_non_config() {
+        // First descriptor is not a Configuration descriptor.
+        let mut cfg = make_cfg_bulk(0xFF);
+        cfg[1] = 0x04;
+        assert!(matches!(
+            find_fp_endpoints(&cfg, FpVendor::Goodix),
+            Err(FpError::NotFingerprint)
+        ));
+        // Shorter than a config header.
+        assert!(matches!(
+            find_fp_endpoints(&[9, 0x02], FpVendor::Goodix),
+            Err(FpError::NotFingerprint)
+        ));
+    }
+
+    // ── DCI encoding pins (xHCI §4.8.1) ──────────────────────
+
+    #[test]
+    fn dci_encoding_pins() {
+        assert_eq!(ep_dci(0x81, true), 3);
+        assert_eq!(ep_dci(0x01, false), 2);
+        assert_eq!(ep_dci(0x02, false), 4);
+        assert_eq!(ep_dci(0x8F, true), 31);
+        assert_eq!(ep_dci(0x0F, false), 30);
+    }
+
+    // ── FpFileNode pure surface ───────────────────────────────
+    // stat/ino need no controller; read/write without a bound
+    // controller must fail closed (Io), never panic. Transfer
+    // conversations themselves need a transport seam (PR #1238's
+    // FpTransport) and are NOT simulated here — see the PR body.
+
+    fn make_test_device(slot_id: u8) -> Arc<FingerprintDevice> {
+        Arc::new(FingerprintDevice {
+            slot_id,
+            vendor: FpVendor::Goodix,
+            bulk_in_ep: 3,
+            bulk_out_ep: 2,
+            in_max_packet: 512,
+            armed: AtomicBool::new(false),
+        })
+    }
+
+    #[test]
+    fn fp_node_stat_and_ino() {
+        use narf_filesystem::{FileType, Mode};
+        let node = FpFileNode {
+            dev: make_test_device(0),
+        };
+        let stat = node.stat();
+        assert_eq!(
+            stat.mode,
+            Mode {
+                file_type: FileType::Special,
+                perms: 0o660,
+            }
+        );
+        assert_eq!(node.ino(), 0xf9_0001);
+        let node1 = FpFileNode {
+            dev: make_test_device(1),
+        };
+        assert_eq!(node1.ino(), 0xf9_0002);
+    }
+
+    struct NoopWaker;
+    impl core::task::Wake for NoopWaker {
+        fn wake(self: Arc<Self>) {}
+        fn wake_by_ref(self: &Arc<Self>) {}
+    }
+
+    #[test]
+    fn fp_node_io_without_controller_fails_closed() {
+        use core::task::{Context, Poll, Waker};
+        // No host test binds a controller, so the global
+        // controller() is None and both directions fail with Io.
+        let node = FpFileNode {
+            dev: make_test_device(0),
+        };
+        let waker = Waker::from(Arc::new(NoopWaker));
+        let mut cx = Context::from_waker(&waker);
+        let mut buf = [0u8; 64];
+        let mut read_fut = node.read(0, &mut buf);
+        assert!(matches!(
+            read_fut.as_mut().poll(&mut cx),
+            Poll::Ready(Err(narf_filesystem::FsError::Io(_)))
+        ));
+        let mut write_fut = node.write(0, b"cmd");
+        assert!(matches!(
+            write_fut.as_mut().poll(&mut cx),
+            Poll::Ready(Err(narf_filesystem::FsError::Io(_)))
+        ));
     }
 }

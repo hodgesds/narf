@@ -160,6 +160,16 @@ also consult upstream Linux GPL sources.
   opening a fresh idle window — a suspended port gates the very
   interrupt endpoint the pump polls, so the resume has to come
   from the supervisor side of the pump, not from report traffic.
+- Fingerprint matching has a single authority (issue #918):
+  `narf_drivers_fingerprint::FINGERPRINT_DEVICES` (31 entries: the
+  scaffold table union the pre-#918 USB table). The USB binder owns
+  no table of its own; `fingerprint::classify_vid_pid` maps the
+  authority's `Family` to the transport vendor (`FpVendor`:
+  Synaptics/Goodix/Validity → bulk-IN + bulk-OUT, ELAN →
+  interrupt-IN), and `fingerprint::find_fp_endpoints` resolves
+  endpoints from the configuration blob. A device whose blob lacks
+  its vendor's endpoints fails with `EndpointsMissing` and falls
+  through the attach cascade; it never binds with a bogus pair.
 - `Xhci::address_device_with(..., Topology)` retains the topology for later
   Evaluate Context operations; marking a downstream device as a hub must not
   erase its route string or parent-TT fields.
@@ -316,11 +326,18 @@ also consult upstream Linux GPL sources.
   binding wholesale (`attach::detach_all_bindings`) and re-enumeration
   follows; on that path the pumped classes are cleared from their
   registries and every MSC device is removed and unpublished
-  (`msc::unbind_all_msc`). On the per-slot detach path, classes the
-  supervisor does not pump (MSC / UAC / UVC / CDC-NCM / btusb / CCID)
-  get the slot disable + reclaim but no class-registry removal yet;
+  (`msc::unbind_all_msc`), every CDC-NCM / r8152 binding is
+  tombstoned and its net iface unregistered
+  (`cdc_ncm::detach_all_ncm`, `r8152::detach_all_r8152`), and
+  every UVC binding is dropped and its video node unregistered
+  (`uvc::detach_all_uvc`). On the per-slot detach path, classes
+  the supervisor does not pump (MSC / UAC / btusb / CCID) get
+  the slot disable + reclaim but no class-registry removal yet;
   the remaining non-pumped classes keep their registries across
-  recovery as well.
+  recovery as well. CDC-NCM and r8152 are not in that set: their
+  unbind hooks run on the per-slot path via `dispatch_unbind`
+  (see below). UVC is not in that set either: its unbind hook
+  runs on the per-slot path via `dispatch_unbind` (see below).
 - `find_video_streaming_endpoints(config)` returns each UVC bulk/isochronous IN
   endpoint with its owning interface and alternate setting.
   `select_video_streaming_iso_endpoint(endpoints, payload)` chooses the smallest
@@ -386,6 +403,42 @@ also consult upstream Linux GPL sources.
   `register_tty_usb`: it removes the port from the ttyUSB node table and
   withdraws the `/sys/class/tty/ttyUSB<N>` kobject. Indices are not
   recycled; a replugged adapter republishes under a fresh index.
+- `cdc_ncm::detach_ncm_slot(slot_id)` and
+  `r8152::detach_r8152_slot(slot_id)` are the USB-Ethernet
+  publication teardowns — tombstone every record bound to the slot
+  (pump-stop flag set first, so a running pump exits on its own;
+  the NCM pump additionally checks the tombstone at its loop top)
+  and unregister each record's net iface via
+  `narf_net::iface::unregister(name)`. Records are never removed:
+  net-registry TX cookies are record indices, so removal would
+  retarget every later device's cookie at the wrong device
+  (the ECM rule); TX/RX on a tombstoned index fail closed
+  (`NotNcm` / `None`). Both are registered as class-registry
+  unbind hooks (`register_class_driver_with_unbind`) and reached
+  via `dispatch_unbind` on the supervisor's detach path; NCM
+  binding stays in the attach cascade and r8152 binding stays in
+  its class-registry probe, and both probes decline nothing they
+  previously accepted. `cdc_ncm::detach_all_ncm()` and
+  `r8152::detach_all_r8152()` are the wholesale variants for
+  controller-recovery teardown. Indices are not recycled; a
+  replugged adapter republishes under a fresh index.
+- `uvc::detach_uvc(slot_id)` is UVC's publication teardown — drop
+  every `UVC_DEVICES` entry bound to the slot (capture-stop flag
+  set first, so a running pump exits on its own) and unregister
+  each entry's `/dev/video<N>` node via
+  `video::devfs_bridge::unregister_video(index)`, which removes the
+  node from the video registry by its `index` field, never by vector
+  position, so no other node's minor is renumbered. It is registered
+  as a class-registry unbind hook
+  (`register_class_driver_with_unbind`, video class triple) and
+  reached via `dispatch_unbind` on the supervisor's detach path; UVC
+  binding itself stays in the attach cascade, and the registry probe
+  always declines. `uvc::detach_all_uvc()` is the wholesale variant
+  for controller-recovery teardown. Indices are not recycled; a
+  replugged camera republishes under a fresh index. Known remainder:
+  the `/sys/class/video4linux/video<N>` kobject has no in-tree
+  removal API, so it lingers after detach; the live paths (devfs
+  node, registry) are the ones withdrawn.
 - `serial::port` is the bind + transfer layer for vendor USB-serial
   adapters (FTDI, Silicon Labs CP210x, Prolific PL2303, WCH CH341 —
   dispatched by exact VID/PID via `serial::identify`, which no other
@@ -490,6 +543,7 @@ also consult upstream Linux GPL sources.
 |---|---|---|---|
 | `05e3:0610` | Genesys Logic USB 2.0 hub | Hub class enumeration, multiple-TT flag, TT think-time propagation, downstream route addressing | Boot on the target xHCI controller and enumerate every downstream port |
 | `27c6:6594` | Goodix USB2.0 MISC fingerprint reader | Explicit Goodix match, vendor-class bulk-IN/bulk-OUT transport, `/dev/fp0` handoff | Userspace Goodix MOC enrol/match protocol |
+| `138a:0011` | Validity VFS5011 fingerprint reader | Explicit Validity match (single authority table, #918), vendor-class bulk-IN/bulk-OUT transport, `/dev/fp0` handoff | Userspace Validity enrol/match protocol; silicon validation on a VFS5011-fitted machine |
 | `10ab:9309` | USI/Qualcomm WCN6855 Bluetooth | Explicit WCN6855 quirk match, runtime version/status query, rampatch + board-NVM USB download, full mandatory HCI bring-up, ready-controller registration, and `hci<N>` sysfs publication | Production-sign the imported firmware and validate the full sequence on silicon |
 | `8087:0032` | Intel AX210 Bluetooth (Renoir target) | Explicit Intel quirk match, version-TLV + boot-params read, `.sfi` secure-send download + Intel Reset boot + `.ddc` config, full mandatory HCI bring-up, ready-controller registration, `hci<N>` sysfs publication, HCI pump | Stage the `intel/ibt-*` blobs and validate the full sequence on silicon |
 | `0e8d:7922` | MediaTek MT7922 Bluetooth (Phoenix target) | Explicit MediaTek quirk match, WMT 79xx RAM-code download (section probe + flagged chunks), full mandatory HCI bring-up, ready-controller registration, `hci<N>` sysfs publication, HCI pump | Stage the `mediatek/BT_RAM_CODE_MT7922_*` blob and validate the full sequence on silicon |

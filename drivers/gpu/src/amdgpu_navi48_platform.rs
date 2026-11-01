@@ -18,12 +18,67 @@ mod client_shaders;
 mod fault_recovery;
 #[path = "amdgpu_navi48_gang.rs"]
 mod gangs;
+#[path = "amdgpu_navi48_idle.rs"]
+mod idle;
 #[path = "amdgpu_navi48_platform_media.rs"]
 mod media_clients;
 #[path = "amdgpu_navi48_suspend_transition.rs"]
 mod suspend_transition;
 #[path = "amdgpu_navi48_platform_transfer.rs"]
 mod transfer;
+pub(crate) fn media_idle_reader(jpeg: bool) -> bool {
+    idle::reader(jpeg)
+}
+pub(crate) fn set_media_idle_reader(jpeg: bool, gated: bool) {
+    let _generation = READ_GENERATION.lock();
+    idle::set_reader(jpeg, gated);
+}
+
+pub(crate) async fn gc_owner() -> Result<
+    (
+        crate::amdgpu_navi48_gfxoff::Reference,
+        narf_lib::mutex::MutexGuard<'static, Option<alloc::boxed::Box<boot::ColdBoot>>>,
+    ),
+    narf_filesystem::FsError,
+> {
+    loop {
+        let gc = crate::amdgpu_navi48_gfxoff::Reference::acquire()
+            .await
+            .map_err(|_| {
+                crate::amdgpu_navi48_interrupts::lose();
+                narf_filesystem::FsError::NoDevice
+            })?;
+        let owner = OWNER.lock().await;
+        if gc.covers_access() {
+            return Ok((gc, owner));
+        }
+        drop(owner);
+        drop(gc);
+    }
+}
+pub(crate) async fn enable_gfxoff(epoch: u64) -> Result<bool, boot::Error> {
+    let mut owner = OWNER.lock().await;
+    if crate::amdgpu_navi48_gfxoff::epoch() != epoch {
+        return Err(boot::Error::Busy);
+    }
+    crate::amdgpu_navi48_gfxoff::transitioning();
+    owner
+        .as_mut()
+        .ok_or(boot::Error::DeviceGone)?
+        .enable_gfxoff()
+        .await
+}
+pub(crate) async fn gfxoff_command(epoch: u64, allow: bool) -> Result<(), boot::Error> {
+    let mut owner = OWNER.lock().await;
+    if crate::amdgpu_navi48_gfxoff::epoch() != epoch {
+        return Err(boot::Error::Busy);
+    }
+    owner
+        .as_mut()
+        .ok_or(boot::Error::DeviceGone)?
+        .gfx_off_control(allow)
+        .await
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -105,6 +160,7 @@ pub enum Status {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Diagnostics {
+    pub gfxoff: Option<crate::amdgpu_navi48_gfxoff::Status>,
     pub state: boot::State,
     pub report: Option<boot::Report>,
     pub display: Result<display::State, display::Error>,
@@ -162,6 +218,7 @@ pub fn status() -> Status {
         None => Status::Running,
         Some(owner) => owner.as_ref().map_or(Status::Absent, |boot| {
             Status::Retained(Diagnostics {
+                gfxoff: crate::amdgpu_navi48_gfxoff::status(),
                 state: boot.state(),
                 report: boot.report(),
                 display: boot.display_state(),
@@ -385,8 +442,9 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
         }?;
     }
     narf_scheduler::spawn(prove_queue_interrupts());
-    if let Some((limits, level)) = boot.power_info() {
-        crate::amdgpu_navi48_power::start(limits, level);
+    idle::start();
+    if let Some((limits, level, profile)) = boot.power_info() {
+        crate::amdgpu_navi48_power::start(limits, level, profile);
     }
     register_submitter(
         boot,
@@ -500,7 +558,7 @@ pub async unsafe fn recover() -> Result<boot::Report, boot::Error> {
 async unsafe fn recover_placed(
     placement: crate::amdgpu_gem::PlacementGuard,
 ) -> Result<boot::Report, boot::Error> {
-    let mut owner = OWNER.lock().await;
+    let (_gc, mut owner) = gc_owner().await.map_err(|_| boot::Error::DeviceGone)?;
     // SAFETY: forwarded caller contract.
     let quiesced = unsafe { quiesce(&mut owner, boot::ColdBoot::prepare_reset, placement) }.await?;
     // SAFETY: forwarded caller contract; every accessor was withdrawn.
@@ -792,7 +850,7 @@ async unsafe fn suspend_gated(baco: Option<Baco>) -> Result<(), boot::Error> {
         );
         return Err(boot::Error::Busy);
     }
-    let mut owner = OWNER.lock().await;
+    let (_gc, mut owner) = gc_owner().await.map_err(|_| boot::Error::DeviceGone)?;
     // SAFETY: forwarded caller contract; client VRAM is empty.
     let quiesced =
         match unsafe { quiesce(&mut owner, boot::ColdBoot::prepare_suspend, placement) }.await {
@@ -1107,6 +1165,8 @@ async unsafe fn quiesce(
         quarantine: |guard| QUARANTINED_PLACEMENTS.lock().push(guard),
     };
     RECOVERY_STATE.store(1, Ordering::Release);
+    idle::stop();
+    crate::amdgpu_navi48_gfxoff::invalidate();
     let retained = RecoveryOwner {
         boot: owner.take(),
         armed: true,
@@ -1213,6 +1273,7 @@ async unsafe fn restart(
     unsafe { boot.prove_queue_interrupts().await }.map_err(boot::Error::Queues)?;
     // SAFETY: GC12 proof drained; SDMA exclusively owns the same GMC test pages.
     unsafe { boot.prove_sdma_interrupts().await }.map_err(boot::Error::Sdma)?;
+    boot.configure_graphics_saving().await?;
     if SHADER_PROOF.load(Ordering::Acquire) {
         // SAFETY: new queues are drained and all test-page users stay under OWNER.
         unsafe { boot.prove_shaders().await }.map_err(boot::Error::Queues)?;
@@ -1257,8 +1318,10 @@ async unsafe fn restart(
     *owner = retained.boot.take();
     retained.armed = false;
     RECOVERY_STATE.store(2, Ordering::Release);
-    if let Some((limits, level)) = owner.as_ref().and_then(|b| b.power_info()) {
-        crate::amdgpu_navi48_power::restart(limits, level);
+    idle::start();
+    crate::amdgpu_navi48_gfxoff::start();
+    if let Some((limits, level, profile)) = owner.as_ref().and_then(|b| b.power_info()) {
+        crate::amdgpu_navi48_power::restart(limits, level, profile);
     }
     if restart_display {
         // SAFETY: caller's external writer exclusions and the existing native
@@ -1593,7 +1656,10 @@ impl Submitter {
                 done
             );
             let recovered = {
-                let mut owner = OWNER.lock().await;
+                let Ok((_gc, mut owner)) = gc_owner().await else {
+                    self.stop_all();
+                    return;
+                };
                 if *READ_GENERATION.lock() != self.generation {
                     return;
                 }
@@ -1853,8 +1919,20 @@ impl crate::amdgpu_cs::Submitter for Submitter {
                 narf_time::monotonic_ns().saturating_add(crate::amdgpu_ring_watch::JOB_TIMEOUT_NS);
             let entity = (request.owner, submission.ctx_id);
             let result = loop {
-                let mut owner = OWNER.lock().await;
+                // Media restore uses cached GC configuration. Video/JPEG
+                // traffic alone must not keep the graphics island awake.
+                let (_gc, mut owner) = if ring < SDMA_RING {
+                    let (gc, owner) = gc_owner().await?;
+                    (Some(gc), owner)
+                } else {
+                    (None, OWNER.lock().await)
+                };
                 let boot = owner.as_mut().ok_or(FsError::NoDevice)?;
+                if matches!(ring, MEDIA_RING | JPEG_RING) {
+                    boot.begin_media_use(ring == JPEG_RING)
+                        .await
+                        .map_err(|_| FsError::NoDevice)?;
+                }
                 if health.reset_epoch() != crate::amdgpu_ctx::recoveries() {
                     health.mark_canceled();
                     break Err(FsError::Canceled);
@@ -2045,6 +2123,25 @@ async fn apply_gfx_level(
     Ok(())
 }
 
+pub(crate) async fn set_power_profile_current(
+    selection: crate::amdgpu_navi48_power::ProfileRequest,
+    generation: u64,
+) -> Result<(), boot::Error> {
+    let _rpm = crate::amdgpu_navi48_runtime_pm::access().await?;
+    // Workload/features use only PPSMC, so a stale request must not even
+    // acquire a GC lease (which could send DisallowGfxOff to a successor).
+    let mut owner = OWNER.lock().await;
+    if !crate::amdgpu_navi48_power::level_owner_current(generation) {
+        return Err(boot::Error::Invalid);
+    }
+    let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
+    boot.set_profile_tuned(selection.profile, selection.custom)
+        .await?;
+    let coefficients = boot.profile_coefficients();
+    crate::amdgpu_navi48_power::applied_profile(selection.profile, coefficients);
+    Ok(())
+}
+
 async fn prove_queue_interrupts() {
     let mut owner = OWNER.lock().await;
     if let Some(boot) = owner.as_mut() {
@@ -2057,6 +2154,14 @@ async fn prove_queue_interrupts() {
             let proved = unsafe { boot.prove_sdma_interrupts().await };
             // SDMA0 now runs jobs, so it can clear VRAM past the BAR.
             if proved.is_ok() {
+                if let Err(error) = boot.configure_graphics_saving().await {
+                    crate::amdgpu_navi48_interrupts::lose();
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut narf_console::Writer,
+                        format_args!("amdgpu: rdna4 GFX ULV admission failed: {error:?}\n"),
+                    );
+                    return;
+                }
                 if SHADER_PROOF.load(Ordering::Acquire) {
                     // SAFETY: both interrupt proofs drained; OWNER retains every
                     // queue and test page before client/clear work can acquire it.
@@ -2101,6 +2206,7 @@ async fn prove_queue_interrupts() {
                     media_clients::activate_media(boot);
                 }
                 publish_clearer(boot);
+                crate::amdgpu_navi48_gfxoff::start();
                 if SHADER_PROOF.load(Ordering::Acquire) {
                     // The worker takes placement admission before its own
                     // native submissions acquire OWNER. This scope releases
@@ -2464,7 +2570,10 @@ impl VramClearer {
         loop {
             // The batch is taken and queued under OWNER, as an SDMA0 reset
             // requeues skipped clears at the queue's front under it too.
-            let mut owner = OWNER.lock().await;
+            let Ok((_gc, mut owner)) = gc_owner().await else {
+                self.refuse_queued();
+                return;
+            };
             if !self.current_generation() || crate::amdgpu_navi48_interrupts::failed() {
                 // These requests have no live SDMA slot (including skipped
                 // clears requeued only after a proven reset). Published
@@ -2957,7 +3066,7 @@ type Timing = crate::amdgpu_dml::Timing;
 type Modeset = crate::amdgpu_navi48_boot::Modeset;
 type ModesetError = crate::amdgpu_navi48_boot::ModesetError;
 type ConnectorType = crate::drm::card::ConnectorType;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 /// Pipe of the console's display, for the cursor hook.
 static CURSOR_PIPE: AtomicU8 = AtomicU8::new(0);
@@ -3601,6 +3710,26 @@ fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bo
             .flatten()
             .and_then(|s| s.cursor)
             .is_some_and(|c| c.pipe == pipe && (c.width, c.height) == (w, h));
+    if boot.fams2_active() {
+        if w == 0 || h == 0 || w > 64 || h > 64 || image.2.len() != (w * h) as usize {
+            return true;
+        }
+        if !shown && position.is_none() {
+            return true;
+        }
+        let image = (!shown).then(|| CursorImage {
+            width: w,
+            height: h,
+            pixels: image.2.to_vec(),
+        });
+        defer_scanout_cursor(
+            pipe,
+            bit,
+            image,
+            position.unwrap_or((-(w as i32), -(h as i32))),
+        );
+        return true;
+    }
     // A failure quarantines the pipe in the owner; the pointer just stops.
     match (shown, position) {
         (false, None) => return true, // never shown: nothing to hide
@@ -3617,6 +3746,47 @@ fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bo
         }
     }
     true
+}
+
+static FAMS_CURSOR_REQUEST: AtomicU64 = AtomicU64::new(0);
+fn defer_scanout_cursor(pipe: u8, bit: u8, image: Option<CursorImage>, position: (i32, i32)) {
+    let generation = *READ_GENERATION.lock();
+    let request = FAMS_CURSOR_REQUEST
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    narf_scheduler::spawn(async move {
+        let mut owner = OWNER.lock().await;
+        if *READ_GENERATION.lock() != generation
+            || FAMS_CURSOR_REQUEST.load(Ordering::Acquire) != request
+            || PRESENT_GATED.load(Ordering::Acquire)
+            || DRM_CURSOR_OWNED.load(Ordering::Acquire) & bit != 0
+            || CURSOR_PIPE.load(Ordering::Acquire) != pipe
+        {
+            return;
+        }
+        let Some(boot) = owner.as_mut() else {
+            return;
+        };
+        // SAFETY: this epoch's OWNER excludes display writers; async cursor
+        // methods also acquire firmware's hardware lock when required.
+        let result = if let Some(image) = image {
+            // SAFETY: OWNER and generation checked above; image is owned here.
+            unsafe {
+                boot.set_display_cursor_async(
+                    pipe,
+                    (image.width, image.height, &image.pixels),
+                    position,
+                )
+            }
+            .await
+        } else {
+            // SAFETY: matching retained owner, with firmware exclusion in the method.
+            unsafe { boot.move_display_cursor_async(pipe, position) }.await
+        };
+        if result.is_ok() {
+            CONSOLE_CURSOR_STALE.fetch_and(!bit, Ordering::AcqRel);
+        }
+    });
 }
 
 /// Put the console on `pipe`'s live scanout, or withdraw it.
@@ -5255,7 +5425,7 @@ pub async unsafe fn set_display_cursor(
         .as_mut()
         .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
     // SAFETY: serialized retained owner; caller excludes external writers.
-    unsafe { boot.set_display_cursor(pipe, image, position) }
+    unsafe { boot.set_display_cursor_async(pipe, image, position) }.await
 }
 
 /// Move the live cursor without waiting: a pointer pump must never block on
@@ -5542,7 +5712,7 @@ async fn drm_cursor_task(display: u8) {
         if let Some(boot) = owner.as_mut() {
             // SAFETY: serialized retained owner; the platform excludes
             // other display writers while OWNER is held.
-            unsafe { converge_drm_cursor(boot, display) };
+            unsafe { converge_drm_cursor(boot, display) }.await;
         }
     }
 }
@@ -5551,11 +5721,11 @@ async fn drm_cursor_task(display: u8) {
 /// starts its pipes without a cursor).
 /// # Safety
 /// As for `converge_drm_cursor`.
-unsafe fn converge_drm_cursors(boot: &mut boot::ColdBoot) {
+async unsafe fn converge_drm_cursors(boot: &mut boot::ColdBoot) {
     let owned = DRM_CURSOR_OWNED.load(Ordering::Acquire);
     for display in (0..DRM_CURSORS.len() as u8).filter(|d| owned & (1 << d) != 0) {
         // SAFETY: forwarded.
-        unsafe { converge_drm_cursor(boot, display) };
+        unsafe { converge_drm_cursor(boot, display) }.await;
     }
 }
 
@@ -5565,7 +5735,7 @@ unsafe fn converge_drm_cursors(boot: &mut boot::ColdBoot) {
 /// cursor off.
 /// # Safety
 /// Serialized retained owner; exclude other display writers.
-unsafe fn converge_drm_cursor(boot: &mut boot::ColdBoot, display: u8) {
+async unsafe fn converge_drm_cursor(boot: &mut boot::ColdBoot, display: u8) {
     let slot = &DRM_CURSORS[usize::from(display)];
     let (image, upload, position) = {
         let mut c = slot.lock();
@@ -5575,9 +5745,10 @@ unsafe fn converge_drm_cursor(boot: &mut boot::ColdBoot, display: u8) {
     };
     let result = match crtc_pipe(display) {
         // SAFETY: the caller's obligations.
-        Some(pipe) => unsafe {
-            converge_pipe_cursor(boot, pipe, image.as_deref(), upload, position)
-        },
+        Some(pipe) => {
+            // SAFETY: the caller retains the owner across this cursor transaction.
+            unsafe { converge_pipe_cursor(boot, pipe, image.as_deref(), upload, position) }.await
+        }
         // A dark display: shown once it lights.
         None => Err(crate::amdgpu_dcn401_otg::Error::Busy),
     };
@@ -5594,7 +5765,7 @@ unsafe fn converge_drm_cursor(boot: &mut boot::ColdBoot, display: u8) {
 /// `converge_drm_cursor` on head pipe `pipe`.
 /// # Safety
 /// As for `converge_drm_cursor`.
-unsafe fn converge_pipe_cursor(
+async unsafe fn converge_pipe_cursor(
     boot: &mut boot::ColdBoot,
     pipe: u8,
     image: Option<&CursorImage>,
@@ -5612,14 +5783,21 @@ unsafe fn converge_pipe_cursor(
     match drm_cursor_step(current, size, upload, position) {
         CursorStep::Keep => Ok(()),
         // SAFETY: the caller's obligations.
-        CursorStep::Hide => unsafe { boot.move_display_cursor(pipe, CURSOR_OFF) }.map(drop),
+        CursorStep::Hide => unsafe { boot.move_display_cursor_async(pipe, CURSOR_OFF) }
+            .await
+            .map(drop),
         // SAFETY: as above.
-        CursorStep::Move => unsafe { boot.move_display_cursor(pipe, position) }.map(drop),
+        CursorStep::Move => unsafe { boot.move_display_cursor_async(pipe, position) }
+            .await
+            .map(drop),
         CursorStep::Upload => match image {
             Some(i) => {
                 // SAFETY: as above.
-                unsafe { boot.set_display_cursor(pipe, (i.width, i.height, &i.pixels), position) }
-                    .map(drop)
+                unsafe {
+                    boot.set_display_cursor_async(pipe, (i.width, i.height, &i.pixels), position)
+                }
+                .await
+                .map(drop)
             }
             None => Ok(()),
         },
@@ -6095,14 +6273,17 @@ fn kick_lfc_service() {
                 {
                     continue;
                 }
-                enabled = true;
                 // SAFETY: OWNER retains the admitted scanout and excludes writers;
                 // only ScanoutRunning is serviced, never a cancelled transaction.
-                if let Err(e) = unsafe { boot.display_lfc_progress(m.pipe, reset) } {
-                    let _ = core::fmt::Write::write_fmt(
-                        &mut narf_console::Writer,
-                        format_args!("amdgpu: navi48 LFC frame service refused: {e:?}\n"),
-                    );
+                match unsafe { boot.display_lfc_progress(m.pipe, reset) }.await {
+                    Ok(()) => enabled = true,
+                    Err(crate::amdgpu_dcn401_otg::Error::Busy) => {}
+                    Err(e) => {
+                        let _ = core::fmt::Write::write_fmt(
+                            &mut narf_console::Writer,
+                            format_args!("amdgpu: navi48 LFC frame service refused: {e:?}\n"),
+                        );
+                    }
                 }
             }
             if !enabled {
@@ -6130,10 +6311,6 @@ async fn converge_vrr(boot: &mut boot::ColdBoot) {
             continue;
         }
         let want = wanted_drr(&m, wants[k]);
-        // While PMFW may switch UCLK, the monitor pass pins it first.
-        if want.is_some() && boot.uclk_switching() {
-            continue;
-        }
         let packet = m
             .selection
             .vrr
@@ -6148,6 +6325,11 @@ async fn converge_vrr(boot: &mut boot::ColdBoot) {
             });
         let unchanged = status.drr.map(|a| a.drr) == want
             && status.freesync.filter(|p| p.complete).map(|p| p.packet) == packet;
+        // A timing/packet change invalidates the currently scheduled FAMS2
+        // configuration, including a transition back to fixed refresh.
+        if !unchanged && boot.pin_display_uclk().await.is_err() {
+            continue;
+        }
         // SAFETY: OWNER is held; the platform excludes timing/stream writers.
         let result = if unchanged {
             Ok(status.drr)
@@ -6172,8 +6354,18 @@ async fn converge_vrr(boot: &mut boot::ColdBoot) {
                 .and_then(|range| {
                     crate::amdgpu_freesync::LfcConfig::new(&m.selection.timing, range)
                 });
-            // SAFETY: OWNER is held and the UCLK pin was checked above.
-            match unsafe { boot.set_display_lfc(m.pipe, config) }.await {
+            let current_lfc = status.drr.and_then(|a| a.lfc()).map(|lfc| lfc.config);
+            if current_lfc != config && boot.pin_display_uclk().await.is_err() {
+                continue;
+            }
+            // SAFETY: OWNER is held. Unchanged policy needs no register write.
+            let lfc_result = if current_lfc == config {
+                Ok(())
+            } else {
+                // SAFETY: OWNER is held and the changed policy pinned UCLK above.
+                unsafe { boot.set_display_lfc(m.pipe, config) }.await
+            };
+            match lfc_result {
                 Ok(()) if config.is_some() => kick_lfc_service(),
                 Ok(()) => {}
                 Err(e) => {
@@ -7439,8 +7631,9 @@ pub async unsafe fn monitor_displays(
     if !steps.is_empty() {
         publish_outputs();
     }
-    // UCLK P-state switching for the configuration now running (pinned
-    // first when a display should run DRR, which the port only runs pinned).
+    // Apply refresh limits while pinned, then plan the resulting live timing.
+    converge_vrr(boot).await;
+    // UCLK P-state switching for the configuration now running.
     // SAFETY: the caller's obligations; OWNER is held.
     match unsafe { boot.converge_uclk_pstate(drr_wanted(boot)) }.await {
         Ok(moved) => {
@@ -7455,8 +7648,6 @@ pub async unsafe fn monitor_displays(
             );
         }
     }
-    // VRR_ENABLED needs no relight: converge every live timing's DRR.
-    converge_vrr(boot).await;
     // Nor do CRTC color and HDR metadata changes.
     converge_streams(boot).await;
     // Client framebuffers a relight, plane update or stop let go of.
@@ -7466,7 +7657,7 @@ pub async unsafe fn monitor_displays(
     // DRM cursors on the pipes this pass lit (amdgpu_dm commits the cursor
     // after the planes).
     // SAFETY: the caller's obligations; OWNER is held.
-    unsafe { converge_drm_cursors(boot) };
+    unsafe { converge_drm_cursors(boot) }.await;
     Ok(steps)
 }
 

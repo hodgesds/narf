@@ -40,6 +40,15 @@
 
 ## 3. Public interface
 
+`driver_match::module_dma_retain_on_teardown(owner, token, retain)` verifies
+current device authority and owner before changing teardown retention. A module
+sets retention before posting DMA addresses and clears it only after a proven
+hardware drain/reset. While retention is set, context teardown masks IRQs,
+disables bus mastering and revokes the device token, but preserves the coherent
+allocations in the I/O registry. This deliberately quarantines memory when
+completion cannot be proven; command-bit disable alone is not a DMA fence.
+
+
 `read_bar` sizes BARs with Command I/O and Memory Space decoding disabled,
 using 16-bit Command accesses so adjacent RW1C Status bits are untouched.
 Bus Master and other Command bits are preserved. A 64-bit pair remains

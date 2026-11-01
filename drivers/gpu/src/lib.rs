@@ -511,9 +511,13 @@ pub mod amdgpu_navi48_faults;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_firmware;
 #[cfg(feature = "amdgpu")]
+pub mod amdgpu_navi48_gfxoff;
+#[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_interrupts;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_kms;
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu_navi48_media_power;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_navi48_msi;
 #[cfg(feature = "amdgpu")]
@@ -691,6 +695,8 @@ pub mod drm_native_planes;
 pub mod drm_registry;
 pub mod drm_sysfs_bridge;
 pub mod drm_uapi;
+#[cfg(feature = "intel")]
+pub mod intel_dpcd_bl;
 #[cfg(feature = "intel")]
 pub mod intel_gpu;
 #[cfg(feature = "intel")]

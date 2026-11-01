@@ -461,3 +461,24 @@ kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_lfc_refuses_live_timing_drift_before_repeat_write
 );
+
+fn dcn401_drr_restores_native_bounds_after_firmware_clamping() -> TestResult {
+    let (mut e, _) = live(1);
+    e.set_drr(1, Some(QHD_48_144)).unwrap();
+    let retained = e.status.drr;
+    // Firmware can leave a temporary clamp while scheduling is active.
+    e.io.regs.insert(otg(1, 0x1b30), 2100);
+    e.io.regs.insert(otg(1, 0x1b31), 2100);
+    e.io.regs.insert(otg(1, 0x1b33), 0);
+    e.restore_drr(1).unwrap();
+    assert_eq!(e.io.regs[&otg(1, 0x1b30)] & 0x7fff, 1496);
+    assert_eq!(e.io.regs[&otg(1, 0x1b31)] & 0x7fff, 4490);
+    assert_eq!(e.io.regs[&otg(1, 0x1b33)] & DRR_FIELDS, DRR_TRIGA);
+    assert_eq!(e.status.drr, retained);
+    assert_eq!(e.status.state, State::ScanoutRunning(1));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-drr",
+    dcn401_drr_restores_native_bounds_after_firmware_clamping
+);

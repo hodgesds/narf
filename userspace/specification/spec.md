@@ -31,6 +31,27 @@ The syscall boundary validates the full user range before entering the
 fault-contained access, including on racing unmaps. User-fence reads and
 writes do not pass through the byte-copy helpers.
 
+Network device ioctls bridge bounded native NIC controls to Linux ethtool:
+link settings, rings/channels/RSS/coalescing, pause/EEE/WoL, counters/names,
+register/NVM reads, diagnostics, link restart and supported L2 flow rules.
+Existing network namespace checks and `CAP_NET_ADMIN` policy precede mutations.
+`SIOCSHWTSTAMP`/`SIOCGHWTSTAMP` report the effective ALL/NONE RX and ON/OFF TX
+configuration. AF_PACKET `SO_TIMESTAMPING` reports raw hardware RX times and
+TX `MSG_ERRQUEUE` records (`SCM_TIMESTAMPING`, `PACKET_TX_TIMESTAMP`), preserving
+error-queue readiness and Linux cmsg layouts.
+
+Dynamic CLOCKFD ids resolve the open file's `hardware_clock` interface for
+clock_gettime/getres/settime/adjtime. Writes require a writable description and
+`CAP_SYS_TIME`; offsets/times/frequency modes are validated and copied through
+guarded user access. The PHC is independent of system time. `SO_TXTIME` and
+`SCM_TXTIME` propagate hardware launch times (and `SO_PRIORITY` queue selection)
+onto outbound `AF_PACKET` frames. `AF_XDP` (44) and `AF_BYPASS` (45) expose
+UMEM/ring setup through `SOL_XDP` (including user-page `XDP_UMEM_REG`,
+`XDP_MMAP_OFFSETS`, `XDP_STATISTICS`, and `mmap` of RX/TX/FILL/COMPLETION rings)
+and direct queue binding through `XDP_ZEROCOPY` (flag 4), with network
+administration permission for hardware binding and truthful `XDP_OPTIONS`.
+
+
 Blocking poll/ppoll and select/pselect distinguish providers with a durable
 readiness arm or broadcast notification from silent legacy providers (such
 as serial ttys). A set containing a silent provider sleeps to a recheck no
@@ -560,6 +581,10 @@ description accepts only Linux's path-safe command whitelist; other commands
 return `EBADF`. `F_GETFL` reads status from the shared open-file description.
 Ordinary single-fd resolution uses a lazily initialized RCU directory of
 direct-indexed descriptor slots, including for tables shared by `CLONE_FILES`.
+Each task has a separate, cache-line-isolated ownership binding to its table;
+lookups retain that binding without updating the shared table's reference count.
+`CLONE_FILES` shares the table, while unshare and socket-alias checks compare
+table ownership rather than binding identity.
 Writers retain the per-table lock and publish slot replacement before releasing
 the previous file/description. A reader upgrades weak file and description
 references, revalidates both the directory and slot identity, and leaves its
@@ -951,6 +976,30 @@ because another event joined an already-readable queue.
 Signalfd uses a per-task pending-set generation that advances only when the
 set changes from empty to nonempty, including the allocation-free IRQ raise
 path.
+Process-directed signals retain a group-shared pending set, while a per-thread
+delivery notification selects which runnable thread may enter a handler.
+Syscall and interrupt returns do not let an unnotified busy sibling consume
+the signal before the selected interruptible sleeper resumes. Mask changes
+retarget pending work or notify a thread that unblocks it; SIGKILL/SIGSTOP
+remain unblockable. Explicit sigwait and signalfd consumers still inspect and
+dequeue shared pending independently of handler selection.
+Handlers, ptrace signal stops, sigwait and signalfd atomically select and dequeue each pending
+instance with its queued payload. A stale selection does not manufacture an
+SI_USER delivery. Queue locks are released before writing a user signal frame;
+the dequeued instance cannot be consumed by another thread during that write.
+If frame construction fails, the instance remains consumed and the task takes
+forced SIGSEGV, matching Linux `signal_setup_done` / `force_sigsegv`. A blocked
+or ignored SIGSEGV is reset to default and unblocked; failure to construct a
+SIGSEGV frame resets its disposition to default rather than retrying it.
+Ptrace captures queued siginfo from that owned instance and preserves later
+private/shared instances. Synchronous fault and forced seccomp stops carry
+their supplied siginfo without consuming an unrelated pending signal.
+`signal_mask_for_delivery() -> u64` gives frame writers the interrupted mask,
+including the original mask of a suspended wait without consuming its record.
+Restorer-based Linux frames contain that mask in `uc_sigmask`; `rt_sigreturn`
+reads it with guarded user access before register restoration and honors
+handler edits, always stripping SIGKILL/SIGSTOP. Compact non-restorer frames
+retain their recorded kernel mask.
 Queued-signal syscalls import the complete native kernel `siginfo` prefix before
 publishing pending state. `rt_sigqueueinfo` and `rt_tgsigqueueinfo` require a
 readable non-null info pointer and preserve Linux's `EFAULT`-before-argument
@@ -1528,12 +1577,14 @@ and quiesce its host resource immediately while deferring DMA-page reuse until
 the final mapping disappears.
 
 Generic filesystem mappings that cannot expose page-cache frames retain one
-canonical fallback page per open-file description and file offset, plus an
+canonical fallback page per filesystem device, anchored file identity and offset, plus an
 exact clean-byte snapshot. `fsync(2)` and `msync(2)` compare against that
 snapshot, write each changed canonical page once even when it has overlapping
 aliases, and advance the snapshot only after the full page write succeeds.
 Clean pages perform no filesystem write; the comparison is byte-exact rather
 than hash-based so collision cannot suppress persistence.
+Filesystem device identity namespaces retained anchors and generation counters:
+a different filesystem cannot reuse idle pages when an anchor address is recycled.
 
 The fallback cache is coherent with the `write(2)` family and carries a
 writeback lifecycle, matching Linux's single page cache. Every successful
@@ -1724,6 +1775,12 @@ before the device lookup (a refused caller gets `EPERM` even for an unknown
 name); a live, namespace-and-interface-matched delegated `AdminHandle` also
 authorizes its one device. Invalid MTU, hardware type, or address values
 return `EINVAL`.
+
+Device-backed MTU/MAC changes invoke the driver's `iface::DeviceControl`
+callback before publishing new metadata. A busy hardware transaction returns
+`EBUSY`, an unsupported device operation returns `EOPNOTSUPP`, and a hardware
+failure returns `EIO`; rtnetlink preserves the driver's positive Linux errno
+through `AdminError::DeviceError`.
 
 `SIOCETHTOOL` implements Linux `dev_ethtool` for `ETHTOOL_GDRVINFO` and
 `ETHTOOL_GLINK`, in its check order: copying the ifreq and the command word

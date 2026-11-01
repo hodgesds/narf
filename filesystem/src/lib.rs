@@ -76,6 +76,7 @@ pub mod devfs;
 pub mod devfs_block;
 pub mod devfs_input;
 pub mod devfs_misc;
+pub mod devfs_ptp;
 pub mod devfs_pty;
 pub mod devfs_rtc;
 pub(crate) mod devfs_vt;
@@ -1161,6 +1162,10 @@ pub trait DrmFence: Send + Sync {
 /// node may be looked up concurrently from multiple tasks; per-file
 /// state (e.g. an offset cursor) lives in the *handle*, not here.
 pub trait FileOps: Send + Sync {
+    /// Retained PHC identity for dynamic clock fds; ordinary files have none.
+    fn hardware_clock(&self) -> Option<Arc<dyn narf_time::phc::HardwareClock>> {
+        None
+    }
     /// Read up to `buf.len()` bytes starting at `offset`. Short reads
     /// (returning `< buf.len()`) signify EOF on Stage-3 in-memory
     /// FSes; Stage 4 disk-backed FSes may also short-read on a torn

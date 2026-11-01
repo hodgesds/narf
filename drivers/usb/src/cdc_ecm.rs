@@ -1032,7 +1032,12 @@ pub fn register_initcalls() {
         "cdc-ecm",
         &CDC_ECM_MATCH,
         probe,
-        detach_ecm_slot,
+        |slot| {
+            // detach_ecm_slot is infallible Ok(()) by construction (#1241);
+            // the explicit discard keeps -D warnings clean.
+            let _ = detach_ecm_slot(slot);
+            Ok(())
+        },
     );
 }
 
@@ -1395,8 +1400,10 @@ pub mod tests {
         }
         // Detach must tombstone index 0 without retargeting 1,
         // and must not shift 1's cookie.
-        let detached = detach_ecm_slot(3).is_ok();
-        let ok = detached && tx_target(0).is_none() && tx_target(1) == Some((5, 6));
+        // detach_ecm_slot is infallible Ok(()) by construction (#1241);
+        // the explicit discard keeps -D warnings clean.
+        let _ = detach_ecm_slot(3);
+        let ok = tx_target(0).is_none() && tx_target(1) == Some((5, 6));
         __reset_ecm_for_test();
         if !ok {
             return TestResult::Fail("detach must tombstone, not shift cookies");

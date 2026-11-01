@@ -8,6 +8,42 @@ fn prepared() -> (Pool, Session<Fake>) {
     run(s.load_smc(&[1, 2, 3, 4])).unwrap();
     (pool, s)
 }
+fn psp14_media_sram_transport_uses_distinct_types_and_retains_unacknowledged_payload() -> TestResult
+{
+    for kind in [49, 128] {
+        let (pool, mut s) = prepared();
+        let available = pool.available();
+        run(s.load_ip(&[0x42; 40], kind)).unwrap();
+        let command = s.engine.io.submissions.last().unwrap();
+        assert_eq!(command[2], 6);
+        assert_eq!(command[9], 40);
+        assert_eq!(command[10], kind);
+        assert!(s.payload.is_none());
+        assert_eq!(pool.available(), available);
+        s.engine.io.stall_command = Some(6);
+        s.engine.io.stall_type = Some(kind);
+        {
+            let mut future = core::pin::pin!(s.load_ip(&[0x24; 40], kind));
+            let mut cx = Context::from_waker(Waker::noop());
+            // One staging-page yield, then reach the unacknowledged upload.
+            for _ in 0..4 {
+                assert!(future.as_mut().poll(&mut cx).is_pending());
+            }
+        }
+        assert!(s.payload.is_some());
+        assert!(!s.payload.as_ref().unwrap().reusable_for_test());
+        assert_eq!(s.engine.io.submissions.last().unwrap()[10], kind);
+        assert!(pool.available() < available);
+        let count = s.engine.io.submissions.len();
+        assert_eq!(run(s.load_ip(&[0; 40], kind)), Err(Error::Busy));
+        assert_eq!(s.engine.io.submissions.len(), count);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4-dpg",
+    psp14_media_sram_transport_uses_distinct_types_and_retains_unacknowledged_payload
+);
 fn psp_navi22_graphics_order_lengths_and_autoload() -> TestResult {
     for mec2 in [true, false] {
         let firmware = firmware();

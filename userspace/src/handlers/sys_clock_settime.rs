@@ -25,6 +25,10 @@ pub(crate) fn sys_clock_settime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let id = args.arg0;
     let ts = args.arg1;
+    if let Some(result) = super::phc::settime(id as i32, ts) {
+        ctx.set_return(SyscallReturn::ok(result as u64));
+        return;
+    }
     // POSIX CPU clocks DO have a `clock_set`: after the timespec copy
     // (-EFAULT), `posix_cpu_clock_set` validates the target with
     // `pid_for_clock(clock, false)` (-EINVAL) and otherwise refuses with

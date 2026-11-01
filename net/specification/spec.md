@@ -37,6 +37,33 @@
 
 ## 3. Public interface
 
+Native NIC extensions live in `net::nic::NicControl`, reached through
+`iface::DeviceControl::nic()` / `nic::with_control`. Drivers serialize settings,
+ring/channel/RSS changes, diagnostics, flow rules, PHC/timestamp and TSN/MAC
+Merge policy, PM and direct UMEM binding. Mutation callers must hold network
+administration authority. `net::ethtool` is a bounded (64-KiB) Linux wire codec;
+userspace owns permission checks and guarded copies. Unsupported controls
+return positive errno, never successful no-ops.
+
+`enable_zero_copy_tx_context` preserves an owned-frame device cookie alongside
+queue-local recycling. `Frame::tx_timing` carries an optional hardware timestamp
+cookie, PHC launch time and queue; `RxMeta::timestamp_ns` carries the hardware
+receive time. SCTP CRC32c is a separate L4 checksum kind; unsupported drivers
+reject it. Native RX dispatch runs XDP once and carries packet timestamps to
+AF_PACKET. Packet timestamp requests remain bound to their sending socket and
+interface; completion/error reports wake its error queue.
+
+`Umem::frame_bytes` returns a CPU read guard that excludes DMA for its lifetime.
+`Umem::lease` invokes current capability validity and exclusively retains one
+frame through DMA. Revocation rejects new leases; it never frees an existing
+lease. Drivers release leases only after terminal DD or a proven quiescence.
+Direct queue claims exclude competing software claims on that interface.
+Both the native `AF_BYPASS` capability/ring contract and the Linux `AF_XDP`
+user-UMEM + shared `mmap` ring layout (`XDP_PGOFF_*`, `XDP_MMAP_OFFSETS`,
+`XDP_STATISTICS`) are supported, alongside `NETLINK_ROUTE` `tc` (`taprio`,
+`cbs`, `etf`) and `NETLINK_GENERIC` `ethtool` MAC Merge (`ETHTOOL_MSG_MM_*`).
+
+
 ### 3.1 Interface object
 
 ```rust
@@ -226,6 +253,18 @@ synchronously and never sets `IFF_UP`). Common ingress and
 egress paths update packet/byte/multicast/drop counters once, and procfs,
 sysfs, and rtnetlink consume the same snapshots rather than constructing
 compatibility-only values.
+
+Wired drivers may install `iface::set_device_control(name,
+Arc<dyn DeviceControl>)` after registration. `DeviceControl::configure`
+receives the proposed `DeviceConfig` (MTU, MAC, promiscuity, all-multicast and
+hardware-address lists) with the registry lock released. Control transactions
+are serialized per interface without masking IRQs across the driver callback;
+reentrant/concurrent changes return EBUSY. Metadata commits only after the
+driver accepts. Re-registration clears the old hook. Drivers without a hook
+retain registry-only behavior. `try_set_mtu`/`try_set_mac` preserve driver
+errnos; bool wrappers remain available. `AdminError::DeviceError(errno)` carries
+hardware failures through administrative handles to rtnetlink and ioctl
+callers, rather than treating a hardware rejection as a missing interface.
 
 `stack::control_registered(&StackAttach)` validates the registered interface
 handle and daemon identity through `Cap::invoke`, returning an interface-bound

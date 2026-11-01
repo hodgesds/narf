@@ -170,7 +170,16 @@ impl Io for Fake {
             && self.commands
             && self.regs.get(&(DCN + 0x1e3 * 4)) == Some(&3)
         {
-            self.execute(value);
+            for _ in 0..127 {
+                let rp = self.regs[&(DCN + 0x1d7 * 4)];
+                if rp == value {
+                    break;
+                }
+                self.execute((rp + 64) % 8192);
+                if self.complete_pointer.is_some() {
+                    break;
+                }
+            }
         }
         if address == DCN + 0x1f8 * 4 && value == 0x10020000 && self.stop {
             self.regs.insert(address, 0x20000);
@@ -289,6 +298,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
         state: State::Prepared,
         status: None,
         mailbox: mailbox::Mailbox::new(),
+        hw_lock_uncertain: false,
     };
     (pool, engine)
 }

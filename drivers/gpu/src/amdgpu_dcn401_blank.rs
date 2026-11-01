@@ -70,7 +70,12 @@ impl<I: Io> Engine<I> {
             .dsc
             .filter(|_| plan.request.signal != Signal::HdmiFrl || self.status.frl_dsc == Some(p));
         let drr = self.status.drr.filter(|a| a.pipe == p);
+        let firmware_timing = drr.is_some_and(|a| a.firmware_owned())
+            || self.status.subvp.is_some_and(|s| s.main == p && s.active);
         for (r, mask, value) in plan.registers() {
+            if firmware_timing && matches!(r, V_MIN | 0x1b31) {
+                continue;
+            }
             let value = match (r, drr) {
                 (V_MIN, Some(a)) => a.adjust.v_total_min - 1,
                 (0x1b31, Some(a)) => a.adjust.v_total_max - 1,
@@ -97,7 +102,9 @@ impl<I: Io> Engine<I> {
             ),
             (l.vtg(p), 0xffff7fff, plan.vtg | u32::from(running) << 31),
         ] {
-            self.expect(at, mask, value)?;
+            if !(firmware_timing && at == l.otg(p, V_CONTROL)) {
+                self.expect(at, mask, value)?;
+            }
         }
         if plan.request.odm.is_some() {
             self.expect(l.odm(p, WIDTH), 0x1fff, plan.segment_width())?;

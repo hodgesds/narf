@@ -81,6 +81,13 @@ decision:
 
 ## 3. SDK boundary
 
+The C module ABI includes `narf_dma_retain_on_teardown(dev, retain) -> i32`,
+cap-gated as DMA access. `retain` is 0/1; bad owner/token or invalid values fail.
+Modules exposing live ring addresses must set retention first. They may clear
+it only after a successful hardware drain/reset, normally from
+`narf_module_exit`. A failed drain leaves DMA pinned after context destruction.
+IGC's `.ko` follows this contract and shares the built-in register protocol.
+
 ### 3.1 The `narf-driver-sdk` crate
 
 A single crate that re-exports the strict subset of kernel APIs a

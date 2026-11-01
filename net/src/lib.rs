@@ -75,6 +75,7 @@ pub mod bypass;
 pub mod cbpf;
 pub mod dhcp;
 pub mod dns;
+pub mod ethtool;
 pub mod gro;
 pub mod gso;
 pub mod http;
@@ -97,6 +98,7 @@ pub mod netlink_diag;
 pub mod netlink_generic;
 pub mod netlink_netfilter;
 pub mod netlink_route;
+pub mod nic;
 pub mod pkt;
 pub mod pkt_coap;
 pub mod pkt_dhcp;
@@ -201,6 +203,7 @@ pub const TX_RING_N: usize = 1024;
 /// invariant: a frame buffer is owned by exactly one holder at a
 /// time.
 pub struct Frame {
+    timing: TxTiming,
     buf: DmaBuffer,
     offset: u32,
     len: u32,
@@ -240,6 +243,7 @@ impl Frame {
             offset: 0,
             len: if len > cap { cap } else { len },
             queue: 0,
+            timing: TxTiming::default(),
             tx_meta: TxMeta::plain(),
             rx_meta: RxMeta::default(),
         }
@@ -270,12 +274,16 @@ impl Frame {
             offset: off,
             len: if len > max_len { max_len } else { len },
             queue,
+            timing: TxTiming::default(),
             tx_meta: TxMeta::plain(),
             rx_meta: RxMeta::default(),
         }
     }
 
     #[inline]
+    pub fn truncate(&mut self, len: u32) {
+        self.len = self.len.min(len);
+    }
     pub fn len(&self) -> u32 {
         self.len
     }
@@ -325,6 +333,13 @@ impl Frame {
         let off = self.offset as usize;
         let end = off + self.len as usize;
         &mut self.buf.as_mut_slice()[off..end]
+    }
+
+    pub fn tx_timing(&self) -> TxTiming {
+        self.timing
+    }
+    pub fn set_tx_timing(&mut self, timing: TxTiming) {
+        self.timing = timing;
     }
 
     /// Offloads requested by the producer. Consult `Interface::offloads` first.
@@ -943,6 +958,16 @@ pub enum L4CsumKind {
     Tcp,
     /// Compute a UDP checksum.
     Udp,
+    /// Compute an SCTP CRC32c. Drivers without SCTP support reject it.
+    Sctp,
+}
+
+/// Optional hardware transmit timing, retained with the owned DMA frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxTiming {
+    pub timestamp_cookie: Option<u64>,
+    pub launch_time_ns: Option<u64>,
+    pub queue: Option<u16>,
 }
 
 /// Per-frame transmit metadata. Drivers read this alongside the
@@ -1013,6 +1038,7 @@ impl TxMeta {
 /// hardware already verified.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RxMeta {
+    pub timestamp_ns: Option<u64>,
     /// `true` if the hardware verified the IP (L3) header checksum
     /// and found it valid.
     pub csum_l3: bool,

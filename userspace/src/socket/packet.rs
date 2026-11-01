@@ -70,6 +70,10 @@ pub(crate) struct PacketRecvAncillary {
     /// `skb->tstamp` (CLOCK_REALTIME).
     pub tstamp_secs: i64,
     pub tstamp_nanos: u32,
+    pub hardware_ns: Option<u64>,
+    pub timestamp_error: Option<i32>,
+    pub timestamping_flags: u32,
+    pub timestamping_new: bool,
 }
 
 fn sock_err(e: i32) -> SocketOpResult {
@@ -174,7 +178,17 @@ impl SocketFile {
                     raw.extend_from_slice(&a.body);
                     raw
                 });
-                match sock.sendmsg(buf, name.as_deref()) {
+                let (timestamp, prio) = {
+                    let opts = self.options.lock();
+                    (opts.timestamping_flags & 1 != 0, opts.ext.priority)
+                };
+                let txtime = self.take_send_txtime();
+                let queue = if (timestamp || txtime.is_some()) && prio != 0 {
+                    u16::try_from(prio).ok()
+                } else {
+                    None
+                };
+                match sock.sendmsg_timed(buf, name.as_deref(), timestamp, txtime, queue) {
                     Ok(n) => SocketOpResult::Ok(n as u64),
                     Err(e) => sock_err(e),
                 }
@@ -196,19 +210,18 @@ impl SocketFile {
         if flags & !(MSG_PEEK | MSG_DONTWAIT | MSG_TRUNC | MSG_CMSG_COMPAT | MSG_ERRQUEUE) != 0 {
             return SocketOpResult::Err(SockError::InvalidArg);
         }
-        if flags & MSG_ERRQUEUE != 0 {
-            // `sock_recv_errqueue`: packet sockets queue nothing there (no
-            // PACKET_TX_TIMESTAMP support), so the queue is always empty.
-            return SocketOpResult::Err(SockError::WouldBlock);
-        }
-        let record = match sock.recv(flags & MSG_PEEK != 0) {
+        let record = match if flags & MSG_ERRQUEUE != 0 {
+            sock.recv_timestamp()
+        } else {
+            sock.recv(flags & MSG_PEEK != 0)
+        } {
             Ok(r) => r,
             Err(e) => return sock_err(e),
         };
         let full_len = record.data.len();
         let copied = full_len.min(buf.len());
         buf[..copied].copy_from_slice(&record.data[..copied]);
-        let auxdata = sock.with_opts(|o| o.auxdata).then(|| {
+        let auxdata = (flags & MSG_ERRQUEUE == 0 && sock.with_opts(|o| o.auxdata)).then(|| {
             let mut status = TP_STATUS_USER;
             let (tci, tpid) = match record.vlan {
                 Some(v) => {
@@ -227,12 +240,20 @@ impl SocketFile {
             aux[18..20].copy_from_slice(&tpid.to_ne_bytes());
             aux
         });
+        let (timestamping_flags, timestamping_new) = {
+            let opts = self.options.lock();
+            (opts.timestamping_flags, opts.timestamping_new)
+        };
         self.packet_recv_ancillary.lock().insert(
             crate::handlers::current_task_id(),
             PacketRecvAncillary {
                 auxdata,
                 tstamp_secs: record.tstamp_secs,
                 tstamp_nanos: record.tstamp_nanos,
+                hardware_ns: record.hardware_ns,
+                timestamp_error: record.timestamp_error,
+                timestamping_flags,
+                timestamping_new,
             },
         );
         let peer = Some(packet_source_addr(&record, self.kind == SOCK_PACKET));

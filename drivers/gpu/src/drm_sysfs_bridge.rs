@@ -107,8 +107,8 @@ pub fn populate_drm_class() {
 }
 
 /// `power_dpm_force_performance_level` and (where the card has a PMFW
-/// feature mask) `pp_features`, both writable. Values are queried at read
-/// time, unlike the boot-time snapshots above.
+/// feature mask) `pp_features` and `pp_power_profile_mode` where
+/// supported. Values are queried at read time.
 fn add_power_controls(kobj: &Kobject, card: &Arc<dyn crate::drm_registry::DrmCard>) {
     let utf8 = |data: &[u8]| {
         core::str::from_utf8(data)
@@ -133,6 +133,16 @@ fn add_power_controls(kobj: &Kobject, card: &Arc<dyn crate::drm_registry::DrmCar
             "pp_features",
             move || show.pp_features().unwrap_or_default(),
             move |data: &[u8]| store.set_pp_features(&utf8(data)?),
+        );
+    }
+    if card.power_profiles().is_some() {
+        let show = card.clone();
+        let store = card.clone();
+        kobject_add_writable_attr(
+            kobj,
+            "pp_power_profile_mode",
+            move || show.power_profiles().unwrap_or_default(),
+            move |data: &[u8]| store.set_power_profile(&utf8(data)?),
         );
     }
 }
@@ -492,7 +502,44 @@ pub mod tests {
         fn power_state(&self) -> &str {
             "D0"
         }
+        fn power_profiles(&self) -> Option<String> {
+            Some(String::from("3 VIDEO*:\n5 COMPUTE :\n"))
+        }
+        fn set_power_profile(&self, profile: &str) -> Result<(), narf_filesystem::FsError> {
+            match profile.trim() {
+                "3" | "5" => Ok(()),
+                "6" => Err(narf_filesystem::FsError::Unsupported),
+                _ => Err(narf_filesystem::FsError::InvalidData),
+            }
+        }
     }
+    fn drm_factory_profile_sysfs_uses_the_live_card_methods() -> TestResult {
+        let object = Kobject::new_root("profile-fixture");
+        let card: Arc<dyn crate::drm_registry::DrmCard> = Arc::new(PciFixture);
+        add_power_controls(&object, &card);
+        assert_eq!(
+            object.attr_show("pp_power_profile_mode"),
+            Some(String::from("3 VIDEO*:\n5 COMPUTE :\n"))
+        );
+        assert!(object.attr_is_writable("pp_power_profile_mode"));
+        assert_eq!(
+            object.attr_store("pp_power_profile_mode", b"5\n"),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            object.attr_store("pp_power_profile_mode", b"6"),
+            Some(Err(narf_filesystem::FsError::Unsupported))
+        );
+        assert_eq!(
+            object.attr_store("pp_power_profile_mode", &[0xff]),
+            Some(Err(narf_filesystem::FsError::InvalidData))
+        );
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/rdna4-policy",
+        drm_factory_profile_sysfs_uses_the_live_card_methods
+    );
     fn smoke_drm_canonical_ancestry_reaches_pci() -> TestResult {
         narf_filesystem::sysfs::__reset_for_test();
         let class = class_register("drm");

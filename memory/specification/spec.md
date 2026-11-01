@@ -239,7 +239,8 @@ pub fn node_total(node: usize) -> usize;
 /// Number of NUMA nodes in the firmware-described (SRAT) topology,
 /// independent of allocator rebalance state; 1 when unknown.
 pub fn firmware_node_count() -> u32;
-/// Free-block counts for buddy orders 0 through 10.
+/// Free-block counts by buddy order, including cached base pages and pairs
+/// in orders 0 and 1 respectively.
 pub fn node_free_blocks(node: usize) -> [usize; BUDDY_ORDER_COUNT];
 
 /// Free-memory pressure band and the physical-page deficit to high.
@@ -1390,8 +1391,11 @@ x86_64 is rejected at runtime.
 - Buddy allocator free lists and their IRQ-safe locks are per-NUMA-node and
   cache-line isolated. Order-0 allocation/free is fronted by a bounded,
   cache-line-aligned per-CPU/per-node cache; refill and spill batch eight pages
-  under one zone-lock acquisition, while cached pages remain included in
-  free-page and order-0 statistics. Each successful ownership handoff updates
+  under one zone-lock acquisition. Kernel/UNMOVABLE order-1 blocks have a
+  separate eight-pair cache per CPU/node, populated only by complete returned
+  blocks and spilling four pairs at a time. User/MOVABLE blocks bypass it.
+  Cached pages remain included in free-page totals and in their corresponding
+  order's block statistics. Each successful ownership handoff updates
   one per-node atomic free-page total after removing a frame from the free pool
   or after publishing it back; watermark and aggregate-free checks read those
   counters without walking or locking all buddy zones. Cache refill, spill,
@@ -1403,7 +1407,8 @@ x86_64 is rejected at runtime.
   or folio allocation holds only one zone lock at a time; nearest-node fallback
   releases the failed zone before trying the next, so unrelated NUMA nodes do
   not serialize on a global frame lock. Coordinated draining bypasses new cache
-  insertion before high-order retry; runtime-hotplug nodes bypass the cache so
+  insertion and drains both cache classes before high-order retry or explicit
+  compaction; runtime-hotplug nodes bypass both cache classes so
   exact-range offline admission continues to observe every free frame in the
   buddy. Aggregate snapshots visit only nodes in the published online mask;
   node counters are initialized before their bit is set and their bit is

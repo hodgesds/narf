@@ -4135,13 +4135,23 @@ fn smoke_fp_usb_id_table_match() -> TestResult {
         // Synaptics
         (0x06CB, 0x00BD, FpVendor::Synaptics),
         (0x06CB, 0x00FF, FpVendor::Synaptics),
+        // Scaffold-only Synaptics (never in the old live table)
+        (0x06CB, 0x00BE, FpVendor::Synaptics),
         // Goodix
         (0x27C6, 0x5110, FpVendor::Goodix),
         (0x27C6, 0x55B4, FpVendor::Goodix),
         (0x27C6, 0x6594, FpVendor::Goodix),
+        // Scaffold-only Goodix (never in the old live table)
+        (0x27C6, 0x609C, FpVendor::Goodix),
         // ELAN
         (0x04F3, 0x0903, FpVendor::Elan),
         (0x04F3, 0x0C03, FpVendor::Elan),
+        // Scaffold-only ELAN (never in the old live table)
+        (0x04F3, 0x0C42, FpVendor::Elan),
+        // Validity (#918: the whole family was absent from the
+        // old live table and fell through to UnknownClass)
+        (0x138A, 0x0011, FpVendor::Validity),
+        (0x138A, 0x0090, FpVendor::Validity),
     ];
     for &(vid, pid, expected) in cases {
         match classify_vid_pid(vid, pid) {
@@ -4163,29 +4173,132 @@ fn smoke_fp_usb_id_table_match() -> TestResult {
 kernel_test_in!("drivers/usb/fingerprint", smoke_fp_usb_id_table_match);
 
 /// Vendor classifier: each VID maps to the correct FpVendor.
+/// Lists are the full #918 union per transport vendor.
 fn smoke_fp_vendor_classifier() -> TestResult {
     use crate::fingerprint::{classify_vid_pid, FpVendor};
-    // All Synaptics PIDs
-    for pid in [0x00BD, 0x00C2, 0x00C6, 0x00C9, 0x00DC, 0x00FF] {
+    // All Synaptics PIDs (Prometheus + MIS-older + live carryover)
+    for pid in [
+        0x00BD, 0x00BE, 0x00BF, 0x00C2, 0x00C9, 0x00A2, 0x00B7, 0x00C6, 0x00DC, 0x00FF,
+    ] {
         if !matches!(classify_vid_pid(0x06CB, pid), Some(FpVendor::Synaptics)) {
             return TestResult::Fail("Synaptics PID not classified");
         }
     }
-    // All Goodix PIDs
-    for pid in [0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4, 0x6594] {
+    // All Goodix PIDs (scaffold + live carryover)
+    for pid in [
+        0x5110, 0x5117, 0x530C, 0x533C, 0x5395, 0x55B4, 0x6594, 0x609C, 0x6584,
+    ] {
         if !matches!(classify_vid_pid(0x27C6, pid), Some(FpVendor::Goodix)) {
             return TestResult::Fail("Goodix PID not classified");
         }
     }
-    // All ELAN PIDs
-    for pid in [0x0903, 0x0907, 0x0C00, 0x0C03] {
+    // All ELAN PIDs (scaffold + live carryover)
+    for pid in [0x0903, 0x0907, 0x0C00, 0x0C03, 0x0C32, 0x0C42] {
         if !matches!(classify_vid_pid(0x04F3, pid), Some(FpVendor::Elan)) {
             return TestResult::Fail("ELAN PID not classified");
+        }
+    }
+    // All Validity PIDs (#918: previously unclassifiable)
+    for pid in [0x0007, 0x0011, 0x0090, 0x0091, 0x0097, 0x00A2] {
+        if !matches!(classify_vid_pid(0x138A, pid), Some(FpVendor::Validity)) {
+            return TestResult::Fail("Validity PID not classified");
         }
     }
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/fingerprint", smoke_fp_vendor_classifier);
+
+/// Anti-drift: the live classifier must agree with the single
+/// match authority for every one of its entries. If the authority
+/// table and the family→vendor mapping ever diverge, this fails —
+/// the #918 drift cannot recur silently.
+fn smoke_fp_classify_matches_authority_table() -> TestResult {
+    use crate::fingerprint::{classify_vid_pid, FpVendor};
+    use narf_drivers_fingerprint::{Family, FINGERPRINT_DEVICES};
+    if FINGERPRINT_DEVICES.len() != 31 {
+        return TestResult::Fail("authority table size drifted from union");
+    }
+    for d in FINGERPRINT_DEVICES.iter() {
+        let expected = match d.family {
+            Family::SynapticsPrometheus | Family::SynapticsMisOlder => FpVendor::Synaptics,
+            Family::Goodix => FpVendor::Goodix,
+            Family::Elan => FpVendor::Elan,
+            Family::Validity => FpVendor::Validity,
+        };
+        match classify_vid_pid(d.vid, d.pid) {
+            Some(v) if v == expected => {}
+            _ => return TestResult::Fail("classifier disagrees with authority table"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/fingerprint",
+    smoke_fp_classify_matches_authority_table
+);
+
+/// #918 bind gate: a Validity VFS5011 must pass the cascade's
+/// fingerprint decision — the `classify_vid_pid(...).is_some()`
+/// gate in `attach.rs` plus endpoint discovery, the two
+/// vendor-specific steps of `try_bind_fingerprint_already_addressed`.
+/// The remainder of try_bind (endpoint configuration,
+/// SET_CONFIGURATION, registry push) is vendor-agnostic, so it
+/// cannot vary by vendor; executing it needs a live xHCI and is
+/// silicon validation, not fixture work. Pre-#918 this smoke
+/// fails at the classify step: 0x138A was absent from the live
+/// table, so the device fell through to WBDI/UnknownClass.
+fn smoke_fp_validity_cascade_gate() -> TestResult {
+    use crate::fingerprint::{classify_vid_pid, find_fp_endpoints, FpEndpoints, FpVendor};
+    use crate::xhci::EndpointKind;
+    // Cascade gate 1: classification (attach.rs fingerprint step).
+    if classify_vid_pid(0x138A, 0x0011) != Some(FpVendor::Validity) {
+        return TestResult::Fail("VFS5011 did not classify as Validity");
+    }
+    // Cascade gate 2: endpoint discovery on a VFS5011-class blob
+    // (vendor class 0xFF + bulk-IN 0x81 + bulk-OUT 0x01).
+    let mut cfg: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
+    cfg[0] = 9;
+    cfg[1] = 0x02;
+    cfg[2] = 32;
+    cfg[4] = 1;
+    cfg[5] = 1;
+    cfg[9] = 9;
+    cfg[10] = 0x04;
+    cfg[11] = 0;
+    cfg[13] = 2;
+    cfg[14] = 0xFF;
+    cfg[18] = 7;
+    cfg[19] = 0x05;
+    cfg[20] = 0x81;
+    cfg[21] = 0x02;
+    cfg[22] = 0x00;
+    cfg[23] = 0x02;
+    cfg[25] = 7;
+    cfg[26] = 0x05;
+    cfg[27] = 0x01;
+    cfg[28] = 0x02;
+    cfg[29] = 0x00;
+    cfg[30] = 0x02;
+    match find_fp_endpoints(&cfg, FpVendor::Validity) {
+        Ok(FpEndpoints::Bulk {
+            bulk_in, bulk_out, ..
+        }) => {
+            if bulk_in.ep_addr != 0x81 || bulk_in.kind != EndpointKind::BulkIn {
+                return TestResult::Fail("Validity bulk-IN mis-decoded");
+            }
+            if bulk_out.ep_addr != 0x01 || bulk_out.kind != EndpointKind::BulkOut {
+                return TestResult::Fail("Validity bulk-OUT mis-decoded");
+            }
+        }
+        _ => return TestResult::Fail("Validity bulk endpoint discovery failed"),
+    }
+    // Masking counterpart: an unknown device still falls through.
+    if classify_vid_pid(0x1234, 0x5678).is_some() {
+        return TestResult::Fail("unknown VID/PID should return None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/fingerprint", smoke_fp_validity_cascade_gate);
 
 /// Endpoint discovery on synthetic config blobs.
 fn smoke_fp_endpoint_discovery() -> TestResult {
@@ -4256,6 +4369,25 @@ fn smoke_fp_endpoint_discovery() -> TestResult {
         }
         _ => return TestResult::Fail("ELAN interrupt-IN discovery failed"),
     }
+    // Validity (#918): same bulk blob resolves to the bulk arm.
+    match find_fp_endpoints(&cfg, FpVendor::Validity) {
+        Ok(FpEndpoints::Bulk {
+            bulk_in, bulk_out, ..
+        }) => {
+            if bulk_in.ep_addr != 0x81 || bulk_in.kind != EndpointKind::BulkIn {
+                return TestResult::Fail("Validity bulk-IN mis-decoded");
+            }
+            if bulk_out.ep_addr != 0x01 || bulk_out.kind != EndpointKind::BulkOut {
+                return TestResult::Fail("Validity bulk-OUT mis-decoded");
+            }
+        }
+        _ => return TestResult::Fail("Validity bulk discovery failed"),
+    }
+    // Masking defeat: a Validity device with only interrupt-IN
+    // must fail discovery, not bind with a bogus bulk pair.
+    if find_fp_endpoints(&cfg2, FpVendor::Validity).is_ok() {
+        return TestResult::Fail("Validity without bulk pair must not discover");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/fingerprint", smoke_fp_endpoint_discovery);
@@ -4270,6 +4402,190 @@ fn smoke_fp_no_reader_on_qemu() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/fingerprint", smoke_fp_no_reader_on_qemu);
+
+/// Endpoint discovery against composite descriptors: the resolved
+/// pair must always belong to the LAST matching interface, never
+/// to an earlier HID or vendor interface (host unit tests pin the
+/// same cases; this smoke runs them on both arches in CI).
+fn smoke_fp_endpoint_discovery_composite() -> TestResult {
+    use crate::fingerprint::{find_fp_endpoints, FpEndpoints, FpVendor};
+    use crate::xhci::EndpointKind;
+
+    // HID iface (intr 0x82) then vendor iface (bulk 0x81/0x02):
+    // Goodix must resolve the vendor pair, not the HID endpoint.
+    let mut cfg: alloc::vec::Vec<u8> = alloc::vec![0u8; 48];
+    cfg[0] = 9;
+    cfg[1] = 0x02;
+    cfg[2] = 48;
+    cfg[4] = 2;
+    cfg[5] = 1;
+    cfg[9] = 9;
+    cfg[10] = 0x04;
+    cfg[11] = 0;
+    cfg[13] = 1;
+    cfg[14] = 0x03;
+    cfg[18] = 7;
+    cfg[19] = 0x05;
+    cfg[20] = 0x82;
+    cfg[21] = 0x03;
+    cfg[22] = 0x40;
+    cfg[25] = 9;
+    cfg[26] = 0x04;
+    cfg[27] = 1;
+    cfg[29] = 2;
+    cfg[30] = 0xFF;
+    cfg[34] = 7;
+    cfg[35] = 0x05;
+    cfg[36] = 0x81;
+    cfg[37] = 0x02;
+    cfg[38] = 0x00;
+    cfg[39] = 0x02;
+    cfg[41] = 7;
+    cfg[42] = 0x05;
+    cfg[43] = 0x02;
+    cfg[44] = 0x02;
+    cfg[45] = 0x00;
+    cfg[46] = 0x02;
+    match find_fp_endpoints(&cfg, FpVendor::Goodix) {
+        Ok(FpEndpoints::Bulk {
+            bulk_in, bulk_out, ..
+        }) => {
+            if bulk_in.ep_addr != 0x81 || bulk_in.kind != EndpointKind::BulkIn {
+                return TestResult::Fail("composite: bulk-IN not from vendor iface");
+            }
+            if bulk_out.ep_addr != 0x02 || bulk_out.kind != EndpointKind::BulkOut {
+                return TestResult::Fail("composite: bulk-OUT not from vendor iface");
+            }
+        }
+        _ => return TestResult::Fail("composite: vendor pair not found"),
+    }
+    // ELAN on the same blob: the HID interrupt endpoint is on a
+    // non-matching interface, so nothing resolves.
+    if find_fp_endpoints(&cfg, FpVendor::Elan).is_ok() {
+        return TestResult::Fail("composite: ELAN resolved a HID endpoint");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/fingerprint",
+    smoke_fp_endpoint_discovery_composite
+);
+
+/// WBDI descriptor-set walk masking defeats (pure logic, no
+/// controller). The plain-WINUSB-first case lives in PR #1237 and
+/// is not duplicated here.
+fn smoke_fp_wbdi_set_masking() -> TestResult {
+    use crate::wbdi::is_wbdi_descriptor_set;
+
+    fn compat(cid: &[u8; 8], sub: &[u8; 8]) -> [u8; 20] {
+        let mut f = [0u8; 20];
+        f[0..2].copy_from_slice(&20u16.to_le_bytes());
+        f[2..4].copy_from_slice(&3u16.to_le_bytes());
+        f[4..12].copy_from_slice(cid);
+        f[12..20].copy_from_slice(sub);
+        f
+    }
+    fn set(features: &[&[u8]], total_override: Option<u16>) -> alloc::vec::Vec<u8> {
+        let actual: usize = 10 + features.iter().map(|f| f.len()).sum::<usize>();
+        let total = total_override.unwrap_or(actual as u16);
+        let mut blob = alloc::vec![0u8; actual];
+        blob[0..2].copy_from_slice(&10u16.to_le_bytes());
+        blob[4..8].copy_from_slice(&0x06030000u32.to_le_bytes());
+        blob[8..10].copy_from_slice(&total.to_le_bytes());
+        let mut off = 10;
+        for f in features {
+            blob[off..off + f.len()].copy_from_slice(f);
+            off += f.len();
+        }
+        blob
+    }
+
+    let wbdi = compat(b"WINUSB\0\0", b"WBDI\0\0\0\0");
+    let wrong_sub = compat(b"WINUSB\0\0", b"MTP\0\0\0\0\0");
+    if is_wbdi_descriptor_set(&set(&[&wrong_sub], None)) {
+        return TestResult::Fail("wrong sub-id accepted as WBDI");
+    }
+    // 24-byte Compatible-ID feature: length != 20, must be skipped.
+    let mut long = [0u8; 24];
+    long[0..2].copy_from_slice(&24u16.to_le_bytes());
+    long[2..4].copy_from_slice(&3u16.to_le_bytes());
+    long[4..12].copy_from_slice(b"WINUSB\0\0");
+    long[12..20].copy_from_slice(b"WBDI\0\0\0\0");
+    if is_wbdi_descriptor_set(&set(&[&long], None)) {
+        return TestResult::Fail("wrong-length Compatible-ID accepted");
+    }
+    if is_wbdi_descriptor_set(&set(&[&wbdi], Some(100))) {
+        return TestResult::Fail("total-overrun set accepted");
+    }
+    let mut bad_header = set(&[&wbdi], None);
+    bad_header[0..2].copy_from_slice(&9u16.to_le_bytes());
+    if is_wbdi_descriptor_set(&bad_header) {
+        return TestResult::Fail("bad header length accepted");
+    }
+    let plain = compat(b"WINUSB\0\0", b"\0\0\0\0\0\0\0\0");
+    if !is_wbdi_descriptor_set(&set(&[&wbdi, &plain], None)) {
+        return TestResult::Fail("WBDI-first set not recognised");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/fingerprint", smoke_fp_wbdi_set_masking);
+
+/// BOS platform-capability walk (pure logic, no controller).
+/// MS OS 2.0 §3.4 Table 4 layout.
+fn smoke_fp_bos_platform_cap() -> TestResult {
+    use crate::wbdi::find_ms_os_20_platform_cap;
+
+    const MS_UUID: [u8; 16] = [
+        0xDF, 0x60, 0xDD, 0xD8, 0x89, 0x45, 0xC7, 0x4C, 0x9C, 0xD2, 0x65, 0x9D, 0x9E, 0x64, 0x8A,
+        0x9F,
+    ];
+    fn cap(uuid: &[u8; 16], total_set: u16, vendor_code: u8) -> [u8; 28] {
+        let mut c = [0u8; 28];
+        c[0] = 28;
+        c[1] = 0x10;
+        c[2] = 0x05;
+        c[4..20].copy_from_slice(uuid);
+        c[20..24].copy_from_slice(&0x06030000u32.to_le_bytes());
+        c[24..26].copy_from_slice(&total_set.to_le_bytes());
+        c[26] = vendor_code;
+        c
+    }
+    fn bos(caps: &[&[u8]]) -> alloc::vec::Vec<u8> {
+        let total: usize = 5 + caps.iter().map(|c| c.len()).sum::<usize>();
+        let mut blob = alloc::vec![0u8; total];
+        blob[0] = 5;
+        blob[1] = 0x0F;
+        blob[2..4].copy_from_slice(&(total as u16).to_le_bytes());
+        blob[4] = 1;
+        let mut off = 5;
+        for c in caps {
+            blob[off..off + c.len()].copy_from_slice(c);
+            off += c.len();
+        }
+        blob
+    }
+
+    let ms = cap(&MS_UUID, 30, 0x42);
+    if find_ms_os_20_platform_cap(&bos(&[&ms])) != Some((0x42, 30)) {
+        return TestResult::Fail("MS platform cap not found");
+    }
+    let other = cap(&[0u8; 16], 30, 0x42);
+    if find_ms_os_20_platform_cap(&bos(&[&other])).is_some() {
+        return TestResult::Fail("non-MS UUID accepted");
+    }
+    if find_ms_os_20_platform_cap(&bos(&[&other, &ms])) != Some((0x42, 30)) {
+        return TestResult::Fail("MS cap second not found");
+    }
+    let mut truncated = [0u8; 20];
+    truncated[0] = 20;
+    truncated[1] = 0x10;
+    truncated[2] = 0x05;
+    if find_ms_os_20_platform_cap(&bos(&[&truncated])).is_some() {
+        return TestResult::Fail("truncated cap accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/fingerprint", smoke_fp_bos_platform_cap);
 
 /// xHCI control helpers reject a method/SETUP direction mismatch. This is
 /// load-bearing for payload-carrying host-to-device requests such as HID
@@ -7109,6 +7425,130 @@ fn smoke_uvc_streamon_composition_e2e() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/uvc", smoke_uvc_streamon_composition_e2e);
+
+/// Two modelled cameras bind, the first detaches cleanly (binding
+/// and node both gone, survivor untouched), detach is idempotent
+/// and a no-op for unknown slots, wholesale detach clears the rest,
+/// and a re-bind of the same slot publishes under a fresh index —
+/// never a duplicate node for the same camera.
+fn smoke_uvc_detach_drops_binding_and_node() -> TestResult {
+    let (transport, _idx, _dev, _ctx, _events) = match uvc_fixture_bound(false, false) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // Second modelled camera on slot 8, same descriptor blob, no
+    // registry reset — the two bindings must coexist.
+    if narf_scheduler::block_on(crate::uvc::try_bind_video_with_transport(
+        &*transport,
+        8,
+        &uvc_fixture_config_blob(),
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("second camera bind failed");
+    }
+    let (node7, node8) = {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        let first = match devices.iter().find(|d| d.slot_id == 7) {
+            Some(d) => d.video_node,
+            None => return TestResult::Fail("slot 7 binding missing"),
+        };
+        let second = match devices.iter().find(|d| d.slot_id == 8) {
+            Some(d) => d.video_node,
+            None => return TestResult::Fail("slot 8 binding missing"),
+        };
+        (first, second)
+    };
+    if crate::uvc::attached_uvc_count() != 2 {
+        return TestResult::Fail("two cameras should be bound");
+    }
+    if node7 == node8 {
+        return TestResult::Fail("two cameras must publish distinct nodes");
+    }
+    if narf_drivers_video::devfs_bridge::get_device(node7).is_none()
+        || narf_drivers_video::devfs_bridge::get_device(node8).is_none()
+    {
+        return TestResult::Fail("both nodes must resolve before detach");
+    }
+    crate::uvc::detach_uvc(7);
+    if crate::uvc::attached_uvc_count() != 1 {
+        return TestResult::Fail("detach must drop exactly one binding");
+    }
+    if crate::uvc::UVC_DEVICES
+        .lock()
+        .iter()
+        .any(|d| d.slot_id == 7)
+    {
+        return TestResult::Fail("slot 7 binding must be gone");
+    }
+    if narf_drivers_video::devfs_bridge::get_device(node7).is_some() {
+        return TestResult::Fail("detached node must no longer resolve");
+    }
+    if narf_drivers_video::devfs_bridge::get_device(node8).is_none() {
+        return TestResult::Fail("survivor node must keep resolving");
+    }
+    // Idempotent, and unknown slots are a silent no-op.
+    crate::uvc::detach_uvc(7);
+    crate::uvc::detach_uvc(99);
+    if crate::uvc::attached_uvc_count() != 1 {
+        return TestResult::Fail("repeat/unknown detach must not change the registry");
+    }
+    crate::uvc::detach_all_uvc();
+    if crate::uvc::attached_uvc_count() != 0 {
+        return TestResult::Fail("wholesale detach must clear every binding");
+    }
+    if narf_drivers_video::devfs_bridge::get_device(node8).is_some() {
+        return TestResult::Fail("wholesale detach must unregister every node");
+    }
+    // Re-bind the same slot: a fresh node, never a duplicate, and
+    // the index is not recycled (the old minor stays retired).
+    if narf_scheduler::block_on(crate::uvc::try_bind_video_with_transport(
+        &*transport,
+        7,
+        &uvc_fixture_config_blob(),
+    ))
+    .is_err()
+    {
+        return TestResult::Fail("re-bind after detach failed");
+    }
+    let rebound_node = match crate::uvc::UVC_DEVICES
+        .lock()
+        .iter()
+        .find(|d| d.slot_id == 7)
+    {
+        Some(d) => d.video_node,
+        None => return TestResult::Fail("re-bound slot 7 binding missing"),
+    };
+    if rebound_node == node7 {
+        return TestResult::Fail("re-bind must not recycle the detached index");
+    }
+    if crate::uvc::attached_uvc_count() != 1 {
+        return TestResult::Fail("re-bind must leave exactly one binding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_detach_drops_binding_and_node);
+
+/// The class-registry unbind hook installed by
+/// `uvc::register_initcalls` must reach `detach_uvc` through the
+/// supervisor's `dispatch_unbind` path — the wiring the hub-detach
+/// path actually uses, not just the detach function in isolation.
+fn smoke_uvc_dispatch_unbind_reaches_detach() -> TestResult {
+    let (_transport, _idx, _dev, _ctx, _events) = match uvc_fixture_bound(false, false) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    crate::uvc::register_initcalls();
+    let report = crate::class_registry::dispatch_unbind(7);
+    if report.invoked == 0 {
+        return TestResult::Fail("dispatch_unbind invoked no hooks");
+    }
+    if crate::uvc::attached_uvc_count() != 0 {
+        return TestResult::Fail("unbind hook must drop the slot 7 binding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_dispatch_unbind_reaches_detach);
 
 fn smoke_uvc_streamon_probe_failure_fails_ioctl() -> TestResult {
     let (transport, idx, dev, ctx, events) = match uvc_fixture_bound(true, false) {

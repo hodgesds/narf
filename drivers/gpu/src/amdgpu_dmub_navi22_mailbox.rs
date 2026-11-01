@@ -315,6 +315,89 @@ impl<I: Io> Engine<I> {
             tick().await;
         }
     }
+    /// Bounded memory-command chain, published with one write-pointer update.
+    /// Firmware may defer processing until multi_cmd_pending clears, so waiting
+    /// after each slot would deadlock. An interrupted chain keeps InFlight.
+    #[allow(dead_code, reason = "shared transport; chained FAMS2 is DCN401-only")]
+    pub(super) async fn command_list(&mut self, requests: &[[u8; 64]]) -> Result<(), Error> {
+        if requests.is_empty()
+            || requests.len() > 9
+            || requests
+                .iter()
+                .enumerate()
+                .any(|(i, c)| c[3] > 60 || c[2] != if i + 1 == requests.len() { 0 } else { 2 })
+        {
+            return Err(Error::Invalid);
+        }
+        self.check_mailbox()?;
+        let l = self.layout;
+        let map = self.memory.mapping();
+        let old = self.mailbox.write;
+        let bytes = requests.len() as u32 * SLOT;
+        let next = (old + bytes) % SIZE;
+        let base = self.mailbox_offset();
+        self.access(|io| {
+            for (i, command) in requests.iter().enumerate() {
+                let offset = base + u64::from((old + i as u32 * SLOT) % SIZE);
+                for (j, word) in command.chunks_exact(4).enumerate() {
+                    io.upload(
+                        map,
+                        offset + j as u64 * 4,
+                        u32::from_le_bytes(word.try_into().unwrap()),
+                    );
+                }
+            }
+            flush(io, l)
+        })?;
+        self.mailbox.write = next;
+        self.access(|io| {
+            io.write(l.dcn + u64::from(IN_W) * 4, next);
+            Ok(())
+        })?;
+        let deadline = narf_time::Deadline::after_ms(200);
+        #[cfg(feature = "kernel-test")]
+        let mut polls = self.io.wait_poll_limit();
+        let mut progress = 0;
+        loop {
+            let done = self.access(|io| {
+                alive(io, l)?;
+                if read(io, l.dcn, IN_W)? != next {
+                    return Err(Error::Protocol);
+                }
+                let rp = pointer(read(io, l.dcn, IN_R)?)?;
+                let advanced = (rp + SIZE - old) % SIZE;
+                if advanced < progress || advanced > bytes {
+                    return Err(Error::Protocol);
+                }
+                progress = advanced;
+                Ok(rp == next)
+            })?;
+            if done {
+                break;
+            }
+            #[cfg(feature = "kernel-test")]
+            if let Some(left) = &mut polls {
+                if *left == 0 {
+                    return Err(Error::CommandTimeout);
+                }
+                *left -= 1;
+                narf_scheduler::yield_now().await;
+                continue;
+            }
+            if deadline.expired() {
+                return Err(Error::CommandTimeout);
+            }
+            tick().await;
+        }
+        for (i, request) in requests.iter().enumerate() {
+            let offset = base + u64::from((old + i as u32 * SLOT) % SIZE);
+            let reply = self.access(|io| Ok(download(io, l, map, offset)))?;
+            if reply[..2] != request[..2] || reply[3] != request[3] || reply[2] & !2 != 0 {
+                return Err(Error::Protocol);
+            }
+        }
+        Ok(())
+    }
     fn outbox(&mut self) -> Result<Option<[u8; 64]>, Error> {
         let l = self.layout;
         let map = self.memory.mapping();

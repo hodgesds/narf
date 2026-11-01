@@ -23,7 +23,7 @@ pub use surface::{
     SurfaceFormat, SurfaceRequest, VblankPhase, CURSOR_MAX, MAX_OVERLAYS,
 };
 pub use surface::{DccBlock, PlaneSurface, SurfaceBytes, Swizzle, Tiling, YuvColor};
-pub use surface::{ExternalSurface, FlipSource, InputTf, PreDegam};
+pub use surface::{ExternalSurface, FlipSource, InputTf, PreDegam, SubvpApplied};
 
 const HUBP_CONTROL: u64 = 0x5f4;
 const HUBP_CLOCK: u64 = 0x5f5;
@@ -107,6 +107,11 @@ impl<I: Io> Engine<I> {
         let l = self.layout;
         let mine = live.map_or_else(alloc::vec::Vec::new, |s| s.live_pipes(self.status.cursor));
         for pipe in l.pool.pipes() {
+            // Firmware may run the retained phantom during a read-only main
+            // health check. Native mutations require config-off and drain.
+            if self.status.subvp.is_some_and(|s| s.phantom == pipe) {
+                continue;
+            }
             // The owned live scanout's pipes (every plane, both ODM halves),
             // and another display's, must be exactly that.
             let theirs = self.displays.siblings.live[usize::from(pipe)];

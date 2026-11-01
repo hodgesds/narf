@@ -5,8 +5,8 @@
 //! last sample. Fan control stays automatic: smu_v14_0_2_ppt.c provides no
 //! fan-mode or PWM setters, so `pwm1`/`pwm1_enable` are read-only as in Linux.
 //! `power1_cap` is writable (amdgpu_hwmon_set_power_cap: microwatts to watts,
-//! checked against `power1_cap_{min,max}`); nothing else changes clocks,
-//! limits or protection.
+//! checked against `power1_cap_{min,max}`). Factory workload controls below
+//! change only the selected heuristics and previously admitted sleep bits.
 use crate::amdgpu_smu_navi48 as smu;
 use crate::amdgpu_smu_navi48_telemetry::{Limits, Telemetry, CRIT_HYST_MILLI, THROTTLERS};
 use alloc::{string::String, vec::Vec};
@@ -14,6 +14,20 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use narf_filesystem::FsError;
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+static GFX_ULV_ALLOWED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+static DCF_SLEEP_ALLOWED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+/// Boot policy, before native ownership is constructed.
+pub fn set_extra_sleep(gfx_ulv: bool, dcf_sleep: bool) {
+    GFX_ULV_ALLOWED.store(gfx_ulv, Ordering::Release);
+    DCF_SLEEP_ALLOWED.store(dcf_sleep, Ordering::Release);
+}
+pub(crate) fn gfx_ulv_requested() -> bool {
+    GFX_ULV_ALLOWED.load(Ordering::Acquire)
+}
+pub(crate) fn dcf_sleep_requested() -> bool {
+    DCF_SLEEP_ALLOWED.load(Ordering::Acquire)
+}
 #[path = "amdgpu_navi48_thermal.rs"]
 pub mod thermal;
 
@@ -135,6 +149,8 @@ pub struct Snapshot {
     /// Every protection running after boot is still running in `telemetry`.
     pub protected: bool,
     pub gfx_level: smu::GfxLevel,
+    pub profile: smu::PowerProfile,
+    pub coefficients: Option<smu::ProfileCoefficients>,
     /// Error of the latest refresh, cleared by the next success.
     pub error: Option<smu::Error>,
     pub samples: u64,
@@ -147,6 +163,8 @@ pub struct Sample {
     pub limits: Option<Limits>,
     pub protected: bool,
     pub gfx_level: smu::GfxLevel,
+    pub profile: smu::PowerProfile,
+    pub coefficients: Option<smu::ProfileCoefficients>,
 }
 
 static SNAPSHOT: IrqSafeSpinLock<Option<Snapshot>> = IrqSafeSpinLock::new(None);
@@ -280,6 +298,8 @@ pub(crate) fn update(previous: Option<Snapshot>, sample: Sample) -> (Snapshot, E
         limits: sample.limits,
         protected,
         gfx_level: sample.gfx_level,
+        profile: sample.profile,
+        coefficients: sample.coefficients,
         error,
         samples: previous.map_or(0, |p| p.samples) + u64::from(error.is_none()),
     };
@@ -464,7 +484,7 @@ pub(crate) fn publish(limits: Option<Limits>) {
 
 /// Seed limits, publish hwmon and start the monitor. Call once, after the
 /// retained boot succeeded.
-pub(crate) fn start(limits: Option<Limits>, gfx_level: smu::GfxLevel) {
+pub(crate) fn start(limits: Option<Limits>, gfx_level: smu::GfxLevel, profile: smu::PowerProfile) {
     {
         let mut published = SNAPSHOT.lock();
         if published.is_some() {
@@ -475,6 +495,8 @@ pub(crate) fn start(limits: Option<Limits>, gfx_level: smu::GfxLevel) {
             limits,
             protected: false,
             gfx_level,
+            profile,
+            coefficients: None,
             error: None,
             samples: 0,
         });
@@ -493,7 +515,11 @@ pub(crate) fn stop() {
         snapshot.error = Some(smu::Error::DeviceGone);
     }
 }
-pub(crate) fn restart(limits: Option<Limits>, gfx_level: smu::GfxLevel) {
+pub(crate) fn restart(
+    limits: Option<Limits>,
+    gfx_level: smu::GfxLevel,
+    profile: smu::PowerProfile,
+) {
     let generation = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     ALERTS.cancel();
     *SNAPSHOT.lock() = Some(Snapshot {
@@ -501,6 +527,8 @@ pub(crate) fn restart(limits: Option<Limits>, gfx_level: smu::GfxLevel) {
         limits,
         protected: false,
         gfx_level,
+        profile,
+        coefficients: None,
         error: None,
         samples: 0,
     });
@@ -511,3 +539,8 @@ pub(crate) fn restart(limits: Option<Limits>, gfx_level: smu::GfxLevel) {
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi48_power_tests.rs"]
 mod tests;
+
+#[path = "amdgpu_navi48_profile.rs"]
+mod profile;
+pub(crate) use profile::{applied as applied_profile, ProfileRequest};
+pub use profile::{profiles, request_profile};

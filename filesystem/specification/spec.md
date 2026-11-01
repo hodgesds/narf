@@ -43,6 +43,15 @@
 
 ## 3. Public interface
 
+`FileOps::hardware_clock()` optionally returns the retained precision-clock
+interface for a dynamic clock fd. `devfs_ptp` publishes registered `/dev/ptpN`
+nodes (0600), PHC capability ioctls and bounded system/device offset sampling
+(old and v2 layouts, at most 25 samples). Ioctl size/direction are validated;
+user access uses `IoctlContext`. Open descriptors retain their clock object
+across registry removal/index reuse. Driver removal determines whether that
+object can still serve operations; an old fd never resolves a replacement.
+
+
 The `/dev/fb0` proxy forwards the driver's complete `MmapBacking`, including
 memory type and lifetime, instead of rebuilding it from `mmap_frames`.
 Framebuffer device mappings request WC; the memory owner retains WB for

@@ -64,7 +64,7 @@ use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::class_registry::{register_class_driver, UsbClassMatch, UsbProbeError};
+use crate::class_registry::{register_class_driver_with_unbind, UsbClassMatch, UsbProbeError};
 use crate::device::USBDevice;
 use crate::xhci::{EndpointConfig, EndpointKind};
 
@@ -471,6 +471,13 @@ pub struct RtlDevice {
     pub pump_running: bool,
     /// Last `PLA_PHYSTATUS` byte sampled (0xFF = never sampled).
     pub link_byte: u8,
+    /// Detach tombstone: set by `detach_r8152_slot`. The pump
+    /// exits when `pump_running` clears; TX resolves to `None`.
+    /// Records are never removed, because net-registry TX
+    /// cookies are record indices — removing a record would
+    /// retarget every later device's cookie at the wrong
+    /// device (the ECM/NCM rule).
+    pub detached: bool,
 }
 
 /// System-wide registry of bound RTL devices.
@@ -482,7 +489,9 @@ pub static RTL_DEVICES: IrqSafeSpinLock<Vec<RtlDevice>> = IrqSafeSpinLock::new(V
 /// different device's endpoint.
 pub fn tx_target(idx: usize) -> Option<(u8, u8)> {
     let g = RTL_DEVICES.lock();
-    g.get(idx).map(|d| (d.slot_id, d.bulk_out_dci))
+    g.get(idx)
+        .filter(|d| !d.detached)
+        .map(|d| (d.slot_id, d.bulk_out_dci))
 }
 
 /// `SendCtxFn` trampoline: the cookie is the device-record index
@@ -608,6 +617,7 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
             iface_name: format!("usb-rtl{}", idx),
             pump_running: false,
             link_byte: 0xFF,
+            detached: false,
         });
         idx
     };
@@ -769,9 +779,72 @@ fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
     Ok(())
 }
 
-/// Register the r8152 USB class driver.
+/// Detach hook for a slot: tombstone every RTL record bound to
+/// it and unregister its net iface. The pump exits at its next
+/// `pump_should_continue` check once `pump_running` clears;
+/// TX resolves to `None` instead of retargeting a later device
+/// (records are never removed — the ECM/NCM rule: net-registry
+/// TX cookies are record indices). Unknown slots no-op; repeat
+/// detach is a silent no-op (unregister is idempotent).
+///
+/// Panic-free and idempotent by the #893 hook contract: no
+/// indexing and no fallible unwraps on any path. Tombstones
+/// are set under the registry lock and iface names collected
+/// there, but the net unregister runs after the lock is
+/// released — the net registry lock must never be taken while
+/// the RTL registry lock is held (UVC collect-then-unregister
+/// pattern). A TX already past `tx_target` when detach lands
+/// may still hit the wire; every later TX fail-closes.
+///
+/// Infallible bookkeeping, adapted to the [`UsbUnbindFn`]
+/// contract with an unconditional `Ok(())` (#893: a hook
+/// reports failure with `Err(())`, never by panicking).
+pub fn detach_r8152_slot(slot_id: u8) -> Result<(), ()> {
+    let ifaces: Vec<String> = {
+        let mut g = RTL_DEVICES.lock();
+        let mut names = Vec::new();
+        for dev in g.iter_mut().filter(|d| d.slot_id == slot_id && !d.detached) {
+            dev.detached = true;
+            dev.pump_running = false;
+            names.push(dev.iface_name.clone());
+        }
+        names
+    };
+    for name in ifaces {
+        let _ = narf_net::iface::unregister(&name);
+    }
+    Ok(())
+}
+
+/// Wholesale variant of [`detach_r8152_slot`] for controller
+/// recovery (`attach::detach_all_bindings`): tombstone every
+/// RTL binding and unregister every net iface, regardless of
+/// slot. Infallible and idempotent, same pump-exit and
+/// never-remove reasoning as [`detach_r8152_slot`].
+pub fn detach_all_r8152() {
+    let ifaces: Vec<String> = {
+        let mut g = RTL_DEVICES.lock();
+        let mut names = Vec::new();
+        for dev in g.iter_mut().filter(|d| !d.detached) {
+            dev.detached = true;
+            dev.pump_running = false;
+            names.push(dev.iface_name.clone());
+        }
+        names
+    };
+    for name in ifaces {
+        let _ = narf_net::iface::unregister(&name);
+    }
+}
+
+/// Register the r8152 USB class driver, together with its
+/// detach hook. The probe spawns the async bind (xpad
+/// precedent); the unbind hook adapts infallible
+/// `detach_r8152_slot` to the fallible `UsbUnbindFn` contract
+/// with an unconditional `Ok(())` (#893: a hook reports
+/// failure with `Err(())`, never by panicking).
 pub fn register() {
-    let _ = register_class_driver("r8152", MATCHES, probe);
+    let _ = register_class_driver_with_unbind("r8152", MATCHES, probe, detach_r8152_slot);
 }
 
 // ── Fixtures ─────────────────────────────────────────────────────
@@ -1062,6 +1135,7 @@ pub mod tests {
             iface_name: alloc::format!("usb-rtl-model-{}", slot_id),
             pump_running: false,
             link_byte: 0xFF,
+            detached: false,
         };
         {
             let mut g = RTL_DEVICES.lock();
@@ -1080,4 +1154,163 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/r8152", smoke_r8152_tx_routing_two_devices);
+
+    /// Two modelled RTL devices bind; detaching the first
+    /// tombstones exactly its record (TX fail-closes, net iface
+    /// unregisters, survivor untouched), detach is idempotent
+    /// and a no-op for unknown slots, wholesale detach clears
+    /// the rest, and a re-push of the same slot publishes under
+    /// a fresh index — never a duplicate iface, never a
+    /// retargeted TX cookie. Masking-defeating case: the
+    /// detached record's pump had already exited
+    /// (`pump_running` false before detach) yet detach still
+    /// tombstones + unregisters.
+    fn smoke_r8152_detach_tombstones_and_unregisters() -> TestResult {
+        RTL_DEVICES.lock().clear();
+        let mk = |slot_id: u8, out_dci: u8| RtlDevice {
+            slot_id,
+            generation: RtlGen::GbE,
+            mac: [0x02, 0, 0, 0, 0, slot_id],
+            bulk_in_dci: 3,
+            bulk_out_dci: out_dci,
+            iface_name: alloc::format!("usb-rtl-detach{}", slot_id),
+            pump_running: true,
+            link_byte: 0xFF,
+            detached: false,
+        };
+        {
+            let mut g = RTL_DEVICES.lock();
+            g.push(mk(7, 4));
+            g.push(mk(9, 6));
+        }
+        // Register the net ifaces for real, capturing the
+        // assigned names, so the unregister half is asserted
+        // against the net registry, not trusted. Names follow
+        // the production rule (`usb-rtl{record index}`).
+        let (name7, name9) = {
+            let mut g = RTL_DEVICES.lock();
+            let n7 = narf_net::iface::register_with_context(
+                "usb-rtl0",
+                [0x02, 0, 0, 0, 0, 7],
+                0,
+                rtl_send_ctx,
+            );
+            let n9 = narf_net::iface::register_with_context(
+                "usb-rtl1",
+                [0x02, 0, 0, 0, 0, 9],
+                1,
+                rtl_send_ctx,
+            );
+            g[0].iface_name = n7.clone();
+            g[1].iface_name = n9.clone();
+            (n7, n9)
+        };
+        if narf_net::iface::lookup(&name7).is_none() || narf_net::iface::lookup(&name9).is_none() {
+            RTL_DEVICES.lock().clear();
+            return TestResult::Fail("net ifaces must resolve before detach");
+        }
+        // Simulate the first pump having already exited.
+        {
+            let mut g = RTL_DEVICES.lock();
+            g[0].pump_running = false;
+        }
+        if detach_r8152_slot(7).is_err() {
+            RTL_DEVICES.lock().clear();
+            return TestResult::Fail("detach must be infallible");
+        }
+        let ok = tx_target(0).is_none()
+            && narf_net::iface::lookup(&name7).is_none()
+            && tx_target(1) == Some((9, 6))
+            && narf_net::iface::lookup(&name9).is_some();
+        if !ok {
+            RTL_DEVICES.lock().clear();
+            return TestResult::Fail("detach must tombstone exactly one binding");
+        }
+        // Idempotent, and unknown slots are a silent no-op.
+        let _ = detach_r8152_slot(7);
+        let _ = detach_r8152_slot(99);
+        if tx_target(1) != Some((9, 6)) {
+            RTL_DEVICES.lock().clear();
+            return TestResult::Fail("repeat/unknown detach must not change the registry");
+        }
+        detach_all_r8152();
+        if tx_target(1).is_some() || narf_net::iface::lookup(&name9).is_some() {
+            RTL_DEVICES.lock().clear();
+            return TestResult::Fail("wholesale detach must clear every binding");
+        }
+        // Re-push the same slot: records are never removed, so
+        // the new record lands at a fresh index with a fresh
+        // iface name — never a duplicate, never a recycled
+        // cookie. The re-bound name follows the production
+        // rule (`usb-rtl{record index}`), exactly as bind
+        // assigns it.
+        let idx = {
+            let mut g = RTL_DEVICES.lock();
+            let idx = g.len();
+            g.push(mk(7, 4));
+            g[idx].iface_name = alloc::format!("usb-rtl{}", idx);
+            idx
+        };
+        if idx != 2 {
+            RTL_DEVICES.lock().clear();
+            return TestResult::Fail("re-bind must not reuse a tombstoned index");
+        }
+        let fresh = {
+            let g = RTL_DEVICES.lock();
+            g[idx].iface_name.clone()
+        };
+        if fresh == name7 {
+            RTL_DEVICES.lock().clear();
+            return TestResult::Fail("re-bind must not recycle the detached iface name");
+        }
+        let _ = detach_r8152_slot(7);
+        if tx_target(idx).is_some() {
+            RTL_DEVICES.lock().clear();
+            return TestResult::Fail("cleanup detach must leave no live binding");
+        }
+        RTL_DEVICES.lock().clear();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/r8152",
+        smoke_r8152_detach_tombstones_and_unregisters
+    );
+
+    /// The class-registry unbind hook installed by
+    /// `r8152::register` must reach `detach_r8152_slot`
+    /// through the supervisor's `dispatch_unbind` path — the
+    /// wiring the hub-detach path actually uses, not just the
+    /// detach function in isolation.
+    fn smoke_r8152_dispatch_unbind_reaches_detach() -> TestResult {
+        RTL_DEVICES.lock().clear();
+        {
+            let mut g = RTL_DEVICES.lock();
+            g.push(RtlDevice {
+                slot_id: 7,
+                generation: RtlGen::GbE,
+                mac: [0x02, 0, 0, 0, 0, 7],
+                bulk_in_dci: 3,
+                bulk_out_dci: 4,
+                iface_name: alloc::format!("usb-rtl-detach{}", 7),
+                pump_running: true,
+                link_byte: 0xFF,
+                detached: false,
+            });
+        }
+        register();
+        let report = crate::class_registry::dispatch_unbind(7);
+        let live = tx_target(0);
+        RTL_DEVICES.lock().clear();
+        if report.invoked == 0 {
+            return TestResult::Fail("dispatch_unbind invoked no hooks");
+        }
+        if live.is_some() {
+            return TestResult::Fail("unbind hook must tombstone the slot 7 binding");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/r8152",
+        smoke_r8152_dispatch_unbind_reaches_detach
+    );
 }

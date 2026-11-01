@@ -1515,7 +1515,7 @@ DCHUB reference — there is no per-SKU bounding box).
 | Linux site | GC 12.0.1 / MP 14.0.3 (Navi48) | GC 12.0.0 / MP 14.0.2 (Navi44) | NARF |
 | --- | --- | --- | --- |
 | `soc24_common_early_init` `external_rev_id` | `rev_id + 0x50` | `rev_id + 0x40` | `Rdna4Chip::external_rev` on `rev_id`, the NBIO `STRAP_ATI_REV_ID` strap (`amdgpu_rdna4::rev_id_strap`: `nbif_v6_3_1_get_rev_id` / `nbio_v7_7_get_rev_id`, BASE_IDX 2), read by the probe — never the PCI revision; DEV_INFO `chip_rev`/`external_rev`, plus `pci_rev` (`pdev->revision`) and `mall_size` (`amdgpu_discovery::mall_size`, MALL_INFO less harvested UMCs) once the probe publishes `Rdna4Identity`. Every 4-bit strap lands in Mesa's `AMDGPU_GFX1200_RANGE` [0x40, 0x50) / `AMDGPU_GFX1201_RANGE` [0x50, 0xFF) (`mesa_external_rev_range`). An unreadable PCI revision or strap fails the RDNA4 probe (Linux never enumerates such a function) |
-| `soc24_common_early_init` pg_flags | VCN, JPEG, VCN_DPG, **JPEG_DPG** | VCN, JPEG, VCN_DPG | `jpeg_dpg()` recorded; both start JPEG/VCN statically (no DPG) |
+| `soc24_common_early_init` pg_flags | VCN, JPEG, VCN_DPG, **JPEG_DPG** | VCN, JPEG, VCN_DPG | Static bootstrap on both; VCN5 DPG on both, JPEG5 DPG only Navi48, after native proofs |
 | `kfd_device.c` gfx_target_version | 120001 (gfx1201) | 120000 (gfx1200) | `gfx_target_version()`; no KFD |
 | `gfx_v12_0`, `imu_v12_0`, `mes_v12_0` firmware | `gc_12_0_1_{pfp,me,mec,rlc,imu,mes,mes1,uni_mes,toc}` + RLC/IMU kicker | `gc_12_0_0_*`, no kicker | `GC_12_0_1_FW` / `GC_12_0_0_FW` (TOC is RLC-backdoor only, never loaded) |
 | `psp_v14_0`, `smu_v14_0` firmware | `psp_14_0_3_{sos,ta}`, `smu_14_0_3`, + kicker builds | `psp_14_0_2_{sos,ta}`, `smu_14_0_2` | `MP_14_0_3_FW` / `MP_14_0_2_FW`, chosen by the discovered MP revision |
@@ -1951,8 +1951,11 @@ capability revalidation at every command/read/copy chunk.
 The internal `Smu::enable_display_power` transition extends the verified mask
 only with UCLK/FCLK/SOCCLK/DCN DPM (bits 3/4/5/7). The board must support all
 four; SCPM is checked again and required autonomous protections must remain
-enabled. Voltage scaling, deep sleep, link DPM, DF C-states and GFXOFF stay
-excluded. It requires retired display consumers and idle engines. Success
+enabled. Only those four bits are enabled with EnableSmuFeaturesLow;
+EnableAll is avoided so a COMPUTE workload cannot regain admitted sleep
+features during display startup. Memory-voltage scaling, link DPM and DF
+C-states stay excluded. Deep sleep, GFX_ULV and GFXOFF have separate owned
+transitions below. It requires retired display consumers and idle engines. Success
 publishes the new `PowerStatus`; partial failure/cancellation retains the
 owner and prevents replay. Only the retained DCN4 clock owner initiates this
 transition, after checking every display consumer. With UCLK DPM running it
@@ -1989,7 +1992,7 @@ socket/board watts, VDDGFX mV, current clocks, and a throttler bit per nonzero
 GFXCLK `SetSoftMaxByFreq` then `SetSoftMinByFreq`, as Linux
 `smu_v14_0_set_performance_level` does for GFXCLK (automatic `0xffff`/0
 bounds, `SMU_V14_SOFT_FREQ_ROUND` on manual maxima); display, memory and
-fabric clocks keep their pinned floors. Runtime commands run from
+fabric constraints remain with the display owner. Runtime commands run from
 `PowerReady`/`DisplayPowerReady` through a transient `Runtime` state: a clean
 PMFW rejection restores the previous state as in Linux, while timeout,
 revocation, device loss or cancellation leave the owner unusable.
@@ -1998,9 +2001,9 @@ revocation, device loss or cancellation leave the owner unusable.
 as SMU 14.0.2 maps it: for each DS feature of Linux's walk the board supports
 (FeaturesToRun), in Linux's order DS_GFXCLK, DS_UCLK, DS_FCLK, DS_SOCCLK,
 DS_LCLK, EnableSmuFeaturesLow/High of that bit (sent again when already
-running, as Linux does). DS_VCN, the walk's last bit, is left out because the
-static media policy requires it off, and DS_MP0CLK/DS_MP1CLK have no 14.0.2
-bit. Narf's boot allowed only a restricted mask, so the walk's bits are first
+running, as Linux does). DS_VCN, the walk's last bit, is deferred to the
+separate proved media DPG transition below. DS_MP0CLK/DS_MP1CLK have no
+14.0.2 bit. Narf's boot allowed only a restricted mask, so the walk's bits are first
 added to the allowed mask (SetAllowedFeaturesMaskHigh/Low). It runs only
 after the display power transition. The first PMFW refusal ends the walk and
 is returned in `DeepSleep::refused` (`DeepSleepRefused { feature, error }`)
@@ -2010,14 +2013,56 @@ or the owner fails; transport failures are terminal, as for every runtime
 command. Linux runs it from `smu_v14_0_2_set_power_profile_mode`
 (`smu_bump_power_profile_mode` at COMPLETE_INIT and on every profile
 change), and with `PP_SMC_POWER_PROFILE_COMPUTE` in the workload mask it
-disables deep sleep instead. Navi48 in narf has no power-profile path (no
-`pp_power_profile_mode`, no KFD compute profile), so the bootup default
-profile, which is not COMPUTE, is the only one: the display owner runs the
-enable once, right after the DCN4 clock owner started (narf turns display DPM
-on only then) and offered PMFW the watermark ranges
-(`ColdBoot::start_display_clocks`, below). A board whose display clocks never
-start keeps deep sleep off. DS_DCFCLK and GFX_ULV, which Linux's
-EnableAllSmuFeatures turns on at boot outside this walk, stay off.
+disables deep sleep instead. The retained workload selection now applies to
+this walk as well: COMPUTE admits the supported bits without enabling them.
+The display owner runs it after its clock startup and acknowledged watermark
+range transfer. DS_VCN is admitted by the retained media DPG owner; a media
+recovery withdraws that admission before static re-proof. Each later profile
+change affects only bits those owners already admitted.
+
+`PowerProfile` exposes the seven factory presets in SMU14's workload map:
+BOOTUP_DEFAULT (0), 3D_FULL_SCREEN (1), POWER_SAVING (2), VIDEO (3), VR (4),
+COMPUTE (5) and WINDOW_3D (7). `Smu::set_power_profile` preserves board limits,
+GFXCLK soft bounds, display constraints and all protections. It checks fresh
+running/protection masks, adjusts only already admitted sleep features, then
+sends SetWorkloadMask (0x24) with the corresponding single-bit factory mask.
+COMPUTE disables admitted DS_GFXCLK/SOCCLK/FCLK/LCLK/UCLK/VCN, DS_DCFCLK and
+GFX_ULV; other profiles restore only admitted, board-supported bits. A clean
+refusal before a mutation leaves the previous selection reusable; failure
+after partial policy changes is terminal. Cancellation leaves Runtime closed,
+and the selected profile changes only after the whole operation succeeds.
+
+GFX_ULV (feature 16) is admitted after fresh GC/RLC/GMC/IRQ proofs. DS_DCFCLK
+(feature 14) requires the matching display owner's acknowledged watermark
+ranges, successful strict clock-admission replay, and a positive DML deep-sleep
+DCFCLK floor. Both are restricted by FeaturesToRun and the selected profile.
+`amdgpu.rdna4_gfx_ulv=0` and `amdgpu.rdna4_dcf_sleep=0` independently skip
+these admissions. All admitted features retain PMFW's board-defined limits;
+there is no voltage or coefficient tuning interface. Reset/resume reconstructs
+the clock and sleep admissions and restores the last successfully applied
+factory profile before fresh queue/media/display proofs and client publication.
+
+After the native queue and requested media proofs complete,
+`amdgpu_navi48_gfxoff` starts a separate GC12 controller on both Navi48 and
+Navi44. It shares RDNA2's request-count state machine, with independent
+device epochs and delayed work. The board must support FEATURE_GFXOFF
+(bit 18); the retained RS64 owner requires a running RLC and clears only
+RLC_PG_CNTL.SMU_HANDSHAKE_DISABLE. SMU14 extends the existing allowed mask
+with GFXOFF alone, enables that feature, verifies all previous running
+features/protections, and sends DisallowGfxOff. A zero request count schedules
+AllowGfxOff after 100 ms. Failed/cancelled messages refuse GC access.
+`amdgpu.rdna4_gfxoff=0` disables startup; unsupported boards remain powered.
+
+`amdgpu_navi48_platform::gc_owner().await` acquires a GC reference before
+OWNER and rechecks activation/reset epoch under OWNER. GFX/compute jobs,
+gangs, ring/fault recovery, kernel VRAM work and reset/suspend use this order.
+Media jobs use cached GC configuration and do not wake the graphics island.
+Quiesce invalidates delayed work while GC is held awake; the fresh proven
+owner starts a new controller. Stale startup tasks cannot fail a successor.
+Initialization holds the controller until its result is known, so a waiting
+submission cannot misclassify initialization as device loss.
+`Diagnostics::gfxoff` / `gfxoff::status()` expose the software request state;
+SMU acceptance does not establish physical GFXOFF entry.
 
 After a successful retained boot, `amdgpu_navi48_platform::run` starts
 `amdgpu_navi48_power`. Through the shared `amdgpu_hwmon` it publishes `/sys/class/hwmon/hwmon<N>` (first free N)
@@ -2066,7 +2111,36 @@ requests. Reads report the last successfully applied level (initially `auto`),
 updated synchronously under OWNER only after both GFXCLK bounds succeed;
 rejected or cancelled changes never publish the requested level. Display,
 memory and fabric floors remain with their existing admission owners.
-Other power-policy feature-mask controls are unchanged.
+The card and PCI-device sysfs `pp_power_profile_mode` use
+`DrmCard::{power_profiles, set_power_profile}` (defaults None/Unsupported),
+backed on both RDNA4 dies by `amdgpu_navi48_power::{profiles, request_profile}`.
+Reads list factory presets plus CUSTOM (6), mark the applied profile with `*`
+and show firmware-read GFXCLK/FCLK coefficients when the table query succeeded.
+They issue no mailbox transaction. Stores accept one decimal profile ID or
+`6 <clock> <fps> <min_type> <min_mhz> <booster_type> <booster_mhz> <limit>
+<error> <error_rate>`; clock 0 is GFXCLK and 1 FCLK. Surrounding whitespace is
+allowed. The three byte fields, two 16-bit frequencies and three 32-bit PD
+values must fit their wire types, with decimal unsigned syntax; malformed
+inputs and unknown IDs are EINVAL. Firmware enforces coefficient policy.
+Profile writes enter a bounded FIFO with one async consumer, so consecutive
+GFX/FCLK updates and same-clock edits retain store order. A full 64-entry
+pending queue reports EBUSY; no IRQ-safe lock is held across an await. After runtime-PM access,
+the task checks its original power-owner generation under OWNER before any
+policy write. No GC lease or GC MMIO is needed.
+
+SMU14 reads and writes TABLE_ACTIVITY_MONITOR_COEFF (7), with workload ID in
+the upper half of the transfer argument, in its retained transfer buffer.
+The 140-byte external table is read fresh; only the selected clock's exposed
+fields change. Hysteresis, time constants, PD a/b, memory thresholds and PMFW
+padding are preserved. Upload acknowledgement and exposed-field readback
+precede SetWorkloadMask and cache publication. Failure after a policy/table
+mutation closes the owner; cancellation retains Runtime and the DMA backing.
+The last accepted selection and both custom clock values are retained for
+reset/resume replay before client proofs. The seven factory presets retain
+their existing masks and COMPUTE sleep suppression; custom coefficients never
+change the board PPT, clock limits, protections or display floors. Telemetry
+carries the applied selection and coefficient cache. Other power-policy
+feature-mask controls are unchanged.
 
 `amdgpu_navi48_power::thermal` retains THM/MP1 interrupt-register ownership
 in the independent IH service. Native THM14.0.2/3 bank0 and MP1 bank1 are
@@ -2188,6 +2262,27 @@ TransferTableDram2Smu (8) of TABLE_WATERMARKS (2), each refusal or sent timeout
 ignored and logged the same way. The owner stays `Applying` throughout the
 sequence and on cancellation; a transport/authority failure enters `Failed`,
 so a partially sent watermark sequence cannot be reused.
+
+`Status::watermarks_ready` records actual success of all three table messages;
+a saturated ignored-message counter cannot manufacture it. Native
+`prepare_display_clocks` and every live bandwidth update pass through
+`admit_dynamic_power(regs, held)` before runtime relaxation or DS_DCFCLK
+admission. It checks owned consumers and acknowledged watermarks, refuses
+an outstanding legacy transaction, marks Applying before awaits, then replays
+NumOfDisplays, DCFCLK's maximum floor, and pinned UCLK/FCLK active/idle
+floors with real acknowledgements. On older PMFW without paired idle DPM,
+FCLK keeps an explicitly acknowledged maximum while displays run.
+
+A successful replay publishes `Status::dynamic_power` with Applied. From
+then on bandwidth, display-count, deep-sleep-floor and watermark messages
+require their actual replies and hard-min acknowledgements. Refusal, missing
+ACK, revocation or cancellation closes the retained owner; diagnostic old
+floors never establish a successful update. Runtime requests are bounded by
+the board ranges and idle floors cannot exceed active floors. DML continues
+to select admissible modes, latencies and per-pipe watermarks; lowering is
+still an optimize step after their updates. Both Navi48 and Navi44 use their
+own existing minimum PMFW versions for paired idle DPM. With no displays,
+legacy FCLK's hard minimum is also released to its first level.
 
 `release(regs).await` is dcn401_update_clocks' optimize once no stream is
 left (NumOfDisplays 0, DCFCLK, UCLK and FCLK at their lowest levels, UCLK
@@ -2691,7 +2786,7 @@ it (`tests/dcn401_dml21/format_vectors.txt`, checked against Linux with
 DCFCLK/FCLK above the pinned UCLK's state is `ClockState`: the port plans
 only at that state. VUpdate/VReady widths at the programmed clocks are
 rounded up from their exact value. GPUVM/HostVM,
-DCC, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback and immediate
+MALL/SubVP, cursor, tdlut, dynamic metadata, writeback and immediate
 flip are excluded rather than approximated.
 
 ODM follows DML's `dml2_odm_mode_auto` (DecideODMMode,
@@ -5721,8 +5816,9 @@ mask the stream-owned bit. The DCN401 stream encoder's MSA is unchanged.
 
 DML21 admission is unchanged and evaluated at the nominal timing. DCN4's
 mode-support and programming calculations do not read `drr_config`; only
-the PMO's UCLK p-state strategies (FAMS2/DRR) do, and this owner disables
-memory clock switching so those strategies are never searched. DRR only
+the PMO's UCLK p-state strategies (FAMS2/DRR) do. Changing the base range
+first pins UCLK and retires any firmware schedule, then the runtime search
+may admit switching against the new live range. DRR only
 lengthens the vertical blank (`v_total_min` is at least the mode's total)
 at the same line time, so every per-line, prefetch, DET and watermark bound
 admitted at the nominal timing still holds, and the stutter budget (taken
@@ -5758,7 +5854,11 @@ apply_below_the_range's multiplier choice and 2000us drift preference;
 `Lfc::vupdate` fixes MIN=MAX for the inserted duration on the first
 observed update and restores the configured variable range at count zero.
 DP floors and HDMI ceilings duration-to-total, clamped to nominal timing.
-DML admission remains at nominal timing, and UCLK must stay pinned.
+DML admission remains at nominal timing. UCLK may switch under a single
+native Vactive/Vblank DRR plan bound to that range: BTR and MID only extend
+the nominal blank, leaving its blackout/fill window intact. Matching FAMS2
+DRR plans can also retain switching, including multiple streams; their
+requested BTR/MID totals go through firmware under the hardware lock.
 
 `unsafe async Otg::set_lfc` / `ColdBoot::set_display_lfc` attach that state to
 the matching ScanoutRunning timing and configured DRR range. The platform
@@ -5776,7 +5876,12 @@ fetch ownership retained. A cancelled transaction stays quarantined;
 `lfc_progress`'s public idle entry accepts only ScanoutRunning. No address,
 surface lease or nominal DML plan is changed by repeating the retained
 surface. Disabling DRR, stopping scanout and recovery remove BTR state and
-restore fixed timing before releasing timing/fetch ownership. This
+restore fixed timing before releasing timing/fetch ownership. Firmware timing
+must first be disabled with clocks pinned. The top-level health check probes underflow read-only and, when observed,
+first pins clocks and acknowledges firmware disable before the native drain
+and return to black. Refused retirement, or a low-level recovery while
+firmware still owns timing, fails closed with the scanout retained for device
+recovery; native recovery cannot overwrite firmware-owned timing. This
 service uses the real FRAME_COUNT witness after notification; precise
 physical cadence and interrupt delivery still require hardware acceptance.
 
@@ -5836,6 +5941,15 @@ Removing MID or DRR clears its selectors/count; fixed teardown also
 clears owned MID storage. The current primary FreeSync BTR module has no
 MID producer: native BTR follows its MIN/MAX sequence, while MID remains
 an explicit finite timing operation with its own owner.
+
+`ColdBoot::display_lfc_progress` and `set_display_drr_mid` are async so they
+can await strict firmware locking and timing replies. The low-level Otg
+LFC/progress/MID and flip/color/HDR entry points accept an optional mutable
+DMUB borrower: Some requires its acknowledged firmware HW lock for the
+whole operation, None excludes firmware timing. Flip entry points group
+the mutable clock/DCCG/GMC owners as one tuple. No IRQ-safe lock spans these
+awaits. Firmware flip offload remains disabled; native code still owns
+address publication, fences, buffer retention and completion.
 
 Native tests replay
 1286 DP/HDMI steps and exercise frame wrap, repeat timing, missed/uncertain
@@ -6979,19 +7093,40 @@ the SVP-prefetch ones, idle minimums from the idle average derates, UCLK
 rounded up to its DPM table, FCLK/DCFCLK fine-grained, FCLK P-state from the
 planes' vactive hiding (clamped to the FCLK maximum when unsupported).
 
-`Pstate::Supported` carries each stream's plan at the chosen latency level
+`Pstate::Supported` carries each stream's plan at DPMM's actual active clocks
 (`Plan::pstate: Some(PlanPstate)` records the table, `fams2` and the
 stream's `pstate::Method`; `Plan::readmits` repeats this search), the
 methods, the level, the active and idle `MinClocks`, FCLK P-state support and
 each stream's FAMS2 static base state (`Fams2Stream`, as
 dml2_core_calcs_get_stream_fams2_programming fills it). The port programs
-the hardware-exclusive methods only: `Pstate::Pinned(Pinned::Firmware(m))`
-when Linux's search would reach a firmware method first (SubVP unless its
-phantom planes or streams certainly do not fit; DRR never arises, every
-native stream has `drr_config` disabled), `Pinned::Unsupported` when Linux
-finds no strategy, and `Pinned::Port` for a DCC plane (MRQ meta rows) or a
-DPMM clock above the latency state. Native admission (`admit_native`) is
-unchanged and never carries a P-state record.
+hardware vactive/vblank and FAMS2 DRR methods. `admit_with_drr` additionally
+accepts each stream's admitted `Option<Drr>` bounds, recorded in PlanPstate
+and both admission caches. One variable-refresh stream can keep hardware
+vactive; multiple active VRR streams require a schedulable firmware variant.
+DRR stretches must fit the sink's maximum total and PMO's refresh bounds.
+DCC uses the native mcache split/placement and adds MRQ metadata rows to the
+blackout fetch bytes before calculating excess-fill bandwidth. Native
+LFC/BTR or finite MID sequences may switch on one admitted native
+Vactive/Vblank DRR stream, or a matching firmware DRR method on any admitted
+stream. The applied range, live/retained plan and idle transaction owner must
+agree; native methods additionally require the sole retained modeset. The
+runtime pinned cache records the per-stream LFC/MID mask, so a refused
+firmware schedule cannot hide a later native admission: a multi-stream result must give every locally adjusted stream a
+firmware DRR method, or it remains pinned.
+The general search reports `Pinned::Firmware` for SubVP without a phantom
+owner, while DRR search skips those candidates. `admit_subvp` additionally
+expands one fixed-refresh, unscaled linear RGB primary in ODM bypass into
+main and phantom plans. It requires a board-derived MALL capacity; DSC,
+rotation, scaling, tiling/DCC, overlays, DRR and multiple streams retain the
+ordinary fallback. `Pinned::Unsupported` records no valid strategy.
+
+Support and candidate selection retain the latency-table clocks. Programming
+then uses DPMM's raised active UCLK/FCLK/DCFCLK, its actual DRAM bandwidth and
+actual UCLK QoS index (zero for a fine-grained clock outside the table).
+Clock floors above the board maxima are refused. Native pinned-UCLK admission
+likewise raises its programmed DCFCLK/FCLK for active/prefetch SDP bandwidth
+within those maxima. No `Pinned::Port` fallback remains for bounded raises.
+Native admission (`admit_native`) never carries a P-state record.
 
 `pstate_strategies.txt` holds PMO's
 expanded lists (`dcn401_pstate_strategy_lists_match_linux`).
@@ -6999,34 +7134,43 @@ expanded lists (`dcn401_pstate_strategy_lists_match_linux`).
 The display owner applies the answer as dcn401_prepare/optimize_bandwidth.
 `ColdBoot::start_display_clocks`, once the clock owner started, writes
 `wm_range_table` to a 4-KiB VRAM range kept out of reuse, sends
-`notify_wm_ranges` and runs `deep_sleep_control`. A table that cannot be
-placed is skipped (as Linux skips a missing `wm_range_table`); firmware
-refusals and ignored sent timeouts do not fail bring-up. An interrupted or
+`notify_wm_ranges` and, only with acknowledged ranges, runs the selected
+profile's `deep_sleep_control`. A table that cannot be placed or acknowledged
+keeps runtime clock relaxation and DS_DCFCLK unavailable. Bootstrap may keep
+the pinned path, while strict runtime admission requires fresh acknowledged
+constraints before enabling any relaxation. An interrupted or
 authority-failed watermark transaction retains an unusable clock owner,
 which subsequent preparation refuses. Every refusal or error is logged in
 `ColdBoot::display_power_policy()` (`DisplayPowerPolicy { wm_ranges,
 deep_sleep }`). `ColdBoot::converge_uclk_pstate(drr)`, from every display monitor
-pass before DRR converges, searches the running configuration (every
-display scanning out without DRR, their plans one admission on the current
-`Soc`, the clock owner's UCLK levels, `display_fams2()`); a configuration
-found pinned is remembered and not searched again. Supported, in
-dcn401_hwseq.c's order: prepare_bandwidth's
-`update_live_display_bandwidth(bandwidth, false)` with `uclk_pstate` forced
-false (Linux forces p_state_change_support false there, so clocks are only
-raised and switching stays disallowed), every display moved to its P-state
-plan with raise-only watermarks (`update_live_display_plan`), then FAMS2
-disabled (`disable_display_fams2`: HW lock, the disabled FAMS2_CONFIG,
-release; only with FAMS 2.1 firmware); then optimize_bandwidth's FAMS2
-disabled again (no firmware method is required), the exact watermarks and
-`update_live_display_bandwidth(bandwidth, true)` allowing switching with
-UCLK/FCLK at DPMM's active and idle minimums; it returns the displays whose
-plans moved. Otherwise, or with `drr` (a display that should run DRR: the
-port plans DRR only pinned), `pin_display_uclk` (`bandwidth::pin_uclk`):
-while `uclk_switching()`, UCLK and FCLK raised to their maxima with
-switching disallowed and then FAMS2 disabled, as prepare_bandwidth orders
-update_clocks before the FAMS2 update; nothing otherwise (Linux sends the
-disabled FAMS2 config on every prepare_bandwidth; the port only ever sends
-it disabled, so a pinned owner skips the repeat). Every configuration-change
+pass after DRR converges, searches the running configuration on the current
+board clocks, live refresh ranges and FAMS version. A pinned configuration is
+cached with all those inputs. Prepare raises/pins clocks with switching off,
+programs raise-only watermarks and disables any old FAMS2 schedule. Optimize
+programs exact watermarks, acknowledges the new firmware configuration when
+required, then allows UCLK switching with DPMM's active/idle floors.
+FAMS2_CONFIG is a bounded chain of at most nine commands, all copied and
+flushed before one ring write-pointer publication; firmware can defer
+consumption until the final multi_cmd_pending bit clears. Pointer progress,
+reply headers, timeout, revocation and cancellation are checked. FAMS 2.1 is
+required for chains. The global constants follow the DCN401 IP caps; native
+flips remain driver-controlled (firmware flip offload is disabled).
+Before the config, FAMS2_DRR_UPDATE supplies the live requested minus-one
+MIN/MAX and optional MID/frame count for each stream. Enable and subsequent disable require acknowledged HW lock,
+config and release; any interrupted operation retains a pending display owner
+and cannot publish relaxed clocks. Disable first clears any finite firmware MID sequence through an acknowledged
+timing request, then restores native DRR registers before releasing the lock.
+A running native MID sequence keeps native policy until explicitly cleared;
+its unknown remaining count is never replayed across a firmware handoff. Flips, colour/HDR and async cursor writes
+acquire the firmware hardware lock while scheduling is active. The console
+pointer callback defers such cursor writes to a generation-bound async task
+without waiting in the callback; superseded requests are skipped.
+Base refresh-range changes first pin and disable the old schedule. LFC/MID
+changes retain switching on a matching single native DRR plan or firmware
+DRR plan. The latter use acknowledged FAMS2_DRR_UPDATE commands rather than
+native MIN/MAX/MID writes. Unadmitted
+configurations call `pin_display_uclk`: raise UCLK/FCLK to their maxima with
+switching disallowed, then disable FAMS2. Every configuration-change
 entry point pins in prepare_bandwidth's position, before its first clock,
 watermark, pipe or link change: `modeset_display`, `modeset_display_mode`,
 `modeset_displays`, `modeset_routed`, `modeset_beside`, `replan_displays`,
@@ -7040,15 +7184,13 @@ link-loss retraining (dp_handle_link_loss: dpms off, then on, on the
 running state) takes no prepare_bandwidth, a conservative extra; on a
 pinned or fresh owner that pin sends nothing. A teardown pins best-effort
 (`pin_display_uclk_for_teardown`): Linux's prepare_bandwidth is void, so a
-pin that fails (a failed clock owner) is logged and the stream is still
-disabled; every other entry point returns the failure before any change.
-`disable_display_fams2` never fails its caller either, as
-dcn401_dmub_hw_control_lock and the FAMS2 update return nothing in Linux:
-lock, disabled config and release are each tried (the release whatever the
-update did) and a failure is logged. Flips, cursor, colour/HDR and DRR updates are
-DC fast or stream updates, which Linux commits without prepare_bandwidth,
-and do not pin (DRR is refused while switching). The step primitives those
-entry points are built from (`start_display_scanout`, `stop_display_scanout`,
+pin failure is logged and the teardown journal attempts retirement; an
+interrupted firmware owner still blocks further display writes until reset.
+Every other entry point returns the failure before any change.
+Before FAMS2 is ever enabled, a disabled-config failure remains optional and
+logged, matching the old pinned bootstrap behavior. Once firmware scheduling
+is active, failed or missing acknowledgements prevent subsequent changes.
+The step primitives those entry points are built from (`start_display_scanout`, `stop_display_scanout`,
 `update_live_display_plan`, `update_live_display_clocks`, the
 `prepare_display_*` and `retire_display_*` steps, ...) do not pin by
 themselves: a caller composing them must pin first. A P-state plan stays
@@ -7063,7 +7205,73 @@ test the bandwidth sequence, the watermark table and the FAMS2 commands, and
 `pin_uclk` over a real clock owner from the fresh states
 `retire_inherited_display`, the first modeset and a relight after resume
 start from.
+The scanout-chain suite also exercises native DRR P-state plans with LFC,
+actual flips, source retirement and finite MID sequences; foreign ranges,
+firmware methods and multi-stream records cannot authorize native timing
+changes. A firmware timing borrower is used by flips, color/HDR, LFC updates
+and MID sequences, with the same engine and retained surfaces. Preallocated
+spare status/display boxes allow a scoped transport loan without per-flip
+allocation; Drop restores the actual boxes even on cancellation. Every DMUB
+borrower must match the display mapping, with current capabilities checked
+before/after the submitted timing request. Source verification compares the
+acknowledged request, since firmware may clamp MIN/MAX/control/MID; all other
+source fields remain checked. Requests complete before address publication
+and after every real frame sampled by latch waits. Idle service samples the
+read-only frame counter before requesting the firmware lock, so timer wakes
+without a new frame submit nothing. Missing replies retain UpdatingStream or
+Flipping, failures retain Failed, and no independent retirement is inferred.
+Disable acknowledges MID clear before the config, then restores requested
+native MIN/MAX and control with MID disabled under lock. Changing timing
+owners cannot restart a finite MID sequence.
+Owner tests cover real flips with firmware-clamped registers, typed MID wire
+bytes, missing/failed timing replies before address writes, cancelled idle
+updates, native restoration, and refusal to retire firmware timing. Raised-clock
+regressions cover board maxima and forged old floors.
 Hardware switching under a lit display is unvalidated.
+
+**SubVP owner.** `admit_subvp` crops the phantom timing and viewport from
+PMO's blackout and prefetch metadata. Its requestor gets zero DET; the DML
+swath/burst model uses the native 1 MiB phantom allowance. Active bandwidth
+excludes phantom fetches; SVP-prefetch includes them with SDP factor 0.25
+and DRAM factor 1.0, including the prefetch schedule's own SDP factor.
+DPMM boosts active clocks with the separately calculated SVP minimums.
+Both plans readmit against the original main mode and MALL capacity.
+MALL bytes use the aligned phantom footprint; ways use 64-byte cache lines,
+16 ways and two extra alignment lines, bounded by the installed die's
+available UMC channels (4 MiB each).
+
+The runtime enables this path only with a spare unfused HUBP/OTG and no
+visible cursor. It first pins switching, installs main deadlines, then
+acknowledges DAL `SetCabForUclkPstate` (0x12, `(ways << 1) | (ways != 0)`).
+A retained pipe reservation precedes phantom clock/power programming. The
+phantom aliases the main's actual address and pitch; it creates no client
+allocation or external link. Its VM aperture, cropped surface, DPP/MPC,
+requestor, DLG/TTU and timing are programmed while native ownership excludes
+FAMS2. After a fresh frame it is blanked/drained and its OTG stopped, with
+MALL select 1 on the phantom, select 2 and FORCE_ONE_ROW_FOR_FRAME on the
+main. FAMS2 type 4 carries the v1 SubVP ratio/timing/delay fields and physical
+phantom OTG/plane masks; config acknowledgement precedes UCLK relaxation.
+
+This first owner disables SubVP before every native flip, cursor,
+colour/HDR or timing update. Switching is pinned, config-off acknowledges,
+the phantom OTG runs long enough to latch its disconnect, HUBP requests
+drain, and fetch/DPP clocks and native MALL selection are restored before
+releasing its DTO and cache ways. The main allocation and client pin stay
+retained throughout; normal flip retirement then applies. Missing replies,
+write loss and cancellation retain pending state and aliases. Native OTG
+lock operations refuse a retained phantom. Health checks may read the main
+while firmware temporarily drives the reserved phantom; observed underflow
+first disables/drains firmware ownership. Linux DCN401 omits the older
+`subvp_save_surf_addr` scratch callback; this path does not use those legacy
+scratch registers or permit firmware flip offload. Dynamic SubVP flips,
+visible cursor scheduling, DRR, tiled/DCC/scaled or multiple planes/streams
+remain extensions. The owner lookup covers selected and parked display slots,
+so selecting another slot cannot hide the phantom from update guards.
+Kernel tests cover typed SubVP command bytes, acknowledged/refused/cancelled
+cache reservations, readmission of both plans and their cache footprint,
+phantom setup and drain, failed address writes, cancellation, parked ownership,
+and native client flips with a different address high word after retirement.
+Physical switching acceptance remains pending.
 
 **No display left.** `converge_uclk_pstate` with no display and no
 teardown in flight runs `ColdBoot::release_display_bandwidth` once: Linux
@@ -8184,7 +8392,15 @@ sub-type 4: the global command, then every stream's base and sub-state,
 `multi_cmd_pending` on all but the last; disabled, the global command
 alone; `global` carries DC's static feature overrides, which the caller
 applies: dcn401's debug defaults turn stall recovery and offload flip on and
-debug off). As in Linux's
+debug off). The native runtime deliberately leaves flip offload disabled.
+`Dmub::fams2_update_config` posts at most nine slots in one bounded chain;
+`fams2_drr_update` supplies the requested minus-one MIN/MAX, optional MID and
+nonzero 8-bit frame count. The wire carries that count as u32; invalid or
+foreign totals and MID without a DRR range are refused before submission.
+Only FAMS 2.1 admits the enabled chain. A missing inbox0 acknowledgement
+permanently closes strict FAMS2 lock admission on that owner, so a late ACK
+cannot prove a later lock; optional disabled-config traffic stays usable. A timed-out or cancelled chain remains
+failed/in flight, with its VRAM backing retained. As in Linux's
 `dc_dmub_srv_query_caps_cmd`, firmware must clear the request's `ret_status`
 bit to acknowledge this query; an unchanged bit leaves capabilities absent.
 This does not initialize a native mode.
@@ -9754,10 +9970,70 @@ backing reusable. Uncertain completion, revocation or cancellation retains
 the published allocation and refuses replay until device recovery.
 
 `unsafe Smu::set_vcn_power(bool).await` is SMU14's dGPU instance-0
-PowerUpVcn/PowerDownVcn, with a fresh static-media/protection feature check.
+PowerUpVcn/PowerDownVcn, with fresh protection and admitted-media-feature checks.
 Power-down requires the retained VCPU/LMI retirement proof. As other SMU
 runtime operations, cancellation leaves the mailbox owner busy and terminal
 transport errors forbid reuse. No display/GFX clock policy is changed.
+
+Normal retained VCN5/JPEG5 clients also have independent static-power idle
+paths. A generation-bound 100 ms supervisor uses Linux's 1 s media idle
+delay. Under OWNER it requires each engine's physical fence and complete
+RPTR drain, then its VCPU/LMI or JMI clean shutdown before the SMU power-down
+message. VCN idle retains the shared NBIO doorbell range even if JPEG is
+busy; JPEG can sleep while VCN remains active. The same supervisor retains
+the static fallback selected by `amdgpu.rdna4_media_dpg=0`.
+
+`ColdBoot::begin_media_use(jpeg).await` runs before normal publication, and
+`wake_media().await` precedes media recovery. Power-up and hardware restore
+preserve VCPU context, JPEG copy slots, proof results, writebacks and logical
+sequences. Warm restore resets only ring pointers and restores master IRQs;
+cached GB_ADDR_CONFIG avoids GC reads while GFXOFF is allowed. Idle never
+marks backing reusable. `IdleStopping`/`IdleStarting` and a retained SMU
+transition marker precede awaits; failure/cancellation prevents replay.
+Full shutdown/recovery keeps its existing destructive retirement proof.
+
+Before stopping an island, the native I/O owner drains synchronous fence
+readers under READ_GENERATION and marks only that island unavailable for
+status reads. Its retained VRAM fence remains readable through live capability,
+HDP and always-on NBIO presence checks. Static engines with fixed clocks
+retain their status checks after restoration. DPG owners and JPEG under
+media clock DPM keep using the always-on presence checks between jobs.
+
+After the requested static transport/IRQ/codec proofs, retained media client
+owners default to DPG (`amdgpu.rdna4_media_dpg=0` keeps the static policy).
+`Vcn::enable_dpg(&mut Psp)` drains the physical fence/RPTR and shuts down the
+static VCPU without releasing any backing or the shared NBIO range. It
+power-cycles ONO5..2, enables PG_MODE/PG_EN, and sends VCN5's 23-pair SOC24
+internal-offset program through PSP14 `LOAD_IP_FW`, type VCN0_RAM (49).
+PSP patches firmware and stack placeholders; context/shared BARs and cached
+GB_ADDR_CONFIG remain owned by this device. This operation is distinct from
+the RDNA2 SRAM loader. It then restores the unified ring and source enable.
+JPEG5 uses JPEG internal addresses, a five-pair restore program including
+PSP's required trailing NO_OP, and JPEG_RAM (128). Both the boot policy and
+PSP firmware-target admission reject JPEG DPG on Navi44 (GC12.0.0); its JPEG
+owner keeps static idle/resume. Navi48 (GC12.0.1) supports both DPG paths.
+
+Every DPG start/resume executes a fresh fence-only frame into a separate
+owned probe word and requires both that new write and RPTR drain. Client
+sequences, completion words, sessions, proof results and copied IB slots
+remain unchanged. `IdleStarting` precedes SRAM upload/probe awaits; an upload
+acknowledgement without physical execution cannot reopen publication.
+DPG idle stops use firmware hold-off, physical fence/RPTR drain and PG_MODE
+withdrawal before SMU power-down. Warm use reloads SRAM under the same PSP,
+TMR, GMC and IRQ owner. Full VCN shutdown additionally pauses DPG, wakes the
+island and performs the existing VCPU/LMI clean reset before reuse. JPEG
+hang recovery clears DPG, powers ONO1 on, resets JMI and completes the
+static clean/power-off sequence; clearing PG_MODE alone is no retirement proof.
+
+Only after successful DPG activation, `unsafe Smu::configure_media_power(true)`
+admits board FeaturesToRun's MM_DPM (20) and DS_VCN (44) through allowed-mask
+and feature-enable commands. Other enabled features and every autonomous
+protection must survive, and unadmitted bits are rejected. Native JPEG fence
+readers are drained before clock sleep is allowed, including Navi44's static
+JPEG path. Queue recovery disables these media features before static
+re-proof, then re-enters DPG and the board-supported media policy before
+client publication. Failed/cancelled owner or mailbox transitions retain
+resources and block replay. Physical acceptance remains pending on both dies.
 
 `Vcn::prove_interrupts().await` requires a retained independent dispatch
 owner (`Key::Vcn { instance: 0 }`, VMID0/PASID0) before enabling the VCPU

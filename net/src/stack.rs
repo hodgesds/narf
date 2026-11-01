@@ -233,9 +233,11 @@ impl AdminHandle {
         if !(68..=65_535).contains(&mtu) {
             return Err(AdminError::InvalidMtu);
         }
-        crate::iface::set_mtu(&self.iface_name, mtu)
-            .then_some(())
-            .ok_or(AdminError::NoIface)
+        crate::iface::try_set_mtu(&self.iface_name, mtu).map_err(|code| match code {
+            19 => AdminError::NoIface,
+            22 => AdminError::InvalidMtu,
+            other => AdminError::DeviceError(other),
+        })
     }
 
     pub fn set_mac(&self, mac: [u8; 6]) -> Result<(), AdminError> {
@@ -243,9 +245,11 @@ impl AdminHandle {
         if mac[0] & 1 != 0 || mac == [0; 6] {
             return Err(AdminError::InvalidMac);
         }
-        crate::iface::set_mac(&self.iface_name, mac)
-            .then_some(())
-            .ok_or(AdminError::NoIface)
+        crate::iface::try_set_mac(&self.iface_name, mac).map_err(|code| match code {
+            19 => AdminError::NoIface,
+            22 => AdminError::InvalidMac,
+            other => AdminError::DeviceError(other),
+        })
     }
 
     pub fn add_ipv4(&self, addr: [u8; 4], prefix_len: u8) -> Result<(), AdminError> {
@@ -449,6 +453,8 @@ impl narf_capabilities::CapOp<AdminCap, Invoke> for AdminContext<'_> {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AdminError {
+    /// Positive Linux errno from the device's hardware control callback.
+    DeviceError(i32),
     AuthorityRevoked,
     NoIface,
     InvalidMtu,

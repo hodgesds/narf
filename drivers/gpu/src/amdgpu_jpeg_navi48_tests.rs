@@ -111,6 +111,7 @@ kernel_test_in!(
     jpeg5_layout_rejects_wrong_mmhub_or_truncated_jpeg_banks
 );
 struct Fake {
+    sram: crate::amdgpu_navi48_media_power::tests::Program,
     picture: decode_tests::Model,
     regs: BTreeMap<u64, u32>,
     memory: Vec<u8>,
@@ -129,6 +130,7 @@ struct Fake {
     wide: bool,
     damage: bool,
     ignored: Option<u64>,
+    power_stuck: bool,
     revoke: Option<Cap<BusDeviceCap, Write>>,
     client_gpu: u64,
     /// Executed client IB copies: (decoder VMID, arena offset, dwords).
@@ -189,10 +191,10 @@ impl Fake {
                     if reg == 0x404d && value == 8 && self.fence {
                         let address = (u64::from(self.packets[&0x40ac]) << 32)
                             | u64::from(self.packets[&0x40ab]);
-                        assert_eq!(address, GPU + FENCE);
-                        self.store(FENCE, self.packets[&0x404e]);
+                        assert!(address == GPU + FENCE || address == GPU + FENCE + 16);
+                        self.store(address - GPU, self.packets[&0x404e]);
                         if self.wide {
-                            self.store(FENCE + 4, self.packets[&0x404f]);
+                            self.store(address - GPU + 4, self.packets[&0x404f]);
                         }
                         if self.damage {
                             self.store(FENCE + 12, 1);
@@ -263,6 +265,7 @@ impl Fake {
 }
 impl Io for Fake {
     fn read(&mut self, at: u64) -> u32 {
+        dpg_tests::replay(self);
         *self.regs.get(&at).unwrap_or(&0)
     }
     fn write(&mut self, at: u64, value: u32) {
@@ -274,7 +277,7 @@ impl Io for Fake {
             return;
         }
         self.regs.insert(at, value);
-        if at == VCN + u64::from(DLDO_CONFIG) * 4 {
+        if at == VCN + u64::from(DLDO_CONFIG) * 4 && !self.power_stuck {
             let status = self
                 .regs
                 .entry(VCN + u64::from(DLDO_STATUS) * 4)
@@ -393,6 +396,7 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>, Irqs) {
     let pool = unsafe { Pool::from_owned_range(map, GPU) }.unwrap();
     let signals = Arc::new([AtomicU32::new(7), AtomicU32::new(9)]);
     let io = Fake {
+        sram: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(None)),
         picture: decode_tests::Model::default(),
         regs: BTreeMap::from([
             (NBIO + u64::from(RANGE) * 4, RANGE_VALUE),
@@ -400,7 +404,8 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>, Irqs) {
             (VCN + u64::from(DLDO_STATUS) * 4, 4),
             (VCN + u64::from(CLEAN) * 4, 0x1010f),
             (VCN + u64::from(STATUS) * 4, 1),
-            (GC + 0x263e * 4, 0x545),
+            (GC + 0x13de * 4, 0x545),
+            (GC + 0x263e * 4, u32::MAX),
             (VCN + u64::from(CG_CTRL) * 4, 0x01010000),
             (VCN + u64::from(RPTR) * 4, 0),
         ]),
@@ -419,6 +424,7 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>, Irqs) {
         wide: false,
         damage: false,
         ignored: None,
+        power_stuck: false,
         revoke: None,
         client_gpu: u64::MAX,
         client_ibs: Vec::new(),
@@ -443,6 +449,9 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>, Irqs) {
         decode_memory: None,
         client_memory: None,
         state: State::Prepared,
+        idle_state: None,
+        addr_config: None,
+        dpg: false,
         result: None,
         decode_result: None,
         seq: 0,
@@ -667,3 +676,6 @@ kernel_test_in!(
     "drivers/gpu/jpeg-navi48",
     jpeg5_requested_decode_and_client_slots_preclaim_atomically_before_power
 );
+
+#[path = "amdgpu_jpeg_navi48_dpg_tests.rs"]
+mod dpg_tests;

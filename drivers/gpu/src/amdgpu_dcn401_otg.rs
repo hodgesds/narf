@@ -463,6 +463,7 @@ pub struct Applied {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Status {
+    pub subvp: Option<fetch::SubvpApplied>,
     pub state: State,
     /// Historical programming, not permission to start scanout. A clock
     /// change invalidates the recorded snapshot; failure/cancellation is sticky.
@@ -627,6 +628,7 @@ impl Status {
     fn new() -> Self {
         Self {
             state: State::Ready,
+            subvp: None,
             pipes: [None; 4],
             blanks: [None; 4],
             running_blank: None,
@@ -1002,6 +1004,12 @@ impl Layout {
     }
 }
 trait Io {
+    fn firmware_timing(&self) -> bool {
+        false
+    }
+    async fn drr_update(&mut self, _otg: u8, _timing: drr::DrrTiming) -> Result<(), Error> {
+        Err(Error::Busy)
+    }
     fn read(&mut self, at: u64) -> u32;
     fn write(&mut self, at: u64, value: u32);
     /// Source ownership is independent of this timing owner. Native code
@@ -1091,6 +1099,9 @@ impl Siblings {
     /// while another is selected besides an idle one.
     fn of(s: &Status) -> Self {
         let mut out = Self::default();
+        if let Some(vp) = s.subvp {
+            out.pipes |= bit(vp.phantom);
+        }
         for p in 0..4u8 {
             let i = usize::from(p);
             let staged = s.pipes[i].is_some()
@@ -1618,8 +1629,15 @@ impl<I: Io> Engine<I> {
         }
     }
 }
+#[path = "amdgpu_dcn401_firmware_timing.rs"]
+mod firmware_timing;
+
 #[derive(Debug)]
-pub struct Otg(Engine<Mmio>, fetch::Surfaces);
+pub struct Otg(
+    Engine<Mmio>,
+    fetch::Surfaces,
+    Option<firmware_timing::Spare>,
+);
 impl Otg {
     /// # Safety
     /// Retain permanent mappings and exclusive display/PM/reset ownership.
@@ -1638,6 +1656,7 @@ impl Otg {
                 displays: Displays::new(),
             },
             fetch::Surfaces::new(),
+            Some(firmware_timing::Spare::new()),
         ))
     }
     pub fn status(&self) -> Status {

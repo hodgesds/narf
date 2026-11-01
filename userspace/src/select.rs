@@ -172,11 +172,25 @@ fn do_select(
         return (SelectCoreResult::Complete(Err(error)), None);
     }
 
-    for fd in 0..nfds {
-        let want_r = bit_is_set(&bits[in_r_at..in_r_at + set_bytes], fd);
-        let want_w = bit_is_set(&bits[in_w_at..in_w_at + set_bytes], fd);
-        let want_e = bit_is_set(&bits[in_e_at..in_e_at + set_bytes], fd);
-        if want_r || want_w || want_e {
+    // Skip empty bitmap bytes rather than testing each descriptor separately.
+    // Sparse sets are common even at a large nfds. Walk selected bits in the
+    // same ascending order and ignore the rounded prefix's bits above nfds.
+    for byte in 0..nfds.div_ceil(8) {
+        let read = bits[in_r_at + byte];
+        let write = bits[in_w_at + byte];
+        let except = bits[in_e_at + byte];
+        let mut selected = read | write | except;
+        while selected != 0 {
+            let bit = selected.trailing_zeros() as usize;
+            let fd = byte * 8 + bit;
+            if fd >= nfds {
+                break;
+            }
+            selected &= selected - 1;
+            let mask = 1u8 << bit;
+            let want_r = read & mask != 0;
+            let want_w = write & mask != 0;
+            let want_e = except & mask != 0;
             let mut events = 0u16;
             if want_r {
                 events |= POLL_IN as u16;

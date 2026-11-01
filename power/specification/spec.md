@@ -43,6 +43,13 @@
 
 ## 3. Public interface
 
+`device_pm::unregister_device_pm(name) -> bool` withdraws a device from future
+PM fan-outs and drops its retained operations outside the registry lock.
+Already-snapshotted callbacks retain their own references; drivers must reject
+removed hardware. IGC uses the existing device callbacks for S3/runtime PM and
+restores configured wake/PHY/clock/queue state across its transitions.
+
+
 ### 3.1 Idle
 
 ```rust
@@ -798,6 +805,13 @@ pub fn register_cooling_device(cap: &Cap<Thermal, Grant>,
     dev: Arc<dyn CoolingDevice>) -> Result<(), ThermalError>;
 pub fn record_temp(zone: u32, milli_c: i32)
     -> Result<ThermalState, ThermalError>;
+pub fn set_cooling_level(level: u8) -> Result<(), ThermalError>;
+pub fn current_cooling_level() -> Option<u8>;   // last driven level
+    // (#916): recorded by the governor on a crossing and by an
+    // explicit set_cooling_level call; drivers/platform's
+    // platform-thermal device_pm entry re-asserts it on resume,
+    // since the governor alone would never re-drive a level
+    // asserted before S3.
 pub fn read_temp(zone: u32) -> Result<i32, ThermalError>;
 pub fn zone_count() -> usize;
 pub fn zones_snapshot() -> Vec<(String, i32, ThermalState)>;

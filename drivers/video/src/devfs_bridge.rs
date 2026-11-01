@@ -279,6 +279,32 @@ pub fn device_count() -> usize {
     VIDEO_NODES.lock().len()
 }
 
+/// Detach half of [`register_video`] / [`register_video_with_formats`]:
+/// remove the node with `index` from the registry, so later lookups
+/// (`get_device`, devfs resolution) no longer find it and a replug
+/// publishes under a fresh index. Returns `false` when no node with
+/// `index` is registered (already detached, or never bound) — the
+/// call is idempotent by construction.
+///
+/// Lookup is by the node's `index` field, never by vector position,
+/// so removing one entry never renumbers another node's `/dev/video<N>`
+/// minor. Already-open file handles keep their `Arc` to the removed
+/// device; the owning class driver must have already stopped its
+/// capture pump (see `uvc::detach_uvc`), so no new frames arrive
+/// after removal. Indices are never recycled, mirroring
+/// `serial::devfs_bridge::unregister_tty_usb`.
+///
+/// Known remainder: the `/sys/class/video4linux/video<N>` kobject
+/// registered by `register_sysfs` has no in-tree removal API, so it
+/// lingers after detach; the live paths (devfs node, registry) are
+/// the ones withdrawn here.
+pub fn unregister_video(index: usize) -> bool {
+    let mut nodes = VIDEO_NODES.lock();
+    let before = nodes.len();
+    nodes.retain(|d| d.lock().index != index);
+    nodes.len() != before
+}
+
 /// Test-only: reset the global registry and index counter.
 #[doc(hidden)]
 pub fn __reset_for_test() {
@@ -499,6 +525,47 @@ pub mod tests {
     kernel_test_in!(
         "drivers/video/devfs_bridge",
         smoke_uvc_probe_allocates_video0
+    );
+
+    /// Detach removes exactly the named node, never renumbers the
+    /// survivor, and is idempotent — the unregister contract the
+    /// UVC detach path relies on.
+    fn smoke_uvc_detach_unregisters_node() -> TestResult {
+        __reset_for_test();
+        let first = register_video("Cam A");
+        let second = register_video("Cam B");
+        if first != 0 || second != 1 {
+            return TestResult::Fail("registrations should get indices 0 and 1");
+        }
+        if !unregister_video(first) {
+            return TestResult::Fail("first unregister should report a removal");
+        }
+        if get_device(first).is_some() {
+            return TestResult::Fail("detached node must no longer resolve");
+        }
+        if get_device(second).is_none() {
+            return TestResult::Fail("survivor must keep its index");
+        }
+        if device_count() != 1 {
+            return TestResult::Fail("device_count should be 1 after detach");
+        }
+        if unregister_video(first) {
+            return TestResult::Fail("second unregister of the same index must be a no-op");
+        }
+        if unregister_video(99) {
+            return TestResult::Fail("unregister of an unknown index must be a no-op");
+        }
+        if lookup_video("video1").is_none() {
+            return TestResult::Fail("lookup_video must still find the survivor");
+        }
+        if lookup_video("video0").is_some() {
+            return TestResult::Fail("lookup_video must not find the detached node");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/video/devfs_bridge",
+        smoke_uvc_detach_unregisters_node
     );
 
     /// /sys/class/video4linux/video0/name returns the camera string.

@@ -991,7 +991,7 @@ struct SharedFilePage {
     /// Every active mapping independently owns a strong FileOps reference.
     ops: Weak<dyn FileOps>,
     /// `mmap_backing_identity` of the file this page caches.
-    identity: usize,
+    identity: SharedFileIdentity,
     offset: u64,
     phys: PhysAddr,
     mappings: usize,
@@ -1009,9 +1009,23 @@ struct SharedFilePage {
     clean: Vec<u8>,
 }
 
+// Pointer anchors and generation counters are only unique within a mounted
+// filesystem. A different filesystem can reuse both after the old one drops.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct SharedFileIdentity {
+    device: u64,
+    anchor: usize,
+}
+fn shared_file_identity(ops: &dyn FileOps) -> SharedFileIdentity {
+    SharedFileIdentity {
+        device: ops.inode_attrs().dev,
+        anchor: ops.mmap_backing_identity(),
+    }
+}
+
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct SharedFileKey {
-    file: usize,
+    file: SharedFileIdentity,
     offset: u64,
 }
 
@@ -1028,11 +1042,11 @@ impl SharedFilePages {
         }
     }
 
-    fn key(identity: usize, offset: u64) -> SharedFileKey {
+    fn key(identity: SharedFileIdentity, offset: u64) -> SharedFileKey {
         Self::key_from_ptr(identity, offset)
     }
 
-    fn key_from_ptr(file: usize, offset: u64) -> SharedFileKey {
+    fn key_from_ptr(file: SharedFileIdentity, offset: u64) -> SharedFileKey {
         SharedFileKey { file, offset }
     }
 
@@ -1071,9 +1085,9 @@ const MAX_RETAINED_SHARED_FILE_PAGES: usize = 1024;
 ///   the guard then, and the recording open need not outlive the page —
 ///   that is what lets a later open of the same file reuse it.
 ///
-/// `identity` is the caller's `ops.mmap_backing_identity()`, computed before
+/// `identity` contains the filesystem device and anchor, computed before
 /// taking the cache lock (a filesystem may lock or allocate to answer it).
-fn shared_page_matches_ops(page: &SharedFilePage, identity: usize) -> bool {
+fn shared_page_matches_ops(page: &SharedFilePage, identity: SharedFileIdentity) -> bool {
     page.identity == identity
         && (page.mappings != 0
             || page.pending != 0
@@ -1132,7 +1146,7 @@ pub(crate) fn reserve_cached_shared_file_pages(
     count: usize,
 ) -> Option<(Vec<PhysAddr>, SharedFilePublication)> {
     let generation = ops.mmap_cache_generation()?;
-    let identity = ops.mmap_backing_identity();
+    let identity = shared_file_identity(ops.as_ref());
     let mut canonical = Vec::new();
     canonical.try_reserve_exact(count).ok()?;
     {
@@ -1591,7 +1605,7 @@ fn fault_error(error: FsError) -> FileFaultError {
 /// file's current generation), but without taking a pending hold, so a
 /// population scan does not perturb the retention state it is only
 /// observing.
-fn shared_file_page_present(identity: usize, offset: u64, generation: u64) -> bool {
+fn shared_file_page_present(identity: SharedFileIdentity, offset: u64, generation: u64) -> bool {
     let pages = SHARED_FILE_PAGES.lock();
     let key = SharedFilePages::key(identity, offset);
     let Some(&phys) = pages.by_file.get(&key) else {
@@ -1643,7 +1657,7 @@ pub(crate) fn populate_file_cache(ops: &Arc<dyn FileOps>, offset: u64, len: u64)
     if end <= first {
         return 0;
     }
-    let identity = ops.mmap_backing_identity();
+    let identity = shared_file_identity(ops.as_ref());
     let mut populated = 0u64;
     let mut page = first;
     while page < end {
@@ -1732,7 +1746,7 @@ pub(crate) fn publish_shared_file_pages(
     let mut canonical = Vec::with_capacity(prepared.len());
     let cache_generation =
         expected_generation.filter(|generation| ops.mmap_cache_generation() == Some(*generation));
-    let identity = ops.mmap_backing_identity();
+    let identity = shared_file_identity(ops.as_ref());
     {
         let mut pages = SHARED_FILE_PAGES.lock();
         for (index, (candidate, clean)) in prepared.into_iter().enumerate() {
@@ -2600,7 +2614,7 @@ fn flush_shared_page(ops: &Arc<dyn FileOps>, offset: u64, phys: PhysAddr) -> Res
 /// process, or has already exited. Page selection follows the cache's own
 /// `shared_page_matches_ops` identity rule.
 pub(crate) fn flush_shared_pages_for_ops(ops: &Arc<dyn FileOps>) -> Result<(), ()> {
-    let identity = ops.mmap_backing_identity();
+    let identity = shared_file_identity(ops.as_ref());
     let targets: Vec<(u64, PhysAddr)> = {
         let pages = SHARED_FILE_PAGES.lock();
         pages
@@ -2623,7 +2637,7 @@ pub(crate) fn flush_all_shared_file_pages() {
     let files: Vec<Arc<dyn FileOps>> = {
         let pages = SHARED_FILE_PAGES.lock();
         let mut files: Vec<Arc<dyn FileOps>> = Vec::new();
-        let mut seen: Vec<usize> = Vec::new();
+        let mut seen: Vec<SharedFileIdentity> = Vec::new();
         for page in pages.by_phys.values() {
             // Dedup on the page's recorded identity: asking a filesystem
             // for its identity may lock or allocate, which the cache lock
@@ -2657,7 +2671,7 @@ pub(crate) fn note_file_written(ops: &Arc<dyn FileOps>, offset: u64, bytes: &[u8
     if bytes.is_empty() {
         return;
     }
-    let identity = ops.mmap_backing_identity();
+    let identity = shared_file_identity(ops.as_ref());
     let mut done = 0usize;
     while done < bytes.len() {
         let cur = offset + done as u64;
@@ -2701,7 +2715,7 @@ fn snapshot_dirty_page(
     phys: PhysAddr,
     len: usize,
 ) -> Option<Vec<u8>> {
-    let identity = ops.mmap_backing_identity();
+    let identity = shared_file_identity(ops.as_ref());
     let pages = SHARED_FILE_PAGES.lock();
     let page = pages.by_phys.get(&phys.raw())?;
     if page.offset != offset || !shared_page_matches_ops(page, identity) {
@@ -2722,7 +2736,7 @@ fn snapshot_dirty_page(
 /// describes what reached the file, so the next fsync observes it as dirty.
 fn mark_page_clean(ops: &Arc<dyn FileOps>, offset: u64, phys: PhysAddr, bytes: &[u8]) {
     let cache_generation = ops.mmap_cache_generation();
-    let identity = ops.mmap_backing_identity();
+    let identity = shared_file_identity(ops.as_ref());
     let mut pages = SHARED_FILE_PAGES.lock();
     if let Some(page) = pages
         .by_phys
@@ -3258,7 +3272,10 @@ mod tests {
         let hold_balanced = {
             let pages = SHARED_FILE_PAGES.lock();
             match pages.by_file.get(&SharedFileKey {
-                file: identity,
+                file: SharedFileIdentity {
+                    device: 0,
+                    anchor: identity,
+                },
                 offset: 4096,
             }) {
                 None => true,
@@ -3801,9 +3818,53 @@ mod tests {
     /// the FAT/minix drivers behave: distinct owner objects reporting
     /// one volume-anchored identity and one shared generation counter.
     struct AnchoredOwner {
+        device: u64,
         identity: usize,
         generation: Arc<AtomicU64>,
     }
+
+    fn smoke_shared_file_cache_separates_recycled_filesystem_identity() -> TestResult {
+        static ANCHOR: AtomicU64 = AtomicU64::new(0);
+        let identity = &ANCHOR as *const _ as usize;
+        let generation = Arc::new(AtomicU64::new(7));
+        let open1: Arc<dyn FileOps> = Arc::new(AnchoredOwner {
+            device: 0x12340001,
+            identity,
+            generation: generation.clone(),
+        });
+        let candidate = match narf_memory::alloc_frame() {
+            Ok(f) => f.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        // SAFETY: newly allocated frame is exclusively owned by this fixture.
+        unsafe {
+            core::ptr::write_bytes(candidate.kernel_mut_ptr::<u8>(), 0x51, 4096);
+        }
+        let (_, publication) =
+            publish_shared_file_pages(&open1, 0, alloc::vec![candidate], Some(7));
+        publication.commit();
+        drop(open1);
+        let other: Arc<dyn FileOps> = Arc::new(AnchoredOwner {
+            device: 0x12340002,
+            identity,
+            generation,
+        });
+        // Same recycled anchor, offset and generation; different superblock.
+        let collision = reserve_cached_shared_file_pages(&other, 0, 1).is_some();
+        let retired = SHARED_FILE_PAGES.lock().remove_phys(candidate.raw());
+        if let Some(page) = retired {
+            narf_memory::free_frame(narf_memory::PhysFrame::new(page.phys));
+        }
+        if collision {
+            TestResult::Fail("different filesystem reused stale mapped data")
+        } else {
+            TestResult::Pass
+        }
+    }
+    kernel_test_in!(
+        "syscall_abi/filemap",
+        smoke_shared_file_cache_separates_recycled_filesystem_identity
+    );
 
     impl FileOps for AnchoredOwner {
         fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
@@ -3820,6 +3881,13 @@ mod tests {
                 blocks: 0,
                 mode: Mode::FILE_RW,
                 mtime_cycles: 0,
+            }
+        }
+
+        fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+            narf_filesystem::InodeAttrs {
+                dev: self.device,
+                ..Default::default()
             }
         }
 
@@ -3850,6 +3918,7 @@ mod tests {
             Err(_) => return TestResult::Skip("frame allocator drained"),
         };
         let open1: Arc<dyn FileOps> = Arc::new(AnchoredOwner {
+            device: 0,
             identity,
             generation: Arc::clone(&generation),
         });
@@ -3871,6 +3940,7 @@ mod tests {
         // A fresh open of the same file (a new object, same anchored
         // identity and generation) must reuse the retained page.
         let open2: Arc<dyn FileOps> = Arc::new(AnchoredOwner {
+            device: 0,
             identity,
             generation: Arc::clone(&generation),
         });

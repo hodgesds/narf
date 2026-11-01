@@ -1,4 +1,6 @@
 use super::*;
+#[path = "amdgpu_dcn401_power_tests.rs"]
+mod power_tests;
 use alloc::{collections::BTreeMap, vec, vec::Vec};
 use core::task::{Context, Waker};
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -95,6 +97,10 @@ impl Io for Fake {
                 assert_eq!(arg, 2, "TABLE_WATERMARKS");
                 0
             }
+            0x12 => {
+                assert!(arg == 0 || arg & 1 == 1 && arg >> 1 <= 16);
+                0
+            }
             0xc => self.dc_limit[(arg >> 16) as usize],
             0x1c => {
                 assert_eq!(arg, 0);
@@ -130,6 +136,9 @@ fn engine() -> Engine<Fake> {
             applied: None,
             bandwidth: Bandwidth::INIT,
             ignored: Ignored::default(),
+            watermarks_ready: false,
+            dynamic_power: false,
+            cab_ways: 0,
         },
         io: Fake {
             regs: BTreeMap::from([(0x589d0, 1)]),
@@ -1237,8 +1246,13 @@ kernel_test_in!(
 struct PinOwner {
     e: Engine<Fake>,
     steps: Vec<&'static str>,
+    firmware: bool,
+    refuse_firmware: bool,
 }
 impl crate::amdgpu_navi48_boot::bandwidth::UclkPin for PinOwner {
+    fn firmware_active(&self) -> bool {
+        self.firmware
+    }
     fn clock_status(&self) -> Result<Status, crate::amdgpu_dcn401_otg::Error> {
         Ok(self.e.status)
     }
@@ -1254,8 +1268,13 @@ impl crate::amdgpu_navi48_boot::bandwidth::UclkPin for PinOwner {
             .map(|_| ())
             .map_err(crate::amdgpu_dcn401_otg::Error::Clocks)
     }
-    async fn disable_fams2(&mut self) {
+    async fn disable_fams2(&mut self) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
         self.steps.push("fams2");
+        if self.refuse_firmware {
+            return Err(crate::amdgpu_dcn401_otg::Error::Busy);
+        }
+        self.firmware = false;
+        Ok(())
     }
 }
 /// A pin's result, the DAL messages it sent and the owner steps it ran.
@@ -1290,6 +1309,8 @@ fn dcn401_fresh_display_owners_pin_like_linux_prepare_bandwidth() -> TestResult 
     let fresh = || PinOwner {
         e: engine(),
         steps: Vec::new(),
+        firmware: false,
+        refuse_firmware: false,
     };
     // retire_inherited_display on cold boot: the clocks not started.
     let mut o = fresh();
@@ -1544,4 +1565,91 @@ fn dcn401_no_display_release_tracks_actual_rates_and_fails_closed() -> TestResul
 kernel_test_in!(
     "drivers/gpu/dcn401-clk",
     dcn401_no_display_release_tracks_actual_rates_and_fails_closed
+);
+
+fn dcn401_pin_retires_a_firmware_schedule_before_any_new_configuration() -> TestResult {
+    let mut o = PinOwner {
+        e: engine(),
+        steps: Vec::new(),
+        firmware: true,
+        refuse_firmware: true,
+    };
+    start(&mut o.e);
+    run(o.e.prepare(request())).unwrap();
+    assert!(!o.e.status.uclk_switching());
+    let (result, messages, steps) = pin(&mut o);
+    assert_eq!(result, Err(crate::amdgpu_dcn401_otg::Error::Busy));
+    assert!(messages.is_empty());
+    assert_eq!(steps, ["fams2"]);
+    assert!(o.firmware);
+    o.refuse_firmware = false;
+    assert_eq!(pin(&mut o), (Ok(()), Vec::new(), vec!["fams2"]));
+    assert!(!o.firmware);
+    o.firmware = true;
+    o.e.status.state = State::Applying;
+    assert_eq!(
+        pin(&mut o),
+        (
+            Err(crate::amdgpu_dcn401_otg::Error::Busy),
+            Vec::new(),
+            Vec::new()
+        )
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_pin_retires_a_firmware_schedule_before_any_new_configuration
+);
+
+fn dcn401_cab_reservation_requires_pin_and_acknowledgement() -> TestResult {
+    for outcome in 0..3 {
+        let mut e = engine();
+        start(&mut e);
+        run(e.prepare(request())).unwrap();
+        e.status.dynamic_power = true;
+        e.status.bandwidth.uclk_pstate = false;
+        e.io.commands.clear();
+        assert_eq!(run(e.reserve_cab(17)), Err(Error::Invalid));
+        assert!(e.io.commands.is_empty());
+        e.status.bandwidth.uclk_pstate = true;
+        assert_eq!(run(e.reserve_cab(3)), Err(Error::Busy));
+        e.status.bandwidth.uclk_pstate = false;
+        if outcome == 1 {
+            e.io.refuse = Some(1);
+        }
+        if outcome == 2 {
+            e.io.stall = Some(1);
+        }
+        if outcome == 2 {
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut f = core::pin::pin!(e.reserve_cab(3));
+            assert!(f.as_mut().poll(&mut cx).is_pending());
+        } else {
+            assert_eq!(
+                run(e.reserve_cab(3)),
+                if outcome == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::Rejected(0xfd))
+                }
+            );
+        }
+        assert_eq!(e.io.commands, alloc::vec![(0x12, 7)]);
+        if outcome == 0 {
+            assert_eq!(e.status.cab_ways, 3);
+            run(e.reserve_cab(0)).unwrap();
+            assert_eq!(e.io.commands.last(), Some(&(0x12, 0)));
+            assert_eq!(e.status.cab_ways, 0);
+        } else {
+            assert_eq!(e.status.cab_ways, 0);
+            assert_eq!(run(e.reserve_cab(0)), Err(Error::Busy));
+            assert_ne!(e.status.state, State::Applied);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_cab_reservation_requires_pin_and_acknowledgement
 );

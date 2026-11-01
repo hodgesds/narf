@@ -11,13 +11,14 @@
 //! The strategy lists, their permutations and DRR variants, the per-stream
 //! P-state meta, the synchronized timing groups and the schedulability
 //! checks are Linux's, and so is the candidate search with its latency
-//! index increases. The port programs the hardware-exclusive methods
-//! (vactive and vblank), which need no firmware: a configuration whose
-//! search would reach a firmware method first (SubVP whose phantom pipes
-//! could be placed, DRR) is [`Pstate::Pinned`], as is anything the port
-//! does not plan (a DCC plane, a DPMM clock raised above the latency
-//! state). Every stream here has fixed refresh (`drr_config` disabled):
-//! VRR streams keep the pinned policy.
+//! index increases. DCC includes the MRQ metadata-row blackout budget and
+//! native mcache placement. `admit_with_drr` carries live refresh limits and
+//! permits hardware vactive/vblank or FAMS2 clamped/stretch strategies.
+//! SubVP remains pinned without a phantom-pipe/MALL owner; the runtime DRR
+//! search skips those unavailable candidates. `admit_subvp` expands the
+//! single-stream linear RGB subset for the native phantom owner.
+//! Mode programming uses DPMM's
+//! actual active clocks, including bounded raises beyond the latency state.
 use super::*;
 
 /// `enum dml2_pstate_method` (dml_top_types.h) values PMO assigns.
@@ -317,6 +318,8 @@ pub(crate) struct Meta {
     subvp_programming: i32,
     subvp_prefetch_to_mall: i32,
     phantom_vtotal: i32,
+    phantom_vactive: i32,
+    phantom_vfp: i32,
     drr: Common,
     drr_programming: i32,
 }
@@ -374,6 +377,8 @@ fn meta(t: &Timing, streams: usize, phantom: (i32, i32)) -> Meta {
     let df_throttle = lines(SUBVP_DF_THROTTLE_DELAY_US);
     m.subvp_prefetch_to_mall = lines(SUBVP_PREFETCH_TO_MALL_DELAY_US);
     let phantom_vactive = m.allow_to_target + m.min_allow_width + phantom.0;
+    m.phantom_vactive = phantom_vactive;
+    m.phantom_vfp = df_throttle;
     m.phantom_vtotal = phantom.1 + df_throttle + 1 + df_throttle + phantom_vactive;
     m.subvp.allow_start = t.v_blank_end() as i32
         + m.contention
@@ -403,6 +408,7 @@ struct Pmo<'a> {
     modes: &'a [Mode],
     shapes: &'a [Shape],
     fams2: bool,
+    drr: [Option<crate::amdgpu_freesync::Drr>; MAX_STREAMS],
     metas: [Meta; MAX_STREAMS],
     /// Each stream's planes (stream_plane_mask), as plane indices.
     planes: [u8; MAX_STREAMS],
@@ -452,10 +458,18 @@ impl Pmo<'_> {
             .max()
             .unwrap_or(0)
     }
-    /// stream_matches_drr_policy for a stream without DRR (the native
-    /// streams' `drr_config.enabled` is false).
-    fn drr_policy_ok(&self, m: Method) -> bool {
-        !(m.drr_var() || m.drr_clamped() || (m.firmware() && !self.fams2))
+    /// stream_matches_drr_policy with active variable refresh. Hardware
+    /// exclusive methods remain valid for one stream; multiple streams need
+    /// firmware clamping or stretching so their allow windows stay schedulable.
+    fn drr_policy_ok(&self, method: Method, stream: usize) -> bool {
+        let active = self.drr[stream].is_some();
+        if method.firmware() && !self.fams2 {
+            return false;
+        }
+        if method.drr_clamped() || method.drr_var() {
+            return active && self.fams2;
+        }
+        !(active && (self.streams() > 1 || method.firmware()))
     }
     /// all_timings_support_svp, with every plane's rect_out spanning the
     /// stream's vactive unless an overlay shares it, and no rotation.
@@ -508,7 +522,7 @@ impl Pmo<'_> {
         let n = self.streams();
         let (mut svp, mut vactive, mut vblank, mut drr, mut alternate) = (0u8, 0u8, 0u8, 0u8, 0u8);
         for (i, &m) in st.methods[..n].iter().enumerate() {
-            if !self.drr_policy_ok(m) {
+            if !self.drr_policy_ok(m, i) {
                 return false;
             }
             let bit = 1 << i;
@@ -532,8 +546,12 @@ impl Pmo<'_> {
                 return false;
             }
         }
-        // DRR needs FAMS2 and DRR on the stream.
-        if drr != 0 {
+        if (0..n).filter(|&i| drr & (1 << i) != 0).any(|i| {
+            let m = &self.metas[i];
+            self.drr[i].is_none()
+                || m.drr.allow_end + m.blackout > m.max_vtotal
+                || !(119.0..=1000.0).contains(&m.nom_refresh_hz)
+        }) {
             return false;
         }
         if svp != 0 && (!self.fams2 || !self.svp_ok(svp)) {
@@ -621,8 +639,12 @@ impl Pmo<'_> {
         // STAGE 3: the larger allow fits every other period (no DRR).
         let mut by_period: Vec<usize> = (0..n).collect();
         bubble(&mut by_period, |i| groups[i].period_us);
-        let ok = (0..n - 1)
-            .all(|i| groups[by_period[i]].allow_time_us >= groups[by_period[i + 1]].period_us);
+        let ok = (0..n - 1).all(|i| {
+            groups[by_period[i]].allow_time_us >= groups[by_period[i + 1]].period_us
+                && !(0..self.streams()).any(|stream| {
+                    self.groups[by_period[i + 1]] & (1 << stream) != 0 && self.drr[stream].is_some()
+                })
+        });
         if ok && max_delay < MAX_ALLOW_DELAY {
             return true;
         }
@@ -691,11 +713,13 @@ impl UclkLevels {
 /// can be admitted again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlanPstate {
+    pub subvp: Option<SubvpProof>,
     pub uclk: UclkLevels,
     /// FAMS 2.1 firmware: SubVP, DRR and FAMS2 strategies were searched.
     pub fams2: bool,
     /// This stream's method.
     pub method: Method,
+    pub drr: [Option<crate::amdgpu_freesync::Drr>; MAX_STREAMS],
 }
 
 /// DPMM's minimum clocks for one SoC state, in kHz.
@@ -731,12 +755,35 @@ pub struct Fams2Stream {
     pub min_ttu_vblank_usable: bool,
     /// legacy.vactive_det_fill_delay_otg_vlines (vactive only).
     pub vactive_det_fill_delay_otg_vlines: u16,
+    pub drr_state: Option<DrrSubstate>,
+    pub subvp: Option<SubvpSubstate>,
 }
+
+/// FAMS2's DRR static sub-state (legacy methods use the fill-delay field).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrrSubstate {
+    pub stretched_vtotal: u16,
+    pub programming_delay: u16,
+}
+
+/// DML21's single-plane RGB SubVP static sub-state. DC adds physical
+/// phantom OTG/HUBP masks at the firmware boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubvpSubstate {
+    pub phantom_vtotal: u16,
+    pub phantom_vactive: u16,
+    pub programming_delay: u16,
+    pub prefetch_to_mall: u16,
+}
+#[path = "amdgpu_dcn401_subvp.rs"]
+mod subvp;
+pub use subvp::{admit_subvp, Phantom, SubvpProof};
 
 /// A configuration with UCLK P-state switching.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Supported {
-    /// Each stream's plan at the chosen level, in admission order.
+    pub phantom: Option<alloc::boxed::Box<Phantom>>,
+    /// Each stream's plan at DPMM's active clocks, in admission order.
     pub plans: Vec<Plan>,
     pub methods: [Method; MAX_STREAMS],
     /// The min-clock-table index the plans' latencies come from.
@@ -746,9 +793,9 @@ pub struct Supported {
     pub active: MinClocks,
     pub idle: MinClocks,
     pub fclk_pstate: bool,
-    /// fams2_required: a firmware method is in use (never, here).
+    /// fams2_required: a firmware method is in use.
     pub fams2_required: bool,
-    pub fams2_streams: [Fams2Stream; MAX_STREAMS],
+    pub fams2_streams: alloc::boxed::Box<[Fams2Stream; MAX_STREAMS]>,
 }
 
 /// Why a configuration keeps the pinned-UCLK policy.
@@ -756,12 +803,9 @@ pub struct Supported {
 pub enum Pinned {
     /// DML has no UCLK P-state strategy for it (uclk_pstate_supported 0).
     Unsupported,
-    /// Linux's search would try a firmware method first (SubVP or DRR),
-    /// which the port does not program.
+    /// Linux's search would try SubVP before a native method, but the
+    /// port has no phantom-pipe/MALL owner.
     Firmware(Method),
-    /// The configuration is outside what this port plans with P-state
-    /// support (a DCC plane, VRR, a DPMM clock above the latency state).
-    Port,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -977,14 +1021,45 @@ pub(crate) fn admit_traced(
     fams2: bool,
     candidates: &mut Vec<Strategy>,
 ) -> Result<Pstate, Error> {
+    admit_config(soc, uclk, modes, fams2, [None; MAX_STREAMS], candidates)
+}
+
+/// Search with each live stream's hardware-admitted variable-refresh limits.
+pub fn admit_with_drr(
+    soc: &Soc,
+    uclk: &UclkLevels,
+    modes: &[Mode],
+    fams2: bool,
+    drr: [Option<crate::amdgpu_freesync::Drr>; MAX_STREAMS],
+) -> Result<Pstate, Error> {
+    admit_config(soc, uclk, modes, fams2, drr, &mut Vec::new())
+}
+fn admit_config(
+    soc: &Soc,
+    uclk: &UclkLevels,
+    modes: &[Mode],
+    fams2: bool,
+    drr: [Option<crate::amdgpu_freesync::Drr>; MAX_STREAMS],
+    candidates: &mut Vec<Strategy>,
+) -> Result<Pstate, Error> {
+    for (i, limits) in drr.iter().enumerate() {
+        if let Some(limits) = limits {
+            let Some(mode) = modes.get(i) else {
+                return Err(Error::Invalid);
+            };
+            if limits.v_total_min < mode.timing.v_total
+                || limits.v_total_min > limits.v_total_max
+                || limits.v_total_max > crate::amdgpu_freesync::MAX_V_TOTAL
+            {
+                return Err(Error::Invalid);
+            }
+        }
+    }
     if uclk.levels().last() != Some(&soc.uclk_khz) {
         return Err(Error::Invalid);
     }
     admit_native(soc, modes)?;
-    let mut shapes = shapes_for(soc, modes, Policy::NATIVE, &[false; MAX_PLANES], None)?;
-    if shapes.iter().any(|s| s.plane.dcc || !s.mcache_fits) {
-        return Ok(Pstate::Pinned(Pinned::Port));
-    }
+    let mut shapes = mcache_shapes(soc, modes, Policy::NATIVE)?;
     let mut p = prepare(soc, &mut shapes)?;
     let table = min_clock_table(soc, uclk);
     if table.is_empty() {
@@ -1029,11 +1104,15 @@ pub(crate) fn admit_traced(
         // VStartup.
         let k = planes[i].trailing_zeros() as usize;
         metas[i] = meta(&m.timing, n, shapes[k].phantom_lines(base_eval.lat.urgent));
+        if let Some(drr) = drr[i] {
+            metas[i].max_vtotal = drr.v_total_max as i32;
+        }
     }
     let mut pmo = Pmo {
         modes,
         shapes: &shapes,
         fams2,
+        drr,
         metas,
         planes,
         vactive_capable: 0,
@@ -1053,7 +1132,7 @@ pub(crate) fn admit_traced(
         mapped |= 1 << i;
         let mut g = 1u8 << i;
         for j in i + 1..n {
-            if same_timing(&modes[i], &modes[j]) {
+            if drr[i].is_none() && drr[j].is_none() && same_timing(&modes[i], &modes[j]) {
                 g |= 1 << j;
                 mapped |= 1 << j;
             }
@@ -1090,10 +1169,14 @@ pub(crate) fn admit_traced(
         let Some(ov) = setup(&pmo, &st) else {
             break None;
         };
-        if let Some(&m) = st.methods[..n].iter().find(|m| m.firmware()) {
-            // Mode support with phantom pipes (SubVP) or DRR: the port
-            // cannot answer it unless the phantoms cannot be placed.
-            if !matches!(m, Method::FwSvp | Method::FwSvpDrr) || !svp_impossible(&pmo, &st) {
+        if let Some(&m) = st.methods[..n]
+            .iter()
+            .find(|m| matches!(m, Method::FwSvp | Method::FwSvpDrr))
+        {
+            // Keep fixed-refresh source-vector ordering. Runtime DRR may
+            // continue to a schedulable non-SubVP method without a phantom
+            // owner; it never programs a SubVP candidate.
+            if !svp_impossible(&pmo, &st) && drr.iter().all(Option::is_none) {
                 return Ok(Pstate::Pinned(Pinned::Firmware(m)));
             }
             last_failed = true;
@@ -1163,10 +1246,6 @@ pub(crate) fn admit_traced(
     ) else {
         return Ok(Pstate::Pinned(Pinned::Unsupported));
     };
-    // The port plans only at the latency state's clocks.
-    if au != level.uclk_khz || af != level.fclk_khz || ad != level.dcfclk_khz {
-        return Ok(Pstate::Pinned(Pinned::Port));
-    }
     // FCLK P-state: planes whose vactive cannot hide a zero FCLK blackout
     // must be synchronizable (each stream's reserved vblank at least zero).
     let hiding_short = (0..shapes.len())
@@ -1194,17 +1273,46 @@ pub(crate) fn admit_traced(
         idle.fclk_khz = soc.fclk_khz[1];
     }
 
-    let ctx = ctx_at(&table, uclk, lat);
+    // core_dcn4_mode_programming uses DPMM's active clocks and its actual
+    // UCLK index. The latency index remains the candidate-search result.
+    let ctx = Ctx {
+        level: Level {
+            uclk_khz: active.uclk_khz,
+            fclk_khz: active.fclk_khz,
+            dcfclk_khz: active.dcfclk_khz,
+            dram_bw_kbps: u64::from(active.uclk_khz)
+                * u64::from(soc.umc_channels)
+                * CHANNEL_BYTES
+                * TRANSACTIONS_PER_CLOCK,
+        },
+        index: uclk
+            .levels()
+            .iter()
+            .position(|&clock| clock == active.uclk_khz)
+            .unwrap_or(0),
+        ..ctx_at(&table, uclk, lat)
+    };
     let mut plans = Vec::with_capacity(n);
     let mut fams2_streams = [Fams2Stream::default(); MAX_STREAMS];
     let (programmed, usable) =
-        program_with_ttu(soc, modes, &shapes, &p, &ctx, &ov, &st, uclk, fams2)?;
+        program_with_ttu(soc, modes, &shapes, &p, &ctx, &ov, &st, uclk, fams2, drr)?;
     for (i, plan) in programmed.into_iter().enumerate() {
         fams2_streams[i] =
             fams2_stream(&modes[i].timing, &stream_metas[i], st.methods[i], usable[i]);
+        fams2_streams[i].is_drr = drr[i].is_some();
+        if st.methods[i] == Method::FwDrr {
+            fams2_streams[i].allow_start_otg_vline = stream_metas[i].drr.allow_start as u16;
+            fams2_streams[i].allow_end_otg_vline = stream_metas[i].drr.allow_end as u16;
+            fams2_streams[i].clamp_vtotal_min = n == 1;
+            fams2_streams[i].drr_state = Some(DrrSubstate {
+                stretched_vtotal: (stream_metas[i].drr.allow_end + stream_metas[i].blackout) as u16,
+                programming_delay: stream_metas[i].drr_programming as u8 as u16,
+            });
+        }
         plans.push(plan);
     }
     Ok(Pstate::Supported(Supported {
+        phantom: None,
         plans,
         methods: st.methods,
         level: lat as u8,
@@ -1212,7 +1320,7 @@ pub(crate) fn admit_traced(
         idle,
         fclk_pstate,
         fams2_required: st.methods[..n].iter().any(|m| m.firmware()),
-        fams2_streams,
+        fams2_streams: alloc::boxed::Box::new(fams2_streams),
     }))
 }
 
@@ -1230,14 +1338,17 @@ fn program_with_ttu(
     st: &Strategy,
     uclk: &UclkLevels,
     fams2: bool,
+    drr: [Option<crate::amdgpu_freesync::Drr>; MAX_STREAMS],
 ) -> Result<(Vec<Plan>, [bool; MAX_STREAMS]), Error> {
     let mut plans = program(soc, modes, shapes, p, ctx, ov, None)?;
     let mut usable = [true; MAX_STREAMS];
     for (i, plan) in plans.iter_mut().enumerate() {
         plan.pstate = Some(PlanPstate {
+            subvp: None,
             uclk: *uclk,
             fams2,
             method: st.methods[i],
+            drr,
         });
         for q in plan.planes.iter().flatten() {
             if q.ttu.min_ttu_vblank <= plan.watermarks.uclk_pstate {
@@ -1319,7 +1430,27 @@ impl Shape {
 
 /// [`Plan::readmits`] for a P-state plan.
 pub(super) fn readmits(plan: &Plan, p: &PlanPstate) -> bool {
-    match admit(&plan.soc, &p.uclk, &plan.joint_modes(), p.fams2) {
+    if let Some(proof) = p.subvp {
+        let mode = if proof.phantom {
+            plan.streams[0].as_ref()
+        } else {
+            Some(&plan.mode)
+        };
+        return mode
+            .and_then(|mode| {
+                admit_subvp(&plan.soc, &p.uclk, mode, proof.mall_bytes)
+                    .ok()
+                    .flatten()
+            })
+            .is_some_and(|s| {
+                if proof.phantom {
+                    s.phantom.is_some_and(|p| p.plan == *plan)
+                } else {
+                    s.plans.first() == Some(plan)
+                }
+            });
+    }
+    match admit_with_drr(&plan.soc, &p.uclk, &plan.joint_modes(), p.fams2, p.drr) {
         Ok(Pstate::Supported(s)) => s.plans.get(usize::from(plan.stream)) == Some(plan),
         _ => false,
     }

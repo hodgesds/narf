@@ -43,6 +43,7 @@ mod vp9_10_tests;
 mod vp9_tests;
 
 struct Fake {
+    sram: crate::amdgpu_navi48_media_power::tests::Program,
     encoding: encode_tests::Model,
     hevc_encoding: hevc_encode_tests::Model,
     av1_encoding: av1_encode_tests::Model,
@@ -72,6 +73,7 @@ struct Fake {
     kernel_stall_at: Option<u8>,
     dirty: bool,
     boot: bool,
+    power_stuck: bool,
     advance: bool,
     advance_on_delay: bool,
     pending_pointer: Option<u32>,
@@ -315,6 +317,7 @@ impl Fake {
 }
 impl Io for Fake {
     fn read(&mut self, at: u64) -> u32 {
+        dpg_tests::replay(self);
         *self.regs.get(&at).unwrap_or(&0)
     }
     fn write(&mut self, at: u64, value: u32) {
@@ -326,6 +329,24 @@ impl Io for Fake {
             return;
         }
         self.regs.insert(at, value);
+        if at == VCN + u64::from(DLDO_CONFIG) * 4 && !self.power_stuck {
+            for (config, status) in [(6, 3), (8, 4), (10, 5), (12, 6)] {
+                let old = self
+                    .regs
+                    .entry(VCN + u64::from(DLDO_STATUS) * 4)
+                    .or_default();
+                if value & (3 << config) == 1 << config {
+                    *old &= !(1 << status);
+                }
+                if value & (3 << config) == 2 << config {
+                    *old |= 1 << status;
+                }
+            }
+        }
+        if at == VCN + 0x14 * 4 {
+            self.regs
+                .insert(at, (value & !8) | if value & 4 != 0 { 8 } else { 0 });
+        }
         if let Some((reg, cap)) = self.revoked {
             if reg == at {
                 cap.revoke();
@@ -530,9 +551,9 @@ impl Io for Fake {
                 }
                 3 => {
                     let address = u64::from(self.word(at + 4)) | u64::from(self.word(at + 8)) << 32;
-                    assert_eq!(address, GPU + FENCE);
+                    assert!(address == GPU + FENCE || address == GPU + FENCE + 16);
                     if self.fence {
-                        self.store(FENCE, self.word(at + 12));
+                        self.store(address - GPU, self.word(at + 12));
                         if self.wide_fence {
                             self.store(WRITEBACK, 0);
                         }
@@ -589,11 +610,13 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>) {
     let regs = BTreeMap::from([
         (VCN + 0x1d6 * 4, 1 << 28),
         (VCN + 0x331 * 4, 0x24f),
-        (GC + 0x263e * 4, 0x545),
+        (GC + 0x13de * 4, 0x545),
+        (GC + 0x263e * 4, u32::MAX),
         (MM + 0x575 * 4, 1),
     ]);
     let e = Engine {
         io: Fake {
+            sram: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(None)),
             encoding: encode_tests::Model::default(),
             hevc_encoding: hevc_encode_tests::Model::default(),
             av1_encoding: av1_encode_tests::Model::default(),
@@ -623,6 +646,7 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>) {
             kernel_stall_at: None,
             dirty: false,
             boot: true,
+            power_stuck: false,
             advance: true,
             advance_on_delay: false,
             pending_pointer: None,
@@ -670,6 +694,9 @@ fn fixture_capacity(capacity: u64) -> (Pool, Engine<Fake>) {
         firmware_bytes: 0x11000,
         encode_interface: Some(0x1000a),
         state: State::Prepared,
+        idle_state: None,
+        addr_config: None,
+        dpg: false,
         proof: None,
         interrupt_result: None,
         ib_result: None,
@@ -877,6 +904,7 @@ fn vcn5_missing_power_boot_or_stop_proof_never_releases_backing() -> TestResult 
         let (_pool, mut e) = fixture();
         let error = match case {
             0 => {
+                e.io.power_stuck = true;
                 e.io.regs.insert(VCN + 4, 8); // ONO2 did not power on
                 assert_eq!(run(e.start(IMAGE, power())), Err(Error::Timeout));
                 Error::Timeout
@@ -942,7 +970,7 @@ fn vcn5_layout_rejects_foreign_ip_and_truncated_register_banks() -> TestResult {
             1 => gpu.ip_blocks[5].num_bases = 1,
             2 => gpu.ip_blocks[5].base_addrs[1] = 0x20000 - 0x331,
             3 => gpu.ip_blocks[2].base_addrs[2] = 0x20000 - 0x1cf,
-            4 => gpu.ip_blocks[0].base_addrs[0] = 0x20000 - 0x263e,
+            4 => gpu.ip_blocks[0].base_addrs[0] = 0x20000 - 0x13de,
             5 => gpu.ip_blocks.push(gpu.ip_blocks[5]),
             6 => gpu.chip.did = crate::amdgpu::NAVI22,
             7 => gpu.regs.len = 0x7f000,
@@ -1329,6 +1357,100 @@ fn ib_ready() -> (Pool, Engine<Fake>, Irqs) {
     run(e.prove_interrupts(&mut observer)).unwrap();
     (pool, e, observer)
 }
+fn vcn5_idle_preserves_sessions_sequences_irq_and_shared_jpeg_range() -> TestResult {
+    let (_pool, mut e, mut irq) = ib_ready();
+    run(e.prove_ibs(&mut irq)).unwrap();
+    e.io.store(0x20080, 0x1234abcd);
+    let seq = e.seq;
+    let range = e.io.regs[&(NBIO + u64::from(NBIO_RANGE) * 4)];
+    e.io.regs.insert(VCN + u64::from(JPEG_DB_CTRL) * 4, 1 << 30);
+    assert!(run(e.idle()).unwrap());
+    assert_eq!(e.state, State::Idle);
+    assert!(!e.memory.reusable_for_test());
+    assert_eq!(e.io.regs[&(NBIO + u64::from(NBIO_RANGE) * 4)], range);
+    e.io.regs.insert(VCN + u64::from(STATUS) * 4, u32::MAX);
+    assert_eq!(e.completed_job(), Ok(seq));
+    e.io.regs.insert(VCN + u64::from(STATUS) * 4, 2);
+    // No GC reads on resume, even with GFXOFF active.
+    e.io.regs.insert(GC + 0x13de * 4, u32::MAX);
+    run(e.resume_idle(IMAGE, power(), &mut ())).unwrap();
+    assert_eq!(e.state, State::IbVerified);
+    assert_eq!(e.seq, seq);
+    assert_eq!(e.io.word(0x20080), 0x1234abcd);
+    assert_eq!(e.io.regs[&(VCN + u64::from(MASTINT) * 4)] & 2, 2);
+    let job = crate::amdgpu_gfx12_queue::Job::new(3, 0x42, 0x1_0000_8001, &[(0x2_0000_1000, 64)])
+        .unwrap();
+    assert_eq!(e.submit(job), Ok(seq.wrapping_add(1)));
+    assert!(run(e.idle()).unwrap());
+    run(e.resume_idle(IMAGE, power(), &mut ())).unwrap();
+    assert_eq!(e.seq, seq.wrapping_add(1));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4-idle",
+    vcn5_idle_preserves_sessions_sequences_irq_and_shared_jpeg_range
+);
+fn vcn5_idle_waits_for_physical_work_and_failed_resume_cannot_replay() -> TestResult {
+    let (_pool, mut e, mut irq) = ib_ready();
+    run(e.prove_ibs(&mut irq)).unwrap();
+    e.seq += 1;
+    let writes = e.io.writes.len();
+    assert!(!run(e.idle()).unwrap());
+    assert_eq!(e.io.writes.len(), writes + 1); // HDP flush only
+    e.io.store(FENCE, e.seq);
+    assert!(run(e.idle()).unwrap());
+    e.io.ignored = Some(VCN + u64::from(VCPU) * 4);
+    assert!(run(e.resume_idle(IMAGE, power(), &mut ())).is_err());
+    let writes = e.io.writes.len();
+    assert_eq!(
+        run(e.resume_idle(IMAGE, power(), &mut ())),
+        Err(Error::DeviceGone)
+    );
+    assert_eq!(e.io.writes.len(), writes);
+    assert!(!e.memory.reusable_for_test());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4-idle",
+    vcn5_idle_waits_for_physical_work_and_failed_resume_cannot_replay
+);
+fn vcn5_cancelled_idle_and_resume_require_device_recovery() -> TestResult {
+    for wake in [false, true] {
+        let (_pool, mut e, mut irq) = ib_ready();
+        run(e.prove_ibs(&mut irq)).unwrap();
+        if wake {
+            assert!(run(e.idle()).unwrap());
+            e.io.boot = false;
+            let mut sram = ();
+            let mut future = core::pin::pin!(e.resume_idle(IMAGE, power(), &mut sram));
+            assert!(future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        } else {
+            e.io.regs.insert(VCN + u64::from(LMI_STATUS) * 4, 0);
+            let mut future = core::pin::pin!(e.idle());
+            assert!(future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        }
+        let writes = e.io.writes.len();
+        assert_eq!(run(e.idle()), Err(Error::DeviceGone));
+        assert_eq!(
+            run(e.resume_idle(IMAGE, power(), &mut ())),
+            Err(Error::DeviceGone)
+        );
+        assert_eq!(run(e.stop()), Err(Error::Busy));
+        assert_eq!(e.io.writes.len(), writes);
+        assert!(!e.memory.reusable_for_test());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/rdna4-idle",
+    vcn5_cancelled_idle_and_resume_require_device_recovery
+);
 fn vcn5_kernel_session_ibs_prove_both_engines_and_restart_at_sequence_wrap() -> TestResult {
     let (pool, mut e, mut observer) = ib_ready();
     for restart in [false, true] {
@@ -1693,3 +1815,6 @@ kernel_test_in!(
     "drivers/gpu/vcn-navi48",
     vcn5_proof_pointer_rejects_progress_outside_published_span
 );
+
+#[path = "amdgpu_vcn_navi48_dpg_tests.rs"]
+mod dpg_tests;

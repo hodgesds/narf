@@ -36,6 +36,10 @@ use crate::posix_timer::{
 /// three clocks that have no discipline interface.
 pub(crate) fn sys_clock_adjtime(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
+    if let Some(result) = super::phc::adjtime(a.arg0 as i32, a.arg1) {
+        ctx.set_return(SyscallReturn::ok(result as u64));
+        return;
+    }
     let r = adjtimex_core(a.arg1, false, clock_adjtime_clock_ok(a.arg0 as i32));
     ctx.set_return(SyscallReturn::ok(r as u64));
 }

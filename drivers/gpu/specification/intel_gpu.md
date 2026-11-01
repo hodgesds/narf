@@ -602,6 +602,45 @@ Composition points and named omissions:
   PCH PPS base (0xC7200) on the south-display SKUs this
   queue covers.
 
+### 10.5 DPCD backlight device (wave-2 backfill — `intel_dpcd_bl`, #957)
+
+A `BacklightDevice` over DPCD through the Intel AUX machinery,
+registered into the arbitrated backlight stack (see §10's PPS
+composition: the device is a candidate alongside the PWM device,
+not a replacement for it):
+
+- Registers: `BACKLIGHT_BRIGHTNESS_MSB` 0x722,
+  `BACKLIGHT_BRIGHTNESS_LSB` 0x723 (issue #957's VESA eDP
+  backlight block). AUX framing is the spec-shaped `dp_aux`
+  layer (DP 1.4a §2.7); the device is generic over
+  `AuxChannel`, so the production `IntelAux` transport and
+  the fixture's panel model run the same device code.
+- Field width is a per-panel fact (`lsb_used`): 16-bit
+  MSB-first levels, max 0xFFFF, when the LSB register is
+  used; the MSB byte alone, max 0xFF, otherwise. Reads and
+  writes carry exactly the field width — never a blanket
+  2-byte access on an 8-bit panel. Semantics follow Linux
+  `intel_dp_aux_backlight` / `drm_edp_backlight` as the
+  public reference implementation of the VESA protocol.
+- Kind is Raw (direct hardware control). Ties keep the
+  earliest registration, so install ordering against
+  `intel_bl::install` decides ownership on dual-path panels.
+- `install(channel, lsb_used)` is the registration seam;
+  no probe call site installs the device yet. Named
+  remainders (grounding gap, not oversights): mode
+  selection at 0x721, the 0x700 capability probe, and the
+  0x720 display-control enable bit — their bit encodings
+  could not be pinned to a citable source in this lane
+  (VESA eDP text paywalled; public Linux sources use
+  symbolic names), so they are not programmed here. The
+  follow-up probes the caps, installs only on full-AUX
+  panels, and installs before `intel_bl::install` so the
+  DPCD device wins the Raw tie on AUX-only panels. The
+  generic PWM panel backlight half of #957 is likewise
+  remainder. Fixture: a panel-side DPCD model asserting
+  the wire frame byte-for-byte, the field-width
+  transcripts, and the NACK → 0 read contract.
+
 ## 11. Forcewake domains (Stage 5 — `intel_gpu_forcewake`, #1013)
 
 Register access under GT power gating. Compiled only under

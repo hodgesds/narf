@@ -2286,3 +2286,685 @@ fn smoke_abi_packet_dhcpcd_sequence() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/packet", smoke_abi_packet_dhcpcd_sequence);
+
+fn smoke_abi_packet_hardware_timestamp_cmsgs() -> TestResult {
+    fn tx(cookie: u64, frame: narf_net::Frame, _: narf_net::TxMeta) -> Result<(), ()> {
+        let name = narf_net::iface::snapshot_all()
+            .into_iter()
+            .find(|i| u64::from(i.ifindex) == cookie)
+            .ok_or(())?
+            .name;
+        let cookie = frame.tx_timing().timestamp_cookie.ok_or(())?;
+        if narf_net::raw_sock::complete_tx_timestamp(
+            &name,
+            narf_net::nic::Timestamp {
+                cookie,
+                nanoseconds: 12_000_000_345,
+                transmit: true,
+                error: None,
+            },
+        ) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+    with_setup(|| {
+        let ifindex = nic(true)?;
+        narf_net::iface::enable_zero_copy_tx_context(
+            NIC,
+            ifindex as u64,
+            tx,
+            alloc::vec![],
+            0,
+            true,
+        );
+        let fd = open_packet(SOCK_RAW, 0x88f7)?;
+        bind_ll(fd, 0x88f7, ifindex)?;
+        expect(
+            set_int(fd, SOL_SOCKET, 37, 0x45) == Some(0),
+            "SO_TIMESTAMPING hardware flags",
+        )?;
+        let bytes = eth(NIC_MAC, PEER_MAC, 0x88f7, b"ptp");
+        let snapshot = narf_net::iface::lookup(NIC).ok_or("NIC lookup")?;
+        narf_net::raw_sock::netif_receive_timestamped(&snapshot, &bytes, Some(7_000_000_123));
+        let mut data = [0; 128];
+        let mut control = [0; 128];
+        let received = recvmsg(fd, &mut [&mut data], &mut control, MSG_DONTWAIT);
+        let messages = cmsgs(&control, received.controllen);
+        expect(
+            received.ret == Some(bytes.len() as i64)
+                && messages.len() == 1
+                && (messages[0].0, messages[0].1) == (1, 37),
+            "hardware RX timestamp cmsg absent",
+        )?;
+        expect(
+            messages[0].2.len() == 48
+                && i64::from_ne_bytes(messages[0].2[32..40].try_into().unwrap()) == 7
+                && i64::from_ne_bytes(messages[0].2[40..48].try_into().unwrap()) == 123,
+            "SCM_TIMESTAMPING raw clock slot wrong",
+        )?;
+        expect(
+            sys(
+                Syscall::SocketSend,
+                a5(fd, bytes.as_ptr() as u64, bytes.len() as u64, 0, 0, 0),
+            ) == Some(bytes.len() as i64),
+            "timestamped packet send",
+        )?;
+        let received = recvmsg(fd, &mut [&mut data], &mut control, MSG_ERRQUEUE);
+        let messages = cmsgs(&control, received.controllen);
+        expect(
+            received.ret == Some(bytes.len() as i64)
+                && received.flags & 0x2000 != 0
+                && messages.len() == 2
+                && (messages[1].0, messages[1].1) == (263, 16),
+            "TX timestamp error queue cmsg absent",
+        )?;
+        expect(
+            i64::from_ne_bytes(messages[0].2[32..40].try_into().unwrap()) == 12
+                && u32::from_ne_bytes(messages[1].2[..4].try_into().unwrap()) == 42
+                && messages[1].2[4] == 4,
+            "TX timestamp extended error layout wrong",
+        )?;
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_packet_hardware_timestamp_cmsgs);
+
+fn smoke_abi_packet_so_txtime_and_scm_txtime() -> TestResult {
+    static LAST_TX_TIMING: IrqSafeSpinLock<Option<narf_net::TxTiming>> = IrqSafeSpinLock::new(None);
+    fn tx(_cookie: u64, frame: narf_net::Frame, _: narf_net::TxMeta) -> Result<(), ()> {
+        *LAST_TX_TIMING.lock() = Some(frame.tx_timing());
+        Ok(())
+    }
+    with_setup(|| {
+        let ifindex = nic(true)?;
+        *LAST_TX_TIMING.lock() = None;
+        narf_net::iface::enable_zero_copy_tx_context(
+            NIC,
+            ifindex as u64,
+            tx,
+            alloc::vec![],
+            0,
+            true,
+        );
+        let fd = open_packet(SOCK_RAW, ETH_P_TEST)?;
+        bind_ll(fd, ETH_P_TEST, ifindex)?;
+        // Reject unknown SO_TXTIME flags.
+        let mut bad_txtime = [0u8; 8];
+        bad_txtime[0..4].copy_from_slice(&11i32.to_ne_bytes());
+        bad_txtime[4..8].copy_from_slice(&4u32.to_ne_bytes());
+        expect(
+            setsockopt(fd, SOL_SOCKET, 61, &bad_txtime) == Some(EINVAL),
+            "SO_TXTIME must reject unknown flags",
+        )?;
+        // Enable SO_TXTIME with CLOCK_TAI (11) and flags = 3 (DEADLINE_MODE | REPORT_ERRORS).
+        let mut cfg = [0u8; 8];
+        cfg[0..4].copy_from_slice(&11i32.to_ne_bytes());
+        cfg[4..8].copy_from_slice(&3u32.to_ne_bytes());
+        expect(
+            setsockopt(fd, SOL_SOCKET, 61, &cfg) == Some(0),
+            "setsockopt(SO_TXTIME)",
+        )?;
+        let mut readback = [0u8; 8];
+        expect(
+            getsockopt(fd, SOL_SOCKET, 61, &mut readback) == (Some(0), 8) && readback == cfg,
+            "getsockopt(SO_TXTIME) roundtrip",
+        )?;
+        expect(
+            set_int(fd, SOL_SOCKET, SO_PRIORITY, 2) == Some(0),
+            "setsockopt(SO_PRIORITY)",
+        )?;
+        let bytes = eth(NIC_MAC, PEER_MAC, ETH_P_TEST, b"launch-time");
+        let iov_slice = bytes.as_slice();
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(iov_slice.as_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(iov_slice.len() as u64).to_ne_bytes());
+        // Build cmsghdr for SOL_SOCKET (1) / SCM_TXTIME (61) with 8-byte u64 launch time.
+        let mut cmsg = [0u8; 24];
+        cmsg[0..8].copy_from_slice(&24u64.to_ne_bytes());
+        cmsg[8..12].copy_from_slice(&1i32.to_ne_bytes());
+        cmsg[12..16].copy_from_slice(&61i32.to_ne_bytes());
+        cmsg[16..24].copy_from_slice(&987_654_321u64.to_ne_bytes());
+        let mut hdr = [0u8; 56];
+        hdr[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        hdr[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        hdr[32..40].copy_from_slice(&(cmsg.as_ptr() as u64).to_ne_bytes());
+        hdr[40..48].copy_from_slice(&(cmsg.len() as u64).to_ne_bytes());
+        expect(
+            sys(Syscall::SocketSendMsg, a2(fd, hdr.as_ptr() as u64, 0)) == Some(bytes.len() as i64),
+            "sendmsg with SCM_TXTIME",
+        )?;
+        let timing = LAST_TX_TIMING
+            .lock()
+            .ok_or("driver did not receive frame")?;
+        expect(
+            timing.launch_time_ns == Some(987_654_321) && timing.queue == Some(2),
+            "SCM_TXTIME + SO_PRIORITY did not propagate to Frame::tx_timing()",
+        )?;
+        close(fd);
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_packet_so_txtime_and_scm_txtime);
+
+fn smoke_abi_netlink_tc_taprio_cbs_etf_and_ethtool_mm() -> TestResult {
+    #[derive(Debug)]
+    struct TsnNic {
+        sched: IrqSafeSpinLock<narf_net::nic::TrafficSchedule>,
+        mm: IrqSafeSpinLock<(narf_net::nic::Preemption, narf_net::nic::PreemptionStatus)>,
+    }
+    impl TsnNic {
+        fn new() -> Self {
+            Self {
+                sched: IrqSafeSpinLock::new(narf_net::nic::TrafficSchedule::default()),
+                mm: IrqSafeSpinLock::new((
+                    narf_net::nic::Preemption::default(),
+                    narf_net::nic::PreemptionStatus::default(),
+                )),
+            }
+        }
+    }
+    impl narf_net::iface::DeviceControl for TsnNic {
+        fn configure(&self, _: &narf_net::iface::DeviceConfig) -> Result<(), i32> {
+            Ok(())
+        }
+        fn nic(&self) -> Option<&dyn narf_net::nic::NicControl> {
+            Some(self)
+        }
+    }
+    impl narf_net::nic::NicControl for TsnNic {
+        fn schedule(&self, s: narf_net::nic::TrafficSchedule) -> Result<(), i32> {
+            *self.sched.lock() = s;
+            Ok(())
+        }
+        fn traffic_schedule(&self) -> Result<narf_net::nic::TrafficSchedule, i32> {
+            Ok(self.sched.lock().clone())
+        }
+        fn preemption(
+            &self,
+        ) -> Result<(narf_net::nic::Preemption, narf_net::nic::PreemptionStatus), i32> {
+            Ok(*self.mm.lock())
+        }
+        fn set_preemption(&self, p: narf_net::nic::Preemption) -> Result<(), i32> {
+            let mut g = self.mm.lock();
+            g.0 = p;
+            g.1 = narf_net::nic::PreemptionStatus {
+                active: p.enabled && p.tx_enabled,
+                verified: p.enabled && p.verify,
+                failed: false,
+                attempts: if p.verify { 1 } else { 0 },
+            };
+            Ok(())
+        }
+    }
+    fn push_nla(out: &mut alloc::vec::Vec<u8>, kind: u16, payload: &[u8]) {
+        let len = (4 + payload.len()) as u16;
+        out.extend_from_slice(&len.to_ne_bytes());
+        out.extend_from_slice(&kind.to_ne_bytes());
+        out.extend_from_slice(payload);
+        while out.len() & 3 != 0 {
+            out.push(0);
+        }
+    }
+    with_setup(|| {
+        let ifindex = nic(true)?;
+        let ctrl = alloc::sync::Arc::new(TsnNic::new());
+        narf_net::iface::set_device_control(NIC, ctrl.clone());
+
+        // 1. NETLINK_ROUTE (0): configure taprio, cbs (queue 0), and etf (queue 1).
+        let rt_fd = open(16, SOCK_RAW, 0)?;
+        let build_tc_msg =
+            |nl_type: u16, flags: u16, parent: u32, handle: u32, kind: &str, opt: &[u8]| {
+                let mut attrs = alloc::vec::Vec::new();
+                let mut k = alloc::vec::Vec::from(kind.as_bytes());
+                k.push(0);
+                push_nla(&mut attrs, 1, &k); // TCA_KIND
+                if !opt.is_empty() {
+                    push_nla(&mut attrs, 2 | 0x8000, opt); // TCA_OPTIONS
+                }
+                let total = 16 + 20 + attrs.len();
+                let mut msg = alloc::vec![0u8; total];
+                msg[0..4].copy_from_slice(&(total as u32).to_ne_bytes());
+                msg[4..6].copy_from_slice(&nl_type.to_ne_bytes());
+                msg[6..8].copy_from_slice(&flags.to_ne_bytes());
+                msg[8..12].copy_from_slice(&1u32.to_ne_bytes());
+                msg[20..24].copy_from_slice(&ifindex.to_ne_bytes());
+                msg[24..28].copy_from_slice(&handle.to_ne_bytes());
+                msg[28..32].copy_from_slice(&parent.to_ne_bytes());
+                msg[36..].copy_from_slice(&attrs);
+                msg
+            };
+        let mut entry = alloc::vec::Vec::new();
+        push_nla(&mut entry, 1, &0u32.to_ne_bytes()); // TCA_TAPRIO_SCHED_ENTRY_INDEX = 0
+        push_nla(&mut entry, 2, &[0u8]); // TCA_TAPRIO_SCHED_ENTRY_CMD = S (0)
+        push_nla(&mut entry, 3, &0x03u32.to_ne_bytes()); // TCA_TAPRIO_SCHED_ENTRY_GATE_MASK = 0x3
+        push_nla(&mut entry, 4, &500_000u32.to_ne_bytes()); // TCA_TAPRIO_SCHED_ENTRY_INTERVAL = 500_000 ns
+        let mut entry_list = alloc::vec::Vec::new();
+        push_nla(&mut entry_list, 1 | 0x8000, &entry); // TCA_TAPRIO_SCHED_ENTRY
+        let mut tc_entry_1 = alloc::vec::Vec::new();
+        push_nla(&mut tc_entry_1, 1, &1u32.to_ne_bytes()); // TCA_TAPRIO_TC_ENTRY_INDEX = 1
+        push_nla(&mut tc_entry_1, 3, &2u32.to_ne_bytes()); // TCA_TAPRIO_TC_ENTRY_FP = TC_FP_PREEMPTIBLE (2)
+        let mut taprio_opt = alloc::vec::Vec::new();
+        push_nla(&mut taprio_opt, 2 | 0x8000, &entry_list); // TCA_TAPRIO_ATTR_SCHED_ENTRY_LIST
+        push_nla(&mut taprio_opt, 3, &1_000_000_000i64.to_ne_bytes()); // TCA_TAPRIO_ATTR_SCHED_BASE_TIME
+        push_nla(&mut taprio_opt, 8, &1_000_000i64.to_ne_bytes()); // TCA_TAPRIO_ATTR_SCHED_CYCLE_TIME
+        push_nla(&mut taprio_opt, 10, &0x02u32.to_ne_bytes()); // TCA_TAPRIO_ATTR_FLAGS = FULL_OFFLOAD (2)
+        push_nla(&mut taprio_opt, 12 | 0x8000, &tc_entry_1); // TCA_TAPRIO_ATTR_TC_ENTRY
+        let taprio_msg = build_tc_msg(36, 0x05, 0xFFFF_FFFF, 0x0001_0000, "taprio", &taprio_opt);
+        expect(
+            send(rt_fd, &taprio_msg) == Some(taprio_msg.len() as i64),
+            "send RTM_NEWQDISC taprio",
+        )?;
+        let mut ack = [0u8; 256];
+        let (r, _, _) = recvfrom(rt_fd, &mut ack, MSG_DONTWAIT);
+        expect(
+            r.is_some_and(|n| n >= 36)
+                && u16::from_ne_bytes([ack[4], ack[5]]) == 2
+                && i32::from_ne_bytes(ack[16..20].try_into().unwrap()) == 0,
+            "RTM_NEWQDISC taprio ACK",
+        )?;
+
+        // CBS on queue 0 (parent 100:1)
+        let mut cbs_parms = [0u8; 20];
+        cbs_parms[0] = 1; // offload
+        cbs_parms[4..8].copy_from_slice(&1500i32.to_ne_bytes()); // hicredit
+        cbs_parms[8..12].copy_from_slice(&(-1500i32).to_ne_bytes()); // locredit
+        cbs_parms[12..16].copy_from_slice(&250_000i32.to_ne_bytes()); // idleslope
+        cbs_parms[16..20].copy_from_slice(&(-750_000i32).to_ne_bytes()); // sendslope
+        let mut cbs_opt = alloc::vec::Vec::new();
+        push_nla(&mut cbs_opt, 1, &cbs_parms);
+        let cbs_msg = build_tc_msg(36, 0x05, 0x0100_0001, 0x0002_0000, "cbs", &cbs_opt);
+        expect(
+            send(rt_fd, &cbs_msg) == Some(cbs_msg.len() as i64),
+            "send RTM_NEWQDISC cbs",
+        )?;
+        let (r, _, _) = recvfrom(rt_fd, &mut ack, MSG_DONTWAIT);
+        expect(
+            r.is_some_and(|n| n >= 36)
+                && u16::from_ne_bytes([ack[4], ack[5]]) == 2
+                && i32::from_ne_bytes(ack[16..20].try_into().unwrap()) == 0,
+            "RTM_NEWQDISC cbs ACK",
+        )?;
+
+        // ETF on queue 1 (parent 100:2)
+        let mut etf_parms = [0u8; 12];
+        etf_parms[0..4].copy_from_slice(&100_000i32.to_ne_bytes()); // delta
+        etf_parms[4..8].copy_from_slice(&11i32.to_ne_bytes()); // CLOCK_TAI
+        etf_parms[8..12].copy_from_slice(&2i32.to_ne_bytes()); // offload bit
+        let mut etf_opt = alloc::vec::Vec::new();
+        push_nla(&mut etf_opt, 1, &etf_parms);
+        let etf_msg = build_tc_msg(36, 0x05, 0x0100_0002, 0x0003_0000, "etf", &etf_opt);
+        expect(
+            send(rt_fd, &etf_msg) == Some(etf_msg.len() as i64),
+            "send RTM_NEWQDISC etf",
+        )?;
+        let (r, _, _) = recvfrom(rt_fd, &mut ack, MSG_DONTWAIT);
+        expect(
+            r.is_some_and(|n| n >= 36)
+                && u16::from_ne_bytes([ack[4], ack[5]]) == 2
+                && i32::from_ne_bytes(ack[16..20].try_into().unwrap()) == 0,
+            "RTM_NEWQDISC etf ACK",
+        )?;
+
+        let sched = ctrl.sched.lock().clone();
+        expect(
+            sched.base_time_ns == 1_000_000_000
+                && sched.cycle_ns == 1_000_000
+                && sched.preemptible_queues == 0x02
+                && sched.gates.len() == 1
+                && sched.gates[0].mask == 0x03
+                && sched.gates[0].interval_ns == 500_000
+                && sched.shapers.len() == 1
+                && sched.shapers[0].queue == 0
+                && sched.shapers[0].idle_slope_kbps == 250_000
+                && sched.shapers[0].high_credit == 1500
+                && (sched.launch_time_queues & (1 << 1)) != 0,
+            "NicControl::traffic_schedule mismatch after tc qdisc setup",
+        )?;
+
+        // 2. NETLINK_GENERIC (16) ethtool MAC Merge (ETHTOOL_MSG_MM_SET / GET).
+        let genl_fd = open(16, SOCK_RAW, 16)?;
+        let mut hdr_nla = alloc::vec::Vec::new();
+        push_nla(&mut hdr_nla, 1, &(ifindex as u32).to_ne_bytes()); // ETHTOOL_A_HEADER_DEV_INDEX
+        let mut mm_set = alloc::vec![0u8; 20];
+        mm_set[4..6].copy_from_slice(&0x14u16.to_ne_bytes()); // GENL_ID_ETHTOOL
+        mm_set[6..8].copy_from_slice(&0x05u16.to_ne_bytes()); // NLM_F_REQUEST | NLM_F_ACK
+        mm_set[8..12].copy_from_slice(&7u32.to_ne_bytes());
+        mm_set[16] = 36; // ETHTOOL_MSG_MM_SET
+        mm_set[17] = 1;
+        push_nla(&mut mm_set, 1 | 0x8000, &hdr_nla); // ETHTOOL_A_MM_HEADER
+        push_nla(&mut mm_set, 2, &[1u8]); // ETHTOOL_A_MM_PMAC_ENABLED
+        push_nla(&mut mm_set, 3, &[1u8]); // ETHTOOL_A_MM_TX_ENABLED
+        push_nla(&mut mm_set, 5, &124u32.to_ne_bytes()); // ETHTOOL_A_MM_TX_MIN_FRAG_SIZE = 124
+        push_nla(&mut mm_set, 7, &[1u8]); // ETHTOOL_A_MM_VERIFY_ENABLED
+        push_nla(&mut mm_set, 9, &15u32.to_ne_bytes()); // ETHTOOL_A_MM_VERIFY_TIME = 15ms
+        let mm_set_len = mm_set.len() as u32;
+        mm_set[0..4].copy_from_slice(&mm_set_len.to_ne_bytes());
+        expect(
+            send(genl_fd, &mm_set) == Some(mm_set.len() as i64),
+            "send ETHTOOL_MSG_MM_SET",
+        )?;
+        let (r, _, _) = recvfrom(genl_fd, &mut ack, MSG_DONTWAIT);
+        expect(
+            r.is_some_and(|n| n >= 36)
+                && u16::from_ne_bytes([ack[4], ack[5]]) == 2
+                && i32::from_ne_bytes(ack[16..20].try_into().unwrap()) == 0,
+            "ETHTOOL_MSG_MM_SET ACK",
+        )?;
+        let (p, status) = *ctrl.mm.lock();
+        expect(
+            p.enabled
+                && p.tx_enabled
+                && p.verify
+                && p.verify_ms == 15
+                && p.minimum_fragment == 124
+                && status.active
+                && status.verified,
+            "NicControl::preemption mismatch after ETHTOOL_MSG_MM_SET",
+        )?;
+
+        let mut mm_get = alloc::vec![0u8; 20];
+        mm_get[4..6].copy_from_slice(&0x14u16.to_ne_bytes());
+        mm_get[6..8].copy_from_slice(&0x01u16.to_ne_bytes()); // NLM_F_REQUEST
+        mm_get[8..12].copy_from_slice(&8u32.to_ne_bytes());
+        mm_get[16] = 35; // ETHTOOL_MSG_MM_GET
+        mm_get[17] = 1;
+        push_nla(&mut mm_get, 1 | 0x8000, &hdr_nla);
+        let mm_get_len = mm_get.len() as u32;
+        mm_get[0..4].copy_from_slice(&mm_get_len.to_ne_bytes());
+        expect(
+            send(genl_fd, &mm_get) == Some(mm_get.len() as i64),
+            "send ETHTOOL_MSG_MM_GET",
+        )?;
+        let mut reply = [0u8; 256];
+        let (r, _, _) = recvfrom(genl_fd, &mut reply, MSG_DONTWAIT);
+        expect(
+            r.is_some_and(|n| n > 20) && reply[16] == 44, // ETHTOOL_MSG_MM_GET_REPLY
+            "ETHTOOL_MSG_MM_GET_REPLY not returned",
+        )?;
+
+        close(genl_fd);
+        close(rt_fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_netlink_tc_taprio_cbs_etf_and_ethtool_mm
+);
+
+fn smoke_abi_af_xdp_user_umem_and_mmap_rings() -> TestResult {
+    #[derive(Debug)]
+    struct XskTestNic {
+        bound: IrqSafeSpinLock<Option<alloc::sync::Arc<narf_net::bypass::xdp::XdpSocket>>>,
+        tx_captured: IrqSafeSpinLock<alloc::vec::Vec<alloc::vec::Vec<u8>>>,
+    }
+    impl XskTestNic {
+        fn new() -> Self {
+            Self {
+                bound: IrqSafeSpinLock::new(None),
+                tx_captured: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            }
+        }
+    }
+    impl narf_net::iface::DeviceControl for XskTestNic {
+        fn configure(&self, _: &narf_net::iface::DeviceConfig) -> Result<(), i32> {
+            Ok(())
+        }
+        fn nic(&self) -> Option<&dyn narf_net::nic::NicControl> {
+            Some(self)
+        }
+    }
+    impl narf_net::nic::NicControl for XskTestNic {
+        fn bind_xsk(
+            &self,
+            q: u16,
+            socket: Option<alloc::sync::Arc<narf_net::bypass::xdp::XdpSocket>>,
+        ) -> Result<(), i32> {
+            if q != 0 {
+                return Err(22);
+            }
+            *self.bound.lock() = socket;
+            Ok(())
+        }
+        fn kick_xsk(&self, _q: u16) -> Result<(), i32> {
+            let Some(sock) = self.bound.lock().clone() else {
+                return Err(22);
+            };
+            // 1. Drain TX ring into tx_captured and publish COMPLETION.
+            while let Some(slot) = sock.pop_tx() {
+                if let Ok(mut lease) = sock.umem().lease(slot.frame_idx) {
+                    // SAFETY: `lease` grants exclusive access to the leased UMEM frame and `slot.len` was validated.
+                    let bytes = unsafe { lease.bytes_mut(slot.len as usize) }.to_vec();
+                    self.tx_captured.lock().push(bytes);
+                }
+                let _ = sock.push_completion(slot);
+            }
+            // 2. Pop one FILL frame, write an RX packet into UMEM, and publish RX.
+            if let Some(fill) = sock.pop_fill() {
+                let rx_pkt = b"af_xdp_zerocopy_rx_payload";
+                if let Ok(mut lease) = sock.umem().lease(fill.frame_idx) {
+                    // SAFETY: `lease` grants exclusive access to the 4096-byte UMEM frame.
+                    unsafe { lease.bytes_mut(rx_pkt.len()) }.copy_from_slice(rx_pkt);
+                }
+                let _ = sock.push_rx(narf_net::bypass::UmemSlot {
+                    frame_idx: fill.frame_idx,
+                    len: rx_pkt.len() as u32,
+                });
+            }
+            Ok(())
+        }
+    }
+    static XDP_TEST_AS: IrqSafeSpinLock<Option<alloc::sync::Arc<narf_memory::AddressSpace>>> =
+        IrqSafeSpinLock::new(None);
+    fn lookup_xdp_as() -> Option<alloc::sync::Arc<narf_memory::AddressSpace>> {
+        XDP_TEST_AS.lock().clone()
+    }
+    fn mapped_ptr(aspace: &narf_memory::AddressSpace, va: u64) -> Result<*mut u8, &'static str> {
+        let page_va = va & !4095;
+        let page_off = (va & 4095) as usize;
+        let region = aspace
+            .lookup(narf_memory::VirtAddr::new(page_va))
+            .ok_or("VA not mapped in user AddressSpace")?;
+        let index = ((page_va - region.base.as_u64()) >> 12) as usize;
+        let phys = match region.phys.get(index).map(|p| p.raw()).filter(|&p| p != 0) {
+            Some(p) => p,
+            None => {
+                // SAFETY: `aspace` is a live user root and paging is enabled.
+                unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(page_va)) }
+                    .map_err(|_| "demand_alloc_page failed")?;
+                let region = aspace
+                    .lookup(narf_memory::VirtAddr::new(page_va))
+                    .ok_or("VA missing after demand fault")?;
+                region
+                    .phys
+                    .get(index)
+                    .map(|p| p.raw())
+                    .filter(|&p| p != 0)
+                    .ok_or("page still unbacked after demand fault")?
+            }
+        };
+        let base_ptr = narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>();
+        // SAFETY: `page_off < 4096` within the 4096-byte direct-map frame.
+        Ok(unsafe { base_ptr.add(page_off) })
+    }
+    fn write_mapped(
+        aspace: &narf_memory::AddressSpace,
+        va: u64,
+        bytes: &[u8],
+    ) -> Result<(), &'static str> {
+        let ptr = mapped_ptr(aspace, va)?;
+        // SAFETY: `ptr` points into a mapped user frame in `aspace` with room for `bytes.len()`.
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+        Ok(())
+    }
+    fn read_mapped(
+        aspace: &narf_memory::AddressSpace,
+        va: u64,
+        dst: &mut [u8],
+    ) -> Result<(), &'static str> {
+        let ptr = mapped_ptr(aspace, va)?;
+        // SAFETY: `ptr` points into a mapped user frame in `aspace` with room for `dst.len()`.
+        unsafe { core::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr(), dst.len()) };
+        Ok(())
+    }
+    with_setup(|| {
+        // SAFETY: kernel tests run with paging enabled; the new root
+        // inherits only the kernel half and is owned by this fixture.
+        let aspace = match unsafe { narf_memory::AddressSpace::new_for_user() } {
+            Ok(a) => alloc::sync::Arc::new(a),
+            Err(_) => return Err("failed to create user AddressSpace"),
+        };
+        *XDP_TEST_AS.lock() = Some(aspace.clone());
+        crate::handlers::install_address_space_lookup(lookup_xdp_as);
+        let res = (|| {
+            let ifindex = nic(true)?;
+            let xsk_nic = alloc::sync::Arc::new(XskTestNic::new());
+            narf_net::iface::set_device_control(NIC, xsk_nic.clone());
+
+            // Open standard Linux AF_XDP (44), SOCK_RAW (3), protocol 0.
+            let fd = open(44, SOCK_RAW, 0)?;
+
+            // Allocate a 2-page (8192-byte) user-space UMEM arena via mmap(MAP_PRIVATE | MAP_ANONYMOUS).
+            let umem_addr = sys(Syscall::Mmap, a5(0, 8192, 0x3, 0x22, (-1i64) as u64, 0))
+                .ok_or("mmap UMEM arena failed")?;
+            expect(
+                umem_addr > 0 && (umem_addr as u64) & 0xfff == 0,
+                "UMEM mmap alignment",
+            )?;
+            let umem_uaddr = umem_addr as u64;
+
+            // Pre-populate frame 1 (offset 4096) in user memory before XDP_UMEM_REG.
+            let tx_payload = b"af_xdp_zerocopy_tx_frame_payload";
+            write_mapped(&aspace, umem_uaddr + 4096, tx_payload)?;
+
+            // Register UMEM via setsockopt(SOL_XDP = 283, XDP_UMEM_REG = 4) with 32-byte layout.
+            let mut reg = [0u8; 32];
+            reg[0..8].copy_from_slice(&umem_uaddr.to_ne_bytes());
+            reg[8..16].copy_from_slice(&8192u64.to_ne_bytes());
+            reg[16..20].copy_from_slice(&4096u32.to_ne_bytes());
+            expect(
+                setsockopt(fd, 283, 4, &reg) == Some(0),
+                "setsockopt(XDP_UMEM_REG)",
+            )?;
+
+            // Configure FILL (5), COMPLETION (6), RX (2), TX (3) rings with 64 entries.
+            for opt in [5u64, 6, 2, 3] {
+                expect(
+                    set_int(fd, 283, opt, 64) == Some(0),
+                    "setsockopt(XDP_*_RING)",
+                )?;
+            }
+
+            // Query XDP_MMAP_OFFSETS (1).
+            let mut offsets = [0u8; 128];
+            expect(
+                getsockopt(fd, 283, 1, &mut offsets) == (Some(0), 128),
+                "getsockopt(XDP_MMAP_OFFSETS)",
+            )?;
+            let prod_off = u64::from_ne_bytes(offsets[0..8].try_into().unwrap());
+            let cons_off = u64::from_ne_bytes(offsets[8..16].try_into().unwrap());
+            let desc_off = u64::from_ne_bytes(offsets[16..24].try_into().unwrap());
+            let flags_off = u64::from_ne_bytes(offsets[24..32].try_into().unwrap());
+            expect(
+                (prod_off, cons_off, desc_off, flags_off) == (0, 128, 384, 256),
+                "XDP_MMAP_OFFSETS ring offsets",
+            )?;
+
+            // mmap RX (0), TX (0x80000000), FILL (0x100000000), COMPLETION (0x180000000) rings.
+            let map_ring = |pgoff: u64| -> Result<u64, &'static str> {
+                let r = sys(Syscall::Mmap, a5(0, 4096, 0x3, 0x01, fd, pgoff))
+                    .ok_or("mmap XDP ring failed")?;
+                if r <= 0 {
+                    return Err("mmap XDP ring returned error");
+                }
+                Ok(r as u64)
+            };
+            let rx_ring = map_ring(0)?;
+            let tx_ring = map_ring(0x8000_0000)?;
+            let fill_ring = map_ring(0x1_0000_0000)?;
+            let comp_ring = map_ring(0x1_8000_0000)?;
+
+            // Bind using standard Linux 16-byte struct sockaddr_xdp (family=44, flags=XDP_ZEROCOPY(4), ifindex, queue_id=0).
+            let mut sxdp = [0u8; 16];
+            sxdp[0..2].copy_from_slice(&44u16.to_ne_bytes());
+            sxdp[2..4].copy_from_slice(&4u16.to_ne_bytes());
+            sxdp[4..8].copy_from_slice(&(ifindex as u32).to_ne_bytes());
+            sxdp[8..12].copy_from_slice(&0u32.to_ne_bytes());
+            expect(bind(fd, &sxdp) == Some(0), "bind(sockaddr_xdp)")?;
+
+            // Post frame 0 (addr = 0) to FILL ring and advance fill_ring.producer to 1.
+            write_mapped(&aspace, fill_ring + desc_off, &0u64.to_ne_bytes())?;
+            write_mapped(&aspace, fill_ring + prod_off, &1u32.to_ne_bytes())?;
+
+            // Post frame 1 (addr = 4096, len = tx_payload.len(), options = 0) to TX ring and advance tx_ring.producer to 1.
+            let mut tx_desc = [0u8; 16];
+            tx_desc[0..8].copy_from_slice(&4096u64.to_ne_bytes());
+            tx_desc[8..12].copy_from_slice(&(tx_payload.len() as u32).to_ne_bytes());
+            write_mapped(&aspace, tx_ring + desc_off, &tx_desc)?;
+            write_mapped(&aspace, tx_ring + prod_off, &1u32.to_ne_bytes())?;
+
+            // Kick TX + RX via sendto(fd, NULL, 0, MSG_DONTWAIT, NULL, 0).
+            expect(
+                sys(Syscall::SocketSend, a5(fd, 0, 0, MSG_DONTWAIT, 0, 0)) == Some(0),
+                "sendto kick on AF_XDP socket",
+            )?;
+
+            // Verify TX frame was transmitted from the shared user UMEM and COMPLETION ring advanced.
+            expect(
+                xsk_nic.tx_captured.lock().as_slice() == [tx_payload.to_vec()],
+                "AF_XDP TX payload mismatch",
+            )?;
+            let mut comp_prod = [0u8; 4];
+            let mut comp_addr = [0u8; 8];
+            read_mapped(&aspace, comp_ring + prod_off, &mut comp_prod)?;
+            read_mapped(&aspace, comp_ring + desc_off, &mut comp_addr)?;
+            expect(
+                u32::from_ne_bytes(comp_prod) == 1 && u64::from_ne_bytes(comp_addr) == 4096,
+                "COMPLETION ring did not publish completed TX frame",
+            )?;
+
+            // Verify RX ring advanced and the user-mapped UMEM at frame 0 contains the received packet!
+            let mut rx_prod = [0u8; 4];
+            let mut rx_desc = [0u8; 16];
+            read_mapped(&aspace, rx_ring + prod_off, &mut rx_prod)?;
+            read_mapped(&aspace, rx_ring + desc_off, &mut rx_desc)?;
+            let rx_addr = u64::from_ne_bytes(rx_desc[0..8].try_into().unwrap());
+            let rx_len = u32::from_ne_bytes(rx_desc[8..12].try_into().unwrap()) as usize;
+            expect(
+                u32::from_ne_bytes(rx_prod) == 1 && rx_addr == 0 && rx_len == 26,
+                "RX ring descriptor mismatch",
+            )?;
+            let mut rx_user_bytes = [0u8; 26];
+            read_mapped(&aspace, umem_uaddr + rx_addr, &mut rx_user_bytes)?;
+            expect(
+                &rx_user_bytes == b"af_xdp_zerocopy_rx_payload",
+                "User-mapped UMEM did not reflect zero-copy RX payload",
+            )?;
+
+            // Query XDP_STATISTICS (7).
+            let mut stats = [0u8; 48];
+            expect(
+                getsockopt(fd, 283, 7, &mut stats) == (Some(0), 48),
+                "getsockopt(XDP_STATISTICS)",
+            )?;
+
+            for (addr, len) in [
+                (rx_ring, 4096u64),
+                (tx_ring, 4096),
+                (fill_ring, 4096),
+                (comp_ring, 4096),
+                (umem_uaddr, 8192),
+            ] {
+                let _ = sys(Syscall::Munmap, a1(addr, len));
+            }
+            close(fd);
+            Ok(())
+        })();
+        crate::handlers::restore_address_space_lookup(None);
+        *XDP_TEST_AS.lock() = None;
+        res
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_af_xdp_user_umem_and_mmap_rings);

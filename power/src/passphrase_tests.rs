@@ -536,7 +536,7 @@ kernel_test_in!(
 fn smoke_passphrase_entropy_absent_refuses_wrap() -> TestResult {
     let anchor = PassphraseAnchor::new(
         AtomicScriptedEntropy::new(false),
-        ScriptedSource::new(&["pw"]),
+        ScriptedSource::new(&["pw", "pw"]),
         fixture_policy(),
         FIXTURE_PARAMS,
     );

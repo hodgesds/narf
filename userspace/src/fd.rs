@@ -984,14 +984,28 @@ impl Default for FdTable {
 
 // ── Sharded per-task table ─────────────────────────────────────────
 
-/// `TaskId.raw()` → the task's fd table. The table is behind an
-/// `Arc<IrqSafeSpinLock<…>>` so that CLONE_FILES threads can SHARE one table
-/// (the same `Arc` is installed under each thread's TaskId; see `share`) while
-/// fork still gets an independent COPY (`fork`). The shard lock guards only the
-/// map (Arc lookup/insert/remove); fd operations run under the per-table inner
-/// lock, so distinct processes don't serialise and a long `poll_blocking` read
-/// holds only its own table's lock, not the whole shard.
-type Tables = BTreeMap<u64, Arc<SharedTable>>;
+/// Each task owns a distinct binding, even when CLONE_FILES shares its inner
+/// table. Syscall lookups clone the binding instead of writing the shared
+/// table's reference count on every CPU. Isolate the binding's Arc counter
+/// from other tasks' counters as well.
+#[derive(Debug)]
+#[repr(align(64))]
+struct TableBinding {
+    table: Arc<SharedTable>,
+}
+
+impl TableBinding {
+    fn new(table: FdTable, task_id: u64) -> Self {
+        Self {
+            table: Arc::new(SharedTable::new(table, task_id)),
+        }
+    }
+}
+
+/// `TaskId.raw()` → the task's binding. Shard locks guard only the map;
+/// operations retain a binding owner before releasing the shard lock, then
+/// use the shared table's lock or RCU view. Fork installs an independent table.
+type Tables = BTreeMap<u64, Arc<TableBinding>>;
 
 /// A fresh fd table pre-populated with the three stdio slots routed to the
 /// kernel console (stdin reads EOF until a real backing lands).
@@ -1069,17 +1083,17 @@ static TABLES: [TableShard; TABLE_SHARDS] = [const { TableShard::new() }; TABLE_
 /// Always `Some`. The `Option` is retained because ~240 call sites read it,
 /// not because the lookup can fail.
 pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option<R> {
-    // Get-or-create this task's table Arc under the shard lock, clone the Arc,
+    // Get-or-create this task's binding under the shard lock, clone its Arc,
     // then DROP the shard lock before running `op` under the per-table lock.
     // This keeps the hot shard lock held only for the brief map lookup, and lets
-    // CLONE_FILES siblings (who share one Arc) serialise on the table itself.
+    // CLONE_FILES siblings serialise on the table itself.
     let arc = {
         let mut map = TABLES[table_shard(task_id)].tables.lock();
         map.entry(task_id)
-            .or_insert_with(|| Arc::new(SharedTable::new(fresh_table(), task_id)))
+            .or_insert_with(|| Arc::new(TableBinding::new(fresh_table(), task_id)))
             .clone()
     };
-    let mut table = arc.lock();
+    let mut table = arc.table.lock();
     Some(op(&mut table))
 }
 
@@ -1090,10 +1104,10 @@ pub(crate) fn lookup(task_id: u64, fd: u32) -> Option<ResolvedFd> {
         let mut map = TABLES[table_shard(task_id)].tables.lock();
         Arc::clone(
             map.entry(task_id)
-                .or_insert_with(|| Arc::new(SharedTable::new(fresh_table(), task_id))),
+                .or_insert_with(|| Arc::new(TableBinding::new(fresh_table(), task_id))),
         )
     };
-    read_index::lookup(&table, fd)
+    read_index::lookup(&table.table, fd)
 }
 
 /// [`with_table`] for an operation that may ALLOCATE a descriptor.
@@ -1289,7 +1303,7 @@ pub fn try_with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Op
         let map = TABLES[table_shard(task_id)].tables.try_lock()?;
         map.get(&task_id)?.clone()
     };
-    let mut table = arc.try_lock()?;
+    let mut table = arc.table.try_lock()?;
     Some(op(&mut table))
 }
 
@@ -1942,7 +1956,7 @@ pub fn fork(parent: u64, child: u64) -> usize {
     // detaches concurrently, final-close cleanup must see the inherited fds.
     let (parent_slots, parent_descriptions, parent_max_fds) = match parent_arc.as_ref() {
         Some(a) => {
-            let table = a.lock();
+            let table = a.table.lock();
             (
                 table.slots.clone(),
                 table.descriptions.clone(),
@@ -1963,7 +1977,7 @@ pub fn fork(parent: u64, child: u64) -> usize {
     let displaced = TABLES[table_shard(child)]
         .tables
         .lock()
-        .insert(child, Arc::new(SharedTable::new(child_table, child)));
+        .insert(child, Arc::new(TableBinding::new(child_table, child)));
     drop(displaced);
     copied
 }
@@ -2001,7 +2015,7 @@ pub(crate) fn release_closed(task: u64, closed: impl IntoIterator<Item = Arc<dyn
             continue;
         }
         let own = TABLES[table_shard(task)].tables.lock().get(&task).cloned();
-        let has_duplicate = own.is_some_and(|table| table.lock().contains_ops(&ops));
+        let has_duplicate = own.is_some_and(|binding| binding.table.lock().contains_ops(&ops));
         // `contains_ops` only sees THIS process's descriptors. A fork gives
         // every child its own table holding the same file description, so
         // each of them looks like the last owner. Release the binding only
@@ -2038,14 +2052,14 @@ pub fn ops_held_by_other_task(
     for shard in TABLES.iter() {
         // Clone the shard's table Arcs out from under its lock, so the
         // per-table locks below are never taken while a shard lock is held.
-        let tables: Vec<Arc<SharedTable>> = shard.tables.lock().values().cloned().collect();
+        let tables: Vec<Arc<TableBinding>> = shard.tables.lock().values().cloned().collect();
         for table in tables {
             if let Some(own) = own.as_ref() {
-                if Arc::ptr_eq(&table, own) {
+                if Arc::ptr_eq(&table.table, &own.table) {
                     continue;
                 }
             }
-            let held = table.lock().slots.iter().any(|slot| {
+            let held = table.table.lock().slots.iter().any(|slot| {
                 slot.as_ref()
                     .map(|entry| alloc::sync::Arc::ptr_eq(&entry.ops, ops))
                     .unwrap_or(false)
@@ -2058,22 +2072,34 @@ pub fn ops_held_by_other_task(
     false
 }
 
-/// CLONE_FILES: install the SAME table `Arc` under the child's TaskId so the
+/// CLONE_FILES: install a new task binding to the SAME table so the
 /// child and parent (and every other thread of the process) share one fd table
 /// — an fd opened by any thread is visible to all, and `close` in one closes it
 /// for all (Linux thread semantics). The table is freed only when the last
 /// sharer `detach`es (Arc refcount). Returns the number of fds in the table.
 pub fn share(parent: u64, child: u64) -> usize {
-    // Get-or-create the parent's table Arc atomically (same logic as
-    // `with_table`'s first-touch), then install that same Arc for the child.
+    // Retain the parent binding until the child binding owns the shared table.
+    // Never share the binding itself: lookup refcounts must remain per-task.
     let arc = {
         let mut map = TABLES[table_shard(parent)].tables.lock();
         map.entry(parent)
-            .or_insert_with(|| Arc::new(SharedTable::new(fresh_table(), parent)))
+            .or_insert_with(|| Arc::new(TableBinding::new(fresh_table(), parent)))
             .clone()
     };
-    let n = arc.lock().slots.iter().filter(|s| s.is_some()).count();
-    let displaced = TABLES[table_shard(child)].tables.lock().insert(child, arc);
+    let n = arc
+        .table
+        .lock()
+        .slots
+        .iter()
+        .filter(|s| s.is_some())
+        .count();
+    let child_binding = Arc::new(TableBinding {
+        table: Arc::clone(&arc.table),
+    });
+    let displaced = TABLES[table_shard(child)]
+        .tables
+        .lock()
+        .insert(child, child_binding);
     drop(displaced);
     n
 }
@@ -2090,8 +2116,8 @@ pub fn unshare_table(task_id: u64) -> bool {
         .tables
         .lock()
         .get(&task_id)
-        // One reference is the map's own entry; any other is a sharer's.
-        .is_some_and(|arc| Arc::strong_count(arc) > 1);
+        // Count table owners, not temporary references to this task's binding.
+        .is_some_and(|binding| Arc::strong_count(&binding.table) > 1);
     if shared {
         // `fork(t, t)` snapshots t's current table into a fresh Arc and
         // installs it under t, replacing the shared one.
@@ -2116,7 +2142,7 @@ pub fn close_cloexec(task_id: u64) -> usize {
         Some(a) => a,
         None => return 0,
     };
-    let closed = arc.lock().close_cloexec_slots();
+    let closed = arc.table.lock().close_cloexec_slots();
     drop(arc);
     let n = closed.len();
     release_closed(task_id, closed);

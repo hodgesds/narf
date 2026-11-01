@@ -43,6 +43,15 @@
 
 ## 3. Public interface
 
+`phc::HardwareClock` supplies device read/set, offset/frequency adjustment,
+current frequency and maximum adjustment. `phc::register/get/unregister/indices`
+manage retained clock references without invoking driver operations under the
+registry lock. Removing an index does not redirect an already-open reference
+to a subsequently registered clock. Device drivers own register locking,
+clock continuity over reset and rejection after removal. PHCs are separate
+from the system wall/monotonic clocks; syscall authority is checked by userspace.
+
+
 ### 3.1 Clocks
 
 ```rust
