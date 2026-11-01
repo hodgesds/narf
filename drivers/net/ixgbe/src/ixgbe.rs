@@ -20,6 +20,7 @@ use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 pub mod queues;
 pub mod rss;
 mod tests;
+pub mod vlan;
 
 // ── PCI device IDs ─────────────────────────────────────────────────
 
@@ -320,6 +321,8 @@ pub struct Ixgbe {
     pub queue_config: queues::QueueConfig,
     /// Programmed RSS state, if `configure_rss` ran.
     pub rss_cfg: IrqSafeSpinLock<Option<rss::IxgbeRss>>,
+    /// Programmed VLAN filter, if `configure_vlan` ran.
+    pub vlan_filter: IrqSafeSpinLock<Option<vlan::VlanFilter>>,
     /// Stage 5: MSI-X table once enabled.
     pub(crate) msix: Option<MsixTable>,
     pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -523,6 +526,7 @@ impl Ixgbe {
             did: device.id.device,
             queue_config,
             rss_cfg: IrqSafeSpinLock::new(None),
+            vlan_filter: IrqSafeSpinLock::new(None),
             msix: None,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
@@ -823,6 +827,36 @@ impl Ixgbe {
         Ok(())
     }
 
+    /// Program VLAN filtering (VFTA + VLNCTRL). Callers must have
+    /// RX disabled while reprogramming filters.
+    pub fn configure_vlan(&self, filter: vlan::VlanFilter) -> Result<(), IxgbeError> {
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            filter.apply(&mut bank);
+        }
+        *self.vlan_filter.lock() = Some(filter);
+        Ok(())
+    }
+
+    /// Clear VLAN filtering (empty table, VFE off).
+    pub fn clear_vlan(&self) {
+        let mut bank = queues::MmioBank::new(&self.mmio);
+        vlan::VlanFilter::clear(&mut bank);
+        *self.vlan_filter.lock() = None;
+    }
+
+    /// Enable/disable VLAN tag stripping (RXDCTL.VME) on RX queue `q`.
+    pub fn set_vlan_strip(&self, q: usize, enable: bool) -> Result<(), IxgbeError> {
+        let regs = queues::rx_queue_regs(q).ok_or(IxgbeError::Other("bad RX queue"))?;
+        let mut bank = queues::MmioBank::new(&self.mmio);
+        if enable {
+            bank.set_bits(regs.rxdctl, vlan::RXDCTL_VME);
+        } else {
+            bank.clear_bits(regs.rxdctl, vlan::RXDCTL_VME);
+        }
+        Ok(())
+    }
+
     /// The stack-visible RSS config, if programmed.
     pub fn rss_config(&self) -> Option<narf_net::rss::RssConfig> {
         self.rss_cfg.lock().as_ref().map(|c| c.as_net_config())
@@ -903,6 +937,9 @@ impl crate::HwNic for Ixgbe {
         let mut caps = crate::NicCaps::PROMISC | crate::NicCaps::MULTICAST_HASH;
         if self.rss_cfg.lock().is_some() {
             caps = caps | crate::NicCaps::RSS;
+        }
+        if self.vlan_filter.lock().is_some() {
+            caps = caps | crate::NicCaps::VLAN_TAGGING;
         }
         caps
     }

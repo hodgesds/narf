@@ -175,9 +175,20 @@ gains `RSS` once programmed. Bring-up leaves RSS off (queue 0
 only) until configured; reprogramming requires RX disabled.
 FlowDirector/ATR stays a follow-up (§14).
 
-## 11. VLAN filtering (v0.2 — see §14 for what is still open)
+## 11. VLAN filtering
 
-Placeholder for the VLAN commit: VFTA / VLNCTRL / RXDCTL.VME.
+`drivers/net/ixgbe/src/ixgbe/vlan.rs` programs the 4096-bit
+VLAN filter: VFTA[0..127] at 0x0A000 + 4*n (bit i of register n
+passes VID 32*n+i) plus VLNCTRL at 0x05088 (VET 0x8100, VFE
+bit 30, optional CFI/CFIEN bits 28/29). `Ixgbe::configure_vlan`
+programs and records the filter (caps gain `VLAN_TAGGING`);
+`clear_vlan` restores the empty table + VFE off;
+`set_vlan_strip(q, enable)` toggles per-queue RXDCTL.VME
+(bit 30, strip the tag on that queue's 802.1Q frames).
+Untagged frames are unaffected by the table. NOTE: this
+driver still uses legacy RX descriptors, so a stripped tag's
+VLAN field is not yet surfaced to the stack — the advanced-
+descriptor migration that reports it is a follow-up (§14).
 
 ## 12. Wake-on-LAN and power management (v0.2 — see §14)
 

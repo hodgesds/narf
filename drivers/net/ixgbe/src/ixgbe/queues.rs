@@ -60,6 +60,10 @@ pub trait RegBank {
         let v = self.read32(offset);
         self.write32(offset, v | mask);
     }
+    fn clear_bits(&mut self, offset: u64, mask: u32) {
+        let v = self.read32(offset);
+        self.write32(offset, v & !mask);
+    }
 }
 
 /// [`RegBank`] over a real BAR0 mapping.

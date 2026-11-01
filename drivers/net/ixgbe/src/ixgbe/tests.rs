@@ -547,3 +547,49 @@ fn smoke_ixgbe_rss_register_conversation() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_rss_register_conversation);
+
+// ── VLAN fixtures (commit 3) ─────────────────────────────────────
+
+fn smoke_ixgbe_vlan_filter() -> TestResult {
+    use super::queues::RegBank;
+    use super::vlan::{
+        vfta_slot, vfta_words, vlnctrl_word, VlanFilter, REG_VFTA_BASE, REG_VLNCTRL,
+    };
+    if vfta_slot(0) != (0, 1) || vfta_slot(32) != (1, 1) || vfta_slot(4095) != (127, 0x8000_0000) {
+        return TestResult::Fail("VFTA slot mapping wrong");
+    }
+    if vfta_slot(100) != (3, 1 << 4) {
+        return TestResult::Fail("VFTA slot for VID 100 wrong");
+    }
+    let words = vfta_words(&[0, 1, 100, 4095, 5000]);
+    if words[0] != 0x3 || words[3] != (1 << 4) || words[127] != 0x8000_0000 {
+        return TestResult::Fail("VFTA words wrong (5000 must be ignored)");
+    }
+    if vlnctrl_word(None) != 0x4000_8100 {
+        return TestResult::Fail("VLNCTRL word without CFI wrong");
+    }
+    if vlnctrl_word(Some(false)) != 0x6000_8100 || vlnctrl_word(Some(true)) != 0x7000_8100 {
+        return TestResult::Fail("VLNCTRL CFI words wrong");
+    }
+    let mut bank = FakeBank::new();
+    let filter = VlanFilter {
+        vids: alloc::vec![100, 200],
+        cfi_match: None,
+    };
+    filter.apply(&mut bank);
+    if bank.read32(REG_VFTA_BASE + 4 * 3) != (1 << 4) {
+        return TestResult::Fail("VFTA VID 100 not programmed");
+    }
+    if bank.read32(REG_VFTA_BASE + 4 * 6) != (1 << 8) {
+        return TestResult::Fail("VFTA VID 200 not programmed");
+    }
+    if bank.read32(REG_VLNCTRL) != 0x4000_8100 {
+        return TestResult::Fail("VLNCTRL not programmed");
+    }
+    VlanFilter::clear(&mut bank);
+    if bank.read32(REG_VFTA_BASE + 4 * 3) != 0 || bank.read32(REG_VLNCTRL) != 0x8100 {
+        return TestResult::Fail("VLAN clear did not restore defaults");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_vlan_filter);
