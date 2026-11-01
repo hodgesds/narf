@@ -1387,6 +1387,111 @@ kernel_test_in!(
     smoke_fb_drm_external_geometry_requires_published_scanout
 );
 
+/// Model the publication after a boot framebuffer has been rebased to its
+/// kernel mapping. Restore all picker state before the caller frees backing.
+fn with_boot_scanout_model<R>(
+    boot: narf_graphics_driver::generic::GenericFb,
+    live: narf_graphics_driver::generic::GenericFb,
+    phys: u64,
+    body: impl FnOnce() -> R,
+) -> R {
+    use core::sync::atomic::Ordering;
+    use narf_drivers_gpu::scanout_access;
+    let saved_test = crate::TEST_SCANOUT.lock().take();
+    let saved_boot = crate::BOOT_GENERIC.lock().replace(boot);
+    let saved_live = *crate::GENERIC_FB.lock();
+    let saved_phys = crate::GENERIC_PHYS.load(Ordering::Acquire);
+    scanout_access::replace(|| {
+        *crate::GENERIC_FB.lock() = Some(live);
+        crate::GENERIC_PHYS.store(phys, Ordering::Release);
+    });
+    let result = body();
+    scanout_access::replace(|| {
+        *crate::GENERIC_FB.lock() = saved_live;
+        crate::GENERIC_PHYS.store(saved_phys, Ordering::Release);
+    });
+    *crate::BOOT_GENERIC.lock() = saved_boot;
+    *crate::TEST_SCANOUT.lock() = saved_test;
+    result
+}
+
+/// UEFI's GOP wins the picker even when a virtual GPU is probed. Its kernel
+/// mapping must remain a DRM copy target without becoming a userspace mmap.
+fn smoke_fb_drm_boot_scanout_uses_rebased_mapping() -> TestResult {
+    use narf_graphics_driver::generic::GenericFb;
+    const PHYS: u64 = 0x3000_0000;
+    let mut pixels = alloc::vec![0u32; 40];
+    let mapped = pixels.as_mut_ptr() as u64;
+    let boot = GenericFb::new(PHYS, 8, 4, 40, 32);
+    let live = GenericFb::new(mapped, 8, 4, 40, 32);
+    let (geometry, mmap_backing) = with_boot_scanout_model(boot, live, PHYS, || {
+        (crate::drm_scanout_geom(), crate::fbdev_info())
+    });
+    if mmap_backing.is_some() {
+        return TestResult::Fail("boot DRM copy target exposed a physical fbdev mmap");
+    }
+    let Some(geometry) = geometry else {
+        return TestResult::Fail("registered boot framebuffer missing from DRM copy targets");
+    };
+    if (
+        geometry.phys,
+        geometry.virt,
+        geometry.width,
+        geometry.height,
+        geometry.stride_bytes,
+    ) != (PHYS, mapped, 8, 4, 40)
+    {
+        return TestResult::Fail("boot DRM target lost its mapping or padded row stride");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "fb/drm_boot",
+    smoke_fb_drm_boot_scanout_uses_rebased_mapping
+);
+
+/// A replaced/unpublished external scanout must not be accepted merely
+/// because the picker still names the generic backend. Nor may malformed
+/// boot geometry become an unchecked CPU copy destination.
+fn smoke_fb_drm_boot_scanout_rejects_other_or_invalid_ranges() -> TestResult {
+    use narf_graphics_driver::generic::GenericFb;
+    const PHYS: u64 = 0x3000_0000;
+    let mut pixels = alloc::vec![0u32; 40];
+    let mapped = pixels.as_mut_ptr() as u64;
+    let boot = GenericFb::new(PHYS, 8, 4, 40, 32);
+    for (live, phys) in [
+        (GenericFb::new(mapped, 8, 4, 40, 32), PHYS + 4096),
+        (GenericFb::new(mapped, 9, 4, 40, 32), PHYS),
+        (GenericFb::new(mapped, 8, 4, 36, 32), PHYS),
+        (GenericFb::new(mapped, 8, 4, 40, 24), PHYS),
+        (GenericFb::new(0, 8, 4, 40, 32), PHYS),
+    ] {
+        if with_boot_scanout_model(boot, live, phys, crate::drm_scanout_geom).is_some() {
+            return TestResult::Fail("non-boot generic scanout accepted as the boot DRM target");
+        }
+    }
+    for invalid in [
+        GenericFb::new(0, 8, 4, 40, 32),
+        GenericFb::new(PHYS, 0, 4, 40, 32),
+        GenericFb::new(PHYS, 8, 0, 40, 32),
+        GenericFb::new(PHYS, 8, 4, 28, 32),
+        GenericFb::new(PHYS, 8, 4, 41, 32),
+        GenericFb::new(PHYS, 8, 4, 40, 24),
+        GenericFb::new(PHYS, 8, 4, u32::MAX - 3, 32),
+    ] {
+        let mut live = invalid;
+        live.addr = mapped;
+        if with_boot_scanout_model(invalid, live, invalid.addr, crate::drm_scanout_geom).is_some() {
+            return TestResult::Fail("invalid boot scanout accepted as a DRM copy target");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "fb/drm_boot",
+    smoke_fb_drm_boot_scanout_rejects_other_or_invalid_ranges
+);
+
 /// The hardware-cursor arrow matches the software sprite's bitmap, and no
 /// hardware path is taken unless the console adopted a published scanout.
 fn smoke_fb_hardware_cursor_arrow_and_gating() -> TestResult {

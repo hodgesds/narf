@@ -72,6 +72,14 @@ rest of that backend. Generic DRM/DP fixtures stay enabled with either or
 both vendors disabled. The registration census has its own test subsystem,
 `drivers/gpu/vendor_features`, for focused boot checks.
 
+The DRM framebuffer hook distinguishes a kernel copy destination from a
+userspace-mappable fbdev backing. A rebased boot framebuffer can receive DRM
+copies through its kernel mapping only while its live physical range and
+geometry match the original boot publication. The CPU copy retains a scanout
+epoch lease. Adopted native scanouts require their owner's live publication;
+boot GPU quarantine refuses copy targets. This does not grant a physical
+fbdev mmap of rebased generic scanouts.
+
 ### Intel scanout takeover and restore
 
 `intel_gpu_modeset::Modeset::modeset_fixed` and
