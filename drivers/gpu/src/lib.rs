@@ -850,10 +850,13 @@ pub fn register_initcalls() {
     });
     #[cfg(feature = "amdgpu")]
     narf_init::register(Stage::Late, "amdgpu-usbc", amdgpu_usbc::start);
-    narf_init::register(Stage::Device, "gpu-backlight", || {
-        backlight::init_backlight_initcall();
-        InitResult::Ok
-    });
+    // No "gpu-backlight" initcall: the unified dispatcher it logged
+    // for was retired in the #949/#1021 consolidation. Panel
+    // brightness composition lives in narf-drivers-backlight (the
+    // arbitrated registry, registered from the frame composition
+    // root); this crate's `backlight` module is the ATIF codec only,
+    // and both GPU backlight owners (AMD panel, Intel BLC) register
+    // from their PCI probes.
     // bochs DRM card registration. Must run at Late stage: the bochs
     // PCI device isn't probed until the post-Device probe phase, so
     // `is_probed()` is still false at Device stage (the card would

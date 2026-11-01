@@ -29,9 +29,16 @@ and `panel_owner()` returns the current owner.
 
 The crate implements the real brightness control paths found on PC hardware.
 The ACPI video path drives the `_BCL`/`_BCM`/`_BQC` methods — the firmware
-brightness-level table, set, and query. The AMD GPU path bridges to the
-`amdgpu` PWM backlight register. An Intel backlight scaffold is present for the
-Intel PWM frequency/duty registers. Keyboard backlight is driven through vendor
+brightness-level table, set, and query — and is the single ACPI implementation
+in the tree: the platform crate's parallel panel registry and the GPU crate's
+dispatcher decode were retired into it (#949). The AMD panel owner lives in
+`drivers/gpu` (`AmdgpuPanelBacklight`, over the DC-correct
+`Amdgpu::set_backlight` sequence) and registers here from the amdgpu PCI probe;
+the crate's former AMD bridge module, which encoded a pre-fix `BL_PWM` register
+scheme, was deleted rather than wired (#951). The Intel path is a real BXT PWM
+device over the frequency/duty registers, installed from the Intel GPU probe —
+the only Intel backlight path; the GPU dispatcher's duplicate Intel backend
+was retired with it (#1021). Keyboard backlight is driven through vendor
 WMI and registered as a PWM-backed LED in the LED class. The brightness-key
 handler subscribes to ACPI Notify events and, on the standard
 brightness-up/brightness-down notifications (0x86/0x87), steps the arbitrated
@@ -42,8 +49,12 @@ Because the keyboard backlight is an LED, this crate builds on `drivers/leds`:
 it imports that crate's LED class and registers its keyboard-backlight channel
 there, so brightness and LED concerns share one registry rather than
 duplicating it. The ACPI/WMI work rests on `narf-aml`; brightness keys feed
-`narf-input`; devices are brought up as `Stage::Device` initcalls and exposed
-through `narf-filesystem` via the sysfs bridge. The crate also pulls in
+`narf-input`; devices are brought up as `Stage::Device` initcalls — registered
+from the frame composition root (#947) — and exposed through `narf-filesystem`
+via the sysfs bridge. Publication is dynamic: every register/unregister
+reconciles `/sys/class/backlight` with the elected owner (#952), so a device
+registered from a PCI probe, after the Device initcalls have run, still gets
+its sysfs directory. The crate also pulls in
 `narf-console`, `narf-scheduler`, `narf-time`, `narf-memory`, and the driver
 runtime.
 
