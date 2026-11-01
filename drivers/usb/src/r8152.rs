@@ -1148,6 +1148,16 @@ fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
 /// TX cookies are record indices). Unknown slots no-op; repeat
 /// detach is a silent no-op (unregister is idempotent).
 ///
+/// RX-mirror obligation (#789, from the #872-review note):
+/// RESOLVED as not owed here — same verdict as ECM/NCM:
+/// this family's pump delivers via
+/// `narf_net::iface::on_rx_frame_from` directly and never calls
+/// `publish::note_rx_mirror_attached`, and its `usb-rtl{N}`
+/// names cannot collide with the `eth%d` keys the mirror
+/// registry can ever hold. No clear call is owed; if this
+/// family ever dual-publishes, its detach paths must call
+/// `publish::clear_rx_mirror_attached` alongside unregister.
+///
 /// Panic-free and idempotent by the #893 hook contract: no
 /// indexing and no fallible unwraps on any path. Tombstones
 /// are set under the registry lock and iface names collected
@@ -1181,7 +1191,8 @@ pub fn detach_r8152_slot(slot_id: u8) -> Result<(), ()> {
 /// recovery (`attach::detach_all_bindings`): tombstone every
 /// RTL binding and unregister every net iface, regardless of
 /// slot. Infallible and idempotent, same pump-exit and
-/// never-remove reasoning as [`detach_r8152_slot`].
+/// never-remove reasoning as [`detach_r8152_slot`], and the
+/// same #789 mirror verdict (no clear call owed).
 pub fn detach_all_r8152() {
     let ifaces: Vec<String> = {
         let mut g = RTL_DEVICES.lock();
@@ -1677,6 +1688,106 @@ pub mod tests {
         "drivers/usb/r8152",
         smoke_r8152_dispatch_unbind_reaches_detach
     );
+
+    /// #789 remainder (a): rebind-on-redock proof. Two modelled
+    /// RTL devices bind with real net ifaces; the supervisor's
+    /// `dispatch_unbind` path detaches the first; a re-push of
+    /// the same slot — the shape bind takes on replug, after
+    /// the supervisor cleared the port claim — lands at a fresh
+    /// index with a fresh iface name, TX resolves to the NEW
+    /// device, and the old cookie fail-closes.
+    fn smoke_r8152_redock_rebind_via_dispatch() -> TestResult {
+        RTL_DEVICES.lock().clear();
+        let mk = |slot_id: u8, out_dci: u8| RtlDevice {
+            slot_id,
+            generation: RtlGen::GbE,
+            version: RtlVersion::Ver03,
+            mac: [0x02, 0, 0, 0, 0, slot_id],
+            bulk_in_dci: 3,
+            bulk_out_dci: out_dci,
+            iface_name: alloc::format!("usb-rtl-detach{}", slot_id),
+            pump_running: true,
+            link_byte: 0xFF,
+            detached: false,
+        };
+        {
+            let mut g = RTL_DEVICES.lock();
+            g.push(mk(7, 4));
+            g.push(mk(9, 6));
+        }
+        let (name7, name9) = {
+            let mut g = RTL_DEVICES.lock();
+            let n7 = narf_net::iface::register_with_context(
+                "usb-rtl0",
+                [0x02, 0, 0, 0, 0, 7],
+                0,
+                rtl_send_ctx,
+            );
+            let n9 = narf_net::iface::register_with_context(
+                "usb-rtl1",
+                [0x02, 0, 0, 0, 0, 9],
+                1,
+                rtl_send_ctx,
+            );
+            g[0].iface_name = n7.clone();
+            g[1].iface_name = n9.clone();
+            (n7, n9)
+        };
+        if narf_net::iface::lookup(&name7).is_none() || narf_net::iface::lookup(&name9).is_none() {
+            RTL_DEVICES.lock().clear();
+            return TestResult::Fail("net ifaces must resolve before detach");
+        }
+        register();
+        let report = crate::class_registry::dispatch_unbind(7);
+        if report.invoked == 0 {
+            RTL_DEVICES.lock().clear();
+            return TestResult::Fail("dispatch_unbind invoked no hooks");
+        }
+        if tx_target(0).is_some()
+            || narf_net::iface::lookup(&name7).is_some()
+            || tx_target(1) != Some((9, 6))
+        {
+            RTL_DEVICES.lock().clear();
+            return TestResult::Fail("dispatch detach must tombstone exactly one binding");
+        }
+        // Re-plug: fresh record, published under the production
+        // name rule with a real net iface — never a recycled
+        // cookie or name.
+        let idx = {
+            let mut g = RTL_DEVICES.lock();
+            let idx = g.len();
+            g.push(mk(7, 4));
+            let requested = alloc::format!("usb-rtl{}", idx);
+            let assigned = narf_net::iface::register_with_context(
+                &requested,
+                [0x02, 0, 0, 0, 0, 7],
+                idx as u64,
+                rtl_send_ctx,
+            );
+            g[idx].iface_name = assigned;
+            idx
+        };
+        if idx != 2 {
+            RTL_DEVICES.lock().clear();
+            return TestResult::Fail("re-bind must not reuse a tombstoned index");
+        }
+        let fresh = {
+            let g = RTL_DEVICES.lock();
+            g[idx].iface_name.clone()
+        };
+        if fresh == name7
+            || tx_target(idx) != Some((7, 4))
+            || tx_target(0).is_some()
+            || narf_net::iface::lookup(&fresh).is_none()
+        {
+            RTL_DEVICES.lock().clear();
+            return TestResult::Fail("re-bind must publish fresh and keep the old cookie dead");
+        }
+        let _ = detach_r8152_slot(7);
+        RTL_DEVICES.lock().clear();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_redock_rebind_via_dispatch);
 
     fn smoke_r8152_version_decode() -> TestResult {
         // Linux's __rtl_get_hw_ver switch, code for code; low

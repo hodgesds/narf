@@ -937,16 +937,69 @@ pub fn recv_frame(idx: usize, scratch: &mut [u8]) -> Result<Option<&[u8]>, EcmEr
 /// of retargeting a later device (records are never removed).
 /// Unknown slots no-op.
 ///
+/// Tombstones are set under the registry lock and iface names
+/// collected there, but the net unregister runs after the lock
+/// is released — the net registry lock must never be taken
+/// while the ECM registry lock is held (the NCM/r8152
+/// collect-then-unregister pattern; this function previously
+/// unregistered under the lock).
+///
+/// RX-mirror obligation (#789, from the #872-review note):
+/// RESOLVED as not owed here. The mirror registry in
+/// `narf_drivers_net_core::publish` is noted only by
+/// dual-published families' `rx_ring()` takes (via
+/// `note_rx_mirror_attached`); this family's pumps deliver via
+/// `narf_net::iface::on_rx_frame_from` directly and never note,
+/// and its `usb-ecm{N}` names live in a disjoint namespace from
+/// the `eth%d` keys that can ever be noted — so no detach path
+/// here can inherit a stale attach note, and no clear call is
+/// owed. If this family ever dual-publishes, its detach paths
+/// must call `publish::clear_rx_mirror_attached` for the iface
+/// name alongside unregister.
+///
 /// Infallible bookkeeping, adapted to the [`UsbUnbindFn`] contract
 /// with an unconditional `Ok(())` (#893: a hook reports failure with
 /// `Err(())`, never by panicking).
 pub fn detach_ecm_slot(slot_id: u8) -> Result<(), ()> {
-    let mut g = CDC_ECM_DEVICES.lock();
-    for dev in g.iter_mut().filter(|d| d.slot_id == slot_id && !d.detached) {
-        dev.detached = true;
-        let _ = narf_net::iface::unregister(&dev.iface_name);
+    let ifaces: Vec<alloc::string::String> = {
+        let mut g = CDC_ECM_DEVICES.lock();
+        let mut names = Vec::new();
+        for dev in g.iter_mut().filter(|d| d.slot_id == slot_id && !d.detached) {
+            dev.detached = true;
+            dev.pump_running = false;
+            names.push(dev.iface_name.clone());
+        }
+        names
+    };
+    for name in ifaces {
+        let _ = narf_net::iface::unregister(&name);
     }
     Ok(())
+}
+
+/// Wholesale variant of [`detach_ecm_slot`] for controller
+/// recovery (`attach::detach_all_bindings`): tombstone every
+/// ECM binding and unregister every net iface, regardless of
+/// slot. Previously this function did not exist, so the
+/// recovery path left ECM bindings live and re-enumeration
+/// would have appended a second live iface for the same
+/// adapter. Infallible and idempotent, same pump-exit and
+/// never-remove reasoning as [`detach_ecm_slot`], and the
+/// same #789 mirror verdict (no clear call owed).
+pub fn detach_all_ecm() {
+    let ifaces: Vec<alloc::string::String> = {
+        let mut g = CDC_ECM_DEVICES.lock();
+        let mut names = Vec::new();
+        for dev in g.iter_mut().filter(|d| !d.detached) {
+            dev.detached = true;
+            dev.pump_running = false;
+            names.push(dev.iface_name.clone());
+        }
+        names
+    };
+    for name in ifaces {
+        let _ = narf_net::iface::unregister(&name);
+    }
 }
 
 fn ecm_send_ctx(cookie: u64, frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
@@ -1411,4 +1464,113 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/usb/cdc_ecm", smoke_ecm_tx_routing_two_devices);
+
+    /// #789 remainder (a): rebind-on-redock proof. Two modelled
+    /// ECM devices bind with real net ifaces; the supervisor's
+    /// `dispatch_unbind` path detaches the first (the wiring the
+    /// hub-detach path actually uses, not just the detach
+    /// function); a re-push of the same slot — the shape bind
+    /// takes on replug, after the supervisor cleared the port
+    /// claim — lands at a fresh index with a fresh iface name,
+    /// TX resolves to the NEW device, and the old cookie
+    /// fail-closes. Wholesale detach then clears everything,
+    /// including the re-bound record (the controller-recovery
+    /// path that previously had no ECM coverage at all).
+    fn smoke_ecm_redock_rebind_and_wholesale() -> TestResult {
+        __reset_ecm_for_test();
+        let mk = |slot: u8, dci: u8| CdcEcmDevice {
+            slot_id: slot,
+            comm_iface: 0,
+            data_iface: 1,
+            bulk_in_dci: dci + 1,
+            bulk_out_dci: dci,
+            notif_dci: 0,
+            mac: [0x02, 0, 0, 0, 0, slot],
+            max_segment_size: 1518,
+            iface_name: alloc::format!("usb-ecm{}", slot),
+            pump_running: true,
+            notif_running: false,
+            link_up: false,
+            downlink_bps: 0,
+            uplink_bps: 0,
+            detached: false,
+        };
+        {
+            let mut g = CDC_ECM_DEVICES.lock();
+            g.push(mk(3, 4));
+            g.push(mk(5, 6));
+        }
+        // Register the net ifaces for real under the production
+        // name rule, so the unregister half is asserted against
+        // the net registry, not trusted.
+        let (name3, name5) = {
+            let mut g = CDC_ECM_DEVICES.lock();
+            let n3 = register_ecm_iface(0, [0x02, 0, 0, 0, 0, 3]);
+            let n5 = register_ecm_iface(1, [0x02, 0, 0, 0, 0, 5]);
+            g[0].iface_name = n3.clone();
+            g[1].iface_name = n5.clone();
+            (n3, n5)
+        };
+        if narf_net::iface::lookup(&name3).is_none() || narf_net::iface::lookup(&name5).is_none() {
+            __reset_ecm_for_test();
+            return TestResult::Fail("net ifaces must resolve before detach");
+        }
+        // Detach through the class-registry unbind hook, as the
+        // supervisor's detach_slot does.
+        register_initcalls();
+        let report = crate::class_registry::dispatch_unbind(3);
+        if report.invoked == 0 {
+            __reset_ecm_for_test();
+            return TestResult::Fail("dispatch_unbind invoked no hooks");
+        }
+        if tx_target(0).is_some()
+            || narf_net::iface::lookup(&name3).is_some()
+            || tx_target(1) != Some((5, 6))
+        {
+            __reset_ecm_for_test();
+            return TestResult::Fail("dispatch detach must tombstone exactly one binding");
+        }
+        // Re-plug: bind pushes a fresh record (records are never
+        // removed) and publishes under the production name rule.
+        let idx = {
+            let mut g = CDC_ECM_DEVICES.lock();
+            let idx = g.len();
+            g.push(mk(3, 4));
+            g[idx].iface_name = register_ecm_iface(idx, [0x02, 0, 0, 0, 0, 3]);
+            idx
+        };
+        if idx != 2 {
+            __reset_ecm_for_test();
+            return TestResult::Fail("re-bind must not reuse a tombstoned index");
+        }
+        let fresh = {
+            let g = CDC_ECM_DEVICES.lock();
+            g[idx].iface_name.clone()
+        };
+        if fresh == name3
+            || tx_target(idx) != Some((3, 4))
+            || narf_net::iface::lookup(&fresh).is_none()
+            || tx_target(0).is_some()
+        {
+            __reset_ecm_for_test();
+            return TestResult::Fail("re-bind must publish fresh and keep the old cookie dead");
+        }
+        // Wholesale detach (controller recovery) clears the
+        // re-bound record and the survivor alike.
+        detach_all_ecm();
+        if attached_ecm_count() != 0
+            || tx_target(idx).is_some()
+            || tx_target(1).is_some()
+            || narf_net::iface::lookup(&fresh).is_some()
+            || narf_net::iface::lookup(&name5).is_some()
+        {
+            __reset_ecm_for_test();
+            return TestResult::Fail("wholesale detach must clear every ECM binding");
+        }
+        // Wholesale detach is idempotent.
+        detach_all_ecm();
+        __reset_ecm_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ecm", smoke_ecm_redock_rebind_and_wholesale);
 }

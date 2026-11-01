@@ -1333,6 +1333,117 @@ pub mod tests {
         "drivers/usb/cdc_ncm",
         smoke_ncm_dispatch_unbind_reaches_detach
     );
+
+    /// #789 remainder (a): rebind-on-redock proof. Two modelled
+    /// NCM devices bind with real net ifaces; the supervisor's
+    /// `dispatch_unbind` path detaches the first; a re-push of
+    /// the same slot — the shape bind takes on replug, after
+    /// the supervisor cleared the port claim — lands at a fresh
+    /// index with a fresh iface name, TX state resolves to the
+    /// NEW device (with a fresh sequence counter), and the old
+    /// cookie fail-closes.
+    fn smoke_ncm_redock_rebind_via_dispatch() -> TestResult {
+        __reset_ncm_for_test();
+        let mk = |slot_id: u8, out_dci: u8| CdcNcmDevice {
+            slot_id,
+            comm_iface: 0,
+            data_iface: 1,
+            bulk_in_dci: 3,
+            bulk_out_dci: out_dci,
+            tx_sequence: 0,
+            mac: [0x02, 0, 0, 0, 0, slot_id],
+            ntb_in_max_size: 4096,
+            ntb_out_max_size: 16384,
+            crc_enabled: false,
+            iface_name: alloc::format!("usb-ncm-detach{}", slot_id),
+            pump_running: true,
+            detached: false,
+        };
+        {
+            let mut g = CDC_NCM_DEVICES.lock();
+            g.push(mk(7, 4));
+            g.push(mk(9, 6));
+        }
+        let (name7, name9) = {
+            let mut g = CDC_NCM_DEVICES.lock();
+            let n7 = narf_net::iface::register_with_context(
+                "usb-ncm0",
+                [0x02, 0, 0, 0, 0, 7],
+                0,
+                ncm_send_ctx,
+            );
+            let n9 = narf_net::iface::register_with_context(
+                "usb-ncm1",
+                [0x02, 0, 0, 0, 0, 9],
+                1,
+                ncm_send_ctx,
+            );
+            g[0].iface_name = n7.clone();
+            g[1].iface_name = n9.clone();
+            (n7, n9)
+        };
+        if narf_net::iface::lookup(&name7).is_none() || narf_net::iface::lookup(&name9).is_none() {
+            __reset_ncm_for_test();
+            return TestResult::Fail("net ifaces must resolve before detach");
+        }
+        register_initcalls();
+        let report = crate::class_registry::dispatch_unbind(7);
+        if report.invoked == 0 {
+            __reset_ncm_for_test();
+            return TestResult::Fail("dispatch_unbind invoked no hooks");
+        }
+        if tx_target(0).is_some()
+            || take_tx_state(0).is_some()
+            || narf_net::iface::lookup(&name7).is_some()
+            || tx_target(1) != Some((9, 6))
+        {
+            __reset_ncm_for_test();
+            return TestResult::Fail("dispatch detach must tombstone exactly one binding");
+        }
+        // Re-plug: fresh record, published under the production
+        // name rule with a real net iface, fresh TX sequence —
+        // never a recycled cookie or name.
+        let idx = {
+            let mut g = CDC_NCM_DEVICES.lock();
+            let idx = g.len();
+            g.push(mk(7, 4));
+            let requested = alloc::format!("usb-ncm{}", idx);
+            let assigned = narf_net::iface::register_with_context(
+                &requested,
+                [0x02, 0, 0, 0, 0, 7],
+                idx as u64,
+                ncm_send_ctx,
+            );
+            g[idx].iface_name = assigned;
+            idx
+        };
+        if idx != 2 {
+            __reset_ncm_for_test();
+            return TestResult::Fail("re-bind must not reuse a tombstoned index");
+        }
+        let fresh = {
+            let g = CDC_NCM_DEVICES.lock();
+            g[idx].iface_name.clone()
+        };
+        // take_tx_state takes the registry lock itself, so it
+        // must run with no guard held here. A fresh record
+        // means a fresh sequence counter (0), not the detached
+        // record's advanced counter.
+        let state = take_tx_state(idx);
+        if fresh == name7
+            || tx_target(idx) != Some((7, 4))
+            || tx_target(0).is_some()
+            || narf_net::iface::lookup(&fresh).is_none()
+            || state != Some((7, 4, 0, false, 4096))
+        {
+            __reset_ncm_for_test();
+            return TestResult::Fail("re-bind must publish fresh and keep the old cookie dead");
+        }
+        let _ = detach_ncm_slot(7);
+        __reset_ncm_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/cdc_ncm", smoke_ncm_redock_rebind_via_dispatch);
 }
 
 // ── Class enumeration + bind ───────────────────────────────────────
@@ -2038,6 +2149,16 @@ fn ncm_send_ctx(cookie: u64, frame: &[u8], _meta: narf_net::TxMeta) -> Result<()
 /// record indices). Unknown slots no-op; repeat detach is a
 /// silent no-op (unregister is idempotent).
 ///
+/// RX-mirror obligation (#789, from the #872-review note):
+/// RESOLVED as not owed here — same verdict as ECM/r8152:
+/// this family's pumps deliver via
+/// `narf_net::iface::on_rx_frame_from` directly and never call
+/// `publish::note_rx_mirror_attached`, and its `usb-ncm{N}`
+/// names cannot collide with the `eth%d` keys the mirror
+/// registry can ever hold. No clear call is owed; if this
+/// family ever dual-publishes, its detach paths must call
+/// `publish::clear_rx_mirror_attached` alongside unregister.
+///
 /// Panic-free and idempotent by the #893 hook contract: no
 /// indexing and no fallible unwraps on any path. Tombstones are
 /// set under the registry lock and iface names collected there,
@@ -2071,7 +2192,8 @@ pub fn detach_ncm_slot(slot_id: u8) -> Result<(), ()> {
 /// recovery (`attach::detach_all_bindings`): tombstone every
 /// NCM binding and unregister every net iface, regardless of
 /// slot. Infallible and idempotent, same pump-exit and
-/// never-remove reasoning as [`detach_ncm_slot`].
+/// never-remove reasoning as [`detach_ncm_slot`], and the same
+/// #789 mirror verdict (no clear call owed).
 pub fn detach_all_ncm() {
     let ifaces: Vec<alloc::string::String> = {
         let mut g = CDC_NCM_DEVICES.lock();

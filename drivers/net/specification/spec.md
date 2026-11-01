@@ -70,7 +70,16 @@ detach path for a dual-published family (issue #789) must call
 `publish::clear_rx_mirror_attached` for the interface's name when it
 unregisters the interface: `eth%d` names are lowest-free-allocated and
 reused, and a stale attach note would mirror frames into a re-probed
-device's fresh ring before any consumer attaches.
+device's fresh ring before any consumer attaches. Scope note
+(#789 USB-NIC remainder, resolved): this obligation covers
+dual-published families only. The USB-NIC families (r8152, CDC-NCM,
+CDC-ECM) are single-published — their pumps deliver via
+`iface::on_rx_frame_from` directly and never call
+`note_rx_mirror_attached`, and their `usb-rtl`/`usb-ncm`/`usb-ecm`
+names cannot collide with the `eth%d` keys the mirror registry can
+ever hold — so their detach paths owe no clear call. If a USB-NIC
+family ever dual-publishes, the obligation attaches to its detach
+paths at that point.
 
 Carrier is a live signal, not a probe-time photograph (issue #791). A family
 republishes its link sample on every transition it can observe, through the
