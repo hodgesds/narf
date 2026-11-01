@@ -19,6 +19,8 @@ extern crate alloc;
 pub use narf_drivers_net_core::*;
 
 #[cfg(feature = "builtin")]
+pub mod features;
+#[cfg(feature = "builtin")]
 pub mod r8169;
 #[cfg(feature = "builtin")]
 pub mod rtl8125;
