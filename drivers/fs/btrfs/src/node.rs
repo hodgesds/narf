@@ -1576,8 +1576,16 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         self.inode().perms() & 0o777
     }
 
+    fn set_dir_mode_async<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        <Self as FileOps>::set_perms(self, perms)
+    }
+
     fn dir_owners(&self) -> (u32, u32) {
         (self.inode().uid, self.inode().gid)
+    }
+
+    fn set_dir_owners_async<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        <Self as FileOps>::set_owners(self, uid, gid)
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {

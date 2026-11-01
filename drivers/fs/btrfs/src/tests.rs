@@ -13614,6 +13614,54 @@ fn smoke_btrfs_super_stripe_exclusion() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_super_stripe_exclusion);
 
+fn smoke_btrfs_directory_metadata_through_dir_ops() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("fixture did not mount"),
+    };
+    let dir = match poll_once(vol.root().mkdir("user-config")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    // mkdir(2) receives a DirOps handle. The syscall assigns the caller's
+    // ownership and mode through that handle before returning to userspace.
+    if !matches!(
+        poll_once(dir.set_dir_owners_async(1000, 1000)),
+        Some(Ok(()))
+    ) || !matches!(poll_once(dir.set_dir_mode_async(0o700)), Some(Ok(())))
+        || dir.dir_owners() != (1000, 1000)
+        || dir.dir_mode() != 0o700
+    {
+        return TestResult::Fail("DirOps silently discarded directory ownership or mode");
+    }
+    let file_view = match poll_once(vol.root().lookup_async("user-config")) {
+        Some(Ok(node)) => node,
+        _ => return TestResult::Fail("file view lookup failed"),
+    };
+    if file_view.owners() != (1000, 1000) || file_view.stat().mode.perms != 0o700 {
+        return TestResult::Fail("directory and file metadata views disagree");
+    }
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("sync failed");
+    }
+    let fresh = match mount_writable(dev) {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("remount failed"),
+    };
+    match poll_once(fresh.root().lookup_dir_async("user-config")) {
+        Some(Ok(dir)) if dir.dir_owners() == (1000, 1000) && dir.dir_mode() == 0o700 => {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("directory ownership or mode did not survive remount"),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/dir_metadata",
+    smoke_btrfs_directory_metadata_through_dir_ops
+);
+
 /// chmod / chown / utimensat through the node (`btrfs_setattr`): the file
 /// type never changes, chown kills set-uid (and group-exec set-gid) on a
 /// file, explicit times land exactly, ctime and the inode sequence advance,

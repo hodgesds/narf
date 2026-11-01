@@ -17,6 +17,11 @@ validates options and returns an unattached `Arc<dyn FsInstance>`.
 Both legacy mount and fsconfig use this constructor. Existing volume/node APIs
 are described in the [driver README](../README.md) and their Rust documentation.
 
+Directory ownership and mode updates through `DirOps` use the same persistent
+inode update path as `FileOps`. In particular, the ownership and mode assigned
+by `mkdir(2)` are visible through both views and survive remounting; directory
+setters propagate write errors instead of silently accepting an update.
+
 Write safety (`rw_gate`):
 
 ```rust
