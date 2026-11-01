@@ -46,13 +46,14 @@
 //!
 //! ## Scope limits (honest)
 //!
-//! The per-chip-version PHY / firmware init tables (the long
-//! version-switched OCP write sequences the reference drivers run
-//! for EEE / ALDPS / PHY patch tuning) are **not** reproduced
-//! here; the bind performs the MAC-level bring-up those tables
-//! precede (soft reset, accept filters, multicast table, receive
-//! size, RX/TX enable) and the datapath runs on the chip's reset
-//! defaults otherwise. Tracked as a follow-up issue.
+//! The version-switched PHY init layer is implemented for the
+//! original RTL8153 family only (VER_03–VER_06, Linux's
+//! `r8153_hw_phy_cfg` — see the §881 section in the code); every
+//! other chip version keeps reset defaults until its sequence is
+//! ported, and the firmware-blob step
+//! (`rtl8152_apply_firmware`) is not reproduced for any version
+//! (it loads per-version firmware files NARF does not ship).
+//! Tracked as follow-up issues.
 
 extern crate alloc;
 
@@ -115,6 +116,60 @@ pub const PLA_PHYSTATUS: u16 = 0xE908;
 
 /// `PLA_TCR1` version field mask.
 pub const TCR1_VERSION_MASK: u16 = 0x7CF0;
+
+/// OCP PHY-register window base register (Linux `PLA_OCP_GPHY_BASE`).
+pub const PLA_OCP_GPHY_BASE: u16 = 0xE86C;
+/// PHY power register (Linux `PLA_PHY_PWR`).
+pub const PLA_PHY_PWR: u16 = 0xE84C;
+/// EEE control register (Linux `PLA_EEE_CR`).
+pub const PLA_EEE_CR: u16 = 0xE040;
+/// Poll register for ALDPS-disable completion (Linux reads PLA
+/// `0xe000` bit `0x0100` after clearing `EN_ALDPS`).
+pub const PLA_ALDPS_POLL: u16 = 0xE000;
+pub const ALDPS_POLL_DONE: u16 = 0x0100;
+
+/// OCP PHY registers (Linux `OCP_*`, reached through the
+/// `PLA_OCP_GPHY_BASE` window).
+pub const OCP_POWER_CFG: u16 = 0xA430;
+pub const OCP_EEE_CFG: u16 = 0xA432;
+pub const OCP_SRAM_ADDR: u16 = 0xA436;
+pub const OCP_SRAM_DATA: u16 = 0xA438;
+pub const OCP_DOWN_SPEED: u16 = 0xA442;
+pub const OCP_BASE_MII: u16 = 0xA400;
+pub const OCP_EEE_ADV: u16 = 0xA5D0;
+
+/// `OCP_POWER_CFG` bits.
+pub const POWER_CFG_EN_ALDPS: u16 = 0x0004;
+pub const POWER_CFG_EEE_CLKDIV_EN: u16 = 0x8000;
+pub const POWER_CFG_EN_10M_PLLOFF: u16 = 0x0001;
+/// `OCP_EEE_CFG` bits.
+pub const EEE_CFG_EEE10_EN: u16 = 0x0010;
+pub const EEE_CFG_CTAP_SHORT_EN: u16 = 0x0040;
+/// `OCP_DOWN_SPEED` bits.
+pub const DOWN_SPEED_EN_10M_BGOFF: u16 = 0x0080;
+/// `PLA_PHY_PWR` bits.
+pub const PHY_PWR_PFM_PWM_SWITCH: u16 = 0x0040;
+/// `PLA_EEE_CR` bits.
+pub const EEE_CR_RX_EN: u16 = 0x0001;
+pub const EEE_CR_TX_EN: u16 = 0x0002;
+/// USB-window U2P3 control (Linux `USB_U2P3_CTRL`).
+pub const USB_U2P3_CTRL: u16 = 0xB460;
+pub const U2P3_ENABLE: u16 = 0x0001;
+
+/// PHY SRAM tuning cells (Linux `SRAM_*`).
+pub const SRAM_LPF_CFG: u16 = 0x8012;
+pub const SRAM_10M_AMP1: u16 = 0x8080;
+pub const SRAM_10M_AMP2: u16 = 0x8082;
+pub const SRAM_IMPEDANCE: u16 = 0x8084;
+
+/// MII advertisement register + pause bits (IEEE 802.3 clause 22).
+pub const MII_ADVERTISE: u16 = 4;
+pub const ADVERTISE_PAUSE_CAP: u16 = 0x0400;
+pub const ADVERTISE_PAUSE_ASYM: u16 = 0x0800;
+
+/// EEE advertisement for the original RTL8153 (Linux `eee_adv` =
+/// `MDIO_EEE_1000T | MDIO_EEE_100TX` = `0x0004 | 0x0002`).
+pub const EEE_ADV_8153: u16 = 0x0006;
 
 // `PLA_CR` bits.
 pub const CR_RST: u8 = 0x10;
@@ -280,6 +335,300 @@ async fn ocp_write_byte(dev: &USBDevice, mcu: u16, addr: u16, value: u8) -> Resu
     dev.control_out(rt, req, wvalue, windex, &data)
         .await
         .map_err(|_| ())?;
+    Ok(())
+}
+
+// ── Per-chip-version PHY init (issue #881) ───────────────────────
+//
+// Linux `drivers/net/usb/r8152.c` switches its PHY/firmware init on
+// the `PLA_TCR1` version field (the high half of the `PLA_TCR0`
+// dword Linux reads). The datapath runs on reset defaults without
+// this layer; the table below reproduces Linux's
+// `r8153_hw_phy_cfg` for the original RTL8153 family
+// (VER_03–VER_06 — the chip in most USB-C docks and GbE dongles,
+// the most common version, implemented here because no chip
+// version is on hand in this VM and no symptom has been observed
+// to drive a symptom-led port per #881's scoping instruction).
+// Every other version keeps reset defaults until its sequence is
+// ported (see the remainder issue); the firmware-blob step
+// (`rtl8152_apply_firmware`) is deliberately NOT reproduced — it
+// loads per-version firmware files NARF does not ship, so the
+// sequence runs around that step in Linux's order otherwise.
+
+/// Chip version, decoded from the `PLA_TCR1` version field.
+/// Names follow Linux's `rtl_version` enum.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RtlVersion {
+    Unknown,
+    Ver01,
+    Ver02,
+    Ver03,
+    Ver04,
+    Ver05,
+    Ver06,
+    Ver07,
+    Ver08,
+    Ver09,
+    Test01,
+    Ver10,
+    Ver11,
+    Ver12,
+    Ver13,
+    Ver14,
+    Ver15,
+    Ver16,
+    Ver17,
+}
+
+/// Decode a raw `PLA_TCR1` word into its chip version (the
+/// version-field mask is applied here, so callers pass the raw
+/// register word). The code table is Linux's
+/// `__rtl_get_hw_ver` switch, verbatim.
+pub fn version_from_tcr1(raw: u16) -> RtlVersion {
+    match raw & TCR1_VERSION_MASK {
+        0x4C00 => RtlVersion::Ver01,
+        0x4C10 => RtlVersion::Ver02,
+        0x5C00 => RtlVersion::Ver03,
+        0x5C10 => RtlVersion::Ver04,
+        0x5C20 => RtlVersion::Ver05,
+        0x5C30 => RtlVersion::Ver06,
+        0x4800 => RtlVersion::Ver07,
+        0x6000 => RtlVersion::Ver08,
+        0x6010 => RtlVersion::Ver09,
+        0x7010 => RtlVersion::Test01,
+        0x7020 => RtlVersion::Ver10,
+        0x7030 => RtlVersion::Ver11,
+        0x7400 => RtlVersion::Ver12,
+        0x7410 => RtlVersion::Ver13,
+        0x6400 => RtlVersion::Ver14,
+        0x7420 => RtlVersion::Ver15,
+        0x1030 => RtlVersion::Ver16,
+        0x2020 => RtlVersion::Ver17,
+        _ => RtlVersion::Unknown,
+    }
+}
+
+/// One step of a version-switched PHY init sequence, in the order
+/// Linux executes it. The executor below interprets each step
+/// through the existing OCP accessors; the table itself is pure
+/// data, so fixtures can pin the whole register conversation
+/// without hardware.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PhyInitOp {
+    /// OCP PHY-register set-bits (read-modify-write via the
+    /// `PLA_OCP_GPHY_BASE` window).
+    OcpRegSetBits { addr: u16, bits: u16 },
+    /// OCP PHY-register clear-bits.
+    OcpRegClrBits { addr: u16, bits: u16 },
+    /// OCP PHY-register plain write.
+    OcpRegWrite { addr: u16, value: u16 },
+    /// SRAM write: `OCP_SRAM_ADDR := addr`, then
+    /// `OCP_SRAM_DATA := value`.
+    SramWrite { addr: u16, value: u16 },
+    /// PLA word set-bits (read-modify-write).
+    PlaWordSetBits { addr: u16, bits: u16 },
+    /// PLA word clear-bits.
+    PlaWordClrBits { addr: u16, bits: u16 },
+    /// USB-window word set-bits.
+    UsbWordSetBits { addr: u16, bits: u16 },
+    /// MDIO set-bits via `OCP_BASE_MII + reg * 2`.
+    MdioSetBits { reg: u16, bits: u16 },
+    /// ALDPS disable: `OCP_POWER_CFG` clear `EN_ALDPS`, then poll
+    /// `PLA_ALDPS_POLL` for `ALDPS_POLL_DONE` (proceeds even if
+    /// the poll never completes, like the reset poll in bind).
+    AldpsDisable,
+}
+
+/// The `r8153_hw_phy_cfg` sequence for the original RTL8153
+/// family, in Linux's order, with the firmware-blob step omitted
+/// (see the section header). Returns an empty sequence for every
+/// other version — those keep reset defaults until ported.
+/// Version gates inside the sequence: `CTAP_SHORT_EN` clears only
+/// on VER_03; the U2P3 enable lands only on VER_05/VER_06 (Linux
+/// enables it for VER_05/VER_06/default and skips VER_03/VER_04).
+pub fn r8153_phy_init_ops(version: RtlVersion) -> Vec<PhyInitOp> {
+    use PhyInitOp::*;
+    match version {
+        RtlVersion::Ver03 | RtlVersion::Ver04 | RtlVersion::Ver05 | RtlVersion::Ver06 => {}
+        _ => return Vec::new(),
+    }
+    let mut ops = vec![
+        // Disable ALDPS before updating the PHY parameters.
+        AldpsDisable,
+        // Disable EEE before updating the PHY parameters.
+        PlaWordClrBits {
+            addr: PLA_EEE_CR,
+            bits: EEE_CR_RX_EN | EEE_CR_TX_EN,
+        },
+        OcpRegClrBits {
+            addr: OCP_EEE_CFG,
+            bits: EEE_CFG_EEE10_EN,
+        },
+        OcpRegWrite {
+            addr: OCP_EEE_ADV,
+            value: 0,
+        },
+        // [rtl8152_apply_firmware skipped: no firmware blobs.]
+        OcpRegSetBits {
+            addr: OCP_POWER_CFG,
+            bits: POWER_CFG_EEE_CLKDIV_EN,
+        },
+        OcpRegSetBits {
+            addr: OCP_DOWN_SPEED,
+            bits: DOWN_SPEED_EN_10M_BGOFF,
+        },
+        OcpRegSetBits {
+            addr: OCP_POWER_CFG,
+            bits: POWER_CFG_EN_10M_PLLOFF,
+        },
+        SramWrite {
+            addr: SRAM_IMPEDANCE,
+            value: 0x0B13,
+        },
+        PlaWordSetBits {
+            addr: PLA_PHY_PWR,
+            bits: PHY_PWR_PFM_PWM_SWITCH,
+        },
+        // Enable LPF corner auto tune.
+        SramWrite {
+            addr: SRAM_LPF_CFG,
+            value: 0xF70F,
+        },
+        // Adjust 10M amplitude.
+        SramWrite {
+            addr: SRAM_10M_AMP1,
+            value: 0x00AF,
+        },
+        SramWrite {
+            addr: SRAM_10M_AMP2,
+            value: 0x0208,
+        },
+        // Re-enable EEE (Linux: eee_en is true for VER_03–VER_06).
+        PlaWordSetBits {
+            addr: PLA_EEE_CR,
+            bits: EEE_CR_RX_EN | EEE_CR_TX_EN,
+        },
+        OcpRegSetBits {
+            addr: OCP_EEE_CFG,
+            bits: EEE_CFG_EEE10_EN,
+        },
+        OcpRegWrite {
+            addr: OCP_EEE_ADV,
+            value: EEE_ADV_8153,
+        },
+        // Re-enable ALDPS.
+        OcpRegSetBits {
+            addr: OCP_POWER_CFG,
+            bits: POWER_CFG_EN_ALDPS,
+        },
+        // Flow-control advertisement (r8152b_enable_fc).
+        MdioSetBits {
+            reg: MII_ADVERTISE,
+            bits: ADVERTISE_PAUSE_CAP | ADVERTISE_PAUSE_ASYM,
+        },
+    ];
+    if version == RtlVersion::Ver03 {
+        // VER_03 only: clear CTAP_SHORT_EN, immediately after the
+        // EEE disable (Linux's position in the sequence).
+        ops.insert(
+            4,
+            OcpRegClrBits {
+                addr: OCP_EEE_CFG,
+                bits: EEE_CFG_CTAP_SHORT_EN,
+            },
+        );
+    }
+    if version == RtlVersion::Ver05 || version == RtlVersion::Ver06 {
+        ops.push(UsbWordSetBits {
+            addr: USB_U2P3_CTRL,
+            bits: U2P3_ENABLE,
+        });
+    }
+    ops
+}
+
+/// Derive the OCP window access for a PHY register address:
+/// `(base, index)` where the base goes to `PLA_OCP_GPHY_BASE`
+/// and the index is the PLA word access (Linux `ocp_reg_read` /
+/// `ocp_reg_write`).
+pub fn ocp_reg_window(addr: u16) -> (u16, u16) {
+    (addr & 0xF000, (addr & 0x0FFF) | 0xB000)
+}
+
+async fn ocp_reg_read(dev: &USBDevice, addr: u16) -> Result<u16, ()> {
+    let (base, index) = ocp_reg_window(addr);
+    ocp_write_word(dev, MCU_TYPE_PLA, PLA_OCP_GPHY_BASE, base).await?;
+    ocp_read_word(dev, MCU_TYPE_PLA, index).await
+}
+
+async fn ocp_reg_write(dev: &USBDevice, addr: u16, value: u16) -> Result<(), ()> {
+    let (base, index) = ocp_reg_window(addr);
+    ocp_write_word(dev, MCU_TYPE_PLA, PLA_OCP_GPHY_BASE, base).await?;
+    ocp_write_word(dev, MCU_TYPE_PLA, index, value).await
+}
+
+async fn ocp_reg_set_bits(dev: &USBDevice, addr: u16, bits: u16) -> Result<(), ()> {
+    let cur = ocp_reg_read(dev, addr).await?;
+    ocp_reg_write(dev, addr, cur | bits).await
+}
+
+async fn ocp_reg_clr_bits(dev: &USBDevice, addr: u16, bits: u16) -> Result<(), ()> {
+    let cur = ocp_reg_read(dev, addr).await?;
+    ocp_reg_write(dev, addr, cur & !bits).await
+}
+
+async fn pla_word_set_bits(dev: &USBDevice, addr: u16, bits: u16) -> Result<(), ()> {
+    let cur = ocp_read_word(dev, MCU_TYPE_PLA, addr).await?;
+    ocp_write_word(dev, MCU_TYPE_PLA, addr, cur | bits).await
+}
+
+async fn pla_word_clr_bits(dev: &USBDevice, addr: u16, bits: u16) -> Result<(), ()> {
+    let cur = ocp_read_word(dev, MCU_TYPE_PLA, addr).await?;
+    ocp_write_word(dev, MCU_TYPE_PLA, addr, cur & !bits).await
+}
+
+/// Execute one [`PhyInitOp`] against the device.
+async fn apply_phy_init_op(dev: &USBDevice, op: PhyInitOp) -> Result<(), ()> {
+    use PhyInitOp::*;
+    match op {
+        OcpRegSetBits { addr, bits } => ocp_reg_set_bits(dev, addr, bits).await,
+        OcpRegClrBits { addr, bits } => ocp_reg_clr_bits(dev, addr, bits).await,
+        OcpRegWrite { addr, value } => ocp_reg_write(dev, addr, value).await,
+        SramWrite { addr, value } => {
+            ocp_reg_write(dev, OCP_SRAM_ADDR, addr).await?;
+            ocp_reg_write(dev, OCP_SRAM_DATA, value).await
+        }
+        PlaWordSetBits { addr, bits } => pla_word_set_bits(dev, addr, bits).await,
+        PlaWordClrBits { addr, bits } => pla_word_clr_bits(dev, addr, bits).await,
+        UsbWordSetBits { addr, bits } => {
+            let cur = ocp_read_word(dev, MCU_TYPE_USB, addr).await?;
+            ocp_write_word(dev, MCU_TYPE_USB, addr, cur | bits).await
+        }
+        MdioSetBits { reg, bits } => {
+            let addr = OCP_BASE_MII + reg * 2;
+            ocp_reg_set_bits(dev, addr, bits).await
+        }
+        AldpsDisable => {
+            ocp_reg_clr_bits(dev, OCP_POWER_CFG, POWER_CFG_EN_ALDPS).await?;
+            for _ in 0..20 {
+                let poll = ocp_read_word(dev, MCU_TYPE_PLA, PLA_ALDPS_POLL).await?;
+                if poll & ALDPS_POLL_DONE != 0 {
+                    break;
+                }
+                narf_scheduler::yield_now().await;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Run the version-switched PHY init sequence for `version`
+/// before CR RE/TE enable. Unknown and not-yet-ported versions
+/// are a no-op (reset defaults), never a bind failure.
+pub async fn apply_phy_init(dev: &USBDevice, version: RtlVersion) -> Result<(), ()> {
+    for op in r8153_phy_init_ops(version) {
+        apply_phy_init_op(dev, op).await?;
+    }
     Ok(())
 }
 
@@ -463,6 +812,10 @@ pub fn rx_max_size(gen: RtlGen) -> u16 {
 pub struct RtlDevice {
     pub slot_id: u8,
     pub generation: RtlGen,
+    /// Chip version decoded from `PLA_TCR1` at bind (drives the
+    /// version-switched PHY init and later version-gated
+    /// programming such as RX VLAN enable).
+    pub version: RtlVersion,
     pub mac: [u8; 6],
     pub bulk_in_dci: u8,
     pub bulk_out_dci: u8,
@@ -588,9 +941,15 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
         }
         narf_scheduler::yield_now().await;
     }
-    // Chip version (diagnostic; the generation comes from the PID).
-    let version = ocp_read_word(&device, MCU_TYPE_PLA, PLA_TCR1).await? & TCR1_VERSION_MASK;
+    // Chip version: drives the version-switched PHY init below
+    // (issue #881); the generation comes from the PID.
+    let version_raw = ocp_read_word(&device, MCU_TYPE_PLA, PLA_TCR1).await?;
+    let version = version_from_tcr1(version_raw);
     let gen = generation_for_pid(device.product_id());
+    // PHY/firmware init for the chip version, before CR RE/TE
+    // enable. Unknown / not-yet-ported versions are a no-op here
+    // (reset defaults); VER_03–VER_06 run r8153_hw_phy_cfg.
+    apply_phy_init(&device, version).await?;
     // Station address from the device itself — never invented.
     let mac = read_station_address(&device, gen).await?;
     // Multicast table wide open (RCR_AM does the policy), then the
@@ -611,6 +970,7 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
         g.push(RtlDevice {
             slot_id: device.slot_id(),
             generation: gen,
+            version,
             mac,
             bulk_in_dci,
             bulk_out_dci,
@@ -634,10 +994,11 @@ async fn bind(device: Arc<USBDevice>) -> Result<usize, ()> {
     }
     let _ = writeln!(
         narf_console::Writer,
-        "  net: r8152 bound slot {} as {} (gen {:?}, tcr1 version {:#06x}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
+        "  net: r8152 bound slot {} as {} (gen {:?}, tcr1 version {:#06x} {:?}, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
         device.slot_id(),
         assigned,
         gen,
+        version_raw,
         version,
         mac[0],
         mac[1],
@@ -1129,6 +1490,7 @@ pub mod tests {
         let mk = |slot_id: u8, out_dci: u8| RtlDevice {
             slot_id,
             generation: RtlGen::GbE,
+            version: RtlVersion::Ver03,
             mac: [0x02, 0, 0, 0, 0, slot_id],
             bulk_in_dci: 3,
             bulk_out_dci: out_dci,
@@ -1170,6 +1532,7 @@ pub mod tests {
         let mk = |slot_id: u8, out_dci: u8| RtlDevice {
             slot_id,
             generation: RtlGen::GbE,
+            version: RtlVersion::Ver03,
             mac: [0x02, 0, 0, 0, 0, slot_id],
             bulk_in_dci: 3,
             bulk_out_dci: out_dci,
@@ -1288,6 +1651,7 @@ pub mod tests {
             g.push(RtlDevice {
                 slot_id: 7,
                 generation: RtlGen::GbE,
+                version: RtlVersion::Ver03,
                 mac: [0x02, 0, 0, 0, 0, 7],
                 bulk_in_dci: 3,
                 bulk_out_dci: 4,
@@ -1312,5 +1676,280 @@ pub mod tests {
     kernel_test_in!(
         "drivers/usb/r8152",
         smoke_r8152_dispatch_unbind_reaches_detach
+    );
+
+    fn smoke_r8152_version_decode() -> TestResult {
+        // Linux's __rtl_get_hw_ver switch, code for code; low
+        // bits outside the version mask must not change the
+        // verdict (the mask is applied inside the decoder).
+        let cases: &[(u16, RtlVersion)] = &[
+            (0x4C00, RtlVersion::Ver01),
+            (0x4C10, RtlVersion::Ver02),
+            (0x5C00, RtlVersion::Ver03),
+            (0x5C0F, RtlVersion::Ver03),
+            (0x5C10, RtlVersion::Ver04),
+            (0x5C20, RtlVersion::Ver05),
+            (0x5C30, RtlVersion::Ver06),
+            (0x4800, RtlVersion::Ver07),
+            (0x6000, RtlVersion::Ver08),
+            (0x6010, RtlVersion::Ver09),
+            (0x7010, RtlVersion::Test01),
+            (0x7020, RtlVersion::Ver10),
+            (0x7030, RtlVersion::Ver11),
+            (0x7400, RtlVersion::Ver12),
+            (0x7410, RtlVersion::Ver13),
+            (0x6400, RtlVersion::Ver14),
+            (0x7420, RtlVersion::Ver15),
+            (0x1030, RtlVersion::Ver16),
+            (0x2020, RtlVersion::Ver17),
+            (0x0000, RtlVersion::Unknown),
+            (0x7FFF, RtlVersion::Unknown),
+        ];
+        for (raw, want) in cases {
+            if version_from_tcr1(*raw) != *want {
+                return TestResult::Fail("TCR1 version decode wrong");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_version_decode);
+
+    fn smoke_r8152_ocp_reg_window() -> TestResult {
+        // OCP window derivation (Linux ocp_reg_read/write): the
+        // high nibble selects the base, the low 12 bits OR'd
+        // with 0xb000 select the index.
+        if ocp_reg_window(OCP_POWER_CFG) != (0xA000, 0xB430) {
+            return TestResult::Fail("OCP_POWER_CFG window wrong");
+        }
+        if ocp_reg_window(OCP_EEE_ADV) != (0xA000, 0xB5D0) {
+            return TestResult::Fail("OCP_EEE_ADV window wrong");
+        }
+        if ocp_reg_window(OCP_SRAM_ADDR) != (0xA000, 0xB436) {
+            return TestResult::Fail("OCP_SRAM_ADDR window wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_ocp_reg_window);
+
+    fn smoke_r8152_phy_init_table_shape() -> TestResult {
+        // Only VER_03–VER_06 get a sequence; everything else is
+        // reset defaults (empty table, never a bind failure).
+        if !r8153_phy_init_ops(RtlVersion::Ver01).is_empty()
+            || !r8153_phy_init_ops(RtlVersion::Ver08).is_empty()
+            || !r8153_phy_init_ops(RtlVersion::Ver16).is_empty()
+            || !r8153_phy_init_ops(RtlVersion::Unknown).is_empty()
+        {
+            return TestResult::Fail("unported version must have an empty PHY table");
+        }
+        let v03 = r8153_phy_init_ops(RtlVersion::Ver03);
+        let v04 = r8153_phy_init_ops(RtlVersion::Ver04);
+        let v05 = r8153_phy_init_ops(RtlVersion::Ver05);
+        let v06 = r8153_phy_init_ops(RtlVersion::Ver06);
+        // VER_03 carries exactly one more step than VER_04: the
+        // CTAP_SHORT_EN clear at position 4 (right after the EEE
+        // disable).
+        if v03.len() != v04.len() + 1 {
+            return TestResult::Fail("VER_03 table must exceed VER_04 by the CTAP step");
+        }
+        if v03[4]
+            != (PhyInitOp::OcpRegClrBits {
+                addr: OCP_EEE_CFG,
+                bits: EEE_CFG_CTAP_SHORT_EN,
+            })
+        {
+            return TestResult::Fail("VER_03 table must clear CTAP_SHORT_EN fourth");
+        }
+        if v04.iter().any(|op| {
+            *op == (PhyInitOp::OcpRegClrBits {
+                addr: OCP_EEE_CFG,
+                bits: EEE_CFG_CTAP_SHORT_EN,
+            })
+        }) {
+            return TestResult::Fail("VER_04 table must not clear CTAP_SHORT_EN");
+        }
+        // VER_05/VER_06 end with the U2P3 enable; VER_03/VER_04
+        // end with the flow-control advertisement.
+        let u2p3 = PhyInitOp::UsbWordSetBits {
+            addr: USB_U2P3_CTRL,
+            bits: U2P3_ENABLE,
+        };
+        if v05.last() != Some(&u2p3) || v06.last() != Some(&u2p3) {
+            return TestResult::Fail("VER_05/VER_06 tables must end with U2P3 enable");
+        }
+        let fc = PhyInitOp::MdioSetBits {
+            reg: MII_ADVERTISE,
+            bits: ADVERTISE_PAUSE_CAP | ADVERTISE_PAUSE_ASYM,
+        };
+        if v03.last() != Some(&fc) || v04.last() != Some(&fc) {
+            return TestResult::Fail("VER_03/VER_04 tables must end with flow control");
+        }
+        // The sequence opens with ALDPS disable and EEE disable,
+        // in Linux's order.
+        if v03[0] != PhyInitOp::AldpsDisable {
+            return TestResult::Fail("PHY table must open with ALDPS disable");
+        }
+        if v03[1]
+            != (PhyInitOp::PlaWordClrBits {
+                addr: PLA_EEE_CR,
+                bits: EEE_CR_RX_EN | EEE_CR_TX_EN,
+            })
+        {
+            return TestResult::Fail("PHY table must disable EEE second");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/usb/r8152", smoke_r8152_phy_init_table_shape);
+
+    /// Modelled register file for the PHY-init conversation: PLA
+    /// words, OCP PHY registers, SRAM cells, USB-window words and
+    /// MDIO registers as small association lists. The executor
+    /// mirrors the production op semantics (read-modify-write
+    /// for set/clr-bits, two-step SRAM writes); the ALDPS poll
+    /// is modelled as satisfied.
+    struct ModelRegs {
+        pla: Vec<(u16, u16)>,
+        ocp: Vec<(u16, u16)>,
+        sram: Vec<(u16, u16)>,
+        usb: Vec<(u16, u16)>,
+        mdio: Vec<(u16, u16)>,
+    }
+
+    impl ModelRegs {
+        fn get(map: &[(u16, u16)], addr: u16) -> u16 {
+            map.iter()
+                .find(|(a, _)| *a == addr)
+                .map(|(_, v)| *v)
+                .unwrap_or(0)
+        }
+        fn set(map: &mut Vec<(u16, u16)>, addr: u16, value: u16) {
+            if let Some(slot) = map.iter_mut().find(|(a, _)| *a == addr) {
+                slot.1 = value;
+            } else {
+                map.push((addr, value));
+            }
+        }
+        fn apply(&mut self, op: PhyInitOp) {
+            use PhyInitOp::*;
+            match op {
+                OcpRegSetBits { addr, bits } => {
+                    let cur = Self::get(&self.ocp, addr);
+                    Self::set(&mut self.ocp, addr, cur | bits);
+                }
+                OcpRegClrBits { addr, bits } => {
+                    let cur = Self::get(&self.ocp, addr);
+                    Self::set(&mut self.ocp, addr, cur & !bits);
+                }
+                OcpRegWrite { addr, value } => Self::set(&mut self.ocp, addr, value),
+                SramWrite { addr, value } => Self::set(&mut self.sram, addr, value),
+                PlaWordSetBits { addr, bits } => {
+                    let cur = Self::get(&self.pla, addr);
+                    Self::set(&mut self.pla, addr, cur | bits);
+                }
+                PlaWordClrBits { addr, bits } => {
+                    let cur = Self::get(&self.pla, addr);
+                    Self::set(&mut self.pla, addr, cur & !bits);
+                }
+                UsbWordSetBits { addr, bits } => {
+                    let cur = Self::get(&self.usb, addr);
+                    Self::set(&mut self.usb, addr, cur | bits);
+                }
+                MdioSetBits { reg, bits } => {
+                    let addr = OCP_BASE_MII + reg * 2;
+                    let cur = Self::get(&self.mdio, addr);
+                    Self::set(&mut self.mdio, addr, cur | bits);
+                }
+                AldpsDisable => {
+                    let cur = Self::get(&self.ocp, OCP_POWER_CFG);
+                    Self::set(&mut self.ocp, OCP_POWER_CFG, cur & !POWER_CFG_EN_ALDPS);
+                }
+            }
+        }
+    }
+
+    fn smoke_r8152_phy_init_modelled_conversation() -> TestResult {
+        // VER_03 against a modelled register file preloaded with
+        // ALDPS on and CTAP_SHORT_EN set: the conversation must
+        // end with ALDPS re-enabled, EEE on with the 8153
+        // advertisement, the SRAM tuning cells programmed, and
+        // the VER_03-only CTAP clear applied.
+        let mut m = ModelRegs {
+            pla: Vec::new(),
+            ocp: Vec::new(),
+            sram: Vec::new(),
+            usb: Vec::new(),
+            mdio: Vec::new(),
+        };
+        ModelRegs::set(&mut m.ocp, OCP_POWER_CFG, POWER_CFG_EN_ALDPS);
+        ModelRegs::set(&mut m.ocp, OCP_EEE_CFG, EEE_CFG_CTAP_SHORT_EN);
+        for op in r8153_phy_init_ops(RtlVersion::Ver03) {
+            m.apply(op);
+        }
+        let power = ModelRegs::get(&m.ocp, OCP_POWER_CFG);
+        if power != POWER_CFG_EN_ALDPS | POWER_CFG_EEE_CLKDIV_EN | POWER_CFG_EN_10M_PLLOFF {
+            return TestResult::Fail("modelled POWER_CFG end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, OCP_DOWN_SPEED) != DOWN_SPEED_EN_10M_BGOFF {
+            return TestResult::Fail("modelled DOWN_SPEED end state wrong");
+        }
+        if ModelRegs::get(&m.ocp, OCP_EEE_CFG) != EEE_CFG_EEE10_EN {
+            return TestResult::Fail("modelled EEE_CFG end state wrong (CTAP must clear)");
+        }
+        if ModelRegs::get(&m.ocp, OCP_EEE_ADV) != EEE_ADV_8153 {
+            return TestResult::Fail("modelled EEE_ADV end state wrong");
+        }
+        if ModelRegs::get(&m.pla, PLA_EEE_CR) != EEE_CR_RX_EN | EEE_CR_TX_EN {
+            return TestResult::Fail("modelled PLA_EEE_CR end state wrong");
+        }
+        if ModelRegs::get(&m.pla, PLA_PHY_PWR) != PHY_PWR_PFM_PWM_SWITCH {
+            return TestResult::Fail("modelled PLA_PHY_PWR end state wrong");
+        }
+        if ModelRegs::get(&m.sram, SRAM_IMPEDANCE) != 0x0B13
+            || ModelRegs::get(&m.sram, SRAM_LPF_CFG) != 0xF70F
+            || ModelRegs::get(&m.sram, SRAM_10M_AMP1) != 0x00AF
+            || ModelRegs::get(&m.sram, SRAM_10M_AMP2) != 0x0208
+        {
+            return TestResult::Fail("modelled SRAM tuning end state wrong");
+        }
+        if ModelRegs::get(&m.mdio, OCP_BASE_MII + MII_ADVERTISE * 2)
+            != ADVERTISE_PAUSE_CAP | ADVERTISE_PAUSE_ASYM
+        {
+            return TestResult::Fail("modelled MDIO flow-control end state wrong");
+        }
+        // VER_04 from the same preload: CTAP_SHORT_EN survives
+        // (no clear step), everything else matches.
+        let mut m4 = ModelRegs {
+            pla: Vec::new(),
+            ocp: Vec::new(),
+            sram: Vec::new(),
+            usb: Vec::new(),
+            mdio: Vec::new(),
+        };
+        ModelRegs::set(&mut m4.ocp, OCP_POWER_CFG, POWER_CFG_EN_ALDPS);
+        ModelRegs::set(&mut m4.ocp, OCP_EEE_CFG, EEE_CFG_CTAP_SHORT_EN);
+        for op in r8153_phy_init_ops(RtlVersion::Ver04) {
+            m4.apply(op);
+        }
+        if ModelRegs::get(&m4.ocp, OCP_EEE_CFG) != EEE_CFG_EEE10_EN | EEE_CFG_CTAP_SHORT_EN {
+            return TestResult::Fail("VER_04 must preserve CTAP_SHORT_EN");
+        }
+        // VER_05: U2P3 enabled, CTAP untouched.
+        let mut m5 = ModelRegs {
+            pla: Vec::new(),
+            ocp: Vec::new(),
+            sram: Vec::new(),
+            usb: Vec::new(),
+            mdio: Vec::new(),
+        };
+        for op in r8153_phy_init_ops(RtlVersion::Ver05) {
+            m5.apply(op);
+        }
+        if ModelRegs::get(&m5.usb, USB_U2P3_CTRL) != U2P3_ENABLE {
+            return TestResult::Fail("VER_05 must enable U2P3");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usb/r8152",
+        smoke_r8152_phy_init_modelled_conversation
     );
 }
