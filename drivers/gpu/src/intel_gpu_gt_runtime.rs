@@ -396,6 +396,7 @@ pub(crate) fn start_pending() {
             p.index,
             GtPlatform::from_pci(p.device.id.vendor, p.device.id.device)
                 .expect("admitted platform"),
+            p.bar.len,
         );
         let ccs_control = crate::intel_gpu_ccs_control::Control::new(p.index);
         let owner = Arc::new(Owner {

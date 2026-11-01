@@ -960,8 +960,8 @@ fn dma_buf_inode() -> narf_filesystem::inode_id::InodeId {
 }
 
 /// Intel same-card PRIME export. This owns CPU-mappable system pages only;
-/// no foreign-device attachment or imported sync-file fence is admitted while
-/// the Intel userspace engine is unavailable.
+/// foreign-device attachment stays refused. Sync-file imports join the shared
+/// reservation independently of current backend readiness.
 #[cfg(feature = "intel")]
 #[derive(Debug)]
 struct IntelPrimeDmaBufFile {
@@ -1052,6 +1052,19 @@ impl FileOps for IntelPrimeDmaBufFile {
                 DMA_BUF_SET_NAME_A | DMA_BUF_SET_NAME_B | DMA_BUF_IOCTL_EXPORT_SYNC_FILE
             ) {
                 return dma_buf_ioctl(&self.object.dma_buf, cmd, arg, context);
+            }
+            if cmd == DMA_BUF_IOCTL_IMPORT_SYNC_FILE {
+                let mut raw = [0; 8];
+                context.read(arg, &mut raw)?;
+                let flags = u32::from_le_bytes(raw[..4].try_into().unwrap()) as u64;
+                if flags & !DMA_BUF_SYNC_RW != 0 || flags & DMA_BUF_SYNC_RW == 0 {
+                    return Err(FsError::InvalidData);
+                }
+                let fd = i32::from_le_bytes(raw[4..].try_into().unwrap());
+                let fences = context.sync_file_fences(fd).ok_or(FsError::InvalidData)?;
+                self.object
+                    .import_fences(fences, flags & DMA_BUF_SYNC_WRITE != 0);
+                return Ok(0);
             }
             if cmd != DMA_BUF_IOCTL_SYNC {
                 return Err(FsError::Unsupported);

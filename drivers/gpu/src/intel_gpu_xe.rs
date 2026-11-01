@@ -276,10 +276,15 @@ impl XeFile {
         let mut wire = read(user, address, 48)?;
         zero(&wire[16..20])?;
         zero(&wire[32..48])?;
-        if u32_at(&wire, 8) != 0x0001_0001 {
+        let width = u16::from_le_bytes(wire[8..10].try_into().unwrap());
+        let count = u16::from_le_bytes(wire[10..12].try_into().unwrap());
+        // xe_exec_queue.c bounds the copied placement matrix to nine entries.
+        // Parallel multi-LRC execution remains a separate protocol.
+        if width != 1 || !(1..=9).contains(&count) {
             return Err(FsError::InvalidData);
         }
-        let instance = read(user, u64_at(&wire, 24), 8)?;
+        let instances = read(user, u64_at(&wire, 24), usize::from(count) * 8)?;
+        let instance = &instances[..8];
         zero(&instance[4..8])?; // GT0 plus MBZ pad, logical instance may be COPY1.
         let class = u16::from_le_bytes(instance[..2].try_into().unwrap());
         let logical = u16::from_le_bytes(instance[2..4].try_into().unwrap());
@@ -289,9 +294,26 @@ impl XeFile {
             .as_ref()
             .and_then(|b| b.status())
             .map_or_else(Default::default, |status| status.engines);
-        let engine = present.from_class_instance(class, logical);
-        if (class != 5 && engine.is_none()) || (class == 5 && logical != 0) {
+        if class == 5 && (logical != 0 || count != 1) {
             return Err(FsError::InvalidData);
+        }
+        let mut placements = crate::intel_gpu_engine::EngineSet::default();
+        if class != 5 {
+            let mut engines = alloc::vec::Vec::new();
+            for instance in instances.chunks_exact(8) {
+                zero(&instance[4..8])?;
+                let candidate = u16::from_le_bytes(instance[..2].try_into().unwrap());
+                let logical = u16::from_le_bytes(instance[2..4].try_into().unwrap());
+                if candidate != class {
+                    return Err(FsError::InvalidData);
+                }
+                engines.push(
+                    present
+                        .from_class_instance(class, logical)
+                        .ok_or(FsError::InvalidData)?,
+                );
+            }
+            placements = crate::intel_gpu_engine::EngineSet::of(&engines);
         }
         let mut extensions = u64_at(&wire, 0);
         let mut seen = BTreeSet::new();
@@ -315,8 +337,11 @@ impl XeFile {
             }
             extensions = u64_at(&ext, 0);
         }
-        let context =
-            UserContext::for_engine(engine.unwrap_or(crate::intel_gpu_engine::Engine::Rcs0));
+        let context = if class == 5 {
+            UserContext::new()
+        } else {
+            UserContext::for_placements(placements)?
+        };
         context.configure_schedule(priority, timeslice)?;
         let mut names = self.names.lock();
         let vm = names

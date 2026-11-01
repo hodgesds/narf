@@ -1449,3 +1449,6 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_dsb",
     smoke_intel_dsb_reset_and_fault_quarantine_before_fresh_console_or_color_writes
 );
+
+#[path = "intel_gpu_mixed_ioctl_tests.rs"]
+mod mixed;

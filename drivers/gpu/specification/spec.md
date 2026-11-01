@@ -159,9 +159,21 @@ VM_CREATE/DESTROY and EXEC_QUEUE_CREATE/DESTROY/GET_PROPERTY have independent
 per-open namespaces bounded at 64 VMs and 64 queues. Destroying a VM with open
 queues returns EBUSY. Queue destruction removes the handle and refuses pending
 admission while retaining every submitted residency until terminal completion.
-Width 1 RCS0, BCS0, BMG BCS8 and selected compute queues, plus software VM_BIND
-queues, are supported; each queue's `UserContext::for_engine` saves and
-restores only its engine's LRC state. VIDEO classes, and COMPUTE on a GT
+Width-one RCS0, BCS0, BMG BCS8 and selected compute queues, plus software
+VM_BIND queues, are supported. A queue accepts 1..9 copied same-GT/same-class
+placement entries, with duplicates collapsed. VM_BIND remains 1x1. Native
+GuC contexts use the complete dense logical placement mask, one class-compatible
+persistent LRC and firmware engine selection; the host does not pick a physical
+engine. A private restore batch captures hardware ENGINE_ID on every virtual
+restore before marking the timestamp active. Hardware compute class5 is decoded
+separately from GuC/UAPI class4; receipts outside the immutable placement set
+refuse attribution and execution-state capture. Migration-aware watchdogs
+validate live LRCA and receipt/timestamp rereads. Queued work is not charged
+while any allowed engine is making real progress. Diagnostics report an exact
+observed engine or unavailable, plus the placement set; the template engine
+is never substituted for physical evidence. Disable/deregister/final-TLB and
+full-reset ownership rules retain the whole virtual context and residency.
+Width greater than one and parallel execution remain unsupported. VIDEO classes, and COMPUTE on a GT
 without a published compute instance, return EINVAL. `UserStatus::engines` carries the GT's
 published `EngineSet`; ENGINES lists exactly that set in xe_hw_engine order
 and engine-cycle queries for an unpublished class return EINVAL after the
@@ -246,8 +258,8 @@ without changing the request or publishing GPU work; the syscall bridge handles
 signal delivery and SA_RESTART. Completed/failed waits never request a park.
 Finite waits retain their original future/deadline instead of restarting a
 relative timeout on each repoll. Kernel callers without the hook await timers.
-Long-running/fault VMs, multi-engine/parallel queues, scanout/WC iGPU
-allocations, observation and additional native Xe query/property families
+Long-running/fault VMs, parallel queues, observation and additional
+native Xe query/property families
 remain refused until their ownership and hardware contracts are implemented.
 
 #### i915 compatibility profile
@@ -269,8 +281,12 @@ pages after all GEM handles and fds close. Each object also owns one shared
 START waits for conflicting native GPU accesses (a CPU reader waits for writers;
 a CPU writer waits for readers and writers); END orders coherent RAM access.
 DMA_BUF_SET_NAME and EXPORT_SYNC_FILE use that shared state and the common
-fd reservation/copyout/install protocol. Foreign attachments and external
-sync-file imports remain unavailable.
+fd reservation/copyout/install protocol. IMPORT_SYNC_FILE resolves the actual
+sync-file descriptor and atomically publishes its READ/WRITE leaf batch through
+the same reservation admission gate as kernel CPU copies and native jobs.
+Invalid flags precede fd lookup; bad/non-sync descriptors and copy faults
+publish nothing, and an empty signalled-stub batch changes no reservation.
+Foreign attachments remain unavailable.
 
 Compatibility-profile GuC and legacy Gen12 resident submissions check every leaf's
 reservation, reject conflicting work without partial reservation publication,
@@ -280,8 +296,15 @@ dma-fence context: completing one cannot elide another's live dependency.
 Resources release before terminal signalling, including failures after
 reservation and verified reset. Unproven stop, timeout and cancelled waiters
 retain reservations. Scheduling acknowledgments are not terminal events.
-Kernel CPU copies check conflicts under the same admission gate; async
-PREAD/PWRITE wait and retry individual chunks without replaying a copied prefix.
+Fence status and immutable context/sequence callbacks run before the admission
+gate; removed foreign references are dropped after it. Kernel CPU copies and
+implicit jobs require an unchanged reservation addition generation under that
+gate after their outside-lock conflict observation. A racing import therefore
+refuses access without copying bytes or publishing a partial multi-object job.
+Async PREAD/PWRITE wait and retry individual chunks without replaying a copied
+prefix. Xe GPU execution retains its explicit-sync contract: imported ordinary
+READ/WRITE fences do not create hidden GPU waits, while CPU access and sync-file
+exports still observe them and every native terminal fence.
 Existing raw CPU/user mappings still require the trusted submitter's exclusion
 contract; a reservation cannot revoke an already installed mapping.
 
@@ -294,7 +317,7 @@ SW_FINISH also wait for conflicting reservations. Synchronous kernel dispatch
 returns WouldBlock for a pending nonzero wait; primary/render `ioctl_user`
 awaits without retaining IRQ-safe locks. Indefinite side-effect-free user waits
 use `restart_after` when available; finite waits retain their copied deadline.
-Accelerated presentation and dma-buf IMPORT_SYNC_FILE remain unavailable.
+Broader accelerated presentation profiles remain separate work.
 
 Context/VM create, destroy and scalar GET/SETPARAM have per-open namespaces,
 bounded extension chains and retained VM identity after VM-handle destruction.
@@ -972,8 +995,24 @@ remaining accesses. Cached thermal limits require a successful current sensor
 sample; `telemetry_status` reports unavailable/discovery failures. BMG thermal
 files are `temp2_emergency`, `temp2_crit`, `temp2_max`, `temp3_emergency`
 and `temp3_crit`, created once and empty until proven. Writable fan/thermal
-controls and BMG PMT energy remain open; no GUID-addressed telemetry reader
-is admitted.
+controls remain open.
+
+BMG cached PMT energy uses the actual first BAR0 PUNIT descriptor described by
+Xe's synthetic telemetry header; it does not fabricate a PCI DVSEC or accept
+arbitrary GUID/address ranges. The retained GT owner receives the actual BAR
+length and validates descriptor type/access/BIR/size/base bounds plus the
+fixed qualified remapper aperture before access. Each 1 Hz sample rechecks
+full identity, preserves non-telemetry selector fields, selects PUNIT index0
+and verifies selector readback before/after its two independent aligned32-bit
+counter reads and final identity check. Future SoC/remapper clients must share
+this owner before admission. `energy1_input`/label expose card energy and
+`energy2_input`/label package energy in microJoules using fixed 2^-14-Joule
+units. Each counter extends checked32-bit wrap independently. All-ones data,
+changed identity/selector, overflow, backward time or a gap over two seconds
+invalidates both series until a fresh activation; close/resume starts a fresh
+series. Optional PMT refusal preserves unrelated valid sensors. Current
+capability/D0/epoch loss invalidates every cached observation immediately,
+including between ticks. Reads and labels perform no MMIO or wake.
 
 BMG package PL1 extends that same port owner with `POWER_SETUP` read/write
 commands. The existing fan/thermal discovery and PL1 actor share one pending
@@ -998,7 +1037,7 @@ activation starts with passive firmware-source observations again. Errors
 disable the power actor until activation; ambiguous port ownership additionally
 quarantines every mailbox client. Known authority loss clears matching cached
 observations immediately between sampling ticks. PL2/card/time-window controls,
-disabling limits, instantaneous watt telemetry and PMT energy remain open.
+disabling limits and instantaneous watt telemetry remain open.
 
 User-job timeout accounting follows `xe_lrc_timestamp` and `check_timeout`:
 a trusted per-context restore batch marks the saved CTX_TIMESTAMP active, and
@@ -6842,8 +6881,23 @@ retain their existing contracts. Admission copies all color data and retains
 both resulting blob identities through queued/projected state and native
 completion; destroying blobs cannot substitute data under an admitted job.
 
-Color mixed with framebuffer, geometry, route or mode changes refuses before
-MMIO, including TEST_ONLY. Active gamma replacement and jointly changed CTM/
+Geometry, route and mode changes mixed with color refuse before MMIO,
+including TEST_ONLY. A primary framebuffer may join a color transaction only
+on the fixed progressive MTL/Arrow Pipe-A direct profile: WC SCANOUT system
+pages, linear XRGB8888, zero offsets and exactly the existing width/height/pitch.
+The queue retains the framebuffer and both color blobs; mixed requests never
+fall back to a CPU copy. The primary target is staged with fresh completion
+status but no CPU SURF write. DSB0 emits the primary SURF arm after the color
+arms in the same hardware safe window. Successful joint completion requires
+both the native primary flip-done/SURFLIVE witness and DSB/color proofs before
+old-window release, Card state publication, events or out-fence success.
+An abandoned armed mixed request retains both surfaces, commands and a separate
+unpublished marker even after DMA completes. Color-only, ordinary primary,
+observation and legacy accesses refuse it. Only successful joint publication
+or verified full color+surface console restoration/fresh recovery clears it;
+cancelling or failing restoration keeps it. Strict pre-trigger Unsupported
+rolls back just the staged target/mapping and any new baseline presenter,
+preserving confirmed front/color and the prior marker. Active gamma replacement and jointly changed CTM/
 gamma use an independently retained display state buffer (DSB) owner on the
 fixed progressive MTL/Arrow Pipe-A profile. TEST_ONLY validates the retained
 mode and copies blobs without acquiring the hardware owner. Execution also

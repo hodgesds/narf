@@ -69,7 +69,9 @@ pub(crate) enum ContextPhase {
 }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ContextInfo {
-    pub engine: Engine,
+    /// Exact pinned/observed physical engine; never guess a virtual placement.
+    pub engine: Option<Engine>,
+    pub placements: EngineSet,
     pub id: u16,
     pub request_stamp: u32,
     pub phase: ContextPhase,
@@ -300,8 +302,9 @@ impl Snapshot {
         for context in report.contexts.entries() {
             let _ = write!(
                 out,
-                "context {} id={} request={} phase={:?} timed_out={} reset={} runtime_ticks=",
-                engine_name(context.engine),
+                "context {} placements=0x{:02x} id={} request={} phase={:?} timed_out={} reset={} runtime_ticks=",
+                context.engine.map_or("unobserved", engine_name),
+                context.placements.bits(),
                 context.id,
                 context.request_stamp,
                 context.phase,

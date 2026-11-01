@@ -167,6 +167,7 @@ pub struct UserContext {
     /// Orders callers while allowing GT/timer tasks to run during waits.
     pub(crate) serial: Mutex<()>,
     engine: crate::intel_gpu_engine::Engine,
+    placements: crate::intel_gpu_engine::EngineSet,
     state: IrqSafeSpinLock<State>,
 }
 
@@ -177,9 +178,32 @@ impl UserContext {
 
     /// The engine is immutable: saved state belongs to one class's layout.
     pub fn for_engine(engine: crate::intel_gpu_engine::Engine) -> Arc<Self> {
+        Self::with_placements(engine, crate::intel_gpu_engine::EngineSet::of(&[engine]))
+    }
+
+    /// Width-one GuC virtual context. The representative supplies only the
+    /// class-compatible image layout; firmware selects each physical engine.
+    pub(crate) fn for_placements(
+        placements: crate::intel_gpu_engine::EngineSet,
+    ) -> Result<Arc<Self>, FsError> {
+        let engine = placements.iter().next().ok_or(FsError::InvalidData)?;
+        if placements
+            .iter()
+            .any(|candidate| candidate.xe_class() != engine.xe_class())
+        {
+            return Err(FsError::InvalidData);
+        }
+        Ok(Self::with_placements(engine, placements))
+    }
+
+    fn with_placements(
+        engine: crate::intel_gpu_engine::Engine,
+        placements: crate::intel_gpu_engine::EngineSet,
+    ) -> Arc<Self> {
         Arc::new(Self {
             serial: Mutex::new(()),
             engine,
+            placements,
             state: IrqSafeSpinLock::new(State {
                 epoch: 0,
                 busy: false,
@@ -196,6 +220,9 @@ impl UserContext {
 
     pub fn engine(&self) -> crate::intel_gpu_engine::Engine {
         self.engine
+    }
+    pub(crate) fn placements(&self) -> crate::intel_gpu_engine::EngineSet {
+        self.placements
     }
     pub(crate) fn last(&self) -> Option<Arc<CompletionFence>> {
         self.state.lock().last.clone()
@@ -300,6 +327,9 @@ pub(crate) struct ContextClaim {
     published: bool,
 }
 impl ContextClaim {
+    pub(crate) fn placements(&self) -> crate::intel_gpu_engine::EngineSet {
+        self.context.placements
+    }
     pub(crate) fn restore(&self, image: &impl GpuBacking) {
         let state = self.context.state.lock();
         if state.valid {

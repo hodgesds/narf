@@ -37,7 +37,8 @@ fn contexts(total: usize) -> Contexts {
     let mut contexts = Contexts::new(total);
     for n in 0..total {
         contexts.push(ContextInfo {
-            engine: Engine::Rcs0,
+            engine: Some(Engine::Rcs0),
+            placements: EngineSet::of(&[Engine::Rcs0]),
             id: (n + 1) as u16,
             request_stamp: n as u32 + 100,
             phase: ContextPhase::Running,
@@ -123,7 +124,8 @@ fn smoke_intel_error_whitelist_profiles_and_redaction() -> TestResult {
                 "report leaked an address-bearing field"
             );
         }
-        assert!(text.contains("context rcs0 id=1 request=100 phase=Running timed_out=1"));
+        assert!(text
+            .contains("context rcs0 placements=0x01 id=1 request=100 phase=Running timed_out=1"));
     }
     let report = Report::capture(
         capture(

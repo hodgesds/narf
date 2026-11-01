@@ -254,6 +254,12 @@ fn fetchers_idle(
 }
 
 #[derive(Debug)]
+struct Joint {
+    staged: bool,
+    completion: Option<crate::intel_gpu_scanout::Completion>,
+}
+
+#[derive(Debug)]
 struct State<M: Platform> {
     console: ActiveScanout,
     presenter: Option<Presenter<PollIo<M>>>,
@@ -267,8 +273,11 @@ struct State<M: Platform> {
     color: Option<crate::intel_gpu_color::Owner>,
     color_owned: bool,
     color_unpublished: bool,
+    // DMA completion alone cannot publish a cancelled mixed framebuffer.
+    mixed_unpublished: bool,
     dsb: Option<crate::intel_gpu_dsb::Owner<M>>,
     dsb_update: Option<crate::intel_gpu_color::Update>,
+    joint: Option<Joint>,
 }
 
 #[derive(Debug)]
@@ -415,6 +424,7 @@ fn quarantine_reset_state<M: Platform>(state: &Mutex<State<M>>, lost: &AtomicBoo
             || state.presenter.is_some()
             || state.color.is_some()
             || state.color_unpublished
+            || state.mixed_unpublished
             || state.paused
             || state.failed
         {
@@ -472,8 +482,10 @@ impl<M: Platform> Device<M> {
                 color: None,
                 color_owned: false,
                 color_unpublished: false,
+                mixed_unpublished: false,
                 dsb: None,
                 dsb_update: None,
+                joint: None,
             }),
         }
     }
@@ -590,10 +602,12 @@ impl<M: Platform> Device<M> {
         state.presenter = None;
         state.current = None;
         state.pending = None;
+        state.joint = None;
         state.recovery_status = None;
         // All old IO and mappings are closed before making normal accesses
         // valid again; only this new console witness reopens admission.
         drop(console);
+        state.mixed_unpublished = false;
         self.platform.recovery_complete();
         state.failed = false;
         state.blocked = false;
@@ -630,6 +644,7 @@ impl<M: Platform> Device<M> {
             || state.presenter.is_some()
             || state.color.is_some()
             || state.color_unpublished
+            || state.mixed_unpublished
             || state.paused
             || state.failed
         {
@@ -698,6 +713,9 @@ impl<M: Platform> Guard<'_, M> {
         Ok(ticket)
     }
     async fn finish_pending(&mut self) -> Result<Option<FlipStamp>, FsError> {
+        if self.state.joint.is_some() {
+            return Err(FsError::Busy);
+        }
         loop {
             let Some(presenter) = self.state.presenter.as_mut() else {
                 return Ok(None);
@@ -810,13 +828,64 @@ impl<M: Platform> Guard<'_, M> {
         self.state.presenter = Some(presenter);
         Ok(())
     }
+    fn prepare_surface(
+        &mut self,
+        object: Arc<GemObject>,
+        geometry: Geometry,
+    ) -> Result<SurfaceId, FsError> {
+        if let Some((current, id)) = &self.state.current {
+            if Arc::ptr_eq(current, &object) {
+                return Ok(*id);
+            }
+        }
+        self.state
+            .presenter
+            .as_mut()
+            .expect("presenter")
+            .prepare(object, geometry)
+            .map_err(scanout_error)
+    }
+    fn rollback_joint_before_arm(&mut self) -> Result<(), FsError> {
+        if let Some(joint) = &self.state.joint {
+            if joint.staged {
+                // SAFETY: invoked only for the DSB's strict Unsupported
+                // preflight before any command stream was armed/exposed.
+                unsafe {
+                    self.state
+                        .presenter
+                        .as_mut()
+                        .expect("presenter")
+                        .cancel_staged_dsb()
+                }
+                .map_err(scanout_error)
+                .inspect_err(|_| self.state.failed = true)?;
+            }
+            self.state.joint = None;
+            let (_, id) = self.state.pending.take().expect("joint GEM owner");
+            if self
+                .state
+                .current
+                .as_ref()
+                .is_none_or(|(_, front)| *front != id)
+            {
+                self.state
+                    .presenter
+                    .as_mut()
+                    .expect("presenter")
+                    .release(id)
+                    .map_err(scanout_error)
+                    .inspect_err(|_| self.state.failed = true)?;
+            }
+        }
+        Ok(())
+    }
     pub(crate) async fn present(
         &mut self,
         object: Arc<GemObject>,
         geometry: Geometry,
     ) -> Result<FlipStamp, FsError> {
         self.check(geometry)?;
-        if self.state.color_unpublished {
+        if self.state.color_unpublished || self.state.mixed_unpublished {
             return Err(FsError::Busy);
         }
         if !object.is_wc() || !object.scanout() || object.is_vram() || object.is_userptr() {
@@ -825,25 +894,7 @@ impl<M: Platform> Guard<'_, M> {
         self.finish_color().await?;
         self.finish_pending().await?;
         self.start().await?;
-        let id = if let Some((current, id)) = &self.state.current {
-            if Arc::ptr_eq(current, &object) {
-                *id
-            } else {
-                self.state
-                    .presenter
-                    .as_mut()
-                    .expect("presenter")
-                    .prepare(object.clone(), geometry)
-                    .map_err(scanout_error)?
-            }
-        } else {
-            self.state
-                .presenter
-                .as_mut()
-                .expect("presenter")
-                .prepare(object.clone(), geometry)
-                .map_err(scanout_error)?
-        };
+        let id = self.prepare_surface(object.clone(), geometry)?;
         let ticket = self.ticket()?;
         // Record the new owner before arming. Cancellation never unpins it.
         self.state.pending = Some((object, id));
@@ -878,9 +929,17 @@ impl<M: Platform> Guard<'_, M> {
     }
     pub(crate) async fn restore_console(&mut self) -> Result<(), FsError> {
         self.restore_color().await?;
-        self.restore_surface().await
+        self.restore_surface_inner().await?;
+        self.state.mixed_unpublished = false;
+        Ok(())
     }
     pub(crate) async fn restore_surface(&mut self) -> Result<(), FsError> {
+        if self.state.mixed_unpublished {
+            return Err(FsError::Busy);
+        }
+        self.restore_surface_inner().await
+    }
+    async fn restore_surface_inner(&mut self) -> Result<(), FsError> {
         self.finish_color().await?;
         if self.state.color_unpublished {
             return Err(FsError::Busy);
@@ -941,6 +1000,26 @@ impl<M: Platform> Guard<'_, M> {
                     self.device.platform.tick().await;
                     continue;
                 }
+                if self
+                    .state
+                    .joint
+                    .as_ref()
+                    .is_some_and(|joint| joint.completion.is_none())
+                {
+                    let completion = self
+                        .state
+                        .presenter
+                        .as_mut()
+                        .expect("joint presenter")
+                        .poll(self.device.platform.now())
+                        .map_err(scanout_error)
+                        .inspect_err(|_| self.state.failed = true)?;
+                    let Some(completion) = completion else {
+                        self.device.platform.tick().await;
+                        continue;
+                    };
+                    self.state.joint.as_mut().expect("joint state").completion = Some(completion);
+                }
                 let stamp = self
                     .state
                     .dsb
@@ -969,6 +1048,22 @@ impl<M: Platform> Guard<'_, M> {
                         self.state.failed = true;
                     })?;
                 self.state.dsb_update = None;
+                let stamp = if let Some(joint) = self.state.joint.take() {
+                    let completion = joint.completion.expect("joint primary latch");
+                    if let Some(retired) = completion.retired {
+                        self.state
+                            .presenter
+                            .as_mut()
+                            .expect("joint presenter")
+                            .release(retired)
+                            .map_err(scanout_error)
+                            .inspect_err(|_| self.state.failed = true)?;
+                    }
+                    self.state.current = self.state.pending.take();
+                    completion.stamp
+                } else {
+                    stamp
+                };
                 return Ok(Some(stamp));
             }
 
@@ -995,6 +1090,7 @@ impl<M: Platform> Guard<'_, M> {
     ) -> Result<FlipStamp, FsError> {
         self.set_color(coefficients, None).await
     }
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) async fn set_color(
         &mut self,
         coefficients: Option<[u64; 9]>,
@@ -1008,10 +1104,43 @@ impl<M: Platform> Guard<'_, M> {
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
         dsb_timing: Option<crate::intel_gpu_dsb::Timing>,
     ) -> Result<FlipStamp, FsError> {
+        if self.state.mixed_unpublished {
+            return Err(FsError::Busy);
+        }
+        self.color_transaction(coefficients, lut, dsb_timing, None)
+            .await
+    }
+    pub(crate) async fn present_color(
+        &mut self,
+        object: Arc<GemObject>,
+        geometry: Geometry,
+        coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        timing: crate::intel_gpu_dsb::Timing,
+    ) -> Result<FlipStamp, FsError> {
+        self.check(geometry)?;
+        if self.state.color_unpublished || self.state.mixed_unpublished {
+            return Err(FsError::Busy);
+        }
+        if !object.is_wc() || !object.scanout() || object.is_vram() || object.is_userptr() {
+            return Err(FsError::Unsupported);
+        }
+        self.color_transaction(coefficients, lut, Some(timing), Some((object, geometry)))
+            .await
+    }
+    async fn color_transaction(
+        &mut self,
+        coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        dsb_timing: Option<crate::intel_gpu_dsb::Timing>,
+        primary: Option<(Arc<GemObject>, Geometry)>,
+    ) -> Result<FlipStamp, FsError> {
         self.ownership_valid()?;
-        self.finish_pending().await?;
         self.finish_color().await?;
+        self.finish_pending().await?;
         let previously_owned = self.state.color_owned;
+        let had_presenter = self.state.presenter.is_some();
+        let previous_mixed = self.state.mixed_unpublished;
         if self.state.color.is_none() {
             let owner = crate::intel_gpu_color::Owner::capture(
                 &self.device.platform,
@@ -1057,12 +1186,37 @@ impl<M: Platform> Guard<'_, M> {
                     })?;
                     self.state.dsb = Some(dsb);
                 }
-                let update = self
+                let surface = if let Some((object, geometry)) = &primary {
+                    self.start().await?;
+                    let id = self.prepare_surface(object.clone(), *geometry)?;
+                    let ticket = self.ticket()?;
+                    self.state.pending = Some((object.clone(), id));
+                    self.state.mixed_unpublished = true;
+                    self.state.joint = Some(Joint {
+                        staged: false,
+                        completion: None,
+                    });
+                    let arm = self
+                        .state
+                        .presenter
+                        .as_mut()
+                        .expect("joint presenter")
+                        .stage_dsb(id, ticket, self.device.platform.now())
+                        .map_err(scanout_error)?;
+                    self.state.joint.as_mut().expect("joint state").staged = true;
+                    Some(arm)
+                } else {
+                    None
+                };
+                let mut update = self
                     .state
                     .color
                     .as_mut()
                     .expect("color owner")
                     .prepare_dsb(&self.device.platform, coefficients, lut.clone())?;
+                if let Some(surface) = surface {
+                    update.registers.push(surface);
+                }
                 self.state.dsb_update = Some(update);
                 let state = &mut *self.state;
                 let update = state.dsb_update.as_ref().expect("DSB color image");
@@ -1089,6 +1243,8 @@ impl<M: Platform> Guard<'_, M> {
             let prewrite = error == FsError::Unsupported
                 && self.state.dsb.as_ref().is_none_or(|dsb| !dsb.armed());
             if prewrite {
+                self.rollback_joint_before_arm()?;
+                self.state.mixed_unpublished = previous_mixed;
                 if self.state.dsb.as_ref().is_some_and(|dsb| !dsb.exposed()) {
                     self.state.dsb = None;
                 }
@@ -1115,6 +1271,9 @@ impl<M: Platform> Guard<'_, M> {
                         self.state.paused = false;
                     }
                 }
+                if !had_presenter && self.state.presenter.is_some() {
+                    self.restore_surface().await?;
+                }
             } else {
                 self.state.failed = true;
             }
@@ -1140,17 +1299,20 @@ impl<M: Platform> Guard<'_, M> {
             .as_ref()
             .is_none_or(|color| !color.pending()));
         self.state.color_unpublished = false;
+        self.state.mixed_unpublished = false;
     }
     async fn restore_color(&mut self) -> Result<(), FsError> {
         self.finish_color().await?;
         if self.state.color.is_some() {
-            self.set_color(None, None).await?;
+            // Internal full restoration may clear color while keeping the
+            // mixed marker until independent primary restoration also ends.
+            self.color_transaction(None, None, None, None).await?;
         }
         self.state.color_unpublished = false;
         Ok(())
     }
     pub(crate) async fn wait_vblank(&mut self) -> Result<FlipStamp, FsError> {
-        if self.state.presenter.is_some() || self.state.failed {
+        if self.state.presenter.is_some() || self.state.failed || self.state.mixed_unpublished {
             return Err(FsError::Busy);
         }
         let start = self.device.platform.read32(0x70040);

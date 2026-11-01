@@ -126,6 +126,7 @@ struct Pending {
     ticket: u64,
     frame: u32,
     deadline: u64,
+    deferred: bool,
 }
 
 /// Hardware evidence for this particular armed surface. `stamp.ns` is the
@@ -295,7 +296,7 @@ impl<M: ScanoutIo> Presenter<M> {
         if !owner.geometry_matches(geometry) {
             return Err(ScanoutError::Unsupported);
         }
-        owner.arm_observed(SurfaceId(0), console, geometry, 0, now)?;
+        owner.arm_observed(SurfaceId(0), console, geometry, 0, now, false)?;
         Ok(owner)
     }
     fn plane(&self) -> u64 {
@@ -449,14 +450,63 @@ impl<M: ScanoutIo> Presenter<M> {
             return Err(ScanoutError::Unavailable);
         }
         let (offset, geometry) = (surface.offset, surface.geometry);
-        self.arm_target(id, offset, geometry, ticket, now)
+        self.arm_target(id, offset, geometry, ticket, now, false)
+    }
+
+    /// Retain a pending target and fresh primary completion status without
+    /// writing SURF. The exclusive KMS owner emits the returned arm in its
+    /// source-qualified DSB safe window, after color arm registers.
+    pub(crate) fn stage_dsb(
+        &mut self,
+        id: SurfaceId,
+        ticket: u64,
+        now: u64,
+    ) -> Result<(u64, u32), ScanoutError> {
+        self.ready()?;
+        let surface = self.surfaces.get(&id).ok_or(ScanoutError::UnknownSurface)?;
+        if !surface.object.idle(false) {
+            return Err(ScanoutError::Busy);
+        }
+        if !surface.object.publish_for_device() {
+            return Err(ScanoutError::Unavailable);
+        }
+        let (offset, geometry) = (surface.offset, surface.geometry);
+        self.arm_target(id, offset, geometry, ticket, now, true)?;
+        Ok((self.plane() + PLANE_SURF_OFFSET, offset))
+    }
+    /// Roll back only an externally staged target whose DSB was never armed.
+    ///
+    /// # Safety
+    /// Caller proves no command stream capable of issuing this staged SURF
+    /// write was exposed/triggered. Cancellation after DSB arming must retain
+    /// the pending target through ordinary completion or fresh recovery.
+    pub(crate) unsafe fn cancel_staged_dsb(&mut self) -> Result<(), ScanoutError> {
+        self.ready()?;
+        if !self.pending.is_some_and(|pending| pending.deferred) {
+            return Err(ScanoutError::Busy);
+        }
+        if self.io().read32(self.plane() + PLANE_SURF_OFFSET) != self.expected_surface
+            || self.io().read32(self.plane() + SURFLIVE_OFFSET) != self.expected_surface
+        {
+            self.failed = true;
+            return Err(ScanoutError::Unavailable);
+        }
+        self.pending = None;
+        Ok(())
     }
 
     /// Restore the retained console surface through the same fresh hardware
     /// latch proof as a GEM flip. Surface zero is reserved for this target.
     pub fn arm_console(&mut self, ticket: u64, now: u64) -> Result<(), ScanoutError> {
         let geometry = self.console_geometry.ok_or(ScanoutError::Unsupported)?;
-        self.arm_target(SurfaceId(0), self.console_surface, geometry, ticket, now)
+        self.arm_target(
+            SurfaceId(0),
+            self.console_surface,
+            geometry,
+            ticket,
+            now,
+            false,
+        )
     }
 
     pub fn pending(&self) -> bool {
@@ -478,6 +528,7 @@ impl<M: ScanoutIo> Presenter<M> {
         geometry: Geometry,
         ticket: u64,
         now: u64,
+        deferred: bool,
     ) -> Result<(), ScanoutError> {
         self.ready()?;
         if self.pending.is_some() {
@@ -492,7 +543,7 @@ impl<M: ScanoutIo> Presenter<M> {
             self.failed = true;
             return Err(ScanoutError::Unavailable);
         }
-        self.arm_observed(id, offset, geometry, ticket, now)
+        self.arm_observed(id, offset, geometry, ticket, now, deferred)
     }
 
     fn arm_observed(
@@ -502,6 +553,7 @@ impl<M: ScanoutIo> Presenter<M> {
         geometry: Geometry,
         ticket: u64,
         now: u64,
+        deferred: bool,
     ) -> Result<(), ScanoutError> {
         let iir = self.io().read32(self.iir());
         let frame = self.io().read32(self.pipe.base() + FRAMECOUNT_OFFSET);
@@ -523,7 +575,11 @@ impl<M: ScanoutIo> Presenter<M> {
             ticket,
             frame,
             deadline: now.saturating_add(FLIP_TIMEOUT_NS),
+            deferred,
         });
+        if deferred {
+            return Ok(());
+        }
         compiler_fence(Ordering::SeqCst);
         self.io().write32(self.plane() + PLANE_SURF_OFFSET, offset);
         if self.io().read32(self.plane() + PLANE_SURF_OFFSET) != offset {

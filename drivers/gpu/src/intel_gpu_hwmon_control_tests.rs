@@ -113,7 +113,8 @@ impl Drop for Admin {
     }
 }
 fn monitor(platform: GtPlatform) -> Monitor {
-    let monitor = Monitor::new(platform).unwrap();
+    // These control-only fixtures carry no PMT BAR-resource proof.
+    let monitor = Monitor::new(platform, 0).unwrap();
     monitor.activate(7);
     monitor
 }
@@ -658,7 +659,7 @@ kernel_test_in!(
 );
 
 fn smoke_hwmon_sysfs_dg2_power_store_is_admin_gated_queued_and_card_scoped() -> TestResult {
-    let monitor = Monitor::register(989, GtPlatform::Alchemist).unwrap();
+    let monitor = Monitor::register(989, GtPlatform::Alchemist, 0).unwrap();
     let class = class_register("hwmon");
     let node = class
         .child_names()

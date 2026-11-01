@@ -253,6 +253,7 @@ enum Action {
     DropMaster,
     SetMaster,
     Color {
+        primary: bool,
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
         dsb: Option<crate::intel_gpu_dsb::Timing>,
@@ -403,6 +404,7 @@ impl Plan {
         let mut color = None;
         let mut gamma = None;
         let mut color_compatible = true;
+        let mut color_primary = false;
         let mut rect = [
             0,
             0,
@@ -523,11 +525,26 @@ impl Plan {
                                     | CRTC_GAMMA_LUT_PROP_ID
                                     | CRTC_OUT_FENCE_PTR_PROP_ID
                             ))
-                            || (object == PLANE_ID_BASE && prop == PLANE_IN_FENCE_FD_PROP_ID))
+                            || (object == PLANE_ID_BASE
+                                && matches!(
+                                    prop,
+                                    PLANE_IN_FENCE_FD_PROP_ID
+                                        | PLANE_FB_ID_PROP_ID
+                                        | PLANE_CRTC_ID_PROP_ID
+                                        | PLANE_SRC_X_PROP_ID
+                                        | PLANE_SRC_Y_PROP_ID
+                                        | PLANE_SRC_W_PROP_ID
+                                        | PLANE_SRC_H_PROP_ID
+                                        | PLANE_CRTC_X_PROP_ID
+                                        | PLANE_CRTC_Y_PROP_ID
+                                        | PLANE_CRTC_W_PROP_ID
+                                        | PLANE_CRTC_H_PROP_ID
+                                )))
                         {
                             color_compatible = false;
                         }
                         if object == PLANE_ID_BASE {
+                            color_primary |= prop != PLANE_IN_FENCE_FD_PROP_ID;
                             match prop {
                                 PLANE_FB_ID_PROP_ID => {
                                     primary_changed = true;
@@ -645,6 +662,47 @@ impl Plan {
             if !color_compatible || !p.previous.enabled || p.previous.mode.is_none() {
                 return Err(FsError::Unsupported);
             }
+            if color_primary {
+                if rect
+                    != [
+                        0,
+                        0,
+                        geometry.width << 16,
+                        geometry.height << 16,
+                        0,
+                        0,
+                        geometry.width,
+                        geometry.height,
+                    ]
+                    || route != Some(p.next.id)
+                {
+                    return Err(FsError::Unsupported);
+                }
+                let id = fb.ok_or(FsError::Unsupported)?;
+                let target = card.framebuffer(id).map_err(|_| FsError::NotFound)?;
+                let object = target.intel.as_ref().ok_or(FsError::Unsupported)?;
+                if target.width != geometry.width
+                    || target.height != geometry.height
+                    || target.pitch != geometry.pitch
+                    || target.format != PixelFormat::Xrgb8888
+                    || target.modifier != 0
+                    || target.offsets != [0, 0]
+                    || target.chroma_pitch != 0
+                    || !object.object.is_wc()
+                    || !object.object.scanout()
+                    || object.object.is_vram()
+                    || object.object.is_userptr()
+                {
+                    return Err(FsError::Unsupported);
+                }
+                if u64::from(target.pitch) * u64::from(geometry.height) > object.object.size() {
+                    return Err(FsError::InvalidData);
+                }
+                p.framebuffer = Some(target.clone());
+                p.next.primary_fb = Some(id);
+                p.next.x = 0;
+                p.next.y = 0;
+            }
             if let Some(blob) = color {
                 p.next_ctm = blob;
             }
@@ -653,7 +711,8 @@ impl Plan {
             }
             // MTL's single-buffered LUT and independent color arms require
             // the owned DSB chain for active replacement/combined changes.
-            let needs_dsb = (p.next_ctm != p.previous_ctm && p.next_gamma != p.previous_gamma)
+            let needs_dsb = color_primary
+                || (p.next_ctm != p.previous_ctm && p.next_gamma != p.previous_gamma)
                 || (p.previous_gamma != 0 && p.next_gamma != 0 && p.next_gamma != p.previous_gamma);
             let dsb = needs_dsb.then_some(crate::intel_gpu_dsb::Timing {
                 clock: wire.clock,
@@ -687,6 +746,7 @@ impl Plan {
                 )?)
             };
             p.action = Action::Color {
+                primary: color_primary,
                 coefficients,
                 lut,
                 dsb,
@@ -853,6 +913,16 @@ trait Backend {
     ) -> FsFuture<'_, FlipStamp> {
         Box::pin(async { Err(FsError::Unsupported) })
     }
+    fn present_color(
+        &mut self,
+        _object: Arc<crate::intel_gpu_gem::GemObject>,
+        _geometry: Geometry,
+        _coefficients: Option<[u64; 9]>,
+        _lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        _timing: crate::intel_gpu_dsb::Timing,
+    ) -> FsFuture<'_, FlipStamp> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
     fn vblank(&mut self) -> FsFuture<'_, FlipStamp>;
     fn copy<'a>(&'a mut self, frame: &'a Framebuffer, mode: &'a ModeState) -> FsFuture<'a, ()> {
         alloc::boxed::Box::pin(copy_frame(frame, mode, self.console_fb()))
@@ -895,6 +965,16 @@ impl<M: crate::intel_gpu_kms::Platform> Backend for crate::intel_gpu_kms::Guard<
         dsb: Option<crate::intel_gpu_dsb::Timing>,
     ) -> FsFuture<'_, FlipStamp> {
         Box::pin(self.set_color_with_dsb(coefficients, lut, dsb))
+    }
+    fn present_color(
+        &mut self,
+        object: Arc<crate::intel_gpu_gem::GemObject>,
+        geometry: Geometry,
+        coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        timing: crate::intel_gpu_dsb::Timing,
+    ) -> FsFuture<'_, FlipStamp> {
+        Box::pin(self.present_color(object, geometry, coefficients, lut, timing))
     }
     fn vblank(&mut self) -> FsFuture<'_, FlipStamp> {
         alloc::boxed::Box::pin(self.wait_vblank())
@@ -1134,11 +1214,25 @@ async fn execute_plan<B: Backend>(
             stamp = Some(backend.vblank().await?);
         }
         Action::Color {
+            primary,
             coefficients,
             lut,
             dsb,
         } => {
-            stamp = Some(backend.color(*coefficients, lut.clone(), *dsb).await?);
+            stamp = Some(if *primary {
+                let object = direct_object(plan.framebuffer.as_ref().ok_or(FsError::InvalidData)?)?;
+                backend
+                    .present_color(
+                        object,
+                        plan.geometry,
+                        *coefficients,
+                        lut.clone(),
+                        dsb.ok_or(FsError::Unsupported)?,
+                    )
+                    .await?
+            } else {
+                backend.color(*coefficients, lut.clone(), *dsb).await?
+            });
         }
         Action::Present => {
             let fb = plan.framebuffer.as_ref().ok_or(FsError::InvalidData)?;
@@ -1227,8 +1321,8 @@ async fn execute_plan<B: Backend>(
                 | Action::Observe
                 | Action::Cursor(_)
                 | Action::SetMaster
-                | Action::Color { .. } => {}
-                Action::Present | Action::Restore => {
+                | Action::Color { primary: false, .. } => {}
+                Action::Present | Action::Restore | Action::Color { primary: true, .. } => {
                     *card.crtc_mut(plan.next.id).map_err(|_| FsError::NotFound)? =
                         plan.next.clone();
                 }

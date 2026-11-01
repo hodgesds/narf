@@ -891,10 +891,10 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 let image = w.0.borrow().memory[&(request[10] & !0xfff)].clone();
                 assert_eq!(image.borrow()[1024 + 0x33] != 0, request[10] & 0x100 != 0);
                 let base = match request[3] {
-                    3 if request[4] == 2 => 0x3ee244,
+                    3 if request[4] & 1 == 0 => 0x3ee244,
                     3 => 0x22244,
                     4 => {
-                        assert!(request[4].is_power_of_two() && request[4] <= 8);
+                        assert!(request[4] != 0 && request[4] <= 15);
                         let logical = request[4].trailing_zeros() as usize;
                         let ads = w.0.borrow().memory[&0x20001000].clone();
                         let physical = (ads.borrow()[(0x123c + 128 + logical / 4 * 4) / 4]
@@ -906,11 +906,19 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 };
                 assert!(
                     request[4] == 1
-                        || (request[3] == 3 && request[4] == 2)
-                        || (request[3] == 4 && request[4].is_power_of_two() && request[4] <= 8)
+                        || (request[3] == 3 && matches!(request[4], 2 | 3))
+                        || (request[3] == 4 && request[4] != 0 && request[4] <= 15)
                 );
                 assert_eq!(image.borrow()[1024 + 2], base);
                 assert_eq!(request[11], 0);
+                if request[4].count_ones() > 1 {
+                    assert!(w
+                        .0
+                        .borrow_mut()
+                        .virtual_contexts
+                        .insert(request[10] & !0xfff, (request[3], request[4]),)
+                        .is_none());
+                }
                 assert!(registered
                     .insert(request[2], request[10] & !0xfff)
                     .is_none());
@@ -927,6 +935,9 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 let id = request[1];
                 let base = registered[&id];
                 let first = w.0.borrow().memory[&base].borrow()[1024 + 2];
+                if request[2] == 1 && execute {
+                    execute_virtual_restore(w, base, true);
+                }
                 if request[2] == 1 && execute && matches!(first, 0x22244 | 0x3ee244) {
                     execute_copy(w, base);
                 } else if request[2] == 1
@@ -1012,7 +1023,8 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 event(&memory, 0x1002, &[id, request[2]]);
             }
             0x4503 => {
-                assert!(registered.remove(&request[1]).is_some());
+                let base = registered.remove(&request[1]).expect("registered identity");
+                w.0.borrow_mut().virtual_contexts.remove(&base);
                 event(&memory, 0x4600, &[request[1]]);
             }
             0x3003 => service_slpc(w, &memory, control_fence, &request),
@@ -1021,6 +1033,84 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
         }
     }
     actions
+}
+
+// Independent GuC choice plus hardware restore execution. The production
+// driver supplies only the logical mask; the model chooses the last allowed
+// engine by default, deliberately different from the first LRC template.
+fn execute_virtual_restore(w: &Window, base: u32, start_ring: bool) {
+    let mut d = w.0.borrow_mut();
+    let Some(&(class, mask)) = d.virtual_contexts.get(&base) else {
+        return;
+    };
+    let logical = d.virtual_pick.unwrap_or(31 - mask.leading_zeros());
+    assert_ne!(
+        mask & (1 << logical),
+        0,
+        "GuC choice outside registered mask"
+    );
+    let physical = if class == 3 {
+        assert!(logical <= 1);
+        logical * 8
+    } else {
+        assert_eq!(class, 4);
+        let ads = d.memory[&0x20001000].borrow();
+        (ads[(0x123c + 128 + logical as usize / 4 * 4) / 4] >> (logical % 4 * 8)) & 255
+    };
+    let receipt = physical << 4 | if class == 4 { 5 } else { 3 };
+    let image = d.memory[&base].clone();
+    let mut image = image.borrow_mut();
+    assert_eq!(image[1024 + 0x13], base + 0x901);
+    assert_eq!(
+        &image[0x900 / 4..0x920 / 4],
+        &[
+            0x12480002,
+            0x8c,
+            base + 0x818,
+            0,
+            0x10400002,
+            base + 0x108c,
+            0,
+            1,
+        ]
+    );
+    if d.regs[&0xd8c] >> 22 == 20 {
+        assert_eq!(
+            &image[0x920 / 4..0x934 / 4],
+            &[0x10400002, base + 0x1094, 0, 0, 0x05000000,]
+        );
+    } else {
+        assert_eq!(image[0x920 / 4], 0x05000000);
+    }
+    image[0x818 / 4] = receipt;
+    image[0x108c / 4] = 1;
+    if start_ring {
+        let ring = d.memory[&image[1024 + 9]].borrow();
+        assert_eq!(&ring[..4], &[0x12480002, 0x3a8, base + 0x810, 0]);
+        let (address, stamp) = if class == 3 {
+            assert_eq!(ring[6], 0x13044002);
+            (ring[7] & !7, ring[9])
+        } else {
+            assert_eq!(ring[4], 0x10400002);
+            (ring[5], ring[7])
+        };
+        assert_eq!(address, base + 0x808);
+        assert_ne!(stamp, 0);
+        image[0x808 / 4] = stamp;
+        image[0x810 / 4] = 0;
+    }
+    let engine_base = if class == 3 {
+        if physical == 8 {
+            0x3ee000
+        } else {
+            0x22000
+        }
+    } else {
+        [0x1a000, 0x1c000, 0x1e000, 0x26000][physical as usize]
+    };
+    d.regs.insert(engine_base + 0x240, base);
+    d.regs.insert(engine_base + 0x3a8, 1_000_000);
+    d.virtual_restores.push((base, receipt));
 }
 
 // Independent BCS0 model from Linux xe_lrc.c {gen12_xcs,xe2_bcs}_offsets,

@@ -10,7 +10,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use narf_filesystem::dma_buf::{dma_resv_usage_rw, DmaBufObject, DmaResvUsage};
+use narf_filesystem::dma_buf::{dma_resv_usage_rw, DmaBufObject, DmaResvFence, DmaResvUsage};
 use narf_filesystem::{FsError, MmapBacking};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::frame::{alloc_frame, free_frame, PhysFrame};
@@ -22,8 +22,9 @@ const MAX_OBJECTS: usize = 4096;
 const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 static LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 static NEXT_MMAP: AtomicU64 = AtomicU64::new(MMAP_BASE);
-// All native reservation writers and kernel CPU copies take this gate. No
-// foreign fence imports are exposed. Never retain the gate across an await.
+// All reservation writers, including PRIME imports, and kernel CPU copies
+// take this gate. Poll foreign fences/identity before it; retire references
+// after it. Never retain the gate across an await or user-memory callback.
 static RESERVATIONS: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 
 #[derive(Debug)]
@@ -222,10 +223,10 @@ impl GemObject {
 
     /// i915 render-class reader (upper bits) and writer (lower bits).
     pub fn busy(&self) -> u32 {
-        let _gate = RESERVATIONS.lock();
-        if !self.dma_buf.resv.fences(DmaResvUsage::Write).is_empty() {
+        let snapshot = self.dma_buf.resv.snapshot();
+        if snapshot.has_fences(DmaResvUsage::Write) {
             0x10001
-        } else if !self.dma_buf.resv.fences(DmaResvUsage::Read).is_empty() {
+        } else if snapshot.has_fences(DmaResvUsage::Read) {
             0x10000
         } else {
             0
@@ -257,6 +258,33 @@ impl GemObject {
             let delay = deadline.map_or(100_000, |end| (end - now).min(100_000));
             narf_time::SleepUntil::new(narf_time::Deadline::after_ns(delay).as_instant()).await;
         }
+    }
+
+    /// IMPORT_SYNC_FILE: descriptor lookup and all foreign fence callbacks
+    /// precede the common CPU/GPU admission lock; mutation is one batch.
+    pub(crate) fn import_fences(
+        &self,
+        fences: Vec<Arc<dyn narf_filesystem::DrmFence>>,
+        write: bool,
+    ) {
+        if fences.is_empty() {
+            return;
+        }
+        let usage = if write {
+            DmaResvUsage::Write
+        } else {
+            DmaResvUsage::Read
+        };
+        let prepared: Vec<_> = fences
+            .into_iter()
+            .map(|fence| (DmaResvFence::new(fence), usage))
+            .collect();
+        let snapshot = self.dma_buf.resv.snapshot();
+        let retired = {
+            let _gate = RESERVATIONS.lock();
+            self.dma_buf.resv.add_prepared(&snapshot, &prepared)
+        };
+        drop(retired);
     }
 
     pub(crate) fn publish_for_device(&self) -> bool {
@@ -315,8 +343,9 @@ impl GemObject {
 
     pub fn read(&self, offset: u64, bytes: &mut [u8]) -> Result<(), FsError> {
         self.range(offset, bytes.len())?;
+        let snapshot = self.dma_buf.resv.snapshot();
         let _reservation = RESERVATIONS.lock();
-        if !self.idle(false) {
+        if !snapshot.is_current() || snapshot.has_fences(dma_resv_usage_rw(false)) {
             return Err(FsError::WouldBlock);
         }
         let _guard = self.cpu.lock();
@@ -339,8 +368,9 @@ impl GemObject {
 
     pub fn write(&self, offset: u64, bytes: &[u8]) -> Result<(), FsError> {
         self.range(offset, bytes.len())?;
+        let snapshot = self.dma_buf.resv.snapshot();
         let _reservation = RESERVATIONS.lock();
-        if !self.idle(true) {
+        if !snapshot.is_current() || snapshot.has_fences(dma_resv_usage_rw(true)) {
             return Err(FsError::WouldBlock);
         }
         let _guard = self.cpu.lock();
@@ -383,40 +413,77 @@ pub(crate) fn reserve_gpu(
     objects: &[(Arc<GemObject>, bool)],
     completion: &Arc<crate::intel_gpu_fence::CompletionFence>,
 ) -> Result<(), FsError> {
-    let _gate = RESERVATIONS.lock();
-    if objects.iter().any(|(object, write)| !object.idle(*write)) {
+    let prepared = DmaResvFence::new(completion.clone());
+    let snapshots: Vec<_> = objects
+        .iter()
+        .map(|(object, _)| object.dma_buf.resv.snapshot())
+        .collect();
+    if snapshots
+        .iter()
+        .zip(objects)
+        .any(|(snapshot, (_, write))| snapshot.has_fences(dma_resv_usage_rw(*write)))
+    {
         return Err(FsError::WouldBlock);
     }
-    for (object, write) in objects {
-        object.dma_buf.resv.add_fence(
-            completion.clone(),
-            if *write {
-                DmaResvUsage::Write
-            } else {
-                DmaResvUsage::Read
-            },
-        );
-    }
+    let retired: Vec<_> = {
+        let _gate = RESERVATIONS.lock();
+        if snapshots.iter().any(|snapshot| !snapshot.is_current()) {
+            return Err(FsError::WouldBlock);
+        }
+        objects
+            .iter()
+            .zip(&snapshots)
+            .map(|((object, write), snapshot)| {
+                object.dma_buf.resv.add_prepared(
+                    snapshot,
+                    &[(
+                        prepared.clone(),
+                        if *write {
+                            DmaResvUsage::Write
+                        } else {
+                            DmaResvUsage::Read
+                        },
+                    )],
+                )
+            })
+            .collect()
+    };
+    drop(retired);
     Ok(())
 }
 
-/// Xe GPU clients supply explicit ordering. Multiple GPU writers may overlap,
-/// but every terminal fence remains in dma_resv to exclude kernel CPU copies.
+/// Xe GPU clients supply explicit ordering. Imported READ/WRITE fences do not
+/// create hidden GPU dependencies; every terminal fence still excludes CPU IO.
 pub(crate) fn reserve_gpu_explicit(
     objects: &[(Arc<GemObject>, bool)],
     completion: &Arc<crate::intel_gpu_fence::CompletionFence>,
 ) {
-    let _gate = RESERVATIONS.lock();
-    for (object, write) in objects {
-        object.dma_buf.resv.add_fence(
-            completion.clone(),
-            if *write {
-                DmaResvUsage::Write
-            } else {
-                DmaResvUsage::Read
-            },
-        );
-    }
+    let prepared = DmaResvFence::new(completion.clone());
+    let snapshots: Vec<_> = objects
+        .iter()
+        .map(|(object, _)| object.dma_buf.resv.snapshot())
+        .collect();
+    let retired: Vec<_> = {
+        let _gate = RESERVATIONS.lock();
+        objects
+            .iter()
+            .zip(&snapshots)
+            .map(|((object, write), snapshot)| {
+                object.dma_buf.resv.add_prepared(
+                    snapshot,
+                    &[(
+                        prepared.clone(),
+                        if *write {
+                            DmaResvUsage::Write
+                        } else {
+                            DmaResvUsage::Read
+                        },
+                    )],
+                )
+            })
+            .collect()
+    };
+    drop(retired);
 }
 
 impl Drop for GemObject {
@@ -670,3 +737,7 @@ mod tests {
         smoke_reservations_conflicts_aliases_and_rollback
     );
 }
+
+#[cfg(feature = "kernel-test")]
+#[path = "intel_gpu_prime_sync_tests.rs"]
+mod prime_sync_tests;

@@ -1,11 +1,11 @@
-//! Cached dGPU telemetry and bounded DG2 PL1 requests, serviced by the
+//! Cached dGPU telemetry and bounded DG2/BMG PL1 requests, serviced by the
 //! retained GT reset/power owner.
 //!
 //! MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad:
 //! xe_hwmon.c::{xe_hwmon_get_reg,xe_hwmon_temp_read,xe_hwmon_get_voltage,
 //! xe_hwmon_energy_get}, regs/{xe_mchbar_regs,xe_pcode_regs,xe_gt_regs}.h.
 //! Sysfs reads use cached observations, never wake the GPU or touch MMIO.
-//! BMG PMT energy and mailbox power-source/control changes remain separate.
+//! BMG PMT energy uses this same owner's bounded BAR0/remapper transaction.
 
 use alloc::{format, string::String, sync::Arc};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -20,6 +20,8 @@ use crate::{intel_gpu_aux::MmioWindow, intel_gpu_gt::GtPlatform};
 mod bmg_power;
 #[path = "intel_gpu_hwmon_pcode.rs"]
 mod pcode;
+#[path = "intel_gpu_hwmon_pmt.rs"]
+mod pmt;
 #[path = "intel_gpu_hwmon_power.rs"]
 mod power;
 
@@ -121,6 +123,9 @@ struct State {
     reading: Option<Reading>,
     energy: Option<Energy>,
     energy_lost: bool,
+    pmt: pmt::Energy,
+    pmt_sampled: Option<u64>,
+    pmt_reading: Option<[u64; 2]>,
     discovery: pcode::Discovery,
     mailbox: pcode::Mailbox,
     fan_sampled: Option<u64>,
@@ -133,18 +138,20 @@ struct State {
 #[derive(Debug)]
 pub(crate) struct Monitor {
     platform: GtPlatform,
+    bar_len: u64,
     admission: AtomicU64,
     state: IrqSafeSpinLock<State>,
     power: power::Power,
     bmg_power: bmg_power::Power,
 }
 impl Monitor {
-    fn new(platform: GtPlatform) -> Option<Self> {
+    fn new(platform: GtPlatform, bar_len: u64) -> Option<Self> {
         if !matches!(platform, GtPlatform::Alchemist | GtPlatform::Battlemage) {
             return None;
         }
         Some(Self {
             platform,
+            bar_len,
             admission: AtomicU64::new(0),
             state: IrqSafeSpinLock::new(State {
                 epoch: 0,
@@ -152,6 +159,9 @@ impl Monitor {
                 reading: None,
                 energy: None,
                 energy_lost: false,
+                pmt: pmt::Energy::default(),
+                pmt_sampled: None,
+                pmt_reading: None,
                 discovery: pcode::Discovery::default(),
                 mailbox: pcode::Mailbox::default(),
                 fan_sampled: None,
@@ -163,8 +173,8 @@ impl Monitor {
         })
     }
 
-    pub(crate) fn register(index: u32, platform: GtPlatform) -> Option<Arc<Self>> {
-        let monitor = Arc::new(Self::new(platform)?);
+    pub(crate) fn register(index: u32, platform: GtPlatform, bar_len: u64) -> Option<Arc<Self>> {
+        let monitor = Arc::new(Self::new(platform, bar_len)?);
         monitor.publish(index);
         Some(monitor)
     }
@@ -176,6 +186,9 @@ impl Monitor {
         state.reading = None;
         state.energy = None;
         state.energy_lost = false;
+        state.pmt = pmt::Energy::default();
+        state.pmt_sampled = None;
+        state.pmt_reading = None;
         state.discovery = pcode::Discovery::default();
         state.mailbox = pcode::Mailbox::default();
         state.fan_sampled = None;
@@ -194,6 +207,9 @@ impl Monitor {
         state.sampled = None;
         state.energy = None;
         state.energy_lost = false;
+        state.pmt = pmt::Energy::default();
+        state.pmt_sampled = None;
+        state.pmt_reading = None;
         state.discovery = pcode::Discovery::default();
         state.mailbox = pcode::Mailbox::default();
         state.fan_sampled = None;
@@ -244,6 +260,8 @@ impl Monitor {
         state.reading = None;
         state.energy = None;
         state.energy_lost = true;
+        state.pmt.invalidate();
+        state.pmt_reading = None;
         state.fans = [None; 3];
         state.fan_rpm = [None; 3];
         // Preserve timestamps and discovery diagnostics, including a pending
@@ -290,6 +308,33 @@ impl Monitor {
         }
         self.sample(epoch, now, |offset| io.read(offset));
         self.sample_fans(epoch, now, io);
+        if self.platform == GtPlatform::Battlemage {
+            self.sample_pmt(epoch, now, io)
+        }
+    }
+
+    fn sample_pmt(&self, epoch: u64, now: u64, io: &mut impl Io) {
+        let mut pmt = {
+            let state = self.state.lock();
+            if epoch == 0
+                || state.epoch != epoch
+                || self.admission.load(Ordering::Acquire) != epoch
+                || state
+                    .pmt_sampled
+                    .is_some_and(|at| now >= at && now - at < INTERVAL_NS)
+            {
+                return;
+            }
+            state.pmt
+        };
+        let reading = pmt.sample(self.bar_len, now, io);
+        let mut state = self.state.lock();
+        if state.epoch != epoch || self.admission.load(Ordering::Acquire) != epoch {
+            return;
+        }
+        state.pmt = pmt;
+        state.pmt_reading = reading;
+        state.pmt_sampled = Some(now);
     }
 
     fn sample_fans(&self, epoch: u64, now: u64, io: &mut impl Io) {
@@ -448,6 +493,29 @@ impl Monitor {
     }
 
     fn show(&self, attribute: &str, now: u64) -> String {
+        if self.platform == GtPlatform::Battlemage {
+            let index = match attribute {
+                "energy1_label" => return "card\n".into(),
+                "energy2_label" => return "pkg\n".into(),
+                "energy1_input" => Some(1),
+                "energy2_input" => Some(0),
+                _ => None,
+            };
+            if let Some(index) = index {
+                let state = self.state.lock();
+                if state.epoch == 0
+                    || self.admission.load(Ordering::Acquire) != state.epoch
+                    || state
+                        .pmt_sampled
+                        .is_none_or(|at| now < at || now - at > MAX_AGE_NS)
+                {
+                    return String::new();
+                }
+                return state
+                    .pmt_reading
+                    .map_or_else(String::new, |v| format!("{}\n", v[index]));
+            }
+        }
         if attribute.starts_with("power2_") {
             return if attribute == "power2_label" {
                 "pkg\n".into()
@@ -556,6 +624,17 @@ impl Monitor {
             }
         } else {
             for attribute in [
+                "energy1_input",
+                "energy1_label",
+                "energy2_input",
+                "energy2_label",
+            ] {
+                let monitor = self.clone();
+                kobject_add_attr(&node, attribute, move || {
+                    monitor.show(attribute, narf_time::monotonic_ns())
+                });
+            }
+            for attribute in [
                 "temp2_emergency",
                 "temp2_crit",
                 "temp2_max",
@@ -638,3 +717,7 @@ mod tests;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_hwmon_control_tests.rs"]
 mod control_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "intel_gpu_hwmon_pmt_tests.rs"]
+mod pmt_tests;

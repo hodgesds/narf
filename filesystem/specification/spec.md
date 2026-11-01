@@ -447,6 +447,11 @@ pub mod dma_buf {
     pub enum DmaResvUsage { Kernel, Write, Read, Bookkeep }
     pub fn dma_resv_usage_rw(write: bool) -> DmaResvUsage;
     pub struct DmaResv;        // add_fence(fence, usage), fences(usage), generation()
+    pub struct DmaResvFence;   // new(Arc<dyn DrmFence>): immutable identity
+    pub struct DmaResvSnapshot<'a>; // has_fences(usage), is_current()
+    pub struct DmaResvRetired; // drop after releasing driver admission locks
+    // DmaResv::snapshot() polls outside locks; add_prepared(snapshot, batch)
+    // publishes without fence callbacks and returns retired references.
     pub struct DmaBufObject { pub resv: DmaResv, /* name */ }
     pub fn dma_buf_ioctl(obj: &DmaBufObject, cmd: u32, arg: u64,
                          ctx: &dyn IoctlContext) -> Result<u64, FsError>;
@@ -1428,8 +1433,20 @@ for NARF's coherent exporters), `DMA_BUF_SET_NAME_A/_B` (`strndup_user` with
 `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` with Linux's flag checks and errno order;
 anything else is `ENOTTY`. `DmaResv` follows `dma_resv_add_fence`
 (same-context replacement, signalled-fence reuse) and `dma_resv_get_fences`
-(unsignalled fences with usage ≤ the query). sync_file fds belong to the
-syscall layer: `IoctlContext::sync_file_fences` is `sync_file_get_fence` +
+(unsignalled fences with usage ≤ the query). Immutable fence context/sequence
+metadata is captured before reservation locking. `snapshot()` retains one
+addition generation and polls every captured fence after dropping that lock.
+A driver may then check `has_fences(usage)` outside its admission lock and
+`is_current()` under it before CPU access or implicit GPU admission. All
+reservation writers on that exporter must share the same admission lock.
+`add_prepared(snapshot, batch)` publishes pre-captured identities without
+foreign callbacks. A stale snapshot can prune only its already-terminal
+entries; it never discards later work. It returns `DmaResvRetired`, whose final
+references must be dropped after the admission lock. Retain snapshots and
+prepared inputs until that lock is dropped too. Empty batches change nothing.
+This also avoids foreign destructor callbacks while either lock is held.
+
+sync_file fds belong to the syscall layer: `IoctlContext::sync_file_fences` is `sync_file_get_fence` +
 `dma_fence_unwrap` (`None` for a bad fd or a non-sync_file), and
 `install_sync_file` reserves an `O_CLOEXEC` descriptor (`NoDescriptor` =
 `EMFILE`), builds `dma_resv_get_singleton`'s result (stub, the fence, or a

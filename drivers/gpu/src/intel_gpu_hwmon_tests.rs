@@ -28,11 +28,12 @@ fn ready<T>(future: impl Future<Output = T>) -> T {
 }
 
 fn smoke_hwmon_dg2_native_sample_units_and_whitelist() -> TestResult {
-    assert!(Monitor::new(GtPlatform::Integrated(
-        crate::intel_gpu::Generation::MeteorLake
-    ))
+    assert!(Monitor::new(
+        GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
+        0
+    )
     .is_none());
-    let monitor = Monitor::new(GtPlatform::Alchemist).unwrap();
+    let monitor = Monitor::new(GtPlatform::Alchemist, 0).unwrap();
     let mut accesses = Vec::new();
     monitor.sample(7, 0, |_| panic!("unactivated sensor read hardware"));
     monitor.activate(7);
@@ -56,7 +57,7 @@ kernel_test_in!(
 );
 
 fn smoke_hwmon_bmg_temperature_channels_and_signed_integer_source_format() -> TestResult {
-    let monitor = Monitor::new(GtPlatform::Battlemage).unwrap();
+    let monitor = Monitor::new(GtPlatform::Battlemage, 0).unwrap();
     monitor.activate(8);
     let mut accesses = Vec::new();
     monitor.sample(8, 0, |register| {
@@ -112,7 +113,7 @@ fn smoke_hwmon_production_mmio_gate_distinguishes_optional_absence_from_loss() -
             panic!("telemetry wrote hardware");
         }
     }
-    let monitor = Monitor::new(GtPlatform::Battlemage).unwrap();
+    let monitor = Monitor::new(GtPlatform::Battlemage, 0).unwrap();
     let io = Sensors(core::cell::RefCell::new(Vec::new()));
     monitor.activate(7);
     monitor.service_mmio(7, 0, &io, || true);
@@ -133,7 +134,7 @@ kernel_test_in!(
 );
 
 fn smoke_hwmon_rate_freshness_epoch_and_close_during_capture() -> TestResult {
-    let monitor = Monitor::new(GtPlatform::Alchemist).unwrap();
+    let monitor = Monitor::new(GtPlatform::Alchemist, 0).unwrap();
     monitor.activate(7);
     monitor.sample(7, 0, dg2);
     monitor.sample(7, 999_999_999, |_| panic!("sample rate exceeded"));
@@ -167,7 +168,7 @@ kernel_test_in!(
 );
 
 fn smoke_hwmon_lost_authority_and_unavailable_registers_never_fabricate_zero() -> TestResult {
-    let monitor = Monitor::new(GtPlatform::Alchemist).unwrap();
+    let monitor = Monitor::new(GtPlatform::Alchemist, 0).unwrap();
     monitor.activate(7);
     monitor.sample(7, 0, dg2);
     let mut accesses = Vec::new();
@@ -200,7 +201,7 @@ kernel_test_in!(
 );
 
 fn smoke_hwmon_energy_wrap_units_gap_and_overflow_ownership() -> TestResult {
-    let monitor = Monitor::new(GtPlatform::Alchemist).unwrap();
+    let monitor = Monitor::new(GtPlatform::Alchemist, 0).unwrap();
     monitor.activate(7);
     monitor.sample(7, 0, |register| {
         if register == 0x14593c {
@@ -255,8 +256,8 @@ kernel_test_in!(
 );
 
 fn smoke_hwmon_real_sysfs_is_card_scoped_read_only_and_cached() -> TestResult {
-    let dg2 = Monitor::register(987, GtPlatform::Alchemist).unwrap();
-    let bmg = Monitor::register(988, GtPlatform::Battlemage).unwrap();
+    let dg2 = Monitor::register(987, GtPlatform::Alchemist, 0).unwrap();
+    let bmg = Monitor::register(988, GtPlatform::Battlemage, 0).unwrap();
     let class = class_register("hwmon");
     let find = |card| {
         class
@@ -274,7 +275,8 @@ fn smoke_hwmon_real_sysfs_is_card_scoped_read_only_and_cached() -> TestResult {
     assert!(node.has_attr("energy2_input"));
     assert!(!node.has_attr("temp6_input"));
     assert!(other.has_attr("temp21_input"));
-    assert!(!other.has_attr("energy2_input"));
+    assert!(other.has_attr("energy2_input"));
+    assert!(other.attr_show("energy2_input").unwrap().is_empty());
     let dir = narf_filesystem::sysfs::SysKobjDir { kobj: node.clone() };
     let file = dir.lookup("temp2_input").unwrap();
     assert_eq!(file.stat().mode.perms, 0o444);

@@ -371,3 +371,7 @@ kernel_test_in!(
 mod dynamic {
     include!("intel_gpu_ccs_control_hw_tests.rs");
 }
+
+mod virtual_queues {
+    include!("intel_gpu_virtual_queue_tests.rs");
+}

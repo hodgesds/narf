@@ -73,6 +73,30 @@ impl EngineSet {
             .filter(|engine| engine.xe_class() == class)
             .nth(usize::from(logical))
     }
+    /// GuC submits a width-one virtual context to this dense logical mask.
+    /// Every placement must belong to one advertised class of this GT.
+    pub(crate) fn logical_mask(self, placements: Self) -> Option<u32> {
+        let first = placements.iter().next()?;
+        placements.iter().try_fold(0, |mask, engine| {
+            (engine.xe_class() == first.xe_class())
+                .then(|| self.logical_instance(engine))
+                .flatten()
+                .map(|logical| mask | 1 << logical)
+        })
+    }
+    /// ENGINE_ID uses hardware class/physical instance, not GuC or UAPI
+    /// numbering (xe_engine_regs.h + xe_lrc.c::get_ctx_timestamp).
+    pub(crate) fn decode_hardware_id(self, word: u32) -> Option<Engine> {
+        self.iter().find(|engine| {
+            word & 7
+                == if engine.is_compute() {
+                    5
+                } else {
+                    engine.guc_class()
+                }
+                && (word >> 4) & 63 == engine.physical_instance()
+        })
+    }
 }
 
 /// Physically present compute instances (bit n = CCSn), from

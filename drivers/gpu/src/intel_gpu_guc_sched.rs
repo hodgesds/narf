@@ -127,7 +127,9 @@ enum Defaults {
 }
 
 struct Context<B: GpuBacking> {
+    /// Class-compatible template; virtual scheduling does not pin this engine.
     engine: Engine,
+    placements: EngineSet,
     id: u16,
     stamp: u32,
     image: B,
@@ -149,7 +151,10 @@ struct Context<B: GpuBacking> {
 impl<B: GpuBacking> Context<B> {
     fn diagnostic(&self) -> ContextInfo {
         ContextInfo {
-            engine: self.engine,
+            engine: job_timeout::observed_engine(&self.image, self.stamp, self.placements)
+                .ok()
+                .flatten(),
+            placements: self.placements,
             id: self.id,
             request_stamp: self.stamp,
             phase: match self.phase {
@@ -524,7 +529,12 @@ impl<A: BootAllocator> GuCScheduler<A> {
             return Err(SchedulingError::State);
         }
         let engine = context.engine();
-        if !self.engines.contains(engine) {
+        let placements = context.placements();
+        if self.engines.logical_mask(placements).is_none()
+            || placements.iter().any(|candidate| {
+                candidate.lrc_pages(self.platform) != engine.lrc_pages(self.platform)
+            })
+        {
             return Err(SchedulingError::State);
         }
         let claim = context
@@ -625,6 +635,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
         if self.resources.contexts.len() == MAX_CONTEXTS {
             return Err(SchedulingError::Full);
         }
+        let placements = user
+            .as_ref()
+            .map_or(EngineSet::of(&[engine]), |claim| claim.placements());
         let (id, stamp) = self
             .identities
             .candidate(|stamp| self.resources.contexts.iter().any(|c| c.stamp == stamp))?;
@@ -768,7 +781,11 @@ impl<A: BootAllocator> GuCScheduler<A> {
             ]
         };
         if user.is_some() {
-            job_timeout::setup(&image, self.platform);
+            if placements.iter().count() > 1 {
+                job_timeout::setup_virtual(&image, self.platform);
+            } else {
+                job_timeout::setup(&image, self.platform);
+            }
             job_timeout::prefix(image.ggtt_offset(), stamp, engine, &mut words);
         }
         if words.len() % 2 != 0 {
@@ -816,6 +833,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
         r.contexts.push(Context {
             user: user.map(|claim| claim.publish(completion.clone())),
             engine,
+            placements,
             id,
             stamp,
             image,
@@ -894,10 +912,16 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     return Err(SchedulingError::Protocol);
                 }
                 if seq != 0 {
+                    let physical = job_timeout::observed_engine(
+                        &context.image,
+                        context.stamp,
+                        context.placements,
+                    )?
+                    .ok_or(SchedulingError::Protocol)?;
                     resources
                         .engines
                         .iter_mut()
-                        .find(|e| e.engine == context.engine)
+                        .find(|e| e.engine == physical)
                         .expect("scheduler engine")
                         .last_progress = Some(now);
                     context.phase = Phase::Disable;
@@ -920,17 +944,32 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     .allocator
                     .sync_for_cpu(&context.image)
                     .map_err(|_| SchedulingError::Cache)?;
-                let (expired, progressed) = context.runtime.expired(
-                    &context.image,
-                    context.stamp,
-                    context.engine,
-                    ct.window(),
-                )?;
+                let (expired, progressed) = if context.placements.iter().count() > 1 {
+                    context.runtime.expired_on(
+                        &context.image,
+                        context.stamp,
+                        context.placements,
+                        ct.window(),
+                    )?
+                } else {
+                    context.runtime.expired(
+                        &context.image,
+                        context.stamp,
+                        context.engine,
+                        ct.window(),
+                    )?
+                };
                 if progressed {
+                    let physical = job_timeout::observed_engine(
+                        &context.image,
+                        context.stamp,
+                        context.placements,
+                    )?
+                    .ok_or(SchedulingError::Protocol)?;
                     resources
                         .engines
                         .iter_mut()
-                        .find(|e| e.engine == context.engine)
+                        .find(|e| e.engine == physical)
                         .expect("scheduler engine")
                         .last_progress = Some(now);
                 }
@@ -995,10 +1034,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         1,
                         id,
                         context.engine.guc_class(),
-                        1 << self
-                            .engines
-                            .logical_instance(context.engine)
-                            .expect("published engine"),
+                        self.engines
+                            .logical_mask(context.placements)
+                            .expect("published placements"),
                         0,
                         0,
                         0,
@@ -1038,23 +1076,31 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 Err(error) => return Err(SchedulingError::Transport(error)),
             }
         }
-        for engine in &mut resources.engines {
-            if resources
-                .contexts
+        for context in resources
+            .contexts
+            .iter()
+            .filter(|context| context.user.is_some() && context.phase == Phase::Running)
+        {
+            // A missing start marker or all contexts staying switched
+            // out must not leave admission wedged forever. Only reset
+            // when every allowed engine made no GPU progress for three
+            // watchdog intervals; never attribute that stall to a queue.
+            if context
+                .placements
                 .iter()
-                .any(|c| c.engine == engine.engine && c.user.is_some() && c.phase == Phase::Running)
+                .filter_map(|engine| state_of(&resources.engines, engine).last_progress)
+                .max()
+                .is_some_and(|last| now.saturating_sub(last) >= 3 * TIMEOUT)
             {
-                // A missing start marker or all contexts staying switched
-                // out must not leave admission wedged forever. Only reset
-                // when this entire engine made no GPU progress for three
-                // watchdog intervals; never attribute that stall to a queue.
-                if engine
-                    .last_progress
-                    .is_some_and(|last| now.saturating_sub(last) >= 3 * TIMEOUT)
-                {
-                    return Err(SchedulingError::Timeout);
-                }
-            } else {
+                return Err(SchedulingError::Timeout);
+            }
+        }
+        for engine in &mut resources.engines {
+            if !resources.contexts.iter().any(|context| {
+                context.placements.contains(engine.engine)
+                    && context.user.is_some()
+                    && context.phase == Phase::Running
+            }) {
                 engine.last_progress = None;
             }
         }
@@ -1114,6 +1160,8 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         .allocator
                         .sync_for_cpu(&c.image)
                         .map_err(|_| SchedulingError::Cache)?;
+                    job_timeout::observed_engine(&c.image, c.stamp, c.placements)?
+                        .ok_or(SchedulingError::Protocol)?;
                     user.capture(&c.image, c.engine.first_lri(self.platform))
                         .map_err(SchedulingError::Residency)?;
                 }
@@ -1151,13 +1199,13 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 // time itself comes from the ring marker/LRC timestamps.
                 c.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
                 if c.user.is_some() {
-                    resources
+                    for engine in resources
                         .engines
                         .iter_mut()
-                        .find(|e| e.engine == c.engine)
-                        .expect("scheduler engine")
-                        .last_progress
-                        .get_or_insert(now);
+                        .filter(|engine| c.placements.contains(engine.engine))
+                    {
+                        engine.last_progress.get_or_insert(now);
+                    }
                 }
             }
             (0x1002, Phase::Disabling, Some(0)) => c.phase = Phase::Deregister,

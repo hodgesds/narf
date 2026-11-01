@@ -1483,6 +1483,34 @@ this wave introduces no aarch64-specific production code. The x86_64 production
 boot, both btrfs postflights, formatting, diff and final source-integrity checks
 pass. Intel silicon and Mesa acceptance remain unrun.
 
+The fifth Intel checkpoint adds true GuC width-one load balancing across
+bounded same-class published placements, with one persistent LRC, private
+per-restore physical-engine receipts and migration-aware watchdog/retirement
+ownership. Parallel queues remain open. Fixed-mode MTL/Arrow direct WC XRGB
+primary flips can join CTM/gamma through common DSB arming; native primary and
+leaf/color witnesses both precede publication and old-window release. Abandoned
+mixed state retains both surfaces and a marker until full restoration or
+verified joint publication, including cancellation during replacement-master
+restoration. BMG PMT now supplies cached card/package energy through a bounded,
+qualified BAR0 PUNIT/remapper owner with checked units/wrap and loss handling.
+Intel PRIME imports external sync-file batches into the shared reservation;
+the filesystem core observes callbacks before admission locks, retires foreign
+references after them and lets CPU/implicit GPU access detect racing imports
+by generation. Xe execution keeps explicit synchronization. These bounded
+profiles leave broader VM, memory, media, display, diagnostics and platform
+work open; silicon and Mesa acceptance remain unrun.
+
+All 27 new fixtures pass on x86_64. Selected Intel/DRM/fb groups pass 801 unique
+tests with zero failures/skips, excluding the repeated 205-test main group.
+Shared-core regressions pass 2252 syscall ABI tests with four existing harness
+skips, plus 62 AMD render tests with zero failures/skips. GPU/fb/filesystem
+target CI Clippy passes all three contexts on both architectures; all four
+host GPU vendor configurations pass all-target Clippy. Both targets pass GPU/fb
+debug/release compilation. aarch64 QEMU is intentionally omitted because this
+wave introduces no aarch64-specific production code.
+The x86_64 production boot, both btrfs postflights, formatting, diff and final
+source-integrity checks pass.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

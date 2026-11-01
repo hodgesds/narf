@@ -312,7 +312,7 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         // Non-arming offsets/coefficients precede Linux's hardware evasion.
         for &(r, v) in registers
             .iter()
-            .filter(|&&(r, _)| r != 0x49028 && r != 0x4a480)
+            .filter(|&&(r, _)| r != 0x49028 && r != 0x4a480 && r != 0x7019c)
         {
             main.write(r, v);
         }
@@ -326,6 +326,11 @@ impl<M: DisplayAccess + Clone> Owner<M> {
             main.write(r, v);
         }
         for &(r, v) in registers.iter().filter(|&&(r, _)| r == 0x49028) {
+            main.write(r, v);
+        }
+        // intel_atomic_dsb_finish: color arm precedes plane arm within the
+        // same evaded safe window; geometry/control remain already owned.
+        for &(r, v) in registers.iter().filter(|&&(r, _)| r == 0x7019c) {
             main.write(r, v);
         }
         if self.chain {

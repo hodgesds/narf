@@ -544,7 +544,7 @@ kernel_test_in!(
 );
 
 fn smoke_hwmon_bmg_real_sysfs_uses_cached_default_only_and_admin_queue() -> TestResult {
-    let monitor = Monitor::register(990, GtPlatform::Battlemage).unwrap();
+    let monitor = Monitor::register(990, GtPlatform::Battlemage, 0).unwrap();
     let class = class_register("hwmon");
     let node = class
         .child_names()

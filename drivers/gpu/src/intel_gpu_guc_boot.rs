@@ -929,6 +929,12 @@ mod tests {
         coherent: bool,
         unstable_gmd: bool,
         gmd_reads: u32,
+        // Firmware-owned virtual-context routing, independent of the LRC's
+        // class template. Tests can request a different logical placement
+        // on the next restore, just as GuC may migrate a width-one context.
+        virtual_contexts: BTreeMap<u32, (u32, u32)>,
+        virtual_pick: Option<u32>,
+        virtual_restores: Vec<(u32, u32)>,
     }
     #[derive(Clone)]
     struct Window(Rc<RefCell<Device>>);

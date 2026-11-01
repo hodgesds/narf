@@ -25,6 +25,7 @@ enum Action {
     Arm(u32),
     Latch(u32),
     Resume,
+    ColorArm(u64),
 }
 #[derive(Debug)]
 struct Hardware {
@@ -145,6 +146,29 @@ impl MockPlatform {
         self.set(0x45788, 14 | (16 << 16));
         t
     }
+    pub(crate) fn allow_flips(&self, enabled: bool) {
+        self.0.lock().flips = enabled;
+    }
+    pub(crate) fn arm_order(&self) -> Vec<u64> {
+        self.0
+            .lock()
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::ColorArm(r) => Some(*r),
+                Action::Arm(_) => Some(SURF),
+                _ => None,
+            })
+            .collect()
+    }
+    pub(crate) fn primary_mappings(&self) -> Vec<(u64, u32)> {
+        self.0
+            .lock()
+            .regs
+            .range(PTE_START..(GGTT_ARRAY_BASE + GEM_SCANOUT_GTT_END / 4096 * 8))
+            .map(|(&r, &v)| (r, v))
+            .collect()
+    }
     pub(crate) fn stall_dsb(&self, id: usize, stalled: bool) {
         self.0.lock().dsb_stalled[id] = stalled;
     }
@@ -244,6 +268,9 @@ impl MmioWindow for MockPlatform {
 }
 impl Hardware {
     fn write(&mut self, offset: u64, value: u32) {
+        if offset == crate::intel_gpu_color::MODE || offset == crate::intel_gpu_color::GAMMA {
+            self.actions.push(Action::ColorArm(offset));
+        }
         for id in 0..2 {
             let base = 0x70b00 + id as u64 * 0x100;
             if (base..=base + 0xf0).contains(&offset) {
