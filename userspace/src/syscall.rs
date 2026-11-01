@@ -783,9 +783,14 @@ pub enum Syscall {
     /// advice values: MADV_DONTNEED (4) and MADV_FREE (8) both
     /// release the backing frames in `[addr, addr+len)` and mark
     /// the slots demand-paged so the next access reads zero.
-    /// All other advice values (MADV_WILLNEED, MADV_HUGEPAGE,
-    /// MADV_DONTFORK, …) return Ok(0) — `madvise` is a hint, not
-    /// a contract. arg0 = base, arg1 = length, arg2 = advice.
+    /// MADV_WILLNEED (3) populates the page cache behind the range;
+    /// MADV_POPULATE_READ (22) / MADV_POPULATE_WRITE (23) install
+    /// the range itself through the bulk fault API and return 0
+    /// only if the entire range was populated. The remaining
+    /// performance-only hints return Ok(0); semantic controls NARF
+    /// cannot honour (DONTFORK, WIPEONFORK, …) return EINVAL — see
+    /// `handlers::sys_madvise`. arg0 = base, arg1 = length,
+    /// arg2 = advice.
     /// Wave-66. Gated by the `linux-compat` feature on the kernel
     /// side; the variant exists on every build so the wire number
     /// stays stable.
