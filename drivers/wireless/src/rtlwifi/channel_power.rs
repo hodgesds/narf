@@ -302,7 +302,7 @@ impl Calibration {
 
 /// Exact pathA factory/PG selection, without Linux scan turbo or thermal
 /// boosts. Negative signed differences never wrap into a larger gain.
-fn factory_gains(factory: &Factory, channel: u8) -> Result<([u8; 4], [u8; 8]), Error> {
+pub(super) fn factory_gains(factory: &Factory, channel: u8) -> Result<([u8; 4], [u8; 8]), Error> {
     if !(1..=11).contains(&channel) {
         return Err(Error::Policy);
     }

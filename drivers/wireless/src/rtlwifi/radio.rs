@@ -97,13 +97,13 @@ async fn bb(io: &impl Io, reg: u16, mask: u32, value: u32) -> Result<(), Error> 
     io.write32(reg, value)?;
     Ok(())
 }
-async fn rf_write(io: &impl Io, reg: u8, value: u32) -> Result<(), Error> {
+pub(super) async fn rf_write(io: &impl Io, reg: u8, value: u32) -> Result<(), Error> {
     // Eight address bits, twenty data bits. The older unused scaffold's
     // four-bit-address/twelve-bit-value encoding is not this device's LSSI.
     io.write32(0x840, (u32::from(reg) << 20) | (value & 0xfffff))?;
     Ok(())
 }
-async fn rf_read(io: &impl Io, reg: u8) -> Result<u32, Error> {
+pub(super) async fn rf_read(io: &impl Io, reg: u8) -> Result<u32, Error> {
     let original = read(io, 0x824)?;
     let request = (original & !0x7f800000) | (u32::from(reg) << 23) | (1 << 31);
     io.write32(0x824, original & !(1 << 31))?;

@@ -153,6 +153,7 @@ struct DeviceEnvironment {
     beacon: AtomicBool,
     ht: Option<HtFixtureSource>,
     ht_channel: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
+    ht_wide: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
     fallback_channel: IrqSafeSpinLock<Option<ChannelFixtureSource>>,
     bus_power: IrqSafeSpinLock<Option<Arc<aspm::tests::Model>>>,
 }
@@ -281,6 +282,33 @@ impl Environment for DeviceEnvironment {
             })
             .transpose()
     }
+    fn ht40(
+        &self,
+        base: Arc<super::super::super::super::super::channel_power::Calibration>,
+    ) -> Result<Vec<Arc<super::super::super::super::super::ht::Grant>>, StationError> {
+        let source = self.ht_wide.lock();
+        let Some((channel, bytes, cap)) = source.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let actual = self
+            .device
+            .lock()
+            .upgrade()
+            .ok_or(StationError::State)?
+            .channel_for_test();
+        if *channel != actual {
+            return Ok(Vec::new());
+        }
+        let grant = super::super::super::super::super::ht::Grant::parse(
+            base,
+            self.firmware.lock().identity().ok_or(StationError::State)?,
+            bytes,
+            Some([0x77; 32]),
+            *cap,
+        )
+        .map_err(StationError::Radio)?;
+        Ok(vec![Arc::new(grant)])
+    }
     fn admission(&self) -> Option<&Arc<Admission>> {
         Some(&self.admission)
     }
@@ -310,9 +338,10 @@ impl Environment for DeviceEnvironment {
         let active = {
             let model = self.packet.model.lock();
             model.master
-                && model.peer.as_ref().is_some_and(|peer| {
-                    self.packet.radio.rf(0x18) & 255 == u32::from(peer.lock().channel)
-                })
+                && model
+                    .peer
+                    .as_ref()
+                    .is_some_and(|peer| self.packet.primary() == peer.lock().channel)
         };
         if active && !self.beacon.swap(true, Ordering::AcqRel) {
             let peer = self.packet.model.lock().peer.clone().unwrap();
@@ -480,6 +509,7 @@ impl Harness {
                 beacon: AtomicBool::new(false),
                 ht: ht_source.clone(),
                 ht_channel: IrqSafeSpinLock::new(None),
+                ht_wide: IrqSafeSpinLock::new(None),
                 fallback_channel: IrqSafeSpinLock::new(None),
                 bus_power: IrqSafeSpinLock::new(None),
             },

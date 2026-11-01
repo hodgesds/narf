@@ -217,6 +217,22 @@ pub(super) fn rate_mask(legacy: u16, mcs: Option<u8>, level: u8, sgi: bool) -> [
     ]
 }
 
+/// Source curtxbw_40mhz adds legacy OFDM6 to the INIT/LOW HT mask.
+/// Existing20MHz payloads remain byte-identical.
+pub(super) fn rate_mask_width(
+    legacy: u16,
+    mcs: Option<u8>,
+    level: u8,
+    sgi: bool,
+    wide: bool,
+) -> [u8; 5] {
+    let mut mask = rate_mask(legacy, mcs, level, sgi);
+    if wide && mcs.is_some() && !matches!(level, STA_HIGH | STA_MIDDLE) {
+        mask[0] |= (legacy & 0x10) as u8;
+    }
+    mask
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod tests {
     use super::*;

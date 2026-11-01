@@ -89,6 +89,28 @@ impl RtlwifiDevice {
             super::ht::request_on_channel(&base, firmware, channel)
         })
     }
+    /// Exact full20/40 qualification request; no radio I/O or permission.
+    pub fn ht40_request(
+        &self,
+        primary: u8,
+        secondary: u8,
+    ) -> Result<super::Ht40Request, super::channel_power::Error> {
+        let geometry = super::ht::Geometry::new(primary, secondary)
+            .map_err(|_| super::channel_power::Error::Policy)?;
+        let factory = self
+            .factory
+            .as_ref()
+            .ok_or(super::channel_power::Error::Identity)?;
+        let base = super::channel_power::Calibration::load_registered(factory)?;
+        let firmware = self
+            .current_firmware()
+            .and_then(|f| f.identity())
+            .ok_or(super::channel_power::Error::Identity)?;
+        firmware
+            .invoke(|| Ok(()))
+            .map_err(|_| super::channel_power::Error::Authority)?;
+        Ok(super::ht::wide_request(&base, firmware, geometry))
+    }
     /// Exact-channel fallback provisioning metadata; grants no radio permission.
     pub fn rate_fallback_request(
         &self,

@@ -14,6 +14,11 @@ use narf_wireless::{
     association::phy::{LocalHt, LocalPhy},
     reg::RegulatoryDomain,
 };
+#[path = "ht40.rs"]
+mod wide;
+pub(super) use wide::{
+    capability as wide_capability, local as local_wide, request as wide_request, Geometry,
+};
 const HEADER: usize = 160;
 const LENGTH: usize = HEADER + 8 * 128;
 const UNKNOWN: i16 = i16::MAX;
@@ -79,6 +84,7 @@ pub(crate) struct Grant {
     ceiling: i16,
     curves: [[i16; 64]; 8],
     firmware: super::firmware_transport::Identity,
+    wide: Option<wide::Qualification>,
 }
 impl Grant {
     pub(super) fn matches(&self, base: &Arc<Calibration>) -> bool {
@@ -112,6 +118,9 @@ impl Grant {
         signer: Option<[u8; 32]>,
         cap: Cap<FirmwareBlob, Read>,
     ) -> Result<Self, Error> {
+        if b.get(4..6) == Some(&[4, 0]) {
+            return wide::parse(base, firmware, b, signer, cap);
+        }
         let bad = || Error::Power(super::channel_power::Error::Format);
         let f = base.factory();
         let channel = *b.get(118).ok_or_else(bad)?;
@@ -162,6 +171,7 @@ impl Grant {
             ceiling,
             curves,
             firmware,
+            wide: None,
         };
         grant.invoke(|| Ok(()))?;
         Ok(grant)
@@ -199,11 +209,50 @@ impl Grant {
             {
                 return Err(Error::State);
             }
-            let limit = legacy.eirp_limit_qdbm().min(self.ceiling);
+            let limit = if let Some(wide) = &self.wide {
+                wide.geometry
+                    .ceiling(domain)?
+                    .min(legacy.eirp_limit_qdbm())
+                    .min(self.ceiling)
+            } else {
+                legacy.eirp_limit_qdbm().min(self.ceiling)
+            };
             if !self.base.within(legacy, limit, self.antenna) {
                 return Err(Error::Power(super::channel_power::Error::NoMeasuredGain));
             }
-            let maximum = factory_gains(self.base.factory(), self.channel)?;
+            let mut maximum = factory_gains(self.base.factory(), self.channel)?;
+            if let Some(wide) = &self.wide {
+                let (cck, ofdm) = legacy.gains();
+                let (wide_cck, wide_ofdm) = super::channel_power::factory_gains(
+                    self.base.factory(),
+                    wide.geometry.center(),
+                )
+                .map_err(Error::Power)?;
+                for (row, (selected, caps)) in [
+                    (cck.as_slice(), wide_cck.as_slice()),
+                    (ofdm.as_slice(), wide_ofdm.as_slice()),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if selected.iter().zip(caps).any(|(gain, cap)| {
+                        gain > cap
+                            || wide.legacy[row][usize::from(*gain)] == UNKNOWN
+                            || i32::from(wide.legacy[row][usize::from(*gain)])
+                                + i32::from(self.antenna)
+                                > i32::from(limit)
+                    }) {
+                        return Err(Error::Power(super::channel_power::Error::NoMeasuredGain));
+                    }
+                }
+                for (max, cap) in maximum.iter_mut().zip(factory_gains_inner(
+                    self.base.factory(),
+                    wide.geometry.center(),
+                    false,
+                )?) {
+                    *max = (*max).min(cap);
+                }
+            }
             let mut indices = [0; 8];
             for ((i, max), curve) in indices.iter_mut().zip(maximum).zip(&self.curves) {
                 *i = (0..=max)
@@ -234,6 +283,18 @@ impl Grant {
         indices: [u8; 8],
         timing: bool,
     ) -> Result<(), Error> {
+        self.readback_width(io, indices, timing, None)
+    }
+    pub(super) fn readback_width(
+        &self,
+        io: &impl Io,
+        indices: [u8; 8],
+        timing: bool,
+        width: Option<Geometry>,
+    ) -> Result<(), Error> {
+        if width.is_some() && width != self.geometry() {
+            return Err(Error::State);
+        }
         self.invoke(|| {
             for (reg, row) in [0xe10, 0xe14].into_iter().zip(indices.chunks_exact(4)) {
                 if io.read32(reg)? != u32::from_le_bytes(row.try_into().unwrap()) {
@@ -242,11 +303,14 @@ impl Grant {
             }
             if io.read32(0xe18)? != 0
                 || io.read32(0xe1c)? != 0
-                || io.read8(0x603)? & 4 == 0
-                || io.read32(0x800)? & 1 != 0
-                || io.read32(0x900)? & 1 != 0
+                || (io.read8(0x603)? & 4 == 0) != width.is_some()
+                || (io.read32(0x800)? & 1 != 0) != width.is_some()
+                || (io.read32(0x900)? & 1 != 0) != width.is_some()
             {
                 return Err(Error::Readback);
+            }
+            if let Some(g) = width {
+                g.readback(io)?;
             }
             if timing
                 && [0x515, 0x517, 0x429, 0x63b]
@@ -263,6 +327,13 @@ impl Grant {
 /// rf.c::_rtl88e_get_txpower_writeval_by_regulatory, pathA/channels1..11/20MHz.
 /// Erased/default board data cannot establish a factory bound here.
 pub(super) fn factory_gains(f: &super::efuse::Factory, channel: u8) -> Result<[u8; 8], Error> {
+    factory_gains_inner(f, channel, true)
+}
+fn factory_gains_inner(
+    f: &super::efuse::Factory,
+    channel: u8,
+    twenty: bool,
+) -> Result<[u8; 8], Error> {
     let b = &f.logical;
     let bad = || Error::Power(super::channel_power::Error::FactoryPower);
     let group = match channel {
@@ -277,7 +348,7 @@ pub(super) fn factory_gains(f: &super::efuse::Factory, channel: u8) -> Result<[u
     }
     let n = i16::from(b[0x1b] >> 4);
     let delta = if n & 8 != 0 { n - 16 } else { n };
-    let base = i16::from(b[0x16 + group]) + delta;
+    let base = i16::from(b[0x16 + group]) + if twenty { delta } else { 0 };
     if !(0..=63).contains(&base) {
         return Err(bad());
     }

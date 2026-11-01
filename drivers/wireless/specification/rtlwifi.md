@@ -1277,6 +1277,47 @@ production checkpoint `6e89e3ab3`; the successor changes only native fixtures,
 whose scoped release CI also passes. Physical acceptance and other chip
 runtimes remain separate.
 
+### Separately qualified RTL8188EE HT20/40 (implemented, acceptance pending)
+
+The [NEHT v4 full-program contract](rtl8188ee-ht40.md) extends the retained
+EE owner with a distinct primary/secondary/center20/40 program. It preserves
+the accepted v2 channel1 and v3 channel2–11 HT20/SGI20/7935RX formats;
+`RtlwifiDevice::ht40_request(primary, secondary)` returns exact provisioning
+metadata without radio I/O. New signed CCK/OFDM and MCS0–7 peak rows must
+qualify the complete20MHz fallback and40MHz LGI emission programs, static
+antenna/IQK/LCK/supply/thermal envelope and autonomous responses. No board
+measurements or deployment artifacts are invented or supplied.
+
+EE follows Linux `core.c::rtl_op_config` → `current_channel=primary±2` →
+`rtl8188ee` switch-channel TX-power/RF commands:40MHz factory/PG lookup uses
+CENTER, while the preceding NEPC20/fallback uses PRIMARY. V4 bounds MCS
+gains by both source maxima, including the signed HT20 difference only in
+the20MHz case. Existing CCK/OFDM raw arrays must also fit CENTER factory
+maxima and the new measured full-program rows. Full occupied40MHz current
+host policy and executable/NEPC/v4 capabilities are checked around every
+native wait, DMA publication and copied IPC/stack callback.
+
+A peer is offered40 only for an exact qualified secondary. The same PCI
+owner waits for actual full32-bit scheduler terminal, pauses queues, closes
+MAC TX/RX, programs/reads back BB/RF/gains and then reopens gates. All native
+DMA allocations/OWN receipts remain retained; a MAC pause grants no DMA
+reclamation. Primary does not change and RXD's original width remains
+independent of metadata, so old40 frames cannot be relabeled as20. Copied
+epochs retire before the transition. A narrowed20 response completes real
+20MHz programming before keys/port or DATA open. Native MCS DATA uses BW40
+and SC3; basic management/control uses the actual20MHz primary subcarrier.
+LGI40 composes with existing SGI20 fallback,7935RX, software CCMP, BA and
+source host RA. SGI40/MCS32/2SS/RTS/CTS and old NEFB under v4 stay closed.
+
+Eight new `drivers/wireless/rtlwifi/ht40` native regressions exercise signed
+identity and center factory maxima, plus/minus Open/WPA2 DHCP and exact IP,
+initial/response20 fallback, original same-PN width/GI rejection, full-span
+policy/v4 loss with held DATA OWN, cancelled native RF waits and actual
+readback/scheduler terminal failures. Formatting/whitespace checks pass;
+coordinated release compilation/native execution remain pending. All prior
+NEHT/scan/power/recovery cases remain required; physical acceptance remains
+external.
+
 ## 4. Invariants
 
 Read requests never set the programming trigger. Preserve unrelated EFUSE
@@ -1317,7 +1358,7 @@ Per-chip remaining inventory uses Linux per-chip `sw.c` and radio/PCI ops:
 
 | Chip | Source hardware scope | Remaining native software |
 |---|---|---|
-| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. NEHT v2 additionally implements SGI20 and7935-byte reception; four native composed regressions pass on both architectures. Reset/recovery, system suspend and IPS are software-validated. Remaining software: HT40, antenna/gain tracking and RTS/CTS (PCIe ASPM, MSI delivery, fwlps leisure power save and DMA quiescence are implemented). Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
+| RTL8188EE |2.4GHz1T1R HT, source `bandset=BAND_ON_2_4G` |Software-validated: separately signed HT20/LGI MCS0–7, standalone3839 A-MSDU, recipient BA/RX reorder, originator BA/TX A-MPDU and capture/publication epochs above. NEHT v2 additionally implements SGI20 and7935-byte reception; four native composed regressions pass on both architectures. Reset/recovery, system suspend and IPS are software-validated. HT20/40 NEHT v4 is implemented pending native acceptance above. Remaining software: antenna/gain tracking and RTS/CTS (PCIe ASPM, MSI delivery, fwlps leisure power save and DMA quiescence are implemented). Exact NEPC/NEHT board measurements and physical acceptance remain external gates. |
 | RTL8192CE family aliases / RTL8192EE |2.4GHz HT; CE aliases need exact RF-type qualification, including the8176/8188CE variant; EE is2T2R |Retained chip firmware/MAC/PHY/RF/calibration/power/packet/station chain, then full HT/QoS/lifecycle. The8179/8188EE HT path does not admit these IDs. |
 | RTL8192DE |Dual-band dual-MAC HT |Exact per-function reset/power/firmware/DMA/radio ownership and station chains, then bands/HT/QoS/lifecycle |
 | RTL8723AE/BE |2.4GHz1T1R HT with BT |Chip-specific retained chain, antenna/BT coexistence and HT/QoS/lifecycle |
@@ -1431,7 +1472,7 @@ runtimes remain separate from the retained RTL8188EE owner.
 | `bt_coexistence` | Bluetooth coexistence on RTL8723AE/BE; blocked on the rtl8723ae/rtl8723be chip runtimes |
 | `dynamic_antenna_selection` | Dynamic antenna selection/tracking; blocked on per-antenna signed board measurements (NEPC binds one static factory antenna) |
 | `five_ghz_operation` | 5GHz band operation on RTL8192DE/RTL8821AE; blocked on the rtl8192de/rtl8821ae chip runtimes (RTL8188EE is 2.4GHz-only) |
-| `ht40` | HT40; blocked on a signed NEHT v2 record covering 40MHz emissions (NEHT v1 binds width20) and 40MHz BW programming |
+| `ht40` | Source-correct native HT20/40/secondary selection and signed NEHT v4 full-program qualification are implemented above, pending coordinated native acceptance. Existing NEHT v2/v3 remain20MHz. Measured per-device board data and physical acceptance remain external |
 | `rf_gain_tracking` | RF gain/power tracking; blocked on a thermal-indexed signed gain envelope (thermal power tracking moves gains outside the fixed NEPC/NEHT envelope) |
 | `rts_cts_protection` | RTS/CTS protection; blocked on signed qualification of RTS/CTS-to-self emissions (NEPC/NEHT exclude them) and TXD RTS fields driven by bss use_cts_prot/use_rts |
 | `vht` | VHT operation including TX/RX STBC on RTL8821AE; blocked on the rtl8821ae runtime |

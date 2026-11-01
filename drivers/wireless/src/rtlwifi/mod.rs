@@ -68,6 +68,7 @@ mod power_runtime;
 mod probe_scan;
 pub use fallback::Request as RateFallbackRequest;
 pub use ht::Request as Ht20Request;
+pub use ht::Request as Ht40Request;
 pub mod irq;
 pub mod mac;
 mod packet_mac;

@@ -130,6 +130,8 @@ pub(super) struct Peer {
     hold_data: bool,
     wmm: Option<Vec<u8>>,
     ht: Option<Vec<u8>>,
+    response_ht: Option<Vec<u8>>,
+    pub(super) ht40: bool,
     controls: Vec<Vec<u8>>,
     hold_control: bool,
     probes: Vec<Vec<u8>>,
@@ -167,6 +169,8 @@ impl Peer {
             hold_data: false,
             wmm: None,
             ht: None,
+            response_ht: None,
+            ht40: false,
             controls: Vec::new(),
             hold_control: false,
             probes: Vec::new(),
@@ -267,7 +271,7 @@ impl Peer {
                     if let Some(parameters) = &self.wmm {
                         reply.extend_from_slice(parameters);
                     }
-                    if let Some(ht) = &self.ht {
+                    if let Some(ht) = self.response_ht.as_ref().or(self.ht.as_ref()) {
                         reply[25] |= 4;
                         reply.extend_from_slice(ht);
                     }

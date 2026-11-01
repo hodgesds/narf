@@ -89,6 +89,7 @@ pub(super) struct State<M: Memory> {
     reserved: Option<M>,
     pub(super) qos: bool,
     pub(super) ht: bool,
+    pub(super) width: Option<super::super::ht::Geometry>,
     /// HIMR/HIMRE/HSIMR currently carry the Linux 88EE masks.
     interrupts: bool,
     /// Firmware leisure power save (fw_current_inpsmode) is active.
@@ -114,6 +115,7 @@ impl<M: Memory> State<M> {
             reserved: None,
             qos: false,
             ht: false,
+            width: None,
             interrupts: false,
             leisure: false,
             rate_mask: None,
@@ -148,6 +150,7 @@ pub struct Mpdu {
     channel: u8,
     ht: bool,
     short_gi: bool,
+    width40: bool,
     /// Native RXD DW1 PAGGR/FAGGR: this MPDU arrived inside an A-MPDU.
     aggregated: bool,
     /// `_rtl88ee_query_rxphystatus` `rx_pwdb_all` when RXD PHYST carried
@@ -169,6 +172,9 @@ impl Mpdu {
     }
     pub(super) fn ht(&self) -> bool {
         self.ht
+    }
+    pub(super) fn width40(&self) -> bool {
+        self.width40
     }
     pub(super) fn short_gi(&self) -> bool {
         self.short_gi
@@ -865,6 +871,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             prefix[1] |= u32::from(index) << 16;
             prefix[4] &= !(1 << 10);
         }
+        if let Some(g) = self.packet.width {
+            prefix[4] |= if frame[0] == 0x88 && rate >= 12 {
+                (1 << 25) | (3 << 20)
+            } else {
+                u32::from(g.prime()) << 20
+            };
+        }
         if frame[0] == 0x88 {
             prefix[4] |= 1 << 6;
         } // EE TXD.QOS; host SSN retained.
@@ -1024,7 +1037,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             let ht_profile = self.packet.ht
                 && ht
                 && (12..=19).contains(&(report & 63))
-                && report & ((1 << 7) | (1 << 9)) == 0;
+                && report & (1 << 7) == 0
+                && (report & (1 << 9) == 0 || self.packet.width.is_some());
             let legacy_profile = !ht && report & (1 << 9) == 0 && report & 63 <= 11;
             // DW1 PAGGR/FAGGR (rtl8188ee trx.h): A-MPDU membership is only
             // admissible on the HT profile, where the station BA owner gates it.
@@ -1080,6 +1094,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             channel,
                             ht,
                             short_gi,
+                            width40: report & (1 << 9) != 0,
                             aggregated,
                             pwdb,
                         });
@@ -1096,6 +1111,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         channel,
                         ht,
                         short_gi,
+                        width40: report & (1 << 9) != 0,
                         aggregated,
                         pwdb,
                     });

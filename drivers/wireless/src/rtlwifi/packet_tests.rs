@@ -123,6 +123,19 @@ impl PacketPort {
             drops: Arc::new(AtomicUsize::new(0)),
         }
     }
+    fn primary(&self) -> u8 {
+        let rf = self.radio.rf(0x18);
+        let center = (rf & 255) as u8;
+        if rf & 0xc00 == 0x400 {
+            match (self.radio.word(0x440) >> 21) & 3 {
+                1 => center.saturating_sub(2),
+                2 => center.saturating_add(2),
+                _ => 0,
+            }
+        } else {
+            center
+        }
+    }
     fn emit(&self, bytes: &[u8]) -> Result<(), Error> {
         self.emit_native(bytes, 0, 0, None)
     }
@@ -466,9 +479,10 @@ impl Port for PacketPort {
         let peer = { self.model.lock().peer.clone() };
         let mut held = false;
         if let Some(peer) = peer {
+            let wide = peer.lock().ht40;
             let result = {
                 let mut peer = peer.lock();
-                if self.radio.rf(0x18) & 255 == u32::from(peer.channel) {
+                if self.primary() == peer.channel {
                     peer.react(&bytes)
                 } else {
                     Ok((Vec::new(), false))
@@ -477,7 +491,11 @@ impl Port for PacketPort {
             match result {
                 Ok((replies, hold)) => {
                     for reply in replies {
-                        self.emit(&reply)?;
+                        if wide && reply.first() == Some(&0x88) {
+                            self.emit_native(&reply, (1 << 6) | (1 << 9) | 19, 0, None)?;
+                        } else {
+                            self.emit(&reply)?;
+                        }
                     }
                     held = hold;
                 }

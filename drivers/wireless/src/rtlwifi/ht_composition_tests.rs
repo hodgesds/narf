@@ -2,6 +2,8 @@
 use super::super::super::super::super::super::ht;
 use super::*;
 use core::sync::atomic::AtomicUsize;
+#[path = "ht40_composition_tests.rs"]
+mod ht40_tests;
 #[path = "rx_amsdu_tests.rs"]
 mod rx_amsdu_tests;
 #[path = "sgi20_tests.rs"]

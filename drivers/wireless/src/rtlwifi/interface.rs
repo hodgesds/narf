@@ -74,6 +74,7 @@ pub(crate) struct Device<I: Port<Buffer = M>, M: Memory, E: Environment> {
     up: AtomicBool,
     bssid: AtomicU64,
     ht: AtomicBool,
+    ht40: AtomicBool,
     rx: Arc<IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
     leisure: IrqSafeSpinLock<Leisure>,
@@ -197,6 +198,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     fn commit_close(&self, _publication: narf_lib::sync::IrqSafeSpinLockGuard<'_, ()>) {
         self.admission.closed.store(true, Ordering::Release);
         self.ht.store(false, Ordering::Release);
+        self.ht40.store(false, Ordering::Release);
         *self.rx.lock() = None;
         self.update_link(None);
     }
@@ -229,6 +231,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             up: AtomicBool::new(false),
             bssid: AtomicU64::new(0),
             ht: AtomicBool::new(false),
+            ht40: AtomicBool::new(false),
             rx: Arc::new(IrqSafeSpinLock::new(Some(consumer))),
             tx: IrqSafeSpinLock::new(Some(producer)),
             leisure: IrqSafeSpinLock::new(Leisure::default()),
@@ -305,6 +308,8 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             }
             self.ht
                 .store(owner.station_ht_capability().is_some(), Ordering::Release);
+            self.ht40
+                .store(owner.station_ht40_supported(), Ordering::Release);
             owner.start_station_service(&self.environment).await?;
         }
         if owner.station_phase() == station::Phase::Failed {
@@ -850,9 +855,13 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
     fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
         (band == 2400 && self.ht.load(Ordering::Acquire)).then(|| {
             narf_wireless::iface::PhyCapabilities {
-                ht: narf_wireless::association::phy::LocalHt::siso20(true, true)
-                    .with_rx_amsdu_7935(true)
-                    .capability_body(),
+                ht: if self.ht40.load(Ordering::Acquire) {
+                    super::ht::wide_capability()
+                } else {
+                    narf_wireless::association::phy::LocalHt::siso20(true, true)
+                        .with_rx_amsdu_7935(true)
+                }
+                .capability_body(),
                 vht: None,
             }
         })
@@ -966,6 +975,8 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             self.admission.closed.store(false, Ordering::Release);
             self.ht
                 .store(owner.station_ht_capability().is_some(), Ordering::Release);
+            self.ht40
+                .store(owner.station_ht40_supported(), Ordering::Release);
         }
         attempt.armed = false;
         result
@@ -1225,6 +1236,25 @@ impl Environment for NativeEnvironment {
             .channel
             .load(Ordering::Acquire);
         super::ht::Grant::registered(
+            base,
+            self.firmware().identity().ok_or(Error::State)?,
+            channel,
+        )
+        .map_err(Error::Radio)
+    }
+    fn ht40(
+        &self,
+        base: Arc<super::channel_power::Calibration>,
+    ) -> Result<Vec<Arc<super::ht::Grant>>, Error> {
+        let channel = self
+            .device
+            .lock()
+            .upgrade()
+            .ok_or(Error::State)?
+            .lifecycle
+            .channel
+            .load(Ordering::Acquire);
+        super::ht::Grant::registered_wide(
             base,
             self.firmware().identity().ok_or(Error::State)?,
             channel,

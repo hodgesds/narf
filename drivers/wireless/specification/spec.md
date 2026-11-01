@@ -1060,6 +1060,17 @@ native cases await release execution; the combined native-context release
 Clippy probe passes. Family §3.63 keeps active/RNR, wider/periodic operation
 and live AP-power replacement as separate open continuations.
 
+RTL8188EE HT40 uses a separately signed NEHT v4 full20/40 program while
+preserving accepted v2/v3 assets. EE wide power follows its source-specific
+center-channel factory lookup, intersected with primary-channel20 fallback
+limits and measured per-rate bounds. The retained owner pauses actual MAC
+transmission, reads back BB/RF/gains and restores20MHz before keys or DATA
+when association narrows. DMA OWN resources remain retained throughout.
+Eight native cases are written; source review and the quick release compile
+probe pass. Native execution is deferred to the combined validation pass.
+The family §3 and `rtl8188ee-ht40.md` specify the contract and external
+per-device qualification requirement.
+
 ## 4. Interaction with `narf-wireless`
 
 - **Registration**: Drivers register via `bus::register_wireless_driver(MatchEntry { ... })`.

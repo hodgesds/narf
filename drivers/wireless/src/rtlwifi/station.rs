@@ -49,6 +49,8 @@ pub(crate) enum Phase {
     Stopped,
     Failed,
 }
+#[path = "ht_width.rs"]
+mod ht_width;
 pub(crate) type TransitionFuture =
     core::pin::Pin<alloc::boxed::Box<dyn Future<Output = Result<(), Error>> + Send>>;
 pub(crate) trait Environment: Send + Sync {
@@ -89,6 +91,12 @@ pub(crate) trait Environment: Send + Sync {
         _base: Arc<super::super::channel_power::Calibration>,
     ) -> Result<Option<Arc<super::super::ht::Grant>>, Error> {
         Ok(None)
+    }
+    fn ht40(
+        &self,
+        _base: Arc<super::super::channel_power::Calibration>,
+    ) -> Result<Vec<Arc<super::super::ht::Grant>>, Error> {
+        Ok(Vec::new())
     }
     /// The separately signed DATA rate fallback continuation (`NEFB`)
     /// over `base`, or `None` (DATA stays USE_RATE + DISFB).
@@ -323,6 +331,7 @@ pub(super) struct State {
     capability: u16,
     wmm: Option<narf_wireless::wmm::Parameters>,
     ht: Option<Arc<super::super::ht::Grant>>,
+    wide_profiles: Vec<Arc<super::super::ht::Grant>>,
     ht_indices: [u8; 8],
     ht_profile: Option<association::phy::HtNegotiation>,
     controls: VecDeque<Vec<u8>>,
@@ -374,6 +383,7 @@ impl State {
             capability: 0,
             wmm: None,
             ht: None,
+            wide_profiles: Vec::new(),
             ht_indices: [0; 8],
             ht_profile: None,
             controls: VecDeque::new(),
@@ -792,9 +802,16 @@ impl<I: Io, M: Memory> Prepared<I, M> {
     pub(crate) fn station_receive_retirement(&mut self, retire: Arc<dyn Fn() + Send + Sync>) {
         self.station.retire = Some(retire);
     }
+    pub(crate) fn station_ht40_supported(&self) -> bool {
+        !self.station.wide_profiles.is_empty()
+    }
     pub(crate) fn station_ht_capability(&self) -> Option<[u8; 26]> {
         self.station.ht.as_ref()?;
-        Some(association::phy::LocalHt::siso20(false, false).capability_body())
+        Some(if self.station.wide_profiles.is_empty() {
+            association::phy::LocalHt::siso20(false, false).capability_body()
+        } else {
+            super::super::ht::wide_capability().capability_body()
+        })
     }
     pub(crate) fn station_receive_epoch(&self) -> (Arc<AtomicU64>, u64) {
         (
@@ -878,8 +895,14 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             if ht.gains(&domain, permission).map_err(Error::Radio)? != self.station.ht_indices {
                 return Err(Error::Profile);
             }
-            ht.readback(&self.io, self.station.ht_indices, self.packet.ht)
-                .map_err(Error::Radio)?;
+            ht.readback_legacy(&self.io, permission)?;
+            ht.readback_width(
+                &self.io,
+                self.station.ht_indices,
+                self.packet.ht,
+                self.packet.width,
+            )
+            .map_err(Error::Radio)?;
         }
         Ok(())
     }
@@ -997,9 +1020,21 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .as_ref()
             .ok_or(Error::Profile)?
             .clone();
-        let Some(grant) = environment.ht20(base.clone())? else {
+        let wide = environment.ht40(base.clone())?;
+        let legacy = environment.ht20(base.clone())?;
+        let Some(grant) = wide.first().cloned().or(legacy) else {
             return Ok(());
         };
+        for q in &wide {
+            if !q.matches(&base)
+                || q.geometry()
+                    .is_none_or(|g| Some(g.primary()) != self.permission.map(|p| p.channel()))
+            {
+                return Err(Error::Profile);
+            }
+            q.gains(&environment.domain()?, self.permission.ok_or(Error::State)?)?;
+        }
+        self.station.wide_profiles = wide;
         if !grant.matches(&base) {
             return Err(Error::Profile);
         }
@@ -1163,12 +1198,19 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         };
         // Ordinary DATA may clear DISFB only under a current NEFB grant;
         // without it the base programs' fixed USE_RATE + DISFB applies.
-        let sgi_profile = self.station.ht_profile.is_some_and(|p| p.tx_sgi20());
+        let sgi_profile =
+            self.packet.width.is_none() && self.station.ht_profile.is_some_and(|p| p.tx_sgi20());
         let short_gi = matches!(kind, Kind::Data) && rate > 12 && sgi_profile;
         // Even MCS0's LGI descriptor must stay fixed when its firmware RA
         // mask advertises SGI. NEFB v1 did not qualify that firmware mode.
-        let fallback =
-            matches!(kind, Kind::Data) && !sgi_profile && self.station.fallback_current();
+        let fallback = matches!(kind, Kind::Data)
+            && !sgi_profile
+            && self
+                .station
+                .ht
+                .as_ref()
+                .is_none_or(|g| g.geometry().is_none())
+            && self.station.fallback_current();
         let mut publish = || {
             let op = || {
                 self.check_station_policy(environment)
@@ -1257,7 +1299,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 self.local().ok_or(Error::State)?,
                 ssid,
                 mode,
-                super::super::ht::local(),
+                self.local_ht_for(&candidate)?,
             )
         } else {
             JoinPlan::prepare(
@@ -1290,6 +1332,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             armed: true,
         };
         let result = async {
+            let width = self
+                .station
+                .plan
+                .as_ref()
+                .and_then(|p| p.offered_phy())
+                .map(|p| Self::offered_width(p.width(), p.ht().operation()))
+                .transpose()?
+                .flatten();
+            self.select_station_width(width, environment).await?;
             super::super::ht::wait(
                 self.station
                     .calibration
@@ -1318,6 +1369,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 let idle = self.progress_station_inner(environment)?;
                 if self.station.phase == Phase::Configuring {
                     self.check_station_policy(environment)?;
+                    let width = self
+                        .station
+                        .plan
+                        .as_ref()
+                        .and_then(|p| p.negotiated_phy())
+                        .map(|p| Self::offered_width(p.width(), p.ht().operation()))
+                        .transpose()?
+                        .flatten();
+                    self.select_station_width(width, environment).await?;
                     let (rates, basic) = self
                         .station
                         .plan
@@ -1343,7 +1403,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         }
                         let ht = self.station.ht.as_ref().ok_or(Error::Profile)?;
                         ht.invoke(|| super::super::station_control::ht_timing(&self.io))?;
-                        ht.readback(&self.io, self.station.ht_indices, true)?;
+                        ht.readback_width(
+                            &self.io,
+                            self.station.ht_indices,
+                            true,
+                            self.packet.width,
+                        )?;
                         self.packet.ht = true;
                     }
                     self.station.linked_at = Some(environment.now_ms());
@@ -1545,7 +1610,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             let Some(frame) = step.packet else {
                 continue;
             };
-            if frame.short_gi() && !self.station.ht_profile.is_some_and(|p| p.rx_sgi20()) {
+            if frame.short_gi()
+                && (frame.width40() || !self.station.ht_profile.is_some_and(|p| p.rx_sgi20()))
+            {
                 continue;
             }
             // _rtl88ee_translate_rx_signal_stuff → rtl_process_phyinfo.
@@ -1942,11 +2009,12 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             .ok_or(Error::State)?
             .legacy_rates();
         let mcs = self.station.ht_profile.map(|profile| profile.tx_mcs()[0]);
-        let payload = super::super::rate_adaptive::rate_mask(
+        let payload = super::super::rate_adaptive::rate_mask_width(
             rates,
             mcs,
             level,
-            self.station.ht_profile.is_some_and(|p| p.tx_sgi20()),
+            self.packet.width.is_none() && self.station.ht_profile.is_some_and(|p| p.tx_sgi20()),
+            self.packet.width.is_some(),
         );
         let base = self
             .station
