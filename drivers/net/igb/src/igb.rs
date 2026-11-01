@@ -965,6 +965,46 @@ impl IgbStats {
     }
 }
 
+// ── Power management and detach ─────────────────────────────────────
+//
+// Linux `__igb_close(suspending)` + `__igb_shutdown` + `igb_resume`
+// (igb_main.c) and the detach contract in `drivers/net/specification`
+// §3 (issue #789): a detach path must call
+// `publish::clear_rx_mirror_attached` for the interface name when it
+// unregisters the interface, because `eth%d` names are
+// lowest-free-allocated and reused. Suspend order here: mask
+// interrupts, disable the queue-0 DMA engines, then either arm WoL
+// (RCTL restored for wake filtering, CTRL.ADVD3WUC, WUC/WUFC) or
+// stop DMA and power the PHY down. Resume reverses it: clear WUS,
+// re-kick the PHY, restore RCTL/TCTL, re-run the per-queue ENABLE
+// handshake, unmask the MSI-X block, republish link. Deliberately
+// NOT programmed: firmware handoff via CTRL_EXT.DRV_LOAD (NARF's igb
+// never claims DRV_LOAD, so there is nothing to release) and PTP
+// suspend (no PTP clock exists in this driver). The async pumps are
+// not torn down on detach — they hold an `Arc<Igb>` — but every
+// datapath entry point fails fast once `detached` is set, so a
+// parked pump can no longer touch the device.
+
+/// PHY BMCR power-down bit (IEEE 802.3 clause 22, bit 11).
+const PHY_BMCR_PWRDOWN: u16 = 0x0800;
+
+/// RCTL word for a WoL-armed suspend: the bring-up receive value,
+/// kept so wake filtering still receives.
+const RCTL_SUSPEND_ARMED: u32 =
+    RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | RCTL_BSIZE_2K;
+
+/// RCTL word for an unarmed suspend: receive DMA stopped.
+const RCTL_SUSPEND_OFF: u32 = RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | RCTL_BSIZE_2K;
+
+/// TCTL word for suspend: transmit DMA stopped, PSP kept.
+const TCTL_SUSPEND_OFF: u32 = TCTL_PSP;
+
+/// Whether the datapath may run: false while suspended or detached.
+/// Factored pure so the fixture pins the gate the live paths use.
+pub const fn datapath_allowed(detached: bool, suspended: bool) -> bool {
+    !detached && !suspended
+}
+
 // CTRL bits.
 const CTRL_RST: u32 = 1 << 26;
 const CTRL_SLU: u32 = 1 << 6;
@@ -1467,6 +1507,9 @@ pub struct Igb {
     stats: IgbStats,
     /// WoL filters the suspend sequence will arm (default: none).
     wol_filters: IrqSafeSpinLock<WolFilters>,
+    /// Datapath gates (see [`datapath_allowed`]).
+    suspended: AtomicBool,
+    detached: AtomicBool,
     rx_head: IrqSafeSpinLock<u16>,
     /// Reject nested/concurrent drains while an RX callback owns the current
     /// descriptor. A callback may synchronously transmit, whose responsive
@@ -1748,6 +1791,8 @@ impl Igb {
             vlan_filter: IrqSafeSpinLock::new(VlanFilter::new()),
             stats: IgbStats::default(),
             wol_filters: IrqSafeSpinLock::new(WolFilters::default()),
+            suspended: AtomicBool::new(false),
+            detached: AtomicBool::new(false),
             rx_head: IrqSafeSpinLock::new(0),
             rx_draining: AtomicBool::new(false),
             ready: true,
@@ -1882,6 +1927,136 @@ impl Igb {
         true
     }
 
+    /// Suspend the device (Linux `__igb_shutdown` order): mask
+    /// interrupts, disable the queue-0 DMA engines, then arm WoL or
+    /// stop DMA and power the PHY down. `runtime` selects the
+    /// runtime-suspend filter (link-change only); otherwise the
+    /// filters set by [`Igb::set_wol_filters`] apply. While suspended
+    /// the datapath gates refuse TX and RX (see [`datapath_allowed`])
+    /// and the interface publishes link down. A second suspend is a
+    /// no-op success; suspending a detached device fails.
+    pub fn suspend(&self, runtime: bool) -> Result<(), IgbError> {
+        if self.detached.load(Ordering::Acquire) {
+            return Err(IgbError::Other("igb device detached"));
+        }
+        if self.suspended.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let q0 = queue_regs(0);
+        // SAFETY: mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_IMC, !0u32);
+            self.mmio.write32(REG_EIMC, !0u32);
+            self.mmio.write32(q0.txdctl, 0);
+            self.mmio.write32(q0.rxdctl, 0);
+        }
+        let filters = *self.wol_filters.lock();
+        let program = wol_suspend_program(filters, self.link_up(), runtime);
+        // SAFETY: mapped MMIO.
+        unsafe {
+            if program.wufc != 0 {
+                self.mmio.write32(REG_RCTL, RCTL_SUSPEND_ARMED);
+                let ctrl = self.mmio.read32(REG_CTRL);
+                self.mmio.write32(REG_CTRL, ctrl | CTRL_ADVD3WUC);
+                self.mmio.write32(REG_WUC, program.wuc);
+                self.mmio.write32(REG_WUFC, program.wufc);
+            } else {
+                self.mmio.write32(REG_WUC, 0);
+                self.mmio.write32(REG_WUFC, 0);
+                self.mmio.write32(REG_RCTL, RCTL_SUSPEND_OFF);
+                self.mmio.write32(REG_TCTL, TCTL_SUSPEND_OFF);
+                Self::phy_write(&self.mmio, PHY_BMCR, PHY_BMCR_PWRDOWN);
+            }
+        }
+        crate::publish::publish_link(igb_ifname(), crate::publish::LinkSample::DOWN);
+        Ok(())
+    }
+
+    /// Resume a suspended device (Linux `igb_resume` order): clear
+    /// WUS, re-kick the PHY out of power-down, restore RCTL/TCTL,
+    /// re-run the queue-0 ENABLE handshake, unmask the MSI-X block,
+    /// and republish link. Resuming a running device is a no-op
+    /// success; resuming a detached device fails. A handshake that
+    /// never reflects leaves the device suspended and reports
+    /// `QueueEnableTimeout`.
+    pub fn resume(&self) -> Result<(), IgbError> {
+        if self.detached.load(Ordering::Acquire) {
+            return Err(IgbError::Other("igb device detached"));
+        }
+        if !self.suspended.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let q0 = queue_regs(0);
+        // SAFETY: mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_WUS, wus_clear_word());
+            self.mmio.write32(REG_WUC, 0);
+            self.mmio.write32(REG_WUFC, 0);
+            Self::phy_write(&self.mmio, PHY_BMCR, PHY_BMCR_ANENABLE | PHY_BMCR_ANRESTART);
+            self.mmio.write32(
+                REG_RCTL,
+                RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | RCTL_BSIZE_2K,
+            );
+            self.mmio.write32(REG_TCTL, TCTL_EN | TCTL_PSP);
+            let txdctl = queue_enable_word(self.mmio.read32(q0.txdctl));
+            self.mmio.write32(q0.txdctl, txdctl);
+            let rxdctl = queue_enable_word(self.mmio.read32(q0.rxdctl));
+            self.mmio.write32(q0.rxdctl, rxdctl);
+        }
+        let tx_on = narf_scheduler::responsive_spin_until(
+            // SAFETY: mapped MMIO.
+            || unsafe { queue_enable_reflected(self.mmio.read32(q0.txdctl)) },
+            narf_time::Deadline::after_ms(100),
+        );
+        let rx_on = narf_scheduler::responsive_spin_until(
+            // SAFETY: mapped MMIO.
+            || unsafe { queue_enable_reflected(self.mmio.read32(q0.rxdctl)) },
+            narf_time::Deadline::after_ms(100),
+        );
+        if !tx_on || !rx_on {
+            return Err(IgbError::QueueEnableTimeout);
+        }
+        // Unmask the MSI-X block (same program as bring-up step 9).
+        if self.irq_vector.is_some() {
+            // SAFETY: mapped MMIO.
+            unsafe {
+                self.mmio.write32(
+                    REG_GPIE,
+                    GPIE_NSICR | GPIE_MULTIPLE_MSIX | GPIE_EIAME | GPIE_PBA,
+                );
+                self.mmio.write32(REG_IVAR0, ivar0_shared_vector(0));
+                self.mmio.write32(REG_IVAR_MISC, ivar_misc_shared_vector(0));
+                self.mmio.write32(REG_EITR0, EITR_START | EITR_CNT_IGNR);
+                self.mmio.write32(REG_EIAC, MSIX_VECTOR0_MASK);
+                self.mmio.write32(REG_EIAM, MSIX_VECTOR0_MASK);
+                self.mmio.write32(REG_EIMS, MSIX_VECTOR0_MASK);
+                self.mmio.write32(REG_IMS, IMS_DEFAULT);
+            }
+        }
+        self.suspended.store(false, Ordering::Release);
+        crate::publish::publish_link(igb_ifname(), igb_link_sample(self));
+        Ok(())
+    }
+
+    /// Device half of detach: mask interrupts, disable the queue-0
+    /// DMA engines, clear any WoL arming, drop the ISR's MMIO base so
+    /// a late interrupt cannot read a torn device, and set the
+    /// detached gate. The registry half lives in [`igb_detach`].
+    fn detach_device(&self) {
+        let q0 = queue_regs(0);
+        // SAFETY: mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_IMC, !0u32);
+            self.mmio.write32(REG_EIMC, !0u32);
+            self.mmio.write32(q0.txdctl, 0);
+            self.mmio.write32(q0.rxdctl, 0);
+            self.mmio.write32(REG_WUC, 0);
+            self.mmio.write32(REG_WUFC, 0);
+        }
+        ISR_MMIO_BASE.store(0, Ordering::Release);
+        self.detached.store(true, Ordering::Release);
+    }
+
     pub fn link_up(&self) -> bool {
         // SAFETY: mapped MMIO; STATUS bit 1 = LU (link up).
         let s = unsafe { self.mmio.read32(REG_STATUS) };
@@ -1992,6 +2167,12 @@ impl Igb {
     /// no IRQ-safe lock spans the responsive completion wait: its sleep-pump
     /// may re-enter RX and synchronously transmit an ARP-released packet.
     pub fn tx(&self, frame: &[u8], meta: &TxMeta) -> Result<(), IgbError> {
+        if !datapath_allowed(
+            self.detached.load(Ordering::Acquire),
+            self.suspended.load(Ordering::Acquire),
+        ) {
+            return Err(IgbError::Other("igb device suspended or detached"));
+        }
         if frame.is_empty() || frame.len() > FRAME_SIZE {
             return Err(IgbError::QueueTooSmall);
         }
@@ -2102,6 +2283,12 @@ impl Igb {
     /// Receive a single frame using the advanced RX descriptor format;
     /// returns the byte count copied into `out`, or 0 if none pending.
     pub fn rx(&self, out: &mut [u8]) -> usize {
+        if !datapath_allowed(
+            self.detached.load(Ordering::Acquire),
+            self.suspended.load(Ordering::Acquire),
+        ) {
+            return 0;
+        }
         let mut head = self.rx_head.lock();
         let idx = *head as usize;
         let ring_phys = self.rx_ring_buf.dma_addr().raw();
@@ -2155,6 +2342,12 @@ impl Igb {
     /// single drain on the same ring), which left late single frames — e.g.
     /// a DNS-server ARP reply — undelivered.
     fn rx_drain_in_place<F: FnMut(&mut [u8])>(&self, budget: usize, mut f: F) -> usize {
+        if !datapath_allowed(
+            self.detached.load(Ordering::Acquire),
+            self.suspended.load(Ordering::Acquire),
+        ) {
+            return 0;
+        }
         let limit = budget.min(RX_RING_LEN);
         if limit == 0 {
             return 0;
@@ -2480,6 +2673,28 @@ fn igb_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     ctrl.tx(frame, &meta).map_err(|_| ())
 }
 
+/// Detach the bound igb device, if any: device half (mask, disable
+/// queues, clear WoL, drop the ISR base, set the datapath gate), then
+/// the registry half the net spec §3 obliges — publish link down,
+/// clear the RX-mirror attach note for the interface name (names are
+/// lowest-free-allocated and reused), and unregister the interface.
+/// Idempotent: a second call finds no controller and does nothing.
+/// The async pumps are not joined (they hold `Arc<Igb>` clones), but
+/// every datapath entry point fails fast once detached, so a parked
+/// pump can no longer touch the device.
+pub fn igb_detach() {
+    let controller = CONTROLLER.lock().take();
+    let Some(device) = controller else {
+        return;
+    };
+    device.detach_device();
+    let name = igb_ifname();
+    crate::publish::publish_link(name, crate::publish::LinkSample::DOWN);
+    crate::publish::clear_rx_mirror_attached(name);
+    let _ = narf_net::iface::unregister(name);
+    *IGB_IFNAME.lock() = None;
+}
+
 /// Drain one frame from the RX ring and dispatch it through the network
 /// stack's RX handler. Returns true iff a frame was processed. Called
 /// from the kernel-side polling task + busy-wait drains.
@@ -2619,27 +2834,29 @@ mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     use super::{
-        eitr_reg, eitr_to_usecs, ivar0_shared_vector, ivar_apply, ivar_misc_shared_vector, ivar_rx,
-        ivar_scheme_for_device, ivar_tx, max_queues_for_device, mrqc_word, previous_rx_slot,
-        queue_disable_word, queue_enable_reflected, queue_enable_word, queue_pairs, queue_regs,
-        reta_entry, reta_reg, reta_shift, reta_table, reta_word, rss_key_word, rss_queue_for_hash,
-        rssrk_reg, rxcsum_rss_word, rxdctl_word, strip_vlan_tag_in_place, txdctl_word,
-        usecs_to_eitr, vfta_bit, vfta_word, wol_supported, wol_suspend_program, wus_clear_word,
-        wus_delivered_wake_packet, AdvRxDescRead, AdvRxDescWb, AdvTxCtxtDesc, AdvTxDataDesc,
-        IgbStats, IvarScheme, TxRingCursor, VlanFilter, WolFilters, ADVTXD_DCMD_DEXT,
-        ADVTXD_DTYP_CTXT, ADV_RXD_STAT_VP, CTRL_ADVD3WUC, EEPROM_APME, EITR_CNT_IGNR, EITR_START,
-        IGB_82576, IGB_82576_NS, IGB_DRIVER_VERSION, IGB_I210_COPPER, IGB_I211_COPPER,
-        IGB_I350_COPPER, IGB_MAX_QUEUES, IGB_MAX_QUEUES_82575, IGB_MAX_QUEUES_I211, IGB_STAT_NAMES,
-        IVAR_VALID, MRQC_ENABLE_RSS_MQ, MRQC_ENABLE_VMDQ, MRQC_ENABLE_VMDQ_RSS_MQ, MRQC_FIELD_IPV4,
-        MRQC_FIELD_IPV4_TCP, MRQC_FIELD_IPV4_UDP, MRQC_FIELD_IPV6, MRQC_FIELD_IPV6_TCP,
-        MRQC_FIELD_IPV6_TCP_EX, MRQC_FIELD_IPV6_UDP, QUEUE_ENABLE, REG_EIAC, REG_EIAM, REG_EIMC,
-        REG_EIMS, REG_EITR0, REG_ICR, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC, REG_MRQC,
-        REG_RDBAH, REG_RDBAL, REG_RDH, REG_RDLEN, REG_RDT, REG_RETA_BASE, REG_RSSRK_BASE,
-        REG_RXCSUM, REG_RXDCTL0, REG_SRRCTL_Q0, REG_TDBAH, REG_TDBAL, REG_TDH, REG_TDLEN, REG_TDT,
-        REG_TXDCTL0, REG_VET, REG_VFTA_BASE, REG_WUC, REG_WUFC, REG_WUS, RETA_REGS, RETA_SIZE,
-        RSS_KEY_SIZE, RXCSUM_CRCOFL, RXCSUM_PCSD, RX_RING_LEN, SRRCTL_DESCTYPE_ADV_ONEBUF,
-        TX_CTXT_VLAN_MASK, TX_CTXT_VLAN_SHIFT, TX_RING_LEN, TX_RING_USABLE, VET_8021Q, VFTA_WORDS,
-        WUC_PME_EN, WUFC_LNKC, WUFC_MAG, WUFC_MC, WUS_ARPD, WUS_IPV6,
+        datapath_allowed, eitr_reg, eitr_to_usecs, ivar0_shared_vector, ivar_apply,
+        ivar_misc_shared_vector, ivar_rx, ivar_scheme_for_device, ivar_tx, max_queues_for_device,
+        mrqc_word, previous_rx_slot, queue_disable_word, queue_enable_reflected, queue_enable_word,
+        queue_pairs, queue_regs, reta_entry, reta_reg, reta_shift, reta_table, reta_word,
+        rss_key_word, rss_queue_for_hash, rssrk_reg, rxcsum_rss_word, rxdctl_word,
+        strip_vlan_tag_in_place, txdctl_word, usecs_to_eitr, vfta_bit, vfta_word, wol_supported,
+        wol_suspend_program, wus_clear_word, wus_delivered_wake_packet, AdvRxDescRead, AdvRxDescWb,
+        AdvTxCtxtDesc, AdvTxDataDesc, IgbStats, IvarScheme, TxRingCursor, VlanFilter, WolFilters,
+        ADVTXD_DCMD_DEXT, ADVTXD_DTYP_CTXT, ADV_RXD_STAT_VP, CTRL_ADVD3WUC, EEPROM_APME,
+        EITR_CNT_IGNR, EITR_START, IGB_82576, IGB_82576_NS, IGB_DRIVER_VERSION, IGB_I210_COPPER,
+        IGB_I211_COPPER, IGB_I350_COPPER, IGB_MAX_QUEUES, IGB_MAX_QUEUES_82575,
+        IGB_MAX_QUEUES_I211, IGB_STAT_NAMES, IVAR_VALID, MRQC_ENABLE_RSS_MQ, MRQC_ENABLE_VMDQ,
+        MRQC_ENABLE_VMDQ_RSS_MQ, MRQC_FIELD_IPV4, MRQC_FIELD_IPV4_TCP, MRQC_FIELD_IPV4_UDP,
+        MRQC_FIELD_IPV6, MRQC_FIELD_IPV6_TCP, MRQC_FIELD_IPV6_TCP_EX, MRQC_FIELD_IPV6_UDP,
+        PHY_BMCR_PWRDOWN, QUEUE_ENABLE, RCTL_BAM, RCTL_EN, RCTL_MPE, RCTL_SECRC,
+        RCTL_SUSPEND_ARMED, RCTL_SUSPEND_OFF, RCTL_UPE, REG_EIAC, REG_EIAM, REG_EIMC, REG_EIMS,
+        REG_EITR0, REG_ICR, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC, REG_MRQC, REG_RDBAH,
+        REG_RDBAL, REG_RDH, REG_RDLEN, REG_RDT, REG_RETA_BASE, REG_RSSRK_BASE, REG_RXCSUM,
+        REG_RXDCTL0, REG_SRRCTL_Q0, REG_TDBAH, REG_TDBAL, REG_TDH, REG_TDLEN, REG_TDT, REG_TXDCTL0,
+        REG_VET, REG_VFTA_BASE, REG_WUC, REG_WUFC, REG_WUS, RETA_REGS, RETA_SIZE, RSS_KEY_SIZE,
+        RXCSUM_CRCOFL, RXCSUM_PCSD, RX_RING_LEN, SRRCTL_DESCTYPE_ADV_ONEBUF, TCTL_EN, TCTL_PSP,
+        TCTL_SUSPEND_OFF, TX_CTXT_VLAN_MASK, TX_CTXT_VLAN_SHIFT, TX_RING_LEN, TX_RING_USABLE,
+        VET_8021Q, VFTA_WORDS, WUC_PME_EN, WUFC_LNKC, WUFC_MAG, WUFC_MC, WUS_ARPD, WUS_IPV6,
     };
 
     fn smoke_igb_extended_interrupt_layout() -> TestResult {
@@ -3357,4 +3574,33 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/igb", smoke_igb_ethtool_stats);
+
+    fn smoke_igb_pm_gates_and_words() -> TestResult {
+        // Datapath gate truth table: only running + attached runs.
+        if !datapath_allowed(false, false)
+            || datapath_allowed(true, false)
+            || datapath_allowed(false, true)
+            || datapath_allowed(true, true)
+        {
+            return TestResult::Fail("igb PM datapath gate drift");
+        }
+        // Suspend words: armed keeps receive on for wake filtering;
+        // unarmed stops receive DMA; transmit always stops (PSP kept).
+        if RCTL_SUSPEND_ARMED != RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC {
+            return TestResult::Fail("igb armed-suspend RCTL drift");
+        }
+        if RCTL_SUSPEND_OFF & RCTL_EN != 0
+            || RCTL_SUSPEND_OFF != RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC
+        {
+            return TestResult::Fail("igb unarmed-suspend RCTL drift");
+        }
+        if TCTL_SUSPEND_OFF != TCTL_PSP || TCTL_SUSPEND_OFF & TCTL_EN != 0 {
+            return TestResult::Fail("igb suspend TCTL drift");
+        }
+        if PHY_BMCR_PWRDOWN != 0x0800 {
+            return TestResult::Fail("igb PHY power-down bit drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_pm_gates_and_words);
 }
