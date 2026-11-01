@@ -253,8 +253,8 @@ enum Action {
     DropMaster,
     SetMaster,
     Color {
-        blob: u32,
         coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
     },
     Cursor(Vec<u8>),
     Noop,
@@ -273,6 +273,8 @@ struct Plan {
     nonblock: bool,
     previous_ctm: u32,
     next_ctm: u32,
+    previous_gamma: u32,
+    next_gamma: u32,
 }
 
 fn same_timing(
@@ -338,7 +340,7 @@ impl Plan {
         request: Request,
         geometry: Geometry,
         previous: Option<Crtc>,
-        previous_ctm: Option<u32>,
+        previous_color: Option<(u32, u32)>,
     ) -> Result<Self, FsError> {
         let request = match request {
             Request::Property {
@@ -373,11 +375,15 @@ impl Plan {
             })
             .ok_or(FsError::NoDevice)?;
         let wire = card.mode_wire(&fixed);
-        let previous_ctm =
-            previous_ctm.unwrap_or_else(|| card.crtc_color(previous.id).map_or(0, |c| c.ctm));
+        let (previous_ctm, previous_gamma) = previous_color.unwrap_or_else(|| {
+            card.crtc_color(previous.id)
+                .map_or((0, 0), |c| (c.ctm, c.gamma_lut))
+        });
         let mut p = Self {
             previous_ctm,
             next_ctm: previous_ctm,
+            previous_gamma,
+            next_gamma: previous_gamma,
             next: previous.clone(),
             previous,
             framebuffer: None,
@@ -394,6 +400,7 @@ impl Plan {
         let mut route = fb.map(|_| p.next.id);
         let mut primary_changed = false;
         let mut color = None;
+        let mut gamma = None;
         let mut color_compatible = true;
         let mut rect = [
             0,
@@ -413,6 +420,7 @@ impl Plan {
             }
             Request::DropMaster => {
                 p.next_ctm = 0;
+                p.next_gamma = 0;
                 p.action = Action::DropMaster;
                 return Ok(p);
             }
@@ -421,6 +429,7 @@ impl Plan {
                 p.action = Action::Remove(id);
                 if p.next.primary_fb == Some(id) {
                     p.next_ctm = 0;
+                    p.next_gamma = 0;
                     p.next.primary_fb = None;
                     p.next.enabled = false;
                     p.next.mode = None;
@@ -507,7 +516,12 @@ impl Plan {
                         .ok_or(FsError::InvalidData)?;
                     for (&prop, &value) in a.props[at..end].iter().zip(&a.values[at..end]) {
                         if !((object == p.next.id
-                            && matches!(prop, CRTC_CTM_PROP_ID | CRTC_OUT_FENCE_PTR_PROP_ID))
+                            && matches!(
+                                prop,
+                                CRTC_CTM_PROP_ID
+                                    | CRTC_GAMMA_LUT_PROP_ID
+                                    | CRTC_OUT_FENCE_PTR_PROP_ID
+                            ))
                             || (object == PLANE_ID_BASE && prop == PLANE_IN_FENCE_FD_PROP_ID))
                         {
                             color_compatible = false;
@@ -548,27 +562,31 @@ impl Plan {
                         } else if object == p.next.id {
                             match prop {
                                 CRTC_CTM_PROP_ID => {
-                                    if !card.ctm_only(p.next.id) {
+                                    if !card.intel_color(p.next.id) {
                                         return Err(FsError::Unsupported);
                                     }
                                     let blob = u32_value(value)?;
-                                    let coefficients = if blob == 0 {
-                                        None
-                                    } else {
+                                    if blob != 0
+                                        && card.property_blob(blob).ok_or(FsError::NotFound)?.len()
+                                            != 72
+                                    {
+                                        return Err(FsError::InvalidData);
+                                    }
+                                    color = Some(blob);
+                                }
+                                CRTC_GAMMA_LUT_PROP_ID => {
+                                    if !card.intel_color(p.next.id) {
+                                        return Err(FsError::Unsupported);
+                                    }
+                                    let id = u32_value(value)?;
+                                    if id != 0 {
                                         let bytes =
-                                            card.property_blob(blob).ok_or(FsError::NotFound)?;
-                                        if bytes.len() != 72 {
+                                            card.property_blob(id).ok_or(FsError::NotFound)?;
+                                        if bytes.len() != crate::intel_gpu_color::LUT_SIZE * 8 {
                                             return Err(FsError::InvalidData);
                                         }
-                                        let mut coefficients = [0; 9];
-                                        for (c, bytes) in
-                                            coefficients.iter_mut().zip(bytes.chunks_exact(8))
-                                        {
-                                            *c = u64::from_le_bytes(bytes.try_into().unwrap());
-                                        }
-                                        Some(coefficients)
-                                    };
-                                    color = Some((blob, coefficients));
+                                    }
+                                    gamma = Some(id);
                                 }
                                 CRTC_ACTIVE_PROP_ID => {
                                     if value > 1 {
@@ -622,12 +640,50 @@ impl Plan {
                 }
             }
         }
-        if let Some((blob, coefficients)) = color {
+        if color.is_some() || gamma.is_some() {
             if !color_compatible || !p.previous.enabled || p.previous.mode.is_none() {
                 return Err(FsError::Unsupported);
             }
-            p.next_ctm = blob;
-            p.action = Action::Color { blob, coefficients };
+            if let Some(blob) = color {
+                p.next_ctm = blob;
+            }
+            if let Some(id) = gamma {
+                p.next_gamma = id;
+            }
+            // GAMMA_MODE and CSC_MODE are independent arms. A common latch
+            // boundary is not established by frame polling; coordinated DSB/
+            // vblank arming is required before changing both atomically.
+            if p.next_ctm != p.previous_ctm && p.next_gamma != p.previous_gamma {
+                return Err(FsError::Unsupported);
+            }
+            // MTL has a single-buffered LUT. Replacement requires a real DSB
+            // or IRQ/vblank loader, not timer polling or visible bypass steps.
+            // Check projected state here too: TEST_ONLY has identical admission
+            // and never acquires a display session or touches MMIO.
+            if p.previous_gamma != 0 && p.next_gamma != 0 && p.next_gamma != p.previous_gamma {
+                return Err(FsError::Unsupported);
+            }
+            let coefficients = if p.next_ctm == 0 {
+                None
+            } else {
+                let bytes = card.property_blob(p.next_ctm).ok_or(FsError::NotFound)?;
+                if bytes.len() != 72 {
+                    return Err(FsError::InvalidData);
+                }
+                let mut coefficients = [0; 9];
+                for (c, bytes) in coefficients.iter_mut().zip(bytes.chunks_exact(8)) {
+                    *c = u64::from_le_bytes(bytes.try_into().unwrap());
+                }
+                Some(coefficients)
+            };
+            let lut = if p.next_gamma == 0 {
+                None
+            } else {
+                Some(crate::intel_gpu_color::Lut::decode(
+                    card.property_blob(p.next_gamma).ok_or(FsError::NotFound)?,
+                )?)
+            };
+            p.action = Action::Color { coefficients, lut };
             return Ok(p);
         }
         if rect
@@ -656,6 +712,7 @@ impl Plan {
             p.action = Action::Observe;
         } else if !p.next.enabled || fb.is_none() || route.is_none() {
             p.next_ctm = 0;
+            p.next_gamma = 0;
             p.next.primary_fb = None;
             p.next.enabled = false;
             p.next.mode = None;
@@ -706,7 +763,11 @@ impl Plan {
         if !card.is_master(open) {
             return false;
         }
-        if card.crtc_color(self.previous.id).map_or(0, |c| c.ctm) != self.previous_ctm {
+        if card
+            .crtc_color(self.previous.id)
+            .map_or((0, 0), |c| (c.ctm, c.gamma_lut))
+            != (self.previous_ctm, self.previous_gamma)
+        {
             return false;
         }
         let Ok(current) = card.crtc(self.previous.id) else {
@@ -777,7 +838,11 @@ trait Backend {
     fn surface(&mut self) -> FsFuture<'_, ()> {
         self.restore()
     }
-    fn color(&mut self, _coefficients: Option<[u64; 9]>) -> FsFuture<'_, FlipStamp> {
+    fn color(
+        &mut self,
+        _coefficients: Option<[u64; 9]>,
+        _lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+    ) -> FsFuture<'_, FlipStamp> {
         Box::pin(async { Err(FsError::Unsupported) })
     }
     fn vblank(&mut self) -> FsFuture<'_, FlipStamp>;
@@ -815,8 +880,12 @@ impl<M: crate::intel_gpu_kms::Platform> Backend for crate::intel_gpu_kms::Guard<
     fn surface(&mut self) -> FsFuture<'_, ()> {
         Box::pin(self.restore_surface())
     }
-    fn color(&mut self, coefficients: Option<[u64; 9]>) -> FsFuture<'_, FlipStamp> {
-        Box::pin(self.set_ctm(coefficients))
+    fn color(
+        &mut self,
+        coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+    ) -> FsFuture<'_, FlipStamp> {
+        Box::pin(self.set_color(coefficients, lut))
     }
     fn vblank(&mut self) -> FsFuture<'_, FlipStamp> {
         alloc::boxed::Box::pin(self.wait_vblank())
@@ -990,6 +1059,28 @@ async fn execute<B: Backend>(
     Ok(0)
 }
 
+/// Both the close task and a replacement master's first transaction consume
+/// the same marker under the display Session. Software master assignment alone
+/// cannot skip restoration, and an old close task cannot restore newer state.
+async fn finish_master_release<B: Backend>(
+    backend: &mut B,
+    mode: &ModeState,
+) -> Result<(), FsError> {
+    if !mode.lock().intel_master_restore_pending() {
+        return Ok(());
+    }
+    backend.restore().await?;
+    backend.valid()?;
+    mode.lock().intel_master_restored();
+    Ok(())
+}
+pub(crate) async fn restore_released_master<M: crate::intel_gpu_kms::Platform>(
+    session: &mut crate::intel_gpu_kms::Guard<'_, M>,
+    mode: &ModeState,
+) -> Result<(), FsError> {
+    finish_master_release(session, mode).await
+}
+
 async fn execute_plan<B: Backend>(
     backend: &mut B,
     mode: &ModeState,
@@ -997,6 +1088,7 @@ async fn execute_plan<B: Backend>(
     plan: &Plan,
     reservation: Option<FlipEventReservation>,
 ) -> Result<FlipStamp, FsError> {
+    finish_master_release(backend, mode).await?;
     if matches!(plan.action, Action::SetMaster) {
         mode.lock().set_master(open).map_err(|_| FsError::Busy)?;
         return Ok(FlipStamp {
@@ -1032,8 +1124,8 @@ async fn execute_plan<B: Backend>(
             backend.surface().await?;
             stamp = Some(backend.vblank().await?);
         }
-        Action::Color { coefficients, .. } => {
-            stamp = Some(backend.color(*coefficients).await?);
+        Action::Color { coefficients, lut } => {
+            stamp = Some(backend.color(*coefficients, lut.clone()).await?);
         }
         Action::Present => {
             let fb = plan.framebuffer.as_ref().ok_or(FsError::InvalidData)?;
@@ -1130,6 +1222,7 @@ async fn execute_plan<B: Backend>(
             }
             if let Some(color) = card.crtc_color.iter_mut().find(|c| c.crtc == plan.next.id) {
                 color.ctm = plan.next_ctm;
+                color.gamma_lut = plan.next_gamma;
             }
             card.collect_blobs();
             if matches!(plan.action, Action::Color { .. }) {
@@ -1147,9 +1240,10 @@ async fn execute_plan<B: Backend>(
     };
     if !published {
         backend.restore().await?;
+        backend.valid()?;
         // The failed transaction restored the kernel console, including its
         // color. Keep subsequent admission consistent with that real image.
-        mode.lock().intel_clear_ctm();
+        mode.lock().intel_master_restored();
         return Err(FsError::Busy);
     }
     Ok(stamp.unwrap_or(FlipStamp {

@@ -17,6 +17,7 @@ use core::task::Poll;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RegisterError {
     Identity,
+    ComputeMode,
     Context(ContextError),
     Unavailable,
     Timeout,
@@ -76,6 +77,14 @@ mod tests {
                     | 0x22050
                     | 0x3ee0d4
                     | 0x3ee050
+                    | 0x1c0d4
+                    | 0x1c050
+                    | 0x1e0d4
+                    | 0x1e050
+                    | 0x260d4
+                    | 0x26050
+                    | 0x14800
+                    | 0x14804
             );
             regs.insert(
                 reg,
@@ -250,6 +259,34 @@ mod tests {
         smoke_global_register_xe2_fuse_and_ip_vectors
     );
 
+    fn smoke_global_multi_ccs_partition_requires_posted_write_proof() -> TestResult {
+        for rejected in [0x14800, 0x14804] {
+            let platform = GtPlatform::Battlemage;
+            let (w, _) = fixture(platform, 0xe20b, 1, 0, false, 1);
+            w.regs.borrow_mut().insert(0x9114, 0xf0010);
+            w.regs.borrow_mut().insert(rejected, 0);
+            let topology = GtTopology::read(&w, platform).unwrap();
+            let bytes = [1u32, 1, 4, 70, 1, 32]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            let config = HardwareConfig::parse(bytes).unwrap();
+            let init = RegisterInit::with_ccs_mode(&w, platform, 0xe20b, &topology, &config, 10, 2)
+                .unwrap();
+            assert_eq!(init.compute_configuration(), (15, 2));
+            w.reject.set(rejected);
+            assert!(
+                matches!(init.poll(&w, 11), Poll::Ready(Err(RegisterError::Verify(reg))) if reg == rejected)
+            );
+            assert_eq!(w.writes.borrow().last(), Some(&(0xfd0, 1)));
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_multi_ccs",
+        smoke_global_multi_ccs_partition_requires_posted_write_proof
+    );
+
     // xe_hw_engine.c compute fuses and __xe_gt_apply_ccs_mode(ccs_mode 1).
     fn smoke_global_register_ccs_inventory_and_mode() -> TestResult {
         use crate::intel_gpu_engine::Engine;
@@ -345,10 +382,12 @@ pub(crate) struct RegisterInit {
     discontiguous: bool,
     /// Physically present CCS instances (bit n = CCSn).
     compute: u8,
+    compute_mode: u8,
     deadline: u64,
 }
 
 impl RegisterInit {
+    #[cfg(feature = "kernel-test")]
     pub(crate) fn new(
         mmio: &impl MmioWindow,
         platform: GtPlatform,
@@ -356,6 +395,18 @@ impl RegisterInit {
         topology: &GtTopology,
         config: &HardwareConfig,
         now: u64,
+    ) -> Result<Self, RegisterError> {
+        Self::with_ccs_mode(mmio, platform, device, topology, config, now, 1)
+    }
+
+    pub(crate) fn with_ccs_mode(
+        mmio: &impl MmioWindow,
+        platform: GtPlatform,
+        device: u16,
+        topology: &GtTopology,
+        config: &HardwareConfig,
+        now: u64,
+        mode: u8,
     ) -> Result<Self, RegisterError> {
         if GtPlatform::from_pci(0x8086, device) != Some(platform) {
             return Err(RegisterError::Identity);
@@ -382,29 +433,38 @@ impl RegisterInit {
             topology.geometry_dss() | topology.compute_dss(),
             seed.fuse4,
         );
+        if crate::intel_gpu_engine::compute_selection(compute, mode).is_none()
+            || (!platform.is_discrete() && mode != 1)
+        {
+            return Err(RegisterError::ComputeMode);
+        }
         Ok(Self {
             platform,
             device,
             seed,
             discontiguous,
             compute,
+            compute_mode: mode,
             deadline: now.checked_add(50_000_000).ok_or(RegisterError::Timeout)?,
         })
     }
 
-    /// RCS0/BCS0 always, BCS8 on BMG, CCS0 when fused present. Linux
+    pub(crate) fn compute_configuration(&self) -> (u8, u8) {
+        (self.compute, self.compute_mode)
+    }
+
+    /// RCS0/BCS0 always, BCS8 on BMG, then the selected physical CCSs. Linux
     /// XE2_GFX_FEATURES includes BCS8; read_copy_fuses does not filter BMG.
     pub(crate) fn engines(&self) -> crate::intel_gpu_engine::EngineSet {
         use crate::intel_gpu_engine::{Engine, EngineSet};
-        match (
-            self.platform == GtPlatform::Battlemage,
-            self.compute & 1 != 0,
-        ) {
-            (true, true) => EngineSet::of(&Engine::ALL),
-            (true, false) => EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Bcs8]),
-            (false, true) => EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs0]),
-            (false, false) => EngineSet::of(&[Engine::Rcs0, Engine::Bcs0]),
+        let mut engines = EngineSet::of(&[Engine::Rcs0, Engine::Bcs0]);
+        if self.platform == GtPlatform::Battlemage {
+            engines = EngineSet::from_bits(engines.bits() | EngineSet::of(&[Engine::Bcs8]).bits());
         }
+        let selected = crate::intel_gpu_engine::compute_selection(self.compute, self.compute_mode)
+            .expect("validated partition");
+        engines = EngineSet::from_bits(engines.bits() | selected.bits());
+        engines
     }
 
     /// Ready(Ok(Some)) also returns BMG's local-memory layout registers,
@@ -568,7 +628,7 @@ impl RegisterInit {
         };
         // Multi-CCS parts: fixed-slice RCU mode and all slices on CCS0
         // (xe_hw_engine_match_fixed_cslice_mode, __xe_gt_apply_ccs_mode).
-        if let Some(mode) = crate::intel_gpu_engine::ccs_mode(self.compute) {
+        if let Some(mode) = crate::intel_gpu_engine::ccs_mode(self.compute, self.compute_mode) {
             add(0x14800, 2, 2, true, Direct);
             add(0x14804, 0xfff, mode & 0xfff, true, Direct);
         }
@@ -680,9 +740,25 @@ impl RegisterInit {
                 add(0x22050, 0x1000, 0x1000, true, Direct); // 16023105232
                 add(0x3ee0d4, 0xc080, 0xc080, true, Direct); // BCS8 ENGINE_BASE
                 add(0x3ee050, 0x1000, 0x1000, true, Direct); // 16023105232
-                if self.compute & 1 != 0 {
-                    add(0x1a0d4, 0xc080, 0xc080, true, Direct); // 16021639441 + priority reads
-                    add(0x1a050, 0x1000, 0x1000, true, Direct); // 16023105232
+                for engine in crate::intel_gpu_engine::Engine::ALL
+                    .into_iter()
+                    .filter(|e| e.is_compute())
+                    .filter(|e| self.compute & (1 << e.physical_instance()) != 0)
+                {
+                    add(
+                        u64::from(engine.base()) + 0xd4,
+                        0xc080,
+                        0xc080,
+                        true,
+                        Direct,
+                    );
+                    add(
+                        u64::from(engine.base()) + 0x50,
+                        0x1000,
+                        0x1000,
+                        true,
+                        Direct,
+                    );
                 }
                 add(0xe530, 0x400, 0x400, false, Dss); // AnyHit null-query tuning
             }

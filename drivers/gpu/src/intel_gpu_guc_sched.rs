@@ -215,7 +215,7 @@ pub(crate) struct GuCScheduler<A: BootAllocator> {
     slpc: Slpc,
     engines: EngineSet,
     /// Default CCS state commands, captured with the render seed's fuses.
-    compute_seed: Vec<u32>,
+    disable_wmtp: bool,
     /// Captured only on an actual failure, before disable can provoke reset.
     pending_error: Option<Report>,
 }
@@ -301,7 +301,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             user_submitted: false,
             slpc: Slpc::new(),
             engines,
-            compute_seed: Vec::new(),
+            disable_wmtp: false,
             pending_error: None,
         })
     }
@@ -550,7 +550,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
         if !self.can_prime() {
             return Err(SchedulingError::Busy);
         }
-        self.compute_seed = crate::intel_gpu_engine::compute_seed(self.platform, seed.disable_wmtp);
+        self.disable_wmtp = seed.disable_wmtp;
         let (id, _) = self.submit(now, Engine::Rcs0, None, Some(seed.commands()))?;
         let completion = Arc::new(CompletionFence::new());
         self.resources.defaults_completion = Some(completion.clone());
@@ -705,7 +705,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             } else {
                 render_completion(
                     self.platform,
-                    engine == Engine::Ccs0,
+                    engine.is_compute(),
                     image.ggtt_offset(),
                     stamp,
                     &mut words,
@@ -728,7 +728,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             } else {
                 let mut words = resident_ring(
                     self.platform,
-                    engine == Engine::Ccs0,
+                    engine.is_compute(),
                     (!batch.skip_batch()).then_some(batch.address()),
                     image.ggtt_offset(),
                     stamp,
@@ -876,7 +876,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             let seed = if engine.is_copy() {
                 crate::intel_gpu_engine::copy_seed(engine, self.platform)
             } else {
-                self.compute_seed.clone()
+                crate::intel_gpu_engine::compute_seed(engine, self.platform, self.disable_wmtp)
             };
             match self.submit(now, engine, None, Some(seed)) {
                 Ok((id, _)) => self.defaults = Defaults::Seed(engine, id),
@@ -995,7 +995,10 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         1,
                         id,
                         context.engine.guc_class(),
-                        context.engine.submit_mask(),
+                        1 << self
+                            .engines
+                            .logical_instance(context.engine)
+                            .expect("published engine"),
                         0,
                         0,
                         0,

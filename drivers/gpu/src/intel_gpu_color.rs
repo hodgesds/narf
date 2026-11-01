@@ -1,8 +1,10 @@
-//! Owned Pipe-A CTM transaction for MTL/Arrow's TGL+ display color pipeline.
+//! Owned Pipe-A CTM/gamma transaction for MTL/Arrow's TGL+ display color pipeline.
 //! MIT Linux b90c984d615e: intel_color.c::ilk_csc_convert_ctm,
 //! ilk_update_pipe_csc, icl_color_commit_noarm/arm and tgl_color_funcs;
-//! intel_color_regs.h / skl_universal_plane_regs.h. No LUT writes or DSB.
+//! intel_color_regs.h / skl_universal_plane_regs.h. Precision LUT preload
+//! follows icl_load_luts/bdw_load_lut_10/intel_can_preload_luts. No DSB.
 use crate::{drm::card::FlipStamp, intel_gpu::Generation, intel_gpu_aux::MmioWindow};
+use alloc::{sync::Arc, vec::Vec};
 use narf_filesystem::FsError;
 
 pub(crate) const MODE: u64 = 0x49028;
@@ -118,9 +120,100 @@ impl Image {
                 .all(|(&r, v)| io.read32(r) == v)
     }
 }
+/// MTL/Arrow's native post-CSC LUT: 1024 RGB entries, ten bits/channel.
+/// This profile has no monotonic/equal-channel restriction (XE_LPDP_FEATURES).
+pub(crate) const LUT_SIZE: usize = 1024;
+const INDEX: u64 = 0x4a400;
+const DATA: u64 = 0x4a404;
+const POST_ENABLE: u32 = 1 << 30;
+const MAX_REGS: [u64; 6] = [0x4a420, 0x4a424, 0x4a428, 0x4a430, 0x4a434, 0x4a438];
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Lut {
+    entries: Vec<u32>,
+}
+impl Lut {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Arc<Self>, FsError> {
+        if bytes.len() != LUT_SIZE * 8 {
+            return Err(FsError::InvalidData);
+        }
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(LUT_SIZE)
+            .map_err(|_| FsError::OutOfMemory)?;
+        for bytes in bytes.chunks_exact(8) {
+            // drm_color_lut_extract(16 -> 10) rounds, not truncates. The UAPI
+            // reserved word is ignored, exactly as Linux's ilk_lut_10 does.
+            let channel = |at| {
+                let v = u32::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
+                (v * 1023 + 32767) / 65535
+            };
+            entries.push(channel(0) << 20 | channel(2) << 10 | channel(4));
+        }
+        Ok(Arc::new(Self { entries }))
+    }
+}
+#[derive(Debug)]
+struct Palette {
+    entries: Vec<u32>,
+    maxima: [u32; 6],
+}
+impl Palette {
+    fn capture(io: &impl MmioWindow) -> Result<Self, FsError> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(LUT_SIZE)
+            .map_err(|_| FsError::OutOfMemory)?;
+        for i in 0..LUT_SIZE {
+            io.write32(INDEX, i as u32);
+            let value = io.read32(DATA);
+            if value == u32::MAX {
+                io.write32(INDEX, 0);
+                return Err(FsError::NoDevice);
+            }
+            entries.push(value);
+        }
+        io.write32(INDEX, 0);
+        let maxima = MAX_REGS.map(|r| io.read32(r));
+        if maxima.contains(&u32::MAX) {
+            return Err(FsError::NoDevice);
+        }
+        Ok(Self { entries, maxima })
+    }
+    fn write(io: &impl MmioWindow, entries: &[u32], maxima: [u32; 6]) -> Result<(), FsError> {
+        // bdw_load_lut_10: reset index before enabling auto increment, then
+        // reset it afterwards so subsequent legacy palette access still works.
+        io.write32(INDEX, 0);
+        io.write32(INDEX, 1 << 15);
+        for &value in entries {
+            io.write32(DATA, value);
+        }
+        io.write32(INDEX, 0);
+        for (register, value) in MAX_REGS.into_iter().zip(maxima) {
+            io.write32(register, value);
+        }
+        // Verify the actual indexed palette, not only the last DATA register.
+        let mut matches = true;
+        for (i, &value) in entries.iter().enumerate() {
+            io.write32(INDEX, i as u32);
+            matches &= io.read32(DATA) == value;
+        }
+        io.write32(INDEX, 0);
+        if !matches
+            || MAX_REGS
+                .into_iter()
+                .zip(maxima)
+                .any(|(r, v)| io.read32(r) != v)
+        {
+            return Err(FsError::NoDevice);
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Copy, Debug)]
 struct Pending {
     image: Image,
+    gamma: u32,
+    restore_palette: bool,
     start: u32,
     deadline: u64,
 }
@@ -131,6 +224,9 @@ pub(crate) struct Owner {
     original: Image,
     gamma: u32,
     expected: Image,
+    expected_gamma: u32,
+    original_palette: Option<Palette>,
+    lut: Option<Arc<Lut>>,
     pending: Option<Pending>,
     failed: bool,
 }
@@ -156,6 +252,9 @@ impl Owner {
             original,
             gamma,
             expected: original,
+            expected_gamma: gamma,
+            original_palette: None,
+            lut: None,
             pending: None,
             failed: false,
         })
@@ -163,10 +262,20 @@ impl Owner {
     pub(crate) fn pending(&self) -> bool {
         self.pending.is_some()
     }
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn arm(
         &mut self,
         io: &impl MmioWindow,
         coefficients: Option<[u64; 9]>,
+        now: u64,
+    ) -> Result<(), FsError> {
+        self.arm_color(io, coefficients, self.lut.clone(), now)
+    }
+    pub(crate) fn arm_color(
+        &mut self,
+        io: &impl MmioWindow,
+        coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<Lut>>,
         now: u64,
     ) -> Result<(), FsError> {
         if self.failed {
@@ -175,14 +284,43 @@ impl Owner {
         if self.pending.is_some() {
             return Err(FsError::Busy);
         }
-        if !pipeline(io) || !self.expected.matches(io) || io.read32(GAMMA) != self.gamma {
+        // Single-buffered LUT: only inactive preload is source-qualified.
+        // Same-LUT CTM changes do not touch palette memory at all.
+        let changed = self.lut != lut;
+        if changed && self.expected_gamma & POST_ENABLE != 0 && lut.is_some() {
+            return Err(FsError::Unsupported);
+        }
+        if !pipeline(io) || !self.expected.matches(io) || io.read32(GAMMA) != self.expected_gamma {
             self.failed = true;
             return Err(FsError::NoDevice);
         }
-        self.write(io, coefficients.map_or(self.original, Image::ctm), now)
+        if let Some(lut) = lut.as_ref().filter(|_| changed) {
+            if self.original_palette.is_none() {
+                self.original_palette = Some(Palette::capture(io)?);
+            }
+            // Retain original and uncertain ownership before the first write.
+            self.failed = true;
+            Palette::write(io, &lut.entries, [1 << 16; 6])?;
+            self.failed = false;
+        }
+        let gamma = if lut.is_some() {
+            (self.gamma & !3) | POST_ENABLE | 1
+        } else {
+            self.gamma
+        };
+        let restore_palette = changed && lut.is_none() && self.original_palette.is_some();
+        self.lut = lut;
+        self.write(
+            io,
+            coefficients.map_or(self.original, Image::ctm),
+            gamma,
+            restore_palette,
+            now,
+        )
     }
-    /// Only the fresh post-reset view can restore an image after loss. No
-    /// old pending frame/readback is consumed as evidence of this new arm.
+    /// Only a fresh post-reset view may restore an image after loss. First
+    /// latch disabled gamma; original single-buffered entries are rewritten
+    /// only after that separate frame/readback proof, before admission reopens.
     pub(crate) fn recover_original(
         &mut self,
         io: &impl MmioWindow,
@@ -194,11 +332,23 @@ impl Owner {
             self.failed = true;
             return Err(FsError::NoDevice);
         }
-        self.write(io, self.original, now)
+        self.lut = None;
+        self.write(
+            io,
+            self.original,
+            self.gamma,
+            self.original_palette.is_some(),
+            now,
+        )
     }
-    fn write(&mut self, io: &impl MmioWindow, image: Image, now: u64) -> Result<(), FsError> {
-        // Publish uncertain ownership before the first write. All coefficient
-        // registers are non-arming shadow registers on TGL+; CSC_MODE is last.
+    fn write(
+        &mut self,
+        io: &impl MmioWindow,
+        image: Image,
+        gamma: u32,
+        restore_palette: bool,
+        now: u64,
+    ) -> Result<(), FsError> {
         let start = io.read32(FRAME);
         if start == u32::MAX {
             self.failed = true;
@@ -206,26 +356,30 @@ impl Owner {
         }
         self.pending = Some(Pending {
             image,
+            gamma,
+            restore_palette,
             start,
             deadline: now.saturating_add(1_000_000_000),
         });
         for (&register, value) in REGISTERS.iter().zip(image.values) {
             io.write32(register, value);
         }
-        io.write32(GAMMA, self.gamma);
+        io.write32(GAMMA, gamma);
         io.write32(MODE, image.mode);
-        if !image.matches(io) || io.read32(GAMMA) != self.gamma {
+        if !image.matches(io) || io.read32(GAMMA) != gamma {
             self.failed = true;
             return Err(FsError::NoDevice);
         }
-        // Capture after posting the arm. Waiting for a later stable frame
-        // cannot mistake a vblank between coefficient writes and arm for latch.
-        let start = io.read32(FRAME);
-        if start == u32::MAX {
+        // Capture after the posted arm. A prior vblank is never latch evidence.
+        let armed = io.read32(FRAME);
+        if armed == u32::MAX || armed != start {
+            // GAMMA_MODE and CSC_MODE have separate arm writes. Refuse a
+            // transaction spanning the latch boundary instead of reporting a
+            // possibly split CTM/gamma update as atomic success.
             self.failed = true;
             return Err(FsError::NoDevice);
         }
-        self.pending.as_mut().expect("pending color").start = start;
+        self.pending.as_mut().expect("pending color").start = armed;
         Ok(())
     }
     pub(crate) fn poll(
@@ -239,14 +393,23 @@ impl Owner {
         let Some(pending) = self.pending else {
             return Ok(None);
         };
-        if !pipeline(io) || !pending.image.matches(io) || io.read32(GAMMA) != self.gamma {
+        if !pipeline(io) || !pending.image.matches(io) || io.read32(GAMMA) != pending.gamma {
             self.failed = true;
             return Err(FsError::NoDevice);
         }
         let before = io.read32(FRAME);
         let after = io.read32(FRAME);
         if before != u32::MAX && before == after && before != pending.start {
+            if pending.restore_palette {
+                // POST_CSC_GAMMA_ENABLE is now proved off at a later vblank.
+                // No in-place active restoration is hidden behind this path.
+                let original = self.original_palette.as_ref().expect("saved palette");
+                self.failed = true;
+                Palette::write(io, &original.entries, original.maxima)?;
+                self.failed = false;
+            }
             self.expected = pending.image;
+            self.expected_gamma = pending.gamma;
             self.pending = None;
             return Ok(Some(FlipStamp {
                 ns: now,

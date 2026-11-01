@@ -5,9 +5,8 @@
 //! applies only to PVC and Xe3+), xe_hw_engine.c, xe_lrc.c
 //! {gen12_xcs,xe2_bcs}_offsets, xe_ring_ops.c::__emit_job_gen12_simple,
 //! xe_gt.c::emit_wa_job, xe_hw_engine_setup_default_lrc_state and
-//! regs/xe_engine_regs.h. CCS0 follows xe_gt_ccs_mode.c's default ccs_mode 1
-//! (all compute slices on CCS0; CCS1-3 never exposed) and xe_hw_engine.c's
-//! compute fuses. BMG's architecture-present BCS8 is ordinary COPY1 while
+//! regs/xe_engine_regs.h. CCS0–3 follow xe_gt_ccs_mode.c's immutable boot
+//! partition (default one engine), dense logical mapping and physical fuses. BMG's architecture-present BCS8 is ordinary COPY1 while
 //! USM is absent. A future USM owner must reserve/revoke that user engine.
 //! Media engines remain unadmitted.
 
@@ -26,6 +25,9 @@ pub enum Engine {
     Bcs0,
     Bcs8,
     Ccs0,
+    Ccs1,
+    Ccs2,
+    Ccs3,
 }
 
 /// The engines a GT publishes, decided from fuses before scheduling starts.
@@ -55,6 +57,22 @@ impl EngineSet {
     pub fn iter(self) -> impl Iterator<Item = Engine> {
         Engine::ALL.into_iter().filter(move |e| self.contains(*e))
     }
+    pub fn compute(self) -> impl Iterator<Item = Engine> {
+        self.iter().filter(|engine| engine.is_compute())
+    }
+    /// Dense UAPI/GuC logical numbering is defined by this published set,
+    /// including when lower physical compute instances are fused off.
+    pub fn logical_instance(self, engine: Engine) -> Option<u16> {
+        self.iter()
+            .filter(|candidate| candidate.xe_class() == engine.xe_class())
+            .position(|candidate| candidate == engine)
+            .map(|index| index as u16)
+    }
+    pub fn from_class_instance(self, class: u16, logical: u16) -> Option<Engine> {
+        self.iter()
+            .filter(|engine| engine.xe_class() == class)
+            .nth(usize::from(logical))
+    }
 }
 
 /// Physically present compute instances (bit n = CCSn), from
@@ -74,25 +92,67 @@ pub(crate) fn compute_instances(platform: GtPlatform, dss: u32, fuse4: u32) -> u
     }
 }
 
-/// xe_gt_ccs_mode.c::__xe_gt_apply_ccs_mode with one exposed engine: every
-/// present compute slice is assigned to CCS0, absent slices stay disabled.
-/// `None` when at most one CCS exists (CCS mode is not enabled).
-pub(crate) fn ccs_mode(instances: u8) -> Option<u32> {
-    if instances.count_ones() <= 1 {
+/// Boot-only compute partition. Xe requires an equal integral slice share.
+/// Default mode1 permits a GT with no compute engine at all.
+pub(crate) fn compute_selection(instances: u8, requested: u8) -> Option<EngineSet> {
+    let count = instances.count_ones() as u8;
+    if instances & !15 != 0
+        || requested == 0
+        || requested > 4
+        || (count == 0 && requested != 1)
+        || (count != 0 && (requested > count || count % requested != 0))
+    {
         return None;
     }
+    Some(EngineSet::from_bits(
+        Engine::ALL
+            .into_iter()
+            .filter(|e| e.is_compute())
+            .filter(|e| instances & (1 << e.physical_instance()) != 0)
+            .take(usize::from(requested))
+            .fold(0, |bits, e| bits | (1 << e.index())),
+    ))
+}
+
+/// xe_gt_ccs_mode.c::__xe_gt_apply_ccs_mode: present slices are assigned
+/// round-robin to the first requested physical engines; absent slices stay disabled.
+/// `None` when at most one CCS exists (CCS mode is not enabled).
+pub(crate) fn ccs_mode(instances: u8, engines: u8) -> Option<u32> {
+    let count = instances.count_ones();
+    if count <= 1 || compute_selection(instances, engines).is_none() {
+        return None;
+    }
+    let mut owners = [0u32; 4];
+    for (n, physical) in (0..4)
+        .filter(|i| instances & (1 << i) != 0)
+        .take(usize::from(engines))
+        .enumerate()
+    {
+        owners[n] = physical;
+    }
     let mut mode = 0xfff; // CCS_MODE_CSLICE_0_3_MASK: all disabled
+    let mut next = 0;
     for slice in 0..4 {
         if instances & 1 << slice != 0 {
-            mode &= !(7 << (slice * 3)); // CCS0
+            mode &= !(7 << (slice * 3));
+            mode |= owners[next % usize::from(engines)] << (slice * 3);
+            next += 1;
         }
     }
     Some(mode | 0xfff << 16)
 }
 
 impl Engine {
-    pub const COUNT: usize = 4;
-    pub const ALL: [Engine; Self::COUNT] = [Engine::Rcs0, Engine::Bcs0, Engine::Bcs8, Engine::Ccs0];
+    pub const COUNT: usize = 7;
+    pub const ALL: [Engine; Self::COUNT] = [
+        Engine::Rcs0,
+        Engine::Bcs0,
+        Engine::Bcs8,
+        Engine::Ccs0,
+        Engine::Ccs1,
+        Engine::Ccs2,
+        Engine::Ccs3,
+    ];
 
     pub(crate) fn index(self) -> usize {
         self as usize
@@ -103,6 +163,9 @@ impl Engine {
             Engine::Bcs0 => 0x22000,
             Engine::Bcs8 => 0x3ee000,
             Engine::Ccs0 => 0x1a000,
+            Engine::Ccs1 => 0x1c000,
+            Engine::Ccs2 => 0x1e000,
+            Engine::Ccs3 => 0x26000,
         }
     }
     /// GUC_RENDER_CLASS / GUC_BLITTER_CLASS / GUC_COMPUTE_CLASS.
@@ -110,7 +173,7 @@ impl Engine {
         match self {
             Engine::Rcs0 => 0,
             Engine::Bcs0 | Engine::Bcs8 => 3,
-            Engine::Ccs0 => 4,
+            Engine::Ccs0 | Engine::Ccs1 | Engine::Ccs2 | Engine::Ccs3 => 4,
         }
     }
     /// DRM_XE_ENGINE_CLASS_RENDER / _COPY / _COMPUTE (also i915 UABI).
@@ -118,39 +181,23 @@ impl Engine {
         match self {
             Engine::Rcs0 => 0,
             Engine::Bcs0 | Engine::Bcs8 => 1,
-            Engine::Ccs0 => 4,
-        }
-    }
-    #[cfg(feature = "kernel-test")]
-    pub(crate) fn from_xe_class(class: u16) -> Option<Self> {
-        Self::from_class_instance(class, 0)
-    }
-    /// Public logical instances are dense within a class; GuC ADS maps
-    /// COPY1 to hardware BCS8 (xe_hw_engine_setup_logical_mapping).
-    pub fn logical_instance(self) -> u16 {
-        if self == Self::Bcs8 {
-            1
-        } else {
-            0
+            Engine::Ccs0 | Engine::Ccs1 | Engine::Ccs2 | Engine::Ccs3 => 4,
         }
     }
     pub(crate) fn physical_instance(self) -> u32 {
-        if self == Self::Bcs8 {
-            8
-        } else {
-            0
+        match self {
+            Self::Bcs8 => 8,
+            Self::Ccs1 => 1,
+            Self::Ccs2 => 2,
+            Self::Ccs3 => 3,
+            _ => 0,
         }
-    }
-    pub(crate) fn submit_mask(self) -> u32 {
-        1 << self.logical_instance()
     }
     pub(crate) fn is_copy(self) -> bool {
         matches!(self, Self::Bcs0 | Self::Bcs8)
     }
-    pub(crate) fn from_class_instance(class: u16, instance: u16) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|e| e.xe_class() == class && e.logical_instance() == instance)
+    pub fn is_compute(self) -> bool {
+        matches!(self, Self::Ccs0 | Self::Ccs1 | Self::Ccs2 | Self::Ccs3)
     }
     /// xe_gt_lrc_size: PPHWSP plus the class's engine context image.
     pub(crate) fn lrc_pages(self, platform: GtPlatform) -> u32 {
@@ -158,8 +205,10 @@ impl Engine {
             (Engine::Rcs0, GtPlatform::Battlemage) => 4,
             (Engine::Rcs0, _) => 14,
             (Engine::Bcs0 | Engine::Bcs8, _) => 2,
-            (Engine::Ccs0, GtPlatform::Battlemage) => 3,
-            (Engine::Ccs0, _) => 14,
+            (Engine::Ccs0 | Engine::Ccs1 | Engine::Ccs2 | Engine::Ccs3, GtPlatform::Battlemage) => {
+                3
+            }
+            (Engine::Ccs0 | Engine::Ccs1 | Engine::Ccs2 | Engine::Ccs3, _) => 14,
         }
     }
     /// First MI_LOAD_REGISTER_IMM header of the hardware-saved image.
@@ -183,12 +232,12 @@ pub(crate) fn enable_ring(
     let base = u64::from(engine.base());
     let uc = uncached_mocs(platform);
     // hw_engine_setup_default_state: discrete Xe2 compute reads use WB.
-    let read = if engine == Engine::Ccs0 && platform == GtPlatform::Battlemage {
+    let read = if engine.is_compute() && platform == GtPlatform::Battlemage {
         4
     } else {
         uc
     };
-    if engine == Engine::Ccs0 {
+    if engine.is_compute() {
         mmio.write32(0x14800, 0x00010001); // RCU_MODE_CCS_ENABLE
     }
     mmio.write32(base + 0xc4, 0x3f7e0000 | uc << 8 | read << 1);
@@ -247,9 +296,9 @@ pub(crate) fn copy_seed(engine: Engine, platform: GtPlatform) -> Vec<u32> {
 /// Default CCS LRC state: xe_hw_engine_setup_default_lrc_state's only
 /// compute entry on these platforms, the Xe2 WMTP-disabled preemption level
 /// (CS_CHICKEN1 PREEMPT_GPGPU_THREAD_GROUP_LEVEL, masked). No 3D state.
-pub(crate) fn compute_seed(platform: GtPlatform, disable_wmtp: bool) -> Vec<u32> {
+pub(crate) fn compute_seed(engine: Engine, platform: GtPlatform, disable_wmtp: bool) -> Vec<u32> {
     if platform == GtPlatform::Battlemage && disable_wmtp {
-        alloc::vec![0x11000001, Engine::Ccs0.base() + 0x580, 0x00060002]
+        alloc::vec![0x11000001, engine.base() + 0x580, 0x00060002]
     } else {
         Vec::new()
     }
@@ -325,7 +374,7 @@ pub(crate) fn xcs_image(engine: Engine, image: &impl GpuBacking, platform: GtPla
     let mut first: Vec<u32> = alloc::vec![
         0x244, 0x034, 0x030, 0x038, 0x03c, 0x168, 0x140, 0x110, 0x1c0, 0x1c4, 0x1c8, 0x180, 0x2b4,
     ];
-    if xe2 || engine == Engine::Ccs0 {
+    if xe2 || engine.is_compute() {
         first.extend_from_slice(&[0x120, 0x124]);
     }
     let second: &[u32] = if xe2 {
@@ -388,7 +437,10 @@ pub(crate) mod tests {
                 (0x2000, 0, 0),
                 (0x22000, 3, 1),
                 (0x3ee000, 3, 1),
-                (0x1a000, 4, 4)
+                (0x1a000, 4, 4),
+                (0x1c000, 4, 4),
+                (0x1e000, 4, 4),
+                (0x26000, 4, 4)
             ]
         );
         assert_eq!(Engine::Ccs0.lrc_pages(GtPlatform::Battlemage), 3);
@@ -410,19 +462,32 @@ pub(crate) mod tests {
             0b1010
         );
         // __xe_gt_apply_ccs_mode with ccs_mode 1: present slices -> CCS0.
-        assert_eq!(ccs_mode(1), None);
-        assert_eq!(ccs_mode(0xf), Some(0x0fff_0000));
-        assert_eq!(ccs_mode(0b1010), Some(0x0fff_0000 | 0b111_000_111));
-        assert_eq!(Engine::from_xe_class(1), Some(Engine::Bcs0));
-        assert_eq!(Engine::from_xe_class(4), Some(Engine::Ccs0));
-        assert_eq!(Engine::from_xe_class(2), None);
-        assert_eq!(Engine::from_class_instance(1, 1), Some(Engine::Bcs8));
-        assert_eq!(Engine::from_class_instance(1, 8), None);
+        assert_eq!(ccs_mode(1, 1), None);
+        assert_eq!(ccs_mode(0xf, 1), Some(0x0fff_0000));
+        assert_eq!(ccs_mode(0b1010, 1), Some(0x0fff_0000 | 0b001_111_001_111));
+        assert_eq!(
+            EngineSet::of(&Engine::ALL).from_class_instance(1, 0),
+            Some(Engine::Bcs0)
+        );
+        assert_eq!(
+            EngineSet::of(&Engine::ALL).from_class_instance(4, 0),
+            Some(Engine::Ccs0)
+        );
+        assert_eq!(EngineSet::of(&Engine::ALL).from_class_instance(2, 0), None);
+        assert_eq!(
+            EngineSet::of(&Engine::ALL).from_class_instance(1, 1),
+            Some(Engine::Bcs8)
+        );
+        assert_eq!(EngineSet::of(&Engine::ALL).from_class_instance(1, 8), None);
         assert_eq!(
             (
                 Engine::Bcs8.physical_instance(),
-                Engine::Bcs8.logical_instance(),
-                Engine::Bcs8.submit_mask()
+                EngineSet::of(&Engine::ALL)
+                    .logical_instance(Engine::Bcs8)
+                    .unwrap(),
+                1u32 << EngineSet::of(&Engine::ALL)
+                    .logical_instance(Engine::Bcs8)
+                    .unwrap()
             ),
             (8, 1, 2)
         );

@@ -122,7 +122,7 @@ pub(super) struct Job {
     completion: Arc<Completion>,
     predecessor: Option<Arc<Completion>>,
     _dumb: Option<DumbPin>,
-    _blob: Option<BlobPin>,
+    _blobs: Vec<BlobPin>,
 }
 impl Drop for Job {
     fn drop(&mut self) {
@@ -131,10 +131,16 @@ impl Drop for Job {
         self.completion.finish(Err(FsError::Busy));
     }
 }
+struct Projection {
+    owner: u64,
+    crtc: Crtc,
+    color: (u32, u32),
+    completion: Arc<Completion>,
+}
 struct State {
     jobs: VecDeque<Job>,
     running: bool,
-    projected: Option<(u64, Crtc, u32, Arc<Completion>)>,
+    projected: Option<Projection>,
 }
 pub(super) struct Queue {
     mode: ModeState,
@@ -180,10 +186,15 @@ impl Queue {
         let (previous, previous_ctm, predecessor) = {
             let state = self.state.lock();
             match &state.projected {
-                Some((owner, next, ctm, last))
-                    if *owner == open && !matches!(last.result(), Some(Err(_))) =>
+                Some(projection)
+                    if projection.owner == open
+                        && !matches!(projection.completion.result(), Some(Err(_))) =>
                 {
-                    (Some(next.clone()), Some(*ctm), Some(last.clone()))
+                    (
+                        Some(projection.crtc.clone()),
+                        Some(projection.color),
+                        Some(projection.completion.clone()),
+                    )
                 }
                 _ => (None, None, None),
             }
@@ -207,21 +218,24 @@ impl Queue {
         if plan.test {
             return Ok(None);
         }
-        let blob = if let Action::Color { blob, .. } = plan.action {
-            if blob != 0 {
-                if !self.mode.lock().intel_retain_blob(blob) {
+        let mut blobs = Vec::new();
+        if matches!(plan.action, Action::Color { .. }) {
+            // Pin both resulting properties, including an unchanged CTM/LUT
+            // inherited from a queued predecessor. Users may destroy blobs as
+            // soon as admission returns; every pending job owns its own pins.
+            for id in [plan.next_ctm, plan.next_gamma]
+                .into_iter()
+                .filter(|&id| id != 0)
+            {
+                if !self.mode.lock().intel_retain_blob(id) {
                     return Err(FsError::NotFound.into());
                 }
-                Some(BlobPin {
+                blobs.push(BlobPin {
                     mode: self.mode.clone(),
-                    id: blob,
-                })
-            } else {
-                None
+                    id,
+                });
             }
-        } else {
-            None
-        };
+        }
         dependencies.extend(plan_dependencies(&plan, &self.mode)?);
         let dumb = if let Some(fb) = plan.framebuffer.as_ref().filter(|fb| fb.intel.is_none()) {
             self.mode
@@ -274,7 +288,12 @@ impl Queue {
         }
         let nonblock = plan.nonblock;
         let mut state = self.state.lock();
-        state.projected = Some((open, plan.next.clone(), plan.next_ctm, completion.clone()));
+        state.projected = Some(Projection {
+            owner: open,
+            crtc: plan.next.clone(),
+            color: (plan.next_ctm, plan.next_gamma),
+            completion: completion.clone(),
+        });
         state.jobs.push_back(Job {
             plan,
             open,
@@ -285,7 +304,7 @@ impl Queue {
             completion: completion.clone(),
             predecessor,
             _dumb: dumb,
-            _blob: blob,
+            _blobs: blobs,
         });
         let start = !state.running;
         state.running = true;

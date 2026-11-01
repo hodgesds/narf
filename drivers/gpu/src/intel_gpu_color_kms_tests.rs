@@ -123,3 +123,88 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_kms",
     smoke_kms_ctm_failed_latch_retains_color_until_fresh_reset_restore
 );
+
+fn gamma() -> Arc<crate::intel_gpu_color::Lut> {
+    let bytes: Vec<u8> = (0..1024u32)
+        .flat_map(|i| {
+            let v = (i * 65535 / 1023) as u16;
+            [v.to_le_bytes(), v.to_le_bytes(), v.to_le_bytes(), [0, 0]].concat()
+        })
+        .collect();
+    crate::intel_gpu_color::Lut::decode(&bytes).unwrap()
+}
+fn smoke_kms_gamma_preserves_color_across_surface_and_ctm_updates() -> TestResult {
+    let platform = MockPlatform::new();
+    let device = platform.meteor();
+    let mut session = complete(device.session()).unwrap();
+    let lut = gamma();
+    complete(session.set_color(Some(identity()), Some(lut.clone()))).unwrap();
+    session.confirm_ctm();
+    let writes = platform.palette_writes();
+    #[cfg(target_arch = "x86_64")]
+    complete(session.present(object(true).unwrap(), geometry())).unwrap();
+    complete(session.restore_surface()).unwrap();
+    assert_eq!(
+        platform.read32(crate::intel_gpu_color::GAMMA),
+        (1 << 30) | 1
+    );
+    assert_eq!(platform.palette_writes(), writes);
+    complete(session.set_color(None, Some(lut))).unwrap();
+    session.confirm_ctm();
+    assert_eq!(platform.read32(MODE), 0);
+    assert_eq!(platform.palette_writes(), writes);
+    complete(session.restore_console()).unwrap();
+    assert_eq!(platform.read32(crate::intel_gpu_color::GAMMA), 0);
+    assert_eq!(platform.palette_writes(), writes + 1024);
+    drop(session);
+    assert!(device.legacy().is_ok());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_gamma_preserves_color_across_surface_and_ctm_updates
+);
+
+fn smoke_kms_gamma_cancellation_suspend_and_reset_restore_original_before_reopen() -> TestResult {
+    for action in 0..3 {
+        let platform = MockPlatform::new();
+        let device = platform.meteor();
+        let mut session = complete(device.session()).unwrap();
+        let mut update = Box::pin(session.set_color(None, Some(gamma())));
+        assert!(once(update.as_mut()).is_pending());
+        if action == 0 {
+            drop(update);
+        } else {
+            complete(update).unwrap();
+            session.confirm_ctm();
+        }
+        assert_eq!(platform.palette_writes(), 1024);
+        drop(session);
+        assert!(device.legacy().is_err());
+        if action == 2 {
+            quarantine_reset_state(&device.state, &platform.1);
+            complete(device.recover()).unwrap();
+            assert!(!device.reset_lost());
+        } else if action == 1 {
+            complete(device.quiesce()).unwrap();
+            assert!(complete(device.session()).is_err());
+            device.legacy().unwrap().console_replaced(&console());
+        } else {
+            let mut session = complete(device.session()).unwrap();
+            complete(session.restore_console()).unwrap();
+        }
+        assert_eq!(platform.read32(crate::intel_gpu_color::GAMMA), 0);
+        assert_eq!(platform.palette_writes(), 2048);
+        for i in [0, 13, 511, 1023] {
+            platform.write32(0x4a400, i);
+            assert_eq!(platform.read32(0x4a404), i);
+        }
+        platform.write32(0x4a400, 0);
+        assert!(device.legacy().is_ok());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_gamma_cancellation_suspend_and_reset_restore_original_before_reopen
+);

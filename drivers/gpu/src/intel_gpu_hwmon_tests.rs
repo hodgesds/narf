@@ -101,6 +101,7 @@ fn smoke_hwmon_production_mmio_gate_distinguishes_optional_absence_from_loss() -
         fn read32(&self, offset: u64) -> u32 {
             self.0.borrow_mut().push(offset);
             match offset {
+                0x138124 => u32::MAX, // unavailable optional discovery port
                 0x138434 => 71,
                 0x1382c0 => 94,
                 0x138264 => u32::MAX,
@@ -114,15 +115,15 @@ fn smoke_hwmon_production_mmio_gate_distinguishes_optional_absence_from_loss() -
     let monitor = Monitor::new(GtPlatform::Battlemage).unwrap();
     let io = Sensors(core::cell::RefCell::new(Vec::new()));
     monitor.activate(7);
-    monitor.sample_mmio(7, 0, &io, || true);
-    assert_eq!(io.0.borrow().len(), 18);
+    monitor.service_mmio(7, 0, &io, || true);
+    assert_eq!(io.0.borrow().len(), 19);
     assert_eq!(monitor.show("temp2_input", 0), "71000\n");
     assert_eq!(monitor.show("temp3_input", 0), "94000\n");
     assert!(monitor.show("temp7_input", 0).is_empty());
     io.0.borrow_mut().clear();
     monitor.activate(8);
-    monitor.sample_mmio(8, 1_000_000_000, &io, || io.0.borrow().len() < 2);
-    assert_eq!(*io.0.borrow(), [0x138434, 0x1382c0]);
+    monitor.service_mmio(8, 1_000_000_000, &io, || io.0.borrow().len() < 3);
+    assert_eq!(*io.0.borrow(), [0x138124, 0x138434, 0x1382c0]);
     assert!(monitor.reading(1_000_000_000).is_none());
     TestResult::Pass
 }

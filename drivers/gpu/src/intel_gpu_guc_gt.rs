@@ -83,6 +83,7 @@ pub struct GuCGt<M: MmioWindow, A: BootAllocator> {
     released: bool,
     hardware: Option<HardwareInit>,
     registers: Option<RegisterInit>,
+    compute_configuration: Option<(u8, u8)>,
     /// Battlemage tile-0 local memory, probed under register steering. A
     /// malformed layout leaves VRAM unpublished, never guessed.
     vram: Option<crate::intel_gpu_vram::VramLayout>,
@@ -151,6 +152,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             released: false,
             hardware: None,
             registers: None,
+            compute_configuration: None,
             vram: None,
         }
     }
@@ -427,6 +429,14 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         Ok(())
     }
 
+    /// Raw physical CCS fuse mask and immutable requested mode. A clean
+    /// same-epoch resume must preserve both, even if its selected set matches.
+    pub fn compute_configuration(&self) -> Option<(u8, u8)> {
+        (self.state == GtState::SchedulingReady)
+            .then_some(self.compute_configuration)
+            .flatten()
+    }
+
     fn verify_register_policy(&self) -> Result<(), GtError> {
         let engines = self
             .engines()
@@ -434,6 +444,21 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 crate::intel_gpu_engine::Engine::Rcs0,
                 crate::intel_gpu_engine::Engine::Bcs0,
             ]));
+        if let Some((mask, mode)) = self.compute_configuration {
+            if let Some(expected) = crate::intel_gpu_engine::ccs_mode(mask, mode) {
+                for (offset, bits, expected) in
+                    [(0x14800, 2, 2), (0x14804, 0xfff, expected & 0xfff)]
+                {
+                    let value = self.parts.boot.window().read32(offset);
+                    if value == u32::MAX {
+                        return Err(GtError::Unavailable);
+                    }
+                    if value & bits != expected {
+                        return Err(GtError::Registers(RegisterError::Verify(offset)));
+                    }
+                }
+            }
+        }
         EnginePolicy::new(self.parts.boot.platform(), engines)
             .and_then(|policy| policy.verify(self.parts.boot.window()))
             .map_err(GtError::Registers)
@@ -549,6 +574,16 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     where
         A: Clone,
     {
+        self.begin_scheduling_with_ccs_mode(now, 1)
+    }
+
+    /// Immutable compute partition for this scheduling incarnation. The reset
+    /// owner must use the same requested mode and verified fuse identity on
+    /// every resume; no client may change an already published engine set.
+    pub fn begin_scheduling_with_ccs_mode(&mut self, now: u64, mode: u8) -> Result<(), GtError>
+    where
+        A: Clone,
+    {
         if self.state != GtState::Ready
             || self.parts.ct.is_some()
             || self.hardware.is_none()
@@ -563,13 +598,14 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         if !self.topology().is_some_and(GtTopology::has_render) {
             return Err(GtError::Topology(TopologyError::NoRender));
         }
-        let registers = RegisterInit::new(
+        let registers = RegisterInit::with_ccs_mode(
             self.parts.boot.window(),
             self.parts.boot.platform(),
             self.parts.boot.device_id(),
             self.topology().ok_or(GtError::State)?,
             self.hwconfig().ok_or(GtError::State)?,
             now,
+            mode,
         )
         .map_err(GtError::Registers)?;
         let scheduler = self
@@ -578,6 +614,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             .scheduler(registers.engines())
             .map_err(GtError::Boot)?;
         self.parts.scheduler = Some(scheduler);
+        self.compute_configuration = Some(registers.compute_configuration());
         self.registers = Some(registers);
         self.state = GtState::PreparingScheduling;
         Ok(())

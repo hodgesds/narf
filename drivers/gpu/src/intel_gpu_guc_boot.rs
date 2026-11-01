@@ -771,6 +771,15 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                         // engine whose context fails to preempt in time; the
                         // scheduler retires that context alone.
                         ads.write32(POLICIES + 76, 0);
+                        let engines = crate::intel_gpu_engine::EngineSet::from_bits(
+                            config
+                                .engines
+                                .iter()
+                                .enumerate()
+                                .fold(0, |bits, (i, state)| {
+                                    bits | if state.is_some() { 1 << i } else { 0 }
+                                }),
+                        );
                         for engine in crate::intel_gpu_engine::Engine::ALL {
                             let Some(state) = config.engines[engine.index()] else {
                                 continue;
@@ -778,7 +787,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                             let class = u64::from(engine.guc_class());
                             let base_reg = engine.base();
                             let saves = 0x2000 + engine.index() as u64 * 48;
-                            let logical = u64::from(engine.logical_instance());
+                            let logical = u64::from(
+                                engines.logical_instance(engine).expect("published engine"),
+                            );
                             let physical = engine.physical_instance();
                             let mapping = SYSINFO + class * 32 + logical / 4 * 4;
                             let shift = (logical % 4) * 8;
@@ -955,7 +966,8 @@ mod tests {
                 0xc050 | 0xc340 if !device.reject_wopcm => value | 1,
                 0xc314 | 0xa188 | 0xa278 | 0x20ec | 0x83b4 | 0xe48c | 0xe18c | 0xe4f4 | 0xe5f0
                 | 0xe420 | 0xe49c | 0xe4f0 | 0x20d4 | 0xe194 | 0xe4c4 | 0xe5f4 | 0x2050
-                | 0x220d4 | 0x22050 | 0x3ee0d4 | 0x3ee050 | 0x1a0d4 | 0x1a050 => {
+                | 0x220d4 | 0x22050 | 0x3ee0d4 | 0x3ee050 | 0x1a0d4 | 0x1a050 | 0x1c0d4
+                | 0x1c050 | 0x1e0d4 | 0x1e050 | 0x260d4 | 0x26050 | 0x14800 | 0x14804 => {
                     let mask = value >> 16;
                     let old = *device.regs.get(&offset).unwrap_or(&0);
                     if value == 0x00110011 {

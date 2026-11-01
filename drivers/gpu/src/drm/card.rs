@@ -926,11 +926,18 @@ pub struct Card {
     intel_transaction: bool,
     #[cfg(feature = "intel")]
     intel_deferred_owners: Vec<u64>,
-    /// Intel exposes only CTM; no gamma/LUT property or legacy gamma claim.
+    /// Registered Intel native display owner; independent of color capability
+    /// and of native_atomic, which other DRM vendors also use.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_display: bool,
+    /// Installed fixed-mode Intel color owner (native CTM and gamma1024).
     #[cfg(feature = "intel")]
     pub(crate) intel_ctm: bool,
     #[cfg(feature = "intel")]
     intel_blob_pins: Vec<(u32, usize)>,
+    /// A released master still owns hardware until serialized restoration.
+    #[cfg(feature = "intel")]
+    intel_restore_pending: bool,
     /// GEM object table for this card.
     pub gem: GemTable,
     /// Dumb-buffer physical backings. Kept alive here so the memory
@@ -1204,7 +1211,11 @@ impl Card {
             #[cfg(feature = "intel")]
             intel_ctm: false,
             #[cfg(feature = "intel")]
+            intel_display: false,
+            #[cfg(feature = "intel")]
             intel_blob_pins: Vec::new(),
+            #[cfg(feature = "intel")]
+            intel_restore_pending: false,
             gem: GemTable::new(),
             dumb_backings: Vec::new(),
             virtgpu_imports: Vec::new(),
@@ -1333,7 +1344,10 @@ impl Card {
         if self.current_master == Some(open_id) {
             self.current_master = None;
             #[cfg(feature = "intel")]
-            self.intel_clear_ctm();
+            {
+                self.intel_restore_pending |= self.intel_display;
+                self.intel_clear_ctm();
+            }
         }
     }
 
@@ -1717,7 +1731,7 @@ impl Card {
                     .any(|n| n.hdr_output_metadata == Some(id)))
     }
 
-    pub(crate) fn ctm_only(&self, crtc: u32) -> bool {
+    pub(crate) fn intel_color(&self, crtc: u32) -> bool {
         #[cfg(feature = "intel")]
         {
             self.intel_ctm && self.crtc_color(crtc).is_some()
@@ -1762,10 +1776,23 @@ impl Card {
         self.collect_blobs();
     }
     #[cfg(feature = "intel")]
+    pub(crate) fn intel_master_restore_pending(&self) -> bool {
+        self.intel_restore_pending
+    }
+    /// Called only under the display Session after original console/color
+    /// restoration and current authority have been verified. A later stale
+    /// close task must then leave a replacement master's new state untouched.
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_master_restored(&mut self) {
+        self.intel_clear_ctm();
+        self.intel_restore_pending = false;
+    }
+    #[cfg(feature = "intel")]
     pub(crate) fn intel_clear_ctm(&mut self) {
         if self.intel_ctm {
             for color in &mut self.crtc_color {
                 color.ctm = 0;
+                color.gamma_lut = 0;
             }
         }
         self.collect_blobs();

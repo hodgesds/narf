@@ -1,4 +1,4 @@
-//! Graphics GuC/RCS0/BCS0 interrupt delivery for single-tile physical functions.
+//! Graphics GuC/render/copy/compute delivery for single-tile physical functions.
 //! MIT Linux xe_irq.c and xe_guc.c, b90c984d615e8ce2af96f5b1411a962d83fed2ad.
 //! The hard handler only masks the tile master. Identity waits and GuC work
 //! run in task context; IRQ notification never proves DMA retirement.
@@ -38,8 +38,8 @@ const OWNED: u32 = RCS0 | BCS0 | GUC_BIT; // bank zero
                                           // CCS0_CCS1_INTR_MASK, bank-zero INTR_CCS(0), identity class COMPUTE (5).
 const CCS_ENABLE: u64 = 0x190048;
 const CCS_MASK: u64 = 0x190100;
-const CCS_RING_MASK: u64 = 0x1a0a8;
-const CCS0: u32 = 1 << 4;
+const CCS_MASKS: [u64; 2] = [CCS_MASK, 0x190104];
+const CCS_BASES: [u64; 4] = [0x1a000, 0x1c000, 0x1e000, 0x26000];
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum IrqError {
@@ -63,15 +63,15 @@ struct Saved {
     bcs8: u32,
     bcs8_ring: u32,
     ccs_enable: u32,
-    ccs: u32,
-    ccs_ring: u32,
+    ccs: [u32; 2],
+    ccs_ring: [u32; 4],
 }
 
 struct State<M> {
     mmio: M,
     saved: Saved,
     /// CCS0 is a published engine and owns its sources.
-    compute: bool,
+    compute: u8,
     copy8: bool,
     active: bool,
     pending: bool,
@@ -96,6 +96,18 @@ fn restore_bits(mmio: &impl MmioWindow, offset: u64, mask: u32, saved: u32) {
     mmio.write32(offset, (current & !mask) | (saved & mask));
 }
 
+fn ccs_pair_mask(compute: u8, pair: usize) -> u32 {
+    (if compute & (1 << (pair * 2)) != 0 {
+        RCS_EVENTS
+    } else {
+        0
+    }) | if compute & (1 << (pair * 2 + 1)) != 0 {
+        RCS
+    } else {
+        0
+    }
+}
+
 impl<M: MmioWindow> Controller<M> {
     #[cfg(feature = "kernel-test")]
     pub(crate) fn new(mmio: M, compute: bool) -> Result<Self, IrqError> {
@@ -108,7 +120,9 @@ impl<M: MmioWindow> Controller<M> {
     }
 
     pub(crate) fn with_engines(mmio: M, engines: EngineSet) -> Result<Self, IrqError> {
-        let compute = engines.contains(Engine::Ccs0);
+        let compute = engines
+            .compute()
+            .fold(0u8, |mask, engine| mask | 1 << engine.physical_instance());
         let copy8 = engines.contains(Engine::Bcs8);
         // No other owner may have delivery enabled. Never commandeer firmware
         // MSI or enable a master with an unhandled display/media indication.
@@ -132,13 +146,25 @@ impl<M: MmioWindow> Controller<M> {
             } else {
                 0
             },
-            ccs_enable: if compute { read(&mmio, CCS_ENABLE)? } else { 0 },
-            ccs: if compute { mmio.read32(CCS_MASK) } else { 0 },
-            ccs_ring: if compute {
-                mmio.read32(CCS_RING_MASK)
+            ccs_enable: if compute != 0 {
+                read(&mmio, CCS_ENABLE)?
             } else {
                 0
             },
+            ccs: core::array::from_fn(|pair| {
+                if ccs_pair_mask(compute, pair) != 0 {
+                    mmio.read32(CCS_MASKS[pair])
+                } else {
+                    0
+                }
+            }),
+            ccs_ring: core::array::from_fn(|i| {
+                if compute & (1 << i) != 0 {
+                    mmio.read32(CCS_BASES[i] + 0xa8)
+                } else {
+                    0
+                }
+            }),
         };
         Ok(Self(IrqSafeSpinLock::new(State {
             mmio,
@@ -166,12 +192,19 @@ impl<M: MmioWindow> Controller<M> {
             (RING_MASK, RCS, 0),
             (BCS_RING_MASK, RCS, 0),
         ];
-        if s.compute {
-            routes.extend_from_slice(&[
-                (CCS_ENABLE, RCS_EVENTS, RCS_EVENTS),
-                (CCS_MASK, RCS_EVENTS, 0),
-                (CCS_RING_MASK, RCS, 0),
-            ]);
+        if s.compute != 0 {
+            routes.push((CCS_ENABLE, RCS_EVENTS, RCS_EVENTS));
+            for (pair, reg) in CCS_MASKS.into_iter().enumerate() {
+                let mask = ccs_pair_mask(s.compute, pair);
+                if mask != 0 {
+                    routes.push((reg, mask, 0));
+                }
+            }
+            for (i, base) in CCS_BASES.into_iter().enumerate() {
+                if s.compute & (1 << i) != 0 {
+                    routes.push((base + 0xa8, RCS, 0));
+                }
+            }
         }
         if s.copy8 {
             routes.extend_from_slice(&[(BCS8_MASK, RCS, 0), (BCS8_RING_MASK, RCS, 0)]);
@@ -227,7 +260,7 @@ impl<M: MmioWindow> Controller<M> {
                 RCS0 => (RCS, 0, 0),
                 BCS0 => (RCS, 3, 0),
                 BCS8 => (RCS, 3, 8),
-                CCS0 => (RCS, 5, 0),
+                bit if bit & 0xf0 != 0 => (RCS, 5, bit.trailing_zeros() - 4),
                 _ => (0x8000, 4, 0),
             };
             if (identity >> 20) & 0x3f != instance
@@ -254,8 +287,7 @@ impl<M: MmioWindow> Controller<M> {
             }
             if master & 1 != 0 {
                 let bits = read(&s.mmio, DW)?;
-                let owned =
-                    OWNED | if s.compute { CCS0 } else { 0 } | if s.copy8 { BCS8 } else { 0 };
+                let owned = OWNED | (u32::from(s.compute) << 4) | if s.copy8 { BCS8 } else { 0 };
                 if bits & !owned != 0 {
                     return Err(IrqError::Conflict);
                 }
@@ -301,14 +333,19 @@ impl<M: MmioWindow> Controller<M> {
         ] {
             restore_bits(&s.mmio, offset, mask, saved);
         }
-        if s.compute {
-            for (offset, mask, saved) in [
-                (CCS_RING_MASK, RCS, s.saved.ccs_ring),
-                (CCS_MASK, RCS_EVENTS, s.saved.ccs),
-                (CCS_ENABLE, RCS_EVENTS, s.saved.ccs_enable),
-            ] {
-                restore_bits(&s.mmio, offset, mask, saved);
+        if s.compute != 0 {
+            for (i, base) in CCS_BASES.into_iter().enumerate() {
+                if s.compute & (1 << i) != 0 {
+                    restore_bits(&s.mmio, base + 0xa8, RCS, s.saved.ccs_ring[i]);
+                }
             }
+            for (pair, reg) in CCS_MASKS.into_iter().enumerate() {
+                let mask = ccs_pair_mask(s.compute, pair);
+                if mask != 0 {
+                    restore_bits(&s.mmio, reg, mask, s.saved.ccs[pair]);
+                }
+            }
+            restore_bits(&s.mmio, CCS_ENABLE, RCS_EVENTS, s.saved.ccs_enable);
         }
         if s.copy8 {
             restore_bits(&s.mmio, BCS8_RING_MASK, RCS, s.saved.bcs8_ring);

@@ -34,6 +34,7 @@ fn color_mode() -> ModeState {
     {
         let mut card = mode.lock();
         card.intel_ctm = true;
+        card.intel_display = true;
         card.crtc_color.push(crate::drm::card::CrtcColor::new(1));
     }
     mode
@@ -210,13 +211,21 @@ fn smoke_intel_ctm_advertisement_test_only_and_combined_updates_refuse() -> Test
     let id = blob(&mode);
     assert_eq!(
         crtc_color_properties(&mode.lock(), 1),
-        (vec![CRTC_CTM_PROP_ID], vec![0])
+        (
+            vec![
+                CRTC_CTM_PROP_ID,
+                CRTC_GAMMA_LUT_PROP_ID,
+                CRTC_GAMMA_LUT_SIZE_PROP_ID
+            ],
+            vec![0, 0, 1024]
+        )
     );
     let mut change = CrtcColorChange::default();
     assert_eq!(
         crtc_color_property(&mode.lock(), 1, CRTC_GAMMA_LUT_PROP_ID, 0, &mut change),
-        Err(FsError::Unsupported)
+        Ok(true)
     );
+    assert_eq!(change.gamma_lut, Some(0));
     let queue = queue::Queue::new(mode.clone());
     let cpu = Cpu::new();
     let events = Events::new(IrqSafeSpinLock::new(Default::default()));
@@ -319,4 +328,716 @@ fn smoke_intel_ctm_uapi_inherited_refusal_and_reset_loss_fail_native_fence() -> 
 kernel_test_in!(
     "drivers/gpu/intel_gpu_kms",
     smoke_intel_ctm_uapi_inherited_refusal_and_reset_loss_fail_native_fence
+);
+
+fn gamma_blob(mode: &ModeState, reverse: bool) -> u32 {
+    let bytes: Vec<u8> = (0..1024u32)
+        .flat_map(|i| {
+            let v = ((if reverse { 1023 - i } else { i }) * 65535 / 1023) as u16;
+            [v.to_le_bytes(), v.to_le_bytes(), v.to_le_bytes(), [0, 0]].concat()
+        })
+        .collect();
+    mode.lock().create_property_blob(bytes).unwrap()
+}
+fn gamma_request(cpu: &Cpu, id: u32, flags: u32) {
+    request(cpu, id, flags);
+    cpu.write(160, &CRTC_GAMMA_LUT_PROP_ID.to_le_bytes())
+        .unwrap();
+}
+fn smoke_intel_gamma_uapi_nonblock_pin_latch_and_same_lut_ctm_preservation() -> TestResult {
+    let mode = color_mode();
+    let gamma = gamma_blob(&mode, false);
+    let ctm = blob(&mode);
+    let queue = queue::Queue::new(mode.clone());
+    let cpu = Cpu::new();
+    let events = Events::new(IrqSafeSpinLock::new(Default::default()));
+    gamma_request(&cpu, gamma, NONBLOCK | EVENT);
+    let completion = submit(&queue, &cpu, &events);
+    let fence = cpu.exported.lock()[0].clone();
+    assert_eq!(fence.status(), 0);
+    assert!(mode.lock().destroy_property_blob(gamma));
+    drop(cpu);
+    let platform = MockPlatform::new();
+    let device = Arc::new(platform.meteor());
+    let mut worker = Worker {
+        device: device.clone(),
+    };
+    let mut work = Box::pin(queue.run(&mut worker));
+    assert!(work
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    assert_eq!(platform.palette_writes(), 1024);
+    assert_eq!(
+        platform.read32(crate::intel_gpu_color::GAMMA),
+        (1 << 30) | 1
+    );
+    assert_eq!(mode.lock().crtc_color(1).unwrap().gamma_lut, 0);
+    assert_eq!(fence.status(), 0);
+    assert!(!events.lock().has_deliverable_event(u64::MAX));
+    run(work);
+    assert_eq!(completion.status(), 1);
+    assert_eq!(fence.timestamp_ns(), Some(251000));
+    assert_eq!(mode.lock().crtc_color(1).unwrap().gamma_lut, gamma);
+    let mut event = [0; 32];
+    assert_eq!(
+        events.lock().read_deliverable_event(u64::MAX, &mut event),
+        Some(32)
+    );
+    assert_eq!(u32::from_le_bytes(event[24..28].try_into().unwrap()), 41);
+    let cpu = Cpu::new();
+    request(&cpu, ctm, NONBLOCK);
+    let changed = submit(&queue, &cpu, &events);
+    mode.lock().destroy_property_blob(ctm);
+    run(queue.run(&mut worker));
+    assert_eq!(changed.status(), 1);
+    assert_eq!(platform.palette_writes(), 1024);
+    assert_eq!(mode.lock().crtc_color(1).unwrap().gamma_lut, gamma);
+    let mut session = run(device.session()).unwrap();
+    run(session.restore_console()).unwrap();
+    assert_eq!(platform.palette_writes(), 2048);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_intel_gamma_uapi_nonblock_pin_latch_and_same_lut_ctm_preservation
+);
+
+fn smoke_intel_gamma_projected_replacement_refuses_test_only_then_disable_enables_new() -> TestResult
+{
+    let mode = color_mode();
+    let first = gamma_blob(&mode, false);
+    let second = gamma_blob(&mode, true);
+    let ctm = blob(&mode);
+    for flags in [NONBLOCK, NONBLOCK | TEST_ONLY] {
+        let request = Request::Atomic(OwnedAtomic {
+            flags,
+            cookie: 0,
+            objects: vec![1],
+            counts: vec![2],
+            props: vec![CRTC_CTM_PROP_ID, CRTC_GAMMA_LUT_PROP_ID],
+            values: vec![u64::from(ctm), u64::from(first)],
+        });
+        assert!(matches!(
+            Plan::stage(
+                &mode.lock(),
+                request,
+                Geometry {
+                    width: 64,
+                    height: 32,
+                    pitch: 256
+                }
+            ),
+            Err(FsError::Unsupported)
+        ));
+    }
+    let queue = queue::Queue::new(mode.clone());
+    let cpu = Cpu::new();
+    let events = Events::new(IrqSafeSpinLock::new(Default::default()));
+    gamma_request(&cpu, first, NONBLOCK);
+    let installed = submit(&queue, &cpu, &events);
+    let platform = MockPlatform::new();
+    let device = Arc::new(platform.meteor());
+    let mut worker = Worker {
+        device: device.clone(),
+    };
+    // Both projected and committed replacement are rejected in foreground,
+    // including TEST_ONLY, without exporting an fd or touching palette/CSC.
+    for committed in [false, true] {
+        if committed {
+            run(queue.run(&mut worker));
+            assert_eq!(installed.status(), 1);
+        }
+        let writes = platform.palette_writes();
+        for flags in [NONBLOCK, NONBLOCK | TEST_ONLY] {
+            let cpu = Cpu::new();
+            gamma_request(&cpu, second, flags);
+            assert!(matches!(
+                run(admit(
+                    &queue,
+                    7,
+                    drm_uapi::DRM_IOCTL_MODE_ATOMIC,
+                    64,
+                    &cpu,
+                    Some(&events),
+                    Geometry {
+                        width: 64,
+                        height: 32,
+                        pitch: 256
+                    },
+                    1
+                )),
+                Err(queue::SubmitError::Io(FsError::Unsupported))
+            ));
+            assert!(cpu.exported.lock().is_empty());
+            assert_eq!(platform.palette_writes(), writes);
+        }
+    }
+    gamma_request(&cpu, 0, NONBLOCK | EVENT);
+    let disabled = submit(&queue, &cpu, &events);
+    gamma_request(&cpu, second, NONBLOCK | EVENT);
+    let replaced = submit(&queue, &cpu, &events); // projected gamma0 permits preload
+    mode.lock().destroy_property_blob(first);
+    mode.lock().destroy_property_blob(second);
+    let mut work = Box::pin(queue.run(&mut worker));
+    assert!(work
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    assert_eq!(platform.read32(crate::intel_gpu_color::GAMMA), 0);
+    assert_eq!(
+        platform.palette_writes(),
+        1024,
+        "disable arm must precede original palette restore"
+    );
+    assert_eq!(disabled.status(), 0);
+    assert_eq!(replaced.status(), 0);
+    run(work);
+    assert_eq!(disabled.status(), 1);
+    assert_eq!(replaced.status(), 1);
+    assert_eq!(platform.palette_writes(), 3072);
+    assert_eq!(mode.lock().crtc_color(1).unwrap().gamma_lut, second);
+    assert!(mode.lock().property_blob(first).is_none());
+    let mut session = run(device.session()).unwrap();
+    run(session.restore_console()).unwrap();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_intel_gamma_projected_replacement_refuses_test_only_then_disable_enables_new
+);
+
+fn smoke_intel_gamma_worker_close_cancel_fault_and_reset_never_publish_success() -> TestResult {
+    for failure in 0..5 {
+        let mode = color_mode();
+        let id = gamma_blob(&mode, true);
+        let queue = queue::Queue::new(mode.clone());
+        let cpu = Cpu::new();
+        let events = Events::new(IrqSafeSpinLock::new(Default::default()));
+        gamma_request(&cpu, id, NONBLOCK | EVENT);
+        let completion = submit(&queue, &cpu, &events);
+        mode.lock().destroy_property_blob(id);
+        let platform = MockPlatform::new();
+        let device = Arc::new(platform.meteor());
+        let mut worker = Worker {
+            device: device.clone(),
+        };
+        if failure == 2 {
+            platform.refuse_palette(true);
+        }
+        let mut work = Box::pin(queue.run(&mut worker));
+        let first = work.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        if failure == 2 {
+            assert!(first.is_ready());
+            drop(work);
+        } else {
+            assert!(first.is_pending());
+            if failure == 0 {
+                events.lock().close();
+                mode.lock().master_release(7);
+                run(work);
+            } else if failure == 1 {
+                drop(work); // real worker cancellation, no user pointer remains
+                let mut session = run(device.session()).unwrap();
+                run(session.restore_console()).unwrap();
+            } else {
+                if failure == 3 {
+                    platform.poison();
+                } else {
+                    platform.set(crate::intel_gpu_color::GAMMA, 0);
+                }
+                run(work);
+            }
+        }
+        assert!(completion.status() < 0);
+        assert_eq!(mode.lock().crtc_color(1).unwrap().gamma_lut, 0);
+        assert!(!events.lock().has_deliverable_event(u64::MAX));
+        if failure >= 2 {
+            platform.refuse_palette(false);
+            platform.poison();
+            run(device.recover()).unwrap();
+        }
+        assert_eq!(platform.read32(crate::intel_gpu_color::GAMMA), 0);
+        for i in [0, 13, 511, 1023] {
+            platform.write32(0x4a400, i);
+            assert_eq!(platform.read32(0x4a404), i);
+        }
+        platform.write32(0x4a400, 0);
+        assert!(device.legacy().is_ok());
+        assert!(mode.lock().property_blob(id).is_none());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_intel_gamma_worker_close_cancel_fault_and_reset_never_publish_success
+);
+
+fn smoke_intel_gamma_native_advertisement_sizes_and_inherited_refusal() -> TestResult {
+    let mode = color_mode();
+    assert_eq!(crtc_color_properties(&mode.lock(), 1).1, vec![0, 0, 1024]);
+    for entries in [256, 1023, 1025, 4096] {
+        let id = mode
+            .lock()
+            .create_property_blob(vec![0; entries * 8])
+            .unwrap();
+        assert_eq!(
+            crtc_color_property(
+                &mode.lock(),
+                1,
+                CRTC_GAMMA_LUT_PROP_ID,
+                u64::from(id),
+                &mut CrtcColorChange::default()
+            ),
+            Err(FsError::InvalidData)
+        );
+        mode.lock().destroy_property_blob(id);
+    }
+    mode.lock().intel_ctm = false;
+    assert_eq!(crtc_color_properties(&mode.lock(), 1).1, vec![0, 0, 4096]);
+    mode.lock().intel_ctm = true;
+    let id = gamma_blob(&mode, false);
+    let queue = queue::Queue::new(mode.clone());
+    let cpu = Cpu::new();
+    let events = Events::new(IrqSafeSpinLock::new(Default::default()));
+    gamma_request(&cpu, id, NONBLOCK | EVENT);
+    let completion = submit(&queue, &cpu, &events);
+    let platform = MockPlatform::new();
+    platform.set(crate::intel_gpu_color::GAMMA, 1 << 31); // inherited pre-CSC stage
+    let device = Arc::new(platform.meteor());
+    let mut worker = Worker {
+        device: device.clone(),
+    };
+    run(queue.run(&mut worker));
+    assert!(completion.status() < 0);
+    assert_eq!(platform.palette_writes(), 0);
+    assert_eq!(platform.read32(crate::intel_gpu_color::GAMMA), 1 << 31);
+    assert_eq!(mode.lock().crtc_color(1).unwrap().gamma_lut, 0);
+    assert!(!events.lock().has_deliverable_event(u64::MAX));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_intel_gamma_native_advertisement_sizes_and_inherited_refusal
+);
+
+fn smoke_intel_gamma_cancelled_owner_replacement_refusal_allows_explicit_clear() -> TestResult {
+    let mode = color_mode();
+    let first = gamma_blob(&mode, false);
+    let second = gamma_blob(&mode, true);
+    let queue = queue::Queue::new(mode.clone());
+    let cpu = Cpu::new();
+    let events = Events::new(IrqSafeSpinLock::new(Default::default()));
+    gamma_request(&cpu, first, NONBLOCK | EVENT);
+    let cancelled = submit(&queue, &cpu, &events);
+    mode.lock().destroy_property_blob(first);
+    let platform = MockPlatform::new();
+    let device = Arc::new(platform.meteor());
+    let mut worker = Worker {
+        device: device.clone(),
+    };
+    let mut work = Box::pin(queue.run(&mut worker));
+    assert!(work
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    drop(work);
+    assert!(cancelled.status() < 0);
+    assert_eq!(mode.lock().crtc_color(1).unwrap().gamma_lut, 0);
+    assert_eq!(platform.palette_writes(), 1024);
+    // Card still says bypass: foreground may admit a different LUT. The real
+    // owner finishes the abandoned latch, then refuses before any new writes.
+    gamma_request(&cpu, second, NONBLOCK | EVENT);
+    let refused = submit(&queue, &cpu, &events);
+    run(queue.run(&mut worker));
+    assert!(refused.status() < 0);
+    assert_eq!(platform.palette_writes(), 1024);
+    assert!(!events.lock().has_deliverable_event(u64::MAX));
+    assert!(
+        run(device.session()).is_ok(),
+        "pre-write Unsupported must not poison the owner"
+    );
+    gamma_request(&cpu, 0, NONBLOCK);
+    let cleared = submit(&queue, &cpu, &events);
+    run(queue.run(&mut worker));
+    assert_eq!(cleared.status(), 1);
+    assert_eq!(platform.palette_writes(), 2048);
+    assert_eq!(platform.read32(crate::intel_gpu_color::GAMMA), 0);
+    assert!(device.legacy().is_ok());
+    gamma_request(&cpu, second, NONBLOCK);
+    let installed = submit(&queue, &cpu, &events);
+    run(queue.run(&mut worker));
+    assert_eq!(installed.status(), 1);
+    assert_eq!(mode.lock().crtc_color(1).unwrap().gamma_lut, second);
+    assert_eq!(platform.palette_writes(), 3072);
+    let mut session = run(device.session()).unwrap();
+    run(session.restore_console()).unwrap();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_intel_gamma_cancelled_owner_replacement_refusal_allows_explicit_clear
+);
+
+fn submit_as(
+    queue: &queue::Queue,
+    open: u64,
+    command: u32,
+    cpu: &Cpu,
+    events: &Events,
+) -> Arc<queue::Completion> {
+    match run(admit(
+        queue,
+        open,
+        command,
+        64,
+        cpu,
+        Some(events),
+        Geometry {
+            width: 64,
+            height: 32,
+            pitch: 256,
+        },
+        1,
+    ))
+    .unwrap()
+    {
+        Some((completion, _, _)) => completion,
+        None => panic!("expected an owned KMS transaction"),
+    }
+}
+fn observe() -> Request {
+    Request::Atomic(OwnedAtomic {
+        flags: NONBLOCK,
+        cookie: 0,
+        objects: vec![1],
+        counts: vec![1],
+        props: vec![CRTC_OUT_FENCE_PTR_PROP_ID],
+        values: vec![512],
+    })
+}
+fn smoke_intel_color_replacement_master_restores_before_flip_and_stale_close_is_noop() -> TestResult
+{
+    for implicit in [false, true] {
+        for close_first in [false, true] {
+            let mode = color_mode();
+            let ctm = blob(&mode);
+            let gamma = gamma_blob(&mode, false);
+            let queue = queue::Queue::new(mode.clone());
+            let cpu = Cpu::new();
+            let old_events = Events::new(IrqSafeSpinLock::new(Default::default()));
+            let events = Events::new(IrqSafeSpinLock::new(Default::default()));
+            let platform = MockPlatform::new();
+            let device = Arc::new(platform.meteor());
+            let mut worker = Worker {
+                device: device.clone(),
+            };
+            request(&cpu, ctm, NONBLOCK);
+            let a = submit(&queue, &cpu, &old_events);
+            run(queue.run(&mut worker));
+            gamma_request(&cpu, gamma, NONBLOCK);
+            let b = submit(&queue, &cpu, &old_events);
+            run(queue.run(&mut worker));
+            assert_eq!((a.status(), b.status()), (1, 1));
+            assert_eq!(
+                platform.read32(crate::intel_gpu_color::GAMMA),
+                (1 << 30) | 1
+            );
+            if !implicit {
+                mode.lock().master_open(8);
+            } // already-open non-master
+            old_events.lock().close();
+            mode.lock().release_file_framebuffers(7);
+            mode.lock().master_release(7);
+            assert!(mode.lock().intel_master_restore_pending());
+            if implicit {
+                mode.lock().master_open(8);
+            }
+            // Simulate the actual lastclose task after B has opened. The task
+            // may run first or after B's worker; both use the same Session and
+            // pending marker rather than checking only has_master().
+            if close_first {
+                let mut session = run(device.session()).unwrap();
+                run(restore_released_master(&mut session, &mode)).unwrap();
+                assert!(!mode.lock().intel_master_restore_pending());
+            }
+            if !implicit {
+                let acquired = submit_as(
+                    &queue,
+                    8,
+                    drm_uapi::io(u32::from(b'd'), 0x1e),
+                    &cpu,
+                    &events,
+                );
+                run(queue.run(&mut worker));
+                assert_eq!(acquired.status(), 1);
+                assert!(mode.lock().is_master(8));
+            }
+            // Real public WC primary flip on x86; WC is deliberately refused
+            // on aarch64, where the same worker observes actual console vblank.
+            #[cfg(target_arch = "x86_64")]
+            let presentation = atomic_frame(framebuffer(&mode, 8, true).unwrap(), NONBLOCK);
+            #[cfg(not(target_arch = "x86_64"))]
+            let presentation = observe();
+            let (flipped, _, _) = run(queue.submit(
+                8,
+                presentation,
+                Geometry {
+                    width: 64,
+                    height: 32,
+                    pitch: 256,
+                },
+                1,
+                &cpu,
+                Some(&events),
+            ))
+            .unwrap()
+            .unwrap();
+            run(queue.run(&mut worker));
+            assert_eq!(flipped.status(), 1);
+            assert!(!mode.lock().intel_master_restore_pending());
+            assert_eq!(platform.read32(crate::intel_gpu_color::GAMMA), 0);
+            assert_eq!(platform.read32(crate::intel_gpu_color::MODE), 0);
+            assert_eq!(
+                mode.lock().crtc_color(1).map(|c| (c.ctm, c.gamma_lut)),
+                Some((0, 0))
+            );
+            assert_eq!(platform.palette_writes(), 2048);
+            // B's independently confirmed color must survive A's late close.
+            request(&cpu, ctm, NONBLOCK);
+            let c = submit_as(&queue, 8, drm_uapi::DRM_IOCTL_MODE_ATOMIC, &cpu, &events);
+            run(queue.run(&mut worker));
+            gamma_request(&cpu, gamma, NONBLOCK);
+            let g = submit_as(&queue, 8, drm_uapi::DRM_IOCTL_MODE_ATOMIC, &cpu, &events);
+            run(queue.run(&mut worker));
+            assert_eq!((c.status(), g.status()), (1, 1));
+            let writes = platform.palette_writes();
+            {
+                let mut session = run(device.session()).unwrap();
+                run(restore_released_master(&mut session, &mode)).unwrap();
+            }
+            assert_eq!(
+                platform.read32(crate::intel_gpu_color::GAMMA),
+                (1 << 30) | 1
+            );
+            assert_eq!(platform.read32(crate::intel_gpu_color::MODE), 1 << 31);
+            assert_eq!(platform.palette_writes(), writes);
+            assert_eq!(
+                mode.lock().crtc_color(1).map(|c| (c.ctm, c.gamma_lut)),
+                Some((ctm, gamma))
+            );
+            let dropped = submit_as(
+                &queue,
+                8,
+                drm_uapi::io(u32::from(b'd'), 0x1f),
+                &cpu,
+                &events,
+            );
+            run(queue.run(&mut worker));
+            assert_eq!(dropped.status(), 1);
+            assert!(!mode.lock().has_master());
+            assert!(!mode.lock().intel_master_restore_pending());
+            assert_eq!(platform.read32(crate::intel_gpu_color::GAMMA), 0);
+            assert_eq!(platform.read32(crate::intel_gpu_color::MODE), 0);
+            assert_eq!(
+                mode.lock().crtc_color(1).map(|c| (c.ctm, c.gamma_lut)),
+                Some((0, 0))
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_intel_color_replacement_master_restores_before_flip_and_stale_close_is_noop
+);
+
+fn smoke_intel_color_master_restore_marker_survives_test_only_cancellation_and_failure(
+) -> TestResult {
+    for failure in [false, true] {
+        let mode = color_mode();
+        let id = gamma_blob(&mode, false);
+        let queue = queue::Queue::new(mode.clone());
+        let cpu = Cpu::new();
+        let events = Events::new(IrqSafeSpinLock::new(Default::default()));
+        let platform = MockPlatform::new();
+        let device = Arc::new(platform.meteor());
+        let mut worker = Worker {
+            device: device.clone(),
+        };
+        gamma_request(&cpu, id, NONBLOCK);
+        let completed = submit(&queue, &cpu, &events);
+        run(queue.run(&mut worker));
+        assert_eq!(completed.status(), 1);
+        mode.lock().master_release(7);
+        mode.lock().master_open(8);
+        gamma_request(&cpu, 0, NONBLOCK | TEST_ONLY);
+        assert!(run(admit(
+            &queue,
+            8,
+            drm_uapi::DRM_IOCTL_MODE_ATOMIC,
+            64,
+            &cpu,
+            Some(&events),
+            Geometry {
+                width: 64,
+                height: 32,
+                pitch: 256
+            },
+            1
+        ))
+        .unwrap()
+        .is_none());
+        assert!(mode.lock().intel_master_restore_pending());
+        assert_eq!(
+            platform.read32(crate::intel_gpu_color::GAMMA),
+            (1 << 30) | 1
+        );
+        assert_eq!(platform.palette_writes(), 1024);
+        {
+            let mut session = run(device.session()).unwrap();
+            let mut close = Box::pin(restore_released_master(&mut session, &mode));
+            assert!(close
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+            assert!(mode.lock().intel_master_restore_pending());
+            assert_eq!(platform.palette_writes(), 1024);
+            if failure {
+                platform.set(crate::intel_gpu_color::GAMMA, 1 << 30);
+                assert_eq!(run(close), Err(FsError::NoDevice));
+            } else {
+                drop(close);
+            }
+        }
+        assert!(mode.lock().intel_master_restore_pending());
+        assert!(device.legacy().is_err());
+        if failure {
+            assert!(run(device.session()).is_err());
+            platform.poison();
+            run(device.recover()).unwrap();
+        }
+        let (observed, _, _) = run(queue.submit(
+            8,
+            observe(),
+            Geometry {
+                width: 64,
+                height: 32,
+                pitch: 256,
+            },
+            1,
+            &cpu,
+            Some(&events),
+        ))
+        .unwrap()
+        .unwrap();
+        run(queue.run(&mut worker));
+        assert_eq!(observed.status(), 1);
+        assert!(!mode.lock().intel_master_restore_pending());
+        assert_eq!(platform.read32(crate::intel_gpu_color::GAMMA), 0);
+        assert_eq!(platform.palette_writes(), 2048);
+        assert_eq!(mode.lock().crtc_color(1).unwrap().gamma_lut, 0);
+        assert!(device.legacy().is_ok());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_intel_color_master_restore_marker_survives_test_only_cancellation_and_failure
+);
+
+fn smoke_intel_native_non_color_close_restores_and_retires_owned_front() -> TestResult {
+    // native_atomic is shared with AMD/virtio and must not opt unrelated
+    // cards into Intel close-time ownership or pending-restoration state.
+    let unrelated = mode();
+    unrelated.lock().master_release(7);
+    assert!(!unrelated.lock().intel_master_restore_pending());
+    let mode = mode();
+    mode.lock().intel_display = true;
+    assert!(!mode.lock().intel_ctm);
+    let platform = MockPlatform::new();
+    let device = Arc::new(platform.tiger());
+    let queue = queue::Queue::new(mode.clone());
+    let cpu = Cpu::new();
+    let events = Events::new(IrqSafeSpinLock::new(Default::default()));
+    let mut worker = Worker {
+        device: device.clone(),
+    };
+    #[cfg(target_arch = "x86_64")]
+    let retained = {
+        let fb = framebuffer(&mode, 7, true).unwrap();
+        let weak = Arc::downgrade(
+            &mode
+                .lock()
+                .framebuffer(fb)
+                .unwrap()
+                .intel
+                .as_ref()
+                .unwrap()
+                .object,
+        );
+        let (presented, _, _) = run(queue.submit(
+            7,
+            atomic_frame(fb, NONBLOCK),
+            Geometry {
+                width: 64,
+                height: 32,
+                pitch: 256,
+            },
+            1,
+            &cpu,
+            Some(&events),
+        ))
+        .unwrap()
+        .unwrap();
+        run(queue.run(&mut worker));
+        assert_eq!(presented.status(), 1);
+        assert_ne!(platform.read32(0x701ac), 0x01000000);
+        assert!(device.legacy().is_err());
+        Some(weak)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let retained: Option<alloc::sync::Weak<crate::intel_gpu_gem::GemObject>> = {
+        let (observed, _, _) = run(queue.submit(
+            7,
+            observe(),
+            Geometry {
+                width: 64,
+                height: 32,
+                pitch: 256,
+            },
+            1,
+            &cpu,
+            Some(&events),
+        ))
+        .unwrap()
+        .unwrap();
+        run(queue.run(&mut worker));
+        assert_eq!(observed.status(), 1);
+        None
+    };
+    events.lock().close();
+    mode.lock().release_file_framebuffers(7);
+    mode.lock().master_release(7);
+    mode.lock().master_open(8); // replacement exists before the close task runs
+    assert!(mode.lock().intel_master_restore_pending());
+    if let Some(weak) = &retained {
+        assert!(weak.upgrade().is_some());
+    }
+    {
+        let mut session = run(device.session()).unwrap();
+        run(restore_released_master(&mut session, &mode)).unwrap();
+    }
+    assert!(!mode.lock().intel_master_restore_pending());
+    assert_eq!(platform.read32(0x701ac), 0x01000000);
+    assert_eq!(platform.palette_writes(), 0);
+    if let Some(weak) = retained {
+        assert!(weak.upgrade().is_none());
+    }
+    assert!(device.legacy().is_ok());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_intel_native_non_color_close_restores_and_retires_owned_front
 );

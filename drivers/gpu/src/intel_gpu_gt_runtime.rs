@@ -32,6 +32,7 @@ pub enum RuntimeError {
     Authority,
     Firmware(crate::intel_gpu_guc_firmware::FirmwareError),
     State,
+    Configuration,
     Gt(GtError),
 }
 
@@ -70,7 +71,7 @@ struct State {
     power_ready: u64,
     recover_after_stop: bool,
     /// User epoch to continue after a runtime resume (clean idle stop only).
-    parked_epoch: Option<u64>,
+    parked_epoch: Option<(u64, crate::intel_gpu_engine::EngineSet, (u8, u8))>,
     /// The SLPC outcome of this GT incarnation has been logged.
     slpc_reported: bool,
 }
@@ -97,6 +98,7 @@ struct Owner {
     user_facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
     power_controls: Arc<crate::intel_gpu_power_controls::PowerControls>,
     hwmon: Option<Arc<crate::intel_gpu_hwmon::Monitor>>,
+    ccs_mode: Result<u8, RuntimeError>,
 }
 
 #[derive(Debug)]
@@ -414,6 +416,7 @@ pub(crate) fn start_pending() {
             user_facts: Arc::new(IrqSafeSpinLock::new(None)),
             power_controls: Arc::new(crate::intel_gpu_power_controls::PowerControls::new()),
             hwmon,
+            ccs_mode: ccs_boot_mode(narf_boot::args()),
         });
         *ops.0.lock() = Arc::downgrade(&owner);
         let backend = Arc::new(Backend {
@@ -520,6 +523,45 @@ fn pci_identity(
     Err(RuntimeError::Device)
 }
 
+/// A single unambiguous boot selection is immutable for each physical owner.
+/// Invalid explicit settings refuse scheduling; tokens after `--` are init args.
+fn ccs_boot_mode(command_line: narf_boot::args::KernelCmdline<'_>) -> Result<u8, RuntimeError> {
+    let mut selection = None;
+    for token in command_line.tokens().take_while(|token| *token != "--") {
+        let value = if token == "narf.intel.ccs_mode" {
+            return Err(RuntimeError::Configuration);
+        } else if let Some(value) = token.strip_prefix("narf.intel.ccs_mode=") {
+            value
+        } else {
+            continue;
+        };
+        if selection.is_some() {
+            return Err(RuntimeError::Configuration);
+        }
+        selection = Some(match value {
+            "1" => 1,
+            "2" => 2,
+            "3" => 3,
+            "4" => 4,
+            _ => return Err(RuntimeError::Configuration),
+        });
+    }
+    Ok(selection.unwrap_or(1))
+}
+
+/// Every advertised physical engine must retire and verify its own private
+/// PPGTT store before publication. The order comes from the frozen EngineSet.
+fn next_probe_engine(
+    engines: crate::intel_gpu_engine::EngineSet,
+    completed: crate::intel_gpu_engine::Engine,
+) -> Result<Option<crate::intel_gpu_engine::Engine>, RuntimeError> {
+    let at = engines
+        .iter()
+        .position(|engine| engine == completed)
+        .ok_or(RuntimeError::State)?;
+    Ok(engines.iter().nth(at + 1))
+}
+
 impl Owner {
     fn close_controls(&self) {
         self.power_controls.close();
@@ -529,6 +571,13 @@ impl Owner {
     }
 
     fn cold_start(&self, state: &mut State) -> Result<(), RuntimeError> {
+        let mode = self.ccs_mode?;
+        let platform =
+            GtPlatform::from_pci(self.pending.device.id.vendor, self.pending.device.id.device)
+                .ok_or(RuntimeError::Device)?;
+        if mode != 1 && !platform.is_discrete() {
+            return Err(RuntimeError::Configuration);
+        }
         state.irq.take();
         state.irq_tried = false;
         state.recover_after_stop = false;
@@ -637,7 +686,8 @@ impl Owner {
                     .card
                     .publish_gt_topology(gt)
                     .map_err(RuntimeError::Gt)?;
-                gt.begin_scheduling(now).map_err(RuntimeError::Gt)?;
+                gt.begin_scheduling_with_ccs_mode(now, self.ccs_mode?)
+                    .map_err(RuntimeError::Gt)?;
                 state.phase = Phase::Reloading;
             }
             (Phase::Reloading, GtState::Ready) => {
@@ -687,19 +737,21 @@ impl Owner {
                         .verify()
                         .map_err(|_| RuntimeError::State)?;
                     state.probe_result = None;
-                    use crate::intel_gpu_engine::Engine;
-                    if state.probe_engine != Engine::Bcs8
-                        && gt
-                            .engines()
-                            .is_some_and(|engines| engines.contains(Engine::Bcs8))
-                    {
+                    let engines = gt.engines().ok_or(RuntimeError::State)?;
+                    if let Some(next) = next_probe_engine(engines, state.probe_engine)? {
                         let probe = gt
-                            .submit_ppgtt_probe_on(now, Engine::Bcs8)
+                            .submit_ppgtt_probe_on(now, next)
                             .map_err(RuntimeError::Gt)?;
                         state.probe = Some(probe.completion);
                         state.probe_result = Some(probe.result);
-                        state.probe_engine = Engine::Bcs8;
+                        state.probe_engine = next;
                         return Ok(());
+                    }
+                    if let Some((epoch, previous, compute)) = state.parked_epoch {
+                        if previous != engines || gt.compute_configuration() != Some(compute) {
+                            return Err(RuntimeError::State);
+                        }
+                        gt.adopt_user_epoch(epoch).map_err(RuntimeError::Gt)?;
                     }
                     *self.user_facts.lock() = Some(gt.device_facts().map_err(RuntimeError::Gt)?);
                     // Before the epoch: discovery sees VRAM with the engines.
@@ -714,15 +766,12 @@ impl Owner {
                         gt.engines().ok_or(RuntimeError::State)?.bits(),
                         Ordering::Release,
                     );
-                    if let Some(epoch) = state.parked_epoch.take() {
-                        gt.adopt_user_epoch(epoch).map_err(RuntimeError::Gt)?;
-                    }
                     // Epoch publication follows an independent console
                     // recovery attempt, outside this GT mutex. A display
                     // waiter may itself still depend on our failed fences.
                     log(
                         self.pending.index,
-                        "GuC ready; default RCS/BCS state, private PPGTT store and retirement verified",
+                        "GuC ready; every published engine's defaults, private PPGTT store and retirement verified",
                     );
                 }
             }
@@ -877,6 +926,7 @@ impl Owner {
                                 hwmon.activate(epoch);
                             }
                             self.user_epoch.store(epoch, Ordering::Release);
+                            state.parked_epoch = None;
                             state.phase = Phase::Running;
                         }
                     }
@@ -893,7 +943,7 @@ impl Owner {
                 if state.phase == Phase::Running {
                     if let Some(hwmon) = &self.hwmon {
                         let mmio = AuthorizedWindow::new(self.pending.bar, self.pending.cap);
-                        hwmon.sample_mmio(
+                        hwmon.service_mmio(
                             self.user_epoch.load(Ordering::Acquire),
                             narf_time::monotonic_ns(),
                             &mmio,
@@ -990,6 +1040,16 @@ impl Owner {
         if epoch == 0 || !state.gt.as_ref().is_some_and(GuCGt::idle) {
             return Err(RpmError::Busy);
         }
+        let engines = state
+            .gt
+            .as_ref()
+            .and_then(GuCGt::engines)
+            .ok_or(RpmError::Failed)?;
+        let compute = state
+            .gt
+            .as_ref()
+            .and_then(GuCGt::compute_configuration)
+            .ok_or(RpmError::Failed)?;
         state.irq.take(); // mask and synchronize while still in D0
         self.close_controls();
         state.irq_tried = false;
@@ -1004,7 +1064,7 @@ impl Owner {
         }
         // Verified stopped: reclaim its GGTT owners before D3hot.
         state.gt.take();
-        state.parked_epoch = Some(epoch);
+        state.parked_epoch = Some((epoch, engines, compute));
         state.phase = Phase::Parked;
         log(self.pending.index, "runtime suspended (idle)");
         Ok(())
@@ -1269,6 +1329,82 @@ mod tests {
     use super::*;
     use alloc::collections::BTreeMap;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_gt_compute_boot_selection_is_unambiguous_and_immutable() -> TestResult {
+        use narf_boot::args::KernelCmdline;
+        for (raw, expected) in [
+            ("", 1),
+            ("quiet", 1),
+            ("narf.intel.ccs_mode=1", 1),
+            ("narf.intel.ccs_mode=2", 2),
+            ("narf.intel.ccs_mode=3", 3),
+            ("narf.intel.ccs_mode=4", 4),
+            ("-- narf.intel.ccs_mode=4", 1),
+        ] {
+            assert_eq!(ccs_boot_mode(KernelCmdline::new(raw)), Ok(expected));
+        }
+        for raw in [
+            "narf.intel.ccs_mode",
+            "narf.intel.ccs_mode=",
+            "narf.intel.ccs_mode=0",
+            "narf.intel.ccs_mode=5",
+            "narf.intel.ccs_mode=-1",
+            "narf.intel.ccs_mode=02",
+            "narf.intel.ccs_mode=2 narf.intel.ccs_mode=2",
+            "narf.intel.ccs_mode=1 narf.intel.ccs_mode=2",
+            "narf.intel.ccs_mode=1 narf.intel.ccs_mode",
+        ] {
+            assert_eq!(
+                ccs_boot_mode(KernelCmdline::new(raw)),
+                Err(RuntimeError::Configuration)
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt",
+        smoke_gt_compute_boot_selection_is_unambiguous_and_immutable
+    );
+
+    fn smoke_gt_private_startup_probes_cover_every_sparse_physical_engine() -> TestResult {
+        use crate::intel_gpu_engine::{Engine, EngineSet};
+        let engines = EngineSet::of(&[
+            Engine::Rcs0,
+            Engine::Bcs0,
+            Engine::Bcs8,
+            Engine::Ccs1,
+            Engine::Ccs3,
+        ]);
+        let mut current = Engine::Rcs0;
+        let mut visited = alloc::vec![current];
+        while let Some(next) = next_probe_engine(engines, current).unwrap() {
+            visited.push(next);
+            current = next;
+        }
+        assert_eq!(
+            visited,
+            [
+                Engine::Rcs0,
+                Engine::Bcs0,
+                Engine::Bcs8,
+                Engine::Ccs1,
+                Engine::Ccs3
+            ]
+        );
+        assert_eq!(
+            next_probe_engine(engines, Engine::Ccs0),
+            Err(RuntimeError::State)
+        );
+        assert_eq!(
+            next_probe_engine(EngineSet::default(), Engine::Rcs0),
+            Err(RuntimeError::State)
+        );
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt",
+        smoke_gt_private_startup_probes_cover_every_sparse_physical_engine
+    );
 
     fn smoke_gt_pci_identity_and_virtualization_admission() -> TestResult {
         // PCIe extended-capability headers: ID[15:0], version[19:16],

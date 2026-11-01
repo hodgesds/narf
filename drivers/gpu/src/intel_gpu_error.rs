@@ -274,6 +274,9 @@ fn engine_name(engine: Engine) -> &'static str {
         Engine::Bcs0 => "bcs0",
         Engine::Bcs8 => "bcs8",
         Engine::Ccs0 => "ccs0",
+        Engine::Ccs1 => "ccs1",
+        Engine::Ccs2 => "ccs2",
+        Engine::Ccs3 => "ccs3",
     }
 }
 impl Snapshot {

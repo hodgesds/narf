@@ -1,17 +1,59 @@
-//! Read-only dGPU telemetry sampled by the retained GT reset/power owner.
+//! Cached dGPU telemetry and bounded DG2 PL1 requests, serviced by the
+//! retained GT reset/power owner.
 //!
 //! MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad:
 //! xe_hwmon.c::{xe_hwmon_get_reg,xe_hwmon_temp_read,xe_hwmon_get_voltage,
 //! xe_hwmon_energy_get}, regs/{xe_mchbar_regs,xe_pcode_regs,xe_gt_regs}.h.
 //! Sysfs reads use cached observations, never wake the GPU or touch MMIO.
-//! Thermal limits, fan/power controls and BMG PMT energy remain separate.
+//! BMG PMT energy and mailbox power-source/control changes remain separate.
 
 use alloc::{format, string::String, sync::Arc};
 use core::sync::atomic::{AtomicU64, Ordering};
-use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
+use narf_filesystem::sysfs::{
+    class_device_register, class_register, kobject_add_attr, kobject_add_writable_attr,
+};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{intel_gpu_aux::MmioWindow, intel_gpu_gt::GtPlatform};
+
+#[path = "intel_gpu_hwmon_pcode.rs"]
+mod pcode;
+#[path = "intel_gpu_hwmon_power.rs"]
+mod power;
+
+trait Io {
+    fn read(&mut self, offset: u64) -> Option<u32>;
+    fn write(&mut self, offset: u64, value: u32) -> bool;
+}
+
+struct LiveIo<'a, M, F> {
+    monitor: &'a Monitor,
+    epoch: u64,
+    mmio: &'a M,
+    current: F,
+    lost: bool,
+}
+impl<M, F: FnMut() -> bool> LiveIo<'_, M, F> {
+    fn allowed(&mut self) -> bool {
+        if !self.lost {
+            self.lost =
+                self.monitor.admission.load(Ordering::Acquire) != self.epoch || !(self.current)();
+        }
+        !self.lost
+    }
+}
+impl<M: MmioWindow, F: FnMut() -> bool> Io for LiveIo<'_, M, F> {
+    fn read(&mut self, offset: u64) -> Option<u32> {
+        self.allowed().then(|| self.mmio.read32(offset))
+    }
+    fn write(&mut self, offset: u64, value: u32) -> bool {
+        if !self.allowed() {
+            return false;
+        }
+        self.mmio.write32(offset, value);
+        true
+    }
+}
 
 const INTERVAL_NS: u64 = 1_000_000_000;
 const MAX_AGE_NS: u64 = 2_000_000_000;
@@ -22,6 +64,7 @@ const VRAM_CHANNEL: u64 = 0x138260;
 const VOLTAGE: u64 = 0x1381b4;
 const ENERGY_UNIT: u64 = 0x145938;
 const ENERGY_STATUS: u64 = 0x14593c;
+const FAN: [u64; 3] = [0x138140, 0x138170, 0x1381a0];
 const TEMPERATURE_NAMES: [(&str, &str); 18] = [
     ("temp2_input", "temp2_label"),
     ("temp3_input", "temp3_label"),
@@ -57,6 +100,12 @@ struct Energy {
     accumulated: u64,
     shift: u8,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct Fan {
+    raw: u32,
+    at: u64,
+}
 impl Energy {
     fn microjoules(&self) -> Option<u64> {
         u64::try_from((u128::from(self.accumulated) * 1_000_000) >> self.shift).ok()
@@ -70,6 +119,10 @@ struct State {
     reading: Option<Reading>,
     energy: Option<Energy>,
     energy_lost: bool,
+    discovery: pcode::Discovery,
+    fan_sampled: Option<u64>,
+    fans: [Option<Fan>; 3],
+    fan_rpm: [Option<u64>; 3],
 }
 
 /// One card's telemetry. An explicit ready epoch admits sampling; stale
@@ -79,6 +132,7 @@ pub(crate) struct Monitor {
     platform: GtPlatform,
     admission: AtomicU64,
     state: IrqSafeSpinLock<State>,
+    power: power::Power,
 }
 impl Monitor {
     fn new(platform: GtPlatform) -> Option<Self> {
@@ -94,7 +148,12 @@ impl Monitor {
                 reading: None,
                 energy: None,
                 energy_lost: false,
+                discovery: pcode::Discovery::default(),
+                fan_sampled: None,
+                fans: [None; 3],
+                fan_rpm: [None; 3],
             }),
+            power: power::Power::new(),
         })
     }
 
@@ -111,6 +170,11 @@ impl Monitor {
         state.reading = None;
         state.energy = None;
         state.energy_lost = false;
+        state.discovery = pcode::Discovery::default();
+        state.fan_sampled = None;
+        state.fans = [None; 3];
+        state.fan_rpm = [None; 3];
+        self.power.activate(epoch);
         self.admission.store(epoch, Ordering::Release);
     }
 
@@ -122,23 +186,132 @@ impl Monitor {
         state.sampled = None;
         state.energy = None;
         state.energy_lost = false;
+        state.discovery = pcode::Discovery::default();
+        state.fan_sampled = None;
+        state.fans = [None; 3];
+        state.fan_rpm = [None; 3];
+        self.power.close();
     }
 
     /// The caller holds the GT reset/power mutex and checks current PCI D0
-    /// and capability authority before *each* read. None stops this sample
-    /// immediately. All-ones optional registers yield unavailable fields.
-    /// At most 1 Hz and 18 (BMG) / 5 (DG2) reads; no write, wait or wake.
-    pub(crate) fn sample_mmio(
+    /// and capability authority before *each* operation. All-ones optional
+    /// sensors remain unavailable. Sensors and PL1 observations run at most
+    /// 1 Hz; a queued DG2 control uses one bounded read/RMW/readback sequence.
+    /// BMG discovery advances at most one mailbox step per service poll.
+    /// No wait, PM wake, IRQ or sysfs-triggered MMIO is performed here.
+    pub(crate) fn service_mmio(
         &self,
         epoch: u64,
         now: u64,
         mmio: &impl MmioWindow,
-        mut current_access_ok: impl FnMut() -> bool,
+        current_access_ok: impl FnMut() -> bool,
     ) {
-        self.sample(epoch, now, |offset| {
-            // An unavailable optional sensor must not discard valid siblings.
-            current_access_ok().then(|| mmio.read32(offset))
-        });
+        if epoch == 0 || self.admission.load(Ordering::Acquire) != epoch {
+            return;
+        }
+        let mut io = LiveIo {
+            monitor: self,
+            epoch,
+            mmio,
+            current: current_access_ok,
+            lost: false,
+        };
+        self.service(epoch, now, &mut io);
+        if io.lost {
+            // A different sub-sampler can observe authority/D0 loss between
+            // the 1 Hz sensor ticks. Revoke all current observations even
+            // when those samplers correctly skipped their rate-limited reads.
+            // Optional all-ones registers do not set this denial latch.
+            self.invalidate_observations(epoch);
+        }
+    }
+
+    fn invalidate_observations(&self, epoch: u64) {
+        let mut state = self.state.lock();
+        if state.epoch != epoch || self.admission.load(Ordering::Acquire) != epoch {
+            return;
+        }
+        state.reading = None;
+        state.energy = None;
+        state.energy_lost = true;
+        state.fans = [None; 3];
+        state.fan_rpm = [None; 3];
+        // Preserve timestamps and discovery diagnostics, including a pending
+        // mailbox's failed Access result. Lost fan/energy continuity must not
+        // be reconstructed from cached samples when authority later returns.
+        self.power.access_lost(epoch);
+    }
+
+    fn service(&self, epoch: u64, now: u64, io: &mut impl Io) {
+        if epoch == 0 || self.admission.load(Ordering::Acquire) != epoch {
+            return;
+        }
+        if self.platform == GtPlatform::Alchemist {
+            self.power.service(epoch, now, io);
+        } else {
+            let mut discovery = self.state.lock().discovery;
+            discovery.step(now, io);
+            let mut state = self.state.lock();
+            if state.epoch != epoch || self.admission.load(Ordering::Acquire) != epoch {
+                return;
+            }
+            state.discovery = discovery;
+        }
+        self.sample(epoch, now, |offset| io.read(offset));
+        self.sample_fans(epoch, now, io);
+    }
+
+    fn sample_fans(&self, epoch: u64, now: u64, io: &mut impl Io) {
+        let (mut fans, count) = {
+            let state = self.state.lock();
+            if state.epoch != epoch
+                || self.admission.load(Ordering::Acquire) != epoch
+                || state
+                    .fan_sampled
+                    .is_some_and(|at| now >= at && now - at < INTERVAL_NS)
+            {
+                return;
+            }
+            let count = if self.platform == GtPlatform::Alchemist {
+                // xe_hwmon_pcode_read_fan_control explicitly uses two for DG2;
+                // that firmware's reported count is known to be incorrect.
+                2
+            } else {
+                usize::from(state.discovery.fans.unwrap_or(0))
+            };
+            (state.fans, count)
+        };
+        let mut rpm = [None; 3];
+        let mut valid = true;
+        for index in 0..count {
+            let Some(raw) = io.read(FAN[index]) else {
+                valid = false;
+                break;
+            };
+            let previous = fans[index];
+            fans[index] = (raw != u32::MAX).then_some(Fan { raw, at: now });
+            if raw == u32::MAX {
+                continue;
+            }
+            if let Some(previous) = previous {
+                if now > previous.at && now - previous.at <= MAX_AGE_NS {
+                    // Xe source: two cumulative PWM pulses per rotation,
+                    // integer milliseconds and ceil(rotations*60000 / ms).
+                    let elapsed_ms = (now - previous.at) / 1_000_000;
+                    if elapsed_ms != 0 {
+                        let rotations = u64::from(raw.wrapping_sub(previous.raw) / 2);
+                        rpm[index] = Some((rotations * 60_000).div_ceil(elapsed_ms));
+                    }
+                }
+            }
+        }
+        let mut state = self.state.lock();
+        if state.epoch != epoch || self.admission.load(Ordering::Acquire) != epoch {
+            return;
+        }
+        state.fan_sampled = Some(now);
+        state.fans = if valid { fans } else { [None; 3] };
+        state.fan_rpm = if valid { rpm } else { [None; 3] };
     }
 
     fn sample(&self, epoch: u64, now: u64, mut read: impl FnMut(u64) -> Option<u32>) {
@@ -244,6 +417,51 @@ impl Monitor {
     }
 
     fn show(&self, attribute: &str, now: u64) -> String {
+        if self.platform == GtPlatform::Alchemist && attribute.starts_with("power2_") {
+            return if attribute == "power2_label" {
+                "pkg\n".into()
+            } else {
+                self.power.show(attribute, now)
+            };
+        }
+        if let Some(index) = attribute
+            .strip_prefix("fan")
+            .and_then(|s| s.strip_suffix("_input"))
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&i| (1..=3).contains(&i))
+        {
+            let state = self.state.lock();
+            if state.epoch == 0
+                || self.admission.load(Ordering::Acquire) != state.epoch
+                || state
+                    .fan_sampled
+                    .is_none_or(|at| now < at || now - at > MAX_AGE_NS)
+            {
+                return String::new();
+            }
+            return state.fan_rpm[index - 1].map_or_else(String::new, |rpm| format!("{rpm}\n"));
+        }
+        if self.platform == GtPlatform::Battlemage {
+            let state = self.state.lock();
+            let current = state.epoch != 0 && self.admission.load(Ordering::Acquire) == state.epoch;
+            if attribute == "telemetry_status" {
+                return if current {
+                    state.discovery.status()
+                } else {
+                    "unavailable\n".into()
+                };
+            }
+            if current
+                && state.reading.is_some()
+                && state
+                    .sampled
+                    .is_some_and(|at| now >= at && now - at <= MAX_AGE_NS)
+            {
+                if let Some(value) = state.discovery.limit(attribute) {
+                    return format!("{value}\n");
+                }
+            }
+        }
         if let Some((index, label)) = temperature_attribute(attribute) {
             if label {
                 return match index {
@@ -303,6 +521,51 @@ impl Monitor {
                     monitor.show(attribute, narf_time::monotonic_ns())
                 });
             }
+            for attribute in [
+                "power2_label",
+                "power2_rated_max",
+                "power2_max_default",
+                "power2_max_min",
+                "power2_max_max",
+                "power2_max_status",
+            ] {
+                let monitor = self.clone();
+                kobject_add_attr(&node, attribute, move || {
+                    monitor.show(attribute, narf_time::monotonic_ns())
+                });
+            }
+            let show = self.clone();
+            let store = self.clone();
+            kobject_add_writable_attr(
+                &node,
+                "power2_max",
+                move || show.show("power2_max", narf_time::monotonic_ns()),
+                move |bytes| store.power.store(bytes, narf_time::monotonic_ns()),
+            );
+        } else {
+            for attribute in [
+                "temp2_emergency",
+                "temp2_crit",
+                "temp2_max",
+                "temp3_emergency",
+                "temp3_crit",
+                "telemetry_status",
+            ] {
+                let monitor = self.clone();
+                kobject_add_attr(&node, attribute, move || {
+                    monitor.show(attribute, narf_time::monotonic_ns())
+                });
+            }
+        }
+        for attribute in if self.platform == GtPlatform::Alchemist {
+            &["fan1_input", "fan2_input"][..]
+        } else {
+            &["fan1_input", "fan2_input", "fan3_input"][..]
+        } {
+            let monitor = self.clone();
+            kobject_add_attr(&node, attribute, move || {
+                monitor.show(attribute, narf_time::monotonic_ns())
+            });
         }
     }
 }
@@ -332,3 +595,7 @@ fn temperature_attribute(name: &str) -> Option<(usize, bool)> {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_hwmon_tests.rs"]
 mod tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "intel_gpu_hwmon_control_tests.rs"]
+mod control_tests;

@@ -126,7 +126,7 @@ impl Platform for Physical {
     fn color_restored(&self) {
         if let Some(card) = crate::drm_registry::mode_state(self.index) {
             let mut card = card.lock();
-            card.intel_clear_ctm();
+            card.intel_master_restored();
         }
     }
     fn pause_console(&self) -> Wait<'_> {
@@ -340,6 +340,7 @@ pub(crate) fn install(
     if let Some(card) = crate::drm_registry::mode_state(index) {
         let mut card = card.lock();
         card.native_atomic = true;
+        card.intel_display = true;
         if generation == Generation::MeteorLake {
             if let Some(crtc) = card.crtcs.first().map(|c| c.id) {
                 card.intel_ctm = true;
@@ -467,7 +468,7 @@ impl<M: Platform> Device<M> {
 
     /// Called by the GT worker only after its reset/startup probes, with its
     /// mutex released and backend epoch still zero. No GT fence is awaited.
-    async fn recover(&self) -> Result<(), FsError> {
+    pub(crate) async fn recover(&self) -> Result<(), FsError> {
         let mut state = self.state.lock().await;
         if !self.platform.reset_lost() {
             return Ok(());
@@ -907,9 +908,17 @@ impl<M: Platform> Guard<'_, M> {
             }
         }
     }
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) async fn set_ctm(
         &mut self,
         coefficients: Option<[u64; 9]>,
+    ) -> Result<FlipStamp, FsError> {
+        self.set_color(coefficients, None).await
+    }
+    pub(crate) async fn set_color(
+        &mut self,
+        coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
     ) -> Result<FlipStamp, FsError> {
         self.ownership_valid()?;
         self.finish_pending().await?;
@@ -941,21 +950,26 @@ impl<M: Platform> Guard<'_, M> {
             }
             self.state.color_owned = true;
         }
-        self.state.color_unpublished = true;
-        self.state
-            .color
-            .as_mut()
-            .expect("color owner")
-            .arm(
-                &self.device.platform,
-                coefficients,
-                self.device.platform.now(),
-            )
-            .inspect_err(|_| {
+        let unpublished = core::mem::replace(&mut self.state.color_unpublished, true);
+        if let Err(error) = self.state.color.as_mut().expect("color owner").arm_color(
+            &self.device.platform,
+            coefficients,
+            lut.clone(),
+            self.device.platform.now(),
+        ) {
+            // Owner's Unsupported branch is strictly before any IO: an
+            // abandoned LUT may still be active although Card never published
+            // it. Keep that uncertainty, but permit an explicit clear/restore.
+            // Palette/control writes and every other failure quarantine it.
+            if error == FsError::Unsupported {
+                self.state.color_unpublished = unpublished;
+            } else {
                 self.state.failed = true;
-            })?;
+            }
+            return Err(error);
+        }
         let stamp = self.finish_color().await?.ok_or(FsError::NoDevice)?;
-        if coefficients.is_none() {
+        if coefficients.is_none() && lut.is_none() {
             self.state.color = None;
             self.state.color_owned = false;
             if self.state.presenter.is_none() && self.state.paused {
@@ -978,7 +992,7 @@ impl<M: Platform> Guard<'_, M> {
     async fn restore_color(&mut self) -> Result<(), FsError> {
         self.finish_color().await?;
         if self.state.color.is_some() {
-            self.set_ctm(None).await?;
+            self.set_color(None, None).await?;
         }
         self.state.color_unpublished = false;
         Ok(())

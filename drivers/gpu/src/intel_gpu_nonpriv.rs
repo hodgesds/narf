@@ -36,62 +36,38 @@ impl Slots {
     }
 }
 
-const RCS: Slots = Slots {
-    base: 0x2000,
-    allowed: &ALLOWED,
-};
-const BCS: Slots = Slots {
-    base: 0x22000,
-    allowed: &[],
-};
-/// xe_reg_whitelist.c oag_mmio_trg_ccs: the same OAG grants as RCS0.
-const CCS: Slots = Slots {
-    base: 0x1a000,
-    allowed: &ALLOWED,
-};
-
+/// CCS instances carry the OAG grants; COPY instances carry no grants.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct EnginePolicy {
-    compute: bool,
-    copy8: bool,
+    engines: crate::intel_gpu_engine::EngineSet,
 }
 
 impl EnginePolicy {
-    /// The enclosing GT has already validated live GMD IP/stepping and PCI
-    /// identity. Gen12 execlists, media and future IPs need separate policies.
     pub(crate) fn new(
         platform: GtPlatform,
         engines: crate::intel_gpu_engine::EngineSet,
     ) -> Result<Self, RegisterError> {
-        if platform != GtPlatform::Battlemage
-            && engines.contains(crate::intel_gpu_engine::Engine::Bcs8)
+        use crate::intel_gpu_engine::Engine;
+        if (platform != GtPlatform::Battlemage && engines.contains(Engine::Bcs8))
+            || (!platform.is_discrete() && engines.compute().any(|e| e != Engine::Ccs0))
         {
             return Err(RegisterError::Identity);
         }
         match platform {
             GtPlatform::Alchemist
             | GtPlatform::Battlemage
-            | GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => Ok(Self {
-                compute: engines.contains(crate::intel_gpu_engine::Engine::Ccs0),
-                copy8: platform == GtPlatform::Battlemage
-                    && engines.contains(crate::intel_gpu_engine::Engine::Bcs8),
-            }),
+            | GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => {
+                Ok(Self { engines })
+            }
             _ => Err(RegisterError::Identity),
         }
     }
 
     fn banks(self) -> impl Iterator<Item = Slots> {
-        [
-            Some(RCS),
-            Some(BCS),
-            self.copy8.then_some(Slots {
-                base: 0x3ee000,
-                allowed: &[],
-            }),
-            self.compute.then_some(CCS),
-        ]
-        .into_iter()
-        .flatten()
+        self.engines.iter().map(|engine| Slots {
+            base: engine.base(),
+            allowed: if engine.is_copy() { &[] } else { &ALLOWED },
+        })
     }
 
     /// Engine must be idle and exclusively owned with both forcewake holds.

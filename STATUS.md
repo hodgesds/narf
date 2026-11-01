@@ -1437,6 +1437,28 @@ as do the x86_64 production boot, both btrfs postflights, formatting and diff
 checks. aarch64 QEMU is intentionally omitted for this architecture-neutral
 iteration. Intel silicon and Mesa acceptance remain unrun.
 
+The third Intel software checkpoint continues on the same branch with
+boot-only DG2/BMG multi-CCS selection and dense logical/sparse physical engine
+mapping, private startup execution proofs for every published engine, and
+exact partition identity on idle resume. It adds MTL/Arrow native 1024-entry
+gamma activation/bypass with safe original-palette restoration; active LUT
+replacement and jointly changed color resources still require a DSB/vblank
+owner and refuse explicitly. Extended hwmon adds admin-gated queued DG2 PL1
+controls within the original boot ceiling, fan RPM and owned BMG thermal
+limit discovery. Immutable compatibility discovery now reports observed
+revision/DSS/EU/timestamp facts and readonly default SSEU state with exact
+copy/lookup behavior; production GuC cards continue to select Xe, so legacy
+backend admission remains open. Master handoff serializes original-console/
+color restoration before replacement work, including non-color Gen12 cards;
+known telemetry access loss immediately hides cached observations between
+sampling ticks. All 40 new fixtures pass on x86_64, and selected Intel/DRM/fb
+groups pass 749 unique tests with no failures or skips. Broader software
+parity and silicon/Mesa acceptance remain open. GPU/fb target CI Clippy passes
+all three contexts on both architectures, all four host GPU configurations
+pass all-target Clippy, and both architectures pass debug/release compilation.
+The x86_64 production boot, both btrfs postflights, formatting and diff checks
+pass. aarch64 QEMU is omitted for this architecture-neutral production change.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

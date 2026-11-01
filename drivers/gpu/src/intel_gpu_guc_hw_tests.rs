@@ -403,6 +403,9 @@ kernel_test_in!(
 );
 
 fn hardware_scheduling_reload(gt: &mut GuCGt<Window, Arena>, w: &Window) {
+    hardware_scheduling_reload_mode(gt, w, 1);
+}
+fn hardware_scheduling_reload_mode(gt: &mut GuCGt<Window, Arena>, w: &Window, mode: u8) {
     // Firmware's old incarnation left bytes in this exact retained log BO.
     // Scheduling reload must clear them only after proving GuC reset.
     let logs = {
@@ -419,7 +422,7 @@ fn hardware_scheduling_reload(gt: &mut GuCGt<Window, Arena>, w: &Window) {
             ads[0x3000 / 4..0x4000 / 4].to_vec(),
         )
     };
-    gt.begin_scheduling(12).unwrap();
+    gt.begin_scheduling_with_ccs_mode(12, mode).unwrap();
     assert_eq!(gt.state(), GtState::PreparingScheduling);
     assert!(gt.poll(12).is_pending());
     assert_eq!(gt.state(), GtState::StartingScheduling);
@@ -890,10 +893,22 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 let base = match request[3] {
                     3 if request[4] == 2 => 0x3ee244,
                     3 => 0x22244,
-                    4 => 0x1a244,
+                    4 => {
+                        assert!(request[4].is_power_of_two() && request[4] <= 8);
+                        let logical = request[4].trailing_zeros() as usize;
+                        let ads = w.0.borrow().memory[&0x20001000].clone();
+                        let physical = (ads.borrow()[(0x123c + 128 + logical / 4 * 4) / 4]
+                            >> (logical % 4 * 8))
+                            & 255;
+                        [0x1a244, 0x1c244, 0x1e244, 0x26244][physical as usize]
+                    }
                     _ => 0x2244,
                 };
-                assert!(request[4] == 1 || (request[3] == 3 && request[4] == 2));
+                assert!(
+                    request[4] == 1
+                        || (request[3] == 3 && request[4] == 2)
+                        || (request[3] == 4 && request[4].is_power_of_two() && request[4] <= 8)
+                );
                 assert_eq!(image.borrow()[1024 + 2], base);
                 assert_eq!(request[11], 0);
                 assert!(registered
@@ -914,7 +929,10 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 let first = w.0.borrow().memory[&base].borrow()[1024 + 2];
                 if request[2] == 1 && execute && matches!(first, 0x22244 | 0x3ee244) {
                     execute_copy(w, base);
-                } else if request[2] == 1 && execute && first == 0x1a244 {
+                } else if request[2] == 1
+                    && execute
+                    && matches!(first, 0x1a244 | 0x1c244 | 0x1e244 | 0x26244)
+                {
                     execute_compute(w, base);
                 } else if request[2] == 1 && execute {
                     let mut d = w.0.borrow_mut();
@@ -1196,16 +1214,31 @@ fn execute_compute(w: &Window, base: u32) {
     let d = w.0.borrow();
     assert!(d.synced.contains(&base));
     let image = d.memory[&base].clone();
+    let engine = match image.borrow()[1026] {
+        0x1a244 => 0x1a000u32,
+        0x1c244 => 0x1c000,
+        0x1e244 => 0x1e000,
+        0x26244 => 0x26000,
+        _ => panic!("unknown physical compute LRC"),
+    };
     let (tail, ring_base, root) = {
         let data = image.borrow();
         assert_eq!(
             &data[1024..1031],
-            &[0, 0x1108101d, 0x1a244, data[1027], 0x1a034, 0, 0x1a030]
+            &[
+                0,
+                0x1108101d,
+                engine + 0x244,
+                data[1027],
+                engine + 0x34,
+                0,
+                engine + 0x30
+            ]
         );
         assert!(matches!(data[1027], 0x00090009 | 0x00090008));
         assert_eq!(
             (data[1032], data[1024 + 0x1c], data[1024 + 0x21]),
-            (0x1a038, 0x1a120, 0x11081011)
+            (engine + 0x38, engine + 0x120, 0x11081011)
         );
         assert_eq!(data[1024 + 0x71], 0x01000000);
         (
@@ -1236,7 +1269,7 @@ fn execute_compute(w: &Window, base: u32) {
             .position(|w| *w == 0x7a000204)
             .expect("compute flush");
         let commands = &seed[..flush - if d.regs[&0xd8c] >> 22 == 20 { 0 } else { 6 }];
-        assert!(commands.is_empty() || commands == [0x11000001, 0x1a580, 0x00060002]);
+        assert!(commands.is_empty() || commands == [0x11000001, engine + 0x580, 0x00060002]);
         assert_eq!(seed[flush + 1], 0x001000a0);
     }
     image.borrow_mut()[0x800 / 4] = stamp;
@@ -1442,9 +1475,10 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
         // Engines prime in order: the k-th publishes its golden image after
         // its seed and switch contexts, i.e. after 2(k+1) registrations.
         let engines: Vec<_> = gt.engines().unwrap().iter().collect();
+        let present = gt.engines().unwrap();
         let goldens: Vec<_> = engines
             .iter()
-            .filter(|e| e.logical_instance() == 0)
+            .filter(|e| present.logical_instance(**e) == Some(0))
             .map(|e| golden_for_class(&w, e.guc_class() as usize))
             .collect();
         let mut published = alloc::vec![None; goldens.len()];
@@ -1467,7 +1501,7 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
         let expected: Vec<_> = engines
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.logical_instance() == 0)
+            .filter(|(_, e)| present.logical_instance(**e) == Some(0))
             .map(|(k, _)| Some(2 * (k + 1)))
             .collect();
         assert_eq!(published, expected, "engines published out of order");

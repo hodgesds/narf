@@ -289,8 +289,7 @@ impl XeFile {
             .as_ref()
             .and_then(|b| b.status())
             .map_or_else(Default::default, |status| status.engines);
-        let engine = crate::intel_gpu_engine::Engine::from_class_instance(class, logical)
-            .filter(|engine| present.contains(*engine));
+        let engine = present.from_class_instance(class, logical);
         if (class != 5 && engine.is_none()) || (class == 5 && logical != 0) {
             return Err(FsError::InvalidData);
         }

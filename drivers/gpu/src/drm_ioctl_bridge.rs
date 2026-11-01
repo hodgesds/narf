@@ -2923,7 +2923,7 @@ fn handle_getcrtc(
         // drm_crtc::gamma_size: the legacy LUT's, on CRTCs that have one.
         let gamma_size = card
             .crtc_color(crtc_id)
-            .filter(|_| !card.ctm_only(crtc_id))
+            .filter(|_| !card.intel_color(crtc_id))
             .map_or(0, |_| crate::drm::card::LEGACY_GAMMA_SIZE as u32);
         out[28..32].copy_from_slice(&gamma_size.to_le_bytes());
         let mode_valid: u32 = crtc.mode.is_some() as u32;
@@ -3631,13 +3631,20 @@ fn blob_value(
 }
 
 /// Shared by GETOBJPROPERTIES and the native admission fixtures. Intel's
-/// fixed-mode color owner publishes CTM alone; AMD keeps its existing LUTs.
+/// fixed-mode color owner exposes its native 1024-entry LUT; AMD retains 4096.
 fn crtc_color_properties(card: &crate::drm::card::Card, crtc: u32) -> (Vec<u32>, Vec<u64>) {
     let Some(color) = card.crtc_color(crtc) else {
         return (Vec::new(), Vec::new());
     };
-    if card.ctm_only(crtc) {
-        (vec![CRTC_CTM_PROP_ID], vec![u64::from(color.ctm)])
+    if card.intel_color(crtc) {
+        (
+            vec![
+                CRTC_CTM_PROP_ID,
+                CRTC_GAMMA_LUT_PROP_ID,
+                CRTC_GAMMA_LUT_SIZE_PROP_ID,
+            ],
+            vec![u64::from(color.ctm), u64::from(color.gamma_lut), 1024],
+        )
     } else {
         (
             vec![
@@ -3679,9 +3686,6 @@ fn crtc_color_property(
     if card.crtc_color(crtc).is_none() {
         return Err(FsError::InvalidData);
     }
-    if prop == CRTC_GAMMA_LUT_PROP_ID && card.ctm_only(crtc) {
-        return Err(FsError::Unsupported);
-    }
     if prop == CRTC_CTM_PROP_ID {
         change.ctm = Some(blob_value(card, value, Some(CTM_BLOB_SIZE), None)?);
         return Ok(true);
@@ -3691,7 +3695,12 @@ fn crtc_color_property(
         let entries = card
             .property_blob(id)
             .map_or(0, |b| b.len() / COLOR_LUT_ENTRY_SIZE);
-        if entries != GAMMA_LUT_SIZE as usize && entries != crate::drm::card::LEGACY_GAMMA_SIZE {
+        let valid = if card.intel_color(crtc) {
+            entries == 1024
+        } else {
+            entries == GAMMA_LUT_SIZE as usize || entries == crate::drm::card::LEGACY_GAMMA_SIZE
+        };
+        if !valid {
             return Err(FsError::InvalidData);
         }
     }
@@ -4350,7 +4359,10 @@ fn handle_gamma(
     let (red, green, blue) = (ptr(8), ptr(16), ptr(24));
     let card = mode_state.lock();
     card.crtc(crtc_id).map_err(|_| FsError::NotFound)?;
-    let Some(color) = card.crtc_color(crtc_id).filter(|_| !card.ctm_only(crtc_id)) else {
+    let Some(color) = card
+        .crtc_color(crtc_id)
+        .filter(|_| !card.intel_color(crtc_id))
+    else {
         // drm_crtc_supports_legacy_gamma is false (gamma_size 0).
         return if set {
             Err(FsError::NotImplemented) // ENOSYS
@@ -8346,6 +8358,8 @@ mod intel_kms;
 mod scanout_kms;
 #[cfg(feature = "intel")]
 pub(crate) use intel_kms::dispatch as intel_kms_async;
+#[cfg(feature = "intel")]
+pub(crate) use intel_kms::restore_released_master as intel_kms_restore_released_master;
 #[cfg(feature = "amdgpu")]
 pub(crate) use scanout_kms::dispatch as amdgpu_kms_async;
 

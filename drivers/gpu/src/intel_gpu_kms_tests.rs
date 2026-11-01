@@ -28,6 +28,9 @@ enum Action {
 struct Hardware {
     regs: BTreeMap<u64, u32>,
     actions: Vec<Action>,
+    palette: [u32; 1024],
+    palette_writes: usize,
+    refuse_palette: bool,
     allowed: bool,
     powered: bool,
     pause_blocked: bool,
@@ -66,6 +69,9 @@ impl MockPlatform {
                 .into_iter()
                 .collect(),
                 actions: Vec::new(),
+                palette: core::array::from_fn(|i| i as u32),
+                palette_writes: 0,
+                refuse_palette: false,
                 allowed: true,
                 powered: true,
                 pause_blocked: false,
@@ -86,11 +92,20 @@ impl MockPlatform {
             false,
         )
     }
+    pub(crate) fn tiger(&self) -> Device<Self> {
+        Device::new(self.clone(), Generation::TigerLake, 0x1000000, console())
+    }
     pub(crate) fn meteor(&self) -> Device<Self> {
         Device::new(self.clone(), Generation::MeteorLake, 0x1000000, console())
     }
     pub(crate) fn set(&self, register: u64, value: u32) {
         self.0.lock().regs.insert(register, value);
+    }
+    pub(crate) fn palette_writes(&self) -> usize {
+        self.0.lock().palette_writes
+    }
+    pub(crate) fn refuse_palette(&self, refuse: bool) {
+        self.0.lock().refuse_palette = refuse;
     }
     pub(crate) fn poison(&self) {
         self.1.store(true, Ordering::Release);
@@ -138,6 +153,9 @@ impl MmioWindow for MockPlatform {
         if (self.reset_lost() && !self.2) || !hw.allowed || !hw.powered {
             return u32::MAX;
         }
+        if offset == 0x4a404 {
+            return hw.palette[(hw.regs.get(&0x4a400).copied().unwrap_or(0) & 1023) as usize];
+        }
         hw.regs.get(&offset).copied().unwrap_or(0)
     }
     fn write32(&self, offset: u64, value: u32) {
@@ -145,7 +163,16 @@ impl MmioWindow for MockPlatform {
         if (self.reset_lost() && !self.2) || !hw.allowed || !hw.powered {
             return;
         }
-        if offset >= PTE_START {
+        if offset == 0x4a404 {
+            hw.palette_writes += 1;
+            if !hw.refuse_palette {
+                let index = hw.regs.get(&0x4a400).copied().unwrap_or(0);
+                hw.palette[(index & 1023) as usize] = value;
+                if index & (1 << 15) != 0 {
+                    hw.regs.insert(0x4a400, (1 << 15) | ((index + 1) & 1023));
+                }
+            }
+        } else if offset >= PTE_START {
             if value == 0 {
                 hw.pte_clears += 1;
             } else {

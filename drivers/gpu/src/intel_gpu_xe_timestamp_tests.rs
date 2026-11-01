@@ -106,12 +106,20 @@ fn smoke_xe_engine_cycles_live_owner_and_query_snapshot() -> TestResult {
                 Engine::Rcs0 => expected,
                 Engine::Bcs0 => u64::from(upper ^ 1) << 32 | 0x0badf00d,
                 Engine::Bcs8 => u64::from(upper ^ 3) << 32 | 0x0bc58000,
-                Engine::Ccs0 => u64::from(upper ^ 2) << 32 | 0x0c0ffee0,
+                Engine::Ccs0 | Engine::Ccs1 | Engine::Ccs2 | Engine::Ccs3 => {
+                    u64::from(upper ^ 2) << 32 | 0x0c0ffee0
+                }
             };
             let mut payload = [0xa5; 40];
             payload[..6].fill(0);
             payload[..2].copy_from_slice(&engine.xe_class().to_le_bytes());
-            payload[2..4].copy_from_slice(&engine.logical_instance().to_le_bytes());
+            payload[2..4].copy_from_slice(
+                &gt.engines()
+                    .unwrap()
+                    .logical_instance(engine)
+                    .unwrap()
+                    .to_le_bytes(),
+            );
             put32(&mut payload, 8, clock);
             user.wire.store(0x2000, &payload);
             query(&user, 40);
@@ -146,7 +154,14 @@ fn smoke_xe_engine_cycles_live_owner_and_query_snapshot() -> TestResult {
                 Poll::Ready(Some(Ok(0)))
             );
             let result = user.wire.load(0x2000, 40);
-            assert_eq!(&result[2..4], &engine.logical_instance().to_le_bytes());
+            assert_eq!(
+                &result[2..4],
+                &gt.engines()
+                    .unwrap()
+                    .logical_instance(engine)
+                    .unwrap()
+                    .to_le_bytes()
+            );
             assert_eq!(&result[4..6], &[0; 2]);
             assert_eq!(&result[6..8], &[0xa5; 2]); // ignored pad, untouched
             assert_eq!(&result[8..12], &[0x5a; 4]);

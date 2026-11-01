@@ -11,11 +11,13 @@ use core::{
 use narf_filesystem::{DirOps, FsError};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-// Global status, RCS0, BCS0, BCS8, CCS0 in xe_hw_engine id order.
-const EXPECTED: [u64; 28] = [
+// Global status, RCS0, BCS0, BCS8, CCS0–3 in xe_hw_engine id order.
+const EXPECTED: [u64; 46] = [
     0xc000, 0xc314, 0x941c, 0x190018, 0x2034, 0x2030, 0x209c, 0x20b8, 0x206c, 0x23a8, 0x22034,
     0x22030, 0x2209c, 0x220b8, 0x2206c, 0x223a8, 0x3ee034, 0x3ee030, 0x3ee09c, 0x3ee0b8, 0x3ee06c,
-    0x3ee3a8, 0x1a034, 0x1a030, 0x1a09c, 0x1a0b8, 0x1a06c, 0x1a3a8,
+    0x3ee3a8, 0x1a034, 0x1a030, 0x1a09c, 0x1a0b8, 0x1a06c, 0x1a3a8, 0x1c034, 0x1c030, 0x1c09c,
+    0x1c0b8, 0x1c06c, 0x1c3a8, 0x1e034, 0x1e030, 0x1e09c, 0x1e0b8, 0x1e06c, 0x1e3a8, 0x26034,
+    0x26030, 0x2609c, 0x260b8, 0x2606c, 0x263a8,
 ];
 fn capture(platform: GtPlatform, reason: Reason) -> Capture {
     Capture {
@@ -78,7 +80,10 @@ fn smoke_intel_error_whitelist_profiles_and_redaction() -> TestResult {
         if platform == GtPlatform::Battlemage {
             expected.extend_from_slice(&EXPECTED[16..22]);
         }
-        expected.extend_from_slice(&EXPECTED[22..]);
+        expected.extend_from_slice(&EXPECTED[22..28]);
+        if platform == GtPlatform::Battlemage {
+            expected.extend_from_slice(&EXPECTED[28..]);
+        }
         let report = Report::capture(capture(platform, Reason::Protocol), contexts(1), |offset| {
             reads.push(offset);
             assert!(

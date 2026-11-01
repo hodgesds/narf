@@ -358,10 +358,21 @@ fn finish(
     registered: &mut BTreeMap<u32, u32>,
     start: u64,
 ) {
+    finish_policy(gt, w, fence, registered, start, 2);
+}
+
+fn finish_policy(
+    gt: &mut GuCGt<Window, Arena>,
+    w: &Window,
+    fence: &CompletionFence,
+    registered: &mut BTreeMap<u32, u32>,
+    start: u64,
+    priority: u32,
+) {
     for now in start..start + 60 {
         assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
-        // Literal GuC policy KLVs for a normal native Xe queue. Inspect the
-        // actual CT bytes before the independent firmware model consumes them.
+        // Native queues request normal2; trusted probes and direct contexts
+        // use low3. Keep the exact caller-selected policy and KLV checks.
         {
             let memory = ct_memory(w);
             let words = memory.borrow();
@@ -370,7 +381,7 @@ fn finish(
             while head != tail {
                 let length = words[1024 + head as usize] & 255;
                 if words[1024 + ((head + 1) & 1023) as usize] as u16 == 0x100b {
-                    assert_eq!(words[1024 + ((head + 4) & 1023) as usize], 2);
+                    assert_eq!(words[1024 + ((head + 4) & 1023) as usize], priority);
                     assert_eq!(words[1024 + ((head + 6) & 1023) as usize], 1000);
                 }
                 head = (head + length + 1) & 1023;
@@ -1405,4 +1416,8 @@ mod timestamps {
 }
 mod waits {
     include!("intel_gpu_xe_wait_tests.rs");
+}
+
+mod multi_ccs {
+    include!("intel_gpu_multi_ccs_tests.rs");
 }

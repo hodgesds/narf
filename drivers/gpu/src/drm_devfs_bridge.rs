@@ -262,16 +262,19 @@ impl Drop for DriCardFile {
             ) {
                 // Drop cannot await. The display owner retains all fronts
                 // until this serialized restoration proves the console latch.
-                // A new master supersedes lastclose's request: never restore
-                // stale console pixels over its newly submitted primary.
+                // Master assignment may race this task. Both it and the new
+                // master's first transaction consume the same pending marker
+                // under this session, so stale close work cannot restore over
+                // a replacement master's already committed primary/color.
                 let _ = narf_scheduler::spawn_stackful(async move {
                     let Ok(mut session) = display.session().await else {
                         return;
                     };
-                    if mode.lock().has_master() {
-                        return;
-                    }
-                    let _ = session.restore_console().await;
+                    let _ = crate::drm_ioctl_bridge::intel_kms_restore_released_master(
+                        &mut session,
+                        &mode,
+                    )
+                    .await;
                 });
             }
         }
