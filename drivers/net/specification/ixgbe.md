@@ -206,7 +206,27 @@ blindly either. IPAV is NOT programmed: the datasheet text
 extracted ambiguously ("0x5838"), so it is a remainder (§14),
 not a guessed value.
 
-## 12b. Power management and detach (placeholder — PM commit)
+## 12b. Power management and detach
+
+`drivers/net/ixgbe/src/ixgbe/pm.rs` implements the PM plans on
+a fake bank (fixtures assert the register conversations):
+`suspend_plan` masks all interrupts (EIMC = all-ones), clears
+RXEN (RXCTRL 0x03000 bit 0), disables queue 0 (RXDCTL/TXDCTL
+ENABLE bit 25 cleared), clears wake status, and arms WoL when
+given a config; `resume_plan` re-enables queue 0, RXEN, and the
+misc vector (EIMS = 1) and refreshes link state from LINKS;
+`detach_plan` suspends with no WoL and clears CTRL_EXT DRV_LOAD
+(bit 28, set at bring-up). `Ixgbe::suspend(wol)` /
+`resume()` / `prepare_detach()` drive the plans and the
+`quiesced` flag, which makes `tx`/`tx_frame` refuse and RX
+report nothing while set (pumps cannot be cancelled — they
+hold Arc clones). `detach_controller()` additionally drops
+the CONTROLLER slot, clears the RX mirror note, and
+unregisters the iface (eth%d names are reused). The PCI
+D-state step itself belongs to the platform PM layer, not
+this driver. Ring contents are NOT rebuilt on resume — a
+suspend that lost DMA state needs a full re-probe, which is
+a caller decision recorded as a follow-up (§14).
 
 ## 13. Ethtool surface (v0.2 — see §14)
 

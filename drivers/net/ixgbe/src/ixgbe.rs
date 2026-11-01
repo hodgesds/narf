@@ -17,6 +17,7 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 
+pub mod pm;
 pub mod queues;
 pub mod rss;
 mod tests;
@@ -313,8 +314,8 @@ pub struct Ixgbe {
     /// MAC read from the EEPROM at bring-up.
     pub mac: [u8; 6],
     /// True after the MAC was successfully programmed into RAH/RAL
-    /// and LINKS reports up.
-    pub link_up: bool,
+    /// and LINKS reports up. Locked: resume() refreshes it via &self.
+    pub link_up: IrqSafeSpinLock<bool>,
     /// Recorded device id (drives `name()`).
     pub did: u16,
     /// Live queue configuration (multi-queue keystone: 1/1 at
@@ -326,6 +327,9 @@ pub struct Ixgbe {
     pub vlan_filter: IrqSafeSpinLock<Option<vlan::VlanFilter>>,
     /// Armed WoL config, if `configure_wol` ran and was not disarmed.
     pub wol_armed: IrqSafeSpinLock<Option<wol::WolConfig>>,
+    /// True while the datapath is quiesced (suspend/detach): tx/rx
+    /// paths refuse work instead of feeding a stopped device.
+    pub quiesced: IrqSafeSpinLock<bool>,
     /// Stage 5: MSI-X table once enabled.
     pub(crate) msix: Option<MsixTable>,
     pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -336,7 +340,7 @@ impl core::fmt::Debug for Ixgbe {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Ixgbe")
             .field("mac", &self.mac)
-            .field("link_up", &self.link_up)
+            .field("link_up", &*self.link_up.lock())
             .field("did", &format_args!("0x{:04X}", self.did))
             .finish_non_exhaustive()
     }
@@ -525,12 +529,13 @@ impl Ixgbe {
             tx_tail: IrqSafeSpinLock::new(0),
             rx_head: IrqSafeSpinLock::new(0),
             mac,
-            link_up,
+            link_up: IrqSafeSpinLock::new(link_up),
             did: device.id.device,
             queue_config,
             rss_cfg: IrqSafeSpinLock::new(None),
             vlan_filter: IrqSafeSpinLock::new(None),
             wol_armed: IrqSafeSpinLock::new(None),
+            quiesced: IrqSafeSpinLock::new(false),
             msix: None,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
@@ -550,6 +555,9 @@ impl Ixgbe {
 
     /// Transmit a single frame, polling the descriptor's DD bit.
     pub fn tx(&self, frame: &[u8], meta: &TxMeta) -> Result<(), IxgbeError> {
+        if *self.quiesced.lock() {
+            return Err(IxgbeError::Other("device quiesced"));
+        }
         if frame.is_empty() || frame.len() > 1518 {
             return Err(IxgbeError::FrameTooLong);
         }
@@ -616,6 +624,9 @@ impl Ixgbe {
     /// synchronous (polls DD), so the device is done the moment this returns
     /// and the caller may drop or recycle the buffer immediately.
     pub fn tx_frame(&self, frame: &Frame) -> Result<(), IxgbeError> {
+        if *self.quiesced.lock() {
+            return Err(IxgbeError::Other("device quiesced"));
+        }
         let len = frame.len() as usize;
         if len == 0 || len > 1518 {
             return Err(IxgbeError::FrameTooLong);
@@ -667,6 +678,9 @@ impl Ixgbe {
 
     /// Drain one RX frame into `out`. Returns 0 if nothing pending.
     pub fn rx_recv(&self, out: &mut [u8]) -> usize {
+        if *self.quiesced.lock() {
+            return 0;
+        }
         let mut head_g = self.rx_head.lock();
         let head = (*head_g) as usize;
         let ring_phys = self.rx_ring.dma_addr().raw();
@@ -725,6 +739,9 @@ impl Ixgbe {
     /// case the received frame is left in its descriptor (head not advanced) to
     /// be retried, rather than dropped with no buffer to replace it.
     pub fn rx_recv_frame(&self) -> Option<Frame> {
+        if *self.quiesced.lock() {
+            return None;
+        }
         let mut head_g = self.rx_head.lock();
         let head = (*head_g) as usize;
         let ring_phys = self.rx_ring.dma_addr().raw();
@@ -771,6 +788,9 @@ impl Ixgbe {
     }
 
     pub fn rx_has_pending(&self) -> bool {
+        if *self.quiesced.lock() {
+            return false;
+        }
         let head = (*self.rx_head.lock()) as usize;
         let ring_phys = self.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (head * 16) as u64;
@@ -857,6 +877,46 @@ impl Ixgbe {
         Ok(())
     }
 
+    /// Suspend: quiesce the datapath (mask interrupts, RXEN off,
+    /// queue 0 disabled, wake status cleared) and arm WoL if
+    /// given. The platform PM layer owns the PCI D-state step.
+    pub fn suspend(&self, wol_cfg: Option<wol::WolConfig>) -> Result<(), IxgbeError> {
+        if let Some(cfg) = wol_cfg {
+            if !wol::wol_supported(self.did) {
+                return Err(IxgbeError::UnsupportedDevice);
+            }
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            pm::suspend_plan(&mut bank, Some(cfg));
+            *self.wol_armed.lock() = Some(cfg);
+        } else {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            pm::suspend_plan(&mut bank, None);
+        }
+        *self.quiesced.lock() = true;
+        Ok(())
+    }
+
+    /// Resume: re-enable queue 0 + RX + the misc vector, refresh
+    /// link state. Ring contents are NOT rebuilt here — a suspend
+    /// that lost DMA state needs a full re-probe (caller decision).
+    pub fn resume(&self) {
+        let mut bank = queues::MmioBank::new(&self.mmio);
+        pm::resume_plan(&mut bank);
+        *self.quiesced.lock() = false;
+        // SAFETY: identity-mapped MMIO.
+        let links = unsafe { self.mmio.read32(REG_LINKS) };
+        *self.link_up.lock() = links & LINKS_UP != 0;
+    }
+
+    /// Prepare detach: suspend with no WoL + clear DRV_LOAD, and
+    /// mark quiesced. The framework half (CONTROLLER slot, mirror
+    /// note, iface unregister) is `detach_controller`.
+    pub fn prepare_detach(&self) {
+        let mut bank = queues::MmioBank::new(&self.mmio);
+        pm::detach_plan(&mut bank);
+        *self.quiesced.lock() = true;
+    }
+
     /// Disarm Wake-on-LAN.
     pub fn disarm_wol(&self) {
         let mut bank = queues::MmioBank::new(&self.mmio);
@@ -927,7 +987,7 @@ impl narf_net::Interface for Ixgbe {
         1500
     }
     fn link_up(&self) -> bool {
-        self.link_up
+        *self.link_up.lock()
     }
     fn num_rx_queues(&self) -> u16 {
         self.queue_config.num_rx as u16
@@ -962,7 +1022,7 @@ impl crate::HwNic for Ixgbe {
         1500
     }
     fn link_up(&self) -> bool {
-        self.link_up
+        *self.link_up.lock()
     }
     fn model(&self) -> crate::NicModel {
         crate::NicModel::IntelIxgbe
@@ -1022,7 +1082,7 @@ impl narf_net::Interface for IxgbeNic {
         1500
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| c.link_up).unwrap_or(false)
+        with_controller(|c| *c.link_up.lock()).unwrap_or(false)
     }
     fn num_rx_queues(&self) -> u16 {
         with_controller(|c| c.queue_config.num_rx as u16).unwrap_or(1)
@@ -1121,6 +1181,22 @@ fn read_mac_from_rar(mmio: &MmioRegion) -> [u8; 6] {
 // ── PCI registration ───────────────────────────────────────────────
 
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<Ixgbe>>> = IrqSafeSpinLock::new(None);
+
+/// Detach the controller: quiesce + clear DRV_LOAD on the device,
+/// drop the CONTROLLER slot, clear the RX mirror note, and
+/// unregister the iface so its eth%d name can be reused. Pumps
+/// hold Arc clones and cannot be cancelled; the quiesced flag
+/// makes their tx/rx paths refuse work instead.
+pub fn detach_controller() {
+    if let Some(dev) = CONTROLLER.lock().take() {
+        dev.prepare_detach();
+    }
+    let name = ixgbe_ifname();
+    if !name.is_empty() {
+        crate::publish::clear_rx_mirror_attached(name);
+        let _ = narf_net::iface::unregister(name);
+    }
+}
 
 /// The interface name `iface::register` gave this NIC (`eth%d`, Linux
 /// `dev_alloc_name`). Set once at probe; the device lives as long as

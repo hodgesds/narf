@@ -666,3 +666,57 @@ fn smoke_ixgbe_wol() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_wol);
+
+// ── PM fixtures (commit 5) ───────────────────────────────────────
+
+fn smoke_ixgbe_pm_plans() -> TestResult {
+    use super::pm::{detach_plan, resume_plan, suspend_plan};
+    use super::queues::{rx_queue_regs, tx_queue_regs, RegBank};
+    use super::wol::WolConfig;
+    use super::{RXDCTL_ENABLE, TXDCTL_ENABLE};
+    let tx = match tx_queue_regs(0) {
+        Some(t) => t,
+        None => return TestResult::Fail("tx_queue_regs(0) is None"),
+    };
+    let rx = match rx_queue_regs(0) {
+        Some(r) => r,
+        None => return TestResult::Fail("rx_queue_regs(0) is None"),
+    };
+    let mut bank = FakeBank::new();
+    bank.set_bits(tx.txdctl, TXDCTL_ENABLE);
+    bank.set_bits(rx.rxdctl, RXDCTL_ENABLE);
+    bank.set_bits(0x03000, 1);
+    bank.set_bits(0x00018, 1 << 28);
+    suspend_plan(&mut bank, None);
+    if bank.read32(0x00888) != 0xFFFF_FFFF {
+        return TestResult::Fail("suspend did not mask interrupts");
+    }
+    if bank.read32(0x03000) & 1 != 0 {
+        return TestResult::Fail("suspend did not clear RXEN");
+    }
+    if bank.read32(tx.txdctl) & TXDCTL_ENABLE != 0 || bank.read32(rx.rxdctl) & RXDCTL_ENABLE != 0 {
+        return TestResult::Fail("suspend did not disable queues");
+    }
+    if bank.read32(0x05808) != 0 {
+        return TestResult::Fail("suspend without WoL left filters armed");
+    }
+    resume_plan(&mut bank);
+    if bank.read32(tx.txdctl) & TXDCTL_ENABLE == 0
+        || bank.read32(rx.rxdctl) & RXDCTL_ENABLE == 0
+        || bank.read32(0x03000) & 1 == 0
+        || bank.read32(0x00880) != 1
+    {
+        return TestResult::Fail("resume did not re-enable datapath");
+    }
+    // Suspend with WoL, then detach extras.
+    suspend_plan(&mut bank, Some(WolConfig::magic_only()));
+    if bank.read32(0x05808) != 0x2 || bank.read32(0x05800) & (1 << 1) == 0 {
+        return TestResult::Fail("suspend with WoL did not arm");
+    }
+    detach_plan(&mut bank);
+    if bank.read32(0x00018) & (1 << 28) != 0 {
+        return TestResult::Fail("detach did not clear DRV_LOAD");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_pm_plans);
