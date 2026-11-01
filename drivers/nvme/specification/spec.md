@@ -68,6 +68,12 @@ multipath / fabrics (defer).
   otherwise; re-probe brings it back under the same instance).
   `with_controller` / `admin_passthrough` / `NvmeBlockSync` /
   `NvmeBlockDevice` address instance 0.
+  Controller access preserves the caller's interrupt state. A contended
+  process-context caller with IRQs enabled cooperatively yields after a
+  short spin, allowing a descheduled holder on the same CPU to release the
+  gate. IRQ/masked and non-stackful callers service pending TLB-shootdown
+  and membarrier acknowledgements while waiting; they never re-enable IRQs
+  or invoke framebuffer/device pumps from the gate wait.
 - **Reset / recovery + hot-remove** (Linux `nvme_reset_work` / `remove`).
   `Controller::reset_recover(cap) -> Result<RecoveryReport, NvmeError>`:
   snapshot identity (IDENTIFY + namespace set), `disable_after_failure`,

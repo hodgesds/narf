@@ -35,6 +35,7 @@ pub mod shutdown;
 mod tests;
 mod tests_dsm;
 mod tests_flush;
+mod tests_gate;
 mod tests_multi;
 
 use core::cell::UnsafeCell;
@@ -3694,8 +3695,9 @@ pub const PCI_PROGIF_NVME: u8 = 0x02;
 ///  - *Finding* the controller: `CONTROLLERS` is taken only long enough
 ///    to copy a slot's `&'static` reference out, then released.
 ///  - *Using* the controller: `req_gate`, a plain atomic spun on
-///    WITHOUT masking interrupts, so timer ticks, RCU quiescent states
-///    and the sleep pumps keep running while a CPU waits its turn.
+///    without changing the caller's interrupt state. Contended process
+///    callers yield so a descheduled holder can run; masked callers service
+///    pending cross-CPU work instead of stranding its acknowledgements.
 ///
 /// One slot per controller (Linux: one `struct nvme_dev` per PCI
 /// function, `nvme_probe` in `drivers/nvme/host/pci.c`). Each slot owns
@@ -3712,7 +3714,7 @@ pub const PCI_PROGIF_NVME: u8 = 0x02;
 /// exists per slot at a time.
 struct InstalledController {
     /// Serialises device round-trips and all references into `ctrl`.
-    /// Acquired by [`acquire`]; spun on with interrupts ENABLED.
+    /// Acquired by [`acquire`] without changing the caller's interrupt state.
     req_gate: AtomicBool,
     /// Probe-order instance: the controller is `nvme<instance>`.
     instance: u32,
@@ -3841,7 +3843,7 @@ static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// Exclusive handle to one installed controller for one device
 /// round-trip. Holds the slot's `req_gate`, NOT the `CONTROLLERS`
-/// spinlock — interrupts stay enabled for the whole transfer.
+/// spinlock — the caller's interrupt state is preserved.
 pub struct ControllerGuard {
     slot: &'static InstalledController,
 }
@@ -3878,18 +3880,30 @@ impl Drop for ControllerGuard {
     }
 }
 
-/// Take `slot`'s gate, spinning with interrupts ENABLED: a CPU parked
-/// here still takes timer ticks and reaches RCU quiescent states while
-/// another CPU's 5-second-budget completion poll runs.
+/// Take `slot`'s gate without masking interrupts. A brief spin handles a
+/// holder running on another CPU; a longer wait yields so a holder suspended
+/// on this CPU can resume. Atomic contexts cannot yield and must service
+/// pending TLB/membarrier work, which the holder may be waiting for.
 fn acquire(slot: &'static InstalledController) -> ControllerGuard {
-    while slot
-        .req_gate
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
+    loop {
+        for _ in 0..64 {
+            if slot
+                .req_gate
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return ControllerGuard { slot };
+            }
+            core::hint::spin_loop();
+        }
+        if !narf_memory::context::irqs_enabled()
+            || narf_lib::context::in_irq()
+            || !narf_scheduler::cooperative_yield()
+        {
+            narf_lib::sync::service_masked_spin();
+            core::hint::spin_loop();
+        }
     }
-    ControllerGuard { slot }
 }
 
 /// Exclusive access to controller `instance`, or `None` if it is not
