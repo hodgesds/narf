@@ -887,6 +887,7 @@ pub fn tx_l3_info(frame: &[u8]) -> Option<TxL3Info> {
 ///   past `GTTCPHO_MAX`, or longer than `TX_LEN_MASK`) are
 ///   rejected here — the send path falls back to software GSO
 ///   for TCP frames it cannot encode.
+///
 /// A `plain` meta produces exactly `build_tx_segment`'s bytes.
 pub fn build_tx_segment_meta(
     frame: &[u8],
