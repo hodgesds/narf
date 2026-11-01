@@ -3095,7 +3095,8 @@ mod tests {
         // two stale reads, then reflection — never an instant pass, and
         // never a spin past reflection.
         let mut ctl = FakeQueueCtl::new(2);
-        ctl.write(queue_enable_word(ctl.read()));
+        let enabled = queue_enable_word(ctl.read());
+        ctl.write(enabled);
         let mut stale_polls = 0u32;
         while !queue_enable_reflected(ctl.read()) {
             stale_polls += 1;
@@ -3107,7 +3108,8 @@ mod tests {
             return TestResult::Fail("igb queue-enable reflection count drift");
         }
         // Disable conversation: clearing ENABLE reflects immediately.
-        ctl.write(queue_disable_word(ctl.read()));
+        let disabled = queue_disable_word(ctl.read());
+        ctl.write(disabled);
         if queue_enable_reflected(ctl.read()) {
             return TestResult::Fail("igb queue-disable did not clear ENABLE");
         }
