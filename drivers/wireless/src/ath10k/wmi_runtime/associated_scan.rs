@@ -190,7 +190,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     ) -> Result<Vec<u8>, Error> {
         let mut frequencies = Vec::new();
         frequencies
-            .try_reserve_exact(self.channels.len() + 4)
+            .try_reserve_exact(self.channels.len() + 8)
             .map_err(|_| Error::NoMemory)?;
         frequencies.extend_from_slice(&self.channels);
         // A deliberately small discovery inventory may omit the HT partner
@@ -199,11 +199,25 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if let Some(station) = station {
             let p = station.permission;
             let occupied = if p.width80 {
-                [p.center - 30, p.center - 10, p.center + 10, p.center + 30]
+                let second = p.center2.unwrap_or(p.center);
+                [
+                    p.center - 30,
+                    p.center - 10,
+                    p.center + 10,
+                    p.center + 30,
+                    second - 30,
+                    second - 10,
+                    second + 10,
+                    second + 30,
+                ]
             } else {
                 [
                     p.frequency,
                     p.secondary.unwrap_or(p.frequency),
+                    p.frequency,
+                    p.frequency,
+                    p.frequency,
+                    p.frequency,
                     p.frequency,
                     p.frequency,
                 ]

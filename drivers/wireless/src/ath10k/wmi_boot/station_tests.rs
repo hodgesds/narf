@@ -37,9 +37,20 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
             let vht = m.data.as_ref().unwrap().vht.as_ref().map(|v| v.width);
             // Linux update_channel_list: ALLOW_VHT for a VHT profile and the
             // full 80 MHz segment (ch36-48 / ch149-161) when it is occupied.
-            let rows: Vec<u16> = if vht == Some(2) {
+            let rows: Vec<u16> = if matches!(vht, Some(2 | 3)) {
                 let first = if m.frequency < 5500 { 5180 } else { 5745 };
-                (0..4).map(|i| first + i * 20).collect()
+                let mut rows: Vec<u16> = (0..4).map(|i| first + i * 20).collect();
+                if let Some(second) = m
+                    .data
+                    .as_ref()
+                    .unwrap()
+                    .vht
+                    .as_ref()
+                    .and_then(|v| v.center2)
+                {
+                    rows.extend_from_slice(&[second - 30, second - 10, second + 10, second + 30]);
+                }
+                rows
             } else {
                 vec![m.frequency, secondary]
             };
@@ -52,6 +63,13 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
             }
             for (i, f) in rows.into_iter().enumerate() {
                 let at = if tlv { 20 + i * 28 } else { 8 + i * 24 };
+                let limit = m
+                    .data
+                    .as_ref()
+                    .unwrap()
+                    .vht
+                    .as_ref()
+                    .map_or(if f < 3000 { 34 } else { 54 }, |v| v.half_dbm);
                 if tlv && word(at - 4) != (80 << 16 | 24)
                     || word(at) != u32::from(f)
                     || word(at + 4) != u32::from(f)
@@ -67,12 +85,7 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
                             } else {
                                 0
                             })
-                    || command[at + 16..at + 24]
-                        != if f < 3000 {
-                            [0, 34, 34, 0, 0, 34, 0, 0]
-                        } else {
-                            [0, 54, 54, 0, 0, 54, 0, 0]
-                        }
+                    || command[at + 16..at + 24] != [0, limit, limit, 0, 0, limit, 0, 0]
                 {
                     return Err(BmiError::BadResponse);
                 }
@@ -140,7 +153,16 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
             }
             1 => {
                 u32at(&mut expected, at, 4);
-                u32at(&mut expected, at + 4, 54);
+                u32at(
+                    &mut expected,
+                    at + 4,
+                    u32::from(
+                        m.data
+                            .as_ref()
+                            .and_then(|f| f.vht.as_ref())
+                            .map_or(54, |v| v.half_dbm),
+                    ),
+                );
             }
             2 => {
                 let chan = if dialect == Dialect::Tlv { 84 } else { 4 };
@@ -148,7 +170,11 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
                 u32at(&mut expected, chan + 4, u32::from(m.frequency));
                 u32at(&mut expected, chan + 12, 0);
                 for offset in [17, 18, 21] {
-                    expected[chan + offset] = 54;
+                    expected[chan + offset] = m
+                        .data
+                        .as_ref()
+                        .and_then(|f| f.vht.as_ref())
+                        .map_or(54, |v| v.half_dbm);
                 }
             }
             _ => {}
@@ -162,7 +188,9 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
         u32at(
             &mut expected,
             channel + 12,
-            if vht == Some(2) {
+            if vht == Some(3) {
+                0x180e
+            } else if vht == Some(2) {
                 0x180a // MODE_11AC_VHT80 | ALLOW_HT | ALLOW_VHT
             } else if m.data.as_ref().unwrap().ht_secondary.is_some() {
                 if m.frequency < 3000 {
@@ -177,7 +205,7 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
             } | if vht.is_some() { 0x1000 } else { 0 },
         );
         if let Some(s) = m.data.as_ref().unwrap().ht_secondary {
-            let center = if vht == Some(2) {
+            let center = if matches!(vht, Some(2 | 3)) {
                 if m.frequency < 5500 {
                     5210
                 } else {
@@ -187,6 +215,19 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
                 (m.frequency + s) / 2
             };
             u32at(&mut expected, channel + 4, u32::from(center));
+            u32at(
+                &mut expected,
+                channel + 8,
+                u32::from(
+                    m.data
+                        .as_ref()
+                        .unwrap()
+                        .vht
+                        .as_ref()
+                        .and_then(|v| v.center2)
+                        .unwrap_or(0),
+                ),
+            );
             if m.data.as_ref().unwrap().ht_inventory != 1 {
                 return Err(BmiError::BadResponse);
             }
@@ -313,6 +354,7 @@ fn smoke_ath10k_scan_policy_vdev_ack_peer_map_composed_all_dialects() -> TestRes
             bssid: [2, 8, 9, 10, 11, 12],
             frequency: 2412,
             center_frequency: 2412,
+            second_center_frequency: None,
             bandwidth_mhz: 20,
             peer_id: 1800,
             maximum_power_dbm: 17,

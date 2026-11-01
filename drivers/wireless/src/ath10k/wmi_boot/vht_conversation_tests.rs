@@ -86,6 +86,9 @@ pub(super) fn enable(h: &Harness, width: u8) -> Result<(), &'static str> {
         f.ht_peer_nss = 2;
         f.vht = Some(Box::new(VhtExpect {
             width,
+            center2: None,
+            wide_override: 0,
+            half_dbm: 54,
             request: REQUEST,
             // mac80211 masking: RX LDPC, exponent7 kept; SGI80 symmetric;
             // the AP's TX STBC needs our (absent) RX STBC promise.

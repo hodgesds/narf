@@ -375,12 +375,22 @@ callback-free source/admin/interface fence prepares native AP ownership;
 the family AP row remains open. Focused release checks pass; execution and
 the full release matrix remain deferred. Physical qualification is separate.
 
+**Source implementation recount 2026-11-01** (bounded ath10k80+80 written):
+the remaining ledger holds **86 `feature`** rows (86 driver, 0 shared),
+**31 `chip`** and **0 `unknown`**. Twenty-one source-complete implementations
+await validation in `research/implemented-pending-validation.tsv`. The bounded
+QCA9984/QCA9888 WMI10.4 owner now carries two actual occupied80MHz spans,
+source-wide NSS, center2 and native peer/copy receipts. Six new native cases
+are written and focused release checks pass. Validation of the preceding20
+implementations is underway in an isolated frozen checkout; source completion
+and software execution do not establish physical board qualification.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 4 | MLO; AP/P2P/WoW; admitted complete6GHz, EHT/320 and single-link MLD source is implemented pending validation; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 4 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA; hosted loadable packet ABI is implemented pending validation |
-| ath10k | 14 | VHT160/80+80, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload; streams/TX STBC and2.4GHz HT40/coexistence are implemented pending validation |
+| ath10k | 13 | Contiguous VHT160, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload; streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are implemented pending validation |
 | ath9k | 3 | Periodic calibration and idle/station sleep; admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants are implemented pending validation; other chips are separate rows |
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are implemented pending validation |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |

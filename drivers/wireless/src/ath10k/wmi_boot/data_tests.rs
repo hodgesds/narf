@@ -133,6 +133,9 @@ pub(super) struct Fixture {
 pub(super) struct VhtExpect {
     /// 0 = VHT20, 1 = VHT40, 2 = VHT80 (the AP-selected bandwidth).
     pub(super) width: u8,
+    pub(super) center2: Option<u16>,
+    pub(super) wide_override: u32,
+    pub(super) half_dbm: u8,
     pub(super) request: [u8; 12],
     pub(super) capabilities: u32,
     pub(super) rates: [u32; 4],
@@ -553,7 +556,14 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
                     | if f.ht_secondary.is_some() { 0x2000 } else { 0 }
                     | if ht { f.ht_peer_flags } else { 0 }
                     | f.vht.as_ref().map_or(0, |v| {
-                        0x0200_0000 | if v.width == 2 { 0x0400_0000 } else { 0 }
+                        0x0200_0000
+                            | if v.width == 3 {
+                                0x2000_0000
+                            } else if v.width == 2 {
+                                0x0400_0000
+                            } else {
+                                0
+                            }
                     }))
             || word(at + 24) != (if secured { 0x11 } else { 1 })
             || word(at + if dialect == Dialect::Tlv { 48 } else { 320 })
@@ -574,6 +584,9 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
         {
             return Err(BmiError::BadResponse);
         }
+        if dialect == Dialect::TenFour && word(at + 352) != vht.map_or(0, |v| v.wide_override) {
+            return Err(BmiError::BadResponse);
+        }
         let count = at + if dialect == Dialect::Tlv { 68 } else { 48 };
         let rates = count + if dialect == Dialect::Tlv { 12 } else { 4 };
         let phy = at + if dialect == Dialect::Tlv { 56 } else { 328 };
@@ -581,7 +594,11 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             || command[rates..rates + 3] != [12, 24, 48]
             || word(phy)
                 != if let Some(v) = f.vht.as_deref() {
-                    8 + u32::from(v.width)
+                    if v.width == 3 {
+                        14
+                    } else {
+                        8 + u32::from(v.width)
+                    }
                 } else if ht {
                     if f.ht_secondary.is_some() {
                         if m.frequency < 3000 {

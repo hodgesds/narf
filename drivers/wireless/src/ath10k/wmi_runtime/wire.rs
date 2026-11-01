@@ -174,17 +174,28 @@ impl Wire {
         } else {
             permission.frequency.min(secondary)
         };
-        let segment;
-        let rows: &[u16] = if permission.width80 {
-            segment = [low, low + 20, low + 40, low + 60];
-            &segment
+        let mut segment = Vec::new();
+        segment.try_reserve_exact(8).map_err(|_| Error::NoMemory)?;
+        if permission.width80 {
+            segment.extend_from_slice(&[low, low + 20, low + 40, low + 60]);
+            if let Some(center2) = permission.center2 {
+                segment.extend_from_slice(&[
+                    center2 - 30,
+                    center2 - 10,
+                    center2 + 10,
+                    center2 + 30,
+                ]);
+            }
         } else {
-            segment = [permission.frequency, secondary, 0, 0];
-            &segment[..2]
-        };
-        let mut out = self.channels(rows)?;
+            segment.extend_from_slice(&[permission.frequency, secondary]);
+        }
+        let mut out = self.channels(&segment)?;
         let tlv = self.dialect == Dialect::Tlv;
-        for (i, frequency) in rows.iter().copied().enumerate() {
+        for (i, frequency) in segment.iter().copied().enumerate() {
+            let pair_base = permission
+                .center2
+                .filter(|center| frequency.abs_diff(*center) <= 30)
+                .map_or(low, |center| center - 30);
             let at = if tlv { 20 + i * 28 } else { 8 + i * 24 };
             // Legacy11A inventory row, ALLOW_HT; only the lower channel of
             // each HT40 pair admits a positive secondary. No IBSS/DFS.
@@ -194,7 +205,7 @@ impl Wire {
                 u32::from(frequency < 3000)
                     | (1 << 11)
                     | if vht { 1 << 12 } else { 0 }
-                    | if (frequency - low) % 40 == 0 {
+                    | if (frequency - pair_base) % 40 == 0 {
                         1 << 6
                     } else {
                         0

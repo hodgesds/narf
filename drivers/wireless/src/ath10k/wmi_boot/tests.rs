@@ -134,6 +134,7 @@ struct Model {
     factory: u32,
     ht: Option<u32>,
     rf_chains: Option<u32>,
+    vht: Option<(u32, u32)>,
 }
 impl Model {
     fn new(dialect: Dialect) -> Self {
@@ -154,6 +155,7 @@ impl Model {
             factory: 0x64,
             ht: None,
             rf_chains: None,
+            vht: None,
         }
     }
 }
@@ -205,6 +207,23 @@ impl Hif for Model {
                         _ => 4 + 84,
                     };
                     u32at(&mut service, at, ht);
+                }
+                if let Some((caps, mcs)) = self.vht {
+                    let at = match self.dialect {
+                        Dialect::Main | Dialect::TenFour => 4 + 92,
+                        Dialect::Tlv => 4 + 4 + 44,
+                        _ => 4 + 88,
+                    };
+                    u32at(&mut service, at, caps);
+                    u32at(&mut service, at + 4, mcs);
+                    if self.dialect == Dialect::TenFour {
+                        // WMI_10_4_SERVICE_11AC=8: legacy four-bit service
+                        // words, bitmap starts at native body offset20.
+                        let bitmap = 4 + 20 + 8;
+                        let value =
+                            u32::from_le_bytes(service[bitmap..bitmap + 4].try_into().unwrap());
+                        u32at(&mut service, bitmap, value | 1);
+                    }
                 }
                 self.rx.push_back((2, header(2, &service)));
                 self.rx.push_back((1, header(0, &[3, 0, 0, 1, 0, 2, 0, 8])));

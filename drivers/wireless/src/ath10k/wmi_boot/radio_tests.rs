@@ -576,6 +576,40 @@ fn radio_boot_country_ht_rf(
     } else {
         HwRev::Qca988x
     };
+    radio_boot_source(
+        version,
+        dialect,
+        features,
+        major,
+        factory,
+        ht,
+        RadioSource {
+            hardware,
+            rf_chains,
+            vht: None,
+        },
+    )
+}
+#[derive(Clone, Copy)]
+struct RadioSource {
+    hardware: HwRev,
+    rf_chains: u32,
+    vht: Option<(u32, u32)>,
+}
+fn radio_boot_source(
+    version: u32,
+    dialect: Dialect,
+    features: u64,
+    major: u8,
+    factory: u32,
+    ht: Option<u32>,
+    source: RadioSource,
+) -> radio::Radio<RadioModel> {
+    let RadioSource {
+        hardware,
+        rf_chains,
+        vht,
+    } = source;
     let htt_version = if dialect == Dialect::Tlv {
         3
     } else if dialect == Dialect::TenFour {
@@ -585,9 +619,16 @@ fn radio_boot_country_ht_rf(
     };
     let c = htt::Config::new(hardware, version, htt_version, 0).unwrap();
     let mut inner = HttModel::new(dialect, c, hardware);
+    if dialect == Dialect::TenFour && hardware == HwRev::Qca9888 {
+        // Independent Linux resource words8/9: QCA9888 has two physical
+        // chains; the default frozen10.4 fixture is QCA9984's four.
+        u32at(&mut inner.inner.expected, 4 + 8 * 4, 3);
+        u32at(&mut inner.inner.expected, 4 + 9 * 4, 3);
+    }
     inner.inner.factory = factory;
     inner.inner.ht = ht;
     inner.inner.rf_chains = Some(rf_chains);
+    inner.inner.vht = vht;
     let raw = features & (1 << 10) != 0;
     inner.raw = raw;
     if raw {

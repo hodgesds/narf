@@ -522,6 +522,7 @@ pub struct PeerPrepared {
     pub bssid: [u8; 6],
     pub frequency: u16,
     pub center_frequency: u16,
+    pub second_center_frequency: Option<u16>,
     pub bandwidth_mhz: u8,
     /// Sparse firmware ID, not an index bounded by resource peer count.
     pub peer_id: u16,

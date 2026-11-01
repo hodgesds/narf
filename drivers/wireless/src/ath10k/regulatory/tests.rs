@@ -232,3 +232,57 @@ kernel_test_in!(
     "drivers/wireless/ath10k/coexistence",
     smoke_ath10k_2ghz_ht40_occupied_edges_and_stricter_overlap_power
 );
+
+fn smoke_ath10k_80p80_split_power_gap_and_second_span_current_receipt() -> TestResult {
+    let factory = us_factory();
+    let mut domain = us_domain(80);
+    domain
+        .rules
+        .iter_mut()
+        .filter(|r| r.freq_start_mhz > 5500)
+        .for_each(|r| r.max_power_dbm = 9);
+    let mut receipt =
+        Permission::from_factory_width(factory, &domain, 5180, Some(5200), true).unwrap();
+    let second = Permission::from_factory_width(factory, &domain, 5745, Some(5765), true).unwrap();
+    receipt.center2 = Some(5775);
+    receipt.half_dbm = receipt.half_dbm.min(second.half_dbm);
+    if receipt.half_dbm != 18 || receipt.check(&domain).is_err() {
+        return TestResult::Fail("second80 full-span minimum not carried by current receipt");
+    }
+    let mut gap = domain.clone();
+    gap.rules.push(narf_wireless::reg::RegRule {
+        freq_start_mhz: 5500,
+        freq_end_mhz: 5700,
+        max_bandwidth_mhz: 20,
+        max_power_dbm: 0,
+        flags: narf_wireless::reg::RegFlags::DFS | narf_wireless::reg::RegFlags::NO_IR,
+    });
+    if receipt.check(&gap).is_err() {
+        return TestResult::Fail("80+80 invented occupancy/DFS authority across the gap");
+    }
+    let mut denied = domain.clone();
+    denied.rules.push(narf_wireless::reg::RegRule {
+        freq_start_mhz: 5800,
+        freq_end_mhz: 5805,
+        max_bandwidth_mhz: 80,
+        max_power_dbm: 9,
+        flags: narf_wireless::reg::RegFlags::NO_IR,
+    });
+    if receipt.check(&denied).is_ok() {
+        return TestResult::Fail("second80 edge revocation erased by first80 permission");
+    }
+    for invalid in [Some(5210), Some(5530), Some(5770)] {
+        let mut foreign = receipt;
+        foreign.center2 = invalid;
+        if foreign.check(&domain).is_ok() {
+            return TestResult::Fail(
+                "foreign/overlapping/nonprofile segment became a current80+80 receipt",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/vht80p80",
+    smoke_ath10k_80p80_split_power_gap_and_second_span_current_receipt
+);

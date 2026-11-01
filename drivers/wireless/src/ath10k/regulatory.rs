@@ -33,6 +33,8 @@ pub(super) struct Permission {
     /// The occupied block is the 80 MHz segment containing the primary/
     /// secondary pair (VHT80, VDEV_START `band_center_freq1` = `center`).
     pub width80: bool,
+    /// A separately granted noncontiguous80 segment; never fills the gap.
+    pub center2: Option<u16>,
     pub half_dbm: u8,
 }
 impl Permission {
@@ -196,22 +198,54 @@ impl Permission {
             center,
             secondary,
             width80,
+            center2: None,
             half_dbm,
         })
     }
     /// Recheck the chosen immutable factory/frequency receipt against the
     /// current host policy without querying or inventing hardware facts.
     pub fn check(self, domain: &narf_wireless::reg::RegulatoryDomain) -> Result<(), Error> {
-        if Self::from_factory_width(
+        let mut current = Self::from_factory_width(
             self.factory,
             domain,
             self.frequency,
             self.secondary,
             self.width80,
-        )? != self
-        {
+        )?;
+        if let Some(second) = self.center2 {
+            if !self.width80 || !matches!(second, 5210 | 5775) || second == self.center {
+                return Err(Error::Unsupported);
+            }
+            let other = Self::from_factory_width(
+                self.factory,
+                domain,
+                second - 30,
+                Some(second - 10),
+                true,
+            )?;
+            current.half_dbm = current.half_dbm.min(other.half_dbm);
+            current.center2 = Some(second);
+        }
+        if current != self {
             return Err(Error::Unsupported);
         }
         Ok(())
+    }
+    pub fn discontiguous(
+        caps: &super::wmi_boot::Capabilities,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        primary: u16,
+        secondary: u16,
+        center2: u16,
+    ) -> Result<Self, Error> {
+        let mut first = Self::occupied_width(caps, domain, primary, Some(secondary), true)?;
+        if !matches!(center2, 5210 | 5775) || center2 == first.center {
+            return Err(Error::Unsupported);
+        }
+        let other = Self::occupied_width(caps, domain, center2 - 30, Some(center2 - 10), true)?;
+        first.center2 = Some(center2);
+        first.half_dbm = first.half_dbm.min(other.half_dbm);
+        first.check(domain)?;
+        Ok(first)
     }
 }

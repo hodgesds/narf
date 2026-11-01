@@ -30,6 +30,8 @@ mod sgi40_conversation_tests;
 mod source_conversation_tests;
 #[path = "vht_conversation_tests.rs"]
 mod vht_conversation_tests;
+#[path = "vht_wide_conversation_tests.rs"]
+mod vht_wide_conversation_tests;
 #[path = "wmm_conversation_tests.rs"]
 mod wmm_conversation_tests;
 fn five_ghz_policy() -> narf_wireless::reg::RegulatoryDomain {
@@ -138,7 +140,42 @@ impl Harness {
         factory: u32,
         profile: (Option<u32>, u32, bool),
     ) -> Self {
-        let mut radio = radio_boot_country_ht_rf(
+        let hardware = if dialect == Dialect::Tlv {
+            HwRev::Qca6174
+        } else if dialect == Dialect::TenFour {
+            HwRev::Qca9984
+        } else {
+            HwRev::Qca988x
+        };
+        Self::new_on_source(
+            version,
+            dialect,
+            secured,
+            active_scan,
+            frequency,
+            factory,
+            (
+                profile.0,
+                RadioSource {
+                    hardware,
+                    rf_chains: profile.1,
+                    vht: None,
+                },
+                profile.2,
+            ),
+        )
+    }
+    fn new_on_source(
+        version: u32,
+        dialect: Dialect,
+        secured: bool,
+        active_scan: bool,
+        frequency: u16,
+        factory: u32,
+        profile: (Option<u32>, RadioSource, bool),
+    ) -> Self {
+        let hardware = profile.1.hardware;
+        let mut radio = radio_boot_source(
             version,
             dialect,
             (1 << 10) | (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 },
@@ -183,13 +220,6 @@ impl Harness {
         );
         fixture.automatic = true;
         m.data = Some(fixture);
-        let hardware = if dialect == Dialect::Tlv {
-            HwRev::Qca6174
-        } else if dialect == Dialect::TenFour {
-            HwRev::Qca9984
-        } else {
-            HwRev::Qca988x
-        };
         m.ce = Some(crate::ath10k::boot::CeFixture::new(hardware));
         let name = String::from(
             NEXT_NAME

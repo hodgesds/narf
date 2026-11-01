@@ -116,6 +116,7 @@ fn smoke_ath10k_coexistence_native_peer_restart_and_response_types_six_dialects(
         center: 2432,
         secondary: None,
         width80: false,
+        center2: None,
         half_dbm: 34,
     };
     for (d, restart_id, peer_id) in [

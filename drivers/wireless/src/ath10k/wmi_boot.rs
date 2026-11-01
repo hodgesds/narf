@@ -559,6 +559,22 @@ pub(super) struct Runtime<T> {
     failed: bool,
 }
 impl<T: Hif + HostMemory> Runtime<T> {
+    /// Linux core.c's actual family wide-NSS ceiling. The native override
+    /// exists only in10.4 PEER_ASSOC; a PCI tuple or raw VHT bit alone is not
+    /// a completed READY/INIT owner or a different dialect's wire contract.
+    pub fn wide_vht_nss(&self) -> Option<u8> {
+        if self.failed || self.ready.is_none() || self.dialect != Dialect::TenFour {
+            return None;
+        }
+        if !self.caps.as_ref()?.service(self.dialect, 8) {
+            return None;
+        }
+        match self.hardware {
+            HwRev::Qca9984 => Some(2),
+            HwRev::Qca9888 => Some(1),
+            _ => None,
+        }
+    }
     pub fn raw_mode(&self) -> bool {
         self.ready.is_some() && self.features & (1 << 10) != 0
     }

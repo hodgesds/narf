@@ -10,6 +10,8 @@ use narf_wireless::association::{
     phy::{intersect_maps, ApElements, HtGi, HtWidth, LocalHt, LocalPhy, LocalVht, Offer, Width},
     Bss, JoinPlan, SecurityMode,
 };
+#[path = "vht_wide.rs"]
+mod wide;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Profile {
@@ -61,6 +63,7 @@ pub(super) struct Vht {
     pub(super) tx_mcs: u16,
     /// Occupied VHT80 (`WMI_PEER_80MHZ`, `MODE_11AC_VHT80`).
     pub(super) eighty: bool,
+    pub(super) wide: Option<wide::Wide>,
     receive_sgi80: bool,
     receive_ldpc: bool,
     receive_stbc: bool,
@@ -116,6 +119,23 @@ pub(super) fn vht_capability(caps: &Capabilities, chains: Chains) -> Option<[u8;
         return None;
     }
     local_vht(caps, chains).ok().map(|v| v.capability_body())
+}
+pub(super) fn vht_wide_capability(
+    caps: &Capabilities,
+    chains: Chains,
+    maximum: u8,
+) -> Option<[u8; 12]> {
+    if caps.vht & 12 != 8 || maximum == 0 {
+        return None;
+    }
+    let mut body = vht_capability(caps, chains)?;
+    body[0] |= 8 | if caps.vht & 64 != 0 { 64 } else { 0 };
+    // Linux core.c/mac.c publishes a max-rate hint for the chip's lower
+    // wide NSS while preserving the ordinary <=80MHz MCS maps.
+    let highest = u16::from(maximum.min(chains.count())) * 780;
+    body[6..8].copy_from_slice(&highest.to_le_bytes());
+    body[10..12].copy_from_slice(&highest.to_le_bytes());
+    Some(body)
 }
 fn local_ht(
     caps: &Capabilities,
@@ -188,17 +208,25 @@ impl Profile {
         phy: Phy,
         chains: Chains,
     ) -> Result<Option<Self>, Error> {
+        if phy == Phy::Vht && (!vht_supported(caps) || cached.frequency < 3000) {
+            return Ok(None);
+        }
+        Self::offer_local(caps, cached, own, local(caps, phy, chains)?, chains)
+    }
+    fn offer_local(
+        caps: &Capabilities,
+        cached: &ScanBss,
+        own: [u8; 6],
+        local: LocalPhy,
+        chains: Chains,
+    ) -> Result<Option<Self>, Error> {
         let bss = bss(cached)?;
         ApElements::parse(&bss.information_elements).map_err(plan_error)?;
         let wmm = narf_wireless::wmm::Parameters::parse(&bss.information_elements)
             .map_err(|_| Error::Malformed)?;
-        if !supported(caps)
-            || wmm.is_none_or(|p| p.ac[0].admission_control)
-            || phy == Phy::Vht && (!vht_supported(caps) || cached.frequency < 3000)
-        {
+        if !supported(caps) || wmm.is_none_or(|p| p.ac[0].admission_control) {
             return Ok(None);
         }
-        let local = local(caps, phy, chains)?;
         let mode = if bss.capability & 16 != 0 {
             SecurityMode::Wpa2Psk
         } else {
@@ -222,7 +250,7 @@ impl Profile {
                 .and_then(|c| association::channel::frequency(*c))
                 .map(|f| f as u16),
             // VHT80: the HT40 pair inside the segment (HT Operation).
-            Width::Eighty => offered
+            Width::Eighty | Width::OneSixty => offered
                 .ht()
                 .operation()
                 .secondary()
@@ -232,7 +260,11 @@ impl Profile {
         };
         let eighty =
             offered.width() == Width::Eighty && offered.vht().is_some() && secondary.is_some();
-        if !(matches!(offered.width(), Width::Twenty | Width::Forty) || eighty) {
+        let wide = offered.width() == Width::OneSixty
+            && offered.discontiguous()
+            && offered.vht().is_some()
+            && secondary.is_some();
+        if !(matches!(offered.width(), Width::Twenty | Width::Forty) || eighty || wide) {
             return Err(Error::Unsupported);
         }
         Ok(Some(Self {
@@ -250,7 +282,16 @@ impl Profile {
             peer_tx_stbc: peer_tx_stbc(h),
             center,
             secondary,
-            vht: offered.vht().map(|v| vht(v, offered.width(), chains)),
+            vht: offered.vht().map(|v| {
+                vht(
+                    v,
+                    offered.width(),
+                    chains,
+                    offered
+                        .secondary_center_channel()
+                        .map(|c| 5000 + 5 * u16::from(c)),
+                )
+            }),
             local,
             offered,
             coexistence_narrowed: false,
@@ -269,6 +310,7 @@ impl Profile {
         if n.width() != self.offered.width()
             || n.center_channel() != self.offered.center_channel()
             || n.occupied_channels() != self.offered.occupied_channels()
+            || n.secondary_center_channel() != self.offered.secondary_center_channel()
             || self.secondary.is_some()
                 && n.ht().operation().protection() != self.offered.ht().operation().protection()
         {
@@ -290,7 +332,15 @@ impl Profile {
         if n.vht().is_some() != self.vht.is_some() {
             return Err(Error::Unsupported);
         }
-        self.vht = n.vht().map(|v| vht(v, n.width(), self.chains));
+        self.vht = n.vht().map(|v| {
+            vht(
+                v,
+                n.width(),
+                self.chains,
+                n.secondary_center_channel()
+                    .map(|c| 5000 + 5 * u16::from(c)),
+            )
+        });
         Ok(self)
     }
     /// Linux `ath10k_peer_assoc_h_ht` peer flags beyond HT/BW40: LDPC
@@ -305,9 +355,16 @@ impl Profile {
             } else {
                 0
             }
-            | self
-                .vht
-                .map_or(0, |v| 0x0200_0000 | if v.eighty { 0x0400_0000 } else { 0 })
+            | self.vht.map_or(0, |v| {
+                0x0200_0000
+                    | if v.wide.is_some() {
+                        0x2000_0000
+                    } else if v.eighty {
+                        0x0400_0000
+                    } else {
+                        0
+                    }
+            })
     }
     /// `peer_max_mpdu`: the HT factor, raised by a larger VHT exponent as
     /// Linux `ath10k_peer_assoc_h_vht` does (`max(ht, 2^(13+exp)-1)`).
@@ -345,6 +402,7 @@ impl Profile {
     /// VHT peer is `MODE_11AC_VHT20/40/80` (8/9/10) by its bandwidth.
     pub(super) fn mode(self, frequency: u16) -> u32 {
         match self.vht {
+            Some(v) if v.wide.is_some() => 14,
             Some(v) if v.eighty => 10,
             Some(_) if self.secondary.is_some() => 9,
             Some(_) => 8,
@@ -356,7 +414,9 @@ impl Profile {
     /// 5GHz20/40 uses MODE_11NA_HT20/HT40 (4/6) even for a VHT peer;
     /// only80 MHz selects MODE_11AC_VHT80 (10).
     pub(super) fn start_mode(self, frequency: u16) -> u32 {
-        if self.vht.is_some_and(|v| v.eighty) {
+        if self.vht.is_some_and(|v| v.wide.is_some()) {
+            14
+        } else if self.vht.is_some_and(|v| v.eighty) {
             10
         } else if self.secondary.is_some() {
             if frequency < 3000 {
@@ -470,7 +530,10 @@ impl Profile {
                     && match a1 & 3 {
                         0 => !sgi || self.receive_sgi20,
                         1 => self.secondary.is_some() && (!sgi || self.receive_sgi40),
-                        2 => v.eighty && (!sgi || v.receive_sgi80),
+                        2 => (v.eighty || v.wide.is_some()) && (!sgi || v.receive_sgi80),
+                        3 => v.wide.is_some_and(|wide| {
+                            nss <= u32::from(wide.rx_nss) && (!sgi || wide.rx_sgi)
+                        }),
                         _ => false,
                     }
             }),
@@ -485,12 +548,22 @@ impl Profile {
 /// length is the minimum (ours is 3895, field 0); SGI80 is symmetric; the
 /// peer's RX STBC needs our selected TX STBC and its TX STBC our RX STBC
 /// promise; beamforming roles need ours (none) and 160/80+80 our width.
-fn vht(v: &association::phy::VhtNegotiation, width: Width, chains: Chains) -> Vht {
+fn vht(
+    v: &association::phy::VhtNegotiation,
+    width: Width,
+    chains: Chains,
+    center2: Option<u16>,
+) -> Vht {
     let peer = v.peer_capability();
     let body = v.peer_capability_body();
     let kept = 0x10 | 0x0020_0000 | 0x0040_0000 | 0x0380_0000 | 0x0c00_0000 | 0x3000_0000;
     Vht {
         capabilities: (peer & kept)
+            | if center2.is_some() {
+                (2 << 2) | if v.tx_sgi160() { 64 } else { 0 }
+            } else {
+                0
+            }
             | if v.tx_sgi80() { 0x20 } else { 0 }
             | if v.rx_stbc() && peer & 0x80 != 0 {
                 0x80
@@ -508,6 +581,20 @@ fn vht(v: &association::phy::VhtNegotiation, width: Width, chains: Chains) -> Vh
         tx_max: u16::from_le_bytes([body[10], body[11]]) & 0x1fff,
         tx_mcs: intersect_maps(v.peer_tx_mcs_map(), v.rx_mcs_map()),
         eighty: width == Width::Eighty,
+        wide: center2.map(|center2| wide::Wide {
+            center2,
+            nss: ((0..4u8)
+                .rev()
+                .find(|n| v.tx_mcs_map() >> (n * 2) & 3 != 3)
+                .map_or(1, |n| n + 1))
+            .min(wide::maxrate_nss(u16::from_le_bytes([body[6], body[7]]) & 0x1fff).unwrap_or(1)),
+            rx_nss: ((0..4u8)
+                .rev()
+                .find(|n| intersect_maps(v.peer_tx_mcs_map(), v.rx_mcs_map()) >> (n * 2) & 3 != 3)
+                .map_or(1, |n| n + 1))
+            .min(wide::maxrate_nss(u16::from_le_bytes([body[10], body[11]]) & 0x1fff).unwrap_or(8)),
+            rx_sgi: v.rx_sgi160(),
+        }),
         receive_sgi80: v.rx_sgi80(),
         receive_ldpc: v.rx_ldpc(),
         receive_stbc: v.rx_stbc(),

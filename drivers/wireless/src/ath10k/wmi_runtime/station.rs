@@ -98,8 +98,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
     pub(in crate::ath10k) fn vht_capabilities(&self) -> Option<[u8; 12]> {
         self.htt.wmi.caps.as_ref().and_then(|caps| {
-            self.chains
-                .and_then(|chains| ht::vht_capability(caps, chains))
+            self.chains.and_then(|chains| {
+                self.htt
+                    .wmi
+                    .wide_vht_nss()
+                    .and_then(|maximum| ht::vht_wide_capability(caps, chains, maximum))
+                    .or_else(|| ht::vht_capability(caps, chains))
+            })
         })
     }
     pub(super) async fn send_station_command(
@@ -144,6 +149,22 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .find(|b| b.bssid == bssid && b.frequency == frequency)
             .ok_or(Error::Unsupported)?;
         let pair = ht40_pair(frequency);
+        if let Some(maximum) = self.htt.wmi.wide_vht_nss() {
+            if let Ok(Some(profile)) = ht::Profile::offer_80p80(caps, cached, own, chains, maximum)
+            {
+                if let (Some(partner), Some(wide)) =
+                    (profile.secondary, profile.vht.and_then(|v| v.wide))
+                {
+                    if let Ok(permission) =
+                        Permission::discontiguous(caps, domain, frequency, partner, wide.center2)
+                    {
+                        if permission.center == profile.center {
+                            return Ok((permission, Some(profile)));
+                        }
+                    }
+                }
+            }
+        }
         // VHT advertises HT20/40 plus an 80 MHz-capable VHT element, so it is
         // offered only when the whole 80 MHz segment is host-permitted. The
         // occupied receipt then matches the AP's selected 20/40/80 geometry;
@@ -420,6 +441,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             bssid: peer.bssid,
             frequency: peer.permission.frequency,
             center_frequency: peer.permission.center,
+            second_center_frequency: peer.permission.center2,
             bandwidth_mhz: bandwidth(peer.permission),
             peer_id: peer.mapped()?,
             maximum_power_dbm: peer.permission.half_dbm / 2,
@@ -561,6 +583,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                             bssid,
                             frequency,
                             center_frequency: permission.center,
+                            second_center_frequency: permission.center2,
                             bandwidth_mhz: bandwidth(permission),
                             peer_id: id,
                             maximum_power_dbm: permission.half_dbm / 2,
@@ -831,7 +854,9 @@ fn ht40_pair(frequency: u16) -> Option<u16> {
     })
 }
 fn bandwidth(permission: Permission) -> u8 {
-    if permission.width80 {
+    if permission.center2.is_some() {
+        160
+    } else if permission.width80 {
         80
     } else if permission.secondary.is_some() {
         40

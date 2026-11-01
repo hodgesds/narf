@@ -20,6 +20,11 @@
 > with seven new cases written; its release compilation and native execution
 > are pending. Physical RF/power acceptance is still separate.
 
+> A subsequent 80+80 extension is source complete for the qualified QCA9984/
+> QCA9888 10.4 station owner. Six new cases are written and unexecuted;
+> release compilation, native suites and physical acceptance are pending.
+> Contiguous160 remains open because this profile has no authorized full span.
+
 ## 1. Purpose & scope
 
 PCIe Qualcomm/Atheros QCA988X, QCA9887, QCA6174/6164, QCA9377, QCA99X0,
@@ -476,7 +481,7 @@ Host-bus/system power transitions remain separate profiles.
   `mac.c::ath10k_create_vht_cap` does: MCS0-9 only for selected native streams
   in both maps, SGI80 (0x20), RX LDPC (0x10), RX STBC (0x300) and the A-MPDU
   exponent; TX STBC needs its source bit and multiple selected TX chains; beamforming roles
-  need a sounding owner and are not advertised, and 160/80+80 are not offered.
+  need a sounding owner and are not advertised, and wider operation needs the separate 80+80 owner below; contiguous160 is not offered.
   `Device::phy_capabilities(5000)` and `hw_caps.vht_supported` report it.
   Because the element promises 80 MHz support, VHT is offered only on a
   qualified 5-GHz primary whose whole 80 MHz segment
@@ -509,10 +514,59 @@ Host-bus/system power transitions remain separate profiles.
   and the 80 MHz geometry, and a later beacon changing the bound VHT
   Capabilities/Operation closes the link like an HT change. RX admits
   `HTT_RX_VHT` (0x0c) PPDUs only when VHT is bound, decoding VHT-SIG-A1/A2 as
-  `htt_rx.c::ath10k_htt_rx_h_rates`: an SU group id (0/63), one space-time
-  stream (two only with STBC and our RX STBC), LDPC only with our RX LDPC,
+  `htt_rx.c::ath10k_htt_rx_h_rates`: an SU group id (0/63), only the selected spatial
+  streams (with the separately bounded STBC direction), LDPC only with our RX LDPC,
   MCS within our map, and a bandwidth/SGI the profile promised. TXBF (0x0d)
   and MU PPDUs are refused before CCMP/PN.
+- 80+80 (`wmi_runtime/vht_wide.rs`, the shared strict VHT plan, native
+  station/channel/peer records) is a separate conditional station profile.
+  The retained BMI-qualified QCA9984/QCA9888 owner must complete actual
+  READY/INIT with10.4, advertise SERVICE_11AC=8 and VHT Supported Channel
+  Width Set2, and have initialized/submitted physical chain limits. Linux
+  `core.c` limits QCA9984 to two wide streams (1560 LGI highest-rate hint)
+  and QCA9888 to one (780); other hardware/dialects remain at primary80.
+  Hardware capability queries keep the ordinary MCS maps with that actual
+  per-chip highest-rate hint. The opt-in association request conservatively
+  limits its VHT maps to the wide stream count at every width; ordinary80
+  fallback keeps its existing selected-chain maps. This is not an assertion
+  of a per-width local MCS API that does not exist.
+  Both real non-DFS80 blocks must be admitted independently: center5210
+  (primaries36–48) and center5775 (149–161), in either primary order.
+  `Permission::discontiguous` retains center2 and checks every constituent
+  against actual SERVICE_READY ranges, immutable fixed-country factory
+  identity, authenticated host rules and the existing firmware/BDF/OTP
+  calibration owner. The programmed ceiling is the minimum of both complete
+  80MHz spans. The spectral gap is not occupied or granted; a restrictive
+  gap rule cannot invent a contiguous160 or DFS/CAC owner. The compound
+  permission, including center2 and both spans, is checked on every wait
+  and copied RX/stack boundary.
+  Native START uses MODE_11AC_VHT80_80=14, center1 for the primary segment
+  and real center2; the inventory contains all eight original20MHz rows
+  with their own HT40_PLUS pair direction. `PeerPrepared` exposes both
+  centers and total occupied bandwidth160 to distinguish this geometry.
+  10.4 PEER_ASSOC carries BW160=0x20000000 and the actual
+  `peer_bw_rxnss_override` word: bit31 plus separately encoded160/80+80 NSS.
+  The AP's actual RX map and RX highest-rate hint additionally bound wide
+  TX NSS as Linux `get_160mhz_nss_from_maxrate` does; unknown RX hints
+  conservatively select one. Known AP TX hints bound received wide NSS
+  independently; an unknown TX hint leaves the advertised receive-map
+  bound intact. Native SU CBW3 PPDUs need the real two-segment owner and
+  those directional NSS bounds before replay/PN. Narrower PPDUs keep their
+  own GI/map bounds. Wide SGI uses actual SERVICE_READY bit0x40, separately
+  from SGI80 bit0x20, and the original request/response directions.
+  Deprecated width3 and revised width1 VHT Operation encodings share the
+  same strict geometry plan. An association response cannot replace a
+  center or occupied segment after native START; it fails before
+  PEER_ASSOC/M2/DATA. Denied second span, absent chip/dialect/service/width
+  facts select an actual primary80 request, native start and peer profile.
+  There is no live retune or late width alias. Native source admission and
+  existing terminal/cancellation/key ownership remain mandatory.
+  Six new cases cover the two actual chip/NSS profiles, both segment orders
+  and operation encodings, Open/WPA2 kernel DHCP/IP, unequal span power,
+  real primary80 fallback, original encrypted same-PN PHY rejection,
+  directional highest-rate hints, second-span final-copy revocation and
+  response center2 replacement. They have not run; release compilation and
+  physical RF/interoperability acceptance are pending.
 - WPA2-PMF and WPA3-SAE (`wmi_runtime/station_pmf.rs`, `data.rs`,
   `management.rs`; smokes under `drivers/wireless/ath10k/pmf` and
   `drivers/wireless/ath10k/wpa3`). Linux v7.2 sets `MFP_CAPABLE`
@@ -587,7 +641,8 @@ Host-bus/system power transitions remain separate profiles.
   It programs immutable factory pair/CTL and additional half-dBm power limits,
   waits for a successful correlated VDEV_START_RESPONSE, creates the BSS
   peer and waits for native HTT peer-map confirmation. `PeerPrepared` reports
-  the bound BSSID/primary frequency, center_frequency, bandwidth_mhz (20/40),
+  the bound BSSID/primary frequency, center_frequency, optional second_center_frequency,
+  and bandwidth_mhz (20/40/80, or160 total for80+80),
   sparse firmware peer ID and host power ceiling;
   `Ath10kDevice::station_prepared`/`station_error` retain this diagnostic
   result. These APIs transmit no MLME/data frame and do not imply association,
@@ -1406,7 +1461,7 @@ not inferred from this PCI table. `profile::PROFILES`, `hw::HwRev::from_pci_id`,
 | QCA6174,168c:003e |05020000 / QCA6174/hw3.0 | R; H conditional; actual revision/OTP/image selection retained. |
 | QCA6174,168c:003e |05030000 / QCA6174/hw3.0 | R; H conditional; existing chip-specific PLL sequence precedes native mission startup. |
 | QCA99X0,168c:0040 |01000000 / QCA99X0/hw2.0 | R; H conditional; 12-pipe hardware/firmware host-memory profile remains exact, chain/NSS extension is source complete, software execution and physical acceptance pending. |
-| QCA9984,168c:0046 |01000000 / QCA9984/hw1.0 | R; H conditional; 2048-byte extended board data and selected OTP remain required. Wider VHT remains open; the chain/NSS extension awaits software execution and board qualification. |
+| QCA9984,168c:0046 |01000000 / QCA9984/hw1.0 | R; H conditional; 2048-byte extended board data and selected OTP remain required. Contiguous160 remains open; the bounded10.4 80+80 and chain/NSS extensions await software execution and board qualification. |
 | QCA9888,168c:0056 |01000000 / QCA9888/hw2.0 | R; H conditional; distinct board/OTP identity is required despite shared CE family. |
 | QCA9377,168c:0042 |05020000 / QCA9377/hw1.0 | R; H conditional; actual RAW/non-PFC image and CE1 routing required. |
 | QCA9377,168c:0042 |05020001 / QCA9377/hw1.0 | R; H conditional; existing revision-specific PLL path and exact board data retained. |
@@ -1428,7 +1483,7 @@ as described in §3; seven new cases and its release/native validation are
 pending. This makes no additional per-chip physical RF or power claim.
 
 Across the reached rows, concrete remaining software packages are
-VHT160/80+80 (VHT20/40/80 is implemented); PFC fetch/queue ownership;
+contiguous VHT160 (VHT20/40/80 and the bounded80+80 owner are implemented); PFC fetch/queue ownership;
 AP-side U-APSD under the AP owner; DFS/indoor/beacon-hint
 qualification; remain-on-channel/action-frame control; hardware key offload;
 AP/P2P roles; host-bus PM and wake offload (system suspend is implemented);
@@ -1448,8 +1503,12 @@ image; `vht160` (MODE_11AC_VHT160, `WMI_PEER_160MHZ`) and `vht80p80`
 160/80+80 and the `peer_bw_rxnss_override` NSS map bounded by the per-chip
 `vht160_mcs_{rx,tx}_highest` in `core.c::ath10k_hw_params_list`, nonzero only
 for QCA9984 (1560) and QCA9888 (780). Other reached tuples cannot claim 160 or
-80+80 from a PCI ID. 80+80 additionally needs a second, discontiguous 80-MHz
-occupied-power receipt and center2 in VDEV_START.
+80+80 from a PCI ID. The new80+80 owner implements the second independent
+occupied-power receipt and actual center2 as described in§3. Contiguous160
+remains open: the lower36–64 span crosses unimplemented DFS/CAC channels,
+while the upper149–177 span extends beyond the current admitted inventory
+and has no established per-board/factory/host authority here. A width bit or
+a hypothetical power rule does not fill either blocker.
 
 Physical acceptance still must validate exact PCI/BMI identity, trusted firmware
 and board calibration, ROM/OTP/PLL/code-swap, native CE/HTC/WMI/HTT progress,

@@ -168,6 +168,13 @@ pub(super) fn peer_phy(
         ) {
             wire::put(&mut out, at + 348, 0xff); // native10.2 max MCS/NSS fields.
         }
+        if let Some(wide) = vht.and_then(|v| v.wide) {
+            if dialect != Dialect::TenFour || !(1..=2).contains(&wide.nss) {
+                return Err(Error::Unsupported);
+            }
+            let nss = u32::from(wide.nss - 1);
+            wire::put(&mut out, at + 352, 0x8000_0000 | nss | (nss << 3));
+        }
     }
     Ok(out)
 }
