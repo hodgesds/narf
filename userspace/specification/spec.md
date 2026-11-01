@@ -575,6 +575,10 @@ description accepts only Linux's path-safe command whitelist; other commands
 return `EBADF`. `F_GETFL` reads status from the shared open-file description.
 Ordinary single-fd resolution uses a lazily initialized RCU directory of
 direct-indexed descriptor slots, including for tables shared by `CLONE_FILES`.
+Each task has a separate, cache-line-isolated ownership binding to its table;
+lookups retain that binding without updating the shared table's reference count.
+`CLONE_FILES` shares the table, while unshare and socket-alias checks compare
+table ownership rather than binding identity.
 Writers retain the per-table lock and publish slot replacement before releasing
 the previous file/description. A reader upgrades weak file and description
 references, revalidates both the directory and slot identity, and leaves its
