@@ -551,6 +551,10 @@ the resolved filesystem path after applying the task root, so a mutation made
 through a chroot reaches a watch established through that same chroot.
 Connected
 stream receive operations honor `MSG_PEEK` without consuming queued bytes.
+Connected AF_UNIX ancillary sends use the same recorded-reader targeting and
+readiness-generation guard as ordinary data sends, with broadcast fallback
+when the reader is unknown. Durable per-ring observers retain their readiness
+notifications independently of that legacy wake target.
 Connected AF_UNIX `SOCK_SEQPACKET` and datagram socketpairs retain one record
 per send; receive consumes at most one record and reports truncation through
 the existing `MSG_TRUNC` result path. Per-record `SCM_RIGHTS` and

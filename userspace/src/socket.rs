@@ -9711,7 +9711,7 @@ impl SocketFile {
         let sndbuf = self.options.lock().sndbuf as usize;
         let state = self.state.lock();
         let tx = match &*state {
-            SocketState::UnixConnected { tx, .. } => tx,
+            SocketState::UnixConnected { tx, .. } => tx.clone(),
             _ => return Err(SockError::NotConnected),
         };
         if tx.is_closed() {
@@ -9739,14 +9739,12 @@ impl SocketFile {
         if n == 0 && !buf.is_empty() {
             return Err(SockError::WouldBlock);
         }
-        // Wake a peer parked in poll/epoll/recv on the other end — same as
-        // `do_send`. An fd-passing `sendmsg` (SCM_RIGHTS) is how libseat hands a
-        // compositor its DRM/input fds; without this, a client blocked in
-        // `poll(-1)` on the libseat socket never learns the reply arrived and
-        // stalls device setup until a coarse fallback tick. `notify` (not a bare
-        // `wake_io_waiters`) also bumps the readiness generation so an
-        // infinite-timeout waiter breaks its re-park via the lost-wake guard.
-        narf_net::readiness::notify(0);
+        // Use the same directed legacy wake as plain sends. The ring already
+        // notified its durable observers; broadcasting here also wakes unrelated
+        // listeners and scans every I/O-waiter shard for each ancillary message.
+        // Keep the ring alive after dropping `state`; wake_reader advances the
+        // generation and retains broadcast when the reader is unknown.
+        tx.wake_reader();
         Ok(n)
     }
 
@@ -11624,6 +11622,93 @@ fn counting_waker(counter: &alloc::sync::Arc<core::sync::atomic::AtomicU32>) -> 
     // SAFETY: `raw` + VTABLE form a valid RawWaker per the fns above.
     unsafe { Waker::from_raw(RawWaker::new(raw, &VTABLE)) }
 }
+
+/// Ancillary sends use the same targeted legacy wake as plain sends. Durable
+/// observers still wake even when they are not the ring's remembered reader;
+/// an unknown reader retains broadcast, and a reader registering late consumes
+/// the targeted wake latch rather than losing the notification.
+fn smoke_unix_sendmsg_targets_reader_and_preserves_fallback() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    const READER: u64 = 0x5c6d_0001;
+    const BYSTANDER: u64 = 0x5c6d_0002;
+    const OBSERVER: u64 = 0x5c6d_0003;
+    crate::handlers::io_waker_init();
+    narf_net::readiness::set_hook(crate::handlers::wake_io_waiters);
+    let reader = Arc::new(AtomicU32::new(0));
+    let bystander = Arc::new(AtomicU32::new(0));
+    let observer = Arc::new(AtomicU32::new(0));
+    let tx = Arc::new(RingBuf::new());
+    let sender = SocketFile::new(AF_UNIX, SOCK_STREAM);
+    *sender.state.lock() = SocketState::UnixConnected {
+        tx: tx.clone(),
+        rx: Arc::new(RingBuf::new()),
+        local_addr: None,
+    };
+    let passed: Arc<dyn FileOps> = SocketFile::new(AF_UNIX, SOCK_STREAM);
+    let result = (|| {
+        tx.set_owner(READER);
+        crate::handlers::register_io_waiter(READER, counting_waker(&reader));
+        crate::handlers::register_io_waiter(BYSTANDER, counting_waker(&bystander));
+        let _ = tx.readiness().arm_persistent(
+            OBSERVER,
+            narf_filesystem::POLL_IN,
+            &counting_waker(&observer),
+        );
+        let generation = narf_net::readiness::generation();
+        let rights = alloc::vec![ScmRightsFile {
+            ops: passed.clone(),
+            status_flags: 0,
+            description: None,
+        }];
+        if !matches!(sender.unix_sendmsg(b"x", rights, None), Ok(1)) {
+            return Err("ancillary send failed");
+        }
+        if reader.load(Ordering::Relaxed) != 1 || bystander.load(Ordering::Relaxed) != 0 {
+            return Err("ancillary send woke an unrelated legacy I/O waiter");
+        }
+        if observer.load(Ordering::Relaxed) == 0 || narf_net::readiness::generation() == generation
+        {
+            return Err("targeting lost durable readiness or the generation guard");
+        }
+        let mut byte = [0];
+        if tx.read(&mut byte, false) != 1 || byte != *b"x" {
+            return Err("targeted send lost its payload");
+        }
+        let received = tx.take_fds().ok_or("targeted send lost its rights")?;
+        if received.len() != 1 || !Arc::ptr_eq(&received[0].ops, &passed) {
+            return Err("targeted send changed the ancillary file");
+        }
+
+        // The reader is not registered now: the directed wake must latch.
+        if !matches!(sender.unix_sendmsg(b"y", Vec::new(), None), Ok(1))
+            || !crate::handlers::register_io_waiter(READER, counting_waker(&reader))
+            || bystander.load(Ordering::Relaxed) != 0
+        {
+            return Err("ancillary send lost a late reader or broadcast its wake");
+        }
+        crate::handlers::register_io_waiter(READER, counting_waker(&reader));
+        tx.set_owner(0);
+        if !matches!(sender.unix_sendmsg(b"z", Vec::new(), None), Ok(1))
+            || reader.load(Ordering::Relaxed) != 2
+            || bystander.load(Ordering::Relaxed) != 1
+        {
+            return Err("unknown ancillary reader did not retain broadcast fallback");
+        }
+        Ok(())
+    })();
+    crate::handlers::drop_io_waiter(READER);
+    crate::handlers::drop_io_waiter(BYSTANDER);
+    tx.readiness().disarm(OBSERVER);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_unix_sendmsg_targets_reader_and_preserves_fallback
+);
 
 /// A listener's durable readiness level must fall when the final queued
 /// connection is accepted. A stale POLL_IN makes the next blocking `accept()`
