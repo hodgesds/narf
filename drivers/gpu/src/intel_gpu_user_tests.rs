@@ -886,6 +886,225 @@ kernel_test_in!(
     smoke_userspace_primary_render_nodes_and_context_namespaces
 );
 
+/// Linux's job timeout (xe_guc_submit.c, 5 s) measured from GuC's enable ACK.
+const HANG_TIMEOUT: u64 = 5_000_000_000;
+
+fn ready(gt: &mut GuCGt<Window, Arena>, now: u64) {
+    assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+}
+
+/// A user job that overruns its deadline is disabled alone: GuC preempts it
+/// or, with CONTEXT_RESET_NOTIFICATION, resets the engine under it. Its fence
+/// fails with Hang and only its context is banned and counted guilty; an
+/// innocent job completes and later work runs at the same epoch.
+fn smoke_userspace_hung_job_is_retired_alone() -> TestResult {
+    use narf_filesystem::DrmFence;
+    for (platform, ack) in [
+        (GtPlatform::Battlemage, 0xdfc),
+        (
+            GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
+            0xdfc,
+        ),
+    ] {
+        for reset in [false, true] {
+            let (w, arena, mut gt) = hardware_model(platform, ack);
+            prime(&mut gt, &w, ack);
+            let epoch = gt.user_epoch();
+            let baseline = arena.live_allocations();
+            let guilty = UserContext::new();
+            let (batch, hung_result) = PpgttProbeResult::prepare(platform).unwrap();
+            let (id, hung) = gt
+                .submit_user_batch(100, guilty.clone(), UserBatch(batch))
+                .unwrap();
+            let mut registered = BTreeMap::new();
+            // GuC enables it, but the batch never completes.
+            for now in 101..130 {
+                ready(&mut gt, now);
+                service_contexts(&w, &mut registered, false);
+            }
+            assert!(hung.is_submit_ready() && hung.result().is_none());
+            // An innocent context's job runs and retires meanwhile.
+            let innocent = UserContext::new();
+            let (batch, result) = PpgttProbeResult::prepare(platform).unwrap();
+            let (_, done) = gt
+                .submit_user_batch(200, innocent.clone(), UserBatch(batch))
+                .unwrap();
+            for now in 201..260 {
+                ready(&mut gt, now);
+                service_contexts(&w, &mut registered, true);
+                if done.result().is_some() {
+                    break;
+                }
+            }
+            assert_eq!(done.result(), Some(Ok(())));
+            assert_eq!(result.verify(), Ok(()));
+            // The deadline counts from the enable ACK (after 100).
+            ready(&mut gt, HANG_TIMEOUT + 100);
+            assert!(!service_contexts(&w, &mut registered, false).contains(&0x1001));
+            ready(&mut gt, HANG_TIMEOUT + 130);
+            if reset {
+                event(&ct_memory(&w), 0x1008, &[u32::from(id)]);
+            }
+            assert!(service_contexts(&w, &mut registered, false).contains(&0x1001));
+            for now in HANG_TIMEOUT + 131..HANG_TIMEOUT + 200 {
+                ready(&mut gt, now);
+                service_contexts(&w, &mut registered, false);
+                if hung.result().is_some() {
+                    break;
+                }
+            }
+            assert_eq!(hung.result(), Some(Err(JobError::Hang)));
+            assert!(hung_result.verify().is_err());
+            assert!(registered.is_empty());
+            assert!(guilty.banned() && !guilty.busy());
+            assert_eq!(guilty.reset_stats(), (1, 0));
+            assert!(!innocent.banned());
+            assert_eq!(innocent.reset_stats(), (0, 0));
+            assert_eq!(gt.state(), GtState::SchedulingReady);
+            assert_eq!(gt.user_epoch(), epoch);
+            // The banned context refuses work; a fresh one runs.
+            let (batch, _) = PpgttProbeResult::prepare(platform).unwrap();
+            assert!(gt
+                .submit_user_batch(HANG_TIMEOUT + 300, guilty.clone(), UserBatch(batch))
+                .is_err());
+            let (batch, result) = PpgttProbeResult::prepare(platform).unwrap();
+            let (_, later) = gt
+                .submit_user_batch(HANG_TIMEOUT + 300, UserContext::new(), UserBatch(batch))
+                .unwrap();
+            for now in HANG_TIMEOUT + 301..HANG_TIMEOUT + 360 {
+                ready(&mut gt, now);
+                service_contexts(&w, &mut registered, true);
+                if later.result().is_some() {
+                    break;
+                }
+            }
+            assert_eq!(later.result(), Some(Ok(())));
+            assert_eq!(result.verify(), Ok(()));
+            drop((hung_result, result));
+            assert_eq!(arena.live_allocations(), baseline);
+            hardware_stop(&mut gt, &w, ack);
+            drop(gt);
+            assert_eq!(arena.live_allocations(), 0);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_userspace_hung_job_is_retired_alone
+);
+
+/// Complete an enabled, unexecuted user job as the fixture's executor would:
+/// breadcrumb from the ring's GGTT post-sync immediate, head at the tail.
+fn complete_by_hand(w: &Window, base: u32) {
+    let image = w.0.borrow().memory[&base].clone();
+    let ring_base = image.borrow()[1024 + 9];
+    let ring = w.0.borrow().memory[&ring_base].clone();
+    let tail = image.borrow()[1024 + 7];
+    let stamp = ring.borrow()[..tail as usize / 4]
+        .windows(6)
+        .find(|v| v[..4] == [0x7a000004, 0x01104080, base + 0x800, 0])
+        .expect("GGTT post-sync immediate")[4];
+    image.borrow_mut()[0x800 / 4] = stamp;
+    image.borrow_mut()[1024 + 5] = tail;
+}
+
+/// A job whose breadcrumb lands just inside its deadline retires normally
+/// even though its cleanup runs past that deadline.
+fn smoke_userspace_job_finishing_at_its_deadline_retires() -> TestResult {
+    let platform = GtPlatform::Battlemage;
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    let context = UserContext::new();
+    let (batch, _result) = PpgttProbeResult::prepare(platform).unwrap();
+    let (_, fence) = gt
+        .submit_user_batch(100, context.clone(), UserBatch(batch))
+        .unwrap();
+    let mut registered = BTreeMap::new();
+    for now in 101..130 {
+        ready(&mut gt, now);
+        service_contexts(&w, &mut registered, false);
+    }
+    let base = *registered.values().next().expect("enabled job");
+    complete_by_hand(&w, base);
+    // Seen before the deadline (enable ACK after 100, plus 5 s).
+    ready(&mut gt, HANG_TIMEOUT + 100);
+    for now in HANG_TIMEOUT + 200..HANG_TIMEOUT + 260 {
+        ready(&mut gt, now);
+        service_contexts(&w, &mut registered, false);
+        if fence.result().is_some() {
+            break;
+        }
+    }
+    assert_eq!(fence.result(), Some(Ok(())));
+    assert!(!context.banned());
+    assert_eq!(context.reset_stats(), (0, 0));
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    drop(_result);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_userspace_job_finishing_at_its_deadline_retires
+);
+
+/// What recovery cannot isolate still resets the GT: a disable GuC never
+/// answers, a kernel job overrunning its deadline, and GuC resetting an
+/// engine under a kernel job.
+fn smoke_userspace_unrecoverable_hangs_reset_the_gt() -> TestResult {
+    let platform = GtPlatform::Battlemage;
+    for case in 0..3 {
+        let (w, _arena, mut gt) = hardware_model(platform, 0xdfc);
+        prime(&mut gt, &w, 0xdfc);
+        let mut registered = BTreeMap::new();
+        let context = UserContext::new();
+        let (id, fence) = if case == 0 {
+            let (batch, _) = PpgttProbeResult::prepare(platform).unwrap();
+            gt.submit_user_batch(100, context.clone(), UserBatch(batch))
+                .unwrap()
+        } else {
+            gt.submit_kernel_probe(100).unwrap()
+        };
+        for now in 101..130 {
+            ready(&mut gt, now);
+            service_contexts(&w, &mut registered, false);
+        }
+        let lost = match case {
+            0 => {
+                // First expiry sends the disable, which is never answered.
+                ready(&mut gt, HANG_TIMEOUT + 130);
+                gt.poll(2 * HANG_TIMEOUT + 130)
+            }
+            1 => gt.poll(HANG_TIMEOUT + 130),
+            _ => {
+                event(&ct_memory(&w), 0x1008, &[u32::from(id)]);
+                gt.poll(131)
+            }
+        };
+        assert!(matches!(
+            lost,
+            Poll::Ready(Err(GtError::Scheduling(
+                crate::intel_gpu_guc_sched::SchedulingError::Timeout
+            )))
+        ));
+        assert_eq!(gt.state(), GtState::Lost);
+        assert!(fence.result().is_none());
+        hardware_stop(&mut gt, &w, 0xdfc);
+        assert_eq!(fence.result(), Some(Err(JobError::Reset)));
+        if case == 0 {
+            // A full reset is not attributed: the job is counted innocent.
+            assert_eq!(context.reset_stats(), (0, 1));
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_userspace_unrecoverable_hangs_reset_the_gt
+);
+
 mod explicit {
     include!("intel_gpu_explicit_tests.rs");
 }

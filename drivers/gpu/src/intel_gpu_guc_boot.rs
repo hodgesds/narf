@@ -743,7 +743,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                         // BCS0, each logical instance 0 of its GuC class.
                         // xe_guc_ads.c mapping/enable masks, golden LRCA with
                         // its post-register state size, and per-engine saves.
-                        ads.write32(POLICIES + 76, 1); // no autonomous engine reset
+                        // guc_policies_init: global_flags 0 lets GuC reset an
+                        // engine whose context fails to preempt in time; the
+                        // scheduler retires that context alone.
+                        ads.write32(POLICIES + 76, 0);
                         for engine in crate::intel_gpu_engine::Engine::ALL {
                             let Some(state) = config.engines[engine.index()] else {
                                 continue;

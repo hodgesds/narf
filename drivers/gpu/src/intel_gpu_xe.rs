@@ -443,12 +443,22 @@ impl XeFile {
         zero(&wire[..8])?;
         zero(&wire[34..56])?;
         let count = u16::from_le_bytes(wire[32..34].try_into().unwrap());
-        if count > 1 {
+        // xe_exec_ioctl order: queue lookup, VM queue, batch count against
+        // the width-1 queue, then reset status before any sync is parsed.
+        let queue = self.queue(u32_at(&wire, 8))?;
+        if queue.bind || count > 1 {
             return Err(FsError::InvalidData);
         }
-        let queue = self.queue(u32_at(&wire, 8))?;
-        if queue.bind {
-            return Err(FsError::InvalidData);
+        // A hung or reset queue is banned: -ECANCELED (reset_status).
+        let canceled = |error| {
+            if queue.context.banned() {
+                FsError::Canceled
+            } else {
+                error
+            }
+        };
+        if queue.context.banned() {
+            return Err(FsError::Canceled);
         }
         let sync = Sync::read(user, u64_at(&wire, 16), u32_at(&wire, 12), table)?;
         let backend = info.backend.as_ref().ok_or(FsError::NoDevice)?;
@@ -458,7 +468,7 @@ impl XeFile {
             previous
                 .wait()
                 .await
-                .map_err(|_| crate::intel_gpu_user::io_error())?;
+                .map_err(|_| canceled(crate::intel_gpu_user::io_error()))?;
         }
         let mut state = queue.vm.state.lock().await;
         loop {
@@ -467,7 +477,7 @@ impl XeFile {
                 .status()
                 .filter(|s| s.platform == info.platform)
                 .ok_or(FsError::NoDevice)?;
-            queue.context.check_epoch(status.epoch)?;
+            queue.context.check_epoch(status.epoch).map_err(canceled)?;
             let resident = ResidentBatch::from_vm(
                 status.platform,
                 &state.mappings,

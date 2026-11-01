@@ -140,6 +140,8 @@ struct State {
     image: Vec<u32>,
     last: Option<Arc<CompletionFence>>,
     lost_pending: u32,
+    /// Jobs of this context that hung and were removed from their engine.
+    guilty: u32,
     policy: (u32, u32),
 }
 
@@ -169,6 +171,7 @@ impl UserContext {
                 image: Vec::new(),
                 last: None,
                 lost_pending: 0,
+                guilty: 0,
                 policy: (3, 1000),
             }),
         })
@@ -206,11 +209,12 @@ impl UserContext {
         let state = self.state.lock();
         state.epoch == 0 && !state.busy
     }
+    /// i915 `batch_active` / `batch_pending`: jobs this context lost because
+    /// they hung (guilty) and because a full GT reset took them (innocent;
+    /// no guilt is guessed for a full reset).
     pub(crate) fn reset_stats(&self) -> (u32, u32) {
         let state = self.state.lock();
-        // No GuC fault attribution is available yet. Like i915's innocent
-        // reset accounting, report affected requests without guessing guilt.
-        (0, state.lost_pending)
+        (state.guilty, state.lost_pending)
     }
     pub(crate) fn check_epoch(&self, epoch: u64) -> Result<(), FsError> {
         let mut state = self.state.lock();
@@ -328,6 +332,15 @@ impl UserJob {
         }
         state.valid = true;
         Ok(())
+    }
+    /// The job hung and was removed from its engine: its state is never
+    /// captured, and the context is banned as Linux bans the exec queue.
+    pub(crate) fn finish_hung(self) {
+        let mut state = self.context.state.lock();
+        state.busy = false;
+        state.banned = true;
+        state.valid = false;
+        state.guilty = state.guilty.saturating_add(1);
     }
     pub(crate) fn finish(self, reset: bool) {
         let mut state = self.context.state.lock();

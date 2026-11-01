@@ -1612,8 +1612,8 @@ resources without an unbounded reset retry.
 
 Scheduling requires CSS submission-interface major 1 (byte 68), separately from
 the firmware release. After HWCONFIG, the owner stops GuC, updates ADS for RCS0,
-reloads/authenticates with LiteRestore, and enables coherent CT. Autonomous
-engine reset remains disabled pending coordinated recovery. The scheduler
+reloads/authenticates with LiteRestore, and enables coherent CT. GuC
+autonomous engine reset is enabled (`guc_policies.global_flags` 0, as Linux). The scheduler
 owns HWS plus a distinct LRC and 8-KiB ring for each of at most 64 kernel probe
 contexts. MTL/DG2 use 14-page LRCs, BMG four pages, with Xe register-state groups.
 The original safe submission entry admits a fixed owned GGTT breadcrumb.
@@ -1874,7 +1874,7 @@ acceptance or a claim of complete acceleration.
 | Engines and platforms | Main-GT DSS/EU discovery; RCS0, never-fused BCS0 and fuse-derived CCS0 (ccs_mode 1) scheduling; separate Gen12 foundations | BMG BCS8, CCS1-3/ccs_mode > 1, media GT and media submission, independently sourced profiles for other IP |
 | Memory and presentation | Owned system RAM, private tables, same-card CPU PRIME mappings; iGPU write-combining objects (retyped kernel aliases, WC mmap, SCANOUT, non-coherent PAT1/PAT2 binds); Battlemage visible VRAM (zeroed pool, DM PTEs, WC BAR mmap, placement fallback) | DG2 VRAM (64K pages + CCS clear), small-BAR/unmapped VRAM, eviction, GPU clears, VRAM PRIME/P2P, accelerated presentation and GPU/KMS synchronization |
 | Display | Gen12 paths and owned Xe-LPG internal-panel modeset | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |
-| Power and faults | Owned GuC/RCS0/BCS0 MSI wakeups with timer fallback, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery; idle D3hot runtime autosuspend for display-less discrete GTs with epoch-continuing resume; GuC SLPC with firmware-controlled RC6 (optional, fail-open) | Finer engine recovery, autosuspend with live VRAM (mapping revocation/eviction) or an active iGPU panel (display power wells/DC states), D3cold, SLPC frequency bounds/power profiles and MTL Wa_22019338487 |
+| Power and faults | Owned GuC/RCS0/BCS0 MSI wakeups with timer fallback, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery; per-context hang recovery (job timeout + GuC engine reset, guilty queue banned); idle D3hot runtime autosuspend for display-less discrete GTs with epoch-continuing resume; GuC SLPC with firmware-controlled RC6 (optional, fail-open) | Runtime-based job timeouts (LRC timestamps), error capture, autosuspend with live VRAM (mapping revocation/eviction) or an active iGPU panel (display power wells/DC states), D3cold, SLPC frequency bounds/power profiles and MTL Wa_22019338487 |
 | Acceptance | Native register/CT/page-walk and ownership models on both kernel architectures | Intel silicon execution, suspend/resume and Mesa OpenGL/Vulkan interoperability |
 
 After the GT's execution probes, the physical worker attempts single-vector
@@ -1911,6 +1911,29 @@ for WB objects and USERPTR. Deviation: PAT0, also XE_COH_NONE in Linux,
 stays refused because its definition is left to firmware for the inherited
 display. dGPU system memory stays WB as in Linux. aarch64 refuses WC
 creation (`NotImplemented`): the kernel's linear map cannot be retyped.
+
+Hung user jobs are recovered per context (MIT Linux
+b90c984d615e8ce2af96f5b1411a962d83fed2ad `guc_exec_queue_timedout_job`,
+`xe_guc_exec_queue_reset_handler`). A user job's 5 s deadline starts at
+GuC's enable ACK. When it expires while the job runs, the scheduler disables
+that context alone; GuC preempts it or, if it cannot preempt within the
+500 ms policy timeout, resets the engine and sends
+CONTEXT_RESET_NOTIFICATION (0x1008). GuC also resets autonomously when a
+non-preemptible context blocks a waiting one. Either way the context is
+deregistered and its final TLB invalidation proven before its tables and
+BOs are released; its saved state is never captured, its fence fails with
+`JobError::Hang`, and its context is banned and counted guilty (i915
+GET_RESET_STATS `batch_active`). Xe EXEC on a banned queue is ECANCELED
+before syncs are parsed, after the queue lookup and batch-count checks, as
+in `xe_exec_ioctl`. A job that completes while being disabled retires
+normally. Kernel jobs, a reset notification for a kernel context, a second
+expiry, an unanswered disable and ENGINE_FAILURE_NOTIFICATION still require a
+full GT reset. Deviation: Linux's `check_timeout` measures run time from LRC
+context timestamps and a ring start marker, so a job queued behind others is
+not charged for their time; NARF's deadline is wall clock from the enable
+ACK, which with GuC time-slicing and engine reset bounds an innocent job's
+wait behind a hog to the preemption timeout but can still ban a job whose
+own GPU time is under 5 s on a heavily shared engine.
 
 The scheduler now recycles a round-robin pool of 64 GuC IDs after verified
 retirement, removing the 65534-request lifetime limit. Request stamps and TLB

@@ -1764,8 +1764,10 @@ fn smoke_hardware_ppgtt_cancel_and_reset() -> TestResult {
     }
     let count = arena.live_allocations();
     assert!(weak.iter().all(|o| o.strong_count() == 1));
+    // A kernel job's 5 s starts at GuC's enable ACK (polls 27..31); its
+    // overrun is never isolated and loses the GT.
     assert!(matches!(
-        gt.poll(5_000_000_026),
+        gt.poll(5_000_000_032),
         Poll::Ready(Err(GtError::Scheduling(_)))
     ));
     assert!(completion.result().is_none());
@@ -1896,6 +1898,15 @@ fn smoke_hardware_gt_reload_and_context_execution() -> TestResult {
         }
         hardware_scheduling(&mut gt, &w);
         assert_eq!(w.0.borrow().regs.get(&0xc18c), Some(&16));
+        // guc_policies: valid, and GuC may reset an engine under a context
+        // that fails to preempt (global_flags without DISABLE_ENGINE_RESET).
+        {
+            let ads = w.0.borrow().memory[&0x20001000].clone();
+            assert_eq!(
+                (ads.borrow()[0x1220 / 4], ads.borrow()[0x1228 / 4]),
+                (1, 0)
+            );
+        }
         assert_eq!(
             w.0.borrow().memory[&0x20001000].borrow()[0x1054 / 4],
             if platform == GtPlatform::Battlemage {
@@ -1964,7 +1975,8 @@ fn smoke_hardware_context_faults_require_full_reset() -> TestResult {
         if malformed {
             event(&ct_memory(&w), 0x1002, &[0xffff, 1]);
         }
-        let now = if malformed { 32 } else { 5_000_000_026 };
+        // The kernel probe's deadline runs from its enable ACK (polls 27..31).
+        let now = if malformed { 32 } else { 5_000_000_032 };
         assert!(matches!(
             gt.poll(now),
             Poll::Ready(Err(GtError::Scheduling(_)))

@@ -940,6 +940,17 @@ interfaces and limits.
 
 ## Current work
 
+Intel GPU hangs are now recovered per context. GuC autonomous engine reset is
+enabled; a user job that overruns its 5 s deadline (from GuC's enable ACK) is
+disabled alone, and GuC preempts it or resets the engine under it
+(CONTEXT_RESET_NOTIFICATION). The job retires through the usual
+deregistration and final-TLB proof, its fence fails with `JobError::Hang`,
+and only its context is banned and counted guilty; other contexts keep
+running at the same epoch. Xe EXEC on a banned queue now returns ECANCELED
+(was EIO), after the queue lookup as in `xe_exec_ioctl`. Kernel-job hangs, an
+unanswered disable and engine-reset failure still reset the GT. The Intel
+GuC/user/Xe suites pass on x86_64 (120 + 85) and aarch64 (104).
+
 Intel iGPU write-combining memory is admitted. `narf_memory::pageattr`
 retypes driver-owned RAM pages write-combining in every kernel alias (Linux
 `set_pages_array_wc`: UC- then WC, huge-leaf split, all-CPU TLB and cache-line

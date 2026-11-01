@@ -8,7 +8,11 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum JobError {
+    /// Lost to a full GT reset.
     Reset,
+    /// Overran its deadline or was reset by GuC: taken off its engine alone,
+    /// with its context banned (Linux -ETIME / -EIO).
+    Hang,
 }
 
 #[derive(Debug)]

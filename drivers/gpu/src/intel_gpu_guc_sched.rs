@@ -146,6 +146,11 @@ struct Context<B: GpuBacking> {
     resident: Option<ResidentBatch>,
     user: Option<crate::intel_gpu_user::UserJob>,
     tail: u32,
+    /// The deadline expired while the user job ran: it is being taken off
+    /// the engine (Linux guc_exec_queue_timedout_job).
+    timed_out: bool,
+    /// GuC reset the engine under this context (CONTEXT_RESET_NOTIFICATION).
+    reset: bool,
 }
 
 struct EngineState<B: GpuBacking> {
@@ -728,6 +733,8 @@ impl<A: BootAllocator> GuCScheduler<A> {
             fence: completion.clone(),
             resident,
             tail,
+            timed_out: false,
+            reset: false,
         });
         if mutating {
             self.pristine = false;
@@ -761,7 +768,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             let Some(message) = ct.receive().map_err(SchedulingError::Transport)? else {
                 break;
             };
-            self.event(message)?;
+            self.event(message, now)?;
         }
         self.progress_slpc(ct, now)?;
         if let Defaults::Seed(engine, _) = self.defaults {
@@ -786,7 +793,21 @@ impl<A: BootAllocator> GuCScheduler<A> {
         }
         for context in &mut self.resources.contexts {
             if now >= context.deadline {
-                return Err(SchedulingError::Timeout);
+                // A user job that overran its slot is disabled alone; GuC
+                // preempts it or, if it cannot, resets the engine under it.
+                // Kernel work, a second expiry, or GuC not answering any
+                // other step needs a full GT reset (Linux likewise resets
+                // the GT for kernel jobs and an unanswered disable).
+                if context.user.is_none()
+                    || context.timed_out
+                    || context.reset
+                    || context.phase != Phase::Running
+                {
+                    return Err(SchedulingError::Timeout);
+                }
+                context.timed_out = true;
+                context.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
+                context.phase = Phase::Disable;
             }
             if context.phase == Phase::Running {
                 fence(Ordering::Acquire);
@@ -796,6 +817,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 }
                 if seq != 0 {
                     context.phase = Phase::Disable;
+                    // Retirement gets its own bound: a job finishing just
+                    // inside its deadline must not lose the GT in cleanup.
+                    context.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
                 }
             }
             let id = u32::from(context.id);
@@ -859,7 +883,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
         Ok(())
     }
 
-    fn event(&mut self, message: GuCMessage) -> Result<(), SchedulingError> {
+    fn event(&mut self, message: GuCMessage, now: u64) -> Result<(), SchedulingError> {
         // RESPONSE_FAILURE to an SLPC fast request: the optional power
         // component is unavailable, not a lost scheduler.
         if message.kind == 6 && message.fence == SLPC_FENCE && self.slpc != SlpcState::Off {
@@ -870,10 +894,13 @@ impl<A: BootAllocator> GuCScheduler<A> {
             return Err(SchedulingError::Protocol);
         }
         let action = message.auxiliary as u16;
-        if !matches!(action, 0x1002 | 0x4600 | 0x7001) {
+        // ENGINE_FAILURE_NOTIFICATION (0x1009, GuC could not reset an engine)
+        // stays a protocol loss: Linux answers it with a GT reset.
+        if !matches!(action, 0x1002 | 0x1008 | 0x4600 | 0x7001) {
             return Err(SchedulingError::Protocol);
         }
         let len = if action == 0x1002 { 2 } else { 1 };
+        // CONTEXT_RESET_NOTIFICATION carries the GuC context ID alone.
         if message.payload.len() != len {
             return Err(SchedulingError::Protocol);
         }
@@ -896,12 +923,16 @@ impl<A: BootAllocator> GuCScheduler<A> {
             (0x7001, Phase::Invalidating, None) if cookie == c.stamp => c.phase = Phase::Register,
             (0x7001, Phase::RetireInvalidating, None) if cookie == (c.stamp | 0x80000000) => {
                 fence(Ordering::Acquire);
-                if c.image.read32(BREADCRUMB) != c.stamp
-                    || c.image.read32(REGS + 5 * 4) & 0x1ffffc != c.tail
+                let hung = c.timed_out || c.reset;
+                if !hung
+                    && (c.image.read32(BREADCRUMB) != c.stamp
+                        || c.image.read32(REGS + 5 * 4) & 0x1ffffc != c.tail)
                 {
                     return Err(SchedulingError::Protocol);
                 }
-                if let Some(user) = &c.user {
+                // A hung job's saved state is never captured: its context
+                // is banned below.
+                if let Some(user) = c.user.as_ref().filter(|_| !hung) {
                     resources
                         .allocator
                         .sync_for_cpu(&c.image)
@@ -920,12 +951,18 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     self.identities.retire(c.id);
                 }
                 // Drop all PPGTT tables and BO references before terminal
-                // publication. Deregistration and the final TLB ACK are proven.
+                // publication. Deregistration and the final TLB ACK are proven,
+                // so even a reset or preempted job no longer reaches them.
                 drop(c.resident);
                 if let Some(user) = c.user {
-                    user.finish(false);
+                    if hung {
+                        user.finish_hung();
+                    } else {
+                        user.finish(false);
+                    }
                 }
-                c.fence.signal(Ok(()));
+                c.fence
+                    .signal(if hung { Err(JobError::Hang) } else { Ok(()) });
                 if self.defaults == Defaults::Switch(c.engine, c.id) {
                     self.capture_defaults(c.engine)?;
                 }
@@ -933,14 +970,43 @@ impl<A: BootAllocator> GuCScheduler<A> {
             (0x1002, Phase::Enabling, Some(1)) => {
                 c.phase = Phase::Running;
                 c.fence.mark_submitted();
+                // The job's time starts when GuC may run it.
+                c.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
             }
             (0x1002, Phase::Disabling, Some(0)) => c.phase = Phase::Deregister,
+            (
+                0x1008,
+                Phase::Running
+                | Phase::Disable
+                | Phase::Disabling
+                | Phase::Deregister
+                | Phase::Deregistering,
+                None,
+            ) => {
+                // GuC reset the engine under this context. A kernel job must
+                // never hang; a user job is taken off and its context banned.
+                if c.user.is_none() {
+                    return Err(SchedulingError::Timeout);
+                }
+                if !c.timed_out && !c.reset {
+                    c.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
+                }
+                c.reset = true;
+                if c.phase == Phase::Running {
+                    c.phase = Phase::Disable;
+                }
+            }
             (0x4600, Phase::Deregistering, None) => {
                 fence(Ordering::Acquire);
-                if c.image.read32(BREADCRUMB) != c.stamp
-                    || c.image.read32(REGS + 5 * 4) & 0x1ffffc != c.tail
-                {
+                let finished = c.image.read32(BREADCRUMB) == c.stamp
+                    && c.image.read32(REGS + 5 * 4) & 0x1ffffc == c.tail;
+                if !finished && !c.timed_out && !c.reset {
                     return Err(SchedulingError::Protocol);
+                }
+                // A job that completed while it was being disabled was slow,
+                // not hung: it retires normally unless GuC reset it.
+                if finished && !c.reset {
+                    c.timed_out = false;
                 }
                 c.phase = Phase::RetireInvalidate;
             }

@@ -755,6 +755,130 @@ kernel_test_in!(
     smoke_xe_vram_placement_queries_mmap_execution_and_reuse
 );
 
+/// A hung EXEC is taken off the engine alone (GuC engine reset) and bans its
+/// queue: GET_PROPERTY(BAN) reports it and the next EXEC is ECANCELED before
+/// any sync is parsed (xe_exec_ioctl reset_status). A new queue on the same
+/// VM still executes.
+fn smoke_xe_hung_exec_bans_only_its_queue() -> TestResult {
+    let platform = GtPlatform::Battlemage;
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    let (mailbox, info) = setup(&mut gt, &w, platform);
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let vm = create_vm(&file, &info, &user);
+    let queue = create_queue(&file, &info, &user, vm, 0);
+    buffers(&file, &info, &user, vm);
+    exec_wire(&user, queue, true, &[]);
+    let hung = {
+        let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
+        assert!(call
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        let (_, fence) = mailbox.accept(&mut gt, 100);
+        assert_eq!(
+            call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Some(Ok(0)))
+        );
+        fence
+    };
+    let mut registered = BTreeMap::new();
+    let mut id = None;
+    for now in 101..130 {
+        assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+        service_contexts(&w, &mut registered, false);
+        id = id.or(registered.keys().next().copied());
+    }
+    let id = id.expect("hung context registered");
+    let ban = |user: &Cpu, queue: u32| {
+        let mut wire = [0; 40];
+        put32(&mut wire, 8, queue);
+        user.wire.store(64, &wire);
+        assert_eq!(invoke(&file, &info, user, xe::EXEC_QUEUE_GET_PROPERTY), Ok(0));
+        u64_at(&user.wire.load(64, 40), 16)
+    };
+    assert_eq!(ban(&user, queue), 0);
+    // Refusals return from the first poll, before any await.
+    let exec_now = |file: &RenderFile, info: &DeviceInfo, user: &Cpu| {
+        match core::pin::pin!(file.dispatch_user(info, xe::EXEC, 64, user))
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(Some(result)) => result,
+            _ => panic!("EXEC refusal parked"),
+        }
+    };
+    let late = 5_000_000_130;
+    assert_eq!(gt.poll(late), Poll::Ready(Ok(GtState::SchedulingReady)));
+    event(&ct_memory(&w), 0x1008, &[id]);
+    for now in late..late + 60 {
+        assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+        service_contexts(&w, &mut registered, false);
+        if hung.result().is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        hung.result(),
+        Some(Err(crate::intel_gpu_fence::JobError::Hang))
+    );
+    assert_eq!(ban(&user, queue), 1);
+    // ECANCELED precedes sync parsing: a sync array at an unmapped address
+    // would otherwise fault.
+    exec_wire(&user, queue, true, &[]);
+    let mut wire = user.wire.load(64, 56);
+    put32(&mut wire, 12, 1);
+    put64(&mut wire, 16, 0xdead_0000);
+    user.wire.store(64, &wire);
+    assert_eq!(exec_now(&file, &info, &user), Err(FsError::Canceled));
+    // xe_exec_ioctl looks the queue up before checking the batch count.
+    put32(&mut wire, 8, 0x7777);
+    put32(&mut wire, 12, 0);
+    wire[32] = 2;
+    user.wire.store(64, &wire);
+    assert_eq!(exec_now(&file, &info, &user), Err(FsError::NotFound));
+    put32(&mut wire, 8, queue);
+    user.wire.store(64, &wire);
+    assert_eq!(exec_now(&file, &info, &user), Err(FsError::InvalidData));
+    // Another queue on the same VM runs: the GT kept its epoch.
+    let other = create_queue(&file, &info, &user, vm, 0);
+    assert_eq!(ban(&user, other), 0);
+    exec_wire(&user, other, true, &[]);
+    let fence = {
+        let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
+        assert!(call
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        let (_, fence) = mailbox.accept(&mut gt, late + 100);
+        assert_eq!(
+            call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Some(Ok(0)))
+        );
+        fence
+    };
+    finish(&mut gt, &w, &fence, &mut registered, late + 101);
+    assert_eq!(user.read_u64_acquire(0x4080), Ok(0x4e415246));
+    user.mapping.lock().take();
+    for queue in [queue, other] {
+        assert_eq!(
+            close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, queue),
+            Ok(0)
+        );
+    }
+    assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, vm), Ok(0));
+    drop(file);
+    drop(info);
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_xe_hung_exec_bans_only_its_queue
+);
+
 /// DRM_XE_GEM_CPU_CACHING_WC on the iGPU: pages retyped write-combining for
 /// the object's lifetime, a WC mmap, SCANOUT only with WC, XE_COH_NONE binds
 /// only for WC objects, and a GPU store through a PAT1 leaf.
