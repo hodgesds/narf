@@ -101,7 +101,15 @@ pub fn activate(n: u32) -> Result<(), ()> {
     if !(1..=MAX_VT).contains(&n) {
         return Err(());
     }
-    STATE.lock().active = n;
+    let changed = {
+        let mut state = STATE.lock();
+        let changed = state.active != n;
+        state.active = n;
+        changed
+    };
+    if changed {
+        crate::sysfs::notify_tty_active();
+    }
     Ok(())
 }
 

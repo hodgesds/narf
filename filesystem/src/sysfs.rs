@@ -53,8 +53,10 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::task::{Poll, Waker};
 
+use narf_lib::readiness::Readiness;
 use narf_lib::smp;
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -399,6 +401,9 @@ pub struct Kobject {
     children: IrqSafeSpinLock<Vec<Arc<Kobject>>>,
     /// Text attribute files (`show` callbacks).
     attrs: IrqSafeSpinLock<BTreeMap<&'static str, AttrShow>>,
+    /// Lazily allocated kernfs notification state, shared by all opens of an
+    /// attribute. The observed event is separate in each `SysAttrFile`.
+    attr_events: IrqSafeSpinLock<BTreeMap<&'static str, Arc<AttrEvents>>>,
     /// Write callbacks for read-write attributes.
     /// Linux ref: `struct attribute / store` (include/linux/sysfs.h:26).
     store_attrs: IrqSafeSpinLock<BTreeMap<&'static str, AttrStore>>,
@@ -430,6 +435,7 @@ impl Kobject {
             parent: None,
             children: IrqSafeSpinLock::new(Vec::new()),
             attrs: IrqSafeSpinLock::new(BTreeMap::new()),
+            attr_events: IrqSafeSpinLock::new(BTreeMap::new()),
             store_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
             bin_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
             symlinks: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -446,6 +452,7 @@ impl Kobject {
             parent: Some(parent.clone()),
             children: IrqSafeSpinLock::new(Vec::new()),
             attrs: IrqSafeSpinLock::new(BTreeMap::new()),
+            attr_events: IrqSafeSpinLock::new(BTreeMap::new()),
             store_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
             bin_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
             symlinks: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -728,6 +735,17 @@ where
     kobj.attrs.lock().insert(name, Arc::new(show));
 }
 
+/// Notify poll/epoll observers of a text attribute after publishing its value.
+/// Linux's `kernfs_notify` advances a shared event and wakes the attribute's
+/// wait queue; each open consumes that event only when it reads the attribute.
+pub fn kobject_notify(kobj: &Kobject, name: &str) {
+    let events = kobj.attr_events.lock().get(name).cloned();
+    if let Some(events) = events {
+        events.generation.fetch_add(1, Ordering::Release);
+        events.waiters.notify(crate::POLL_PRI | crate::POLL_ERR);
+    }
+}
+
 /// Add a binary attribute to a kobject.
 /// Linux ref: `sysfs_create_bin_file` (fs/sysfs/bin.c:209).
 pub fn kobject_add_bin_attr(kobj: &Kobject, name: &'static str, read: BinAttrRead) {
@@ -996,6 +1014,19 @@ pub fn populate_tty_class() {
     let dev_char = get_or_create_child(&dev_dir, "char");
     let _dev_block = get_or_create_child(&dev_dir, "block");
     dev_char.add_symlink("4:64", "../../devices/virtual/tty/ttyS0");
+}
+
+/// Called after a logical VT switch, with the VT state lock released. logind
+/// watches this attribute with an empty epoll interest mask: POLL_ERR must
+/// still wake it so it can refresh the active session and device ACLs.
+pub(crate) fn notify_tty_active() {
+    let tty0 = get_root()
+        .get_child("class")
+        .and_then(|class| class.get_child("tty"))
+        .and_then(|tty| tty.get_child("tty0"));
+    if let Some(tty0) = tty0 {
+        kobject_notify(&tty0, "active");
+    }
 }
 
 /// Contents of `/sys/class/tty/console/active`.
@@ -3355,10 +3386,7 @@ impl DirOps for SysRoot {
         // Text attrs: use find_attr_key so any dynamically-registered attr
         // is visible without a separate static allowlist.
         if let Some(attr_s) = kobj.find_attr_key(name) {
-            return Some(Arc::new(SysAttrFile {
-                kobj: kobj.clone(),
-                attr_name: attr_s,
-            }));
+            return Some(Arc::new(SysAttrFile::new(kobj.clone(), attr_s)));
         }
         // Sub-kobjects look like directories
         if let Some(child) = kobj.get_child(name) {
@@ -3426,10 +3454,7 @@ impl DirOps for SysKobjDir {
         // Text attrs: use find_attr_key so any dynamically-registered attr
         // (backlight, leds, hwmon, etc.) is visible without a static list.
         if let Some(attr_s) = self.kobj.find_attr_key(name) {
-            return Some(Arc::new(SysAttrFile {
-                kobj: self.kobj.clone(),
-                attr_name: attr_s,
-            }));
+            return Some(Arc::new(SysAttrFile::new(self.kobj.clone(), attr_s)));
         }
         // Binary attrs. Previously omitted, which made every bin attr
         // UNREACHABLE: `kobject_add_bin_attr` registered it, `has_attr`
@@ -3663,11 +3688,42 @@ impl FileOps for SysBinAttrFile {
     }
 }
 
+struct AttrEvents {
+    generation: AtomicU64,
+    /// Notification-only wait queue. Readiness levels depend on each open's
+    /// cursor, so the shared cell has no level bits of its own.
+    waiters: Readiness,
+}
+
 struct SysAttrFile {
     kobj: Arc<Kobject>,
     /// The key into `kobj.attrs`; must be `&'static str` because it
     /// is stored as such in the `BTreeMap`.
     attr_name: &'static str,
+    events: Arc<AttrEvents>,
+    observed: AtomicU64,
+}
+
+impl SysAttrFile {
+    fn new(kobj: Arc<Kobject>, attr_name: &'static str) -> Self {
+        let events = kobj
+            .attr_events
+            .lock()
+            .entry(attr_name)
+            .or_insert_with(|| {
+                Arc::new(AttrEvents {
+                    generation: AtomicU64::new(1),
+                    waiters: Readiness::new(0),
+                })
+            })
+            .clone();
+        Self {
+            kobj,
+            attr_name,
+            events,
+            observed: AtomicU64::new(0),
+        }
+    }
 }
 
 impl fmt::Debug for SysAttrFile {
@@ -3679,6 +3735,46 @@ impl fmt::Debug for SysAttrFile {
 }
 
 impl FileOps for SysAttrFile {
+    fn open_instance(&self) -> Option<Arc<dyn FileOps>> {
+        // Path lookup may be cached; only dup/fork share an open's cursor.
+        Some(Arc::new(Self::new(self.kobj.clone(), self.attr_name)))
+    }
+
+    fn poll_readiness(&self) -> u32 {
+        let mut ready = crate::POLL_IN | crate::POLL_OUT;
+        if self.observed.load(Ordering::Acquire) != self.events.generation.load(Ordering::Acquire) {
+            ready |= crate::POLL_PRI | crate::POLL_ERR;
+        }
+        ready
+    }
+
+    fn arm_readiness(&self, id: u64, interest: u32, waker: &Waker) -> Option<Poll<u32>> {
+        // Register before checking the per-open generation. A concurrent
+        // notify either wakes this registration or is visible to the check.
+        let _ = self.events.waiters.arm(id, interest, waker);
+        let ready = self.poll_readiness() & interest;
+        Some(if ready == 0 {
+            Poll::Pending
+        } else {
+            self.events.waiters.disarm(id);
+            Poll::Ready(ready)
+        })
+    }
+
+    fn arm_readiness_persistent(&self, id: u64, interest: u32, waker: &Waker) -> Option<u32> {
+        self.events.waiters.arm_persistent(id, interest, waker);
+        Some(self.poll_readiness() & interest)
+    }
+
+    fn disarm_readiness(&self, id: u64) -> bool {
+        self.events.waiters.disarm(id);
+        true
+    }
+
+    fn readiness_notifies(&self) -> bool {
+        true
+    }
+
     fn ino(&self) -> u64 {
         self.kobj.node_ino(self.attr_name)
     }
@@ -3686,8 +3782,16 @@ impl FileOps for SysAttrFile {
         sysfs_attrs()
     }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        let content = self.kobj.attr_show(self.attr_name).unwrap_or_default();
         Box::pin(async move {
+            // Capture before show(), as kernfs_seq_show does. A notification
+            // concurrent with generating the value must remain pending.
+            if offset == 0 && !buf.is_empty() {
+                self.observed.store(
+                    self.events.generation.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+            }
+            let content = self.kobj.attr_show(self.attr_name).unwrap_or_default();
             let bytes = content.as_bytes();
             let start = offset as usize;
             if start >= bytes.len() {
@@ -3749,6 +3853,54 @@ pub fn mount_sysfs() {
 }
 
 use narf_kernel_test::{kernel_test_in, TestResult};
+
+fn smoke_sysfs_active_vt_notifies_each_open() -> TestResult {
+    crate::vt::__reset_for_test();
+    populate_tty_class();
+    let root = get_root();
+    let tty0 = root
+        .get_child("class")
+        .unwrap()
+        .get_child("tty")
+        .unwrap()
+        .get_child("tty0")
+        .unwrap();
+    let dir = SysKobjDir { kobj: tty0 };
+    let first = dir.lookup("active").unwrap();
+    let second = dir.lookup("active").unwrap();
+    let mut buf = [0u8; 16];
+    for file in [&first, &second] {
+        if narf_scheduler::block_on_spin(file.read(0, &mut buf)) != Ok(5) || &buf[..5] != b"tty1\n"
+        {
+            return TestResult::Fail("initial active VT read");
+        }
+    }
+    let changed = crate::POLL_PRI | crate::POLL_ERR;
+    if first.poll_readiness() & changed != 0 {
+        return TestResult::Fail("read must clear sysfs notification");
+    }
+    if crate::vt::activate(2).is_err() || first.poll_readiness() & changed != changed {
+        return TestResult::Fail("VT activation must notify sysfs pollers");
+    }
+    // Poll delivery is not an acknowledgement: Linux kernfs consumes the
+    // notification when the attribute is read, separately for each open.
+    first.acknowledge_poll_readiness(changed);
+    if first.poll_readiness() & changed != changed {
+        return TestResult::Fail("poll consumed sysfs notification before read");
+    }
+    if narf_scheduler::block_on_spin(first.read(0, &mut buf)) != Ok(5) || &buf[..5] != b"tty2\n" {
+        return TestResult::Fail("activated VT read");
+    }
+    if first.poll_readiness() & changed != 0 || second.poll_readiness() & changed != changed {
+        return TestResult::Fail("sysfs notification cursors must be per open");
+    }
+    crate::vt::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/sysfs/vt_notify",
+    smoke_sysfs_active_vt_notifies_each_open
+);
 
 fn smoke_sysfs_numa_node_live_files() -> TestResult {
     populate_numa_nodes();

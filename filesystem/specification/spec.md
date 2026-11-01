@@ -161,6 +161,15 @@ lock. Providers support explicit refresh after probes and use the existing
 kobject/class registration API. Every sysfs mount shares that live graph;
 mounting a new view never repopulates it or emits device ADD events.
 
+`sysfs::kobject_notify(kobj, attribute)` publishes a text-attribute change
+after its value changes. Each open has an independent event cursor (shared
+by dup/fork): `poll`/`epoll` report `POLLPRI|POLLERR` until that open reads
+the attribute again. Notification wakes registered waiters, including epoll
+registrations interested only in the always-reported error bit. Poll delivery
+alone does not consume the event. A logical VT activation notifies
+`/sys/class/tty/tty0/active` after releasing the VT state lock, allowing logind
+to update seat0's active session and transfer device ACLs.
+
 ### 3.0 Root-device orchestration
 
 `root_mount::try_mount_root` and `try_mount_root_with` apply every explicit
