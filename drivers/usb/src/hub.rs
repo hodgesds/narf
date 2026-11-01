@@ -53,6 +53,66 @@ pub const HUB_PROTOCOL_SINGLE_TT: u8 = 0x01;
 /// High-speed hub device protocol: one Transaction Translator per port.
 pub const HUB_PROTOCOL_MULTI_TT: u8 = 0x02;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HubRequest {
+    kind: u8,
+    code: u8,
+    value: u16,
+    index: u16,
+}
+
+// The same attach sequence runs against xHCI and the firmware model. Keep
+// requests at the wire boundary so tests observe the selected hub mode.
+trait HubTransport: Sync {
+    fn read<'a>(
+        &'a self,
+        slot: u8,
+        request: HubRequest,
+        data: &'a mut [u8],
+    ) -> impl core::future::Future<Output = Result<usize, xhci::XhciError>> + Send + 'a;
+
+    fn write(
+        &self,
+        slot: u8,
+        request: HubRequest,
+    ) -> impl core::future::Future<Output = Result<usize, xhci::XhciError>> + Send;
+}
+
+impl HubTransport for Xhci {
+    async fn read<'a>(
+        &'a self,
+        slot: u8,
+        request: HubRequest,
+        data: &'a mut [u8],
+    ) -> Result<usize, xhci::XhciError> {
+        self.control_in(
+            slot,
+            request.kind,
+            request.code,
+            request.value,
+            request.index,
+            data,
+        )
+        .await
+    }
+
+    async fn write(&self, slot: u8, request: HubRequest) -> Result<usize, xhci::XhciError> {
+        self.control_out(
+            slot,
+            request.kind,
+            request.code,
+            request.value,
+            request.index,
+            &[],
+        )
+        .await
+    }
+}
+
+#[cfg(feature = "kernel-test")]
+#[path = "hub_tests.rs"]
+mod tests;
+
 // ── Class-specific request encodings ───────────────────────────────
 
 /// Standard `GET_DESCRIPTOR` (§11.24.2.5) targeting the hub
@@ -153,9 +213,53 @@ pub struct UsbHub {
     pub descriptor: HubDescriptor,
     /// Speed negotiated between this hub and its upstream port.
     pub speed: PortSpeed,
-    /// Device Descriptor `bDeviceProtocol`. A high-speed hub reports
-    /// 1 for a shared TT and 2 for one TT per downstream port.
+    /// Device Descriptor capability; protocol 2 still starts in single-TT
+    /// mode until its multiple-TT alternate interface has been selected.
     pub device_protocol: u8,
+    pub interface_alt: u8,
+    pub interface_protocol: u8,
+}
+
+/// Resolve the active hub interface before any class request. USB 2.0
+/// configuration selects alternate zero. A high-speed multiple-TT hub must
+/// explicitly select its advertised protocol-2 alternate (USB 2.0 §11.23).
+fn hub_interface_mode(
+    config: &[u8],
+    iface: u8,
+    device_protocol: u8,
+    speed: PortSpeed,
+) -> Result<(u8, u8), HubError> {
+    let multiple = matches!(speed, PortSpeed::High) && device_protocol == HUB_PROTOCOL_MULTI_TT;
+    let mut default = None;
+    let mut selected = None;
+    let mut offset = 0;
+    while offset + 2 <= config.len() {
+        let len = config[offset] as usize;
+        if len < 2 || offset + len > config.len() {
+            return Err(HubError::BadDescriptor);
+        }
+        let descriptor = &config[offset..offset + len];
+        if descriptor[1] == 4
+            && len >= 9
+            && descriptor[2] == iface
+            && descriptor[5] == HUB_INTERFACE_CLASS
+        {
+            let alternate = descriptor[3];
+            let protocol = descriptor[7];
+            if alternate == 0 {
+                default = Some((alternate, protocol));
+            } else if protocol == HUB_PROTOCOL_MULTI_TT {
+                selected.get_or_insert((alternate, protocol));
+            }
+        }
+        offset += len;
+    }
+    let default = default.ok_or(HubError::BadDescriptor)?;
+    if multiple {
+        selected.ok_or(HubError::BadDescriptor)
+    } else {
+        Ok(default)
+    }
 }
 
 /// Walk a Configuration Descriptor tree looking for the first
@@ -187,17 +291,46 @@ impl UsbHub {
         iface_num: u8,
         device_protocol: u8,
         speed: PortSpeed,
+        config: &[u8],
     ) -> Result<Self, HubError> {
+        Self::attach_transport(xhci_dev, slot_id, iface_num, device_protocol, speed, config).await
+    }
+
+    async fn attach_transport(
+        transport: &impl HubTransport,
+        slot_id: u8,
+        iface_num: u8,
+        device_protocol: u8,
+        speed: PortSpeed,
+        config: &[u8],
+    ) -> Result<Self, HubError> {
+        let (interface_alt, interface_protocol) =
+            hub_interface_mode(config, iface_num, device_protocol, speed)?;
+        if interface_alt != 0 {
+            transport
+                .write(
+                    slot_id,
+                    HubRequest {
+                        kind: 0x01, // Host-to-device | Standard | Interface.
+                        code: 11,   // SET_INTERFACE (USB 2.0 §9.4.10).
+                        value: interface_alt as u16,
+                        index: iface_num as u16,
+                    },
+                )
+                .await?;
+        }
         // GET_DESCRIPTOR(Hub) — bmRequestType 0xA0, value
         // (HUB_DESC_TYPE << 8), index 0.
         let mut desc_buf = [0u8; 16];
-        let n = xhci_dev
-            .control_in(
+        let n = transport
+            .read(
                 slot_id,
-                RT_DEV_TO_HOST_CLASS_DEVICE,
-                REQ_GET_DESCRIPTOR,
-                (HUB_DESC_TYPE as u16) << 8,
-                0,
+                HubRequest {
+                    kind: RT_DEV_TO_HOST_CLASS_DEVICE,
+                    code: REQ_GET_DESCRIPTOR,
+                    value: (HUB_DESC_TYPE as u16) << 8,
+                    index: 0,
+                },
                 &mut desc_buf,
             )
             .await?;
@@ -208,14 +341,15 @@ impl UsbHub {
 
         // Power on every downstream port via SET_FEATURE(PORT_POWER).
         for p in 1..=descriptor.num_ports {
-            let _ = xhci_dev
-                .control_out(
+            let _ = transport
+                .write(
                     slot_id,
-                    RT_HOST_TO_DEV_CLASS_OTHER,
-                    REQ_SET_FEATURE,
-                    PORT_POWER,
-                    p as u16,
-                    &[],
+                    HubRequest {
+                        kind: RT_HOST_TO_DEV_CLASS_OTHER,
+                        code: REQ_SET_FEATURE,
+                        value: PORT_POWER,
+                        index: p as u16,
+                    },
                 )
                 .await;
         }
@@ -226,12 +360,14 @@ impl UsbHub {
             descriptor,
             speed,
             device_protocol,
+            interface_alt,
+            interface_protocol,
         })
     }
 
     /// Whether this is a high-speed multiple-TT hub.
     pub const fn is_multi_tt(&self) -> bool {
-        matches!(self.speed, PortSpeed::High) && self.device_protocol == HUB_PROTOCOL_MULTI_TT
+        matches!(self.speed, PortSpeed::High) && self.interface_protocol == HUB_PROTOCOL_MULTI_TT
     }
 
     /// Build the xHCI route metadata for a child on this hub. Low- and

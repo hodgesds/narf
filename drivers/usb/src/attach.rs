@@ -735,7 +735,8 @@ async fn dispatch_after_address(
             let _ = xhci_dev.disable_slot(slot_id).await;
             return AttachOutcome::UnknownClass;
         }
-        let bound = match UsbHub::attach(xhci_dev, slot_id, iface, dev_protocol, speed).await {
+        let bound = match UsbHub::attach(xhci_dev, slot_id, iface, dev_protocol, speed, &full).await
+        {
             Ok(b) => b,
             Err(_) => {
                 let _ = xhci_dev.disable_slot(slot_id).await;
@@ -745,10 +746,15 @@ async fn dispatch_after_address(
         // Flip the slot context's Hub bit + Number of Ports so the
         // controller sizes its TT-routing state for downstream
         // enumeration (xHCI 1.2 §6.2.2 dword0[26], dword1[31:24]).
-        // Failure here isn't fatal — most controllers tolerate it.
-        let _ = xhci_dev
+        // Do not publish children against an unconfigured hub/TT context.
+        if xhci_dev
             .mark_as_hub(slot_id, bound.descriptor.num_ports, bound.is_multi_tt())
-            .await;
+            .await
+            .is_err()
+        {
+            let _ = xhci_dev.disable_slot(slot_id).await;
+            return AttachOutcome::UnknownClass;
+        }
         // Tier of THIS hub = number of 4-bit nibbles already
         // populated in `this_route`. For a tier-0 hub the route is
         // 0 and tier is 0; downstream-of-hub devices will use
