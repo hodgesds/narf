@@ -1952,8 +1952,11 @@ impl Igb {
         }
         let filters = *self.wol_filters.lock();
         let program = wol_suspend_program(filters, self.link_up(), runtime);
-        // SAFETY: mapped MMIO.
+        // SAFETY: mapped MMIO. Transmit DMA stops in both branches
+        // (`__igb_close` has already stopped the TX unit before Linux
+        // arms wake filtering); only the receive side differs.
         unsafe {
+            self.mmio.write32(REG_TCTL, TCTL_SUSPEND_OFF);
             if program.wufc != 0 {
                 self.mmio.write32(REG_RCTL, RCTL_SUSPEND_ARMED);
                 let ctrl = self.mmio.read32(REG_CTRL);
@@ -1964,7 +1967,6 @@ impl Igb {
                 self.mmio.write32(REG_WUC, 0);
                 self.mmio.write32(REG_WUFC, 0);
                 self.mmio.write32(REG_RCTL, RCTL_SUSPEND_OFF);
-                self.mmio.write32(REG_TCTL, TCTL_SUSPEND_OFF);
                 Self::phy_write(&self.mmio, PHY_BMCR, PHY_BMCR_PWRDOWN);
             }
         }
@@ -2038,11 +2040,14 @@ impl Igb {
         Ok(())
     }
 
-    /// Device half of detach: mask interrupts, disable the queue-0
-    /// DMA engines, clear any WoL arming, drop the ISR's MMIO base so
-    /// a late interrupt cannot read a torn device, and set the
-    /// detached gate. The registry half lives in [`igb_detach`].
+    /// Device half of detach: set the datapath gate and drop the
+    /// ISR's MMIO base first (so no new datapath work or late
+    /// interrupt can race the teardown), then mask interrupts, stop
+    /// the TX/RX units, disable the queue-0 DMA engines, and clear
+    /// any WoL arming. The registry half lives in [`igb_detach`].
     fn detach_device(&self) {
+        self.detached.store(true, Ordering::Release);
+        ISR_MMIO_BASE.store(0, Ordering::Release);
         let q0 = queue_regs(0);
         // SAFETY: mapped MMIO.
         unsafe {
@@ -2050,11 +2055,11 @@ impl Igb {
             self.mmio.write32(REG_EIMC, !0u32);
             self.mmio.write32(q0.txdctl, 0);
             self.mmio.write32(q0.rxdctl, 0);
+            self.mmio.write32(REG_RCTL, RCTL_SUSPEND_OFF);
+            self.mmio.write32(REG_TCTL, TCTL_SUSPEND_OFF);
             self.mmio.write32(REG_WUC, 0);
             self.mmio.write32(REG_WUFC, 0);
         }
-        ISR_MMIO_BASE.store(0, Ordering::Release);
-        self.detached.store(true, Ordering::Release);
     }
 
     pub fn link_up(&self) -> bool {
