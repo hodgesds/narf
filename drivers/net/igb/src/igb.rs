@@ -532,6 +532,141 @@ pub fn rss_queue_for_hash(hash: u32, reta: &[u8; RETA_SIZE]) -> u8 {
     reta[(hash & 0x7F) as usize]
 }
 
+// ── VLAN filtering and insertion ────────────────────────────────────
+//
+// Linux `igb_vlan_rx_add_vid` / `igb_restore_vlan` (igb_main.c) and
+// the TX context-descriptor VLAN field (`IGB_TX_FLAGS_VLAN_MASK` /
+// `IGB_TX_FLAGS_VLAN_SHIFT` in igb.h: the tag rides in bits[31:16]
+// of the context descriptor's `vlan_macip_lens`). RX filtering is a
+// 4096-bit table (VFTA, 128 words at 0x5600): VID `v` sets word
+// `v / 32`, bit `v % 32`. Linux always restores VID 0 (priority-tagged
+// frames share the untagged path); the shadow here starts empty and
+// `restore_default` adds VID 0, mirroring that restore step. The live
+// device programs no VFTA word at bring-up — filtering is opt-in
+// through [`Igb::vlan_filter_add`], so the single-queue QEMU path
+// keeps its current accept-all behaviour until a caller opts in.
+
+/// VET — VLAN Ether Type. Linux programs 0x8100 ("enable h/w to
+/// recognize an 802.1Q VLAN Ethernet packet").
+const REG_VET: u64 = 0x038;
+/// VET value for 802.1Q.
+const VET_8021Q: u32 = 0x8100;
+/// VFTA base — VLAN Filter Table Array, 128 words.
+const REG_VFTA_BASE: u64 = 0x5600;
+/// VFTA words (4096 VIDs / 32 bits).
+pub const VFTA_WORDS: usize = 128;
+/// Maximum valid VID (12-bit field).
+pub const VLAN_VID_MAX: u16 = 4095;
+/// RX descriptor status bit: IEEE VLAN packet (Linux E1000_RXD_STAT_VP).
+pub const ADV_RXD_STAT_VP: u32 = 1 << 3;
+/// TX context-descriptor VLAN tag shift/mask (Linux IGB_TX_FLAGS_*).
+pub const TX_CTXT_VLAN_SHIFT: u32 = 16;
+pub const TX_CTXT_VLAN_MASK: u32 = 0xFFFF_0000;
+
+/// VFTA word index for a VID.
+pub const fn vfta_word(vid: u16) -> usize {
+    (vid as usize) / 32
+}
+
+/// VFTA bit within its word for a VID.
+pub const fn vfta_bit(vid: u16) -> u32 {
+    (vid as usize % 32) as u32
+}
+
+/// Shadow of the hardware VFTA plus the opt-in filter state. A VID is
+/// accepted by the filter iff its bit is set; VID 0 is special (see
+/// [`VlanFilter::restore_default`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VlanFilter {
+    words: [u32; VFTA_WORDS],
+}
+
+impl VlanFilter {
+    /// Empty filter: no tagged VID accepted.
+    pub const fn new() -> Self {
+        Self {
+            words: [0; VFTA_WORDS],
+        }
+    }
+
+    /// Linux restore default: VID 0 is always present.
+    pub fn restore_default(&mut self) {
+        self.add(0);
+    }
+
+    /// Add a VID. Returns false (and changes nothing) for VID > 4095.
+    pub fn add(&mut self, vid: u16) -> bool {
+        if vid > VLAN_VID_MAX {
+            return false;
+        }
+        self.words[vfta_word(vid)] |= 1 << vfta_bit(vid);
+        true
+    }
+
+    /// Remove a VID. Returns false for VID > 4095.
+    pub fn remove(&mut self, vid: u16) -> bool {
+        if vid > VLAN_VID_MAX {
+            return false;
+        }
+        self.words[vfta_word(vid)] &= !(1 << vfta_bit(vid));
+        true
+    }
+
+    /// Whether a VID is in the filter (false for VID > 4095).
+    pub fn contains(&self, vid: u16) -> bool {
+        if vid > VLAN_VID_MAX {
+            return false;
+        }
+        self.words[vfta_word(vid)] & (1 << vfta_bit(vid)) != 0
+    }
+
+    /// Accept every VID (VLAN promiscuous, Linux `IGB_FLAG_VLAN_PROMISC`
+    /// set-VFTA step).
+    pub fn set_promiscuous(&mut self) {
+        self.words = [!0u32; VFTA_WORDS];
+    }
+
+    /// Shadow word `i` — the value programmed to VFTA register `i`.
+    pub const fn word(&self, i: usize) -> u32 {
+        self.words[i]
+    }
+}
+
+impl Default for VlanFilter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// VLAN tag decoded from an RX write-back descriptor: present iff the
+/// VP status bit is set, in which case `tag` is the descriptor's
+/// `vlan` field (12-bit VID + PCP + CFI, as received on the wire).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RxVlan {
+    pub present: bool,
+    pub tag: u16,
+}
+
+/// Strip an 802.1Q tag from an Ethernet frame in place: with a tag the
+/// frame is `dst(6) src(6) TPID(2) TCI(2) ethertype(2) payload`, and
+/// stripping deletes the 4 TPID/TCI bytes, returning the new length.
+/// Returns `None` (frame untouched) when the frame is too short or
+/// carries no 0x8100 TPID at bytes 12..14. This is the software half
+/// of VLAN stripping; the hardware half is the VFTA filter above plus
+/// the caller's decision to strip before handing the frame to the
+/// stack (the live drain currently passes tag bytes through, as
+/// before — stripping is opt-in, not a silent frame rewrite).
+pub fn strip_vlan_tag_in_place(frame: &mut [u8], len: usize) -> Option<usize> {
+    if len < 18 || len > frame.len() {
+        return None;
+    }
+    if frame[12] != 0x81 || frame[13] != 0x00 {
+        return None;
+    }
+    frame.copy_within(16..len, 12);
+    Some(len - 4)
+}
+
 // CTRL bits.
 const CTRL_RST: u32 = 1 << 26;
 const CTRL_SLU: u32 = 1 << 6;
@@ -798,12 +933,21 @@ struct TxTicket {
 
 /// Producer/consumer bookkeeping for the queue-0 TX ring. One descriptor is
 /// left unused so equal head/tail values remain unambiguous to the hardware.
+/// A VLAN-insertion frame occupies two slots — a context descriptor
+/// immediately followed by its data descriptor — tracked via
+/// `is_context`: context descriptors carry no buffer and no waiter, so
+/// reclaim completes one only once its following data descriptor shows
+/// DD (the chip fetches descriptors in ring order, so data DD implies
+/// the context was consumed; completing it any earlier could let a
+/// wrap-around reservation overwrite a context the chip has not
+/// fetched yet).
 #[derive(Debug)]
 struct TxRingCursor {
     next_to_use: usize,
     next_to_clean: usize,
     in_flight: usize,
     generations: [u64; TX_RING_LEN],
+    is_context: [bool; TX_RING_LEN],
 }
 
 impl TxRingCursor {
@@ -813,6 +957,7 @@ impl TxRingCursor {
             next_to_clean: 0,
             in_flight: 0,
             generations: [0; TX_RING_LEN],
+            is_context: [false; TX_RING_LEN],
         }
     }
 
@@ -824,14 +969,50 @@ impl TxRingCursor {
         self.next_to_use = (slot + 1) % TX_RING_LEN;
         self.in_flight += 1;
         self.generations[slot] = self.generations[slot].wrapping_add(1);
+        self.is_context[slot] = false;
         Some(TxTicket {
             slot,
             generation: self.generations[slot],
         })
     }
 
+    /// Reserve a (context, data) slot pair for one VLAN-insertion
+    /// frame. Both slots count against the usable capacity, and the
+    /// pair may wrap across the ring end (context in the last slot,
+    /// data in slot 0).
+    fn reserve_pair(&mut self) -> Option<(TxTicket, TxTicket)> {
+        if self.in_flight + 2 > TX_RING_USABLE {
+            return None;
+        }
+        let ctx_slot = self.next_to_use;
+        let data_slot = (ctx_slot + 1) % TX_RING_LEN;
+        self.next_to_use = (data_slot + 1) % TX_RING_LEN;
+        self.in_flight += 2;
+        self.generations[ctx_slot] = self.generations[ctx_slot].wrapping_add(1);
+        self.generations[data_slot] = self.generations[data_slot].wrapping_add(1);
+        self.is_context[ctx_slot] = true;
+        self.is_context[data_slot] = false;
+        Some((
+            TxTicket {
+                slot: ctx_slot,
+                generation: self.generations[ctx_slot],
+            },
+            TxTicket {
+                slot: data_slot,
+                generation: self.generations[data_slot],
+            },
+        ))
+    }
+
+    /// Slot following the oldest outstanding descriptor — the data
+    /// descriptor of a context slot at the clean head.
+    fn following_slot(&self) -> usize {
+        (self.next_to_clean + 1) % TX_RING_LEN
+    }
+
     fn complete_oldest(&mut self) {
         debug_assert!(self.in_flight != 0);
+        self.is_context[self.next_to_clean] = false;
         self.next_to_clean = (self.next_to_clean + 1) % TX_RING_LEN;
         self.in_flight -= 1;
     }
@@ -853,6 +1034,18 @@ impl AdvRxDescWb {
         self.lower as u32
     }
 
+    /// VLAN tag for this frame: present iff the VP status bit is set,
+    /// with the tag taken from the descriptor's `vlan` field. When VP
+    /// is clear the `vlan` field is meaningless and `present` is
+    /// false, even if the field happens to be non-zero.
+    #[allow(dead_code)]
+    pub fn rx_vlan(&self) -> RxVlan {
+        RxVlan {
+            present: self.status_error & ADV_RXD_STAT_VP != 0,
+            tag: self.vlan,
+        }
+    }
+
     /// Decode the RX checksum result from `status_error`.
     #[allow(dead_code)]
     pub fn csum_result(&self) -> RxCsumResult {
@@ -872,6 +1065,21 @@ impl AdvRxDescWb {
 }
 
 impl AdvTxCtxtDesc {
+    /// Build a VLAN-insertion context descriptor: the tag rides in
+    /// bits[31:16] of `vlan_macip_lens` (Linux `IGB_TX_FLAGS_VLAN_MASK`
+    /// / `IGB_TX_FLAGS_VLAN_SHIFT`). The following data descriptor is
+    /// an ordinary data descriptor; the chip inserts the tag on the
+    /// wire. A combined TSO+VLAN descriptor ORs the tag into
+    /// [`AdvTxCtxtDesc::new_tso_v4`]'s `vlan_macip_lens`.
+    pub fn new_vlan(tag: u16) -> Self {
+        AdvTxCtxtDesc {
+            vlan_macip_lens: ((tag as u32) << TX_CTXT_VLAN_SHIFT) & TX_CTXT_VLAN_MASK,
+            launch_time: 0,
+            type_tucmd_mlhl: ADVTXD_DCMD_DEXT | ADVTXD_DTYP_CTXT,
+            mss_l4len_idx: 0,
+        }
+    }
+
     /// Build a TSO context descriptor for an IPv4/TCP frame.
     pub fn new_tso_v4(mac_len: u8, ip_len: u8, l4_len: u8, mss: u16) -> Self {
         let vlan_macip_lens = (ip_len as u32) | ((mac_len as u32) << ADVTXD_MACLEN_SHIFT);
@@ -954,6 +1162,9 @@ pub struct Igb {
     /// a buffer still owned by the device.
     tx_buf_pool: alloc::vec::Vec<DmaBuffer>,
     tx_state: IrqSafeSpinLock<TxRingCursor>,
+    /// Opt-in VLAN filter shadow; no VFTA word is programmed at
+    /// bring-up (see [`VlanFilter`]).
+    vlan_filter: IrqSafeSpinLock<VlanFilter>,
     rx_head: IrqSafeSpinLock<u16>,
     /// Reject nested/concurrent drains while an RX callback owns the current
     /// descriptor. A callback may synchronously transmit, whose responsive
@@ -1157,6 +1368,13 @@ impl Igb {
                 REG_RCTL,
                 RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE | RCTL_SECRC | RCTL_BSIZE_2K,
             );
+
+            // VET — tell the hardware 0x8100 is the VLAN EtherType so
+            // tagged frames are recognised for VFTA filtering and the
+            // RX descriptor VP bit. This matches Linux's configure
+            // step and QEMU's default; it changes no acceptance
+            // behaviour while the VFTA shadow stays unprogrammed.
+            mmio.write32(REG_VET, VET_8021Q);
         }
         // igb per-queue enable: set RXDCTL.ENABLE then spin until the
         // chip reflects it. Linux `igb_configure_rx_ring`.
@@ -1225,6 +1443,7 @@ impl Igb {
             rx_buf_pool: IrqSafeSpinLock::new(rx_buf_pool),
             tx_buf_pool,
             tx_state: IrqSafeSpinLock::new(TxRingCursor::new()),
+            vlan_filter: IrqSafeSpinLock::new(VlanFilter::new()),
             rx_head: IrqSafeSpinLock::new(0),
             rx_draining: AtomicBool::new(false),
             ready: true,
@@ -1286,6 +1505,45 @@ impl Igb {
         self.mac
     }
 
+    /// Opt a VID into the hardware VLAN filter: update the shadow and
+    /// program that one VFTA word (Linux `igb_vlan_rx_add_vid` writes
+    /// the shadow word to the device). Returns false for VID > 4095.
+    /// The caller owns the policy question of whether enabling any
+    /// filter also needs VID 0 restored (see
+    /// [`VlanFilter::restore_default`]).
+    pub fn vlan_filter_add(&self, vid: u16) -> bool {
+        let mut filter = self.vlan_filter.lock();
+        if !filter.add(vid) {
+            return false;
+        }
+        let word = vfta_word(vid);
+        let value = filter.word(word);
+        drop(filter);
+        // SAFETY: mapped MMIO; VFTA word `word` is within the 128-word
+        // table for any valid VID.
+        unsafe {
+            self.mmio.write32(REG_VFTA_BASE + word as u64 * 4, value);
+        }
+        true
+    }
+
+    /// Remove a VID from the hardware VLAN filter (shadow + the one
+    /// VFTA word). Returns false for VID > 4095.
+    pub fn vlan_filter_remove(&self, vid: u16) -> bool {
+        let mut filter = self.vlan_filter.lock();
+        if !filter.remove(vid) {
+            return false;
+        }
+        let word = vfta_word(vid);
+        let value = filter.word(word);
+        drop(filter);
+        // SAFETY: mapped MMIO; see `vlan_filter_add`.
+        unsafe {
+            self.mmio.write32(REG_VFTA_BASE + word as u64 * 4, value);
+        }
+        true
+    }
+
     pub fn link_up(&self) -> bool {
         // SAFETY: mapped MMIO; STATUS bit 1 = LU (link up).
         let s = unsafe { self.mmio.read32(REG_STATUS) };
@@ -1302,7 +1560,17 @@ impl Igb {
     }
 
     fn reclaim_tx_locked(&self, state: &mut TxRingCursor) {
-        while state.in_flight != 0 && self.tx_desc_done(state.next_to_clean) {
+        while state.in_flight != 0 {
+            // A context descriptor at the clean head has no DD of its
+            // own: it completes only once its following data descriptor
+            // shows DD (in-order fetch makes that a sound proxy).
+            if state.is_context[state.next_to_clean] {
+                if !self.tx_desc_done(state.following_slot()) {
+                    break;
+                }
+            } else if !self.tx_desc_done(state.next_to_clean) {
+                break;
+            }
             // Pair the device's DD write with subsequent slot/buffer reuse.
             compiler_fence(Ordering::SeqCst);
             state.complete_oldest();
@@ -1320,6 +1588,40 @@ impl Igb {
             core::ptr::write_volatile(
                 self.tx_ring_buf.cpu_mut_ptr_at::<AdvTxDataDesc>(desc_off),
                 descriptor,
+            );
+        }
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: mapped MMIO; every preceding descriptor through
+        // `next_to_use` was posted while holding the same `tx_state` lock.
+        unsafe {
+            self.mmio.write32(REG_TDT, state.next_to_use as u32);
+        }
+    }
+
+    /// Post a VLAN-insertion pair: context descriptor first, data
+    /// descriptor second, then a single TDT doorbell past both. The
+    /// context slot uses no TX buffer (its slot's persistent buffer
+    /// stays untouched for the data descriptor's own slot).
+    fn post_tx_pair_locked(
+        &self,
+        state: &TxRingCursor,
+        ctx_ticket: TxTicket,
+        ctx: AdvTxCtxtDesc,
+        data_ticket: TxTicket,
+        data: AdvTxDataDesc,
+    ) {
+        let ctx_off = (ctx_ticket.slot * core::mem::size_of::<AdvTxCtxtDesc>()) as u64;
+        let data_off = (data_ticket.slot * core::mem::size_of::<AdvTxDataDesc>()) as u64;
+        // SAFETY: both tickets were reserved from this ring under
+        // `tx_state`; context and data descriptors are both 16 bytes.
+        unsafe {
+            core::ptr::write_volatile(
+                self.tx_ring_buf.cpu_mut_ptr_at::<AdvTxCtxtDesc>(ctx_off),
+                ctx,
+            );
+            core::ptr::write_volatile(
+                self.tx_ring_buf.cpu_mut_ptr_at::<AdvTxDataDesc>(data_off),
+                data,
             );
         }
         compiler_fence(Ordering::SeqCst);
@@ -1355,7 +1657,10 @@ impl Igb {
         if frame.is_empty() || frame.len() > FRAME_SIZE {
             return Err(IgbError::QueueTooSmall);
         }
-        if meta.csum_l4.is_some() || meta.tso_mss.is_some() || meta.vlan_tag.is_some() {
+        if let Some(tag) = meta.vlan_tag {
+            return self.tx_vlan(frame, tag);
+        }
+        if meta.csum_l4.is_some() || meta.tso_mss.is_some() {
             return Err(IgbError::UnsupportedOffload);
         }
         let mut ticket = None;
@@ -1385,6 +1690,52 @@ impl Igb {
             return Err(IgbError::TxTimeout);
         }
         self.wait_for_tx(ticket.ok_or(IgbError::Other("TX reservation lost"))?)
+    }
+
+    /// Transmit a single Ethernet frame with VLAN insertion: a context
+    /// descriptor carrying the tag precedes the ordinary data
+    /// descriptor, and completion waits on the data descriptor's DD
+    /// (which also releases the context slot through reclaim). The
+    /// plain path is untouched — only a frame that actually requests a
+    /// tag takes the two-slot path.
+    fn tx_vlan(&self, frame: &[u8], tag: u16) -> Result<(), IgbError> {
+        if frame.is_empty() || frame.len() > FRAME_SIZE {
+            return Err(IgbError::QueueTooSmall);
+        }
+        let mut data_ticket = None;
+        let posted = narf_scheduler::responsive_spin_until(
+            || {
+                let mut state = self.tx_state.lock();
+                self.reclaim_tx_locked(&mut state);
+                let Some((ctx_ticket, data)) = state.reserve_pair() else {
+                    return false;
+                };
+                let buffer = &self.tx_buf_pool[data.slot];
+                // SAFETY: one persistent FRAME_SIZE allocation backs this
+                // reserved data slot and cannot be reused until DD
+                // completion; the context slot has no buffer.
+                unsafe {
+                    for (i, byte) in frame.iter().enumerate() {
+                        core::ptr::write_volatile(buffer.cpu_mut_ptr_at::<u8>(i as u64), *byte);
+                    }
+                }
+                let descriptor = Self::tx_descriptor(buffer.dma_addr().raw(), frame.len());
+                self.post_tx_pair_locked(
+                    &state,
+                    ctx_ticket,
+                    AdvTxCtxtDesc::new_vlan(tag),
+                    data,
+                    descriptor,
+                );
+                data_ticket = Some(data);
+                true
+            },
+            narf_time::Deadline::after_ms(250),
+        );
+        if !posted {
+            return Err(IgbError::TxTimeout);
+        }
+        self.wait_for_tx(data_ticket.ok_or(IgbError::Other("TX VLAN reservation lost"))?)
     }
 
     /// Frame compatibility wrapper. Copying into the descriptor's persistent
@@ -1918,18 +2269,20 @@ mod tests {
         ivar_scheme_for_device, ivar_tx, max_queues_for_device, mrqc_word, previous_rx_slot,
         queue_disable_word, queue_enable_reflected, queue_enable_word, queue_pairs, queue_regs,
         reta_entry, reta_reg, reta_shift, reta_table, reta_word, rss_key_word, rss_queue_for_hash,
-        rssrk_reg, rxcsum_rss_word, rxdctl_word, txdctl_word, AdvRxDescRead, AdvRxDescWb,
-        AdvTxDataDesc, IvarScheme, TxRingCursor, EITR_CNT_IGNR, EITR_START, IGB_82576,
-        IGB_82576_NS, IGB_I210_COPPER, IGB_I211_COPPER, IGB_I350_COPPER, IGB_MAX_QUEUES,
-        IGB_MAX_QUEUES_82575, IGB_MAX_QUEUES_I211, IVAR_VALID, MRQC_ENABLE_RSS_MQ,
-        MRQC_ENABLE_VMDQ, MRQC_ENABLE_VMDQ_RSS_MQ, MRQC_FIELD_IPV4, MRQC_FIELD_IPV4_TCP,
-        MRQC_FIELD_IPV4_UDP, MRQC_FIELD_IPV6, MRQC_FIELD_IPV6_TCP, MRQC_FIELD_IPV6_TCP_EX,
-        MRQC_FIELD_IPV6_UDP, QUEUE_ENABLE, REG_EIAC, REG_EIAM, REG_EIMC, REG_EIMS, REG_EITR0,
-        REG_ICR, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC, REG_MRQC, REG_RDBAH, REG_RDBAL,
-        REG_RDH, REG_RDLEN, REG_RDT, REG_RETA_BASE, REG_RSSRK_BASE, REG_RXCSUM, REG_RXDCTL0,
-        REG_SRRCTL_Q0, REG_TDBAH, REG_TDBAL, REG_TDH, REG_TDLEN, REG_TDT, REG_TXDCTL0, RETA_REGS,
-        RETA_SIZE, RSS_KEY_SIZE, RXCSUM_CRCOFL, RXCSUM_PCSD, RX_RING_LEN,
-        SRRCTL_DESCTYPE_ADV_ONEBUF, TX_RING_LEN, TX_RING_USABLE,
+        rssrk_reg, rxcsum_rss_word, rxdctl_word, strip_vlan_tag_in_place, txdctl_word, vfta_bit,
+        vfta_word, AdvRxDescRead, AdvRxDescWb, AdvTxCtxtDesc, AdvTxDataDesc, IvarScheme,
+        TxRingCursor, VlanFilter, ADVTXD_DCMD_DEXT, ADVTXD_DTYP_CTXT, ADV_RXD_STAT_VP,
+        EITR_CNT_IGNR, EITR_START, IGB_82576, IGB_82576_NS, IGB_I210_COPPER, IGB_I211_COPPER,
+        IGB_I350_COPPER, IGB_MAX_QUEUES, IGB_MAX_QUEUES_82575, IGB_MAX_QUEUES_I211, IVAR_VALID,
+        MRQC_ENABLE_RSS_MQ, MRQC_ENABLE_VMDQ, MRQC_ENABLE_VMDQ_RSS_MQ, MRQC_FIELD_IPV4,
+        MRQC_FIELD_IPV4_TCP, MRQC_FIELD_IPV4_UDP, MRQC_FIELD_IPV6, MRQC_FIELD_IPV6_TCP,
+        MRQC_FIELD_IPV6_TCP_EX, MRQC_FIELD_IPV6_UDP, QUEUE_ENABLE, REG_EIAC, REG_EIAM, REG_EIMC,
+        REG_EIMS, REG_EITR0, REG_ICR, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC, REG_MRQC,
+        REG_RDBAH, REG_RDBAL, REG_RDH, REG_RDLEN, REG_RDT, REG_RETA_BASE, REG_RSSRK_BASE,
+        REG_RXCSUM, REG_RXDCTL0, REG_SRRCTL_Q0, REG_TDBAH, REG_TDBAL, REG_TDH, REG_TDLEN, REG_TDT,
+        REG_TXDCTL0, REG_VET, REG_VFTA_BASE, RETA_REGS, RETA_SIZE, RSS_KEY_SIZE, RXCSUM_CRCOFL,
+        RXCSUM_PCSD, RX_RING_LEN, SRRCTL_DESCTYPE_ADV_ONEBUF, TX_CTXT_VLAN_MASK,
+        TX_CTXT_VLAN_SHIFT, TX_RING_LEN, TX_RING_USABLE, VET_8021Q, VFTA_WORDS,
     };
 
     fn smoke_igb_extended_interrupt_layout() -> TestResult {
@@ -2355,4 +2708,155 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/igb", smoke_igb_rss_mrqc_and_hash);
+
+    fn smoke_igb_vlan_filter_table() -> TestResult {
+        if REG_VET != 0x038 || VET_8021Q != 0x8100 || REG_VFTA_BASE != 0x5600 || VFTA_WORDS != 128 {
+            return TestResult::Fail("igb VET/VFTA register drift");
+        }
+        if vfta_word(0) != 0
+            || vfta_bit(0) != 0
+            || vfta_word(100) != 3
+            || vfta_bit(100) != 4
+            || vfta_word(4095) != 127
+            || vfta_bit(4095) != 31
+        {
+            return TestResult::Fail("igb VFTA word/bit math drift");
+        }
+        let mut filter = VlanFilter::new();
+        if filter.contains(100) {
+            return TestResult::Fail("igb empty VLAN filter accepts a VID");
+        }
+        if !filter.add(100) || !filter.contains(100) || filter.contains(101) {
+            return TestResult::Fail("igb VLAN filter add drift");
+        }
+        if filter.word(3) != 1 << 4 {
+            return TestResult::Fail("igb VLAN filter shadow word drift");
+        }
+        if !filter.remove(100) || filter.contains(100) || filter.word(3) != 0 {
+            return TestResult::Fail("igb VLAN filter remove drift");
+        }
+        // Out-of-range VIDs are rejected without touching the table.
+        if filter.add(4096) || filter.remove(4096) || filter.contains(4096) {
+            return TestResult::Fail("igb VLAN filter accepted an out-of-range VID");
+        }
+        // Linux restore default: VID 0 always present.
+        filter.restore_default();
+        if !filter.contains(0) || filter.word(0) != 1 {
+            return TestResult::Fail("igb VLAN restore-default drift");
+        }
+        filter.set_promiscuous();
+        if filter.word(0) != !0u32 || filter.word(127) != !0u32 || !filter.contains(4095) {
+            return TestResult::Fail("igb VLAN promiscuous shadow drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_vlan_filter_table);
+
+    fn smoke_igb_vlan_rx_decode_and_strip() -> TestResult {
+        // VP set: tag comes from the descriptor's vlan field.
+        let tagged = AdvRxDescWb {
+            lower: 0,
+            status_error: ADV_RXD_STAT_VP,
+            length: 64,
+            vlan: 0x1234,
+        };
+        let decoded = tagged.rx_vlan();
+        if !decoded.present || decoded.tag != 0x1234 {
+            return TestResult::Fail("igb RX VLAN decode drift");
+        }
+        // VP clear: a non-zero vlan field is meaningless, not a tag.
+        let untagged = AdvRxDescWb {
+            lower: 0,
+            status_error: 0x1,
+            length: 64,
+            vlan: 0x1234,
+        };
+        if untagged.rx_vlan().present {
+            return TestResult::Fail("igb RX VLAN decode reported a tag without VP");
+        }
+        // Strip: dst/src preserved, TPID+TCI deleted, ethertype moves.
+        let mut frame = [0u8; 64];
+        frame[0..6].copy_from_slice(&[0xAA; 6]);
+        frame[6..12].copy_from_slice(&[0xBB; 6]);
+        frame[12] = 0x81;
+        frame[13] = 0x00;
+        frame[14] = 0x00;
+        frame[15] = 0x64;
+        frame[16] = 0x08;
+        frame[17] = 0x00;
+        frame[18..22].copy_from_slice(&[0xCC; 4]);
+        let stripped = match strip_vlan_tag_in_place(&mut frame, 22) {
+            Some(len) => len,
+            None => return TestResult::Fail("igb VLAN strip rejected a tagged frame"),
+        };
+        if stripped != 18 || frame[12] != 0x08 || frame[13] != 0x00 || frame[14] != 0xCC {
+            return TestResult::Fail("igb VLAN strip rewrote the frame incorrectly");
+        }
+        // No TPID, no strip; short frame, no strip.
+        let mut plain = [0u8; 64];
+        plain[12] = 0x08;
+        plain[13] = 0x00;
+        if strip_vlan_tag_in_place(&mut plain, 22).is_some()
+            || strip_vlan_tag_in_place(&mut frame, 10).is_some()
+        {
+            return TestResult::Fail("igb VLAN strip fired on an untagged/short frame");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_vlan_rx_decode_and_strip);
+
+    fn smoke_igb_vlan_tx_context_and_pair() -> TestResult {
+        // Context descriptor: tag in bits[31:16], DEXT+CTXT type.
+        let ctx = AdvTxCtxtDesc::new_vlan(100);
+        if ctx.vlan_macip_lens != (100u32 << TX_CTXT_VLAN_SHIFT)
+            || ctx.vlan_macip_lens & !TX_CTXT_VLAN_MASK != 0
+            || ctx.type_tucmd_mlhl != ADVTXD_DCMD_DEXT | ADVTXD_DTYP_CTXT
+        {
+            return TestResult::Fail("igb TX VLAN context descriptor drift");
+        }
+        // Pair reservation: a full-ish ring refuses the pair, and a
+        // pair allocated across the ring end wraps (context last,
+        // data first) with the context flag only on the first slot.
+        let mut cursor = TxRingCursor::new();
+        for _ in 0..6 {
+            if cursor.reserve().is_none() {
+                return TestResult::Fail("igb TX cursor fill failed in VLAN pair test");
+            }
+        }
+        if cursor.reserve_pair().is_some() {
+            return TestResult::Fail("igb TX pair over-committed a full ring");
+        }
+        cursor.complete_oldest();
+        let (ctx_ticket, data_ticket) = match cursor.reserve_pair() {
+            Some(pair) => pair,
+            None => return TestResult::Fail("igb TX pair reservation failed"),
+        };
+        if ctx_ticket.slot != 6
+            || data_ticket.slot != 7
+            || !cursor.is_context[6]
+            || cursor.is_context[7]
+        {
+            return TestResult::Fail("igb TX pair slot/context-flag drift");
+        }
+        for _ in 0..5 {
+            cursor.complete_oldest();
+        }
+        if cursor.next_to_clean != 6 || cursor.following_slot() != 7 {
+            return TestResult::Fail("igb TX pair clean-head/following-slot drift");
+        }
+        cursor.complete_oldest();
+        if cursor.is_context[6] || cursor.next_to_clean != 7 || cursor.in_flight != 1 {
+            return TestResult::Fail("igb TX context completion drift");
+        }
+        // Slot 0 re-reserves with a bumped generation.
+        let first = match cursor.reserve() {
+            Some(ticket) => ticket,
+            None => return TestResult::Fail("igb TX wrap reservation failed"),
+        };
+        if first.slot != 0 || first.generation != 2 {
+            return TestResult::Fail("igb TX wrap generation drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_vlan_tx_context_and_pair);
 }
