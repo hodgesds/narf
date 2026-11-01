@@ -27,6 +27,9 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+mod message_buffer;
+use message_buffer::MessageBuffer;
+
 use narf_memory::{AddressSpace, HugeRegion, Region, RegionPerms, VirtAddr};
 
 use crate::{

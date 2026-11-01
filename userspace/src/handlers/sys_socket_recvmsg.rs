@@ -51,14 +51,19 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EMSGSIZE));
         return;
     }
-    let mut iovs = alloc::vec![0u8; iov_len * 16];
+    let mut iovs = match MessageBuffer::<{ 8 * 16 }>::try_new(iov_len * 16) {
+        Ok(buffer) => buffer,
+        Err(_) => {
+            ctx.set_return(errno_ret(ENOMEM));
+            return;
+        }
+    };
     // SAFETY: copy_from_user range-validates the iovec array (a NULL
     // `msg_iov` with a non-zero `msg_iovlen` included).
     if iov_len != 0 && unsafe { copy_from_user(&mut iovs, iov_ptr) }.is_err() {
         ctx.set_return(errno_ret(EFAULT));
         return;
     }
-    let mut segs: alloc::vec::Vec<(u64, usize)> = alloc::vec::Vec::with_capacity(iov_len);
     let mut total_cap = 0usize;
     for chunk in iovs.chunks_exact(16) {
         let base = u64::from_ne_bytes(chunk[0..8].try_into().unwrap());
@@ -73,12 +78,17 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
             return;
         }
         total_cap += len;
-        segs.push((base, len));
     }
     const MSG_DONTWAIT: u32 = 0x40;
     let nonblock = (flags & (MSG_DONTWAIT | crate::socket::MSG_ERRQUEUE)) != 0
         || socket_listener_nonblock(current_task_id(), fd, sock.as_ref());
-    let mut staging = alloc::vec![0u8; total_cap];
+    let mut staging = match MessageBuffer::<128>::try_new(total_cap) {
+        Ok(buffer) => buffer,
+        Err(_) => {
+            ctx.set_return(errno_ret(ENOMEM));
+            return;
+        }
+    };
     let result = sock.dispatch_op(crate::socket::SocketOp::Recv {
         buf: &mut staging,
         flags,
@@ -114,10 +124,14 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
             };
             // Scatter into iovec destinations under SMAP bracket.
             let mut copied = 0;
-            for &(p, l) in &segs {
+            // All descriptors were validated before dequeue. Scatter from
+            // that same frozen array without a second parsed-vector allocation.
+            for chunk in iovs.chunks_exact(16) {
                 if copied >= n {
                     break;
                 }
+                let p = u64::from_ne_bytes(chunk[..8].try_into().unwrap());
+                let l = u64::from_ne_bytes(chunk[8..].try_into().unwrap()) as usize;
                 let take = core::cmp::min(l, n - copied);
                 // SAFETY: p is a user VA; SMAP bracket inside copy_to_user.
                 if unsafe { copy_to_user(p, &staging[copied..copied + take]) }.is_err() {

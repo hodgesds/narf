@@ -9966,6 +9966,10 @@ impl Drop for SocketFile {
 #[derive(Debug)]
 pub struct RingBuf {
     inner: IrqSafeSpinLock<RingInner>,
+    /// Serialize the state sample through its readiness publication. Mutators
+    /// release `inner` before taking this lock; publishers take it before
+    /// sampling `inner`, so an older sample cannot overwrite a newer level.
+    publish: IrqSafeSpinLock<()>,
     closed: AtomicBool,
     /// The reading endpoint closed with data still queued: its writer's
     /// `sk_err` is ECONNRESET until consumed (see
@@ -10120,6 +10124,7 @@ impl core::fmt::Debug for RingInner {
 impl RingBuf {
     fn new() -> Self {
         Self {
+            publish: IrqSafeSpinLock::new(()),
             inner: IrqSafeSpinLock::new(RingInner {
                 buf: VecDeque::new(),
                 packets: VecDeque::new(),
@@ -10185,6 +10190,7 @@ impl RingBuf {
     /// Called after every write/read/close that changes occupancy; kept
     /// alongside the legacy edge tokens + `wake_reader` during the migration.
     fn sync_readiness(&self, event: u32) {
+        let publish = self.publish.lock();
         let closed = self.closed.load(Ordering::Acquire);
         let (data, space) = {
             let g = self.inner.lock();
@@ -10203,14 +10209,20 @@ impl RingBuf {
             narf_filesystem::POLL_IN
         }) | (if space { 0 } else { narf_filesystem::POLL_OUT })
             | (if closed { 0 } else { narf_filesystem::POLL_HUP });
-        self.readiness.set(add, clear);
         // Linux wait-queue wakeup: fire the waiters interested in the DIRECTION
         // that just saw activity even when the level did not change (a
         // follow-up write on an already-readable ring, a read that frees space
         // while POLL_OUT was already set) — so an epoll ready-list edge is
         // produced on every event, not just a rising level edge. This is the
         // job the per-ring readable/writable edge tokens used to do.
-        self.readiness.notify(event & !clear);
+        if closed {
+            // Every blocked reader/writer must observe EOF/EPIPE, even if no
+            // remaining data operation can relay the wake to another waiter.
+            self.readiness.set_wake_all(add, clear);
+        } else {
+            self.readiness.set_event(add, clear, event);
+        }
+        drop(publish);
     }
 
     /// The durable readiness cell shared by both endpoints of this ring. The
@@ -11622,6 +11634,115 @@ fn counting_waker(counter: &alloc::sync::Arc<core::sync::atomic::AtomicU32>) -> 
     // SAFETY: `raw` + VTABLE form a valid RawWaker per the fns above.
     unsafe { Waker::from_raw(RawWaker::new(raw, &VTABLE)) }
 }
+
+/// A rising level and the write event are one operation, so they must not
+/// select two exclusive readers or notify a persistent observer twice.
+fn smoke_unix_stream_write_selects_one_exclusive_reader() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    let ring = RingBuf::new();
+    let first = Arc::new(AtomicU32::new(0));
+    let second = Arc::new(AtomicU32::new(0));
+    let observer = Arc::new(AtomicU32::new(0));
+    for (id, wakes) in [(1, &first), (2, &second)] {
+        if ring
+            .readiness()
+            .arm_exclusive(id, narf_filesystem::POLL_IN, &counting_waker(wakes))
+            .is_ready()
+        {
+            return TestResult::Fail("empty ring was readable");
+        }
+    }
+    let _ =
+        ring.readiness()
+            .arm_persistent(3, narf_filesystem::POLL_IN, &counting_waker(&observer));
+    if ring.write_stream_with_fds(b"x", Vec::new(), None) != Ok(1) {
+        return TestResult::Fail("stream write failed");
+    }
+    if first.load(Ordering::Relaxed) != 1
+        || second.load(Ordering::Relaxed) != 0
+        || observer.load(Ordering::Relaxed) != 1
+    {
+        return TestResult::Fail("one write performed more than one readiness wake");
+    }
+    if ring.write_stream_with_fds(b"y", Vec::new(), None) != Ok(1)
+        || second.load(Ordering::Relaxed) != 1
+        || observer.load(Ordering::Relaxed) != 2
+    {
+        return TestResult::Fail("same-level write lost its readiness event");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_unix_stream_write_selects_one_exclusive_reader
+);
+
+fn smoke_unix_stream_blocking_wakes_preserve_observers_and_close() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    let rx = Arc::new(RingBuf::new());
+    let socket = SocketFile::new(AF_UNIX, SOCK_STREAM);
+    *socket.state.lock() = SocketState::UnixConnected {
+        tx: Arc::new(RingBuf::new()),
+        rx: rx.clone(),
+        local_addr: None,
+    };
+    let counts = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+    let counts = counts.map(Arc::new);
+    let observer = Arc::new(AtomicU32::new(0));
+    for (i, count) in counts.iter().enumerate() {
+        if socket.arm_readiness_exclusive(
+            0x5c6e_1000 + i as u64,
+            narf_filesystem::POLL_IN,
+            &counting_waker(count),
+        ) != Some(core::task::Poll::Pending)
+        {
+            return TestResult::Fail("empty stream did not queue a blocked reader");
+        }
+    }
+    let _ = socket.arm_readiness_persistent(
+        0x5c6e_2000,
+        narf_filesystem::POLL_IN,
+        &counting_waker(&observer),
+    );
+    if rx.write_stream_with_fds(b"abc", Vec::new(), None) != Ok(3) {
+        return TestResult::Fail("blocked-reader write failed");
+    }
+    for i in 0..3 {
+        if counts.iter().any(|c| c.load(Ordering::Relaxed) != 1)
+            || observer.load(Ordering::Relaxed) != 1
+        {
+            return TestResult::Fail("stream changed wake-all delivery or duplicated a poll edge");
+        }
+        socket.disarm_readiness(0x5c6e_1000 + i as u64);
+        let mut byte = [0];
+        if rx.read(&mut byte, false) != 1 || byte[0] != b'a' + i as u8 {
+            return TestResult::Fail("blocked readers changed the stream bytes");
+        }
+    }
+    for (i, count) in counts.iter().enumerate() {
+        if socket.arm_readiness_exclusive(
+            0x5c6e_1000 + i as u64,
+            narf_filesystem::POLL_IN,
+            &counting_waker(count),
+        ) != Some(core::task::Poll::Pending)
+        {
+            return TestResult::Fail("drained stream did not requeue a blocked reader");
+        }
+    }
+    rx.close();
+    if counts.iter().any(|c| c.load(Ordering::Relaxed) != 2)
+        || observer.load(Ordering::Relaxed) != 2
+    {
+        return TestResult::Fail("terminal stream close stranded a waiter");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_unix_stream_blocking_wakes_preserve_observers_and_close
+);
 
 /// Ancillary sends use the same targeted legacy wake as plain sends. Durable
 /// observers still wake even when they are not the ring's remembered reader;

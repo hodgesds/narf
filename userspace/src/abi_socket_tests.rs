@@ -2650,6 +2650,136 @@ kernel_test_in!(
     smoke_abi_socket_sendmsg_exact_validation
 );
 
+/// Exercise both inline scratch and heap fallbacks while preserving scatter
+/// order, all descriptor imports before I/O, and SCM_RIGHTS identity/flags.
+fn smoke_abi_socket_message_scratch_boundaries() -> TestResult {
+    use alloc::sync::Arc;
+
+    with_setup(|| {
+        let passed = call(
+            Syscall::SocketOpen.raw(),
+            a2(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0),
+        )
+        .filter(|fd| *fd >= 0)
+        .ok_or("passed socket setup failed")? as u32;
+        for (iov_count, payload_len, rights_count) in [
+            (1usize, 1usize, 1usize),
+            (8, 128, 1),
+            (9, 129, 3),
+            (9, 129, 17),
+        ] {
+            let (tx, rx) = open_unix_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+            let mut input = [0u8; 129];
+            for (i, byte) in input.iter_mut().enumerate() {
+                *byte = (i as u8).wrapping_mul(37);
+            }
+            let mut iov = [0u8; 9 * 16];
+            let mut offset = 0;
+            for i in 0..iov_count {
+                let len = if i + 1 == iov_count {
+                    payload_len - offset
+                } else {
+                    payload_len / iov_count
+                };
+                iov[i * 16..i * 16 + 8]
+                    .copy_from_slice(&(input[offset..].as_ptr() as u64).to_ne_bytes());
+                iov[i * 16 + 8..i * 16 + 16].copy_from_slice(&(len as u64).to_ne_bytes());
+                offset += len;
+            }
+            let mut control = [0u8; 17 * 24];
+            for i in 0..rights_count {
+                let start = i * 24;
+                control[start..start + 8].copy_from_slice(&20u64.to_ne_bytes());
+                control[start + 8..start + 12].copy_from_slice(&1i32.to_ne_bytes());
+                control[start + 12..start + 16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+                control[start + 16..start + 20].copy_from_slice(&passed.to_ne_bytes());
+            }
+            let mut msg = [0u8; 56];
+            msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+            msg[24..32].copy_from_slice(&(iov_count as u64).to_ne_bytes());
+            msg[32..40].copy_from_slice(&(control.as_ptr() as u64).to_ne_bytes());
+            msg[40..48].copy_from_slice(&((rights_count * 24) as u64).to_ne_bytes());
+            let mut output = [0u8; 129];
+            if iov_count == 9 {
+                let saved: [u8; 8] = iov[8 * 16..8 * 16 + 8].try_into().unwrap();
+                iov[8 * 16..8 * 16 + 8].copy_from_slice(&BAD_USER_PTR.to_ne_bytes());
+                let result = call(Syscall::SocketSendMsg.raw(), a2(tx, msg.as_ptr() as u64, 0));
+                iov[8 * 16..8 * 16 + 8].copy_from_slice(&saved);
+                if result != Some(EFAULT)
+                    || call(
+                        Syscall::SocketRecv.raw(),
+                        a3(rx, output.as_mut_ptr() as u64, 1, 0),
+                    ) != Some(EAGAIN)
+                {
+                    return Err("late invalid send iovec published partial data");
+                }
+            }
+            if call(Syscall::SocketSendMsg.raw(), a2(tx, msg.as_ptr() as u64, 0))
+                != Some(payload_len as i64)
+            {
+                return Err("scratch-boundary sendmsg failed");
+            }
+
+            offset = 0;
+            for i in 0..iov_count {
+                let len = if i + 1 == iov_count {
+                    payload_len - offset
+                } else {
+                    payload_len / iov_count
+                };
+                iov[i * 16..i * 16 + 8]
+                    .copy_from_slice(&(output[offset..].as_mut_ptr() as u64).to_ne_bytes());
+                offset += len;
+            }
+            let mut received_control = [0u8; 88];
+            msg[32..40].copy_from_slice(&(received_control.as_mut_ptr() as u64).to_ne_bytes());
+            msg[40..48].copy_from_slice(&88u64.to_ne_bytes());
+            if iov_count == 9 {
+                let saved: [u8; 8] = iov[8 * 16..8 * 16 + 8].try_into().unwrap();
+                iov[8 * 16..8 * 16 + 8].copy_from_slice(&BAD_USER_PTR.to_ne_bytes());
+                let result = call(Syscall::SocketRecvMsg.raw(), a2(rx, msg.as_ptr() as u64, 0));
+                iov[8 * 16..8 * 16 + 8].copy_from_slice(&saved);
+                if result != Some(EFAULT) {
+                    return Err("late invalid receive iovec was accepted");
+                }
+            }
+            if call(
+                Syscall::SocketRecvMsg.raw(),
+                a2(rx, msg.as_ptr() as u64, 0x4000_0000),
+            ) != Some(payload_len as i64)
+                || output[..payload_len] != input[..payload_len]
+                || u64::from_ne_bytes(received_control[..8].try_into().unwrap())
+                    != (16 + rights_count * 4) as u64
+                || u32::from_ne_bytes(msg[48..52].try_into().unwrap()) != 0
+            {
+                return Err("scratch-boundary recvmsg lost data or ancillary records");
+            }
+            let original = fd::lookup(FAKE_TASK, passed).ok_or("passed fd disappeared")?;
+            for i in 0..rights_count {
+                let start = 16 + i * 4;
+                let received =
+                    u32::from_ne_bytes(received_control[start..start + 4].try_into().unwrap());
+                let copy = fd::lookup(FAKE_TASK, received).ok_or("received fd missing")?;
+                if !Arc::ptr_eq(&copy.ops, &original.ops)
+                    || !Arc::ptr_eq(&copy.description, &original.description)
+                    || copy.flags != fd::FD_CLOEXEC
+                    || copy.description.status_flags() & fd::O_NONBLOCK == 0
+                {
+                    return Err("scratch-boundary rights changed identity or flags");
+                }
+                let _ = call(Syscall::Close.raw(), a0(received as u64));
+            }
+            let _ = call(Syscall::Close.raw(), a0(tx));
+            let _ = call(Syscall::Close.raw(), a0(rx));
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_message_scratch_boundaries
+);
+
 // ───────────────────────────── SocketRecvMsg ──────────────────────────
 
 fn smoke_abi_socket_recvmsg_pos() -> TestResult {

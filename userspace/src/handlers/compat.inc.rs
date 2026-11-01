@@ -13351,7 +13351,7 @@ fn parse_scm_send_ancillary(
     if ctrl_len > MAX_USER_COPY {
         return Err(EINVAL);
     }
-    let mut ctrl = alloc::vec![0u8; ctrl_len];
+    let mut ctrl = MessageBuffer::<64>::try_new(ctrl_len).map_err(|_| ENOMEM)?;
     // SAFETY: ctrl sized to ctrl_len; copy_from_user range-validates + SMAP.
     if unsafe { copy_from_user(&mut ctrl, ctrl_ptr) }.is_err() {
         return Err(EFAULT);
@@ -13753,23 +13753,42 @@ fn install_recv_ancillary(
         return false;
     }
     let control_capacity = if ctrl_ptr == 0 { 0 } else { ctrl_len };
-    let mut ctrl: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    // Bound scratch space by the records we can actually emit, not by the
+    // caller's arbitrary control capacity. Common credentials/rights fit on
+    // the stack. Encode installed fd numbers in this buffer so it also serves
+    // as the rollback list if the final guarded copy faults.
+    let maximum = if cred.is_some() { 32 } else { 0 }
+        + if fds.is_empty() {
+            0
+        } else {
+            (16 + fds.len() * 4).next_multiple_of(8)
+        };
+    let mut ctrl = match MessageBuffer::<64>::try_new(control_capacity.min(maximum)) {
+        Ok(buffer) => buffer,
+        Err(_) => {
+            // No fd was installed. Drop their retained references and report
+            // truncation, as when descriptor allocation cannot make progress.
+            // SAFETY: the guarded copy validates the msghdr output field.
+            let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_le_bytes()) };
+            return true;
+        }
+    };
+    let mut used = 0;
     let mut truncated = false;
-    let push_cmsg = |ctrl: &mut alloc::vec::Vec<u8>, ctype: i32, data: &[u8]| -> bool {
-        let room = control_capacity.saturating_sub(ctrl.len());
+    let push_cmsg = |ctrl: &mut [u8], used: &mut usize, ctype: i32, data: &[u8]| -> bool {
+        let room = ctrl.len() - *used;
         if room < 16 {
             return false;
         }
         let full_len = 16 + data.len();
         let cmsg_len = core::cmp::min(full_len, room);
-        let mut hdr = [0u8; 16];
-        hdr[0..8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
-        hdr[8..12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
-        hdr[12..16].copy_from_slice(&ctype.to_le_bytes());
-        ctrl.extend_from_slice(&hdr);
-        ctrl.extend_from_slice(&data[..cmsg_len - 16]);
+        let start = *used;
+        ctrl[start..start + 8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
+        ctrl[start + 8..start + 12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
+        ctrl[start + 12..start + 16].copy_from_slice(&ctype.to_le_bytes());
+        ctrl[start + 16..start + cmsg_len].copy_from_slice(&data[..cmsg_len - 16]);
         let consumed = core::cmp::min((full_len + 7) & !7, room);
-        ctrl.resize(ctrl.len() + consumed.saturating_sub(cmsg_len), 0);
+        *used += consumed;
         cmsg_len == full_len
     };
 
@@ -13780,7 +13799,7 @@ fn install_recv_ancillary(
         data[0..4].copy_from_slice(&c.pid.to_le_bytes());
         data[4..8].copy_from_slice(&c.uid.to_le_bytes());
         data[8..12].copy_from_slice(&c.gid.to_le_bytes());
-        if !push_cmsg(&mut ctrl, SCM_CREDENTIALS, &data) {
+        if !push_cmsg(&mut ctrl, &mut used, SCM_CREDENTIALS, &data) {
             truncated = true;
         }
     }
@@ -13788,12 +13807,13 @@ fn install_recv_ancillary(
     // Install only descriptors whose integer values can be reported. Linux's
     // `scm_max_fds` needs `CMSG_LEN`, not full aligned `CMSG_SPACE`, so a
     // 20-byte buffer can carry exactly one descriptor.
-    let rights_room = control_capacity.saturating_sub(ctrl.len());
+    let rights_start = used;
+    let rights_room = ctrl.len() - used;
     let max_rights = rights_room.saturating_sub(16) / 4;
     let rights_to_install = core::cmp::min(fds.len(), max_rights);
     truncated |= rights_to_install < fds.len();
     let task = current_task_id();
-    let mut new_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
+    let mut installed = 0;
     for passed in fds.into_iter().take(rights_to_install) {
         if let Some(newfd) = fd::with_table_alloc(task, |t| {
             t.open_transferred(
@@ -13805,20 +13825,20 @@ fn install_recv_ancillary(
         })
         .flatten()
         {
-            new_fds.push(newfd as i32);
+            let offset = rights_start + 16 + installed * 4;
+            ctrl[offset..offset + 4].copy_from_slice(&newfd.to_le_bytes());
+            installed += 1;
         } else {
             truncated = true;
             break;
         }
     }
-    if !new_fds.is_empty() {
-        let mut data = alloc::vec::Vec::with_capacity(new_fds.len() * 4);
-        for &nfd in &new_fds {
-            data.extend_from_slice(&nfd.to_le_bytes());
-        }
-        if !push_cmsg(&mut ctrl, SCM_RIGHTS, &data) {
-            truncated = true;
-        }
+    if installed != 0 {
+        let cmsg_len = 16 + installed * 4;
+        ctrl[rights_start..rights_start + 8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
+        ctrl[rights_start + 8..rights_start + 12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
+        ctrl[rights_start + 12..rights_start + 16].copy_from_slice(&SCM_RIGHTS.to_le_bytes());
+        used += cmsg_len.next_multiple_of(8).min(rights_room);
     }
     if ctrl_ptr == 0 {
         // SAFETY: 8-byte write to `msg_controllen` at `msg_ptr + 40`.
@@ -13830,16 +13850,18 @@ fn install_recv_ancillary(
     // integer before `fd_install`; NARF installs first, so it must roll back.
     // SAFETY: `ctrl_ptr` is the caller's msg_control address; copy_to_user
     // validates the complete emitted range and SMAP-brackets the write.
-    let copied = ctrl.is_empty() || unsafe { copy_to_user(ctrl_ptr, &ctrl) }.is_ok();
+    let copied = used == 0 || unsafe { copy_to_user(ctrl_ptr, &ctrl[..used]) }.is_ok();
     if !copied {
-        for newfd in &new_fds {
-            let _ = fd::with_table(task, |table| table.close(*newfd as u32));
+        for i in 0..installed {
+            let offset = rights_start + 16 + i * 4;
+            let newfd = u32::from_le_bytes(ctrl[offset..offset + 4].try_into().unwrap());
+            let _ = fd::with_table(task, |table| table.close(newfd));
         }
-        ctrl.clear();
+        used = 0;
         truncated = true;
     }
     // SAFETY: 8-byte write to `msg_controllen` at `msg_ptr + 40`.
-    let _ = unsafe { copy_to_user(msg_ptr + 40, &(ctrl.len() as u64).to_le_bytes()) };
+    let _ = unsafe { copy_to_user(msg_ptr + 40, &(used as u64).to_le_bytes()) };
     truncated
 }
 

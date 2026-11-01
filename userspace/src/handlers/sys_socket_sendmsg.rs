@@ -108,23 +108,24 @@ pub(super) fn sendmsg_on_socket(
         Some(bytes) => bytes,
         None => return SendMsgResult::Error(14), // EFAULT
     };
-    let iov_raw = if iov_bytes == 0 {
-        alloc::vec::Vec::new()
-    } else {
-        // SAFETY: complete iovec-array import; invalid array pointer is EFAULT.
-        match unsafe { copy_from_user_vec(iov_ptr, iov_bytes) } {
-            Ok(bytes) => bytes,
-            Err(_) => return SendMsgResult::Error(14),
-        }
+    // Keep Linux's UIO_FASTIOV-sized import on the stack. Validate the array
+    // before allocation, as copy_from_user_vec did, and freeze it in one copy.
+    if iov_bytes != 0 && validate_user_range(iov_ptr, iov_bytes).is_err() {
+        return SendMsgResult::Error(EFAULT);
+    }
+    let mut iov_raw = match MessageBuffer::<{ 8 * 16 }>::try_new(iov_bytes) {
+        Ok(buffer) => buffer,
+        Err(_) => return SendMsgResult::Error(ENOMEM),
     };
+    // SAFETY: the complete array range was validated; the guarded copy also
+    // catches concurrent unmaps. A zero-count array does not touch its pointer.
+    if iov_bytes != 0 && unsafe { copy_from_user(&mut iov_raw, iov_ptr) }.is_err() {
+        return SendMsgResult::Error(EFAULT);
+    }
 
     // Import all vector descriptors and validate their source ranges before
     // ancillary processing, as Linux import_iovec does. Actual payload copying
     // remains deferred until after the control buffer has been imported.
-    let mut vectors = alloc::vec::Vec::new();
-    if vectors.try_reserve_exact(iov_len).is_err() {
-        return SendMsgResult::Error(12); // ENOMEM
-    }
     let mut total_len = 0usize;
     for i in 0..iov_len {
         let off = i * 16;
@@ -141,7 +142,6 @@ pub(super) fn sendmsg_on_socket(
             return SendMsgResult::Error(14); // EFAULT
         }
         total_len += len;
-        vectors.push((ptr, len));
     }
 
     // Linux rejects an unrepresentable control length as ENOBUFS before
@@ -165,21 +165,27 @@ pub(super) fn sendmsg_on_socket(
         }
     }
 
-    let mut total = alloc::vec::Vec::new();
-    if total.try_reserve_exact(total_len).is_err() {
-        return SendMsgResult::Error(12); // ENOMEM
-    }
-    for (ptr, len) in vectors {
+    let mut total = match MessageBuffer::<128>::try_new(total_len) {
+        Ok(buffer) => buffer,
+        Err(_) => return SendMsgResult::Error(ENOMEM),
+    };
+    let mut copied = 0;
+    // Revisit our frozen descriptors instead of allocating a second vector.
+    // The first pass validated every range before ancillary import; payload
+    // faults still happen after ancillary processing and before publication.
+    for chunk in iov_raw.chunks_exact(16) {
+        let ptr = u64::from_ne_bytes(chunk[..8].try_into().unwrap());
+        let len = (u64::from_ne_bytes(chunk[8..].try_into().unwrap()) as usize)
+            .min(total_len - copied);
         if len == 0 {
             continue;
         }
-        let old_len = total.len();
-        total.resize(old_len + len, 0);
         // SAFETY: the range was validated above; the guarded copy still catches
         // an unmap race and reports EFAULT rather than publishing partial data.
-        if unsafe { copy_from_user(&mut total[old_len..], ptr) }.is_err() {
+        if unsafe { copy_from_user(&mut total[copied..copied + len], ptr) }.is_err() {
             return SendMsgResult::Error(14);
         }
+        copied += len;
     }
 
     if allow_msg_eor {

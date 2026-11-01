@@ -5406,6 +5406,157 @@ fn flock_op(fd: u64, op: u64) -> Option<i64> {
     call(Syscall::Flock.raw(), a1(fd, op))
 }
 
+fn smoke_abi_fdio_flock_close_during_acquire_keeps_description() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_filesystem::{FileOps, FsFuture, InodeAttrs, Stat};
+
+    struct CloseOnAttrs {
+        inner: Arc<dyn FileOps>,
+        fd: AtomicU32,
+    }
+    impl FileOps for CloseOnAttrs {
+        fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            self.inner.read(offset, buf)
+        }
+        fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+            self.inner.write(offset, buf)
+        }
+        fn stat(&self) -> Stat {
+            self.inner.stat()
+        }
+        fn ino(&self) -> u64 {
+            self.inner.ino()
+        }
+        fn inode_attrs(&self) -> InodeAttrs {
+            let fd = self.fd.swap(u32::MAX, Ordering::Relaxed);
+            if fd != u32::MAX {
+                // Deterministically model another CLONE_FILES thread closing
+                // the fd after resolution but before flock_try acquires it.
+                drop(fd::with_table(FAKE_TASK, |t| t.take(fd)).flatten());
+            }
+            self.inner.inode_attrs()
+        }
+    }
+
+    with_memfs("/flk", "flk", &[("f", b"hi")], || {
+        let actor = open_fd(b"/flk/f\0")?;
+        let rival = open_fd(b"/flk/f\0")?;
+        let inner = fd::with_table(FAKE_TASK, |t| t.get(actor).map(|e| e.ops.clone()))
+            .flatten()
+            .ok_or("actor file missing")?;
+        let wrapper = Arc::new(CloseOnAttrs {
+            inner,
+            fd: AtomicU32::new(u32::MAX),
+        });
+        fd::with_table(FAKE_TASK, |t| {
+            t.set(
+                actor,
+                fd::FdEntry {
+                    ops: wrapper.clone(),
+                    offset: 0,
+                    flags: 0,
+                    status_flags: fd::O_RDWR,
+                },
+            );
+        });
+        let owner = fd::with_table(FAKE_TASK, |t| t.description_lock_owner(actor))
+            .flatten()
+            .ok_or("actor description missing")?;
+        wrapper.fd.store(actor, Ordering::Relaxed);
+        let acquired = flock_op(actor as u64, LOCK_EX_OP | LOCK_NB_OP);
+        let closed = fd::lookup(FAKE_TASK, actor).is_none();
+        let competed = flock_op(rival as u64, LOCK_EX_OP | LOCK_NB_OP);
+        // Also clean the orphan created by the unfixed handler on a red run.
+        crate::handlers::release_flock_owner(owner);
+        if acquired != Some(0) || !closed {
+            return Err("close-during-flock fixture did not acquire and close");
+        }
+        if competed != Some(0) {
+            return Err("flock outlived its last open-file description");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_flock_close_during_acquire_keeps_description
+);
+
+struct FlockYieldJmp(core::cell::UnsafeCell<core::mem::MaybeUninit<narf_scheduler::JmpBuf>>);
+
+// SAFETY: only this serial kernel test accesses the buffer, with interrupts
+// masked across setjmp, the syscall, and the returning longjmp.
+unsafe impl Sync for FlockYieldJmp {}
+
+static FLOCK_YIELD_JMP: FlockYieldJmp =
+    FlockYieldJmp(core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+
+unsafe fn flock_yield_test_hook(_uctx: *mut crate::user_task::UserTaskCtx) -> ! {
+    // SAFETY: setjmp initialized this buffer before installing the hook. Its
+    // caller is still live, and the test masks interrupts to prevent migration.
+    unsafe { narf_scheduler::longjmp(FLOCK_YIELD_JMP.0.get().cast::<narf_scheduler::JmpBuf>(), 1) }
+}
+
+fn smoke_abi_fdio_flock_legacy_yield_releases_description() -> TestResult {
+    use crate::user_task::{install_current, UserTaskCtx};
+    use alloc::sync::Arc;
+
+    with_memfs("/flk-yield", "flk-yield", &[("f", b"hi")], || {
+        let holder = open_fd(b"/flk-yield/f\0")?;
+        let waiter = open_fd(b"/flk-yield/f\0")?;
+        if flock_op(holder as u64, LOCK_EX_OP | LOCK_NB_OP) != Some(0) {
+            return Err("flock holder setup failed");
+        }
+        let weak = fd::with_table(FAKE_TASK, |table| {
+            table
+                .description(waiter)
+                .map(|description| Arc::downgrade(&description))
+        })
+        .flatten()
+        .ok_or("flock waiter description missing")?;
+
+        // Observe the real non-returning park boundary. Rust drops in the
+        // abandoned syscall frames do not run, just as in the legacy poller.
+        let uctx = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(UserTaskCtx::new()));
+        crate::user_task::__test_clear_hooks();
+        let reached_hook = narf_lib::sync::without_interrupts(|| {
+            install_current(uctx);
+            // SAFETY: the static buffer is writable, correctly aligned storage
+            // for JmpBuf. setjmp writes it before the hook can read it.
+            let resumed = unsafe {
+                narf_scheduler::setjmp(FLOCK_YIELD_JMP.0.get().cast::<narf_scheduler::JmpBuf>())
+            };
+            let jumped = if resumed == 0 {
+                crate::user_task::install_yield_hook(flock_yield_test_hook);
+                let _ = flock_op(waiter as u64, LOCK_EX_OP);
+                false
+            } else {
+                true
+            };
+            // Clear the per-CPU pointer and global hook before IRQs can permit
+            // migration; nothing may still reference uctx when it is freed.
+            crate::user_task::__test_clear_hooks();
+            jumped
+        });
+        // SAFETY: uctx came from Box::into_raw above; its installed pointer was
+        // cleared under the same IRQ mask before leaving the closure.
+        drop(unsafe { alloc::boxed::Box::from_raw(uctx) });
+        drop(fd::with_table(FAKE_TASK, |table| table.take(waiter)).flatten());
+        if !reached_hook {
+            return Err("blocking flock did not reach the legacy yield hook");
+        }
+        if weak.upgrade().is_some() {
+            return Err("flock yielded with an owned description in abandoned frames");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_flock_legacy_yield_releases_description
+);
+
 fn smoke_abi_fdio_flock_two_opens_conflict() -> TestResult {
     with_memfs("/flk", "flk", &[("f", b"hi")], || {
         let a = open_fd(b"/flk/f\0")? as u64;
