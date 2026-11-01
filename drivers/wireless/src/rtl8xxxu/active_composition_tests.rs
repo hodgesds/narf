@@ -179,8 +179,26 @@ struct Harness {
     domain: Arc<IrqSafeSpinLock<narf_wireless::reg::RegulatoryDomain>>,
 }
 impl Harness {
+    // Finish construction before the real admin-UP callback constructs its
+    // retained PM future. Keeping prepare's20KiB temporaries live across that
+    // callback's47KiB frame exceeded the ARM boot stack in every shared case.
     #[inline(never)]
     fn new(protected: bool) -> Result<Box<Self>, &'static str> {
+        let h = Self::prepare(protected)?;
+        narf_net::stack::kernel_admin(&h.name)
+            .ok_or("probe current admin")?
+            .set_link(true)
+            .map_err(|_| "probe actual UP")?;
+        for _ in 0..64 {
+            narf_scheduler::poll_one_round();
+            if !h.device.admin_pending() {
+                return Ok(h);
+            }
+        }
+        Err("probe administrative wake did not complete")
+    }
+    #[inline(never)]
+    fn prepare(protected: bool) -> Result<Box<Self>, &'static str> {
         let (control, firmware) = initialized_registered_firmware();
         let factory = firmware.factory().ok_or("probe original factory")?;
         let domain = Arc::new(IrqSafeSpinLock::new(narf_wireless::reg::RegulatoryDomain {
@@ -243,25 +261,15 @@ impl Harness {
         *ACTIVE_PROBE.lock() = Some(device.clone());
         narf_net::iface::install_rx_handler(narf_net::tcp_stack::rx_handler);
         narf_net::iface::install_rx_drain(drain_probe_device);
-        narf_net::stack::kernel_admin(&name)
-            .ok_or("probe current admin")?
-            .set_link(true)
-            .map_err(|_| "probe actual UP")?;
-        for _ in 0..64 {
-            narf_scheduler::poll_one_round();
-            if !device.admin_pending() {
-                return Ok(Box::new(Self {
-                    device,
-                    link,
-                    control,
-                    source,
-                    firmware,
-                    name,
-                    domain,
-                }));
-            }
-        }
-        Err("probe administrative wake did not complete")
+        Ok(Box::new(Self {
+            device,
+            link,
+            control,
+            source,
+            firmware,
+            name,
+            domain,
+        }))
     }
     fn scan(&self, ssid: &[u8]) -> ScanRequest {
         ScanRequest {
