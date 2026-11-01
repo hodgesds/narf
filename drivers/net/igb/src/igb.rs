@@ -821,6 +821,150 @@ pub const fn wus_clear_word() -> u32 {
     !0u32
 }
 
+// ── ethtool surface ─────────────────────────────────────────────────
+//
+// NARF has no ethtool ABI (the only in-tree mention is a comment in
+// `drivers/net/core` about future rtnetlink/ethtool consumers), so
+// this is a driver-local query surface shaped on Linux's
+// `igb_ethtool_ops` read side — drvinfo, link settings, ring
+// parameters, coalesce, pause parameters, WoL, RSS sizes, and the
+// statistics set — rather than a wire protocol. Counters are real:
+// the RX drain and the TX completion paths below bump them, so the
+// snapshot reports observed traffic, not constants. Set-side ops
+// (set_wol, set_rxfh, set_coalesce, set_ringparam) are deliberately
+// absent: changing rings or the RETA table on a live device needs
+// the stop/reconfigure sequence the PM commit adds, and advertising
+// setters before it would be a lie.
+
+/// Driver version reported by the ethtool surface (matches the
+/// module version in `lib.rs`).
+pub const IGB_DRIVER_VERSION: &str = "0.1.0";
+
+/// Link settings in Linux `igb_get_link_ksettings` shape. NARF
+/// forces 1 GbE full-duplex at bring-up (CTRL_FRCSPD/FRCDPLX), so
+/// autoneg is reported off — not guessed on.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EthtoolLink {
+    pub speed_mbps: Option<u32>,
+    pub duplex_full: bool,
+    pub autoneg: bool,
+}
+
+/// Ring parameters in Linux `igb_get_ringparam` shape. `tx_usable`
+/// is the sentinel-adjusted capacity (one slot is never posted).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EthtoolRings {
+    pub tx_count: usize,
+    pub tx_usable: usize,
+    pub rx_count: usize,
+}
+
+/// Coalesce parameters in Linux `igb_get_coalesce` shape. NARF
+/// routes RX and TX through one shared vector with one EITR, so both
+/// directions report the same interval.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EthtoolCoalesce {
+    pub rx_usecs: u32,
+    pub tx_usecs: u32,
+}
+
+/// Pause parameters in Linux `igb_get_pauseparam` shape. NARF's igb
+/// programs no flow-control registers, so all three report off.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct EthtoolPause {
+    pub autoneg: bool,
+    pub rx_pause: bool,
+    pub tx_pause: bool,
+}
+
+/// Statistics snapshot. Names match [`IGB_STAT_NAMES`] order.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct EthtoolStats {
+    pub rx_packets: u64,
+    pub rx_bytes: u64,
+    pub tx_packets: u64,
+    pub tx_bytes: u64,
+    pub tx_errors: u64,
+}
+
+/// Statistic names in snapshot order (Linux `igb_get_strings` shape,
+/// restricted to the counters this driver actually maintains).
+pub const IGB_STAT_NAMES: [&str; 5] = [
+    "rx_packets",
+    "rx_bytes",
+    "tx_packets",
+    "tx_bytes",
+    "tx_errors",
+];
+
+/// Whole ethtool read surface for one igb device.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EthtoolInfo {
+    pub driver: &'static str,
+    pub version: &'static str,
+    pub link: EthtoolLink,
+    pub rings: EthtoolRings,
+    pub coalesce: EthtoolCoalesce,
+    pub pause: EthtoolPause,
+    /// WoL support: `None` while NVM access (hence the EEPROM APME
+    /// probe) is unavailable — unknown, not false.
+    pub wol_supported: Option<bool>,
+    pub wol: WolFilters,
+    pub rss_indir_size: usize,
+    pub rss_key_size: usize,
+    pub stats: EthtoolStats,
+}
+
+/// EITR interval (256 ns units, Linux EITR encoding) to whole
+/// microseconds, masking the CNT_IGNR flag bit first.
+pub const fn eitr_to_usecs(eitr: u32) -> u32 {
+    ((eitr & !EITR_CNT_IGNR) * 256) / 1000
+}
+
+/// Whole microseconds to an EITR interval (floor; the 256 ns unit
+/// cannot represent every microsecond value exactly).
+pub const fn usecs_to_eitr(usecs: u32) -> u32 {
+    (usecs * 1000) / 256
+}
+
+/// Live counters backing [`EthtoolStats`]. Bumped with relaxed
+/// atomics from the datapath; the snapshot is informational, not a
+/// billing record, so relaxed ordering is sufficient.
+#[derive(Debug, Default)]
+pub struct IgbStats {
+    rx_packets: AtomicU64,
+    rx_bytes: AtomicU64,
+    tx_packets: AtomicU64,
+    tx_bytes: AtomicU64,
+    tx_errors: AtomicU64,
+}
+
+impl IgbStats {
+    fn note_rx(&self, len: u64) {
+        self.rx_packets.fetch_add(1, Ordering::Relaxed);
+        self.rx_bytes.fetch_add(len, Ordering::Relaxed);
+    }
+
+    fn note_tx_ok(&self, len: u64) {
+        self.tx_packets.fetch_add(1, Ordering::Relaxed);
+        self.tx_bytes.fetch_add(len, Ordering::Relaxed);
+    }
+
+    fn note_tx_error(&self) {
+        self.tx_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> EthtoolStats {
+        EthtoolStats {
+            rx_packets: self.rx_packets.load(Ordering::Relaxed),
+            rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
+            tx_packets: self.tx_packets.load(Ordering::Relaxed),
+            tx_bytes: self.tx_bytes.load(Ordering::Relaxed),
+            tx_errors: self.tx_errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
 // CTRL bits.
 const CTRL_RST: u32 = 1 << 26;
 const CTRL_SLU: u32 = 1 << 6;
@@ -1319,6 +1463,10 @@ pub struct Igb {
     /// Opt-in VLAN filter shadow; no VFTA word is programmed at
     /// bring-up (see [`VlanFilter`]).
     vlan_filter: IrqSafeSpinLock<VlanFilter>,
+    /// Live counters for the ethtool surface.
+    stats: IgbStats,
+    /// WoL filters the suspend sequence will arm (default: none).
+    wol_filters: IrqSafeSpinLock<WolFilters>,
     rx_head: IrqSafeSpinLock<u16>,
     /// Reject nested/concurrent drains while an RX callback owns the current
     /// descriptor. A callback may synchronously transmit, whose responsive
@@ -1598,6 +1746,8 @@ impl Igb {
             tx_buf_pool,
             tx_state: IrqSafeSpinLock::new(TxRingCursor::new()),
             vlan_filter: IrqSafeSpinLock::new(VlanFilter::new()),
+            stats: IgbStats::default(),
+            wol_filters: IrqSafeSpinLock::new(WolFilters::default()),
             rx_head: IrqSafeSpinLock::new(0),
             rx_draining: AtomicBool::new(false),
             ready: true,
@@ -1657,6 +1807,40 @@ impl Igb {
 
     pub fn mac(&self) -> [u8; 6] {
         self.mac
+    }
+
+    /// Set the WoL filters the suspend sequence will arm.
+    pub fn set_wol_filters(&self, filters: WolFilters) {
+        *self.wol_filters.lock() = filters;
+    }
+
+    /// Whole ethtool read surface for this device, from live state.
+    pub fn ethtool_info(&self) -> EthtoolInfo {
+        let link_up = self.link_up();
+        EthtoolInfo {
+            driver: "igb",
+            version: IGB_DRIVER_VERSION,
+            link: EthtoolLink {
+                speed_mbps: if link_up { Some(1000) } else { None },
+                duplex_full: link_up,
+                autoneg: false,
+            },
+            rings: EthtoolRings {
+                tx_count: TX_RING_LEN,
+                tx_usable: TX_RING_USABLE,
+                rx_count: RX_RING_LEN,
+            },
+            coalesce: EthtoolCoalesce {
+                rx_usecs: eitr_to_usecs(EITR_START | EITR_CNT_IGNR),
+                tx_usecs: eitr_to_usecs(EITR_START | EITR_CNT_IGNR),
+            },
+            pause: EthtoolPause::default(),
+            wol_supported: None,
+            wol: *self.wol_filters.lock(),
+            rss_indir_size: RETA_SIZE,
+            rss_key_size: RSS_KEY_SIZE,
+            stats: self.stats.snapshot(),
+        }
     }
 
     /// Opt a VID into the hardware VLAN filter: update the shadow and
@@ -1841,9 +2025,16 @@ impl Igb {
             narf_time::Deadline::after_ms(250),
         );
         if !posted {
+            self.stats.note_tx_error();
             return Err(IgbError::TxTimeout);
         }
-        self.wait_for_tx(ticket.ok_or(IgbError::Other("TX reservation lost"))?)
+        let result = self.wait_for_tx(ticket.ok_or(IgbError::Other("TX reservation lost"))?);
+        match &result {
+            Ok(()) => self.stats.note_tx_ok(frame.len() as u64),
+            Err(IgbError::TxTimeout) => self.stats.note_tx_error(),
+            Err(_) => {}
+        }
+        result
     }
 
     /// Transmit a single Ethernet frame with VLAN insertion: a context
@@ -1887,9 +2078,17 @@ impl Igb {
             narf_time::Deadline::after_ms(250),
         );
         if !posted {
+            self.stats.note_tx_error();
             return Err(IgbError::TxTimeout);
         }
-        self.wait_for_tx(data_ticket.ok_or(IgbError::Other("TX VLAN reservation lost"))?)
+        let result =
+            self.wait_for_tx(data_ticket.ok_or(IgbError::Other("TX VLAN reservation lost"))?);
+        match &result {
+            Ok(()) => self.stats.note_tx_ok(frame.len() as u64),
+            Err(IgbError::TxTimeout) => self.stats.note_tx_error(),
+            Err(_) => {}
+        }
+        result
     }
 
     /// Frame compatibility wrapper. Copying into the descriptor's persistent
@@ -1993,6 +2192,7 @@ impl Igb {
                     core::slice::from_raw_parts_mut(slots[idx].cpu_mut_ptr_at::<u8>(0), len)
                 };
                 f(frame);
+                self.stats.note_rx(len as u64);
                 buf_phys
             };
             let _ = ADV_RXD_STAT_EOP; // multi-buffer frames land in a follow-up.
@@ -2419,27 +2619,27 @@ mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     use super::{
-        eitr_reg, ivar0_shared_vector, ivar_apply, ivar_misc_shared_vector, ivar_rx,
+        eitr_reg, eitr_to_usecs, ivar0_shared_vector, ivar_apply, ivar_misc_shared_vector, ivar_rx,
         ivar_scheme_for_device, ivar_tx, max_queues_for_device, mrqc_word, previous_rx_slot,
         queue_disable_word, queue_enable_reflected, queue_enable_word, queue_pairs, queue_regs,
         reta_entry, reta_reg, reta_shift, reta_table, reta_word, rss_key_word, rss_queue_for_hash,
-        rssrk_reg, rxcsum_rss_word, rxdctl_word, strip_vlan_tag_in_place, txdctl_word, vfta_bit,
-        vfta_word, wol_supported, wol_suspend_program, wus_clear_word, wus_delivered_wake_packet,
-        AdvRxDescRead, AdvRxDescWb, AdvTxCtxtDesc, AdvTxDataDesc, IvarScheme, TxRingCursor,
-        VlanFilter, WolFilters, ADVTXD_DCMD_DEXT, ADVTXD_DTYP_CTXT, ADV_RXD_STAT_VP, CTRL_ADVD3WUC,
-        EEPROM_APME, EITR_CNT_IGNR, EITR_START, IGB_82576, IGB_82576_NS, IGB_I210_COPPER,
-        IGB_I211_COPPER, IGB_I350_COPPER, IGB_MAX_QUEUES, IGB_MAX_QUEUES_82575,
-        IGB_MAX_QUEUES_I211, IVAR_VALID, MRQC_ENABLE_RSS_MQ, MRQC_ENABLE_VMDQ,
-        MRQC_ENABLE_VMDQ_RSS_MQ, MRQC_FIELD_IPV4, MRQC_FIELD_IPV4_TCP, MRQC_FIELD_IPV4_UDP,
-        MRQC_FIELD_IPV6, MRQC_FIELD_IPV6_TCP, MRQC_FIELD_IPV6_TCP_EX, MRQC_FIELD_IPV6_UDP,
-        QUEUE_ENABLE, REG_EIAC, REG_EIAM, REG_EIMC, REG_EIMS, REG_EITR0, REG_ICR, REG_IMC, REG_IMS,
-        REG_IVAR0, REG_IVAR_MISC, REG_MRQC, REG_RDBAH, REG_RDBAL, REG_RDH, REG_RDLEN, REG_RDT,
-        REG_RETA_BASE, REG_RSSRK_BASE, REG_RXCSUM, REG_RXDCTL0, REG_SRRCTL_Q0, REG_TDBAH,
-        REG_TDBAL, REG_TDH, REG_TDLEN, REG_TDT, REG_TXDCTL0, REG_VET, REG_VFTA_BASE, REG_WUC,
-        REG_WUFC, REG_WUS, RETA_REGS, RETA_SIZE, RSS_KEY_SIZE, RXCSUM_CRCOFL, RXCSUM_PCSD,
-        RX_RING_LEN, SRRCTL_DESCTYPE_ADV_ONEBUF, TX_CTXT_VLAN_MASK, TX_CTXT_VLAN_SHIFT,
-        TX_RING_LEN, TX_RING_USABLE, VET_8021Q, VFTA_WORDS, WUC_PME_EN, WUFC_LNKC, WUFC_MAG,
-        WUFC_MC, WUS_ARPD, WUS_IPV6,
+        rssrk_reg, rxcsum_rss_word, rxdctl_word, strip_vlan_tag_in_place, txdctl_word,
+        usecs_to_eitr, vfta_bit, vfta_word, wol_supported, wol_suspend_program, wus_clear_word,
+        wus_delivered_wake_packet, AdvRxDescRead, AdvRxDescWb, AdvTxCtxtDesc, AdvTxDataDesc,
+        IgbStats, IvarScheme, TxRingCursor, VlanFilter, WolFilters, ADVTXD_DCMD_DEXT,
+        ADVTXD_DTYP_CTXT, ADV_RXD_STAT_VP, CTRL_ADVD3WUC, EEPROM_APME, EITR_CNT_IGNR, EITR_START,
+        IGB_82576, IGB_82576_NS, IGB_DRIVER_VERSION, IGB_I210_COPPER, IGB_I211_COPPER,
+        IGB_I350_COPPER, IGB_MAX_QUEUES, IGB_MAX_QUEUES_82575, IGB_MAX_QUEUES_I211, IGB_STAT_NAMES,
+        IVAR_VALID, MRQC_ENABLE_RSS_MQ, MRQC_ENABLE_VMDQ, MRQC_ENABLE_VMDQ_RSS_MQ, MRQC_FIELD_IPV4,
+        MRQC_FIELD_IPV4_TCP, MRQC_FIELD_IPV4_UDP, MRQC_FIELD_IPV6, MRQC_FIELD_IPV6_TCP,
+        MRQC_FIELD_IPV6_TCP_EX, MRQC_FIELD_IPV6_UDP, QUEUE_ENABLE, REG_EIAC, REG_EIAM, REG_EIMC,
+        REG_EIMS, REG_EITR0, REG_ICR, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC, REG_MRQC,
+        REG_RDBAH, REG_RDBAL, REG_RDH, REG_RDLEN, REG_RDT, REG_RETA_BASE, REG_RSSRK_BASE,
+        REG_RXCSUM, REG_RXDCTL0, REG_SRRCTL_Q0, REG_TDBAH, REG_TDBAL, REG_TDH, REG_TDLEN, REG_TDT,
+        REG_TXDCTL0, REG_VET, REG_VFTA_BASE, REG_WUC, REG_WUFC, REG_WUS, RETA_REGS, RETA_SIZE,
+        RSS_KEY_SIZE, RXCSUM_CRCOFL, RXCSUM_PCSD, RX_RING_LEN, SRRCTL_DESCTYPE_ADV_ONEBUF,
+        TX_CTXT_VLAN_MASK, TX_CTXT_VLAN_SHIFT, TX_RING_LEN, TX_RING_USABLE, VET_8021Q, VFTA_WORDS,
+        WUC_PME_EN, WUFC_LNKC, WUFC_MAG, WUFC_MC, WUS_ARPD, WUS_IPV6,
     };
 
     fn smoke_igb_extended_interrupt_layout() -> TestResult {
@@ -3107,4 +3307,54 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/igb", smoke_igb_wol_suspend_and_status);
+
+    fn smoke_igb_ethtool_coalesce_and_rings() -> TestResult {
+        // EITR 648 × 256 ns = 165.888 µs, reported as 165 µs; the
+        // CNT_IGNR flag bit must not leak into the interval.
+        if eitr_to_usecs(EITR_START) != 165
+            || eitr_to_usecs(EITR_START | EITR_CNT_IGNR) != 165
+            || eitr_to_usecs(0) != 0
+        {
+            return TestResult::Fail("igb EITR-to-usecs drift");
+        }
+        // Microsecond-to-EITR conversion floors to the 256 ns unit.
+        if usecs_to_eitr(165) != 644 || usecs_to_eitr(0) != 0 {
+            return TestResult::Fail("igb usecs-to-EITR drift");
+        }
+        if TX_RING_LEN != 8 || TX_RING_USABLE != 7 || RX_RING_LEN != 256 {
+            return TestResult::Fail("igb ethtool ring-parameter drift");
+        }
+        if IGB_STAT_NAMES.len() != 5
+            || IGB_STAT_NAMES[0] != "rx_packets"
+            || IGB_STAT_NAMES[4] != "tx_errors"
+        {
+            return TestResult::Fail("igb ethtool statistic-name drift");
+        }
+        if IGB_DRIVER_VERSION != "0.1.0" {
+            return TestResult::Fail("igb ethtool driver-version drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_ethtool_coalesce_and_rings);
+
+    fn smoke_igb_ethtool_stats() -> TestResult {
+        let stats = IgbStats::default();
+        let snap = stats.snapshot();
+        if snap.rx_packets != 0 || snap.tx_bytes != 0 || snap.tx_errors != 0 {
+            return TestResult::Fail("igb ethtool stats do not start at zero");
+        }
+        stats.note_rx(1500);
+        stats.note_rx(64);
+        stats.note_tx_ok(1500);
+        stats.note_tx_error();
+        let snap = stats.snapshot();
+        if snap.rx_packets != 2 || snap.rx_bytes != 1564 {
+            return TestResult::Fail("igb ethtool RX counter drift");
+        }
+        if snap.tx_packets != 1 || snap.tx_bytes != 1500 || snap.tx_errors != 1 {
+            return TestResult::Fail("igb ethtool TX counter drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_ethtool_stats);
 }
