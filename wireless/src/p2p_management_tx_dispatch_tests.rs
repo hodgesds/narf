@@ -2,9 +2,19 @@
 //! model; native TXS and dual packet retirement are tested in MT76 itself.
 use super::*;
 static EVENTS: IrqSafeSpinLock<Vec<(u64, u32, Vec<u8>)>> = IrqSafeSpinLock::new(Vec::new());
-static CAPTURING: AtomicBool = AtomicBool::new(false);
+static CAPTURE_WDEV: IrqSafeSpinLock<Option<u64>> = IrqSafeSpinLock::new(None);
 fn event(namespace: u64, group: u32, bytes: &[u8]) {
-    if CAPTURING.load(Ordering::Acquire) && bytes.get(16) == Some(&60) {
+    let Some(wanted_wdev) = *CAPTURE_WDEV.lock() else {
+        return;
+    };
+    // Capture every namespace for this exact WDEV: a wrong-namespace status
+    // must still fail the positive namespace or negative zero-event checks.
+    if group == 19
+        && bytes.get(4..6) == Some(crate::nl80211::NL80211_FAMILY_ID.to_ne_bytes().as_slice())
+        && bytes.get(16) == Some(&60)
+        && bytes.get(20..).and_then(|attrs| attribute(attrs, 153))
+            == Some(wanted_wdev.to_ne_bytes().as_slice())
+    {
         EVENTS.lock().push((namespace, group, bytes.to_vec()));
     }
 }
@@ -12,13 +22,17 @@ struct Capture(Option<fn(u64, u32, &[u8])>);
 impl Capture {
     fn new() -> Self {
         EVENTS.lock().clear();
-        CAPTURING.store(true, Ordering::Release);
+        *CAPTURE_WDEV.lock() = None;
         Self(narf_net::netlink_generic::install_event_sink(event))
+    }
+    fn select(&self, child: &Child) {
+        *CAPTURE_WDEV.lock() = Some(child.registration.id());
+        EVENTS.lock().clear();
     }
 }
 impl Drop for Capture {
     fn drop(&mut self) {
-        CAPTURING.store(false, Ordering::Release);
+        *CAPTURE_WDEV.lock() = None;
         if let Some(old) = self.0 {
             narf_net::netlink_generic::install_event_sink(old);
         }
@@ -60,19 +74,53 @@ fn request(child: &Child, source: Arc<Source>, frame: &[u8]) -> Result<Vec<Vec<u
         ],
     )
 }
+// The preceding SME suite may leave an ordinary FRAME status queued on the
+// global executor. A scheduler round is neither a request-specific phase
+// receipt nor proof that every observed MLME event belongs to this WDEV.
+fn pending(child: &Child) -> Result<(), &'static str> {
+    for _ in 0..256 {
+        if child.radio.inner.start_polls.load(Ordering::Acquire) != 0 {
+            return Ok(());
+        }
+        narf_scheduler::poll_one_round();
+    }
+    Err("specific FRAME callback did not enter its held native boundary")
+}
+fn foreign_status(parent: &Fixture, target: &Child) -> Result<(), &'static str> {
+    let foreign = super::child(parent, None, target.registration.namespace())?;
+    let wiphy = crate::registry::wiphy_index(parent.iface.wiphy_id())
+        .ok_or("actual foreign management-status physical wiphy")?;
+    let mut attrs = Vec::new();
+    dispatch::attr(&mut attrs, 1, &wiphy.to_ne_bytes());
+    dispatch::attr(&mut attrs, 153, &foreign.registration.id().to_ne_bytes());
+    dispatch::attr(&mut attrs, 51, &frame(&foreign));
+    dispatch::attr(&mut attrs, 88, &0x5eedu64.to_ne_bytes());
+    narf_net::netlink_generic::publish_event(
+        crate::nl80211::NL80211_FAMILY_ID,
+        19,
+        foreign.registration.namespace(),
+        narf_net::netlink_generic::GenlReply { command: 60, attrs },
+    );
+    if !EVENTS.lock().is_empty() {
+        return Err("foreign registered WDEV status contaminated this FRAME observation");
+    }
+    Ok(())
+}
 fn terminal() -> Result<(), &'static str> {
-    let _capture = Capture::new();
+    let capture = Capture::new();
     for ack in [false, true] {
         EVENTS.lock().clear();
         let parent = fixture()?;
         let child = child(&parent, None, 27)?;
         child.radio.management_tx_ack.store(ack, Ordering::Release);
         let source = Arc::new(Source::new());
+        capture.select(&child);
         let frame = frame(&child);
         if !request(&child, source.clone(), &frame)?.is_empty() {
             return Err("FRAME returned cookie before actual callback completed");
         }
-        narf_scheduler::poll_one_round();
+        foreign_status(&parent, &child)?;
+        pending(&child)?;
         if child.radio.inner.start_polls.load(Ordering::Acquire) == 0
             || child.radio.management_tx.lock().is_some()
             || !EVENTS.lock().is_empty()
@@ -133,16 +181,18 @@ kernel_test_in!(
 );
 
 fn lost() -> Result<(), &'static str> {
-    let _capture = Capture::new();
+    let capture = Capture::new();
     for cause in 0..5 {
         EVENTS.lock().clear();
         let parent = fixture()?;
         let child = paired_child(&parent)?;
         let source = Arc::new(Source::new());
+        capture.select(&child);
         if !request(&child, source.clone(), &frame(&child))?.is_empty() {
             return Err("held FRAME admission completed early");
         }
-        narf_scheduler::poll_one_round();
+        foreign_status(&parent, &child)?;
+        pending(&child)?;
         match cause {
             0 => source.0.store(false, Ordering::Release),
             1 => child.cap.revoke(),

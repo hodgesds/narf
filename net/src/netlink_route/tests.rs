@@ -126,9 +126,19 @@ fn getlink_point_query_returns_one_non_multipart_link() -> narf_kernel_test::Tes
         Some(&b"lo\0"[..])
     );
 
-    body[4..8].copy_from_slice(&999i32.to_ne_bytes());
+    // Interface index 999 can belong to a real device in the full suite. Prove the
+    // queried positive index is absent instead of assuming a fixed value.
+    let (links, _) = enumerate();
+    let Some(absent) =
+        (2..=i32::MAX).find(|index| !links.iter().any(|link| link.ifindex == *index as u32))
+    else {
+        return narf_kernel_test::TestResult::Fail("no absent positive test ifindex");
+    };
+    body[4..8].copy_from_slice(&absent.to_ne_bytes());
     let missing = frame_message(RTM_GETLINK, NLM_F_REQUEST, 44, 7, &body);
     let replies = build_dump(&missing);
+    narf_kernel_test::kt_assert_eq!(replies.len(), 1);
+    narf_kernel_test::kt_assert_eq!(parse_hdr(&replies[0]).unwrap().msg_type, NLMSG_ERROR);
     narf_kernel_test::kt_assert_eq!(
         i32::from_ne_bytes(
             replies[0][NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
