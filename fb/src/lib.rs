@@ -50,17 +50,17 @@ pub use drain_task::{drain_once, stats as drain_stats, DrainTask};
 #[cfg(feature = "amdgpu")]
 mod amdgpu_boot;
 
-/// Whether the amdgpu boot handoff has paused fb drawing. Without
-/// the amdgpu feature there is no handoff to pause for.
-fn amdgpu_boot_paused() -> bool {
+/// Firmware training or Intel direct KMS temporarily owns display access.
+fn drawing_paused() -> bool {
     #[cfg(feature = "amdgpu")]
-    {
-        amdgpu_boot::paused()
-    }
+    let amd = amdgpu_boot::paused();
     #[cfg(not(feature = "amdgpu"))]
-    {
-        false
-    }
+    let amd = false;
+    #[cfg(feature = "intel")]
+    let intel = narf_drivers_gpu::intel_gpu::kms_console_paused();
+    #[cfg(not(feature = "intel"))]
+    let intel = false;
+    amd || intel
 }
 pub use registry::{
     connect as registry_connect, disconnect as registry_disconnect,
@@ -582,6 +582,7 @@ fn clear_generic() {
 }
 /// The console draws to exactly the scanout a driver published.
 pub(crate) fn adopted_external_scanout() -> bool {
+    #[cfg(any(feature = "amdgpu", feature = "intel"))]
     let phys = GENERIC_PHYS.load(core::sync::atomic::Ordering::Acquire);
     #[cfg(feature = "amdgpu")]
     let amd =
@@ -636,6 +637,7 @@ fn external_scanout_geom() -> Option<narf_drivers_gpu::drm_fb_hook::ScanoutGeom>
 /// there, and the internal panel keeps showing its last frame rather than
 /// blanking. When the stream goes away the console goes back to the boot
 /// framebuffer, because the scanout memory is about to be released.
+#[cfg(any(feature = "amdgpu", feature = "intel"))]
 fn external_scanout_changed(scanout: Option<narf_graphics_driver::generic::GenericFb>) {
     match scanout {
         Some(fb) => {
@@ -731,7 +733,7 @@ impl FbScanout for GenericScanout {
 /// (no other path mutates the slot), the resulting `&'static`
 /// stays valid until clear_test_scanout runs.
 pub fn select_active() -> Option<&'static dyn FbScanout> {
-    if amdgpu_boot_paused() {
+    if drawing_paused() {
         return None;
     }
     {
@@ -944,7 +946,7 @@ impl FbWriter {
 
     /// Validate cap is still live; returns `Err` if revoked.
     fn check_live(&self) -> Result<(), FbWriteError> {
-        if amdgpu_boot_paused() {
+        if drawing_paused() {
             return Err(FbWriteError::NoActiveScanout);
         }
         self.cap
@@ -1129,7 +1131,7 @@ impl PumpWriterCell {
 /// Reads the boot-cached writer and runs one drain pass; cheap
 /// on empty rings.
 fn fb_drain_pump() {
-    if amdgpu_boot_paused() {
+    if drawing_paused() {
         return;
     }
     // SAFETY: PUMP_WRITER is initialised once at boot before any
@@ -1173,7 +1175,7 @@ fn init_pump_writer(writer: FbWriter) {
 /// active. Used by the cursor sleep-pump tick to avoid minting a
 /// fresh `Cap::bootstrap()` per call.
 pub(crate) fn pump_writer_ref() -> Option<&'static FbWriter> {
-    if amdgpu_boot_paused() {
+    if drawing_paused() {
         return None;
     }
     // SAFETY: PUMP_WRITER is initialised once at boot; subsequent
@@ -1198,7 +1200,18 @@ impl FbWriter {
     pub(crate) unsafe fn scanout_for_cursor(&self) -> scanout_access::View<Framebuffer> {
         // SAFETY: generic mapping replacements use the same epoch lock. The
         // caller keeps the lease for the complete access and excludes writers.
-        unsafe { scanout_access::snapshot(|| self.scanout.framebuffer()) }
+        unsafe {
+            scanout_access::snapshot(|| {
+                if drawing_paused() {
+                    // A paused cached cursor/status writer gets an empty
+                    // view. All Framebuffer operations clip before access;
+                    // no pointer from the previous scanout escapes this epoch.
+                    Framebuffer::new(core::ptr::NonNull::<u32>::dangling().as_ptr(), 0, 0, 0)
+                } else {
+                    self.scanout.framebuffer()
+                }
+            })
+        }
     }
 
     /// Mutable variant for the status panel's `draw_string_8x8`

@@ -6,10 +6,10 @@
 //! not completion: the previous buffer survives until fresh flip-done,
 //! SURFLIVE and a stable changed hardware frame counter agree.
 //!
-//! This owner is deliberately not installed by the KMS copy path yet. Its
-//! caller must own display power, console handoff, modeset/PM exclusion and
-//! event publication. The current generic KMS path does not provide those
-//! contracts. No display IRQ enable/mask or synthetic vblank is changed here.
+//! The per-card intel_gpu_kms service supplies display power, console handoff,
+//! modeset/PM exclusion and transactional event publication. Its PollIo adapter
+//! enables status latching with IRQ delivery masked; this owner never invents
+//! vblank completion or programs timing/geometry.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -57,6 +57,16 @@ const FLIP_TIMEOUT_NS: u64 = 1_000_000_000;
 /// successful zero-valued MMIO. It must not re-enter this presenter.
 pub unsafe trait ScanoutIo: MmioWindow {
     fn invalidate_ggtt(&self) -> bool;
+
+    /// Restore only the status bits owned by this presentation service.
+    ///
+    /// # Safety
+    /// Every owned GEM mapping is independently proven no longer fetched;
+    /// the inherited console may still scan. Current authority, power and
+    /// exclusion of modeset/reset remain held through this operation.
+    unsafe fn finish_stopped(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -111,6 +121,8 @@ struct Surface {
 #[derive(Clone, Copy)]
 struct Pending {
     id: SurfaceId,
+    offset: u32,
+    geometry: Geometry,
     ticket: u64,
     frame: u32,
     deadline: u64,
@@ -139,6 +151,8 @@ pub struct Presenter<M: ScanoutIo> {
     surfaces: BTreeMap<SurfaceId, Surface>,
     next_id: u64,
     current: Option<SurfaceId>,
+    console_surface: u32,
+    console_geometry: Option<Geometry>,
     expected_surface: u32,
     pending: Option<Pending>,
     failed: bool,
@@ -207,6 +221,8 @@ impl<M: ScanoutIo> Presenter<M> {
             surfaces: BTreeMap::new(),
             next_id: 1,
             current: None,
+            console_surface: initial_surface,
+            console_geometry: None,
             expected_surface: initial_surface,
             pending: None,
             failed: false,
@@ -373,7 +389,42 @@ impl<M: ScanoutIo> Presenter<M> {
         if !surface.object.publish_for_device() {
             return Err(ScanoutError::Unavailable);
         }
-        if !self.geometry_matches(surface.geometry) {
+        let (offset, geometry) = (surface.offset, surface.geometry);
+        self.arm_target(id, offset, geometry, ticket, now)
+    }
+
+    /// Restore the retained console surface through the same fresh hardware
+    /// latch proof as a GEM flip. Surface zero is reserved for this target.
+    pub fn arm_console(&mut self, ticket: u64, now: u64) -> Result<(), ScanoutError> {
+        let geometry = self.console_geometry.ok_or(ScanoutError::Unsupported)?;
+        self.arm_target(SurfaceId(0), self.console_surface, geometry, ticket, now)
+    }
+
+    pub fn pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    pub fn console_active(&self) -> bool {
+        !self.failed
+            && !self.closed
+            && self.current.is_none()
+            && self.pending.is_none()
+            && self.expected_surface == self.console_surface
+    }
+
+    fn arm_target(
+        &mut self,
+        id: SurfaceId,
+        offset: u32,
+        geometry: Geometry,
+        ticket: u64,
+        now: u64,
+    ) -> Result<(), ScanoutError> {
+        self.ready()?;
+        if self.pending.is_some() {
+            return Err(ScanoutError::Busy);
+        }
+        if !self.geometry_matches(geometry) {
             return Err(ScanoutError::Unsupported);
         }
         if self.io().read32(self.plane() + PLANE_SURF_OFFSET) != self.expected_surface
@@ -394,9 +445,11 @@ impl<M: ScanoutIo> Presenter<M> {
             self.failed = true;
             return Err(ScanoutError::Unavailable);
         }
-        let offset = surface.offset;
+        self.console_geometry.get_or_insert(geometry);
         self.pending = Some(Pending {
             id,
+            offset,
+            geometry,
             ticket,
             frame,
             deadline: now.saturating_add(FLIP_TIMEOUT_NS),
@@ -417,7 +470,6 @@ impl<M: ScanoutIo> Presenter<M> {
         let Some(pending) = self.pending else {
             return Ok(None);
         };
-        let surface = &self.surfaces[&pending.id];
         let before = self.io().read32(self.pipe.base() + FRAMECOUNT_OFFSET);
         let live = self.io().read32(self.plane() + SURFLIVE_OFFSET);
         let status = self.io().read32(self.iir());
@@ -428,21 +480,24 @@ impl<M: ScanoutIo> Presenter<M> {
         }
         if before == after
             && after != pending.frame
-            && live == surface.offset
+            && live == pending.offset
             && status & PRIMARY_FLIP_DONE != 0
         {
-            if self.io().read32(self.plane() + PLANE_SURF_OFFSET) != surface.offset
-                || !self.geometry_matches(surface.geometry)
+            if self.io().read32(self.plane() + PLANE_SURF_OFFSET) != pending.offset
+                || !self.geometry_matches(pending.geometry)
             {
                 self.failed = true;
                 return Err(ScanoutError::Unavailable);
             }
             self.io().write32(self.iir(), PRIMARY_FLIP_DONE);
-            self.expected_surface = surface.offset;
-            let retired = self
-                .current
-                .replace(pending.id)
-                .filter(|old| *old != pending.id);
+            self.expected_surface = pending.offset;
+            let retired = if pending.id == SurfaceId(0) {
+                self.current.take()
+            } else {
+                self.current
+                    .replace(pending.id)
+                    .filter(|old| *old != pending.id)
+            };
             self.pending = None;
             return Ok(Some(Completion {
                 surface: pending.id,
@@ -516,6 +571,33 @@ impl<M: ScanoutIo> Presenter<M> {
                 self.failed = true;
                 return Err(ScanoutError::Unavailable);
             }
+        }
+        self.finish_shutdown()
+    }
+
+    /// Reclaim after our console latch retired every owned GEM fetch. The
+    /// console backing itself remains retained by the enclosing display owner.
+    pub fn shutdown_restored_console(&mut self) -> Result<(), ScanoutError> {
+        self.ready()?;
+        if !self.console_active()
+            || self.io().read32(self.plane() + PLANE_SURF_OFFSET) != self.console_surface
+            || self.io().read32(self.plane() + SURFLIVE_OFFSET) != self.console_surface
+        {
+            return Err(ScanoutError::Busy);
+        }
+        // SAFETY: no GEM flip remains pending, and either no GEM was ever
+        // armed or our fresh console latch retired its last hardware fetch.
+        // The constructor excludes all other users of this reserved arena.
+        unsafe { self.shutdown_stopped() }
+    }
+
+    /// Finalize only after the caller's stop/console-latch proof and all
+    /// owned PTE clears have completed. Failed status restoration retains RAM.
+    fn finish_shutdown(&mut self) -> Result<(), ScanoutError> {
+        // SAFETY: invoked only by shutdown paths after their no-fetch proof.
+        if !unsafe { self.io().finish_stopped() } {
+            self.failed = true;
+            return Err(ScanoutError::Unavailable);
         }
         self.current = None;
         self.pending = None;

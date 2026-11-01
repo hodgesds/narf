@@ -6484,14 +6484,30 @@ may not be VM-bound (`GemObject::vm_bound`, maintained by
 `xe_vm::State::publish` and its drop) and becomes SCANOUT. `Framebuffer::intel`
 (`IntelFb`: the object, which the framebuffer holds, and the owning open)
 is removed by RMFB or `Card::release_file_framebuffers`; `gem_owner` is
-the shared owner test. SETCRTC, PAGE_FLIP, atomic and DIRTYFB present it
-through the scanout copy (`present_intel_frame`): every WRITE fence of the
-object completes first (implicit sync, 15 s bound, else EBUSY), a
-write-back object is CLFLUSHed for CPU reads, and each line is copied
-across the object's pages (`copy_object_row`), never past its end. Only
-32-bpp frames match the scanout. Deviations: no tiled modifiers, no
-plane-0 offset handling and no zero-copy flip (Linux scans out of the BO
-through GGTT); the copy reads write-combining memory uncached.
+the shared owner test. A registered owned Intel internal panel installs
+`intel_gpu_kms`, whose per-card async mutex serializes SETCRTC, PAGE_FLIP,
+SETPLANE, atomic/property updates, DIRTYFB, master changes, cursor updates
+and removal. User arrays are copied before waiting; no Card, controller or
+IRQ-safe lock survives a latch/fence await. A Card transaction defers close-time
+framebuffer destruction, revalidates master and framebuffer identity, then
+publishes state, events and out-fences together after hardware completion.
+Cancellation refunds uncompleted event reservations while retaining every
+armed display owner for the next session to drain.
+
+Exact retained mode/geometry/pitch, zero-offset LINEAR XRGB8888 WC system
+SCANOUT objects can be presented directly through GGTT. Production admission
+currently requires the live MTL/Arrow GuC backend: it proves inherited GT
+retirement and exclusive use above the separate display reservation. Gen12
+has a register adapter but awaits its production execution backend. PTL,
+external/multiple active planes, active hardware cursors, FBC and enabled/busy
+DSB engines refuse direct takeover. Unsupported pre-arm states, WB/ARGB and
+dumb sources use checked copy into the retained console after restoring it;
+hardware loss, fault, timeout or ambiguous writes remain errors. RGB565
+presentation refuses. Copy waits for implicit WRITE fences (15 s bound),
+synchronizes WB objects for CPU reads and copies each validated row across
+retained pages; it requires the per-card console physical mapping and a
+scanout-access epoch. Completion then waits for an actual changed hardware
+frame count. The render node refuses KMS.
 
 `intel_gpu_gtt::check_console_scanout_range` restricts legacy scanout mappers
 to the four exact 32 MiB pipe windows beginning at 16, 48, 80 and 112 MiB.
@@ -6516,11 +6532,35 @@ invalidation. Uncertain writes, faults, timeout and Drop retain object pages
 and the MMIO/power owner. Only unsafe `shutdown_stopped`, after independently
 proven fetch stop, permits complete reclamation.
 
-This owner is not yet installed by KMS. Direct flips still require per-card
-console handoff, shared modeset/PM exclusion, display-power ownership and
-event/out-fence publication after successful presentation. Existing KMS keeps
-the copy path and simulated vblank completion; the new owner enables neither
-Intel display interrupts nor zero-copy userspace presentation.
+`intel_gpu_scanout_io::PollIo` uses a UC BAR and capability invocation on
+every access. It verifies Pipe A/D0, installed MTL non-coherent WT PAT1 and
+exclusive owned pipe status; enables IIR latching in IER while leaving IMR
+delivery masked, drains stale flip-done and preserves unrelated status bits.
+There is no Intel display IRQ handler in this path. Gen11+ display-only UC
+GGTT changes require posted PTE writes and barriers; GuC/engine TLB protocols
+remain separate and cannot address this reserved arena.
+
+Before takeover, the console/cursor pumps and cached CPU framebuffer views
+are paused and old scanout epochs drained. The original contiguous console
+allocation stays retained and remains the fbdev mapping; scattered GEM pages
+are never published as a contiguous framebuffer. PSR1/2 is disabled and
+verified idle, with re-enable inhibited during GEM ownership. Restoring the
+console uses the same fresh flip-done/SURFLIVE/frame-count proof before GEM
+PTEs and owners are retired; `shutdown_restored_console` then restores only
+owned interrupt-mask/enable bits. Legacy modeset/HPD and display PM acquire
+the same mutex and refuse live or uncertain ownership. Async system suspend
+restores the console before GT or PCI teardown, and only verified console
+relight reopens admission. Automatic GT recovery invalidates any active/busy
+presentation access before reset/cache-policy changes; pending/front pages
+remain quarantined without claiming fetch stop.
+
+Page-flip events carry the witnessed frame sequence and observation timestamp;
+out-fences become signalled only after that completion. This first fixed-mode
+path also awaits latch for NONBLOCK commits, so NONBLOCK does not yet promise
+an immediate ioctl return. ASYNC flips, tiled/compressed modifiers, arbitrary
+modesets, extra planes and full recovery of quarantined display owners remain
+open. These contracts have native register/ownership tests; Intel hardware
+and Mesa rendering-to-scanout acceptance are separate gates.
 
 **Client framebuffers scanned out in place.** On the native card ADDFB2
 also takes one of the calling open's amdgpu GEM handles

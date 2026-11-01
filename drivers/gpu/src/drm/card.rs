@@ -689,6 +689,59 @@ impl Default for DrmEventQueue {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DrmEventQueueFull;
 
+/// Event space reserved before an async Intel display transaction starts.
+/// Waiting or cancellation neither exposes a success event nor lets another
+/// ioctl consume the space this transaction needs after its hardware latch.
+#[cfg(feature = "intel")]
+#[derive(Debug)]
+pub(crate) struct FlipEventReservation<'a> {
+    queue: &'a narf_lib::sync::IrqSafeSpinLock<DrmEventQueue>,
+    pending: bool,
+}
+
+#[cfg(feature = "intel")]
+impl<'a> FlipEventReservation<'a> {
+    pub(crate) fn reserve(
+        queue: &'a narf_lib::sync::IrqSafeSpinLock<DrmEventQueue>,
+    ) -> Result<Self, DrmEventQueueFull> {
+        {
+            let mut events = queue.lock();
+            events.ensure_flip_event_space(1)?;
+            events.event_space -= DrmEventQueue::FLIP_EVENT_BYTES;
+        }
+        Ok(Self {
+            queue,
+            pending: true,
+        })
+    }
+
+    /// Publish only the actual completed latch, without simulated render
+    /// slack or an additional event-space allocation.
+    pub(crate) fn complete(mut self, user_data: u64, crtc_id: u32, stamp: FlipStamp) {
+        let mut bytes = [0; 32];
+        bytes[..4].copy_from_slice(&2u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&32u32.to_le_bytes());
+        bytes[8..16].copy_from_slice(&user_data.to_le_bytes());
+        bytes[28..32].copy_from_slice(&crtc_id.to_le_bytes());
+        patch_vblank_event(&mut bytes, stamp.ns, stamp.sequence);
+        self.queue.lock().events.push_back(QueuedEvent {
+            deliver_at_ns: stamp.ns,
+            wait: Wait::Time,
+            bytes,
+        });
+        self.pending = false;
+    }
+}
+
+#[cfg(feature = "intel")]
+impl Drop for FlipEventReservation<'_> {
+    fn drop(&mut self) {
+        if self.pending {
+            self.queue.lock().event_space += DrmEventQueue::FLIP_EVENT_BYTES;
+        }
+    }
+}
+
 /// When and in which vblank a hardware flip completed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlipStamp {
@@ -835,6 +888,12 @@ pub struct Card {
     pub framebuffers: Vec<Framebuffer>,
     /// Next framebuffer id to assign.
     pub(crate) next_fb_id: u32,
+    /// Excludes synchronous KMS writes while an Intel async transaction has
+    /// dropped the mode-state lock to wait for the real display latch.
+    #[cfg(feature = "intel")]
+    intel_transaction: bool,
+    #[cfg(feature = "intel")]
+    intel_deferred_owners: Vec<u64>,
     /// GEM object table for this card.
     pub gem: GemTable,
     /// Dumb-buffer physical backings. Kept alive here so the memory
@@ -1101,6 +1160,10 @@ impl Card {
             crtcs: Vec::new(),
             framebuffers: Vec::new(),
             next_fb_id: 1,
+            #[cfg(feature = "intel")]
+            intel_transaction: false,
+            #[cfg(feature = "intel")]
+            intel_deferred_owners: Vec::new(),
             gem: GemTable::new(),
             dumb_backings: Vec::new(),
             virtgpu_imports: Vec::new(),
@@ -1189,6 +1252,11 @@ impl Card {
     /// `is_master` for the per-ioctl permission gate.
     pub fn is_master(&self, open_id: u64) -> bool {
         self.current_master == Some(open_id)
+    }
+
+    #[cfg(feature = "intel")]
+    pub(crate) fn has_master(&self) -> bool {
+        self.current_master.is_some()
     }
 
     /// `DRM_IOCTL_SET_MASTER`. `Ok` if `open_id` already holds master or the
@@ -2027,6 +2095,13 @@ impl Card {
     /// from one of its GEM handles (as RMFB does, turning off what shows
     /// it). Returns how many went.
     pub fn release_file_framebuffers(&mut self, owner: u64) -> usize {
+        #[cfg(feature = "intel")]
+        if self.intel_transaction {
+            if !self.intel_deferred_owners.contains(&owner) {
+                self.intel_deferred_owners.push(owner);
+            }
+            return 0;
+        }
         let ids: Vec<u32> = self
             .framebuffers
             .iter()
@@ -2037,6 +2112,40 @@ impl Card {
             let _ = self.rmfb(id);
         }
         ids.len()
+    }
+
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_transaction_busy(&self) -> bool {
+        self.intel_transaction
+    }
+
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_begin_transaction(
+        &mut self,
+        open: u64,
+    ) -> Result<(), narf_filesystem::FsError> {
+        if !self.is_master(open) {
+            return Err(narf_filesystem::FsError::PermissionDenied);
+        }
+        if self.intel_transaction {
+            return Err(narf_filesystem::FsError::Busy);
+        }
+        self.intel_transaction = true;
+        Ok(())
+    }
+
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_owner_closed(&self, owner: u64) -> bool {
+        self.intel_deferred_owners.contains(&owner)
+    }
+
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_finish_transaction(&mut self) {
+        self.intel_transaction = false;
+        let owners = core::mem::take(&mut self.intel_deferred_owners);
+        for owner in owners {
+            self.release_file_framebuffers(owner);
+        }
     }
 
     /// `AMDGPU_GEM_METADATA` SET on a dumb BO of this card: record its

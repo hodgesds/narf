@@ -71,7 +71,7 @@
 //! users for it to disagree with, and resume sanitizes through
 //! it before anything else touches GT registers.
 //!
-//! Lock order (never inverted): `PM_CORE` → `CONTROLLER` /
+//! Lock order (never inverted): KMS display session → `PM_CORE` → `CONTROLLER` /
 //! RCS statics / ACTIVE_MODE. Probe registration takes the PM
 //! statics without holding `CONTROLLER`.
 //!
@@ -1007,6 +1007,30 @@ impl PmPlatform for ProductionPlatform {
     }
 }
 
+// Only the production entry points below construct this adapter, while
+// retaining the outer LegacyGuard. Keep the public ProductionPlatform's
+// relight path independently guarded for other PmCore callers.
+struct LockedProductionPlatform;
+impl PmPlatform for LockedProductionPlatform {
+    fn close_submission_gate(&self) {
+        ProductionPlatform.close_submission_gate();
+    }
+    fn open_submission_gate(&self) {
+        ProductionPlatform.open_submission_gate();
+    }
+    fn drain_submissions(&self, budget: u32) -> bool {
+        ProductionPlatform.drain_submissions(budget)
+    }
+    fn display_state(&self) -> (Option<Mode>, Option<ActiveScanout>) {
+        ProductionPlatform.display_state()
+    }
+    fn relight(&self, mode: &Mode) -> Result<(), PmError> {
+        crate::intel_gpu::relight_display_locked(mode)
+            .map(|_| ())
+            .ok_or(PmError::Relight)
+    }
+}
+
 fn production_window() -> Option<PmBarWindow> {
     crate::intel_gpu::with_controller(|gpu| PmBarWindow(gpu.gtt_mmadr))
 }
@@ -1014,15 +1038,51 @@ fn production_window() -> Option<PmBarWindow> {
 /// The device-PM suspend entry (registry-facing).
 pub fn production_suspend() -> Result<(), PmError> {
     let window = production_window().ok_or(PmError::NotProbed)?;
+    let display = crate::intel_gpu_kms::display_for_bar(&window.0);
+    let mut ownership = match display.as_ref() {
+        Some(display) => Some(display.legacy().map_err(|_| PmError::Busy)?),
+        None => None,
+    };
+    if let Some(guard) = ownership.as_mut() {
+        guard.suspend();
+    }
     let mut core = PM_CORE.lock();
-    core.suspend(&window, &BusPciPower, &ProductionPlatform)
+    let result = core.suspend(&window, &BusPciPower, &LockedProductionPlatform);
+    if result == Err(PmError::Busy) {
+        // A drain refusal made no power writes; the existing console is
+        // still live. Ambiguous PCI failures deliberately stay blocked.
+        if let (Some(guard), Some(console)) = (
+            ownership.as_mut(),
+            crate::intel_gpu::with_controller(|gpu| gpu.current_mode()).flatten(),
+        ) {
+            guard.console_replaced(&console);
+        }
+    }
+    result
 }
 
 /// The device-PM resume entry (registry-facing).
 pub fn production_resume() -> Result<(), PmError> {
     let window = production_window().ok_or(PmError::NotProbed)?;
+    let display = crate::intel_gpu_kms::display_for_bar(&window.0);
+    let mut ownership = match display.as_ref() {
+        Some(display) => Some(display.legacy().map_err(|_| PmError::Busy)?),
+        None => None,
+    };
+    if let Some(guard) = ownership.as_mut() {
+        guard.suspend();
+    }
     let mut core = PM_CORE.lock();
-    core.resume(&window, &BusPciPower, &ProductionPlatform)
+    let result = core.resume(&window, &BusPciPower, &LockedProductionPlatform);
+    if result.is_ok() {
+        if let (Some(guard), Some(console)) = (
+            ownership.as_mut(),
+            crate::intel_gpu::with_controller(|gpu| gpu.current_mode()).flatten(),
+        ) {
+            guard.console_replaced(&console);
+        }
+    }
+    result
 }
 
 /// The S4 coordinator entry: act on the recorded unseal
@@ -1030,8 +1090,25 @@ pub fn production_resume() -> Result<(), PmError> {
 /// unseal, then this reconcile).
 pub fn production_reconcile() -> Result<(), PmError> {
     let window = production_window().ok_or(PmError::NotProbed)?;
+    let display = crate::intel_gpu_kms::display_for_bar(&window.0);
+    let mut ownership = match display.as_ref() {
+        Some(display) => Some(display.legacy().map_err(|_| PmError::Busy)?),
+        None => None,
+    };
+    if let Some(guard) = ownership.as_mut() {
+        guard.suspend();
+    }
     let mut core = PM_CORE.lock();
-    core.reconcile_after_unseal(&window, &ProductionPlatform)
+    let result = core.reconcile_after_unseal(&window, &LockedProductionPlatform);
+    if result.is_ok() && core.phase == PmPhase::Live && core.dstate == PciPowerState::D0 {
+        if let (Some(guard), Some(console)) = (
+            ownership.as_mut(),
+            crate::intel_gpu::with_controller(|gpu| gpu.current_mode()).flatten(),
+        ) {
+            guard.console_replaced(&console);
+        }
+    }
+    result
 }
 
 fn pm_to_device_error(e: PmError) -> DeviceSuspendError {

@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.17** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.18** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -8,7 +8,8 @@
 > landed — see §11; RC6 + DMC landed — see §12; suspend/resume
 > + D-state transitions landed — see §13; external DisplayPort
 > full single-stream landed — see §14; multi-pipe
-> display + DP MST landed — see §16).
+> display + DP MST landed — see §16; fixed-mode MTL/Arrow WC GEM KMS
+> flips connected — see §19 and `spec.md` §3).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -1921,36 +1922,48 @@ Presentation now has a separately owned GGTT window/latch component
 SURFLIVE and a changed stable frame count. Legacy console mappings are
 restricted to their four 32 MiB pipe windows; GEM windows occupy 160–256 MiB,
 below the GT arena. Failed writes, timeout and drop retain uncertain DMA
-owners until independently verified fetch stop. KMS still uses scanout copy:
-direct flips require console handoff, display-power/modeset/PM ownership and
-transactional event/out-fence publication. The detailed owner contract is in
-`spec.md` §3, "Intel GEM framebuffers".
+owners until independently verified fetch stop. The production KMS service
+now installs this owner for fixed-mode Pipe A flips on MTL/Arrow with a live
+GuC backend. It drains console CPU epochs, inhibits PSR, excludes legacy
+modeset/PM and retains old/pending objects through fresh hardware latch
+proof. State, events and out-fences publish together after that proof;
+unsupported pre-arm states restore the console and use checked copy with
+hardware vblank completion. NONBLOCK still waits for latch. Inherited extra
+planes/cursors, FBC and DSB refuse direct takeover. Automatic GT recovery
+quarantines active display owners before reset, while system suspend restores
+the console before power teardown. Gen12 production direct flips await its
+execution backend; external planes, tiled/compressed layouts and recovery
+of quarantined owners remain open. The detailed contract is in `spec.md`
+§3, "Intel GEM framebuffers".
 
-This continuation adds 25 native fixtures: seven for runtime accounting and
-engine progress, six for SLPC controls and twelve for scanout ownership/latch
-evidence. All 25 execute and pass on both kernel architectures, including the
-public WC admission path on x86_64 and its explicit refusal on aarch64. These
-are register/transport and ownership models, not Intel hardware acceptance.
-The complete selected Intel/DRM regression groups pass 579 tests on x86_64
-and 451 on aarch64, without failures or skips. Filters are split into short
-groups to fit x86 PVH's 512-byte command-line bound. Target CI Clippy's three
-feature contexts pass on both architectures, as do all four host vendor
-feature configurations, Intel debug builds, formatting, production boots and
-both btrfs postflights per architecture.
+The runtime/SLPC/scanout foundation added 25 native fixtures: seven for
+runtime accounting and engine progress, six for SLPC and twelve for scanout
+ownership/latch evidence. KMS integration adds 35, including real mapped
+copy, transaction/event publication, console epoch handoff, PSR, inherited
+fetcher refusal, cancellation, suspend and reset quarantine. All 60 execute
+and pass on both kernel architectures; x86_64 exercises public WC GEM flips
+and aarch64 verifies WC refusal alongside the shared lifecycle paths. These
+are native register/transport and ownership models, not Intel hardware
+acceptance. The latest selected Intel/DRM/framebuffer regression groups pass
+648 tests on x86_64 and 520 on aarch64, without failures or skips. Filters
+are split to fit x86 PVH's 512-byte command-line bound. GPU/fb target CI
+Clippy's three feature contexts pass on both architectures, as do all four
+host vendor configurations, Intel debug builds, formatting, production boots
+and both btrfs postflights per architecture.
 
 | Area | Current checkpoint | Still required |
 | --- | --- | --- |
 | GuC execution | Owned GGTT/PPGTT jobs, primed/persistent user RCS0, BCS0 and CCS0 state, verified register policy, graphics-GT/engine workarounds on MTL/Arrow, DG2 and BMG | Additional compute/media engines, remaining out-of-band workarounds and silicon qualification |
 | Render UAPI | Native Xe queries/GEM/VM_BIND (incl. snapshot-pinned MAP_USERPTR)/RCS and COPY queues/EXEC/user fences/per-engine cycles; i915 compatibility with legacy BLT ring, context engine maps and explicit fences; context loss and fresh-epoch rebuild | USERPTR invalidation (MMU notifier), i915 GEM_USERPTR, fault/long-running VMs, i915 load balancing/parallel submission, more queue/query families and Mesa interoperability |
 | Engines and platforms | Main-GT DSS/EU discovery; RCS0, never-fused BCS0 and fuse-derived CCS0 (ccs_mode 1) scheduling; separate Gen12 foundations | BMG BCS8, CCS1-3/ccs_mode > 1, media GT and media submission, independently sourced profiles for other IP |
-| Memory and presentation | Owned system RAM, private tables, same-card CPU PRIME mappings; iGPU write-combining objects (retyped kernel aliases, WC mmap, SCANOUT, non-coherent PAT1/PAT2 binds); Battlemage visible VRAM (zeroed pool, DM PTEs, WC BAR mmap, placement fallback); KMS Intel GEM framebuffers with scanout copy; bounded console GGTT windows and an owned GEM window/surface-latch component | DG2 VRAM (64K pages + CCS clear), small-BAR/unmapped VRAM, eviction, GPU clears, VRAM PRIME/P2P, KMS zero-copy admission (console/display-power/PM ownership and transactional flip events), tiled modifiers |
+| Memory and presentation | Owned system RAM, private tables, same-card CPU PRIME mappings; iGPU write-combining objects (retyped kernel aliases, WC mmap, SCANOUT, non-coherent PAT1/PAT2 binds); Battlemage visible VRAM (zeroed pool, DM PTEs, WC BAR mmap, placement fallback); fixed-mode MTL/Arrow WC GEM KMS flips with console handoff, PM exclusion and hardware latch events; checked-copy fallback and bounded console/GEM GGTT windows | DG2 VRAM (64K pages + CCS clear), small-BAR/unmapped VRAM, eviction, GPU clears, VRAM PRIME/P2P, Gen12 production direct-flip admission, asynchronous NONBLOCK return, tiled/compressed modifiers and extra planes |
 | Display | Gen12 paths and owned Xe-LPG internal-panel modeset | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |
 | Power and faults | Owned GuC/RCS0/BCS0 MSI wakeups with timer fallback, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery; per-context hang recovery with LRC runtime accounting and engine-progress fallback; idle D3hot runtime autosuspend for display-less discrete GTs with epoch-continuing resume; optional GuC SLPC/RC6 with acknowledged frequency bounds and Base/PowerSaving profiles | Error capture, autosuspend with live VRAM (mapping revocation/eviction) or an active iGPU panel (display power wells/DC states), D3cold, dynamic BMG MERT cap removal/L2-flush frequency coordination and media-GT power management |
 | Acceptance | Native register/CT/page-walk and ownership models on both kernel architectures | Intel silicon execution, suspend/resume and Mesa OpenGL/Vulkan interoperability |
 
-#### Remaining-work status (2026-10-31)
+#### Remaining-work status (2026-11-01)
 
-**Size today.** `tokei` code lines (comments and blanks excluded; inline
+**Size before KMS flip integration.** `tokei` code lines (comments and blanks excluded; inline
 test modules included):
 
 | | NARF Intel driver | Linux reference (b90c984d, C) |
@@ -1971,14 +1984,15 @@ test modules included):
 | i915 compatibility | 3–5k | GEM_USERPTR, SSEU, perf, remaining params |
 | Platforms | 8–12k | Lunar Lake (Xe2 iGPU), Panther Lake (Xe3), Tiger Lake/Alder Lake on GuC; roughly 2–4k per family |
 | **GT subtotal** | **50–75k** | |
-| Presentation | 6–10k | KMS zero-copy admission through owned GGTT windows/PLANE_SURF latches, including console handoff, display-power/PM exclusion and flip-done/vblank events; tiled and compressed modifiers; extra planes |
+| Presentation | 6–10k | Gen12/external direct-flip admission; asynchronous NONBLOCK return; recovery of quarantined display owners; tiled and compressed modifiers; extra planes |
 | Atomic modeset | 15–25k | Watermark and DBUF allocation; CDCLK changes with pcode; multi-pipe; bigjoiner; DSC; VRR |
 | Outputs | 15–25k | Type-C/Thunderbolt PHY and DP alt mode; C20 HDMI 2.1; DP 2.0 UHBR; PSR2/panel replay; hotplug |
 | Display power, color, HDCP, Arc display | 15–28k | DC states and DMC, FBC, display runtime PM; gamma/CTM; HDCP; DG2/BMG display |
 | **Display subtotal** | **50–90k** | |
 
-**Usable Meteor Lake desktop subset: ~10–20k.** Finishing presentation,
-including zero-copy flips, plus whatever silicon bring-up exposes. A
+**Usable Meteor Lake desktop subset: ~10–20k (pre-flip estimate).** Fixed-mode
+zero-copy presentation is now implemented; this estimate still needs revision
+after silicon bring-up and Mesa execution acceptance. A
 read-only audit of upstream Mesa main's Xe backends (anv, iris and their
 shared device code) found no startup blocker in the admitted UAPI. The five
 device queries Mesa treats as fatal are served. PXP, the low-latency hint,

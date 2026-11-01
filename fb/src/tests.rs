@@ -1448,3 +1448,73 @@ fn smoke_fb_status_wifi_line() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("fb", smoke_fb_status_wifi_line);
+
+/// A writer cached before Intel KMS must obey the actual fb admission gate,
+/// including views that pass their first check before console pause begins.
+#[cfg(all(feature = "intel", feature = "kernel-test"))]
+fn smoke_fb_intel_kms_pause_drains_cached_views_and_blocks_pixels() -> TestResult {
+    use crate::{FbWriteError, FbWriter, Rect};
+    use core::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    use narf_drivers_gpu::intel_gpu::{
+        kms_console_paused,
+        tests::{kms_pause_console_for_test, kms_resume_console_for_test},
+    };
+    use narf_graphics::Pixel32;
+
+    if kms_console_paused() {
+        return TestResult::Skip("a production Intel KMS session owns the console");
+    }
+    if crate::drawing_paused() {
+        return TestResult::Skip("firmware handoff owns framebuffer access");
+    }
+    crate::install_test_scanout(4, 4);
+    let writer = FbWriter::new(crate::bootstrap_writer()).expect("cached test writer");
+    let rect = Rect::new(0, 0, 4, 4);
+    writer.fill(rect, Pixel32::BLUE).expect("initial fill");
+    let preempt = narf_scheduler::preempt_count();
+    // SAFETY: this synchronous fixture exclusively owns the synthetic backing.
+    // We manually poll the pause future; no task suspension occurs with a view.
+    let mut old = unsafe { writer.scanout_for_cursor() };
+    assert_eq!((old.width, old.height), (4, 4));
+    let mut pause = core::pin::pin!(kms_pause_console_for_test());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert_eq!(pause.as_mut().poll(&mut cx), Poll::Pending);
+    assert!(kms_console_paused());
+    assert!(crate::select_active().is_none());
+    assert_eq!(
+        writer.fill(rect, Pixel32::RED),
+        Err(FbWriteError::NoActiveScanout)
+    );
+    assert_eq!(crate::test_scanout_pixel(0, 0), Some(Pixel32::BLUE));
+    // SAFETY: the post-pause lease has zero geometry and cannot alias the
+    // old pixels. This specifically tests the inner epoch admission check.
+    let mut empty = unsafe { writer.scanout_for_cursor() };
+    assert_eq!((empty.width, empty.height), (0, 0));
+    empty.draw_pixel(0, 0, Pixel32::RED);
+    assert_eq!(crate::test_scanout_pixel(0, 0), Some(Pixel32::BLUE));
+    // A lease from before pause remains valid until its final fenced drop.
+    old.draw_pixel(1, 1, Pixel32::WHITE);
+    assert_eq!(crate::test_scanout_pixel(1, 1), Some(Pixel32::WHITE));
+    drop(old);
+    assert_eq!(pause.as_mut().poll(&mut cx), Poll::Ready(()));
+    // The current empty view cannot starve retirement of the old scanout.
+    drop(empty);
+    assert_eq!(narf_scheduler::preempt_count(), preempt);
+    kms_resume_console_for_test();
+    assert!(!kms_console_paused());
+    writer
+        .fill(rect, Pixel32::GREEN)
+        .expect("same cached writer after resume");
+    assert_eq!(crate::test_scanout_pixel(0, 0), Some(Pixel32::GREEN));
+    assert_eq!(crate::test_scanout_pixel(1, 1), Some(Pixel32::GREEN));
+    crate::clear_test_scanout();
+    TestResult::Pass
+}
+#[cfg(all(feature = "intel", feature = "kernel-test"))]
+kernel_test_in!(
+    "fb",
+    smoke_fb_intel_kms_pause_drains_cached_views_and_blocks_pixels
+);

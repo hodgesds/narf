@@ -239,13 +239,40 @@ impl Drop for DriCardFile {
         }
         // drm_master_release: if this fd held DRM master, drop it so the device
         // is free for the next session's SET_MASTER (greeter→user handoff).
-        if let Some(ms) = crate::drm_registry::mode_state(self.index) {
+        let was_master = if let Some(ms) = crate::drm_registry::mode_state(self.index) {
             let mut ms = ms.lock();
+            let was_master = ms.is_master(self.open_id);
             // drm_fb_release: the framebuffers it made of its GEM buffers.
             ms.release_file_framebuffers(self.open_id);
             ms.master_release(self.open_id);
             ms.magic_release(self.open_id);
+            was_master
+        } else {
+            false
+        };
+        #[cfg(feature = "intel")]
+        if was_master && crate::intel_gpu_kms::active(self.index) {
+            if let (Some(display), Some(mode)) = (
+                crate::intel_gpu_kms::display(self.index),
+                crate::drm_registry::mode_state(self.index),
+            ) {
+                // Drop cannot await. The display owner retains all fronts
+                // until this serialized restoration proves the console latch.
+                // A new master supersedes lastclose's request: never restore
+                // stale console pixels over its newly submitted primary.
+                let _ = narf_scheduler::spawn_stackful(async move {
+                    let Ok(mut session) = display.session().await else {
+                        return;
+                    };
+                    if mode.lock().has_master() {
+                        return;
+                    }
+                    let _ = session.restore_console().await;
+                });
+            }
         }
+        #[cfg(not(feature = "intel"))]
+        let _ = was_master;
         // Last master node closed → release the framebuffer back to the
         // kernel console (no-op if a DRM client never took it over).
         if LIVE_CARD_FILES.fetch_sub(1, core::sync::atomic::Ordering::AcqRel) == 1 {
@@ -584,6 +611,20 @@ impl FileOps for DriCardFile {
                 .intel
                 .dispatch_card_user(self.index, cmd, arg, context)
                 .await
+            {
+                return result;
+            }
+            #[cfg(feature = "intel")]
+            if let Some(result) = crate::drm_ioctl_bridge::intel_kms_async(
+                self.index,
+                self.open_id,
+                cmd,
+                arg,
+                context,
+                Some(&self.events),
+                Some(&self.pending_out_fences),
+            )
+            .await
             {
                 return result;
             }

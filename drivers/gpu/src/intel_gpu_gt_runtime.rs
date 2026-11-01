@@ -700,6 +700,10 @@ impl Owner {
                     state.irq.take(); // stop delivery before resetting the GT
                     delay_us = 500;
                     self.user_epoch.store(0, Ordering::Release);
+                    // A display waiter can depend on one of our fences.
+                    // Poison its proofs synchronously before reset; never
+                    // await the KMS mutex while holding this GT reset mutex.
+                    crate::intel_gpu_kms::quarantine_for_gt_reset(&self.pending.bar);
                     state.parked_epoch = None; // a failed resume is a real loss
                     state.recover_after_stop |= state.phase == Phase::Running;
                     use core::fmt::Write as _;
@@ -886,6 +890,12 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
     fn prepare_suspend(&self) -> narf_power::system_pm::SystemPmFuture<'_> {
         Box::pin(async move {
             use narf_power::device_pm::DeviceSuspendError as E;
+            // Retire display GEM fetch before closing the backend or taking
+            // its reset mutex. KMS holds this same display mutex while a
+            // transaction is armed, so suspend cannot overtake its latch.
+            crate::intel_gpu_kms::quiesce_for_legacy(&self.pending.bar)
+                .await
+                .map_err(|_| E::Busy)?;
             self.suspended.store(true, Ordering::Release);
             self.user_epoch.store(0, Ordering::Release);
             let mut state = self.state.lock().await;

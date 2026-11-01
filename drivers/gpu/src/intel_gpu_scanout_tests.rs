@@ -684,3 +684,149 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_scanout",
     scanout_xelpg_pipe_b_pat_and_ats_vectors
 );
+
+fn scanout_console_restore_requires_fresh_latch_before_reclaim() -> TestResult {
+    let model = Model::new();
+    let mut owner = presenter(&model);
+    let front = object(8192);
+    let front_weak = Arc::downgrade(&front);
+    let id = owner
+        .prepare_object(front, geometry())
+        .expect("front mapping");
+    owner.arm(id, 1, 0).expect("front arm");
+    model.land(0x0a000000, 41);
+    owner.poll(1).expect("front poll").expect("front latch");
+    assert!(!owner.console_active());
+
+    owner.arm_console(2, 2).expect("console arm");
+    assert!(owner.pending());
+    assert!(!owner.console_active());
+    assert_eq!(model.read32(0x7019c), 0x01000000);
+    assert_eq!(model.read32(0x701ac), 0x0a000000);
+    assert_eq!(owner.release(id), Err(ScanoutError::Busy));
+    assert_eq!(owner.shutdown_restored_console(), Err(ScanoutError::Busy));
+    assert!(front_weak.upgrade().is_some());
+
+    // SURFLIVE and a changed counter alone do not retire the GEM front.
+    model.set(0x701ac, 0x01000000);
+    model.set(0x70040, 42);
+    assert_eq!(owner.poll(3), Ok(None));
+    assert_eq!(owner.shutdown_restored_console(), Err(ScanoutError::Busy));
+    assert!(front_weak.upgrade().is_some());
+    // A fresh flip-done with an unchanged frame still cannot complete it.
+    model.land(0x01000000, 41);
+    assert_eq!(owner.poll(4), Ok(None));
+    assert_eq!(owner.release(id), Err(ScanoutError::Busy));
+
+    model.land(0x01000000, 42);
+    let completion = owner.poll(5).expect("console poll").expect("console latch");
+    assert_eq!(completion.ticket, 2);
+    assert_eq!(completion.retired, Some(id));
+    assert_eq!(completion.surface, SurfaceId(0));
+    assert_eq!(completion.stamp.sequence, 42);
+    assert!(owner.console_active() && !owner.pending());
+    // Completion proves no further fetch, but allocation release remains an
+    // explicit step after the cleared PTEs are posted and invalidated.
+    assert!(front_weak.upgrade().is_some());
+    owner
+        .shutdown_restored_console()
+        .expect("restored shutdown");
+    assert!(front_weak.upgrade().is_none());
+    assert_eq!(model.read32(0x850000), 0);
+    assert_eq!(model.read32(0x850008), 0);
+    assert_eq!(model.read32(0x70180) & PLANE_CTL_ENABLE, PLANE_CTL_ENABLE);
+    assert_eq!(model.read32(0x701ac), 0x01000000);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_scanout",
+    scanout_console_restore_requires_fresh_latch_before_reclaim
+);
+
+fn scanout_console_restore_cannot_replace_pending_or_be_abandoned() -> TestResult {
+    let model = Model::new();
+    let mut owner = presenter(&model);
+    let front = object(8192);
+    let weak = Arc::downgrade(&front);
+    let first = owner.prepare_object(front, geometry()).expect("first");
+    let second = owner
+        .prepare_object(object(8192), geometry())
+        .expect("second");
+    owner.arm(first, 1, 0).expect("first arm");
+    let writes = model.0.borrow().writes.len();
+    assert_eq!(owner.arm_console(2, 1), Err(ScanoutError::Busy));
+    assert_eq!(model.0.borrow().writes.len(), writes);
+    assert_eq!(owner.shutdown_restored_console(), Err(ScanoutError::Busy));
+    model.land(0x0a000000, 41);
+    owner.poll(2).expect("first poll").expect("first latch");
+    owner.arm_console(3, 3).expect("console arm");
+    assert_eq!(owner.poll(4), Ok(None));
+    // The caller can cancel its waiter, but the presenter retains the
+    // armed console transition and previous GEM front for the next waiter.
+    assert!(owner.pending());
+    assert_eq!(owner.arm(second, 4, 5), Err(ScanoutError::Busy));
+    assert_eq!(owner.arm_console(5, 5), Err(ScanoutError::Busy));
+    assert_eq!(owner.release(first), Err(ScanoutError::Busy));
+    assert!(weak.upgrade().is_some());
+    model.land(0x01000000, 42);
+    let completion = owner.poll(6).expect("resumed poll").expect("console latch");
+    assert_eq!(completion.ticket, 3);
+    assert_eq!(completion.retired, Some(first));
+    owner.release(first).expect("retired release");
+    assert!(weak.upgrade().is_none());
+    owner
+        .shutdown_restored_console()
+        .expect("remaining prepared release");
+    assert!(owner.surfaces.is_empty());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_scanout",
+    scanout_console_restore_cannot_replace_pending_or_be_abandoned
+);
+
+fn scanout_failed_console_write_and_invalidation_retain_front() -> TestResult {
+    for failed_write in [true, false] {
+        let model = Model::new();
+        let mut owner = presenter(&model);
+        let front = object(8192);
+        let weak = Arc::downgrade(&front);
+        let id = owner.prepare_object(front, geometry()).expect("front");
+        owner.arm(id, 1, 0).expect("arm");
+        model.land(0x0a000000, 41);
+        owner.poll(1).expect("poll").expect("latch");
+        if failed_write {
+            model.0.borrow_mut().drop_surface = true;
+            assert_eq!(owner.arm_console(2, 2), Err(ScanoutError::Unavailable));
+            assert!(owner.pending());
+            assert_eq!(owner.current, Some(id));
+            assert_eq!(
+                owner.shutdown_restored_console(),
+                Err(ScanoutError::Unavailable)
+            );
+        } else {
+            owner.arm_console(2, 2).expect("console arm");
+            model.land(0x01000000, 42);
+            owner.poll(3).expect("console poll").expect("console latch");
+            model.0.borrow_mut().invalidate = false;
+            assert_eq!(
+                owner.shutdown_restored_console(),
+                Err(ScanoutError::Unavailable)
+            );
+        }
+        assert!(weak.upgrade().is_some());
+        assert!(!owner.console_active());
+        assert_eq!(owner.release(id), Err(ScanoutError::Unavailable));
+        // An independent fetch-stop proof can still reclaim a failed owner;
+        // neither an attempted console write nor timeout supplies that proof.
+        model.0.borrow_mut().drop_surface = false;
+        model.0.borrow_mut().invalidate = true;
+        shutdown(&mut owner);
+        assert!(weak.upgrade().is_none());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_scanout",
+    scanout_failed_console_write_and_invalidation_retain_front
+);

@@ -2097,6 +2097,24 @@ pub(crate) fn dispatch_card_for_file(
 
     // 3. Look up the per-cmd handler.
     let nr = drm_uapi::ioc_nr(cmd);
+    #[cfg(feature = "intel")]
+    if crate::intel_gpu_kms::available(card_index) {
+        if intel_kms::mutates(cmd) {
+            return Err(if mode_state.lock().intel_transaction_busy() {
+                FsError::Busy
+            } else {
+                FsError::Unsupported
+            });
+        }
+        if mode_state.lock().intel_transaction_busy()
+            && matches!(
+                IoctlCmd::from_raw(nr),
+                IoctlCmd::GemClose | IoctlCmd::ModeDestroyDumb
+            )
+        {
+            return Err(FsError::Busy);
+        }
+    }
     match IoctlCmd::from_raw(nr) {
         // VERSION needs special-case handling because the user struct
         // holds out-pointers (name/date/desc) that the kernel writes
@@ -8302,8 +8320,13 @@ pub async fn amdgpu_create_dumb_async(
     Some(finish_amdgpu_dumb(arg, req, made))
 }
 
+#[cfg(feature = "intel")]
+#[path = "intel_gpu_kms_ioctl.rs"]
+mod intel_kms;
 #[path = "amdgpu_scanout_kms.rs"]
 mod scanout_kms;
+#[cfg(feature = "intel")]
+pub(crate) use intel_kms::dispatch as intel_kms_async;
 #[cfg(feature = "amdgpu")]
 pub(crate) use scanout_kms::dispatch as amdgpu_kms_async;
 

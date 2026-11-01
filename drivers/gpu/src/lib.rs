@@ -760,6 +760,8 @@ pub mod intel_gpu_hdmi;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_hwconfig;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_kms;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_media;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_modeset;
@@ -791,6 +793,8 @@ pub mod intel_gpu_regions;
 pub mod intel_gpu_render;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_scanout;
+#[cfg(feature = "intel")]
+mod intel_gpu_scanout_io;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_slpc;
 #[cfg(feature = "intel")]

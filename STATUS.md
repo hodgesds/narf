@@ -1380,12 +1380,21 @@ profiles with verified range readback. BMG's source-qualified conservative
 floor/cap remain; dynamic MERT cap removal and media power control are open.
 Legacy console GGTT mappings now enforce their per-pipe reservations. An owned
 GEM scanout/latch component retains objects through hardware completion or
-verified fetch stop, but KMS continues to copy: direct flips still require
-console/display-power/PM ownership and transactional event publication.
+verified fetch stop. The following KMS continuation installs that owner for
+fixed-mode MTL/Arrow Pipe A WC GEM flips, with console epoch handoff, PSR
+inhibition, modeset/PM exclusion and transactional hardware events/out-fences.
+Unsupported pre-arm states restore the retained console for checked-copy
+fallback and observed hardware vblank. NONBLOCK currently waits for latch.
+Gen12 production direct flips, extra planes/modifiers and full recovery of
+quarantined display owners remain open. Automatic GT recovery invalidates
+active display access before reset and retains uncertain owners; system
+suspend restores the console before power teardown.
 Intel silicon and Mesa acceptance remain untested.
-The 25 new native fixtures pass on both architectures. Complete selected
-Intel/DRM regression groups pass 579 tests on x86_64 and 451 on aarch64, with
-zero failures/skips. All three GPU CI Clippy contexts pass per architecture;
+The foundation's 25 native fixtures and KMS integration's 35 fixtures pass
+on both architectures, including real mapped-console copying and cancellation,
+PSR, event publication and reset quarantine. Latest selected Intel/DRM/fb
+regression groups pass 648 tests on x86_64 and 520 on aarch64, with zero
+failures/skips. All three GPU/fb CI Clippy contexts pass per architecture;
 host default/Intel-only/AMD-only/no-vendor all-target Clippy, Intel debug
 builds, formatting, both production boots and both btrfs postflights pass.
 
