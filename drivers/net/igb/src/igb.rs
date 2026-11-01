@@ -3280,7 +3280,7 @@ mod tests {
         if wb.rss_hash() != 0xDEAD_BEEF {
             return TestResult::Fail("igb RX descriptor RSS hash decode drift");
         }
-        if rss_queue_for_hash(0xDEAD_BEEF, &table) != table[(0x6F) as usize] {
+        if rss_queue_for_hash(0xDEAD_BEEF, &table) != table[0x6F] {
             return TestResult::Fail("igb RSS hash-to-queue steering drift");
         }
         if rss_queue_for_hash(0, &table) != 0 || rss_queue_for_hash(127, &table) != 3 {
