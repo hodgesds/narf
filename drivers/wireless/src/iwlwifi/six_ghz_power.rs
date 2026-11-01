@@ -1,6 +1,8 @@
 //! AP_TX_POWER_CONSTRAINTS_CMD v1, Linux mld/power.c and fw/api/power.h.
 //! IEEE TPE parsing reuses the existing family-independent wire parser.
-use crate::ath11k::mac_frame::{TxPowerEnvelope, TxPowerInterpretation};
+use crate::ath11k::mac_frame::TxPowerEnvelope;
+#[cfg(any(test, feature = "kernel-test"))]
+use crate::ath11k::mac_frame::TxPowerInterpretation;
 use narf_wireless::reg::PowerType6Ghz;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

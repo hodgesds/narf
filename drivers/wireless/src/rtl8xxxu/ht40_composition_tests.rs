@@ -6,6 +6,7 @@ use crate::rtl8xxxu::{
     firmware_transport::Executable,
     ht_runtime::{self, Geometry, WideMode, WidePlan, WideProgram, WideQualification},
 };
+use core::pin::Pin;
 use narf_wireless::station_security::RawFrame;
 
 pub(super) fn elements(geometry: Geometry) -> Vec<u8> {
@@ -454,6 +455,29 @@ impl Rig {
         Ok(None)
     }
 }
+// Construct each retained native future on a separate call frame, then leave
+// that frame before polling it. The release ARM smoke otherwise kept a46KiB
+// aggregate temporary frame live across the nested current-source checks.
+// Dynamic dispatch keeps the already boxed future out of the caller's frame.
+type RawTransition<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, crate::rtl8xxxu::receive_runtime::Error>> + 'a>>;
+#[inline(never)]
+fn raw_select_geometry(
+    receiver: &mut Receiver<Fake, AssociatedLink>,
+    geometry: Geometry,
+) -> RawTransition<'_, ()> {
+    Box::pin(receiver.select_station_geometry(Some(geometry)))
+}
+#[inline(never)]
+fn raw_park(receiver: &mut Receiver<Fake, AssociatedLink>) -> RawTransition<'_, ()> {
+    Box::pin(receiver.park())
+}
+#[inline(never)]
+fn raw_resume(
+    receiver: &mut Receiver<Fake, AssociatedLink>,
+) -> RawTransition<'_, crate::rtl8xxxu::power_policy::Permission> {
+    Box::pin(receiver.resume_parked())
+}
 fn raw_epoch_and_current_span() -> Result<(), &'static str> {
     let mut h = Rig::new()?;
     h.push_data()?;
@@ -464,7 +488,7 @@ fn raw_epoch_and_current_span() -> Result<(), &'static str> {
     h.push_data()?;
     let old_rx = h.link.radio.bulk.0.lock().rx;
     let before = h.link.radio.control.0.lock().cold_generation;
-    drive(h.receiver.select_station_geometry(Some(h.geometry)))?
+    drive(raw_select_geometry(&mut h.receiver, h.geometry))?
         .map_err(|_| "EU real same-primary width transition")?;
     // copied() polls this exact model through AssociatedLink, which reads
     // control and bulk again. Complete both guard scopes before invoking it.
@@ -475,14 +499,14 @@ fn raw_epoch_and_current_span() -> Result<(), &'static str> {
         "EU old queued40 copy was relabeled after width change"
     );
     let before_park = h.link.radio.bulk.0.lock().rx;
-    drive(h.receiver.park())?.map_err(|_| "EU wide actual park")?;
+    drive(raw_park(&mut h.receiver))?.map_err(|_| "EU wide actual park")?;
     let parked_rx = { h.link.radio.bulk.0.lock().rx };
     ensure!(
         h.receiver.phase() == crate::rtl8xxxu::receive_runtime::Phase::Parked
             && parked_rx.is_none(),
         "EU wide park left actual RX posted"
     );
-    drive(h.receiver.resume_parked())?.map_err(|_| "EU wide actual wake")?;
+    drive(raw_resume(&mut h.receiver))?.map_err(|_| "EU wide actual wake")?;
     let resumed_rx = { h.link.radio.bulk.0.lock().rx };
     let resumed_rf = { h.link.radio.control.0.lock().rf[0x18] };
     ensure!(

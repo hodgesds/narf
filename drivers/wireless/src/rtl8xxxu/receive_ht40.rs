@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Actual native20/40 program selection, separate from peer metadata.
 use super::*;
+#[cfg(any(test, feature = "kernel-test"))]
+use crate::rtl8xxxu::ht_runtime::WideProgram;
 use crate::rtl8xxxu::{
     device_init::Factory,
-    ht_runtime::{Geometry, WideMode, WidePlan, WideProgram, WideQualification},
+    ht_runtime::{Geometry, WideMode, WidePlan, WideQualification},
     management_runtime::Candidate,
 };
 impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
