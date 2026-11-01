@@ -996,14 +996,47 @@ async fn dispatch_after_address(
         }
         // WBDI fingerprint reader — Microsoft Biometric Device
         // Interface, identified by an MS OS 2.0 Compatible-ID
-        // descriptor of "WINBIO". Last in the cascade because the
-        // wire-up here is intentionally non-fatal: a positive WBDI
-        // sniff records the device for a future userland driver
-        // but doesn't seize the slot beyond logging.
-        if crate::wbdi::try_bind_wbdi_already_addressed(xhci_dev, slot_id, &cfg_blob)
-            .await
-            .is_ok()
+        // descriptor of WINUSB with a WBDI sub-compatible-ID.
+        // Last in the cascade because the table bind above already
+        // claimed every known VID/PID; this step catches only
+        // readers the table missed, and never shadows a table bind.
+        // Recognition is bridged into the fingerprint stack
+        // (fingerprint::try_bridge_wbdi_already_addressed): the
+        // reader gets endpoints + a FingerprintDevice in
+        // FP_DEVICES, consumable through /dev/fp<N> by registry
+        // index via the devfs provider registry. The bridge is
+        // non-fatal — if it fails, the outcome is still
+        // WbdiFingerprint and the slot stays alive exactly as
+        // recognition alone left it (#919). (The "WINBIO" wording
+        // this comment previously carried was wrong: the code has
+        // always matched WINUSB/WBDI.)
+        if let Ok(entry) =
+            crate::wbdi::try_bind_wbdi_already_addressed(xhci_dev, slot_id, &cfg_blob).await
         {
+            match crate::fingerprint::try_bridge_wbdi_already_addressed(
+                xhci_dev, slot_id, &cfg_blob,
+            )
+            .await
+            {
+                Ok(fp_idx) => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  usb-wbdi: slot={} iface={} transport bound fp{}",
+                        slot_id,
+                        entry.vendor_iface,
+                        fp_idx
+                    );
+                }
+                Err(e) => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  usb-wbdi: slot={} iface={} recognised but transport bridge failed: {:?}; slot stays alive, no fingerprint device registered",
+                        slot_id, entry.vendor_iface, e
+                    );
+                }
+            }
             return AttachOutcome::WbdiFingerprint;
         }
 
