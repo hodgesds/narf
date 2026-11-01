@@ -310,8 +310,11 @@ fn credit_poll_copies_stricter_tpe_before_publication() -> R {
         "6GHz native credit poll bypassed the final AP power gate",
     )?;
     drop(state);
+    // The tail-expression temporary otherwise keeps HARNESS locked while
+    // Guard::drop reacquires it to destroy the native model (edition2021).
+    let unpublished = HARNESS.lock().as_ref().unwrap().1.data.len() == before;
     require(
-        HARNESS.lock().as_ref().unwrap().1.data.len() == before,
+        unpublished,
         "6GHz credit poll published DATA using the caller's stale AP power view",
     )
 }
