@@ -371,6 +371,7 @@ fn populate_card_node(
     if card.vendor_id() == 0x8086 {
         crate::intel_gpu_error::populate_card(idx, &kobj);
         crate::intel_gpu_power_controls::populate_card(idx, &kobj);
+        crate::intel_gpu_ccs_control::populate_card(idx, &kobj);
     }
 
     // ── Optional AMDGPU-specific attrs ───────────────────────────────────

@@ -41,6 +41,11 @@ const FRAME_COUNT: u64 = 0x40;
 /// Calling this predicate must neither wait nor re-enter the presenter.
 pub(crate) unsafe trait DisplayAccess: MmioWindow {
     fn access_ok(&self) -> bool;
+    /// Stable physical PCI BAR identity; isolated native register vectors may
+    /// omit it, but production DMA reservations always supply the shared key.
+    fn ggtt_key(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -122,6 +127,18 @@ impl<M: DisplayAccess> PollIo<M> {
             GEM_SCANOUT_GTT_END - GEM_SCANOUT_GTT_START,
         )
         .map_err(|_| IoError::Bounds)?;
+        if let Some(key) = mmio.ggtt_key() {
+            let ledger = crate::intel_gpu_ggtt_ranges::Ledger::for_bar(key, bar_len)
+                .map_err(|_| IoError::Bounds)?;
+            if !ledger.allows(
+                crate::intel_gpu_ggtt_ranges::Kind::Primary,
+                GEM_SCANOUT_GTT_START,
+                GEM_SCANOUT_GTT_END - GEM_SCANOUT_GTT_START,
+            ) {
+                return Err(IoError::Bounds);
+            }
+        }
+
         let status = COMMON_STATUS
             | if format == PteFormat::XeLpg {
                 MTL_ATS_STATUS

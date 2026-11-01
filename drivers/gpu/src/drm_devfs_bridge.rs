@@ -156,6 +156,10 @@ pub struct DriCardFile {
     /// mints the sync_file fds — fd tables belong to that layer, exactly
     /// like EXECBUFFER's FENCE_FD_OUT.
     pending_out_fences: narf_lib::sync::IrqSafeSpinLock<Vec<(u64, u64)>>,
+    /// Declared last so every per-file namespace drops before reconfiguration
+    /// can observe this open's final client lease gone.
+    #[cfg(feature = "intel")]
+    _intel_client: Option<crate::intel_gpu_ccs_control::ClientLease>,
 }
 
 /// Number of live `DriCardFile` (DRM master node) handles. When it falls
@@ -175,6 +179,8 @@ pub(crate) const NO_MASTER_OPEN_ID: u64 = 0;
 impl DriCardFile {
     pub(crate) fn new(index: u32) -> Option<Self> {
         let metadata = crate::drm_registry::node_metadata(index, false)?;
+        #[cfg(feature = "intel")]
+        let intel_client = crate::intel_gpu_ccs_control::client_open(index).ok()?;
         let open_id = NEXT_OPEN_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         LIVE_CARD_FILES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         // drm_master_open: the first opener of a master-free device becomes its
@@ -206,6 +212,8 @@ impl DriCardFile {
                 crate::drm::card::DrmEventQueue::new(),
             )),
             pending_out_fences: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
+            #[cfg(feature = "intel")]
+            _intel_client: intel_client,
         })
     }
 
@@ -1461,6 +1469,9 @@ pub struct DriRenderFile {
     amdgpu_bo_lists: crate::amdgpu_bo_list::BoListTable,
     /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
     client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
+    /// Outlives GEM/VM/queue namespaces, including their destructor work.
+    #[cfg(feature = "intel")]
+    _intel_client: Option<crate::intel_gpu_ccs_control::ClientLease>,
 }
 
 impl Drop for DriRenderFile {
@@ -1881,6 +1892,8 @@ impl DirOps for DriDir {
                     let idx = render_idx - 128;
                     if (idx as usize) < crate::drm_registry::count() {
                         let metadata = crate::drm_registry::node_metadata(idx, true)?;
+                        #[cfg(feature = "intel")]
+                        let intel_client = crate::intel_gpu_ccs_control::client_open(idx).ok()?;
                         #[cfg(feature = "amdgpu")]
                         crate::amdgpu_navi48_runtime_pm::on_open(idx);
                         return Some(Arc::new(DriRenderFile {
@@ -1898,6 +1911,8 @@ impl DirOps for DriDir {
                             #[cfg(feature = "amdgpu")]
                             amdgpu_bo_lists: crate::amdgpu_bo_list::BoListTable::new(),
                             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
+                            #[cfg(feature = "intel")]
+                            _intel_client: intel_client,
                         }));
                     }
                 }

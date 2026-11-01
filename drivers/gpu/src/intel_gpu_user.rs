@@ -62,6 +62,10 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn power_controls(&self) -> Option<Arc<crate::intel_gpu_power_controls::PowerControls>> {
         None
     }
+    /// Client-free compute partition changes serviced by the retained owner.
+    fn ccs_control(&self) -> Option<Arc<crate::intel_gpu_ccs_control::Control>> {
+        None
+    }
     /// Copy bounded firmware logs into an owned diagnostic buffer while the
     /// retained GT excludes reset/power transitions. The file provider owns
     /// diagnostic authorization and rechecks it before every read.

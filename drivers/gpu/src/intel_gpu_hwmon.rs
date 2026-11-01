@@ -16,6 +16,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{intel_gpu_aux::MmioWindow, intel_gpu_gt::GtPlatform};
 
+#[path = "intel_gpu_hwmon_bmg_power.rs"]
+mod bmg_power;
 #[path = "intel_gpu_hwmon_pcode.rs"]
 mod pcode;
 #[path = "intel_gpu_hwmon_power.rs"]
@@ -120,6 +122,7 @@ struct State {
     energy: Option<Energy>,
     energy_lost: bool,
     discovery: pcode::Discovery,
+    mailbox: pcode::Mailbox,
     fan_sampled: Option<u64>,
     fans: [Option<Fan>; 3],
     fan_rpm: [Option<u64>; 3],
@@ -133,6 +136,7 @@ pub(crate) struct Monitor {
     admission: AtomicU64,
     state: IrqSafeSpinLock<State>,
     power: power::Power,
+    bmg_power: bmg_power::Power,
 }
 impl Monitor {
     fn new(platform: GtPlatform) -> Option<Self> {
@@ -149,11 +153,13 @@ impl Monitor {
                 energy: None,
                 energy_lost: false,
                 discovery: pcode::Discovery::default(),
+                mailbox: pcode::Mailbox::default(),
                 fan_sampled: None,
                 fans: [None; 3],
                 fan_rpm: [None; 3],
             }),
             power: power::Power::new(),
+            bmg_power: bmg_power::Power::new(),
         })
     }
 
@@ -171,10 +177,12 @@ impl Monitor {
         state.energy = None;
         state.energy_lost = false;
         state.discovery = pcode::Discovery::default();
+        state.mailbox = pcode::Mailbox::default();
         state.fan_sampled = None;
         state.fans = [None; 3];
         state.fan_rpm = [None; 3];
         self.power.activate(epoch);
+        self.bmg_power.activate(epoch);
         self.admission.store(epoch, Ordering::Release);
     }
 
@@ -187,10 +195,12 @@ impl Monitor {
         state.energy = None;
         state.energy_lost = false;
         state.discovery = pcode::Discovery::default();
+        state.mailbox = pcode::Mailbox::default();
         state.fan_sampled = None;
         state.fans = [None; 3];
         state.fan_rpm = [None; 3];
         self.power.close();
+        self.bmg_power.close();
     }
 
     /// The caller holds the GT reset/power mutex and checks current PCI D0
@@ -240,6 +250,10 @@ impl Monitor {
         // mailbox's failed Access result. Lost fan/energy continuity must not
         // be reconstructed from cached samples when authority later returns.
         self.power.access_lost(epoch);
+        if self.platform == GtPlatform::Battlemage {
+            state.mailbox.access_lost();
+            self.bmg_power.access_lost(epoch);
+        }
     }
 
     fn service(&self, epoch: u64, now: u64, io: &mut impl Io) {
@@ -249,13 +263,30 @@ impl Monitor {
         if self.platform == GtPlatform::Alchemist {
             self.power.service(epoch, now, io);
         } else {
-            let mut discovery = self.state.lock().discovery;
-            discovery.step(now, io);
+            let (mut discovery, mut mailbox) = {
+                let state = self.state.lock();
+                (state.discovery, state.mailbox)
+            };
+            let next = if mailbox.available() {
+                discovery
+                    .command()
+                    .or_else(|| self.bmg_power.command(epoch, now))
+            } else {
+                None
+            };
+            if let Some((client, result)) = mailbox.step(next, now, io) {
+                if client == pcode::Client::Power {
+                    self.bmg_power.complete(epoch, now, result)
+                } else {
+                    discovery.complete(client, result)
+                }
+            }
             let mut state = self.state.lock();
             if state.epoch != epoch || self.admission.load(Ordering::Acquire) != epoch {
                 return;
             }
             state.discovery = discovery;
+            state.mailbox = mailbox;
         }
         self.sample(epoch, now, |offset| io.read(offset));
         self.sample_fans(epoch, now, io);
@@ -417,11 +448,13 @@ impl Monitor {
     }
 
     fn show(&self, attribute: &str, now: u64) -> String {
-        if self.platform == GtPlatform::Alchemist && attribute.starts_with("power2_") {
+        if attribute.starts_with("power2_") {
             return if attribute == "power2_label" {
                 "pkg\n".into()
-            } else {
+            } else if self.platform == GtPlatform::Alchemist {
                 self.power.show(attribute, now)
+            } else {
+                self.bmg_power.show(attribute, now)
             };
         }
         if let Some(index) = attribute
@@ -446,7 +479,7 @@ impl Monitor {
             let current = state.epoch != 0 && self.admission.load(Ordering::Acquire) == state.epoch;
             if attribute == "telemetry_status" {
                 return if current {
-                    state.discovery.status()
+                    state.discovery.status(&state.mailbox)
                 } else {
                     "unavailable\n".into()
                 };
@@ -521,27 +554,6 @@ impl Monitor {
                     monitor.show(attribute, narf_time::monotonic_ns())
                 });
             }
-            for attribute in [
-                "power2_label",
-                "power2_rated_max",
-                "power2_max_default",
-                "power2_max_min",
-                "power2_max_max",
-                "power2_max_status",
-            ] {
-                let monitor = self.clone();
-                kobject_add_attr(&node, attribute, move || {
-                    monitor.show(attribute, narf_time::monotonic_ns())
-                });
-            }
-            let show = self.clone();
-            let store = self.clone();
-            kobject_add_writable_attr(
-                &node,
-                "power2_max",
-                move || show.show("power2_max", narf_time::monotonic_ns()),
-                move |bytes| store.power.store(bytes, narf_time::monotonic_ns()),
-            );
         } else {
             for attribute in [
                 "temp2_emergency",
@@ -557,6 +569,33 @@ impl Monitor {
                 });
             }
         }
+        for attribute in [
+            "power2_label",
+            "power2_rated_max",
+            "power2_max_default",
+            "power2_max_min",
+            "power2_max_max",
+            "power2_max_status",
+        ] {
+            let monitor = self.clone();
+            kobject_add_attr(&node, attribute, move || {
+                monitor.show(attribute, narf_time::monotonic_ns())
+            });
+        }
+        let show = self.clone();
+        let store = self.clone();
+        kobject_add_writable_attr(
+            &node,
+            "power2_max",
+            move || show.show("power2_max", narf_time::monotonic_ns()),
+            move |bytes| {
+                if store.platform == GtPlatform::Alchemist {
+                    store.power.store(bytes, narf_time::monotonic_ns())
+                } else {
+                    store.bmg_power.store(bytes, narf_time::monotonic_ns())
+                }
+            },
+        );
         for attribute in if self.platform == GtPlatform::Alchemist {
             &["fan1_input", "fan2_input"][..]
         } else {

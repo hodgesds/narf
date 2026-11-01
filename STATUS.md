@@ -1459,6 +1459,30 @@ pass all-target Clippy, and both architectures pass debug/release compilation.
 The x86_64 production boot, both btrfs postflights, formatting and diff checks
 pass. aarch64 QEMU is omitted for this architecture-neutral production change.
 
+The fourth Intel software checkpoint adds client-free DG2/BMG CCS
+reconfiguration: primary/render file leases exclude racing opens and outlive
+namespace teardown; a queued administrative request holds runtime PM through
+full reset, every engine's startup proofs and fresh-epoch publication. Busy
+lastclose jobs refuse without reset, while loss/S3 prevents stale-epoch replay.
+BMG package PL1 shares the existing PCODE owner, with passive firmware defaults,
+a retained ceiling, pair-preserving administrative updates and exact current-
+source readback; close discards pending/source ownership without replay.
+Fixed progressive MTL/Arrow Pipe-A active gamma replacement and joint CTM/gamma
+changes now use a real retained DSB chain, independent command-fetch retirement
+and leaf/frame/palette evidence before native events/fences. One private 16 KiB
+WC mapping remains pinned/reused after exposure. Reset, cancellation and master
+handoff cannot bypass its retirement, and temporary recovery authority is
+removed before admission reopens. Mixed framebuffer/color transactions and
+broader display profiles remain open alongside the VM, media, local-memory,
+platform and diagnostics workstreams. All 25 new fixtures pass on x86_64;
+selected Intel/DRM/fb groups pass 774 unique tests, with zero failures/skips.
+GPU/fb target CI Clippy passes all three contexts on both architectures, all
+four host GPU vendor configurations pass all-target Clippy, and both targets
+pass debug/release compilation. aarch64 QEMU is intentionally omitted because
+this wave introduces no aarch64-specific production code. The x86_64 production
+boot, both btrfs postflights, formatting, diff and final source-integrity checks
+pass. Intel silicon and Mesa acceptance remain unrun.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

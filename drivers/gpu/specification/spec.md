@@ -702,7 +702,7 @@ Linux reserves the highest BCS for USM. NARF has no USM owner and currently
 admits ordinary copy jobs there; adding USM must reserve/revoke that engine's
 userspace availability rather than silently sharing its ownership.
 
-**Boot-selected compute partition.** `narf.intel.ccs_mode=N` selects one
+**Boot-selected compute partition.** `narf.intel.ccs_mode=N` initially selects one
 through four compute engines on DG2/BMG; absence means one. Exactly one
 canonical value is accepted before the boot `--` delimiter. Bare, duplicate,
 malformed and out-of-range settings return `RuntimeError::Configuration`
@@ -721,8 +721,36 @@ dense user instances. Each engine has independent saves/default priming,
 nonprivileged policy, IRQ attribution, timestamps, watchdog and PPGTT proof.
 Full reset/S3 requires revalidation. Clean runtime resume may retain a user
 epoch only when the exact physical EngineSet, raw fuse mask and requested
-mode match the parked state. Dynamic sysfs reconfiguration and client-free
-reset arbitration remain separate work; no live mode setter is exposed.
+mode match the parked state. The partition is never patched on live engines;
+dynamic changes require the client-free reset transaction below.
+
+**Client-free compute reconfiguration.** DG2/BMG card sysfs exposes cached
+`ccs_mode`, read-only `num_cslices` and `ccs_mode_status`. A current
+initial-namespace CAP_SYS_ADMIN grant is required for every mode store.
+The bounded scalar accepts canonical 1..4, subject to the same fuse/divisor
+rules. Stores enqueue one request and perform no MMIO or waits. Status
+distinguishes unavailable, ready, queued, applying, applied and failed;
+acceptance is asynchronous and does not claim Linux's synchronous sysfs reset
+semantics. The scalar remains the last confirmed configuration during loss.
+
+Both primary and render node construction acquire a per-card client lease
+before namespaces or master side effects, including before backend readiness
+and on GT-only cards without a mode-state `Card`. The lease outlives namespace
+destruction and the last `Arc` of its file. Request acceptance atomically
+requires zero clients and closes the same gate. New devfs lookups temporarily
+return no file while that gate is closed; directory enumeration may still list
+the nodes. Other vendors and invalid indices create no Intel gate.
+
+The worker first takes a runtime-PM reference outside the GT mutex. Under
+that mutex it requires the exact old epoch/partition and an idle `GuCGt`,
+including jobs retained after lastclose. Busy work refuses the change without
+reset. Otherwise it closes the public epoch, controls and IRQ delivery before
+the existing GuC plus full-engine stop, and retains the gate and power through
+fresh bring-up and every selected engine's startup proof. Only verified new
+epoch publication reopens clients. True loss/S3 close retires the prior epoch
+even without pending work; a stale callback cannot publish it again. Ordinary
+idle park retains the same partition/epoch contract. Load balancing and
+parallel queues remain separate work.
 
 `intel_gpu_nonpriv::EnginePolicy` initializes each admitted engine's twelve
 FORCE_TO_NONPRIV slots while idle under the GT owner's forcewake holds.
@@ -945,7 +973,32 @@ sample; `telemetry_status` reports unavailable/discovery failures. BMG thermal
 files are `temp2_emergency`, `temp2_crit`, `temp2_max`, `temp3_emergency`
 and `temp3_crit`, created once and empty until proven. Writable fan/thermal
 controls and BMG PMT energy remain open; no GUID-addressed telemetry reader
-or firmware power-limit mailbox is invented.
+is admitted.
+
+BMG package PL1 extends that same port owner with `POWER_SETUP` read/write
+commands. The existing fan/thermal discovery and PL1 actor share one pending
+command; a service step posts or polls one transfer, without posting another
+command on completion. Fresh firmware-source reads expose cached
+`power2_max_default`/`power2_max_max` and the representable policy floor
+`power2_max_min=125000` microWatts. That floor is not a guessed SKU fuse.
+The first valid enabled firmware-source PL1 remains the card's ceiling across
+activation/reset. Before an explicit administrative source switch,
+`power2_max_status` is default-only and current `power2_max`/`power2_rated_max`
+are empty. Reads never switch firmware power policy.
+
+A BMG `power2_max` store uses current CAP_SYS_ADMIN, fresh bounds, nonzero
+checked 125000-microWatt quantization and one queued/in-flight request. The
+actor reads the selected source afresh, changes only PL1 value/enable bits,
+preserves PL2 and time/unrelated fields, posts the pair, then reads PCODE
+source zero. Successful status alone is not completion: the entire pair must
+match before current values and applied status are published. Subsequent
+background reads refresh that owned source at most once per second. Close
+discards pending/source ownership without writes or policy replay; a later
+activation starts with passive firmware-source observations again. Errors
+disable the power actor until activation; ambiguous port ownership additionally
+quarantines every mailbox client. Known authority loss clears matching cached
+observations immediately between sampling ticks. PL2/card/time-window controls,
+disabling limits, instantaneous watt telemetry and PMT energy remain open.
 
 User-job timeout accounting follows `xe_lrc_timestamp` and `check_timeout`:
 a trusted per-context restore batch marks the saved CTX_TIMESTAMP active, and
@@ -6789,14 +6842,38 @@ retain their existing contracts. Admission copies all color data and retains
 both resulting blob identities through queued/projected state and native
 completion; destroying blobs cannot substitute data under an admitted job.
 
-Only one color resource may change in a client transaction. Simultaneous
-changed CTM and gamma identities, or color mixed with framebuffer, geometry,
-route or mode changes, refuse before MMIO (including TEST_ONLY). Active gamma
-cannot be replaced by a different nonzero LUT: users explicitly disable,
-then install the new LUT. Same-LUT CTM changes and ordinary surface flips do
-not write palette data. Tear-free active replacement and jointly armed
-resources await a real DSB/early-vblank owner; a stable frame counter across
-two independent control writes alone is not a common-latch proof.
+Color mixed with framebuffer, geometry, route or mode changes refuses before
+MMIO, including TEST_ONLY. Active gamma replacement and jointly changed CTM/
+gamma use an independently retained display state buffer (DSB) owner on the
+fixed progressive MTL/Arrow Pipe-A profile. TEST_ONLY validates the retained
+mode and copies blobs without acquiring the hardware owner. Execution also
+checks live fixed timing, disabled VRR/DCB/interlace, PSR inhibition and source-
+qualified MTL DEwake latencies; unsupported live state refuses before arming.
+Same-LUT CTM changes and ordinary surface flips do not write palette data.
+
+The DSB0 command stream programs non-arming coefficients before hardware
+scanline evasion, jointly arms the color controls and starts DSB1 at vblank.
+DSB1 loads the single-buffered precision LUT/clamps and emits the leaf program
+completion. A single-buffer stream handles combined control changes without
+LUT data. Completion requires fresh owned status without errors, consumed
+command tails, idle DSB0 followed by verified disable, then idle/disabled DSB1,
+a later stable frame and actual color/palette readback. Unrelated display
+interrupt causes are preserved; delivery for the owned engines remains masked
+and their status is polled by the queued KMS owner. GT reset or a new console
+latch alone never proves DSB command-fetch retirement.
+
+A per-function GGTT ledger checks the fixed console, primary and GT ranges
+and leases exclusive command addresses from the 144–160 MiB gap. DSB retains
+one private 16 KiB WC command BO with PAT1 after first exposure. Successful
+retirement parks and reuses the same physical pages and GGTT address; it never
+frees/rebinds a cached command translation without a global invalidation owner.
+Lost authority, timeout or an uncertain dropped owner retains its BO, PTEs,
+lease and IO owner. Fresh reset recovery allows only the retained Pipe-A
+DSB0/1 through the inherited-fetcher check, then retires that old stream before
+restoring color or programming a new console. Its temporary fresh IO view is
+replaced by normal reset-checked IO before reopening. Cancellation and master
+handoff obey the same retirement ordering. This bounded lifetime costs one
+retained mapping per installed display owner.
 
 Initial takeover requires full RGB bypass: no pipe/output CSC, pre/post
 gamma, plane transforms or nonzero CUS_CTL, with primary
@@ -6808,7 +6885,7 @@ adoption retains strict checks; unrelated pipes are untouched.
 The owner retains original CSC coefficients/offsets/mode and gamma mode. On
 first inactive LUT preload it also retains the 1024 original precision words
 and six extended maxima. LUT conversion follows Linux's rounded 16-to-10-bit
-packing; maxima are 1<<16. Preload happens only with LUT bypass proven.
+packing; maxima are 1<<16. CPU preload happens only with LUT bypass proven; active replacement uses the DSB chain.
 Control/CSC readback and a later stable changed frame after posted arm prove
 completion; a detected frame crossing during arm fails and retains ownership.
 Hardware completion becomes successful only at final Card publication.
@@ -6817,7 +6894,7 @@ restoration. Strictly pre-write Unsupported leaves recovery available; any
 uncertain write/readback/timeout retains the owner and cannot publish success.
 
 Full console release, close/drop, suspend and fresh-view reset recovery first
-arm original bypass controls and obtain later-frame/readback proof. Only then
+retire any pending DSB commands, then arm original bypass controls and obtain later-frame/readback proof. Only then
 may they restore and verify the original inactive palette/maxima, release
 color/PSR ownership and reopen display admission. Internal restoration may
 change both controls but publishes no client atomic color success. Failed

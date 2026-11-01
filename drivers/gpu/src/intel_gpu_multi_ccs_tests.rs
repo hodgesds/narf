@@ -367,3 +367,7 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_multi_ccs",
     smoke_multi_ccs_timeout_bans_only_physical_ccs3_after_terminal_retirement
 );
+
+mod dynamic {
+    include!("intel_gpu_ccs_control_hw_tests.rs");
+}

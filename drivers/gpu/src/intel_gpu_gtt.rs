@@ -330,12 +330,22 @@ pub fn map_contiguous_scanout(
     start_phys: u64,
     size_bytes: u64,
 ) -> Result<u32, GttError> {
+    let ledger = crate::intel_gpu_ggtt_ranges::Ledger::for_bar(gtt_mmadr.phys.raw(), gtt_mmadr.len)
+        .map_err(|_| GttError::OutOfBounds)?;
+
     // We arbitrarily pick a GTT offset of 16 MiB (0x1000000) for our scanout
     // to avoid colliding with whatever the UEFI GOP mapped lower down (often at 0).
     const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
 
     let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
     check_console_scanout_range(gtt_mmadr.len, SCANOUT_GTT_OFFSET, size_bytes)?;
+    if !ledger.allows(
+        crate::intel_gpu_ggtt_ranges::Kind::Console(0),
+        SCANOUT_GTT_OFFSET,
+        size_bytes,
+    ) {
+        return Err(GttError::OutOfBounds);
+    };
     for i in 0..pages {
         let phys = start_phys + i * GTT_PAGE_SIZE;
         let pte = encode_scanout_pte(phys, PatSlot::Slot2)?;
@@ -371,10 +381,20 @@ pub fn alloc_coherent_scanout(
     gtt_mmadr: &narf_bus::bar::MmioRegion,
     size_bytes: u64,
 ) -> Result<(u32, alloc::vec::Vec<narf_memory::frame::PhysFrame>), GttError> {
+    let ledger = crate::intel_gpu_ggtt_ranges::Ledger::for_bar(gtt_mmadr.phys.raw(), gtt_mmadr.len)
+        .map_err(|_| GttError::OutOfBounds)?;
+
     const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
 
     let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
     check_console_scanout_range(gtt_mmadr.len, SCANOUT_GTT_OFFSET, size_bytes)?;
+    if !ledger.allows(
+        crate::intel_gpu_ggtt_ranges::Kind::Console(0),
+        SCANOUT_GTT_OFFSET,
+        size_bytes,
+    ) {
+        return Err(GttError::OutOfBounds);
+    };
     let mut frames = alloc::vec::Vec::with_capacity(pages as usize);
 
     for i in 0..pages {
@@ -494,6 +514,9 @@ pub fn alloc_contiguous_scanout_with_format(
     format: PteFormat,
     pat_index: u8,
 ) -> Result<ContiguousScanout, GttError> {
+    let ledger = crate::intel_gpu_ggtt_ranges::Ledger::for_bar(gtt_mmadr.phys.raw(), gtt_mmadr.len)
+        .map_err(|_| GttError::OutOfBounds)?;
+
     if size_bytes == 0 || gtt_offset % GTT_PAGE_SIZE != 0 || gtt_offset > u32::MAX as u64 {
         return Err(GttError::OutOfBounds);
     }
@@ -501,6 +524,14 @@ pub fn alloc_contiguous_scanout_with_format(
     let order = scanout_order_for(size_bytes).ok_or(GttError::OutOfMemory)?;
     let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
     check_console_scanout_range(gtt_mmadr.len, gtt_offset, size_bytes)?;
+    let pipe = ((gtt_offset - SCANOUT_GTT_OFFSET_PIPE_A) / CONSOLE_SCANOUT_WINDOW_BYTES) as u8;
+    if !ledger.allows(
+        crate::intel_gpu_ggtt_ranges::Kind::Console(pipe),
+        gtt_offset,
+        size_bytes,
+    ) {
+        return Err(GttError::OutOfBounds);
+    };
     let head = narf_memory::frame::alloc_pages_on(0, order).map_err(|_| GttError::OutOfMemory)?;
     let base = head.start_address().raw();
     for i in 0..pages {

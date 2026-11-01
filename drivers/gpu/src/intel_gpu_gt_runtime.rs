@@ -74,6 +74,9 @@ struct State {
     parked_epoch: Option<(u64, crate::intel_gpu_engine::EngineSet, (u8, u8))>,
     /// The SLPC outcome of this GT incarnation has been logged.
     slpc_reported: bool,
+    /// Immutable boot choice initially; changed only by a client-free reset
+    /// transaction. Clean runtime resume preserves this exact owner policy.
+    ccs_mode: Result<u8, RuntimeError>,
 }
 
 struct Pending {
@@ -98,7 +101,7 @@ struct Owner {
     user_facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
     power_controls: Arc<crate::intel_gpu_power_controls::PowerControls>,
     hwmon: Option<Arc<crate::intel_gpu_hwmon::Monitor>>,
-    ccs_mode: Result<u8, RuntimeError>,
+    ccs_control: Option<Arc<crate::intel_gpu_ccs_control::Control>>,
 }
 
 #[derive(Debug)]
@@ -110,9 +113,13 @@ struct Backend {
     platform: GtPlatform,
     facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
     power_controls: Arc<crate::intel_gpu_power_controls::PowerControls>,
+    ccs_control: Option<Arc<crate::intel_gpu_ccs_control::Control>>,
 }
 
 impl crate::intel_gpu_user::UserBackend for Backend {
+    fn ccs_control(&self) -> Option<Arc<crate::intel_gpu_ccs_control::Control>> {
+        self.ccs_control.clone()
+    }
     fn guc_log_snapshot(
         &self,
         buffer: crate::intel_gpu_guc_log::CaptureBuffer,
@@ -390,6 +397,7 @@ pub(crate) fn start_pending() {
             GtPlatform::from_pci(p.device.id.vendor, p.device.id.device)
                 .expect("admitted platform"),
         );
+        let ccs_control = crate::intel_gpu_ccs_control::Control::new(p.index);
         let owner = Arc::new(Owner {
             pending: p,
             pm,
@@ -408,6 +416,7 @@ pub(crate) fn start_pending() {
                 recover_after_stop: false,
                 parked_epoch: None,
                 slpc_reported: false,
+                ccs_mode: ccs_boot_mode(narf_boot::args()),
             }),
             suspended: AtomicBool::new(false),
             user_epoch: Arc::new(AtomicU64::new(0)),
@@ -416,7 +425,7 @@ pub(crate) fn start_pending() {
             user_facts: Arc::new(IrqSafeSpinLock::new(None)),
             power_controls: Arc::new(crate::intel_gpu_power_controls::PowerControls::new()),
             hwmon,
-            ccs_mode: ccs_boot_mode(narf_boot::args()),
+            ccs_control,
         });
         *ops.0.lock() = Arc::downgrade(&owner);
         let backend = Arc::new(Backend {
@@ -431,6 +440,7 @@ pub(crate) fn start_pending() {
             .expect("admitted platform"),
             facts: owner.user_facts.clone(),
             power_controls: owner.power_controls.clone(),
+            ccs_control: owner.ccs_control.clone(),
         });
         if owner.pending.card.install_user_backend(backend).is_err() {
             log(
@@ -571,7 +581,7 @@ impl Owner {
     }
 
     fn cold_start(&self, state: &mut State) -> Result<(), RuntimeError> {
-        let mode = self.ccs_mode?;
+        let mode = state.ccs_mode?;
         let platform =
             GtPlatform::from_pci(self.pending.device.id.vendor, self.pending.device.id.device)
                 .ok_or(RuntimeError::Device)?;
@@ -633,7 +643,7 @@ impl Owner {
         Ok(())
     }
 
-    fn step(&self, state: &mut State) -> Result<(), RuntimeError> {
+    fn step(&self, state: &mut State, reconfiguration_power: bool) -> Result<(), RuntimeError> {
         if state.phase == Phase::Cold {
             let current = narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
                 .map_err(|_| RuntimeError::Authority)?
@@ -686,7 +696,7 @@ impl Owner {
                     .card
                     .publish_gt_topology(gt)
                     .map_err(RuntimeError::Gt)?;
-                gt.begin_scheduling_with_ccs_mode(now, self.ccs_mode?)
+                gt.begin_scheduling_with_ccs_mode(now, state.ccs_mode?)
                     .map_err(RuntimeError::Gt)?;
                 state.phase = Phase::Reloading;
             }
@@ -776,6 +786,28 @@ impl Owner {
                 }
             }
             (Phase::Running, GtState::SchedulingReady) => {
+                if reconfiguration_power {
+                    if let Some(control) = &self.ccs_control {
+                        let epoch = self.user_epoch.load(Ordering::Acquire);
+                        if control
+                            .begin(gt, epoch, now, |mode| {
+                                self.close_controls();
+                                self.user_epoch.store(0, Ordering::Release);
+                                state.irq.take();
+                                state.irq_tried = false;
+                                crate::intel_gpu_kms::quarantine_for_gt_reset(&self.pending.bar);
+                                state.parked_epoch = None;
+                                state.ccs_mode = Ok(mode);
+                                state.recover_after_stop = true;
+                            })
+                            .map_err(RuntimeError::Gt)?
+                            .is_some()
+                        {
+                            state.phase = Phase::Cleaning;
+                            return Ok(());
+                        }
+                    }
+                }
                 use crate::intel_gpu_guc_sched::SlpcState;
                 match gt.slpc() {
                     SlpcState::Running if !state.slpc_reported => {
@@ -806,14 +838,39 @@ impl Owner {
     }
 
     async fn run(self: Arc<Self>) {
+        let mut reconfiguration_power = None;
         loop {
+            let mut reconfiguration_power_failed = false;
+            // Runtime resume can acquire this same GT mutex. Never request
+            // power while holding it, and retain the usage reference across
+            // verified stop, all new probes and epoch publication.
+            if self
+                .ccs_control
+                .as_ref()
+                .is_some_and(|control| control.needs_power())
+                && !self.suspended.load(Ordering::Acquire)
+            {
+                if reconfiguration_power.is_none() {
+                    match Awake::take(&self).await {
+                        Ok(awake) => reconfiguration_power = Some(awake),
+                        Err(_) => {
+                            reconfiguration_power_failed = true;
+                            if let Some(control) = &self.ccs_control {
+                                control.close();
+                            }
+                        }
+                    }
+                }
+            } else {
+                drop(reconfiguration_power.take());
+            }
             let mut wait = None;
             let mut delay_us = 500;
             if !self.suspended.load(Ordering::Acquire) {
                 let mut state = self.state.lock().await;
                 // Snapshot the IRQ epoch before servicing any status. The
                 // waiter observes an edge even before its first poll.
-                if let Some(irq) = &state.irq {
+                if let Some(irq) = state.irq.as_ref().filter(|_| !reconfiguration_power_failed) {
                     wait = Some(narf_interrupts::wait_for_irq(irq.vector()));
                     match irq.service(narf_time::monotonic_ns()) {
                         Ok(pending) => delay_us = if pending { 10 } else { 10_000 },
@@ -827,7 +884,12 @@ impl Owner {
                         }
                     }
                 }
-                if let Err(error) = self.step(&mut state) {
+                let stepped = if reconfiguration_power_failed {
+                    Err(RuntimeError::Authority)
+                } else {
+                    self.step(&mut state, reconfiguration_power.is_some())
+                };
+                if let Err(error) = stepped {
                     drop(wait.take());
                     state.irq.take(); // stop delivery before resetting the GT
                     delay_us = 500;
@@ -880,6 +942,9 @@ impl Owner {
                         crate::intel_gpu_error::record(self.pending.index, report);
                     }
                     self.close_controls();
+                    if let Some(control) = &self.ccs_control {
+                        control.close();
+                    }
                     self.user_epoch.store(0, Ordering::Release);
                     // A display waiter can depend on one of our fences.
                     // Poison its proofs synchronously before reset; never
@@ -921,13 +986,40 @@ impl Owner {
                         && !self.suspended.load(Ordering::Acquire)
                     {
                         if let Some(epoch) = state.gt.as_ref().and_then(GuCGt::user_epoch) {
-                            self.power_controls.activate(epoch);
-                            if let Some(hwmon) = &self.hwmon {
-                                hwmon.activate(epoch);
+                            let configuration =
+                                state.gt.as_ref().and_then(GuCGt::compute_configuration);
+                            let mut publish = || {
+                                self.power_controls.activate(epoch);
+                                if let Some(hwmon) = &self.hwmon {
+                                    hwmon.activate(epoch);
+                                }
+                                self.user_epoch.store(epoch, Ordering::Release);
+                                state.parked_epoch = None;
+                                state.phase = Phase::Running;
+                            };
+                            let configured = match (&self.ccs_control, configuration) {
+                                (Some(control), Some(configuration)) => {
+                                    control.publish_with(epoch, configuration, publish)
+                                }
+                                (Some(_), None) => Err(narf_filesystem::FsError::NoDevice),
+                                (None, _) => {
+                                    publish();
+                                    Ok(())
+                                }
+                            };
+                            if configured.is_err() {
+                                // DisplayRecovery is not a polling phase:
+                                // the next step returns State and takes the
+                                // common fatal/reset path before admission.
+                                self.close_controls();
+                                self.user_epoch.store(0, Ordering::Release);
+                                if let Some(control) = &self.ccs_control {
+                                    control.close();
+                                }
+                                drop(state);
+                                narf_scheduler::yield_now().await;
+                                continue;
                             }
-                            self.user_epoch.store(epoch, Ordering::Release);
-                            state.parked_epoch = None;
-                            state.phase = Phase::Running;
                         }
                     }
                 }
@@ -1141,6 +1233,9 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             // activation. Display quiescence remains outside this lock.
             let mut state = self.state.lock().await;
             self.close_controls();
+            if let Some(control) = &self.ccs_control {
+                control.close();
+            }
             self.suspended.store(true, Ordering::Release);
             self.user_epoch.store(0, Ordering::Release);
             state.irq.take(); // mask/synchronize while the function is in D0

@@ -8,6 +8,9 @@ use core::cell::{Cell, RefCell};
 use narf_filesystem::FsError;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+#[path = "intel_gpu_hwmon_bmg_power_tests.rs"]
+mod bmg_power_tests;
+
 const PL1: u64 = 0x1459a0;
 const BOOT_PL1: u32 = 0x5a2e_8640; // enabled200 W, unrelated fields retained
 const SECOND: u64 = 1_000_000_000;
@@ -82,6 +85,12 @@ impl MmioWindow for Hardware {
         self.writes.borrow_mut().push((offset, value));
         if offset != PL1 || self.sticky_pl1.get() {
             self.set(offset, value);
+        }
+        // The legacy discovery model has no package-power firmware support.
+        // Its first passive package read completes Illegal Command, rather
+        // than pretending the new power client owns a working endpoint.
+        if offset == pcode::MAILBOX && value == 0x8001_087c {
+            self.set(offset, 1);
         }
     }
 }
@@ -371,8 +380,8 @@ fn smoke_hwmon_bmg_owned_mailbox_fans_and_thermal_limit_wire_cases() -> TestResu
     assert!(!hw.reads.borrow().contains(&0x1381a0));
     assert_eq!(
         hw.writes.borrow().len(),
-        6,
-        "discovery repeatedly posted commands"
+        9,
+        "two discovery reads plus one refused package read expected"
     );
     assert!(monitor.show("temp2_crit", 4 * SECOND + 1).is_empty());
     hw.reads.borrow_mut().clear();

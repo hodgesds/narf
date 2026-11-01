@@ -839,6 +839,7 @@ pub struct GgttArena {
     policy: Option<crate::intel_gpu_gt_hw::CachePolicy>,
     authority: Option<crate::intel_gpu_gt_hw::AuthorizedWindow>,
     gt_platform: Option<crate::intel_gpu_gt::GtPlatform>,
+    ggtt_ledger: Option<alloc::sync::Arc<crate::intel_gpu_ggtt_ranges::Ledger>>,
 }
 
 impl core::fmt::Debug for GgttArena {
@@ -887,6 +888,8 @@ impl GgttArena {
             policy: None,
             authority: None,
             gt_platform: None,
+            ggtt_ledger: crate::intel_gpu_ggtt_ranges::Ledger::for_bar(bar.phys.raw(), bar.len)
+                .ok(),
         }
     }
 
@@ -967,6 +970,17 @@ impl GpuAllocator for GgttArena {
             }
         }
         let (i, off, len) = slot.ok_or(SubmitError::OutOfMemory)?;
+        if self.bar.len != 0
+            && !self.ggtt_ledger.as_ref().is_some_and(|ledger| {
+                ledger.allows(
+                    crate::intel_gpu_ggtt_ranges::Kind::Gt,
+                    u64::from(off),
+                    u64::from(pages) * GTT_PAGE_SIZE,
+                )
+            })
+        {
+            return Err(SubmitError::OutOfMemory);
+        }
         if self.ggtt_va_size != 0 && off as u64 + pages as u64 * GTT_PAGE_SIZE > self.ggtt_va_size {
             return Err(SubmitError::OutOfMemory);
         }

@@ -1,14 +1,11 @@
-//! BMG read-only PCODE discovery. MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad
-//! xe_pcode.c::{xe_pcode_read,__pcode_mailbox_rw,pcode_mailbox_status},
-//! xe_hwmon.c::{xe_hwmon_pcode_read_fan_control,xe_hwmon_pcode_read_thermal_info},
-//! xe_pcode_api.h. One bounded step per retained GT service poll, no spinning.
+//! One BMG PCODE port owner for discovery and package PL1 transactions.
+//! MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad xe_pcode.c,
+//! xe_pcode_api.h and xe_hwmon.c. One bounded post OR poll per service.
 //!
-//! This port is exclusive to this service on the admitted dGPU path:
-//! intel_gpu::probe returns probe_discrete before constructing the integrated
-//! display Controller; probe_discrete installs a GT-only card with display=None.
-//! Existing intel_gpu_pcode callers are integrated modeset::program_watermarks
-//! only. GuC boot, SLPC and dGPU PM do not use the PCODE port. Any future dGPU
-//! PCODE owner must join this transaction owner before it may be admitted.
+//! intel_gpu::probe returns GT-only probe_discrete before constructing the
+//! integrated display Controller. Existing intel_gpu_pcode callers belong to
+//! integrated modeset::program_watermarks; GuC/SLPC/dGPU PM use no PCODE port.
+//! Future dGPU PCODE clients must join this owner before being admitted.
 
 use super::Io;
 
@@ -16,14 +13,10 @@ pub(super) const MAILBOX: u64 = 0x138124;
 pub(super) const DATA0: u64 = 0x138128;
 pub(super) const DATA1: u64 = 0x13812c;
 const READY: u32 = 1 << 31;
-const FAN_COUNT: u32 = 0x047d;
-const THERMAL_LIMITS: u32 = 0x25;
-// xe_pcode_read's timeout is 1 ms. A late service poll first tests completion;
-// only an observed still-busy command can time out and quarantine this owner.
-const TIMEOUT_NS: u64 = 1_000_000;
+const TIMEOUT_NS: u64 = 1_000_000; // xe_pcode_read and PL_WRITE_MBX_TIMEOUT_MS
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Fault {
+pub(super) enum Fault {
     Access,
     ForeignBusy,
     Identity,
@@ -31,120 +24,190 @@ enum Fault {
     Status(u8),
     Data,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Client {
+    Fan,
+    Thermal,
+    Power,
+}
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Reply {
+    None,
+    One,
+    Two,
+}
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Command {
+    pub(super) client: Client,
+    pub(super) word: u32,
+    pub(super) input: [u32; 2],
+    pub(super) reply: Reply,
+}
 #[derive(Clone, Copy, Debug)]
 struct Pending {
-    command: u32,
+    command: Command,
     posted_at: u64,
 }
 #[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Mailbox {
+    pending: Option<Pending>,
+    fault: Option<Fault>,
+}
+impl Mailbox {
+    pub(super) fn available(&self) -> bool {
+        self.pending.is_none() && self.fault.is_none()
+    }
+    pub(super) fn fault(&self) -> Option<Fault> {
+        self.fault
+    }
+    pub(super) fn access_lost(&mut self) {
+        self.fault = Some(Fault::Access);
+        self.pending = None;
+    }
+    pub(super) fn step(
+        &mut self,
+        next: Option<Command>,
+        now: u64,
+        io: &mut impl Io,
+    ) -> Option<(Client, Result<[u32; 2], Fault>)> {
+        if self.fault.is_some() {
+            return None;
+        }
+        let command = self.pending.map(|p| p.command).or(next)?;
+        let result = if let Some(pending) = self.pending {
+            match self.poll(pending, now, io) {
+                Ok(None) => return None,
+                Ok(Some(data)) => Ok(data),
+                Err(error) => Err(error),
+            }
+        } else {
+            match self.post(command, now, io) {
+                Ok(()) => return None,
+                Err(error) => Err(error),
+            }
+        };
+        self.pending = None;
+        if let Err(error) = result {
+            // A completed error status/data error retains software ownership
+            // of an idle port. An ambiguous transfer quarantines the port.
+            if !matches!(error, Fault::Status(_) | Fault::Data) {
+                self.fault = Some(error)
+            }
+        }
+        Some((command.client, result))
+    }
+    fn post(&mut self, command: Command, now: u64, io: &mut impl Io) -> Result<(), Fault> {
+        let mailbox = io
+            .read(MAILBOX)
+            .filter(|&v| v != u32::MAX)
+            .ok_or(Fault::Access)?;
+        if mailbox & READY != 0 {
+            return Err(Fault::ForeignBusy);
+        }
+        if !io.write(DATA0, command.input[0])
+            || !io.write(DATA1, command.input[1])
+            || !io.write(MAILBOX, READY | command.word)
+        {
+            return Err(Fault::Access);
+        }
+        self.pending = Some(Pending {
+            command,
+            posted_at: now,
+        });
+        Ok(())
+    }
+    fn poll(
+        &self,
+        pending: Pending,
+        now: u64,
+        io: &mut impl Io,
+    ) -> Result<Option<[u32; 2]>, Fault> {
+        let mailbox = io
+            .read(MAILBOX)
+            .filter(|&v| v != u32::MAX)
+            .ok_or(Fault::Access)?;
+        if mailbox & READY != 0 {
+            if mailbox & 0x00ff_ffff != pending.command.word {
+                return Err(Fault::Identity);
+            }
+            if now < pending.posted_at || now - pending.posted_at >= TIMEOUT_NS {
+                return Err(Fault::Timeout);
+            }
+            return Ok(None);
+        }
+        // Completion guarantees low8 status only, never a command echo.
+        let status = (mailbox & 0xff) as u8;
+        if status != 0 {
+            return Err(Fault::Status(status));
+        }
+        let mut data = [0; 2];
+        if !matches!(pending.command.reply, Reply::None) {
+            data[0] = io.read(DATA0).ok_or(Fault::Access)?;
+        }
+        if matches!(pending.command.reply, Reply::Two) {
+            data[1] = io.read(DATA1).ok_or(Fault::Access)?;
+        }
+        if !matches!(pending.command.reply, Reply::None) && io.read(MAILBOX) != Some(mailbox) {
+            return Err(Fault::Identity);
+        }
+        if data.contains(&u32::MAX) {
+            return Err(Fault::Data);
+        }
+        Ok(Some(data))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Discovery {
     stage: u8,
-    pending: Option<Pending>,
-    poisoned: bool,
     fault: Option<Fault>,
     pub(super) fans: Option<u8>,
-    // pkg shutdown, pkg critical, memory shutdown, pkg max, memory critical.
     limits: Option<[u8; 5]>,
 }
 impl Discovery {
-    pub(super) fn step(&mut self, now: u64, io: &mut impl Io) {
-        if self.poisoned || self.stage >= 2 {
+    pub(super) fn command(&self) -> Option<Command> {
+        let (client, word, reply) = match self.stage {
+            0 => (Client::Fan, 0x047d, Reply::One),
+            1 => (Client::Thermal, 0x25, Reply::Two),
+            _ => return None,
+        };
+        Some(Command {
+            client,
+            word,
+            input: [0; 2],
+            reply,
+        })
+    }
+    pub(super) fn complete(&mut self, client: Client, result: Result<[u32; 2], Fault>) {
+        let expected = match self.stage {
+            0 => Client::Fan,
+            1 => Client::Thermal,
+            _ => return,
+        };
+        if client != expected {
+            self.fault = Some(Fault::Identity);
             return;
         }
-        if let Some(pending) = self.pending {
-            let Some(mailbox) = io.read(MAILBOX).filter(|&v| v != u32::MAX) else {
-                self.poison(Fault::Access);
-                return;
-            };
-            if mailbox & READY != 0 {
-                // While busy, the request fields still identify our post.
-                if mailbox & 0x00ff_ffff != pending.command {
-                    self.poison(Fault::Identity);
-                } else if now < pending.posted_at || now - pending.posted_at >= TIMEOUT_NS {
-                    self.poison(Fault::Timeout);
-                }
-                return;
-            }
-            // Completed PCODE only guarantees low8 status, not a command echo.
-            // Never interpret DATA without a software-owned post in this epoch.
-            let status = (mailbox & 0xff) as u8;
-            if status != 0 {
-                self.fault = Some(Fault::Status(status));
-                self.advance();
-                return;
-            }
-            let Some(data0) = io.read(DATA0) else {
-                self.poison(Fault::Access);
-                return;
-            };
-            let data1 = if self.stage == 1 {
-                io.read(DATA1)
-            } else {
-                Some(0)
-            };
-            let Some(data1) = data1 else {
-                self.poison(Fault::Access);
-                return;
-            };
-            // Detect an unexpected new command while copying the tiny reply.
-            if io.read(MAILBOX) != Some(mailbox) {
-                self.poison(Fault::Identity);
-                return;
-            }
-            if data0 == u32::MAX || data1 == u32::MAX {
-                self.fault = Some(Fault::Data);
-            } else if self.stage == 0 {
-                // Only three fan registers are source-defined. Do not let a
-                // firmware count expand MMIO or manufacture extra channels.
-                if data0 <= 3 {
-                    self.fans = Some(data0 as u8);
+        match result {
+            Err(error) => self.fault = Some(error),
+            Ok(data) if client == Client::Fan => {
+                if data[0] <= 3 {
+                    self.fans = Some(data[0] as u8)
                 } else {
-                    self.fault = Some(Fault::Data);
+                    self.fault = Some(Fault::Data)
                 }
-            } else {
+            }
+            Ok([data0, data1]) => {
                 self.limits = Some([
                     data0 as u8,
                     (data0 >> 8) as u8,
                     (data0 >> 16) as u8,
                     (data0 >> 24) as u8,
                     data1 as u8,
-                ]);
+                ])
             }
-            self.advance();
-            return;
         }
-        let Some(mailbox) = io.read(MAILBOX).filter(|&v| v != u32::MAX) else {
-            self.poison(Fault::Access);
-            return;
-        };
-        if mailbox & READY != 0 {
-            self.poison(Fault::ForeignBusy);
-            return;
-        }
-        let command = if self.stage == 0 {
-            FAN_COUNT
-        } else {
-            THERMAL_LIMITS
-        };
-        if !io.write(DATA0, 0) || !io.write(DATA1, 0) || !io.write(MAILBOX, READY | command) {
-            self.poison(Fault::Access);
-            return;
-        }
-        self.pending = Some(Pending {
-            command,
-            posted_at: now,
-        });
-    }
-    fn advance(&mut self) {
-        self.pending = None;
         self.stage += 1;
-    }
-    fn poison(&mut self, fault: Fault) {
-        self.fault = Some(fault);
-        self.poisoned = true;
-        self.pending = None;
-        // Previously confirmed independent metadata remains usable in this
-        // epoch, but no new command may consume a late/unrelated reply.
     }
     pub(super) fn limit(&self, attribute: &str) -> Option<u32> {
         let index = match attribute {
@@ -158,10 +221,9 @@ impl Discovery {
         let value = self.limits?[index];
         (value != 0).then_some(u32::from(value) * 1000)
     }
-    pub(super) fn status(&self) -> alloc::string::String {
-        use alloc::format;
-        if let Some(fault) = self.fault {
-            format!("failed {fault:?}\n")
+    pub(super) fn status(&self, mailbox: &Mailbox) -> alloc::string::String {
+        if let Some(fault) = mailbox.fault().or(self.fault) {
+            alloc::format!("failed {fault:?}\n")
         } else if self.stage == 2 {
             "ready\n".into()
         } else {

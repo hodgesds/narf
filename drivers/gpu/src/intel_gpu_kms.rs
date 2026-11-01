@@ -50,7 +50,7 @@ pub(crate) trait Platform:
         false
     }
     /// A fresh, checked view used only after GT startup and outside its lock.
-    fn recovery_platform(&self) -> Result<Self, FsError>;
+    fn recovery_platform(&self, owned_dsb: bool) -> Result<Self, FsError>;
     fn recovery_complete(&self);
 }
 
@@ -86,6 +86,10 @@ impl MmioWindow for Physical {
 // function's iGPU runtime-PM owner forbids autosuspend with an active panel.
 // AuthorizedWindow invokes the current capability for each MMIO access.
 unsafe impl DisplayAccess for Physical {
+    fn ggtt_key(&self) -> Option<u64> {
+        Some(self.bar.phys.raw())
+    }
+
     fn access_ok(&self) -> bool {
         self.console_access_ok()
             && (self.generation != Generation::MeteorLake || self.read32(0x4804) == 4)
@@ -162,13 +166,13 @@ impl Platform for Physical {
     fn reset_lost(&self) -> bool {
         self.reset_lost.load(Ordering::Acquire)
     }
-    fn recovery_platform(&self) -> Result<Self, FsError> {
+    fn recovery_platform(&self, owned_dsb: bool) -> Result<Self, FsError> {
         let mut fresh = self.clone();
         fresh.recovering = true;
         if !fresh.access_ok() {
             return Err(FsError::NoDevice);
         }
-        inherited_fetchers_idle(&fresh, fresh.generation)?;
+        fetchers_idle(&fresh, fresh.generation, owned_dsb)?;
         if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(fresh.bar.phys) {
             return Err(FsError::NoDevice);
         }
@@ -182,6 +186,16 @@ impl Platform for Physical {
 }
 
 fn inherited_fetchers_idle(mmio: &impl MmioWindow, generation: Generation) -> Result<(), FsError> {
+    fetchers_idle(mmio, generation, false)
+}
+/// Recovery alone may observe Pipe-A DSB0/1 backed by a retained transport.
+/// This grants observation, never retirement: the caller must independently
+/// stop source0 then leaf1 before fresh console/color programming.
+fn fetchers_idle(
+    mmio: &impl MmioWindow,
+    generation: Generation,
+    owned_dsb: bool,
+) -> Result<(), FsError> {
     // MIT Linux intel_cursor_regs.h, intel_fbc.c and intel_display_device.c:
     // neither cursor DMA nor FBC compression tracking belongs to this owner.
     // Refuse them rather than treating a primary latch as their retirement.
@@ -219,7 +233,7 @@ fn inherited_fetchers_idle(mmio: &impl MmioWindow, generation: Generation) -> Re
             if ctl == u32::MAX {
                 return Err(FsError::NoDevice);
             }
-            if ctl & ((1 << 31) | 1) != 0 {
+            if ctl & ((1 << 31) | 1) != 0 && !(owned_dsb && pipe == 0 && dsb < 2) {
                 return Err(FsError::Unsupported);
             }
         }
@@ -253,6 +267,8 @@ struct State<M: Platform> {
     color: Option<crate::intel_gpu_color::Owner>,
     color_owned: bool,
     color_unpublished: bool,
+    dsb: Option<crate::intel_gpu_dsb::Owner<M>>,
+    dsb_update: Option<crate::intel_gpu_color::Update>,
 }
 
 #[derive(Debug)]
@@ -456,6 +472,8 @@ impl<M: Platform> Device<M> {
                 color: None,
                 color_owned: false,
                 color_unpublished: false,
+                dsb: None,
+                dsb_update: None,
             }),
         }
     }
@@ -480,7 +498,24 @@ impl<M: Platform> Device<M> {
         if let Some(old) = &state.presenter {
             old.retained_io().poison();
         }
-        let fresh = self.platform.recovery_platform()?;
+        let fresh = self
+            .platform
+            .recovery_platform(state.dsb.as_ref().is_some_and(|dsb| dsb.exposed()))?;
+        if let Some(dsb) = state.dsb.as_mut() {
+            dsb.recover_view(fresh.clone(), self.platform.now());
+            while dsb.armed() && !dsb.poll(self.platform.now())? {
+                self.platform.tick().await;
+            }
+            // DSB DMA is independent of GT and primary fetch. Stop/disable
+            // chain source0 then leaf1 before any fresh console/color arm.
+            dsb.shutdown()?;
+            // Recovery authority is temporary. The retained same-VA owner
+            // must observe the shared poison on every subsequent GT reset.
+            // This only replaces IO; no access uses the still-lost view.
+            dsb.recover_view(self.platform.clone(), self.platform.now());
+        }
+        state.dsb_update = None;
+
         let saved = match state.recovery_status {
             Some(saved) => saved,
             None => {
@@ -892,6 +927,51 @@ impl<M: Platform> Guard<'_, M> {
     async fn finish_color(&mut self) -> Result<Option<FlipStamp>, FsError> {
         loop {
             self.ownership_valid()?;
+            if self.state.dsb.as_ref().is_some_and(|dsb| dsb.armed()) {
+                let ready = self
+                    .state
+                    .dsb
+                    .as_mut()
+                    .expect("DSB owner")
+                    .poll(self.device.platform.now())
+                    .inspect_err(|_| {
+                        self.state.failed = true;
+                    })?;
+                if !ready {
+                    self.device.platform.tick().await;
+                    continue;
+                }
+                let stamp = self
+                    .state
+                    .dsb
+                    .as_ref()
+                    .expect("DSB owner")
+                    .stamp(self.device.platform.now())
+                    .inspect_err(|_| {
+                        self.state.failed = true;
+                    })?;
+                let state = &mut *self.state;
+                let update = state.dsb_update.as_ref().expect("DSB color image");
+                state
+                    .color
+                    .as_mut()
+                    .expect("color owner")
+                    .complete_dsb(&self.device.platform, update)
+                    .inspect_err(|_| {
+                        state.failed = true;
+                    })?;
+                self.state
+                    .dsb
+                    .as_mut()
+                    .expect("DSB owner")
+                    .shutdown()
+                    .inspect_err(|_| {
+                        self.state.failed = true;
+                    })?;
+                self.state.dsb_update = None;
+                return Ok(Some(stamp));
+            }
+
             let Some(color) = self.state.color.as_mut() else {
                 return Ok(None);
             };
@@ -920,9 +1000,18 @@ impl<M: Platform> Guard<'_, M> {
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
     ) -> Result<FlipStamp, FsError> {
+        self.set_color_with_dsb(coefficients, lut, None).await
+    }
+    pub(crate) async fn set_color_with_dsb(
+        &mut self,
+        coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        dsb_timing: Option<crate::intel_gpu_dsb::Timing>,
+    ) -> Result<FlipStamp, FsError> {
         self.ownership_valid()?;
         self.finish_pending().await?;
         self.finish_color().await?;
+        let previously_owned = self.state.color_owned;
         if self.state.color.is_none() {
             let owner = crate::intel_gpu_color::Owner::capture(
                 &self.device.platform,
@@ -951,18 +1040,81 @@ impl<M: Platform> Guard<'_, M> {
             self.state.color_owned = true;
         }
         let unpublished = core::mem::replace(&mut self.state.color_unpublished, true);
-        if let Err(error) = self.state.color.as_mut().expect("color owner").arm_color(
-            &self.device.platform,
-            coefficients,
-            lut.clone(),
-            self.device.platform.now(),
-        ) {
+        let arm = if let Some(timing) = dsb_timing {
+            async {
+                self.device.platform.takeover()?; // live PAT/GT + PSR ownership
+                if self.state.dsb.is_none() {
+                    let dsb = crate::intel_gpu_dsb::Owner::reserve(
+                        self.device.platform.clone(),
+                        self.device.bar_len,
+                    )
+                    .map_err(|error| {
+                        if error == FsError::NotImplemented {
+                            FsError::Unsupported
+                        } else {
+                            error
+                        }
+                    })?;
+                    self.state.dsb = Some(dsb);
+                }
+                let update = self
+                    .state
+                    .color
+                    .as_mut()
+                    .expect("color owner")
+                    .prepare_dsb(&self.device.platform, coefficients, lut.clone())?;
+                self.state.dsb_update = Some(update);
+                let state = &mut *self.state;
+                let update = state.dsb_update.as_ref().expect("DSB color image");
+                state.dsb.as_mut().expect("DSB owner").arm(
+                    timing,
+                    &update.registers,
+                    update.lut(),
+                    self.device.platform.now(),
+                )
+            }
+            .await
+        } else {
+            self.state.color.as_mut().expect("color owner").arm_color(
+                &self.device.platform,
+                coefficients,
+                lut.clone(),
+                self.device.platform.now(),
+            )
+        };
+        if let Err(error) = arm {
+            // Unsupported is confined to preflight before this attempt
+            // writes command memory, PTEs, or controls. Preserve a parked
+            // installed BO/VA while unwinding this unexposed color update.
+            let prewrite = error == FsError::Unsupported
+                && self.state.dsb.as_ref().is_none_or(|dsb| !dsb.armed());
+            if prewrite {
+                if self.state.dsb.as_ref().is_some_and(|dsb| !dsb.exposed()) {
+                    self.state.dsb = None;
+                }
+                self.state.dsb_update = None;
+                self.state
+                    .color
+                    .as_mut()
+                    .expect("color owner")
+                    .cancel_dsb_before_arm();
+            }
             // Owner's Unsupported branch is strictly before any IO: an
             // abandoned LUT may still be active although Card never published
             // it. Keep that uncertainty, but permit an explicit clear/restore.
             // Palette/control writes and every other failure quarantine it.
-            if error == FsError::Unsupported {
+            if prewrite {
                 self.state.color_unpublished = unpublished;
+                if !previously_owned {
+                    // This owner captured only untouched inherited baseline;
+                    // no color arm/palette write was exposed by this attempt.
+                    self.state.color = None;
+                    self.state.color_owned = false;
+                    if self.state.presenter.is_none() {
+                        self.device.platform.resume_console();
+                        self.state.paused = false;
+                    }
+                }
             } else {
                 self.state.failed = true;
             }

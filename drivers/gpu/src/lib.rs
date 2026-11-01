@@ -704,6 +704,8 @@ pub mod intel_gpu_audio;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_aux;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_ccs_control;
+#[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_color;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_context;
@@ -715,6 +717,8 @@ pub mod intel_gpu_dmc;
 pub mod intel_gpu_dp;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_dp_bridge;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_dsb;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_edp;
 #[cfg(feature = "intel")]
@@ -731,6 +735,8 @@ pub mod intel_gpu_fence;
 pub mod intel_gpu_forcewake;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gem;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_ggtt_ranges;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gmbus;
 #[cfg(feature = "intel")]

@@ -7,6 +7,8 @@ use alloc::collections::BTreeMap;
 use core::task::{Context, Poll, Waker};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+static NEXT_GGTT_KEY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1 << 63);
+
 const SURF: u64 = 0x7019c;
 const LIVE: u64 = 0x701ac;
 const FRAME: u64 = 0x70040;
@@ -26,6 +28,7 @@ enum Action {
 }
 #[derive(Debug)]
 struct Hardware {
+    ggtt_key: u64,
     regs: BTreeMap<u64, u32>,
     actions: Vec<Action>,
     palette: [u32; 1024],
@@ -46,6 +49,12 @@ struct Hardware {
     refuse_ptes: bool,
     refuse_console: bool,
     refuse_status_restore: bool,
+    dsb_pc: [u32; 2],
+    dsb_wait: [Option<u32>; 2],
+    dsb_delay: [bool; 2],
+    dsb_stalled: [bool; 2],
+    dsb_writes: Vec<(u64, u32)>,
+    poison_dsb_read: bool,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct MockPlatform(Arc<IrqSafeSpinLock<Hardware>>, Arc<AtomicBool>, bool);
@@ -53,6 +62,7 @@ impl MockPlatform {
     pub(crate) fn new() -> Self {
         Self(
             Arc::new(IrqSafeSpinLock::new(Hardware {
+                ggtt_key: NEXT_GGTT_KEY.fetch_add(1, Ordering::Relaxed),
                 regs: [
                     (0x70180, 0x84000000),
                     (0x701cc, 1 << 13),
@@ -87,6 +97,12 @@ impl MockPlatform {
                 refuse_ptes: false,
                 refuse_console: false,
                 refuse_status_restore: false,
+                dsb_pc: [0; 2],
+                dsb_wait: [None; 2],
+                dsb_delay: [false; 2],
+                dsb_stalled: [false; 2],
+                dsb_writes: Vec::new(),
+                poison_dsb_read: false,
             })),
             Arc::new(AtomicBool::new(false)),
             false,
@@ -110,7 +126,61 @@ impl MockPlatform {
     pub(crate) fn poison(&self) {
         self.1.store(true, Ordering::Release);
     }
-    fn step(&self) {
+    pub(crate) fn dsb_timing(&self) -> crate::intel_gpu_dsb::Timing {
+        // Same software timing carried by this fixture's real Card mode.
+        let t = crate::intel_gpu_dsb::Timing {
+            clock: 1034,
+            width: 64,
+            height: 32,
+            htotal: 224,
+            vtotal: 77,
+            flags: 0,
+        };
+        self.set(0x60000, 223 << 16 | 63);
+        self.set(0x6000c, 76 << 16 | 31);
+        self.set(0x60010, 76 << 16 | 31);
+        self.set(0x70008, 3 << 30);
+        self.set(0x45780, 6 | (8 << 16));
+        self.set(0x45784, 10 | (12 << 16));
+        self.set(0x45788, 14 | (16 << 16));
+        t
+    }
+    pub(crate) fn stall_dsb(&self, id: usize, stalled: bool) {
+        self.0.lock().dsb_stalled[id] = stalled;
+    }
+    pub(crate) fn dsb_writes(&self) -> Vec<(u64, u32)> {
+        self.0.lock().dsb_writes.clone()
+    }
+    pub(crate) fn dsb_mappings(&self) -> Vec<(u64, u32)> {
+        let hw = self.0.lock();
+        hw.regs
+            .range(
+                (GGTT_ARRAY_BASE + 144 * 1024 * 1024 / 4096 * 8)
+                    ..(GGTT_ARRAY_BASE + 160 * 1024 * 1024 / 4096 * 8),
+            )
+            .map(|(&r, &v)| (r, v))
+            .collect()
+    }
+    pub(crate) fn poison_next_dsb_read(&self) {
+        self.0.lock().poison_dsb_read = true;
+    }
+    pub(crate) fn console_resumes(&self) -> usize {
+        self.0
+            .lock()
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::Resume))
+            .count()
+    }
+    pub(crate) fn primary_arms(&self) -> usize {
+        self.0
+            .lock()
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::Arm(_)))
+            .count()
+    }
+    pub(crate) fn step(&self) {
         let mut hw = self.0.lock();
         hw.now = hw.now.saturating_add(hw.tick_ns);
         if !hw.allowed || !hw.powered {
@@ -134,6 +204,8 @@ impl MockPlatform {
                 hw.actions.push(Action::Latch(surface));
             }
         }
+        hw.execute_dsb(0);
+        hw.execute_dsb(1);
     }
     fn actions(&self) -> Vec<Action> {
         self.0.lock().actions.clone()
@@ -149,7 +221,11 @@ impl MockPlatform {
 }
 impl MmioWindow for MockPlatform {
     fn read32(&self, offset: u64) -> u32 {
-        let hw = self.0.lock();
+        let mut hw = self.0.lock();
+        if offset == 0x70b08 && hw.poison_dsb_read {
+            hw.poison_dsb_read = false;
+            self.1.store(true, Ordering::Release);
+        }
         if (self.reset_lost() && !self.2) || !hw.allowed || !hw.powered {
             return u32::MAX;
         }
@@ -163,48 +239,209 @@ impl MmioWindow for MockPlatform {
         if (self.reset_lost() && !self.2) || !hw.allowed || !hw.powered {
             return;
         }
+        hw.write(offset, value);
+    }
+}
+impl Hardware {
+    fn write(&mut self, offset: u64, value: u32) {
+        for id in 0..2 {
+            let base = 0x70b00 + id as u64 * 0x100;
+            if (base..=base + 0xf0).contains(&offset) {
+                self.dsb_writes.push((offset, value));
+                if offset == base + 0x28 {
+                    let old = self.regs.get(&offset).copied().unwrap_or(0);
+                    self.regs
+                        .insert(offset, (value & 0xffff0000) | ((old & 0xffff) & !value));
+                    return;
+                }
+                if offset == base + 8 {
+                    let busy = self.regs.get(&offset).copied().unwrap_or(0) & 1;
+                    self.regs.insert(offset, (value & !1) | busy);
+                    return;
+                }
+                self.regs.insert(offset, value);
+                if offset == base + 4
+                    && self.regs.get(&(base + 8)).copied().unwrap_or(0) & (1 << 31) != 0
+                {
+                    let control = self.regs.get_mut(&(base + 8)).unwrap();
+                    *control |= 1;
+                    self.dsb_pc[id] = self.regs.get(&base).copied().unwrap_or(0);
+                    self.regs.insert(base + 0x2c, self.dsb_pc[id]);
+                    self.dsb_wait[id] = if *self.regs.get(&(base + 8)).unwrap() & (1 << 28) != 0 {
+                        Some(self.regs[&FRAME].wrapping_add(1))
+                    } else {
+                        None
+                    };
+                }
+                return;
+            }
+        }
         if offset == 0x4a404 {
-            hw.palette_writes += 1;
-            if !hw.refuse_palette {
-                let index = hw.regs.get(&0x4a400).copied().unwrap_or(0);
-                hw.palette[(index & 1023) as usize] = value;
+            self.palette_writes += 1;
+            if !self.refuse_palette {
+                let index = self.regs.get(&0x4a400).copied().unwrap_or(0);
+                self.palette[(index & 1023) as usize] = value;
                 if index & (1 << 15) != 0 {
-                    hw.regs.insert(0x4a400, (1 << 15) | ((index + 1) & 1023));
+                    self.regs.insert(0x4a400, (1 << 15) | ((index + 1) & 1023));
                 }
             }
-        } else if offset >= PTE_START {
+        } else if offset >= GGTT_ARRAY_BASE {
             if value == 0 {
-                hw.pte_clears += 1;
+                self.pte_clears += 1;
             } else {
-                hw.pte_installs += 1;
+                self.pte_installs += 1;
             }
-            if hw.refuse_ptes {
+            if self.refuse_ptes {
                 return;
             }
             if value == 0 {
-                hw.regs.remove(&offset);
+                self.regs.remove(&offset);
             } else {
-                hw.regs.insert(offset, value);
+                self.regs.insert(offset, value);
             }
         } else if offset == IIR {
-            *hw.regs.get_mut(&IIR).unwrap() &= !value;
+            *self.regs.get_mut(&IIR).unwrap() &= !value;
         } else {
-            if (offset == SURF && value == CONSOLE && hw.refuse_console)
-                || (offset == IER && value & 8 == 0 && hw.refuse_status_restore)
+            if (offset == SURF && value == CONSOLE && self.refuse_console)
+                || (offset == IER && value & 8 == 0 && self.refuse_status_restore)
             {
                 return;
             }
-            hw.regs.insert(offset, value);
+            self.regs.insert(offset, value);
             if offset == SURF {
-                hw.pending_surface = Some(value);
-                hw.actions.push(Action::Arm(value));
+                self.pending_surface = Some(value);
+                self.actions.push(Action::Arm(value));
             }
         }
+    }
+    fn dsb_word(&self, address: u32) -> Option<u32> {
+        if !(144 * 1024 * 1024..160 * 1024 * 1024).contains(&address) || address % 4 != 0 {
+            return None;
+        }
+        let pte = GGTT_ARRAY_BASE + u64::from(address) / 4096 * 8;
+        let value =
+            u64::from(*self.regs.get(&pte)?) | (u64::from(*self.regs.get(&(pte + 4))?) << 32);
+        if value & 1 == 0 {
+            return None;
+        }
+        let physical = (value & crate::intel_gpu_gtt::PTE_PHYS_MASK) + u64::from(address % 4096);
+        // SAFETY: this vector follows the actual present GGTT PTE, installed
+        // by the production owner from retained allocated WC GEM frames.
+        Some(unsafe {
+            narf_memory::PhysAddr::new(physical)
+                .kernel_ptr::<u32>()
+                .read_volatile()
+        })
+    }
+    fn execute_dsb(&mut self, id: usize) {
+        let base = 0x70b00 + id as u64 * 0x100;
+        if self.dsb_stalled[id] || self.regs.get(&(base + 8)).copied().unwrap_or(0) & 1 == 0 {
+            return;
+        }
+        if let Some(frame) = self.dsb_wait[id] {
+            if self.regs[&FRAME].wrapping_sub(frame) > 0x7fff_ffff {
+                return;
+            }
+            self.dsb_wait[id] = None;
+        }
+        if self.dsb_delay[id] {
+            self.dsb_delay[id] = false;
+        }
+        let tail = self.regs.get(&(base + 4)).copied().unwrap_or(0);
+        for _ in 0..2048 {
+            let pc = self.dsb_pc[id];
+            if pc == tail {
+                *self.regs.get_mut(&(base + 8)).unwrap() &= !1;
+                self.regs.insert(base + 0x2c, tail);
+                return;
+            }
+            let Some(low) = self.dsb_word(pc) else {
+                self.regs.insert(base + 0x28, 8);
+                return;
+            };
+            let Some(high) = self.dsb_word(pc + 4) else {
+                self.regs.insert(base + 0x28, 8);
+                return;
+            };
+            let mut next = pc + 8;
+            let mut wait = false;
+            match high >> 24 {
+                0 => {}
+                1 => {
+                    let r = u64::from(high & 0xfffff);
+                    let mut mask = 0;
+                    for byte in 0..4 {
+                        if high & (1 << (20 + byte)) != 0 {
+                            mask |= 255 << (byte * 8);
+                        }
+                    }
+                    let old = self.regs.get(&r).copied().unwrap_or(0);
+                    self.write(r, (old & !mask) | (low & mask));
+                }
+                2 => {
+                    self.dsb_delay[id] = true;
+                    wait = true;
+                }
+                4 => {
+                    self.dsb_wait[id] = Some(self.regs[&FRAME].wrapping_add(low));
+                    wait = true;
+                }
+                6 => {
+                    // Progress at the source-qualified active scanline. The
+                    // chained leaf starts only at the following vblank.
+                    let window = u64::from(low) | (u64::from(high & 255) << 32);
+                    let lower = (window & 0xfffff) as u32;
+                    let upper = (window >> 20) as u32;
+                    let line = 8;
+                    if if lower <= upper {
+                        line >= lower && line <= upper
+                    } else {
+                        line >= lower || line <= upper
+                    } {
+                        return;
+                    }
+                }
+                7 => {
+                    let ints = self.regs.entry(base + 0x28).or_default();
+                    *ints |= 1;
+                    if *ints & (1 << 16) != 0 && self.regs[&IER] & (1 << (13 + id)) != 0 {
+                        *self.regs.get_mut(&IIR).unwrap() |= 1 << (13 + id);
+                        if self.regs[&IMR] & (1 << (13 + id)) == 0 {
+                            self.deliveries += 1;
+                        }
+                    }
+                }
+                9 => {
+                    for index in 0..low {
+                        let Some(value) = self.dsb_word(pc + 8 + index * 4) else {
+                            self.regs.insert(base + 0x28, 8);
+                            return;
+                        };
+                        self.write(u64::from(high & 0xfffff), value);
+                    }
+                    next += low.div_ceil(2) * 8;
+                }
+                _ => {
+                    self.regs.insert(base + 0x28, 2);
+                    return;
+                }
+            }
+            self.dsb_pc[id] = next;
+            self.regs.insert(base + 0x2c, next);
+            if wait {
+                return;
+            }
+        }
+        panic!("native DSB model exceeded bounded command count");
     }
 }
 // SAFETY: each fixture owns its complete register bank. Every access refuses
 // revoked authority/power, and the Arc retains the bank for pending futures.
 unsafe impl DisplayAccess for MockPlatform {
+    fn ggtt_key(&self) -> Option<u64> {
+        Some(self.0.lock().ggtt_key)
+    }
+
     fn access_ok(&self) -> bool {
         let hw = self.0.lock();
         (!self.reset_lost() || self.2) && hw.allowed && hw.powered
@@ -241,12 +478,13 @@ impl Platform for MockPlatform {
     fn reset_lost(&self) -> bool {
         self.1.load(Ordering::Acquire)
     }
-    fn recovery_platform(&self) -> Result<Self, FsError> {
+    fn recovery_platform(&self, owned_dsb: bool) -> Result<Self, FsError> {
         let mut fresh = self.clone();
         fresh.2 = true;
         if !fresh.access_ok() {
             return Err(FsError::NoDevice);
         }
+        fetchers_idle(&fresh, Generation::MeteorLake, owned_dsb)?;
         Ok(fresh)
     }
     fn recovery_complete(&self) {
@@ -948,6 +1186,22 @@ fn smoke_kms_inherited_fetchers_block_arena_claim() -> TestResult {
         );
         assert!(platform.actions().is_empty());
         assert_eq!(platform.0.lock().pte_clears, 0);
+    }
+    let owned = MockPlatform::new();
+    owned.set(0x70b08, (1 << 31) | 1);
+    owned.set(0x70c08, (1 << 31) | 1);
+    assert_eq!(
+        inherited_fetchers_idle(&owned, Generation::MeteorLake),
+        Err(FsError::Unsupported)
+    );
+    assert_eq!(fetchers_idle(&owned, Generation::MeteorLake, true), Ok(()));
+    for r in [0x70d08, 0x71b08, 0x72080, 0x43208] {
+        owned.set(r, 1 << 31 | 1);
+        assert_eq!(
+            fetchers_idle(&owned, Generation::MeteorLake, true),
+            Err(FsError::Unsupported)
+        );
+        owned.set(r, 0);
     }
     let platform = MockPlatform::new();
     platform.0.lock().allowed = false;

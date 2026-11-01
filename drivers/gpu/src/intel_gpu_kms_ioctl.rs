@@ -255,6 +255,7 @@ enum Action {
     Color {
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        dsb: Option<crate::intel_gpu_dsb::Timing>,
     },
     Cursor(Vec<u8>),
     Noop,
@@ -650,17 +651,19 @@ impl Plan {
             if let Some(id) = gamma {
                 p.next_gamma = id;
             }
-            // GAMMA_MODE and CSC_MODE are independent arms. A common latch
-            // boundary is not established by frame polling; coordinated DSB/
-            // vblank arming is required before changing both atomically.
-            if p.next_ctm != p.previous_ctm && p.next_gamma != p.previous_gamma {
-                return Err(FsError::Unsupported);
-            }
-            // MTL has a single-buffered LUT. Replacement requires a real DSB
-            // or IRQ/vblank loader, not timer polling or visible bypass steps.
-            // Check projected state here too: TEST_ONLY has identical admission
-            // and never acquires a display session or touches MMIO.
-            if p.previous_gamma != 0 && p.next_gamma != 0 && p.next_gamma != p.previous_gamma {
+            // MTL's single-buffered LUT and independent color arms require
+            // the owned DSB chain for active replacement/combined changes.
+            let needs_dsb = (p.next_ctm != p.previous_ctm && p.next_gamma != p.previous_gamma)
+                || (p.previous_gamma != 0 && p.next_gamma != 0 && p.next_gamma != p.previous_gamma);
+            let dsb = needs_dsb.then_some(crate::intel_gpu_dsb::Timing {
+                clock: wire.clock,
+                width: wire.hdisplay,
+                height: wire.vdisplay,
+                htotal: wire.htotal,
+                vtotal: wire.vtotal,
+                flags: wire.flags,
+            });
+            if dsb.is_some_and(|timing| !timing.valid()) {
                 return Err(FsError::Unsupported);
             }
             let coefficients = if p.next_ctm == 0 {
@@ -683,7 +686,11 @@ impl Plan {
                     card.property_blob(p.next_gamma).ok_or(FsError::NotFound)?,
                 )?)
             };
-            p.action = Action::Color { coefficients, lut };
+            p.action = Action::Color {
+                coefficients,
+                lut,
+                dsb,
+            };
             return Ok(p);
         }
         if rect
@@ -842,6 +849,7 @@ trait Backend {
         &mut self,
         _coefficients: Option<[u64; 9]>,
         _lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        _dsb: Option<crate::intel_gpu_dsb::Timing>,
     ) -> FsFuture<'_, FlipStamp> {
         Box::pin(async { Err(FsError::Unsupported) })
     }
@@ -884,8 +892,9 @@ impl<M: crate::intel_gpu_kms::Platform> Backend for crate::intel_gpu_kms::Guard<
         &mut self,
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        dsb: Option<crate::intel_gpu_dsb::Timing>,
     ) -> FsFuture<'_, FlipStamp> {
-        Box::pin(self.set_color(coefficients, lut))
+        Box::pin(self.set_color_with_dsb(coefficients, lut, dsb))
     }
     fn vblank(&mut self) -> FsFuture<'_, FlipStamp> {
         alloc::boxed::Box::pin(self.wait_vblank())
@@ -1124,8 +1133,12 @@ async fn execute_plan<B: Backend>(
             backend.surface().await?;
             stamp = Some(backend.vblank().await?);
         }
-        Action::Color { coefficients, lut } => {
-            stamp = Some(backend.color(*coefficients, lut.clone()).await?);
+        Action::Color {
+            coefficients,
+            lut,
+            dsb,
+        } => {
+            stamp = Some(backend.color(*coefficients, lut.clone(), *dsb).await?);
         }
         Action::Present => {
             let fb = plan.framebuffer.as_ref().ok_or(FsError::InvalidData)?;

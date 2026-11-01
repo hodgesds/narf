@@ -2,7 +2,8 @@
 //! MIT Linux b90c984d615e: intel_color.c::ilk_csc_convert_ctm,
 //! ilk_update_pipe_csc, icl_color_commit_noarm/arm and tgl_color_funcs;
 //! intel_color_regs.h / skl_universal_plane_regs.h. Precision LUT preload
-//! follows icl_load_luts/bdw_load_lut_10/intel_can_preload_luts. No DSB.
+//! follows icl_load_luts/bdw_load_lut_10/intel_can_preload_luts; active/combined
+//! updates use the separately retained intel_gpu_dsb transport.
 use crate::{drm::card::FlipStamp, intel_gpu::Generation, intel_gpu_aux::MmioWindow};
 use alloc::{sync::Arc, vec::Vec};
 use narf_filesystem::FsError;
@@ -209,6 +210,24 @@ impl Palette {
         Ok(())
     }
 }
+/// Retained desired image for an independently owned DSB DMA transaction.
+#[derive(Debug)]
+pub(crate) struct Update {
+    image: Image,
+    gamma: u32,
+    lut: Option<Arc<Lut>>,
+    restore_palette: bool,
+    write_lut: bool,
+    pub(crate) registers: Vec<(u64, u32)>,
+}
+impl Update {
+    pub(crate) fn lut(&self) -> Option<&[u32]> {
+        self.lut
+            .as_ref()
+            .filter(|_| self.write_lut)
+            .map(|lut| lut.entries.as_slice())
+    }
+}
 #[derive(Clone, Copy, Debug)]
 struct Pending {
     image: Image,
@@ -228,6 +247,7 @@ pub(crate) struct Owner {
     original_palette: Option<Palette>,
     lut: Option<Arc<Lut>>,
     pending: Option<Pending>,
+    external_pending: bool,
     failed: bool,
 }
 impl Owner {
@@ -256,11 +276,12 @@ impl Owner {
             original_palette: None,
             lut: None,
             pending: None,
+            external_pending: false,
             failed: false,
         })
     }
     pub(crate) fn pending(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() || self.external_pending
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn arm(
@@ -281,7 +302,7 @@ impl Owner {
         if self.failed {
             return Err(FsError::NoDevice);
         }
-        if self.pending.is_some() {
+        if self.pending() {
             return Err(FsError::Busy);
         }
         // Single-buffered LUT: only inactive preload is source-qualified.
@@ -318,6 +339,87 @@ impl Owner {
             now,
         )
     }
+    pub(crate) fn prepare_dsb(
+        &mut self,
+        io: &impl MmioWindow,
+        coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<Lut>>,
+    ) -> Result<Update, FsError> {
+        if self.failed {
+            return Err(FsError::NoDevice);
+        }
+        if self.pending() {
+            return Err(FsError::Busy);
+        }
+        if !pipeline(io) || !self.expected.matches(io) || io.read32(GAMMA) != self.expected_gamma {
+            self.failed = true;
+            return Err(FsError::NoDevice);
+        }
+        if lut.is_some() && self.original_palette.is_none() {
+            // First use is inactive by capture's strict initial bypass gate.
+            if self.expected_gamma & POST_ENABLE != 0 {
+                return Err(FsError::NoDevice);
+            }
+            self.original_palette = Some(Palette::capture(io)?);
+        }
+        let image = coefficients.map_or(self.original, Image::ctm);
+        let gamma = if lut.is_some() {
+            (self.gamma & !3) | POST_ENABLE | 1
+        } else {
+            self.gamma
+        };
+        let mut registers: Vec<(u64, u32)> = REGISTERS.into_iter().zip(image.values).collect();
+        registers.extend([(GAMMA, gamma), (MODE, image.mode)]);
+        let restore_palette =
+            self.lut.is_some() && lut.is_none() && self.original_palette.is_some();
+        self.external_pending = true;
+        let write_lut = self.lut != lut;
+        Ok(Update {
+            image,
+            gamma,
+            lut,
+            restore_palette,
+            write_lut,
+            registers,
+        })
+    }
+    pub(crate) fn cancel_dsb_before_arm(&mut self) {
+        self.external_pending = false;
+    }
+    pub(crate) fn complete_dsb(
+        &mut self,
+        io: &impl MmioWindow,
+        update: &Update,
+    ) -> Result<(), FsError> {
+        if !self.external_pending || self.failed {
+            return Err(FsError::NoDevice);
+        }
+        self.failed = true;
+        if !pipeline(io) || !update.image.matches(io) || io.read32(GAMMA) != update.gamma {
+            return Err(FsError::NoDevice);
+        }
+        if let Some(lut) = &update.lut {
+            let mut matches = true;
+            for (i, &value) in lut.entries.iter().enumerate() {
+                io.write32(INDEX, i as u32);
+                matches &= io.read32(DATA) == value;
+            }
+            io.write32(INDEX, 0);
+            if !matches || MAX_REGS.into_iter().any(|r| io.read32(r) != 1 << 16) {
+                return Err(FsError::NoDevice);
+            }
+        }
+        if update.restore_palette {
+            let original = self.original_palette.as_ref().expect("original palette");
+            Palette::write(io, &original.entries, original.maxima)?;
+        }
+        self.expected = update.image;
+        self.expected_gamma = update.gamma;
+        self.lut = update.lut.clone();
+        self.external_pending = false;
+        self.failed = false;
+        Ok(())
+    }
     /// Only a fresh post-reset view may restore an image after loss. First
     /// latch disabled gamma; original single-buffered entries are rewritten
     /// only after that separate frame/readback proof, before admission reopens.
@@ -328,6 +430,7 @@ impl Owner {
     ) -> Result<(), FsError> {
         self.failed = false;
         self.pending = None;
+        self.external_pending = false;
         if !pipeline(io) {
             self.failed = true;
             return Err(FsError::NoDevice);
