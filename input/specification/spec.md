@@ -62,6 +62,13 @@ All code is derived strictly from the references below.
   Producers fill the identity from their discovering transport;
   `DeviceCaps::default()` keeps the historical synthetic identity
   (`narf-input`, `BUS_VIRTUAL`, ids 0) for producers not yet plumbed.
+- `evdev::Router::set_device_change_hook` installs one synchronous
+  publication observer. It receives `Added` after insertion and `Removed`
+  after removal and reader wakeup, with both router and observer locks
+  released. It may query the router, but must not sleep or await. The
+  filesystem installs its observer before taking the initial snapshot;
+  devices registered later receive the same sysfs discovery topology and
+  udev notifications as devices present at boot.
 - `evdev` LED output surface: `DeviceCaps::ledbit` (declared via
   `add_led`) advertises `EV_LED` codes. The input core owns the
   per-device LED state (`DeviceNode::led_state`, the bitmap

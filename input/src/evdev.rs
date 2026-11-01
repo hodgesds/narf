@@ -1076,7 +1076,18 @@ impl core::future::Future for WaitEventFuture<'_> {
 /// list per device (`input.c:input_register_handler`).
 pub struct Router {
     inner: IrqSafeSpinLock<RouterInner>,
+    device_change: IrqSafeSpinLock<Option<DeviceChangeHook>>,
 }
+
+/// Registration changes, delivered after the router lock is released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceChange {
+    Added,
+    Removed,
+}
+
+/// A synchronous observer may query the router, but must not sleep or await.
+pub type DeviceChangeHook = fn(&Router, DeviceId, DeviceChange);
 
 struct RouterInner {
     devices: Vec<Arc<DeviceNode>>,
@@ -1096,6 +1107,20 @@ impl Router {
                 devices: Vec::new(),
                 next_id: 1,
             }),
+            device_change: IrqSafeSpinLock::new(None),
+        }
+    }
+
+    /// Install the device publication observer before taking the initial
+    /// device snapshot, so registrations during that snapshot are not lost.
+    pub fn set_device_change_hook(&self, hook: DeviceChangeHook) {
+        *self.device_change.lock() = Some(hook);
+    }
+
+    fn notify_device_change(&self, id: DeviceId, change: DeviceChange) {
+        let hook = *self.device_change.lock();
+        if let Some(hook) = hook {
+            hook(self, id, change);
         }
     }
 
@@ -1104,21 +1129,31 @@ impl Router {
     /// (driver) retains the `Arc` and calls `node.dispatch()` from
     /// its IRQ handler.
     pub fn register_device(&self, caps: DeviceCaps) -> (DeviceId, Arc<DeviceNode>) {
-        let mut g = self.inner.lock();
-        let id = DeviceId(g.next_id);
-        g.next_id += 1;
-        let node = Arc::new(DeviceNode::new(id, caps));
-        g.devices.push(Arc::clone(&node));
+        let (id, node) = {
+            let mut g = self.inner.lock();
+            let id = DeviceId(g.next_id);
+            g.next_id += 1;
+            let node = Arc::new(DeviceNode::new(id, caps));
+            g.devices.push(Arc::clone(&node));
+            (id, node)
+        };
+        self.notify_device_change(id, DeviceChange::Added);
         (id, node)
     }
 
     /// Remove a device by id. Calls `DeviceNode::remove` (synthesises
     /// SYN_DROPPED + wakes readers) and drops the router's reference.
     pub fn unregister_device(&self, id: DeviceId) {
-        let mut g = self.inner.lock();
-        if let Some(pos) = g.devices.iter().position(|n| n.id == id) {
-            let node = g.devices.remove(pos);
+        let removed = {
+            let mut g = self.inner.lock();
+            g.devices
+                .iter()
+                .position(|n| n.id == id)
+                .map(|pos| g.devices.remove(pos))
+        };
+        if let Some(node) = removed {
             node.remove();
+            self.notify_device_change(id, DeviceChange::Removed);
         }
     }
 

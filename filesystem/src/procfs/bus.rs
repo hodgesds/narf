@@ -359,7 +359,7 @@ impl ProcFile for InputDevicesFile {
         let mut out = String::new();
 
         for snap in &snaps {
-            let id_num = snap.id.0;
+            let id_num = snap.id.0.saturating_sub(1);
             let caps = &snap.caps;
 
             let _ = writeln!(
@@ -369,7 +369,7 @@ impl ProcFile for InputDevicesFile {
             );
             let _ = writeln!(out, "N: Name=\"{}\"", caps.name);
             let _ = writeln!(out, "P: Phys={}", caps.phys);
-            let _ = writeln!(out, "S: Sysfs=/devices/virtual/input/input{id_num}");
+            let _ = writeln!(out, "S: Sysfs=/devices/platform/narf-input/input{id_num}");
             let _ = writeln!(out, "U: Uniq={}", caps.uniq);
 
             // H: always include evdev eventN; also kbd when EV_KEY is set.

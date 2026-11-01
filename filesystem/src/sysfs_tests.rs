@@ -26,6 +26,80 @@ use crate::sysfs::{
 use crate::uevent::{self, UeventAction, UeventReader};
 use crate::{FileType, FsInstance};
 
+fn smoke_input_hotplug_publication() -> TestResult {
+    use narf_input::evdev::{DeviceCaps, ROUTER};
+
+    crate::sysfs::populate_input_class();
+    let mut reader = UeventReader::new();
+    let mut caps = DeviceCaps {
+        name: String::from("late USB keyboard regression"),
+        ..DeviceCaps::default()
+    };
+    caps.add_key(30);
+    let (id, node) = ROUTER.register_device(caps);
+    let n = id.0 - 1;
+    let result = (|| {
+        let root = crate::sysfs::get_root();
+        let parent = root
+            .get_child("devices")?
+            .get_child("platform")?
+            .get_child("narf-input")?;
+        let input = parent.get_child(&alloc::format!("input{}", n))?;
+        let event = input.get_child(&alloc::format!("event{}", n))?;
+        let class = root.get_child("class")?.get_child("input")?;
+        let chars = root.get_child("dev")?.get_child("char")?;
+        if event.attr_show("dev")? != alloc::format!("13:{}\n", 64 + n)
+            || class.get_symlink(&alloc::format!("event{}", n)).is_none()
+            || chars
+                .get_symlink(&alloc::format!("13:{}", 64 + n))
+                .is_none()
+        {
+            return None;
+        }
+        let added = reader.drain(16);
+        if added.len() != 2
+            || added[0].action != UeventAction::Add
+            || added[1].action != UeventAction::Add
+            || added[0].devpath != input.path().trim_start_matches("/sys")
+            || added[1].devpath != event.path().trim_start_matches("/sys")
+            || added.iter().any(|env| env.subsystem != "input")
+        {
+            return None;
+        }
+        crate::sysfs::populate_input_class();
+        if !Arc::ptr_eq(&input, &parent.get_child(&alloc::format!("input{}", n))?)
+            || !reader.drain(16).is_empty()
+        {
+            return None;
+        }
+        ROUTER.unregister_device(id);
+        let removed = reader.drain(16);
+        if removed.len() != 2
+            || removed[0].action != UeventAction::Remove
+            || removed[1].action != UeventAction::Remove
+            || removed[0].devpath != added[1].devpath
+            || removed[1].devpath != added[0].devpath
+            || parent.get_child(&alloc::format!("input{}", n)).is_some()
+            || class.get_symlink(&alloc::format!("event{}", n)).is_some()
+            || class.get_symlink(&alloc::format!("input{}", n)).is_some()
+            || chars
+                .get_symlink(&alloc::format!("13:{}", 64 + n))
+                .is_some()
+            || node.is_alive()
+        {
+            return None;
+        }
+        Some(())
+    })();
+    ROUTER.unregister_device(id);
+    if result.is_some() {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("late input device discovery, notification or removal is inconsistent")
+    }
+}
+kernel_test_in!("filesystem/input-hotplug", smoke_input_hotplug_publication);
+
 // ── Minimal fake block device for tests ───────────────────────────────
 
 use alloc::vec;

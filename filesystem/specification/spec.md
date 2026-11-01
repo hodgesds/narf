@@ -48,6 +48,14 @@ The read-only scheduler debugfs `sched/quantum_unit` file reports `nanos`,
 unit. Instruction-mode admission and limits are defined in
 `scheduler/specification/spec.md` §3.1.1.
 
+Evdev registration publishes a stable `/sys/devices/platform/narf-input/inputN`
+parent and `eventN` child, class links and the `13:(64+N)` device link, with
+`N = DeviceId - 1` matching `/dev/input/eventN`. The input registry observer
+is installed before the boot snapshot. Late registrations emit parent then
+child ADD notifications after publication; removal emits child then parent
+REMOVE notifications and removes discovery links. Refresh preserves existing
+kobject identity and emits no duplicate ADD notifications.
+
 `FileOps::hardware_clock()` optionally returns the retained precision-clock
 interface for a dynamic clock fd. `devfs_ptp` publishes registered `/dev/ptpN`
 nodes (0600), PHC capability ioctls and bounded system/device offset sampling
