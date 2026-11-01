@@ -403,15 +403,17 @@ also consult upstream Linux GPL sources.
   runs on the per-slot path via `dispatch_unbind` (see below).
 - Fingerprint lifecycle (#922): per-slot detach runs through the
   class-registry unbind dispatch — `fingerprint::detach_fp` removes
-  every `FP_DEVICES` entry for the slot and unregisters `/dev/fp0`
-  exactly when the removed set included the node owner (pre-removal
-  index 0; bind only appends, so the owner can only leave index 0
-  by being removed), and `wbdi::detach_wbdi` removes every
+  every `FP_DEVICES` entry for the slot, and its outcome reports
+  whether the removed set included the pre-removal index-0 entry
+  (the `/dev/fp0` name's occupant; bind only appends, so the
+  occupant can only leave index 0 by being removed), and
+  `wbdi::detach_wbdi` removes every
   `WBDI_DEVICES` entry for the slot. Both hooks are infallible and
   idempotent, registered with never-claim probes (empty matches) so
-  the cascade keeps binding fingerprint. No promotion: a surviving
-  reader is not promoted to `/dev/fp0` (the node's identity is
-  per-slot); per-device nodes are #920's surface. Suspend/resume
+  the cascade keeps binding fingerprint. Nodes are provider-resolved
+  from the registry by index (#920, merged as #1238): removal itself
+  unpublishes, and a survivor now at index 0 resolves as fp0 —
+  detach performs no renumbering. Suspend/resume
   runs through the `usb-fp` async system-PM hook: prepare is a
   no-op (no pump, no background task, transfers are synchronous
   per-call); resume fails loudly with `DriverError` when the xHCI

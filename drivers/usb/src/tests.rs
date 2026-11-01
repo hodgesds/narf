@@ -4467,12 +4467,10 @@ fn smoke_fp_endpoint_discovery_composite() -> TestResult {
     TestResult::Pass
 }
 /// Lifecycle (#922): detach removes only the slot's entries, and
-/// the fp0-node decision follows the index-0 rule. Node state
-/// itself is not observable (FP_NODE is devfs-private); what is
-/// pinned here is the decision flag plus registry state, and the
-/// unregister call on the true path is the same one-line call
-/// `__reset_fp_for_test` already exercises. Globals are reset at
-/// start and end so the empty-registry smokes stay valid.
+/// the fp0-occupant flag follows the index-0 rule. What is pinned
+/// here is the outcome flag plus registry state: nodes resolve
+/// from the registry by index (#920), so removal itself unpublishes.
+/// Globals are reset at start and end so the empty-registry smokes stay valid.
 #[cfg(feature = "kernel-test")]
 fn smoke_fp_detach_removes_slot_and_node_flag() -> TestResult {
     use crate::fingerprint::{
@@ -4481,18 +4479,18 @@ fn smoke_fp_detach_removes_slot_and_node_flag() -> TestResult {
     crate::fingerprint::__reset_fp_for_test();
     __test_push(__test_make_device(5, FpVendor::Goodix, false));
     __test_push(__test_make_device(7, FpVendor::Synaptics, false));
-    // Unknown slot: no-op, no node decision.
+    // Unknown slot: no-op, occupant flag false.
     let out = detach_fp(9);
-    if out.removed != 0 || out.fp0_unregistered || attached_fp_count() != 2 {
+    if out.removed != 0 || out.fp0_occupant_removed || attached_fp_count() != 2 {
         crate::fingerprint::__reset_fp_for_test();
         return TestResult::Fail("detach of unknown slot must be a no-op");
     }
-    // Owner (index 0) detaches: entry gone, node decision true,
+    // Owner (index 0) detaches: entry gone, occupant flag true,
     // survivor keeps its slot.
     let out = detach_fp(5);
-    if out.removed != 1 || !out.fp0_unregistered || attached_fp_count() != 1 {
+    if out.removed != 1 || !out.fp0_occupant_removed || attached_fp_count() != 1 {
         crate::fingerprint::__reset_fp_for_test();
-        return TestResult::Fail("detach of node owner must remove one entry + node flag");
+        return TestResult::Fail("detach of occupant must remove one entry + occupant flag");
     }
     if with_device(0, |d| d.slot_id) != Some(7) {
         crate::fingerprint::__reset_fp_for_test();
@@ -4500,7 +4498,7 @@ fn smoke_fp_detach_removes_slot_and_node_flag() -> TestResult {
     }
     // Idempotent: second detach of the same slot removes nothing.
     let out = detach_fp(5);
-    if out.removed != 0 || out.fp0_unregistered || attached_fp_count() != 1 {
+    if out.removed != 0 || out.fp0_occupant_removed || attached_fp_count() != 1 {
         crate::fingerprint::__reset_fp_for_test();
         return TestResult::Fail("detach must be idempotent");
     }
@@ -4513,8 +4511,8 @@ kernel_test_in!(
     smoke_fp_detach_removes_slot_and_node_flag
 );
 
-/// Lifecycle (#922): detaching a non-owner leaves the node flag
-/// false — the node belongs to the index-0 entry, not to every
+/// Lifecycle (#922): detaching a non-owner leaves the occupant flag
+/// false — the fp0 name's occupant is the index-0 entry, not every
 /// detached device.
 #[cfg(feature = "kernel-test")]
 fn smoke_fp_detach_non_owner_keeps_node_flag() -> TestResult {
@@ -4525,9 +4523,9 @@ fn smoke_fp_detach_non_owner_keeps_node_flag() -> TestResult {
     __test_push(__test_make_device(5, FpVendor::Goodix, false));
     __test_push(__test_make_device(7, FpVendor::Synaptics, false));
     let out = detach_fp(7);
-    if out.removed != 1 || out.fp0_unregistered || attached_fp_count() != 1 {
+    if out.removed != 1 || out.fp0_occupant_removed || attached_fp_count() != 1 {
         crate::fingerprint::__reset_fp_for_test();
-        return TestResult::Fail("detach of non-owner must not raise the node flag");
+        return TestResult::Fail("detach of non-owner must not raise the occupant flag");
     }
     if with_device(0, |d| d.slot_id) != Some(5) {
         crate::fingerprint::__reset_fp_for_test();

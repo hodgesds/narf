@@ -401,37 +401,38 @@ pub fn __test_register_device(
 // ── Lifecycle: detach + suspend/resume (#922) ────────────────────────
 
 /// Outcome of [`detach_fp`]: how many registry entries were removed
-/// for the slot, and whether the `/dev/fp0` node was unregistered.
-/// The node decision is part of the outcome (not just a side
-/// effect) so fixtures pin it: the node belongs to the entry that
-/// was at registry index 0 when it bound — bind only appends, so
-/// the owner can only leave index 0 by being removed, and a
-/// non-owner at index 0 can only exist once the node is already
-/// gone. Unregistering on "a removed entry was at index 0" is
-/// therefore exact, and a no-op when the node is already `None`.
+/// for the slot, and whether the removed set included the entry at
+/// pre-removal registry index 0 — the occupant of the `/dev/fp0`
+/// name. The occupant flag is part of the outcome so fixtures pin
+/// it: bind only appends, so the index-0 entry can only leave
+/// index 0 by being removed. Nodes are provider-resolved from the
+/// registry by index (#920: `lookup_fp` / `enumerate_fp`), so
+/// removing entries unpublishes by itself — there is no devfs node
+/// registration to undo, and no `unregister_fp` call exists on
+/// current main (the old proxy node API went away with #1238).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FpDetachOutcome {
     pub removed: usize,
-    pub fp0_unregistered: bool,
+    pub fp0_occupant_removed: bool,
 }
 
 /// Detach bookkeeping for one slot: remove every registry entry
-/// for `slot_id` and unregister `/dev/fp0` if the removed set
-/// included the node owner (pre-removal index 0). Infallible and
-/// idempotent: a second call for the same slot removes nothing
-/// and unregisters nothing.
+/// for `slot_id`. Infallible and idempotent: a second call for
+/// the same slot removes nothing. The outcome reports whether the
+/// removed set included the pre-removal index-0 entry (the
+/// `/dev/fp0` name's occupant).
 ///
-/// No promotion: a surviving reader is NOT promoted to `/dev/fp0`
-/// — the node's identity is per-slot (`ino = 0xf90000 | slot+1`),
-/// so rebinding the name to a different physical device would lie
-/// to a daemon holding fp0. Per-device nodes are #920's surface
-/// (draft PR #1238); until that lands, a surviving second reader
-/// simply stays unpublished.
+/// Index shift, not promotion bookkeeping: nodes resolve by
+/// registry index (#920), so after an owner removal a survivor now
+/// at index 0 resolves as fp0 — detach performs no renumbering
+/// itself, it only removes entries, and the provider re-resolves
+/// by new index.
 ///
 /// An already-open fp0 handle keeps its `Arc` to the detached
 /// device, so its reads fail cleanly at the transfer layer
 /// (`EndpointConfig` on the disabled slot) rather than dangling;
-/// new opens fail via the devfs proxy's `None` node (`FsError::Io`).
+/// new lookups resolve against the surviving registry (out-of-range
+/// names resolve to nothing).
 pub fn detach_fp(slot_id: u8) -> FpDetachOutcome {
     let mut g = FP_DEVICES.lock();
     let mut removed = 0usize;
@@ -451,27 +452,22 @@ pub fn detach_fp(slot_id: u8) -> FpDetachOutcome {
         }
     });
     drop(g);
-    let fp0_unregistered = if owned_node {
-        narf_filesystem::devfs::unregister_fp();
-        true
-    } else {
-        false
-    };
     FpDetachOutcome {
         removed,
-        fp0_unregistered,
+        fp0_occupant_removed: owned_node,
     }
 }
 
-/// Controller-recovery teardown: drop every bound reader and
-/// unregister `/dev/fp0`. Called from `attach::detach_all_bindings`
+/// Controller-recovery teardown: drop every bound reader.
+/// Called from `attach::detach_all_bindings`
 /// after a recovery epoch change invalidated every slot; stale
 /// entries must not survive to be re-enumerated alongside fresh
 /// binds (the MSC Concern C species: a surviving entry would make
 /// re-enumeration append a second live device for the same reader).
+/// Clearing the registry unpublishes every provider-resolved node
+/// — no separate unregister step exists under #920's provider model.
 pub fn unbind_all_fp() {
     FP_DEVICES.lock().clear();
-    narf_filesystem::devfs::unregister_fp();
 }
 
 /// Reset the ELAN interrupt-IN arming flag on every bound device.
