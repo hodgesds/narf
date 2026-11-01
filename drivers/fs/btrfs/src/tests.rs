@@ -3358,6 +3358,92 @@ fn smoke_btrfs_mmap_identity_is_per_inode() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_mmap_identity_is_per_inode);
 
+/// Model a read that owns the operation lock when a mutator queues behind
+/// it. A cache fill may sample the generation after the mutator starts but
+/// before it obtains the lock (the same interleave can occur across CPUs).
+/// Once the mutation completes, that old-data fill must no longer carry the
+/// current generation.
+fn check_queued_mutation_cache_epoch(kind: u8) -> TestResult {
+    use narf_filesystem::{FsFuture, FsInstance};
+    let vol = match mount_fixture() {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("cache epoch fixture failed to mount"),
+    };
+    let root = vol.root();
+    let file = match poll_once(root.create("queued-cache.dat")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("cache epoch file create failed"),
+    };
+    let old = alloc::vec![0x5a; 8192];
+    if !matches!(poll_once(file.write(0, &old)), Some(Ok(8192))) {
+        return TestResult::Fail("cache epoch file seed failed");
+    }
+    let held = match poll_once(vol.op_lock().lock()) {
+        Some(held) => held,
+        None => return TestResult::Fail("cache epoch operation lock busy"),
+    };
+    let mut mutation: FsFuture<'_, ()> = match kind {
+        0 => alloc::boxed::Box::pin(async { file.write(0, b"changed").await.map(|_| ()) }),
+        1 => file.truncate(4096),
+        _ => file.fallocate(crate::write::FALLOC_FL_ZERO_RANGE, 0, 4096),
+    };
+    if poll_once(mutation.as_mut()).is_some() {
+        return TestResult::Fail("mutation bypassed a reader's operation lock");
+    }
+    let cached_generation = file.mmap_cache_generation();
+    let inode = match poll_once(vol.load_inode(file.ino())) {
+        Some(Ok(inode)) => inode,
+        _ => return TestResult::Fail("cache epoch inode read failed"),
+    };
+    let mut cached_bytes = alloc::vec![0; old.len()];
+    if !matches!(
+        poll_once(crate::extent::read_file(
+            &vol,
+            vol.fs_tree_root().0,
+            file.ino(),
+            inode.size,
+            0,
+            &mut cached_bytes,
+        )),
+        Some(Ok(8192))
+    ) || cached_bytes != old
+    {
+        return TestResult::Fail("queued mutation changed the serialized reader's data");
+    }
+    drop(held);
+    if !matches!(poll_once(mutation.as_mut()), Some(Ok(()))) {
+        return TestResult::Fail("queued cache epoch mutation did not finish");
+    }
+    if cached_generation.is_none() || file.mmap_cache_generation() == cached_generation {
+        return TestResult::Fail("completed mutation left old bytes under the current cache epoch");
+    }
+    TestResult::Pass
+}
+
+fn smoke_btrfs_queued_write_invalidates_old_fill() -> TestResult {
+    check_queued_mutation_cache_epoch(0)
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/cache",
+    smoke_btrfs_queued_write_invalidates_old_fill
+);
+
+fn smoke_btrfs_queued_truncate_invalidates_old_fill() -> TestResult {
+    check_queued_mutation_cache_epoch(1)
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/cache",
+    smoke_btrfs_queued_truncate_invalidates_old_fill
+);
+
+fn smoke_btrfs_queued_fallocate_invalidates_old_fill() -> TestResult {
+    check_queued_mutation_cache_epoch(2)
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/cache",
+    smoke_btrfs_queued_fallocate_invalidates_old_fill
+);
+
 /// The btrfs half of the `mmap_cache_generation` contract (issue
 /// #680; the minix/FAT smokes of the same name are the shape): the
 /// generation lives in the shared core, keyed by (fs tree, inode),

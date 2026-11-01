@@ -318,9 +318,11 @@ impl<B: BlockDevice> VolCore<B> {
     /// create landing a new file on a (possibly recycled) inode
     /// number. Assigns a fresh tick rather than incrementing, so the
     /// value afterwards names the new instance / epoch and no earlier
-    /// tenant's. Every such change in this driver bumps exactly once,
-    /// before the operation returns, so a completed mutation can
-    /// never leave a retained page looking current.
+    /// tenant's. Content mutations issue their epoch
+    /// under the operation lock before changing bytes or length, so a
+    /// reader cannot fill old bytes under a queued writer's new epoch.
+    /// An allocating operation may retry after ENOSPC; each attempt gets
+    /// its own epoch, including attempts that end in partial errors.
     pub(crate) fn bump_cache_generation(&self, tree: u64, ino: u64) {
         let mut generations = self.cache_generations.lock();
         let generation = generations.fresh_tick();

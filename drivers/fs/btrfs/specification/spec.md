@@ -63,6 +63,11 @@ metadata, size, and mapping identity. Creation and lookup acquire that reference
 before releasing the operation mutex. `stat_async` and `statx_async` refresh
 metadata from the current tree; writes and size changes publish shared metadata
 before releasing the same mutex. Reads serialize with mutation and eviction.
+Content generations advance after acquiring that mutex and before changing
+bytes or length. A queued mutation cannot publish the epoch that would let a
+reader retain old bytes as current after the mutation completes. Shrinking
+truncate publishes EOF and revokes mappings under the same operation lock,
+before retiring extents; a failed revoke restores the cached inode there.
 
 Last-link unlink and file replacement remove the name and persist `nlink=0`
 with a Linux `ORPHAN_ITEM` in the owning fs tree. Existing handles and private
