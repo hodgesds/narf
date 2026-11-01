@@ -1191,6 +1191,8 @@ fn execute_ppgtt_probe(
     };
     let table_pat = if pat == 3 {
         assert_eq!(regs.get(&0x4808), Some(&0xc));
+        // Xe-LPG PAT1 is Linux's non-coherent WT entry.
+        assert_eq!(regs.get(&0x4804), Some(&4));
         2
     } else {
         pat

@@ -940,6 +940,21 @@ interfaces and limits.
 
 ## Current work
 
+Intel iGPU write-combining memory is admitted. `narf_memory::pageattr`
+retypes driver-owned RAM pages write-combining in every kernel alias (Linux
+`set_pages_array_wc`: UC- then WC, huge-leaf split, all-CPU TLB and cache-line
+flushes, write-back restore before free; x86_64 only) and a user leaf of a
+retyped page takes the recorded type. Native Xe creates iGPU
+`CPU_CACHING_WC` objects in those pages with WC mmaps, admits SCANOUT (EINVAL
+with WB) and binds MTL's non-coherent PAT1/PAT2 only for WC objects; PAT1 is
+now programmed as Linux's WT entry. Earlier on this branch: i915 BLT rings and
+context engine maps, Xe MAP_USERPTR over snapshot pins (fork copies pinned
+pages for the child), Battlemage visible VRAM, display-less dGPU runtime
+autosuspend, GuC SLPC with firmware RC6, and fuse-derived CCS0 scheduling.
+The memory pageattr suites pass on x86_64 (460) and aarch64 (361), the Intel
+groups pass on x86_64 (148 + 108) and aarch64 (73), and boot-smoke plus both
+btrfs postflights pass. Silicon and Mesa acceptance remain.
+
 The Intel GuC path now schedules BCS0, the copy engine that every admitted
 MTL/Arrow, DG2 and BMG graphics IP carries unfused (Linux `read_copy_fuses`
 applies only to PVC/Xe3+). The scheduler owns per-engine HWS and golden LRCs;

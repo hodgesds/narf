@@ -755,6 +755,144 @@ kernel_test_in!(
     smoke_xe_vram_placement_queries_mmap_execution_and_reuse
 );
 
+/// DRM_XE_GEM_CPU_CACHING_WC on the iGPU: pages retyped write-combining for
+/// the object's lifetime, a WC mmap, SCANOUT only with WC, XE_COH_NONE binds
+/// only for WC objects, and a GPU store through a PAT1 leaf.
+fn smoke_xe_igpu_wc_objects_scanout_noncoherent_binds_and_restore() -> TestResult {
+    use narf_memory::pageattr::ram_memory_type;
+    let platform = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    let (mailbox, info) = setup(&mut gt, &w, platform);
+    let file = RenderFile::new();
+    let user = Cpu::new();
+    let wc_type = Some(narf_memory::MemoryType::WriteCombining);
+    // xe_gem_create_ioctl: scanout is never coherent with a WB CPU cache;
+    // NEEDS_VISIBLE_VRAM is not an iGPU flag.
+    assert_eq!(
+        create_placed(&file, &info, &user, 8192, 1, 2, 1),
+        Err(FsError::InvalidData)
+    );
+    assert_eq!(
+        create_placed(&file, &info, &user, 8192, 1, 4, 2),
+        Err(FsError::InvalidData)
+    );
+    let wb = create_placed(&file, &info, &user, 4096, 1, 0, 1).unwrap();
+    if !cfg!(target_arch = "x86_64") {
+        // Only x86_64 retypes kernel RAM aliases.
+        assert_eq!(
+            create_placed(&file, &info, &user, 8192, 1, 2, 2),
+            Err(FsError::NotImplemented)
+        );
+        drop(file);
+        drop(info);
+        hardware_stop(&mut gt, &w, 0xdfc);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+        return TestResult::Pass;
+    }
+    let wc = create_placed(&file, &info, &user, 8192, 1, 2, 2).unwrap();
+    let object = file.gem.object(wc).unwrap();
+    assert!(object.is_wc() && !file.gem.object(wb).unwrap().is_wc());
+    let pages: Vec<u64> = object.pages().collect();
+    assert_eq!(pages.len(), 2);
+    for page in &pages {
+        assert_eq!(ram_memory_type(narf_memory::PhysAddr::new(*page)), wc_type);
+    }
+    let mut prior = [0xffu8; 8192];
+    object.read(0, &mut prior).unwrap();
+    assert!(prior.iter().all(|b| *b == 0));
+    object.write(4000, b"narf").unwrap();
+    let mut back = [0; 4];
+    object.read(4000, &mut back).unwrap();
+    assert_eq!(&back, b"narf");
+    let view = object.backing(0, 8192).unwrap();
+    assert_eq!(view.memory_type, narf_memory::MemoryType::WriteCombining);
+    assert_eq!(view.frames, pages);
+    drop(view);
+    // xe_vm_bind_ioctl_validate_bo: XE_COH_NONE needs a non-WB object. PAT0 is
+    // left to firmware and refused; a missing handle is ENOENT first.
+    let vm = create_vm(&file, &info, &user);
+    for (handle, pat, expected) in [
+        (wb, 1, Err(FsError::InvalidData)),
+        (wb, 2, Err(FsError::InvalidData)),
+        (wc, 0, Err(FsError::InvalidData)),
+        (wc, 5, Err(FsError::InvalidData)),
+        (0x7fff_0000, 1, Err(FsError::NotFound)),
+    ] {
+        bind_wire(
+            &user,
+            vm,
+            &[mapping(handle, 0x5000_0000, 0, 4096, pat, 0)],
+            &[],
+        );
+        assert_eq!(bind_now(&file, &info, &user), expected, "pat {pat}");
+    }
+    for (va, pat) in [(0x6000_0000, 2), (0x7000_0000, 3)] {
+        bind_wire(&user, vm, &[mapping(wc, va, 0, 8192, pat, 0)], &[]);
+        assert_eq!(bind_now(&file, &info, &user), Ok(0));
+    }
+    // A GPU store lands in the WC object through a PAT1 leaf.
+    let code = create_bo(&file, &info, &user, 8192, 0);
+    let words = [0x10000002u32, 0x80, 0x2345, 0x4e415246, 0x05000000, 0];
+    let bytes: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    file.gem.object(code).unwrap().write(4096, &bytes).unwrap();
+    *user.mapping.lock() = Some(object.backing(0, 4096).unwrap());
+    bind_wire(
+        &user,
+        vm,
+        &[
+            mapping(code, 0x1234_0000_0000, 4096, 4096, 3, 1),
+            mapping(wc, 0x2345_0000_0000, 0, 4096, 1, 0),
+        ],
+        &[],
+    );
+    assert_eq!(bind_now(&file, &info, &user), Ok(0));
+    let queue = create_queue(&file, &info, &user, vm, 1);
+    exec_wire(&user, queue, true, &[]);
+    let fence = {
+        let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
+        assert!(call
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        let (_, fence) = mailbox.accept(&mut gt, 100);
+        assert_eq!(
+            call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Some(Ok(0)))
+        );
+        fence
+    };
+    let mut registered = BTreeMap::new();
+    finish(&mut gt, &w, &fence, &mut registered, 101);
+    let mut stored = [0; 4];
+    object.read(0x80, &mut stored).unwrap();
+    assert_eq!(u32_at(&stored, 0), 0x4e415246);
+    // Pages return write-back only once mappings, binds and the handle go.
+    *user.mapping.lock() = None;
+    drop(object);
+    assert_eq!(close(&file, &info, &user, abi::GEM_CLOSE, wc), Ok(0));
+    assert_eq!(ram_memory_type(narf_memory::PhysAddr::new(pages[0])), wc_type);
+    assert_eq!(
+        close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, queue),
+        Ok(0)
+    );
+    assert_eq!(close(&file, &info, &user, xe::VM_DESTROY, vm), Ok(0));
+    drop(file);
+    for page in &pages {
+        assert_eq!(ram_memory_type(narf_memory::PhysAddr::new(*page)), None);
+    }
+    drop(info);
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_xe_igpu_wc_objects_scanout_noncoherent_binds_and_restore
+);
+
 fn smoke_xe_vm_slices_nulls_private_objects_and_transactions() -> TestResult {
     let platform = GtPlatform::Battlemage;
     let (w, arena, mut gt) = hardware_model(platform, 0xdfc);

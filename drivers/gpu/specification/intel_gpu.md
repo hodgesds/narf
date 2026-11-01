@@ -1596,7 +1596,8 @@ the physical service retains its runtime-PM references.
 initial GuC/full-engine quiescence before PAT/MOCS programming. Staged physical
 allocations reserve frames/VA without writing inherited GGTT entries. Installed
 policies use MTL PAT3, DG2 PAT0 and BMG PAT2; MTL also installs UC PAT2 for
-non-leaf PPGTT reads. MTL display PAT0 is preserved.
+non-leaf PPGTT reads and Linux's non-coherent WT PAT1 (Mesa's scanout and
+write-combining index). MTL display PAT0 is preserved.
 MCR steering is serialized and restored, and BMG PTE writes drain the G-unit.
 
 `intel_gpu_gt_runtime` starts a persistent per-function owner from Stage::Late,
@@ -1871,7 +1872,7 @@ acceptance or a claim of complete acceleration.
 | GuC execution | Owned GGTT/PPGTT jobs, primed/persistent user RCS0 and BCS0 state, verified register policy, graphics-GT/RCS/BCS workarounds on MTL/Arrow, DG2 and BMG | Compute/media engines, remaining out-of-band workarounds and silicon qualification |
 | Render UAPI | Native Xe queries/GEM/VM_BIND (incl. snapshot-pinned MAP_USERPTR)/RCS and COPY queues/EXEC/user fences/per-engine cycles; i915 compatibility with legacy BLT ring, context engine maps and explicit fences; context loss and fresh-epoch rebuild | USERPTR invalidation (MMU notifier), i915 GEM_USERPTR, fault/long-running VMs, i915 load balancing/parallel submission, more queue/query families and Mesa interoperability |
 | Engines and platforms | Main-GT DSS/EU discovery; RCS0, never-fused BCS0 and fuse-derived CCS0 (ccs_mode 1) scheduling; separate Gen12 foundations | BMG BCS8, CCS1-3/ccs_mode > 1, media GT and media submission, independently sourced profiles for other IP |
-| Memory and presentation | Owned system RAM, private tables, same-card CPU PRIME mappings; Battlemage visible VRAM (zeroed pool, DM PTEs, WC BAR mmap, placement fallback) | DG2 VRAM (64K pages + CCS clear), small-BAR/unmapped VRAM, eviction, GPU clears, VRAM PRIME/P2P, accelerated presentation and GPU/KMS synchronization |
+| Memory and presentation | Owned system RAM, private tables, same-card CPU PRIME mappings; iGPU write-combining objects (retyped kernel aliases, WC mmap, SCANOUT, non-coherent PAT1/PAT2 binds); Battlemage visible VRAM (zeroed pool, DM PTEs, WC BAR mmap, placement fallback) | DG2 VRAM (64K pages + CCS clear), small-BAR/unmapped VRAM, eviction, GPU clears, VRAM PRIME/P2P, accelerated presentation and GPU/KMS synchronization |
 | Display | Gen12 paths and owned Xe-LPG internal-panel modeset | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |
 | Power and faults | Owned GuC/RCS0/BCS0 MSI wakeups with timer fallback, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery; idle D3hot runtime autosuspend for display-less discrete GTs with epoch-continuing resume; GuC SLPC with firmware-controlled RC6 (optional, fail-open) | Finer engine recovery, autosuspend with live VRAM (mapping revocation/eviction) or an active iGPU panel (display power wells/DC states), D3cold, SLPC frequency bounds/power profiles and MTL Wa_22019338487 |
 | Acceptance | Native register/CT/page-walk and ownership models on both kernel architectures | Intel silicon execution, suspend/resume and Mesa OpenGL/Vulkan interoperability |
@@ -1895,9 +1896,21 @@ and job holds through retirement, so the GPU never reaches freed memory. Fork
 copies pinned private pages for the child (`page_needs_cow_for_dma`), so the
 pins keep aliasing the binder's memory. Linux parity still needs
 `xe_userptr.c`'s invalidation/repin/rebind against unmap and replacement,
-which requires a memory-layer MMU notifier. amdgpu GEM_USERPTR shares this gap. Likewise, admitting iGPU WC allocations requires a
-cache-alias policy covering the kernel's WB mapping, rather than changing only
-the userspace PTE or silently substituting WB for the requested policy.
+which requires a memory-layer MMU notifier. amdgpu GEM_USERPTR shares this gap.
+
+iGPU `DRM_XE_GEM_CPU_CACHING_WC` objects are admitted (MIT Linux
+b90c984d615e8ce2af96f5b1411a962d83fed2ad `xe_ttm_tt_create`,
+`xe_gem_create_ioctl`, `xe_vm_bind_ioctl_validate_bo`). Their pages come
+from `narf_memory::pageattr::WcPages`: every kernel alias is retyped
+write-combining before publication (TTM `set_pages_array_wc`), user mmaps
+are WC, kernel copies end with SFENCE and device publication needs no
+CLFLUSH. Pages are restored write-back only after the last mapping, VM
+binding and job drop the object. SCANOUT is admitted on the iGPU and is
+EINVAL with WB caching. XE_COH_NONE binds (MTL PAT1 WT, PAT2 UC) are EINVAL
+for WB objects and USERPTR. Deviation: PAT0, also XE_COH_NONE in Linux,
+stays refused because its definition is left to firmware for the inherited
+display. dGPU system memory stays WB as in Linux. aarch64 refuses WC
+creation (`NotImplemented`): the kernel's linear map cannot be retyped.
 
 The scheduler now recycles a round-robin pool of 64 GuC IDs after verified
 retirement, removing the 65534-request lifetime limit. Request stamps and TLB

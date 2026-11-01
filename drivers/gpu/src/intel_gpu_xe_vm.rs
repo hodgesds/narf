@@ -64,12 +64,20 @@ pub(crate) struct Bind {
     pub userptr: Option<u64>,
 }
 
+/// PAT indices coherent with CPU caches that this driver programs.
 pub(crate) fn pat_allowed(platform: GtPlatform, pat: u16) -> bool {
     match platform {
         GtPlatform::Alchemist => pat == 0,
         GtPlatform::Battlemage => matches!(pat, 1 | 2 | 4 | 5 | 7),
         GtPlatform::Integrated(_) => matches!(pat, 3 | 4),
     }
+}
+
+/// Programmed XE_COH_NONE indices: Xe-LPG PAT1 (WT) and PAT2 (UC). Linux
+/// also admits PAT0, whose definition this driver leaves to firmware for the
+/// inherited display, so it stays refused.
+pub(crate) fn pat_noncoherent(platform: GtPlatform, pat: u16) -> bool {
+    matches!(platform, GtPlatform::Integrated(_)) && matches!(pat, 1 | 2)
 }
 
 impl Bind {
@@ -160,11 +168,15 @@ impl Bind {
             }
             None
         } else {
-            if !pat_allowed(platform, pat) || offset % 4096 != 0 {
+            let noncoherent = pat_noncoherent(platform, pat);
+            if !(pat_allowed(platform, pat) || noncoherent) || offset % 4096 != 0 {
                 return Err(FsError::InvalidData);
             }
             let object = gem.object(object)?;
-            if object.vm_owner().is_some_and(|owner| owner != vm.identity)
+            // xe_vm_bind_ioctl_validate_bo: XE_COH_NONE on a WB object would
+            // let the GPU miss dirty CPU lines (or the CPU miss GPU writes).
+            if (noncoherent && !object.is_wc())
+                || object.vm_owner().is_some_and(|owner| owner != vm.identity)
                 || offset
                     .checked_add(length)
                     .is_none_or(|end| end > object.size())

@@ -1,6 +1,10 @@
 //! Per-open Intel GEM storage. Host pages are owned by the object, not its
 //! handle: CPU mappings, VM bindings and submitted jobs retain the same Arc.
 //! Xe-LP and Xe-LPG integrated GPUs both use system-memory objects here.
+//! An iGPU object created with DRM_XE_GEM_CPU_CACHING_WC lives in pages whose
+//! kernel aliases are write-combining (`narf_memory::pageattr::WcPages`, the
+//! TTM `ttm_write_combined` pool): CPU writes bypass the caches, so the
+//! non-snooping display and non-coherent PATs see them without CLFLUSH.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -30,6 +34,8 @@ pub struct GemObject {
     pins: Vec<narf_memory::address_space::UserPagePin>,
     /// Zeroed local memory; reached by the CPU only through the LMEM BAR.
     vram: Option<crate::intel_gpu_vram::VramAllocation>,
+    /// Zeroed write-combining system pages, in place of `frames`.
+    wc: Option<narf_memory::pageattr::WcPages>,
     size: u64,
     /// `size` is charged to the system-memory LIVE_BYTES bound.
     charged: bool,
@@ -40,20 +46,39 @@ pub struct GemObject {
     pub(crate) dma_buf: DmaBufObject,
 }
 
+/// Where [`GemState::create_placed`] puts an object's storage.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Placement<'a> {
+    /// Write-back system pages.
+    System,
+    /// System pages every kernel alias maps write-combining.
+    SystemWc,
+    /// Zeroed VRAM, tried first; `true` permits write-back system memory when
+    /// VRAM is exhausted.
+    Vram(&'a Arc<crate::intel_gpu_vram::Vram>, bool),
+}
+
+/// Charge `size` bytes to the system-memory bound for an object's lifetime,
+/// including after GEM_CLOSE while a VMA/VM/job still owns it. Closing
+/// handles cannot bypass this bound.
+fn charge(size: u64) -> Result<(), FsError> {
+    let limit = ((narf_memory::frame::stats().total as u64 * PAGE) / 2).min(512 * 1024 * 1024);
+    LIVE_BYTES
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+            live.checked_add(size).filter(|next| *next <= limit)
+        })
+        .map(|_| ())
+        .map_err(|_| FsError::OutOfMemory)
+}
+
 impl GemObject {
     fn allocate(size: u64, offset: u64) -> Result<Self, FsError> {
-        // Charge the allocation's lifetime, including after GEM_CLOSE while a
-        // VMA/VM/job still owns it. Closing handles cannot bypass this bound.
-        let limit = ((narf_memory::frame::stats().total as u64 * PAGE) / 2).min(512 * 1024 * 1024);
-        LIVE_BYTES
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
-                live.checked_add(size).filter(|next| *next <= limit)
-            })
-            .map_err(|_| FsError::OutOfMemory)?;
+        charge(size)?;
         let mut object = Self {
             frames: Vec::new(),
             pins: Vec::new(),
             vram: None,
+            wc: None,
             size,
             charged: true,
             offset,
@@ -80,6 +105,34 @@ impl GemObject {
         Ok(object)
     }
 
+    /// As `allocate`, in zeroed write-combining pages. A kernel that cannot
+    /// retype RAM (aarch64) refuses with NotImplemented.
+    fn allocate_wc(size: u64, offset: u64) -> Result<Self, FsError> {
+        let mut object = Self::allocate(0, offset)?;
+        charge(size)?;
+        // From here the drop releases the charge, including on failure below.
+        object.size = size;
+        let pages =
+            narf_memory::pageattr::WcPages::allocate((size / PAGE) as usize).map_err(|error| {
+                match error {
+                    narf_memory::pageattr::PageAttrError::NoFrame => FsError::OutOfMemory,
+                    _ => FsError::NotImplemented,
+                }
+            })?;
+        object.wc = Some(pages);
+        Ok(object)
+    }
+
+    /// Owned system pages: write-back `frames` or the write-combining set.
+    fn system_frames(&self) -> &[PhysFrame] {
+        self.wc.as_ref().map_or(&self.frames, |wc| wc.frames())
+    }
+
+    /// System pages whose kernel and user CPU aliases are write-combining.
+    pub(crate) fn is_wc(&self) -> bool {
+        self.wc.is_some()
+    }
+
     /// A VM-private USERPTR object over `pins`, charged like owned storage.
     pub(crate) fn from_user_pins(
         pins: Vec<narf_memory::address_space::UserPagePin>,
@@ -90,12 +143,7 @@ impl GemObject {
             .filter(|size| *size != 0)
             .ok_or(FsError::InvalidData)?;
         let mut object = Self::allocate(0, 0)?;
-        let limit = ((narf_memory::frame::stats().total as u64 * PAGE) / 2).min(512 * 1024 * 1024);
-        LIVE_BYTES
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
-                live.checked_add(size).filter(|next| *next <= limit)
-            })
-            .map_err(|_| FsError::OutOfMemory)?;
+        charge(size)?;
         object.size = size;
         object.pins = pins;
         object.vm_owner = Some(vm);
@@ -127,7 +175,7 @@ impl GemObject {
     }
 
     pub fn pages(&self) -> impl Iterator<Item = u64> + '_ {
-        self.frames
+        self.system_frames()
             .iter()
             .map(|frame| frame.start_address().raw())
             .chain(self.pins.iter().map(|pin| pin.phys().raw()))
@@ -176,6 +224,11 @@ impl GemObject {
     }
 
     pub(crate) fn publish_for_device(&self) -> bool {
+        if self.is_wc() {
+            // Nothing is cached; order earlier write-combining stores.
+            wc_fence();
+            return true;
+        }
         crate::intel_gpu_gtt::publish_system_pages(self.frames.iter())
             && crate::intel_gpu_gtt::publish_system_phys(self.pins.iter().map(|pin| pin.phys()))
     }
@@ -215,7 +268,12 @@ impl GemObject {
         Ok(MmapBacking {
             frames,
             lifetime: Some(self.clone()),
-            memory_type: narf_memory::MemoryType::WriteBack,
+            // memory/ maps retyped pages with their recorded WC type.
+            memory_type: if self.is_wc() {
+                narf_memory::MemoryType::WriteCombining
+            } else {
+                narf_memory::MemoryType::WriteBack
+            },
         })
     }
 
@@ -233,7 +291,7 @@ impl GemObject {
                 *byte = unsafe { core::ptr::read_volatile(alias) };
                 continue;
             }
-            let base = self.frames[(at / PAGE) as usize]
+            let base = self.system_frames()[(at / PAGE) as usize]
                 .start_address()
                 .kernel_ptr::<u8>();
             // SAFETY: range checked; raw volatile access also tolerates concurrent
@@ -257,14 +315,29 @@ impl GemObject {
                 unsafe { core::ptr::write_volatile(alias, *byte) };
                 continue;
             }
-            let base = self.frames[(at / PAGE) as usize]
+            let base = self.system_frames()[(at / PAGE) as usize]
                 .start_address()
                 .kernel_mut_ptr::<u8>();
             // SAFETY: same owned, range-checked pages as read().
             unsafe { core::ptr::write_volatile(base.add((at % PAGE) as usize), *byte) };
         }
+        if self.is_wc() || self.is_vram() {
+            // Write-combining stores are weakly ordered: drain them before a
+            // later submission or fence publishes the bytes.
+            wc_fence();
+        }
         Ok(())
     }
+}
+
+/// SFENCE: retire this CPU's write-combining buffers.
+fn wc_fence() {
+    core::sync::atomic::fence(Ordering::SeqCst);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SFENCE has no memory operands or preconditions.
+    unsafe {
+        core::arch::asm!("sfence", options(nostack, preserves_flags))
+    };
 }
 
 /// Atomic all-or-nothing conflict check followed by publication of the job's
@@ -365,17 +438,16 @@ impl GemState {
         owner: Option<u64>,
         report: impl FnOnce(u32, u64) -> Result<(), FsError>,
     ) -> Result<u32, FsError> {
-        self.create_placed(size, owner, None, report)
+        self.create_placed(size, owner, Placement::System, report)
     }
 
-    /// As `create_for_vm`, optionally in zeroed local memory, which is tried
-    /// first; `fallback` permits system memory when VRAM is exhausted. A
-    /// VRAM object is not charged to the system-memory object limit.
+    /// As `create_for_vm`, in `placement`. A VRAM object is not charged to the
+    /// system-memory object limit.
     pub(crate) fn create_placed(
         &self,
         size: u64,
         owner: Option<u64>,
-        vram: Option<(&Arc<crate::intel_gpu_vram::Vram>, bool)>,
+        placement: Placement<'_>,
         report: impl FnOnce(u32, u64) -> Result<(), FsError>,
     ) -> Result<u32, FsError> {
         let size = size.checked_add(PAGE - 1).ok_or(FsError::InvalidData)? & !(PAGE - 1);
@@ -396,23 +468,24 @@ impl GemState {
                     .filter(|next| *next < 1 << 63)
             })
             .map_err(|_| FsError::OutOfMemory)?;
-        let local = match vram {
-            Some((vram, fallback)) => match vram.allocate(size) {
+        let local = match placement {
+            Placement::Vram(vram, fallback) => match vram.allocate(size) {
                 Ok(allocation) => Some(allocation),
                 Err(FsError::OutOfMemory) if fallback => None,
                 Err(error) => return Err(error),
             },
-            None => None,
+            Placement::System | Placement::SystemWc => None,
         };
-        let mut object = match local {
-            Some(allocation) => {
+        let mut object = match (local, placement) {
+            (Some(allocation), _) => {
                 let mut object = GemObject::allocate(0, offset)?;
                 object.vram = Some(allocation);
                 object.size = size;
                 object.charged = false;
                 object
             }
-            None => GemObject::allocate(size, offset)?,
+            (None, Placement::SystemWc) => GemObject::allocate_wc(size, offset)?,
+            (None, _) => GemObject::allocate(size, offset)?,
         };
         object.vm_owner = owner;
         let object = Arc::new(object);

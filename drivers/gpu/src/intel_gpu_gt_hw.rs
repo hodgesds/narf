@@ -242,8 +242,11 @@ impl HardwareInit {
                 // inherited display, is deliberately not redefined.
                 mmio.write32(0x480c, 2);
                 mmio.write32(0x4810, 3); // Xe-LPG PAT4: two-way coherent WB
-                                         // xe_pat.c: PAT2 is UC. Non-snooping Xe-LPG PPGTT walks
-                                         // use this policy independently of coherent WB leaf BOs.
+                                         // XELPG_PAT_1_WT, non-coherent: Mesa's scanout and
+                                         // write-combining index, admitted for WC objects only.
+                mmio.write32(0x4804, 4);
+                // xe_pat.c: PAT2 is UC. Non-snooping Xe-LPG PPGTT walks
+                // use this policy independently of coherent WB leaf BOs.
                 mmio.write32(0x4808, 0xc);
                 let global = [
                     0, 0x100, 0x100, 0x10c, 0x100, 0x10c, 0x100, 0x10c, 0x100, 0x10c, 0x100, 0x100,
