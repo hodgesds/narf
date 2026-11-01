@@ -200,6 +200,80 @@ async fn release_fixture_slots(
     first_error.map_or(Ok(()), Err)
 }
 
+fn smoke_enumeration_failure_reclaims_slot() -> TestResult {
+    use crate::{attach, xhci};
+    let Some(controller) = xhci::controller() else {
+        return TestResult::Skip("xhci not probed");
+    };
+    let Some((port, _)) = controller.connected_ports().first().copied() else {
+        return TestResult::Skip("no connected port");
+    };
+    let mut held = alloc::vec::Vec::new();
+    let result = narf_scheduler::block_on(async {
+        if let Some(slot) = controller.slot_for_port(port) {
+            attach::detach_slot(&controller, slot).await;
+        }
+        let mut previous_generation = 0;
+        for cycle in 0..2 {
+            if controller.port_reset(port).await.is_err() {
+                return TestResult::Fail("enumeration port reset failed");
+            }
+            let Some(speed) = controller.port_speed(port) else {
+                return TestResult::Fail("unknown port speed");
+            };
+            // Only the initial reservation bypasses slots retained by other
+            // fixtures. The retry uses the ordinary production allocator.
+            let slot = if cycle == 0 {
+                match reserve_fresh_address_slot(&controller, &mut held).await {
+                    Ok((slot, _)) => slot,
+                    Err(_) => return TestResult::Fail("no initial slot available"),
+                }
+            } else {
+                match controller.enable_slot().await {
+                    Ok(slot) if slot != 0 && !held.contains(&slot) => {
+                        held.push(slot);
+                        slot
+                    }
+                    _ => return TestResult::Fail("retry could not enable a slot"),
+                }
+            };
+            if !controller.test_address_slot_unused(slot)
+                || controller.address_device(slot, port, speed).await.is_err()
+            {
+                return TestResult::Fail("retry received a retired software slot");
+            }
+            let Some(generation) = controller.device_generation(slot) else {
+                return TestResult::Fail("addressed device has no generation");
+            };
+            if generation <= previous_generation {
+                return TestResult::Fail("retry reused an old device generation");
+            }
+            previous_generation = generation;
+            // A class-probe failure after addressing uses this exact cleanup
+            // path. The next attempt must be able to address the returned id.
+            if attach::release_slot(&controller, slot).await.is_err() {
+                return TestResult::Fail("terminal enumeration cleanup failed");
+            }
+            held.retain(|held_slot| *held_slot != slot);
+            if !controller.test_address_slot_unused(slot)
+                || controller.device_generation(slot).is_some()
+            {
+                return TestResult::Fail("failed enumeration left its slot or DMA retained");
+            }
+        }
+        TestResult::Pass
+    });
+    let cleanup = narf_scheduler::block_on(release_fixture_slots(&controller, &mut held));
+    if matches!(result, TestResult::Pass) && cleanup.is_err() {
+        return TestResult::Fail("fixture cleanup failed");
+    }
+    result
+}
+kernel_test_in!(
+    "drivers/usb/enumeration_cleanup",
+    smoke_enumeration_failure_reclaims_slot
+);
+
 fn smoke_xhci_address_device_qemu() -> TestResult {
     use crate::{hid, xhci};
     if !xhci::is_probed() {

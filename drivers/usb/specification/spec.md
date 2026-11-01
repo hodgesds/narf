@@ -347,6 +347,17 @@ also consult upstream Linux GPL sources.
   the bulk-stop profile. `USBDevice::clear_endpoint_halt(endpoint)` pairs
   it with the device-side CLEAR_FEATURE(ENDPOINT_HALT) so host and device
   data toggles restart together; EP0 skips the CLEAR_FEATURE step.
+- The supervisor drives root and hub enumeration to a terminal result using
+  the hardware operations' individual deadlines. It does not cancel an
+  in-flight owner at a whole-port deadline. Pending enumeration and hub-status
+  waits service existing nonblocking report pumps, with bound suspended ports
+  resumed before the first pump in each supervisor cycle.
+- Terminal enumeration failures and device detach share slot cleanup. They
+  await successful Disable Slot completion before reclaiming the reservation
+  and retained DMA, so a retry can address the hardware's returned slot under
+  a fresh generation. Failed or cancelled disable operations do not reclaim.
+  Class probes that merely decline a device still leave its addressed slot
+  available to later probes; cleanup runs only at the terminal failure.
 - `Xhci::reclaim_slot(slot)` is the explicit stop/drain/removal path that
   makes a disabled slot reusable. It refuses any slot that has not
   completed Disable Slot (the completion is the hardware-quiescence

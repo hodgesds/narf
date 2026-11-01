@@ -626,7 +626,7 @@ async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
         // contexts. AMD Renoir's MaxSlots is typically 32 and a
         // laptop with multiple internal USB devices can burn
         // through them quickly across enumeration retries.
-        let _ = xhci_dev.disable_slot(slot_id).await;
+        let _ = crate::attach::release_slot(xhci_dev, slot_id).await;
     }
     res
 }

@@ -258,13 +258,12 @@ pub fn mark_ports_bound(parent_hub_slot: u8, bits: u64) {
 ///      of `dispatch_after_address` — one push per successful
 ///      hub bind of an addressed slot.
 ///   2. A slot id returns to the allocatable pool only via
-///      `Xhci::reclaim_slot`, whose sole caller is
-///      `detach_slot`; and `detach_slot` removes *every* HUBS
-///      entry for the slot (`retain`) strictly before it
-///      disables and reclaims the slot. Attach-failure paths
-///      call `disable_slot` but never `reclaim_slot`, so a
-///      failed bind's id stays retired rather than recycling
-///      under a live entry.
+///      `Xhci::reclaim_slot`, through `release_slot` after successful
+///      Disable Slot completion. `detach_slot` removes every HUBS
+///      entry for the slot before releasing it. Enumeration failures
+///      release their slot before any successful binding is published.
+///      Failed or cancelled disable operations retain the reservation
+///      and DMA rather than returning an ambiguous slot to the pool.
 ///   3. Wholesale controller recovery clears HUBS entirely
 ///      (`detach_all_bindings`) in the same supervisor step
 ///      that observes the recovery-epoch change, before any
@@ -434,6 +433,17 @@ pub(crate) fn suspended_ports_among(hubs: &[HubBinding], ports: &[(u8, u8)]) -> 
     out
 }
 
+/// Terminal slot cleanup shared by failed enumeration and detach.
+/// Successful Disable Slot completion is the quiescence proof required
+/// before reclamation. A failed or cancelled disable retains ownership.
+pub(crate) async fn release_slot(
+    xhci_dev: &Xhci,
+    slot_id: u8,
+) -> Result<(), crate::xhci::XhciError> {
+    xhci_dev.disable_slot(slot_id).await?;
+    xhci_dev.reclaim_slot(slot_id)
+}
+
 /// Drive enumeration for a device on root-hub `port`. Returns the
 /// outcome so the supervisor can update its claimed-bitmask state.
 /// Slot is freed on failure (UnknownClass / class-driver error).
@@ -452,7 +462,7 @@ pub async fn try_attach_root(xhci_dev: &Xhci, port: u8) -> AttachOutcome {
         Err(_) => return AttachOutcome::UnknownClass,
     };
     if xhci_dev.address_device(slot_id, port, speed).await.is_err() {
-        let _ = xhci_dev.disable_slot(slot_id).await;
+        let _ = release_slot(xhci_dev, slot_id).await;
         return AttachOutcome::UnknownClass;
     }
     dispatch_after_address(
@@ -498,7 +508,7 @@ pub async fn try_attach_via_hub(
         .await
         .is_err()
     {
-        let _ = xhci_dev.disable_slot(slot_id).await;
+        let _ = release_slot(xhci_dev, slot_id).await;
         return AttachOutcome::UnknownClass;
     }
     dispatch_after_address(
@@ -591,8 +601,7 @@ pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
     HUBS.lock().retain(|h| h.hub.slot_id != slot_id);
 
     // 3. Controller teardown + DMA reclamation (queue 10).
-    let _ = xhci_dev.disable_slot(slot_id).await;
-    let _ = xhci_dev.reclaim_slot(slot_id);
+    let _ = release_slot(xhci_dev, slot_id).await;
 }
 
 /// Drop every binding the supervisor owns, without touching the
@@ -678,7 +687,7 @@ async fn dispatch_after_address(
                 (d[4], d[6], vid, pid)
             }
             Err(_) => {
-                let _ = xhci_dev.disable_slot(slot_id).await;
+                let _ = release_slot(xhci_dev, slot_id).await;
                 return AttachOutcome::UnknownClass;
             }
         };
@@ -690,12 +699,12 @@ async fn dispatch_after_address(
         let mut head = [0u8; 9];
         let n = xhci_dev.get_config_descriptor(slot_id, 0, &mut head).await;
         if n.is_err() || head.iter().take(2).all(|b| *b == 0) {
-            let _ = xhci_dev.disable_slot(slot_id).await;
+            let _ = release_slot(xhci_dev, slot_id).await;
             return AttachOutcome::UnknownClass;
         }
         let total = u16::from_le_bytes([head[2], head[3]]) as usize;
         if !(9..=4096).contains(&total) {
-            let _ = xhci_dev.disable_slot(slot_id).await;
+            let _ = release_slot(xhci_dev, slot_id).await;
             return AttachOutcome::UnknownClass;
         }
         let cfg_value = head[5];
@@ -703,7 +712,7 @@ async fn dispatch_after_address(
         let n2 = match xhci_dev.get_config_descriptor(slot_id, 0, &mut full).await {
             Ok(n) => n,
             Err(_) => {
-                let _ = xhci_dev.disable_slot(slot_id).await;
+                let _ = release_slot(xhci_dev, slot_id).await;
                 return AttachOutcome::UnknownClass;
             }
         };
@@ -713,7 +722,7 @@ async fn dispatch_after_address(
         let iface = match hub::find_hub_interface(&full) {
             Some(i) => i,
             None => {
-                let _ = xhci_dev.disable_slot(slot_id).await;
+                let _ = release_slot(xhci_dev, slot_id).await;
                 return AttachOutcome::UnknownClass;
             }
         };
@@ -732,14 +741,14 @@ async fn dispatch_after_address(
             .await
             .is_err()
         {
-            let _ = xhci_dev.disable_slot(slot_id).await;
+            let _ = release_slot(xhci_dev, slot_id).await;
             return AttachOutcome::UnknownClass;
         }
         let bound = match UsbHub::attach(xhci_dev, slot_id, iface, dev_protocol, speed, &full).await
         {
             Ok(b) => b,
             Err(_) => {
-                let _ = xhci_dev.disable_slot(slot_id).await;
+                let _ = release_slot(xhci_dev, slot_id).await;
                 return AttachOutcome::UnknownClass;
             }
         };
@@ -752,7 +761,7 @@ async fn dispatch_after_address(
             .await
             .is_err()
         {
-            let _ = xhci_dev.disable_slot(slot_id).await;
+            let _ = release_slot(xhci_dev, slot_id).await;
             return AttachOutcome::UnknownClass;
         }
         // Tier of THIS hub = number of 4-bit nibbles already
@@ -1074,7 +1083,7 @@ async fn dispatch_after_address(
     // device's interface descriptors looked like so a future class-
     // driver pass has a starting point.
     log_unknown_device_classes(xhci_dev, slot_id, port).await;
-    let _ = xhci_dev.disable_slot(slot_id).await;
+    let _ = release_slot(xhci_dev, slot_id).await;
     AttachOutcome::UnknownClass
 }
 

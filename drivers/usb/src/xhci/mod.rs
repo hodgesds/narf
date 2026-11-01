@@ -2524,7 +2524,7 @@ impl Xhci {
             // wheel-based and observed not to fire wakers for the
             // USB supervisor task on real HW even though the same
             // wheel works for the panel paint task — same workaround
-            // pattern as port_reset / supervisor's outer YieldTimeout.
+            // pattern as port_reset and supervisor enumeration polling.
             // Trade-off: CPU is busier (re-polls every executor
             // round vs. parked-then-irq), but the outer 250 ms
             // deadline still bounds the busy phase. Other tasks
