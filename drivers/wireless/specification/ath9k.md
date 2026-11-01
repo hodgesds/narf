@@ -5,7 +5,9 @@
 > continuations implemented.** Native software functional validation passed in
 > the coordinated x86_64 and aarch64 scoped Wi-Fi suites. Physical EEPROM,
 > calibration, RF and DMA
-> acceptance remains pending. Wider channels, recovery and other chips are separate.
+> acceptance remains pending. Wider bandwidths and other chips are separate.
+> The channel1–13 cold-generation continuation (§3.5) is source-complete; its
+> six new native cases and combined release validation have not run.
 > The additional bounded two-MPDU sender BA/A-MPDU continuation below is
 > implemented with ten new native smokes passing the coordinated validation
 > on both architectures. AR2427 (`168c:002c`, AR9285 silicon with HT bonded
@@ -59,8 +61,8 @@ AR9285-specific writes follow a checked silicon revision.
   EEPROM version, factory regulatory-domain values, and chain masks.
 - `Ath9k::calibration()` exposes the complete 376-byte normalized
   `ar5416_eeprom_4k` image for later PHY calibration programming.
-- `Ath9k::baseband` reports `BasebandPrepared`: the 2412 MHz reference
-  frequency, selected EEPROM high-power gain/SYNTH9 XE2 variant and count
+- `Ath9k::baseband` reports `BasebandPrepared`: initially the 2412 MHz
+  reference, then the exact selected channel after a cold retune, with the selected EEPROM high-power gain/SYNTH9 XE2 variant and count
   of programmed INI rows. Successful preparation also applies normalized
   EEPROM modal/RF board values, the interpolated detector/PDADC table, and
   legacy20 CCK/OFDM/HT20 target-power registers limited by factory CTL and
@@ -76,7 +78,8 @@ AR9285-specific writes follow a checked silicon revision.
   power piers, CTL edges or unsupported factory regulatory identity.
   `Policy` rejects missing/unqualified live channel permission and `BadState`
   rejects an active engine or a repeated calibration attempt.
-- `calibrate_radio()` is the channel1/full-rate/20MHz continuation.
+- `calibrate_radio()` initially continues channel1/full-rate/20MHz; cold
+  retunes repeat the same complete chain for the selected channel (§3.5).
   Probe queues the same retained owner in executor context and drives background
   provisioning via `drive_scheduled` across 120 attempts with 500 ms intervals. It obtains the
   shared authenticated regulatory policy, requires `trusted_net_authority`, intersects every overlapping rule
@@ -123,12 +126,14 @@ AR9285-specific writes follow a checked silicon revision.
   Directed binary SSIDs and wildcard discovery use actual broadcast Probe
   Requests through the same calibrated descriptor/DMA owner. Empty active
   input becomes one wildcard; SSIDs are bounded to 32 bytes before I/O.
-  Driver-owned CCK/OFDM rate and channel1 elements precede publication. Each
+  Driver-owned CCK/OFDM rate and the actual current channel elements precede
+  publication. Each
   probe waits for its exact native terminal TX completion within the total
   bounded dwell; broadcast completion does not claim an over-air ACK.
   Current signed policy, PCI authority and RF-silent input constrain every
-  publication. Discovery is limited to the unassociated initial channel;
-  scans while associated return Busy without changing carrier. Failure or
+  publication. Discovery is limited to unassociated generations; §3.5 adds
+  real cold retunes for multi-channel scans. Scans while associated return
+  Busy without changing carrier. Failure or
   cancellation hides the partial cache, closes the owner and retains DMA.
 - Synchronous bounded packet progression services polled RX/TX with hardware
   IRQs masked. Every transmit rechecks current signed policy and factory
@@ -555,6 +560,66 @@ are refused, and preparation cannot report success after authority loss.
 Initial parking and the calibration's PCI parking read also execute inside
 current capability invocation, including the actual configuration accesses.
 
+### 3.5 Exact-channel cold generations and signed v2 records
+
+`WirelessNetIface::get_wireless_info` advertises the checked EEPROM/CTL
+channel mask intersected with current host permission. The admitted channel
+set is1–13 (2412–2472MHz), full-rate20. Japan's CCK-only channel14 is not
+advertised or accepted. `set_config` with a new channel and no power override
+requests a complete cold reset; it does not preserve association. A current
+Open generation may be deliberately retired; transitional MLME generations
+are Busy. Same-channel configuration retains the existing no-op behavior.
+
+Retirement withdraws the exact interface, closes its publication token,
+clears carrier/queued packets/capture, fails keys and retires recipient/sender
+BA, and requires the actual all-QCU/RX DMA stop proof before a successor
+exists. Failure pins the owner and starts no replacement. The same physical
+function is power-on/warm-reset, EEPROM and silicon identity are re-read and
+must match, and full INI/modal/detector/CTL/rate/PA/NF/IQ preparation repeats
+for the target primary. Only a fresh successful frequency-bound calibration
+report can create new Packet/Radio/Device objects. The old interface name is
+reserved and terminal; the successor registers a new name, as existing
+recovery does. Old Arc/ring/cache/key/BA authorities never reopen. A future
+stable-name or association-preserving retune would require another explicit
+publication protocol; this implementation does not claim one.
+
+`channels` owns the queued physical operation independently of public waiter
+lifetimes. A driver worker owns hardware timer wakeups; dropping the caller
+cannot strand a partially retired/calibrating generation. Requests bind the
+requester's physical generation and are rechecked after the complete-control
+mutex is acquired. Concurrent different targets or old generations cannot
+retune the successor. Reset, initialize and suspend share that control mutex.
+Recovery and resume retain the selected primary and repeat full retirement.
+
+Multi-channel passive or active scans drive actual fresh generations for
+each requested channel and restore the original primary by another complete
+reset on success. Results identify the actual RX owner frequency. Copied
+result IEs are presentation data only; they cannot authorize association.
+A join to another channel retunes, performs fresh directed native discovery
+and then authenticates with that new generation's BSS/security facts.
+Associated scans return Busy. Failure/cancellation closes any active scan
+owner; a committed driver-owned cold transition continues to a valid passive
+successor or terminal error. It never reopens the old owner or promises RF
+restoration after a failed/cancelled scan.
+
+`N85H/N85B/N85T/N85Q` v1 recipes, request hashes, filenames and channel1
+bodies are retained unchanged. Other primaries require distinct v2 request
+prefixes/filenames and version2/channel fields. Requests bind the actual
+per-channel calibration and rate table; every capability invocation constrains
+the entire selected20MHz span. Full format and qualification requirements
+are in [ar9285-channels.md](ar9285-channels.md). No measured board data is
+provided or inferred. Legacy admission retains factory/CTL, current policy,
+RF-silent, PCI capability and native DMA/copy gates; new per-channel accesses
+also read back the actual synth/mode and all seven installed power registers
+inside the current device invocation.
+
+Six native cases in `interface_channel_tests.rs` exercise actual reset/EEPROM,
+PHY and calibration code before real MAC/Packet/Radio/Device composition,
+Open/WPA2 IP, all13 selected primaries, v1/v2 boundaries and foreign records,
+fresh discovery, multi-channel active/passive scan and RF restore, stale
+owner rejection and wedged DMA/policy preflight. These cases are written,
+not executed. They supply no physical EEPROM/RF/interoperability acceptance.
+
 ## 4. Invariants
 
 - PCI parking is verified by command-register readback before BAR sizing: BME
@@ -678,29 +743,21 @@ No RF or AP interoperability has been demonstrated by the model tests.
 Additional AC/TID scheduling is implemented in §3.4. The remaining software
 rows and the tree facts that keep each open:
 
-- `additional_channels`, `channel_retuning`: every live owner is bound to
-  2412 MHz. `packet_native.rs::Native::new` and `ht::Facts::new` reject any
-  calibration report whose frequency is not 2412; `phy/channel.rs` is invoked
-  only for the inactive reference; the one-shot calibration receipt cannot be
-  replayed without the full generation reset; and the `N85H/N85B/N85T/N85Q`
-  bodies fix primary channel 1 at offset 54 while each `invoke` intersects
-  only host rules overlapping 2402-2422 MHz. Linux retunes through
-  `main.c::ath9k_config` -> `channel.c::ath_chanctx_set_channel` ->
-  `main.c::ath_reset_internal` -> `hw.c::ath9k_hw_reset` (per-channel INI,
-  `ar9002_phy.c::ar9002_hw_set_channel`, spur mitigation, calibration and
-  `ath9k_hw_do_fastcc`). Closing these needs a per-channel calibration
-  report/permission and a channel-set field in every signed record (a v2 of
-  all four formats), plus multi-channel scan. Signed HT40 has the same
-  dependency.
+- `additional_channels`, `channel_retuning` are source-complete for admitted
+  primary channels1–13/full-rate20 in §3.5. Release/native validation is
+  pending; Japan CCK-only channel14 remains unadvertised. The cold reset
+  replaces the netdev generation/name and drops keys, BA and association.
 - `ht40`, `sgi40`: Linux `common-init.c::ath9k_cmn_setup_ht_cap` advertises
   `SUP_WIDTH_20_40 | SGI_40` for AR9285, but HT40 needs a secondary channel
   (rejected by `ht::response` and `Profile::observe`), the extension
   channel/`AR_PHY_TURBO` dynamic 20/40 programming, HT40 CTL/target-power
-  planning (`phy/rates.rs` plans only CCK/OFDM/HT20) and the multi-channel
-  record above; SGI40 depends on HT40 (`N85H` byte 57 fixes GI 0).
+  planning (`phy/rates.rs` plans only CCK/OFDM/HT20) and a distinct measured
+  full20/40 program beyond the channel-bound v2 records; SGI40 depends on
+  HT40 (`N85H` byte57 fixes GI0).
 - `factory_profile_selection`: the production owner accepts only the AR9285
   `eeprom_4k.c` 376-byte map, version 14.1+, chain masks 1/1 and the
-  channel1 plan (`identity.rs::decode_identity`, `phy/`). The spec line names
+  admitted channel1–13/full-rate20 plan (`identity.rs::decode_identity`,
+  `phy/`). The spec line names
   no further Linux variant to select; the enumerated variants are the chip
   rows below.
 - `periodic_calibration`: Linux `link.c::ath_ani_calibrate` runs a short IQ

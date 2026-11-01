@@ -66,6 +66,7 @@ impl narf_wireless::ccmp::AesCcm for Ccm {
     }
 }
 pub(in crate::ath9k) struct Peer {
+    pub(in crate::ath9k) channel: u8,
     pub(in crate::ath9k) ap: FakeAp,
     pub(in crate::ath9k) plan: NetworkPlan,
     pub(in crate::ath9k) server: DhcpServer,
@@ -105,6 +106,13 @@ pub(in crate::ath9k) struct Peer {
 }
 impl Peer {
     pub(in crate::ath9k) fn new_rates(protected: bool, rates: Option<&[u8]>) -> Self {
+        Self::new_channel(protected, rates, 1)
+    }
+    pub(in crate::ath9k) fn new_channel(
+        protected: bool,
+        rates: Option<&[u8]>,
+        channel: u8,
+    ) -> Self {
         let plan = NetworkPlan {
             station: OWN,
             bssid: AP,
@@ -114,9 +122,9 @@ impl Peer {
             lease_seconds: 3600,
         };
         let ap = if protected {
-            FakeAp::wpa2(plan, SSID, 1, 42, PMK, ANONCE)
+            FakeAp::wpa2(plan, SSID, channel, 42, PMK, ANONCE)
         } else {
-            FakeAp::open(plan, SSID, 1, 42)
+            FakeAp::open(plan, SSID, channel, 42)
         }
         .unwrap();
         let ap = if let Some(rates) = rates {
@@ -125,6 +133,7 @@ impl Peer {
             ap.with_basic_1mbps().unwrap()
         };
         Self {
+            channel,
             ap,
             plan,
             server: DhcpServer::new(plan),
@@ -253,8 +262,25 @@ impl Peer {
                 || frame.get(26 + length..)
                     != Some(
                         &[
-                            1, 4, 0x82, 0x84, 0x8b, 0x96, 50, 8, 12, 18, 24, 36, 48, 72, 96, 108,
-                            3, 1, 1,
+                            1,
+                            4,
+                            0x82,
+                            0x84,
+                            0x8b,
+                            0x96,
+                            50,
+                            8,
+                            12,
+                            18,
+                            24,
+                            36,
+                            48,
+                            72,
+                            96,
+                            108,
+                            3,
+                            1,
+                            self.channel,
                         ][..],
                     )
             {

@@ -1,0 +1,149 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! Driver-owned cold channel generations. A public waiter cannot cancel RF
+//! reset/calibration after the old generation has been physically retired.
+use super::*;
+use alloc::{boxed::Box, task::Wake, vec::Vec};
+use core::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll, Waker},
+};
+type Error = station::Error;
+pub(super) type Successor = Arc<dyn interface::ChannelIface>;
+pub(super) type Transition =
+    Pin<Box<dyn Future<Output = Result<Successor, Error>> + Send + 'static>>;
+struct Completion {
+    result: Option<Result<Successor, Error>>,
+    waiters: Vec<Waker>,
+}
+type Slot = Arc<IrqSafeSpinLock<Completion>>;
+struct DriverWake(IrqSafeSpinLock<Option<Waker>>);
+impl Wake for DriverWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        let worker = self.0.lock().clone();
+        if let Some(worker) = worker {
+            worker.wake();
+        }
+    }
+}
+struct Work {
+    frequency: u16,
+    generation: u32,
+    result: Slot,
+    future: Transition,
+    wake: Arc<DriverWake>,
+}
+static WORK: Mutex<Option<Work>> = Mutex::new(None);
+pub(super) fn channel(frequency: u16) -> Result<u8, Error> {
+    if !(2412..=2472).contains(&frequency) || (frequency - 2412) % 5 != 0 {
+        return Err(Error::Profile);
+    }
+    Ok(((frequency - 2407) / 5) as u8)
+}
+pub(super) fn frequency(channel: u32) -> Result<u16, Error> {
+    if !(1..=13).contains(&channel) {
+        return Err(Error::Profile);
+    }
+    Ok(2407 + 5 * channel as u16)
+}
+pub(super) fn request(frequency: u16, generation: u32) -> Result<Transition, Error> {
+    channel(frequency)?;
+    let result = {
+        let mut slot = WORK.try_lock().ok_or(Error::Busy)?;
+        if let Some(work) = slot.as_ref() {
+            if work.frequency != frequency || work.generation != generation {
+                return Err(Error::Busy);
+            }
+            work.result.clone()
+        } else {
+            let owner = CONTROLLER.lock().clone().ok_or(Error::State)?;
+            let result = Arc::new(IrqSafeSpinLock::new(Completion {
+                result: None,
+                waiters: Vec::new(),
+            }));
+            let wake = Arc::new(DriverWake(IrqSafeSpinLock::new(None)));
+            *slot = Some(Work {
+                frequency,
+                generation,
+                result: result.clone(),
+                wake: wake.clone(),
+                future: Box::pin(async move {
+                    super::reset_owner_at(&owner, Some(frequency), Some(generation))
+                        .await
+                        .map_err(|e| match e {
+                            BringUpError::Policy => Error::Profile,
+                            BringUpError::DeviceGone => Error::Transport(packet::Error::Access),
+                            _ => Error::State,
+                        })?;
+                    let device = interface::current().ok_or(Error::State)?;
+                    let correct = device.radio.try_lock().is_some_and(|r| {
+                        r.frequency_mhz() == frequency && r.phase() == station::Phase::Passive
+                    });
+                    if !correct {
+                        return Err(Error::State);
+                    }
+                    Ok(device as Successor)
+                }),
+            });
+            let completed = result.clone();
+            narf_scheduler::spawn(core::future::poll_fn(move |cx| {
+                *wake.0.lock() = Some(cx.waker().clone());
+                poll(cx);
+                if completed.lock().result.is_some() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }));
+            result
+        }
+    };
+    Ok(Box::pin(core::future::poll_fn(move |cx| {
+        {
+            let mut completion = result.lock();
+            if let Some(result) = &completion.result {
+                return Poll::Ready(result.clone());
+            }
+            if !completion.waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                if completion.waiters.len() == 16 {
+                    return Poll::Ready(Err(Error::Busy));
+                }
+                completion.waiters.push(cx.waker().clone());
+            }
+        }
+        poll(cx);
+        let ready = result.lock().result.clone();
+        match ready {
+            Some(result) => Poll::Ready(result),
+            None => Poll::Pending,
+        }
+    })))
+}
+/// The physical supervisor calls this even when all public waiters are gone.
+/// Only a regular mutex spans the native future poll; no IRQ guard does.
+pub(super) fn poll(cx: &mut Context<'_>) {
+    let Some(mut slot) = WORK.try_lock() else {
+        cx.waker().wake_by_ref();
+        return;
+    };
+    let Some(work) = slot.as_mut() else {
+        return;
+    };
+    let wake = Waker::from(work.wake.clone());
+    let mut native = Context::from_waker(&wake);
+    if let Poll::Ready(result) = work.future.as_mut().poll(&mut native) {
+        let wake = {
+            let mut completion = work.result.lock();
+            completion.result = Some(result);
+            core::mem::take(&mut completion.waiters)
+        };
+        *slot = None;
+        drop(slot);
+        for waker in wake {
+            waker.wake();
+        }
+    }
+}

@@ -22,7 +22,13 @@ pub struct Request {
 pub(super) fn request(base: &ht::Grant) -> Request {
     let (identity, digest, mac) = base.ba_identity();
     let mut h = narf_crypto::sha256::Sha256::new();
-    h.update(b"NARF AR9285 N85B static recipient BA v1");
+    if base.version() == 1 {
+        h.update(b"NARF AR9285 N85B static recipient BA v1");
+    } else {
+        h.update(b"NARF AR9285 N85B static recipient BA exact-channel v2");
+        h.update(&base.frequency().to_le_bytes());
+        h.update(b"exact current per-channel HT/calibration/CTL/rate facts and original packet/key/BA/capture generation; no v1 channel1 receipt reused");
+    }
     h.update(b"pending proposal prealloc64 opaque originals bound to receive epoch and actual receipt; no crypto/PN/delivery before positive ACK+RXidle; pre-proposal or unopened port never staged; source/key/DELBA/cancel drops stage;8191 is captured MPDU+FCS+minimum delimiter extent, not fabricated total PHY length");
     h.update(&identity);
     h.update(&digest);
@@ -31,10 +37,23 @@ pub(super) fn request(base: &ht::Grant) -> Request {
     Request {
         identity: h.finalize(),
         mac,
-        filename: format!(
-            "ath9k/ar9285-rxba-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-        ),
+        filename: if base.version() == 1 {
+            format!(
+                "ath9k/ar9285-rxba-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            )
+        } else {
+            format!(
+                "ath9k/ar9285-rxba-v2-ch{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                base.channel(),
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
+            )
+        },
     }
 }
 pub(super) struct Grant {
@@ -92,12 +111,12 @@ impl Grant {
         let r = request(&base);
         if signer.is_none()
             || b.len() != 96
-            || b[..8] != [b'N', b'8', b'5', b'B', 1, 0, 96, 0]
+            || b[..8] != [b'N', b'8', b'5', b'B', base.version(), 0, 96, 0]
             || b[8..12] != 96u32.to_le_bytes()
             || b[12..16] != [0x8c, 0x16, 0x2b, 0]
             || b[16..48] != r.identity
             || b[48..54] != r.mac
-            || b[54..58] != [1, 20, 1, 1]
+            || b[54..58] != [base.channel(), 20, 1, 1]
             || !(1..=64).contains(&b[60])
             || b[61] != 0
             || b[64..] != [0; 32]
@@ -126,7 +145,9 @@ impl Grant {
                     let mut limit = self.0.ceiling.min(base_limit);
                     let d = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
                     for r in &d.rules {
-                        if r.freq_start_mhz < 2422 && r.freq_end_mhz > 2402 {
+                        if r.freq_start_mhz < self.0.base.span().1
+                            && r.freq_end_mhz > self.0.base.span().0
+                        {
                             limit = limit.min(i16::from(r.max_power_dbm) * 2);
                         }
                     }

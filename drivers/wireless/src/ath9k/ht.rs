@@ -41,14 +41,23 @@ impl Facts {
             || id.tx_chainmask != 1
             || id.rx_chainmask != 1
             || !id.ht20(image)
-            || base.reference_frequency != 2412
-            || report.frequency_mhz != 2412
+            || base.reference_frequency != report.frequency_mhz
+            || !(2412..=2472).contains(&report.frequency_mhz)
+            || (report.frequency_mhz - 2412) % 5 != 0
         {
             return Err(BringUpError::BadIdentity);
         }
-        let powers = phy::rates::checked_plan(image, report.max_power_half_dbm)?.registers;
+        let powers =
+            phy::rates::checked_plan_at(image, report.frequency_mhz, report.max_power_half_dbm)?
+                .registers;
         let mut h = narf_crypto::sha256::Sha256::new();
-        h.update(b"NARF AR9285 N85H measured static HT20 LGI one-chain v1");
+        if report.frequency_mhz == 2412 {
+            h.update(b"NARF AR9285 N85H measured static HT20 LGI one-chain v1");
+        } else {
+            h.update(b"NARF AR9285 N85H measured exact-channel static HT20 LGI one-chain v2");
+            h.update(&report.frequency_mhz.to_le_bytes());
+            h.update(b"actual full reset/INI/channel synth slope spur/detector/CTL/current-host-calibration report and exact rate array; no channel1 calibration receipt reused; fresh packet/capture/key/BA generation for each cold retune");
+        }
         h.update(b"AR9285 rev2 source RX STBC1 only; exact advertised local HT RX_STBC1 and actual AP TX_STBC offer/response bind per-MPDU native AR_STBC; chain1 TX STBC stays zero; no SGI20");
         h.update(b"native HT/ERP protection: exact offer+response and later current AP beacon, sticky RTS/CTS required, negotiated CCK basic long preamble, ctl0 RTS bit22 and first series RTSCTSQual bit15 with native packet duration, no simultaneous CTS-only; current native ownership unchanged");
         h.update(b"independent Open/secured QoS TID sequence spaces across key replies; legacy management sequence is separate; current receive authorization independent of ordinary TX credit");
@@ -85,10 +94,23 @@ impl Facts {
         let request = Request {
             identity: h.finalize(),
             mac: id.mac,
-            filename: format!(
-                "ath9k/ar9285-ht20-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-                id.mac[0], id.mac[1], id.mac[2], id.mac[3], id.mac[4], id.mac[5]
-            ),
+            filename: if report.frequency_mhz == 2412 {
+                format!(
+                    "ath9k/ar9285-ht20-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                    id.mac[0], id.mac[1], id.mac[2], id.mac[3], id.mac[4], id.mac[5]
+                )
+            } else {
+                format!(
+                    "ath9k/ar9285-ht20-v2-ch{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                    (report.frequency_mhz - 2407) / 5,
+                    id.mac[0],
+                    id.mac[1],
+                    id.mac[2],
+                    id.mac[3],
+                    id.mac[4],
+                    id.mac[5]
+                )
+            },
         };
         Ok(Self {
             request,
@@ -170,12 +192,26 @@ impl Grant {
         cap.invoke(NoopOp).map_err(|_| Error::Access)?;
         if signer.is_none()
             || b.len() != 160
-            || b[..8] != [b'N', b'8', b'5', b'H', 1, 0, 160, 0]
+            || b[..8]
+                != [
+                    b'N',
+                    b'8',
+                    b'5',
+                    b'H',
+                    if facts.report.frequency_mhz == 2412 {
+                        1
+                    } else {
+                        2
+                    },
+                    0,
+                    160,
+                    0,
+                ]
             || b[8..12] != 160u32.to_le_bytes()
             || b[12..16] != [0x8c, 0x16, 0x2b, 0]
             || b[16..48] != facts.request.identity
             || b[48..54] != facts.request.mac
-            || b[54..58] != [1, 20, 1, 0]
+            || b[54..58] != [((facts.report.frequency_mhz - 2407) / 5) as u8, 20, 1, 0]
             || b[62] == 0
             || b[63] != 0
             || b[106..] != [0; 54]
@@ -216,13 +252,16 @@ impl Grant {
             fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
                 Ok((|| {
                     let d = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
-                    let p = Permission::from_domain(&d).map_err(|_| Error::Access)?;
+                    let p = Permission::from_domain_at(&d, self.0.facts.report.frequency_mhz)
+                        .map_err(|_| Error::Access)?;
                     if !p.allows_report(self.0.facts.report) {
                         return Err(Error::Access);
                     }
                     let mut ceiling = self.0.ceiling;
                     for r in &d.rules {
-                        if r.freq_start_mhz < 2422 && r.freq_end_mhz > 2402 {
+                        if r.freq_start_mhz < u32::from(self.0.facts.report.frequency_mhz) + 10
+                            && r.freq_end_mhz > u32::from(self.0.facts.report.frequency_mhz) - 10
+                        {
                             ceiling = ceiling.min(i16::from(r.max_power_dbm) * 2);
                         }
                     }
@@ -250,6 +289,25 @@ impl Grant {
     }
     pub(super) fn mcs(&self) -> u8 {
         self.mcs
+    }
+    pub(super) fn frequency(&self) -> u16 {
+        self.facts.report.frequency_mhz
+    }
+    pub(super) fn channel(&self) -> u8 {
+        ((self.frequency() - 2407) / 5) as u8
+    }
+    pub(super) fn version(&self) -> u8 {
+        if self.frequency() == 2412 {
+            1
+        } else {
+            2
+        }
+    }
+    pub(super) fn span(&self) -> (u32, u32) {
+        (
+            u32::from(self.frequency()) - 10,
+            u32::from(self.frequency()) + 10,
+        )
     }
     pub(super) fn ba_identity(&self) -> ([u8; 32], [u8; 32], [u8; 6]) {
         (

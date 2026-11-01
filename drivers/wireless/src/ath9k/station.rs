@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! One retained AR9285 channel1 legacy/qualified-HT20 station, host RSNA/CCMP.
+//! One retained AR9285 exact-channel legacy/qualified-HT20 station, host RSNA/CCMP.
 use super::{
     descriptor::Mpdu,
     packet::{self, Packet, Port},
@@ -55,12 +55,23 @@ pub(super) enum Phase {
     Stopped,
 }
 pub(super) trait Environment: Send + Sync {
+    fn retune(&self, _frequency: u16) -> Option<super::channels::Transition> {
+        None
+    }
     fn now_ms(&self) -> u64;
     fn nonce(&self) -> Option<[u8; 32]>;
     fn pause(&self) -> impl Future<Output = ()> + Send;
 }
-pub(super) struct NativeEnvironment;
+pub(super) struct NativeEnvironment {
+    pub(super) generation: u32,
+}
 impl Environment for NativeEnvironment {
+    fn retune(&self, frequency: u16) -> Option<super::channels::Transition> {
+        Some(
+            super::channels::request(frequency, self.generation)
+                .unwrap_or_else(|error| alloc::boxed::Box::pin(async move { Err(error) })),
+        )
+    }
     fn now_ms(&self) -> u64 {
         narf_time::monotonic_ns() / 1_000_000
     }
@@ -203,6 +214,19 @@ impl<P: Port, E: Environment> Radio<P, E> {
     }
     pub(super) fn publication(&self) -> Arc<IrqSafeSpinLock<()>> {
         self.publication.clone()
+    }
+    /// Capture an owned transition before releasing this generation's lock.
+    pub(super) fn retune(&self, frequency: u16) -> Option<super::channels::Transition> {
+        self.environment.retune(frequency)
+    }
+    pub(super) fn frequency_mhz(&self) -> u16 {
+        self.packet.frequency_mhz()
+    }
+    pub(super) fn channel_mask(&self) -> u16 {
+        self.packet.channel_mask()
+    }
+    pub(super) fn channel(&self) -> u8 {
+        self.packet.channel()
     }
     pub(super) fn local(&self) -> [u8; 6] {
         self.own
@@ -419,9 +443,9 @@ impl<P: Port, E: Environment> Radio<P, E> {
                     && (bytes[4..10] == self.own || bytes[4..10] == [255; 6])
             });
         let observed = if let Some(g) = &grant {
-            association::observe_with_phy(frame, 1, self.own, signal, &g.local())
+            association::observe_with_phy(frame, self.channel(), self.own, signal, &g.local())
         } else {
-            association::observe(frame, 1, self.own, signal)
+            association::observe(frame, self.channel(), self.own, signal)
         };
         let Ok(candidate) = observed else {
             if current {
@@ -1199,7 +1223,25 @@ impl<P: Port, E: Environment> Radio<P, E> {
             probe.extend_from_slice(name);
             // Driver-owned legacy CCK/OFDM rates, no HT/VHT/WMM promotion.
             probe.extend_from_slice(&[
-                1, 4, 0x82, 0x84, 0x8b, 0x96, 50, 8, 12, 18, 24, 36, 48, 72, 96, 108, 3, 1, 1,
+                1,
+                4,
+                0x82,
+                0x84,
+                0x8b,
+                0x96,
+                50,
+                8,
+                12,
+                18,
+                24,
+                36,
+                48,
+                72,
+                96,
+                108,
+                3,
+                1,
+                self.channel(),
             ]);
             {
                 let publication = self.publication.clone();
@@ -1245,7 +1287,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
             .into_iter()
             .find(|c| c.bss.bssid == bssid)
             .ok_or(Error::Profile)?;
-        if candidate.bss.channel != 1 {
+        if candidate.bss.channel != self.channel() {
             return Err(Error::Profile);
         }
         let mode = if pmk.is_some() {

@@ -73,15 +73,35 @@ pub struct Report {
 pub(super) struct Permission {
     country: [u8; 2],
     ceiling: u8,
+    frequency: u16,
 }
 impl Permission {
     pub(super) fn allows_report(self, report: Report) -> bool {
         self.country == report.country
-            && report.frequency_mhz == 2412
+            && report.frequency_mhz == self.frequency
             && self.ceiling >= report.max_power_half_dbm
     }
+    pub(super) fn budget(self) -> u8 {
+        self.ceiling
+    }
+    pub(super) fn current_in(self, domain: &RegulatoryDomain) -> bool {
+        Self::from_domain_at(domain, self.frequency)
+            .is_ok_and(|p| p.country == self.country && p.ceiling >= self.ceiling)
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn from_domain(domain: &RegulatoryDomain) -> Result<Self, BringUpError> {
-        // The first one-shot profile is channel1/full-rate/20MHz. The entire
+        Self::from_domain_at(domain, 2412)
+    }
+    pub(super) fn from_domain_at(
+        domain: &RegulatoryDomain,
+        frequency: u16,
+    ) -> Result<Self, BringUpError> {
+        if !(2412..=2472).contains(&frequency) || (frequency - 2412) % 5 != 0 {
+            return Err(BringUpError::Policy);
+        }
+        let lower = u32::from(frequency) - 10;
+        let upper = u32::from(frequency) + 10;
+        // Every admitted primary uses full-rate/20MHz. The entire
         // occupied span must be covered; every overlapping limit constrains it.
         if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
             return Err(BringUpError::Policy);
@@ -89,7 +109,7 @@ impl Permission {
         let mut covered = false;
         let mut ceiling = 20i8;
         for rule in &domain.rules {
-            if rule.freq_start_mhz >= 2422 || rule.freq_end_mhz <= 2402 {
+            if rule.freq_start_mhz >= upper || rule.freq_end_mhz <= lower {
                 continue;
             }
             if rule.max_bandwidth_mhz < 20
@@ -101,7 +121,7 @@ impl Permission {
                 return Err(BringUpError::Policy);
             }
             ceiling = ceiling.min(rule.max_power_dbm);
-            covered |= rule.freq_start_mhz <= 2402 && rule.freq_end_mhz >= 2422;
+            covered |= rule.freq_start_mhz <= lower && rule.freq_end_mhz >= upper;
         }
         if !covered {
             return Err(BringUpError::Policy);
@@ -109,6 +129,7 @@ impl Permission {
         Ok(Self {
             country: domain.country_code,
             ceiling: (ceiling as u8) * 2,
+            frequency,
         })
     }
 }
@@ -164,7 +185,7 @@ impl Calibration {
         };
         // Caller supplied the signed domain; factory CTL, antenna and all
         // per-rate target limits are intersected before PHY activation.
-        super::phy::program_live_power(io, image, permission.ceiling)?;
+        super::phy::program_live_power_at(io, image, permission.frequency, permission.ceiling)?;
         pcie(io, xe2).await?;
         let delay = read(io, 0x9914)? & 0x3fff;
         write(io, 0x981c, 1)?;
@@ -187,7 +208,7 @@ impl Calibration {
         }
         let report = Report {
             country: permission.country,
-            frequency_mhz: 2412,
+            frequency_mhz: permission.frequency,
             max_power_half_dbm: permission.ceiling,
             pa_offset,
             iq_i,
@@ -455,4 +476,4 @@ async fn iq(io: &mut impl Io) -> Result<(u8, i8), BringUpError> {
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "calibration/tests.rs"]
-mod tests;
+pub(super) mod tests;

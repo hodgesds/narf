@@ -14,12 +14,12 @@ use zeroize::Zeroizing;
 fn record(base: &ht::Grant) -> Vec<u8> {
     let r = request(base);
     let mut b = vec![0; 96];
-    b[..8].copy_from_slice(&[b'N', b'8', b'5', b'Q', 1, 0, 96, 0]);
+    b[..8].copy_from_slice(&[b'N', b'8', b'5', b'Q', base.version(), 0, 96, 0]);
     b[8..12].copy_from_slice(&96u32.to_le_bytes());
     b[12..16].copy_from_slice(&[0x8c, 0x16, 0x2b, 0]);
     b[16..48].copy_from_slice(&r.identity);
     b[48..54].copy_from_slice(&r.mac);
-    b[54..58].copy_from_slice(&[1, 20, 1, 4]);
+    b[54..58].copy_from_slice(&[base.channel(), 20, 1, 4]);
     b[58..60].copy_from_slice(&12i16.to_le_bytes());
     b[60] = TIDS;
     b[61] = STARVE;

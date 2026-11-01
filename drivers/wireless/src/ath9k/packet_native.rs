@@ -13,6 +13,8 @@ pub(super) struct Native {
     bar: MmioRegion,
     active: AtomicBool,
     report: super::calibration::Report,
+    channel_mask: u16,
+    powers: Option<[(u64, u32); 7]>,
     rf_silent: Option<(u8, bool)>,
     ht: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::ht::Grant>>>,
     ht_facts: Option<super::ht::Facts>,
@@ -52,7 +54,10 @@ impl Native {
         image: &[u8; super::EEPROM_4K_BYTES],
     ) -> Result<Self, Error> {
         // AR2427 shares this legacy owner; HT stays behind `ht::Facts`.
-        if !crate::ath9k::ar9285_silicon(&device.id) || report.frequency_mhz != 2412 {
+        if !crate::ath9k::ar9285_silicon(&device.id)
+            || !(2412..=2472).contains(&report.frequency_mhz)
+            || (report.frequency_mhz - 2412) % 5 != 0
+        {
             return Err(Error::Packet);
         }
         let bytes = [image[20], image[21]];
@@ -69,12 +74,33 @@ impl Native {
         } else {
             None
         };
+        let mut channel_mask = 1 << ((report.frequency_mhz - 2412) / 5);
+        for channel in 1..=13u16 {
+            if super::phy::rates::checked_plan_at(image, 2407 + 5 * channel, 40).is_ok() {
+                channel_mask |= 1 << (channel - 1);
+            }
+        }
+        let powers = if report.frequency_mhz == 2412 {
+            None
+        } else {
+            Some(
+                super::phy::rates::checked_plan_at(
+                    image,
+                    report.frequency_mhz,
+                    report.max_power_half_dbm,
+                )
+                .map_err(|_| Error::Packet)?
+                .registers,
+            )
+        };
         Ok(Self {
             device,
             cap,
             bar,
             active: AtomicBool::new(false),
             report,
+            channel_mask,
+            powers,
             rf_silent,
             ht: narf_lib::sync::IrqSafeSpinLock::new(None),
             ht_facts: None,
@@ -259,6 +285,12 @@ narf_kernel_test::kernel_test_in!(
     smoke_ar9285_native_packet_revocation_precedes_config_dma_and_mmio
 );
 impl Port for Native {
+    fn channel_mask(&self) -> u16 {
+        self.channel_mask
+    }
+    fn frequency_mhz(&self) -> u16 {
+        self.report.frequency_mhz
+    }
     fn qos_grant(&self) -> Option<alloc::sync::Arc<super::qos::Grant>> {
         if let Some(g) = self.qos.lock().clone() {
             return Some(g);
@@ -302,9 +334,15 @@ impl Port for Native {
     fn transmit_allowed(&self) -> Result<(), Error> {
         let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
         let permission =
-            super::calibration::Permission::from_domain(&domain).map_err(|_| Error::Access)?;
+            super::calibration::Permission::from_domain_at(&domain, self.report.frequency_mhz)
+                .map_err(|_| Error::Access)?;
         if !permission.allows_report(self.report) {
             return Err(Error::Access);
+        }
+        // Includes physical per-channel synth/mode/power readbacks in the
+        // same current PCI invocation as every original DMA/copy operation.
+        if self.powers.is_some() {
+            self.access(self.active.load(Ordering::Acquire), || Ok(()))?;
         }
         if let Some((gpio, polarity)) = self.rf_silent {
             if (self.read(0x4048)? & (1 << (12 + gpio)) != 0) == polarity {
@@ -331,9 +369,31 @@ impl Port for Native {
             }
             let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
             let permission =
-                super::calibration::Permission::from_domain(&domain).map_err(|_| Error::Access)?;
+                super::calibration::Permission::from_domain_at(&domain, self.report.frequency_mhz)
+                    .map_err(|_| Error::Access)?;
             if !permission.allows_report(self.report) {
                 return Err(Error::Access);
+            }
+            if let Some(powers) = &self.powers {
+                // Raw loads stay inside this current BusDevice invocation;
+                // using Port::read here would recursively enter access().
+                let read = |register| -> Result<u32, Error> {
+                    self.extent(register)?;
+                    // SAFETY: full dword BAR bounds and current exclusive PCI
+                    // authority were checked above; no competing channel writer.
+                    Ok(unsafe { self.bar.read32(register) })
+                };
+                if read(0x9874)? & 0x3fff_ffff
+                    != (0x3000_0000 | (u32::from(self.report.frequency_mhz) * 0x10000 / 15))
+                    || read(0x9804)? & 0x7ff != 0x3c0
+                {
+                    return Err(Error::Descriptor);
+                }
+                for (register, value) in powers {
+                    if read(*register)? != *value {
+                        return Err(Error::Descriptor);
+                    }
+                }
             }
             if let Some((gpio, polarity)) = self.rf_silent {
                 self.extent(0x4048)?;

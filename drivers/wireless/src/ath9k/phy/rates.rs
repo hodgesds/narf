@@ -165,15 +165,22 @@ fn initial_ctl(factory: Factory) -> u16 {
         factory.ctl_2ghz
     }) | 2
 }
-pub(in crate::ath9k) fn checked_plan(
+pub(in crate::ath9k) fn checked_plan_at(
     image: &[u8; EEPROM_4K_BYTES],
+    frequency: u16,
     ceiling: u8,
 ) -> Result<Plan, BringUpError> {
+    if !(2412..=2472).contains(&frequency) || (frequency - 2412) % 5 != 0 {
+        return Err(BringUpError::BadCalibration);
+    }
+    if frequency != 2412 && ceiling < image[60] {
+        return Err(BringUpError::Policy);
+    }
     let factory = Factory::from_eeprom(u32::from(u16::from_le_bytes(
         image[8..10].try_into().unwrap(),
     )))
     .map_err(|_| BringUpError::BadCalibration)?;
-    plan(image, 2412, initial_ctl(factory), ceiling)
+    plan(image, frequency, initial_ctl(factory), ceiling)
 }
 pub(super) fn program(
     io: &mut impl RegisterIo,

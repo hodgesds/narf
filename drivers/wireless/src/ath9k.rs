@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! AR9285 reset/EEPROM, inactive INI/PLL/RF and signed-policy calibration.
-//! Linux ath9k is the reference. The one-shot channel1 analog/AGC/IQ owner
+//! Linux ath9k is the reference. The one-shot selected-channel analog/AGC/IQ owner
 //! retains partial attempts through native DMA, host RSNA and station service.
 
 use alloc::sync::Arc;
@@ -10,6 +10,7 @@ use narf_capabilities::{Cap, Write};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
 mod calibration;
+mod channels;
 mod descriptor;
 mod ht;
 mod identity;
@@ -136,6 +137,9 @@ struct Retained {
 }
 static CLAIMED_ADDRESS: IrqSafeSpinLock<Option<BusAddr>> = IrqSafeSpinLock::new(None);
 static CONTROLLER: IrqSafeSpinLock<Option<Arc<Retained>>> = IrqSafeSpinLock::new(None);
+/// Serialize whole physical initialize/reset/retune generations. No IRQ
+/// disabling guard spans calibration or packet-retirement waits.
+static CONTROL: Mutex<()> = Mutex::new(());
 
 pub fn with_controller<R>(callback: impl FnOnce(&Ath9k) -> R) -> Option<R> {
     let owner = { CONTROLLER.lock().clone() }?;
@@ -152,6 +156,10 @@ pub async fn calibrate_radio() -> Result<RadioCalibration, BringUpError> {
     initialize_owner(&owner).await
 }
 async fn initialize_owner(owner: &Retained) -> Result<RadioCalibration, BringUpError> {
+    let _control = CONTROL.lock().await;
+    initialize_owner_inner(owner).await
+}
+async fn initialize_owner_inner(owner: &Retained) -> Result<RadioCalibration, BringUpError> {
     let report = {
         let controller = owner.state.lock().await;
         if owner.removed.load(core::sync::atomic::Ordering::Acquire) || controller.pinned {
@@ -217,8 +225,9 @@ where
 }
 async fn calibrate_owner(owner: &Retained) -> Result<RadioCalibration, BringUpError> {
     let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
-    let permission = calibration::Permission::from_domain(&domain)?;
     let mut controller = owner.state.try_lock().ok_or(BringUpError::BadState)?;
+    let frequency = controller.baseband.reference_frequency;
+    let permission = calibration::Permission::from_domain_at(&domain, frequency)?;
     let command = identity::invoke(&controller._cap, || {
         narf_bus::pci::read_command(&controller._cap, &controller._device)
     })
@@ -244,7 +253,19 @@ async fn calibrate_owner(owner: &Retained) -> Result<RadioCalibration, BringUpEr
     // completed full INI/modal/detector preparation, and never allocated or
     // published packet DMA. Current PCI parking was verified above; an async
     // mutex, rather than an IRQ-disabling guard, serializes the full attempt.
-    unsafe { controller.radio.run(&mut io, &image, permission, xe2).await }
+    let future = unsafe { controller.radio.run(&mut io, &image, permission, xe2) };
+    if frequency == 2412 {
+        future.await
+    } else {
+        let mut future = core::pin::pin!(future);
+        core::future::poll_fn(|cx| {
+            if narf_wireless::reg::db::snapshot().is_none_or(|d| !permission.current_in(&d)) {
+                return core::task::Poll::Ready(Err(BringUpError::Policy));
+            }
+            core::future::Future::poll(future.as_mut(), cx)
+        })
+        .await
+    }
 }
 
 async fn prepare_packets(owner: &Retained) -> Result<RetainedRadio, packet::Error> {
@@ -292,7 +313,9 @@ async fn prepare_packets(owner: &Retained) -> Result<RetainedRadio, packet::Erro
         packet,
         controller.identity.mac,
         report.noise_dbm,
-        station::NativeEnvironment,
+        station::NativeEnvironment {
+            generation: controller.generation,
+        },
     )));
     // The exact native owner is retained before packet start or NIC exposure.
     // Interface/control/drain callers clone only this same Arc.
@@ -325,6 +348,14 @@ pub async fn reset_radio() -> Result<RadioCalibration, BringUpError> {
     reset_owner(&owner).await
 }
 async fn reset_owner(owner: &Retained) -> Result<RadioCalibration, BringUpError> {
+    reset_owner_at(owner, None, None).await
+}
+async fn reset_owner_at(
+    owner: &Retained,
+    selected: Option<u16>,
+    expected: Option<u32>,
+) -> Result<RadioCalibration, BringUpError> {
+    let _control = CONTROL.lock().await;
     {
         let mut controller = owner.state.lock().await;
         if owner.removed.load(core::sync::atomic::Ordering::Acquire)
@@ -332,6 +363,18 @@ async fn reset_owner(owner: &Retained) -> Result<RadioCalibration, BringUpError>
             || controller.suspended
         {
             return Err(BringUpError::DeviceGone);
+        }
+        if expected.is_some_and(|generation| generation != controller.generation) {
+            return Err(BringUpError::BadState);
+        }
+        let frequency = selected.unwrap_or(controller.baseband.reference_frequency);
+        if selected.is_some() {
+            let domain =
+                narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
+            let permission = calibration::Permission::from_domain_at(&domain, frequency)?;
+            // Validate a requested target before withdrawing a live owner.
+            // Ordinary recovery still retires first, including on policy loss.
+            phy::rates::checked_plan_at(&controller.calibration, frequency, permission.budget())?;
         }
         if !retire_generation(&mut controller).await {
             return Err(BringUpError::BadState);
@@ -353,7 +396,8 @@ async fn reset_owner(owner: &Retained) -> Result<RadioCalibration, BringUpError>
         if identity != controller.identity || image != controller.calibration {
             return Err(BringUpError::BadIdentity);
         }
-        controller.baseband = phy::program(controller._mmio, controller._cap, &image)?;
+        controller.baseband =
+            phy::program_at(controller._mmio, controller._cap, &image, frequency)?;
         controller.pcie_aspm = pcie_pm::restore(
             &controller._device,
             controller._cap,
@@ -366,7 +410,7 @@ async fn reset_owner(owner: &Retained) -> Result<RadioCalibration, BringUpError>
             .ok_or(BringUpError::BadState)?;
         controller.packet_attempted = false;
     }
-    initialize_owner(owner).await
+    initialize_owner_inner(owner).await
 }
 
 /// Rejoin supervisor: once a published station generation is terminal
@@ -376,6 +420,11 @@ async fn reset_owner(owner: &Retained) -> Result<RadioCalibration, BringUpError>
 async fn supervise(owner: Arc<Retained>) {
     let mut failures = 0u32;
     loop {
+        core::future::poll_fn(|cx| {
+            channels::poll(cx);
+            core::task::Poll::Ready(())
+        })
+        .await;
         narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)).await;
         if owner.removed.load(core::sync::atomic::Ordering::Acquire) {
             return;
@@ -431,6 +480,7 @@ async fn supervise(owner: Arc<Retained>) {
 /// owner and fails suspend rather than powering down a mastering device.
 fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
     use narf_power::device_pm::DeviceSuspendError;
+    let _control = CONTROL.try_lock().ok_or(DeviceSuspendError::Busy)?;
     let Some(owner) = CONTROLLER.lock().clone() else {
         return Ok(());
     };

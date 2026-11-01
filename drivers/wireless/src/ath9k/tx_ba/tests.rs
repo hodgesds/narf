@@ -14,12 +14,12 @@ pub(in crate::ath9k) fn qualify(model: &Arc<Model>, window: u8) -> Cap<FirmwareB
     let base = model.ht.borrow().clone().unwrap();
     let r = request(&base);
     let mut b = vec![0; 96];
-    b[..8].copy_from_slice(&[b'N', b'8', b'5', b'T', 1, 0, 96, 0]);
+    b[..8].copy_from_slice(&[b'N', b'8', b'5', b'T', base.version(), 0, 96, 0]);
     b[8..12].copy_from_slice(&96u32.to_le_bytes());
     b[12..16].copy_from_slice(&[0x8c, 0x16, 0x2b, 0]);
     b[16..48].copy_from_slice(&r.identity);
     b[48..54].copy_from_slice(&r.mac);
-    b[54..58].copy_from_slice(&[1, 20, 1, 2]);
+    b[54..58].copy_from_slice(&[base.channel(), 20, 1, 2]);
     b[58..60].copy_from_slice(&12i16.to_le_bytes());
     b[60] = window;
     b[61] = 3;
@@ -84,12 +84,12 @@ fn smoke_ar9285_tx_ba_distinct_signed_contract_and_missing_source_keeps_single_m
         return TestResult::Fail("sender qualification aliased another profile");
     }
     let mut b = vec![0; 96];
-    b[..8].copy_from_slice(&[b'N', b'8', b'5', b'T', 1, 0, 96, 0]);
+    b[..8].copy_from_slice(&[b'N', b'8', b'5', b'T', base.version(), 0, 96, 0]);
     b[8..12].copy_from_slice(&96u32.to_le_bytes());
     b[12..16].copy_from_slice(&[0x8c, 0x16, 0x2b, 0]);
     b[16..48].copy_from_slice(&r.identity);
     b[48..54].copy_from_slice(&r.mac);
-    b[54..58].copy_from_slice(&[1, 20, 1, 2]);
+    b[54..58].copy_from_slice(&[base.channel(), 20, 1, 2]);
     b[58..60].copy_from_slice(&12i16.to_le_bytes());
     b[60] = 64;
     b[61] = 3;

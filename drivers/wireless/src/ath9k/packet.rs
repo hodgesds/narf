@@ -73,6 +73,13 @@ pub(super) enum Phase {
     Stopped,
 }
 pub(super) trait Port {
+    /// Actual fresh calibrated physical owner. RXD has no channel field.
+    fn frequency_mhz(&self) -> u16 {
+        2412
+    }
+    fn channel_mask(&self) -> u16 {
+        1
+    }
     fn tx_ba_grant(&self) -> Option<alloc::sync::Arc<super::tx_ba::Grant>> {
         None
     }
@@ -324,6 +331,10 @@ impl<P: Port> Packet<P> {
     /// BME, RX, all TX queues and IRQ delivery remained off. No inherited DMA
     /// may refer to these fresh mappings. No other actor can start the engines.
     pub(super) unsafe fn prepare(port: P, local: [u8; 6]) -> Result<Self, Error> {
+        let frequency = port.frequency_mhz();
+        if !(2412..=2472).contains(&frequency) || (frequency - 2412) % 5 != 0 {
+            return Err(Error::Packet);
+        }
         if local[0] & 1 != 0 || local == [0; 6] {
             return Err(Error::Packet);
         }
@@ -427,6 +438,15 @@ impl<P: Port> Packet<P> {
             return Err(Error::Descriptor);
         }
         self.port.access(self.phase != Phase::Prepared, || Ok(()))
+    }
+    pub(super) fn frequency_mhz(&self) -> u16 {
+        self.port.frequency_mhz()
+    }
+    pub(super) fn channel_mask(&self) -> u16 {
+        self.port.channel_mask()
+    }
+    pub(super) fn channel(&self) -> u8 {
+        ((self.frequency_mhz() - 2407) / 5) as u8
     }
     pub(super) fn ht_grant(&self) -> Option<alloc::sync::Arc<super::ht::Grant>> {
         self.port.ht_grant()

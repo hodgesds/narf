@@ -46,6 +46,8 @@ pub(in crate::ath9k) struct Region {
     pub len: usize,
 }
 pub(in crate::ath9k) struct Model {
+    pub(in crate::ath9k) frequency: Cell<u16>,
+    pub(in crate::ath9k) channels: Cell<u16>,
     pub(in crate::ath9k) registers: RefCell<BTreeMap<u64, u32>>,
     pub(in crate::ath9k) regions: RefCell<Vec<Region>>,
     pub(in crate::ath9k) master: Cell<bool>,
@@ -98,6 +100,8 @@ pub(in crate::ath9k) type Reaction =
 impl Model {
     pub(in crate::ath9k) fn new() -> Arc<Self> {
         Arc::new(Self {
+            frequency: Cell::new(2412),
+            channels: Cell::new(1),
             registers: RefCell::new(BTreeMap::from([
                 (CR, 0),
                 (QTXE, 0),
@@ -339,6 +343,12 @@ impl Model {
     }
 }
 impl Port for Arc<Model> {
+    fn frequency_mhz(&self) -> u16 {
+        self.frequency.get()
+    }
+    fn channel_mask(&self) -> u16 {
+        self.channels.get()
+    }
     fn qos_grant(&self) -> Option<Arc<crate::ath9k::qos::Grant>> {
         self.qos.borrow().clone()
     }

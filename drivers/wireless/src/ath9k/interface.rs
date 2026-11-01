@@ -42,6 +42,8 @@ impl State {
 pub(super) struct Device<P: Port, E: Environment> {
     pub(super) radio: Arc<Mutex<Radio<P, E>>>,
     state: Mutex<State>,
+    /// Copied scan output only; never an association/key/calibration authority.
+    scan_ies: IrqSafeSpinLock<Vec<([u8; 6], Vec<u8>)>>,
     name: String,
     own: [u8; 6],
     admitted: AtomicBool,
@@ -95,6 +97,7 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
         let (producer, tx) = narf_ipc::channel();
         Ok(Self {
             radio,
+            scan_ies: IrqSafeSpinLock::new(Vec::new()),
             state: Mutex::new(State {
                 rx,
                 tx,
@@ -152,6 +155,75 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
             return Err(Error::Busy);
         }
         Ok(())
+    }
+    async fn scan_current(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+        let dwell = scan_dwell(&request)?;
+        let mut radio = self.radio.lock().await;
+        let frequency = radio.frequency_mhz();
+        let channel = radio.channel();
+        if request.frequencies_mhz != [u32::from(frequency)] {
+            return Err(WirelessError::InvalidArgs);
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(WirelessError::HardwareError);
+        }
+        if !matches!(radio.phase(), Phase::Prepared | Phase::Passive) {
+            return Err(WirelessError::Busy);
+        }
+        self.start(&mut radio).map_err(wireless)?;
+        let mut attempt = Attempt {
+            device: self,
+            armed: true,
+        };
+        let result = if request.active {
+            radio.active_scan_for(dwell, &request.ssids).await
+        } else {
+            radio.scan_for(dwell).await
+        };
+        attempt.armed = false;
+        if result.is_err() {
+            self.close();
+            let _ = radio.stop();
+        }
+        result
+            .map(|list| {
+                list.into_iter()
+                    .filter(|candidate| {
+                        request.ssids.is_empty()
+                            || request
+                                .ssids
+                                .iter()
+                                .any(|ssid| ssid.is_empty() || *ssid == candidate.bss.ssid)
+                    })
+                    .map(|candidate| BssInfo {
+                        bssid: candidate.bss.bssid,
+                        ssid: candidate.bss.ssid,
+                        frequency_mhz: u32::from(frequency),
+                        channel: u32::from(channel),
+                        rssi: candidate.bss.signal_dbm.unwrap_or(i8::MIN),
+                        security: if candidate.ap_rsne.is_some() {
+                            narf_wireless::scan::BssSecurity::Wpa2
+                        } else if candidate.bss.capability & 16 != 0 {
+                            narf_wireless::scan::BssSecurity::Wep
+                        } else {
+                            narf_wireless::scan::BssSecurity::Open
+                        },
+                    })
+                    .collect()
+            })
+            .map_err(wireless)
+    }
+    fn scan_metadata(&self, list: &[BssInfo], owner: &dyn WirelessNetIface) {
+        for candidate in list {
+            if let Some(ies) = owner.scan_information_elements(candidate.bssid) {
+                let mut saved = self.scan_ies.lock();
+                if let Some(old) = saved.iter_mut().find(|old| old.0 == candidate.bssid) {
+                    old.1 = ies;
+                } else if saved.len() < 128 {
+                    saved.push((candidate.bssid, ies));
+                }
+            }
+        }
     }
     pub(super) fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
         if self.closed.load(Ordering::Acquire)
@@ -424,6 +496,15 @@ impl<P: Port + Send + 'static, E: Environment + 'static> WirelessNetIface for De
         (peer[7] != 0).then(|| peer[..6].try_into().unwrap())
     }
     fn scan_information_elements(&self, peer: [u8; 6]) -> Option<Vec<u8>> {
+        if let Some(ies) = self
+            .scan_ies
+            .lock()
+            .iter()
+            .find(|entry| entry.0 == peer)
+            .map(|entry| entry.1.clone())
+        {
+            return Some(ies);
+        }
         self.radio.try_lock()?.information_elements(peer)
     }
     fn get_wireless_info(&self) -> narf_wireless::WirelessIfaceInfo {
@@ -433,7 +514,14 @@ impl<P: Port + Send + 'static, E: Environment + 'static> WirelessNetIface for De
             base_mac: self.own,
             bands: vec![WirelessBand {
                 freq_mhz: 2400,
-                channels: vec![1],
+                channels: self.radio.try_lock().map_or_else(Vec::new, |radio| {
+                    (1..=13)
+                        .filter(|channel| {
+                            radio.channel_mask() & (1 << (channel - 1)) != 0
+                                && permitted(2407 + 5 * *channel as u16)
+                        })
+                        .collect()
+                }),
             }],
             modes: WirelessModes::STATION,
             hw_caps: HwCaps {
@@ -445,60 +533,104 @@ impl<P: Port + Send + 'static, E: Environment + 'static> WirelessNetIface for De
         }
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        let dwell = scan_dwell(&request)?;
-        let mut radio = self.radio.lock().await;
-        if self.closed.load(Ordering::Acquire) {
-            return Err(WirelessError::HardwareError);
-        }
-        if !matches!(radio.phase(), Phase::Prepared | Phase::Passive) {
-            return Err(WirelessError::Busy);
-        }
-        self.start(&mut radio).map_err(wireless)?;
-        let mut attempt = Attempt {
-            device: self,
-            armed: true,
+        scan_dwell(&request)?;
+        let (original, mask) = {
+            let radio = self.radio.lock().await;
+            if self.closed.load(Ordering::Acquire) {
+                return Err(WirelessError::HardwareError);
+            }
+            if !matches!(radio.phase(), Phase::Prepared | Phase::Passive) {
+                return Err(WirelessError::Busy);
+            }
+            (radio.frequency_mhz(), radio.channel_mask())
         };
-        let result = if request.active {
-            radio.active_scan_for(dwell, &request.ssids).await
-        } else {
-            radio.scan_for(dwell).await
-        };
-        attempt.armed = false;
-        if result.is_err() {
-            self.close();
-            let _ = radio.stop();
+        let frequencies = scan_frequencies(&request, mask)?;
+        self.scan_ies.lock().clear();
+        let mut owner: Option<super::channels::Successor> = None;
+        let mut operating = original;
+        let mut output: Vec<BssInfo> = Vec::new();
+        for frequency in frequencies {
+            if operating != frequency {
+                let transition = match &owner {
+                    Some(device) => device.retune_channel(frequency),
+                    None => self.retune_channel(frequency),
+                }
+                .map_err(wireless)?;
+                owner = Some(transition.await.map_err(wireless)?);
+                operating = frequency;
+            }
+            let result = match &owner {
+                Some(device) => device.scan(one_scan(&request, frequency)).await,
+                None => self.scan_current(one_scan(&request, frequency)).await,
+            };
+            let list = result?;
+            match &owner {
+                Some(device) => self.scan_metadata(&list, device.as_ref()),
+                None => self.scan_metadata(&list, self),
+            }
+            for candidate in list {
+                if let Some(old) = output.iter_mut().find(|old| {
+                    old.bssid == candidate.bssid && old.frequency_mhz == candidate.frequency_mhz
+                }) {
+                    *old = candidate;
+                } else {
+                    output.push(candidate);
+                }
+            }
         }
-        result
-            .map(|list| {
-                list.into_iter()
-                    .filter(|candidate| {
-                        request.ssids.is_empty()
-                            || request
-                                .ssids
-                                .iter()
-                                .any(|ssid| ssid.is_empty() || *ssid == candidate.bss.ssid)
-                    })
-                    .map(|candidate| BssInfo {
-                        bssid: candidate.bss.bssid,
-                        ssid: candidate.bss.ssid,
-                        frequency_mhz: 2412,
-                        channel: 1,
-                        rssi: candidate.bss.signal_dbm.unwrap_or(i8::MIN),
-                        security: if candidate.ap_rsne.is_some() {
-                            narf_wireless::scan::BssSecurity::Wpa2
-                        } else if candidate.bss.capability & 16 != 0 {
-                            narf_wireless::scan::BssSecurity::Wep
-                        } else {
-                            narf_wireless::scan::BssSecurity::Open
-                        },
-                    })
-                    .collect()
-            })
-            .map_err(wireless)
+        // The initial interface remains terminal after the first cold retune.
+        // Restore RF by another real generation, never reopening old tokens.
+        if operating != original {
+            owner
+                .as_ref()
+                .ok_or(WirelessError::HardwareError)?
+                .retune_channel(original)
+                .map_err(wireless)?
+                .await
+                .map_err(wireless)?;
+        }
+        Ok(output)
     }
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
-        if request.frequency_mhz != 2412 || request.channel != 1 {
-            return Err(WirelessError::NotSupported);
+        let frequency = super::channels::frequency(request.channel).map_err(wireless)?;
+        if request.frequency_mhz != u32::from(frequency) {
+            return Err(WirelessError::InvalidArgs);
+        }
+        let current = {
+            let radio = self.radio.lock().await;
+            if self.closed.load(Ordering::Acquire) {
+                return Err(WirelessError::HardwareError);
+            }
+            radio.frequency_mhz()
+        };
+        if current != frequency {
+            let successor = self
+                .retune_channel(frequency)
+                .map_err(wireless)?
+                .await
+                .map_err(wireless)?;
+            // A BSS from a retired generation cannot authorize a new join.
+            let found = successor
+                .scan(ScanRequest {
+                    ssids: vec![request.ssid.clone()],
+                    frequencies_mhz: vec![u32::from(frequency)],
+                    channels: vec![request.channel],
+                    active: true,
+                    random_mac: None,
+                    colocated_6ghz: false,
+                    duration_tu: None,
+                    duration_mandatory: false,
+                    extra_ies: Vec::new(),
+                })
+                .await?;
+            if !found.iter().any(|bss| {
+                bss.bssid == request.bssid
+                    && bss.ssid == request.ssid
+                    && bss.frequency_mhz == request.frequency_mhz
+            }) {
+                return Err(WirelessError::InvalidArgs);
+            }
+            return successor.associate(request).await;
         }
         let pmk = match request.security {
             SecurityConfig::Open => None,
@@ -532,23 +664,112 @@ impl<P: Port + Send + 'static, E: Environment + 'static> WirelessNetIface for De
         radio.stop().map_err(wireless)
     }
     async fn set_config(&self, config: WirelessConfig) -> Result<(), WirelessError> {
-        if config.channel == 1 && config.tx_power_dbm.is_none() {
-            Ok(())
-        } else {
-            Err(WirelessError::NotSupported)
+        if config.tx_power_dbm.is_some() {
+            return Err(WirelessError::NotSupported);
+        }
+        let frequency = super::channels::frequency(config.channel).map_err(wireless)?;
+        {
+            let radio = self.radio.lock().await;
+            if self.closed.load(Ordering::Acquire) {
+                return Err(WirelessError::HardwareError);
+            }
+            if radio.frequency_mhz() == frequency {
+                return Ok(());
+            }
+        }
+        self.retune_channel(frequency)
+            .map_err(wireless)?
+            .await
+            .map_err(wireless)?;
+        Ok(())
+    }
+}
+/// Private continuation carrying the actual next driver generation.
+pub(super) trait ChannelIface: WirelessNetIface {
+    fn retune_channel(&self, frequency: u16) -> Result<super::channels::Transition, Error>;
+}
+impl<P: Port + Send + 'static, E: Environment + 'static> ChannelIface for Device<P, E> {
+    fn retune_channel(&self, frequency: u16) -> Result<super::channels::Transition, Error> {
+        let channel = super::channels::channel(frequency)?;
+        let radio = self.radio.try_lock().ok_or(Error::Busy)?;
+        if self.closed.load(Ordering::Acquire)
+            || !self.admitted.load(Ordering::Acquire)
+            || !matches!(
+                radio.phase(),
+                Phase::Prepared | Phase::Passive | Phase::Open
+            )
+        {
+            return Err(Error::State);
+        }
+        if radio.channel_mask() & (1 << (channel - 1)) == 0 || !permitted(frequency) {
+            return Err(Error::Profile);
+        }
+        radio.retune(frequency).ok_or(Error::Profile)
+    }
+}
+fn permitted(frequency: u16) -> bool {
+    narf_wireless::reg::db::snapshot().is_some_and(|domain| {
+        super::calibration::Permission::from_domain_at(&domain, frequency).is_ok()
+    })
+}
+fn one_scan(request: &ScanRequest, frequency: u16) -> ScanRequest {
+    ScanRequest {
+        ssids: request.ssids.clone(),
+        frequencies_mhz: vec![u32::from(frequency)],
+        channels: vec![u32::from((frequency - 2407) / 5)],
+        active: request.active,
+        random_mac: request.random_mac,
+        colocated_6ghz: request.colocated_6ghz,
+        duration_tu: request.duration_tu,
+        duration_mandatory: request.duration_mandatory,
+        extra_ies: request.extra_ies.clone(),
+    }
+}
+fn scan_frequencies(request: &ScanRequest, mask: u16) -> Result<Vec<u16>, WirelessError> {
+    let explicit = !request.frequencies_mhz.is_empty() || !request.channels.is_empty();
+    let selected = if !request.frequencies_mhz.is_empty() {
+        request
+            .frequencies_mhz
+            .iter()
+            .map(|f| u16::try_from(*f).map_err(|_| WirelessError::InvalidArgs))
+            .collect::<Result<Vec<_>, _>>()?
+    } else if !request.channels.is_empty() {
+        request
+            .channels
+            .iter()
+            .map(|ch| super::channels::frequency(*ch).map_err(wireless))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        (1..=13)
+            .filter(|ch| mask & (1 << (ch - 1)) != 0)
+            .map(|ch| 2407 + ch * 5)
+            .collect()
+    };
+    let mut output = Vec::new();
+    for frequency in selected {
+        let channel = super::channels::channel(frequency).map_err(wireless)?;
+        // Retain the original channel1-only selector behavior. The native
+        // Port still checks current policy on every actual RF/DMA operation.
+        let reference = mask == 1 && frequency == 2412;
+        if mask & (1 << (channel - 1)) == 0 || !reference && !permitted(frequency) {
+            if explicit {
+                return Err(WirelessError::NotSupported);
+            }
+            continue;
+        }
+        if !output.contains(&frequency) {
+            output.push(frequency);
         }
     }
+    if output.is_empty() {
+        return Err(WirelessError::NotSupported);
+    }
+    Ok(output)
 }
 fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
     if request.random_mac.is_some()
         || request.colocated_6ghz
         || !request.extra_ies.is_empty()
-        || request
-            .frequencies_mhz
-            .iter()
-            .any(|frequency| *frequency != 2412)
-        || request.frequencies_mhz.is_empty()
-            && request.channels.iter().any(|channel| *channel != 1)
         || request.ssids.len() > if request.active { 4 } else { 32 }
         || request.ssids.iter().any(|ssid| ssid.len() > 32)
     {
@@ -640,6 +861,9 @@ pub(super) fn publish(radio: super::RetainedRadio) -> Result<Arc<Native>, Error>
     });
     Ok(device)
 }
+pub(super) fn current() -> Option<Arc<Native>> {
+    CURRENT.lock().clone()
+}
 /// Withdraw only the generation that owns `radio`: close carrier and rings,
 /// leave every registry, and keep the retired name reserved so a late old
 /// publisher cannot address a successor. Returns whether it was published.
@@ -684,3 +908,7 @@ impl Interface for Registered {
 #[cfg(feature = "kernel-test")]
 #[path = "interface_tests.rs"]
 mod tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "interface_channel_tests.rs"]
+mod channel_tests;

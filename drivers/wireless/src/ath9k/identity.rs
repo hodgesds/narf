@@ -274,7 +274,9 @@ fn decode_identity(
     })
 }
 
-fn identify(io: &mut impl RegisterIo) -> Result<(Identity, [u8; EEPROM_4K_BYTES]), BringUpError> {
+pub(in crate::ath9k) fn identify(
+    io: &mut impl RegisterIo,
+) -> Result<(Identity, [u8; EEPROM_4K_BYTES]), BringUpError> {
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
