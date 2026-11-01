@@ -34,12 +34,36 @@ impl Mcc {
         primary: u8,
         width: u8,
         center: u8,
+        qos: Option<super::qos::Parameters>,
+    ) -> Option<super::qos::Parameters> {
+        self.limit_qos_band(
+            domain,
+            if primary <= 14 {
+                super::native_band::Band::Two
+            } else {
+                super::native_band::Band::Five
+            },
+            primary,
+            width,
+            center,
+            qos,
+        )
+    }
+    pub fn limit_qos_band(
+        &self,
+        domain: &RegulatoryDomain,
+        band: super::native_band::Band,
+        primary: u8,
+        width: u8,
+        center: u8,
         mut qos: Option<super::qos::Parameters>,
     ) -> Option<super::qos::Parameters> {
         let Some(parameters) = qos.as_mut() else {
             return qos;
         };
-        let frequency = if primary == 14 {
+        let frequency = if band == super::native_band::Band::Six {
+            5950 + 5 * u32::from(center)
+        } else if primary == 14 {
             2484
         } else {
             (if primary <= 14 { 2407 } else { 5000 }) + 5 * u32::from(center)
@@ -55,7 +79,7 @@ impl Mcc {
                 configured.txop_us = configured.txop_us.min(required.cot_us / 32 * 32);
             }
         };
-        if self.etsi_5ghz && primary > 14 {
+        if self.etsi_5ghz && band == super::native_band::Band::Five {
             apply(&WmmRule::ETSI);
         }
         for rule in domain.rules.iter().filter(|r| {

@@ -46,6 +46,7 @@ pub struct Device {
     mac: [u8; 6],
     irq_vector: Option<u8>,
     channels: Vec<u8>,
+    six_channels: Vec<super::native_band::Channel>,
     tx_chains: u32,
     phy: super::ht_vht::Local,
     firmware: Vec<u8>,
@@ -294,6 +295,7 @@ impl Device {
             mac,
             irq_vector,
             channels: nvm.channels,
+            six_channels: nvm.six_channels,
             tx_chains: nvm.tx_chains,
             phy: nvm.phy,
             firmware: firmware.to_vec(),
@@ -319,6 +321,9 @@ impl Device {
         }
         nvm.phy.he &= super::sc_he::native_supported(hardware);
         nvm.phy.native_rates = super::sc_he::rates_version(hardware).unwrap_or(0);
+        if !nvm.phy.he || !hardware.band_in_rx_supported() {
+            nvm.six_channels.clear();
+        }
         let runtime = hardware.runtime_configuration()?;
         hardware
             .command(1, 0x98, &nvm.tx_chains.to_le_bytes())
@@ -382,7 +387,11 @@ impl Device {
         let nvm = Self::configure(&mut state.hardware, mac)
             .await
             .map_err(|_| WirelessError::HardwareError)?;
-        if nvm.tx_chains != self.tx_chains || nvm.channels != self.channels || nvm.phy != self.phy {
+        if nvm.tx_chains != self.tx_chains
+            || nvm.channels != self.channels
+            || nvm.six_channels != self.six_channels
+            || nvm.phy != self.phy
+        {
             state.hardware.fail();
             return Err(WirelessError::HardwareError);
         }
@@ -1236,6 +1245,11 @@ impl Device {
                 b.bssid == request.bssid
                     && b.ssid == request.ssid
                     && b.channel as u32 == request.channel
+                    && super::native_band::Channel::from_frequency(b.channel, request.frequency_mhz)
+                        == Some(super::native_band::Channel {
+                            band: b.band,
+                            number: b.channel,
+                        })
             })
             .cloned()
             .ok_or(WirelessError::InvalidArgs)?;
@@ -1338,7 +1352,11 @@ impl WirelessNetIface for Device {
     }
 
     fn phy_capabilities(&self, band_mhz: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
-        self.phy.capabilities(band_mhz)
+        if band_mhz == 6000 {
+            None
+        } else {
+            self.phy.capabilities(band_mhz)
+        }
     }
     fn tx_ring_for_ac(
         &self,
@@ -1372,17 +1390,24 @@ impl WirelessNetIface for Device {
         WirelessIfaceInfo {
             base_name: self.name().into(),
             base_mac: self.mac,
-            bands: [2400, 5000]
+            bands: [2400, 5000, 6000]
                 .into_iter()
+                .filter(|&band| band != 6000 || !self.six_channels.is_empty())
                 .map(|freq_mhz| WirelessBand {
                     freq_mhz,
-                    channels: self
-                        .channels
-                        .iter()
-                        .copied()
-                        .filter(|&ch| (ch <= 14) == (freq_mhz == 2400))
-                        .map(u32::from)
-                        .collect(),
+                    channels: if freq_mhz == 6000 {
+                        self.six_channels
+                            .iter()
+                            .map(|ch| u32::from(ch.number))
+                            .collect()
+                    } else {
+                        self.channels
+                            .iter()
+                            .copied()
+                            .filter(|&ch| (ch <= 14) == (freq_mhz == 2400))
+                            .map(u32::from)
+                            .collect()
+                    },
                 })
                 .collect(),
             modes: WirelessModes::STATION,
@@ -1399,21 +1424,52 @@ impl WirelessNetIface for Device {
         if request.ssids.len() > 20 || request.ssids.iter().any(|ssid| ssid.len() > 32) {
             return Err(WirelessError::InvalidArgs);
         }
-        let channels = if request.channels.is_empty() {
-            self.channels.clone()
-        } else {
-            let mut channels = Vec::new();
-            for channel in &request.channels {
-                let channel = u8::try_from(*channel).map_err(|_| WirelessError::InvalidArgs)?;
-                if !self.channels.contains(&channel) {
-                    return Err(WirelessError::InvalidArgs);
-                }
+        // Frequencies are authoritative; numeric-only selectors retain the
+        // legacy2.4/5GHz interpretation. Keep separate bounded native jobs.
+        let mut supported: Vec<_> = self
+            .channels
+            .iter()
+            .filter_map(|&ch| super::native_band::Channel::legacy(ch))
+            .collect();
+        supported.extend_from_slice(&self.six_channels);
+        let mut channels = Vec::new();
+        if !request.frequencies_mhz.is_empty() {
+            for &frequency in &request.frequencies_mhz {
+                let channel = supported
+                    .iter()
+                    .find(|ch| ch.frequency() == frequency)
+                    .copied()
+                    .ok_or(WirelessError::InvalidArgs)?;
                 if !channels.contains(&channel) {
                     channels.push(channel);
                 }
             }
-            channels
-        };
+        } else if request.channels.is_empty() {
+            channels = supported;
+        } else {
+            for &number in &request.channels {
+                let number = u8::try_from(number).map_err(|_| WirelessError::InvalidArgs)?;
+                let channel = super::native_band::Channel::legacy(number)
+                    .filter(|ch| supported.contains(ch))
+                    .ok_or(WirelessError::InvalidArgs)?;
+                if !channels.contains(&channel) {
+                    channels.push(channel);
+                }
+            }
+        }
+        if channels.is_empty() {
+            return Err(WirelessError::InvalidArgs);
+        }
+        let legacy: Vec<_> = channels
+            .iter()
+            .copied()
+            .filter(|ch| ch.band != super::native_band::Band::Six)
+            .collect();
+        let six: Vec<_> = channels
+            .iter()
+            .copied()
+            .filter(|ch| ch.band == super::native_band::Band::Six)
+            .collect();
         self.finish_control().await;
         if self.closing.load(Ordering::Acquire) {
             return Err(WirelessError::Busy);
@@ -1448,163 +1504,184 @@ impl WirelessNetIface for Device {
                 ..
             } = &mut *state;
             let version = hw.version(1, 0xd).ok_or(WirelessError::NotSupported)?.0;
-            let mut body = scan_api::passive(version, uid, &channels)
-                .map_err(|_| WirelessError::NotSupported)?;
-            if request.active {
-                if let Ok(domain) = self.policy.snapshot() {
-                    hw.install_rf_policy(super::mld_policy::Authority::Transaction(
-                        self.policy
-                            .transaction(&domain)
-                            .map_err(|_| WirelessError::HardwareError)?,
-                    ))
-                    .map_err(|_| WirelessError::HardwareError)?;
-                    let permissions = super::connection::regulatory_channels_in_domain(hw, &domain)
-                        .await
-                        .map_err(|_| WirelessError::HardwareError)?;
-                    let powers: Vec<_> = channels
-                        .iter()
-                        .map(|&channel| {
-                            super::connection::channel_power(
-                                &domain,
-                                channel,
-                                &permissions.channels,
-                                true,
-                            )
-                        })
-                        .collect();
-                    if let Some(power) = powers.iter().flatten().min() {
-                        hw.ensure_platform_power()
-                            .await
-                            .map_err(|_| WirelessError::HardwareError)?;
-                        let mut power_command = station_api::tx_power(
-                            hw.version(1, 0x9f).ok_or(WirelessError::NotSupported)?.0,
-                            *power,
-                        )
-                        .map_err(|_| WirelessError::NotSupported)?;
-                        power_command[0] = 1; // SET_DEVICE: scan probes are not bound to link0
-                        hw.command(1, 0x9f, &power_command)
-                            .await
-                            .map_err(|_| WirelessError::HardwareError)?;
-                    }
-                    body = scan_api::active(
-                        version,
-                        uid,
-                        &channels,
-                        &powers.iter().map(Option::is_some).collect::<Vec<_>>(),
-                        self.mac,
-                        &request.ssids,
-                    )
-                    .map_err(|_| WirelessError::InvalidArgs)?;
-                    let mut probe_phy = self.phy;
-                    probe_phy.he &= permissions.he_allowed;
-                    scan_api::with_phy_capabilities(version, &mut body, probe_phy)
-                        .map_err(|_| WirelessError::InvalidArgs)?;
-                }
-            }
-            hw.notifications
-                .retain(|p| !(p.header.group_id == 0 && matches!(p.header.cmd, 0xf | 0xc1)));
-            hw.command(1, 0xd, &body)
-                .await
-                .map_err(|_| WirelessError::HardwareError)?;
-            let deadline = narf_time::Deadline::after_ms(15_000);
             let mut result: Vec<BssInfo> = Vec::new();
-            loop {
-                let activity = hw.activity();
-                hw.poll().map_err(|_| WirelessError::HardwareError)?;
-                while let Some(packet) = hw.notifications.pop_front() {
-                    if packet.header.group_id != 0 {
-                        continue;
-                    }
-                    if packet.header.cmd == 0xf {
-                        if packet.payload.len() != 16 {
-                            return Err(WirelessError::HardwareError);
+            for channels in [legacy, six].iter().filter(|channels| !channels.is_empty()) {
+                let mut body = scan_api::passive_channels(version, uid, channels)
+                    .map_err(|_| WirelessError::NotSupported)?;
+                if channels[0].band == super::native_band::Band::Six
+                    && hw.scan_fixed_antenna_supported()
+                {
+                    body[17] = 1 << 2; // MLD, or MVM's actual capability111.
+                }
+                if request.active && channels[0].band != super::native_band::Band::Six {
+                    let channels: Vec<_> = channels.iter().map(|ch| ch.number).collect();
+                    if let Ok(domain) = self.policy.snapshot() {
+                        hw.install_rf_policy(super::mld_policy::Authority::Transaction(
+                            self.policy
+                                .transaction(&domain)
+                                .map_err(|_| WirelessError::HardwareError)?,
+                        ))
+                        .map_err(|_| WirelessError::HardwareError)?;
+                        let permissions =
+                            super::connection::regulatory_channels_in_domain(hw, &domain)
+                                .await
+                                .map_err(|_| WirelessError::HardwareError)?;
+                        let powers: Vec<_> = channels
+                            .iter()
+                            .map(|&channel| {
+                                super::connection::channel_power(
+                                    &domain,
+                                    channel,
+                                    &permissions.channels,
+                                    true,
+                                )
+                            })
+                            .collect();
+                        if let Some(power) = powers.iter().flatten().min() {
+                            hw.ensure_platform_power()
+                                .await
+                                .map_err(|_| WirelessError::HardwareError)?;
+                            let mut power_command = station_api::tx_power(
+                                hw.version(1, 0x9f).ok_or(WirelessError::NotSupported)?.0,
+                                *power,
+                            )
+                            .map_err(|_| WirelessError::NotSupported)?;
+                            power_command[0] = 1; // SET_DEVICE: scan probes are not bound to link0
+                            hw.command(1, 0x9f, &power_command)
+                                .await
+                                .map_err(|_| WirelessError::HardwareError)?;
                         }
-                        if packet.payload[..4] != uid.to_le_bytes() {
+                        body = scan_api::active(
+                            version,
+                            uid,
+                            &channels,
+                            &powers.iter().map(Option::is_some).collect::<Vec<_>>(),
+                            self.mac,
+                            &request.ssids,
+                        )
+                        .map_err(|_| WirelessError::InvalidArgs)?;
+                        let mut probe_phy = self.phy;
+                        probe_phy.he &= permissions.he_allowed;
+                        scan_api::with_phy_capabilities(version, &mut body, probe_phy)
+                            .map_err(|_| WirelessError::InvalidArgs)?;
+                    }
+                }
+                hw.notifications
+                    .retain(|p| !(p.header.group_id == 0 && matches!(p.header.cmd, 0xf | 0xc1)));
+                hw.command(1, 0xd, &body)
+                    .await
+                    .map_err(|_| WirelessError::HardwareError)?;
+                let deadline = narf_time::Deadline::after_ms(15_000);
+                'native_job: loop {
+                    let activity = hw.activity();
+                    hw.poll().map_err(|_| WirelessError::HardwareError)?;
+                    while let Some(packet) = hw.notifications.pop_front() {
+                        if packet.header.group_id != 0 {
                             continue;
                         }
-                        return if packet.payload[6] == 1 {
-                            Ok(result)
-                        } else {
-                            Err(WirelessError::HardwareError)
+                        if packet.header.cmd == 0xf {
+                            if packet.payload.len() != 16 {
+                                return Err(WirelessError::HardwareError);
+                            }
+                            if packet.payload[..4] != uid.to_le_bytes() {
+                                continue;
+                            }
+                            if packet.payload[6] != 1 {
+                                return Err(WirelessError::HardwareError);
+                            }
+                            break 'native_job;
+                        }
+                        if packet.receive_queue != 0 || packet.header.cmd != 0xc1 {
+                            continue;
+                        }
+                        let Some(mpdu) = scan_api::mpdu(&packet.payload) else {
+                            continue;
                         };
+                        let Some(channel) = super::native_band::Channel::received(
+                            mpdu.channel,
+                            mpdu.raw_band,
+                            hw.band_in_rx_supported(),
+                        )
+                        .filter(|channel| channels.contains(channel)) else {
+                            continue;
+                        };
+                        if mpdu.frame.len() < 36 || !matches!(mpdu.frame[0], 0x80 | 0x50) {
+                            continue;
+                        }
+                        let bssid = mpdu.frame[16..22].try_into().unwrap();
+                        let Some(body) = mpdu.body(24, 0) else {
+                            continue;
+                        };
+                        let Some(beacon) = super::mlme::parse_beacon_to_bss(bssid, body) else {
+                            continue;
+                        };
+                        if !request.ssids.is_empty()
+                            && !request.ssids.iter().any(Vec::is_empty)
+                            && !request.ssids.contains(&beacon.ssid)
+                        {
+                            continue;
+                        }
+                        let record = Beacon {
+                            bssid,
+                            ssid: beacon.ssid.clone(),
+                            channel: mpdu.channel,
+                            band: channel.band,
+                            interval: u16::from_le_bytes([body[8], body[9]]),
+                            dtim: super::scan_api::dtim_period(body),
+                            rsn: beacon.rsn_ie_body.clone(),
+                            privacy: body[10] & 0x10 != 0,
+                            capabilities: u16::from_le_bytes([body[10], body[11]]),
+                            information_elements: body[12..].to_vec(),
+                        };
+                        if let Some(old) = beacons.iter_mut().find(|old| {
+                            old.bssid == bssid
+                                && old.band == channel.band
+                                && old.channel == channel.number
+                        }) {
+                            *old = record;
+                        } else if beacons.len() < 256 {
+                            beacons.push(record);
+                        }
+                        let security = if beacon.rsn_ie_body.is_some() {
+                            narf_wireless::scan::BssSecurity::Wpa2
+                        } else if u16::from_le_bytes(mpdu.frame[34..36].try_into().unwrap()) & 0x10
+                            != 0
+                        {
+                            narf_wireless::scan::BssSecurity::Wep
+                        } else {
+                            narf_wireless::scan::BssSecurity::Open
+                        };
+                        let bss = BssInfo {
+                            bssid,
+                            ssid: beacon.ssid,
+                            frequency_mhz: channel.frequency(),
+                            channel: mpdu.channel as u32,
+                            rssi: mpdu.rssi,
+                            security,
+                        };
+                        if let Some(old) = result.iter_mut().find(|entry| {
+                            entry.bssid == bssid && entry.frequency_mhz == channel.frequency()
+                        }) {
+                            *old = bss;
+                        } else if result.len() < 256 {
+                            result.push(bss);
+                        }
                     }
-                    if packet.receive_queue != 0 || packet.header.cmd != 0xc1 {
-                        continue;
+                    if deadline.expired() {
+                        let mut abort = [0; 8];
+                        super::boot_context::put32(&mut abort, 0, uid);
+                        hw.command(1, 0xe, &abort)
+                            .await
+                            .map_err(|_| WirelessError::HardwareError)?;
+                        hw.wait_notification(0, 0xf, 2000)
+                            .await
+                            .map_err(|_| WirelessError::HardwareError)?;
+                        return Err(WirelessError::Timeout);
                     }
-                    let Some(mpdu) = scan_api::mpdu(&packet.payload) else {
-                        continue;
-                    };
-                    if mpdu.frame.len() < 36 || !matches!(mpdu.frame[0], 0x80 | 0x50) {
-                        continue;
-                    }
-                    let bssid = mpdu.frame[16..22].try_into().unwrap();
-                    let Some(body) = mpdu.body(24, 0) else {
-                        continue;
-                    };
-                    let Some(beacon) = super::mlme::parse_beacon_to_bss(bssid, body) else {
-                        continue;
-                    };
-                    if !request.ssids.is_empty()
-                        && !request.ssids.iter().any(Vec::is_empty)
-                        && !request.ssids.contains(&beacon.ssid)
-                    {
-                        continue;
-                    }
-                    let record = Beacon {
-                        bssid,
-                        ssid: beacon.ssid.clone(),
-                        channel: mpdu.channel,
-                        interval: u16::from_le_bytes([body[8], body[9]]),
-                        dtim: super::scan_api::dtim_period(body),
-                        rsn: beacon.rsn_ie_body.clone(),
-                        privacy: body[10] & 0x10 != 0,
-                        capabilities: u16::from_le_bytes([body[10], body[11]]),
-                        information_elements: body[12..].to_vec(),
-                    };
-                    if let Some(old) = beacons.iter_mut().find(|old| old.bssid == bssid) {
-                        *old = record;
-                    } else if beacons.len() < 256 {
-                        beacons.push(record);
-                    }
-                    let security = if beacon.rsn_ie_body.is_some() {
-                        narf_wireless::scan::BssSecurity::Wpa2
-                    } else if u16::from_le_bytes(mpdu.frame[34..36].try_into().unwrap()) & 0x10 != 0
-                    {
-                        narf_wireless::scan::BssSecurity::Wep
-                    } else {
-                        narf_wireless::scan::BssSecurity::Open
-                    };
-                    let bss = BssInfo {
-                        bssid,
-                        ssid: beacon.ssid,
-                        frequency_mhz: match mpdu.channel as u32 {
-                            14 => 2484,
-                            1..=13 => 2407 + 5 * u32::from(mpdu.channel),
-                            ch => 5000 + 5 * ch,
-                        },
-                        channel: mpdu.channel as u32,
-                        rssi: mpdu.rssi,
-                        security,
-                    };
-                    if let Some(old) = result.iter_mut().find(|entry| entry.bssid == bssid) {
-                        *old = bss;
-                    } else if result.len() < 256 {
-                        result.push(bss);
-                    }
+                    activity.await;
                 }
-                if deadline.expired() {
-                    let mut abort = [0; 8];
-                    super::boot_context::put32(&mut abort, 0, uid);
-                    hw.command(1, 0xe, &abort)
-                        .await
-                        .map_err(|_| WirelessError::HardwareError)?;
-                    hw.wait_notification(0, 0xf, 2000)
-                        .await
-                        .map_err(|_| WirelessError::HardwareError)?;
-                    return Err(WirelessError::Timeout);
-                }
-                activity.await;
             }
+            Ok(result)
         }
         .await;
         state.needs_reset = outcome.is_err();
@@ -1671,6 +1748,11 @@ impl WirelessNetIface for Device {
             b.bssid == request.bssid
                 && b.ssid == request.ssid
                 && b.channel as u32 == request.channel
+                && super::native_band::Channel::from_frequency(b.channel, request.frequency_mhz)
+                    == Some(super::native_band::Channel {
+                        band: b.band,
+                        number: b.channel,
+                    })
         }) {
             Some(beacon) => beacon.clone(),
             None => {

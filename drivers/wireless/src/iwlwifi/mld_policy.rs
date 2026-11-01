@@ -176,6 +176,8 @@ pub(super) struct Program {
     applied_dbm: Arc<AtomicI8>,
     qos: Option<super::qos::Parameters>,
     he: bool,
+    band: super::native_band::Band,
+    six: Option<(narf_wireless::reg::PowerType6Ghz, u32)>,
 }
 impl Program {
     #[allow(clippy::too_many_arguments)]
@@ -199,6 +201,36 @@ impl Program {
             applied_dbm: Arc::new(AtomicI8::new(applied_dbm)),
             qos,
             he: false,
+            band: super::native_band::Channel::legacy(primary)
+                .ok_or("Intel legacy policy channel absent")?
+                .band,
+            six: None,
+        };
+        program.check(domain)?;
+        Ok(program)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_six(
+        domain: &RegulatoryDomain,
+        firmware: super::mld_regulatory::Mcc,
+        profile: &super::six_ghz_station::Profile,
+        applied_dbm: i8,
+        qos: Option<super::qos::Parameters>,
+        validity: Validity,
+    ) -> Result<Self, &'static str> {
+        let channel = profile.channel();
+        let program = Self {
+            country: domain.country_code,
+            validity,
+            firmware: Arc::new(IrqSafeSpinLock::new(firmware)),
+            primary: channel.number,
+            width: 0,
+            center: channel.number,
+            applied_dbm: Arc::new(AtomicI8::new(applied_dbm)),
+            qos,
+            he: true,
+            band: channel.band,
+            six: Some((profile.power_type(), profile.nvm_flags)),
         };
         program.check(domain)?;
         Ok(program)
@@ -216,6 +248,27 @@ impl Program {
     pub fn ceiling(&self, domain: &RegulatoryDomain) -> Result<i8, &'static str> {
         let firmware = self.firmware.lock();
         self.check_firmware(domain, &firmware)?;
+        self.allowed_power(domain, &firmware)
+            .ok_or("Intel current policy has no station power ceiling")
+    }
+    fn allowed_power(
+        &self,
+        domain: &RegulatoryDomain,
+        firmware: &super::mld_regulatory::Mcc,
+    ) -> Option<i8> {
+        if let Some((power_type, nvm_flags)) = self.six {
+            return super::six_ghz_station::rule(
+                domain,
+                super::native_band::Channel {
+                    band: self.band,
+                    number: self.primary,
+                },
+                nvm_flags,
+                Some(firmware),
+            )
+            .filter(|rule| rule.allows_6ghz_client(power_type))
+            .map(|rule| rule.max_power_dbm);
+        }
         super::connection::channel_power_width(
             domain,
             self.primary,
@@ -223,7 +276,6 @@ impl Program {
             self.center,
             &firmware.channels,
         )
-        .ok_or("Intel current policy has no station power ceiling")
     }
     /// A planned increase is part of every copied proof before publication.
     /// Decreases become visible only after their native receipt completes.
@@ -263,17 +315,18 @@ impl Program {
             || !firmware.widths.permits(self.width)
             || self.he && !firmware.he_allowed
             || self.country != *b"00" && !self.country.iter().all(u8::is_ascii_uppercase)
-            || super::connection::channel_power_width(
+            || self
+                .allowed_power(domain, firmware)
+                .is_none_or(|ceiling| ceiling < self.power())
+            || firmware.country != *b"00" && !firmware.country.iter().all(u8::is_ascii_uppercase)
+            || firmware.limit_qos_band(
                 domain,
+                self.band,
                 self.primary,
                 self.width,
                 self.center,
-                &firmware.channels,
-            )
-            .is_none_or(|ceiling| ceiling < self.power())
-            || firmware.country != *b"00" && !firmware.country.iter().all(u8::is_ascii_uppercase)
-            || firmware.limit_qos(domain, self.primary, self.width, self.center, self.qos)
-                != self.qos
+                self.qos,
+            ) != self.qos
         {
             return Err("Intel current regulatory policy forbids the programmed station span");
         }

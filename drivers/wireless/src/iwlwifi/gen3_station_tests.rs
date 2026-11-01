@@ -21,6 +21,7 @@ pub(super) fn setup(
             tx_model: tx,
             api89: Some(case),
             bz: None,
+            six: None,
         },
     )?;
     Ok(Box::new(guard))

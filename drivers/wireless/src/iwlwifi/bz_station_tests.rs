@@ -21,6 +21,7 @@ fn setup(
             tx_model: tx,
             api89: None,
             bz: Some(case),
+            six: None,
         },
     )?))
 }

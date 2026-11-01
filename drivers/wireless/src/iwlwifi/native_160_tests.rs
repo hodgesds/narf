@@ -52,6 +52,7 @@ fn setup(native: Native, secured: bool, he: bool, fault: Fault) -> R<Box<Guard>>
             api89: matches!(native, Native::Api89).then_some(gen3_station_tests::Case::SoCdb),
             bz: matches!(native, Native::Bz)
                 .then_some(super::super::super::bz_fixture::Case::WhIntegrated),
+            six: None,
         },
     )?))
 }
@@ -314,6 +315,7 @@ fn smoke_iwl_native160_needs_raw_nvm_and_every_host_mcc_constituent() -> TestRes
             bssid: AP,
             ssid: SSID.to_vec(),
             channel: 36,
+            band: super::super::super::native_band::Band::Five,
             interval: 100,
             dtim: 1,
             rsn: None,

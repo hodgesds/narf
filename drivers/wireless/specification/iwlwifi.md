@@ -2140,10 +2140,14 @@ describe the remaining native paths.
   link/STA/TLC maps,320MHz admission and multiple live link/peer owners.
   Each needs the applicable native firmware contract and qualified radio
   program. These features do not apply to AX200/AX201 hardware.
-- **six_ghz.** The Gen3/Sc native station still identifies its band by a
-  2.4/5GHz channel number; it does not consume a band-qualified6GHz
-  JoinPlan or enforce6GHz AP power type and native regulatory/SAR admission.
-  The shared6GHz plan/API exists; AX200/AX201 has no6GHz hardware.
+- **six_ghz (open; HE20 draft pending acceptance).** §3.63 implements
+  explicit NVM/UMAC/RFH/cache/policy band identity and a shared6GHz
+  JoinPlan for AP20/STA20 SAE-H2E/PMF on admitted Sc/API89/Bz profiles,
+  including actual AP power constraints and host/NVM/MCC type limits.
+  Coordinated compilation/native/release acceptance is still pending.
+  Active/RNR and periodic6GHz, wider native spans, general response
+  refinement and in-place TPE replacement remain continuations.
+  AX200/AX201 has no6GHz hardware.
 - **gen2_sae_ext_key, gen2_wpa2_pmf.** §3.45 implements the native
   continuations: negotiated group19 SAE-EXT-KEY AKM24, and WPA2 PMF with
   AKMs2/6. Native key/IGTK/controlled-port regressions passed on both
@@ -3725,6 +3729,84 @@ postflights pass on each architecture. The original shared PHY Offer is
 heap-retained only for160MHz, avoiding large copied negotiation state
 on the ordinary kernel stack. Firmware/AP execution remains supplied by
 the native fixtures; physical qualification remains separate.
+
+### 3.63 Band-qualified native6GHz HE20 continuation (acceptance pending)
+
+The initial6GHz station owner is a separate explicit-band path on the
+admitted Sc/API89/Bz command profiles. `native_band::{Band,Channel}` keeps
+NVM indexes, UMAC channel records, RFH copies, candidate-cache entries,
+CONNECT/roam frequencies and current station publication proofs distinct
+from same-number2.4/5GHz channels. NVMv4/v5 retain the59 valid6GHz tail
+entries1+4k through233 separately from the first51 entries; v5's UNII-9
+237..253 entries remain unavailable under the current shared channel
+contract. Raw valid/VLP/AFC facts are retained independently of PCI/SKU
+inference. MLD consumes actual copied `mac_phy_band[7:6]`; MVM additionally
+requires retained TLV API59 (`BAND_IN_RX_DATA`) before any6GHz I/O. A6GHz
+copy with a legacy band cannot acquire candidate, PN, BA or reorder state.
+
+One full scan uses bounded native jobs: the legacy51-channel set and the
+6GHz59-channel set each reach their own actual terminal. Frequencies are
+authoritative; a numeric-only selector retains its legacy interpretation.
+The6GHz job stays passive, including non-PSC channels, uses native band2,
+non-PSC FORCE_PASSIVE and PSC_NO_FILTER records, and source-qualified fixed
+antenna flags. An active request can still probe its authorized legacy job
+while its6GHz job stays passive. RNR/colocated active6GHz, periodic6GHz and
+wider native6GHz remain open continuations.
+
+The initial join requires an AP20/STA20 HE span, WMM, actual NVM/HE/rate
+facts and AP_TX_POWER_CONSTRAINTS_CMD v1. It calls the existing shared
+`JoinPlan::prepare_6ghz` with HE6GHz capabilities and SAE-H2E/PMF; Open,
+WPA2, HNP-only, absent PMF/HE/band capability and HT/VHT elements or
+membership selectors are refused. The station request emits HE, HE6GHz
+Band Capabilities and Non-AP STA Regulatory Connectivity without HT/VHT
+elements. Native PHY band2, HE-only STA/LINK/TLC, MFP keys, original CCMP
+offsets, carrier, IPC and protected DHCP use the existing native owners.
+
+Every overlapping host restriction is intersected with actual NVM and
+correlated MCC valid/VLP/AFC permissions for the selected AP power type.
+Copied policy fences retain that band/type, the current MCC cell, HE
+permission and applied host ceiling. The exact28-byte native AP power
+command carries link0, LPI/SP/VLP, five EIRP and sixteen PSD half-dB limits;
+its default client category intersects local/regulatory-client TPE values,
+keeps127 as no-limit and refuses occupied PSD-128. The existing IEEE TPE
+wire parser in `ath11k::mac_frame` is reused without granting ath11k radio
+authority. Platform power and REDUCE_TX_POWER receipts remain required.
+Following Linux's active-link command ordering, AP constraints complete
+after link activation and before station/TX queue creation or SAE TX.
+Bound beacons copied during that receipt are checked before first TX.
+The installed immutable6GHz snapshot is also checked inside both native
+Hardware TX publication paths after the actual credit wait/poll. A bound
+stricter beacon beyond Device's64-notification receive budget cannot be
+skipped by ordinary or aggregate DATA, and a beacon copied during a credit
+poll cannot retain the caller's earlier power view. A rejected publication
+denies the native receive epoch and retains DMA for the existing stop path.
+SMEM aggregate sizing selects the source CDB LMAC by explicit band:
+6GHz channels1/5/9/13 use the same high-band LMAC1 as other non2.4GHz
+channels, independently of their low numeric values.
+
+This baseline confirms the exact offered HE/6GHz/TPE response and current
+beacon facts; a changed operating/power profile closes TX and requires
+reassociation through a new native power receipt. General response
+refinement and in-place TPE replacement are later continuations. The full
+`six_ghz` feature row therefore remains open.
+
+Six `drivers/wireless/iwlwifi/six_ghz` cases cover native Sc/API89/Bz
+SAE24-H2E/PMF/keys/DHCP for LPI/SP/VLP; v5 tail bounds and two terminal jobs
+with a same-BSSID2.4/6GHz alias; security and absent MVM API59 before I/O;
+TPE/PSD and current host/NVM/MCC AP-type limits; wrong RFH band/rate before
+valid same-PN/replay; and tightened AP TPE or dropped host-policy ownership
+while the real AP power receipt is held. Existing cases also check native
+ordinary/aggregate IPC DATA behind64 copied notifications and a stricter
+bound beacon, a stricter descriptor copied by the native credit poll,
+and unequal actual LMAC0/LMAC1 FIFO limits with a small valid aggregate and
+oversized-to-LMAC1 single-frame fallback. Formatting/whitespace checks are
+local; compilation, native execution and coordinated release gates remain
+pending. Earlier accepted checkpoints are unchanged by this pending scope.
+
+Primary layouts and ordering: Linux7.3-rc7
+`iwl-nvm-parse.{c,h}`, `fw/{file.h,api/{rx,scan,phy,power}.h}`,
+`mld/{scan,power,rx}.c` and `mvm/scan.c`; shared security/HE policy remains
+owned by `wireless/src/association/{six_ghz,he,sae_join}.rs`.
 
 ## 4. References
 

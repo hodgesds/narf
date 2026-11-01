@@ -57,6 +57,7 @@ impl Fixture {
             mac: [2; 6],
             irq_vector: None,
             channels: alloc::vec![1],
+            six_channels: Vec::new(),
             tx_chains: 1,
             phy: super::super::ht_vht::Local::from_nvm(0, 1, 1),
             firmware: Vec::new(),

@@ -186,6 +186,10 @@ impl Profile {
             }
             Err(_) => return Err("unsupported MLD station security offer"),
         };
+        Self::from_plan(&plan, mode)
+    }
+
+    pub(super) fn from_plan(plan: &JoinPlan, mode: SecurityMode) -> Result<Self, &'static str> {
         use narf_wireless::eapol::KeyMgmt;
         let akm = match plan.akm() {
             None if mode == SecurityMode::Open => None,

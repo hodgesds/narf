@@ -40,6 +40,9 @@ mod gen3_station_tests;
 mod native_160_tests;
 #[path = "sc_scheduled_tests.rs"]
 mod scheduled_tests;
+#[cfg(feature = "kernel-test")]
+#[path = "six_ghz_native_tests.rs"]
+mod six_ghz_tests;
 
 type R<T = ()> = Result<T, &'static str>;
 const OWN: [u8; 6] = [2, 0x71, 2, 3, 4, 5];
@@ -79,6 +82,7 @@ enum Fault {
     HoldGroupReply,
     HoldScan,
     HoldPower,
+    HoldSixPower,
     HoldIgtk,
     WrongSaeSelector,
     HoldHe,
@@ -96,6 +100,18 @@ struct PhyModel {
     rates: u8,
     mcc_he: bool,
     response_he: bool,
+}
+/// Independently authored6GHz firmware/AP facts, separate from numeric
+/// legacy PhyModel::channel and actual Hardware/Device policy fields.
+#[derive(Clone, Copy)]
+struct SixModel {
+    channel: u8,
+    regulatory: u8,
+    nvm_flags: u32,
+    mcc_flags: u32,
+    api59: bool,
+    tpe: i8,
+    alias: bool,
 }
 impl PhyModel {
     fn channel(self) -> u8 {
@@ -207,6 +223,7 @@ struct Wire {
     bz: Option<super::super::bz_fixture::Case>,
     mcc_caps_override: Option<u32>,
     mcc_permissions: Option<Vec<u32>>,
+    six: Option<SixModel>,
 }
 
 // SAFETY: no real device or thread accesses these fixture pointers. The sole
@@ -328,19 +345,30 @@ impl Wire {
                 // The authored MLD table selects iwl_nvm_get_info_rsp v4:
                 // legacy-only single-chain NVM, 14 valid channels/110 entries.
                 response.resize(28 + 110 * 4, 0);
-                let count = if self.phy.is_some() { 51u32 } else { 14 };
+                let count = if self.six.is_some() {
+                    110u32
+                } else if self.phy.is_some() {
+                    51
+                } else {
+                    14
+                };
                 let chains = self.phy.map_or(1, PhyModel::chains);
                 response[8..12].copy_from_slice(&self.phy.map_or(0u32, |_| 28).to_le_bytes());
                 response[12..16].copy_from_slice(&chains.to_le_bytes());
                 response[16..20].copy_from_slice(&chains.to_le_bytes());
                 response[24..28].copy_from_slice(&count.to_le_bytes());
                 for i in 0..count as usize {
-                    let flags = 1u32
-                        | if self.phy.is_some_and(|phy| phy.width == 3) && (14..22).contains(&i) {
+                    let flags = if i >= 51 {
+                        self.six.map_or(0, |six| six.nvm_flags)
+                    } else {
+                        1u32 | if self.phy.is_some_and(|phy| phy.width == 3)
+                            && (14..22).contains(&i)
+                        {
                             1 << 11
                         } else {
                             0
-                        };
+                        }
+                    };
                     response[28 + i * 4..32 + i * 4].copy_from_slice(&flags.to_le_bytes());
                 }
             }
@@ -349,7 +377,13 @@ impl Wire {
                     body.len() == 28 && half(body, 0) == u16::from_be_bytes(*b"US") && body[2] == 2,
                     "Sc MCC source/country",
                 )?;
-                let count = if self.phy.is_some() { 51u32 } else { 14 };
+                let count = if self.six.is_some() {
+                    110u32
+                } else if self.phy.is_some() {
+                    51
+                } else {
+                    14
+                };
                 let first = if self.api89.is_some() { 20 } else { 24 };
                 response.resize(first + count as usize * 4, 0);
                 response[4..6].copy_from_slice(&body[..2]);
@@ -392,10 +426,16 @@ impl Wire {
                     13
                 };
                 for i in 0..count as usize {
-                    let permission = self
-                        .mcc_permissions
-                        .as_ref()
-                        .map_or(permission, |flags| flags[i]);
+                    let permission = self.mcc_permissions.as_ref().map_or_else(
+                        || {
+                            if i >= 51 {
+                                self.six.map_or(permission, |six| six.mcc_flags)
+                            } else {
+                                permission
+                            }
+                        },
+                        |flags| flags[i],
+                    );
                     response[first + i * 4..first + 4 + i * 4]
                         .copy_from_slice(&permission.to_le_bytes());
                 }
@@ -599,10 +639,25 @@ impl Wire {
                 }
             }
             (1, 8) => require(
-                body.len() == 32
-                    && word(body, 8) == u32::from(self.phy.map_or(6, PhyModel::channel)),
+                body.len() == 32 && word(body, 8) == u32::from(self.channel()),
                 "Sc PHY channel",
             )?,
+            (4, 0xc) if self.six.is_some() => {
+                let six = self.six.unwrap();
+                require(
+                    body.len() == 28
+                        && half(body, 0) == 0
+                        && half(body, 2) == u16::from(six.regulatory)
+                        && body[4] == six.tpe as u8
+                        && body[5..25].iter().all(|&b| b == 127)
+                        && body[25..] == [0; 3],
+                    "6GHz actual AP_TX_POWER_CONSTRAINTS wire",
+                )?;
+                if self.fault == Fault::HoldSixPower {
+                    self.held = Some((cmd, group, sequence));
+                    return Ok(());
+                }
+            }
             (1, 0x9f) => {
                 require(
                     body.len() == if self.api89.is_some() { 120 } else { 108 }
@@ -651,13 +706,36 @@ impl Wire {
                     return Ok(());
                 }
             }
-            (1, 0xd) => require(
-                body.len() == if self.api89.is_some() { 1940 } else { 1948 }
-                    && (half(body, 8) == 0x802 || self.phy.is_some() && half(body, 8) == 2)
-                    && body[45] == 1
-                    && body[52] == self.phy.map_or(6, PhyModel::channel),
-                "Sc passive scan ABI",
-            )?,
+            (1, 0xd) => {
+                require(
+                    body.len() == if self.api89.is_some() { 1940 } else { 1948 }
+                        && (half(body, 8) == 0x802 || self.phy.is_some() && half(body, 8) == 2),
+                    "Sc passive scan ABI",
+                )?;
+                if self.six.is_some() {
+                    let count = usize::from(body[45]);
+                    require(
+                        count > 0 && count <= if self.api89.is_some() { 67 } else { 68 },
+                        "6GHz bounded native scan count",
+                    )?;
+                    for record in body[48..48 + count * 8].chunks_exact(8) {
+                        let band = if version < 17 {
+                            record[5]
+                        } else {
+                            (word(record, 0) >> 30) as u8
+                        };
+                        require(
+                            band <= 2 && (band != 2 || record[4] % 4 == 1 && record[4] <= 233),
+                            "6GHz actual UMAC band/channel",
+                        )?;
+                    }
+                } else {
+                    require(
+                        body[45] == 1 && body[52] == self.channel(),
+                        "Sc scan channel",
+                    )?;
+                }
+            }
             (1, 0x98) => require(
                 body == self.phy.map_or(1, PhyModel::chains).to_le_bytes(),
                 "Sc NVM chain identity",
@@ -733,7 +811,22 @@ impl Wire {
                 return Ok(());
             }
             let mut beacon = self.ap.beacon();
-            if let Some(phy) = self.phy {
+            let mut six_job = true;
+            if let Some(six) = self.six {
+                six_job = body[48..48 + usize::from(body[45]) * 8]
+                    .chunks_exact(8)
+                    .any(|record| {
+                        let band = if version < 17 {
+                            record[5]
+                        } else {
+                            (word(record, 0) >> 30) as u8
+                        };
+                        band == 2 && record[4] == six.channel
+                    });
+                if six_job {
+                    six_ghz_tests::complete_ap_frame(&mut beacon, six)?;
+                }
+            } else if let Some(phy) = self.phy {
                 beacon.extend_from_slice(&he_tests::elements(phy, true));
             }
             if self.sae_h2e_only {
@@ -741,7 +834,11 @@ impl Wire {
                 // SAE Commit must independently confirm H2E.
                 beacon.extend_from_slice(&[50, 1, 0xfb]);
             }
-            self.mpdu(&beacon, false);
+            if self.six.is_none() || six_job {
+                self.mpdu(&beacon, false);
+            } else if self.six.is_some_and(|six| six.alias) {
+                self.mpdu_at(&beacon, false, 1, self.six.unwrap().channel);
+            }
             let mut done = [0; 16];
             done[..4].copy_from_slice(&body[..4]);
             done[6] = 1;
@@ -999,11 +1096,12 @@ impl Wire {
                     }
                 }
                 for mut response in responses {
-                    if let Some(phy) = self
-                        .phy
-                        .filter(|_| response[0] == 0x10 || response[0] == 0x30)
-                    {
-                        response.extend_from_slice(&he_tests::elements(phy, phy.response_he));
+                    if matches!(response[0], 0x10 | 0x30) {
+                        if let Some(six) = self.six {
+                            six_ghz_tests::complete_ap_frame(&mut response, six)?;
+                        } else if let Some(phy) = self.phy {
+                            response.extend_from_slice(&he_tests::elements(phy, phy.response_he));
+                        }
                     }
                     if self.fault == Fault::WrongSaeSelector
                         && response[0] == 0xb0
@@ -1057,11 +1155,27 @@ impl Wire {
         Ok(())
     }
 
+    fn channel(&self) -> u8 {
+        self.six
+            .map_or_else(|| self.phy.map_or(6, PhyModel::channel), |six| six.channel)
+    }
     fn mpdu(&mut self, frame: &[u8], protected: bool) {
+        self.mpdu_at(
+            frame,
+            protected,
+            if self.six.is_some() { 2 } else { 0 },
+            self.channel(),
+        );
+    }
+    fn mpdu_at(&mut self, frame: &[u8], protected: bool, band: u8, channel: u8) {
         if self.replies.len() < 64 {
             self.replies.push(frame[0]);
         }
         let mut payload = vec![0; 64];
+        payload[7] = band << 6;
+        if self.six.is_some() {
+            payload[36..40].copy_from_slice(&0x100u32.to_le_bytes());
+        }
         payload[..2].copy_from_slice(&(frame.len() as u16).to_le_bytes());
         payload[12..16].copy_from_slice(&(if protected { 0x243u32 } else { 3 }).to_le_bytes());
         // Firmware follows the station's actual programmed TLC, not the
@@ -1125,7 +1239,7 @@ impl Wire {
         }
         payload[40] = 50;
         payload[41] = 60;
-        payload[42] = self.phy.map_or(6, PhyModel::channel);
+        payload[42] = channel;
         payload.extend_from_slice(frame);
         self.firmware.inject(0xc1, 0, 0x8000, &payload);
     }
@@ -1208,6 +1322,7 @@ struct NativeModel {
     tx_model: Option<TxModel>,
     api89: Option<gen3_station_tests::Case>,
     bz: Option<super::super::bz_fixture::Case>,
+    six: Option<SixModel>,
 }
 struct Guard {
     device: Option<Arc<Device>>,
@@ -1269,6 +1384,7 @@ impl Guard {
                 tx_model,
                 api89: None,
                 bz: None,
+                six: None,
             },
         )
     }
@@ -1286,6 +1402,7 @@ impl Guard {
             tx_model,
             api89,
             bz,
+            six,
         } = model;
         let multi_receive = receive_model.enabled();
         require(
@@ -1306,6 +1423,9 @@ impl Guard {
                 he_tests::versions(&mut versions);
             }
             receive_model.commands(&mut versions);
+        }
+        if six.is_some() {
+            versions.extend_from_slice(&[0xc, 4, 1, 0]);
         }
         if api89.is_none() && bz.is_none() {
             if let Some(tx) = &tx_model {
@@ -1333,6 +1453,34 @@ impl Guard {
             tx_amsdu_tests::image(&versions, tx_model.as_ref())?
         };
         receive_model.capability(&mut authored);
+        if six.is_some() {
+            if six.is_some_and(|six| !six.api59) {
+                // A factual API89 fixture may already carry API59. Remove
+                // that source bit, not merely omit an OR-only extra TLV.
+                let mut offset = 88;
+                while offset < authored.len() {
+                    let tag = word(&authored, offset);
+                    let length = word(&authored, offset + 4) as usize;
+                    if tag == 29 && length == 8 && word(&authored, offset + 8) == 1 {
+                        let bits = word(&authored, offset + 12) & !(1 << 27);
+                        authored[offset + 12..offset + 16].copy_from_slice(&bits.to_le_bytes());
+                    }
+                    offset += 8 + length.next_multiple_of(4);
+                }
+            }
+            // Actual API59 in TLV29, not a direct Hardware field override.
+            if six.is_some_and(|six| six.api59) {
+                authored.extend_from_slice(&29u32.to_le_bytes());
+                authored.extend_from_slice(&8u32.to_le_bytes());
+                authored.extend_from_slice(&1u32.to_le_bytes());
+                authored.extend_from_slice(&(1u32 << 27).to_le_bytes());
+            }
+            // Retain the complete authored command table. TLV48 replaces
+            // rather than appends to an earlier executable command table.
+            authored.extend_from_slice(&48u32.to_le_bytes());
+            authored.extend_from_slice(&(versions.len() as u32).to_le_bytes());
+            authored.extend_from_slice(&versions);
+        }
         let parsed = super::super::parse_ucode(&authored)
             .map_err(|_| "Sc fixture firmware metadata parse")?;
         model::firmware_profile(&mut hardware, &parsed)?;
@@ -1350,7 +1498,7 @@ impl Guard {
             hardware.bind_sources(firmware, Some(pnvm))?;
         }
         Device::validate_station_profile(&hardware)?;
-        let channel = phy.map_or(6, PhyModel::channel);
+        let channel = six.map_or_else(|| phy.map_or(6, PhyModel::channel), |six| six.channel);
         let ap = if secured {
             FakeAp::wpa2(NETWORK, SSID, channel, 7, PMK, ANONCE)
         } else {
@@ -1403,6 +1551,7 @@ impl Guard {
             bz,
             mcc_caps_override: None,
             mcc_permissions: None,
+            six,
         });
         let configured = run(Device::configure(&mut hardware, OWN), || wire.service());
         let nvm = match configured {
@@ -1439,7 +1588,9 @@ impl Guard {
         });
         let source = state.hardware.source_fence()?;
         let policy_db = Arc::new(narf_wireless::reg::db::Database::new());
-        policy_db.install(if phy.is_some_and(|phy| phy.width == 3) {
+        policy_db.install(if six.is_some() {
+            six_ghz_tests::policy()
+        } else if phy.is_some_and(|phy| phy.width == 3) {
             native_160_tests::policy()
         } else if phy.is_some() {
             he_tests::policy()
@@ -1465,6 +1616,7 @@ impl Guard {
             mac: OWN,
             irq_vector: None,
             channels: nvm.channels,
+            six_channels: nvm.six_channels,
             tx_chains: nvm.tx_chains,
             phy: nvm.phy,
             firmware: Vec::new(),

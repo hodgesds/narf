@@ -19,6 +19,9 @@ pub struct Nvm {
     pub tx_chains: u32,
     pub rx_chains: u32,
     pub channels: Vec<u8>,
+    /// Valid, explicitly band-qualified NVM tail channels, never numeric
+    /// aliases of the first51 legacy entries.
+    pub(super) six_channels: Vec<super::native_band::Channel>,
     pub phy: super::ht_vht::Local,
     /// Actual NVM_MAC_SKU_FLAGS_802_11AX_ENABLED, not a PCI inference.
     pub he: bool,
@@ -26,8 +29,8 @@ pub struct Nvm {
 
 impl Nvm {
     /// Versions 4/5 share the header and the first 51 channel profiles.
-    /// This interface currently selects 2.4/5 GHz by channel number;
-    /// 6 GHz needs a band-qualified request to avoid channel aliasing.
+    /// Keep the6GHz tail separately and select it only with an explicit
+    /// frequency/band-qualified request.
     pub fn parse(version: u8, bytes: &[u8]) -> Result<Self, &'static str> {
         let capacity = match version {
             4 => 110,
@@ -61,6 +64,16 @@ impl Nvm {
             tx_chains,
             rx_chains,
             channels,
+            six_channels: flags
+                .iter()
+                .enumerate()
+                .skip(51)
+                .filter_map(|(index, flags)| {
+                    (*flags & 1 != 0)
+                        .then(|| super::native_band::Channel::six(1 + 4 * (index - 51) as u8))
+                        .flatten()
+                })
+                .collect(),
             phy: super::ht_vht::Local::from_nvm(
                 u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
                 tx_chains,
@@ -93,6 +106,11 @@ pub fn phy(action: u32, channel: u8) -> [u8; 32] {
     out[28] = 4; // unused secondary control channel, opposite primary
     out
 }
+pub(super) fn phy_channel(action: u32, channel: super::native_band::Channel) -> [u8; 32] {
+    let mut body = phy(action, channel.number);
+    body[12] = channel.band as u8;
+    body
+}
 
 pub fn link(
     action: u32,
@@ -122,6 +140,27 @@ pub fn link(
     put32(&mut out, 136, beacon_interval as u32);
     put32(&mut out, 140, beacon_interval as u32 * dtim.max(1) as u32);
     out
+}
+pub(super) fn link_channel(
+    action: u32,
+    address: [u8; 6],
+    active: bool,
+    channel: super::native_band::Channel,
+    beacon_interval: u16,
+    dtim: u8,
+) -> [u8; 208] {
+    let mut body = link(
+        action,
+        address,
+        active,
+        channel.number,
+        beacon_interval,
+        dtim,
+    );
+    if channel.band == super::native_band::Band::Six {
+        put32(&mut body, 36, 0);
+    }
+    body
 }
 
 pub fn peer(address: [u8; 6]) -> [u8; 104] {

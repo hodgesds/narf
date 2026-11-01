@@ -453,7 +453,8 @@ impl Owner {
 fn observed_beacon(payload: &[u8], channels: &[u8], local: [u8; 6]) -> Option<(Beacon, i8)> {
     let mpdu = scan_api::mpdu_gen2(payload)?;
     let frame = mpdu.frame;
-    if frame.len() < 36
+    if mpdu.raw_band >= 2
+        || frame.len() < 36
         || !matches!(frame[0], 0x80 | 0x50)
         || frame[1] & 0xc7 != 0
         || frame[22] & 15 != 0
@@ -537,6 +538,7 @@ fn observed_beacon(payload: &[u8], channels: &[u8], local: [u8; 6]) -> Option<(B
             bssid,
             ssid: ssid?,
             channel: mpdu.channel,
+            band: super::super::native_band::Channel::legacy(mpdu.channel)?.band,
             interval,
             dtim: scan_api::dtim_period(body),
             rsn,

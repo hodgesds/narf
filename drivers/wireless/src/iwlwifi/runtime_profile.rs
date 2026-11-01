@@ -49,6 +49,32 @@ impl Hardware {
     pub(in crate::iwlwifi) fn uses_mld_station_protocol(&self) -> bool {
         self.mld_station
     }
+    /// MLD directly consumes mac_phy_band; MVM requires the actual
+    /// IWL_UCODE_TLV_API_BAND_IN_RX_DATA (59), not a command-version guess.
+    pub(in crate::iwlwifi) fn band_in_rx_supported(&self) -> bool {
+        self.mld_station || self.band_in_rx
+    }
+    pub(in crate::iwlwifi) fn scan_fixed_antenna_supported(&self) -> bool {
+        self.mld_station || self.scan_fixed_antenna
+    }
+    pub(in crate::iwlwifi) fn install_six_tx_profile(
+        &mut self,
+        profile: alloc::sync::Arc<super::super::six_ghz_station::Profile>,
+    ) -> Result<(), &'static str> {
+        profile.check_pending(self)?;
+        self.six_tx_profile = Some(profile);
+        Ok(())
+    }
+    pub(in crate::iwlwifi) fn check_six_tx_publication(&mut self) -> Result<(), &'static str> {
+        let result = self
+            .six_tx_profile
+            .as_ref()
+            .map_or(Ok(()), |profile| profile.check_pending(self));
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
     pub(in crate::iwlwifi) async fn station_peer(
         &mut self,
         peer: &[u8; 104],
@@ -72,11 +98,12 @@ impl Hardware {
     pub(in crate::iwlwifi) async fn station_phy(
         &mut self,
         canonical: &[u8; 32],
-        channel: u8,
+        _channel: u8,
     ) -> Result<(), &'static str> {
         let mut body = *canonical;
         if let Some((profile, _)) = self.api89 {
-            boot_context::put32(&mut body, 16, u32::from(profile.cdb && channel > 14));
+            let high_band = body[12] != 1;
+            boot_context::put32(&mut body, 16, u32::from(profile.cdb && high_band));
             body[20..24].fill(0); // PHYv4 reserves the old RX-chain field.
         }
         self.command(1, 8, &body).await?;

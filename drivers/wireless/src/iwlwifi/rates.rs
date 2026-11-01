@@ -9,6 +9,11 @@ pub struct Rates {
     pub basic: u16,
 }
 impl Rates {
+    pub(super) fn parse_six(ies: &[u8], sae_h2e: bool) -> Result<Self, &'static str> {
+        // OFDM-only independently of the aliased numeric channel. HT/VHT
+        // membership selectors remain forbidden on the HE-only6GHz path.
+        Self::parse_for_profiles(ies, 36, 0, sae_h2e, true)
+    }
     pub fn parse(ies: &[u8], channel: u8) -> Result<Self, &'static str> {
         Self::parse_for_phy(ies, channel, 0)
     }

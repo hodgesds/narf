@@ -89,16 +89,28 @@ pub(super) fn matches_native(
 /// Bounded source-profile HE capability, only for callers that separately
 /// proved the current NVM HE SKU, MCC bit13 and native firmware contract.
 pub(super) fn local(phy: super::ht_vht::Local, primary: u8) -> Result<LocalHe, &'static str> {
+    local_inner(phy, primary, false)
+}
+pub(super) fn local_six(phy: super::ht_vht::Local) -> Result<LocalHe, &'static str> {
+    local_inner(phy, 1, true)
+}
+fn local_inner(phy: super::ht_vht::Local, primary: u8, six: bool) -> Result<LocalHe, &'static str> {
     if !phy.ht
         || primary == 14
         || !(1..=2).contains(&phy.rx_streams)
         || !(1..=2).contains(&phy.tx_streams)
-        || primary > 14 && !phy.vht
+        || !six && primary > 14 && !phy.vht
     {
         return Err("MLD local HE PHY prerequisites absent");
     }
     let mut capability = [0; 11];
-    capability[0] = if primary <= 14 { 2 } else { 4 };
+    capability[0] = if six {
+        0
+    } else if primary <= 14 {
+        2
+    } else {
+        4
+    };
     capability[1] = 0x30;
     capability[2] = 2 | 8;
     capability[7] = 4;
@@ -112,7 +124,7 @@ pub(super) fn local(phy: super::ht_vht::Local, primary: u8) -> Result<LocalHe, &
         map(phy.tx_streams),
     )
     .map_err(|_| "MLD local HE source profile invalid")?;
-    if primary > 14 && phy.supports160() {
+    if !six && primary > 14 && phy.supports160() {
         local
             .with_160mhz(map(phy.rx_streams), map(phy.tx_streams))
             .map_err(|_| "MLD local HE160 source profile invalid")

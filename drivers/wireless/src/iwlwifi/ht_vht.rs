@@ -19,6 +19,8 @@ pub struct Local {
     /// Actual complete native rate-consumer namespace, selected after NVM
     /// parsing from the retained firmware metadata (zero means not proved).
     pub(super) native_rates: u8,
+    /// Raw valid/VLP/AFC6GHz NVM tail bitmaps, in channel1+4k order.
+    pub(super) six_channels: [u64; 3],
 }
 
 impl Local {
@@ -32,10 +34,12 @@ impl Local {
             rx_streams: rx.count_ones().min(limit) as u8,
             width160_channels: 0,
             native_rates: 0,
+            six_channels: [0; 3],
         }
     }
 
     pub(super) fn with_nvm_channels(mut self, flags: &[u32]) -> Self {
+        self.six_channels = [0; 3];
         self.width160_channels = flags
             .iter()
             .take(51)
@@ -47,6 +51,13 @@ impl Local {
                     0
                 }
             });
+        for (index, &flags) in flags.iter().skip(51).take(59).enumerate() {
+            if flags & 1 != 0 {
+                self.six_channels[0] |= 1 << index;
+                self.six_channels[1] |= u64::from(flags & (1 << 13) != 0) << index;
+                self.six_channels[2] |= u64::from(flags & (1 << 14) != 0) << index;
+            }
+        }
         self
     }
 
@@ -118,7 +129,7 @@ fn mcs_map(streams: u8) -> u16 {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Negotiated {
-    /// TLC mode: legacy=0, HT=1, VHT=2.
+    /// Native mode: legacy=0, HT=1, VHT=2, HE-only6GHz=3.
     pub mode: u8,
     /// TLC/PHY bandwidth: 20=0, 40=1, 80=2, contiguous160=3.
     pub width: u8,
@@ -197,6 +208,19 @@ fn element(ies: &[u8], id: u8, size: usize) -> Result<Option<&[u8]>, &'static st
 }
 
 impl Negotiated {
+    pub(super) fn he_six(
+        channel: u8,
+        capability: narf_wireless::association::six_ghz::He6GhzCapability,
+    ) -> Self {
+        Self {
+            mode: 3,
+            center: channel,
+            density: capability.min_mpdu_start(),
+            ampdu_exp: capability.max_ampdu_len_exp(),
+            dynamic_smps: capability.sm_ps() == 1,
+            ..Self::default()
+        }
+    }
     /// Association responses can omit operation IEs already received in
     /// beacons. Capabilities must be confirmed by the response itself.
     pub fn confirm(
@@ -412,7 +436,7 @@ impl Negotiated {
 
     pub fn association_ies(&self, local: Local, channel: u8) -> Vec<u8> {
         let mut ies = Vec::new();
-        if self.mode == 0 {
+        if self.mode == 0 || self.mode == 3 {
             return ies;
         }
         let mut caps = local

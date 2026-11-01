@@ -33,10 +33,10 @@ impl State {
     }
 }
 impl Hardware {
-    /// Linux mld/mld.h: only actual CDB support redirects a 5GHz link to
+    /// Linux mld/mld.h: actual CDB support redirects every non2.4GHz link to
     /// LMAC1. An absent FIFO/LMAC in the real response cannot be invented.
-    pub(in crate::iwlwifi) fn station_lmac(&self, channel: u8) -> u8 {
-        u8::from(self.shared_memory.cdb && channel > 14)
+    pub(in crate::iwlwifi) fn station_lmac(&self, band: super::super::native_band::Band) -> u8 {
+        u8::from(self.shared_memory.cdb && band != super::super::native_band::Band::Two)
     }
     pub(in crate::iwlwifi) async fn station_shared_memory(
         &mut self,

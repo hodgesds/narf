@@ -235,7 +235,8 @@ pub(super) fn copied_bss(
     } else {
         scan_api::mpdu(&packet.payload)?
     };
-    if !channels.contains(&mpdu.channel)
+    if mpdu.raw_band >= 2
+        || !channels.contains(&mpdu.channel)
         || mpdu.frame.len() < 36
         || !matches!(mpdu.frame[0], 0x80 | 0x50)
     {
@@ -257,6 +258,7 @@ pub(super) fn copied_bss(
         bssid,
         ssid: parsed.ssid.clone(),
         channel: mpdu.channel,
+        band: super::native_band::Channel::legacy(mpdu.channel)?.band,
         interval: u16::from_le_bytes(body[8..10].try_into().ok()?),
         dtim: scan_api::dtim_period(body),
         rsn: parsed.rsn_ie_body.clone(),

@@ -14,6 +14,7 @@ pub struct Beacon {
     pub bssid: [u8; 6],
     pub ssid: Vec<u8>,
     pub channel: u8,
+    pub(super) band: super::native_band::Band,
     pub interval: u16,
     pub dtim: u8,
     pub rsn: Option<Vec<u8>>,
@@ -71,6 +72,7 @@ pub struct Connection {
     management_pn: u64,
     key_history: super::sc_security::KeyHistory,
     he: Option<super::sc_he::Profile>,
+    six: Option<alloc::sync::Arc<super::six_ghz_station::Profile>>,
     tx_amsdu: super::sc_tx_amsdu::Limits,
     amsdu_memory: Option<super::Gen2SharedMemory>,
     amsdu_memory_attempted: bool,
@@ -124,6 +126,13 @@ impl core::fmt::Debug for AuthMethod {
 }
 
 impl Connection {
+    fn admits_channel(&self, mpdu: &scan_api::Mpdu<'_>) -> bool {
+        super::native_band::Channel::received(mpdu.channel, mpdu.raw_band, true)
+            == Some(super::native_band::Channel {
+                band: self.beacon.band,
+                number: self.beacon.channel,
+            })
+    }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn open_model() -> Self {
         Self {
@@ -131,6 +140,7 @@ impl Connection {
                 bssid: [4; 6],
                 ssid: Vec::new(),
                 channel: 1,
+                band: super::native_band::Band::Two,
                 interval: 100,
                 dtim: 1,
                 rsn: None,
@@ -167,6 +177,7 @@ impl Connection {
             management_pn: 0,
             key_history: super::sc_security::KeyHistory::default(),
             he: None,
+            six: None,
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
             amsdu_memory: None,
             amsdu_memory_attempted: false,
@@ -270,12 +281,33 @@ impl Connection {
         roam_from: Option<[u8; 6]>,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<Self, &'static str> {
+        //6GHz admission precedes even receive-queue I/O. MVM API59 and
+        // AP-power API1 are source facts, never inferred from the channel.
+        let six_preflight = if beacon.band == super::native_band::Band::Six {
+            if !hw.band_in_rx_supported()
+                || !super::sc_he::native_supported(hw)
+                || hw.version(4, 0xc).map(|v| v.0) != Some(1)
+            {
+                return Err("6GHz native RX/HE/AP-power command contract absent");
+            }
+            Some(super::six_ghz_station::prepare(
+                &beacon, local, &auth, local_phy, domain, None,
+            )?)
+        } else {
+            None
+        };
         // Reserve before any native await. Neither old notifications nor
         // descriptors copied while this port is closed belong to the new key.
         let receive_epoch = hw.close_receive_epoch()?;
         hw.prepare_receive_queues().await?;
         let secure = !matches!(auth, AuthMethod::Open);
-        let mut profile = super::sc_security::Profile::negotiate(&beacon, local, &auth, local_phy)?;
+        let (mut profile, mut six) = match six_preflight {
+            Some((profile, six)) => (profile, Some(six)),
+            None => (
+                super::sc_security::Profile::negotiate(&beacon, local, &auth, local_phy)?,
+                None,
+            ),
+        };
         let akm = profile.akm;
         if secure && hw.version(5, 0x18).map(|v| v.0) != Some(1) {
             return Err("unsupported MLD security key command");
@@ -288,47 +320,76 @@ impl Connection {
             None
         };
         let qos = super::qos::Parameters::parse(&beacon.information_elements)?;
+        if six.is_some() && qos.is_none() {
+            return Err("6GHz native HE requires WMM");
+        }
         let permissions = regulatory_channels_in_domain(hw, domain).await?;
+        if six.is_some() {
+            let admitted = super::six_ghz_station::prepare(
+                &beacon,
+                local,
+                &auth,
+                local_phy,
+                domain,
+                Some(&permissions),
+            )?;
+            profile = admitted.0;
+            six = Some(admitted.1);
+        }
         let original_local = local_phy;
         // Rebuild the shared offer with the native owner's current width
         // limit. A forbidden160 span retains a genuine HE/VHT80 fallback;
         // an unbounded shared160 offer cannot relabel that narrower program.
-        if !permissions.widths.permits(3)
-            || ![50, 114, 163].into_iter().any(|center| {
-                local_phy.permits160(center)
-                    && channel_power_width(domain, beacon.channel, 3, center, &permissions.channels)
+        if six.is_none()
+            && (!permissions.widths.permits(3)
+                || ![50, 114, 163].into_iter().any(|center| {
+                    local_phy.permits160(center)
+                        && channel_power_width(
+                            domain,
+                            beacon.channel,
+                            3,
+                            center,
+                            &permissions.channels,
+                        )
                         .is_some()
-            })
+                }))
         {
             local_phy.width160_channels = 0;
         }
-        if local_phy.he && (!permissions.he_allowed || !super::sc_he::native_supported(hw)) {
+        if six.is_none()
+            && local_phy.he
+            && (!permissions.he_allowed || !super::sc_he::native_supported(hw))
+        {
             local_phy.he = false;
         }
         if local_phy != original_local {
             profile = super::sc_security::Profile::negotiate(&beacon, local, &auth, local_phy)?;
         }
-        let phy = super::ht_vht::Negotiated::parse_with_offer(
-            local_phy,
-            &beacon.information_elements,
-            beacon.channel,
-            qos.is_some(),
-            |width, center| {
-                permissions.widths.permits(width)
-                    && channel_power_width(
-                        domain,
-                        beacon.channel,
-                        width,
-                        center,
-                        &permissions.channels,
-                    )
-                    .is_some()
-            },
-            profile
-                .offer
-                .as_ref()
-                .map(|offer| (offer, profile.sae.as_ref().is_some_and(|join| join.h2e()))),
-        )?;
+        let phy = if let Some(six) = &six {
+            super::ht_vht::Negotiated::he_six(beacon.channel, six.plan.peer_capability())
+        } else {
+            super::ht_vht::Negotiated::parse_with_offer(
+                local_phy,
+                &beacon.information_elements,
+                beacon.channel,
+                qos.is_some(),
+                |width, center| {
+                    permissions.widths.permits(width)
+                        && channel_power_width(
+                            domain,
+                            beacon.channel,
+                            width,
+                            center,
+                            &permissions.channels,
+                        )
+                        .is_some()
+                },
+                profile
+                    .offer
+                    .as_ref()
+                    .map(|offer| (offer, profile.sae.as_ref().is_some_and(|join| join.h2e()))),
+            )?
+        };
         let he_offer = profile
             .offer
             .filter(|offer| qos.is_some() && super::sc_he::matches_native(offer, &phy));
@@ -336,50 +397,96 @@ impl Connection {
             local_phy.he = false;
             profile = super::sc_security::Profile::negotiate(&beacon, local, &auth, local_phy)?;
         }
-        let rates = super::rates::Rates::parse_for_profiles(
-            &beacon.information_elements,
-            beacon.channel,
-            phy.mode,
-            profile.sae.as_ref().is_some_and(|join| join.h2e()),
-            he_offer.is_some(),
-        )?;
-        let max_power = channel_power_width(
-            domain,
-            beacon.channel,
-            phy.width,
-            phy.center,
-            &permissions.channels,
-        )
-        .ok_or("channel transmission prohibited by host/firmware regulatory policy")?;
-        let ap_power = super::mld_power::ap_limit_in_ies(
-            &beacon.information_elements,
-            beacon.capabilities,
-            beacon.channel,
-        )?;
+        let rates = if six.is_some() {
+            super::rates::Rates::parse_six(&beacon.information_elements, true)?
+        } else {
+            super::rates::Rates::parse_for_profiles(
+                &beacon.information_elements,
+                beacon.channel,
+                phy.mode,
+                profile.sae.as_ref().is_some_and(|join| join.h2e()),
+                he_offer.is_some(),
+            )?
+        };
+        let max_power = if let Some(six) = &six {
+            super::six_ghz_station::rule(domain, six.channel(), six.nvm_flags, Some(&permissions))
+                .filter(|rule| rule.allows_6ghz_client(six.power_type()))
+                .map(|rule| rule.max_power_dbm)
+                .ok_or("6GHz current host/NVM/MCC power prohibited")?
+        } else {
+            channel_power_width(
+                domain,
+                beacon.channel,
+                phy.width,
+                phy.center,
+                &permissions.channels,
+            )
+            .ok_or("channel transmission prohibited by host/firmware regulatory policy")?
+        };
+        let ap_power = if six.is_some() {
+            None
+        } else {
+            super::mld_power::ap_limit_in_ies(
+                &beacon.information_elements,
+                beacon.capabilities,
+                beacon.channel,
+            )?
+        };
         let max_power = ap_power.map_or(max_power, |limit| i16::from(max_power).min(limit) as i8);
-        let qos = permissions.limit_qos(domain, beacon.channel, phy.width, phy.center, qos);
-        let regulatory = super::mld_policy::Program::new(
-            domain,
-            permissions.clone(),
-            beacon.channel,
-            phy.width,
-            phy.center,
-            max_power,
-            qos,
-            hw.rf_policy_validity()?,
-        )?;
+        let qos = if six.is_some() {
+            permissions.limit_qos_band(
+                domain,
+                beacon.band,
+                beacon.channel,
+                phy.width,
+                phy.center,
+                qos,
+            )
+        } else {
+            permissions.limit_qos(domain, beacon.channel, phy.width, phy.center, qos)
+        };
+        let regulatory = if let Some(six) = &six {
+            super::mld_policy::Program::new_six(
+                domain,
+                permissions.clone(),
+                six,
+                max_power,
+                qos,
+                hw.rf_policy_validity()?,
+            )?
+        } else {
+            super::mld_policy::Program::new(
+                domain,
+                permissions.clone(),
+                beacon.channel,
+                phy.width,
+                phy.center,
+                max_power,
+                qos,
+                hw.rf_policy_validity()?,
+            )?
+        };
         hw.ensure_platform_power().await?;
-        let mut phy_command = station_api::phy(1, beacon.channel);
+        let mut phy_command = station_api::phy_channel(
+            1,
+            super::native_band::Channel {
+                band: beacon.band,
+                number: beacon.channel,
+            },
+        );
         phy.apply_phy(&mut phy_command, beacon.channel);
         hw.station_phy(&phy_command, beacon.channel).await?;
         // PHY binding is accepted only while the link stays inactive.
         // Combining the bind with activation causes firmware to ignore
         // phy_id, leaving the link detached from its channel context.
-        let mut binding = station_api::link(
+        let mut binding = station_api::link_channel(
             2,
             local,
             false,
-            beacon.channel,
+            super::native_band::Channel {
+                band: beacon.band,
+                number: beacon.channel,
+            },
             beacon.interval,
             beacon.dtim,
         );
@@ -391,8 +498,17 @@ impl Connection {
             max_power,
         )?;
         hw.command(1, 0x9f, &power).await?;
-        let mut link =
-            station_api::link(2, local, true, beacon.channel, beacon.interval, beacon.dtim);
+        let mut link = station_api::link_channel(
+            2,
+            local,
+            true,
+            super::native_band::Channel {
+                band: beacon.band,
+                number: beacon.channel,
+            },
+            beacon.interval,
+            beacon.dtim,
+        );
         rates.apply(&mut link);
         put32(
             &mut link,
@@ -409,6 +525,17 @@ impl Connection {
         }
         phy.apply_link(&mut link);
         hw.command(3, 9, &link).await?;
+        if let Some(six) = &six {
+            // Linux's AP-power command is issued on an active link. No
+            // station/TX queue exists yet, and no management TX precedes
+            // this actual native receipt or a queued stricter AP beacon.
+            let receipt = hw.command(4, 0xc, six.power.command()).await?;
+            if !receipt.payload.is_empty() {
+                return Err("invalid6GHz AP power receipt");
+            }
+            six.check_pending(hw)?;
+            hw.install_six_tx_profile(six.clone())?;
+        }
         let mut peer = station_api::peer(beacon.bssid);
         phy.apply_peer(&mut peer, 0);
         put32(&mut peer, 36, u32::from(profile.pmf));
@@ -462,6 +589,7 @@ impl Connection {
             management_pn: 0,
             key_history: super::sc_security::KeyHistory::default(),
             he: None,
+            six,
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
             amsdu_memory: None,
             amsdu_memory_attempted: false,
@@ -469,6 +597,7 @@ impl Connection {
         };
         // Authenticate: open-system auth for Open/WPA2-PSK; the SAE
         // commit/confirm exchange for WPA3, which also yields the PMK.
+        this.check_six_pending(hw)?;
         let pmk: Option<[u8; 32]> = match &auth {
             AuthMethod::Open | AuthMethod::Wpa2Psk(_) => {
                 let frame = this.management(0xb0, &mlme::build_open_auth_body());
@@ -539,12 +668,16 @@ impl Connection {
             request.extend_from_slice(&super::qos::INFORMATION_IE);
         }
         request.extend_from_slice(&this.phy.association_ies(local_phy, this.beacon.channel));
+        if let Some(six) = &this.six {
+            six.append_capabilities(&mut request);
+        }
         if let Some(he) = he_offer.as_ref().and_then(|offer| offer.he()) {
             let capability = he.local_capability();
             request.extend_from_slice(&[255, capability.len() as u8]);
             request.extend_from_slice(&capability);
         }
         this.sequence = this.sequence.wrapping_add(1);
+        this.check_six_pending(hw)?;
         hw.transmit(management_queue, &request, 24, this.rate())
             .await?;
         let reply = this.wait_management(hw, response_subtype).await?;
@@ -559,40 +692,54 @@ impl Connection {
             // the beacon. Only use QoS if the AP confirms WMM support.
             this.qos = super::qos::Parameters::parse(&reply[6..])?;
         }
-        this.phy = this.phy.confirm(
-            local_phy,
-            &this.beacon.information_elements,
-            &reply[6..],
-            this.beacon.channel,
-            this.qos.is_some(),
-        )?;
-        if let Some(offer) = he_offer {
-            let negotiated = offer
-                .response_elements_with_sae_h2e(
-                    &reply[6..],
-                    profile.sae.as_ref().is_some_and(|join| join.h2e()),
-                )
-                .map_err(|_| "MLD association response did not confirm the HE offer")?;
-            let he = *negotiated.he().ok_or("MLD response omitted HE")?;
-            if negotiated.center_channel() != this.phy.center
-                || match negotiated.width() {
-                    narf_wireless::association::phy::Width::Twenty => this.phy.width != 0,
-                    narf_wireless::association::phy::Width::Forty => this.phy.width != 1,
-                    narf_wireless::association::phy::Width::Eighty => this.phy.width != 2,
-                    narf_wireless::association::phy::Width::OneSixty => this.phy.width != 3,
-                }
-            {
-                return Err("MLD HE response differs from native PHY/MCC span");
-            }
-            this.he = Some(super::sc_he::Profile::new(
-                he,
-                &reply[6..],
-                (negotiated.ht().peer_capability() >> 2) & 3 == 0,
-                super::sc_he::rates_version(hw).ok_or("MLD HE rate ABI changed")?,
-            )?);
+        if this.six.is_some() && this.qos.is_none() {
+            return Err("6GHz response did not confirm WMM");
         }
-        this.qos = permissions.limit_qos(
+        if let Some(six) = &this.six {
+            six.confirm(&reply[6..])?;
+            this.he = Some(super::sc_he::Profile::new(
+                *six.plan.he(),
+                &reply[6..],
+                six.plan.peer_capability().sm_ps() == 0,
+                super::sc_he::rates_version(hw).ok_or("6GHz native HE rate ABI changed")?,
+            )?);
+        } else {
+            this.phy = this.phy.confirm(
+                local_phy,
+                &this.beacon.information_elements,
+                &reply[6..],
+                this.beacon.channel,
+                this.qos.is_some(),
+            )?;
+            if let Some(offer) = he_offer {
+                let negotiated = offer
+                    .response_elements_with_sae_h2e(
+                        &reply[6..],
+                        profile.sae.as_ref().is_some_and(|join| join.h2e()),
+                    )
+                    .map_err(|_| "MLD association response did not confirm the HE offer")?;
+                let he = *negotiated.he().ok_or("MLD response omitted HE")?;
+                if negotiated.center_channel() != this.phy.center
+                    || match negotiated.width() {
+                        narf_wireless::association::phy::Width::Twenty => this.phy.width != 0,
+                        narf_wireless::association::phy::Width::Forty => this.phy.width != 1,
+                        narf_wireless::association::phy::Width::Eighty => this.phy.width != 2,
+                        narf_wireless::association::phy::Width::OneSixty => this.phy.width != 3,
+                    }
+                {
+                    return Err("MLD HE response differs from native PHY/MCC span");
+                }
+                this.he = Some(super::sc_he::Profile::new(
+                    he,
+                    &reply[6..],
+                    (negotiated.ht().peer_capability() >> 2) & 3 == 0,
+                    super::sc_he::rates_version(hw).ok_or("MLD HE rate ABI changed")?,
+                )?);
+            }
+        }
+        this.qos = permissions.limit_qos_band(
             domain,
+            this.beacon.band,
             this.beacon.channel,
             this.phy.width,
             this.phy.center,
@@ -603,14 +750,21 @@ impl Connection {
         if !permissions.widths.permits(this.phy.width) {
             return Err("association response exceeds native MCC width capability");
         }
-        let final_power = channel_power_width(
-            domain,
-            this.beacon.channel,
-            this.phy.width,
-            this.phy.center,
-            &permissions.channels,
-        )
-        .ok_or("association response selected a prohibited channel span")?;
+        let final_power = if let Some(six) = &this.six {
+            super::six_ghz_station::rule(domain, six.channel(), six.nvm_flags, Some(&permissions))
+                .filter(|rule| rule.allows_6ghz_client(six.power_type()))
+                .map(|rule| rule.max_power_dbm)
+                .ok_or("6GHz response lost native channel power")?
+        } else {
+            channel_power_width(
+                domain,
+                this.beacon.channel,
+                this.phy.width,
+                this.phy.center,
+                &permissions.channels,
+            )
+            .ok_or("association response selected a prohibited channel span")?
+        };
         if final_power < max_power {
             let power = station_api::tx_power(
                 hw.version(1, 0x9f).ok_or("missing TX power command")?.0,
@@ -619,22 +773,35 @@ impl Connection {
             hw.command(1, 0x9f, &power).await?;
         }
         // Recheck membership selectors after a response downgrades PHY.
-        this.rates = super::rates::Rates::parse_for_profiles(
-            &this.beacon.information_elements,
-            this.beacon.channel,
-            this.phy.mode,
-            profile.sae.as_ref().is_some_and(|join| join.h2e()),
-            this.he.is_some(),
-        )?;
-        let mut phy_command = station_api::phy(2, this.beacon.channel);
+        this.rates = if this.six.is_some() {
+            super::rates::Rates::parse_six(&this.beacon.information_elements, true)?
+        } else {
+            super::rates::Rates::parse_for_profiles(
+                &this.beacon.information_elements,
+                this.beacon.channel,
+                this.phy.mode,
+                profile.sae.as_ref().is_some_and(|join| join.h2e()),
+                this.he.is_some(),
+            )?
+        };
+        let mut phy_command = station_api::phy_channel(
+            2,
+            super::native_band::Channel {
+                band: this.beacon.band,
+                number: this.beacon.channel,
+            },
+        );
         this.phy.apply_phy(&mut phy_command, this.beacon.channel);
         hw.station_phy(&phy_command, this.beacon.channel).await?;
         {
-            let mut link = station_api::link(
+            let mut link = station_api::link_channel(
                 2,
                 local,
                 true,
-                this.beacon.channel,
+                super::native_band::Channel {
+                    band: this.beacon.band,
+                    number: this.beacon.channel,
+                },
                 this.beacon.interval,
                 this.beacon.dtim,
             );
@@ -689,17 +856,28 @@ impl Connection {
         hw.station_tlc(&tlc).await?;
         // The response-refined native span/power is the handshake's owner;
         // a beacon received during M4 can update that same shared proof.
-        this.regulatory = super::mld_policy::Program::new(
-            domain,
-            permissions,
-            this.beacon.channel,
-            this.phy.width,
-            this.phy.center,
-            final_power.min(max_power),
-            this.qos,
-            hw.rf_policy_validity()?,
-        )?
-        .with_he(this.he.is_some())?;
+        this.regulatory = if let Some(six) = &this.six {
+            super::mld_policy::Program::new_six(
+                domain,
+                permissions,
+                six,
+                final_power.min(max_power),
+                this.qos,
+                hw.rf_policy_validity()?,
+            )?
+        } else {
+            super::mld_policy::Program::new(
+                domain,
+                permissions,
+                this.beacon.channel,
+                this.phy.width,
+                this.phy.center,
+                final_power.min(max_power),
+                this.qos,
+                hw.rf_policy_validity()?,
+            )?
+            .with_he(this.he.is_some())?
+        };
         if secure {
             let deadline = narf_time::Deadline::after_ms(8000);
             while !this.security.as_ref().unwrap().complete() {
@@ -769,7 +947,22 @@ impl Connection {
                     continue;
                 };
                 let frame = mpdu.frame;
-                if frame.len() < 24
+                if self.admits_channel(&mpdu)
+                    && frame.len() >= 36
+                    && frame[0] == 0x80
+                    && frame[10..16] == self.beacon.bssid
+                    && frame[16..22] == self.beacon.bssid
+                {
+                    if let Some(six) = &self.six {
+                        six.confirm(
+                            mpdu.body(24, 0)
+                                .and_then(|body| body.get(12..))
+                                .ok_or("invalid6GHz association beacon")?,
+                        )?;
+                    }
+                }
+                if !self.admits_channel(&mpdu)
+                    || frame.len() < 24
                     || frame[4..10] != self.local
                     || frame[10..16] != self.beacon.bssid
                     || frame[16..22] != self.beacon.bssid
@@ -830,6 +1023,7 @@ impl Connection {
         for _ in 0..=3 {
             let commit = sae.commit_body(token.as_deref());
             let frame = self.management(0xb0, &mlme::build_sae_auth_body(1, status, &commit));
+            self.check_six_pending(hw)?;
             hw.transmit(self.management_queue, &frame, 24, self.rate())
                 .await?;
             commit_reply = self.wait_management(hw, 0xb0).await?;
@@ -879,6 +1073,7 @@ impl Connection {
             .map_err(|_| "SAE commit processing failed")?;
         let confirm = sae.build_confirm();
         let frame = self.management(0xb0, &mlme::build_sae_auth_body(2, 0, &confirm));
+        self.check_six_pending(hw)?;
         hw.transmit(self.management_queue, &frame, 24, self.rate())
             .await?;
         let reply = self.wait_management(hw, 0xb0).await?;
@@ -1108,7 +1303,7 @@ impl Connection {
         hw: &mut Hardware,
         mpdu: &scan_api::Mpdu<'_>,
     ) -> Result<Option<Vec<u8>>, &'static str> {
-        if !self.admits_data_header(mpdu) {
+        if !self.admits_channel(mpdu) || !self.admits_data_header(mpdu) {
             return Ok(None);
         }
         if !self.authorized && mpdu.frame.first() == Some(&0x80) {
@@ -1189,7 +1384,7 @@ impl Connection {
                 let Some(mpdu) = scan_api::mpdu(&packet.payload) else {
                     return Ok(output);
                 };
-                if mpdu.channel != self.beacon.channel {
+                if !self.admits_channel(&mpdu) {
                     return Ok(output);
                 }
                 let frame = mpdu.frame;
@@ -1355,7 +1550,16 @@ impl Connection {
         Ok(output.into_iter().map(|(frame, _)| frame).collect())
     }
 
+    fn check_six_pending(&self, hw: &mut Hardware) -> Result<(), &'static str> {
+        if let Some(six) = &self.six {
+            hw.poll()?;
+            six.check_pending(hw)?;
+        }
+        Ok(())
+    }
+
     async fn service_power(&mut self, hw: &mut Hardware) -> Result<(), &'static str> {
+        self.check_six_pending(hw)?;
         if !self.power_pending {
             return Ok(());
         }
@@ -1565,6 +1769,7 @@ impl Connection {
             return true;
         }
         if frame.len() < 24
+            || self.six.is_some() && !matches!((mpdu.rate_n_flags >> 8) & 7, 1 | 4)
             || !self.phy.admits_wide_rx(self.local_phy, mpdu.rate_n_flags)
             || (mpdu.rate_n_flags >> 8) & 7 >= 4
                 && self
@@ -1593,7 +1798,7 @@ impl Connection {
         queue: usize,
     ) -> Result<Option<Vec<u8>>, &'static str> {
         let frame = mpdu.frame;
-        if mpdu.channel != self.beacon.channel || !self.admits_data_header(mpdu) {
+        if !self.admits_channel(mpdu) || !self.admits_data_header(mpdu) {
             return Ok(None);
         }
         if frame.len() >= 24
@@ -1601,40 +1806,52 @@ impl Connection {
             && frame[16..22] == self.beacon.bssid
         {
             if frame[0] == 0x80 {
-                if let Some(body) = mpdu.body(24, 0) {
-                    if let Some(ies) = body.get(12..) {
-                        let capabilities = u16::from_le_bytes([body[10], body[11]]);
-                        if let Ok(Some(power)) = super::mld_power::ap_limit_in_ies(
-                            ies,
-                            capabilities,
-                            self.beacon.channel,
-                        ) {
-                            if self.ap_power_limit != Some(power) {
-                                self.ap_power_limit = Some(power);
-                                self.power_pending = true;
-                            }
-                        }
-                        // Missing/invalid later AP data never clears an
-                        // already programmed restriction (Linux's no-change).
-                    }
-                }
-                if self.phy.mode != 0 {
-                    let body = mpdu.body(24, 0).ok_or("invalid associated beacon")?;
-                    let ies = body.get(12..).ok_or("short associated beacon")?;
-                    // Live channel/PHY changes require reassociation. Stop TX
-                    // immediately if the AP's current operating constraints no
-                    // longer match the programmed width, MCS or protection.
-                    if self.phy.confirm(
-                        self.local_phy,
-                        ies,
-                        ies,
-                        self.beacon.channel,
-                        self.qos.is_some(),
-                    )? != self.phy
-                        || self.he.is_some_and(|he| !he.matches(ies))
-                    {
+                if let Some(six) = &self.six {
+                    let result = mpdu
+                        .body(24, 0)
+                        .and_then(|body| body.get(12..))
+                        .ok_or("invalid associated6GHz beacon")
+                        .and_then(|ies| six.confirm(ies));
+                    if let Err(reason) = result {
                         self.authorized = false;
-                        return Err("AP changed PHY operation; reassociation required");
+                        return Err(reason);
+                    }
+                } else {
+                    if let Some(body) = mpdu.body(24, 0) {
+                        if let Some(ies) = body.get(12..) {
+                            let capabilities = u16::from_le_bytes([body[10], body[11]]);
+                            if let Ok(Some(power)) = super::mld_power::ap_limit_in_ies(
+                                ies,
+                                capabilities,
+                                self.beacon.channel,
+                            ) {
+                                if self.ap_power_limit != Some(power) {
+                                    self.ap_power_limit = Some(power);
+                                    self.power_pending = true;
+                                }
+                            }
+                            // Missing/invalid later AP data never clears an
+                            // already programmed restriction (Linux's no-change).
+                        }
+                    }
+                    if self.phy.mode != 0 {
+                        let body = mpdu.body(24, 0).ok_or("invalid associated beacon")?;
+                        let ies = body.get(12..).ok_or("short associated beacon")?;
+                        // Live channel/PHY changes require reassociation. Stop TX
+                        // immediately if the AP's current operating constraints no
+                        // longer match the programmed width, MCS or protection.
+                        if self.phy.confirm(
+                            self.local_phy,
+                            ies,
+                            ies,
+                            self.beacon.channel,
+                            self.qos.is_some(),
+                        )? != self.phy
+                            || self.he.is_some_and(|he| !he.matches(ies))
+                        {
+                            self.authorized = false;
+                            return Err("AP changed PHY operation; reassociation required");
+                        }
                     }
                 }
                 self.last_beacon = narf_time::now_cycles();
@@ -1935,18 +2152,44 @@ impl Connection {
         hw.command(
             3,
             9,
-            &station_api::link(2, self.local, false, self.beacon.channel, 0, 1),
+            &station_api::link_channel(
+                2,
+                self.local,
+                false,
+                super::native_band::Channel {
+                    band: self.beacon.band,
+                    number: self.beacon.channel,
+                },
+                0,
+                1,
+            ),
         )
         .await?;
         // A second inactive update detaches phy_id after deactivation.
         hw.command(
             3,
             9,
-            &station_api::link(2, self.local, false, self.beacon.channel, 0, 1),
+            &station_api::link_channel(
+                2,
+                self.local,
+                false,
+                super::native_band::Channel {
+                    band: self.beacon.band,
+                    number: self.beacon.channel,
+                },
+                0,
+                1,
+            ),
         )
         .await?;
         hw.station_phy(
-            &station_api::phy(3, self.beacon.channel),
+            &station_api::phy_channel(
+                3,
+                super::native_band::Channel {
+                    band: self.beacon.band,
+                    number: self.beacon.channel,
+                },
+            ),
             self.beacon.channel,
         )
         .await?;

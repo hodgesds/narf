@@ -1049,6 +1049,17 @@ legacy netdev/AP acceptance remains unchanged. Four additional native cases
 are wired for this continuation and await release acceptance. Independent
 client/GO contexts and qualified 6 GHz management TX remain open.
 
+Intel Sc/API89/Bz station owners retain explicit 6 GHz band identity through
+raw NVM tails, passive scan jobs, copied RFH descriptors and current host/MCC
+publication proofs. The initial AP20/STA20 HE profile requires SAE-H2E/PMF
+and exact AP power-type/TPE facts; the native AP power command completes
+after link activation and before peer queues or first transmission. Both
+native send paths recheck queued bound beacons at publication, including
+after an async credit wait. CDB FIFO sizing uses the explicit band. Six new
+native cases await release execution; the combined native-context release
+Clippy probe passes. Family §3.63 keeps active/RNR, wider/periodic operation
+and live AP-power replacement as separate open continuations.
+
 ## 4. Interaction with `narf-wireless`
 
 - **Registration**: Drivers register via `bus::register_wireless_driver(MatchEntry { ... })`.

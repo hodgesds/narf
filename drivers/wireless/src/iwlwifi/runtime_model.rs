@@ -343,6 +343,9 @@ pub(in crate::iwlwifi) fn create_for_format(
         responses: alloc::collections::VecDeque::new(),
         tx_completed: alloc::collections::VecDeque::new(),
         versions: Vec::new(),
+        band_in_rx: false,
+        scan_fixed_antenna: false,
+        six_tx_profile: None,
         bios_versions: Vec::new(),
         platform_power: platform_power::State::default(),
         shared_memory: smem::State::default(),
@@ -403,6 +406,8 @@ pub(in crate::iwlwifi) fn firmware_profile(
         return Err("model firmware metadata on a live/native station");
     }
     hardware.versions = parsed.api.commands.to_vec();
+    hardware.band_in_rx = parsed.api.api_changes[1] & (1 << 27) != 0;
+    hardware.scan_fixed_antenna = parsed.api.has_capability(111);
     hardware.shared_memory = smem::State::new(parsed);
     hardware.receive_queues = rx_multi::State::new(parsed);
     Ok(())

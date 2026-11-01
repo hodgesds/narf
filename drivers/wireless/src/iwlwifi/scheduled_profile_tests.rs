@@ -35,6 +35,7 @@ fn control(profile: Profile, active: bool) -> R<Control> {
         tx_model: None,
         api89,
         bz,
+        six: None,
     };
     Control::with_guard(
         configured(active),

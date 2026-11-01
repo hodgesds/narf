@@ -626,6 +626,11 @@ pub struct Hardware {
     responses: alloc::collections::VecDeque<Packet>,
     tx_completed: alloc::collections::VecDeque<(u16, u16, bool)>,
     versions: Vec<u8>,
+    band_in_rx: bool,
+    scan_fixed_antenna: bool,
+    /// The actual installed6GHz AP power/HE snapshot. This constraint
+    /// gate is checked after native credit waits at every TX publication.
+    six_tx_profile: Option<alloc::sync::Arc<super::six_ghz_station::Profile>>,
     bios_versions: Vec<u8>,
     platform_power: platform_power::State,
     shared_memory: smem::State,
@@ -738,6 +743,9 @@ impl Hardware {
             responses: alloc::collections::VecDeque::new(),
             tx_completed: alloc::collections::VecDeque::new(),
             versions: parsed.api.commands.to_vec(),
+            band_in_rx: parsed.api.api_changes[1] & (1 << 27) != 0,
+            scan_fixed_antenna: parsed.api.has_capability(111),
+            six_tx_profile: None,
             bios_versions: parsed.api.bios_commands.unwrap_or(&[]).to_vec(),
             platform_power: platform_power::State::default(),
             shared_memory: smem::State::new(parsed),
@@ -796,6 +804,8 @@ impl Hardware {
     pub(super) fn matches_firmware(&self, parsed: &ParsedUcode<'_>) -> bool {
         if self.format != rx_rfh::CompletionFormat::Qu
             || self.versions != parsed.api.commands
+            || self.band_in_rx != (parsed.api.api_changes[1] & (1 << 27) != 0)
+            || self.scan_fixed_antenna != parsed.api.has_capability(111)
             || self.resources.boot.phy_config != parsed.api.phy_config
         {
             return false;
@@ -1437,6 +1447,7 @@ impl Hardware {
     }
 
     pub(super) fn clear_rf_policy(&mut self) {
+        self.six_tx_profile = None;
         if let Some(policy) = self.rf_policy.take() {
             policy.invalidate();
         }
@@ -1659,6 +1670,7 @@ impl Hardware {
             return Err("Wi-Fi transport failed");
         }
         let sources = self.source_fence()?;
+        self.check_six_tx_publication()?;
         let queue = self
             .resources
             .data
@@ -1770,6 +1782,7 @@ impl Hardware {
             return Err("MVM station closed before native packet publication");
         }
         let sources = self.source_fence()?;
+        self.check_six_tx_publication()?;
         let queue = self
             .resources
             .data

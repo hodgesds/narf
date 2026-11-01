@@ -64,7 +64,7 @@ impl Connection {
         }
         let Some(ceiling) = self.tx_amsdu.payload_ceiling(
             self.amsdu_memory.as_ref().unwrap(),
-            hw.station_lmac(self.beacon.channel),
+            hw.station_lmac(self.beacon.band),
             tid,
             self.he.is_some(),
         ) else {

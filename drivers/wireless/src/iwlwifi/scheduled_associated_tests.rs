@@ -80,6 +80,7 @@ fn control(profile: Profile, active: bool, phy: Option<PhyModel>) -> R<Control> 
         tx_model: None,
         api89,
         bz,
+        six: None,
     };
     Control::with_guard(
         configured(active),
