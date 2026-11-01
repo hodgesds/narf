@@ -17,6 +17,7 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 
+pub mod queues;
 mod tests;
 
 // ── PCI device IDs ─────────────────────────────────────────────────
@@ -51,10 +52,8 @@ pub(crate) const REG_EERD: u64 = 0x10010;
 pub(crate) const REG_EICR: u64 = 0x00800;
 pub(crate) const REG_EIMS: u64 = 0x00880;
 pub(crate) const REG_EIMC: u64 = 0x00888;
-pub(crate) const REG_GPIE: u64 = 0x00A50;
-pub(crate) const REG_EIAM: u64 = 0x00A90;
-pub(crate) const REG_IVAR0: u64 = 0x01000; // 64 IVARs, stride 4
-pub(crate) const REG_IVAR_MISC: u64 = 0x011E0; // OTHER_CAUSES_IVAR
+pub(crate) const REG_GPIE: u64 = 0x00898;
+pub(crate) const REG_EIAM: u64 = 0x00890;
 
 pub(crate) const REG_FCTRL: u64 = 0x05080;
 pub(crate) const REG_RAL0: u64 = 0x0A200; // 82599 receive-address regs §8.2.3.7.9
@@ -62,21 +61,11 @@ pub(crate) const REG_RAH0: u64 = 0x0A204;
 pub(crate) const REG_RXCTRL: u64 = 0x03000;
 pub(crate) const REG_LINKS: u64 = 0x04200;
 
-// 82599 RX queue 0 register block. §8.2.3.8 — stride 0x40 per queue.
-pub(crate) const RX_RDBAL: u64 = 0x01000;
-pub(crate) const RX_RDBAH: u64 = 0x01004;
-pub(crate) const RX_RDLEN: u64 = 0x01008;
-pub(crate) const RX_RDH: u64 = 0x01010;
+// Queue-0 tail pointers still used directly by the tx/rx paths; all
+// other queue registers come from queues::rx_queue_regs/tx_queue_regs
+// (datasheet §8.2, stride 0x40 per queue).
 pub(crate) const RX_RDT: u64 = 0x01018;
-pub(crate) const RX_RXDCTL: u64 = 0x01028;
-pub(crate) const RX_SRRCTL: u64 = 0x01014;
-
-pub(crate) const TX_TDBAL: u64 = 0x06000;
-pub(crate) const TX_TDBAH: u64 = 0x06004;
-pub(crate) const TX_TDLEN: u64 = 0x06008;
-pub(crate) const TX_TDH: u64 = 0x06010;
 pub(crate) const TX_TDT: u64 = 0x06018;
-pub(crate) const TX_TXDCTL: u64 = 0x06028;
 
 // CTRL bits (§8.2.3.1.1).
 pub(crate) const CTRL_RST_MASK: u32 = (1 << 26) | (1 << 3); // RST | LRST
@@ -325,6 +314,9 @@ pub struct Ixgbe {
     pub link_up: bool,
     /// Recorded device id (drives `name()`).
     pub did: u16,
+    /// Live queue configuration (multi-queue keystone: 1/1 at
+    /// bring-up; register addressing + IVAR routing cover up to 64).
+    pub queue_config: queues::QueueConfig,
     /// Stage 5: MSI-X table once enabled.
     pub(crate) msix: Option<MsixTable>,
     pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -356,6 +348,13 @@ impl Ixgbe {
     ) -> Result<Arc<Self>, IxgbeError> {
         // SAFETY: caller-authority over the device.
         let mmio = unsafe { map_bar(device, 0) }.map_err(|_| IxgbeError::BarMapFailed)?;
+        // The single-queue config is valid by construction; validate
+        // anyway so a future multi-queue bring-up cannot silently
+        // program an out-of-range queue count.
+        let queue_config = queues::QueueConfig::single();
+        queue_config
+            .validate()
+            .map_err(|_| IxgbeError::Other("invalid queue config"))?;
 
         // 1. Mask all extended interrupts (§4.6.3.2 — driver should
         //    own EIMC before firmware moves on).
@@ -429,16 +428,20 @@ impl Ixgbe {
                 core::ptr::write_volatile(tx_ring.cpu_mut_ptr_at::<u8>(i as u64), 0);
             }
         }
+        // Queue-0 registers come from the multi-queue addressing
+        // helpers (queues.rs), which the fixtures prove equal to the
+        // datasheet queue-0 addresses.
+        let txq = queues::tx_queue_regs(0).expect("queue 0 is in range");
         // SAFETY: identity-mapped MMIO.
         unsafe {
-            mmio.write32(TX_TDBAL, tx_phys as u32);
-            mmio.write32(TX_TDBAH, (tx_phys >> 32) as u32);
-            mmio.write32(TX_TDLEN, (TX_RING_LEN * 16) as u32);
-            mmio.write32(TX_TDH, 0);
-            mmio.write32(TX_TDT, 0);
+            mmio.write32(txq.tdbal, tx_phys as u32);
+            mmio.write32(txq.tdbah, (tx_phys >> 32) as u32);
+            mmio.write32(txq.tdlen, (TX_RING_LEN * 16) as u32);
+            mmio.write32(txq.tdh, 0);
+            mmio.write32(txq.tdt, 0);
             // Enable TX queue.
-            let dctl = mmio.read32(TX_TXDCTL);
-            mmio.write32(TX_TXDCTL, dctl | TXDCTL_ENABLE);
+            let dctl = mmio.read32(txq.txdctl);
+            mmio.write32(txq.txdctl, dctl | TXDCTL_ENABLE);
         }
         // Poll for queue-enable to take effect (§7.2.3.4.1).
         // responsive_spin_until ticks sleep_pumps; failure is
@@ -446,7 +449,7 @@ impl Ixgbe {
         // behaviour. 100 ms wall-clock budget.
         let _ = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
-            || unsafe { mmio.read32(TX_TXDCTL) } & TXDCTL_ENABLE != 0,
+            || unsafe { mmio.read32(txq.txdctl) } & TXDCTL_ENABLE != 0,
             narf_time::Deadline::after_ms(100),
         );
 
@@ -475,18 +478,21 @@ impl Ixgbe {
             }
             rx_pool.push(buf);
         }
+        // Queue-0 registers come from the multi-queue addressing
+        // helpers (queues.rs).
+        let rxq = queues::rx_queue_regs(0).expect("queue 0 is in range");
         // SAFETY: identity-mapped MMIO.
         unsafe {
-            mmio.write32(RX_RDBAL, rx_ring_phys as u32);
-            mmio.write32(RX_RDBAH, (rx_ring_phys >> 32) as u32);
-            mmio.write32(RX_RDLEN, (RX_RING_LEN * 16) as u32);
-            mmio.write32(RX_RDH, 0);
-            mmio.write32(RX_RDT, (RX_RING_LEN - 1) as u32);
+            mmio.write32(rxq.rdbal, rx_ring_phys as u32);
+            mmio.write32(rxq.rdbah, (rx_ring_phys >> 32) as u32);
+            mmio.write32(rxq.rdlen, (RX_RING_LEN * 16) as u32);
+            mmio.write32(rxq.rdh, 0);
+            mmio.write32(rxq.rdt, (RX_RING_LEN - 1) as u32);
             // SRRCTL: 2K legacy buffers.
-            mmio.write32(RX_SRRCTL, SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_LEGACY);
+            mmio.write32(rxq.srrctl, SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_LEGACY);
             // Enable RX queue.
-            let dctl = mmio.read32(RX_RXDCTL);
-            mmio.write32(RX_RXDCTL, dctl | RXDCTL_ENABLE);
+            let dctl = mmio.read32(rxq.rxdctl);
+            mmio.write32(rxq.rxdctl, dctl | RXDCTL_ENABLE);
             // Promiscuous + broadcast accept.
             mmio.write32(REG_FCTRL, FCTRL_BAM | FCTRL_UPE | FCTRL_MPE);
             // Master RX enable.
@@ -512,6 +518,7 @@ impl Ixgbe {
             mac,
             link_up,
             did: device.id.device,
+            queue_config,
             msix: None,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
@@ -763,11 +770,13 @@ impl Ixgbe {
     }
 
     /// Stage 5: enable MSI-X on this device. Allocates a single
-    /// shared "misc" vector and routes RX queue 0 + the OTHER cause
-    /// onto it via the IVAR registers. Stage 5 stops at table
-    /// programming; the actual ISR wire-up happens once the
-    /// `narf-interrupts` MSI delivery side is consumed by the net
-    /// stack.
+    /// shared "misc" vector and routes RX queue 0 + TX queue 0 + the
+    /// OTHER cause onto it via the IVAR registers. Corrected
+    /// 2026-10-31 against datasheet §8.2.3.5.16/.17: IVAR[0] is at
+    /// 0x00900 (not 0x01000, which is RDBAL[0]) and packs RX0/TX0 as
+    /// `0x8080` (vector 0 + both valid bits); IVAR_MISC is at
+    /// 0x00A00 with the OTHER cause at bits 14:8 + valid bit 15
+    /// (`0x8000` for vector 0), not `0x80`.
     pub fn enable_msix_vector(
         &mut self,
         cap: &Cap<BusDeviceCap, Write>,
@@ -776,18 +785,18 @@ impl Ixgbe {
         let table = enable_msix(cap, device).map_err(|_| IxgbeError::MsixUnavailable)?;
         // Take vector 0 for "misc" (link / RX0 / TX0 collapsed).
         let _ = table.size(); // probed for completeness
-                              // SAFETY: identity-mapped MMIO.
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            queues::route_queue_vector(&mut bank, 0, 0);
+            queues::route_misc_vector(&mut bank, 0);
+        }
+        // SAFETY: identity-mapped MMIO.
         unsafe {
-            // Route RX queue 0 RX cause to vector 0:
-            //   IVAR[0]: bit 7 = valid, bits[6:0] = vector.
-            // RX uses low byte; TX uses byte 2.
-            let ivar = (0x80u32) | (0x80u32 << 16);
-            self.mmio.write32(REG_IVAR0, ivar);
-            // OTHER_CAUSES_IVAR — link-state etc. → vector 0.
-            self.mmio.write32(REG_IVAR_MISC, 0x80);
             // GPIE: enable multiple-MSIX, auto-mask, no EIAME yet.
+            // Offset corrected to 0x00898 (datasheet §8.2.3.5.18).
             self.mmio.write32(REG_GPIE, (1 << 4) | (1 << 5) | (1 << 6));
             // EIAM: auto-clear vector 0 on read of EICR.
+            // Offset corrected to 0x00890 (datasheet §8.2).
             self.mmio.write32(REG_EIAM, 1);
             // Unmask vector 0.
             self.mmio.write32(REG_EIMS, 1);
@@ -829,6 +838,12 @@ impl narf_net::Interface for Ixgbe {
     fn link_up(&self) -> bool {
         self.link_up
     }
+    fn num_rx_queues(&self) -> u16 {
+        self.queue_config.num_rx as u16
+    }
+    fn num_tx_queues(&self) -> u16 {
+        self.queue_config.num_tx as u16
+    }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         &self.rx_ipc_ring
     }
@@ -860,6 +875,12 @@ impl crate::HwNic for Ixgbe {
     }
     fn caps(&self) -> crate::NicCaps {
         crate::NicCaps::PROMISC | crate::NicCaps::MULTICAST_HASH
+    }
+    fn num_rx_queues(&self) -> u16 {
+        self.queue_config.num_rx as u16
+    }
+    fn num_tx_queues(&self) -> u16 {
+        self.queue_config.num_tx as u16
     }
     fn ring_capacity(&self) -> usize {
         TX_RING_LEN
@@ -898,6 +919,12 @@ impl narf_net::Interface for IxgbeNic {
     }
     fn link_up(&self) -> bool {
         with_controller(|c| c.link_up).unwrap_or(false)
+    }
+    fn num_rx_queues(&self) -> u16 {
+        with_controller(|c| c.queue_config.num_rx as u16).unwrap_or(1)
+    }
+    fn num_tx_queues(&self) -> u16 {
+        with_controller(|c| c.queue_config.num_tx as u16).unwrap_or(1)
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =

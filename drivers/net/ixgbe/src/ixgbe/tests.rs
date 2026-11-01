@@ -17,6 +17,41 @@ use super::{
     IXGBE_DEV_X540, IXGBE_DEV_X550, IXGBE_DEV_X550EM_X, IXGBE_VENDOR,
 };
 
+/// In-memory register bank for fixtures: 64 KiB of BAR0 window,
+/// covering every register this stream programs (highest is
+/// MRQC at 0x0EC80). Lives here (not in queues.rs) because this
+/// test module is x86_64-only while the driver builds for both
+/// arches — a test-only helper in the driver module would trip
+/// dead-code on aarch64.
+struct FakeBank {
+    regs: alloc::vec::Vec<u32>,
+}
+
+impl FakeBank {
+    fn new() -> Self {
+        Self {
+            regs: alloc::vec![0u32; 0x10000 / 4],
+        }
+    }
+}
+
+impl super::queues::RegBank for FakeBank {
+    fn read32(&self, offset: u64) -> u32 {
+        if offset % 4 != 0 {
+            return 0;
+        }
+        self.regs.get((offset / 4) as usize).copied().unwrap_or(0)
+    }
+    fn write32(&mut self, offset: u64, value: u32) {
+        if offset % 4 != 0 {
+            return;
+        }
+        if let Some(slot) = self.regs.get_mut((offset / 4) as usize) {
+            *slot = value;
+        }
+    }
+}
+
 // ── Stage 1: PCI match table ───────────────────────────────────────
 
 fn smoke_ixgbe_pci_match_table() -> TestResult {
@@ -201,3 +236,235 @@ fn smoke_ixgbe_hwnic_surface() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_hwnic_surface);
+
+// ── Multi-queue keystone: register addressing + IVAR routing ─────
+
+fn smoke_ixgbe_queue_regs_match_legacy_q0() -> TestResult {
+    use super::queues::{rx_queue_regs, tx_queue_regs};
+    // Datasheet §8.2 queue-0 addresses (the old per-constant names
+    // were deleted once the helpers became the single source).
+    let rx = match rx_queue_regs(0) {
+        Some(r) => r,
+        None => return TestResult::Fail("rx_queue_regs(0) is None"),
+    };
+    if rx.rdbal != 0x01000
+        || rx.rdbah != 0x01004
+        || rx.rdlen != 0x01008
+        || rx.rdh != 0x01010
+        || rx.rdt != 0x01018
+        || rx.rxdctl != 0x01028
+        || rx.srrctl != 0x01014
+    {
+        return TestResult::Fail("rx queue-0 block disagrees with datasheet addresses");
+    }
+    let tx = match tx_queue_regs(0) {
+        Some(t) => t,
+        None => return TestResult::Fail("tx_queue_regs(0) is None"),
+    };
+    if tx.tdbal != 0x06000
+        || tx.tdbah != 0x06004
+        || tx.tdlen != 0x06008
+        || tx.tdh != 0x06010
+        || tx.tdt != 0x06018
+        || tx.txdctl != 0x06028
+    {
+        return TestResult::Fail("tx queue-0 block disagrees with datasheet addresses");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_queue_regs_match_legacy_q0);
+
+fn smoke_ixgbe_queue_regs_stride_and_banks() -> TestResult {
+    use super::queues::{rx_queue_regs, tx_queue_regs};
+    let rx0 = match rx_queue_regs(0) {
+        Some(r) => r,
+        None => return TestResult::Fail("rx_queue_regs(0) is None"),
+    };
+    let rx1 = match rx_queue_regs(1) {
+        Some(r) => r,
+        None => return TestResult::Fail("rx_queue_regs(1) is None"),
+    };
+    if rx1.rdbal != rx0.rdbal + 0x40 || rx1.rxdctl != rx0.rxdctl + 0x40 {
+        return TestResult::Fail("rx stride is not 0x40");
+    }
+    if match rx_queue_regs(63) {
+        Some(r) => r.rdbal,
+        None => return TestResult::Fail("rx_queue_regs(63) is None"),
+    } != 0x01000 + 63 * 0x40
+    {
+        return TestResult::Fail("rx queue 63 base wrong");
+    }
+    // Second RX bank: queues 64..127 live at 0x0D000 + 0x40*(q-64).
+    if match rx_queue_regs(64) {
+        Some(r) => r.rdbal,
+        None => return TestResult::Fail("rx_queue_regs(64) is None"),
+    } != 0x0D000
+    {
+        return TestResult::Fail("rx queue 64 second-bank base wrong");
+    }
+    if match rx_queue_regs(127) {
+        Some(r) => r.rdbal,
+        None => return TestResult::Fail("rx_queue_regs(127) is None"),
+    } != 0x0D000 + 63 * 0x40
+    {
+        return TestResult::Fail("rx queue 127 base wrong");
+    }
+    if match tx_queue_regs(127) {
+        Some(t) => t.tdbal,
+        None => return TestResult::Fail("tx_queue_regs(127) is None"),
+    } != 0x06000 + 127 * 0x40
+    {
+        return TestResult::Fail("tx queue 127 base wrong");
+    }
+    if rx_queue_regs(128).is_some() || tx_queue_regs(128).is_some() {
+        return TestResult::Fail("queue 128 accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_queue_regs_stride_and_banks);
+
+fn smoke_ixgbe_ivar_routing() -> TestResult {
+    use super::queues::{
+        ivar_field, ivar_reg, route_misc_vector, route_queue_vector, RegBank, REG_IVAR_BASE,
+        REG_IVAR_MISC,
+    };
+    if ivar_reg(0) != Some(0x00900) || ivar_reg(1) != Some(0x00900) {
+        return TestResult::Fail("IVAR[0] is not 0x00900");
+    }
+    if ivar_reg(2) != Some(0x00904) || ivar_reg(127) != Some(0x00900 + 4 * 63) {
+        return TestResult::Fail("IVAR register index wrong");
+    }
+    if ivar_field(0, 0, false) != 0x80 || ivar_field(0, 0, true) != 0x8000 {
+        return TestResult::Fail("IVAR queue-0 field packing wrong");
+    }
+    let mut bank = FakeBank::new();
+    if !route_queue_vector(&mut bank, 0, 0) {
+        return TestResult::Fail("route_queue_vector(0) failed");
+    }
+    if bank.read32(REG_IVAR_BASE) != 0x8080 {
+        return TestResult::Fail("IVAR[0] queue-0 routing is not 0x8080");
+    }
+    if !route_queue_vector(&mut bank, 1, 3) {
+        return TestResult::Fail("route_queue_vector(1) failed");
+    }
+    // Queue 1 (odd half) must not disturb queue 0's fields.
+    if bank.read32(REG_IVAR_BASE) != 0x8383_8080 {
+        return TestResult::Fail("IVAR[0] sibling queue clobbered");
+    }
+    // Re-routing queue 0 replaces only its own half.
+    if !route_queue_vector(&mut bank, 0, 5) {
+        return TestResult::Fail("route_queue_vector re-route failed");
+    }
+    if bank.read32(REG_IVAR_BASE) != 0x8383_8585 {
+        return TestResult::Fail("IVAR[0] re-route clobbered sibling");
+    }
+    if route_misc_vector(&mut bank, 0) != 0x8000 || bank.read32(REG_IVAR_MISC) != 0x8000 {
+        return TestResult::Fail("IVAR_MISC OTHER routing is not 0x8000");
+    }
+    if route_queue_vector(&mut bank, 128, 0) {
+        return TestResult::Fail("route_queue_vector accepted queue 128");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_ivar_routing);
+
+fn smoke_ixgbe_queue_config_validation() -> TestResult {
+    use super::queues::{QueueConfig, QueueError};
+    if QueueConfig::single().validate().is_err() {
+        return TestResult::Fail("single-queue config rejected");
+    }
+    let zero = QueueConfig {
+        num_tx: 0,
+        num_rx: 1,
+        ring_len: 32,
+    };
+    if zero.validate() != Err(QueueError::ZeroQueues) {
+        return TestResult::Fail("zero TX queues accepted");
+    }
+    let many = QueueConfig {
+        num_tx: 65,
+        num_rx: 1,
+        ring_len: 32,
+    };
+    if many.validate() != Err(QueueError::TooManyQueues) {
+        return TestResult::Fail("65 queues accepted");
+    }
+    let small = QueueConfig {
+        num_tx: 1,
+        num_rx: 1,
+        ring_len: 16,
+    };
+    if small.validate() != Err(QueueError::BadRingLen) {
+        return TestResult::Fail("16-entry ring accepted");
+    }
+    let odd = QueueConfig {
+        num_tx: 1,
+        num_rx: 1,
+        ring_len: 48,
+    };
+    if odd.validate() != Err(QueueError::BadRingLen) {
+        return TestResult::Fail("non-power-of-two ring accepted");
+    }
+    let full = QueueConfig {
+        num_tx: 64,
+        num_rx: 64,
+        ring_len: 64,
+    };
+    if full.validate().is_err() {
+        return TestResult::Fail("64-queue config rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_queue_config_validation);
+
+fn smoke_ixgbe_queue0_register_conversation() -> TestResult {
+    use super::queues::{rx_queue_regs, tx_queue_regs, RegBank};
+    use super::{RXDCTL_ENABLE, SRRCTL_BSIZE_2K, SRRCTL_DESCTYPE_LEGACY, TXDCTL_ENABLE};
+    // Fake-bank replay of bring_up's queue-0 programming: base, length,
+    // head/tail, SRRCTL, queue-enable — the exact register conversation
+    // the hardware sees, minus DMA.
+    let mut bank = FakeBank::new();
+    let tx = match tx_queue_regs(0) {
+        Some(t) => t,
+        None => return TestResult::Fail("tx_queue_regs(0) is None"),
+    };
+    let rx = match rx_queue_regs(0) {
+        Some(r) => r,
+        None => return TestResult::Fail("rx_queue_regs(0) is None"),
+    };
+    let tx_phys: u64 = 0x1_0000_1000;
+    let rx_phys: u64 = 0x1_0000_2000;
+    bank.write32(tx.tdbal, tx_phys as u32);
+    bank.write32(tx.tdbah, (tx_phys >> 32) as u32);
+    bank.write32(tx.tdlen, 32 * 16);
+    bank.write32(tx.tdh, 0);
+    bank.write32(tx.tdt, 0);
+    bank.set_bits(tx.txdctl, TXDCTL_ENABLE);
+    bank.write32(rx.rdbal, rx_phys as u32);
+    bank.write32(rx.rdbah, (rx_phys >> 32) as u32);
+    bank.write32(rx.rdlen, 32 * 16);
+    bank.write32(rx.rdh, 0);
+    bank.write32(rx.rdt, 31);
+    bank.write32(rx.srrctl, SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_LEGACY);
+    bank.set_bits(rx.rxdctl, RXDCTL_ENABLE);
+    if bank.read32(tx.tdbal) != tx_phys as u32
+        || bank.read32(tx.tdbah) != (tx_phys >> 32) as u32
+        || bank.read32(tx.tdlen) != 512
+        || bank.read32(tx.txdctl) & TXDCTL_ENABLE == 0
+    {
+        return TestResult::Fail("TX queue-0 conversation wrong");
+    }
+    if bank.read32(rx.rdbal) != rx_phys as u32
+        || bank.read32(rx.rdlen) != 512
+        || bank.read32(rx.rdt) != 31
+        || bank.read32(rx.srrctl) != (SRRCTL_BSIZE_2K | SRRCTL_DESCTYPE_LEGACY)
+        || bank.read32(rx.rxdctl) & RXDCTL_ENABLE == 0
+    {
+        return TestResult::Fail("RX queue-0 conversation wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/ixgbe",
+    smoke_ixgbe_queue0_register_conversation
+);
