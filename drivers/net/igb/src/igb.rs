@@ -388,6 +388,150 @@ pub const fn eitr_reg(vector: usize) -> u64 {
     REG_EITR0 + vector as u64 * 4
 }
 
+// ── Receive Side Scaling (RSS) ──────────────────────────────────────
+//
+// Linux `igb_setup_mrqc` + `igb_write_rss_key` +
+// `igb_write_rss_indir_tbl` (igb_main.c / igb_ethtool.c). The 40-byte
+// RSS key feeds RSSRK, the 128-entry indirection table feeds RETA
+// (32 registers × 4 one-byte queue entries, little-endian packed),
+// and MRQC selects the hash fields and the queueing mode. Live
+// bring-up does not program MRQC yet: it stays queue-0-only, and
+// programming RXCSUM.PCSD would repurpose the RX descriptor's lower
+// word from checksum to hash — that switch belongs to the
+// multi-queue activation step, not to a single-queue bring-up.
+
+/// MRQC — Multiple Receive Queue Control.
+const REG_MRQC: u64 = 0x5818;
+/// RXCSUM — Receive Checksum Control.
+const REG_RXCSUM: u64 = 0x5000;
+/// RETA base — RSS indirection table, 32 registers.
+const REG_RETA_BASE: u64 = 0x5C00;
+/// RSSRK base — RSS random key, 10 registers.
+const REG_RSSRK_BASE: u64 = 0x5C80;
+
+/// RETA entries (Linux IGB_RETA_SIZE = 128).
+pub const RETA_SIZE: usize = 128;
+/// RSS key bytes (Linux IGB_RSS_KEY_SIZE = 40).
+pub const RSS_KEY_SIZE: usize = 40;
+/// RETA registers (128 entries / 4 per register).
+pub const RETA_REGS: usize = 32;
+
+/// MRQC hash-field bits (Linux e1000_defines.h / e1000_82575.h).
+pub const MRQC_FIELD_IPV4_TCP: u32 = 0x0001_0000;
+pub const MRQC_FIELD_IPV4: u32 = 0x0002_0000;
+pub const MRQC_FIELD_IPV6_TCP_EX: u32 = 0x0004_0000;
+pub const MRQC_FIELD_IPV6: u32 = 0x0010_0000;
+pub const MRQC_FIELD_IPV6_TCP: u32 = 0x0020_0000;
+pub const MRQC_FIELD_IPV4_UDP: u32 = 0x0040_0000;
+pub const MRQC_FIELD_IPV6_UDP: u32 = 0x0080_0000;
+pub const MRQC_FIELD_IPV6_UDP_EX: u32 = 0x0100_0000;
+/// MRQC queueing modes.
+pub const MRQC_ENABLE_RSS_MQ: u32 = 0x0000_0002;
+pub const MRQC_ENABLE_VMDQ: u32 = 0x0000_0003;
+pub const MRQC_ENABLE_VMDQ_RSS_MQ: u32 = 0x0000_0005;
+/// RXCSUM bits Linux sets alongside MRQC: PCSD puts the RSS hash (not
+/// the packet checksum) in the RX descriptor's lower word; CRCOFL
+/// enables SCTP CRC offload (all NARF-claimed ids are >= 82576).
+pub const RXCSUM_PCSD: u32 = 0x0000_2000;
+pub const RXCSUM_CRCOFL: u32 = 0x0000_0800;
+
+/// RETA register for indirection-table word `i` (0..32).
+pub const fn reta_reg(i: usize) -> u64 {
+    REG_RETA_BASE + i as u64 * 4
+}
+
+/// RSSRK register for key word `i` (0..10).
+pub const fn rssrk_reg(i: usize) -> u64 {
+    REG_RSSRK_BASE + i as u64 * 4
+}
+
+/// Default RETA entry for `index`: Linux's `(j * num_rx_queues) /
+/// IGB_RETA_SIZE` spread, so a 4-queue table cycles 0,0,..1,1,.. and
+/// an 8-queue table cycles twice as fast. Every queue gets an equal
+/// share of the 128 slots.
+pub const fn reta_entry(queue_count: usize, index: usize) -> u8 {
+    ((index * queue_count) / RETA_SIZE) as u8
+}
+
+/// Default RETA table for `queue_count` queues.
+pub const fn reta_table(queue_count: usize) -> [u8; RETA_SIZE] {
+    let mut table = [0u8; RETA_SIZE];
+    let mut i = 0;
+    while i < RETA_SIZE {
+        table[i] = reta_entry(queue_count, i);
+        i += 1;
+    }
+    table
+}
+
+/// Pack four RETA entries into one register word, little-endian
+/// (entry `i` at byte `i`), as Linux's `igb_write_rss_indir_tbl`
+/// does before the shift below.
+pub const fn reta_word(entries: [u8; 4]) -> u32 {
+    entries[0] as u32
+        | ((entries[1] as u32) << 8)
+        | ((entries[2] as u32) << 16)
+        | ((entries[3] as u32) << 24)
+}
+
+/// RETA value shift for a device: 0, except 82576 with VFs allocated,
+/// where Linux shifts by 3 (the 82575 shift of 6 belongs to a silicon
+/// generation NARF claims no id for and is deliberately not encoded).
+pub fn reta_shift(device_id: u16, vfs_allocated: u16) -> u32 {
+    match device_id {
+        IGB_82576 | IGB_82576_NS if vfs_allocated > 0 => 3,
+        _ => 0,
+    }
+}
+
+/// One RSSRK word from a 40-byte key: little-endian, key bytes
+/// `[4*i .. 4*i+4]` (Linux `get_unaligned_le32(&rss_key[i * 4])`).
+pub const fn rss_key_word(key: &[u8; RSS_KEY_SIZE], i: usize) -> u32 {
+    (key[i * 4] as u32)
+        | ((key[i * 4 + 1] as u32) << 8)
+        | ((key[i * 4 + 2] as u32) << 16)
+        | ((key[i * 4 + 3] as u32) << 24)
+}
+
+/// MRQC word: the fixed hash fields Linux always enables (IPv4,
+/// IPv4/TCP, IPv6, IPv6/TCP, IPv6/TCP-extended), optional UDP fields,
+/// and the queueing mode — RSS multi-queue without VMDq, VMDq+RSS
+/// when VMDq is active with more than one RSS queue, plain VMDq
+/// otherwise.
+pub const fn mrqc_word(udp_v4: bool, udp_v6: bool, vmdq: bool, rss_queues: usize) -> u32 {
+    let mut word = MRQC_FIELD_IPV4
+        | MRQC_FIELD_IPV4_TCP
+        | MRQC_FIELD_IPV6
+        | MRQC_FIELD_IPV6_TCP
+        | MRQC_FIELD_IPV6_TCP_EX;
+    if udp_v4 {
+        word |= MRQC_FIELD_IPV4_UDP;
+    }
+    if udp_v6 {
+        word |= MRQC_FIELD_IPV6_UDP;
+    }
+    word |= if !vmdq {
+        MRQC_ENABLE_RSS_MQ
+    } else if rss_queues > 1 {
+        MRQC_ENABLE_VMDQ_RSS_MQ
+    } else {
+        MRQC_ENABLE_VMDQ
+    };
+    word
+}
+
+/// RXCSUM word for RSS operation: PCSD + CRCOFL over whatever the
+/// caller already programmed.
+pub const fn rxcsum_rss_word(current: u32) -> u32 {
+    current | RXCSUM_PCSD | RXCSUM_CRCOFL
+}
+
+/// RX queue selected by an RSS hash through a RETA table: the low 7
+/// hash bits index the 128-entry table.
+pub fn rss_queue_for_hash(hash: u32, reta: &[u8; RETA_SIZE]) -> u8 {
+    reta[(hash & 0x7F) as usize]
+}
+
 // CTRL bits.
 const CTRL_RST: u32 = 1 << 26;
 const CTRL_SLU: u32 = 1 << 6;
@@ -700,6 +844,15 @@ impl TxRingCursor {
 // ── Descriptor offload impl blocks ──────────────────────────────────
 
 impl AdvRxDescWb {
+    /// RSS hash for this frame: once RXCSUM.PCSD is set (see
+    /// [`rxcsum_rss_word`]), the descriptor's lower word carries the
+    /// RSS hash instead of the packet checksum. Only meaningful for
+    /// descriptors written back after MRQC programming.
+    #[allow(dead_code)]
+    pub fn rss_hash(&self) -> u32 {
+        self.lower as u32
+    }
+
     /// Decode the RX checksum result from `status_error`.
     #[allow(dead_code)]
     pub fn csum_result(&self) -> RxCsumResult {
@@ -1762,16 +1915,21 @@ mod tests {
 
     use super::{
         eitr_reg, ivar0_shared_vector, ivar_apply, ivar_misc_shared_vector, ivar_rx,
-        ivar_scheme_for_device, ivar_tx, max_queues_for_device, previous_rx_slot,
+        ivar_scheme_for_device, ivar_tx, max_queues_for_device, mrqc_word, previous_rx_slot,
         queue_disable_word, queue_enable_reflected, queue_enable_word, queue_pairs, queue_regs,
-        rxdctl_word, txdctl_word, AdvRxDescRead, AdvRxDescWb, AdvTxDataDesc, IvarScheme,
-        TxRingCursor, EITR_CNT_IGNR, EITR_START, IGB_82576, IGB_82576_NS, IGB_I210_COPPER,
-        IGB_I211_COPPER, IGB_I350_COPPER, IGB_MAX_QUEUES, IGB_MAX_QUEUES_82575,
-        IGB_MAX_QUEUES_I211, IVAR_VALID, QUEUE_ENABLE, REG_EIAC, REG_EIAM, REG_EIMC, REG_EIMS,
-        REG_EITR0, REG_ICR, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC, REG_RDBAH, REG_RDBAL,
-        REG_RDH, REG_RDLEN, REG_RDT, REG_RXDCTL0, REG_SRRCTL_Q0, REG_TDBAH, REG_TDBAL, REG_TDH,
-        REG_TDLEN, REG_TDT, REG_TXDCTL0, RX_RING_LEN, SRRCTL_DESCTYPE_ADV_ONEBUF, TX_RING_LEN,
-        TX_RING_USABLE,
+        reta_entry, reta_reg, reta_shift, reta_table, reta_word, rss_key_word, rss_queue_for_hash,
+        rssrk_reg, rxcsum_rss_word, rxdctl_word, txdctl_word, AdvRxDescRead, AdvRxDescWb,
+        AdvTxDataDesc, IvarScheme, TxRingCursor, EITR_CNT_IGNR, EITR_START, IGB_82576,
+        IGB_82576_NS, IGB_I210_COPPER, IGB_I211_COPPER, IGB_I350_COPPER, IGB_MAX_QUEUES,
+        IGB_MAX_QUEUES_82575, IGB_MAX_QUEUES_I211, IVAR_VALID, MRQC_ENABLE_RSS_MQ,
+        MRQC_ENABLE_VMDQ, MRQC_ENABLE_VMDQ_RSS_MQ, MRQC_FIELD_IPV4, MRQC_FIELD_IPV4_TCP,
+        MRQC_FIELD_IPV4_UDP, MRQC_FIELD_IPV6, MRQC_FIELD_IPV6_TCP, MRQC_FIELD_IPV6_TCP_EX,
+        MRQC_FIELD_IPV6_UDP, QUEUE_ENABLE, REG_EIAC, REG_EIAM, REG_EIMC, REG_EIMS, REG_EITR0,
+        REG_ICR, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC, REG_MRQC, REG_RDBAH, REG_RDBAL,
+        REG_RDH, REG_RDLEN, REG_RDT, REG_RETA_BASE, REG_RSSRK_BASE, REG_RXCSUM, REG_RXDCTL0,
+        REG_SRRCTL_Q0, REG_TDBAH, REG_TDBAL, REG_TDH, REG_TDLEN, REG_TDT, REG_TXDCTL0, RETA_REGS,
+        RETA_SIZE, RSS_KEY_SIZE, RXCSUM_CRCOFL, RXCSUM_PCSD, RX_RING_LEN,
+        SRRCTL_DESCTYPE_ADV_ONEBUF, TX_RING_LEN, TX_RING_USABLE,
     };
 
     fn smoke_igb_extended_interrupt_layout() -> TestResult {
@@ -2084,4 +2242,117 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/igb", smoke_igb_ivar_routing);
+
+    fn smoke_igb_rss_table_and_key() -> TestResult {
+        if RETA_SIZE != 128 || RSS_KEY_SIZE != 40 || RETA_REGS != 32 {
+            return TestResult::Fail("igb RETA/key size drift");
+        }
+        if REG_MRQC != 0x5818
+            || REG_RXCSUM != 0x5000
+            || REG_RETA_BASE != 0x5C00
+            || REG_RSSRK_BASE != 0x5C80
+        {
+            return TestResult::Fail("igb MRQC/RXCSUM/RETA/RSSRK base drift");
+        }
+        if reta_reg(0) != 0x5C00
+            || reta_reg(31) != 0x5C7C
+            || rssrk_reg(0) != 0x5C80
+            || rssrk_reg(9) != 0x5CA4
+        {
+            return TestResult::Fail("igb RETA/RSSRK register stride drift");
+        }
+        // Default spread: 4 queues cycle every 32 slots, 8 queues
+        // every 16; the last slot always lands on the last queue.
+        if reta_entry(4, 0) != 0
+            || reta_entry(4, 31) != 0
+            || reta_entry(4, 32) != 1
+            || reta_entry(4, 127) != 3
+            || reta_entry(8, 15) != 0
+            || reta_entry(8, 16) != 1
+            || reta_entry(8, 127) != 7
+        {
+            return TestResult::Fail("igb RETA default spread drift");
+        }
+        // Fake RETA register file: program the 4-queue table through
+        // reta_word, then read the entries back out of the words.
+        let table = reta_table(4);
+        let mut regs = [0u32; RETA_REGS];
+        for (i, reg) in regs.iter_mut().enumerate() {
+            let base = i * 4;
+            *reg = reta_word([
+                table[base],
+                table[base + 1],
+                table[base + 2],
+                table[base + 3],
+            ]);
+        }
+        for (i, entry) in table.iter().enumerate() {
+            let back = ((regs[i / 4] >> ((i % 4) * 8)) & 0xFF) as u8;
+            if back != *entry {
+                return TestResult::Fail("igb RETA register round-trip drift");
+            }
+        }
+        // RSS key words are little-endian slices of the 40-byte key.
+        let mut key = [0u8; RSS_KEY_SIZE];
+        for (i, byte) in key.iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        if rss_key_word(&key, 0) != 0x0302_0100 || rss_key_word(&key, 9) != 0x2726_2524 {
+            return TestResult::Fail("igb RSS key word packing drift");
+        }
+        // RETA shift: 0 normally, 3 for 82576 with VFs.
+        if reta_shift(IGB_I350_COPPER, 0) != 0
+            || reta_shift(IGB_82576, 0) != 0
+            || reta_shift(IGB_82576_NS, 2) != 3
+        {
+            return TestResult::Fail("igb RETA shift drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_rss_table_and_key);
+
+    fn smoke_igb_rss_mrqc_and_hash() -> TestResult {
+        let base = MRQC_FIELD_IPV4
+            | MRQC_FIELD_IPV4_TCP
+            | MRQC_FIELD_IPV6
+            | MRQC_FIELD_IPV6_TCP
+            | MRQC_FIELD_IPV6_TCP_EX;
+        if mrqc_word(false, false, false, 1) != base | MRQC_ENABLE_RSS_MQ {
+            return TestResult::Fail("igb MRQC single-queue RSS word drift");
+        }
+        if mrqc_word(true, true, false, 8)
+            != base | MRQC_FIELD_IPV4_UDP | MRQC_FIELD_IPV6_UDP | MRQC_ENABLE_RSS_MQ
+        {
+            return TestResult::Fail("igb MRQC UDP-field word drift");
+        }
+        if mrqc_word(false, false, true, 4) != base | MRQC_ENABLE_VMDQ_RSS_MQ
+            || mrqc_word(false, false, true, 1) != base | MRQC_ENABLE_VMDQ
+        {
+            return TestResult::Fail("igb MRQC VMDq mode word drift");
+        }
+        if rxcsum_rss_word(0) != RXCSUM_PCSD | RXCSUM_CRCOFL || rxcsum_rss_word(0x100) & 0x100 == 0
+        {
+            return TestResult::Fail("igb RXCSUM RSS word drift");
+        }
+        // Hash steering: low 7 hash bits index RETA; a descriptor's
+        // lower word is the hash once PCSD is set.
+        let table = reta_table(4);
+        let wb = AdvRxDescWb {
+            lower: 0xDEAD_BEEF,
+            status_error: 0,
+            length: 0,
+            vlan: 0,
+        };
+        if wb.rss_hash() != 0xDEAD_BEEF {
+            return TestResult::Fail("igb RX descriptor RSS hash decode drift");
+        }
+        if rss_queue_for_hash(0xDEAD_BEEF, &table) != table[(0x6F) as usize] {
+            return TestResult::Fail("igb RSS hash-to-queue steering drift");
+        }
+        if rss_queue_for_hash(0, &table) != 0 || rss_queue_for_hash(127, &table) != 3 {
+            return TestResult::Fail("igb RSS hash boundary steering drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_rss_mrqc_and_hash);
 }
