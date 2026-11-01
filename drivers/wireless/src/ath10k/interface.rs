@@ -17,6 +17,8 @@ use narf_wireless::{
 };
 type Error = wmi_runtime::Error;
 use wmi_runtime::receive_permission;
+#[path = "interface_offchannel.rs"]
+mod offchannel;
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 enum Policy {
     Installed,
@@ -59,11 +61,13 @@ pub(super) struct RadioFeatures {
     ht: Option<[u8; 26]>,
     ht40: Option<[u8; 26]>,
     vht: Option<[u8; 12]>,
+    offchannel_tx: bool,
 }
 impl RadioFeatures {
     fn observed<T: Hif + HostMemory + HttMemory>(radio: &Radio<T>) -> Self {
         Self {
             power_save: radio.power_save_supported(),
+            offchannel_tx: radio.offchannel_action_supported(),
             ht: radio.ht_capabilities(),
             ht40: radio.ht40_capabilities(),
             vht: radio.vht_capabilities(),
@@ -86,6 +90,9 @@ pub(super) struct Device<T: Hif + HostMemory + HttMemory> {
     name: String,
     generation: u64,
     ps_supported: bool,
+    offchannel_tx: bool,
+    radio_control: Arc<narf_wireless::ap_control::ExclusiveControl>,
+    management_subscriptions: Arc<wmi_runtime::offchannel::Subscriptions>,
     ht_capabilities: Option<[u8; 26]>,
     ht40_capabilities: Option<[u8; 26]>,
     vht_capabilities: Option<[u8; 12]>,
@@ -131,6 +138,7 @@ impl Drop for Attempt<'_> {
 }
 impl<T: Hif + HostMemory + HttMemory + Send + 'static> HostClose for Device<T> {
     fn close(&self) {
+        self.management_subscriptions.invalidate();
         {
             let _publication = self.publication.lock();
             self.closed.store(true, Ordering::Release);
@@ -161,6 +169,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             .map(|radio| RadioFeatures::observed(&radio))
             .unwrap_or(RadioFeatures {
                 power_save: false,
+                offchannel_tx: false,
                 ht: None,
                 ht40: None,
                 vht: None,
@@ -197,6 +206,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             }),
             name: name.into(),
             ps_supported: features.power_save,
+            offchannel_tx: features.offchannel_tx,
+            radio_control: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
+            management_subscriptions: Arc::new(wmi_runtime::offchannel::Subscriptions::new()),
             ht_capabilities: features.ht,
             ht40_capabilities: features.ht40,
             vht_capabilities: features.vht,
@@ -223,6 +235,15 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             tx: IrqSafeSpinLock::new(Some(producer)),
             wake: IrqSafeSpinLock::new(None),
         }
+    }
+    pub(super) fn reserve_control(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        if self.closed.load(Ordering::Acquire) || self.retired.load(Ordering::Acquire) {
+            return Err(WirelessError::HardwareError);
+        }
+        self.radio_control.try_reserve().map(Some)
     }
     /// Kick the service worker (host TX / power-save request).
     fn kick(&self) {
@@ -362,10 +383,25 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         })
     }
     #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn management_subscriptions_for_test(
+        &self,
+    ) -> Arc<wmi_runtime::offchannel::Subscriptions> {
+        self.management_subscriptions.clone()
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn radio_generation_for_test(&self) -> Option<core::num::NonZeroU64> {
+        if self.closed.load(Ordering::Acquire) || self.retired.load(Ordering::Acquire) {
+            None
+        } else {
+            core::num::NonZeroU64::new(self.generation)
+        }
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn generation_for_test(&self) -> u64 {
         self.generation
     }
     pub(super) fn retire_host(&self) {
+        self.management_subscriptions.invalidate();
         {
             let _publication = self.publication.lock();
             if self.retired.load(Ordering::Acquire) {
@@ -413,6 +449,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         let Some(mut radio) = self.radio.try_lock() else {
             return Ok(());
         };
+        if radio.roc_active() {
+            return Ok(());
+        }
         let mut attempt = Attempt {
             device: self,
             armed: true,
@@ -515,7 +554,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 state.clear();
                 return None;
             }
-            if !radio.has_station_data() {
+            if radio.roc_active() || !radio.has_station_data() {
                 return None;
             }
             (|| {
@@ -717,6 +756,9 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             return Err(WirelessError::NotSupported);
         }
         let mut radio = self.radio.lock().await;
+        if radio.roc_active() {
+            return Err(WirelessError::Busy);
+        }
         if radio.prepared_peer().is_some() && radio.station_link().is_none() {
             return Err(WirelessError::Busy);
         }
@@ -876,11 +918,14 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
             ),
             _ => return Err(WirelessError::NotSupported),
         };
+        let mut radio = self.radio.lock().await;
+        if radio.roc_active() {
+            return Err(WirelessError::Busy);
+        }
         let mut attempt = Attempt {
             device: self,
             armed: true,
         };
-        let mut radio = self.radio.lock().await;
         self.state.lock().await.clear();
         if self.closed.load(Ordering::Acquire) {
             return Err(WirelessError::HardwareError);
@@ -1201,6 +1246,10 @@ fn publish_with_mac(
         // a drain made progress (Linux `napi_schedule` when work remains).
         narf_scheduler::spawn(async move {
             loop {
+                if worker.service_offchannel().await.is_err() {
+                    super::pci::scan_cleanup_failed(worker.radio.clone());
+                    break;
+                }
                 if worker.closed.load(Ordering::Acquire) {
                     if worker.cleanup_failed_scan().await.is_err() {
                         super::pci::scan_cleanup_failed(worker.radio.clone());
@@ -1311,6 +1360,68 @@ pub(super) async fn wait_publish(
 }
 #[async_trait::async_trait]
 impl WirelessNetIface for Native {
+    fn radio_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        if self.closed.load(Ordering::Acquire) || self.retired.load(Ordering::Acquire) {
+            None
+        } else {
+            core::num::NonZeroU64::new(self.generation)
+        }
+    }
+    fn reserve_radio_control(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        self.reserve_control()
+    }
+    fn async_roc_control(&self) -> bool {
+        true
+    }
+    fn max_remain_on_channel_duration_ms(&self) -> u32 {
+        wmi_runtime::offchannel::MAX_DURATION
+    }
+    fn supports_offchannel_mgmt_tx(&self) -> bool {
+        self.offchannel_tx
+    }
+    fn async_radio_management_tx_control(&self) -> bool {
+        self.offchannel_tx
+    }
+    fn async_radio_management_rx_control(&self) -> bool {
+        true
+    }
+    async fn register_mgmt_frame_radio_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        frame_type: u16,
+        prefix: &[u8],
+    ) -> Result<(), i32> {
+        self.register_offchannel_frame(authority, frame_type, prefix)
+            .await
+    }
+    async fn remain_on_channel_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        cookie: u64,
+        frequency: u32,
+        duration: u32,
+    ) -> Result<(), WirelessError> {
+        self.start_offchannel(authority, cookie, frequency, duration)
+            .await
+    }
+    async fn cancel_remain_on_channel_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        cookie: u64,
+    ) -> Result<(), WirelessError> {
+        self.cancel_offchannel(authority, cookie).await
+    }
+    async fn mgmt_tx_radio_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        cookie: u64,
+        request: narf_wireless::MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        self.transmit_offchannel(authority, cookie, request).await
+    }
     fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
         Device::phy_capabilities(self, band)
     }

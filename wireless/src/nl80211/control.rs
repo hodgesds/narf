@@ -2976,6 +2976,12 @@ fn mlme_handle(
         })
         .ok_or(ENODEV)?;
     let admin = authority(&context, iface.as_ref())?;
+    if command == FRAME && iface.async_radio_management_tx_control() {
+        return p2p_async::frame(bytes, context, deferred);
+    }
+    if command == REGISTER_FRAME && iface.async_radio_management_rx_control() {
+        return p2p_async::register_frame(bytes, context, deferred);
+    }
     let ns = context.net_ns_id;
     if matches!(
         command,

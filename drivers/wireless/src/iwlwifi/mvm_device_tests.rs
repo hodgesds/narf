@@ -8,6 +8,8 @@ use narf_wifi_fixtures::{udp_ipv4, DhcpServer, FakeAp, NetworkPlan};
 use narf_wireless::reg::{db::Database, RegFlags, RegRule};
 #[path = "mvm_active_scan_tests.rs"]
 mod active_scan_tests;
+#[path = "mvm_ap_device_tests.rs"]
+mod ap_tests;
 #[path = "mvm_he_tests.rs"]
 mod he_tests;
 #[path = "mvm_rx_multi_tests.rs"]
@@ -146,6 +148,7 @@ fn ht_ies() -> Vec<u8> {
     out
 }
 struct Actor {
+    native_ap: Option<Box<ap_tests::Model>>,
     pno: Option<Box<scheduled_tests::Model>>,
     multi_receive: bool,
     rx_configuration: Vec<rx_multi_tests::Receipt>,
@@ -235,6 +238,7 @@ impl Actor {
             (1, 0x9f) if b[0] == 2 => Some(10),
             (1, 0x9f) if b[0] == 1 => Some(11),
             (1, 0xd) => Some(12),
+            (1, 0x91) => Some(15),
             (5, 0x16) if b[0] == 0 => Some(1),
             (5, 0x16) if b[0] == 2 => Some(5),
             (2, 0) | (1, 0x25) => Some(13),
@@ -393,6 +397,17 @@ impl Actor {
             let s = u16::from_le_bytes([p.bytes[2], p.bytes[3]]);
             let b = &p.bytes[8..];
             self.commands.push((g, c, b.to_vec()));
+            if let Some(ap) = &mut self.native_ap {
+                if let Some(body) = ap.command(g, c, b)? {
+                    if (g, c) == (5, 2) {
+                        let mut marker = vec![8, 0, 0, 0, 0, 0, 1, 0];
+                        marker.extend_from_slice(&b[16..20]);
+                        self.inject(0xff, 5, 0x8000, &marker);
+                    }
+                    self.reply(c, if g == 1 && c == 0x18 { 0 } else { g }, s, body);
+                    return Ok(());
+                }
+            }
             if self.pno.is_some() && self.scheduled_command(g, c, s, b)? {
                 return Ok(());
             }
@@ -443,6 +458,9 @@ impl Actor {
                         return Err("MVM configure NVM body");
                     }
                     let mut nvm = nvm();
+                    if self.native_ap.is_some() {
+                        nvm[20] = 1; // actual NVM LAR, not an AP-role boolean
+                    }
                     if self.ht {
                         nvm[8] = 4;
                     }
@@ -811,6 +829,9 @@ impl Actor {
             self.reply(c, if g == 1 && c == 0x18 { 0 } else { g }, s, body);
             return Ok(());
         }
+        if let Some(ap) = &mut self.native_ap {
+            return ap.transmit(&p, &mut self.firmware);
+        }
         if !(matches!(p.queue, 23 | 24) || self.qos_tids && (25..32).contains(&p.queue))
             || p.bytes.len() < 48
         {
@@ -1002,6 +1023,8 @@ struct Harness {
     scan_power: Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
     available: Arc<AtomicBool>,
     clock: Arc<AtomicU64>,
+    ap_power:
+        Arc<IrqSafeSpinLock<Option<Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>>>>,
 }
 type Endpoint = (Arc<Device>, Arc<IrqSafeSpinLock<Actor>>);
 static CURRENT: IrqSafeSpinLock<Option<Endpoint>> = IrqSafeSpinLock::new(None);
@@ -1246,6 +1269,9 @@ impl Harness {
                 entry[2] = tlc_version;
             }
         }
+        if emission == 7 {
+            ap_tests::profile(&mut image, &mut versions)?;
+        }
         tlv(&mut image, 48, &versions);
         if let Some(model) = &pno {
             let flags = 0xfbfb4b7fu32 | if model.profile.short { 1 << 7 } else { 0 };
@@ -1264,11 +1290,15 @@ impl Harness {
         let executable = asset("narf-test/mvm-interface/executable", &image, true)?;
         let parsed = super::super::parse_ucode(&executable.bytes).unwrap();
         let (mut hardware, firmware, trace) = model::station_model_for_format(CompletionFormat::Qu);
+        if emission == 7 {
+            model::native_station_identity(&mut hardware, 0xa0f0, 0x351, 0x10c000)?;
+        }
         model::firmware_profile(&mut hardware, &parsed)?;
         let mut owner = Owner::model_after_alive(hardware, &executable.bytes);
         let mut security = super::super::mvm_boot::SecurityModel::new(3)?;
         security.ap = ap(protected)?;
         let mut actor = Actor {
+            native_ap: (emission == 7).then(|| Box::new(ap_tests::Model::new())),
             pno: pno.map(Box::new),
             multi_receive,
             rx_configuration: Vec::new(),
@@ -1363,7 +1393,22 @@ impl Harness {
         let scan_staged = available.clone();
         let clock = Arc::new(AtomicU64::new(narf_time::now_cycles()));
         let observation_clock = clock.clone();
+        let ap_power = Arc::new(IrqSafeSpinLock::new(None));
+        let ap_cap = ap_power.clone();
+        let ap_staged = available.clone();
         let environment = Environment {
+            ap_power: Arc::new(move |request| {
+                if emission != 7 || !ap_staged.load(Ordering::Acquire) {
+                    return Err("fixture has no staged tag7 AP source");
+                }
+                let mut bytes = power();
+                bytes[8..40].copy_from_slice(&request.binding);
+                bytes[46] = 7;
+                let signed = asset("narf-test/mvm-interface/ap-power", &bytes, true)?;
+                *ap_cap.lock() = Some(signed.cap);
+                Ok(signed)
+            }),
+            ap_policy: super::super::mld_policy::Source::database(db.clone()),
             scan_power: Arc::new(move |_, _| {
                 if !scan_staged.load(Ordering::Acquire) {
                     return Err("fixture measured scan power asset not staged");
@@ -1438,6 +1483,7 @@ impl Harness {
             scan_power: scan_cap,
             available,
             clock,
+            ap_power,
         })
     }
     fn scan(&self) -> Result<(), &'static str> {

@@ -373,13 +373,24 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
         if id > u32::from(u16::MAX) || status > 2 {
             return Err(Error::Malformed);
         }
+        if self.tx_receipts.len() >= usize::from(self.config.pending) {
+            return Err(Error::Busy);
+        }
+        self.tx_receipts
+            .try_reserve(1)
+            .map_err(|_| Error::NoMemory)?;
         self.wmi.htc.transport.complete_htt_tx(&[id as u16], true)?;
-        self.failed = false;
-        Ok(match status {
+        let status = match status {
             0 => 0,
             1 => 2,
             _ => 1,
-        })
+        };
+        self.tx_receipts.push_back(TxReceipt {
+            id: id as u16,
+            status,
+        });
+        self.failed = false;
+        Ok(status)
     }
     pub fn complete_tx(&mut self, bytes: &[u8]) -> Result<u8, Error> {
         if self.failed || self.ready.is_none() {
@@ -401,6 +412,52 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
     }
     pub fn take_tx_receipt(&mut self) -> Option<TxReceipt> {
         self.tx_receipts.pop_front()
+    }
+    pub fn take_tx_receipt_for(&mut self, id: u16) -> Option<TxReceipt> {
+        let at = self.tx_receipts.iter().position(|r| r.id == id)?;
+        self.tx_receipts.remove(at)
+    }
+    // mac.c::ath10k_mac_tx_frm_has_freq: the actual negotiated version and
+    // TLV HTT dialect qualify this field, never PCI identity alone.
+    pub fn offchannel_frequency_field(&self) -> bool {
+        self.config.dialect == 3 && self.ready.is_some_and(|r| r.major >= 3 && r.minor >= 4)
+    }
+    pub fn prepare_offchannel(
+        &mut self,
+        parameters: tx::Parameters,
+        bytes: &[u8],
+        frequency: u16,
+    ) -> Result<(u16, Vec<u8>), Error> {
+        if self.failed
+            || self.ready.is_none()
+            || parameters.kind != tx::Kind::Management
+            || frequency == 0
+        {
+            return Err(Error::Failed);
+        }
+        let (id, mut body) =
+            self.wmi
+                .htc
+                .transport
+                .prepare_htt_tx(self.config, parameters, bytes)?;
+        if self.offchannel_frequency_field() {
+            // v3 TX_FRM peerid/freq union; old MGMT_TX has no frequency field.
+            if self.config.major < 3 || body.len() < 16 {
+                return Err(Error::Malformed);
+            }
+            body[12..14].copy_from_slice(&u16::MAX.to_le_bytes());
+            body[14..16].copy_from_slice(&frequency.to_le_bytes());
+        }
+        Ok((id, body))
+    }
+    pub async fn submit_prepared(&mut self, body: &[u8]) -> Result<(), Error> {
+        if self.failed || self.ready.is_none() {
+            return Err(Error::Failed);
+        }
+        self.failed = true;
+        self.wmi.htc.send_htt(body).await?;
+        self.failed = false;
+        Ok(())
     }
     pub fn data_profile(&self) -> bool {
         self.wmi.raw_mode() && !self.config.pfc

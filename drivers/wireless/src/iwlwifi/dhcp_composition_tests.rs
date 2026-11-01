@@ -33,6 +33,9 @@ mod rx_multi_tests;
 #[path = "sc_tx_amsdu_tests.rs"]
 mod tx_amsdu_tests;
 
+#[cfg(feature = "kernel-test")]
+#[path = "ap_native_tests.rs"]
+mod ap_native_tests;
 #[path = "gen3_station_tests.rs"]
 mod gen3_station_tests;
 #[cfg(feature = "kernel-test")]
@@ -141,6 +144,7 @@ enum ReceiveModel {
     ExplicitV1,
     NativeSc,
     Unsupported,
+    Ap,
 }
 impl From<bool> for ReceiveModel {
     fn from(enabled: bool) -> Self {
@@ -158,6 +162,9 @@ impl ReceiveModel {
             Self::ExplicitV1 => versions.extend_from_slice(&[0x0d, 5, 1, 0, 0xb3, 1, 1, 0]),
             Self::NativeSc => versions.extend_from_slice(&[0x0d, 5, 2, 0]),
             Self::Unsupported => versions.extend_from_slice(&[0x0d, 5, 3, 0]),
+            // Exact installed Sc core103 beacon14/flush2 contracts. These
+            // additional commands neither invent RX capability nor a role.
+            Self::Ap => versions.extend_from_slice(&[0x91, 1, 14, 0, 0x1e, 1, 2, 1]),
         }
     }
     fn capability(self, image: &mut Vec<u8>) {
@@ -232,6 +239,7 @@ struct Wire {
     mld: Option<mlo_tests::Model>,
     mld_m3: Option<Vec<u8>>,
     mld_tx: mlo_tests::TxState,
+    native_ap: Option<ap_native_tests::Model>,
 }
 
 // SAFETY: no real device or thread accesses these fixture pointers. The sole
@@ -332,6 +340,22 @@ impl Wire {
         )?;
         let body = &bytes[8..];
         self.commands.push((group, cmd, body.to_vec()));
+        if let Some(ap) = &mut self.native_ap {
+            if let Some(response) = ap.command(group, cmd, version, body)? {
+                if ap.hold == Some((group, cmd)) {
+                    ap.held = Some(response);
+                    self.held = Some((cmd, if group == 1 { 0 } else { group }, sequence));
+                } else {
+                    self.firmware.inject(
+                        cmd,
+                        if group == 1 { 0 } else { group },
+                        sequence,
+                        &response,
+                    );
+                }
+                return Ok(());
+            }
+        }
         let mut response = Vec::new();
         match (group, cmd) {
             (1, 0x25) | (2, 0) if self.tx_model.is_some() => {
@@ -936,6 +960,9 @@ impl Wire {
     }
 
     fn transmit(&mut self, p: Published) -> R {
+        if let Some(ap) = &mut self.native_ap {
+            return ap.transmit(&p, &mut self.firmware);
+        }
         require(
             self.queues
                 .iter()
@@ -1711,6 +1738,7 @@ impl Guard {
             mld: None,
             mld_m3: None,
             mld_tx: mlo_tests::TxState::default(),
+            native_ap: matches!(receive_model, ReceiveModel::Ap).then(ap_native_tests::Model::new),
         });
         let configured = run(Device::configure(&mut hardware, OWN), || wire.service());
         let nvm = match configured {
@@ -1730,10 +1758,13 @@ impl Guard {
             scheduled: None,
             beacons: Vec::new(),
             connection: None,
+            ap: None,
+            ap_probes: VecDeque::new(),
             needs_reset: false,
             stop_completed: false,
             producer: Some(rx_producer),
             receive_ipc: None,
+            receive_ap_data: None,
             eapol: VecDeque::new(),
             tx: core::array::from_fn(|_| None),
             pending: core::array::from_fn(|_| None),
@@ -1746,6 +1777,7 @@ impl Guard {
             IrqSafeSpinLock::new(Some(producer))
         });
         let source = state.hardware.source_fence()?;
+        let ap_capable = super::super::ap_session::supported(&state.hardware);
         let policy_db = Arc::new(narf_wireless::reg::db::Database::new());
         policy_db.install(if six.is_some() {
             six_ghz_tests::policy()
@@ -1761,6 +1793,10 @@ impl Guard {
             me: me.clone(),
             radio_control: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
             scan_generation: Arc::new(super::super::scheduled_epoch::Epoch::new()),
+            mode: AtomicU32::new(2),
+            mode_generation: AtomicU64::new(1),
+            ap_capable,
+            ap_host: ap::Host::new(),
             state: Mutex::new(state),
             control: Mutex::new(None),
             publication: AtomicBool::new(true),

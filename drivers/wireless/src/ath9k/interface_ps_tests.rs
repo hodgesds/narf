@@ -44,6 +44,13 @@ fn prepared(protected: bool, sender: bool) -> (Harness, Cap<FirmwareBlob, Read>)
 fn enable(h: &Harness) {
     setting(h, true).unwrap();
     h.pump();
+    assert!(
+        h.device.link_up()
+            && h.model.ps_bound.get()
+            && !h.model.ps_sleeping.get()
+            && h.model.registers.borrow().get(&0x24) == Some(&1),
+        "initial current S1 IRQ binding closed the owner before its first TIM"
+    );
     beacon(h, 102400, false, false);
     h.pump();
 }
@@ -55,6 +62,16 @@ fn smoke_ar9285_station_ps_signed_source_and_public_default_fail_closed() -> Tes
         return TestResult::Fail("unqualified PS advertised or set");
     }
     let base = h.model.ht.borrow().clone().unwrap();
+    // Provisioning S alone cannot authorize the S1 IRQ program. Before
+    // actual bind, the original HT readback must still reject IER1.
+    let _source = ps::tests::qualify(&h.model);
+    let unbound = crate::ath9k::packet::Port::station_ps_current(&h.model);
+    h.model.registers.borrow_mut().insert(0x24, 1);
+    let refused = base.readback(&h.model).is_err();
+    h.model.registers.borrow_mut().insert(0x24, 0);
+    if unbound != Ok(false) || !refused {
+        return TestResult::Fail("unbound S asset bypassed the original HT IER0 invariant");
+    }
     let good = ps::tests::record(&base);
     if ps::request(&base).identity == crate::ath9k::tx_ba::request(&base).identity {
         return TestResult::Fail("PS source aliases BA");

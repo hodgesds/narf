@@ -25,6 +25,7 @@ mod coexistence;
 mod data;
 mod ht;
 mod mlme;
+pub(in crate::ath10k) mod offchannel;
 mod power_save;
 mod protection;
 pub use protection::Request as StationProtection;
@@ -107,11 +108,15 @@ pub(super) struct Radio<T> {
     scan_pending: Option<u16>,
     scan_terminal: Option<u16>,
     scan_dwell: Option<dwell_scan::Work>,
+    roc: Option<alloc::boxed::Box<offchannel::Work>>,
     pending: VecDeque<htt::Event>,
     failed: bool,
     power_save: Option<bool>,
     protection: Option<StationProtection>,
     chains: Option<chains::Chains>,
+    management_subscriptions: Option<alloc::sync::Arc<offchannel::Subscriptions>>,
+    management_received: VecDeque<offchannel::Captured>,
+    management_completed: Option<offchannel::Completed>,
     coexistence: Option<alloc::boxed::Box<coexistence::State>>,
     coexistence_epoch: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
 }
@@ -140,11 +145,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             scan_pending: None,
             scan_terminal: None,
             scan_dwell: None,
+            roc: None,
             pending: VecDeque::new(),
             failed: false,
             power_save: None,
             protection: None,
             chains: None,
+            management_subscriptions: None,
+            management_received: VecDeque::new(),
+            management_completed: None,
             coexistence: None,
             coexistence_epoch: alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
         }

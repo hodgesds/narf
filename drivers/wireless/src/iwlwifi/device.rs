@@ -13,7 +13,7 @@ use alloc::{
 use core::{
     future::{poll_fn, Future},
     pin::Pin,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     task::{Context, Poll, Waker},
 };
 use narf_ipc::{Consumer, Producer};
@@ -30,6 +30,10 @@ pub struct Device {
     me: Weak<Self>,
     radio_control: Arc<narf_wireless::ap_control::ExclusiveControl>,
     scan_generation: Arc<super::scheduled_epoch::Epoch>,
+    mode: AtomicU32,
+    mode_generation: AtomicU64,
+    ap_capable: bool,
+    ap_host: ap::Host,
     state: Mutex<State>,
     control: Mutex<Option<Work>>,
     publication: AtomicBool,
@@ -75,10 +79,13 @@ struct State {
     scheduled: Option<scheduled::Owner>,
     beacons: Vec<Beacon>,
     connection: Option<Connection>,
+    ap: Option<super::ap_session::Session>,
+    ap_probes: VecDeque<Vec<u8>>,
     needs_reset: bool,
     stop_completed: bool,
     producer: Option<Producer<Frame, RX_RING_N>>,
     receive_ipc: Option<super::runtime::rx_epoch::Publication>,
+    receive_ap_data: Option<super::ap_owner::DataPublication>,
     eapol: VecDeque<Vec<u8>>,
     tx: [Option<Consumer<Frame, TX_RING_N>>; 4],
     pending: [Option<PendingTx<Frame>>; 4],
@@ -90,6 +97,7 @@ struct State {
 struct StepOutcome {
     data: Vec<Delivery>,
     radio: Vec<scheduled::Publication>,
+    ap: Vec<ap::Publication>,
 }
 
 #[derive(Clone)]
@@ -99,6 +107,7 @@ struct Delivery {
     generation: Arc<AtomicU64>,
     epoch: u64,
     receive: super::runtime::rx_epoch::Publication,
+    ap_data: Option<super::ap_owner::DataPublication>,
     policy: super::mld_policy::Fence,
 }
 impl core::ops::Deref for Delivery {
@@ -109,7 +118,9 @@ impl core::ops::Deref for Delivery {
 }
 impl Delivery {
     fn current(&self) -> bool {
-        self.generation.load(Ordering::Acquire) == self.epoch && self.receive.current()
+        self.generation.load(Ordering::Acquire) == self.epoch
+            && self.receive.current()
+            && self.ap_data.as_ref().is_none_or(|data| data.current())
     }
     fn invoke<T>(
         &self,
@@ -141,6 +152,9 @@ impl State {
     }
 
     fn progress_transmit(&mut self, mut cx: Option<&mut Context<'_>>) -> Result<(), &'static str> {
+        if self.ap.is_some() {
+            return self.progress_ap_transmit(cx);
+        }
         self.tx_progress = false;
         let Some(connection) = self.connection.as_mut().filter(|c| c.authorized) else {
             self.clear_transmit();
@@ -260,22 +274,30 @@ impl Device {
         let nvm = Self::configure(&mut hardware, mac).await?;
         let irq_vector = hardware.irq_vector();
         let source = hardware.source_fence()?;
+        let ap_capable = super::ap_session::supported(&hardware);
         Ok(Arc::new_cyclic(|me| Self {
             #[cfg(any(test, feature = "kernel-test"))]
             test_name: None,
             me: me.clone(),
             radio_control: Arc::new(narf_wireless::ap_control::ExclusiveControl::new()),
             scan_generation: Arc::new(super::scheduled_epoch::Epoch::new()),
+            mode: AtomicU32::new(2),
+            mode_generation: AtomicU64::new(1),
+            ap_capable,
+            ap_host: ap::Host::new(),
             state: Mutex::new(State {
                 hardware,
                 scan_uid: 0,
                 scheduled: None,
                 beacons: Vec::new(),
                 connection: None,
+                ap: None,
+                ap_probes: VecDeque::new(),
                 needs_reset: false,
                 stop_completed: false,
                 producer: None,
                 receive_ipc: None,
+                receive_ap_data: None,
                 eapol: VecDeque::new(),
                 tx: core::array::from_fn(|_| None),
                 pending: core::array::from_fn(|_| None),
@@ -356,6 +378,7 @@ impl Device {
         state.needs_reset = true;
         state.stop_completed = false;
         state.connection = None;
+        self.retire_ap(state);
         self.abandon_scheduled(state);
         state.clear_transmit();
         state.eapol.clear();
@@ -498,7 +521,18 @@ impl Device {
         if self.suspended.load(Ordering::Acquire) {
             return Ok(());
         }
-        WirelessNetIface::disassociate(self).await?;
+        if self.current_iftype() == 3 {
+            let mut state = self.state.lock().await;
+            self.stop_locked(&mut state).await;
+            self.suspended.store(true, Ordering::Release);
+            return if self.quarantined.load(Ordering::Acquire) {
+                Err(WirelessError::HardwareError)
+            } else {
+                Ok(())
+            };
+        } else {
+            WirelessNetIface::disassociate(self).await?;
+        }
         let mut state = self.state.lock().await;
         if state.connection.is_some() || state.scheduled.is_some() {
             return Err(WirelessError::Busy);
@@ -567,7 +601,7 @@ impl Device {
         if !up {
             self.bssid.store(0, Ordering::Release);
         }
-        if was_up && !up && current {
+        if was_up && !up && current && self.current_iftype() == 2 {
             narf_wireless::nl80211::notify_disconnect(self.name(), 1, false);
         }
     }
@@ -602,6 +636,7 @@ impl Device {
     /// The retained transport owner stops autonomous firmware emission and
     /// pins uncertain DMA. It does not need continuing RF/source authority.
     async fn stop_locked(&self, state: &mut State) {
+        self.retire_ap(state);
         self.set_link(false);
         self.retire_receive_ipc(state);
         state.needs_reset = true;
@@ -620,6 +655,7 @@ impl Device {
         self.closing.store(false, Ordering::Release);
     }
     fn start_repair(self: &Arc<Self>, state: &mut State) {
+        self.retire_ap(state);
         self.set_link(false);
         // Copied scan callbacks leave State before the retained physical
         // stop runs. Close their private owner at repair admission too.
@@ -657,6 +693,14 @@ impl Device {
             && self.policy_current().is_ok()
     }
     async fn close_locked(&self, state: &mut State) -> Result<(), WirelessError> {
+        if state.ap.is_some() {
+            self.stop_locked(state).await;
+            return if self.quarantined.load(Ordering::Acquire) {
+                Err(WirelessError::HardwareError)
+            } else {
+                Ok(())
+            };
+        }
         self.retire_scheduled(state)
             .await
             .map_err(|_| WirelessError::HardwareError)?;
@@ -735,6 +779,7 @@ impl Device {
 
     fn retire_receive_ipc(&self, state: &mut State) {
         state.receive_ipc = None;
+        state.receive_ap_data = None;
         state.producer = None;
         *self.rx.lock() = None;
     }
@@ -745,7 +790,8 @@ impl Device {
         let _admission = self.admission.lock();
         if state.needs_reset
             || !state.eapol.is_empty()
-            || !state.connection.as_ref().is_some_and(|c| c.authorized)
+            || !(state.connection.as_ref().is_some_and(|c| c.authorized)
+                || state.ap.as_ref().is_some_and(|ap| ap.current().is_ok()))
             || !self.up.load(Ordering::Acquire)
             || self.quarantined.load(Ordering::Acquire)
             || !self.current_owner()
@@ -757,21 +803,34 @@ impl Device {
             self.retire_receive_ipc(state);
             return Ok(());
         };
-        let result = self.source.invoke(|| {
+        let ap_data = state.ap.as_ref().map(|ap| ap.data_publication());
+        let source = if state.ap.is_some() {
+            state.hardware.source_fence()?
+        } else {
+            self.source.clone()
+        };
+        let result = source.invoke(|| {
             self.policy_current()?;
-            if !receive.current() {
+            if !receive.current() || ap_data.as_ref().is_some_and(|data| !data.current()) {
                 return Err("Intel RX IPC key epoch closed");
             }
+            let ap_changed = match (&state.receive_ap_data, &ap_data) {
+                (None, None) => false,
+                (Some(old), Some(new)) => !old.same_epoch(new),
+                _ => true,
+            };
             if state
                 .receive_ipc
                 .as_ref()
                 .is_none_or(|old| !old.same_epoch(&receive))
+                || ap_changed
                 || state.producer.is_none()
             {
                 let (producer, consumer) = narf_ipc::channel();
                 state.producer = Some(producer);
                 *self.rx.lock() = Some(consumer);
                 state.receive_ipc = Some(receive);
+                state.receive_ap_data = ap_data;
             }
             Ok(())
         });
@@ -805,6 +864,9 @@ impl Device {
         for publication in outcome.radio {
             publication.publish();
         }
+        for publication in outcome.ap {
+            publication.publish();
+        }
         outcome.data
     }
 
@@ -816,6 +878,7 @@ impl Device {
             return outcome;
         }
         let mut fallback = Context::from_waker(Waker::noop());
+        let ap_lost = self.ap_currentness(cx.as_deref_mut().map(|cx| cx.waker()));
         if self
             .poll_control(cx.as_deref_mut().unwrap_or(&mut fallback))
             .is_pending()
@@ -834,6 +897,7 @@ impl Device {
             return outcome;
         };
         if source_lost
+            || ap_lost
             || policy_lost
             || state.needs_reset
             || self.quarantined.load(Ordering::Acquire)
@@ -863,6 +927,7 @@ impl Device {
                 return outcome;
             }
         }
+        let ap_data = state.ap.as_ref().map(|ap| ap.data_publication());
         if state.hardware.poll().is_err() {
             self.start_repair(&mut state);
             return outcome;
@@ -881,10 +946,37 @@ impl Device {
             hardware,
             connection,
             eapol,
+            ap,
+            ap_probes,
             ..
         } = &mut *state;
         hardware.retire_transmits();
-        if let Some(connection) = connection {
+        if let Some(ap) = ap {
+            for _ in 0..receive_budget {
+                let Some(packet) = hardware.notifications.pop_front() else {
+                    break;
+                };
+                match ap.receive(&packet, hardware) {
+                    Ok(received) => {
+                        if let Some(data) = received.data {
+                            output.push((data, narf_net::RxMeta::default()));
+                        }
+                        if let Some(event) = received.event {
+                            outcome.ap.extend(self.ap_publications(ap, hardware, event));
+                        }
+                        if let Some(probe) = received.probe {
+                            if ap_probes.len() < 8 {
+                                ap_probes.push_back(probe);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        receive_failed = true;
+                        break;
+                    }
+                }
+            }
+        } else if let Some(connection) = connection {
             for _ in 0..receive_budget {
                 let Some(packet) = hardware.notifications.pop_front() else {
                     break;
@@ -937,6 +1029,12 @@ impl Device {
             self.start_repair(&mut state);
             return outcome;
         }
+        if ap_data.as_ref().is_some_and(|data| !data.current()) {
+            // A real peer-loss management notification can follow DATA in the
+            // same drain. Preserve its typed event, but never rebind older DATA
+            // to the new host authorization generation at final publication.
+            output.clear();
+        }
         let maintenance = !state.needs_reset
             && !state.hardware.is_failed()
             && state.connection.as_ref().is_some_and(|connection| {
@@ -969,10 +1067,18 @@ impl Device {
             };
             let delivery = Delivery {
                 bytes,
-                source: self.source.clone(),
+                source: if state.ap.is_some() {
+                    match state.hardware.source_fence() {
+                        Ok(fence) => fence,
+                        Err(_) => break,
+                    }
+                } else {
+                    self.source.clone()
+                },
                 generation: self.generation.clone(),
                 epoch,
                 receive,
+                ap_data: ap_data.clone(),
                 policy,
             };
             let published = {
@@ -1086,7 +1192,13 @@ impl Device {
 
     async fn pump(self: Arc<Self>) {
         loop {
-            let mut activity = super::iwl_msix::Activity::new(self.irq_vector, 100);
+            // Provider retirement wakes this owner immediately. The bounded
+            // AP timer also re-invokes generic cap epochs, which have no wake
+            // callback, and drives physical beacon stop after revocation.
+            let mut activity = super::iwl_msix::Activity::new(
+                self.irq_vector,
+                if self.current_iftype() == 3 { 1 } else { 100 },
+            );
             // Re-enter step on every wake, including IPC producer and retained
             // control wakes. Awaiting Activity alone would swallow those wakes
             // until the next unrelated radio interrupt or fallback timer.
@@ -1318,7 +1430,202 @@ impl Device {
 
 #[async_trait::async_trait]
 impl WirelessNetIface for Device {
+    fn current_iftype(&self) -> u32 {
+        self.mode.load(Ordering::Acquire)
+    }
+    fn set_iftype(&self, mode: u32) -> Result<(), WirelessError> {
+        self.ap_set_mode(mode)
+    }
+    fn supports_ap(&self) -> bool {
+        self.ap_capable
+    }
+    fn supports_ap_uapsd(&self) -> bool {
+        self.ap_capable
+    }
+    fn max_ap_assoc_sta(&self) -> u32 {
+        if self.ap_capable {
+            super::ap_wire::MAX_PEERS as u32
+        } else {
+            0
+        }
+    }
+    fn supports_ap_userspace_mlme(&self) -> bool {
+        self.ap_capable
+    }
+    fn supports_ap_authenticator(&self) -> bool {
+        self.ap_capable
+    }
+    fn supports_control_port_tx_status(&self) -> bool {
+        self.ap_capable
+    }
+    fn supports_control_port_no_preauth(&self) -> bool {
+        self.ap_capable
+    }
+    fn cipher_suites(&self) -> &'static [u32] {
+        if self.ap_capable {
+            &[
+                narf_wireless::CIPHER_SUITE_CCMP,
+                narf_wireless::CIPHER_SUITE_AES_CMAC,
+            ]
+        } else {
+            &[narf_wireless::CIPHER_SUITE_CCMP]
+        }
+    }
+    fn ap_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        self.ap_capable
+            .then(|| core::num::NonZeroU64::new(self.mode_generation.load(Ordering::Acquire)))
+            .flatten()
+    }
+    fn reserve_ap_control(
+        &self,
+    ) -> Result<Option<Arc<dyn narf_wireless::ap_control::ApControlReservation>>, WirelessError>
+    {
+        self.radio_control.try_reserve().map(Some)
+    }
+    async fn start_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::ApConfig,
+    ) -> Result<(), WirelessError> {
+        self.start_ap_with_settings_async(
+            authority,
+            config,
+            narf_wireless::ApStartSettings::default(),
+        )
+        .await
+    }
+    async fn start_ap_with_settings_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        config: narf_wireless::ApConfig,
+        settings: narf_wireless::ApStartSettings,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(
+            authority,
+            ap::Operation::Start(Box::new(config), Box::new(settings)),
+        )
+        .await
+        .map(|_| ())
+        .map_err(ap::error)
+    }
+    async fn stop_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Stop)
+            .await
+            .map(|_| ())
+            .map_err(ap::error)
+    }
+    async fn set_beacon_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        head: Option<Vec<u8>>,
+        tail: Option<Vec<u8>>,
+        probe: Option<Vec<u8>>,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Beacon(head, tail, probe))
+            .await
+            .map(|_| ())
+            .map_err(ap::error)
+    }
+    async fn add_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        station: narf_wireless::StationConfig,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Add(station))
+            .await
+            .map(|_| ())
+            .map_err(ap::error)
+    }
+    async fn set_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        station: narf_wireless::StationConfig,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Set(station))
+            .await
+            .map(|_| ())
+            .map_err(ap::error)
+    }
+    async fn del_station_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        peer: Option<[u8; 6]>,
+        _reason: u16,
+    ) -> Result<(), WirelessError> {
+        self.ap_control(authority, ap::Operation::Delete(peer))
+            .await
+            .map(|_| ())
+            .map_err(ap::error)
+    }
+    async fn add_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        key: narf_wireless::OwnedKey,
+    ) -> Result<(), i32> {
+        self.ap_control(authority, ap::Operation::Key(key))
+            .await
+            .map(|_| ())
+    }
+    async fn del_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<(), i32> {
+        self.ap_control(authority, ap::Operation::DeleteKey(index, pairwise, peer))
+            .await
+            .map(|_| ())
+    }
+    async fn default_key_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        index: u8,
+        unicast: bool,
+        multicast: bool,
+        management: bool,
+        beacon: bool,
+    ) -> Result<(), i32> {
+        self.ap_control(
+            authority,
+            ap::Operation::DefaultKey(index, unicast, multicast, management, beacon),
+        )
+        .await
+        .map(|_| ())
+    }
+    async fn tx_control_port_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        request: narf_wireless::ControlPortTxRequest,
+    ) -> Result<bool, i32> {
+        self.ap_control(authority, ap::Operation::Control(request))
+            .await
+    }
+    async fn mgmt_tx_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        _cookie: u64,
+        request: narf_wireless::MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        self.ap_control(authority, ap::Operation::Management(request))
+            .await
+            .map_err(ap::error)
+    }
+    async fn register_mgmt_frame_ap_async(
+        &self,
+        authority: &narf_wireless::ap_control::ApControlAuthority,
+        frame_type: u16,
+        prefix: Vec<u8>,
+    ) -> Result<(), WirelessError> {
+        self.ap_register(authority, frame_type, prefix)
+    }
     fn radio_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        if self.current_iftype() == 3 {
+            return core::num::NonZeroU64::new(self.mode_generation.load(Ordering::Acquire));
+        }
         core::num::NonZeroU64::new(self.generation.load(Ordering::Acquire).checked_add(1)?)
     }
     fn reserve_radio_control(
@@ -1354,7 +1661,7 @@ impl WirelessNetIface for Device {
     }
 
     fn phy_capabilities(&self, band_mhz: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
-        if band_mhz == 6000 {
+        if band_mhz == 6000 || self.current_iftype() == 3 {
             None
         } else {
             self.phy.capabilities(band_mhz)
@@ -1412,17 +1719,24 @@ impl WirelessNetIface for Device {
                     },
                 })
                 .collect(),
-            modes: WirelessModes::STATION,
+            modes: if self.ap_capable {
+                WirelessModes::STATION | WirelessModes::AP
+            } else {
+                WirelessModes::STATION
+            },
             hw_caps: HwCaps {
-                ht_supported: self.phy.ht,
-                vht_supported: self.phy.vht,
-                he_supported: self.phy.he,
-                eht_supported: self.phy.eht,
+                ht_supported: self.current_iftype() != 3 && self.phy.ht,
+                vht_supported: self.current_iftype() != 3 && self.phy.vht,
+                he_supported: self.current_iftype() != 3 && self.phy.he,
+                eht_supported: self.current_iftype() != 3 && self.phy.eht,
             },
         }
     }
 
     async fn scan(&self, mut request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+        if self.current_iftype() != 2 {
+            return Err(WirelessError::Busy);
+        }
         if request.ssids.len() > 20 || request.ssids.iter().any(|ssid| ssid.len() > 32) {
             return Err(WirelessError::InvalidArgs);
         }
@@ -1779,6 +2093,9 @@ impl WirelessNetIface for Device {
     }
 
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
+        if self.current_iftype() != 2 {
+            return Err(WirelessError::Busy);
+        }
         let domain =
             narf_wireless::reg::db::ensure_domain().map_err(|_| WirelessError::HardwareError)?;
         self.associate_in_domain(request, &domain).await
@@ -1802,6 +2119,9 @@ impl WirelessNetIface for Device {
     }
 
     async fn roam(&self, request: AssociateRequest) -> Result<(), WirelessError> {
+        if self.current_iftype() != 2 {
+            return Err(WirelessError::Busy);
+        }
         use super::connection::AuthMethod;
         if request.ssid.len() > 32 || request.bssid[0] & 1 != 0 {
             return Err(WirelessError::InvalidArgs);
@@ -2057,5 +2377,7 @@ mod tests;
 #[path = "dhcp_composition_tests.rs"]
 mod dhcp_composition;
 
+#[path = "ap_device.rs"]
+mod ap;
 #[path = "sc_scheduled.rs"]
 mod scheduled;

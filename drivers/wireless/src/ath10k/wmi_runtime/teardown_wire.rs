@@ -24,6 +24,15 @@ impl Wire {
         if bssid == [0; 6] || bssid[0] & 1 != 0 {
             return Err(Error::Malformed);
         }
+        self.delete_peer_record(bssid)
+    }
+    pub fn delete_offchannel_peer(self, destination: [u8; 6]) -> Result<Vec<u8>, Error> {
+        if destination == [0; 6] {
+            return Err(Error::Malformed);
+        }
+        self.delete_peer_record(destination)
+    }
+    fn delete_peer_record(self, bssid: [u8; 6]) -> Result<Vec<u8>, Error> {
         let tlv = self.dialect == Dialect::Tlv;
         let mut out = packet(self.teardown_ids().1, if tlv { 16 } else { 12 })?;
         let at = if tlv {

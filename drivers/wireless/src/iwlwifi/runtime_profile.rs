@@ -152,6 +152,82 @@ impl Hardware {
         self.command(3, 0xa, &peer[..length]).await?;
         Ok(())
     }
+    pub(in crate::iwlwifi) fn install_ap_owner(
+        &mut self,
+        owner: alloc::sync::Arc<super::super::ap_owner::Owner>,
+    ) -> Result<(), &'static str> {
+        owner.check()?;
+        self.ap_owner = Some(owner);
+        Ok(())
+    }
+    pub(in crate::iwlwifi) async fn ap_tlc(
+        &mut self,
+        body: &[u8; 44],
+        station: u8,
+    ) -> Result<(), &'static str> {
+        let response = if self.is_mvm89() || self.ap_gen2.is_some() {
+            let wire = super::super::gen3_wire::ap_tlc_v4(body, station)?;
+            self.command(5, 0xf, &wire).await?
+        } else {
+            self.command(5, 0xf, body).await?
+        };
+        if !response.payload.is_empty() {
+            return Err("AP native TLC receipt payload unexpected");
+        }
+        Ok(())
+    }
+    pub(in crate::iwlwifi) async fn ap_peer(
+        &mut self,
+        peer: &[u8; 104],
+    ) -> Result<(), &'static str> {
+        if let Some(adapter) = &self.ap_gen2 {
+            let (id, body) = adapter.peer(peer)?;
+            let receipt = self.command(1, 0x18, &body).await?;
+            return self.ap_gen2.as_mut().unwrap().added(id, &receipt.payload);
+        }
+        let length = self.api89.map_or(104, |(_, abi)| abi.station_extent());
+        if !self
+            .command(3, 0xa, &peer[..length])
+            .await?
+            .payload
+            .is_empty()
+        {
+            return Err("AP native peer receipt payload unexpected");
+        }
+        Ok(())
+    }
+    pub(in crate::iwlwifi) async fn ap_phy(
+        &mut self,
+        canonical: &[u8; 32],
+    ) -> Result<(), &'static str> {
+        if let Some(adapter) = &self.ap_gen2 {
+            let (body, rlc) = adapter.phy(canonical)?;
+            if !self.command(1, 8, &body).await?.payload.is_empty() {
+                return Err("API77 AP PHY native receipt unexpected");
+            }
+            if let Some(rlc) = rlc {
+                if !self
+                    .command_with_header_version(5, 8, &rlc, 2)
+                    .await?
+                    .payload
+                    .is_empty()
+                {
+                    return Err("API77 AP RLC native receipt unexpected");
+                }
+            }
+            return Ok(());
+        }
+        let mut body = *canonical;
+        if let Some((profile, _)) = self.api89 {
+            let high_band = body[12] != 1;
+            boot_context::put32(&mut body, 16, u32::from(profile.cdb && high_band));
+            body[20..24].fill(0);
+        }
+        if !self.command(1, 8, &body).await?.payload.is_empty() {
+            return Err("AP native PHY receipt payload unexpected");
+        }
+        Ok(())
+    }
     pub(in crate::iwlwifi) async fn station_tlc(
         &mut self,
         canonical: &[u8; 44],

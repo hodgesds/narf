@@ -466,7 +466,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         validate: &impl Fn() -> Result<(), Error>,
     ) -> Result<PeerPrepared, Error> {
         validate()?;
-        if self.failed || self.ready.is_none() || self.peer.is_some() {
+        if self.failed || self.ready.is_none() || self.peer.is_some() || self.scan_pending.is_some()
+        {
             return Err(Error::Failed);
         }
         self.prepare_coexistence(domain, bssid, frequency, validate)
@@ -805,6 +806,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
     pub(super) fn station_event(&mut self, event: htt::Event) -> Result<htt::Event, Error> {
         self.observe_dwell_scan(&event)?;
+        self.observe_roc(&event)?;
+        self.capture_roc_management(&event)?;
         self.observe_coexistence(&event)?;
         if let htt::Event::Wmi(bytes) = &event {
             if self.wire.dialect == Dialect::Tlv {
@@ -826,8 +829,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
         }
         if let htt::Event::Message(bytes) = &event {
-            if self.peer.as_mut().ok_or(Error::Failed)?.record(bytes)? {
+            if self.observe_roc_peer(bytes)? {
                 return Ok(htt::Event::Progress);
+            }
+            if let Some(peer) = &mut self.peer {
+                if peer.record(bytes)? {
+                    return Ok(htt::Event::Progress);
+                }
             }
         }
         Ok(event)

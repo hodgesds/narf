@@ -913,6 +913,17 @@ pub trait WirelessNetIface: Interface {
     fn async_p2p_management_tx_control(&self) -> bool {
         false
     }
+    /// Opt an actual managed netdev into source-bound native FRAME. Legacy
+    /// station/AP handlers retain their existing route; this is independent
+    /// of the control-only P2P-device opt-in above.
+    fn async_radio_management_tx_control(&self) -> bool {
+        false
+    }
+    /// Source-bound management subscription on a real managed netdev.
+    /// Metadata registration itself grants no channel/capture/key authority.
+    fn async_radio_management_rx_control(&self) -> bool {
+        false
+    }
     async fn mgmt_tx_radio_async(
         &self,
         _authority: &ap_control::RadioControlAuthority,

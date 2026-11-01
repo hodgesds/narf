@@ -18,6 +18,8 @@ mod coexistence_conversation_tests;
 mod ht40_conversation_tests;
 #[path = "ht_conversation_tests.rs"]
 mod ht_conversation_tests;
+#[path = "offchannel_conversation_tests.rs"]
+mod offchannel_conversation_tests;
 #[path = "pmf_conversation_tests.rs"]
 mod pmf_conversation_tests;
 #[path = "protection_conversation_tests.rs"]
@@ -59,6 +61,13 @@ fn send(generation: u64, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>
 fn drain() -> bool {
     let device = ACTIVE_TEST.lock().clone();
     device.is_some_and(|device| device.drain())
+}
+struct NativeFirmware {
+    ht: Option<u32>,
+    radio: RadioSource,
+    all_inventory: bool,
+    features: u64,
+    htt: (u8, u8),
 }
 struct Harness {
     device: Arc<ModelDevice>,
@@ -174,15 +183,40 @@ impl Harness {
         factory: u32,
         profile: (Option<u32>, RadioSource, bool),
     ) -> Self {
-        let hardware = profile.1.hardware;
-        let mut radio = radio_boot_source(
+        Self::new_on_firmware(
             version,
             dialect,
-            (1 << 10) | (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 },
-            3,
+            secured,
+            active_scan,
+            frequency,
             factory,
-            profile.0,
-            profile.1,
+            NativeFirmware {
+                ht: profile.0,
+                radio: profile.1,
+                all_inventory: profile.2,
+                features: (1 << 10) | (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 },
+                htt: (3, 1),
+            },
+        )
+    }
+    fn new_on_firmware(
+        version: u32,
+        dialect: Dialect,
+        secured: bool,
+        active_scan: bool,
+        frequency: u16,
+        factory: u32,
+        profile: NativeFirmware,
+    ) -> Self {
+        let hardware = profile.radio.hardware;
+        let mut radio = radio_boot_source_version(
+            version,
+            dialect,
+            profile.features,
+            profile.htt,
+            factory,
+            profile.ht,
+            profile.radio,
         );
         radio.htt.wmi.htc.transport.frequency = frequency;
         if active_scan {
@@ -200,7 +234,7 @@ impl Harness {
         } else {
             &pair
         };
-        if profile.2 {
+        if profile.all_inventory {
             radio.htt.wmi.htc.transport.default_channels = true;
             assert!(matches!(
                 drive(radio.start_from_hardware()),

@@ -168,6 +168,31 @@ impl DataQueue {
         Ok(id)
     }
 
+    pub(super) fn ap_snapshot(&self, station: u8) -> Option<(u16, u8, u16, u16)> {
+        let (owned, tid) = self.station_tid?;
+        (owned == station).then_some((self.id?, tid, self.read, self.write))
+    }
+    pub(super) fn validate_ap_flush(
+        &self,
+        read: u16,
+        write: u16,
+        before: u16,
+        after: u16,
+    ) -> Result<(), &'static str> {
+        let normalize = |v: u16| {
+            if self.pre_ax210 {
+                read.wrapping_add(v.wrapping_sub(read) & 255)
+            } else {
+                v
+            }
+        };
+        let before = normalize(before);
+        let after = normalize(after);
+        if before.wrapping_sub(read) > write.wrapping_sub(read) || after != write {
+            return Err("AP flush read pointers exceed exact outstanding native prefix");
+        }
+        self.validate_reclaim(self.native_pointer(after))
+    }
     pub fn is_idle(&self) -> bool {
         self.read == self.write
     }
@@ -212,6 +237,49 @@ impl DataQueue {
         header_len: usize,
         rate: Option<u32>,
         assist: u32,
+    ) -> Result<u16, &'static str> {
+        self.send_inner(mmio, frame, header_len, rate, assist, None)
+    }
+    /// AP key authority chooses encryption independently of Protected FC:
+    /// native BIP group management can have that bit clear. Existing station
+    /// callers retain their original Protected-FC selection unchanged.
+    pub(super) fn send_ap(
+        &mut self,
+        mmio: &mut impl IwlMmio,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+        encrypt: bool,
+    ) -> Result<u16, &'static str> {
+        if !encrypt && frame.get(1).is_some_and(|fc| fc & 0x40 != 0) {
+            return Err("AP protected frame has no installed native encryption owner");
+        }
+        self.send_ap_assisted(mmio, frame, header_len, rate, encrypt, 0)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn send_ap_assisted(
+        &mut self,
+        mmio: &mut impl IwlMmio,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+        encrypt: bool,
+        assist: u32,
+    ) -> Result<u16, &'static str> {
+        if !encrypt && frame.get(1).is_some_and(|fc| fc & 0x40 != 0) {
+            return Err("AP protected frame lacks native key owner");
+        }
+        self.send_inner(mmio, frame, header_len, rate, assist, Some(encrypt))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn send_inner(
+        &mut self,
+        mmio: &mut impl IwlMmio,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+        assist: u32,
+        encrypt: Option<bool>,
     ) -> Result<u16, &'static str> {
         use super::csum::{OFFLD_IP_HDR, OFFLD_L4_EN};
         let amsdu = assist & (1 << 14) != 0;
@@ -264,7 +332,8 @@ impl DataQueue {
         put16(&mut bytes, 4, frame.len() as u16);
         // Protected frames use the station's firmware CCMP key. The
         // firmware inserts IV/MIC and advances its TX packet number.
-        let flags = u16::from(rate.is_some()) | if frame[1] & 0x40 != 0 { 0 } else { 2 };
+        let encrypt = encrypt.unwrap_or(frame[1] & 0x40 != 0);
+        let flags = u16::from(rate.is_some()) | if encrypt { 0 } else { 2 };
         let offload = assist
             | ((header_len / 2) as u32) << super::csum::OFFLD_MH_SIZE
             | if padding != 0 {

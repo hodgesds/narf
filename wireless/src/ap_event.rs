@@ -44,6 +44,14 @@ impl ApEventAuthority {
         signal_dbm: Option<i8>,
         frame: &[u8],
     ) -> Result<(), WirelessError> {
+        self.deliver(59, self.management_attrs(frequency_mhz, signal_dbm, frame)?)
+    }
+    fn management_attrs(
+        &self,
+        frequency_mhz: u32,
+        signal_dbm: Option<i8>,
+        frame: &[u8],
+    ) -> Result<Vec<u8>, WirelessError> {
         if !(24..=4096).contains(&frame.len()) || frame[0] & 15 != 0 || frequency_mhz == 0 {
             return Err(WirelessError::InvalidArgs);
         }
@@ -53,7 +61,7 @@ impl ApEventAuthority {
             attr(&mut attrs, 151, &i32::from(signal).to_ne_bytes());
         }
         attr(&mut attrs, 51, frame);
-        self.deliver(59, attrs)
+        Ok(attrs)
     }
     /// The native owner independently proves the peer/cipher/replay facts.
     /// Ordinary Ethernet/IP rings never authorize this EAPOL delivery.
@@ -64,6 +72,15 @@ impl ApEventAuthority {
         pdu: &[u8],
         unencrypted: bool,
     ) -> Result<(), WirelessError> {
+        self.deliver(129, self.control_attrs(peer, ethertype, pdu, unencrypted)?)
+    }
+    fn control_attrs(
+        &self,
+        peer: [u8; 6],
+        ethertype: u16,
+        pdu: &[u8],
+        unencrypted: bool,
+    ) -> Result<Vec<u8>, WirelessError> {
         if peer == [0; 6]
             || peer[0] & 1 != 0
             || !matches!(ethertype, 0x888e | 0x88c7)
@@ -79,7 +96,43 @@ impl ApEventAuthority {
             attr(&mut attrs, 103, &[]);
         }
         attr(&mut attrs, 51, pdu);
-        self.deliver(129, attrs)
+        Ok(attrs)
+    }
+    /// Complete arbitrary source/interface callbacks and serialize this exact
+    /// native management event outside driver State. After preparation, the
+    /// driver must recheck its original source/RF/native receive proof before
+    /// the callback-free fixed-source checks in `PreparedApEvent::deliver`.
+    pub fn prepare_management_received(
+        &self,
+        frequency_mhz: u32,
+        signal_dbm: Option<i8>,
+        frame: &[u8],
+    ) -> Result<PreparedApEvent, WirelessError> {
+        self.prepare(59, self.management_attrs(frequency_mhz, signal_dbm, frame)?)
+    }
+    /// Prepare only typed SME control delivery. Ordinary preauthentication
+    /// additionally requires the driver's current DATA authorization proof
+    /// after every callback here; preparation supplies no such admission.
+    pub fn prepare_control_received(
+        &self,
+        peer: [u8; 6],
+        ethertype: u16,
+        pdu: &[u8],
+        unencrypted: bool,
+    ) -> Result<PreparedApEvent, WirelessError> {
+        self.prepare(129, self.control_attrs(peer, ethertype, pdu, unencrypted)?)
+    }
+    fn prepare(&self, command: u8, attrs: Vec<u8>) -> Result<PreparedApEvent, WirelessError> {
+        let iface = self.guard.iface.upgrade().ok_or(WirelessError::Denied)?;
+        let original = self.native_emission_for(iface.as_ref())?;
+        self.current()?;
+        let message = message(command, &attrs);
+        self.current()?;
+        Ok(PreparedApEvent {
+            source: self.clone(),
+            original,
+            message,
+        })
     }
     fn base(&self) -> Result<Vec<u8>, WirelessError> {
         self.current()?;
@@ -95,20 +148,55 @@ impl ApEventAuthority {
     }
     fn deliver(&self, command: u8, attrs: Vec<u8>) -> Result<(), WirelessError> {
         self.current()?;
-        // nl80211's in-tree family has the stable generic-netlink version1.
-        // Notification sequence/sender are zero, as cfg80211 RX events are.
-        let mut message = vec![0; 16];
-        message[4..6].copy_from_slice(&crate::nl80211::NL80211_FAMILY_ID.to_ne_bytes());
-        message.extend_from_slice(&[command, 1, 0, 0]);
-        message.extend_from_slice(&attrs);
-        let len = message.len() as u32;
-        message[..4].copy_from_slice(&len.to_ne_bytes());
+        let message = message(command, &attrs);
         self.current()?;
         self.guard
             .reply
             .deliver(message)
             .map_err(|_| WirelessError::Denied)
     }
+}
+/// Serialized for the original AP event source/receiver only. Its final
+/// delivery performs no dynamic current callback, endpoint lookup or recapture.
+/// It grants no native receive/key/RF/DATA authority: the concrete driver must
+/// recheck those original proofs immediately before consuming this token.
+pub struct PreparedApEvent {
+    source: ApEventAuthority,
+    original: ApEmissionAuthority,
+    message: Vec<u8>,
+}
+impl fmt::Debug for PreparedApEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedApEvent")
+            .field("message_len", &self.message.len())
+            .finish_non_exhaustive()
+    }
+}
+impl PreparedApEvent {
+    pub fn deliver(self) -> Result<(), WirelessError> {
+        if !matches!(self.source.guard.kind, ControlKind::Ap)
+            || !matches!(self.source.guard.mode, 3 | 9)
+            || !self.original.matches_control(&self.source.guard)
+        {
+            return Err(WirelessError::Denied);
+        }
+        self.source
+            .guard
+            .reply
+            .deliver(self.message)
+            .map_err(|_| WirelessError::Denied)
+    }
+}
+fn message(command: u8, attrs: &[u8]) -> Vec<u8> {
+    // nl80211's in-tree family has the stable generic-netlink version1.
+    // Notification sequence/sender are zero, as cfg80211 RX events are.
+    let mut message = vec![0; 16];
+    message[4..6].copy_from_slice(&crate::nl80211::NL80211_FAMILY_ID.to_ne_bytes());
+    message.extend_from_slice(&[command, 1, 0, 0]);
+    message.extend_from_slice(attrs);
+    let len = message.len() as u32;
+    message[..4].copy_from_slice(&len.to_ne_bytes());
+    message
 }
 fn attr(out: &mut Vec<u8>, kind: u16, payload: &[u8]) {
     out.extend_from_slice(&((payload.len() + 4) as u16).to_ne_bytes());

@@ -785,6 +785,55 @@ acquire nor no-response abort becomes native success through this API. Closing
 or rebinding a source cannot retarget these notifications. The interface alone
 advertises no ROC or P2P role.
 
+`async_radio_management_tx_control()` separately opts an actual managed netdev
+(mode2) into source-bound native FRAME through `mgmt_tx_radio_async`. Its default
+is false. This route accepts the original IFINDEX (and consistent WDEV selector,
+when supplied), retains its exact current Radio authority/reservation, and defers
+the cookie/status until the native callback completes. It does not require a
+userspace SME. Status carries the original IFINDEX; the separate control-only
+P2P-device route carries its actual WDEV. The native result alone supplies ACK.
+Existing station and AP handlers retain their previous opt-ins and wire parsing.
+The typed route validates empty NO_CCK flag135 and supplied duration10..native
+maximum; each driver still refuses unsupported flags or interval semantics.
+
+`async_radio_management_rx_control()` independently opts a real managed netdev
+(mode2, default false) into typed `REGISTER_FRAME` through
+`register_mgmt_frame_radio_async`. It uses the original IFINDEX, source and
+reserved Radio authority, independently of userspace SME; control-only WDEV and
+legacy station/AP routes keep their existing opt-ins. The callback supplies its
+actual positive errno, including overlapping-registration `EALREADY`. Registration
+is subscription metadata only: it grants no RF channel, captured packet, native
+peer, key or controlled port. A driver may support directed Public Action only
+and refuse unsupported multicast reception instead of inventing a monitor vdev.
+
+Managed native RX may use
+`RadioEventAuthority::prepare_management_received` outside native State. It
+validates the original source/interface and serializes the original namespace,
+IFINDEX, WDEV, frequency and raw bytes, retaining that source's fixed Radio proof.
+After all dynamic callbacks finish, the driver rechecks current physical-device
+permission, channel/power policy, finite native interval and its actual copy/filter
+owner. `PreparedRadioManagementEvent::deliver(RadioReceiveFence)` then performs
+only fixed original source/registration/admin/receiver/mode-generation checks and
+an acquire read of the driver's nonwrapping copy epoch before actual delivery.
+The fence separately retains the registered receiver and originating ROC proofs;
+a live guard from another socket cannot replace the prepared source's lifetime.
+The driver closes that epoch before filter or RF transitions and host retirement,
+then retires owned copies/source metadata after unlocking State. This seam neither
+looks up a successor endpoint nor grants RF/packet authority. Ordinary typed WDEV
+management events retain their existing API and native proof requirements.
+
+`RadioControlAuthority::native_emission_for` captures a distinct
+`RadioEmissionAuthority` only for an actual Radio-kind managed netdev. It retains
+the original fixed administrative/source/registration lifetimes and concrete
+receiver/generation; unknown source providers refuse. Native `current`, role
+matching and optional owner-waker watching call no arbitrary source/interface
+callback under driver State. AP capture continues to require its AP-kind guard;
+neither public constructor retargets another kind or a control-only WDEV. The
+driver independently checks native RF/packet epochs, current channel/power,
+terminal DMA/ACK and mandatory stop ownership. A physical owner uses its retained
+pump waker or bounded timer for cleanup; short-lived request wakers are not
+silently accumulated as unbounded provider watches.
+
 `async_p2p_device_control` opts an actual control-only WDEV into
 `START_P2P_DEVICE`/`STOP_P2P_DEVICE` (89/90) and their async callbacks.
 The request names its real namespace-bound WDEV and carries no IFINDEX or
@@ -916,6 +965,19 @@ epoch/current RF owner, registered frame filter, peer/cipher/replay facts and
 control-port configuration. The type supplies none of those hardware or packet
 receipts, and neither authorizes ordinary Ethernet/IP delivery nor injection.
 
+Native AP drivers may use `prepare_management_received` and
+`prepare_control_received` to complete all dynamic original source/interface
+checks and serialize exact namespace/IFINDEX/WDEV metadata outside native State.
+The opaque `PreparedApEvent` retains that event source's actual fixed AP emission
+proof; unknown native providers refuse. After preparation returns, the driver
+must re-invoke its original current physical/source/RF/key/receive-copy proof
+and any ordinary-DATA authorization generation. `PreparedApEvent::deliver`
+then checks only the fixed original source/admin/registration/receiver/mode
+proof and delivers to the same socket, without another dynamic current callback,
+successor lookup or recapture. Native management loss events retain physical
+receive/source proof while remaining independent of ordinary-DATA denial.
+Preparation supplies no packet, key, RX-prefix, RF or DATA admission.
+
 `ApControlAuthority::native_emission_for` and its event counterpart capture
 `ApEmissionAuthority` outside native State, while the full original request,
 UP identity and concrete receiver are current. Only an actual socket provider
@@ -949,6 +1011,18 @@ their driver path. Native errno is preserved. A NEW_KEY default choice follows
 successful installation in the same reserved operation; failed installation
 cannot select a transmit key. SET_KEY delegates the actual unicast/multicast/
 management/beacon selection instead of acknowledging a station-only no-op.
+
+A source-qualified native AP may accept pre-START group keys as zeroizing
+software staging, following Linux's early-AP-key path. That ACK/default-choice
+record is staging metadata only: it grants no installed key, selected native
+default, controlled port or RF emission. The original exact source/interface/role
+authority remains retained; closure, revocation or role replacement erases stale
+staging, and a retired endpoint cannot be recaptured as a fresh source. START
+captures current callback-free emission guards from those original authorities
+outside native State, then requires actual multicast/broadcast station and
+key-install receipts before promoting any staged default choice or opening its
+controlled port. A failed or cancelled native install never promotes staged
+metadata.
 
 `supports_ap_authenticator` and `supports_ap_userspace_mlme` report the physical
 AP key/control and management paths independently of station external-supplicant

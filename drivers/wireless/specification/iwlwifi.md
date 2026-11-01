@@ -2199,9 +2199,12 @@ describe the remaining native paths.
   exact-channel-set signed emitting program, native SAR and device-wide
   limits before scan publication, and per-channel NVM/MCC plus host-policy
   admission. Deployment qualification and physical RF acceptance remain.
-- **ap.** There is no AP/GO MAC context, beacon template
-  (`BEACON_TEMPLATE_CMD`) or multi-station key/queue owner, although the
-  shared `WirelessNetIface::start_ap` exists.
+- **ap.** §3.68 writes the retained ordinary AP common owner and actual
+  Sc/Bz/API89 MAC/LINK/beacon/multi-peer key/queue adapters, with callback-
+  free current source/administrative fences and written native fixtures.
+  Compilation/native acceptance is pending for that slice. The applicable
+  Gen2/API77 MVM adapter is still required, so the literal family row stays
+  open; P2P GO/discovery remains separately open.
 - **p2p.** There is no native P2P device/client/GO role owner or discovery
   and action exchange; the existing native interface is one BSS station.
 - **wow.** There is no D3 firmware image, `D3_CONFIG_CMD` or WoWLAN key
@@ -4151,3 +4154,287 @@ Primary source pin: Linux7.3-rc7 `iwl-nvm-parse.{c,h}`,
 and contracts are retained in the immutable implementation evidence.
 The admitted single-link6GHz source contract is complete independently of
 the separately open multiple-active-link `mlo` feature.
+
+### 3.68 Native AP common owner and Sc/Bz/API89 adapters (partial family row; validation pending)
+
+The first AP implementation slice admits the actual retained Sc/Bz core103
+MAC3/LINK8/STA2/PHY6/beacon14/TLC6 profile and the independently selected
+API89 MAC2/LINK2/STA1/PHY4/beacon13/TLC4 profile. API89's omitted STA command
+record uses its source-qualified fixed v1 consumer; presence of a newer enum
+or a generic VHT/HE SKU bit grants no role. Only a valid retained NVM channel
+and a fresh current native MCC ACTIVE/non-radar permission plus signed host
+permission admit initial radiation. This is the Linux LAR contract; no
+unrelated board-data prerequisite or initial NVM NO_IR override is invented.
+The bounded profile is ordinary single-BSS legacy20 AP on2.4/5GHz, with up
+to8 actual peers, native firmware power-save/TIM/UAPSD ownership, Open or
+CCMP128 userspace-SME security and optional/required CMAC128 PMF. Unsupported
+HT/VHT/HE/EHT,6GHz AP, DFS/CSA, multiple-BSSID, discovery/TWT/FTM and other
+optional services stay unadvertised and explicit unsupported inputs refuse.
+
+AP mode has a separate nonzero generation and may change only while down and
+idle. START replaces the actual inactive default station MAC/LINK rather
+than relabeling a live association. It requires native PHY/link/power, two
+distinct internal stations and queues, an all-owned-RFH prefix and the actual
+beacon-template receipt before carrier. Firmware MAC typeGO also means an
+ordinary AP. Multicast DATA uses native station0/typeMCAST/TID0; broadcast
+management uses station1/typeBCAST/MFP/TID15; each peer owns a separate
+station id, four actual AC queues, management queue, AID, TLC and port state.
+Beacon13 TIM length is the4-byte body; beacon14's same word is BTWT offset0.
+These13/14 consumers cannot stop beaconing by sending a fabricated zero-byte
+template, so the retained owner performs the actual physical transport stop.
+
+The shared `ApEmissionAuthority` retains and invokes actual original
+Admin/daemon/NetIface caps with weak exact socket/registration/admin-UP
+provider receipts. All virtual interface/source and ACK/event callbacks run
+outside native State/control locks. Final command, ordinary DATA and control
+queue publication checks use concrete callback-free authority, actual
+device/firmware/RF ownership and a driver-owned role lifetime. Each awaited
+mutation has its own immutable request guard and cancellation flag as well
+as the original START owner. Provider retirement wakes the retained pump;
+its1ms fallback timer additionally re-invokes generic capability epochs.
+Dropped API waiters retain native command/stop work. Non-emitting physical
+RF reset/BME-off/stop uses the original still-current device authority after
+the administrative/socket grant dies, retaining every uncertain allocation.
+
+Userspace authentication/association management and EAPOL are independent
+typed nl80211 paths; ordinary Ethernet cannot bypass that port. Native
+CONTROL_PORT_FRAME additionally accepts RSN preauthentication0x88c7, as in
+mac80211. It requires an authorized ordinary peer and normal BSS key policy;
+the configured EAPOL no-encrypt exception does not apply. The individual TX
+request retains its explicit encryption choice. `no_preauth` chooses only
+the RX control-event versus netdev route; ordinary authorized preauth DATA
+can still transmit. Incoming preauth retains normal authorization and crypto
+checks before PN commitment or either delivery endpoint.
+PTK/GTK/IGTK commands name the exact peer/multicast/broadcast station mask;
+AP group keys permit native TX, and BIP uses the installed IGTK even though
+its management header's Protected bit is clear. Plaintext control may precede
+PTK installation; encrypted control and peer authorization require actual
+key/default receipts. Default selection additionally requires the current
+matching installed group owner and, for software BIP, its retained host key.
+Deleting a group clears its selected/latest markers without erasing material
+history or peer replay floors; a deleted index cannot regain default, peer
+authorization or multicast/PMF emission through metadata alone. Same-key
+retries never re-add material or reset nonce/replay state; retired/cross-role
+material cannot restart PN. An actual peer authorization-bit transition
+closes the native receive/copy epoch before STA/TLC waits and publishes the
+new port state only after an all-owned-RFH prefix receipt. Preauthorization
+DATA already in RFH is discarded without advancing replay; deauthorization
+retires prepared copies and queued RX IPC frames. The API77 frontend replaces
+both plain RX IPC endpoints on every native receive epoch change, as the
+Sc/Bz frontend already does. These transitions retain the installed keys,
+peer DATA/PMF replay floors and native key receipts. Cancellation or an
+uncertain native receipt leaves capture closed and retained cleanup owns
+physical stop and any unproved DMA. Adding an initially authorized Open
+peer uses the same closed-prefix rule from absent/denied admission; its
+native station/queues/TLC and receive-prefix receipts precede ordinary DATA.
+Accepted native DEAUTH/DISASSOC separately advances a nonwrapping host DATA
+denial generation. Ordinary copied DATA, ordinary preauth control events and
+both RX IPC endpoints bind it in addition to their mandatory original
+source, physical receive/copy and key proofs. DATA accumulated earlier in
+the same drain is discarded, while the genuine typed management loss event
+retains its original source/native proof and is still delivered. This host
+generation grants no physical admission or replacement RX-prefix receipt.
+Other peers and AP carrier remain current; reauthorizing the lost peer still
+requires explicit SET with current keys/defaults and the actual RFH prefix.
+Native loss retains DATA/PMF replay floors and installed key ownership. A
+fresh PTK replacement preserves only the actual pre-mutation authorization
+bit, so neither a native loss nor DEL_KEY can be undone through a stale
+configured flag. Uncertain/cancelled native work remains closed and pinned.
+Typed control and management events prepare their exact original socket
+metadata and fixed source proof outside State. After all arbitrary source or
+interface callbacks finish, publication re-invokes the original source/RF/key
+and native receive/copy proof, plus DATA denial for ordinary preauth. Final
+delivery then uses callback-free original source/receiver checks. A callback
+cannot accept native peer loss or perform a real receive-prefix transition
+and still publish an older prepared event. Management retains physical proof
+without acquiring ordinary-DATA authorization requirements.
+Per-peer data
+and PMF replay admission requires original physical STA/band/channel/copy
+epoch plus native integrity before any counter or delivery changes. Source-
+fenced typed management/control events leave State before callbacks.
+
+Peer/key retirement validates the actual TXPATH_FLUSHv2 STA, every queue/TID,
+and complete read-before/read-after prefix before reclaiming any DMA. An
+empty ACK, omitted live queue, duplicate/wrong queue or impossible prefix is
+not terminal ownership. Later queue/STA removal and all-owned receive fencing
+precede publication of replacement state. Source loss or uncertain receipts
+close ports and drive physical stop while allocations remain retained.
+
+Four written, unexecuted native registrations cover Sc/API89/Bz beacon,
+multi-peer queue/TLC and stop receipts; secure control ports, exact native
+key roles, invalid STA/band/integrity, replay, idempotent PTK retry and BIP;
+active source/cap/DOWN-up revocation and malformed flush/DMA retention; and
+held beacon cancellation/source closure with no carrier before its receipt.
+The existing secure public case additionally leaves real RFH preauth DATA
+queued across authorization without a preflush, proves same-PN acceptance
+only after current authorization, and checks deauthorization against copied
+DATA/IPC and retained replay/key ownership. The original API77 native case
+exercises the same RFH-prefix, copied-publication and plain-IPC boundaries.
+The existing Sc/API89/Bz Open case additionally holds the actual peer TLC
+receipt after native STA/queue creation, leaves valid-STA DATA queued before
+host authorization without a preflush, refuses that prefix, then admits
+fresh DATA.
+The existing secure and original API77 cases also queue protected loss after
+already copied DATA and within a DATA drain, prove stale DATA/IPC/preauth
+denial with a real management event and current carrier, then require fresh
+reauthorization/RFH prefix without resetting DATA or PMF replay. The secure
+case additionally checks that PTK replacement after loss or DEL_KEY does not
+restore authorization through saved metadata. The original API77 AP proof
+bundle uses fallible immutable indirection; allocation failure returns to
+the retained stop/deny path.
+The existing secure public case additionally reenters the actual native pump
+from a late source callback to accept protected peer loss while preauth is
+prepared, and performs a real public SET/RFH transition while management is
+prepared. Both stale events refuse after callbacks; the genuine loss event,
+current carrier and fresh management after DATA denial remain observable.
+The shared guard has separate actual-cap/provider/socket cases. Coordinated
+release compilation and native/regression execution remain pending for this
+AP slice. The Gen2/API77 continuation under this same retained owner is
+described in §3.70–§3.71; its compilation and source review remain pending.
+P2P GO/discovery and multiple-active-link MLO remain separate
+open rows; this ordinary AP slice does not claim those roles.
+
+Primary sources: Linux7.3-rc7 iwlwifi `mld/{ap,iface,link,sta,key,tx}.c`,
+`mvm/{mac-ctxt,sta,tx}.c`, `fw/api/{mac-cfg,mac,sta,tx,datapath}.h` and
+`iwl-nvm-parse.{c,h}`, with installed Sc/Bz c103 and So/GF API89 command
+inventories. Exact source and firmware hashes are retained with the AP plan.
+
+### 3.69 Early AP group-key staging and original-source promotion (partial family row)
+
+Following Linux `mld/ap.c` and `mvm/mac80211.c`, pre-START group-key and
+default-choice ACKs accept zeroizing software staging only. They create no
+installed firmware key, native default, controlled port or emission owner.
+Only bounded group CCMP/CMAC records are staged; pairwise/foreign peer,
+invalid cipher/index/RSC and absent default-key inputs refuse without I/O.
+Each key and default choice retains its original exact event/source authority
+and concrete role lifetime. Mode replacement clears secrets, and the AP pump
+prunes closed/revoked sources outside native State; a namespace/port successor
+cannot recapture an expired original endpoint.
+
+START validates staging against its actual beacon security plan and captures
+current callback-free guards from every original accepted key/default source
+outside State. Its immutable request fence retains all those real capability/
+provider proofs plus the START source and cancellation flag through native
+preparation, key receipts, default promotion and carrier publication. Internal
+multicast/broadcast stations and all-owned-RX fencing precede actual key ADD;
+selected defaults are installed last in their cipher class before any TX, so
+no old key needs a PN-resetting re-add to select it. The beacon template is
+published only after those receipts. Staged default flags alone never select
+a native key. Failed, dropped or revoked promotion performs the retained
+non-emitting physical stop without releasing uncertain DMA.
+
+Source watches use the retained physical pump's stable waker, rather than
+accumulating one historical waker per short netlink request. Watch exhaustion
+refuses new native work. The existing AP timer also covers capability-epoch
+revocation and pre-START staging cleanup. A fifth unexecuted native case proves
+no key/carrier authority from metadata, no beacon before held key receipts,
+separate START versus original-key sources, original-key source closure and
+mode-ABA erasure. The earlier four native registrations keep their assertions.
+Release compilation and native acceptance of this continuation are pending;
+the connected Gen2/API77 frontend is described in §3.71 and remains pending
+coordinated compilation and acceptance.
+
+### 3.70 API77 AP consumer and software-BIP continuation (partial)
+
+The retained API77 boot owner records an optional closed AP command consumer
+after its actual correlated NVM response. These facts alone do not enable
+START: §3.71 connects the original MvmDevice/BootOwner, current MCC/host proof
+and separately qualified AP power owner. A MAC/LINK enum, command table or
+copied ready bit alone grants no emission.
+
+The consumer requires actual MLD-MAC capability110, STA_TYPE API30, MAC1,
+absent/UNKNOWN/default-v1 LINK, legacy PHY1/2, ADD_STA12/status2, REMOVE_STA2,
+TLC4, SEC_KEY1, beacon13, TVQM3/response2, TXPATH_FLUSH2/response1, TX9 with
+its real response6..8, rates-v2 notification3 and RX notification4. Actual
+legacy NVM channel and chain values select the 36/40-byte PHY body, optional
+explicit-v2 RLC and the48-byte receive envelope. Peer ADD/modify is tracked
+only after the exact four-byte low8=ADD_STA_SUCCESS reply. Unknown native
+PHY fields, station/AID/UAPSD identities and failed status never become
+peer ownership. Original Sc/Bz/API89 consumers keep their own ABI paths.
+
+`iwlwifi::gen2_ap_transmit_power_request()` returns the original retained
+PCI/MAC/RF, NVM chains, firmware image and platform SMBIOS binding for a
+separate signed NIPW tag7 program, named
+`mvm-api77-legacy20-ap-power-v7`. Its hash domain explicitly covers legacy20
+autonomous beacon/TIM, two internal stations, eight clients, four ACs,
+SME/control and CCMP/PMF. Existing tag1 station or tag6 active-probe records
+cannot substitute. This query provides metadata only, not measured limits,
+a board prerequisite inferred from an enum, or any RF grant.
+
+The installed CC API77 image reports SEC_KEY1 but lacks BIGTK_TX
+capability109. Linux `mvm/mac80211.c` therefore declines AP group CMAC
+offload. The common AP key owner has an explicit host software-BIP branch
+for that actual consumer: a zeroizing CMAC key and monotonically reserved
+48-bit IPN follow the same original request, exact flush/RX-prefix and
+default-choice ownership. It never fabricates a firmware IGTK ACK. Group
+robust management uses real MMIE/CMAC with physical management addresses,
+clear Protected FC and native ENCRYPT_DIS; unicast PMF retains its actual
+PTK/firmware encryption path. A failed send burns its reserved IPN and
+exhaustion refuses before mutation. Key-material history and same-key
+idempotence remain under the common retained owner. Optional beacon/BIGTK
+protection is unadvertised.
+
+Two additional unexecuted cases inspect actual API77 TFH ADD/modify/remove
+status, literal PHY and native48 RX bytes, missing source API/capability and
+unknown-field refusal, plus genuine software CMAC/MMIE, tamper/replay, exact
+physical source and nonwrapping IPN. These are source fixtures, not runtime
+acceptance. Applicable Gen2 AP power receipts and the full retained frontend
+role/SME/data/cleanup are described in §3.71.
+
+### 3.71 Original API77 AP frontend and current qualified power (pending validation)
+
+The original MvmDevice and BootOwner implement the same retained ordinary-AP
+role, userspace SME/control port, peer/key/data and cleanup contract as the
+Sc/Bz/API89 owner. No proxy interface or duplicate same-name radio is created.
+AP capability requires the complete closed §3.70 adapter plus actual reduced
+v5 power and retained NVM permissions. Unsupported metadata leaves station
+boot available while AP remains unadvertised. This AP scope is legacy20 on
+actual admitted 2.4/5GHz channels, eight clients and four ACs; optional AP
+HT/VHT/HE/EHT, 6GHz, DFS/CSA, multiple BSSID and beacon protection remain
+unadvertised. P2P and multiple active MLO links are independent rows.
+
+START loads the separately signed tag7 source through the existing actual
+trusted loader outside native State. It recomputes the original PCI/MAC/RF,
+firmware, NVM-chain and platform binding before I/O. A fixed concrete cap
+fence retains that source and the planned conducted ceiling. Fresh actual
+MVM MCC replies retain their own v3/v4/v8 layouts and raw channel flags:
+VALID, ACTIVE and20MHz are required; without LAR, the actual NVM IBSS flag
+is also required. RADAR, host NO_IR/DFS, country replacement, missing records
+and tightened host/qualified ceilings refuse. No MVM flag is relabelled as
+an Sc channel permission. A native CHUB/MCC change invalidates every copied
+RF proof and requires a new retained owner.
+
+Actual inactive MAC/link defaults precede the common GO MAC, inactive link
+and native36/40-byte PHY. Native SET_CHAINS SAR plus SET_LINK v5 empty
+receipts must both complete before the active link, internal stations,
+all-owned RX prefix, early key promotion and beacon publication. Planned
+power and staged defaults are distinct from those native receipts. The
+zeroizing qualification owner stays with Session; cap and current host
+ceilings are rechecked at every command, credit wait, packet and copied
+delivery boundary. API77 all-owned RX uses the actual MVM sync1 marker and
+48-byte MPDU layout, including saved management-prefix checks.
+
+The original typed role, socket/Admin/daemon/NetIface source receipts and
+per-request guards remain callback-free under State. Full callbacks execute
+outside State. Retained Work owns command/stop progress after waiter drop;
+provider retirement wakes the physical pump and its1ms timer also checks
+capability epochs. Source/policy loss closes DATA immediately and schedules
+non-emitting physical stop, including failures observed by copied IPC/stack
+publication. Publication-generation exhaustion also drives physical stop.
+The dead START guard cannot deny cleanup under still-current device authority;
+uncertain DMA stays retained. STOP/recovery never reuses installed peer/key
+or receive-epoch authority.
+
+Two new unexecuted original-netdev registrations cover actual raw LAR MCC
+without a fabricated IBSS requirement, distinct AP qualification, native
+beacon/STA/TLC/TVQM/SEC receipts, authorization/default ownership, bridged
+FromDS A3, native48 receive identity before same-PN admission, software-BIP
+CMAC on the exact broadcast queue, native flush/peer retirement and STOP.
+Held SET_LINK cases cover socket/provider closure, signed-power revocation,
+host tightening, DOWN-up, native MCC notification and waiter cancellation;
+missing ACTIVE and actual radar flags refuse before beacon emission. RAM
+fixtures author MMIO identities and SMBIOS structures through the actual
+parsers, restore boot SMBIOS after their retained owner dies and create no
+physical calibration grant. All nine AP registrations and this frontend
+remain pending coordinated release compilation, native execution and review;
+the family row is not accepted by these source fixtures alone.

@@ -16,10 +16,13 @@ use target::Target;
 
 #[path = "ap_event.rs"]
 mod event;
-pub use event::ApEventAuthority;
+pub use event::{ApEventAuthority, PreparedApEvent};
 #[path = "radio_control.rs"]
 mod radio;
-pub use radio::{RadioControlAuthority, RadioEventAuthority, RadioInterfaceIdentity};
+pub use radio::{
+    PreparedRadioManagementEvent, RadioControlAuthority, RadioEmissionAuthority,
+    RadioEventAuthority, RadioInterfaceIdentity, RadioReceiveFence,
+};
 #[path = "ap_emission.rs"]
 mod emission;
 pub use emission::ApEmissionAuthority;

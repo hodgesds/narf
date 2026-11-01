@@ -18,7 +18,7 @@ pub(super) struct Fixture {
     scan: Vec<u8>,
 }
 
-fn domain(dialect: Dialect, home: u16) -> Vec<u8> {
+pub(super) fn domain(dialect: Dialect, home: u16) -> Vec<u8> {
     let mut packet = match dialect {
         Dialect::Main => RD_MAIN,
         Dialect::TenOne => RD_10X,
@@ -35,7 +35,7 @@ fn domain(dialect: Dialect, home: u16) -> Vec<u8> {
     }
     packet
 }
-fn power(dialect: Dialect, frequency: u16) -> Vec<u8> {
+pub(super) fn power(dialect: Dialect, frequency: u16) -> Vec<u8> {
     let mut packet = match dialect {
         Dialect::Main => POWER_MAIN,
         Dialect::TenOne => POWER_10X,
@@ -49,7 +49,13 @@ fn power(dialect: Dialect, frequency: u16) -> Vec<u8> {
     u32at(&mut packet, at + 4, if frequency < 3000 { 34 } else { 54 });
     packet
 }
-fn inventory(dialect: Dialect, receive: &[u16], home: u16, width: u8, probes: &[u16]) -> Vec<u8> {
+pub(super) fn inventory(
+    dialect: Dialect,
+    receive: &[u16],
+    home: u16,
+    width: u8,
+    probes: &[u16],
+) -> Vec<u8> {
     let mut frequencies = receive.to_vec();
     let occupied: Vec<u16> = match width {
         80 => vec![5180, 5200, 5220, 5240],

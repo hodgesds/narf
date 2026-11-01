@@ -347,6 +347,9 @@ pub(in crate::iwlwifi) fn create_for_format(
         scan_fixed_antenna: false,
         scan_six_capabilities: 0,
         six_tx_profile: None,
+        ap_owner: None,
+        ap_request: None,
+        ap_gen2: None,
         mld_link: None,
         eht_source: None,
         bios_versions: Vec::new(),
@@ -391,6 +394,9 @@ pub(in crate::iwlwifi) unsafe fn destroy(hardware: Hardware) {
         core::ptr::drop_in_place(&mut hardware.platform_power);
         core::ptr::drop_in_place(&mut hardware.shared_memory);
         core::ptr::drop_in_place(&mut hardware.receive_queues);
+        core::ptr::drop_in_place(&mut hardware.ap_owner);
+        core::ptr::drop_in_place(&mut hardware.ap_request);
+        core::ptr::drop_in_place(&mut hardware.ap_gen2);
     };
 }
 
@@ -415,6 +421,7 @@ pub(in crate::iwlwifi) fn firmware_profile(
         u8::from(parsed.api.has_capability(59)) | (u8::from(parsed.api.has_capability(10)) << 1);
     // A metadata inventory alone is not a new ALIVE/PNVM source proof.
     hardware.eht_source = None;
+    hardware.ap_gen2 = None;
     hardware.shared_memory = smem::State::new(parsed);
     hardware.receive_queues = rx_multi::State::new(parsed);
     Ok(())

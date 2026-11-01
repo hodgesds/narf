@@ -46,6 +46,8 @@ struct Spec {
     large: bool,
     factory: Option<calibration::tests::factory::Selection>,
     power_save: bool,
+    periodic: bool,
+    periodic_low_child: bool,
 }
 struct Nominal {
     image: [u8; crate::ath9k::EEPROM_4K_BYTES],
@@ -62,6 +64,7 @@ struct Owner {
     devices: IrqSafeSpinLock<Vec<Arc<TestDevice>>>,
     models: IrqSafeSpinLock<Vec<Arc<Model>>>,
     peers: IrqSafeSpinLock<Vec<Arc<IrqSafeSpinLock<Peer>>>>,
+    clocks: IrqSafeSpinLock<Vec<Arc<Env>>>,
     qualification: IrqSafeSpinLock<Option<Cap<FirmwareBlob, Read>>>,
 }
 struct WideEnvironment {
@@ -182,6 +185,7 @@ impl Owner {
             devices: IrqSafeSpinLock::new(Vec::new()),
             models: IrqSafeSpinLock::new(Vec::new()),
             peers: IrqSafeSpinLock::new(Vec::new()),
+            clocks: IrqSafeSpinLock::new(Vec::new()),
             qualification: IrqSafeSpinLock::new(None),
         });
         let device = owner.prepare_twenty(spec.geometry.control()).unwrap();
@@ -288,6 +292,24 @@ impl Owner {
         noise: i16,
         wide: bool,
     ) -> Result<Arc<TestDevice>, Error> {
+        if self.spec.periodic {
+            if wide && self.spec.periodic_low_child {
+                let base = { model.ht.borrow().clone().ok_or(Error::State)? };
+                let mut bytes = crate::ath9k::tx_ba::large_tests::record(&base, 8, 65535, 64);
+                bytes[62..64].copy_from_slice(&24i16.to_le_bytes());
+                let source = crate::ath9k::tx_ba::Source::Verified {
+                    bytes,
+                    signer: Some([0x85; 32]),
+                    cap: Cap::bootstrap(),
+                }
+                .load(base)?;
+                *model.tx_ba.borrow_mut() = Some(source);
+            }
+            crate::ath9k::periodic::tests::qualify_peak(
+                &model,
+                if self.spec.periodic_low_child { 30 } else { 18 },
+            );
+        }
         let peer = Arc::new(IrqSafeSpinLock::new(Peer::new_channel(
             self.spec.protected,
             None,
@@ -328,7 +350,7 @@ impl Owner {
             WideEnvironment {
                 owner: Arc::downgrade(self),
                 generation,
-                clock,
+                clock: clock.clone(),
             },
         );
         radio.start()?;
@@ -345,6 +367,7 @@ impl Owner {
         narf_net::iface::install_rx_drain(drain);
         self.models.lock().push(model);
         self.peers.lock().push(peer);
+        self.clocks.lock().push(clock);
         self.devices.lock().push(device.clone());
         Ok(device)
     }
@@ -454,6 +477,8 @@ fn spec(width: Width, gi: u8, protected: bool) -> Spec {
         large: false,
         factory: None,
         power_save: false,
+        periodic: false,
+        periodic_low_child: false,
     }
 }
 fn network(owner: &Owner) -> Result<(), &'static str> {
@@ -1003,3 +1028,6 @@ mod factory_tests;
 
 #[path = "interface_ps_wide_tests.rs"]
 mod ps_tests;
+
+#[path = "interface_periodic_wide_tests.rs"]
+mod periodic_tests;

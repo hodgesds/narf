@@ -80,6 +80,14 @@ impl State {
             && !self.pending.reply_in_flight()
             && self.security.as_ref().is_none_or(|s| !s.handshake_active())
     }
+    pub(super) fn roc_quiescent(&self) -> bool {
+        self.protection_allowed() && self.pending.is_empty() && self.management.is_none()
+    }
+    pub(super) fn retire_roc_receive(&mut self) {
+        self.rx_ba.discard_ppdu();
+        self.incoming.clear();
+        self.received.clear();
+    }
     pub(super) fn protection_idle(&self) -> bool {
         self.pending.is_empty()
     }
@@ -289,6 +297,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         &mut self,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<bool, Error> {
+        if self.roc_active() {
+            return Ok(false);
+        }
         let coexistence = self.service_coexistence(domain).await?;
         if self.failed
             || self.station_link().is_none()
@@ -416,6 +427,9 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         &self,
         domain: &narf_wireless::reg::RegulatoryDomain,
     ) -> Result<(), Error> {
+        if self.roc_active() {
+            return Err(Error::Unsupported);
+        }
         self.check_dwell_scan(domain)?;
         self.htt
             .wmi

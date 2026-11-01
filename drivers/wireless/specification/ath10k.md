@@ -939,8 +939,8 @@ Host-bus/system power transitions remain separate profiles.
   retry succeeds after the native teardown receipt. Physical-generation
   retirement prevents an old cleanup continuation from addressing a successor.
   DMA stays retained and the failed owner requires full reset; this is no
-  receive-generation or recovery proof. Remain-on-channel/action-frame TX for
-  P2P is a separate residual under the off-channel feature row.
+  receive-generation or recovery proof. Managed remain-on-channel/Public Action
+  control uses the separate bounded owner below; native P2P roles remain separate.
   Scan setup/restore/STOP use cooperative retained WMI publication: HTC credits
   and sequence remain in Session, while native CE3 occupancy, bounce bytes and
   completion deadline remain in HIF. A public drop at a credit/CE wait cannot
@@ -964,6 +964,80 @@ Host-bus/system power transitions remain separate profiles.
   requires the original halt plus ordered-flush proof; otherwise DMA stays
   pinned. A stale request cannot retire a successor. Physical grant loss may
   deny the attempt; no timeout or reset submission asserts physical RF quiet.
+- **Bounded ROC, implicit FRAME wait and Public Action responses (source
+  implementation; execution pending):** actual managed vdev0 can acquire one
+  receive-only or separately TX-qualified channel for1..500ms through typed Radio control. It never creates
+  a P2P interface or borrows an AP/GO owner. A live original socket/grant,
+  registered IFINDEX and immutable physical generation remain required. The
+  current native BSS/key owner must be idle before an associated ROC; existing
+  DATA/reply IDs and active security work cannot cross acquisition. Native RF
+  transition advances the copied-RX epoch and discards prior PPDU/receive staging.
+  Host DATA, ordinary queued management and operator PS programming pause until
+  the exact ROC terminal/home restore, preserving the original PTK/PN/carrier.
+  STARTED or CE/credit progress is insufficient: the matching nonwrapping scan
+  ID/request/vdev must report FOREIGN_CHANNEL at the requested frequency before
+  READY or an action descriptor. Passive scan flags and empty probe content are
+  retained. Linux's WMI dwell/max-scan fields are set to the requested finite
+  budget itself, rather than relying on a blocked host waiter to enforce Linux's
+  longer scan backstop; MAIN/10.4/TLV also carry that burst duration. Early native
+  completion ends the interval instead of fabricating remaining RF time.
+  Host expiry/cancel sends the exact STOP once. COMPLETE/DEQUEUED and, for a live
+  BSS, an actual matching BSS_CHANNEL home receipt precede restoring the original
+  full occupied domain/power/inventory. A host timer or STOP submission is no
+  terminal or RF-quiet proof. Current home/foreign rules and actual device/source
+  authority are rechecked across every suspended control; revoked work cannot
+  restore obsolete power or publish late READY/EXPIRED. Failure or dropped
+  mutation waiters leave stop/DMA/peer ownership with the retained worker and
+  existing reset supervisor; ambiguous completion retains resources.
+  Explicit-ROC FRAME accepts unprotected nonfragmented Public Action only, with
+  the actual local SA and requested ROC frequency/initiating-power receipt.
+  Receive-only/NO_IR ROC cannot be upgraded into TX. It records the exact native
+  DMA token before the first suspended publication and reports ACK only from
+  its actual terminal; multicast never invents ACK. Legacy HTT MGMT_TX, HTT
+  TX_FRM and TLV by-reference WMI retain their separate completion identities.
+  Inline WMI, which proves only transport submission, refuses this TX facility.
+  Actual TLV HTT>=3 with minor>=4 uses its peerid/frequency union; older firmware
+  creates a separate WMI DEFAULT destination peer and waits for its MAP. An
+  existing BSS peer is preserved. Ordered receive drains fence old records;
+  actual TX terminal precedes temporary DELETE/UNMAP and advertised synchronous
+  delete acknowledgement. A lost descriptor is never completed by scan expiry.
+  An existing public ROC accepts FRAME duration0; it does not silently extend
+  that separate interval to satisfy a new wait. FRAME may also acquire an
+  independent private ROC when no explicit interval exists. Pure validation
+  precedes native mutation. Its native dwell/max-scan
+  budget is500ms; omitted wait selects10ms and an explicit wait must be10..500ms.
+  The response tail starts at actual TX terminal and is clipped to the original
+  finite native grant: neither ACK nor a timer extends RF authority. The separate
+  DA peer remains owned through that tail. Only actual scan/home, TX and peer
+  retirement plus the complete current home restore release the private result.
+  No public READY/EXPIRED cookie is fabricated for this internal lease. Source
+  loss, a dropped waiter or host closure closes capture first and retains exact
+  native STOP/packet/peer cleanup; uncertain ownership remains pinned.
+  Actual netdev REGISTER_FRAME installs at most16 source-bound Action prefixes,
+  rejecting overlaps across sockets with EALREADY. Metadata alone emits no RF.
+  The completed old HIF prefix is drained and the nonwrapping copy epoch closes
+  before filter replacement. Only a live matching FOREIGN_CHANNEL grants raw
+  capture: native WMI status/channel, unicast RA=own, nonfragmented unprotected
+  Public Action, current prefix and actual physical/source owner must all match.
+  The original raw bytes/frequency are retained; SNR is not relabelled as a dBm
+  measurement. Serialization and dynamic source checks run after Radio unlock,
+  followed by fresh policy/device checks and a final fixed original-source,
+  receiver/origin and epoch fence immediately before delivery. Filter/source
+  retirement, native expiry/home movement or callback-time policy change denies
+  a retained copy without retargeting it. Multicast raw reception is refused:
+  Linux's relevant profiles require an additional monitor-vdev/filter path, which
+  is not advertised here. Robust SME/PMF injection and P2P device/client/GO roles
+  remain separate capabilities. A 2.4GHz NO_CCK request still refuses without an
+  actual restorable per-request native rate receipt;5GHz uses its native rate.
+  The bounded managed-vdev `offchannel_scan` contract is source implemented.
+  Ten new native cases cover six dialects, real delegated source/registration,
+  actual FOREIGN/home receipts, Open/WPA2 DHCP/IP after DATA suspension, old/new
+  HTT and WMI-reference terminal/peer ownership, multicast TX, timed/cancelled
+  STOP holds, source/cap/daemon/policy loss, pure/inline/NO_IR refusals, implicit
+  wait, actual WMI responses and callback-time filter/policy/source/expiry loss.
+  Four shared cases cover exact IFINDEX/deferred status/registration and fixed
+  Radio-kind prepared-event fences. All14 are written but unexecuted; no RF,
+  timing or board qualification is claimed.
 - RAW/non-PFC images without firmware `NO_PS` expose an awake station
   power-save default and `WirelessNetIface::set_power_save`. The synchronous
   setter records desired intent; the retained async worker submits native
@@ -1485,7 +1559,7 @@ pending. This makes no additional per-chip physical RF or power claim.
 Across the reached rows, concrete remaining software packages are
 contiguous VHT160 (VHT20/40/80 and the bounded80+80 owner are implemented); PFC fetch/queue ownership;
 AP-side U-APSD under the AP owner; DFS/indoor/beacon-hint
-qualification; remain-on-channel/action-frame control; hardware key offload;
+qualification; hardware key offload;
 AP/P2P roles; host-bus PM and wake offload (system suspend is implemented);
 DT/NVMEM calibration sources (QCA9887 EEPROM and registry files are implemented)
 and automatic credential replay after recovery.

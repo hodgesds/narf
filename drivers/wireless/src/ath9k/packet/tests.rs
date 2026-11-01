@@ -46,6 +46,7 @@ pub(in crate::ath9k) struct Region {
     pub len: usize,
 }
 pub(in crate::ath9k) struct Model {
+    pub(in crate::ath9k) periodic: RefCell<periodic_model::State>,
     pub(in crate::ath9k) wide: RefCell<Option<crate::ath9k::calibration::wide::WideReport>>,
     pub(in crate::ath9k) ps: RefCell<Option<Arc<crate::ath9k::ps::Grant>>>,
     pub(in crate::ath9k) ps_bound: Cell<bool>,
@@ -108,6 +109,7 @@ pub(in crate::ath9k) type Reaction =
 impl Model {
     pub(in crate::ath9k) fn new() -> Arc<Self> {
         Arc::new(Self {
+            periodic: RefCell::new(periodic_model::State::default()),
             wide: RefCell::new(None),
             ps: RefCell::new(None),
             ps_bound: Cell::new(false),
@@ -392,8 +394,55 @@ impl Model {
     }
 }
 impl Port for Arc<Model> {
+    fn periodic_grant(&self) -> Option<Arc<crate::ath9k::periodic::Grant>> {
+        self.periodic.borrow().source.clone()
+    }
+    fn bind_periodic(&self, source: &Arc<crate::ath9k::periodic::Grant>) -> Result<(), Error> {
+        self.bind_periodic_model(source)
+    }
+    fn periodic_initial(
+        &self,
+    ) -> Result<
+        (
+            crate::ath9k::calibration::Report,
+            Option<crate::ath9k::calibration::wide::WideReport>,
+        ),
+        Error,
+    > {
+        self.periodic_model_invoke(|| {
+            Ok((
+                self.ht
+                    .borrow()
+                    .as_ref()
+                    .ok_or(Error::State)?
+                    .initial_calibration(),
+                *self.wide.borrow(),
+            ))
+        })
+    }
+    fn periodic_read(&self, register: u64) -> Result<u32, Error> {
+        self.periodic_model_read(register)
+    }
+    fn periodic_write(&self, register: u64, value: u32) -> Result<(), Error> {
+        self.periodic_model_write(register, value)
+    }
+    fn periodic_install(&self, live: crate::ath9k::periodic::Live) -> Result<(), Error> {
+        self.install_periodic_model(live)
+    }
+    fn periodic_failed(&self) {
+        self.periodic.borrow_mut().failed = true;
+    }
+    fn periodic_current(&self) -> Result<bool, Error> {
+        self.periodic_model_current()
+    }
     fn ps_grant(&self) -> Option<Arc<crate::ath9k::ps::Grant>> {
         self.ps.borrow().clone()
+    }
+    fn station_ps_current(&self) -> Result<bool, Error> {
+        if !self.ps_bound.get() {
+            return Ok(false);
+        }
+        self.access(self.master.get(), || Ok(true))
     }
     fn bind_ps(&self, source: &Arc<crate::ath9k::ps::Grant>) -> Result<(), Error> {
         self.as_ref().access()?;
@@ -484,6 +533,7 @@ impl Port for Arc<Model> {
                 operation()
             }
         };
+        let operation = || self.with_periodic(operation);
         if self.ps_bound.get() {
             self.ps_grant().ok_or(Error::Access)?.invoke(operation)
         } else {
@@ -491,184 +541,189 @@ impl Port for Arc<Model> {
         }
     }
     fn read(&self, reg: u64) -> Result<u32, Error> {
-        self.as_ref().access()?;
-        self.power_awake()?;
-        if let Some(g) = self.tx_ba_grant() {
-            g.check()?;
-        }
-        if let Some(g) = self.rx_ba_grant() {
-            g.check()?;
-        }
-        if let Some(g) = self.ht_grant() {
-            g.check()?;
-        }
-        if let Some(g) = self.qos_grant() {
-            g.check()?;
-        }
-        if self.ps_bound.get() && reg == 0xc0 {
-            let value = self.registers.borrow_mut().remove(&reg).unwrap_or(0);
-            self.registers.borrow_mut().insert(0x80, 0);
-            self.registers.borrow_mut().insert(0x4038, 0);
-            return Ok(value);
-        }
-        if self.ps_bound.get() && reg == 0xd8 {
-            return Ok(self.registers.borrow_mut().remove(&reg).unwrap_or(0));
-        }
-        Ok(*self.registers.borrow().get(&reg).unwrap_or(&0))
+        self.with_periodic(|| {
+            self.as_ref().access()?;
+            self.power_awake()?;
+            if let Some(g) = self.tx_ba_grant() {
+                g.check()?;
+            }
+            if let Some(g) = self.rx_ba_grant() {
+                g.check()?;
+            }
+            if let Some(g) = self.ht_grant() {
+                g.check()?;
+            }
+            if let Some(g) = self.qos_grant() {
+                g.check()?;
+            }
+            if self.ps_bound.get() && reg == 0xc0 {
+                let value = self.registers.borrow_mut().remove(&reg).unwrap_or(0);
+                self.registers.borrow_mut().insert(0x80, 0);
+                self.registers.borrow_mut().insert(0x4038, 0);
+                return Ok(value);
+            }
+            if self.ps_bound.get() && reg == 0xd8 {
+                return Ok(self.registers.borrow_mut().remove(&reg).unwrap_or(0));
+            }
+            Ok(*self.registers.borrow().get(&reg).unwrap_or(&0))
+        })
     }
     fn write(&self, reg: u64, value: u32) -> Result<(), Error> {
-        self.as_ref().access()?;
-        self.power_awake()?;
-        if let Some(g) = self.tx_ba_grant() {
-            g.check()?;
-        }
-        if let Some(g) = self.rx_ba_grant() {
-            g.check()?;
-        }
-        if let Some(g) = self.ht_grant() {
-            g.check()?;
-        }
-        if let Some(g) = self.qos_grant() {
-            g.check()?;
-        }
-        if self.ignore.get() == Some(reg) {
-            return Ok(());
-        }
-        let prior = self.registers.borrow_mut().insert(reg, value).unwrap_or(0);
-        if self.ps_bound.get() {
-            self.ps_trace.borrow_mut().push((reg, value));
-        }
-        if reg == RXDP {
-            self.cursor.set(value);
-        }
-        if reg == CR && value == 4 && self.cursor.get() == 0 {
-            if let Some(last) = self.last_rx.get() {
-                self.cursor.set(self.word(last)?);
+        self.with_periodic(|| {
+            self.as_ref().access()?;
+            self.power_awake()?;
+            if let Some(g) = self.tx_ba_grant() {
+                g.check()?;
             }
-        }
-        if reg == QTXE && value.count_ones() == 1 && value & 0xf != 0 {
-            if !self.master.get() || !self.allowed.get() {
-                return Err(Error::Access);
+            if let Some(g) = self.rx_ba_grant() {
+                g.check()?;
             }
-            let queue = u64::from(value.trailing_zeros());
-            self.tx_queue.set(queue);
-            self.queues.borrow_mut().push(queue);
-            let descriptor = self.read(QTXDP + queue * 4)?;
-            // Follow only the actual native links, with cycle/extent bounds.
-            // Payloads are read through the retained DMA maps below.
-            let mut chain = vec![descriptor];
-            while let Some(next) = chain
-                .last()
-                .map(|address| self.word(*address))
-                .transpose()?
-            {
-                if next == 0 {
-                    break;
+            if let Some(g) = self.ht_grant() {
+                g.check()?;
+            }
+            if let Some(g) = self.qos_grant() {
+                g.check()?;
+            }
+            if self.ignore.get() == Some(reg) {
+                return Ok(());
+            }
+            let prior = self.registers.borrow_mut().insert(reg, value).unwrap_or(0);
+            if self.ps_bound.get() {
+                self.ps_trace.borrow_mut().push((reg, value));
+            }
+            if reg == RXDP {
+                self.cursor.set(value);
+            }
+            if reg == CR && value == 4 && self.cursor.get() == 0 {
+                if let Some(last) = self.last_rx.get() {
+                    self.cursor.set(self.word(last)?);
                 }
-                if chain.len() >= crate::ath9k::tx_ba::MAX_MEMBERS || chain.contains(&next) {
-                    return Err(Error::Descriptor);
-                }
-                chain.push(next);
             }
-            let tail = if chain.len() > 1 {
-                *chain.last().ok_or(Error::Descriptor)?
-            } else {
-                0
-            };
-            if tail != 0 {
-                for (index, member) in chain.iter().enumerate() {
-                    let flags = if index + 1 == chain.len() {
-                        0x4000_0000
-                    } else {
-                        0x6000_0000
-                    };
-                    if self.word(*member + 12)? & 0x6000_0000 != flags
-                        || index != 0
-                            && [16, 20, 24, 28, 36]
-                                .into_iter()
-                                .any(|offset| self.word(*member + offset) != Ok(0))
-                    {
+            if reg == QTXE && value.count_ones() == 1 && value & 0xf != 0 {
+                if !self.master.get() || !self.allowed.get() {
+                    return Err(Error::Access);
+                }
+                let queue = u64::from(value.trailing_zeros());
+                self.tx_queue.set(queue);
+                self.queues.borrow_mut().push(queue);
+                let descriptor = self.read(QTXDP + queue * 4)?;
+                // Follow only the actual native links, with cycle/extent bounds.
+                // Payloads are read through the retained DMA maps below.
+                let mut chain = vec![descriptor];
+                while let Some(next) = chain
+                    .last()
+                    .map(|address| self.word(*address))
+                    .transpose()?
+                {
+                    if next == 0 {
+                        break;
+                    }
+                    if chain.len() >= crate::ath9k::tx_ba::MAX_MEMBERS || chain.contains(&next) {
                         return Err(Error::Descriptor);
                     }
+                    chain.push(next);
                 }
-                self.pair_tail.set(Some(tail));
-                self.last_pair.set(Some((descriptor, tail)));
-                *self.last_chain.borrow_mut() = chain.clone();
-            }
-            self.tx.set(Some(descriptor));
-            self.registers.borrow_mut().insert(QSTS + queue * 4, 1);
-            let reaction = { self.reaction.borrow().clone() };
-            let mut held = reaction.is_none() || tail != 0 && self.hold_pair.get();
-            let mut ack = true;
-            for (i, d) in chain.into_iter().enumerate() {
-                if d == 0 {
-                    continue;
-                }
-                let (dma, observed) = self.wire(d)?;
-                if tail != 0 && i == 0 {
-                    self.pair_seq
-                        .set(u16::from_le_bytes([observed[22], observed[23]]) >> 4);
-                }
-                self.dma_transmitted.borrow_mut().push(dma);
-                self.transmitted.borrow_mut().push(observed.clone());
-                let data = observed.first() == Some(&0x88);
-                if data && tail == 0 {
-                    ack = self.data_ack.get();
-                }
-                let received = if tail != 0 {
-                    self.pair_received.get() & (1 << i) != 0
+                let tail = if chain.len() > 1 {
+                    *chain.last().ok_or(Error::Descriptor)?
                 } else {
-                    !data || observed[1] & 8 == 0 || self.retry_receive.get()
+                    0
                 };
-                if received {
-                    if let Some(reaction) = &reaction {
-                        let (responses, hold) = reaction(&observed)?;
-                        held |= hold;
-                        for response in responses {
-                            // A solicited compressed BA is consumed by the native
-                            // MAC into BAR TX status, never invented as RAW RX.
-                            if observed.first() == Some(&0x84)
-                                && response.len() == 28
-                                && response[..2] == [0x94, 0]
-                                && response[4..10] == observed[10..16]
-                                && response[10..16] == observed[4..10]
-                            {
-                                *self.bar_reply.borrow_mut() = Some(response);
-                            } else {
-                                self.inject(&response, 0)?;
+                if tail != 0 {
+                    for (index, member) in chain.iter().enumerate() {
+                        let flags = if index + 1 == chain.len() {
+                            0x4000_0000
+                        } else {
+                            0x6000_0000
+                        };
+                        if self.word(*member + 12)? & 0x6000_0000 != flags
+                            || index != 0
+                                && [16, 20, 24, 28, 36]
+                                    .into_iter()
+                                    .any(|offset| self.word(*member + offset) != Ok(0))
+                        {
+                            return Err(Error::Descriptor);
+                        }
+                    }
+                    self.pair_tail.set(Some(tail));
+                    self.last_pair.set(Some((descriptor, tail)));
+                    *self.last_chain.borrow_mut() = chain.clone();
+                }
+                self.tx.set(Some(descriptor));
+                self.registers.borrow_mut().insert(QSTS + queue * 4, 1);
+                let reaction = { self.reaction.borrow().clone() };
+                let mut held = reaction.is_none() || tail != 0 && self.hold_pair.get();
+                let mut ack = true;
+                for (i, d) in chain.into_iter().enumerate() {
+                    if d == 0 {
+                        continue;
+                    }
+                    let (dma, observed) = self.wire(d)?;
+                    if tail != 0 && i == 0 {
+                        self.pair_seq
+                            .set(u16::from_le_bytes([observed[22], observed[23]]) >> 4);
+                    }
+                    self.dma_transmitted.borrow_mut().push(dma);
+                    self.transmitted.borrow_mut().push(observed.clone());
+                    let data = observed.first() == Some(&0x88);
+                    if data && tail == 0 {
+                        ack = self.data_ack.get();
+                    }
+                    let received = if tail != 0 {
+                        self.pair_received.get() & (1 << i) != 0
+                    } else {
+                        !data || observed[1] & 8 == 0 || self.retry_receive.get()
+                    };
+                    if received {
+                        if let Some(reaction) = &reaction {
+                            let (responses, hold) = reaction(&observed)?;
+                            held |= hold;
+                            for response in responses {
+                                // A solicited compressed BA is consumed by the native
+                                // MAC into BAR TX status, never invented as RAW RX.
+                                if observed.first() == Some(&0x84)
+                                    && response.len() == 28
+                                    && response[..2] == [0x94, 0]
+                                    && response[4..10] == observed[10..16]
+                                    && response[10..16] == observed[4..10]
+                                {
+                                    *self.bar_reply.borrow_mut() = Some(response);
+                                } else {
+                                    self.inject(&response, 0)?;
+                                }
                             }
                         }
                     }
                 }
+                if !held {
+                    self.complete(ack)?;
+                }
             }
-            if !held {
-                self.complete(ack)?;
+            if reg == CR && value == 0x20 {
+                let rxe = if self.stuck_rx.get() { 4 } else { 0 };
+                self.registers.borrow_mut().insert(CR, rxe);
             }
-        }
-        if reg == CR && value == 0x20 {
-            let rxe = if self.stuck_rx.get() { 4 } else { 0 };
-            self.registers.borrow_mut().insert(CR, rxe);
-        }
-        if reg == 0x4028 {
-            // AR_INTR_SYNC_CAUSE_CLR is write-one-to-clear.
-            self.registers.borrow_mut().insert(reg, prior & !value);
-        }
-        if reg == CR && value == 4 && self.stuck_rx.get() {
-            self.registers.borrow_mut().insert(CR, 4);
-        }
-        if reg == QTXD && value & 1 != 0 && !self.stuck_tx.get() {
-            // Disabled DCU: the in-flight descriptor is abandoned unsent.
-            self.registers.borrow_mut().insert(QTXE, 0);
-            self.registers
-                .borrow_mut()
-                .insert(QSTS + self.tx_queue.get() * 4, 0);
-            self.tx.set(None);
-            self.pair_tail.set(None);
-        }
-        Ok(())
+            if reg == 0x4028 {
+                // AR_INTR_SYNC_CAUSE_CLR is write-one-to-clear.
+                self.registers.borrow_mut().insert(reg, prior & !value);
+            }
+            if reg == CR && value == 4 && self.stuck_rx.get() {
+                self.registers.borrow_mut().insert(CR, 4);
+            }
+            if reg == QTXD && value & 1 != 0 && !self.stuck_tx.get() {
+                // Disabled DCU: the in-flight descriptor is abandoned unsent.
+                self.registers.borrow_mut().insert(QTXE, 0);
+                self.registers
+                    .borrow_mut()
+                    .insert(QSTS + self.tx_queue.get() * 4, 0);
+                self.tx.set(None);
+                self.pair_tail.set(None);
+            }
+            Ok(())
+        })
     }
     fn delay_us(&self, us: u64) {
-        self.now.set(self.now.get() + us);
+        let jump = { self.periodic.borrow().delay_jump };
+        self.now.set(self.now.get() + us + jump);
     }
     fn release(&self, buffers: Vec<DmaBuffer>) {
         self.released.borrow_mut().extend(buffers);
@@ -1172,5 +1227,7 @@ kernel_test_in!(
     smoke_ar9285_packet_msi_cause_kill_resume_and_fatal
 );
 
+#[path = "periodic_model.rs"]
+pub(in crate::ath9k) mod periodic_model;
 #[path = "ps_model.rs"]
 mod power;

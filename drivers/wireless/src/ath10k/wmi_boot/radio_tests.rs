@@ -42,6 +42,7 @@ struct RadioModel {
     data: Option<data_tests::Fixture>,
     active: Option<active_scan_tests::Fixture>,
     associated: Option<associated_scan_tests::Fixture>,
+    offchannel: Option<offchannel_native::Fixture>,
     ps: Option<power_save_tests::Fixture>,
     ps_default_off: bool,
     frequency: u16,
@@ -288,12 +289,16 @@ impl Hif for RadioModel {
         if let Some(ce) = &mut self.ce {
             ce.begin_send(pipe, bytes)?;
         }
+        if offchannel_native::is_htt(self, bytes) {
+            return offchannel_native::htt_send(self, bytes);
+        }
         data_tests::send_now(self, bytes)
     }
     fn poll_now(&mut self) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
         if let Some(ce) = &mut self.ce {
             ce.poll_now()?;
         }
+        offchannel_native::poll(self)?;
         data_tests::poll(self)?;
         match self.inner.inner.rx.pop_front() {
             Some((pipe, bytes)) => match &mut self.ce {
@@ -304,6 +309,7 @@ impl Hif for RadioModel {
         }
     }
     async fn poll(&mut self, b: u64) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        offchannel_native::poll(self)?;
         data_tests::poll(self)?;
         if self.mismatch_rx && self.inner.inner.rx.is_empty() {
             // Literal TLV management RX containing an otherwise valid Open
@@ -348,6 +354,9 @@ impl Hif for RadioModel {
             }
             ce.send(pipe, bytes).await?;
         }
+        if pipe == 4 && offchannel_native::is_htt(self, bytes) {
+            return offchannel_native::htt_send(self, bytes);
+        }
         if pipe == 4 && self.data.is_some() {
             return data_tests::send(self, bytes).await;
         }
@@ -368,6 +377,9 @@ impl Hif for RadioModel {
         self.sequence = self.sequence.wrapping_add(1);
         if let Some(stage) = chains_tests::stage(self.inner.inner.dialect, &bytes[8..]) {
             return chains_tests::send(self, bytes, stage).await;
+        }
+        if offchannel_native::handles(self, &bytes[8..]) {
+            return offchannel_native::send(self, bytes);
         }
         if coexistence_native::handles(self, &bytes[8..]) {
             return coexistence_native::send(self, bytes);
@@ -605,19 +617,30 @@ fn radio_boot_source(
     ht: Option<u32>,
     source: RadioSource,
 ) -> radio::Radio<RadioModel> {
+    radio_boot_source_version(version, dialect, features, (major, 1), factory, ht, source)
+}
+fn radio_boot_source_version(
+    version: u32,
+    dialect: Dialect,
+    features: u64,
+    htt_version: (u8, u8),
+    factory: u32,
+    ht: Option<u32>,
+    source: RadioSource,
+) -> radio::Radio<RadioModel> {
     let RadioSource {
         hardware,
         rf_chains,
         vht,
     } = source;
-    let htt_version = if dialect == Dialect::Tlv {
+    let htt_dialect = if dialect == Dialect::Tlv {
         3
     } else if dialect == Dialect::TenFour {
         4
     } else {
         1
     };
-    let c = htt::Config::new(hardware, version, htt_version, 0).unwrap();
+    let c = htt::Config::new(hardware, version, htt_dialect, 0).unwrap();
     let mut inner = HttModel::new(dialect, c, hardware);
     if dialect == Dialect::TenFour && hardware == HwRev::Qca9888 {
         // Independent Linux resource words8/9: QCA9888 has two physical
@@ -640,7 +663,8 @@ fn radio_boot_source(
         };
         inner.inner.expected[at..at + 4].fill(0);
     }
-    inner.version = major;
+    inner.version = htt_version.0;
+    inner.minor = htt_version.1;
     let model = RadioModel {
         sources: None,
         inner,
@@ -674,6 +698,7 @@ fn radio_boot_source(
         chain_stall: None,
         coexistence: None,
         associated: None,
+        offchannel: None,
     };
     let mut htc = Session::new(model, hardware);
     assert_eq!(once(htc.start()), Poll::Ready(Ok(())));
@@ -947,5 +972,7 @@ mod associated_scan_tests;
 mod chains_tests;
 #[path = "coexistence_native.rs"]
 mod coexistence_native;
+#[path = "offchannel_native.rs"]
+mod offchannel_native;
 #[path = "power_save_tests.rs"]
 mod power_save_tests;

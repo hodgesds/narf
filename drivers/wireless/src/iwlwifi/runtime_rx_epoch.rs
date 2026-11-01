@@ -173,7 +173,8 @@ impl Hardware {
     ) -> Result<Vec<Packet>, &'static str> {
         let mut body = vec![0; if baid.is_some() { 24 } else { 20 }];
         let queues = self.receive_queue_count();
-        let mut prefix = if self.is_mvm89() {
+        let mvm_sync = self.is_mvm89() || self.ap_legacy_selected();
+        let mut prefix = if mvm_sync {
             super::super::rx_multi::Prefix::gen2(queues, cookie, baid)?
         } else {
             super::super::rx_multi::Prefix::new(queues, cookie, baid)?
@@ -182,7 +183,7 @@ impl Hardware {
         let count = if baid.is_some() { 12 } else { 8 };
         boot_context::put32(&mut body, 8, count);
         body[12] = u8::from(baid.is_some()); // EMPTY0 / DEL_BA1
-        if self.is_mvm89() {
+        if mvm_sync {
             boot_context::put16(&mut body, 14, 1);
         }
         boot_context::put32(&mut body, 16, cookie);
@@ -214,8 +215,12 @@ impl Hardware {
                 }
                 if packet.receive_queue == 0
                     && packet.header.cmd == 0xc1
-                    && scan_api::mpdu(&packet.payload)
-                        .is_some_and(|m| m.frame.first().is_some_and(|fc| fc & 12 == 0))
+                    && (if self.ap_legacy_selected() {
+                        scan_api::mpdu_gen2(&packet.payload)
+                    } else {
+                        scan_api::mpdu(&packet.payload)
+                    })
+                    .is_some_and(|m| m.frame.first().is_some_and(|fc| fc & 12 == 0))
                 {
                     if management.len() == 32 {
                         return Err("MLD RX epoch management prefix bound");

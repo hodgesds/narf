@@ -226,6 +226,14 @@ impl RadioEventAuthority {
         signal_dbm: Option<i8>,
         frame: &[u8],
     ) -> Result<(), WirelessError> {
+        self.deliver(59, self.management_attrs(frequency_mhz, signal_dbm, frame)?)
+    }
+    fn management_attrs(
+        &self,
+        frequency_mhz: u32,
+        signal_dbm: Option<i8>,
+        frame: &[u8],
+    ) -> Result<Vec<u8>, WirelessError> {
         if !(24..=4096).contains(&frame.len()) || frame[0] & 15 != 0 || frequency_mhz == 0 {
             return Err(WirelessError::InvalidArgs);
         }
@@ -235,7 +243,33 @@ impl RadioEventAuthority {
             attr(&mut attrs, 151, &i32::from(signal).to_ne_bytes());
         }
         attr(&mut attrs, 51, frame);
-        self.deliver(59, attrs)
+        Ok(attrs)
+    }
+    /// Perform arbitrary source/interface checks and serialization outside
+    /// native State. The driver then checks its fresh policy/IO/native copy
+    /// facts, before the callback-free fixed fence in `deliver` below.
+    pub fn prepare_management_received(
+        &self,
+        frequency_mhz: u32,
+        signal_dbm: Option<i8>,
+        frame: &[u8],
+    ) -> Result<PreparedRadioManagementEvent, WirelessError> {
+        let attrs = self.management_attrs(frequency_mhz, signal_dbm, frame)?;
+        let iface = self
+            .source
+            .guard
+            .iface
+            .upgrade()
+            .ok_or(WirelessError::Denied)?;
+        let original = self.source.native_emission_for(iface.as_ref())?;
+        self.current()?;
+        let message = radio_message(59, &attrs);
+        self.current()?;
+        Ok(PreparedRadioManagementEvent {
+            source: self.clone(),
+            original,
+            message,
+        })
     }
     /// The native scheduled request is running only after the driver's
     /// matching firmware start receipt. Admission/queued work is insufficient.
@@ -307,12 +341,7 @@ impl RadioEventAuthority {
     }
     fn deliver(&self, command: u8, attrs: Vec<u8>) -> Result<(), WirelessError> {
         self.current()?;
-        let mut message = vec![0; 16];
-        message[4..6].copy_from_slice(&crate::nl80211::NL80211_FAMILY_ID.to_ne_bytes());
-        message.extend_from_slice(&[command, 1, 0, 0]);
-        message.extend_from_slice(&attrs);
-        let len = message.len() as u32;
-        message[..4].copy_from_slice(&len.to_ne_bytes());
+        let message = radio_message(command, &attrs);
         self.current()?;
         self.source
             .guard
@@ -326,4 +355,85 @@ fn attr(out: &mut Vec<u8>, kind: u16, payload: &[u8]) {
     out.extend_from_slice(&kind.to_ne_bytes());
     out.extend_from_slice(payload);
     out.resize((out.len() + 3) & !3, 0);
+}
+
+/// Managed-netdev native emission proof. The original Radio-kind source,
+/// concrete receiver, current netdev registration and grant remain bound.
+/// This wrapper cannot be constructed from a captured AP emission guard.
+#[derive(Clone, Debug)]
+pub struct RadioEmissionAuthority(super::emission::ApEmissionAuthority);
+impl RadioControlAuthority {
+    pub fn native_emission_for<I: WirelessNetIface + ?Sized>(
+        &self,
+        receiver: &I,
+    ) -> Result<RadioEmissionAuthority, WirelessError> {
+        if !matches!(self.guard.kind, ControlKind::Radio) || self.guard.mode != 2 {
+            return Err(WirelessError::NotSupported);
+        }
+        Ok(RadioEmissionAuthority(
+            self.guard.capture_native_emission(receiver)?,
+        ))
+    }
+}
+impl RadioEmissionAuthority {
+    pub fn current(&self) -> bool {
+        self.0.current()
+    }
+    pub fn matches_role<I: WirelessNetIface + ?Sized>(
+        &self,
+        receiver: &I,
+        generation: core::num::NonZeroU64,
+    ) -> bool {
+        self.0.matches_role(receiver, 2, generation)
+    }
+    pub fn watch(&self, waker: &core::task::Waker) -> bool {
+        self.0.watch(waker)
+    }
+}
+
+/// Borrowed native copy boundary; no cap or RF authority is minted. The
+/// driver advances this nonwrapping epoch before RF/filter closure and
+/// separately validates current policy/IO after event preparation.
+pub struct RadioReceiveFence<'a> {
+    pub epoch: &'a core::sync::atomic::AtomicU64,
+    pub generation: u64,
+    pub receiver: &'a RadioEmissionAuthority,
+    pub origin: &'a RadioEmissionAuthority,
+}
+/// Serialized for its original source/namespace/IFINDEX only. No new
+/// endpoint/provider lookup or dynamic current callback occurs in deliver.
+#[derive(Debug)]
+pub struct PreparedRadioManagementEvent {
+    source: RadioEventAuthority,
+    original: RadioEmissionAuthority,
+    message: Vec<u8>,
+}
+impl PreparedRadioManagementEvent {
+    pub fn deliver(self, fence: RadioReceiveFence<'_>) -> Result<(), WirelessError> {
+        if matches!(fence.generation, 0 | u64::MAX)
+            || !matches!(self.source.source.guard.kind, ControlKind::Radio)
+            || self.source.source.guard.mode != 2
+            || !self.original.0.matches_control(&self.source.source.guard)
+            || !fence.receiver.0.matches_control(&self.source.source.guard)
+            || !fence.origin.0.matches_control(&self.source.source.guard)
+            || fence.epoch.load(core::sync::atomic::Ordering::Acquire) != fence.generation
+        {
+            return Err(WirelessError::Denied);
+        }
+        self.source
+            .source
+            .guard
+            .reply
+            .deliver(self.message)
+            .map_err(|_| WirelessError::Denied)
+    }
+}
+fn radio_message(command: u8, attrs: &[u8]) -> Vec<u8> {
+    let mut message = vec![0; 16];
+    message[4..6].copy_from_slice(&crate::nl80211::NL80211_FAMILY_ID.to_ne_bytes());
+    message.extend_from_slice(&[command, 1, 0, 0]);
+    message.extend_from_slice(attrs);
+    let len = message.len() as u32;
+    message[..4].copy_from_slice(&len.to_ne_bytes());
+    message
 }

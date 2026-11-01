@@ -9,6 +9,8 @@ pub enum Phase {
     New,
     Starting,
     Configured,
+    PreparingAp,
+    ApActive,
     Scanning,
     ReadingSharedMemory,
     PreparingChannel,
@@ -156,6 +158,9 @@ impl Owner {
                 .collect(),
         );
         self.mac = Some(mac);
+        if let Ok(parsed) = super::parse_ucode(&self.firmware) {
+            self.hardware.retain_gen2_ap_adapter(&parsed.api, &nvm);
+        }
         self.nvm = Some(nvm);
         // Private RAM fixtures share one MAC and must not leak key history
         // into each other; native owners adopt their radio's ledger.
@@ -234,8 +239,15 @@ mod ba;
 mod phy;
 pub(super) use phy::local_ht;
 pub(super) use phy::{local_ht_for, local_vht_for};
+#[path = "mvm_ap_power.rs"]
+mod ap_power;
 #[path = "mvm_power.rs"]
 mod power;
+pub(in crate::iwlwifi) type ApPower = ap_power::Fence;
+pub(in crate::iwlwifi) type ApPowerPlan = ap_power::Plan;
+pub(in crate::iwlwifi) type ApPreparedPower = power::Prepared;
+#[path = "mvm_ap.rs"]
+mod ap;
 pub type PowerRequest = power::PowerRequest;
 pub type PowerStatus = power::PowerStatus;
 pub(super) use power::feature as feature_bits;

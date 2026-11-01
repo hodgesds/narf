@@ -634,6 +634,9 @@ pub struct Hardware {
     /// The actual installed6GHz AP power/HE snapshot. This constraint
     /// gate is checked after native credit waits at every TX publication.
     six_tx_profile: Option<alloc::sync::Arc<super::six_ghz_station::Profile>>,
+    ap_owner: Option<alloc::sync::Arc<super::ap_owner::Owner>>,
+    ap_request: Option<alloc::sync::Arc<super::ap_owner::Request>>,
+    ap_gen2: Option<super::ap_gen2_wire::Adapter>,
     mld_link: Option<alloc::sync::Arc<super::sc_mlo::Binding>>,
     eht_source: Option<super::sc_eht::Source>,
     bios_versions: Vec<u8>,
@@ -753,6 +756,9 @@ impl Hardware {
             scan_six_capabilities: u8::from(parsed.api.has_capability(59))
                 | (u8::from(parsed.api.has_capability(10)) << 1),
             six_tx_profile: None,
+            ap_owner: None,
+            ap_request: None,
+            ap_gen2: None,
             mld_link: None,
             eht_source: None,
             bios_versions: parsed.api.bios_commands.unwrap_or(&[]).to_vec(),
@@ -1461,6 +1467,10 @@ impl Hardware {
     }
 
     pub(super) fn clear_rf_policy(&mut self) {
+        self.ap_request = None;
+        if let Some(owner) = self.ap_owner.take() {
+            owner.retire();
+        }
         self.six_tx_profile = None;
         self.mld_link = None;
         if let Some(policy) = self.rf_policy.take() {
@@ -1746,7 +1756,7 @@ impl Hardware {
         header_len: usize,
         rate: Option<u32>,
     ) -> Result<(), &'static str> {
-        self.transmit_owned(id, frame, header_len, rate, false, 0)
+        self.transmit_owned(id, frame, header_len, rate, false, 0, None)
             .await
     }
 
@@ -1760,7 +1770,7 @@ impl Hardware {
         rate: Option<u32>,
         assist: u32,
     ) -> Result<(), &'static str> {
-        self.transmit_owned(id, frame, header_len, rate, false, assist)
+        self.transmit_owned(id, frame, header_len, rate, false, assist, None)
             .await
     }
 
@@ -1774,10 +1784,22 @@ impl Hardware {
         header_len: usize,
         rate: Option<u32>,
     ) -> Result<(), &'static str> {
-        self.transmit_owned(id, frame, header_len, rate, true, 0)
+        self.transmit_owned(id, frame, header_len, rate, true, 0, None)
             .await
     }
 
+    pub(in crate::iwlwifi) async fn transmit_ap(
+        &mut self,
+        id: u16,
+        frame: &[u8],
+        header_len: usize,
+        rate: Option<u32>,
+        encrypt: bool,
+    ) -> Result<(), &'static str> {
+        self.transmit_owned(id, frame, header_len, rate, false, 0, Some(encrypt))
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
     async fn transmit_owned(
         &mut self,
         id: u16,
@@ -1786,6 +1808,7 @@ impl Hardware {
         rate: Option<u32>,
         closing: bool,
         assist: u32,
+        encrypt: Option<bool>,
     ) -> Result<(), &'static str> {
         // A credit wait can copy a newer AP TPE. Resolve its exact native
         // power receipt before publishing this still-unsubmitted frame.
@@ -1821,8 +1844,10 @@ impl Hardware {
             .iter_mut()
             .find(|q| q.id() == Some(id))
             .ok_or("unknown TX queue")?;
-        let ssn = sources
-            .invoke(|| queue.send_assisted(&mut self.mmio, frame, header_len, rate, assist))?;
+        let ssn = sources.invoke(|| match encrypt {
+            Some(encrypt) => queue.send_ap(&mut self.mmio, frame, header_len, rate, encrypt),
+            None => queue.send_assisted(&mut self.mmio, frame, header_len, rate, assist),
+        })?;
         self.count_protected(frame);
         let deadline = narf_time::Deadline::after_ms(2000);
         loop {
@@ -2068,3 +2093,6 @@ mod bz_profile;
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "runtime_bz_tests.rs"]
 mod bz_tests;
+
+#[path = "runtime_ap.rs"]
+mod ap;

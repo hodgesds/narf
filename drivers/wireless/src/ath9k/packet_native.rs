@@ -7,6 +7,8 @@ use super::{
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
+#[path = "packet_native/periodic.rs"]
+mod live_calibration;
 enum InstalledPower {
     Twenty([(u64, u32); 7]),
     Forty(super::calibration::wide::WideReport),
@@ -37,6 +39,7 @@ pub(super) struct Native {
     ps_bound: AtomicBool,
     ps_sleeping: AtomicBool,
     ps_failed: AtomicBool,
+    periodic: narf_lib::sync::IrqSafeSpinLock<live_calibration::Slot>,
     msi: narf_lib::sync::IrqSafeSpinLock<Option<Msi>>,
 }
 /// Single MSI vector (Linux `ath9k_use_msi` + `pci_enable_msi`). The handler
@@ -127,6 +130,7 @@ impl Native {
             ps_bound: AtomicBool::new(false),
             ps_sleeping: AtomicBool::new(false),
             ps_failed: AtomicBool::new(false),
+            periodic: narf_lib::sync::IrqSafeSpinLock::new(live_calibration::Slot::default()),
             msi: narf_lib::sync::IrqSafeSpinLock::new(None),
         })
     }
@@ -242,6 +246,101 @@ impl Native {
     fn invoke<T>(&self, operation: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
         identity::invoke(&self.cap, operation).map_err(|_| Error::Access)?
     }
+    fn physical_readback(&self, active: bool, periodic: bool) -> Result<(), Error> {
+        let command = self.command()?;
+        if (command & narf_bus::pci::cmd::BUS_MASTER != 0) != active
+            || self.active.load(Ordering::Acquire) != active
+        {
+            return Err(Error::Access);
+        }
+        let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
+        let permission =
+            super::calibration::Permission::from_domain_at(&domain, self.report.frequency_mhz)
+                .map_err(|_| Error::Access)?;
+        if !permission.allows_report(self.report) {
+            return Err(Error::Access);
+        }
+        if let Some(powers) = &self.powers {
+            // Raw loads stay inside this current BusDevice invocation;
+            // using Port::read here would recursively enter access().
+            let read = |register| -> Result<u32, Error> {
+                self.extent(register)?;
+                // SAFETY: full dword BAR bounds and current exclusive PCI
+                // authority were checked above; no competing channel writer.
+                Ok(unsafe { self.bar.read32(register) })
+            };
+            let geometry = self.geometry();
+            if read(0x9874)? & 0x3fff_ffff
+                != (0x3000_0000 | (u32::from(geometry.center()) * 0x10000 / 15))
+                || read(0x9804)? & 0x7ff != geometry.turbo()
+            {
+                return Err(Error::Descriptor);
+            }
+            for (register, value) in powers.registers() {
+                if read(*register)? != *value {
+                    return Err(Error::Descriptor);
+                }
+            }
+            if let InstalledPower::Forty(actual) = powers {
+                let iq =
+                    0x800 | (u32::from(actual.report.iq_i) << 5) | (actual.report.iq_q as u32 & 31);
+                if read(0x8318)? != 1
+                    || !periodic && (read(0x99b4)? != actual.adc || read(0x9920)? & 0xfff != iq)
+                {
+                    return Err(Error::Descriptor);
+                }
+            }
+        }
+        if let Some((gpio, polarity)) = self.rf_silent {
+            self.extent(0x4048)?;
+            // SAFETY: checked full input-register extent in current PCI
+            // invocation, without recursively entering this access helper.
+            let value = unsafe { self.bar.read32(0x4048) };
+            if value == u32::MAX || (value & (1 << (12 + gpio)) != 0) == polarity {
+                return Err(Error::Access);
+            }
+        }
+        if periodic {
+            let source = { self.ht.lock().clone().ok_or(Error::Access)? };
+            source.periodic_physical(|register| {
+                self.extent(register)?;
+                // SAFETY: full checked extent in this current PCI invocation.
+                Ok(unsafe { self.bar.read32(register) })
+            })?;
+            self.extent(0x7044)?;
+            // SAFETY: invoked only inside the current retained PCI capability.
+            if unsafe { self.bar.read32(0x7044) } & 15 != 2 {
+                return Err(Error::State);
+            }
+        }
+        Ok(())
+    }
+    fn invoke_packet_sources<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let grant = { self.ht.lock().clone() };
+        let ba = { self.ba.lock().clone() };
+        let tx = { self.tx_ba.lock().clone() };
+        let qos = { self.qos.lock().clone() };
+        let operation = || match (ba, grant) {
+            (Some(g), _) => g.invoke(operation),
+            (None, Some(g)) => g.invoke(operation),
+            (None, None) => operation(),
+        };
+        let operation = || {
+            if let Some(g) = tx {
+                g.invoke(operation)
+            } else {
+                operation()
+            }
+        };
+        if let Some(g) = qos {
+            g.invoke(operation)
+        } else {
+            operation()
+        }
+    }
 }
 
 #[cfg(feature = "kernel-test")]
@@ -324,6 +423,44 @@ narf_kernel_test::kernel_test_in!(
     smoke_ar9285_native_packet_revocation_precedes_config_dma_and_mmio
 );
 impl Port for Native {
+    fn periodic_grant(&self) -> Option<alloc::sync::Arc<super::periodic::Grant>> {
+        self.periodic_source()
+    }
+    fn bind_periodic(
+        &self,
+        source: &alloc::sync::Arc<super::periodic::Grant>,
+    ) -> Result<(), Error> {
+        self.periodic_begin(source)
+    }
+    fn periodic_initial(
+        &self,
+    ) -> Result<
+        (
+            super::calibration::Report,
+            Option<super::calibration::wide::WideReport>,
+        ),
+        Error,
+    > {
+        self.periodic_report()
+    }
+    fn periodic_read(&self, register: u64) -> Result<u32, Error> {
+        self.periodic_read_raw(register)
+    }
+    fn periodic_write(&self, register: u64, value: u32) -> Result<(), Error> {
+        self.periodic_write_raw(register, value)
+    }
+    fn periodic_install(&self, live: super::periodic::Live) -> Result<(), Error> {
+        self.install_periodic(live)
+    }
+    fn periodic_failed(&self) {
+        self.fail_periodic();
+    }
+    fn periodic_current(&self) -> Result<bool, Error> {
+        match self.periodic_snapshot()? {
+            Some(_) => self.access(self.active.load(Ordering::Acquire), || Ok(true)),
+            None => Ok(false),
+        }
+    }
     fn ps_grant(&self) -> Option<alloc::sync::Arc<super::ps::Grant>> {
         if let Some(source) = self.ps.lock().clone() {
             return Some(source);
@@ -332,7 +469,19 @@ impl Port for Native {
         let mut retained = self.ps.lock();
         Some(retained.get_or_insert(source).clone())
     }
+    fn station_ps_current(&self) -> Result<bool, Error> {
+        if !self.ps_bound.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        // Reuse actual current S/base/child/PCI and awake/physical checks.
+        // access() does not call HT readback, so this cannot recurse through
+        // the IER field whose admitted value this observation distinguishes.
+        self.access(self.active.load(Ordering::Acquire), || Ok(true))
+    }
     fn bind_ps(&self, source: &alloc::sync::Arc<super::ps::Grant>) -> Result<(), Error> {
+        if self.has_periodic() {
+            return Err(Error::State);
+        }
         if self
             .ps_grant()
             .is_none_or(|current| !alloc::sync::Arc::ptr_eq(&current, source))
@@ -476,83 +625,20 @@ impl Port for Native {
                         return Err(Error::State);
                     }
                 }
-                let command = self.command()?;
-                if (command & narf_bus::pci::cmd::BUS_MASTER != 0) != active
-                    || self.active.load(Ordering::Acquire) != active
-                {
-                    return Err(Error::Access);
+                let periodic = self.periodic_snapshot()?;
+                if periodic.is_some() && ps.is_some() {
+                    return Err(Error::State);
                 }
-                let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
-                let permission = super::calibration::Permission::from_domain_at(
-                    &domain,
-                    self.report.frequency_mhz,
-                )
-                .map_err(|_| Error::Access)?;
-                if !permission.allows_report(self.report) {
-                    return Err(Error::Access);
-                }
-                if let Some(powers) = &self.powers {
-                    // Raw loads stay inside this current BusDevice invocation;
-                    // using Port::read here would recursively enter access().
-                    let read = |register| -> Result<u32, Error> {
-                        self.extent(register)?;
-                        // SAFETY: full dword BAR bounds and current exclusive PCI
-                        // authority were checked above; no competing channel writer.
-                        Ok(unsafe { self.bar.read32(register) })
-                    };
-                    let geometry = self.geometry();
-                    if read(0x9874)? & 0x3fff_ffff
-                        != (0x3000_0000 | (u32::from(geometry.center()) * 0x10000 / 15))
-                        || read(0x9804)? & 0x7ff != geometry.turbo()
-                    {
-                        return Err(Error::Descriptor);
+                let action = || {
+                    self.physical_readback(active, periodic.is_some())?;
+                    if let Some((_, live)) = &periodic {
+                        live.readback(&live_calibration::Raw { native: self })?;
                     }
-                    for (register, value) in powers.registers() {
-                        if read(*register)? != *value {
-                            return Err(Error::Descriptor);
-                        }
-                    }
-                    if let InstalledPower::Forty(actual) = powers {
-                        let iq = 0x800
-                            | (u32::from(actual.report.iq_i) << 5)
-                            | (actual.report.iq_q as u32 & 31);
-                        if read(0x8318)? != 1
-                            || read(0x99b4)? != actual.adc
-                            || read(0x9920)? & 0xfff != iq
-                        {
-                            return Err(Error::Descriptor);
-                        }
-                    }
-                }
-                if let Some((gpio, polarity)) = self.rf_silent {
-                    self.extent(0x4048)?;
-                    // SAFETY: checked full input-register extent in current PCI
-                    // invocation, without recursively entering this access helper.
-                    let value = unsafe { self.bar.read32(0x4048) };
-                    if value == u32::MAX || (value & (1 << (12 + gpio)) != 0) == polarity {
-                        return Err(Error::Access);
-                    }
-                }
-                let grant = { self.ht.lock().clone() };
-                let ba = { self.ba.lock().clone() };
-                let tx = { self.tx_ba.lock().clone() };
-                let qos = { self.qos.lock().clone() };
-                let operation = || match (ba, grant) {
-                    (Some(g), _) => g.invoke(operation),
-                    (None, Some(g)) => g.invoke(operation),
-                    (None, None) => operation(),
+                    self.invoke_packet_sources(operation)
                 };
-                let operation = || {
-                    if let Some(g) = tx {
-                        g.invoke(operation)
-                    } else {
-                        operation()
-                    }
-                };
-                if let Some(g) = qos {
-                    g.invoke(operation)
-                } else {
-                    operation()
+                match periodic.as_ref() {
+                    Some((source, _)) => source.invoke_under(self.periodic_limit(), action),
+                    None => action(),
                 }
             };
             match ps.as_ref() {

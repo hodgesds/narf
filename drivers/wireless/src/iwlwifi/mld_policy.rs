@@ -25,6 +25,7 @@ impl Source {
             source: self.clone(),
             initial,
             validity: Validity::new(),
+            mvm_ap: None,
         })
     }
     pub fn bind(&self, program: Program) -> Result<Fence, &'static str> {
@@ -45,8 +46,17 @@ pub(super) struct Transaction {
     source: Source,
     initial: Arc<RegulatoryDomain>,
     validity: Validity,
+    mvm_ap: Option<Arc<super::mvm_boot::ApPower>>,
 }
 impl Transaction {
+    pub fn with_mvm_ap(
+        mut self,
+        power: Arc<super::mvm_boot::ApPower>,
+    ) -> Result<Self, &'static str> {
+        power.check(&self.initial)?;
+        self.mvm_ap = Some(power);
+        Ok(self)
+    }
     pub fn invalidate(&self) {
         self.validity.invalidate();
     }
@@ -54,6 +64,9 @@ impl Transaction {
         self.validity.check()?;
         if !Arc::ptr_eq(&self.initial, &self.source.snapshot()?) {
             return Err("Intel regulatory policy changed during native configuration");
+        }
+        if let Some(power) = &self.mvm_ap {
+            power.check(&self.initial)?;
         }
         Ok(())
     }
@@ -179,6 +192,8 @@ pub(super) struct Program {
     eht: bool,
     band: super::native_band::Band,
     six: Option<(narf_wireless::reg::PowerType6Ghz, u32)>,
+    ap: bool,
+    mvm_ap: Option<(Arc<super::mvm_boot::ApPower>, bool)>,
 }
 impl Program {
     #[allow(clippy::too_many_arguments)]
@@ -207,6 +222,8 @@ impl Program {
                 .ok_or("Intel legacy policy channel absent")?
                 .band,
             six: None,
+            ap: false,
+            mvm_ap: None,
         };
         program.check(domain)?;
         Ok(program)
@@ -234,9 +251,54 @@ impl Program {
             eht: false,
             band: channel.band,
             six: Some((profile.power_type(), profile.nvm_flags)),
+            ap: false,
+            mvm_ap: None,
         };
         program.check(domain)?;
         Ok(program)
+    }
+    /// Autonomous AP20 additionally requires actual ACTIVE/non-radar MCC
+    /// and host non-DFS permission at every copied/current publication.
+    pub fn with_ap(mut self) -> Result<Self, &'static str> {
+        if self.width != 0 || self.six.is_some() {
+            return Err("Intel AP policy lacks native AP20 span");
+        }
+        self.ap = true;
+        Ok(self)
+    }
+    pub fn new_mvm_ap(
+        domain: &RegulatoryDomain,
+        firmware: super::mld_regulatory::Mcc,
+        primary: u8,
+        power: Arc<super::mvm_boot::ApPower>,
+        ibss: bool,
+        validity: Validity,
+    ) -> Result<Self, &'static str> {
+        let program = Self {
+            country: domain.country_code,
+            validity,
+            firmware: Arc::new(IrqSafeSpinLock::new(firmware)),
+            primary,
+            width: 0,
+            center: primary,
+            applied_dbm: Arc::new(AtomicI8::new(power.radiated_dbm()?)),
+            qos: None,
+            he: false,
+            eht: false,
+            band: super::native_band::Channel::legacy(primary)
+                .ok_or("MVM AP band/channel absent")?
+                .band,
+            six: None,
+            ap: true,
+            mvm_ap: Some((power, ibss)),
+        };
+        program.check(domain)?;
+        Ok(program)
+    }
+    pub fn emission_ready(&self) -> Result<(), &'static str> {
+        self.mvm_ap
+            .as_ref()
+            .map_or(Ok(()), |(power, _)| power.ready())
     }
     pub fn with_he(mut self, he: bool) -> Result<Self, &'static str> {
         if he && !self.firmware.lock().he_allowed {
@@ -266,6 +328,24 @@ impl Program {
         domain: &RegulatoryDomain,
         firmware: &super::mld_regulatory::Mcc,
     ) -> Option<i8> {
+        if self.ap {
+            if let Some((_, ibss)) = &self.mvm_ap {
+                let flags = *firmware
+                    .channels
+                    .get(super::station_api::channel_index(self.primary)?)?;
+                let required = 1 | 8 | 256 | if *ibss { 2 } else { 0 };
+                if flags & required != required || flags & 16 != 0 {
+                    return None;
+                }
+                return super::connection::host_channel_power(domain, self.primary, true);
+            }
+            return super::connection::channel_power(
+                domain,
+                self.primary,
+                &firmware.channels,
+                true,
+            );
+        }
         if let Some((power_type, nvm_flags)) = self.six {
             return super::six_ghz_span::Span::new(self.primary, self.width, self.center)?
                 .rule(domain, nvm_flags, Some(firmware))
@@ -314,6 +394,9 @@ impl Program {
         firmware: &super::mld_regulatory::Mcc,
     ) -> Result<(), &'static str> {
         self.validity.check()?;
+        if let Some((power, _)) = &self.mvm_ap {
+            power.check(domain)?;
+        }
         if domain.country_code != self.country
             || !firmware.widths.permits(self.width)
             || self.he && !firmware.he_allowed

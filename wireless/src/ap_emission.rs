@@ -24,11 +24,19 @@ impl ApControlAuthority {
         &self,
         receiver: &I,
     ) -> Result<ApEmissionAuthority, WirelessError> {
-        self.check_for(receiver)?;
-        self.require_up()?;
         if !matches!(self.kind, ControlKind::Ap) {
             return Err(WirelessError::NotSupported);
         }
+        self.capture_native_emission(receiver)
+    }
+    // Shared implementation only: each public constructor first checks its
+    // distinct control kind. A captured AP guard cannot become a Radio guard.
+    pub(super) fn capture_native_emission<I: WirelessNetIface + ?Sized>(
+        &self,
+        receiver: &I,
+    ) -> Result<ApEmissionAuthority, WirelessError> {
+        self.check_for(receiver)?;
+        self.require_up()?;
         let Target::Netdev { ifindex, epoch } = self.target else {
             return Err(WirelessError::NotSupported);
         };
@@ -89,6 +97,12 @@ impl ApEmissionAuthority {
         self.receiver == core::ptr::from_ref(receiver).cast::<()>() as usize
             && self.mode == mode
             && self.generation == generation
+            && self.current()
+    }
+    pub(super) fn matches_control(&self, control: &ApControlAuthority) -> bool {
+        self.receiver == control.iface.as_ptr().cast::<()>() as usize
+            && self.mode == control.mode
+            && self.generation == control.generation
             && self.current()
     }
     /// Register the retained physical cleanup owner's waker outside native

@@ -786,6 +786,36 @@ acceptance are [AR9285 station power save](ar9285-station-power-save.md).
 Eight new native cases are written; release/native execution and physical
 acceptance remain pending.
 
+### 3.10 Optional measured periodic calibration and ANI
+
+`Ath9k::periodic_calibration_request()` exposes factual N85P1 request metadata
+for the current retained H owner. The distinct160-byte full-program contract
+and exact layout are in [ar9285-periodic-calibration.md](ar9285-periodic-calibration.md).
+No production measurements are supplied. Absence leaves every accepted
+static H/B/T/Q/S program unchanged; a provisioned current P profile binds
+automatically at a quiet associated station boundary.
+
+The actual native owner retains original H1/H2/H3 identity and calibration
+receipts while a separate current live receipt tracks actual IQ/ADC/PA/NF/ANI.
+Source20 IQ and40 ADCgain/DC/IQ measurement,30s PA/NF,20min reset-valid,
+actual MIB/listen/PHY-error ANI and current-peer RSSI are implemented. Host
+writes require original ticket and RX-idle ownership, actual all-QCU idle,
+RXabort/state0 and readback. Bounded hardware measurement allows traffic
+under unchanged prior coefficients; a partial host mutation never escapes
+normal Radio polling. Every original key/PN/SC/BA/capture owner survives.
+
+Current P global peak intersects original H, every installed B/T/Q ceiling
+and all overlapping full-span host rules. Original initial coefficient
+checks are replaced only by the actual current P live receipt; all factory,
+geometry/center/power/chain/RF-silent/PCI/current-source checks remain.
+Failure closes CPU admission and independently attempts BME-off; unproved
+DMA stays pinned. P1 requires actual AWAKE and rejects S1 composition without
+reinterpreting its bytes. Existing suspend retires this generation.
+
+Six native cases are written, including actual fresh40/full-reset factory
+composition, native eight-original delivery and kernel DHCP. Release/native
+execution and physical qualification remain pending.
+
 ## 4. Invariants
 
 - PCI parking is verified by command-register readback before BAR sizing: BME
@@ -794,10 +824,15 @@ acceptance remain pending.
   matched singleton radios are parked with BME/memory decode off and rejected.
   Repeated dispatch of the owned address fails before parking.
 - BME, MAC RX, all ten TX queues and interrupts remain disabled throughout
-  identification, preparation and calibration. PHY activation is confined to
+  identification, preparation and initial calibration. PHY activation is confined to
   the policy-bound calibration continuation; packet rings are allocated only
   after its complete retained receipt. The common table's cleared DIAG_SW is followed by restored
   RX_ABORT/RX_DIS, which remain set through calibration.
+- Optional N85P1 keeps those initial receipts immutable. Live host writes
+  require actual TX/control idle and RXabort/state0 with retained original
+  mappings; current P/live readback replaces only dynamic calibration fields.
+  Bounded actual measurement keeps prior coefficients current. No mutation,
+  timeout or scheduler intent fabricates a fresh calibration or DMA receipt.
 - Packet start requires complete aligned 32-bit DMA extents and verified ring
   programming before BME activation. TX status is terminal only after descriptor
   completion and queue idle; RX completion is acquired before status/payload.
@@ -924,16 +959,12 @@ rows and the tree facts that keep each open:
   native paths; five new cases await execution. Linux names no additional
   AR9285 map selector; other layouts remain separate chip rows. External
   measured assets and physical acceptance are pending.
-- `periodic_calibration`: Linux `link.c::ath_ani_calibrate` runs a short IQ
-  calibration (`ATH_STA_SHORT_CALINTERVAL` 1 s) until done and a 30 s
-  (`ATH_LONG_CALINTERVAL`) long calibration
-  (`ar9002_calib.c::ar9002_hw_calibrate`: `ar9285_hw_pa_cal(ah, false)`
-  incremental PA tracking, `calib.c::ath9k_hw_getnf/loadnf/start_nfcal`),
-  plus ANI. `calibration.rs` is a one-shot `New -> Running -> Ready` owner
-  that runs before packet preparation and cannot be re-entered while the
-  rings run; PA tracking changes live transmit gain, which the `N85H`
-  envelope explicitly excludes ("Periodic tracking is not inferred"). It needs
-  a live-owner calibration hook and its own measured tracking record.
+- `periodic_calibration` is source-complete for the admitted distinct N85P1
+  always-awake full20/40 program in §3.10. Actual IQ/ADC, PA/NF and ANI
+  continuations retain the original native/key/BA/capture owners and separate
+  current full-program qualification; no static H or S1 tracking authority is
+  inferred. Six native cases are written; release/native and physical
+  acceptance remain pending.
 - `larger_tx_aggregates` is source-complete for distinct signed N85T4
   bounded3–8-member AR9285 sender programs in §3.7. Actual N-slot DMA,
   half-BAW/factor/air/4ms sizing, per-member BA/retry/BAR/key-epoch ownership

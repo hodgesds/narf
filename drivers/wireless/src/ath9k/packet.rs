@@ -62,6 +62,8 @@ pub(super) enum Error {
     Timeout,
 }
 
+#[path = "packet/periodic.rs"]
+mod periodic_owner;
 #[cfg(feature = "kernel-test")]
 #[path = "packet/tests.rs"]
 pub(super) mod tests;
@@ -84,8 +86,48 @@ pub(super) trait Port {
         super::channel_width::Geometry::from_frequency(self.frequency_mhz())
             .expect("prepared physical primary")
     }
+    fn periodic_grant(&self) -> Option<alloc::sync::Arc<super::periodic::Grant>> {
+        None
+    }
+    fn bind_periodic(
+        &self,
+        _source: &alloc::sync::Arc<super::periodic::Grant>,
+    ) -> Result<(), Error> {
+        Err(Error::State)
+    }
+    fn periodic_initial(
+        &self,
+    ) -> Result<
+        (
+            super::calibration::Report,
+            Option<super::calibration::wide::WideReport>,
+        ),
+        Error,
+    > {
+        Err(Error::State)
+    }
+    fn periodic_read(&self, _register: u64) -> Result<u32, Error> {
+        Err(Error::State)
+    }
+    fn periodic_write(&self, _register: u64, _value: u32) -> Result<(), Error> {
+        Err(Error::State)
+    }
+    fn periodic_install(&self, _live: super::periodic::Live) -> Result<(), Error> {
+        Err(Error::State)
+    }
+    fn periodic_failed(&self) {}
+    /// True only after actual current P/native dynamic receipt validation.
+    /// Default profiles retain exact original initial coefficient checks.
+    fn periodic_current(&self) -> Result<bool, Error> {
+        Ok(false)
+    }
     fn ps_grant(&self) -> Option<alloc::sync::Arc<super::ps::Grant>> {
         None
+    }
+    /// Actual bound/current S1 program, not an advertised desired setting.
+    /// Qualified ISR kill/resume may hold IER0 or1; ordinary HT stays IER0.
+    fn station_ps_current(&self) -> Result<bool, Error> {
+        Ok(false)
     }
     fn bind_ps(&self, _grant: &alloc::sync::Arc<super::ps::Grant>) -> Result<(), Error> {
         Err(Error::State)
@@ -371,6 +413,8 @@ pub(super) struct Packet<P: Port> {
     ps_irq_created: bool,
     irq: Option<super::irq::Mask>,
     full_imr: u32,
+    periodic: Option<super::periodic::Owner>,
+    periodic_checked: bool,
 }
 impl<P: Port> core::fmt::Debug for Packet<P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -456,6 +500,8 @@ impl<P: Port> Packet<P> {
             ps_irq_created: false,
             irq: None,
             full_imr: 0,
+            periodic: None,
+            periodic_checked: false,
         })
     }
     pub(super) fn phase(&self) -> Phase {

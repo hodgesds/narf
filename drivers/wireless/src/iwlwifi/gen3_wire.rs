@@ -138,3 +138,17 @@ pub(super) fn tlc_v4(canonical: &[u8; 44]) -> Result<[u8; 28], &'static str> {
     bytes[24..28].copy_from_slice(&canonical[40..44]);
     Ok(bytes)
 }
+
+/// AP peers have distinct native station IDs. The admitted v4 TLC uses a
+/// byte station ID; canonical v6 uses its one-bit station mask. Keep the
+/// existing station0 adapter strict for all existing callers.
+pub(super) fn ap_tlc_v4(canonical: &[u8; 44], station: u8) -> Result<[u8; 28], &'static str> {
+    if station >= 32 || u32::from_le_bytes(canonical[..4].try_into().unwrap()) != 1u32 << station {
+        return Err("API89 AP TLC has no exact native peer mask");
+    }
+    let mut zero = *canonical;
+    put32(&mut zero, 0, 1);
+    let mut bytes = tlc_v4(&zero)?;
+    bytes[0] = station;
+    Ok(bytes)
+}

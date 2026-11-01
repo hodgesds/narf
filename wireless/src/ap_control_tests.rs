@@ -28,6 +28,7 @@ struct Radio {
     starts: AtomicU32,
     start_drops: AtomicU32,
     mgmt_cookie: AtomicU64,
+    radio_mgmt: AtomicBool,
     mgmt_acked: AtomicBool,
     key_errno: AtomicU32,
     key_installs: AtomicU32,
@@ -60,6 +61,7 @@ impl Radio {
             starts: AtomicU32::new(0),
             start_drops: AtomicU32::new(0),
             mgmt_cookie: AtomicU64::new(0),
+            radio_mgmt: AtomicBool::new(false),
             mgmt_acked: AtomicBool::new(true),
             key_errno: AtomicU32::new(0),
             key_installs: AtomicU32::new(0),
@@ -169,6 +171,44 @@ impl WirelessNetIface for Radio {
                 max_match_sets: 8,
                 ..crate::SchedScanSupport::NET_DETECT
             })
+    }
+    fn supports_offchannel_mgmt_tx(&self) -> bool {
+        self.radio_mgmt.load(Ordering::Acquire)
+    }
+    fn max_remain_on_channel_duration_ms(&self) -> u32 {
+        if self.radio_mgmt.load(Ordering::Acquire) {
+            500
+        } else {
+            0
+        }
+    }
+    fn async_radio_management_tx_control(&self) -> bool {
+        self.radio_mgmt.load(Ordering::Acquire)
+    }
+    fn async_radio_management_rx_control(&self) -> bool {
+        self.radio_mgmt.load(Ordering::Acquire)
+    }
+    async fn register_mgmt_frame_radio_async(
+        &self,
+        authority: &RadioControlAuthority,
+        frame_type: u16,
+        prefix: &[u8],
+    ) -> Result<(), i32> {
+        self.scheduled_callback(authority).await?;
+        *self.management_registration.lock() = Some((frame_type, prefix.to_vec()));
+        Ok(())
+    }
+    async fn mgmt_tx_radio_async(
+        &self,
+        authority: &RadioControlAuthority,
+        cookie: u64,
+        _: crate::MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        self.scheduled_callback(authority)
+            .await
+            .map_err(|_| WirelessError::Denied)?;
+        self.mgmt_cookie.store(cookie, Ordering::Release);
+        Ok(self.mgmt_acked.load(Ordering::Acquire))
     }
     fn async_sched_scan_control(&self) -> bool {
         self.sched_native.load(Ordering::Acquire)
@@ -784,3 +824,5 @@ kernel_test_in!(
 
 #[path = "radio_control_tests.rs"]
 mod radio;
+#[path = "radio_frame_tests.rs"]
+mod radio_frame;

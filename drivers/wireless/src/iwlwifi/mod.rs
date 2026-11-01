@@ -51,9 +51,15 @@ use alloc::vec::Vec;
 use core::fmt;
 
 pub mod aggregation;
+mod ap_gen2_wire;
+mod ap_host;
+mod ap_owner;
+mod ap_session;
+mod ap_wire;
 pub mod bcast;
 pub mod boot_context;
 mod bootstrap;
+pub use bootstrap::gen2_ap_transmit_power_request;
 pub use bootstrap::gen2_ba_transmit_power_request;
 pub use bootstrap::gen2_ht20_transmit_power_request;
 pub use bootstrap::gen2_nested_ba_transmit_power_request;

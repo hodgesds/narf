@@ -118,6 +118,9 @@ impl Source {
     }
 }
 impl Grant {
+    pub(super) fn signed_ceiling(&self) -> i16 {
+        self.ceiling
+    }
     fn decode(
         b: &[u8],
         signer: Option<[u8; 32]>,

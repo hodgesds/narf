@@ -395,13 +395,24 @@ Eight native cases are written and isolated release checks pass. Validation
 of the preceding21 implementations continues in a frozen checkout; this
 source addition remains in the next batch. Physical qualification is separate.
 
+**Source implementation recount 2026-11-01** (native AP, periodic calibration and bounded ROC written):
+the remaining ledger holds **82 `feature`** rows (82 driver, 0 shared),
+**31 `chip`** and **0 `unknown`**. Twenty-five source-complete implementations
+await validation in `research/implemented-pending-validation.tsv`. This source
+batch adds original Intel Sc/Bz/API89/API77 legacy20 AP control/data owners,
+qualified AR9285 periodic calibration/ANI and managed ath10k Public Action ROC.
+Twenty-nine new cases are written. Isolated release compile/lint checks pass;
+cross-architecture native acceptance remains pending. The station NETWORK_SLEEP
+IRQ/readback repair is included in the frozen source graph. Physical board
+measurements and the remaining family profiles retain their own qualification.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 4 | MLO; AP/P2P/WoW; admitted complete6GHz, EHT/320 and single-link MLD source is implemented pending validation; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated |
+| iwlwifi | 3 | MLO, P2P and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are implemented pending validation; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 4 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA; hosted loadable packet ABI is implemented pending validation |
-| ath10k | 13 | Contiguous VHT160, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload; streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are implemented pending validation |
-| ath9k | 2 | Periodic calibration and idle FULL_SLEEP; station NETWORK_SLEEP is implemented pending validation; admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants are implemented pending validation; other chips are separate rows |
+| ath10k | 12 | Contiguous VHT160, PFC, alternate calibration sources, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload; managed Public Action ROC, streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are implemented pending validation |
+| ath9k | 1 | Idle FULL_SLEEP; periodic calibration/ANI and station NETWORK_SLEEP are implemented pending validation, as are admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants; other chips are separate rows |
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are implemented pending validation |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
@@ -1182,6 +1193,26 @@ leaves existing awake operation and refuses unsupported requests. Original
 key/PN, BA, copied-frame and terminal DMA ownership remain independent.
 Idle FULL_SLEEP and periodic calibration are separate implementations; the
 family §3.9 and `ar9285-station-power-save.md` specify the exact contract.
+
+### 3.3 Additional qualified native control owners (validation pending)
+
+Admitted Intel Sc/Bz/API89/API77 profiles expose the existing typed AP public
+controls through their original device owner, with actual power/beacon/peer/key
+and terminal packet receipts. Prepared typed events complete arbitrary
+callbacks before rechecking the original source/native receive proof, then
+deliver using only the fixed original source and receiver. Optional unadvertised
+AP PHY/DFS/P2P/MLO capabilities remain separate; family §3.68–3.71 is normative.
+
+The managed ath10k Radio implements bounded1–500ms ROC and Public Action FRAME
+through matching native foreign-channel, air-terminal, STOP/COMPLETE and home
+receipts. Registered responses retain the original socket/filter/physical
+generation and callback-free final checks. This supplies no native P2P role.
+AR9285 exposes `periodic_calibration_request()` as factual
+`Result<PeriodicCalibrationRequest, BringUpError>` metadata for a separate signed
+N85P1 full program. Current P1 hardware receipts replace only calibration/ANI
+state; original key/PN/TX/copy owners persist. P1 remains always awake and
+refuses composition with N85S1. Family §3 and the measured-program documents
+define the narrower native and external qualification contracts.
 
 ## 4. Interaction with `narf-wireless`
 

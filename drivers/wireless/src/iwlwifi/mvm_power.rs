@@ -37,6 +37,10 @@ pub(in crate::iwlwifi) enum Emission {
     /// Firmware probe requests before a station/PHY exists. The exact
     /// requested scan-channel list is additionally included in the binding.
     ActiveScan,
+    /// Ordinary legacy20 AP: autonomous beacons/TIM, two internal stations,
+    /// up to8 external clients, four ACs and separately admitted SME/key TX.
+    /// An existing station/active-scan program never qualifies this role.
+    ApLegacy,
 }
 
 /// Emitting-feature bits of a tag5 program.
@@ -95,12 +99,13 @@ impl Emission {
             Emission::Ht20NestedBa => 4,
             Emission::Features(_) => 5,
             Emission::ActiveScan => 6,
+            Emission::ApLegacy => 7,
         }
     }
     /// Feature bits granted by this program (tag3/4 imply their BA bits).
     pub(in crate::iwlwifi) fn features(self) -> u16 {
         match self {
-            Emission::Legacy | Emission::Ht20 | Emission::ActiveScan => 0,
+            Emission::Legacy | Emission::Ht20 | Emission::ActiveScan | Emission::ApLegacy => 0,
             Emission::Ht20Ba => feature::BA,
             Emission::Ht20NestedBa => feature::BA | feature::NESTED_BA,
             Emission::Features(bits) => bits,
@@ -141,7 +146,7 @@ impl Context {
     }
 }
 
-pub(super) struct Prepared {
+pub(in crate::iwlwifi) struct Prepared {
     pub(super) emission: Emission,
     source: Asset,
     sar: [[u8; 5]; 2],
@@ -195,6 +200,24 @@ pub(super) fn span_power(domain: &RegulatoryDomain, channel: u8, span: Option<Sp
 }
 
 impl Prepared {
+    pub(in crate::iwlwifi) fn is_ap(&self) -> bool {
+        self.emission == Emission::ApLegacy
+    }
+    pub(super) fn ap_source(
+        &self,
+    ) -> (
+        narf_capabilities::Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+        i16,
+        i16,
+    ) {
+        (self.source.cap, self.maximum, self.gain)
+    }
+    pub(super) fn ap_commands(&self, planned: i16) -> ([u8; 44], [u8; 44]) {
+        (chain_command(self.sar), link_command(planned))
+    }
+    pub(super) fn ap_acknowledge(&mut self, planned: i16) {
+        self.applied = Some(planned);
+    }
     /// Bind the span of a granted HT40/VHT program.
     pub(super) fn with_span(mut self, span: Option<Span>) -> Self {
         self.span = span;
@@ -237,6 +260,7 @@ fn request(binding: [u8; 32], mac: [u8; 6], emission: Emission) -> PowerRequest 
         Emission::Ht20Ba => "mvm-api77-ht20-siso-wmm-ba-power-v3",
         Emission::Ht20NestedBa => "mvm-api77-ht20-siso-wmm-nested-ba-power-v4",
         Emission::ActiveScan => "mvm-api77-active-scan-power-v6",
+        Emission::ApLegacy => "mvm-api77-legacy20-ap-power-v7",
         Emission::Features(bits) => {
             features = format!("mvm-api77-ht20-siso-wmm-features-{bits:04x}-power-v5");
             &features
@@ -630,6 +654,9 @@ impl Owner {
             }
             Emission::ActiveScan => {
                 &b"NARF Intel MVM API77 qualified active-scan legacy probe rates24+5 raw26 SSIDs20 dwell30TU SET_CHAINS+SET_DEVICE power v6"[..]
+            }
+            Emission::ApLegacy => {
+                &b"NARF Intel MVM API77 qualified legacy20 AP beacon-TIM two-internal eight-client four-AC SME-CCMP-PMF source-fenced program power v7"[..]
             }
         });
         if let Emission::Features(bits) = emission {

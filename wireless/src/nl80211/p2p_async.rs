@@ -57,9 +57,13 @@ pub(super) fn register_frame(
     slot: Option<&DeferredRequest>,
 ) -> Result<Vec<GenlReply>, i32> {
     let attrs = attributes(bytes)?;
-    reject_unknown(&attrs, &[153, 91, 101])?;
+    reject_unknown(&attrs, &[3, 153, 91, 101])?;
     let (iface, index) = interface(&attrs, context.net_ns_id)?;
-    if index.is_some() || iface.current_iftype() != 10 || !iface.async_p2p_management_rx_control() {
+    let supported = match index {
+        Some(_) => iface.current_iftype() == 2 && iface.async_radio_management_rx_control(),
+        None => iface.current_iftype() == 10 && iface.async_p2p_management_rx_control(),
+    };
+    if !supported {
         return Err(EOPNOTSUPP);
     }
     let admin = source_authority(&context, iface.as_ref(), slot)?;
@@ -72,7 +76,7 @@ pub(super) fn register_frame(
         iface,
         admin,
         context.net_ns_id,
-        None,
+        index,
         slot,
         Operation::RegisterFrame(frame_type, prefix),
     )
@@ -84,9 +88,13 @@ pub(super) fn frame(
     slot: Option<&DeferredRequest>,
 ) -> Result<Vec<GenlReply>, i32> {
     let attrs = attributes(bytes)?;
-    reject_unknown(&attrs, &[153, 38, 51, 87, 108, 135])?;
+    reject_unknown(&attrs, &[3, 153, 38, 51, 87, 108, 135])?;
     let (iface, index) = interface(&attrs, context.net_ns_id)?;
-    if index.is_some() || iface.current_iftype() != 10 || !iface.async_p2p_management_tx_control() {
+    let supported = match index {
+        Some(_) => iface.current_iftype() == 2 && iface.async_radio_management_tx_control(),
+        None => iface.current_iftype() == 10 && iface.async_p2p_management_tx_control(),
+    };
+    if !supported {
         return Err(EOPNOTSUPP);
     }
     let admin = source_authority(&context, iface.as_ref(), slot)?;
@@ -131,7 +139,7 @@ pub(super) fn frame(
         iface,
         admin,
         context.net_ns_id,
-        None,
+        index,
         slot,
         Operation::Frame { cookie, request },
     )
@@ -257,19 +265,26 @@ pub(super) fn defer(
                             .await
                             .map_err(errno)?;
                         call.check_for(iface.as_ref()).map_err(errno)?;
-                        let wdev = crate::registry::control_for(iface.as_ref()).ok_or(ENODEV)?;
                         let wiphy = crate::registry::wiphy_index(iface.wiphy_id()).ok_or(ENODEV)?;
                         let mut attrs = Vec::new();
                         push_attr(&mut attrs, 1, &wiphy.to_ne_bytes());
-                        push_attr(&mut attrs, 153, &wdev.id().to_ne_bytes());
+                        if let Some(index) = index {
+                            // Original bound IFINDEX; check_for above also
+                            // rejects replacement, transfer and generation ABA.
+                            push_attr(&mut attrs, 3, &index.to_ne_bytes());
+                        } else {
+                            let wdev =
+                                crate::registry::control_for(iface.as_ref()).ok_or(ENODEV)?;
+                            push_attr(&mut attrs, 153, &wdev.id().to_ne_bytes());
+                        }
                         push_attr(&mut attrs, 51, &sent);
                         push_attr(&mut attrs, 88, &cookie.to_ne_bytes());
                         if acked {
                             push_attr(&mut attrs, 92, &[]);
                         }
                         // Native ACK and packet retirement are already complete.
-                        // Linux's status is MLME multicast, with WDEV and no
-                        // fabricated IFINDEX for this control-only interface.
+                        // Status is MLME multicast using the original netdev
+                        // IFINDEX or actual control-only WDEV selected above.
                         publish_event(
                             NL80211_FAMILY_ID,
                             19,

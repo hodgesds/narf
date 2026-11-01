@@ -27,6 +27,7 @@ struct HttModel {
     sequence: u8,
     stall_rx: bool,
     version: u8,
+    minor: u8,
     receive_pipe: u8,
     tx_next: u64,
     stall_tx: bool,
@@ -45,6 +46,7 @@ impl HttModel {
             sequence: 0,
             stall_rx: false,
             version: 3,
+            minor: 1,
             tx_next: 0x800000,
             stall_tx: false,
             raw: false,
@@ -152,9 +154,10 @@ impl Hif for HttModel {
             if self.storage.is_some() {
                 return Err(BmiError::BadResponse);
             }
-            self.inner
-                .rx
-                .push_back((self.receive_pipe, header(1, &[0, 1, self.version, 0])));
+            self.inner.rx.push_back((
+                self.receive_pipe,
+                header(1, &[0, self.minor, self.version, 0]),
+            ));
             return Ok(());
         }
         let storage = self.storage.as_ref().ok_or(BmiError::BadResponse)?;

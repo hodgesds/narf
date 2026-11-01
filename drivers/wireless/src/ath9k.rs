@@ -23,6 +23,7 @@ mod mac;
 mod packet;
 mod packet_native;
 mod pcie_pm;
+mod periodic;
 mod phy;
 mod ps;
 mod qos;
@@ -34,6 +35,7 @@ pub use calibration::{Report as RadioCalibration, State as RadioState};
 pub use ht::Request as Ht20QualificationRequest;
 pub use ht40::Request as Ht40QualificationRequest;
 pub use identity::{BringUpError, Identity, EEPROM_4K_BYTES};
+pub use periodic::Request as PeriodicCalibrationRequest;
 pub use phy::Prepared as BasebandPrepared;
 pub use ps::Request as PowerSaveQualificationRequest;
 pub use qos::Request as QosQualificationRequest;
@@ -84,6 +86,15 @@ pub struct Ath9k {
 }
 
 impl Ath9k {
+    /// Factual optional complete-program calibration request; this metadata
+    /// grants no periodic writes, emission, clock or board measurement claim.
+    pub fn periodic_calibration_request(&self) -> Result<PeriodicCalibrationRequest, BringUpError> {
+        self.station
+            .as_ref()
+            .and_then(|radio| radio.try_lock())
+            .and_then(|radio| radio.periodic_request())
+            .ok_or(BringUpError::BadState)
+    }
     /// Factual four-AC/eight-TID QoS request; no emission grant.
     pub fn qos_qualification_request(&self) -> Result<QosQualificationRequest, BringUpError> {
         self.station

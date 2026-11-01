@@ -13,6 +13,46 @@ pub(super) struct Mcc {
     pub widths: super::gen3_wire::Widths,
 }
 impl Mcc {
+    /// API77 MVM reply geometry is source-selected independently of its
+    /// raw channel permission bits. This deliberately promises legacy20.
+    pub fn parse_mvm(version: u8, bytes: &[u8]) -> Result<Self, &'static str> {
+        let (header, count_at, geo) = match version {
+            3 => (16, 12, 8),
+            4 => (20, 16, 10),
+            8 => (24, 20, 14),
+            _ => return Err("MVM AP MCC response ABI unsupported"),
+        };
+        if bytes.len() < header {
+            return Err("MVM AP MCC reply truncated");
+        }
+        let country = u16::from_le_bytes(bytes[4..6].try_into().unwrap()).to_be_bytes();
+        let count = u32::from_le_bytes(bytes[count_at..count_at + 4].try_into().unwrap()) as usize;
+        if u32::from_le_bytes(bytes[..4].try_into().unwrap()) > 1
+            || count == 0
+            || count > 110
+            || bytes.len() != header + 4 * count
+            || country != *b"00" && !country.iter().all(u8::is_ascii_uppercase)
+        {
+            return Err("MVM AP MCC current status/country/count invalid");
+        }
+        Ok(Self {
+            country,
+            channels: bytes[header..]
+                .chunks_exact(4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .collect::<alloc::vec::Vec<_>>()
+                .into(),
+            etsi_5ghz: u16::from_le_bytes(bytes[geo..geo + 2].try_into().unwrap()) & 1 != 0,
+            he_allowed: false,
+            eht_allowed: false,
+            widths: super::gen3_wire::Widths {
+                forty: false,
+                eighty: false,
+                one_sixty: false,
+                three_twenty: false,
+            },
+        })
+    }
     pub fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
         Self::parse_version(8, bytes)
     }

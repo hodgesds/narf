@@ -424,8 +424,16 @@ impl<P: Port, E: Environment> Radio<P, E> {
     pub(super) fn ps_request(&self) -> Option<super::ps::Request> {
         self.packet.ht_grant().map(|base| super::ps::request(&base))
     }
+    pub(super) fn periodic_request(&self) -> Option<super::periodic::Request> {
+        self.packet
+            .ht_grant()
+            .map(|base| super::periodic::request(&base))
+    }
     pub(super) fn power_save(&self) -> Option<bool> {
         if self.terminal() {
+            return None;
+        }
+        if self.packet.periodic_bound() {
             return None;
         }
         if let Some(owner) = &self.ps {
@@ -442,6 +450,9 @@ impl<P: Port, E: Environment> Radio<P, E> {
             let _publication = publication.lock();
             if self.terminal() {
                 return Err(Error::State);
+            }
+            if self.packet.periodic_bound() {
+                return Err(Error::Profile);
             }
             if self.ps.is_none() {
                 let source = self.packet.ps_grant().ok_or(Error::Profile)?;
@@ -478,11 +489,15 @@ impl<P: Port, E: Environment> Radio<P, E> {
         }
     }
     pub(super) fn current_receive(&self, epoch: u64) -> Result<bool, Error> {
+        if self.packet.periodic_deferred()? {
+            return Ok(false);
+        }
         self.packet.check_transmit()?;
         Ok(self.epoch == epoch && self.receive_open())
     }
     fn retire_receive(&mut self) -> Result<(), Error> {
         self.epoch = self.epoch.checked_add(1).ok_or(Error::State)?;
+        self.packet.periodic_epoch();
         if let Some(owner) = &mut self.ps {
             owner.key_epoch(self.epoch);
         }
@@ -714,6 +729,9 @@ impl<P: Port, E: Environment> Radio<P, E> {
             .as_ref()
             .is_some_and(|peer| peer.bss.bssid == candidate.bss.bssid)
         {
+            if bytes.first() == Some(&0x80) && frame.rssi != i8::MIN {
+                self.packet.periodic_beacon(frame.rssi);
+            }
             if self.ht.is_some() {
                 let peer = self.peer.as_ref().ok_or(Error::State)?;
                 let mode = if self.security.is_some() {
@@ -889,10 +907,15 @@ impl<P: Port, E: Environment> Radio<P, E> {
             let _publication = publication.lock();
             // Interrupt bottom half brackets one service pass: causes are
             // read and IER killed first, then resumed after RX/TX work.
-            self.ps
-                .as_ref()
-                .map_or(Ok(()), |owner| owner.grant.check())
+            self.packet
+                .periodic_service(false)
                 .map_err(Error::from)
+                .and_then(|_| {
+                    self.ps
+                        .as_ref()
+                        .map_or(Ok(()), |owner| owner.grant.check())
+                        .map_err(Error::from)
+                })
                 .and_then(|_| self.packet.service_begin().map_err(Error::from))
                 .and_then(|events| {
                     if let Some(events) = events {
@@ -914,6 +937,11 @@ impl<P: Port, E: Environment> Radio<P, E> {
                 .and_then(|frames| {
                     self.packet.service_end()?;
                     self.restore_ps_inner()?;
+                    let periodic_idle = self.ps.is_none()
+                        && self.ready()
+                        && self.rx_idle
+                        && self.incoming.is_empty();
+                    self.packet.periodic_service(periodic_idle)?;
                     Ok(frames)
                 })
         };

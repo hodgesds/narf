@@ -386,6 +386,57 @@ impl Grant {
     pub(super) fn ba_limit(&self) -> (i16, i16) {
         (self.antenna, self.ceiling)
     }
+    pub(super) fn initial_calibration(&self) -> super::calibration::Report {
+        self.wide
+            .as_ref()
+            .map_or(self.facts.report, |(_, actual)| actual.report)
+    }
+    /// Non-calibration physical invariants of the same admitted H program.
+    /// Caller retains current P/base/PCI around these raw actual reads; only
+    /// dynamic IQ/ADC/PA/NF/ANI are replaced by the independent live receipt.
+    pub(super) fn periodic_physical(
+        &self,
+        mut read: impl FnMut(u64) -> Result<u32, Error>,
+    ) -> Result<(), Error> {
+        self.check()?;
+        let geometry = self.geometry();
+        if read(0x9874)? & 0x3fff_ffff
+            != (0x3000_0000 | (u32::from(geometry.center()) * 0x10000 / 15))
+            || read(0x9804)? & 0x7ff != geometry.turbo()
+        {
+            return Err(Error::Descriptor);
+        }
+        if let Some((_, actual)) = &self.wide {
+            for (register, value) in actual.powers.registers {
+                if read(register)? != value {
+                    return Err(Error::Descriptor);
+                }
+            }
+            if read(0x8318)? != 1 {
+                return Err(Error::Descriptor);
+            }
+        } else {
+            for (register, value) in self.facts.powers {
+                if read(register)? != value {
+                    return Err(Error::Descriptor);
+                }
+            }
+        }
+        for (register, mask, value) in [
+            (0x99a4, u32::MAX, 1),
+            (0xa39c, u32::MAX, 1),
+            (0x832c, u32::MAX, 1),
+            (0xa200, u32::MAX, 4),
+            (0x24, 1, 0),
+            (0x8114, u32::MAX, 0x200),
+            (0x8340, u32::MAX, 0x380),
+        ] {
+            if read(register)? & mask != value {
+                return Err(Error::Descriptor);
+            }
+        }
+        Ok(())
+    }
     pub(super) fn readback(&self, io: &impl Port) -> Result<(), Error> {
         if let Some((grant, actual)) = &self.wide {
             return grant.readback(io, *actual);
@@ -402,13 +453,18 @@ impl Grant {
             (0xa39c, u32::MAX, 1),
             (0x832c, u32::MAX, 1),
             (0xa200, u32::MAX, 4),
-            (0x24, 1, 0),
             (0x8114, u32::MAX, 0x200),
             (0x8340, u32::MAX, 0x380),
         ] {
             if io.read(r)? & mask != v {
                 return Err(Error::Descriptor);
             }
+        }
+        // AR_IER is0x24 (RXCFG is0x34). The distinct actually bound
+        // S1 program owns interrupt kill/resume; a mere optional asset or
+        // desired policy cannot relax the original static HT IER0 contract.
+        if !io.station_ps_current()? && io.read(0x24)? & 1 != 0 {
+            return Err(Error::Descriptor);
         }
         for entry in 0..128u64 {
             if io.read(0x8800 + entry * 32 + 28)? & 0x8000 != 0 {

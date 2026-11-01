@@ -335,6 +335,7 @@ impl Grant {
     }
     pub(super) fn readback(&self, io: &impl Port, actual: WideReport) -> Result<(), Error> {
         self.accept(actual)?;
+        let periodic = io.periodic_current()?;
         for (register, value) in actual.powers.registers {
             if io.read(register)? != value {
                 return Err(Error::Descriptor);
@@ -352,19 +353,32 @@ impl Grant {
             (0xa39c, u32::MAX, 1),
             (0x832c, u32::MAX, 1),
             (0xa200, u32::MAX, 4),
-            (0x24, 1, 0),
-            (0x99b4, u32::MAX, actual.adc),
-            (
-                0x9920,
-                0xfff,
-                0x800 | (u32::from(actual.report.iq_i) << 5) | (actual.report.iq_q as u32 & 31),
-            ),
             (0x8114, u32::MAX, 0x200),
             (0x8340, u32::MAX, 0x380),
         ] {
             if io.read(register)? & mask != expected {
                 return Err(Error::Descriptor);
             }
+        }
+        if !periodic {
+            for (register, mask, expected) in [
+                (0x99b4, u32::MAX, actual.adc),
+                (
+                    0x9920,
+                    0xfff,
+                    0x800 | (u32::from(actual.report.iq_i) << 5) | (actual.report.iq_q as u32 & 31),
+                ),
+            ] {
+                if io.read(register)? & mask != expected {
+                    return Err(Error::Descriptor);
+                }
+            }
+        }
+        // AR_IER is0x24 (RXCFG is0x34). The distinct actually bound
+        // S1 program owns interrupt kill/resume; a mere optional asset or
+        // desired policy cannot relax the original static HT IER0 contract.
+        if !io.station_ps_current()? && io.read(0x24)? & 1 != 0 {
+            return Err(Error::Descriptor);
         }
         for entry in 0..128u64 {
             if io.read(0x8800 + entry * 32 + 28)? & 0x8000 != 0 {

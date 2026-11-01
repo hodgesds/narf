@@ -141,6 +141,13 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
         _ => return Err(BmiError::BadResponse),
     }
     .to_vec();
+    if phase == 0 && m.inner.inner.factory == 0x8348 {
+        // Fixed-country EEPROM is independent of the current RF band.
+        let at = if dialect == Dialect::Tlv { 12 } else { 4 };
+        for (i, value) in [0x3a, 0x3a, 0x3a, 0x10, 0x10].into_iter().enumerate() {
+            u32at(&mut expected, at + i * 4, value);
+        }
+    }
     if m.frequency > 3000 {
         // Independent source facts for the fixed US factory5GHz profile.
         // Retain the full reviewed packet and replace only authored fields.

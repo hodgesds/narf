@@ -1247,5 +1247,7 @@ kernel_test_in!(
 );
 #[path = "interface_aggregate_tests.rs"]
 mod aggregate_tests;
+#[path = "interface_periodic_tests.rs"]
+mod periodic_tests;
 #[path = "interface_ps_tests.rs"]
 mod ps_tests;

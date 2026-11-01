@@ -13,7 +13,7 @@ fn permission(
     Permission::from_domain(caps, domain, frequency)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(in crate::ath10k) struct Plan {
     pub(super) channels: Vec<u16>,
     pub(super) ssids: Vec<Vec<u8>>,
