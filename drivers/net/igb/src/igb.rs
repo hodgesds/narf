@@ -667,6 +667,160 @@ pub fn strip_vlan_tag_in_place(frame: &mut [u8], len: usize) -> Option<usize> {
     Some(len - 4)
 }
 
+// ── Wake-on-LAN ─────────────────────────────────────────────────────
+//
+// Linux `igb_init_wol` / `__igb_shutdown` / resume WUS drain
+// (igb_main.c) and `igb_get_wol` / `igb_set_wol` (igb_ethtool.c).
+// WUC arms PME, WUFC selects the wake filters, WUS reports which
+// filter fired (write-1-to-clear; Linux clears it with ~0 on resume).
+// The live device does not arm WoL at bring-up: arming belongs to
+// the suspend sequence (next commit), and the EEPROM support probe
+// below still needs NVM access NARF's igb does not have yet — the
+// support decode is provided so the suspend path can use it the
+// moment NVM reads land, not as a claim that probe knows it today.
+
+/// WUC — Wakeup Control.
+const REG_WUC: u64 = 0x5800;
+/// WUFC — Wakeup Filter Control.
+const REG_WUFC: u64 = 0x5808;
+/// WUS — Wakeup Status (W1C).
+const REG_WUS: u64 = 0x5810;
+/// WUC PME enable (Linux E1000_WUC_PME_EN).
+pub const WUC_PME_EN: u32 = 0x0000_0002;
+/// CTRL bit: advertise D3 wake capability (Linux E1000_CTRL_ADVD3WUC).
+pub const CTRL_ADVD3WUC: u32 = 0x0010_0000;
+/// WUFC/WUS filter bits (Linux E1000_WUFC_* / E1000_WUS_*).
+pub const WUFC_LNKC: u32 = 0x0000_0001;
+pub const WUFC_MAG: u32 = 0x0000_0002;
+pub const WUFC_EX: u32 = 0x0000_0004;
+pub const WUFC_MC: u32 = 0x0000_0008;
+pub const WUFC_BC: u32 = 0x0000_0010;
+/// WUS directed-packet bits (Linux E1000_WUS_ARPD/IPV4/IPV6/NSD).
+pub const WUS_ARPD: u32 = 0x0000_0020;
+pub const WUS_IPV4: u32 = 0x0000_0040;
+pub const WUS_IPV6: u32 = 0x0000_0080;
+pub const WUS_NSD: u32 = 0x0000_0400;
+/// WUS bits that mean a wake packet was delivered to the host
+/// (Linux WAKE_PKT_WUS: EX | ARPD | IPV4 | IPV6 | NSD).
+pub const WUS_WAKE_PKT: u32 = WUFC_EX | WUS_ARPD | WUS_IPV4 | WUS_IPV6 | WUS_NSD;
+/// EEPROM APME bit (Linux IGB_EEPROM_APME = 0x0400): set in NVM init
+/// control word 3 when the part may wake the system.
+pub const EEPROM_APME: u16 = 0x0400;
+
+/// Wake filters a caller may arm, mirroring Linux's `adapter->wol`
+/// WUFC word without exposing raw bit positions to callers.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WolFilters {
+    pub link_change: bool,
+    pub magic: bool,
+    pub directed_exact: bool,
+    pub multicast: bool,
+    pub broadcast: bool,
+}
+
+impl WolFilters {
+    /// Magic-packet-only, Linux's default when WoL is supported.
+    pub const fn magic_only() -> Self {
+        Self {
+            link_change: false,
+            magic: true,
+            directed_exact: false,
+            multicast: false,
+            broadcast: false,
+        }
+    }
+
+    /// Encode as a WUFC word.
+    pub const fn to_wufc(&self) -> u32 {
+        (if self.link_change { WUFC_LNKC } else { 0 })
+            | (if self.magic { WUFC_MAG } else { 0 })
+            | (if self.directed_exact { WUFC_EX } else { 0 })
+            | (if self.multicast { WUFC_MC } else { 0 })
+            | (if self.broadcast { WUFC_BC } else { 0 })
+    }
+
+    /// Decode a WUFC word (unknown bits are dropped).
+    pub const fn from_wufc(word: u32) -> Self {
+        Self {
+            link_change: word & WUFC_LNKC != 0,
+            magic: word & WUFC_MAG != 0,
+            directed_exact: word & WUFC_EX != 0,
+            multicast: word & WUFC_MC != 0,
+            broadcast: word & WUFC_BC != 0,
+        }
+    }
+}
+
+/// Whether WoL is supported, from Linux `igb_init_wol`'s two main
+/// gates: port A supports wake by default, other ports need the NVM
+/// APME bit, and the platform must be able to wake at all
+/// (`device_can_wakeup`). NOT encoded here: the fiber/quad-port
+/// special cases (dual-fiber port B, quad-copper non-A ports), which
+/// need multi-port topology the NARF probe does not track — a caller
+/// with that topology must clear support explicitly. When this
+/// returns true, Linux's default armed filter is magic-only.
+pub fn wol_supported(port_is_a: bool, eeprom_apme: bool, device_can_wakeup: bool) -> bool {
+    (port_is_a || eeprom_apme) && device_can_wakeup
+}
+
+/// Suspend-time WoL programming, from Linux `__igb_shutdown`: the
+/// runtime-suspend path arms link-change only; the system-suspend
+/// path arms the caller's filters, except link-change is dropped when
+/// the link is already up (an up link cannot be a wake event). When
+/// the resulting filter word is zero, WUC/WUFC are both cleared and
+/// the link is powered down instead of armed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WolSuspendProgram {
+    /// Set CTRL.ADVD3WUC when arming.
+    pub advd3wuc: bool,
+    /// Value for WUC (PME_EN when arming, 0 otherwise).
+    pub wuc: u32,
+    /// Value for WUFC (the armed filters, or 0).
+    pub wufc: u32,
+    /// Power the link down (true only when nothing is armed).
+    pub power_down_link: bool,
+}
+
+/// Compute the suspend-time WoL program. `runtime` selects the
+/// runtime-suspend filter (link-change only); otherwise the caller's
+/// filters apply, minus link-change when `link_up`.
+pub fn wol_suspend_program(filters: WolFilters, link_up: bool, runtime: bool) -> WolSuspendProgram {
+    let mut wufc = if runtime {
+        WUFC_LNKC
+    } else {
+        filters.to_wufc()
+    };
+    if link_up {
+        wufc &= !WUFC_LNKC;
+    }
+    if wufc != 0 {
+        WolSuspendProgram {
+            advd3wuc: true,
+            wuc: WUC_PME_EN,
+            wufc,
+            power_down_link: false,
+        }
+    } else {
+        WolSuspendProgram {
+            advd3wuc: false,
+            wuc: 0,
+            wufc: 0,
+            power_down_link: true,
+        }
+    }
+}
+
+/// Whether a WUS word reports a delivered wake packet.
+pub const fn wus_delivered_wake_packet(wus: u32) -> bool {
+    wus & WUS_WAKE_PKT != 0
+}
+
+/// WUS clear word: WUS is write-1-to-clear, and Linux clears all
+/// pending status with ~0 on resume.
+pub const fn wus_clear_word() -> u32 {
+    !0u32
+}
+
 // CTRL bits.
 const CTRL_RST: u32 = 1 << 26;
 const CTRL_SLU: u32 = 1 << 6;
@@ -2270,19 +2424,22 @@ mod tests {
         queue_disable_word, queue_enable_reflected, queue_enable_word, queue_pairs, queue_regs,
         reta_entry, reta_reg, reta_shift, reta_table, reta_word, rss_key_word, rss_queue_for_hash,
         rssrk_reg, rxcsum_rss_word, rxdctl_word, strip_vlan_tag_in_place, txdctl_word, vfta_bit,
-        vfta_word, AdvRxDescRead, AdvRxDescWb, AdvTxCtxtDesc, AdvTxDataDesc, IvarScheme,
-        TxRingCursor, VlanFilter, ADVTXD_DCMD_DEXT, ADVTXD_DTYP_CTXT, ADV_RXD_STAT_VP,
-        EITR_CNT_IGNR, EITR_START, IGB_82576, IGB_82576_NS, IGB_I210_COPPER, IGB_I211_COPPER,
-        IGB_I350_COPPER, IGB_MAX_QUEUES, IGB_MAX_QUEUES_82575, IGB_MAX_QUEUES_I211, IVAR_VALID,
-        MRQC_ENABLE_RSS_MQ, MRQC_ENABLE_VMDQ, MRQC_ENABLE_VMDQ_RSS_MQ, MRQC_FIELD_IPV4,
-        MRQC_FIELD_IPV4_TCP, MRQC_FIELD_IPV4_UDP, MRQC_FIELD_IPV6, MRQC_FIELD_IPV6_TCP,
-        MRQC_FIELD_IPV6_TCP_EX, MRQC_FIELD_IPV6_UDP, QUEUE_ENABLE, REG_EIAC, REG_EIAM, REG_EIMC,
-        REG_EIMS, REG_EITR0, REG_ICR, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC, REG_MRQC,
-        REG_RDBAH, REG_RDBAL, REG_RDH, REG_RDLEN, REG_RDT, REG_RETA_BASE, REG_RSSRK_BASE,
-        REG_RXCSUM, REG_RXDCTL0, REG_SRRCTL_Q0, REG_TDBAH, REG_TDBAL, REG_TDH, REG_TDLEN, REG_TDT,
-        REG_TXDCTL0, REG_VET, REG_VFTA_BASE, RETA_REGS, RETA_SIZE, RSS_KEY_SIZE, RXCSUM_CRCOFL,
-        RXCSUM_PCSD, RX_RING_LEN, SRRCTL_DESCTYPE_ADV_ONEBUF, TX_CTXT_VLAN_MASK,
-        TX_CTXT_VLAN_SHIFT, TX_RING_LEN, TX_RING_USABLE, VET_8021Q, VFTA_WORDS,
+        vfta_word, wol_supported, wol_suspend_program, wus_clear_word, wus_delivered_wake_packet,
+        AdvRxDescRead, AdvRxDescWb, AdvTxCtxtDesc, AdvTxDataDesc, IvarScheme, TxRingCursor,
+        VlanFilter, WolFilters, ADVTXD_DCMD_DEXT, ADVTXD_DTYP_CTXT, ADV_RXD_STAT_VP, CTRL_ADVD3WUC,
+        EEPROM_APME, EITR_CNT_IGNR, EITR_START, IGB_82576, IGB_82576_NS, IGB_I210_COPPER,
+        IGB_I211_COPPER, IGB_I350_COPPER, IGB_MAX_QUEUES, IGB_MAX_QUEUES_82575,
+        IGB_MAX_QUEUES_I211, IVAR_VALID, MRQC_ENABLE_RSS_MQ, MRQC_ENABLE_VMDQ,
+        MRQC_ENABLE_VMDQ_RSS_MQ, MRQC_FIELD_IPV4, MRQC_FIELD_IPV4_TCP, MRQC_FIELD_IPV4_UDP,
+        MRQC_FIELD_IPV6, MRQC_FIELD_IPV6_TCP, MRQC_FIELD_IPV6_TCP_EX, MRQC_FIELD_IPV6_UDP,
+        QUEUE_ENABLE, REG_EIAC, REG_EIAM, REG_EIMC, REG_EIMS, REG_EITR0, REG_ICR, REG_IMC, REG_IMS,
+        REG_IVAR0, REG_IVAR_MISC, REG_MRQC, REG_RDBAH, REG_RDBAL, REG_RDH, REG_RDLEN, REG_RDT,
+        REG_RETA_BASE, REG_RSSRK_BASE, REG_RXCSUM, REG_RXDCTL0, REG_SRRCTL_Q0, REG_TDBAH,
+        REG_TDBAL, REG_TDH, REG_TDLEN, REG_TDT, REG_TXDCTL0, REG_VET, REG_VFTA_BASE, REG_WUC,
+        REG_WUFC, REG_WUS, RETA_REGS, RETA_SIZE, RSS_KEY_SIZE, RXCSUM_CRCOFL, RXCSUM_PCSD,
+        RX_RING_LEN, SRRCTL_DESCTYPE_ADV_ONEBUF, TX_CTXT_VLAN_MASK, TX_CTXT_VLAN_SHIFT,
+        TX_RING_LEN, TX_RING_USABLE, VET_8021Q, VFTA_WORDS, WUC_PME_EN, WUFC_LNKC, WUFC_MAG,
+        WUFC_MC, WUS_ARPD, WUS_IPV6,
     };
 
     fn smoke_igb_extended_interrupt_layout() -> TestResult {
@@ -2859,4 +3016,95 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/igb", smoke_igb_vlan_tx_context_and_pair);
+
+    fn smoke_igb_wol_filters_and_registers() -> TestResult {
+        if REG_WUC != 0x5800 || REG_WUFC != 0x5808 || REG_WUS != 0x5810 {
+            return TestResult::Fail("igb WUC/WUFC/WUS register drift");
+        }
+        if WUC_PME_EN != 0x2 || CTRL_ADVD3WUC != 0x0010_0000 {
+            return TestResult::Fail("igb WUC/CTRL wake bit drift");
+        }
+        // Filter encode/decode round-trip, including unknown-bit drop.
+        let filters = WolFilters {
+            link_change: true,
+            magic: true,
+            directed_exact: false,
+            multicast: true,
+            broadcast: false,
+        };
+        let word = filters.to_wufc();
+        if word != WUFC_LNKC | WUFC_MAG | WUFC_MC {
+            return TestResult::Fail("igb WUFC encode drift");
+        }
+        if WolFilters::from_wufc(word) != filters
+            || WolFilters::from_wufc(word | 0x8000_0000) != filters
+        {
+            return TestResult::Fail("igb WUFC decode drift");
+        }
+        if WolFilters::magic_only().to_wufc() != WUFC_MAG {
+            return TestResult::Fail("igb WoL magic-only default drift");
+        }
+        // Support gates: port A, or APME on other ports, and the
+        // platform must be able to wake at all.
+        if !wol_supported(true, false, true)
+            || !wol_supported(false, true, true)
+            || wol_supported(false, false, true)
+            || wol_supported(true, false, false)
+        {
+            return TestResult::Fail("igb WoL support-gate drift");
+        }
+        if EEPROM_APME != 0x0400 {
+            return TestResult::Fail("igb EEPROM APME bit drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_wol_filters_and_registers);
+
+    fn smoke_igb_wol_suspend_and_status() -> TestResult {
+        // System suspend with magic-only arms PME + MAG, keeps the
+        // link powered (wake needs it).
+        let program = wol_suspend_program(WolFilters::magic_only(), false, false);
+        if !program.advd3wuc
+            || program.wuc != WUC_PME_EN
+            || program.wufc != WUFC_MAG
+            || program.power_down_link
+        {
+            return TestResult::Fail("igb WoL system-suspend program drift");
+        }
+        // Link already up drops link-change from the armed set.
+        let filters = WolFilters {
+            link_change: true,
+            magic: true,
+            directed_exact: false,
+            multicast: false,
+            broadcast: false,
+        };
+        let program = wol_suspend_program(filters, true, false);
+        if program.wufc != WUFC_MAG {
+            return TestResult::Fail("igb WoL link-up LNKC drop drift");
+        }
+        // Runtime suspend arms link-change only, even with no caller
+        // filters — unless the link is up, in which case nothing is
+        // armed and the link powers down.
+        let program = wol_suspend_program(WolFilters::default(), false, true);
+        if program.wufc != WUFC_LNKC || program.power_down_link {
+            return TestResult::Fail("igb WoL runtime-suspend program drift");
+        }
+        let program = wol_suspend_program(WolFilters::default(), true, true);
+        if program.wuc != 0 || program.wufc != 0 || !program.power_down_link {
+            return TestResult::Fail("igb WoL nothing-armed program drift");
+        }
+        // WUS: directed-packet bits count as a delivered wake packet;
+        // link-change/magic alone do not; clear word is all-ones.
+        if !wus_delivered_wake_packet(WUS_ARPD)
+            || !wus_delivered_wake_packet(WUS_IPV6)
+            || wus_delivered_wake_packet(WUFC_MAG)
+            || wus_delivered_wake_packet(WUFC_LNKC)
+            || wus_clear_word() != !0u32
+        {
+            return TestResult::Fail("igb WUS wake-packet decode drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_wol_suspend_and_status);
 }
