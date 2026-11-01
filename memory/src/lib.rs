@@ -49,6 +49,7 @@ pub mod migrate;
 pub mod module_text;
 pub mod numa_tier;
 pub mod oom;
+pub mod pageattr;
 pub mod pager;
 pub mod per_domain_root;
 pub mod reclaim;
@@ -74,6 +75,7 @@ pub mod zpool;
 
 mod guard_tests;
 mod memtype_tests;
+mod pageattr_tests;
 mod remote_access_tests;
 mod tests;
 

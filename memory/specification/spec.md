@@ -544,6 +544,34 @@ pub mod memtype {
     pub fn aarch64_leaf_bits(memory_type: MemoryType) -> aarch64::paging::PtFlags;
 }
 
+/// Kernel page attributes of System RAM (module `pageattr`; Linux
+/// `set_pages_array_wc` / `set_pages_array_wb` / `lookup_memtype`). x86_64
+/// only; every call on aarch64 is `Unsupported`.
+pub mod pageattr {
+    pub enum PageAttrError { NotRam, Busy, Unsupported, NoFrame }
+    /// Recorded type of a retyped RAM page; None = write-back.
+    pub fn ram_memory_type(phys: PhysAddr) -> Option<MemoryType>;
+    pub fn retyped_pages() -> usize;
+    /// Pages a `WcPages` drop could not restore and leaked unfreed.
+    pub fn leaked_pages() -> u64;
+    /// Direct map live and kernel root recorded (x86_64).
+    pub fn supported() -> bool;
+    /// Record WC, rewrite every kernel alias UC- then WC (splitting huge
+    /// leaves), flushing all TLBs and the pages' cache lines after each.
+    /// All or nothing: NotRam, Busy (typed or repeated page), NoFrame.
+    pub unsafe fn set_pages_wc(pages: &[PhysFrame]) -> Result<(), PageAttrError>;
+    /// Restore write-back on pages `set_pages_wc` retyped (else Busy, no
+    /// change). Mandatory before the pages are freed.
+    pub unsafe fn set_pages_wb(pages: &[PhysFrame]) -> Result<(), PageAttrError>;
+    /// Owned zeroed WC pages (TTM `ttm_write_combined`): allocate → zero →
+    /// retype; drop → restore → free, or leak if the restore fails.
+    pub struct WcPages;
+    impl WcPages {
+        pub fn allocate(count: usize) -> Result<WcPages, PageAttrError>;
+        pub fn frames(&self) -> &[PhysFrame];
+    }
+}
+
 // x86_64 paging additions for memory types.
 impl x86_64::paging::PtFlags {
     pub const PAT_4K: PtFlags;          // bit 7 of a 4 KiB PTE
@@ -1321,16 +1349,29 @@ x86_64 is rejected at runtime.
 
 - Every non-identity kernel mapping has a domain assignment; untagged
   mappings panic in debug, deny-by-default in release.
-- **User memory types never alias System RAM.** Every user leaf is built
-  by `user_leaf_flags(perms, writable, phys)` from the frame it maps. A
-  non-write-back `MemoryType` reaches the leaf only when the region is a
-  special mapping (`memtype::region_may_request`) and `phys` is outside
-  System RAM (`frame::is_system_ram`); otherwise the leaf is write-back,
-  matching the kernel direct map, and a RAM refusal is counted. This is
-  Linux's rule for RAM pfns in `reserve_pfn_range` / `track_pfn_insert`
-  (the request is replaced by the page's memtype, which is write-back
-  because NARF has no `set_memory_wc`). The type is recomputed whenever a
+- **User memory types never alias System RAM against the kernel's type.**
+  Every user leaf is built by `user_leaf_flags(perms, writable, phys)` from
+  the frame it maps. In a special mapping (`memtype::region_may_request`),
+  a RAM page retyped by `pageattr::set_pages_wc` maps with its recorded type
+  whatever was requested; otherwise a non-write-back `MemoryType` reaches
+  the leaf only when `phys` is outside System RAM (`frame::is_system_ram`),
+  and a RAM refusal is counted. Ordinary regions are always write-back and
+  never hold a retyped page. This is Linux's rule for RAM pfns in
+  `reserve_pfn_range` / `track_pfn_insert` (the request is replaced by the
+  page's memtype, `lookup_memtype`). The type is recomputed whenever a
   leaf is rebuilt (mprotect, fork, relocation), so it follows the frame.
+- **A retyped RAM page has one type everywhere.** `set_pages_wc` records the
+  type before any alias changes and rewrites every kernel alias
+  (`text_poke::alias_vas`: direct map and kernel window) to UC- then WC,
+  each step followed by an all-CPU TLB flush and CLFLUSH(OPT) of every
+  line, so no cached copy or stale translation survives. Huge alias leaves
+  are split into identical translations with an all-CPU flush before any
+  attribute changes (`__split_large_page`). Only PWT/PCD/PAT(7) change; the
+  PKS key field, NX, WRITABLE and GLOBAL are preserved. A retyped page is
+  restored to write-back (`set_pages_wb`) before it reaches the frame
+  allocator; `WcPages` enforces this and leaks rather than frees a page it
+  cannot restore. All rewrites of the shared kernel windows, here and in
+  `text_poke`, serialise on `pageattr::CPA_LOCK`.
   Only kernel drivers set the request (through `MmapBacking::memory_type`);
   no syscall lets userspace choose one.
 - **Write-back is bit-identical.** `MemoryType::WriteBack` contributes no
@@ -1969,7 +2010,9 @@ x86_64 is rejected at runtime.
     `kernel_ptr`; they read the same offset from `narf_lib::directmap`,
     which `narf-memory` publishes once the direct map is live.
   - `text_poke` closes the *writable aliases* of a physical page. The
-    identity VA is no longer one of them; see `alias_vas`.
+    identity VA is no longer one of them; see `alias_vas`. `pageattr`
+    retypes the same aliases' cache selector (4 KiB leaves only, PAT slot 1
+    WC / slot 2 UC-) and shares `text_poke`'s split and `CPA_LOCK`.
     Permission changes invalidate global range entries and every non-global
     PCID context on all CPUs before publishing executable text or releasing
     its backing. A kernel alias may be cached under an inactive userspace

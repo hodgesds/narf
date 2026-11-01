@@ -51,9 +51,12 @@
 //! `flush_user_tlb_all_cpus()`, which is synchronous — it INVPCID/CR3-flushes
 //! locally and then broadcasts through `shoot_full`, which spins for every
 //! peer's ack before returning. The permission store happens after that call
-//! returns, on the next turn of the walk loop. Every writer here holds
-//! `bpf_text`'s `PACKS` lock for the whole sequence, which is this tree's
-//! stand-in for `cpa_lock`.
+//! returns, on the next turn of the walk loop. Every writer takes
+//! `pageattr::CPA_LOCK` (Linux `cpa_lock`) for the whole sequence; it is
+//! shared with `pageattr`'s cache-type rewrites of the same windows. Before
+//! it existed the only serialisation was each caller's own lock, and
+//! `bpf_text` (`PACKS`) and `module_text` (its own lock) could split the same
+//! huge leaf concurrently, one losing its table.
 //!
 //! Changing an attribute needs its own invalidation too, and that one is *not*
 //! the split's: [`set_range_writable`] ends with a synchronous
@@ -63,7 +66,7 @@
 //! at all — which left the protection correct in the page tables and inert in
 //! the TLB. `smoke_text_poke_protect_round_trip` is what found that.
 //!
-//! `PACKS` is also the whole of the serialisation argument, so it is worth
+//! `CPA_LOCK` is also the whole of the serialisation argument, so it is worth
 //! being explicit about what it does *not* cover. `paging.rs` guards
 //! `map_4kb` / `unmap_4kb` with a per-root shard lock (`pt_lock_for`), and
 //! [`set_leaf_writable`] does not take it — it walks the tables directly. The
@@ -73,8 +76,8 @@
 //! `map_4kb`s into the low identity map, the higher-half kernel window, or the
 //! direct map, which are the only subtrees rewritten here. The one VA range
 //! this module does hand to `map_4kb` — the poke window — lives in the BPF text
-//! slot, disjoint from all three. Lock order is `PACKS` → `pt_lock`, never the
-//! reverse.
+//! slot, disjoint from all three. Lock order is `PACKS` → `CPA_LOCK` →
+//! `pt_lock`, never the reverse.
 //!
 //! On aarch64 the same reasoning does **not** apply, and this module does not
 //! pretend otherwise. ARMv8 requires break-before-make when a translation's
@@ -212,10 +215,11 @@ pub fn can_protect(phys: u64, len: u64) -> bool {
 /// # Safety
 /// - `[phys, phys + len)` must be memory the caller owns exclusively; nothing
 ///   else may be writing through a kernel pointer to it.
-/// - The caller must serialise against every other user of this module (in
-///   practice: hold `bpf_text::PACKS`).
+/// - Serialisation against other rewrites of the kernel windows is internal
+///   (`pageattr::CPA_LOCK`); callers serialise their own bookkeeping.
 /// - [`protect_rw`] must run before the frames are released.
 pub unsafe fn protect_ro(phys: u64, len: u64) -> Result<(), PokeError> {
+    let _cpa = crate::pageattr::CPA_LOCK.lock();
     // SAFETY: forwarded caller contract.
     unsafe { set_alias_writable(phys, len, false) }
 }
@@ -227,6 +231,7 @@ pub unsafe fn protect_ro(phys: u64, len: u64) -> Result<(), PokeError> {
 /// frames back to the buddy leaves a read-only alias on memory whose next
 /// owner expects to be able to write it.
 pub unsafe fn protect_rw(phys: u64, len: u64) -> Result<(), PokeError> {
+    let _cpa = crate::pageattr::CPA_LOCK.lock();
     // SAFETY: forwarded caller contract.
     unsafe { set_alias_writable(phys, len, true) }
 }
@@ -264,7 +269,7 @@ unsafe fn set_alias_writable(phys: u64, len: u64, writable: bool) -> Result<(), 
 /// PML4[1] (512 GiB..1 TiB) is the high-MMIO identity window and never maps
 /// RAM, so it is not a candidate either.
 #[cfg(target_arch = "x86_64")]
-fn alias_vas(phys: u64) -> ([u64; 2], usize) {
+pub(crate) fn alias_vas(phys: u64) -> ([u64; 2], usize) {
     let mut out = [0u64; 2];
     let mut n = 0;
     // Ask the window what it covers rather than assuming the first GiB: it maps
@@ -521,8 +526,12 @@ fn apply_writable(slot: &mut crate::x86_64::paging::PageTableEntry, writable: bo
 /// note only makes behaviour undefined when the large and small translations
 /// *differ*), and the synchronous flush at the end is what makes it legal for
 /// the caller to change an attribute afterwards.
+///
+/// # Safety
+/// `slot` is a present huge leaf of a live kernel table and the caller holds
+/// `pageattr::CPA_LOCK`.
 #[cfg(target_arch = "x86_64")]
-unsafe fn split_leaf(
+pub(crate) unsafe fn split_leaf(
     slot: &mut crate::x86_64::paging::PageTableEntry,
     from_1g: bool,
 ) -> Result<(), PokeError> {
