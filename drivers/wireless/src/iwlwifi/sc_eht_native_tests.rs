@@ -66,6 +66,10 @@ impl Model {
             out.extend_from_slice(body);
             out.resize(out.len().next_multiple_of(4), 0);
         }
+        // The actual core103 image uses the full version word only with
+        // API_NEW_VERSION20. A header spelling103 without this source bit
+        // means legacy API0 and must not qualify EHT/320/MLD admission.
+        tlv(image, 29, &[0, 0, 0, 0, 0, 0, 0x10, 0]);
         let mut pnvm = Vec::new();
         let sku: Vec<_> = self.sku().into_iter().flat_map(u32::to_le_bytes).collect();
         tlv(&mut pnvm, 64, &sku);
@@ -433,6 +437,36 @@ fn smoke_iwl_eht_rf_subsystem_bw_reduced_sku_and_exact_pnvm_source() -> TestResu
         model.pnvm_image(&mut image, 0x48);
         let parsed =
             super::super::super::parse_ucode(&image).map_err(|_| "EHT source negative parse")?;
+        require(
+            super::super::super::gen2_profile::firmware_api(&parsed) == 103
+                && parsed.api.api_changes[0] & (1 << 20) != 0,
+            "EHT authored core103 source lacks actual full-version API20",
+        )?;
+        let mut missing_api = image.clone();
+        let mut offset = 88;
+        while offset < missing_api.len() {
+            let tag = word(&missing_api, offset);
+            let length = word(&missing_api, offset + 4) as usize;
+            if tag == 29 && length == 8 && word(&missing_api, offset + 8) == 0 {
+                let flags = word(&missing_api, offset + 12) & !(1 << 20);
+                missing_api[offset + 12..offset + 16].copy_from_slice(&flags.to_le_bytes());
+            }
+            offset += 8 + length.next_multiple_of(4);
+        }
+        let missing = super::super::super::parse_ucode(&missing_api)
+            .map_err(|_| "EHT missing-version source parse")?;
+        require(
+            sc_eht::Source::boot(
+                0xe340,
+                0x0050,
+                0x480,
+                model.radio(),
+                &missing,
+                &model.alive(),
+            )?
+            .is_none(),
+            "EHT header name substituted for actual full-version API20",
+        )?;
         let mut bad = model.alive();
         bad[120] ^= 1;
         require(

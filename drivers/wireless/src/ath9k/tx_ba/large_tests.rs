@@ -297,6 +297,12 @@ fn smoke_ar9285_large_tx_preflight_half_baw_peer_factor_air_time_and_no_sequence
     let mut offer = ht::tests::elements();
     offer[4] = (offer[4] & !3) | 3;
     f.peer.lock().ht = Some(offer);
+    // The fixture initially delivered a real factor0 beacon. Updating the
+    // peer alone cannot widen those cached facts: deliver the actual new
+    // offer before JoinPlan negotiates its min(beacon,response) bound.
+    let beacon = f.peer.lock().beacon();
+    f.model.inject(&beacon, 0).unwrap();
+    f.radio.poll().unwrap();
     qualify(&f.model, 8, 65535, 64);
     station::complete(f.radio.associate(AP, SSID, Some(Zeroizing::new(PMK)), &[])).unwrap();
     settle(&mut f);

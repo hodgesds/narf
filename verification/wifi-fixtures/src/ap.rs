@@ -106,7 +106,7 @@ impl FakeAp {
     ) -> Result<Self, ApError> {
         if ssid.is_empty()
             || ssid.len() > 32
-            || !(1..=11).contains(&channel)
+            || !(1..=13).contains(&channel)
                 && !matches!(channel, 36 | 40 | 44 | 48 | 149 | 153 | 157 | 161 | 165)
             || !(1..=2007).contains(&aid)
             || plan.station == plan.bssid
