@@ -95,7 +95,7 @@ pub(crate) struct EngineAds {
 /// Indexed by `Engine::index`; exactly the scheduler's engines are present.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct SchedulingAds {
-    pub engines: [Option<EngineAds>; 3],
+    pub engines: [Option<EngineAds>; Engine::COUNT],
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -226,7 +226,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
         platform: GtPlatform,
         engines: EngineSet,
     ) -> Result<Self, SchedulingError> {
-        if !engines.contains(Engine::Rcs0) {
+        if !engines.contains(Engine::Rcs0)
+            || (platform != GtPlatform::Battlemage && engines.contains(Engine::Bcs8))
+        {
             return Err(SchedulingError::State);
         }
         let mut owned: Vec<A::Backing> = Vec::new();
@@ -305,7 +307,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
     }
 
     pub(crate) fn ads(&self) -> SchedulingAds {
-        let mut engines = [None; 3];
+        let mut engines = [None; Engine::COUNT];
         for state in &self.resources.engines {
             engines[state.engine.index()] = Some(EngineAds {
                 golden: state.golden.ggtt_offset(),
@@ -568,11 +570,23 @@ impl<A: BootAllocator> GuCScheduler<A> {
         now: u64,
         batch: ResidentBatch,
     ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
+        // SAFETY: the unchanged trusted-batch contract is forwarded.
+        unsafe { self.submit_resident_on(now, Engine::Rcs0, batch) }
+    }
+
+    /// # Safety
+    /// Same trusted resident-batch contract as `submit_resident`.
+    pub(crate) unsafe fn submit_resident_on(
+        &mut self,
+        now: u64,
+        engine: Engine,
+        batch: ResidentBatch,
+    ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
         self.admit()?;
-        if batch.platform() != Some(self.platform) {
+        if batch.platform() != Some(self.platform) || !self.engines.contains(engine) {
             return Err(SchedulingError::Address);
         }
-        self.submit(now, Engine::Rcs0, Some(batch), None)
+        self.submit(now, engine, Some(batch), None)
     }
 
     fn submit(
@@ -686,7 +700,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
         let mut words: Vec<u32> = if let Some(prefix) = prefix {
             let mut words = alloc::vec![0x04000001];
             words.extend_from_slice(&prefix);
-            if engine == Engine::Bcs0 {
+            if engine.is_copy() {
                 crate::intel_gpu_engine::copy_completion(image.ggtt_offset(), stamp, &mut words);
             } else {
                 render_completion(
@@ -704,7 +718,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             // slots are identical in the RCS and BCS register tables.
             image.write32(REGS + 0x31 * 4, (root >> 32) as u32);
             image.write32(REGS + 0x33 * 4, root as u32);
-            if engine == Engine::Bcs0 {
+            if engine.is_copy() {
                 crate::intel_gpu_engine::copy_ring(
                     (!batch.skip_batch()).then_some(batch.address()),
                     batch.user_fence(),
@@ -859,8 +873,8 @@ impl<A: BootAllocator> GuCScheduler<A> {
             // Linux records every class's default LRC; BCS's WA job is
             // emit_wa_job's BLIT_CCTL RMW and CCS's only the Xe2 WMTP level,
             // with no render 3D state.
-            let seed = if engine == Engine::Bcs0 {
-                crate::intel_gpu_engine::copy_seed(self.platform)
+            let seed = if engine.is_copy() {
+                crate::intel_gpu_engine::copy_seed(engine, self.platform)
             } else {
                 self.compute_seed.clone()
             };
@@ -981,7 +995,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         1,
                         id,
                         context.engine.guc_class(),
-                        1,
+                        context.engine.submit_mask(),
                         0,
                         0,
                         0,

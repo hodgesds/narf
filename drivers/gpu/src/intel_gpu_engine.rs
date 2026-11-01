@@ -7,7 +7,9 @@
 //! xe_gt.c::emit_wa_job, xe_hw_engine_setup_default_lrc_state and
 //! regs/xe_engine_regs.h. CCS0 follows xe_gt_ccs_mode.c's default ccs_mode 1
 //! (all compute slices on CCS0; CCS1-3 never exposed) and xe_hw_engine.c's
-//! compute fuses. BCS8 and media engines remain unadmitted.
+//! compute fuses. BMG's architecture-present BCS8 is ordinary COPY1 while
+//! USM is absent. A future USM owner must reserve/revoke that user engine.
+//! Media engines remain unadmitted.
 
 use crate::{intel_gpu_gt::GtPlatform, intel_gpu_rcs::GpuBacking};
 use alloc::vec::Vec;
@@ -22,6 +24,7 @@ const START: u64 = BREADCRUMB + 8;
 pub enum Engine {
     Rcs0,
     Bcs0,
+    Bcs8,
     Ccs0,
 }
 
@@ -43,7 +46,7 @@ impl EngineSet {
         self.0
     }
     pub const fn from_bits(bits: u8) -> Self {
-        Self(bits & 0b111)
+        Self(bits & ((1 << Engine::COUNT) - 1))
     }
     pub fn contains(self, engine: Engine) -> bool {
         self.0 & 1 << engine as u8 != 0
@@ -88,7 +91,8 @@ pub(crate) fn ccs_mode(instances: u8) -> Option<u32> {
 }
 
 impl Engine {
-    pub const ALL: [Engine; 3] = [Engine::Rcs0, Engine::Bcs0, Engine::Ccs0];
+    pub const COUNT: usize = 4;
+    pub const ALL: [Engine; Self::COUNT] = [Engine::Rcs0, Engine::Bcs0, Engine::Bcs8, Engine::Ccs0];
 
     pub(crate) fn index(self) -> usize {
         self as usize
@@ -97,6 +101,7 @@ impl Engine {
         match self {
             Engine::Rcs0 => 0x2000,
             Engine::Bcs0 => 0x22000,
+            Engine::Bcs8 => 0x3ee000,
             Engine::Ccs0 => 0x1a000,
         }
     }
@@ -104,7 +109,7 @@ impl Engine {
     pub(crate) fn guc_class(self) -> u32 {
         match self {
             Engine::Rcs0 => 0,
-            Engine::Bcs0 => 3,
+            Engine::Bcs0 | Engine::Bcs8 => 3,
             Engine::Ccs0 => 4,
         }
     }
@@ -112,26 +117,54 @@ impl Engine {
     pub fn xe_class(self) -> u16 {
         match self {
             Engine::Rcs0 => 0,
-            Engine::Bcs0 => 1,
+            Engine::Bcs0 | Engine::Bcs8 => 1,
             Engine::Ccs0 => 4,
         }
     }
+    #[cfg(feature = "kernel-test")]
     pub(crate) fn from_xe_class(class: u16) -> Option<Self> {
-        Self::ALL.into_iter().find(|e| e.xe_class() == class)
+        Self::from_class_instance(class, 0)
+    }
+    /// Public logical instances are dense within a class; GuC ADS maps
+    /// COPY1 to hardware BCS8 (xe_hw_engine_setup_logical_mapping).
+    pub fn logical_instance(self) -> u16 {
+        if self == Self::Bcs8 {
+            1
+        } else {
+            0
+        }
+    }
+    pub(crate) fn physical_instance(self) -> u32 {
+        if self == Self::Bcs8 {
+            8
+        } else {
+            0
+        }
+    }
+    pub(crate) fn submit_mask(self) -> u32 {
+        1 << self.logical_instance()
+    }
+    pub(crate) fn is_copy(self) -> bool {
+        matches!(self, Self::Bcs0 | Self::Bcs8)
+    }
+    pub(crate) fn from_class_instance(class: u16, instance: u16) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|e| e.xe_class() == class && e.logical_instance() == instance)
     }
     /// xe_gt_lrc_size: PPHWSP plus the class's engine context image.
     pub(crate) fn lrc_pages(self, platform: GtPlatform) -> u32 {
         match (self, platform) {
             (Engine::Rcs0, GtPlatform::Battlemage) => 4,
             (Engine::Rcs0, _) => 14,
-            (Engine::Bcs0, _) => 2,
+            (Engine::Bcs0 | Engine::Bcs8, _) => 2,
             (Engine::Ccs0, GtPlatform::Battlemage) => 3,
             (Engine::Ccs0, _) => 14,
         }
     }
     /// First MI_LOAD_REGISTER_IMM header of the hardware-saved image.
     pub(crate) fn first_lri(self, platform: GtPlatform) -> u32 {
-        if self == Engine::Bcs0 && platform != GtPlatform::Battlemage {
+        if self.is_copy() && platform != GtPlatform::Battlemage {
             0x11081019 // gen12_xcs_offsets: 13 registers, no PRT_BB_STATE
         } else {
             0x1108101d
@@ -177,9 +210,9 @@ pub(crate) fn uncached_mocs(platform: GtPlatform) -> u32 {
 
 /// Default BCS LRC state: emit_wa_job's non-MCR read-modify-write of
 /// BLIT_CCTL, pointing MOCS-less blitter commands at the uncached index.
-pub(crate) fn copy_seed(platform: GtPlatform) -> Vec<u32> {
+pub(crate) fn copy_seed(engine: Engine, platform: GtPlatform) -> Vec<u32> {
     let uc = uncached_mocs(platform);
-    let reg = Engine::Bcs0.base() + 0x204;
+    let reg = engine.base() + 0x204;
     alloc::vec![
         0x15080001,
         reg,
@@ -305,7 +338,7 @@ pub(crate) fn xcs_image(engine: Engine, image: &impl GpuBacking, platform: GtPla
         ]
     };
     let mut groups: Vec<(u64, &[u32])> = alloc::vec![(1, first.as_slice()), (0x21, second)];
-    if xe2 && engine == Engine::Bcs0 {
+    if xe2 && engine.is_copy() {
         groups.push((0x41, &[0x200, 0x204]));
     }
     let mut end = 0;
@@ -351,7 +384,12 @@ pub(crate) mod tests {
     fn smoke_engine_identity_table() -> TestResult {
         assert_eq!(
             Engine::ALL.map(|e| (e.base(), e.guc_class(), e.xe_class())),
-            [(0x2000, 0, 0), (0x22000, 3, 1), (0x1a000, 4, 4)]
+            [
+                (0x2000, 0, 0),
+                (0x22000, 3, 1),
+                (0x3ee000, 3, 1),
+                (0x1a000, 4, 4)
+            ]
         );
         assert_eq!(Engine::Ccs0.lrc_pages(GtPlatform::Battlemage), 3);
         assert_eq!(Engine::Ccs0.lrc_pages(GtPlatform::Alchemist), 14);
@@ -378,6 +416,17 @@ pub(crate) mod tests {
         assert_eq!(Engine::from_xe_class(1), Some(Engine::Bcs0));
         assert_eq!(Engine::from_xe_class(4), Some(Engine::Ccs0));
         assert_eq!(Engine::from_xe_class(2), None);
+        assert_eq!(Engine::from_class_instance(1, 1), Some(Engine::Bcs8));
+        assert_eq!(Engine::from_class_instance(1, 8), None);
+        assert_eq!(
+            (
+                Engine::Bcs8.physical_instance(),
+                Engine::Bcs8.logical_instance(),
+                Engine::Bcs8.submit_mask()
+            ),
+            (8, 1, 2)
+        );
+        assert_eq!(EngineSet::from_bits(0xff), EngineSet::of(&Engine::ALL));
         for platform in [
             GtPlatform::Alchemist,
             GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
@@ -388,6 +437,7 @@ pub(crate) mod tests {
         }
         assert_eq!(Engine::Rcs0.lrc_pages(GtPlatform::Battlemage), 4);
         assert_eq!(Engine::Bcs0.first_lri(GtPlatform::Battlemage), 0x1108101d);
+        assert_eq!(Engine::Bcs8.lrc_pages(GtPlatform::Battlemage), 2);
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_engine", smoke_engine_identity_table);
@@ -422,6 +472,16 @@ pub(crate) mod tests {
         assert_eq!(
             &r[0x41..0x47],
             &[0x11081003, 0x22200, 0, 0x22204, 0, 0x05000001]
+        );
+        drop(w);
+        let copy8 = Image(RefCell::new(alloc::vec![0; 2048]));
+        xcs_image(Engine::Bcs8, &copy8, GtPlatform::Battlemage, 0x0123_4000);
+        let w = copy8.0.borrow();
+        let r = &w[1024..];
+        assert_eq!(&r[..6], &[0, 0x1108101d, 0x3ee244, 0x00090009, 0x3ee034, 0]);
+        assert_eq!(
+            &r[0x41..0x47],
+            &[0x11081003, 0x3ee200, 0, 0x3ee204, 0, 0x05000001]
         );
         TestResult::Pass
     }
@@ -474,11 +534,16 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(fenced.len() % 2, 0);
-        let seed = copy_seed(GtPlatform::Battlemage);
+        let seed = copy_seed(Engine::Bcs0, GtPlatform::Battlemage);
         assert_eq!(&seed[..3], &[0x15080001, 0x22204, 0x600]);
         assert_eq!(seed[7], 3 << 9 | 3 << 1);
         assert_eq!(&seed[17..20], &[0x15040001, 0x600, 0x22204]);
-        assert_eq!(copy_seed(GtPlatform::Alchemist)[7], 1 << 9 | 1 << 1);
+        assert_eq!(
+            copy_seed(Engine::Bcs0, GtPlatform::Alchemist)[7],
+            1 << 9 | 1 << 1
+        );
+        let copy8 = copy_seed(Engine::Bcs8, GtPlatform::Battlemage);
+        assert_eq!((copy8[1], copy8[19], copy8[7]), (0x3ee204, 0x3ee204, 0x606));
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/intel_gpu_engine", smoke_copy_ring_vectors);

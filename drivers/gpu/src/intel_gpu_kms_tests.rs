@@ -45,13 +45,14 @@ struct Hardware {
     refuse_status_restore: bool,
 }
 #[derive(Clone, Debug)]
-struct MockPlatform(Arc<IrqSafeSpinLock<Hardware>>, Arc<AtomicBool>, bool);
+pub(crate) struct MockPlatform(Arc<IrqSafeSpinLock<Hardware>>, Arc<AtomicBool>, bool);
 impl MockPlatform {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(
             Arc::new(IrqSafeSpinLock::new(Hardware {
                 regs: [
                     (0x70180, 0x84000000),
+                    (0x701cc, 1 << 13),
                     (0x70188, 4),
                     (0x70190, 0x001f003f),
                     (SURF, CONSOLE),
@@ -84,6 +85,15 @@ impl MockPlatform {
             Arc::new(AtomicBool::new(false)),
             false,
         )
+    }
+    pub(crate) fn meteor(&self) -> Device<Self> {
+        Device::new(self.clone(), Generation::MeteorLake, 0x1000000, console())
+    }
+    pub(crate) fn set(&self, register: u64, value: u32) {
+        self.0.lock().regs.insert(register, value);
+    }
+    pub(crate) fn poison(&self) {
+        self.1.store(true, Ordering::Release);
     }
     fn step(&self) {
         let mut hw = self.0.lock();
@@ -924,3 +934,6 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_kms",
     smoke_kms_inherited_fetchers_block_arena_claim
 );
+
+#[path = "intel_gpu_color_kms_tests.rs"]
+mod color;

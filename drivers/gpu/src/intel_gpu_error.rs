@@ -37,7 +37,7 @@ const ENGINE: [(&str, u64, u32); 6] = [
     ("instdone", 0x6c, u32::MAX),
     ("ctx_timestamp", 0x3a8, u32::MAX),
 ];
-const REGISTERS: usize = 4 + 3 * 6;
+const REGISTERS: usize = 4 + Engine::COUNT * 6;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Reason {
@@ -272,6 +272,7 @@ fn engine_name(engine: Engine) -> &'static str {
     match engine {
         Engine::Rcs0 => "rcs0",
         Engine::Bcs0 => "bcs0",
+        Engine::Bcs8 => "bcs8",
         Engine::Ccs0 => "ccs0",
     }
 }

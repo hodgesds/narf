@@ -11,10 +11,11 @@ use core::{
 use narf_filesystem::{DirOps, FsError};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-const EXPECTED: [u64; 22] = [
+// Global status, RCS0, BCS0, BCS8, CCS0 in xe_hw_engine id order.
+const EXPECTED: [u64; 28] = [
     0xc000, 0xc314, 0x941c, 0x190018, 0x2034, 0x2030, 0x209c, 0x20b8, 0x206c, 0x23a8, 0x22034,
-    0x22030, 0x2209c, 0x220b8, 0x2206c, 0x223a8, 0x1a034, 0x1a030, 0x1a09c, 0x1a0b8, 0x1a06c,
-    0x1a3a8,
+    0x22030, 0x2209c, 0x220b8, 0x2206c, 0x223a8, 0x3ee034, 0x3ee030, 0x3ee09c, 0x3ee0b8, 0x3ee06c,
+    0x3ee3a8, 0x1a034, 0x1a030, 0x1a09c, 0x1a0b8, 0x1a06c, 0x1a3a8,
 ];
 fn capture(platform: GtPlatform, reason: Reason) -> Capture {
     Capture {
@@ -23,7 +24,11 @@ fn capture(platform: GtPlatform, reason: Reason) -> Capture {
         epoch: 42,
         now_ns: 9000,
         state: GtState::Lost,
-        engines: EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs0]),
+        engines: if platform == GtPlatform::Battlemage {
+            EngineSet::of(&Engine::ALL)
+        } else {
+            EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs0])
+        },
     }
 }
 fn contexts(total: usize) -> Contexts {
@@ -69,10 +74,15 @@ fn smoke_intel_error_whitelist_profiles_and_redaction() -> TestResult {
         GtPlatform::Battlemage,
     ] {
         let mut reads = Vec::new();
+        let mut expected = EXPECTED[..16].to_vec();
+        if platform == GtPlatform::Battlemage {
+            expected.extend_from_slice(&EXPECTED[16..22]);
+        }
+        expected.extend_from_slice(&EXPECTED[22..]);
         let report = Report::capture(capture(platform, Reason::Protocol), contexts(1), |offset| {
             reads.push(offset);
             assert!(
-                EXPECTED.contains(&offset),
+                expected.contains(&offset),
                 "capture read a non-whitelisted register"
             );
             Some(if matches!(offset & 0xfff, 0x30 | 0x34) {
@@ -81,7 +91,7 @@ fn smoke_intel_error_whitelist_profiles_and_redaction() -> TestResult {
                 0x12345678
             })
         });
-        assert_eq!(reads, EXPECTED);
+        assert_eq!(reads, expected);
         assert_eq!(report.access, RegisterAccess::Complete);
         let text = Snapshot {
             report,
@@ -90,6 +100,9 @@ fn smoke_intel_error_whitelist_profiles_and_redaction() -> TestResult {
         .text();
         assert!(text.contains("rcs0.head_offset=0x001cba98"));
         assert!(text.contains("bcs0.tail_offset=0x001cba98"));
+        if platform == GtPlatform::Battlemage {
+            assert!(text.contains("bcs8.tail_offset=0x001cba98"));
+        }
         for forbidden in [
             "fedcba98",
             "lrca",
@@ -126,7 +139,9 @@ kernel_test_in!(
 );
 
 fn smoke_intel_error_lost_access_preserves_software_and_stops_mmio() -> TestResult {
-    for lose_at in [0, 1, 7, 21] {
+    // Exercise every cut, including both BCS8/CCS0 boundaries and the final
+    // CCS0 register, so the loss vectors cannot silently omit a new engine.
+    for lose_at in 0..EXPECTED.len() {
         let mut reads = 0;
         let report = Report::capture(
             capture(GtPlatform::Battlemage, Reason::WakeLost),
@@ -143,6 +158,8 @@ fn smoke_intel_error_lost_access_preserves_software_and_stops_mmio() -> TestResu
             lose_at + 1,
             "capture continued after current ownership was lost"
         );
+        assert!(report.registers[..lose_at].iter().all(Option::is_some));
+        assert!(report.registers[lose_at..].iter().all(Option::is_none));
         let text = Snapshot {
             report,
             suppressed: 0,

@@ -86,6 +86,16 @@ impl DrmFence for Completion {
     }
 }
 
+struct BlobPin {
+    mode: ModeState,
+    id: u32,
+}
+impl Drop for BlobPin {
+    fn drop(&mut self) {
+        self.mode.lock().intel_release_blob(self.id);
+    }
+}
+
 struct DumbPin {
     mode: ModeState,
     handle: u32,
@@ -112,6 +122,7 @@ pub(super) struct Job {
     completion: Arc<Completion>,
     predecessor: Option<Arc<Completion>>,
     _dumb: Option<DumbPin>,
+    _blob: Option<BlobPin>,
 }
 impl Drop for Job {
     fn drop(&mut self) {
@@ -123,7 +134,7 @@ impl Drop for Job {
 struct State {
     jobs: VecDeque<Job>,
     running: bool,
-    projected: Option<(u64, Crtc, Arc<Completion>)>,
+    projected: Option<(u64, Crtc, u32, Arc<Completion>)>,
 }
 pub(super) struct Queue {
     mode: ModeState,
@@ -153,6 +164,9 @@ impl Queue {
             }),
         }
     }
+    pub(super) fn is_master(&self, open: u64) -> bool {
+        self.mode.lock().is_master(open)
+    }
     pub(super) async fn submit(
         &self,
         open: u64,
@@ -163,15 +177,15 @@ impl Queue {
         events: Option<&Events>,
     ) -> Result<Submitted, SubmitError> {
         let _admission = self.admission.lock().await;
-        let (previous, predecessor) = {
+        let (previous, previous_ctm, predecessor) = {
             let state = self.state.lock();
             match &state.projected {
-                Some((owner, next, last))
+                Some((owner, next, ctm, last))
                     if *owner == open && !matches!(last.result(), Some(Err(_))) =>
                 {
-                    (Some(next.clone()), Some(last.clone()))
+                    (Some(next.clone()), Some(*ctm), Some(last.clone()))
                 }
-                _ => (None, None),
+                _ => (None, None, None),
             }
         };
         let mut plan = {
@@ -183,7 +197,7 @@ impl Queue {
             } else if !card.is_master(open) {
                 return Err(FsError::PermissionDenied.into());
             }
-            Plan::stage_from(&card, request, geometry, previous)?
+            Plan::stage_from(&card, request, geometry, previous, previous_ctm)?
         };
         let mut dependencies = if let Some(fd) = plan.fence.take() {
             context.sync_file_fences(fd).ok_or(FsError::InvalidData)?
@@ -193,6 +207,21 @@ impl Queue {
         if plan.test {
             return Ok(None);
         }
+        let blob = if let Action::Color { blob, .. } = plan.action {
+            if blob != 0 {
+                if !self.mode.lock().intel_retain_blob(blob) {
+                    return Err(FsError::NotFound.into());
+                }
+                Some(BlobPin {
+                    mode: self.mode.clone(),
+                    id: blob,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         dependencies.extend(plan_dependencies(&plan, &self.mode)?);
         let dumb = if let Some(fb) = plan.framebuffer.as_ref().filter(|fb| fb.intel.is_none()) {
             self.mode
@@ -245,7 +274,7 @@ impl Queue {
         }
         let nonblock = plan.nonblock;
         let mut state = self.state.lock();
-        state.projected = Some((open, plan.next.clone(), completion.clone()));
+        state.projected = Some((open, plan.next.clone(), plan.next_ctm, completion.clone()));
         state.jobs.push_back(Job {
             plan,
             open,
@@ -256,6 +285,7 @@ impl Queue {
             completion: completion.clone(),
             predecessor,
             _dumb: dumb,
+            _blob: blob,
         });
         let start = !state.running;
         state.running = true;

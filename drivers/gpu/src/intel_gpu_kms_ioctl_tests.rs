@@ -936,3 +936,6 @@ kernel_test_in!(
 
 #[path = "intel_gpu_kms_queue_tests.rs"]
 mod nonblock;
+
+#[path = "intel_gpu_color_ioctl_tests.rs"]
+mod color;

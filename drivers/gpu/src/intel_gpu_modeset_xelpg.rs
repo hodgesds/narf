@@ -346,6 +346,11 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         // Step 3: disable the existing pipeline (plane → pipe →
         // transcoder → port PLL request dropped).
         self.disable_pipeline();
+        // This is a full owned modeset with the pipe off, not a KMS
+        // inheritance path. Establish RGB bypass rather than depend on GOP
+        // leaving its per-plane gamma/CSC controls in an admissible state.
+        crate::intel_gpu_color::initialize_rgb_bypass(self.mmio)
+            .map_err(|_| ModesetError::ColorPipelineUnavailable)?;
 
         // Step 4: CDCLK floor for the mode's pixel clock.
         program_cdclk_floor(self.mmio, &mode)?;
@@ -777,6 +782,7 @@ pub mod tests {
         aux_reply: RefCell<Vec<u8>>,
         dpcd: RefCell<[u8; 0x1000]>,
         pub hbr2_cr_fails: Cell<bool>,
+        refuse_color: Cell<u64>,
     }
 
     const PIPECONF_OFF: u64 = 0x7_0008;
@@ -796,6 +802,7 @@ pub mod tests {
                 aux_reply: RefCell::new(Vec::new()),
                 dpcd: RefCell::new([0; 0x1000]),
                 hbr2_cr_fails: Cell::new(false),
+                refuse_color: Cell::new(u64::MAX),
             }
         }
 
@@ -909,6 +916,9 @@ pub mod tests {
 
         fn write32(&self, off: u64, val: u32) {
             self.writes.borrow_mut().push((off, val));
+            if off == self.refuse_color.get() {
+                return;
+            }
             if off == PWR_WELL_CTL2 || off == PWR_WELL_CTL_AUX2 {
                 self.wells.borrow_mut().push((off, val));
                 return;
@@ -918,7 +928,10 @@ pub mod tests {
                 return;
             }
             if off == PIPECONF_OFF {
-                self.pipeconf.set(val);
+                // STATE is hardware-owned and follows ENABLE, including
+                // read-modify-writes which carry the prior read-only state.
+                self.pipeconf
+                    .set(val & !crate::intel_gpu_pipes::PIPECONF_STATE);
                 return;
             }
             if off == self.port.aux_ctl() {
@@ -1227,5 +1240,147 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset_xelpg",
         smoke_mtl_cdclk_table_and_decode
+    );
+
+    // Full native production modeset conversations establish the prerequisite
+    // consumed by CTM capture. No firmware color defaults are supplied.
+    use crate::intel_gpu::Generation;
+    use crate::intel_gpu_color::{initialize_rgb_bypass, Owner, GAMMA, MODE};
+    use narf_filesystem::FsError;
+
+    const CONTROLS: [(u64, u32); 5] = [
+        (0x70034, 0),
+        (GAMMA, 0),
+        (MODE, 0),
+        (0x701c8, 0),
+        (0x701cc, 1 << 13),
+    ];
+    fn inherited(fake: &MtlFake) {
+        // Live inherited RGB surface with unowned output CSC and LUTs. The
+        // production sequence must disable it and replace these control values.
+        fake.phy.write32(0x70180, 0x84000000);
+        fake.pipeconf.set(1 << 31);
+        for (r, _) in CONTROLS {
+            fake.phy.write32(r, 0xffffffff);
+        }
+        for r in [0x49128, 0x4ac80, 0x711cc, 0x71034, 0x49050, 0x70210] {
+            fake.phy.write32(r, 0x12345678);
+        }
+    }
+    fn smoke_mtl_owned_modeset_establishes_ctm_rgb_bypass_without_firmware_defaults() -> TestResult
+    {
+        let fake = MtlFake::new(XeLpgPort::A);
+        inherited(&fake);
+        assert!(Owner::capture(&fake, Generation::MeteorLake).is_err());
+        let mode = Mode::VESA_1024X768_60;
+        assert_eq!(
+            crate::intel_gpu_modeset::modeset_display(
+                &fake,
+                Generation::MeteorLake,
+                &test_fb(),
+                Some(&mode)
+            ),
+            Ok(mode)
+        );
+        let mut owner = Owner::capture(&fake, Generation::MeteorLake)
+            .expect("owned setup must admit CTM capture");
+        owner
+            .arm(
+                &fake,
+                Some([1 << 32, 0, 0, 0, 1 << 32, 0, 0, 0, 1 << 32]),
+                100,
+            )
+            .unwrap();
+        fake.phy.write32(0x70040, 1);
+        assert!(owner.poll(&fake, 200).unwrap().is_some());
+        // Restore CTM so control readback below also verifies baseline retention.
+        owner.arm(&fake, None, 201).unwrap();
+        fake.phy.write32(0x70040, 2);
+        assert!(owner.poll(&fake, 202).unwrap().is_some());
+        for (r, value) in CONTROLS {
+            assert_eq!(fake.read32(r), value);
+        }
+        for r in [0x49128, 0x4ac80, 0x711cc, 0x71034, 0x49050, 0x70210] {
+            assert_eq!(fake.read32(r), 0x12345678);
+            assert!(
+                fake.writes_to(r).is_empty(),
+                "other pipe or disabled matrix touched: {r:#x}"
+            );
+        }
+        let writes = fake.writes.borrow();
+        let disabled = writes
+            .iter()
+            .position(|&(r, v)| r == PIPECONF_OFF && v & (3 << 30) == 0)
+            .unwrap();
+        let color = writes
+            .iter()
+            .position(|&(r, v)| r == 0x701cc && v == 1 << 13)
+            .unwrap();
+        let enabled = writes
+            .iter()
+            .position(|&(r, v)| r == 0x70180 && v & (1 << 31) != 0)
+            .unwrap();
+        assert!(
+            disabled < color && color < enabled,
+            "RGB bypass must precede primary enable while pipe is off"
+        );
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_mtl_owned_modeset_establishes_ctm_rgb_bypass_without_firmware_defaults
+    );
+    fn smoke_mtl_color_setup_rejects_live_or_unavailable_pipe_without_writes() -> TestResult {
+        for (r, value) in [
+            (0x70180, 1 << 31),
+            (PIPECONF_OFF, 1 << 31),
+            (PIPECONF_OFF, 1 << 30),
+            (0x70180, u32::MAX),
+        ] {
+            let fake = MtlFake::new(XeLpgPort::A);
+            if r == PIPECONF_OFF {
+                fake.pipeconf.set(value);
+            } else {
+                fake.phy.write32(r, value);
+            }
+            assert!(matches!(
+                initialize_rgb_bypass(&fake),
+                Err(FsError::Busy | FsError::NoDevice)
+            ));
+            assert!(fake.writes.borrow().is_empty());
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_mtl_color_setup_rejects_live_or_unavailable_pipe_without_writes
+    );
+    fn smoke_mtl_color_readback_failure_aborts_owned_modeset_before_reenable() -> TestResult {
+        for (register, _) in CONTROLS {
+            let fake = MtlFake::new(XeLpgPort::A);
+            inherited(&fake);
+            fake.refuse_color.set(register);
+            assert_eq!(
+                crate::intel_gpu_modeset::modeset_display(
+                    &fake,
+                    Generation::MeteorLake,
+                    &test_fb(),
+                    Some(&Mode::VESA_1024X768_60)
+                ),
+                Err(ModesetError::ColorPipelineUnavailable)
+            );
+            assert!(fake.writes_to(0x70180).iter().all(|v| v & (1 << 31) == 0));
+            assert_eq!(fake.read32(PIPECONF_OFF) & (3 << 30), 0);
+            assert!(fake.writes_to(CDCLK_PLL_ENABLE_REG).is_empty());
+            for r in [0x49128, 0x4ac80, 0x711cc, 0x71034] {
+                assert!(fake.writes_to(r).is_empty());
+            }
+            assert!(Owner::capture(&fake, Generation::MeteorLake).is_err());
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset_xelpg",
+        smoke_mtl_color_readback_failure_aborts_owned_modeset_before_reenable
     );
 }

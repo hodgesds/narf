@@ -200,7 +200,15 @@ pub struct GuCBoot<M: MmioWindow, A: BootAllocator> {
     scheduling: Option<crate::intel_gpu_guc_sched::SchedulingAds>,
     reload: bool,
     submission_version: (u8, u8, u8),
+    firmware_version: (u8, u8, u8),
+    incarnation: u64,
     workarounds: Option<GuCWorkarounds>,
+}
+
+pub(crate) struct LiveLog<'a, B> {
+    pub backing: &'a B,
+    pub firmware_version: (u8, u8, u8),
+    pub incarnation: u64,
 }
 
 impl<M: MmioWindow, A: BootAllocator> core::fmt::Debug for GuCBoot<M, A> {
@@ -230,6 +238,14 @@ fn extent(backing: &impl GpuBacking, pages: u32) -> Result<(), BootError> {
 impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
     pub(crate) fn submission_version(&self) -> (u8, u8, u8) {
         self.submission_version
+    }
+
+    pub(crate) fn live_log(&self) -> Option<LiveLog<'_, A::Backing>> {
+        (self.state == BootState::Ready && self.incarnation != 0).then_some(LiveLog {
+            backing: &self.resources.logs,
+            firmware_version: self.firmware_version,
+            incarnation: self.incarnation,
+        })
     }
 
     pub fn stage(
@@ -354,6 +370,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             scheduling: None,
             reload: false,
             submission_version: image.submission_version,
+            firmware_version: image.version,
+            incarnation: 0,
             workarounds: None,
         })
     }
@@ -608,6 +626,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         }
         let r = &mut *self.resources;
         let workarounds = self.workarounds.ok_or(BootError::State)?;
+        // Reset completion is independently verified before upload. No live
+        // firmware writes this BO now; never relabel previous-incarnation log
+        // bytes as output from the firmware about to start.
+        r.logs.zero_fill();
+        self.incarnation = crate::intel_gpu_guc_log::next_incarnation();
         // GuC is proven in reset. Publish bounded zero-length 16:16 KLVs,
         // the complete 64-bit ADS pointer and its byte count before DMA.
         for i in 0..PAGE / 4 {
@@ -739,8 +762,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                         let config = self.scheduling.expect("scheduling reload");
                         let ads = &self.resources.ads;
                         let base = ads.ggtt_offset();
-                        // Populate only while GuC is proven stopped: RCS0 and
-                        // BCS0, each logical instance 0 of its GuC class.
+                        // Populate only while GuC is proven stopped. Mapping
+                        // uses dense logical instances, enable masks and
+                        // register-state headers use physical instances.
                         // xe_guc_ads.c mapping/enable masks, golden LRCA with
                         // its post-register state size, and per-engine saves.
                         // guc_policies_init: global_flags 0 lets GuC reset an
@@ -754,12 +778,25 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                             let class = u64::from(engine.guc_class());
                             let base_reg = engine.base();
                             let saves = 0x2000 + engine.index() as u64 * 48;
-                            ads.write32(SYSINFO + class * 32, 0x20202000);
-                            ads.write32(SYSINFO + 512 + class * 4, 1);
-                            ads.write32(0x1014 + class * 4, state.golden);
-                            ads.write32(0x1054 + class * 4, state.bytes - 4096 - 96 * 4);
-                            ads.write32(class * 256, base + saves as u32);
-                            ads.write32(class * 256 + 4, 3);
+                            let logical = u64::from(engine.logical_instance());
+                            let physical = engine.physical_instance();
+                            let mapping = SYSINFO + class * 32 + logical / 4 * 4;
+                            let shift = (logical % 4) * 8;
+                            ads.write32(
+                                mapping,
+                                (ads.read32(mapping) & !(0xff << shift)) | physical << shift,
+                            );
+                            let enabled = SYSINFO + 512 + class * 4;
+                            ads.write32(enabled, ads.read32(enabled) | 1 << physical);
+                            // GuC's golden image is per class, not instance.
+                            // COPY0's identical class state remains its source.
+                            if logical == 0 {
+                                ads.write32(0x1014 + class * 4, state.golden);
+                                ads.write32(0x1054 + class * 4, state.bytes - 4096 - 96 * 4);
+                            }
+                            let header = class * 256 + u64::from(physical) * 8;
+                            ads.write32(header, base + saves as u32);
+                            ads.write32(header + 4, 3);
                             for (i, (reg, value, flags)) in [
                                 (base_reg + 0x29c, 0, 1),
                                 (base_reg + 0x80, state.hwsp, 0),
@@ -917,7 +954,8 @@ mod tests {
                 0xd8c => *device.regs.get(&offset).unwrap_or(&0), // read-only GMD_ID
                 0xc050 | 0xc340 if !device.reject_wopcm => value | 1,
                 0xc314 | 0xa188 | 0xa278 | 0x20ec | 0x83b4 | 0xe48c | 0xe18c | 0xe4f4 | 0xe5f0
-                | 0xe420 | 0xe49c | 0xe4f0 | 0x20d4 | 0xe194 | 0xe4c4 | 0xe5f4 | 0x2050 => {
+                | 0xe420 | 0xe49c | 0xe4f0 | 0x20d4 | 0xe194 | 0xe4c4 | 0xe5f4 | 0x2050
+                | 0x220d4 | 0x22050 | 0x3ee0d4 | 0x3ee050 | 0x1a0d4 | 0x1a050 => {
                     let mask = value >> 16;
                     let old = *device.regs.get(&offset).unwrap_or(&0);
                     if value == 0x00110011 {

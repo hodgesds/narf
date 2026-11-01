@@ -5,6 +5,7 @@
 use super::*;
 use crate::drm::card::{Card, Crtc, FlipEventReservation, FlipStamp, Framebuffer, PixelFormat};
 use crate::intel_gpu_scanout::Geometry;
+use alloc::boxed::Box;
 use narf_filesystem::FsFuture;
 
 type ModeState = Arc<narf_lib::sync::IrqSafeSpinLock<Card>>;
@@ -251,6 +252,10 @@ enum Action {
     Remove(u32),
     DropMaster,
     SetMaster,
+    Color {
+        blob: u32,
+        coefficients: Option<[u64; 9]>,
+    },
     Cursor(Vec<u8>),
     Noop,
 }
@@ -266,6 +271,8 @@ struct Plan {
     fence: Option<i32>,
     test: bool,
     nonblock: bool,
+    previous_ctm: u32,
+    next_ctm: u32,
 }
 
 fn same_timing(
@@ -323,7 +330,7 @@ fn legacy_wire(m: crate::drm_uapi::DrmModeModeInfoUapi) -> crate::drm::ioctl::Dr
 impl Plan {
     #[cfg(any(test, feature = "kernel-test"))]
     fn stage(card: &Card, request: Request, geometry: Geometry) -> Result<Self, FsError> {
-        Self::stage_from(card, request, geometry, None)
+        Self::stage_from(card, request, geometry, None, None)
     }
 
     fn stage_from(
@@ -331,6 +338,7 @@ impl Plan {
         request: Request,
         geometry: Geometry,
         previous: Option<Crtc>,
+        previous_ctm: Option<u32>,
     ) -> Result<Self, FsError> {
         let request = match request {
             Request::Property {
@@ -365,7 +373,11 @@ impl Plan {
             })
             .ok_or(FsError::NoDevice)?;
         let wire = card.mode_wire(&fixed);
+        let previous_ctm =
+            previous_ctm.unwrap_or_else(|| card.crtc_color(previous.id).map_or(0, |c| c.ctm));
         let mut p = Self {
+            previous_ctm,
+            next_ctm: previous_ctm,
             next: previous.clone(),
             previous,
             framebuffer: None,
@@ -381,6 +393,8 @@ impl Plan {
         let mut fb = p.next.primary_fb;
         let mut route = fb.map(|_| p.next.id);
         let mut primary_changed = false;
+        let mut color = None;
+        let mut color_compatible = true;
         let mut rect = [
             0,
             0,
@@ -398,6 +412,7 @@ impl Plan {
                 return Ok(p);
             }
             Request::DropMaster => {
+                p.next_ctm = 0;
                 p.action = Action::DropMaster;
                 return Ok(p);
             }
@@ -405,6 +420,7 @@ impl Plan {
                 card.framebuffer(id).map_err(|_| FsError::NotFound)?;
                 p.action = Action::Remove(id);
                 if p.next.primary_fb == Some(id) {
+                    p.next_ctm = 0;
                     p.next.primary_fb = None;
                     p.next.enabled = false;
                     p.next.mode = None;
@@ -490,6 +506,12 @@ impl Plan {
                         .filter(|n| *n <= a.props.len() && *n <= a.values.len())
                         .ok_or(FsError::InvalidData)?;
                     for (&prop, &value) in a.props[at..end].iter().zip(&a.values[at..end]) {
+                        if !((object == p.next.id
+                            && matches!(prop, CRTC_CTM_PROP_ID | CRTC_OUT_FENCE_PTR_PROP_ID))
+                            || (object == PLANE_ID_BASE && prop == PLANE_IN_FENCE_FD_PROP_ID))
+                        {
+                            color_compatible = false;
+                        }
                         if object == PLANE_ID_BASE {
                             match prop {
                                 PLANE_FB_ID_PROP_ID => {
@@ -525,6 +547,29 @@ impl Plan {
                             }
                         } else if object == p.next.id {
                             match prop {
+                                CRTC_CTM_PROP_ID => {
+                                    if !card.ctm_only(p.next.id) {
+                                        return Err(FsError::Unsupported);
+                                    }
+                                    let blob = u32_value(value)?;
+                                    let coefficients = if blob == 0 {
+                                        None
+                                    } else {
+                                        let bytes =
+                                            card.property_blob(blob).ok_or(FsError::NotFound)?;
+                                        if bytes.len() != 72 {
+                                            return Err(FsError::InvalidData);
+                                        }
+                                        let mut coefficients = [0; 9];
+                                        for (c, bytes) in
+                                            coefficients.iter_mut().zip(bytes.chunks_exact(8))
+                                        {
+                                            *c = u64::from_le_bytes(bytes.try_into().unwrap());
+                                        }
+                                        Some(coefficients)
+                                    };
+                                    color = Some((blob, coefficients));
+                                }
                                 CRTC_ACTIVE_PROP_ID => {
                                     if value > 1 {
                                         return Err(FsError::InvalidData);
@@ -577,6 +622,14 @@ impl Plan {
                 }
             }
         }
+        if let Some((blob, coefficients)) = color {
+            if !color_compatible || !p.previous.enabled || p.previous.mode.is_none() {
+                return Err(FsError::Unsupported);
+            }
+            p.next_ctm = blob;
+            p.action = Action::Color { blob, coefficients };
+            return Ok(p);
+        }
         if rect
             != [
                 0,
@@ -602,6 +655,7 @@ impl Plan {
             // CRTC/connector metadata does not disable the boot console.
             p.action = Action::Observe;
         } else if !p.next.enabled || fb.is_none() || route.is_none() {
+            p.next_ctm = 0;
             p.next.primary_fb = None;
             p.next.enabled = false;
             p.next.mode = None;
@@ -650,6 +704,9 @@ impl Plan {
     }
     fn still_valid(&self, card: &Card, open: u64) -> bool {
         if !card.is_master(open) {
+            return false;
+        }
+        if card.crtc_color(self.previous.id).map_or(0, |c| c.ctm) != self.previous_ctm {
             return false;
         }
         let Ok(current) = card.crtc(self.previous.id) else {
@@ -716,12 +773,19 @@ trait Backend {
         g: Geometry,
     ) -> FsFuture<'a, FlipStamp>;
     fn restore(&mut self) -> FsFuture<'_, ()>;
+    fn color_published(&mut self) {}
+    fn surface(&mut self) -> FsFuture<'_, ()> {
+        self.restore()
+    }
+    fn color(&mut self, _coefficients: Option<[u64; 9]>) -> FsFuture<'_, FlipStamp> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
     fn vblank(&mut self) -> FsFuture<'_, FlipStamp>;
     fn copy<'a>(&'a mut self, frame: &'a Framebuffer, mode: &'a ModeState) -> FsFuture<'a, ()> {
         alloc::boxed::Box::pin(copy_frame(frame, mode, self.console_fb()))
     }
 }
-impl Backend for crate::intel_gpu_kms::Session<'_> {
+impl<M: crate::intel_gpu_kms::Platform> Backend for crate::intel_gpu_kms::Guard<'_, M> {
     fn valid(&self) -> Result<(), FsError> {
         self.ownership_valid()
     }
@@ -744,6 +808,15 @@ impl Backend for crate::intel_gpu_kms::Session<'_> {
     }
     fn restore(&mut self) -> FsFuture<'_, ()> {
         alloc::boxed::Box::pin(self.restore_console())
+    }
+    fn color_published(&mut self) {
+        self.confirm_ctm();
+    }
+    fn surface(&mut self) -> FsFuture<'_, ()> {
+        Box::pin(self.restore_surface())
+    }
+    fn color(&mut self, coefficients: Option<[u64; 9]>) -> FsFuture<'_, FlipStamp> {
+        Box::pin(self.set_ctm(coefficients))
     }
     fn vblank(&mut self) -> FsFuture<'_, FlipStamp> {
         alloc::boxed::Box::pin(self.wait_vblank())
@@ -951,9 +1024,16 @@ async fn execute_plan<B: Backend>(
                 backend.restore().await?;
             }
         }
-        Action::Restore | Action::Observe => {
+        Action::Restore => {
             backend.restore().await?;
             stamp = Some(backend.vblank().await?);
+        }
+        Action::Observe => {
+            backend.surface().await?;
+            stamp = Some(backend.vblank().await?);
+        }
+        Action::Color { coefficients, .. } => {
+            stamp = Some(backend.color(*coefficients).await?);
         }
         Action::Present => {
             let fb = plan.framebuffer.as_ref().ok_or(FsError::InvalidData)?;
@@ -981,20 +1061,20 @@ async fn execute_plan<B: Backend>(
                     // before arm. A hard/lost/pending hardware error must keep
                     // its owners and cannot silently turn into CPU presentation.
                     Err(FsError::Unsupported) => {
-                        backend.restore().await?;
+                        backend.surface().await?;
                         backend.copy(fb, mode).await?;
                         backend.vblank().await?
                     }
                     Err(error) => return Err(error),
                 });
             } else {
-                backend.restore().await?;
+                backend.surface().await?;
                 backend.copy(fb, mode).await?;
                 stamp = Some(backend.vblank().await?);
             }
         }
         Action::Cursor(bytes) => {
-            backend.restore().await?;
+            backend.surface().await?;
             if let Some(fb) = &plan.framebuffer {
                 backend.copy(fb, mode).await?;
             }
@@ -1038,11 +1118,22 @@ async fn execute_plan<B: Backend>(
                         );
                     }
                 }
-                Action::Noop | Action::Observe | Action::Cursor(_) | Action::SetMaster => {}
+                Action::Noop
+                | Action::Observe
+                | Action::Cursor(_)
+                | Action::SetMaster
+                | Action::Color { .. } => {}
                 Action::Present | Action::Restore => {
                     *card.crtc_mut(plan.next.id).map_err(|_| FsError::NotFound)? =
                         plan.next.clone();
                 }
+            }
+            if let Some(color) = card.crtc_color.iter_mut().find(|c| c.crtc == plan.next.id) {
+                color.ctm = plan.next_ctm;
+            }
+            card.collect_blobs();
+            if matches!(plan.action, Action::Color { .. }) {
+                backend.color_published();
             }
             if let Some(reservation) = reservation {
                 reservation.complete(
@@ -1056,6 +1147,9 @@ async fn execute_plan<B: Backend>(
     };
     if !published {
         backend.restore().await?;
+        // The failed transaction restored the kernel console, including its
+        // color. Keep subsequent admission consistent with that real image.
+        mode.lock().intel_clear_ctm();
         return Err(FsError::Busy);
     }
     Ok(stamp.unwrap_or(FlipStamp {
@@ -1092,6 +1186,28 @@ fn direct_object(frame: &Framebuffer) -> Result<Arc<crate::intel_gpu_gem::GemObj
         .ok_or(FsError::Unsupported)
 }
 
+/// Shared foreground boundary for the real dispatcher and native PCI models.
+/// All user copies/FD lookups finish before the owned job can reach the worker.
+#[allow(clippy::too_many_arguments)]
+async fn admit(
+    queue: &queue::Queue,
+    open: u64,
+    cmd: u32,
+    arg: u64,
+    context: &dyn IoctlContext,
+    events: Option<&Events>,
+    geometry: Geometry,
+    epoch: u64,
+) -> Result<queue::Submitted, queue::SubmitError> {
+    if drm_uapi::ioc_nr(cmd) != 0x1e && !queue.is_master(open) {
+        return Err(FsError::PermissionDenied.into());
+    }
+    let request = Request::copy(cmd, arg, context)?;
+    queue
+        .submit(open, request, geometry, epoch, context, events)
+        .await
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch(
     index: u32,
@@ -1109,16 +1225,19 @@ pub(crate) async fn dispatch(
     Some(
         async {
             let mode = crate::drm_registry::mode_state(index).ok_or(FsError::Unsupported)?;
-            // Preserve DRM_MASTER precedence before touching nested user pointers.
-            if drm_uapi::ioc_nr(cmd) != 0x1e && !mode.lock().is_master(open) {
-                return Err(FsError::PermissionDenied);
-            }
-            let request = Request::copy(cmd, arg, context)?;
             let queue = queue::for_card(index, mode.clone());
             let geometry = display.console_geometry();
-            let submitted = match queue
-                .submit(open, request, geometry, display.epoch(), context, events)
-                .await
+            let submitted = match admit(
+                &queue,
+                open,
+                cmd,
+                arg,
+                context,
+                events,
+                geometry,
+                display.epoch(),
+            )
+            .await
             {
                 Ok(submitted) => submitted,
                 Err(queue::SubmitError::Io(error)) => return Err(error),

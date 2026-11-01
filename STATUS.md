@@ -1418,6 +1418,19 @@ The full software campaign and remaining dependencies are tracked in
 `drivers/gpu/specification/intel_gpu.md` §20; these four workstreams do not
 complete Linux-xe parity.
 
+The second parallel checkpoint integrates BMG BCS8 as logical COPY1 through
+ADS, per-instance saved/default state, nonprivileged policy, IRQ handling,
+private PPGTT startup execution proofs and Xe/i915 engine selection. MTL/Arrow
+Pipe A gains fixed-mode CTM-only transactions with retained blobs/original
+color state, hardware-frame completion and full console restoration. A
+default-off CAP_SYSLOG-gated `/dev/dri/guc-logN` descriptor captures immutable
+bounded raw GuC logs from an already-awake coherent GT, with actual firmware
+identity and per-read authority checks; it does not consume firmware cursors
+or provide a lossless stream. Read-only `xe` hwmon nodes expose cached DG2/BMG
+temperatures and DG2 voltage/extended energy without read-triggered MMIO or
+wake. Writable controls and BMG PMT energy remain open. Native regression and
+cross-target build/lint validation for this checkpoint is in progress.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

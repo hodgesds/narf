@@ -35,7 +35,7 @@ pub struct UserStatus {
     pub epoch: u64,
     pub platform: GtPlatform,
     pub submission_version: (u8, u8, u8),
-    /// Engines userspace may name: always RCS0/BCS0, CCS0 when fused in.
+    /// Engines userspace may name: RCS0/BCS0, BMG BCS8 and fused CCS0.
     pub engines: crate::intel_gpu_engine::EngineSet,
 }
 
@@ -61,6 +61,15 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
     /// Nonblocking policy requests serviced only by the retained GT owner.
     fn power_controls(&self) -> Option<Arc<crate::intel_gpu_power_controls::PowerControls>> {
         None
+    }
+    /// Copy bounded firmware logs into an owned diagnostic buffer while the
+    /// retained GT excludes reset/power transitions. The file provider owns
+    /// diagnostic authorization and rechecks it before every read.
+    fn guc_log_snapshot(
+        &self,
+        _buffer: crate::intel_gpu_guc_log::CaptureBuffer,
+    ) -> FsFuture<'_, crate::intel_gpu_guc_log::Snapshot> {
+        Box::pin(async { Err(FsError::Unsupported) })
     }
     /// Correlate a live engine counter with one supported CPU clock while the
     /// owner retains PCI D0, render forcewake and its reset mutex.

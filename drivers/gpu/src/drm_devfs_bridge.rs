@@ -1858,6 +1858,10 @@ pub struct DriDir;
 
 impl DirOps for DriDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        #[cfg(feature = "intel")]
+        if let Some(file) = crate::intel_gpu_guc_log::lookup(name) {
+            return Some(file);
+        }
         // card<N>
         if let Some(rest) = name.strip_prefix("card") {
             if let Ok(idx) = rest.parse::<u32>() {
@@ -1911,6 +1915,10 @@ impl DirOps for DriDir {
         for idx in 0..count as u32 {
             all.push((format!("card{}", idx), FileType::Special));
             all.push((format!("renderD{}", idx + 128), FileType::Special));
+            #[cfg(feature = "intel")]
+            if crate::intel_gpu_guc_log::visible(idx) {
+                all.push((format!("guc-log{idx}"), FileType::File));
+            }
         }
         all.into_iter().skip(cursor).take(max).collect()
     }

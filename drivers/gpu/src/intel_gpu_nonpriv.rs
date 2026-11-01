@@ -53,6 +53,7 @@ const CCS: Slots = Slots {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct EnginePolicy {
     compute: bool,
+    copy8: bool,
 }
 
 impl EnginePolicy {
@@ -62,20 +63,35 @@ impl EnginePolicy {
         platform: GtPlatform,
         engines: crate::intel_gpu_engine::EngineSet,
     ) -> Result<Self, RegisterError> {
+        if platform != GtPlatform::Battlemage
+            && engines.contains(crate::intel_gpu_engine::Engine::Bcs8)
+        {
+            return Err(RegisterError::Identity);
+        }
         match platform {
             GtPlatform::Alchemist
             | GtPlatform::Battlemage
             | GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake) => Ok(Self {
                 compute: engines.contains(crate::intel_gpu_engine::Engine::Ccs0),
+                copy8: platform == GtPlatform::Battlemage
+                    && engines.contains(crate::intel_gpu_engine::Engine::Bcs8),
             }),
             _ => Err(RegisterError::Identity),
         }
     }
 
     fn banks(self) -> impl Iterator<Item = Slots> {
-        [Some(RCS), Some(BCS), self.compute.then_some(CCS)]
-            .into_iter()
-            .flatten()
+        [
+            Some(RCS),
+            Some(BCS),
+            self.copy8.then_some(Slots {
+                base: 0x3ee000,
+                allowed: &[],
+            }),
+            self.compute.then_some(CCS),
+        ]
+        .into_iter()
+        .flatten()
     }
 
     /// Engine must be idle and exclusively owned with both forcewake holds.
@@ -145,7 +161,7 @@ mod tests {
     }
 
     struct Window {
-        slots: RefCell<[u32; 36]>,
+        slots: RefCell<[u32; 48]>,
         writes: RefCell<Vec<(u64, u32)>>,
         unavailable: Cell<Option<usize>>,
         reject: Cell<Option<(usize, bool)>>,
@@ -154,7 +170,7 @@ mod tests {
     impl Window {
         fn new() -> Self {
             Self {
-                slots: RefCell::new([0x2030; 36]),
+                slots: RefCell::new([0x2030; 48]),
                 writes: RefCell::new(Vec::new()),
                 unavailable: Cell::new(None),
                 reject: Cell::new(None),
@@ -167,6 +183,7 @@ mod tests {
                 0x24d0..=0x24fc => (reg as usize - 0x24d0) / 4,
                 0x224d0..=0x224fc => 12 + (reg as usize - 0x224d0) / 4,
                 0x1a4d0..=0x1a4fc => 24 + (reg as usize - 0x1a4d0) / 4,
+                0x3ee4d0..=0x3ee4fc => 36 + (reg as usize - 0x3ee4d0) / 4,
                 _ => panic!("unexpected NONPRIV register {reg:x}"),
             }
         }
@@ -174,7 +191,8 @@ mod tests {
             match slot {
                 0..12 => 0x2094,
                 12..24 => 0x22094,
-                _ => 0x1a094,
+                24..36 => 0x1a094,
+                _ => 0x3ee094,
             }
         }
     }
@@ -243,7 +261,7 @@ mod tests {
         .unwrap();
         policy.install(&w).unwrap();
         assert_eq!(w.slots.borrow()[24..27], [0x1000dafc, 0x1000db01, 0xdb1c]);
-        assert!(w.slots.borrow()[27..].iter().all(|word| *word == 0x1a094));
+        assert!(w.slots.borrow()[27..36].iter().all(|word| *word == 0x1a094));
         policy.verify(&w).unwrap();
         for generation in [
             crate::intel_gpu::Generation::TigerLake,
@@ -348,5 +366,42 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_nonpriv",
         smoke_nonpriv_verification_never_repairs_live_policy
+    );
+
+    fn smoke_nonpriv_copy8_clear_failures_and_platform_gate() -> TestResult {
+        use crate::intel_gpu_engine::{Engine, EngineSet};
+        let engines = EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Bcs8]);
+        assert!(EnginePolicy::new(GtPlatform::Alchemist, engines).is_err());
+        assert!(EnginePolicy::new(
+            GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
+            engines
+        )
+        .is_err());
+        for failure in 0..3 {
+            let w = Window::new();
+            let policy = EnginePolicy::new(GtPlatform::Battlemage, engines).unwrap();
+            if failure == 1 {
+                w.unavailable.set(Some(47));
+            }
+            if failure == 2 {
+                w.reject.set(Some((47, false)));
+            }
+            let result = policy.install(&w);
+            if failure == 0 {
+                result.unwrap();
+                assert!(w.slots.borrow()[36..].iter().all(|word| *word == 0x3ee094));
+                policy.verify(&w).unwrap();
+                w.slots.borrow_mut()[47] = 0x3ee030;
+                assert_eq!(policy.verify(&w), Err(RegisterError::Verify(0x3ee4fc)));
+            } else {
+                assert!(result.is_err());
+                assert!(!w.writes.borrow().contains(&(0x24d0, 0x1000dafc)));
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_nonpriv",
+        smoke_nonpriv_copy8_clear_failures_and_platform_gate
     );
 }

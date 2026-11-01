@@ -704,6 +704,8 @@ pub mod intel_gpu_audio;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_aux;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_color;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_context;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_ddi;
@@ -752,6 +754,8 @@ pub mod intel_gpu_guc_firmware;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_guc_gt;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_guc_log;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_guc_sched;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_guc_transport;
@@ -761,6 +765,8 @@ mod intel_gpu_guc_wa;
 pub mod intel_gpu_hdmi;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_hwconfig;
+#[cfg(feature = "intel")]
+mod intel_gpu_hwmon;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_kms;
 #[cfg(feature = "intel")]

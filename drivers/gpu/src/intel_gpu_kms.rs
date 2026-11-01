@@ -35,6 +35,10 @@ pub(crate) trait Platform:
     DisplayAccess + Clone + core::fmt::Debug + Send + Sync + 'static
 {
     fn takeover(&self) -> Result<(), FsError>;
+    fn color_takeover(&self) -> Result<(), FsError> {
+        self.takeover()
+    }
+    fn color_restored(&self) {}
     fn pause_console(&self) -> Wait<'_>;
     fn resume_console(&self);
     fn now(&self) -> u64;
@@ -108,6 +112,22 @@ impl Platform for Physical {
         // Keep the same current-capability/reset checks during PSR and AUX
         // waits as during PTE/plane access; no controller lock spans a wait.
         crate::intel_gpu_edp::kms_inhibit_psr(self).map_err(|_| crate::intel_gpu_user::io_error())
+    }
+    fn color_takeover(&self) -> Result<(), FsError> {
+        if !self.console_access_ok() {
+            return Err(FsError::NoDevice);
+        }
+        inherited_fetchers_idle(self, self.generation)?;
+        if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(self.bar.phys) {
+            return Err(FsError::NoDevice);
+        }
+        crate::intel_gpu_edp::kms_inhibit_psr(self).map_err(|_| crate::intel_gpu_user::io_error())
+    }
+    fn color_restored(&self) {
+        if let Some(card) = crate::drm_registry::mode_state(self.index) {
+            let mut card = card.lock();
+            card.intel_clear_ctm();
+        }
     }
     fn pause_console(&self) -> Wait<'_> {
         Box::pin(crate::intel_gpu::kms_pause_console())
@@ -230,6 +250,9 @@ struct State<M: Platform> {
     blocked: bool,
     failed: bool,
     recovery_status: Option<SavedStatus>,
+    color: Option<crate::intel_gpu_color::Owner>,
+    color_owned: bool,
+    color_unpublished: bool,
 }
 
 #[derive(Debug)]
@@ -241,7 +264,6 @@ pub(crate) struct Device<M: Platform> {
     geometry: IrqSafeSpinLock<Geometry>,
 }
 pub(crate) type Display = Device<Physical>;
-pub(crate) type Session<'a> = Guard<'a, Physical>;
 
 impl Display {
     /// Admission epoch is published by the GT owner after reset recovery;
@@ -316,7 +338,16 @@ pub(crate) fn install(
     displays.push(display);
     drop(displays);
     if let Some(card) = crate::drm_registry::mode_state(index) {
-        card.lock().native_atomic = true;
+        let mut card = card.lock();
+        card.native_atomic = true;
+        if generation == Generation::MeteorLake {
+            if let Some(crtc) = card.crtcs.first().map(|c| c.id) {
+                card.intel_ctm = true;
+                if card.crtc_color(crtc).is_none() {
+                    card.crtc_color.push(crate::drm::card::CrtcColor::new(crtc));
+                }
+            }
+        }
     }
 }
 pub(crate) fn display(index: u32) -> Option<Arc<Display>> {
@@ -339,9 +370,13 @@ pub(crate) fn available(index: u32) -> bool {
 pub(crate) fn active(index: u32) -> bool {
     display(index).is_some_and(|d| {
         d.platform.reset_lost()
-            || d.state
-                .try_lock()
-                .is_none_or(|s| s.presenter.is_some() || s.paused || s.failed)
+            || d.state.try_lock().is_none_or(|s| {
+                s.presenter.is_some()
+                    || s.color.is_some()
+                    || s.color_unpublished
+                    || s.paused
+                    || s.failed
+            })
     })
 }
 
@@ -359,7 +394,12 @@ pub(crate) fn quarantine_for_gt_reset(bar: &narf_bus::MmioRegion) {
 
 fn quarantine_reset_state<M: Platform>(state: &Mutex<State<M>>, lost: &AtomicBool) {
     if let Some(mut state) = state.try_lock() {
-        if lost.load(Ordering::Acquire) || state.presenter.is_some() || state.paused || state.failed
+        if lost.load(Ordering::Acquire)
+            || state.presenter.is_some()
+            || state.color.is_some()
+            || state.color_unpublished
+            || state.paused
+            || state.failed
         {
             lost.store(true, Ordering::Release);
             state.blocked = true;
@@ -412,6 +452,9 @@ impl<M: Platform> Device<M> {
                 blocked: false,
                 failed: false,
                 recovery_status: None,
+                color: None,
+                color_owned: false,
+                color_unpublished: false,
             }),
         }
     }
@@ -453,9 +496,10 @@ impl<M: Platform> Device<M> {
         // SAFETY: the old owner remains retained and poisoned. The GT worker
         // owns D0 and verified PAT policy; this mutex excludes every display
         // transition. Only the fresh view can observe/arm hardware now.
-        let io =
-            unsafe { PollIo::after_reset(fresh, self.generation, Pipe::A, self.bar_len, saved) }
-                .map_err(|_| crate::intel_gpu_user::io_error())?;
+        let io = unsafe {
+            PollIo::after_reset(fresh.clone(), self.generation, Pipe::A, self.bar_len, saved)
+        }
+        .map_err(|_| crate::intel_gpu_user::io_error())?;
         let format = io.format();
         let pat = if self.generation == Generation::MeteorLake {
             1
@@ -486,6 +530,19 @@ impl<M: Platform> Device<M> {
                 None => self.platform.tick().await,
             }
         }
+        if let Some(color) = state.color.as_mut() {
+            color.recover_original(&fresh, self.platform.now())?;
+            loop {
+                if color.poll(&fresh, self.platform.now())?.is_some() {
+                    break;
+                }
+                self.platform.tick().await;
+            }
+        }
+        state.color = None;
+        state.color_owned = false;
+        state.color_unpublished = false;
+        self.platform.color_restored();
         if let Some(old) = state.presenter.as_mut() {
             // SAFETY: the fresh console flip-done, SURFLIVE and changed
             // stable frame independently retired every old GEM fetch. Clear
@@ -525,6 +582,7 @@ impl<M: Platform> Device<M> {
             state,
         };
         guard.restore_console().await?;
+        self.platform.color_restored();
         guard.state.blocked = true;
         Ok(())
     }
@@ -532,7 +590,13 @@ impl<M: Platform> Device<M> {
 impl<M: Platform> Device<M> {
     pub(crate) fn legacy(&self) -> Result<LegacyGuard<'_, M>, FsError> {
         let state = self.state.try_lock().ok_or(FsError::Busy)?;
-        if self.platform.reset_lost() || state.presenter.is_some() || state.paused || state.failed {
+        if self.platform.reset_lost()
+            || state.presenter.is_some()
+            || state.color.is_some()
+            || state.color_unpublished
+            || state.paused
+            || state.failed
+        {
             return Err(FsError::Busy);
         }
         Ok(LegacyGuard {
@@ -716,9 +780,13 @@ impl<M: Platform> Guard<'_, M> {
         geometry: Geometry,
     ) -> Result<FlipStamp, FsError> {
         self.check(geometry)?;
+        if self.state.color_unpublished {
+            return Err(FsError::Busy);
+        }
         if !object.is_wc() || !object.scanout() || object.is_vram() || object.is_userptr() {
             return Err(FsError::Unsupported);
         }
+        self.finish_color().await?;
         self.finish_pending().await?;
         self.start().await?;
         let id = if let Some((current, id)) = &self.state.current {
@@ -773,6 +841,17 @@ impl<M: Platform> Guard<'_, M> {
             .ok_or_else(crate::intel_gpu_user::io_error)
     }
     pub(crate) async fn restore_console(&mut self) -> Result<(), FsError> {
+        self.restore_color().await?;
+        self.restore_surface().await
+    }
+    pub(crate) async fn restore_surface(&mut self) -> Result<(), FsError> {
+        self.finish_color().await?;
+        if self.state.color_unpublished {
+            return Err(FsError::Busy);
+        }
+        if !self.state.color_owned {
+            self.state.color = None;
+        }
         if self.device.platform.reset_lost() {
             self.state.failed = true;
             return Err(FsError::NoDevice);
@@ -803,10 +882,105 @@ impl<M: Platform> Guard<'_, M> {
             self.state.current = None;
             self.state.recovery_status = None;
         }
-        if self.state.paused {
+        if self.state.paused && self.state.color.is_none() {
             self.device.platform.resume_console();
             self.state.paused = false;
         }
+        Ok(())
+    }
+    async fn finish_color(&mut self) -> Result<Option<FlipStamp>, FsError> {
+        loop {
+            self.ownership_valid()?;
+            let Some(color) = self.state.color.as_mut() else {
+                return Ok(None);
+            };
+            if !color.pending() {
+                return Ok(None);
+            }
+            match color.poll(&self.device.platform, self.device.platform.now()) {
+                Ok(Some(stamp)) => return Ok(Some(stamp)),
+                Ok(None) => self.device.platform.tick().await,
+                Err(error) => {
+                    self.state.failed = true;
+                    return Err(error);
+                }
+            }
+        }
+    }
+    pub(crate) async fn set_ctm(
+        &mut self,
+        coefficients: Option<[u64; 9]>,
+    ) -> Result<FlipStamp, FsError> {
+        self.ownership_valid()?;
+        self.finish_pending().await?;
+        self.finish_color().await?;
+        if self.state.color.is_none() {
+            let owner = crate::intel_gpu_color::Owner::capture(
+                &self.device.platform,
+                self.device.generation,
+            )?;
+            self.state.color = Some(owner);
+        }
+        if !self.state.color_owned {
+            self.state.paused = true;
+            self.device.platform.pause_console().await;
+            if let Err(error) = self.device.platform.color_takeover() {
+                // The original was retained before pausing; no CSC write has
+                // occurred. Lost authority keeps the owner quarantined.
+                if self.device.platform.reset_lost() {
+                    self.state.failed = true;
+                } else {
+                    self.state.color = None;
+                    self.state.color_owned = false;
+                    if self.state.presenter.is_none() {
+                        self.device.platform.resume_console();
+                        self.state.paused = false;
+                    }
+                }
+                return Err(error);
+            }
+            self.state.color_owned = true;
+        }
+        self.state.color_unpublished = true;
+        self.state
+            .color
+            .as_mut()
+            .expect("color owner")
+            .arm(
+                &self.device.platform,
+                coefficients,
+                self.device.platform.now(),
+            )
+            .inspect_err(|_| {
+                self.state.failed = true;
+            })?;
+        let stamp = self.finish_color().await?.ok_or(FsError::NoDevice)?;
+        if coefficients.is_none() {
+            self.state.color = None;
+            self.state.color_owned = false;
+            if self.state.presenter.is_none() && self.state.paused {
+                self.device.platform.resume_console();
+                self.state.paused = false;
+            }
+        }
+        Ok(stamp)
+    }
+    /// The KMS publisher calls this while still holding this session and its
+    /// final Card lock, after copying the hardware-complete CTM into Card.
+    pub(crate) fn confirm_ctm(&mut self) {
+        debug_assert!(self
+            .state
+            .color
+            .as_ref()
+            .is_none_or(|color| !color.pending()));
+        self.state.color_unpublished = false;
+    }
+    async fn restore_color(&mut self) -> Result<(), FsError> {
+        self.finish_color().await?;
+        if self.state.color.is_some() {
+            self.set_ctm(None).await?;
+        }
+        self.state.color_unpublished = false;
         Ok(())
     }
     pub(crate) async fn wait_vblank(&mut self) -> Result<FlipStamp, FsError> {
@@ -842,4 +1016,4 @@ impl<M: Platform> Guard<'_, M> {
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_kms_tests.rs"]
-mod tests;
+pub(crate) mod tests;

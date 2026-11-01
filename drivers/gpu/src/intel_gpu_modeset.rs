@@ -283,6 +283,9 @@ pub enum ModesetError {
     /// Invalid plane geometry, pitch or GGTT range. Linear pitch must
     /// be nonzero, 64-byte aligned and cover the active row.
     InvalidFramebuffer,
+    /// Owned Xe-LPG RGB color setup could not prove Pipe A disabled, or
+    /// its bypass register writes did not read back. Leave the pipe off.
+    ColorPipelineUnavailable,
 }
 
 /// A negotiated link configuration handed to

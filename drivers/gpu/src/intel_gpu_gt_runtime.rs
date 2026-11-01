@@ -64,6 +64,7 @@ struct State {
     firmware: Option<GuCFirmware>,
     probe: Option<Arc<CompletionFence>>,
     probe_result: Option<crate::intel_gpu_exec::PpgttProbeResult>,
+    probe_engine: crate::intel_gpu_engine::Engine,
     phase: Phase,
     saved: Option<narf_bus::pci::SavedPciConfig>,
     power_ready: u64,
@@ -95,6 +96,7 @@ struct Owner {
     user_engines: Arc<core::sync::atomic::AtomicU8>,
     user_facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
     power_controls: Arc<crate::intel_gpu_power_controls::PowerControls>,
+    hwmon: Option<Arc<crate::intel_gpu_hwmon::Monitor>>,
 }
 
 #[derive(Debug)]
@@ -109,6 +111,44 @@ struct Backend {
 }
 
 impl crate::intel_gpu_user::UserBackend for Backend {
+    fn guc_log_snapshot(
+        &self,
+        buffer: crate::intel_gpu_guc_log::CaptureBuffer,
+    ) -> narf_filesystem::FsFuture<'_, crate::intel_gpu_guc_log::Snapshot> {
+        Box::pin(async move {
+            let owner = self
+                .owner
+                .upgrade()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            if buffer.index() != owner.pending.index {
+                return Err(narf_filesystem::FsError::NoDevice);
+            }
+            // Passive diagnostics never resume/reboot an idle or lost GT.
+            // This reset/power mutex excludes park/S3 throughout the bounded
+            // synchronous copy; each chunk rechecks current D0 and wake.
+            let state = owner.state.lock().await;
+            let epoch = owner.user_epoch.load(Ordering::Acquire);
+            if state.phase != Phase::Running
+                || epoch == 0
+                || owner.suspended.load(Ordering::Acquire)
+            {
+                return Err(narf_filesystem::FsError::NoDevice);
+            }
+            let digest = state
+                .firmware
+                .as_ref()
+                .ok_or(narf_filesystem::FsError::NoDevice)?
+                .digest;
+            state
+                .gt
+                .as_ref()
+                .ok_or(narf_filesystem::FsError::NoDevice)?
+                .snapshot_guc_log(buffer, epoch, narf_time::monotonic_ns(), digest, || {
+                    narf_bus::pci::power_state(&owner.pending.cap, &owner.pending.device)
+                        == Ok(Some(narf_bus::pci::PciPowerState::D0))
+                })
+        })
+    }
     fn power_controls(&self) -> Option<Arc<crate::intel_gpu_power_controls::PowerControls>> {
         Some(self.power_controls.clone())
     }
@@ -139,7 +179,7 @@ impl crate::intel_gpu_user::UserBackend for Backend {
                 .ok_or(narf_filesystem::FsError::NoDevice)?;
             let result = gt.engine_cycles(engine, clock);
             if gt.state() == GtState::Lost {
-                owner.power_controls.close();
+                owner.close_controls();
                 owner.user_epoch.store(0, Ordering::Release);
             }
             result.map_err(|error| match error {
@@ -218,7 +258,7 @@ impl Backend {
             None => gt.submit_user_batch(narf_time::monotonic_ns(), context, batch),
         };
         if gt.state() == GtState::Lost {
-            owner.power_controls.close();
+            owner.close_controls();
             owner.user_epoch.store(0, Ordering::Release);
         }
         if let Ok((_, fence)) = &result {
@@ -343,6 +383,11 @@ pub(crate) fn start_pending() {
                 continue;
             }
         };
+        let hwmon = crate::intel_gpu_hwmon::Monitor::register(
+            p.index,
+            GtPlatform::from_pci(p.device.id.vendor, p.device.id.device)
+                .expect("admitted platform"),
+        );
         let owner = Arc::new(Owner {
             pending: p,
             pm,
@@ -354,6 +399,7 @@ pub(crate) fn start_pending() {
                 firmware: None,
                 probe: None,
                 probe_result: None,
+                probe_engine: crate::intel_gpu_engine::Engine::Rcs0,
                 phase: Phase::Cold,
                 saved: None,
                 power_ready: 0,
@@ -367,6 +413,7 @@ pub(crate) fn start_pending() {
             user_engines: Arc::new(core::sync::atomic::AtomicU8::new(0)),
             user_facts: Arc::new(IrqSafeSpinLock::new(None)),
             power_controls: Arc::new(crate::intel_gpu_power_controls::PowerControls::new()),
+            hwmon,
         });
         *ops.0.lock() = Arc::downgrade(&owner);
         let backend = Arc::new(Backend {
@@ -474,6 +521,13 @@ fn pci_identity(
 }
 
 impl Owner {
+    fn close_controls(&self) {
+        self.power_controls.close();
+        if let Some(hwmon) = &self.hwmon {
+            hwmon.close();
+        }
+    }
+
     fn cold_start(&self, state: &mut State) -> Result<(), RuntimeError> {
         state.irq.take();
         state.irq_tried = false;
@@ -617,6 +671,7 @@ impl Owner {
                         return Err(RuntimeError::State);
                     }
                     let probe = gt.submit_ppgtt_probe(now).map_err(RuntimeError::Gt)?;
+                    state.probe_engine = crate::intel_gpu_engine::Engine::Rcs0;
                     state.probe = Some(probe.completion);
                     state.probe_result = Some(probe.result);
                     state.phase = Phase::PpgttProbe;
@@ -632,6 +687,20 @@ impl Owner {
                         .verify()
                         .map_err(|_| RuntimeError::State)?;
                     state.probe_result = None;
+                    use crate::intel_gpu_engine::Engine;
+                    if state.probe_engine != Engine::Bcs8
+                        && gt
+                            .engines()
+                            .is_some_and(|engines| engines.contains(Engine::Bcs8))
+                    {
+                        let probe = gt
+                            .submit_ppgtt_probe_on(now, Engine::Bcs8)
+                            .map_err(RuntimeError::Gt)?;
+                        state.probe = Some(probe.completion);
+                        state.probe_result = Some(probe.result);
+                        state.probe_engine = Engine::Bcs8;
+                        return Ok(());
+                    }
                     *self.user_facts.lock() = Some(gt.device_facts().map_err(RuntimeError::Gt)?);
                     // Before the epoch: discovery sees VRAM with the engines.
                     self.pending.card.publish_gt_vram(gt);
@@ -761,7 +830,7 @@ impl Owner {
                         );
                         crate::intel_gpu_error::record(self.pending.index, report);
                     }
-                    self.power_controls.close();
+                    self.close_controls();
                     self.user_epoch.store(0, Ordering::Release);
                     // A display waiter can depend on one of our fences.
                     // Poison its proofs synchronously before reset; never
@@ -804,6 +873,9 @@ impl Owner {
                     {
                         if let Some(epoch) = state.gt.as_ref().and_then(GuCGt::user_epoch) {
                             self.power_controls.activate(epoch);
+                            if let Some(hwmon) = &self.hwmon {
+                                hwmon.activate(epoch);
+                            }
                             self.user_epoch.store(epoch, Ordering::Release);
                             state.phase = Phase::Running;
                         }
@@ -818,18 +890,32 @@ impl Owner {
                         );
                     }
                 }
+                if state.phase == Phase::Running {
+                    if let Some(hwmon) = &self.hwmon {
+                        let mmio = AuthorizedWindow::new(self.pending.bar, self.pending.cap);
+                        hwmon.sample_mmio(
+                            self.user_epoch.load(Ordering::Acquire),
+                            narf_time::monotonic_ns(),
+                            &mmio,
+                            || {
+                                narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
+                                    == Ok(Some(narf_bus::pci::PciPowerState::D0))
+                            },
+                        );
+                    }
+                }
                 if state.phase == Phase::Running && !state.irq_tried {
                     state.irq_tried = true;
-                    let compute = state
+                    let engines = state
                         .gt
                         .as_ref()
                         .and_then(GuCGt::engines)
-                        .is_some_and(|set| set.contains(crate::intel_gpu_engine::Engine::Ccs0));
+                        .unwrap_or_default();
                     state.irq = crate::intel_gpu_gt_irq::GtIrq::for_device(
                         AuthorizedWindow::new(self.pending.bar, self.pending.cap),
                         self.pending.cap,
                         self.pending.device,
-                        compute,
+                        engines,
                     )
                     .ok();
                     if state.irq.is_some() {
@@ -905,7 +991,7 @@ impl Owner {
             return Err(RpmError::Busy);
         }
         state.irq.take(); // mask and synchronize while still in D0
-        self.power_controls.close();
+        self.close_controls();
         state.irq_tried = false;
         let gt = state.gt.as_mut().expect("running GT");
         let stopped = gt.begin_stop(narf_time::monotonic_ns()).is_ok()
@@ -994,7 +1080,7 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             // Serialize closing admission with the worker's ready-epoch
             // activation. Display quiescence remains outside this lock.
             let mut state = self.state.lock().await;
-            self.power_controls.close();
+            self.close_controls();
             self.suspended.store(true, Ordering::Release);
             self.user_epoch.store(0, Ordering::Release);
             state.irq.take(); // mask/synchronize while the function is in D0

@@ -159,6 +159,37 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         self.state
     }
 
+    pub(crate) fn snapshot_guc_log(
+        &self,
+        buffer: crate::intel_gpu_guc_log::CaptureBuffer,
+        epoch: u64,
+        now_ns: u64,
+        firmware_digest: [u8; 32],
+        mut current_access_ok: impl FnMut() -> bool,
+    ) -> Result<crate::intel_gpu_guc_log::Snapshot, narf_filesystem::FsError> {
+        if self.state != GtState::SchedulingReady || epoch == 0 || self.user_epoch() != Some(epoch)
+        {
+            return Err(narf_filesystem::FsError::NoDevice);
+        }
+        let log = self
+            .parts
+            .boot
+            .live_log()
+            .ok_or(narf_filesystem::FsError::NoDevice)?;
+        buffer.capture(
+            log.backing,
+            crate::intel_gpu_guc_log::Identity {
+                epoch,
+                incarnation: log.incarnation,
+                now_ns,
+                platform: self.parts.boot.platform(),
+                firmware_version: log.firmware_version,
+                firmware_digest,
+            },
+            || current_access_ok() && self.awake().is_ok(),
+        )
+    }
+
     /// Allocation-free scalar/status capture under this owner's reset lock.
     /// The access predicate checks current D0/PCI authority before even the
     /// wake-proof MMIO reads. Each status read requires current GT/render wake. Failure to
@@ -256,7 +287,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         engine: crate::intel_gpu_engine::Engine,
         clock: i32,
     ) -> Result<crate::intel_gpu_timestamp::EngineCycles, GtError> {
-        if self.user_epoch().is_none() {
+        if self.user_epoch().is_none()
+            || !self
+                .engines()
+                .is_some_and(|engines| engines.contains(engine))
+        {
             return Err(GtError::State);
         }
         if !matches!(clock, 0 | 1 | 4 | 7) {
@@ -773,15 +808,37 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         &mut self,
         now: u64,
     ) -> Result<crate::intel_gpu_exec::PpgttProbeSubmission, GtError> {
-        if self.state != GtState::SchedulingReady {
+        self.submit_ppgtt_probe_on(now, crate::intel_gpu_engine::Engine::Rcs0)
+    }
+
+    /// Verify the private store batch on the exact published engine. BMG
+    /// COPY1 must execute its own PPGTT probe before backend publication.
+    pub(crate) fn submit_ppgtt_probe_on(
+        &mut self,
+        now: u64,
+        engine: crate::intel_gpu_engine::Engine,
+    ) -> Result<crate::intel_gpu_exec::PpgttProbeSubmission, GtError> {
+        if self.state != GtState::SchedulingReady
+            || !self
+                .engines()
+                .is_some_and(|engines| engines.contains(engine))
+        {
             return Err(GtError::State);
         }
+        self.admit_scheduling()?;
         let (batch, result) =
             crate::intel_gpu_exec::PpgttProbeResult::prepare(self.parts.boot.platform())
                 .map_err(|error| GtError::Scheduling(SchedulingError::Residency(error)))?;
         // SAFETY: both BOs are private, unexported and inaccessible for writes;
         // only the fixed MI_STORE_DATA_IMM/BB_END stream is executable.
-        let (id, completion) = unsafe { self.submit_kernel_batch(now, batch)? };
+        let (id, completion) = unsafe {
+            self.parts
+                .scheduler
+                .as_mut()
+                .expect("owned scheduler")
+                .submit_resident_on(now, engine, batch)
+                .map_err(GtError::Scheduling)?
+        };
         Ok(crate::intel_gpu_exec::PpgttProbeSubmission {
             context_id: id,
             completion,

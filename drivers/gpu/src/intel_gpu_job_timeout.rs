@@ -41,7 +41,7 @@ pub(super) fn setup(image: &impl GpuBacking, platform: GtPlatform) {
 pub(super) fn prefix(image: u32, stamp: u32, engine: Engine, words: &mut Vec<u32>) {
     let mut start = alloc::vec![0x12480002, 0x3a8, image + JOB_TIMESTAMP as u32, 0];
     // BCS already has a TLB-invalidating MI_FLUSH_DW start stamp.
-    if engine != Engine::Bcs0 {
+    if !engine.is_copy() {
         start.extend_from_slice(&[0x10400002, image + START as u32, 0, stamp]);
     }
     words.splice(0..0, start);
@@ -202,7 +202,7 @@ mod tests {
                 let mut words = alloc::vec![0x04000001];
                 prefix(image.ggtt_offset(), 7, engine, &mut words);
                 assert_eq!(&words[..4], &[0x12480002, 0x3a8, 0x01000810, 0]);
-                if engine == Engine::Bcs0 {
+                if engine.is_copy() {
                     assert_eq!(&words[4..], &[0x04000001]);
                 } else {
                     assert_eq!(&words[4..], &[0x10400002, 0x01000808, 0, 7, 0x04000001]);

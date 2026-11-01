@@ -926,6 +926,11 @@ pub struct Card {
     intel_transaction: bool,
     #[cfg(feature = "intel")]
     intel_deferred_owners: Vec<u64>,
+    /// Intel exposes only CTM; no gamma/LUT property or legacy gamma claim.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_ctm: bool,
+    #[cfg(feature = "intel")]
+    intel_blob_pins: Vec<(u32, usize)>,
     /// GEM object table for this card.
     pub gem: GemTable,
     /// Dumb-buffer physical backings. Kept alive here so the memory
@@ -1196,6 +1201,10 @@ impl Card {
             intel_transaction: false,
             #[cfg(feature = "intel")]
             intel_deferred_owners: Vec::new(),
+            #[cfg(feature = "intel")]
+            intel_ctm: false,
+            #[cfg(feature = "intel")]
+            intel_blob_pins: Vec::new(),
             gem: GemTable::new(),
             dumb_backings: Vec::new(),
             virtgpu_imports: Vec::new(),
@@ -1323,6 +1332,8 @@ impl Card {
     pub fn master_release(&mut self, open_id: u64) {
         if self.current_master == Some(open_id) {
             self.current_master = None;
+            #[cfg(feature = "intel")]
+            self.intel_clear_ctm();
         }
     }
 
@@ -1687,6 +1698,14 @@ impl Card {
 
     /// Whether a committed color or HDR property names blob `id`.
     fn blob_referenced(&self, id: u32) -> bool {
+        #[cfg(feature = "intel")]
+        if self
+            .intel_blob_pins
+            .iter()
+            .any(|&(blob, count)| blob == id && count != 0)
+        {
+            return true;
+        }
         id != 0
             && (self
                 .crtc_color
@@ -1696,6 +1715,60 @@ impl Card {
                     .native
                     .iter()
                     .any(|n| n.hdr_output_metadata == Some(id)))
+    }
+
+    pub(crate) fn ctm_only(&self, crtc: u32) -> bool {
+        #[cfg(feature = "intel")]
+        {
+            self.intel_ctm && self.crtc_color(crtc).is_some()
+        }
+        #[cfg(not(feature = "intel"))]
+        {
+            let _ = crtc;
+            false
+        }
+    }
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_retain_blob(&mut self, id: u32) -> bool {
+        if self.property_blob(id).is_none() {
+            return false;
+        }
+        if let Some((_, count)) = self
+            .intel_blob_pins
+            .iter_mut()
+            .find(|(blob, _)| *blob == id)
+        {
+            let Some(next) = count.checked_add(1) else {
+                return false;
+            };
+            *count = next;
+        } else {
+            self.intel_blob_pins.push((id, 1));
+        }
+        true
+    }
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_release_blob(&mut self, id: u32) {
+        if let Some(at) = self
+            .intel_blob_pins
+            .iter()
+            .position(|(blob, _)| *blob == id)
+        {
+            self.intel_blob_pins[at].1 -= 1;
+            if self.intel_blob_pins[at].1 == 0 {
+                self.intel_blob_pins.swap_remove(at);
+            }
+        }
+        self.collect_blobs();
+    }
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_clear_ctm(&mut self) {
+        if self.intel_ctm {
+            for color in &mut self.crtc_color {
+                color.ctm = 0;
+            }
+        }
+        self.collect_blobs();
     }
 
     /// Free destroyed blobs no committed property names any more (the last

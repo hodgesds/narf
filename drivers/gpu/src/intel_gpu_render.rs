@@ -186,9 +186,7 @@ fn read_engines(
         let present = info
             .user_status()
             .map_or_else(Default::default, |status| status.engines);
-        let engine = Engine::ALL
-            .into_iter()
-            .find(|engine| engine.xe_class() == class && instance == 0)
+        let engine = Engine::from_class_instance(class, instance)
             .filter(|engine| present.contains(*engine))
             .ok_or(FsError::NotFound)?;
         map.push(Some(engine));
@@ -1195,15 +1193,17 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
                     // i915_query.c::query_engine_info in uabi class order:
                     // RENDER then COPY, logical instance 0, no capabilities.
                     // RENDER, COPY, COMPUTE share i915 and Xe class numbers.
-                    let engines: Vec<u16> = info.user_status().map_or_else(Vec::new, |status| {
-                        status.engines.iter().map(|e| e.xe_class()).collect()
-                    });
+                    let engines: Vec<_> = info
+                        .user_status()
+                        .map_or_else(Vec::new, |status| status.engines.iter().collect());
                     let mut reply = vec![0; 16 + engines.len() * 56];
                     put32(&mut reply, 0, engines.len() as u32);
-                    for (i, class) in engines.iter().enumerate() {
+                    for (i, engine) in engines.iter().enumerate() {
                         let entry = &mut reply[16 + i * 56..16 + (i + 1) * 56];
-                        entry[..2].copy_from_slice(&class.to_le_bytes());
+                        entry[..2].copy_from_slice(&engine.xe_class().to_le_bytes());
+                        entry[2..4].copy_from_slice(&engine.logical_instance().to_le_bytes());
                         put64(entry, 8, 1); // I915_ENGINE_INFO_HAS_LOGICAL_INSTANCE
+                        entry[24..26].copy_from_slice(&engine.logical_instance().to_le_bytes());
                     }
                     Cow::Owned(reply)
                 }

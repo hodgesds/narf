@@ -403,6 +403,13 @@ kernel_test_in!(
 );
 
 fn hardware_scheduling_reload(gt: &mut GuCGt<Window, Arena>, w: &Window) {
+    // Firmware's old incarnation left bytes in this exact retained log BO.
+    // Scheduling reload must clear them only after proving GuC reset.
+    let logs = {
+        let d = w.0.borrow();
+        d.memory[&(d.regs[&0xc184] & !0xfff)].clone()
+    };
+    logs.borrow_mut().fill(0xa5a55a5a);
     let before = {
         let d = w.0.borrow();
         let ads = d.memory[&0x20001000].borrow();
@@ -425,6 +432,10 @@ fn hardware_scheduling_reload(gt: &mut GuCGt<Window, Arena>, w: &Window) {
     assert!(gt.poll(16).is_pending());
     w.0.borrow_mut().regs.insert(0xc000, 0x8000f000);
     assert_eq!(gt.poll(17), Poll::Ready(Ok(GtState::Ready)));
+    assert!(
+        logs.borrow().iter().all(|word| *word == 0),
+        "reload retained stale firmware log bytes"
+    );
     {
         let d = w.0.borrow();
         let ads = d.memory[&0x20001000].borrow();
@@ -651,7 +662,7 @@ fn smoke_hardware_register_initialization_gates_scheduling() -> TestResult {
         } else {
             gt.begin_scheduling(12).unwrap();
             let count = arena.live_allocations();
-            assert_eq!(count, before + 4); // HWSP + golden per RCS0/BCS0
+            assert_eq!(count, before + 6); // HWSP + golden per RCS0/BCS0/BCS8
             if failure == 1 {
                 w.0.borrow_mut().regs.insert(0xe7cc, u32::MAX);
                 assert_eq!(
@@ -865,21 +876,24 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 event(&memory, 0x7001, &[request[1]]);
             }
             0x4502 => {
-                // GUC_RENDER/BLITTER/COMPUTE_CLASS for RCS0/BCS0/CCS0.
+                // GUC_RENDER/BLITTER/COMPUTE_CLASS for the admitted engines;
+                // physical BCS0/BCS8 share BLITTER with logical COPY0/COPY1.
                 assert!(matches!(request[3], 0 | 3 | 4));
                 assert_eq!(
                     &request[1..10],
-                    &[1, request[2], request[3], 1, 0, 0, 0, 0, 0]
+                    &[1, request[2], request[3], request[4], 0, 0, 0, 0, 0]
                 );
                 assert_eq!(request.len(), 12);
                 assert!(matches!(request[10] & 0xfff, 0x19 | 0x119));
                 let image = w.0.borrow().memory[&(request[10] & !0xfff)].clone();
                 assert_eq!(image.borrow()[1024 + 0x33] != 0, request[10] & 0x100 != 0);
                 let base = match request[3] {
+                    3 if request[4] == 2 => 0x3ee244,
                     3 => 0x22244,
                     4 => 0x1a244,
                     _ => 0x2244,
                 };
+                assert!(request[4] == 1 || (request[3] == 3 && request[4] == 2));
                 assert_eq!(image.borrow()[1024 + 2], base);
                 assert_eq!(request[11], 0);
                 assert!(registered
@@ -898,7 +912,7 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 let id = request[1];
                 let base = registered[&id];
                 let first = w.0.borrow().memory[&base].borrow()[1024 + 2];
-                if request[2] == 1 && execute && first == 0x22244 {
+                if request[2] == 1 && execute && matches!(first, 0x22244 | 0x3ee244) {
                     execute_copy(w, base);
                 } else if request[2] == 1 && execute && first == 0x1a244 {
                     execute_compute(w, base);
@@ -998,6 +1012,11 @@ fn execute_copy(w: &Window, base: u32) {
     assert!(d.synced.contains(&base));
     let xe2 = d.regs[&0xd8c] >> 22 == 20;
     let image = d.memory[&base].clone();
+    let engine = match image.borrow()[1026] {
+        0x22244 => 0x22000,
+        0x3ee244 if xe2 => 0x3ee000,
+        _ => panic!("unsupported copy register bank"),
+    };
     let (tail, ring_base) = {
         let data = image.borrow();
         assert_eq!(data.len(), 2048);
@@ -1006,15 +1025,15 @@ fn execute_copy(w: &Window, base: u32) {
             &[
                 0,
                 if xe2 { 0x1108101d } else { 0x11081019 },
-                0x22244,
+                engine + 0x244,
                 data[1027],
-                0x22034,
+                engine + 0x34,
                 0,
-                0x22030
+                engine + 0x30
             ]
         );
         assert!(matches!(data[1027], 0x00090009 | 0x00090008));
-        assert_eq!((data[1032], data[1024 + 0x21]), (0x22038, 0x11081011));
+        assert_eq!((data[1032], data[1024 + 0x21]), (engine + 0x38, 0x11081011));
         assert_eq!(data[1024 + 0x71], 0x01000000);
         (data[1024 + 7], data[1024 + 9])
     };
@@ -1065,14 +1084,14 @@ fn execute_copy(w: &Window, base: u32) {
         // RING_CMD_CCTL is pinned per platform by the RCS tests; BCS0's ring
         // and BLIT_CCTL must use the same uncached MOCS index.
         let cctl = d.regs[&0x20c4];
-        assert_eq!(d.regs[&0x220c4], cctl);
+        assert_eq!(d.regs[&u64::from(engine + 0xc4)], cctl);
         let uc = (cctl >> 1) & 0x3f;
         assert_eq!(cctl, 0x3f7e0000 | uc << 8 | uc << 1);
         assert_eq!(
             &words[1..28],
             &[
                 0x15080001,
-                0x22204,
+                (engine + 0x204),
                 0x600,
                 0x11080003,
                 0x608,
@@ -1090,7 +1109,7 @@ fn execute_copy(w: &Window, base: u32) {
                 0x18000031,
                 0x15040001,
                 0x600,
-                0x22204,
+                (engine + 0x204),
                 0x11080005,
                 0x600,
                 0,
@@ -1100,9 +1119,13 @@ fn execute_copy(w: &Window, base: u32) {
                 0,
             ]
         );
-        let old = d.regs.get(&0x22204).copied().unwrap_or(0xffff_ffff);
+        let old = d
+            .regs
+            .get(&u64::from(engine + 0x204))
+            .copied()
+            .unwrap_or(0xffff_ffff);
         let value = (old & !0x7e7e) | uc << 9 | uc << 1;
-        d.regs.insert(0x22204, value);
+        d.regs.insert(u64::from(engine + 0x204), value);
         if xe2 {
             // xe2_bcs_offsets saves BLIT_CCTL in the context image.
             image.borrow_mut()[1024 + 0x45] = value;
@@ -1421,9 +1444,10 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
         let engines: Vec<_> = gt.engines().unwrap().iter().collect();
         let goldens: Vec<_> = engines
             .iter()
+            .filter(|e| e.logical_instance() == 0)
             .map(|e| golden_for_class(&w, e.guc_class() as usize))
             .collect();
-        let mut published = alloc::vec![None; engines.len()];
+        let mut published = alloc::vec![None; goldens.len()];
         for now in 27..200 {
             assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
             for (k, golden) in goldens.iter().enumerate() {
@@ -1440,7 +1464,12 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
                 .filter(|a| **a == 0x4502)
                 .count();
         }
-        let expected: Vec<_> = (0..engines.len()).map(|k| Some(2 * (k + 1))).collect();
+        let expected: Vec<_> = engines
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.logical_instance() == 0)
+            .map(|(k, _)| Some(2 * (k + 1)))
+            .collect();
         assert_eq!(published, expected, "engines published out of order");
         assert_eq!(registrations, 2 * engines.len());
         assert_eq!(completion.result(), Some(Ok(())));
@@ -1483,37 +1512,22 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
             // Mapping, enable mask, state size and BCS0 register saves.
             assert_eq!(
                 (ads[(0x123c + 96) / 4], ads[(0x123c + 524) / 4]),
-                (0x20202000, 1)
+                (
+                    if xe2 { 0x20200800 } else { 0x20202000 },
+                    if xe2 { 0x101 } else { 1 }
+                )
             );
             assert_eq!(ads[0x1060 / 4], 8192 - 4096 - 384);
             assert_eq!(ads[0x300 / 4 + 1], 3);
             let saves = (ads[0x300 / 4] - 0x20001000) as usize / 4;
             assert_eq!(
-                [
-                    ads[saves],
-                    ads[saves + 2],
-                    ads[saves + 4],
-                    ads[saves + 8],
-                    ads[saves + 12]
-                ],
-                [
-                    0x2229c,
-                    1,
-                    0x22080,
-                    0x220a8,
-                    // CCS0's saves follow BCS0's when it is published.
-                    if gt
-                        .engines()
-                        .unwrap()
-                        .contains(crate::intel_gpu_engine::Engine::Ccs0)
-                    {
-                        0x1a29c
-                    } else {
-                        0
-                    }
-                ]
+                [ads[saves], ads[saves + 2], ads[saves + 4], ads[saves + 8]],
+                [0x2229c, 1, 0x22080, 0x220a8]
             );
             assert_eq!(ads[saves + 5], w.0.borrow().regs[&0x22080]);
+            if !xe2 {
+                assert_eq!((ads[0x340 / 4], ads[0x340 / 4 + 1]), (0, 0));
+            }
         }
         if engines.contains(&crate::intel_gpu_engine::Engine::Ccs0) {
             let compute_golden = golden_for_class(&w, 4);
@@ -1532,6 +1546,17 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
                 (0x20202000, 1)
             );
             assert_eq!(ads[0x400 / 4 + 1], 3);
+            // GuC follows the class/physical-instance header, not adjacency
+            // to another engine's save list. An absent BCS8 leaves its own
+            // reserved save range empty before CCS0's range.
+            let saves = (ads[0x400 / 4] - 0x20001000) as usize / 4;
+            assert_ne!(ads[0x400 / 4], ads[0x300 / 4]);
+            assert_eq!(
+                [ads[saves], ads[saves + 4], ads[saves + 8]],
+                [0x1a29c, 0x1a080, 0x1a0a8]
+            );
+            assert_eq!(ads[saves + 2], 1);
+            assert_eq!(ads[saves + 5], w.0.borrow().regs[&0x1a080]);
             assert_eq!(w.0.borrow().regs[&0x14800] & 1, 1, "RCU_MODE_CCS_ENABLE");
         }
         // A fresh PPGTT context must inherit the device's saved opaque state,
@@ -2284,4 +2309,8 @@ mod slpc_controls {
 
 fn service_slpc(w: &Window, memory: &Words, control_fence: u16, request: &[u32]) {
     slpc_controls::service(w, memory, control_fence, request);
+}
+
+mod bcs8 {
+    include!("intel_gpu_bcs8_tests.rs");
 }

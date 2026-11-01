@@ -74,6 +74,8 @@ mod tests {
                     | 0x2050
                     | 0x220d4
                     | 0x22050
+                    | 0x3ee0d4
+                    | 0x3ee050
             );
             regs.insert(
                 reg,
@@ -214,6 +216,9 @@ mod tests {
             (1, false, 1 << 8, true),
         ] {
             let (w, init) = fixture(GtPlatform::Battlemage, 0xe20b, release, 0, flat, live);
+            assert!(init
+                .engines()
+                .contains(crate::intel_gpu_engine::Engine::Bcs8));
             let Poll::Ready(Ok(Some(vram))) = init.poll(&w, 11) else {
                 return TestResult::Fail("BMG did not capture local-memory registers");
             };
@@ -232,6 +237,8 @@ mod tests {
             );
             assert_eq!(r[&0xe7cc], 0xa5a55a5a | 0x9000);
             assert_eq!(r[&0x20d4], 0xa5a55a5a | 0xc080);
+            assert_eq!(r[&0x3ee0d4], 0xa5a55a5a | 0xc080);
+            assert_eq!(r[&0x3ee050], 0xa5a55a5a | 0x1000);
             assert_eq!(r[&0xe4c4], 0xa5a55a5a | 0x1040);
             assert_eq!(r[&0xb158], 0xa5a5587f);
             assert_eq!(r[&0x4148], 0xa5a55a50);
@@ -253,6 +260,7 @@ mod tests {
             (0x0000_0100, false, false),
         ] {
             let (w, init) = fixture(GtPlatform::Alchemist, 0x56a0, 0, 0, false, live);
+            assert!(!init.engines().contains(Engine::Bcs8));
             assert_eq!(init.engines().contains(Engine::Ccs0), ccs0);
             assert!(matches!(init.poll(&w, 11), Poll::Ready(Ok(None))));
             let writes = w.writes.borrow();
@@ -384,13 +392,18 @@ impl RegisterInit {
         })
     }
 
-    /// RCS0 and BCS0 always; CCS0 when its instance is fused present.
+    /// RCS0/BCS0 always, BCS8 on BMG, CCS0 when fused present. Linux
+    /// XE2_GFX_FEATURES includes BCS8; read_copy_fuses does not filter BMG.
     pub(crate) fn engines(&self) -> crate::intel_gpu_engine::EngineSet {
         use crate::intel_gpu_engine::{Engine, EngineSet};
-        if self.compute & 1 != 0 {
-            EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs0])
-        } else {
-            EngineSet::of(&[Engine::Rcs0, Engine::Bcs0])
+        match (
+            self.platform == GtPlatform::Battlemage,
+            self.compute & 1 != 0,
+        ) {
+            (true, true) => EngineSet::of(&Engine::ALL),
+            (true, false) => EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Bcs8]),
+            (false, true) => EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs0]),
+            (false, false) => EngineSet::of(&[Engine::Rcs0, Engine::Bcs0]),
         }
     }
 
@@ -665,6 +678,8 @@ impl RegisterInit {
                                                            // FOREACH_ENGINE/ENGINE_BASE entries reach BCS0 as well.
                 add(0x220d4, 0xc080, 0xc080, true, Direct); // 16021639441 + priority reads
                 add(0x22050, 0x1000, 0x1000, true, Direct); // 16023105232
+                add(0x3ee0d4, 0xc080, 0xc080, true, Direct); // BCS8 ENGINE_BASE
+                add(0x3ee050, 0x1000, 0x1000, true, Direct); // 16023105232
                 if self.compute & 1 != 0 {
                     add(0x1a0d4, 0xc080, 0xc080, true, Direct); // 16021639441 + priority reads
                     add(0x1a050, 0x1000, 0x1000, true, Direct); // 16023105232

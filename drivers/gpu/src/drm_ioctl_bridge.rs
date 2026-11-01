@@ -2923,6 +2923,7 @@ fn handle_getcrtc(
         // drm_crtc::gamma_size: the legacy LUT's, on CRTCs that have one.
         let gamma_size = card
             .crtc_color(crtc_id)
+            .filter(|_| !card.ctm_only(crtc_id))
             .map_or(0, |_| crate::drm::card::LEGACY_GAMMA_SIZE as u32);
         out[28..32].copy_from_slice(&gamma_size.to_le_bytes());
         let mode_valid: u32 = crtc.mode.is_some() as u32;
@@ -3629,6 +3630,30 @@ fn blob_value(
     Ok(id)
 }
 
+/// Shared by GETOBJPROPERTIES and the native admission fixtures. Intel's
+/// fixed-mode color owner publishes CTM alone; AMD keeps its existing LUTs.
+fn crtc_color_properties(card: &crate::drm::card::Card, crtc: u32) -> (Vec<u32>, Vec<u64>) {
+    let Some(color) = card.crtc_color(crtc) else {
+        return (Vec::new(), Vec::new());
+    };
+    if card.ctm_only(crtc) {
+        (vec![CRTC_CTM_PROP_ID], vec![u64::from(color.ctm)])
+    } else {
+        (
+            vec![
+                CRTC_CTM_PROP_ID,
+                CRTC_GAMMA_LUT_PROP_ID,
+                CRTC_GAMMA_LUT_SIZE_PROP_ID,
+            ],
+            vec![
+                u64::from(color.ctm),
+                u64::from(color.gamma_lut),
+                GAMMA_LUT_SIZE,
+            ],
+        )
+    }
+}
+
 /// A CRTC's color properties' new values from one request: each is
 /// `None` while the request leaves it alone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3653,6 +3678,9 @@ fn crtc_color_property(
     }
     if card.crtc_color(crtc).is_none() {
         return Err(FsError::InvalidData);
+    }
+    if prop == CRTC_GAMMA_LUT_PROP_ID && card.ctm_only(crtc) {
+        return Err(FsError::Unsupported);
     }
     if prop == CRTC_CTM_PROP_ID {
         change.ctm = Some(blob_value(card, value, Some(CTM_BLOB_SIZE), None)?);
@@ -4322,7 +4350,7 @@ fn handle_gamma(
     let (red, green, blue) = (ptr(8), ptr(16), ptr(24));
     let card = mode_state.lock();
     card.crtc(crtc_id).map_err(|_| FsError::NotFound)?;
-    let Some(color) = card.crtc_color(crtc_id) else {
+    let Some(color) = card.crtc_color(crtc_id).filter(|_| !card.ctm_only(crtc_id)) else {
         // drm_crtc_supports_legacy_gamma is false (gamma_size 0).
         return if set {
             Err(FsError::NotImplemented) // ENOSYS
@@ -4600,18 +4628,9 @@ fn handle_obj_getproperties(
                 props.push(CRTC_VRR_ENABLED_PROP_ID);
                 values.push(u64::from(vrr));
             }
-            if let Some(color) = card.crtc_color(obj_id) {
-                props.extend([
-                    CRTC_CTM_PROP_ID,
-                    CRTC_GAMMA_LUT_PROP_ID,
-                    CRTC_GAMMA_LUT_SIZE_PROP_ID,
-                ]);
-                values.extend([
-                    u64::from(color.ctm),
-                    u64::from(color.gamma_lut),
-                    GAMMA_LUT_SIZE,
-                ]);
-            }
+            let (color_props, color_values) = crtc_color_properties(&card, obj_id);
+            props.extend(color_props);
+            values.extend(color_values);
             (props, values)
         } else if obj_type == DRM_MODE_OBJECT_CONNECTOR {
             let connector = card.connector(obj_id).map_err(|_| FsError::InvalidData)?;

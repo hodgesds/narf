@@ -39,10 +39,13 @@ pub(crate) async fn query_user(
         return Err(FsError::InvalidData);
     }
     // Like xe_query.c, the engine pad is ignored. Only main GT0's published
-    // logical instance 0 of RCS or BCS can be sampled.
-    let engine = Engine::from_xe_class(u16::from_le_bytes([input[0], input[1]]))
-        .filter(|_| input[2..6] == [0; 4])
-        .ok_or(FsError::InvalidData)?;
+    // logical instances can be sampled, including BMG COPY1 -> BCS8.
+    let engine = Engine::from_class_instance(
+        u16::from_le_bytes([input[0], input[1]]),
+        u16::from_le_bytes([input[2], input[3]]),
+    )
+    .filter(|_| input[4..6] == [0; 2])
+    .ok_or(FsError::InvalidData)?;
     let destination = data.checked_add(12).ok_or(FsError::BadAddress)?;
     let status = info
         .backend
@@ -90,6 +93,8 @@ fn query_wire(
             put32(&mut reply, 0, engines.len() as u32);
             for (i, engine) in engines.iter().enumerate() {
                 reply[8 + i * 32..10 + i * 32].copy_from_slice(&engine.xe_class().to_le_bytes());
+                reply[10 + i * 32..12 + i * 32]
+                    .copy_from_slice(&engine.logical_instance().to_le_bytes());
             }
             reply
         }

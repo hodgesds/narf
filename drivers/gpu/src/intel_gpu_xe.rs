@@ -280,17 +280,18 @@ impl XeFile {
             return Err(FsError::InvalidData);
         }
         let instance = read(user, u64_at(&wire, 24), 8)?;
-        zero(&instance[2..8])?;
+        zero(&instance[4..8])?; // GT0 plus MBZ pad, logical instance may be COPY1.
         let class = u16::from_le_bytes(instance[..2].try_into().unwrap());
+        let logical = u16::from_le_bytes(instance[2..4].try_into().unwrap());
         // Only the GT's published (fused-in) engines are addressable.
         let present = info
             .backend
             .as_ref()
             .and_then(|b| b.status())
             .map_or_else(Default::default, |status| status.engines);
-        let engine = crate::intel_gpu_engine::Engine::from_xe_class(class)
+        let engine = crate::intel_gpu_engine::Engine::from_class_instance(class, logical)
             .filter(|engine| present.contains(*engine));
-        if class != 5 && engine.is_none() {
+        if (class != 5 && engine.is_none()) || (class == 5 && logical != 0) {
             return Err(FsError::InvalidData);
         }
         let mut extensions = u64_at(&wire, 0);
