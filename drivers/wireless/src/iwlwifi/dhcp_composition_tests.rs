@@ -1645,11 +1645,19 @@ impl Guard {
         }
         Device::validate_station_profile(&hardware)?;
         let channel = six.map_or_else(|| phy.map_or(6, PhyModel::channel), |six| six.channel);
+        let legacy = if six.is_some() { 5 } else { channel };
         let ap = if secured {
-            FakeAp::wpa2(NETWORK, SSID, channel, 7, PMK, ANONCE)
+            FakeAp::wpa2(NETWORK, SSID, legacy, 7, PMK, ANONCE)
         } else {
-            FakeAp::open(NETWORK, SSID, channel, 7)
+            FakeAp::open(NETWORK, SSID, legacy, 7)
         }
+        .and_then(|ap| {
+            if six.is_some() {
+                ap.with_six_ghz_channel(channel)
+            } else {
+                Ok(ap)
+            }
+        })
         .map_err(|_| "shared Sc AP configuration")?;
         let mut wire = Box::new(Wire {
             firmware,

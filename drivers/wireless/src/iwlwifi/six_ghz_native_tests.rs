@@ -229,7 +229,7 @@ pub(super) fn release_power() -> R {
     wire.firmware.inject(cmd, group, sequence, &[]);
     Ok(())
 }
-fn power_progress(mut complete: impl FnMut() -> bool, reason: &'static str) -> R {
+pub(super) fn power_progress(mut complete: impl FnMut() -> bool, reason: &'static str) -> R {
     // A copied command receipt still waits on the actual production1ms
     // no-IRQ Activity fallback. Tight iteration counts do not establish
     // that elapsed-time contract on every release/QEMU schedule.
@@ -943,8 +943,12 @@ fn smoke_iwl_six_ghz_held_ap_power_tightening_and_dropped_policy_owner_close_tx(
             require(
                 state.needs_reset
                     && state.hardware.is_failed()
-                    && model::retained(&state.hardware).1 != 0,
-                "6GHz failed power owner released uncertain DMA",
+                    // Initial AP power precedes STA/TVQM creation. Its
+                    // outstanding native command owns the uncertain DMA;
+                    // no packet TX queue may have been created yet.
+                    && model::retained(&state.hardware).0 != 0
+                    && model::retained(&state.hardware).1 == 0,
+                "6GHz initial power owner lost command DMA or created packet queues",
             )?;
             drop(state);
             let slot = HARNESS.lock();

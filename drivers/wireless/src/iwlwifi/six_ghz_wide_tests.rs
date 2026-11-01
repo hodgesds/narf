@@ -337,12 +337,13 @@ fn setup(
     let ap = FakeAp::wpa3_sae(
         NETWORK,
         SSID,
-        wide.primary,
+        5, // Explicit6GHz geometry is selected before any AP transcript.
         7,
         PASSWORD,
         narf_wifi_fixtures::ApSaePwe::HashToElement,
         ANONCE,
     )
+    .and_then(|ap| ap.with_six_ghz_channel(wide.primary))
     .and_then(|ap| ap.with_akms(&[24]))
     .and_then(|ap| ap.with_igtk([0x6b; 16], 5, 0x0102_0304_0506))
     .map_err(|_| "native320 SAE24/PMF peer")?;
@@ -815,13 +816,10 @@ fn queued_tpe_tightening() -> R {
         wire.mpdu(&beacon, false);
         wire.data.len()
     };
-    for _ in 0..256 {
-        service()?;
-        drain();
-        if HARNESS.lock().as_ref().unwrap().1.held.is_some() {
-            break;
-        }
-    }
+    six_ghz_tests::power_progress(
+        || HARNESS.lock().as_ref().unwrap().1.held.is_some(),
+        "native320 queued PSD did not reach actual native power receipt",
+    )?;
     let unpublished = {
         let slot = HARNESS.lock();
         let wire = &slot.as_ref().unwrap().1;
@@ -832,13 +830,10 @@ fn queued_tpe_tightening() -> R {
         "native320 queued PSD escaped before its new native receipt",
     )?;
     six_ghz_tests::release_power()?;
-    for _ in 0..256 {
-        service()?;
-        drain();
-        if HARNESS.lock().as_ref().unwrap().1.data.len() > before {
-            break;
-        }
-    }
+    six_ghz_tests::power_progress(
+        || HARNESS.lock().as_ref().unwrap().1.data.len() == before + 1,
+        "native320 DATA did not resume after current tighter PSD receipt",
+    )?;
     let resumed = HARNESS.lock().as_ref().unwrap().1.data.len() == before + 1;
     require(
         resumed,
@@ -952,8 +947,11 @@ fn held_power_owner() -> R {
         .try_lock()
         .ok_or("native320 dropped power owner retained lock")?;
     require(
-        state.needs_reset && state.hardware.is_failed() && model::retained(&state.hardware).1 != 0,
-        "native320 dropped power owner released uncertain DMA",
+        state.needs_reset
+            && state.hardware.is_failed()
+            && model::retained(&state.hardware).0 != 0
+            && model::retained(&state.hardware).1 == 0,
+        "native320 initial power owner lost command DMA or created packet queues",
     )?;
     drop(state);
     let slot = HARNESS.lock();

@@ -384,7 +384,7 @@ fn smoke_ath10k_80p80_response_second_center_cannot_rebind_prepared_native_owner
                 at += 2 + usize::from(ies[at + 1]);
             }
         });
-        if h.join().is_ok() || !h.closed() {
+        if h.join().is_ok() || !h.never_opened() {
             return TestResult::Fail(
                 "association response replaced source-selected second80 center",
             );

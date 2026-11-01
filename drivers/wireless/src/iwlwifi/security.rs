@@ -378,6 +378,28 @@ mod tests {
         if m2.keys.is_some() || !session.complete() || session.ptk.as_ref().unwrap().tk != old_key {
             return TestResult::Fail("unauthenticated rekey M1 replaced the active PTK");
         }
+        let wire = KeyFrame::decode(&m2.bytes[4..], 16).unwrap();
+        let mut unsigned = m2.bytes.clone();
+        unsigned[81..97].fill(0);
+        if wire.key_information
+            != (KI_VERSION_HMAC_SHA1_AES | KI_KEY_TYPE_PAIRWISE | KI_KEY_MIC | KI_SECURE)
+            || wire.key_mic
+                != handshake::compute_mic(
+                    &session
+                        .pending_rekey
+                        .as_ref()
+                        .unwrap()
+                        .ptk
+                        .as_ref()
+                        .unwrap()
+                        .kck,
+                    &unsigned,
+                )
+        {
+            return TestResult::Fail(
+                "native pairwise rekey M2 lost installed-PTK Secure/MIC context",
+            );
+        }
         let retry = session
             .process_with_nonce(&rekey1, || panic!("duplicate M1 regenerated SNonce"))
             .unwrap();
@@ -689,7 +711,7 @@ impl Session {
             if key.key_information == (self.akm.ki_version() | KI_KEY_ACK | KI_KEY_TYPE_PAIRWISE) {
                 if let Some(pending) = &mut self.pending_rekey {
                     if pdu == pending.last_request {
-                        return pending.process_inner(pdu);
+                        return pending.process_inner(pdu, true);
                     }
                 }
                 if key.replay_counter <= self.replay
@@ -714,7 +736,7 @@ impl Session {
                 candidate.rsn_extensions = self.rsn_extensions.clone();
                 candidate.pmf = self.pmf;
                 candidate.mld = self.mld.clone();
-                let reply = candidate.process_inner(pdu)?;
+                let reply = candidate.process_inner(pdu, true)?;
                 self.pending_rekey = Some(candidate);
                 return Ok(reply);
             }
@@ -728,7 +750,7 @@ impl Session {
                     return Err("stale rekey completion");
                 }
                 let pending = self.pending_rekey.as_mut().unwrap();
-                let response = pending.process_inner(pdu)?;
+                let response = pending.process_inner(pdu, true)?;
                 if pending.complete {
                     let replacement = self.pending_rekey.take().unwrap();
                     *self = *replacement; // Drop zeroizes the previous PTK.
@@ -736,10 +758,10 @@ impl Session {
                 return Ok(response);
             }
         }
-        self.process_inner(pdu)
+        self.process_inner(pdu, false)
     }
 
-    fn process_inner(&mut self, pdu: &[u8]) -> Result<Response, &'static str> {
+    fn process_inner(&mut self, pdu: &[u8], m2_secure: bool) -> Result<Response, &'static str> {
         if pdu.len() < 99
             || !matches!(pdu[0], 1..=3)
             || pdu[1] != 3
@@ -781,7 +803,13 @@ impl Session {
                 .akm
                 .derive_ptk(&self.pmk, &ap, &local, &key.key_nonce, &self.snonce, 16);
             let mut reply = KeyFrame::empty(16);
-            reply.key_information = self.akm.ki_version() | KI_KEY_TYPE_PAIRWISE | KI_KEY_MIC;
+            // hostap wpa_supplicant_send_2_of_4 sets Secure when the
+            // current PTK remains installed. A fresh candidate must retain
+            // that outer owner fact without replacing its active key.
+            reply.key_information = self.akm.ki_version()
+                | KI_KEY_TYPE_PAIRWISE
+                | KI_KEY_MIC
+                | if m2_secure { KI_SECURE } else { 0 };
             reply.replay_counter = key.replay_counter;
             reply.key_nonce = self.snonce;
             let rsn = self

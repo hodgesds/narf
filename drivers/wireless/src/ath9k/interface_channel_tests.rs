@@ -214,7 +214,18 @@ fn join(owner: &Owner) -> Result<(), WirelessError> {
         } else {
             SecurityConfig::Open
         },
-    }))
+    }))?;
+    // MLME/controlled-port completion does not release a qualified sender's
+    // actual ADDBA publication/ACK/response credit. Settle those real native
+    // receipts before a test claims DATA is available to wedge or retune.
+    let mut radio = device.radio.try_lock().ok_or(WirelessError::Busy)?;
+    for _ in 0..16 {
+        radio.poll().map_err(wireless)?;
+        if radio.ready() {
+            return Ok(());
+        }
+    }
+    Err(WirelessError::Busy)
 }
 fn smoke_ar9285_channels_full_reset_calibration_receipts_and_native_open_wpa2_ip() -> TestResult {
     let _policy = policy();

@@ -617,7 +617,10 @@ Missing Basic flags retain beacon requirements. Malformed or duplicate rate
 elements fail the transaction; neither the AID nor rate bitmaps commit until
 all checks pass. A matching invalid response leaves the plan Failed and its
 old bitmaps unchanged. Response rates cannot grant PHY, key or port authority.
-`association::channel` exposes the existing 2.4/5GHz legacy 20MHz geometry.
+`association::channel` exposes legacy20MHz geometry, including full-rate
+2.4GHz channels1–13 (2412–2472MHz) and exact inverse frequency/band lookup.
+Channel14 stays absent. These physical coordinates grant no device, signed
+power-program, firmware, factory or current regulatory permission.
 Drivers retain their own rate-index mapping, radio/regulatory authority,
 firmware peer records, retained supplicant, key installation and controlled
 port. `Associated` alone grants none of those. MT76 preserves its existing

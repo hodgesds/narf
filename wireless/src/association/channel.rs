@@ -1,4 +1,5 @@
 //! Shared legacy 20MHz channel geometry from Linux mt76/mac80211.c.
+//! Full-rate2.4GHz channels1–13 have regular5MHz spacing; channel14 is absent.
 //! Channel numbers with the CONNAC2 6 GHz flag never enter this profile.
 use alloc::vec::Vec;
 
@@ -17,7 +18,7 @@ pub enum Band {
 }
 
 pub fn band(channel: u8) -> Option<Band> {
-    if (1..=11).contains(&channel) {
+    if (1..=13).contains(&channel) {
         Some(Band::Ghz2)
     } else if CHANNELS_5GHZ.contains(&channel) {
         Some(Band::Ghz5)
@@ -68,7 +69,7 @@ pub fn from_frequency_band(mhz: u32) -> Option<(Band, u8)> {
 
 pub fn from_frequency(mhz: u32) -> Option<u8> {
     let channel = match mhz {
-        2412..=2462 if (mhz - 2407) % 5 == 0 => u8::try_from((mhz - 2407) / 5).ok()?,
+        2412..=2472 if (mhz - 2407) % 5 == 0 => u8::try_from((mhz - 2407) / 5).ok()?,
         5180..=5885 if mhz % 5 == 0 => u8::try_from((mhz - 5000) / 5).ok()?,
         _ => return None,
     };
@@ -80,7 +81,7 @@ pub fn from_frequency(mhz: u32) -> Option<u8> {
 pub fn channels(bands: u8) -> Vec<u8> {
     let mut channels = Vec::new();
     if bands & 1 != 0 {
-        channels.extend(1..=11);
+        channels.extend(1..=13);
     }
     if bands & 2 != 0 {
         channels.extend(CHANNELS_5GHZ);

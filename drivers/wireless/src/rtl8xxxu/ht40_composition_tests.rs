@@ -499,8 +499,15 @@ fn raw_epoch_and_current_span() -> Result<(), &'static str> {
         flags: narf_wireless::reg::RegFlags::NO_IR,
     });
     let factory = h.firmware.factory().ok_or("EU raw current factory")?;
+    // The sealed copied proof re-enters the original model domain through
+    // WideQualification -> base Proof::policy. End this guard's scope before
+    // that call; retain the independently checked primary20 permission.
+    let primary_still_allowed = {
+        let current = h.domain.lock();
+        calibration(factory).permission(&current, 1).is_ok()
+    };
     ensure!(
-        calibration(factory).permission(&h.domain.lock(), 1).is_ok() && !copied.unmodified(),
+        primary_still_allowed && !copied.unmodified(),
         "EU40 proof ignored a forbidden subspan outside the original20 primary"
     );
     h.domain.lock().rules.pop();

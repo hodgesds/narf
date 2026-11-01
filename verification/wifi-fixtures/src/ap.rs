@@ -46,6 +46,7 @@ pub struct FakeAp {
     plan: NetworkPlan,
     ssid: Vec<u8>,
     channel: u8,
+    band: narf_wireless::association::channel::Band,
     aid: u16,
     pmk: Option<Zeroizing<[u8; 32]>>,
     anonce: [u8; 32],
@@ -78,6 +79,32 @@ impl Drop for FakeAp {
 }
 
 impl FakeAp {
+    /// Explicit6GHz20MHz geometry, before any authentication transcript.
+    /// The native fixture wrapper still supplies HE6/EHT/operation/TPE and
+    /// physical RX band/channel facts. This creates no RF/security grant.
+    pub fn with_six_ghz_channel(mut self, channel: u8) -> Result<Self, ApError> {
+        use narf_wireless::association::channel::{frequency_in, Band};
+        if self.phase != ApPhase::Authentication
+            || self.ptk.is_some()
+            || self.mld.is_some()
+            || channel != 2 && (channel == 0 || channel > 253 || channel % 4 != 1)
+            || frequency_in(Band::Ghz6, channel).is_none()
+            || self.basic_1mbps
+            || self
+                .rates
+                .as_ref()
+                .is_some_and(|rates| rates.iter().any(|r| matches!(r & 127, 2 | 4 | 11 | 22)))
+        {
+            return Err(ApError::Configuration);
+        }
+        self.band = Band::Ghz6;
+        self.channel = channel;
+        Ok(self)
+    }
+    /// Geometry only; native/regulatory and security owners remain separate.
+    pub fn channel_band(&self) -> (narf_wireless::association::channel::Band, u8) {
+        (self.band, self.channel)
+    }
     pub fn open(plan: NetworkPlan, ssid: &[u8], channel: u8, aid: u16) -> Result<Self, ApError> {
         Self::new(plan, ssid, channel, aid, None, [0; 32])
     }
@@ -120,6 +147,11 @@ impl FakeAp {
             plan,
             ssid: ssid.to_vec(),
             channel,
+            band: if channel <= 14 {
+                narf_wireless::association::channel::Band::Ghz2
+            } else {
+                narf_wireless::association::channel::Band::Ghz5
+            },
             aid,
             pmk,
             anonce,
@@ -297,7 +329,10 @@ impl FakeAp {
     /// authentication. Default constructors retain their OFDM6/12/24 profile.
     /// This configures only the fake peer; it grants no driver/radio authority.
     pub fn with_basic_1mbps(mut self) -> Result<Self, ApError> {
-        if self.phase != ApPhase::Authentication || self.ptk.is_some() || self.channel > 14 {
+        if self.phase != ApPhase::Authentication
+            || self.ptk.is_some()
+            || self.band != narf_wireless::association::channel::Band::Ghz2
+        {
             return Err(ApError::Phase);
         }
         self.basic_1mbps = true;
@@ -323,7 +358,9 @@ impl FakeAp {
                 .iter()
                 .position(|r| *r == rate & 127)
                 .ok_or(ApError::Configuration)?;
-            if seen & (1 << index) != 0 || self.channel > 14 && index < 4 {
+            if seen & (1 << index) != 0
+                || self.band != narf_wireless::association::channel::Band::Ghz2 && index < 4
+            {
                 return Err(ApError::Configuration);
             }
             seen |= 1 << index;
@@ -503,7 +540,9 @@ impl FakeAp {
         let mut out = vec![0, self.ssid.len() as u8];
         out.extend_from_slice(&self.ssid);
         self.append_rates(&mut out);
-        out.extend_from_slice(&[3, 1, self.channel]);
+        if self.band != narf_wireless::association::channel::Band::Ghz6 {
+            out.extend_from_slice(&[3, 1, self.channel]);
+        }
         if self.protected() {
             out.extend_from_slice(&self.rsn_ie());
         }

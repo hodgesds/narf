@@ -77,6 +77,16 @@ CCK profiles on those channels, malformed/duplicate rates, absent basic rates
 and post-authentication profile replacement are refused. These fixture profiles
 grant no device, calibration or regulatory authority.
 
+**Explicit6GHz fixture geometry.**
+`FakeAp::with_six_ghz_channel(primary)` is a pre-authentication opt-in that
+retains `Band::Ghz6` separately from the channel number. It accepts source
+20MHz primary geometry1+4k through253 and special channel2, omits the legacy
+DS Parameter Set and refuses CCK profiles. `channel_band()` exposes those
+immutable selected facts. Bare legacy constructors keep their existing
+2.4/5GHz bounds. Native wrappers independently author actual HE6/EHT,
+operation/TPE, copied physical RX band/channel and security facts; this
+geometry method supplies no device, legal, RF or security permission.
+
 **WPA3 and PMF profiles.** `FakeAp::wpa3_sae(plan, ssid, channel, aid,
 password, ApSaePwe::{HuntAndPeck, HashToElement}, anonce)` builds a
 WPA3-Personal AP. It offers AKM 8 with MFPC|MFPR, plus the RSNXE SAE-H2E

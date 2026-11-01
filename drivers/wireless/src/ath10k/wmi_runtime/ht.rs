@@ -208,6 +208,16 @@ impl Profile {
         phy: Phy,
         chains: Chains,
     ) -> Result<Option<Self>, Error> {
+        // Apply the unsupported-HT legacy gate before constructing a local
+        // chain/NSS profile. Missing raw HT/RF facts cannot manufacture HT,
+        // nor turn the retained legacy owner into an impossible local PHY.
+        // Preserve malformed AP/WMM refusal even on that legacy path.
+        if !supported(caps) {
+            ApElements::parse(&cached.information_elements).map_err(plan_error)?;
+            narf_wireless::wmm::Parameters::parse(&cached.information_elements)
+                .map_err(|_| Error::Malformed)?;
+            return Ok(None);
+        }
         if phy == Phy::Vht && (!vht_supported(caps) || cached.frequency < 3000) {
             return Ok(None);
         }

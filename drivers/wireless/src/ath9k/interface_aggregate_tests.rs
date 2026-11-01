@@ -79,7 +79,8 @@ fn smoke_ar9285_large_tx_public_ipc_eight_originals_kernel_dhcp_and_recipient_co
             if !h.device.link_up()
                 || h.peer.lock().uplink.last() != Some(&other)
                 || last.get(24..26) != Some(&[7, 0])
-                || h.model.queues.borrow().last() != Some(&3)
+                // Literal source QCU: TID7/VO uses2; QCU3 is BK/TID1,2.
+                || h.model.queues.borrow().last() != Some(&2)
             {
                 return TestResult::Fail(
                     "nonzero-TID single corrupted sender BA or missed its native QCU",

@@ -115,7 +115,10 @@ fn smoke_ath10k_native_chain_selection_uses_actual_service_ready_and_init_mask()
                     HwRev::Qca988x
                 };
                 r.htt.wmi.htc.transport.ce = Some(crate::ath10k::boot::CeFixture::new(hw));
-                if !matches!(drive(r.start(&[5180])), Poll::Ready(Ok(_))) {
+                // The independent generic firmware model authors the
+                // two-row2412/5180 inventory. Chain selection is checked on
+                // that actual vector, without an unmatched single-row setup.
+                if !matches!(drive(r.start(&[2412, 5180])), Poll::Ready(Ok(_))) {
                     return Err("native chain selection failed");
                 }
                 let m = &r.htt.wmi.htc.transport;
