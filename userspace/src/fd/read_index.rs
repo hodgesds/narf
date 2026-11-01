@@ -593,8 +593,14 @@ mod tests {
             drop(crate::fd::lookup(FAKE_TASK, 4));
             crate::fd::share(FAKE_TASK, shared);
             drop(crate::fd::lookup(shared, 4));
+            if crate::fd::ops_held_by_other_task(FAKE_TASK, &first) {
+                return Err("shared binding was mistaken for an independent fd table");
+            }
             crate::fd::fork(FAKE_TASK, forked);
             drop(crate::fd::lookup(forked, 4));
+            if !crate::fd::ops_held_by_other_task(FAKE_TASK, &first) {
+                return Err("forked table was skipped by the file alias check");
+            }
             let second = file();
             crate::fd::with_table(FAKE_TASK, |t| t.set(4, entry(Arc::clone(&second))));
             if !Arc::ptr_eq(&crate::fd::lookup(shared, 4).unwrap().ops, &second)
@@ -604,6 +610,9 @@ mod tests {
             }
             if !crate::fd::unshare_table(shared) {
                 return Err("unshare did not copy the shared descriptor table");
+            }
+            if crate::fd::unshare_table(shared) {
+                return Err("private descriptor table was copied again");
             }
             drop(crate::fd::lookup(shared, 4));
             crate::fd::with_table(FAKE_TASK, |t| t.close_range(4, 4, false));
