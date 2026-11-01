@@ -3091,10 +3091,13 @@ mod tests {
 
     fn smoke_igb_queue_enable_handshake() -> TestResult {
         // Enable conversation: driver writes ENABLE, chip reflects it
-        // only on the third read; the poll predicate must see exactly
-        // two stale reads, then reflection — never an instant pass, and
-        // never a spin past reflection.
-        let mut ctl = FakeQueueCtl::new(2);
+        // on the third read after the write; the poll predicate must
+        // see exactly two stale reads, then reflection — never an
+        // instant pass, and never a spin past reflection. The setup
+        // read below consumes one stale slot before the write, so the
+        // fake needs three stale slots for the poll loop to observe
+        // exactly two after the write.
+        let mut ctl = FakeQueueCtl::new(3);
         let enabled = queue_enable_word(ctl.read());
         ctl.write(enabled);
         let mut stale_polls = 0u32;
