@@ -83,6 +83,9 @@ enum Fault {
     HoldScan,
     HoldPower,
     HoldSixPower,
+    SixResponseWithoutTpe,
+    SixResponseNarrow80,
+    SixRnrReport,
     HoldIgtk,
     WrongSaeSelector,
     HoldHe,
@@ -727,7 +730,9 @@ impl Wire {
             (1, 0xd) => {
                 require(
                     body.len() == if self.api89.is_some() { 1940 } else { 1948 }
-                        && (half(body, 8) == 0x802 || self.phy.is_some() && half(body, 8) == 2),
+                        && (half(body, 8) == 0x802
+                            || self.phy.is_some() && half(body, 8) == 2
+                            || self.six.is_some() && half(body, 8) == 0x42),
                     "Sc passive scan ABI",
                 )?;
                 if self.six.is_some() {
@@ -743,7 +748,7 @@ impl Wire {
                             (word(record, 0) >> 30) as u8
                         };
                         require(
-                            band <= 2 && (band != 2 || record[4] % 4 == 1 && record[4] <= 233),
+                            band <= 2 && (band != 2 || record[4] % 4 == 1 && record[4] <= 253),
                             "6GHz actual UMAC band/channel",
                         )?;
                     }
@@ -859,7 +864,13 @@ impl Wire {
                 // SAE Commit must independently confirm H2E.
                 beacon.extend_from_slice(&[50, 1, 0xfb]);
             }
-            if self.six.is_none() || six_job {
+            if self.fault == Fault::SixRnrReport && !six_job {
+                let six = self.six.ok_or("RNR fixture lost actual6GHz source")?;
+                beacon.extend_from_slice(&[201, 13, 0, 9, 131, six.channel, 0]);
+                beacon.extend_from_slice(&AP);
+                beacon.extend_from_slice(&[0x52, 8]);
+                self.mpdu_at(&beacon, false, 1, 5);
+            } else if self.six.is_none() || six_job {
                 self.mpdu(&beacon, false);
             } else if self.six.is_some_and(|six| six.alias) {
                 self.mpdu_at(&beacon, false, 1, self.six.unwrap().channel);
@@ -1134,9 +1145,17 @@ impl Wire {
                     if matches!(response[0], 0x10 | 0x30) {
                         if let Some(six) = self.six {
                             if let Some(wide) = self.wide_six {
-                                wide.complete_ap_frame(&mut response)?;
+                                wide.complete_response(&mut response, self.fault)?;
+                                if self.fault == Fault::SixResponseNarrow80 {
+                                    self.wide_six = Some(wide.response_width(2));
+                                }
                             } else {
                                 six_ghz_tests::complete_ap_frame(&mut response, six)?;
+                                if self.fault == Fault::SixResponseWithoutTpe {
+                                    let ies = six_ghz_tests::without(&response[30..], 195, None);
+                                    response.truncate(30);
+                                    response.extend_from_slice(&ies);
+                                }
                             }
                         } else if let Some(phy) = self.phy {
                             response.extend_from_slice(&he_tests::elements(phy, phy.response_he));

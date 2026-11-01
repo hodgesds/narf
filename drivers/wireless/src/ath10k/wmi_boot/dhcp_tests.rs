@@ -8,6 +8,8 @@ use narf_net::Interface;
 use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessError};
 #[path = "associated_scan_conversation_tests.rs"]
 mod associated_scan_conversation_tests;
+#[path = "chains_conversation_tests.rs"]
+mod chains_conversation_tests;
 #[path = "coding_conversation_tests.rs"]
 mod coding_conversation_tests;
 #[path = "ht40_conversation_tests.rs"]
@@ -96,13 +98,33 @@ impl Harness {
         factory: u32,
         ht: Option<u32>,
     ) -> Self {
-        let mut radio = radio_boot_country_ht(
+        Self::new_on_profile(
+            version,
+            dialect,
+            secured,
+            active_scan,
+            frequency,
+            factory,
+            (ht, 2),
+        )
+    }
+    fn new_on_profile(
+        version: u32,
+        dialect: Dialect,
+        secured: bool,
+        active_scan: bool,
+        frequency: u16,
+        factory: u32,
+        profile: (Option<u32>, u32),
+    ) -> Self {
+        let mut radio = radio_boot_country_ht_rf(
             version,
             dialect,
             (1 << 10) | (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 },
             3,
             factory,
-            ht,
+            profile.0,
+            profile.1,
         );
         radio.htt.wmi.htc.transport.frequency = frequency;
         if active_scan {
@@ -934,6 +956,7 @@ enum TestPhy {
     Ht40,
     Sgi40,
     Vht80,
+    Mimo,
 }
 fn composition_radio(
     version: u32,
@@ -952,7 +975,13 @@ fn composition_radio(
         active_scan,
         frequency,
         if frequency < 3000 { 0x64 } else { 0x8348 },
-        (phy == TestPhy::Sgi40).then_some(0x803),
+        if phy == TestPhy::Sgi40 {
+            Some(0x803)
+        } else if phy == TestPhy::Mimo {
+            Some(0x7b)
+        } else {
+            None
+        },
     );
     if qos {
         h.model(|model| {
@@ -973,6 +1002,9 @@ fn composition_radio(
     }
     if phy == TestPhy::Vht80 {
         vht_conversation_tests::enable(&h, 2)?;
+    }
+    if phy == TestPhy::Mimo {
+        chains_conversation_tests::enable(&h);
     }
     if power_save {
         h.model(|model| {

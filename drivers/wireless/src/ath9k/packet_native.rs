@@ -7,6 +7,18 @@ use super::{
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
+enum InstalledPower {
+    Twenty([(u64, u32); 7]),
+    Forty(super::calibration::wide::WideReport),
+}
+impl InstalledPower {
+    fn registers(&self) -> &[(u64, u32)] {
+        match self {
+            Self::Twenty(powers) => powers,
+            Self::Forty(actual) => &actual.powers.registers,
+        }
+    }
+}
 pub(super) struct Native {
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
@@ -14,7 +26,7 @@ pub(super) struct Native {
     active: AtomicBool,
     report: super::calibration::Report,
     channel_mask: u16,
-    powers: Option<[(u64, u32); 7]>,
+    powers: Option<InstalledPower>,
     rf_silent: Option<(u8, bool)>,
     ht: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::ht::Grant>>>,
     ht_facts: Option<super::ht::Facts>,
@@ -83,7 +95,7 @@ impl Native {
         let powers = if report.frequency_mhz == 2412 {
             None
         } else {
-            Some(
+            Some(InstalledPower::Twenty(
                 super::phy::rates::checked_plan_at(
                     image,
                     report.frequency_mhz,
@@ -91,7 +103,7 @@ impl Native {
                 )
                 .map_err(|_| Error::Packet)?
                 .registers,
-            )
+            ))
         };
         Ok(Self {
             device,
@@ -109,6 +121,25 @@ impl Native {
             qos: narf_lib::sync::IrqSafeSpinLock::new(None),
             msi: narf_lib::sync::IrqSafeSpinLock::new(None),
         })
+    }
+    /// # Safety
+    /// Same sole calibrated function as new(); this distinct constructor
+    /// additionally consumes the actual fresh40 receipt and current H3 grant.
+    pub(super) unsafe fn new_wide(
+        device: BusDevice,
+        cap: Cap<BusDeviceCap, Write>,
+        bar: MmioRegion,
+        image: &[u8; super::EEPROM_4K_BYTES],
+        grant: alloc::sync::Arc<super::ht40::Grant>,
+        actual: super::calibration::wide::WideReport,
+    ) -> Result<Self, Error> {
+        grant.accept(actual)?;
+        // SAFETY: caller establishes the same exclusive native contract;
+        // all40-specific ownership is installed before this object escapes.
+        let mut native = unsafe { Self::new(device, cap, bar, actual.report, image) }?;
+        native.powers = Some(InstalledPower::Forty(actual));
+        *native.ht.lock() = Some(super::ht::Grant::from_wide(grant, actual)?);
+        Ok(native)
     }
     /// Discover, program and install one MSI vector while delivery stays
     /// disabled. Any failure leaves the owner on scheduled polling; a vector
@@ -288,6 +319,13 @@ impl Port for Native {
     fn channel_mask(&self) -> u16 {
         self.channel_mask
     }
+    fn geometry(&self) -> super::channel_width::Geometry {
+        match &self.powers {
+            Some(InstalledPower::Forty(actual)) => actual.geometry,
+            _ => super::channel_width::Geometry::from_frequency(self.report.frequency_mhz)
+                .expect("validated native primary"),
+        }
+    }
     fn frequency_mhz(&self) -> u16 {
         self.report.frequency_mhz
     }
@@ -383,14 +421,26 @@ impl Port for Native {
                     // authority were checked above; no competing channel writer.
                     Ok(unsafe { self.bar.read32(register) })
                 };
+                let geometry = self.geometry();
                 if read(0x9874)? & 0x3fff_ffff
-                    != (0x3000_0000 | (u32::from(self.report.frequency_mhz) * 0x10000 / 15))
-                    || read(0x9804)? & 0x7ff != 0x3c0
+                    != (0x3000_0000 | (u32::from(geometry.center()) * 0x10000 / 15))
+                    || read(0x9804)? & 0x7ff != geometry.turbo()
                 {
                     return Err(Error::Descriptor);
                 }
-                for (register, value) in powers {
+                for (register, value) in powers.registers() {
                     if read(*register)? != *value {
+                        return Err(Error::Descriptor);
+                    }
+                }
+                if let InstalledPower::Forty(actual) = powers {
+                    let iq = 0x800
+                        | (u32::from(actual.report.iq_i) << 5)
+                        | (actual.report.iq_q as u32 & 31);
+                    if read(0x8318)? != 1
+                        || read(0x99b4)? != actual.adc
+                        || read(0x9920)? & 0xfff != iq
+                    {
                         return Err(Error::Descriptor);
                     }
                 }

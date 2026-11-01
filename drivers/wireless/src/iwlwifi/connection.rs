@@ -589,11 +589,7 @@ impl Connection {
             // Linux's AP-power command is issued on an active link. No
             // station/TX queue exists yet, and no management TX precedes
             // this actual native receipt or a queued stricter AP beacon.
-            let receipt = hw.command(4, 0xc, six.power.command()).await?;
-            if !receipt.payload.is_empty() {
-                return Err("invalid6GHz AP power receipt");
-            }
-            six.check_pending(hw)?;
+            six.apply_pending(hw).await?;
             hw.install_six_tx_profile(six.clone())?;
         }
         let mut peer = station_api::peer(beacon.bssid);
@@ -775,22 +771,41 @@ impl Connection {
         if this.six.is_some() && this.qos.is_none() {
             return Err("6GHz response did not confirm WMM");
         }
-        if let Some(six) = &this.six {
-            six.confirm(&reply[6..])?;
-            this.he = Some(super::sc_he::Profile::new(
-                *six.plan.he(),
-                &reply[6..],
-                six.plan.peer_capability().sm_ps() == 0,
-                super::sc_he::rates_version(hw).ok_or("6GHz native HE rate ABI changed")?,
-            )?);
+        if let Some(original) = this.six.clone() {
+            let six = original.refine(&reply[6..], domain, &permissions)?;
+            let static_smps = six.plan.peer_capability().sm_ps() == 0
+                || original.original().peer_capability().sm_ps() == 0;
+            this.he = Some(
+                super::sc_he::Profile::new(
+                    *six.plan.he(),
+                    &reply[6..],
+                    static_smps,
+                    super::sc_he::rates_version(hw).ok_or("6GHz native HE rate ABI changed")?,
+                )?
+                .bound_original(original.original().he())?,
+            );
             if let Some(eht) = six.plan.eht() {
                 this.eht = Some(super::sc_eht::Profile::new_six(
                     *eht,
-                    eht,
+                    original
+                        .original()
+                        .eht()
+                        .ok_or("6GHz response invented EHT")?,
                     this.he.as_ref().unwrap(),
-                    six.plan.peer_capability().sm_ps() == 0,
+                    static_smps,
                 )?);
             }
+            let mut phy =
+                super::ht_vht::Negotiated::he_six(this.beacon.channel, six.plan.peer_capability());
+            // A response cannot enlarge the original peer's aggregation or
+            // relax its MPDU spacing/SMPS promises.
+            phy.ampdu_exp = phy.ampdu_exp.min(this.phy.ampdu_exp);
+            phy.density = phy.density.max(this.phy.density);
+            phy.dynamic_smps |= this.phy.dynamic_smps;
+            phy.width = six.span.width;
+            phy.center = six.span.center;
+            this.phy = phy;
+            this.six = Some(six);
         } else {
             this.phy = this.phy.confirm(
                 local_phy,
@@ -975,6 +990,10 @@ impl Connection {
             eht.apply_tlc(&mut tlc);
         }
         hw.station_tlc(&tlc).await?;
+        if let Some(six) = &this.six {
+            six.apply_pending(hw).await?;
+            hw.install_six_tx_profile(six.clone())?;
+        }
         // The response-refined native span/power is the handshake's owner;
         // a beacon received during M4 can update that same shared proof.
         this.regulatory = if let Some(six) = &this.six {
@@ -1350,7 +1369,10 @@ impl Connection {
         if !hw.transmit_space(queue)? {
             return Ok(false);
         }
-        hw.enqueue_transmit_assisted(queue, &frame, header, None, assist)?;
+        match hw.enqueue_transmit_assisted(queue, &frame, header, None, assist) {
+            Err(super::six_ghz_station::UPDATE_REQUIRED) => return Ok(false),
+            result => result?,
+        }
         self.sequence = self.sequence.wrapping_add(1);
         Ok(true)
     }
@@ -1396,6 +1418,7 @@ impl Connection {
     }
     pub(super) fn maintenance_pending(&self) -> bool {
         self.power_pending
+            || self.six.as_ref().is_some_and(|six| six.pending())
             || self.amsdu_memory_pending()
             || !self.actions.is_empty()
             || (0..super::aggregation::MAX_TIDS)
@@ -1713,7 +1736,10 @@ impl Connection {
         if self.six.is_some() || self.mld.is_some() {
             hw.poll()?;
             if let Some(six) = &self.six {
-                six.check_pending(hw)?;
+                match six.check_pending(hw) {
+                    Ok(()) | Err(super::six_ghz_station::UPDATE_REQUIRED) => {}
+                    Err(reason) => return Err(reason),
+                }
             }
             if let Some(mld) = &self.mld {
                 mld.check_pending(hw)?;
@@ -1724,6 +1750,7 @@ impl Connection {
 
     async fn service_power(&mut self, hw: &mut Hardware) -> Result<(), &'static str> {
         self.check_six_pending(hw)?;
+        hw.service_six_power().await?;
         if !self.power_pending {
             return Ok(());
         }

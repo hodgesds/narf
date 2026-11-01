@@ -353,13 +353,23 @@ Retuning disconnects and replaces the interface name; old keys/BA/owners
 remain terminal. Six new native cases are written; execution and the full
 release matrix remain deferred. Japan channel14 is not advertised.
 
+**Source implementation recount 2026-11-01** (Intel6GHz, ath10k chains and ath9k40 written):
+the remaining ledger holds **91 `feature`** rows (91 driver, 0 shared),
+**31 `chip`** and **0 `unknown`**. Sixteen source-complete implementations
+await validation in `research/implemented-pending-validation.tsv`. This batch
+completes admitted Intel6GHz active/RNR/periodic discovery, response refinement
+and live TPE receipts; ath10k spatial streams/TX STBC; and qualified AR9285
+HT40/directional SGI40 with actual calibration and physical20MHz fallback.
+Fifteen new native cases are written. Execution and the full release matrix
+remain deferred; source completion grants no physical board qualification.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 5 | 6GHz discovery/periodic/refinement and MLO; AP/P2P/WoW; exact admitted station/HE/TX A-MSDU and idle/associated periodic-scan profiles are software-validated |
+| iwlwifi | 4 | MLO; AP/P2P/WoW; admitted complete6GHz, EHT/320 and single-link MLD source is implemented pending validation; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 4 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA; hosted loadable packet ABI is implemented pending validation |
-| ath10k | 18 | 2.4-GHz HT40/coexistence, additional streams/TX STBC and VHT160/80+80, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload |
-| ath9k | 7 | HT40/SGI40 profiles, factory selection, periodic calibration, larger TX aggregates and idle/station sleep; admitted1–13 cold channel generations are implemented pending validation; other chips are separate rows |
+| ath10k | 16 | 2.4-GHz HT40/coexistence and VHT160/80+80, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload; selected streams/TX STBC are implemented pending validation |
+| ath9k | 5 | Factory selection, periodic calibration, larger TX aggregates and idle/station sleep; admitted1–13 cold generations and qualified HT40/SGI40 are implemented pending validation; other chips are separate rows |
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are implemented pending validation |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |

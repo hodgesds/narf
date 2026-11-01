@@ -24,10 +24,15 @@ pub(super) fn request(base: &ht::Grant) -> Request {
     let mut h = narf_crypto::sha256::Sha256::new();
     if base.version() == 1 {
         h.update(b"NARF AR9285 N85B static recipient BA v1");
-    } else {
+    } else if base.version() == 2 {
         h.update(b"NARF AR9285 N85B static recipient BA exact-channel v2");
         h.update(&base.frequency().to_le_bytes());
         h.update(b"exact current per-channel HT/calibration/CTL/rate facts and original packet/key/BA/capture generation; no v1 channel1 receipt reused");
+    }
+    if base.version() == 3 {
+        h.update(b"NARF AR9285 N85B complete20/40 LGI/SGI40 exact qualified native program v3");
+        h.update(&base.geometry().body());
+        h.update(b"exact H3 complete signed payload and current fresh40 calibration/10power program; primary+secondary full40span; native TXwidth/GI and RXwidth/GI/STBC matches negotiated direction; noSGI20; narrow response requires actual cold20 reset/calibration/fresh join before keys/data; source v1/v2 protocol/ownership rules retained while literal narrow NDBPS/duration is replaced by actual20/40 and ceil3.6us");
     }
     h.update(b"pending proposal prealloc64 opaque originals bound to receive epoch and actual receipt; no crypto/PN/delivery before positive ACK+RXidle; pre-proposal or unopened port never staged; source/key/DELBA/cancel drops stage;8191 is captured MPDU+FCS+minimum delimiter extent, not fabricated total PHY length");
     h.update(&identity);
@@ -42,10 +47,22 @@ pub(super) fn request(base: &ht::Grant) -> Request {
                 "ath9k/ar9285-rxba-v1-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
             )
-        } else {
+        } else if base.version() == 2 {
             format!(
                 "ath9k/ar9285-rxba-v2-ch{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
                 base.channel(),
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
+            )
+        } else {
+            format!(
+                "ath9k/ar9285-rxba-v3-ch{}-ext{}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
+                base.channel(),
+                base.geometry().secondary().expect("H3 exact extension"),
                 mac[0],
                 mac[1],
                 mac[2],
@@ -116,7 +133,7 @@ impl Grant {
             || b[12..16] != [0x8c, 0x16, 0x2b, 0]
             || b[16..48] != r.identity
             || b[48..54] != r.mac
-            || b[54..58] != [base.channel(), 20, 1, 1]
+            || b[54..58] != base.child_geometry(1)
             || !(1..=64).contains(&b[60])
             || b[61] != 0
             || b[64..] != [0; 32]

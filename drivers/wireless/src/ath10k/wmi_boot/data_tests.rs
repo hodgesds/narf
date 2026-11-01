@@ -96,9 +96,12 @@ pub(super) struct Fixture {
     protection_delay: u8,
     ht_response: Option<Vec<u8>>,
     ht_mcs: u8,
+    pub(super) ht_mcs_more: [u8; 3],
+    pub(super) ht_peer_nss: u32,
     ht_sgi: bool,
     ht_request_sgi: bool,
     ht_request_sgi40: bool,
+    pub(super) ht_request_nss: u8,
     ht_ampdu: u8,
     ht_capabilities: u16,
     // Source-cited coding bits beyond the base request IE: IEEE LDPC 0x0001
@@ -172,9 +175,12 @@ impl Fixture {
             protection_delay: 0,
             ht_response: None,
             ht_mcs: 0xff,
+            ht_mcs_more: [0; 3],
+            ht_peer_nss: 1,
             ht_sgi: true,
             ht_request_sgi: true,
             ht_request_sgi40: false,
+            ht_request_nss: 2,
             ht_ampdu: 0x1b,
             ht_capabilities: 0x002c,
             ht_request_coding: 0,
@@ -468,6 +474,7 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
             expected.extend_from_slice(&[0; 11]);
             expected.push(1);
             expected.extend_from_slice(&[0; 10]);
+            expected[5..5 + usize::from(m.data.as_ref().unwrap().ht_request_nss)].fill(255);
             if !frame.windows(expected.len()).any(|ie| ie == expected) {
                 return Err(BmiError::BadResponse);
             }
@@ -517,7 +524,15 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
         };
         let f = m.data.as_ref().unwrap();
         let ht = f.ht_expected;
-        let ht_rates: Vec<u8> = (0..8).filter(|n| f.ht_mcs & (1 << n) != 0).collect();
+        let masks = [
+            f.ht_mcs,
+            f.ht_mcs_more[0],
+            f.ht_mcs_more[1],
+            f.ht_mcs_more[2],
+        ];
+        let ht_rates: Vec<u8> = (0..32)
+            .filter(|n| masks[usize::from(*n / 8)] & (1 << (n % 8)) != 0)
+            .collect();
         let size = size
             + if ht && dialect == Dialect::Tlv {
                 ht_rates.len().next_multiple_of(4)
@@ -541,6 +556,8 @@ pub(super) async fn control(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiE
                         0x0200_0000 | if v.width == 2 { 0x0400_0000 } else { 0 }
                     }))
             || word(at + 24) != (if secured { 0x11 } else { 1 })
+            || word(at + if dialect == Dialect::Tlv { 48 } else { 320 })
+                != if ht { f.ht_peer_nss } else { 1 }
         {
             return Err(BmiError::BadResponse);
         }

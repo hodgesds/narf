@@ -552,6 +552,9 @@ pub(super) struct Runtime<T> {
     features: u64,
     pub caps: Option<Capabilities>,
     pub ready: Option<Ready>,
+    /// Selected from actual SERVICE_READY chains and the submitted INIT's
+    /// resource masks; not yet a runtime PDEV chainmask submission receipt.
+    pub initialized_chain_mask: Option<u8>,
     early_htt: VecDeque<Vec<u8>>,
     failed: bool,
 }
@@ -567,6 +570,7 @@ impl<T: Hif + HostMemory> Runtime<T> {
             features,
             caps: None,
             ready: None,
+            initialized_chain_mask: None,
             early_htt: VecDeque::new(),
             failed: false,
         }
@@ -612,6 +616,17 @@ impl<T: Hif + HostMemory> Runtime<T> {
         let body = self.event(self.dialect.service_event()).await?;
         let service = service_ready(self.dialect, &body)?;
         let config = resources(self.dialect, self.hardware, &service.caps, self.features)?;
+        let chain_at = match self.dialect {
+            Dialect::Main | Dialect::Tlv => 7,
+            Dialect::TenOne | Dialect::TenTwo | Dialect::TenTwoFour => 5,
+            Dialect::TenFour => 8,
+        };
+        let initialized_chain_mask = ((1u32 << service.caps.rf_chains) - 1)
+            & config.words[chain_at]
+            & config.words[chain_at + 1];
+        if !matches!(initialized_chain_mask, 1 | 3 | 7 | 15) {
+            return Err(Error::Unsupported);
+        }
         let plans = memory_plans(&service.requests, &config)?;
         let chunks = self.htc.transport.retain_wmi_memory(&plans)?;
         if chunks.len() != plans.len()
@@ -630,6 +645,7 @@ impl<T: Hif + HostMemory> Runtime<T> {
         self.htc.send_wmi(&command).await?;
         let ready = ready(self.dialect, &self.event(self.dialect.ready_event()).await?)?;
         self.ready = Some(ready);
+        self.initialized_chain_mask = Some(initialized_chain_mask as u8);
         self.failed = false;
         Ok(ready)
     }

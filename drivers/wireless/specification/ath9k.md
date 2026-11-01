@@ -7,7 +7,10 @@
 > calibration, RF and DMA
 > acceptance remains pending. Wider bandwidths and other chips are separate.
 > The channel1–13 cold-generation continuation (§3.5) is source-complete; its
-> six new native cases and combined release validation have not run.
+> six new native cases have not run. Its coordinated seven-package release
+> Clippy/module checks passed before the separate full20/40 draft.
+> The distinct measured full20/40/SGI40 continuation (§3.6) is source-complete
+> with another six native cases written; release/native validation is pending.
 > The additional bounded two-MPDU sender BA/A-MPDU continuation below is
 > implemented with ten new native smokes passing the coordinated validation
 > on both architectures. AR2427 (`168c:002c`, AR9285 silicon with HT bonded
@@ -620,6 +623,78 @@ fresh discovery, multi-channel active/passive scan and RF restore, stale
 owner rejection and wedged DMA/policy preflight. These cases are written,
 not executed. They supply no physical EEPROM/RF/interoperability acceptance.
 
+### 3.6 Optional measured full20/40 and directional SGI40
+
+`Ath9k::ht40_qualification_request(secondary)` exposes factual identity, MAC
+and external filename for one exact primary/secondary pair. It requires the
+actual current nominal20 calibration and H1/2 grant, complete EEPROM,
+AR9285 revision2, chain1/1 and both HT disable flags clear. AR2427 stays
+legacy-only. `BasebandPrepared::width_mhz()` and `secondary_channel()` report
+actual typed preparation; `reference_frequency` remains the primary, while
+the RF synth/detector/delta-slope/spur center is primary±10MHz. Neither a
+request nor prepared registers are RF permission.
+
+The signed `N85H` v3 record is a distinct full20/40 static program. It binds
+the preceding H1/2 identity and complete payload, exact board image, primary,
+secondary/direction, actual primary/extension/center power lookup chain and
+all ten installed registers, actual source algorithms, directional SGI40,
+full-program peaks and a signer-supplied expected fresh40 calibration digest.
+No v1/v2 recipe, filename, field meaning or20-only permission is reinterpreted.
+The exact384-byte body and its B/T/Q3 children are specified in
+[ar9285-ht40.md](ar9285-ht40.md). No board measurements or signed assets are
+provided.
+
+A current wide AP offer triggers H3 preflight before retirement or40
+calibration. The entire occupied40MHz span and every overlapping host limit
+must admit the fixed nominal budget and measured antenna/peak bounds. The
+old-generation DMA proof, reset and identical factory re-read precede40 INI
+column3, source modal40 settling, joined extension CCA, real synth/slope/spur,
+RF-center detector table, primary20 and extension legacy CTLs plus RF-center
+HT40 target/CTL and EEPROM PDADC compensation. All stable writes read back.
+Live40 calibration uses the source40 carrier-leakage branch, PA, both
+control/extension NF planes, actual even/odd ADC gain/DC and IQ. The actual
+receipt must match the signed expected digest before Native/Packet allocation
+and publication. Current qualification encloses each async calibration poll.
+
+Missing/invalid H3 retains the preceding20 profile and its admission rules.
+A failed or mismatching40 preparation/calibration cannot publish40. Provided
+old DMA is reclaimable and current20 policy remains valid, the retained
+control worker fully resets and calibrates a new real20 generation. A peer's
+successful association response that narrows to20 likewise closes the40
+owner before M2, keys, BA or DATA, performs a real20 reset/calibration, then
+fresh directed discovery and a forced20 association. It never substitutes a
+host width flag for hardware programming or loops back into40. Failed DMA
+proof, PCI/source loss or invalid fallback policy leaves terminal ownership.
+Ordinary recovery and resume deliberately return to actual20 at the same
+primary; a later qualified join may select40 again.
+
+Native first-series TXD width/GI bits and duration use the actual negotiated
+mode, including one-stream40 NDBPS and Linux's rounded3.6µs symbol formula.
+The two-MPDU owner uses the same width/GI for padding density, airtime limits
+and native aggregate duration. Management/ACK/BAR remain the supported20
+control program. RX width/GI/STBC are checked before original CCMP/PN,
+reordering or delivery: SGI20, wide frames on a20 owner, and unqualified RX
+SGI40 are dropped. Later source/peer/readback loss closes the owner; native
+RF mode, synth, ten power registers and ADC/IQ remain current at actual
+DMA/payload/capture/copy boundaries. Full40 recipient BA, sender BA and QoS
+require distinct B/T/Q3 records bound to the complete H3 body and40 span.
+
+The existing cold-generation interface-name, association/key/BA/capture loss
+rules remain. Scans while associated are Busy. Unassociated off-channel
+scans may return a fresh20 generation at the original primary; they do not
+promise to restore40 width. Successful joins publish only the actual
+successor's link and port. Public HT capability metadata requires a current
+HT source; the actual Association Request carries the selected width and
+directional GI capabilities.
+
+Six new native cases in `interface_ht40_tests.rs` exercise real reset/PHY/
+calibration/MAC/Packet/Radio/Device paths, both extension directions, Open and
+WPA2 kernel DHCP/IP, all8 MCS/GI modes and two actual DMA maps/tail receipts,
+peer20 and bad-receipt real fallback before M2/DATA, full-span policy, power
+lookup-center separation, signed/unknown/ignored-write rejection, directional
+RX GI, cancellation and revocation after actual copy. These cases are written,
+not executed. No physical RF or interoperability result is claimed.
+
 ## 4. Invariants
 
 - PCI parking is verified by command-register readback before BAR sizing: BME
@@ -747,13 +822,11 @@ rows and the tree facts that keep each open:
   primary channels1–13/full-rate20 in §3.5. Release/native validation is
   pending; Japan CCK-only channel14 remains unadvertised. The cold reset
   replaces the netdev generation/name and drops keys, BA and association.
-- `ht40`, `sgi40`: Linux `common-init.c::ath9k_cmn_setup_ht_cap` advertises
-  `SUP_WIDTH_20_40 | SGI_40` for AR9285, but HT40 needs a secondary channel
-  (rejected by `ht::response` and `Profile::observe`), the extension
-  channel/`AR_PHY_TURBO` dynamic 20/40 programming, HT40 CTL/target-power
-  planning (`phy/rates.rs` plans only CCK/OFDM/HT20) and a distinct measured
-  full20/40 program beyond the channel-bound v2 records; SGI40 depends on
-  HT40 (`N85H` byte57 fixes GI0).
+- `ht40`, `sgi40` are source-complete for the exact measured AR9285
+  revision2 full20/40 program in §3.6. Version3 is distinct from every
+  accepted20-only v1/v2 contract; actual fresh40 calibration and real20
+  fallback before keys/DATA are mandatory. Release/native and physical
+  acceptance are pending.
 - `factory_profile_selection`: the production owner accepts only the AR9285
   `eeprom_4k.c` 376-byte map, version 14.1+, chain masks 1/1 and the
   admitted channel1–13/full-rate20 plan (`identity.rs::decode_identity`,

@@ -82,9 +82,10 @@ The supported software profile is a single station with Open/WPA2-PSK or
 WPA3-SAE security, 2.4/5 GHz, and legacy/HT/VHT operation up to 80 MHz.
 Gen2's separate §§3.17–3.19 profiles implement legacy20 and WMM/HT20/SISO
 Open/WPA2 station operation with distinct emitting-program qualifications.
-Sc HE20/40/80 is §3.49; the qualified Gen2 continuation is §3.44. AP mode,
-6 GHz and EHT still require separate native implementations; non-WoWLAN
-system suspend/resume is §3.29. Those remaining native paths are separate
+Sc HE20/40/80 is §3.49; the qualified Gen2 continuation is §3.44. Native
+6GHz/EHT continuations are §§3.63–3.67 (source implemented, validation
+pending). AP mode and multiple active MLD links remain separate;
+non-WoWLAN system suspend/resume is §3.29. Those native paths are separate
 from physical acceptance of the enabled software profiles.
 
 ## 3. Public interface and stage progression
@@ -2152,14 +2153,15 @@ describe the remaining native paths.
   per-link key delivery. Multiple active PHY/LINK/STA/queue, power, PN/reorder
   and public-control owners remain continuations. MLO,320MHz and EHT do
   not apply to AX200/AX201 hardware.
-- **six_ghz (open; implemented passive/wide station path).** §3.63 implements
-  explicit NVM/UMAC/RFH/cache/policy band identity and a shared6GHz
-  JoinPlan for AP20/STA20 SAE-H2E/PMF on admitted Sc/API89/Bz profiles,
-  including actual AP power constraints and host/NVM/MCC type limits.
-  Coordinated compilation/native/release acceptance is still pending.
-  §3.65 extends actual native spans through HE160/EHT320. Active/RNR
-  and periodic6GHz, general response refinement and in-place TPE replacement
-  remain continuations.
+- **six_ghz (implemented; validation pending).** §§3.63–3.67 implement
+  explicit actual NVM/UMAC/RFH/cache/policy band identity, v4/v5 channel
+  tails, active PSC/RNR and native PSC/passive periodic discovery, shared
+  SAE-H2E/PMF station planning through HE160/EHT320, response refinement
+  within original offers, and live TPE replacement through fresh native
+  AP-constraint receipts. AP power-type or PHY/channel changes require
+  reassociation, following Linux; they grant no in-place mode-switch
+  authority. Current host/NVM/MCC, source and terminal ownership apply.
+  Compilation/native/release acceptance of the completed source is pending.
   AX200/AX201 has no6GHz hardware.
 - **gen2_sae_ext_key, gen2_wpa2_pmf.** §3.45 implements the native
   continuations: negotiated group19 SAE-EXT-KEY AKM24, and WPA2 PMF with
@@ -3749,10 +3751,10 @@ The initial6GHz station owner is a separate explicit-band path on the
 admitted Sc/API89/Bz command profiles. `native_band::{Band,Channel}` keeps
 NVM indexes, UMAC channel records, RFH copies, candidate-cache entries,
 CONNECT/roam frequencies and current station publication proofs distinct
-from same-number2.4/5GHz channels. NVMv4/v5 retain the59 valid6GHz tail
-entries1+4k through233 separately from the first51 entries; v5's UNII-9
-237..253 entries remain unavailable under the current shared channel
-contract. Raw valid/VLP/AFC facts are retained independently of PCI/SKU
+from same-number2.4/5GHz channels. The initial baseline retained59 valid
+6GHz tail entries1+4k through233 separately from the first51 entries.
+§3.67 extends the actual v5 tail through253 while v4 retains its original
+extent. Raw valid/VLP/AFC facts are retained independently of PCI/SKU
 inference. MLD consumes actual copied `mac_phy_band[7:6]`; MVM additionally
 requires retained TLV API59 (`BAND_IN_RX_DATA`) before any6GHz I/O. A6GHz
 copy with a legacy band cannot acquire candidate, PN, BA or reorder state.
@@ -3763,8 +3765,9 @@ authoritative; a numeric-only selector retains its legacy interpretation.
 The6GHz job stays passive, including non-PSC channels, uses native band2,
 non-PSC FORCE_PASSIVE and PSC_NO_FILTER records, and source-qualified fixed
 antenna flags. An active request can still probe its authorized legacy job
-while its6GHz job stays passive. RNR/colocated active6GHz, periodic6GHz and
-wider native6GHz remain open continuations.
+while its6GHz job stays passive in this initial baseline. §3.65 implements
+wider native6GHz, and §3.67 implements source-qualified PSC/RNR active
+and PSC/passive periodic6GHz discovery.
 
 The initial join requires an AP20/STA20 HE span, WMM, actual NVM/HE/rate
 facts and AP_TX_POWER_CONSTRAINTS_CMD v1. It calls the existing shared
@@ -3799,9 +3802,10 @@ channels, independently of their low numeric values.
 
 This baseline confirms the exact offered HE/6GHz/TPE response and current
 beacon facts; a changed operating/power profile closes TX and requires
-reassociation through a new native power receipt. General response
-refinement and in-place TPE replacement are later continuations. The full
-`six_ghz` feature row therefore remains open.
+reassociation through a new native power receipt in this initial baseline.
+§3.67 supersedes the exact-response/TPE restriction with bounded response
+refinement and current native-receipt TPE replacement; power-type and actual
+PHY/channel changes still require reassociation.
 
 Six `drivers/wireless/iwlwifi/six_ghz` cases cover native Sc/API89/Bz
 SAE24-H2E/PMF/keys/DHCP for LPI/SP/VLP; v5 tail bounds and two terminal jobs
@@ -4048,3 +4052,102 @@ coordinated compilation/native/release gates are pending. This is a single
 associated link, with no EML or extra-link request. Multiple simultaneously
 active PHY/LINK/STA/queue owners, per-link power/key/PN/reorder lifetimes,
 link switching and public multiple-link control remain open in `mlo`.
+
+
+### 3.67 Complete native6GHz discovery, refinement and live TPE (validation pending)
+
+**Actual channel and source facts.** NVMv4 has110 records, including59
+6GHz entries through233. NVMv5 has115 records, including64 through253;
+its response count and every raw VALID/VLP/AFC/width bit remain authoritative.
+The native bitmap retains bit63 without extending a shorter response. Shared
+channel/frequency, HE/EHT geometry and RNR/scan planning now use Linux's
+253/7215MHz generic bound. This creates no regulatory or hardware grant:
+actual NVM, correlated MCC and every overlapping signed-host rule must
+permit every occupied20MHz constituent and the selected AP client type.
+An older v4 profile, shorter v5 count or host rule ending7125MHz cannot
+acquire the UNII-9 tail. Channel2/5935MHz has no native NVM entry here.
+MVM still requires its actual band-in-RX API59 before6GHz I/O. Hidden6GHz
+probe support is the separate TLV capability59, not that equal-numbered API;
+TPC and fixed-antenna probe behavior retain their actual capabilities too.
+Restart metadata matching includes these used source facts.
+
+**Regular and periodic discovery.** Regular scans retain distinct terminal
+legacy/6GHz UMAC14..18 jobs. Copied, CRC/band-qualified legacy beacons feed
+shared RNR planning before the requested SSID result filter; they confer no
+RF authority. The native6GHz job carries the actual eight-short-SSID and
+sixteen-BSSID tables, per-channel short/BSSID maps, PSC-no-listen and
+unsolicited-response facts, versioned band/PSD fields and source-qualified
+hidden direct SSIDs. The6GHz probe segment contains OFDM, actual local
+HE/HE6-band and admitted EHT capabilities; unsupported legacy PHY overrides
+and malformed/oversized extra IEs are refused. Before any active probe,
+actual NVM HE/VALID, current MCC ACTIVE/non-radar and signed-host permission
+are intersected and a native SET_DEVICE power ceiling is acknowledged.
+PSC channels without targets retain listen behavior; non-PSC targetless or
+unauthorized channels remain passive. RNR PSD-128 means unknown in that
+scan field, independently of occupied TPE PSD-128 prohibition.
+
+Periodic operation follows Linux's literal native contract: remove non-PSC
+6GHz channels, keep surviving6GHz channels passive, and allow probes only
+on separately permitted legacy records. The retained UID/request/caller,
+source/policy and terminal-abort owner now stores typed bands, including
+associated MLD home-link operation. Copied BSS/cache/publication entries
+keep frequency identity, so same-BSSID/channel-number2.4/6GHz results never
+replace each other. A6GHz copy needs the actual retained band-in-RX source;
+a numeric alias cannot become a candidate or data/key/reorder owner. Every
+stop, dropped caller, stale epoch and uncertain DMA receipt uses the
+existing autonomous-scan retirement path.
+
+**Association refinement.** Original beacon HE/EHT/AP-type facts and latest
+beacon TPE are retained separately from the station's response-refined
+plan. Responses must supply actual HE capability/operation and may narrow
+HE/EHT width and directional maps within the original offer. Optional
+missing HE6-band/EHT-operation elements inherit the retained beacon;
+original mandatory selectors and single-link MLD/EHT requirements remain.
+Native HE TX maps intersect each matching original AP RX width slot, and
+STBC/LDPC, SMPS, MPDU spacing and aggregation cannot gain an unoffered
+permission. EHT keeps the original directional RX-map bound too. The final
+native PHY/LINK/STA/MAC/TLC and full constituent NVM/MCC/host span are
+revalidated before keys/port publication. Linux does not repeat TPE in an
+association response: retained beacon TPE is rearranged for the actual new
+span, and a fresh AP_TX_POWER_CONSTRAINTS receipt precedes its use.
+
+**Live replacement and publication.** A same-operation beacon can replace
+TPE, including a missing TPE's default127 limits. Requested, applied and
+inflight AP constraints are distinct. No changed constraint becomes applied
+until the exact native command receipt is empty/successful and the current
+source/policy fence is invoked. Newer queued constraints survive a held
+receipt and are resolved again before TX. A dropped owner leaves uncertain
+receipt state sticky; source/policy loss, invalid/prohibiting PSD, changed
+AP type/PHY/channel or an ambiguous receipt stops the transport and retains
+uncertain DMA. Changed AP type requires reassociation, matching Linux's
+association/reset ownership rather than inventing live type-switch rights.
+
+Both actual descriptor/doorbell publication boundaries inspect the complete
+copied notification queue. A valid pending TPE returns an internal retry
+before publication; ordinary and A-MSDU IPC frames remain owned, and retained
+maintenance resolves the new receipt. Async TX also resolves a new receipt
+when its native queue-credit poll copied the changed beacon. Queued changes
+beyond Device's64-record processing budget cannot escape either boundary.
+There is no hot-path firmware instrumentation or implicit receive/key epoch
+refresh.
+
+**Written evidence.** Five additional native/source cases cover literal
+UMAC14..18 tables/probe segments and API59-versus-capability59 negatives;
+real PSC and copied-RNR discovery plus host/MCC/NVM probe refusals; mixed
+periodic typed results and native UID stop on idle/associated owners;
+Sc/API89/Bz responses omitting TPE; live LPI/SP/VLP tightening, relaxation
+and removal; and actual EHT320-to80 response narrowing with retained N/K TPE,
+missing optional response elements, current power receipts and protected DHCP.
+The existing20/320 cases now require no DATA before a held new TPE receipt
+and actual ordinary/aggregate/credit-wait DATA afterward; source loss,
+current MCC withdrawal, prohibited PSD and dropped/uncertain native owners
+remain negative assertions. Existing NVM bounds prove v4 versus v5 count,
+actual bit63 and same-number band identities. All registrations are written;
+coordinated release compilation/native/regression acceptance is pending.
+
+Primary source pin: Linux7.3-rc7 `iwl-nvm-parse.{c,h}`,
+`mld/{scan,power}.c`, `mvm/scan.c`, `fw/{file.h,api/{scan,power}.h}`,
+`net/wireless/{util,scan}.c` and `net/mac80211/{mlme,util}.c`; exact hashes
+and contracts are retained in the immutable implementation evidence.
+The admitted single-link6GHz source contract is complete independently of
+the separately open multiple-active-link `mlo` feature.

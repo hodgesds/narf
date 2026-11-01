@@ -345,6 +345,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         versions: Vec::new(),
         band_in_rx: false,
         scan_fixed_antenna: false,
+        scan_six_capabilities: 0,
         six_tx_profile: None,
         mld_link: None,
         eht_source: None,
@@ -410,6 +411,8 @@ pub(in crate::iwlwifi) fn firmware_profile(
     hardware.versions = parsed.api.commands.to_vec();
     hardware.band_in_rx = parsed.api.api_changes[1] & (1 << 27) != 0;
     hardware.scan_fixed_antenna = parsed.api.has_capability(111);
+    hardware.scan_six_capabilities =
+        u8::from(parsed.api.has_capability(59)) | (u8::from(parsed.api.has_capability(10)) << 1);
     // A metadata inventory alone is not a new ALIVE/PNVM source proof.
     hardware.eht_source = None;
     hardware.shared_memory = smem::State::new(parsed);

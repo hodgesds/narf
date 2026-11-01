@@ -10,12 +10,12 @@ use narf_wireless::reg::{PowerType6Ghz, RegFlags, RegRule, RegulatoryDomain};
 
 const PASSWORD: &[u8] = b"native-six-H2E-PMF-password";
 #[derive(Clone, Copy)]
-enum Native {
+pub(super) enum Native {
     Sc,
     Mvm,
     Bz,
 }
-fn model() -> SixModel {
+pub(super) fn model() -> SixModel {
     SixModel {
         channel: 5,
         regulatory: 0,
@@ -81,7 +81,7 @@ pub(super) fn complete_ap_frame(frame: &mut Vec<u8>, model: SixModel) -> R {
     Ok(())
 }
 #[inline(never)]
-fn setup(native: Native, six: SixModel, fault: Fault) -> R<Box<Guard>> {
+pub(super) fn setup(native: Native, six: SixModel, fault: Fault) -> R<Box<Guard>> {
     setup_with_tx(native, six, fault, None)
 }
 #[inline(never)]
@@ -159,7 +159,7 @@ fn discover(guard: &Guard, six: SixModel) -> R {
         "6GHz explicit copied RFH identity",
     )
 }
-fn join(guard: &Guard, six: SixModel) -> R {
+pub(super) fn join(guard: &Guard, six: SixModel) -> R {
     discover(guard, six)?;
     run(
         guard
@@ -170,7 +170,7 @@ fn join(guard: &Guard, six: SixModel) -> R {
     .map_err(|_| "6GHz actual SAE-H2E/PMF station association")?;
     carrier(guard.device(), true)
 }
-fn close(guard: &Guard) -> R {
+pub(super) fn close(guard: &Guard) -> R {
     run(guard.device().disassociate(), service)?.map_err(|_| "6GHz native ordered teardown")
 }
 #[inline(never)]
@@ -214,6 +214,21 @@ fn cdb_fifo_bounds() -> R {
     close(&guard)
 }
 
+pub(super) fn release_power() -> R {
+    let mut slot = HARNESS.lock();
+    let wire = &mut slot.as_mut().unwrap().1;
+    let (cmd, group, sequence) = wire
+        .held
+        .take()
+        .ok_or("6GHz fresh AP power receipt missing")?;
+    require(
+        (group, cmd) == (4, 0xc),
+        "6GHz another command held the AP power owner",
+    )?;
+    wire.fault = Fault::None;
+    wire.firmware.inject(cmd, group, sequence, &[]);
+    Ok(())
+}
 #[inline(never)]
 fn queued_tpe_blocks_native_data(batch: bool) -> R {
     let six = model();
@@ -247,29 +262,49 @@ fn queued_tpe_blocks_native_data(batch: bool) -> R {
             .inject_packed(&vec![(0xab, 5, 0x8000, &[][..]); 64]);
         let mut stricter = six;
         stricter.tpe = 10;
+        wire.six = Some(stricter);
+        wire.fault = Fault::HoldSixPower;
         let mut beacon = wire.ap.beacon();
         complete_ap_frame(&mut beacon, stricter)?;
         wire.mpdu(&beacon, false);
         (wire.data.len(), wire.aggregates.len())
     };
-    drain();
-    let state = guard
-        .device()
-        .state
-        .try_lock()
-        .ok_or("6GHz backlog publication owner")?;
+    for _ in 0..256 {
+        service()?;
+        drain();
+        if HARNESS.lock().as_ref().unwrap().1.held.is_some() {
+            break;
+        }
+    }
+    {
+        let slot = HARNESS.lock();
+        let wire = &slot.as_ref().unwrap().1;
+        require(
+            wire.held.is_some()
+                && wire.data.len() == before_data
+                && wire.aggregates.len() == before_aggregate,
+            "6GHz queued TPE did not retain DATA until its new native receipt",
+        )?;
+    }
+    release_power()?;
+    for _ in 0..256 {
+        service()?;
+        drain();
+        if HARNESS.lock().as_ref().unwrap().1.data.len() > before_data {
+            break;
+        }
+    }
+    carrier(guard.device(), true)?;
+    let resumed = {
+        let slot = HARNESS.lock();
+        let wire = &slot.as_ref().unwrap().1;
+        wire.data.len() > before_data && (!batch || wire.aggregates.len() > before_aggregate)
+    };
     require(
-        state.hardware.is_failed() && state.needs_reset && !state.hardware.notifications.is_empty(),
-        "6GHz TX gate missed a stricter native beacon beyond the receive budget",
+        resumed,
+        "6GHz native DATA did not resume after current tighter TPE receipt",
     )?;
-    drop(state);
-    carrier(guard.device(), false)?;
-    let slot = HARNESS.lock();
-    let wire = &slot.as_ref().unwrap().1;
-    require(
-        wire.data.len() == before_data && wire.aggregates.len() == before_aggregate,
-        "6GHz queued stricter TPE allowed ordinary or aggregate native DATA",
-    )
+    close(&guard)
 }
 
 #[inline(never)]
@@ -297,26 +332,45 @@ fn credit_poll_copies_stricter_tpe_before_publication() -> R {
             .0;
         let mut stricter = six;
         stricter.tpe = 10;
+        wire.six = Some(stricter);
+        wire.fault = Fault::HoldSixPower;
         let mut beacon = wire.ap.beacon();
         complete_ap_frame(&mut beacon, stricter)?;
         wire.mpdu(&beacon, false);
         (queue, wire.data.len())
     };
-    // wait_tx_space now copies that previously unseen DMA descriptor. The
-    // publication must check its new snapshot after this actual credit poll.
-    require(
-        run(state.hardware.transmit(queue, &frame, 26, None), service)?.is_err()
-            && state.hardware.is_failed(),
-        "6GHz native credit poll bypassed the final AP power gate",
-    )?;
-    drop(state);
-    // The tail-expression temporary otherwise keeps HARNESS locked while
-    // Guard::drop reacquires it to destroy the native model (edition2021).
+    // wait_tx_space copies that previously unseen DMA descriptor. Its
+    // still-unpublished frame must wait for the fresh AP constraint receipt.
+    let mut future = Box::pin(state.hardware.transmit(queue, &frame, 26, None));
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..256 {
+        require(
+            future.as_mut().poll(&mut cx).is_pending(),
+            "6GHz credit-wait TPE receipt escaped",
+        )?;
+        service()?;
+        if HARNESS.lock().as_ref().unwrap().1.held.is_some() {
+            break;
+        }
+    }
     let unpublished = HARNESS.lock().as_ref().unwrap().1.data.len() == before;
     require(
         unpublished,
-        "6GHz credit poll published DATA using the caller's stale AP power view",
-    )
+        "6GHz credit poll published DATA under a stale AP TPE",
+    )?;
+    release_power()?;
+    run(future, service)??;
+    require(
+        !state.hardware.is_failed(),
+        "6GHz valid credit-wait TPE update failed transport",
+    )?;
+    drop(state);
+    let resumed = HARNESS.lock().as_ref().unwrap().1.data.len() == before + 1;
+    require(
+        resumed,
+        "6GHz credit-wait DATA did not resume after its native receipt",
+    )?;
+    close(&guard)
 }
 fn smoke_iwl_six_ghz_native_sc_mvm_bz_sae24_pmf_power_and_dhcp() -> TestResult {
     check(|| {
@@ -406,14 +460,32 @@ fn smoke_iwl_six_ghz_nvm_tail_passive_jobs_and_legacy_channel_alias() -> TestRes
         let nvm = super::super::super::station_api::Nvm::parse(5, &raw)?;
         require(
             nvm.channels.len() == 51
-                && nvm.six_channels.len() == 59
+                && nvm.six_channels.len() == 64
                 && Channel::six(233).unwrap().index() == Some(109)
-                && Channel::six(237).is_none()
+                && Channel::six(253).unwrap().index() == Some(114)
+                && Channel::six(255).is_none()
                 && Channel::from_frequency(5, 2432).is_some_and(|ch| ch.band == Band::Two)
                 && Channel::from_frequency(5, 5975).is_some_and(|ch| ch.band == Band::Six)
                 && Channel::from_frequency(149, 5745).is_some_and(|ch| ch.band == Band::Five)
                 && Channel::from_frequency(149, 6695).is_some_and(|ch| ch.band == Band::Six),
             "6GHz NVM tail or same-number channel/frequency alias",
+        )?;
+        require(
+            nvm.phy.six_channels[0] == u64::MAX,
+            "NVMv5 discarded the high valid bitmap bit",
+        )?;
+        raw[24..28].copy_from_slice(&110u32.to_le_bytes());
+        let bounded = super::super::super::station_api::Nvm::parse(5, &raw)?;
+        require(
+            bounded.six_channels.len() == 59
+                && bounded.six_channels.iter().all(|ch| ch.number <= 233),
+            "NVMv5 inferred UNII9 permission beyond actual channel count",
+        )?;
+        let legacy = super::super::super::station_api::Nvm::parse(4, &raw[..28 + 110 * 4])?;
+        require(
+            legacy.six_channels.len() == 59
+                && super::super::super::station_api::Nvm::parse(4, &raw).is_err(),
+            "NVMv4 accepted a fabricated v5 tail extent",
         )?;
         let mut six = model();
         six.alias = true;
@@ -484,7 +556,7 @@ kernel_test_in!(
     smoke_iwl_six_ghz_nvm_tail_passive_jobs_and_legacy_channel_alias
 );
 
-fn without(mut bytes: &[u8], id: u8, extension: Option<u8>) -> Vec<u8> {
+pub(super) fn without(mut bytes: &[u8], id: u8, extension: Option<u8>) -> Vec<u8> {
     let mut out = Vec::new();
     while !bytes.is_empty() {
         let len = usize::from(bytes[1]);
@@ -791,6 +863,7 @@ fn smoke_iwl_six_ghz_held_ap_power_tightening_and_dropped_policy_owner_close_tx(
                 let wire = &mut slot.as_mut().unwrap().1;
                 let mut stricter = six;
                 stricter.tpe = 10;
+                wire.six = Some(stricter);
                 let mut beacon = wire.ap.beacon();
                 complete_ap_frame(&mut beacon, stricter)?;
                 wire.mpdu(&beacon, false);
@@ -807,10 +880,23 @@ fn smoke_iwl_six_ghz_held_ap_power_tightening_and_dropped_policy_owner_close_tx(
                 wire.firmware.inject(cmd, group, sequence, &[]);
             }
             if !drop_waiter {
+                run(future.take().unwrap(), service)?
+                    .map_err(|_| "6GHz initial held TPE did not refine before first TX")?;
+                carrier(guard.device(), true)?;
+                let tightened = {
+                    let slot = HARNESS.lock();
+                    let wire = &slot.as_ref().unwrap().1;
+                    wire.commands
+                        .iter()
+                        .filter(|(g, c, _)| (*g, *c) == (4, 0xc))
+                        .any(|(_, _, b)| b[4] == 10)
+                };
                 require(
-                    run(future.take().unwrap(), service)?.is_err(),
-                    "6GHz tightened AP TPE retained old emission",
+                    tightened,
+                    "6GHz initial receipt failed to replace queued tighter TPE",
                 )?;
+                close(&guard)?;
+                continue;
             } else {
                 for _ in 0..32 {
                     service()?;
@@ -844,3 +930,6 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/six_ghz",
     smoke_iwl_six_ghz_held_ap_power_tightening_and_dropped_policy_owner_close_tx
 );
+
+#[path = "six_ghz_completion_tests.rs"]
+mod completion;

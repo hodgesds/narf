@@ -30,7 +30,8 @@ impl Wake for DriverWake {
     }
 }
 struct Work {
-    frequency: u16,
+    geometry: channel_width::Geometry,
+    source: Option<[u8; 32]>,
     generation: u32,
     result: Slot,
     future: Transition,
@@ -51,10 +52,25 @@ pub(super) fn frequency(channel: u32) -> Result<u16, Error> {
 }
 pub(super) fn request(frequency: u16, generation: u32) -> Result<Transition, Error> {
     channel(frequency)?;
+    request_geometry(
+        channel_width::Geometry::from_frequency(frequency).map_err(|_| Error::Profile)?,
+        generation,
+        None,
+    )
+}
+pub(super) fn request_geometry(
+    geometry: channel_width::Geometry,
+    generation: u32,
+    wide: Option<Arc<ht40::Grant>>,
+) -> Result<Transition, Error> {
+    let source = wide.as_ref().map(|grant| grant.ba_identity().1);
+    if geometry.is_wide() != wide.is_some() {
+        return Err(Error::Profile);
+    }
     let result = {
         let mut slot = WORK.try_lock().ok_or(Error::Busy)?;
         if let Some(work) = slot.as_ref() {
-            if work.frequency != frequency || work.generation != generation {
+            if work.geometry != geometry || work.source != source || work.generation != generation {
                 return Err(Error::Busy);
             }
             work.result.clone()
@@ -66,12 +82,13 @@ pub(super) fn request(frequency: u16, generation: u32) -> Result<Transition, Err
             }));
             let wake = Arc::new(DriverWake(IrqSafeSpinLock::new(None)));
             *slot = Some(Work {
-                frequency,
+                geometry,
+                source,
                 generation,
                 result: result.clone(),
                 wake: wake.clone(),
                 future: Box::pin(async move {
-                    super::reset_owner_at(&owner, Some(frequency), Some(generation))
+                    super::reset_owner_geometry(&owner, Some(geometry), Some(generation), wide)
                         .await
                         .map_err(|e| match e {
                             BringUpError::Policy => Error::Profile,
@@ -80,7 +97,9 @@ pub(super) fn request(frequency: u16, generation: u32) -> Result<Transition, Err
                         })?;
                     let device = interface::current().ok_or(Error::State)?;
                     let correct = device.radio.try_lock().is_some_and(|r| {
-                        r.frequency_mhz() == frequency && r.phase() == station::Phase::Passive
+                        r.frequency_mhz() == geometry.control()
+                            && (r.geometry() == geometry || r.geometry() == geometry.twenty())
+                            && r.phase() == station::Phase::Passive
                     });
                     if !correct {
                         return Err(Error::State);

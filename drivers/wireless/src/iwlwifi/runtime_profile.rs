@@ -98,6 +98,12 @@ impl Hardware {
     pub(in crate::iwlwifi) fn scan_fixed_antenna_supported(&self) -> bool {
         self.mld_station || self.scan_fixed_antenna
     }
+    pub(in crate::iwlwifi) fn scan_hidden_six_supported(&self) -> bool {
+        self.mld_station || self.scan_six_capabilities & 1 != 0
+    }
+    pub(in crate::iwlwifi) fn scan_tpc_supported(&self) -> bool {
+        self.mld_station || self.scan_six_capabilities & 2 != 0
+    }
     pub(in crate::iwlwifi) fn install_six_tx_profile(
         &mut self,
         profile: alloc::sync::Arc<super::super::six_ghz_station::Profile>,
@@ -108,18 +114,27 @@ impl Hardware {
     }
     pub(in crate::iwlwifi) fn check_six_tx_publication(&mut self) -> Result<(), &'static str> {
         let result = self
-            .six_tx_profile
+            .mld_link
             .as_ref()
-            .map_or(Ok(()), |profile| profile.check_pending(self))
+            .map_or(Ok(()), |mld| mld.check_pending(self))
             .and_then(|()| {
-                self.mld_link
+                self.six_tx_profile
                     .as_ref()
-                    .map_or(Ok(()), |mld| mld.check_pending(self))
+                    .map_or(Ok(()), |profile| profile.check_pending(self))
             });
-        if result.is_err() {
+        if result
+            .as_ref()
+            .is_err_and(|&reason| reason != super::super::six_ghz_station::UPDATE_REQUIRED)
+        {
             self.fail();
         }
         result
+    }
+    pub(in crate::iwlwifi) async fn service_six_power(&mut self) -> Result<(), &'static str> {
+        if let Some(profile) = self.six_tx_profile.clone() {
+            profile.apply_pending(self).await?;
+        }
+        Ok(())
     }
     pub(in crate::iwlwifi) fn install_mld_link(
         &mut self,

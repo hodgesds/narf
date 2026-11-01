@@ -133,6 +133,7 @@ struct Model {
     stall_init: bool,
     factory: u32,
     ht: Option<u32>,
+    rf_chains: Option<u32>,
 }
 impl Model {
     fn new(dialect: Dialect) -> Self {
@@ -152,6 +153,7 @@ impl Model {
             stall_init: false,
             factory: 0x64,
             ht: None,
+            rf_chains: None,
         }
     }
 }
@@ -186,6 +188,14 @@ impl Hif for Model {
                 self.rx.push_back((1, header(0, &[3, 0, 0, 3, 0, 1, 0, 1])));
             } else if bytes == [0, 0, 8, 0, 0, 1, 0, 0, 2, 0, 0, 1, 0, 32, 0, 0] {
                 let mut service = event_factory(self.dialect, false, self.factory);
+                if let Some(chains) = self.rf_chains {
+                    let at = match self.dialect {
+                        Dialect::Main | Dialect::TenFour => 4 + 84,
+                        Dialect::Tlv => 4 + 4 + 36,
+                        _ => 4 + 80,
+                    };
+                    u32at(&mut service, at, chains);
+                }
                 if let Some(ht) = self.ht {
                     // Literal SERVICE_READY WMI header + native fixed/TLV
                     // event offsets; exercise the production parser.

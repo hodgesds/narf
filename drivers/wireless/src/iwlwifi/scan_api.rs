@@ -35,6 +35,14 @@ pub(super) fn passive_channels(
     uid: u32,
     channels: &[super::native_band::Channel],
 ) -> Result<Vec<u8>, &'static str> {
+    base_channels(version, uid, channels, false)
+}
+fn base_channels(
+    version: u8,
+    uid: u32,
+    channels: &[super::native_band::Channel],
+    periodic: bool,
+) -> Result<Vec<u8>, &'static str> {
     let capacity = match version {
         14..=17 => 67,
         18 => 68,
@@ -44,16 +52,17 @@ pub(super) fn passive_channels(
         return Err("invalid scan channels");
     }
     let six = channels[0].band == super::native_band::Band::Six;
-    if channels
-        .iter()
-        .any(|channel| (channel.band == super::native_band::Band::Six) != six)
+    if !periodic
+        && channels
+            .iter()
+            .any(|channel| (channel.band == super::native_band::Band::Six) != six)
     {
         return Err("6GHz requires its own native scan job");
     }
     // uid/ooc(8), general(36), channel(4+8*N), periodic(12),
     // probe(532+4+20*34+8*4+16*6). See fw/api/scan.h.
-    let periodic = 48 + capacity * 8;
-    let mut out = vec![0; periodic + 12 + 1344];
+    let periodic_at = 48 + capacity * 8;
+    let mut out = vec![0; periodic_at + 12 + 1344];
     put32(&mut out, 0, uid);
     put32(&mut out, 4, 6);
     put16(&mut out, 8, (1 << 1) | (1 << 11)); // PASS_ALL | FORCE_PASSIVE
@@ -61,7 +70,7 @@ pub(super) fn passive_channels(
     put32(&mut out, 36, 6); // scan priority
     out[40..42].fill(110); // passive dwell per LMAC (TU)
     out[45] = channels.len() as u8;
-    if six {
+    if six && !periodic {
         out[44] = 1 << 6;
     } // 6G_PSC_NO_FILTER; no firmware SSID filter.
     for (i, &channel) in channels.iter().enumerate() {
@@ -69,7 +78,9 @@ pub(super) fn passive_channels(
         // Modern channel flags use PHY_BAND_24=1, PHY_BAND_5=0
         // (opposite the legacy scan v2 band's numbering).
         let band = channel.band as u8;
-        let flags = if six && channel.number % 16 != 5 {
+        let flags = if channel.band == super::native_band::Band::Six
+            && (periodic || channel.number % 16 != 5)
+        {
             1 << 26
         } else {
             0
@@ -81,12 +92,57 @@ pub(super) fn passive_channels(
         } else {
             // v5 moves band into flags and reuses that byte for PSD.
             put32(&mut out, start, (u32::from(band) << 30) | flags);
-            out[start + 5] = 127; // PSD reserved
+            // RNR/scan unknown is -128; TPE's no-limit127 is a distinct
+            // namespace. Preserve ordinary legacy bytes.
+            out[start + 5] = if channel.band == super::native_band::Band::Six {
+                128
+            } else {
+                127
+            };
         }
         out[start + 4] = channel.number;
         out[start + 6] = 1; // one iteration
     }
-    out[periodic + 2] = 1;
+    out[periodic_at + 2] = 1;
+    Ok(out)
+}
+
+/// Linux scheduled scans carry mixed typed bands but remove non-PSC6GHz
+/// channels and force every remaining6GHz channel passive. Only the actual
+/// legacy subset may own directed probe bits; no numeric6GHz alias is used.
+pub(super) fn periodic_channels(
+    version: u8,
+    uid: u32,
+    channels: &[super::native_band::Channel],
+    permitted: &[bool],
+    local: [u8; 6],
+    ssids: &[Vec<u8>],
+) -> Result<Vec<u8>, &'static str> {
+    if permitted.len() != channels.len() {
+        return Err("periodic native permissions differ from channels");
+    }
+    let mut out = base_channels(version, uid, channels, true)?;
+    let legacy: Vec<_> = channels
+        .iter()
+        .zip(permitted)
+        .filter(|(ch, _)| ch.band != super::native_band::Band::Six)
+        .collect();
+    if legacy.iter().any(|(_, allowed)| **allowed) {
+        let numbers: Vec<_> = legacy.iter().map(|(ch, _)| ch.number).collect();
+        let allowed: Vec<_> = legacy.iter().map(|(_, allowed)| **allowed).collect();
+        let probes = active(version, uid, &numbers, &allowed, local, ssids)?;
+        out[8..44].copy_from_slice(&probes[8..44]);
+        let at = 48 + if version == 18 { 68 * 8 } else { 67 * 8 } + 12;
+        out[at..].copy_from_slice(&probes[at..]);
+        let bitmap = (1u32 << ssids.len().max(1)) - 1;
+        for (i, (channel, &allowed)) in channels.iter().zip(permitted).enumerate() {
+            if allowed && channel.band != super::native_band::Band::Six {
+                let at = 48 + i * 8;
+                let flags = u32::from_le_bytes(out[at..at + 4].try_into().unwrap());
+                put32(&mut out, at, flags | bitmap);
+            }
+        }
+    }
     Ok(out)
 }
 

@@ -80,8 +80,8 @@ pub(super) fn peer_phy(
         .collect();
     let tlv = dialect == Dialect::Tlv;
     let vht = ht.and_then(|h| h.vht);
-    let ht_rates: Vec<u8> = (0..8)
-        .filter(|mcs| ht.is_some_and(|ht| ht.mcs & (1 << mcs) != 0))
+    let ht_rates: Vec<u8> = (0..32)
+        .filter(|mcs| ht.is_some_and(|ht| ht.mcs[usize::from(*mcs / 8)] & (1 << (mcs % 8)) != 0))
         .collect();
     let (command, size) = match dialect {
         Dialect::Main => (0x6005, 356),
@@ -135,7 +135,7 @@ pub(super) fn peer_phy(
         2
     }; // 11A/G/B
     if tlv {
-        wire::put(&mut out, at + 48, 1); // one spatial stream
+        wire::put(&mut out, at + 48, ht.map_or(1, |h| h.peer_nss()));
         wire::put(&mut out, at + 56, mode);
         wire::put(&mut out, at + 68, legacy.len() as u32);
         wire::put(&mut out, at + 72, ht_rates.len() as u32);
@@ -156,7 +156,7 @@ pub(super) fn peer_phy(
         out[at + 52..at + 52 + legacy.len()].copy_from_slice(&legacy);
         wire::put(&mut out, at + 184, ht_rates.len() as u32);
         out[at + 188..at + 188 + ht_rates.len()].copy_from_slice(&ht_rates);
-        wire::put(&mut out, at + 320, 1);
+        wire::put(&mut out, at + 320, ht.map_or(1, |h| h.peer_nss()));
         wire::put(&mut out, at + 328, mode);
         if let Some(v) = vht {
             wire::put(&mut out, at + 324, v.capabilities);

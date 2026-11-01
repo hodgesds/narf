@@ -18,6 +18,7 @@
 //! ar5008_phy.c, ar9002_phy.c and hw.c. No PHY/packet engine is activated.
 use super::rmw;
 use crate::ath9k::{
+    channel_width::Geometry,
     identity::{BringUpError, RegisterIo},
     EEPROM_4K_BYTES,
 };
@@ -159,6 +160,7 @@ fn spur(
     io: &mut impl RegisterIo,
     image: &[u8; EEPROM_4K_BYTES],
     frequency: u16,
+    wide: bool,
 ) -> Result<(), BringUpError> {
     let mut selected = None;
     // offsetof(ar5416_eeprom_4k, modalHeader.spurChans)=100; 5x4 bytes.
@@ -168,7 +170,7 @@ fn spur(
             break;
         }
         let offset = i32::from(value / 10) + 2300 - i32::from(frequency);
-        if offset.abs() < 10 {
+        if offset.abs() < if wide { 20 } else { 10 } {
             selected = Some(offset);
             break;
         }
@@ -183,10 +185,16 @@ fn spur(
         0x994c,
         (0xff << 18) | 0x20000 | (0xff << 9) | 0x100 | 40,
     )?;
-    let phase = ((offset * 524288) / 10) as u32 & 0xfffff;
-    let frequency = ((offset * 2048) / 44) as u32 & 0x3ff;
+    let phase = ((offset * if wide { 262144 } else { 524288 }) / 10) as u32 & 0xfffff;
+    let subchannel = u32::from(wide && offset < 0);
+    let adjusted = if wide {
+        offset + if offset < 0 { 10 } else { -10 }
+    } else {
+        offset
+    };
+    let frequency = ((adjusted * 2048) / 44) as u32 & 0x3ff;
     write(io, 0x99a0, 0x40000000 | (frequency << 20) | phase)?;
-    write(io, 0x99c0, 0)?; // No HT40 secondary channel.
+    write(io, 0x99c0, subchannel << 28)?;
     masks(io, offset * 320)
 }
 pub(super) fn prepare(
@@ -197,6 +205,14 @@ pub(super) fn prepare(
     if !(2412..=2472).contains(&frequency) || (frequency - 2412) % 5 != 0 {
         return Err(BringUpError::BadCalibration);
     }
+    prepare_geometry(io, image, Geometry::from_frequency(frequency)?)
+}
+pub(in crate::ath9k) fn prepare_geometry(
+    io: &mut impl RegisterIo,
+    image: &[u8; EEPROM_4K_BYTES],
+    geometry: Geometry,
+) -> Result<(), BringUpError> {
+    let frequency = geometry.center();
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
@@ -208,8 +224,8 @@ pub(super) fn prepare(
     if turbo == u32::MAX {
         return Err(BringUpError::DeviceGone);
     }
-    write(io, 0x9804, 0x3c0 | (turbo & 0x800))?;
-    write(io, 0x8318, 0)?;
+    write(io, 0x9804, geometry.turbo() | (turbo & 0x800))?;
+    write(io, 0x8318, u32::from(geometry.is_wide()))?;
     write(io, 0x64, 25 << 16)?;
     write(io, 0x6c, 15 << 16)?;
     // The independently identified AR9285 is strictly one RX/TX chain.
@@ -234,7 +250,7 @@ pub(super) fn prepare(
     let (mantissa, exponent) = slope(9 * coefficient / 10);
     field(io, 0x99d0, 0x7fff0, 4, mantissa)?;
     field(io, 0x99d0, 15, 0, exponent)?;
-    spur(io, image, frequency)?;
+    spur(io, image, frequency, geometry.is_wide())?;
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }

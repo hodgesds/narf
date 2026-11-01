@@ -46,6 +46,8 @@ pub(in crate::ath9k) struct Region {
     pub len: usize,
 }
 pub(in crate::ath9k) struct Model {
+    pub(in crate::ath9k) wide: RefCell<Option<crate::ath9k::calibration::wide::WideReport>>,
+    pub(in crate::ath9k) rx_flags: Cell<u32>,
     pub(in crate::ath9k) frequency: Cell<u16>,
     pub(in crate::ath9k) channels: Cell<u16>,
     pub(in crate::ath9k) registers: RefCell<BTreeMap<u64, u32>>,
@@ -100,6 +102,8 @@ pub(in crate::ath9k) type Reaction =
 impl Model {
     pub(in crate::ath9k) fn new() -> Arc<Self> {
         Arc::new(Self {
+            wide: RefCell::new(None),
+            rx_flags: Cell::new(0),
             frequency: Cell::new(2412),
             channels: Cell::new(1),
             registers: RefCell::new(BTreeMap::from([
@@ -329,6 +333,14 @@ impl Model {
         )?;
         self.put(descriptor + 20, length as u32)?;
         self.put(
+            descriptor + 28,
+            if bytes.first() == Some(&0x88) {
+                self.rx_flags.get()
+            } else {
+                0
+            },
+        )?;
+        self.put(
             descriptor + 48,
             3 | error
                 | if bytes.first() == Some(&0x88) {
@@ -343,6 +355,12 @@ impl Model {
     }
 }
 impl Port for Arc<Model> {
+    fn geometry(&self) -> crate::ath9k::channel_width::Geometry {
+        self.wide.borrow().as_ref().map_or_else(
+            || crate::ath9k::channel_width::Geometry::from_frequency(self.frequency.get()).unwrap(),
+            |actual| actual.geometry,
+        )
+    }
     fn frequency_mhz(&self) -> u16 {
         self.frequency.get()
     }

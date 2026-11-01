@@ -208,6 +208,12 @@ pub(super) fn transmit_ht_tid(
         group,
         true,
     )?;
+    if profile.geometry().is_wide() {
+        words[6] = profile
+            .duration(frame.len() + 4, mcs)
+            .ok_or(Error::Profile)?;
+        words[9] |= 1 | (u32::from(profile.tx_sgi40()) << 1);
+    }
     if profile.rts() && !group {
         // Linux ath_buf_set_rate + set11nPktDurRTSCTS: native packet duration
         // remains the DATA duration; hardware forms RTS/CTS NAV itself.
@@ -304,9 +310,7 @@ pub(super) fn transmit_pair(
     first[0] = addresses.tail as u32;
     first[3] |= 0x6000_0000;
     first[8] = permit.air as u32 | (u32::from(permit.delims) << 18);
-    first[6] = (36
-        + 4 * (8 * permit.air as u32 + 22)
-            .div_ceil([26, 52, 78, 104, 156, 208, 234, 260][usize::from(mcs)]))
+    first[6] = profile.duration(permit.air, mcs).ok_or(Error::Profile)?
         | if profile.rts() { 0x8000 } else { 0 };
     let mut last = [0; WORDS];
     last[1] = encoded_last[1];
@@ -573,7 +577,7 @@ fn receive_inner(
     }
     if status & !(0x8000_0003 | if ba { 0x2003_0000 } else { 0 }) != 0
         || words[5] & 0x1000 != 0
-        || words[7] & 7 != 0
+        || words[7] & 4 != 0
         || !(if ba { 24 } else { 28 }..=if ht { 3887 } else { MAX_MPDU + 4 }).contains(&length)
     {
         return Ok(None);
@@ -593,6 +597,9 @@ fn receive_inner(
     let Some(rate) = rate else {
         return Ok(None);
     };
+    if words[7] & 3 != 0 && profile.is_none_or(|p| !p.accepts_rx(rate, words[7])) {
+        return Ok(None);
+    }
     // AR9002 status3 reports one-spatial-stream STBC in bit3. Admission is
     // directional: our source-bound RX capability plus the actual AP's
     // association-response TX_STBC, never the AP's RX capability alone.

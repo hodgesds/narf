@@ -9,7 +9,7 @@ use super::super::scheduled_wire as wire;
 pub(super) struct Owner {
     event: RadioEventAuthority,
     request: SchedScanRequest,
-    channels: Vec<u8>,
+    channels: Vec<super::super::native_band::Channel>,
     cancel: Arc<AtomicBool>,
     epoch: u64,
     results: Vec<(BssInfo, Vec<u8>)>,
@@ -118,7 +118,7 @@ impl Device {
             max_scan_plans: 2,
             max_plan_interval_secs: 65535,
             max_plan_iterations: 254,
-            max_frequencies: self.channels.len() as u16,
+            max_frequencies: (self.channels.len() + self.six_channels.len()) as u16,
             random_mac: true,
         }
     }
@@ -204,16 +204,22 @@ impl Device {
             // new firmware merely because the interface name stayed equal.
             authority.check_for(self).map_err(|_| 1)?;
         }
-        let channels = if request.frequencies_mhz.is_empty() {
-            self.channels.clone()
+        use super::super::native_band::{Band, Channel};
+        let supported: Vec<_> = self
+            .channels
+            .iter()
+            .filter_map(|&ch| Channel::legacy(ch))
+            .chain(self.six_channels.iter().copied())
+            .collect();
+        let mut channels = if request.frequencies_mhz.is_empty() {
+            supported.clone()
         } else {
             let mut channels = Vec::new();
-            for &requested_frequency in &request.frequencies_mhz {
-                let channel = self
-                    .channels
+            for &frequency in &request.frequencies_mhz {
+                let channel = supported
                     .iter()
                     .copied()
-                    .find(|&channel| wire::frequency(channel) == Some(requested_frequency))
+                    .find(|ch| ch.frequency() == frequency)
                     .ok_or(22)?;
                 if !channels.contains(&channel) {
                     channels.push(channel);
@@ -221,6 +227,12 @@ impl Device {
             }
             channels
         };
+        // Linux removes non-PSC6GHz from periodic scans and transmits no
+        // probes on the surviving6GHz entries. Geometry grants no RF right.
+        channels.retain(|ch| ch.band != Band::Six || ch.number % 16 == 5);
+        if channels.is_empty() {
+            return Err(22);
+        }
         let local = if let Some(random) = &request.random_mac {
             let mut bytes = [0; 6];
             narf_crypto::try_fill_random_bytes(&mut bytes).map_err(|_| 5)?;
@@ -238,7 +250,7 @@ impl Device {
         // Pure structural preflight precedes the first native mutation.
         let profile = wire::profiles(&request.matches).map_err(|_| 22)?;
         let version = state.hardware.version(1, 0xd).ok_or(95)?.0;
-        wire::request(
+        wire::request_channels(
             version,
             &channels,
             &alloc::vec![false;channels.len()],
@@ -303,12 +315,16 @@ impl Device {
                         let powers: Vec<_> = channels
                             .iter()
                             .map(|&channel| {
-                                super::super::connection::channel_power(
-                                    &domain,
-                                    channel,
-                                    &mcc.channels,
-                                    true,
-                                )
+                                if channel.band == Band::Six {
+                                    None
+                                } else {
+                                    super::super::connection::channel_power(
+                                        &domain,
+                                        channel.number,
+                                        &mcc.channels,
+                                        true,
+                                    )
+                                }
                             })
                             .collect();
                         if let Some(power) = powers.iter().flatten().min() {
@@ -325,13 +341,17 @@ impl Device {
                                 power,
                             )?;
                             body[0] = 1;
-                            hw.command(1, 0x9f, &body).await?;
+                            let receipt = hw.command(1, 0x9f, &body).await?;
+                            if !receipt.payload.is_empty() {
+                                return Err("scheduled global power receipt ambiguous");
+                            }
                         }
                         permitted = powers.iter().map(Option::is_some).collect();
                         phy.he &= mcc.he_allowed;
                     }
                 }
-                let mut body = wire::request(version, &channels, &permitted, local, phy, &request)?;
+                let mut body =
+                    wire::request_channels(version, &channels, &permitted, local, phy, &request)?;
                 if associated {
                     // scan.h GENERAL_PARAMS_API_VER_12: link0 is our actual
                     // single serving link; WILD timing for the current low-load
@@ -492,28 +512,32 @@ impl Device {
             if copy {
                 // Parse only scan facts from the borrowed fallback MPDU. Data
                 // packets incur no duplicate allocation or owner replacement.
-                let copied = wire::copied_bss(packet, false, &owner.channels, &owner.request);
+                let copied = wire::copied_bss_channels(
+                    packet,
+                    false,
+                    state.hardware.band_in_rx_supported(),
+                    &owner.channels,
+                    &owner.request,
+                );
                 if owner.associated {
                     index += 1;
                 } else {
                     state.hardware.notifications.remove(index);
                 }
                 if let Some((beacon, bss)) = copied {
-                    if let Some(old) = state
-                        .beacons
-                        .iter_mut()
-                        .find(|old| old.bssid == beacon.bssid)
-                    {
+                    if let Some(old) = state.beacons.iter_mut().find(|old| {
+                        old.bssid == beacon.bssid
+                            && old.band == beacon.band
+                            && old.channel == beacon.channel
+                    }) {
                         *old = beacon.clone();
                     } else if state.beacons.len() < 256 {
                         state.beacons.push(beacon.clone());
                     }
                     let entry = (bss, beacon.information_elements);
-                    if let Some(old) = owner
-                        .results
-                        .iter_mut()
-                        .find(|old| old.0.bssid == entry.0.bssid)
-                    {
+                    if let Some(old) = owner.results.iter_mut().find(|old| {
+                        old.0.bssid == entry.0.bssid && old.0.frequency_mhz == entry.0.frequency_mhz
+                    }) {
                         *old = entry;
                     } else if owner.results.len() < 256 {
                         owner.results.push(entry);

@@ -34,7 +34,7 @@ impl Span {
         let low = i16::from(center) - 2 * ((1i16 << width) - 1);
         let high = i16::from(center) + 2 * ((1i16 << width) - 1);
         if low < 1
-            || high > 233
+            || high > 253
             || !(0..1u8 << width).all(|i| Channel::six((low + 4 * i16::from(i)) as u8).is_some())
             || !span.channels().any(|channel| channel == primary)
         {

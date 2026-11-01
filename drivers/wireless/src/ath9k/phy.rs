@@ -4,6 +4,7 @@
 //! channel admission are separate stages; PHY activation stays disabled.
 
 use super::{
+    channel_width::Geometry,
     identity::{BringUpError, RegisterIo, Registers},
     initvals::*,
     EEPROM_4K_BYTES,
@@ -14,10 +15,24 @@ use super::{
 /// Live channel authorization and analog calibration remain; PHY stays off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Prepared {
+    pub(in crate::ath9k) geometry: Geometry,
     pub reference_frequency: u16,
     pub high_power_gain: bool,
     pub xe2_gain: bool,
     pub ini_writes: u16,
+}
+
+impl Prepared {
+    pub fn width_mhz(&self) -> u8 {
+        if self.geometry.is_wide() {
+            40
+        } else {
+            20
+        }
+    }
+    pub fn secondary_channel(&self) -> Option<u8> {
+        self.geometry.secondary()
+    }
 }
 
 pub(super) const REQUIRED_BAR: u64 = 0xd388;
@@ -92,6 +107,17 @@ pub(in crate::ath9k) fn prepare_at(
     if !(2412..=2472).contains(&frequency) || (frequency - 2412) % 5 != 0 {
         return Err(BringUpError::BadCalibration);
     }
+    prepare_geometry(io, image, Geometry::from_frequency(frequency)?)
+}
+pub(in crate::ath9k) fn prepare_geometry(
+    io: &mut impl RegisterIo,
+    image: &[u8; EEPROM_4K_BYTES],
+    geometry: Geometry,
+) -> Result<Prepared, BringUpError> {
+    let frequency = geometry.control();
+    if geometry.is_wide() && image[6] & 0x2a != 2 {
+        return Err(BringUpError::BadCalibration);
+    }
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);
     }
@@ -121,12 +147,13 @@ pub(in crate::ath9k) fn prepare_at(
     io.write32(0x9830, 1); // External analog shift selection.
     io.write32(0x9830, 0); // AR9285 has no separate ADDAC table.
     let mut writes = 0;
-    table(io, AR9285_MODES_9285_1_2, 4, &mut writes); // 2GHz HT20.
-    table(io, gain, 4, &mut writes);
+    let column = if geometry.is_wide() { 3 } else { 4 };
+    table(io, AR9285_MODES_9285_1_2, column, &mut writes);
+    table(io, gain, column, &mut writes);
     table(io, AR9285_COMMON_9285_1_2, 1, &mut writes);
     // Full-reset INI precedes mode/chain/synth/slope/spur preparation.
     // No fast retune or live PHY activation is implied by this call.
-    if frequency == 2412 {
+    if !geometry.is_wide() && frequency == 2412 {
         channel::prepare(io, image, frequency)?;
         modal::prepare(io, image, false, false)?;
         power::program(io, image, frequency)?;
@@ -137,20 +164,26 @@ pub(in crate::ath9k) fn prepare_at(
                 io: &mut *io,
                 good: true,
             };
-            channel::prepare(&mut checked, image, frequency)?;
+            channel::prepare_geometry(&mut checked, image, geometry)?;
             if !checked.authorized() {
                 return Err(BringUpError::DeviceGone);
             }
         }
         // Modal analog writes retain their source settling sequence. The
         // frequency-dependent stable detector/rate tables are read back below.
-        modal::prepare(io, image, false, false)?;
+        modal::prepare(io, image, geometry.is_wide(), false)?;
         let mut checked = Checked {
             io: &mut *io,
             good: true,
         };
-        power::program(&mut checked, image, frequency)?;
-        rates::program(&mut checked, image, frequency, 0)?;
+        power::program(&mut checked, image, geometry.center())?;
+        if geometry.is_wide() {
+            // PHY remains off. A zero conducted budget is preparation only;
+            // live full40 permission/qualification replaces it before AGC/RF.
+            rates::wide::program_wide(&mut checked, image, geometry, image[60])?;
+        } else {
+            rates::program(&mut checked, image, frequency, 0)?;
+        }
         if !checked.authorized() {
             return Err(BringUpError::DeviceGone);
         }
@@ -166,6 +199,7 @@ pub(in crate::ath9k) fn prepare_at(
         return Err(BringUpError::DeviceGone);
     }
     Ok(Prepared {
+        geometry,
         reference_frequency: frequency,
         high_power_gain: high,
         xe2_gain: xe2,
@@ -188,6 +222,14 @@ pub(super) fn program_at(
     frequency: u16,
 ) -> Result<Prepared, BringUpError> {
     prepare_at(&mut Registers::new(mmio, cap), image, frequency)
+}
+pub(super) fn program_geometry(
+    mmio: narf_bus::MmioRegion,
+    cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+    image: &[u8; EEPROM_4K_BYTES],
+    geometry: Geometry,
+) -> Result<Prepared, BringUpError> {
+    prepare_geometry(&mut Registers::new(mmio, cap), image, geometry)
 }
 pub(super) fn program_live_power_at(
     io: &mut impl RegisterIo,

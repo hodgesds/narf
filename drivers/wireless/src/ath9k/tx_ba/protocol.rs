@@ -67,6 +67,8 @@ pub(in crate::ath9k) struct Owner {
     delba: Option<Delba>,
     disabled: bool,
     density: u8,
+    geometry: crate::ath9k::channel_width::Geometry,
+    short_gi: bool,
     max_air: usize,
 }
 impl Owner {
@@ -84,7 +86,13 @@ impl Owner {
             .ht()
             .peer_mpdu_density()
             .max(n.ht().peer_mpdu_density());
+        let geometry = grant.base.geometry();
+        if geometry.is_wide() != (n.width() == narf_wireless::association::phy::Width::Forty) {
+            return Err(Error::Packet);
+        }
         Ok(Self {
+            geometry,
+            short_gi: geometry.is_wide() && n.ht().tx_sgi40(),
             grant,
             serial: 0,
             dialog: 0,
@@ -295,9 +303,18 @@ impl Owner {
         if seq != [s.head, (s.head + 1) & 4095] {
             return Err(Error::State);
         }
-        let bits = [26usize, 52, 78, 104, 156, 208, 234, 260][usize::from(mcs)];
+        let bits = if self.geometry.is_wide() {
+            [54usize, 108, 162, 216, 324, 432, 486, 540]
+        } else {
+            [26usize, 52, 78, 104, 156, 208, 234, 260]
+        }[usize::from(mcs)];
         let base = 256usize.saturating_sub(lengths[0]).div_ceil(4);
-        let symbols = usize::from(self.density >> 2).max(1);
+        let symbols = if self.short_gi {
+            (usize::from(self.density) * 5).saturating_sub(4) / 18
+        } else {
+            usize::from(self.density >> 2)
+        }
+        .max(1);
         let density = if self.density == 0 {
             0
         } else {
@@ -305,7 +322,13 @@ impl Owner {
         };
         let delims = base.max(density);
         let air = (4 + lengths[0]).next_multiple_of(4) + delims * 4 + 4 + lengths[1];
-        if delims > 255 || air > self.max_air || 36 + 4 * (8 * air + 22).div_ceil(bits) > 4000 {
+        if delims > 255
+            || air > self.max_air
+            || self
+                .geometry
+                .ht_duration(self.short_gi, air, mcs)
+                .is_none_or(|duration| duration > 4000)
+        {
             return Err(Error::Packet);
         }
         Ok(PairPermit {

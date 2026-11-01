@@ -354,6 +354,13 @@ for SAE. `Security::new_sae` refuses non-SAE AKMs.
 - `channel::from_frequency_band(mhz) -> Option<(Band, u8)>` is the inverse.
 - `channel::valid_6ghz(u8)` tests a 6 GHz channel number.
 
+The generic6GHz geometry now follows Linux's explicit253 upper bound,
+including the five237/241/245/249/253 entries of Intel's actual NVMv5
+64-channel tail. HE/EHT operating-channel and RNR/scan planners use this
+same conversion. Geometry remains separate from actual driver NVM/MCC and
+current host-policy admission; a rule ending at7125MHz still refuses
+those additional frequencies. Unqualified numeric channels remain legacy.
+
 `association::Bss` gains `band: Option<Band>`. `None` means the 2.4/5 GHz
 numbering, so existing literals add `band: None`. `Bss::band()` returns the
 explicit band or the derived one, and `Bss::frequency_mhz()` returns the

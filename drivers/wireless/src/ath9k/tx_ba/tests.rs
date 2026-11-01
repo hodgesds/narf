@@ -19,7 +19,7 @@ pub(in crate::ath9k) fn qualify(model: &Arc<Model>, window: u8) -> Cap<FirmwareB
     b[12..16].copy_from_slice(&[0x8c, 0x16, 0x2b, 0]);
     b[16..48].copy_from_slice(&r.identity);
     b[48..54].copy_from_slice(&r.mac);
-    b[54..58].copy_from_slice(&[base.channel(), 20, 1, 2]);
+    b[54..58].copy_from_slice(&base.child_geometry(2));
     b[58..60].copy_from_slice(&12i16.to_le_bytes());
     b[60] = window;
     b[61] = 3;
@@ -89,7 +89,7 @@ fn smoke_ar9285_tx_ba_distinct_signed_contract_and_missing_source_keeps_single_m
     b[12..16].copy_from_slice(&[0x8c, 0x16, 0x2b, 0]);
     b[16..48].copy_from_slice(&r.identity);
     b[48..54].copy_from_slice(&r.mac);
-    b[54..58].copy_from_slice(&[base.channel(), 20, 1, 2]);
+    b[54..58].copy_from_slice(&base.child_geometry(2));
     b[58..60].copy_from_slice(&12i16.to_le_bytes());
     b[60] = 64;
     b[61] = 3;

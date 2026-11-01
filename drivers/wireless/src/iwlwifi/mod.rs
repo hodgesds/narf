@@ -116,6 +116,7 @@ mod scheduled_epoch;
 mod scheduled_wire;
 pub mod security;
 mod six_ghz_power;
+mod six_ghz_scan;
 mod six_ghz_span;
 mod six_ghz_station;
 pub mod sta;

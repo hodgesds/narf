@@ -477,3 +477,6 @@ async fn iq(io: &mut impl Io) -> Result<(u8, i8), BringUpError> {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "calibration/tests.rs"]
 pub(super) mod tests;
+
+/// Distinct full40 initial analog/NF/ADC/IQ receipt.
+pub(in crate::ath9k) mod wide;

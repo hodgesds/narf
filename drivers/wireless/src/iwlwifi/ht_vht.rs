@@ -60,7 +60,7 @@ impl Local {
                     0
                 }
             });
-        for (index, &flags) in flags.iter().skip(51).take(59).enumerate() {
+        for (index, &flags) in flags.iter().skip(51).take(64).enumerate() {
             if flags & 1 != 0 {
                 self.six_channels[0] |= 1 << index;
                 self.six_channels[1] |= u64::from(flags & (1 << 13) != 0) << index;

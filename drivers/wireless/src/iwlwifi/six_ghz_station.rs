@@ -5,7 +5,8 @@ use super::{
     ht_vht::Local,
     native_band::{Band, Channel},
 };
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
+use narf_lib::sync::IrqSafeSpinLock;
 use narf_wireless::{
     association::{
         self,
@@ -17,11 +18,28 @@ use narf_wireless::{
 
 pub(super) struct Profile {
     pub plan: SixGhzPlan,
-    pub power: super::six_ghz_power::Constraints,
     pub nvm_flags: u32,
     pub span: super::six_ghz_span::Span,
-    ap_span: super::six_ghz_span::Span,
+    announcement: Arc<Announcement>,
+    live: IrqSafeSpinLock<Live>,
     peer: [u8; 6],
+}
+
+/// Internal retry only: no native TX descriptor or doorbell was published.
+pub(super) const UPDATE_REQUIRED: &str = "6GHz AP constraints need a current native receipt";
+struct Announcement {
+    plan: SixGhzPlan,
+    ies: Vec<u8>,
+    span: super::six_ghz_span::Span,
+    source: Local,
+}
+struct Live {
+    applied: Option<super::six_ghz_power::Constraints>,
+    requested: super::six_ghz_power::Constraints,
+    ies: Vec<u8>,
+    // Dropping a command owner leaves this sticky; only its exact terminal
+    // receipt can resolve the uncertain firmware state.
+    inflight: bool,
 }
 
 fn width(width: SixGhzWidth) -> u8 {
@@ -292,10 +310,20 @@ pub(super) fn prepare(
             super::sc_security::Profile::from_plan(&plan, mode)?,
             Arc::new(Profile {
                 plan: selected,
-                power,
                 nvm_flags,
                 span,
-                ap_span,
+                announcement: Arc::new(Announcement {
+                    plan: selected,
+                    ies: beacon.information_elements.clone(),
+                    span: ap_span,
+                    source,
+                }),
+                live: IrqSafeSpinLock::new(Live {
+                    applied: None,
+                    requested: power,
+                    ies: beacon.information_elements.clone(),
+                    inflight: false,
+                }),
                 peer: beacon.bssid,
             }),
         ));
@@ -334,33 +362,154 @@ impl Profile {
             self.plan.regulatory_connectivity(),
         ]);
     }
-    /// Initial native contract confirms the exact offered AP HE/6GHz
-    /// facts. A changed response/live operation requires reassociation.
+    pub fn original(&self) -> &SixGhzPlan {
+        &self.announcement.plan
+    }
+    pub fn pending(&self) -> bool {
+        let live = self.live.lock();
+        live.inflight || live.applied != Some(live.requested)
+    }
+    /// The AP's beacon operation remains the association announcement even
+    /// after its response narrows our station span/maps. TPE is the one live
+    /// replacement fact: it takes effect only after a new native receipt.
     #[inline(never)]
     pub fn confirm(&self, ies: &[u8]) -> Result<(), &'static str> {
         forbid_legacy(ies)?;
-        super::rates::Rates::parse_six_eht(ies, true, self.plan.eht().is_some())?;
+        let original = &self.announcement.plan;
+        super::rates::Rates::parse_six_eht(ies, true, original.eht().is_some())?;
         let actual = six_ghz::admit(ies, self.channel().number)
-            .map_err(|_| "6GHz response omitted HE/band/operation facts")?;
-        if actual.he_capability != *self.plan.he().peer_capability()
-            || actual.he_operation != *self.plan.he().operation()
-            || actual.capability != self.plan.peer_capability()
-            || actual.operation != *self.plan.operation()
-            || announced_span(ies, self.channel().number)? != self.ap_span
-            || super::six_ghz_power::Constraints::parse_span(
-                self.power_type(),
-                ies,
-                self.ap_span,
-                self.span,
-            )? != self.power
-            || self
-                .plan
+            .map_err(|_| "6GHz beacon omitted HE/band/operation facts")?;
+        if actual.he_capability != *original.he().peer_capability()
+            || actual.he_operation != *original.he().operation()
+            || actual.capability != original.peer_capability()
+            || actual.operation != *original.operation()
+            || announced_span(ies, self.channel().number)? != self.announcement.span
+            || original
                 .eht()
                 .is_some_and(|eht| !super::sc_eht::matches(eht, ies, &actual.he_capability))
         {
-            return Err("6GHz AP changed HE/channel/power facts; reassociation required");
+            return Err("6GHz AP changed PHY/channel/power type; reassociation required");
+        }
+        let power = super::six_ghz_power::Constraints::parse_span(
+            self.power_type(),
+            ies,
+            self.announcement.span,
+            self.span,
+        )?;
+        let mut live = self.live.lock();
+        live.requested = power;
+        if live.ies != ies {
+            live.ies = ies.to_vec();
         }
         Ok(())
+    }
+    /// Linux's association response normally has no TPE. Refine only the
+    /// actual response HE/EHT offer, retaining the original beacon's TPE
+    /// and optional HE6-band/EHT-operation elements when absent there.
+    #[inline(never)]
+    pub fn refine(
+        &self,
+        response: &[u8],
+        domain: &RegulatoryDomain,
+        firmware: &super::mld_regulatory::Mcc,
+    ) -> Result<Arc<Self>, &'static str> {
+        forbid_legacy(response)?;
+        let mut ies = response.to_vec();
+        for extension in [59, 106] {
+            if !has_extension(response, extension)? {
+                append_extension(&mut ies, &self.announcement.ies, extension)?;
+            }
+        }
+        let rule = self
+            .rule(domain, Some(firmware))
+            .ok_or("6GHz response lost original full-span permission")?;
+        let physical = local_for_width(self.announcement.source, self.span.width, rule)?;
+        let selected = six_ghz::plan(&ies, self.channel().number, &physical)
+            .map_err(|_| "6GHz response did not confirm an admitted HE/EHT offer")?;
+        if selected.power_type() != self.power_type()
+            || self.plan.eht().is_none() && selected.eht().is_some()
+            || has_extension(&self.announcement.ies, 107)? && selected.eht().is_none()
+        {
+            return Err("6GHz response changed AP power type or required EHT mode");
+        }
+        // Original membership selectors remain requirements after a response
+        // drops optional EHT. A BasicML association itself requires EHT.
+        super::rates::Rates::parse_six_eht(&self.announcement.ies, true, selected.eht().is_some())?;
+        super::rates::Rates::parse_six_eht(&ies, true, selected.eht().is_some())?;
+        let span = super::six_ghz_span::Span::new(
+            self.channel().number,
+            width(selected.width()),
+            selected.channel().center,
+        )
+        .ok_or("6GHz response native span invalid")?;
+        if !self.span.contains(span) {
+            return Err("6GHz response widened the original station offer");
+        }
+        let nvm_flags = span
+            .nvm_flags(self.announcement.source)
+            .ok_or("6GHz response lost raw NVM span")?;
+        span.rule(domain, nvm_flags, Some(firmware))
+            .filter(|r| r.allows_6ghz_client(selected.power_type()))
+            .ok_or("6GHz response full host/MCC span prohibited")?;
+        let retained = { self.live.lock().ies.clone() };
+        let power = super::six_ghz_power::Constraints::parse_span(
+            self.power_type(),
+            &retained,
+            self.announcement.span,
+            span,
+        )?;
+        Ok(Arc::new(Self {
+            plan: selected,
+            nvm_flags,
+            span,
+            announcement: self.announcement.clone(),
+            peer: self.peer,
+            live: IrqSafeSpinLock::new(Live {
+                applied: None,
+                requested: power,
+                ies: retained,
+                inflight: false,
+            }),
+        }))
+    }
+    pub async fn apply_pending(
+        &self,
+        hw: &mut super::runtime::Hardware,
+    ) -> Result<(), &'static str> {
+        let result = async {
+            for _ in 0..16 {
+                hw.poll()?;
+                match self.check_pending(hw) {
+                    Ok(()) => return Ok(()),
+                    Err(UPDATE_REQUIRED) => {}
+                    Err(e) => return Err(e),
+                }
+                let power = {
+                    let mut live = self.live.lock();
+                    if live.inflight {
+                        return Err("6GHz AP constraint owner has an uncertain native receipt");
+                    }
+                    live.inflight = true;
+                    live.requested
+                };
+                let receipt = hw.command(4, 0xc, power.command()).await?;
+                if !receipt.payload.is_empty() {
+                    return Err("invalid6GHz AP power receipt");
+                }
+                hw.source_fence()?.invoke(|| {
+                    let mut live = self.live.lock();
+                    live.applied = Some(power);
+                    live.inflight = false;
+                    Ok(())
+                })?;
+            }
+            Err("6GHz AP constraints did not stabilize before native TX")
+        }
+        .await;
+        if result.is_err() {
+            hw.fail();
+        }
+        result
     }
     pub fn check_pending(&self, hw: &super::runtime::Hardware) -> Result<(), &'static str> {
         for packet in &hw.notifications {
@@ -386,6 +535,37 @@ impl Profile {
                 .ok_or("invalid6GHz pending beacon")?;
             self.confirm(ies)?;
         }
-        Ok(())
+        if self.pending() {
+            Err(UPDATE_REQUIRED)
+        } else {
+            Ok(())
+        }
     }
+}
+
+fn has_extension(mut ies: &[u8], extension: u8) -> Result<bool, &'static str> {
+    let mut found = false;
+    while !ies.is_empty() {
+        let len = usize::from(*ies.get(1).ok_or("truncated6GHz response IE")?);
+        let body = ies.get(2..2 + len).ok_or("truncated6GHz response IE")?;
+        if ies[0] == 255 && body.first() == Some(&extension) {
+            if found {
+                return Err("duplicate6GHz response extension");
+            }
+            found = true;
+        }
+        ies = &ies[2 + len..];
+    }
+    Ok(found)
+}
+fn append_extension(out: &mut Vec<u8>, mut ies: &[u8], extension: u8) -> Result<(), &'static str> {
+    while !ies.is_empty() {
+        let len = usize::from(*ies.get(1).ok_or("truncated retained6GHz IE")?);
+        let element = ies.get(..2 + len).ok_or("truncated retained6GHz IE")?;
+        if element[0] == 255 && element.get(2) == Some(&extension) {
+            out.extend_from_slice(element);
+        }
+        ies = &ies[2 + len..];
+    }
+    Ok(())
 }

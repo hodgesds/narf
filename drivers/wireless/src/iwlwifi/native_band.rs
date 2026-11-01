@@ -22,9 +22,9 @@ impl Channel {
         })
     }
     pub fn six(number: u8) -> Option<Self> {
-        // Shared channel::Band currently admits through 233. The NVMv5
-        // UNII-9 entries 237..253 remain unavailable, not aliased to 5GHz.
-        (number <= 233 && number % 4 == 1).then_some(Self {
+        // Actual NVMv4 ends at233; v5 has five UNII-9 entries through253.
+        // Their presence is proved separately, never inferred from geometry.
+        (number <= 253 && number % 4 == 1).then_some(Self {
             band: Band::Six,
             number,
         })

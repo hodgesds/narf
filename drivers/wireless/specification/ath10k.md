@@ -14,6 +14,8 @@
 > pass both-architecture native suites; matched IDs confer no board qualification.
 > The separately gated SGI40 extension passes nine native cases on both
 > architectures; physical qualification remains open.
+> A later chain/NSS/TX-STBC extension is source complete with four new
+> unexecuted cases; release compilation and native validation are pending.
 
 ## 1. Purpose & scope
 
@@ -122,14 +124,32 @@ Host-bus/system power transitions remain separate profiles.
   These opaque probe elements grant no PHY, association, security or regulatory
   authority. Current channel/power checks, terminal correlation/restoration,
   failure/cancellation and retained-DMA rules are identical to `scan_active`.
-- The retained RAW station additionally negotiates a native HT20/one-stream profile when
+- Native chain selection (`wmi_runtime::chains`) intersects actual
+  SERVICE_READY `num_rf_chains` with both masks in the actual submitted WMI
+  INIT resource configuration. The original firmware count is retained,
+  never relabeled as the selected count. MAIN/10.x/TLV resources bound this
+  profile to three chains; 10.4 QCA99X0/9984 resources permit four, and other
+  10.4 resources permit two. A PCI ID alone enables none of them. This follows
+  Linux7.2 wmi.c:5582–5590 and core.c:2737–2779; signed firmware/BDF and real
+  OTP calibration remain prerequisites. Before publishing a scan/PHY owner,
+  Radio submits native PDEV TX_CHAIN_MASK1 and RX_CHAIN_MASK2, creates vdev0,
+  then submits VDEV NSS (MAIN/TLV/10.4 parameter34; 10.x32), as Linux
+  mac.c:5036–5070/5763–5778 does. All use the actual per-dialect command/TLV
+  shape and retained HTC/CE terminal submission. There is no invented
+  firmware parameter ACK or RF receipt. Current source/capability is checked
+  through publication; failure or cancellation keeps the owner closed and
+  DMA retained. No live chain reconfiguration or packet-key migration is
+  attempted. Only after the complete sequence may per-band/request PHY
+  capabilities use the immutable selected mask.
+- The retained RAW station additionally negotiates a native HT20 profile when
   SERVICE_READY reports HT and a valid RF-chain count, and the actual AP offer
-  contains valid HT Capability/Operation and usable WMM. It retains MCS0..7,
+  contains valid HT Capability/Operation and usable WMM. It retains only the
+  selected chains' MCS0..31, intersected with the actual AP RX offer/response,
   requires every basic MCS to fit that profile and binds HT Operation to the
   observed primary channel. SGI20 transmit requires the actual firmware capability
   and both beacon/response support; receive follows the local advertised promise.
-  A driver-owned HT IE advertises the selected width, one
-  stream, SMPS disabled, no GF and only the firmware-backed LDPC/RX-STBC
+  A driver-owned HT IE advertises the selected width and stream masks,
+  SMPS disabled, no GF and only the firmware-backed LDPC/STBC
   coding described below; caller SME IEs cannot supply it.
   VDEV_START programs native 11NG/11NA HT20 plus ALLOW_HT, retaining the same
   20 MHz factory/host power receipt. The actual association response intersects
@@ -176,9 +196,11 @@ Host-bus/system power transitions remain separate profiles.
   RF-chain facts with the shared typed `JoinPlan::prepare_with_phy` offer and
   response. Linux `mac.c::ath10k_get_ht_cap` makes 20/40 support available with
   `WMI_HT_CAP_ENABLED`; the independent HT40-SGI capability is not inferred from
-  SGI20. This profile advertises MCS0..7, LGI40, optional qualified SGI20 and
+  SGI20. This profile advertises only the selected chains' MCS set, LGI40,
+  optional qualified SGI20 and
   separately gated SGI40 as described below,
-  without GF, TX STBC or an extra spatial stream (LDPC/RX STBC follow the
+  without GF; stream/STBC admission follows the same native chain receipt
+  (LDPC/STBC follow the
   coding bullet below). Only the pairs
   5180/5200, 5220/5240, 5745/5765 and 5785/5805 MHz, in either primary order,
   are selected. The actual board/OTP calibration path, immutable EEPROM
@@ -243,22 +265,25 @@ Host-bus/system power transitions remain separate profiles.
   advertised only for SERVICE_READY `WMI_HT_CAP_LDPC` (0x0040) or the pair
   `WMI_HT_CAP_RX_LDPC|WMI_HT_CAP_TX_LDPC` (0x1000|0x2000); a lone directional
   bit is not. A nonzero `WMI_HT_CAP_RX_STBC` field (0x0030) advertises one RX
-  STBC stream (IEEE 0x0100), bounded by this one-stream profile. Both reach the
+  STBC stream (IEEE 0x0100), only with at least two selected physical RX chains.
+  TX STBC additionally requires `WMI_HT_CAP_TX_STBC`0x0008 and two selected TX
+  chains. These reach the
   per-band capability body, the driver-owned request IE and the HT20/HT40
-  `LocalPhy` through the shared `LocalHt::{with_ldpc,with_rx_stbc}` builder.
+  `LocalPhy` through `LocalHt::{with_ldpc,with_rx_stbc,with_tx_stbc}`.
   PEER_ASSOC `peer_ht_caps` applies `mac80211/ht.c::ieee80211_ht_cap_ie_to_sta_ht_cap`
   masking: peer LDPC survives only with local LDPC, the peer's RX STBC field
-  (0x0300) is cleared because no local TX STBC exists, and the peer's TX STBC
+  (0x0300) is bounded by local TX STBC and half the selected physical TX chains;
+  the peer's TX STBC
   (0x0080) survives only with our RX STBC promise. `ath10k_peer_assoc_h_ht`
   then sets `WMI_PEER_LDPC` (0x10000), `WMI_PEER_STBC` (0x8000) and
-  `WMI_RC_TX_STBC_FLAG` (0x20); these values are identical in all six dialect
+  `WMI_RC_TX_STBC_FLAG` (0x20), RX-STBC field0xc0 and DS/TS stream flags;
+  these values are identical in all six dialect
   peer-flag maps. The firmware owns LDPC encoding toward a capable peer and
   STBC/LDPC decoding. Native RX additionally rejects, before BA sequence or
   CCMP replay commitment, an HT-SIG2 FEC-coding bit (bit6) without our LDPC
   promise, a one-stream STBC field (bits4..5 = 1) without our RX STBC promise
-  and any larger/reserved STBC value. TX STBC stays absent: Linux requires
-  `cfg_tx_chainmask > 1`, and this SISO profile never selects a second TX
-  chain. Native smokes `drivers/wireless/ath10k/coding` cover the service-bit
+  and any larger/reserved STBC value or NSTS exceeding selected physical chains.
+  Native smokes `drivers/wireless/ath10k/coding` cover the service-bit
   advertisement, masked peer record/flags on all six dialects with DHCP-backed
   CCMP traffic and pre-replay PPDU coding checks. No RF coding gain is claimed.
 - `wmi_runtime::StationProtection { rts_threshold: Option<u16>,
@@ -381,13 +406,13 @@ Host-bus/system power transitions remain separate profiles.
   cleared, lower-power or different-country policy closes it. A 40 MHz
   receipt over the same pair is a different receipt. The VHT station
   profile below is the only selector of `width80`.
-- SISO VHT station profile (`wmi_runtime/ht.rs`, `station.rs`, `mlme.rs`;
+- VHT station profile (`wmi_runtime/ht.rs`, `station.rs`, `mlme.rs`;
   smokes under `drivers/wireless/ath10k/vht`). A nonzero SERVICE_READY
   `vht_cap_info` builds the local element through the shared
   `LocalPhy::vht80`/`LocalVht` exactly as Linux v7.2
-  `mac.c::ath10k_create_vht_cap` does for one chain: MCS0-9 for one stream
+  `mac.c::ath10k_create_vht_cap` does: MCS0-9 only for selected native streams
   in both maps, SGI80 (0x20), RX LDPC (0x10), RX STBC (0x300) and the A-MPDU
-  exponent; TX STBC is cleared (`cfg_tx_chainmask <= 1`), beamforming roles
+  exponent; TX STBC needs its source bit and multiple selected TX chains; beamforming roles
   need a sounding owner and are not advertised, and 160/80+80 are not offered.
   `Device::phy_capabilities(5000)` and `hw_caps.vht_supported` report it.
   Because the element promises 80 MHz support, VHT is offered only on a
@@ -405,7 +430,12 @@ Host-bus/system power transitions remain separate profiles.
   STBC only with our RX STBC); `peer_max_mpdu` is `max(HT, 2^(13+exp)-1)`;
   the `wmi_vht_rate_set` (TLV tag 102, or the common-command tail at +332) is
   the AP's RX map narrowed by our TX map and its TX map narrowed by our RX
-  map, with the AP's highest-rate fields; `peer_phymode` is
+  map, with the AP's highest-rate fields. The native peer NSS follows this
+  actual directional VHT map; HT uses its complete0..31 rate array and
+  response-bound NSS. Original HT RX PPDUs are bounded by selected/local and
+  explicit peer TX MCS facts; VHT RX intersects AP TX and local RX per NSS.
+  Unsupported NSS/MCS/STBC/width/GI is rejected before reorder or CCMP PN,
+  including a same-PN valid retry. `peer_phymode` is
   `ath10k_peer_assoc_h_phymode` `MODE_11AC_VHT20/40/80` (8/9/10). VDEV_START
   follows `chan_to_phymode`, which maps the chandef width only: 20/40 stay
   `MODE_11NA_HT20/HT40` and 80 MHz is `MODE_11AC_VHT80` with
@@ -1312,19 +1342,27 @@ not inferred from this PCI table. `profile::PROFILES`, `hw::HwRev::from_pci_id`,
 | QCA6174,168c:003e |05010000 / QCA6174/hw2.1 | R; H conditional; native CE1 HTT route and actual board/image required. |
 | QCA6174,168c:003e |05020000 / QCA6174/hw3.0 | R; H conditional; actual revision/OTP/image selection retained. |
 | QCA6174,168c:003e |05030000 / QCA6174/hw3.0 | R; H conditional; existing chip-specific PLL sequence precedes native mission startup. |
-| QCA99X0,168c:0040 |01000000 / QCA99X0/hw2.0 | R; H conditional; 12-pipe hardware/firmware host-memory profile remains exact, additional chains/VHT are not enabled. |
-| QCA9984,168c:0046 |01000000 / QCA9984/hw1.0 | R; H conditional; 2048-byte extended board data and selected OTP remain required. Wider VHT/extra chains are not implemented here. |
+| QCA99X0,168c:0040 |01000000 / QCA99X0/hw2.0 | R; H conditional; 12-pipe hardware/firmware host-memory profile remains exact, chain/NSS extension is source complete, software execution and physical acceptance pending. |
+| QCA9984,168c:0046 |01000000 / QCA9984/hw1.0 | R; H conditional; 2048-byte extended board data and selected OTP remain required. Wider VHT remains open; the chain/NSS extension awaits software execution and board qualification. |
 | QCA9888,168c:0056 |01000000 / QCA9888/hw2.0 | R; H conditional; distinct board/OTP identity is required despite shared CE family. |
 | QCA9377,168c:0042 |05020000 / QCA9377/hw1.0 | R; H conditional; actual RAW/non-PFC image and CE1 routing required. |
 | QCA9377,168c:0042 |05020001 / QCA9377/hw1.0 | R; H conditional; existing revision-specific PLL path and exact board data retained. |
 | QCA9887,168c:0050 |4100016d / QCA9887/hw1.0 | R; H conditional. QCA988X-family register/reset route plus SI EEPROM calibration with board-file/OTP fallback; single-chain board facts and actual RAW/non-PFC image required. |
 | AR9462,168c:0034 | none | Explicit pre-MMIO rejection; ath9k ownership, not a missing ath10k station implementation. |
 
+The chain/NSS/TX-STBC extension is source complete under the contract in §3.
+Four new source cases under `drivers/wireless/ath10k/chains` cover all six
+dialects, actual SERVICE_READY/INIT limits, native CE-held partial publication,
+two-stream HT plus TX-STBC through real RSNA/DHCP/IP, and rejected MCS/NSTS
+before a valid same-PN packet. Existing coding/SGI/VHT cases retain their
+assertions with the newly selected local masks; the VHT PPDU case now admits
+actual two-stream traffic and rejects three streams. None of these changed
+cases has been executed yet; coordinated release compile/native gates remain
+pending. No physical board or over-air STBC result is claimed.
+
 Across the reached rows, concrete remaining software packages are 2.4-GHz HT40
 coexistence/occupied-power ownership;
-additional streams and TX STBC (which needs a second selected TX chain;
-LDPC and one-stream RX STBC are implemented above);
-VHT160/80+80 (SISO VHT20/40/80 is implemented); PFC fetch/queue ownership;
+VHT160/80+80 (VHT20/40/80 is implemented); PFC fetch/queue ownership;
 AP-side U-APSD under the AP owner; DFS/indoor/beacon-hint
 qualification; remain-on-channel/action-frame control; hardware key offload;
 AP/P2P roles; host-bus PM and wake offload (system suspend is implemented);

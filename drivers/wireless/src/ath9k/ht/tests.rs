@@ -97,6 +97,7 @@ fn inputs() -> (narf_bus::BusDevice, Identity, Prepared, Report) {
             big_endian_fields: false,
         },
         Prepared {
+            geometry: crate::ath9k::channel_width::Geometry::from_frequency(2412).unwrap(),
             reference_frequency: 2412,
             high_power_gain: false,
             xe2_gain: false,

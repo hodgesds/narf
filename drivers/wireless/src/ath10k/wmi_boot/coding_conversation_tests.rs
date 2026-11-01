@@ -11,7 +11,7 @@ use super::*;
 /// Firmware HT word → IEEE capability low/high bytes of our request IE.
 fn local(ht: u32) -> u16 {
     let ldpc = ht & 0x40 != 0 || ht & 0x3000 == 0x3000;
-    u16::from(ldpc) | if ht & 0x30 != 0 { 0x100 } else { 0 }
+    u16::from(ldpc) | if ht & 0x30 != 0 { 0x100 } else { 0 } | if ht & 8 != 0 { 0x80 } else { 0 }
 }
 fn enable(h: &Harness, ht: u32, ap: u16) {
     super::ht_conversation_tests::enable(h);
@@ -51,7 +51,7 @@ fn smoke_ath10k_coding_native_service_bits_select_band_ht_capability() -> TestRe
                 (0x2001, 0),      // TX_LDPC alone likewise.
                 (0x11, 0x0100),   // One RX STBC stream.
                 (0x31, 0x0100),   // Three-stream firmware: one-stream profile.
-                (0x09, 0),        // TX STBC needs more than one TX chain.
+                (0x09, 0x0080),   // Native chainmask3 now selects two TX chains.
                 (0x3071, 0x0101), // Both coding facts together.
                 (0x70, 0),        // Coding bits never imply HT enablement.
             ] {
@@ -64,6 +64,7 @@ fn smoke_ath10k_coding_native_service_bits_select_band_ht_capability() -> TestRe
                         body[..2].copy_from_slice(&cap.to_le_bytes());
                         body[2] = 24;
                         body[3] = 255;
+                        body[4] = 255;
                         body[15] = 1;
                         body
                     });

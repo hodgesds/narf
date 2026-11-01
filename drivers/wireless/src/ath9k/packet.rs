@@ -80,6 +80,10 @@ pub(super) trait Port {
     fn channel_mask(&self) -> u16 {
         1
     }
+    fn geometry(&self) -> super::channel_width::Geometry {
+        super::channel_width::Geometry::from_frequency(self.frequency_mhz())
+            .expect("prepared physical primary")
+    }
     fn tx_ba_grant(&self) -> Option<alloc::sync::Arc<super::tx_ba::Grant>> {
         None
     }
@@ -439,6 +443,9 @@ impl<P: Port> Packet<P> {
         }
         self.port.access(self.phase != Phase::Prepared, || Ok(()))
     }
+    pub(super) fn geometry(&self) -> super::channel_width::Geometry {
+        self.port.geometry()
+    }
     pub(super) fn frequency_mhz(&self) -> u16 {
         self.port.frequency_mhz()
     }
@@ -563,6 +570,9 @@ impl<P: Port> Packet<P> {
         Ok(())
     }
     pub(super) fn set_ht(&mut self, profile: super::ht::Profile) -> Result<(), Error> {
+        if profile.geometry() != self.geometry() {
+            return Err(Error::State);
+        }
         if self.phase != Phase::Running || self.pending.is_some() || self.ht.is_some() {
             return Err(Error::State);
         }

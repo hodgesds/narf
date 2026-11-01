@@ -628,6 +628,9 @@ pub struct Hardware {
     versions: Vec<u8>,
     band_in_rx: bool,
     scan_fixed_antenna: bool,
+    /// Actual TLV capabilities59(hidden6GHz) and10(TPC report), separate
+    /// from API59(BAND_IN_RX_DATA) and from the native MLD consumer.
+    scan_six_capabilities: u8,
     /// The actual installed6GHz AP power/HE snapshot. This constraint
     /// gate is checked after native credit waits at every TX publication.
     six_tx_profile: Option<alloc::sync::Arc<super::six_ghz_station::Profile>>,
@@ -747,6 +750,8 @@ impl Hardware {
             versions: parsed.api.commands.to_vec(),
             band_in_rx: parsed.api.api_changes[1] & (1 << 27) != 0,
             scan_fixed_antenna: parsed.api.has_capability(111),
+            scan_six_capabilities: u8::from(parsed.api.has_capability(59))
+                | (u8::from(parsed.api.has_capability(10)) << 1),
             six_tx_profile: None,
             mld_link: None,
             eht_source: None,
@@ -810,6 +815,9 @@ impl Hardware {
             || self.versions != parsed.api.commands
             || self.band_in_rx != (parsed.api.api_changes[1] & (1 << 27) != 0)
             || self.scan_fixed_antenna != parsed.api.has_capability(111)
+            || self.scan_six_capabilities
+                != (u8::from(parsed.api.has_capability(59))
+                    | (u8::from(parsed.api.has_capability(10)) << 1))
             || self.resources.boot.phy_config != parsed.api.phy_config
         {
             return false;
@@ -1779,7 +1787,24 @@ impl Hardware {
         closing: bool,
         assist: u32,
     ) -> Result<(), &'static str> {
-        self.wait_tx_space(id).await?;
+        // A credit wait can copy a newer AP TPE. Resolve its exact native
+        // power receipt before publishing this still-unsubmitted frame.
+        let mut ready = false;
+        for _ in 0..16 {
+            self.wait_tx_space(id).await?;
+            match self.check_six_tx_publication() {
+                Ok(()) => {
+                    ready = true;
+                    break;
+                }
+                Err(super::six_ghz_station::UPDATE_REQUIRED) => self.service_six_power().await?,
+                Err(reason) => return Err(reason),
+            }
+        }
+        if !ready {
+            self.fail();
+            return Err("6GHz TPE changed continuously before TX publication");
+        }
         if !closing
             && self
                 .station_stop

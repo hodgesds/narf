@@ -155,6 +155,7 @@ pub(super) struct Profile {
     rx80: u16,
     rx_wide_stbc: bool,
     rates_version: u8,
+    tx_flags: u16,
     /// ACI-indexed three-byte source records, not firmware AC order.
     mu_edca: Option<[[u8; 3]; 4]>,
     uora: Option<u8>,
@@ -195,9 +196,43 @@ impl Profile {
             rx80: local.rx80,
             rx_wide_stbc,
             rates_version,
+            tx_flags: u16::from(negotiation.tx_stbc()) | u16::from(negotiation.tx_ldpc()) << 1,
             mu_edca,
             uora,
         })
+    }
+    /// Cap each width by its original AP RX map. A160→80 response
+    /// must use original RX80, never intersect an unrelated RX160 slot.
+    pub fn bound_original(mut self, original: &HeNegotiation) -> Result<Self, &'static str> {
+        let old = original.peer_capability().mcs_nss();
+        let intersect = |a: u16, b: u16| {
+            let mut out = 0xffff;
+            for nss in 0..8 {
+                let x = (a >> (nss * 2)) & 3;
+                let y = (b >> (nss * 2)) & 3;
+                let value = if x == 3 || y == 3 { 3 } else { x.min(y) };
+                out = (out & !(3 << (nss * 2))) | (value << (nss * 2));
+            }
+            out
+        };
+        self.tx80 = intersect(self.tx80, old.rx80);
+        let map = if self.negotiation.width() == narf_wireless::association::phy::Width::OneSixty {
+            old.rx160
+        } else {
+            old.rx80
+        };
+        self.tx_map = intersect(self.tx_map, map);
+        self.tx_flags &= u16::from(original.tx_stbc()) | u16::from(original.tx_ldpc()) << 1;
+        let basic = self.negotiation.operation().basic_mcs_nss();
+        let covers = (0..8).all(|nss| {
+            let have = (self.tx_map >> (2 * nss)) & 3;
+            let need = (basic >> (2 * nss)) & 3;
+            need == 3 || have != 3 && have >= need
+        });
+        if !covers || self.tx80 & 3 == 3 || self.tx_map & 3 == 3 {
+            return Err("6GHz response has no originally offered HE MCS");
+        }
+        Ok(self)
     }
     pub fn matches(&self, ies: &[u8]) -> bool {
         // Compare only HE facts here: HT/VHT have their own native
@@ -361,11 +396,7 @@ impl Profile {
         };
         bytes[9] = 3;
         bytes[11] = 0;
-        put16(
-            bytes,
-            12,
-            u16::from(self.negotiation.tx_stbc()) | u16::from(self.negotiation.tx_ldpc()) << 1,
-        );
+        put16(bytes, 12, self.tx_flags);
         bytes[16..40].fill(0);
         for stream in 0..2 {
             let bits = |map: u16| match (map >> (stream * 2)) & 3 {

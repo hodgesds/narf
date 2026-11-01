@@ -209,3 +209,6 @@ pub(super) fn program(
 }
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;
+
+/// Full20/40 exact primary/extension/center power program; v1/v2 remain20.
+pub(in crate::ath9k) mod wide;

@@ -41,6 +41,7 @@ impl Facts {
             || id.tx_chainmask != 1
             || id.rx_chainmask != 1
             || !id.ht20(image)
+            || base.geometry.is_wide()
             || base.reference_frequency != report.frequency_mhz
             || !(2412..=2472).contains(&report.frequency_mhz)
             || (report.frequency_mhz - 2412) % 5 != 0
@@ -144,6 +145,10 @@ pub(super) struct Grant {
     ceiling: i16,
     mcs: u8,
     digest: [u8; 32],
+    wide: Option<(
+        Arc<super::ht40::Grant>,
+        super::calibration::wide::WideReport,
+    )>,
 }
 pub(super) enum Source {
     Registered,
@@ -220,6 +225,7 @@ impl Grant {
         }
         let signed = |at| i16::from_le_bytes([b[at], b[at + 1]]);
         let g = Self {
+            wide: None,
             digest: {
                 let mut hash = narf_crypto::sha256::Sha256::new();
                 hash.update(b);
@@ -246,6 +252,9 @@ impl Grant {
         &self,
         operation: impl FnOnce() -> Result<T, Error>,
     ) -> Result<T, Error> {
+        if let Some((grant, _)) = &self.wide {
+            return grant.invoke(operation);
+        }
         struct Live<'a, F>(&'a Grant, F);
         impl<T, F: FnOnce() -> Result<T, Error>> CapOp<FirmwareBlob, Read> for Live<'_, F> {
             type Output = Result<T, Error>;
@@ -285,7 +294,44 @@ impl Grant {
         self.invoke(|| Ok(()))
     }
     pub(super) fn local(&self) -> LocalPhy {
-        local(self.mcs).expect("validated HT mask").0
+        self.wide.as_ref().map_or_else(
+            || local(self.mcs).expect("validated HT mask").0,
+            |(grant, _)| grant.local(),
+        )
+    }
+    pub(super) fn from_wide(
+        grant: Arc<super::ht40::Grant>,
+        actual: super::calibration::wide::WideReport,
+    ) -> Result<Arc<Self>, Error> {
+        grant.accept(actual)?;
+        let base = grant.base();
+        let (antenna, ceiling) = grant.ba_limit();
+        Ok(Arc::new(Self {
+            facts: base.facts.clone(),
+            cap: base.cap,
+            peaks: base.peaks,
+            antenna,
+            ceiling,
+            mcs: grant.mcs(),
+            digest: grant.ba_identity().1,
+            wide: Some((grant, actual)),
+        }))
+    }
+    pub(super) fn geometry(&self) -> super::channel_width::Geometry {
+        self.wide.as_ref().map_or_else(
+            || {
+                super::channel_width::Geometry::from_frequency(self.frequency())
+                    .expect("validated primary")
+            },
+            |(_, actual)| actual.geometry,
+        )
+    }
+    pub(super) fn child_geometry(&self, program: u8) -> [u8; 4] {
+        if self.wide.is_some() {
+            self.geometry().body()
+        } else {
+            [self.channel(), 20, 1, program]
+        }
     }
     pub(super) fn mcs(&self) -> u8 {
         self.mcs
@@ -297,6 +343,9 @@ impl Grant {
         ((self.frequency() - 2407) / 5) as u8
     }
     pub(super) fn version(&self) -> u8 {
+        if self.wide.is_some() {
+            return 3;
+        }
         if self.frequency() == 2412 {
             1
         } else {
@@ -304,12 +353,18 @@ impl Grant {
         }
     }
     pub(super) fn span(&self) -> (u32, u32) {
+        if let Some((grant, _)) = &self.wide {
+            return grant.geometry().span();
+        }
         (
             u32::from(self.frequency()) - 10,
             u32::from(self.frequency()) + 10,
         )
     }
     pub(super) fn ba_identity(&self) -> ([u8; 32], [u8; 32], [u8; 6]) {
+        if let Some((grant, _)) = &self.wide {
+            return grant.ba_identity();
+        }
         (
             self.facts.request.identity,
             self.digest,
@@ -320,6 +375,9 @@ impl Grant {
         (self.antenna, self.ceiling)
     }
     pub(super) fn readback(&self, io: &impl Port) -> Result<(), Error> {
+        if let Some((grant, actual)) = &self.wide {
+            return grant.readback(io, *actual);
+        }
         self.check()?;
         for (r, v) in self.facts.powers {
             if io.read(r)? != v {
@@ -354,6 +412,10 @@ pub(super) struct Profile {
     be: narf_wireless::wmm::Ac,
     rx_stbc: bool,
     rts: bool,
+    geometry: super::channel_width::Geometry,
+    allow_twenty_secondary: bool,
+    tx_sgi40: bool,
+    rx_sgi40: bool,
 }
 impl Profile {
     pub(super) fn mcs(self) -> u8 {
@@ -368,14 +430,40 @@ impl Profile {
     pub(super) fn rts(self) -> bool {
         self.rts
     }
+    pub(super) fn geometry(self) -> super::channel_width::Geometry {
+        self.geometry
+    }
+    pub(super) fn tx_sgi40(self) -> bool {
+        self.tx_sgi40
+    }
+    pub(super) fn duration(self, air: usize, mcs: u8) -> Option<u32> {
+        self.geometry.ht_duration(self.tx_sgi40, air, mcs)
+    }
+    pub(super) fn accepts_rx(self, rate: usize, flags: u32) -> bool {
+        let wide = flags & 2 != 0;
+        let short = flags & 1 != 0;
+        flags & 4 == 0
+            && (!wide || self.geometry.is_wide())
+            && (!short || wide && self.rx_sgi40)
+            && (rate >= 12 || !wide && !short)
+    }
     pub(super) fn observe(
         mut self,
         offer: &Offer,
         ies: &[u8],
         basic: usize,
     ) -> Result<Self, Error> {
-        if offer.width() != Width::Twenty
-            || offer.ht().operation().secondary().is_some()
+        if offer.width()
+            != if self.geometry.is_wide() {
+                Width::Forty
+            } else {
+                Width::Twenty
+            }
+            || self.geometry.is_wide()
+                && offer.ht().operation().secondary() != self.geometry.secondary()
+            || !self.geometry.is_wide()
+                && !self.allow_twenty_secondary
+                && offer.ht().operation().secondary().is_some()
             || contention(ies)? != self.be
             || self.mcs & !offer.ht().tx_mcs()[0] != 0
         {
@@ -386,6 +474,7 @@ impl Profile {
             return Err(Error::Packet);
         }
         self.rx_stbc &= offer.ht().peer_capability() & 0x80 != 0;
+        self.tx_sgi40 &= offer.ht().tx_sgi40();
         Ok(self)
     }
 }
@@ -395,9 +484,19 @@ pub(super) fn response(
     offer_ies: &[u8],
     ies: &[u8],
     basic: usize,
+    geometry: super::channel_width::Geometry,
+    allow_twenty_secondary: bool,
 ) -> Result<Profile, Error> {
-    if n.width() != Width::Twenty
-        || n.ht().operation().secondary().is_some()
+    if n.width()
+        != if geometry.is_wide() {
+            Width::Forty
+        } else {
+            Width::Twenty
+        }
+        || geometry.is_wide() && n.ht().operation().secondary() != geometry.secondary()
+        || !geometry.is_wide()
+            && !allow_twenty_secondary
+            && n.ht().operation().secondary().is_some()
         || n.ht().tx_sgi20()
         || n.ht().rx_sgi20()
     {
@@ -418,6 +517,10 @@ pub(super) fn response(
         return Err(Error::Packet);
     }
     Ok(Profile {
+        geometry,
+        allow_twenty_secondary,
+        tx_sgi40: geometry.is_wide() && n.ht().tx_sgi40(),
+        rx_sgi40: geometry.is_wide() && n.ht().rx_sgi40(),
         mcs: tx[0],
         be,
         rx_stbc: n.ht().rx_stbc()

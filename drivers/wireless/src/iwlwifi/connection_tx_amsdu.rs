@@ -105,7 +105,10 @@ impl Connection {
         // exclusion from this actual QoS header. No pre-encryption or host
         // PTK/PN synthesis is involved. Current source/policy is invoked at
         // the actual descriptor/doorbell publication inside enqueue.
-        hw.enqueue_transmit_assisted(queue, &frame, 26, None, 1 << 14)?;
+        match hw.enqueue_transmit_assisted(queue, &frame, 26, None, 1 << 14) {
+            Err(super::super::six_ghz_station::UPDATE_REQUIRED) => return Ok(Batch::Busy),
+            result => result?,
+        }
         self.sequence = self.sequence.wrapping_add(1);
         Ok(Batch::Sent)
     }

@@ -20,6 +20,7 @@ mod dwell_scan;
 pub(in crate::ath10k) use active_scan::checked as checked_policy;
 pub(in crate::ath10k) use associated_scan::receive_permission;
 pub(in crate::ath10k) use dwell_scan::ScanPolicy;
+mod chains;
 mod data;
 mod ht;
 mod mlme;
@@ -109,6 +110,7 @@ pub(super) struct Radio<T> {
     failed: bool,
     power_save: Option<bool>,
     protection: Option<StationProtection>,
+    chains: Option<chains::Chains>,
 }
 impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn configured_channels(&self) -> &[u16] {
@@ -139,6 +141,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             failed: false,
             power_save: None,
             protection: None,
+            chains: None,
         }
     }
     /// No country policy is inferred here: these are receive-only IEEE
@@ -174,16 +177,41 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let mac = self.htt.wmi.ready.ok_or(Error::Failed)?.mac;
         let create = self.wire.create(mac)?;
         let configured = self.wire.channels(channels)?;
+        let chains =
+            chains::Chains::new(self.htt.wmi.initialized_chain_mask.ok_or(Error::Failed)?)?;
+        let chain_commands = chains.commands(self.wire.dialect)?;
+        let vdev_nss = chains.vdev_nss(self.wire.dialect)?;
         self.channels
             .try_reserve_exact(channels.len())
             .map_err(|_| Error::NoMemory)?;
         // No await can expose a reusable vdev/command owner after an
         // ambiguous publication. DMA remains in the nested mission owner.
         self.failed = true;
+        for command in chain_commands {
+            self.htt
+                .wmi
+                .htc
+                .transport
+                .check_current()
+                .map_err(crate::ath10k::control::Error::from)
+                .map_err(htt::Error::from)?;
+            self.htt
+                .wmi
+                .htc
+                .send_wmi(&command)
+                .await
+                .map_err(htt::Error::from)?;
+        }
         self.htt
             .wmi
             .htc
             .send_wmi(&create)
+            .await
+            .map_err(htt::Error::from)?;
+        self.htt
+            .wmi
+            .htc
+            .send_wmi(&vdev_nss)
             .await
             .map_err(htt::Error::from)?;
         self.htt
@@ -197,6 +225,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             mac,
             channels: channels.len() as u8,
         };
+        self.htt
+            .wmi
+            .htc
+            .transport
+            .check_current()
+            .map_err(crate::ath10k::control::Error::from)
+            .map_err(htt::Error::from)?;
+        self.chains = Some(chains);
         self.ready = Some(ready);
         self.failed = false;
         Ok(ready)

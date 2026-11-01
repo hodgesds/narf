@@ -143,6 +143,35 @@ impl Model {
         }
         out
     }
+    pub fn response_width(mut self, width: u8) -> Self {
+        self.expected_width = width;
+        self
+    }
+    pub fn complete_response(self, frame: &mut Vec<u8>, fault: Fault) -> R {
+        if fault == Fault::SixResponseNarrow80 {
+            let mut response = self;
+            response.ap_width = 2;
+            response.center = self.block_center(2);
+            response.complete_ap_frame(frame)?;
+        } else {
+            self.complete_ap_frame(frame)?;
+        }
+        if matches!(
+            fault,
+            Fault::SixResponseWithoutTpe | Fault::SixResponseNarrow80
+        ) {
+            let ies = six_ghz_tests::without(&frame[30..], 195, None);
+            let ies = six_ghz_tests::without(&ies, 255, Some(59));
+            let ies = if fault == Fault::SixResponseWithoutTpe {
+                six_ghz_tests::without(&ies, 255, Some(106))
+            } else {
+                ies
+            };
+            frame.truncate(30);
+            frame.extend_from_slice(&ies);
+        }
+        Ok(())
+    }
     pub fn complete_ap_frame(self, frame: &mut Vec<u8>) -> R {
         let prefix = if frame[0] == 0x80 { 36 } else { 30 };
         let mut rest = frame.get(prefix..).ok_or("wide6 authored AP header")?;
@@ -776,30 +805,47 @@ fn queued_tpe_tightening() -> R {
         wire.firmware
             .inject_packed(&vec![(0xab, 5, 0x8000, &[][..]); 64]);
         let mut beacon = wire.ap.beacon();
-        Model {
+        let tighter = Model {
             psd_shift: -1,
             ..model
-        }
-        .complete_ap_frame(&mut beacon)?;
+        };
+        tighter.complete_ap_frame(&mut beacon)?;
+        wire.wide_six = Some(tighter);
+        wire.fault = Fault::HoldSixPower;
         wire.mpdu(&beacon, false);
         wire.data.len()
     };
-    drain();
-    let owner = guard
-        .device()
-        .state
-        .try_lock()
-        .ok_or("native320 final-send owner")?;
-    require(
-        owner.hardware.is_failed() && owner.needs_reset && !owner.hardware.notifications.is_empty(),
-        "native320 queued stricter PSD escaped beyond receive budget",
-    )?;
-    drop(owner);
-    let unpublished = HARNESS.lock().as_ref().unwrap().1.data.len() == before;
+    for _ in 0..256 {
+        service()?;
+        drain();
+        if HARNESS.lock().as_ref().unwrap().1.held.is_some() {
+            break;
+        }
+    }
+    let unpublished = {
+        let slot = HARNESS.lock();
+        let wire = &slot.as_ref().unwrap().1;
+        wire.held.is_some() && wire.data.len() == before
+    };
     require(
         unpublished,
-        "native320 stale PSD reached actual TX publication",
-    )
+        "native320 queued PSD escaped before its new native receipt",
+    )?;
+    six_ghz_tests::release_power()?;
+    for _ in 0..256 {
+        service()?;
+        drain();
+        if HARNESS.lock().as_ref().unwrap().1.data.len() > before {
+            break;
+        }
+    }
+    let resumed = HARNESS.lock().as_ref().unwrap().1.data.len() == before + 1;
+    require(
+        resumed,
+        "native320 DATA did not resume after current tighter PSD receipt",
+    )?;
+    carrier(guard.device(), true)?;
+    close(&guard)
 }
 #[inline(never)]
 fn current_mcc_width_withdrawal() -> R {
@@ -928,4 +974,139 @@ fn smoke_iwl_six_ghz_320_queued_tpe_current_mcc_and_dropped_power_owner_close_tx
 kernel_test_in!(
     "drivers/wireless/iwlwifi/six_ghz_320",
     smoke_iwl_six_ghz_320_queued_tpe_current_mcc_and_dropped_power_owner_close_tx
+);
+
+fn smoke_iwl_six_ghz_response_refines_actual_span_maps_with_retained_beacon_tpe() -> TestResult {
+    check(|| {
+        for fault in [Fault::SixResponseWithoutTpe, Fault::SixResponseNarrow80] {
+            let model = Model::default();
+            let guard = setup(model, None, false, 0x0050, fault)?;
+            join(&guard, model)?;
+            let slot = HARNESS.lock();
+            let wire = &slot.as_ref().unwrap().1;
+            let width = if fault == Fault::SixResponseNarrow80 {
+                2
+            } else {
+                4
+            };
+            let phy = &wire
+                .commands
+                .iter()
+                .rev()
+                .find(|(g, c, _)| (*g, *c) == (1, 8))
+                .ok_or("refined6GHz PHY missing")?
+                .2;
+            let tlc = &wire
+                .commands
+                .iter()
+                .rev()
+                .find(|(g, c, _)| (*g, *c) == (5, 0xf))
+                .ok_or("refined6GHz TLC missing")?
+                .2;
+            let power = &wire
+                .commands
+                .iter()
+                .rev()
+                .find(|(g, c, _)| (*g, *c) == (4, 0xc))
+                .ok_or("refined6GHz AP constraints missing")?
+                .2;
+            require(
+                phy[13] == width
+                    && tlc[8] == width
+                    && tlc[9] == 4
+                    && power.as_slice() == model.response_width(width).expected_power().as_slice()
+                    && wire
+                        .commands
+                        .iter()
+                        .filter(|(g, c, _)| (*g, *c) == (4, 0xc))
+                        .count()
+                        >= 2,
+                "6GHz response relabelled width/maps or lost retained beacon TPE/native receipt",
+            )?;
+            if width == 2 {
+                require(
+                    word(tlc, 20) == 0
+                        && word(tlc, 24) == 0
+                        && word(tlc, 32) == 0
+                        && word(tlc, 36) == 0,
+                    "6GHz narrowed80 response retained unselected160/320 native TLC maps",
+                )?;
+            }
+            drop(slot);
+            if width == 2 {
+                // The actual native flow above narrows320→80. Independently
+                // increase the response's RX80 ceiling to MCS11 and require
+                // native HE TLC to retain original RX80's MCS7 ceiling.
+                let beacon = guard
+                    .device()
+                    .state
+                    .try_lock()
+                    .ok_or("refinement original cache owner")?
+                    .beacons[0]
+                    .clone();
+                let (_, original) = super::super::super::six_ghz_station::prepare(
+                    &beacon,
+                    OWN,
+                    &super::super::super::connection::AuthMethod::Wpa3Sae {
+                        password: PASSWORD.to_vec(),
+                    },
+                    guard.device().phy,
+                    &policy(),
+                    None,
+                )?;
+                let mut response = vec![0; 30];
+                response[0] = 0x10;
+                model.complete_response(&mut response, Fault::SixResponseNarrow80)?;
+                let mut at = 30;
+                while at < response.len() {
+                    let len = usize::from(response[at + 1]);
+                    if response[at] == 255 && response[at + 2] == 35 {
+                        response[at + 20..at + 22].copy_from_slice(&0xfffau16.to_le_bytes());
+                    }
+                    at += 2 + len;
+                }
+                let mcc = super::super::super::mld_regulatory::Mcc {
+                    channels: vec![0x6e09; 110].into(),
+                    country: *b"US",
+                    etsi_5ghz: false,
+                    he_allowed: true,
+                    eht_allowed: true,
+                    widths: super::super::super::gen3_wire::Widths {
+                        forty: true,
+                        eighty: true,
+                        one_sixty: true,
+                        three_twenty: true,
+                    },
+                };
+                let refined = original.refine(&response[30..], &policy(), &mcc)?;
+                let he = super::super::super::sc_he::Profile::new(
+                    *refined.plan.he(),
+                    &response[30..],
+                    false,
+                    3,
+                )?
+                .bound_original(original.original().he())?;
+                let mut literal = [0; 44];
+                he.apply_tlc(&mut literal)?;
+                require(
+                    literal[8] == 2 && word(&literal, 16) == 0xff && word(&literal, 28) == 0xff,
+                    "6GHz response invented HE MCS or intersected original160 rather than RX80",
+                )?;
+                let missing = six_ghz_tests::without(&response[30..], 255, Some(35));
+                require(
+                    original.refine(&missing, &policy(), &mcc).is_err(),
+                    "6GHz response inherited missing mandatory HE capability from beacon",
+                )?;
+            }
+            let lease = narf_net::dhcp::dhcp_acquire(guard.device().name(), 0)
+                .map_err(|_| "refined6GHz protected DHCP")?;
+            require(NETWORK.matches_lease(&lease), "refined6GHz DHCP lease")?;
+            close(&guard)?;
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/six_ghz",
+    smoke_iwl_six_ghz_response_refines_actual_span_maps_with_retained_beacon_tpe
 );

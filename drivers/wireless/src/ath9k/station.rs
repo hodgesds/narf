@@ -24,6 +24,7 @@ pub(super) enum Error {
     Entropy,
     Timeout,
     PeerLost,
+    WidthFallback,
     Transport(packet::Error),
     Management(association::Error),
     Security(station_security::Error),
@@ -58,6 +59,24 @@ pub(super) trait Environment: Send + Sync {
     fn retune(&self, _frequency: u16) -> Option<super::channels::Transition> {
         None
     }
+    fn wide_qualification(
+        &self,
+        _base: Arc<super::ht::Grant>,
+        _geometry: super::channel_width::Geometry,
+    ) -> Result<Option<Arc<super::ht40::Grant>>, Error> {
+        Ok(None)
+    }
+    fn retune_geometry(
+        &self,
+        geometry: super::channel_width::Geometry,
+        _wide: Option<Arc<super::ht40::Grant>>,
+    ) -> Option<super::channels::Transition> {
+        if geometry.is_wide() {
+            None
+        } else {
+            self.retune(geometry.control())
+        }
+    }
     fn now_ms(&self) -> u64;
     fn nonce(&self) -> Option<[u8; 32]>;
     fn pause(&self) -> impl Future<Output = ()> + Send;
@@ -69,6 +88,23 @@ impl Environment for NativeEnvironment {
     fn retune(&self, frequency: u16) -> Option<super::channels::Transition> {
         Some(
             super::channels::request(frequency, self.generation)
+                .unwrap_or_else(|error| alloc::boxed::Box::pin(async move { Err(error) })),
+        )
+    }
+    fn wide_qualification(
+        &self,
+        base: Arc<super::ht::Grant>,
+        geometry: super::channel_width::Geometry,
+    ) -> Result<Option<Arc<super::ht40::Grant>>, Error> {
+        super::wide_qualification(base, geometry, self.generation)
+    }
+    fn retune_geometry(
+        &self,
+        geometry: super::channel_width::Geometry,
+        wide: Option<Arc<super::ht40::Grant>>,
+    ) -> Option<super::channels::Transition> {
+        Some(
+            super::channels::request_geometry(geometry, self.generation, wide)
                 .unwrap_or_else(|error| alloc::boxed::Box::pin(async move { Err(error) })),
         )
     }
@@ -163,6 +199,7 @@ pub(super) struct Radio<P: Port, E: Environment> {
     last_now: u64,
     rates: Option<super::rates::Control>,
     ht: Option<u8>,
+    force_twenty: bool,
     epoch: u64,
 }
 impl<P: Port, E: Environment> core::fmt::Debug for Radio<P, E> {
@@ -206,6 +243,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
             last_now: 0,
             rates: None,
             ht: None,
+            force_twenty: false,
             epoch: 1,
         }
     }
@@ -218,6 +256,76 @@ impl<P: Port, E: Environment> Radio<P, E> {
     /// Capture an owned transition before releasing this generation's lock.
     pub(super) fn retune(&self, frequency: u16) -> Option<super::channels::Transition> {
         self.environment.retune(frequency)
+    }
+    pub(super) fn geometry(&self) -> super::channel_width::Geometry {
+        self.packet.geometry()
+    }
+    pub(super) fn ht_grant(&self) -> Option<Arc<super::ht::Grant>> {
+        self.packet.ht_grant()
+    }
+    pub(super) fn retune_width(
+        &self,
+        geometry: super::channel_width::Geometry,
+        wide: Option<Arc<super::ht40::Grant>>,
+    ) -> Option<super::channels::Transition> {
+        self.environment.retune_geometry(geometry, wide)
+    }
+    pub(super) fn preferred_width(
+        &self,
+        peer: [u8; 6],
+    ) -> Result<Option<Arc<super::ht40::Grant>>, Error> {
+        if self.geometry().is_wide() {
+            return Ok(None);
+        }
+        let Some(base) = self.packet.ht_grant() else {
+            return Ok(None);
+        };
+        base.check()?;
+        let candidate = self
+            .candidates()
+            .into_iter()
+            .find(|entry| entry.bss.bssid == peer)
+            .ok_or(Error::Profile)?;
+        let elements = narf_wireless::association::phy::ApElements::parse(
+            &candidate.bss.information_elements,
+        )?;
+        let Some(operation) = elements.ht_operation() else {
+            return Ok(None);
+        };
+        if operation[0] != self.channel() || operation[1] & 4 == 0 {
+            return Ok(None);
+        }
+        let width = match operation[1] & 3 {
+            1 => super::channel_width::Width::FortyAbove,
+            3 => super::channel_width::Width::FortyBelow,
+            _ => return Ok(None),
+        };
+        let geometry = super::channel_width::Geometry::new(self.channel(), width)
+            .map_err(|_| Error::Profile)?;
+        let Some(grant) = self.environment.wide_qualification(base, geometry)? else {
+            return Ok(None);
+        };
+        // Fully validate the offered primary/secondary and peer capabilities
+        // through the real common parser, not just the preliminary IE hint.
+        let mode = if candidate.ap_rsne.is_some() {
+            SecurityMode::Wpa2Psk
+        } else {
+            SecurityMode::Open
+        };
+        let plan = JoinPlan::prepare_with_phy(
+            &candidate.bss,
+            self.own,
+            &candidate.bss.ssid,
+            mode,
+            grant.local(),
+        )?;
+        if !plan.offered_phy().is_some_and(|offer| {
+            offer.width() == association::phy::Width::Forty
+                && offer.ht().operation().secondary() == geometry.secondary()
+        }) {
+            return Ok(None);
+        }
+        Ok(Some(grant))
     }
     pub(super) fn frequency_mhz(&self) -> u16 {
         self.packet.frequency_mhz()
@@ -865,6 +973,19 @@ impl<P: Port, E: Environment> Radio<P, E> {
                         .ok_or(Error::State)?
                         .association_response(frame.bytes())?
                     {
+                        if self.geometry().is_wide()
+                            && self
+                                .plan
+                                .as_ref()
+                                .and_then(JoinPlan::negotiated_phy)
+                                .is_none_or(|n| {
+                                    n.width() != association::phy::Width::Forty
+                                        || n.ht().operation().secondary()
+                                            != self.geometry().secondary()
+                                })
+                        {
+                            return Err(Error::WidthFallback);
+                        }
                         let peer = self.peer.as_ref().ok_or(Error::State)?;
                         let response_cap =
                             u16::from_le_bytes([frame.bytes()[24], frame.bytes()[25]]);
@@ -886,6 +1007,8 @@ impl<P: Port, E: Environment> Radio<P, E> {
                                 &peer.bss.information_elements,
                                 &frame.bytes()[30..],
                                 self.rates.ok_or(Error::State)?.basic(),
+                                self.geometry(),
+                                self.force_twenty,
                             )?;
                             self.packet.set_ht(profile)?;
                             self.ht = Some(profile.mcs());
@@ -1272,6 +1395,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
             self.environment.pause().await;
         }
     }
+    #[cfg(feature = "kernel-test")]
     pub(super) async fn associate(
         &mut self,
         bssid: [u8; 6],
@@ -1279,6 +1403,17 @@ impl<P: Port, E: Environment> Radio<P, E> {
         pmk: Option<Zeroizing<[u8; 32]>>,
         ies: &[u8],
     ) -> Result<(), Error> {
+        self.associate_mode(bssid, ssid, pmk, ies, false).await
+    }
+    pub(super) async fn associate_mode(
+        &mut self,
+        bssid: [u8; 6],
+        ssid: &[u8],
+        pmk: Option<Zeroizing<[u8; 32]>>,
+        ies: &[u8],
+        force_twenty: bool,
+    ) -> Result<(), Error> {
+        self.force_twenty = force_twenty;
         if self.phase() != Phase::Passive {
             return Err(Error::State);
         }
@@ -1299,8 +1434,17 @@ impl<P: Port, E: Environment> Radio<P, E> {
         let mut plan = if let Some(g) = grant {
             let plan = JoinPlan::prepare_with_phy(&candidate.bss, self.own, ssid, mode, g.local())?;
             if let Some(offer) = plan.offered_phy() {
-                if offer.ht().operation().secondary().is_some() {
+                if !self.geometry().is_wide()
+                    && !force_twenty
+                    && offer.ht().operation().secondary().is_some()
+                {
                     return Err(Error::Profile);
+                }
+                if self.geometry().is_wide()
+                    && (offer.width() != association::phy::Width::Forty
+                        || offer.ht().operation().secondary() != self.geometry().secondary())
+                {
+                    return Err(Error::WidthFallback);
                 }
                 super::ht::contention(&candidate.bss.information_elements)?;
             }

@@ -78,7 +78,8 @@ pub(in crate::ath9k) struct Peer {
     pub(in crate::ath9k) hold_m4: bool,
     pub(in crate::ath9k) hold_data: bool,
     pub(in crate::ath9k) ht: Option<Vec<u8>>,
-    ht_response: Option<Vec<u8>>,
+    pub(in crate::ath9k) ht_response: Option<Vec<u8>>,
+    pub(in crate::ath9k) expected_ht_cap: [u8; 2],
     pub(in crate::ath9k) ht_active: bool,
     pub(in crate::ath9k) declines: Vec<Vec<u8>>,
     pub(in crate::ath9k) hold_decline: bool,
@@ -148,6 +149,7 @@ impl Peer {
             hold_data: false,
             ht: None,
             ht_response: None,
+            expected_ht_cap: [12, 1],
             ht_active: false,
             declines: Vec::new(),
             hold_decline: false,
@@ -398,7 +400,11 @@ impl Peer {
                         ies = &ies[end..];
                     }
                     if let Some(cap) = ht {
-                        if cap.len() != 28 || cap[2..4] != [12, 1] || cap[5] != 255 || !wmm {
+                        if cap.len() != 28
+                            || cap[2..4] != self.expected_ht_cap
+                            || cap[5] != 255
+                            || !wmm
+                        {
                             return Err("native local HT/WMM/SGI20");
                         }
                         replies[0]

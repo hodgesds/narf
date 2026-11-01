@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 //! Linux scheduled-scan wire helpers. These bytes grant no firmware,
 //! PCI, regulatory, receive or autonomous-emission authority.
-use super::{ht_vht, scan_api};
+use super::{
+    ht_vht,
+    native_band::{Band, Channel},
+    scan_api,
+};
 use alloc::{vec, vec::Vec};
 use narf_wireless::{NetDetectMatch, NetDetectScanPlan};
 
@@ -127,23 +131,47 @@ pub(super) fn request(
     phy: ht_vht::Local,
     request: &narf_wireless::SchedScanRequest,
 ) -> Result<Vec<u8>, &'static str> {
-    if permitted.len() != channels.len() {
-        return Err("scheduled per-channel permissions differ from request");
+    let typed: Vec<_> = channels
+        .iter()
+        .map(|&channel| Channel::legacy(channel).ok_or("invalid legacy periodic channel"))
+        .collect::<Result<_, _>>()?;
+    request_channels(version, &typed, permitted, local, phy, request)
+}
+
+pub(super) fn request_channels(
+    version: u8,
+    channels: &[Channel],
+    permitted: &[bool],
+    local: [u8; 6],
+    phy: ht_vht::Local,
+    request: &narf_wireless::SchedScanRequest,
+) -> Result<Vec<u8>, &'static str> {
+    if permitted.len() != channels.len()
+        || channels
+            .iter()
+            .any(|ch| ch.band == Band::Six && ch.number % 16 != 5)
+    {
+        return Err("scheduled per-channel permissions/PSC differ from native request");
     }
     let ssids = ssids(&request.matches, &request.probe_ssids)?;
-    let active = !request.probe_ssids.is_empty() && permitted.iter().any(|&p| p);
-    let mut body = if active {
-        scan_api::active(
-            version,
-            UID,
-            channels,
-            permitted,
-            local,
-            &request.probe_ssids,
-        )?
-    } else {
-        scan_api::passive(version, UID, channels)?
-    };
+    let active = !request.probe_ssids.is_empty()
+        && channels
+            .iter()
+            .zip(permitted)
+            .any(|(ch, &allowed)| allowed && ch.band != Band::Six);
+    let effective: Vec<_> = channels
+        .iter()
+        .zip(permitted)
+        .map(|(ch, &allowed)| active && allowed && ch.band != Band::Six)
+        .collect();
+    let mut body = scan_api::periodic_channels(
+        version,
+        UID,
+        channels,
+        &effective,
+        local,
+        &request.probe_ssids,
+    )?;
     scan_api::with_phy_capabilities(version, &mut body, phy)?;
     let capacity = if version == 18 { 68 } else { 67 };
     let periodic_at = 48 + capacity * 8;
@@ -164,7 +192,7 @@ pub(super) fn request(
     // iwl_mld_scan_ooc_priority: periodic/scheduled scans use EXT_2;
     // scan_priority inside general params stays EXT_6 like Linux.
     body[4..8].copy_from_slice(&2u32.to_le_bytes());
-    for (i, &allowed) in permitted.iter().enumerate() {
+    for (i, &allowed) in effective.iter().enumerate() {
         let at = 48 + i * 8;
         let flags = u32::from_le_bytes(body[at..at + 4].try_into().unwrap()) & !0xfffff;
         body[at..at + 4].copy_from_slice(
@@ -230,13 +258,26 @@ pub(super) fn copied_bss(
     channels: &[u8],
     request: &narf_wireless::SchedScanRequest,
 ) -> Option<(super::connection::Beacon, narf_wireless::BssInfo)> {
+    let typed: Vec<_> = channels
+        .iter()
+        .filter_map(|&ch| Channel::legacy(ch))
+        .collect();
+    copied_bss_channels(packet, gen2, false, &typed, request)
+}
+pub(super) fn copied_bss_channels(
+    packet: &super::runtime::Packet,
+    gen2: bool,
+    band_in_rx: bool,
+    channels: &[Channel],
+    request: &narf_wireless::SchedScanRequest,
+) -> Option<(super::connection::Beacon, narf_wireless::BssInfo)> {
     let mpdu = if gen2 {
         scan_api::mpdu_gen2(&packet.payload)?
     } else {
         scan_api::mpdu(&packet.payload)?
     };
-    if mpdu.raw_band >= 2
-        || !channels.contains(&mpdu.channel)
+    let channel = Channel::received(mpdu.channel, mpdu.raw_band, band_in_rx)?;
+    if !channels.contains(&channel)
         || mpdu.frame.len() < 36
         || !matches!(mpdu.frame[0], 0x80 | 0x50)
     {
@@ -258,7 +299,7 @@ pub(super) fn copied_bss(
         bssid,
         ssid: parsed.ssid.clone(),
         channel: mpdu.channel,
-        band: super::native_band::Channel::legacy(mpdu.channel)?.band,
+        band: channel.band,
         interval: u16::from_le_bytes(body[8..10].try_into().ok()?),
         dtim: scan_api::dtim_period(body),
         rsn: parsed.rsn_ie_body.clone(),
@@ -266,7 +307,18 @@ pub(super) fn copied_bss(
         capabilities: u16::from_le_bytes(body[10..12].try_into().ok()?),
         information_elements: body[12..].to_vec(),
     };
-    let security = if beacon.rsn.is_some() {
+    let security = if channel.band == Band::Six
+        && beacon
+            .rsn
+            .as_deref()
+            .and_then(narf_wireless::rsn::RsnIe::decode_body)
+            .is_some_and(|rsn| {
+                rsn.akms.iter().any(|suite| {
+                    suite.oui == narf_wireless::rsn::RSN_OUI && matches!(suite.suite_type, 8 | 24)
+                })
+            }) {
+        narf_wireless::scan::BssSecurity::Wpa3
+    } else if beacon.rsn.is_some() {
         narf_wireless::scan::BssSecurity::Wpa2
     } else if beacon.privacy {
         narf_wireless::scan::BssSecurity::Wep
@@ -277,7 +329,7 @@ pub(super) fn copied_bss(
         bssid,
         ssid: parsed.ssid,
         channel: u32::from(mpdu.channel),
-        frequency_mhz: frequency(mpdu.channel)?,
+        frequency_mhz: channel.frequency(),
         rssi: mpdu.rssi,
         security,
     };

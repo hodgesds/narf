@@ -32,7 +32,8 @@ pub fn frequency(channel: u8) -> Option<u32> {
 
 /// cfg80211 `ieee80211_channel_to_freq_khz` (in MHz) for `band`. The 2.4/5
 /// GHz results are limited to this profile's channels (`band(channel)`);
-/// 6 GHz accepts the 20 MHz channels 1, 5, .. 233 and channel 2 (5935 MHz).
+/// 6 GHz includes the source-supported UNII-9 tail through253 and channel2
+/// (5935MHz). This geometry grants no device/regulatory permission.
 pub fn frequency_in(band_id: Band, channel: u8) -> Option<u32> {
     match band_id {
         Band::Ghz2 | Band::Ghz5 if band(channel) != Some(band_id) => None,
@@ -44,15 +45,15 @@ pub fn frequency_in(band_id: Band, channel: u8) -> Option<u32> {
     }
 }
 
-/// A 6 GHz channel number of any width: 20 MHz channels 1 + 4k up to 233
+/// A 6 GHz channel number of any width: 20 MHz channels1+4k through253
 /// and the 40/80/160/320 MHz centre numbers (3 + 8k, 7 + 16k, 15 + 32k,
-/// 31 + 32k) that `ieee80211_channel_to_freq_khz` maps below 7125 MHz.
+/// 31+32k), matching `ieee80211_channel_to_freq_khz`'s explicit253 bound.
 pub fn valid_6ghz(channel: u8) -> bool {
-    (1..=233).contains(&channel) && channel % 2 == 1
+    (1..=253).contains(&channel) && channel % 2 == 1
 }
 
 /// `ieee80211_freq_khz_to_channel` plus the band: 2.4/5 GHz in this profile
-/// (`from_frequency`) and 6 GHz 5935 MHz / 5955..=7115 MHz.
+/// (`from_frequency`) and 6 GHz5935MHz /5955..=7215MHz.
 pub fn from_frequency_band(mhz: u32) -> Option<(Band, u8)> {
     if let Some(channel) = from_frequency(mhz) {
         return band(channel).map(|band| (band, channel));

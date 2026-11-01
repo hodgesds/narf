@@ -83,10 +83,40 @@ impl Model {
                 && body.len() == extent
                 && word(body, 0) == 1
                 && word(body, 4) == 2
-                && body[45] == 1
-                && body[52] == 6,
+                && usize::from(body[45])
+                    == self
+                        .request
+                        .frequencies_mhz
+                        .iter()
+                        .filter(|&&f| f < 5950 || ((f - 5950) / 5) % 16 == 5)
+                        .count(),
             "Sc PNO UID/native scan extent/channel/profile ordering",
         )?;
+        let expected: Vec<_> = self
+            .request
+            .frequencies_mhz
+            .iter()
+            .copied()
+            .filter(|&f| f < 5950 || ((f - 5950) / 5) % 16 == 5)
+            .collect();
+        for (record, &frequency) in body[48..48 + expected.len() * 8]
+            .chunks_exact(8)
+            .zip(&expected)
+        {
+            let (channel, band) = if frequency >= 5950 {
+                (((frequency - 5950) / 5) as u8, 2)
+            } else if frequency < 2500 {
+                (((frequency - 2407) / 5) as u8, 1)
+            } else {
+                (((frequency - 5000) / 5) as u8, 0)
+            };
+            require(
+                record[4] == channel
+                    && word(record, 0) >> 30 == band
+                    && (band != 2 || word(record, 0) & ((1 << 26) | 0xfffff) == 1 << 26),
+                "native periodic typed channel aliased or6GHz probe bitmap escaped",
+            )?;
+        }
         let flags = half(body, 8);
         require(
             flags & 0x101 == 0x101 && flags & (1 << 8) != 0,
@@ -117,7 +147,7 @@ impl Model {
         )?;
         let active = word(body, 48) & 0xfffff != 0;
         require(
-            active != self.request.probe_ssids.is_empty(),
+            active == (!self.request.probe_ssids.is_empty() && expected.iter().any(|&f| f < 5950)),
             "Sc PNO match sets wrongly authorized probes",
         )?;
         if active {
@@ -915,3 +945,6 @@ mod native_profiles;
 
 #[path = "scheduled_associated_tests.rs"]
 mod associated;
+
+#[path = "six_ghz_periodic_tests.rs"]
+mod six_ghz_periodic;

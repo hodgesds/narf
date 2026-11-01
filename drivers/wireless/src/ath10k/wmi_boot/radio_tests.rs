@@ -45,6 +45,9 @@ struct RadioModel {
     ps: Option<power_save_tests::Fixture>,
     ps_default_off: bool,
     frequency: u16,
+    chain_mask: u8,
+    chain_sent: Vec<Vec<u8>>,
+    chain_stall: Option<u8>,
 }
 // SAFETY: This private firmware fixture owns its complete graph of CE-model
 // Rc/RefCell buffers; no reference-counted alias escapes the model. Moving the
@@ -240,15 +243,20 @@ impl Hif for RadioModel {
             // Reuse the independent firmware parser/emitter below, with its
             // blocking CE wrapper detached. The actual nonblocking source
             // descriptor/bounce and terminal receipt are owned by CeFixture.
-            let stalled = self
-                .associated
-                .as_ref()
-                .is_some_and(associated_scan_tests::stall_next)
-                || self
-                    .active
+            let chain_stage =
+                chains_tests::stage(self.inner.inner.dialect, bytes.get(8..).unwrap_or_default());
+            let stalled = if let Some(stage) = chain_stage {
+                self.chain_stall == Some(stage)
+            } else {
+                self.associated
                     .as_ref()
-                    .is_some_and(active_scan_tests::stall_next)
-                || self.stall == Some(self.phase);
+                    .is_some_and(associated_scan_tests::stall_next)
+                    || self
+                        .active
+                        .as_ref()
+                        .is_some_and(active_scan_tests::stall_next)
+                    || self.stall == Some(self.phase)
+            };
             let mut ce = self.ce.take().unwrap();
             let outcome = {
                 let mut emit = core::pin::pin!(self.send(pipe, bytes));
@@ -328,7 +336,15 @@ impl Hif for RadioModel {
         }
     }
     async fn send(&mut self, pipe: u8, bytes: &[u8]) -> Result<(), BmiError> {
+        let hold_chain = pipe == 3
+            && self.chain_stall.is_some_and(|target| {
+                chains_tests::stage(self.inner.inner.dialect, bytes.get(8..).unwrap_or_default())
+                    == Some(target)
+            });
         if let Some(ce) = &mut self.ce {
+            if hold_chain {
+                ce.hold_source(true);
+            }
             ce.send(pipe, bytes).await?;
         }
         if pipe == 4 && self.data.is_some() {
@@ -349,6 +365,9 @@ impl Hif for RadioModel {
             return Err(BmiError::BadResponse);
         }
         self.sequence = self.sequence.wrapping_add(1);
+        if let Some(stage) = chains_tests::stage(self.inner.inner.dialect, &bytes[8..]) {
+            return chains_tests::send(self, bytes, stage).await;
+        }
         if data_tests::protection_handles(self.inner.inner.dialect, &bytes[8..]) {
             return data_tests::protection_send(self, bytes).await;
         }
@@ -535,6 +554,17 @@ fn radio_boot_country_ht(
     factory: u32,
     ht: Option<u32>,
 ) -> radio::Radio<RadioModel> {
+    radio_boot_country_ht_rf(version, dialect, features, major, factory, ht, 2)
+}
+fn radio_boot_country_ht_rf(
+    version: u32,
+    dialect: Dialect,
+    features: u64,
+    major: u8,
+    factory: u32,
+    ht: Option<u32>,
+    rf_chains: u32,
+) -> radio::Radio<RadioModel> {
     let hardware = if dialect == Dialect::Tlv {
         HwRev::Qca6174
     } else if dialect == Dialect::TenFour {
@@ -553,6 +583,7 @@ fn radio_boot_country_ht(
     let mut inner = HttModel::new(dialect, c, hardware);
     inner.inner.factory = factory;
     inner.inner.ht = ht;
+    inner.inner.rf_chains = Some(rf_chains);
     let raw = features & (1 << 10) != 0;
     inner.raw = raw;
     if raw {
@@ -592,6 +623,10 @@ fn radio_boot_country_ht(
         ps: None,
         ps_default_off: false,
         frequency: 2412,
+        chain_mask: (((1u32 << rf_chains.min(4)) - 1)
+            & if dialect == Dialect::TenFour { 15 } else { 7 }) as u8,
+        chain_sent: Vec::new(),
+        chain_stall: None,
         associated: None,
     };
     let mut htc = Session::new(model, hardware);
@@ -862,5 +897,7 @@ mod data_tests;
 mod active_scan_tests;
 #[path = "associated_scan_tests.rs"]
 mod associated_scan_tests;
+#[path = "chains_tests.rs"]
+mod chains_tests;
 #[path = "power_save_tests.rs"]
 mod power_save_tests;

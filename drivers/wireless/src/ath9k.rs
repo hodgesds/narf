@@ -10,9 +10,11 @@ use narf_capabilities::{Cap, Write};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 
 mod calibration;
+mod channel_width;
 mod channels;
 mod descriptor;
 mod ht;
+mod ht40;
 mod identity;
 mod initvals;
 mod interface;
@@ -29,6 +31,7 @@ mod station;
 mod tx_ba;
 pub use calibration::{Report as RadioCalibration, State as RadioState};
 pub use ht::Request as Ht20QualificationRequest;
+pub use ht40::Request as Ht40QualificationRequest;
 pub use identity::{BringUpError, Identity, EEPROM_4K_BYTES};
 pub use phy::Prepared as BasebandPrepared;
 pub use qos::Request as QosQualificationRequest;
@@ -62,6 +65,8 @@ pub struct Ath9k {
     pub baseband: BasebandPrepared,
     calibration: [u8; EEPROM_4K_BYTES],
     radio: calibration::Calibration,
+    wide: Option<Arc<ht40::Grant>>,
+    wide_report: Option<calibration::wide::WideReport>,
     station: Option<RetainedRadio>,
     packet_attempted: bool,
     /// Physical generation; bumped by each successful reset.
@@ -112,6 +117,44 @@ impl Ath9k {
         )
         .map(|facts| facts.request())
     }
+    /// Factual full20/40 request for one exact extension; no RF grant.
+    pub fn ht40_qualification_request(
+        &self,
+        secondary: u8,
+    ) -> Result<Ht40QualificationRequest, BringUpError> {
+        if let Some(grant) = &self.wide {
+            return if grant.geometry().secondary() == Some(secondary) {
+                Ok(grant.request())
+            } else {
+                Err(BringUpError::Policy)
+            };
+        }
+        let primary = ((self.baseband.reference_frequency - 2407) / 5) as u8;
+        let width = if secondary == primary.checked_add(4).ok_or(BringUpError::Policy)? {
+            channel_width::Width::FortyAbove
+        } else if primary >= 5 && secondary == primary - 4 {
+            channel_width::Width::FortyBelow
+        } else {
+            return Err(BringUpError::Policy);
+        };
+        let geometry = channel_width::Geometry::new(primary, width)?;
+        let base = self
+            .station
+            .as_ref()
+            .and_then(|r| r.try_lock())
+            .and_then(|r| r.ht_grant())
+            .ok_or(BringUpError::BadState)?;
+        ht40::Facts::new(
+            self._device,
+            self.identity,
+            self.baseband,
+            self.radio.report().ok_or(BringUpError::BadState)?,
+            &self.calibration,
+            base,
+            geometry,
+        )
+        .map(|facts| facts.request())
+    }
     pub fn calibration(&self) -> &[u8; EEPROM_4K_BYTES] {
         &self.calibration
     }
@@ -145,6 +188,32 @@ pub fn with_controller<R>(callback: impl FnOnce(&Ath9k) -> R) -> Option<R> {
     let owner = { CONTROLLER.lock().clone() }?;
     let controller = owner.state.try_lock()?;
     Some(callback(&controller))
+}
+
+fn wide_qualification(
+    base: Arc<ht::Grant>,
+    geometry: channel_width::Geometry,
+    generation: u32,
+) -> Result<Option<Arc<ht40::Grant>>, station::Error> {
+    let owner = CONTROLLER.lock().clone().ok_or(station::Error::State)?;
+    let controller = owner.state.try_lock().ok_or(station::Error::Busy)?;
+    if controller.generation != generation
+        || controller.baseband.geometry.is_wide()
+        || owner.removed.load(core::sync::atomic::Ordering::Acquire)
+    {
+        return Err(station::Error::State);
+    }
+    let facts = ht40::Facts::new(
+        controller._device,
+        controller.identity,
+        controller.baseband,
+        controller.radio.report().ok_or(station::Error::State)?,
+        &controller.calibration,
+        base,
+        geometry,
+    )
+    .map_err(|_| station::Error::Profile)?;
+    Ok(ht40::Source::Registered.load(facts).ok())
 }
 
 /// Continue the same retained calibration/MAC/packet owner through native NIC
@@ -227,6 +296,65 @@ async fn calibrate_owner(owner: &Retained) -> Result<RadioCalibration, BringUpEr
     let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
     let mut controller = owner.state.try_lock().ok_or(BringUpError::BadState)?;
     let frequency = controller.baseband.reference_frequency;
+    if controller.baseband.geometry.is_wide() {
+        let grant = controller.wide.clone().ok_or(BringUpError::Policy)?;
+        let host = channel_width::Permission::from_domain(&domain, controller.baseband.geometry)?;
+        grant.check().map_err(|_| BringUpError::Policy)?;
+        if host.ceiling < grant.budget() {
+            return Err(BringUpError::Policy);
+        }
+        // Keep the exact qualified program even if host policy is relaxed;
+        // fresh permission proves this lower selected budget is still valid.
+        let permission = channel_width::Permission {
+            ceiling: grant.budget(),
+            ..host
+        };
+        let command = identity::invoke(&controller._cap, || {
+            narf_bus::pci::read_command(&controller._cap, &controller._device)
+        })
+        .map_err(|_| BringUpError::DeviceGone)?
+        .map_err(|_| BringUpError::DeviceGone)?;
+        let mask = narf_bus::pci::cmd::BUS_MASTER
+            | narf_bus::pci::cmd::MEM_SPACE
+            | narf_bus::pci::cmd::INTX_DISABLE;
+        if command & mask != (narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE) {
+            return Err(BringUpError::BadState);
+        }
+        let mut io = identity::Registers::new(controller._mmio, controller._cap);
+        let image = controller.calibration;
+        let xe2 = controller.baseband.xe2_gain;
+        let aspm = controller.pcie_aspm;
+        pcie_pm::configure(
+            &mut io,
+            aspm,
+            xe2 && controller.identity.revision >= 2,
+            false,
+        )?;
+        let actual = {
+            // SAFETY: current H3 preflight covers this exact full40 program;
+            // old DMA was proven stopped and complete40 PHY preparation ran.
+            let future = unsafe {
+                calibration::wide::run(&mut controller.radio, &mut io, &image, permission, xe2)
+            };
+            let mut future = core::pin::pin!(future);
+            core::future::poll_fn(|cx| {
+                if narf_wireless::reg::db::snapshot()
+                    .is_none_or(|domain| !permission.current_in(&domain))
+                {
+                    return core::task::Poll::Ready(Err(BringUpError::Policy));
+                }
+                grant
+                    .invoke(|| Ok(core::future::Future::poll(future.as_mut(), cx)))
+                    .unwrap_or(core::task::Poll::Ready(Err(BringUpError::Policy)))
+            })
+            .await?
+        };
+        grant
+            .accept(actual)
+            .map_err(|_| BringUpError::BadCalibration)?;
+        controller.wide_report = Some(actual);
+        return Ok(actual.report);
+    }
     let permission = calibration::Permission::from_domain_at(&domain, frequency)?;
     let command = identity::invoke(&controller._cap, || {
         narf_bus::pci::read_command(&controller._cap, &controller._device)
@@ -282,26 +410,43 @@ async fn prepare_packets(owner: &Retained) -> Result<RetainedRadio, packet::Erro
     controller.packet_attempted = true;
     // SAFETY: same retained sole function/cap/BAR/factory image as the exact
     // successful calibration; this async mutex serializes all native access.
-    let mut native = unsafe {
-        packet_native::Native::new(
+    let native = if controller.baseband.geometry.is_wide() {
+        let grant = controller.wide.clone().ok_or(packet::Error::State)?;
+        let actual = controller.wide_report.ok_or(packet::Error::State)?;
+        // SAFETY: same sole calibrated function, checked full40 receipt and
+        // current source; no native packet DMA was allocated or published.
+        unsafe {
+            packet_native::Native::new_wide(
+                controller._device,
+                controller._cap,
+                controller._mmio,
+                &controller.calibration,
+                grant,
+                actual,
+            )
+        }?
+    } else {
+        // SAFETY: the unchanged complete20 preparation/calibration contract.
+        let mut native = unsafe {
+            packet_native::Native::new(
+                controller._device,
+                controller._cap,
+                controller._mmio,
+                report,
+                &controller.calibration,
+            )
+        }?;
+        if let Ok(facts) = ht::Facts::new(
             controller._device,
-            controller._cap,
-            controller._mmio,
+            controller.identity,
+            controller.baseband,
             report,
             &controller.calibration,
-        )
-    }?;
-    if let Ok(facts) = ht::Facts::new(
-        controller._device,
-        controller.identity,
-        controller.baseband,
-        report,
-        &controller.calibration,
-    ) {
-        // Optional qualification is resolved before any new live HT program.
-        // Missing/invalid external measurements preserve the legacy profile.
-        native.qualify_ht(facts);
-    }
+        ) {
+            native.qualify_ht(facts);
+        }
+        native
+    };
     mac::prepare(&native, &controller.calibration, controller.identity.mac)?;
     // Optional MSI (Linux `ath9k_use_msi`); without it the owner stays polled.
     let _ = native.arm_msi();
@@ -355,7 +500,52 @@ async fn reset_owner_at(
     selected: Option<u16>,
     expected: Option<u32>,
 ) -> Result<RadioCalibration, BringUpError> {
+    let selected = selected
+        .map(channel_width::Geometry::from_frequency)
+        .transpose()?;
+    reset_owner_geometry(owner, selected, expected, None).await
+}
+async fn reset_owner_geometry(
+    owner: &Retained,
+    selected: Option<channel_width::Geometry>,
+    expected: Option<u32>,
+    wide: Option<Arc<ht40::Grant>>,
+) -> Result<RadioCalibration, BringUpError> {
     let _control = CONTROL.lock().await;
+    let geometry = {
+        let controller = owner.state.lock().await;
+        if expected.is_some_and(|generation| generation != controller.generation) {
+            return Err(BringUpError::BadState);
+        }
+        // Recovery/resume deliberately return to a new actual20 generation;
+        // association and keys are already lost at this full reset boundary.
+        let geometry = selected.unwrap_or(controller.baseband.geometry.twenty());
+        if selected.is_some() && !geometry.is_wide() {
+            let domain =
+                narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
+            let permission = calibration::Permission::from_domain_at(&domain, geometry.control())?;
+            phy::rates::checked_plan_at(
+                &controller.calibration,
+                geometry.control(),
+                permission.budget(),
+            )?;
+        }
+        geometry
+    };
+    let result = reset_owner_geometry_inner(owner, geometry, wide).await;
+    if geometry.is_wide() && result.is_err() {
+        // CONTROL still belongs to this exact accepted request. This cannot
+        // retune a different-generation request or bypass pinned DMA. The
+        // original H3 grant never substitutes a20 hardware receipt.
+        return reset_owner_geometry_inner(owner, geometry.twenty(), None).await;
+    }
+    result
+}
+async fn reset_owner_geometry_inner(
+    owner: &Retained,
+    geometry: channel_width::Geometry,
+    wide: Option<Arc<ht40::Grant>>,
+) -> Result<RadioCalibration, BringUpError> {
     {
         let mut controller = owner.state.lock().await;
         if owner.removed.load(core::sync::atomic::Ordering::Acquire)
@@ -364,17 +554,19 @@ async fn reset_owner_at(
         {
             return Err(BringUpError::DeviceGone);
         }
-        if expected.is_some_and(|generation| generation != controller.generation) {
-            return Err(BringUpError::BadState);
-        }
-        let frequency = selected.unwrap_or(controller.baseband.reference_frequency);
-        if selected.is_some() {
-            let domain =
-                narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
-            let permission = calibration::Permission::from_domain_at(&domain, frequency)?;
-            // Validate a requested target before withdrawing a live owner.
-            // Ordinary recovery still retires first, including on policy loss.
-            phy::rates::checked_plan_at(&controller.calibration, frequency, permission.budget())?;
+        let frequency = geometry.control();
+        if geometry.is_wide() {
+            let grant = wide.as_ref().ok_or(BringUpError::Policy)?;
+            if grant.geometry() != geometry {
+                return Err(BringUpError::Policy);
+            }
+            grant.check().map_err(|_| BringUpError::Policy)?;
+            phy::rates::wide::wide_plan(&controller.calibration, geometry, grant.budget())?;
+        } else {
+            // Current target policy is checked before retiring a public
+            // request and again before analog activation. Recovery still
+            // retires a failed old generation even when its policy is gone.
+            phy::rates::checked_plan_at(&controller.calibration, frequency, 40)?;
         }
         if !retire_generation(&mut controller).await {
             return Err(BringUpError::BadState);
@@ -391,13 +583,23 @@ async fn reset_owner_at(
         // From here the old calibration/packet state is gone regardless of
         // outcome; a failed reset leaves a fresh, un-calibrated owner.
         controller.radio = calibration::Calibration::default();
+        controller.wide = wide.clone();
+        controller.wide_report = None;
         controller.packet_attempted = true;
         let (identity, image) = identity::read(controller._mmio, controller._cap)?;
         if identity != controller.identity || image != controller.calibration {
             return Err(BringUpError::BadIdentity);
         }
-        controller.baseband =
-            phy::program_at(controller._mmio, controller._cap, &image, frequency)?;
+        controller.baseband = if let Some(grant) = &wide {
+            grant
+                .invoke(|| {
+                    phy::program_geometry(controller._mmio, controller._cap, &image, geometry)
+                        .map_err(|_| packet::Error::State)
+                })
+                .map_err(|_| BringUpError::Policy)?
+        } else {
+            phy::program_at(controller._mmio, controller._cap, &image, frequency)?
+        };
         controller.pcie_aspm = pcie_pm::restore(
             &controller._device,
             controller._cap,
@@ -659,6 +861,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             baseband,
             calibration,
             radio: calibration::Calibration::default(),
+            wide: None,
+            wide_report: None,
             station: None,
             packet_attempted: false,
             generation: 0,

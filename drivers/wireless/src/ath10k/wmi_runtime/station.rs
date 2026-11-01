@@ -85,21 +85,22 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .ok_or(Error::Failed)
     }
     pub(in crate::ath10k) fn ht_capabilities(&self) -> Option<[u8; 26]> {
-        self.htt
-            .wmi
-            .caps
-            .as_ref()
-            .and_then(|c| ht::capability(c, false))
+        self.htt.wmi.caps.as_ref().and_then(|c| {
+            self.chains
+                .and_then(|chains| ht::capability(c, false, chains))
+        })
     }
     pub(in crate::ath10k) fn ht40_capabilities(&self) -> Option<[u8; 26]> {
-        self.htt
-            .wmi
-            .caps
-            .as_ref()
-            .and_then(|c| ht::capability(c, true))
+        self.htt.wmi.caps.as_ref().and_then(|c| {
+            self.chains
+                .and_then(|chains| ht::capability(c, true, chains))
+        })
     }
     pub(in crate::ath10k) fn vht_capabilities(&self) -> Option<[u8; 12]> {
-        self.htt.wmi.caps.as_ref().and_then(ht::vht_capability)
+        self.htt.wmi.caps.as_ref().and_then(|caps| {
+            self.chains
+                .and_then(|chains| ht::vht_capability(caps, chains))
+        })
     }
     pub(super) async fn send_station_command(
         &mut self,
@@ -136,6 +137,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     ) -> Result<(Permission, Option<ht::Profile>), Error> {
         let caps = self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?;
         let own = self.ready.ok_or(Error::Failed)?.mac;
+        let chains = self.chains.ok_or(Error::Failed)?;
         let cached = self
             .scan_cache
             .iter()
@@ -150,7 +152,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .filter(|_| ht::vht_supported(caps))
             .and_then(|s| Permission::occupied_width(caps, domain, frequency, Some(s), true).ok())
         {
-            if let Ok(Some(v)) = ht::Profile::offer(caps, cached, own, ht::Phy::Vht) {
+            if let Ok(Some(v)) = ht::Profile::offer(caps, cached, own, ht::Phy::Vht, chains) {
                 if let Some(vht) = v.vht {
                     let permission = if vht.eighty {
                         Ok(wide)
@@ -178,6 +180,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             } else {
                 ht::Phy::Ht20
             },
+            chains,
         )?;
         if let Some(h) = ht.filter(|h| h.secondary.is_some()) {
             if let Ok(permission) = Permission::occupied(caps, domain, frequency, h.secondary) {
@@ -193,7 +196,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // without the occupied40 permission whose native owner it promises.
         Ok((
             Permission::from_domain(caps, domain, frequency)?,
-            ht::Profile::offer(caps, cached, own, ht::Phy::Ht20)?,
+            ht::Profile::offer(caps, cached, own, ht::Phy::Ht20, chains)?,
         ))
     }
     pub fn associated_station(&self) -> Option<StationAssociated> {
