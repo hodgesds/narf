@@ -6441,6 +6441,32 @@ dumb framebuffer of it is copied whole, block row by block row
 scanned out in place (below); a frame of another tiling than shown waits
 for the plane update its plane change requested.
 
+**Intel GEM framebuffers.** On an Intel card ADDFB and ADDFB2 also take
+one of the calling open's Intel GEM handles on the primary node
+(`drm_ioctl_bridge::intel_addfb2_bo`, dispatched by `DriCardFile` before
+the card's ADDFB2; the render node refuses KMS). `Card::addfb2_intel` runs
+drm's framebuffer_check and Linux `intel_framebuffer_init` in order (MIT
+Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad `intel_fb.c`,
+`skl_universal_plane.c`, Xe `intel_fb_bo.c`), every refusal EINVAL:
+LINEAR XRGB8888/ARGB8888/RGB565 only; non-zero width and height; a pitch
+holding a line, 64-byte aligned (4 KiB once past the plane's 128 KiB
+`adl_plane_max_stride`) and at most 256 KiB (`intel_fb_max_stride`); no
+plane-0 offset; unused planes empty (handles/pitches/offsets checked only
+with FB_MODIFIERS, as for pre-modifier userspace); `pitch * height` within
+the object; no VRAM object. On native Xe an object not created SCANOUT
+may not be VM-bound (`GemObject::vm_bound`, maintained by
+`xe_vm::State::publish` and its drop) and becomes SCANOUT. `Framebuffer::intel`
+(`IntelFb`: the object, which the framebuffer holds, and the owning open)
+is removed by RMFB or `Card::release_file_framebuffers`; `gem_owner` is
+the shared owner test. SETCRTC, PAGE_FLIP, atomic and DIRTYFB present it
+through the scanout copy (`present_intel_frame`): every WRITE fence of the
+object completes first (implicit sync, 15 s bound, else EBUSY), a
+write-back object is CLFLUSHed for CPU reads, and each line is copied
+across the object's pages (`copy_object_row`), never past its end. Only
+32-bpp frames match the scanout. Deviations: no tiled modifiers, no
+plane-0 offset handling and no zero-copy flip (Linux scans out of the BO
+through GGTT); the copy reads write-combining memory uncached.
+
 **Client framebuffers scanned out in place.** On the native card ADDFB2
 also takes one of the calling open's amdgpu GEM handles
 (amdgpu_display_user_framebuffer_create's drm_gem_object_lookup in the

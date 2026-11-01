@@ -36,6 +36,10 @@ pub struct GemObject {
     vram: Option<crate::intel_gpu_vram::VramAllocation>,
     /// Zeroed write-combining system pages, in place of `frames`.
     wc: Option<narf_memory::pageattr::WcPages>,
+    /// XE_BO_FLAG_SCANOUT: created for scanout, or made a framebuffer.
+    scanout: core::sync::atomic::AtomicBool,
+    /// Published VM bindings naming this object (Linux xe_bo_is_vm_bound).
+    vm_binds: core::sync::atomic::AtomicU32,
     size: u64,
     /// `size` is charged to the system-memory LIVE_BYTES bound.
     charged: bool,
@@ -79,6 +83,8 @@ impl GemObject {
             pins: Vec::new(),
             vram: None,
             wc: None,
+            scanout: core::sync::atomic::AtomicBool::new(false),
+            vm_binds: core::sync::atomic::AtomicU32::new(0),
             size,
             charged: true,
             offset,
@@ -131,6 +137,36 @@ impl GemObject {
     /// System pages whose kernel and user CPU aliases are write-combining.
     pub(crate) fn is_wc(&self) -> bool {
         self.wc.is_some()
+    }
+
+    /// DRM_XE_GEM_CREATE_FLAG_SCANOUT, or made a framebuffer since.
+    pub(crate) fn scanout(&self) -> bool {
+        self.scanout.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_scanout(&self) {
+        self.scanout.store(true, Ordering::Release);
+    }
+
+    /// Bound in some VM's published mapping set (Linux xe_bo_is_vm_bound).
+    pub(crate) fn vm_bound(&self) -> bool {
+        self.vm_binds.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn vm_bind(&self) {
+        self.vm_binds.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn vm_unbind(&self) {
+        let _ = self
+            .vm_binds
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+    }
+
+    /// Make device writes visible to CPU reads: CLFLUSH evicts any stale
+    /// line of a write-back page; write-combining pages are never cached.
+    pub(crate) fn sync_for_cpu_read(&self) -> bool {
+        self.publish_for_device()
     }
 
     /// A VM-private USERPTR object over `pins`, charged like owned storage.

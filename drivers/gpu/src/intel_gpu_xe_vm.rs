@@ -246,6 +246,18 @@ fn remove(mappings: &mut Vec<VmMapping>, start: u64, length: u64) {
 }
 
 impl State {
+    /// Publish a prepared mapping set. Objects it names count as VM-bound
+    /// while it is published (Linux xe_bo_is_vm_bound).
+    pub fn publish(&mut self, mappings: Vec<VmMapping>) {
+        for object in mappings.iter().filter_map(|m| m.object.as_ref()) {
+            object.vm_bind();
+        }
+        for object in self.mappings.iter().filter_map(|m| m.object.as_ref()) {
+            object.vm_unbind();
+        }
+        self.mappings = mappings;
+    }
+
     pub fn prepare(&self, binds: &[Bind], scratch: bool) -> Result<Vec<VmMapping>, FsError> {
         let mut mappings = self.mappings.clone();
         for bind in binds {
@@ -290,6 +302,14 @@ impl State {
     }
 }
 
+impl Drop for State {
+    fn drop(&mut self) {
+        for object in self.mappings.iter().filter_map(|m| m.object.as_ref()) {
+            object.vm_unbind();
+        }
+    }
+}
+
 pub(crate) fn read(
     user: &dyn IoctlContext,
     address: u64,
@@ -325,17 +345,19 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let state = State {
-            mappings: alloc::vec![VmMapping {
-                object: Some(gem.object(handle).unwrap()),
-                va: 0x10000,
-                offset: 0,
-                length: 16384,
-                writable: true,
-                pat: 2
-            }],
+        let mut state = State {
+            mappings: Vec::new(),
             active: Vec::new(),
         };
+        state.publish(alloc::vec![VmMapping {
+            object: Some(gem.object(handle).unwrap()),
+            va: 0x10000,
+            offset: 0,
+            length: 16384,
+            writable: true,
+            pat: 2,
+        }]);
+        assert!(gem.object(handle).unwrap().vm_bound());
         let unmap = Bind {
             object: None,
             address: 0x11000,

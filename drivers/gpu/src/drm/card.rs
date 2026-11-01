@@ -249,6 +249,31 @@ pub struct Framebuffer {
     /// or imported buffer): `drm_framebuffer.obj[0]`, which the
     /// framebuffer holds.
     pub bo: Option<FbBo>,
+    /// The Intel GEM buffer behind a framebuffer made from one of an open's
+    /// Intel GEM handles (`drm_framebuffer.obj[0]`).
+    #[cfg(feature = "intel")]
+    pub intel: Option<IntelFb>,
+}
+
+impl Framebuffer {
+    /// The open that made this framebuffer from one of its GEM handles
+    /// (drm_fb_release removes it with that open); `None` for a dumb or
+    /// imported buffer.
+    pub fn gem_owner(&self) -> Option<u64> {
+        #[cfg(feature = "intel")]
+        if let Some(intel) = &self.intel {
+            return Some(intel.owner);
+        }
+        self.bo.as_ref().map(|bo| bo.owner)
+    }
+}
+
+/// An Intel GEM buffer a framebuffer holds, and the open that made it.
+#[cfg(feature = "intel")]
+#[derive(Clone, Debug)]
+pub struct IntelFb {
+    pub object: Arc<crate::intel_gpu_gem::GemObject>,
+    pub owner: u64,
 }
 
 /// An amdgpu GEM buffer a framebuffer holds, and the open that made it:
@@ -1846,6 +1871,8 @@ impl Card {
             chroma_pitch,
             modifier,
             bo: None,
+            #[cfg(feature = "intel")]
+            intel: None,
         });
         Ok(id)
     }
@@ -1905,18 +1932,105 @@ impl Card {
             chroma_pitch: if two { cmd.pitches[1] } else { 0 },
             modifier,
             bo: Some(FbBo { object, owner }),
+            #[cfg(feature = "intel")]
+            intel: None,
+        });
+        Ok(id)
+    }
+
+    /// ADDFB2 naming one of open `owner`'s Intel GEM handles: drm core's
+    /// framebuffer_check and Linux intel_framebuffer_init, in their order.
+    /// Only LINEAR is taken (no tiled presentation exists here); plane 0 has
+    /// no offset; the pitch is 64-byte aligned (4 KiB past the plane's
+    /// 128 KiB native limit) and at most 256 KiB; the object holds every
+    /// line. On native Xe (`xe`), an object not created SCANOUT may not be
+    /// VM-bound and becomes SCANOUT (intel_fb_bo_framebuffer_init).
+    #[cfg(feature = "intel")]
+    pub fn addfb2_intel(
+        &mut self,
+        cmd: &crate::drm::fb_cmd::FbCmd,
+        object: Arc<crate::intel_gpu_gem::GemObject>,
+        owner: u64,
+        xe: bool,
+    ) -> Result<u32, CardError> {
+        use crate::drm::fb_cmd::{FB_INTERLACED, FB_MODIFIERS};
+        // framebuffer_check.
+        if cmd.flags & !(FB_INTERLACED | FB_MODIFIERS) != 0
+            || (cmd.flags & FB_MODIFIERS != 0 && cmd.modifier[0] != 0)
+        {
+            return Err(CardError::UnknownFormat);
+        }
+        let legacy = matches!(cmd.pixel_format, 0x3432_5258 | 0x3432_5241 | 0x3631_4752);
+        let format = PixelFormat::from_fourcc(cmd.pixel_format)
+            .filter(|_| legacy)
+            .ok_or(CardError::UnknownFormat)?;
+        if cmd.width == 0 || cmd.height == 0 {
+            return Err(CardError::InvalidDimensions);
+        }
+        let line = u64::from(cmd.width) * u64::from(format.cpp());
+        if u64::from(cmd.pitches[0]) < line {
+            return Err(CardError::InvalidDimensions);
+        }
+        // Unused planes carry nothing (checked when FB_MODIFIERS is set,
+        // as older userspace left them uncleared).
+        for i in 1..4 {
+            if cmd.modifier[i] != 0
+                || (cmd.flags & FB_MODIFIERS != 0
+                    && (cmd.handles[i] != 0 || cmd.pitches[i] != 0 || cmd.offsets[i] != 0))
+            {
+                return Err(CardError::InvalidDimensions);
+            }
+        }
+        // VRAM pages have no CPU physical address for the scanout copy, and
+        // no display reads them here.
+        if object.is_vram() {
+            return Err(CardError::InvalidDimensions);
+        }
+        if xe && !object.scanout() {
+            if object.vm_bound() {
+                return Err(CardError::InvalidDimensions);
+            }
+            object.mark_scanout();
+        }
+        let pitch = cmd.pitches[0];
+        const MAX_STRIDE: u32 = 256 * 1024; // intel_fb_max_stride, remapped
+        const PLANE_STRIDE: u32 = 128 * 1024; // adl_plane_max_stride bytes
+        let alignment = if pitch > PLANE_STRIDE { 4096 } else { 64 };
+        if pitch > MAX_STRIDE || cmd.offsets[0] != 0 || pitch % alignment != 0 {
+            return Err(CardError::InvalidDimensions);
+        }
+        if u64::from(pitch) * u64::from(cmd.height) > object.size() {
+            return Err(CardError::InvalidDimensions);
+        }
+        if self.framebuffers.len() >= 4096 {
+            return Err(CardError::TooManyFbs);
+        }
+        let id = self.next_fb_id;
+        self.next_fb_id = self.next_fb_id.wrapping_add(1).max(1);
+        self.framebuffers.push(Framebuffer {
+            id,
+            width: cmd.width,
+            height: cmd.height,
+            format,
+            pitch,
+            gem_handle: cmd.handles[0],
+            offsets: [0, 0],
+            chroma_pitch: 0,
+            modifier: 0,
+            bo: None,
+            intel: Some(IntelFb { object, owner }),
         });
         Ok(id)
     }
 
     /// drm_fb_release for open `owner`: remove every framebuffer it made
-    /// from an amdgpu GEM handle (as RMFB does, turning off what shows
+    /// from one of its GEM handles (as RMFB does, turning off what shows
     /// it). Returns how many went.
     pub fn release_file_framebuffers(&mut self, owner: u64) -> usize {
         let ids: Vec<u32> = self
             .framebuffers
             .iter()
-            .filter(|fb| fb.bo.as_ref().is_some_and(|b| b.owner == owner))
+            .filter(|fb| fb.gem_owner() == Some(owner))
             .map(|fb| fb.id)
             .collect();
         for &id in &ids {
@@ -1975,8 +2089,9 @@ impl Card {
             p.crtc_id = None;
         }
         // A GEM buffer's reference goes with the framebuffer; a scanout pin
-        // (amdgpu_dm_plane_helper_prepare_fb's) keeps it while fetched.
-        if fb.bo.is_some() {
+        // (amdgpu_dm_plane_helper_prepare_fb's) keeps it while fetched. Its
+        // handle names no dumb buffer or import of this card.
+        if fb.gem_owner().is_some() {
             return Ok(None);
         }
         let freed = self.remove_dumb_backing(fb.gem_handle);
@@ -2063,5 +2178,206 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/drm/card",
         smoke_dumb_backing_frees_when_unmapped
+    );
+
+    /// ADDFB2 of an Intel GEM handle follows drm's framebuffer_check and
+    /// Linux intel_framebuffer_init in order: LINEAR 8888/565 only, no
+    /// plane-0 offset, a 64-byte aligned pitch (4 KiB past the plane's
+    /// 128 KiB limit) of at most 256 KiB, every line inside the object, and
+    /// unused planes empty. On native Xe a VM-bound object not created
+    /// SCANOUT is refused (intel_fb_bo_framebuffer_init); otherwise it
+    /// becomes SCANOUT. An open's framebuffers leave with it.
+    #[cfg(feature = "intel")]
+    fn smoke_intel_framebuffers_follow_intel_framebuffer_init() -> TestResult {
+        use crate::drm::fb_cmd::{FbCmd, FB_MODIFIERS};
+        use crate::intel_gpu_gem::GemState;
+        let gem = GemState::new();
+        let create = |size| {
+            let mut handle = 0;
+            gem.create(size, |h, _| {
+                handle = h;
+                Ok(())
+            })
+            .unwrap();
+            handle
+        };
+        let (handle, other) = (create(1 << 20), create(1 << 20));
+        let object = gem.object(handle).unwrap();
+        let cmd = |width, height, pitch| {
+            let mut cmd = FbCmd {
+                width,
+                height,
+                pixel_format: 0x3432_5258, // XR24
+                ..Default::default()
+            };
+            cmd.handles[0] = handle;
+            cmd.pitches[0] = pitch;
+            cmd
+        };
+        let mut card = Card::new("test", "test", (1, 0, 0));
+        let mut refused = |cmd: FbCmd, error: CardError| {
+            card.addfb2_intel(&cmd, object.clone(), 7, false) == Err(error)
+        };
+        let mut nv12 = cmd(256, 256, 1024);
+        nv12.pixel_format = 0x3231_564e;
+        let mut tiled = cmd(256, 256, 1024);
+        tiled.flags = FB_MODIFIERS;
+        tiled.modifier[0] = 0x0100_0000_0000_0001; // I915_FORMAT_MOD_X_TILED
+        let mut offset = cmd(256, 256, 1024);
+        offset.offsets[0] = 64;
+        let mut stray = cmd(256, 256, 1024);
+        stray.flags = FB_MODIFIERS;
+        stray.handles[1] = handle;
+        let checks = [
+            refused(nv12, CardError::UnknownFormat),
+            refused(tiled, CardError::UnknownFormat),
+            refused(cmd(0, 256, 1024), CardError::InvalidDimensions),
+            refused(cmd(256, 256, 512), CardError::InvalidDimensions), // < a line
+            refused(cmd(256, 256, 1056), CardError::InvalidDimensions), // 64 B
+            refused(offset, CardError::InvalidDimensions),
+            refused(stray, CardError::InvalidDimensions),
+            refused(cmd(256, 1, 256 * 1024 + 4096), CardError::InvalidDimensions),
+            refused(cmd(256, 1, 128 * 1024 + 1024), CardError::InvalidDimensions), // 4 KiB
+            refused(cmd(256, 1100, 1024), CardError::InvalidDimensions),           // > object
+        ];
+        if checks.contains(&false) {
+            return TestResult::Fail("an Intel framebuffer Linux refuses was accepted");
+        }
+        // Pre-modifier userspace may leave unused plane fields uncleared.
+        let mut legacy = cmd(256, 256, 1024);
+        legacy.handles[1] = handle;
+        let ids = [
+            card.addfb2_intel(&legacy, object.clone(), 7, false),
+            card.addfb2_intel(&cmd(256, 1, 128 * 1024 + 4096), object.clone(), 7, false),
+            card.addfb2_intel(&cmd(256, 256, 1024), object.clone(), 8, false),
+        ];
+        let [Ok(a), Ok(_), Ok(c)] = ids else {
+            return TestResult::Fail("a valid Intel framebuffer was refused");
+        };
+        let fb = card.framebuffer(a).unwrap();
+        if fb.gem_owner() != Some(7) || fb.bo.is_some() || fb.modifier != 0 {
+            return TestResult::Fail("Intel framebuffer recorded the wrong buffer");
+        }
+        // drm_fb_release: only the closing open's framebuffers go.
+        if card.release_file_framebuffers(7) != 2 || card.framebuffer(c).is_err() {
+            return TestResult::Fail("fb release removed the wrong framebuffers");
+        }
+        if card.rmfb(c) != Ok(None) {
+            return TestResult::Fail("RMFB of an Intel framebuffer freed card backing");
+        }
+
+        // Xe: a VM-bound object not created SCANOUT cannot become one.
+        let bound = gem.object(other).unwrap();
+        let mut state = crate::intel_gpu_xe_vm::State {
+            mappings: Vec::new(),
+            active: Vec::new(),
+        };
+        state.publish(alloc::vec![crate::intel_gpu_exec::VmMapping {
+            object: Some(bound.clone()),
+            va: 0x10000,
+            offset: 0,
+            length: 4096,
+            writable: true,
+            pat: 3,
+        }]);
+        let mut bound_cmd = cmd(256, 256, 1024);
+        bound_cmd.handles[0] = other;
+        if card.addfb2_intel(&bound_cmd, bound.clone(), 7, true)
+            != Err(CardError::InvalidDimensions)
+            || bound.scanout()
+        {
+            return TestResult::Fail("Xe accepted a VM-bound non-scanout framebuffer");
+        }
+        // i915 has no such rule; once unbound, Xe makes it SCANOUT.
+        if card
+            .addfb2_intel(&bound_cmd, bound.clone(), 7, false)
+            .is_err()
+        {
+            return TestResult::Fail("i915 refused a VM-bound framebuffer");
+        }
+        drop(state);
+        if bound.vm_bound()
+            || card
+                .addfb2_intel(&bound_cmd, bound.clone(), 7, true)
+                .is_err()
+            || !bound.scanout()
+        {
+            return TestResult::Fail("an unbound object did not become a scanout");
+        }
+        // A SCANOUT object stays admissible while bound.
+        let mut state = crate::intel_gpu_xe_vm::State {
+            mappings: Vec::new(),
+            active: Vec::new(),
+        };
+        state.publish(alloc::vec![crate::intel_gpu_exec::VmMapping {
+            object: Some(bound.clone()),
+            va: 0x10000,
+            offset: 0,
+            length: 4096,
+            writable: true,
+            pat: 3,
+        }]);
+        if card
+            .addfb2_intel(&bound_cmd, bound.clone(), 7, true)
+            .is_err()
+        {
+            return TestResult::Fail("Xe refused a bound SCANOUT framebuffer");
+        }
+        drop(state);
+        TestResult::Pass
+    }
+    #[cfg(feature = "intel")]
+    kernel_test_in!(
+        "drivers/gpu/drm/card",
+        smoke_intel_framebuffers_follow_intel_framebuffer_init
+    );
+
+    /// The scanout copy reads each line across the object's scattered pages
+    /// and never past the object's end.
+    #[cfg(feature = "intel")]
+    fn smoke_intel_framebuffer_row_copy_spans_pages() -> TestResult {
+        let gem = crate::intel_gpu_gem::GemState::new();
+        let mut handle = 0;
+        gem.create(3 * 4096, |h, _| {
+            handle = h;
+            Ok(())
+        })
+        .unwrap();
+        let object = gem.object(handle).unwrap();
+        let pattern: Vec<u8> = (0..3 * 4096u32).map(|i| (i * 7 + i / 4096) as u8).collect();
+        if object.write(0, &pattern).is_err() {
+            return TestResult::Fail("fixture write failed");
+        }
+        let pages: Vec<u64> = object.pages().collect();
+        let pitch = 4160; // 64-byte aligned, crossing every page boundary
+        let mut line = alloc::vec![0u8; pitch as usize];
+        for (row, want) in [(0u32, 4160usize), (1, 4160), (2, 3 * 4096 - 2 * 4160)] {
+            line.fill(0xee);
+            // SAFETY: the object's frames are retained by `object`; `line`
+            // holds `pitch` bytes.
+            let copied = unsafe {
+                crate::drm_ioctl_bridge::copy_object_row(
+                    &pages,
+                    object.size(),
+                    pitch,
+                    row,
+                    line.as_mut_ptr(),
+                    pitch as usize,
+                )
+            };
+            let start = (row * pitch) as usize;
+            if copied != want || line[..want] != pattern[start..start + want] {
+                return TestResult::Fail("row copy lost bytes across a page boundary");
+            }
+            if line[want..].iter().any(|b| *b != 0xee) {
+                return TestResult::Fail("row copy read past the object's end");
+            }
+        }
+        TestResult::Pass
+    }
+    #[cfg(feature = "intel")]
+    kernel_test_in!(
+        "drivers/gpu/drm/card",
+        smoke_intel_framebuffer_row_copy_spans_pages
     );
 }

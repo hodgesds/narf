@@ -445,6 +445,18 @@ impl FileOps for DriCardFile {
         ) {
             return result;
         }
+        // A framebuffer of one of this open's Intel GEM buffers (primary node
+        // only: the render node refuses KMS).
+        #[cfg(feature = "intel")]
+        if let Some(result) = crate::drm_ioctl_bridge::intel_addfb2_bo(
+            self.index,
+            self.open_id,
+            cmd,
+            arg,
+            &self.intel.gem,
+        ) {
+            return result;
+        }
         // Mesa's GBM/EGL compositor context is created on the PRIMARY (card)
         // node and issues the VIRTGPU driver ioctls (GETPARAM/GET_CAPS/
         // CONTEXT_INIT/RESOURCE_CREATE/EXECBUFFER/…) there — every one is

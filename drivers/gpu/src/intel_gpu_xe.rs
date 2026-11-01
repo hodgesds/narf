@@ -162,7 +162,7 @@ impl XeFile {
                     None if wc => Placement::SystemWc,
                     None => Placement::System,
                 };
-                gem.create_placed(
+                let handle = gem.create_placed(
                     size,
                     vm.as_ref().map(|vm| vm.identity),
                     memory,
@@ -170,8 +170,14 @@ impl XeFile {
                         put32(&mut wire, 28, handle);
                         user.write(address, &wire)
                     },
-                )
-                .map(|_| ())
+                )?;
+                if flags & 2 != 0 {
+                    // XE_BO_FLAG_SCANOUT; ADDFB may also set it later.
+                    if let Ok(object) = gem.object(handle) {
+                        object.mark_scanout();
+                    }
+                }
+                Ok(())
             }
             abi::GEM_MMAP_OFFSET => {
                 let mut wire = read(user, address, 40)?;
@@ -428,7 +434,7 @@ impl XeFile {
         if let Some((address, value)) = sync.user_fence {
             user.write_u64_release(address, value)?;
         }
-        state.mappings = mappings;
+        state.publish(mappings);
         sync.publish(so::stub());
         Ok(())
     }
