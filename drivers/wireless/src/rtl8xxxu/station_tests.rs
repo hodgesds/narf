@@ -403,6 +403,32 @@ fn prepared(protected: bool) -> (Fake, Link, Station<Fake, Link>) {
     .unwrap();
     (control, link, station)
 }
+// Keep the original native futures in heap storage before polling them. The
+// release ARM station/service tests otherwise reserve 97,600--110,464 bytes.
+type StationOperation<'a> = Pin<Box<dyn Future<Output = Result<(), Error>> + 'a>>;
+#[inline(never)]
+fn station_begin(station: &mut Station<Fake, Link>, now: u64) -> StationOperation<'_> {
+    Box::pin(station.begin(now))
+}
+#[inline(never)]
+fn station_step(
+    station: &mut Station<Fake, Link>,
+    now: u64,
+    nonce: [u8; 32],
+) -> StationOperation<'_> {
+    Box::pin(station.step(now, nonce))
+}
+#[inline(never)]
+fn service_connect<'a>(
+    service: &'a mut super::super::super::service_runtime::Service<Fake, Link, Env>,
+    bssid: [u8; 6],
+    ssid: &'a [u8],
+    mode: SecurityMode,
+    pmk: Option<Zeroizing<[u8; 32]>>,
+    ies: &'a [u8],
+) -> Pin<Box<dyn Future<Output = Result<(), super::super::super::service_runtime::Error>> + 'a>> {
+    Box::pin(service.connect(bssid, ssid, mode, pmk, ies))
+}
 const WMM: [u8; 26] = [
     221, 24, 0, 0x50, 0xf2, 2, 1, 1, 0x81, 0, 0x62, 0x32, 47, 0, 3, 0xa4, 0, 0, 0x42, 0x43, 94, 0,
     0x27, 0xa4, 0, 0,
@@ -468,11 +494,11 @@ fn smoke_rtl8188eu_negotiated_legacy_rate_native_usb_and_current_power() -> Test
             let expected = if code == 12 { 11 } else { code as u8 };
             let (_, link, mut s, cap, _) = wmm_rates(protected, Some(&RATES));
             link.state.lock().rates = response;
-            if narf_scheduler::block_on(s.begin(0)).is_err() {
+            if narf_scheduler::block_on(station_begin(&mut s, 0)).is_err() {
                 return TestResult::Fail("EU richer rates native start");
             }
             for now in 1..20 {
-                if narf_scheduler::block_on(s.step(now, SN)).is_err() {
+                if narf_scheduler::block_on(station_step(&mut s, now, SN)).is_err() {
                     return TestResult::Fail("EU richer rate response/RSNA");
                 }
                 if s.controlled_port_open() {
@@ -519,11 +545,11 @@ kernel_test_in!(
 fn smoke_rtl8188eu_wmm_real_ep0_bulk_edca_qos_and_current_authority() -> TestResult {
     for protected in [false, true] {
         let (control, link, mut s, cap, _) = wmm_prepared(protected);
-        if narf_scheduler::block_on(s.begin(0)).is_err() {
+        if narf_scheduler::block_on(station_begin(&mut s, 0)).is_err() {
             return TestResult::Fail("EU WMM native begin");
         }
         for now in 1..20 {
-            if narf_scheduler::block_on(s.step(now, SN)).is_err() {
+            if narf_scheduler::block_on(station_step(&mut s, now, SN)).is_err() {
                 return TestResult::Fail("EU WMM native association/RSNA");
             }
             if s.controlled_port_open() {
@@ -615,11 +641,11 @@ fn smoke_rtl8188eu_wmm_classifies_dscp_to_all_tids_queues_and_bulk_pipes() -> Te
                 parameters[18] |= 16;
             }
             let (control, link, mut s, _, _) = wmm_profile(protected, None, &parameters);
-            if narf_scheduler::block_on(s.begin(0)).is_err() {
+            if narf_scheduler::block_on(station_begin(&mut s, 0)).is_err() {
                 return TestResult::Fail("EU classified WMM native begin");
             }
             for now in 1..20 {
-                if narf_scheduler::block_on(s.step(now, SN)).is_err() {
+                if narf_scheduler::block_on(station_step(&mut s, now, SN)).is_err() {
                     return TestResult::Fail("EU classified WMM association/RSNA");
                 }
                 if s.controlled_port_open() {
@@ -696,12 +722,12 @@ fn smoke_rtl8188eu_wmm_response_rejection_and_pending_ep0_cancellation_retain_ow
         } else {
             control.0.lock().pending_write = Some(0x508);
         }
-        if narf_scheduler::block_on(s.begin(0)).is_err() {
+        if narf_scheduler::block_on(station_begin(&mut s, 0)).is_err() {
             return TestResult::Fail("EU WMM failure fixture begin");
         }
         let mut failure = false;
         for now in 1..12 {
-            let mut operation = Box::pin(s.step(now, SN));
+            let mut operation = station_step(&mut s, now, SN);
             let mut cx = Context::from_waker(Waker::noop());
             match operation.as_mut().poll(&mut cx) {
                 Poll::Ready(Err(_)) => {
@@ -772,11 +798,11 @@ fn smoke_rtl8188eu_wmm_beacon_parameter_set_count_updates_live_edca() -> TestRes
     const UPDATED: [u32; 4] = [0xa546, 0xa496, 0x005e4346, 0x001e3232];
     for protected in [false, true] {
         let (control, link, mut s, _, _) = wmm_prepared(protected);
-        if narf_scheduler::block_on(s.begin(0)).is_err() {
+        if narf_scheduler::block_on(station_begin(&mut s, 0)).is_err() {
             return TestResult::Fail("EU live EDCA begin");
         }
         for now in 1..20 {
-            if narf_scheduler::block_on(s.step(now, SN)).is_err() {
+            if narf_scheduler::block_on(station_step(&mut s, now, SN)).is_err() {
                 return TestResult::Fail("EU live EDCA association/RSNA");
             }
             if s.controlled_port_open() {
@@ -877,9 +903,9 @@ fn smoke_rtl8188eu_wmm_beacon_parameter_set_count_updates_live_edca() -> TestRes
     // losing WMM entirely is peer loss.
     for case in 0..2 {
         let (control, link, mut s, _, _) = wmm_prepared(false);
-        narf_scheduler::block_on(s.begin(0)).unwrap();
+        narf_scheduler::block_on(station_begin(&mut s, 0)).unwrap();
         for now in 1..20 {
-            narf_scheduler::block_on(s.step(now, SN)).unwrap();
+            narf_scheduler::block_on(station_step(&mut s, now, SN)).unwrap();
             if s.controlled_port_open() {
                 break;
             }
@@ -916,9 +942,9 @@ kernel_test_in!(
 fn smoke_rtl8188eu_real_station_auth_assoc_fw_rsna_and_packet_roundtrip() -> TestResult {
     for protected in [false, true] {
         let (control, link, mut s) = prepared(protected);
-        narf_scheduler::block_on(s.begin(0)).unwrap();
+        narf_scheduler::block_on(station_begin(&mut s, 0)).unwrap();
         for now in 1..20 {
-            narf_scheduler::block_on(s.step(now, SN)).unwrap();
+            narf_scheduler::block_on(station_step(&mut s, now, SN)).unwrap();
             if s.controlled_port_open() {
                 break;
             }
@@ -970,15 +996,15 @@ kernel_test_in!(
 fn smoke_rtl8188eu_station_m4_receipt_is_required_and_timeout_retains_it() -> TestResult {
     let (_, link, mut s) = prepared(true);
     link.state.lock().hold_m4 = true;
-    narf_scheduler::block_on(s.begin(0)).unwrap();
+    narf_scheduler::block_on(station_begin(&mut s, 0)).unwrap();
     for now in 1..10 {
-        narf_scheduler::block_on(s.step(now, SN)).unwrap();
+        narf_scheduler::block_on(station_step(&mut s, now, SN)).unwrap();
     }
     if s.controlled_port_open() || s.phase() != Phase::FourWay || link.state.lock().tx.is_none() {
         return TestResult::Fail("M4 submission was treated as terminal delivery");
     }
     let count = link.state.lock().sent.len();
-    if narf_scheduler::block_on(s.step(2000, SN)) != Err(Error::Timeout)
+    if narf_scheduler::block_on(station_step(&mut s, 2000, SN)) != Err(Error::Timeout)
         || s.phase() != Phase::Failed
         || link.state.lock().tx.is_none()
         || link.state.lock().sent.len() != count
@@ -993,10 +1019,10 @@ kernel_test_in!(
 );
 fn smoke_rtl8188eu_station_active_media_command_cancellation_is_terminal() -> TestResult {
     let (control, link, mut s) = prepared(false);
-    narf_scheduler::block_on(s.begin(0)).unwrap();
-    narf_scheduler::block_on(s.step(1, SN)).unwrap();
+    narf_scheduler::block_on(station_begin(&mut s, 0)).unwrap();
+    narf_scheduler::block_on(station_step(&mut s, 1, SN)).unwrap();
     control.0.lock().pending_write = Some(0x1d0);
-    let mut step = Box::pin(s.step(2, SN));
+    let mut step = station_step(&mut s, 2, SN);
     let mut cx = Context::from_waker(Waker::noop());
     if step.as_mut().poll(&mut cx) != Poll::Pending || !control.0.lock().active_td {
         return TestResult::Fail("fixture did not submit the actual firmware media command");
@@ -1006,7 +1032,7 @@ fn smoke_rtl8188eu_station_active_media_command_cancellation_is_terminal() -> Te
     let sent = link.state.lock().sent.len();
     if s.phase() != Phase::Failed
         || s.carrier_up()
-        || narf_scheduler::block_on(s.step(3, SN)) != Err(Error::State)
+        || narf_scheduler::block_on(station_step(&mut s, 3, SN)) != Err(Error::State)
         || control.0.lock().ops.len() != n
         || link.state.lock().sent.len() != sent
         || control.0.lock().unsafe_reuses != 0
@@ -1022,9 +1048,9 @@ kernel_test_in!(
 
 fn smoke_rtl8188eu_station_disconnect_closes_port_media_and_owned_receipts() -> TestResult {
     let (control, link, mut s) = prepared(true);
-    narf_scheduler::block_on(s.begin(0)).unwrap();
+    narf_scheduler::block_on(station_begin(&mut s, 0)).unwrap();
     for now in 1..20 {
-        narf_scheduler::block_on(s.step(now, SN)).unwrap();
+        narf_scheduler::block_on(station_step(&mut s, now, SN)).unwrap();
         if s.controlled_port_open() {
             break;
         }
@@ -1038,7 +1064,7 @@ fn smoke_rtl8188eu_station_disconnect_closes_port_media_and_owned_receipts() -> 
         || s.carrier_up()
         || s.pop_received().is_some()
         || s.send_ethernet(&ethernet, 21) != Err(Error::State)
-        || narf_scheduler::block_on(s.begin(21)) != Err(Error::State)
+        || narf_scheduler::block_on(station_begin(&mut s, 21)) != Err(Error::State)
         || link.state.lock().rx.is_some()
         || link.state.lock().tx.is_some()
     {
@@ -1071,9 +1097,9 @@ kernel_test_in!(
 );
 fn smoke_rtl8188eu_station_disconnect_cancel_retains_claim_and_forbids_reuse() -> TestResult {
     let (control, link, mut s) = prepared(false);
-    narf_scheduler::block_on(s.begin(0)).unwrap();
-    narf_scheduler::block_on(s.step(1, SN)).unwrap();
-    narf_scheduler::block_on(s.step(2, SN)).unwrap();
+    narf_scheduler::block_on(station_begin(&mut s, 0)).unwrap();
+    narf_scheduler::block_on(station_step(&mut s, 1, SN)).unwrap();
+    narf_scheduler::block_on(station_step(&mut s, 2, SN)).unwrap();
     control.0.lock().pending_write = Some(0x1d4);
     let mut disconnect = Box::pin(s.disconnect());
     let mut cx = Context::from_waker(Waker::noop());
@@ -1147,7 +1173,8 @@ fn smoke_rtl8188eu_service_composes_passive_scan_optional_ies_rsna_and_sync_netw
         return TestResult::Fail("passive native cache unavailable");
     }
     let n = control.0.lock().ops.len();
-    if narf_scheduler::block_on(service.connect(
+    if narf_scheduler::block_on(service_connect(
+        &mut service,
         AP,
         b"narf",
         SecurityMode::Wpa2Psk,
@@ -1162,7 +1189,8 @@ fn smoke_rtl8188eu_service_composes_passive_scan_optional_ies_rsna_and_sync_netw
         return TestResult::Fail("invalid SME input changed the retained receive/radio owner");
     }
     let vendor = [221, 4, 0x12, 0x34, 0x56, 0x78];
-    narf_scheduler::block_on(service.connect(
+    narf_scheduler::block_on(service_connect(
+        &mut service,
         AP,
         b"narf",
         SecurityMode::Wpa2Psk,
@@ -1211,7 +1239,8 @@ fn smoke_rtl8188eu_service_composes_passive_scan_optional_ies_rsna_and_sync_netw
         state.queue.push_back(beacon(true).bytes);
     }
     service.poll().unwrap();
-    if narf_scheduler::block_on(service.connect(
+    if narf_scheduler::block_on(service_connect(
+        &mut service,
         AP,
         b"narf",
         SecurityMode::Wpa2Psk,
@@ -1252,7 +1281,8 @@ fn smoke_rtl8188eu_service_entropy_failure_precedes_radio_tx_and_cancel_is_termi
     env.no_entropy
         .store(true, core::sync::atomic::Ordering::Release);
     let n = control.0.lock().ops.len();
-    if narf_scheduler::block_on(service.connect(
+    if narf_scheduler::block_on(service_connect(
+        &mut service,
         AP,
         b"narf",
         SecurityMode::Wpa2Psk,
@@ -1269,13 +1299,14 @@ fn smoke_rtl8188eu_service_entropy_failure_precedes_radio_tx_and_cancel_is_termi
         .store(false, core::sync::atomic::Ordering::Release);
     env.pause_pending
         .store(true, core::sync::atomic::Ordering::Release);
-    let mut connect = Box::pin(service.connect(
+    let mut connect = service_connect(
+        &mut service,
         AP,
         b"narf",
         SecurityMode::Wpa2Psk,
         Some(Zeroizing::new(PMK)),
         &[],
-    ));
+    );
     let mut cx = Context::from_waker(Waker::noop());
     if connect.as_mut().poll(&mut cx) != Poll::Pending {
         return TestResult::Fail("fixture did not reach actual retained join pause");
@@ -1306,7 +1337,8 @@ fn smoke_rtl8188eu_service_rekey_closes_controlled_port_without_false_disconnect
         narf_scheduler::block_on(Service::start(radio, power, Env::default())).unwrap();
     link.state.lock().queue.push_back(beacon(true).bytes);
     service.poll().unwrap();
-    narf_scheduler::block_on(service.connect(
+    narf_scheduler::block_on(service_connect(
+        &mut service,
         AP,
         b"narf",
         SecurityMode::Wpa2Psk,
@@ -1435,9 +1467,9 @@ kernel_test_in!(
 );
 fn smoke_rtl8188eu_ap_broadcast_teardown_closes_retained_station() -> TestResult {
     let (_, link, mut station) = prepared(false);
-    narf_scheduler::block_on(station.begin(0)).unwrap();
-    narf_scheduler::block_on(station.step(1, SN)).unwrap();
-    narf_scheduler::block_on(station.step(2, SN)).unwrap();
+    narf_scheduler::block_on(station_begin(&mut station, 0)).unwrap();
+    narf_scheduler::block_on(station_step(&mut station, 1, SN)).unwrap();
+    narf_scheduler::block_on(station_step(&mut station, 2, SN)).unwrap();
     let mut deauth = mgmt(0xc0, [255; 6]);
     deauth.extend_from_slice(&3u16.to_le_bytes());
     link.state.lock().queue.push_back(deauth);
@@ -1465,7 +1497,8 @@ fn smoke_rtl8188eu_service_only_draws_entropy_at_new_handshake_consumption() -> 
     let mut service = narf_scheduler::block_on(Service::start(radio, power, env.clone())).unwrap();
     link.state.lock().queue.push_back(beacon(true).bytes);
     service.poll().unwrap();
-    narf_scheduler::block_on(service.connect(
+    narf_scheduler::block_on(service_connect(
+        &mut service,
         AP,
         b"narf",
         SecurityMode::Wpa2Psk,
@@ -1528,22 +1561,11 @@ kernel_test_in!(
 /// and reposts/reopens it, best-effort DATA is dropped, a failed reset is
 /// terminal, and disconnect recovers a halted pipe before draining it.
 fn smoke_rtl8188eu_station_endpoint_halt_recovery_keeps_association() -> TestResult {
-    // Construct each retained native future on the heap before polling it.
-    // Keeping both inline in open reserved 99,040 bytes in the release ARM frame.
-    type Setup<'a> = Pin<Box<dyn Future<Output = Result<(), Error>> + 'a>>;
-    #[inline(never)]
-    fn begin(s: &mut Station<Fake, Link>) -> Setup<'_> {
-        Box::pin(s.begin(0))
-    }
-    #[inline(never)]
-    fn step(s: &mut Station<Fake, Link>, now: u64) -> Setup<'_> {
-        Box::pin(s.step(now, SN))
-    }
     fn open() -> (Link, Station<Fake, Link>) {
         let (_, link, mut s) = prepared(false);
-        narf_scheduler::block_on(begin(&mut s)).unwrap();
+        narf_scheduler::block_on(station_begin(&mut s, 0)).unwrap();
         for now in 1..20 {
-            narf_scheduler::block_on(step(&mut s, now)).unwrap();
+            narf_scheduler::block_on(station_step(&mut s, now, SN)).unwrap();
             if s.controlled_port_open() {
                 break;
             }
