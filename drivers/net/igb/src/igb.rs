@@ -166,6 +166,228 @@ pub const SRRCTL_DESCTYPE_ADV_ONEBUF: u32 = 1 << 25;
 /// E1000_TXDCTL_QUEUE_ENABLE / E1000_RXDCTL_QUEUE_ENABLE = 0x02000000.
 pub const QUEUE_ENABLE: u32 = 0x0200_0000;
 
+// ── Multi-queue register windows ────────────────────────────────────
+//
+// Linux: drivers/net/ethernet/intel/igb/e1000_regs.h E1000_RDBAL /
+// RDBAH / RDLEN / SRRCTL / RDH / RDT / RXDCTL and E1000_TDBAL / TDBAH /
+// TDLEN / TDH / TDT / TXDCTL. Queues 0..3 use the 0x2800 (RX) / 0x3800
+// (TX) windows with a 0x100 stride; queues 4..7 use the compact 0xC000
+// (RX) / 0xE000 (TX) windows with a 0x40 stride. Queue 0 of either window
+// is the legacy REG_*0 constant above. Bring-up still arms queue 0 only
+// (the QEMU/CI profile is single-queue); these windows are the
+// programming surface for queues 1..7, exercised end-to-end by the
+// fake-register fixtures in the test module below.
+
+/// Maximum RX/TX queues on the family (I350 / 82576 / 82580 / i354).
+/// Linux: drivers/net/ethernet/intel/igb/igb.h IGB_MAX_RX_QUEUES /
+/// IGB_MAX_TX_QUEUES = 8.
+pub const IGB_MAX_QUEUES: usize = 8;
+/// Maximum queues on 82575 and I210 (Linux IGB_MAX_RX_QUEUES_82575 = 4;
+/// `igb_get_max_rss_queues` maps both e1000_82575 and e1000_i210 here).
+pub const IGB_MAX_QUEUES_82575: usize = 4;
+/// Maximum queues on I211 (Linux IGB_MAX_RX_QUEUES_I211 = 2).
+pub const IGB_MAX_QUEUES_I211: usize = 2;
+
+/// All BAR0 register offsets of one queue's descriptor windows.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct QueueRegs {
+    pub rdbal: u64,
+    pub rdbah: u64,
+    pub rdlen: u64,
+    pub srrctl: u64,
+    pub rdh: u64,
+    pub rdt: u64,
+    pub rxdctl: u64,
+    pub tdbal: u64,
+    pub tdbah: u64,
+    pub tdlen: u64,
+    pub tdh: u64,
+    pub tdt: u64,
+    pub txdctl: u64,
+}
+
+const fn rx_queue_base(queue: usize) -> u64 {
+    if queue < 4 {
+        0x2800 + queue as u64 * 0x100
+    } else {
+        0xC000 + queue as u64 * 0x40
+    }
+}
+
+const fn tx_queue_base(queue: usize) -> u64 {
+    if queue < 4 {
+        0x3800 + queue as u64 * 0x100
+    } else {
+        0xE000 + queue as u64 * 0x40
+    }
+}
+
+/// Register window for `queue` (0..7). Queues past the device's
+/// `max_queues_for_device` limit have well-defined addresses but must
+/// never be programmed: the silicon has no such queue.
+pub const fn queue_regs(queue: usize) -> QueueRegs {
+    let rx = rx_queue_base(queue);
+    let tx = tx_queue_base(queue);
+    QueueRegs {
+        rdbal: rx,
+        rdbah: rx + 0x04,
+        rdlen: rx + 0x08,
+        srrctl: rx + 0x0C,
+        rdh: rx + 0x10,
+        rdt: rx + 0x18,
+        rxdctl: rx + 0x28,
+        tdbal: tx,
+        tdbah: tx + 0x04,
+        tdlen: tx + 0x08,
+        tdh: tx + 0x10,
+        tdt: tx + 0x18,
+        txdctl: tx + 0x28,
+    }
+}
+
+/// Maximum RSS queues for a device id, mirroring Linux
+/// `igb_get_max_rss_queues` (igb_main.c) first-hand, including the
+/// SR-IOV interaction: an I350 with any VF allocated drops to 1 queue
+/// ("I350 cannot do RSS and SR-IOV at the same time"), an 82576 with
+/// VFs drops to 2, and every other family keeps its full count.
+/// `vfs_allocated` is the SR-IOV VF count (0 when SR-IOV is off).
+pub fn max_queues_for_device(device_id: u16, vfs_allocated: u16) -> usize {
+    match device_id {
+        IGB_I211_COPPER => IGB_MAX_QUEUES_I211,
+        IGB_I210_COPPER
+        | IGB_I210_FIBER
+        | IGB_I210_SERDES
+        | IGB_I210_SGMII
+        | IGB_I210_COPPER_FLASHLESS
+        | IGB_I210_SERDES_FLASHLESS => IGB_MAX_QUEUES_82575,
+        IGB_82576 | IGB_82576_NS => {
+            if vfs_allocated > 0 {
+                2
+            } else {
+                IGB_MAX_QUEUES
+            }
+        }
+        IGB_I350_COPPER => {
+            if vfs_allocated > 0 {
+                1
+            } else {
+                IGB_MAX_QUEUES
+            }
+        }
+        // Linux `default:` arm (82580 / i354 / unknown) is 8.
+        _ => IGB_MAX_QUEUES,
+    }
+}
+
+/// Whether TX and RX queues share one MSI-X vector per queue (Linux
+/// `igb_set_flag_queue_pairs`: pairs when rss_queues > max/2, so a
+/// full 8-queue I350/82576 pairs but a 4-of-8 configuration does not).
+pub const fn queue_pairs(queues: usize, max_queues: usize) -> bool {
+    queues > max_queues / 2
+}
+
+/// TXDCTL/RXDCTL word with the ENABLE bit set, preserving the
+/// threshold/other bits the caller already programmed.
+pub const fn queue_enable_word(current: u32) -> u32 {
+    current | QUEUE_ENABLE
+}
+
+/// TXDCTL/RXDCTL word with the ENABLE bit cleared (queue disable).
+pub const fn queue_disable_word(current: u32) -> u32 {
+    current & !QUEUE_ENABLE
+}
+
+/// Whether a TXDCTL/RXDCTL read reflects the ENABLE handshake: the
+/// bring-up spin in `Igb::bring_up` polls exactly this predicate, and
+/// a queue that never reflects ENABLE is a dead queue
+/// (`IgbError::QueueEnableTimeout`).
+pub const fn queue_enable_reflected(value: u32) -> bool {
+    value & QUEUE_ENABLE != 0
+}
+
+/// TXDCTL programming word from Linux's thresholds (igb.h):
+/// PTHRESH at bits[7:0], HTHRESH at bits[15:8], WTHRESH at bits[23:16],
+/// plus ENABLE. The common (non-82576+MSI-X) values are PTHRESH 8,
+/// HTHRESH 1, WTHRESH 16; an 82576 with MSI-X uses WTHRESH 1.
+pub const fn txdctl_word(pthresh: u32, hthresh: u32, wthresh: u32) -> u32 {
+    (pthresh & 0xFF) | ((hthresh & 0xFF) << 8) | ((wthresh & 0xFF) << 16) | QUEUE_ENABLE
+}
+
+/// RXDCTL programming word, same layout as [`txdctl_word`]. The common
+/// values are PTHRESH 8, HTHRESH 8, WTHRESH 4; an 82576 with MSI-X uses
+/// WTHRESH 1. (i354 raises PTHRESH to 12 TX / 20 RX; NARF claims no
+/// i354 device id, so those variants are not encoded.)
+pub const fn rxdctl_word(pthresh: u32, hthresh: u32, wthresh: u32) -> u32 {
+    (pthresh & 0xFF) | ((hthresh & 0xFF) << 8) | ((wthresh & 0xFF) << 16) | QUEUE_ENABLE
+}
+
+// ── MSI-X vector routing (IVAR) ─────────────────────────────────────
+//
+// Linux `igb_assign_vector` (igb_main.c) routes each queue's RX and TX
+// causes to an MSI-X vector through the IVAR table (one 32-bit word
+// per row, four byte lanes). The scheme depends on silicon generation:
+// 82575 uses an MSIXBM bitmask instead of IVAR; 82576 orders the table
+// column-major (low 3 bits = row, bit 3 = column); 82580 and newer
+// (I210 / I211 / I350 / i354) order it row-major (bit 0 = column, the
+// rest = row). Queue 0 under row-major reproduces the existing shared
+// IVAR0 word 0x8080 (RX byte 0, TX byte 1, both vector 0 + VALID).
+
+/// Which IVAR addressing scheme a device id uses.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IvarScheme {
+    /// 82575: MSIXBM bitmask, no IVAR table. No NARF-claimed id uses
+    /// this scheme; it is encoded so the difference is explicit rather
+    /// than silently mapped onto a wrong table layout.
+    Bitmask82575,
+    /// 82576: column-major IVAR table.
+    ColumnMajor82576,
+    /// 82580 / I210 / I211 / I350 / i354: row-major IVAR table.
+    RowMajor82580Plus,
+}
+
+/// IVAR scheme for a NARF-claimed igb device id.
+pub fn ivar_scheme_for_device(device_id: u16) -> IvarScheme {
+    match device_id {
+        IGB_82576 | IGB_82576_NS => IvarScheme::ColumnMajor82576,
+        // Every other claimed id (I210 family, I211, I350) is 82580+.
+        _ => IvarScheme::RowMajor82580Plus,
+    }
+}
+
+/// (IVAR register address, byte-lane shift) for a queue's RX cause.
+pub const fn ivar_rx(queue: usize, scheme: IvarScheme) -> (u64, u32) {
+    let (index, shift) = match scheme {
+        IvarScheme::Bitmask82575 => (0, 0),
+        IvarScheme::ColumnMajor82576 => (queue & 0x7, ((queue & 0x8) << 1) as u32),
+        IvarScheme::RowMajor82580Plus => (queue >> 1, ((queue & 0x1) << 4) as u32),
+    };
+    (REG_IVAR0 + index as u64 * 4, shift)
+}
+
+/// (IVAR register address, byte-lane shift) for a queue's TX cause.
+pub const fn ivar_tx(queue: usize, scheme: IvarScheme) -> (u64, u32) {
+    let (index, shift) = match scheme {
+        IvarScheme::Bitmask82575 => (0, 0),
+        IvarScheme::ColumnMajor82576 => (queue & 0x7, (((queue & 0x8) << 1) + 8) as u32),
+        IvarScheme::RowMajor82580Plus => (queue >> 1, (((queue & 0x1) << 4) + 8) as u32),
+    };
+    (REG_IVAR0 + index as u64 * 4, shift)
+}
+
+/// Apply one queue cause's vector to an IVAR word: clear only that byte
+/// lane, then set `vector | VALID`. Other lanes are untouched, so RX
+/// and TX of a queue pair compose into one word write each.
+pub const fn ivar_apply(current: u32, shift: u32, vector: u8) -> u32 {
+    (current & !(0xFF << shift)) | (((vector as u32) | IVAR_VALID) << shift)
+}
+
+/// EITR register for an MSI-X vector: 0x1680 + 4 * vector (Linux
+/// E1000_EITR(n)). Queue pairs share one vector, so one EITR programs
+/// the throttle for both directions of the pair.
+pub const fn eitr_reg(vector: usize) -> u64 {
+    REG_EITR0 + vector as u64 * 4
+}
+
 // CTRL bits.
 const CTRL_RST: u32 = 1 << 26;
 const CTRL_SLU: u32 = 1 << 6;
@@ -713,28 +935,33 @@ impl Igb {
         }
 
         // 6. Initialise TX descriptors (zeroed by alloc_coherent) and
-        //    enable the per-queue TX DMA engine.
+        //    enable the per-queue TX DMA engine. Queue 0 is programmed
+        //    through the multi-queue window helper; `queue_regs(0)`
+        //    reproduces the legacy REG_TDBAL/REG_TXDCTL0 addresses
+        //    exactly (asserted by the multi-queue fixture below), so
+        //    this refactor changes no live register traffic.
+        let q0 = queue_regs(0);
         let tx_phys = tx_ring_buf.dma_addr().raw();
         let tx_len = (TX_RING_LEN * 16) as u32;
         // SAFETY: mapped DMA, freshly zeroed.
         unsafe {
-            mmio.write32(REG_TDBAL, (tx_phys & 0xFFFF_FFFF) as u32);
-            mmio.write32(REG_TDBAH, (tx_phys >> 32) as u32);
-            mmio.write32(REG_TDLEN, tx_len);
-            mmio.write32(REG_TDH, 0);
-            mmio.write32(REG_TDT, 0);
+            mmio.write32(q0.tdbal, (tx_phys & 0xFFFF_FFFF) as u32);
+            mmio.write32(q0.tdbah, (tx_phys >> 32) as u32);
+            mmio.write32(q0.tdlen, tx_len);
+            mmio.write32(q0.tdh, 0);
+            mmio.write32(q0.tdt, 0);
             mmio.write32(REG_TCTL, TCTL_EN | TCTL_PSP);
         }
         // igb per-queue enable: set TXDCTL.ENABLE then spin until the
         // chip reflects it. Linux `igb_configure_tx_ring`.
         // SAFETY: mapped MMIO.
         unsafe {
-            let txdctl = mmio.read32(REG_TXDCTL0) | QUEUE_ENABLE;
-            mmio.write32(REG_TXDCTL0, txdctl);
+            let txdctl = queue_enable_word(mmio.read32(q0.txdctl));
+            mmio.write32(q0.txdctl, txdctl);
         }
         let tx_on = narf_scheduler::responsive_spin_until(
             // SAFETY: mapped MMIO.
-            || unsafe { mmio.read32(REG_TXDCTL0) } & QUEUE_ENABLE != 0,
+            || unsafe { queue_enable_reflected(mmio.read32(q0.txdctl)) },
             narf_time::Deadline::after_ms(100),
         );
         if !tx_on {
@@ -759,19 +986,19 @@ impl Igb {
                     },
                 );
             }
-            mmio.write32(REG_RDBAL, (rx_phys & 0xFFFF_FFFF) as u32);
-            mmio.write32(REG_RDBAH, (rx_phys >> 32) as u32);
-            mmio.write32(REG_RDLEN, (RX_RING_LEN * 16) as u32);
-            mmio.write32(REG_RDH, 0);
-            mmio.write32(REG_RDT, (RX_RING_LEN - 1) as u32);
+            mmio.write32(q0.rdbal, (rx_phys & 0xFFFF_FFFF) as u32);
+            mmio.write32(q0.rdbah, (rx_phys >> 32) as u32);
+            mmio.write32(q0.rdlen, (RX_RING_LEN * 16) as u32);
+            mmio.write32(q0.rdh, 0);
+            mmio.write32(q0.rdt, (RX_RING_LEN - 1) as u32);
 
             // SRRCTL — per-queue: buffer-size = 2 KiB, descriptor type =
             // ADV_ONEBUF. Linux `igb_setup_srrctl`; queue 0 only.
-            let mut srrctl = mmio.read32(REG_SRRCTL_Q0);
+            let mut srrctl = mmio.read32(q0.srrctl);
             srrctl &= !(SRRCTL_BSIZEPKT_MASK | SRRCTL_DESCTYPE_MASK);
             srrctl |= ((FRAME_SIZE as u32) >> SRRCTL_BSIZEPKT_SHIFT) & SRRCTL_BSIZEPKT_MASK;
             srrctl |= SRRCTL_DESCTYPE_ADV_ONEBUF;
-            mmio.write32(REG_SRRCTL_Q0, srrctl);
+            mmio.write32(q0.srrctl, srrctl);
 
             mmio.write32(
                 REG_RCTL,
@@ -782,12 +1009,12 @@ impl Igb {
         // chip reflects it. Linux `igb_configure_rx_ring`.
         // SAFETY: mapped MMIO.
         unsafe {
-            let rxdctl = mmio.read32(REG_RXDCTL0) | QUEUE_ENABLE;
-            mmio.write32(REG_RXDCTL0, rxdctl);
+            let rxdctl = queue_enable_word(mmio.read32(q0.rxdctl));
+            mmio.write32(q0.rxdctl, rxdctl);
         }
         let rx_on = narf_scheduler::responsive_spin_until(
             // SAFETY: mapped MMIO.
-            || unsafe { mmio.read32(REG_RXDCTL0) } & QUEUE_ENABLE != 0,
+            || unsafe { queue_enable_reflected(mmio.read32(q0.rxdctl)) },
             narf_time::Deadline::after_ms(100),
         );
         if !rx_on {
@@ -1534,10 +1761,16 @@ mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     use super::{
-        ivar0_shared_vector, ivar_misc_shared_vector, previous_rx_slot, AdvRxDescRead, AdvRxDescWb,
-        AdvTxDataDesc, TxRingCursor, EITR_CNT_IGNR, EITR_START, QUEUE_ENABLE, REG_EIAC, REG_EIAM,
-        REG_EIMC, REG_EIMS, REG_EITR0, REG_ICR, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC,
-        REG_RXDCTL0, REG_TXDCTL0, RX_RING_LEN, SRRCTL_DESCTYPE_ADV_ONEBUF, TX_RING_LEN,
+        eitr_reg, ivar0_shared_vector, ivar_apply, ivar_misc_shared_vector, ivar_rx,
+        ivar_scheme_for_device, ivar_tx, max_queues_for_device, previous_rx_slot,
+        queue_disable_word, queue_enable_reflected, queue_enable_word, queue_pairs, queue_regs,
+        rxdctl_word, txdctl_word, AdvRxDescRead, AdvRxDescWb, AdvTxDataDesc, IvarScheme,
+        TxRingCursor, EITR_CNT_IGNR, EITR_START, IGB_82576, IGB_82576_NS, IGB_I210_COPPER,
+        IGB_I211_COPPER, IGB_I350_COPPER, IGB_MAX_QUEUES, IGB_MAX_QUEUES_82575,
+        IGB_MAX_QUEUES_I211, IVAR_VALID, QUEUE_ENABLE, REG_EIAC, REG_EIAM, REG_EIMC, REG_EIMS,
+        REG_EITR0, REG_ICR, REG_IMC, REG_IMS, REG_IVAR0, REG_IVAR_MISC, REG_RDBAH, REG_RDBAL,
+        REG_RDH, REG_RDLEN, REG_RDT, REG_RXDCTL0, REG_SRRCTL_Q0, REG_TDBAH, REG_TDBAL, REG_TDH,
+        REG_TDLEN, REG_TDT, REG_TXDCTL0, RX_RING_LEN, SRRCTL_DESCTYPE_ADV_ONEBUF, TX_RING_LEN,
         TX_RING_USABLE,
     };
 
@@ -1666,4 +1899,189 @@ mod tests {
         "drivers/net/igb",
         smoke_igb_tx_cursor_reserves_without_wait_lock
     );
+
+    fn smoke_igb_multiqueue_register_windows() -> TestResult {
+        // Queue 0 through the window helper must reproduce the legacy
+        // queue-0 constants exactly — this is what makes the bring_up
+        // refactor a no-op on live register traffic.
+        let q0 = queue_regs(0);
+        if q0.rdbal != REG_RDBAL
+            || q0.rdbah != REG_RDBAH
+            || q0.rdlen != REG_RDLEN
+            || q0.srrctl != REG_SRRCTL_Q0
+            || q0.rdh != REG_RDH
+            || q0.rdt != REG_RDT
+            || q0.rxdctl != REG_RXDCTL0
+            || q0.tdbal != REG_TDBAL
+            || q0.tdbah != REG_TDBAH
+            || q0.tdlen != REG_TDLEN
+            || q0.tdh != REG_TDH
+            || q0.tdt != REG_TDT
+            || q0.txdctl != REG_TXDCTL0
+        {
+            return TestResult::Fail("igb queue-0 window drifted from legacy offsets");
+        }
+        // Low window stride 0x100 for queues 1..3, compact window
+        // stride 0x40 from queue 4 (Linux E1000_RDBAL/TDBAL macros).
+        let q3 = queue_regs(3);
+        if q3.rdbal != 0x2B00 || q3.tdbal != 0x3B00 || q3.rxdctl != 0x2B28 || q3.txdctl != 0x3B28 {
+            return TestResult::Fail("igb queue-3 window stride drift");
+        }
+        let q4 = queue_regs(4);
+        if q4.rdbal != 0xC100 || q4.tdbal != 0xE100 || q4.srrctl != 0xC10C || q4.rxdctl != 0xC128 {
+            return TestResult::Fail("igb queue-4 compact window drift");
+        }
+        let q7 = queue_regs(7);
+        if q7.rdbal != 0xC1C0 || q7.tdbal != 0xE1C0 || q7.rxdctl != 0xC1E8 || q7.txdctl != 0xE1E8 {
+            return TestResult::Fail("igb queue-7 compact window drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_multiqueue_register_windows);
+
+    fn smoke_igb_multiqueue_counts_and_pairs() -> TestResult {
+        if IGB_MAX_QUEUES != 8 || IGB_MAX_QUEUES_82575 != 4 || IGB_MAX_QUEUES_I211 != 2 {
+            return TestResult::Fail("igb queue-cap constant drift");
+        }
+        if max_queues_for_device(IGB_I211_COPPER, 0) != 2
+            || max_queues_for_device(IGB_I210_COPPER, 0) != 4
+            || max_queues_for_device(IGB_82576, 0) != 8
+            || max_queues_for_device(IGB_82576_NS, 0) != 8
+            || max_queues_for_device(IGB_I350_COPPER, 0) != 8
+        {
+            return TestResult::Fail("igb per-device queue cap drift");
+        }
+        // SR-IOV interaction, Linux igb_get_max_rss_queues: I350 with
+        // any VF allocated drops to 1 queue, 82576 to 2.
+        if max_queues_for_device(IGB_I350_COPPER, 1) != 1
+            || max_queues_for_device(IGB_I350_COPPER, 7) != 1
+            || max_queues_for_device(IGB_82576, 3) != 2
+            || max_queues_for_device(IGB_I211_COPPER, 1) != 2
+        {
+            return TestResult::Fail("igb SR-IOV queue-cap interaction drift");
+        }
+        // Queue pairs iff rss_queues > max/2 (Linux igb_set_flag_queue_pairs).
+        if !queue_pairs(8, 8) || queue_pairs(4, 8) || !queue_pairs(3, 4) || queue_pairs(2, 4) {
+            return TestResult::Fail("igb queue-pair rule drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_multiqueue_counts_and_pairs);
+
+    /// Fake per-queue DMA-control register: the "chip" reflects ENABLE
+    /// only after `stale_reads_left` stale reads, so the test exercises
+    /// the spin-until-reflected conversation instead of assuming an
+    /// instant reflection.
+    struct FakeQueueCtl {
+        word: u32,
+        stale_reads_left: u32,
+    }
+
+    impl FakeQueueCtl {
+        fn new(stale_reads: u32) -> Self {
+            Self {
+                word: 0,
+                stale_reads_left: stale_reads,
+            }
+        }
+
+        fn write(&mut self, word: u32) {
+            self.word = word;
+        }
+
+        fn read(&mut self) -> u32 {
+            if self.stale_reads_left > 0 {
+                self.stale_reads_left -= 1;
+                self.word & !QUEUE_ENABLE
+            } else {
+                self.word
+            }
+        }
+    }
+
+    fn smoke_igb_queue_enable_handshake() -> TestResult {
+        // Enable conversation: driver writes ENABLE, chip reflects it
+        // only on the third read; the poll predicate must see exactly
+        // two stale reads, then reflection — never an instant pass, and
+        // never a spin past reflection.
+        let mut ctl = FakeQueueCtl::new(2);
+        ctl.write(queue_enable_word(ctl.read()));
+        let mut stale_polls = 0u32;
+        while !queue_enable_reflected(ctl.read()) {
+            stale_polls += 1;
+            if stale_polls > 100 {
+                return TestResult::Fail("igb queue-enable spin did not terminate");
+            }
+        }
+        if stale_polls != 2 {
+            return TestResult::Fail("igb queue-enable reflection count drift");
+        }
+        // Disable conversation: clearing ENABLE reflects immediately.
+        ctl.write(queue_disable_word(ctl.read()));
+        if queue_enable_reflected(ctl.read()) {
+            return TestResult::Fail("igb queue-disable did not clear ENABLE");
+        }
+        // Threshold words: PTHRESH/HTHRESH/WTHRESH fields plus ENABLE.
+        if txdctl_word(8, 1, 16) != 0x0210_0108 || rxdctl_word(8, 8, 4) != 0x0204_0808 {
+            return TestResult::Fail("igb TXDCTL/RXDCTL threshold word drift");
+        }
+        if txdctl_word(8, 1, 1) & QUEUE_ENABLE == 0 || rxdctl_word(8, 8, 1) & QUEUE_ENABLE == 0 {
+            return TestResult::Fail("igb 82576+MSI-X threshold word lost ENABLE");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_queue_enable_handshake);
+
+    fn smoke_igb_ivar_routing() -> TestResult {
+        // Row-major (82580+): queue 0 reproduces the legacy shared word
+        // 0x8080; queue 1 RX/TX live in the same IVAR0 word's upper
+        // lanes; queue 2 RX starts the next word.
+        let scheme = ivar_scheme_for_device(IGB_I350_COPPER);
+        if scheme != IvarScheme::RowMajor82580Plus {
+            return TestResult::Fail("igb I350 IVAR scheme is not row-major");
+        }
+        if ivar_scheme_for_device(IGB_82576) != IvarScheme::ColumnMajor82576 {
+            return TestResult::Fail("igb 82576 IVAR scheme is not column-major");
+        }
+        let (rx0_reg, rx0_shift) = ivar_rx(0, scheme);
+        let (tx0_reg, tx0_shift) = ivar_tx(0, scheme);
+        if rx0_reg != REG_IVAR0 || rx0_shift != 0 || tx0_reg != REG_IVAR0 || tx0_shift != 8 {
+            return TestResult::Fail("igb queue-0 IVAR lanes drift");
+        }
+        let mut word = ivar_apply(0, rx0_shift, 0);
+        word = ivar_apply(word, tx0_shift, 0);
+        if word != ivar0_shared_vector(0) {
+            return TestResult::Fail("igb queue-0 IVAR word does not match legacy shared vector");
+        }
+        let (rx1_reg, rx1_shift) = ivar_rx(1, scheme);
+        let (tx1_reg, tx1_shift) = ivar_tx(1, scheme);
+        if rx1_reg != REG_IVAR0 || rx1_shift != 16 || tx1_reg != REG_IVAR0 || tx1_shift != 24 {
+            return TestResult::Fail("igb queue-1 row-major IVAR lanes drift");
+        }
+        let (rx2_reg, rx2_shift) = ivar_rx(2, scheme);
+        if rx2_reg != REG_IVAR0 + 4 || rx2_shift != 0 {
+            return TestResult::Fail("igb queue-2 row-major IVAR row drift");
+        }
+        // Column-major (82576): queue 1 RX is row 1, lane 0.
+        let col = IvarScheme::ColumnMajor82576;
+        let (rx1c_reg, rx1c_shift) = ivar_rx(1, col);
+        let (tx1c_reg, tx1c_shift) = ivar_tx(1, col);
+        if rx1c_reg != REG_IVAR0 + 4
+            || rx1c_shift != 0
+            || tx1c_reg != REG_IVAR0 + 4
+            || tx1c_shift != 8
+        {
+            return TestResult::Fail("igb 82576 column-major IVAR lanes drift");
+        }
+        // Lane isolation: writing the TX lane must not disturb RX.
+        let composed = ivar_apply(ivar_apply(0, 0, 3), 8, 3);
+        if composed != (3 | IVAR_VALID) | ((3 | IVAR_VALID) << 8) {
+            return TestResult::Fail("igb IVAR lane write clobbered a neighbouring lane");
+        }
+        if eitr_reg(0) != REG_EITR0 || eitr_reg(3) != 0x168C {
+            return TestResult::Fail("igb per-vector EITR stride drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_ivar_routing);
 }
