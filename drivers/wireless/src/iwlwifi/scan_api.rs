@@ -158,6 +158,8 @@ pub struct Mpdu<'a> {
     pub channel: u8,
     /// Copied mac_phy_band[7:6], independent of channel's numeric value.
     pub(super) raw_band: u8,
+    /// Actual native MLD firmware link, independent of the AP spec id.
+    pub(super) raw_fw_link: u8,
     pub rssi: i8,
     pub rate_n_flags: u32,
     pub status: u32,
@@ -211,6 +213,7 @@ fn mpdu_layout(bytes: &[u8], prefix: usize, energy_offset: usize) -> Option<Mpdu
         frame: &bytes[prefix..prefix + len],
         channel: bytes[energy_offset + 2],
         raw_band: bytes[7] >> 6,
+        raw_fw_link: bytes[7] & 15,
         rssi: -(energy.min(127) as i8),
         rate_n_flags: u32::from_le_bytes(bytes[energy_offset - 4..energy_offset].try_into().ok()?),
         status,

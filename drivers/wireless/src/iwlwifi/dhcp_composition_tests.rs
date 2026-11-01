@@ -226,6 +226,9 @@ struct Wire {
     six: Option<SixModel>,
     eht: Option<eht_tests::Model>,
     wide_six: Option<wide_six_tests::Model>,
+    mld: Option<mlo_tests::Model>,
+    mld_m3: Option<Vec<u8>>,
+    mld_tx: mlo_tests::TxState,
 }
 
 // SAFETY: no real device or thread accesses these fixture pointers. The sole
@@ -495,6 +498,9 @@ impl Wire {
                     require(
                         self.ap.pmf()
                             && ((word(body, 12) == 0x6a && (4..=5).contains(&word(body, 8)))
+                                || (self.mld.is_some()
+                                    && word(body, 12) == 0x22
+                                    && word(body, 8) == 0)
                                 || (self.gtk_expected.is_some()
                                     && word(body, 12) == 0x4a
                                     && word(body, 8) <= 3))
@@ -949,6 +955,12 @@ impl Wire {
                     header.next_multiple_of(4)
                 }..],
         );
+        let radio = if let Some(mld) = self.mld {
+            mld.transmit(&self.commands, &mut frame)?;
+            Some(mld.radio_transmit(&self.commands, &frame, &mut self.mld_tx)?)
+        } else {
+            None
+        };
         if self.phy.is_some() && matches!(frame[0], 0 | 0x20) {
             self.phy_requests.push(frame.clone());
         }
@@ -967,6 +979,7 @@ impl Wire {
                 self.tx_model.is_some()
                     && data
                     && header == 26
+                    && frame[16..22] == AP
                     && frame[24] & 0x80 != 0
                     && word(bytes, 8) == 0x4d00
                     && protected == self.ap.protected(),
@@ -1068,7 +1081,7 @@ impl Wire {
                 let phase = self.ap.phase();
                 let responses = self
                     .ap
-                    .receive(&frame)
+                    .receive(radio.as_deref().unwrap_or(&frame))
                     .map_err(|error| match (error, phase) {
                         (narf_wifi_fixtures::ApError::Association, _) => {
                             "Sc AP rejected association RSNE/RSNXE/rates"
@@ -1115,6 +1128,9 @@ impl Wire {
                     }
                 }
                 for mut response in responses {
+                    if self.mld.is_some() && phase == ApPhase::Message2 {
+                        self.mld_m3 = Some(response.clone());
+                    }
                     if matches!(response[0], 0x10 | 0x30) {
                         if let Some(six) = self.six {
                             if let Some(wide) = self.wide_six {
@@ -1142,7 +1158,11 @@ impl Wire {
                 if phase == ApPhase::Message4 {
                     self.m4 = true;
                     require(
-                        self.keys == if self.ap.pmf() { 3 } else { 2 },
+                        if self.mld.is_some() {
+                            self.keys >= 3
+                        } else {
+                            self.keys == if self.ap.pmf() { 3 } else { 2 }
+                        },
                         "Sc M4 before key receipts",
                     )?;
                     if self.fault == Fault::HoldM4 {
@@ -1194,6 +1214,22 @@ impl Wire {
         );
     }
     fn mpdu_at(&mut self, frame: &[u8], protected: bool, band: u8, channel: u8) {
+        let translated;
+        let frame = if let Some(mld) = self.mld {
+            match mld.receive(&self.commands, frame, protected) {
+                Ok(frame) => {
+                    translated = frame;
+                    translated.as_slice()
+                }
+                Err(reason) => {
+                    self.error = Some(reason);
+                    return;
+                }
+            }
+        } else {
+            frame
+        };
+        let protected = protected || self.mld.is_some() && frame[1] & 0x40 != 0;
         if self.replies.len() < 64 {
             self.replies.push(frame[0]);
         }
@@ -1204,6 +1240,9 @@ impl Wire {
         }
         payload[..2].copy_from_slice(&(frame.len() as u16).to_le_bytes());
         payload[12..16].copy_from_slice(&(if protected { 0x243u32 } else { 3 }).to_le_bytes());
+        if self.mld.is_some() && frame[0] & 12 == 8 {
+            payload[12] |= 4;
+        }
         // Firmware follows the station's actual programmed TLC, not the
         // AP's advertised maximum. M1 may precede TLC and use a legacy rate;
         // a narrowed/non-HE association must not receive invented HE data.
@@ -1273,6 +1312,13 @@ impl Wire {
     }
 
     fn ethernet(&mut self, ethernet: &[u8]) {
+        if self.mld.is_some() {
+            match self.ap.transmit_mld_data(ethernet) {
+                Ok(frame) => self.mpdu(&frame, false),
+                Err(_) => self.error = Some("native MLD AP protected data/PN owner refused"),
+            }
+            return;
+        }
         let protected = self.ap.protected();
         let mut frame = vec![0; 24];
         frame[0] = 8;
@@ -1626,6 +1672,9 @@ impl Guard {
             six,
             eht,
             wide_six,
+            mld: None,
+            mld_m3: None,
+            mld_tx: mlo_tests::TxState::default(),
         });
         let configured = run(Device::configure(&mut hardware, OWN), || wire.service());
         let nvm = match configured {
@@ -2660,5 +2709,8 @@ kernel_test_in!(
 mod bz_station_tests;
 #[path = "sc_eht_native_tests.rs"]
 mod eht_tests;
+#[cfg(feature = "kernel-test")]
+#[path = "sc_mlo_native_tests.rs"]
+mod mlo_tests;
 #[path = "six_ghz_wide_tests.rs"]
 mod wide_six_tests;

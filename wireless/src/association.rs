@@ -10,6 +10,8 @@ pub mod channel;
 pub mod eht;
 #[path = "association/he.rs"]
 pub mod he;
+#[path = "association/mlo.rs"]
+pub mod mlo;
 #[path = "association/phy.rs"]
 pub mod phy;
 #[path = "association/sae_join.rs"]
@@ -131,6 +133,14 @@ pub struct JoinPlan {
     /// 6 GHz state of a `prepare_6ghz` plan (boxed: `JoinPlan` stays small
     /// for the 2.4/5 GHz callers' stacks).
     six_ghz: Option<Box<six_ghz::SixGhzPlan>>,
+    mld: Option<Box<mlo::Context>>,
+}
+
+#[derive(Default)]
+struct PrepareProfile<'a> {
+    phy: Option<phy::LocalPhy>,
+    six: Option<&'a six_ghz::SixGhzLocal>,
+    mld: Option<mlo::Local>,
 }
 
 /// Capability Information EPD subfield (bit13, IEEE802.11-2020 9.4.1.4).
@@ -581,6 +591,14 @@ impl JoinPlan {
             return Err(Error::InvalidBss);
         }
         validate_sme_ies(bytes, self.security.is_wpa2())?;
+        if self.mld.is_some() {
+            ies(bytes, |id, body| {
+                if id == 242 || id == 255 && body.first() == Some(&mlo::EXT_MULTI_LINK) {
+                    return Err(Error::InvalidBss);
+                }
+                Ok(())
+            })?;
+        }
         if self.six_ghz.is_some() {
             // HT and VHT are not allowed on 6 GHz (mac80211 never adds HT
             // or VHT Capabilities to a 6 GHz association request).
@@ -615,7 +633,14 @@ impl JoinPlan {
         ssid: &[u8],
         security: SecurityMode,
     ) -> Result<Self, Error> {
-        Self::prepare_inner(bss, own, ssid, security, None, JoinOptions::default(), None)
+        Self::prepare_inner(
+            bss,
+            own,
+            ssid,
+            security,
+            JoinOptions::default(),
+            PrepareProfile::default(),
+        )
     }
     /// Prepare using an implementation profile derived by the native owner.
     /// AP facts are reparsed and bound here, never accepted as an external grant.
@@ -631,9 +656,11 @@ impl JoinPlan {
             own,
             ssid,
             security,
-            Some(local),
             JoinOptions::default(),
-            None,
+            PrepareProfile {
+                phy: Some(local),
+                ..Default::default()
+            },
         )
     }
     pub fn offered_phy(&self) -> Option<&phy::Offer> {
@@ -652,7 +679,17 @@ impl JoinPlan {
         local: Option<phy::LocalPhy>,
         options: JoinOptions,
     ) -> Result<Self, Error> {
-        Self::prepare_inner(bss, own, ssid, security, local, options, None)
+        Self::prepare_inner(
+            bss,
+            own,
+            ssid,
+            security,
+            options,
+            PrepareProfile {
+                phy: local,
+                ..Default::default()
+            },
+        )
     }
     /// Prepare a 6 GHz station plan. `bss.band` must be `Some(Band::Ghz6)`
     /// and its HE Operation must carry 6 GHz Operation Information;
@@ -680,7 +717,70 @@ impl JoinPlan {
         local: &six_ghz::SixGhzLocal,
         options: JoinOptions,
     ) -> Result<Self, Error> {
-        Self::prepare_inner(bss, own, ssid, security, None, options, Some(local))
+        Self::prepare_inner(
+            bss,
+            own,
+            ssid,
+            security,
+            options,
+            PrepareProfile {
+                six: Some(local),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Opt into a single associated link as a non-AP MLD. The link MACs
+    /// remain physical packet/native-key identities; only management/SAE/PTK
+    /// identity uses the Basic MLE's MLD addresses. EHT and PMF are required.
+    pub fn prepare_mld(
+        bss: &Bss,
+        own_link: [u8; 6],
+        ssid: &[u8],
+        security: SecurityMode,
+        phy: phy::LocalPhy,
+        options: JoinOptions,
+        mld: mlo::Local,
+    ) -> Result<Self, Error> {
+        Self::prepare_inner(
+            bss,
+            own_link,
+            ssid,
+            security,
+            options,
+            PrepareProfile {
+                phy: Some(phy),
+                six: None,
+                mld: Some(mld),
+            },
+        )
+    }
+    pub fn prepare_mld_6ghz(
+        bss: &Bss,
+        own_link: [u8; 6],
+        ssid: &[u8],
+        security: SecurityMode,
+        six: &six_ghz::SixGhzLocal,
+        options: JoinOptions,
+        mld: mlo::Local,
+    ) -> Result<Self, Error> {
+        Self::prepare_inner(
+            bss,
+            own_link,
+            ssid,
+            security,
+            options,
+            PrepareProfile {
+                phy: None,
+                six: Some(six),
+                mld: Some(mld),
+            },
+        )
+    }
+    /// Selected immutable candidate identity; successful association and a
+    /// current native RF/key grant are separate requirements.
+    pub fn mld(&self) -> Option<&mlo::Context> {
+        self.mld.as_deref()
     }
     /// The negotiated 6 GHz operation, power type, channel/width and HE
     /// (and EHT) facts of a `prepare_6ghz` plan; `None` on 2.4/5 GHz.
@@ -716,10 +816,22 @@ impl JoinPlan {
         own: [u8; 6],
         ssid: &[u8],
         security: SecurityMode,
-        local: Option<phy::LocalPhy>,
         options: JoinOptions,
-        six: Option<&six_ghz::SixGhzLocal>,
+        profile: PrepareProfile<'_>,
     ) -> Result<Self, Error> {
+        let local = profile.phy;
+        let six = profile.six;
+        let mld = profile
+            .mld
+            .map(|local| {
+                local.context(
+                    own,
+                    bss.bssid,
+                    &mlo::BasicMultiLink::from_ies(&bss.information_elements)?,
+                )
+            })
+            .transpose()?
+            .map(Box::new);
         let band = match six {
             // A 6 GHz plan needs the explicit band and a 6 GHz channel.
             Some(_) if bss.band == Some(channel::Band::Ghz6) => {
@@ -806,6 +918,12 @@ impl JoinPlan {
             return Err(Error::UnsupportedRates);
         }
         let offered_phy = match local {
+            Some(local) if mld.is_some() => phy::Offer::prepare_mld(
+                local,
+                &bss.information_elements,
+                bss.channel,
+                rate_elements.selectors,
+            )?,
             Some(local) => phy::Offer::prepare(
                 local,
                 &bss.information_elements,
@@ -825,6 +943,14 @@ impl JoinPlan {
             }
             _ => None,
         };
+        if mld.is_some()
+            && offered_phy
+                .as_ref()
+                .is_none_or(|offer| offer.eht().is_none())
+            && six_ghz.as_ref().is_none_or(|plan| plan.eht().is_none())
+        {
+            return Err(Error::UnsupportedRates);
+        }
         // IEEE802.11-2020 9.4.1.4: an EPD-mandatory BSS advertises the EPD
         // capability subfield (bit13); an inconsistent beacon is malformed.
         let epd = rate_elements.selectors & SEL_EPD != 0;
@@ -867,9 +993,18 @@ impl JoinPlan {
                 Some(body)
             }
         };
-        let mut auth = management(0xb0, own, bss.bssid);
+        if mld.is_some() && (!security.is_rsn() || sae.is_none() && !wpa2.pmf) {
+            return Err(Error::UnsupportedSecurity);
+        }
+        let (management_own, management_peer) = mld.as_ref().map_or((own, bss.bssid), |context| {
+            (context.own_mld(), context.peer_mld())
+        });
+        let mut auth = management(0xb0, management_own, management_peer);
         auth.extend_from_slice(&[0, 0, 1, 0, 0, 0]);
-        let mut assoc = management(0, own, bss.bssid);
+        if let Some(local) = profile.mld {
+            auth.extend_from_slice(&local.authentication_element());
+        }
+        let mut assoc = management(0, management_own, management_peer);
         // ESS, negotiated privacy, and only AP-supported short preamble/slot.
         let optional = if band == Some(channel::Band::Ghz2) {
             0x0420
@@ -913,9 +1048,12 @@ impl JoinPlan {
         if let Some(plan) = six_ghz.as_ref() {
             plan.append_capabilities(&mut assoc);
         }
+        if let Some(local) = profile.mld {
+            assoc.extend_from_slice(&local.request_element());
+        }
         Ok(Self {
-            own,
-            peer: bss.bssid,
+            own: management_own,
+            peer: management_peer,
             channel: bss.channel,
             security,
             rates,
@@ -931,6 +1069,7 @@ impl JoinPlan {
             epd,
             wpa2,
             six_ghz,
+            mld,
         })
     }
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
@@ -970,6 +1109,15 @@ impl JoinPlan {
             self.phase = Phase::Failed;
             return Err(Error::Rejected(status));
         }
+        if let Some(mld) = self.mld.as_deref() {
+            if !mld
+                .authentication_body(&bytes[30..])
+                .is_ok_and(|body| body.is_empty())
+            {
+                self.phase = Phase::Failed;
+                return Err(Error::Protocol);
+            }
+        }
         self.phase = Phase::AwaitAssociation;
         Ok(Some(&self.assoc))
     }
@@ -1007,6 +1155,12 @@ impl JoinPlan {
         if raw & 0xc000 != 0xc000 || !(1..=2007).contains(&aid) {
             self.phase = Phase::Failed;
             return Err(Error::Protocol);
+        }
+        if let Some(mld) = self.mld.as_ref() {
+            if mld.response(&bytes[30..]).is_err() {
+                self.phase = Phase::Failed;
+                return Err(Error::Protocol);
+            }
         }
         let mut response = RateElements {
             allowed: if self.offered_phy.is_some() {

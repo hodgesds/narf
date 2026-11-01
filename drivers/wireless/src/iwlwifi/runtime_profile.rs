@@ -110,11 +110,24 @@ impl Hardware {
         let result = self
             .six_tx_profile
             .as_ref()
-            .map_or(Ok(()), |profile| profile.check_pending(self));
+            .map_or(Ok(()), |profile| profile.check_pending(self))
+            .and_then(|()| {
+                self.mld_link
+                    .as_ref()
+                    .map_or(Ok(()), |mld| mld.check_pending(self))
+            });
         if result.is_err() {
             self.fail();
         }
         result
+    }
+    pub(in crate::iwlwifi) fn install_mld_link(
+        &mut self,
+        link: alloc::sync::Arc<super::super::sc_mlo::Binding>,
+    ) -> Result<(), &'static str> {
+        link.check_pending(self)?;
+        self.mld_link = Some(link);
+        Ok(())
     }
     pub(in crate::iwlwifi) async fn station_peer(
         &mut self,

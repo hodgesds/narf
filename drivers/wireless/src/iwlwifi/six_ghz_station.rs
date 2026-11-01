@@ -162,6 +162,26 @@ fn local_for_width(source: Local, maximum: u8, rule: RegRule) -> Result<SixGhzLo
         Ok(local)
     }
 }
+fn join_plan(
+    bss: &Bss,
+    own: [u8; 6],
+    mode: SecurityMode,
+    physical: &SixGhzLocal,
+    mld: Option<association::mlo::Local>,
+) -> Result<JoinPlan, association::Error> {
+    match mld {
+        Some(mld) => JoinPlan::prepare_mld_6ghz(
+            bss,
+            own,
+            &bss.ssid,
+            mode,
+            physical,
+            JoinOptions::default(),
+            mld,
+        ),
+        None => JoinPlan::prepare_6ghz(bss, own, &bss.ssid, mode, physical, JoinOptions::default()),
+    }
+}
 #[inline(never)]
 pub(super) fn prepare(
     beacon: &Beacon,
@@ -205,6 +225,7 @@ pub(super) fn prepare(
     let mut source = local;
     source.eht &= firmware.is_none_or(|mcc| mcc.eht_allowed);
     source.eht_320 &= source.eht && firmware.is_none_or(|mcc| mcc.widths.three_twenty);
+    let mld = super::sc_mlo::local(source.eht, &beacon.information_elements, own)?;
     let he160 = source.width160_channels != 0 || source.six_widths[2] != 0;
     let maximum = if source.eht_320 && he160 {
         4
@@ -219,14 +240,7 @@ pub(super) fn prepare(
     };
     for maximum in (0..=maximum).rev() {
         let physical = local_for_width(source, maximum, primary_rule.clone())?;
-        let Ok(plan) = JoinPlan::prepare_6ghz(
-            &bss,
-            own,
-            &beacon.ssid,
-            mode,
-            &physical,
-            JoinOptions::default(),
-        ) else {
+        let Ok(plan) = join_plan(&bss, own, mode, &physical, mld) else {
             continue;
         };
         let selected = *plan.six_ghz().ok_or("shared6GHz plan absent")?;
@@ -256,14 +270,7 @@ pub(super) fn prepare(
         // keeps transmitted regulatory connectivity truthful too.
         drop(plan);
         let physical = local_for_width(source, maximum, rule)?;
-        let Ok(plan) = JoinPlan::prepare_6ghz(
-            &bss,
-            own,
-            &beacon.ssid,
-            mode,
-            &physical,
-            JoinOptions::default(),
-        ) else {
+        let Ok(plan) = join_plan(&bss, own, mode, &physical, mld) else {
             continue;
         };
         let selected = *plan.six_ghz().ok_or("shared6GHz full-span plan absent")?;

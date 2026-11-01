@@ -430,7 +430,7 @@ impl LocalPhy {
     }
     /// Opt into UHR (IEEE P802.11bn D1.3) on top of `with_eht`. UHR is only
     /// admitted for `LocalUhr::for_mld_association` on the
-    /// `Offer::from_elements` path (see `association::uhr`).
+    /// `Offer::from_elements` or explicit MLD JoinPlan path (see `association::uhr`).
     pub fn with_uhr(mut self, uhr: LocalUhr) -> Result<Self, Error> {
         if self.eht.is_none() {
             return Err(Error::UnsupportedRates);
@@ -888,7 +888,7 @@ macro_rules! selection_accessors {
         pub fn eht(&self) -> Option<&EhtNegotiation> {
             self.0.eht.as_ref()
         }
-        /// UHR facts for a native MLD association (never for `JoinPlan`).
+        /// UHR facts for a native or explicit single-link MLD association.
         pub fn uhr(&self) -> Option<&UhrNegotiation> {
             self.0.uhr.as_ref()
         }
@@ -959,6 +959,16 @@ impl Offer {
         selectors: u8,
     ) -> Result<Option<Self>, Error> {
         Self::prepare_from(local, bytes, primary, selectors, false)
+    }
+    /// Called only after JoinPlan's explicit Basic-ML identity admission.
+    pub(super) fn prepare_mld(
+        mut local: LocalPhy,
+        bytes: &[u8],
+        primary: u8,
+        selectors: u8,
+    ) -> Result<Option<Self>, Error> {
+        local.uhr = local.uhr.map(LocalUhr::for_mld_association);
+        Self::prepare_from(local, bytes, primary, selectors, true)
     }
     fn prepare_from(
         local: LocalPhy,
@@ -1171,7 +1181,7 @@ fn select(local: LocalPhy, ap: ApElements, primary: u8, native: bool) -> Result<
         he: None,
         eht: None,
         uhr: None,
-        // Only an MLD-asserting native owner differs from a JoinPlan offer.
+        // Only a native or explicit JoinPlan MLD opt-in sets this fact.
         native: native && local.uhr.is_some_and(|u| u.mld_association()),
         width: Width::Twenty,
         center: primary,

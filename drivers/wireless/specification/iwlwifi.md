@@ -2148,8 +2148,10 @@ describe the remaining native paths.
   fact, full-span power and native extended control-position/rate ownership.
   Coordinated compilation/native/release acceptance remains pending.
 - **mlo (open).** Multiple live link/peer owners remain disabled. MLO
-  needs shared ML association/security and per-link native lifetime/control
-  ownership. MLO,320MHz and EHT do not apply to AX200/AX201 hardware.
+  has the bounded §3.66 single-link native MLD draft plus shared Basic ML/
+  per-link key delivery. Multiple active PHY/LINK/STA/queue, power, PN/reorder
+  and public-control owners remain continuations. MLO,320MHz and EHT do
+  not apply to AX200/AX201 hardware.
 - **six_ghz (open; implemented passive/wide station path).** §3.63 implements
   explicit NVM/UMAC/RFH/cache/policy band identity and a shared6GHz
   JoinPlan for AP20/STA20 SAE-H2E/PMF on admitted Sc/API89/Bz profiles,
@@ -3963,3 +3965,86 @@ and static review. Coordinated compilation, both-architecture native execution,
 ordinary boots and release gates remain pending. Physical acceptance remains
 separate; this implementation does not claim active/RNR/periodic6GHz scan or
 multiple live MLO links.
+
+### 3.66 Bounded native single-link non-AP MLD (validation pending)
+
+**Identity and actual native source.** On the already admitted §3.64 Sc/Bz
+FM/WH core103 EHT source, an AP Basic Multi-Link element opts the station
+into the shared single-link MLD JoinPlan. Actual WPA3/PMF, the current RF/
+ALIVE/PNVM source, native firmware tuple and the existing host/MCC/span
+proofs remain prerequisites. The normal non-MLD and non-EHT owners retain
+their existing path. No MLO capability follows from an MLD-named command
+or a generic HE/VHT SKU.
+
+The immutable native binding retains separate logical MLD and physical link
+MACs, the actual physical band/channel, AP spec link0..14, and the explicitly
+owned firmware link0/station0. The AP spec id never selects an arbitrary
+firmware queue, station or packet-key mask. LINK_CONFIGv8 byte166 is an ADD
+fact: the inactive default link is removed/re-added with its actual spec id
+before PHY binding. MAC_CONFIGv3's actual local MLD address and byte24 HE/
+byte26 EHT are acknowledged before AP STA creation, enabling the firmware's
+source-correct address translation. STA_CONFIGv2 retains distinct peer MLD
+and physical peer-link fields. Terminal teardown restores the ordinary
+inactive default link only after station/queue/PHY retirement.
+
+**Management, packet crypto and capture proof.** Native explicit-link
+management is projected to the physical radio addresses before publication,
+as in Linux `mld/mac80211.c`; SAE/PMK/PTK and Basic ML identities remain
+logical. Every authentication transaction carries the canonical Basic ML
+trailer. Its exact negotiated peer is validated separately before stripping
+the trailer for SAE crypto; the association response must confirm the same
+MLD/link context and cannot add another requested link.
+
+Unicast DATA has logical MLD A1/A2 in its CCMP AAD and A2 nonce, with physical
+link addresses on air; firmware translates after TX encryption. Group DATA
+and management preserve physical-link crypto identity. Linux's RX original
+`link_addrs`/AAD override applies only to non-data management. The native
+consumer requires actual original RFH firmware-link, station, band, channel
+and receive-epoch ownership before a translated unicast header can enter
+EAPOL, PN or reorder state. Unicast DATA requires the owned station0 result;
+multicast/management retain their physical header form. There is no generic
+accept-either address or decrypt fallback. A-MSDU outer A3 carries the proper
+BSSID, logical before native MLD firmware translation, with physical source
+proof retained independently of inner MSDU addresses.
+
+Deferred MLD EAPOL records retain a bounded exact-frame digest and capture
+epoch minted only after this original native admission. Processing consumes
+that proof; direct Ethernet bytes or a stale capture cannot reuse a logical
+peer's key-install authority. The final native TX gate checks pending bound
+MLD facts after credit polling and at both publication boundaries, including
+a changed Basic ML peer beyond the64-notification processing budget.
+
+**Key and terminal ownership.** The native Session validates the M1 AP MLD
+MAC before PTK derivation or a rekey nonce, repeats its own MLD MAC in M2,
+and derives PTK from the logical MLD pair. Original EAPOL descriptor/MIC and
+AES-unwrapping gates precede shared authenticated M3/group Link/MLGTK/MLIGTK
+validation. Exact selected spec-link, physical peer and AP RSNE/RSNXE are
+bound together; mixed legacy or other-link group keys are refused. Native
+GTK and IGTK floors come from the selected per-link KDE, not a legacy outer
+RSC. Existing native receipt, history, reinstalls and RX-marker rules govern
+actual station0 packet keys and controlled-port publication.
+
+For MLD pairwise rekey, the new KCK authenticates M4 while its outer packet
+remains protected by the still-installed old native TK. The driver awaits
+that exact native TX terminal receipt before removing/replacing the TK and
+committing the new RX epoch. Initial association retains its existing held
+key/M4 ordering. A dropped caller or lost source/policy never releases
+uncertain DMA or opens the port around the retained owner.
+
+**Written evidence; bounded scope.** Six cases in
+`drivers/wireless/iwlwifi/mlo` include four native Sc/Bz5/6GHz compositions
+and two native Session vectors. They cover literal early MAC/LINK/STA
+ordering and spec14 versus firmware0, real H2E/AKM24/PMF/DHCP, original
+RFH negatives followed by valid same-PN delivery, response/context loss,
+deferred-byte proof refusal, queued peer change, actual group/pairwise rekey,
+physical group DATA crypto/PN replay, and dropped held-IGTK ownership. The
+Session vectors use independently generated logical KDF bytes and authored
+per-link KDE floors. The device-side fixture requires the actual observed
+native command graph before any address projection and verifies genuine
+class-specific AES/MIC wire data using the one AP packet-number owner.
+
+Source and fixtures have undergone standalone formatting/static review;
+coordinated compilation/native/release gates are pending. This is a single
+associated link, with no EML or extra-link request. Multiple simultaneously
+active PHY/LINK/STA/queue owners, per-link power/key/PN/reorder lifetimes,
+link switching and public multiple-link control remain open in `mlo`.

@@ -332,6 +332,17 @@ implemented with native PHY/TXD/training and per-mux/thermal qualification;
 no manual antenna control is advertised. Compilation/native/release gates
 remain deferred, and physical measurements are externally supplied.
 
+**Source implementation recount 2026-11-01** (shared single-link MLD written):
+the remaining ledger holds **98 `feature`** rows (98 driver, 0 shared),
+**31 `chip`** and **0 `unknown`**. Nine source-complete implementations
+await validation in `research/implemented-pending-validation.tsv`. Shared
+single-link MLD association, MLD-address SAE/PTK, authenticated per-link
+GTK/IGTK delivery and exact native-context/terminal key ownership are now
+implemented, with additive encrypted FakeAp fixtures. This closes the
+shared contract. Admitted Intel Sc/Bz native single-link MLD is implemented
+as a partial driver scope; multiple active links remain open in its MLO row.
+Native execution and the full release matrix remain deferred.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 5 | 6GHz discovery/periodic/refinement and MLO; AP/P2P/WoW; exact admitted station/HE/TX A-MSDU and idle/associated periodic-scan profiles are software-validated |

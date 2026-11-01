@@ -5,6 +5,8 @@ mod amsdu_tests;
 mod epd_tests;
 #[path = "station_security_htc_tests.rs"]
 mod htc_tests;
+#[path = "station_security_mlo_tests.rs"]
+mod mlo_tests;
 #[path = "station_security_sae_tests.rs"]
 mod sae_tests;
 use crate::eapol::{self, KeyFrame, KeyMgmt, Ptk};

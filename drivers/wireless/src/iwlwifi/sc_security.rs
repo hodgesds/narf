@@ -20,6 +20,7 @@ pub(super) struct Profile {
     pub rsne: Option<Vec<u8>>,
     pub sae: Option<SaeJoin>,
     pub offer: Option<narf_wireless::association::phy::Offer>,
+    pub mld: Option<alloc::boxed::Box<narf_wireless::association::mlo::Context>>,
 }
 
 /// Retired material cannot return with reset replay/nonce state during this
@@ -133,6 +134,7 @@ impl Profile {
                     rsne: None,
                     sae: None,
                     offer: None,
+                    mld: None,
                 });
             }
             AuthMethod::Open => SecurityMode::Open,
@@ -169,23 +171,30 @@ impl Profile {
             }
             Err(reason) => return Err(reason),
         };
-        let plan = JoinPlan::prepare_with_options(
-            &bss,
-            own,
-            &beacon.ssid,
-            mode,
-            physical,
-            JoinOptions::default()
-                .with_akms(AkmSet::ALL)
-                .with_pmf(if peer_mfpc {
-                    Pmf::Optional
-                } else {
-                    Pmf::Disabled
-                }),
-        );
+        let mld = super::sc_mlo::local(local.eht, &beacon.information_elements, own)?;
+        let options = JoinOptions::default()
+            .with_akms(AkmSet::ALL)
+            .with_pmf(if peer_mfpc {
+                Pmf::Optional
+            } else {
+                Pmf::Disabled
+            });
+        let plan = if let Some(mld) = mld {
+            JoinPlan::prepare_mld(
+                &bss,
+                own,
+                &beacon.ssid,
+                mode,
+                physical.ok_or("native MLD physical EHT source absent")?,
+                options,
+                mld,
+            )
+        } else {
+            JoinPlan::prepare_with_options(&bss, own, &beacon.ssid, mode, physical, options)
+        };
         let plan = match plan {
             Ok(plan) => plan,
-            Err(_) if local.he => {
+            Err(_) if local.he && mld.is_none() => {
                 // A non-HE-mandatory BSS can retain the native legacy path
                 // when its optional HE profile is not implemented. The
                 // shared plan still rejects a mandatory HE selector.
@@ -214,6 +223,7 @@ impl Profile {
             rsne: plan.rsn_body(),
             sae: plan.sae().cloned(),
             offer: plan.offered_phy().copied(),
+            mld: plan.mld().copied().map(alloc::boxed::Box::new),
         })
     }
 
@@ -241,6 +251,11 @@ impl Profile {
     /// Optional response RSNEs cannot silently change the negotiated AKM,
     /// cipher or PMF facts. SAE responses may omit the SAE PMKID.
     pub fn check_response(&self, mut ies: &[u8]) -> Result<(), &'static str> {
+        if let Some(context) = self.mld.as_deref() {
+            context
+                .response(ies)
+                .map_err(|_| "native MLD association response changed selected context")?;
+        }
         let mut seen = false;
         while !ies.is_empty() {
             if ies.len() < 2 || usize::from(ies[1]) > ies.len() - 2 {

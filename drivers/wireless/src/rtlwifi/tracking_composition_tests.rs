@@ -179,10 +179,8 @@ fn smoke_rtl8188ee_thermal_signed_full_dimensional_identity_unknown_and_current_
             q.check_sources(&domain, permission).is_err(),
             "NETH revoked qualification remained current",
         )?;
-        require(
-            !h.packet.model.lock().master,
-            "NETH metadata started native DMA",
-        )
+        let parked = !h.packet.model.lock().master;
+        require(parked, "NETH metadata started native DMA")
     })
 }
 kernel_test_in!(

@@ -84,9 +84,10 @@ impl Connection {
         if !hw.transmit_space(queue)? {
             return Ok(Batch::Busy);
         }
+        let (own, peer) = self.management_addresses();
         let Some(mut frame) = frame_api::transmit_qos(
-            self.local,
-            self.beacon.bssid,
+            own,
+            peer,
             self.sequence,
             first,
             self.security.is_some(),
@@ -95,6 +96,9 @@ impl Connection {
             return Ok(Batch::Unsuited);
         };
         frame.truncate(26);
+        // IEEE address table and Linux mld/tx.c: the outer A-MSDU A3
+        // carries the BSSID (logical MLD before firmware translation).
+        frame[16..22].copy_from_slice(&peer);
         frame[24] |= 0x80;
         frame.extend_from_slice(&body);
         // The existing transport derives MAC-size and the native AMSDU/PAD

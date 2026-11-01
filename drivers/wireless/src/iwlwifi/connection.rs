@@ -74,6 +74,8 @@ pub struct Connection {
     he: Option<super::sc_he::Profile>,
     eht: Option<alloc::sync::Arc<super::sc_eht::Profile>>,
     six: Option<alloc::sync::Arc<super::six_ghz_station::Profile>>,
+    mld: Option<alloc::sync::Arc<super::sc_mlo::Binding>>,
+    mld_eapol: VecDeque<(u64, [u8; 32])>,
     tx_amsdu: super::sc_tx_amsdu::Limits,
     amsdu_memory: Option<super::Gen2SharedMemory>,
     amsdu_memory_attempted: bool,
@@ -128,6 +130,9 @@ impl core::fmt::Debug for AuthMethod {
 
 impl Connection {
     fn admits_channel(&self, mpdu: &scan_api::Mpdu<'_>) -> bool {
+        if self.mld.as_ref().is_some_and(|mld| !mld.owns_mpdu(mpdu)) {
+            return false;
+        }
         super::native_band::Channel::received(mpdu.channel, mpdu.raw_band, true)
             == Some(super::native_band::Channel {
                 band: self.beacon.band,
@@ -180,6 +185,8 @@ impl Connection {
             he: None,
             eht: None,
             six: None,
+            mld: None,
+            mld_eapol: VecDeque::new(),
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
             amsdu_memory: None,
             amsdu_memory_attempted: false,
@@ -482,7 +489,38 @@ impl Connection {
                 hw.rf_policy_validity()?,
             )?
         };
+        let mld = profile
+            .mld
+            .as_deref()
+            .map(|context| {
+                super::sc_mlo::Binding::new(
+                    *context,
+                    super::native_band::Channel {
+                        band: beacon.band,
+                        number: beacon.channel,
+                    },
+                    local,
+                    beacon.bssid,
+                )
+            })
+            .transpose()?;
+        if mld.is_some() && (!local_phy.eht || !hw.eht_supported() || !profile.pmf) {
+            return Err("native MLD current EHT/PMF source absent");
+        }
         hw.ensure_platform_power().await?;
+        if let Some(mld) = &mld {
+            let mut mac = station_api::mac(2, local, None);
+            mld.apply_mac(&mut mac);
+            hw.command(3, 8, &mac).await?;
+            // spec_link_id is an ADD-time fact in Linux. Replace the
+            // inactive default link instead of pretending MODIFY sets it.
+            let mut removed = station_api::link(3, local, false, beacon.channel, 0, 1);
+            mld.apply_link(&mut removed);
+            hw.command(3, 9, &removed).await?;
+            let mut added = station_api::link(1, local, false, beacon.channel, 0, 1);
+            mld.apply_link(&mut added);
+            hw.command(3, 9, &added).await?;
+        }
         let mut phy_command = station_api::phy_channel(
             1,
             super::native_band::Channel {
@@ -507,6 +545,9 @@ impl Connection {
             beacon.dtim,
         );
         put32(&mut binding, 12, 0);
+        if let Some(mld) = &mld {
+            mld.apply_link(&mut binding);
+        }
         hw.command(3, 9, &binding).await?;
         // Program host/AP power before any active link or autonomous TX.
         let power = station_api::tx_power(
@@ -540,6 +581,9 @@ impl Connection {
             qos.apply(&mut link);
         }
         phy.apply_link(&mut link);
+        if let Some(mld) = &mld {
+            mld.apply_link(&mut link);
+        }
         hw.command(3, 9, &link).await?;
         if let Some(six) = &six {
             // Linux's AP-power command is issued on an active link. No
@@ -555,7 +599,13 @@ impl Connection {
         let mut peer = station_api::peer(beacon.bssid);
         phy.apply_peer(&mut peer, 0);
         put32(&mut peer, 36, u32::from(profile.pmf));
+        if let Some(mld) = &mld {
+            mld.apply_peer(&mut peer);
+        }
         hw.station_peer(&peer).await?;
+        if let Some(mld) = &mld {
+            hw.install_mld_link(mld.clone())?;
+        }
         let management_queue = hw.allocate_tx(0, 15).await?;
         let mut data_queues = [None; 4];
         for (ac, &tid) in super::qos::TIDS.iter().enumerate() {
@@ -607,6 +657,8 @@ impl Connection {
             he: None,
             eht: None,
             six,
+            mld,
+            mld_eapol: VecDeque::new(),
             tx_amsdu: super::sc_tx_amsdu::Limits::default(),
             amsdu_memory: None,
             amsdu_memory_attempted: false,
@@ -640,26 +692,28 @@ impl Connection {
         if let (Some(pmk), Some(akm)) = (pmk, akm) {
             let (station_rsnxe, ap_rsnxe) =
                 profile.rsn_extensions(&this.beacon.information_elements)?;
-            this.security = Some(
-                security::Session::new(
-                    akm,
-                    pmk,
-                    this.beacon.bssid,
-                    local,
-                    **snonce.as_ref().ok_or("missing secure association nonce")?,
-                    this.beacon.rsn.clone().ok_or("AP has no RSN IE")?,
-                )
-                .with_pmf(profile.pmf)
-                .with_station_rsn(profile.rsne.clone().ok_or("MLD station RSNE missing")?)
-                .with_rsn_extensions(station_rsnxe, ap_rsnxe)?,
-            );
+            let session = security::Session::new(
+                akm,
+                pmk,
+                this.beacon.bssid,
+                local,
+                **snonce.as_ref().ok_or("missing secure association nonce")?,
+                this.beacon.rsn.clone().ok_or("AP has no RSN IE")?,
+            )
+            .with_pmf(profile.pmf)
+            .with_station_rsn(profile.rsne.clone().ok_or("MLD station RSNE missing")?)
+            .with_rsn_extensions(station_rsnxe, ap_rsnxe)?;
+            this.security = Some(match &this.mld {
+                Some(mld) => session.with_mld(mld.context)?,
+                None => session,
+            });
         }
         let rsn = profile.rsne.clone();
         let rates = this.rates.elements();
         let params = mlme::AssocParamsRsn {
             base: mlme::AssocParams {
-                sta_addr: local,
-                ap_bssid: this.beacon.bssid,
+                sta_addr: this.management_addresses().0,
+                ap_bssid: this.management_addresses().1,
                 ssid: this.beacon.ssid.clone(),
                 supported_rates: rates[..rates.len().min(8)].to_vec(),
                 capability_info: 1
@@ -697,6 +751,10 @@ impl Connection {
             let capability = eht.local_capability();
             request.extend_from_slice(&[255, capability.len() as u8]);
             request.extend_from_slice(&capability);
+        }
+        if let Some(mld) = &this.mld {
+            request.extend_from_slice(mld.request_element());
+            mld.project_management(&mut request);
         }
         this.sequence = this.sequence.wrapping_add(1);
         this.check_six_pending(hw)?;
@@ -865,6 +923,9 @@ impl Connection {
                 qos.apply(&mut link);
             }
             this.phy.apply_link(&mut link);
+            if let Some(mld) = &this.mld {
+                mld.apply_link(&mut link);
+            }
             if let Some(he) = this.he {
                 he.apply_link(&mut link);
             }
@@ -880,6 +941,9 @@ impl Connection {
             eht.apply_sta(&mut peer);
         }
         put32(&mut peer, 36, u32::from(this.pmf_negotiated));
+        if let Some(mld) = &this.mld {
+            mld.apply_peer(&mut peer);
+        }
         hw.station_peer(&peer).await?;
         let mut mac = station_api::mac(2, local, Some(response.aid));
         if let Some(he) = this.he {
@@ -887,6 +951,9 @@ impl Connection {
         }
         if let Some(eht) = &this.eht {
             eht.apply_mac(&mut mac);
+        }
+        if let Some(mld) = &this.mld {
+            mld.apply_mac(&mut mac);
         }
         hw.command(3, 8, &mac).await?;
         let mut tlc = this.rates.tlc(
@@ -969,9 +1036,31 @@ impl Connection {
         Some(self.rates.management_rate(self.tx_antenna))
     }
 
+    fn management_addresses(&self) -> ([u8; 6], [u8; 6]) {
+        self.mld
+            .as_ref()
+            .map_or((self.local, self.beacon.bssid), |mld| {
+                (mld.context.own_mld(), mld.context.peer_mld())
+            })
+    }
+    fn data_addresses(&self, mpdu: &scan_api::Mpdu<'_>) -> Option<([u8; 6], [u8; 6])> {
+        match &self.mld {
+            Some(mld) => mld.data_addresses(mpdu),
+            None => Some((self.local, self.beacon.bssid)),
+        }
+    }
+
     fn management(&mut self, subtype: u8, body: &[u8]) -> Vec<u8> {
-        let mut frame =
-            frame_api::management(subtype, self.local, self.beacon.bssid, self.sequence, body);
+        let (own, peer) = self.management_addresses();
+        let mut frame = frame_api::management(subtype, own, peer, self.sequence, body);
+        if subtype == 0xb0 {
+            if let Some(mld) = &self.mld {
+                frame.extend_from_slice(mld.authentication_element());
+            }
+        }
+        if let Some(mld) = &self.mld {
+            mld.project_management(&mut frame);
+        }
         if self.pmf_negotiated
             && self.pairwise_key.is_some()
             && matches!(subtype, 0xa0 | 0xc0 | 0xd0)
@@ -1016,22 +1105,35 @@ impl Connection {
                         )?;
                     }
                 }
-                if !self.admits_channel(&mpdu)
-                    || frame.len() < 24
-                    || frame[4..10] != self.local
-                    || frame[10..16] != self.beacon.bssid
-                    || frame[16..22] != self.beacon.bssid
-                {
+                let header = self.mld.as_ref().map_or_else(
+                    || {
+                        frame.len() >= 24
+                            && frame[4..10] == self.local
+                            && frame[10..16] == self.beacon.bssid
+                            && frame[16..22] == self.beacon.bssid
+                    },
+                    |mld| mld.management_header(&mpdu),
+                );
+                if !self.admits_channel(&mpdu) || !header {
                     continue;
                 }
                 if matches!(frame[0], 0xa0 | 0xc0) {
                     return Err("AP disconnected during association");
                 }
                 if frame[0] == subtype {
-                    return mpdu
-                        .body(24, 0)
-                        .map(|body| body.to_vec())
-                        .ok_or("invalid management body");
+                    let body = mpdu.body(24, 0).ok_or("invalid management body")?;
+                    let body = if subtype == 0xb0 {
+                        match &self.mld {
+                            Some(mld) => mld
+                                .context
+                                .authentication_body(body)
+                                .map_err(|_| "native MLD auth omitted matching Basic ML trailer")?,
+                            None => body,
+                        }
+                    } else {
+                        body
+                    };
+                    return Ok(body.to_vec());
                 }
             }
             if deadline.expired() {
@@ -1052,10 +1154,11 @@ impl Connection {
     ) -> Result<([u8; 32], [u8; 16]), &'static str> {
         use narf_wireless::sae::{SaeSession, SaeState, SAE_STATUS_HASH_TO_ELEMENT};
         let ssid = self.beacon.ssid.clone();
+        let (own, peer) = self.management_addresses();
         let sae = if join.h2e() {
-            SaeSession::new_h2e_bytes(&ssid, password, self.local, self.beacon.bssid)
+            SaeSession::new_h2e_bytes(&ssid, password, own, peer)
         } else {
-            SaeSession::new_hunt_and_peck(password, self.local, self.beacon.bssid)
+            SaeSession::new_hunt_and_peck(password, own, peer)
         };
         let mut sae = match join.akm_suite_selector() {
             Some(selector) => sae
@@ -1181,8 +1284,8 @@ impl Connection {
             ele_sta: &ele_sta,
             sca_ap: &sca_ap,
             sca_sta: &sca_sta,
-            ap_bssid: &self.beacon.bssid,
-            sta_mac: &self.local,
+            ap_bssid: &self.management_addresses().1,
+            sta_mac: &self.management_addresses().0,
         };
         if pk::authenticate_ap(&verification) {
             Ok(())
@@ -1305,6 +1408,7 @@ impl Connection {
         protected: bool,
         requested_ac: Option<usize>,
     ) -> Result<(u16, Vec<u8>, usize), &'static str> {
+        let (own, peer) = self.management_addresses();
         let (ac, frame, header) = if let Some(qos) = &self.qos {
             let ac = requested_ac
                 .map_or_else(|| qos.classify(ethernet), |ac| qos.admitted(ac))
@@ -1312,8 +1416,8 @@ impl Connection {
             (
                 ac,
                 frame_api::transmit_qos(
-                    self.local,
-                    self.beacon.bssid,
+                    own,
+                    peer,
                     self.sequence,
                     ethernet,
                     protected,
@@ -1324,13 +1428,7 @@ impl Connection {
         } else {
             (
                 1,
-                frame_api::transmit(
-                    self.local,
-                    self.beacon.bssid,
-                    self.sequence,
-                    ethernet,
-                    protected,
-                ),
+                frame_api::transmit(own, peer, self.sequence, ethernet, protected),
                 24,
             )
         };
@@ -1361,6 +1459,9 @@ impl Connection {
         if !self.admits_channel(mpdu) || !self.admits_data_header(mpdu) {
             return Ok(None);
         }
+        let Some((local, peer)) = self.data_addresses(mpdu) else {
+            return Ok(None);
+        };
         if !self.authorized && mpdu.frame.first() == Some(&0x80) {
             self.receive_frame(mpdu)?;
             self.service_power(hw).await?;
@@ -1371,8 +1472,8 @@ impl Connection {
             // buffered beside a genuine initial EAPOL message.
             let Some(ethernet) = frame_api::receive(
                 mpdu,
-                self.local,
-                self.beacon.bssid,
+                local,
+                peer,
                 self.security.is_some(),
                 &mut self.replay.clone(),
             ) else {
@@ -1442,6 +1543,9 @@ impl Connection {
                 if !self.admits_channel(&mpdu) {
                     return Ok(output);
                 }
+                let Some((local, peer)) = self.data_addresses(&mpdu) else {
+                    return Ok(output);
+                };
                 let frame = mpdu.frame;
                 if queue != 0 {
                     // The configured RSS classes hash IP flows. Multicast,
@@ -1453,8 +1557,8 @@ impl Connection {
                     let mut replay = self.replay_for(queue).clone();
                     let Some(ethernet) = frame_api::receive(
                         &mpdu,
-                        self.local,
-                        self.beacon.bssid,
+                        local,
+                        peer,
                         self.security.is_some(),
                         &mut replay,
                     ) else {
@@ -1471,9 +1575,9 @@ impl Connection {
                     && frame[0] == 0xd0
                     && frame[1] & 0x87 == 0
                     && frame[22] & 15 == 0
-                    && frame[4..10] == self.local
-                    && frame[10..16] == self.beacon.bssid
-                    && frame[16..22] == self.beacon.bssid
+                    && frame[4..10] == local
+                    && frame[10..16] == peer
+                    && frame[16..22] == peer
                     && self.authorized
                 {
                     if let Some(body) = super::sc_security::robust_unicast_body(
@@ -1499,8 +1603,8 @@ impl Connection {
                         if (self.security.is_some() && frame[1] & 0x40 == 0)
                             || frame_api::receive(
                                 &mpdu,
-                                self.local,
-                                self.beacon.bssid,
+                                local,
+                                peer,
                                 self.security.is_some(),
                                 &mut self.replay_for(queue).clone(),
                             )
@@ -1606,9 +1710,14 @@ impl Connection {
     }
 
     fn check_six_pending(&self, hw: &mut Hardware) -> Result<(), &'static str> {
-        if let Some(six) = &self.six {
+        if self.six.is_some() || self.mld.is_some() {
             hw.poll()?;
-            six.check_pending(hw)?;
+            if let Some(six) = &self.six {
+                six.check_pending(hw)?;
+            }
+            if let Some(mld) = &self.mld {
+                mld.check_pending(hw)?;
+            }
         }
         Ok(())
     }
@@ -1861,10 +1970,23 @@ impl Connection {
         if !self.admits_channel(mpdu) || !self.admits_data_header(mpdu) {
             return Ok(None);
         }
-        if frame.len() >= 24
-            && frame[10..16] == self.beacon.bssid
-            && frame[16..22] == self.beacon.bssid
-        {
+        let Some((local, peer)) = self.data_addresses(mpdu) else {
+            return Ok(None);
+        };
+        if let Some(mld) = &self.mld {
+            if frame.len() >= 36
+                && matches!(frame[0], 0x80 | 0x50)
+                && frame[10..16] == mld.context.peer_link()
+                && frame[16..22] == mld.context.peer_link()
+            {
+                mld.confirm_beacon(
+                    mpdu.body(24, 0)
+                        .and_then(|body| body.get(12..))
+                        .ok_or("native MLD live beacon body invalid")?,
+                )?;
+            }
+        }
+        if frame.len() >= 24 && frame[10..16] == peer && frame[16..22] == peer {
             if frame[0] == 0x80 {
                 if let Some(six) = &self.six {
                     let result = mpdu
@@ -1923,7 +2045,7 @@ impl Connection {
                 self.last_beacon = narf_time::now_cycles();
             }
             if matches!(frame[0], 0xa0 | 0xc0)
-                && (frame[4..10] == self.local || frame[4..10] == [0xff; 6])
+                && (frame[4..10] == local || frame[4..10] == [0xff; 6])
             {
                 // 802.11w: once MFP is active a deauth/disassoc must be
                 // authentic, else it is dropped instead of tearing the link
@@ -1969,13 +2091,24 @@ impl Connection {
         }
         let Some(ethernet) = frame_api::receive(
             mpdu,
-            self.local,
-            self.beacon.bssid,
+            local,
+            peer,
             self.security.is_some(),
             self.replay_for(queue),
         ) else {
             return Ok(None);
         };
+        if self.mld.is_some() && ethernet.get(12..14) == Some(&[0x88, 0x8e]) {
+            self.mld_eapol
+                .retain(|(epoch, _)| *epoch == self.receive_epoch);
+            if self.mld_eapol.len() >= 16 {
+                return Ok(None);
+            }
+            let mut hash = narf_crypto::sha256::Sha256::new();
+            hash.update(&ethernet);
+            self.mld_eapol
+                .push_back((self.receive_epoch, hash.finalize()));
+        }
         Ok(Some(ethernet))
     }
 
@@ -1984,11 +2117,20 @@ impl Connection {
         hw: &mut Hardware,
         ethernet: &[u8],
     ) -> Result<(), &'static str> {
-        if ethernet.len() < 14
-            || ethernet[..6] != self.local
-            || ethernet[6..12] != self.beacon.bssid
-        {
+        let (local, peer) = self.management_addresses();
+        if ethernet.len() < 14 || ethernet[..6] != local || ethernet[6..12] != peer {
             return Ok(());
+        }
+        if self.mld.is_some() {
+            self.mld_eapol
+                .retain(|(epoch, _)| *epoch == self.receive_epoch);
+            let mut hash = narf_crypto::sha256::Sha256::new();
+            hash.update(ethernet);
+            let proof = (self.receive_epoch, hash.finalize());
+            let Some(at) = self.mld_eapol.iter().position(|entry| *entry == proof) else {
+                return Ok(());
+            };
+            self.mld_eapol.remove(at);
         }
         let Some(security) = self.security.as_mut() else {
             return Ok(());
@@ -2054,10 +2196,28 @@ impl Connection {
                 || self.group_keys[keys.group_id as usize] != Some(keys.group)
                 || igtk_changed
         });
+        let mld_pairwise_rekey = self.mld.is_some()
+            && self.authorized
+            && self.pairwise_key.is_some()
+            && response
+                .keys
+                .as_ref()
+                .is_some_and(|keys| keys.pairwise.is_some());
         if changed {
             self.receive_epoch = hw.close_receive_epoch()?;
             self.discard_reorder();
             self.actions.clear();
+        }
+        let mut reply = Vec::new();
+        reply.extend_from_slice(&peer);
+        reply.extend_from_slice(&local);
+        reply.extend_from_slice(&[0x88, 0x8e]);
+        reply.extend_from_slice(&response.bytes);
+        if mld_pairwise_rekey {
+            // The new KCK authenticates M4, but its outer DATA MPDU still
+            // belongs to the old packet key. Do not retire that key before
+            // the exact native TX receipt proves M4 terminal delivery.
+            self.send_ethernet(hw, &reply, true).await?;
         }
         let mut pending_igtk = None;
         if let Some(keys) = response.keys {
@@ -2146,13 +2306,10 @@ impl Connection {
             // post-M4 epoch. The final marker below proves that boundary.
             self.receive_epoch = hw.close_receive_epoch()?;
         }
-        let mut reply = Vec::new();
-        reply.extend_from_slice(&self.beacon.bssid);
-        reply.extend_from_slice(&self.local);
-        reply.extend_from_slice(&[0x88, 0x8e]);
-        reply.extend_from_slice(&response.bytes);
-        // M2/M4 remain unencrypted; subsequent group-key replies use PTK.
-        self.send_ethernet(hw, &reply, self.authorized).await?;
+        // Initial M2/M4 are plaintext; later replies use the installed PTK.
+        if !mld_pairwise_rekey {
+            self.send_ethernet(hw, &reply, self.authorized).await?;
+        }
         if changed {
             self.open_receive_epoch(hw).await?;
         }
@@ -2259,6 +2416,22 @@ impl Connection {
             self.beacon.channel,
         )
         .await?;
+        if self.mld.is_some() {
+            // Restore the ordinary inactive default only after every
+            // station/queue and PHY owner reached its terminal removal.
+            hw.command(
+                3,
+                9,
+                &station_api::link(3, self.local, false, self.beacon.channel, 0, 1),
+            )
+            .await?;
+            hw.command(
+                3,
+                9,
+                &station_api::link(1, self.local, false, self.beacon.channel, 0, 1),
+            )
+            .await?;
+        }
         Ok(())
     }
 }

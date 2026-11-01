@@ -631,6 +631,7 @@ pub struct Hardware {
     /// The actual installed6GHz AP power/HE snapshot. This constraint
     /// gate is checked after native credit waits at every TX publication.
     six_tx_profile: Option<alloc::sync::Arc<super::six_ghz_station::Profile>>,
+    mld_link: Option<alloc::sync::Arc<super::sc_mlo::Binding>>,
     eht_source: Option<super::sc_eht::Source>,
     bios_versions: Vec<u8>,
     platform_power: platform_power::State,
@@ -747,6 +748,7 @@ impl Hardware {
             band_in_rx: parsed.api.api_changes[1] & (1 << 27) != 0,
             scan_fixed_antenna: parsed.api.has_capability(111),
             six_tx_profile: None,
+            mld_link: None,
             eht_source: None,
             bios_versions: parsed.api.bios_commands.unwrap_or(&[]).to_vec(),
             platform_power: platform_power::State::default(),
@@ -1452,6 +1454,7 @@ impl Hardware {
 
     pub(super) fn clear_rf_policy(&mut self) {
         self.six_tx_profile = None;
+        self.mld_link = None;
         if let Some(policy) = self.rf_policy.take() {
             policy.invalidate();
         }

@@ -628,9 +628,9 @@ kernel_abi! {
     ) -> i32 {
         if out_operation.is_null() || request_len > narf_bus::module_wireless::MAX_REQUEST
             || (request_len != 0 && request.is_null()) { return -22; }
-        // SAFETY: the module promises readable bytes for this bounded call;
-        // the host copies them before returning. Empty requests need no pointer.
         let request = if request_len == 0 { &[] } else {
+            // SAFETY: the module promises readable bytes for this bounded call;
+            // the host copies them before returning. The pointer is non-null.
             unsafe { core::slice::from_raw_parts(request, request_len) }
         };
         let owner = crate::symbols::current_execution_id().0;
@@ -658,8 +658,9 @@ kernel_abi! {
     ) -> i32 {
         if out_len.is_null() || reply_len > narf_bus::module_wireless::MAX_REPLY
             || (reply_len != 0 && reply.is_null()) { return -22; }
-        // SAFETY: bounded writable module storage, borrowed for this call.
         let reply = if reply_len == 0 { &mut [] } else {
+            // SAFETY: bounded writable module storage, borrowed for this call;
+            // the nonempty buffer has a non-null pointer.
             unsafe { core::slice::from_raw_parts_mut(reply, reply_len) }
         };
         let owner = crate::symbols::current_execution_id().0;

@@ -5,7 +5,7 @@
 //! frames are CCMP-protected (IEEE802.11-2020 11.13, 12.5.3, 12.5.4).
 use crate::eapol::{EapolRx, EapolRxError, Gtk, KeyMgmt, RsnaParams, Supplicant};
 use crate::packet_key::{self, Key, Role};
-use alloc::{vec, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Native receive admission supplied by the hardware adapter. The adapter
@@ -20,6 +20,12 @@ pub trait RawFrame {
     fn bytes(&self) -> &[u8];
     /// True only for an original MPDU in this adapter's admitted PHY profile.
     fn unmodified(&self) -> bool;
+    /// Exact current physical link/peer context proven by an MLD adapter's
+    /// native descriptor owner. It is never derived from an untrusted frame
+    /// link-id byte. Ordinary non-MLD adapters retain the default `None`.
+    fn mld_context(&self) -> Option<crate::association::mlo::Context> {
+        None
+    }
 }
 
 const HISTORY: usize = 16;
@@ -94,6 +100,7 @@ pub struct Security {
     igtk: crate::mfp::MfpKeyStore,
     /// EtherType Protocol Discrimination framing (`JoinPlan::epd()`).
     epd: bool,
+    mld: Option<Box<crate::association::mlo::Context>>,
 }
 impl core::fmt::Debug for Security {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -183,6 +190,42 @@ impl Security {
     /// RSNEs both set MFPC (`JoinPlan::pmf()`).
     pub fn pmf(&self) -> bool {
         self.pmf
+    }
+    /// Opt into this exact negotiated single-link context before any EAPOL
+    /// work. Physical source/PN/key ownership keeps the MACs passed to
+    /// `new`/`new_sae`; unicast DATA uses the logical MLD crypto addresses
+    /// only after that admission. Group/management stay physical. No RF grant.
+    pub fn with_mld(mut self, context: crate::association::mlo::Context) -> Result<Self, Error> {
+        if self.own != context.own_link()
+            || self.peer != context.peer_link()
+            || self.mld.is_some()
+            || !self.pmf
+            || self.pending.is_some()
+            || self.pair.is_some()
+        {
+            return Err(Error::Profile);
+        }
+        self.supplicant
+            .configure_mld(context)
+            .map_err(|_| Error::Profile)?;
+        self.mld = Some(Box::new(context));
+        Ok(self)
+    }
+    pub fn mld(&self) -> Option<&crate::association::mlo::Context> {
+        self.mld.as_deref()
+    }
+    fn admitted_link(&self, mpdu: &impl RawFrame) -> bool {
+        mpdu.mld_context() == self.mld.as_deref().copied()
+    }
+    fn logical_own(&self) -> [u8; 6] {
+        self.mld
+            .as_deref()
+            .map_or(self.own, |context| context.own_mld())
+    }
+    fn authenticator(&self) -> [u8; 6] {
+        self.mld
+            .as_deref()
+            .map_or(self.peer, |context| context.peer_mld())
     }
     #[allow(clippy::too_many_arguments)]
     fn new_inner(
@@ -311,6 +354,7 @@ impl Security {
             pmf,
             igtk: crate::mfp::MfpKeyStore::new(),
             epd: false,
+            mld: None,
         })
     }
     /// Frame MSDUs with EtherType Protocol Discrimination (IEEE802.11-2020
@@ -350,7 +394,11 @@ impl Security {
         }
         let (ethertype, header) = self.msdu_type(&frame[offset..])?;
         let mut out = Vec::with_capacity(frame.len());
-        out.extend_from_slice(&frame[4..10]);
+        if self.mld.is_some() && frame[4..10] == self.own {
+            out.extend_from_slice(&self.logical_own());
+        } else {
+            out.extend_from_slice(&frame[4..10]);
+        }
         out.extend_from_slice(&frame[16..22]);
         out.extend_from_slice(&ethertype.to_be_bytes());
         out.extend_from_slice(&frame[offset + header..]);
@@ -401,6 +449,9 @@ impl Security {
         }
     }
     fn normalize(&mut self, mpdu: &impl RawFrame) -> Result<Option<Vec<u8>>, Error> {
+        if !self.admitted_link(mpdu) {
+            return Ok(None);
+        }
         let raw = mpdu.bytes();
         // +HTC QoS DATA (IEEE802.11-2020 9.2.4.1.10, mac80211
         // `ieee80211_hdrlen`): the Order bit marks a four-octet HT Control
@@ -499,6 +550,9 @@ impl Security {
         if !self.port_open() {
             return Err(Error::State);
         }
+        if !self.admitted_link(mpdu) {
+            return Ok(None);
+        }
         if self.epd {
             return Ok(None);
         }
@@ -579,7 +633,7 @@ impl Security {
         }
         // Only the negotiated authenticator's unicast native FromDS EAPOL
         // reaches the supplicant. A group/source alias never becomes EAPOL.
-        if frame[4..10] != self.own || frame[16..22] != self.peer {
+        if frame[4..10] != self.own || frame[16..22] != self.authenticator() {
             return Ok(Rx::Ignored);
         }
         let pdu = &frame[offset + header..];
@@ -697,7 +751,7 @@ impl Security {
         let mut header = vec![8, 1, 0, 0];
         header.extend_from_slice(&self.peer);
         header.extend_from_slice(&self.own);
-        header.extend_from_slice(&self.peer);
+        header.extend_from_slice(&self.authenticator());
         header.extend_from_slice(&(self.sequence << 4).to_le_bytes());
         self.sequence = (self.sequence + 1) & 4095;
         let mut body = self.msdu_header(0x888e);
@@ -768,7 +822,8 @@ impl Security {
         if tid > 15 || self.epd {
             return Err(Error::Profile);
         }
-        let body = crate::amsdu::encode(frames, self.own, limit).map_err(|_| Error::Profile)?;
+        let body =
+            crate::amsdu::encode(frames, self.logical_own(), limit).map_err(|_| Error::Profile)?;
         let mut header = vec![0x88, 0x41, 0, 0];
         header.extend_from_slice(&self.peer);
         header.extend_from_slice(&self.own);
@@ -830,7 +885,7 @@ impl Security {
             return Err(Error::State);
         }
         if !(14..=1514).contains(&ethernet.len())
-            || ethernet[6..12] != self.own
+            || ethernet[6..12] != self.logical_own()
             || ethernet[..6] == [0; 6]
         {
             return Err(Error::Profile);
@@ -932,6 +987,24 @@ impl Security {
     /// The packet owner has proved exact terminal host delivery. This never
     /// treats submission, a quiet poll or an on-air guess as M4 completion.
     pub fn reply_delivered(&mut self, native_bytes: usize) -> Result<(), Error> {
+        if self.mld.is_some() {
+            return Err(Error::Profile);
+        }
+        self.reply_delivered_inner(native_bytes)
+    }
+    /// The native owner proves terminal delivery on this exact negotiated
+    /// link/peer. Wrong context leaves the real pending reply/key work retained.
+    pub fn reply_delivered_mld(
+        &mut self,
+        context: &crate::association::mlo::Context,
+        native_bytes: usize,
+    ) -> Result<(), Error> {
+        if self.mld.as_deref() != Some(context) {
+            return Err(Error::Profile);
+        }
+        self.reply_delivered_inner(native_bytes)
+    }
+    fn reply_delivered_inner(&mut self, native_bytes: usize) -> Result<(), Error> {
         if self.failed {
             return Err(Error::State);
         }
@@ -942,6 +1015,7 @@ impl Security {
             self.fail();
             return Err(Error::Protocol);
         }
+        let mld = self.mld.as_deref().copied();
         if let Some(material) = pending.change.pair {
             if let Some(old) = &mut self.pair {
                 if *old.material == *material {
@@ -949,6 +1023,7 @@ impl Security {
                 } else {
                     let key = Key::new(&material, 0, Role::Pairwise, self.own, self.peer, 0)
                         .and_then(|key| key.with_spp_amsdu(self.spp_amsdu))
+                        .and_then(|key| key.with_mld_context(mld.as_ref()))
                         .map_err(Error::Crypto)?;
                     self.history.push(Zeroizing::new(*material));
                     self.pair = Some(Slot { material, key });
@@ -956,6 +1031,7 @@ impl Security {
             } else {
                 let key = Key::new(&material, 0, Role::Pairwise, self.own, self.peer, 0)
                     .and_then(|key| key.with_spp_amsdu(self.spp_amsdu))
+                    .and_then(|key| key.with_mld_context(mld.as_ref()))
                     .map_err(Error::Crypto)?;
                 self.history.push(Zeroizing::new(*material));
                 self.pair = Some(Slot { material, key });
@@ -976,6 +1052,7 @@ impl Security {
                     self.peer,
                     group.rsc,
                 )
+                .and_then(|key| key.with_mld_context(mld.as_ref()))
                 .map_err(Error::Crypto)?;
                 self.history.push(Zeroizing::new(*group.material));
                 self.group[at] = Some(Slot {
@@ -1033,6 +1110,9 @@ impl Security {
     pub fn receive_management(&mut self, mpdu: &impl RawFrame) -> Result<MgmtRx, Error> {
         if self.failed {
             return Err(Error::State);
+        }
+        if !self.admitted_link(mpdu) {
+            return Ok(MgmtRx::Ignored);
         }
         let b = mpdu.bytes();
         if !mpdu.unmodified()

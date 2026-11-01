@@ -7,6 +7,10 @@ use alloc::{boxed::Box, vec::Vec};
 use narf_wireless::eapol::*;
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "security_mlo_tests.rs"]
+mod mlo_tests;
+
 /// Production nonces require the guarded hardware entropy path. A partial
 /// failing sample stays private and is zeroized before returning an error.
 pub(super) fn fresh_nonce() -> Result<[u8; 32], &'static str> {
@@ -552,6 +556,9 @@ pub struct Session {
     sta_rsn: Option<Vec<u8>>,
     /// Exact Association station/AP RSNXE bodies when explicitly bound.
     rsn_extensions: Option<RsnExtensions>,
+    /// Logical PTK/KDE identity is additive to the physical native peer.
+    /// The caller must retain the matching firmware/physical link owner.
+    mld: Option<Box<narf_wireless::association::mlo::Context>>,
     last_request: Vec<u8>,
     last_response: Vec<u8>,
     initial_key_data: Vec<u8>,
@@ -601,6 +608,7 @@ impl Session {
             ap_rsn,
             sta_rsn: None,
             rsn_extensions: None,
+            mld: None,
             last_request: Vec::new(),
             last_response: Vec::new(),
             initial_key_data: Vec::new(),
@@ -616,6 +624,23 @@ impl Session {
     pub(super) fn with_pmf(mut self, pmf: bool) -> Self {
         self.pmf = pmf;
         self
+    }
+
+    pub(super) fn with_mld(
+        mut self,
+        context: narf_wireless::association::mlo::Context,
+    ) -> Result<Self, &'static str> {
+        if self.ap != context.peer_link()
+            || self.local != context.own_link()
+            || !self.pmf
+            || !matches!(self.akm, Akm::Wpa3Sae | Akm::Wpa3SaeExtKey)
+            || self.ptk.is_some()
+            || !self.last_request.is_empty()
+        {
+            return Err("native MLD security context does not match physical peer");
+        }
+        self.mld = Some(Box::new(context));
+        Ok(self)
     }
 
     /// Echo `rsn` (the exact association-request RSNE body) in message 2
@@ -673,6 +698,10 @@ impl Session {
                 {
                     return Err("stale pairwise rekey challenge");
                 }
+                if let Some(context) = self.mld.as_deref() {
+                    mlo::message1(*context, &key.key_data)
+                        .map_err(|_| "native MLD rekey M1 peer/context mismatch")?;
+                }
                 let mut candidate = Box::new(Session::new(
                     self.akm,
                     self.pmk,
@@ -684,6 +713,7 @@ impl Session {
                 candidate.sta_rsn = self.sta_rsn.clone();
                 candidate.rsn_extensions = self.rsn_extensions.clone();
                 candidate.pmf = self.pmf;
+                candidate.mld = self.mld.clone();
                 let reply = candidate.process_inner(pdu)?;
                 self.pending_rekey = Some(candidate);
                 return Ok(reply);
@@ -737,14 +767,19 @@ impl Session {
             {
                 return Err("invalid message 1");
             }
-            let ptk = self.akm.derive_ptk(
-                &self.pmk,
-                &self.ap,
-                &self.local,
-                &key.key_nonce,
-                &self.snonce,
-                16,
-            );
+            if let Some(context) = self.mld.as_deref() {
+                mlo::message1(*context, &key.key_data)
+                    .map_err(|_| "native MLD M1 peer/context mismatch")?;
+            }
+            let (ap, local) = self
+                .mld
+                .as_deref()
+                .map_or((self.ap, self.local), |context| {
+                    (context.peer_mld(), context.own_mld())
+                });
+            let ptk = self
+                .akm
+                .derive_ptk(&self.pmk, &ap, &local, &key.key_nonce, &self.snonce, 16);
             let mut reply = KeyFrame::empty(16);
             reply.key_information = self.akm.ki_version() | KI_KEY_TYPE_PAIRWISE | KI_KEY_MIC;
             reply.replay_counter = key.replay_counter;
@@ -764,6 +799,10 @@ impl Session {
                     .key_data
                     .extend_from_slice(&[244, station.len() as u8]);
                 reply.key_data.extend_from_slice(station);
+            }
+            if let Some(context) = self.mld.as_deref() {
+                reply.key_data = mlo::message2(*context, &reply.key_data)
+                    .map_err(|_| "native MLD M2 association/context mismatch")?;
             }
             self.ptk = Some(ptk);
             self.anonce = key.key_nonce;
@@ -808,10 +847,11 @@ impl Session {
             let clear = Zeroizing::new(
                 rekey::aes_key_unwrap(&kek, &key.key_data).ok_or("invalid encrypted key data")?,
             );
-            if pairwise_message && !contains_ie(&clear, 48, &self.ap_rsn) {
+            if self.mld.is_none() && pairwise_message && !contains_ie(&clear, 48, &self.ap_rsn) {
                 return Err("AP RSN changed during handshake");
             }
-            if pairwise_message
+            if self.mld.is_none()
+                && pairwise_message
                 && self
                     .rsn_extensions
                     .as_ref()
@@ -822,13 +862,65 @@ impl Session {
             if pairwise_message && self.complete && *clear != self.initial_key_data {
                 return Err("retransmitted M3 changed key data");
             }
-            let gtk = rekey::parse_gtk_kde(&clear).ok_or("message lacks GTK")?;
-            let group_id = gtk.key_id;
-            let gtk = Zeroizing::new(gtk.gtk);
-            let group = gtk
-                .as_slice()
-                .try_into()
-                .map_err(|_| "invalid CCMP GTK length")?;
+            let (group, group_id, pn, selected_igtk) = if let Some(context) = self.mld.as_deref() {
+                let mut rsne = alloc::vec![48, self.ap_rsn.len() as u8];
+                rsne.extend_from_slice(&self.ap_rsn);
+                let rsnxe = self.rsn_extensions.as_ref().and_then(|(_, ap)| {
+                    ap.as_ref().map(|body| {
+                        let mut ie = alloc::vec![244, body.len() as u8];
+                        ie.extend_from_slice(body);
+                        ie
+                    })
+                });
+                let selected = mlo::authenticated_keys(
+                    *context,
+                    if pairwise_message {
+                        mlo::Kind::Pairwise3
+                    } else {
+                        mlo::Kind::Group1
+                    },
+                    key.key_information,
+                    &clear,
+                    mlo::Profile {
+                        rsne: &rsne,
+                        rsnxe: rsnxe.as_deref(),
+                        gtk_len: 16,
+                        igtk_len: Some(16),
+                    },
+                )
+                .map_err(|_| "native MLD authenticated per-link key data invalid")?;
+                let group_id = selected.gtk.key_id;
+                let pn = u64::from_le_bytes(selected.gtk.rsc);
+                let gtk = Zeroizing::new(selected.gtk.key);
+                let group = gtk
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "invalid native MLD GTK length")?;
+                let igtk = selected
+                    .igtk
+                    .map(|key| -> Result<([u8; 16], u16, u64), &'static str> {
+                        let material = Zeroizing::new(key.key);
+                        let material = material
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| "invalid native MLD IGTK length")?;
+                        let mut ipn = [0; 8];
+                        ipn[..6].copy_from_slice(&key.ipn);
+                        Ok((material, key.key_id, u64::from_le_bytes(ipn)))
+                    })
+                    .transpose()?;
+                (group, group_id, pn, igtk)
+            } else {
+                let gtk = rekey::parse_gtk_kde(&clear).ok_or("message lacks GTK")?;
+                let group_id = gtk.key_id;
+                let gtk = Zeroizing::new(gtk.gtk);
+                let group = gtk
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "invalid CCMP GTK length")?;
+                let igtk = rekey::parse_igtk_kde(&clear).map(|key| (key.igtk, key.key_id, key.ipn));
+                (group, group_id, u64::from_le_bytes(key.key_rsc), igtk)
+            };
             let pairwise = if self.complete {
                 None
             } else {
@@ -839,15 +931,14 @@ impl Session {
                         .map_err(|_| "invalid TK length")?,
                 )
             };
-            let pn = u64::from_le_bytes(key.key_rsc);
             if pn >> 48 != 0 {
                 return Err("invalid GTK replay counter");
             }
             // A PMF association requires its initial IGTK irrespective of
             // AKM. Group rekeys may retain the already-installed IGTK.
             let igtk = if self.pmf {
-                match rekey::parse_igtk_kde(&clear) {
-                    Some(kde) => Some((kde.igtk, kde.key_id, kde.ipn)),
+                match selected_igtk {
+                    Some(key) => Some(key),
                     None if pairwise_message && !self.complete => {
                         return Err("PMF message 3 lacks IGTK")
                     }

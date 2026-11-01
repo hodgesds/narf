@@ -346,6 +346,7 @@ pub(in crate::iwlwifi) fn create_for_format(
         band_in_rx: false,
         scan_fixed_antenna: false,
         six_tx_profile: None,
+        mld_link: None,
         eht_source: None,
         bios_versions: Vec::new(),
         platform_power: platform_power::State::default(),

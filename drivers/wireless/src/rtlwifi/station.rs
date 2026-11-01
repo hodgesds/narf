@@ -1068,11 +1068,17 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             super::super::tracking::readback(&self.io, tracking.applied)?;
         }
         if let Some(antenna) = &self.station.antenna {
-            antenna.grant.check(
-                &domain,
-                permission,
-                self.station_operating_gains(environment)?,
-            )?;
+            // This policy query is available before packet preparation (Io),
+            // so derive the same gains without requiring the native Port API.
+            let gains = match &self.station.tracking {
+                Some(tracking) => tracking.applied,
+                None => super::super::tracking::Gains::nominal(
+                    self.station.ht.as_deref(),
+                    &domain,
+                    permission,
+                )?,
+            };
+            antenna.grant.check(&domain, permission, gains)?;
             antenna.readback(&self.io)?;
         }
         if let Some(protection) = &self.station.protection {

@@ -244,7 +244,39 @@ TX limited by AP RX, eht.c `ieee80211_eht_cap_ie_to_sta_eht_cap`),
 `su_beamformee()/su_beamformer()`, `peer_capability()`, `operation()` and
 `local_capability()`. The request carries EHT Capabilities only when EHT
 was negotiated; responses must keep EHT and cannot raise TX NSS or roles.
-Multi-link (MLO) association is not part of `JoinPlan`.
+Existing constructors retain ordinary station association. The explicit
+single-link MLD opt-in below supplies the separate MLO identity/key contract.
+
+**Single-link MLD (`association::mlo`).** `mlo::Local::single_link(own_mld)`
+validates a unicast logical address. `JoinPlan::prepare_mld(bss, own_link,
+ssid, security, phy, options, local)` and `prepare_mld_6ghz` opt into one
+associated link, require EHT and RSN with PMF, and retain a boxed immutable
+`mlo::Context` alongside the existing boxed 6GHz plan. `JoinPlan::mld()`
+reports that selected candidate; successful association and current native
+radio/key authority remain separate requirements. The context binds own/AP
+MLD addresses, own/AP physical link MACs and the beacon's IEEE Link ID. A
+scalar Link ID never selects a different peer, firmware link or key owner.
+
+`BasicMultiLink::{parse, from_ies}` checks the Basic ML Control type/presence
+bits, exact common-info lengths, unicast MLD MAC and optional Link ID, bounds
+affiliated Per-STA profiles and rejects duplicate/fragmented elements. Those
+profiles never supply the selected link's RSN or PHY. The association request
+contains one canonical Basic MLE (common length9, local MLD MAC and MLD
+Capabilities with Max Simultaneous Links0); it requests no additional link,
+EML, TID-to-link mapping or beacon protection. `Local::request_element()`
+exposes that same builder for native owners. `Context::response(ies)` requires
+the exact AP MLD, rejects extra link profiles and mismatched present Link IDs;
+an absent response Link ID preserves the beacon-selected link. Caller-supplied
+MLE/fragment IEs cannot replace the protocol-owned request element.
+
+Authentication/association headers and SAE sessions use logical MLD addresses.
+`Local::authentication_element()` supplies Linux's canonical Basic auth MLE
+(common length7, MLD MAC); `Context::authentication_body(bytes)` validates and
+strips the AP's exact trailer before SAE scalar/token/confirm parsing. An
+ordinary Open System authentication success must contain that trailer alone.
+SAE's password/PMK computation uses the MLD address pair; the physical link
+MACs remain separate throughout packet protection and native key binding.
+These validators create no association, RF, terminal-completion or key grant.
 
 **UHR admission (`association::uhr`, IEEE P802.11bn D1.3 draft).**
 `UhrCapability::parse(body, from_ap)` / `UhrOperation::parse` implement the
@@ -260,9 +292,10 @@ when the AP supports it on an80/160MHz channel with the NPCA primary in the
 opposite half and unpunctured (`cfg80211_chandef_add_npca` /
 `cfg80211_chandef_npca_valid`), and DBE operation consistent with the DBE
 bandwidth field and the AP's DBE capability (DBE widening is not applied).
-Because UHR operation is an MLD association, `JoinPlan` (single-link) never
-negotiates UHR and its UHR selector stays fail-closed; a native owner whose
-firmware associates as a non-AP MLD asserts
+Because UHR operation requires MLD association, ordinary `JoinPlan`
+constructors keep its selector fail-closed. `prepare_mld` supplies the strict
+single-link MLD/key-delivery contract and can negotiate UHR; a native owner
+whose firmware associates as a non-AP MLD asserts
 `LocalUhr::for_mld_association()` and uses `Offer::from_elements`, whose
 `Offer/Negotiated::uhr() -> Option<&UhrNegotiation>` reports the peer
 capability, operation and the usable `npca_channel()` (only when the local
@@ -1890,6 +1923,30 @@ admitted peer/channel/PHY profile before nonce or key state can advance. The
 security owner additionally checks native addresses, DS direction, fragments,
 EAPOL envelope and negotiated crypto. It grants no radio or carrier authority.
 
+`Security::with_mld(context)` is an additive pre-handshake opt-in. Its
+constructor MACs must equal the context's physical link pair and PMF must be
+negotiated. `RawFrame::mld_context()` defaults to None; an MLD native adapter
+returns the exact context only after proving its current descriptor/link/peer
+owner. The security owner compares the full context before any crypto or PN
+work, and `reply_delivered_mld(&context, native_bytes)` requires it again at
+the exact native M2/M4/group terminal boundary. The ordinary receipt method
+cannot commit an MLD reply. Original physical 802.11 headers, PN windows and
+native key/peer slots remain source-bound. After that proof,
+`Context::data_crypto_header` supplies a separate bounded crypto header:
+unicast DATA A1/A2 and nonce A2 use MLD addresses; group DATA and management
+keep the physical link addresses. Ordinary MSDU A3 and FC/SC/QC are preserved.
+Only an exact unicast A-MSDU with raw A3 equal to the physical AP BSSID also
+uses AP MLD A3 for crypto. No original header is modified and no alternate
+address-form decryption is attempted. This follows pinned Linux7.2
+rx.c:5228..5250/wpa.c:574..587 (original address crypto is preserved only for
+non-data management), and Intel mld/tx.c:515..530 (A-MSDU BSSID translation
+occurs after encryption). Logical Ethernet source and local destination use
+the MLD MAC. The internal packet-key A-MSDU seam checks the physical outer
+receiver and exact link context first, then admits only
+the logical local/group subframe DA and legitimate external bridged SAs; it
+commits replay state only after the entire aggregate passes. An IEEE Link ID
+or translated frame address alone supplies none of these native proofs.
+
 `receive_with_nonce` lazily requests fallible secure SNonce material through
 the existing supplicant contract. `pending_frame` retains each exact M2/M4 or
 group-key response; the transport calls `reply_delivered(native_bytes)` only
@@ -1993,6 +2050,23 @@ rekeys and discarded traffic never request fresh entropy. `None` returns
 caller aborts the attempted handshake/rekey. Production callers use the
 fallible hardware-seeded crypto API, with no timing fallback. Existing
 `rx_eapol` retains its fixed-byte interface through this same implementation.
+
+`Supplicant::configure_mld(context)` binds one PMF CCMP-128/BIP-CMAC-128
+association before M1, uses the logical MLD pair for PTK derivation and keeps
+ordinary handshakes unchanged. `eapol::mlo::message1` checks the AP MLD MAC KDE
+before consuming a fresh SNonce; `message2` adds the station MLD MAC KDE to
+the station RSNE/RSNXE. `authenticated_keys(context, kind, key_info, data,
+Profile)` is the shared native helper for already MIC-verified, AES-unwrapped
+M3/group data. It bounds the complete TLV stream and padding, requires
+encrypted key delivery and M3 Install+Secure, checks the exact AP MLD MAC,
+selected Link KDE/AP physical MAC and RSNE/RSNXE, and accepts only that link's
+ML GTK/IGTK KDEs. Duplicate, foreign-link, mixed legacy, Extended Key ID and
+unnegotiated BIGTK deliveries fail. Each ML GTK's own six-octet PN supplies
+its RSC; a descriptor-wide RSC cannot replace it. The checked records feed
+the existing install/reinstallation, retired-key history, old-key reply and
+exact M4/group terminal state machines. These pure helpers grant no MIC,
+firmware key-install, radio, controlled-port or completion authority. Multiple
+active links and other ciphers remain outside this explicit one-link profile.
 
 ### 3.5.1 SAE commit entropy (`sae`)
 

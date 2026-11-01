@@ -60,6 +60,8 @@ fn connection() -> Connection {
         he: None,
         eht: None,
         six: None,
+        mld: None,
+        mld_eapol: VecDeque::new(),
         tx_amsdu: super::super::sc_tx_amsdu::Limits::default(),
         amsdu_memory: None,
         amsdu_memory_attempted: false,

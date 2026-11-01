@@ -3,7 +3,7 @@
 //! header/CCMP bounds, peer binding, per-key/TID replay and non-wrapping TX PN.
 //! It does not open a controlled port or install keys before RSNA completes.
 use crate::ccmp::{self, AesCcm, CcmpError, ReplayWindow};
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const MAX_PN: u64 = (1u64 << 48) - 1;
@@ -158,6 +158,8 @@ pub struct Key {
     key_id: u8,
     role: Role,
     local: [u8; 6],
+    msdu_local: [u8; 6],
+    mld: Option<Box<crate::association::mlo::Context>>,
     peer: [u8; 6],
     tx_pn: u64,
     receive: [ReplayWindow; 18],
@@ -194,6 +196,8 @@ impl Key {
             key_id,
             role,
             local,
+            msdu_local: local,
+            mld: None,
             peer,
             tx_pn: 0,
             receive: [ReplayWindow { last_seen_pn: rsc }; 18],
@@ -212,6 +216,28 @@ impl Key {
         }
         self.spp_amsdu = enabled;
         Ok(self)
+    }
+    /// Only the retained Security owner supplies this exact negotiated
+    /// context. Physical raw header/key/PN bindings stay unchanged; the
+    /// unicast DATA cryptographic address form is a separate checked copy.
+    pub(crate) fn with_mld_context(
+        mut self,
+        context: Option<&crate::association::mlo::Context>,
+    ) -> Result<Self, Error> {
+        if let Some(context) = context {
+            if context.own_link() != self.local || context.peer_link() != self.peer {
+                return Err(Error::Key);
+            }
+            self.msdu_local = context.own_mld();
+            self.mld = Some(Box::new(*context));
+        }
+        Ok(self)
+    }
+    fn data_crypto_header(&self, physical: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        self.mld
+            .as_deref()
+            .map(|context| context.data_crypto_header(physical).map_err(|_| Error::Key))
+            .transpose()
     }
     pub fn spp_amsdu(&self) -> bool {
         self.spp_amsdu
@@ -249,11 +275,12 @@ impl Key {
         if self.tx_pn == MAX_PN {
             return Err(Error::Exhausted);
         }
+        let crypto_header = self.data_crypto_header(header)?;
         self.tx_pn += 1;
         let mut ciphertext = Zeroizing::new(body.to_vec());
         ccmp::protect(
             &Ccm,
-            header,
+            crypto_header.as_deref().unwrap_or(header),
             &self.tk,
             self.tx_pn,
             self.key_id,
@@ -344,10 +371,11 @@ impl Key {
         }
         // Keep the driver transaction explicit even though shared unprotect
         // also commits only after MIC. This binds state to the selected TID.
+        let crypto_header = self.data_crypto_header(header)?;
         let mut candidate = self.receive[shape.index];
         let plaintext = ccmp::unprotect(
             &Ccm,
-            header,
+            crypto_header.as_deref().unwrap_or(header),
             &self.tk,
             shape.priority,
             false,
@@ -410,11 +438,12 @@ impl Key {
             .try_reserve_exact(wire.len())
             .map_err(|_| Error::Aggregate(crate::amsdu::Error::Allocation))?;
         scratch.extend_from_slice(wire);
+        let crypto_header = self.data_crypto_header(header)?;
         let mut candidate = self.receive[usize::from(priority)];
         let opened = if self.spp_amsdu {
             ccmp::unprotect_spp_amsdu(
                 &Ccm,
-                header,
+                crypto_header.as_deref().unwrap_or(header),
                 &self.tk,
                 priority,
                 &mut candidate,
@@ -423,7 +452,7 @@ impl Key {
         } else {
             ccmp::unprotect(
                 &Ccm,
-                header,
+                crypto_header.as_deref().unwrap_or(header),
                 &self.tk,
                 priority,
                 false,
@@ -432,10 +461,11 @@ impl Key {
             )
         };
         let plaintext = Zeroizing::new(opened.map_err(Error::Crypto)?);
-        let frames = crate::amsdu::decode_with_limit(
+        let frames = crate::amsdu::decode_for_link(
             &plaintext,
-            self.local,
+            self.msdu_local,
             header[4..10].try_into().unwrap(),
+            self.local,
             admission.limit,
         )
         .map_err(Error::Aggregate)?;
@@ -487,12 +517,13 @@ impl Key {
             .try_reserve_exact(body.len())
             .map_err(|_| Error::Aggregate(crate::amsdu::Error::Allocation))?;
         ciphertext.extend_from_slice(body);
+        let crypto_header = self.data_crypto_header(header)?;
         self.tx_pn += 1;
         let priority = header[24] & 15;
         if self.spp_amsdu {
             ccmp::protect_spp_amsdu(
                 &Ccm,
-                header,
+                crypto_header.as_deref().unwrap_or(header),
                 &self.tk,
                 self.tx_pn,
                 self.key_id,
@@ -502,7 +533,7 @@ impl Key {
         } else {
             ccmp::protect(
                 &Ccm,
-                header,
+                crypto_header.as_deref().unwrap_or(header),
                 &self.tk,
                 self.tx_pn,
                 self.key_id,

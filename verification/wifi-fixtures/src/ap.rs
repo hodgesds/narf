@@ -7,6 +7,10 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ap_rsn::{ApPmf, ApSaePwe, RsnProfile, SaeAp};
 use crate::NetworkPlan;
 
+#[path = "ap_mlo.rs"]
+mod mlo;
+pub use mlo::MldGroupKeys;
+
 /// The peer progresses only after observing the station's matching request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApPhase {
@@ -50,6 +54,7 @@ pub struct FakeAp {
     basic_1mbps: bool,
     rates: Option<Vec<u8>>,
     rsn: Option<alloc::boxed::Box<RsnProfile>>,
+    mld: Option<alloc::boxed::Box<mlo::State>>,
 }
 
 impl core::fmt::Debug for FakeAp {
@@ -123,6 +128,7 @@ impl FakeAp {
             basic_1mbps: false,
             rates: None,
             rsn: None,
+            mld: None,
         })
     }
 
@@ -230,11 +236,17 @@ impl FakeAp {
 
     /// Select the IGTK, its key ID (4 or 5) and the IPN message 3 reports.
     pub fn with_igtk(mut self, igtk: [u8; 16], key_id: u16, ipn: u64) -> Result<Self, ApError> {
+        if self.mld.is_some() && self.phase != ApPhase::Authentication {
+            return Err(ApError::Phase);
+        }
         let profile = self.rsn.as_mut().ok_or(ApError::Configuration)?;
         if !matches!(key_id, 4 | 5) || ipn >= 1 << 48 {
             return Err(ApError::Configuration);
         }
         (profile.igtk, profile.igtk_id, profile.ipn) = (igtk, key_id, ipn);
+        if let Some(mld) = self.mld.as_mut() {
+            (mld.keys.igtk, mld.keys.igtk_id, mld.keys.igtk_ipn) = (igtk, key_id, ipn);
+        }
         Ok(self)
     }
 
@@ -362,6 +374,9 @@ impl FakeAp {
     /// React to one native station authentication/association/EAPOL frame.
     /// Invalid input leaves the AP's phase and installed PTK unchanged.
     pub fn receive(&mut self, frame: &[u8]) -> Result<Vec<Vec<u8>>, ApError> {
+        if self.mld.is_some() {
+            return self.receive_mld(frame);
+        }
         if frame.len() > 4096 {
             return Err(ApError::Frame);
         }
@@ -491,6 +506,9 @@ impl FakeAp {
         out.extend_from_slice(&[3, 1, self.channel]);
         if self.protected() {
             out.extend_from_slice(&self.rsn_ie());
+        }
+        if let Some(mld) = self.mld.as_deref() {
+            out.extend_from_slice(&mld.beacon_element());
         }
         out
     }

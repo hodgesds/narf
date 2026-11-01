@@ -28,6 +28,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::future::Future;
@@ -1134,8 +1135,10 @@ pub struct Link {
 /// no formatter because every variant owns key material.
 #[derive(Clone)]
 enum StationRecoveryKeys {
-    External(ext::ExtKeys),
-    Internal(Option<Supplicant>),
+    // Cold recovery snapshots own their key source without growing the
+    // inline recovery state as the shared supplicant gains optional profiles.
+    External(Box<ext::ExtKeys>),
+    Internal(Box<Option<Supplicant>>),
 }
 
 /// mac80211 state that survives a hardware restart for an associated
@@ -2329,7 +2332,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         Some(StationRecovery {
             vif,
             link,
-            keys: StationRecoveryKeys::External(self.ext_keys.clone()),
+            keys: StationRecoveryKeys::External(Box::new(self.ext_keys.clone())),
             mfp: self.mfp.clone(),
             powersave: self.powersave,
             gtk_rekey_data: self.gtk_rekey_data,
@@ -2363,7 +2366,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         Some(StationRecovery {
             vif,
             link,
-            keys: StationRecoveryKeys::Internal(self.sup.clone()),
+            keys: StationRecoveryKeys::Internal(Box::new(self.sup.clone())),
             mfp: self.mfp.clone(),
             powersave: self.powersave,
             gtk_rekey_data: self.gtk_rekey_data,
@@ -2422,7 +2425,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         let aid = retained_vif.aid;
         self.link = Some(link);
         self.ext_keys = match &keys {
-            StationRecoveryKeys::External(keys) => keys.clone(),
+            StationRecoveryKeys::External(keys) => keys.as_ref().clone(),
             StationRecoveryKeys::Internal(_) => ext::ExtKeys::default(),
         };
         self.sup = None;
@@ -2539,7 +2542,7 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
                 }
             }
             StationRecoveryKeys::Internal(supplicant) => {
-                if let Some(supplicant) = supplicant {
+                if let Some(supplicant) = *supplicant {
                     if supplicant.ptk_installed {
                         if let Some(ptk) = supplicant.ptk.as_ref() {
                             self.install_key(bss.bssid, 0, &ptk.tk, true).await?;
