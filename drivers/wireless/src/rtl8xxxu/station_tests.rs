@@ -10,6 +10,7 @@ use super::native_permission;
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::{
     future::Future,
+    pin::Pin,
     task::{Context, Poll, Waker},
 };
 use narf_drivers_usb::device::UsbError;
@@ -1527,11 +1528,22 @@ kernel_test_in!(
 /// and reposts/reopens it, best-effort DATA is dropped, a failed reset is
 /// terminal, and disconnect recovers a halted pipe before draining it.
 fn smoke_rtl8188eu_station_endpoint_halt_recovery_keeps_association() -> TestResult {
+    // Construct each retained native future on the heap before polling it.
+    // Keeping both inline in open reserved 99,040 bytes in the release ARM frame.
+    type Setup<'a> = Pin<Box<dyn Future<Output = Result<(), Error>> + 'a>>;
+    #[inline(never)]
+    fn begin(s: &mut Station<Fake, Link>) -> Setup<'_> {
+        Box::pin(s.begin(0))
+    }
+    #[inline(never)]
+    fn step(s: &mut Station<Fake, Link>, now: u64) -> Setup<'_> {
+        Box::pin(s.step(now, SN))
+    }
     fn open() -> (Link, Station<Fake, Link>) {
         let (_, link, mut s) = prepared(false);
-        narf_scheduler::block_on(s.begin(0)).unwrap();
+        narf_scheduler::block_on(begin(&mut s)).unwrap();
         for now in 1..20 {
-            narf_scheduler::block_on(s.step(now, SN)).unwrap();
+            narf_scheduler::block_on(step(&mut s, now)).unwrap();
             if s.controlled_port_open() {
                 break;
             }
