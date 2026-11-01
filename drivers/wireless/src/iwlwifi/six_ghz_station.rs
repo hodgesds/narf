@@ -1,5 +1,5 @@
-//! Explicit-band native HE20 station admission. Wider/active/RNR6GHz
-//! ownership remains separate; no numeric legacy-channel fallback exists.
+//! Explicit-band native HE/EHT20..320 station admission. Active/RNR6GHz
+//! scanning remains separate; no numeric legacy-channel fallback exists.
 use super::{
     connection::{AuthMethod, Beacon},
     ht_vht::Local,
@@ -19,7 +19,59 @@ pub(super) struct Profile {
     pub plan: SixGhzPlan,
     pub power: super::six_ghz_power::Constraints,
     pub nvm_flags: u32,
+    pub span: super::six_ghz_span::Span,
+    ap_span: super::six_ghz_span::Span,
     peer: [u8; 6],
+}
+
+fn width(width: SixGhzWidth) -> u8 {
+    match width {
+        SixGhzWidth::Twenty => 0,
+        SixGhzWidth::Forty => 1,
+        SixGhzWidth::Eighty => 2,
+        SixGhzWidth::OneSixty => 3,
+        SixGhzWidth::ThreeTwenty => 4,
+    }
+}
+fn announced_span(ies: &[u8], primary: u8) -> Result<super::six_ghz_span::Span, &'static str> {
+    let he = six_ghz::admit(ies, primary).map_err(|_| "invalid6GHz announced HE channel")?;
+    if he.channel.discontiguous {
+        return Err("native6GHz80+80 owner absent");
+    }
+    let he_width = match he.channel.width {
+        association::phy::Width::Twenty => 0,
+        association::phy::Width::Forty => 1,
+        association::phy::Width::Eighty => 2,
+        association::phy::Width::OneSixty => 3,
+    };
+    let he_center = if he_width == 3 {
+        he.operation.ccfs1
+    } else {
+        he.operation.ccfs0
+    };
+    let he_span = super::six_ghz_span::Span::new(primary, he_width, he_center)
+        .ok_or("invalid6GHz HE span")?;
+    let mut rest = ies;
+    while !rest.is_empty() {
+        let len = usize::from(*rest.get(1).ok_or("short6GHz EHT channel IE")?);
+        let body = rest.get(2..2 + len).ok_or("short6GHz EHT channel extent")?;
+        if rest[0] == 255 && body.first() == Some(&106) {
+            let operation = association::eht::EhtOperation::parse(&body[1..])
+                .map_err(|_| "invalid6GHz EHT operation")?;
+            if let Some(info) = operation.information() {
+                let width = info[0] & 7;
+                let center = if width >= 3 { info[2] } else { info[1] };
+                let span = super::six_ghz_span::Span::new(primary, width, center)
+                    .ok_or("invalid6GHz EHT span")?;
+                if !span.contains(he_span) {
+                    return Err("6GHz EHT operation does not contain HE channel");
+                }
+                return Ok(span);
+            }
+        }
+        rest = &rest[2 + len..];
+    }
+    Ok(he_span)
 }
 
 fn forbid_legacy(mut ies: &[u8]) -> Result<(), &'static str> {
@@ -51,7 +103,9 @@ pub(super) fn rule(
         Some(_) => return None,
         None => 5 | (1 << 13) | (1 << 14),
     };
-    if flags & 5 != 5 {
+    // ACTIVE permits ordinary operation; ALLOW_20MHZ_ACTIVITY is only
+    // the narrower no-IR relaxation. Neither bit is a wider-span proof.
+    if flags & 1 == 0 || flags & (4 | 8) == 0 {
         return None;
     }
     let frequency = channel.frequency();
@@ -88,6 +142,26 @@ pub(super) fn rule(
     covered.then_some(combined)
 }
 
+fn local_for_width(source: Local, maximum: u8, rule: RegRule) -> Result<SixGhzLocal, &'static str> {
+    let he = super::sc_he::local_six_width(source, maximum)?;
+    let limit = match maximum {
+        0 => SixGhzWidth::Twenty,
+        1 => SixGhzWidth::Forty,
+        2 => SixGhzWidth::Eighty,
+        3 => SixGhzWidth::OneSixty,
+        _ => SixGhzWidth::ThreeTwenty,
+    };
+    let local = SixGhzLocal::new(he, He6GhzCapability::new(4 | (3 << 3) | (3 << 9)), rule)
+        .map_err(|_| "invalid native6GHz HE width profile")?
+        .with_max_width(limit);
+    if source.eht {
+        local
+            .with_eht(super::sc_eht::local_six_width(source, &he, maximum)?)
+            .map_err(|_| "invalid native6GHz EHT width profile")
+    } else {
+        Ok(local)
+    }
+}
 #[inline(never)]
 pub(super) fn prepare(
     beacon: &Beacon,
@@ -99,41 +173,18 @@ pub(super) fn prepare(
 ) -> Result<(super::sc_security::Profile, Arc<Profile>), &'static str> {
     forbid_legacy(&beacon.information_elements)?;
     let channel = Channel::six(beacon.channel)
-        .filter(|ch| beacon.band == ch.band)
+        .filter(|ch| ch.band == beacon.band)
         .ok_or("6GHz association has no explicit native channel")?;
-    let bit = 1u64 << (channel.index().unwrap() - 51);
-    if !local.he || local.six_channels[0] & bit == 0 || !matches!(local.native_rates, 2 | 3) {
-        return Err("6GHz association lacks actual NVM/HE/rate facts");
+    if !local.he || !matches!(local.native_rates, 2 | 3) {
+        return Err("6GHz actual HE/rate facts absent");
     }
-    let nvm_flags =
-        1 | if local.six_channels[1] & bit != 0 {
-            1 << 13
-        } else {
-            0
-        } | if local.six_channels[2] & bit != 0 {
-            1 << 14
-        } else {
-            0
-        };
-    let rule =
-        rule(domain, channel, nvm_flags, firmware).ok_or("6GHz host/NVM/MCC channel prohibited")?;
-    let mut source_phy = local;
-    source_phy.eht &= firmware.is_none_or(|mcc| mcc.eht_allowed);
-    let local = SixGhzLocal::new(
-        super::sc_he::local_six(local)?,
-        // Actual shared HE source profile: min spacing4, A-MPDU exp3,
-        // MPDU3895, SMPS disabled, no unproved RD/antenna promises.
-        He6GhzCapability::new(4 | (3 << 3) | (3 << 9)),
-        rule,
-    )
-    .map_err(|_| "invalid native6GHz local HE profile")?;
-    let local = if source_phy.eht {
-        local
-            .with_eht(super::sc_eht::local(source_phy, None)?)
-            .map_err(|_| "invalid native6GHz local EHT profile")?
-    } else {
-        local
-    };
+    let primary = super::six_ghz_span::Span::new(channel.number, 0, channel.number).unwrap();
+    let primary_flags = primary
+        .nvm_flags(local)
+        .ok_or("6GHz actual primary NVM fact absent")?;
+    let primary_rule = primary
+        .rule(domain, primary_flags, firmware)
+        .ok_or("6GHz primary host/NVM/MCC prohibited")?;
     let mode = match auth {
         AuthMethod::Wpa3Sae { .. } => SecurityMode::Wpa3Sae {
             pwe: association::SaePwe::HashToElement,
@@ -150,47 +201,111 @@ pub(super) fn prepare(
         beacon_interval: beacon.interval,
         information_elements: beacon.information_elements.clone(),
     };
-    let plan = JoinPlan::prepare_6ghz(
-        &bss,
-        own,
-        &beacon.ssid,
-        mode,
-        &local,
-        JoinOptions::default(),
-    )
-    .map_err(|_| "unsupported native6GHz security/HE offer")?;
-    let selected = *plan.six_ghz().ok_or("shared6GHz plan absent")?;
-    let announced = six_ghz::admit(&beacon.information_elements, beacon.channel)
-        .map_err(|_| "invalid native6GHz AP operation")?;
-    if selected.width() != SixGhzWidth::Twenty
-        || announced.channel.width != association::phy::Width::Twenty
-        || selected.channel().discontiguous
-    {
-        return Err("native6GHz owner currently requires an AP20/STA20 HE span");
+    let ap_span = announced_span(&beacon.information_elements, beacon.channel)?;
+    let mut source = local;
+    source.eht &= firmware.is_none_or(|mcc| mcc.eht_allowed);
+    source.eht_320 &= source.eht && firmware.is_none_or(|mcc| mcc.widths.three_twenty);
+    let he160 = source.width160_channels != 0 || source.six_widths[2] != 0;
+    let maximum = if source.eht_320 && he160 {
+        4
+    } else if source.six_widths[2] != 0 {
+        3
+    } else if source.six_widths[1] != 0 {
+        2
+    } else if source.six_widths[0] != 0 {
+        1
+    } else {
+        0
+    };
+    for maximum in (0..=maximum).rev() {
+        let physical = local_for_width(source, maximum, primary_rule.clone())?;
+        let Ok(plan) = JoinPlan::prepare_6ghz(
+            &bss,
+            own,
+            &beacon.ssid,
+            mode,
+            &physical,
+            JoinOptions::default(),
+        ) else {
+            continue;
+        };
+        let selected = *plan.six_ghz().ok_or("shared6GHz plan absent")?;
+        if selected.channel().discontiguous {
+            continue;
+        }
+        let Some(span) = super::six_ghz_span::Span::new(
+            beacon.channel,
+            width(selected.width()),
+            selected.channel().center,
+        ) else {
+            continue;
+        };
+        if !ap_span.contains(span) {
+            continue;
+        }
+        let Some(nvm_flags) = span.nvm_flags(source) else {
+            continue;
+        };
+        let Some(rule) = span
+            .rule(domain, nvm_flags, firmware)
+            .filter(|rule| rule.allows_6ghz_client(selected.power_type()))
+        else {
+            continue;
+        };
+        // Rebuild with the full selected span's AP-type restrictions. This
+        // keeps transmitted regulatory connectivity truthful too.
+        drop(plan);
+        let physical = local_for_width(source, maximum, rule)?;
+        let Ok(plan) = JoinPlan::prepare_6ghz(
+            &bss,
+            own,
+            &beacon.ssid,
+            mode,
+            &physical,
+            JoinOptions::default(),
+        ) else {
+            continue;
+        };
+        let selected = *plan.six_ghz().ok_or("shared6GHz full-span plan absent")?;
+        if width(selected.width()) != span.width || selected.channel().center != span.center {
+            return Err("6GHz regulatory refinement changed native span");
+        }
+        super::rates::Rates::parse_six_eht(
+            &beacon.information_elements,
+            true,
+            selected.eht().is_some(),
+        )?;
+        let power = super::six_ghz_power::Constraints::parse_span(
+            selected.power_type(),
+            &beacon.information_elements,
+            ap_span,
+            span,
+        )?;
+        return Ok((
+            super::sc_security::Profile::from_plan(&plan, mode)?,
+            Arc::new(Profile {
+                plan: selected,
+                power,
+                nvm_flags,
+                span,
+                ap_span,
+                peer: beacon.bssid,
+            }),
+        ));
     }
-    super::rates::Rates::parse_six_eht(
-        &beacon.information_elements,
-        true,
-        selected.eht().is_some(),
-    )?;
-    let power = super::six_ghz_power::Constraints::parse(
-        selected.power_type(),
-        &beacon.information_elements,
-    )?;
-    Ok((
-        super::sc_security::Profile::from_plan(&plan, mode)?,
-        Arc::new(Profile {
-            plan: selected,
-            power,
-            nvm_flags,
-            peer: beacon.bssid,
-        }),
-    ))
+    Err("native6GHz has no complete source-qualified HE/EHT channel span")
 }
 
 impl Profile {
     pub fn channel(&self) -> Channel {
-        Channel::six(self.plan.channel().primary).unwrap()
+        self.span.primary
+    }
+    pub fn rule(
+        &self,
+        domain: &RegulatoryDomain,
+        firmware: Option<&super::mld_regulatory::Mcc>,
+    ) -> Option<RegRule> {
+        self.span.rule(domain, self.nvm_flags, firmware)
     }
     pub fn power_type(&self) -> PowerType6Ghz {
         self.plan.power_type()
@@ -224,7 +339,13 @@ impl Profile {
             || actual.he_operation != *self.plan.he().operation()
             || actual.capability != self.plan.peer_capability()
             || actual.operation != *self.plan.operation()
-            || super::six_ghz_power::Constraints::parse(self.power_type(), ies)? != self.power
+            || announced_span(ies, self.channel().number)? != self.ap_span
+            || super::six_ghz_power::Constraints::parse_span(
+                self.power_type(),
+                ies,
+                self.ap_span,
+                self.span,
+            )? != self.power
             || self
                 .plan
                 .eht()

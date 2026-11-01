@@ -8,6 +8,7 @@ pub(super) struct Widths {
     pub forty: bool,
     pub eighty: bool,
     pub one_sixty: bool,
+    pub three_twenty: bool,
 }
 impl Widths {
     pub fn permits(self, width: u8) -> bool {
@@ -16,6 +17,7 @@ impl Widths {
             1 => self.forty,
             2 => self.eighty,
             3 => self.one_sixty,
+            4 => self.three_twenty,
             _ => false,
         }
     }
@@ -63,16 +65,19 @@ impl Mcc {
                 forty: capability & (1 << 7) == 0,
                 eighty: capability & (1 << 3) != 0,
                 one_sixty: capability & (1 << 2) != 0,
+                three_twenty: false,
             },
             6 => Widths {
                 forty: capability & (1 << 8) != 0,
                 eighty: capability & (1 << 4) != 0,
                 one_sixty: capability & (1 << 3) != 0,
+                three_twenty: false,
             },
             8 => Widths {
                 forty: true,
                 eighty: capability & (1 << 4) != 0,
                 one_sixty: capability & (1 << 3) != 0,
+                three_twenty: capability & (1 << 16) != 0,
             },
             _ => unreachable!(),
         };

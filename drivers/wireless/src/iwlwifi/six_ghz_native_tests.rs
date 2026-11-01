@@ -665,7 +665,7 @@ kernel_test_in!(
     smoke_iwl_six_ghz_tpe_psd_and_current_host_nvm_mcc_ap_type_bounds
 );
 
-fn inject_data(frame: &[u8], band: u8, channel: u8, rate: u32, pn: u64) {
+pub(super) fn inject_data(frame: &[u8], band: u8, channel: u8, rate: u32, pn: u64) {
     let mut mac = vec![0; 30];
     mac[0] = 0x88;
     mac[1] = 0xc2;

@@ -89,12 +89,20 @@ pub(super) fn matches_native(
 /// Bounded source-profile HE capability, only for callers that separately
 /// proved the current NVM HE SKU, MCC bit13 and native firmware contract.
 pub(super) fn local(phy: super::ht_vht::Local, primary: u8) -> Result<LocalHe, &'static str> {
-    local_inner(phy, primary, false)
+    local_inner(phy, primary, false, 0)
 }
-pub(super) fn local_six(phy: super::ht_vht::Local) -> Result<LocalHe, &'static str> {
-    local_inner(phy, 1, true)
+pub(super) fn local_six_width(
+    phy: super::ht_vht::Local,
+    width: u8,
+) -> Result<LocalHe, &'static str> {
+    local_inner(phy, 1, true, width)
 }
-fn local_inner(phy: super::ht_vht::Local, primary: u8, six: bool) -> Result<LocalHe, &'static str> {
+fn local_inner(
+    phy: super::ht_vht::Local,
+    primary: u8,
+    six: bool,
+    six_width: u8,
+) -> Result<LocalHe, &'static str> {
     if !phy.ht
         || primary == 14
         || !(1..=2).contains(&phy.rx_streams)
@@ -105,7 +113,11 @@ fn local_inner(phy: super::ht_vht::Local, primary: u8, six: bool) -> Result<Loca
     }
     let mut capability = [0; 11];
     capability[0] = if six {
-        0
+        if six_width >= 1 {
+            4
+        } else {
+            0
+        }
     } else if primary <= 14 {
         2
     } else {
@@ -124,7 +136,9 @@ fn local_inner(phy: super::ht_vht::Local, primary: u8, six: bool) -> Result<Loca
         map(phy.tx_streams),
     )
     .map_err(|_| "MLD local HE source profile invalid")?;
-    if !six && primary > 14 && phy.supports160() {
+    if (!six && primary > 14 && phy.supports160())
+        || (six && six_width >= 3 && (phy.width160_channels != 0 || phy.six_widths[2] != 0))
+    {
         local
             .with_160mhz(map(phy.rx_streams), map(phy.tx_streams))
             .map_err(|_| "MLD local HE160 source profile invalid")
@@ -139,6 +153,7 @@ pub(super) struct Profile {
     pub tx_map: u16,
     tx80: u16,
     rx80: u16,
+    rx_wide_stbc: bool,
     rates_version: u8,
     /// ACI-indexed three-byte source records, not firmware AC order.
     mu_edca: Option<[[u8; 3]; 4]>,
@@ -158,8 +173,9 @@ impl Profile {
         let tx_map = negotiation.tx_mcs_map() | if single_stream { 0xfffc } else { 0 };
         let local = negotiation.local_capability();
         let local = HeCapability::parse(&local[1..])
-            .map_err(|_| "MLD retained local HE capability invalid")?
-            .mcs_nss();
+            .map_err(|_| "MLD retained local HE capability invalid")?;
+        let rx_wide_stbc = local.phy_capability()[7] & 0x80 != 0;
+        let local = local.mcs_nss();
         let peer = negotiation.peer_capability().mcs_nss();
         let mut tx80 = 0xffffu16;
         for nss in 0..2 {
@@ -177,6 +193,7 @@ impl Profile {
             tx_map,
             tx80,
             rx80: local.rx80,
+            rx_wide_stbc,
             rates_version,
             mu_edca,
             uora,
@@ -258,7 +275,11 @@ impl Profile {
             Width::OneSixty => 3,
         };
         let coding = u32::from(self.negotiation.rx_ldpc()) << 16
-            | u32::from(self.negotiation.rx_stbc()) << 17;
+            | u32::from(if width > 2 {
+                self.rx_wide_stbc
+            } else {
+                self.negotiation.rx_stbc()
+            }) << 17;
         let kind = (rate >> 23) & 3;
         let gi = (rate >> 20) & 7;
         mcs <= highest

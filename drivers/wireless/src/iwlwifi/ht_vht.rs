@@ -13,6 +13,7 @@ pub struct Local {
     pub he: bool,
     /// Exact boot RF/core103 source, independent of NVM HE SKU facts.
     pub(super) eht: bool,
+    pub(super) eht_320: bool,
     pub tx_streams: u8,
     pub rx_streams: u8,
     /// Raw, valid 5GHz NVM_CHANNEL_160MHZ facts in station_api's channel
@@ -23,6 +24,8 @@ pub struct Local {
     pub(super) native_rates: u8,
     /// Raw valid/VLP/AFC6GHz NVM tail bitmaps, in channel1+4k order.
     pub(super) six_channels: [u64; 3],
+    /// Actual raw6GHz NVM 40/80/160 channel flags; no invented320 bit.
+    pub(super) six_widths: [u64; 3],
 }
 
 impl Local {
@@ -33,16 +36,19 @@ impl Local {
             vht: sku & 12 == 12,
             he: sku & 20 == 20,
             eht: false,
+            eht_320: false,
             tx_streams: tx.count_ones().min(limit) as u8,
             rx_streams: rx.count_ones().min(limit) as u8,
             width160_channels: 0,
             native_rates: 0,
             six_channels: [0; 3],
+            six_widths: [0; 3],
         }
     }
 
     pub(super) fn with_nvm_channels(mut self, flags: &[u32]) -> Self {
         self.six_channels = [0; 3];
+        self.six_widths = [0; 3];
         self.width160_channels = flags
             .iter()
             .take(51)
@@ -59,6 +65,9 @@ impl Local {
                 self.six_channels[0] |= 1 << index;
                 self.six_channels[1] |= u64::from(flags & (1 << 13) != 0) << index;
                 self.six_channels[2] |= u64::from(flags & (1 << 14) != 0) << index;
+                for (width, map) in self.six_widths.iter_mut().enumerate() {
+                    *map |= u64::from(flags & (1 << (9 + width)) != 0) << index;
+                }
             }
         }
         self
@@ -510,7 +519,8 @@ impl Negotiated {
         body[14] = if self.width == 0 {
             0
         } else {
-            (distance.saturating_sub(2) / 4) | if primary > self.center { 4 } else { 0 }
+            let offset = distance.saturating_sub(2) / 4;
+            (offset & 3) | ((offset & 4) << 1) | if primary > self.center { 4 } else { 0 }
         };
         body[28] = body[14] ^ 4;
     }

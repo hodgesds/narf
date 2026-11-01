@@ -314,9 +314,18 @@ count, not a claim that their deferred release/native gates passed. Partial
 6 GHz/P2P/MLO work remains in the remaining ledger. Full validation and the
 recorded ARM regression investigation remain outstanding.
 
+**Source implementation recount 2026-10-31** (native320 written, validation deferred):
+the remaining ledger holds **100 `feature`** rows (99 driver, 1 shared),
+**31 `chip`** and **0 `unknown`**. Seven source-complete features are now
+listed in `research/implemented-pending-validation.tsv`, including actual
+Sc/Bz contiguous6GHz320MHz ownership. Exact RF/SKU/bandwidth, constituent
+facts, MCC/host span, TPE/PSD and native PHY/TLC/RFH rules are implemented;
+six new native cases are written. This credits implementation without
+claiming their deferred compile/native/release matrix passed.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 6 | Wider bands/widths and MLO; AP/P2P/WoW; exact admitted station/HE/TX A-MSDU and idle/associated periodic-scan profiles are software-validated |
+| iwlwifi | 5 | 6GHz discovery/periodic/refinement and MLO; AP/P2P/WoW; exact admitted station/HE/TX A-MSDU and idle/associated periodic-scan profiles are software-validated |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 4 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA; hosted loadable packet ABI is implemented pending validation |
 | ath10k | 18 | 2.4-GHz HT40/coexistence, additional streams/TX STBC and VHT160/80+80, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload |

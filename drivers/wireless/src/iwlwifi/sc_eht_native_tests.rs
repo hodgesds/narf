@@ -31,6 +31,15 @@ impl Default for Model {
     }
 }
 impl Model {
+    pub(super) fn wide_source(wh: bool, reduced: bool, subsystem: u16) -> Self {
+        Self {
+            wh,
+            reduced,
+            subsystem,
+            six: true,
+            ..Self::default()
+        }
+    }
     pub fn radio(self) -> u32 {
         if self.wh {
             0x20113100

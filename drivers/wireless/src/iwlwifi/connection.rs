@@ -213,6 +213,7 @@ impl Connection {
                     forty: true,
                     eighty: true,
                     one_sixty: true,
+                    three_twenty: false,
                 },
             },
             1,
@@ -287,6 +288,7 @@ impl Connection {
         //6GHz admission precedes even receive-queue I/O. MVM API59 and
         // AP-power API1 are source facts, never inferred from the channel.
         local_phy.eht &= hw.eht_supported();
+        local_phy.eht_320 &= local_phy.eht && hw.eht_320_supported();
         let six_preflight = if beacon.band == super::native_band::Band::Six {
             if !hw.band_in_rx_supported()
                 || !super::sc_he::native_supported(hw)
@@ -367,11 +369,15 @@ impl Connection {
             local_phy.he = false;
         }
         local_phy.eht &= local_phy.he && permissions.eht_allowed && hw.eht_supported();
-        if local_phy != original_local {
+        if six.is_none() && local_phy != original_local {
             profile = super::sc_security::Profile::negotiate(&beacon, local, &auth, local_phy)?;
         }
         let phy = if let Some(six) = &six {
-            super::ht_vht::Negotiated::he_six(beacon.channel, six.plan.peer_capability())
+            let mut phy =
+                super::ht_vht::Negotiated::he_six(beacon.channel, six.plan.peer_capability());
+            phy.width = six.span.width;
+            phy.center = six.span.center;
+            phy
         } else {
             super::ht_vht::Negotiated::parse_with_offer(
                 local_phy,
@@ -419,7 +425,7 @@ impl Connection {
             )?
         };
         let max_power = if let Some(six) = &six {
-            super::six_ghz_station::rule(domain, six.channel(), six.nvm_flags, Some(&permissions))
+            six.rule(domain, Some(&permissions))
                 .filter(|rule| rule.allows_6ghz_client(six.power_type()))
                 .map(|rule| rule.max_power_dbm)
                 .ok_or("6GHz current host/NVM/MCC power prohibited")?
@@ -720,7 +726,7 @@ impl Connection {
                 super::sc_he::rates_version(hw).ok_or("6GHz native HE rate ABI changed")?,
             )?);
             if let Some(eht) = six.plan.eht() {
-                this.eht = Some(super::sc_eht::Profile::new(
+                this.eht = Some(super::sc_eht::Profile::new_six(
                     *eht,
                     eht,
                     this.he.as_ref().unwrap(),
@@ -785,7 +791,7 @@ impl Connection {
             return Err("association response exceeds native MCC width capability");
         }
         let final_power = if let Some(six) = &this.six {
-            super::six_ghz_station::rule(domain, six.channel(), six.nvm_flags, Some(&permissions))
+            six.rule(domain, Some(&permissions))
                 .filter(|rule| rule.allows_6ghz_client(six.power_type()))
                 .map(|rule| rule.max_power_dbm)
                 .ok_or("6GHz response lost native channel power")?

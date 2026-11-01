@@ -2136,24 +2136,28 @@ describe the remaining native paths.
   FM/WH core103 HE20/40/80 are software-validated at `62b62ea68`, including
   the source-correct MLD/MVM rate namespaces. All521 Intel native cases
   pass on both architectures. Physical qualification remains separate.
-- **eht (bounded source draft; acceptance pending).** §3.64 implements
+- **eht (implemented; validation pending).** §3.64 implements
   single-link native EHT on actual admitted Sc/Bz FM/WH core103 sources,
   with directional TLC/STA/RFH contracts and WPA3/PMF on existing native
   spans, including6GHz20. The new source and six native compositions have
-  not yet passed coordinated compilation/native/release acceptance.
-  Optional EHT features and physical qualification remain continuations.
-- **width_320, mlo (open).** §3.64 keeps320MHz and multiple live link/peer
-  owners disabled.320 needs actual raw NVM/MCC/AP span and native extended
-  control-position/rate ownership. MLO needs shared ML association/security
-  and per-link native lifetime/control ownership. These features and EHT
-  do not apply to AX200/AX201 hardware.
-- **six_ghz (open; HE20 draft pending acceptance).** §3.63 implements
+  not yet passed coordinated native/release acceptance. The implemented
+  admitted-profile baseline is complete independently of the optional,
+  unadvertised4096QAM/extra-LTF/beamforming/puncturing enhancements.
+- **width_320 (implemented; validation pending).** §3.65 implements
+  actual RF/SKU/bandwidth/MCC admission, every constituent NVM/MCC/host
+  fact, full-span power and native extended control-position/rate ownership.
+  Coordinated compilation/native/release acceptance remains pending.
+- **mlo (open).** Multiple live link/peer owners remain disabled. MLO
+  needs shared ML association/security and per-link native lifetime/control
+  ownership. MLO,320MHz and EHT do not apply to AX200/AX201 hardware.
+- **six_ghz (open; implemented passive/wide station path).** §3.63 implements
   explicit NVM/UMAC/RFH/cache/policy band identity and a shared6GHz
   JoinPlan for AP20/STA20 SAE-H2E/PMF on admitted Sc/API89/Bz profiles,
   including actual AP power constraints and host/NVM/MCC type limits.
   Coordinated compilation/native/release acceptance is still pending.
-  Active/RNR and periodic6GHz, wider native spans, general response
-  refinement and in-place TPE replacement remain continuations.
+  §3.65 extends actual native spans through HE160/EHT320. Active/RNR
+  and periodic6GHz, general response refinement and in-place TPE replacement
+  remain continuations.
   AX200/AX201 has no6GHz hardware.
 - **gen2_sae_ext_key, gen2_wpa2_pmf.** §3.45 implements the native
   continuations: negotiated group19 SAE-EXT-KEY AKM24, and WPA2 PMF with
@@ -3822,7 +3826,7 @@ owned by `wireless/src/association/{six_ghz,he,sae_join}.rs`.
 - IEEE Std 802.11-2020.
 
 
-### 3.64 Bounded native single-link EHT continuation (acceptance pending)
+### 3.64 Native single-link EHT implementation (validation pending)
 
 **Source contract.** `sc_eht` admits only the already supported Sc A0 and
 Bz B0 non-CDB core103 station producer/consumer profiles with actual FM/WH
@@ -3890,12 +3894,72 @@ Standalone formatting/static review has run. Coordinated compilation,
 both-architecture native execution, ordinary boots and release gates are
 pending; no physical Wi-Fi qualification is claimed.
 
-**Remaining continuations.**320MHz needs source-qualified NVM/MCC and all
-sixteen20MHz constituents, actual EHT operation/control-position/rate
-contracts and native6GHz wider power ownership. MLO needs Basic ML parse
+**Separate continuations.** §3.65 implements320MHz, including source-qualified
+NVM/MCC and all sixteen20MHz constituents, actual EHT operation/control-position/
+rate contracts and native6GHz wider power ownership. MLO needs Basic ML parse
 and association, MLD/link address and key/EAPOL scope, multiple retained
 PHY/LINK/STA/queue owners, per-link power/PN/reorder lifetimes and public
 control teardown semantics. Optional EHT4096QAM/MCS12–13, extra-LTF,
-beamforming and dynamic puncturing remain explicit follow-on scope. This
-source-complete admitted EHT profile is implemented with validation pending;
-`width_320` and `mlo` retain their separate implementation rows.
+beamforming and dynamic puncturing remain explicit, unadvertised follow-on
+scope. The admitted-profile single-link EHT baseline is implemented; its
+software acceptance remains pending. MLO retains its independent open row.
+
+### 3.65 Native contiguous6GHz widths through EHT320 (validation pending)
+
+**Actual source and channel facts.** The admitted §3.64 Sc/Bz FM/WH core103
+owner emits320 support only for the actual full-bandwidth RF/subsystem
+configuration and an unreduced FM SKU. WH bit25 is not an FM reduced-SKU
+alias. Exact limited160 subsystem matches and more-specific full-bandwidth
+Killer matches retain their independent Linux configuration semantics.
+Gen2 and the admitted API89 Wi-Fi6/6E profiles do not acquire EHT320 support.
+MCCv8 bit16 permits320 independently of the HE/EHT prohibitions.
+
+`six_ghz_span` retains an explicit primary band, true selected center and
+width and checks every occupied20MHz channel before native PHY publication.
+Both320 rasters and every primary position are supported on complete native
+NVM spans within channels1..233. All sixteen actual raw NVM VALID facts,
+MCC VALID/ACTIVE/non-radar facts, AP-type limits and overlapping current host
+restrictions must permit the320 span. Linux has no NVM_CHANNEL_320MHZ bit;
+NO_160 is independent of NO_320. The native owner therefore preserves the
+actual40/80/160 NVM/MCC facts for narrower operation without inventing a320
+bit or requiring160 permission on every320 constituent. A missing wide-span
+fact selects a genuine primary160/80/40/20 shared plan, not a relabelled PHY.
+The shared planning ceiling also bounds HE40 independently of its joint40/80
+capability bit. Current copied MCC/host programs retain the complete span.
+
+**Native command, power and receive ownership.** HE capabilities describe
+at most160; EHT carries the actual optional third320 matrix. PHY_CONTEXTv6
+width4 uses the extended control-position bit and matching secondary position.
+TLCv6 mode4/width4 retains separate directional <=80/160/320 matrices; the
+bounded320 local matrix promises only MCS0..9, which also remains valid on
+Linux slow-PCIe/FORCE_URM sources. MAC/STA/link/key authority retains §3.64's
+response and native receipt ordering. Optional EHT prohibition retains a
+genuine HE6GHz plan when the AP does not require EHT.
+
+AP_TX_POWER_CONSTRAINTS_CMD retains its five EIRP slots and sixteen PSD slots.
+The N primary-HE-block and K remaining-channel TPE values are reordered by
+actual AP frequency before selecting the native occupied span. Every occupied
+-128 PSD value refuses publication; a prohibition outside a narrower selected
+span does not leak into it. Bound live/response operation or power changes
+require reassociation. The final-send gate remains after native credit polling
+and at both actual assisted publication boundaries, including a stricter TPE
+beyond the64-notification receive budget. Current MCC320 withdrawal invalidates
+all copied programs even when HE and EHT remain legal.
+
+Original RFH-v3 EHT format5 width4, all directional local RX maps, separate
+above80 STBC promises and source-qualified MCS/GI/coding bounds are checked
+before PN/reorder mutation. Wrong-band numeric aliases, HE320, UHR and
+unadvertised MCS10+/extra-LTF/beamforming/duplicate forms are refused. Existing
+band-qualified receive, key and LMAC FIFO ownership is retained.
+
+**Written evidence.** Six cases in `drivers/wireless/iwlwifi/six_ghz_320`
+cover Sc/Bz, both rasters/all primary positions, real20/40/80/160 operation,
+RF/SKU/subsystem/MCC fallback, every constituent NVM/MCC hole, raw NO_160
+independence, overlapping host/AP-type restrictions, literal N/K/fifth-EIRP
+power bytes, occupied PSD prohibition, original invalid RFH/same-PN behavior,
+queued power tightening, copied-proof retirement and dropped held-power
+owners. These source and fixture changes have undergone standalone formatting
+and static review. Coordinated compilation, both-architecture native execution,
+ordinary boots and release gates remain pending. Physical acceptance remains
+separate; this implementation does not claim active/RNR/periodic6GHz scan or
+multiple live MLO links.

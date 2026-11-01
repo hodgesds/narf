@@ -127,14 +127,44 @@ pub(super) fn local(
         Ok(result)
     }
 }
+pub(super) fn local_six_width(
+    phy: super::ht_vht::Local,
+    he: &narf_wireless::association::he::LocalHe,
+    width: u8,
+) -> Result<LocalEht, &'static str> {
+    if width == 0 {
+        return local(phy, None);
+    }
+    let nss = phy.rx_streams | (phy.tx_streams << 4);
+    let mut physical = [0; 9];
+    physical[5] = 0x20;
+    let local =
+        LocalEht::new([0; 2], physical, [nss, nss, 0]).map_err(|_| "6GHz EHT wide maps invalid")?;
+    let local = if he.capability().phy_capability()[0] & 8 != 0 {
+        local
+            .with_160mhz([nss, nss, 0])
+            .map_err(|_| "6GHz EHT160 maps invalid")?
+    } else {
+        local
+    };
+    if width == 4 && phy.eht_320 && he.capability().phy_capability()[0] & 8 != 0 {
+        // MCS0..9 is valid even for Linux's slow-PCIe/FORCE_URM cases;
+        // those restrict320 MCS11/13, independently of reduced-SKU/BW.
+        local
+            .with_320mhz([nss, 0, 0])
+            .map_err(|_| "6GHz EHT320 maps invalid")
+    } else {
+        Ok(local)
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct Profile {
     pub negotiation: EhtNegotiation,
     tx: [[u32; 3]; 2],
-    rx: [[u8; 4]; 2],
+    rx: [[u8; 4]; 3],
     extension: [[[u8; 2]; 5]; 2],
-    rx_coding: u32,
+    rx_coding: [u32; 2],
 }
 impl Profile {
     #[inline(never)]
@@ -144,42 +174,64 @@ impl Profile {
         he: &super::sc_he::Profile,
         static_smps: bool,
     ) -> Result<alloc::sync::Arc<Self>, &'static str> {
-        if negotiation.width320() || negotiation.width() != he.negotiation.width() {
+        Self::new_inner(negotiation, original, he, static_smps, false)
+    }
+    pub fn new_six(
+        negotiation: EhtNegotiation,
+        original: &EhtNegotiation,
+        he: &super::sc_he::Profile,
+        static_smps: bool,
+    ) -> Result<alloc::sync::Arc<Self>, &'static str> {
+        Self::new_inner(negotiation, original, he, static_smps, true)
+    }
+    #[inline(never)]
+    fn new_inner(
+        negotiation: EhtNegotiation,
+        original: &EhtNegotiation,
+        he: &super::sc_he::Profile,
+        static_smps: bool,
+        six: bool,
+    ) -> Result<alloc::sync::Arc<Self>, &'static str> {
+        if !six && (negotiation.width320() || negotiation.width() != he.negotiation.width()) {
             return Err("native EHT span differs from retained HE/PHY owner");
         }
         let local = negotiation.local_capability();
-        let local = EhtCapability::parse(&local[1..], he.negotiation.local_capability()[7], false)
+        let he_local = he.negotiation.local_capability();
+        let local = EhtCapability::parse(&local[1..], he_local[7], false)
             .map_err(|_| "native retained EHT local capability invalid")?;
         let peer = negotiation.peer_capability();
         let mut tx = [[0; 3]; 2];
-        let mut rx = [[0; 4]; 2];
-        let ranges = |cap: &EhtCapability, wide: bool| -> [u8; 4] {
+        let mut rx = [[0; 4]; 3];
+        let ranges = |cap: &EhtCapability, slot: usize| -> [u8; 4] {
             let set = cap.mcs_nss();
             if set.len() == 4 {
                 return set.try_into().unwrap();
             }
-            let at = if wide { 3 } else { 0 };
+            let at = 3 * slot;
             if set.len() < at + 3 {
                 return [0; 4];
             }
             [set[at], set[at], set[at + 1], set[at + 2]]
         };
-        for slot in 0..=usize::from(negotiation.width() == Width::OneSixty) {
-            let ours = ranges(&local, slot == 1);
-            let theirs = ranges(peer, slot == 1);
-            let offered = ranges(original.peer_capability(), slot == 1);
+        let selected = if negotiation.width320() {
+            2
+        } else {
+            usize::from(negotiation.width() == Width::OneSixty)
+        };
+        for slot in 0..=selected {
+            let ours = ranges(&local, slot);
+            let theirs = ranges(peer, slot);
+            let offered = ranges(original.peer_capability(), slot);
             rx[slot] = ours.map(|nss| nss & 15);
             for (range, mask) in [0xff, 0x300, 0xc00, 0x3000].into_iter().enumerate() {
                 let streams = (ours[range] >> 4)
                     .min(theirs[range] & 15)
                     .min(offered[range] & 15)
-                    .min(
-                        if slot == usize::from(negotiation.width() == Width::OneSixty) {
-                            negotiation.tx_max_nss()[range]
-                        } else {
-                            2
-                        },
-                    )
+                    .min(if slot == selected {
+                        negotiation.tx_max_nss()[range]
+                    } else {
+                        2
+                    })
                     .min(2);
                 for (stream, rates) in tx.iter_mut().enumerate().take(usize::from(streams)) {
                     if stream == 0 || !static_smps {
@@ -197,8 +249,12 @@ impl Profile {
             tx,
             rx,
             extension,
-            rx_coding: u32::from(he.negotiation.rx_ldpc()) << 16
-                | u32::from(he.negotiation.rx_stbc()) << 17,
+            rx_coding: [
+                u32::from(he.negotiation.rx_ldpc()) << 16
+                    | u32::from(he.negotiation.rx_stbc()) << 17,
+                u32::from(he.negotiation.rx_ldpc()) << 16
+                    | u32::from(he_local[14] & 0x80 != 0) << 17,
+            ],
         }))
     }
     pub fn apply_sta(&self, bytes: &mut [u8; 104]) {
@@ -222,6 +278,16 @@ impl Profile {
         bytes[26] = 1;
     }
     pub fn apply_tlc(&self, bytes: &mut [u8; 44]) {
+        bytes[8] = if self.negotiation.width320() {
+            4
+        } else {
+            match self.negotiation.width() {
+                Width::Twenty => 0,
+                Width::Forty => 1,
+                Width::Eighty => 2,
+                Width::OneSixty => 3,
+            }
+        };
         bytes[9] = 4; // IWL_TLC_MNG_MODE_EHT, not a HE capability alias.
         bytes[11] = 0;
         // Linux retains the actual negotiated HE coding flags for EHT.
@@ -240,11 +306,15 @@ impl Profile {
             return false;
         }
         let width = (rate >> 11) & 7;
-        let maximum = match self.negotiation.width() {
-            Width::Twenty => 0,
-            Width::Forty => 1,
-            Width::Eighty => 2,
-            Width::OneSixty => 3,
+        let maximum = if self.negotiation.width320() {
+            4
+        } else {
+            match self.negotiation.width() {
+                Width::Twenty => 0,
+                Width::Forty => 1,
+                Width::Eighty => 2,
+                Width::OneSixty => 3,
+            }
         };
         let mcs = rate & 31;
         let range = match mcs {
@@ -254,7 +324,11 @@ impl Profile {
             12..=13 => 3,
             _ => return false,
         };
-        let slot = usize::from(width == 3);
+        let slot = match width {
+            3 => 1,
+            4 => 2,
+            _ => 0,
+        };
         let nss = 1 + ((rate >> 5) & 1);
         let kind = (rate >> 23) & 3;
         let gi = (rate >> 20) & 7;
@@ -265,7 +339,12 @@ impl Profile {
             && kind != 1
             && gi <= if kind == 3 { 2 } else { 3 }
             && (gi != 2 || kind == 3)
-            && rate & (0xc0 | ((15 << 16) & !self.rx_coding) | (7 << 25) | (15 << 28)) == 0
+            && rate
+                & (0xc0
+                    | ((15 << 16) & !self.rx_coding[usize::from(width > 2)])
+                    | (7 << 25)
+                    | (15 << 28))
+                == 0
     }
     pub fn matches(&self, ies: &[u8], he: &HeCapability) -> bool {
         matches(&self.negotiation, ies, he)

@@ -66,12 +66,11 @@ cyw43439	system_suspend	System suspend	feature	drivers/wireless/specification/cy
 cyw43439	transport_reset	Confirmed native transport reset	feature	drivers/wireless/specification/cyw43439.md	515
 cyw43439	virtual_interfaces	Additional virtual interfaces	feature	drivers/wireless/specification/cyw43439.md	519
 cyw43439	wake_on_wireless	Wake on Wireless (WoW)	feature	drivers/wireless/specification/cyw43439.md	518
-iwlwifi	ap	AP role	feature	drivers/wireless/specification/iwlwifi.md	2194
-iwlwifi	mlo	MLO on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	2145
-iwlwifi	p2p	P2P role	feature	drivers/wireless/specification/iwlwifi.md	2197
-iwlwifi	six_ghz	Explicit-band passive6GHz discovery and AP20/STA20 HE SAE-H2E/PMF station ownership are implemented for admitted Sc/API89/Bz profiles, with actual NVM/RFH band, host/MCC/AP power-type/TPE constraints and final native publication gates. Reviewed release native-context Clippy passes; six new native cases await release acceptance. Active/RNR discovery, wider and periodic operation, refinement and live AP-type/TPE replacement remain.	feature	drivers/wireless/specification/iwlwifi.md	3740
-iwlwifi	width_320	320MHz operation on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	2145
-iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	2199
+iwlwifi	ap	AP role	feature	drivers/wireless/specification/iwlwifi.md	2198
+iwlwifi	mlo	MLO on applicable Wi-Fi7 profiles	feature	drivers/wireless/specification/iwlwifi.md	2150
+iwlwifi	p2p	P2P role	feature	drivers/wireless/specification/iwlwifi.md	2201
+iwlwifi	six_ghz	Explicit-band passive6GHz discovery and AP20/STA20 HE SAE-H2E/PMF station ownership are implemented for admitted Sc/API89/Bz profiles, with actual NVM/RFH band, host/MCC/AP power-type/TPE constraints and final native publication gates. Reviewed release native-context Clippy passes; six new native cases await release acceptance. Active/RNR discovery, wider and periodic operation, refinement and live AP-type/TPE replacement remain.	feature	drivers/wireless/specification/iwlwifi.md	3744
+iwlwifi	wow	Wake on WLAN	feature	drivers/wireless/specification/iwlwifi.md	2203
 mt76	native_key_pipeline_retirement	Native old-key firmware/MAC/FIFO pipeline retirement	feature	drivers/wireless/specification/mt7921.md	2397
 mt76	noncoherent_dma	Non-coherent platform DMA support	feature	drivers/wireless/specification/mt7921.md	2281
 mt76	p2p_mode	Independent device/CNM/finite ROC, control NEW/DEL, management RX and current-ROC management TX are software-validated at aa6b98463. Private native management ROC and requested NO_CCK are implemented with four additional native cases pending release acceptance. Qualified6GHz emission and independent client/GO peer/key/data contexts remain.	feature	drivers/wireless/specification/mt7921.md	532

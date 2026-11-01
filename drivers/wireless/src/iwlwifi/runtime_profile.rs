@@ -37,6 +37,12 @@ impl Hardware {
         }) && self.uses_mld_station_protocol()
             && super::super::sc_he::rates_version(self) == Some(3)
     }
+    pub(in crate::iwlwifi) fn eht_320_supported(&mut self) -> bool {
+        self.eht_supported()
+            && self
+                .eht_source
+                .is_some_and(|source| source.bandwidth_limit >= 320 && !source.reduced)
+    }
     pub(in crate::iwlwifi) fn prepare_station_profile(
         &mut self,
         parsed: &ParsedUcode<'_>,

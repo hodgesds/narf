@@ -226,8 +226,8 @@ impl Program {
             validity,
             firmware: Arc::new(IrqSafeSpinLock::new(firmware)),
             primary: channel.number,
-            width: 0,
-            center: channel.number,
+            width: profile.span.width,
+            center: profile.span.center,
             applied_dbm: Arc::new(AtomicI8::new(applied_dbm)),
             qos,
             he: true,
@@ -267,17 +267,10 @@ impl Program {
         firmware: &super::mld_regulatory::Mcc,
     ) -> Option<i8> {
         if let Some((power_type, nvm_flags)) = self.six {
-            return super::six_ghz_station::rule(
-                domain,
-                super::native_band::Channel {
-                    band: self.band,
-                    number: self.primary,
-                },
-                nvm_flags,
-                Some(firmware),
-            )
-            .filter(|rule| rule.allows_6ghz_client(power_type))
-            .map(|rule| rule.max_power_dbm);
+            return super::six_ghz_span::Span::new(self.primary, self.width, self.center)?
+                .rule(domain, nvm_flags, Some(firmware))
+                .filter(|rule| rule.allows_6ghz_client(power_type))
+                .map(|rule| rule.max_power_dbm);
         }
         super::connection::channel_power_width(
             domain,
@@ -402,6 +395,7 @@ mod tests {
                         forty: true,
                         eighty: true,
                         one_sixty: true,
+                        three_twenty: false,
                     },
                 },
                 36,
@@ -481,6 +475,7 @@ mod tests {
                     forty: true,
                     eighty: true,
                     one_sixty: false,
+                    three_twenty: false,
                 },
             };
             for he_prohibition in [false, true] {

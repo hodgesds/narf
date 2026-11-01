@@ -225,6 +225,7 @@ struct Wire {
     mcc_permissions: Option<Vec<u32>>,
     six: Option<SixModel>,
     eht: Option<eht_tests::Model>,
+    wide_six: Option<wide_six_tests::Model>,
 }
 
 // SAFETY: no real device or thread accesses these fixture pointers. The sole
@@ -360,7 +361,10 @@ impl Wire {
                 response[24..28].copy_from_slice(&count.to_le_bytes());
                 for i in 0..count as usize {
                     let flags = if i >= 51 {
-                        self.six.map_or(0, |six| six.nvm_flags)
+                        self.wide_six.map_or_else(
+                            || self.six.map_or(0, |six| six.nvm_flags),
+                            |wide| wide.nvm_flags((i - 51) as u8),
+                        )
                     } else {
                         1u32 | if self.phy.is_some_and(|phy| phy.width == 3)
                             && (14..22).contains(&i)
@@ -430,7 +434,10 @@ impl Wire {
                     let permission = self.mcc_permissions.as_ref().map_or_else(
                         || {
                             if i >= 51 {
-                                self.six.map_or(permission, |six| six.mcc_flags)
+                                self.wide_six.map_or_else(
+                                    || self.six.map_or(permission, |six| six.mcc_flags),
+                                    |wide| wide.mcc_flags((i - 51) as u8),
+                                )
                             } else {
                                 permission
                             }
@@ -646,12 +653,16 @@ impl Wire {
             (4, 0xc) if self.six.is_some() => {
                 let six = self.six.unwrap();
                 require(
-                    body.len() == 28
-                        && half(body, 0) == 0
-                        && half(body, 2) == u16::from(six.regulatory)
-                        && body[4] == six.tpe as u8
-                        && body[5..25].iter().all(|&b| b == 127)
-                        && body[25..] == [0; 3],
+                    if let Some(wide) = self.wide_six {
+                        body == wide.expected_power().as_slice()
+                    } else {
+                        body.len() == 28
+                            && half(body, 0) == 0
+                            && half(body, 2) == u16::from(six.regulatory)
+                            && body[4] == six.tpe as u8
+                            && body[5..25].iter().all(|&b| b == 127)
+                            && body[25..] == [0; 3]
+                    },
                     "6GHz actual AP_TX_POWER_CONSTRAINTS wire",
                 )?;
                 if self.fault == Fault::HoldSixPower {
@@ -825,12 +836,16 @@ impl Wire {
                         band == 2 && record[4] == six.channel
                     });
                 if six_job {
-                    six_ghz_tests::complete_ap_frame(&mut beacon, six)?;
+                    if let Some(wide) = self.wide_six {
+                        wide.complete_ap_frame(&mut beacon)?;
+                    } else {
+                        six_ghz_tests::complete_ap_frame(&mut beacon, six)?;
+                    }
                 }
             } else if let Some(phy) = self.phy {
                 beacon.extend_from_slice(&he_tests::elements(phy, true));
             }
-            if let Some(eht) = self.eht {
+            if let Some(eht) = self.eht.filter(|_| self.wide_six.is_none()) {
                 beacon.extend_from_slice(&eht.elements(self.phy.unwrap(), false));
             }
             if self.sae_h2e_only {
@@ -1102,11 +1117,15 @@ impl Wire {
                 for mut response in responses {
                     if matches!(response[0], 0x10 | 0x30) {
                         if let Some(six) = self.six {
-                            six_ghz_tests::complete_ap_frame(&mut response, six)?;
+                            if let Some(wide) = self.wide_six {
+                                wide.complete_ap_frame(&mut response)?;
+                            } else {
+                                six_ghz_tests::complete_ap_frame(&mut response, six)?;
+                            }
                         } else if let Some(phy) = self.phy {
                             response.extend_from_slice(&he_tests::elements(phy, phy.response_he));
                         }
-                        if let Some(eht) = self.eht {
+                        if let Some(eht) = self.eht.filter(|_| self.wide_six.is_none()) {
                             response.extend_from_slice(&eht.elements(self.phy.unwrap(), true));
                         }
                     }
@@ -1201,7 +1220,7 @@ impl Wire {
                 0x500u32
             } else {
                 0x400u32
-            }) | if phy.width == 3 {
+            }) | if phy.width == 3 || self.wide_six.is_some() {
                 self.commands
                     .iter()
                     .rev()
@@ -1419,6 +1438,20 @@ impl Guard {
         model: NativeModel,
         eht: Option<eht_tests::Model>,
     ) -> R<Self> {
+        Self::build_native_wide(secured, fault, name, sources, phy, model, eht, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn build_native_wide(
+        secured: bool,
+        fault: Fault,
+        name: Option<&'static str>,
+        sources: Option<(&crate::firmware_asset::Asset, &crate::firmware_asset::Asset)>,
+        phy: Option<PhyModel>,
+        model: NativeModel,
+        eht: Option<eht_tests::Model>,
+        wide_six: Option<wide_six_tests::Model>,
+    ) -> R<Self> {
         let NativeModel {
             receive_model,
             tx_model,
@@ -1588,10 +1621,11 @@ impl Guard {
             scheduled: None,
             api89,
             bz,
-            mcc_caps_override: None,
+            mcc_caps_override: wide_six.map(|wide| wide.mcc_caps()),
             mcc_permissions: None,
             six,
             eht,
+            wide_six,
         });
         let configured = run(Device::configure(&mut hardware, OWN), || wire.service());
         let nvm = match configured {
@@ -2626,3 +2660,5 @@ kernel_test_in!(
 mod bz_station_tests;
 #[path = "sc_eht_native_tests.rs"]
 mod eht_tests;
+#[path = "six_ghz_wide_tests.rs"]
+mod wide_six_tests;
