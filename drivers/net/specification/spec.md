@@ -255,6 +255,40 @@ same reason: ARP resolution may synchronously re-enter the transmit hook.
 The driver does not advertise checksum or segmentation offloads until it emits
 the required context-plus-data descriptor sequence.
 
+IGB multi-queue, RSS, VLAN, WoL, ethtool, and PM surface: the per-queue
+register windows are the Linux `E1000_RDBAL/TDBAL` family (0x100 stride for
+queues 0..3, compact 0x40 stride for queues 4..7), with per-device queue caps
+(I211 2, I210/82575 4, I350/82576 8) and the SR-IOV interaction (I350 with VFs
+1, 82576 with VFs 2), queue pairing when queues exceed half the maximum, and
+IVAR routing in both the 82576 column-major and 82580+ row-major schemes with
+per-vector EITR. RSS programs the 40-byte key into RSSRK, the 128-entry
+indirection table into RETA (4 little-endian entries per word, 82576+SR-IOV
+shift 3), and MRQC hash fields plus the RSS-MQ / VMDq / VMDq+RSS-MQ modes;
+the RX descriptor lower word then carries the hash (RXCSUM PCSD) for
+hash-to-queue steering. VLAN RX filtering is the 128-word VFTA (VID/32 word,
+VID%32 bit, VID 0 restored by default, promiscuous mode sets all words);
+the RX descriptor VP bit gates the tag decode, software stripping deletes the
+4 TPID/TCI bytes, and TX insertion pairs a context descriptor (tag in
+bits[31:16] of `vlan_macip_lens`) with its data descriptor, whose reclaim
+completes the context only once the data descriptor shows DD. WoL uses
+WUC/WUFC/WUS with the port-A-or-NVM-APME support gates and the suspend
+program (runtime suspend arms link-change only, system suspend arms the
+caller's filters minus link-change when the link is up, an empty armed set
+powers the link down). The ethtool surface is a driver-local read struct
+(drvinfo, forced-link settings, ring parameters, EITR coalesce, pause
+parameters, WoL, RSS sizes, live RX/TX counters); set-side ops are absent.
+Suspend masks interrupts, disables queue 0, and arms WoL or stops DMA and
+powers the PHY down; resume clears WUS, re-kicks the PHY, restores RCTL/TCTL,
+re-runs the ENABLE handshake, and unmasks MSI-X. Detach masks and disables,
+clears WoL, drops the ISR MMIO base, gates the datapath, publishes link down,
+clears the RX-mirror attach note, and unregisters the interface. Live
+bring-up still arms queue 0 only and programs neither MRQC nor VFTA: the
+multi-queue activation and filter opt-in await a multi-queue test profile,
+and the iface offload advertisement stays off. SR-IOV/VMDq is not in this
+surface (VF mailbox, VMDq pools, and VF MAC filtering are a separate lane,
+filed as a follow-up issue); the queue-cap interaction with VFs above is
+encoded so that lane starts from the correct limits.
+
 ### 3.1 i40e runtime profile
 
 Each X710/XL710/XXV710/X722 PF negotiates 1–8 64-entry TX/RX pairs.
