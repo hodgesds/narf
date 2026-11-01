@@ -12422,11 +12422,17 @@ impl AddressSpace {
             let mut perms = region.perms;
             perms.0 &= !(RegionPerms::LOCKED.0 | RegionPerms::LOCK_ONFAULT.0);
             let shared = perms.contains(RegionPerms::SHARED);
-            // Linux page_needs_cow_for_dma: a pinned writable private page is
-            // copied for the child now. The parent keeps it exclusive and
-            // writable, so a GPU/DMA pin keeps aliasing the parent's memory
-            // instead of a frame left shared with the child. Copies are not
-            // COW retains: they are installed only after the region succeeds.
+            // Linux page_needs_cow_for_dma: a pinned private page is copied
+            // for the child now. The parent keeps it exclusive (and writable
+            // if it was), so a GPU/DMA pin keeps aliasing the parent's memory
+            // instead of a frame left shared with the child. Like Linux, whose
+            // test is the COW mapping and not the PTE write bit, this ignores
+            // the region's current protection: after mprotect(PROT_READ), a
+            // later PROT_WRITE would otherwise split the parent away from its
+            // pin. Every resident private frame is owned by this address space
+            // (private FILE_DEMAND faults install private copies), and special
+            // mappings cannot be pinned. Copies are not COW retains: they are
+            // installed only after the region succeeds.
             let mut copies: Vec<(usize, PhysAddr)> = Vec::new();
             // (retained prefix, error) of a failed region.
             let mut failure = None;
@@ -12443,7 +12449,7 @@ impl AddressSpace {
                             // owner decrement before clearing this marker, so
                             // no unprotected mapping is missed.
                             let pinned = crate::frame::cow::is_pinned(*page);
-                            if pinned && writable {
+                            if pinned {
                                 match copy_pinned_for_child(*page) {
                                     Ok(copy) => copies.push((page_index, copy)),
                                     Err(error) => {

@@ -431,10 +431,11 @@ impl UserPagePin {
 /// Pin acquisition is serialized with authoritative mapping changes. External
 /// RAM mappings require PINNABLE_RAM in addition to LOCK_EXEMPT; device PFNs
 /// cannot be pinned. Base-page pin references are tracked separately. Fork
-/// gives the child a private copy of every pinned writable private page
-/// (Linux page_needs_cow_for_dma) and leaves the parent's leaf writable and
-/// exclusive, so a DMA/GPU/pipe pin keeps aliasing the parent's memory and
-/// never a frame shared with the child (the CVE-2020-29374 class).
+/// gives the child a private copy of every pinned private page, whatever the
+/// region's current protection (Linux page_needs_cow_for_dma), and leaves the
+/// parent's leaf exclusive (and writable if it was), so a DMA/GPU/pipe pin
+/// keeps aliasing the parent's memory and never a frame shared with the child
+/// (the CVE-2020-29374 class), even across a later mprotect(PROT_WRITE).
 /// Physical migration to another node rejects pinned backing with
 /// AddressSpaceError::Pinned (move_pages reports per-page EBUSY).
 

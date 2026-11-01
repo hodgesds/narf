@@ -4769,7 +4769,7 @@ kernel_test_in!(
     smoke_memory_failed_fork_rolls_back_unpublished_cow_refs
 );
 
-/// page_needs_cow_for_dma: a pinned writable private page is copied for the
+/// page_needs_cow_for_dma: a pinned private page is copied for the
 /// fork child, so the pin keeps aliasing the parent's memory. Unpinned pages
 /// stay COW-shared and a failed fork releases the copies without touching
 /// the retain rollback.
@@ -4878,6 +4878,104 @@ fn smoke_memory_fork_copies_pinned_pages_for_child() -> TestResult {
     feature = "kernel-test"
 ))]
 kernel_test_in!("memory", smoke_memory_fork_copies_pinned_pages_for_child);
+
+/// The copy does not depend on the region's current protection: a page
+/// pinned and then made read-only is still copied for the child, so a later
+/// mprotect(PROT_WRITE) and parent write cannot split the parent away from
+/// its pin and leave device writes landing in a frame the child shares.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+fn smoke_memory_fork_copies_pinned_read_only_page() -> TestResult {
+    use crate::address_space::__test_fork_write_protected_pages;
+    use crate::frame::{self, cow};
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    cow::__test_clear();
+    // SAFETY: paging is live in the kernel-test harness and this test owns
+    // the fresh root until teardown.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(parent) => parent,
+        Err(_) => return TestResult::Skip("fork pin parent root unavailable"),
+    };
+    let Ok(pinned) = frame::alloc_frame() else {
+        return TestResult::Skip("fork pin frame unavailable");
+    };
+    let pinned = pinned.start_address();
+    let base = VirtAddr::new(0x0000_0080_3b10_0000);
+    // SAFETY: freshly allocated, exclusively owned frame.
+    unsafe { *pinned.kernel_mut_ptr::<u32>() = 0xb2b2_b2b2 };
+    if parent
+        .map_region(Region {
+            base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![pinned].into(),
+        })
+        .is_err()
+    {
+        return TestResult::Fail("fork pin VMA setup failed");
+    }
+    let Some(pin) = parent.pin_user_page(base) else {
+        return TestResult::Fail("ordinary RAM pin refused");
+    };
+    if parent
+        .mprotect_range(base, 0x1000, RegionPerms::READ)
+        .is_err()
+    {
+        return TestResult::Fail("mprotect(PROT_READ) of the pinned page failed");
+    }
+    let protected_before = __test_fork_write_protected_pages();
+    // SAFETY: exclusively owned inactive parent.
+    let child = match unsafe { parent.clone_for_fork() } {
+        Ok(child) => child,
+        Err(_) => return TestResult::Fail("clone_for_fork"),
+    };
+    let child_page = child.lookup(base).expect("child page").phys[0];
+    if child_page == pinned || cow::count(pinned) != 2 || cow::count(child_page) > 1 {
+        return TestResult::Fail("read-only pinned page was shared instead of copied");
+    }
+    if parent.lookup(base).expect("parent page").phys[0] != pinned {
+        return TestResult::Fail("fork moved the parent's pinned page");
+    }
+    if __test_fork_write_protected_pages() != protected_before {
+        return TestResult::Fail("fork write-protected a read-only page");
+    }
+    // SAFETY: the child's copy is a resident frame it exclusively owns.
+    if unsafe { *child_page.kernel_ptr::<u32>() } != 0xb2b2_b2b2 {
+        return TestResult::Fail("child copy lost the fork-time contents");
+    }
+    // Write access returns to the parent; its pin still aliases its page.
+    if parent
+        .mprotect_range(base, 0x1000, RegionPerms::READ | RegionPerms::WRITE)
+        .is_err()
+    {
+        return TestResult::Fail("mprotect(PROT_WRITE) of the pinned page failed");
+    }
+    if parent.lookup(base).expect("parent page").phys[0] != pinned {
+        return TestResult::Fail("restoring write split the parent from its pin");
+    }
+    // SAFETY: the pin retains this frame; this test is its only writer.
+    unsafe { *(pin.phys().kernel_mut_ptr::<u32>()) = 0x6666_6666 };
+    // SAFETY: as above, the child's private copy.
+    if unsafe { *child_page.kernel_ptr::<u32>() } != 0xb2b2_b2b2 {
+        return TestResult::Fail("pinned DMA leaked into the fork child");
+    }
+    drop(child);
+    drop(pin);
+    drop(parent);
+    if cow::count(pinned) != 0 {
+        return TestResult::Fail("teardown left COW metadata");
+    }
+    cow::__test_clear();
+    TestResult::Pass
+}
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+kernel_test_in!("memory", smoke_memory_fork_copies_pinned_read_only_page);
 
 /// The first fork write-protects exactly the resident writable private
 /// pages it newly shares; a repeated fork of the unchanged parent selects
