@@ -352,6 +352,8 @@ pub const fn rx_vlan_tag(opts2: u32) -> Option<u16> {
 pub struct WolOpts(pub u8);
 
 impl WolOpts {
+    /// No wake source.
+    pub const NONE: WolOpts = WolOpts(0);
     /// Wake on link-up (`WAKE_PHY`).
     pub const PHY: WolOpts = WolOpts(1 << 0);
     /// Wake on unicast frame (`WAKE_UCAST`).
@@ -887,6 +889,94 @@ pub unsafe fn apply_rss<R: RegFile>(regs: &mut R, queues: usize, key: &[u8], ind
 pub unsafe fn apply_rss_single_queue<R: RegFile>(regs: &mut R) {
     // SAFETY: caller owns the register window (see [`RegFile`]).
     unsafe { regs.write32(REG_RSS_CTRL_8125, 0) };
+}
+
+// ── MAC version decode (TxConfig XID) ───────────────────────────────
+
+/// One row of Linux's `rtl_chip_infos` table, in file order:
+/// `(xid_mask, xid_value, mac_version)`. First match wins —
+/// masks overlap (0x7cf / 0x7c8 / 0xfc8), so order is load-bearing.
+/// The input XID is `(TxConfig >> 20) & 0xfcf` (Linux line 6848).
+/// The `VER_EXTENDED` and `0x7fffffff` sentinels are omitted:
+/// they carry no version.
+const XID_TABLE: &[(u32, u32, u32)] = &[
+    (0x7cf, 0x6c9, 80),
+    (0x7cf, 0x64a, 70),
+    (0x7cf, 0x649, 70),
+    (0x7cf, 0x681, 66),
+    (0x7cf, 0x708, 65),
+    (0x7cf, 0x68b, 64),
+    (0x7cf, 0x68a, 64),
+    (0x7cf, 0x689, 64),
+    (0x7cf, 0x688, 64),
+    (0x7cf, 0x641, 63),
+    (0x7cf, 0x609, 61),
+    (0x7cf, 0x54b, 52),
+    (0x7cf, 0x54a, 52),
+    (0x7cf, 0x502, 51),
+    (0x7cf, 0x541, 46),
+    (0x7cf, 0x6c0, 46),
+    (0x7cf, 0x5c8, 44),
+    (0x7cf, 0x509, 42),
+    (0x7cf, 0x4c0, 40),
+    (0x7c8, 0x488, 38),
+    (0x7cf, 0x481, 36),
+    (0x7cf, 0x480, 35),
+    (0x7c8, 0x2c8, 34),
+    (0x7cf, 0x2c1, 32),
+    (0x7c8, 0x2c0, 33),
+    (0x7cf, 0x281, 25),
+    (0x7c8, 0x280, 26),
+    (0x7cf, 0x28a, 28),
+    (0x7cf, 0x28b, 31),
+    (0x7cf, 0x3c9, 23),
+    (0x7cf, 0x3c8, 18),
+    (0x7c8, 0x3c8, 24),
+    (0x7cf, 0x3c0, 19),
+    (0x7cf, 0x3c2, 20),
+    (0x7cf, 0x3c3, 21),
+    (0x7c8, 0x3c0, 22),
+    (0x7c8, 0x380, 17),
+    (0x7c8, 0x448, 39),
+    (0x7c8, 0x440, 37),
+    (0x7cf, 0x409, 29),
+    (0x7c8, 0x408, 30),
+    (0x7cf, 0x349, 8),
+    (0x7cf, 0x249, 8),
+    (0x7cf, 0x348, 7),
+    (0x7cf, 0x248, 7),
+    (0x7cf, 0x240, 14),
+    (0x7c8, 0x348, 9),
+    (0x7c8, 0x248, 9),
+    (0x7c8, 0x340, 10),
+    (0xfc8, 0x980, 6),
+    (0xfc8, 0x180, 5),
+    (0xfc8, 0x100, 4),
+    (0xfc8, 0x040, 3),
+    (0xfc8, 0x008, 2),
+];
+
+/// Decode the MAC version from a raw TxConfig register value.
+/// `None` when the XID matches no table entry.
+pub const fn mac_version_from_xid(txcfg: u32) -> Option<u32> {
+    let xid = (txcfg >> 20) & 0xfcf;
+    let mut i = 0;
+    while i < XID_TABLE.len() {
+        let (mask, val, ver) = XID_TABLE[i];
+        if xid & mask == val {
+            return Some(ver);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether a chip uses the v2 TX offload layout, mirroring
+/// Linux's `rtl_chip_supports_csum_v2`: false for VER_02..06 and
+/// VER_10..17, true otherwise — including unknown versions
+/// (Linux's `default: return true` arm).
+pub const fn supports_csum_v2(version: Option<u32>) -> bool {
+    !matches!(version, Some(2..=6) | Some(10..=17))
 }
 
 // ── RX checksum decode (default descriptor type) ────────────────────
@@ -1643,4 +1733,35 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/realtek-features", smoke_features_offload_words);
+
+    fn smoke_features_xid_decode() -> TestResult {
+        // TxConfig values are synthesized: XID in bits 29:20.
+        // 8127A: XID 0x6c9 -> VER_80.
+        if mac_version_from_xid(0x6c9 << 20) != Some(80) {
+            return TestResult::Fail("XID 0x6c9 must decode to VER_80");
+        }
+        // 8125A: XID 0x609 -> VER_61.
+        if mac_version_from_xid(0x609 << 20) != Some(61) {
+            return TestResult::Fail("XID 0x609 must decode to VER_61");
+        }
+        // 8168evl: XID 0x2c8 (mask 0x7c8) -> VER_34.
+        if mac_version_from_xid(0x2c8 << 20) != Some(34) {
+            return TestResult::Fail("XID 0x2c8 must decode to VER_34");
+        }
+        // Unknown XID -> None, and csum-v2 defaults to true.
+        if mac_version_from_xid(0x001 << 20).is_some() {
+            return TestResult::Fail("unknown XID must decode to None");
+        }
+        if !supports_csum_v2(None) || !supports_csum_v2(Some(80)) {
+            return TestResult::Fail("unknown/VER_80 must be csum-v2");
+        }
+        if supports_csum_v2(Some(5)) || supports_csum_v2(Some(17)) {
+            return TestResult::Fail("VER_05/VER_17 must not be csum-v2");
+        }
+        if !supports_csum_v2(Some(7)) {
+            return TestResult::Fail("VER_07 must be csum-v2");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/realtek-features", smoke_features_xid_decode);
 }

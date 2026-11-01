@@ -2,9 +2,23 @@
 //! controller used on a wide swathe of consumer / laptop boards
 //! (including the user's AMD Ryzen 7 PRO 8840HS Phoenix laptop).
 //!
-//! Stage-4 cut: probe + reset + TX/RX rings + one MSI-X vector. No
-//! GMII auto-neg tuning, no EEE/WOL, no jumbo, no checksum offload,
-//! no VLAN, no multi-queue.
+//! Stage-4 cut + Linux compared feature set: probe + reset +
+//! TX/RX rings + one MSI-X vector, plus XID-decoded MAC version,
+//! TX checksum (TCP/UDP, v4/v6) and TSO (v2 layout on csum-v2
+//! chips, v1 layout on older chips), VLAN tag insertion on TX,
+//! RX checksum decode, jumbo-sized rings / RMS / MTPS, WoL
+//! register programming, and an EEE capability model. Deliberate
+//! asymmetries, all Linux-faithful: RX VLAN stripping stays OFF
+//! (NARF's `Frame::rx_meta` has no VLAN-tag field, so stripping
+//! would discard tags); the interface MTU stays 1500 with
+//! offloads advertised (Linux's `rtl8169_fix_features` disables
+//! CSUM + TSO when MTU > 1500 on MAC > VER_06, so a jumbo MTU
+//! and TX offload cannot coexist on this family — a runtime MTU
+//! switch is future work); RSS is not a gap here (Linux keeps
+//! one RX ring on 8168). Still missing: GMII auto-negotiation
+//! tuning, per-revision 8168 PHY tables, EEE PHY advertisement,
+//! and the 8168evl (VER_34) ERI step for WoL magic packets
+//! (reported by `set_wol_opts`, not silently dropped).
 //!
 //! ## Reference
 //!
@@ -39,7 +53,8 @@
 //!
 //! ```text
 //!   word0:  flags (OWN/EOR/FS/LS/...) | frame_length[15:0]
-//!   word1:  VLAN tag bits             (we leave 0)
+//!   word1:  VLAN tag bits + v2 offload fields (MSS / csum bits /
+//!           TCPHO) — see `crate::features` for the layout
 //!   word2:  buffer phys addr  low  32 bits
 //!   word3:  buffer phys addr  high 32 bits
 //! ```
@@ -84,7 +99,6 @@ const REG_RCR: u64 = 0x44;
 const REG_9346CR: u64 = 0x50;
 const REG_PHYSTAT: u64 = 0x6C;
 const REG_RMS: u64 = 0xDA;
-const REG_CPLUSCR: u64 = 0xE0;
 const REG_RDSAR: u64 = 0xE4;
 const REG_MTPS: u64 = 0xEC;
 
@@ -99,7 +113,6 @@ const TPPOLL_NPQ: u8 = 1 << 6;
 // 9346CR (config-write lock). Bits 7:6 = EEM. 00=normal, 11=config-
 // register write-enable.
 const EEM_NORMAL: u8 = 0x00;
-#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EEM_CONFIG_WRITE: u8 = 0xC0;
 
 // RCR bits.
@@ -133,47 +146,29 @@ const TXD_EOR: u32 = 1 << 30;
 const TXD_FS: u32 = 1 << 29;
 const TXD_LS: u32 = 1 << 28;
 
-// TX v1 offload bits (word0; older chips RTL8168b and earlier).
-// Source: Linux r8169_main.c around line 588.
-/// v1 LSO enable (large-send offload). Bit 27 of word0.
-pub const TD_LSO: u32 = 1 << 27;
-/// v1 MSS field shift within word0 (bits[26:16]). Mask = 0x07FF_0000.
-pub const TD0_MSS_SHIFT: u32 = 16;
-/// v1 TCP checksum insert (word0 bit 16). Set alongside TD_LSO.
-pub const TD0_TCP_CS: u32 = 1 << 16;
-/// v1 IP checksum insert (word0 bit 18).
-pub const TD0_IP_CS: u32 = 1 << 18;
+// TX offload bits — canonical definitions live in
+// `crate::features` (corrected placement: v2 GTSENV/GTTCPHO in
+// word0, MSS/csum bits/TCPHO in word1). Re-exported here so
+// existing users of these names keep compiling. The previous
+// in-tree comments placed the v2 bits in word1, which was wrong
+// and would have corrupted the MSS field; see `features.rs`.
+/// Historic spelling of [`TD1_IPV4_CS`].
+pub use crate::features::TD1_IPV4_CS as TD1_IPv4_CS;
+pub use crate::features::{
+    TD0_IP_CS, TD0_MSS_SHIFT, TD0_TCP_CS, TD0_UDP_CS, TD1_GTSENV4, TD1_GTSENV6, TD1_IPV4_CS,
+    TD1_MSS_SHIFT, TD1_TCP_CS, TD1_UDP_CS, TD_LSO,
+};
 
-// TX v2 offload bits (word1/vlan field; RTL8168c+ chips).
-// Source: Linux r8169_main.c around line 597.
-/// v2 GTS IPv4 large-send (word1 bit 26).
-pub const TD1_GTSENV4: u32 = 1 << 26;
-/// v2 GTS IPv6 large-send (word1 bit 25).
-pub const TD1_GTSENV6: u32 = 1 << 25;
-/// v2 MSS field shift in word1 (bits[28:18]). Mask = 0x1FFC_0000.
-pub const TD1_MSS_SHIFT: u32 = 18;
-/// v2 IPv4 header checksum insert (word1 bit 29).
-#[allow(non_upper_case_globals)] // TODO(narf): mirrors the datasheet register/bit name
-pub const TD1_IPv4_CS: u32 = 1 << 29;
-/// v2 TCP checksum insert (word1 bit 30).
-pub const TD1_TCP_CS: u32 = 1 << 30;
-/// v2 UDP checksum insert (word1 bit 31).
-pub const TD1_UDP_CS: u32 = 1 << 31;
-
-// RX status bits in word0 returned by hardware after a received frame.
-// Source: Linux r8169_main.c; IPFail/UDPFail/TCPFail in rx descriptor.
-/// RX: IP checksum failed (bit 16 of the returned flags_len word).
-pub const RX_IPFAIL: u32 = 1 << 16;
-/// RX: UDP checksum failed (bit 15).
-pub const RX_UDPFAIL: u32 = 1 << 15;
-/// RX: TCP checksum failed (bit 14).
-pub const RX_TCPFAIL: u32 = 1 << 14;
-/// RX: IP protocol present (bit 5). Set => hardware attempted IP csum.
-pub const RX_IPOK: u32 = 1 << 5;
-/// RX: TCP protocol present (bit 6). Set => hardware attempted L4 csum.
-pub const RX_TCPOK: u32 = 1 << 6;
-/// RX: UDP protocol present (bit 7). Set => hardware attempted L4 csum.
-pub const RX_UDPOK: u32 = 1 << 7;
+// RX status bits in word0 returned by hardware after a received
+// frame. Source: Linux r8169_main.c; IPFail/UDPFail/TCPFail in
+// the RX descriptor. The previous in-tree "OK" bits (RX_IPOK /
+// RX_TCPOK / RX_UDPOK, bits 5/6/7) were frame-length bits, not
+// protocol bits, and are deleted; decode through
+// [`Desc::rx_csum_result`], which uses the PID/fail rule.
+pub use crate::features::{
+    RX_FAIL_IP as RX_IPFAIL, RX_FAIL_TCP as RX_TCPFAIL, RX_FAIL_UDP as RX_UDPFAIL,
+};
+pub use crate::features::{RX_PID_TCP, RX_PID_UDP};
 
 /// RX checksum verification result decoded from `Desc.flags_len` on
 /// a chip-returned RX descriptor.
@@ -203,21 +198,25 @@ const RXD_LS: u32 = 1 << 28;
 pub const RING_LEN: usize = 256;
 const RING_BYTES: usize = RING_LEN * 16;
 
-/// RX buffer size. 2 KiB matches what the RCR datasheet expects for
-/// non-jumbo traffic; the driver doesn't program any RX-buffer-size
-/// register on this chip — buffer size is per-descriptor — so we
-/// just set RMS to a value that bounds an RX frame at ≤ 2 KiB.
-pub const RX_BUF_LEN: usize = 2048;
+/// RX buffer size. Linux sizes every RX buffer on this family to
+/// `R8169_RX_BUF_SIZE` (16 KiB − 1) and programs RMS to the
+/// buffer bound, independent of MTU; jumbo frames are therefore
+/// receivable even while the interface MTU stays 1500 (see the
+/// module header on the MTU/offload trade-off).
+pub const RX_BUF_LEN: usize = 16383;
 
-/// MTPS units are 128 bytes. 0x3B → 7552 bytes; 0x0C → 1536 bytes.
-/// We pick 0x3B so a single TX descriptor can carry up to 7440 bytes
-/// without TX underrun (even though we restrict frames to 1518 in
-/// `transmit`). MTPS == 0 is reserved/illegal per §2.21.
-const MTPS_DEFAULT: u8 = 0x3B;
+/// TX slot buffer size: one slot must hold the largest frame this
+/// driver will transmit — the chip's jumbo tagged frame, capped
+/// here at 16 KiB (the family buffer bound).
+pub const TX_BUF_LEN: usize = 16384;
 
-/// Max RX packet length (RMS register, 14-bit). Set to 1536 so a
-/// 1518-byte Ethernet frame + alignment padding fits cleanly.
-const RMS_DEFAULT: u16 = 1536;
+/// MTPS units are 128 bytes; MTPS == 0 is reserved/illegal per
+/// §2.21. The bring-up value is computed from the chip's jumbo
+/// frame size (per-version override for VER_31..33), not a fixed
+/// constant, so no `MTPS_DEFAULT` remains.
+///
+/// Max RX packet length (RMS register, 14-bit): the buffer bound
+/// 16383, matching Linux's `rtl_set_rx_max_size`.
 
 // ── Errors ──────────────────────────────────────────────────────────
 
@@ -225,7 +224,7 @@ const RMS_DEFAULT: u16 = 1536;
 pub enum NicError {
     BarMapFailed,
     NoMemory,
-    /// Frame outside [1, 1518].
+    /// Frame outside [1, chip max frame].
     FrameTooLong,
     /// `transmit` couldn't find a free TX descriptor.
     TxRingFull,
@@ -233,6 +232,10 @@ pub enum NicError {
     TxTimeout,
     /// MSI-X table couldn't be brought up.
     MsixSetup,
+    /// The requested TX offload cannot be programmed for this
+    /// frame (unparseable transport header, SCTP, MSS/offset
+    /// overflow, or TSO on a chip that cannot take it).
+    UnsupportedOffload,
 }
 
 // ── Descriptor in-memory shape ──────────────────────────────────────
@@ -253,54 +256,40 @@ const _: () = assert!(core::mem::size_of::<Desc>() == 16);
 // ── Descriptor offload builders ─────────────────────────────────────
 
 impl Desc {
-    /// Build a TX descriptor with v2-path IP + TCP checksum offload.
-    /// The v2 csum bits live in `vlan` (word1); `flags_len` carries the
-    /// standard OWN | FS | LS | buffer-length encoding.
-    pub fn tx_with_csum(addr_lo: u32, addr_hi: u32, len: u16) -> Self {
+    /// Build a TX descriptor from pre-computed offload words (see
+    /// `crate::features::v1_csum_words` / `v2_tso_words` and kin).
+    /// `flags_len` carries OWN | FS | LS | length plus the
+    /// word0 offload bits; `vlan` carries the word1 offload bits
+    /// (MSS / csum bits / TCPHO / VLAN-insert field).
+    pub fn tx_with_offload(
+        addr_lo: u32,
+        addr_hi: u32,
+        len: u16,
+        words: crate::features::OffloadWords,
+    ) -> Self {
         Desc {
-            flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32),
-            vlan: TD1_IPv4_CS | TD1_TCP_CS,
+            flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32) | words.word0,
+            vlan: words.word1,
             addr_lo,
             addr_hi,
         }
     }
 
-    /// Build a TX descriptor for TSO (v2 path). MSS is packed into
-    /// `vlan` bits[28:18] alongside the GTS-enable bit (TD1_GTSENV4).
-    /// Source: Linux r8169_main.c `rtl8169_tso_csum_v2`.
-    pub fn tx_with_tso(addr_lo: u32, addr_hi: u32, len: u16, mss: u16) -> Self {
-        Desc {
-            flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32),
-            vlan: TD1_GTSENV4 | TD1_IPv4_CS | TD1_TCP_CS | ((mss as u32) << TD1_MSS_SHIFT),
-            addr_lo,
-            addr_hi,
-        }
-    }
-
-    /// Decode the RX checksum result from a chip-returned descriptor.
-    ///
-    /// On RX, after the chip clears OWN, `flags_len` carries the error
-    /// indicator bits at specific positions. The *OK* bits (IPOK /
-    /// TCPOK / UDPOK) tell us the hardware attempted csum verification;
-    /// the *FAIL* bits (RX_IPFAIL / RX_TCPFAIL / RX_UDPFAIL) indicate
-    /// a bad result. If no OK bits are set the frame had no checksummed
-    /// protocol and we return None. Source: Linux r8169_main.c
-    /// `rtl8169_rx_csum`.
-    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
+    /// Decode the RX checksum result from a chip-returned
+    /// descriptor, using the Linux PID/fail rule (see
+    /// `crate::features::rx_csum_decode`): a checksum is trusted
+    /// only when exactly one protocol-ID bit is set and no fail
+    /// bit is set. The previous in-tree decode read bits 5/6/7
+    /// as protocol-OK bits; those bits are frame-length bits, so
+    /// it misclassified length-dependent frames.
     pub fn rx_csum_result(&self) -> RxCsumResult {
-        let ip_done = self.flags_len & RX_IPOK != 0;
-        let tcp_done = self.flags_len & RX_TCPOK != 0;
-        let udp_done = self.flags_len & RX_UDPOK != 0;
-        if !ip_done && !tcp_done && !udp_done {
-            return RxCsumResult::None;
-        }
-        let ip_fail = self.flags_len & RX_IPFAIL != 0;
-        let tcp_fail = self.flags_len & RX_TCPFAIL != 0;
-        let udp_fail = self.flags_len & RX_UDPFAIL != 0;
-        if ip_fail || tcp_fail || udp_fail {
+        let decoded = crate::features::rx_csum_decode(self.flags_len);
+        if decoded.l4_ok {
+            RxCsumResult::Ok
+        } else if self.flags_len & (RX_IPFAIL | RX_TCPFAIL | RX_UDPFAIL) != 0 {
             RxCsumResult::Fail
         } else {
-            RxCsumResult::Ok
+            RxCsumResult::None
         }
     }
 }
@@ -329,6 +318,17 @@ pub struct RtlNic {
     rx_head: IrqSafeSpinLock<u32>,
     /// MAC address read from IDR0..5 at bring-up.
     pub mac: [u8; 6],
+    /// Decoded MAC version (`RTL_GIGA_MAC_VER_*` number) from the
+    /// TxConfig XID at bring-up, or `None` when the XID matches
+    /// no known table entry (Linux then treats the chip as
+    /// csum-v2-capable by default).
+    pub mac_version: Option<u32>,
+    /// Whether this chip uses the v2 TX offload layout (word0
+    /// GTSENV/GTTCPHO, word1 MSS/csum/TCPHO). False for VER_02..06
+    /// and VER_10..17; true otherwise, including unknown XIDs.
+    pub csum_v2: bool,
+    /// Last WoL option set programmed via [`RtlNic::set_wol_opts`].
+    wol_opts: IrqSafeSpinLock<crate::features::WolOpts>,
     /// True when PHYStatus.LinkSts read 1 at bring-up. We don't yet
     /// re-poll on LinkChg interrupts.
     pub link_up: bool,
@@ -429,15 +429,33 @@ impl RtlNic {
         }
         let mut tx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
         for _ in 0..RING_LEN {
-            tx_pool.push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?);
+            tx_pool.push(
+                alloc_coherent(TX_BUF_LEN, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
+            );
         }
 
-        // 4. C+CR first per §7 step 1. We disable VLAN-detag + RX
-        //    checksum offload — the upper layer doesn't yet consume
-        //    these, and a clean zero is the predictable default.
+        // 2.5. Decode the MAC version from TxConfig's XID field
+        //     BEFORE step 5a overwrites TCR. Linux reads the same
+        //     register at probe (`rtl_read_mac_version`); the
+        //     reset-default TCR carries the chip's XID in bits
+        //     29:20 (masked to 0xfcf by the table matcher).
         // SAFETY: identity-mapped.
+        let txcfg = unsafe { mmio.read32(REG_TCR) };
+        let mac_version = crate::features::mac_version_from_xid(txcfg);
+        let csum_v2 = crate::features::supports_csum_v2(mac_version);
+
+        // 4. C+CR first per §7 step 1. Enable RX checksum offload
+        //    (the RX pump decodes it into `Frame::rx_meta`) and
+        //    keep RX VLAN stripping OFF: NARF's `Frame::rx_meta`
+        //    has no VLAN-tag field, so stripping would discard
+        //    tags the stack needs. TX VLAN insertion is
+        //    independent of this bit and is always available.
+        //    NORMAL mode is preserved; INTT timing bits are
+        //    preserved (Linux's `CPCMD_MASK` shape).
+        // SAFETY: bring_up owns the BAR exclusively.
         unsafe {
-            mmio.write16(REG_CPLUSCR, 0);
+            let mut regs = crate::features::MmioRegs(&mmio);
+            crate::features::apply_cplus(&mut regs, false, true);
         }
 
         // 5. CR enables both TE + RE per §7 step 2. The datasheet
@@ -453,6 +471,10 @@ impl RtlNic {
         //     it's safe to leave the ring in all-zero (host-owned)
         //     state since we touch slot 0 first and walk linearly.
         let tx_phys = tx_ring.dma_addr().raw();
+        // MTPS + jumbo Config bits: the chip's jumbo frame size
+        // (tagged) drives MTPS; VER_31..33 take Linux's 0x24
+        // override in jumbo mode. The Config writes are gated
+        // behind the 9346CR unlock (they are CONFIG registers).
         // SAFETY: identity-mapped MMIO. RDSAR / TNPDS take a 64-bit
         // value; per §2.20 the spec splits it as low-32 at offset+0
         // and high-32 at offset+4.
@@ -461,7 +483,17 @@ impl RtlNic {
             mmio.write32(REG_TNPDS, tx_phys as u32);
             mmio.write32(REG_TNPDS + 4, (tx_phys >> 32) as u32);
             mmio.write32(REG_TCR, TCR_MXDMA_UNLIMITED | TCR_IFG_STD);
-            mmio.write8(REG_MTPS, MTPS_DEFAULT);
+            mmio.write8(REG_9346CR, EEM_CONFIG_WRITE);
+            let mut regs = crate::features::MmioRegs(&mmio);
+            let ver = mac_version.unwrap_or(0);
+            let jumbo = crate::features::jumbo_config(ver, true);
+            crate::features::apply_jumbo_config(&mut regs, ver, true);
+            let tagged_max = max_tagged_frame(mac_version);
+            let mtps = jumbo
+                .mtps_override
+                .unwrap_or_else(|| crate::features::mtps_for_frame(tagged_max));
+            mmio.write8(REG_MTPS, mtps);
+            mmio.write8(REG_9346CR, EEM_NORMAL);
         }
 
         // 5b. Pre-fill RX descriptors: each points at its pooled
@@ -490,11 +522,15 @@ impl RtlNic {
                 );
             }
         }
+        // RMS is the buffer bound (16383), not the MTU bound —
+        // Linux's `rtl_set_rx_max_size` shape. Jumbo frames are
+        // therefore receivable into the 16 KiB buffers even
+        // though the interface MTU stays 1500.
         // SAFETY: identity-mapped MMIO.
         unsafe {
             mmio.write32(REG_RDSAR, rx_ring_phys as u32);
             mmio.write32(REG_RDSAR + 4, (rx_ring_phys >> 32) as u32);
-            mmio.write16(REG_RMS, RMS_DEFAULT);
+            mmio.write16(REG_RMS, RX_BUF_LEN as u16);
         }
 
         // 5c. RCR — accept physical-match + multicast + broadcast,
@@ -548,6 +584,9 @@ impl RtlNic {
             rx_pool,
             rx_head: IrqSafeSpinLock::new(0),
             mac,
+            mac_version,
+            csum_v2,
+            wol_opts: IrqSafeSpinLock::new(crate::features::WolOpts::NONE),
             link_up,
             irq_vector: None,
             msix: None,
@@ -606,7 +645,7 @@ impl RtlNic {
     /// `[1, 1518]` bytes (no jumbo); the chip pads frames < 64 bytes
     /// itself per §6.1.
     pub fn transmit(&self, frame: &[u8], meta: &TxMeta) -> Result<(), NicError> {
-        if frame.is_empty() || frame.len() > 1518 {
+        if frame.is_empty() || frame.len() > self.max_frame() as usize {
             return Err(NicError::FrameTooLong);
         }
         // Persistent per-slot buffer (audit #4); index by slot.
@@ -634,31 +673,46 @@ impl RtlNic {
         }
 
         // Select descriptor format based on offload request.
-        let d = if let Some(mss) = meta.tso_mss {
-            let mut d =
-                Desc::tx_with_tso(phys as u32, (phys >> 32) as u32, frame.len() as u16, mss);
-            if slot == RING_LEN - 1 {
-                d.flags_len |= TXD_EOR;
+        // Offload words are computed driver-locally (frame parsing
+        // + `crate::features` builders); no shared TX-path code is
+        // touched. An offload the chip cannot take for this frame
+        // (unparseable header, SCTP, MSS/offset overflow) is
+        // `UnsupportedOffload`, never a descriptor with a guessed
+        // offset. Plain frames still get VLAN insertion.
+        let mut d = if let Some(mss) = meta.tso_mss {
+            if mss == 0 || mss > crate::features::MSS_MAX {
+                return Err(NicError::UnsupportedOffload);
             }
-            d
-        } else if meta.csum_l4.is_some() {
-            let mut d = Desc::tx_with_csum(phys as u32, (phys >> 32) as u32, frame.len() as u16);
-            if slot == RING_LEN - 1 {
-                d.flags_len |= TXD_EOR;
+            let info =
+                crate::features::parse_transport(frame).ok_or(NicError::UnsupportedOffload)?;
+            let words = if self.csum_v2 {
+                crate::features::v2_tso_words(info.ip, mss, info.offset, meta.vlan_tag)
+            } else {
+                crate::features::v1_tso_words(mss, meta.vlan_tag)
             }
-            d
+            .ok_or(NicError::UnsupportedOffload)?;
+            Desc::tx_with_offload(phys as u32, (phys >> 32) as u32, frame.len() as u16, words)
+        } else if let Some(kind) = meta.csum_l4 {
+            let info =
+                crate::features::parse_transport(frame).ok_or(NicError::UnsupportedOffload)?;
+            let words = if self.csum_v2 {
+                crate::features::v2_csum_words(kind, info.ip, info.offset, meta.vlan_tag)
+            } else {
+                crate::features::v1_csum_words(kind, meta.vlan_tag)
+            }
+            .ok_or(NicError::UnsupportedOffload)?;
+            Desc::tx_with_offload(phys as u32, (phys >> 32) as u32, frame.len() as u16, words)
         } else {
-            let mut flags = TXD_OWN | TXD_FS | TXD_LS | (frame.len() as u32 & 0xFFFF);
-            if slot == RING_LEN - 1 {
-                flags |= TXD_EOR;
-            }
             Desc {
-                flags_len: flags,
-                vlan: 0,
+                flags_len: TXD_OWN | TXD_FS | TXD_LS | (frame.len() as u32 & 0xFFFF),
+                vlan: crate::features::tx_vlan_word(meta.vlan_tag),
                 addr_lo: phys as u32,
                 addr_hi: (phys >> 32) as u32,
             }
         };
+        if slot == RING_LEN - 1 {
+            d.flags_len |= TXD_EOR;
+        }
         // The NIC sees OWN=1 once we publish word0; the addr/len
         // fields must already be visible. Order: write addr/vlan/
         // length-without-OWN first, fence, then publish OWN.
@@ -722,6 +776,12 @@ impl RtlNic {
     /// when a descriptor's OWN bit reads 0 (NIC handed it back) and
     /// `None` when the ring head is still NIC-owned.
     pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
+        self.receive_with_meta().map(|(buf, _)| buf)
+    }
+
+    /// Like [`RtlNic::receive`], plus the chip's RX checksum
+    /// verification result decoded from the returned descriptor.
+    pub fn receive_with_meta(&self) -> Option<(alloc::vec::Vec<u8>, RxCsumResult)> {
         let mut head_g = self.rx_head.lock();
         let slot = (*head_g) as usize % RING_LEN;
         let ring_phys = self.rx_ring.dma_addr().raw();
@@ -734,6 +794,16 @@ impl RtlNic {
         if flags_len & RXD_OWN != 0 {
             return None;
         }
+
+        // Decode the RX checksum result now, before rearming
+        // overwrites the descriptor.
+        let csum = Desc {
+            flags_len,
+            vlan: 0,
+            addr_lo: 0,
+            addr_hi: 0,
+        }
+        .rx_csum_result();
 
         // Status layout: bits[13:0] = received frame length (incl.
         // CRC unless RCR.SECRC strips it; Stage-4 leaves SECRC off
@@ -781,7 +851,60 @@ impl RtlNic {
         compiler_fence(Ordering::SeqCst);
 
         *head_g = (*head_g + 1) % (RING_LEN as u32);
-        Some(out)
+        Some((out, csum))
+    }
+
+    /// Largest frame this chip may transmit: its jumbo tagged
+    /// frame, capped by the TX slot buffer size.
+    pub fn max_frame(&self) -> u32 {
+        max_tagged_frame(self.mac_version).min(TX_BUF_LEN as u32)
+    }
+
+    /// EEE LPI capabilities for this chip's MAC version (Linux's
+    /// `rtl8169_get_lpi_caps` shape; unknown version → none).
+    pub fn eee_caps(&self) -> crate::features::EeeCaps {
+        crate::features::eee_lpi_caps(self.mac_version.unwrap_or(0))
+    }
+
+    /// Program Wake-on-LAN options (Linux's `__rtl8169_set_wol`
+    /// shape, via `crate::features::apply_wol`). Config registers
+    /// are unlocked for the sequence and re-locked after. Returns
+    /// the out-of-band magic step the caller must still perform:
+    /// on 8168evl (VER_34) the magic bit lives in ERI space, which
+    /// NARF has no accessor for yet — that step is reported, not
+    /// silently dropped. All other versions program magic fully.
+    pub fn set_wol_opts(
+        &self,
+        opts: crate::features::WolOpts,
+    ) -> Result<crate::features::WolPendingMagic, NicError> {
+        if !opts.is_valid() {
+            return Err(NicError::UnsupportedOffload);
+        }
+        let magic = match self.mac_version {
+            Some(34) => crate::features::WolMagic::Eri0dc,
+            _ => crate::features::WolMagic::Config3Bit,
+        };
+        let pme = match self.mac_version {
+            Some(2..=6) => crate::features::WolPmeReg::Config1,
+            Some(34) | Some(37) | Some(39..) => crate::features::WolPmeReg::Config2,
+            _ => crate::features::WolPmeReg::None,
+        };
+        // SAFETY: bring_up owns the BAR; `set_wol_opts` is called
+        // only on the live controller, whose MMIO is exclusively
+        // owned by this instance.
+        unsafe {
+            self.mmio.write8(REG_9346CR, EEM_CONFIG_WRITE);
+            let mut regs = crate::features::MmioRegs(&self.mmio);
+            let pending = crate::features::apply_wol(&mut regs, opts, magic, pme);
+            self.mmio.write8(REG_9346CR, EEM_NORMAL);
+            *self.wol_opts.lock() = opts;
+            Ok(pending)
+        }
+    }
+
+    /// Last WoL option set programmed via [`RtlNic::set_wol_opts`].
+    pub fn wol_opts(&self) -> crate::features::WolOpts {
+        *self.wol_opts.lock()
     }
 
     /// Read the PHY-status register. Useful for tests; bit 1 = link.
@@ -823,7 +946,7 @@ impl RtlNic {
     /// Caller must have brought MSI-X up via [`enable_msix`]; on a
     /// controller without MSI-X this returns `MsixSetup`.
     pub async fn transmit_irq_async(&self, frame: &[u8]) -> Result<(), NicError> {
-        if frame.is_empty() || frame.len() > 1518 {
+        if frame.is_empty() || frame.len() > self.max_frame() as usize {
             return Err(NicError::FrameTooLong);
         }
         let v = self.irq_vector.ok_or(NicError::MsixSetup)?;
@@ -1065,11 +1188,20 @@ async fn r8169_rx_pump(device: Arc<RtlNic>, mut rx_prod: Producer<Frame, RX_RING
             last_sample = sample;
             crate::publish::publish_link(r8169_ifname(), sample);
         }
-        if let Some(pkt) = device.receive() {
+        if let Some((pkt, csum)) = device.receive_with_meta() {
             let dma_buf =
                 alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, pkt.len() as u32);
             frame.payload_mut().copy_from_slice(&pkt);
+            // RX checksum verification from the descriptor: only
+            // `Ok` marks the checksums verified; `Fail` and `None`
+            // both leave the flags clear so the stack re-checks.
+            let mut rx_meta = narf_net::RxMeta::default();
+            if csum == RxCsumResult::Ok {
+                rx_meta.csum_l3 = true;
+                rx_meta.csum_l4 = true;
+            }
+            frame.set_rx_meta(rx_meta);
             // RX fan-out (issue #784), e1000's `dispatch_rx_frame`
             // shape via the shared helper: an attached ring consumer
             // gets a pristine pre-dispatch copy; the original goes to
@@ -1134,6 +1266,19 @@ impl narf_net::Interface for Rtl8168Nic {
     fn link_up(&self) -> bool {
         with_controller(|c| c.link_up).unwrap_or(false)
     }
+    fn offloads(&self) -> narf_net::OffloadCapabilities {
+        // The TSO byte cap is the TX slot buffer: a TSO packet is
+        // one frame copied into one slot. (Whether the chip takes
+        // the v2 or v1 descriptor layout is a controller property,
+        // not an interface capability; Linux's TSO6-vs-TSO4 split
+        // follows the same version rule.)
+        narf_net::OffloadCapabilities {
+            tx_checksum: true,
+            rx_checksum: true,
+            max_tso_bytes: TX_BUF_LEN as u32,
+            vlan_insert: true,
+        }
+    }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
             IrqSafeSpinLock::new(None);
@@ -1185,7 +1330,10 @@ impl crate::HwNic for Rtl8168Nic {
         crate::NicModel::RealtekRtl8168
     }
     fn caps(&self) -> crate::NicCaps {
-        crate::NicCaps::NONE
+        crate::NicCaps::TX_CSUM
+            | crate::NicCaps::RX_CSUM
+            | crate::NicCaps::TSO
+            | crate::NicCaps::VLAN_TAGGING
     }
     fn ring_capacity(&self) -> usize {
         RING_LEN
@@ -1196,6 +1344,14 @@ impl crate::HwNic for Rtl8168Nic {
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
         <Self as narf_net::Interface>::tx_ring(self)
     }
+}
+
+/// Largest tagged frame a chip of this MAC version may transmit:
+/// its jumbo MTU as a frame, plus one VLAN tag. Unknown version
+/// takes Linux's 9K default.
+fn max_tagged_frame(version: Option<u32>) -> u32 {
+    let ver = version.unwrap_or(0);
+    crate::features::frame_for_mtu(crate::features::jumbo_max_mtu(ver)) + 4
 }
 
 pub fn is_probed() -> bool {
