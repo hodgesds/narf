@@ -244,6 +244,20 @@ fn smoke_rtl8188ee_rts_threshold_native_boundary_and_cts_precedence() -> TestRes
             iface.rts_threshold() == Some(length as u32 - 1),
             "NERT station reset lost physical policy",
         )?;
+        // A second real MLME/RSNA session needs a fresh AP/PTK/replay/PN
+        // owner. Preserve this same Device, signed protection source,
+        // negotiated RTS24 rate offer and physical threshold configuration.
+        {
+            let mut peer = h.peer.lock();
+            let fresh = Peer::new(true);
+            peer.ap = fresh
+                .ap
+                .with_legacy_rates(&LEGACY_RATES)
+                .map_err(|_| "NERT rejoin RTS24 peer rates")?;
+            peer.ptk = fresh.ptk;
+            peer.replay = fresh.replay;
+            peer.pn = fresh.pn;
+        }
         join(&h)?;
         data(&h, 0x1008)?;
         iface
