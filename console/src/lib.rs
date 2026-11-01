@@ -849,7 +849,7 @@ pub fn run_persist_hook(msg: Option<&[u8]>) {
     }
 }
 
-/// Lock-free string emit used by the CPU trap path. The trap may
+/// Nonblocking string emit used by the CPU trap path. The trap may
 /// have fired while the original code was holding `CONSOLE.lock`
 /// (mid-`write_str`); a blocking re-acquire from the trap handler
 /// would deadlock against itself, which is why every line past
@@ -858,12 +858,12 @@ pub fn run_persist_hook(msg: Option<&[u8]>) {
 /// since callers usually want raw writes interleaved with their
 /// own register dumps.
 pub fn trap_sink(s: &str) {
-    // Skip `klog::record` deliberately — it takes an
-    // `IrqSafeSpinLock` (the log store's) and the original faulting
-    // code may already hold it; deadlock there manifests as the
-    // trap printer dying after one line. The FB hook is also
-    // skipped for the same reason — the FB-console writer's path
-    // takes its own locks.
+    // The normal record path waits for the store lock, which the faulting
+    // code may hold. Only try it: serial output must still work if the store
+    // is busy, while an available store lets dmesg and persistent capture see
+    // watchdogs, CPU samples and fatal reports without a serial connection.
+    klog::try_record_trap(s);
+    // The framebuffer hook remains excluded: it takes its own locks.
     if let Some(kind) = CONSOLE.kind.get() {
         let base = CONSOLE.base.load(Ordering::Acquire) as usize;
         if base != 0 {
@@ -877,7 +877,7 @@ pub fn trap_sink(s: &str) {
     }
 }
 
-/// Lock-free `fmt::Write` adapter for the trap printer.
+/// Nonblocking `fmt::Write` adapter for the trap printer.
 pub struct TrapWriter;
 
 impl fmt::Debug for TrapWriter {

@@ -294,6 +294,47 @@ fn smoke_klog_console_only_not_recorded() -> TestResult {
 }
 kernel_test_in!("console/klog", smoke_klog_console_only_not_recorded);
 
+/// Native boot capture reads kmsg: trap diagnostics must survive without an
+/// attached UART, including the fragments emitted by a formatted register dump.
+fn smoke_klog_trap_text_reaches_readers() -> TestResult {
+    let has = |hay: &[u8], n: &[u8]| hay.windows(n.len()).any(|w| w == n);
+    let seq = next_seq();
+    crate::trap_sink("narf-trap-store-probe-");
+    crate::trap_sink("7c91\n");
+    if !has(&text_since(seq), b"narf-trap-store-probe-7c91") {
+        return TestResult::Fail("trap text missing from the kernel log store");
+    }
+    let Some(export) = export_since(seq, usize::MAX, false) else {
+        return TestResult::Fail("trap text left the kernel log store locked");
+    };
+    if !has(&export.text, b"narf-trap-store-probe-7c91") {
+        return TestResult::Fail("trap text missing from persistent-log export");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("console/klog", smoke_klog_trap_text_reaches_readers);
+
+/// A trap can interrupt the store lock itself. Recording must never wait for
+/// that lock, and losing that fragment must not prevent a subsequent record.
+fn smoke_klog_trap_text_does_not_wait_for_store() -> TestResult {
+    let has = |hay: &[u8], n: &[u8]| hay.windows(n.len()).any(|w| w == n);
+    {
+        let store = RING.lock();
+        let seq = store.next_seq;
+        crate::trap_sink("narf-trap-busy-probe-7c91\n");
+        if store.next_seq != seq {
+            return TestResult::Fail("trap wrote through an already-held store lock");
+        }
+    }
+    let seq = next_seq();
+    crate::trap_sink("narf-trap-after-busy-probe-7c91\n");
+    if !has(&text_since(seq), b"narf-trap-after-busy-probe-7c91") {
+        return TestResult::Fail("trap recording did not recover after store contention");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("console/klog", smoke_klog_trap_text_does_not_wait_for_store);
+
 /// `export_since` renders dmesg-style lines, chunks by size without
 /// duplicating or skipping a record, and reports records lost to the ring.
 fn smoke_klog_export_since_chunks_without_gaps() -> TestResult {
