@@ -945,6 +945,11 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             Ok(ops) => {
                 narf_memory::install_file_fault_hook(crate::mapped_file::demand_frame);
                 narf_memory::install_file_batch_fault_hook(crate::mapped_file::demand_frames_batch);
+                // Truncate hook: paired with the fault hooks (see
+                // the deferred-shared branch for why).
+                narf_filesystem::install_mmap_truncate_hook(
+                    crate::mapped_file::truncate_file_mappings,
+                );
                 Some(ops)
             }
             Err(_) => {
@@ -1049,6 +1054,22 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 lazy_shared_file = true;
                 narf_memory::install_file_fault_hook(crate::mapped_file::demand_frame);
                 narf_memory::install_file_batch_fault_hook(crate::mapped_file::demand_frames_batch);
+                // The truncate hook is installed beside the fault
+                // hooks at every site that installs them. It used to
+                // be installed only on the `supports_mmap_fault`
+                // branch above, so in a boot whose mappings were all
+                // generic-fallback, a filesystem shrink's
+                // `unmap_mapping_range` was a no-op: past-EOF pages
+                // were never punched and recorded batches (#737
+                // step 2) were never dropped — the batch_restore
+                // truncate smoke caught exactly that (a post-shrink
+                // fault restored the whole recorded range). A
+                // filesystem can only call the hook once a mapping
+                // exists, and every mapping path installs it, so the
+                // pairing leaves no such window.
+                narf_filesystem::install_mmap_truncate_hook(
+                    crate::mapped_file::truncate_file_mappings,
+                );
                 // Linux installs only VMA metadata here. An empty sparse
                 // prefix represents every page as absent until FILE_DEMAND
                 // grows through the first touched slot.
@@ -1074,6 +1095,11 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             private_file_ops = Some(Arc::clone(&ops));
             narf_memory::install_file_fault_hook(crate::mapped_file::demand_frame);
             narf_memory::install_file_batch_fault_hook(crate::mapped_file::demand_frames_batch);
+            // Truncate hook: paired with the fault hooks (see the
+            // deferred-shared branch for why).
+            narf_filesystem::install_mmap_truncate_hook(
+                crate::mapped_file::truncate_file_mappings,
+            );
             // As with Linux's file-backed VMA, mmap publishes no resident pages.
             // Each first touch reads exactly that file page into a private frame.
             alloc::vec::Vec::new()

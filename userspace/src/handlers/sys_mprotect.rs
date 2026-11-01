@@ -108,7 +108,15 @@ pub(crate) fn sys_mprotect(ctx: &mut dyn TrapContext) {
     }
     let base = VirtAddr::new(args.arg0);
     match mprotect_core(&as_ref, base, len, prot) {
-        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+        Ok(()) => {
+            // Protections changed under any recorded batch (#737
+            // step 2): the record must not restore pages under a
+            // protection story it was not taken against. The batch
+            // claim would re-derive current per-page protections
+            // anyway — this drop is the prompt half of the discipline.
+            crate::mapped_file::scrub_advice_range(as_ref.identity(), args.arg0, len);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
         // e is the positive errno (ENOMEM for an unmapped range, EACCES for a
         // W^X denial / missing JIT cap); negate for the Linux ABI.
         Err(e) => ctx.set_return(errno_ret(e)),
