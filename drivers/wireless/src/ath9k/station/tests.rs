@@ -104,6 +104,12 @@ pub(in crate::ath9k) struct Peer {
     rx_sequence: u16,
     /// Accept uplink QoS TIDs 0..7 (N85Q); otherwise only TID0.
     pub(in crate::ath9k) qos_tids: bool,
+    pub(in crate::ath9k) ps_test: bool,
+    pub(in crate::ath9k) ps_asleep: bool,
+    pub(in crate::ath9k) ps_notices: Vec<Vec<u8>>,
+    pub(in crate::ath9k) ps_polls: Vec<Vec<u8>>,
+    pub(in crate::ath9k) ps_buffered: alloc::collections::VecDeque<Vec<u8>>,
+    pub(in crate::ath9k) hold_ps: bool,
 }
 impl Peer {
     pub(in crate::ath9k) fn new_rates(protected: bool, rates: Option<&[u8]>) -> Self {
@@ -173,6 +179,12 @@ impl Peer {
             sender_reorder: None,
             rx_sequence: 0,
             qos_tids: false,
+            ps_test: false,
+            ps_asleep: false,
+            ps_notices: Vec::new(),
+            ps_polls: Vec::new(),
+            ps_buffered: alloc::collections::VecDeque::new(),
+            hold_ps: false,
         }
     }
     pub(in crate::ath9k) fn downlink(&mut self, ethernet: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -220,6 +232,46 @@ impl Peer {
         &mut self,
         frame: &[u8],
     ) -> Result<(Vec<Vec<u8>>, bool), &'static str> {
+        if self.ps_test && frame.len() == 24 && frame[0] == 0x48 {
+            if !matches!(frame[1], 1 | 0x11)
+                || frame[4..10] != AP
+                || frame[10..16] != self.plan.station
+                || frame[16..22] != AP
+                || frame[22] & 15 != 0
+                || !self.ht_active
+                || self.ap.protected() && self.ptk.is_none()
+            {
+                return Err("native PM Null identity/cleartext/port");
+            }
+            self.ps_asleep = frame[1] & 0x10 != 0;
+            self.ps_notices.push(frame.to_vec());
+            return Ok((Vec::new(), self.hold_ps));
+        }
+        if self.ps_test && frame.len() == 16 && frame[0] == 0xa4 {
+            if frame[..4] != [0xa4, 0x10, 42, 0xc0]
+                || frame[4..10] != AP
+                || frame[10..16] != self.plan.station
+                || !self.ps_asleep
+            {
+                return Err("native PS-Poll AID/identity/PM");
+            }
+            self.ps_polls.push(frame.to_vec());
+            let reply = if let Some(ethernet) = self.ps_buffered.pop_front() {
+                let mut wire = self.downlink(&ethernet)?;
+                if !self.ps_buffered.is_empty() {
+                    wire[1] |= 0x20;
+                }
+                wire
+            } else {
+                let mut wire = vec![0x48, 2, 0, 0];
+                wire.extend_from_slice(&self.plan.station);
+                wire.extend_from_slice(&AP);
+                wire.extend_from_slice(&AP);
+                wire.extend_from_slice(&[0, 0]);
+                wire
+            };
+            return Ok((vec![reply], self.hold_ps));
+        }
         if frame.first() == Some(&0x84) {
             if frame.len() != 20
                 || frame[..2] != [0x84, 0]
@@ -552,8 +604,15 @@ impl Peer {
         let mut ethernet = frame[16..22].to_vec();
         ethernet.extend_from_slice(&frame[10..16]);
         ethernet.extend_from_slice(&body[6..]);
+        if self.ps_test {
+            self.ps_asleep = frame[1] & 0x10 != 0;
+        }
         self.uplink.push(ethernet.clone());
         let replies = match self.server.receive(&ethernet) {
+            Some(reply) if self.ps_test && self.ps_asleep => {
+                self.ps_buffered.push_back(reply);
+                Vec::new()
+            }
             Some(reply) => vec![self.downlink(&reply)?],
             None => Vec::new(),
         };

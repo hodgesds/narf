@@ -84,6 +84,15 @@ pub(super) trait Port {
         super::channel_width::Geometry::from_frequency(self.frequency_mhz())
             .expect("prepared physical primary")
     }
+    fn ps_grant(&self) -> Option<alloc::sync::Arc<super::ps::Grant>> {
+        None
+    }
+    fn bind_ps(&self, _grant: &alloc::sync::Arc<super::ps::Grant>) -> Result<(), Error> {
+        Err(Error::State)
+    }
+    fn network_sleep(&self) -> Result<(), Error> {
+        Err(Error::State)
+    }
     fn tx_ba_grant(&self) -> Option<alloc::sync::Arc<super::tx_ba::Grant>> {
         None
     }
@@ -358,6 +367,8 @@ pub(super) struct Packet<P: Port> {
     ba: bool,
     tx_ba: bool,
     reclaimed: bool,
+    ps: Option<alloc::sync::Arc<super::ps::Grant>>,
+    ps_irq_created: bool,
     irq: Option<super::irq::Mask>,
     full_imr: u32,
 }
@@ -441,6 +452,8 @@ impl<P: Port> Packet<P> {
             ba: false,
             tx_ba: false,
             reclaimed: false,
+            ps: None,
+            ps_irq_created: false,
             irq: None,
             full_imr: 0,
         })
@@ -508,6 +521,126 @@ impl<P: Port> Packet<P> {
     }
     pub(super) fn rx_ba_grant(&self) -> Option<alloc::sync::Arc<super::rx_ba::Grant>> {
         self.port.rx_ba_grant()
+    }
+    pub(super) fn ps_grant(&self) -> Option<alloc::sync::Arc<super::ps::Grant>> {
+        self.port.ps_grant()
+    }
+    pub(super) fn enable_ps(
+        &mut self,
+        source: &alloc::sync::Arc<super::ps::Grant>,
+    ) -> Result<(), Error> {
+        if let Some(bound) = &self.ps {
+            if !alloc::sync::Arc::ptr_eq(bound, source) {
+                return Err(Error::State);
+            }
+            source.check()?;
+        }
+        if self.phase != Phase::Running
+            || self.ht.is_none()
+            || self.pending.is_some()
+            || self.pair.is_some()
+            || self
+                .port
+                .ps_grant()
+                .is_none_or(|current| !alloc::sync::Arc::ptr_eq(&current, source))
+        {
+            return Err(Error::State);
+        }
+        source.readback(&self.port)?;
+        self.port.bind_ps(source)?;
+        self.ps = Some(source.clone());
+        if self.irq.is_none() {
+            self.irq = Some(super::irq::enable(&self.port, true, false)?);
+            if self.qos.is_some() {
+                super::irq::data_queues(&self.port)?;
+            }
+            self.full_imr = self.irq.ok_or(Error::State)?.imr;
+            self.ps_irq_created = true;
+        }
+        Ok(())
+    }
+    pub(super) fn ps_receive_on(&self) -> Result<(), Error> {
+        self.ps.as_ref().ok_or(Error::State)?.check()?;
+        let old = self.port.read(DIAG)?;
+        self.port.write(DIAG, old & !RX_PARK)?;
+        if self.port.read(DIAG)? & RX_PARK != 0 {
+            return Err(Error::Descriptor);
+        }
+        Ok(())
+    }
+    pub(super) fn ps_timers(&mut self, plan: super::ps::tim::Plan) -> Result<(), Error> {
+        self.ps.as_ref().ok_or(Error::State)?.readback(&self.port)?;
+        for (register, value) in plan.registers {
+            self.port.write(register, value)?;
+            if self.port.read(register)? != value {
+                return Err(Error::Descriptor);
+            }
+        }
+        let rssi = (self.port.read(0x8018)? & !0xff00) | (10 << 8);
+        self.port.write(0x8018, rssi)?;
+        let mode = self.port.read(0x8240)? | 0x31;
+        self.port.write(0x8240, mode)?;
+        if self.port.read(0x8018)? != rssi || self.port.read(0x8240)? != mode {
+            return Err(Error::Descriptor);
+        }
+        let mask = super::irq::power_save(&self.port, self.irq.ok_or(Error::State)?, true)?;
+        self.full_imr = mask.imr;
+        self.irq = Some(mask);
+        Ok(())
+    }
+    pub(super) fn ps_awake_mode(&mut self) -> Result<(), Error> {
+        self.ps_receive_on()?;
+        let mode = self.port.read(0x8240)? & !0x31;
+        self.port.write(0x8240, mode)?;
+        if self.port.read(0x8240)? != mode {
+            return Err(Error::Descriptor);
+        }
+        let mask = super::irq::power_save(&self.port, self.irq.ok_or(Error::State)?, false)?;
+        if self.ps_irq_created {
+            super::irq::kill(&self.port, false)?;
+            self.irq = None;
+            self.ps_irq_created = false;
+        } else {
+            self.full_imr = mask.imr;
+            self.irq = Some(mask);
+        }
+        Ok(())
+    }
+    pub(super) fn ps_sleep(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Running
+            || self.pending.is_some()
+            || self.pair.is_some()
+            || self.held.is_some()
+        {
+            return Err(Error::Busy);
+        }
+        self.check_transmit()?;
+        self.ps.as_ref().ok_or(Error::State)?.check()?;
+        self.port.network_sleep()
+    }
+    pub(super) fn ps_tsf(&self) -> Result<u64, Error> {
+        self.ps.as_ref().ok_or(Error::State)?.check()?;
+        for _ in 0..8 {
+            let high = self.port.read(0x8050)?;
+            let low = self.port.read(0x804c)?;
+            if self.port.read(0x8050)? == high {
+                return Ok((u64::from(high) << 32) | u64::from(low));
+            }
+        }
+        Err(Error::Descriptor)
+    }
+    pub(super) fn submit_ps(
+        &mut self,
+        frame: &[u8],
+        ap: [u8; 6],
+        aid: u16,
+        basic: usize,
+    ) -> Result<u64, Error> {
+        let source = self.ps.clone().ok_or(Error::State)?;
+        let local = self.local;
+        self.submit_inner(frame, |address| {
+            descriptor::transmit_ps(frame, local, ap, aid, address, basic, &source)
+        })
     }
     pub(super) fn tx_ba_grant(&self) -> Option<alloc::sync::Arc<super::tx_ba::Grant>> {
         self.port.tx_ba_grant()
@@ -736,8 +869,16 @@ impl<P: Port> Packet<P> {
     }
     pub(super) fn submit(&mut self, frame: &[u8], rate: usize) -> Result<u64, Error> {
         let local = self.local;
+        let copy = if frame.get(1).is_some_and(|flag| flag & 0x10 != 0) {
+            Some(
+                descriptor::ps_unmark(frame, self.ps.as_ref().ok_or(Error::State)?)
+                    .map_err(|_| Error::Packet)?,
+            )
+        } else {
+            None
+        };
         self.submit_inner(frame, |address| {
-            descriptor::transmit(frame, local, address, rate)
+            descriptor::transmit(copy.as_deref().unwrap_or(frame), local, address, rate)
         })
     }
     pub(super) fn submit_rates(
@@ -746,8 +887,16 @@ impl<P: Port> Packet<P> {
         series: super::rates::Series,
     ) -> Result<u64, Error> {
         let local = self.local;
+        let copy = if frame.get(1).is_some_and(|flag| flag & 0x10 != 0) {
+            Some(
+                descriptor::ps_unmark(frame, self.ps.as_ref().ok_or(Error::State)?)
+                    .map_err(|_| Error::Packet)?,
+            )
+        } else {
+            None
+        };
         self.submit_inner(frame, |address| {
-            descriptor::transmit_series(frame, local, address, series)
+            descriptor::transmit_series(copy.as_deref().unwrap_or(frame), local, address, series)
         })
     }
     pub(super) fn submit_ba_response(&mut self, frame: &[u8], rate: usize) -> Result<u64, Error> {
@@ -787,8 +936,24 @@ impl<P: Port> Packet<P> {
         } else {
             0
         };
+        let copy = if frame.get(1).is_some_and(|flag| flag & 0x10 != 0) {
+            Some(
+                descriptor::ps_unmark(frame, self.ps.as_ref().ok_or(Error::State)?)
+                    .map_err(|_| Error::Packet)?,
+            )
+        } else {
+            None
+        };
         self.submit_queue(frame, queue, |address| {
-            descriptor::transmit_ht_tid(frame, local, address, mcs, basic, profile, tids)
+            descriptor::transmit_ht_tid(
+                copy.as_deref().unwrap_or(frame),
+                local,
+                address,
+                mcs,
+                basic,
+                profile,
+                tids,
+            )
         })
     }
     pub(super) fn submit_sender_action(
@@ -841,8 +1006,22 @@ impl<P: Port> Packet<P> {
             .iter()
             .map(|s| u64::from(storage.tx.address()) + (*s * STRIDE) as u64)
             .collect();
+        let copies: Option<Vec<Vec<u8>>> = if frames
+            .iter()
+            .any(|frame| frame.get(1).is_some_and(|flag| flag & 0x10 != 0))
+        {
+            let source = self.ps.as_ref().ok_or(Error::State)?;
+            Some(
+                frames
+                    .iter()
+                    .map(|frame| descriptor::ps_unmark(frame, source).map_err(|_| Error::Packet))
+                    .collect::<Result<_, _>>()?,
+            )
+        } else {
+            None
+        };
         let words = descriptor::transmit_aggregate(
-            frames,
+            copies.as_deref().unwrap_or(frames),
             self.local,
             descriptor::AggregateAddresses {
                 payloads: &payloads,
@@ -867,6 +1046,9 @@ impl<P: Port> Packet<P> {
             .ok_or(Error::Timeout)?;
         self.phase = Phase::Failed;
         self.check_transmit()?;
+        if self.ps.is_some() {
+            self.ps_receive_on()?;
+        }
         if self.port.read(QTXE)? & 1 != 0 || self.port.read(QSTS)? & 3 != 0 {
             return Err(Error::Descriptor);
         }
@@ -989,6 +1171,9 @@ impl<P: Port> Packet<P> {
         let dma = descriptor::dma_bytes(frame).map_err(|_| Error::Packet)?;
         self.phase = Phase::Failed;
         self.check_transmit()?;
+        if self.ps.is_some() {
+            self.ps_receive_on()?;
+        }
         if self.port.read(QTXE)? & 0xf != 0
             || self.port.read(QSTS)? & 3 != 0
             || self.qos.is_some() && !self.data_queues_idle()?
@@ -1139,7 +1324,15 @@ impl<P: Port> Packet<P> {
             }
             storage.rx_bytes[slot].sync();
             let payload = storage.rx_bytes[slot].bytes(length)?;
-            let frame = if self.ba {
+            let frame = if let Some(source) = &self.ps {
+                descriptor::receive_ps(
+                    &words,
+                    &payload,
+                    self.ht.ok_or(Error::State)?,
+                    self.ba,
+                    source,
+                )
+            } else if self.ba {
                 descriptor::receive_ba(&words, &payload, self.ht.ok_or(Error::State)?)
             } else if let Some(profile) = self.ht {
                 descriptor::receive_profile(&words, &payload, profile)

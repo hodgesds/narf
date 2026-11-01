@@ -24,6 +24,7 @@ mod packet;
 mod packet_native;
 mod pcie_pm;
 mod phy;
+mod ps;
 mod qos;
 mod rates;
 mod rx_ba;
@@ -34,6 +35,7 @@ pub use ht::Request as Ht20QualificationRequest;
 pub use ht40::Request as Ht40QualificationRequest;
 pub use identity::{BringUpError, Identity, EEPROM_4K_BYTES};
 pub use phy::Prepared as BasebandPrepared;
+pub use ps::Request as PowerSaveQualificationRequest;
 pub use qos::Request as QosQualificationRequest;
 pub use rx_ba::Request as RxBaQualificationRequest;
 pub use tx_ba::Request as TxBaQualificationRequest;
@@ -107,6 +109,17 @@ impl Ath9k {
             .as_ref()
             .and_then(|radio| radio.try_lock())
             .and_then(|radio| radio.tx_aggregate_request())
+            .ok_or(BringUpError::BadState)
+    }
+    /// Factual optional NETWORK_SLEEP full-program request; no power-state
+    /// transition, AP notice or key authority is granted by this metadata.
+    pub fn power_save_qualification_request(
+        &self,
+    ) -> Result<PowerSaveQualificationRequest, BringUpError> {
+        self.station
+            .as_ref()
+            .and_then(|radio| radio.try_lock())
+            .and_then(|radio| radio.ps_request())
             .ok_or(BringUpError::BadState)
     }
     /// Optional recipient-BA request from the same current HT source/owner.

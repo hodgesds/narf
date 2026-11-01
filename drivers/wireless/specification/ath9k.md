@@ -142,7 +142,7 @@ AR9285-specific writes follow a checked silicon revision.
   Busy without changing carrier. Failure or
   cancellation hides the partial cache, closes the owner and retains DMA.
 - Synchronous bounded packet progression services polled RX/TX with hardware
-  IRQs masked. Every transmit rechecks current signed policy and factory
+  IRQs masked unless MSI or optional source-qualified station PS is active. Every transmit rechecks current signed policy and factory
   RF-silent GPIO state; metadata and packet publication share terminal closure.
   Disconnect, cancellation, peer loss, policy loss or ambiguous completion
   closes the initial profile permanently and retains every published mapping.
@@ -755,6 +755,37 @@ through the same real owner. No new generic board profile or chip is inferred.
 Five additional native cases are written; release/native and physical
 acceptance remain pending.
 
+
+### 3.9 Optional source-qualified station NETWORK_SLEEP
+
+`Ath9k::power_save_qualification_request()` returns the factual optional
+N85S1 source identity/MAC/filename for the exact current H1/2/3 body and
+20/40 geometry. The existing `WirelessNetIface::power_save_default` and
+`set_power_save` methods now serve the real nl80211 setting. SET owns desired
+configuration; actual PM notice, ACK/queue/RX-idle receipt, timer program and
+RTC transition finish in the retained Radio continuation. Default awake and
+unsupported-without-S behavior preserve existing deployments.
+
+The admitted AR9285 program is source-complete for PM1/PM0 non-QoS plaintext
+Null, actual short PS-Poll descriptor/AID, current-beacon TIM/DTIM/CAB/MoreData,
+manual TIM_TIMER/MSI-or-polled wake, source-literal timers and bounded actual
+AWAKE/NETWORK_SLEEP readbacks. Shared DATA crypto is unchanged: controls
+consume no PN; ordinary original DATA/security PM mutation preserves exact
+native and shared reply ownership. A bounded, epoch-cleared unpublished BA
+reply continuation drains RX behind a held PS receipt; BA activation still
+requires its own real native ACK/idle proof. Re-enable needs a fresh beacon. Fresh
+source and PCI invocations enclose every actual native wake/access/copy;
+SHUTDOWN never fabricates live association preservation. Ambiguous hardware
+or authority loss closes the owner and retains unproven DMA. Complete signed
+full-program/multidimensional qualification is required; no physical board
+measurements or signed asset is supplied. The separate idle_FULL_SLEEP and
+periodic-calibration operations are not authorized by S.
+
+The exact format, source references, controls, hardware ownership and pending
+acceptance are [AR9285 station power save](ar9285-station-power-save.md).
+Eight new native cases are written; release/native execution and physical
+acceptance remain pending.
+
 ## 4. Invariants
 
 - PCI parking is verified by command-register readback before BAR sizing: BME
@@ -923,10 +954,12 @@ rows and the tree facts that keep each open:
   `Port` register access assumes AWAKE and no use-counted wake wraps the
   packet/irq/station owners, and the station has no idle notion distinct from
   its passive scan cache, which keeps RX running.
-- `station_network_sleep`: Linux sets `SUPPORTS_PS` only with
-  `ps_enable=1` (`init.c`, default off). Natively there is no beacon-timer
-  programming (`ath9k_hw_set_sta_beacon_timers`), TIM parsing, PS-Poll or
-  NULL-data PM signalling, and IMR_S5 TIM_TIMER stays cleared (`irq.rs`).
+- `station_network_sleep` is source-complete for the admitted optional
+  AR9285 N85S1 program in §3.9: actual public desired setting, PM notice/
+  PS-Poll receipts, TIM/DTIM/CAB timers, source-qualified real awake/sleep
+  access and terminal DMA ownership. Eight new native cases are written;
+  release/native execution and external measured physical acceptance remain
+  pending. Missing S preserves default awake operation.
 - `host_bus_pm`: native implementation and x86_64/aarch64 software
   validation completed2026-10-29. The family subtree passes114 native
   smokes per architecture; bus/pcie also covers current child authority,
@@ -972,17 +1005,19 @@ failed MSI disable quarantines the vector. Covered by
 on AR9285 is unmeasured.
 
 Power transitions are enumerated from Linux `hw.h::ath9k_power_mode`
-(`AWAKE`, `FULL_SLEEP`, `NETWORK_SLEEP`) and their callers. The current owner
-forces `AR_RTC_FORCE_WAKE` during reset and stays `AWAKE`; AR9285 lacks
-`ATH9K_HW_CAP_AUTOSLEEP` (`hw.c::ath9k_hw_fill_cap_info`), so every sleep entry
-must be software-forced. Remaining named operations:
+(`AWAKE`, `FULL_SLEEP`, `NETWORK_SLEEP`) and their callers. Reset forces
+`AR_RTC_FORCE_WAKE`; the default owner stays awake unless the optional N85S1
+station program in §3.9 is admitted. AR9285 lacks `ATH9K_HW_CAP_AUTOSLEEP`
+(`hw.c::ath9k_hw_fill_cap_info`), so sleep entry is software-forced. Named
+operations and their separate owners:
 
 - `idle_full_sleep`: `main.c::{ath9k_ps_wakeup,ath9k_ps_restore,ath_ps_full_sleep}`
   use-counted wake, 100 ms idle timer, RX abort/DMA stop and `FULL_SLEEP`,
   with `hw.c::ath9k_hw_setpower` restoring `AWAKE` before register access.
 - `station_network_sleep`: `NETWORK_SLEEP` station power save with
   `beacon.c::ath9k_beacon_config_sta`/`hw.c::ath9k_hw_set_sta_beacon_timers`
-  TIM/DTIM timers and beacon/CAB/PS-Poll/TX-ACK wake conditions. Linux leaves
+  TIM/DTIM timers and beacon/CAB/PS-Poll/TX-ACK wake conditions, implemented
+  with distinct signed N85S1 source authority in §3.9. Linux leaves
   `SUPPORTS_PS` behind the `ps_enable` module parameter (default off).
 - `host_bus_pm`: `pci.c::ath_pci_aspm_init` parent-link ASPM L0s/L1 discovery
   and `aspm_l1_fix` (config 0x70c) handling.

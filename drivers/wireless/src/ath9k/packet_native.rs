@@ -33,6 +33,10 @@ pub(super) struct Native {
     ba: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::rx_ba::Grant>>>,
     tx_ba: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::tx_ba::Grant>>>,
     qos: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::qos::Grant>>>,
+    ps: narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<super::ps::Grant>>>,
+    ps_bound: AtomicBool,
+    ps_sleeping: AtomicBool,
+    ps_failed: AtomicBool,
     msi: narf_lib::sync::IrqSafeSpinLock<Option<Msi>>,
 }
 /// Single MSI vector (Linux `ath9k_use_msi` + `pci_enable_msi`). The handler
@@ -119,6 +123,10 @@ impl Native {
             ba: narf_lib::sync::IrqSafeSpinLock::new(None),
             tx_ba: narf_lib::sync::IrqSafeSpinLock::new(None),
             qos: narf_lib::sync::IrqSafeSpinLock::new(None),
+            ps: narf_lib::sync::IrqSafeSpinLock::new(None),
+            ps_bound: AtomicBool::new(false),
+            ps_sleeping: AtomicBool::new(false),
+            ps_failed: AtomicBool::new(false),
             msi: narf_lib::sync::IrqSafeSpinLock::new(None),
         })
     }
@@ -316,6 +324,50 @@ narf_kernel_test::kernel_test_in!(
     smoke_ar9285_native_packet_revocation_precedes_config_dma_and_mmio
 );
 impl Port for Native {
+    fn ps_grant(&self) -> Option<alloc::sync::Arc<super::ps::Grant>> {
+        if let Some(source) = self.ps.lock().clone() {
+            return Some(source);
+        }
+        let source = super::ps::Source::Registered.load(self.ht_grant()?).ok()?;
+        let mut retained = self.ps.lock();
+        Some(retained.get_or_insert(source).clone())
+    }
+    fn bind_ps(&self, source: &alloc::sync::Arc<super::ps::Grant>) -> Result<(), Error> {
+        if self
+            .ps_grant()
+            .is_none_or(|current| !alloc::sync::Arc::ptr_eq(&current, source))
+        {
+            return Err(Error::Access);
+        }
+        source.check()?;
+        self.access(self.active.load(Ordering::Acquire), || {
+            self.command()?; // includes PCI INTx disabled for the polled path.
+            self.ps_bound.store(true, Ordering::Release);
+            Ok(())
+        })
+    }
+    fn network_sleep(&self) -> Result<(), Error> {
+        let source = self.ps.lock().clone().ok_or(Error::Access)?;
+        if !self.ps_bound.load(Ordering::Acquire) || self.ps_failed.load(Ordering::Acquire) {
+            return Err(Error::Access);
+        }
+        self.transmit_allowed()?;
+        source.invoke(|| {
+            self.invoke(|| {
+                let raw = PowerRaw {
+                    native: self,
+                    source: &source,
+                };
+                // Mark an ambiguous attempt before any clock mutation. Ordinary
+                // I/O can resume only after the full actual sleep proof succeeds.
+                self.ps_failed.store(true, Ordering::Release);
+                super::ps::hardware::network_sleep(&raw)?;
+                self.ps_sleeping.store(true, Ordering::Release);
+                self.ps_failed.store(false, Ordering::Release);
+                Ok(())
+            })
+        })
+    }
     fn channel_mask(&self) -> u16 {
         self.channel_mask
     }
@@ -399,81 +451,113 @@ impl Port for Native {
         operation: impl FnOnce() -> Result<T, Error>,
     ) -> Result<T, Error> {
         self.invoke(|| {
-            let command = self.command()?;
-            if (command & narf_bus::pci::cmd::BUS_MASTER != 0) != active
-                || self.active.load(Ordering::Acquire) != active
-            {
-                return Err(Error::Access);
-            }
-            let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
-            let permission =
-                super::calibration::Permission::from_domain_at(&domain, self.report.frequency_mhz)
-                    .map_err(|_| Error::Access)?;
-            if !permission.allows_report(self.report) {
-                return Err(Error::Access);
-            }
-            if let Some(powers) = &self.powers {
-                // Raw loads stay inside this current BusDevice invocation;
-                // using Port::read here would recursively enter access().
-                let read = |register| -> Result<u32, Error> {
-                    self.extent(register)?;
-                    // SAFETY: full dword BAR bounds and current exclusive PCI
-                    // authority were checked above; no competing channel writer.
-                    Ok(unsafe { self.bar.read32(register) })
-                };
-                let geometry = self.geometry();
-                if read(0x9874)? & 0x3fff_ffff
-                    != (0x3000_0000 | (u32::from(geometry.center()) * 0x10000 / 15))
-                    || read(0x9804)? & 0x7ff != geometry.turbo()
-                {
-                    return Err(Error::Descriptor);
-                }
-                for (register, value) in powers.registers() {
-                    if read(*register)? != *value {
-                        return Err(Error::Descriptor);
+            let ps = if self.ps_bound.load(Ordering::Acquire) {
+                Some(self.ps.lock().clone().ok_or(Error::Access)?)
+            } else {
+                None
+            };
+            let action = || {
+                if let Some(source) = ps.as_ref() {
+                    if self.ps_failed.load(Ordering::Acquire) {
+                        return Err(Error::Access);
+                    }
+                    let raw = PowerRaw {
+                        native: self,
+                        source,
+                    };
+                    if self.ps_sleeping.load(Ordering::Acquire) {
+                        if let Err(error) = super::ps::hardware::awake(&raw) {
+                            self.ps_failed.store(true, Ordering::Release);
+                            return Err(error);
+                        }
+                        self.ps_sleeping.store(false, Ordering::Release);
+                    } else if super::ps::hardware::Raw::read(&raw, 0x7044)? & 15 != 2 {
+                        self.ps_failed.store(true, Ordering::Release);
+                        return Err(Error::State);
                     }
                 }
-                if let InstalledPower::Forty(actual) = powers {
-                    let iq = 0x800
-                        | (u32::from(actual.report.iq_i) << 5)
-                        | (actual.report.iq_q as u32 & 31);
-                    if read(0x8318)? != 1
-                        || read(0x99b4)? != actual.adc
-                        || read(0x9920)? & 0xfff != iq
+                let command = self.command()?;
+                if (command & narf_bus::pci::cmd::BUS_MASTER != 0) != active
+                    || self.active.load(Ordering::Acquire) != active
+                {
+                    return Err(Error::Access);
+                }
+                let domain = narf_wireless::reg::db::snapshot().ok_or(Error::Access)?;
+                let permission = super::calibration::Permission::from_domain_at(
+                    &domain,
+                    self.report.frequency_mhz,
+                )
+                .map_err(|_| Error::Access)?;
+                if !permission.allows_report(self.report) {
+                    return Err(Error::Access);
+                }
+                if let Some(powers) = &self.powers {
+                    // Raw loads stay inside this current BusDevice invocation;
+                    // using Port::read here would recursively enter access().
+                    let read = |register| -> Result<u32, Error> {
+                        self.extent(register)?;
+                        // SAFETY: full dword BAR bounds and current exclusive PCI
+                        // authority were checked above; no competing channel writer.
+                        Ok(unsafe { self.bar.read32(register) })
+                    };
+                    let geometry = self.geometry();
+                    if read(0x9874)? & 0x3fff_ffff
+                        != (0x3000_0000 | (u32::from(geometry.center()) * 0x10000 / 15))
+                        || read(0x9804)? & 0x7ff != geometry.turbo()
                     {
                         return Err(Error::Descriptor);
                     }
+                    for (register, value) in powers.registers() {
+                        if read(*register)? != *value {
+                            return Err(Error::Descriptor);
+                        }
+                    }
+                    if let InstalledPower::Forty(actual) = powers {
+                        let iq = 0x800
+                            | (u32::from(actual.report.iq_i) << 5)
+                            | (actual.report.iq_q as u32 & 31);
+                        if read(0x8318)? != 1
+                            || read(0x99b4)? != actual.adc
+                            || read(0x9920)? & 0xfff != iq
+                        {
+                            return Err(Error::Descriptor);
+                        }
+                    }
                 }
-            }
-            if let Some((gpio, polarity)) = self.rf_silent {
-                self.extent(0x4048)?;
-                // SAFETY: checked full input-register extent in current PCI
-                // invocation, without recursively entering this access helper.
-                let value = unsafe { self.bar.read32(0x4048) };
-                if value == u32::MAX || (value & (1 << (12 + gpio)) != 0) == polarity {
-                    return Err(Error::Access);
+                if let Some((gpio, polarity)) = self.rf_silent {
+                    self.extent(0x4048)?;
+                    // SAFETY: checked full input-register extent in current PCI
+                    // invocation, without recursively entering this access helper.
+                    let value = unsafe { self.bar.read32(0x4048) };
+                    if value == u32::MAX || (value & (1 << (12 + gpio)) != 0) == polarity {
+                        return Err(Error::Access);
+                    }
                 }
-            }
-            let grant = { self.ht.lock().clone() };
-            let ba = { self.ba.lock().clone() };
-            let tx = { self.tx_ba.lock().clone() };
-            let qos = { self.qos.lock().clone() };
-            let operation = || match (ba, grant) {
-                (Some(g), _) => g.invoke(operation),
-                (None, Some(g)) => g.invoke(operation),
-                (None, None) => operation(),
-            };
-            let operation = || {
-                if let Some(g) = tx {
+                let grant = { self.ht.lock().clone() };
+                let ba = { self.ba.lock().clone() };
+                let tx = { self.tx_ba.lock().clone() };
+                let qos = { self.qos.lock().clone() };
+                let operation = || match (ba, grant) {
+                    (Some(g), _) => g.invoke(operation),
+                    (None, Some(g)) => g.invoke(operation),
+                    (None, None) => operation(),
+                };
+                let operation = || {
+                    if let Some(g) = tx {
+                        g.invoke(operation)
+                    } else {
+                        operation()
+                    }
+                };
+                if let Some(g) = qos {
                     g.invoke(operation)
                 } else {
                     operation()
                 }
             };
-            if let Some(g) = qos {
-                g.invoke(operation)
-            } else {
-                operation()
+            match ps.as_ref() {
+                Some(source) => source.invoke(action),
+                None => action(),
             }
         })
     }
@@ -589,6 +673,77 @@ impl Port for Native {
             quarantine(&msi);
             core::mem::forget(msi);
             Err(Error::Access)
+        }
+    }
+}
+
+/// Raw current-cap power operations; never recursively call Port::read.
+struct PowerRaw<'a> {
+    native: &'a Native,
+    source: &'a super::ps::Grant,
+}
+impl super::ps::hardware::Raw for PowerRaw<'_> {
+    fn read(&self, register: u64) -> Result<u32, Error> {
+        self.source.invoke(|| {
+            self.native.invoke(|| {
+                let command = self.native.command()?;
+                if (command & narf_bus::pci::cmd::BUS_MASTER != 0)
+                    != self.native.active.load(Ordering::Acquire)
+                {
+                    return Err(Error::Access);
+                }
+                self.native.extent(register)?;
+                // SAFETY: actual retained sole BAR, complete dword extent and
+                // fresh source/PCI invocation; raw RTC access must precede AWAKE.
+                let value = unsafe { self.native.bar.read32(register) };
+                if value == u32::MAX {
+                    Err(Error::Access)
+                } else {
+                    Ok(value)
+                }
+            })
+        })
+    }
+    fn write(&self, register: u64, value: u32) -> Result<(), Error> {
+        self.source.invoke(|| {
+            self.native.invoke(|| {
+                let command = self.native.command()?;
+                if (command & narf_bus::pci::cmd::BUS_MASTER != 0)
+                    != self.native.active.load(Ordering::Acquire)
+                {
+                    return Err(Error::Access);
+                }
+                self.native.extent(register)?;
+                // SAFETY: same current sole PCI/source invocation and full BAR
+                // extent, serialized by the retained packet/radio owner.
+                unsafe {
+                    self.native.bar.write32(register, value);
+                }
+                Ok(())
+            })
+        })
+    }
+    fn delay(&self, us: u64) {
+        narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_us(us));
+    }
+    fn wait(&self, register: u64, mask: u32, expected: u32, budget_us: u64) -> Result<(), Error> {
+        let mut failure = None;
+        let done = narf_scheduler::responsive_spin_until(
+            || match self.read(register) {
+                Ok(value) => value & mask == expected,
+                Err(error) => {
+                    failure = Some(error);
+                    true
+                }
+            },
+            narf_time::Deadline::after_us(budget_us),
+        );
+        if let Some(error) = failure {
+            Err(error)
+        } else if done {
+            Ok(())
+        } else {
+            Err(Error::Timeout)
         }
     }
 }

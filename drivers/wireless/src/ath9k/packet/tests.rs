@@ -47,6 +47,11 @@ pub(in crate::ath9k) struct Region {
 }
 pub(in crate::ath9k) struct Model {
     pub(in crate::ath9k) wide: RefCell<Option<crate::ath9k::calibration::wide::WideReport>>,
+    pub(in crate::ath9k) ps: RefCell<Option<Arc<crate::ath9k::ps::Grant>>>,
+    pub(in crate::ath9k) ps_bound: Cell<bool>,
+    pub(in crate::ath9k) ps_sleeping: Cell<bool>,
+    pub(in crate::ath9k) ps_failed: Cell<bool>,
+    pub(in crate::ath9k) ps_trace: RefCell<Vec<(u64, u32)>>,
     pub(in crate::ath9k) rx_flags: Cell<u32>,
     pub(in crate::ath9k) frequency: Cell<u16>,
     pub(in crate::ath9k) channels: Cell<u16>,
@@ -104,6 +109,11 @@ impl Model {
     pub(in crate::ath9k) fn new() -> Arc<Self> {
         Arc::new(Self {
             wide: RefCell::new(None),
+            ps: RefCell::new(None),
+            ps_bound: Cell::new(false),
+            ps_sleeping: Cell::new(false),
+            ps_failed: Cell::new(false),
+            ps_trace: RefCell::new(Vec::new()),
             rx_flags: Cell::new(0),
             frequency: Cell::new(2412),
             channels: Cell::new(1),
@@ -294,6 +304,12 @@ impl Model {
         Ok((dma, original))
     }
     pub(in crate::ath9k) fn inject(&self, bytes: &[u8], error: u32) -> Result<(), Error> {
+        if self.ps_bound.get()
+            && (self.ps_sleeping.get()
+                || self.registers.borrow().get(&DIAG).copied().unwrap_or(0) & RX_PARK != 0)
+        {
+            return Err(Error::State);
+        }
         let mut padded = Vec::new();
         if bytes.first() == Some(&0x88) {
             if bytes.len() < 26 {
@@ -353,10 +369,57 @@ impl Model {
         )?;
         self.last_rx.set(Some(descriptor));
         self.cursor.set(self.word(descriptor)?);
+        if self.ps_bound.get() {
+            // Real device-side TSF sync and RX interrupt report after DMA.
+            if bytes.len() >= 36 && bytes.first() == Some(&0x80) {
+                let tsf = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+                self.registers.borrow_mut().insert(0x804c, tsf as u32);
+                self.registers
+                    .borrow_mut()
+                    .insert(0x8050, (tsf >> 32) as u32);
+            }
+            let mut registers = self.registers.borrow_mut();
+            let cause = registers.get(&0x80).copied().unwrap_or(0) | 0x80000000;
+            registers.insert(0x80, cause);
+            registers.insert(0xc0, cause);
+            registers.insert(0x4038, 2);
+            drop(registers);
+            if let Some(signal) = self.signal.borrow().clone() {
+                signal.raise();
+            }
+        }
         Ok(())
     }
 }
 impl Port for Arc<Model> {
+    fn ps_grant(&self) -> Option<Arc<crate::ath9k::ps::Grant>> {
+        self.ps.borrow().clone()
+    }
+    fn bind_ps(&self, source: &Arc<crate::ath9k::ps::Grant>) -> Result<(), Error> {
+        self.as_ref().access()?;
+        if self
+            .ps_grant()
+            .is_none_or(|current| !Arc::ptr_eq(&current, source))
+        {
+            return Err(Error::Access);
+        }
+        source.check()?;
+        self.ps_bound.set(true);
+        self.power_awake()
+    }
+    fn network_sleep(&self) -> Result<(), Error> {
+        self.transmit_allowed()?;
+        let source = self.ps_grant().ok_or(Error::Access)?;
+        source.check()?;
+        self.ps_failed.set(true);
+        crate::ath9k::ps::hardware::network_sleep(&power::RawModel {
+            model: self,
+            source: &source,
+        })?;
+        self.ps_sleeping.set(true);
+        self.ps_failed.set(false);
+        Ok(())
+    }
     fn geometry(&self) -> crate::ath9k::channel_width::Geometry {
         self.wide.borrow().as_ref().map_or_else(
             || crate::ath9k::channel_width::Geometry::from_frequency(self.frequency.get()).unwrap(),
@@ -382,6 +445,7 @@ impl Port for Arc<Model> {
         self.ht.borrow().clone()
     }
     fn transmit_allowed(&self) -> Result<(), Error> {
+        self.power_awake()?;
         if self.allowed.get() {
             if let Some(g) = self.rx_ba_grant() {
                 g.check()?;
@@ -400,6 +464,7 @@ impl Port for Arc<Model> {
         operation: impl FnOnce() -> Result<T, Error>,
     ) -> Result<T, Error> {
         self.as_ref().access()?;
+        self.power_awake()?;
         if self.master.get() != active {
             return Err(Error::Access);
         }
@@ -412,14 +477,22 @@ impl Port for Arc<Model> {
                 operation()
             }
         };
-        if let Some(g) = self.tx_ba_grant() {
-            g.invoke(operation)
+        let operation = || {
+            if let Some(g) = self.tx_ba_grant() {
+                g.invoke(operation)
+            } else {
+                operation()
+            }
+        };
+        if self.ps_bound.get() {
+            self.ps_grant().ok_or(Error::Access)?.invoke(operation)
         } else {
             operation()
         }
     }
     fn read(&self, reg: u64) -> Result<u32, Error> {
         self.as_ref().access()?;
+        self.power_awake()?;
         if let Some(g) = self.tx_ba_grant() {
             g.check()?;
         }
@@ -432,10 +505,20 @@ impl Port for Arc<Model> {
         if let Some(g) = self.qos_grant() {
             g.check()?;
         }
+        if self.ps_bound.get() && reg == 0xc0 {
+            let value = self.registers.borrow_mut().remove(&reg).unwrap_or(0);
+            self.registers.borrow_mut().insert(0x80, 0);
+            self.registers.borrow_mut().insert(0x4038, 0);
+            return Ok(value);
+        }
+        if self.ps_bound.get() && reg == 0xd8 {
+            return Ok(self.registers.borrow_mut().remove(&reg).unwrap_or(0));
+        }
         Ok(*self.registers.borrow().get(&reg).unwrap_or(&0))
     }
     fn write(&self, reg: u64, value: u32) -> Result<(), Error> {
         self.as_ref().access()?;
+        self.power_awake()?;
         if let Some(g) = self.tx_ba_grant() {
             g.check()?;
         }
@@ -452,6 +535,9 @@ impl Port for Arc<Model> {
             return Ok(());
         }
         let prior = self.registers.borrow_mut().insert(reg, value).unwrap_or(0);
+        if self.ps_bound.get() {
+            self.ps_trace.borrow_mut().push((reg, value));
+        }
         if reg == RXDP {
             self.cursor.set(value);
         }
@@ -597,6 +683,7 @@ impl Port for Arc<Model> {
     }
     fn allocate(&self, bytes: usize) -> Result<DmaBuffer, Error> {
         self.as_ref().access()?;
+        self.power_awake()?;
         // Match the native adapter: ordinary ring allocation is inactive;
         // only a current distinct larger source permits running expansion.
         if self.master.get() {
@@ -1084,3 +1171,6 @@ kernel_test_in!(
     "drivers/wireless/ath9k/packet",
     smoke_ar9285_packet_msi_cause_kill_resume_and_fatal
 );
+
+#[path = "ps_model.rs"]
+mod power;

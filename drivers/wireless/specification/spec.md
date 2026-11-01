@@ -385,13 +385,23 @@ are written and focused release checks pass. Validation of the preceding20
 implementations is underway in an isolated frozen checkout; source completion
 and software execution do not establish physical board qualification.
 
+**Source implementation recount 2026-11-01** (AR9285 station NETWORK_SLEEP written):
+the remaining ledger holds **85 `feature`** rows (85 driver, 0 shared),
+**31 `chip`** and **0 `unknown`**. Twenty-two source-complete implementations
+await validation in `research/implemented-pending-validation.tsv`. The new
+optional N85S1 owner drives actual PM notices, TIM/DTIM/CAB wake, PS-Poll and
+AWAKE/NETWORK_SLEEP readbacks without replacing original key/BA/DMA owners.
+Eight native cases are written and isolated release checks pass. Validation
+of the preceding21 implementations continues in a frozen checkout; this
+source addition remains in the next batch. Physical qualification is separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 4 | MLO; AP/P2P/WoW; admitted complete6GHz, EHT/320 and single-link MLD source is implemented pending validation; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 4 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA; hosted loadable packet ABI is implemented pending validation |
 | ath10k | 13 | Contiguous VHT160, PFC, alternate calibration sources, ROC/action-frame ownership, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload; streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are implemented pending validation |
-| ath9k | 3 | Periodic calibration and idle/station sleep; admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants are implemented pending validation; other chips are separate rows |
+| ath9k | 2 | Periodic calibration and idle FULL_SLEEP; station NETWORK_SLEEP is implemented pending validation; admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants are implemented pending validation; other chips are separate rows |
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are implemented pending validation |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
@@ -1161,6 +1171,17 @@ capabilities and separate320/MLO work grant no additional operation. The
 MT76 native MCU/WFDMA engine remains permanently resident while the loadable
 frontend owns its real probe/service/control lifecycle. Full native, module
 and cross-architecture validation is deferred to the combined final pass.
+
+AR9285 exposes `Ath9k::power_save_qualification_request()` as
+`Result<PowerSaveQualificationRequest, BringUpError>` factual identity/MAC/
+filename metadata. The existing `WirelessNetIface` power-save SET/GET carries
+desired policy only. An optional current signed N85S1 full-program owner must
+observe actual PM notice/PS-Poll ACK and native idle receipts, fresh TIM/AID
+and actual clock/timer/RX-abort readbacks before NETWORK_SLEEP. Missing N85S1
+leaves existing awake operation and refuses unsupported requests. Original
+key/PN, BA, copied-frame and terminal DMA ownership remain independent.
+Idle FULL_SLEEP and periodic calibration are separate implementations; the
+family §3.9 and `ar9285-station-power-save.md` specify the exact contract.
 
 ## 4. Interaction with `narf-wireless`
 

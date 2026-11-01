@@ -549,6 +549,17 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Device<P, E> {
                 narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
             }
         }
+        // Native checks/copy/callback admission may have woken a dozing
+        // owner after Radio::poll. Restore only after all reentrant stack
+        // work, with the same pending/control/RX-idle/source predicates.
+        if !self.closed.load(Ordering::Acquire) {
+            if let Some(mut radio) = self.radio.try_lock() {
+                if radio.restore_power_save().is_err() {
+                    self.close();
+                    self.clear_rx();
+                }
+            }
+        }
         progress
     }
     #[cfg(any(test, feature = "kernel-test"))]
@@ -597,6 +608,23 @@ impl<P: Port + Send + 'static, E: Environment + 'static> Interface for Device<P,
 }
 #[async_trait::async_trait]
 impl<P: Port + Send + 'static, E: Environment + 'static> WirelessNetIface for Device<P, E> {
+    fn power_save_default(&self) -> Option<bool> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        self.radio.try_lock()?.power_save()
+    }
+    fn set_power_save(&self, enabled: bool) -> Result<(), i32> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(-5);
+        }
+        let mut radio = self.radio.try_lock().ok_or(-16)?;
+        radio.set_power_save(enabled).map_err(|error| match error {
+            Error::Profile => -95,
+            Error::Busy => -16,
+            _ => -5,
+        })
+    }
     fn max_scan_ssids(&self) -> u8 {
         4
     }

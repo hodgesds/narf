@@ -19,6 +19,10 @@
 use super::rates::{Feedback, Series};
 use alloc::vec::Vec;
 
+#[path = "descriptor_ps.rs"]
+mod power_save;
+pub(super) use power_save::{receive_ps, transmit_ps, unmark as ps_unmark};
+
 pub(super) const WORDS: usize = 24;
 pub(super) const BYTES: usize = WORDS * 4;
 pub(super) const MAX_MPDU: usize = 2304;
@@ -406,7 +410,7 @@ fn encode_series(
     group: bool,
     ht: bool,
 ) -> Result<[u32; WORDS], Error> {
-    if !(20..=MAX_MPDU).contains(&length) {
+    if !(16..=MAX_MPDU).contains(&length) {
         return Err(Error::Length);
     }
     if address == 0
@@ -432,8 +436,8 @@ fn encode_series(
     // CTL/host-limited power is already programmed in the per-rate registers.
     words[2] = packet_length | (63 << 16) | (1 << 24);
     words[3] = (length + if ht { 2 } else { 0 }) as u32 | if group { 1 << 24 } else { 0 };
-    // Linux enables native duration/L-SIG update for every supported frame;
-    // the excluded PS-Poll profile is the sole upstream exception.
+    // Linux enables native duration/L-SIG update for ordinary frames. The
+    // separate source-qualified PS-Poll encoder clears it to preserve AID.
     words[4] = 0x8000;
     words[9] = u32::from(RATES[usize::from(series.basic)].1) << 20;
     for slot in 0..4 {
@@ -565,27 +569,28 @@ impl narf_wireless::station_security::RawFrame for Mpdu {
 /// exact payload extent. KeyMiss is normal for protected host-CCMP frames;
 /// the MAC owner must have cleared the complete hardware key cache.
 pub(super) fn receive(words: &[u32; WORDS], payload: &[u8]) -> Result<Option<Mpdu>, Error> {
-    receive_inner(words, payload, None, false)
+    receive_inner(words, payload, None, false, false)
 }
 pub(super) fn receive_profile(
     words: &[u32; WORDS],
     payload: &[u8],
     profile: super::ht::Profile,
 ) -> Result<Option<Mpdu>, Error> {
-    receive_inner(words, payload, Some(profile), false)
+    receive_inner(words, payload, Some(profile), false, false)
 }
 pub(super) fn receive_ba(
     words: &[u32; WORDS],
     payload: &[u8],
     profile: super::ht::Profile,
 ) -> Result<Option<Mpdu>, Error> {
-    receive_inner(words, payload, Some(profile), true)
+    receive_inner(words, payload, Some(profile), true, false)
 }
 fn receive_inner(
     words: &[u32; WORDS],
     payload: &[u8],
     profile: Option<super::ht::Profile>,
     ba: bool,
+    ps: bool,
 ) -> Result<Option<Mpdu>, Error> {
     let ht = profile.is_some();
     let status = words[RX_DONE];
@@ -672,9 +677,19 @@ fn receive_inner(
         && bytes.len() >= 28
         && (bytes[24] & 0x70 == 0 || ba && bytes[24] & 0x70 == 0x60)
         && bytes[25] == 0;
+    // Only the distinct S entry admits a native plaintext AP Null that
+    // can finish a PS-Poll wait. It never supplies DATA/crypto authority;
+    // Radio still requires exact current own/AP identities and pending wait.
+    let ps_null = ps
+        && bytes.len() == 24
+        && bytes[0] == 0x48
+        && bytes[1] & !0x20 == 2
+        && rate < 12
+        && !stbc
+        && aggregation == Aggregation::default();
     let legacy = match (fc >> 2) & 3 {
         0 => fc & 0x4300 == 0,
-        2 => fc & 0x03f0 == 0x0200 || qos,
+        2 => fc & 0x03f0 == 0x0200 || qos || ps_null,
         _ => false,
     };
     if !legacy || !qos && length > MAX_MPDU + 4 || rate >= 12 && (!ht || (fc >> 2) & 3 != 2) {

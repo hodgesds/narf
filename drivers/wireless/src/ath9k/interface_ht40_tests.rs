@@ -45,6 +45,7 @@ struct Spec {
     missing: bool,
     large: bool,
     factory: Option<calibration::tests::factory::Selection>,
+    power_save: bool,
 }
 struct Nominal {
     image: [u8; crate::ath9k::EEPROM_4K_BYTES],
@@ -270,6 +271,9 @@ impl Owner {
             crate::ath9k::tx_ba::tests::qualify(&model, 64);
         }
         crate::ath9k::qos::tests::qualify(&model);
+        if self.spec.power_save {
+            crate::ath9k::ps::tests::qualify(&model);
+        }
         self.finish(
             model,
             receipt.identity.mac,
@@ -295,6 +299,7 @@ impl Owner {
         } //16us density.
         peer.lock().ht = Some(offer);
         peer.lock().qos_tids = true;
+        peer.lock().ps_test = self.spec.power_save;
         if wide {
             peer.lock().expected_ht_cap = [14 | if self.spec.gi & 2 != 0 { 64 } else { 0 }, 1];
         }
@@ -448,6 +453,7 @@ fn spec(width: Width, gi: u8, protected: bool) -> Spec {
         missing: false,
         large: false,
         factory: None,
+        power_save: false,
     }
 }
 fn network(owner: &Owner) -> Result<(), &'static str> {
@@ -994,3 +1000,6 @@ mod aggregate_tests;
 
 #[path = "interface_factory_tests.rs"]
 mod factory_tests;
+
+#[path = "interface_ps_wide_tests.rs"]
+mod ps_tests;

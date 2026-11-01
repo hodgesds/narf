@@ -134,10 +134,13 @@ enum Kind {
     TxRetry(u64, usize),
     TxBar(u64),
     TxDelba(u64),
+    PsNull(u64),
+    PsPoll(u64),
 }
 struct Pending {
     id: u64,
     bytes: Vec<u8>,
+    security_original: Option<Vec<u8>>,
     kind: Kind,
     epoch: u64,
 }
@@ -189,6 +192,13 @@ pub(super) struct Radio<P: Port, E: Environment> {
     tx_ba: Option<super::tx_ba::Owner>,
     tx_ba_checked: bool,
     pair_pending: Option<PairPending>,
+    ps: Option<super::ps::Owner>,
+    ps_bound: bool,
+    delivered_ps: Option<Pending>,
+    // Bounded unpublished BA replies while an actual PS receipt owns TX.
+    // Key/peer epoch retirement withdraws these before any publication.
+    ps_controls: VecDeque<(Vec<u8>, Kind)>,
+    rx_idle: bool,
     tx_sequence: Option<u16>,
     initial_nonce: Option<[u8; 32]>,
     sequence: u16,
@@ -233,6 +243,11 @@ impl<P: Port, E: Environment> Radio<P, E> {
             tx_ba: None,
             tx_ba_checked: false,
             pair_pending: None,
+            ps: None,
+            ps_bound: false,
+            delivered_ps: None,
+            ps_controls: VecDeque::new(),
+            rx_idle: false,
             tx_sequence: None,
             initial_nonce: None,
             sequence: 1,
@@ -355,6 +370,10 @@ impl<P: Port, E: Environment> Radio<P, E> {
     }
     pub(super) fn ready(&self) -> bool {
         self.receive_open()
+            && (!self.ps_bound || self.rx_idle)
+            && self.ps.as_ref().is_none_or(super::ps::Owner::data_ready)
+            && self.delivered_ps.is_none()
+            && self.ps_controls.is_empty()
             && self.pair_pending.is_none()
             && self.tx_ba.as_ref().is_none_or(super::tx_ba::Owner::ready)
             && self.pending.is_none()
@@ -402,13 +421,73 @@ impl<P: Port, E: Environment> Radio<P, E> {
     pub(super) fn can_aggregate(&self) -> bool {
         self.ready() && self.tx_ba.as_ref().is_some_and(super::tx_ba::Owner::paired)
     }
+    pub(super) fn ps_request(&self) -> Option<super::ps::Request> {
+        self.packet.ht_grant().map(|base| super::ps::request(&base))
+    }
+    pub(super) fn power_save(&self) -> Option<bool> {
+        if self.terminal() {
+            return None;
+        }
+        if let Some(owner) = &self.ps {
+            return owner.grant.check().ok().map(|_| owner.desired());
+        }
+        self.packet
+            .ps_grant()
+            .filter(|source| source.check().is_ok())
+            .map(|_| false)
+    }
+    pub(super) fn set_power_save(&mut self, desired: bool) -> Result<(), Error> {
+        let result = (|| {
+            let publication = self.publication.clone();
+            let _publication = publication.lock();
+            if self.terminal() {
+                return Err(Error::State);
+            }
+            if self.ps.is_none() {
+                let source = self.packet.ps_grant().ok_or(Error::Profile)?;
+                source.check()?;
+                self.ps = Some(super::ps::Owner::new(source, self.epoch));
+            }
+            self.ps.as_mut().ok_or(Error::State)?.set(desired)?;
+            if let Some(signal) = self.packet.interrupt() {
+                signal.raise();
+            }
+            Ok(())
+        })();
+        // Missing qualification is an unsupported setting. A formerly
+        // admitted owner losing authority is a terminal hardware boundary;
+        // retire only after releasing publication to avoid lock reentry.
+        if result.is_err() && !matches!(result, Err(Error::Profile)) {
+            self.fail();
+        }
+        result
+    }
+    fn ps_aid(&self) -> Result<u16, Error> {
+        match self.plan.as_ref().ok_or(Error::State)?.phase() {
+            association::Phase::Associated { aid } => Ok(aid),
+            _ => Err(Error::State),
+        }
+    }
+    fn ps_data(&mut self, frame: &[u8]) {
+        if let Some(owner) = &mut self.ps {
+            owner.accepted_data(
+                frame.get(4).is_some_and(|a| a & 1 == 0),
+                frame.get(1).is_some_and(|flags| flags & 0x20 != 0),
+                frame.get(1).is_some_and(|flags| flags & 4 != 0),
+            );
+        }
+    }
     pub(super) fn current_receive(&self, epoch: u64) -> Result<bool, Error> {
         self.packet.check_transmit()?;
         Ok(self.epoch == epoch && self.receive_open())
     }
     fn retire_receive(&mut self) -> Result<(), Error> {
         self.epoch = self.epoch.checked_add(1).ok_or(Error::State)?;
+        if let Some(owner) = &mut self.ps {
+            owner.key_epoch(self.epoch);
+        }
         self.received.clear();
+        self.ps_controls.clear();
         // Retain only exact unprotected EAPOL for the supplicant, never data
         // captured before this key/controlled-port boundary.
         self.incoming.retain(|i| plaintext_eapol(i.frame.bytes()));
@@ -444,6 +523,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
         }
         self.incoming.clear();
         self.received.clear();
+        self.ps_controls.clear();
         if let Some(ba) = &mut self.ba {
             ba.retire();
         }
@@ -485,6 +565,41 @@ impl<P: Port, E: Environment> Radio<P, E> {
             .find(|candidate| candidate.bss.bssid == bssid)
             .map(|candidate| candidate.bss.information_elements)
     }
+    fn recipient_delba(&mut self, frame: &[u8], ap: [u8; 6]) -> bool {
+        if self
+            .ba
+            .as_mut()
+            .is_none_or(|ba| !ba.delba(frame, self.own, ap))
+        {
+            return false;
+        }
+        // Unlike already-published DMA, an unpublished reply can be
+        // withdrawn for this actual current peer TID. Check again during
+        // incoming processing: the ADDBA may have created the owner only
+        // after the raw RX batch was initially copied.
+        let tid = u16::from_le_bytes([frame[26], frame[27]]) >> 12;
+        self.ps_controls.retain(|(bytes, _)| {
+            bytes.len() != 33
+                || bytes[24..26] != [3, 1]
+                || u16::from_le_bytes([bytes[29], bytes[30]]) >> 2 & 15 != tid
+        });
+        true
+    }
+    /// A completed PS native TX receipt must drain all queued key/peer
+    /// updates before AP PM commit. Retain BA replies without publishing or
+    /// activating their tickets; blocking this RX loop would deadlock that
+    /// fresh-idle fence. The same epoch owner clears this queue on rekey.
+    fn transmit_or_defer_ps_control(&mut self, bytes: Vec<u8>, kind: Kind) -> Result<(), Error> {
+        if self.delivered_ps.is_some() {
+            if self.ps_controls.len() == 8 {
+                return Err(Error::State);
+            }
+            self.ps_controls.push_back((bytes, kind));
+            Ok(())
+        } else {
+            self.transmit(bytes, kind)
+        }
+    }
     fn transmit(&mut self, mut bytes: Vec<u8>, kind: Kind) -> Result<(), Error> {
         // Caller holds publication; this helper never awaits or re-enters it.
         if self.closed.load(Ordering::Acquire) {
@@ -494,17 +609,44 @@ impl<P: Port, E: Environment> Radio<P, E> {
             || self.pair_pending.is_some()
             || self.delivered_reply.is_some()
             || self.delivered_ba.is_some()
+            || self.delivered_ps.is_some()
         {
             return Err(Error::Busy);
         }
         if !matches!(
             kind,
-            Kind::Security | Kind::Data | Kind::TxRetry(..) | Kind::TxBar(_)
+            Kind::Security
+                | Kind::Data
+                | Kind::TxRetry(..)
+                | Kind::TxBar(_)
+                | Kind::PsNull(_)
+                | Kind::PsPoll(_)
         ) {
             bytes[22..24].copy_from_slice(&(self.sequence << 4).to_le_bytes());
             self.sequence = (self.sequence + 1) & 4095;
         }
-        let id = if matches!(kind, Kind::Data | Kind::TxRetry(..)) {
+        let security_original = if kind == Kind::Security
+            && self.ps_bound
+            && self.ps.as_ref().is_some_and(super::ps::Owner::mark_pm)
+        {
+            Some(bytes.clone())
+        } else {
+            None
+        };
+        if matches!(kind, Kind::Data | Kind::Security)
+            && self.ps_bound
+            && self.ps.as_ref().is_some_and(super::ps::Owner::mark_pm)
+        {
+            bytes[1] |= 0x10;
+        }
+        let id = if matches!(kind, Kind::PsNull(_) | Kind::PsPoll(_)) {
+            self.packet.submit_ps(
+                &bytes,
+                self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
+                self.ps_aid()?,
+                self.rates.ok_or(Error::State)?.basic(),
+            )?
+        } else if matches!(kind, Kind::Data | Kind::TxRetry(..)) {
             let control = self.rates.ok_or(Error::State)?;
             if let Some(mask) = self.ht {
                 self.packet
@@ -535,6 +677,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
         self.pending = Some(Pending {
             id,
             bytes,
+            security_original,
             kind,
             epoch: self.epoch,
         });
@@ -595,6 +738,19 @@ impl<P: Port, E: Environment> Radio<P, E> {
                         plan.offered_phy().ok_or(Error::Profile)?,
                         self.packet.ht_profile().ok_or(Error::State)?,
                     )?;
+                }
+            }
+            if self.ps_bound
+                && self.ps.as_ref().is_some_and(super::ps::Owner::active)
+                && bytes.first() == Some(&0x80)
+            {
+                let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                if let Some(tim) = super::ps::tim::Tim::parse(bytes, self.own, ap, self.ps_aid()?)?
+                {
+                    let tsf = self.packet.ps_tsf()?;
+                    if let Some(plan) = self.ps.as_mut().ok_or(Error::State)?.beacon(tim, tsf) {
+                        self.packet.ps_timers(plan)?;
+                    }
                 }
             }
             self.last_peer = now;
@@ -711,7 +867,9 @@ impl<P: Port, E: Environment> Radio<P, E> {
                 )?;
             }
         }
-        if pending.kind == Kind::Security {
+        if matches!(pending.kind, Kind::PsNull(_) | Kind::PsPoll(_)) {
+            self.delivered_ps = Some(pending);
+        } else if pending.kind == Kind::Security {
             self.delivered_reply = Some(pending);
         } else if matches!(
             pending.kind,
@@ -731,14 +889,66 @@ impl<P: Port, E: Environment> Radio<P, E> {
             let _publication = publication.lock();
             // Interrupt bottom half brackets one service pass: causes are
             // read and IER killed first, then resumed after RX/TX work.
-            self.packet
-                .service_begin()
+            self.ps
+                .as_ref()
+                .map_or(Ok(()), |owner| owner.grant.check())
                 .map_err(Error::from)
-                .and_then(|_| self.progress())
+                .and_then(|_| self.packet.service_begin().map_err(Error::from))
+                .and_then(|events| {
+                    if let Some(events) = events {
+                        if events.bmiss && self.ps_bound {
+                            return Err(Error::PeerLost);
+                        }
+                        if self.ps_bound && (events.tim_timer || events.tsf_oor) {
+                            self.packet.ps_receive_on()?;
+                            let owner = self.ps.as_mut().ok_or(Error::State)?;
+                            if events.tsf_oor {
+                                owner.resync();
+                            } else {
+                                owner.wake_beacon();
+                            }
+                        }
+                    }
+                    self.progress()
+                })
                 .and_then(|frames| {
                     self.packet.service_end()?;
+                    self.restore_ps_inner()?;
                     Ok(frames)
                 })
+        };
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    fn restore_ps_inner(&mut self) -> Result<(), Error> {
+        if self.ps_bound
+            && self.ps.as_ref().is_some_and(super::ps::Owner::quiet)
+            && self.pending.is_none()
+            && self.pair_pending.is_none()
+            && self.delivered_ps.is_none()
+            && self.ps_controls.is_empty()
+            && self.delivered_reply.is_none()
+            && self.delivered_ba.is_none()
+            && self.incoming.is_empty()
+            && self.rx_idle
+            && self.receive_open()
+            && self.tx_ba.as_ref().is_none_or(super::tx_ba::Owner::ready)
+            && self
+                .security
+                .as_ref()
+                .is_none_or(|security| !security.handshake_active())
+        {
+            self.packet.ps_sleep()?;
+        }
+        Ok(())
+    }
+    pub(super) fn restore_power_save(&mut self) -> Result<(), Error> {
+        let result = {
+            let publication = self.publication.clone();
+            let _publication = publication.lock();
+            self.restore_ps_inner()
         };
         if result.is_err() {
             self.fail();
@@ -753,7 +963,11 @@ impl<P: Port, E: Environment> Radio<P, E> {
         }
         self.packet.check_transmit()?;
         let now = self.now()?;
+        if let Some(owner) = &self.ps {
+            owner.tick(now.saturating_mul(1_000_000))?;
+        }
         self.delivery()?;
+        self.rx_idle = false;
         let mut idle = false;
         for _ in 0..32 {
             let step = self.packet.receive()?;
@@ -774,10 +988,10 @@ impl<P: Port, E: Environment> Radio<P, E> {
                         }
                     }
                 }
-                if let (Some(peer), Some(ba)) = (peer, &mut self.ba) {
-                    if ba.delba(frame.bytes(), self.own, peer) {
-                        continue;
-                    }
+                if peer.is_some_and(|ap| self.recipient_delba(frame.bytes(), ap)) {
+                    continue;
+                }
+                if let (Some(peer), Some(_)) = (peer, &mut self.ba) {
                     if frame.bytes().first() == Some(&0x84) {
                         self.ba.as_mut().ok_or(Error::State)?.discard_ppdu();
                         if self.receive_open() {
@@ -865,6 +1079,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
                 ba.discard_ppdu();
             }
         }
+        self.rx_idle = idle;
         if self.established {
             if let (Some(ba), Some(peer)) = (&mut self.ba, self.peer.as_ref()) {
                 let frames = ba.expire(now.saturating_mul(1_000_000), self.own, peer.bss.bssid)?;
@@ -898,16 +1113,25 @@ impl<P: Port, E: Environment> Radio<P, E> {
             }
             if let Some(receipt) = self.delivered_reply.take() {
                 let security = self.security.as_mut().ok_or(Error::State)?;
-                if security.pending_frame() != Some(receipt.bytes.as_slice()) {
+                // Native proves the exact transmitted PM-marked original;
+                // shared Security commits its exact original message. Only
+                // the S-authorized CCMP-mutable PM bit distinguishes them.
+                let original = receipt
+                    .security_original
+                    .as_deref()
+                    .unwrap_or(&receipt.bytes);
+                if security.pending_frame() != Some(original) {
                     return Err(Error::State);
                 }
-                security.reply_delivered(receipt.bytes.len())?;
+                security.reply_delivered(original.len())?;
                 self.retire_receive()?;
             }
         }
         if self.established
             && self.pending.is_none()
             && self.pair_pending.is_none()
+            && self.delivered_ps.is_none()
+            && self.ps_controls.is_empty()
             && self.delivered_reply.is_none()
             && self.delivered_ba.is_none()
             && self
@@ -1049,6 +1273,29 @@ impl<P: Port, E: Environment> Radio<P, E> {
                             continue;
                         }
                     }
+                    if admitted && self.receive_open() {
+                        let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                        if self.recipient_delba(frame.bytes(), ap) {
+                            continue;
+                        }
+                    }
+                    if self.ps_bound && admitted && self.receive_open() {
+                        let bytes = frame.bytes();
+                        let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                        // Linux PS-Poll wait may finish on a plaintext Null
+                        // response. It grants no DATA/key/PN/replay receipt.
+                        if bytes.len() == 24
+                            && bytes[0] == 0x48
+                            && bytes[1] & !0x20 == 2
+                            && bytes[4..10] == self.own
+                            && bytes[10..16] == ap
+                            && bytes[16..22] == ap
+                            && bytes[22] & 15 == 0
+                        {
+                            self.ps_data(bytes);
+                            continue;
+                        }
+                    }
                     if self.ht.is_some() && admitted && self.receive_open() {
                         if let Some(ba) = &mut self.tx_ba {
                             if ba.response(
@@ -1099,9 +1346,9 @@ impl<P: Port, E: Environment> Radio<P, E> {
                                 } else {
                                     Kind::Decline
                                 };
-                                self.transmit(answer.bytes, kind)?;
+                                self.transmit_or_defer_ps_control(answer.bytes, kind)?;
                             } else {
-                                self.transmit(reply, Kind::Decline)?;
+                                self.transmit_or_defer_ps_control(reply, Kind::Decline)?;
                             }
                             continue;
                         }
@@ -1152,6 +1399,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
                             None
                         };
                         if let Some(batch) = batch {
+                            self.ps_data(frame.bytes());
                             if self.received.len() + batch.len() > 256 {
                                 return Err(Error::State);
                             }
@@ -1173,6 +1421,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
                                     self.own,
                                     self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
                                 ) {
+                                    self.ps_data(frame.bytes());
                                     self.last_peer = now;
                                     if self.received.len() == 256 {
                                         return Err(Error::State);
@@ -1193,6 +1442,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
                         self.own,
                         self.peer.as_ref().ok_or(Error::State)?.bss.bssid,
                     ) {
+                        self.ps_data(frame.bytes());
                         self.last_peer = now;
                         if self.received.len() == 256 {
                             return Err(Error::State);
@@ -1203,7 +1453,11 @@ impl<P: Port, E: Environment> Radio<P, E> {
                 _ => {}
             }
         }
-        if self.pending.is_none() && self.pair_pending.is_none() && self.delivered_reply.is_none() {
+        if self.pending.is_none()
+            && self.pair_pending.is_none()
+            && self.delivered_reply.is_none()
+            && self.delivered_ps.is_none()
+        {
             if let Some(reply) = self
                 .security
                 .as_ref()
@@ -1224,11 +1478,107 @@ impl<P: Port, E: Environment> Radio<P, E> {
             self.phase = Phase::Open;
             self.last_peer = now;
         }
+        if !self.ps_bound
+            && self.receive_open()
+            && self.pending.is_none()
+            && self.pair_pending.is_none()
+            && self.delivered_reply.is_none()
+            && self.delivered_ba.is_none()
+            && self.delivered_ps.is_none()
+        {
+            if let Some(owner) = self.ps.as_ref().filter(|owner| owner.active()) {
+                self.packet.enable_ps(&owner.grant)?;
+                self.ps_bound = true;
+            }
+        }
+        if idle && self.incoming.is_empty() {
+            if let Some(receipt) = self.delivered_ps.take() {
+                let ticket = match receipt.kind {
+                    Kind::PsNull(ticket) | Kind::PsPoll(ticket) => ticket,
+                    _ => return Err(Error::State),
+                };
+                if let Some(false) = self.ps.as_mut().ok_or(Error::State)?.delivered(
+                    ticket,
+                    now.saturating_mul(1_000_000),
+                    self.epoch,
+                )? {
+                    self.packet.ps_awake_mode()?;
+                }
+            }
+        }
+        if idle
+            && self.incoming.is_empty()
+            && self.receive_open()
+            && self.pending.is_none()
+            && self.pair_pending.is_none()
+            && self.delivered_ps.is_none()
+            && self.delivered_reply.is_none()
+            && self.delivered_ba.is_none()
+            && self
+                .security
+                .as_ref()
+                .is_none_or(|security| !security.handshake_active())
+        {
+            if let Some((bytes, kind)) = self.ps_controls.pop_front() {
+                self.transmit(bytes, kind)?;
+            }
+        }
+        if self.ps_bound
+            && idle
+            && self.incoming.is_empty()
+            && self.receive_open()
+            && self.ps_controls.is_empty()
+            && self.tx_ba_checked
+            && self.pending.is_none()
+            && self.pair_pending.is_none()
+            && self.delivered_ps.is_none()
+            && self.delivered_reply.is_none()
+            && self.delivered_ba.is_none()
+            && self.tx_ba.as_ref().is_none_or(super::tx_ba::Owner::ready)
+            && self
+                .security
+                .as_ref()
+                .is_none_or(|security| !security.handshake_active())
+        {
+            if self.ps.as_ref().is_some_and(super::ps::Owner::active) {
+                let grant = self.ps.as_ref().ok_or(Error::State)?.grant.clone();
+                self.packet.enable_ps(&grant)?;
+            }
+            if let Some(action) = self
+                .ps
+                .as_mut()
+                .ok_or(Error::State)?
+                .next(now.saturating_mul(1_000_000), self.epoch)?
+            {
+                let ap = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                let (bytes, kind) = match action {
+                    super::ps::Action::Null(ticket, on) => {
+                        let sequence = if let Some(security) = &mut self.security {
+                            security.reserve_plain_control_sequence()?
+                        } else {
+                            let sequence = self.sequence;
+                            self.sequence = (sequence + 1) & 4095;
+                            sequence
+                        };
+                        (
+                            super::ps::null(self.own, ap, sequence, on),
+                            Kind::PsNull(ticket),
+                        )
+                    }
+                    super::ps::Action::Poll(ticket) => (
+                        super::ps::poll(self.own, ap, self.ps_aid()?),
+                        Kind::PsPoll(ticket),
+                    ),
+                };
+                self.transmit(bytes, kind)?;
+            }
+        }
         if self.receive_open()
             && self.pending.is_none()
             && self.pair_pending.is_none()
             && self.delivered_reply.is_none()
             && self.delivered_ba.is_none()
+            && self.delivered_ps.is_none()
         {
             if !self.tx_ba_checked && self.ht.is_some() {
                 self.tx_ba_checked = true;
@@ -1536,7 +1886,7 @@ impl<P: Port, E: Environment> Radio<P, E> {
     fn native_data(&mut self, frame: &[u8]) -> Result<Vec<u8>, Error> {
         let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
         let tid = self.transmit_tid(frame);
-        let native = if let Some(security) = &mut self.security {
+        let mut native = if let Some(security) = &mut self.security {
             if self.ht.is_some() {
                 security.transmit_ethernet_qos(frame, tid)?
             } else {
@@ -1568,6 +1918,9 @@ impl<P: Port, E: Environment> Radio<P, E> {
             bytes.extend_from_slice(&frame[12..]);
             bytes
         };
+        if self.ps_bound && self.ps.as_ref().is_some_and(super::ps::Owner::mark_pm) {
+            native[1] |= 0x10;
+        }
         if self.ht.is_some() && tid == 0 {
             self.tx_sequence =
                 Some(((u16::from_le_bytes([native[22], native[23]]) >> 4) + 1) & 4095);
@@ -1624,8 +1977,28 @@ impl<P: Port, E: Environment> Radio<P, E> {
                     .collect::<Result<_, _>>()?;
                 let mcs = 7 - self.ht.ok_or(Error::State)?.leading_zeros() as u8;
                 let peer = self.peer.as_ref().ok_or(Error::State)?.bss.bssid;
+                let copies: Option<Vec<Vec<u8>>> =
+                    if frames.iter().any(|frame| frame[1] & 0x10 != 0) {
+                        let source = &self.ps.as_ref().ok_or(Error::State)?.grant;
+                        Some(
+                            frames
+                                .iter()
+                                .map(|frame| {
+                                    super::descriptor::ps_unmark(frame, source)
+                                        .map_err(|_| Error::Profile)
+                                })
+                                .collect::<Result<_, _>>()?,
+                        )
+                    } else {
+                        None
+                    };
                 let ba = self.tx_ba.as_mut().ok_or(Error::State)?;
-                let refs: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
+                let refs: Vec<&[u8]> = copies
+                    .as_deref()
+                    .unwrap_or(&frames)
+                    .iter()
+                    .map(Vec::as_slice)
+                    .collect();
                 let permit = ba.permit(&refs, self.own, peer, mcs)?;
                 ba.begin_pair(permit, frames.clone(), self.epoch)?;
                 let id = self.packet.submit_aggregate(
