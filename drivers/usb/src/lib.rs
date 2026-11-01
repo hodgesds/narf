@@ -116,12 +116,13 @@ pub fn register_initcalls() {
     });
     // Fingerprint binds through the attach cascade, not the class
     // registry; this registration exists so the registry's unbind
-    // dispatch (detach path) can reach fingerprint::detach_fp and
-    // wbdi::detach_wbdi, and so the async system-PM hook can
-    // re-arm ELAN devices on resume (#922).
+    // dispatch (detach path) can reach fingerprint::detach_fp,
+    // and so the async system-PM hook can
+    // re-arm ELAN devices on resume (#922). WBDI has no
+    // registry or detach hook since #1237: bridged readers live
+    // in FP_DEVICES, so the fingerprint hook covers them.
     narf_init::register(Stage::Subsys, "usb-fp-lifecycle", || {
         fingerprint::register_initcalls();
-        wbdi::register_initcalls();
         fingerprint::register_pm();
         InitResult::Ok
     });
