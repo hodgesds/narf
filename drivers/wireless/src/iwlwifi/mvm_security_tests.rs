@@ -608,9 +608,13 @@ impl Device {
                 let key = KeyFrame::decode(&pdu[4..], 16).ok_or("AP EAPOL descriptor")?;
                 if let Some(mut rekey) = self.rekey.take() {
                     if let Some(anonce) = rekey.anonce {
-                        if key.key_information == 0x10a {
+                        // M2 and M4 both carry Secure while the original
+                        // PTK remains installed. The challenge counter and
+                        // exact nonce/data transcript select the native phase.
+                        if key.replay_counter == rekey.replay {
                             kind = Kind::Message2;
-                            if key.replay_counter != rekey.replay
+                            if key.key_information != 0x30a
+                                || key.key_nonce == [0; 32]
                                 || key.key_nonce == SNONCE
                                 || key.key_data != rsn()
                             {
@@ -648,6 +652,7 @@ impl Device {
                             kind = Kind::Message4;
                             if key.key_information != 0x30a
                                 || key.replay_counter != rekey.replay + 1
+                                || key.key_nonce != [0; 32]
                                 || !key.key_data.is_empty()
                             {
                                 return Err("rekey M4 flags/replay/data");

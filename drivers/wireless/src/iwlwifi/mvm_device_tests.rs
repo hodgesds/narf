@@ -898,7 +898,11 @@ impl Actor {
                 && frame
                     .get(36..)
                     .and_then(|b| narf_wireless::eapol::KeyFrame::decode(b, 16))
-                    .is_some_and(|k| k.key_information == 0x30a);
+                    .is_some_and(|k| {
+                        k.key_information == 0x30a
+                            && k.key_nonce == [0; 32]
+                            && k.key_data.is_empty()
+                    });
             let held = (m4 && self.hold_m4).then_some(self.security.events.len());
             let before = self.security.data.len();
             if self.ba && p.queue == 24 && self.tx_ba_enabled {

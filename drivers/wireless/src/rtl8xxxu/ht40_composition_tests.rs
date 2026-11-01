@@ -466,23 +466,27 @@ fn raw_epoch_and_current_span() -> Result<(), &'static str> {
     let before = h.link.radio.control.0.lock().cold_generation;
     drive(h.receiver.select_station_geometry(Some(h.geometry)))?
         .map_err(|_| "EU real same-primary width transition")?;
+    // copied() polls this exact model through AssociatedLink, which reads
+    // control and bulk again. Complete both guard scopes before invoking it.
+    let cold_generation = { h.link.radio.control.0.lock().cold_generation };
+    let new_rx = { h.link.radio.bulk.0.lock().rx };
     ensure!(
-        h.link.radio.control.0.lock().cold_generation > before
-            && h.link.radio.bulk.0.lock().rx != old_rx
-            && h.copied()?.is_none(),
+        cold_generation > before && new_rx != old_rx && h.copied()?.is_none(),
         "EU old queued40 copy was relabeled after width change"
     );
     let before_park = h.link.radio.bulk.0.lock().rx;
     drive(h.receiver.park())?.map_err(|_| "EU wide actual park")?;
+    let parked_rx = { h.link.radio.bulk.0.lock().rx };
     ensure!(
         h.receiver.phase() == crate::rtl8xxxu::receive_runtime::Phase::Parked
-            && h.link.radio.bulk.0.lock().rx.is_none(),
+            && parked_rx.is_none(),
         "EU wide park left actual RX posted"
     );
     drive(h.receiver.resume_parked())?.map_err(|_| "EU wide actual wake")?;
+    let resumed_rx = { h.link.radio.bulk.0.lock().rx };
+    let resumed_rf = { h.link.radio.control.0.lock().rf[0x18] };
     ensure!(
-        h.link.radio.bulk.0.lock().rx != before_park
-            && h.link.radio.control.0.lock().rf[0x18] & 0xfff == 0x403,
+        resumed_rx != before_park && resumed_rf & 0xfff == 0x403,
         "EU wide wake lost actual40MHz geometry or reused old RX"
     );
     h.push_data()?;
