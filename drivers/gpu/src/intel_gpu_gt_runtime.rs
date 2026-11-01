@@ -581,7 +581,7 @@ impl Owner {
                 if state.slpc_reported {
                     log(
                         self.pending.index,
-                        "GuC SLPC not started; static GT frequency",
+                        "GuC SLPC not started; retaining current GT frequency policy",
                     );
                 }
                 let (_, completion) = gt.submit_kernel_probe(now).map_err(RuntimeError::Gt)?;
@@ -654,7 +654,7 @@ impl Owner {
                         state.slpc_reported = true;
                         log(
                             self.pending.index,
-                            "GuC SLPC unavailable; static GT frequency",
+                            "GuC SLPC controls unavailable; retaining current firmware policy",
                         );
                     }
                     _ => {}

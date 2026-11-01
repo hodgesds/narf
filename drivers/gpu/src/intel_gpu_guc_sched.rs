@@ -24,21 +24,11 @@ use core::{
 };
 
 const TIMEOUT: u64 = 5_000_000_000;
+#[path = "intel_gpu_job_timeout.rs"]
+mod job_timeout;
 const MAX_CONTEXTS: usize = 64;
-/// CT fence of SLPC fast requests; a failure response names it.
-const SLPC_FENCE: u16 = 0xfffe;
-/// xe_guc_pc.c: SLPC_RESET_TIMEOUT_MS + SLPC_RESET_EXTENDED_TIMEOUT_MS.
-const SLPC_TIMEOUT: u64 = 1_005_000_000;
-
-/// GuC SLPC (frequency management) and firmware-controlled RC6 (GUCRC).
-/// Optional: failure leaves the GT running at its static frequency.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum SlpcState {
-    Off,
-    Resetting { deadline: u64 },
-    Running,
-    Unavailable,
-}
+pub use crate::intel_gpu_slpc::SlpcState;
+use crate::intel_gpu_slpc::{FrequencyRange, Limits, PowerProfile, Slpc, SlpcError, Status};
 
 /// Firmware context identities are reusable after deregistration. Request
 /// stamps are independent, so a prior TLB ACK/breadcrumb cannot complete a
@@ -91,6 +81,7 @@ pub enum SchedulingError {
     Protocol,
     Timeout,
     Transport(TransportError),
+    Slpc(SlpcError),
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -142,11 +133,12 @@ struct Context<B: GpuBacking> {
     ring: B,
     phase: Phase,
     deadline: u64,
+    runtime: job_timeout::Runtime,
     fence: Arc<CompletionFence>,
     resident: Option<ResidentBatch>,
     user: Option<crate::intel_gpu_user::UserJob>,
     tail: u32,
-    /// The deadline expired while the user job ran: it is being taken off
+    /// The GPU runtime budget expired: the user job is being taken off
     /// the engine (Linux guc_exec_queue_timedout_job).
     timed_out: bool,
     /// GuC reset the engine under this context (CONTEXT_RESET_NOTIFICATION).
@@ -157,6 +149,8 @@ struct EngineState<B: GpuBacking> {
     engine: Engine,
     hwsp: B,
     golden: B,
+    /// GPU execution progress, independent of CT traffic and queue admission.
+    last_progress: Option<u64>,
 }
 
 fn state_of<B: GpuBacking>(engines: &[EngineState<B>], engine: Engine) -> &EngineState<B> {
@@ -189,7 +183,7 @@ pub(crate) struct GuCScheduler<A: BootAllocator> {
     epoch: u64,
     /// A user job ran under `epoch`; its identity can no longer change.
     user_submitted: bool,
-    slpc: SlpcState,
+    slpc: Slpc,
     engines: EngineSet,
     /// Default CCS state commands, captured with the render seed's fuses.
     compute_seed: Vec<u32>,
@@ -250,6 +244,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 engine,
                 hwsp,
                 golden,
+                last_progress: None,
             });
         }
         Ok(Self {
@@ -271,7 +266,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             defaults: Defaults::Empty,
             pristine: true,
             user_submitted: false,
-            slpc: SlpcState::Off,
+            slpc: Slpc::new(),
             engines,
             compute_seed: Vec::new(),
         })
@@ -346,7 +341,31 @@ impl<A: BootAllocator> GuCScheduler<A> {
     }
 
     pub(crate) fn slpc(&self) -> SlpcState {
+        self.slpc.state()
+    }
+
+    pub(crate) fn slpc_status(&self) -> Option<Status> {
+        self.slpc.status()
+    }
+
+    pub(crate) fn slpc_frequency_range(
+        &mut self,
+        range: FrequencyRange,
+        now: u64,
+    ) -> Result<(), SchedulingError> {
         self.slpc
+            .set_range(range, now)
+            .map_err(SchedulingError::Slpc)
+    }
+
+    pub(crate) fn slpc_power_profile(
+        &mut self,
+        profile: PowerProfile,
+        now: u64,
+    ) -> Result<(), SchedulingError> {
+        self.slpc
+            .set_profile(profile, now)
+            .map_err(SchedulingError::Slpc)
     }
 
     /// xe_guc_pc_start: zero the 8 KiB shared data, publish its size and
@@ -354,13 +373,14 @@ impl<A: BootAllocator> GuCScheduler<A> {
     pub(crate) fn begin_slpc<M: MmioWindow>(
         &mut self,
         ct: &mut XeLpgTransport<M, A>,
+        limits: Limits,
         now: u64,
     ) -> Result<(), SchedulingError> {
-        if !self.published || self.lost || self.slpc != SlpcState::Off {
+        if !self.published || self.lost || self.slpc.state() != SlpcState::Off {
             return Err(SchedulingError::State);
         }
-        let deadline = now
-            .checked_add(SLPC_TIMEOUT)
+        // Validate the absolute deadline before exposing any allocation.
+        now.checked_add(1_005_000_000)
             .ok_or(SchedulingError::Timeout)?;
         let r = &mut *self.resources;
         let shared = r.allocator.alloc(2).map_err(SchedulingError::Allocation)?;
@@ -387,12 +407,20 @@ impl<A: BootAllocator> GuCScheduler<A> {
         }
         let address = shared.ggtt_offset();
         // GuC never saw the address if the request is refused.
-        if let Err(error) = ct.send(SLPC_FENCE, 0x3003, 0, &[2, address, 0], true) {
+        if let Err(error) = ct.send(
+            crate::intel_gpu_slpc::RESET_FENCE,
+            0x3003,
+            0,
+            &[2, address, 0],
+            true,
+        ) {
             r.allocator.free(shared);
             return Err(SchedulingError::Transport(error));
         }
         r.slpc = Some(shared);
-        self.slpc = SlpcState::Resetting { deadline };
+        self.slpc
+            .start(limits, now)
+            .map_err(SchedulingError::Slpc)?;
         Ok(())
     }
 
@@ -401,25 +429,11 @@ impl<A: BootAllocator> GuCScheduler<A> {
         ct: &mut XeLpgTransport<M, A>,
         now: u64,
     ) -> Result<(), SchedulingError> {
-        let SlpcState::Resetting { deadline } = self.slpc else {
-            return Ok(());
-        };
         let r = &mut *self.resources;
-        let shared = r.slpc.as_ref().expect("SLPC shared data");
-        r.allocator
-            .sync_for_cpu(shared)
-            .map_err(|_| SchedulingError::Cache)?;
-        fence(Ordering::Acquire);
-        match shared.read32(4) {
-            // SLPC_GLOBAL_STATE_RUNNING: hand RC6 to firmware (GUCRC).
-            3 => match ct.send(SLPC_FENCE, 0x3004, 0, &[1], true) {
-                Ok(()) => self.slpc = SlpcState::Running,
-                Err(TransportError::Ct(crate::intel_gpu_guc::GuCError::Full)) => {}
-                Err(error) => return Err(SchedulingError::Transport(error)),
-            },
-            5 => self.slpc = SlpcState::Unavailable, // SLPC_GLOBAL_STATE_ERROR
-            _ if now >= deadline => self.slpc = SlpcState::Unavailable,
-            _ => {}
+        if let Some(shared) = r.slpc.as_ref() {
+            self.slpc
+                .progress(ct, &mut r.allocator, shared, now)
+                .map_err(SchedulingError::Transport)?;
         }
         Ok(())
     }
@@ -568,6 +582,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
             || !image.coherent_for_device()
             || !ring.coherent_for_device()
             || overlap(&image, &ring)
+            || r.slpc
+                .as_ref()
+                .is_some_and(|old| overlap(old, &image) || overlap(old, &ring))
             || r.seed_image
                 .as_ref()
                 .is_some_and(|old| overlap(old, &image) || overlap(old, &ring))
@@ -679,6 +696,10 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 0,
             ]
         };
+        if user.is_some() {
+            job_timeout::setup(&image, self.platform);
+            job_timeout::prefix(image.ggtt_offset(), stamp, engine, &mut words);
+        }
         if words.len() % 2 != 0 {
             words.push(0);
         }
@@ -730,6 +751,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             ring,
             phase: Phase::Invalidate,
             deadline,
+            runtime: job_timeout::Runtime::default(),
             fence: completion.clone(),
             resident,
             tail,
@@ -791,24 +813,8 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 Err(error) => return Err(error),
             }
         }
-        for context in &mut self.resources.contexts {
-            if now >= context.deadline {
-                // A user job that overran its slot is disabled alone; GuC
-                // preempts it or, if it cannot, resets the engine under it.
-                // Kernel work, a second expiry, or GuC not answering any
-                // other step needs a full GT reset (Linux likewise resets
-                // the GT for kernel jobs and an unanswered disable).
-                if context.user.is_none()
-                    || context.timed_out
-                    || context.reset
-                    || context.phase != Phase::Running
-                {
-                    return Err(SchedulingError::Timeout);
-                }
-                context.timed_out = true;
-                context.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
-                context.phase = Phase::Disable;
-            }
+        let resources = &mut *self.resources;
+        for context in &mut resources.contexts {
             if context.phase == Phase::Running {
                 fence(Ordering::Acquire);
                 let seq = context.image.read32(BREADCRUMB);
@@ -816,10 +822,52 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     return Err(SchedulingError::Protocol);
                 }
                 if seq != 0 {
+                    resources
+                        .engines
+                        .iter_mut()
+                        .find(|e| e.engine == context.engine)
+                        .expect("scheduler engine")
+                        .last_progress = Some(now);
                     context.phase = Phase::Disable;
                     // Retirement gets its own bound: a job finishing just
                     // inside its deadline must not lose the GT in cleanup.
                     context.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
+                }
+            }
+            if now >= context.deadline {
+                // Protocol transitions, kernel work and a second expiry
+                // remain bounded by wall clock and require a full GT reset.
+                if context.user.is_none()
+                    || context.timed_out
+                    || context.reset
+                    || context.phase != Phase::Running
+                {
+                    return Err(SchedulingError::Timeout);
+                }
+                resources
+                    .allocator
+                    .sync_for_cpu(&context.image)
+                    .map_err(|_| SchedulingError::Cache)?;
+                let (expired, progressed) = context.runtime.expired(
+                    &context.image,
+                    context.stamp,
+                    context.engine,
+                    ct.window(),
+                )?;
+                if progressed {
+                    resources
+                        .engines
+                        .iter_mut()
+                        .find(|e| e.engine == context.engine)
+                        .expect("scheduler engine")
+                        .last_progress = Some(now);
+                }
+                context.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
+                if expired {
+                    // GuC preempts this context alone or resets its engine
+                    // if it cannot preempt within the firmware policy bound.
+                    context.timed_out = true;
+                    context.phase = Phase::Disable;
                 }
             }
             let id = u32::from(context.id);
@@ -880,14 +928,32 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 Err(error) => return Err(SchedulingError::Transport(error)),
             }
         }
+        for engine in &mut resources.engines {
+            if resources
+                .contexts
+                .iter()
+                .any(|c| c.engine == engine.engine && c.user.is_some() && c.phase == Phase::Running)
+            {
+                // A missing start marker or all contexts staying switched
+                // out must not leave admission wedged forever. Only reset
+                // when this entire engine made no GPU progress for three
+                // watchdog intervals; never attribute that stall to a queue.
+                if engine
+                    .last_progress
+                    .is_some_and(|last| now.saturating_sub(last) >= 3 * TIMEOUT)
+                {
+                    return Err(SchedulingError::Timeout);
+                }
+            } else {
+                engine.last_progress = None;
+            }
+        }
         Ok(())
     }
 
     fn event(&mut self, message: GuCMessage, now: u64) -> Result<(), SchedulingError> {
-        // RESPONSE_FAILURE to an SLPC fast request: the optional power
-        // component is unavailable, not a lost scheduler.
-        if message.kind == 6 && message.fence == SLPC_FENCE && self.slpc != SlpcState::Off {
-            self.slpc = SlpcState::Unavailable;
+        // SLPC uses a disjoint fence namespace and fails independently.
+        if self.slpc.event(&message) {
             return Ok(());
         }
         if message.kind != 1 || message.auxiliary >> 16 != 0 {
@@ -970,8 +1036,18 @@ impl<A: BootAllocator> GuCScheduler<A> {
             (0x1002, Phase::Enabling, Some(1)) => {
                 c.phase = Phase::Running;
                 c.fence.mark_submitted();
-                // The job's time starts when GuC may run it.
+                // Start the watchdog when GuC may run it. User execution
+                // time itself comes from the ring marker/LRC timestamps.
                 c.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
+                if c.user.is_some() {
+                    resources
+                        .engines
+                        .iter_mut()
+                        .find(|e| e.engine == c.engine)
+                        .expect("scheduler engine")
+                        .last_progress
+                        .get_or_insert(now);
+                }
             }
             (0x1002, Phase::Disabling, Some(0)) => c.phase = Phase::Deregister,
             (

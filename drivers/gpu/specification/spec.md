@@ -776,18 +776,44 @@ engine resets remain disabled. Userspace publication additionally requires
 the runtime's verified PPGTT probe and backend installation.
 
 GuC power management follows xe_guc_pc_start. When scheduling becomes ready
-and before the kernel probe, `GuCGt::begin_slpc` allocates an 8 KiB SLPC
+and before the kernel probe, `GuCGt::begin_slpc` reads stable main-GT fused
+RPn/RPe/RP0 limits and allocates an 8 KiB SLPC
 shared buffer (coherent GGTT, no overlap with scheduler storage), zeroes it,
 publishes its size and sends the fast request
 HOST2GUC_PC_SLPC_REQUEST(SLPC_EVENT_RESET, address). Polling observes
-`global_state` RUNNING (3) within 1005 ms and then sends SETUP_PC_GUCRC
-(GUCRC_FIRMWARE_CONTROL), so GuC owns GT frequency and RC6; the host
-programs no RC6 registers. A RESPONSE_FAILURE carrying the SLPC fence, an
-ERROR state or the deadline marks SLPC `Unavailable` without closing
-scheduling. A refused start (allocation, cache, CT) frees the buffer, which
-GuC never saw. Once sent, the buffer is retained until proven reset, like all
-GuC-reachable storage. Frequency bounds, the MTL media cap
-(Wa_22019338487) and power profiles keep GuC defaults.
+`global_state` RUNNING (3) within 1005 ms, queries firmware defaults, clamps
+them to the admitted limits and confirms the programmed range before sending
+SETUP_PC_GUCRC (GUCRC_FIRMWARE_CONTROL). GuC owns GT frequency and RC6; the
+host programs no RC6 registers. `intel_gpu_slpc` owns the bounded control
+transaction and its separate CT fence namespace. `GuCGt::slpc_status` returns
+confirmed `Limits`, `FrequencyRange` and `PowerProfile` only while SLPC is
+Running. `begin_slpc_frequency_range` validates ordered MHz bounds, including
+hardware rounding, and `begin_slpc_power_profile` selects Base or PowerSaving.
+The owner must keep polling: enqueue is not acknowledgment, and Updating has
+no publishable status. Range updates require a final firmware query matching
+the requested rounded values. Invalid ranges leave the confirmed state intact;
+firmware refusal, stale replies, malformed readback or timeout mark SLPC
+Unavailable without closing scheduling. A refused start (allocation, cache,
+CT) frees the buffer, which GuC never saw. Once sent, the buffer is retained
+until proven reset, like all GuC-reachable storage.
+
+The source-qualified conservative bounds retain BMG G21's 1200 MHz floor
+(Wa_14022085890) and graphics IP 20.01's 2133 MHz MERT cap
+(Wa_22019338487). The latter is not an MTL graphics workaround. Dynamic cap
+removal, the L2-flush frequency protocol and media-GT power management remain
+unowned. No userspace frequency-control ABI is added.
+
+User-job timeout accounting follows `xe_lrc_timestamp` and `check_timeout`:
+a trusted per-context restore batch marks the saved CTX_TIMESTAMP active, and
+the ring records the context timestamp before its job-start marker. Five-second
+watchdog observations charge only the wrapping GPU timestamp delta, with Linux's
+5% scheduling tolerance. An active context reads its own engine timestamp under
+the GT's wake/authority owner and rereads saved state to handle switch-out.
+Queued and preempted intervals do not consume the runtime budget. A stuck active
+counter still triggers isolated context recovery. An engine making no GPU
+progress for three watchdog intervals requires full GT reset, without blaming
+an unstarted queue. Unavailable clock/MMIO or cache synchronization fails closed;
+kernel jobs and protocol/retirement transitions retain wall-clock bounds.
 
 Before context registration and after deregistration, a heavy GuC GGTT TLB
 invalidation (0x7000, operation 0x80000003) requires its matching 0x7001 cookie.
@@ -6466,6 +6492,35 @@ across the object's pages (`copy_object_row`), never past its end. Only
 32-bpp frames match the scanout. Deviations: no tiled modifiers, no
 plane-0 offset handling and no zero-copy flip (Linux scans out of the BO
 through GGTT); the copy reads write-combining memory uncached.
+
+`intel_gpu_gtt::check_console_scanout_range` restricts legacy scanout mappers
+to the four exact 32 MiB pipe windows beginning at 16, 48, 80 and 112 MiB.
+Oversized, empty and unassigned ranges refuse before allocation or PTE writes.
+The separate `[160 MiB, 256 MiB)` GEM scanout reservation ends at the GT arena.
+`intel_gpu_scanout::Presenter<ScanoutIo>` owns that reservation and one primary
+plane; its unsafe constructor requires exclusive display/arena ownership,
+current power and MMIO authority, installed cache policy and invalidated empty
+PTEs. `prepare` retains zero-offset LINEAR XRGB8888 WC system GEM objects and
+maps their pitch-times-height extent, bounded to 96 MiB and 8192 pixels per
+dimension. Pitch must fit the 12-bit PLANE_STRIDE field in 64-byte units;
+above 128 KiB it also needs 4 KiB alignment (252 KiB is the largest directly
+encodable admitted pitch). WB, USERPTR, local memory, non-SCANOUT and busy writers refuse.
+PTE readback, posting and verified GGTT invalidation precede publication.
+
+`arm` changes only PLANE_SURF on a compatible enabled plane, with one pending
+flip. `poll` requires fresh primary flip-done, matching SURFLIVE and a stable
+changed hardware frame counter before returning the caller's completion ticket
+and retired surface. Its timestamp is the observation time. `release` never
+unmaps the current/pending object; window reuse follows verified clears and
+invalidation. Uncertain writes, faults, timeout and Drop retain object pages
+and the MMIO/power owner. Only unsafe `shutdown_stopped`, after independently
+proven fetch stop, permits complete reclamation.
+
+This owner is not yet installed by KMS. Direct flips still require per-card
+console handoff, shared modeset/PM exclusion, display-power ownership and
+event/out-fence publication after successful presentation. Existing KMS keeps
+the copy path and simulated vblank completion; the new owner enables neither
+Intel display interrupts nor zero-copy userspace presentation.
 
 **Client framebuffers scanned out in place.** On the native card ADDFB2
 also takes one of the calling open's amdgpu GEM handles

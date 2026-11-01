@@ -1370,6 +1370,25 @@ builds and formatting pass.
 Both architectures also pass production boot and both btrfs interoperability
 postflights. These remain native model/QEMU results; physical execution is unrun.
 
+The Intel branch continuation now accounts user-job time from per-context
+GPU timestamps, including active-context ownership checks and counter wrap,
+instead of charging queued/preempted wall time. Isolated context recovery
+remains; an engine-wide no-progress watchdog retains full-reset fallback
+without blaming an unstarted queue. Optional GuC SLPC now discovers stable
+fused limits and applies acknowledged frequency bounds and Base/PowerSaving
+profiles with verified range readback. BMG's source-qualified conservative
+floor/cap remain; dynamic MERT cap removal and media power control are open.
+Legacy console GGTT mappings now enforce their per-pipe reservations. An owned
+GEM scanout/latch component retains objects through hardware completion or
+verified fetch stop, but KMS continues to copy: direct flips still require
+console/display-power/PM ownership and transactional event publication.
+Intel silicon and Mesa acceptance remain untested.
+The 25 new native fixtures pass on both architectures. Complete selected
+Intel/DRM regression groups pass 579 tests on x86_64 and 451 on aarch64, with
+zero failures/skips. All three GPU CI Clippy contexts pass per architecture;
+host default/Intel-only/AMD-only/no-vendor all-target Clippy, Intel debug
+builds, formatting, both production boots and both btrfs postflights pass.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

@@ -180,6 +180,11 @@ fn hardware_model_with_interface(
         d.regs.insert(0x9134, 5);
         d.regs.insert(0x9114, 0x10);
         d.regs.insert(0x9118, 1);
+        // xe_guc_pc.c fused RPn/RPe/RP0: 300/1500/3000 MHz.
+        d.regs.insert(0x138000, (18 << 16) | 180);
+        d.regs.insert(0x13800c, 90);
+        d.regs.insert(0x145998, (6 << 16) | 60);
+        d.regs.insert(0x145ef0, 30 << 8);
         d.regs.insert(
             0xd8c,
             if platform == GtPlatform::Battlemage {
@@ -732,7 +737,7 @@ fn smoke_hardware_slpc_gucrc_and_optional_failures() -> TestResult {
         assert_eq!(arena.live_allocations(), before + 1);
         let mut registered = BTreeMap::new();
         let mut gucrc = 0;
-        for now in 31..40 {
+        for now in 31..55 {
             gucrc += service_contexts(&w, &mut registered, true)
                 .iter()
                 .filter(|action| **action == 0x3004)
@@ -835,14 +840,22 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
             for i in 1..=count {
                 request.push(words[1024 + ((head + i) & 1023) as usize]);
             }
-            assert_eq!(request[0] >> 28, 2, "fast request");
-            requests.push(request);
+            let control_fence = (words[1024 + head as usize] >> 16) as u16;
+            assert_eq!(
+                request[0] >> 28,
+                if request[0] as u16 == 0x3003 && request[1] != 2 {
+                    0
+                } else {
+                    2
+                }
+            );
+            requests.push((control_fence, request));
             head = (head + count + 1) & 1023;
         }
         words[0] = head;
     }
     let mut actions = Vec::new();
-    for request in requests {
+    for (control_fence, request) in requests {
         let action = request[0] as u16;
         actions.push(action);
         match action {
@@ -854,7 +867,10 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
             0x4502 => {
                 // GUC_RENDER/BLITTER/COMPUTE_CLASS for RCS0/BCS0/CCS0.
                 assert!(matches!(request[3], 0 | 3 | 4));
-                assert_eq!(&request[1..10], &[1, request[2], request[3], 1, 0, 0, 0, 0, 0]);
+                assert_eq!(
+                    &request[1..10],
+                    &[1, request[2], request[3], 1, 0, 0, 0, 0, 0]
+                );
                 assert_eq!(request.len(), 12);
                 assert!(matches!(request[10] & 0xfff, 0x19 | 0x119));
                 let image = w.0.borrow().memory[&(request[10] & !0xfff)].clone();
@@ -967,19 +983,7 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 assert!(registered.remove(&request[1]).is_some());
                 event(&memory, 0x4600, &[request[1]]);
             }
-            0x3003 => {
-                // SLPC_EVENT(RESET, 2): shared-data GGTT address, high dword.
-                assert_eq!((request.len(), request[1], request[3]), (4, 2, 0));
-                let shared = w.0.borrow().memory[&request[2]].clone();
-                assert_eq!(shared.borrow().len(), 2048);
-                assert_eq!(shared.borrow()[0], 8192);
-                match SLPC_FIXTURE_MODE.load(core::sync::atomic::Ordering::Relaxed) {
-                    0 => shared.borrow_mut()[1] = 3,
-                    1 => shared.borrow_mut()[1] = 5,
-                    2 => failure_response(&memory, 0xfffe),
-                    _ => {}
-                }
-            }
+            0x3003 => service_slpc(w, &memory, control_fence, &request),
             0x3004 => assert_eq!(&request[1..], &[1]), // GUCRC_FIRMWARE_CONTROL
             _ => panic!("unexpected action {action:x}"),
         }
@@ -1016,7 +1020,11 @@ fn execute_copy(w: &Window, base: u32) {
     };
     assert!(d.synced.contains(&ring_base));
     let ring = d.memory[&ring_base].borrow().clone();
-    let words = &ring[..tail as usize / 4];
+    let mut words = &ring[..tail as usize / 4];
+    if image.borrow()[1024 + 0x13] != 0 {
+        assert_eq!(&words[..4], &[0x12480002, 0x3a8, base + 0x810, 0]);
+        words = &words[4..];
+    }
     assert_eq!(words.len() % 2, 0);
     let stamp = if tail == 32 {
         assert_eq!(&words[..3], &[0x04000001, 0, 0x10400002]);
@@ -1035,12 +1043,21 @@ fn execute_copy(w: &Window, base: u32) {
         words[at + 3]
     };
     assert_ne!(stamp, 0);
-    let root = (u64::from(image.borrow()[1024 + 0x31]) << 32) | u64::from(image.borrow()[1024 + 0x33]);
+    let root =
+        (u64::from(image.borrow()[1024 + 0x31]) << 32) | u64::from(image.borrow()[1024 + 0x33]);
     if root != 0 {
         // A PPGTT copy job begins with a TLB-invalidating start stamp.
         assert_eq!(
             &words[..7],
-            &[0x04000001, 0x02800101, 0x13044002, (base + 0x808) | 4, 0, stamp, 0x02800100]
+            &[
+                0x04000001,
+                0x02800101,
+                0x13044002,
+                (base + 0x808) | 4,
+                0,
+                stamp,
+                0x02800100
+            ]
         );
         execute_copy_ppgtt(root, &words[7..]);
     } else if tail != 32 {
@@ -1054,10 +1071,33 @@ fn execute_copy(w: &Window, base: u32) {
         assert_eq!(
             &words[1..28],
             &[
-                0x15080001, 0x22204, 0x600, 0x11080003, 0x608, 0x7e7e, 0x610,
-                uc << 9 | uc << 1, 0x0d000007, 0x08008000, 0x48008401, 0x10200000,
-                0x18000031, 0x08008000, 0x08008402, 0x10300000, 0x18000031, 0x15040001,
-                0x600, 0x22204, 0x11080005, 0x600, 0, 0x608, 0, 0x610, 0,
+                0x15080001,
+                0x22204,
+                0x600,
+                0x11080003,
+                0x608,
+                0x7e7e,
+                0x610,
+                uc << 9 | uc << 1,
+                0x0d000007,
+                0x08008000,
+                0x48008401,
+                0x10200000,
+                0x18000031,
+                0x08008000,
+                0x08008402,
+                0x10300000,
+                0x18000031,
+                0x15040001,
+                0x600,
+                0x22204,
+                0x11080005,
+                0x600,
+                0,
+                0x608,
+                0,
+                0x610,
+                0,
             ]
         );
         let old = d.regs.get(&0x22204).copied().unwrap_or(0xffff_ffff);
@@ -1140,7 +1180,10 @@ fn execute_compute(w: &Window, base: u32) {
             &[0, 0x1108101d, 0x1a244, data[1027], 0x1a034, 0, 0x1a030]
         );
         assert!(matches!(data[1027], 0x00090009 | 0x00090008));
-        assert_eq!((data[1032], data[1024 + 0x1c], data[1024 + 0x21]), (0x1a038, 0x1a120, 0x11081011));
+        assert_eq!(
+            (data[1032], data[1024 + 0x1c], data[1024 + 0x21]),
+            (0x1a038, 0x1a120, 0x11081011)
+        );
         assert_eq!(data[1024 + 0x71], 0x01000000);
         (
             data[1024 + 7],
@@ -1165,7 +1208,10 @@ fn execute_compute(w: &Window, base: u32) {
     } else if tail != 32 {
         // ARB_ON, then the optional Xe2 WMTP level, then the compute flush.
         let seed = &words[1..];
-        let flush = seed.iter().position(|w| *w == 0x7a000204).expect("compute flush");
+        let flush = seed
+            .iter()
+            .position(|w| *w == 0x7a000204)
+            .expect("compute flush");
         let commands = &seed[..flush - if d.regs[&0xd8c] >> 22 == 20 { 0 } else { 6 }];
         assert!(commands.is_empty() || commands == [0x11000001, 0x1a580, 0x00060002]);
         assert_eq!(seed[flush + 1], 0x001000a0);
@@ -1227,7 +1273,20 @@ fn execute_ppgtt_probe(
     } else {
         (0x7a000404, 0x20344c1c)
     };
-    let mut expected = alloc::vec![0x04000001, 0x02800101, header, flags, 0xd0, 0, 0, 0,];
+    let mut expected = Vec::new();
+    if image[1024 + 0x13] != 0 {
+        expected.extend_from_slice(&[
+            0x12480002,
+            0x3a8,
+            base + 0x810,
+            0,
+            0x10400002,
+            base + 0x808,
+            0,
+            id,
+        ]);
+    }
+    expected.extend_from_slice(&[0x04000001, 0x02800101, header, flags, 0xd0, 0, 0, 0]);
     if pat == 3 {
         expected.extend_from_slice(&[0x11020001, 0x4208, 1, 0]);
     }
@@ -1422,19 +1481,32 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
             let ads = w.0.borrow().memory[&0x20001000].clone();
             let ads = ads.borrow();
             // Mapping, enable mask, state size and BCS0 register saves.
-            assert_eq!((ads[(0x123c + 96) / 4], ads[(0x123c + 524) / 4]), (0x20202000, 1));
+            assert_eq!(
+                (ads[(0x123c + 96) / 4], ads[(0x123c + 524) / 4]),
+                (0x20202000, 1)
+            );
             assert_eq!(ads[0x1060 / 4], 8192 - 4096 - 384);
             assert_eq!(ads[0x300 / 4 + 1], 3);
             let saves = (ads[0x300 / 4] - 0x20001000) as usize / 4;
             assert_eq!(
-                [ads[saves], ads[saves + 2], ads[saves + 4], ads[saves + 8], ads[saves + 12]],
+                [
+                    ads[saves],
+                    ads[saves + 2],
+                    ads[saves + 4],
+                    ads[saves + 8],
+                    ads[saves + 12]
+                ],
                 [
                     0x2229c,
                     1,
                     0x22080,
                     0x220a8,
                     // CCS0's saves follow BCS0's when it is published.
-                    if gt.engines().unwrap().contains(crate::intel_gpu_engine::Engine::Ccs0) {
+                    if gt
+                        .engines()
+                        .unwrap()
+                        .contains(crate::intel_gpu_engine::Engine::Ccs0)
+                    {
                         0x1a29c
                     } else {
                         0
@@ -1448,11 +1520,17 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
             let data = compute_golden.borrow();
             let xe2 = platform == GtPlatform::Battlemage;
             assert_eq!(data.len(), if xe2 { 3 * 1024 } else { 14 * 1024 });
-            assert_eq!((data[1025], data[1026], data[1027]), (0x1108101d, 0x1a244, 0x00090008));
+            assert_eq!(
+                (data[1025], data[1026], data[1027]),
+                (0x1108101d, 0x1a244, 0x00090008)
+            );
             assert_eq!((data[1029], data[1031], data[1033]), (0, 0, 0));
             let ads = w.0.borrow().memory[&0x20001000].clone();
             let ads = ads.borrow();
-            assert_eq!((ads[(0x123c + 128) / 4], ads[(0x123c + 528) / 4]), (0x20202000, 1));
+            assert_eq!(
+                (ads[(0x123c + 128) / 4], ads[(0x123c + 528) / 4]),
+                (0x20202000, 1)
+            );
             assert_eq!(ads[0x400 / 4 + 1], 3);
             assert_eq!(w.0.borrow().regs[&0x14800] & 1, 1, "RCU_MODE_CCS_ENABLE");
         }
@@ -1902,10 +1980,7 @@ fn smoke_hardware_gt_reload_and_context_execution() -> TestResult {
         // that fails to preempt (global_flags without DISABLE_ENGINE_RESET).
         {
             let ads = w.0.borrow().memory[&0x20001000].clone();
-            assert_eq!(
-                (ads.borrow()[0x1220 / 4], ads.borrow()[0x1228 / 4]),
-                (1, 0)
-            );
+            assert_eq!((ads.borrow()[0x1220 / 4], ads.borrow()[0x1228 / 4]), (1, 0));
         }
         assert_eq!(
             w.0.borrow().memory[&0x20001000].borrow()[0x1054 / 4],
@@ -2201,3 +2276,12 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_guc_gt",
     smoke_hardware_admission_and_boot_failure
 );
+
+mod slpc_controls {
+    use super::*;
+    include!("intel_gpu_slpc_tests.rs");
+}
+
+fn service_slpc(w: &Window, memory: &Words, control_fence: u16, request: &[u32]) {
+    slpc_controls::service(w, memory, control_fence, request);
+}

@@ -1906,15 +1906,95 @@ Continue these dependencies on the current Intel branch. Existing native
 models and kernel diagnostics are implementation checkpoints, not physical
 acceptance or a claim of complete acceleration.
 
+The current continuation adds acknowledged GuC SLPC frequency bounds and
+Base/PowerSaving profiles through the owned GT API (`intel_gpu_slpc`).
+Stable main-GT RPn/RPe/RP0 discovery bounds requests before allocation;
+range updates require matched replies and a final firmware readback. Pending
+updates publish no confirmed status. Optional control failure retains the
+shared buffer until verified stop and leaves command scheduling available.
+BMG G21 keeps the source's 1200 MHz floor; graphics IP 20.01 conservatively
+keeps the 2133 MHz MERT cap. Dynamic cap removal and the associated flush
+protocol remain open. Wa_22019338487 does not apply to MTL graphics.
+
+Presentation now has a separately owned GGTT window/latch component
+(`intel_gpu_scanout`), with object retention through fresh flip-done,
+SURFLIVE and a changed stable frame count. Legacy console mappings are
+restricted to their four 32 MiB pipe windows; GEM windows occupy 160–256 MiB,
+below the GT arena. Failed writes, timeout and drop retain uncertain DMA
+owners until independently verified fetch stop. KMS still uses scanout copy:
+direct flips require console handoff, display-power/modeset/PM ownership and
+transactional event/out-fence publication. The detailed owner contract is in
+`spec.md` §3, "Intel GEM framebuffers".
+
+This continuation adds 25 native fixtures: seven for runtime accounting and
+engine progress, six for SLPC controls and twelve for scanout ownership/latch
+evidence. All 25 execute and pass on both kernel architectures, including the
+public WC admission path on x86_64 and its explicit refusal on aarch64. These
+are register/transport and ownership models, not Intel hardware acceptance.
+The complete selected Intel/DRM regression groups pass 579 tests on x86_64
+and 451 on aarch64, without failures or skips. Filters are split into short
+groups to fit x86 PVH's 512-byte command-line bound. Target CI Clippy's three
+feature contexts pass on both architectures, as do all four host vendor
+feature configurations, Intel debug builds, formatting, production boots and
+both btrfs postflights per architecture.
+
 | Area | Current checkpoint | Still required |
 | --- | --- | --- |
-| GuC execution | Owned GGTT/PPGTT jobs, primed/persistent user RCS0 and BCS0 state, verified register policy, graphics-GT/RCS/BCS workarounds on MTL/Arrow, DG2 and BMG | Compute/media engines, remaining out-of-band workarounds and silicon qualification |
+| GuC execution | Owned GGTT/PPGTT jobs, primed/persistent user RCS0, BCS0 and CCS0 state, verified register policy, graphics-GT/engine workarounds on MTL/Arrow, DG2 and BMG | Additional compute/media engines, remaining out-of-band workarounds and silicon qualification |
 | Render UAPI | Native Xe queries/GEM/VM_BIND (incl. snapshot-pinned MAP_USERPTR)/RCS and COPY queues/EXEC/user fences/per-engine cycles; i915 compatibility with legacy BLT ring, context engine maps and explicit fences; context loss and fresh-epoch rebuild | USERPTR invalidation (MMU notifier), i915 GEM_USERPTR, fault/long-running VMs, i915 load balancing/parallel submission, more queue/query families and Mesa interoperability |
 | Engines and platforms | Main-GT DSS/EU discovery; RCS0, never-fused BCS0 and fuse-derived CCS0 (ccs_mode 1) scheduling; separate Gen12 foundations | BMG BCS8, CCS1-3/ccs_mode > 1, media GT and media submission, independently sourced profiles for other IP |
-| Memory and presentation | Owned system RAM, private tables, same-card CPU PRIME mappings; iGPU write-combining objects (retyped kernel aliases, WC mmap, SCANOUT, non-coherent PAT1/PAT2 binds); Battlemage visible VRAM (zeroed pool, DM PTEs, WC BAR mmap, placement fallback); KMS framebuffers of Intel GEM objects (intel_framebuffer_init checks, Xe VM-bound rule, implicit-sync wait, scanout copy) | DG2 VRAM (64K pages + CCS clear), small-BAR/unmapped VRAM, eviction, GPU clears, VRAM PRIME/P2P, zero-copy scanout (GGTT framebuffer windows, PLANE_SURF flips, flip-done events), tiled modifiers |
+| Memory and presentation | Owned system RAM, private tables, same-card CPU PRIME mappings; iGPU write-combining objects (retyped kernel aliases, WC mmap, SCANOUT, non-coherent PAT1/PAT2 binds); Battlemage visible VRAM (zeroed pool, DM PTEs, WC BAR mmap, placement fallback); KMS Intel GEM framebuffers with scanout copy; bounded console GGTT windows and an owned GEM window/surface-latch component | DG2 VRAM (64K pages + CCS clear), small-BAR/unmapped VRAM, eviction, GPU clears, VRAM PRIME/P2P, KMS zero-copy admission (console/display-power/PM ownership and transactional flip events), tiled modifiers |
 | Display | Gen12 paths and owned Xe-LPG internal-panel modeset | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |
-| Power and faults | Owned GuC/RCS0/BCS0 MSI wakeups with timer fallback, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery; per-context hang recovery (job timeout + GuC engine reset, guilty queue banned); idle D3hot runtime autosuspend for display-less discrete GTs with epoch-continuing resume; GuC SLPC with firmware-controlled RC6 (optional, fail-open) | Runtime-based job timeouts (LRC timestamps), error capture, autosuspend with live VRAM (mapping revocation/eviction) or an active iGPU panel (display power wells/DC states), D3cold, SLPC frequency bounds/power profiles and MTL Wa_22019338487 |
+| Power and faults | Owned GuC/RCS0/BCS0 MSI wakeups with timer fallback, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery; per-context hang recovery with LRC runtime accounting and engine-progress fallback; idle D3hot runtime autosuspend for display-less discrete GTs with epoch-continuing resume; optional GuC SLPC/RC6 with acknowledged frequency bounds and Base/PowerSaving profiles | Error capture, autosuspend with live VRAM (mapping revocation/eviction) or an active iGPU panel (display power wells/DC states), D3cold, dynamic BMG MERT cap removal/L2-flush frequency coordination and media-GT power management |
 | Acceptance | Native register/CT/page-walk and ownership models on both kernel architectures | Intel silicon execution, suspend/resume and Mesa OpenGL/Vulkan interoperability |
+
+#### Remaining-work status (2026-10-31)
+
+**Size today.** `tokei` code lines (comments and blanks excluded; inline
+test modules included):
+
+| | NARF Intel driver | Linux reference (b90c984d, C) |
+| --- | --- | --- |
+| GT / compute / UAPI | ~30.8k | xe core ~77.9k |
+| Display | ~16.9k | i915/display ~144.3k (shared by xe) + xe/display glue ~1.6k |
+| Total | ~47.7k (of which ~6.3k in `*_tests.rs` files) | ~223.8k |
+
+**Estimate for full Linux-xe parity: ~100k–165k more Rust lines**, a
+~150k–210k-line driver. For scale, NARF amdgpu is ~286k.
+
+| Area | Still to write (est.) | Main items |
+| --- | --- | --- |
+| VM and memory | 18–25k | Fault-mode, long-running and CPU-address-mirror VMs; USERPTR invalidation (memory-layer MMU notifier); VRAM eviction and migration through copy-engine jobs (GPU clears/copies); DG2 64K VRAM pages and flat-CCS clears; small-BAR VRAM; VRAM PRIME/P2P |
+| Engines | 10–15k | MTL media GT (own GuC instance, VCS/VECS, HuC load/auth); BMG BCS8; CCS1–3 and ccs_mode > 1; load-balanced and parallel queues |
+| Reliability and observability | 8–12k | Error capture/devcoredump; GuC log; OA and EU-stall perf streams |
+| Power | 5–8k | D3cold; autosuspend with live VRAM or a lit panel; userspace SLPC policy and dynamic MERT caps; dGPU hwmon |
+| i915 compatibility | 3–5k | GEM_USERPTR, SSEU, perf, remaining params |
+| Platforms | 8–12k | Lunar Lake (Xe2 iGPU), Panther Lake (Xe3), Tiger Lake/Alder Lake on GuC; roughly 2–4k per family |
+| **GT subtotal** | **50–75k** | |
+| Presentation | 6–10k | KMS zero-copy admission through owned GGTT windows/PLANE_SURF latches, including console handoff, display-power/PM exclusion and flip-done/vblank events; tiled and compressed modifiers; extra planes |
+| Atomic modeset | 15–25k | Watermark and DBUF allocation; CDCLK changes with pcode; multi-pipe; bigjoiner; DSC; VRR |
+| Outputs | 15–25k | Type-C/Thunderbolt PHY and DP alt mode; C20 HDMI 2.1; DP 2.0 UHBR; PSR2/panel replay; hotplug |
+| Display power, color, HDCP, Arc display | 15–28k | DC states and DMC, FBC, display runtime PM; gamma/CTM; HDCP; DG2/BMG display |
+| **Display subtotal** | **50–90k** | |
+
+**Usable Meteor Lake desktop subset: ~10–20k.** Finishing presentation,
+including zero-copy flips, plus whatever silicon bring-up exposes. A
+read-only audit of upstream Mesa main's Xe backends (anv, iris and their
+shared device code) found no startup blocker in the admitted UAPI. The five
+device queries Mesa treats as fatal are served. PXP, the low-latency hint,
+the state-cache perf fix, purgeable madvise and fault-reporting VMs are used
+only when advertised, which NARF does not do. Scratch-page VMs, queue
+priorities, bind queues, the VM_BIND op and flag set and WC
+scanout/uncached buffers are admitted. What remains is execution behaviour,
+which only hardware can show.
+
+**Caveats.**
+- Silicon bring-up is the unbounded term. Nothing here has run on Intel
+  hardware or under Mesa.
+- Estimates follow NARF's style: Linux-cited, inline native tests, about
+  Linux's C density.
+- SR-IOV, PXP and HDCP content protection are excluded from the subtotals
+  except where listed.
 
 After the GT's execution probes, the physical worker attempts single-vector
 MSI for primary GuC, RCS0 and BCS0, preserving unrelated enable/mask halves.
@@ -1953,9 +2033,22 @@ creation (`NotImplemented`): the kernel's linear map cannot be retyped.
 
 Hung user jobs are recovered per context (MIT Linux
 b90c984d615e8ce2af96f5b1411a962d83fed2ad `guc_exec_queue_timedout_job`,
-`xe_guc_exec_queue_reset_handler`). A user job's 5 s deadline starts at
-GuC's enable ACK. When it expires while the job runs, the scheduler disables
-that context alone; GuC preempts it or, if it cannot preempt within the
+`xe_guc_exec_queue_reset_handler`, `xe_lrc_timestamp` and `check_timeout`).
+A user job's 5 s watchdog starts at GuC's enable ACK, but timeout attribution
+uses the ring's CTX_TIMESTAMP/start-stamp stores and saved LRC runtime.
+A private restore batch marks active state; live MMIO is sampled only when
+RING_CURRENT_LRCA names that LRC before and after the read, with a saved-state
+reread covering switch-out. Queuing and preemption consume no job runtime.
+Unsigned 32-bit subtraction handles counter wrap, with Linux's 5% scheduling
+tolerance. Two unchanged active timestamp samples also identify a hang.
+Missing/unchanging inactive timestamps instead require full GT reset after the
+entire engine makes no GPU progress for three watchdog intervals. Changed
+sampled counters and completed breadcrumbs refresh that engine watchdog, so
+no queue is blamed for a scheduling stall. Cache/read failures fail closed and
+retain all backing until proven reset.
+
+When a context exceeds its GPU runtime budget, the scheduler disables that
+context alone; GuC preempts it or, if it cannot preempt within the
 500 ms policy timeout, resets the engine and sends
 CONTEXT_RESET_NOTIFICATION (0x1008). GuC also resets autonomously when a
 non-preemptible context blocks a waiting one. Either way the context is
@@ -1967,12 +2060,10 @@ before syncs are parsed, after the queue lookup and batch-count checks, as
 in `xe_exec_ioctl`. A job that completes while being disabled retires
 normally. Kernel jobs, a reset notification for a kernel context, a second
 expiry, an unanswered disable and ENGINE_FAILURE_NOTIFICATION still require a
-full GT reset. Deviation: Linux's `check_timeout` measures run time from LRC
-context timestamps and a ring start marker, so a job queued behind others is
-not charged for their time; NARF's deadline is wall clock from the enable
-ACK, which with GuC time-slicing and engine reset bounds an innocent job's
-wait behind a hog to the preemption timeout but can still ban a job whose
-own GPU time is under 5 s on a heavily shared engine.
+full GT reset. Kernel jobs and protocol/retirement steps retain bounded
+wall-clock deadlines. Native tests cover active/inactive samples, counter
+wrap, switch-out and sentinel collisions, queued time, isolated recovery,
+failed cache reads, engine stalls and continuously completing short jobs.
 
 The scheduler now recycles a round-robin pool of 64 GuC IDs after verified
 retirement, removing the 65534-request lifetime limit. Request stamps and TLB

@@ -259,6 +259,12 @@ impl<M: MmioWindow, A: GpuAllocator> XeLpgTransport<M, A> {
         self.state
     }
 
+    /// The enclosing GT owner holds PCI D0 and engine forcewake while polling
+    /// its scheduler. Keep live timestamp reads under that same ownership.
+    pub(crate) fn window(&self) -> &M {
+        &self.mailbox.mmio
+    }
+
     fn register(&mut self, index: u8, now: u64) -> Result<(), TransportError> {
         let base = self.resources.blob.ggtt_offset();
         // GuC requires receive registration before send registration. Address

@@ -551,7 +551,8 @@ fn smoke_userspace_i915_copy_engine_legacy_ring_and_engine_map() -> TestResult {
         exec(&user, handles, context);
         set_ring(&user, ring);
         let mut cx = Context::from_waker(Waker::noop());
-        let mut call = core::pin::pin!(file.dispatch_user(&info, abi::GEM_EXECBUFFER2_WR, 64, &user));
+        let mut call =
+            core::pin::pin!(file.dispatch_user(&info, abi::GEM_EXECBUFFER2_WR, 64, &user));
         assert!(call.as_mut().poll(&mut cx).is_pending());
         let submitted = backend.accept(gt, now);
         assert_eq!(call.as_mut().poll(&mut cx), Poll::Ready(Some(Ok(0))));
@@ -593,7 +594,10 @@ fn smoke_userspace_i915_copy_engine_legacy_ring_and_engine_map() -> TestResult {
     assert!(!Arc::ptr_eq(&render, &context));
     run(&mut gt, &fence, 201);
     for ring in [2, 4, 5, 0x3f] {
-        assert_eq!(refuse(ring, 0), Poll::Ready(Some(Err(FsError::InvalidData))));
+        assert_eq!(
+            refuse(ring, 0),
+            Poll::Ready(Some(Err(FsError::InvalidData)))
+        );
     }
     // The default context is finalized at open: its map is immutable.
     let param = engines_param(&user, 0, &[(1, 0)], 8192);
@@ -620,7 +624,10 @@ fn smoke_userspace_i915_copy_engine_legacy_ring_and_engine_map() -> TestResult {
     assert_eq!(slot2.engine(), Engine::Rcs0);
     run(&mut gt, &fence, 401);
     for ring in [1, 3, abi::EXEC_BLT + 8] {
-        assert_eq!(refuse(ring, mapped), Poll::Ready(Some(Err(FsError::InvalidData))));
+        assert_eq!(
+            refuse(ring, mapped),
+            Poll::Ready(Some(Err(FsError::InvalidData)))
+        );
     }
     // A duplicate ENGINES extension in one chain is EINVAL before its copy.
     let mut first = ext;
@@ -886,7 +893,7 @@ kernel_test_in!(
     smoke_userspace_primary_render_nodes_and_context_namespaces
 );
 
-/// Linux's job timeout (xe_guc_submit.c, 5 s) measured from GuC's enable ACK.
+/// Runtime budget and wall-clock sampling interval (xe_guc_submit.c, 5 s).
 const HANG_TIMEOUT: u64 = 5_000_000_000;
 
 fn ready(gt: &mut GuCGt<Window, Arena>, now: u64) {
@@ -938,9 +945,11 @@ fn smoke_userspace_hung_job_is_retired_alone() -> TestResult {
             }
             assert_eq!(done.result(), Some(Ok(())));
             assert_eq!(result.verify(), Ok(()));
-            // The deadline counts from the enable ACK (after 100).
+            // Enable ACK starts the watchdog; queued time is not GPU time.
             ready(&mut gt, HANG_TIMEOUT + 100);
             assert!(!service_contexts(&w, &mut registered, false).contains(&0x1001));
+            let base = registered[&u32::from(id)];
+            model_runtime(&w, base, 0, 15_000_000, true);
             ready(&mut gt, HANG_TIMEOUT + 130);
             if reset {
                 event(&ct_memory(&w), 0x1008, &[u32::from(id)]);
@@ -1009,6 +1018,45 @@ fn complete_by_hand(w: &Window, base: u32) {
     image.borrow_mut()[1024 + 5] = tail;
 }
 
+/// Hardware-style private timestamp/start stores and context switch state.
+/// The reference clock is 3 MHz for this fixture's RPM_CONFIG0 = 0.
+fn model_runtime(w: &Window, base: u32, start: u32, current: u32, active: bool) {
+    let image = w.0.borrow().memory[&base].clone();
+    let ring_base = image.borrow()[1024 + 9];
+    let ring = w.0.borrow().memory[&ring_base].clone();
+    let stamp = ring.borrow()[7];
+    assert_eq!(
+        &ring.borrow()[..7],
+        &[
+            0x12480002,
+            0x3a8,
+            base + 0x810,
+            0,
+            0x10400002,
+            base + 0x808,
+            0,
+        ]
+    );
+    assert_eq!(image.borrow()[1024 + 0x13], base + 0x901);
+    assert_eq!(
+        &image.borrow()[0x900 / 4..0x910 / 4],
+        &[0x10400002, base + 0x108c, 0, 1]
+    );
+    let engine_base = image.borrow()[1024 + 2] - 0x244;
+    {
+        let mut words = image.borrow_mut();
+        words[0x808 / 4] = stamp;
+        words[0x810 / 4] = start;
+        words[1024 + 0x23] = if active { 1 } else { current };
+    }
+    let mut device = w.0.borrow_mut();
+    device.regs.insert(u64::from(engine_base + 0x3a8), current);
+    device.regs.insert(
+        u64::from(engine_base + 0x240),
+        if active { base } else { 0 },
+    );
+}
+
 /// A job whose breadcrumb lands just inside its deadline retires normally
 /// even though its cleanup runs past that deadline.
 fn smoke_userspace_job_finishing_at_its_deadline_retires() -> TestResult {
@@ -1074,6 +1122,7 @@ fn smoke_userspace_unrecoverable_hangs_reset_the_gt() -> TestResult {
         let lost = match case {
             0 => {
                 // First expiry sends the disable, which is never answered.
+                model_runtime(&w, registered[&u32::from(id)], 0, 15_000_000, true);
                 ready(&mut gt, HANG_TIMEOUT + 130);
                 gt.poll(2 * HANG_TIMEOUT + 130)
             }
@@ -1103,6 +1152,201 @@ fn smoke_userspace_unrecoverable_hangs_reset_the_gt() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_user",
     smoke_userspace_unrecoverable_hangs_reset_the_gt
+);
+
+fn smoke_userspace_runtime_excludes_queueing_and_preemption() -> TestResult {
+    let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    let context = UserContext::new();
+    let (batch, result) = PpgttProbeResult::prepare(GtPlatform::Battlemage).unwrap();
+    let (id, fence) = gt
+        .submit_user_batch(100, context.clone(), UserBatch(batch))
+        .unwrap();
+    let mut registered = BTreeMap::new();
+    for now in 101..130 {
+        ready(&mut gt, now);
+        service_contexts(&w, &mut registered, false);
+    }
+    let base = registered[&u32::from(id)];
+    // Ten seconds queued with no ring start cannot make this queue guilty.
+    for interval in 1..=2 {
+        ready(&mut gt, interval * HANG_TIMEOUT + 130);
+        assert!(!service_contexts(&w, &mut registered, false).contains(&0x1001));
+        assert!(!context.banned());
+    }
+    // A saved counter belongs to a preempted job; another context's live
+    // MMIO value must not be added to this job's budget.
+    model_runtime(&w, base, 0, 3_000_000, false);
+    w.0.borrow_mut().regs.insert(0x23a8, 900_000_000);
+    ready(&mut gt, 3 * HANG_TIMEOUT + 130);
+    model_runtime(&w, base, 0, 6_000_000, true);
+    ready(&mut gt, 4 * HANG_TIMEOUT + 130);
+    model_runtime(&w, base, 0, 6_000_000, false);
+    ready(&mut gt, 5 * HANG_TIMEOUT + 130);
+    model_runtime(&w, base, 0, 9_000_000, true);
+    ready(&mut gt, 6 * HANG_TIMEOUT + 130);
+    assert!(fence.result().is_none());
+    assert!(!context.banned());
+    complete_by_hand(&w, base);
+    for now in 7 * HANG_TIMEOUT + 130..7 * HANG_TIMEOUT + 170 {
+        ready(&mut gt, now);
+        service_contexts(&w, &mut registered, false);
+        if fence.result().is_some() {
+            break;
+        }
+    }
+    assert_eq!(fence.result(), Some(Ok(())));
+    assert_eq!(context.reset_stats(), (0, 0));
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop((gt, result));
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_userspace_runtime_excludes_queueing_and_preemption
+);
+
+fn smoke_userspace_runtime_stuck_active_counter_is_a_hang() -> TestResult {
+    let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    let context = UserContext::new();
+    let (batch, result) = PpgttProbeResult::prepare(GtPlatform::Battlemage).unwrap();
+    let (id, fence) = gt
+        .submit_user_batch(100, context.clone(), UserBatch(batch))
+        .unwrap();
+    let mut registered = BTreeMap::new();
+    for now in 101..130 {
+        ready(&mut gt, now);
+        service_contexts(&w, &mut registered, false);
+    }
+    model_runtime(&w, registered[&u32::from(id)], 0, 3_000_000, true);
+    ready(&mut gt, HANG_TIMEOUT + 130);
+    assert!(!service_contexts(&w, &mut registered, false).contains(&0x1001));
+    ready(&mut gt, 2 * HANG_TIMEOUT + 130);
+    assert!(service_contexts(&w, &mut registered, false).contains(&0x1001));
+    for now in 2 * HANG_TIMEOUT + 131..2 * HANG_TIMEOUT + 170 {
+        ready(&mut gt, now);
+        service_contexts(&w, &mut registered, false);
+        if fence.result().is_some() {
+            break;
+        }
+    }
+    assert_eq!(fence.result(), Some(Err(JobError::Hang)));
+    assert!(context.banned());
+    assert_eq!(context.reset_stats(), (1, 0));
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop((gt, result));
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_userspace_runtime_stuck_active_counter_is_a_hang
+);
+
+fn smoke_userspace_runtime_unknown_or_unreadable_requires_full_reset() -> TestResult {
+    for case in 0..4 {
+        let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+        prime(&mut gt, &w, 0xdfc);
+        let context = UserContext::new();
+        let (batch, result) = PpgttProbeResult::prepare(GtPlatform::Battlemage).unwrap();
+        let (id, fence) = gt
+            .submit_user_batch(100, context.clone(), UserBatch(batch))
+            .unwrap();
+        let mut registered = BTreeMap::new();
+        for now in 101..130 {
+            ready(&mut gt, now);
+            service_contexts(&w, &mut registered, false);
+        }
+        let live = arena.live_allocations();
+        let failed = if case == 0 {
+            // An engine which never executes any admitted ring is stuck;
+            // a full reset bounds that stall without blaming its queues.
+            ready(&mut gt, HANG_TIMEOUT + 130);
+            ready(&mut gt, 2 * HANG_TIMEOUT + 130);
+            gt.poll(3 * HANG_TIMEOUT + 130)
+        } else {
+            model_runtime(&w, registered[&u32::from(id)], 0, 3_000_000, true);
+            match case {
+                1 => w.0.borrow_mut().fail_cpu_sync = true,
+                2 => {
+                    w.0.borrow_mut().regs.insert(0x23a8, u32::MAX);
+                }
+                _ => {
+                    w.0.borrow_mut().regs.insert(0xd00, u32::MAX);
+                }
+            }
+            gt.poll(HANG_TIMEOUT + 130)
+        };
+        assert!(matches!(failed, Poll::Ready(Err(GtError::Scheduling(_)))));
+        assert_eq!(gt.state(), GtState::Lost);
+        assert!(fence.result().is_none());
+        assert_eq!(arena.live_allocations(), live);
+        assert!(!context.banned());
+        hardware_stop(&mut gt, &w, 0xdfc);
+        assert_eq!(fence.result(), Some(Err(JobError::Reset)));
+        assert_eq!(context.reset_stats(), (0, 1));
+        drop((gt, result));
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_userspace_runtime_unknown_or_unreadable_requires_full_reset
+);
+
+fn smoke_userspace_runtime_engine_watchdog_counts_short_completions() -> TestResult {
+    let platform = GtPlatform::Battlemage;
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    let waiting = UserContext::new();
+    let (batch, result) = PpgttProbeResult::prepare(platform).unwrap();
+    let (_, pending) = gt
+        .submit_user_batch(100, waiting.clone(), UserBatch(batch))
+        .unwrap();
+    let mut registered = BTreeMap::new();
+    for now in 101..130 {
+        ready(&mut gt, now);
+        service_contexts(&w, &mut registered, false);
+    }
+    // One ring stays queued while a sequence of short jobs completes. No
+    // job reaches its own five-second runtime sampling point, so completion
+    // breadcrumbs must keep the engine watchdog alive by themselves.
+    for iteration in 0..6 {
+        let start = 200 + iteration * 3_000_000_000;
+        let (batch, short_result) = PpgttProbeResult::prepare(platform).unwrap();
+        let (id, done) = gt
+            .submit_user_batch(start, UserContext::new(), UserBatch(batch))
+            .unwrap();
+        for now in start + 1..start + 30 {
+            ready(&mut gt, now);
+            service_contexts(&w, &mut registered, false);
+        }
+        complete_by_hand(&w, registered[&u32::from(id)]);
+        for now in start + 31..start + 70 {
+            ready(&mut gt, now);
+            service_contexts(&w, &mut registered, false);
+            if done.result().is_some() {
+                break;
+            }
+        }
+        assert_eq!(done.result(), Some(Ok(())));
+        assert!(pending.result().is_none());
+        assert!(!waiting.banned());
+        drop(short_result);
+    }
+    hardware_stop(&mut gt, &w, 0xdfc);
+    assert_eq!(pending.result(), Some(Err(JobError::Reset)));
+    assert_eq!(waiting.reset_stats(), (0, 1));
+    drop((gt, result));
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_user",
+    smoke_userspace_runtime_engine_watchdog_counts_short_completions
 );
 
 mod explicit {

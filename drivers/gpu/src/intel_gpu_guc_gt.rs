@@ -572,12 +572,19 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     /// Start GuC SLPC/GUCRC. Optional: errors leave scheduling untouched.
     pub fn begin_slpc(&mut self, now: u64) -> Result<(), GtError> {
         self.admit_scheduling()?;
+        let limits = crate::intel_gpu_slpc::Limits::read(
+            self.parts.boot.window(),
+            self.parts.boot.platform(),
+            self.parts.boot.device_id(),
+        )
+        .map_err(|error| GtError::Scheduling(SchedulingError::Slpc(error)))?;
+        self.admit_scheduling()?;
         let parts = &mut *self.parts;
         parts
             .scheduler
             .as_mut()
             .ok_or(GtError::State)?
-            .begin_slpc(parts.ct.as_mut().ok_or(GtError::State)?, now)
+            .begin_slpc(parts.ct.as_mut().ok_or(GtError::State)?, limits, now)
             .map_err(GtError::Scheduling)
     }
 
@@ -586,6 +593,44 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             .scheduler
             .as_ref()
             .map_or(crate::intel_gpu_guc_sched::SlpcState::Off, |s| s.slpc())
+    }
+
+    /// Confirmed frequency bounds/profile only while SLPC is ready. An
+    /// in-flight or failed multi-command update has no publishable snapshot.
+    pub fn slpc_status(&self) -> Option<crate::intel_gpu_slpc::Status> {
+        (self.state == GtState::SchedulingReady)
+            .then(|| self.parts.scheduler.as_ref()?.slpc_status())
+            .flatten()
+    }
+
+    /// Begin a bounded update; the owner must keep driving `poll` until SLPC
+    /// returns Running or Unavailable. Acceptance is not a firmware ACK.
+    pub fn begin_slpc_frequency_range(
+        &mut self,
+        range: crate::intel_gpu_slpc::FrequencyRange,
+        now: u64,
+    ) -> Result<(), GtError> {
+        self.admit_scheduling()?;
+        self.parts
+            .scheduler
+            .as_mut()
+            .ok_or(GtError::State)?
+            .slpc_frequency_range(range, now)
+            .map_err(GtError::Scheduling)
+    }
+
+    pub fn begin_slpc_power_profile(
+        &mut self,
+        profile: crate::intel_gpu_slpc::PowerProfile,
+        now: u64,
+    ) -> Result<(), GtError> {
+        self.admit_scheduling()?;
+        self.parts
+            .scheduler
+            .as_mut()
+            .ok_or(GtError::State)?
+            .slpc_power_profile(profile, now)
+            .map_err(GtError::Scheduling)
     }
 
     /// SchedulingReady with no registered, running or retiring context.

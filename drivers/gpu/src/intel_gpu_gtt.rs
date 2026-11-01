@@ -47,6 +47,34 @@
 /// occupies the rest of the BAR.
 pub const GGTT_ARRAY_BASE: u64 = 0x80_0000;
 
+/// Four fixed boot/console windows (A-D), each at most 32 MiB. Their
+/// reservation ends at 144 MiB; framebuffer pins use a separate arena.
+pub const CONSOLE_SCANOUT_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+/// Owned GEM scanout windows: 160..256 MiB, below the GT submission arena.
+pub const GEM_SCANOUT_GTT_START: u64 = 160 * 1024 * 1024;
+pub const GEM_SCANOUT_GTT_END: u64 = 256 * 1024 * 1024;
+
+/// Validate a legacy pipe's *reservation*, as well as the BAR aperture.
+/// Without this check a large surface can overwrite another pipe, a GEM
+/// framebuffer window, or the GT arena even though it fits inside the BAR.
+pub fn check_console_scanout_range(
+    bar_len: u64,
+    gtt_offset: u64,
+    size_bytes: u64,
+) -> Result<(), GttError> {
+    let pipe = gtt_offset
+        .checked_sub(SCANOUT_GTT_OFFSET_PIPE_A)
+        .ok_or(GttError::OutOfBounds)?;
+    if pipe % CONSOLE_SCANOUT_WINDOW_BYTES != 0
+        || pipe / CONSOLE_SCANOUT_WINDOW_BYTES >= 4
+        || size_bytes == 0
+        || size_bytes > CONSOLE_SCANOUT_WINDOW_BYTES
+    {
+        return Err(GttError::OutOfBounds);
+    }
+    check_ggtt_range(bar_len, gtt_offset, size_bytes)
+}
+
 /// GGTT virtual-address size in bytes, derived from the length
 /// of the GTTMMADR BAR mapping: one 8-byte PTE per 4 KiB page
 /// over the array half of the BAR. A 16 MiB BAR therefore yields
@@ -307,7 +335,7 @@ pub fn map_contiguous_scanout(
     const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
 
     let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
-    check_ggtt_range(gtt_mmadr.len, SCANOUT_GTT_OFFSET, pages * GTT_PAGE_SIZE)?;
+    check_console_scanout_range(gtt_mmadr.len, SCANOUT_GTT_OFFSET, size_bytes)?;
     for i in 0..pages {
         let phys = start_phys + i * GTT_PAGE_SIZE;
         let pte = encode_scanout_pte(phys, PatSlot::Slot2)?;
@@ -346,7 +374,7 @@ pub fn alloc_coherent_scanout(
     const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
 
     let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
-    check_ggtt_range(gtt_mmadr.len, SCANOUT_GTT_OFFSET, pages * GTT_PAGE_SIZE)?;
+    check_console_scanout_range(gtt_mmadr.len, SCANOUT_GTT_OFFSET, size_bytes)?;
     let mut frames = alloc::vec::Vec::with_capacity(pages as usize);
 
     for i in 0..pages {
@@ -472,7 +500,7 @@ pub fn alloc_contiguous_scanout_with_format(
     format.encode_ggtt(0, pat_index)?;
     let order = scanout_order_for(size_bytes).ok_or(GttError::OutOfMemory)?;
     let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
-    check_ggtt_range(gtt_mmadr.len, gtt_offset, pages * GTT_PAGE_SIZE)?;
+    check_console_scanout_range(gtt_mmadr.len, gtt_offset, size_bytes)?;
     let head = narf_memory::frame::alloc_pages_on(0, order).map_err(|_| GttError::OutOfMemory)?;
     let base = head.start_address().raw();
     for i in 0..pages {
