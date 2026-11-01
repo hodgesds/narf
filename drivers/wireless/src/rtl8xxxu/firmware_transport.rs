@@ -451,6 +451,28 @@ impl<I: ControlIo> Owner<I> {
         Ok(super::ht_runtime::request(&base, executable))
     }
 
+    /// Resolve the signed v2 full20/40 program request for this primary and
+    /// secondary. This performs no radio I/O and grants no native HT mode.
+    pub fn ht40_request(&self, primary: u8, secondary: u8) -> Result<super::Ht40Request, Error> {
+        let geometry = super::ht_runtime::Geometry::new(primary, secondary)
+            .map_err(|_| Error::RuntimeState)?;
+        let executable = self.executable().ok_or(Error::RuntimeState)?;
+        executable.invoke(|| ())?;
+        let factory = self.factory().ok_or(Error::RuntimeState)?;
+        let (vid, pid) = self.usb_identity().ok_or(Error::RuntimeState)?;
+        let calibration = super::power_policy::Calibration::load_registered(factory, vid, pid)
+            .map_err(|_| Error::RuntimeState)?;
+        let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::RuntimeState)?;
+        geometry.ceiling(&domain).map_err(|_| Error::RuntimeState)?;
+        let permission = calibration
+            .permission(&domain, primary)
+            .map_err(|_| Error::RuntimeState)?;
+        let base = super::wmm_runtime::Proof::registered(factory, vid, pid, permission)
+            .map_err(|_| Error::RuntimeState)?;
+        base.invoke(|| ()).map_err(|_| Error::RuntimeState)?;
+        Ok(super::ht_runtime::wide_request(&base, executable, geometry))
+    }
+
     pub fn calibration(&self) -> Option<CalibrationInfo> {
         *self.calibration.lock()
     }

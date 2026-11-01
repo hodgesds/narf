@@ -140,6 +140,10 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
     pub fn local(&self) -> [u8; 6] {
         self.own
     }
+    pub(super) fn wide_supported(&self) -> bool {
+        self.radio.as_ref().is_some_and(Receiver::has_wide_profiles)
+            || self.station.as_ref().is_some_and(Station::wide_supported)
+    }
     pub(super) fn ht_enabled(&self) -> bool {
         self.radio.as_ref().is_some_and(Receiver::ht_enabled)
             || self.station.as_ref().is_some_and(Station::ht_enabled)
@@ -368,7 +372,9 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
             self.own,
             ssid,
             mode,
-            self.radio.as_ref().and_then(Receiver::ht_local),
+            self.radio
+                .as_ref()
+                .and_then(|radio| radio.ht_local_for(&candidate)),
         )
         .map_err(Error::Management)?;
         plan.append_sme_ies(ies).map_err(Error::Management)?;

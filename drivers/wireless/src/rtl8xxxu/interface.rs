@@ -109,6 +109,7 @@ pub struct Device<C: ControlIo, B: PacketIo, E: Environment> {
     closed: AtomicBool,
     failed: Arc<AtomicBool>,
     ht: bool,
+    ht40: bool,
     rx: Arc<IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>>,
     tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
     admin: IrqSafeSpinLock<interface_power::Admin>,
@@ -133,7 +134,8 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
             *retire.lock() = None;
         }));
         let failed = service.close_flag();
-        let ht = service.ht_enabled();
+        let ht40 = service.wide_supported();
+        let ht = service.ht_enabled() || ht40;
         Self {
             state: Mutex::new(State {
                 service,
@@ -149,6 +151,7 @@ impl<C: ControlIo, B: PacketIo, E: Environment> Device<C, B, E> {
             closed: AtomicBool::new(parked),
             failed,
             ht,
+            ht40,
             rx: rx_consumer,
             tx: IrqSafeSpinLock::new(Some(tx_producer)),
             admin: IrqSafeSpinLock::new(interface_power::Admin::new()),
@@ -602,8 +605,12 @@ impl<C: ControlIo + 'static, B: PacketIo + 'static, E: Environment + 'static> Wi
     fn phy_capabilities(&self, band: u32) -> Option<narf_wireless::iface::PhyCapabilities> {
         (band == 2400 && self.ht && !self.closed.load(Ordering::Acquire)).then(|| {
             narf_wireless::iface::PhyCapabilities {
-                ht: narf_wireless::association::phy::LocalHt::siso20(false, false)
-                    .capability_body(),
+                ht: if self.ht40 {
+                    super::ht_runtime::wide_ht()
+                } else {
+                    narf_wireless::association::phy::LocalHt::siso20(false, false)
+                }
+                .capability_body(),
                 vht: None,
             }
         })

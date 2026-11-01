@@ -43,8 +43,18 @@ impl ChannelLink {
     }
     fn physical(&self) -> (u8, bool, bool) {
         let model = self.control.0.lock();
+        let center = (model.rf[0x18] & 0x3ff) as u8;
+        let primary = if model.rf[0x18] & 0xc00 == 0x400 {
+            match u32::from_le_bytes(model.regs[0x440..0x444].try_into().unwrap()) & (3 << 21) {
+                0x200000 => center.saturating_sub(2),
+                0x400000 => center.saturating_add(2),
+                _ => u8::MAX,
+            }
+        } else {
+            center
+        };
         (
-            (model.rf[0x18] & 0xff) as u8,
+            primary,
             model.regs[0x100] & 0x80 != 0,
             model.regs[0x100] & 0xc0 == 0xc0,
         )

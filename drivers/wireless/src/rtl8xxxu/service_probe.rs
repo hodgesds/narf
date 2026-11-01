@@ -29,7 +29,14 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
             // Include the largest possible current profile in pure timing
             // admission, before any stop or RF write. HT is still optional
             // and actual publication uses only the installed grant.
-            Prepared::new(self.own, channel, ssid, 0, channel == 1, extra)
+            let ht = channel == 1
+                || self
+                    .radio
+                    .as_ref()
+                    .is_some_and(|radio| radio.wide_plan_for_channel(channel).is_some());
+            // Only the size is used here; actual channel/HT fields come
+            // from prepare_probe after native programming succeeds.
+            Prepared::new(self.own, if ht { 1 } else { channel }, ssid, 0, ht, extra)
                 .map_err(Error::Radio)?
                 .timing(dwell_ms, mandatory)
                 .map_err(Error::Radio)?;
@@ -67,15 +74,12 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
             return Err(Error::State);
         }
         self.check_current()?;
-        let probe = Prepared::new(
-            self.own,
-            self.channel()?,
-            ssid,
-            self.probe_sequence,
-            self.radio.as_ref().is_some_and(Receiver::ht_enabled),
-            extra,
-        )
-        .map_err(Error::Radio)?;
+        let probe = self
+            .radio
+            .as_ref()
+            .ok_or(Error::State)?
+            .prepare_probe(ssid, self.probe_sequence, extra)
+            .map_err(Error::Radio)?;
         let (pre_ms, post_ms) = probe.timing(dwell_ms, mandatory).map_err(Error::Radio)?;
         let authority = self.current()?;
         let mut attempt = Attempt {

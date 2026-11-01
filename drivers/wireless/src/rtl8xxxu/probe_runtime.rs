@@ -15,6 +15,7 @@ pub(super) struct Prepared {
     own: [u8; 6],
     channel: u8,
     ht: bool,
+    wide: bool,
     bytes: Vec<u8>,
 }
 impl Prepared {
@@ -70,11 +71,39 @@ impl Prepared {
             own,
             channel,
             ht,
+            wide: false,
             bytes,
         })
     }
-    pub(super) fn matches(&self, own: [u8; 6], channel: u8, ht: bool) -> bool {
-        self.own == own && self.channel == channel && self.ht == ht
+    pub(super) fn native(
+        own: [u8; 6],
+        channel: u8,
+        ssid: &[u8],
+        sequence: u16,
+        ht: bool,
+        wide: Option<&super::ht_runtime::WideProgram>,
+        extra: &[u8],
+    ) -> Result<Self, Error> {
+        if let Some(program) = wide {
+            program.invoke(|| ())?;
+            if program.geometry().primary() != channel {
+                return Err(Error::State);
+            }
+            let mut prepared = Self::new(own, channel, ssid, sequence, false, extra)?;
+            let at = prepared.bytes.len() - extra.len();
+            let mut element = [0u8; 28];
+            element[..2].copy_from_slice(&[45, 26]);
+            element[2..].copy_from_slice(&super::ht_runtime::wide_ht().capability_body());
+            drop(prepared.bytes.splice(at..at, element));
+            prepared.ht = true;
+            prepared.wide = true;
+            Ok(prepared)
+        } else {
+            Self::new(own, channel, ssid, sequence, ht, extra)
+        }
+    }
+    pub(super) fn matches(&self, own: [u8; 6], channel: u8, ht: bool, wide: bool) -> bool {
+        self.own == own && self.channel == channel && self.ht == ht && self.wide == wide
     }
     pub(super) fn bytes(&self) -> &[u8] {
         &self.bytes

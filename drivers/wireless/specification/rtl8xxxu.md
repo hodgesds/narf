@@ -547,8 +547,8 @@ responses, actual held ADDBA/M4 receipts, closed captures, each current source,
 policy loss and reentrant key/ordinary-credit publication. These cases pass
 both-architecture native QEMU and coordinated build/Clippy gates. Physical
 USB/RF/HT interoperability and exact-device measured qualification remain external.
-SGI20, HT40, broader scans/channels, coexistence
-and reset/rejoin remain software work.
+SGI20, broader bands and coexistence remain software work. The separate
+HT20/40 v2 continuation below is implemented pending native acceptance.
 
 #### Host rate adaptation and rate fallback (implemented)
 
@@ -1015,6 +1015,46 @@ native work. Only hardware/firmware execution and peer inputs are inert.
 The eight earlier associated-passive cases remain separate registrations.
 The new active cases await coordinated release compilation and execution.
 
+### Separately qualified RTL8188EU HT20/40/LGI (implemented, validation pending)
+
+The optional signed N8HT v2 contract is specified in
+[rtl8188eu-ht40.md](rtl8188eu-ht40.md). `Owner::ht40_request(primary, secondary)`
+returns its exact filename/source binding without modifying the radio.
+It binds a legal primary/secondary/center, actual current executable, exact
+factory and preceding N8PC identities, unchanged v1 recipe, and new measured
+CCK/OFDM plus MCS0–7 full-program peak envelopes covering both20 and40MHz.
+The existing v1 parser, filename and channel1 HT20 behavior are unchanged.
+Missing v2 data preserves that path; invalid present data fails preclaim.
+No real measured artifact or physical acceptance is provided.
+
+The actual native owner selects primary factory power groups, never the RF
+center group or another chip's HT difference. It intersects the complete
+occupied40MHz host policy with N8PC/v2 envelopes, preserves the current
+legacy gain pair and bounds every MCS gain. Native BB/RF/gain/SIFS writes
+and readback happen with MAC parked. A sealed program is minted only after
+those operations; typed geometry and selected gains supply no RF authority.
+Every width transition retires real old RXDMA/USB/MAC-FIFO contents even
+when primary is unchanged. Actual copied RX40 MPDUs need that program's
+private current-source seal. Source or policy failure permanently retires
+that program's receipts without poisoning a later installation.
+
+The selected peer receives an HT40 offer only for its exact signed/current
+secondary. A narrowed20 response forces a real cold20 restore of the same
+logical peer before keys/data open. Native QoS DATA/Null add the source v3
+BW/primary descriptor fields and checksum; management remains basic1Mbps.
+The SISO MCS0–7/LGI path composes with software CCMP, BA/replay, host rate
+adaptation and whole A-MSDU. Scans and park/wake retain exact home geometry;
+away receivers stay NOHT. SGI, MCS32 and2SS are not advertised by this subset.
+
+Eight additional native regressions are registered under
+`drivers/wireless/rtl8xxxu/ht40`: signed identity/primary power group,
+literal plus/minus geometry and Open/WPA2 DHCP,20MHz fallback and response
+narrowing, same-primary FIFO cuts and copied full-span policy retirement,
+held DATA/source loss, BA/replay retention, and active-scan/cold EP0 restore.
+They await coordinated release compilation and native execution; all prior
+v1/scan registrations remain required. Hardware measurements and physical
+USB/RF interoperability remain external.
+
 ## 4. Invariants
 
 - Linux's disabled→EMU→active handshake precedes firmware writes. MAC TX/RX
@@ -1071,7 +1111,7 @@ Associated passive scanning/Null functions pass native software gates at `a77975
 | Production scan/MLME service and policy-admitted management TX | Qualified idle passive multi-channel scan/home restoration passes native gates; idle active and associated passive/Null pass native gates; signed board/deployment admission required; connected active scans are implemented pending native acceptance |
 | Software AES-CCM + strict CCMP/key/TID ownership | Implemented dependency; independent ciphertext/forgery/role/PN regressions |
 | WPA2 key installation/controlled port and Ethernet transport | Implemented retained shared RSNA/software CCMP, exact native delivery, Narf-Rings and synchronous stack progress |
-| Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX. Qualified legacy channels1–13 and cold idle FIFO retuning pass native software gates. Separate N8HT HT20/LGI MCS0..7/whole A-MSDU/decline/capture-publication continuation passes native software gates above and stays channel1-bound. Management/basic1Mbps remains required. SGI/HT40, broader bands/adaptation and coexistence remain missing |
+| Broader channel/rate profiles and coexistence | Native optional WMM DATA uses negotiated12-rate legacy TX. Qualified legacy channels1–13 and cold idle FIFO retuning pass native software gates. Separate N8HT HT20/LGI MCS0..7/whole A-MSDU/decline/capture-publication continuation passes native software gates above and stays channel1-bound. Management/basic1Mbps remains required. The separate v2 HT20/40 LGI continuation above is implemented pending native acceptance; SGI, broader bands and coexistence remain missing |
 | USB transfer ownership / stale handles | EP0 + bulk claims, retained command DMA and generation rejection implemented; slot reuse stays gated |
 | Non-stream bulk stop/drain | Implemented in USB; exact commands/context/event-prefix proof |
 | Disconnect/peer-loss callbacks and normal bulk stop | Implemented; a completed disconnect returns to Passive (safe rejoin) |
@@ -1080,7 +1120,8 @@ Associated passive scanning/Null functions pass native software gates at `a77975
 Chip inventory is source-specific: Linux `rtl8xxxu/8188e.c` identifies1TX/1RX;
 `8192e.c` identifies actual1/2TX and2RX; `8723b.c` identifies1TX/1RX and optional
 BT/S0S1. EU's separately qualified HT20/LGI continuation is software-validated above;
-SGI20/HT40 and controller-proven EP0 reset remain software work.
+SGI20 and controller-proven EP0 reset remain software work; the separate v2
+HT20/40 continuation above is implemented pending native acceptance.
 Associated active scanning is implemented with native acceptance pending. Qualified idle passive
 multi-channel scanning passes native software gates; associated passive scans
 and Null functions pass native software gates at `a7797583a`.

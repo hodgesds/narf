@@ -31,10 +31,20 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
             let permission = self.channel_permission(channel);
             self.authority().invoke(|| ()).map_err(Error::Radio)?;
             permission?;
-            Prepared::new(own, channel, request.ssid, 0, channel == 1, request.extra)
-                .map_err(Error::Radio)?
-                .timing(dwell, request.mandatory)
-                .map_err(Error::Radio)?;
+            let ht = channel == 1 || self.radio.wide_plan_for_channel(channel).is_some();
+            // Pure worst-profile sizing; actual fields use prepare_probe
+            // only after the target native program is installed.
+            Prepared::new(
+                own,
+                if ht { 1 } else { channel },
+                request.ssid,
+                0,
+                ht,
+                request.extra,
+            )
+            .map_err(Error::Radio)?
+            .timing(dwell, request.mandatory)
+            .map_err(Error::Radio)?;
         }
         let authority = self.authority();
         let mut attempt = self.attempt();
@@ -67,15 +77,10 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
                             .map_err(Error::Radio)?;
                         *generation = next;
                         let sequence = self.reserve_plain_sequence()?;
-                        let probe = Prepared::new(
-                            own,
-                            channel,
-                            request.ssid,
-                            sequence,
-                            self.radio.ht_enabled(),
-                            request.extra,
-                        )
-                        .map_err(Error::Radio)?;
+                        let probe = self
+                            .radio
+                            .prepare_probe(request.ssid, sequence, request.extra)
+                            .map_err(Error::Radio)?;
                         let timing = probe
                             .timing(dwell, request.mandatory)
                             .map_err(Error::Radio)?;

@@ -241,15 +241,56 @@ impl Join {
     pub(super) fn wmm(&self) -> Option<narf_wireless::wmm::Parameters> {
         self.wmm
     }
+    fn geometry(
+        primary: u8,
+        width: association::phy::Width,
+        center: u8,
+        secondary: Option<u8>,
+    ) -> Result<Option<super::ht_runtime::Geometry>, Error> {
+        match width {
+            association::phy::Width::Twenty if center == primary => Ok(None),
+            association::phy::Width::Forty => {
+                let geometry =
+                    super::ht_runtime::Geometry::new(primary, secondary.ok_or(Error::Profile)?)
+                        .map_err(|_| Error::Profile)?;
+                if geometry.center() != center {
+                    return Err(Error::Profile);
+                }
+                Ok(Some(geometry))
+            }
+            _ => Err(Error::Profile),
+        }
+    }
+    pub(super) fn offered_geometry(&self) -> Result<Option<super::ht_runtime::Geometry>, Error> {
+        self.plan.offered_phy().map_or(Ok(None), |phy| {
+            Self::geometry(
+                self.candidate.channel(),
+                phy.width(),
+                phy.center_channel(),
+                phy.ht().operation().secondary(),
+            )
+        })
+    }
+    pub(super) fn negotiated_geometry(&self) -> Result<Option<super::ht_runtime::Geometry>, Error> {
+        self.plan.negotiated_phy().map_or(Ok(None), |phy| {
+            Self::geometry(
+                self.candidate.channel(),
+                phy.width(),
+                phy.center_channel(),
+                phy.ht().operation().secondary(),
+            )
+        })
+    }
     pub(super) fn data_rate(&self) -> Result<u8, Error> {
         if !matches!(self.phase(), Phase::Associated { .. }) {
             return Err(Error::Profile);
         }
         if let Some(phy) = self.plan.negotiated_phy() {
             let ht = phy.ht();
-            if phy.width() != association::phy::Width::Twenty
-                || phy.center_channel() != 1
-                || ht.operation().protection() != 0
+            if !matches!(
+                phy.width(),
+                association::phy::Width::Twenty | association::phy::Width::Forty
+            ) || ht.operation().protection() != 0
             {
                 return Err(Error::Profile);
             }

@@ -1014,6 +1014,17 @@ key and capture owners remain separate. Four native MT cases and two shared
 control cases await execution; implicit ROC and client/GO contexts remain
 open. Combined parent release Clippy passes; the family §3 records this scope.
 
+RTL8188EU HT20/40 LGI uses a distinct signed N8HT v2 qualification covering
+the complete radio program and both emission spans. The retained owner
+selects factory power by primary channel and tunes RF to the center, binds
+each copied receive span to the current installed program, and cold-restores
+20 MHz before key/data traffic when association narrows the offer. Current
+host policy must admit the whole 40 MHz span even for a 20 MHz fallback.
+Existing v1 qualification remains valid for its original profile. Eight new
+native cases await release execution; source review and the combined release
+Clippy probe pass. The family §3 and `rtl8188eu-ht40.md` specify the contract;
+real per-device qualification data remains externally supplied.
+
 ## 4. Interaction with `narf-wireless`
 
 - **Registration**: Drivers register via `bus::register_wireless_driver(MatchEntry { ... })`.

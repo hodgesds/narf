@@ -15,7 +15,7 @@ pub(super) struct Probes {
     pub(super) hold: bool,
     pub(super) short: bool,
     air_held: bool,
-    responses: bool,
+    pub(super) responses: bool,
     pub(super) suppress_away_beacon: bool,
     consumed: usize,
     truncated: usize,
@@ -86,7 +86,7 @@ impl AssociatedLink {
             let mut response = peer.ap.beacon();
             response[0] = 0x50;
             response[4..10].copy_from_slice(&peer.network.station);
-            if channel == 6 {
+            if channel != self.home {
                 response[10..16].copy_from_slice(&AWAY);
                 response[16..22].copy_from_slice(&AWAY);
             }
@@ -95,9 +95,13 @@ impl AssociatedLink {
                 .position(|bytes| bytes == [3, 1, 1])
                 .ok_or(UsbError::Stall)?;
             response[ds + 2] = channel;
-            if channel == 1 && peer.ht {
+            if channel == self.home && peer.ht {
                 response.extend_from_slice(&super::super::super::super::ht_tests::WMM);
-                response.extend_from_slice(&super::super::super::super::ht_tests::elements(255));
+                response.extend_from_slice(
+                    peer.beacon_ht
+                        .as_deref()
+                        .unwrap_or(&super::super::super::super::ht_tests::elements(255)),
+                );
             }
             Some(response)
         } else {

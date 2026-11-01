@@ -138,7 +138,7 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         result
     }
 
-    fn scan_config(&self) -> Result<ScanConfig, Error> {
+    pub(super) fn scan_config(&self) -> Result<ScanConfig, Error> {
         let management_runtime::Phase::Associated { aid } = self.plan.phase() else {
             return Err(Error::State);
         };

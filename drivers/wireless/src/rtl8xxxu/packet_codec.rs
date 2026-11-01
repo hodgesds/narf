@@ -29,6 +29,7 @@ pub struct Mpdu {
     pub decrypted: bool,
     pub timestamp: u32,
     pub(super) native: Option<[u32; 4]>,
+    pub(super) wide: Option<super::ht_runtime::RxSeal>,
     /// Set only by the station's recipient BA gate for a QoS MPDU on a TID
     /// with an accepted ADDBA session; then (and only for HT MPDUs without
     /// the A-MSDU bit, since the ADDBA response clears A-MSDU permission)
@@ -48,7 +49,16 @@ impl Mpdu {
         self.admitted_with(ht_profile, self.ba) || ht_profile && self.admitted_with(true, true)
     }
     fn admitted_with(&self, ht_profile: bool, ba: bool) -> bool {
-        if self.decrypted || self.bandwidth40 {
+        if self.decrypted
+            || self.bandwidth40 && !self.wide.as_ref().is_some_and(|proof| proof.admits(true))
+        {
+            return false;
+        }
+        if self
+            .wide
+            .as_ref()
+            .is_some_and(|proof| !proof.admits(self.bandwidth40))
+        {
             return false;
         }
         let aggregation = self.aggregation_mask(ba);
@@ -76,7 +86,7 @@ impl Mpdu {
             }
         }
         if !self.ht {
-            return self.rate <= 11;
+            return !self.bandwidth40 && self.rate <= 11;
         }
         if !ht_profile || !(12..=19).contains(&self.rate) {
             return false;
@@ -84,11 +94,17 @@ impl Mpdu {
         let Some([d0, d1, d2, d3]) = self.native else {
             return false;
         };
-        if d3 & 0xf80 != 0 || d1 & aggregation != 0 || d2 & 0xf000 != 0 {
+        let wide = self
+            .wide
+            .as_ref()
+            .is_some_and(|proof| proof.admits(self.bandwidth40));
+        if d3 & (if wide { 0xd80 } else { 0xf80 }) != 0 || d1 & aggregation != 0 || d2 & 0xf000 != 0
+        {
             return false;
         }
         if (d0 & (1 << 26) != 0) == self.phy.is_empty()
-            || !self.phy.is_empty() && (self.phy.len() != 32 || self.phy[27] & 0x0e != 0)
+            || !self.phy.is_empty()
+                && (self.phy.len() != 32 || self.phy[27] & (if wide { 2 } else { 0x0e }) != 0)
         {
             return false;
         }
@@ -204,6 +220,7 @@ pub fn receive(bytes: &[u8]) -> Result<Vec<Record>, Error> {
                 decrypted: d0 & (1 << 27) == 0 && d0 & (7 << 20) != 0,
                 timestamp: word(desc, 20),
                 native: Some([d0, d1, word(desc, 8), d3]),
+                wide: None,
                 ba: false,
             }));
         }
@@ -382,4 +399,15 @@ pub(super) const fn data_endpoint(class: u8, count: u8) -> usize {
         (3, _) => 2,
         _ => 0,
     }
+}
+
+/// Only a current private native program selects these source v3 fields.
+pub(super) fn width_fields(packet: &mut [u8], geometry: super::ht_runtime::Geometry) {
+    let value = u32::from_le_bytes(packet[16..20].try_into().unwrap()) | geometry.data_width_bits();
+    packet[16..20].copy_from_slice(&value.to_le_bytes());
+    packet[28..30].fill(0);
+    let checksum = packet[..TX_DESC]
+        .chunks_exact(2)
+        .fold(0u16, |sum, b| sum ^ u16::from_le_bytes([b[0], b[1]]));
+    packet[28..30].copy_from_slice(&checksum.to_le_bytes());
 }

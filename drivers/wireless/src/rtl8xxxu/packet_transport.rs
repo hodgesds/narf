@@ -117,6 +117,7 @@ pub struct Owner<I: Io> {
     failed: bool,
     pub(super) qos: bool,
     pub(super) ht: bool,
+    pub(super) wide: Option<super::ht_runtime::Geometry>,
     /// HT peer MPDU density and operational originator-BA TID bitmap.
     pub(super) ampdu: Option<(u8, u8)>,
     receive: Option<I::Receipt>,
@@ -154,6 +155,7 @@ impl<I: Io> Owner<I> {
             failed: false,
             qos: false,
             ht: false,
+            wide: None,
             ampdu: None,
             receive: None,
             transmit: None,
@@ -176,6 +178,7 @@ impl<I: Io> Owner<I> {
         }
         self.qos = false;
         self.ht = false;
+        self.wide = None;
         self.ampdu = None;
         self.scratch.fill(0);
         self.channel = channel;
@@ -348,6 +351,11 @@ impl<I: Io> Owner<I> {
             return Err(Error::Busy);
         }
         let mut packet = packet_codec::transmit_rate(frame, kind, rate).map_err(Error::Packet)?;
+        if kind == Kind::Data && frame.first() == Some(&0x88) {
+            if let Some(geometry) = self.wide {
+                packet_codec::width_fields(&mut packet, geometry);
+            }
+        }
         if let Some(pt_stage) = adaptive {
             packet_codec::adaptive_fields(&mut packet, pt_stage);
         }
@@ -392,7 +400,13 @@ impl<I: Io> Owner<I> {
         }
         let class = packet_codec::access_category(if null.qos() { 7 } else { 0 }).1;
         let index = packet_codec::data_endpoint(class, self.endpoints.output_count);
-        self.submit_encoded(packet_codec::transmit_null(null), index)
+        let mut packet = packet_codec::transmit_null(null);
+        if null.qos() {
+            if let Some(geometry) = self.wide {
+                packet_codec::width_fields(&mut packet, geometry);
+            }
+        }
+        self.submit_encoded(packet, index)
     }
     fn submit_encoded(&mut self, packet: Vec<u8>, index: usize) -> Result<(), Error> {
         let endpoint = self.endpoints.output[index];

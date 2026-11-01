@@ -86,6 +86,10 @@ struct Tx {
 }
 struct Peer {
     ht: bool,
+    ht40: bool,
+    ht40_request: bool,
+    beacon_ht: Option<Vec<u8>>,
+    eapol_retry: Option<Vec<u8>>,
     response_ht: Option<Vec<u8>>,
     response_wmm: bool,
     declines: usize,
@@ -127,6 +131,10 @@ impl Peer {
         .unwrap();
         Self {
             ht: false,
+            ht40: false,
+            ht40_request: false,
+            beacon_ht: None,
+            eapol_retry: None,
             response_ht: None,
             response_wmm: true,
             declines: 0,
@@ -303,7 +311,9 @@ impl Peer {
             let before = self.ap.phase();
             if self.ht && frame[0] == 0 {
                 ensure!(
-                    frame.windows(4).any(|x| x == [45, 26, 12, 0])
+                    frame
+                        .windows(4)
+                        .any(|x| x == [45, 26, if self.ht40_request { 14 } else { 12 }, 0])
                         && frame
                             .windows(9)
                             .any(|x| x == narf_wireless::wmm::INFORMATION),
@@ -325,6 +335,14 @@ impl Peer {
                         }
                     }
                 }
+            }
+            if before == ApPhase::Association && self.ap.phase() == ApPhase::Message2 {
+                self.eapol_retry = replies
+                    .iter()
+                    .find(|frame| frame.get(24..32) == Some(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]))
+                    .cloned();
+            } else if before == ApPhase::Message2 {
+                self.eapol_retry = None;
             }
             if before == ApPhase::Message2 {
                 let key =
@@ -451,7 +469,9 @@ impl Io for Link {
             out[4..8].copy_from_slice(&d1.to_le_bytes());
         }
         if ht {
-            out[12..16].copy_from_slice(&(19u32 | (1 << 6)).to_le_bytes());
+            out[12..16].copy_from_slice(
+                &(19u32 | (1 << 6) | if p.ht40 { 1 << 9 } else { 0 }).to_le_bytes(),
+            );
         }
         out[if ht { 56 } else { 24 }..length].copy_from_slice(&frame);
         p.rx = None;

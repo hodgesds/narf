@@ -4,10 +4,11 @@
 //! retires the old receive stream before any new channel label is published.
 use super::*;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Restart {
     ChannelChange,
     Parked,
+    Wide(super::super::ht_runtime::WidePlan),
     /// Always retire the old physical stream, even on the same channel.
     Scan {
         retain_ht: bool,
@@ -40,6 +41,14 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         retain_ht: bool,
     ) -> Result<super::super::power_policy::Permission, Error> {
         self.restore_channel(channel, Restart::Scan { retain_ht })
+            .await
+    }
+
+    pub(in crate::rtl8xxxu) async fn cold_wide_plan(
+        &mut self,
+        plan: super::super::ht_runtime::WidePlan,
+    ) -> Result<super::super::power_policy::Permission, Error> {
+        self.restore_channel(plan.geometry().primary(), Restart::Wide(plan))
             .await
     }
 
@@ -99,90 +108,117 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         // calibration program and the selected operating row must stay valid.
         let home = base.for_channel(1)?;
         let authority = self.authority();
-        let ht = if channel == 1 && !matches!(restart, Restart::Scan { retain_ht: false }) {
+        let wide_plan = match &restart {
+            Restart::Wide(plan) => Some(plan.clone()),
+            Restart::Scan { retain_ht: false } => None,
+            Restart::Parked | Restart::Scan { retain_ht: true } => self
+                .wide
+                .as_ref()
+                .filter(|program| program.geometry().primary() == channel)
+                .map(|program| program.plan())
+                .or_else(|| self.wide_plan_for_channel(channel)),
+            Restart::ChannelChange => self.wide_plan_for_channel(channel),
+        };
+        let ht = if wide_plan.is_none()
+            && channel == 1
+            && !matches!(restart, Restart::Scan { retain_ht: false })
+        {
             self.home_ht.clone()
         } else {
             None
         };
+        if let Some(plan) = &wide_plan {
+            plan.current()?;
+        }
         let factory = self.firmware.factory().ok_or(Error::State)?;
         let mut attempt = Attempt {
             firmware: self.firmware.clone(),
             armed: true,
         };
-        let result = authority
-            .fence(
-                async {
-                    home.fence(
-                        target.fence(
-                            async {
-                                if matches!(restart, Restart::Parked) {
-                                    self.firmware
-                                        .restart_parked()
-                                        .await
-                                        .map_err(Error::Control)?;
-                                } else {
-                                    self.quiesce_restart().await?;
-                                    self.firmware
-                                        .restart_stopped()
-                                        .await
-                                        .map_err(Error::Control)?;
-                                }
-                                // This is a freshly booted firmware session;
-                                // old H2C/RA host bookkeeping cannot survive it.
-                                self.mailbox = 0;
-                                self.ra = None;
-                                self.report_time = None;
-                                let rx =
-                                    self.firmware.read32(0x284).await.map_err(Error::Control)?;
+        let operation = authority.fence(
+            async {
+                home.fence(
+                    target.fence(
+                        async {
+                            if matches!(restart, Restart::Parked) {
                                 self.firmware
-                                    .write32(0x284, rx & !(1 << 18))
+                                    .restart_parked()
                                     .await
                                     .map_err(Error::Control)?;
-                                if self.firmware.read32(0x284).await.map_err(Error::Control)?
-                                    & (1 << 18)
-                                    != 0
-                                {
-                                    return Err(Error::State);
-                                }
-                                super::super::channel_runtime::initial20(
-                                    &self.firmware,
-                                    factory,
-                                    channel,
-                                )
+                            } else {
+                                self.quiesce_restart().await?;
+                                self.firmware
+                                    .restart_stopped()
+                                    .await
+                                    .map_err(Error::Control)?;
+                            }
+                            // This is a freshly booted firmware session;
+                            // old H2C/RA host bookkeeping cannot survive it.
+                            self.mailbox = 0;
+                            self.ra = None;
+                            self.report_time = None;
+                            let rx = self.firmware.read32(0x284).await.map_err(Error::Control)?;
+                            self.firmware
+                                .write32(0x284, rx & !(1 << 18))
                                 .await
                                 .map_err(Error::Control)?;
-                                // Exact RF readback precedes the new packet geometry.
-                                let actual =
-                                    super::super::calibration::read_rf(&self.firmware, 0x18)
-                                        .await
-                                        .map_err(Error::Control)?;
-                                if actual & 0xfff != (u32::from(channel) | 0xc00) {
-                                    return Err(Error::State);
-                                }
-                                self.ht = None;
-                                self.ht_gains = None;
-                                if let Some(grant) = &ht {
-                                    let gains = grant.gains()?;
-                                    grant.program(&self.firmware, gains).await?;
-                                    self.ht_gains = Some(gains);
-                                }
-                                self.ht = ht;
-                                self.wmm = Some(target.clone());
-                                self.packets
-                                    .retarget_stopped(channel)
-                                    .map_err(Error::Packet)?;
-                                self.phase = Phase::Stopped;
-                                self.start().await
-                            },
-                            core::convert::identity,
-                        ),
+                            if self.firmware.read32(0x284).await.map_err(Error::Control)?
+                                & (1 << 18)
+                                != 0
+                            {
+                                return Err(Error::State);
+                            }
+                            super::super::channel_runtime::initial20(
+                                &self.firmware,
+                                factory,
+                                channel,
+                            )
+                            .await
+                            .map_err(Error::Control)?;
+                            // Exact RF readback precedes the new packet geometry.
+                            let actual = super::super::calibration::read_rf(&self.firmware, 0x18)
+                                .await
+                                .map_err(Error::Control)?;
+                            if actual & 0xfff != (u32::from(channel) | 0xc00) {
+                                return Err(Error::State);
+                            }
+                            self.ht = None;
+                            self.ht_gains = None;
+                            self.wide = None;
+                            if let Some(plan) = &wide_plan {
+                                self.wide = Some(
+                                    super::super::ht_runtime::WideProgram::install(
+                                        &self.firmware,
+                                        plan.clone(),
+                                    )
+                                    .await?,
+                                );
+                            } else if let Some(grant) = &ht {
+                                let gains = grant.gains()?;
+                                grant.program(&self.firmware, gains).await?;
+                                self.ht_gains = Some(gains);
+                            }
+                            self.ht = ht;
+                            self.wmm = Some(target.clone());
+                            self.packets
+                                .retarget_stopped(channel)
+                                .map_err(Error::Packet)?;
+                            self.phase = Phase::Stopped;
+                            self.start().await
+                        },
                         core::convert::identity,
-                    )
-                    .await
-                },
-                core::convert::identity,
-            )
-            .await;
+                    ),
+                    core::convert::identity,
+                )
+                .await
+            },
+            core::convert::identity,
+        );
+        let result = if let Some(plan) = &wide_plan {
+            plan.fence(operation).await
+        } else {
+            operation.await
+        };
         attempt.armed = false;
         if result.is_err() {
             self.fail();

@@ -72,6 +72,7 @@ pub mod usb;
 mod wmm_runtime;
 
 pub use ht_runtime::Request as Ht20Request;
+pub use ht_runtime::Request as Ht40Request;
 pub use regs::{ChipFamily, RTL8XXXU_VENDOR};
 
 // ── MLME scaffold ───────────────────────────────────────────────────

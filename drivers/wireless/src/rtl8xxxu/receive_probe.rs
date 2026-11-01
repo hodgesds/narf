@@ -3,6 +3,22 @@
 use super::*;
 
 impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
+    pub(in crate::rtl8xxxu) fn prepare_probe(
+        &self,
+        ssid: &[u8],
+        sequence: u16,
+        extra: &[u8],
+    ) -> Result<super::super::probe_runtime::Prepared, Error> {
+        super::super::probe_runtime::Prepared::native(
+            self.local().ok_or(Error::State)?,
+            self.channel(),
+            ssid,
+            sequence,
+            self.ht_enabled(),
+            self.wide.as_deref(),
+            extra,
+        )
+    }
     pub(in crate::rtl8xxxu) fn submit_probe(
         &mut self,
         probe: &super::super::probe_runtime::Prepared,
@@ -14,6 +30,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
                 self.local().ok_or(Error::State)?,
                 self.channel(),
                 self.ht_enabled(),
+                self.wide.is_some(),
             )
         {
             return Err(Error::State);

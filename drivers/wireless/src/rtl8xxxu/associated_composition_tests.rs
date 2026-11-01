@@ -4,6 +4,8 @@ use super::*;
 use crate::rtl8xxxu::{ht_runtime::Grant, packet_codec, ps_null};
 #[path = "associated_active_composition_tests.rs"]
 mod active;
+#[path = "ht40_composition_tests.rs"]
+mod ht40;
 
 #[derive(Default)]
 struct PowerIndications {
@@ -17,12 +19,14 @@ struct PowerIndications {
     truncated: usize,
     away_generation: u64,
     home_generation: u64,
+    eapol_retry_after: u64,
     inject_away_data: Option<Vec<u8>>,
     buffered: VecDeque<Vec<u8>>,
 }
 #[derive(Clone)]
 struct AssociatedLink {
     radio: ChannelLink,
+    home: u8,
     power: Arc<IrqSafeSpinLock<PowerIndications>>,
     probes: Arc<IrqSafeSpinLock<active::Probes>>,
     clock: Env,
@@ -34,7 +38,7 @@ impl AssociatedLink {
         let Some((ready, asleep)) = power.air else {
             return;
         };
-        if channel != 1 || !tx {
+        if channel != self.home || !tx {
             power.truncated += 1;
             power.air = None;
             return;
@@ -74,15 +78,24 @@ impl Io for AssociatedLink {
         if rx {
             let mut power = self.power.lock();
             let mut peer = self.radio.bulk.0.lock();
-            if channel == 1 && power.home_generation != generation {
+            if channel == self.home && power.home_generation != generation {
                 let mut beacon = peer.ap.beacon();
+                if let Some(ds) = beacon.windows(3).position(|w| w == [3, 1, 1]) {
+                    beacon[ds + 2] = self.home;
+                }
                 if peer.ht {
                     beacon.extend_from_slice(&super::super::super::ht_tests::WMM);
-                    beacon.extend_from_slice(&super::super::super::ht_tests::elements(255));
+                    beacon.extend_from_slice(
+                        peer.beacon_ht
+                            .as_deref()
+                            .unwrap_or(&super::super::super::ht_tests::elements(255)),
+                    );
                 }
                 peer.queue.push_back(beacon);
                 power.home_generation = generation;
-            } else if channel == 6 && power.away_generation != generation {
+            } else if channel == (if self.home == 1 { 6 } else { 1 })
+                && power.away_generation != generation
+            {
                 let mut beacon = peer.ap.beacon();
                 // Another real BSS on this physical channel, not a relabel
                 // of the home AP's retained receive buffer.
@@ -92,7 +105,7 @@ impl Io for AssociatedLink {
                     .windows(3)
                     .position(|w| w == [3, 1, 1])
                     .ok_or(UsbError::Stall)?;
-                beacon[ds + 2] = 6;
+                beacon[ds + 2] = channel;
                 if !suppress_away_beacon {
                     peer.queue.push_back(beacon);
                 }
@@ -107,6 +120,20 @@ impl Io for AssociatedLink {
                 }
                 power.away_generation = generation;
             }
+            // The AP retains its own M1 independently of the NIC FIFO. A
+            // real protocol retransmission after its100ms timer supplies a
+            // NEW physical copy if a response-narrowing cold cut lost M1.
+            if channel == self.home
+                && peer.ap.phase() == ApPhase::Message2
+                && peer.queue.is_empty()
+                && peer.raw_queue.is_empty()
+                && self.clock.now_ms() >= power.eapol_retry_after
+            {
+                if let Some(frame) = peer.eapol_retry.clone() {
+                    peer.queue.push_back(frame);
+                    power.eapol_retry_after = self.clock.now_ms().saturating_add(100);
+                }
+            }
         }
         self.radio.bulk.poll_receive(receipt, bytes)
     }
@@ -115,14 +142,36 @@ impl Io for AssociatedLink {
             return self.begin_probe(dci, bytes);
         }
         let (channel, _, tx) = self.radio.physical();
-        if channel != 1 || !tx {
+        if channel != self.home || !tx {
             return Err(UsbError::Stall);
         }
         if !matches!(bytes.get(TX_DESC), Some(0x48 | 0xc8)) {
-            return self.radio.bulk.begin_send(dci, bytes);
+            let result = self.radio.bulk.begin_send(dci, bytes);
+            if result.is_ok()
+                && bytes.get(TX_DESC) == Some(&0)
+                && self.radio.bulk.0.lock().ap.phase() == ApPhase::Message2
+            {
+                self.power.lock().eapol_retry_after = self.clock.now_ms().saturating_add(100);
+            }
+            return result;
         }
         let frame = &bytes[TX_DESC..];
         let qos = frame[0] == 0xc8;
+        let width = if qos && self.radio.control.0.lock().rf[0x18] & 0xc00 == 0x400 {
+            let rsr = u32::from_le_bytes(
+                self.radio.control.0.lock().regs[0x440..0x444]
+                    .try_into()
+                    .unwrap(),
+            );
+            (1 << 25)
+                | if rsr & (1 << 21) != 0 {
+                    1 << 20
+                } else {
+                    1 << 21
+                }
+        } else {
+            0
+        };
         let mut power = self.power.lock();
         let mut peer = self.radio.bulk.0.lock();
         let queue = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
@@ -135,7 +184,7 @@ impl Io for AssociatedLink {
             || frame[4..10] != AP
             || frame[10..16] != peer.network.station
             || frame[16..22] != AP
-            || flags != 0x100 | if qos { 0x40 } else { 0 }
+            || flags != (0x100 | (if qos { 0x40 } else { 0 }) | width)
             || queue != if qos { 7 << 8 } else { 0 }
             || bytes[20..24] != 0x0001ff00u32.to_le_bytes()
             || qos && (frame[22..26] != [0, 0, 7, 0] || dci != 6)
@@ -220,10 +269,21 @@ struct AssociatedFixture {
     domain: Arc<IrqSafeSpinLock<narf_wireless::reg::RegulatoryDomain>>,
     firmware: Arc<Owner<Fake>>,
     name: String,
+    home: u8,
+    wide_source: Option<Cap<FirmwareBlob, Read>>,
 }
 impl AssociatedFixture {
     #[inline(never)]
     fn new(protected: bool, ht: bool) -> Result<Box<Self>, &'static str> {
+        Self::new_profile(protected, ht, None)
+    }
+    #[inline(never)]
+    fn new_profile(
+        protected: bool,
+        ht: bool,
+        wide: Option<crate::rtl8xxxu::ht_runtime::Geometry>,
+    ) -> Result<Box<Self>, &'static str> {
+        let home = wide.map_or(1, |geometry| geometry.primary());
         let (control, firmware) = initialized_registered_firmware();
         let factory = firmware.factory().ok_or("EU associated factory")?;
         let domain = Arc::new(IrqSafeSpinLock::new(narf_wireless::reg::RegulatoryDomain {
@@ -231,7 +291,7 @@ impl AssociatedFixture {
             rules: vec![narf_wireless::reg::RegRule {
                 freq_start_mhz: 2402,
                 freq_end_mhz: 2482,
-                max_bandwidth_mhz: 20,
+                max_bandwidth_mhz: if wide.is_some() { 40 } else { 20 },
                 max_power_dbm: 17,
                 flags: narf_wireless::reg::RegFlags::empty(),
             }],
@@ -247,6 +307,12 @@ impl AssociatedFixture {
         let mut peer = Peer::new(plan(factory.mac), protected);
         peer.ht = ht;
         peer.response_ht = ht.then(|| super::super::super::ht_tests::elements(255));
+        if let Some(geometry) = wide {
+            peer.ht40 = true;
+            peer.ht40_request = true;
+            peer.beacon_ht = Some(ht40::elements(geometry));
+            peer.response_ht = peer.beacon_ht.clone();
+        }
         let radio = ChannelLink {
             bulk: Link(Arc::new(IrqSafeSpinLock::new(peer))),
             control: control.clone(),
@@ -256,6 +322,7 @@ impl AssociatedFixture {
         };
         let link = AssociatedLink {
             radio,
+            home,
             clock: clock.clone(),
             probes: Arc::new(IrqSafeSpinLock::new(Default::default())),
             power: Arc::new(IrqSafeSpinLock::new(PowerIndications {
@@ -276,7 +343,7 @@ impl AssociatedFixture {
             let artifact = super::super::super::ht_tests::artifact(&proof, executable);
             let grant = Arc::new(
                 Grant::parse(
-                    proof,
+                    proof.clone(),
                     executable,
                     factory.ht40_power[0],
                     &artifact,
@@ -287,6 +354,28 @@ impl AssociatedFixture {
             );
             drive(receiver.install_ht(grant))?.map_err(|_| "EU associated actual HT program")?;
         }
+        let wide_source = if let Some(geometry) = wide {
+            let cap = Cap::bootstrap();
+            let selected = proof
+                .for_channel(geometry.primary())
+                .map_err(|_| "EU wide target N8PC")?;
+            let executable = firmware.executable().ok_or("EU wide executable")?;
+            let qualification = crate::rtl8xxxu::ht_runtime::WideQualification::parse(
+                selected.clone(),
+                executable,
+                factory,
+                geometry,
+                &ht40::artifact(&selected, executable, geometry),
+                Some([7; 32]),
+                cap,
+            )
+            .map_err(|_| "EU wide v2 qualification")?;
+            drive(receiver.install_wide_model(Arc::new(qualification)))?
+                .map_err(|_| "EU wide native20 fallback program")?;
+            Some(cap)
+        } else {
+            None
+        };
         let service =
             drive(Service::start(receiver, power, clock))?.map_err(|_| "EU associated service")?;
         let name = narf_net::iface::register("wlan%d", factory.mac, send_associated);
@@ -303,6 +392,8 @@ impl AssociatedFixture {
             domain,
             firmware,
             name,
+            home,
+            wide_source,
         }))
     }
     fn scan(&self, channels: &[u32]) -> ScanRequest {
@@ -319,13 +410,13 @@ impl AssociatedFixture {
         }
     }
     fn join(&self) -> Result<(), &'static str> {
-        drive(self.device.scan(self.scan(&[1])))?
+        drive(self.device.scan(self.scan(&[u32::from(self.home)])))?
             .map_err(|_| "EU associated initial native scan")?;
         drive(self.device.associate(AssociateRequest {
             bssid: AP,
             ssid: SSID.to_vec(),
-            channel: 1,
-            frequency_mhz: 2412,
+            channel: u32::from(self.home),
+            frequency_mhz: 2407 + u32::from(self.home) * 5,
             security: if self.link.radio.bulk.0.lock().ap.protected() {
                 SecurityConfig::Wpa2 { psk: PMK }
             } else {
@@ -780,7 +871,9 @@ fn downlink(
     Ok((header, ethernet))
 }
 fn ba_and_away_crypto() -> Result<(), &'static str> {
-    let h = AssociatedFixture::new(true, true)?;
+    ba_and_away_crypto_on(AssociatedFixture::new(true, true)?)
+}
+fn ba_and_away_crypto_on(h: Box<AssociatedFixture>) -> Result<(), &'static str> {
     h.join()?;
     let params = 2u16 | 5 << 2 | 32 << 6;
     let mut body = vec![3, 0, 7];

@@ -15,6 +15,7 @@ pub(in crate::rtl8xxxu) struct ScanConfig {
 pub(in crate::rtl8xxxu) struct ScanHome {
     channel: u8,
     profile_ht: bool,
+    wide: Option<super::super::ht_runtime::WidePlan>,
     config: ScanConfig,
     ra: Option<super::super::rate_adaptation::RateAdaptation>,
     report_time: Option<u16>,
@@ -98,6 +99,7 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
                     Ok(ScanHome {
                         channel: self.channel(),
                         profile_ht: self.ht_enabled(),
+                        wide: self.wide.as_ref().map(|program| program.plan()),
                         config,
                         ra: self.ra.take(),
                         report_time: self.report_time.take(),
@@ -113,6 +115,28 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         result
     }
 
+    /// The response may narrow an offered40MHz link to20MHz. Preserve the
+    /// same logical authenticated peer while actually retiring the old native
+    /// stream and restoring its selected program before keys/data can open.
+    pub(in crate::rtl8xxxu) async fn reconcile_station_geometry(
+        &mut self,
+        geometry: Option<super::super::ht_runtime::Geometry>,
+        config: ScanConfig,
+        permission: super::super::power_policy::Permission,
+    ) -> Result<(), Error> {
+        if geometry.is_none()
+            && self
+                .wide
+                .as_ref()
+                .is_some_and(|p| p.mode() == super::super::ht_runtime::WideMode::Forty)
+        {
+            let mut home = self.suspend_station(config).await?;
+            home.wide = Some(home.wide.as_ref().ok_or(Error::State)?.narrow());
+            self.restore_station(home, permission).await
+        } else {
+            self.confirm_station_geometry(geometry)
+        }
+    }
     pub(in crate::rtl8xxxu) async fn restore_station(
         &mut self,
         home: ScanHome,
@@ -121,11 +145,13 @@ impl<C: ControlIo, B: PacketIo> Receiver<C, B> {
         if self.peer.is_some() || permission.channel() != home.channel {
             return Err(Error::State);
         }
-        if self
-            .cold_scan_channel(home.channel, home.profile_ht)
-            .await?
-            != permission
-        {
+        let restored = if let Some(plan) = home.wide {
+            self.cold_wide_plan(plan).await?
+        } else {
+            self.cold_scan_channel(home.channel, home.profile_ht)
+                .await?
+        };
+        if restored != permission {
             return Err(Error::State);
         }
         self.enable_transmit(permission).await?;
