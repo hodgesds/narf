@@ -1,0 +1,710 @@
+//! Native conversations through the production Device/Guard/Presenter/PollIo
+//! path. Register vectors follow MIT Linux b90c984d, intel_display_regs.h;
+//! only the platform boundary and the next display tick are modeled.
+
+use super::*;
+use alloc::collections::BTreeMap;
+use core::task::{Context, Poll, Waker};
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+const SURF: u64 = 0x7019c;
+const LIVE: u64 = 0x701ac;
+const FRAME: u64 = 0x70040;
+const IIR: u64 = 0x44408;
+const IMR: u64 = 0x44404;
+const IER: u64 = 0x4440c;
+const CONSOLE: u32 = 0x01000000;
+const PTE_START: u64 = GGTT_ARRAY_BASE + GEM_SCANOUT_GTT_START / 4096 * 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    Pause,
+    Takeover,
+    Arm(u32),
+    Latch(u32),
+    Resume,
+}
+#[derive(Debug)]
+struct Hardware {
+    regs: BTreeMap<u64, u32>,
+    actions: Vec<Action>,
+    allowed: bool,
+    powered: bool,
+    pause_blocked: bool,
+    takeover_error: Option<FsError>,
+    pending_surface: Option<u32>,
+    flips: bool,
+    frames: bool,
+    now: u64,
+    tick_ns: u64,
+    deliveries: u32,
+    pte_installs: usize,
+    pte_clears: usize,
+    refuse_ptes: bool,
+}
+#[derive(Clone, Debug)]
+struct MockPlatform(Arc<IrqSafeSpinLock<Hardware>>, Arc<AtomicBool>);
+impl MockPlatform {
+    fn new() -> Self {
+        Self(
+            Arc::new(IrqSafeSpinLock::new(Hardware {
+                regs: [
+                    (0x70180, 0x84000000),
+                    (0x70188, 4),
+                    (0x70190, 0x001f003f),
+                    (SURF, CONSOLE),
+                    (LIVE, CONSOLE),
+                    (FRAME, 40),
+                    (IIR, 0),
+                    (IMR, u32::MAX),
+                    (IER, 0),
+                    (0x4804, 4),
+                ]
+                .into_iter()
+                .collect(),
+                actions: Vec::new(),
+                allowed: true,
+                powered: true,
+                pause_blocked: false,
+                takeover_error: None,
+                pending_surface: None,
+                flips: true,
+                frames: true,
+                now: 1000,
+                tick_ns: 250_000,
+                deliveries: 0,
+                pte_installs: 0,
+                pte_clears: 0,
+                refuse_ptes: false,
+            })),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+    fn step(&self) {
+        let mut hw = self.0.lock();
+        hw.now = hw.now.saturating_add(hw.tick_ns);
+        if !hw.allowed || !hw.powered {
+            return;
+        }
+        if hw.frames {
+            let count = hw.regs[&FRAME].wrapping_add(1);
+            hw.regs.insert(FRAME, count);
+        }
+        if hw.flips {
+            if let Some(surface) = hw.pending_surface.take() {
+                hw.regs.insert(LIVE, surface);
+                // Actual register programming enables latching; IMR suppresses
+                // delivery. The test never injects flipdone into a disabled IER.
+                if hw.regs[&IER] & 8 != 0 {
+                    *hw.regs.get_mut(&IIR).unwrap() |= 8;
+                    if hw.regs[&IMR] & 8 == 0 {
+                        hw.deliveries += 1;
+                    }
+                }
+                hw.actions.push(Action::Latch(surface));
+            }
+        }
+    }
+    fn actions(&self) -> Vec<Action> {
+        self.0.lock().actions.clone()
+    }
+    fn mapping_count(&self) -> usize {
+        self.0
+            .lock()
+            .regs
+            .range(PTE_START..)
+            .filter(|(offset, value)| **offset % 8 == 0 && **value != 0)
+            .count()
+    }
+}
+impl MmioWindow for MockPlatform {
+    fn read32(&self, offset: u64) -> u32 {
+        let hw = self.0.lock();
+        if self.reset_lost() || !hw.allowed || !hw.powered {
+            return u32::MAX;
+        }
+        hw.regs.get(&offset).copied().unwrap_or(0)
+    }
+    fn write32(&self, offset: u64, value: u32) {
+        let mut hw = self.0.lock();
+        if self.reset_lost() || !hw.allowed || !hw.powered {
+            return;
+        }
+        if offset >= PTE_START {
+            if value == 0 {
+                hw.pte_clears += 1;
+            } else {
+                hw.pte_installs += 1;
+            }
+            if hw.refuse_ptes {
+                return;
+            }
+            if value == 0 {
+                hw.regs.remove(&offset);
+            } else {
+                hw.regs.insert(offset, value);
+            }
+        } else if offset == IIR {
+            *hw.regs.get_mut(&IIR).unwrap() &= !value;
+        } else {
+            hw.regs.insert(offset, value);
+            if offset == SURF {
+                hw.pending_surface = Some(value);
+                hw.actions.push(Action::Arm(value));
+            }
+        }
+    }
+}
+// SAFETY: each fixture owns its complete register bank. Every access refuses
+// revoked authority/power, and the Arc retains the bank for pending futures.
+unsafe impl DisplayAccess for MockPlatform {
+    fn access_ok(&self) -> bool {
+        let hw = self.0.lock();
+        !self.reset_lost() && hw.allowed && hw.powered
+    }
+}
+impl Platform for MockPlatform {
+    fn takeover(&self) -> Result<(), FsError> {
+        if self.reset_lost() {
+            return Err(FsError::NoDevice);
+        }
+        let mut hw = self.0.lock();
+        hw.actions.push(Action::Takeover);
+        hw.takeover_error.map_or(Ok(()), Err)
+    }
+    fn pause_console(&self) -> Wait<'_> {
+        self.0.lock().actions.push(Action::Pause);
+        Box::pin(core::future::poll_fn(move |_| {
+            if self.0.lock().pause_blocked {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        }))
+    }
+    fn resume_console(&self) {
+        if self.reset_lost() {
+            return;
+        }
+        self.0.lock().actions.push(Action::Resume);
+    }
+    fn now(&self) -> u64 {
+        self.0.lock().now
+    }
+    fn reset_lost(&self) -> bool {
+        self.1.load(Ordering::Acquire)
+    }
+    fn tick(&self) -> Wait<'_> {
+        let mut yielded = false;
+        Box::pin(core::future::poll_fn(move |cx| {
+            if !yielded {
+                yielded = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                self.step();
+                Poll::Ready(())
+            }
+        }))
+    }
+}
+fn console() -> ActiveScanout {
+    ActiveScanout {
+        width: 64,
+        height: 32,
+        stride_bytes: 256,
+        gtt_offset: CONSOLE,
+        phys_base: 0x100000,
+    }
+}
+fn geometry() -> Geometry {
+    Geometry {
+        width: 64,
+        height: 32,
+        pitch: 256,
+    }
+}
+fn device(platform: &MockPlatform) -> Device<MockPlatform> {
+    Device::new(
+        platform.clone(),
+        Generation::TigerLake,
+        0x1000000,
+        console(),
+    )
+}
+fn once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+    future.poll(&mut Context::from_waker(Waker::noop()))
+}
+fn complete<F: Future>(future: F) -> F::Output {
+    let mut future = Box::pin(future);
+    for _ in 0..128 {
+        if let Poll::Ready(result) = once(future.as_mut()) {
+            return result;
+        }
+    }
+    panic!("native KMS conversation did not finish");
+}
+fn object(wc: bool) -> Result<Arc<GemObject>, FsError> {
+    use crate::intel_gpu_gem::{GemState, Placement};
+    let gem = GemState::new();
+    let handle = gem.create_placed(
+        8192,
+        None,
+        if wc {
+            Placement::SystemWc
+        } else {
+            Placement::System
+        },
+        |_, _| Ok(()),
+    )?;
+    let object = gem.object(handle)?;
+    object.mark_scanout();
+    gem.close(handle)?;
+    Ok(object)
+}
+
+fn smoke_kms_cross_open_serialization_and_legacy_exclusion() -> TestResult {
+    let platform = MockPlatform::new();
+    let device = device(&platform);
+    let first = complete(device.session()).unwrap();
+    let mut other_open = Box::pin(device.session());
+    assert!(once(other_open.as_mut()).is_pending());
+    assert!(
+        device.legacy().is_err(),
+        "legacy bypassed active session mutex"
+    );
+    drop(first);
+    let mut second = complete(other_open).unwrap();
+    complete(second.start()).unwrap();
+    assert!(device.legacy().is_err());
+    drop(second);
+    assert!(
+        device.legacy().is_err(),
+        "legacy stole paused console/status owner"
+    );
+    let mut next = complete(device.session()).unwrap();
+    complete(next.restore_console()).unwrap();
+    drop(next);
+    assert!(device.legacy().is_ok());
+    complete(device.quiesce()).unwrap();
+    assert!(complete(device.session()).is_err());
+    let mut legacy = device.legacy().unwrap();
+    legacy.suspend();
+    legacy.console_replaced(&console());
+    drop(legacy);
+    assert!(
+        complete(device.session()).is_ok(),
+        "console replacement failed to reopen admission"
+    );
+    assert_eq!(platform.read32(IER), 0);
+    assert_eq!(platform.read32(IMR), u32::MAX);
+    assert_eq!(platform.mapping_count(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_cross_open_serialization_and_legacy_exclusion
+);
+
+fn smoke_kms_pause_cancellation_retains_transaction_until_next_client() -> TestResult {
+    let platform = MockPlatform::new();
+    let device = device(&platform);
+    platform.0.lock().pause_blocked = true;
+    let mut first = complete(device.session()).unwrap();
+    let mut call = Box::pin(first.start());
+    assert!(once(call.as_mut()).is_pending());
+    let mut other = Box::pin(device.session());
+    assert!(once(other.as_mut()).is_pending());
+    drop(call);
+    drop(first);
+    assert_eq!(platform.actions(), [Action::Pause]);
+    assert!(
+        device.legacy().is_err(),
+        "cancelled pause opened unsafe legacy access"
+    );
+    let mut next = complete(other).unwrap();
+    assert!(next.state.paused);
+    assert!(next.state.presenter.is_none());
+    complete(next.restore_console()).unwrap();
+    assert_eq!(platform.actions(), [Action::Pause, Action::Resume]);
+    platform.0.lock().pause_blocked = false;
+    complete(next.start()).unwrap();
+    complete(next.restore_console()).unwrap();
+    drop(next);
+    assert!(device.legacy().is_ok());
+    assert_eq!(platform.0.lock().deliveries, 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_pause_cancellation_retains_transaction_until_next_client
+);
+
+fn smoke_kms_console_vblank_is_observed_and_loss_is_not_a_stamp() -> TestResult {
+    let platform = MockPlatform::new();
+    let device = device(&platform);
+    let mut guard = complete(device.session()).unwrap();
+    let mut call = Box::pin(guard.wait_vblank());
+    assert!(once(call.as_mut()).is_pending());
+    assert_eq!(platform.read32(FRAME), 40);
+    let stamp = complete(call).unwrap();
+    assert_eq!(stamp.sequence, 41);
+    assert_eq!(stamp.ns, 251000);
+    assert!(
+        platform.actions().is_empty(),
+        "console vblank paused or armed scanout"
+    );
+    platform.0.lock().frames = false;
+    platform.0.lock().tick_ns = 500_000_000;
+    assert!(complete(guard.wait_vblank()).is_err());
+    platform.0.lock().allowed = false;
+    assert_eq!(complete(guard.wait_vblank()), Err(FsError::NoDevice));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_console_vblank_is_observed_and_loss_is_not_a_stamp
+);
+
+fn smoke_kms_start_refusal_and_hard_failure_never_fall_back() -> TestResult {
+    for hard in [false, true] {
+        let platform = MockPlatform::new();
+        let device = device(&platform);
+        if hard {
+            let mut hw = platform.0.lock();
+            hw.refuse_ptes = true;
+            hw.regs.insert(PTE_START, 0x12345001);
+        } else {
+            platform.0.lock().takeover_error = Some(FsError::Unsupported);
+        }
+        let mut guard = complete(device.session()).unwrap();
+        assert!(complete(guard.start()).is_err());
+        assert_eq!(guard.state.failed, hard);
+        assert_eq!(guard.state.paused, hard);
+        assert_eq!(
+            platform
+                .actions()
+                .iter()
+                .filter(|a| **a == Action::Resume)
+                .count(),
+            usize::from(!hard)
+        );
+        assert!(!platform
+            .actions()
+            .iter()
+            .any(|a| matches!(a, Action::Arm(_))));
+        drop(guard);
+        if hard {
+            assert!(complete(device.session()).is_err());
+            assert!(device.legacy().is_err());
+            assert!(complete(device.quiesce()).is_err());
+        } else {
+            assert!(device.legacy().is_ok());
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_start_refusal_and_hard_failure_never_fall_back
+);
+
+fn smoke_kms_arena_bounds_refuse_before_console_or_pte_changes() -> TestResult {
+    let platform = MockPlatform::new();
+    let device = Device::new(platform.clone(), Generation::TigerLake, 0x800000, console());
+    let mut guard = complete(device.session()).unwrap();
+    assert_eq!(complete(guard.start()), Err(FsError::Unsupported));
+    assert!(!guard.state.paused && guard.state.presenter.is_none() && !guard.state.failed);
+    assert!(platform.actions().is_empty());
+    let hw = platform.0.lock();
+    assert_eq!((hw.pte_installs, hw.pte_clears), (0, 0));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_arena_bounds_refuse_before_console_or_pte_changes
+);
+
+fn smoke_kms_gt_reset_quarantines_owned_or_busy_state_without_waiting() -> TestResult {
+    // No presenter and no in-flight display owner: epoch-zero publication
+    // by the GT caller is sufficient to prevent a premature next takeover.
+    let platform = MockPlatform::new();
+    let idle_device = device(&platform);
+    quarantine_reset_state(&idle_device.state, &platform.1);
+    assert!(!platform.reset_lost());
+    assert!(complete(idle_device.session()).is_ok());
+
+    // A busy legacy owner cannot clear reset loss by publishing console
+    // metadata from a sequence which raced reset/PAT re-initialization.
+    let mut legacy = idle_device.legacy().unwrap();
+    quarantine_reset_state(&idle_device.state, &platform.1);
+    assert!(platform.reset_lost());
+    legacy.console_replaced(&console());
+    assert!(legacy.state.failed && legacy.state.blocked);
+    drop(legacy);
+    assert!(idle_device.legacy().is_err());
+    assert!(complete(idle_device.session()).is_err());
+    assert!(complete(idle_device.quiesce()).is_err());
+    assert!(platform.actions().is_empty());
+
+    // Cancellation/in-flight CPU quiescence has not created a Presenter
+    // yet. Reset still poisons its cloned IO and cannot resume the console.
+    let paused_platform = MockPlatform::new();
+    let paused_device = device(&paused_platform);
+    paused_platform.0.lock().pause_blocked = true;
+    let mut guard = complete(paused_device.session()).unwrap();
+    let mut start = Box::pin(guard.start());
+    assert!(once(start.as_mut()).is_pending());
+    quarantine_reset_state(&paused_device.state, &paused_platform.1);
+    paused_platform.0.lock().pause_blocked = false;
+    assert_eq!(complete(start), Err(FsError::NoDevice));
+    assert!(guard.state.paused && guard.state.failed && guard.state.presenter.is_none());
+    assert_eq!(complete(guard.restore_console()), Err(FsError::NoDevice));
+    assert_eq!(paused_platform.actions(), [Action::Pause]);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let front_platform = MockPlatform::new();
+        let front_device = device(&front_platform);
+        let front = object(true).unwrap();
+        let weak = Arc::downgrade(&front);
+        let mut guard = complete(front_device.session()).unwrap();
+        complete(guard.present(front, geometry())).unwrap();
+        drop(guard);
+        let mapped = front_platform.mapping_count();
+        let actions = front_platform.actions();
+        quarantine_reset_state(&front_device.state, &front_platform.1);
+        assert!(front_platform.reset_lost());
+        assert!(weak.upgrade().is_some());
+        assert_eq!(front_platform.mapping_count(), mapped);
+        assert!(complete(front_device.session()).is_err());
+        assert!(complete(front_device.quiesce()).is_err());
+        assert_eq!(front_platform.actions(), actions);
+        assert!(weak.upgrade().is_some());
+        // Intentionally no fake fetch-stop: the real Presenter destructor
+        // quarantines these two pages and its IO owner, as on hardware loss.
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_gt_reset_quarantines_owned_or_busy_state_without_waiting
+);
+
+fn smoke_kms_public_wc_flip_restore_and_retirement() -> TestResult {
+    let platform = MockPlatform::new();
+    let device = device(&platform);
+    let wc = object(true);
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(matches!(wc, Err(FsError::NotImplemented)));
+        let mut guard = complete(device.session()).unwrap();
+        assert_eq!(
+            complete(guard.present(object(false).unwrap(), geometry())),
+            Err(FsError::Unsupported)
+        );
+        assert!(platform.actions().is_empty());
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let object = wc.unwrap();
+        let weak = Arc::downgrade(&object);
+        let mut guard = complete(device.session()).unwrap();
+        let stamp = complete(guard.present(object.clone(), geometry())).unwrap();
+        assert_eq!(stamp.sequence, 41);
+        let surface = platform.read32(LIVE);
+        assert!((GEM_SCANOUT_GTT_START..GEM_SCANOUT_GTT_END).contains(&u64::from(surface)));
+        assert_eq!(platform.mapping_count(), 2);
+        assert_eq!(platform.0.lock().deliveries, 0);
+        drop(object);
+        assert!(weak.upgrade().is_some());
+        assert!(
+            complete(guard.wait_vblank()).is_err(),
+            "native presenter allowed synthetic console vblank path"
+        );
+        let mut restore = Box::pin(guard.restore_console());
+        assert!(once(restore.as_mut()).is_pending());
+        assert_eq!(platform.read32(SURF), CONSOLE);
+        assert_eq!(
+            platform.read32(LIVE),
+            surface,
+            "arm fabricated console latch"
+        );
+        assert!(
+            weak.upgrade().is_some(),
+            "console arm released still-live GEM"
+        );
+        complete(restore).unwrap();
+        assert_eq!(platform.read32(LIVE), CONSOLE);
+        assert_eq!(platform.mapping_count(), 0);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(platform.read32(IER), 0);
+        assert_eq!(platform.read32(IMR), u32::MAX);
+        assert_eq!(
+            platform.actions(),
+            [
+                Action::Pause,
+                Action::Takeover,
+                Action::Arm(surface),
+                Action::Latch(surface),
+                Action::Arm(CONSOLE),
+                Action::Latch(CONSOLE),
+                Action::Resume
+            ]
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_public_wc_flip_restore_and_retirement
+);
+
+fn smoke_kms_cancelled_flip_drains_before_next_client_arms() -> TestResult {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let platform = MockPlatform::new();
+        let device = device(&platform);
+        let first = object(true).unwrap();
+        let first_weak = Arc::downgrade(&first);
+        let second = object(true).unwrap();
+        let second_weak = Arc::downgrade(&second);
+        let mut guard = complete(device.session()).unwrap();
+        let mut pending = Box::pin(guard.present(first.clone(), geometry()));
+        assert!(once(pending.as_mut()).is_pending());
+        let first_surface = platform.read32(SURF);
+        assert_eq!(platform.read32(LIVE), CONSOLE);
+        drop(pending);
+        drop(guard);
+        drop(first);
+        assert!(first_weak.upgrade().is_some());
+        assert!(device.legacy().is_err());
+        let mut next = complete(device.session()).unwrap();
+        complete(next.present(second.clone(), geometry())).unwrap();
+        let second_surface = platform.read32(LIVE);
+        assert_ne!(first_surface, second_surface);
+        assert!(
+            first_weak.upgrade().is_none(),
+            "retired first client mapping remained pinned"
+        );
+        let actions = platform.actions();
+        let first_latch = actions
+            .iter()
+            .position(|a| *a == Action::Latch(first_surface))
+            .unwrap();
+        let next_arm = actions
+            .iter()
+            .position(|a| *a == Action::Arm(second_surface))
+            .unwrap();
+        assert!(
+            first_latch < next_arm,
+            "next client armed over unretired cancelled flip"
+        );
+        drop(second);
+        complete(next.restore_console()).unwrap();
+        assert!(second_weak.upgrade().is_none());
+        assert_eq!(platform.mapping_count(), 0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    assert!(matches!(object(true), Err(FsError::NotImplemented)));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_cancelled_flip_drains_before_next_client_arms
+);
+
+fn smoke_kms_timeout_retains_pending_pages_and_closes_admission() -> TestResult {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let platform = MockPlatform::new();
+        let device = device(&platform);
+        let object = object(true).unwrap();
+        let weak = Arc::downgrade(&object);
+        let mut guard = complete(device.session()).unwrap();
+        platform.0.lock().flips = false;
+        platform.0.lock().tick_ns = 500_000_000;
+        assert!(complete(guard.present(object.clone(), geometry())).is_err());
+        drop(object);
+        assert!(weak.upgrade().is_some());
+        assert!(guard.state.pending.is_some());
+        assert!(guard.state.failed && guard.state.paused);
+        assert!(complete(guard.restore_console()).is_err());
+        assert!(!platform.actions().contains(&Action::Resume));
+        drop(guard);
+        assert!(complete(device.session()).is_err());
+        assert!(device.legacy().is_err());
+        assert_eq!(platform.mapping_count(), 2);
+        // Explicit fixture teardown supplies an independent fetch-stop proof;
+        // a production timeout itself cannot release any of these resources.
+        let mut state = complete(device.state.lock());
+        platform.0.lock().pending_surface = None;
+        platform.0.lock().regs.insert(0x70180, 0);
+        // SAFETY: the native display is stopped; this fixture owns every
+        // fetcher, page-table slot, authority and power reference.
+        unsafe { state.presenter.as_mut().unwrap().shutdown_stopped() }.unwrap();
+        state.presenter = None;
+        state.current = None;
+        state.pending = None;
+        assert!(weak.upgrade().is_none());
+    }
+    #[cfg(target_arch = "aarch64")]
+    assert!(matches!(object(true), Err(FsError::NotImplemented)));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_timeout_retains_pending_pages_and_closes_admission
+);
+
+fn smoke_kms_inherited_fetchers_block_arena_claim() -> TestResult {
+    // Primary plane A is the retained console. Every other universal plane,
+    // hardware cursor, FBC instance and display state buffer is unowned.
+    for (generation, enabled) in [
+        (Generation::TigerLake, 0x70080),  // Cursor A, mode bits.
+        (Generation::AlderLake, 0x73080),  // Cursor D.
+        (Generation::MeteorLake, 0x72080), // Cursor C.
+        (Generation::TigerLake, 0x43208),  // FBC A.
+        (Generation::MeteorLake, 0x43248), // FBC B.
+        (Generation::TigerLake, 0x70280),  // Pipe A plane 2.
+        (Generation::MeteorLake, 0x73580), // Pipe D plane 5.
+        (Generation::TigerLake, 0x70b08),  // DSB A0.
+        (Generation::MeteorLake, 0x73d08), // DSB D2.
+    ] {
+        let platform = MockPlatform::new();
+        assert_eq!(inherited_fetchers_idle(&platform, generation), Ok(()));
+        let cursor = matches!(enabled, 0x70080 | 0x72080 | 0x73080);
+        let dsb = matches!(enabled, 0x70b08 | 0x73d08);
+        if dsb {
+            platform.0.lock().regs.insert(enabled, 1); // Busy without enable.
+            assert_eq!(
+                inherited_fetchers_idle(&platform, generation),
+                Err(FsError::Unsupported)
+            );
+        }
+        let value = if cursor { 0x27 } else { 1 << 31 };
+        platform.0.lock().regs.insert(enabled, value);
+        assert_eq!(
+            inherited_fetchers_idle(&platform, generation),
+            Err(FsError::Unsupported)
+        );
+        platform.0.lock().regs.insert(enabled, u32::MAX);
+        assert_eq!(
+            inherited_fetchers_idle(&platform, generation),
+            Err(FsError::NoDevice)
+        );
+        assert!(platform.actions().is_empty());
+        assert_eq!(platform.0.lock().pte_clears, 0);
+    }
+    let platform = MockPlatform::new();
+    platform.0.lock().allowed = false;
+    assert_eq!(
+        inherited_fetchers_idle(&platform, Generation::MeteorLake),
+        Err(FsError::NoDevice)
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_kms",
+    smoke_kms_inherited_fetchers_block_arena_claim
+);

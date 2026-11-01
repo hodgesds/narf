@@ -345,7 +345,9 @@ pub(crate) fn hardware_cursor(position: Option<(u32, u32)>) -> bool {
     #[cfg(feature = "amdgpu")]
     let cursor = narf_drivers_gpu::amdgpu_dcn_display::active_scanout_cursor();
     #[cfg(not(feature = "amdgpu"))]
-    let cursor: Option<fn((u32, u32, &[u32]), Option<(i32, i32)>) -> bool> = None;
+    type Cursor = fn((u32, u32, &[u32]), Option<(i32, i32)>) -> bool;
+    #[cfg(not(feature = "amdgpu"))]
+    let cursor: Option<Cursor> = None;
     let Some(cursor) = cursor else {
         return false;
     };

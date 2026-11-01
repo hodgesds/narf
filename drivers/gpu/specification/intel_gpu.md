@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.16** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.18** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -8,7 +8,8 @@
 > landed — see §11; RC6 + DMC landed — see §12; suspend/resume
 > + D-state transitions landed — see §13; external DisplayPort
 > full single-stream landed — see §14; multi-pipe
-> display + DP MST landed — see §16).
+> display + DP MST landed — see §16; fixed-mode MTL/Arrow WC GEM KMS
+> flips connected — see §19 and `spec.md` §3).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -1512,6 +1513,21 @@ not claimed.
 
 ## 19. Render UAPI and 3D admission (in progress)
 
+Production GuC owners now select native Xe on both render and primary opens.
+The new path implements Xe engine/memory/config/GT/HWCONFIG/topology queries,
+correlated RCS engine/CPU timestamps through the live reset/forcewake owner,
+system GEM creation/mmap, persistent VM binding metadata, RCS0 and software
+bind queues, binary/timeline syncs, GPU and CPU user fences and masked waits.
+Its immutable per-execution PPGTT roots retain partial BO ranges and aliases;
+scratch/NULL mappings use shared hardware NULL tables with private path copies.
+Xe GPU ordering is explicit while terminal dma_resv fences exclude CPU copies.
+VM-attached BO identities cannot be exported or rebound to a different VM.
+Native queue priorities and timeslices reach the real GuC policy KLVs.
+Legacy backends retain the i915 compatibility profile described below.
+Fault/long-running VMs, compute/media engines, VRAM, scanout allocation
+and additional query/property families remain completion work. Mesa and
+physical execution remain separate acceptance gates.
+
 The public contract is `spec.md` §3, "Intel render UAPI and address-space
 admission". The modules are `intel_gpu_uapi` (wire definitions),
 `intel_gpu_gem` (owned system memory), `intel_gpu_render` (per-open dispatcher,
@@ -1521,11 +1537,64 @@ globally distinct mmap offsets; foreign attachments/sync-file imports are
 unavailable. Both primary and render nodes route these requests
 before shared DRM/KMS dispatch and acquire mmap backing atomically.
 
-Validated execbuffer requests still return NotImplemented. No userspace engines
-or acceleration capabilities are advertised. Gen12 production execlists helpers
+Native terminal fences now back the shared per-object dma-buf reservation.
+GuC and Gen12 resident admission check the whole residency list before adding
+READ/WRITE fences; readers can overlap, conflicting writers return busy, and
+kernel CPU copies use the same admission gate. Cache publication follows
+reservation. Failure after reservation releases the graph before signalling;
+uncertain DMA lifetime keeps reservations through timeout/cancel until proven
+full reset. Independent GuC LRCs do not share an ordered dma-fence context.
+GEM_BUSY exposes render-class reader/writer bits. Async GEM_WAIT preserves one
+relative timeout deadline across parking and writes remaining nanoseconds;
+PREAD/PWRITE and CPU-domain waits respect reservations. PRIME SYNC START waits
+for conflicting access, END orders coherent RAM, and shared names and
+EXPORT_SYNC_FILE use the generic dma-buf fd/copyout protocol. Existing mappings
+still require caller exclusion; this does not enable external fence import,
+external fence import or Mesa acceptance. Linux references are
+`i915_gem_busy.c`, `i915_gem_wait.c`, `dma-resv.c` and `dma-buf.c` at the pinned
+source revision below. Native smokes exercise alias/PRIME lifetime, independent
+readers, all-or-nothing conflict admission, async deadlines/cancellation,
+CPU-copy exclusion, sync-file copy faults and GuC terminal/reset boundaries.
+
+Live MTL/Arrow, DG2 and BMG owners now accept async nonsecure softpin
+EXECBUFFER2/WR on RCS0. Per-open contexts serialize submissions and preserve
+their saved LRC state across fully retired jobs; independent contexts begin
+from the golden template. The entry sets BB_START bit8 for nonsecure PPGTT,
+with kernel rings/images/tables absent from user mappings and the RCS register
+policy reverified before admission. Nested commands and mutable leaf BOs
+remain untrusted; hardware privilege checking is required throughout execution.
+The complete copied residency plan and context survive handle/fd close and
+cancelled waiters. Admission/cache failures roll back claims; uncertain saves
+retain ownership until proven full reset. Saved CPU images have a 64-MiB cap.
+The backend publishes RCS0, relevant i915 capability bits, the real CSS
+submission-interface version and i915 loader identity only after startup's
+default-state and PPGTT probes pass. Loss/suspend closes readiness; proven stop
+allows a fresh GT epoch, with old contexts refused/banned and no automatic
+batch replay. Gen12 production execlists helpers
 refuse Meteor/Arrow Lake before MMIO. The physical GuC owner now supplies
 per-card startup, kernel context scheduling, completion and full-engine reset
-ownership; userspace state/isolation, active topology and Mesa 3D remain open.
+ownership. Live geometry/compute DSS and EU fuses now feed per-card topology
+queries. Explicit sync_file IN/OUT fences, binary syncobj arrays and timeline
+extensions now connect to the exact terminal job fence. Each open owns its
+own binary/timeline syncobj table; dependencies and signal objects survive
+handle/fd close. Output fd reservation and rsvd2 copyout precede non-failing
+enqueue, so EMFILE/EFAULT cannot queue an unreported job. Array/extension
+bounds, flags, cycles and timeline WAIT|SIGNAL conflicts fail before publication.
+FENCE_SUBMIT now accepts the same input sync_file fd as FENCE_IN, with those
+two input flags mutually exclusive. Native Intel leaves satisfy SUBMIT after
+the owner observes GuC's scheduling-enable ACK; foreign leaves require
+completion. Syncobj/sync_file round trips retain the native leaf. FENCE_OUT
+still exports terminal completion, and GEM reservations, same-context ordering
+and syncobj WAIT retain terminal gates. Loss before enable ACK keeps SUBMIT
+pending until proven full reset publishes a terminal error. Native Rust smokes
+cover ACK timing before any GPU breadcrumb, ioctl admission before completion,
+fd close/wire edits, mixed foreign/native timeline chains, binary/timeline WAIT,
+invalid flag/fd combinations and reset ownership. Linux references are
+`i915_gem_execbuffer.c::eb_fences_add`,
+`i915_request.c::i915_request_await_execution` and `__await_execution` at the
+pinned revision below. These model checks do not establish silicon/Mesa acceptance.
+Other engine/media/cache inventory, accelerated presentation and Intel
+silicon/Mesa acceptance remain open.
 
 `intel_gpu_guc` now supplies validated CSS component ranges and coherent CTB
 send/receive primitives. `intel_gpu_guc_firmware` acquires a bounded immutable
@@ -1566,7 +1635,9 @@ the physical service retains its runtime-PM references.
 `intel_gpu_gt_hw` adds capability-invoked MMIO, render-well wake and bounded
 initial GuC/full-engine quiescence before PAT/MOCS programming. Staged physical
 allocations reserve frames/VA without writing inherited GGTT entries. Installed
-policies use MTL PAT3, DG2 PAT0 and BMG PAT2; MTL display PAT0 is preserved.
+policies use MTL PAT3, DG2 PAT0 and BMG PAT2; MTL also installs UC PAT2 for
+non-leaf PPGTT reads and Linux's non-coherent WT PAT1 (Mesa's scanout and
+write-combining index). MTL display PAT0 is preserved.
 MCR steering is serialized and restored, and BMG PTE writes drain the G-unit.
 
 `intel_gpu_gt_runtime` starts a persistent per-function owner from Stage::Late,
@@ -1581,23 +1652,130 @@ resources without an unbounded reset retry.
 
 Scheduling requires CSS submission-interface major 1 (byte 68), separately from
 the firmware release. After HWCONFIG, the owner stops GuC, updates ADS for RCS0,
-reloads/authenticates with LiteRestore, and enables coherent CT. Autonomous
-engine reset is disabled while the golden image is unprimed. The scheduler
+reloads/authenticates with LiteRestore, and enables coherent CT. GuC
+autonomous engine reset is enabled (`guc_policies.global_flags` 0, as Linux). The scheduler
 owns HWS plus a distinct LRC and 8-KiB ring for each of at most 64 kernel probe
 contexts. MTL/DG2 use 14-page LRCs, BMG four pages, with Xe register-state groups.
-Only fixed owned breadcrumb commands are admitted; no user commands or PPGTT
-enter this interface.
+The original safe submission entry admits a fixed owned GGTT breadcrumb.
+The resident interface below adds trusted kernel PPGTT work; the separate
+nonsecure userspace entry requires the startup probes and live backend.
 
 `intel_gpu_guc_sched` sends GGTT invalidation, context registration, policy,
 enable, disable and deregistration through real CT rings. Full rings retry
 without losing phase; stale/foreign events and deadlines close admission.
-Context IDs are never reused within the GT lifetime. Fences require the GPU
+Context IDs are reused only after verified retirement, with independent
+request stamps and TLB cookies. Fences require the GPU
 breadcrumb, saved ring head, deregistration ACK and correlated final TLB
 completion; scheduling ACKs alone cannot complete a job. A canceled waiter
 leaves the context owned. Uncertain jobs survive until GuC reset/DMA idle plus
 GRDOM_FULL; then fences report Reset and render/GT wake releases are acknowledged.
 The service logs startup success only after its hardware probe retires. The
 async `kernel_probe(card)` API queues another owned context on that function.
+
+The same owner now accepts trusted kernel resident PPGTT batches through
+unsafe `submit_kernel_batch`; user commands remain gated. `prepare_for_gt`
+selects the installed WB leaf policy (MTL/Arrow PAT3, DG2 PAT0, BMG PAT2).
+MTL/Arrow non-leaf entries and PDP0/PTBP use a separately installed UC PAT2;
+DG2/BMG retain their WB policy for those entries. Every immutable table
+and BO is cache-cleaned before context registration; Xe-LPG's non-coherent
+table walker cannot observe dirty CPU cache lines. Registration sets PPGTT
+mode and the kernel ring uses PPGTT batch start, preparser/TLB/cache
+invalidation, MTL AuxCCS invalidation, DG2/Xe-LPG depth-flush workaround, render-cache
+drain and a separate GGTT post-sync fence. The submitted tail, deregistration
+and final invalidation must all agree before tables and BOs are released and
+the terminal fence is published. Uncertain residency survives until full reset.
+
+`submit_ppgtt_probe` / async `kernel_ppgtt_probe(card)` provide a safe fixed
+kernel diagnostic with unexported code/result BOs at two separate 48-bit
+addresses. After completion `PpgttProbeResult::verify` checks the stored value,
+every guard byte and the unchanged code page. Startup runs this after the
+original GGTT probe before reporting readiness. Native Rust models walk the
+real production tables, check literal command/PAT vectors, execute the store
+through translated physical pages and verify retirement/reset ownership.
+The RCS default-context priming path now selects Linux's context workaround
+and tuning tables using stable GMD ID and fuse observations: Xe-LPG
+12.70/12.71/12.74 and Xe2 HPG 20.01/20.02 remain distinct. Non-masked registers
+use GPU MI_MATH read/modify/write through a non-terminated MCR instance;
+HWCONFIG physical maxima select the DSS layout, while observed L3 fuses select
+the cache bank. Temporary GPRs and CS selective-read steering are reset after
+use. Every admitted profile explicitly seeds all fifty SVG command headers
+(Wa_14019789679); Xe2 substitutes pipelined DRAWING_RECTANGLE_FAST for the
+non-pipelined DG2/Xe-LPG command. This corrects the earlier DG2-only selection.
+
+`begin_context_defaults` owns an exclusive seed → complete retirement →
+different-context execution/retirement → CPU synchronization → golden copy →
+device synchronization transaction. The seed image stays owned through the
+switch; submission is Busy while the priming fence is pending. Priming is
+refused after any resident kernel batch has been accepted, so its state cannot
+contaminate the template. The fixed GGTT diagnostic may precede priming. Only the
+successfully published template makes `context_defaults_ready()` true. New
+contexts copy opaque saved state, clear their status, enable restore and assign
+their own ring/root/timestamp. The physical service primes between its GGTT
+and PPGTT probes. Cancellation or missing save/synchronization proof retains
+all uncertain backing until GuC plus full-engine reset; it cannot complete the
+priming fence early. User isolation and synchronization remain prerequisites
+for EXECBUFFER2 and Mesa acceptance.
+
+Graphics-GT/RCS0 MMIO workarounds now run in `PreparingScheduling` before
+ring publication and the scheduling GuC reload. Linux's GT/engine tables and
+tunings select DG2 G10/G11/G12, Xe-LPG IP and stepping, and Battlemage
+20.01/20.02. Battlemage compression tunings follow the observed flat-CCS
+enable bit, and the EU-stall workaround follows gaps in live DSS groups.
+Non-masked fields use host read/modify/write through live MCR targets; DG2
+implicit SF/SQIDI steering is initialized independently. Masked registers
+preserve unrelated fields. Modern steering semaphore contention yields with
+a deadline, and selector/semaphore ownership is restored on every outcome.
+Readable registers are preflighted before WA writes and verified afterward;
+DG2 CACHE_MODE_SS follows Linux's no-readback exception. Failure closes
+scheduling admission, retaining owned storage until full reset. Media GT,
+other engine classes, out-of-band workarounds and coordinated reset recovery
+remain separate work.
+
+RCS0 now also installs an explicit nonprivileged register policy before ring
+publication. All twelve FORCE_TO_NONPRIV entries are cleared to RING_NOPID
+and verified before the three Linux Xe OA grants are installed in address
+order: status RD, head/tail/buffer/control RD, and MMIO trigger RW. Unused slots
+stay at NOPID; inherited addresses, ranges and access bits cannot survive.
+The source is `xe_reg_whitelist.c`, `regs/xe_engine_regs.h`, `regs/xe_oa_regs.h`
+and i915's `intel_engine_apply_whitelist` at the pinned revision. The complete
+policy is checked after firmware reload, CT enablement and before kernel
+submission/default priming. Drift closes admission without a live repair and
+keeps existing jobs/reservations until proven full reset. Native literal vectors
+and hardware conversations cover all six admitted IP profiles, failed clears,
+unavailable/cross-slot writes, reload/CT drift and reset ownership. This does not
+enable an OA stream or legacy Gen12/media policies.
+
+The firmware-side workaround path binds stable graphics IP/stepping before
+GuC's first reset/DMA and refuses a different identity on scheduling reload.
+GuC boot parameters now carry DG2 die and Xe-LPG stepping flags. Source-defined
+zero-length KLV headers occupy a dedicated ADS page, with packed pointer/size
+fields published before DMA cache synchronization. DG2/Xe-LPG use MGSR and
+BB-stack-pointer records; Battlemage 20.01 adds PFQ polling and asynchronous
+compute MTP records, while 20.02 keeps its narrower reset/BB-stack list.
+The physical service remains RCS0-only, so modern CCS DUAL_QUEUE handling,
+other engines, reset sequencing and RC6 acceptance remain separate work.
+Native wire fixtures check each variant and reject bad live identity before
+DMA; reload checks preserve firmware records and retain uncertain ownership.
+
+`intel_gpu_topology::GtTopology` reads main-GT geometry/compute DSS and EU fuses
+after initial quiescence, with two matching samples and current wake checks
+before firmware DMA. All three admitted profiles use one geometry and one
+compute register; Xe2 BMG does not use Xe3's three-register DSS layout. MTL/DG2
+expand paired SIMD8 EU bits; BMG preserves SIMD16 bits. The admitted EU format
+is eight fuse bits; unexpected upper bits, empty units and unstable readings
+refuse discovery. Full 32-bit DSS masks remain valid. Compute-only fuses can
+describe a GT but cannot authorize the RCS0 kernel scheduler.
+
+Each card publishes its immutable observed snapshot through a live GT owner,
+separately from HWCONFIG maxima. Identical resume observations are idempotent;
+changed fuses refuse restart. QUERY_TOPOLOGY reports the geometry/compute union
+and QUERY_GEOMETRY_SUBSLICES the geometry subset in i915's single software-slice
+wire layout, preserving sparse DSS indices and per-DSS EU masks. Missing
+snapshots return -ENODEV; data queries check readable headers, short capacity
+and user-copy failures with independent per-item errors. Snapshots remain
+queryable on both DRM nodes after verified stop frees all GT DMA storage.
+They do not admit userspace engines or commands. Media GT and L3 inventory
+remain separate work.
 
 Before CT enablement, `GuCGt::begin_hwconfig` performs the source-defined
 GET_HWCONFIG size query and GGTT copy through the same bounded MMIO mailbox
@@ -1629,20 +1807,23 @@ and per-item -EFAULT for a bad copy. GuC submission-version remains -ENODEV unti
 the userspace scheduling interface is admitted. Native tests traverse both DRM
 node types, GEM/mmap ownership, the GT discovery/publication chain and snapshot
 queries after all GT DMA is freed.
-Arc identity still adds no display binding, local VRAM or userspace engines.
+Arc identity still adds no display binding or local VRAM. RCS0 availability
+comes only from the live backend after execution-tested startup.
 
 Gen12 owned resident submission, cache-flushed
 post-sync breadcrumbs, terminal fences and loss retention have native hardware
-models. Active topology, userspace context setup, accelerated PRIME/presentation
+models. Complete engine/media/cache inventory, accelerated PRIME/presentation
 and real Mesa acceptance remain outstanding.
 
 The memory audit corrected previous x86-like GPU PTE assumptions. Gen12
 PPGTT PAT bits are 3,4,7 and Xe-LPG adds bit62; Xe-LPG GGTT uses bits52,53.
-Gen12 system GGTT has no PAT bits. Intermediate PPGTT entries include RW;
-context PDP0 holds a raw physical address. No GPU NX/LRU permission is claimed.
+Gen12 system GGTT has no PAT bits. Intermediate PPGTT entries include RW and
+their independent two-bit PAT policy. The legacy Gen12 attachment keeps its
+raw-root contract; GuC PDP0/PTBP uses a complete encoded descriptor.
+No GPU NX/LRU permission is claimed.
 The common physical range is conservatively bounded to 46 bits. PAT numeric
 indices do not define cache policy: physical startup now programs the owned
-GGTT policy; userspace PPGTT policy/state admission remains separate work.
+GGTT and PPGTT policy before admitting kernel or user work.
 
 Native Rust fixtures use literal ABI/PTE vectors, fault-contained user-memory
 models, cross-open ownership failures, copy-failure rollback, extension cycles,
@@ -1671,11 +1852,240 @@ checkout at `b90c984d615e8ce2af96f5b1411a962d83fed2ad`: MIT-licensed
 `include/drm/intel/pciids.h`, `drivers/gpu/drm/xe/{xe_uc_fw.c,xe_guc.c,xe_wopcm.c,
 xe_guc_ads.c,xe_guc_fwif.h,xe_guc_tlb_inval.c,xe_ggtt.c,xe_force_wake.c,
 xe_guc_hwconfig.c,xe_mocs.c,xe_pat.c,xe_gt_mcr.c,xe_bo.c,xe_lrc.c,
-xe_hw_engine.c,xe_guc_submit.c}`, `drivers/gpu/drm/i915/gt/uc/intel_guc_hwconfig.c`,
+xe_hw_engine.c,xe_guc_submit.c,xe_gt_topology.c,xe_vm.c,xe_ring_ops.c,
+xe_gt.c,xe_wa.c,xe_tuning.c,xe_irq.c,xe_userptr.c}`,
+`drivers/gpu/drm/i915/gt/{uc/intel_guc_hwconfig.c,intel_sseu.c}`,
 `drivers/gpu/drm/i915/i915_query.c`, `include/uapi/drm/i915_drm.h` and
-`drivers/gpu/drm/xe/regs/{xe_guc_regs.h,xe_gt_regs.h,xe_irq_regs.h}` and the
+`drivers/gpu/drm/xe/regs/{xe_guc_regs.h,xe_gt_regs.h,xe_irq_regs.h,xe_lrc_layout.h}`,
+`drivers/gpu/drm/xe/instructions/{xe_mi_commands.h,xe_gpu_commands.h,
+xe_alu_commands.h,xe_gfxpipe_commands.h}` and the
 GuC actions/KLV/CSS ABI headers. Native Rust models pin register/ADS values,
 reset/DMA/full-engine stop proofs, cache-policy publication, current authority,
 two-context execution, 64-context pressure/CT backpressure, context retirement,
 allocation rollback, coherence refusal and per-card query lifetime. These tests
 do not establish firmware boot or context execution on Intel silicon.
+
+### Copy engine (BCS0)
+
+BCS0 (MMIO 0x22000, GuC class 3, Xe COPY) is part of every admitted graphics
+IP's Linux engine mask and is never fused: Linux `read_copy_fuses` applies only
+to PVC and Xe3+. `intel_gpu_engine` owns the literal per-engine table. Its LRC
+is two pages; the register image follows `gen12_xcs_offsets` on DG2 and
+Xe-LPG (Linux selects it for COPY before Xe2, not `dg2_xcs_offsets`) and
+`xe2_bcs_offsets` on BMG, whose third LRI saves BCS_SWCTRL/BLIT_CCTL. Ring
+enable mirrors `xe_hw_engine_enable_ring` with RING_CMD_CCTL's uncached MOCS.
+Default state is the source's BLIT_CCTL RMW only: no render 3D state and, on
+these platforms, no LRC workaround. BCS0 shares RCS0's render forcewake
+domain. BMG 20.01/20.02 also apply the ENGINE_BASE engine entries for BCS0.
+The NONPRIV deny fill, ADS publication, priming order and Xe UAPI surface are
+described in `spec.md`. The i915 compatibility profile reaches BCS0 through
+the legacy BLT ring and proto-context engine maps. BCS8 on BMG and
+migration-style kernel copies remain unadmitted.
+
+### Compute engine (CCS0)
+
+CCS0 (MMIO 0x1a000, GuC class 4, Xe/i915 COMPUTE) is published when fused in:
+always on Xe-LPG, from DSS quadrant 0 on DG2 (8-DSS quadrants of the
+geometry|compute union) and from XEHP_FUSE4 CCS_EN on BMG. `EngineSet`
+records the fused set before scheduling; the scheduler, ADS, NONPRIV
+policy, IRQ routing, priming and UAPI all follow it. As Linux's default
+`ccs_mode` 1, only CCS0 is exposed and every present compute slice is
+assigned to it. Multi-CCS parts program fixed-slice RCU_MODE and CCS_MODE;
+enabling CCS0 sets RCU_MODE_CCS_ENABLE. The LRC uses `dg2_xcs_offsets`
+(14 pages) or `xe2_xcs_offsets` (3 pages on BMG). Jobs use the render
+stream with PIPE_CONTROL_3D_ENGINE_FLAGS masked (no VF invalidate,
+tile/render-target/depth flush). Default state is only the Xe2
+WMTP-disabled preemption level. NONPRIV grants the RCS OAG triple, BMG
+applies the engine-base CSFE/PSMI entries, and Xe2 dGFX compute reads use
+the WB MOCS index. The global LSC/ROW/TDL workarounds stay with RCS0, the
+first render/compute engine. CCS1-3 and other ccs_mode values are not
+admitted.
+
+### Remaining accelerated-driver completion work
+
+Continue these dependencies on the current Intel branch. Existing native
+models and kernel diagnostics are implementation checkpoints, not physical
+acceptance or a claim of complete acceleration.
+
+The current continuation adds acknowledged GuC SLPC frequency bounds and
+Base/PowerSaving profiles through the owned GT API (`intel_gpu_slpc`).
+Stable main-GT RPn/RPe/RP0 discovery bounds requests before allocation;
+range updates require matched replies and a final firmware readback. Pending
+updates publish no confirmed status. Optional control failure retains the
+shared buffer until verified stop and leaves command scheduling available.
+BMG G21 keeps the source's 1200 MHz floor; graphics IP 20.01 conservatively
+keeps the 2133 MHz MERT cap. Dynamic cap removal and the associated flush
+protocol remain open. Wa_22019338487 does not apply to MTL graphics.
+
+Presentation now has a separately owned GGTT window/latch component
+(`intel_gpu_scanout`), with object retention through fresh flip-done,
+SURFLIVE and a changed stable frame count. Legacy console mappings are
+restricted to their four 32 MiB pipe windows; GEM windows occupy 160–256 MiB,
+below the GT arena. Failed writes, timeout and drop retain uncertain DMA
+owners until independently verified fetch stop. The production KMS service
+now installs this owner for fixed-mode Pipe A flips on MTL/Arrow with a live
+GuC backend. It drains console CPU epochs, inhibits PSR, excludes legacy
+modeset/PM and retains old/pending objects through fresh hardware latch
+proof. State, events and out-fences publish together after that proof;
+unsupported pre-arm states restore the console and use checked copy with
+hardware vblank completion. NONBLOCK still waits for latch. Inherited extra
+planes/cursors, FBC and DSB refuse direct takeover. Automatic GT recovery
+quarantines active display owners before reset, while system suspend restores
+the console before power teardown. Gen12 production direct flips await its
+execution backend; external planes, tiled/compressed layouts and recovery
+of quarantined owners remain open. The detailed contract is in `spec.md`
+§3, "Intel GEM framebuffers".
+
+The runtime/SLPC/scanout foundation added 25 native fixtures: seven for
+runtime accounting and engine progress, six for SLPC and twelve for scanout
+ownership/latch evidence. KMS integration adds 35, including real mapped
+copy, transaction/event publication, console epoch handoff, PSR, inherited
+fetcher refusal, cancellation, suspend and reset quarantine. All 60 execute
+and pass on both kernel architectures; x86_64 exercises public WC GEM flips
+and aarch64 verifies WC refusal alongside the shared lifecycle paths. These
+are native register/transport and ownership models, not Intel hardware
+acceptance. The latest selected Intel/DRM/framebuffer regression groups pass
+648 tests on x86_64 and 520 on aarch64, without failures or skips. Filters
+are split to fit x86 PVH's 512-byte command-line bound. GPU/fb target CI
+Clippy's three feature contexts pass on both architectures, as do all four
+host vendor configurations, Intel debug builds, formatting, production boots
+and both btrfs postflights per architecture.
+
+| Area | Current checkpoint | Still required |
+| --- | --- | --- |
+| GuC execution | Owned GGTT/PPGTT jobs, primed/persistent user RCS0, BCS0 and CCS0 state, verified register policy, graphics-GT/engine workarounds on MTL/Arrow, DG2 and BMG | Additional compute/media engines, remaining out-of-band workarounds and silicon qualification |
+| Render UAPI | Native Xe queries/GEM/VM_BIND (incl. snapshot-pinned MAP_USERPTR)/RCS and COPY queues/EXEC/user fences/per-engine cycles; i915 compatibility with legacy BLT ring, context engine maps and explicit fences; context loss and fresh-epoch rebuild | USERPTR invalidation (MMU notifier), i915 GEM_USERPTR, fault/long-running VMs, i915 load balancing/parallel submission, more queue/query families and Mesa interoperability |
+| Engines and platforms | Main-GT DSS/EU discovery; RCS0, never-fused BCS0 and fuse-derived CCS0 (ccs_mode 1) scheduling; separate Gen12 foundations | BMG BCS8, CCS1-3/ccs_mode > 1, media GT and media submission, independently sourced profiles for other IP |
+| Memory and presentation | Owned system RAM, private tables, same-card CPU PRIME mappings; iGPU write-combining objects (retyped kernel aliases, WC mmap, SCANOUT, non-coherent PAT1/PAT2 binds); Battlemage visible VRAM (zeroed pool, DM PTEs, WC BAR mmap, placement fallback); fixed-mode MTL/Arrow WC GEM KMS flips with console handoff, PM exclusion and hardware latch events; checked-copy fallback and bounded console/GEM GGTT windows | DG2 VRAM (64K pages + CCS clear), small-BAR/unmapped VRAM, eviction, GPU clears, VRAM PRIME/P2P, Gen12 production direct-flip admission, asynchronous NONBLOCK return, tiled/compressed modifiers and extra planes |
+| Display | Gen12 paths and owned Xe-LPG internal-panel modeset | Xe-LPG external-display admission, Arc display and platform-specific feature qualification |
+| Power and faults | Owned GuC/RCS0/BCS0 MSI wakeups with timer fallback, D0/wake ownership, verified full-reset teardown and fresh-epoch recovery; per-context hang recovery with LRC runtime accounting and engine-progress fallback; idle D3hot runtime autosuspend for display-less discrete GTs with epoch-continuing resume; optional GuC SLPC/RC6 with acknowledged frequency bounds and Base/PowerSaving profiles | Error capture, autosuspend with live VRAM (mapping revocation/eviction) or an active iGPU panel (display power wells/DC states), D3cold, dynamic BMG MERT cap removal/L2-flush frequency coordination and media-GT power management |
+| Acceptance | Native register/CT/page-walk and ownership models on both kernel architectures | Intel silicon execution, suspend/resume and Mesa OpenGL/Vulkan interoperability |
+
+#### Remaining-work status (2026-11-01)
+
+**Size before KMS flip integration.** `tokei` code lines (comments and blanks excluded; inline
+test modules included):
+
+| | NARF Intel driver | Linux reference (b90c984d, C) |
+| --- | --- | --- |
+| GT / compute / UAPI | ~30.8k | xe core ~77.9k |
+| Display | ~16.9k | i915/display ~144.3k (shared by xe) + xe/display glue ~1.6k |
+| Total | ~47.7k (of which ~6.3k in `*_tests.rs` files) | ~223.8k |
+
+**Estimate for full Linux-xe parity: ~100k–165k more Rust lines**, a
+~150k–210k-line driver. For scale, NARF amdgpu is ~286k.
+
+| Area | Still to write (est.) | Main items |
+| --- | --- | --- |
+| VM and memory | 18–25k | Fault-mode, long-running and CPU-address-mirror VMs; USERPTR invalidation (memory-layer MMU notifier); VRAM eviction and migration through copy-engine jobs (GPU clears/copies); DG2 64K VRAM pages and flat-CCS clears; small-BAR VRAM; VRAM PRIME/P2P |
+| Engines | 10–15k | MTL media GT (own GuC instance, VCS/VECS, HuC load/auth); BMG BCS8; CCS1–3 and ccs_mode > 1; load-balanced and parallel queues |
+| Reliability and observability | 8–12k | Error capture/devcoredump; GuC log; OA and EU-stall perf streams |
+| Power | 5–8k | D3cold; autosuspend with live VRAM or a lit panel; userspace SLPC policy and dynamic MERT caps; dGPU hwmon |
+| i915 compatibility | 3–5k | GEM_USERPTR, SSEU, perf, remaining params |
+| Platforms | 8–12k | Lunar Lake (Xe2 iGPU), Panther Lake (Xe3), Tiger Lake/Alder Lake on GuC; roughly 2–4k per family |
+| **GT subtotal** | **50–75k** | |
+| Presentation | 6–10k | Gen12/external direct-flip admission; asynchronous NONBLOCK return; recovery of quarantined display owners; tiled and compressed modifiers; extra planes |
+| Atomic modeset | 15–25k | Watermark and DBUF allocation; CDCLK changes with pcode; multi-pipe; bigjoiner; DSC; VRR |
+| Outputs | 15–25k | Type-C/Thunderbolt PHY and DP alt mode; C20 HDMI 2.1; DP 2.0 UHBR; PSR2/panel replay; hotplug |
+| Display power, color, HDCP, Arc display | 15–28k | DC states and DMC, FBC, display runtime PM; gamma/CTM; HDCP; DG2/BMG display |
+| **Display subtotal** | **50–90k** | |
+
+**Usable Meteor Lake desktop subset: ~10–20k (pre-flip estimate).** Fixed-mode
+zero-copy presentation is now implemented; this estimate still needs revision
+after silicon bring-up and Mesa execution acceptance. A
+read-only audit of upstream Mesa main's Xe backends (anv, iris and their
+shared device code) found no startup blocker in the admitted UAPI. The five
+device queries Mesa treats as fatal are served. PXP, the low-latency hint,
+the state-cache perf fix, purgeable madvise and fault-reporting VMs are used
+only when advertised, which NARF does not do. Scratch-page VMs, queue
+priorities, bind queues, the VM_BIND op and flag set and WC
+scanout/uncached buffers are admitted. What remains is execution behaviour,
+which only hardware can show.
+
+**Caveats.**
+- Silicon bring-up is the unbounded term. Nothing here has run on Intel
+  hardware or under Mesa.
+- Estimates follow NARF's style: Linux-cited, inline native tests, about
+  Linux's C density.
+- SR-IOV, PXP and HDCP content protection are excluded from the subtotals
+  except where listed.
+
+After the GT's execution probes, the physical worker attempts single-vector
+MSI for primary GuC, RCS0 and BCS0, preserving unrelated enable/mask halves.
+The hard handler masks/posts the tile master; bounded task-context identity
+decoding acknowledges only owned RCS0/COPY0/OTHER0 causes before rearming. Dispatch
+epoch capture precedes servicing, avoiding lost wakes around waiter polling.
+The actual GuC/retirement path runs on the IRQ or a 10 ms watchdog; refused or
+failed IRQ routing retains the 500 us timer path. Unrelated display/media
+status is left pending with delivery closed. Reset/S3 tears down routing while
+powered, and unprovable shutdown quarantines the vector/cookie instead of
+reusing it. Active firmware routes and VMD shared routing refuse takeover;
+ARM production routing still needs an ITS event owner. These native models do
+not establish physical MSI delivery or Mesa/silicon acceptance.
+
+Xe MAP_USERPTR is admitted with snapshot pins: the syscall boundary faults the
+range, resolves write COW copies and retains `UserPagePin`s that every mapping
+and job holds through retirement, so the GPU never reaches freed memory. Fork
+copies pinned private pages for the child (`page_needs_cow_for_dma`), so the
+pins keep aliasing the binder's memory. Linux parity still needs
+`xe_userptr.c`'s invalidation/repin/rebind against unmap and replacement,
+which requires a memory-layer MMU notifier. amdgpu GEM_USERPTR shares this gap.
+
+iGPU `DRM_XE_GEM_CPU_CACHING_WC` objects are admitted (MIT Linux
+b90c984d615e8ce2af96f5b1411a962d83fed2ad `xe_ttm_tt_create`,
+`xe_gem_create_ioctl`, `xe_vm_bind_ioctl_validate_bo`). Their pages come
+from `narf_memory::pageattr::WcPages`: every kernel alias is retyped
+write-combining before publication (TTM `set_pages_array_wc`), user mmaps
+are WC, kernel copies end with SFENCE and device publication needs no
+CLFLUSH. Pages are restored write-back only after the last mapping, VM
+binding and job drop the object. SCANOUT is admitted on the iGPU and is
+EINVAL with WB caching. XE_COH_NONE binds (MTL PAT1 WT, PAT2 UC) are EINVAL
+for WB objects and USERPTR. Deviation: PAT0, also XE_COH_NONE in Linux,
+stays refused because its definition is left to firmware for the inherited
+display. dGPU system memory stays WB as in Linux. aarch64 refuses WC
+creation (`NotImplemented`): the kernel's linear map cannot be retyped.
+
+Hung user jobs are recovered per context (MIT Linux
+b90c984d615e8ce2af96f5b1411a962d83fed2ad `guc_exec_queue_timedout_job`,
+`xe_guc_exec_queue_reset_handler`, `xe_lrc_timestamp` and `check_timeout`).
+A user job's 5 s watchdog starts at GuC's enable ACK, but timeout attribution
+uses the ring's CTX_TIMESTAMP/start-stamp stores and saved LRC runtime.
+A private restore batch marks active state; live MMIO is sampled only when
+RING_CURRENT_LRCA names that LRC before and after the read, with a saved-state
+reread covering switch-out. Queuing and preemption consume no job runtime.
+Unsigned 32-bit subtraction handles counter wrap, with Linux's 5% scheduling
+tolerance. Two unchanged active timestamp samples also identify a hang.
+Missing/unchanging inactive timestamps instead require full GT reset after the
+entire engine makes no GPU progress for three watchdog intervals. Changed
+sampled counters and completed breadcrumbs refresh that engine watchdog, so
+no queue is blamed for a scheduling stall. Cache/read failures fail closed and
+retain all backing until proven reset.
+
+When a context exceeds its GPU runtime budget, the scheduler disables that
+context alone; GuC preempts it or, if it cannot preempt within the
+500 ms policy timeout, resets the engine and sends
+CONTEXT_RESET_NOTIFICATION (0x1008). GuC also resets autonomously when a
+non-preemptible context blocks a waiting one. Either way the context is
+deregistered and its final TLB invalidation proven before its tables and
+BOs are released; its saved state is never captured, its fence fails with
+`JobError::Hang`, and its context is banned and counted guilty (i915
+GET_RESET_STATS `batch_active`). Xe EXEC on a banned queue is ECANCELED
+before syncs are parsed, after the queue lookup and batch-count checks, as
+in `xe_exec_ioctl`. A job that completes while being disabled retires
+normally. Kernel jobs, a reset notification for a kernel context, a second
+expiry, an unanswered disable and ENGINE_FAILURE_NOTIFICATION still require a
+full GT reset. Kernel jobs and protocol/retirement steps retain bounded
+wall-clock deadlines. Native tests cover active/inactive samples, counter
+wrap, switch-out and sentinel collisions, queued time, isolated recovery,
+failed cache reads, engine stalls and continuously completing short jobs.
+
+The scheduler now recycles a round-robin pool of 64 GuC IDs after verified
+retirement, removing the 65534-request lifetime limit. Request stamps and TLB
+cookies are independent of those IDs; wrap skips live stamps and old
+generation-bearing evidence cannot retire a replacement job. The seed ID stays
+leased through the forced switch/capture sequence. As in Linux Xe, ID-only
+scheduling responses rely on GuC's deregistration contract; the final TLB ACK
+also proves our reclamation barrier. Failed stop/capture retains leased IDs.
+
+Graphics APIs, shader compilation and application state generation belong in
+userspace; the kernel must supply the supported execution and memory contracts.

@@ -565,6 +565,10 @@ pub enum PsrError {
     /// region against a scanout that is about to change would
     /// update the wrong frame.
     FlipPending,
+    /// A source register was inaccessible or refused the disable request.
+    Unavailable,
+    /// The source did not leave self-refresh within the bounded idle wait.
+    Timeout,
 }
 
 impl From<AuxError> for PsrError {
@@ -1138,6 +1142,7 @@ struct EdpRuntime {
     flip_pending: bool,
     frame: (u16, u16),
     last_region: Option<SuRegion>,
+    kms_inhibited: bool,
 }
 
 impl EdpRuntime {
@@ -1150,6 +1155,7 @@ impl EdpRuntime {
             flip_pending: false,
             frame: (0, 0),
             last_region: None,
+            kms_inhibited: false,
         }
     }
 
@@ -1160,6 +1166,9 @@ impl EdpRuntime {
         mmio: &M,
         region: Option<SuRegion>,
     ) -> Result<DirtyOutcome, PsrError> {
+        if self.kms_inhibited {
+            return Err(PsrError::FlipPending);
+        }
         let Some(active) = self.active else {
             return Ok(DirtyOutcome::NoPsr);
         };
@@ -1200,6 +1209,52 @@ impl EdpRuntime {
             }
         }
     }
+
+    /// Surface updates require a real scanout fetch, rather than a panel
+    /// still showing self-refresh. MIT Linux b90c984d intel_psr.c disables
+    /// the source and waits for idle before handing the sink back.
+    fn inhibit_for_kms<M: MmioWindow + ?Sized, A: AuxChannel>(
+        &mut self,
+        mmio: &M,
+        aux: &mut A,
+    ) -> Result<(), PsrError> {
+        self.kms_inhibited = true;
+        self.flip_pending = true;
+        let psr1 = mmio.read32(PSR_CTL);
+        let psr2 = mmio.read32(PSR2_CTL);
+        if psr1 == u32::MAX || psr2 == u32::MAX {
+            return Err(PsrError::Unavailable);
+        }
+        let enabled = self.active.is_some() || (psr1 | psr2) & (1 << 31) != 0;
+        mmio.write32(PSR_CTL, psr1 & PSR_CTL_RESTORE_ACTIVE_CTX);
+        mmio.write32(PSR2_CTL, 0);
+        mmio.write32(PSR2_MAN_TRK_CTL, 0);
+        let mut unavailable = false;
+        let idle = narf_scheduler::responsive_spin_until(
+            || {
+                let ctl1 = mmio.read32(PSR_CTL);
+                let ctl2 = mmio.read32(PSR2_CTL);
+                let status1 = mmio.read32(PSR_STATUS);
+                let status2 = mmio.read32(PSR2_STATUS);
+                unavailable = [ctl1, ctl2, status1, status2].contains(&u32::MAX)
+                    || (ctl1 | ctl2) & (1 << 31) != 0;
+                unavailable || (status1 & (7 << 29) == 0 && status2 & (15 << 28) == 0)
+            },
+            narf_time::Deadline::after_ms(2000),
+        );
+        if unavailable {
+            return Err(PsrError::Unavailable);
+        }
+        if !idle {
+            return Err(PsrError::Timeout);
+        }
+        if enabled {
+            sink_write(aux, DPCD_PSR_EN_CFG, &[0])?;
+        }
+        self.active = None;
+        self.last_region = None;
+        Ok(())
+    }
 }
 
 static EDP_RUNTIME: IrqSafeSpinLock<EdpRuntime> = IrqSafeSpinLock::new(EdpRuntime::new());
@@ -1215,6 +1270,9 @@ pub fn runtime_install_panel(delays: PanelDelays, layout: PsrLayout) {
 /// Record a live PSR session at probe time.
 pub fn runtime_install_psr(caps: PsrCaps, active: PsrMode, width: u16, height: u16) {
     let mut rt = EDP_RUNTIME.lock();
+    if rt.kms_inhibited {
+        return;
+    }
     rt.caps = Some(caps);
     rt.active = Some(active);
     rt.frame = (width, height);
@@ -1225,6 +1283,22 @@ pub fn runtime_install_psr(caps: PsrCaps, active: PsrMode, width: u16, height: u
 /// session machinery drives around its page flips.
 pub fn set_flip_pending(pending: bool) {
     EDP_RUNTIME.lock().flip_pending = pending;
+}
+
+/// The caller retains its KMS session, PCI authority and display power. An
+/// error leaves PSR inhibited so another task cannot re-enter during recovery.
+pub(crate) fn kms_inhibit_psr(mmio: &impl MmioWindow) -> Result<(), PsrError> {
+    let mut aux = IntelAux::new(mmio, Ddi::A);
+    EDP_RUNTIME.lock().inhibit_for_kms(mmio, &mut aux)
+}
+
+/// Called only after console restoration or verified fetch stop. PSR stays
+/// disabled until a later explicit enable; releasing this guard is not proof
+/// that a panel supports re-entry with a changed configuration.
+pub(crate) fn kms_release_psr() {
+    let mut runtime = EDP_RUNTIME.lock();
+    runtime.kms_inhibited = false;
+    runtime.flip_pending = false;
 }
 
 /// Notify the PSR session that scanout content changed.
@@ -1283,6 +1357,10 @@ impl MmioWindow for BarWindow<'_> {
 /// running; PSR is an optimization, never a boot blocker.
 pub fn enable_psr_for_panel(gpu: &crate::intel_gpu::IntelGpu, mode: &Mode) {
     use core::fmt::Write as _;
+    let mut runtime = EDP_RUNTIME.lock();
+    if runtime.kms_inhibited {
+        return;
+    }
     let window = BarWindow(&gpu.gtt_mmadr);
     let mut aux = IntelAux::new(&window, Ddi::A);
     let caps = match PsrCaps::probe(&mut aux) {
@@ -1303,7 +1381,9 @@ pub fn enable_psr_for_panel(gpu: &crate::intel_gpu::IntelGpu, mode: &Mode) {
     let layout = PsrLayout::from_generation(gpu.chip.generation);
     match psr_enable(&window, &mut aux, &caps, layout, mode, tps3) {
         Ok(active) => {
-            runtime_install_psr(caps, active, mode.h_active, mode.v_active);
+            runtime.caps = Some(caps);
+            runtime.active = Some(active);
+            runtime.frame = (mode.h_active, mode.v_active);
             let _ = writeln!(
                 narf_console::Writer,
                 "intel-gpu/edp: PSR enabled: {:?} (idle {} frames)",
@@ -1541,6 +1621,68 @@ pub mod tests {
         rt.frame = (1920, 1080);
         rt
     }
+
+    fn smoke_kms_psr_handoff_requires_idle_and_inhibits_dirty() -> TestResult {
+        for active in [PsrMode::Psr1, PsrMode::Psr2] {
+            let mmio = ScriptMmio::default();
+            mmio.set_current(PSR_CTL, PSR_CTL_RESTORE_ACTIVE_CTX | (1 << 31));
+            mmio.set_current(PSR2_CTL, if active == PsrMode::Psr2 { 1 << 31 } else { 0 });
+            mmio.script_reads(PSR_STATUS, &[3 << 29, 1 << 29, 0]);
+            mmio.script_reads(PSR2_STATUS, &[8 << 28, 1 << 28, 0]);
+            let mut aux = ScriptAux::default();
+            let mut rt = runtime_psr2(PsrLayout::TigerLake);
+            rt.active = Some(active);
+            assert_eq!(rt.inhibit_for_kms(&mmio, &mut aux), Ok(()));
+            assert!(rt.kms_inhibited && rt.flip_pending && rt.active.is_none());
+            assert_eq!(
+                mmio.writes_to(PSR_CTL),
+                alloc::vec![PSR_CTL_RESTORE_ACTIVE_CTX]
+            );
+            assert_eq!(mmio.writes_to(PSR2_CTL), alloc::vec![0]);
+            assert_eq!(mmio.writes_to(PSR2_MAN_TRK_CTL), alloc::vec![0]);
+            assert_eq!(aux.writes(), alloc::vec![(DPCD_PSR_EN_CFG, alloc::vec![0])]);
+            let writes = mmio.all_writes();
+            assert_eq!(rt.notify_dirty(&mmio, None), Err(PsrError::FlipPending));
+            assert_eq!(mmio.all_writes(), writes);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_kms",
+        smoke_kms_psr_handoff_requires_idle_and_inhibits_dirty
+    );
+
+    fn smoke_kms_psr_failed_read_or_disable_preserves_inhibition() -> TestResult {
+        struct Refused<'a>(&'a ScriptMmio);
+        impl MmioWindow for Refused<'_> {
+            fn read32(&self, off: u64) -> u32 {
+                self.0.read32(off)
+            }
+            fn write32(&self, off: u64, value: u32) {
+                if off != PSR_CTL {
+                    self.0.write32(off, value);
+                }
+            }
+        }
+        for unavailable in [true, false] {
+            let mmio = ScriptMmio::default();
+            mmio.set_current(PSR_CTL, if unavailable { u32::MAX } else { 1 << 31 });
+            let mut aux = ScriptAux::default();
+            let mut rt = runtime_psr2(PsrLayout::TigerLake);
+            assert_eq!(
+                rt.inhibit_for_kms(&Refused(&mmio), &mut aux),
+                Err(PsrError::Unavailable)
+            );
+            assert!(rt.kms_inhibited && rt.flip_pending && rt.active.is_some());
+            assert!(aux.writes().is_empty());
+            assert_eq!(rt.notify_dirty(&mmio, None), Err(PsrError::FlipPending));
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_kms",
+        smoke_kms_psr_failed_read_or_disable_preserves_inhibition
+    );
 
     // ── PPS fixtures ────────────────────────────────────────
 

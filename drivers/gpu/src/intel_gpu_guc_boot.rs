@@ -10,6 +10,7 @@ use crate::intel_gpu_gt::{GtPlatform, GUC_GGTT_MIN};
 use crate::intel_gpu_guc::CssImage;
 use crate::intel_gpu_guc_firmware::GuCFirmware;
 use crate::intel_gpu_guc_transport::{TransportError, XeLpgTransport};
+use crate::intel_gpu_guc_wa::GuCWorkarounds;
 use crate::intel_gpu_hwconfig::{HardwareConfig, HwconfigError};
 use crate::intel_gpu_rcs::{GpuAllocator, GpuBacking, SubmitError};
 use alloc::sync::Arc;
@@ -26,6 +27,7 @@ const ADS_PRIVATE: u32 = 0x6000;
 const LOG_BYTES: u32 = 0x115000; // state page + 16K crash + 64K events + 1M capture
 const POLICIES: u64 = 0x11dc;
 const SYSINFO: u64 = 0x123c;
+const WA_KLVS: u64 = 0x3000; // reserved ADS page, separate from register saves/private data
 
 fn invalidate_guc_tlb(mmio: &impl MmioWindow, platform: GtPlatform) {
     let _ = mmio.read32(0x1901f8);
@@ -58,6 +60,7 @@ pub enum BootError {
     Transport(TransportError),
     Hwconfig(HwconfigError),
     Scheduling(crate::intel_gpu_guc_sched::SchedulingError),
+    Graphics(crate::intel_gpu_gt::GraphicsError),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -197,6 +200,7 @@ pub struct GuCBoot<M: MmioWindow, A: BootAllocator> {
     scheduling: Option<crate::intel_gpu_guc_sched::SchedulingAds>,
     reload: bool,
     submission_version: (u8, u8, u8),
+    workarounds: Option<GuCWorkarounds>,
 }
 
 impl<M: MmioWindow, A: BootAllocator> core::fmt::Debug for GuCBoot<M, A> {
@@ -224,6 +228,10 @@ fn extent(backing: &impl GpuBacking, pages: u32) -> Result<(), BootError> {
 }
 
 impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
+    pub(crate) fn submission_version(&self) -> (u8, u8, u8) {
+        self.submission_version
+    }
+
     pub fn stage(
         mmio: M,
         allocator: A,
@@ -346,6 +354,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             scheduling: None,
             reload: false,
             submission_version: image.submission_version,
+            workarounds: None,
         })
     }
 
@@ -355,6 +364,14 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
 
     pub(crate) fn platform(&self) -> GtPlatform {
         self.platform
+    }
+
+    pub(crate) fn device_id(&self) -> u16 {
+        self.config.device_id
+    }
+
+    pub(crate) fn revision(&self) -> u8 {
+        self.config.revision
     }
 
     pub(crate) fn configure_cache(
@@ -371,7 +388,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         Ok(())
     }
 
-    pub(crate) fn scheduler(&self) -> Result<crate::intel_gpu_guc_sched::GuCScheduler<A>, BootError>
+    pub(crate) fn scheduler(
+        &self,
+        engines: crate::intel_gpu_engine::EngineSet,
+    ) -> Result<crate::intel_gpu_guc_sched::GuCScheduler<A>, BootError>
     where
         A: Clone,
     {
@@ -384,6 +404,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         crate::intel_gpu_guc_sched::GuCScheduler::allocate(
             self.resources.allocator.clone(),
             self.platform,
+            engines,
         )
         .map_err(BootError::Scheduling)
     }
@@ -531,6 +552,14 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         if self.mmio.read32(GDRST) != 0 || self.mmio.read32(DMA_CTRL) & 1 != 0 {
             return Err(BootError::Busy);
         }
+        let ip = crate::intel_gpu_gt::GraphicsIp::read(&self.mmio, self.platform)
+            .map_err(BootError::Graphics)?;
+        let workarounds = GuCWorkarounds::for_rcs(self.platform, self.config.device_id, ip);
+        if self.workarounds.is_some_and(|old| old != workarounds) {
+            return Err(BootError::Device);
+        }
+        self.awake()?;
+        self.workarounds = Some(workarounds);
         self.deadline = now.checked_add(5_000_000).ok_or(BootError::Timeout)?;
         self.state = BootState::Resetting;
         self.mmio.write32(GDRST, 8);
@@ -578,6 +607,18 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             return Err(BootError::Unavailable);
         }
         let r = &mut *self.resources;
+        let workarounds = self.workarounds.ok_or(BootError::State)?;
+        // GuC is proven in reset. Publish bounded zero-length 16:16 KLVs,
+        // the complete 64-bit ADS pointer and its byte count before DMA.
+        for i in 0..PAGE / 4 {
+            r.ads.write32(WA_KLVS + u64::from(i) * 4, 0);
+        }
+        for (i, word) in workarounds.klvs.iter().copied().enumerate() {
+            r.ads.write32(WA_KLVS + i as u64 * 4, word);
+        }
+        r.ads.write32(0x11a4, r.ads.ggtt_offset() + WA_KLVS as u32);
+        r.ads.write32(0x11a8, 0);
+        r.ads.write32(0x11ac, workarounds.klvs.len() as u32 * 4);
         if !self.platform.is_discrete() {
             let doorbells = self.mmio.read32(0xd08);
             if doorbells == u32::MAX {
@@ -591,6 +632,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         r.allocator.sync_for_device(&r.logs)?;
         let mut params = [0u32; 14];
         params[0] = r.logs.ggtt_offset() | 0x3f5;
+        params[1] = workarounds.flags;
         params[2] = if self.scheduling.is_some() {
             1 << 4
         } else {
@@ -697,22 +739,39 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                         let config = self.scheduling.expect("scheduling reload");
                         let ads = &self.resources.ads;
                         let base = ads.ggtt_offset();
-                        // Populate only while GuC is proven stopped. RCS0 is
-                        // the only engine enabled by this kernel bring-up path.
-                        ads.write32(SYSINFO, 0x20202000);
-                        ads.write32(SYSINFO + 512, 1);
-                        ads.write32(0x1014, config.golden);
-                        ads.write32(0x1054, config.bytes - 4096 - 96 * 4);
-                        ads.write32(POLICIES + 76, 1); // no autonomous engine reset
-                        ads.write32(0, base + 0x2000);
-                        ads.write32(4, 3);
-                        ads.write32(0x2014, config.hwsp);
-                        for (i, (reg, flags)) in [(0x229c, 1), (0x2080, 0), (0x20a8, 0)]
+                        // Populate only while GuC is proven stopped: RCS0 and
+                        // BCS0, each logical instance 0 of its GuC class.
+                        // xe_guc_ads.c mapping/enable masks, golden LRCA with
+                        // its post-register state size, and per-engine saves.
+                        // guc_policies_init: global_flags 0 lets GuC reset an
+                        // engine whose context fails to preempt in time; the
+                        // scheduler retires that context alone.
+                        ads.write32(POLICIES + 76, 0);
+                        for engine in crate::intel_gpu_engine::Engine::ALL {
+                            let Some(state) = config.engines[engine.index()] else {
+                                continue;
+                            };
+                            let class = u64::from(engine.guc_class());
+                            let base_reg = engine.base();
+                            let saves = 0x2000 + engine.index() as u64 * 48;
+                            ads.write32(SYSINFO + class * 32, 0x20202000);
+                            ads.write32(SYSINFO + 512 + class * 4, 1);
+                            ads.write32(0x1014 + class * 4, state.golden);
+                            ads.write32(0x1054 + class * 4, state.bytes - 4096 - 96 * 4);
+                            ads.write32(class * 256, base + saves as u32);
+                            ads.write32(class * 256 + 4, 3);
+                            for (i, (reg, value, flags)) in [
+                                (base_reg + 0x29c, 0, 1),
+                                (base_reg + 0x80, state.hwsp, 0),
+                                (base_reg + 0xa8, 0, 0),
+                            ]
                             .into_iter()
                             .enumerate()
-                        {
-                            ads.write32(0x2000 + i as u64 * 16, reg);
-                            ads.write32(0x2008 + i as u64 * 16, flags);
+                            {
+                                ads.write32(saves + i as u64 * 16, reg);
+                                ads.write32(saves + i as u64 * 16 + 4, value);
+                                ads.write32(saves + i as u64 * 16 + 8, flags);
+                            }
                         }
                         self.state = BootState::Staged;
                         self.begin(now)?;
@@ -820,19 +879,45 @@ mod tests {
         cpu_synced: BTreeSet<u32>,
         reject_wopcm: bool,
         coherent: bool,
+        unstable_gmd: bool,
+        gmd_reads: u32,
     }
     #[derive(Clone)]
     struct Window(Rc<RefCell<Device>>);
     impl MmioWindow for Window {
         fn read32(&self, offset: u64) -> u32 {
+            if offset == 0xd8c {
+                let mut device = self.0.borrow_mut();
+                let value = *device.regs.get(&offset).unwrap_or(&0);
+                device.gmd_reads += 1;
+                return value ^ u32::from(device.unstable_gmd && device.gmd_reads % 2 == 0);
+            }
             *self.0.borrow().regs.get(&offset).unwrap_or(&0)
         }
         fn write32(&self, offset: u64, value: u32) {
             let mut device = self.0.borrow_mut();
             device.writes.push((offset, value));
             let actual = match offset {
+                0x190008 | 0x190010 => {
+                    let old = *device.regs.get(&offset).unwrap_or(&0);
+                    (old & !value & 0x7fffffff) | (value & 0x80000000)
+                }
+                0x190018 | 0x190060 => *device.regs.get(&offset).unwrap_or(&0) & !value,
+                0x190070 => {
+                    device.regs.insert(
+                        0x190060,
+                        match value {
+                            1 => 0x80000001,
+                            0x02000000 => 0x80048000,
+                            _ => panic!("unowned interrupt selector"),
+                        },
+                    );
+                    value
+                }
+                0xd8c => *device.regs.get(&offset).unwrap_or(&0), // read-only GMD_ID
                 0xc050 | 0xc340 if !device.reject_wopcm => value | 1,
-                0xc314 | 0xa188 | 0xa278 => {
+                0xc314 | 0xa188 | 0xa278 | 0x20ec | 0x83b4 | 0xe48c | 0xe18c | 0xe4f4 | 0xe5f0
+                | 0xe420 | 0xe49c | 0xe4f0 | 0x20d4 | 0xe194 | 0xe4c4 | 0xe5f4 | 0x2050 => {
                     let mask = value >> 16;
                     let old = *device.regs.get(&offset).unwrap_or(&0);
                     if value == 0x00110011 {
@@ -982,6 +1067,16 @@ mod tests {
         bytes
     }
     fn stage(window: Window, arena: Arena, platform: GtPlatform) -> GuCBoot<Window, Arena> {
+        window
+            .0
+            .borrow_mut()
+            .regs
+            .entry(0xd8c)
+            .or_insert(if platform == GtPlatform::Battlemage {
+                (20 << 22) | (1 << 14)
+            } else {
+                (12 << 22) | (70 << 14)
+            });
         let device_id = match platform {
             GtPlatform::Alchemist => 0x56a0,
             GtPlatform::Battlemage => 0xe20b,
@@ -1021,6 +1116,140 @@ mod tests {
         reset_done(window);
         assert_eq!(boot.poll(101), Poll::Ready(Ok(BootState::Stopped)));
     }
+
+    fn smoke_boot_workaround_wire_profiles() -> TestResult {
+        let mtl = GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake);
+        let rows: &[(GtPlatform, u16, u32, u32, &[u32])] = &[
+            (
+                GtPlatform::Alchemist,
+                0x56a0,
+                0,
+                0x424800,
+                &[0x90020000, 0x900b0000],
+            ),
+            (
+                GtPlatform::Alchemist,
+                0x56a5,
+                0,
+                0x42c800,
+                &[0x90020000, 0x900b0000],
+            ),
+            (
+                GtPlatform::Alchemist,
+                0x56a3,
+                0,
+                0x424800,
+                &[0x90020000, 0x900b0000],
+            ),
+            (
+                mtl,
+                0x7d55,
+                (12 << 22) | (70 << 14),
+                0x420000,
+                &[0x90020000, 0x900b0000],
+            ),
+            (
+                mtl,
+                0x7d55,
+                (12 << 22) | (70 << 14) | 4,
+                0x400000,
+                &[0x90020000, 0x900b0000],
+            ),
+            (
+                mtl,
+                0x7d55,
+                (12 << 22) | (71 << 14) | 3,
+                0x420000,
+                &[0x90020000, 0x900b0000],
+            ),
+            (
+                mtl,
+                0x7d55,
+                (12 << 22) | (74 << 14),
+                0x400000,
+                &[0x90020000, 0x900b0000],
+            ),
+            (
+                GtPlatform::Battlemage,
+                0xe20b,
+                (20 << 22) | (1 << 14),
+                0,
+                &[0x90050000, 0x90070000, 0x90090000, 0x900b0000],
+            ),
+            (
+                GtPlatform::Battlemage,
+                0xe20b,
+                (20 << 22) | (2 << 14),
+                0,
+                &[0x90090000, 0x900b0000],
+            ),
+        ];
+        for &(platform, device, gmd, flags, klvs) in rows {
+            let (w, arena) = model();
+            let mut boot = stage(w.clone(), arena.clone(), platform);
+            boot.config.device_id = device;
+            w.0.borrow_mut().regs.insert(0xd8c, gmd);
+            ready(&mut boot, &w);
+            {
+                let d = w.0.borrow();
+                assert_eq!(d.regs[&0xc188], flags);
+                assert_eq!(d.regs[&0xc198] >> 16, u32::from(device));
+                let ads = d.memory[&0x20001000].borrow();
+                assert_eq!(
+                    &ads[0x11a4 / 4..0x11b0 / 4],
+                    &[0x20004000, 0, klvs.len() as u32 * 4]
+                );
+                assert_eq!(&ads[0x3000 / 4..0x3000 / 4 + klvs.len()], klvs);
+                assert!(ads[0x3000 / 4 + klvs.len()..0x4000 / 4]
+                    .iter()
+                    .all(|v| *v == 0));
+                assert!(ads[0x2000 / 4..0x3000 / 4].iter().all(|v| *v == 0));
+            }
+            stop(&mut boot, &w);
+            drop(boot);
+            assert_eq!(arena.live_allocations(), 0);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_boot",
+        smoke_boot_workaround_wire_profiles
+    );
+
+    fn smoke_boot_workarounds_reject_bad_live_ip() -> TestResult {
+        for (gmd, unstable, error) in [
+            (
+                u32::MAX,
+                false,
+                crate::intel_gpu_gt::GraphicsError::Unavailable,
+            ),
+            (
+                (20 << 22) | (4 << 14),
+                false,
+                crate::intel_gpu_gt::GraphicsError::Unsupported,
+            ),
+            (
+                (20 << 22) | (1 << 14),
+                true,
+                crate::intel_gpu_gt::GraphicsError::Unstable,
+            ),
+        ] {
+            let (w, arena) = model();
+            let mut boot = stage(w.clone(), arena.clone(), GtPlatform::Battlemage);
+            w.0.borrow_mut().regs.insert(0xd8c, gmd);
+            w.0.borrow_mut().unstable_gmd = unstable;
+            assert_eq!(boot.begin(0), Err(BootError::Graphics(error)));
+            assert_eq!(boot.state(), BootState::Staged);
+            assert!(w.0.borrow().writes.is_empty());
+            drop(boot);
+            assert_eq!(arena.live_allocations(), 0);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_boot",
+        smoke_boot_workarounds_reject_bad_live_ip
+    );
 
     fn smoke_boot_dma_ads_and_transport() -> TestResult {
         for platform in [

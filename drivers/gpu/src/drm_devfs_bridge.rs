@@ -239,13 +239,40 @@ impl Drop for DriCardFile {
         }
         // drm_master_release: if this fd held DRM master, drop it so the device
         // is free for the next session's SET_MASTER (greeter→user handoff).
-        if let Some(ms) = crate::drm_registry::mode_state(self.index) {
+        let was_master = if let Some(ms) = crate::drm_registry::mode_state(self.index) {
             let mut ms = ms.lock();
+            let was_master = ms.is_master(self.open_id);
             // drm_fb_release: the framebuffers it made of its GEM buffers.
             ms.release_file_framebuffers(self.open_id);
             ms.master_release(self.open_id);
             ms.magic_release(self.open_id);
+            was_master
+        } else {
+            false
+        };
+        #[cfg(feature = "intel")]
+        if was_master && crate::intel_gpu_kms::active(self.index) {
+            if let (Some(display), Some(mode)) = (
+                crate::intel_gpu_kms::display(self.index),
+                crate::drm_registry::mode_state(self.index),
+            ) {
+                // Drop cannot await. The display owner retains all fronts
+                // until this serialized restoration proves the console latch.
+                // A new master supersedes lastclose's request: never restore
+                // stale console pixels over its newly submitted primary.
+                let _ = narf_scheduler::spawn_stackful(async move {
+                    let Ok(mut session) = display.session().await else {
+                        return;
+                    };
+                    if mode.lock().has_master() {
+                        return;
+                    }
+                    let _ = session.restore_console().await;
+                });
+            }
         }
+        #[cfg(not(feature = "intel"))]
+        let _ = was_master;
         // Last master node closed → release the framebuffer back to the
         // kernel console (no-op if a DRM client never took it over).
         if LIVE_CARD_FILES.fetch_sub(1, core::sync::atomic::Ordering::AcqRel) == 1 {
@@ -445,6 +472,18 @@ impl FileOps for DriCardFile {
         ) {
             return result;
         }
+        // A framebuffer of one of this open's Intel GEM buffers (primary node
+        // only: the render node refuses KMS).
+        #[cfg(feature = "intel")]
+        if let Some(result) = crate::drm_ioctl_bridge::intel_addfb2_bo(
+            self.index,
+            self.open_id,
+            cmd,
+            arg,
+            &self.intel.gem,
+        ) {
+            return result;
+        }
         // Mesa's GBM/EGL compositor context is created on the PRIMARY (card)
         // node and issues the VIRTGPU driver ioctls (GETPARAM/GET_CAPS/
         // CONTEXT_INIT/RESOURCE_CREATE/EXECBUFFER/…) there — every one is
@@ -568,7 +607,25 @@ impl FileOps for DriCardFile {
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
             #[cfg(feature = "intel")]
-            if let Some(result) = self.intel.dispatch_card(self.index, cmd, arg, context) {
+            if let Some(result) = self
+                .intel
+                .dispatch_card_user(self.index, cmd, arg, context)
+                .await
+            {
+                return result;
+            }
+            #[cfg(feature = "intel")]
+            if let Some(result) = crate::drm_ioctl_bridge::intel_kms_async(
+                self.index,
+                self.open_id,
+                cmd,
+                arg,
+                context,
+                Some(&self.events),
+                Some(&self.pending_out_fences),
+            )
+            .await
+            {
                 return result;
             }
             // amdgpu_drm_ioctl: pm_runtime_get_sync … put_autosuspend.
@@ -778,7 +835,7 @@ impl FileOps for DriCardFile {
         if crate::drm_registry::driver_name(self.index) == Some("intel-gpu") {
             return Ok(intel_dma_buf_file(
                 self.index,
-                self.intel.gem.object(gem_handle)?,
+                self.intel.gem.export_object(gem_handle)?,
             ));
         }
         #[cfg(feature = "amdgpu")]
@@ -974,8 +1031,14 @@ impl FileOps for IntelPrimeDmaBufFile {
         context: &'a dyn narf_filesystem::IoctlContext,
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
-            // DMA_BUF_IOCTL_SYNC, CPU-coherent RAM with no admitted GPU work.
-            if cmd != 0x4008_6200 {
+            use narf_filesystem::dma_buf::*;
+            if matches!(
+                cmd,
+                DMA_BUF_SET_NAME_A | DMA_BUF_SET_NAME_B | DMA_BUF_IOCTL_EXPORT_SYNC_FILE
+            ) {
+                return dma_buf_ioctl(&self.object.dma_buf, cmd, arg, context);
+            }
+            if cmd != DMA_BUF_IOCTL_SYNC {
                 return Err(FsError::Unsupported);
             }
             let mut bytes = [0; 8];
@@ -983,6 +1046,16 @@ impl FileOps for IntelPrimeDmaBufFile {
             let flags = u64::from_le_bytes(bytes);
             if flags & !7 != 0 || flags & 3 == 0 {
                 return Err(FsError::InvalidData);
+            }
+            if flags & DMA_BUF_SYNC_END == 0 {
+                if !self.object.idle(flags & DMA_BUF_SYNC_WRITE != 0)
+                    && context.restart_after(1_000_000)
+                {
+                    return Err(FsError::WouldBlock);
+                }
+                self.object
+                    .wait_idle(flags & DMA_BUF_SYNC_WRITE != 0, None)
+                    .await?;
             }
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             Ok(0)
@@ -1592,7 +1665,11 @@ impl FileOps for DriRenderFile {
     ) -> FsFuture<'a, u64> {
         Box::pin(async move {
             #[cfg(feature = "intel")]
-            if let Some(result) = self.intel.dispatch_card(self.index, cmd, arg, context) {
+            if let Some(result) = self
+                .intel
+                .dispatch_card_user(self.index, cmd, arg, context)
+                .await
+            {
                 return result;
             }
             // amdgpu_drm_ioctl: pm_runtime_get_sync … put_autosuspend.
@@ -1693,7 +1770,7 @@ impl FileOps for DriRenderFile {
         if crate::drm_registry::driver_name(self.index) == Some("intel-gpu") {
             return Ok(intel_dma_buf_file(
                 self.index,
-                self.intel.gem.object(gem_handle)?,
+                self.intel.gem.export_object(gem_handle)?,
             ));
         }
         #[cfg(feature = "amdgpu")]
@@ -2090,6 +2167,11 @@ pub struct IntelGpuCard {
     pub subsystem_did: u16,
     hwconfig:
         narf_lib::sync::IrqSafeSpinLock<Option<Arc<crate::intel_gpu_hwconfig::HardwareConfig>>>,
+    topology: narf_lib::sync::IrqSafeSpinLock<Option<Arc<crate::intel_gpu_topology::GtTopology>>>,
+    backend: narf_lib::sync::IrqSafeSpinLock<Option<Arc<dyn crate::intel_gpu_user::UserBackend>>>,
+    /// The function's LMEM BAR, mapped write-combining at discrete probe.
+    lmem_bar: narf_lib::sync::IrqSafeSpinLock<Option<narf_bus::MmioRegion>>,
+    vram: narf_lib::sync::IrqSafeSpinLock<Option<Arc<crate::intel_gpu_vram::Vram>>>,
 }
 
 #[cfg(feature = "intel")]
@@ -2108,7 +2190,58 @@ impl IntelGpuCard {
             subsystem_vid,
             subsystem_did,
             hwconfig: narf_lib::sync::IrqSafeSpinLock::new(None),
+            topology: narf_lib::sync::IrqSafeSpinLock::new(None),
+            backend: narf_lib::sync::IrqSafeSpinLock::new(None),
+            lmem_bar: narf_lib::sync::IrqSafeSpinLock::new(None),
+            vram: narf_lib::sync::IrqSafeSpinLock::new(None),
         }
+    }
+
+    /// # Safety
+    /// `bar` is this card's own LMEM BAR (BAR2), mapped write-combining,
+    /// exclusively owned by this driver apart from the boot framebuffer.
+    pub(crate) unsafe fn install_lmem_bar(&self, bar: narf_bus::MmioRegion) {
+        self.lmem_bar.lock().get_or_insert(bar);
+    }
+
+    /// Bytes currently allocated from this card's VRAM pool, if published.
+    pub(crate) fn intel_vram_used(&self) -> Option<u64> {
+        self.vram.lock().as_ref().map(|vram| vram.used())
+    }
+
+    /// Build the VRAM pool once from the GT's probed layout. The pool, and
+    /// every allocation in it, outlives GT resets: local memory persists.
+    pub fn publish_gt_vram<M, A>(&self, gt: &crate::intel_gpu_guc_gt::GuCGt<M, A>)
+    where
+        M: crate::intel_gpu_aux::MmioWindow,
+        A: crate::intel_gpu_guc_boot::BootAllocator,
+    {
+        let Some(layout) = gt.vram_layout() else {
+            return;
+        };
+        let Some(bar) = *self.lmem_bar.lock() else {
+            return;
+        };
+        let mut slot = self.vram.lock();
+        if slot.as_ref().is_some_and(|old| old.layout != layout) {
+            return; // never re-derive ownership from a changed probe
+        }
+        if slot.is_none() {
+            // SAFETY: install_lmem_bar's ownership contract for this card.
+            *slot = unsafe { crate::intel_gpu_vram::Vram::new(bar, layout) }.ok();
+        }
+    }
+
+    pub(crate) fn install_user_backend(
+        &self,
+        backend: Arc<dyn crate::intel_gpu_user::UserBackend>,
+    ) -> Result<(), FsError> {
+        let mut slot = self.backend.lock();
+        if slot.is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+        *slot = Some(backend);
+        Ok(())
     }
 
     /// Publish static capabilities once, after this function's GT acquired and
@@ -2135,6 +2268,34 @@ impl IntelGpuCard {
         *slot = Some(snapshot);
         Ok(())
     }
+
+    /// Publish only a validated snapshot from this function's live GT owner.
+    /// A resume may revalidate identical immutable fuses; changed fuses refuse
+    /// restart instead of silently keeping an incompatible published snapshot.
+    pub fn publish_gt_topology<M, A>(
+        &self,
+        gt: &mut crate::intel_gpu_guc_gt::GuCGt<M, A>,
+    ) -> Result<(), crate::intel_gpu_guc_gt::GtError>
+    where
+        M: crate::intel_gpu_aux::MmioWindow,
+        A: crate::intel_gpu_guc_boot::BootAllocator,
+    {
+        use crate::intel_gpu_guc_gt::GtError;
+        if self.vid != 0x8086 {
+            return Err(GtError::Boot(crate::intel_gpu_guc_boot::BootError::Device));
+        }
+        let snapshot = gt.topology_for_device(self.did)?;
+        let mut slot = self.topology.lock();
+        if slot.as_ref().is_some_and(|old| **old != *snapshot) {
+            return Err(GtError::Topology(
+                crate::intel_gpu_topology::TopologyError::Unstable,
+            ));
+        }
+        if slot.is_none() {
+            *slot = Some(snapshot);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "intel")]
@@ -2153,6 +2314,15 @@ impl crate::drm_registry::DrmCard for IntelGpuCard {
     }
     fn intel_hwconfig(&self) -> Option<Arc<crate::intel_gpu_hwconfig::HardwareConfig>> {
         self.hwconfig.lock().clone()
+    }
+    fn intel_topology(&self) -> Option<Arc<crate::intel_gpu_topology::GtTopology>> {
+        self.topology.lock().clone()
+    }
+    fn intel_vram(&self) -> Option<Arc<crate::intel_gpu_vram::Vram>> {
+        self.vram.lock().clone()
+    }
+    fn intel_user_backend(&self) -> Option<Arc<dyn crate::intel_gpu_user::UserBackend>> {
+        self.backend.lock().clone()
     }
     fn subsystem_vendor(&self) -> u16 {
         self.subsystem_vid

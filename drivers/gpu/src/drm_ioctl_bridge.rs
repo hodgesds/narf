@@ -2097,6 +2097,24 @@ pub(crate) fn dispatch_card_for_file(
 
     // 3. Look up the per-cmd handler.
     let nr = drm_uapi::ioc_nr(cmd);
+    #[cfg(feature = "intel")]
+    if crate::intel_gpu_kms::available(card_index) {
+        if intel_kms::mutates(cmd) {
+            return Err(if mode_state.lock().intel_transaction_busy() {
+                FsError::Busy
+            } else {
+                FsError::Unsupported
+            });
+        }
+        if mode_state.lock().intel_transaction_busy()
+            && matches!(
+                IoctlCmd::from_raw(nr),
+                IoctlCmd::GemClose | IoctlCmd::ModeDestroyDumb
+            )
+        {
+            return Err(FsError::Busy);
+        }
+    }
     match IoctlCmd::from_raw(nr) {
         // VERSION needs special-case handling because the user struct
         // holds out-pointers (name/date/desc) that the kernel writes
@@ -5795,6 +5813,7 @@ fn atomic_commit(
                         fb.bo
                             .as_ref()
                             .and_then(|_| prepared_frame(&card, fb, &prepared)),
+                        intel_frame(fb),
                         flip_tickets
                             .iter()
                             .find(|(id, _)| *id == crtc_id)
@@ -5853,6 +5872,7 @@ fn atomic_commit(
         (pitch, width, height, format),
         fb_id,
         gem_frame,
+        intel,
         flip_ticket,
     ) in presentation.into_iter().flatten()
     {
@@ -5860,6 +5880,8 @@ fn atomic_commit(
             present_virgl_frame(&resource, width, height)?;
         } else if let Some(frame) = gem_frame {
             present_frame(card_index, crtc_id, frame, flip_ticket);
+        } else if let Some(frame) = intel {
+            present_intel_frame(&frame)?;
         } else if let Some(src_phys) = src_phys {
             present_frame(
                 card_index,
@@ -6553,6 +6575,8 @@ fn handle_setcrtc_decoded(
     let src_frame: crate::drm::card::PlaneFrame;
     // A GEM framebuffer, pinned for scanout in place.
     let gem_frame: Option<crate::drm::card::PlaneFrame>;
+    // An Intel GEM framebuffer, presented through the scanout copy.
+    let intel: Option<IntelFrame>;
     {
         let mut card = mode_state.lock();
         if let Some(a) = admission {
@@ -6751,6 +6775,7 @@ fn handle_setcrtc_decoded(
             .is_some()
             .then(|| prepared_frame(&card, fb, &prepared))
             .flatten();
+        intel = intel_frame(fb);
         virgl_resource = card.virtgpu_import(gem_handle).cloned();
     }
 
@@ -6773,6 +6798,8 @@ fn handle_setcrtc_decoded(
         present_virgl_frame(&resource, src_w, src_h)?;
     } else if let Some(f) = gem_frame {
         present_frame(card_index, req.crtc_id, f, None);
+    } else if let Some(frame) = intel {
+        present_intel_frame(&frame)?;
     } else if let Some(src) = src_phys {
         present_frame(
             card_index,
@@ -6830,7 +6857,7 @@ fn handle_dirty_fb(
         // `num_clips` entries (at most DIRTY_MAX_CLIPS, so 2 KiB).
         unsafe { copy_in(cmd.clips_ptr as usize, len)? }
     };
-    let (crtcs, frame) = {
+    let (crtcs, frame, intel) = {
         let card = mode_state.lock();
         let fb = card.framebuffer(cmd.fb_id).map_err(|_| FsError::NotFound)?;
         let crtcs: Vec<u32> = card
@@ -6845,8 +6872,13 @@ fn handle_dirty_fb(
             card.dumb_backing(fb.gem_handle)
                 .map(|b| fb_frame(fb, b.phys))
         };
-        (crtcs, frame)
+        (crtcs, frame, intel_frame(fb))
     };
+    // An Intel GEM framebuffer is copied whole: the copy keeps no damage.
+    if let Some(frame) = intel.filter(|_| !crtcs.is_empty()) {
+        present_intel_frame(&frame)?;
+        return Ok(0);
+    }
     let rows = frame.as_ref().map_or(0..0, |f| cmd.rows(&clips, f.height));
     // A request whose clips cover no row changes nothing on screen.
     if let Some(f) = frame.filter(|_| !rows.is_empty()) {
@@ -6927,6 +6959,7 @@ fn handle_page_flip_decoded(
     let src_frame: crate::drm::card::PlaneFrame;
     // A GEM framebuffer, pinned for scanout in place.
     let gem_frame: Option<crate::drm::card::PlaneFrame>;
+    let intel: Option<IntelFrame>;
     let mut flip_ticket = None;
     {
         let mut card = mode_state.lock();
@@ -6990,6 +7023,7 @@ fn handle_page_flip_decoded(
             .is_some()
             .then(|| prepared_frame(&card, fb, &prepared))
             .flatten();
+        intel = intel_frame(fb);
         virgl_resource = card.virtgpu_import(gem_handle).cloned();
 
         // Reserve Linux's per-file event space before changing the CRTC, so an
@@ -7064,6 +7098,8 @@ fn handle_page_flip_decoded(
         present_virgl_frame(&resource, src_w, src_h)?;
     } else if let Some(f) = gem_frame {
         present_frame(card_index, req.crtc_id, f, flip_ticket);
+    } else if let Some(frame) = intel {
+        present_intel_frame(&frame)?;
     } else if let Some(src) = src_phys {
         present_frame(
             card_index,
@@ -7595,6 +7631,30 @@ fn blit_to_virtio_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32)
 /// The scanout geometry is fetched through the DRM fbdev hook installed
 /// by `narf_fb` at `Stage::Late` — avoids a circular crate dependency.
 fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
+    blit_rows_to_scanout(src_w, src_h, src_pitch, |row, dst, len| {
+        let src_row = src_phys + u64::from(row) * u64::from(src_pitch);
+        // SAFETY: src is an identity-mapped dumb buffer validated by its
+        // allocator; `len` is within its row (blit_rows_to_scanout's
+        // contract: at most `src_w` pixels).
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                narf_memory::PhysAddr::new(src_row).kernel_ptr::<u8>(),
+                dst,
+                len,
+            );
+        }
+    });
+}
+
+/// Copy rows of a `src_w` x `src_h` 32-bpp source into the live scanout:
+/// `copy_row(row, dst, len)` writes `len` bytes (at most `src_w` and the
+/// scanout's width in pixels) of source row `row` to `dst`.
+fn blit_rows_to_scanout(
+    src_w: u32,
+    src_h: u32,
+    src_pitch: u32,
+    mut copy_row: impl FnMut(u32, *mut u8, usize),
+) {
     // SAFETY: fb replaces its generic mapping through scanout_access; all
     // destination accesses below finish before this view is dropped.
     let view = unsafe { crate::scanout_access::snapshot(crate::drm_fb_hook::query_scanout) };
@@ -7637,7 +7697,6 @@ fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
     let dst_h = info.height.min(src_h);
     let row_bytes = (dst_w as usize) * 4;
     for row in 0..dst_h as usize {
-        let src_row = src_phys + (row * src_pitch as usize) as u64;
         let offset = (row * info.stride_bytes as usize) as u64;
         // A device-memory scanout is reached through its kernel mapping; a
         // RAM-backed one through the physical map.
@@ -7646,17 +7705,9 @@ fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
         } else {
             narf_memory::PhysAddr::new(info.phys + offset).kernel_mut_ptr::<u8>()
         };
-        // SAFETY: src is an identity-mapped dumb buffer validated by its
-        // allocator; dst is the scanout's mapping or physical-map address.
-        // `row_bytes` is within both (row < dst_h <= src_h, dst_w <= src_w).
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                narf_memory::PhysAddr::new(src_row).kernel_ptr::<u8>(),
-                dst,
-                row_bytes,
-            );
-        }
+        // dst is the scanout's mapping or physical-map address with
+        // `row_bytes` available (row < dst_h, dst_w <= the scanout width).
+        copy_row(row as u32, dst, row_bytes);
     }
     drop(view);
     // Tell the FB cursor renderer the frame was fully repainted so it drops
@@ -7966,6 +8017,167 @@ pub fn amdgpu_addfb2_bo(
     }))
 }
 
+/// `DRM_IOCTL_MODE_ADDFB` / `ADDFB2` on an Intel card naming one of the
+/// calling open's Intel GEM handles (intel_user_framebuffer_create's
+/// drm_gem_object_lookup in the file's own table), then
+/// `Card::addfb2_intel`. `None` for another ioctl or card, or a handle that
+/// is not one of the open's Intel GEM objects (the card's ADDFB2 answers it).
+#[cfg(feature = "intel")]
+pub fn intel_addfb2_bo(
+    card_index: u32,
+    open_id: u64,
+    cmd: u32,
+    arg: usize,
+    gem: &crate::intel_gpu_gem::GemState,
+) -> Option<Result<u64, FsError>> {
+    let legacy = cmd == drm_uapi::DRM_IOCTL_MODE_ADDFB;
+    if (!legacy && cmd != drm_uapi::DRM_IOCTL_MODE_ADDFB2) || arg == 0 {
+        return None;
+    }
+    let info = crate::intel_gpu_render::DeviceInfo::for_card(card_index)?;
+    let mode_state = crate::drm_registry::mode_state(card_index)?;
+    let size = if legacy {
+        drm_uapi::SZ_DRM_MODE_FB_CMD
+    } else {
+        drm_uapi::SZ_DRM_MODE_FB_CMD2
+    };
+    // SAFETY: `arg` is the ioctl pointer; the selected Linux request size is
+    // 28 (fb_cmd) or 104 (fb_cmd2), checked by copy_in.
+    let b = match unsafe { copy_in(arg, size as usize) } {
+        Ok(b) => b,
+        Err(e) => return Some(Err(e)),
+    };
+    let fb = if legacy {
+        // Reached only from the primary node: the generic legacy handler's
+        // display-authority gate, before anything is allocated.
+        if !mode_state.lock().is_master(open_id) {
+            return Some(Err(FsError::PermissionDenied));
+        }
+        match crate::drm::ioctl::legacy_fb_cmd(&b) {
+            Ok(fb) => fb,
+            Err(e) => return Some(Err(map_err(e))),
+        }
+    } else {
+        crate::drm::fb_cmd::FbCmd::parse(&b)?
+    };
+    let object = gem.object(fb.handles[0]).ok()?;
+    let id = mode_state
+        .lock()
+        .addfb2_intel(&fb, object, open_id, info.native_xe())
+        .map_err(|e| match e {
+            crate::drm::card::CardError::BadGemHandle => FsError::NotFound,
+            _ => FsError::InvalidData,
+        });
+    Some(id.and_then(|id| {
+        // SAFETY: as above; fb_id is the struct's first u32.
+        unsafe { copy_out(arg, &id.to_le_bytes()) }.map(|()| 0)
+    }))
+}
+
+/// An Intel GEM framebuffer to present: the object and its geometry,
+/// captured under the card lock and presented after it is released.
+#[cfg(feature = "intel")]
+#[derive(Clone)]
+struct IntelFrame {
+    object: Arc<crate::intel_gpu_gem::GemObject>,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    cpp: u32,
+}
+#[cfg(not(feature = "intel"))]
+#[derive(Clone)]
+struct IntelFrame(core::convert::Infallible);
+
+#[cfg(feature = "intel")]
+fn intel_frame(fb: &crate::drm::card::Framebuffer) -> Option<IntelFrame> {
+    fb.intel.as_ref().map(|intel| IntelFrame {
+        object: intel.object.clone(),
+        pitch: fb.pitch,
+        width: fb.width,
+        height: fb.height,
+        cpp: fb.format.cpp(),
+    })
+}
+#[cfg(not(feature = "intel"))]
+fn intel_frame(_fb: &crate::drm::card::Framebuffer) -> Option<IntelFrame> {
+    None
+}
+
+/// Present an Intel GEM framebuffer through the scanout copy. Its GPU writes
+/// complete first (implicit sync: every WRITE fence, the virgl scanout
+/// bound), are made visible to CPU reads (CLFLUSH of a write-back object; a
+/// write-combining one is never cached), and each line is then copied across
+/// the object's scattered pages. Only 32-bpp frames match the scanout.
+#[cfg(feature = "intel")]
+fn present_intel_frame(frame: &IntelFrame) -> Result<(), FsError> {
+    const GPU_FENCE_TIMEOUT_MS: u64 = 15_000;
+    let object = &frame.object;
+    for fence in object.dma_buf.resv.fences(DmaResvUsage::Write) {
+        if !fence.is_signalled() && !fence.wait(GPU_FENCE_TIMEOUT_MS) {
+            return Err(FsError::Busy);
+        }
+    }
+    if frame.cpp != 4 {
+        let (log, n) = should_log(&NOBACKING_N);
+        if log {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  drm: {}-bpp Intel framebuffer not presented: the scanout copy is 32 bpp (#{n})",
+                frame.cpp * 8
+            );
+        }
+        return Ok(());
+    }
+    if !object.sync_for_cpu_read() {
+        return Err(crate::intel_gpu_user::io_error());
+    }
+    let pages: Vec<u64> = object.pages().collect();
+    let size = object.size();
+    blit_rows_to_scanout(frame.width, frame.height, frame.pitch, |row, dst, len| {
+        // SAFETY: `pages` are the retained object's frames; `dst` has `len`
+        // bytes (blit_rows_to_scanout's contract).
+        unsafe { copy_object_row(&pages, size, frame.pitch, row, dst, len) };
+    });
+    Ok(())
+}
+
+/// Copy up to `len` bytes of line `row` (at `row * pitch`) of an object of
+/// `size` bytes in 4 KiB `pages` to `dst`, crossing page boundaries; bytes
+/// past the object's end are not read. Returns the bytes copied.
+///
+/// # Safety
+/// `pages` are live frames of the object, retained for the call, and `dst`
+/// is valid for `len` bytes.
+#[cfg(feature = "intel")]
+pub(crate) unsafe fn copy_object_row(
+    pages: &[u64],
+    size: u64,
+    pitch: u32,
+    row: u32,
+    dst: *mut u8,
+    len: usize,
+) -> usize {
+    let start = u64::from(row) * u64::from(pitch);
+    let len = len.min(size.saturating_sub(start) as usize);
+    let mut done = 0;
+    while done < len {
+        let at = start + done as u64;
+        let n = (4096 - (at % 4096) as usize).min(len - done);
+        let src =
+            narf_memory::PhysAddr::new(pages[(at / 4096) as usize] + at % 4096).kernel_ptr::<u8>();
+        // SAFETY: `src..src + n` lies in one of the object's pages; `dst`
+        // has `len` bytes (caller contract).
+        unsafe { core::ptr::copy_nonoverlapping(src, dst.add(done), n) };
+        done += n;
+    }
+    len
+}
+#[cfg(not(feature = "intel"))]
+fn present_intel_frame(frame: &IntelFrame) -> Result<(), FsError> {
+    match frame.0 {}
+}
+
 /// Whether CREATE_DUMB on DRM card `card_index` makes an amdgpu GEM buffer
 /// in VRAM (`amdgpu_mode_dumb_create`): the native Navi48 card, once its
 /// client VRAM heap is up. Other cards, and the Navi48 card without a heap
@@ -8108,8 +8320,13 @@ pub async fn amdgpu_create_dumb_async(
     Some(finish_amdgpu_dumb(arg, req, made))
 }
 
+#[cfg(feature = "intel")]
+#[path = "intel_gpu_kms_ioctl.rs"]
+mod intel_kms;
 #[path = "amdgpu_scanout_kms.rs"]
 mod scanout_kms;
+#[cfg(feature = "intel")]
+pub(crate) use intel_kms::dispatch as intel_kms_async;
 #[cfg(feature = "amdgpu")]
 pub(crate) use scanout_kms::dispatch as amdgpu_kms_async;
 

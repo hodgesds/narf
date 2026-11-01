@@ -969,6 +969,44 @@ impl IntelGpu {
 
 static CONTROLLER: IrqSafeSpinLock<Option<IntelGpu>> = IrqSafeSpinLock::new(None);
 
+// KMS owns the display while its primary plane names a GEM surface. The
+// console's own allocation is retained throughout, never republished as GEM.
+static KMS_CONSOLE_PAUSED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static KMS_SAVED_CONSOLE: IrqSafeSpinLock<Option<narf_graphics::FbConsole>> =
+    IrqSafeSpinLock::new(None);
+
+/// Also checked inside the framebuffer view epoch: an old cached writer
+/// cannot pass its admission check before pause and capture pixels after it.
+pub fn kms_console_paused() -> bool {
+    KMS_CONSOLE_PAUSED.load(Ordering::Acquire)
+}
+
+/// Caller holds the KMS display session, outside CONTROLLER. Pause new
+/// kernel framebuffer access, drain the synchronous log writer, then wait
+/// for every earlier cursor/status/draw view (including its WC fence).
+/// Cancellation leaves the console paused until verified console restoration.
+pub(crate) async fn kms_pause_console() {
+    crate::scanout_access::replace(|| {
+        if !KMS_CONSOLE_PAUSED.swap(true, Ordering::AcqRel) {
+            *KMS_SAVED_CONSOLE.lock() = narf_graphics::console::GLOBAL_FB_CONSOLE.lock().take();
+        }
+    });
+    crate::scanout_access::wait_retired().await;
+}
+
+/// Caller holds the KMS display session and has proved the original owned
+/// console surface latched (or that GEM fetch never started). Failed stop
+/// paths deliberately retain the paused state and saved console.
+pub(crate) fn kms_resume_console() {
+    crate::scanout_access::replace(|| {
+        if KMS_CONSOLE_PAUSED.load(Ordering::Acquire) {
+            *narf_graphics::console::GLOBAL_FB_CONSOLE.lock() = KMS_SAVED_CONSOLE.lock().take();
+            KMS_CONSOLE_PAUSED.store(false, Ordering::Release);
+        }
+    });
+}
+
 fn log_probe(msg: &str, device: &BusDevice) {
     use core::fmt::Write as _;
     let _ = writeln!(
@@ -1232,6 +1270,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     }
 
     let scanout_mode = dev.current_mode();
+    let kms_console = scanout_mode.clone();
+    let kms_generation = dev.chip.generation;
     // Power management (Q9, #1015) covers the Gen12 register
     // map only. Xe-LPG now has a region map and a display
     // engine (#1016); its separate GT owner handles system PM below.
@@ -1308,6 +1348,9 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         }
         None => crate::drm_registry::register_drm_card(intel_card),
     };
+    if let Some(console) = kms_console {
+        crate::intel_gpu_kms::install(card_index, kms_generation, gt_bar, device, cap, console);
+    }
     // A retained firmware scanout has not granted us its GGTT reservation.
     // Start automatically only after this driver owns the integrated scanout.
     if owns_scanout {
@@ -1351,6 +1394,27 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 /// controller's scanout state and the fb-console publication
 /// follow the new surface. Returns the new active scanout.
 pub fn relight_display(mode: &crate::intel_gpu_modeset::Mode) -> Option<ActiveScanout> {
+    let display =
+        with_controller(|gpu| crate::intel_gpu_kms::display_for_bar(&gpu.gtt_mmadr)).flatten();
+    let mut ownership = match display.as_ref() {
+        Some(display) => Some(display.legacy().ok()?),
+        None => None,
+    };
+    if let Some(guard) = ownership.as_mut() {
+        guard.suspend();
+    }
+    let console = relight_display_locked(mode)?;
+    if let Some(guard) = ownership.as_mut() {
+        guard.console_replaced(&console);
+    }
+    Some(console)
+}
+
+/// The caller already holds the display's LegacyGuard. Used by the PM core
+/// so its outer power-transition exclusion is retained through publication.
+pub(crate) fn relight_display_locked(
+    mode: &crate::intel_gpu_modeset::Mode,
+) -> Option<ActiveScanout> {
     use crate::intel_gpu_aux::MmioWindow;
     use narf_bus::bar::MmioRegion;
 
@@ -1373,25 +1437,29 @@ pub fn relight_display(mode: &crate::intel_gpu_modeset::Mode) -> Option<ActiveSc
         }
     }
 
-    let mut guard = CONTROLLER.lock();
-    let dev = guard.as_mut()?;
-    if !dev.chip.generation.display_supported() {
+    let display = with_display_info(|display| *display)?;
+    if !display.chip.generation.display_supported() {
         return None;
     }
     let width = u32::from(mode.h_active);
     let height = u32::from(mode.v_active);
     let stride_bytes = padded_stride_bytes(width);
     let size_bytes = scanout_size_bytes(width, height);
-    let alloc = crate::intel_gpu_gtt::alloc_contiguous_scanout(&dev.gtt_mmadr, size_bytes).ok()?;
+    let alloc =
+        crate::intel_gpu_gtt::alloc_contiguous_scanout(&display.gtt_mmadr, size_bytes).ok()?;
     let fb = crate::intel_gpu_modeset::Framebuffer {
         phys_addr: u64::from(alloc.gtt_offset),
         stride_bytes,
         format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
     };
-    let window = BarWindow(&dev.gtt_mmadr);
-    let applied =
-        crate::intel_gpu_modeset::modeset_display(&window, dev.chip.generation, &fb, Some(mode))
-            .ok()?;
+    let window = BarWindow(&display.gtt_mmadr);
+    let applied = crate::intel_gpu_modeset::modeset_display(
+        &window,
+        display.chip.generation,
+        &fb,
+        Some(mode),
+    )
+    .ok()?;
     let scanout = ActiveScanout {
         width: u32::from(applied.h_active),
         height: u32::from(applied.v_active),
@@ -1399,6 +1467,11 @@ pub fn relight_display(mode: &crate::intel_gpu_modeset::Mode) -> Option<ActiveSc
         gtt_offset: alloc.gtt_offset,
         phys_base: alloc.phys_base(),
     };
+    let mut guard = CONTROLLER.lock();
+    let dev = guard.as_mut()?;
+    if dev.gtt_mmadr.phys != display.gtt_mmadr.phys {
+        return None;
+    }
     dev.scanout = Some(ScanoutAllocation {
         gtt_offset: alloc.gtt_offset,
         phys_base: alloc.phys_base(),
@@ -1519,6 +1592,25 @@ pub fn with_controller<R>(f: impl FnOnce(&IntelGpu) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
 }
 
+/// Permanent probe-mapped display identity. Slow AUX/modeset operations use
+/// this snapshot under a LegacyGuard rather than retaining CONTROLLER while
+/// responsive waits run framebuffer pumps which also query the controller.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct DisplayInfo {
+    pub gtt_mmadr: MmioRegion,
+    pub chip: ChipInfo,
+    pub gmd_id: u32,
+}
+
+pub(crate) fn with_display_info<R>(f: impl FnOnce(&DisplayInfo) -> R) -> Option<R> {
+    let display = CONTROLLER.lock().as_ref().map(|gpu| DisplayInfo {
+        gtt_mmadr: gpu.gtt_mmadr,
+        chip: gpu.chip,
+        gmd_id: gpu.gmd_id,
+    })?;
+    Some(f(&display))
+}
+
 // ── External DisplayPort session (lane Q4, #1092) ──────────────
 //
 // The HPD-driven external-DP path: `intel_gpu_dp` owns the
@@ -1583,13 +1675,30 @@ static HDMI_SESSION: IrqSafeSpinLock<Option<HdmiSessionState>> = IrqSafeSpinLock
 /// boot is picked up there); a future periodic-polled caller
 /// can invoke it the same way.
 pub fn poll_dp_hpd_events() {
+    let display =
+        with_controller(|gpu| crate::intel_gpu_kms::display_for_bar(&gpu.gtt_mmadr)).flatten();
+    let mut ownership = match display.as_ref() {
+        Some(display) => match display.legacy() {
+            Ok(guard) => Some(guard),
+            Err(_) => return,
+        },
+        None => None,
+    };
     loop {
-        let event = with_controller(|gpu| {
+        let event = with_display_info(|gpu| {
             let window = DpBarWindow(&gpu.gtt_mmadr);
             poll_external_hpd(&window, gpu.chip.generation)
         });
         match event {
-            Some(Some(event)) => handle_dp_hpd_event(event),
+            Some(Some(event)) => {
+                if let Some(guard) = ownership.as_mut() {
+                    // External programming may change pipe ownership or
+                    // shared watermarks. Re-admit fixed internal flips only
+                    // after an explicit owned-console re-establishment.
+                    guard.suspend();
+                }
+                handle_dp_hpd_event(event);
+            }
             _ => return,
         }
     }
@@ -1691,7 +1800,7 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
             let session = DP_SESSION.lock().take();
             if let Some(state) = session {
                 if state.conn.ddi == ddi {
-                    with_controller(|gpu| {
+                    with_display_info(|gpu| {
                         let window = DpBarWindow(&gpu.gtt_mmadr);
                         crate::intel_gpu_dp::disconnect(&window, &state.conn);
                         // Hand the pipe back and re-split the
@@ -1707,7 +1816,7 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
             let session = HDMI_SESSION.lock().take();
             if let Some(state) = session {
                 if state.conn.ddi == ddi {
-                    with_controller(|gpu| {
+                    with_display_info(|gpu| {
                         let window = DpBarWindow(&gpu.gtt_mmadr);
                         crate::intel_gpu_hdmi::disconnect(&window, &state.conn);
                     });
@@ -1738,7 +1847,7 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
                     .map(|state| (state.conn.clone(), state.fb))
             };
             if let Some((conn, fb)) = current {
-                let updated = with_controller(|gpu| {
+                let updated = with_display_info(|gpu| {
                     let window = DpBarWindow(&gpu.gtt_mmadr);
                     let out = crate::intel_gpu_dp::retrain(&window, &conn, &fb).ok();
                     if out.is_some() {
@@ -1769,7 +1878,7 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
 /// retrain handling. The claim is re-entrant per DDI, so a
 /// repeat connect event for a live session reuses its pipe.
 fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpConnection> {
-    with_controller(|gpu| {
+    with_display_info(|gpu| {
         if !gpu.chip.generation.external_display_supported() {
             return None;
         }
@@ -1841,7 +1950,7 @@ fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpC
 /// The HPD handler tries this only after the DP probe did
 /// not answer — an HDMI sink never answers AUX.
 fn hdmi_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_hdmi::HdmiConnection> {
-    with_controller(|gpu| {
+    with_display_info(|gpu| {
         if !gpu.chip.generation.external_display_supported() {
             return None;
         }
@@ -1914,7 +2023,7 @@ fn mst_session_ddi() -> Option<crate::intel_gpu_ddi::Ddi> {
 /// falls back to the SST connect.
 fn mst_connect(ddi: crate::intel_gpu_ddi::Ddi) -> bool {
     use crate::dp_aux::AuxChannel as _;
-    let state = with_controller(|gpu| {
+    let state = with_display_info(|gpu| {
         if !gpu.chip.generation.external_display_supported() {
             return None;
         }
@@ -2041,7 +2150,7 @@ fn mst_disconnect(ddi: crate::intel_gpu_ddi::Ddi) {
         state.link.streams().iter().map(|s| s.pipe).collect();
     let sinks: alloc::vec::Vec<crate::dp_mst_mgr::Sink> =
         state.streams.iter().map(|g| g.sink).collect();
-    with_controller(|gpu| {
+    with_display_info(|gpu| {
         let window = DpBarWindow(&gpu.gtt_mmadr);
         let mut maux = crate::intel_gpu_mst::IntelMstAux::new(&window, ddi);
         for sink in sinks.iter().rev() {
@@ -2069,7 +2178,7 @@ fn mst_poll_notifications(ddi: crate::intel_gpu_ddi::Ddi) {
         }
     };
     let Some(mut state) = state else { return };
-    with_controller(|gpu| {
+    with_display_info(|gpu| {
         let window = DpBarWindow(&gpu.gtt_mmadr);
         let mut maux = crate::intel_gpu_mst::IntelMstAux::new(&window, ddi);
         if let Ok(events) = state.link.poll_notifications(&mut maux) {
@@ -2096,6 +2205,62 @@ fn mst_poll_notifications(ddi: crate::intel_gpu_ddi::Ddi) {
 pub mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// Cross-crate native fixture hook: exercises the real CPU-view gate,
+    /// without constructing a PCI display or pretending any GEM DMA retired.
+    pub async fn kms_pause_console_for_test() {
+        super::kms_pause_console().await;
+    }
+
+    /// The calling fixture owns its synthetic CPU scanout and proves it
+    /// never armed GEM fetch before reopening the real writer gate.
+    pub fn kms_resume_console_for_test() {
+        super::kms_resume_console();
+    }
+
+    fn smoke_kms_console_pause_drains_views_and_survives_cancel() -> TestResult {
+        use core::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        if kms_console_paused() {
+            return TestResult::Skip("a production KMS session owns the console");
+        }
+        let installed = narf_graphics::console::GLOBAL_FB_CONSOLE.lock().is_some();
+        // SAFETY: only a scalar is captured; no mapping access escapes.
+        let old = unsafe { crate::scanout_access::snapshot(|| 7) };
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let mut pause = core::pin::pin!(kms_pause_console());
+            assert_eq!(pause.as_mut().poll(&mut cx), Poll::Pending);
+            assert!(kms_console_paused());
+            assert!(narf_graphics::console::GLOBAL_FB_CONSOLE.lock().is_none());
+        }
+        // Cancellation does not reopen writers while a previous CPU view
+        // can still write. A later waiter must observe that same old view.
+        assert!(kms_console_paused());
+        let mut pause = core::pin::pin!(kms_pause_console());
+        assert_eq!(pause.as_mut().poll(&mut cx), Poll::Pending);
+        // A post-pause view sees the gate under the same epoch lock and
+        // must not delay retirement of the prior display's writers.
+        // SAFETY: only the admission boolean is captured, with no raw mapping.
+        let current = unsafe { crate::scanout_access::snapshot(kms_console_paused) };
+        assert!(*current);
+        drop(old);
+        assert_eq!(pause.as_mut().poll(&mut cx), Poll::Ready(()));
+        drop(current);
+        kms_resume_console();
+        assert!(!kms_console_paused());
+        assert_eq!(
+            narf_graphics::console::GLOBAL_FB_CONSOLE.lock().is_some(),
+            installed
+        );
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_kms",
+        smoke_kms_console_pause_drains_views_and_survives_cancel
+    );
 
     /// Census: the canonical table must contain exactly the DID
     /// set transcribed from spec §5 / pci.ids v2.2, every row

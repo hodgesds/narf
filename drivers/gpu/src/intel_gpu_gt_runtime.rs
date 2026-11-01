@@ -13,8 +13,12 @@ use crate::{
     intel_gpu_guc_gt::{GtError, GtState, GuCGt},
     intel_gpu_rcs::{GgttArena, SharedArena},
 };
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use alloc::{
+    boxed::Box,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Read, Write};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
@@ -40,19 +44,32 @@ enum Phase {
     Reloading,
     Ct,
     Probe,
+    Defaults,
+    PpgttProbe,
     Running,
+    /// Runtime-suspended after a verified idle stop; D3hot is owned by the
+    /// PCI runtime-PM layer. Resume restarts from Cold under the same epoch.
+    Parked,
     Stopped,
     Failed,
     Cleaning,
 }
 
 struct State {
+    irq: Option<crate::intel_gpu_gt_irq::GtIrq>,
+    irq_tried: bool,
     gt: Option<ProductionGt>,
     firmware: Option<GuCFirmware>,
     probe: Option<Arc<CompletionFence>>,
+    probe_result: Option<crate::intel_gpu_exec::PpgttProbeResult>,
     phase: Phase,
     saved: Option<narf_bus::pci::SavedPciConfig>,
     power_ready: u64,
+    recover_after_stop: bool,
+    /// User epoch to continue after a runtime resume (clean idle stop only).
+    parked_epoch: Option<u64>,
+    /// The SLPC outcome of this GT incarnation has been logged.
+    slpc_reported: bool,
 }
 
 struct Pending {
@@ -66,20 +83,204 @@ struct Pending {
 
 struct Owner {
     pending: Pending,
-    _pm: narf_power::runtime_pm_pci::PciRuntimeNode,
+    pm: narf_power::runtime_pm_pci::PciRuntimeNode,
+    /// Autosuspend has been configured and runtime PM allowed.
+    autosuspend: AtomicBool,
     state: Mutex<State>,
     suspended: AtomicBool,
+    user_epoch: Arc<AtomicU64>,
+    user_version: Arc<AtomicU32>,
+    user_engines: Arc<core::sync::atomic::AtomicU8>,
+    user_facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
 }
 
-// Deliberately no autosuspend yet. The probe reference and forbid reference
-// keep this PCI function and its upstream bridge in D0 for the GT lifetime.
-struct PinnedPower;
-impl RuntimePmOps for PinnedPower {
+#[derive(Debug)]
+struct Backend {
+    owner: Weak<Owner>,
+    epoch: Arc<AtomicU64>,
+    version: Arc<AtomicU32>,
+    engines: Arc<core::sync::atomic::AtomicU8>,
+    platform: GtPlatform,
+    facts: Arc<IrqSafeSpinLock<Option<crate::intel_gpu_user::DeviceFacts>>>,
+}
+
+impl crate::intel_gpu_user::UserBackend for Backend {
+    fn native_xe(&self) -> bool {
+        true
+    }
+    fn device_facts(&self) -> Option<crate::intel_gpu_user::DeviceFacts> {
+        *self.facts.lock()
+    }
+    fn engine_cycles(
+        &self,
+        engine: crate::intel_gpu_engine::Engine,
+        clock: i32,
+    ) -> narf_filesystem::FsFuture<'_, crate::intel_gpu_timestamp::EngineCycles> {
+        Box::pin(async move {
+            let owner = self
+                .owner
+                .upgrade()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let _awake = Awake::take(&owner).await?;
+            let mut state = owner.lock_running().await;
+            if state.phase != Phase::Running || owner.suspended.load(Ordering::Acquire) {
+                return Err(narf_filesystem::FsError::NoDevice);
+            }
+            let gt = state
+                .gt
+                .as_mut()
+                .ok_or(narf_filesystem::FsError::NoDevice)?;
+            let result = gt.engine_cycles(engine, clock);
+            if gt.state() == GtState::Lost {
+                owner.user_epoch.store(0, Ordering::Release);
+            }
+            result.map_err(|error| match error {
+                GtError::Busy => narf_filesystem::FsError::WouldBlock,
+                GtError::State => narf_filesystem::FsError::NoDevice,
+                _ => crate::intel_gpu_user::io_error(),
+            })
+        })
+    }
+    fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let version = self.version.load(Ordering::Relaxed);
+        (epoch != 0).then_some(crate::intel_gpu_user::UserStatus {
+            epoch,
+            platform: self.platform,
+            submission_version: ((version >> 16) as u8, (version >> 8) as u8, version as u8),
+            engines: crate::intel_gpu_engine::EngineSet::from_bits(
+                self.engines.load(Ordering::Acquire),
+            ),
+        })
+    }
+    fn submit<'a>(
+        &'a self,
+        context: Arc<crate::intel_gpu_user::UserContext>,
+        batch: crate::intel_gpu_user::UserBatch,
+    ) -> narf_filesystem::FsFuture<'a, Arc<CompletionFence>> {
+        Box::pin(async move {
+            self.submit_request(context, batch, None)
+                .await
+                .map_err(|error| match error {
+                    crate::intel_gpu_user::OutputError::Io(error) => error,
+                    crate::intel_gpu_user::OutputError::Install(_) => {
+                        crate::intel_gpu_user::io_error()
+                    }
+                })
+        })
+    }
+
+    fn submit_with_output<'a>(
+        &'a self,
+        context: Arc<crate::intel_gpu_user::UserContext>,
+        batch: crate::intel_gpu_user::UserBatch,
+        output: crate::intel_gpu_user::UserOutput<'a>,
+    ) -> crate::intel_gpu_user::OutputFuture<'a> {
+        Box::pin(async move { self.submit_request(context, batch, Some(&output)).await })
+    }
+}
+
+impl Backend {
+    async fn submit_request(
+        &self,
+        context: Arc<crate::intel_gpu_user::UserContext>,
+        batch: crate::intel_gpu_user::UserBatch,
+        output: Option<&crate::intel_gpu_user::UserOutput<'_>>,
+    ) -> Result<Arc<CompletionFence>, crate::intel_gpu_user::OutputError> {
+        use crate::intel_gpu_user::OutputError;
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or(narf_filesystem::FsError::NoDevice)?;
+        let awake = Awake::take(&owner).await?;
+        let mut state = owner.lock_running().await;
+        if state.phase != Phase::Running || owner.suspended.load(Ordering::Acquire) {
+            return Err(narf_filesystem::FsError::NoDevice.into());
+        }
+        let gt = state
+            .gt
+            .as_mut()
+            .ok_or(narf_filesystem::FsError::NoDevice)?;
+        let epoch = gt.user_epoch().ok_or(narf_filesystem::FsError::NoDevice)?;
+        context.check_epoch(epoch)?;
+        let result = match output {
+            Some(output) => {
+                gt.submit_user_batch_with_output(narf_time::monotonic_ns(), context, batch, output)
+            }
+            None => gt.submit_user_batch(narf_time::monotonic_ns(), context, batch),
+        };
+        if gt.state() == GtState::Lost {
+            owner.user_epoch.store(0, Ordering::Release);
+        }
+        if let Ok((_, fence)) = &result {
+            awake.until(fence.clone());
+        }
+        result.map(|(_, fence)| fence).map_err(|error| match error {
+            GtError::Scheduling(crate::intel_gpu_guc_sched::SchedulingError::Residency(error)) => {
+                OutputError::Io(error)
+            }
+            GtError::Scheduling(crate::intel_gpu_guc_sched::SchedulingError::Output(error)) => {
+                OutputError::Install(error)
+            }
+            GtError::Scheduling(
+                crate::intel_gpu_guc_sched::SchedulingError::Busy
+                | crate::intel_gpu_guc_sched::SchedulingError::Full,
+            ) => OutputError::Io(narf_filesystem::FsError::WouldBlock),
+            _ => OutputError::Io(crate::intel_gpu_user::io_error()),
+        })
+    }
+}
+
+/// Runtime-PM callbacks, bound to the owner once it exists. Until then (and
+/// after the owner is gone) suspension is refused and resume is a no-op.
+struct PmOps(IrqSafeSpinLock<Weak<Owner>>);
+impl RuntimePmOps for PmOps {
     fn runtime_suspend(&self) -> RpmFuture<'_> {
-        Box::pin(async { Err(RpmError::Busy) })
+        let owner = self.0.lock().upgrade();
+        Box::pin(async move {
+            match owner {
+                Some(owner) => owner.park().await,
+                None => Err(RpmError::Busy),
+            }
+        })
     }
     fn runtime_resume(&self) -> RpmFuture<'_> {
-        Box::pin(async { Ok(()) })
+        let owner = self.0.lock().upgrade();
+        Box::pin(async move {
+            if let Some(owner) = owner {
+                owner.unpark().await;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Linux xe's default autosuspend delay.
+const AUTOSUSPEND_MS: i32 = 1000;
+
+/// A runtime-PM usage reference: the function stays in D0 until it drops.
+struct Awake(Arc<narf_power::runtime_pm::RuntimePmDevice>);
+impl Awake {
+    async fn take(owner: &Owner) -> Result<Self, narf_filesystem::FsError> {
+        let device = owner.pm.device.clone();
+        if device.resume_and_get().await.is_err() {
+            let _ = device.put_autosuspend();
+            return Err(narf_filesystem::FsError::NoDevice);
+        }
+        Ok(Self(device))
+    }
+    /// Release when `fence` reaches a terminal state, not at ioctl return.
+    fn until(self, fence: Arc<CompletionFence>) {
+        narf_scheduler::spawn(async move {
+            let _ = fence.wait().await;
+            drop(self);
+        });
+    }
+}
+impl Drop for Awake {
+    fn drop(&mut self) {
+        self.0.mark_last_busy();
+        let _ = self.0.put_autosuspend();
     }
 }
 
@@ -116,11 +317,14 @@ pub(crate) fn start_pending() {
     let pending = core::mem::take(&mut *PENDING.lock());
     for p in pending {
         let name = alloc::format!("intel-gt-{}", p.index);
+        let ops = Arc::new(PmOps(IrqSafeSpinLock::new(Weak::new())));
+        // The probe and forbid references keep the function in D0 until a
+        // running, eligible GT explicitly allows autosuspend.
         let pm = match narf_power::runtime_pm_pci::register_pci_device(
             &name,
             p.cap,
             p.device,
-            Arc::new(PinnedPower),
+            ops.clone(),
             None,
             Arc::new(SchedulerEnv),
         ) {
@@ -132,17 +336,48 @@ pub(crate) fn start_pending() {
         };
         let owner = Arc::new(Owner {
             pending: p,
-            _pm: pm,
+            pm,
+            autosuspend: AtomicBool::new(false),
             state: Mutex::new(State {
+                irq: None,
+                irq_tried: false,
                 gt: None,
                 firmware: None,
                 probe: None,
+                probe_result: None,
                 phase: Phase::Cold,
                 saved: None,
                 power_ready: 0,
+                recover_after_stop: false,
+                parked_epoch: None,
+                slpc_reported: false,
             }),
             suspended: AtomicBool::new(false),
+            user_epoch: Arc::new(AtomicU64::new(0)),
+            user_version: Arc::new(AtomicU32::new(0)),
+            user_engines: Arc::new(core::sync::atomic::AtomicU8::new(0)),
+            user_facts: Arc::new(IrqSafeSpinLock::new(None)),
         });
+        *ops.0.lock() = Arc::downgrade(&owner);
+        let backend = Arc::new(Backend {
+            owner: Arc::downgrade(&owner),
+            epoch: owner.user_epoch.clone(),
+            version: owner.user_version.clone(),
+            engines: owner.user_engines.clone(),
+            platform: GtPlatform::from_pci(
+                owner.pending.device.id.vendor,
+                owner.pending.device.id.device,
+            )
+            .expect("admitted platform"),
+            facts: owner.user_facts.clone(),
+        });
+        if owner.pending.card.install_user_backend(backend).is_err() {
+            log(
+                owner.pending.index,
+                "duplicate userspace backend; GT not started",
+            );
+            continue;
+        }
         OWNERS.lock().push(owner.clone());
         narf_power::device_pm::register_device_pm_ops(&name, owner.clone());
         narf_power::system_pm::register_async_system_pm(&name, owner.clone());
@@ -229,6 +464,9 @@ fn pci_identity(
 
 impl Owner {
     fn cold_start(&self, state: &mut State) -> Result<(), RuntimeError> {
+        state.irq.take();
+        state.irq_tried = false;
+        state.recover_after_stop = false;
         if state
             .gt
             .as_ref()
@@ -307,7 +545,7 @@ impl Owner {
             }
             return self.cold_start(state);
         }
-        if matches!(state.phase, Phase::Failed | Phase::Stopped) {
+        if matches!(state.phase, Phase::Failed | Phase::Stopped | Phase::Parked) {
             return Ok(());
         }
         let now = narf_time::monotonic_ns();
@@ -326,6 +564,10 @@ impl Owner {
                     Ok(()) | Err(GtError::Busy) => {}
                     Err(e) => return Err(RuntimeError::Gt(e)),
                 }
+                self.pending
+                    .card
+                    .publish_gt_topology(gt)
+                    .map_err(RuntimeError::Gt)?;
                 gt.begin_scheduling(now).map_err(RuntimeError::Gt)?;
                 state.phase = Phase::Reloading;
             }
@@ -334,6 +576,14 @@ impl Owner {
                 state.phase = Phase::Ct;
             }
             (Phase::Ct, GtState::SchedulingReady) => {
+                // Optional GuC frequency/RC6 management, as xe_guc_pc_start.
+                state.slpc_reported = gt.begin_slpc(now).is_err();
+                if state.slpc_reported {
+                    log(
+                        self.pending.index,
+                        "GuC SLPC not started; retaining current GT frequency policy",
+                    );
+                }
                 let (_, completion) = gt.submit_kernel_probe(now).map_err(RuntimeError::Gt)?;
                 state.probe = Some(completion);
                 state.phase = Phase::Probe;
@@ -341,16 +591,82 @@ impl Owner {
             (Phase::Probe, GtState::SchedulingReady) => {
                 if let Some(result) = state.probe.as_ref().expect("owned probe").result() {
                     result.map_err(|_| RuntimeError::State)?;
+                    state.probe = Some(gt.begin_context_defaults(now).map_err(RuntimeError::Gt)?);
+                    state.phase = Phase::Defaults;
+                }
+            }
+            (Phase::Defaults, GtState::SchedulingReady) => {
+                if let Some(result) = state.probe.as_ref().expect("owned defaults fence").result() {
+                    result.map_err(|_| RuntimeError::State)?;
+                    if !gt.context_defaults_ready() {
+                        return Err(RuntimeError::State);
+                    }
+                    let probe = gt.submit_ppgtt_probe(now).map_err(RuntimeError::Gt)?;
+                    state.probe = Some(probe.completion);
+                    state.probe_result = Some(probe.result);
+                    state.phase = Phase::PpgttProbe;
+                }
+            }
+            (Phase::PpgttProbe, GtState::SchedulingReady) => {
+                if let Some(result) = state.probe.as_ref().expect("owned PPGTT probe").result() {
+                    result.map_err(|_| RuntimeError::State)?;
+                    state
+                        .probe_result
+                        .as_ref()
+                        .expect("owned result")
+                        .verify()
+                        .map_err(|_| RuntimeError::State)?;
+                    state.probe_result = None;
+                    *self.user_facts.lock() = Some(gt.device_facts().map_err(RuntimeError::Gt)?);
+                    // Before the epoch: discovery sees VRAM with the engines.
+                    self.pending.card.publish_gt_vram(gt);
                     state.phase = Phase::Running;
+                    let (major, minor, patch) = gt.submission_version();
+                    self.user_version.store(
+                        u32::from(major) << 16 | u32::from(minor) << 8 | u32::from(patch),
+                        Ordering::Relaxed,
+                    );
+                    self.user_engines.store(
+                        gt.engines().ok_or(RuntimeError::State)?.bits(),
+                        Ordering::Release,
+                    );
+                    if let Some(epoch) = state.parked_epoch.take() {
+                        gt.adopt_user_epoch(epoch).map_err(RuntimeError::Gt)?;
+                    }
+                    self.user_epoch.store(
+                        gt.user_epoch().ok_or(RuntimeError::State)?,
+                        Ordering::Release,
+                    );
                     log(
                         self.pending.index,
-                        "GuC ready; kernel context execution and deregistration verified",
+                        "GuC ready; default RCS/BCS state, private PPGTT store and retirement verified",
                     );
                 }
             }
-            (Phase::Running, GtState::SchedulingReady) => {}
+            (Phase::Running, GtState::SchedulingReady) => {
+                use crate::intel_gpu_guc_sched::SlpcState;
+                match gt.slpc() {
+                    SlpcState::Running if !state.slpc_reported => {
+                        state.slpc_reported = true;
+                        log(self.pending.index, "GuC SLPC running; GuC controls RC6");
+                    }
+                    SlpcState::Unavailable if !state.slpc_reported => {
+                        state.slpc_reported = true;
+                        log(
+                            self.pending.index,
+                            "GuC SLPC controls unavailable; retaining current firmware policy",
+                        );
+                    }
+                    _ => {}
+                }
+            }
             (Phase::Cleaning, GtState::Stopped) => {
-                state.phase = Phase::Failed;
+                state.phase = if state.recover_after_stop {
+                    state.recover_after_stop = false;
+                    Phase::Cold
+                } else {
+                    Phase::Failed
+                };
             }
             _ => return Err(RuntimeError::State),
         }
@@ -359,9 +675,37 @@ impl Owner {
 
     async fn run(self: Arc<Self>) {
         loop {
+            let mut wait = None;
+            let mut delay_us = 500;
             if !self.suspended.load(Ordering::Acquire) {
                 let mut state = self.state.lock().await;
+                // Snapshot the IRQ epoch before servicing any status. The
+                // waiter observes an edge even before its first poll.
+                if let Some(irq) = &state.irq {
+                    wait = Some(narf_interrupts::wait_for_irq(irq.vector()));
+                    match irq.service(narf_time::monotonic_ns()) {
+                        Ok(pending) => delay_us = if pending { 10 } else { 10_000 },
+                        Err(_) => {
+                            drop(wait.take());
+                            state.irq.take();
+                            log(
+                                self.pending.index,
+                                "IRQ delivery closed; using timer completion",
+                            );
+                        }
+                    }
+                }
                 if let Err(error) = self.step(&mut state) {
+                    drop(wait.take());
+                    state.irq.take(); // stop delivery before resetting the GT
+                    delay_us = 500;
+                    self.user_epoch.store(0, Ordering::Release);
+                    // A display waiter can depend on one of our fences.
+                    // Poison its proofs synchronously before reset; never
+                    // await the KMS mutex while holding this GT reset mutex.
+                    crate::intel_gpu_kms::quarantine_for_gt_reset(&self.pending.bar);
+                    state.parked_epoch = None; // a failed resume is a real loss
+                    state.recover_after_stop |= state.phase == Phase::Running;
                     use core::fmt::Write as _;
                     let _ = writeln!(
                         narf_console::Writer,
@@ -380,9 +724,143 @@ impl Owner {
                         }
                     }
                 }
+                if state.phase == Phase::Running && !state.irq_tried {
+                    state.irq_tried = true;
+                    let compute = state
+                        .gt
+                        .as_ref()
+                        .and_then(GuCGt::engines)
+                        .is_some_and(|set| set.contains(crate::intel_gpu_engine::Engine::Ccs0));
+                    state.irq = crate::intel_gpu_gt_irq::GtIrq::for_device(
+                        AuthorizedWindow::new(self.pending.bar, self.pending.cap),
+                        self.pending.cap,
+                        self.pending.device,
+                        compute,
+                    )
+                    .ok();
+                    if state.irq.is_some() {
+                        log(self.pending.index, "MSI completion delivery installed");
+                        delay_us = 10; // first drain before opening tile master
+                    } else {
+                        log(
+                            self.pending.index,
+                            "MSI unavailable; using timer completion",
+                        );
+                    }
+                }
             }
+            self.arm_autosuspend().await;
             narf_scheduler::yield_now().await;
-            narf_time::SleepUntil::new(narf_time::Deadline::after_us(500).as_instant()).await;
+            let deadline = narf_time::Deadline::after_us(delay_us);
+            if let Some(wait) = wait {
+                let _ = narf_time::timeout(deadline, wait).await;
+            } else {
+                narf_time::SleepUntil::new(deadline.as_instant()).await;
+            }
+        }
+    }
+}
+
+impl Owner {
+    /// Discrete functions without a bound display may autosuspend. An iGPU
+    /// scanout keeps its function in D0, as Linux's display wakeref does.
+    fn autosuspend_eligible(&self) -> bool {
+        let platform =
+            GtPlatform::from_pci(self.pending.device.id.vendor, self.pending.device.id.device);
+        platform.is_some_and(GtPlatform::is_discrete) && self.pending.mode.is_none()
+    }
+
+    /// Once the first bring-up publishes users: configure autosuspend, allow
+    /// runtime PM and drop the probe reference. Never holds the state lock,
+    /// because allowing may immediately invoke `park`.
+    async fn arm_autosuspend(&self) {
+        if self.autosuspend.load(Ordering::Acquire)
+            || !self.autosuspend_eligible()
+            || self.user_epoch.load(Ordering::Acquire) == 0
+        {
+            return;
+        }
+        self.autosuspend.store(true, Ordering::Release);
+        let device = &self.pm.device;
+        device.set_autosuspend_delay(AUTOSUSPEND_MS).await;
+        device.use_autosuspend(true).await;
+        device.mark_last_busy();
+        device.allow();
+        let _ = device.put_autosuspend();
+    }
+
+    /// Runtime suspend: refuse unless the GT is running and provably idle,
+    /// no VRAM object exists (CPU BAR mappings cannot be revoked) and no
+    /// system sleep owns the function. Then stop the GT exactly as for
+    /// reset, keeping the user epoch published for the resume.
+    async fn park(&self) -> Result<(), RpmError> {
+        let mut state = self.state.lock().await;
+        if self.suspended.load(Ordering::Acquire)
+            || state.phase != Phase::Running
+            || !self.autosuspend_eligible()
+            || self
+                .pending
+                .card
+                .intel_vram_used()
+                .is_some_and(|used| used != 0)
+        {
+            return Err(RpmError::Busy);
+        }
+        let epoch = self.user_epoch.load(Ordering::Acquire);
+        if epoch == 0 || !state.gt.as_ref().is_some_and(GuCGt::idle) {
+            return Err(RpmError::Busy);
+        }
+        state.irq.take(); // mask and synchronize while still in D0
+        state.irq_tried = false;
+        let gt = state.gt.as_mut().expect("running GT");
+        let stopped = gt.begin_stop(narf_time::monotonic_ns()).is_ok()
+            && gt.wait().await == Ok(GtState::Stopped);
+        if !stopped {
+            // Uncertain hardware: close admission; the worker owns recovery.
+            self.user_epoch.store(0, Ordering::Release);
+            state.phase = Phase::Failed;
+            return Err(RpmError::Failed);
+        }
+        // Verified stopped: reclaim its GGTT owners before D3hot.
+        state.gt.take();
+        state.parked_epoch = Some(epoch);
+        state.phase = Phase::Parked;
+        log(self.pending.index, "runtime suspended (idle)");
+        Ok(())
+    }
+
+    /// Runtime resume: the PCI layer restored D0 and config space; restart
+    /// the verified bring-up, which adopts the parked epoch at publication.
+    async fn unpark(&self) {
+        let mut state = self.state.lock().await;
+        if state.phase == Phase::Parked {
+            state.phase = Phase::Cold;
+            state.probe = None;
+            state.probe_result = None;
+        }
+    }
+
+    /// Whether a non-running GT is resuming under a still-valid epoch, so a
+    /// caller should wait rather than see a lost device.
+    fn resuming(&self, state: &State) -> bool {
+        state.parked_epoch.is_some()
+            && !matches!(
+                state.phase,
+                Phase::Failed | Phase::Cleaning | Phase::Stopped
+            )
+            && !self.suspended.load(Ordering::Acquire)
+    }
+
+    /// The state, once any runtime-resume bring-up has finished or failed.
+    /// The lock is released between polls so the worker can progress.
+    async fn lock_running(&self) -> narf_lib::mutex::MutexGuard<'_, State> {
+        loop {
+            let state = self.state.lock().await;
+            if !self.resuming(&state) {
+                return state;
+            }
+            drop(state);
+            narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
         }
     }
 }
@@ -412,9 +890,19 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
     fn prepare_suspend(&self) -> narf_power::system_pm::SystemPmFuture<'_> {
         Box::pin(async move {
             use narf_power::device_pm::DeviceSuspendError as E;
+            // Retire display GEM fetch before closing the backend or taking
+            // its reset mutex. KMS holds this same display mutex while a
+            // transaction is armed, so suspend cannot overtake its latch.
+            crate::intel_gpu_kms::quiesce_for_legacy(&self.pending.bar)
+                .await
+                .map_err(|_| E::Busy)?;
             self.suspended.store(true, Ordering::Release);
+            self.user_epoch.store(0, Ordering::Release);
             let mut state = self.state.lock().await;
+            state.irq.take(); // mask/synchronize while the function is in D0
             state.saved = None;
+            // System sleep loses context state: no runtime epoch survives it.
+            state.parked_epoch = None;
             let result = async {
                 if let Some(gt) = &mut state.gt {
                     if !matches!(gt.state(), GtState::Staged | GtState::Stopped) {
@@ -479,6 +967,7 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             }
             state.phase = Phase::Cold;
             state.probe = None;
+            state.probe_result = None;
             state.saved = None;
             self.suspended.store(false, Ordering::Release);
             Ok(())
@@ -506,6 +995,30 @@ pub async fn kernel_probe(index: u32) -> Result<Arc<CompletionFence>, RuntimeErr
         .ok_or(RuntimeError::State)?
         .submit_kernel_probe(narf_time::monotonic_ns())
         .map(|(_, completion)| completion)
+        .map_err(RuntimeError::Gt)
+}
+
+/// Queue the fixed private-address-space store probe on this PCI function.
+/// Wait for completion before checking `result.verify()`. Cancelling the
+/// waiter or dropping the result retains the scheduler's complete residency.
+pub async fn kernel_ppgtt_probe(
+    index: u32,
+) -> Result<crate::intel_gpu_exec::PpgttProbeSubmission, RuntimeError> {
+    let owner = OWNERS
+        .lock()
+        .iter()
+        .find(|o| o.pending.index == index)
+        .cloned()
+        .ok_or(RuntimeError::Device)?;
+    let mut state = owner.state.lock().await;
+    if state.phase != Phase::Running || owner.suspended.load(Ordering::Acquire) {
+        return Err(RuntimeError::State);
+    }
+    state
+        .gt
+        .as_mut()
+        .ok_or(RuntimeError::State)?
+        .submit_ppgtt_probe(narf_time::monotonic_ns())
         .map_err(RuntimeError::Gt)
 }
 
@@ -539,6 +1052,10 @@ pub(crate) fn probe_discrete(
     // SAFETY: the PCI probe grants exclusive ownership of this function's BAR0.
     let bar = unsafe { narf_bus::bar::map_bar(&device, 0) }
         .map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    // LMEM BAR: write-combining for the prefetchable window. A failed or
+    // conflicting mapping leaves VRAM unpublished rather than refusing the GT.
+    // SAFETY: the same exclusive probe ownership covers BAR2.
+    let lmem = unsafe { narf_bus::bar::map_bar(&device, 2) }.ok();
     let index = crate::drm_registry::count() as u32;
     let card = Arc::new(IntelGpuCard::new(
         alloc::format!("card{index}"),
@@ -547,6 +1064,10 @@ pub(crate) fn probe_discrete(
         device.id.subsystem_vendor,
         device.id.subsystem_id,
     ));
+    if let Some(lmem) = lmem {
+        // SAFETY: this card's own BAR2, owned exclusively by this probe.
+        unsafe { card.install_lmem_bar(lmem) };
+    }
     let assigned = crate::drm_registry::register_drm_card(card.clone());
     install(assigned, card, device, cap, bar, None);
     narf_drivers::record_bound(narf_drivers::BoundDriver {

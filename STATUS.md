@@ -979,6 +979,138 @@ interfaces and limits.
 
 ## Current work
 
+Intel GPU hangs are now recovered per context. GuC autonomous engine reset is
+enabled; a user job that overruns its 5 s deadline (from GuC's enable ACK) is
+disabled alone, and GuC preempts it or resets the engine under it
+(CONTEXT_RESET_NOTIFICATION). The job retires through the usual
+deregistration and final-TLB proof, its fence fails with `JobError::Hang`,
+and only its context is banned and counted guilty; other contexts keep
+running at the same epoch. Xe EXEC on a banned queue now returns ECANCELED
+(was EIO), after the queue lookup as in `xe_exec_ioctl`. Kernel-job hangs, an
+unanswered disable and engine-reset failure still reset the GT. The Intel
+GuC/user/Xe suites pass on x86_64 (120 + 85) and aarch64 (104).
+
+Intel iGPU write-combining memory is admitted. `narf_memory::pageattr`
+retypes driver-owned RAM pages write-combining in every kernel alias (Linux
+`set_pages_array_wc`: UC- then WC, huge-leaf split, all-CPU TLB and cache-line
+flushes, write-back restore before free; x86_64 only) and a user leaf of a
+retyped page takes the recorded type. Native Xe creates iGPU
+`CPU_CACHING_WC` objects in those pages with WC mmaps, admits SCANOUT (EINVAL
+with WB) and binds MTL's non-coherent PAT1/PAT2 only for WC objects; PAT1 is
+now programmed as Linux's WT entry. Earlier on this branch: i915 BLT rings and
+context engine maps, Xe MAP_USERPTR over snapshot pins (fork copies pinned
+pages for the child), Battlemage visible VRAM, display-less dGPU runtime
+autosuspend, GuC SLPC with firmware RC6, and fuse-derived CCS0 scheduling.
+The memory pageattr suites pass on x86_64 (460) and aarch64 (361), the Intel
+groups pass on x86_64 (148 + 108) and aarch64 (73), and boot-smoke plus both
+btrfs postflights pass. Silicon and Mesa acceptance remain.
+
+The Intel GuC path now schedules BCS0, the copy engine that every admitted
+MTL/Arrow, DG2 and BMG graphics IP carries unfused (Linux `read_copy_fuses`
+applies only to PVC/Xe3+). The scheduler owns per-engine HWS and golden LRCs;
+the reload ADS publishes RCS0/BCS0 mapping, enable masks, golden state sizes
+and register saves. BCS0 uses the source `gen12_xcs`/`xe2_bcs` LRC layouts, the
+simple MI_FLUSH_DW job and breadcrumb, a BLIT_CCTL uncached-MOCS default-state
+RMW primed after RCS0, BMG's ENGINE_BASE workarounds and a verified all-NOPID
+NONPRIV policy. Native Xe publishes RENDER+COPY engines, admits width-1 COPY
+queues with per-engine saved state, samples either engine's RING_TIMESTAMP and
+routes BCS0 MI_USER/FLUSH interrupts through the owned MSI path. A native
+device model executes copy-queue PPGTT batches and user fences, and checks the
+saved LRC and ADS words. The selected Intel GuC/user/Xe tests pass on x86_64
+(143) and aarch64 (145), the other Intel groups pass on x86_64 (142 + 70), and
+the production boot-smoke and both btrfs postflights pass on x86_64. Clippy
+(both feature contexts, both architectures) and formatting pass. BCS8,
+CCS/media engines, i915 BLT execbuffer and silicon/Mesa acceptance remain.
+
+The Intel continuation now selects the native Xe ABI on production GuC cards.
+Per-open VM and execution-queue namespaces support transactional vector/inline
+binds, partial-object mappings, overlap replacement, UNMAP_ALL, sparse NULL
+scratch trees and VM-private BOs. Explicit binary/timeline syncs retain payloads
+through handle destruction; zero-bind barriers and zero-batch executions are
+supported. Executions preserve private PPGTT/context ownership and publish
+terminal reservations for every CPU conflict while allowing explicitly ordered
+queues to overlap. GPU user fences use an owned PPGTT qword store after cache
+flush; CPU bind fences and masked waits use guarded atomic qword access on both
+architectures. Discovery reports observed engines, memory, GT/IP/clock facts,
+HWCONFIG, topology and the loaded GuC submission-interface version. Correlated
+RCS engine-cycle queries use current forcewake and the reset mutex, bounded
+rollover-safe MMIO observations, actual 36/64-bit counters and NARF CPU clocks.
+They retain inputs across waits and copy only output fields.
+Infinite user-fence waits also use the existing interruptible syscall restart
+hook, while finite waits retain their original deadlines. Queue
+priority/timeslice policies reach the actual GuC KLV request. Native Rust tests
+exercise the ioctl-to-hardware ownership path, bind cancellation, handle close,
+concurrent queues, user-fence visibility and transactional copyout failures.
+This does not establish Mesa or physical Intel acceptance. USERPTR, fault/LR
+VMs, iGPU WC/incoherent mappings, other engines, local VRAM, accelerated
+presentation and runtime autosuspend remain outstanding.
+
+The physical Intel GT worker now installs owned primary-GuC/RCS0 MSI after
+its startup probes, with task-context identity decoding, dispatch epoch waits
+and a 10 ms watchdog. Routing refusal/failure keeps the 500 us timer path.
+Display/media causes and mask halves are preserved. Reset/S3 tears down the
+powered route before GT stop; uncertain shutdown quarantines its vector and
+cookie. Native register/dispatch tests cover delayed identities, waiter races,
+route rollback and teardown; physical MSI acceptance remains unverified.
+This continuation passes 62 selected Intel tests on each architecture,
+including all five new IRQ regressions, with zero failures/skips. Source and
+master readback rejection, lost MSI recovery, shared media enable preservation,
+device-loss quarantine and real GuC retirement run in native Rust models.
+GPU CI Clippy passes all three feature contexts on both architectures;
+host default/Intel-only/AMD-only/no-vendor checks, Intel-only debug builds and
+formatting pass. Both production boots and both btrfs postflights per
+architecture pass.
+
+Before the MSI continuation, native Xe regression runs passed 136 distinct
+Intel/DRM tests on x86_64 and 124 on aarch64, including all 15 then-new tests,
+with zero failures/skips.
+Deadline tests use a controlled clock and fixture
+progress uses bounded polling, avoiding short host-dependent timing guards.
+GPU, arch, filesystem and userspace CI Clippy pass all three feature contexts
+on both targets; host default, Intel-only, AMD-only and no-vendor all-target
+checks pass. Intel-only debug and release builds, formatting, both production
+boots and both btrfs postflights per architecture pass. These are native Rust
+models and QEMU checks; physical Intel and Mesa acceptance remain unverified.
+
+The existing compatibility profile implements userspace RCS0 submission on
+MTL/Arrow Xe-LPG, Alchemist and Battlemage. Async i915 EXECBUFFER2/WR uses copied softpin
+residency, per-open ordered contexts, implicit GEM/PRIME reservations and the
+live GT owner. Private context images preserve saved state between retired
+jobs; kernel rings/images/tables remain outside user mappings. Hardware
+nonsecure PPGTT command checking and the verified RCS register policy constrain
+untrusted batches. Live engine/capability/version queries and the i915 loader
+identity publish only after startup probes pass. Loss/suspend closes admission;
+verified full stop allows rebuild with a fresh epoch, refusing old contexts
+without replaying their batches. Failed cleanup remains closed.
+Native Rust models exercise the actual ioctl -> GT -> CT -> PPGTT execution
+and retirement chain, context save/restore/isolation across six IP variants,
+cache failure rollback, cancellation, handle/fd close and reset/epoch ownership.
+The branch also implements explicit sync_file IN/OUT fences, per-open binary
+and timeline syncobj submission, transactional output-fd publication and
+retained dependency snapshots. Native tests cover fd/handle close, cancellation,
+timeline order and publication failures. A round-robin GuC ID pool now reuses
+identities only after verified retirement, with independent request stamps and
+TLB cookies, removing the 65534-request limit. Priming holds the seed ID until
+the distinct switch/capture completes. Native conversations exercise more than
+65534 requests, stale evidence after reuse, pool exhaustion and stamp wrap.
+FENCE_SUBMIT now waits for native Intel scheduling-enable ACKs while foreign
+leaves retain terminal waits. Syncobj round trips preserve native milestones;
+GEM reservations, context order, syncobj WAIT and output fences still require
+terminal completion. Loss before ACK retains ownership and blocks submit
+dependencies until proven reset. Invalid input-flag combinations and bad fds
+fail before publication; HAS_EXEC_SUBMIT_FENCE follows live readiness.
+Intel silicon and Mesa OpenGL/Vulkan acceptance, other engines,
+local VRAM and accelerated presentation remain outstanding.
+The preceding FENCE_SUBMIT checkpoint passed 112 selected Intel/DRM tests on
+x86_64 and 100 on aarch64,
+including five FENCE_SUBMIT smokes, seven explicit-fence/ID-recycling smokes
+and twelve existing DRM synchronization tests on x86_64, with zero
+failures/skips. GPU and filesystem CI Clippy pass all three feature contexts
+on x86_64 and aarch64; host default, Intel-only, AMD-only
+and no-vendor all-target checks pass. Intel-only debug builds, formatting,
+both production boots and both btrfs postflights per architecture pass.
+The following paragraphs record earlier implementation checkpoints.
+
 Intel render work merged through #1175 includes per-open i915-wire
 GEM storage, CPU copies/WB mmap, same-card PRIME sharing, context and VM
 namespaces, two-pass memory and
@@ -995,7 +1127,7 @@ GGTT CT owner with MMIO registration/enable/disable, bounded retry/timeout and
 quarantined allocation lifetime. These are native model/ownership paths, not
 working Mesa acceleration or a firmware boot claim.
 EXECBUFFER2 still refuses submission and queries expose no userspace engines.
-Active topology, userspace context setup, accelerated PRIME/KMS and Mesa
+Complete engine/media/cache inventory, userspace context setup, accelerated PRIME/KMS and Mesa
 OpenGL/Vulkan acceptance remain open. The physical GuC kernel path below now
 owns GT reset and context scheduling.
 Existing Gen12 RCS/media helpers refuse Xe-LPG before MMIO.
@@ -1097,6 +1229,174 @@ vendor-only MST helper is now gated when both vendors and kernel tests are
 disabled. Production boot and both btrfs interoperability checks pass on both
 architectures. These results do not validate Intel silicon, firmware boot on
 hardware or Mesa rendering.
+
+The `codex/intel-gt-topology` follow-up reads stable main-GT geometry/compute
+DSS and EU fuses under the owned wake/reset protocol before firmware DMA.
+MTL/Arrow and DG2 expand paired SIMD8 EUs; BMG retains individual SIMD16 EUs.
+Full 32-DSS masks are valid; unstable/empty/unavailable fuse reads close startup.
+Compute-only GTs cannot authorize RCS0 programming. Per-card immutable snapshots
+are independent of HWCONFIG maxima and survive verified stop/reclamation.
+Identical resume observations are accepted; changed fuses refuse restart.
+Primary and render nodes expose i915 topology and geometry-DSS queries with
+sparse masks, exact little-endian layouts, two-pass sizes and per-item copy
+errors. These queries add no userspace engine or EXECBUFFER2 admission.
+Media/cache inventory, userspace isolation/state and silicon/Mesa acceptance
+remain open.
+Six new native smokes cover fuse decoding/stability, literal topology layouts,
+pre-DMA and compute-only admission, equal-ID card isolation, immutable snapshots
+after reclamation and per-item user-copy failures. Selected GPU/DRM coverage
+passes 296 tests on x86_64 and 135 on aarch64, with zero failures/skips. GPU CI
+Clippy passes all three contexts on both targets; host default, Intel-only,
+AMD-only and no-vendor all-target checks, Intel-only debug builds and formatting
+pass. Both architectures pass production boot and btrfs interoperability.
+
+The same Intel branch now adds owned GuC PPGTT kernel submission on MTL/Arrow,
+DG2 and BMG. Independently selected non-leaf PAT bits reach every table level
+and PDP0/PTBP; MTL installs UC PAT2 for table reads while data uses coherent
+WB PAT3. Immutable tables and BOs are explicitly cache-cleaned before GPU
+publication. Rings include source-defined PPGTT start, invalidation and render
+cache drain, with MTL AuxCCS and DG2 depth-flush differences. Residency survives
+wait cancellation, timeout and missing retirement evidence until proven full
+reset; terminal fences publish only after release. Startup now also requires
+a private high-address PPGTT store probe and checks its entire result and code
+pages. This is trusted kernel execution, with an unsafe contract for arbitrary
+kernel batches. Default 3D LRC state/workarounds, isolated userspace scheduling,
+full engine inventory, Arc VRAM/display and silicon/Mesa acceptance remain open.
+Four new native smokes cover independent table/root PAT vectors, real-page
+PPGTT stores on all three profiles, cancellation/reset ownership, profile
+rejection and lost retirement proof. The final x86_64 full GPU selection passes
+2698 GPU tests plus 13 CDC-ECM tests, with zero failures and five existing AMD
+skips (unprobed hardware or masked interrupts). Three final aarch64 groups
+pass 343 Intel/DRM tests without failures/skips; all 13 CDC-ECM tests also pass.
+GPU CI Clippy passes three resolved feature contexts on each architecture;
+host default/Intel-only/AMD-only/no-vendor all-target Clippy, Intel-only debug
+builds, formatting, both production boots and both btrfs checks per architecture
+pass. The upstream USB Result fix is retained; its routing smoke now checks
+detach success instead of ignoring the returned Result.
+
+The same Intel branch now primes and captures default RCS state before the
+physical service's PPGTT probe. The context workaround/tuning stream covers
+DG2, Xe-LPG 12.70/12.71/12.74 and separate Battlemage 20.01/20.02 selections.
+Stable GMD/fuse observations and observed DSS/HWCONFIG layout select live MCR
+targets; GPU read/modify/write preserves non-masked fields, and scratch state
+is cleared. DG2 explicitly seeds all fifty SVG headers to avoid inherited
+state through missing restore instructions. An exclusive two-context sequence
+fully retires the seed, retains its image through a forced switch, then
+synchronizes and copies the saved body into the golden template. New contexts
+restore it with fresh status, ring and root identity. Cancellation, bad save
+evidence and failed synchronization retain uncertain backing until full reset.
+Priming refuses prior resident kernel work; only the fixed GGTT diagnostic may
+precede it, preventing a previous batch from contaminating the saved template.
+Global GT/engine workarounds, user isolation/synchronization and physical
+acceptance remain open; acceleration and autonomous engine reset stay gated.
+
+The follow-up now applies Linux-derived graphics-GT and RCS0 MMIO workarounds
+and tunings before publishing the ring and reloading scheduling firmware.
+Selection distinguishes DG2 dies, Xe-LPG IP/stepping and Battlemage 20.01/20.02,
+including flat-CCS enable and sparse DSS groups. Reads use live steering
+targets and writes preserve unrelated bits. A firmware-owned steering
+semaphore yields until its deadline, and failure retains the owned graph
+through full reset. Native register vectors and hardware conversations cover
+selection, steering, contention, failed reads/readback and cancellation.
+Media/additional engines, out-of-band workarounds, nonprivileged register
+policy, isolated user execution and hardware/Mesa acceptance remain open.
+The ten new native smokes across context priming and register initialization
+pass in the final Intel/DRM selections: 526 tests on x86_64 and 353 on aarch64,
+with zero failures/skips. GPU CI Clippy passes all three resolved contexts on
+both architectures; host default/Intel-only/AMD-only/no-vendor all-target
+Clippy, Intel-only debug builds and formatting pass. Both architectures also
+pass production boot and both btrfs interoperability postflights. These are
+register/DMA models and QEMU checks, not physical Intel or Mesa acceptance.
+
+The next Linux-source audit corrects Wa_14019789679 coverage: all admitted
+Xe-LPG and Battlemage profiles now seed the same fifty SVG headers as DG2,
+with Xe2's DRAWING_RECTANGLE_FAST substitution. Captured opaque model state
+reaches both the golden template and new PPGTT contexts. Xe-LPG also receives
+the source-required extra depth-cache flush before completion. Firmware boot
+now binds stable live IP/stepping and supplies platform/die GuC WA flags plus
+ADS KLV records before DMA/cache publication, preserving the same records on
+scheduling reload and rejecting changed identity. Media/additional engines,
+remaining out-of-band/reset handling, isolated userspace 3D and physical
+acceptance remain open.
+Three new native smokes cover firmware wire profiles, refused live IP and
+identity changes during reload; extended state/PPGTT fixtures cover all six
+admitted IP variants. All 101 targeted smokes pass on each architecture,
+without failures/skips. GPU CI Clippy passes three contexts per architecture;
+host default/Intel-only/AMD-only/no-vendor all-target checks, Intel-only debug
+builds and formatting pass. Both production boots and both btrfs postflights
+per architecture pass. Physical Intel/Mesa acceptance remains untested.
+
+The same Intel branch now connects native terminal fences to each GEM object's
+shared PRIME reservation. GuC and legacy Gen12 resident paths admit overlapping
+readers and reject conflicting writers transactionally before cache publication.
+Kernel CPU copies respect those reservations; GEM_BUSY reports actual render
+reader/writer bits, and async GEM_WAIT retains its relative timeout deadline
+while parked. PREAD/PWRITE retry waiting chunks without replaying a prefix.
+PRIME CPU-access synchronization, shared names and sync-file export observe the
+same terminal fences across aliases. Cancellation/timeouts retain reservations
+until verified completion or reset; failed copies publish no sync-file fd.
+External fence import, raw-mapping exclusion, isolated user submission and
+physical Intel/Mesa acceptance remain open.
+Four new native smokes cover reservation conflicts/rollback and aliases,
+relative wait deadlines/cancellation and retained CPU-domain requests,
+PRIME synchronization/export copy faults, and pre-publication cache failure.
+Extended GuC conversations check real terminal/reset reservation boundaries.
+The final focused x86_64 selection passes 83 tests. The aarch64 Intel/DRM
+selection passes 360 tests, with all 15 render tests rerun after the final
+CPU-domain lifetime correction; all runs have zero failures/skips. GPU CI
+Clippy passes three contexts on each architecture; host default, Intel-only,
+AMD-only and no-vendor all-target checks, Intel debug builds and formatting pass.
+Both architectures pass production boot and both btrfs interoperability
+postflights. The refreshed standalone x86_64 boot uses the dedicated test
+virtio-blk image through NARF_VBLK_IMG; the default Alpine image is not writable
+by the current user.
+
+The Intel continuation now installs and verifies the RCS0 nonprivileged
+register policy before ring publication. All twelve inherited slots are
+cleared before the three Linux Xe OA access entries are granted; unused slots
+remain at RING_NOPID. Reload, CT enablement and kernel submission/default
+priming check the exact policy. Failure enters Lost without repairing live
+registers or releasing existing jobs and GEM reservations before full reset.
+The implementation covers DG2, Xe-LPG 12.70/12.71/12.74 and BMG 20.01/20.02.
+OA streams, legacy Gen12/media register policies, isolated userspace scheduling
+and physical Intel/Mesa acceptance remain open.
+Six new native smokes cover literal permissions, inherited-slot clearing,
+dropped/cross-slot writes, all six admitted IP profiles, reload/CT failures
+and live-job ownership across policy drift and full reset. All 64 selected
+policy/firmware/context/GEM/render smokes pass on each architecture, without
+failures/skips. GPU CI Clippy passes three contexts on x86_64 and aarch64;
+host default/Intel-only/AMD-only/no-vendor all-target Clippy, Intel debug
+builds and formatting pass.
+Both architectures also pass production boot and both btrfs interoperability
+postflights. These remain native model/QEMU results; physical execution is unrun.
+
+The Intel branch continuation now accounts user-job time from per-context
+GPU timestamps, including active-context ownership checks and counter wrap,
+instead of charging queued/preempted wall time. Isolated context recovery
+remains; an engine-wide no-progress watchdog retains full-reset fallback
+without blaming an unstarted queue. Optional GuC SLPC now discovers stable
+fused limits and applies acknowledged frequency bounds and Base/PowerSaving
+profiles with verified range readback. BMG's source-qualified conservative
+floor/cap remain; dynamic MERT cap removal and media power control are open.
+Legacy console GGTT mappings now enforce their per-pipe reservations. An owned
+GEM scanout/latch component retains objects through hardware completion or
+verified fetch stop. The following KMS continuation installs that owner for
+fixed-mode MTL/Arrow Pipe A WC GEM flips, with console epoch handoff, PSR
+inhibition, modeset/PM exclusion and transactional hardware events/out-fences.
+Unsupported pre-arm states restore the retained console for checked-copy
+fallback and observed hardware vblank. NONBLOCK currently waits for latch.
+Gen12 production direct flips, extra planes/modifiers and full recovery of
+quarantined display owners remain open. Automatic GT recovery invalidates
+active display access before reset and retains uncertain owners; system
+suspend restores the console before power teardown.
+Intel silicon and Mesa acceptance remain untested.
+The foundation's 25 native fixtures and KMS integration's 35 fixtures pass
+on both architectures, including real mapped-console copying and cancellation,
+PSR, event publication and reset quarantine. Latest selected Intel/DRM/fb
+regression groups pass 648 tests on x86_64 and 520 on aarch64, with zero
+failures/skips. All three GPU/fb CI Clippy contexts pass per architecture;
+host default/Intel-only/AMD-only/no-vendor all-target Clippy, Intel debug
+builds, formatting, both production boots and both btrfs postflights pass.
 
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI

@@ -15,7 +15,7 @@
 //! ```
 //!
 //! Every table is one 4 KiB page of 512 8-byte entries. An
-//! intermediate entry is `PRESENT | phys` of the next-level
+//! intermediate entry is `PRESENT | RW | PAT[1:0] | phys` of the next-level
 //! table ([`crate::intel_gpu_gtt::encode_table_entry`]); a leaf
 //! entry is an engine PTE
 //! ([`crate::intel_gpu_gtt::encode_engine_pte`]). The execlists
@@ -46,12 +46,12 @@
 //! means the table was written by someone else — firmware, a
 //! peer engine, a bug — and the honest answer is to say so.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use crate::intel_gpu_gtt::{
-    encode_table_entry, pte_phys, pte_present, GttError, PatSlot, PteFormat, GTT_PAGE_SIZE,
-    PTE_PAT0, PTE_PAT1, PTE_PAT2, PTE_PAT3, PTE_PHYS_MASK, PTE_PRESENT, PTE_RW,
+    encode_table_entry_with_pat, pte_phys, pte_present, GttError, PatSlot, PteFormat,
+    GTT_PAGE_SIZE, PTE_PAT0, PTE_PAT1, PTE_PAT2, PTE_PAT3, PTE_PHYS_MASK, PTE_PRESENT, PTE_RW,
 };
 
 /// Virtual-address width of the Gen12 PPGTT (PRM Vol. 5).
@@ -74,9 +74,10 @@ pub const LEVEL_PD: u8 = 2;
 /// PT (leaf) level number (see [`LEVEL_PML4`]).
 pub const LEVEL_PT: u8 = 3;
 
-/// Bits a well-formed *intermediate* entry may carry: `PRESENT`
-/// plus the next-table physical address.
-const TABLE_ENTRY_ALLOWED: u64 = PTE_PRESENT | PTE_RW | PTE_PHYS_MASK;
+/// Non-leaf entries have PRESENT, RW, two PAT bits and a physical address.
+const TABLE_ENTRY_ALLOWED: u64 = PTE_PRESENT | PTE_RW | PTE_PHYS_MASK | PTE_PAT0 | PTE_PAT1;
+const PTE_NULL: u64 = 1 << 9; // MIT xe_gtt_defs.h: reads zero, writes discarded.
+pub(crate) const PTE_DM: u64 = 1 << 11; // XE_PPGTT_PTE_DM: device (local) memory.
 /// Bits a well-formed *leaf* entry may carry: every flag the
 /// GFX PTE definition assigns, plus the physical address.
 const LEAF_ENTRY_ALLOWED: u64 =
@@ -124,6 +125,8 @@ impl From<GttError> for PpgttError {
 /// Result of walking one virtual address.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WalkOutcome {
+    /// Hardware NULL mapping: reads return zero and writes are discarded.
+    Null,
     /// Fully walked: the physical address, page base plus the
     /// VA's in-page offset.
     Mapped(u64),
@@ -198,6 +201,10 @@ impl FramePtMemory {
         }
     }
 
+    pub(crate) fn publish_for_device(&self) -> bool {
+        crate::intel_gpu_gtt::publish_system_pages(self.frames.values())
+    }
+
     /// Raw pointer to entry `index` of the table at `phys`.
     ///
     /// # Safety
@@ -262,9 +269,13 @@ impl PtMemory for FramePtMemory {
 #[derive(Debug)]
 pub struct Ppgtt {
     format: PteFormat,
+    table_pat: u8,
     root: u64,
     tables: u32,
     mapped: u64,
+    scratch: [u64; 3],
+    null_pat: u8,
+    nulls: BTreeSet<u64>,
 }
 
 impl Ppgtt {
@@ -275,13 +286,95 @@ impl Ppgtt {
 
     /// A walker for Xe-LP or Xe-LPG PPGTT leaf encodings.
     pub fn with_format<M: PtMemory>(mem: &mut M, format: PteFormat) -> Result<Self, PpgttError> {
+        Self::with_table_pat(mem, format, 0)
+    }
+
+    /// Select the independently programmed cache policy for every non-leaf
+    /// page and the context root descriptor. Leaves retain their own PAT.
+    pub fn with_table_pat<M: PtMemory>(
+        mem: &mut M,
+        format: PteFormat,
+        table_pat: u8,
+    ) -> Result<Self, PpgttError> {
+        if table_pat > 3 {
+            return Err(PpgttError::InvalidPatIndex);
+        }
         let root = mem.alloc_table()?;
+        if let Err(error) = encode_table_entry_with_pat(root, table_pat) {
+            mem.free_table(root);
+            return Err(error.into());
+        }
         Ok(Self {
             format,
+            table_pat,
             root,
             tables: 1,
             mapped: 0,
+            scratch: [0; 3],
+            null_pat: 0,
+            nulls: BTreeSet::new(),
         })
+    }
+
+    /// A bounded shared scratch tree covers the entire 48-bit VA space.
+    /// Mapping a real page copies only its path, never modifies shared tables.
+    pub fn with_scratch<M: PtMemory>(
+        mem: &mut M,
+        format: PteFormat,
+        table_pat: u8,
+        leaf_pat: u8,
+    ) -> Result<Self, PpgttError> {
+        format.encode_ppgtt(0, leaf_pat, true)?;
+        let mut result = Self::with_table_pat(mem, format, table_pat)?;
+        result.null_pat = leaf_pat;
+        for level in (1..4).rev() {
+            let table = match mem.alloc_table() {
+                Ok(table) => table,
+                Err(error) => {
+                    result.teardown(mem);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = encode_table_entry_with_pat(table, table_pat) {
+                mem.free_table(table);
+                result.teardown(mem);
+                return Err(error.into());
+            }
+            let empty = if level == LEVEL_PT {
+                format
+                    .encode_ppgtt(0, leaf_pat, true)
+                    .expect("validated PAT")
+                    | PTE_NULL
+            } else {
+                result.empty(level)
+            };
+            for index in 0..512 {
+                mem.write_entry(table, index, empty);
+            }
+            result.scratch[level as usize - 1] = table;
+            result.tables += 1;
+        }
+        for index in 0..512 {
+            mem.write_entry(result.root, index, result.empty(0));
+        }
+        Ok(result)
+    }
+
+    fn empty(&self, level: u8) -> u64 {
+        if level == LEVEL_PT {
+            if self.scratch[2] == 0 {
+                return 0;
+            }
+            self.format
+                .encode_ppgtt(0, self.null_pat, true)
+                .expect("validated PAT")
+                | PTE_NULL
+        } else if self.scratch[level as usize] != 0 {
+            encode_table_entry_with_pat(self.scratch[level as usize], self.table_pat)
+                .expect("validated table")
+        } else {
+            0
+        }
     }
 
     /// Physical address of the PML4 root — the value an
@@ -289,6 +382,12 @@ impl Ppgtt {
     /// ([`crate::intel_gpu_rcs::RcsEngine::attach_ppgtt`]).
     pub fn root_phys(&self) -> u64 {
         self.root
+    }
+
+    /// Encoded PDP0/PTBP, including PRESENT, RW and the non-leaf PAT bits.
+    pub fn root_descriptor(&self) -> u64 {
+        // Creation/map validate the allocator's physical field.
+        self.root | PTE_PRESENT | PTE_RW | ((self.table_pat as u64) << 3)
     }
 
     /// Table pages this PPGTT owns, root included.
@@ -311,6 +410,7 @@ impl Ppgtt {
         }
         let allowed = if level == LEVEL_PT {
             LEAF_ENTRY_ALLOWED
+                | PTE_NULL
                 | if self.format == PteFormat::XeLpg {
                     PTE_PAT3
                 } else {
@@ -320,7 +420,17 @@ impl Ppgtt {
             TABLE_ENTRY_ALLOWED
         };
         let phys = pte_phys(entry);
-        if entry & !allowed != 0 || phys == 0 {
+        if entry & !allowed != 0 {
+            return Err(WalkOutcome::Corrupt { level });
+        }
+        if level == LEVEL_PT && entry & PTE_NULL != 0 {
+            return Err(if phys == 0 {
+                WalkOutcome::Null
+            } else {
+                WalkOutcome::Corrupt { level }
+            });
+        }
+        if phys == 0 {
             return Err(WalkOutcome::Corrupt { level });
         }
         Ok(phys)
@@ -361,11 +471,62 @@ impl Ppgtt {
         // Encode first: a bad physical address fails before any
         // table is created, leaving the tree untouched.
         let leaf = self.format.encode_ppgtt(phys, pat_index, writable)?;
+        self.map_encoded(mem, va, leaf)
+    }
+
+    /// As [`Self::map_with_pat`] for a local-memory (VRAM) device address:
+    /// sets XE_PPGTT_PTE_DM (bit 11), outside the PAT and address fields.
+    pub fn map_device_with_pat<M: PtMemory>(
+        &mut self,
+        mem: &mut M,
+        va: u64,
+        device_address: u64,
+        pat_index: u8,
+        writable: bool,
+    ) -> Result<(), PpgttError> {
+        if va >= PPGTT_VA_SIZE {
+            return Err(PpgttError::VaOutOfRange);
+        }
+        if va % GTT_PAGE_SIZE != 0 {
+            return Err(PpgttError::Unaligned);
+        }
+        let leaf = self
+            .format
+            .encode_ppgtt(device_address, pat_index, writable)?
+            | PTE_DM;
+        self.map_encoded(mem, va, leaf)
+    }
+
+    pub fn map_null<M: PtMemory>(
+        &mut self,
+        mem: &mut M,
+        va: u64,
+        pat_index: u8,
+    ) -> Result<(), PpgttError> {
+        let leaf = self.format.encode_ppgtt(0, pat_index, true)? | PTE_NULL;
+        self.map_encoded(mem, va, leaf)?;
+        self.nulls.insert(va);
+        Ok(())
+    }
+
+    fn map_encoded<M: PtMemory>(
+        &mut self,
+        mem: &mut M,
+        va: u64,
+        leaf: u64,
+    ) -> Result<(), PpgttError> {
+        if va >= PPGTT_VA_SIZE {
+            return Err(PpgttError::VaOutOfRange);
+        }
+        if va % GTT_PAGE_SIZE != 0 {
+            return Err(PpgttError::Unaligned);
+        }
         let idx = va_indices(va);
         let mut table = self.root;
         for (level, &index) in idx.iter().enumerate().take(LEVEL_PT as usize) {
             let entry = mem.read_entry(table, index);
-            if pte_present(entry) {
+            if pte_present(entry) && (self.scratch[level] == 0 || entry != self.empty(level as u8))
+            {
                 // An existing intermediate entry must be
                 // well-formed to descend into; a corrupt one is
                 // not ours to overwrite silently.
@@ -378,14 +539,26 @@ impl Ppgtt {
                 }
             } else {
                 let new_table = mem.alloc_table()?;
-                let encoded = encode_table_entry(new_table)?;
+                let encoded = match encode_table_entry_with_pat(new_table, self.table_pat) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        mem.free_table(new_table);
+                        return Err(error.into());
+                    }
+                };
+                let empty = self.empty(level as u8 + 1);
+                if empty != 0 {
+                    for index in 0..512 {
+                        mem.write_entry(new_table, index, empty);
+                    }
+                }
                 mem.write_entry(table, index, encoded);
                 self.tables += 1;
                 table = new_table;
             }
         }
         let existing = mem.read_entry(table, idx[LEVEL_PT as usize]);
-        if pte_present(existing) {
+        if pte_present(existing) && (existing != self.empty(LEVEL_PT) || self.nulls.contains(&va)) {
             return Err(PpgttError::AlreadyMapped);
         }
         mem.write_entry(table, idx[LEVEL_PT as usize], leaf);
@@ -420,11 +593,12 @@ impl Ppgtt {
         }
         tables[LEVEL_PT as usize] = table;
         let leaf = mem.read_entry(table, idx[LEVEL_PT as usize]);
-        if !pte_present(leaf) {
+        if !pte_present(leaf) || (leaf == self.empty(LEVEL_PT) && !self.nulls.contains(&va)) {
             return Err(PpgttError::NotMapped);
         }
         let phys = pte_phys(leaf);
-        mem.write_entry(table, idx[LEVEL_PT as usize], 0);
+        self.nulls.remove(&va);
+        mem.write_entry(table, idx[LEVEL_PT as usize], self.empty(LEVEL_PT));
         self.mapped -= 1;
         // Prune empty tables bottom-up: a freed table's parent
         // entry is cleared, which may empty the parent in turn.
@@ -432,7 +606,7 @@ impl Ppgtt {
             let t = tables[level];
             let mut empty = true;
             for i in 0..ENTRIES_PER_TABLE {
-                if mem.read_entry(t, i) != 0 {
+                if mem.read_entry(t, i) != self.empty(level as u8) {
                     empty = false;
                     break;
                 }
@@ -440,7 +614,11 @@ impl Ppgtt {
             if !empty {
                 break;
             }
-            mem.write_entry(tables[level - 1], idx[level - 1], 0);
+            mem.write_entry(
+                tables[level - 1],
+                idx[level - 1],
+                self.empty(level as u8 - 1),
+            );
             mem.free_table(t);
             self.tables -= 1;
         }
@@ -474,20 +652,26 @@ impl Ppgtt {
     /// are abandoned, not unmapped one by one; leaf frames were
     /// never ours to free.
     pub fn teardown<M: PtMemory>(self, mem: &mut M) {
-        Self::free_subtree(mem, self.root, LEVEL_PML4);
+        Self::free_subtree(mem, self.root, LEVEL_PML4, &self.scratch);
+        for table in self.scratch {
+            if table != 0 {
+                mem.free_table(table);
+            }
+        }
     }
 
-    fn free_subtree<M: PtMemory>(mem: &mut M, table: u64, level: u8) {
+    fn free_subtree<M: PtMemory>(mem: &mut M, table: u64, level: u8, scratch: &[u64; 3]) {
         if level < LEVEL_PT {
             let mut children = Vec::new();
             for i in 0..ENTRIES_PER_TABLE {
                 let entry = mem.read_entry(table, i);
-                if pte_present(entry) && pte_phys(entry) != 0 {
+                if pte_present(entry) && pte_phys(entry) != 0 && !scratch.contains(&pte_phys(entry))
+                {
                     children.push(pte_phys(entry));
                 }
             }
             for child in children {
-                Self::free_subtree(mem, child, level + 1);
+                Self::free_subtree(mem, child, level + 1, scratch);
             }
         }
         mem.free_table(table);
@@ -513,6 +697,52 @@ pub mod tests {
 
     /// First physical address the fake RAM hands out.
     const FAKE_PHYS_BASE: u64 = 0x4000_0000;
+
+    fn smoke_null_scratch_tree_isolation_and_reclamation() -> TestResult {
+        let mut mem = FakePtMemory::new();
+        let mut vm = Ppgtt::with_scratch(&mut mem, PteFormat::XeLpg, 2, 3).unwrap();
+        assert_eq!(vm.table_pages(), 4);
+        assert_eq!(mem.live, 4);
+        // Fixed wire values: scratch PT is first after root, WB PAT3+RW+NULL.
+        assert_eq!(mem.raw_read(FAKE_PHYS_BASE + 4096, 17), 0x21b);
+        for va in [0, 0x1234_5678, (1u64 << 48) - 1] {
+            assert_eq!(vm.translate(&mem, va), Ok(WalkOutcome::Null));
+        }
+        vm.map_with_pat(&mut mem, 0x1234_0000_0000, 0x1000_0000, 3, true)
+            .unwrap();
+        assert_eq!(vm.table_pages(), 7);
+        assert_eq!(
+            vm.translate(&mem, 0x1234_0000_0080),
+            Ok(WalkOutcome::Mapped(0x1000_0080))
+        );
+        assert_eq!(vm.translate(&mem, 0x1234_0000_1080), Ok(WalkOutcome::Null));
+        assert_eq!(vm.translate(&mem, 0x2234_0000_0080), Ok(WalkOutcome::Null));
+        assert_eq!(vm.unmap(&mut mem, 0x1234_0000_0000), Ok(0x1000_0000));
+        assert_eq!(vm.table_pages(), 4);
+        assert_eq!(
+            vm.unmap(&mut mem, 0x1234_0000_0000),
+            Err(PpgttError::NotMapped)
+        );
+        vm.map_null(&mut mem, 0x1234_0000_0000, 3).unwrap();
+        assert_eq!(
+            vm.map_with_pat(&mut mem, 0x1234_0000_0000, 0x1000_0000, 3, true),
+            Err(PpgttError::AlreadyMapped)
+        );
+        assert_eq!(vm.unmap(&mut mem, 0x1234_0000_0000), Ok(0));
+        vm.teardown(&mut mem);
+        assert_eq!(mem.live, 0);
+        for limit in 1..4 {
+            let mut mem = FakePtMemory::new();
+            mem.limit = limit;
+            assert!(Ppgtt::with_scratch(&mut mem, PteFormat::XeLpg, 2, 3).is_err());
+            assert_eq!(mem.live, 0);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_ppgtt",
+        smoke_null_scratch_tree_isolation_and_reclamation
+    );
 
     struct FakePtMemory {
         pages: BTreeMap<u64, Rc<RefCell<alloc::vec::Vec<u8>>>>,
@@ -609,6 +839,45 @@ pub mod tests {
         }
         Some((e & 0x0000_3FFF_FFFF_F000) | (va & 0xFFF))
     }
+
+    fn smoke_ppgtt_nonleaf_cache_policy() -> TestResult {
+        // xe_vm.c::pde_encode_pat_index/xelp_pde_encode_bo: low two PAT
+        // bits occupy 4:3 at every non-leaf and in the context root descriptor.
+        for pat in 0..=3 {
+            let mut memory = FakePtMemory::new();
+            let mut vm = Ppgtt::with_table_pat(&mut memory, PteFormat::XeLpg, pat).unwrap();
+            let root = vm.root_phys();
+            assert_eq!(vm.root_descriptor(), root | 3 | ((pat as u64) << 3));
+            vm.map_with_pat(&mut memory, 0x1234_0000_0000, 0x12345000, 9, false)
+                .unwrap();
+            let mut page = root;
+            for index in [36, 208, 0] {
+                let entry = memory.raw_read(page, index);
+                assert_eq!(entry & 0xfff, 3 | ((pat as u64) << 3));
+                page = entry & 0x0000_3fff_ffff_f000;
+            }
+            assert_eq!(memory.raw_read(page, 0), 0x4000_0000_1234_5009);
+            assert_eq!(
+                vm.translate(&memory, 0x1234_0000_0123),
+                Ok(WalkOutcome::Mapped(0x12345123))
+            );
+            assert_eq!(vm.unmap(&mut memory, 0x1234_0000_0000), Ok(0x12345000));
+            assert_eq!(memory.live_tables(), 1);
+            vm.teardown(&mut memory);
+            assert_eq!(memory.live_tables(), 0);
+        }
+        let mut memory = FakePtMemory::new();
+        assert!(matches!(
+            Ppgtt::with_table_pat(&mut memory, PteFormat::XeLpg, 4),
+            Err(PpgttError::InvalidPatIndex)
+        ));
+        assert_eq!(memory.live_tables(), 0);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_ppgtt",
+        smoke_ppgtt_nonleaf_cache_policy
+    );
 
     fn smoke_ppgtt_va_decomposition() -> TestResult {
         // Hand-decomposed: indices 3 / 5 / 7 / 9, offset 0xABC.

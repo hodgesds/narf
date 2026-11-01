@@ -14,19 +14,23 @@
 //!   migrated) that does not declare `PINNABLE_RAM`. Anything else maps
 //!   write-back, so anonymous, file, COW, swap-in and huge-page leaves are
 //!   unaffected.
-//! * **Never on System RAM.** Every RAM page is mapped write-back by the
-//!   kernel direct map, and NARF never changes that (it has no
-//!   `set_memory_wc`). A write-combining or uncached user alias of such a
-//!   page is an architectural mixed-attribute alias: a cached line filled
+//! * **Never against the kernel's type for System RAM.** Every RAM page is
+//!   mapped write-back by the kernel direct map unless
+//!   [`crate::pageattr::set_pages_wc`] retyped it. A user alias of another
+//!   type is an architectural mixed-attribute alias: a cached line filled
 //!   through the direct map can be written back over data the user wrote
 //!   around the cache, or the user can read stale DRAM under a dirty line.
 //!   Linux refuses the alias the same way: for a RAM pfn,
 //!   `reserve_pfn_range` and `track_pfn_insert` (`arch/x86/mm/pat/memtype.c`)
-//!   replace the requested cache bits with the page's own memtype, which is
-//!   write-back unless `set_memory_*` changed the direct map. NARF does
-//!   exactly that per leaf: a RAM frame in a write-combining region gets a
-//!   write-back leaf, and [`ram_alias_refusals`] counts it (Linux prints
-//!   "x86/PAT: ... map pfn RAM range req ..., got write-back").
+//!   replace the requested cache bits with the page's own memtype
+//!   (`lookup_memtype`), which is write-back unless `set_memory_*` changed
+//!   the direct map. NARF does exactly that per leaf: a retyped page maps
+//!   with its recorded type whatever the region asked; any other RAM frame
+//!   in a non-write-back region gets a write-back leaf, and
+//!   [`ram_alias_refusals`] counts it (Linux prints "x86/PAT: ... map pfn RAM
+//!   range req ..., got write-back"). Only 4 KiB frames are retyped, and huge
+//!   user leaves come only from hugepage regions, so a large leaf never
+//!   spans a retyped page.
 //!
 //! RAM is [`crate::frame::is_system_ram`], Linux's `pat_pagerange_is_ram`.
 //! Every decision is per leaf and recomputed from the backing frame each
@@ -146,14 +150,24 @@ pub const fn region_may_request(perms: RegionPerms) -> bool {
 
 /// The memory type the leaf mapping `phys` under `perms` must use.
 ///
-/// Write-back unless the region asked otherwise, may ask
-/// ([`region_may_request`]), and `phys` is a real frame outside System
-/// RAM. A request refused because `phys` is RAM increments
-/// [`ram_alias_refusals`].
+/// Write-back unless the region may carry a type ([`region_may_request`])
+/// and either `phys` is a retyped RAM page — which always maps with its
+/// recorded type, whatever was asked — or the region asked for one and `phys`
+/// is a real frame outside System RAM. A request refused because `phys` is
+/// write-back RAM increments [`ram_alias_refusals`].
+///
+/// Anonymous, file, COW and swap leaves fail the first test; their frames are
+/// never retyped (a retyped page is owned by its driver until restored).
 #[inline]
 pub fn effective_memory_type(perms: RegionPerms, phys: PhysAddr) -> MemoryType {
+    if !region_may_request(perms) || phys.raw() == 0 {
+        return MemoryType::WriteBack;
+    }
+    if let Some(kernel) = crate::pageattr::ram_memory_type(phys) {
+        return kernel;
+    }
     let requested = perms.memory_type();
-    if requested == MemoryType::WriteBack || !region_may_request(perms) || phys.raw() == 0 {
+    if requested == MemoryType::WriteBack {
         return MemoryType::WriteBack;
     }
     if crate::frame::is_system_ram(phys) {

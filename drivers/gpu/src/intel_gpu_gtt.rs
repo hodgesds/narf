@@ -22,7 +22,7 @@
 //! GGTT system memory      physical | PRESENT    + PAT[1:0] in bits53:52
 //! PPGTT 4KiB system       PRESENT, RW,           + PAT[3] in bit62
 //!                         PAT[2:0] in bits7,4,3
-//! PPGTT intermediate      physical | PRESENT | RW
+//! PPGTT intermediate      physical | PRESENT | RW | PAT[1:0] in bits4:3
 //! ```
 //!
 //! This implementation uses the common physical-address field 45:12 and
@@ -46,6 +46,34 @@
 /// the low 8 MiB of the BAR are the register file, the array
 /// occupies the rest of the BAR.
 pub const GGTT_ARRAY_BASE: u64 = 0x80_0000;
+
+/// Four fixed boot/console windows (A-D), each at most 32 MiB. Their
+/// reservation ends at 144 MiB; framebuffer pins use a separate arena.
+pub const CONSOLE_SCANOUT_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+/// Owned GEM scanout windows: 160..256 MiB, below the GT submission arena.
+pub const GEM_SCANOUT_GTT_START: u64 = 160 * 1024 * 1024;
+pub const GEM_SCANOUT_GTT_END: u64 = 256 * 1024 * 1024;
+
+/// Validate a legacy pipe's *reservation*, as well as the BAR aperture.
+/// Without this check a large surface can overwrite another pipe, a GEM
+/// framebuffer window, or the GT arena even though it fits inside the BAR.
+pub fn check_console_scanout_range(
+    bar_len: u64,
+    gtt_offset: u64,
+    size_bytes: u64,
+) -> Result<(), GttError> {
+    let pipe = gtt_offset
+        .checked_sub(SCANOUT_GTT_OFFSET_PIPE_A)
+        .ok_or(GttError::OutOfBounds)?;
+    if pipe % CONSOLE_SCANOUT_WINDOW_BYTES != 0
+        || pipe / CONSOLE_SCANOUT_WINDOW_BYTES >= 4
+        || size_bytes == 0
+        || size_bytes > CONSOLE_SCANOUT_WINDOW_BYTES
+    {
+        return Err(GttError::OutOfBounds);
+    }
+    check_ggtt_range(bar_len, gtt_offset, size_bytes)
+}
 
 /// GGTT virtual-address size in bytes, derived from the length
 /// of the GTTMMADR BAR mapping: one 8-byte PTE per 4 KiB page
@@ -226,8 +254,62 @@ pub fn encode_engine_pte(phys: u64, pat: PatSlot, writable: bool) -> Result<u64,
 /// PPGTT intermediate entry: physical address, PRESENT and RW. The
 /// default page-directory cache policy is PAT index zero.
 pub fn encode_table_entry(next_level_phys: u64) -> Result<u64, GttError> {
+    encode_table_entry_with_pat(next_level_phys, 0)
+}
+
+/// Linux xe_vm.c::xelp_pde_encode_bo: non-leaf nodes and the context's
+/// PDP4 descriptor have only two PAT bits, independently of leaf policy.
+pub fn encode_table_entry_with_pat(next_level_phys: u64, pat: u8) -> Result<u64, GttError> {
     validate_phys(next_level_phys)?;
-    Ok(PTE_PRESENT | PTE_RW | next_level_phys)
+    if pat > 3 {
+        return Err(GttError::InvalidPatIndex);
+    }
+    Ok(PTE_PRESENT | PTE_RW | next_level_phys | ((pat as u64 & 3) << 3))
+}
+
+/// Publish immutable system pages before a GPU page walk or batch fetch.
+/// In particular, Xe-LPG table reads do not snoop CPU caches (xe_bo.c).
+/// Callers must keep all pages owned and prevent CPU writes until retirement.
+pub(crate) fn publish_system_pages<'a>(
+    pages: impl Iterator<Item = &'a narf_memory::frame::PhysFrame>,
+) -> bool {
+    publish_system_phys(pages.map(|frame| frame.start_address()))
+}
+
+/// As [`publish_system_pages`] for retained pages (e.g. USERPTR pins) that
+/// the caller keeps alive until retirement.
+pub(crate) fn publish_system_phys(pages: impl Iterator<Item = narf_memory::PhysAddr>) -> bool {
+    use core::sync::atomic::{compiler_fence, fence, Ordering};
+    compiler_fence(Ordering::SeqCst);
+    #[cfg(target_arch = "x86_64")]
+    let line = {
+        let caps = narf_arch::x86_64::cache::caps();
+        let line = caps.line_bytes as usize;
+        if !caps.clflush || !line.is_power_of_two() || line > 4096 {
+            return false;
+        }
+        line
+    };
+    for page in pages {
+        let base = page.kernel_ptr::<u8>();
+        #[cfg(target_arch = "x86_64")]
+        for offset in (0..4096usize).step_by(line) {
+            compiler_fence(Ordering::SeqCst);
+            // SAFETY: callers supply their owned, direct-mapped physical pages;
+            // CLFLUSH support and the cache-line stride were checked above.
+            unsafe { narf_arch::x86_64::cache::clflush(base.add(offset)) };
+            compiler_fence(Ordering::SeqCst);
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: the caller owns the entire mapped page.
+        unsafe {
+            narf_arch::aarch64::cache::clean_inval_to_poc(base as usize, 4096);
+        }
+        narf_scheduler::sleep_pumps::run();
+    }
+    fence(Ordering::SeqCst);
+    compiler_fence(Ordering::SeqCst);
+    true
 }
 
 /// Decode the phys-address portion of an existing PTE.
@@ -253,7 +335,7 @@ pub fn map_contiguous_scanout(
     const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
 
     let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
-    check_ggtt_range(gtt_mmadr.len, SCANOUT_GTT_OFFSET, pages * GTT_PAGE_SIZE)?;
+    check_console_scanout_range(gtt_mmadr.len, SCANOUT_GTT_OFFSET, size_bytes)?;
     for i in 0..pages {
         let phys = start_phys + i * GTT_PAGE_SIZE;
         let pte = encode_scanout_pte(phys, PatSlot::Slot2)?;
@@ -292,7 +374,7 @@ pub fn alloc_coherent_scanout(
     const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
 
     let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
-    check_ggtt_range(gtt_mmadr.len, SCANOUT_GTT_OFFSET, pages * GTT_PAGE_SIZE)?;
+    check_console_scanout_range(gtt_mmadr.len, SCANOUT_GTT_OFFSET, size_bytes)?;
     let mut frames = alloc::vec::Vec::with_capacity(pages as usize);
 
     for i in 0..pages {
@@ -418,7 +500,7 @@ pub fn alloc_contiguous_scanout_with_format(
     format.encode_ggtt(0, pat_index)?;
     let order = scanout_order_for(size_bytes).ok_or(GttError::OutOfMemory)?;
     let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
-    check_ggtt_range(gtt_mmadr.len, gtt_offset, pages * GTT_PAGE_SIZE)?;
+    check_console_scanout_range(gtt_mmadr.len, gtt_offset, size_bytes)?;
     let head = narf_memory::frame::alloc_pages_on(0, order).map_err(|_| GttError::OutOfMemory)?;
     let base = head.start_address().raw();
     for i in 0..pages {

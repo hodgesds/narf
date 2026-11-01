@@ -1,12 +1,15 @@
-//! Owned single-LRC GuC scheduling, with a kernel execution probe.
+//! Owned GuC scheduling for kernel GGTT/PPGTT and nonsecure userspace work.
 //!
 //! Linux reference: ~/git/linux b90c984d615e8ce2af96f5b1411a962d83fed2ad,
 //! MIT xe_guc_submit.c, xe_lrc.c, xe_guc_ads.c and their ABI headers.
 //! Scheduling acknowledgments are not job completion. Retirement additionally
-//! requires the probe's GPU breadcrumb and saved ring head after deregistration.
+//! requires the GPU breadcrumb and exact saved ring head after deregistration.
 
 use crate::{
     intel_gpu_aux::MmioWindow,
+    intel_gpu_context::{ContextError, ContextSeed},
+    intel_gpu_engine::{Engine, EngineSet, BREADCRUMB, REGS},
+    intel_gpu_exec::ResidentBatch,
     intel_gpu_fence::{CompletionFence, JobError},
     intel_gpu_gt::GtPlatform,
     intel_gpu_guc::GuCMessage,
@@ -20,28 +23,78 @@ use core::{
     sync::atomic::{fence, Ordering},
 };
 
-const REGS: u64 = 4096;
-const BREADCRUMB: u64 = 0x800;
 const TIMEOUT: u64 = 5_000_000_000;
+#[path = "intel_gpu_job_timeout.rs"]
+mod job_timeout;
 const MAX_CONTEXTS: usize = 64;
+pub use crate::intel_gpu_slpc::SlpcState;
+use crate::intel_gpu_slpc::{FrequencyRange, Limits, PowerProfile, Slpc, SlpcError, Status};
+
+/// Firmware context identities are reusable after deregistration. Request
+/// stamps are independent, so a prior TLB ACK/breadcrumb cannot complete a
+/// new incarnation. The final TLB ACK is our reclamation/reuse barrier.
+struct Identities {
+    used: u64,
+    next_id: u16,
+    next_stamp: u32,
+}
+impl Identities {
+    const fn new() -> Self {
+        Self {
+            used: 0,
+            next_id: 1,
+            next_stamp: 1,
+        }
+    }
+    fn candidate(&self, live: impl Fn(u32) -> bool) -> Result<(u16, u32), SchedulingError> {
+        let id = (0..64)
+            .map(|n| (self.next_id - 1 + n) % 64 + 1)
+            .find(|id| self.used & (1u64 << (id - 1)) == 0)
+            .ok_or(SchedulingError::Full)?;
+        let mut stamp = self.next_stamp;
+        while live(stamp) {
+            stamp = ((stamp + 1) & 0x7fffffff).max(1);
+        }
+        Ok((id, stamp))
+    }
+    fn claim(&mut self, id: u16, stamp: u32) {
+        self.used |= 1u64 << (id - 1);
+        self.next_id = id % 64 + 1;
+        self.next_stamp = ((stamp + 1) & 0x7fffffff).max(1);
+    }
+    fn retire(&mut self, id: u16) {
+        self.used &= !(1u64 << (id - 1));
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SchedulingError {
     State,
+    Busy,
     Full,
     Allocation(SubmitError),
     Address,
     Cache,
+    Residency(narf_filesystem::FsError),
+    Output(narf_filesystem::InstallFdError),
+    Defaults(ContextError),
     Protocol,
     Timeout,
     Transport(TransportError),
+    Slpc(SlpcError),
 }
 
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct SchedulingAds {
+pub(crate) struct EngineAds {
     pub golden: u32,
     pub bytes: u32,
     pub hwsp: u32,
+}
+
+/// Indexed by `Engine::index`; exactly the scheduler's engines are present.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct SchedulingAds {
+    pub engines: [Option<EngineAds>; 3],
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -61,110 +114,201 @@ enum Phase {
     RetireInvalidating,
 }
 
+/// Engines prime in `Engine::ALL` order; one engine's golden image is
+/// published before the next engine's seed is admitted.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Defaults {
+    Empty,
+    Seed(Engine, u16),
+    Switch(Engine, u16),
+    Next(Engine),
+    Ready,
+}
+
 struct Context<B: GpuBacking> {
+    engine: Engine,
     id: u16,
+    stamp: u32,
     image: B,
     ring: B,
     phase: Phase,
     deadline: u64,
+    runtime: job_timeout::Runtime,
     fence: Arc<CompletionFence>,
+    resident: Option<ResidentBatch>,
+    user: Option<crate::intel_gpu_user::UserJob>,
+    tail: u32,
+    /// The GPU runtime budget expired: the user job is being taken off
+    /// the engine (Linux guc_exec_queue_timedout_job).
+    timed_out: bool,
+    /// GuC reset the engine under this context (CONTEXT_RESET_NOTIFICATION).
+    reset: bool,
+}
+
+struct EngineState<B: GpuBacking> {
+    engine: Engine,
+    hwsp: B,
+    golden: B,
+    /// GPU execution progress, independent of CT traffic and queue admission.
+    last_progress: Option<u64>,
+}
+
+fn state_of<B: GpuBacking>(engines: &[EngineState<B>], engine: Engine) -> &EngineState<B> {
+    engines
+        .iter()
+        .find(|state| state.engine == engine)
+        .expect("scheduler engine")
 }
 
 struct Resources<A: BootAllocator> {
     allocator: A,
-    hwsp: A::Backing,
-    golden: A::Backing,
+    engines: Vec<EngineState<A::Backing>>,
     contexts: Vec<Context<A::Backing>>,
+    seed_image: Option<A::Backing>,
+    seed_id: Option<u16>,
+    defaults_completion: Option<Arc<CompletionFence>>,
+    /// SLPC shared data; GuC may reach it until a proven reset.
+    slpc: Option<A::Backing>,
 }
 
 pub(crate) struct GuCScheduler<A: BootAllocator> {
     resources: ManuallyDrop<Resources<A>>,
     platform: GtPlatform,
-    next_id: u32,
+    identities: Identities,
     published: bool,
     lost: bool,
     released: bool,
+    defaults: Defaults,
+    pristine: bool,
+    epoch: u64,
+    /// A user job ran under `epoch`; its identity can no longer change.
+    user_submitted: bool,
+    slpc: Slpc,
+    engines: EngineSet,
+    /// Default CCS state commands, captured with the render seed's fuses.
+    compute_seed: Vec<u32>,
 }
 
 impl<A: BootAllocator> GuCScheduler<A> {
     pub(crate) fn allocate(
         mut allocator: A,
         platform: GtPlatform,
+        engines: EngineSet,
     ) -> Result<Self, SchedulingError> {
-        let hwsp = allocator.alloc(1).map_err(SchedulingError::Allocation)?;
-        if !valid(&hwsp) || !hwsp.coherent_for_device() {
-            allocator.free(hwsp);
-            return Err(SchedulingError::Cache);
+        if !engines.contains(Engine::Rcs0) {
+            return Err(SchedulingError::State);
         }
-        let pages = if platform == GtPlatform::Battlemage {
-            4
-        } else {
-            14
-        };
-        let golden = match allocator.alloc(pages) {
-            Ok(b) => b,
-            Err(e) => {
-                allocator.free(hwsp);
-                return Err(SchedulingError::Allocation(e));
+        let mut owned: Vec<A::Backing> = Vec::new();
+        let release = |allocator: &mut A, owned: Vec<A::Backing>| {
+            for backing in owned.into_iter().rev() {
+                allocator.free(backing);
             }
         };
-        if !valid(&golden) || !golden.coherent_for_device() || overlap(&hwsp, &golden) {
-            allocator.free(golden);
-            allocator.free(hwsp);
-            return Err(SchedulingError::Address);
+        for engine in engines.iter() {
+            for pages in [1, engine.lrc_pages(platform)] {
+                let backing = match allocator.alloc(pages) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        release(&mut allocator, owned);
+                        return Err(SchedulingError::Allocation(e));
+                    }
+                };
+                let error = if !valid(&backing) || backing.size_pages() != pages {
+                    Some(SchedulingError::Address)
+                } else if !backing.coherent_for_device() {
+                    Some(SchedulingError::Cache)
+                } else if owned.iter().any(|old| overlap(old, &backing)) {
+                    Some(SchedulingError::Address)
+                } else {
+                    None
+                };
+                owned.push(backing);
+                if let Some(error) = error {
+                    release(&mut allocator, owned);
+                    return Err(error);
+                }
+            }
         }
-        hwsp.zero_fill();
-        golden.zero_fill();
-        if allocator.sync_for_device(&hwsp).is_err() || allocator.sync_for_device(&golden).is_err()
-        {
-            allocator.free(golden);
-            allocator.free(hwsp);
-            return Err(SchedulingError::Cache);
+        for backing in &owned {
+            backing.zero_fill();
+            if allocator.sync_for_device(backing).is_err() {
+                release(&mut allocator, owned);
+                return Err(SchedulingError::Cache);
+            }
         }
-        Ok(Self {
-            resources: ManuallyDrop::new(Resources {
-                allocator,
+        let mut states = Vec::new();
+        let mut owned = owned.into_iter();
+        for engine in engines.iter() {
+            let (hwsp, golden) = (owned.next().expect("HWS"), owned.next().expect("golden"));
+            states.push(EngineState {
+                engine,
                 hwsp,
                 golden,
+                last_progress: None,
+            });
+        }
+        Ok(Self {
+            epoch: crate::intel_gpu_user::next_epoch(),
+            resources: ManuallyDrop::new(Resources {
+                allocator,
+                engines: states,
                 contexts: Vec::new(),
+                seed_image: None,
+                seed_id: None,
+                defaults_completion: None,
+                slpc: None,
             }),
             platform,
-            next_id: 1,
+            identities: Identities::new(),
             published: false,
             lost: false,
             released: false,
+            defaults: Defaults::Empty,
+            pristine: true,
+            user_submitted: false,
+            slpc: Slpc::new(),
+            engines,
+            compute_seed: Vec::new(),
         })
     }
 
     pub(crate) fn ads(&self) -> SchedulingAds {
-        SchedulingAds {
-            golden: self.resources.golden.ggtt_offset(),
-            bytes: self.resources.golden.size_pages() * 4096,
-            hwsp: self.resources.hwsp.ggtt_offset(),
+        let mut engines = [None; 3];
+        for state in &self.resources.engines {
+            engines[state.engine.index()] = Some(EngineAds {
+                golden: state.golden.ggtt_offset(),
+                bytes: state.golden.size_pages() * 4096,
+                hwsp: state.hwsp.ggtt_offset(),
+            });
         }
+        SchedulingAds { engines }
+    }
+
+    pub(crate) fn engines(&self) -> EngineSet {
+        self.engines
     }
 
     pub(crate) fn enable_engine(&mut self, mmio: &impl MmioWindow) -> Result<(), SchedulingError> {
         if self.published || self.lost {
             return Err(SchedulingError::State);
         }
-        if mmio.read32(0x208c) == u32::MAX {
+        if self
+            .engines
+            .iter()
+            .any(|e| mmio.read32(u64::from(e.base()) + 0x8c) == u32::MAX)
+        {
             return Err(SchedulingError::Protocol);
         }
         // xe_hw_engine_enable_ring: render-well and GT wake are held by GuCGt.
         self.published = true;
-        let uc = match self.platform {
-            GtPlatform::Integrated(_) => 9,
-            GtPlatform::Alchemist => 1,
-            GtPlatform::Battlemage => 3,
-        };
-        mmio.write32(0x20c4, 0x3f7e0000 | uc << 8 | uc << 1);
-        mmio.write32(0x20a8, u32::MAX); // polling owner masks RCS interrupts
-        mmio.write32(0x2098, u32::MAX);
-        mmio.write32(0x2080, self.resources.hwsp.ggtt_offset());
-        mmio.write32(0x229c, 0x00080008);
-        mmio.write32(0x209c, 0x01000000);
-        let _ = mmio.read32(0x209c);
+        for state in &self.resources.engines {
+            crate::intel_gpu_engine::enable_ring(
+                mmio,
+                state.engine,
+                self.platform,
+                state.hwsp.ggtt_offset(),
+            );
+        }
         Ok(())
     }
 
@@ -174,22 +318,252 @@ impl<A: BootAllocator> GuCScheduler<A> {
         &mut self,
         now: u64,
     ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
+        self.admit()?;
+        self.submit(now, Engine::Rcs0, None, None)
+    }
+
+    fn admit(&self) -> Result<(), SchedulingError> {
+        if matches!(
+            self.defaults,
+            Defaults::Seed(..) | Defaults::Switch(..) | Defaults::Next(_)
+        ) {
+            return Err(SchedulingError::Busy);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn defaults_ready(&self) -> bool {
+        self.defaults == Defaults::Ready && !self.lost
+    }
+
+    pub(crate) fn user_epoch(&self) -> Option<u64> {
+        (self.published && self.defaults_ready()).then_some(self.epoch)
+    }
+
+    pub(crate) fn slpc(&self) -> SlpcState {
+        self.slpc.state()
+    }
+
+    pub(crate) fn slpc_status(&self) -> Option<Status> {
+        self.slpc.status()
+    }
+
+    pub(crate) fn slpc_frequency_range(
+        &mut self,
+        range: FrequencyRange,
+        now: u64,
+    ) -> Result<(), SchedulingError> {
+        self.slpc
+            .set_range(range, now)
+            .map_err(SchedulingError::Slpc)
+    }
+
+    pub(crate) fn slpc_power_profile(
+        &mut self,
+        profile: PowerProfile,
+        now: u64,
+    ) -> Result<(), SchedulingError> {
+        self.slpc
+            .set_profile(profile, now)
+            .map_err(SchedulingError::Slpc)
+    }
+
+    /// xe_guc_pc_start: zero the 8 KiB shared data, publish its size and
+    /// request SLPC_EVENT_RESET. Completion is observed in `poll`.
+    pub(crate) fn begin_slpc<M: MmioWindow>(
+        &mut self,
+        ct: &mut XeLpgTransport<M, A>,
+        limits: Limits,
+        now: u64,
+    ) -> Result<(), SchedulingError> {
+        if !self.published || self.lost || self.slpc.state() != SlpcState::Off {
+            return Err(SchedulingError::State);
+        }
+        // Validate the absolute deadline before exposing any allocation.
+        now.checked_add(1_005_000_000)
+            .ok_or(SchedulingError::Timeout)?;
+        let r = &mut *self.resources;
+        let shared = r.allocator.alloc(2).map_err(SchedulingError::Allocation)?;
+        let clashes = r
+            .engines
+            .iter()
+            .flat_map(|e| [&e.hwsp, &e.golden])
+            .chain(r.seed_image.iter())
+            .chain(r.contexts.iter().flat_map(|c| [&c.image, &c.ring]))
+            .any(|old| overlap(old, &shared));
+        if !valid(&shared) || shared.size_pages() != 2 || clashes {
+            r.allocator.free(shared);
+            return Err(SchedulingError::Address);
+        }
+        if !shared.coherent_for_device() {
+            r.allocator.free(shared);
+            return Err(SchedulingError::Cache);
+        }
+        shared.zero_fill();
+        shared.write32(0, 8192);
+        if r.allocator.sync_for_device(&shared).is_err() {
+            r.allocator.free(shared);
+            return Err(SchedulingError::Cache);
+        }
+        let address = shared.ggtt_offset();
+        // GuC never saw the address if the request is refused.
+        if let Err(error) = ct.send(
+            crate::intel_gpu_slpc::RESET_FENCE,
+            0x3003,
+            0,
+            &[2, address, 0],
+            true,
+        ) {
+            r.allocator.free(shared);
+            return Err(SchedulingError::Transport(error));
+        }
+        r.slpc = Some(shared);
+        self.slpc
+            .start(limits, now)
+            .map_err(SchedulingError::Slpc)?;
+        Ok(())
+    }
+
+    fn progress_slpc<M: MmioWindow>(
+        &mut self,
+        ct: &mut XeLpgTransport<M, A>,
+        now: u64,
+    ) -> Result<(), SchedulingError> {
+        let r = &mut *self.resources;
+        if let Some(shared) = r.slpc.as_ref() {
+            self.slpc
+                .progress(ct, &mut r.allocator, shared, now)
+                .map_err(SchedulingError::Transport)?;
+        }
+        Ok(())
+    }
+
+    /// No firmware context is registered, in flight or retiring.
+    pub(crate) fn idle(&self) -> bool {
+        self.defaults_ready() && self.resources.contexts.is_empty()
+    }
+
+    /// Continue the user epoch of a previous scheduler that stopped cleanly
+    /// while idle: every user context then holds a complete saved image, so
+    /// it is not a lost context. Refused once this scheduler ran user work.
+    pub(crate) fn adopt_epoch(&mut self, epoch: u64) -> Result<(), SchedulingError> {
+        if self.user_submitted || epoch == 0 {
+            return Err(SchedulingError::State);
+        }
+        self.epoch = epoch;
+        Ok(())
+    }
+
+    pub(crate) fn submit_user(
+        &mut self,
+        now: u64,
+        context: Arc<crate::intel_gpu_user::UserContext>,
+        batch: crate::intel_gpu_user::UserBatch,
+        output: Option<&crate::intel_gpu_user::UserOutput<'_>>,
+    ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
+        if self.user_epoch().is_none() || batch.0.platform() != Some(self.platform) {
+            return Err(SchedulingError::State);
+        }
+        let engine = context.engine();
+        if !self.engines.contains(engine) {
+            return Err(SchedulingError::State);
+        }
+        let claim = context
+            .claim(self.epoch, engine.lrc_pages(self.platform))
+            .map_err(SchedulingError::Residency)?;
+        self.user_submitted = true;
+        self.submit_inner(now, engine, Some(batch.0), None, Some(claim), output)
+    }
+
+    pub(crate) fn can_prime(&self) -> bool {
+        self.published
+            && !self.lost
+            && self.pristine
+            && self.defaults == Defaults::Empty
+            && self.resources.contexts.is_empty()
+    }
+
+    pub(crate) fn begin_defaults(
+        &mut self,
+        seed: ContextSeed,
+        now: u64,
+    ) -> Result<Arc<CompletionFence>, SchedulingError> {
+        if !self.can_prime() {
+            return Err(SchedulingError::Busy);
+        }
+        self.compute_seed = crate::intel_gpu_engine::compute_seed(self.platform, seed.disable_wmtp);
+        let (id, _) = self.submit(now, Engine::Rcs0, None, Some(seed.commands()))?;
+        let completion = Arc::new(CompletionFence::new());
+        self.resources.defaults_completion = Some(completion.clone());
+        self.defaults = Defaults::Seed(Engine::Rcs0, id);
+        Ok(completion)
+    }
+
+    /// # Safety
+    /// The batch and every nested command stream must be trusted kernel code.
+    /// It must access only resident mappings, return with BB_END and leave
+    /// global/transport/context/ring state and completion evidence untouched.
+    /// No CPU, userspace mapping or peer may modify any leaf until the fence
+    /// completes or full-engine reset is proven. This does not grant isolated
+    /// user 3D execution; isolated user state and coordinated recovery remain gated.
+    pub(crate) unsafe fn submit_resident(
+        &mut self,
+        now: u64,
+        batch: ResidentBatch,
+    ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
+        self.admit()?;
+        if batch.platform() != Some(self.platform) {
+            return Err(SchedulingError::Address);
+        }
+        self.submit(now, Engine::Rcs0, Some(batch), None)
+    }
+
+    fn submit(
+        &mut self,
+        now: u64,
+        engine: Engine,
+        resident: Option<ResidentBatch>,
+        prefix: Option<Vec<u32>>,
+    ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
+        self.submit_inner(now, engine, resident, prefix, None, None)
+    }
+
+    /// Engines before the one being primed already publish golden state.
+    fn golden_ready(&self, engine: Engine) -> bool {
+        match self.defaults {
+            Defaults::Ready => true,
+            Defaults::Seed(next, _) | Defaults::Switch(next, _) | Defaults::Next(next) => {
+                engine < next
+            }
+            Defaults::Empty => false,
+        }
+    }
+
+    fn submit_inner(
+        &mut self,
+        now: u64,
+        engine: Engine,
+        resident: Option<ResidentBatch>,
+        prefix: Option<Vec<u32>>,
+        user: Option<crate::intel_gpu_user::ContextClaim>,
+        output: Option<&crate::intel_gpu_user::UserOutput<'_>>,
+    ) -> Result<(u16, Arc<CompletionFence>), SchedulingError> {
         if !self.published || self.lost {
             return Err(SchedulingError::State);
         }
-        if self.resources.contexts.len() == MAX_CONTEXTS || self.next_id >= 65535 {
+        if self.resources.contexts.len() == MAX_CONTEXTS {
             return Err(SchedulingError::Full);
         }
+        let (id, stamp) = self
+            .identities
+            .candidate(|stamp| self.resources.contexts.iter().any(|c| c.stamp == stamp))?;
         let deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
+        let golden_ready = self.golden_ready(engine);
         let r = &mut *self.resources;
         r.contexts
             .try_reserve(1)
             .map_err(|_| SchedulingError::Full)?;
-        let pages = if self.platform == GtPlatform::Battlemage {
-            4
-        } else {
-            14
-        };
+        let pages = engine.lrc_pages(self.platform);
         let image = r
             .allocator
             .alloc(pages)
@@ -208,8 +582,15 @@ impl<A: BootAllocator> GuCScheduler<A> {
             || !image.coherent_for_device()
             || !ring.coherent_for_device()
             || overlap(&image, &ring)
-            || [&r.hwsp, &r.golden]
-                .into_iter()
+            || r.slpc
+                .as_ref()
+                .is_some_and(|old| overlap(old, &image) || overlap(old, &ring))
+            || r.seed_image
+                .as_ref()
+                .is_some_and(|old| overlap(old, &image) || overlap(old, &ring))
+            || r.engines
+                .iter()
+                .flat_map(|e| [&e.hwsp, &e.golden])
                 .any(|old| overlap(old, &image) || overlap(old, &ring))
             || r.contexts.iter().any(|c| {
                 [&c.image, &c.ring]
@@ -223,39 +604,164 @@ impl<A: BootAllocator> GuCScheduler<A> {
         }
         image.zero_fill();
         ring.zero_fill();
-        let id = self.next_id as u16;
-        context_image(&image, self.platform, ring.ggtt_offset());
-        let words = [
-            0x04000001,
-            0,
-            0x10400002,
-            image.ggtt_offset() + BREADCRUMB as u32,
-            0,
-            u32::from(id),
-            0x01000000,
-            0,
-        ];
+        if golden_ready {
+            let golden = &state_of(&r.engines, engine).golden;
+            for off in (REGS..u64::from(pages) * 4096).step_by(4) {
+                image.write32(off, golden.read32(off));
+            }
+            if let Some(user) = &user {
+                user.restore(&image);
+            }
+            image.write32(REGS + 3 * 4, 0x00090008);
+            image.write32(REGS + 5 * 4, 0);
+            image.write32(REGS + 9 * 4, ring.ggtt_offset());
+            image.write32(REGS + 11 * 4, 0x1001);
+            image.write32(REGS + 0x23 * 4, 0);
+            for slot in (0x25..=0x33).step_by(2) {
+                image.write32(REGS + slot * 4, 0);
+            }
+        } else if engine != Engine::Rcs0 {
+            crate::intel_gpu_engine::xcs_image(engine, &image, self.platform, ring.ggtt_offset());
+        } else {
+            context_image(&image, self.platform, ring.ggtt_offset());
+        }
+        let mutating = resident.is_some() || prefix.is_some();
+        let mut words: Vec<u32> = if let Some(prefix) = prefix {
+            let mut words = alloc::vec![0x04000001];
+            words.extend_from_slice(&prefix);
+            if engine == Engine::Bcs0 {
+                crate::intel_gpu_engine::copy_completion(image.ggtt_offset(), stamp, &mut words);
+            } else {
+                render_completion(
+                    self.platform,
+                    engine == Engine::Ccs0,
+                    image.ggtt_offset(),
+                    stamp,
+                    &mut words,
+                );
+            }
+            words
+        } else if let Some(batch) = &resident {
+            let root = batch.space().root_descriptor();
+            // xe_lrc.c::xe_lrc_set_ppgtt: PDP0 on DG2/MTL, PTBP on Xe2. The
+            // slots are identical in the RCS and BCS register tables.
+            image.write32(REGS + 0x31 * 4, (root >> 32) as u32);
+            image.write32(REGS + 0x33 * 4, root as u32);
+            if engine == Engine::Bcs0 {
+                crate::intel_gpu_engine::copy_ring(
+                    (!batch.skip_batch()).then_some(batch.address()),
+                    batch.user_fence(),
+                    image.ggtt_offset(),
+                    stamp,
+                )
+            } else {
+                let mut words = resident_ring(
+                    self.platform,
+                    engine == Engine::Ccs0,
+                    (!batch.skip_batch()).then_some(batch.address()),
+                    image.ggtt_offset(),
+                    stamp,
+                );
+                if let Some((address, value)) = batch.user_fence() {
+                    // MIT xe_ring_ops.c::emit_store_imm_ppgtt_posted: qword
+                    // PPGTT store after the render-cache flush, before the owned
+                    // GGTT breadcrumb. ResidentBatch validated writable residency.
+                    let before_breadcrumb = words
+                        .windows(2)
+                        .position(|v| v == [0x7a000004, 0x01104080])
+                        .expect("owned completion stream");
+                    words.splice(
+                        before_breadcrumb..before_breadcrumb,
+                        [
+                            0x10200003,
+                            address as u32,
+                            (address >> 32) as u32,
+                            value as u32,
+                            (value >> 32) as u32,
+                            0,
+                        ],
+                    );
+                }
+                words
+            }
+        } else {
+            alloc::vec![
+                0x04000001,
+                0,
+                0x10400002,
+                image.ggtt_offset() + BREADCRUMB as u32,
+                0,
+                stamp,
+                0x01000000,
+                0,
+            ]
+        };
+        if user.is_some() {
+            job_timeout::setup(&image, self.platform);
+            job_timeout::prefix(image.ggtt_offset(), stamp, engine, &mut words);
+        }
+        if words.len() % 2 != 0 {
+            words.push(0);
+        }
+        if words.len() > ring.size_pages() as usize * 1024 {
+            r.allocator.free(ring);
+            r.allocator.free(image);
+            return Err(SchedulingError::Full);
+        }
+        let tail = words.len() as u32 * 4;
         for (i, word) in words.into_iter().enumerate() {
             ring.write32(i as u64 * 4, word);
         }
-        image.write32(REGS + 7 * 4, 32);
+        image.write32(REGS + 7 * 4, tail);
+        let completion = Arc::new(CompletionFence::new());
+        if let Some(batch) = &resident {
+            if let Err(error) = batch.reserve(&completion) {
+                r.allocator.free(ring);
+                r.allocator.free(image);
+                return Err(SchedulingError::Residency(error));
+            }
+        }
         if r.allocator.sync_for_device(&image).is_err()
             || r.allocator.sync_for_device(&ring).is_err()
+            || resident
+                .as_ref()
+                .is_some_and(|batch| !batch.publish_for_device())
         {
             r.allocator.free(ring);
             r.allocator.free(image);
+            drop(resident);
+            completion.signal(Err(JobError::Reset));
             return Err(SchedulingError::Cache);
         }
-        let completion = Arc::new(CompletionFence::new());
+        if let Some(output) = output {
+            if let Err(error) = output.install(completion.clone()) {
+                r.allocator.free(ring);
+                r.allocator.free(image);
+                drop(resident);
+                completion.signal(Err(JobError::Reset));
+                return Err(SchedulingError::Output(error));
+            }
+        }
         r.contexts.push(Context {
+            user: user.map(|claim| claim.publish(completion.clone())),
+            engine,
             id,
+            stamp,
             image,
             ring,
             phase: Phase::Invalidate,
             deadline,
+            runtime: job_timeout::Runtime::default(),
             fence: completion.clone(),
+            resident,
+            tail,
+            timed_out: false,
+            reset: false,
         });
-        self.next_id += 1;
+        if mutating {
+            self.pristine = false;
+        }
+        self.identities.claim(id, stamp);
         Ok((id, completion))
     }
 
@@ -284,28 +790,96 @@ impl<A: BootAllocator> GuCScheduler<A> {
             let Some(message) = ct.receive().map_err(SchedulingError::Transport)? else {
                 break;
             };
-            self.event(message)?;
+            self.event(message, now)?;
         }
-        for context in &mut self.resources.contexts {
-            if now >= context.deadline {
-                return Err(SchedulingError::Timeout);
+        self.progress_slpc(ct, now)?;
+        if let Defaults::Seed(engine, _) = self.defaults {
+            if self.resources.seed_image.is_some() {
+                let (id, _) = self.submit(now, engine, None, None)?;
+                self.defaults = Defaults::Switch(engine, id);
             }
+        } else if let Defaults::Next(engine) = self.defaults {
+            // Linux records every class's default LRC; BCS's WA job is
+            // emit_wa_job's BLIT_CCTL RMW and CCS's only the Xe2 WMTP level,
+            // with no render 3D state.
+            let seed = if engine == Engine::Bcs0 {
+                crate::intel_gpu_engine::copy_seed(self.platform)
+            } else {
+                self.compute_seed.clone()
+            };
+            match self.submit(now, engine, None, Some(seed)) {
+                Ok((id, _)) => self.defaults = Defaults::Seed(engine, id),
+                Err(SchedulingError::Full) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let resources = &mut *self.resources;
+        for context in &mut resources.contexts {
             if context.phase == Phase::Running {
                 fence(Ordering::Acquire);
                 let seq = context.image.read32(BREADCRUMB);
-                if seq != 0 && seq != u32::from(context.id) {
+                if seq != 0 && seq != context.stamp {
                     return Err(SchedulingError::Protocol);
                 }
                 if seq != 0 {
+                    resources
+                        .engines
+                        .iter_mut()
+                        .find(|e| e.engine == context.engine)
+                        .expect("scheduler engine")
+                        .last_progress = Some(now);
+                    context.phase = Phase::Disable;
+                    // Retirement gets its own bound: a job finishing just
+                    // inside its deadline must not lose the GT in cleanup.
+                    context.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
+                }
+            }
+            if now >= context.deadline {
+                // Protocol transitions, kernel work and a second expiry
+                // remain bounded by wall clock and require a full GT reset.
+                if context.user.is_none()
+                    || context.timed_out
+                    || context.reset
+                    || context.phase != Phase::Running
+                {
+                    return Err(SchedulingError::Timeout);
+                }
+                resources
+                    .allocator
+                    .sync_for_cpu(&context.image)
+                    .map_err(|_| SchedulingError::Cache)?;
+                let (expired, progressed) = context.runtime.expired(
+                    &context.image,
+                    context.stamp,
+                    context.engine,
+                    ct.window(),
+                )?;
+                if progressed {
+                    resources
+                        .engines
+                        .iter_mut()
+                        .find(|e| e.engine == context.engine)
+                        .expect("scheduler engine")
+                        .last_progress = Some(now);
+                }
+                context.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
+                if expired {
+                    // GuC preempts this context alone or resets its engine
+                    // if it cannot preempt within the firmware policy bound.
+                    context.timed_out = true;
                     context.phase = Phase::Disable;
                 }
             }
             let id = u32::from(context.id);
             let (action, payload, next): (u16, Vec<u32>, Phase) = match context.phase {
-                Phase::Invalidate => (0x7000, alloc::vec![id, 0x80000003], Phase::Invalidating),
+                Phase::Invalidate => (
+                    0x7000,
+                    alloc::vec![context.stamp, 0x80000003],
+                    Phase::Invalidating,
+                ),
                 Phase::RetireInvalidate => (
                     0x7000,
-                    alloc::vec![id | 0x10000, 0x80000003],
+                    alloc::vec![context.stamp | 0x80000000, 0x80000003],
                     Phase::RetireInvalidating,
                 ),
                 Phase::Register => (
@@ -313,21 +887,34 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     alloc::vec![
                         1,
                         id,
-                        0,
+                        context.engine.guc_class(),
                         1,
                         0,
                         0,
                         0,
                         0,
                         0,
-                        context.image.ggtt_offset() | 0x19,
+                        context.image.ggtt_offset()
+                            | if context.resident.is_some() {
+                                0x119
+                            } else {
+                                0x19
+                            },
                         0
                     ],
                     Phase::Policy,
                 ),
                 Phase::Policy => (
                     0x100b,
-                    alloc::vec![id, 0x20030001, 3, 0x20010001, 1000, 0x20020001, 500000],
+                    {
+                        let (priority, timeslice) = context
+                            .user
+                            .as_ref()
+                            .map_or((3, 1000), |user| user.policy());
+                        alloc::vec![
+                            id, 0x20030001, priority, 0x20010001, timeslice, 0x20020001, 500000
+                        ]
+                    },
                     Phase::Enable,
                 ),
                 Phase::Enable => (0x1001, alloc::vec![id, 1], Phase::Enabling),
@@ -341,63 +928,207 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 Err(error) => return Err(SchedulingError::Transport(error)),
             }
         }
+        for engine in &mut resources.engines {
+            if resources
+                .contexts
+                .iter()
+                .any(|c| c.engine == engine.engine && c.user.is_some() && c.phase == Phase::Running)
+            {
+                // A missing start marker or all contexts staying switched
+                // out must not leave admission wedged forever. Only reset
+                // when this entire engine made no GPU progress for three
+                // watchdog intervals; never attribute that stall to a queue.
+                if engine
+                    .last_progress
+                    .is_some_and(|last| now.saturating_sub(last) >= 3 * TIMEOUT)
+                {
+                    return Err(SchedulingError::Timeout);
+                }
+            } else {
+                engine.last_progress = None;
+            }
+        }
         Ok(())
     }
 
-    fn event(&mut self, message: GuCMessage) -> Result<(), SchedulingError> {
+    fn event(&mut self, message: GuCMessage, now: u64) -> Result<(), SchedulingError> {
+        // SLPC uses a disjoint fence namespace and fails independently.
+        if self.slpc.event(&message) {
+            return Ok(());
+        }
         if message.kind != 1 || message.auxiliary >> 16 != 0 {
             return Err(SchedulingError::Protocol);
         }
         let action = message.auxiliary as u16;
-        if !matches!(action, 0x1002 | 0x4600 | 0x7001) {
+        // ENGINE_FAILURE_NOTIFICATION (0x1009, GuC could not reset an engine)
+        // stays a protocol loss: Linux answers it with a GT reset.
+        if !matches!(action, 0x1002 | 0x1008 | 0x4600 | 0x7001) {
             return Err(SchedulingError::Protocol);
         }
         let len = if action == 0x1002 { 2 } else { 1 };
+        // CONTEXT_RESET_NOTIFICATION carries the GuC context ID alone.
         if message.payload.len() != len {
             return Err(SchedulingError::Protocol);
         }
         let cookie = message.payload[0];
-        let context_id = if action == 0x7001 {
-            cookie & 0xffff
-        } else {
-            cookie
-        };
         let index = self
             .resources
             .contexts
             .iter()
-            .position(|c| u32::from(c.id) == context_id)
+            .position(|c| {
+                if action == 0x7001 {
+                    c.stamp == cookie & 0x7fffffff
+                } else {
+                    u32::from(c.id) == cookie
+                }
+            })
             .ok_or(SchedulingError::Protocol)?;
-        let c = &mut self.resources.contexts[index];
+        let resources = &mut *self.resources;
+        let c = &mut resources.contexts[index];
         match (action, c.phase, message.payload.get(1).copied()) {
-            (0x7001, Phase::Invalidating, None) if cookie == u32::from(c.id) => {
-                c.phase = Phase::Register
-            }
-            (0x7001, Phase::RetireInvalidating, None) if cookie == (u32::from(c.id) | 0x10000) => {
+            (0x7001, Phase::Invalidating, None) if cookie == c.stamp => c.phase = Phase::Register,
+            (0x7001, Phase::RetireInvalidating, None) if cookie == (c.stamp | 0x80000000) => {
                 fence(Ordering::Acquire);
-                if c.image.read32(BREADCRUMB) != u32::from(c.id)
-                    || c.image.read32(REGS + 5 * 4) & 0x1ffffc != 32
+                let hung = c.timed_out || c.reset;
+                if !hung
+                    && (c.image.read32(BREADCRUMB) != c.stamp
+                        || c.image.read32(REGS + 5 * 4) & 0x1ffffc != c.tail)
                 {
                     return Err(SchedulingError::Protocol);
                 }
-                let c = self.resources.contexts.remove(index);
-                let r = &mut *self.resources;
+                // A hung job's saved state is never captured: its context
+                // is banned below.
+                if let Some(user) = c.user.as_ref().filter(|_| !hung) {
+                    resources
+                        .allocator
+                        .sync_for_cpu(&c.image)
+                        .map_err(|_| SchedulingError::Cache)?;
+                    user.capture(&c.image, c.engine.first_lri(self.platform))
+                        .map_err(SchedulingError::Residency)?;
+                }
+                let c = resources.contexts.remove(index);
+                let r = resources;
                 r.allocator.free(c.ring);
-                r.allocator.free(c.image);
-                c.fence.signal(Ok(()));
+                if self.defaults == Defaults::Seed(c.engine, c.id) {
+                    r.seed_image = Some(c.image);
+                    r.seed_id = Some(c.id);
+                } else {
+                    r.allocator.free(c.image);
+                    self.identities.retire(c.id);
+                }
+                // Drop all PPGTT tables and BO references before terminal
+                // publication. Deregistration and the final TLB ACK are proven,
+                // so even a reset or preempted job no longer reaches them.
+                drop(c.resident);
+                if let Some(user) = c.user {
+                    if hung {
+                        user.finish_hung();
+                    } else {
+                        user.finish(false);
+                    }
+                }
+                c.fence
+                    .signal(if hung { Err(JobError::Hang) } else { Ok(()) });
+                if self.defaults == Defaults::Switch(c.engine, c.id) {
+                    self.capture_defaults(c.engine)?;
+                }
             }
-            (0x1002, Phase::Enabling, Some(1)) => c.phase = Phase::Running,
+            (0x1002, Phase::Enabling, Some(1)) => {
+                c.phase = Phase::Running;
+                c.fence.mark_submitted();
+                // Start the watchdog when GuC may run it. User execution
+                // time itself comes from the ring marker/LRC timestamps.
+                c.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
+                if c.user.is_some() {
+                    resources
+                        .engines
+                        .iter_mut()
+                        .find(|e| e.engine == c.engine)
+                        .expect("scheduler engine")
+                        .last_progress
+                        .get_or_insert(now);
+                }
+            }
             (0x1002, Phase::Disabling, Some(0)) => c.phase = Phase::Deregister,
+            (
+                0x1008,
+                Phase::Running
+                | Phase::Disable
+                | Phase::Disabling
+                | Phase::Deregister
+                | Phase::Deregistering,
+                None,
+            ) => {
+                // GuC reset the engine under this context. A kernel job must
+                // never hang; a user job is taken off and its context banned.
+                if c.user.is_none() {
+                    return Err(SchedulingError::Timeout);
+                }
+                if !c.timed_out && !c.reset {
+                    c.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
+                }
+                c.reset = true;
+                if c.phase == Phase::Running {
+                    c.phase = Phase::Disable;
+                }
+            }
             (0x4600, Phase::Deregistering, None) => {
                 fence(Ordering::Acquire);
-                if c.image.read32(BREADCRUMB) != u32::from(c.id)
-                    || c.image.read32(REGS + 5 * 4) & 0x1ffffc != 32
-                {
+                let finished = c.image.read32(BREADCRUMB) == c.stamp
+                    && c.image.read32(REGS + 5 * 4) & 0x1ffffc == c.tail;
+                if !finished && !c.timed_out && !c.reset {
                     return Err(SchedulingError::Protocol);
+                }
+                // A job that completed while it was being disabled was slow,
+                // not hung: it retires normally unless GuC reset it.
+                if finished && !c.reset {
+                    c.timed_out = false;
                 }
                 c.phase = Phase::RetireInvalidate;
             }
             _ => return Err(SchedulingError::Protocol),
+        }
+        Ok(())
+    }
+
+    fn capture_defaults(&mut self, engine: Engine) -> Result<(), SchedulingError> {
+        let r = &mut *self.resources;
+        let image = r.seed_image.as_ref().ok_or(SchedulingError::State)?;
+        r.allocator
+            .sync_for_cpu(image)
+            .map_err(|_| SchedulingError::Cache)?;
+        // The seed was fully retired, then a different context executed and
+        // retired. The image cannot still be resident in the engine.
+        if image.read32(REGS + 4) != engine.first_lri(self.platform)
+            || image.size_pages() != engine.lrc_pages(self.platform)
+            || image.read32(REGS + 0x33 * 4) != 0
+            || image.read32(REGS + 0x31 * 4) != 0
+        {
+            return Err(SchedulingError::Protocol);
+        }
+        let golden = &state_of(&r.engines, engine).golden;
+        golden.zero_fill();
+        for off in (REGS..u64::from(image.size_pages()) * 4096).step_by(4) {
+            golden.write32(off, image.read32(off));
+        }
+        golden.write32(REGS + 3 * 4, 0x00090008);
+        for slot in [5, 7, 9, 0x23] {
+            golden.write32(REGS + slot * 4, 0);
+        }
+        r.allocator
+            .sync_for_device(golden)
+            .map_err(|_| SchedulingError::Cache)?;
+        let next = self.engines.iter().find(|e| *e > engine);
+        self.defaults = next.map_or(Defaults::Ready, Defaults::Next);
+        self.identities
+            .retire(r.seed_id.take().expect("retired seed identity"));
+        r.allocator
+            .free(r.seed_image.take().expect("owned retired seed"));
+        if next.is_none() {
+            r.defaults_completion
+                .as_ref()
+                .expect("owned priming fence")
+                .signal(Ok(()));
         }
         Ok(())
     }
@@ -407,9 +1138,6 @@ impl<A: BootAllocator> GuCScheduler<A> {
     /// No other host owner can re-arm the retired HWS/LRC/GGTT addresses.
     pub(crate) unsafe fn release_after_reset(mut self) {
         self.published = false;
-        for c in &self.resources.contexts {
-            c.fence.signal(Err(JobError::Reset));
-        }
         self.free();
     }
 
@@ -423,9 +1151,25 @@ impl<A: BootAllocator> GuCScheduler<A> {
         for c in r.contexts.drain(..) {
             r.allocator.free(c.ring);
             r.allocator.free(c.image);
+            drop(c.resident);
+            if let Some(user) = c.user {
+                user.finish(true);
+            }
+            c.fence.signal(Err(JobError::Reset));
         }
-        r.allocator.free(r.golden);
-        r.allocator.free(r.hwsp);
+        if let Some(image) = r.seed_image.take() {
+            r.allocator.free(image);
+        }
+        if let Some(shared) = r.slpc.take() {
+            r.allocator.free(shared);
+        }
+        for engine in r.engines.drain(..).rev() {
+            r.allocator.free(engine.golden);
+            r.allocator.free(engine.hwsp);
+        }
+        if let Some(completion) = r.defaults_completion {
+            completion.signal(Err(JobError::Reset));
+        }
     }
 }
 
@@ -446,6 +1190,75 @@ fn valid(b: &impl GpuBacking) -> bool {
 fn overlap(a: &impl GpuBacking, b: &impl GpuBacking) -> bool {
     (a.ggtt_offset() as u64) < b.ggtt_offset() as u64 + b.size_pages() as u64 * 4096
         && (b.ggtt_offset() as u64) < a.ggtt_offset() as u64 + a.size_pages() as u64 * 4096
+}
+
+/// Single nonsecure PPGTT render job, following xe_ring_ops.c. Preparser/TLB
+/// invalidation precedes the PPGTT batch; HDC/render/depth/data cache drain
+/// precedes the separate GGTT post-sync completion write. MTL needs AuxCCS
+/// invalidation; DG2 and Xe-LPG need the extra
+/// depth flush (Wa_14016712196). All tails are qword aligned.
+/// Compute queues (xe_ring_ops.c mask_flags = PIPE_CONTROL_3D_ENGINE_FLAGS)
+/// drop VF invalidation (and its L3 read-only invalidate) and the tile,
+/// render-target and depth flushes; Wa_14016712196's depth flush remains.
+fn resident_ring(
+    platform: GtPlatform,
+    compute: bool,
+    batch: Option<u64>,
+    image: u32,
+    seq: u32,
+) -> Vec<u32> {
+    let (header, flags) = if compute {
+        (0x7a000004, 0x20344c0c)
+    } else {
+        (0x7a000404, 0x20344c1c)
+    };
+    let mut words = alloc::vec![0x04000001, 0x02800101, header, flags, 0xd0, 0, 0, 0,];
+    if matches!(platform, GtPlatform::Integrated(_)) {
+        words.extend_from_slice(&[0x11020001, 0x4208, 1, 0]);
+    }
+    if let Some(batch) = batch {
+        words.extend_from_slice(&[
+            0x02800100,
+            0x18800101,
+            batch as u32,
+            (batch >> 32) as u32,
+            0x04000000,
+        ]);
+    }
+    render_completion(platform, compute, image, seq, &mut words);
+    words
+}
+
+fn render_completion(
+    platform: GtPlatform,
+    compute: bool,
+    image: u32,
+    seq: u32,
+    words: &mut Vec<u32>,
+) {
+    if platform != GtPlatform::Battlemage {
+        words.extend_from_slice(&[0x7a000004, 1, 0xd0, 0, 0, 0]);
+    }
+    words.extend_from_slice(&[
+        0x7a000204,
+        if compute { 0x001000a0 } else { 0x101010a1 },
+        0,
+        0,
+        0,
+        0,
+        0x7a000004,
+        0x01104080,
+        image + BREADCRUMB as u32,
+        0,
+        seq,
+        0,
+        0x01000000,
+        0x04000001,
+        0x02800000,
+    ]);
+    if words.len() % 2 != 0 {
+        words.push(0);
+    }
 }
 
 fn context_image(image: &impl GpuBacking, platform: GtPlatform, ring: u32) {
@@ -498,4 +1311,41 @@ fn context_image(image: &impl GpuBacking, platform: GtPlatform, ring: u32) {
                                           // reset_stop_ring() sets the masked STOP_RING disable in value slot
                                           // 0x71 of the later register block; the initial inhibited restore skips it.
     image.write32(REGS + 0x71 * 4, 0x01000000);
+}
+
+#[cfg(feature = "kernel-test")]
+mod identity_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    fn smoke_identity_pool_full_wrap_and_failed_preview() -> TestResult {
+        let mut ids = Identities::new();
+        assert_eq!(ids.candidate(|_| false), Ok((1, 1)));
+        assert_eq!(
+            ids.candidate(|_| false),
+            Ok((1, 1)),
+            "a failed preparation must not consume an identity"
+        );
+        for expected in 1..=64 {
+            let (id, stamp) = ids.candidate(|_| false).unwrap();
+            assert_eq!(id, expected);
+            ids.claim(id, stamp);
+        }
+        assert_eq!(ids.candidate(|_| false), Err(SchedulingError::Full));
+        ids.retire(7);
+        ids.next_stamp = 0x7fffffff;
+        assert_eq!(
+            ids.candidate(|s| s == 0x7fffffff || s == 1 || s == 2),
+            Ok((7, 3))
+        );
+        ids.claim(7, 0x7fffffff);
+        assert_eq!(ids.next_stamp, 1);
+        assert_eq!(ids.candidate(|_| false), Err(SchedulingError::Full));
+        ids.retire(7);
+        assert_eq!(ids.candidate(|s| s == 1), Ok((7, 2)));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_guc_gt",
+        smoke_identity_pool_full_wrap_and_failed_preview
+    );
 }

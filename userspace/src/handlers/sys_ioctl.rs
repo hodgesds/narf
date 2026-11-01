@@ -12,6 +12,26 @@ struct DeviceIoctlContext {
 }
 
 impl narf_filesystem::IoctlContext for DeviceIoctlContext {
+    fn read_u64_acquire(&self, address: u64) -> Result<u64, narf_filesystem::FsError> {
+        validate_user_range(address, 8).map_err(|_| narf_filesystem::FsError::BadAddress)?;
+        if address & 7 != 0 {
+            return Err(narf_filesystem::FsError::InvalidData);
+        }
+        // SAFETY: validated user range, active syscall address space, guarded
+        // aligned access survives faults and concurrent unmaps.
+        unsafe { narf_arch::access_user_u64_guarded(address as *mut u64, None) }
+            .map_err(|_| narf_filesystem::FsError::BadAddress)
+    }
+    fn write_u64_release(&self, address: u64, value: u64) -> Result<(), narf_filesystem::FsError> {
+        validate_user_range(address, 8).map_err(|_| narf_filesystem::FsError::BadAddress)?;
+        if address & 7 != 0 {
+            return Err(narf_filesystem::FsError::InvalidData);
+        }
+        // SAFETY: same validated, fault-contained syscall contract as the load.
+        unsafe { narf_arch::access_user_u64_guarded(address as *mut u64, Some(value)) }
+            .map(|_| ())
+            .map_err(|_| narf_filesystem::FsError::BadAddress)
+    }
     fn read(&self, address: u64, destination: &mut [u8]) -> Result<(), narf_filesystem::FsError> {
         // SAFETY: this context is used only inside the calling syscall while
         // its address space is active. The helper validates and guards faults.
@@ -23,6 +43,50 @@ impl narf_filesystem::IoctlContext for DeviceIoctlContext {
         // SAFETY: same syscall/address-space contract as read; racing unmaps
         // are caught by the guarded copy rather than faulting the kernel.
         unsafe { copy_to_user(address, source) }.map_err(|_| narf_filesystem::FsError::BadAddress)
+    }
+
+    fn pin_user_pages(
+        &self,
+        address: u64,
+        pages: u64,
+        writable: bool,
+    ) -> Result<Vec<narf_memory::address_space::UserPagePin>, narf_filesystem::FsError> {
+        use narf_filesystem::FsError;
+        use narf_memory::address_space::RegionPerms;
+        let len = pages.checked_mul(4096).ok_or(FsError::BadAddress)?;
+        if address % 4096 != 0 {
+            return Err(FsError::InvalidData);
+        }
+        address.checked_add(len).ok_or(FsError::BadAddress)?;
+        let space = current_address_space().ok_or(FsError::BadAddress)?;
+        let mut pins = Vec::new();
+        pins.try_reserve_exact(pages as usize)
+            .map_err(|_| FsError::OutOfMemory)?;
+        for page in 0..pages {
+            let va = address + page * 4096;
+            // Per page: MAX_USER_COPY bounds copies, not pinned ranges.
+            validate_user_range(va, 4096).map_err(|_| FsError::BadAddress)?;
+            let at = narf_memory::VirtAddr::new(va);
+            let region = space.lookup(at).ok_or(FsError::BadAddress)?;
+            if !region.perms.contains(RegionPerms::READ) {
+                return Err(FsError::BadAddress);
+            }
+            if writable && !region.perms.contains(RegionPerms::WRITE) {
+                return Err(FsError::OperationNotPermitted);
+            }
+            // Fault a lazy page in through a guarded user access first.
+            let index = ((va - region.base.as_u64()) / 4096) as usize;
+            if region.phys.get(index).is_none_or(|phys| phys.raw() == 0) {
+                self.read(va, &mut [0])?;
+            }
+            // SAFETY: the calling task's live address space; the kernel
+            // identity map and COW tables are live during this syscall.
+            if writable && !unsafe { space.user_page_writable_or_resolve(at) } {
+                return Err(FsError::BadAddress);
+            }
+            pins.push(space.pin_user_page(at).ok_or(FsError::BadAddress)?);
+        }
+        Ok(pins)
     }
 
     fn nonblocking(&self) -> bool {
@@ -2136,4 +2200,116 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             ctx.set_return(errno_ret(EINVAL));
         }
     }
+}
+
+#[cfg(feature = "kernel-test")]
+mod pin_tests {
+    use super::*;
+    use crate::abi_test_support::*;
+    use narf_filesystem::{FsError, IoctlContext};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_lib::sync::IrqSafeSpinLock;
+    use narf_memory::{AddressSpace, VirtAddr};
+
+    static PIN_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> = IrqSafeSpinLock::new(None);
+    fn lookup_pin_as() -> Option<Arc<AddressSpace>> {
+        PIN_AS.lock().clone()
+    }
+
+    fn map(prot: u64, len: u64) -> Result<u64, &'static str> {
+        let args = SyscallArgs {
+            arg0: 0,
+            arg1: len,
+            arg2: prot,
+            arg3: 0x22, // MAP_PRIVATE | MAP_ANONYMOUS
+            arg4: u64::MAX,
+            arg5: 0,
+        };
+        match call(Syscall::Mmap.raw(), args) {
+            Some(addr) if addr > 0 => Ok(addr as u64),
+            _ => Err("anonymous mmap failed"),
+        }
+    }
+
+    fn frame(space: &AddressSpace, va: u64) -> Option<u64> {
+        let region = space.lookup(VirtAddr::new(va))?;
+        let phys = region
+            .phys
+            .get(((va - region.base.as_u64()) / 4096) as usize)?
+            .raw();
+        (phys != 0).then_some(phys)
+    }
+
+    /// The USERPTR seam over a real process address space: resident frames,
+    /// permission classes, all-or-nothing failure and pins outliving munmap.
+    fn smoke_ioctl_pin_user_pages_classes_and_lifetime() -> TestResult {
+        with_setup(|| {
+            // SAFETY: kernel tests run with paging enabled; the fixture owns
+            // this root, which inherits only the kernel half.
+            let space = Arc::new(
+                unsafe { AddressSpace::new_for_user() }.map_err(|_| "address space allocation")?,
+            );
+            *PIN_AS.lock() = Some(space.clone());
+            install_address_space_lookup(lookup_pin_as);
+            let result = (|| {
+                let rw = map(3, 3 * 4096)?;
+                // An explicit hole after the two RW pages.
+                if call(Syscall::Munmap.raw(), a1(rw + 2 * 4096, 4096)) != Some(0) {
+                    return Err("hole munmap failed");
+                }
+                let ro = map(1, 4096)?;
+                for page in [rw, rw + 4096] {
+                    // SAFETY: live user root, page inside the RW mapping.
+                    unsafe { space.demand_alloc_page(VirtAddr::new(page)) }
+                        .map_err(|_| "anonymous fault")?;
+                }
+                let context = DeviceIoctlContext {
+                    nonblocking: false,
+                    restart_deadline_ns: core::sync::atomic::AtomicU64::new(0),
+                };
+                let pins = context
+                    .pin_user_pages(rw, 2, true)
+                    .map_err(|_| "writable pin refused")?;
+                for (i, pin) in pins.iter().enumerate() {
+                    if Some(pin.phys().raw()) != frame(&space, rw + i as u64 * 4096) {
+                        return Err("pin is not the current resident frame");
+                    }
+                }
+                if !matches!(
+                    context.pin_user_pages(ro, 1, true),
+                    Err(FsError::OperationNotPermitted)
+                ) {
+                    return Err("write pin of a read-only mapping was not EPERM");
+                }
+                if !matches!(context.pin_user_pages(rw + 8, 1, true), Err(FsError::InvalidData)) {
+                    return Err("unaligned pin accepted");
+                }
+                // The second page is the hole: all-or-nothing EFAULT.
+                if !matches!(context.pin_user_pages(rw + 4096, 2, true), Err(FsError::BadAddress)) {
+                    return Err("partially unmapped range was not EFAULT");
+                }
+                let alias = narf_memory::PhysAddr::new(pins[0].phys().raw()).kernel_mut_ptr::<u8>();
+                // SAFETY: the pin retains this frame; the fixture is its only writer.
+                unsafe { core::ptr::write_volatile(alias.add(100), 0xa5) };
+                match call(Syscall::Munmap.raw(), a1(rw, 2 * 4096)) {
+                    Some(0) => {}
+                    _ => return Err("munmap failed"),
+                }
+                if frame(&space, rw).is_some() {
+                    return Err("munmap left the page mapped");
+                }
+                let mut byte = [0];
+                pins[0].copy_into(100, &mut byte);
+                if byte != [0xa5] {
+                    return Err("pin did not outlive munmap");
+                }
+                drop(pins);
+                Ok(())
+            })();
+            restore_address_space_lookup(None);
+            *PIN_AS.lock() = None;
+            result
+        })
+    }
+    kernel_test_in!("userspace/ioctl", smoke_ioctl_pin_user_pages_classes_and_lifetime);
 }

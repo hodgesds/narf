@@ -935,7 +935,32 @@ pub struct FsIoctlReply {
 pub trait IoctlContext: Sync {
     fn read(&self, address: u64, destination: &mut [u8]) -> Result<(), FsError>;
     fn write(&self, address: u64, source: &[u8]) -> Result<(), FsError>;
+    /// Atomic aligned user-fence access; byte-copy implementations must not
+    /// silently substitute a potentially torn qword. The syscall boundary
+    /// validates the range and contains faults on concurrent unmaps.
+    fn read_u64_acquire(&self, _address: u64) -> Result<u64, FsError> {
+        Err(FsError::Unsupported)
+    }
+    fn write_u64_release(&self, _address: u64, _value: u64) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
     fn nonblocking(&self) -> bool;
+    /// GUP-style lifetime holds on `pages` resident pages from `address` in
+    /// the calling process: every page is faulted in and, when `writable`,
+    /// its private COW copy is resolved first, so the pins name the frames
+    /// the caller writes now. Pins are snapshots. Later munmap, remap or COW
+    /// splits do not move them, and nothing is freed under them. Unmapped or
+    /// unreadable pages are `BadAddress`; a write pin over a read-only mapping
+    /// is `OperationNotPermitted` (hmm_range_fault's -EPERM). Device/PFN
+    /// mappings are refused. All-or-nothing: an error releases every pin.
+    fn pin_user_pages(
+        &self,
+        _address: u64,
+        _pages: u64,
+        _writable: bool,
+    ) -> Result<Vec<narf_memory::address_space::UserPagePin>, FsError> {
+        Err(FsError::Unsupported)
+    }
     /// Resolve a descriptor in the calling process without exposing its table
     /// to a driver. The retained open description also handles dup/fork.
     fn file(&self, _fd: i32) -> Result<Arc<dyn FileOps>, FsError> {
@@ -1081,6 +1106,15 @@ pub struct DirEntry {
 pub trait DrmFence: Send + Sync {
     fn is_signalled(&self) -> bool;
     fn wait(&self, timeout_ms: u64) -> bool;
+
+    /// Ready for an i915 EXEC_FENCE_SUBMIT dependency. Native Intel fences
+    /// may report scheduling admission before terminal completion; foreign
+    /// fences conservatively wait for completion, as Linux i915 does.
+    /// A terminal failure also satisfies the dependency. This never implies
+    /// readiness for CPU access, resource reclamation, or ordinary fence waits.
+    fn is_submit_ready(&self) -> bool {
+        self.is_signalled()
+    }
 
     /// Driver-private execution context used to elide a self-dependency wait:
     /// work submitted later to the same ordered ring already depends on this

@@ -668,7 +668,9 @@ pub mod amdgpu_vm;
 pub mod amdgpu_vmhub_regs;
 #[cfg(feature = "amdgpu")]
 pub mod amdgpu_vmid;
-#[cfg(feature = "amdgpu")]
+// Shared by the Intel discrete local-memory pool.
+#[cfg(any(feature = "amdgpu", feature = "intel"))]
+#[cfg_attr(not(feature = "amdgpu"), allow(dead_code))]
 pub mod amdgpu_vram;
 #[cfg(feature = "amdgpu")]
 mod amdgpu_vram_access;
@@ -702,6 +704,8 @@ pub mod intel_gpu_audio;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_aux;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_context;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_ddi;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_dmc;
@@ -712,7 +716,11 @@ pub mod intel_gpu_dp_bridge;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_edp;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_engine;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_exec;
+#[cfg(feature = "intel")]
+mod intel_gpu_exec_sync;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_fence;
 #[cfg(feature = "intel")]
@@ -725,6 +733,10 @@ pub mod intel_gpu_gmbus;
 pub mod intel_gpu_gt;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gt_hw;
+#[cfg(feature = "intel")]
+mod intel_gpu_gt_irq;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_gt_registers;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gt_runtime;
 #[cfg(feature = "intel")]
@@ -742,9 +754,13 @@ pub mod intel_gpu_guc_sched;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_guc_transport;
 #[cfg(feature = "intel")]
+mod intel_gpu_guc_wa;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_hdmi;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_hwconfig;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_kms;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_media;
 #[cfg(feature = "intel")]
@@ -755,6 +771,8 @@ pub mod intel_gpu_modeset_xelpg;
 pub mod intel_gpu_mst;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_multipipe;
+#[cfg(feature = "intel")]
+mod intel_gpu_nonpriv;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_pcode;
 #[cfg(feature = "intel")]
@@ -774,9 +792,33 @@ pub mod intel_gpu_regions;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_render;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_scanout;
+#[cfg(feature = "intel")]
+mod intel_gpu_scanout_io;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_slpc;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_timestamp;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_topology;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_uapi;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_user;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_vram;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_wm;
+#[cfg(feature = "intel")]
+mod intel_gpu_xe;
+#[cfg(feature = "intel")]
+mod intel_gpu_xe_query;
+#[cfg(feature = "intel")]
+mod intel_gpu_xe_sync;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_xe_uapi;
+#[cfg(feature = "intel")]
+mod intel_gpu_xe_vm;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_xelpg;
 pub mod nvidia_gpu;

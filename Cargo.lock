@@ -1450,6 +1450,7 @@ version = "0.0.0"
 dependencies = [
  "narf-acpi",
  "narf-arch",
+ "narf-block",
  "narf-bus",
  "narf-capabilities",
  "narf-console",

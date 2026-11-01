@@ -25,6 +25,12 @@ applications above NARF.
 
 ## 3. Public interface
 
+Device ioctl contexts implement the filesystem's atomic aligned qword
+load-acquire/store-release hooks using `narf_arch::access_user_u64_guarded`.
+The syscall boundary validates the full user range before entering the
+fault-contained access, including on racing unmaps. User-fence reads and
+writes do not pass through the byte-copy helpers.
+
 Network device ioctls bridge bounded native NIC controls to Linux ethtool:
 link settings, rings/channels/RSS/coalescing, pause/EEE/WoL, counters/names,
 register/NVM reads, diagnostics, link restart and supported L2 flow rules.

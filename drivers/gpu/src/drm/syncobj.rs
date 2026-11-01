@@ -711,7 +711,7 @@ pub struct SyncObjTable {
 }
 
 impl SyncObjTable {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         SyncObjTable {
             objs: Vec::new(),
             next: 1,

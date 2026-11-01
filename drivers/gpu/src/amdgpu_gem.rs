@@ -51,8 +51,9 @@
 //! GEM_WAIT_IDLE is handled by amdgpu_cs::dispatch_async on running cards.
 //!
 //! `GEM_USERPTR` pins the caller's pages at creation (Linux faults them with
-//! HMM and re-validates through an MMU interval notifier). LINUX-GAP: without
-//! a notifier the pins are a snapshot: a later CPU remap, fork-COW split or
+//! HMM and re-validates through an MMU interval notifier). Fork copies pinned
+//! pages for the child, so the pins keep aliasing the creator's memory.
+//! LINUX-GAP: without a notifier the pins are a snapshot: a later CPU remap or
 //! munmap leaves the GPU on the pinned frames, never on freed memory.
 //! `GEM_LIST_HANDLES` is not implemented and returns EINVAL.
 

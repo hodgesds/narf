@@ -5,6 +5,55 @@
 
 use crate::intel_gpu::Generation;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GraphicsError {
+    Unsupported,
+    Unavailable,
+    Unstable,
+}
+
+/// A matched graphics-GT IP, sampled with current forcewake by its owner.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GraphicsIp {
+    pub version: u16,
+    pub step: u8,
+}
+
+impl GraphicsIp {
+    pub(crate) fn read(
+        mmio: &impl crate::intel_gpu_aux::MmioWindow,
+        platform: GtPlatform,
+    ) -> Result<Self, GraphicsError> {
+        platform.guc().ok_or(GraphicsError::Unsupported)?;
+        if platform == GtPlatform::Alchemist {
+            return Ok(Self {
+                version: 1255,
+                step: 0,
+            });
+        }
+        let a = mmio.read32(0xd8c);
+        let b = mmio.read32(0xd8c);
+        if a == u32::MAX || b == u32::MAX {
+            return Err(GraphicsError::Unavailable);
+        }
+        if a != b {
+            return Err(GraphicsError::Unstable);
+        }
+        let version = (a >> 22) * 100 + ((a >> 14) & 255);
+        let supported = match platform {
+            GtPlatform::Battlemage => matches!(version, 2001 | 2002),
+            _ => matches!(version, 1270 | 1271 | 1274),
+        };
+        if !supported {
+            return Err(GraphicsError::Unsupported);
+        }
+        Ok(Self {
+            version: version as u16,
+            step: (a & 63) as u8,
+        })
+    }
+}
+
 // GuC addresses below WOPCM bypass the GGTT. Reserve the largest WOPCM
 // accepted from already-locked firmware layouts (xe_wopcm.c: MAX_WOPCM_SIZE).
 pub(crate) const GUC_GGTT_MIN: u32 = 8 * 1024 * 1024;

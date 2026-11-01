@@ -48,7 +48,7 @@ intel = ["narf-drivers-gpu/intel"]
 # Marker the frame-level `kernel-test` feature switches on so this
 # crate can skip work that would interfere with the test harness
 # (live status-panel repaint while a test installs a test scanout).
-kernel-test = []
+kernel-test = ["narf-drivers-gpu/kernel-test"]
 
 [lints]
 workspace = true

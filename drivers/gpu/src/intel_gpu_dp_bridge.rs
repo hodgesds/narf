@@ -140,8 +140,19 @@ impl DpAltModeGpuBridge for IntelDpBridge {
             return Err(DpBridgeError::NoSuchConnector);
         }
 
+        let display =
+            intel_gpu::with_controller(|gpu| crate::intel_gpu_kms::display_for_bar(&gpu.gtt_mmadr))
+                .flatten();
+        let mut ownership = match display.as_ref() {
+            Some(display) => Some(display.legacy().map_err(|_| DpBridgeError::NotReady)?),
+            None => None,
+        };
+        if let Some(guard) = ownership.as_mut() {
+            guard.suspend();
+        }
+
         let mut outcome = Err(DpBridgeError::NotReady);
-        intel_gpu::with_controller(|gpu| {
+        intel_gpu::with_display_info(|gpu| {
             outcome = self.bind_and_modeset(gpu, ddi, cfg);
         });
         outcome
@@ -151,7 +162,7 @@ impl DpAltModeGpuBridge for IntelDpBridge {
 impl IntelDpBridge {
     fn bind_and_modeset(
         &self,
-        gpu: &intel_gpu::IntelGpu,
+        gpu: &intel_gpu::DisplayInfo,
         ddi: Ddi,
         cfg: &DpLinkConfig,
     ) -> Result<(), DpBridgeError> {

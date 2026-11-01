@@ -50,12 +50,18 @@ pub const QUERY_GEOMETRY_SUBSLICES: u64 = 6;
 pub const QUERY_GUC_SUBMISSION_VERSION: u64 = 7;
 
 pub const EXEC_RENDER: u64 = 1;
+pub const EXEC_BLT: u64 = 3;
+pub const CONTEXT_PARAM_ENGINES: u64 = 0xa;
+/// I915_ENGINE_CLASS_INVALID with I915_ENGINE_CLASS_INVALID_NONE: an empty
+/// engine-map slot.
+pub const ENGINE_INVALID: u16 = 0xffff;
 pub const EXEC_NO_RELOC: u64 = 1 << 11;
 pub const EXEC_HANDLE_LUT: u64 = 1 << 12;
 pub const EXEC_FENCE_IN: u64 = 1 << 16;
 pub const EXEC_FENCE_OUT: u64 = 1 << 17;
 pub const EXEC_BATCH_FIRST: u64 = 1 << 18;
 pub const EXEC_FENCE_ARRAY: u64 = 1 << 19;
+pub const EXEC_FENCE_SUBMIT: u64 = 1 << 20;
 pub const EXEC_USE_EXTENSIONS: u64 = 1 << 21;
 pub const OBJECT_WRITE: u64 = 1 << 2;
 pub const OBJECT_SUPPORTS_48B: u64 = 1 << 3;

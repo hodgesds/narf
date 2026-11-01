@@ -13,6 +13,11 @@ pub mod mmio;
 pub mod percpu;
 pub mod speculation;
 
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::uaccess::access_user_u64_guarded;
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::smap::access_user_u64_guarded;
+
 mod tests;
 
 #[cfg(target_arch = "x86_64")]

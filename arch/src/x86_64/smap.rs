@@ -505,6 +505,68 @@ pub unsafe fn cmpxchg_user_guarded(uaddr: *mut u32, old: u32, new: u32) -> Resul
     Ok(observed)
 }
 
+/// One aligned, fault-contained 64-bit user load (acquire) or store (release).
+/// `None` loads; `Some(value)` stores and returns that value.
+///
+/// # Safety
+/// The caller must validate the entire user address range and execute in the
+/// trapping task's address space, outside IRQ context. The user mapping may
+/// disappear concurrently; the guarded probe turns that fault into `Err`.
+pub unsafe fn access_user_u64_guarded(address: *mut u64, write: Option<u64>) -> Result<u64, ()> {
+    use crate::x86_64::probe;
+    use core::sync::atomic::{compiler_fence, Ordering};
+    if address as usize & 7 != 0 {
+        return Err(());
+    }
+    let saved_flags: u64;
+    let recovery: u64;
+    // SAFETY: privileged IRQ masking and a local recovery label at CPL0.
+    unsafe {
+        asm!("pushfq", "pop {f}", "cli", f = out(reg) saved_flags);
+        asm!("lea {r}, [96f + rip]", r = out(reg) recovery, options(nostack, preserves_flags));
+    }
+    let cpu = crate::current_cpu_id().raw() as usize;
+    set_guarded_copy_armed_for(cpu, true);
+    probe::arm_for_cpu(cpu, recovery);
+    let mut value = write.unwrap_or(0);
+    // SAFETY: SMAP is opened only across the probed access. Aligned x86 MOV
+    // is a single-copy atomic qword operation; TSO plus compiler fences gives
+    // the acquire/release contract without a modifying read operation.
+    unsafe { stac() };
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: the armed probe covers exactly this aligned qword operation.
+    unsafe {
+        asm!(
+            "test {store:e}, {store:e}",
+            "jz 95f",
+            "mov qword ptr [{p}], {v}",
+            "jmp 96f",
+            "95:",
+            "mov {v}, qword ptr [{p}]",
+            "96:",
+            p = in(reg) address,
+            store = in(reg) u32::from(write.is_some()),
+            v = inout(reg) value,
+            options(nostack),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: always close SMAP, including the recovered-fault path.
+    unsafe { clac() };
+    let cpu = crate::current_cpu_id().raw() as usize;
+    let caught = probe::disarm_for_cpu(cpu);
+    set_guarded_copy_armed_for(cpu, false);
+    if saved_flags & (1 << 9) != 0 {
+        // SAFETY: restore the caller's IRQ posture.
+        unsafe { asm!("sti", options(nostack)) };
+    }
+    if caught.vector.is_some() {
+        Err(())
+    } else {
+        Ok(value)
+    }
+}
+
 /// Clear CR4.SMAP. Reserved for unit-test reset paths only.
 ///
 /// **DO NOT call this from production code.**

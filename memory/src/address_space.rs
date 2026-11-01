@@ -1158,6 +1158,25 @@ fn resident_count(phys: &RegionBacking) -> u64 {
     phys.indexed().filter(|(_, phys)| phys.raw() != 0).count() as u64
 }
 
+/// A fresh private copy of a pinned page for a fork child. The copy is a
+/// snapshot: concurrent DMA into the pinned page after this point is the
+/// parent's, exactly as Linux's copy_present_page.
+fn copy_pinned_for_child(source: PhysAddr) -> Result<PhysAddr, AddressSpaceError> {
+    let frame =
+        crate::frame::alloc_user_frame_urgent().map_err(|_| AddressSpaceError::AllocationFailed)?;
+    let copy = frame.start_address();
+    // SAFETY: both frames are resident RAM reached through the kernel map; the
+    // source is retained by its pin and the destination is exclusively ours.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            source.kernel_ptr::<u8>(),
+            copy.kernel_mut_ptr::<u8>(),
+            crate::frame::PAGE_SIZE as usize,
+        );
+    }
+    Ok(copy)
+}
+
 fn rollback_backing_retain(phys: &RegionBacking, end: usize) {
     for (_, slots) in phys.chunks(0, end) {
         crate::frame::cow::rollback_inc_ref_batch(slots);
@@ -12391,7 +12410,7 @@ impl AddressSpace {
         };
 
         for region in parent.iter() {
-            let phys = match region.phys.try_clone() {
+            let mut phys = match region.phys.try_clone() {
                 Ok(phys) => phys,
                 Err(_) => {
                     if !reserve_per_region {
@@ -12403,21 +12422,45 @@ impl AddressSpace {
             let mut perms = region.perms;
             perms.0 &= !(RegionPerms::LOCKED.0 | RegionPerms::LOCK_ONFAULT.0);
             let shared = perms.contains(RegionPerms::SHARED);
+            // Linux page_needs_cow_for_dma: a pinned private page is copied
+            // for the child now. The parent keeps it exclusive (and writable
+            // if it was), so a GPU/DMA pin keeps aliasing the parent's memory
+            // instead of a frame left shared with the child. Like Linux, whose
+            // test is the COW mapping and not the PTE write bit, this ignores
+            // the region's current protection: after mprotect(PROT_READ), a
+            // later PROT_WRITE would otherwise split the parent away from its
+            // pin. Every resident private frame is owned by this address space
+            // (private FILE_DEMAND faults install private copies), and special
+            // mappings cannot be pinned. Copies are not COW retains: they are
+            // installed only after the region succeeds.
+            let mut copies: Vec<(usize, PhysAddr)> = Vec::new();
+            // (retained prefix, error) of a failed region.
+            let mut failure = None;
             if !shared {
                 let writable = perms.contains(RegionPerms::WRITE);
-                for (chunk_first, slots) in phys.chunks(0, phys.len()) {
+                'chunks: for (chunk_first, slots) in phys.chunks(0, phys.len()) {
                     let mut run_start = None;
                     for (offset, page) in slots.iter().enumerate() {
                         let page_index = chunk_first + offset;
                         let selected = if page.raw() == 0 {
                             false
                         } else {
-                            // Read pins retain RAM without restricting the
-                            // original PTE. Sample before retain: pin release
-                            // publishes its owner decrement before clearing
-                            // this marker, so no unprotected mapping is missed.
+                            // Sample before retain: pin release publishes its
+                            // owner decrement before clearing this marker, so
+                            // no unprotected mapping is missed.
                             let pinned = crate::frame::cow::is_pinned(*page);
-                            (retain.retain(*page) || pinned) && writable
+                            if pinned {
+                                match copy_pinned_for_child(*page) {
+                                    Ok(copy) => copies.push((page_index, copy)),
+                                    Err(error) => {
+                                        failure = Some((page_index, error));
+                                        break 'chunks;
+                                    }
+                                }
+                                false
+                            } else {
+                                retain.retain(*page) && writable
+                            }
                         };
                         if selected {
                             run_start.get_or_insert(page_index);
@@ -12425,11 +12468,8 @@ impl AddressSpace {
                             let pages = (page_index - start) as u64;
                             let base = VirtAddr::new(region.base.as_u64() + start as u64 * 4096);
                             if let Err(error) = protect_run(base, pages) {
-                                rollback_backing_retain(&phys, page_index + 1);
-                                if !reserve_per_region {
-                                    child_regions.finish_sorted_build();
-                                }
-                                return Err(error);
+                                failure = Some((page_index + 1, error));
+                                break 'chunks;
                             }
                         }
                     }
@@ -12437,20 +12477,35 @@ impl AddressSpace {
                         let pages = (chunk_first + slots.len() - start) as u64;
                         let base = VirtAddr::new(region.base.as_u64() + start as u64 * 4096);
                         if let Err(error) = protect_run(base, pages) {
-                            rollback_backing_retain(&phys, chunk_first + slots.len());
-                            if !reserve_per_region {
-                                child_regions.finish_sorted_build();
-                            }
-                            return Err(error);
+                            failure = Some((chunk_first + slots.len(), error));
+                            break 'chunks;
                         }
                     }
                 }
             }
-            if reserve_per_region && child_regions.try_reserve_nodes(1).is_err() {
-                if !shared {
-                    rollback_backing_retain(&phys, phys.len());
+            if failure.is_none()
+                && reserve_per_region
+                && child_regions.try_reserve_nodes(1).is_err()
+            {
+                failure = Some((phys.len(), AddressSpaceError::AllocationFailed));
+            }
+            if let Some((retained, error)) = failure {
+                // Copied slots were never retained: clear them so the retain
+                // rollback skips them, then release the copies.
+                for (index, copy) in copies {
+                    *phys.get_mut(index).expect("copied slot") = PhysAddr::new(0);
+                    crate::frame::free_frame(crate::frame::PhysFrame::new(copy));
                 }
-                return Err(AddressSpaceError::AllocationFailed);
+                if !shared {
+                    rollback_backing_retain(&phys, retained);
+                }
+                if !reserve_per_region {
+                    child_regions.finish_sorted_build();
+                }
+                return Err(error);
+            }
+            for (index, copy) in copies {
+                *phys.get_mut(index).expect("copied slot") = copy;
             }
             let child_region = Region {
                 base: region.base,

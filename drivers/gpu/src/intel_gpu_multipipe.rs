@@ -268,7 +268,7 @@ pub fn reprogram_dbuf_shares<M: MmioWindow + ?Sized>(mmio: &M, allocator: &PipeA
 /// 32 MiB, the largest block the scanout allocator hands out
 /// (`scanout_order_for` caps at order 13), so windows can
 /// never overlap.
-pub const SCANOUT_GTT_STRIDE: u64 = 0x200_0000;
+pub const SCANOUT_GTT_STRIDE: u64 = crate::intel_gpu_gtt::CONSOLE_SCANOUT_WINDOW_BYTES;
 
 /// The GGTT offset of `pipe`'s scanout window. Pipe A keeps
 /// the historical single-scanout offset (0x1000000); B and C
