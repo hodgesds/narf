@@ -1367,7 +1367,7 @@ fn smoke_vt_mode_roundtrip() -> TestResult {
     }
     // logind installs VT_PROCESS with release/acquire signals; VT_GETMODE must
     // round-trip it faithfully.
-    crate::vt::set_mode(
+    let _ = crate::vt::set_mode(
         1,
         crate::vt::VtMode {
             mode: crate::vt::VT_PROCESS,

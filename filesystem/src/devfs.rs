@@ -1439,6 +1439,25 @@ impl FileOps for DevConsole {
         Box::pin(async move { Ok(()) })
     }
 
+    fn ioctl_user<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        _context: &'a dyn crate::IoctlContext,
+    ) -> FsFuture<'a, u64> {
+        Box::pin(async move {
+            if cmd == crate::devfs_pty::VT_WAITACTIVE
+                && self.port().kind() != crate::console_tty::PortKind::Serial
+            {
+                let target = u32::try_from(arg).map_err(|_| crate::FsError::InvalidData)?;
+                crate::vt::wait_active(target).await?;
+                Ok(0)
+            } else {
+                self.ioctl(cmd, arg as usize)
+            }
+        })
+    }
+
     /// Terminal ioctls so `/dev/console` looks like a real tty: a
     /// successful `TCGETS` (returning a cooked-mode termios) makes
     /// `isatty(0)` true, which is what flips a shell into interactive
@@ -1654,18 +1673,21 @@ impl FileOps for DevConsole {
                 Ok(0)
             }
             VT_ACTIVATE => {
-                // `arg` is the VT number by value. Move the logical active VT so
-                // logind's active-session comparison (and the sysfs `active`
-                // read) resolve to the switched-to session.
-                crate::vt::activate(arg as u32)
+                let target = u32::try_from(arg).map_err(|_| crate::FsError::InvalidData)?;
+                crate::vt::activate(target)
                     .map(|()| 0)
                     .map_err(|()| crate::FsError::InvalidData)
             }
             VT_WAITACTIVE => {
-                // `arg` is the target VT. Activation is synchronous in NARF, so
-                // the target is already current — return success immediately.
-                let _ = arg;
-                Ok(0)
+                // The async ioctl_user path waits on a durable wake. Direct
+                // sync callers may only succeed when the target is active.
+                if !(1..=crate::vt::MAX_VT as usize).contains(&arg) {
+                    Err(crate::FsError::InvalidData)
+                } else if crate::vt::active_vt() as usize == arg {
+                    Ok(0)
+                } else {
+                    Err(crate::FsError::WouldBlock)
+                }
             }
             VT_GETMODE => {
                 let m = crate::vt::get_mode(this_vt);
@@ -1685,15 +1707,13 @@ impl FileOps for DevConsole {
                         acqsig,
                         frsig,
                     },
-                );
-                Ok(0)
+                )
+                .map(|()| 0)
+                .map_err(|()| crate::FsError::InvalidData)
             }
-            VT_RELDISP => {
-                // Acknowledge a switch request. NARF never forces a switch out
-                // from under the owner, so there is nothing to release.
-                let _ = arg;
-                Ok(0)
-            }
+            VT_RELDISP => crate::vt::release_display(this_vt, arg as u64)
+                .map(|()| 0)
+                .map_err(|()| crate::FsError::InvalidData),
             _ => Err(crate::FsError::Unsupported),
         }
     }

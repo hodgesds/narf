@@ -731,6 +731,15 @@ The Linux open path treats `/dev/tty` as the caller's controlling-terminal
 multiplexer: it selects the recorded console or PTY slave, preserves the 5:0
 path-node identity, and reports `ENXIO` for a detached session. `O_PATH`
 continues to open only the side-effect-free path node.
+`vt::install_process_hooks` supplies opaque installing-thread identities and
+a privileged signal enqueue callback before userspace runs. The callback must
+not wait or re-enter VT state. `VT_SETMODE(VT_PROCESS)` captures that thread;
+activation sends its release signal and waits for `VT_RELDISP` acceptance
+before publishing the active VT, notifying sysfs, and signalling acquisition.
+Rejection leaves the old VT active. A dead controller reverts to VT_AUTO.
+`VT_WAITACTIVE` through `FileOps::ioctl_user` sleeps on a registered wake and
+unregisters on cancellation; the direct synchronous ioctl returns WouldBlock
+until the target is active. `/dev/tty` forwards this async ioctl contract.
 Userspace writes to console ttys (`/dev/console`, serial and virtual terminals)
 apply the selected tty's output processing and reach its output device without
 creating kernel log records. A kernel-log reader may print records to a tty and

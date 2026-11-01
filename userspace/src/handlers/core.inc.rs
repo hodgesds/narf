@@ -1074,6 +1074,7 @@ pub fn init_per_task_state() {
         // ISIG characters on a console tty raise their signal at that tty's
         // own foreground process group (Linux `isig` -> `kill_pgrp`).
         narf_filesystem::console_tty::install_signal_pgrp_hook(console_isig_to_pgrp);
+        narf_filesystem::vt::install_process_hooks(current_task_id, vt_signal_controller);
         // The console tty's winsize follows the framebuffer console's text
         // grid (Linux `vc_do_resize` → `tty_do_resize`); applied at once if
         // the framebuffer console is already up.
@@ -16602,6 +16603,18 @@ fn console_isig_to_pgrp(pgrp: u64, byte: u8) -> bool {
         _ => return false,
     };
     deliver_signal_to_pgrp(pgrp, signum)
+}
+
+/// Linux kill_pid(..., priv=1) for the thread which installed VT_PROCESS.
+/// Only enqueue/wake here: the VT state lock serializes its handshakes.
+fn vt_signal_controller(task: u64, signum: u32) -> bool {
+    if task == 0 || signum > 64 || !signal_target_exists(task) {
+        return false;
+    }
+    if signum != 0 {
+        raise_signal_pending(task, signum);
+    }
+    true
 }
 
 /// `TIOCNOTTY`-on-console hook: detach the calling task's controlling tty.

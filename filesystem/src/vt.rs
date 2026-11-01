@@ -16,13 +16,22 @@
 //! `/sys/class/tty/tty0/active` attribute — so both must agree; see
 //! [`active_vt`] and [`active_sysfs`].
 //!
-//! Real hardware console switching is intentionally omitted (a VM never needs
-//! it): [`activate`] just moves the logical active VT so the read paths agree.
+//! Logical switching still needs the Linux VT_PROCESS handshake: the old
+//! controller must drop DRM master before acknowledging release, then the new
+//! controller may acquire it. No framebuffer repaint is performed here.
 //! Linux ref: `drivers/tty/vt/vt_ioctl.c`, `include/uapi/linux/vt.h`.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
+use core::future::Future;
+use core::pin::Pin;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::task::{Context, Poll};
+use narf_lib::readiness::Readiness;
 use narf_lib::sync::IrqSafeSpinLock;
+
+#[path = "vt_tests.rs"]
+mod tests;
 
 /// `vt_mode.mode` values (`include/uapi/linux/vt.h`).
 pub const VT_AUTO: u8 = 0x00;
@@ -36,8 +45,7 @@ pub const MAX_VT: u32 = 63;
 
 /// `struct vt_mode` (`include/uapi/linux/vt.h`) — the per-VT switch mode set by
 /// `VT_SETMODE` and read back by `VT_GETMODE`. Stored so the round-trip is
-/// faithful; the signals are honoured only trivially since NARF never forces a
-/// switch out from under the owner.
+/// faithful; release/acquire signals are delivered to its installing thread.
 #[derive(Clone, Copy, Debug)]
 pub struct VtMode {
     pub mode: u8,
@@ -69,6 +77,9 @@ struct State {
     allocated: BTreeSet<u32>,
     /// Per-VT switch modes set via `VT_SETMODE`.
     modes: BTreeMap<u32, VtMode>,
+    controllers: BTreeMap<u32, u64>,
+    /// A process-controlled active VT must acknowledge before it changes.
+    pending: Option<u32>,
     /// Per-VT owner `(uid, gid)`. logind `chown`s a session's VT to the session
     /// user (and back to root on restore); the default is `root:tty` = `(0, 5)`,
     /// matching devtmpfs' `/dev/ttyN`.
@@ -79,8 +90,65 @@ static STATE: IrqSafeSpinLock<State> = IrqSafeSpinLock::new(State {
     active: 1,
     allocated: BTreeSet::new(),
     modes: BTreeMap::new(),
+    controllers: BTreeMap::new(),
+    pending: None,
     owners: BTreeMap::new(),
 });
+
+static CURRENT_CONTROLLER: AtomicUsize = AtomicUsize::new(0);
+static SIGNAL_CONTROLLER: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_CHANGED: Readiness = Readiness::new(0);
+static NEXT_WAITER: AtomicU64 = AtomicU64::new(1);
+
+/// Install the userspace thread-identity and privileged signal enqueue hooks.
+/// Identities are opaque kernel task tokens, never caller-supplied Linux pids.
+/// The signal hook returns false for a dead controller. It runs under the VT
+/// state lock, like Linux's console lock: it must only enqueue/wake, and must
+/// neither wait nor re-enter this module. Install before userspace starts.
+pub fn install_process_hooks(current: fn() -> u64, signal: fn(u64, u32) -> bool) {
+    CURRENT_CONTROLLER.store(current as usize, Ordering::Release);
+    SIGNAL_CONTROLLER.store(signal as usize, Ordering::Release);
+}
+
+fn current_controller() -> u64 {
+    let raw = CURRENT_CONTROLLER.load(Ordering::Acquire);
+    if raw == 0 {
+        return 0;
+    }
+    // SAFETY: only install_process_hooks writes this pointer/signature.
+    let current: fn() -> u64 = unsafe { core::mem::transmute(raw) };
+    current()
+}
+
+fn signal_controller(task: u64, signal: i16) -> bool {
+    let raw = SIGNAL_CONTROLLER.load(Ordering::Acquire);
+    if raw == 0 || task == 0 {
+        return false;
+    }
+    // SAFETY: only install_process_hooks writes this pointer/signature.
+    let enqueue: fn(u64, u32) -> bool = unsafe { core::mem::transmute(raw) };
+    enqueue(task, signal as u32)
+}
+
+/// Complete a switch with release already acknowledged (or VT_AUTO).
+/// Caller holds STATE, serializing acquire signals with subsequent releases.
+fn complete_switch(state: &mut State, target: u32) {
+    state.active = target;
+    state.pending = None;
+    let mode = state.modes.get(&target).copied().unwrap_or_default();
+    if mode.mode == VT_PROCESS {
+        let controller = state.controllers.get(&target).copied().unwrap_or(0);
+        if !signal_controller(controller, mode.acqsig) {
+            state.modes.remove(&target);
+            state.controllers.remove(&target);
+        }
+    }
+}
+
+fn notify_switch() {
+    crate::sysfs::notify_tty_active();
+    ACTIVE_CHANGED.notify(1);
+}
 
 /// The default VT node owner — `root:tty` (`gid 5`), as devtmpfs creates
 /// `/dev/ttyN`.
@@ -94,23 +162,97 @@ pub fn active_vt() -> u32 {
 }
 
 /// `VT_ACTIVATE(n)` — make `n` the active VT. This is the switch logind
-/// performs to activate a session (`chvt`-equivalent). Logical only: no console
-/// is repainted, but the active-VT read paths now report `n`, so logind sees
-/// the target session become active. `EINVAL` for an out-of-range VT.
+/// performs to activate a session (`chvt`-equivalent). A VT_PROCESS controller
+/// receives relsig and must acknowledge via release_display before active VT
+/// and sysfs change. A dead controller falls back to VT_AUTO, as in Linux.
 pub fn activate(n: u32) -> Result<(), ()> {
     if !(1..=MAX_VT).contains(&n) {
         return Err(());
     }
-    let changed = {
+    {
         let mut state = STATE.lock();
-        let changed = state.active != n;
-        state.active = n;
-        changed
-    };
-    if changed {
-        crate::sysfs::notify_tty_active();
+        if state.active == n {
+            return Ok(());
+        }
+        let old = state.active;
+        let mode = state.modes.get(&old).copied().unwrap_or_default();
+        if mode.mode == VT_PROCESS {
+            // Publish before signalling: another CPU may immediately ack.
+            state.pending = Some(n);
+            let controller = state.controllers.get(&old).copied().unwrap_or(0);
+            if signal_controller(controller, mode.relsig) {
+                return Ok(());
+            }
+            state.modes.remove(&old);
+            state.controllers.remove(&old);
+        }
+        complete_switch(&mut state, n);
     }
+    notify_switch();
     Ok(())
+}
+
+/// VT_RELDISP: reject a pending release (0), accept it (nonzero), or
+/// acknowledge acquisition (2) when no release is pending. Linux vt_reldisp
+/// requires VT_PROCESS and rejects release acknowledgements without a request.
+pub fn release_display(vt: u32, response: u64) -> Result<(), ()> {
+    {
+        let mut state = STATE.lock();
+        if state
+            .modes
+            .get(&vt)
+            .is_none_or(|mode| mode.mode != VT_PROCESS)
+        {
+            return Err(());
+        }
+        if state.active != vt || state.pending.is_none() {
+            return if response == 2 { Ok(()) } else { Err(()) };
+        }
+        let target = state.pending.take().unwrap();
+        if response == 0 {
+            return Ok(());
+        }
+        complete_switch(&mut state, target);
+    }
+    notify_switch();
+    Ok(())
+}
+
+struct WaitActive {
+    target: u32,
+    id: u64,
+}
+
+impl Future for WaitActive {
+    type Output = Result<(), crate::FsError>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Register before checking, so completion cannot race past the wait.
+        let _ = ACTIVE_CHANGED.arm(self.id, 1, cx.waker());
+        if active_vt() == self.target {
+            ACTIVE_CHANGED.disarm(self.id);
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for WaitActive {
+    fn drop(&mut self) {
+        ACTIVE_CHANGED.disarm(self.id);
+    }
+}
+
+/// Sleep until the requested VT is active. No state/IRQ lock crosses await;
+/// the future unregisters its durable wake on completion or cancellation.
+pub fn wait_active(target: u32) -> crate::FsFuture<'static, ()> {
+    if !(1..=MAX_VT).contains(&target) {
+        return alloc::boxed::Box::pin(async { Err(crate::FsError::InvalidData) });
+    }
+    alloc::boxed::Box::pin(WaitActive {
+        target,
+        id: NEXT_WAITER.fetch_add(1, Ordering::Relaxed),
+    })
 }
 
 /// `VT_OPENQRY` — the lowest free VT (`>= 1`, not already allocated), which the
@@ -133,8 +275,20 @@ pub fn get_mode(vt: u32) -> VtMode {
 }
 
 /// Record the switch mode `VT_SETMODE` installs for VT `vt`.
-pub fn set_mode(vt: u32, mode: VtMode) {
-    STATE.lock().modes.insert(vt, mode);
+pub fn set_mode(vt: u32, mut mode: VtMode) -> Result<(), ()> {
+    if !(1..=MAX_VT).contains(&vt) || !matches!(mode.mode, VT_AUTO | VT_PROCESS) {
+        return Err(());
+    }
+    let controller = current_controller();
+    // Linux ignores frsig and clears a previous pending release on SETMODE.
+    mode.frsig = 0;
+    let mut state = STATE.lock();
+    state.modes.insert(vt, mode);
+    state.controllers.insert(vt, controller);
+    if state.active == vt {
+        state.pending = None;
+    }
+    Ok(())
 }
 
 /// The owner `(uid, gid)` of VT `vt` (default `root:tty` if never chowned).
@@ -185,6 +339,8 @@ pub fn __reset_for_test() {
     s.active = 1;
     s.allocated.clear();
     s.modes.clear();
+    s.controllers.clear();
+    s.pending = None;
     s.owners.clear();
     drop(s);
     *KBD.lock() = Kbd::new();
