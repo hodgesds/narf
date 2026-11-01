@@ -46,6 +46,9 @@
 
 #![allow(dead_code)]
 
+/// Shared PHY-config entry types (see `crate::phy_access`).
+pub use crate::phy_access::{PhyConfigEntry, PhyConfigKind};
+
 mod tests;
 
 // ── PCI ids ─────────────────────────────────────────────────────────
@@ -405,47 +408,6 @@ pub const fn firmware_name_for_xid(xid: u32) -> &'static str {
         0x649 => FIRMWARE_8126A_2,
         _ => FIRMWARE_8126A_3,
     }
-}
-
-// ── PHY paged-register access types ─────────────────────────────────
-// The RTL8126A uses the same paged-MDIO scheme as RTL8125 / RTL8168G.
-// "Page" = value written to MII reg 0x1F; the helpers here model the
-// Linux `phy_modify_paged` / `phy_write_paged` / `r8168g_phy_param` /
-// `rtl8125_phy_param` helpers from r8169_phy_config.c.
-
-/// One entry in the static PHY configuration table.
-/// Encodes a `phy_modify_paged` or `phy_write_paged` operation.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct PhyConfigEntry {
-    /// PHY page (value written to MII reg 0x1F).
-    pub page: u16,
-    /// MII register within that page.
-    pub reg: u8,
-    /// Bits to clear (ANDed inverted with current value).
-    pub mask: u16,
-    /// Bits to set (ORed after masking).
-    pub val: u16,
-    /// Entry kind.
-    pub kind: PhyConfigKind,
-}
-
-/// Which PHY-access flavour this entry uses.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum PhyConfigKind {
-    /// `phy_modify_paged(page, reg, mask, val)` — page via MII reg 0x1F.
-    /// Linux r8169_phy_config.c `phy_modify_paged` callers.
-    ModifyPaged,
-    /// `phy_write_paged(page, reg, val)` — full 16-bit write.
-    /// Equivalent to `ModifyPaged` with `mask = 0xFFFF`.
-    WritePaged,
-    /// `r8168g_phy_param(parm, mask, val)` — page 0x0a43, reg 0x13
-    /// = parm, modify reg 0x14.
-    /// Linux r8169_phy_config.c lines 42–51.
-    R8168gParam,
-    /// `rtl8125_phy_param(parm, mask, val)` — MMD VEND2 registers
-    /// 0xb87c / 0xb87e.
-    /// Linux r8169_phy_config.c lines 53–60.
-    Rtl8125Param,
 }
 
 // ── Full rtl8126a_hw_phy_config table ───────────────────────────────

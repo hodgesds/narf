@@ -34,7 +34,7 @@
 //!
 //! So [`PhyAccess`] is the whole "MDIO layer": one accessor plus the
 //! address translation, and every entry in
-//! [`super::PHY_CONFIG_TABLE`] becomes one or two OCP transactions.
+//! [`crate::rtl8127::PHY_CONFIG_TABLE`] becomes one or two OCP transactions.
 //!
 //! ## Firmware is optional
 //!
@@ -48,7 +48,56 @@ use alloc::vec::Vec;
 
 use narf_bus::MmioRegion;
 
-use super::{PhyConfigEntry, PhyConfigKind};
+// ── PHY paged-register access types ─────────────────────────────────
+// Shared by the whole family (RTL8125 / RTL8126 / RTL8127 /
+// RTL8168G): "page" is the value written to MII register 0x1F.
+// Previously defined separately in `rtl8127.rs` and `rtl8126.rs`
+// (the 8126 copy used a `u8` register, which cannot hold the
+// MMD register the `Rtl8125Param` form modifies); one definition
+// now serves every driver.
+
+/// One entry in a static PHY configuration table.
+///
+/// The `page` / `reg` pair is interpreted per [`PhyConfigKind`]:
+///
+/// | kind | `page` | `reg` |
+/// |---|---|---|
+/// | `ModifyPaged` / `WritePaged` | MDIO page written to reg 0x1F | register in that page |
+/// | `R8168gParam` | `parm`, written to reg 0x13 of page 0x0a43 | always 0x14, the register modified |
+/// | `Rtl8125Param` | `parm`, written to MMD VEND2 reg 0xb87c | always 0xb87e, the register modified |
+///
+/// `reg` is a `u16` because the MMD register the `Rtl8125Param` form
+/// modifies (0xb87e) does not fit a `u8`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PhyConfigEntry {
+    /// MDIO page, or the `parm` selector for the `*Param` kinds.
+    pub page: u16,
+    /// Register within the page, or the fixed register the `*Param`
+    /// kinds modify.
+    pub reg: u16,
+    /// Bits to clear (ANDed inverted with current value).
+    pub mask: u16,
+    /// Bits to set (ORed after masking).
+    pub val: u16,
+    /// Entry kind.
+    pub kind: PhyConfigKind,
+}
+
+/// Which PHY-access flavour this entry uses.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PhyConfigKind {
+    /// `phy_modify_paged(page, reg, mask, val)`.
+    ModifyPaged,
+    /// `phy_write_paged(page, reg, val)` — `ModifyPaged` with
+    /// `mask = 0xFFFF`.
+    WritePaged,
+    /// `r8168g_phy_param(parm, mask, val)` — page 0x0a43, reg 0x13 =
+    /// parm, modify reg 0x14.
+    R8168gParam,
+    /// `rtl8125_phy_param(parm, mask, val)` — MMD VEND2 registers
+    /// 0xb87c / 0xb87e.
+    Rtl8125Param,
+}
 
 // ── OCP windows (BAR2) ──────────────────────────────────────────────
 
