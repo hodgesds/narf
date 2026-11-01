@@ -98,6 +98,10 @@ pub fn register_late_firmware_initcalls() {
             narf_drivers_net_realtek::configure_rtl8125_phy_late();
             InitResult::Ok
         });
+        narf_init::register(Stage::Late, "rtl8126-phy-firmware", || {
+            narf_drivers_net_realtek::configure_rtl8126_phy_late();
+            InitResult::Ok
+        });
     }
 
     #[cfg(feature = "qemu-static-ipv4")]

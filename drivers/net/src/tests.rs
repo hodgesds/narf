@@ -1536,10 +1536,19 @@ kernel_test_in!("drivers/net/rtl8126", smoke_rtl8126_phystat_decode_5g);
 fn smoke_rtl8126_tso_desc_encode() -> TestResult {
     // TSO descriptor: TD1_GTSENV4 + csum bits + MSS field.
     // Same v2 offload path as RTL8125. Linux r8169_main.c `rtl8169_tso_csum_v2`.
+    // Corrected layout: GTSENV in word0 (`flags_len`), MSS +
+    // csum bits in word1 (`vlan`).
     use crate::rtl8126::{TD1_IPv4_CS, TxDesc, TD1_GTSENV4, TD1_MSS_SHIFT, TD1_TCP_CS};
-    let d = TxDesc::with_tso(0xF000u32, 0x0001u32, 1448, 1448);
-    if d.vlan & TD1_GTSENV4 == 0 {
-        return TestResult::Fail("rtl8126 TSO: TD1_GTSENV4 not set");
+    use narf_drivers_net_realtek::features::{v2_tso_words, IpVersion};
+    let Some(words) = v2_tso_words(IpVersion::V4, 1448, 34, None) else {
+        return TestResult::Fail("rtl8126 TSO: v2_tso_words rejected a valid request");
+    };
+    let d = TxDesc::with_offload(0xF000u32, 0x0001u32, 1448, words);
+    if d.flags_len & TD1_GTSENV4 == 0 {
+        return TestResult::Fail("rtl8126 TSO: TD1_GTSENV4 not set in word0");
+    }
+    if d.vlan & TD1_GTSENV4 != 0 {
+        return TestResult::Fail("rtl8126 TSO: TD1_GTSENV4 must not be in word1");
     }
     if d.vlan & TD1_IPv4_CS == 0 {
         return TestResult::Fail("rtl8126 TSO: TD1_IPv4_CS not set");
@@ -1570,14 +1579,19 @@ kernel_test_in!("drivers/net/rtl8126", smoke_rtl8126_tso_desc_encode);
 fn smoke_rtl8126_csum_offload_bits() -> TestResult {
     // csum-only descriptor: IPv4_CS + TCP_CS set, GTSENV4 must NOT be set.
     use crate::rtl8126::{TD1_IPv4_CS, TxDesc, TD1_GTSENV4, TD1_TCP_CS};
-    let d = TxDesc::with_csum(0xE000u32, 0x0001u32, 60);
+    use narf_drivers_net_realtek::features::{v2_csum_words, IpVersion};
+    use narf_net::L4CsumKind;
+    let Some(words) = v2_csum_words(L4CsumKind::Tcp, IpVersion::V4, 34, None) else {
+        return TestResult::Fail("rtl8126 csum: v2_csum_words rejected a valid request");
+    };
+    let d = TxDesc::with_offload(0xE000u32, 0x0001u32, 60, words);
     if d.vlan & TD1_IPv4_CS == 0 {
         return TestResult::Fail("rtl8126 csum: TD1_IPv4_CS not set");
     }
     if d.vlan & TD1_TCP_CS == 0 {
         return TestResult::Fail("rtl8126 csum: TD1_TCP_CS not set");
     }
-    if d.vlan & TD1_GTSENV4 != 0 {
+    if d.flags_len & TD1_GTSENV4 != 0 {
         return TestResult::Fail("rtl8126 csum: TD1_GTSENV4 must not be set");
     }
     TestResult::Pass

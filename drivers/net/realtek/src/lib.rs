@@ -76,3 +76,9 @@ pub fn configure_rtl8127_phy_late() {
 pub fn configure_rtl8125_phy_late() {
     rtl8125::configure_phy_late();
 }
+
+/// The RTL8126 late PHY-firmware pass. Same ordering constraint.
+#[cfg(feature = "builtin")]
+pub fn configure_rtl8126_phy_late() {
+    rtl8126::configure_phy_late();
+}

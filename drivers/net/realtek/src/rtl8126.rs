@@ -1,6 +1,18 @@
 //! Realtek RTL8126 / RTL8126A 5 Gigabit Ethernet driver — Stage-1
-//! cut: probe + reset + TX/RX rings + one MSI-X vector. No PHY-config
-//! tables yet (PHY-config is a follow-up matching the rtl8125 pattern).
+//! cut, extended with the Linux compared feature set: probe +
+//! reset + TX/RX rings + one MSI-X vector, plus TX checksum
+//! (TCP/UDP, v4/v6) and TSO
+//! (v2 layout — VER_70 is csum-v2), VLAN tag insertion on TX, RX
+//! checksum decode, jumbo-sized rings / RMS / MTPS, WoL register
+//! programming (including the 8125-family MAC-OCP steps), the EEE
+//! TX LPI idle timer, and the existing 6-entry PHY-config table
+//! applied from a `Stage::Late` hook (firmware first, matching
+//! Linux's `rtl8126a_hw_phy_config`). Deliberate asymmetries,
+//! shared with the 8125 driver: RX VLAN stripping stays OFF,
+//! the interface MTU stays 1500 with offloads advertised, and
+//! RSS stays off (Linux enables RSS only on VER_80). Still
+//! missing: EEE PHY advertisement and GMII auto-negotiation
+//! tuning.
 //!
 //! ## Reference
 //!
@@ -265,11 +277,15 @@ pub(crate) const RXD_EOR: u32 = 1 << 30;
 pub(crate) const RXD_LS: u32 = 1 << 28;
 pub(crate) const RXD_LEN_MASK: u32 = 0x3FFF;
 
-/// RX buffer size — 2 KiB, identical to rtl8125 Stage-1.
-pub const RX_BUF_LEN: usize = 2048;
+/// RX buffer size. Linux sizes every RX buffer on this family to
+/// `R8169_RX_BUF_SIZE` (16 KiB − 1) and programs RMS to the
+/// buffer bound, independent of MTU.
+pub const RX_BUF_LEN: usize = 16383;
 
-const MTPS_DEFAULT: u8 = 0x3B;
-const RMS_DEFAULT: u16 = 1536;
+/// TX slot buffer size: one slot must hold the largest frame this
+/// driver will transmit — the family jumbo tagged frame
+/// (16384 bytes).
+pub const TX_BUF_LEN: usize = 16384;
 
 /// In-memory TX (and RX) descriptor — 16-byte `repr(C)` layout shared
 /// with rtl8125. The RTL8126 hardware DMAs the same on-wire format.
@@ -314,29 +330,25 @@ pub const fn build_rx_desc(slot: usize, phys: u64, buf_size: u32) -> TxDesc {
 }
 
 // ── TX offload descriptor helpers ───────────────────────────────────
-// Same TD1 offload-bit layout as RTL8125 (TxDesc.vlan / word1).
-// Linux r8169_main.c `rtl8169_tso_csum_v2` (same path for VER_70).
+// Canonical definitions live in `crate::features` (corrected
+// placement: v2 GTSENV/GTTCPHO in word0, MSS/csum bits/TCPHO in
+// word1). The previous in-tree comments placed the v2 bits in
+// word1, which was wrong and would have corrupted the MSS field.
 // RTL8126 uses the v2 offload path identically to RTL8125.
+/// Historic spelling of [`TD1_IPV4_CS`].
+pub use crate::features::TD1_IPV4_CS as TD1_IPv4_CS;
+pub use crate::features::{
+    TD1_GTSENV4, TD1_GTSENV6, TD1_IPV4_CS, TD1_IPV6_CS, TD1_MSS_SHIFT, TD1_TCP_CS, TD1_UDP_CS,
+};
 
-/// TSO: enable giant-send IPv4. Combine with `TD1_IPv4_CS | TD1_TCP_CS`
-/// and MSS in `[28:18]`. Linux `r8169_main.c` TD_RSOB_TX.
-pub const TD1_GTSENV4: u32 = 1 << 26;
-/// MSS field shift for TSO (bits `[28:18]` in `TxDesc.vlan`).
-pub const TD1_MSS_SHIFT: u32 = 18;
-/// IPv4 header checksum offload. Linux `r8169_main.c` `TD1_IPv4_CS`.
-#[allow(non_upper_case_globals)] // TODO(narf): mirrors the datasheet register/bit name
-pub const TD1_IPv4_CS: u32 = 1 << 29;
-/// TCP checksum offload. Linux `r8169_main.c` `TD1_TCP_CS`.
-pub const TD1_TCP_CS: u32 = 1 << 30;
-
-// RX descriptor csum status bits (word0 after chip writes back).
-// Same layout as RTL8125 (Linux r8169_main.c csum check path).
-pub(crate) const RX_IPOK: u32 = 1 << 5;
-pub(crate) const RX_TCPOK: u32 = 1 << 6;
-pub(crate) const RX_UDPOK: u32 = 1 << 7;
-pub(crate) const RX_IPFAIL: u32 = 1 << 16;
-pub(crate) const RX_TCPFAIL: u32 = 1 << 14;
-pub(crate) const RX_UDPFAIL: u32 = 1 << 15;
+// RX descriptor csum status bits — see
+// `crate::features::rx_csum_decode`. The previous in-tree "OK"
+// bits (RX_IPOK / RX_TCPOK / RX_UDPOK, bits 5/6/7) were
+// frame-length bits, not protocol bits, and are deleted.
+pub use crate::features::{
+    RX_FAIL_IP as RX_IPFAIL, RX_FAIL_TCP as RX_TCPFAIL, RX_FAIL_UDP as RX_UDPFAIL,
+};
+pub use crate::features::{RX_PID_TCP, RX_PID_UDP};
 
 /// Result of hardware checksum verification on a received frame.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -350,41 +362,32 @@ pub enum RxCsumResult {
 }
 
 impl TxDesc {
-    /// Build a TX descriptor with IPv4 + TCP checksum offload only.
-    /// Sets `TD1_IPv4_CS | TD1_TCP_CS` in the vlan word; no TSO.
-    /// Mirrors `rtl8125::TxDesc::with_csum`.
-    pub const fn with_csum(addr_lo: u32, addr_hi: u32, len: u16) -> Self {
+    /// Build a TX descriptor from pre-computed offload words (see
+    /// `crate::features::v2_csum_words` / `v2_tso_words`).
+    pub fn with_offload(
+        addr_lo: u32,
+        addr_hi: u32,
+        len: u16,
+        words: crate::features::OffloadWords,
+    ) -> Self {
         TxDesc {
-            flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32 & TXD_LEN_MASK),
-            vlan: TD1_IPv4_CS | TD1_TCP_CS,
+            flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32 & TXD_LEN_MASK) | words.word0,
+            vlan: words.word1,
             addr_lo,
             addr_hi,
         }
     }
 
-    /// Build a TX descriptor with TSO + IPv4 + TCP checksum offload.
-    /// Sets `TD1_GTSENV4 | TD1_IPv4_CS | TD1_TCP_CS` and encodes `mss`
-    /// in bits `[28:18]` of the vlan word.
-    /// Mirrors `rtl8125::TxDesc::with_tso`.
-    pub const fn with_tso(addr_lo: u32, addr_hi: u32, len: u16, mss: u16) -> Self {
-        TxDesc {
-            flags_len: TXD_OWN | TXD_FS | TXD_LS | (len as u32 & TXD_LEN_MASK),
-            vlan: TD1_GTSENV4 | TD1_IPv4_CS | TD1_TCP_CS | ((mss as u32) << TD1_MSS_SHIFT),
-            addr_lo,
-            addr_hi,
-        }
-    }
-
-    /// Decode the RX checksum result from a chip-writeback descriptor.
-    pub const fn rx_csum_result(&self) -> RxCsumResult {
-        let done = self.flags_len & (RX_IPOK | RX_TCPOK | RX_UDPOK) != 0;
-        if !done {
-            return RxCsumResult::None;
-        }
-        if self.flags_len & (RX_IPFAIL | RX_TCPFAIL | RX_UDPFAIL) != 0 {
+    /// Decode the RX checksum result from a chip-writeback
+    /// descriptor, using the Linux PID/fail rule.
+    pub fn rx_csum_result(&self) -> RxCsumResult {
+        let decoded = crate::features::rx_csum_decode(self.flags_len);
+        if decoded.l4_ok {
+            RxCsumResult::Ok
+        } else if self.flags_len & (RX_IPFAIL | RX_TCPFAIL | RX_UDPFAIL) != 0 {
             RxCsumResult::Fail
         } else {
-            RxCsumResult::Ok
+            RxCsumResult::None
         }
     }
 }
@@ -582,7 +585,7 @@ use narf_driver_runtime::{
     Lock as IrqSafeSpinLock, MmioRegion, Write,
 };
 use narf_ipc::{channel, Consumer, Producer};
-use narf_net::{Frame, RX_RING_N, TX_RING_N};
+use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NicError {
@@ -592,6 +595,10 @@ pub enum NicError {
     TxRingFull,
     TxTimeout,
     MsixSetup,
+    /// The requested TX offload cannot be programmed for this
+    /// frame (unparseable transport header, SCTP, MSS/offset
+    /// overflow).
+    UnsupportedOffload,
     Other(&'static str),
 }
 
@@ -606,8 +613,13 @@ pub struct Rtl8126Nic {
     rx_head: IrqSafeSpinLock<u32>,
     /// MAC address read from IDR0..5 at bring-up.
     pub mac: [u8; 6],
+    /// Raw chip XID from TxConfig at bring-up (drives the
+    /// firmware-blob pick).
+    pub xid: u32,
     /// MAC version detected from TxConfig.XID at bring-up.
     pub mac_version: MacVersion,
+    /// Last WoL option set programmed via [`Rtl8126Nic::set_wol_opts`].
+    wol_opts: IrqSafeSpinLock<crate::features::WolOpts>,
     /// True when PHYStatus.LinkSts read 1 at bring-up.
     pub link_up: bool,
     /// IDT vector wired to MSI-X entry 0, when MSI-X is enabled.
@@ -683,10 +695,13 @@ impl Rtl8126Nic {
             ]
         };
 
-        // 3. Detect MAC version from TxConfig XID.
+        // 3. Detect MAC version from TxConfig XID. Read BEFORE the
+        //    TCR overwrite below: the reset-default TCR carries
+        //    the chip's XID.
         // SAFETY: identity-mapped MMIO.
         let txcfg = unsafe { mmio.read32(REG_TCR) };
-        let mac_version = mac_version_from_xid(decode_xid(txcfg));
+        let xid = decode_xid(txcfg);
+        let mac_version = mac_version_from_xid(xid);
 
         // 4. Allocate descriptor rings + per-slot buffers.
         let tx_ring =
@@ -701,12 +716,23 @@ impl Rtl8126Nic {
         }
         let mut tx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
         for _ in 0..RING_LEN {
-            tx_pool.push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?);
+            tx_pool.push(
+                alloc_coherent(TX_BUF_LEN, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
+            );
         }
 
-        // 5. C+CR: disable VLAN-detag + RX checksum offload (Stage 1).
-        // SAFETY: identity-mapped MMIO.
-        unsafe { mmio.write16(REG_CPLUSCR, 0) };
+        // 5. C+CR: enable RX checksum offload (the RX pump decodes
+        //    it into `Frame::rx_meta`) and keep RX VLAN stripping
+        //    OFF (no VLAN-tag field in `Frame::rx_meta`). Then
+        //    program the EEE TX LPI idle timer (Linux's
+        //    `rtl_set_eee_txidle_timer` VER_61..LAST arm covers
+        //    VER_70).
+        // SAFETY: bring_up owns the BAR exclusively.
+        unsafe {
+            let mut regs = crate::features::MmioRegs(&mmio);
+            crate::features::apply_cplus(&mut regs, false, true);
+            crate::features::apply_eee_txidle(&mut regs, 1500);
+        }
 
         // 6. Enable TX + RX.
         // SAFETY: same.
@@ -714,12 +740,15 @@ impl Rtl8126Nic {
 
         // 6a. TX descriptor ring base + TCR.
         let tx_phys = tx_ring.dma_addr().raw();
+        // MTPS from the family jumbo tagged frame (16384 bytes →
+        // 128 units). VER_70 needs no jumbo Config writes (Linux's
+        // `rtl_jumbo_config` default arm).
         // SAFETY: identity-mapped MMIO.
         unsafe {
             mmio.write32(REG_TNPDS, tx_phys as u32);
             mmio.write32(REG_TNPDS + 4, (tx_phys >> 32) as u32);
             mmio.write32(REG_TCR, TCR_MXDMA_UNLIMITED | TCR_IFG_STD);
-            mmio.write8(REG_MTPS, MTPS_DEFAULT);
+            mmio.write8(REG_MTPS, crate::features::mtps_for_frame(TX_BUF_LEN as u32));
         }
 
         // 6b. Pre-fill RX descriptors.
@@ -745,11 +774,13 @@ impl Rtl8126Nic {
                 );
             }
         }
+        // RMS is the buffer bound (16383), not the MTU bound —
+        // Linux's `rtl_set_rx_max_size` shape.
         // SAFETY: identity-mapped MMIO.
         unsafe {
             mmio.write32(REG_RDSAR, rx_ring_phys as u32);
             mmio.write32(REG_RDSAR + 4, (rx_ring_phys >> 32) as u32);
-            mmio.write16(REG_RMS, RMS_DEFAULT);
+            mmio.write16(REG_RMS, RX_BUF_LEN as u16);
         }
 
         // 6c. RxConfig — RTL8126 (VER_70) uses the VER_63..LAST path:
@@ -803,7 +834,9 @@ impl Rtl8126Nic {
             rx_pool,
             rx_head: IrqSafeSpinLock::new(0),
             mac,
+            xid,
             mac_version,
+            wol_opts: IrqSafeSpinLock::new(crate::features::WolOpts::NONE),
             link_up,
             irq_vector: None,
             msix: None,
@@ -851,8 +884,10 @@ impl Rtl8126Nic {
     }
 
     /// Transmit a single Ethernet frame (polled completion).
-    pub fn transmit(&self, frame: &[u8]) -> Result<(), NicError> {
-        if frame.is_empty() || frame.len() > 1518 {
+    /// Frames up to the family jumbo tagged frame (16384 bytes)
+    /// are accepted.
+    pub fn transmit(&self, frame: &[u8], meta: &TxMeta) -> Result<(), NicError> {
+        if frame.is_empty() || frame.len() > TX_BUF_LEN {
             return Err(NicError::FrameTooLong);
         }
         let mut head_g = self.tx_head.lock();
@@ -875,15 +910,43 @@ impl Rtl8126Nic {
             return Err(NicError::TxRingFull);
         }
 
-        let mut flags = TXD_OWN | TXD_FS | TXD_LS | (frame.len() as u32 & TXD_LEN_MASK);
+        // Descriptor format from the offload request. VER_70 is
+        // csum-v2, so only the v2 builders are used. Offload words
+        // are computed driver-locally; no shared TX-path code is
+        // touched. An offload the chip cannot take for this frame
+        // is `UnsupportedOffload`, never a descriptor with a
+        // guessed offset. Plain frames still get VLAN insertion.
+        let mut d = if let Some(mss) = meta.tso_mss {
+            if mss == 0 || mss > crate::features::MSS_MAX {
+                return Err(NicError::UnsupportedOffload);
+            }
+            let info =
+                crate::features::parse_transport(frame).ok_or(NicError::UnsupportedOffload)?;
+            let words = crate::features::v2_tso_words(info.ip, mss, info.offset, meta.vlan_tag)
+                .ok_or(NicError::UnsupportedOffload)?;
+            TxDesc::with_offload(phys as u32, (phys >> 32) as u32, frame.len() as u16, words)
+        } else if let Some(kind) = meta.csum_l4 {
+            let info =
+                crate::features::parse_transport(frame).ok_or(NicError::UnsupportedOffload)?;
+            let words = crate::features::v2_csum_words(kind, info.ip, info.offset, meta.vlan_tag)
+                .ok_or(NicError::UnsupportedOffload)?;
+            TxDesc::with_offload(phys as u32, (phys >> 32) as u32, frame.len() as u16, words)
+        } else {
+            TxDesc {
+                flags_len: TXD_OWN | TXD_FS | TXD_LS | (frame.len() as u32 & TXD_LEN_MASK),
+                vlan: crate::features::tx_vlan_word(meta.vlan_tag),
+                addr_lo: phys as u32,
+                addr_hi: (phys >> 32) as u32,
+            }
+        };
         if slot == RING_LEN - 1 {
-            flags |= TXD_EOR;
+            d.flags_len |= TXD_EOR;
         }
         // SAFETY: identity-mapped DMA ring.
         unsafe {
             core::ptr::write_volatile(
                 narf_memory::PhysAddr::new(desc_addr + 4).kernel_mut_ptr::<u32>(),
-                0u32,
+                d.vlan,
             );
             core::ptr::write_volatile(
                 narf_memory::PhysAddr::new(desc_addr + 8).kernel_mut_ptr::<u32>(),
@@ -899,7 +962,7 @@ impl Rtl8126Nic {
         unsafe {
             core::ptr::write_volatile(
                 narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<u32>(),
-                flags,
+                d.flags_len,
             )
         };
         compiler_fence(Ordering::SeqCst);
@@ -924,6 +987,12 @@ impl Rtl8126Nic {
 
     /// Pop one received frame off the RX ring.
     pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
+        self.receive_with_meta().map(|(buf, _)| buf)
+    }
+
+    /// Like [`Rtl8126Nic::receive`], plus the chip's RX checksum
+    /// verification result decoded from the returned descriptor.
+    pub fn receive_with_meta(&self) -> Option<(alloc::vec::Vec<u8>, RxCsumResult)> {
         let mut head_g = self.rx_head.lock();
         let slot = (*head_g) as usize % RING_LEN;
         let ring_phys = self.rx_ring.dma_addr().raw();
@@ -936,6 +1005,16 @@ impl Rtl8126Nic {
         if flags_len & RXD_OWN != 0 {
             return None;
         }
+
+        // Decode the RX checksum result now, before rearming
+        // overwrites the descriptor.
+        let csum = TxDesc {
+            flags_len,
+            vlan: 0,
+            addr_lo: 0,
+            addr_hi: 0,
+        }
+        .rx_csum_result();
 
         let len = (flags_len & RXD_LEN_MASK) as usize;
         let buf_phys = self.rx_pool[slot].dma_addr().raw();
@@ -975,7 +1054,76 @@ impl Rtl8126Nic {
         compiler_fence(Ordering::SeqCst);
 
         *head_g = (*head_g + 1) % (RING_LEN as u32);
-        Some(out)
+        Some((out, csum))
+    }
+
+    /// Largest frame this driver will transmit: the family jumbo
+    /// tagged frame, which is also the TX slot buffer size.
+    pub fn max_frame(&self) -> u32 {
+        TX_BUF_LEN as u32
+    }
+
+    /// EEE LPI capabilities for VER_70 (Linux's
+    /// `rtl8169_get_lpi_caps` shape: 100/1000/2500/5000FD).
+    pub fn eee_caps(&self) -> crate::features::EeeCaps {
+        crate::features::eee_lpi_caps(70)
+    }
+
+    /// Program Wake-on-LAN options (Linux's `__rtl8169_set_wol`
+    /// 8125-family shape, as in the 8125 driver: Config registers
+    /// via `apply_wol` with the MAC-OCP magic, then the 0xe0c6
+    /// LinkUp step and the 0xc0b6 magic step through the shared
+    /// OCP accessor). Nothing is left pending.
+    pub fn set_wol_opts(&self, opts: crate::features::WolOpts) -> Result<(), NicError> {
+        if !opts.is_valid() {
+            return Err(NicError::UnsupportedOffload);
+        }
+        // SAFETY: bring_up owns the BAR; `set_wol_opts` is called
+        // only on the live controller, whose MMIO is exclusively
+        // owned by this instance.
+        unsafe {
+            self.mmio.write8(REG_9346CR, EEM_CONFIG_WRITE);
+            let mut regs = crate::features::MmioRegs(&self.mmio);
+            let pending = crate::features::apply_wol(
+                &mut regs,
+                opts,
+                crate::features::WolMagic::MacOcpC0b6,
+                crate::features::WolPmeReg::Config2,
+            );
+            self.mmio.write8(REG_9346CR, EEM_NORMAL);
+            *self.wol_opts.lock() = opts;
+            let access = crate::phy_access::PhyAccess::new(&self.mmio);
+            let linkup_val: u16 = if opts.contains(crate::features::WolOpts::PHY) {
+                0x13
+            } else {
+                0
+            };
+            let cur_e0c6 = access
+                .mac_ocp_read(0xe0c6)
+                .map_err(|_| NicError::Other("OCP read failed"))?;
+            access
+                .mac_ocp_write(0xe0c6, (cur_e0c6 & !0x3f) | linkup_val)
+                .map_err(|_| NicError::Other("OCP write failed"))?;
+            if let crate::features::WolPendingMagic::MacOcpC0b6(magic_on) = pending {
+                let cur_c0b6 = access
+                    .mac_ocp_read(0xc0b6)
+                    .map_err(|_| NicError::Other("OCP read failed"))?;
+                let new_c0b6 = if magic_on {
+                    cur_c0b6 | 0x0001
+                } else {
+                    cur_c0b6 & !0x0001
+                };
+                access
+                    .mac_ocp_write(0xc0b6, new_c0b6)
+                    .map_err(|_| NicError::Other("OCP write failed"))?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Last WoL option set programmed via [`Rtl8126Nic::set_wol_opts`].
+    pub fn wol_opts(&self) -> crate::features::WolOpts {
+        *self.wol_opts.lock()
     }
 
     /// Read the PHY-status register.
@@ -1022,9 +1170,9 @@ pub fn rtl8126_ifname() -> &'static str {
 /// `Rtl8126Nic::transmit`. The Arc is cloned out rather than holding
 /// the IRQ-masking CONTROLLER lock across `transmit` (same reasoning
 /// as e1000's send path).
-fn rtl8126_send_frame(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+fn rtl8126_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     let ctrl = CONTROLLER.lock().clone().ok_or(())?;
-    ctrl.transmit(frame).map_err(|_| ())
+    ctrl.transmit(frame, &meta).map_err(|_| ())
 }
 
 /// Decode a PHYStatus byte into a publication sample via the family's
@@ -1144,11 +1292,20 @@ async fn rtl8126_rx_pump(device: Arc<Rtl8126Nic>, mut rx_prod: Producer<Frame, R
             last_sample = sample;
             crate::publish::publish_link(rtl8126_ifname(), sample);
         }
-        if let Some(pkt) = device.receive() {
+        if let Some((pkt, csum)) = device.receive_with_meta() {
             let dma_buf =
                 alloc_coherent(pkt.len(), DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, pkt.len() as u32);
             frame.payload_mut().copy_from_slice(&pkt);
+            // RX checksum verification from the descriptor: only
+            // `Ok` marks the checksums verified; `Fail` and `None`
+            // both leave the flags clear so the stack re-checks.
+            let mut rx_meta = narf_net::RxMeta::default();
+            if csum == RxCsumResult::Ok {
+                rx_meta.csum_l3 = true;
+                rx_meta.csum_l4 = true;
+            }
+            frame.set_rx_meta(rx_meta);
             // RX fan-out (issue #784), e1000's `dispatch_rx_frame`
             // shape via the shared helper: an attached ring consumer
             // gets a pristine pre-dispatch copy; the original goes to
@@ -1171,8 +1328,102 @@ async fn rtl8126_rx_pump(device: Arc<Rtl8126Nic>, mut rx_prod: Producer<Frame, R
 
 async fn rtl8126_tx_pump(device: Arc<Rtl8126Nic>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
     while let Ok(frame) = tx_cons.recv().await {
-        let _ = device.transmit(frame.payload());
+        let _ = device.transmit(frame.payload(), &TxMeta::plain());
     }
+}
+
+/// Run the PHY bring-up sequence once the firmware registry exists.
+/// Mirrors the 8125 late hook. Only VER_70 controllers run it: an
+/// unknown XID has no known blob, and guessing the common blob
+/// would program the wrong PHY patch. A missing blob is a log
+/// line, not an error — the table still programs the registers
+/// it names.
+pub fn configure_phy_late() {
+    let controller = CONTROLLER.lock().clone();
+    let Some(controller) = controller else {
+        return;
+    };
+    if controller.mac_version != MacVersion::Ver70 {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  rtl8126: unknown XID {:#x}; skipping PHY config",
+            controller.xid,
+        );
+        return;
+    }
+    configure_phy(&controller.mmio, controller.xid);
+}
+
+fn configure_phy(mmio: &MmioRegion, xid: u32) {
+    use core::fmt::Write as _;
+
+    let mut access = crate::phy_access::PhyAccess::new(mmio);
+    match load_phy_firmware(xid) {
+        Some(code) => match access.run_firmware(&code) {
+            Ok(()) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtl8126: applied firmware ({} opcodes)",
+                    code.len(),
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtl8126: firmware aborted at an opcode: {:?}; PHY may be partly patched",
+                    e,
+                );
+            }
+        },
+        None => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8126: firmware blob not present; applying PHY config without it",
+            );
+        }
+    }
+    if let Err(e) = access.apply_config_table(PHY_CONFIG_TABLE) {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  rtl8126: PHY config table aborted: {:?}",
+            e
+        );
+    }
+}
+
+/// Fetch and parse this chip's firmware blob, if the firmware
+/// registry has it.
+fn load_phy_firmware(xid: u32) -> Option<alloc::vec::Vec<u32>> {
+    use core::fmt::Write as _;
+
+    let name = firmware_name_for_xid(xid);
+    let auth = narf_firmware::trusted_loader_authority()?.derive().ok()?;
+    let cap = narf_firmware::open(name, &auth).ok()?;
+    let view = narf_firmware::view_of(&cap).ok()?;
+
+    let code = match crate::phy_access::parse_firmware(view.bytes) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8126: {} failed its format check: {:?}",
+                name,
+                e,
+            );
+            return None;
+        }
+    };
+    if let Err(e) = crate::phy_access::validate_firmware(&code) {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  rtl8126: {} rejected: {:?}",
+            name,
+            e,
+        );
+        return None;
+    }
+    Some(code)
 }
 
 /// Register a PCI match-table entry per supported device id.
@@ -1231,6 +1482,16 @@ impl narf_net::Interface for Rtl8126NicIface {
     fn link_up(&self) -> bool {
         with_controller(|c| c.link_up).unwrap_or(false)
     }
+    fn offloads(&self) -> narf_net::OffloadCapabilities {
+        // The TSO byte cap is the TX slot buffer: a TSO packet is
+        // one frame copied into one slot.
+        narf_net::OffloadCapabilities {
+            tx_checksum: true,
+            rx_checksum: true,
+            max_tso_bytes: TX_BUF_LEN as u32,
+            vlan_insert: true,
+        }
+    }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
             IrqSafeSpinLock::new(None);
@@ -1282,7 +1543,10 @@ impl crate::HwNic for Rtl8126NicIface {
         crate::NicModel::RealtekRtl8168
     }
     fn caps(&self) -> crate::NicCaps {
-        crate::NicCaps::NONE
+        crate::NicCaps::TX_CSUM
+            | crate::NicCaps::RX_CSUM
+            | crate::NicCaps::TSO
+            | crate::NicCaps::VLAN_TAGGING
     }
     fn ring_capacity(&self) -> usize {
         RING_LEN
