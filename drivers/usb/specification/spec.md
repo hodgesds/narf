@@ -410,7 +410,10 @@ also consult upstream Linux GPL sources.
   (`cdc_ncm::detach_all_ncm`, `r8152::detach_all_r8152`,
   `cdc_ecm::detach_all_ecm`), and
   every UVC binding is dropped and its video node unregistered
-  (`uvc::detach_all_uvc`). On the per-slot detach path, classes
+  (`uvc::detach_all_uvc`), and every bound fingerprint reader and
+  recognised WBDI sensor is removed and unpublished
+  (`fingerprint::unbind_all_fp` / `wbdi::unbind_all_wbdi`, #922).
+  On the per-slot detach path, classes
   the supervisor does not pump (MSC / UAC / btusb / CCID) get
   the slot disable + reclaim but no class-registry removal yet;
   the remaining non-pumped classes keep their registries across
@@ -418,6 +421,28 @@ also consult upstream Linux GPL sources.
   unbind hooks run on the per-slot path via `dispatch_unbind`
   (see below). UVC is not in that set either: its unbind hook
   runs on the per-slot path via `dispatch_unbind` (see below).
+- Fingerprint lifecycle (#922): per-slot detach runs through the
+  class-registry unbind dispatch — `fingerprint::detach_fp` removes
+  every `FP_DEVICES` entry for the slot, and its outcome reports
+  whether the removed set included the pre-removal index-0 entry
+  (the `/dev/fp0` name's occupant; bind only appends, so the
+  occupant can only leave index 0 by being removed), and
+  `wbdi::detach_wbdi` removes every
+  `WBDI_DEVICES` entry for the slot. Both hooks are infallible and
+  idempotent, registered with never-claim probes (empty matches) so
+  the cascade keeps binding fingerprint. Nodes are provider-resolved
+  from the registry by index (#920, merged as #1238): removal itself
+  unpublishes, and a survivor now at index 0 resolves as fp0 —
+  detach performs no renumbering. Suspend/resume
+  runs through the `usb-fp` async system-PM hook: prepare is a
+  no-op (no pump, no background task, transfers are synchronous
+  per-call); resume fails loudly with `DriverError` when the xHCI
+  controller never came back while devices are still bound, and
+  otherwise resets every ELAN interrupt-IN arming flag (the
+  controller fan-out rebuilds endpoint state, invalidating the
+  staged TRB; the next read re-arms). A device unplugged while
+  suspended is not validated at resume — the supervisor's
+  disconnect polling detaches it on the next cycle.
 - `find_video_streaming_endpoints(config)` returns each UVC bulk/isochronous IN
   endpoint with its owning interface and alternate setting.
   `select_video_streaming_iso_endpoint(endpoints, payload)` chooses the smallest

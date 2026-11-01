@@ -274,6 +274,12 @@ impl FingerprintDevice {
         self.vendor
     }
 
+    /// Whether the ELAN interrupt-IN endpoint is currently armed.
+    /// Test/diagnostic accessor for the resume path.
+    pub fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::Acquire)
+    }
+
     /// Read one response packet from the device (bulk-IN or
     /// interrupt-IN). Returns the byte count written into `buf`.
     ///
@@ -391,6 +397,197 @@ pub fn __test_register_device(
     g.push(dev);
     g.len() - 1
 }
+
+// ── Lifecycle: detach + suspend/resume (#922) ────────────────────────
+
+/// Outcome of [`detach_fp`]: how many registry entries were removed
+/// for the slot, and whether the removed set included the entry at
+/// pre-removal registry index 0 — the occupant of the `/dev/fp0`
+/// name. The occupant flag is part of the outcome so fixtures pin
+/// it: bind only appends, so the index-0 entry can only leave
+/// index 0 by being removed. Nodes are provider-resolved from the
+/// registry by index (#920: `lookup_fp` / `enumerate_fp`), so
+/// removing entries unpublishes by itself — there is no devfs node
+/// registration to undo, and no `unregister_fp` call exists on
+/// current main (the old proxy node API went away with #1238).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FpDetachOutcome {
+    pub removed: usize,
+    pub fp0_occupant_removed: bool,
+}
+
+/// Detach bookkeeping for one slot: remove every registry entry
+/// for `slot_id`. Infallible and idempotent: a second call for
+/// the same slot removes nothing. The outcome reports whether the
+/// removed set included the pre-removal index-0 entry (the
+/// `/dev/fp0` name's occupant).
+///
+/// Index shift, not promotion bookkeeping: nodes resolve by
+/// registry index (#920), so after an owner removal a survivor now
+/// at index 0 resolves as fp0 — detach performs no renumbering
+/// itself, it only removes entries, and the provider re-resolves
+/// by new index.
+///
+/// An already-open fp0 handle keeps its `Arc` to the detached
+/// device, so its reads fail cleanly at the transfer layer
+/// (`EndpointConfig` on the disabled slot) rather than dangling;
+/// new lookups resolve against the surviving registry (out-of-range
+/// names resolve to nothing).
+pub fn detach_fp(slot_id: u8) -> FpDetachOutcome {
+    let mut g = FP_DEVICES.lock();
+    let mut removed = 0usize;
+    let mut owned_node = false;
+    let mut orig = 0usize;
+    g.retain(|dev| {
+        let cur = orig;
+        orig += 1;
+        if dev.slot_id == slot_id {
+            if cur == 0 {
+                owned_node = true;
+            }
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+    drop(g);
+    FpDetachOutcome {
+        removed,
+        fp0_occupant_removed: owned_node,
+    }
+}
+
+/// Controller-recovery teardown: drop every bound reader.
+/// Called from `attach::detach_all_bindings`
+/// after a recovery epoch change invalidated every slot; stale
+/// entries must not survive to be re-enumerated alongside fresh
+/// binds (the MSC Concern C species: a surviving entry would make
+/// re-enumeration append a second live device for the same reader).
+/// Clearing the registry unpublishes every provider-resolved node
+/// — no separate unregister step exists under #920's provider model.
+pub fn unbind_all_fp() {
+    FP_DEVICES.lock().clear();
+}
+
+/// Reset the ELAN interrupt-IN arming flag on every bound device.
+/// The controller fan-out rebuilds xHCI endpoint state on resume,
+/// invalidating the staged interrupt-IN TRB; the next read must
+/// re-arm rather than poll a dead staging. Bulk devices carry no
+/// equivalent volatile state.
+pub fn reset_all_armed() {
+    let g = FP_DEVICES.lock();
+    for dev in g.iter() {
+        dev.armed.store(false, Ordering::Release);
+    }
+}
+
+/// Resume decision for the system-PM hook, factored out of the
+/// async wrapper so fixtures pin it without an xHCI controller.
+/// With no controller and bound devices, fail loudly (ACM mirror
+/// — the suspend service records the failure best-effort and it
+/// does not stop other hooks); with no bound devices, or a live
+/// controller, resume proceeds, and the live-controller path
+/// resets ELAN arming (see [`reset_all_armed`]).
+///
+/// A device unplugged while suspended is NOT validated here — it
+/// is still in the registry at resume time (the supervisor was not
+/// polling during suspend), and resetting its flag is harmless;
+/// the supervisor's disconnect polling detaches it on the next
+/// cycle, mirroring the serial hook's "absent gets no replay".
+pub fn resume_fp_devices(
+    controller_present: bool,
+) -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    if !controller_present && attached_fp_count() > 0 {
+        return Err(narf_power::device_pm::DeviceSuspendError::DriverError);
+    }
+    if controller_present {
+        reset_all_armed();
+    }
+    Ok(())
+}
+
+/// Async system-PM hook for fingerprint (#922). Prepare has
+/// nothing to quiesce — no pump, no background task, transfers
+/// are synchronous per-call — so it always succeeds. Resume runs
+/// [`resume_fp_devices`] after the synchronous device fan-out
+/// restores xHCI.
+struct FpSystemPm;
+
+impl narf_power::system_pm::AsyncSystemPm for FpSystemPm {
+    fn prepare_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn resume_from_suspend<'a>(&'a self) -> narf_power::system_pm::SystemPmFuture<'a> {
+        Box::pin(async { resume_fp_devices(crate::xhci::controller().is_some()) })
+    }
+}
+
+/// Register the async system-PM hook. Called once from the USB
+/// crate's Stage::Subsys initcalls; registration is idempotent
+/// on the hook name.
+pub fn register_pm() {
+    narf_power::system_pm::register_async_system_pm("usb-fp", alloc::sync::Arc::new(FpSystemPm));
+}
+
+/// Registry probe that never claims: fingerprint binds through
+/// the attach cascade, never the class-registry probe — this
+/// entry exists so the registry's unbind dispatch (detach path)
+/// can reach [`detach_fp`], mirroring MSC.
+fn fp_registry_probe(
+    _device: alloc::sync::Arc<crate::device::USBDevice>,
+) -> Result<(), crate::class_registry::UsbProbeError> {
+    Err(crate::class_registry::UsbProbeError::BindFailed)
+}
+
+/// Register fingerprint's unbind hook with the class registry.
+/// Called from the crate's Stage::Subsys initcalls (`lib.rs`).
+/// [`detach_fp`] is infallible bookkeeping, so the hook adapts
+/// it to the fallible [`UsbUnbindFn`] contract with an
+/// unconditional `Ok(())` (#893: a hook reports failure with
+/// `Err(())`, never by panicking). The matches slice is empty
+/// on purpose: the probe must never fire (the cascade binds
+/// fingerprint), so the entry is hook-only.
+pub fn register_initcalls() {
+    let _ = crate::class_registry::register_class_driver_with_unbind(
+        "usb-fp",
+        &[],
+        fp_registry_probe,
+        |slot| {
+            detach_fp(slot);
+            Ok(())
+        },
+    );
+}
+
+/// Test/seeding constructor: one bound-reader record without an
+/// xHCI controller. Kernel-test smokes seed the registry with
+/// it, then exercise [`detach_fp`] / [`resume_fp_devices`].
+/// Not a bind path — endpoint configuration is the cascade's job.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __test_make_device(slot_id: u8, vendor: FpVendor, armed: bool) -> Arc<FingerprintDevice> {
+    Arc::new(FingerprintDevice {
+        slot_id,
+        vendor,
+        bulk_in_ep: 3,
+        bulk_out_ep: 2,
+        in_max_packet: 512,
+        armed: AtomicBool::new(armed),
+    })
+}
+
+/// Test/seeding push: append a record to the registry directly.
+/// Kernel-test smokes seed with [`__test_make_device`], then
+/// exercise the lifecycle paths.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __test_push(dev: Arc<FingerprintDevice>) {
+    FP_DEVICES.lock().push(dev);
+}
+
+// ── /dev/fp0 FileOps bridge ───────────────────────────────────────────
 
 /// Test-only: build a `/dev/fp<N>` node for `dev` over an explicit
 /// transport, so smokes can drive the ioctl surface without silicon
