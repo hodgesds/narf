@@ -105,7 +105,11 @@ impl<P: Port> Packet<P> {
             let Some(work) = owner.work(&raw)? else {
                 return Ok(());
             };
-            if !urgent && (self.pending.is_some() || self.pair.is_some() || self.held.is_some()) {
+            // `held` is the last completed RX descriptor kept mapped by
+            // buf_hold against a prefetch/rearm race, not pending work. The
+            // Radio supplied fresh RX/software idle; park below proves actual
+            // all-QCU/RX quiet without recycling or releasing that tail.
+            if !urgent && (self.pending.is_some() || self.pair.is_some()) {
                 return Ok(());
             }
             let saved = match self.periodic_park(true) {

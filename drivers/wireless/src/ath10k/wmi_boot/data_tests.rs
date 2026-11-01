@@ -725,7 +725,79 @@ pub(super) async fn send(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiErro
     }
     Ok(())
 }
+/// Actual HTT3 TX_FRM management for the bounded legacy auth/association
+/// composition. Firmware without WMI MGMT_TX still sends these frames over
+/// pipe4; decoding them as raw DATA would reject before the independent AP.
+fn initial_htt_management(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
+    let body = bytes.get(8..).ok_or(BmiError::BadResponse)?;
+    let fixture = m.data.as_ref().ok_or(BmiError::BadResponse)?;
+    let phase = fixture.control_phase;
+    if m.inner.version < 3
+        || bytes[0] != 1
+        || bytes[1] != 0
+        || bytes[5] != m.inner.sequence
+        || bytes[2..4] != (bytes.len() as u16 - 8).to_le_bytes()
+        || body.len() < 16
+        || body[..4] != [1, 0x65, 0x40, 0x0c] // MGMT/plaintext, extTID17, vdev0.
+        || body[12..16] != [0xff, 0xff, 0, 0] // Home-channel peer/freq union.
+        || phase >= 2
+        || fixture.qos()
+        || fixture.ht_expected
+        || m.station.as_ref().is_none_or(|station| station.phase < 4)
+    {
+        return Err(BmiError::BadResponse);
+    }
+    let length = usize::from(u16::from_le_bytes(body[4..6].try_into().unwrap()));
+    let id = u16::from_le_bytes(body[6..8].try_into().unwrap());
+    let frame = {
+        let storage = m.inner.storage.as_ref().ok_or(BmiError::BadResponse)?;
+        let (address, payload) = storage.tx.snapshot(id).ok_or(BmiError::BadResponse)?;
+        let prefetch = length.min(50).div_ceil(4) * 4;
+        if u32::from_le_bytes(body[8..12].try_into().unwrap()) != address as u32
+            || body.len() != 16 + prefetch
+            || payload.get(..prefetch) != body.get(16..)
+        {
+            return Err(BmiError::BadResponse);
+        }
+        payload.get(..length).ok_or(BmiError::BadResponse)?.to_vec()
+    };
+    if frame.len() < 24
+        || frame[..2] != if phase == 0 { [0xb0, 0] } else { [0, 0] }
+        || frame[4..10] != AP
+        || frame[10..16] != OWN
+        || frame[16..22] != AP
+    {
+        return Err(BmiError::BadResponse);
+    }
+    // The real AP validates authentication/RSNE and creates the actual early
+    // M1. No key/controlled-port or synthetic association receipt is supplied.
+    let replies = m
+        .data
+        .as_mut()
+        .unwrap()
+        .ap
+        .receive(&frame)
+        .map_err(|_| BmiError::BadResponse)?;
+    m.inner.sequence = m.inner.sequence.wrapping_add(1);
+    m.native_management.push(frame);
+    m.sent.push(bytes.to_vec());
+    m.data.as_mut().unwrap().control_phase += 1;
+    // A real ID from the retained DMA slot is completed through the normal
+    // HTT3 TX terminal event, independently of the AP management response.
+    complete(m, id, 0);
+    for reply in replies {
+        if reply[0] == 8 {
+            m.data.as_mut().unwrap().queue.push_back(reply);
+        } else {
+            management_frame(m, reply);
+        }
+    }
+    Ok(())
+}
 pub(super) fn send_now(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {
+    if bytes.get(8..10) == Some(&[1, 0x65]) {
+        return initial_htt_management(m, bytes);
+    }
     let body = bytes.get(8..).ok_or(BmiError::BadResponse)?;
     if bytes[0] != 1
         || bytes[1] != 0

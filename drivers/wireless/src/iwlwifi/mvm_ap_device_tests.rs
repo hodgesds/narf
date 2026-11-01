@@ -90,7 +90,14 @@ impl Model {
         let mut reply = Vec::new();
         match (group, command) {
             (3, 8) => require(
-                b.len() == 52 && b[12..18] == OWN && (word(b, 0) == 3 || word(b, 8) == 8),
+                b.len() == 52
+                    && word(b, 0) == 0
+                    && b[12..18] == OWN
+                    && if word(b, 4) == 3 {
+                        word(b, 8) == 5 && word(b, 20) == 30
+                    } else {
+                        matches!(word(b, 4), 1 | 2) && word(b, 8) == 8 && word(b, 20) & !8 == 38
+                    },
                 "API77 AP actual MAC0 GO/filter identity",
             )?,
             (3, 9) => require(

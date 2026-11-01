@@ -653,13 +653,12 @@ impl<P: Port> Packet<P> {
         Ok(())
     }
     pub(super) fn ps_sleep(&mut self) -> Result<(), Error> {
-        if self.phase != Phase::Running
-            || self.pending.is_some()
-            || self.pair.is_some()
-            || self.held.is_some()
-        {
+        if self.phase != Phase::Running || self.pending.is_some() || self.pair.is_some() {
             return Err(Error::Busy);
         }
+        // held is the completed RX tail retained against descriptor prefetch,
+        // not a pending packet. Keep its mapping/rearm ownership through sleep;
+        // Radio drained RX and native sleep still proves QCU/RX-abort/RTC state.
         self.check_transmit()?;
         self.ps.as_ref().ok_or(Error::State)?.check()?;
         self.port.network_sleep()

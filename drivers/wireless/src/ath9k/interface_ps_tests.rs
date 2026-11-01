@@ -52,7 +52,23 @@ fn enable(h: &Harness) {
         "initial current S1 IRQ binding closed the owner before its first TIM"
     );
     beacon(h, 102400, false, false);
+    let tail = h
+        .model
+        .last_rx
+        .get()
+        .expect("actual first TIM RX descriptor");
     h.pump();
+    let tail_done = h.model.word(tail + 48).is_ok_and(|word| word & 1 != 0);
+    let mappings_retained = h.model.released.borrow().is_empty();
+    assert!(
+        h.device.link_up()
+            && h.model.master.get()
+            && h.model.ps_sleeping.get()
+            && h.model.last_rx.get() == Some(tail)
+            && tail_done
+            && mappings_retained,
+        "actual NETWORK_SLEEP discarded or mistook its completed retained RX tail"
+    );
 }
 fn smoke_ar9285_station_ps_signed_source_and_public_default_fail_closed() -> TestResult {
     let _policy = crate::ath9k::ht::tests::Policy::install();

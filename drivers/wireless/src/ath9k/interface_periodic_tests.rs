@@ -145,6 +145,25 @@ fn measurement() -> Result<(), &'static str> {
         advance(&h, 1_000_000)?;
         let running = h.model.registers.borrow()[&0x9920] & 0x10000 != 0;
         let unchanged = h.model.registers.borrow()[&0x9920] & 0xfff == before;
+        // The actual just-consumed beacon tail stays DMA-mapped and terminal
+        // while source DO_CAL starts; periodic work must never clear/rearm
+        // buf_hold or release its storage merely to obtain eligibility.
+        let held = h
+            .model
+            .last_rx
+            .get()
+            .ok_or("periodic real completed beacon tail missing")?;
+        let held_terminal = h
+            .model
+            .word(held + 48)
+            .map_err(|_| "periodic retained completed tail lost its DMA mapping")?
+            & 1
+            != 0;
+        let retained = { h.model.released.borrow().is_empty() };
+        check!(
+            held_terminal && retained,
+            "periodic recycled or released actual buf_hold while starting measurement"
+        );
         check!(
             running && unchanged && h.device.link_up(),
             "actual IQ sample did not retain prior coefficient receipt"

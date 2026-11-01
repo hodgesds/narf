@@ -1560,7 +1560,6 @@ impl Guard {
             bz,
             six,
         } = model;
-        let multi_receive = receive_model.enabled();
         require(
             ACTIVE.lock().is_none()
                 && narf_net::iface::lookup(super::super::iwl_ifname()).is_none()
@@ -1650,6 +1649,13 @@ impl Guard {
         }
         let parsed = super::super::parse_ucode(&authored)
             .map_err(|_| "Sc fixture firmware metadata parse")?;
+        // Original API89/Bz images retain capability68, so AP startup
+        // actually configures additional RFH/RSS queues before replacing
+        // the inactive station. Keep their existing literal DMA/marker
+        // consumer enabled from that parsed fact, rather than mistaking
+        // the AP role for the authored single-queue Sc fixture.
+        let multi_receive = receive_model.enabled()
+            || matches!(receive_model, ReceiveModel::Ap) && parsed.api.has_capability(68);
         model::firmware_profile(&mut hardware, &parsed)?;
         if api89.is_some() || bz.is_some() {
             hardware.prepare_station_profile(&parsed)?;

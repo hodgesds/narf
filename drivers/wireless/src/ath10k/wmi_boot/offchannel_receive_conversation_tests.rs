@@ -171,6 +171,25 @@ fn implicit_wait() -> Result<(), &'static str> {
         let h = harness(4, Dialect::Tlv, protected, true);
         if protected {
             h.join()?;
+            let actual_htt_management = h.model(|m| {
+                m.native_management.len() == 2
+                    && m.native_management[0].get(..2) == Some(&[0xb0, 0])
+                    && m.native_management[1].get(..2) == Some(&[0, 0])
+                    && m.sent
+                        .iter()
+                        .filter(|bytes| {
+                            bytes.get(..2) == Some(&[1, 0]) && bytes.get(8..10) == Some(&[1, 0x65])
+                        })
+                        .count()
+                        == 2
+                    && m.inner
+                        .storage
+                        .as_ref()
+                        .is_some_and(|storage| storage.tx.pending() == 0)
+            });
+            if !actual_htt_management {
+                return Err("secure private FRAME lacked actual HTT3 auth/assoc DMA terminals");
+            }
         }
         let b = Bound::new(&h)?;
         if drive(register(&h, &b, b.source.clone(), &[4, 9])) != Poll::Ready(Ok(())) {

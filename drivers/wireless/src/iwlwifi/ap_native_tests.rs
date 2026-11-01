@@ -1579,6 +1579,23 @@ fn smoke_iwl_native_ap_sc_api89_bz_beacon_multi_peer_receipts_and_stop() -> Test
         ] {
             let f = Fixture::new(api89, bz)?;
             f.start(false)?;
+            let receive_queues = f
+                .device()
+                .state
+                .try_lock()
+                .ok_or("AP profile retained State after START")?
+                .hardware
+                .receive_queue_count();
+            let additional = HARNESS.lock().as_ref().unwrap().1.rx_queues.len();
+            require(
+                (receive_queues, additional)
+                    == if api89.is_some() || bz.is_some() {
+                        (3, 2)
+                    } else {
+                        (1, 0)
+                    },
+                "AP original profile lost actual RFH/RSS allocation receipts",
+            )?;
             add_open_with_prefix(&f)?;
             f.add([2, 0x74, 2, 3, 4, 5], 8, false)?;
             {
