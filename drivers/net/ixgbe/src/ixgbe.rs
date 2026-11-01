@@ -18,6 +18,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, TxMeta, RX_RING_N, TX_RING_N};
 
 pub mod queues;
+pub mod rss;
 mod tests;
 
 // ── PCI device IDs ─────────────────────────────────────────────────
@@ -317,6 +318,8 @@ pub struct Ixgbe {
     /// Live queue configuration (multi-queue keystone: 1/1 at
     /// bring-up; register addressing + IVAR routing cover up to 64).
     pub queue_config: queues::QueueConfig,
+    /// Programmed RSS state, if `configure_rss` ran.
+    pub rss_cfg: IrqSafeSpinLock<Option<rss::IxgbeRss>>,
     /// Stage 5: MSI-X table once enabled.
     pub(crate) msix: Option<MsixTable>,
     pub rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
@@ -519,6 +522,7 @@ impl Ixgbe {
             link_up,
             did: device.id.device,
             queue_config,
+            rss_cfg: IrqSafeSpinLock::new(None),
             msix: None,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
@@ -805,6 +809,25 @@ impl Ixgbe {
         Ok(())
     }
 
+    /// Program RSS for `queues` RX queues (1..=16, MRQE = 0001
+    /// mode). Callers must have RX disabled while reprogramming
+    /// filters; bring-up leaves RSS off until this runs.
+    pub fn configure_rss(&self, queues: usize) -> Result<(), IxgbeError> {
+        let cfg = rss::IxgbeRss::standard(queues)
+            .map_err(|_| IxgbeError::Other("bad RSS queue count"))?;
+        {
+            let mut bank = queues::MmioBank::new(&self.mmio);
+            cfg.apply(&mut bank);
+        }
+        *self.rss_cfg.lock() = Some(cfg);
+        Ok(())
+    }
+
+    /// The stack-visible RSS config, if programmed.
+    pub fn rss_config(&self) -> Option<narf_net::rss::RssConfig> {
+        self.rss_cfg.lock().as_ref().map(|c| c.as_net_config())
+    }
+
     pub fn read_status(&self) -> u32 {
         // SAFETY: identity-mapped MMIO.
         unsafe { self.mmio.read32(REG_STATUS) }
@@ -844,6 +867,9 @@ impl narf_net::Interface for Ixgbe {
     fn num_tx_queues(&self) -> u16 {
         self.queue_config.num_tx as u16
     }
+    fn rss(&self) -> Option<narf_net::rss::RssConfig> {
+        self.rss_config()
+    }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         &self.rx_ipc_ring
     }
@@ -874,13 +900,20 @@ impl crate::HwNic for Ixgbe {
         crate::NicModel::IntelIxgbe
     }
     fn caps(&self) -> crate::NicCaps {
-        crate::NicCaps::PROMISC | crate::NicCaps::MULTICAST_HASH
+        let mut caps = crate::NicCaps::PROMISC | crate::NicCaps::MULTICAST_HASH;
+        if self.rss_cfg.lock().is_some() {
+            caps = caps | crate::NicCaps::RSS;
+        }
+        caps
     }
     fn num_rx_queues(&self) -> u16 {
         self.queue_config.num_rx as u16
     }
     fn num_tx_queues(&self) -> u16 {
         self.queue_config.num_tx as u16
+    }
+    fn rss(&self) -> Option<narf_net::rss::RssConfig> {
+        self.rss_config()
     }
     fn ring_capacity(&self) -> usize {
         TX_RING_LEN
@@ -925,6 +958,9 @@ impl narf_net::Interface for IxgbeNic {
     }
     fn num_tx_queues(&self) -> u16 {
         with_controller(|c| c.queue_config.num_tx as u16).unwrap_or(1)
+    }
+    fn rss(&self) -> Option<narf_net::rss::RssConfig> {
+        with_controller(|c| c.rss_config()).flatten()
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =

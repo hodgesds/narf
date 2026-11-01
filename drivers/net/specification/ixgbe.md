@@ -157,10 +157,23 @@ addressing, validation, and vector routing they need are done
 here, and fixtures replay the queue-0 register conversation on a
 fake bank plus IVAR sibling-preservation checks.
 
-## 10. RSS (v0.2 — see §14 for what is still open)
+## 10. RSS
 
-Placeholder for the RSS commit: MRQC / RSSRK / RETA programming
-over `narf_net::rss` (standard key + balanced indirection table).
+`drivers/net/ixgbe/src/ixgbe/rss.rs` programs RSS-only mode
+(MRQC at 0x0EC80, MRQE = 0001b = single 16-queue set, all six
+hash-field enables: TcpIPv4/IPv4/IPv6/TcpIPv6/UdpIPv4/UdpIPv6),
+the 40-byte key into RSSRK[0..9] (0x0EB80 + 4*n, little-endian
+words), and the 128-entry balanced indirection table into
+RETA[0..31] (0x0EB00 + 4*n, 4-bit entries). The key and table
+come from `narf_net::rss` (standard conformance key + balanced
+table), so hardware steering equals `RssConfig::rx_queue` for
+the same frame — fixtures assert that agreement plus the
+MRQC/RSSRK/RETA register conversation on a fake bank.
+`Ixgbe::configure_rss(queues)` (1..=16) programs and records
+the state; `HwNic`/`Interface::rss()` expose it and `caps()`
+gains `RSS` once programmed. Bring-up leaves RSS off (queue 0
+only) until configured; reprogramming requires RX disabled.
+FlowDirector/ATR stays a follow-up (§14).
 
 ## 11. VLAN filtering (v0.2 — see §14 for what is still open)
 

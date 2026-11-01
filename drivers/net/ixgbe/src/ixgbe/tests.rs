@@ -468,3 +468,82 @@ kernel_test_in!(
     "drivers/net/ixgbe",
     smoke_ixgbe_queue0_register_conversation
 );
+
+// ── RSS fixtures (commit 2) — append to tests.rs ────────────────
+
+fn smoke_ixgbe_rss_packing() -> TestResult {
+    use super::rss::{mrqc_word, reta_words, rssrk_words, IxgbeRss, RETA_ENTRIES};
+    use narf_net::rss::RSS_KEY;
+    if mrqc_word() != 0x00F3_0001 {
+        return TestResult::Fail("MRQC word is not RSS-only + all hash fields");
+    }
+    let mut key = [0u8; 40];
+    key.copy_from_slice(&RSS_KEY);
+    let words = rssrk_words(&key);
+    if words[0] != 0xda56_5a6d || words[9] != 0xfa01_acbe {
+        return TestResult::Fail("RSSRK key packing wrong");
+    }
+    let rss = match IxgbeRss::standard(4) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("IxgbeRss::standard(4) failed"),
+    };
+    let reta = reta_words(&rss.table);
+    // Balanced 4-queue table: entries 0..3 = 0,1,2,3.
+    if reta[0] != 0x0302_0100 || reta[31] != 0x0302_0100 {
+        return TestResult::Fail("RETA packing wrong");
+    }
+    if IxgbeRss::standard(0).is_ok() || IxgbeRss::standard(17).is_ok() {
+        return TestResult::Fail("RSS queue-count validation failed");
+    }
+    let rss16 = match IxgbeRss::standard(16) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("IxgbeRss::standard(16) failed"),
+    };
+    for q in 0..16 {
+        if rss16.table.iter().filter(|&&e| e as usize == q).count() != RETA_ENTRIES / 16 {
+            return TestResult::Fail("RSS 16-queue table unbalanced");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_rss_packing);
+
+fn smoke_ixgbe_rss_register_conversation() -> TestResult {
+    use super::queues::RegBank;
+    use super::rss::{IxgbeRss, REG_MRQC, REG_RETA_BASE, REG_RSSRK_BASE};
+    let rss = match IxgbeRss::standard(4) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("IxgbeRss::standard(4) failed"),
+    };
+    let mut bank = FakeBank::new();
+    rss.apply(&mut bank);
+    if bank.read32(REG_MRQC) != 0x00F3_0001 {
+        return TestResult::Fail("MRQC not programmed");
+    }
+    if bank.read32(REG_RSSRK_BASE) != 0xda56_5a6d {
+        return TestResult::Fail("RSSRK[0] not programmed");
+    }
+    if bank.read32(REG_RETA_BASE) != 0x0302_0100 {
+        return TestResult::Fail("RETA[0] not programmed");
+    }
+    // Hardware steering agrees with the shared stack-side hash.
+    let mut frame = alloc::vec![0u8; 54];
+    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    frame[14] = 0x45;
+    frame[23] = 6;
+    frame[26..30].copy_from_slice(&[66, 9, 149, 187]);
+    frame[30..34].copy_from_slice(&[161, 142, 100, 80]);
+    frame[34..36].copy_from_slice(&2794u16.to_be_bytes());
+    frame[36..38].copy_from_slice(&1766u16.to_be_bytes());
+    let net_cfg = narf_net::rss::RssConfig::standard(4, 128);
+    if rss.rx_queue(&frame) != net_cfg.rx_queue(&frame) {
+        return TestResult::Fail("ixgbe RSS queue disagrees with net rss");
+    }
+    let mut arp = frame.clone();
+    arp[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+    if rss.rx_queue(&arp) != 0 {
+        return TestResult::Fail("non-IP frame did not hash to queue 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_rss_register_conversation);
