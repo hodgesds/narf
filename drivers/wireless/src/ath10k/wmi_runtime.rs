@@ -23,6 +23,7 @@ pub(in crate::ath10k) use dwell_scan::ScanPolicy;
 mod chains;
 mod coexistence;
 mod data;
+mod host_power;
 mod ht;
 mod mlme;
 pub(in crate::ath10k) mod offchannel;

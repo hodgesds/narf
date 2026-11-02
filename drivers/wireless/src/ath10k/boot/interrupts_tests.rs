@@ -26,6 +26,7 @@ fn owner(words: &mut Vec<u32>, hardware: HwRev) -> PciBoot {
         mmio: Mmio {
             cap: Cap::bootstrap(),
             sources: None,
+            power: None,
             io: RawMmio(MmioRegion {
                 phys: base,
                 virt: words.as_mut_ptr() as u64,
@@ -172,12 +173,84 @@ fn smoke_ath10k_interrupts_delivered_service_brackets_ring_poll() -> TestResult 
         return TestResult::Fail("teardown left a CE or line source enabled");
     }
     park(owner);
+    #[cfg(feature = "kernel-test")]
+    if let Err(error) = terminal_wake_failure_retires_vector() {
+        return TestResult::Fail(error);
+    }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/ath10k/interrupts",
     smoke_ath10k_interrupts_delivered_service_brackets_ring_poll
 );
+
+/// Real MSI capability/config/vector lifecycle over an owned RAM ECAM
+/// aperture. RTC stays OFF, so the production terminal wake must time out;
+/// no fake MsiConfig, wake/quiet receipt or native reclaim is supplied.
+#[cfg(feature = "kernel-test")]
+fn terminal_wake_failure_retires_vector() -> Result<(), &'static str> {
+    if SIGNAL.lock().is_some() {
+        return Err("terminal PM fixture cannot replace an existing MSI owner");
+    }
+    let mut config = vec![0u32; 4096 / 4];
+    let pointer = config.as_mut_ptr().cast::<u8>();
+    let physical = narf_memory::PhysAddr::from_kernel_ptr(pointer.cast_const());
+    // SAFETY: this case exclusively owns the config fixture; its RAM outlives
+    // the scoped ECAM mapping and every native MSI config operation below.
+    let _mapping = unsafe { narf_bus::ecam::__test_windows(&[(physical, pointer, 4096)]) };
+    config[0] = 0x003e_168c;
+    config[1] = 0x0010_0000 | u32::from(narf_bus::pci::cmd::BUS_MASTER);
+    config[0x34 / 4] = 0x80;
+    config[0x80 / 4] = 0x0080_0005; // single64-bit MSI capability
+    let mut words = vec![0u32; 0x100000 / 4];
+    let mut owner = owner(&mut words, HwRev::Qca6174);
+    let address = narf_bus::PcieAddr::new(0x7fa4, 0, 27, 0);
+    owner.device.addr = narf_bus::BusAddr::Pcie(address);
+    owner.device.kind = narf_bus::BusKind::Pcie {
+        addr: address,
+        cfg_phys: physical,
+    };
+    owner.start_interrupts();
+    let vector = owner
+        .msi
+        .as_ref()
+        .ok_or("actual terminal MSI setup failed")?
+        .vector;
+    if config[0x80 / 4] & 0x10000 == 0
+        || narf_interrupts::dispatch::is_masked(vector)
+        || !narf_interrupts::vector::is_allocated(vector)
+    {
+        return Err("terminal PM fixture lacks actual enabled MSI/vector ownership");
+    }
+    owner.mmio.power = Some(power::Owner::new(HwRev::Qca6174));
+    // The RAM endpoint never changes RTC to ON3 after the actual WAKE write.
+    // The original PCI grant remains current for MSI disable and BMEoff.
+    let result = owner.retire_for_restart();
+    let correct = matches!(result, Err(BmiError::Timeout))
+        && owner.retired
+        && !owner.reclaimable
+        && !owner.hif_live
+        && owner.msi.is_none()
+        && owner.interrupts.is_none()
+        && config[0x80 / 4] & 0x10000 == 0
+        && config[1] & u32::from(narf_bus::pci::cmd::BUS_MASTER) == 0
+        && !narf_interrupts::vector::is_allocated(vector)
+        && !narf_interrupts::dispatch::installed_handler_names(vector).contains(&"ath10k")
+        && SIGNAL.lock().is_none();
+    if !correct {
+        // Fixture restoration only: retain the original failure verdict even
+        // on the defective source whose retired Drop skipped this cleanup.
+        owner.stop_interrupts();
+        park(owner);
+        return Err("terminal wake failure skipped original MSI/vector cleanup or released DMA");
+    }
+    words.fill(0x1234);
+    drop(owner);
+    if words.iter().any(|value| *value != 0x1234) {
+        return Err("late failed-PM retired Drop modified successor hardware");
+    }
+    Ok(())
+}
 
 const FW_IND_EVENT_PENDING_BIT: u32 = crate::ath10k::hw::FW_IND_EVENT_PENDING;
 use crate::ath10k::irq::HOST_IS_COPY_COMPLETE;

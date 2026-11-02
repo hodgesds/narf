@@ -71,6 +71,84 @@ fn allocate_runtime(hw: HwRev) -> (Runtime<Buffer>, Vec<Buffer>) {
     .unwrap();
     (runtime, allocations)
 }
+fn smoke_ath10k_host_pm_retains_posted_rx_and_native_ce_management_tickets() -> TestResult {
+    let hardware = HwRev::Qca6174;
+    let (mut runtime, buffers) = allocate_runtime(hardware);
+    let mut io = Io::default();
+    runtime.initialize(&mut io, hardware).unwrap();
+    let mapped = buffers
+        .iter()
+        .map(|buffer| Rc::strong_count(&buffer.bytes))
+        .collect::<Vec<_>>();
+    if !runtime.host_idle()
+        || !runtime
+            .pipes
+            .iter()
+            .any(|pipe| pipe.direction == Direction::Destination && pipe.ring.busy())
+    {
+        return TestResult::Fail("posted native RX maps were mistaken for pending host work");
+    }
+    let source = runtime
+        .pipes
+        .iter_mut()
+        .find(|pipe| pipe.number == 4)
+        .unwrap();
+    begin_send(source, &mut io, &[1, 2, 3, 4]).unwrap();
+    if runtime.host_idle() {
+        return TestResult::Fail("published native CE original admitted host sleep");
+    }
+    let held = runtime.pipes.iter().find(|pipe| pipe.number == 4).unwrap();
+    if held.pending.is_none()
+        || !held.ring.busy()
+        || buffers
+            .iter()
+            .map(|buffer| Rc::strong_count(&buffer.bytes))
+            .collect::<Vec<_>>()
+            != mapped
+    {
+        return TestResult::Fail("idle probe released or replaced retained native DMA ownership");
+    }
+    let base = hardware.registers().unwrap().ce_base(4).unwrap();
+    let target = io.regs[&(base + crate::ath10k::hw::ce_off::SR_WR_INDEX)];
+    io.regs
+        .insert(base + crate::ath10k::hw::ce_off::CURRENT_SRRI, target);
+    runtime.poll(&mut io).unwrap();
+    if !runtime.host_idle() {
+        return TestResult::Fail("actual CE terminal did not retire the old native host work");
+    }
+    let mut pool = crate::ath10k::wmi_runtime::management::Pool::new().unwrap();
+    let (id, address) = pool
+        .prepare(&[0xb0; 30], |n| {
+            Ok(Buffer {
+                address: 0x900000,
+                bytes: Rc::new(RefCell::new(vec![0; n])),
+            })
+        })
+        .unwrap();
+    let original = pool.snapshot(id).unwrap();
+    runtime.management_memory = Some(pool);
+    if runtime.host_idle()
+        || runtime.management_memory.as_ref().unwrap().pending() != 1
+        || runtime.management_memory.as_ref().unwrap().snapshot(id) != Some(original)
+        || address != 0x900000
+    {
+        return TestResult::Fail("referenced management air ticket became CE-only sleep/release");
+    }
+    runtime
+        .management_memory
+        .as_mut()
+        .unwrap()
+        .complete(&[id])
+        .unwrap();
+    if !runtime.host_idle() {
+        return TestResult::Fail("matching native management terminal did not release idle denial");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath10k/host-bus-pm",
+    smoke_ath10k_host_pm_retains_posted_rx_and_native_ce_management_tickets
+);
 fn smoke_ath10k_runtime_ce_profiles_receive_refill() -> TestResult {
     for (hw, want) in [
         (HwRev::Qca6174, vec![2, 3, 4]),

@@ -75,6 +75,14 @@ pub(super) struct State {
     management: Option<Vec<u8>>,
 }
 impl State {
+    fn host_idle(&self) -> bool {
+        self.roc_quiescent()
+            && self.incoming.is_empty()
+            && self.received.is_empty()
+            && self.wmm_update.is_none()
+            && self.protection_update.is_none()
+            && self.rx_ba.host_idle()
+    }
     pub(super) fn protection_allowed(&self) -> bool {
         self.open()
             && !self.pending.reply_in_flight()
@@ -746,7 +754,28 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             let event = match self.pending.pop_front() {
                 Some(e) => e,
                 None => {
+                    // This optional host-vote hint is narrower than DATA
+                    // admission: retain every buffered BA/key/control/native
+                    // original, scan/ROC and copy owner on the full poll path.
+                    let eligible = self.scan_pending.is_none()
+                        && self.scan_dwell.is_none()
+                        && self.roc.is_none()
+                        && self.management_done.is_empty()
+                        && self.management_received.is_empty()
+                        && self.management_completed.is_none()
+                        && self
+                            .coexistence
+                            .as_ref()
+                            .is_none_or(|state| !state.blocked())
+                        && self.data.as_ref().is_some_and(State::host_idle);
+                    self.htt.wmi.htc.transport.runtime_idle(eligible);
                     let event = self.htt.poll_now()?;
+                    if self.htt.take_idle_deferred() {
+                        // No actual empty native prefix was read. Do not run
+                        // data_event(Idle), expiry/publication or M4 commit.
+                        self.failed = false;
+                        return Ok(Vec::new());
+                    }
                     self.station_event(event)?
                 }
             };

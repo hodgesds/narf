@@ -33,6 +33,14 @@ fn order_error(error: narf_wireless::reorder::Error) -> Error {
     }
 }
 impl Owner {
+    pub(super) fn host_idle(&self) -> bool {
+        self.ppdu.is_none()
+            && self
+                .sessions
+                .iter()
+                .flatten()
+                .all(|session| session.order.buffered() == 0)
+    }
     pub(super) fn new(profile: Option<ht::Profile>) -> Result<Self, Error> {
         let mut sessions = Vec::new();
         sessions

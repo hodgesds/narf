@@ -118,6 +118,7 @@ fn smoke_ath10k_recovery_real_cap_revocation_before_and_after_master_disable() -
             cap,
             io: ready(0x34400, 8),
             sources: None,
+            power: None,
         };
         let mut revoke = Some(revoke);
         if !during {
@@ -177,6 +178,7 @@ fn smoke_ath10k_recovery_retired_physical_drop_preserves_successor_and_pins_dma(
         mmio: Mmio {
             cap: Cap::bootstrap(),
             sources: None,
+            power: None,
             io: RawMmio(MmioRegion {
                 phys: base,
                 virt: words.as_mut_ptr() as u64,
@@ -265,6 +267,7 @@ fn smoke_ath10k_recovery_reclaimable_retired_drop_frees_without_hardware_access(
         mmio: Mmio {
             cap: Cap::bootstrap(),
             sources: None,
+            power: None,
             io: RawMmio(MmioRegion {
                 phys: base,
                 virt: words.as_mut_ptr() as u64,
@@ -448,6 +451,7 @@ fn smoke_ath10k_failed_scan_expired_firmware_still_uses_live_pci_to_reset() -> T
         mmio: Mmio {
             cap: Cap::bootstrap(),
             sources: Some(source.clone()),
+            power: None,
             io: RawMmio(MmioRegion {
                 phys: base,
                 virt: words.as_mut_ptr() as u64,

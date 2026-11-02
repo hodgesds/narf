@@ -2,6 +2,8 @@
 //! Native started-wdev/CNM/RF receipts are separate driver preconditions.
 use super::super::{RadioControlAuthority, RadioInterfaceIdentity};
 use super::*;
+#[path = "radio_control_emission_tests.rs"]
+mod emission;
 fn radio(fixture: &Fixture) -> Result<RadioControlAuthority, WirelessError> {
     RadioControlAuthority::bind(
         fixture.admin.clone(),

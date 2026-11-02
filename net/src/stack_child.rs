@@ -11,6 +11,11 @@ pub(super) struct ControlParent {
     ownership_epoch: u64,
 }
 impl ControlParent {
+    /// Original delegation context only. Native capture re-invokes these
+    /// retained grants and checks their exact registered parent identity.
+    pub(super) fn native_binding(&self) -> (&AdminHandle, u64, u64) {
+        (&self.admin, self.namespace, self.ownership_epoch)
+    }
     pub(super) fn current(&self) -> bool {
         self.admin.cap.invoke(AdminContext {
             handle: &self.admin,

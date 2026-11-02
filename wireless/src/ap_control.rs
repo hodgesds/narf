@@ -20,8 +20,8 @@ pub use event::{ApEventAuthority, PreparedApEvent};
 #[path = "radio_control.rs"]
 mod radio;
 pub use radio::{
-    PreparedRadioManagementEvent, RadioControlAuthority, RadioEmissionAuthority,
-    RadioEventAuthority, RadioInterfaceIdentity, RadioReceiveFence,
+    PreparedRadioManagementEvent, PreparedRadioRocEvent, RadioControlAuthority,
+    RadioEmissionAuthority, RadioEventAuthority, RadioInterfaceIdentity, RadioReceiveFence,
 };
 #[path = "ap_emission.rs"]
 mod emission;

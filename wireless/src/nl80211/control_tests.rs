@@ -4,6 +4,8 @@ use narf_ipc::{Consumer, Producer};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 
+#[path = "p2p_iftype_tests.rs"]
+mod p2p_iftype;
 #[path = "permission_tests.rs"]
 mod permission;
 #[path = "pmf_tests.rs"]

@@ -202,6 +202,54 @@ impl RadioEventAuthority {
     ) -> Result<(), WirelessError> {
         self.roc(56, cookie, frequency_mhz, duration_ms)
     }
+    /// Prepare outside State after the native matching successful START.
+    /// Delivery still requires that exact native notification/grant epoch.
+    pub fn prepare_roc_ready(
+        &self,
+        receiver: &RadioEmissionAuthority,
+        cookie: u64,
+        frequency_mhz: u32,
+        duration_ms: u32,
+    ) -> Result<PreparedRadioRocEvent, WirelessError> {
+        self.prepare_roc(receiver, 55, cookie, frequency_mhz, duration_ms)
+    }
+    /// Prepare after actual native retirement. A host timeout/cancel request
+    /// supplies no terminal receipt and cannot authorize this publication.
+    pub fn prepare_roc_expired(
+        &self,
+        receiver: &RadioEmissionAuthority,
+        cookie: u64,
+        frequency_mhz: u32,
+        duration_ms: u32,
+    ) -> Result<PreparedRadioRocEvent, WirelessError> {
+        self.prepare_roc(receiver, 56, cookie, frequency_mhz, duration_ms)
+    }
+    fn prepare_roc(
+        &self,
+        receiver: &RadioEmissionAuthority,
+        command: u8,
+        cookie: u64,
+        frequency_mhz: u32,
+        duration_ms: u32,
+    ) -> Result<PreparedRadioRocEvent, WirelessError> {
+        if cookie == 0 || frequency_mhz == 0 || duration_ms == 0 {
+            return Err(WirelessError::InvalidArgs);
+        }
+        let mut attrs = self.base()?;
+        attr(&mut attrs, 38, &frequency_mhz.to_ne_bytes());
+        attr(&mut attrs, 87, &duration_ms.to_ne_bytes());
+        attr(&mut attrs, 88, &cookie.to_ne_bytes());
+        let message = radio_message(command, &attrs);
+        self.current()?;
+        if !receiver.matches_control(&self.source.guard) {
+            return Err(WirelessError::Denied);
+        }
+        Ok(PreparedRadioRocEvent {
+            source: self.clone(),
+            original: receiver.clone(),
+            message,
+        })
+    }
     fn roc(
         &self,
         command: u8,
@@ -262,6 +310,35 @@ impl RadioEventAuthority {
             .upgrade()
             .ok_or(WirelessError::Denied)?;
         let original = self.source.native_emission_for(iface.as_ref())?;
+        self.current()?;
+        let message = radio_message(59, &attrs);
+        self.current()?;
+        Ok(PreparedRadioManagementEvent {
+            source: self.clone(),
+            original,
+            message,
+        })
+    }
+    /// Control-WDEV counterpart: the native owner supplies its actual child
+    /// Write grant while preparation performs full callbacks outside State.
+    /// The resulting event still needs the original copy/grant epoch fence.
+    pub fn prepare_control_management_received(
+        &self,
+        child: &narf_capabilities::Cap<narf_net::NetIface, narf_capabilities::Write>,
+        frequency_mhz: u32,
+        signal_dbm: Option<i8>,
+        frame: &[u8],
+    ) -> Result<PreparedRadioManagementEvent, WirelessError> {
+        let attrs = self.management_attrs(frequency_mhz, signal_dbm, frame)?;
+        let iface = self
+            .source
+            .guard
+            .iface
+            .upgrade()
+            .ok_or(WirelessError::Denied)?;
+        let original = self
+            .source
+            .native_control_emission_for(iface.as_ref(), child)?;
         self.current()?;
         let message = radio_message(59, &attrs);
         self.current()?;
@@ -357,41 +434,154 @@ fn attr(out: &mut Vec<u8>, kind: u16, payload: &[u8]) {
     out.resize((out.len() + 3) & !3, 0);
 }
 
-/// Managed-netdev native emission proof. The original Radio-kind source,
-/// concrete receiver, current netdev registration and grant remain bound.
+/// Native Radio-kind proof with exact netdev or actual control-WDEV ancestry.
+/// Original source, concrete receiver, registrations and grants remain bound.
 /// This wrapper cannot be constructed from a captured AP emission guard.
 #[derive(Clone, Debug)]
-pub struct RadioEmissionAuthority(super::emission::ApEmissionAuthority);
+pub struct RadioEmissionAuthority(RadioEmission);
+#[derive(Clone, Debug)]
+enum RadioEmission {
+    Netdev(super::emission::ApEmissionAuthority),
+    Control(Arc<ControlEmission>),
+}
+#[derive(Clone, Debug)]
+struct ControlEmission {
+    admin: narf_net::AdminEmissionAuthority,
+    source: narf_net::native_emission::Lifetime,
+    child: narf_net::native_emission::Lifetime,
+    parent: narf_net::native_emission::Lifetime,
+    receiver: usize,
+    target: Target,
+    namespace: u64,
+    generation: NonZeroU64,
+}
+impl ControlEmission {
+    fn current(&self) -> bool {
+        self.source.current()
+            && self.child.current()
+            && self.parent.current()
+            && self.admin.current()
+    }
+    fn matches_control(&self, control: &ApControlAuthority) -> bool {
+        self.receiver == control.iface.as_ptr().cast::<()>() as usize
+            && self.target == control.target
+            && self.namespace == control.namespace
+            && control.mode == 10
+            && self.generation == control.generation
+            && self.current()
+    }
+}
 impl RadioControlAuthority {
     pub fn native_emission_for<I: WirelessNetIface + ?Sized>(
         &self,
         receiver: &I,
     ) -> Result<RadioEmissionAuthority, WirelessError> {
-        if !matches!(self.guard.kind, ControlKind::Radio) || self.guard.mode != 2 {
+        if !matches!(self.guard.kind, ControlKind::Radio) || !matches!(self.guard.mode, 2 | 8 | 9) {
             return Err(WirelessError::NotSupported);
         }
-        Ok(RadioEmissionAuthority(
+        Ok(RadioEmissionAuthority(RadioEmission::Netdev(
             self.guard.capture_native_emission(receiver)?,
-        ))
+        )))
+    }
+    /// Capture outside native State using this actual child's original Write
+    /// grant. No same-name netdev, parent grant or observed WDEV substitutes
+    /// for the real typed child/parent registration and original source.
+    pub fn native_control_emission_for<I: WirelessNetIface + ?Sized>(
+        &self,
+        receiver: &I,
+        child: &narf_capabilities::Cap<narf_net::NetIface, narf_capabilities::Write>,
+    ) -> Result<RadioEmissionAuthority, WirelessError> {
+        if !matches!(self.guard.kind, ControlKind::Radio) || self.guard.mode != 10 {
+            return Err(WirelessError::NotSupported);
+        }
+        self.guard.check_for(receiver)?;
+        let Target::Control(target) = self.guard.target else {
+            return Err(WirelessError::NotSupported);
+        };
+        let (registration, parent) = crate::registry::native_control_registration(receiver, target)
+            .ok_or(WirelessError::Denied)?;
+        let source = self
+            .guard
+            .reply
+            .native_source()
+            .ok_or(WirelessError::NotSupported)?;
+        let admin = self
+            .guard
+            .admin
+            .native_control_emission(child, self.guard.namespace)
+            .map_err(|_| WirelessError::Denied)?;
+        let guard = ControlEmission {
+            admin,
+            source,
+            child: registration,
+            parent,
+            receiver: core::ptr::from_ref(receiver).cast::<()>() as usize,
+            target: self.guard.target,
+            namespace: self.guard.namespace,
+            generation: self.guard.generation,
+        };
+        self.guard.check_for(receiver)?;
+        if !guard.current() {
+            return Err(WirelessError::Denied);
+        }
+        Ok(RadioEmissionAuthority(RadioEmission::Control(Arc::new(
+            guard,
+        ))))
     }
 }
 impl RadioEmissionAuthority {
     pub fn current(&self) -> bool {
-        self.0.current()
+        match &self.0 {
+            RadioEmission::Netdev(guard) => guard.current(),
+            RadioEmission::Control(guard) => guard.current(),
+        }
     }
     pub fn matches_role<I: WirelessNetIface + ?Sized>(
         &self,
         receiver: &I,
         generation: core::num::NonZeroU64,
     ) -> bool {
-        self.0.matches_role(receiver, 2, generation)
+        self.matches_mode(receiver, 2, generation)
+    }
+    /// Native P2P owners must provide their actual current role generation.
+    /// The legacy matches_role method retains its managed-station mode2 rule.
+    pub fn matches_mode<I: WirelessNetIface + ?Sized>(
+        &self,
+        receiver: &I,
+        mode: u32,
+        generation: core::num::NonZeroU64,
+    ) -> bool {
+        match &self.0 {
+            RadioEmission::Netdev(guard) => guard.matches_role(receiver, mode, generation),
+            RadioEmission::Control(guard) => {
+                mode == 10
+                    && guard.receiver == core::ptr::from_ref(receiver).cast::<()>() as usize
+                    && guard.generation == generation
+                    && guard.current()
+            }
+        }
     }
     pub fn watch(&self, waker: &core::task::Waker) -> bool {
-        self.0.watch(waker)
+        match &self.0 {
+            RadioEmission::Netdev(guard) => guard.watch(waker),
+            RadioEmission::Control(guard) => {
+                guard.source.watch(waker.clone())
+                    && guard.child.watch(waker.clone())
+                    && guard.parent.watch(waker.clone())
+                    && guard.admin.watch(waker)
+                    && guard.current()
+            }
+        }
+    }
+    fn matches_control(&self, control: &ApControlAuthority) -> bool {
+        match &self.0 {
+            RadioEmission::Netdev(guard) => guard.matches_control(control),
+            RadioEmission::Control(guard) => guard.matches_control(control),
+        }
     }
 }
 
-/// Borrowed native copy boundary; no cap or RF authority is minted. The
+/// Borrowed native copy/grant-notification boundary; no RF grant is minted. The
 /// driver advances this nonwrapping epoch before RF/filter closure and
 /// separately validates current policy/IO after event preparation.
 pub struct RadioReceiveFence<'a> {
@@ -400,7 +590,7 @@ pub struct RadioReceiveFence<'a> {
     pub receiver: &'a RadioEmissionAuthority,
     pub origin: &'a RadioEmissionAuthority,
 }
-/// Serialized for its original source/namespace/IFINDEX only. No new
+/// Serialized for its original source/namespace/netdev or control-WDEV only. No new
 /// endpoint/provider lookup or dynamic current callback occurs in deliver.
 #[derive(Debug)]
 pub struct PreparedRadioManagementEvent {
@@ -410,14 +600,7 @@ pub struct PreparedRadioManagementEvent {
 }
 impl PreparedRadioManagementEvent {
     pub fn deliver(self, fence: RadioReceiveFence<'_>) -> Result<(), WirelessError> {
-        if matches!(fence.generation, 0 | u64::MAX)
-            || !matches!(self.source.source.guard.kind, ControlKind::Radio)
-            || self.source.source.guard.mode != 2
-            || !self.original.0.matches_control(&self.source.source.guard)
-            || !fence.receiver.0.matches_control(&self.source.source.guard)
-            || !fence.origin.0.matches_control(&self.source.source.guard)
-            || fence.epoch.load(core::sync::atomic::Ordering::Acquire) != fence.generation
-        {
+        if !prepared_current(&self.source, &self.original, &fence) {
             return Err(WirelessError::Denied);
         }
         self.source
@@ -427,6 +610,40 @@ impl PreparedRadioManagementEvent {
             .deliver(self.message)
             .map_err(|_| WirelessError::Denied)
     }
+}
+/// Typed READY/EXPIRED bytes prepared without a native State guard. Native
+/// receipt/phase and original epoch ownership remain driver preconditions.
+#[derive(Debug)]
+pub struct PreparedRadioRocEvent {
+    source: RadioEventAuthority,
+    original: RadioEmissionAuthority,
+    message: Vec<u8>,
+}
+impl PreparedRadioRocEvent {
+    pub fn deliver(self, fence: RadioReceiveFence<'_>) -> Result<(), WirelessError> {
+        if !prepared_current(&self.source, &self.original, &fence) {
+            return Err(WirelessError::Denied);
+        }
+        self.source
+            .source
+            .guard
+            .reply
+            .deliver(self.message)
+            .map_err(|_| WirelessError::Denied)
+    }
+}
+fn prepared_current(
+    source: &RadioEventAuthority,
+    original: &RadioEmissionAuthority,
+    fence: &RadioReceiveFence<'_>,
+) -> bool {
+    !matches!(fence.generation, 0 | u64::MAX)
+        && matches!(source.source.guard.kind, ControlKind::Radio)
+        && matches!(source.source.guard.mode, 2 | 8 | 9 | 10)
+        && original.matches_control(&source.source.guard)
+        && fence.receiver.matches_control(&source.source.guard)
+        && fence.origin.matches_control(&source.source.guard)
+        && fence.epoch.load(core::sync::atomic::Ordering::Acquire) == fence.generation
 }
 fn radio_message(command: u8, attrs: &[u8]) -> Vec<u8> {
     let mut message = vec![0; 16];

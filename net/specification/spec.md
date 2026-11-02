@@ -631,8 +631,35 @@ flush/disable/remove cleanup uses still-current device authority after the
 original administrative/socket guard dies, retaining uncertain DMA until
 actual terminal stop. Full arbitrary authority and delivery callbacks run
 outside native State locks; a cached successful check is never authority.
-Its additive `retain_control_admin` / `control_admin` methods retain only an
-explicit current control-child Admin on that exact source; default sinks refuse
+`AdminHandle::native_control_emission(child_write_cap, namespace)` captures
+the exact already-registered control child under its original administrative
+grant. The explicit current child capability must match that registration,
+the handle's child scope and its recorded physical-parent capability. A
+delegated capture retains and re-invokes the original child Admin/daemon/Write
+and parent Admin/daemon/Write grants. A namespace kernel handle retains its
+existing Admin and the recorded actual parent/child Write grants; capture
+creates no additional administrative capability. Unsupported or nested
+ancestry refuses. The returned `AdminEmissionAuthority` uses the same fixed
+`current`/`watch` operations and weak exact provider receipts as netdev emission.
+The control object has no IFACES entry, fabricated ifindex or UP bit. Its
+physical parent's actual Ethernet registration, namespace and original
+delegation ownership epoch remain bound, including while that parent is DOWN.
+The ordinary `native_emission` constructor keeps its existing UP/netdev rule.
+
+Control capture serializes its fixed invoked-cap/metadata observation with
+legacy representation publication in `PUBLISH -> Registry -> IFACES` order.
+Creating a same-name legacy entry retires the control registration's prior
+native receipt before publication, and removal cannot revive that receipt.
+Parent/child typed unregister, parent identity replacement, namespace/MAC
+change and DOWN retire the captured observations; wakes run after provider
+locks release. A fresh capture requires the original grants to remain current.
+The native wireless owner separately retains the exact source socket, WDEV,
+role generation, actual START/channel grants and current device/RF policy.
+This net proof supplies no source socket, START receipt, packet or RF authority.
+Source or administrative loss closes emission while physical non-emitting
+cleanup remains owned by the driver's original device authority.
+The additive `DeferredReplySink::retain_control_admin` / `control_admin` methods
+retain only an explicit current control-child Admin on that exact source; default sinks refuse
 retention and return no grant. The real source prunes retired/revoked child
 controls. Namespace, names, port ids and WDEV observations never create them;
 families still prove the actual registered parent-child relation inside the

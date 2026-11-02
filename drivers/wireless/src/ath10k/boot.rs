@@ -26,6 +26,8 @@ pub(super) use hif::tests::CeFixture;
 mod htt_memory;
 #[path = "boot/interrupts.rs"]
 mod interrupts;
+#[path = "boot/power.rs"]
+mod power;
 #[path = "boot/recovery.rs"]
 mod recovery;
 pub(super) use recovery::Restart;
@@ -58,6 +60,7 @@ struct Mmio<I = RawMmio> {
     cap: Cap<BusDeviceCap, Write>,
     io: I,
     sources: Option<super::firmware_source::Source>,
+    power: Option<power::Owner>,
 }
 struct RegisterOp<'a, I> {
     io: &'a mut I,
@@ -78,38 +81,18 @@ impl<I: Ath10kMmio> CapOp<BusDeviceCap, Write> for RegisterOp<'_, I> {
 }
 impl<I: Ath10kMmio> Ath10kMmio for Mmio<I> {
     fn authorized(&self) -> bool {
-        self.cap.invoke(NoopOp).is_ok()
+        self.power.as_ref().is_none_or(power::Owner::current)
+            && self.cap.invoke(NoopOp).is_ok()
             && self
                 .sources
                 .as_ref()
                 .is_none_or(|s| s.invoke_boot(|| ()).is_ok())
     }
     fn read32(&mut self, offset: u64) -> u32 {
-        let operation = RegisterOp {
-            io: &mut self.io,
-            offset,
-            value: None,
-        };
-        match &self.sources {
-            Some(s) => s
-                .invoke_boot(|| self.cap.invoke(operation))
-                .ok()
-                .and_then(Result::ok),
-            None => self.cap.invoke(operation).ok(),
-        }
-        .unwrap_or(u32::MAX)
+        self.access_register(offset, None).unwrap_or(u32::MAX)
     }
     fn write32(&mut self, offset: u64, value: u32) {
-        let operation = RegisterOp {
-            io: &mut self.io,
-            offset,
-            value: Some(value),
-        };
-        if let Some(s) = &self.sources {
-            let _ = s.invoke_boot(|| self.cap.invoke(operation));
-        } else {
-            let _ = self.cap.invoke(operation);
-        }
+        let _ = self.access_register(offset, Some(value));
     }
 }
 
@@ -241,6 +224,7 @@ impl PciBoot {
                 cap,
                 io: RawMmio(mmio),
                 sources: None,
+                power: Some(power::Owner::new(hardware)),
             },
             hardware,
             registers,
@@ -534,6 +518,11 @@ impl Transport for PciBoot {
     fn done_complete(&mut self) {
         self.hif_live = true;
         self.start_interrupts();
+        // Rings and the native interrupt consumer already exist. A source or
+        // actual wake/ASPM failure cannot admit a runtime DATA generation.
+        if self.start_host_power().is_err() {
+            self.poisoned = true;
+        }
     }
 
     async fn exchange(&mut self, request: &[u8], response: &mut [u8]) -> Result<usize, BmiError> {
@@ -746,7 +735,11 @@ impl Drop for PciBoot {
                 .is_ok_and(|command| command & narf_bus::pci::cmd::BUS_MASTER == 0);
         // After DONE, firmware may still direct writes; with BME verified off
         // and an ordered flush read those can neither start nor be in flight.
-        if stopped && disabled && (!self.mission_pending || self.flushed()) {
+        if stopped
+            && disabled
+            && (!self.mission_pending || self.flushed())
+            && self.mmio.stop_power().is_ok()
+        {
             barrier();
             // SAFETY: no CE can access the allocations and PCI BME is clear.
             unsafe {

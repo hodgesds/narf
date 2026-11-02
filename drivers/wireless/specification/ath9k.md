@@ -826,6 +826,56 @@ Six native cases are written, including actual fresh40/full-reset factory
 composition, native eight-original delivery and kernel DHCP. Release/native
 execution and physical qualification remain pending.
 
+### 3.11 Counted D0 idle FULL_SLEEP and retained cold wake
+
+The family controller exposes `set_idle_full_sleep(bool) ->
+Result<IdlePowerStatus, IdlePowerError>`, `idle_full_sleep_status() ->
+Option<IdlePowerStatus>` and `acquire_idle_wake() ->
+Result<IdleWakeGuard, IdlePowerError>`. These operate on the original retained
+controller; station NETWORK_SLEEP, operator IFF_UP/DOWN and system S3 retain
+their separate meanings. The admitted baseline accepts idle only on a current
+published Passive, unassociated generation with no MLME/security/control or
+native/software original pending. Counted external users and accepted queued
+initialize/reset/retune work return Busy before idle can be admitted.
+
+Each actual station holds a counted idle guard throughout its native lifetime.
+The retained worker withdraws its exact public interface/copies/IPC, requires
+the same complete all-ten-QCU/RX/IRQ/BME-off terminal retirement, then releases
+that guard and owns Linux's100ms delay. A completed retained RX tail remains
+mapped until terminal stop. Missing stop proof pins the owner, count and DMA;
+no successor or clock-off is allowed. Dropping a public waiter cannot cancel
+this worker. Leaving idle cancels the delay and continues that original owner.
+Actual current-capability D0 entry proves RXabort/state0 and IRQ/queue/BMEoff,
+uses the source STA_ID1/RTC/reset sequence and requires RTC_SHUTDOWN1.
+
+Wake performs a fresh complete actual20 cold generation at the retained primary,
+including identical raw factory/identity, INI/PLL/RF, current factory/host plan,
+analog calibration, complete MAC/key-cache preparation and native reports before
+new-name publication. Keys, association, PN/replay, BA, copies and old endpoints
+do not survive. A40 predecessor cannot lend its center/report to a20 successor.
+Existing H/B/T/Q/S/P formats and qualification recipes are unchanged; no clock
+off happens under a live P1 always-awake or S1 packet owner. Physical board
+measurements, power and wake acceptance remain external and pending.
+
+Status distinguishes desired idle, phase, counted users and physical generation.
+`Operational` means not parked, including provisioning before publication or
+independent S1 doze; it grants no calibration or IO authority. `Asleep` requires
+completed physical entry. A public wake-use return additionally requires a
+Running packet and current source/PCI/actual awake admission. Its guard prevents
+idle FULL_SLEEP and grants no register/key/DMA access. System suspend fences
+new users and refuses extra live guards; resume cold-restores actual20. Remove
+permanently closes the original idle owner, and the terminal supervisor never
+resurrects an intentionally parked owner.
+
+The source contract and pinned Linux call chain are
+[AR9285 D0 idle FULL_SLEEP](ar9285-idle-full-sleep.md). Seven native cases are
+written, covering real Device/Radio/Packet/DMA, all-queue/RX retirement, current
+physical sleep/readback negatives, counted control/association refusal,
+cancelled delay, fresh Open/WPA2/kernel DHCP and full40-above/below to actual20.
+They compose the production lifetime helpers with complete model cold-reset
+primitives; they do not instantiate the singleton native PCI controller.
+Release/native execution and physical acceptance remain pending.
+
 ## 4. Invariants
 
 - PCI parking is verified by command-register readback before BAR sizing: BME
@@ -988,13 +1038,13 @@ rows and the tree facts that keep each open:
   rejects longer frames; `N85H` hashes "noTXAMSDU". The shared
   `station_security::transmit_amsdu_qos` encoder exists but needs larger maps
   and a separate measured record.
-- `idle_full_sleep`: Linux `main.c::ath_ps_full_sleep` aborts RX and enters
-  FULL_SLEEP only while mac80211 reports `IEEE80211_CONF_IDLE`, and leaving
-  idle reprograms the channel through `ath_reset`. Natively the only
-  FULL_SLEEP entry is the suspend path (`identity::disable_and_sleep`); every
-  `Port` register access assumes AWAKE and no use-counted wake wraps the
-  packet/irq/station owners, and the station has no idle notion distinct from
-  its passive scan cache, which keeps RX running.
+- `idle_full_sleep` is source-complete for the admitted Passive/unassociated
+  original-controller baseline in §3.11: counted native/control/wake users,
+  public desired/status controls, retained100ms continuation, full terminal
+  DMA/IRQ proof before actual D0 SHUTDOWN and fresh actual20 cold wake.
+  Associated retention, runtime PCI D3 and physical board wake measurements are
+  not inferred. Seven native cases are written; release/native and physical
+  acceptance remain pending.
 - `station_network_sleep` is source-complete for the admitted optional
   AR9285 N85S1 program in §3.9: actual public desired setting, PM notice/
   PS-Poll receipts, TIM/DTIM/CAB timers, source-qualified real awake/sleep
@@ -1053,8 +1103,10 @@ station program in §3.9 is admitted. AR9285 lacks `ATH9K_HW_CAP_AUTOSLEEP`
 operations and their separate owners:
 
 - `idle_full_sleep`: `main.c::{ath9k_ps_wakeup,ath9k_ps_restore,ath_ps_full_sleep}`
-  use-counted wake, 100 ms idle timer, RX abort/DMA stop and `FULL_SLEEP`,
-  with `hw.c::ath9k_hw_setpower` restoring `AWAKE` before register access.
+  use-counted wake,100ms idle timer, RX abort/DMA stop and `FULL_SLEEP` are
+  implemented in §3.11 on the retained original controller. Leaving idle uses
+  `ath9k_config`'s full channel-reset requirement and fresh actual20 native
+  calibration rather than claiming old live keys/register state survived.
 - `station_network_sleep`: `NETWORK_SLEEP` station power save with
   `beacon.c::ath9k_beacon_config_sta`/`hw.c::ath9k_hw_set_sta_beacon_timers`
   TIM/DTIM timers and beacon/CAB/PS-Poll/TX-ACK wake conditions, implemented

@@ -830,16 +830,46 @@ looks up a successor endpoint nor grants RF/packet authority. Ordinary typed WDE
 management events retain their existing API and native proof requirements.
 
 `RadioControlAuthority::native_emission_for` captures a distinct
-`RadioEmissionAuthority` only for an actual Radio-kind managed netdev. It retains
+`RadioEmissionAuthority` for an actual Radio-kind netdev in mode2,8 or9. It retains
 the original fixed administrative/source/registration lifetimes and concrete
 receiver/generation; unknown source providers refuse. Native `current`, role
 matching and optional owner-waker watching call no arbitrary source/interface
 callback under driver State. AP capture continues to require its AP-kind guard;
-neither public constructor retargets another kind or a control-only WDEV. The
-driver independently checks native RF/packet epochs, current channel/power,
+its constructor keeps its original scope. Real netdev capture requires actual
+administrative UP. `matches_role` retains its mode2 rule; P2P native callers use
+`matches_mode` with their actual current role and nonwrapping generation. These
+capture helpers do not extend the existing public FRAME/REGISTER_FRAME opt-ins.
+The driver independently checks native RF/packet epochs, current channel/power,
 terminal DMA/ACK and mandatory stop ownership. A physical owner uses its retained
 pump waker or bounded timer for cleanup; short-lived request wakers are not
 silently accumulated as unbounded provider watches.
+
+`native_control_emission_for(receiver, actual_child_write_cap)` separately
+captures an actual mode10 control-WDEV proof. Full source/interface callbacks
+run outside native State. Capture requires the original current child Admin,
+explicit typed child Write grant, recorded actual physical-parent ancestry,
+exact registered WDEV/namespace and original socket's concrete native-source
+receipt. Parent and child wireless registrations are retained as weak exact
+provider observations; the net proof independently re-invokes the original
+parent/admin/daemon/child capability chain. There is no fabricated netdev,
+IFINDEX or UP requirement for the control-only child. Its actual completed
+native START, channel/RF grant and copied-notification epoch remain mandatory
+driver proofs. Parent/child replacement, namespace transfer, source close,
+same-name legacy representation and native role retirement cannot be replaced
+by another current provider. Provider wakes and a bounded capability timer
+drive retained physical cleanup after emission authority dies.
+
+`RadioEventAuthority::prepare_control_management_received` prepares the exact
+original control-WDEV event using that actual child capability outside State.
+The resulting `PreparedRadioManagementEvent` uses the existing fixed
+`RadioReceiveFence` after the driver rechecks physical source/policy/native
+copy ownership. `prepare_roc_ready` and `prepare_roc_expired` similarly retain
+the original fixed Radio proof in a `PreparedRadioRocEvent`; READY preparation
+requires the real matching successful START, and EXPIRED preparation requires
+actual native retirement. Their final fixed epoch/receiver/source checks deny
+events retired by a reentrant preparation callback. Actual socket delivery
+runs outside native State. These typed events do not convert a queued command,
+host timer or cancelled waiter into a native receipt or RF permission.
 
 `async_p2p_device_control` opts an actual control-only WDEV into
 `START_P2P_DEVICE`/`STOP_P2P_DEVICE` (89/90) and their async callbacks.
@@ -1172,6 +1202,17 @@ retain their existing UP/ownership-epoch contract. Typed control-wdev radio
 events omit IFINDEX and carry their actual WDEV id, while ordinary netdev and
 scheduled-scan event shapes remain unchanged. This registration facade itself
 advertises no P2P role or native control operation.
+
+`WirelessNetIface::p2p_interface_types()` selects the family's actual P2P
+interface-type subset for wiphy advertisement. Its default preserves the
+existing DEVICE10/CLIENT8/GO9 wire order. Serialization consults the subset
+only when that family's `WirelessModes::P2P` is present, ignores values outside
+8/9/10, and emits each selected type once. A native implementation that
+completes only control-device operations returns `[10]`; GO/client require
+their own implemented role owners. Interface combinations, actual typed
+registration/source authority, native START/ROC receipts, and per-operation
+RF/key/port admission remain independent requirements.
+
 `GET_INTERFACE` resolves a control-only target by its exact WDEV/namespace and
 emits no IFINDEX attribute; retired IDs cannot select another object. WDEV-based
 physical-wiphy lookup resolves the same registered control object rather than

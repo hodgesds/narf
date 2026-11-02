@@ -227,6 +227,15 @@ pub trait WirelessNetIface: Interface {
         false
     }
 
+    /// The family's actual P2P role subset for wiphy advertisement. This is
+    /// consulted only when WirelessModes::P2P is present; values outside
+    /// CLIENT8/GO9/DEVICE10 and duplicates are ignored. The default retains
+    /// the historical complete P2P advertisement, including its wire order.
+    /// A device-only native implementation must return just DEVICE10.
+    fn p2p_interface_types(&self) -> Vec<u32> {
+        alloc::vec![10, 8, 9]
+    }
+
     /// Valid simultaneous virtual-interface sets for this physical wiphy.
     /// Returning an empty list leaves the implicit one-interface-per-iftype
     /// cfg80211 combinations only; a driver with virtual vdevs must return

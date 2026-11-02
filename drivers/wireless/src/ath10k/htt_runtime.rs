@@ -283,6 +283,9 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
         Ok(id)
     }
     pub fn poll_now(&mut self) -> Result<Event, Error> {
+        // Buffered real HTC/HTT events must never inherit an earlier physical
+        // PM defer. Only this call's actual HIF result may deny fresh idle.
+        self.wmi.htc.take_idle_deferred();
         if self.failed || self.ready.is_none() {
             return Err(Error::Failed);
         }
@@ -296,6 +299,9 @@ impl<T: Hif + HostMemory + HttMemory> Runtime<T> {
         };
         self.failed = false;
         self.dispatch(progressed, packet)
+    }
+    pub(super) fn take_idle_deferred(&mut self) -> bool {
+        self.wmi.htc.take_idle_deferred()
     }
     pub async fn transmit(
         &mut self,

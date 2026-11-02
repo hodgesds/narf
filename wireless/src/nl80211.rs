@@ -848,9 +848,23 @@ fn wiphy_attrs(
         push_attr(&mut modes, NL80211_IFTYPE_MONITOR as u16, &[]);
     }
     if info.modes.contains(crate::iface::WirelessModes::P2P) {
-        push_attr(&mut modes, NL80211_IFTYPE_P2P_DEVICE as u16, &[]);
-        push_attr(&mut modes, NL80211_IFTYPE_P2P_CLIENT as u16, &[]);
-        push_attr(&mut modes, NL80211_IFTYPE_P2P_GO as u16, &[]);
+        let mut advertised = 0u16;
+        for iftype in iface.map_or_else(
+            || {
+                alloc::vec![
+                    NL80211_IFTYPE_P2P_DEVICE,
+                    NL80211_IFTYPE_P2P_CLIENT,
+                    NL80211_IFTYPE_P2P_GO
+                ]
+            },
+            crate::WirelessNetIface::p2p_interface_types,
+        ) {
+            if !matches!(iftype, 8..=10) || advertised & (1 << iftype) != 0 {
+                continue;
+            }
+            advertised |= 1 << iftype;
+            push_attr(&mut modes, iftype as u16, &[]);
+        }
     }
     push_attr(
         &mut attrs,

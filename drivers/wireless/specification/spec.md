@@ -422,13 +422,25 @@ are superseded only for these25 scopes. Later idle-FULL_SLEEP, host-bus-PM,
 P2P and other drafts receive no credit. Physical measurements, signed deployment
 programs and per-device RF/power/interoperability qualification remain separate.
 
+**Source implementation recount 2026-11-01** (D0 idle and host-bus power management):
+the remaining ledger holds **80 `feature`**, **31 `chip`** and **0 `unknown`**
+rows. Two source-complete implementations await native acceptance in
+`research/implemented-pending-validation.tsv`: AR9285 counted unassociated
+idle FULL_SLEEP/cold wake and QCA6174/QCA9377 counted host-bus wake/ASPM.
+Fourteen native cases are written. Shared P2P source/control emission fences,
+interface-type subsets and Intel firmware resource-count parsing add eight
+cases and no feature-row closure; native P2P roles remain open. Release metadata
+checks pass for the combined source graph. This is implementation accounting;
+native execution and the next full release matrix remain pending. Physical
+board measurements, signed programs and deployment qualification remain separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 3 | MLO, P2P and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 4 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA; hosted loadable packet ABI is software-accepted at `6813a24c6` |
-| ath10k | 12 | Contiguous VHT160, PFC, alternate calibration sources, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload; managed Public Action ROC, streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are software-accepted at `6813a24c6` |
-| ath9k | 1 | Idle FULL_SLEEP; periodic calibration/ANI, station NETWORK_SLEEP, admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants are software-accepted at `6813a24c6`; other chips are separate rows |
+| ath10k | 11 | Contiguous VHT160, PFC, alternate calibration sources, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay and wake offload; host-bus PM is implemented pending validation; managed Public Action ROC, streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are software-accepted at `6813a24c6` |
+| ath9k | 0 | Counted idle FULL_SLEEP/cold wake is implemented pending validation; prior periodic calibration/ANI, station NETWORK_SLEEP, admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants are software-accepted at `6813a24c6`; other chips are separate rows |
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are software-accepted at `6813a24c6` |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
@@ -1229,6 +1241,21 @@ N85P1 full program. Current P1 hardware receipts replace only calibration/ANI
 state; original key/PN/TX/copy owners persist. P1 remains always awake and
 refuses composition with N85S1. Family §3 and the measured-program documents
 define the narrower native and external qualification contracts.
+
+### 3.4 Counted native D0 power owners (validation pending)
+
+AR9285 exposes `request_idle_full_sleep`, `idle_full_sleep_status` and
+`acquire_idle_wake` through its original retained device. Only an admitted
+unassociated Passive owner may retire actual queues/RX/IRQs and enter D0
+FULL_SLEEP. Counted control users fence the transition; cold wake creates a
+fresh20MHz identity before republication. Family §3.11 specifies the exact
+receipt, cancellation and system-suspend barriers.
+
+QCA6174/QCA9377 host-bus power management uses counted actual RTC/SoC wake
+votes and retained MSI-driven quiet/grace ownership. ASPM restoration follows
+actual HIF and input admission. Deferred native polling cannot commit packet,
+key or copied-frame state, and non-MSI profiles keep the awake polling path.
+Family §3 specifies the original DMA/source/control and failure-cleanup rules.
 
 ## 4. Interaction with `narf-wireless`
 

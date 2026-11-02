@@ -4450,3 +4450,29 @@ parsers, restore boot SMBIOS after their retained owner dies and create no
 physical calibration grant. All nine AP registrations and this frontend
 remain pending coordinated release compilation, native execution and review;
 the family row is not accepted by these source fixtures alone.
+
+### 3.72 Factual firmware station/link resource counts
+
+The executable metadata decoder retains optional `FirmwareApi::num_stations`
+and `num_links` from actual TLV0x100/0x101 (`IWL_UCODE_TLV_CONST_BASE` plus0/1).
+Linux7.3-rc7 `fw/file.h`, `fw/api/mac.h`, `fw/api/mac-cfg.h` and `iwl-drv.c`
+define four-byte little-endian counts, at most16 stations and four firmware
+links (IDs0..3). Malformed lengths, duplicate counts and values above those
+maxima reject the image. Zero remains `Some(0)`; omitted TLVs remain `None`.
+Existing protocol admission for images lacking these optional facts is
+unchanged. Optional native P2P operations require their needed factual slots
+before I/O, independently of the command table, SKU or a32-bit station mask.
+
+All four installed admitted Sc/Bz core103 images report15 stations/four
+links. The installed API77/API89 inventory also includes14-station images,
+so a native consumer derives a reserved AUX slot from the validated actual
+count and keeps original station0/FW-link0 reserved. The earlier uncompiled
+P2P draft's AUX31 assumption was incorrect and is superseded. These metadata
+facts create no control WDEV, native MAC/link/AUX receipt, PHY/ROC grant, RF
+permission or P2P CLIENT/GO implementation; the literal P2P row remains open.
+
+One new unexecuted loader fixture covers absent counts, the actual15/4 and
+14/4 shapes, maximum and zero values, malformed/overflow extents and duplicate
+replacement (including a factual zero), while retaining unrelated executable
+API facts. The parser component remains pending coordinated compilation and
+native validation.

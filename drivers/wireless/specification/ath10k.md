@@ -24,6 +24,11 @@
 > QCA9888 10.4 station owner. Six new cases are written and unexecuted;
 > release compilation, native suites and physical acceptance are pending.
 > Contiguous160 remains open because this profile has no authorized full span.
+>
+> A later host-bus PM continuation is source complete for MSI-backed
+> QCA6174/6164 and QCA9377 runtime owners. Seven new cases are written and
+> unexecuted; release compilation, native suites and physical acceptance are
+> pending. A released host wake vote is not a firmware-sleep acknowledgement.
 
 ## 1. Purpose & scope
 
@@ -818,8 +823,60 @@ actual-device RF/power/interoperability acceptance remain separate.
   registration). Resume without a parked generation does nothing. As in
   Linux without WoWLAN, the association is not preserved, and rejoin goes
   through the new interface. Suspend does not use the recovery attempt
-  budget. WoWLAN (`wow.c`) and PCIe runtime PM/ASPM transitions are not
-  provided (`wake_offload`, `host_bus_pm`).
+  budget. WoWLAN (`wow.c`) and PCI runtime D3/platform wake routing are not
+  provided (`wake_offload`). The separate D0 host-vote/ASPM owner follows.
+- Host-bus PM (`boot/power.rs`). Pinned Linux7.2
+  `pci.c::ath10k_pci_{wake,sleep,ps_timer}` and `ath10k_pci_hif_start` supply
+  the QCA6174/6164 and QCA9377 `pci_ps` contract. Boot retains its explicit
+  wake vote. After actual BMI_DONE, retained CE startup and successful MSI
+  delivery setup, each ordinary MMIO operation acquires a nonwrapping awake
+  reference under the original current PCI and executable/board capabilities.
+  A fresh wake writes the actual PCI-local WAKE bit, reads it back, and waits
+  up to30ms for actual RTC_ON3 before the requested register access. Raw
+  WAKE/RTC polls invoke those same authorities directly, so wake never
+  recursively requires already-awake MMIO. The operation releases its exact
+  reference even when the payload fails; failure closes ordinary admission.
+  Saved PCIe ASPM is restored and its owned bits read back only after runtime
+  CE/IRQ startup with that owner installed, rather than only on Drop.
+
+  A genuine empty native service pass can arm60ms grace only while current
+  Radio/software/BA/control state and all source CE, referenced management and
+  HTT TX owners are idle. Permanently posted destination RX buffers remain
+  mapped; they are not pending host work or released by sleep. During the
+  grace the MSI-backed idle pump observes its retained signal counter and
+  timer without BAR reads. At60ms it clears and reads back only its host WAKE
+  vote. Firmware may remain awake or actually sleep: neither the request nor
+  that readback is called a target-sleep receipt. An IRQ, host native operation
+  or changed pending ownership defeats the old idle observation; payload MMIO
+  still requires a fresh WAKE/RTC proof. A70ms bound from the original empty
+  pass forces a full wake/service backstop, preserving the existing10ms
+  missed-edge interval after vote release. The hard IRQ only raises the same
+  retained signal and performs no sleeping BAR access. Without MSI, or on
+  Linux profiles whose `pci_ps` is false, the ordinary polling path remains.
+
+  Initialized unassociated owners use a narrowly opted-in passive maintenance
+  path under the Device publication/Radio locks. It drains actual HTC credit
+  progress, requires no peer/DATA/scan/ROC/control/copy continuation, and retains
+  any other native event unchanged in the existing bounded queue while
+  disabling idle. Ordinary transport models default out. Associated DATA also
+  requires empty receive/reorder/security/native-original state; current policy,
+  source and controlled-port checks remain mandatory. A PM-deferred physical
+  poll propagates as explicit progress through HTC/HTT, never as an actual empty
+  receive prefix: it cannot complete M4, expire/release reordered frames or
+  publish copied RX. Synchronous protocol/control waits bypass the defer path.
+
+  Retirement first closes the original HIF/RF generation and detaches only its
+  expired executable scope. Its still-current original PCI authority may wake
+  solely for terminal IRQ/CE/reset cleanup, with the vote pinned across reset;
+  it cannot restore that old mission owner. Actual CE halt, BMEoff and ordered
+  flush remain prerequisites for reclaiming DMA and releasing the terminal
+  vote. A failed wake still attempts original-PCI MSI/vector teardown (or CPU
+  quarantine if that grant is lost), PCI BMEoff and retains uncertain mappings;
+  retired Drop never supplies a delayed hardware-cleanup attempt.
+  Seven source cases cover real cap revocation/RTC/vote/refcount edges, retained
+  native CE and management tickets, explicit defer versus genuine empty
+  receive, and unassociated current-source/input ownership. They are written
+  but unexecuted. No target power, wake latency or board measurement is claimed.
 - Interrupt service (`irq.rs`, `boot/interrupts.rs`). Linux v6.10
   `pci.c::ath10k_pci_init_irq` tries MSI first; `ath10k_pci_hif_start`
   calls `ath10k_pci_irq_enable`. Here `PciBoot::done_complete` (BMI_DONE
@@ -1063,7 +1120,8 @@ actual-device RF/power/interoperability acceptance remain separate.
   native command-future poll, including a coalesced no-op request. Failure
   or cancellation closes station admission and retains uncertain DMA;
   reinstalling policy or late receipts cannot reopen it. This profile
-  enables neither U-APSD nor host-bus PM or wake offload.
+  enables neither U-APSD nor wake offload. Host-bus PM is the independent
+  native MMIO/ASPM owner above and does not infer station RF-sleep authority.
 - Physical packet HIF supplies bounded source-ready, begin-send and poll-now
   operations. Each source pipe retains its bounce occupancy/deadline before
   publication. An occupied source is rejected before any buffer copy; its CE
@@ -1570,7 +1628,7 @@ Across the reached rows, concrete remaining software packages are
 contiguous VHT160 (VHT20/40/80 and the bounded80+80 owner are implemented); PFC fetch/queue ownership;
 AP-side U-APSD under the AP owner; DFS/indoor/beacon-hint
 qualification; hardware key offload;
-AP/P2P roles; host-bus PM and wake offload (system suspend is implemented);
+AP/P2P roles; wake offload (system suspend and D0 host-bus PM are implemented);
 DT/NVMEM calibration sources (QCA9887 EEPROM and registry files are implemented)
 and automatic credential replay after recovery.
 Firmware-owned TX BA, the N-deep HTT pipeline and aggregate retry accounting

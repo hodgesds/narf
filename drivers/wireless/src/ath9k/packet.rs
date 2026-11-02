@@ -512,6 +512,9 @@ impl<P: Port> Packet<P> {
     pub(super) fn reclaimed(&self) -> bool {
         self.reclaimed
     }
+    pub(super) fn idle_admissible(&self) -> bool {
+        self.phase == Phase::Running && self.pending.is_none() && self.pair.is_none()
+    }
     pub(super) fn check_transmit(&self) -> Result<(), Error> {
         self.port.transmit_allowed()?;
         if self.ht.is_some()

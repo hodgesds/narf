@@ -16,6 +16,7 @@ mod descriptor;
 mod ht;
 mod ht40;
 mod identity;
+mod idle;
 mod initvals;
 mod interface;
 mod irq;
@@ -35,6 +36,11 @@ pub use calibration::{Report as RadioCalibration, State as RadioState};
 pub use ht::Request as Ht20QualificationRequest;
 pub use ht40::Request as Ht40QualificationRequest;
 pub use identity::{BringUpError, Identity, EEPROM_4K_BYTES};
+pub use idle::{
+    set as set_idle_full_sleep, status as idle_full_sleep_status, wake_use as acquire_idle_wake,
+    Error as IdlePowerError, State as IdlePowerState, Status as IdlePowerStatus,
+    WakeGuard as IdleWakeGuard,
+};
 pub use periodic::Request as PeriodicCalibrationRequest;
 pub use phy::Prepared as BasebandPrepared;
 pub use ps::Request as PowerSaveQualificationRequest;
@@ -72,6 +78,9 @@ pub struct Ath9k {
     wide: Option<Arc<ht40::Grant>>,
     wide_report: Option<calibration::wide::WideReport>,
     station: Option<RetainedRadio>,
+    /// Pins this original physical generation against idle FULL_SLEEP until
+    /// its actual native DMA owner has reached terminal retirement.
+    station_use: Option<IdleWakeGuard>,
     packet_attempted: bool,
     /// Physical generation; bumped by each successful reset.
     generation: u32,
@@ -209,6 +218,7 @@ type RetainedRadio = Arc<Mutex<NativeRadio>>;
 
 struct Retained {
     state: Mutex<Ath9k>,
+    idle: Arc<idle::Owner>,
     /// Set by device removal before its teardown waits for the state lock;
     /// every later initialization or reset of this owner fails closed.
     removed: core::sync::atomic::AtomicBool,
@@ -260,13 +270,21 @@ pub async fn calibrate_radio() -> Result<RadioCalibration, BringUpError> {
     initialize_owner(&owner).await
 }
 async fn initialize_owner(owner: &Retained) -> Result<RadioCalibration, BringUpError> {
+    let _use = owner
+        .idle
+        .use_awake(false)
+        .map_err(|_| BringUpError::BadState)?;
     let _control = CONTROL.lock().await;
     initialize_owner_inner(owner).await
 }
 async fn initialize_owner_inner(owner: &Retained) -> Result<RadioCalibration, BringUpError> {
     let report = {
         let controller = owner.state.lock().await;
-        if owner.removed.load(core::sync::atomic::Ordering::Acquire) || controller.pinned {
+        if owner.removed.load(core::sync::atomic::Ordering::Acquire)
+            || controller.pinned
+            || controller.suspended
+            || !owner.idle.can_initialize()
+        {
             return Err(BringUpError::DeviceGone);
         }
         match controller.radio.state() {
@@ -489,6 +507,10 @@ async fn prepare_packets(owner: &Retained) -> Result<RetainedRadio, packet::Erro
     // preparation succeeded on this same non-cloneable native adapter. Probe
     // never published packet DMA; prepare allocates but does not start DMA.
     let packet = unsafe { packet::Packet::prepare(native, controller.identity.mac) }?;
+    let station_use = owner
+        .idle
+        .use_awake(true)
+        .map_err(|_| packet::Error::State)?;
     let station = Arc::new(Mutex::new(station::Radio::new(
         packet,
         controller.identity.mac,
@@ -500,6 +522,7 @@ async fn prepare_packets(owner: &Retained) -> Result<RetainedRadio, packet::Erro
     // The exact native owner is retained before packet start or NIC exposure.
     // Interface/control/drain callers clone only this same Arc.
     controller.station = Some(station.clone());
+    controller.station_use = Some(station_use);
     Ok(station)
 }
 
@@ -510,8 +533,10 @@ async fn retire_generation(controller: &mut Ath9k) -> bool {
     let Some(station) = controller.station.take() else {
         return true;
     };
-    interface::retire(&station);
-    let reclaimed = station.lock().await.retire();
+    let reclaimed = idle::retire_station(&station, &mut controller.station_use, || {
+        interface::retire(&station);
+    })
+    .await;
     if !reclaimed {
         controller.pinned = true;
     }
@@ -546,6 +571,10 @@ async fn reset_owner_geometry(
     expected: Option<u32>,
     wide: Option<Arc<ht40::Grant>>,
 ) -> Result<RadioCalibration, BringUpError> {
+    let _use = owner
+        .idle
+        .use_awake(false)
+        .map_err(|_| BringUpError::BadState)?;
     let _control = CONTROL.lock().await;
     let geometry = {
         let controller = owner.state.lock().await;
@@ -659,6 +688,7 @@ async fn supervise(owner: Arc<Retained>) {
     loop {
         core::future::poll_fn(|cx| {
             channels::poll(cx);
+            idle::poll(cx);
             core::task::Poll::Ready(())
         })
         .await;
@@ -672,6 +702,9 @@ async fn supervise(owner: Arc<Retained>) {
             };
             if controller.pinned {
                 return;
+            }
+            if !owner.idle.operational() {
+                continue;
             }
             controller
                 .station
@@ -730,13 +763,22 @@ fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
     }
     if let Some(station) = controller.station.clone() {
         let mut radio = station.try_lock().ok_or(DeviceSuspendError::Busy)?;
+        if !owner
+            .idle
+            .system_block(u32::from(controller.station_use.is_some()))
+        {
+            return Err(DeviceSuspendError::Busy);
+        }
         interface::retire(&station);
         if !radio.retire() {
             controller.pinned = true;
             return Err(DeviceSuspendError::DriverError);
         }
+    } else if !owner.idle.system_block(0) {
+        return Err(DeviceSuspendError::Busy);
     }
     controller.station = None;
+    controller.station_use = None;
     controller.radio = calibration::Calibration::default();
     // Blocks initialization until resume re-identifies the chip.
     controller.packet_attempted = true;
@@ -777,7 +819,7 @@ fn pm_resume() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
         controller.suspended = false;
     }
     narf_scheduler::spawn(async move {
-        if let Err(error) = reset_owner(&owner).await {
+        if let Err(error) = idle::system_resume(&owner).await {
             let _ = writeln!(
                 narf_console::Writer,
                 "ath9k: resume reset closed: {:?}",
@@ -799,7 +841,9 @@ fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
     owner
         .removed
         .store(true, core::sync::atomic::Ordering::Release);
+    owner.idle.block(true);
     narf_scheduler::spawn(async move {
+        let _control = CONTROL.lock().await;
         let mut controller = owner.state.lock().await;
         if controller._device.addr != device.addr {
             return;
@@ -899,6 +943,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             wide: None,
             wide_report: None,
             station: None,
+            station_use: None,
             packet_attempted: false,
             generation: 0,
             pinned: false,
@@ -906,6 +951,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             pcie_aspm,
         }),
         removed: core::sync::atomic::AtomicBool::new(false),
+        idle: idle::Owner::new(),
     });
     *CONTROLLER.lock() = Some(retained.clone());
     narf_drivers::record_bound(narf_drivers::BoundDriver {

@@ -2,6 +2,8 @@
 use super::*;
 use alloc::task::Wake;
 use core::task::Waker;
+#[path = "stack_control_native_tests.rs"]
+mod control;
 
 fn capture(f: &Fixture) -> Result<crate::AdminEmissionAuthority, &'static str> {
     let link = crate::iface::lookup(&f.name).ok_or("actual native netdev")?;

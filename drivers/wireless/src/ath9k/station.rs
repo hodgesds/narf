@@ -384,6 +384,32 @@ impl<P: Port, E: Environment> Radio<P, E> {
     pub(super) fn receive_open(&self) -> bool {
         self.peer().is_some() && self.security.as_ref().is_none_or(Security::port_open)
     }
+    /// Factual idle admission, not a hardware quiet receipt. The retained RX
+    /// tail is intentionally allowed; actual retirement owns its DMA proof.
+    pub(super) fn idle_admissible(&self) -> bool {
+        self.phase() == Phase::Passive
+            && !self.established
+            && self.peer.is_none()
+            && self.plan.is_none()
+            && self.security.is_none()
+            && self.pending.is_none()
+            && self.pair_pending.is_none()
+            && self.delivered_reply.is_none()
+            && self.delivered_ba.is_none()
+            && self.delivered_ps.is_none()
+            && self.ps_controls.is_empty()
+            && self.incoming.is_empty()
+            && self.received.is_empty()
+            && self.packet.idle_admissible()
+    }
+    /// Counted use is not IO authority: a public wake-use return also requires
+    /// the current native source, PCI and actual awake program to admit access.
+    pub(super) fn idle_wake_current(&self) -> Result<(), Error> {
+        if self.terminal() || self.packet.phase() != packet::Phase::Running {
+            return Err(Error::State);
+        }
+        self.packet.check_transmit().map_err(Error::Transport)
+    }
     pub(super) fn interrupt(&self) -> Option<Arc<super::irq::Signal>> {
         self.packet.interrupt()
     }

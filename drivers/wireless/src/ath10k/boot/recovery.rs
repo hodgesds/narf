@@ -125,7 +125,27 @@ impl PciBoot {
         self.hif_live = false;
         self.power_ready = false;
         self.mmio.sources = None;
-        let cap = self.mmio.cap.derive::<Write>().map_err(|_| BmiError::Pci)?;
+        let cap = match self.mmio.cap.derive::<Write>() {
+            Ok(cap) => cap,
+            Err(_) => {
+                // Drop cannot touch this retired generation. Even a lost
+                // PCI grant must retire/quarantine its original CPU vector.
+                self.stop_interrupts();
+                return Err(BmiError::Pci);
+            }
+        };
+        if let Err(error) = self.mmio.terminal_power_cleanup() {
+            // Failed runtime wake denies BAR masking, but the independent
+            // original-PCI MSI disable can still release the vector or keep
+            // it CPU-quarantined. Never defer this to retired Drop.
+            self.stop_interrupts();
+            // A failed wake/reference proof never skips the last available
+            // PCI-only BME-off attempt. No allocation is reclaimable here.
+            let _ = crate::qualcomm_pci::invoke(&cap, || {
+                narf_bus::pci::clear_command(&cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
+            });
+            return Err(error);
+        }
         self.stop_interrupts();
         Ok(cap)
     }
@@ -149,7 +169,7 @@ impl PciBoot {
             .map_err(|_| BmiError::Pci)?
         })
         .await?;
-        self.reclaimable = halted && self.flushed();
+        self.reclaimable = halted && self.flushed() && self.mmio.stop_power().is_ok();
         Ok(Restart {
             device,
             cap,
@@ -175,7 +195,7 @@ impl PciBoot {
             })
             .map_err(|_| BmiError::Pci)?
         })?;
-        self.reclaimable = self.flushed();
+        self.reclaimable = self.flushed() && self.mmio.stop_power().is_ok();
         Ok(Restart {
             device,
             cap,

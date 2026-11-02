@@ -1,6 +1,8 @@
 use super::*;
 use crate::ath10k::{bmi::BmiError, wmi_runtime as radio};
 include!("radio_golden.rs");
+#[path = "host_power_tests.rs"]
+mod host_power_tests;
 
 // These pure protocol fixtures can yield after credit-only HTC progress.
 // Keep polling the SAME pinned operation; once() intentionally drops a
@@ -50,6 +52,15 @@ struct RadioModel {
     chain_sent: Vec<Vec<u8>>,
     chain_stall: Option<u8>,
     coexistence: Option<coexistence_native::Fixture>,
+    host_power: HostPowerFixture,
+}
+#[derive(Debug, Default)]
+struct HostPowerFixture {
+    enabled: bool,
+    eligible: bool,
+    defer: bool,
+    deferred: bool,
+    polls: usize,
 }
 // SAFETY: This private firmware fixture owns its complete graph of CE-model
 // Rc/RefCell buffers; no reference-counted alias escapes the model. Moving the
@@ -212,6 +223,15 @@ fn management_frame(model: &mut RadioModel, frame: Vec<u8>) {
     add_event(model, id, &body);
 }
 impl Hif for RadioModel {
+    fn runtime_idle_supported(&self) -> bool {
+        self.host_power.enabled
+    }
+    fn runtime_idle(&mut self, eligible: bool) {
+        self.host_power.eligible = eligible;
+    }
+    fn take_idle_deferred(&mut self) -> bool {
+        core::mem::take(&mut self.host_power.deferred)
+    }
     fn nonblocking_wmi(&self) -> bool {
         self.ce.is_some()
     }
@@ -295,6 +315,16 @@ impl Hif for RadioModel {
         data_tests::send_now(self, bytes)
     }
     fn poll_now(&mut self) -> Result<Option<(u8, Vec<u8>)>, BmiError> {
+        self.host_power.deferred = false;
+        if self.host_power.enabled
+            && self.host_power.eligible
+            && self.host_power.defer
+            && self.inner.inner.rx.is_empty()
+        {
+            self.host_power.deferred = true;
+            return Ok(None);
+        }
+        self.host_power.polls += 1;
         if let Some(ce) = &mut self.ce {
             ce.poll_now()?;
         }
@@ -699,6 +729,7 @@ fn radio_boot_source_version(
         coexistence: None,
         associated: None,
         offchannel: None,
+        host_power: HostPowerFixture::default(),
     };
     let mut htc = Session::new(model, hardware);
     assert_eq!(once(htc.start()), Poll::Ready(Ok(())));

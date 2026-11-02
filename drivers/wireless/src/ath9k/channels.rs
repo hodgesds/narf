@@ -76,6 +76,9 @@ pub(super) fn request_geometry(
             work.result.clone()
         } else {
             let owner = CONTROLLER.lock().clone().ok_or(Error::State)?;
+            // Count the accepted original request before it waits for CONTROL;
+            // an idle request cannot retire hardware from under queued work.
+            let awake = owner.idle.use_awake(false).map_err(|_| Error::Busy)?;
             let result = Arc::new(IrqSafeSpinLock::new(Completion {
                 result: None,
                 waiters: Vec::new(),
@@ -88,6 +91,7 @@ pub(super) fn request_geometry(
                 result: result.clone(),
                 wake: wake.clone(),
                 future: Box::pin(async move {
+                    let _awake = awake;
                     super::reset_owner_geometry(&owner, Some(geometry), Some(generation), wide)
                         .await
                         .map_err(|e| match e {

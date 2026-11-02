@@ -554,10 +554,17 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                 state.clear();
                 return None;
             }
-            if radio.roc_active() || !radio.has_station_data() {
+            if radio.roc_active() {
                 return None;
             }
             (|| {
+                if !radio.has_station_data() {
+                    // Only an actual opted-in physical host-vote owner gets
+                    // passive maintenance. No peer/data owner or publication
+                    // is inferred from a PM defer or an empty receive prefix.
+                    radio.poll_passive_host_idle()?;
+                    return Ok(None);
+                }
                 // Sampling under the publication gate precedes consuming any
                 // host TX or publishing generated security replies to native
                 // DMA. A changed ceiling must match the programmed channel.

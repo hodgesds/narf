@@ -16,6 +16,10 @@ pub struct FirmwareApi<'a> {
     pub api_changes: [u32; 8],
     pub phy_config: u32,
     pub calibration: [u32; 2],
+    /// Actual CONST_BASE TLVs; absence preserves older protocol admission.
+    /// Optional role consumers must separately require their needed slots.
+    pub num_stations: Option<u8>,
+    pub num_links: Option<u8>,
 }
 
 impl<'a> FirmwareApi<'a> {
@@ -61,7 +65,23 @@ impl<'a> FirmwareApi<'a> {
                 self.bios_commands = Some(data);
             }
             74 if !data.is_empty() => self.pnvm = Some(data),
-            18 | 22 | 23 | 29 | 30 | 48 | 52 | 73 | 74 => return Err("malformed firmware API TLV"),
+            0x100 | 0x101 if data.len() == 4 => {
+                let value = u32::from_le_bytes(data.try_into().unwrap());
+                // Linux fw/api/mac.h and mac-cfg.h: station count<=16,
+                // firmware link IDs0..3. Zero is factual, not an absent TLV.
+                let (target, maximum) = if tag == 0x100 {
+                    (&mut self.num_stations, 16)
+                } else {
+                    (&mut self.num_links, 4)
+                };
+                if target.is_some() || value > maximum {
+                    return Err("duplicate/out-of-range firmware resource count");
+                }
+                *target = Some(value as u8);
+            }
+            18 | 22 | 23 | 29 | 30 | 48 | 52 | 73 | 74 | 0x100 | 0x101 => {
+                return Err("malformed firmware API TLV")
+            }
             _ => return Ok(false),
         }
         Ok(true)

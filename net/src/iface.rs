@@ -745,6 +745,10 @@ fn register_inner(
 ) -> String {
     let _capture = monitor::PUBLISH.lock();
     let enumerated_name = name.contains("%d");
+    // Control capture takes the same PUBLISH -> Registry -> IFACES order.
+    // A new same-name data representation permanently retires its old
+    // control-only proof before that representation becomes observable.
+    let mut typed = crate::registry().inner.lock();
     let mut g = IFACES.lock();
     let v = g.get_or_insert_with(Vec::new);
     let name = {
@@ -754,6 +758,11 @@ fn register_inner(
         reserved.retain(|held| *held != name);
         name
     };
+    let retired_control = typed
+        .iter_mut()
+        .find(|entry| entry.name == name && entry.control_namespace.is_some())
+        .map(|entry| core::mem::take(&mut entry.native_lifetime).retire());
+    drop(typed);
     // De-dup: a same-named iface is replaced, keeping its ifindex and the
     // configuration userspace gave it (admin state, addresses). A name
     // retired for rebind restores its retired entry the same way.
@@ -899,6 +908,9 @@ fn register_inner(
     }
     drop(_capture);
     if let Some(retired) = retired_native {
+        retired.notify();
+    }
+    if let Some(retired) = retired_control {
         retired.notify();
     }
     // Publish this interface's `net.ipv4.conf.<dev>.*` keys and seed its
@@ -1968,6 +1980,42 @@ pub(crate) fn native_identity(
             && entry.registration_epoch != 0
     })?;
     Some((entry.native_lifetime.observe(), entry.registration_epoch))
+}
+/// Serialize fixed native control capture with representation publication.
+/// The closure performs invoked-cap/cached-metadata checks only; arbitrary
+/// interface and source callbacks must run before or after this scope.
+pub(crate) fn native_control_capture<T>(capture: impl FnOnce() -> T) -> T {
+    let _publication = monitor::PUBLISH.lock();
+    capture()
+}
+
+/// Parent observation for an actual typed control child. The child has no
+/// IFACES entry or UP state; its physical parent's real Ethernet identity
+/// must match the original namespace/registration/ownership delegation.
+/// Caller holds PUBLISH and the invoked typed-registry relation, so legacy
+/// creation cannot race between this absence check and provider capture.
+pub(crate) fn native_control_parent_identity(
+    child: &str,
+    parent: &str,
+    namespace: u64,
+    registration: Option<u64>,
+    ownership: Option<u64>,
+) -> Option<crate::native_emission::Lifetime> {
+    let interfaces = IFACES.lock();
+    let entries = interfaces.as_ref()?;
+    if child == parent || entries.iter().any(|entry| entry.name == child) {
+        return None;
+    }
+    let entry = entries.iter().find(|entry| {
+        entry.name == parent
+            && entry.net_ns_id == namespace
+            && entry.ownership_epoch != 0
+            && entry.registration_epoch != 0
+            && entry.link_layer == LinkLayer::Ethernet
+            && registration.is_none_or(|expected| expected == entry.registration_epoch)
+            && ownership.is_none_or(|expected| expected == entry.ownership_epoch)
+    })?;
+    Some(entry.native_lifetime.observe())
 }
 /// Called after the actual registered NetIface capability was invoked.
 /// No callback/capability operation runs under this short comparison lock.

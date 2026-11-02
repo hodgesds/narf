@@ -304,3 +304,32 @@ pub(crate) fn native_registration<I: WirelessNetIface + ?Sized>(
         })
         .map(|entry| entry.native_lifetime.observe())
 }
+
+/// Exact weak child/parent observations for a control-only WDEV. Capability
+/// invocation and the immutable namespace/role/source checks are independent.
+/// Cached registry facts avoid virtual receiver callbacks while locked.
+pub(crate) fn native_control_registration<I: WirelessNetIface + ?Sized>(
+    iface: &I,
+    expected: ControlWdev,
+) -> Option<(
+    narf_net::native_emission::Lifetime,
+    narf_net::native_emission::Lifetime,
+)> {
+    let receiver = core::ptr::from_ref(iface).cast::<()>();
+    let registry = REGISTRY.lock();
+    let child = registry.iter().find(|entry| {
+        !entry.retired
+            && entry.control == Some(expected)
+            && Arc::as_ptr(&entry.iface).cast::<()>() == receiver
+    })?;
+    let actual_parent = child.parent.as_ref()?;
+    let parent = registry.iter().find(|entry| {
+        !entry.retired
+            && entry.control.is_none()
+            && Weak::ptr_eq(actual_parent, &Arc::downgrade(&entry.iface))
+    })?;
+    Some((
+        child.native_lifetime.observe(),
+        parent.native_lifetime.observe(),
+    ))
+}
