@@ -419,6 +419,28 @@ reads; the old whole-inode scan fails it. This establishes read amplification
 and its correction, not the cause of the remaining native desktop failure
 or a measured startup-time improvement.
 
+The next physical attempt, `045727b4-b279-479e-b112-feca662b1b3b`,
+used the installed `fc68acfe1` bundle. The operator reset after about a
+minute; the saved process/seat samples end before PlasmaLogin or KWin
+starts. This attempt therefore does not establish whether the read-window
+correction resolves KWin startup. Its direct kernel stream places memory
+training at 33.100091–43.972903 and 37 completed GPU summary lines at
+46.641497–49.247976, with approximately 72 ms between adjacent lines.
+Early device-node setup spans approximately 16 seconds across the kernel
+stream and journal. These are observations from one boot, not a benchmark;
+the service intervals overlap. NARF scales the raw TSC without subtracting
+kernel entry, so absolute timestamps can include firmware time, and early
+records before calibration are zero.
+
+The console audit identifies a concrete source of synchronous work: every
+scroll repainted the full 480×266 character grid through the framebuffer
+hook while IRQ-safe console locks were held. PID 1's `/dev/kmsg` output
+uses this same hook. Scrolling now compares character rows in RAM and
+paints changed cells only; palette changes and `fb_mut` drawing force a
+complete repaint. Regressions check pixels, redraw counts, palette changes,
+the reserved beacon band and stride padding. Native boot-time improvement
+and visible Plasma remain unverified.
+
 The earlier native boot also failed in the dynamic loader before Plasma
 startup. The separate VFS/Btrfs fixes and their private-mmap regression must
 be included in the same production image. Complete software checks and

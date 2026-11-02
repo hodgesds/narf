@@ -56,6 +56,9 @@ adapter that calls into the dedicated EDID parser.
 ### Landed
 - 32-bit XRGB8888 framebuffer + drawing primitives (rect fill,
   blit, font rendering).
+- Console scrolling shifts the RAM character grid and paints only changed
+  cells, without framebuffer reads. Palette changes and access through
+  `FbConsole::fb_mut` force a complete text-region repaint on the next scroll.
 - Cursor compositor + boot splash.
 - EDID adapter (delegates to `narf-edid`).
 - DSC PPS codec (`dsc`): clean-room Picture Parameter Set encoder
