@@ -8223,22 +8223,20 @@ fn present_intel_frame(frame: &IntelFrame) -> Result<(), FsError> {
     match frame.0 {}
 }
 
-/// Whether CREATE_DUMB on DRM card `card_index` makes an amdgpu GEM buffer
-/// in VRAM (`amdgpu_mode_dumb_create`): the native Navi48 card, once its
-/// client VRAM heap is up. Other cards, and the Navi48 card without a heap
-/// (before bring-up, while suspended or recovering), keep the card's
-/// system-memory dumb buffers.
+/// Native primary opens use their one per-file GEM namespace for both
+/// CREATE_DUMB and GEM_CREATE. A missing heap must fail the allocation;
+/// falling through to the card-global table would alias compact handles.
 #[cfg(feature = "amdgpu")]
 fn amdgpu_vram_dumb(card_index: u32) -> bool {
-    crate::drm_registry::mode_state(card_index).is_some_and(|m| m.lock().gfx12_modifiers)
-        && crate::amdgpu_gem::vram_heap_usage(card_index).is_some()
+    crate::drm_registry::mode_state(card_index).is_some_and(|m| {
+        let card = m.lock();
+        card.gfx12_modifiers || crate::amdgpu_native_kms::linear_gem_card(&card)
+    })
 }
 
 #[cfg(feature = "amdgpu")]
 fn amdgpu_dumb_live(card_index: u32) -> Result<(), FsError> {
-    let native =
-        crate::drm_registry::mode_state(card_index).is_some_and(|mode| mode.lock().gfx12_modifiers);
-    if native {
+    if amdgpu_vram_dumb(card_index) {
         crate::amdgpu_gem::ensure_placement_live(card_index)?;
     }
     Ok(())
@@ -8281,7 +8279,7 @@ fn read_create_dumb(arg: usize) -> Result<DrmModeCreateDumbUapi, FsError> {
 /// The dumb-buffer ioctls of an amdgpu card open whose GEM table is `gem`
 /// (drm_mode_create_dumb / drm_mode_mmap_dumb_ioctl / drm_mode_destroy_dumb
 /// on Linux's one per-file handle space):
-/// - CREATE_DUMB on the Navi48 card ([`amdgpu_vram_dumb`]) is
+/// - CREATE_DUMB on the native card ([`amdgpu_vram_dumb`]) is
 ///   `GemState::create_dumb`: a VRAM buffer in the open's own table, which
 ///   ADDFB2 then scans out in place (`amdgpu_addfb2_bo`);
 /// - MAP_DUMB and DESTROY_DUMB of one of the open's amdgpu GEM handles, on

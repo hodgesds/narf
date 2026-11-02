@@ -7469,8 +7469,26 @@ copied at the commit. Dumb buffers are such GEM buffers in VRAM (below) and take
 this path; only one of the card's own system-memory dumb buffers, made
 while no VRAM heap was up, is still CPU-copied.
 
-**Dumb buffers in VRAM.** On the native card, once its client VRAM heap is
-registered (`drm_ioctl_bridge::amdgpu_vram_dumb`), `DriCardFile` answers
+**Native GEM handles and mmap offsets.** AMD render opens and native RDNA2 /
+GFX12 primary opens allocate compact nonzero GEM handles starting at one.
+CREATE_DUMB, GEM_CREATE, USERPTR and PRIME imports on a native primary share
+its one per-open object table. Another open's same-numbered handle names
+only that other open's object. Counter exhaustion returns NoSpace permanently,
+without wrapping onto a live id. Native primary-node selection is made when
+the file opens from its published KMS capabilities. Legacy primary cards that
+still use the separate card-global dumb table retain their disjoint large
+handle range; compact primary handles are not claimed for that older path.
+
+GEM_MMAP and native MAP_DUMB return the opaque byte offset
+`(0x40000000 + u64::from(handle)) << 12`. The high tag belongs only to the
+mmap-offset namespace; exposing it as the GEM handle makes libdrm 2.4.134's
+dense `handle_table_insert` allocate and clear over 8 GiB on its first buffer.
+All GEM mmap entry points remove that tag, reject unaligned or out-of-range
+offsets and resolve only the opener's table. Existing CPU-mapping permission,
+memory-type, revocation and lifetime checks continue to apply.
+
+**Dumb buffers in VRAM.** On native RDNA2 and GFX12 primary cards
+(`drm_ioctl_bridge::amdgpu_vram_dumb`), `DriCardFile` answers
 CREATE_DUMB as amdgpu_mode_dumb_create (`drm_ioctl_bridge::amdgpu_dumb`,
 `GemState::create_dumb`): drm_mode_create_dumb's checks, the pitch of
 `amdgpu_gem::align_pitch` and the page-rounded size (`dumb_layout`), in
@@ -7485,11 +7503,13 @@ domains VRAM | GTT. Full visible VRAM first evicts idle unmapped buffers
 (`evict_visible_locked`), and from a user open (`amdgpu_create_dumb_async`,
 `amdgpu_gem::create_dumb_async`) mapped ones too (`reclaim_vram_locked`, shared
 with GEM_CREATE's strict path); there is no GTT fallback, so it is then
-ENOMEM. MAP_DUMB and DESTROY_DUMB of one of an open's amdgpu GEM handles,
+ENOMEM. An absent native heap returns NoDevice instead of falling back to
+the card-global dumb table and creating an overlapping handle. MAP_DUMB and
+DESTROY_DUMB of one of an open's amdgpu GEM handles,
 on any amdgpu card, are amdgpu_mode_dumb_mmap (`GemState::map_dumb`: the
 GEM_MMAP offset, EPERM for a userptr or NO_CPU_ACCESS buffer) and
-drm_gem_handle_delete (`destroy_dumb`); other handles fall through to the
-card's table. mmap of the offset is the revocable CPU-mapping backing
+drm_gem_handle_delete (`destroy_dumb`); the legacy primary path still falls
+through to its card table for generic dumb handles. mmap of the offset is the revocable CPU-mapping backing
 (`cpu_mapping::backing`) over the buffer's BAR window, which follows the
 buffer when it moves. ADDFB2 of the handle is `amdgpu_addfb2_bo`, so
 showing it pins it and scans it out in place as above. Native amdgpu user

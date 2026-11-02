@@ -505,6 +505,34 @@ unverified. The journal-flush unit's 11.21-second elapsed interval in this
 physical capture must not be described as pure disk-flush time: journald
 reports 1.46 seconds for its own flush operation.
 
+With the corrected collector, boot `47e05b54-b079-479e-b012-fe4ac670254b`
+records PlasmaLogin started at 60.05 seconds and KWin launched at 65.15.
+KWin never acquires its service's bus name before the distro's 15-second
+user-service start timeout. systemd begins terminating it at 83.19 and kills
+it at 90.04; the greeter's later Wayland connection failures are downstream
+of that loss. No framebuffer rejection or client-compute timeout is recorded
+in this attempt. These are observations from one boot, not a performance
+benchmark of the collector change.
+
+The previously unexplained 8 GiB RSS has a concrete ABI cause. NARF starts
+amdgpu GEM handles at `0x40000000` to distinguish them from its generic dumb
+table. libdrm 2.4.134's
+[`handle_table_insert`](https://gitlab.freedesktop.org/mesa/drm/-/blob/libdrm-2.4.134/amdgpu/handle_table.c)
+uses a dense handle-indexed pointer array and zeroes newly grown entries.
+The first handle therefore requests 8 GiB + 4096 bytes; the saved KWin maps
+contain an 8 GiB + 8192-byte anonymous malloc mapping, and samples catch its
+RSS rising through 2.4, 5.3 and 8.1 GiB during libc's zeroing loop.
+
+The correction gives render opens and native RDNA2/GFX12 primary opens
+compact handles starting at one. Native dumb buffers use that same per-open
+table, and mmap routing uses a separate opaque offset tag. A missing native
+heap fails rather than creating a conflicting generic dumb handle. Legacy
+primary cards using the old card-global dumb table remain outside this
+compact-primary contract. New ioctl regressions reproduce the original
+sparse-handle and split-table failures. This fixes the oversized allocation
+at its source; physical KWin startup and desktop presentation after the
+correction still require acceptance.
+
 ### Linux Navi22 initialization comparison
 
 Reference checkout: `~/git/linux` at `ecd997b0189a`. This is a mapping of

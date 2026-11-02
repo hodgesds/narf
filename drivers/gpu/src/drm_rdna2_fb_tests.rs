@@ -195,3 +195,101 @@ kernel_test_in!(
     "drivers/gpu/drm/rdna2_fb",
     rdna2_primary_ioctl_accepts_own_linear_gem_framebuffers
 );
+
+fn rdna2_dumb_and_render_buffers_share_compact_per_open_handles() -> TestResult {
+    let Some(f) = Fixture::new() else {
+        return TestResult::Fail("fixture");
+    };
+    let file = crate::drm_devfs_bridge::DriCardFile::new(f.index).unwrap();
+    let other = crate::drm_devfs_bridge::DriCardFile::new(f.index).unwrap();
+    let mut dumb = [0u8; 32];
+    dumb[..4].copy_from_slice(&12u32.to_le_bytes());
+    dumb[4..8].copy_from_slice(&64u32.to_le_bytes());
+    dumb[8..12].copy_from_slice(&32u32.to_le_bytes());
+    if file.ioctl(
+        crate::drm_uapi::DRM_IOCTL_MODE_CREATE_DUMB,
+        dumb.as_mut_ptr() as usize,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("CREATE_DUMB");
+    }
+    let first = u32::from_le_bytes(dumb[16..20].try_into().unwrap());
+    let mut create = [0u8; 32];
+    create[..8].copy_from_slice(&4096u64.to_le_bytes());
+    create[16..24]
+        .copy_from_slice(&u64::from(crate::amdgpu_uapi::AMDGPU_GEM_DOMAIN_VRAM).to_le_bytes());
+    if file.ioctl(0xc020_6440, create.as_mut_ptr() as usize) != Ok(0) {
+        return TestResult::Fail("GEM_CREATE");
+    }
+    let second = u32::from_le_bytes(create[..4].try_into().unwrap());
+    if (first, second) != (1, 2) || !f.mode.lock().dumb_backings.is_empty() {
+        return TestResult::Fail(
+            "native dumb and render handles do not share one compact namespace",
+        );
+    }
+    for handle in [first, second] {
+        let mut fb = request(handle, 0x3432_5258, 2);
+        if file.ioctl(
+            crate::drm_uapi::DRM_IOCTL_MODE_ADDFB2,
+            fb.as_mut_ptr() as usize,
+        ) != Ok(0)
+        {
+            return TestResult::Fail("ADDFB2 does not resolve the common GEM namespace");
+        }
+        let mut foreign = request(handle, 0x3432_5258, 2);
+        if other
+            .ioctl(
+                crate::drm_uapi::DRM_IOCTL_MODE_ADDFB2,
+                foreign.as_mut_ptr() as usize,
+            )
+            .is_ok()
+        {
+            return TestResult::Fail("a foreign open reached a native handle");
+        }
+    }
+    let mut map = [0u8; 16];
+    map[..4].copy_from_slice(&first.to_le_bytes());
+    if file.ioctl(
+        crate::drm_uapi::DRM_IOCTL_MODE_MAP_DUMB,
+        map.as_mut_ptr() as usize,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("MAP_DUMB");
+    }
+    let offset = u64::from_le_bytes(map[8..16].try_into().unwrap());
+    if file.mmap_backing(offset, 4096).is_err() || other.mmap_backing(offset, 4096).is_ok() {
+        return TestResult::Fail("mmap did not resolve the opener's buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm/rdna2_fb",
+    rdna2_dumb_and_render_buffers_share_compact_per_open_handles
+);
+
+fn rdna2_missing_heap_does_not_fall_back_to_card_global_dumb_handles() -> TestResult {
+    let Some(f) = Fixture::new() else {
+        return TestResult::Fail("fixture");
+    };
+    let file = crate::drm_devfs_bridge::DriCardFile::new(f.index).unwrap();
+    gem::unregister_vram_heap(f.index);
+    let mut dumb = [0u8; 32];
+    dumb[..4].copy_from_slice(&12u32.to_le_bytes());
+    dumb[4..8].copy_from_slice(&64u32.to_le_bytes());
+    dumb[8..12].copy_from_slice(&32u32.to_le_bytes());
+    let before = dumb;
+    if file.ioctl(
+        crate::drm_uapi::DRM_IOCTL_MODE_CREATE_DUMB,
+        dumb.as_mut_ptr() as usize,
+    ) != Err(FsError::NoDevice)
+        || dumb != before
+        || !f.mode.lock().dumb_backings.is_empty()
+    {
+        return TestResult::Fail("missing native heap created a conflicting generic handle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm/rdna2_fb",
+    rdna2_missing_heap_does_not_fall_back_to_card_global_dumb_handles
+);
