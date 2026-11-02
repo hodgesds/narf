@@ -2201,15 +2201,15 @@ production feature. Unsupported functionality remains unadvertised.
 | Gen12 fixed hardware cursor | Source PCODE/DBUF watermark partition, private PAT-free DMA39 slots, generation-specific DSB and independent cursor/console retirement | Implemented; native fixtures pass |
 | Gen12 native and legacy LUTs | Exact display12/13 gamma/degamma profiles, bounded ABI/storage, canonical DSB writes, readable state witnesses and profile-specific original restoration | Implemented; native fixtures pass |
 | GuC loss-accounted log fanout | Four bounded reader FIFOs, transactional host loss accounting, observed firmware-overflow lower bounds and actual publication/incarnation-bound admission | Implemented; native fixtures pass |
-| Gen12 joint primary/color | Fixed retained common DSB transactions, full inactive preload where required, independent primary/color retirement and shared native-frame publication | Implemented; debug native fixtures pass |
-| Gen12 X/integer primary views | Exact family SURF alignment/control, fixed source X/linear viewport bounds, old/pending journal and exact original-console recovery | Implemented; debug native fixtures pass |
-| Headless LNL main GT | Exact PCI/GMD/firmware profile, one-way boot exclusion, fresh whole-device reset/media arena, five-level private VM and all-engine probes | Implemented; debug native fixtures pass |
-| Headless PTL main GT | Exact Xe3-LPG IP/step/PAT/cache/context/SLPC, retained takeover, 96-DSS physical topology and all-engine private-VM probes | Implemented; debug native fixtures pass |
-| Gen12 main-GuC media | Fuse-present VCS/VECS defaults, source video commands, retained media wake/reset/ADS/IRQ and actual native Xe queues | Implemented; debug native fixtures pass |
-| Legacy i915 media selection | Live published BSD/VEBOX discovery, dense sparse-engine selectors and retained independent per-context state through real GuC execution | Implemented; debug native fixtures pass |
-| Intel CPU alias lifetime | Whole-BO physical census, pending publication tokens, retained unpublished-fork metadata and permanent mixed-vendor provider dispatch | Implemented; debug native fixtures pass |
-| Xe low-latency queue hint | Truthful current ABI/epoch discovery, immutable real queue flag, source policy KLV before enable ACK and retained physical/virtual/parallel contexts | Implemented; debug native fixtures pass |
-| LNL EU-stall observation | Exact headless graphics20.04 profile, retained sampler/cache/media proof and existing bounded privilege/loss/reset lifecycle | Implemented; debug native fixtures pass |
+| Gen12 joint primary/color | Fixed retained common DSB transactions, full inactive preload where required, independent primary/color retirement and shared native-frame publication | Implemented; native fixtures pass |
+| Gen12 X/integer primary views | Exact family SURF alignment/control, fixed source X/linear viewport bounds, old/pending journal and exact original-console recovery | Implemented; native fixtures pass |
+| Headless LNL main GT | Exact PCI/GMD/firmware profile, one-way boot exclusion, fresh whole-device reset/media arena, five-level private VM and all-engine probes | Implemented; native fixtures pass |
+| Headless PTL main GT | Exact Xe3-LPG IP/step/PAT/cache/context/SLPC, retained takeover, 96-DSS physical topology and all-engine private-VM probes | Implemented; native fixtures pass |
+| Gen12 main-GuC media | Fuse-present VCS/VECS defaults, source video commands, retained media wake/reset/ADS/IRQ and actual native Xe queues | Implemented; native fixtures pass |
+| Legacy i915 media selection | Live published BSD/VEBOX discovery, dense sparse-engine selectors and retained independent per-context state through real GuC execution | Implemented; native fixtures pass |
+| Intel CPU alias lifetime | Whole-BO physical census, pending publication tokens, retained unpublished-fork metadata and permanent mixed-vendor provider dispatch | Implemented; native fixtures pass |
+| Xe low-latency queue hint | Truthful current ABI/epoch discovery, immutable real queue flag, source policy KLV before enable ACK and retained physical/virtual/parallel contexts | Implemented; native fixtures pass |
+| LNL EU-stall observation | Exact headless graphics20.04 profile, retained sampler/cache/media proof and existing bounded privilege/loss/reset lifecycle | Implemented; native fixtures pass |
 | GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open; mapping revocation and platform PM |
 | Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; primary-source register/firmware contracts |
 
@@ -2930,13 +2930,21 @@ verifies exact GAM MOCS3/PAT2, current media/cache/MMIO authority and physical
 DSS positions before publishing data. It retains uncertain DMA through the
 same independent reset and arena-before-media-release protocol. PTL sampling,
 OA, codec/HuC, media-GT and physical Intel/Mesa acceptance remain separate.
-All ten new fixtures pass in the debug native kernel. The combined branch
-passes 1,154 Intel/DRM/framebuffer/backlight tests and 670 shared filesystem/
-graphics/AMD tests, with no failures or duplicate names and one existing shared
-RNG-registration skip. All 68 new fixture names, all 1,087 prior Intel fixture
-names and all 31 shared backlight regressions are covered. Host GPU/filesystem
-all-target Clippy, workspace formatting, diff and all 94 frozen source/linker
-hashes pass. The ledger has 58 implemented checkpoint rows and ten broad open
-workstreams. Release native, production boot/btrfs and cross-target gates are
-running on this same frozen source; this is a local native-tested checkpoint,
-not a merge-readiness or Intel silicon/Mesa acceptance claim.
+All ten new fixtures pass in debug and release native kernels. The combined
+branch passes 1,154 Intel/DRM/framebuffer/backlight tests and 670 shared
+filesystem/graphics/AMD tests in each profile, with no failures or duplicate
+names and one existing shared RNG-registration skip. All 68 new fixture names,
+all 1,087 prior Intel fixture names and all 31 shared backlight regressions
+are covered. The release production boot and both btrfs postflights pass,
+closing the pending gates for the preceding integration batch as well.
+GPU/fb/filesystem/graphics target CI Clippy passes all three feature contexts
+on both architectures; all four host GPU vendor configurations pass all-target
+Clippy. Changed-package debug/release builds pass on both targets, and
+workspace formatting, diff and source-integrity checks pass. Two pure fixture
+readers now compile on both targets; removing their obsolete x86-only guards
+preserves the compiled x86 test code. aarch64 QEMU is
+omitted under the maintainer's iteration policy because no aarch64-specific
+production behavior changes. The ledger has 58 implemented checkpoint rows
+and ten broad open workstreams. Intel silicon and Mesa acceptance remain
+unrun. The separate retained external-display draft has cleared static review;
+its executable/native validation remains pending.

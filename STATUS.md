@@ -1717,14 +1717,18 @@ placement migration and invalidate-aware USERPTR remain separate work.
 The following Intel slice implements current-epoch native Xe low-latency
 queue hints and exact headless LNL EU-stall sampling, preserving the existing
 single GuC/SLPC actor and DMA/reset lifetimes. All ten new fixtures pass in
-the debug native kernel: the combined branch passes 1,154 selected Intel/DRM/
-fb/backlight and 670 shared filesystem/graphics/AMD tests, with no failures or
-duplicate names and one existing shared RNG-registration skip. All 68 new
-fixture names, all 1,087 prior Intel fixture names and 31 backlight regressions
-are covered. Host all-target Clippy, formatting/diff and the 94 source/linker
-hashes pass. The ledger has 58 implemented checkpoint rows and ten broad open
-workstreams. Release native, production boot/btrfs and cross-target gates are
-running on the same frozen source; merge readiness is not claimed. The separate
+debug and release native kernels. The combined branch passes 1,154 selected
+Intel/DRM/fb/backlight and 670 shared filesystem/graphics/AMD tests per profile,
+with no failures or duplicate names and one existing shared RNG-registration
+skip. All 68 new fixture names, all 1,087 prior Intel fixture names and 31
+backlight regressions are covered. Release production boot and both btrfs
+postflights pass, closing the preceding batch's pending gates. GPU/fb/
+filesystem/graphics CI Clippy passes all three feature contexts on both
+targets; all four host GPU configurations pass all-target Clippy. Both-target
+changed-package debug/release builds, formatting, diff and final source hashes
+pass. aarch64 QEMU is omitted because no aarch64-specific production behavior
+changes. The ledger has 58 implemented checkpoint rows and ten broad open
+workstreams; physical Intel/Mesa acceptance remains unrun. The separate
 external-DP teardown draft has cleared static review; its 21 native fixtures
 and executable validation remain pending.
 

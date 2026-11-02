@@ -279,11 +279,9 @@ impl MockPlatform {
     pub(crate) fn superfine(&self) -> [u32; 18] {
         self.0.lock().superfine
     }
-    #[cfg(target_arch = "x86_64")]
     pub(crate) fn precision(&self) -> [u32; 1024] {
         self.0.lock().palette
     }
-    #[cfg(target_arch = "x86_64")]
     pub(crate) fn unreadable_prec_reads(&self) -> usize {
         self.0.lock().unreadable_prec_reads
     }
