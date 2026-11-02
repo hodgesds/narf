@@ -100,6 +100,52 @@ fn geometry() -> Geometry {
         pitch: 256,
     }
 }
+
+fn scanout_linear_viewport_decomposition_and_extent_bounds() -> TestResult {
+    let visible = Geometry {
+        width: 64,
+        height: 32,
+        pitch: 512,
+    };
+    assert_eq!(
+        Viewport { x: 3, y: 17 }.layout(visible),
+        Ok((8192, 0x10003, 25088))
+    );
+    assert_eq!(Viewport { x: 64, y: 0 }.layout(visible), Ok((0, 64, 16384)));
+    for view in [
+        Viewport { x: 65, y: 0 },
+        Viewport { x: u32::MAX, y: 0 },
+        Viewport { x: 0, y: 0x10000 },
+    ] {
+        assert_eq!(view.layout(visible), Err(ScanoutError::Bounds));
+    }
+    assert_eq!(
+        Viewport { x: 0, y: 65535 }.layout(Geometry {
+            width: 64,
+            height: 32,
+            pitch: 4096
+        }),
+        Err(ScanoutError::Bounds)
+    );
+    // A remainder crossing a logical row is decomposed exactly as Linux's
+    // linear helper; X-tile-specific x+width restrictions do not apply.
+    let narrow = Geometry {
+        width: 64,
+        height: 32,
+        pitch: 320,
+    };
+    let (base, xy, extent) = Viewport { x: 2, y: 13 }.layout(narrow).unwrap();
+    assert_eq!(
+        u64::from(base) + u64::from(xy >> 16) * 320 + u64::from(xy & 0xffff) * 4,
+        4168
+    );
+    assert_eq!(extent, 14400);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_scanout",
+    scanout_linear_viewport_decomposition_and_extent_bounds
+);
 fn object(size: u64) -> Arc<GemObject> {
     let gem = crate::intel_gpu_gem::GemState::new();
     let handle = gem.create(size, |_, _| Ok(())).expect("GEM allocation");

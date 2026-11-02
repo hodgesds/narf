@@ -17,6 +17,7 @@ use core::task::Poll;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RegisterError {
     Identity,
+    ComputeMode,
     Context(ContextError),
     Unavailable,
     Timeout,
@@ -74,6 +75,16 @@ mod tests {
                     | 0x2050
                     | 0x220d4
                     | 0x22050
+                    | 0x3ee0d4
+                    | 0x3ee050
+                    | 0x1c0d4
+                    | 0x1c050
+                    | 0x1e0d4
+                    | 0x1e050
+                    | 0x260d4
+                    | 0x26050
+                    | 0x14800
+                    | 0x14804
             );
             regs.insert(
                 reg,
@@ -175,6 +186,77 @@ mod tests {
         smoke_global_register_dg2_subplatform_vectors
     );
 
+    fn smoke_global_register_dg2_vram_requires_stable_owned_layout() -> TestResult {
+        struct Capture<'a> {
+            window: &'a Window,
+            unstable: bool,
+            reads: Cell<u32>,
+        }
+        impl MmioWindow for Capture<'_> {
+            fn read32(&self, reg: u64) -> u32 {
+                let value = self.window.read32(reg);
+                if reg == 0x4910 {
+                    let reads = self.reads.get();
+                    self.reads.set(reads + 1);
+                    if self.unstable && reads != 0 {
+                        return value ^ 0x100;
+                    }
+                }
+                value
+            }
+            fn write32(&self, reg: u64, value: u32) {
+                self.window.write32(reg, value);
+            }
+        }
+        // xe_vram.c: tile0 8 GiB, 64 MiB stolen tail, preceding 32 MiB CCS.
+        let gsm = (8u64 << 30) - (64 << 20);
+        let ccs = gsm - (32 << 20);
+        for failure in 0..3 {
+            let (window, init) = fixture(GtPlatform::Alchemist, 0x56a0, 55, 0, false, 1 << 18);
+            window.regs.borrow_mut().extend([
+                (0x1083a0, 8 << 8),
+                (0x4910, ((ccs / 65536) << 8) as u32),
+                (0x108104, (gsm >> 32) as u32),
+                (0x108100, gsm as u32),
+            ]);
+            if failure == 1 {
+                window.unavailable.set(0x4910);
+            }
+            let capture = Capture {
+                window: &window,
+                unstable: failure == 2,
+                reads: Cell::new(0),
+            };
+            let Poll::Ready(Ok(registers)) = init.poll(&capture, 11) else {
+                panic!("optional VRAM refusal must preserve qualified system execution");
+            };
+            assert_eq!(capture.reads.get(), 2);
+            if failure == 0 {
+                let registers = registers.expect("stable qualified tile0 capture");
+                assert!(matches!(
+                    registers,
+                    crate::intel_gpu_vram::VramRegisters::Dg2(_)
+                ));
+                assert_eq!(
+                    crate::intel_gpu_vram::VramLayout::from_registers(registers)
+                        .unwrap()
+                        .usable,
+                    ccs
+                );
+            } else {
+                assert_eq!(registers, None);
+            }
+            // The explicit selector has no bearing on GAM implicit capture,
+            // and its prior value remains restored after all workarounds.
+            assert_eq!(window.regs.borrow()[&0xfdc], 0x81000000);
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt_registers",
+        smoke_global_register_dg2_vram_requires_stable_owned_layout
+    );
+
     fn smoke_global_register_xelpg_stepping_vectors() -> TestResult {
         for (release, step, clock, atomic) in [
             (70, 0, true, true),
@@ -214,8 +296,14 @@ mod tests {
             (1, false, 1 << 8, true),
         ] {
             let (w, init) = fixture(GtPlatform::Battlemage, 0xe20b, release, 0, flat, live);
+            assert!(init
+                .engines()
+                .contains(crate::intel_gpu_engine::Engine::Bcs8));
             let Poll::Ready(Ok(Some(vram))) = init.poll(&w, 11) else {
                 return TestResult::Fail("BMG did not capture local-memory registers");
+            };
+            let crate::intel_gpu_vram::VramRegisters::Xe2(vram) = vram else {
+                panic!("Xe2 register profile")
             };
             assert_eq!(vram.ccs_lower & 1 != 0, flat);
             let r = w.regs.borrow();
@@ -232,6 +320,8 @@ mod tests {
             );
             assert_eq!(r[&0xe7cc], 0xa5a55a5a | 0x9000);
             assert_eq!(r[&0x20d4], 0xa5a55a5a | 0xc080);
+            assert_eq!(r[&0x3ee0d4], 0xa5a55a5a | 0xc080);
+            assert_eq!(r[&0x3ee050], 0xa5a55a5a | 0x1000);
             assert_eq!(r[&0xe4c4], 0xa5a55a5a | 0x1040);
             assert_eq!(r[&0xb158], 0xa5a5587f);
             assert_eq!(r[&0x4148], 0xa5a55a50);
@@ -241,6 +331,34 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt_registers",
         smoke_global_register_xe2_fuse_and_ip_vectors
+    );
+
+    fn smoke_global_multi_ccs_partition_requires_posted_write_proof() -> TestResult {
+        for rejected in [0x14800, 0x14804] {
+            let platform = GtPlatform::Battlemage;
+            let (w, _) = fixture(platform, 0xe20b, 1, 0, false, 1);
+            w.regs.borrow_mut().insert(0x9114, 0xf0010);
+            w.regs.borrow_mut().insert(rejected, 0);
+            let topology = GtTopology::read(&w, platform).unwrap();
+            let bytes = [1u32, 1, 4, 70, 1, 32]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            let config = HardwareConfig::parse(bytes).unwrap();
+            let init = RegisterInit::with_ccs_mode(&w, platform, 0xe20b, &topology, &config, 10, 2)
+                .unwrap();
+            assert_eq!(init.compute_configuration(), (15, 2));
+            w.reject.set(rejected);
+            assert!(
+                matches!(init.poll(&w, 11), Poll::Ready(Err(RegisterError::Verify(reg))) if reg == rejected)
+            );
+            assert_eq!(w.writes.borrow().last(), Some(&(0xfd0, 1)));
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_multi_ccs",
+        smoke_global_multi_ccs_partition_requires_posted_write_proof
     );
 
     // xe_hw_engine.c compute fuses and __xe_gt_apply_ccs_mode(ccs_mode 1).
@@ -253,6 +371,7 @@ mod tests {
             (0x0000_0100, false, false),
         ] {
             let (w, init) = fixture(GtPlatform::Alchemist, 0x56a0, 0, 0, false, live);
+            assert!(!init.engines().contains(Engine::Bcs8));
             assert_eq!(init.engines().contains(Engine::Ccs0), ccs0);
             assert!(matches!(init.poll(&w, 11), Poll::Ready(Ok(None))));
             let writes = w.writes.borrow();
@@ -337,10 +456,12 @@ pub(crate) struct RegisterInit {
     discontiguous: bool,
     /// Physically present CCS instances (bit n = CCSn).
     compute: u8,
+    compute_mode: u8,
     deadline: u64,
 }
 
 impl RegisterInit {
+    #[cfg(feature = "kernel-test")]
     pub(crate) fn new(
         mmio: &impl MmioWindow,
         platform: GtPlatform,
@@ -348,6 +469,18 @@ impl RegisterInit {
         topology: &GtTopology,
         config: &HardwareConfig,
         now: u64,
+    ) -> Result<Self, RegisterError> {
+        Self::with_ccs_mode(mmio, platform, device, topology, config, now, 1)
+    }
+
+    pub(crate) fn with_ccs_mode(
+        mmio: &impl MmioWindow,
+        platform: GtPlatform,
+        device: u16,
+        topology: &GtTopology,
+        config: &HardwareConfig,
+        now: u64,
+        mode: u8,
     ) -> Result<Self, RegisterError> {
         if GtPlatform::from_pci(0x8086, device) != Some(platform) {
             return Err(RegisterError::Identity);
@@ -374,33 +507,47 @@ impl RegisterInit {
             topology.geometry_dss() | topology.compute_dss(),
             seed.fuse4,
         );
+        if crate::intel_gpu_engine::compute_selection(compute, mode).is_none()
+            || (!platform.is_discrete() && mode != 1)
+        {
+            return Err(RegisterError::ComputeMode);
+        }
         Ok(Self {
             platform,
             device,
             seed,
             discontiguous,
             compute,
+            compute_mode: mode,
             deadline: now.checked_add(50_000_000).ok_or(RegisterError::Timeout)?,
         })
     }
 
-    /// RCS0 and BCS0 always; CCS0 when its instance is fused present.
-    pub(crate) fn engines(&self) -> crate::intel_gpu_engine::EngineSet {
-        use crate::intel_gpu_engine::{Engine, EngineSet};
-        if self.compute & 1 != 0 {
-            EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs0])
-        } else {
-            EngineSet::of(&[Engine::Rcs0, Engine::Bcs0])
-        }
+    pub(crate) fn compute_configuration(&self) -> (u8, u8) {
+        (self.compute, self.compute_mode)
     }
 
-    /// Ready(Ok(Some)) also returns BMG's local-memory layout registers,
-    /// read under the same steering semaphore as the workaround writes.
+    /// RCS0/BCS0 always, BCS8 on BMG, then the selected physical CCSs. Linux
+    /// XE2_GFX_FEATURES includes BCS8; read_copy_fuses does not filter BMG.
+    pub(crate) fn engines(&self) -> crate::intel_gpu_engine::EngineSet {
+        use crate::intel_gpu_engine::{Engine, EngineSet};
+        let mut engines = EngineSet::of(&[Engine::Rcs0, Engine::Bcs0]);
+        if self.platform == GtPlatform::Battlemage {
+            engines = EngineSet::from_bits(engines.bits() | EngineSet::of(&[Engine::Bcs8]).bits());
+        }
+        let selected = crate::intel_gpu_engine::compute_selection(self.compute, self.compute_mode)
+            .expect("validated partition");
+        engines = EngineSet::from_bits(engines.bits() | selected.bits());
+        engines
+    }
+
+    /// Ready(Ok(Some)) also returns qualified DG2/Xe2 local-memory layout
+    /// registers under the workaround's current awake/steering ownership.
     pub(crate) fn poll(
         &self,
         mmio: &impl MmioWindow,
         now: u64,
-    ) -> Poll<Result<Option<crate::intel_gpu_vram::Xe2VramRegisters>, RegisterError>> {
+    ) -> Poll<Result<Option<crate::intel_gpu_vram::VramRegisters>, RegisterError>> {
         if now >= self.deadline {
             return Poll::Ready(Err(RegisterError::Timeout));
         }
@@ -464,7 +611,7 @@ impl RegisterInit {
         &self,
         mmio: &impl MmioWindow,
         selector: u64,
-    ) -> Result<Option<crate::intel_gpu_vram::Xe2VramRegisters>, RegisterError> {
+    ) -> Result<Option<crate::intel_gpu_vram::VramRegisters>, RegisterError> {
         if self.platform == GtPlatform::Alchemist {
             // DG2 SF/SQIDI implicit ranges use instance two. GAM ranges
             // retain their separate hardware-default instance-one selector.
@@ -475,6 +622,22 @@ impl RegisterInit {
             }
         }
         let mut vram = None;
+        if self.platform == GtPlatform::Alchemist {
+            // 0x4910 is in DG2's GAM implicit-steering range (xe_gt_mcr.c),
+            // independent of the explicit MCR selector. Read all layout
+            // words twice; an absent layout merely withholds VRAM while the
+            // already-qualified system-memory execution backend remains live.
+            let read = || crate::intel_gpu_vram::Dg2VramRegisters {
+                tile_range: mmio.read32(0x1083a0),
+                ccs_base: mmio.read32(0x4910),
+                gsm_base: u64::from(mmio.read32(0x108104)) << 32 | u64::from(mmio.read32(0x108100)),
+            };
+            let a = read();
+            let b = read();
+            if a == b && crate::intel_gpu_vram::VramLayout::dg2(a).is_ok() {
+                vram = Some(crate::intel_gpu_vram::VramRegisters::Dg2(a));
+            }
+        }
         let flat = if self.platform == GtPlatform::Battlemage {
             self.steer(mmio, selector, Target::Instance0)?;
             let a = mmio.read32(0x8800);
@@ -493,13 +656,15 @@ impl RegisterInit {
             if gsm_base != gsm() {
                 return Err(RegisterError::Verify(0x108100));
             }
-            vram = Some(crate::intel_gpu_vram::Xe2VramRegisters {
-                tile_range: mmio.read32(0x1083a0),
-                ccs_lower: a,
-                ccs_upper: upper,
-                fuse3: mmio.read32(0x9118),
-                gsm_base,
-            });
+            vram = Some(crate::intel_gpu_vram::VramRegisters::Xe2(
+                crate::intel_gpu_vram::Xe2VramRegisters {
+                    tile_range: mmio.read32(0x1083a0),
+                    ccs_lower: a,
+                    ccs_upper: upper,
+                    fuse3: mmio.read32(0x9118),
+                    gsm_base,
+                },
+            ));
             a & 1 != 0
         } else {
             false
@@ -555,7 +720,7 @@ impl RegisterInit {
         };
         // Multi-CCS parts: fixed-slice RCU mode and all slices on CCS0
         // (xe_hw_engine_match_fixed_cslice_mode, __xe_gt_apply_ccs_mode).
-        if let Some(mode) = crate::intel_gpu_engine::ccs_mode(self.compute) {
+        if let Some(mode) = crate::intel_gpu_engine::ccs_mode(self.compute, self.compute_mode) {
             add(0x14800, 2, 2, true, Direct);
             add(0x14804, 0xfff, mode & 0xfff, true, Direct);
         }
@@ -665,9 +830,27 @@ impl RegisterInit {
                                                            // FOREACH_ENGINE/ENGINE_BASE entries reach BCS0 as well.
                 add(0x220d4, 0xc080, 0xc080, true, Direct); // 16021639441 + priority reads
                 add(0x22050, 0x1000, 0x1000, true, Direct); // 16023105232
-                if self.compute & 1 != 0 {
-                    add(0x1a0d4, 0xc080, 0xc080, true, Direct); // 16021639441 + priority reads
-                    add(0x1a050, 0x1000, 0x1000, true, Direct); // 16023105232
+                add(0x3ee0d4, 0xc080, 0xc080, true, Direct); // BCS8 ENGINE_BASE
+                add(0x3ee050, 0x1000, 0x1000, true, Direct); // 16023105232
+                for engine in crate::intel_gpu_engine::Engine::ALL
+                    .into_iter()
+                    .filter(|e| e.is_compute())
+                    .filter(|e| self.compute & (1 << e.physical_instance()) != 0)
+                {
+                    add(
+                        u64::from(engine.base()) + 0xd4,
+                        0xc080,
+                        0xc080,
+                        true,
+                        Direct,
+                    );
+                    add(
+                        u64::from(engine.base()) + 0x50,
+                        0x1000,
+                        0x1000,
+                        true,
+                        Direct,
+                    );
                 }
                 add(0xe530, 0x400, 0x400, false, Dss); // AnyHit null-query tuning
             }

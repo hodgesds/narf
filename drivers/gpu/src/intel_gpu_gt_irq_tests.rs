@@ -37,9 +37,15 @@ impl Window {
             (0x1900e8, 0xffff9234),
             (0x20a8, 0xffffffff),
             (0x220a8, 0xfffffffe),
+            (0x19011c, 0x5a5affff),
+            (0x3ee0a8, 0xa5a5ffff),
             (0x190048, 0x0000_0003),
             (0x190100, 0xffff_0004),
             (0x1a0a8, 0xffff_ffff),
+            (0x1c0a8, 0x1234_ffff),
+            (0x1e0a8, 0x5678_ffff),
+            (0x260a8, 0x9abc_ffff),
+            (0x190104, 0xabcd_ffff),
         ]
         .into_iter()
         .collect();
@@ -100,7 +106,11 @@ impl MmioWindow for Window {
                 r.identity = match value {
                     1 => 0x80000001,          // valid RCS0 MI_USER_INTERRUPT
                     0x8000 => 0x80030010,     // valid COPY0 FLUSH_COMPLETE
-                    0x10 => 0x80050001,       // valid COMPUTE0 MI_USER_INTERRUPT
+                    0x00800000 => 0x80830010, // valid COPY hardware8 FLUSH_COMPLETE
+                    0x10 => 0x80050001,
+                    0x20 => 0x80150001,
+                    0x40 => 0x80250001,
+                    0x80 => 0x80350001,       // valid COMPUTE0 MI_USER_INTERRUPT
                     0x02000000 => 0x80048000, // valid OTHER0 GUC2HOST
                     _ => panic!("selected an unowned interrupt"),
                 };
@@ -245,7 +255,12 @@ kernel_test_in!(
 fn smoke_gt_irq_compute_routes_decode_and_teardown() -> TestResult {
     let w = Window::new();
     let saved = w.0.lock().words.clone();
-    let irq = Delivery::install_with(w.clone(), Route(w.clone()), true).unwrap();
+    let irq = Delivery::install_with(
+        w.clone(),
+        Route(w.clone()),
+        EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs0]),
+    )
+    .unwrap();
     assert_eq!(irq.service(0), Ok(false));
     // ENGINE1 (CCS0) halves only; CCS1 bits and unrelated bits preserved.
     assert_eq!(w.read32(0x190048), 0x0011_0003);
@@ -273,6 +288,123 @@ fn smoke_gt_irq_compute_routes_decode_and_teardown() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_gt_irq",
     smoke_gt_irq_compute_routes_decode_and_teardown
+);
+
+fn smoke_gt_irq_multi_compute_physical_masks_and_foreign_identity() -> TestResult {
+    for engines in [
+        EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs1, Engine::Ccs3]),
+        EngineSet::of(&Engine::ALL),
+    ] {
+        let w = Window::new();
+        let saved = w.0.lock().words.clone();
+        let irq = Delivery::install_with(w.clone(), Route(w.clone()), engines).unwrap();
+        assert_eq!(irq.service(0), Ok(false));
+        let sparse = !engines.contains(Engine::Ccs0);
+        assert_eq!(
+            w.read32(0x190100),
+            if sparse {
+                0xffff_0004 & !0x11
+            } else {
+                0xffee_0004 & !0x11
+            }
+        );
+        assert_eq!(
+            w.read32(0x190104),
+            if sparse { 0xabcd_ffee } else { 0xabcc_ffee }
+        );
+        for (n, bit) in [0x10u32, 0x20, 0x40, 0x80].into_iter().enumerate() {
+            if sparse && n % 2 == 0 {
+                continue;
+            }
+            w.raise(bit);
+            assert_eq!(irq.service(10 + n as u64 * 2), Ok(true));
+            assert_eq!(irq.service(11 + n as u64 * 2), Ok(false));
+        }
+        drop(irq);
+        for offset in [
+            0x190048, 0x190100, 0x190104, 0x1a0a8, 0x1c0a8, 0x1e0a8, 0x260a8,
+        ] {
+            assert_eq!(w.read32(offset), saved[&offset]);
+        }
+    }
+    let w = Window::new();
+    let irq = Delivery::install_with(
+        w.clone(),
+        Route(w.clone()),
+        EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Ccs3]),
+    )
+    .unwrap();
+    irq.service(0).unwrap();
+    w.raise(0x80);
+    assert_eq!(irq.service(1), Ok(true));
+    w.0.lock().identity = 0x80050001;
+    assert_eq!(irq.service(2), Err(IrqError::Identity));
+    assert_eq!(w.read32(0x190018), 0x80);
+    drop(irq);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_multi_ccs",
+    smoke_gt_irq_multi_compute_physical_masks_and_foreign_identity
+);
+
+fn smoke_gt_irq_copy8_identity_shared_mask_and_teardown() -> TestResult {
+    let w = Window::new();
+    let irq = Delivery::install_with(
+        w.clone(),
+        Route(w.clone()),
+        EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Bcs8]),
+    )
+    .unwrap();
+    assert_eq!(w.read32(0x19011c), 0x5a5affee);
+    assert_eq!(w.read32(0x3ee0a8), 0xa5a5ffee);
+    irq.service(0).unwrap();
+    w.raise(0x00800000);
+    assert_eq!(irq.service(1), Ok(true));
+    assert_eq!(irq.service(2), Ok(false));
+    assert_eq!(w.read32(0x190018), 0);
+    // BCS7's high-half owner may change independently. Preserve its latest
+    // bits while restoring only BCS8's saved low-half event mask.
+    w.0.lock().words.insert(0x19011c, 0x1234ffee);
+    drop(irq);
+    assert_eq!(w.read32(0x19011c), 0x1234ffff);
+    assert_eq!(w.read32(0x3ee0a8), 0xa5a5ffff);
+    let irq = Delivery::install_with(
+        w.clone(),
+        Route(w.clone()),
+        EngineSet::of(&[Engine::Rcs0, Engine::Bcs0, Engine::Bcs8]),
+    )
+    .unwrap();
+    irq.service(3).unwrap();
+    w.raise(0x00800000);
+    assert_eq!(irq.service(4), Ok(true));
+    w.0.lock().identity = 0x80030010; // class COPY but wrong physical instance
+    assert_eq!(irq.service(5), Err(IrqError::Identity));
+    assert_eq!(w.read32(0x190018), 0x00800000);
+    drop(irq);
+    // Without published COPY1, the same bank cause is foreign and remains
+    // masked; no decoder may pretend that it came from COPY0.
+    // Raise a fresh hierarchy: the rejected identity above retained DW but
+    // its MASTER bank indication had already been acknowledged. Like Linux
+    // xe_irq.c::gt_irq_handler, service only reads a bank indicated by MASTER.
+    let w = Window::new();
+    let irq = install(&w);
+    assert_eq!(irq.service(6), Ok(false));
+    let writes = w.0.lock().writes.len();
+    w.raise(0x00800000);
+    assert_eq!(irq.service(7), Err(IrqError::Conflict));
+    assert_eq!(w.read32(0x190018), 0x00800000);
+    assert_eq!(w.read32(0x19011c), 0x5a5affff);
+    assert_eq!(w.read32(0x3ee0a8), 0xa5a5ffff);
+    assert!(!w.0.lock().writes[writes..]
+        .iter()
+        .any(|(offset, _)| matches!(*offset, 0x190018 | 0x190060 | 0x190070)));
+    drop(irq);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_gt_irq",
+    smoke_gt_irq_copy8_identity_shared_mask_and_teardown
 );
 
 fn smoke_gt_irq_delayed_identity_timeout_and_foreign_causes() -> TestResult {

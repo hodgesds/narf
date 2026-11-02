@@ -15,6 +15,7 @@ path = "src/lib.rs"
 narf-lib             = { path = "../../lib" }
 narf-arch            = { path = "../../arch" }
 narf-capabilities    = { path = "../../capabilities" }
+narf-boot            = { path = "../../boot" }
 narf-kernel-test     = { path = "../../verification/kernel-test" }
 narf-graphics-driver = { path = "../graphics" }
 narf-graphics        = { path = "../../graphics" }

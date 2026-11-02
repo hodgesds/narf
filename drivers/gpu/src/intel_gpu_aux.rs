@@ -48,6 +48,11 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
+// Every Intel AUX user, including independently retained backlight and KMS
+// PSR owners, shares this physical transport exclusion. Try-lock refuses a
+// concurrent/reentrant caller without spinning behind a polled transaction.
+static AUX_TRANSACTION: narf_lib::mutex::Mutex<()> = narf_lib::mutex::Mutex::new(());
+
 use crate::dp_aux::{
     decode_response, encode_request, AuxChannel, AuxError, AuxRequest, AuxResponse,
 };
@@ -329,6 +334,16 @@ impl<'a, M: MmioWindow + ?Sized> AuxChannel for IntelAux<'a, M> {
         req: &AuxRequest<'_>,
         reply_buf: &'b mut [u8],
     ) -> Result<AuxResponse<'b>, AuxError> {
+        let _transaction = AUX_TRANSACTION.try_lock().ok_or(AuxError::Deferred)?;
+        let inherited = self.mmio.read32(self.aux_ctl_off());
+        if inherited == u32::MAX {
+            return Err(AuxError::ShortReply);
+        }
+        // A firmware/foreign request has no NARF reply owner. Never overwrite
+        // its DATA or clear its completion while SEND_BUSY remains asserted.
+        if inherited & AUX_CTL_SEND_BUSY != 0 {
+            return Err(AuxError::Deferred);
+        }
         // Encode the request into the on-wire 3..20 byte frame (3 =
         // an I²C address-only request).
         let mut wire = [0u8; 20];
@@ -378,7 +393,15 @@ impl<'a, M: MmioWindow + ?Sized> AuxChannel for IntelAux<'a, M> {
         // Hand the raw reply (status nibble in high half of byte 0,
         // then payload) to the dp_aux decoder. The decoder enforces
         // length + status invariants.
-        decode_response(&reply_buf[..raw_len], expected_payload)
+        // NACK/DEFER replies carry only the status byte, including for a
+        // read requesting payload. Classify that status before enforcing the
+        // ACK payload length; otherwise normal DEFER becomes ShortReply and
+        // a missing optional DPCD interface cannot be identified as NACK.
+        let raw = &reply_buf[..raw_len];
+        if raw[0] & 0xf0 != 0 {
+            return decode_response(raw, 0);
+        }
+        decode_response(raw, expected_payload)
     }
 }
 
@@ -435,6 +458,52 @@ pub mod tests {
     fn ctl_off() -> u64 {
         Ddi::A.base() + DDI_AUX_CTL_OFFSET
     }
+
+    fn smoke_aux_shared_exclusion_busy_and_inaccessible_never_overwrite() -> TestResult {
+        let mmio = MockMmio::default();
+        let mut aux = IntelAux::new(&mmio, Ddi::A);
+        let request = AuxRequest {
+            cmd: AuxCommand::NativeRead,
+            address: 0x700,
+            data: &[0],
+        };
+        let mut reply = [0; 2];
+        let held = AUX_TRANSACTION.try_lock().unwrap();
+        assert!(matches!(
+            aux.transact(&request, &mut reply),
+            Err(AuxError::Deferred)
+        ));
+        assert!(mmio.writes.borrow().is_empty());
+        drop(held);
+        mmio.set_read(ctl_off(), AUX_CTL_SEND_BUSY);
+        assert!(matches!(
+            aux.transact(&request, &mut reply),
+            Err(AuxError::Deferred)
+        ));
+        assert!(mmio.writes.borrow().is_empty());
+        mmio.set_read(ctl_off(), u32::MAX);
+        assert!(matches!(
+            aux.transact(&request, &mut reply),
+            Err(AuxError::ShortReply)
+        ));
+        assert!(mmio.writes.borrow().is_empty());
+        mmio.set_read(ctl_off(), AUX_CTL_DONE | (1 << AUX_CTL_MSGSIZE_SHIFT));
+        mmio.set_read(Ddi::A.base() + DDI_AUX_DATA_OFFSET, 0x2000_0000);
+        assert!(matches!(
+            aux.transact(&request, &mut reply),
+            Err(AuxError::Deferred)
+        ));
+        mmio.set_read(Ddi::A.base() + DDI_AUX_DATA_OFFSET, 0x1000_0000);
+        assert!(matches!(
+            aux.transact(&request, &mut reply),
+            Err(AuxError::Nacked)
+        ));
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_aux",
+        smoke_aux_shared_exclusion_busy_and_inaccessible_never_overwrite
+    );
 
     fn smoke_aux_wire_packing_is_big_endian() -> TestResult {
         let mmio = MockMmio::default();

@@ -39,10 +39,12 @@ pub(crate) async fn query_user(
         return Err(FsError::InvalidData);
     }
     // Like xe_query.c, the engine pad is ignored. Only main GT0's published
-    // logical instance 0 of RCS or BCS can be sampled.
-    let engine = Engine::from_xe_class(u16::from_le_bytes([input[0], input[1]]))
-        .filter(|_| input[2..6] == [0; 4])
-        .ok_or(FsError::InvalidData)?;
+    // logical instances can be sampled, including BMG COPY1 -> BCS8.
+    let class = u16::from_le_bytes([input[0], input[1]]);
+    let logical = u16::from_le_bytes([input[2], input[3]]);
+    if input[4..6] != [0; 2] {
+        return Err(FsError::InvalidData);
+    }
     let destination = data.checked_add(12).ok_or(FsError::BadAddress)?;
     let status = info
         .backend
@@ -50,9 +52,10 @@ pub(crate) async fn query_user(
         .and_then(|b| b.status())
         .ok_or(FsError::NoDevice)?;
     // A known class this GT did not publish (fused-off CCS0) is EINVAL.
-    if !status.engines.contains(engine) {
-        return Err(FsError::InvalidData);
-    }
+    let engine = status
+        .engines
+        .from_class_instance(class, logical)
+        .ok_or(FsError::InvalidData)?;
     let stamp = info
         .backend
         .as_ref()
@@ -78,18 +81,23 @@ fn query_wire(
     let payload = match u32_at(wire, 8) {
         0 => {
             // drm_xe_query_engines in xe_hw_engine id order: RCS0, BCS0, CCS0.
-            let engines: alloc::vec::Vec<Engine> = info
+            let present = info
                 .backend
                 .as_ref()
                 .and_then(|b| b.status())
                 .filter(|status| status.platform == info.platform)
-                .map_or_else(alloc::vec::Vec::new, |status| {
-                    status.engines.iter().collect()
-                });
+                .map_or_else(Default::default, |status| status.engines);
+            let engines: alloc::vec::Vec<Engine> = present.iter().collect();
             let mut reply = vec![0; 8 + engines.len() * 32];
             put32(&mut reply, 0, engines.len() as u32);
             for (i, engine) in engines.iter().enumerate() {
                 reply[8 + i * 32..10 + i * 32].copy_from_slice(&engine.xe_class().to_le_bytes());
+                reply[10 + i * 32..12 + i * 32].copy_from_slice(
+                    &present
+                        .logical_instance(*engine)
+                        .expect("published engine")
+                        .to_le_bytes(),
+                );
             }
             reply
         }
@@ -104,7 +112,7 @@ fn query_wire(
                 let used = vram.used();
                 reply[96..98].copy_from_slice(&1u16.to_le_bytes());
                 reply[98..100].copy_from_slice(&1u16.to_le_bytes());
-                put32(&mut reply, 100, 4096); // BMG has no NEED64K VRAM flag
+                put32(&mut reply, 100, vram.page_size() as u32);
                 put64(&mut reply, 104, vram.total());
                 put64(&mut reply, 112, used);
                 put64(&mut reply, 120, vram.visible());
@@ -196,6 +204,12 @@ fn query_wire(
             }
             reply
         }
+        10 => crate::intel_gpu_eu_stall::query(
+            info.backend
+                .as_ref()
+                .and_then(|backend| backend.eu_stall_info())
+                .ok_or(FsError::NoDevice)?,
+        )?,
         6 => {
             if u32_at(wire, 12) != 0 {
                 if u32_at(wire, 12) != 40 {

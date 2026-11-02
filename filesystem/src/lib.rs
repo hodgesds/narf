@@ -1105,6 +1105,13 @@ pub struct DirEntry {
 /// on the same DRM open produce newer fences.
 pub trait DrmFence: Send + Sync {
     fn is_signalled(&self) -> bool;
+
+    /// Linux `dma_fence_get_status`: zero while pending, one on successful
+    /// completion, or a negative errno on terminal failure. A failed fence
+    /// is signalled too: poll/wait wakes, while FILE_INFO preserves the error.
+    fn status(&self) -> i32 {
+        i32::from(self.is_signalled())
+    }
     fn wait(&self, timeout_ms: u64) -> bool;
 
     /// Ready for an i915 EXEC_FENCE_SUBMIT dependency. Native Intel fences

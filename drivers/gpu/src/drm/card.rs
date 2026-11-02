@@ -428,8 +428,8 @@ pub(crate) struct PropertyBlob {
     pub(crate) user: bool,
 }
 
-/// `drm_crtc::gamma_size` of every color-managed CRTC: amdgpu_dm's
-/// `drm_mode_crtc_set_gamma_size(MAX_COLOR_LEGACY_LUT_ENTRIES)`.
+/// `drm_crtc::gamma_size` of every color-managed CRTC: Intel and AMD both
+/// initialize the legacy store with 256 entries, independently of native LUT size.
 pub const LEGACY_GAMMA_SIZE: usize = 256;
 
 /// A CRTC's color management as amdgpu_dm attaches it on DCN 4.0.1
@@ -467,6 +467,8 @@ impl CrtcColor {
 pub(crate) struct DrmEventQueue {
     events: VecDeque<QueuedEvent>,
     event_space: usize,
+    #[cfg(feature = "intel")]
+    closed: bool,
 }
 
 /// One queued `drm_event`, deliverable at `deliver_at_ns` or when what it
@@ -599,7 +601,19 @@ impl DrmEventQueue {
         Self {
             events: VecDeque::new(),
             event_space: Self::EVENT_SPACE_BYTES,
+            #[cfg(feature = "intel")]
+            closed: false,
         }
+    }
+
+    #[cfg(feature = "intel")]
+    pub(crate) fn close(&mut self) {
+        self.closed = true;
+    }
+
+    #[cfg(feature = "intel")]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
     }
 
     fn push(&mut self, event: QueuedEvent) -> Result<(), DrmEventQueueFull> {
@@ -694,23 +708,35 @@ pub(crate) struct DrmEventQueueFull;
 /// ioctl consume the space this transaction needs after its hardware latch.
 #[cfg(feature = "intel")]
 #[derive(Debug)]
-pub(crate) struct FlipEventReservation<'a> {
-    queue: &'a narf_lib::sync::IrqSafeSpinLock<DrmEventQueue>,
+pub(crate) struct FlipEventReservation {
+    queue: Arc<narf_lib::sync::IrqSafeSpinLock<DrmEventQueue>>,
     pending: bool,
 }
 
 #[cfg(feature = "intel")]
-impl<'a> FlipEventReservation<'a> {
+impl FlipEventReservation {
     pub(crate) fn reserve(
-        queue: &'a narf_lib::sync::IrqSafeSpinLock<DrmEventQueue>,
+        queue: &Arc<narf_lib::sync::IrqSafeSpinLock<DrmEventQueue>>,
     ) -> Result<Self, DrmEventQueueFull> {
         {
             let mut events = queue.lock();
+            if events.closed {
+                return Err(DrmEventQueueFull);
+            }
             events.ensure_flip_event_space(1)?;
+            // Reserve storage for every charged event, including reservations
+            // not yet published by the asynchronous display worker.
+            let charged = (DrmEventQueue::EVENT_SPACE_BYTES - events.event_space)
+                / DrmEventQueue::FLIP_EVENT_BYTES
+                + 1;
+            events
+                .events
+                .try_reserve(charged)
+                .map_err(|_| DrmEventQueueFull)?;
             events.event_space -= DrmEventQueue::FLIP_EVENT_BYTES;
         }
         Ok(Self {
-            queue,
+            queue: queue.clone(),
             pending: true,
         })
     }
@@ -724,7 +750,13 @@ impl<'a> FlipEventReservation<'a> {
         bytes[8..16].copy_from_slice(&user_data.to_le_bytes());
         bytes[28..32].copy_from_slice(&crtc_id.to_le_bytes());
         patch_vblank_event(&mut bytes, stamp.ns, stamp.sequence);
-        self.queue.lock().events.push_back(QueuedEvent {
+        let mut queue = self.queue.lock();
+        if queue.closed {
+            queue.event_space += DrmEventQueue::FLIP_EVENT_BYTES;
+            self.pending = false;
+            return;
+        }
+        queue.events.push_back(QueuedEvent {
             deliver_at_ns: stamp.ns,
             wait: Wait::Time,
             bytes,
@@ -734,7 +766,7 @@ impl<'a> FlipEventReservation<'a> {
 }
 
 #[cfg(feature = "intel")]
-impl Drop for FlipEventReservation<'_> {
+impl Drop for FlipEventReservation {
     fn drop(&mut self) {
         if self.pending {
             self.queue.lock().event_space += DrmEventQueue::FLIP_EVENT_BYTES;
@@ -894,6 +926,18 @@ pub struct Card {
     intel_transaction: bool,
     #[cfg(feature = "intel")]
     intel_deferred_owners: Vec<u64>,
+    /// Registered Intel native display owner; independent of color capability
+    /// and of native_atomic, which other DRM vendors also use.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_display: bool,
+    /// Installed fixed-mode Intel color owner (native CTM, gamma1024/legacy256).
+    #[cfg(feature = "intel")]
+    pub(crate) intel_ctm: bool,
+    #[cfg(feature = "intel")]
+    intel_blob_pins: Vec<(u32, usize)>,
+    /// A released master still owns hardware until serialized restoration.
+    #[cfg(feature = "intel")]
+    intel_restore_pending: bool,
     /// GEM object table for this card.
     pub gem: GemTable,
     /// Dumb-buffer physical backings. Kept alive here so the memory
@@ -1164,6 +1208,14 @@ impl Card {
             intel_transaction: false,
             #[cfg(feature = "intel")]
             intel_deferred_owners: Vec::new(),
+            #[cfg(feature = "intel")]
+            intel_ctm: false,
+            #[cfg(feature = "intel")]
+            intel_display: false,
+            #[cfg(feature = "intel")]
+            intel_blob_pins: Vec::new(),
+            #[cfg(feature = "intel")]
+            intel_restore_pending: false,
             gem: GemTable::new(),
             dumb_backings: Vec::new(),
             virtgpu_imports: Vec::new(),
@@ -1291,6 +1343,11 @@ impl Card {
     pub fn master_release(&mut self, open_id: u64) {
         if self.current_master == Some(open_id) {
             self.current_master = None;
+            #[cfg(feature = "intel")]
+            {
+                self.intel_restore_pending |= self.intel_display;
+                self.intel_clear_ctm();
+            }
         }
     }
 
@@ -1655,6 +1712,14 @@ impl Card {
 
     /// Whether a committed color or HDR property names blob `id`.
     fn blob_referenced(&self, id: u32) -> bool {
+        #[cfg(feature = "intel")]
+        if self
+            .intel_blob_pins
+            .iter()
+            .any(|&(blob, count)| blob == id && count != 0)
+        {
+            return true;
+        }
         id != 0
             && (self
                 .crtc_color
@@ -1664,6 +1729,73 @@ impl Card {
                     .native
                     .iter()
                     .any(|n| n.hdr_output_metadata == Some(id)))
+    }
+
+    pub(crate) fn intel_color(&self, crtc: u32) -> bool {
+        #[cfg(feature = "intel")]
+        {
+            self.intel_ctm && self.crtc_color(crtc).is_some()
+        }
+        #[cfg(not(feature = "intel"))]
+        {
+            let _ = crtc;
+            false
+        }
+    }
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_retain_blob(&mut self, id: u32) -> bool {
+        if self.property_blob(id).is_none() {
+            return false;
+        }
+        if let Some((_, count)) = self
+            .intel_blob_pins
+            .iter_mut()
+            .find(|(blob, _)| *blob == id)
+        {
+            let Some(next) = count.checked_add(1) else {
+                return false;
+            };
+            *count = next;
+        } else {
+            self.intel_blob_pins.push((id, 1));
+        }
+        true
+    }
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_release_blob(&mut self, id: u32) {
+        if let Some(at) = self
+            .intel_blob_pins
+            .iter()
+            .position(|(blob, _)| *blob == id)
+        {
+            self.intel_blob_pins[at].1 -= 1;
+            if self.intel_blob_pins[at].1 == 0 {
+                self.intel_blob_pins.swap_remove(at);
+            }
+        }
+        self.collect_blobs();
+    }
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_master_restore_pending(&self) -> bool {
+        self.intel_restore_pending
+    }
+    /// Called only under the display Session after original console/color
+    /// restoration and current authority have been verified. A later stale
+    /// close task must then leave a replacement master's new state untouched.
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_master_restored(&mut self) {
+        self.intel_clear_ctm();
+        self.intel_restore_pending = false;
+    }
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_clear_ctm(&mut self) {
+        if self.intel_ctm {
+            for color in &mut self.crtc_color {
+                color.ctm = 0;
+                color.gamma_lut = 0;
+            }
+        }
+        self.collect_blobs();
     }
 
     /// Free destroyed blobs no committed property names any more (the last

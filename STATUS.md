@@ -1384,19 +1384,232 @@ verified fetch stop. The following KMS continuation installs that owner for
 fixed-mode MTL/Arrow Pipe A WC GEM flips, with console epoch handoff, PSR
 inhibition, modeset/PM exclusion and transactional hardware events/out-fences.
 Unsupported pre-arm states restore the retained console for checked-copy
-fallback and observed hardware vblank. NONBLOCK currently waits for latch.
-Gen12 production direct flips, extra planes/modifiers and full recovery of
-quarantined display owners remain open. Automatic GT recovery invalidates
-active display access before reset and retains uncertain owners; system
-suspend restores the console before power teardown.
+fallback and observed hardware vblank. The software-completion branch adds
+a bounded owned FIFO so NONBLOCK returns before dependency waits or latch;
+native out-fences preserve errors through sync_file. Automatic GT recovery
+invalidates old display access, then uses fresh authority and a verified
+console latch to retire GEM mappings. Failed latch/clear/status restoration
+keeps owners quarantined. System suspend restores the console before power
+teardown. Gen12 production direct flips and extra planes/modifiers remain open.
+Bounded first-error reports are readable at `/sys/class/drm/cardN/error`.
+Userspace SLPC stores enqueue validated range/profile policy; only firmware
+acknowledgment publishes values, and confirmed policy replays in a fresh epoch.
 Intel silicon and Mesa acceptance remain untested.
 The foundation's 25 native fixtures and KMS integration's 35 fixtures pass
 on both architectures, including real mapped-console copying and cancellation,
-PSR, event publication and reset quarantine. Latest selected Intel/DRM/fb
-regression groups pass 648 tests on x86_64 and 520 on aarch64, with zero
-failures/skips. All three GPU/fb CI Clippy contexts pass per architecture;
+PSR, event publication and reset quarantine. Selected Intel/DRM/fb groups at
+that preceding checkpoint pass 648 tests on x86_64 and 520 on aarch64, with
+zero failures/skips. All three GPU/fb CI Clippy contexts pass per architecture;
 host default/Intel-only/AMD-only/no-vendor all-target Clippy, Intel debug
 builds, formatting, both production boots and both btrfs postflights pass.
+
+The `codex/intel-software-completion` integration adds 27 native fixtures:
+all pass on x86_64, and all 25 GPU fixtures also pass on aarch64. Selected
+Intel/DRM/fb groups pass 673 and 545 tests respectively, with no failures or
+skips. The x86_64 syscall ABI group passes 2252 with four existing harness
+skips; its redundant aarch64 run was stopped at the maintainer's request.
+Architecture-neutral iterations now use x86_64 tests; aarch64 reruns cover
+changes to its code or behavior, while cross-target build/lint checks remain.
+GPU/filesystem/userspace/fb target CI Clippy passes all three feature contexts
+on both architectures; all four host GPU vendor configurations pass all-target
+Clippy. Intel debug builds, production boots, both btrfs postflights per
+architecture, formatting and diff checks pass.
+The full software campaign and remaining dependencies are tracked in
+`drivers/gpu/specification/intel_gpu.md` §20; these four workstreams do not
+complete Linux-xe parity.
+
+The second parallel checkpoint integrates BMG BCS8 as logical COPY1 through
+ADS, per-instance saved/default state, nonprivileged policy, IRQ handling,
+private PPGTT startup execution proofs and Xe/i915 engine selection. MTL/Arrow
+Pipe A gains fixed-mode CTM-only transactions with retained blobs/original
+color state, hardware-frame completion and full console restoration. A
+default-off CAP_SYSLOG-gated `/dev/dri/guc-logN` descriptor captures immutable
+bounded raw GuC logs from an already-awake coherent GT, with actual firmware
+identity and per-read authority checks; it does not consume firmware cursors
+or provide a lossless stream. Read-only `xe` hwmon nodes expose cached DG2/BMG
+temperatures and DG2 voltage/extended energy without read-triggered MMIO or
+wake. Writable controls and BMG PMT energy remain open. This checkpoint adds
+36 native fixtures; all pass on x86_64. Selected Intel/DRM/fb regression groups
+pass 709 unique tests with no failures or skips. GPU/fb target CI Clippy passes
+all three contexts on both architectures; all four host GPU vendor contexts
+pass all-target Clippy. Debug/release compilation passes on both architectures,
+as do the x86_64 production boot, both btrfs postflights, formatting and diff
+checks. aarch64 QEMU is intentionally omitted for this architecture-neutral
+iteration. Intel silicon and Mesa acceptance remain unrun.
+
+The third Intel software checkpoint continues on the same branch with
+boot-only DG2/BMG multi-CCS selection and dense logical/sparse physical engine
+mapping, private startup execution proofs for every published engine, and
+exact partition identity on idle resume. It adds MTL/Arrow native 1024-entry
+gamma activation/bypass with safe original-palette restoration; active LUT
+replacement and jointly changed color resources still require a DSB/vblank
+owner and refuse explicitly. Extended hwmon adds admin-gated queued DG2 PL1
+controls within the original boot ceiling, fan RPM and owned BMG thermal
+limit discovery. Immutable compatibility discovery now reports observed
+revision/DSS/EU/timestamp facts and readonly default SSEU state with exact
+copy/lookup behavior; production GuC cards continue to select Xe, so legacy
+backend admission remains open. Master handoff serializes original-console/
+color restoration before replacement work, including non-color Gen12 cards;
+known telemetry access loss immediately hides cached observations between
+sampling ticks. All 40 new fixtures pass on x86_64, and selected Intel/DRM/fb
+groups pass 749 unique tests with no failures or skips. Broader software
+parity and silicon/Mesa acceptance remain open. GPU/fb target CI Clippy passes
+all three contexts on both architectures, all four host GPU configurations
+pass all-target Clippy, and both architectures pass debug/release compilation.
+The x86_64 production boot, both btrfs postflights, formatting and diff checks
+pass. aarch64 QEMU is omitted for this architecture-neutral production change.
+
+The fourth Intel software checkpoint adds client-free DG2/BMG CCS
+reconfiguration: primary/render file leases exclude racing opens and outlive
+namespace teardown; a queued administrative request holds runtime PM through
+full reset, every engine's startup proofs and fresh-epoch publication. Busy
+lastclose jobs refuse without reset, while loss/S3 prevents stale-epoch replay.
+BMG package PL1 shares the existing PCODE owner, with passive firmware defaults,
+a retained ceiling, pair-preserving administrative updates and exact current-
+source readback; close discards pending/source ownership without replay.
+Fixed progressive MTL/Arrow Pipe-A active gamma replacement and joint CTM/gamma
+changes now use a real retained DSB chain, independent command-fetch retirement
+and leaf/frame/palette evidence before native events/fences. One private 16 KiB
+WC mapping remains pinned/reused after exposure. Reset, cancellation and master
+handoff cannot bypass its retirement, and temporary recovery authority is
+removed before admission reopens. Mixed framebuffer/color transactions and
+broader display profiles remain open alongside the VM, media, local-memory,
+platform and diagnostics workstreams. All 25 new fixtures pass on x86_64;
+selected Intel/DRM/fb groups pass 774 unique tests, with zero failures/skips.
+GPU/fb target CI Clippy passes all three contexts on both architectures, all
+four host GPU vendor configurations pass all-target Clippy, and both targets
+pass debug/release compilation. aarch64 QEMU is intentionally omitted because
+this wave introduces no aarch64-specific production code. The x86_64 production
+boot, both btrfs postflights, formatting, diff and final source-integrity checks
+pass. Intel silicon and Mesa acceptance remain unrun.
+
+The fifth Intel checkpoint adds true GuC width-one load balancing across
+bounded same-class published placements, with one persistent LRC, private
+per-restore physical-engine receipts and migration-aware watchdog/retirement
+ownership. Parallel queues remain open. Fixed-mode MTL/Arrow direct WC XRGB
+primary flips can join CTM/gamma through common DSB arming; native primary and
+leaf/color witnesses both precede publication and old-window release. Abandoned
+mixed state retains both surfaces and a marker until full restoration or
+verified joint publication, including cancellation during replacement-master
+restoration. BMG PMT now supplies cached card/package energy through a bounded,
+qualified BAR0 PUNIT/remapper owner with checked units/wrap and loss handling.
+Intel PRIME imports external sync-file batches into the shared reservation;
+the filesystem core observes callbacks before admission locks, retires foreign
+references after them and lets CPU/implicit GPU access detect racing imports
+by generation. Xe execution keeps explicit synchronization. These bounded
+profiles leave broader VM, memory, media, display, diagnostics and platform
+work open; silicon and Mesa acceptance remain unrun.
+
+All 27 new fixtures pass on x86_64. Selected Intel/DRM/fb groups pass 801 unique
+tests with zero failures/skips, excluding the repeated 205-test main group.
+Shared-core regressions pass 2252 syscall ABI tests with four existing harness
+skips, plus 62 AMD render tests with zero failures/skips. GPU/fb/filesystem
+target CI Clippy passes all three contexts on both architectures; all four
+host GPU vendor configurations pass all-target Clippy. Both targets pass GPU/fb
+debug/release compilation. aarch64 QEMU is intentionally omitted because this
+wave introduces no aarch64-specific production code.
+The x86_64 production boot, both btrfs postflights, formatting, diff and final
+source-integrity checks pass.
+
+The sixth Intel checkpoint connects the supported i915 compatibility subset
+and LOAD_BALANCE contexts to live GuC cards through exact Xe-first ioctl
+routing, shared WB handles/reservations/syncobjs and native migration/lifetime
+ownership. WC/VRAM cannot inherit WB compatibility mappings or cache claims.
+Bounded MTL/Arrow primary panning uses integer source origins with unchanged
+visible geometry/stride/bandwidth, common DSB OFFSET/SURF arms, both hardware
+witnesses and complete console/reset restoration. BMG adds firmware-selected
+I1 power/current thresholds; DG2 adds PL1 intervals. Fresh readback, retained
+ceilings, fair shared PCODE transaction scheduling and no replay bound writes.
+GuC LFD export uses the same protected immutable snapshots with checked
+state/LIC/event/crash framing; lossless streaming remains open. Parallel queues,
+Gen12 direct flips, cursors and MERT cap lifting retain their multi-lane, GT,
+watermark and frequency/flush prerequisites. Broader software parity and
+Intel silicon/Mesa acceptance remain open.
+
+All 31 new fixtures pass on x86_64. Selected Intel/DRM/fb groups pass 832 unique
+tests with zero failures/skips; the repeated 230-test main group is excluded.
+GPU/fb target CI Clippy passes all three contexts on both architectures,
+all four host GPU vendor configurations pass all-target Clippy, and both
+targets pass debug/release compilation. aarch64 QEMU is intentionally omitted
+because this wave introduces no aarch64-specific production code. The x86_64
+production boot, both btrfs postflights, formatting, diff and final source-
+integrity checks pass.
+
+The seventh Intel checkpoint adds bounded native Xe width-two COPY/COMPUTE
+groups with protected firmware workqueues, separate persistent lane state,
+per-lane watchdogs and all-lane retirement. MTL/Arrow gains qualified full-AUX
+VESA SDR backlight with live-route/authority checks, retained brightness intent,
+shared AUX exclusion and verified asynchronous T8/T9 suspend/relight. BMG gains
+package PL2 and both PL1/PL2 intervals through the retained paired PCODE owner,
+with independent ceilings, sibling checks and exact source readback. Opt-in
+GuC failure bundles capture immutable first-failure status/log/CT before full
+teardown, with privileged reads, generation-matched clear and bounded retained
+buffers. The bundles remain partial coredumps. Broader parallel, VM/memory,
+media, display, diagnostics, power and platform work remains open; the cursor
+and MERT resource/frequency gates stay intact. Intel silicon/Mesa acceptance
+remains unrun.
+
+This checkpoint adds 30 native fixtures. Selected Intel/DRM/framebuffer and
+backlight groups pass 893 unique x86_64 tests, including 31 shared backlight
+regressions, with zero failures/skips. The queued-gang regression fails under
+the original stall logic and passes with the unfinished-engine progress fix.
+GPU/fb production target CI Clippy passes all three contexts on both
+architectures; all four host GPU configurations pass all-target Clippy;
+GPU/fb debug/release builds pass on both targets. Corrected fixtures also pass
+host lint and native reruns. The x86_64 production boot, both btrfs postflights,
+formatting, diff and final source-integrity checks pass. aarch64 QEMU remains
+omitted under the maintainer's policy for this architecture-neutral wave.
+The ledger records 25 implemented checkpoint rows and ten broad open
+workstreams, rather than a completion percentage.
+
+The eighth Intel checkpoint widens single-row native Xe COPY/COMPUTE groups
+to two through four lanes, preserving independent runtime/saved state,
+contiguous IDs and all-lane retirement. DG2 visible VRAM now uses 64 KiB
+placement and real BCS0 data/flat-CCS initialization before handle exposure;
+BMG clears use a live GT/PM/capability owner per bounded CPU chunk. Changed
+or missing reset layout blocks execution admission, and S3 refuses live VRAM
+until preservation/migration is owned. Qualified MTL/Arrow Pipe-A gains a
+64x64 legacy hardware cursor with owned PM_DEMAND/DBUF/MBUS/IPC/watermarks,
+private permanent slots, common KMS FIFO and independent cursor/DSB retirement.
+An independent admin/syslog-gated GuC stream copies checked event/crash frames
+before source cursor/flush acknowledgement, with bounded backpressure,
+observed-loss errors and acknowledged policy restoration or reset quarantine.
+The finite source overflow counter prevents an unconditional lossless claim.
+
+All 31 new native fixtures pass on x86_64. Selected Intel/DRM/framebuffer
+and backlight groups pass 924 unique tests, including 31 shared backlight
+regressions, with zero failures/skips. Production boot and both btrfs
+postflights pass. GPU/fb production target CI Clippy passes all three contexts
+on both architectures; all four host GPU configurations pass all-target Clippy.
+Debug/release compilation passes on both targets. The aarch64 fixture-only
+control-flow correction passes final target/host lint; x86 behavior is unchanged.
+Formatting, diff and final source-integrity checks pass. aarch64 QEMU remains
+omitted because this wave changes no aarch64-specific production behavior.
+The ledger records 28 implemented checkpoint rows and ten broad open
+workstreams, without a completion percentage. Multi-placement/GPU joins, general VM/memory, media,
+broader display/output/diagnostics/power services and additional platforms
+remain open. Intel silicon and Mesa acceptance remain unrun.
+
+The ninth Intel checkpoint adds all-lane GPU user-fence joins to native
+single-row COPY/COMPUTE groups, with one parent qword store and a separate
+private final marker/watchdog. Qualified MTL/Arrow legacy gamma now uses the
+actual 256-entry palette through the common KMS FIFO, publishing its legacy
+store only after confirmed hardware completion. BMG PSYS card PL1/PL2 and
+intervals share the existing fair PCODE owner, retained firmware ceilings and
+whole-pair readback. Default-off privileged BMG EU-stall observation owns real
+sparse-DSS buffers and a bounded host FIFO; copy-before-ack, explicit observed
+loss, current authority and full-reset DMA retirement bound the profile.
+WAIT_NUM_REPORTS=1 is supported; OA and broader thresholds remain open.
+
+All 25 new native fixtures pass; selected Intel/DRM/framebuffer and backlight
+groups pass 949 unique x86_64 tests, including 31 shared backlight regressions,
+with zero failures/skips. Production boot and both btrfs postflights pass.
+GPU/fb target CI Clippy passes all three contexts on both architectures; all
+four host GPU configurations pass all-target Clippy, and debug/release builds
+pass on both targets. Formatting, diff and final source-integrity checks pass.
+aarch64 QEMU is omitted under the maintainer's iteration policy. The ledger
+records 32 implemented checkpoint rows and ten broad open workstreams;
+hardware and Mesa acceptance remain separate, unrun gates.
 
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI

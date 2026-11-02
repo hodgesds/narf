@@ -24,7 +24,7 @@ use crate::{
     },
     intel_gpu_pipes::Pipe,
     intel_gpu_scanout::{Geometry, Presenter, ScanoutError, SurfaceId},
-    intel_gpu_scanout_io::{DisplayAccess, PollIo},
+    intel_gpu_scanout_io::{DisplayAccess, PollIo, SavedStatus},
 };
 
 type Wait<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
@@ -34,7 +34,11 @@ type Wait<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 pub(crate) trait Platform:
     DisplayAccess + Clone + core::fmt::Debug + Send + Sync + 'static
 {
-    fn takeover(&self) -> Result<(), FsError>;
+    fn takeover(&self, owned_cursor: bool) -> Result<(), FsError>;
+    fn color_takeover(&self, owned_cursor: bool) -> Result<(), FsError> {
+        self.takeover(owned_cursor)
+    }
+    fn color_restored(&self) {}
     fn pause_console(&self) -> Wait<'_>;
     fn resume_console(&self);
     fn now(&self) -> u64;
@@ -45,6 +49,9 @@ pub(crate) trait Platform:
     fn reset_lost(&self) -> bool {
         false
     }
+    /// A fresh, checked view used only after GT startup and outside its lock.
+    fn recovery_platform(&self, owned_dsb: bool, owned_cursor: bool) -> Result<Self, FsError>;
+    fn recovery_complete(&self);
 }
 
 #[derive(Clone, Debug)]
@@ -58,17 +65,18 @@ pub(crate) struct Physical {
     /// Shared by every retained PollIo clone. A GT reset invalidates all
     /// outstanding display/cache witnesses; reset alone never retires DMA.
     reset_lost: Arc<AtomicBool>,
+    recovering: bool,
 }
 impl MmioWindow for Physical {
     fn read32(&self, offset: u64) -> u32 {
-        if self.reset_lost() {
+        if self.reset_lost() && !self.recovering {
             u32::MAX
         } else {
             self.window.read32(offset)
         }
     }
     fn write32(&self, offset: u64, value: u32) {
-        if !self.reset_lost() {
+        if !self.reset_lost() || self.recovering {
             self.window.write32(offset, value);
         }
     }
@@ -78,13 +86,17 @@ impl MmioWindow for Physical {
 // function's iGPU runtime-PM owner forbids autosuspend with an active panel.
 // AuthorizedWindow invokes the current capability for each MMIO access.
 unsafe impl DisplayAccess for Physical {
+    fn ggtt_key(&self) -> Option<u64> {
+        Some(self.bar.phys.raw())
+    }
+
     fn access_ok(&self) -> bool {
         self.console_access_ok()
             && (self.generation != Generation::MeteorLake || self.read32(0x4804) == 4)
     }
 }
 impl Platform for Physical {
-    fn takeover(&self) -> Result<(), FsError> {
+    fn takeover(&self, owned_cursor: bool) -> Result<(), FsError> {
         // Only an execution-tested backend has retired inherited GT owners
         // and established the disjoint >=256-MiB kernel GGTT arena. Untrusted
         // commands cannot address this privileged 160..256-MiB display range.
@@ -97,13 +109,29 @@ impl Platform for Physical {
         if !self.access_ok() {
             return Err(FsError::NoDevice);
         }
-        inherited_fetchers_idle(self, self.generation)?;
+        fetchers_with_cursor(self, self.generation, false, owned_cursor)?;
         if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(self.bar.phys) {
             return Err(FsError::NoDevice);
         }
         // Keep the same current-capability/reset checks during PSR and AUX
         // waits as during PTE/plane access; no controller lock spans a wait.
         crate::intel_gpu_edp::kms_inhibit_psr(self).map_err(|_| crate::intel_gpu_user::io_error())
+    }
+    fn color_takeover(&self, owned_cursor: bool) -> Result<(), FsError> {
+        if !self.console_access_ok() {
+            return Err(FsError::NoDevice);
+        }
+        fetchers_with_cursor(self, self.generation, false, owned_cursor)?;
+        if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(self.bar.phys) {
+            return Err(FsError::NoDevice);
+        }
+        crate::intel_gpu_edp::kms_inhibit_psr(self).map_err(|_| crate::intel_gpu_user::io_error())
+    }
+    fn color_restored(&self) {
+        if let Some(card) = crate::drm_registry::mode_state(self.index) {
+            let mut card = card.lock();
+            card.intel_master_restored();
+        }
     }
     fn pause_console(&self) -> Wait<'_> {
         Box::pin(crate::intel_gpu::kms_pause_console())
@@ -124,7 +152,7 @@ impl Platform for Physical {
         ))
     }
     fn console_access_ok(&self) -> bool {
-        if self.reset_lost() {
+        if self.reset_lost() && !self.recovering {
             return false;
         }
         if narf_bus::pci::power_state(&self.cap, &self.device)
@@ -138,9 +166,46 @@ impl Platform for Physical {
     fn reset_lost(&self) -> bool {
         self.reset_lost.load(Ordering::Acquire)
     }
+    fn recovery_platform(&self, owned_dsb: bool, owned_cursor: bool) -> Result<Self, FsError> {
+        let mut fresh = self.clone();
+        fresh.recovering = true;
+        if !fresh.access_ok() {
+            return Err(FsError::NoDevice);
+        }
+        fetchers_with_cursor(&fresh, fresh.generation, owned_dsb, owned_cursor)?;
+        if crate::intel_gpu::with_controller(|gpu| gpu.gtt_mmadr.phys) != Some(fresh.bar.phys) {
+            return Err(FsError::NoDevice);
+        }
+        crate::intel_gpu_edp::kms_inhibit_psr(&fresh)
+            .map_err(|_| crate::intel_gpu_user::io_error())?;
+        Ok(fresh)
+    }
+    fn recovery_complete(&self) {
+        self.reset_lost.store(false, Ordering::Release);
+    }
 }
 
+#[cfg(any(test, feature = "kernel-test"))]
 fn inherited_fetchers_idle(mmio: &impl MmioWindow, generation: Generation) -> Result<(), FsError> {
+    fetchers_idle(mmio, generation, false)
+}
+/// Recovery alone may observe Pipe-A DSB0/1 backed by a retained transport.
+/// This grants observation, never retirement: the caller must independently
+/// stop source0 then leaf1 before fresh console/color programming.
+#[cfg(any(test, feature = "kernel-test"))]
+fn fetchers_idle(
+    mmio: &impl MmioWindow,
+    generation: Generation,
+    owned_dsb: bool,
+) -> Result<(), FsError> {
+    fetchers_with_cursor(mmio, generation, owned_dsb, false)
+}
+fn fetchers_with_cursor(
+    mmio: &impl MmioWindow,
+    generation: Generation,
+    owned_dsb: bool,
+    owned_cursor: bool,
+) -> Result<(), FsError> {
     // MIT Linux intel_cursor_regs.h, intel_fbc.c and intel_display_device.c:
     // neither cursor DMA nor FBC compression tracking belongs to this owner.
     // Refuse them rather than treating a primary latch as their retirement.
@@ -168,7 +233,7 @@ fn inherited_fetchers_idle(mmio: &impl MmioWindow, generation: Generation) -> Re
         if cursor == u32::MAX {
             return Err(FsError::NoDevice);
         }
-        if cursor & 0x27 != 0 {
+        if cursor & 0x27 != 0 && !(owned_cursor && pipe == 0) {
             return Err(FsError::Unsupported);
         }
         // MIT intel_dsb_regs.h: an inherited display state buffer can fetch
@@ -178,7 +243,7 @@ fn inherited_fetchers_idle(mmio: &impl MmioWindow, generation: Generation) -> Re
             if ctl == u32::MAX {
                 return Err(FsError::NoDevice);
             }
-            if ctl & ((1 << 31) | 1) != 0 {
+            if ctl & ((1 << 31) | 1) != 0 && !(owned_dsb && pipe == 0 && dsb < 2) {
                 return Err(FsError::Unsupported);
             }
         }
@@ -199,6 +264,17 @@ fn inherited_fetchers_idle(mmio: &impl MmioWindow, generation: Generation) -> Re
 }
 
 #[derive(Debug)]
+struct Joint {
+    staged: bool,
+    completion: Option<crate::intel_gpu_scanout::Completion>,
+}
+struct PrimaryTarget {
+    object: Arc<GemObject>,
+    geometry: Geometry,
+    viewport: crate::intel_gpu_scanout::Viewport,
+}
+
+#[derive(Debug)]
 struct State<M: Platform> {
     console: ActiveScanout,
     presenter: Option<Presenter<PollIo<M>>>,
@@ -208,6 +284,16 @@ struct State<M: Platform> {
     paused: bool,
     blocked: bool,
     failed: bool,
+    recovery_status: Option<SavedStatus>,
+    color: Option<crate::intel_gpu_color::Owner>,
+    color_owned: bool,
+    color_unpublished: bool,
+    // DMA completion alone cannot publish a cancelled mixed framebuffer.
+    mixed_unpublished: bool,
+    dsb: Option<crate::intel_gpu_dsb::Owner<M>>,
+    dsb_update: Option<crate::intel_gpu_color::Update>,
+    joint: Option<Joint>,
+    cursor: Option<crate::intel_gpu_cursor::Owner<M>>,
 }
 
 #[derive(Debug)]
@@ -216,9 +302,20 @@ pub(crate) struct Device<M: Platform> {
     generation: Generation,
     bar_len: u64,
     state: Mutex<State<M>>,
+    geometry: IrqSafeSpinLock<Geometry>,
 }
 pub(crate) type Display = Device<Physical>;
-pub(crate) type Session<'a> = Guard<'a, Physical>;
+
+impl Display {
+    /// Admission epoch is published by the GT owner after reset recovery;
+    /// reading it never acquires the GT or display transaction mutex.
+    pub(crate) fn epoch(&self) -> u64 {
+        crate::drm_registry::card(self.platform.index)
+            .and_then(|card| card.intel_user_backend())
+            .and_then(|backend| backend.status())
+            .map_or(0, |status| status.epoch)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct Guard<'a, M: Platform> {
@@ -230,6 +327,7 @@ pub(crate) struct Guard<'a, M: Platform> {
 pub(crate) struct LegacyGuard<'a, M: Platform = Physical> {
     state: MutexGuard<'a, State<M>>,
     platform: &'a M,
+    geometry: &'a IrqSafeSpinLock<Geometry>,
 }
 impl<M: Platform> LegacyGuard<'_, M> {
     pub(crate) fn suspend(&mut self) {
@@ -242,6 +340,7 @@ impl<M: Platform> LegacyGuard<'_, M> {
             return;
         }
         self.state.console = console.clone();
+        *self.geometry.lock() = scanout_geometry(console);
         self.state.blocked = false;
     }
 }
@@ -267,6 +366,7 @@ pub(crate) fn install(
         window: crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap),
         generation,
         reset_lost: Arc::new(AtomicBool::new(false)),
+        recovering: false,
     };
     let display = Arc::new(Device::new(platform, generation, bar.len, console));
     let mut displays = DISPLAYS.lock();
@@ -279,7 +379,17 @@ pub(crate) fn install(
     displays.push(display);
     drop(displays);
     if let Some(card) = crate::drm_registry::mode_state(index) {
-        card.lock().native_atomic = true;
+        let mut card = card.lock();
+        card.native_atomic = true;
+        card.intel_display = true;
+        if generation == Generation::MeteorLake {
+            if let Some(crtc) = card.crtcs.first().map(|c| c.id) {
+                card.intel_ctm = true;
+                if card.crtc_color(crtc).is_none() {
+                    card.crtc_color.push(crate::drm::card::CrtcColor::new(crtc));
+                }
+            }
+        }
     }
 }
 pub(crate) fn display(index: u32) -> Option<Arc<Display>> {
@@ -302,17 +412,22 @@ pub(crate) fn available(index: u32) -> bool {
 pub(crate) fn active(index: u32) -> bool {
     display(index).is_some_and(|d| {
         d.platform.reset_lost()
-            || d.state
-                .try_lock()
-                .is_none_or(|s| s.presenter.is_some() || s.paused || s.failed)
+            || d.state.try_lock().is_none_or(|s| {
+                s.presenter.is_some()
+                    || s.color.is_some()
+                    || s.cursor.as_ref().is_some_and(|cursor| cursor.active())
+                    || s.color_unpublished
+                    || s.paused
+                    || s.failed
+            })
     })
 }
 
 /// Called after publishing backend epoch zero and before an automatic GT
 /// reset, while the GT reset mutex is held. Never await or wait for display
 /// ownership here: a display transaction may itself await a GT fence.
-/// A busy/owned display loses its witnesses permanently; GEM pages and the
-/// paused console remain quarantined until reboot. GT reset is no fetch-stop
+/// A busy/owned display loses its witnesses; GEM pages and the paused console
+/// remain quarantined until an independent fresh console latch. GT reset is no fetch-stop
 /// proof, and this path must neither unpin a front nor restore status bits.
 pub(crate) fn quarantine_for_gt_reset(bar: &narf_bus::MmioRegion) {
     if let Some(display) = display_for_bar(bar) {
@@ -322,7 +437,14 @@ pub(crate) fn quarantine_for_gt_reset(bar: &narf_bus::MmioRegion) {
 
 fn quarantine_reset_state<M: Platform>(state: &Mutex<State<M>>, lost: &AtomicBool) {
     if let Some(mut state) = state.try_lock() {
-        if lost.load(Ordering::Acquire) || state.presenter.is_some() || state.paused || state.failed
+        if lost.load(Ordering::Acquire)
+            || state.presenter.is_some()
+            || state.color.is_some()
+            || state.cursor.as_ref().is_some_and(|cursor| cursor.active())
+            || state.color_unpublished
+            || state.mixed_unpublished
+            || state.paused
+            || state.failed
         {
             lost.store(true, Ordering::Release);
             state.blocked = true;
@@ -340,7 +462,29 @@ pub(crate) async fn quiesce_for_legacy(bar: &narf_bus::MmioRegion) -> Result<(),
     if let Some(display) = display_for_bar(bar) {
         display.quiesce().await?;
     }
+    if let Err(error) = crate::intel_dpcd_bl::suspend_complete_for_bar(bar).await {
+        // A failed system-PM prepare hook is not resumed by the coordinator.
+        // Attempt a fully verified replay while the original video is live;
+        // failed replay keeps the AUX owner parked with its intent retained.
+        let _ = crate::intel_dpcd_bl::resume_for_bar(bar);
+        return Err(error);
+    }
     Ok(())
+}
+
+pub(crate) async fn recover_after_gt_reset(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {
+    if let Some(display) = display_for_bar(bar) {
+        display.recover().await?;
+    }
+    Ok(())
+}
+
+fn scanout_geometry(console: &ActiveScanout) -> Geometry {
+    Geometry {
+        width: console.width,
+        height: console.height,
+        pitch: console.stride_bytes,
+    }
 }
 
 impl<M: Platform> Device<M> {
@@ -349,6 +493,7 @@ impl<M: Platform> Device<M> {
             platform,
             generation,
             bar_len,
+            geometry: IrqSafeSpinLock::new(scanout_geometry(&console)),
             state: Mutex::new(State {
                 console,
                 presenter: None,
@@ -358,8 +503,176 @@ impl<M: Platform> Device<M> {
                 paused: false,
                 blocked: false,
                 failed: false,
+                recovery_status: None,
+                color: None,
+                color_owned: false,
+                color_unpublished: false,
+                mixed_unpublished: false,
+                dsb: None,
+                dsb_update: None,
+                joint: None,
+                cursor: None,
             }),
         }
+    }
+    pub(crate) fn reset_lost(&self) -> bool {
+        self.platform.reset_lost()
+    }
+    pub(crate) fn console_geometry(&self) -> Geometry {
+        *self.geometry.lock()
+    }
+
+    /// Called by the GT worker only after its reset/startup probes, with its
+    /// mutex released and backend epoch still zero. No GT fence is awaited.
+    pub(crate) async fn recover(&self) -> Result<(), FsError> {
+        let mut state = self.state.lock().await;
+        if !self.platform.reset_lost() {
+            return Ok(());
+        }
+        state.blocked = true;
+        state.failed = true;
+        state.paused = true;
+        self.platform.pause_console().await;
+        if let Some(old) = &state.presenter {
+            old.retained_io().poison();
+        }
+        let fresh = self.platform.recovery_platform(
+            state.dsb.as_ref().is_some_and(|dsb| dsb.exposed()),
+            state.cursor.as_ref().is_some_and(|cursor| cursor.exposed()),
+        )?;
+        if let Some(dsb) = state.dsb.as_mut() {
+            dsb.recover_view(fresh.clone(), self.platform.now());
+            while dsb.armed() && !dsb.poll(self.platform.now())? {
+                self.platform.tick().await;
+            }
+            // DSB DMA is independent of GT and primary fetch. Stop/disable
+            // chain source0 then leaf1 before any fresh console/color arm.
+            dsb.shutdown()?;
+            // Recovery authority is temporary. The retained same-VA owner
+            // must observe the shared poison on every subsequent GT reset.
+            // This only replaces IO; no access uses the still-lost view.
+            dsb.recover_view(self.platform.clone(), self.platform.now());
+        }
+        state.dsb_update = None;
+        if state.cursor.as_ref().is_some_and(|cursor| cursor.active()) {
+            let cursor = state.cursor.as_mut().expect("cursor");
+            cursor.replace_io(fresh.clone());
+            cursor.begin_recovery_stop();
+            let timing = cursor.timing;
+            let profile =
+                crate::intel_gpu_display_resources::Profile::capture_timing(&fresh, timing)?;
+            let regs = cursor.stage(profile, None, true, None)?;
+            {
+                let dsb = state.dsb.as_mut().ok_or(FsError::NoDevice)?;
+                dsb.recover_view(fresh.clone(), self.platform.now());
+                dsb.arm(timing, &regs, None, self.platform.now())?;
+                while !dsb.poll(self.platform.now())? {
+                    self.platform.tick().await;
+                }
+            }
+            state.cursor.as_mut().expect("cursor").complete()?;
+            // This stream belongs to the cursor, not dsb_update. Retire the
+            // transport/status ownership before console/color work can reuse
+            // it; terminal polling alone deliberately keeps armed=true.
+            state.dsb.as_mut().expect("DSB").shutdown()?;
+            state
+                .cursor
+                .as_mut()
+                .expect("cursor")
+                .replace_io(self.platform.clone());
+            state
+                .dsb
+                .as_mut()
+                .expect("DSB")
+                .recover_view(self.platform.clone(), self.platform.now());
+        }
+
+        let saved = match state.recovery_status {
+            Some(saved) => saved,
+            None => {
+                let saved = if let Some(old) = &state.presenter {
+                    old.retained_io().saved_status()
+                } else {
+                    PollIo::snapshot_status(&fresh, self.generation)
+                        .map_err(|_| FsError::NoDevice)?
+                };
+                state.recovery_status = Some(saved);
+                saved
+            }
+        };
+        // SAFETY: the old owner remains retained and poisoned. The GT worker
+        // owns D0 and verified PAT policy; this mutex excludes every display
+        // transition. Only the fresh view can observe/arm hardware now.
+        let io = unsafe {
+            PollIo::after_reset(fresh.clone(), self.generation, Pipe::A, self.bar_len, saved)
+        }
+        .map_err(|_| crate::intel_gpu_user::io_error())?;
+        let format = io.format();
+        let pat = if self.generation == Generation::MeteorLake {
+            1
+        } else {
+            0
+        };
+        // SAFETY: all old current/pending owners remain in state.presenter;
+        // retained console pages are outside their arena. No pre-reset
+        // completion is consumed by this independent fresh transaction.
+        let mut console = unsafe {
+            Presenter::recover_console(
+                io,
+                self.bar_len,
+                Pipe::A,
+                format,
+                pat,
+                (
+                    state.console.gtt_offset,
+                    scanout_geometry(&state.console),
+                    self.platform.now(),
+                ),
+            )
+        }
+        .map_err(scanout_error)?;
+        loop {
+            match console.poll(self.platform.now()).map_err(scanout_error)? {
+                Some(_) => break,
+                None => self.platform.tick().await,
+            }
+        }
+        if let Some(color) = state.color.as_mut() {
+            color.recover_original(&fresh, self.platform.now())?;
+            loop {
+                if color.poll(&fresh, self.platform.now())?.is_some() {
+                    break;
+                }
+                self.platform.tick().await;
+            }
+        }
+        state.color = None;
+        state.color_owned = false;
+        state.color_unpublished = false;
+        self.platform.color_restored();
+        if let Some(old) = state.presenter.as_mut() {
+            // SAFETY: the fresh console flip-done, SURFLIVE and changed
+            // stable frame independently retired every old GEM fetch. Clear
+            // with fresh IO; never re-enable the old poisoned adapter.
+            unsafe { old.shutdown_retired_with(console.retained_io()) }.map_err(scanout_error)?;
+        } else {
+            console.shutdown_restored_console().map_err(scanout_error)?;
+        }
+        state.presenter = None;
+        state.current = None;
+        state.pending = None;
+        state.joint = None;
+        state.recovery_status = None;
+        // All old IO and mappings are closed before making normal accesses
+        // valid again; only this new console witness reopens admission.
+        drop(console);
+        state.mixed_unpublished = false;
+        self.platform.recovery_complete();
+        state.failed = false;
+        state.blocked = false;
+        self.platform.resume_console();
+        state.paused = false;
+        Ok(())
     }
     pub(crate) async fn session(&self) -> Result<Guard<'_, M>, FsError> {
         let state = self.state.lock().await;
@@ -378,6 +691,7 @@ impl<M: Platform> Device<M> {
             state,
         };
         guard.restore_console().await?;
+        self.platform.color_restored();
         guard.state.blocked = true;
         Ok(())
     }
@@ -385,12 +699,21 @@ impl<M: Platform> Device<M> {
 impl<M: Platform> Device<M> {
     pub(crate) fn legacy(&self) -> Result<LegacyGuard<'_, M>, FsError> {
         let state = self.state.try_lock().ok_or(FsError::Busy)?;
-        if self.platform.reset_lost() || state.presenter.is_some() || state.paused || state.failed {
+        if self.platform.reset_lost()
+            || state.presenter.is_some()
+            || state.color.is_some()
+            || state.cursor.as_ref().is_some_and(|cursor| cursor.active())
+            || state.color_unpublished
+            || state.mixed_unpublished
+            || state.paused
+            || state.failed
+        {
             return Err(FsError::Busy);
         }
         Ok(LegacyGuard {
             state,
             platform: &self.platform,
+            geometry: &self.geometry,
         })
     }
 }
@@ -403,6 +726,18 @@ fn scanout_error(error: ScanoutError) -> FsError {
     }
 }
 impl<M: Platform> Guard<'_, M> {
+    /// Recheck before publishing a hardware transaction. The synchronous GT
+    /// loss path can poison a busy session without acquiring this mutex.
+    pub(crate) fn ownership_valid(&self) -> Result<(), FsError> {
+        if self.state.failed
+            || self.state.blocked
+            || self.device.platform.reset_lost()
+            || !self.device.platform.console_access_ok()
+        {
+            return Err(FsError::NoDevice);
+        }
+        Ok(())
+    }
     pub(crate) fn console_geometry(&self) -> Geometry {
         Geometry {
             width: self.state.console.width,
@@ -438,6 +773,9 @@ impl<M: Platform> Guard<'_, M> {
         Ok(ticket)
     }
     async fn finish_pending(&mut self) -> Result<Option<FlipStamp>, FsError> {
+        if self.state.joint.is_some() {
+            return Err(FsError::Busy);
+        }
         loop {
             let Some(presenter) = self.state.presenter.as_mut() else {
                 return Ok(None);
@@ -481,10 +819,15 @@ impl<M: Platform> Guard<'_, M> {
         // Publish cancellation-safe ownership before the first await.
         self.state.paused = true;
         self.device.platform.pause_console().await;
-        if let Err(error) = self.device.platform.takeover() {
+        if let Err(error) = self.device.platform.takeover(self.state.cursor.is_some()) {
             if self.device.platform.reset_lost() {
                 self.state.failed = true;
-            } else {
+            } else if !self
+                .state
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.active())
+            {
                 self.device.platform.resume_console();
                 self.state.paused = false;
             }
@@ -504,6 +847,12 @@ impl<M: Platform> Guard<'_, M> {
             }
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.state.recovery_status = Some(
+            PollIo::snapshot_status(platform, self.device.generation).map_err(|_| {
+                self.state.failed = true;
+                crate::intel_gpu_user::io_error()
+            })?,
+        );
         // SAFETY: the per-card mutex owns the running internal plane and all
         // reserved PTEs. CPU epochs retired above; power/modeset/PSR cannot
         // transition before quiesce obtains this same mutex.
@@ -544,36 +893,81 @@ impl<M: Platform> Guard<'_, M> {
         self.state.presenter = Some(presenter);
         Ok(())
     }
+    fn prepare_surface(
+        &mut self,
+        object: Arc<GemObject>,
+        geometry: Geometry,
+        viewport: crate::intel_gpu_scanout::Viewport,
+    ) -> Result<SurfaceId, FsError> {
+        if let Some((current, id)) = &self.state.current {
+            if Arc::ptr_eq(current, &object)
+                && self
+                    .state
+                    .presenter
+                    .as_ref()
+                    .expect("presenter")
+                    .matches_view(*id, geometry, viewport)
+            {
+                return Ok(*id);
+            }
+        }
+        self.state
+            .presenter
+            .as_mut()
+            .expect("presenter")
+            .prepare_view(object, geometry, viewport)
+            .map_err(scanout_error)
+    }
+    fn rollback_joint_before_arm(&mut self) -> Result<(), FsError> {
+        if let Some(joint) = &self.state.joint {
+            if joint.staged {
+                // SAFETY: invoked only for the DSB's strict Unsupported
+                // preflight before any command stream was armed/exposed.
+                unsafe {
+                    self.state
+                        .presenter
+                        .as_mut()
+                        .expect("presenter")
+                        .cancel_staged_dsb()
+                }
+                .map_err(scanout_error)
+                .inspect_err(|_| self.state.failed = true)?;
+            }
+            self.state.joint = None;
+            let (_, id) = self.state.pending.take().expect("joint GEM owner");
+            if self
+                .state
+                .current
+                .as_ref()
+                .is_none_or(|(_, front)| *front != id)
+            {
+                self.state
+                    .presenter
+                    .as_mut()
+                    .expect("presenter")
+                    .release(id)
+                    .map_err(scanout_error)
+                    .inspect_err(|_| self.state.failed = true)?;
+            }
+        }
+        Ok(())
+    }
     pub(crate) async fn present(
         &mut self,
         object: Arc<GemObject>,
         geometry: Geometry,
     ) -> Result<FlipStamp, FsError> {
         self.check(geometry)?;
+        if self.state.color_unpublished || self.state.mixed_unpublished {
+            return Err(FsError::Busy);
+        }
         if !object.is_wc() || !object.scanout() || object.is_vram() || object.is_userptr() {
             return Err(FsError::Unsupported);
         }
+        self.finish_color().await?;
         self.finish_pending().await?;
         self.start().await?;
-        let id = if let Some((current, id)) = &self.state.current {
-            if Arc::ptr_eq(current, &object) {
-                *id
-            } else {
-                self.state
-                    .presenter
-                    .as_mut()
-                    .expect("presenter")
-                    .prepare(object.clone(), geometry)
-                    .map_err(scanout_error)?
-            }
-        } else {
-            self.state
-                .presenter
-                .as_mut()
-                .expect("presenter")
-                .prepare(object.clone(), geometry)
-                .map_err(scanout_error)?
-        };
+        let id = self.prepare_surface(object.clone(), geometry, Default::default())?;
         let ticket = self.ticket()?;
         // Record the new owner before arming. Cancellation never unpins it.
         self.state.pending = Some((object, id));
@@ -607,6 +1001,35 @@ impl<M: Platform> Guard<'_, M> {
             .ok_or_else(crate::intel_gpu_user::io_error)
     }
     pub(crate) async fn restore_console(&mut self) -> Result<(), FsError> {
+        self.finish_cursor().await?;
+        if self
+            .state
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.active())
+        {
+            let timing = self.state.cursor.as_ref().expect("cursor").timing;
+            self.cursor_inner(None, true, None, timing, true).await?;
+        }
+        self.restore_color().await?;
+        self.restore_surface_inner().await?;
+        self.state.mixed_unpublished = false;
+        Ok(())
+    }
+    pub(crate) async fn restore_surface(&mut self) -> Result<(), FsError> {
+        if self.state.mixed_unpublished {
+            return Err(FsError::Busy);
+        }
+        self.restore_surface_inner().await
+    }
+    async fn restore_surface_inner(&mut self) -> Result<(), FsError> {
+        self.finish_color().await?;
+        if self.state.color_unpublished {
+            return Err(FsError::Busy);
+        }
+        if !self.state.color_owned {
+            self.state.color = None;
+        }
         if self.device.platform.reset_lost() {
             self.state.failed = true;
             return Err(FsError::NoDevice);
@@ -635,15 +1058,567 @@ impl<M: Platform> Guard<'_, M> {
                 .map_err(scanout_error)?;
             self.state.presenter = None;
             self.state.current = None;
+            self.state.recovery_status = None;
         }
-        if self.state.paused {
+        if self.state.paused
+            && self.state.color.is_none()
+            && !self
+                .state
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.active())
+        {
             self.device.platform.resume_console();
             self.state.paused = false;
         }
         Ok(())
     }
+    async fn finish_cursor(&mut self) -> Result<Option<FlipStamp>, FsError> {
+        let mut stamp = None;
+        while self
+            .state
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.pending())
+        {
+            self.ownership_valid()?;
+            let done = self
+                .state
+                .dsb
+                .as_mut()
+                .ok_or(FsError::NoDevice)?
+                .poll(self.device.platform.now())
+                .inspect_err(|_| self.state.failed = true)?;
+            if !done {
+                self.device.platform.tick().await;
+                continue;
+            }
+            self.state
+                .cursor
+                .as_mut()
+                .expect("cursor")
+                .complete()
+                .inspect_err(|_| self.state.failed = true)?;
+            let state = &mut *self.state;
+            let dsb = state.dsb.as_mut().expect("cursor DSB");
+            stamp = Some(
+                dsb.stamp(self.device.platform.now())
+                    .inspect_err(|_| state.failed = true)?,
+            );
+            // Clear armed and restore status only after the independent live
+            // cursor witness. A retained idle transport is reusable by color;
+            // it must not be mistaken for an outstanding color transaction.
+            dsb.shutdown().inspect_err(|_| state.failed = true)?;
+        }
+        if let Some(cursor) = self.state.cursor.as_ref() {
+            cursor
+                .current_valid()
+                .inspect_err(|_| self.state.failed = true)?;
+        }
+        Ok(stamp)
+    }
+    fn cursor_refused_before_arm(&mut self) {
+        if self
+            .state
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| !cursor.exposed() && !cursor.active())
+        {
+            self.state.cursor = None;
+        }
+        if self.state.paused
+            && !self.state.failed
+            && self.state.presenter.is_none()
+            && self.state.color.is_none()
+            && !self.state.color_owned
+            && !self.state.color_unpublished
+            && !self.state.mixed_unpublished
+            && !self
+                .state
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.active())
+        {
+            self.device.platform.resume_console();
+            self.state.paused = false;
+        }
+    }
+    pub(crate) async fn cursor(
+        &mut self,
+        image: Option<Arc<GemObject>>,
+        replace: bool,
+        position: Option<(i32, i32)>,
+        timing: crate::intel_gpu_dsb::Timing,
+    ) -> Result<FlipStamp, FsError> {
+        self.cursor_inner(image, replace, position, timing, false)
+            .await
+    }
+    async fn cursor_inner(
+        &mut self,
+        image: Option<Arc<GemObject>>,
+        replace: bool,
+        position: Option<(i32, i32)>,
+        timing: crate::intel_gpu_dsb::Timing,
+        restoring: bool,
+    ) -> Result<FlipStamp, FsError> {
+        self.ownership_valid()?;
+        if self.device.generation != Generation::MeteorLake || !timing.valid() {
+            return Err(FsError::Unsupported);
+        }
+        if self
+            .state
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| !cursor.timing_matches(timing))
+        {
+            return Err(FsError::Unsupported);
+        }
+        if !restoring && (self.state.mixed_unpublished || self.state.color_unpublished) {
+            return Err(FsError::Busy);
+        }
+        self.finish_color().await?;
+        self.finish_pending().await?;
+        let profile = crate::intel_gpu_display_resources::Profile::capture_timing(
+            &self.device.platform,
+            timing,
+        )?;
+        self.device.platform.takeover(self.state.cursor.is_some())?;
+        if self.state.cursor.is_none() {
+            let cursor = crate::intel_gpu_cursor::Owner::new(
+                self.device.platform.clone(),
+                self.device.bar_len,
+                timing,
+            )?;
+            self.state.cursor = Some(cursor);
+        }
+        if !self.state.paused {
+            self.state.paused = true;
+            self.device.platform.pause_console().await;
+        }
+        if self.state.dsb.is_none() {
+            let reserved = crate::intel_gpu_dsb::Owner::reserve(
+                self.device.platform.clone(),
+                self.device.bar_len,
+            );
+            match reserved {
+                Ok(dsb) => self.state.dsb = Some(dsb),
+                Err(error) => {
+                    if error == FsError::Unsupported {
+                        self.cursor_refused_before_arm();
+                    } else {
+                        self.state.failed = true;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let staged = self.state.cursor.as_mut().expect("cursor").stage(
+            profile,
+            image.as_ref(),
+            replace,
+            position,
+        );
+        let regs = match staged {
+            Ok(regs) => regs,
+            Err(error) => {
+                if matches!(error, FsError::Unsupported | FsError::InvalidData) {
+                    self.cursor_refused_before_arm();
+                } else {
+                    self.state.failed = true;
+                }
+                return Err(error);
+            }
+        };
+        let arm = self.state.dsb.as_mut().expect("DSB").arm(
+            timing,
+            &regs,
+            None,
+            self.device.platform.now(),
+        );
+        if let Err(error) = arm {
+            if error == FsError::Unsupported {
+                self.state.cursor.as_mut().expect("cursor").cancel_unarmed();
+                self.cursor_refused_before_arm();
+            } else {
+                self.state.failed = true;
+            }
+            return Err(error);
+        }
+        self.finish_cursor().await?.ok_or(FsError::NoDevice)
+    }
+    async fn finish_color(&mut self) -> Result<Option<FlipStamp>, FsError> {
+        self.finish_cursor().await?;
+        loop {
+            self.ownership_valid()?;
+            if self.state.dsb.as_ref().is_some_and(|dsb| dsb.armed()) {
+                let ready = self
+                    .state
+                    .dsb
+                    .as_mut()
+                    .expect("DSB owner")
+                    .poll(self.device.platform.now())
+                    .inspect_err(|_| {
+                        self.state.failed = true;
+                    })?;
+                if !ready {
+                    self.device.platform.tick().await;
+                    continue;
+                }
+                if self
+                    .state
+                    .joint
+                    .as_ref()
+                    .is_some_and(|joint| joint.completion.is_none())
+                {
+                    let completion = self
+                        .state
+                        .presenter
+                        .as_mut()
+                        .expect("joint presenter")
+                        .poll(self.device.platform.now())
+                        .map_err(scanout_error)
+                        .inspect_err(|_| self.state.failed = true)?;
+                    let Some(completion) = completion else {
+                        self.device.platform.tick().await;
+                        continue;
+                    };
+                    self.state.joint.as_mut().expect("joint state").completion = Some(completion);
+                }
+                let stamp = self
+                    .state
+                    .dsb
+                    .as_ref()
+                    .expect("DSB owner")
+                    .stamp(self.device.platform.now())
+                    .inspect_err(|_| {
+                        self.state.failed = true;
+                    })?;
+                let state = &mut *self.state;
+                let update = state.dsb_update.as_ref().expect("DSB color image");
+                state
+                    .color
+                    .as_mut()
+                    .expect("color owner")
+                    .complete_dsb(&self.device.platform, update)
+                    .inspect_err(|_| {
+                        state.failed = true;
+                    })?;
+                self.state
+                    .dsb
+                    .as_mut()
+                    .expect("DSB owner")
+                    .shutdown()
+                    .inspect_err(|_| {
+                        self.state.failed = true;
+                    })?;
+                self.state.dsb_update = None;
+                let stamp = if let Some(joint) = self.state.joint.take() {
+                    let completion = joint.completion.expect("joint primary latch");
+                    if let Some(retired) = completion.retired {
+                        self.state
+                            .presenter
+                            .as_mut()
+                            .expect("joint presenter")
+                            .release(retired)
+                            .map_err(scanout_error)
+                            .inspect_err(|_| self.state.failed = true)?;
+                    }
+                    self.state.current = self.state.pending.take();
+                    completion.stamp
+                } else {
+                    stamp
+                };
+                return Ok(Some(stamp));
+            }
+
+            let Some(color) = self.state.color.as_mut() else {
+                return Ok(None);
+            };
+            if !color.pending() {
+                return Ok(None);
+            }
+            match color.poll(&self.device.platform, self.device.platform.now()) {
+                Ok(Some(stamp)) => return Ok(Some(stamp)),
+                Ok(None) => self.device.platform.tick().await,
+                Err(error) => {
+                    self.state.failed = true;
+                    return Err(error);
+                }
+            }
+        }
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) async fn set_ctm(
+        &mut self,
+        coefficients: Option<[u64; 9]>,
+    ) -> Result<FlipStamp, FsError> {
+        self.set_color(coefficients, None).await
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) async fn set_color(
+        &mut self,
+        coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+    ) -> Result<FlipStamp, FsError> {
+        self.set_color_with_dsb(coefficients, lut, None).await
+    }
+    pub(crate) async fn set_color_with_dsb(
+        &mut self,
+        coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        dsb_timing: Option<crate::intel_gpu_dsb::Timing>,
+    ) -> Result<FlipStamp, FsError> {
+        if self.state.mixed_unpublished {
+            return Err(FsError::Busy);
+        }
+        self.color_transaction(coefficients, lut, dsb_timing, None)
+            .await
+    }
+    pub(crate) async fn present_color(
+        &mut self,
+        object: Arc<GemObject>,
+        geometry: Geometry,
+        viewport: crate::intel_gpu_scanout::Viewport,
+        coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        timing: crate::intel_gpu_dsb::Timing,
+    ) -> Result<FlipStamp, FsError> {
+        self.check(geometry)?;
+        if self.state.color_unpublished || self.state.mixed_unpublished {
+            return Err(FsError::Busy);
+        }
+        if !object.is_wc() || !object.scanout() || object.is_vram() || object.is_userptr() {
+            return Err(FsError::Unsupported);
+        }
+        let (_, _, extent) = viewport.layout(geometry).map_err(scanout_error)?;
+        if extent > object.size() {
+            return Err(FsError::InvalidData);
+        }
+        self.color_transaction(
+            coefficients,
+            lut,
+            Some(timing),
+            Some(PrimaryTarget {
+                object,
+                geometry,
+                viewport,
+            }),
+        )
+        .await
+    }
+    async fn color_transaction(
+        &mut self,
+        coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        dsb_timing: Option<crate::intel_gpu_dsb::Timing>,
+        primary: Option<PrimaryTarget>,
+    ) -> Result<FlipStamp, FsError> {
+        self.ownership_valid()?;
+        self.finish_color().await?;
+        self.finish_pending().await?;
+        let previously_owned = self.state.color_owned;
+        let had_presenter = self.state.presenter.is_some();
+        let previous_mixed = self.state.mixed_unpublished;
+        if self.state.color.is_none() {
+            let owner = crate::intel_gpu_color::Owner::capture(
+                &self.device.platform,
+                self.device.generation,
+            )?;
+            self.state.color = Some(owner);
+        }
+        if !self.state.color_owned {
+            self.state.paused = true;
+            self.device.platform.pause_console().await;
+            if let Err(error) = self
+                .device
+                .platform
+                .color_takeover(self.state.cursor.is_some())
+            {
+                // The original was retained before pausing; no CSC write has
+                // occurred. Lost authority keeps the owner quarantined.
+                if self.device.platform.reset_lost() {
+                    self.state.failed = true;
+                } else {
+                    self.state.color = None;
+                    self.state.color_owned = false;
+                    if self.state.presenter.is_none()
+                        && !self
+                            .state
+                            .cursor
+                            .as_ref()
+                            .is_some_and(|cursor| cursor.active())
+                    {
+                        self.device.platform.resume_console();
+                        self.state.paused = false;
+                    }
+                }
+                return Err(error);
+            }
+            self.state.color_owned = true;
+        }
+        let unpublished = core::mem::replace(&mut self.state.color_unpublished, true);
+        let arm = if let Some(timing) = dsb_timing {
+            async {
+                self.device.platform.takeover(self.state.cursor.is_some())?; // live PAT/GT + PSR ownership
+                if self.state.dsb.is_none() {
+                    let dsb = crate::intel_gpu_dsb::Owner::reserve(
+                        self.device.platform.clone(),
+                        self.device.bar_len,
+                    )
+                    .map_err(|error| {
+                        if error == FsError::NotImplemented {
+                            FsError::Unsupported
+                        } else {
+                            error
+                        }
+                    })?;
+                    self.state.dsb = Some(dsb);
+                }
+                let surface = if let Some(PrimaryTarget {
+                    object,
+                    geometry,
+                    viewport,
+                }) = &primary
+                {
+                    self.start().await?;
+                    let id = self.prepare_surface(object.clone(), *geometry, *viewport)?;
+                    let ticket = self.ticket()?;
+                    self.state.pending = Some((object.clone(), id));
+                    self.state.mixed_unpublished = true;
+                    self.state.joint = Some(Joint {
+                        staged: false,
+                        completion: None,
+                    });
+                    let arm = self
+                        .state
+                        .presenter
+                        .as_mut()
+                        .expect("joint presenter")
+                        .stage_dsb(id, ticket, self.device.platform.now())
+                        .map_err(scanout_error)?;
+                    self.state.joint.as_mut().expect("joint state").staged = true;
+                    Some(arm)
+                } else {
+                    None
+                };
+                let mut update = self
+                    .state
+                    .color
+                    .as_mut()
+                    .expect("color owner")
+                    .prepare_dsb(&self.device.platform, coefficients, lut.clone())?;
+                if let Some(surface) = surface {
+                    update.registers.extend(surface);
+                }
+                self.state.dsb_update = Some(update);
+                let state = &mut *self.state;
+                let update = state.dsb_update.as_ref().expect("DSB color image");
+                state.dsb.as_mut().expect("DSB owner").arm(
+                    timing,
+                    &update.registers,
+                    update.lut(),
+                    self.device.platform.now(),
+                )
+            }
+            .await
+        } else {
+            self.state.color.as_mut().expect("color owner").arm_color(
+                &self.device.platform,
+                coefficients,
+                lut.clone(),
+                self.device.platform.now(),
+            )
+        };
+        if let Err(error) = arm {
+            // Unsupported is confined to preflight before this attempt
+            // writes command memory, PTEs, or controls. Preserve a parked
+            // installed BO/VA while unwinding this unexposed color update.
+            let prewrite = error == FsError::Unsupported
+                && self.state.dsb.as_ref().is_none_or(|dsb| !dsb.armed());
+            if prewrite {
+                self.rollback_joint_before_arm()?;
+                self.state.mixed_unpublished = previous_mixed;
+                if self.state.dsb.as_ref().is_some_and(|dsb| !dsb.exposed()) {
+                    self.state.dsb = None;
+                }
+                self.state.dsb_update = None;
+                self.state
+                    .color
+                    .as_mut()
+                    .expect("color owner")
+                    .cancel_dsb_before_arm();
+            }
+            // Owner's Unsupported branch is strictly before any IO: an
+            // abandoned LUT may still be active although Card never published
+            // it. Keep that uncertainty, but permit an explicit clear/restore.
+            // Palette/control writes and every other failure quarantine it.
+            if prewrite {
+                self.state.color_unpublished = unpublished;
+                if !previously_owned {
+                    // This owner captured only untouched inherited baseline;
+                    // no color arm/palette write was exposed by this attempt.
+                    self.state.color = None;
+                    self.state.color_owned = false;
+                    if self.state.presenter.is_none()
+                        && !self
+                            .state
+                            .cursor
+                            .as_ref()
+                            .is_some_and(|cursor| cursor.active())
+                    {
+                        self.device.platform.resume_console();
+                        self.state.paused = false;
+                    }
+                }
+                if !had_presenter && self.state.presenter.is_some() {
+                    self.restore_surface().await?;
+                }
+            } else {
+                self.state.failed = true;
+            }
+            return Err(error);
+        }
+        let stamp = self.finish_color().await?.ok_or(FsError::NoDevice)?;
+        if coefficients.is_none() && lut.is_none() {
+            self.state.color = None;
+            self.state.color_owned = false;
+            if self.state.presenter.is_none()
+                && self.state.paused
+                && !self
+                    .state
+                    .cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.active())
+            {
+                self.device.platform.resume_console();
+                self.state.paused = false;
+            }
+        }
+        Ok(stamp)
+    }
+    /// The KMS publisher calls this while still holding this session and its
+    /// final Card lock, after copying the hardware-complete CTM into Card.
+    pub(crate) fn confirm_ctm(&mut self) {
+        debug_assert!(self
+            .state
+            .color
+            .as_ref()
+            .is_none_or(|color| !color.pending()));
+        self.state.color_unpublished = false;
+        self.state.mixed_unpublished = false;
+    }
+    async fn restore_color(&mut self) -> Result<(), FsError> {
+        self.finish_color().await?;
+        if self.state.color.is_some() {
+            // Internal full restoration may clear color while keeping the
+            // mixed marker until independent primary restoration also ends.
+            self.color_transaction(None, None, None, None).await?;
+        }
+        self.state.color_unpublished = false;
+        Ok(())
+    }
     pub(crate) async fn wait_vblank(&mut self) -> Result<FlipStamp, FsError> {
-        if self.state.presenter.is_some() || self.state.failed {
+        if self.state.presenter.is_some() || self.state.failed || self.state.mixed_unpublished {
             return Err(FsError::Busy);
         }
         let start = self.device.platform.read32(0x70040);
@@ -675,4 +1650,4 @@ impl<M: Platform> Guard<'_, M> {
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_kms_tests.rs"]
-mod tests;
+pub(crate) mod tests;

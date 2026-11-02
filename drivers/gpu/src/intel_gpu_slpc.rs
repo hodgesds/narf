@@ -127,7 +127,7 @@ impl Limits {
         })
     }
 
-    fn validate(self, range: FrequencyRange) -> Result<(), SlpcError> {
+    pub(crate) fn validate(self, range: FrequencyRange) -> Result<(), SlpcError> {
         if range.min_mhz < self.min_mhz
             || range.max_mhz > self.max_mhz
             || range.min_mhz > range.max_mhz

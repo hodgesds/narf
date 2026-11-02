@@ -704,9 +704,17 @@ pub mod intel_gpu_audio;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_aux;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_ccs_control;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_color;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_context;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_cursor;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_ddi;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_display_resources;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_dmc;
 #[cfg(feature = "intel")]
@@ -714,9 +722,15 @@ pub mod intel_gpu_dp;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_dp_bridge;
 #[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_dsb;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_edp;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_engine;
+#[cfg(feature = "intel")]
+mod intel_gpu_error;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_eu_stall;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_exec;
 #[cfg(feature = "intel")]
@@ -727,6 +741,8 @@ pub mod intel_gpu_fence;
 pub mod intel_gpu_forcewake;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gem;
+#[cfg(feature = "intel")]
+pub(crate) mod intel_gpu_ggtt_ranges;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_gmbus;
 #[cfg(feature = "intel")]
@@ -750,6 +766,8 @@ pub mod intel_gpu_guc_firmware;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_guc_gt;
 #[cfg(feature = "intel")]
+pub mod intel_gpu_guc_log;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_guc_sched;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_guc_transport;
@@ -759,6 +777,8 @@ mod intel_gpu_guc_wa;
 pub mod intel_gpu_hdmi;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_hwconfig;
+#[cfg(feature = "intel")]
+mod intel_gpu_hwmon;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_kms;
 #[cfg(feature = "intel")]
@@ -781,6 +801,8 @@ pub mod intel_gpu_pipes;
 pub mod intel_gpu_pll;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_pm;
+#[cfg(feature = "intel")]
+pub mod intel_gpu_power_controls;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_ppgtt;
 #[cfg(feature = "intel")]

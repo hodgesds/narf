@@ -54,6 +54,9 @@ fn smoke_explicit_output_transaction_and_real_terminal_fence() -> TestResult {
     let platform = GtPlatform::Battlemage;
     let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
     prime(&mut gt, &w, 0xdfc);
+    // Each published engine retires a seed and a switch context. Preserve
+    // the no-consumption assertion without assuming a fixed engine count.
+    let first_user_id = (2 * gt.engines().unwrap().iter().count() + 1) as u16;
     let baseline = arena.live_allocations();
     let context = UserContext::new();
     let user = Fds::new();
@@ -85,7 +88,10 @@ fn smoke_explicit_output_transaction_and_real_terminal_fence() -> TestResult {
     let (id, fence) = gt
         .submit_user_batch_with_output(100, context.clone(), UserBatch(batch), &output)
         .unwrap();
-    assert_eq!(id, 5, "failed output transactions consumed an identity"); // after RCS+BCS priming
+    assert_eq!(
+        id, first_user_id,
+        "failed output transactions consumed an identity"
+    );
     assert_eq!(
         u64_at(&user.user.load(120, 8), 0),
         (17u64 << 32) | 0x76543210

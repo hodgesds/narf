@@ -78,6 +78,7 @@ pub const LEVEL_PT: u8 = 3;
 const TABLE_ENTRY_ALLOWED: u64 = PTE_PRESENT | PTE_RW | PTE_PHYS_MASK | PTE_PAT0 | PTE_PAT1;
 const PTE_NULL: u64 = 1 << 9; // MIT xe_gtt_defs.h: reads zero, writes discarded.
 pub(crate) const PTE_DM: u64 = 1 << 11; // XE_PPGTT_PTE_DM: device (local) memory.
+pub(crate) const PTE_PS64: u64 = 1 << 8; // Xe-HPG contiguous 64 KiB TLB hint.
 /// Bits a well-formed *leaf* entry may carry: every flag the
 /// GFX PTE definition assigns, plus the physical address.
 const LEAF_ENTRY_ALLOWED: u64 =
@@ -411,6 +412,8 @@ impl Ppgtt {
         let allowed = if level == LEVEL_PT {
             LEAF_ENTRY_ALLOWED
                 | PTE_NULL
+                | PTE_DM
+                | PTE_PS64
                 | if self.format == PteFormat::XeLpg {
                     PTE_PAT3
                 } else {
@@ -424,13 +427,16 @@ impl Ppgtt {
             return Err(WalkOutcome::Corrupt { level });
         }
         if level == LEVEL_PT && entry & PTE_NULL != 0 {
-            return Err(if phys == 0 {
+            return Err(if phys == 0 && entry & (PTE_DM | PTE_PS64) == 0 {
                 WalkOutcome::Null
             } else {
                 WalkOutcome::Corrupt { level }
             });
         }
-        if phys == 0 {
+        if entry & PTE_PS64 != 0 && (self.format != PteFormat::Gen12 || entry & PTE_DM == 0) {
+            return Err(WalkOutcome::Corrupt { level });
+        }
+        if phys == 0 && entry & PTE_DM == 0 {
             return Err(WalkOutcome::Corrupt { level });
         }
         Ok(phys)
@@ -495,6 +501,49 @@ impl Ppgtt {
             .encode_ppgtt(device_address, pat_index, writable)?
             | PTE_DM;
         self.map_encoded(mem, va, leaf)
+    }
+
+    /// Xe-HPG VRAM requires aligned, contiguous 64 KiB regions. Linux
+    /// xe_pt.c::xe_pt_stage_bind_entry uses sixteen ordinary 4 KiB PTEs,
+    /// each with PS64, when a compact whole-2MiB table is not selected.
+    /// This builder owns unpublished tables; no live GPU observes rollback.
+    pub fn map_device_64k_with_pat<M: PtMemory>(
+        &mut self,
+        mem: &mut M,
+        va: u64,
+        device_address: u64,
+        pat_index: u8,
+        writable: bool,
+    ) -> Result<(), PpgttError> {
+        if self.format != PteFormat::Gen12 || va & 65535 != 0 || device_address & 65535 != 0 {
+            return Err(PpgttError::Unaligned);
+        }
+        if va.checked_add(65536).is_none_or(|end| end > PPGTT_VA_SIZE) {
+            return Err(PpgttError::VaOutOfRange);
+        }
+        // Validate the entire physical extent before allocating any table.
+        self.format.encode_ppgtt(
+            device_address
+                .checked_add(61440)
+                .ok_or(PpgttError::PhysOutOfRange)?,
+            pat_index,
+            writable,
+        )?;
+        for lane in 0..16 {
+            let offset = lane * GTT_PAGE_SIZE;
+            let leaf = self
+                .format
+                .encode_ppgtt(device_address + offset, pat_index, writable)?
+                | PTE_DM
+                | PTE_PS64;
+            if let Err(error) = self.map_encoded(mem, va + offset, leaf) {
+                for old in (0..lane).rev() {
+                    let _ = self.unmap(mem, va + old * GTT_PAGE_SIZE);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     pub fn map_null<M: PtMemory>(
@@ -642,6 +691,23 @@ impl Ppgtt {
             }
         }
         let leaf = mem.read_entry(table, idx[LEVEL_PT as usize]);
+        let first = idx[LEVEL_PT as usize] & !15;
+        // A corrupted queried leaf may have lost its hint while another
+        // entry still identifies this as a contiguous 64 KiB group.
+        if leaf & PTE_PS64 != 0
+            || (self.format == PteFormat::Gen12
+                && (0..16).any(|i| mem.read_entry(table, first + i) & PTE_PS64 != 0))
+        {
+            let base = pte_phys(leaf) & !65535;
+            let flags = leaf & !PTE_PHYS_MASK;
+            if leaf & PTE_PS64 == 0
+                || (0..16).any(|i| {
+                    mem.read_entry(table, first + i) != ((base + i as u64 * GTT_PAGE_SIZE) | flags)
+                })
+            {
+                return Ok(WalkOutcome::Corrupt { level: LEVEL_PT });
+            }
+        }
         match self.follow(leaf, LEVEL_PT) {
             Ok(page) => Ok(WalkOutcome::Mapped(page | (va & 0xFFF))),
             Err(outcome) => Ok(outcome),

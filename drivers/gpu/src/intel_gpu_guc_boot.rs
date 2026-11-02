@@ -113,6 +113,13 @@ impl BootAllocator for crate::intel_gpu_rcs::SharedArena {
     }
 
     fn sync_for_cpu(&mut self, backing: &Self::Backing) -> Result<(), BootError> {
+        // This proof covers concurrent CPU/device shared cache lines. Live
+        // scheduler polling needs ordering, not repeated whole-LRC CLFLUSH.
+        // Unconfigured/legacy/ARM mappings still use exclusive invalidation.
+        if backing.coherent_for_device() {
+            fence(Ordering::Acquire);
+            return Ok(());
+        }
         // This destination was cleaned before publication and is CPU-read-only
         // afterwards, so no dirty CPU line can overwrite the device response.
         self.sync_for_device(backing)
@@ -200,7 +207,15 @@ pub struct GuCBoot<M: MmioWindow, A: BootAllocator> {
     scheduling: Option<crate::intel_gpu_guc_sched::SchedulingAds>,
     reload: bool,
     submission_version: (u8, u8, u8),
+    firmware_version: (u8, u8, u8),
+    incarnation: u64,
     workarounds: Option<GuCWorkarounds>,
+}
+
+pub(crate) struct LiveLog<'a, B> {
+    pub backing: &'a B,
+    pub firmware_version: (u8, u8, u8),
+    pub incarnation: u64,
 }
 
 impl<M: MmioWindow, A: BootAllocator> core::fmt::Debug for GuCBoot<M, A> {
@@ -230,6 +245,17 @@ fn extent(backing: &impl GpuBacking, pages: u32) -> Result<(), BootError> {
 impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
     pub(crate) fn submission_version(&self) -> (u8, u8, u8) {
         self.submission_version
+    }
+
+    pub(crate) fn live_log(&self) -> Option<LiveLog<'_, A::Backing>> {
+        if self.released || self.state != BootState::Ready || self.incarnation == 0 {
+            return None;
+        }
+        Some(LiveLog {
+            backing: &self.resources.logs,
+            firmware_version: self.firmware_version,
+            incarnation: self.incarnation,
+        })
     }
 
     pub fn stage(
@@ -354,6 +380,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             scheduling: None,
             reload: false,
             submission_version: image.submission_version,
+            firmware_version: image.version,
+            incarnation: 0,
             workarounds: None,
         })
     }
@@ -372,6 +400,13 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
 
     pub(crate) fn revision(&self) -> u8 {
         self.config.revision
+    }
+
+    pub(crate) fn diagnostic_allocator(&self) -> A
+    where
+        A: Clone,
+    {
+        self.resources.allocator.clone()
     }
 
     pub(crate) fn configure_cache(
@@ -608,6 +643,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         }
         let r = &mut *self.resources;
         let workarounds = self.workarounds.ok_or(BootError::State)?;
+        // Reset completion is independently verified before upload. No live
+        // firmware writes this BO now; never relabel previous-incarnation log
+        // bytes as output from the firmware about to start.
+        r.logs.zero_fill();
+        self.incarnation = crate::intel_gpu_guc_log::next_incarnation();
         // GuC is proven in reset. Publish bounded zero-length 16:16 KLVs,
         // the complete 64-bit ADS pointer and its byte count before DMA.
         for i in 0..PAGE / 4 {
@@ -632,6 +672,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         r.allocator.sync_for_device(&r.logs)?;
         let mut params = [0u32; 14];
         params[0] = r.logs.ggtt_offset() | 0x3f5;
+        if crate::intel_gpu_guc_log::stream::enabled() {
+            params[0] |= 1 << 1; // source half-full notifications; verbosity stays off
+        }
         params[1] = workarounds.flags;
         params[2] = if self.scheduling.is_some() {
             1 << 4
@@ -739,14 +782,24 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                         let config = self.scheduling.expect("scheduling reload");
                         let ads = &self.resources.ads;
                         let base = ads.ggtt_offset();
-                        // Populate only while GuC is proven stopped: RCS0 and
-                        // BCS0, each logical instance 0 of its GuC class.
+                        // Populate only while GuC is proven stopped. Mapping
+                        // uses dense logical instances, enable masks and
+                        // register-state headers use physical instances.
                         // xe_guc_ads.c mapping/enable masks, golden LRCA with
                         // its post-register state size, and per-engine saves.
                         // guc_policies_init: global_flags 0 lets GuC reset an
                         // engine whose context fails to preempt in time; the
                         // scheduler retires that context alone.
                         ads.write32(POLICIES + 76, 0);
+                        let engines = crate::intel_gpu_engine::EngineSet::from_bits(
+                            config
+                                .engines
+                                .iter()
+                                .enumerate()
+                                .fold(0, |bits, (i, state)| {
+                                    bits | if state.is_some() { 1 << i } else { 0 }
+                                }),
+                        );
                         for engine in crate::intel_gpu_engine::Engine::ALL {
                             let Some(state) = config.engines[engine.index()] else {
                                 continue;
@@ -754,12 +807,27 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                             let class = u64::from(engine.guc_class());
                             let base_reg = engine.base();
                             let saves = 0x2000 + engine.index() as u64 * 48;
-                            ads.write32(SYSINFO + class * 32, 0x20202000);
-                            ads.write32(SYSINFO + 512 + class * 4, 1);
-                            ads.write32(0x1014 + class * 4, state.golden);
-                            ads.write32(0x1054 + class * 4, state.bytes - 4096 - 96 * 4);
-                            ads.write32(class * 256, base + saves as u32);
-                            ads.write32(class * 256 + 4, 3);
+                            let logical = u64::from(
+                                engines.logical_instance(engine).expect("published engine"),
+                            );
+                            let physical = engine.physical_instance();
+                            let mapping = SYSINFO + class * 32 + logical / 4 * 4;
+                            let shift = (logical % 4) * 8;
+                            ads.write32(
+                                mapping,
+                                (ads.read32(mapping) & !(0xff << shift)) | physical << shift,
+                            );
+                            let enabled = SYSINFO + 512 + class * 4;
+                            ads.write32(enabled, ads.read32(enabled) | 1 << physical);
+                            // GuC's golden image is per class, not instance.
+                            // COPY0's identical class state remains its source.
+                            if logical == 0 {
+                                ads.write32(0x1014 + class * 4, state.golden);
+                                ads.write32(0x1054 + class * 4, state.bytes - 4096 - 96 * 4);
+                            }
+                            let header = class * 256 + u64::from(physical) * 8;
+                            ads.write32(header, base + saves as u32);
+                            ads.write32(header + 4, 3);
                             for (i, (reg, value, flags)) in [
                                 (base_reg + 0x29c, 0, 1),
                                 (base_reg + 0x80, state.hwsp, 0),
@@ -864,6 +932,12 @@ mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     type Words = Rc<RefCell<Vec<u32>>>;
+    #[derive(Clone)]
+    struct ParallelContext {
+        images: Vec<u32>,
+        scratch: u32,
+        enabled: bool,
+    }
     #[derive(Default)]
     struct Device {
         regs: BTreeMap<u64, u32>,
@@ -881,11 +955,35 @@ mod tests {
         coherent: bool,
         unstable_gmd: bool,
         gmd_reads: u32,
+        // Firmware-owned virtual-context routing, independent of the LRC's
+        // class template. Tests can request a different logical placement
+        // on the next restore, just as GuC may migrate a width-one context.
+        virtual_contexts: BTreeMap<u32, (u32, u32)>,
+        virtual_pick: Option<u32>,
+        virtual_restores: Vec<(u32, u32)>,
+        parallel_contexts: BTreeMap<u32, ParallelContext>,
+        parallel_lanes: Option<u8>,
+        parallel_reply_child: bool,
+        parallel_reply_lane: Option<u32>,
+        parallel_starts: Vec<(u32, u32)>,
+        parallel_join_hold: bool,
+        parallel_join_stores: Vec<(u32, u64, u64)>,
+        stream_controls: Vec<(u16, u16, u32)>,
+        stream_fences: BTreeSet<u16>,
+        stream_acks: usize,
+        stream_enabled: bool,
+        stream_drop: Option<(u16, u32)>,
+        stream_overwrite: bool,
+        mmio_reads: Cell<usize>,
     }
     #[derive(Clone)]
     struct Window(Rc<RefCell<Device>>);
     impl MmioWindow for Window {
         fn read32(&self, offset: u64) -> u32 {
+            {
+                let d = self.0.borrow();
+                d.mmio_reads.set(d.mmio_reads.get() + 1);
+            }
             if offset == 0xd8c {
                 let mut device = self.0.borrow_mut();
                 let value = *device.regs.get(&offset).unwrap_or(&0);
@@ -917,7 +1015,9 @@ mod tests {
                 0xd8c => *device.regs.get(&offset).unwrap_or(&0), // read-only GMD_ID
                 0xc050 | 0xc340 if !device.reject_wopcm => value | 1,
                 0xc314 | 0xa188 | 0xa278 | 0x20ec | 0x83b4 | 0xe48c | 0xe18c | 0xe4f4 | 0xe5f0
-                | 0xe420 | 0xe49c | 0xe4f0 | 0x20d4 | 0xe194 | 0xe4c4 | 0xe5f4 | 0x2050 => {
+                | 0xe420 | 0xe49c | 0xe4f0 | 0x20d4 | 0xe194 | 0xe4c4 | 0xe5f4 | 0x2050
+                | 0x220d4 | 0x22050 | 0x3ee0d4 | 0x3ee050 | 0x1a0d4 | 0x1a050 | 0x1c0d4
+                | 0x1c050 | 0x1e0d4 | 0x1e050 | 0x260d4 | 0x26050 | 0x14800 | 0x14804 => {
                     let mask = value >> 16;
                     let old = *device.regs.get(&offset).unwrap_or(&0);
                     if value == 0x00110011 {

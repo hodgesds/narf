@@ -149,13 +149,17 @@ pub struct DriCardFile {
     /// Per-open flip-complete queue. The event's opaque `user_data` belongs to
     /// this opener's address space, so it must never be visible to another
     /// compositor across a greeter-to-session handoff.
-    events: narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>,
+    events: Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>>,
     /// `OUT_FENCE_PTR` results of the last atomic commit: (user pointer,
     /// vblank deadline ns) pairs. The syscall layer drains these via
     /// [`FileOps::drm_take_out_fences`] right after the ioctl returns and
     /// mints the sync_file fds — fd tables belong to that layer, exactly
     /// like EXECBUFFER's FENCE_FD_OUT.
     pending_out_fences: narf_lib::sync::IrqSafeSpinLock<Vec<(u64, u64)>>,
+    /// Declared last so every per-file namespace drops before reconfiguration
+    /// can observe this open's final client lease gone.
+    #[cfg(feature = "intel")]
+    _intel_client: Option<crate::intel_gpu_ccs_control::ClientLease>,
 }
 
 /// Number of live `DriCardFile` (DRM master node) handles. When it falls
@@ -175,6 +179,8 @@ pub(crate) const NO_MASTER_OPEN_ID: u64 = 0;
 impl DriCardFile {
     pub(crate) fn new(index: u32) -> Option<Self> {
         let metadata = crate::drm_registry::node_metadata(index, false)?;
+        #[cfg(feature = "intel")]
+        let intel_client = crate::intel_gpu_ccs_control::client_open(index).ok()?;
         let open_id = NEXT_OPEN_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         LIVE_CARD_FILES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         // drm_master_open: the first opener of a master-free device becomes its
@@ -202,8 +208,12 @@ impl DriCardFile {
             #[cfg(feature = "amdgpu")]
             amdgpu_bo_lists: crate::amdgpu_bo_list::BoListTable::new(),
             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
-            events: narf_lib::sync::IrqSafeSpinLock::new(crate::drm::card::DrmEventQueue::new()),
+            events: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+                crate::drm::card::DrmEventQueue::new(),
+            )),
             pending_out_fences: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
+            #[cfg(feature = "intel")]
+            _intel_client: intel_client,
         })
     }
 
@@ -225,6 +235,8 @@ impl DriCardFile {
 
 impl Drop for DriCardFile {
     fn drop(&mut self) {
+        #[cfg(feature = "intel")]
+        self.events.lock().close();
         // Quiesce any virtio-gpu host resources this open created (Mesa may
         // build its render context + resources on the card node, not just the
         // render node — see the `virtgpu` field). Mirrors DriRenderFile::drop:
@@ -258,16 +270,19 @@ impl Drop for DriCardFile {
             ) {
                 // Drop cannot await. The display owner retains all fronts
                 // until this serialized restoration proves the console latch.
-                // A new master supersedes lastclose's request: never restore
-                // stale console pixels over its newly submitted primary.
+                // Master assignment may race this task. Both it and the new
+                // master's first transaction consume the same pending marker
+                // under this session, so stale close work cannot restore over
+                // a replacement master's already committed primary/color.
                 let _ = narf_scheduler::spawn_stackful(async move {
                     let Ok(mut session) = display.session().await else {
                         return;
                     };
-                    if mode.lock().has_master() {
-                        return;
-                    }
-                    let _ = session.restore_console().await;
+                    let _ = crate::drm_ioctl_bridge::intel_kms_restore_released_master(
+                        &mut session,
+                        &mode,
+                    )
+                    .await;
                 });
             }
         }
@@ -623,6 +638,7 @@ impl FileOps for DriCardFile {
                 context,
                 Some(&self.events),
                 Some(&self.pending_out_fences),
+                &self.intel.gem,
             )
             .await
             {
@@ -945,8 +961,8 @@ fn dma_buf_inode() -> narf_filesystem::inode_id::InodeId {
 }
 
 /// Intel same-card PRIME export. This owns CPU-mappable system pages only;
-/// no foreign-device attachment or imported sync-file fence is admitted while
-/// the Intel userspace engine is unavailable.
+/// foreign-device attachment stays refused. Sync-file imports join the shared
+/// reservation independently of current backend readiness.
 #[cfg(feature = "intel")]
 #[derive(Debug)]
 struct IntelPrimeDmaBufFile {
@@ -1037,6 +1053,19 @@ impl FileOps for IntelPrimeDmaBufFile {
                 DMA_BUF_SET_NAME_A | DMA_BUF_SET_NAME_B | DMA_BUF_IOCTL_EXPORT_SYNC_FILE
             ) {
                 return dma_buf_ioctl(&self.object.dma_buf, cmd, arg, context);
+            }
+            if cmd == DMA_BUF_IOCTL_IMPORT_SYNC_FILE {
+                let mut raw = [0; 8];
+                context.read(arg, &mut raw)?;
+                let flags = u32::from_le_bytes(raw[..4].try_into().unwrap()) as u64;
+                if flags & !DMA_BUF_SYNC_RW != 0 || flags & DMA_BUF_SYNC_RW == 0 {
+                    return Err(FsError::InvalidData);
+                }
+                let fd = i32::from_le_bytes(raw[4..].try_into().unwrap());
+                let fences = context.sync_file_fences(fd).ok_or(FsError::InvalidData)?;
+                self.object
+                    .import_fences(fences, flags & DMA_BUF_SYNC_WRITE != 0);
+                return Ok(0);
             }
             if cmd != DMA_BUF_IOCTL_SYNC {
                 return Err(FsError::Unsupported);
@@ -1454,6 +1483,9 @@ pub struct DriRenderFile {
     amdgpu_bo_lists: crate::amdgpu_bo_list::BoListTable,
     /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
     client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
+    /// Outlives GEM/VM/queue namespaces, including their destructor work.
+    #[cfg(feature = "intel")]
+    _intel_client: Option<crate::intel_gpu_ccs_control::ClientLease>,
 }
 
 impl Drop for DriRenderFile {
@@ -1854,6 +1886,18 @@ pub struct DriDir;
 
 impl DirOps for DriDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        #[cfg(feature = "intel")]
+        if let Some(file) = crate::intel_gpu_guc_log::stream::lookup(name) {
+            return Some(file);
+        }
+        #[cfg(feature = "intel")]
+        if let Some(file) = crate::intel_gpu_error::coredump::lookup(name) {
+            return Some(file);
+        }
+        #[cfg(feature = "intel")]
+        if let Some(file) = crate::intel_gpu_guc_log::lookup(name) {
+            return Some(file);
+        }
         // card<N>
         if let Some(rest) = name.strip_prefix("card") {
             if let Ok(idx) = rest.parse::<u32>() {
@@ -1870,6 +1914,8 @@ impl DirOps for DriDir {
                     let idx = render_idx - 128;
                     if (idx as usize) < crate::drm_registry::count() {
                         let metadata = crate::drm_registry::node_metadata(idx, true)?;
+                        #[cfg(feature = "intel")]
+                        let intel_client = crate::intel_gpu_ccs_control::client_open(idx).ok()?;
                         #[cfg(feature = "amdgpu")]
                         crate::amdgpu_navi48_runtime_pm::on_open(idx);
                         return Some(Arc::new(DriRenderFile {
@@ -1887,6 +1933,8 @@ impl DirOps for DriDir {
                             #[cfg(feature = "amdgpu")]
                             amdgpu_bo_lists: crate::amdgpu_bo_list::BoListTable::new(),
                             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
+                            #[cfg(feature = "intel")]
+                            _intel_client: intel_client,
                         }));
                     }
                 }
@@ -1907,6 +1955,19 @@ impl DirOps for DriDir {
         for idx in 0..count as u32 {
             all.push((format!("card{}", idx), FileType::Special));
             all.push((format!("renderD{}", idx + 128), FileType::Special));
+            #[cfg(feature = "intel")]
+            if crate::intel_gpu_guc_log::visible(idx) {
+                all.push((format!("guc-log{idx}"), FileType::File));
+                all.push((format!("guc-log-lfd{idx}"), FileType::File));
+            }
+            #[cfg(feature = "intel")]
+            if crate::intel_gpu_error::coredump::visible(idx) {
+                all.push((format!("devcoredump{idx}"), FileType::File));
+            }
+            #[cfg(feature = "intel")]
+            if crate::intel_gpu_guc_log::stream::visible(idx) {
+                all.push((format!("guc-log-stream{idx}"), FileType::Special));
+            }
         }
         all.into_iter().skip(cursor).take(max).collect()
     }
@@ -2211,25 +2272,41 @@ impl IntelGpuCard {
 
     /// Build the VRAM pool once from the GT's probed layout. The pool, and
     /// every allocation in it, outlives GT resets: local memory persists.
-    pub fn publish_gt_vram<M, A>(&self, gt: &crate::intel_gpu_guc_gt::GuCGt<M, A>)
+    pub fn publish_gt_vram<M, A>(
+        &self,
+        gt: &crate::intel_gpu_guc_gt::GuCGt<M, A>,
+    ) -> Result<(), FsError>
     where
         M: crate::intel_gpu_aux::MmioWindow,
         A: crate::intel_gpu_guc_boot::BootAllocator,
     {
+        let mut slot = self.vram.lock();
+        if slot.as_ref().is_some_and(|old| {
+            Some(old.layout) != gt.vram_layout()
+                || old.requires_ccs_clear() != gt.vram_needs_ccs_clear()
+        }) {
+            // Old GEM/VM objects can survive reset. Refuse the new execution
+            // epoch too: allocation-only refusal cannot protect their fetches.
+            return Err(FsError::NoDevice);
+        }
         let Some(layout) = gt.vram_layout() else {
-            return;
+            return Ok(());
         };
         let Some(bar) = *self.lmem_bar.lock() else {
-            return;
+            return Ok(());
         };
-        let mut slot = self.vram.lock();
-        if slot.as_ref().is_some_and(|old| old.layout != layout) {
-            return; // never re-derive ownership from a changed probe
-        }
         if slot.is_none() {
             // SAFETY: install_lmem_bar's ownership contract for this card.
-            *slot = unsafe { crate::intel_gpu_vram::Vram::new(bar, layout) }.ok();
+            *slot = unsafe {
+                if gt.vram_needs_ccs_clear() {
+                    crate::intel_gpu_vram::Vram::new_dg2(bar, layout)
+                } else {
+                    crate::intel_gpu_vram::Vram::new(bar, layout)
+                }
+            }
+            .ok();
         }
+        Ok(())
     }
 
     pub(crate) fn install_user_backend(

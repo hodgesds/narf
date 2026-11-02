@@ -670,8 +670,13 @@ fn smoke_userspace_i915_copy_engine_legacy_ring_and_engine_map() -> TestResult {
         file.dispatch(&info, abi::GEM_CONTEXT_SETPARAM, 64, &user),
         Some(Err(FsError::NotFound))
     );
-    // Load-balance extension (name 0) is not admitted; unknown names are EINVAL.
-    for (name, expected) in [(0u32, FsError::NotImplemented), (3, FsError::InvalidData)] {
+    // Balancing may fill only a hole; bonding/parallel are still refused.
+    for (name, expected) in [
+        (0u32, FsError::AlreadyExists),
+        (1, FsError::NotImplemented),
+        (2, FsError::NotImplemented),
+        (3, FsError::InvalidData),
+    ] {
         let mut extension = [0; 32];
         put32(&mut extension, 8, name);
         user.store(7168, &extension);
@@ -951,6 +956,32 @@ fn smoke_userspace_hung_job_is_retired_alone() -> TestResult {
             let base = registered[&u32::from(id)];
             model_runtime(&w, base, 0, 15_000_000, true);
             ready(&mut gt, HANG_TIMEOUT + 130);
+            // The snapshot precedes servicing the disable request, which can
+            // induce firmware engine reset. It owns no LRC/command addresses.
+            let diagnostic = gt
+                .take_error_report()
+                .expect("timeout capture before disable");
+            assert!(
+                gt.take_error_report().is_none(),
+                "capture was not consumed once"
+            );
+            let index = (0..crate::intel_gpu_error::MAX_CARDS as u32)
+                .rev()
+                .find(|index| crate::intel_gpu_error::snapshot(*index).is_none())
+                .expect("free diagnostic slot");
+            let stored = crate::intel_gpu_error::record(index, diagnostic);
+            let crate::intel_gpu_error::RecordResult::Stored(generation) = stored else {
+                panic!("diagnostic publication refused");
+            };
+            let report = crate::intel_gpu_error::snapshot(index).unwrap();
+            let text = report.text();
+            assert!(text.contains("reason=Timeout\n"));
+            assert!(text.contains(&alloc::format!("epoch={}\n", epoch.unwrap())));
+            assert!(text.contains(&alloc::format!("id={id} ")));
+            assert!(text.contains("phase=Running timed_out=1 reset=0 runtime_ticks=15000000"));
+            assert!(text.contains("register_access=Complete\n"));
+            assert!(!text.contains("lrca") && !text.contains("bbaddr"));
+            assert!(crate::intel_gpu_error::clear(index, generation));
             if reset {
                 event(&ct_memory(&w), 0x1008, &[u32::from(id)]);
             }
@@ -1347,6 +1378,99 @@ fn smoke_userspace_runtime_engine_watchdog_counts_short_completions() -> TestRes
 kernel_test_in!(
     "drivers/gpu/intel_gpu_user",
     smoke_userspace_runtime_engine_watchdog_counts_short_completions
+);
+
+fn smoke_userspace_i915_copy1_query_map_and_execution() -> TestResult {
+    use crate::intel_gpu_engine::Engine;
+    let platform = GtPlatform::Battlemage;
+    let (w, arena, mut gt) = hardware_model(platform, 0xdfc);
+    prime(&mut gt, &w, 0xdfc);
+    let backend = Arc::new(Mailbox {
+        status: IrqSafeSpinLock::new(Some(UserStatus {
+            epoch: gt.user_epoch().unwrap(),
+            platform,
+            submission_version: gt.submission_version(),
+            engines: gt.engines().unwrap(),
+        })),
+        pending: IrqSafeSpinLock::new(Vec::new()),
+    });
+    let info = DeviceInfo {
+        device_id: 0xe20b,
+        platform,
+        memory_bytes: 0x80000000,
+        hwconfig: None,
+        topology: None,
+        vram: None,
+        backend: Some(backend.clone()),
+    };
+    let file = RenderFile::new();
+    let user = User::new();
+    let mut query = [0; 16];
+    put32(&mut query, 0, 1);
+    put64(&mut query, 8, 1024);
+    let mut item = [0; 24];
+    put64(&mut item, 0, abi::QUERY_ENGINES);
+    user.store(64, &query);
+    user.store(1024, &item);
+    invoke(&file, &info, &user, abi::QUERY);
+    let size = u32_at(&user.load(1024, 24), 8);
+    assert_eq!(size, 16 + 3 * 56);
+    put32(&mut item, 8, size);
+    put64(&mut item, 16, 2048);
+    user.store(1024, &item);
+    invoke(&file, &info, &user, abi::QUERY);
+    let data = user.load(2048, size as usize);
+    assert_eq!(u32_at(&data, 0), 3);
+    assert!(data[4..16].iter().all(|byte| *byte == 0));
+    // Third i915 engine is COPY1; hardware instance8 is never its UABI name.
+    let copy1 = &data[16 + 2 * 56..16 + 3 * 56];
+    assert_eq!(&copy1[..4], &[1, 0, 1, 0]);
+    assert_eq!(u64_at(copy1, 8), 1);
+    assert_eq!(&copy1[24..26], &[1, 0]);
+    user.store(64, &[0; 8]);
+    invoke(&file, &info, &user, abi::GEM_CONTEXT_CREATE);
+    let context = u32_at(&user.load(64, 8), 0);
+    for instance in [2, 8] {
+        let param = engines_param(&user, context, &[(1, instance)], 8192);
+        user.store(64, &param);
+        assert_eq!(
+            file.dispatch(&info, abi::GEM_CONTEXT_SETPARAM, 64, &user),
+            Some(Err(FsError::NotFound))
+        );
+    }
+    let param = engines_param(&user, context, &[(1, 1)], 8192);
+    user.store(64, &param);
+    invoke(&file, &info, &user, abi::GEM_CONTEXT_SETPARAM);
+    let handles = buffers(&file, &info, &user);
+    let result = file.gem.object(handles[1]).unwrap();
+    exec(&user, handles, context);
+    set_ring(&user, 0);
+    let mut call = core::pin::pin!(file.dispatch_user(&info, abi::GEM_EXECBUFFER2_WR, 64, &user));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(call.as_mut().poll(&mut cx).is_pending());
+    let (selected, fence) = backend.accept(&mut gt, 200);
+    assert_eq!(selected.engine(), Engine::Bcs8);
+    assert_eq!(call.as_mut().poll(&mut cx), Poll::Ready(Some(Ok(0))));
+    let mut registered = BTreeMap::new();
+    for now in 201..260 {
+        assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+        service_contexts(&w, &mut registered, true);
+        if fence.result().is_some() {
+            break;
+        }
+    }
+    assert_eq!(fence.result(), Some(Ok(())));
+    let mut value = [0; 4];
+    result.read(0x80, &mut value).unwrap();
+    assert_eq!(u32::from_le_bytes(value), 0x4e415246);
+    hardware_stop(&mut gt, &w, 0xdfc);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_bcs8",
+    smoke_userspace_i915_copy1_query_map_and_execution
 );
 
 mod explicit {

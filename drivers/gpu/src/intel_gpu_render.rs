@@ -1,7 +1,7 @@
 //! Intel render-node UAPI over per-open GEM/context/VM namespaces.
 //!
-//! Production GuC cards select the native Xe ABI; the i915 compatibility
-//! profile remains available to legacy backends. Submission admission is
+//! Production GuC cards identify as Xe and accept its exact ioctl encodings
+//! plus the explicit i915 compatibility subset. Submission admission is
 //! independent of display admission.
 //! Unsupported acceleration is reported as such, never as a completed job.
 
@@ -100,7 +100,7 @@ struct Vm {
     _identity: u32,
 }
 
-type EngineMap = Vec<Option<crate::intel_gpu_engine::Engine>>;
+type EngineMap = Vec<Option<crate::intel_gpu_engine::EngineSet>>;
 
 /// One i915 context. Legacy rings select its RCS0/BCS0 states; a user
 /// engine map gives every slot its own hardware context, as i915 does.
@@ -169,10 +169,12 @@ fn read_engines(
     size: u32,
     value: u64,
 ) -> Result<EngineMap, FsError> {
-    use crate::intel_gpu_engine::Engine;
     if size < 8 || (size - 8) % 4 != 0 || (size - 8) / 4 > 64 {
         return Err(FsError::InvalidData);
     }
+    let present = info
+        .user_status()
+        .map_or_else(Default::default, |status| status.engines);
     let mut map = Vec::new();
     for n in 0..u64::from((size - 8) / 4) {
         let address = value.checked_add(8 + n * 4).ok_or(FsError::BadAddress)?;
@@ -183,20 +185,60 @@ fn read_engines(
             map.push(None);
             continue;
         }
-        let present = info
-            .user_status()
-            .map_or_else(Default::default, |status| status.engines);
-        let engine = Engine::ALL
-            .into_iter()
-            .find(|engine| engine.xe_class() == class && instance == 0)
-            .filter(|engine| present.contains(*engine))
+        let engine = present
+            .from_class_instance(class, instance)
             .ok_or(FsError::NotFound)?;
-        map.push(Some(engine));
+        map.push(Some(crate::intel_gpu_engine::EngineSet::of(&[engine])));
     }
     let extensions_at = u64_at(&read(user, value, 8)?, 0);
-    extensions(user, extensions_at, |_, name| match name {
-        // Load balancing, bonding and parallel submission are not admitted.
-        0..=2 => Err(FsError::NotImplemented),
+    extensions(user, extensions_at, |address, name| match name {
+        abi::CONTEXT_ENGINES_EXT_LOAD_BALANCE => {
+            // i915_gem_context.c::set_proto_ctx_engines_balance checks the
+            // destination slot before reading sibling count, flags or data.
+            let at = address.checked_add(32).ok_or(FsError::BadAddress)?;
+            let index = read(user, at, 2)?;
+            let index = usize::from(u16::from_le_bytes(index[..].try_into().unwrap()));
+            let slot = map.get_mut(index).ok_or(FsError::InvalidData)?;
+            if slot.is_some() {
+                return Err(FsError::AlreadyExists);
+            }
+            let count = read(user, at.checked_add(2).ok_or(FsError::BadAddress)?, 2)?;
+            let count = u16::from_le_bytes(count[..].try_into().unwrap());
+            let reserved = read(user, at.checked_add(4).ok_or(FsError::BadAddress)?, 12)?;
+            if reserved.iter().any(|byte| *byte != 0) {
+                return Err(FsError::InvalidData);
+            }
+            if count == 0 {
+                return Ok(());
+            }
+            let mut siblings = Vec::new();
+            for n in 0..u64::from(count) {
+                let at = address.checked_add(48 + n * 4).ok_or(FsError::BadAddress)?;
+                let entry = read(user, at, 4)?;
+                let class = u16::from_le_bytes(entry[..2].try_into().unwrap());
+                let logical = u16::from_le_bytes(entry[2..].try_into().unwrap());
+                let engine = present
+                    .from_class_instance(class, logical)
+                    .ok_or(FsError::InvalidData)?;
+                // GuC guc_create_virtual refuses duplicate siblings and mixed
+                // classes. Refuse before publishing an unusable proto-map.
+                // Distinct admitted siblings inherently bound this loop.
+                if siblings.contains(&engine)
+                    || siblings
+                        .first()
+                        .is_some_and(|first: &crate::intel_gpu_engine::Engine| {
+                            first.xe_class() != engine.xe_class()
+                        })
+                {
+                    return Err(FsError::InvalidData);
+                }
+                siblings.push(engine);
+            }
+            *slot = Some(crate::intel_gpu_engine::EngineSet::of(&siblings));
+            Ok(())
+        }
+        // Bonding and multi-LRC parallel submission need their own owners.
+        1 | 2 => Err(FsError::NotImplemented),
         _ => Err(FsError::InvalidData),
     })?;
     Ok(map)
@@ -243,8 +285,11 @@ impl Namespaces {
             let context = self.contexts.get_mut(&id).ok_or(FsError::NotFound)?;
             context.engines = Some(
                 map.into_iter()
-                    .map(|slot| slot.map(crate::intel_gpu_user::UserContext::for_engine))
-                    .collect(),
+                    .map(|slot| {
+                        slot.map(crate::intel_gpu_user::UserContext::for_placements)
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
             );
             return Ok(());
         }
@@ -410,13 +455,17 @@ impl RenderFile {
             )
             .await;
         }
-        if info.native_xe() {
+        if info.native_xe()
+            && (crate::intel_gpu_xe_uapi::driver_ioctl(cmd) || !abi::compatibility_ioctl(cmd))
+        {
             if matches!(
                 cmd,
                 crate::intel_gpu_xe_uapi::DEVICE_QUERY
+                    | crate::intel_gpu_xe_uapi::GEM_CREATE
                     | crate::intel_gpu_xe_uapi::VM_BIND
                     | crate::intel_gpu_xe_uapi::EXEC
                     | crate::intel_gpu_xe_uapi::WAIT_USER_FENCE
+                    | crate::intel_gpu_xe_uapi::OBSERVATION
             ) {
                 return self
                     .xe
@@ -637,7 +686,9 @@ impl RenderFile {
         arg: u64,
         user: &dyn IoctlContext,
     ) -> Option<Result<u64, FsError>> {
-        if cmd == crate::drm_uapi::DRM_IOCTL_VERSION && info.submission_ready() {
+        if cmd == crate::drm_uapi::DRM_IOCTL_VERSION
+            && (info.native_xe() || info.submission_ready())
+        {
             return Some(
                 version(arg, user, if info.native_xe() { b"xe" } else { b"i915" }).map(|()| 0),
             );
@@ -658,7 +709,9 @@ impl RenderFile {
                 Err(error) => return Some(Err(error)),
             }
         }
-        if info.native_xe() {
+        if info.native_xe()
+            && (crate::intel_gpu_xe_uapi::driver_ioctl(cmd) || !abi::compatibility_ioctl(cmd))
+        {
             return self.xe.dispatch(info, cmd, arg, user, &self.gem);
         }
         let nr = crate::drm_uapi::ioc_nr(cmd);
@@ -669,6 +722,81 @@ impl RenderFile {
             return None;
         }
         Some(self.ioctl(info, cmd, arg, user).map(|()| 0))
+    }
+
+    /// Read the immutable default SSEU image. On these >=Gen12 profiles Linux
+    /// refuses SSEU reconfiguration (only Gen11 supports set_proto_ctx_sseu).
+    /// Its old context ABI deliberately contains only an eight-bit DSS view;
+    /// full-width geometry/compute masks remain in QUERY_TOPOLOGY.
+    fn sseu_parameter(
+        &self,
+        info: &DeviceInfo,
+        request: &mut [u8],
+        set: bool,
+        user: &dyn IoctlContext,
+    ) -> Result<(), FsError> {
+        let context = {
+            let mut namespaces = self.namespaces.lock();
+            namespaces.initialize();
+            let context = namespaces
+                .contexts
+                .get_mut(&u32_at(request, 0))
+                .ok_or(FsError::NotFound)?;
+            if !set {
+                context.finalized = true;
+            }
+            context.clone()
+        };
+        let size = u32_at(request, 4);
+        if set {
+            return Err(if size < 32 {
+                FsError::InvalidData
+            } else {
+                FsError::NoDevice
+            });
+        }
+        if size == 0 {
+            put32(request, 4, 32);
+            return Ok(());
+        }
+        if size < 32 {
+            return Err(FsError::InvalidData);
+        }
+        let mut wire = read(user, u64_at(request, 16), 32)?;
+        let flags = u32_at(&wire, 4);
+        if flags & !1 != 0 || u32_at(&wire, 28) != 0 {
+            return Err(FsError::InvalidData);
+        }
+        let class = u16::from_le_bytes([wire[0], wire[1]]);
+        let instance = u16::from_le_bytes([wire[2], wire[3]]);
+        match context.engines.as_ref() {
+            Some(map) if flags == 1 => {
+                // lookup_user_engine ignores engine_class for indexed maps.
+                map.get(instance as usize)
+                    .and_then(Option::as_ref)
+                    .ok_or(FsError::InvalidData)?;
+            }
+            None if flags == 0 && matches!((class, instance), (0 | 1, 0)) => {}
+            _ => return Err(FsError::InvalidData),
+        }
+        let topology = observed_topology(info)?;
+        let eus = match topology.eu_type() {
+            crate::intel_gpu_topology::EuType::Simd8 => 16u16,
+            crate::intel_gpu_topology::EuType::Simd16 => 8,
+        };
+        // intel_sseu_from_device_info: default is whole-device; min/max are
+        // the architecture maximum, not an invented per-context fuse setting.
+        put64(&mut wire, 8, 1);
+        put64(
+            &mut wire,
+            16,
+            u64::from((topology.geometry_dss() | topology.compute_dss()) & 0xff),
+        );
+        wire[24..26].copy_from_slice(&eus.to_le_bytes());
+        wire[26..28].copy_from_slice(&eus.to_le_bytes());
+        user.write(u64_at(request, 16), &wire)?;
+        put32(request, 4, 32);
+        Ok(())
     }
 
     fn ioctl(
@@ -747,14 +875,17 @@ impl RenderFile {
                     return Err(FsError::InvalidData);
                 }
                 if cmd == abi::GEM_MMAP_OFFSET {
-                    // System RAM mappings are WB in NARF on both architectures.
-                    // Reject aliases with incompatible cache types, rather than
-                    // accepting WC and returning a WB mapping silently.
+                    // Compatibility supports only WB system mappings; native
+                    // Xe handles retain their own cache/memory placement.
                     if u64_at(&request, 16) != 2 || u64_at(&request, 24) != 0 {
                         return Err(FsError::InvalidData);
                     }
                 } else {
                     return Err(FsError::NotImplemented);
+                }
+                let object = self.gem.object(u32_at(&request, 0))?;
+                if object.is_wc() || object.is_vram() {
+                    return Err(FsError::InvalidData);
                 }
                 let offset = self.gem.mmap_offset(u32_at(&request, 0))?;
                 put64(&mut request, 8, offset);
@@ -795,7 +926,14 @@ impl RenderFile {
                     8
                 };
                 let mut request = read(user, arg, size)?;
-                self.gem.object(u32_at(&request, 0))?;
+                let object = self.gem.object(u32_at(&request, 0))?;
+                if matches!(cmd, abi::GEM_GET_CACHING | abi::GEM_SET_CACHING)
+                    && (object.is_wc() || object.is_vram())
+                {
+                    // This WB-only compatibility policy cannot retype or
+                    // describe a native object's explicit cache placement.
+                    return Err(FsError::Unsupported);
+                }
                 match cmd {
                     abi::GEM_SET_TILING if u32_at(&request, 4) != 0 || u32_at(&request, 8) != 0 => {
                         return Err(FsError::InvalidData)
@@ -847,6 +985,10 @@ impl RenderFile {
             abi::GEM_CONTEXT_GETPARAM | abi::GEM_CONTEXT_SETPARAM => {
                 let mut request = read(user, arg, 24)?;
                 let set = cmd == abi::GEM_CONTEXT_SETPARAM;
+                if u64_at(&request, 8) == 7 {
+                    self.sseu_parameter(info, &mut request, set, user)?;
+                    return user.write(arg, &request);
+                }
                 let engines = if set && u64_at(&request, 8) == abi::CONTEXT_PARAM_ENGINES {
                     // Check first, then copy without the namespace spinlock.
                     self.namespaces
@@ -1114,8 +1256,19 @@ fn create_extensions(user: &dyn IoctlContext, address: u64) -> Result<(), FsErro
     })
 }
 
+/// Immutable observed facts stay queryable after an owned GT stop; no query
+/// here reads MMIO or wakes firmware. MIT Linux b90c984d i915_getparam.c.
+fn observed_topology(info: &DeviceInfo) -> Result<&crate::intel_gpu_topology::GtTopology, FsError> {
+    info.topology
+        .as_deref()
+        .filter(|topology| topology.platform() == info.platform)
+        .ok_or(FsError::NoDevice)
+}
+
 fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
     Ok(match param {
+        // Obsolete UMS/DRI parameters are ENODEV in Linux, not fabricated zero.
+        1..=3 | 14 => return Err(FsError::NoDevice),
         4 => info.device_id as i32,
         5 => 1, // GEM storage is available independently of acceleration.
         9 | 11 | 25 | 26 | 37 | 44 | 48 | 49 | 50 | 53 | 55 => i32::from(info.submission_ready()),
@@ -1128,20 +1281,53 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
         }
         19 => 1, // GEM_WAIT supports the timeout wire request
         30 => 0, // legacy GEM_MMAP returns a CPU VA: not supported
-        40 => 4, // MMAP_OFFSET, WB only
-        // Explicitly absent features. Never claim unimplemented submission,
-        // reset, media, sync-file, cache domains, or context isolation support.
-        1..=3
-        | 6..=8
+        32 => i32::from(
+            info.backend
+                .as_ref()
+                .and_then(|backend| backend.device_facts())
+                .ok_or(FsError::NoDevice)?
+                .revision,
+        ),
+        33 => i32::try_from(observed_topology(info)?.dss_count()).map_err(|_| FsError::NoDevice)?,
+        34 => i32::try_from(observed_topology(info)?.eu_count()).map_err(|_| FsError::NoDevice)?,
+        40 => 4, // MMAP_OFFSET
+        // Only ENABLED: i915 priority configuration, busy stats, semaphore and
+        // preemption capability bits require their own implemented contracts.
+        41 => i32::from(info.submission_ready()),
+        46 | 47 => {
+            // xehp_sseu_info_init's software slice is not a legacy power-gating
+            // mask. Linux requires full topology queries from Xe_HP onward.
+            return Err(if info.platform.guc().is_some() {
+                FsError::InvalidData
+            } else {
+                FsError::NoDevice
+            });
+        }
+        51 => {
+            let frequency = info
+                .backend
+                .as_ref()
+                .and_then(|backend| backend.device_facts())
+                .ok_or(FsError::NoDevice)?
+                .reference_clock;
+            if frequency == 0 {
+                return Err(FsError::NoDevice);
+            }
+            i32::try_from(frequency).map_err(|_| FsError::NoDevice)?
+        }
+        // Explicitly absent features; do not advertise media, perf, USERPTR,
+        // secure dispatch, CPU coherency or unimplemented scheduler controls.
+        6..=8
         | 10
-        | 12..=17
+        | 12..=13
+        | 15..=17
         | 20..=24
         | 27..=29
         | 31
         | 35..=36
         | 38..=39
-        | 41..=43
-        | 45..=47
+        | 42..=43
+        | 45
         | 52
         | 54
         | 56..=59 => 0,
@@ -1192,18 +1378,21 @@ fn query(info: &DeviceInfo, arg: u64, user: &dyn IoctlContext) -> Result<(), FsE
             }
             let reply: Cow<'_, [u8]> = match id {
                 abi::QUERY_ENGINES => {
-                    // i915_query.c::query_engine_info in uabi class order:
-                    // RENDER then COPY, logical instance 0, no capabilities.
-                    // RENDER, COPY, COMPUTE share i915 and Xe class numbers.
-                    let engines: Vec<u16> = info.user_status().map_or_else(Vec::new, |status| {
-                        status.engines.iter().map(|e| e.xe_class()).collect()
-                    });
+                    // RENDER/COPY/COMPUTE share Xe's class numbers. Public
+                    // instances are dense within this exact physical set.
+                    let present = info
+                        .user_status()
+                        .map_or_else(Default::default, |status| status.engines);
+                    let engines: Vec<_> = present.iter().collect();
                     let mut reply = vec![0; 16 + engines.len() * 56];
                     put32(&mut reply, 0, engines.len() as u32);
-                    for (i, class) in engines.iter().enumerate() {
+                    for (i, engine) in engines.iter().enumerate() {
                         let entry = &mut reply[16 + i * 56..16 + (i + 1) * 56];
-                        entry[..2].copy_from_slice(&class.to_le_bytes());
+                        entry[..2].copy_from_slice(&engine.xe_class().to_le_bytes());
+                        let logical = present.logical_instance(*engine).expect("published engine");
+                        entry[2..4].copy_from_slice(&logical.to_le_bytes());
                         put64(entry, 8, 1); // I915_ENGINE_INFO_HAS_LOGICAL_INSTANCE
+                        entry[24..26].copy_from_slice(&logical.to_le_bytes());
                     }
                     Cow::Owned(reply)
                 }
@@ -2331,4 +2520,7 @@ pub(crate) mod tests {
     );
 
     include!("intel_gpu_sync_tests.rs");
+    mod discovery {
+        include!("intel_gpu_i915_info_tests.rs");
+    }
 }

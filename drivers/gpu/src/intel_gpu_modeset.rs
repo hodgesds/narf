@@ -283,6 +283,11 @@ pub enum ModesetError {
     /// Invalid plane geometry, pitch or GGTT range. Linear pitch must
     /// be nonzero, 64-byte aligned and cover the active row.
     InvalidFramebuffer,
+    /// Owned Xe-LPG RGB color setup could not prove Pipe A disabled, or
+    /// its bypass register writes did not read back. Leave the pipe off.
+    ColorPipelineUnavailable,
+    /// A fixed display resource request or pipe-off repartition failed.
+    DisplayResourceUnavailable,
 }
 
 /// A negotiated link configuration handed to
@@ -3136,7 +3141,7 @@ pub mod tests {
 /// Attempt to take over the display from UEFI GOP without disrupting
 /// the existing framebuffer mapping.
 pub fn takeover_display(gpu: &crate::intel_gpu::IntelGpu) -> Option<Mode> {
-    let window = crate::intel_gpu_edp::BarWindow(&gpu.gtt_mmadr);
+    let window = gpu.mode_window();
     takeover_display_with(&window, gpu.chip.generation)
 }
 

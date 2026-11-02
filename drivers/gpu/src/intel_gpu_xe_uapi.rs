@@ -14,6 +14,25 @@ pub const EXEC: u32 = iow(D, 0x49, 56);
 pub const WAIT_USER_FENCE: u32 = iowr(D, 0x4a, 72);
 pub const OBSERVATION: u32 = iow(D, 0x4b, 32);
 
+pub(crate) fn driver_ioctl(cmd: u32) -> bool {
+    matches!(
+        cmd,
+        DEVICE_QUERY
+            | GEM_CREATE
+            | GEM_MMAP_OFFSET
+            | VM_CREATE
+            | VM_DESTROY
+            | VM_BIND
+            | EXEC_QUEUE_CREATE
+            | EXEC_QUEUE_DESTROY
+            | EXEC_QUEUE_GET_PROPERTY
+            | EXEC
+            | WAIT_USER_FENCE
+            | OBSERVATION
+            | crate::intel_gpu_uapi::GEM_CLOSE
+    )
+}
+
 #[cfg(feature = "kernel-test")]
 mod tests {
     use super::*;

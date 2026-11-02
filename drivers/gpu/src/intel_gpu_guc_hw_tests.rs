@@ -6,6 +6,267 @@ mod userspace {
     include!("intel_gpu_user_tests.rs");
 }
 
+// Observation-only MCR bank around the unchanged GuC/GT model. All other
+// hardware transitions still pass through the real boot/scheduler helpers.
+#[derive(Default)]
+struct EuStallRegisters {
+    values: BTreeMap<(usize, u64), u32>,
+    lost: bool,
+}
+#[derive(Clone)]
+struct EuStallWindow {
+    inner: Window,
+    samplers: Rc<RefCell<EuStallRegisters>>,
+}
+impl MmioWindow for EuStallWindow {
+    fn read32(&self, offset: u64) -> u32 {
+        if matches!(offset, 0xe520 | 0xe524 | 0xe528 | 0xe52c | 0xe53c) {
+            let selector = self.inner.read32(0xfd4);
+            let dss = ((selector >> 8) & 15) as usize * 4 + (selector & 15) as usize;
+            let bank = self.samplers.borrow();
+            return if bank.lost {
+                u32::MAX
+            } else {
+                *bank.values.get(&(dss, offset)).unwrap_or(&0)
+            };
+        }
+        self.inner.read32(offset)
+    }
+    fn write32(&self, offset: u64, value: u32) {
+        if matches!(offset, 0xe520 | 0xe524 | 0xe528 | 0xe52c | 0xe53c) {
+            let selector = self.inner.read32(0xfd4);
+            assert_eq!(selector & 0x80000000, 0);
+            let dss = ((selector >> 8) & 15) as usize * 4 + (selector & 15) as usize;
+            let mut bank = self.samplers.borrow_mut();
+            let old = *bank.values.get(&(dss, offset)).unwrap_or(&0);
+            let next = if matches!(offset, 0xe528 | 0xe52c | 0xe53c) {
+                let mask = value >> 16;
+                (old & !mask) | (value & mask)
+            } else {
+                value
+            };
+            bank.values.insert((dss, offset), next);
+        }
+        self.inner.write32(offset, value);
+    }
+}
+fn eu_stall_gt() -> (EuStallWindow, Arena, GuCGt<EuStallWindow, Arena>, u32) {
+    let (inner, arena) = model();
+    inner.0.borrow_mut().regs.extend([
+        (0xdfc, 0),
+        (0xa188, 2),
+        (0xa278, 2),
+        (0xd84, 0),
+        (0xfd0, 1),
+        (0x913c, 5),
+        (0x9144, 6),
+        (0x9134, 5),
+        (0x9114, 0x10),
+        (0x9118, 1),
+        (0x138000, (18 << 16) | 180),
+        (0x13800c, 90),
+        (0x145998, (6 << 16) | 60),
+        (0x145ef0, 30 << 8),
+        (0xd8c, (20 << 22) | (1 << 14)),
+    ]);
+    let io = EuStallWindow {
+        inner,
+        samplers: Rc::new(RefCell::new(EuStallRegisters::default())),
+    };
+    let boot = GuCBoot::stage_image(
+        io.clone(),
+        arena.clone(),
+        GtPlatform::Battlemage,
+        CssImage::parse(&image(), 70).unwrap(),
+        BootConfig {
+            device_id: 0xe20b,
+            revision: 3,
+            huc_upload_bytes: 0,
+            uncached_mocs: Some(3),
+        },
+    )
+    .unwrap();
+    let mut gt = GuCGt::from_staged_hardware(boot).unwrap();
+    assert!(gt.eu_stall_info().is_none() && gt.user_epoch().is_none());
+    let initial = arena.live_allocations();
+    assert_eq!(
+        gt.prepare_eu_stall(60),
+        Err(narf_filesystem::FsError::Unsupported)
+    );
+    assert_eq!(arena.live_allocations(), initial);
+    hardware_discovery(&mut gt, &io.inner, 0xdfc);
+    let before: BTreeSet<_> = io.inner.0.borrow().memory.keys().copied().collect();
+    gt.prepare_eu_stall(60).unwrap();
+    let base = *io
+        .inner
+        .0
+        .borrow()
+        .memory
+        .keys()
+        .find(|base| !before.contains(*base))
+        .unwrap();
+    assert_eq!(
+        io.inner.0.borrow().memory[&base].borrow().len() * 4,
+        3 * 512 * 1024
+    );
+    let info = gt.eu_stall_info().unwrap();
+    assert_eq!((info.card, info.dss, info.per_group), (60, 7, 4));
+    assert!(gt.user_epoch().is_none());
+    hardware_scheduling(&mut gt, &io.inner);
+    assert!(
+        gt.user_epoch().is_none(),
+        "CT startup is not a verified execution epoch"
+    );
+    let completion = gt.begin_context_defaults(26).unwrap();
+    let mut registered = BTreeMap::new();
+    let mut invalidations = 0;
+    for now in 27..300 {
+        assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+        assert!(io.inner.0.borrow().memory.contains_key(&base));
+        if completion.result().is_some() {
+            break;
+        }
+        assert!(gt.user_epoch().is_none());
+        invalidations += service_contexts(&io.inner, &mut registered, true)
+            .iter()
+            .filter(|action| **action == 0x7000)
+            .count();
+    }
+    assert_eq!(completion.result(), Some(Ok(())));
+    assert!(invalidations >= 2 && registered.is_empty());
+    assert!(gt.user_epoch().is_some() && gt.idle());
+    assert!(!io
+        .inner
+        .0
+        .borrow()
+        .writes
+        .iter()
+        .any(|(reg, _)| *reg == 0xe520));
+    (io, arena, gt, base)
+}
+
+fn eu_stall_finish_stop(
+    gt: &mut GuCGt<EuStallWindow, Arena>,
+    io: &EuStallWindow,
+    base: u32,
+    now: u64,
+) {
+    // GuC reset and idle alone cannot retire an exposed sampler BO.
+    assert!(io.inner.0.borrow().memory.contains_key(&base));
+    reset_done(&io.inner);
+    assert!(gt.poll(now).is_pending());
+    assert_eq!(gt.state(), GtState::ResettingEngines);
+    assert!(io.inner.0.borrow().memory.contains_key(&base));
+    assert_eq!(io.inner.0.borrow().regs[&0x941c], 1);
+    assert!(gt.poll(now + 1).is_pending());
+    assert!(io.inner.0.borrow().memory.contains_key(&base));
+    reset_done(&io.inner); // independent GRDOM_FULL self-clear + DMA idle
+    assert!(gt.poll(now + 2).is_pending());
+    assert!(!io.inner.0.borrow().memory.contains_key(&base));
+    assert!(gt.eu_stall_info().is_none());
+    io.inner.0.borrow_mut().regs.insert(0xd84, 0);
+    assert!(gt.poll(now + 3).is_pending());
+    io.inner.0.borrow_mut().regs.insert(0xdfc, 0);
+    assert_eq!(gt.poll(now + 4), Poll::Ready(Ok(GtState::Stopped)));
+}
+
+fn smoke_hardware_eu_stall_preallocation_epoch_and_full_reset_retirement() -> TestResult {
+    use crate::intel_gpu_eu_stall::{Config, Operation, Session};
+    let (io, arena, mut gt, base) = eu_stall_gt();
+    let session = Session::new(gt.eu_stall_info().unwrap(), Config { rate: 4, wait: 1 }).unwrap();
+    gt.control_eu_stall(session.clone(), Operation::Attach, || true)
+        .unwrap();
+    gt.control_eu_stall(session.clone(), Operation::Enable, || true)
+        .unwrap();
+    assert!(!gt.idle());
+    for dss in 0..3 {
+        assert_eq!(io.samplers.borrow().values[&(dss, 0xe520)], base | 0x12);
+    }
+    let memory = io.inner.0.borrow().memory[&base].clone();
+    memory.borrow_mut()[..16].copy_from_slice(&[0x4e415246; 16]);
+    io.samplers.borrow_mut().values.insert((0, 0xe528), 4); //one64-byte record
+    gt.poll_eu_stall(500, || true);
+    let mut bytes = [0; 64];
+    assert_eq!(session.read_for_test(&mut bytes), Ok(64));
+    assert!(bytes
+        .chunks_exact(4)
+        .all(|word| word == 0x4e415246u32.to_le_bytes()));
+    let retained = arena.live_allocations();
+    gt.begin_stop(600).unwrap();
+    assert!(gt.user_epoch().is_none());
+    assert_eq!(
+        session.read_for_test(&mut bytes),
+        Err(narf_filesystem::FsError::NoDevice)
+    );
+    assert_eq!(arena.live_allocations(), retained);
+    assert!(gt.poll(601).is_pending());
+    assert!(io.inner.0.borrow().memory.contains_key(&base));
+    eu_stall_finish_stop(&mut gt, &io, base, 602);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_eu_stall_preallocation_epoch_and_full_reset_retirement
+);
+
+fn smoke_hardware_eu_stall_busy_mcr_and_authority_loss_escalate_with_dma_retained() -> TestResult {
+    use crate::intel_gpu_eu_stall::{Config, Operation, Session};
+    for failure in 0..3 {
+        let (io, arena, mut gt, base) = eu_stall_gt();
+        let session =
+            Session::new(gt.eu_stall_info().unwrap(), Config { rate: 4, wait: 1 }).unwrap();
+        gt.control_eu_stall(session.clone(), Operation::Attach, || true)
+            .unwrap();
+        gt.control_eu_stall(session.clone(), Operation::Enable, || true)
+            .unwrap();
+        if failure == 0 {
+            io.inner.0.borrow_mut().regs.insert(0xfd0, 0);
+        } else if failure == 1 {
+            io.samplers.borrow_mut().lost = true;
+        } else {
+            let reads = io.inner.0.borrow().mmio_reads.get();
+            gt.poll_eu_stall(550, || false);
+            assert_eq!(
+                io.inner.0.borrow().mmio_reads.get(),
+                reads,
+                "denied authority performed wake MMIO"
+            );
+            assert_eq!(
+                gt.control_eu_stall(session.clone(), Operation::Enable, || false),
+                Err(narf_filesystem::FsError::NoDevice)
+            );
+            assert_eq!(io.inner.0.borrow().mmio_reads.get(), reads);
+            assert!(!gt.idle());
+        }
+        let retained = arena.live_allocations();
+        gt.begin_stop(600).unwrap();
+        assert_eq!(
+            session.read_for_test(&mut [0; 64]),
+            Err(narf_filesystem::FsError::NoDevice)
+        );
+        assert!(gt.poll(601).is_pending());
+        if failure == 0 {
+            // A busy steering semaphore gets its bounded retry window; it
+            // cannot postpone the independent whole-GT reset indefinitely.
+            assert_eq!(io.inner.0.borrow().regs[&0xc000], 0x8000f000);
+            assert_eq!(arena.live_allocations(), retained);
+            assert!(gt.poll(50_000_601).is_pending());
+        }
+        assert!(io.inner.0.borrow().memory.contains_key(&base));
+        let reset_at = if failure == 0 { 50_000_602 } else { 602 };
+        eu_stall_finish_stop(&mut gt, &io, base, reset_at);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_gt",
+    smoke_hardware_eu_stall_busy_mcr_and_authority_loss_escalate_with_dma_retained
+);
+
 fn smoke_hardware_irq_notification_requires_actual_retirement() -> TestResult {
     for (platform, ack) in [
         (
@@ -203,7 +464,7 @@ fn hardware_model_with_interface(
     (window, arena, gt)
 }
 
-fn hardware_discovery(gt: &mut GuCGt<Window, Arena>, w: &Window, ack: u64) {
+fn hardware_discovery<M: MmioWindow + Clone>(gt: &mut GuCGt<M, Arena>, w: &Window, ack: u64) {
     gt.begin(0).unwrap();
     assert!(gt.poll(1).is_pending());
     w.0.borrow_mut().regs.insert(ack, 1);
@@ -402,7 +663,21 @@ kernel_test_in!(
     smoke_hardware_fuse_admission_before_dma_and_scheduling
 );
 
-fn hardware_scheduling_reload(gt: &mut GuCGt<Window, Arena>, w: &Window) {
+fn hardware_scheduling_reload<M: MmioWindow + Clone>(gt: &mut GuCGt<M, Arena>, w: &Window) {
+    hardware_scheduling_reload_mode(gt, w, 1);
+}
+fn hardware_scheduling_reload_mode<M: MmioWindow + Clone>(
+    gt: &mut GuCGt<M, Arena>,
+    w: &Window,
+    mode: u8,
+) {
+    // Firmware's old incarnation left bytes in this exact retained log BO.
+    // Scheduling reload must clear them only after proving GuC reset.
+    let logs = {
+        let d = w.0.borrow();
+        d.memory[&(d.regs[&0xc184] & !0xfff)].clone()
+    };
+    logs.borrow_mut().fill(0xa5a55a5a);
     let before = {
         let d = w.0.borrow();
         let ads = d.memory[&0x20001000].borrow();
@@ -412,7 +687,7 @@ fn hardware_scheduling_reload(gt: &mut GuCGt<Window, Arena>, w: &Window) {
             ads[0x3000 / 4..0x4000 / 4].to_vec(),
         )
     };
-    gt.begin_scheduling(12).unwrap();
+    gt.begin_scheduling_with_ccs_mode(12, mode).unwrap();
     assert_eq!(gt.state(), GtState::PreparingScheduling);
     assert!(gt.poll(12).is_pending());
     assert_eq!(gt.state(), GtState::StartingScheduling);
@@ -425,6 +700,10 @@ fn hardware_scheduling_reload(gt: &mut GuCGt<Window, Arena>, w: &Window) {
     assert!(gt.poll(16).is_pending());
     w.0.borrow_mut().regs.insert(0xc000, 0x8000f000);
     assert_eq!(gt.poll(17), Poll::Ready(Ok(GtState::Ready)));
+    assert!(
+        logs.borrow().iter().all(|word| *word == 0),
+        "reload retained stale firmware log bytes"
+    );
     {
         let d = w.0.borrow();
         let ads = d.memory[&0x20001000].borrow();
@@ -435,7 +714,7 @@ fn hardware_scheduling_reload(gt: &mut GuCGt<Window, Arena>, w: &Window) {
     }
 }
 
-fn hardware_scheduling(gt: &mut GuCGt<Window, Arena>, w: &Window) {
+fn hardware_scheduling<M: MmioWindow + Clone>(gt: &mut GuCGt<M, Arena>, w: &Window) {
     hardware_scheduling_reload(gt, w);
     gt.begin_ct(18).unwrap();
     for now in 19..25 {
@@ -651,7 +930,7 @@ fn smoke_hardware_register_initialization_gates_scheduling() -> TestResult {
         } else {
             gt.begin_scheduling(12).unwrap();
             let count = arena.live_allocations();
-            assert_eq!(count, before + 4); // HWSP + golden per RCS0/BCS0
+            assert_eq!(count, before + 6); // HWSP + golden per RCS0/BCS0/BCS8
             if failure == 1 {
                 w.0.borrow_mut().regs.insert(0xe7cc, u32::MAX);
                 assert_eq!(
@@ -843,7 +1122,9 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
             let control_fence = (words[1024 + head as usize] >> 16) as u16;
             assert_eq!(
                 request[0] >> 28,
-                if request[0] as u16 == 0x3003 && request[1] != 2 {
+                if matches!(request[0] as u16, 0x40 | 0x302)
+                    || (request[0] as u16 == 0x3003 && request[1] != 2)
+                {
                     0
                 } else {
                     2
@@ -865,26 +1146,144 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 event(&memory, 0x7001, &[request[1]]);
             }
             0x4502 => {
-                // GUC_RENDER/BLITTER/COMPUTE_CLASS for RCS0/BCS0/CCS0.
+                // GUC_RENDER/BLITTER/COMPUTE_CLASS for the admitted engines;
+                // physical BCS0/BCS8 share BLITTER with logical COPY0/COPY1.
                 assert!(matches!(request[3], 0 | 3 | 4));
                 assert_eq!(
                     &request[1..10],
-                    &[1, request[2], request[3], 1, 0, 0, 0, 0, 0]
+                    &[1, request[2], request[3], request[4], 0, 0, 0, 0, 0]
                 );
                 assert_eq!(request.len(), 12);
                 assert!(matches!(request[10] & 0xfff, 0x19 | 0x119));
                 let image = w.0.borrow().memory[&(request[10] & !0xfff)].clone();
                 assert_eq!(image.borrow()[1024 + 0x33] != 0, request[10] & 0x100 != 0);
                 let base = match request[3] {
+                    3 if request[4] & 1 == 0 => 0x3ee244,
                     3 => 0x22244,
-                    4 => 0x1a244,
+                    4 => {
+                        assert!(request[4] != 0 && request[4] <= 15);
+                        let logical = request[4].trailing_zeros() as usize;
+                        let ads = w.0.borrow().memory[&0x20001000].clone();
+                        let physical = (ads.borrow()[(0x123c + 128 + logical / 4 * 4) / 4]
+                            >> (logical % 4 * 8))
+                            & 255;
+                        [0x1a244, 0x1c244, 0x1e244, 0x26244][physical as usize]
+                    }
                     _ => 0x2244,
                 };
+                assert!(
+                    request[4] == 1
+                        || (request[3] == 3 && matches!(request[4], 2 | 3))
+                        || (request[3] == 4 && request[4] != 0 && request[4] <= 15)
+                );
                 assert_eq!(image.borrow()[1024 + 2], base);
                 assert_eq!(request[11], 0);
+                if request[4].count_ones() > 1 {
+                    assert!(w
+                        .0
+                        .borrow_mut()
+                        .virtual_contexts
+                        .insert(request[10] & !0xfff, (request[3], request[4]),)
+                        .is_none());
+                }
                 assert!(registered
                     .insert(request[2], request[10] & !0xfff)
                     .is_none());
+            }
+            0x4601 => {
+                // Independent width-parametric MULTI_LRC wire vector.
+                let width = request[10] as usize;
+                assert!((2..=4).contains(&width));
+                assert_eq!(request.len(), 11 + width * 2);
+                assert_eq!(request[1], 1);
+                assert!(matches!(request[3], 3 | 4));
+                assert_eq!(request[4].count_ones(), 1);
+                assert_eq!([request[6], request[8]], [0; 2]);
+                assert_eq!([request[7], request[9]], [request[5] + 1024, 1024]);
+                let images: Vec<_> = request[11..]
+                    .chunks_exact(2)
+                    .map(|descriptor| {
+                        assert_eq!((descriptor[0] & 0xfff, descriptor[1]), (0x119, 0));
+                        descriptor[0] & !0xfff
+                    })
+                    .collect();
+                {
+                    let d = w.0.borrow();
+                    assert!(d.synced.contains(&request[5]));
+                    let scratch = d.memory[&request[5]].borrow();
+                    assert_eq!(&scratch[..4], &[0, (width as u32 + 3) * 4, 0, 1]);
+                    assert!(scratch[4..256].iter().all(|word| *word == 0));
+                    let ads = d.memory[&0x20001000].borrow();
+                    let first_logical = request[4].trailing_zeros() as usize;
+                    for (lane, base) in images.iter().copied().enumerate() {
+                        let image = d.memory[&base].borrow();
+                        let logical = first_logical + lane;
+                        let physical = (ads
+                            [(0x123c + request[3] as usize * 32 + logical / 4 * 4) / 4]
+                            >> (logical % 4 * 8))
+                            & 255;
+                        let bank = if request[3] == 3 {
+                            match physical {
+                                0 => 0x22000,
+                                8 => 0x3ee000,
+                                _ => panic!("COPY physical"),
+                            }
+                        } else {
+                            [0x1a000, 0x1c000, 0x1e000, 0x26000][physical as usize]
+                        };
+                        assert_eq!(image[1026], bank + 0x244);
+                        assert_ne!(image[1024 + 0x33], 0);
+                        assert!(registered.insert(request[2] + lane as u32, base).is_none());
+                    }
+                }
+                assert!(w
+                    .0
+                    .borrow_mut()
+                    .parallel_contexts
+                    .insert(
+                        request[2],
+                        ParallelContext {
+                            images,
+                            scratch: request[5],
+                            enabled: false,
+                        }
+                    )
+                    .is_none());
+            }
+            0x1000 => {
+                assert_eq!(request.len(), 2);
+                let id = request[1];
+                let group = w.0.borrow().parallel_contexts[&id].clone();
+                assert!(group.enabled);
+                let width = group.images.len();
+                let lanes = {
+                    let d = w.0.borrow();
+                    let scratch = d.memory[&group.scratch].borrow();
+                    assert_eq!(&scratch[..4], &[0, (width as u32 + 3) * 4, 0, 1]);
+                    let parent = d.memory[&group.images[0]].borrow();
+                    assert_eq!(
+                        &scratch[256..260],
+                        &[
+                            ((width as u32 + 2) << 16) | 5,
+                            group.images[0] | 0x119,
+                            id | (parent[1024 + 7] / 8) << 18,
+                            0,
+                        ]
+                    );
+                    for (index, base) in group.images.iter().enumerate().skip(1) {
+                        let child = d.memory[base].borrow();
+                        assert_eq!(scratch[259 + index], child[1024 + 7] / 8);
+                    }
+                    d.parallel_lanes.unwrap_or((1 << width) - 1)
+                };
+                w.0.borrow().memory[&group.scratch].borrow_mut()[0] = (width as u32 + 3) * 4;
+                if execute {
+                    for (lane, base) in group.images.iter().copied().enumerate() {
+                        if lanes & (1 << lane) != 0 {
+                            execute_parallel_lane(w, id, base);
+                        }
+                    }
+                }
             }
             0x100b => {
                 assert!(matches!(request[3], 2 | 3));
@@ -898,9 +1297,32 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 let id = request[1];
                 let base = registered[&id];
                 let first = w.0.borrow().memory[&base].borrow()[1024 + 2];
-                if request[2] == 1 && execute && first == 0x22244 {
+                let parallel = w.0.borrow().parallel_contexts.contains_key(&id);
+                if parallel {
+                    w.0.borrow_mut()
+                        .parallel_contexts
+                        .get_mut(&id)
+                        .unwrap()
+                        .enabled = request[2] == 1;
+                    // Linux aliases every group ID for scheduler replies.
+                    let d = w.0.borrow();
+                    let reply = id
+                        + d.parallel_reply_lane
+                            .unwrap_or(u32::from(d.parallel_reply_child));
+                    assert!(reply < id + d.parallel_contexts[&id].images.len() as u32);
+                    drop(d);
+                    event(&memory, 0x1002, &[reply, request[2]]);
+                    continue;
+                }
+                if request[2] == 1 && execute {
+                    execute_virtual_restore(w, base, true);
+                }
+                if request[2] == 1 && execute && matches!(first, 0x22244 | 0x3ee244) {
                     execute_copy(w, base);
-                } else if request[2] == 1 && execute && first == 0x1a244 {
+                } else if request[2] == 1
+                    && execute
+                    && matches!(first, 0x1a244 | 0x1c244 | 0x1e244 | 0x26244)
+                {
                     execute_compute(w, base);
                 } else if request[2] == 1 && execute {
                     let mut d = w.0.borrow_mut();
@@ -980,15 +1402,231 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 event(&memory, 0x1002, &[id, request[2]]);
             }
             0x4503 => {
-                assert!(registered.remove(&request[1]).is_some());
-                event(&memory, 0x4600, &[request[1]]);
+                let base = registered.remove(&request[1]).expect("registered identity");
+                w.0.borrow_mut().virtual_contexts.remove(&base);
+                let group = w.0.borrow_mut().parallel_contexts.remove(&request[1]);
+                if let Some(group) = &group {
+                    assert!(!group.enabled);
+                    for (index, base) in group.images.iter().enumerate().skip(1) {
+                        assert_eq!(registered.remove(&(request[1] + index as u32)), Some(*base));
+                    }
+                }
+                let d = w.0.borrow();
+                let lane = if group.is_some() {
+                    d.parallel_reply_lane
+                        .unwrap_or(u32::from(d.parallel_reply_child))
+                } else {
+                    0
+                };
+                drop(d);
+                event(&memory, 0x4600, &[request[1] + lane]);
             }
+            0x40 | 0x302 | 0x30 => bcs8::stream_hw::service(w, &memory, control_fence, &request),
             0x3003 => service_slpc(w, &memory, control_fence, &request),
             0x3004 => assert_eq!(&request[1..], &[1]), // GUCRC_FIRMWARE_CONTROL
             _ => panic!("unexpected action {action:x}"),
         }
     }
     actions
+}
+
+// Hardware executes each private lane independently after GuC consumes the
+// shared WQ. Tests may withhold one lane without forging parent completion.
+fn execute_parallel_lane(w: &Window, id: u32, base: u32) {
+    let group = w.0.borrow().parallel_contexts[&id].clone();
+    let image = w.0.borrow().memory[&base].clone();
+    let (first, tail, ring) = {
+        let words = image.borrow();
+        (
+            words[1026],
+            words[1031],
+            w.0.borrow().memory[&words[1033]].clone(),
+        )
+    };
+    let split = ring.borrow()[..tail as usize / 4]
+        .iter()
+        .position(|word| *word == 0x0e40c002);
+    if image.borrow()[0x800 / 4] == 0 {
+        // Hardware can stop at a semaphore, after executing the complete
+        // payload and its first flush/breadcrumb. Decode that prefix through
+        // the unchanged class model; no child completion is synthesized.
+        if let Some(split) = split {
+            assert_eq!(base, group.images[0]);
+            image.borrow_mut()[1031] = split as u32 * 4;
+        }
+        w.0.borrow_mut().parallel_starts.push((id, base));
+        if matches!(first, 0x22244 | 0x3ee244) {
+            execute_copy(w, base);
+        } else {
+            execute_compute(w, base);
+        }
+        image.borrow_mut()[1031] = tail;
+    }
+    execute_parallel_join(w, id);
+}
+
+fn execute_parallel_join(w: &Window, id: u32) {
+    let d = w.0.borrow();
+    let group = d.parallel_contexts[&id].clone();
+    let image = d.memory[&group.images[0]].clone();
+    let image_words = image.borrow();
+    let tail = image_words[1031];
+    let ring = d.memory[&image_words[1033]].borrow();
+    let words = &ring[..tail as usize / 4];
+    let Some(start) = words.iter().position(|word| *word == 0x0e40c002) else {
+        return;
+    };
+    let scratch = d.memory[&group.scratch].clone();
+    if scratch.borrow()[128 / 4] != 0 || image_words[0x800 / 4] == 0 {
+        return;
+    }
+    let stamp = image_words[0x800 / 4];
+    let mut i = start;
+    for child in &group.images[1..] {
+        assert_eq!(&words[i..i + 4], &[0x0e40c002, stamp, child + 0x800, 0]);
+        if d.memory[child].borrow()[0x800 / 4] != stamp {
+            drop(image_words);
+            image.borrow_mut()[1029] = i as u32 * 4;
+            return;
+        }
+        i += 4;
+    }
+    if d.parallel_join_hold {
+        return;
+    }
+    assert_eq!(words[i], 0x04000000);
+    i += 1;
+    let copy = matches!(image_words[1026], 0x22244 | 0x3ee244);
+    if copy {
+        assert_eq!(&words[i..i + 4], &[0x13000002, 0, 0, 0]);
+        i += 4;
+    }
+    assert_eq!(words[i], 0x10200003);
+    let address = u64::from(words[i + 1]) | u64::from(words[i + 2]) << 32;
+    let value = u64::from(words[i + 3]) | u64::from(words[i + 4]) << 32;
+    let root = u64::from(image_words[1073]) << 32 | u64::from(image_words[1075]);
+    i += 5;
+    if copy {
+        assert_eq!(
+            &words[i..i + 4],
+            &[0x13004002, (group.scratch + 128) | 4, 0, stamp]
+        );
+        i += 4;
+    } else {
+        assert_eq!(
+            &words[i..i + 7],
+            &[0, 0x7a000004, 0x01104080, group.scratch + 128, 0, stamp, 0]
+        );
+        i += 7;
+    }
+    assert_eq!(&words[i..i + 3], &[0x01000000, 0x04000001, 0x02800000]);
+    assert!(words[i + 3..].iter().all(|word| *word == 0));
+    let mut page = root & 0x0000_3fff_ffff_f000;
+    assert_eq!(address & 7, 0);
+    for shift in [39, 30, 21, 12] {
+        let table = narf_memory::PhysAddr::new(page).kernel_ptr::<u64>();
+        // SAFETY: real resident production PPGTT pages remain owned by the
+        // group; this independent decoder never dereferences user pointers.
+        let entry =
+            unsafe { core::ptr::read_volatile(table.add(((address >> shift) & 511) as usize)) };
+        assert_eq!(entry & 3, 3, "user fence requires a present writable leaf");
+        page = entry & 0x0000_3fff_ffff_f000;
+        if shift == 12 && entry & (1 << 11) != 0 {
+            let cpu = FIXTURE_VRAM.load(core::sync::atomic::Ordering::Relaxed);
+            assert_ne!(cpu, 0);
+            page += cpu;
+        }
+    }
+    let target = narf_memory::PhysAddr::new(page | (address & 4095)).kernel_mut_ptr::<u64>();
+    // SAFETY: the walk above proved one aligned owned writable qword. The
+    // single GPU store follows every independently fetched child semaphore.
+    unsafe { core::ptr::write_volatile(target, value) };
+    scratch.borrow_mut()[128 / 4] = stamp;
+    drop(image_words);
+    image.borrow_mut()[1029] = tail;
+    drop(ring);
+    drop(d);
+    w.0.borrow_mut()
+        .parallel_join_stores
+        .push((id, address, value));
+}
+
+// Independent GuC choice plus hardware restore execution. The production
+// driver supplies only the logical mask; the model chooses the last allowed
+// engine by default, deliberately different from the first LRC template.
+fn execute_virtual_restore(w: &Window, base: u32, start_ring: bool) {
+    let mut d = w.0.borrow_mut();
+    let Some(&(class, mask)) = d.virtual_contexts.get(&base) else {
+        return;
+    };
+    let logical = d.virtual_pick.unwrap_or(31 - mask.leading_zeros());
+    assert_ne!(
+        mask & (1 << logical),
+        0,
+        "GuC choice outside registered mask"
+    );
+    let physical = if class == 3 {
+        assert!(logical <= 1);
+        logical * 8
+    } else {
+        assert_eq!(class, 4);
+        let ads = d.memory[&0x20001000].borrow();
+        (ads[(0x123c + 128 + logical as usize / 4 * 4) / 4] >> (logical % 4 * 8)) & 255
+    };
+    let receipt = physical << 4 | if class == 4 { 5 } else { 3 };
+    let image = d.memory[&base].clone();
+    let mut image = image.borrow_mut();
+    assert_eq!(image[1024 + 0x13], base + 0x901);
+    assert_eq!(
+        &image[0x900 / 4..0x920 / 4],
+        &[
+            0x12480002,
+            0x8c,
+            base + 0x818,
+            0,
+            0x10400002,
+            base + 0x108c,
+            0,
+            1,
+        ]
+    );
+    if d.regs[&0xd8c] >> 22 == 20 {
+        assert_eq!(
+            &image[0x920 / 4..0x934 / 4],
+            &[0x10400002, base + 0x1094, 0, 0, 0x05000000,]
+        );
+    } else {
+        assert_eq!(image[0x920 / 4], 0x05000000);
+    }
+    image[0x818 / 4] = receipt;
+    image[0x108c / 4] = 1;
+    if start_ring {
+        let ring = d.memory[&image[1024 + 9]].borrow();
+        assert_eq!(&ring[..4], &[0x12480002, 0x3a8, base + 0x810, 0]);
+        let (address, stamp) = if class == 3 {
+            assert_eq!(ring[6], 0x13044002);
+            (ring[7] & !7, ring[9])
+        } else {
+            assert_eq!(ring[4], 0x10400002);
+            (ring[5], ring[7])
+        };
+        assert_eq!(address, base + 0x808);
+        assert_ne!(stamp, 0);
+        image[0x808 / 4] = stamp;
+        image[0x810 / 4] = 0;
+    }
+    let engine_base = if class == 3 {
+        if physical == 8 {
+            0x3ee000
+        } else {
+            0x22000
+        }
+    } else {
+        [0x1a000, 0x1c000, 0x1e000, 0x26000][physical as usize]
+    };
+    d.regs.insert(engine_base + 0x240, base);
+    d.regs.insert(engine_base + 0x3a8, 1_000_000);
+    d.virtual_restores.push((base, receipt));
 }
 
 // Independent BCS0 model from Linux xe_lrc.c {gen12_xcs,xe2_bcs}_offsets,
@@ -998,6 +1636,11 @@ fn execute_copy(w: &Window, base: u32) {
     assert!(d.synced.contains(&base));
     let xe2 = d.regs[&0xd8c] >> 22 == 20;
     let image = d.memory[&base].clone();
+    let engine = match image.borrow()[1026] {
+        0x22244 => 0x22000,
+        0x3ee244 if xe2 => 0x3ee000,
+        _ => panic!("unsupported copy register bank"),
+    };
     let (tail, ring_base) = {
         let data = image.borrow();
         assert_eq!(data.len(), 2048);
@@ -1006,15 +1649,15 @@ fn execute_copy(w: &Window, base: u32) {
             &[
                 0,
                 if xe2 { 0x1108101d } else { 0x11081019 },
-                0x22244,
+                engine + 0x244,
                 data[1027],
-                0x22034,
+                engine + 0x34,
                 0,
-                0x22030
+                engine + 0x30
             ]
         );
         assert!(matches!(data[1027], 0x00090009 | 0x00090008));
-        assert_eq!((data[1032], data[1024 + 0x21]), (0x22038, 0x11081011));
+        assert_eq!((data[1032], data[1024 + 0x21]), (engine + 0x38, 0x11081011));
         assert_eq!(data[1024 + 0x71], 0x01000000);
         (data[1024 + 7], data[1024 + 9])
     };
@@ -1065,14 +1708,14 @@ fn execute_copy(w: &Window, base: u32) {
         // RING_CMD_CCTL is pinned per platform by the RCS tests; BCS0's ring
         // and BLIT_CCTL must use the same uncached MOCS index.
         let cctl = d.regs[&0x20c4];
-        assert_eq!(d.regs[&0x220c4], cctl);
+        assert_eq!(d.regs[&u64::from(engine + 0xc4)], cctl);
         let uc = (cctl >> 1) & 0x3f;
         assert_eq!(cctl, 0x3f7e0000 | uc << 8 | uc << 1);
         assert_eq!(
             &words[1..28],
             &[
                 0x15080001,
-                0x22204,
+                (engine + 0x204),
                 0x600,
                 0x11080003,
                 0x608,
@@ -1090,7 +1733,7 @@ fn execute_copy(w: &Window, base: u32) {
                 0x18000031,
                 0x15040001,
                 0x600,
-                0x22204,
+                (engine + 0x204),
                 0x11080005,
                 0x600,
                 0,
@@ -1100,9 +1743,13 @@ fn execute_copy(w: &Window, base: u32) {
                 0,
             ]
         );
-        let old = d.regs.get(&0x22204).copied().unwrap_or(0xffff_ffff);
+        let old = d
+            .regs
+            .get(&u64::from(engine + 0x204))
+            .copied()
+            .unwrap_or(0xffff_ffff);
         let value = (old & !0x7e7e) | uc << 9 | uc << 1;
-        d.regs.insert(0x22204, value);
+        d.regs.insert(u64::from(engine + 0x204), value);
         if xe2 {
             // xe2_bcs_offsets saves BLIT_CCTL in the context image.
             image.borrow_mut()[1024 + 0x45] = value;
@@ -1136,14 +1783,16 @@ fn execute_copy_ppgtt(root: u64, words: &[u32]) {
     let mut i = 0;
     if words[0] == 0x18800101 {
         let batch = u64::from(words[1]) | u64::from(words[2]) << 32;
-        let code = narf_memory::PhysAddr::new(walk(batch)).kernel_ptr::<u32>();
-        // SAFETY: translated page is an owned resident batch BO.
-        let cmd = unsafe { core::slice::from_raw_parts(code, 6) };
-        assert_eq!((cmd[0], cmd[4], cmd[5]), (0x10000002, 0x05000000, 0));
-        let dst = u64::from(cmd[1]) | u64::from(cmd[2]) << 32;
-        let target = narf_memory::PhysAddr::new(walk(dst)).kernel_mut_ptr::<u32>();
-        // SAFETY: the walk resolved one owned writable result dword.
-        unsafe { core::ptr::write_volatile(target, cmd[3]) };
+        if !crate::intel_gpu_exec::vram_clear::execute_fixture(root, batch) {
+            let code = narf_memory::PhysAddr::new(walk(batch)).kernel_ptr::<u32>();
+            // SAFETY: translated page is an owned resident batch BO.
+            let cmd = unsafe { core::slice::from_raw_parts(code, 6) };
+            assert_eq!((cmd[0], cmd[4], cmd[5]), (0x10000002, 0x05000000, 0));
+            let dst = u64::from(cmd[1]) | u64::from(cmd[2]) << 32;
+            let target = narf_memory::PhysAddr::new(walk(dst)).kernel_mut_ptr::<u32>();
+            // SAFETY: the walk resolved one owned writable result dword.
+            unsafe { core::ptr::write_volatile(target, cmd[3]) };
+        }
         i = 3;
     }
     assert_eq!(words[i], 0x04000000);
@@ -1173,16 +1822,31 @@ fn execute_compute(w: &Window, base: u32) {
     let d = w.0.borrow();
     assert!(d.synced.contains(&base));
     let image = d.memory[&base].clone();
+    let engine = match image.borrow()[1026] {
+        0x1a244 => 0x1a000u32,
+        0x1c244 => 0x1c000,
+        0x1e244 => 0x1e000,
+        0x26244 => 0x26000,
+        _ => panic!("unknown physical compute LRC"),
+    };
     let (tail, ring_base, root) = {
         let data = image.borrow();
         assert_eq!(
             &data[1024..1031],
-            &[0, 0x1108101d, 0x1a244, data[1027], 0x1a034, 0, 0x1a030]
+            &[
+                0,
+                0x1108101d,
+                engine + 0x244,
+                data[1027],
+                engine + 0x34,
+                0,
+                engine + 0x30
+            ]
         );
         assert!(matches!(data[1027], 0x00090009 | 0x00090008));
         assert_eq!(
             (data[1032], data[1024 + 0x1c], data[1024 + 0x21]),
-            (0x1a038, 0x1a120, 0x11081011)
+            (engine + 0x38, engine + 0x120, 0x11081011)
         );
         assert_eq!(data[1024 + 0x71], 0x01000000);
         (
@@ -1204,7 +1868,14 @@ fn execute_compute(w: &Window, base: u32) {
     };
     if root != 0 {
         let regs = d.regs.clone();
-        execute_ppgtt_probe(&regs, &image.borrow(), &ring, stamp, base, true);
+        execute_ppgtt_probe(
+            &regs,
+            &image.borrow(),
+            &ring[..tail as usize / 4],
+            stamp,
+            base,
+            true,
+        );
     } else if tail != 32 {
         // ARB_ON, then the optional Xe2 WMTP level, then the compute flush.
         let seed = &words[1..];
@@ -1213,7 +1884,7 @@ fn execute_compute(w: &Window, base: u32) {
             .position(|w| *w == 0x7a000204)
             .expect("compute flush");
         let commands = &seed[..flush - if d.regs[&0xd8c] >> 22 == 20 { 0 } else { 6 }];
-        assert!(commands.is_empty() || commands == [0x11000001, 0x1a580, 0x00060002]);
+        assert!(commands.is_empty() || commands == [0x11000001, engine + 0x580, 0x00060002]);
         assert_eq!(seed[flush + 1], 0x001000a0);
     }
     image.borrow_mut()[0x800 / 4] = stamp;
@@ -1290,9 +1961,18 @@ fn execute_ppgtt_probe(
     if pat == 3 {
         expected.extend_from_slice(&[0x11020001, 0x4208, 1, 0]);
     }
-    let has_batch = ring.windows(2).any(|w| w == [0x02800100, 0x18800101]);
-    if has_batch {
-        expected.extend_from_slice(&[0x02800100, 0x18800101, 0, 0x1234, 0x04000000]);
+    let batch = ring
+        .windows(4)
+        .find(|w| w[..2] == [0x02800100, 0x18800101])
+        .map(|w| u64::from(w[2]) | u64::from(w[3]) << 32);
+    if let Some(address) = batch {
+        expected.extend_from_slice(&[
+            0x02800100,
+            0x18800101,
+            address as u32,
+            (address >> 32) as u32,
+            0x04000000,
+        ]);
     }
     if pat == 0 || pat == 3 {
         expected.extend_from_slice(&[0x7a000004, 1, 0xd0, 0, 0, 0]);
@@ -1327,19 +2007,19 @@ fn execute_ppgtt_probe(
     assert_eq!(image[1031] as usize, expected.len() * 4);
     assert_eq!(&ring[..expected.len()], expected.as_slice());
     // Literal batch from xe_mi_commands.h, independent of the producer's codec.
-    if has_batch {
-        let code = narf_memory::PhysAddr::new(walk(0x1234_0000_0000, false)).kernel_ptr::<u32>();
-        for (i, word) in [0x10000002, 0x80, 0x2345, 0x4e415246, 0x05000000, 0]
-            .into_iter()
-            .enumerate()
-        {
-            // SAFETY: translated page is owned by the resident fixture.
-            assert_eq!(unsafe { core::ptr::read_volatile(code.add(i)) }, word);
-        }
-        let target =
-            narf_memory::PhysAddr::new(walk(0x2345_0000_0080, true)).kernel_mut_ptr::<u32>();
-        // SAFETY: the validated writable leaf is an owned private result page.
-        unsafe { core::ptr::write_volatile(target, 0x4e415246) };
+    if let Some(address) = batch {
+        let code = narf_memory::PhysAddr::new(walk(address, false)).kernel_ptr::<u32>();
+        // SAFETY: each native fixture places this six-DW batch inside one
+        // resident code page. Fetch and decode independently of its producer.
+        let commands = unsafe { core::slice::from_raw_parts(code, 6) };
+        assert_eq!(
+            (commands[0], commands[4], commands[5]),
+            (0x10000002, 0x05000000, 0)
+        );
+        let destination = u64::from(commands[1]) | u64::from(commands[2]) << 32;
+        let target = narf_memory::PhysAddr::new(walk(destination, true)).kernel_mut_ptr::<u32>();
+        // SAFETY: the four-level walk proved a resident writable result dword.
+        unsafe { core::ptr::write_volatile(target, commands[3]) };
     }
     if let Some(store) = user_store {
         let address = u64::from(store[1]) | u64::from(store[2]) << 32;
@@ -1419,11 +2099,13 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
         // Engines prime in order: the k-th publishes its golden image after
         // its seed and switch contexts, i.e. after 2(k+1) registrations.
         let engines: Vec<_> = gt.engines().unwrap().iter().collect();
+        let present = gt.engines().unwrap();
         let goldens: Vec<_> = engines
             .iter()
+            .filter(|e| present.logical_instance(**e) == Some(0))
             .map(|e| golden_for_class(&w, e.guc_class() as usize))
             .collect();
-        let mut published = alloc::vec![None; engines.len()];
+        let mut published = alloc::vec![None; goldens.len()];
         for now in 27..200 {
             assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
             for (k, golden) in goldens.iter().enumerate() {
@@ -1440,7 +2122,12 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
                 .filter(|a| **a == 0x4502)
                 .count();
         }
-        let expected: Vec<_> = (0..engines.len()).map(|k| Some(2 * (k + 1))).collect();
+        let expected: Vec<_> = engines
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| present.logical_instance(**e) == Some(0))
+            .map(|(k, _)| Some(2 * (k + 1)))
+            .collect();
         assert_eq!(published, expected, "engines published out of order");
         assert_eq!(registrations, 2 * engines.len());
         assert_eq!(completion.result(), Some(Ok(())));
@@ -1483,37 +2170,22 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
             // Mapping, enable mask, state size and BCS0 register saves.
             assert_eq!(
                 (ads[(0x123c + 96) / 4], ads[(0x123c + 524) / 4]),
-                (0x20202000, 1)
+                (
+                    if xe2 { 0x20200800 } else { 0x20202000 },
+                    if xe2 { 0x101 } else { 1 }
+                )
             );
             assert_eq!(ads[0x1060 / 4], 8192 - 4096 - 384);
             assert_eq!(ads[0x300 / 4 + 1], 3);
             let saves = (ads[0x300 / 4] - 0x20001000) as usize / 4;
             assert_eq!(
-                [
-                    ads[saves],
-                    ads[saves + 2],
-                    ads[saves + 4],
-                    ads[saves + 8],
-                    ads[saves + 12]
-                ],
-                [
-                    0x2229c,
-                    1,
-                    0x22080,
-                    0x220a8,
-                    // CCS0's saves follow BCS0's when it is published.
-                    if gt
-                        .engines()
-                        .unwrap()
-                        .contains(crate::intel_gpu_engine::Engine::Ccs0)
-                    {
-                        0x1a29c
-                    } else {
-                        0
-                    }
-                ]
+                [ads[saves], ads[saves + 2], ads[saves + 4], ads[saves + 8]],
+                [0x2229c, 1, 0x22080, 0x220a8]
             );
             assert_eq!(ads[saves + 5], w.0.borrow().regs[&0x22080]);
+            if !xe2 {
+                assert_eq!((ads[0x340 / 4], ads[0x340 / 4 + 1]), (0, 0));
+            }
         }
         if engines.contains(&crate::intel_gpu_engine::Engine::Ccs0) {
             let compute_golden = golden_for_class(&w, 4);
@@ -1532,6 +2204,17 @@ fn smoke_hardware_default_context_capture_and_clone() -> TestResult {
                 (0x20202000, 1)
             );
             assert_eq!(ads[0x400 / 4 + 1], 3);
+            // GuC follows the class/physical-instance header, not adjacency
+            // to another engine's save list. An absent BCS8 leaves its own
+            // reserved save range empty before CCS0's range.
+            let saves = (ads[0x400 / 4] - 0x20001000) as usize / 4;
+            assert_ne!(ads[0x400 / 4], ads[0x300 / 4]);
+            assert_eq!(
+                [ads[saves], ads[saves + 4], ads[saves + 8]],
+                [0x1a29c, 0x1a080, 0x1a0a8]
+            );
+            assert_eq!(ads[saves + 2], 1);
+            assert_eq!(ads[saves + 5], w.0.borrow().regs[&0x1a080]);
             assert_eq!(w.0.borrow().regs[&0x14800] & 1, 1, "RCU_MODE_CCS_ENABLE");
         }
         // A fresh PPGTT context must inherit the device's saved opaque state,
@@ -2284,4 +2967,8 @@ mod slpc_controls {
 
 fn service_slpc(w: &Window, memory: &Words, control_fence: u16, request: &[u32]) {
     slpc_controls::service(w, memory, control_fence, request);
+}
+
+mod bcs8 {
+    include!("intel_gpu_bcs8_tests.rs");
 }

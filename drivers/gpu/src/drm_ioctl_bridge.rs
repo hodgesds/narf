@@ -3629,6 +3629,37 @@ fn blob_value(
     Ok(id)
 }
 
+/// Shared by GETOBJPROPERTIES and the native admission fixtures. Intel's
+/// fixed-mode color owner exposes its native 1024-entry LUT; AMD retains 4096.
+fn crtc_color_properties(card: &crate::drm::card::Card, crtc: u32) -> (Vec<u32>, Vec<u64>) {
+    let Some(color) = card.crtc_color(crtc) else {
+        return (Vec::new(), Vec::new());
+    };
+    if card.intel_color(crtc) {
+        (
+            vec![
+                CRTC_CTM_PROP_ID,
+                CRTC_GAMMA_LUT_PROP_ID,
+                CRTC_GAMMA_LUT_SIZE_PROP_ID,
+            ],
+            vec![u64::from(color.ctm), u64::from(color.gamma_lut), 1024],
+        )
+    } else {
+        (
+            vec![
+                CRTC_CTM_PROP_ID,
+                CRTC_GAMMA_LUT_PROP_ID,
+                CRTC_GAMMA_LUT_SIZE_PROP_ID,
+            ],
+            vec![
+                u64::from(color.ctm),
+                u64::from(color.gamma_lut),
+                GAMMA_LUT_SIZE,
+            ],
+        )
+    }
+}
+
 /// A CRTC's color properties' new values from one request: each is
 /// `None` while the request leaves it alone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3663,7 +3694,12 @@ fn crtc_color_property(
         let entries = card
             .property_blob(id)
             .map_or(0, |b| b.len() / COLOR_LUT_ENTRY_SIZE);
-        if entries != GAMMA_LUT_SIZE as usize && entries != crate::drm::card::LEGACY_GAMMA_SIZE {
+        let valid = if card.intel_color(crtc) {
+            entries == 1024 || entries == crate::drm::card::LEGACY_GAMMA_SIZE
+        } else {
+            entries == GAMMA_LUT_SIZE as usize || entries == crate::drm::card::LEGACY_GAMMA_SIZE
+        };
+        if !valid {
             return Err(FsError::InvalidData);
         }
     }
@@ -4322,6 +4358,12 @@ fn handle_gamma(
     let (red, green, blue) = (ptr(8), ptr(16), ptr(24));
     let card = mode_state.lock();
     card.crtc(crtc_id).map_err(|_| FsError::NotFound)?;
+    if set && card.intel_color(crtc_id) {
+        // Intel SET must traverse its async owned color FIFO. A missing
+        // display owner or synchronous caller cannot publish software-only
+        // success through the AMD legacy helper below.
+        return Err(FsError::Unsupported);
+    }
     let Some(color) = card.crtc_color(crtc_id) else {
         // drm_crtc_supports_legacy_gamma is false (gamma_size 0).
         return if set {
@@ -4530,14 +4572,23 @@ fn handle_obj_getproperties(
             };
             let crtc = &card.crtcs[crtc_idx as usize];
             let fb = crtc.primary_fb.and_then(|id| card.framebuffer(id).ok());
-            let width = fb
+            #[cfg(feature = "intel")]
+            let fixed_intel_view = card.intel_display;
+            #[cfg(not(feature = "intel"))]
+            let fixed_intel_view = false;
+            let source_width = fb
                 .map(|f| f.width)
                 .or_else(|| crtc.mode.map(|m| m.width))
                 .unwrap_or(0);
-            let height = fb
+            let source_height = fb
                 .map(|f| f.height)
                 .or_else(|| crtc.mode.map(|m| m.height))
                 .unwrap_or(0);
+            let (width, height) = if fixed_intel_view {
+                crtc.mode.map_or((0, 0), |mode| (mode.width, mode.height))
+            } else {
+                (source_width, source_height)
+            };
             let (props, values) = (
                 vec![
                     PLANE_TYPE_PROP_ID,
@@ -4565,8 +4616,8 @@ fn handle_obj_getproperties(
                     (crtc.y as u64) << 16,
                     (width as u64) << 16,
                     (height as u64) << 16,
-                    crtc.x as u64,
-                    crtc.y as u64,
+                    if fixed_intel_view { 0 } else { crtc.x as u64 },
+                    if fixed_intel_view { 0 } else { crtc.y as u64 },
                     width as u64,
                     height as u64,
                     // IN_FENCE_FD reads back as -1 (never a live fd),
@@ -4600,18 +4651,9 @@ fn handle_obj_getproperties(
                 props.push(CRTC_VRR_ENABLED_PROP_ID);
                 values.push(u64::from(vrr));
             }
-            if let Some(color) = card.crtc_color(obj_id) {
-                props.extend([
-                    CRTC_CTM_PROP_ID,
-                    CRTC_GAMMA_LUT_PROP_ID,
-                    CRTC_GAMMA_LUT_SIZE_PROP_ID,
-                ]);
-                values.extend([
-                    u64::from(color.ctm),
-                    u64::from(color.gamma_lut),
-                    GAMMA_LUT_SIZE,
-                ]);
-            }
+            let (color_props, color_values) = crtc_color_properties(&card, obj_id);
+            props.extend(color_props);
+            values.extend(color_values);
             (props, values)
         } else if obj_type == DRM_MODE_OBJECT_CONNECTOR {
             let connector = card.connector(obj_id).map_err(|_| FsError::InvalidData)?;
@@ -8327,6 +8369,8 @@ mod intel_kms;
 mod scanout_kms;
 #[cfg(feature = "intel")]
 pub(crate) use intel_kms::dispatch as intel_kms_async;
+#[cfg(feature = "intel")]
+pub(crate) use intel_kms::restore_released_master as intel_kms_restore_released_master;
 #[cfg(feature = "amdgpu")]
 pub(crate) use scanout_kms::dispatch as amdgpu_kms_async;
 

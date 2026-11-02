@@ -1,16 +1,16 @@
-//! Battlemage local memory: layout probe, owned CPU-visible pool and cleared
-//! allocations.
+//! Qualified DG2/Xe2 local memory: layout probe and owned CPU-visible pool.
 //!
 //! MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad: xe_vram.c
 //! {tile_vram_size,get_flat_ccs_offset,determine_lmem_bar_size}, xe_regs.h
 //! (GSMBASE, SG_TILE_ADDR_RANGE) and xe_gt_regs.h (XE2_FLAT_CCS_BASE_RANGE_*,
 //! MIRROR_FUSE3). Usable VRAM ends at the flat-CCS base (or GSMBASE without
 //! flat CCS); the stolen/GSM/CCS tail is never allocated. Only the LMEM BAR's
-//! CPU-visible prefix is pooled: every allocation is zeroed through that
-//! write-combining mapping before publication. Xe2 compression is enabled
+//! CPU-visible prefix is pooled. Reservations never access the BAR. Before
+//! publication, the GT runtime initializes Xe2 data through its owned WC
+//! mapping, or executes DG2's trusted data and flat-CCS clear. Xe2 compression is enabled
 //! only by compressed PAT indices, which this driver never admits, so stale
-//! CCS metadata cannot affect any admitted access. DG2 (64K VRAM pages and
-//! surface-state compression) is not admitted.
+//! CCS metadata cannot affect any admitted access. DG2 requires 64 KiB
+//! allocations/PTE groups and fresh flat-CCS initialization on every reuse.
 
 use crate::amdgpu_vram::{Pool, Reservation};
 use alloc::sync::Arc;
@@ -49,7 +49,58 @@ pub struct Xe2VramRegisters {
     pub gsm_base: u64,
 }
 
+/// Xe-HPG's flat-CCS base is an MCR-steered 64 KiB pointer, not the Xe2
+/// per-node split register. Linux xe_vram.c::get_flat_ccs_offset.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Dg2VramRegisters {
+    pub tile_range: u32,
+    pub ccs_base: u32,
+    pub gsm_base: u64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VramRegisters {
+    Xe2(Xe2VramRegisters),
+    Dg2(Dg2VramRegisters),
+}
+
 impl VramLayout {
+    pub fn from_registers(regs: VramRegisters) -> Result<Self, VramError> {
+        match regs {
+            VramRegisters::Xe2(regs) => Self::xe2(regs),
+            VramRegisters::Dg2(regs) => Self::dg2(regs),
+        }
+    }
+
+    pub fn dg2(regs: Dg2VramRegisters) -> Result<Self, VramError> {
+        if regs.tile_range == u32::MAX || regs.ccs_base == u32::MAX || regs.gsm_base == u64::MAX {
+            return Err(VramError::Unavailable);
+        }
+        let tile_size = u64::from((regs.tile_range >> 8) & 0x3ff) * GIB;
+        let tile_offset = u64::from((regs.tile_range >> 1) & 0x7f) * GIB;
+        let ccs = u64::from(regs.ccs_base >> 8) * 65536;
+        let end = tile_offset
+            .checked_add(tile_size)
+            .ok_or(VramError::Layout)?;
+        // This driver owns tile zero only. Never pool CCS, stolen/GSM, a
+        // foreign tile, or an unqualified tail. Xe-HPG has one CCS byte per
+        // 256 data bytes; unlike Xe2, no adjacency equality is assumed.
+        if tile_size == 0
+            || tile_offset != 0
+            || ccs == 0
+            || ccs >= regs.gsm_base
+            || regs.gsm_base > end
+            || regs.gsm_base - ccs < tile_size / 256
+        {
+            return Err(VramError::Layout);
+        }
+        Ok(Self {
+            tile_size,
+            tile_offset,
+            usable: ccs,
+        })
+    }
+
     pub fn xe2(regs: Xe2VramRegisters) -> Result<Self, VramError> {
         if [regs.tile_range, regs.ccs_lower, regs.ccs_upper, regs.fuse3].contains(&u32::MAX)
             || regs.gsm_base == u64::MAX
@@ -97,7 +148,7 @@ pub fn record_boot_framebuffer(fb: narf_graphics_driver::generic::GenericFb) {
 }
 
 /// One card's local memory. Allocations come only from the CPU-visible,
-/// unreserved prefix and are zeroed before they are returned.
+/// unreserved prefix. Reservations require owned initialization before use.
 #[derive(Debug)]
 pub struct Vram {
     pool: Pool,
@@ -105,6 +156,7 @@ pub struct Vram {
     /// LMEM BAR physical base: device address `d` is CPU address `bar + d`
     /// (xe_vram.c dpa_base 0, io_start + tile offset).
     bar: u64,
+    page_size: u64,
 }
 
 impl Vram {
@@ -113,12 +165,30 @@ impl Vram {
     /// `layout` was probed from the same device. No other kernel owner
     /// allocates from this VRAM except the recorded boot framebuffer.
     pub unsafe fn new(bar: MmioRegion, layout: VramLayout) -> Result<Arc<Self>, VramError> {
+        // SAFETY: forwarded exclusive, mapped-aperture contract.
+        unsafe { Self::new_inner(bar, layout, 4096) }
+    }
+
+    /// # Safety
+    /// As `new`, with a layout qualified by `VramLayout::dg2`. Every returned
+    /// allocation additionally requires a completed trusted flat-CCS clear
+    /// before it can be published to a handle, CPU mapping or user VM.
+    pub unsafe fn new_dg2(bar: MmioRegion, layout: VramLayout) -> Result<Arc<Self>, VramError> {
+        // SAFETY: the caller supplies the same exclusive aperture ownership.
+        unsafe { Self::new_inner(bar, layout, 65536) }
+    }
+
+    unsafe fn new_inner(
+        bar: MmioRegion,
+        layout: VramLayout,
+        page_size: u64,
+    ) -> Result<Arc<Self>, VramError> {
         let len = bar
             .len
             .checked_sub(layout.tile_offset)
             .ok_or(VramError::Mapping)?
             .min(layout.usable)
-            & !4095;
+            & !(page_size - 1);
         if len == 0 {
             return Err(VramError::Mapping);
         }
@@ -145,7 +215,15 @@ impl Vram {
             pool,
             layout,
             bar: bar.phys.raw(),
+            page_size,
         }))
+    }
+
+    pub fn page_size(&self) -> u64 {
+        self.page_size
+    }
+    pub(crate) fn requires_ccs_clear(&self) -> bool {
+        self.page_size == 65536
     }
 
     pub fn total(&self) -> u64 {
@@ -158,25 +236,16 @@ impl Vram {
         self.pool.size() - self.pool.available()
     }
 
-    /// Reserve and zero `size` bytes. The returned device range is never
-    /// shared with another live allocation.
+    /// Reserve `size` bytes without accessing the BAR. The returned device
+    /// range is exclusive, but its prior contents are not yet initialized.
     pub fn allocate(self: &Arc<Self>, size: u64) -> Result<VramAllocation, FsError> {
-        if size == 0 || size % 4096 != 0 {
+        if size == 0 || size % self.page_size != 0 {
             return Err(FsError::InvalidData);
         }
-        let reservation = self.pool.reserve(size).map_err(|_| FsError::OutOfMemory)?;
-        let map = reservation.mapping();
-        for offset in (0..map.len).step_by(8) {
-            // SAFETY: the reservation exclusively owns this WC-mapped range.
-            unsafe { core::ptr::write_volatile((map.virt + offset) as *mut u64, 0) };
-        }
-        // Drain write-combining buffers before any device or user access.
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: SFENCE has no memory operands or preconditions.
-        unsafe {
-            core::arch::asm!("sfence", options(nostack, preserves_flags))
-        };
+        let reservation = self
+            .pool
+            .reserve_aligned(size, self.page_size)
+            .map_err(|_| FsError::OutOfMemory)?;
         Ok(VramAllocation {
             reservation: Some(reservation),
             vram: self.clone(),
@@ -184,7 +253,7 @@ impl Vram {
     }
 }
 
-/// A zeroed VRAM range. Dropping it proves that no GPU job, VM snapshot or
+/// An exclusively reserved VRAM range. Dropping it proves no GPU job, VM snapshot or
 /// CPU mapping still references it (they all retain the owning GEM object).
 #[derive(Debug)]
 pub struct VramAllocation {
@@ -193,6 +262,15 @@ pub struct VramAllocation {
 }
 
 impl VramAllocation {
+    pub(crate) fn pool_is(&self, pool: &Arc<Vram>) -> bool {
+        Arc::ptr_eq(&self.vram, pool)
+    }
+    pub(crate) fn page_size(&self) -> u64 {
+        self.vram.page_size()
+    }
+    pub(crate) fn requires_ccs_clear(&self) -> bool {
+        self.vram.requires_ccs_clear()
+    }
     fn reservation(&self) -> &Reservation {
         self.reservation.as_ref().expect("live VRAM reservation")
     }

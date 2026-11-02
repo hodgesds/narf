@@ -30,26 +30,36 @@ fn smoke_xe_explicit_queues_overlap_and_cpu_reservations_wait_for_both() -> Test
     let q2 = create_queue(&file, &info, &user, vm, 0);
     let handles = buffers(&file, &info, &user, vm);
     let data = file.gem.object(handles[1]).unwrap();
-    let submit = |queue, gt: &mut GuCGt<Window, Arena>| {
+    let submit = |queue, now, gt: &mut GuCGt<Window, Arena>| {
         exec_wire(&user, queue, true, &[]);
         let mut call = core::pin::pin!(file.dispatch_user(&info, xe::EXEC, 64, &user));
         assert!(call
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending());
-        let (_, fence) = mailbox.accept(gt, 100);
+        let (_, fence) = mailbox.accept(gt, now);
         assert_eq!(
             call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Some(Ok(0)))
         );
         fence
     };
-    let f1 = submit(q1, &mut gt);
-    let f2 = submit(q2, &mut gt);
-    assert_eq!(data.dma_buf.resv.fences(DmaResvUsage::Write).len(), 2);
-    assert_eq!(data.read(128, &mut [0; 4]), Err(FsError::WouldBlock));
+    let f1 = submit(q1, 100, &mut gt);
     let mut registered = BTreeMap::new();
     for now in 101..125 {
+        assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
+        service_contexts(&w, &mut registered, false);
+        if narf_filesystem::DrmFence::is_submit_ready(&*f1) {
+            break;
+        }
+    }
+    assert!(narf_filesystem::DrmFence::is_submit_ready(&*f1));
+    assert_eq!(registered.len(), 1);
+    let first_id = *registered.keys().next().unwrap();
+    let f2 = submit(q2, 130, &mut gt);
+    assert_eq!(data.dma_buf.resv.fences(DmaResvUsage::Write).len(), 2);
+    assert_eq!(data.read(128, &mut [0; 4]), Err(FsError::WouldBlock));
+    for now in 131..155 {
         assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
         service_contexts(&w, &mut registered, false);
         if narf_filesystem::DrmFence::is_submit_ready(&*f1)
@@ -58,15 +68,20 @@ fn smoke_xe_explicit_queues_overlap_and_cpu_reservations_wait_for_both() -> Test
             break;
         }
     }
-    // Priming consumed IDs 1-2 (RCS0) and 3-4 (BCS0).
-    assert_eq!(registered.keys().copied().collect::<Vec<_>>(), [5, 6]);
-    execute_one(&w, &registered, 5);
-    finish(&mut gt, &w, &f1, &mut registered, 130);
+    assert!(narf_filesystem::DrmFence::is_submit_ready(&*f2));
+    assert_eq!(registered.len(), 2);
+    assert!(registered.contains_key(&first_id));
+    let second_id = *registered.keys().find(|id| **id != first_id).unwrap();
+    assert_ne!(first_id, second_id);
+    assert!(f1.result().is_none() && f2.result().is_none());
+    execute_one(&w, &registered, first_id);
+    finish(&mut gt, &w, &f1, &mut registered, 160);
     assert_eq!(f2.result(), None);
     assert_eq!(registered.len(), 1);
     assert_eq!(data.dma_buf.resv.fences(DmaResvUsage::Write).len(), 1);
     assert_eq!(data.read(128, &mut [0; 4]), Err(FsError::WouldBlock));
-    execute_one(&w, &registered, 6);
+    assert!(registered.contains_key(&second_id));
+    execute_one(&w, &registered, second_id);
     finish(&mut gt, &w, &f2, &mut registered, 200);
     let mut value = [0; 4];
     data.read(128, &mut value).unwrap();

@@ -18,7 +18,7 @@ use crate::intel_gpu_aux::MmioWindow;
 use crate::intel_gpu_gtt::{
     check_ggtt_range, PteFormat, GEM_SCANOUT_GTT_END, GEM_SCANOUT_GTT_START, GGTT_ARRAY_BASE,
 };
-use crate::intel_gpu_pipes::{Pipe, PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET};
+use crate::intel_gpu_pipes::{Pipe, PLANE_OFFSET_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET};
 use crate::intel_gpu_scanout::ScanoutIo;
 
 const IMR: u64 = 0x44404;
@@ -41,6 +41,11 @@ const FRAME_COUNT: u64 = 0x40;
 /// Calling this predicate must neither wait nor re-enter the presenter.
 pub(crate) unsafe trait DisplayAccess: MmioWindow {
     fn access_ok(&self) -> bool;
+    /// Stable physical PCI BAR identity; isolated native register vectors may
+    /// omit it, but production DMA reservations always supply the shared key.
+    fn ggtt_key(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -49,6 +54,12 @@ pub(crate) enum IoError {
     Bounds,
     Conflict,
     Unavailable,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct SavedStatus {
+    ier: u32,
+    imr: u32,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -116,6 +127,18 @@ impl<M: DisplayAccess> PollIo<M> {
             GEM_SCANOUT_GTT_END - GEM_SCANOUT_GTT_START,
         )
         .map_err(|_| IoError::Bounds)?;
+        if let Some(key) = mmio.ggtt_key() {
+            let ledger = crate::intel_gpu_ggtt_ranges::Ledger::for_bar(key, bar_len)
+                .map_err(|_| IoError::Bounds)?;
+            if !ledger.allows(
+                crate::intel_gpu_ggtt_ranges::Kind::Primary,
+                GEM_SCANOUT_GTT_START,
+                GEM_SCANOUT_GTT_END - GEM_SCANOUT_GTT_START,
+            ) {
+                return Err(IoError::Bounds);
+            }
+        }
+
         let status = COMMON_STATUS
             | if format == PteFormat::XeLpg {
                 MTL_ATS_STATUS
@@ -167,6 +190,62 @@ impl<M: DisplayAccess> PollIo<M> {
 
     pub(crate) fn format(&self) -> PteFormat {
         self.format
+    }
+
+    pub(crate) fn saved_status(&self) -> SavedStatus {
+        SavedStatus {
+            ier: self.saved_ier,
+            imr: self.saved_imr,
+        }
+    }
+
+    pub(crate) fn snapshot_status(
+        mmio: &M,
+        generation: Generation,
+    ) -> Result<SavedStatus, IoError> {
+        if !mmio.access_ok() {
+            return Err(IoError::Unavailable);
+        }
+        let ier = mmio.read32(IER);
+        let imr = mmio.read32(IMR);
+        if ier == u32::MAX || !mmio.access_ok() {
+            return Err(IoError::Unavailable);
+        }
+        let status = COMMON_STATUS
+            | if generation == Generation::MeteorLake {
+                MTL_ATS_STATUS
+            } else {
+                0
+            };
+        Ok(SavedStatus {
+            ier: ier & status,
+            imr: imr & status,
+        })
+    }
+
+    /// Acquire a new status observation after reset while preserving the
+    /// original firmware ownership, rather than treating our old IER/IMR
+    /// bits as inherited state. The old adapter remains permanently lost.
+    ///
+    /// # Safety
+    /// Same exclusion/current cache-policy requirements as `new`. Old DMA
+    /// owners remain retained; this acquisition is no fetch-stop proof.
+    pub(crate) unsafe fn after_reset(
+        mmio: M,
+        generation: Generation,
+        pipe: Pipe,
+        bar_len: u64,
+        saved: SavedStatus,
+    ) -> Result<Self, IoError> {
+        // SAFETY: caller supplies the constructor's current ownership proof.
+        let mut owner = unsafe { Self::new(mmio, generation, pipe, bar_len) }?;
+        owner.saved_ier = saved.ier;
+        owner.saved_imr = saved.imr;
+        Ok(owner)
+    }
+
+    pub(crate) fn poison(&self) {
+        self.state.set(State::Lost);
     }
 
     fn fail<T>(&self) -> Result<T, IoError> {
@@ -290,7 +369,15 @@ impl<M: DisplayAccess> MmioWindow for PollIo<M> {
         let pte_end = GGTT_ARRAY_BASE + GEM_SCANOUT_GTT_END / 4096 * 8;
         let pte = (pte_start..pte_end).contains(&offset);
         let surface = Pipe::A.base() + PLANE_PRIMARY_OFFSET + PLANE_SURF_OFFSET;
-        if self.state.get() != State::Active || !(pte || offset == surface || offset == IIR) {
+        // Only the original console's zero source origin may be restored
+        // through CPU IO. Client panning is emitted by the owned DSB in its
+        // hardware safe window, never through this register adapter.
+        let console_origin =
+            offset == Pipe::A.base() + PLANE_PRIMARY_OFFSET + PLANE_OFFSET_OFFSET && value == 0;
+        if self.state.get() != State::Active
+            || !(pte || offset == surface || offset == IIR || console_origin)
+            || (console_origin && self.owned_status_ready().is_err())
+        {
             self.state.set(State::Lost);
             return;
         }

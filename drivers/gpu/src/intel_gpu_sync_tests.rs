@@ -214,10 +214,16 @@ fn smoke_intel_prime_reservations_sync_file_and_copy_fault() -> TestResult {
         object.dma_buf.name().as_deref(),
         Some(b"intel-shared".as_slice())
     );
+    // This export-only context does not resolve sync_file descriptors. A
+    // previously unsupported import now validates that fd and returns EINVAL
+    // without altering the shared reservation or its existing native writer.
+    let before = object.dma_buf.resv.generation();
     assert_eq!(
         narf_scheduler::block_on_spin(prime.ioctl_user(DMA_BUF_IOCTL_IMPORT_SYNC_FILE, 64, &ctx)),
-        Err(FsError::Unsupported)
+        Err(FsError::InvalidData)
     );
+    assert_eq!(object.dma_buf.resv.generation(), before);
+    assert_eq!(object.busy(), 0x10001);
     gem.close(handle).unwrap();
     drop(prime);
     drop(alias);

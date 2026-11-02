@@ -4,11 +4,12 @@
 //! intel_display_irq.c at b90c984d615e8ce2af96f5b1411a962d83fed2ad.
 use super::*;
 use crate::drm::card::{Card, Crtc, FlipEventReservation, FlipStamp, Framebuffer, PixelFormat};
-use crate::intel_gpu_scanout::Geometry;
+use crate::intel_gpu_scanout::{Geometry, Viewport};
+use alloc::boxed::Box;
 use narf_filesystem::FsFuture;
 
 type ModeState = Arc<narf_lib::sync::IrqSafeSpinLock<Card>>;
-type Events = narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>;
+type Events = Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::DrmEventQueue>>;
 type OutFences = narf_lib::sync::IrqSafeSpinLock<Vec<(u64, u64)>>;
 const EVENT: u32 = 1;
 const TEST_ONLY: u32 = 0x100;
@@ -18,7 +19,7 @@ const ALLOW_MODESET: u32 = 0x400;
 pub(super) fn mutates(cmd: u32) -> bool {
     matches!(
         drm_uapi::ioc_nr(cmd),
-        0x1e | 0x1f | 0xa2 | 0xa3 | 0xab | 0xaf | 0xb0 | 0xb1 | 0xb7 | 0xba | 0xbb | 0xbc
+        0x1e | 0x1f | 0xa2 | 0xa3 | 0xa5 | 0xab | 0xaf | 0xb0 | 0xb1 | 0xb7 | 0xba | 0xbb | 0xbc
     )
 }
 
@@ -44,7 +45,12 @@ enum Request {
     DropMaster,
     SetMaster,
     Dirty(u32),
-    Cursor(Vec<u8>),
+    Cursor(Vec<u8>, Option<Arc<crate::intel_gpu_gem::GemObject>>, bool),
+    LegacyGamma {
+        crtc: u32,
+        store: Vec<u16>,
+        blob: u32,
+    },
 }
 fn read(context: &dyn IoctlContext, address: u64, size: usize) -> Result<Vec<u8>, FsError> {
     let mut bytes = vec![0; size];
@@ -224,15 +230,19 @@ impl Request {
                 }
                 Self::Dirty(w[0])
             }
-            0xa3 | 0xbb => Self::Cursor(read(
-                context,
-                arg,
-                if drm_uapi::ioc_nr(cmd) == 0xbb {
-                    36
-                } else {
-                    28
-                },
-            )?),
+            0xa3 | 0xbb => Self::Cursor(
+                read(
+                    context,
+                    arg,
+                    if drm_uapi::ioc_nr(cmd) == 0xbb {
+                        36
+                    } else {
+                        28
+                    },
+                )?,
+                None,
+                false,
+            ),
             _ => return Err(FsError::Unsupported),
         })
     }
@@ -250,7 +260,19 @@ enum Action {
     Restore,
     Remove(u32),
     DropMaster,
-    Cursor(Vec<u8>),
+    SetMaster,
+    Color {
+        primary: bool,
+        coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        dsb: Option<crate::intel_gpu_dsb::Timing>,
+    },
+    Cursor {
+        bytes: Vec<u8>,
+        object: Option<Arc<crate::intel_gpu_gem::GemObject>>,
+        hardware: bool,
+        timing: crate::intel_gpu_dsb::Timing,
+    },
     Noop,
 }
 struct Plan {
@@ -264,6 +286,12 @@ struct Plan {
     out: Option<u64>,
     fence: Option<i32>,
     test: bool,
+    nonblock: bool,
+    previous_ctm: u32,
+    next_ctm: u32,
+    previous_gamma: u32,
+    next_gamma: u32,
+    legacy_store: Option<Vec<u16>>,
 }
 
 fn same_timing(
@@ -319,8 +347,35 @@ fn legacy_wire(m: crate::drm_uapi::DrmModeModeInfoUapi) -> crate::drm::ioctl::Dr
 }
 
 impl Plan {
+    #[cfg(any(test, feature = "kernel-test"))]
     fn stage(card: &Card, request: Request, geometry: Geometry) -> Result<Self, FsError> {
+        Self::stage_from(card, request, geometry, None, None)
+    }
+
+    fn stage_from(
+        card: &Card,
+        request: Request,
+        geometry: Geometry,
+        previous: Option<Crtc>,
+        previous_color: Option<(u32, u32)>,
+    ) -> Result<Self, FsError> {
+        let mut legacy_store = None;
         let request = match request {
+            Request::LegacyGamma { crtc, store, blob } => {
+                if !card.intel_color(crtc) || store.len() != 3 * crate::drm::card::LEGACY_GAMMA_SIZE
+                {
+                    return Err(FsError::InvalidData);
+                }
+                legacy_store = Some(store);
+                Request::Atomic(OwnedAtomic {
+                    flags: 0,
+                    cookie: 0,
+                    objects: vec![crtc],
+                    counts: vec![2],
+                    props: vec![CRTC_CTM_PROP_ID, CRTC_GAMMA_LUT_PROP_ID],
+                    values: vec![0, u64::from(blob)],
+                })
+            }
             Request::Property {
                 object,
                 kind,
@@ -339,7 +394,9 @@ impl Plan {
             }
             other => other,
         };
-        let previous = card.crtcs.first().ok_or(FsError::NoDevice)?.clone();
+        let previous = previous
+            .or_else(|| card.crtcs.first().cloned())
+            .ok_or(FsError::NoDevice)?;
         let fixed = previous
             .mode
             .or_else(|| {
@@ -351,7 +408,15 @@ impl Plan {
             })
             .ok_or(FsError::NoDevice)?;
         let wire = card.mode_wire(&fixed);
+        let (previous_ctm, previous_gamma) = previous_color.unwrap_or_else(|| {
+            card.crtc_color(previous.id)
+                .map_or((0, 0), |c| (c.ctm, c.gamma_lut))
+        });
         let mut p = Self {
+            previous_ctm,
+            next_ctm: previous_ctm,
+            previous_gamma,
+            next_gamma: previous_gamma,
             next: previous.clone(),
             previous,
             framebuffer: None,
@@ -362,13 +427,19 @@ impl Plan {
             out: None,
             fence: None,
             test: false,
+            nonblock: false,
+            legacy_store,
         };
         let mut fb = p.next.primary_fb;
         let mut route = fb.map(|_| p.next.id);
         let mut primary_changed = false;
+        let mut color = None;
+        let mut gamma = None;
+        let mut color_compatible = true;
+        let mut color_primary = false;
         let mut rect = [
-            0,
-            0,
+            p.next.x << 16,
+            p.next.y << 16,
             geometry.width << 16,
             geometry.height << 16,
             0,
@@ -377,12 +448,16 @@ impl Plan {
             geometry.height,
         ];
         match request {
-            Request::Property { .. } => unreachable!("property request normalized before staging"),
+            Request::Property { .. } | Request::LegacyGamma { .. } => {
+                unreachable!("property request normalized before staging")
+            }
             Request::SetMaster => {
-                p.action = Action::Noop;
+                p.action = Action::SetMaster;
                 return Ok(p);
             }
             Request::DropMaster => {
+                p.next_ctm = 0;
+                p.next_gamma = 0;
                 p.action = Action::DropMaster;
                 return Ok(p);
             }
@@ -390,21 +465,58 @@ impl Plan {
                 card.framebuffer(id).map_err(|_| FsError::NotFound)?;
                 p.action = Action::Remove(id);
                 if p.next.primary_fb == Some(id) {
+                    p.next_ctm = 0;
+                    p.next_gamma = 0;
                     p.next.primary_fb = None;
                     p.next.enabled = false;
                     p.next.mode = None;
                 }
                 return Ok(p);
             }
-            Request::Cursor(bytes) => {
+            Request::Cursor(bytes, object, hardware) => {
+                if !hardware && (p.next.x != 0 || p.next.y != 0) {
+                    return Err(FsError::Unsupported);
+                }
                 let w = words(&bytes);
                 if w[0] == 0 || w[0] & !3 != 0 || w[1] != p.next.id {
                     return Err(FsError::InvalidData);
                 }
-                p.action = Action::Cursor(bytes);
-                if let Some(id) = fb {
-                    p.framebuffer =
-                        Some(card.framebuffer(id).map_err(|_| FsError::NotFound)?.clone());
+                if hardware
+                    && w[0] & 1 != 0
+                    && w[6] != 0
+                    && (w[4] != 64
+                        || w[5] != 64
+                        || object
+                            .as_ref()
+                            .is_none_or(|o| o.size() < 16384 || o.is_userptr() || o.is_vram()))
+                {
+                    return Err(FsError::Unsupported);
+                }
+                if hardware
+                    && w[0] & 2 != 0
+                    && ((w[2] as i32).unsigned_abs() > 32767
+                        || (w[3] as i32).unsigned_abs() > 32767)
+                {
+                    return Err(FsError::Unsupported);
+                }
+                p.action = Action::Cursor {
+                    bytes,
+                    object,
+                    hardware,
+                    timing: crate::intel_gpu_dsb::Timing {
+                        clock: wire.clock,
+                        width: wire.hdisplay,
+                        height: wire.vdisplay,
+                        htotal: wire.htotal,
+                        vtotal: wire.vtotal,
+                        flags: wire.flags,
+                    },
+                };
+                if !hardware {
+                    if let Some(id) = fb {
+                        p.framebuffer =
+                            Some(card.framebuffer(id).map_err(|_| FsError::NotFound)?.clone());
+                    }
                 }
                 return Ok(p);
             }
@@ -443,7 +555,7 @@ impl Plan {
                 if r.crtc_id != p.next.id {
                     return Err(FsError::NotFound);
                 }
-                if r.x != 0 || r.y != 0 || r.mode_valid > 1 {
+                if r.x > 0xffff || r.y > 0xffff || r.mode_valid > 1 {
                     return Err(FsError::InvalidData);
                 }
                 if let Some(id) = connector {
@@ -456,6 +568,8 @@ impl Plan {
                 route = fb.map(|_| p.next.id);
                 p.next.enabled = fb.is_some();
                 p.next.mode = fb.map(|_| fixed);
+                rect[0] = r.x << 16;
+                rect[1] = r.y << 16;
             }
             Request::Atomic(a) => {
                 if !atomic_card(card) {
@@ -464,6 +578,7 @@ impl Plan {
                 p.event = a.flags & EVENT != 0;
                 p.cookie = a.cookie;
                 p.test = a.flags & TEST_ONLY != 0;
+                p.nonblock = a.flags & NONBLOCK != 0;
                 if a.objects.len() != a.counts.len() {
                     return Err(FsError::InvalidData);
                 }
@@ -474,7 +589,33 @@ impl Plan {
                         .filter(|n| *n <= a.props.len() && *n <= a.values.len())
                         .ok_or(FsError::InvalidData)?;
                     for (&prop, &value) in a.props[at..end].iter().zip(&a.values[at..end]) {
+                        if !((object == p.next.id
+                            && matches!(
+                                prop,
+                                CRTC_CTM_PROP_ID
+                                    | CRTC_GAMMA_LUT_PROP_ID
+                                    | CRTC_OUT_FENCE_PTR_PROP_ID
+                            ))
+                            || (object == PLANE_ID_BASE
+                                && matches!(
+                                    prop,
+                                    PLANE_IN_FENCE_FD_PROP_ID
+                                        | PLANE_FB_ID_PROP_ID
+                                        | PLANE_CRTC_ID_PROP_ID
+                                        | PLANE_SRC_X_PROP_ID
+                                        | PLANE_SRC_Y_PROP_ID
+                                        | PLANE_SRC_W_PROP_ID
+                                        | PLANE_SRC_H_PROP_ID
+                                        | PLANE_CRTC_X_PROP_ID
+                                        | PLANE_CRTC_Y_PROP_ID
+                                        | PLANE_CRTC_W_PROP_ID
+                                        | PLANE_CRTC_H_PROP_ID
+                                )))
+                        {
+                            color_compatible = false;
+                        }
                         if object == PLANE_ID_BASE {
+                            color_primary |= prop != PLANE_IN_FENCE_FD_PROP_ID;
                             match prop {
                                 PLANE_FB_ID_PROP_ID => {
                                     primary_changed = true;
@@ -509,6 +650,33 @@ impl Plan {
                             }
                         } else if object == p.next.id {
                             match prop {
+                                CRTC_CTM_PROP_ID => {
+                                    if !card.intel_color(p.next.id) {
+                                        return Err(FsError::Unsupported);
+                                    }
+                                    let blob = u32_value(value)?;
+                                    if blob != 0
+                                        && card.property_blob(blob).ok_or(FsError::NotFound)?.len()
+                                            != 72
+                                    {
+                                        return Err(FsError::InvalidData);
+                                    }
+                                    color = Some(blob);
+                                }
+                                CRTC_GAMMA_LUT_PROP_ID => {
+                                    if !card.intel_color(p.next.id) {
+                                        return Err(FsError::Unsupported);
+                                    }
+                                    let id = u32_value(value)?;
+                                    if id != 0 {
+                                        let bytes =
+                                            card.property_blob(id).ok_or(FsError::NotFound)?;
+                                        if ![256 * 8, 1024 * 8].contains(&bytes.len()) {
+                                            return Err(FsError::InvalidData);
+                                        }
+                                    }
+                                    gamma = Some(id);
+                                }
                                 CRTC_ACTIVE_PROP_ID => {
                                     if value > 1 {
                                         return Err(FsError::InvalidData);
@@ -561,6 +729,135 @@ impl Plan {
                 }
             }
         }
+        if !p.next.enabled || fb.is_none() || route.is_none() {
+            // Full restoration selects the retained origin-zero console;
+            // an inherited panned rectangle must not prevent disabling it.
+            rect[0] = 0;
+            rect[1] = 0;
+        }
+        // Every panned primary arm uses the retained DSB owner, even if the
+        // client changes no color properties. This also covers returning to
+        // origin zero and PAGE_FLIP inheriting its queued source rectangle.
+        let viewport = Viewport {
+            x: rect[0] >> 16,
+            y: rect[1] >> 16,
+        };
+        let panning = (primary_changed || color_primary || (color.is_none() && gamma.is_none()))
+            && (viewport != Viewport::default() || p.previous.x != 0 || p.previous.y != 0)
+            && p.next.enabled
+            && fb.is_some()
+            && route.is_some();
+        color_primary |= panning;
+        if color.is_some() || gamma.is_some() || panning {
+            if !card.intel_color(p.next.id) {
+                return Err(FsError::Unsupported);
+            }
+            if !color_compatible || !p.previous.enabled || p.previous.mode.is_none() {
+                return Err(FsError::Unsupported);
+            }
+            if color_primary {
+                if rect
+                    != [
+                        rect[0],
+                        rect[1],
+                        geometry.width << 16,
+                        geometry.height << 16,
+                        0,
+                        0,
+                        geometry.width,
+                        geometry.height,
+                    ]
+                    || route != Some(p.next.id)
+                {
+                    return Err(FsError::Unsupported);
+                }
+                let id = fb.ok_or(FsError::Unsupported)?;
+                let target = card.framebuffer(id).map_err(|_| FsError::NotFound)?;
+                let object = target.intel.as_ref().ok_or(FsError::Unsupported)?;
+                if target.pitch != geometry.pitch
+                    || target.format != PixelFormat::Xrgb8888
+                    || target.modifier != 0
+                    || target.offsets != [0, 0]
+                    || target.chroma_pitch != 0
+                    || !object.object.is_wc()
+                    || !object.object.scanout()
+                    || object.object.is_vram()
+                    || object.object.is_userptr()
+                {
+                    return Err(FsError::Unsupported);
+                }
+                if viewport
+                    .x
+                    .checked_add(geometry.width)
+                    .is_none_or(|x| x > target.width)
+                    || viewport
+                        .y
+                        .checked_add(geometry.height)
+                        .is_none_or(|y| y > target.height)
+                {
+                    return Err(FsError::NoSpace);
+                }
+                let (_, _, extent) = viewport
+                    .layout(geometry)
+                    .map_err(|_| FsError::InvalidData)?;
+                if extent > object.object.size() {
+                    return Err(FsError::InvalidData);
+                }
+                p.framebuffer = Some(target.clone());
+                p.next.primary_fb = Some(id);
+                p.next.x = viewport.x;
+                p.next.y = viewport.y;
+            }
+            if let Some(blob) = color {
+                p.next_ctm = blob;
+            }
+            if let Some(id) = gamma {
+                p.next_gamma = id;
+            }
+            // MTL's single-buffered LUT and independent color arms require
+            // the owned DSB chain for active replacement/combined changes.
+            let needs_dsb = color_primary
+                || (p.next_ctm != p.previous_ctm && p.next_gamma != p.previous_gamma)
+                || (p.previous_gamma != 0 && p.next_gamma != 0 && p.next_gamma != p.previous_gamma);
+            let dsb = needs_dsb.then_some(crate::intel_gpu_dsb::Timing {
+                clock: wire.clock,
+                width: wire.hdisplay,
+                height: wire.vdisplay,
+                htotal: wire.htotal,
+                vtotal: wire.vtotal,
+                flags: wire.flags,
+            });
+            if dsb.is_some_and(|timing| !timing.valid()) {
+                return Err(FsError::Unsupported);
+            }
+            let coefficients = if p.next_ctm == 0 {
+                None
+            } else {
+                let bytes = card.property_blob(p.next_ctm).ok_or(FsError::NotFound)?;
+                if bytes.len() != 72 {
+                    return Err(FsError::InvalidData);
+                }
+                let mut coefficients = [0; 9];
+                for (c, bytes) in coefficients.iter_mut().zip(bytes.chunks_exact(8)) {
+                    *c = u64::from_le_bytes(bytes.try_into().unwrap());
+                }
+                Some(coefficients)
+            };
+            let lut = if p.next_gamma == 0 {
+                None
+            } else {
+                Some(crate::intel_gpu_color::Lut::decode(
+                    card.property_blob(p.next_gamma).ok_or(FsError::NotFound)?,
+                )?)
+            };
+            p.action = Action::Color {
+                primary: color_primary,
+                coefficients,
+                lut,
+                dsb,
+            };
+            return Ok(p);
+        }
         if rect
             != [
                 0,
@@ -586,9 +883,13 @@ impl Plan {
             // CRTC/connector metadata does not disable the boot console.
             p.action = Action::Observe;
         } else if !p.next.enabled || fb.is_none() || route.is_none() {
+            p.next_ctm = 0;
+            p.next_gamma = 0;
             p.next.primary_fb = None;
             p.next.enabled = false;
             p.next.mode = None;
+            p.next.x = 0;
+            p.next.y = 0;
             p.action = Action::Restore;
         } else {
             if p.next.mode.is_none() {
@@ -634,6 +935,13 @@ impl Plan {
     }
     fn still_valid(&self, card: &Card, open: u64) -> bool {
         if !card.is_master(open) {
+            return false;
+        }
+        if card
+            .crtc_color(self.previous.id)
+            .map_or((0, 0), |c| (c.ctm, c.gamma_lut))
+            != (self.previous_ctm, self.previous_gamma)
+        {
             return false;
         }
         let Ok(current) = card.crtc(self.previous.id) else {
@@ -687,6 +995,10 @@ impl Plan {
 }
 
 trait Backend {
+    fn valid(&self) -> Result<(), FsError> {
+        Ok(())
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
     fn geometry(&self) -> Geometry;
     fn console_fb(&self) -> narf_graphics_driver::generic::GenericFb;
     fn check(&self, g: Geometry) -> Result<(), FsError>;
@@ -696,12 +1008,48 @@ trait Backend {
         g: Geometry,
     ) -> FsFuture<'a, FlipStamp>;
     fn restore(&mut self) -> FsFuture<'_, ()>;
+    fn color_published(&mut self) {}
+    fn surface(&mut self) -> FsFuture<'_, ()> {
+        self.restore()
+    }
+    fn color(
+        &mut self,
+        _coefficients: Option<[u64; 9]>,
+        _lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        _dsb: Option<crate::intel_gpu_dsb::Timing>,
+    ) -> FsFuture<'_, FlipStamp> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+    fn present_color(
+        &mut self,
+        _object: Arc<crate::intel_gpu_gem::GemObject>,
+        _geometry: Geometry,
+        _viewport: Viewport,
+        _coefficients: Option<[u64; 9]>,
+        _lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        _timing: crate::intel_gpu_dsb::Timing,
+    ) -> FsFuture<'_, FlipStamp> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+    fn cursor(
+        &mut self,
+        _object: Option<Arc<crate::intel_gpu_gem::GemObject>>,
+        _replace: bool,
+        _position: Option<(i32, i32)>,
+        _timing: crate::intel_gpu_dsb::Timing,
+    ) -> FsFuture<'_, FlipStamp> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
     fn vblank(&mut self) -> FsFuture<'_, FlipStamp>;
     fn copy<'a>(&'a mut self, frame: &'a Framebuffer, mode: &'a ModeState) -> FsFuture<'a, ()> {
         alloc::boxed::Box::pin(copy_frame(frame, mode, self.console_fb()))
     }
 }
-impl Backend for crate::intel_gpu_kms::Session<'_> {
+impl<M: crate::intel_gpu_kms::Platform> Backend for crate::intel_gpu_kms::Guard<'_, M> {
+    fn valid(&self) -> Result<(), FsError> {
+        self.ownership_valid()
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
     fn geometry(&self) -> Geometry {
         self.console_geometry()
     }
@@ -721,11 +1069,46 @@ impl Backend for crate::intel_gpu_kms::Session<'_> {
     fn restore(&mut self) -> FsFuture<'_, ()> {
         alloc::boxed::Box::pin(self.restore_console())
     }
+    fn color_published(&mut self) {
+        self.confirm_ctm();
+    }
+    fn surface(&mut self) -> FsFuture<'_, ()> {
+        Box::pin(self.restore_surface())
+    }
+    fn color(
+        &mut self,
+        coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        dsb: Option<crate::intel_gpu_dsb::Timing>,
+    ) -> FsFuture<'_, FlipStamp> {
+        Box::pin(self.set_color_with_dsb(coefficients, lut, dsb))
+    }
+    fn present_color(
+        &mut self,
+        object: Arc<crate::intel_gpu_gem::GemObject>,
+        geometry: Geometry,
+        viewport: Viewport,
+        coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        timing: crate::intel_gpu_dsb::Timing,
+    ) -> FsFuture<'_, FlipStamp> {
+        Box::pin(self.present_color(object, geometry, viewport, coefficients, lut, timing))
+    }
+    fn cursor(
+        &mut self,
+        object: Option<Arc<crate::intel_gpu_gem::GemObject>>,
+        replace: bool,
+        position: Option<(i32, i32)>,
+        timing: crate::intel_gpu_dsb::Timing,
+    ) -> FsFuture<'_, FlipStamp> {
+        Box::pin(self.cursor(object, replace, position, timing))
+    }
     fn vblank(&mut self) -> FsFuture<'_, FlipStamp> {
         alloc::boxed::Box::pin(self.wait_vblank())
     }
 }
 
+#[cfg(any(test, feature = "kernel-test"))]
 async fn wait_fences(fences: Vec<Arc<dyn narf_filesystem::DrmFence>>) -> Result<(), FsError> {
     let deadline = narf_time::monotonic_ns().saturating_add(15_000_000_000);
     while fences.iter().any(|f| !f.is_signalled()) {
@@ -779,7 +1162,9 @@ where
     let mut pages = None;
     let mut phys = None;
     let size = if let Some(intel) = &frame.intel {
-        wait_fences(intel.object.dma_buf.resv.fences(DmaResvUsage::Write)).await?;
+        // The transaction owner resolves writer dependencies before obtaining
+        // the display session, so reset recovery never waits behind a fence.
+
         if !intel.object.sync_for_cpu_read() {
             return Err(crate::intel_gpu_user::io_error());
         }
@@ -840,6 +1225,7 @@ where
     Ok(())
 }
 
+#[cfg(any(test, feature = "kernel-test"))]
 #[allow(clippy::too_many_arguments)]
 async fn execute<B: Backend>(
     backend: &mut B,
@@ -850,21 +1236,13 @@ async fn execute<B: Backend>(
     events: Option<&Events>,
     out: Option<&OutFences>,
 ) -> Result<u64, FsError> {
-    let (plan, transaction) = {
-        let mut card = mode.lock();
+    let plan = {
+        let card = mode.lock();
         if !card.is_master(open) {
             return Err(FsError::PermissionDenied);
         }
-        let plan = Plan::stage(&card, request, backend.geometry())?;
-        let transaction = if plan.test {
-            None
-        } else {
-            card.intel_begin_transaction(open)?;
-            Some(Transaction(mode.clone()))
-        };
-        (plan, transaction)
+        Plan::stage(&card, request, backend.geometry())?
     };
-    let _transaction = transaction;
     if plan.test {
         if let Some(fd) = plan.fence {
             context.sync_file_fences(fd).ok_or(FsError::InvalidData)?;
@@ -888,9 +1266,64 @@ async fn execute<B: Backend>(
     if let Some(fd) = plan.fence {
         wait_fences(context.sync_file_fences(fd).ok_or(FsError::InvalidData)?).await?;
     }
+    wait_fences(plan_dependencies(&plan, mode)?).await?;
+    let out_ptr = plan.out;
+    let stamp = execute_plan(backend, mode, open, &plan, reservation).await?;
+    if let (Some(ptr), Some(sink)) = (out_ptr, out) {
+        sink.lock().push((ptr, stamp.ns));
+    }
+    Ok(0)
+}
+
+/// Both the close task and a replacement master's first transaction consume
+/// the same marker under the display Session. Software master assignment alone
+/// cannot skip restoration, and an old close task cannot restore newer state.
+async fn finish_master_release<B: Backend>(
+    backend: &mut B,
+    mode: &ModeState,
+) -> Result<(), FsError> {
+    if !mode.lock().intel_master_restore_pending() {
+        return Ok(());
+    }
+    backend.restore().await?;
+    backend.valid()?;
+    mode.lock().intel_master_restored();
+    Ok(())
+}
+pub(crate) async fn restore_released_master<M: crate::intel_gpu_kms::Platform>(
+    session: &mut crate::intel_gpu_kms::Guard<'_, M>,
+    mode: &ModeState,
+) -> Result<(), FsError> {
+    finish_master_release(session, mode).await
+}
+
+async fn execute_plan<B: Backend>(
+    backend: &mut B,
+    mode: &ModeState,
+    open: u64,
+    plan: &Plan,
+    reservation: Option<FlipEventReservation>,
+) -> Result<FlipStamp, FsError> {
+    finish_master_release(backend, mode).await?;
+    if matches!(plan.action, Action::SetMaster) {
+        mode.lock().set_master(open).map_err(|_| FsError::Busy)?;
+        return Ok(FlipStamp {
+            ns: narf_time::monotonic_ns(),
+            sequence: 0,
+        });
+    }
+    {
+        let mut card = mode.lock();
+        if !plan.still_valid(&card, open) {
+            return Err(FsError::Busy);
+        }
+        card.intel_begin_transaction(open)?;
+    }
+    let _transaction = Transaction(mode.clone());
     let mut stamp = None;
     match &plan.action {
         Action::Noop => {}
+        Action::SetMaster => unreachable!("handled before transaction"),
         Action::DropMaster => {
             backend.restore().await?;
         }
@@ -899,9 +1332,38 @@ async fn execute<B: Backend>(
                 backend.restore().await?;
             }
         }
-        Action::Restore | Action::Observe => {
+        Action::Restore => {
             backend.restore().await?;
             stamp = Some(backend.vblank().await?);
+        }
+        Action::Observe => {
+            backend.surface().await?;
+            stamp = Some(backend.vblank().await?);
+        }
+        Action::Color {
+            primary,
+            coefficients,
+            lut,
+            dsb,
+        } => {
+            stamp = Some(if *primary {
+                let object = direct_object(plan.framebuffer.as_ref().ok_or(FsError::InvalidData)?)?;
+                backend
+                    .present_color(
+                        object,
+                        plan.geometry,
+                        Viewport {
+                            x: plan.next.x,
+                            y: plan.next.y,
+                        },
+                        *coefficients,
+                        lut.clone(),
+                        dsb.ok_or(FsError::Unsupported)?,
+                    )
+                    .await?
+            } else {
+                backend.color(*coefficients, lut.clone(), *dsb).await?
+            });
         }
         Action::Present => {
             let fb = plan.framebuffer.as_ref().ok_or(FsError::InvalidData)?;
@@ -923,50 +1385,73 @@ async fn execute<B: Backend>(
             };
             if direct {
                 let object = direct_object(fb)?;
-                wait_fences(object.dma_buf.resv.fences(DmaResvUsage::Write)).await?;
                 stamp = Some(match backend.present(object.clone(), plan.geometry).await {
                     Ok(stamp) => stamp,
                     // The display owner uses Unsupported only for admission
                     // before arm. A hard/lost/pending hardware error must keep
                     // its owners and cannot silently turn into CPU presentation.
                     Err(FsError::Unsupported) => {
-                        backend.restore().await?;
+                        backend.surface().await?;
                         backend.copy(fb, mode).await?;
                         backend.vblank().await?
                     }
                     Err(error) => return Err(error),
                 });
             } else {
-                backend.restore().await?;
+                backend.surface().await?;
                 backend.copy(fb, mode).await?;
                 stamp = Some(backend.vblank().await?);
             }
         }
-        Action::Cursor(bytes) => {
-            backend.restore().await?;
-            if let Some(fb) = &plan.framebuffer {
-                backend.copy(fb, mode).await?;
-            }
+        Action::Cursor {
+            bytes,
+            object,
+            hardware,
+            timing,
+        } => {
             let w = words(bytes);
-            if w[0] & 1 != 0 {
-                if w[6] == 0 {
-                    narf_console::user_cursor_hide();
-                } else {
-                    narf_console::user_cursor_show();
+            if *hardware {
+                stamp = Some(
+                    backend
+                        .cursor(
+                            object.clone(),
+                            w[0] & 1 != 0,
+                            (w[0] & 2 != 0).then_some((w[2] as i32, w[3] as i32)),
+                            *timing,
+                        )
+                        .await?,
+                );
+            } else {
+                backend.surface().await?;
+                if let Some(fb) = &plan.framebuffer {
+                    backend.copy(fb, mode).await?;
                 }
-            }
-            if w[0] & 2 != 0 {
-                let (hx, hy) = if w.len() == 9 {
-                    (w[7] as i32, w[8] as i32)
-                } else {
-                    (0, 0)
-                };
-                let x = (i64::from(w[2] as i32) + i64::from(hx)).clamp(0, u32::MAX as i64) as u32;
-                let y = (i64::from(w[3] as i32) + i64::from(hy)).clamp(0, u32::MAX as i64) as u32;
-                narf_console::user_cursor_move(x, y);
+                let w = words(bytes);
+                if w[0] & 1 != 0 {
+                    if w[6] == 0 {
+                        narf_console::user_cursor_hide();
+                    } else {
+                        narf_console::user_cursor_show();
+                    }
+                }
+                if w[0] & 2 != 0 {
+                    let (hx, hy) = if w.len() == 9 {
+                        (w[7] as i32, w[8] as i32)
+                    } else {
+                        (0, 0)
+                    };
+                    let x =
+                        (i64::from(w[2] as i32) + i64::from(hx)).clamp(0, u32::MAX as i64) as u32;
+                    let y =
+                        (i64::from(w[3] as i32) + i64::from(hy)).clamp(0, u32::MAX as i64) as u32;
+                    narf_console::user_cursor_move(x, y);
+                }
             }
         }
     }
+    // This is the completion linearization witness. A reset/loss after the
+    // final await must not turn an abandoned surface into a success event.
+    backend.valid()?;
     let published = {
         let mut card = mode.lock();
         if !plan.still_valid(&card, open) {
@@ -984,11 +1469,26 @@ async fn execute<B: Backend>(
                         );
                     }
                 }
-                Action::Noop | Action::Observe | Action::Cursor(_) => {}
-                Action::Present | Action::Restore => {
+                Action::Noop
+                | Action::Observe
+                | Action::Cursor { .. }
+                | Action::SetMaster
+                | Action::Color { primary: false, .. } => {}
+                Action::Present | Action::Restore | Action::Color { primary: true, .. } => {
                     *card.crtc_mut(plan.next.id).map_err(|_| FsError::NotFound)? =
                         plan.next.clone();
                 }
+            }
+            if let Some(color) = card.crtc_color.iter_mut().find(|c| c.crtc == plan.next.id) {
+                color.ctm = plan.next_ctm;
+                color.gamma_lut = plan.next_gamma;
+                if let Some(store) = &plan.legacy_store {
+                    color.gamma_store = store.clone();
+                }
+            }
+            card.collect_blobs();
+            if matches!(plan.action, Action::Color { .. }) {
+                backend.color_published();
             }
             if let Some(reservation) = reservation {
                 reservation.complete(
@@ -997,25 +1497,168 @@ async fn execute<B: Backend>(
                     stamp.ok_or(FsError::InvalidData)?,
                 );
             }
-            if let (Some(ptr), Some(sink)) = (plan.out, out) {
-                sink.lock()
-                    .push((ptr, stamp.ok_or(FsError::InvalidData)?.ns));
-            }
             true
         }
     };
     if !published {
         backend.restore().await?;
+        backend.valid()?;
+        // The failed transaction restored the kernel console, including its
+        // color. Keep subsequent admission consistent with that real image.
+        mode.lock().intel_master_restored();
         return Err(FsError::Busy);
     }
-    Ok(0)
+    Ok(stamp.unwrap_or(FlipStamp {
+        ns: narf_time::monotonic_ns(),
+        sequence: 0,
+    }))
 }
+
+fn plan_dependencies(
+    plan: &Plan,
+    mode: &ModeState,
+) -> Result<Vec<Arc<dyn narf_filesystem::DrmFence>>, FsError> {
+    if let Action::Cursor {
+        object: Some(object),
+        hardware: true,
+        ..
+    } = &plan.action
+    {
+        return Ok(object.dma_buf.resv.fences(DmaResvUsage::Write));
+    }
+    let Some(fb) = &plan.framebuffer else {
+        return Ok(Vec::new());
+    };
+    if let Some(intel) = &fb.intel {
+        Ok(intel.object.dma_buf.resv.fences(DmaResvUsage::Write))
+    } else {
+        Ok(mode
+            .lock()
+            .dumb_backing(fb.gem_handle)
+            .ok_or(FsError::NotFound)?
+            .dma_buf
+            .resv
+            .fences(DmaResvUsage::Write))
+    }
+}
+
 fn direct_object(frame: &Framebuffer) -> Result<Arc<crate::intel_gpu_gem::GemObject>, FsError> {
     frame
         .intel
         .as_ref()
         .map(|i| i.object.clone())
         .ok_or(FsError::Unsupported)
+}
+
+fn legacy_gamma_store(mode: &ModeState, crtc: u32, size: usize) -> Result<Vec<u16>, FsError> {
+    let card = mode.lock();
+    card.crtc(crtc).map_err(|_| FsError::NotFound)?;
+    if !card.intel_color(crtc) {
+        return Err(FsError::NotImplemented);
+    }
+    if size != crate::drm::card::LEGACY_GAMMA_SIZE {
+        return Err(FsError::InvalidData);
+    }
+    Ok(card
+        .crtc_color(crtc)
+        .expect("validated color")
+        .gamma_store
+        .clone())
+}
+
+fn get_legacy_gamma(
+    mode: &ModeState,
+    arg: u64,
+    context: &dyn IoctlContext,
+) -> Result<u64, FsError> {
+    let bytes = read(context, arg, 32)?;
+    let w = words(&bytes);
+    let size = w[1] as usize;
+    let store = legacy_gamma_store(mode, w[0], size)?;
+    for (channel, at) in [8, 16, 24].into_iter().enumerate() {
+        let pointer = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let values: Vec<u8> = store[channel * size..(channel + 1) * size]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        context.write(pointer, &values)?;
+    }
+    Ok(0)
+}
+
+/// Shared foreground boundary for the real dispatcher and native PCI models.
+/// All user copies/FD lookups finish before the owned job can reach the worker.
+#[allow(clippy::too_many_arguments)]
+async fn admit_with_gem(
+    queue: &queue::Queue,
+    open: u64,
+    cmd: u32,
+    arg: u64,
+    context: &dyn IoctlContext,
+    events: Option<&Events>,
+    geometry: Geometry,
+    epoch: u64,
+    gem: Option<&crate::intel_gpu_gem::GemState>,
+) -> Result<queue::Submitted, queue::SubmitError> {
+    if drm_uapi::ioc_nr(cmd) != 0x1e && !queue.is_master(open) {
+        return Err(FsError::PermissionDenied.into());
+    }
+    let mut request = if drm_uapi::ioc_nr(cmd) == 0xa5 {
+        let bytes = read(context, arg, 32)?;
+        let w = words(&bytes);
+        let (crtc, size) = (w[0], w[1] as usize);
+        queue.check_legacy_gamma(crtc, size)?;
+        let mut store = Vec::new();
+        store
+            .try_reserve_exact(3 * size)
+            .map_err(|_| FsError::OutOfMemory)?;
+        for at in [8, 16, 24] {
+            let pointer = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+            let ramp = read(context, pointer, size * 2)?;
+            store.extend(
+                ramp.chunks_exact(2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]])),
+            );
+        }
+        Request::LegacyGamma {
+            crtc,
+            store,
+            blob: 0,
+        }
+    } else {
+        Request::copy(cmd, arg, context)?
+    };
+    if let (Request::Cursor(bytes, object, hardware), Some(gem)) = (&mut request, gem) {
+        let w = words(bytes);
+        if w[0] == 0 || w[0] & !3 != 0 {
+            return Err(FsError::InvalidData.into());
+        }
+        if w[0] & 1 != 0 && w[6] != 0 {
+            *object = Some(gem.object(w[6])?);
+        }
+        *hardware = true;
+    }
+    queue
+        .submit(open, request, geometry, epoch, context, events)
+        .await
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[allow(clippy::too_many_arguments)]
+async fn admit(
+    queue: &queue::Queue,
+    open: u64,
+    cmd: u32,
+    arg: u64,
+    context: &dyn IoctlContext,
+    events: Option<&Events>,
+    geometry: Geometry,
+    epoch: u64,
+) -> Result<queue::Submitted, queue::SubmitError> {
+    admit_with_gem(
+        queue, open, cmd, arg, context, events, geometry, epoch, None,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1027,7 +1670,14 @@ pub(crate) async fn dispatch(
     context: &dyn IoctlContext,
     events: Option<&Events>,
     out: Option<&OutFences>,
+    gem: &crate::intel_gpu_gem::GemState,
 ) -> Option<Result<u64, FsError>> {
+    if drm_uapi::ioc_nr(cmd) == 0xa4 {
+        let mode = crate::drm_registry::mode_state(index)?;
+        if mode.lock().intel_ctm {
+            return Some(get_legacy_gamma(&mode, arg, context));
+        }
+    }
     if !mutates(cmd) {
         return None;
     }
@@ -1035,24 +1685,49 @@ pub(crate) async fn dispatch(
     Some(
         async {
             let mode = crate::drm_registry::mode_state(index).ok_or(FsError::Unsupported)?;
-            // Preserve DRM_MASTER precedence before touching nested user pointers.
-            if drm_uapi::ioc_nr(cmd) != 0x1e && !mode.lock().is_master(open) {
-                return Err(FsError::PermissionDenied);
+            let queue = queue::for_card(index, mode.clone());
+            let geometry = display.console_geometry();
+            let submitted = match admit_with_gem(
+                &queue,
+                open,
+                cmd,
+                arg,
+                context,
+                events,
+                geometry,
+                display.epoch(),
+                (crate::drm_registry::mode_state(index).is_some_and(|card| card.lock().intel_ctm))
+                    .then_some(gem),
+            )
+            .await
+            {
+                Ok(submitted) => submitted,
+                Err(queue::SubmitError::Io(error)) => return Err(error),
+                Err(queue::SubmitError::NoDescriptor) => return Ok((-24i64) as u64),
+            };
+            if let Some((completion, start, nonblock)) = submitted {
+                if start {
+                    let queue = queue.clone();
+                    // Scheduler admission is infallible (TaskId, not Result);
+                    // the independent task survives cancellation of this ioctl.
+                    let _worker = narf_scheduler::spawn_stackful(async move {
+                        let mut worker = queue::DisplayWorker { display, mode };
+                        queue.run(&mut worker).await;
+                    });
+                }
+                if !nonblock {
+                    completion.result_async().await?;
+                }
             }
-            let request = Request::copy(cmd, arg, context)?;
-            let mut session = display.session().await?;
-            if matches!(request, Request::SetMaster) {
-                return mode
-                    .lock()
-                    .set_master(open)
-                    .map(|_| 0)
-                    .map_err(|_| FsError::Busy);
-            }
-            execute(&mut session, &mode, open, request, context, events, out).await
+            let _ = out; // Other vendors retain the legacy deadline export sink.
+            Ok(0)
         }
         .await,
     )
 }
+
+#[path = "intel_gpu_kms_queue.rs"]
+mod queue;
 
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_kms_ioctl_tests.rs"]

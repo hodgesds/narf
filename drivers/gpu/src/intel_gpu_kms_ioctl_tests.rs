@@ -8,12 +8,22 @@ use narf_lib::sync::IrqSafeSpinLock;
 struct Cpu {
     bytes: IrqSafeSpinLock<[u8; 4096]>,
     bad_write: AtomicBool,
+    writes: AtomicUsize,
+    fail_after: AtomicUsize,
+    no_descriptor: AtomicBool,
+    exported: IrqSafeSpinLock<Vec<Arc<dyn narf_filesystem::DrmFence>>>,
+    inputs: IrqSafeSpinLock<Vec<Arc<dyn narf_filesystem::DrmFence>>>,
 }
 impl Cpu {
     fn new() -> Self {
         Self {
             bytes: IrqSafeSpinLock::new([0; 4096]),
             bad_write: AtomicBool::new(false),
+            writes: AtomicUsize::new(0),
+            fail_after: AtomicUsize::new(usize::MAX),
+            no_descriptor: AtomicBool::new(false),
+            exported: IrqSafeSpinLock::new(Vec::new()),
+            inputs: IrqSafeSpinLock::new(Vec::new()),
         }
     }
 }
@@ -28,7 +38,9 @@ impl IoctlContext for Cpu {
         Ok(())
     }
     fn write(&self, address: u64, src: &[u8]) -> Result<(), FsError> {
-        if self.bad_write.load(Ordering::Acquire) {
+        if self.bad_write.load(Ordering::Acquire)
+            || self.writes.fetch_add(1, Ordering::AcqRel) >= self.fail_after.load(Ordering::Acquire)
+        {
             return Err(FsError::BadAddress);
         }
         let start = usize::try_from(address).map_err(|_| FsError::BadAddress)?;
@@ -38,6 +50,21 @@ impl IoctlContext for Cpu {
             .ok_or(FsError::BadAddress)?;
         self.bytes.lock()[start..end].copy_from_slice(src);
         Ok(())
+    }
+    fn install_sync_file(
+        &self,
+        fences: Vec<Arc<dyn narf_filesystem::DrmFence>>,
+        report: &mut dyn FnMut(i32) -> Result<(), FsError>,
+    ) -> Result<i32, narf_filesystem::InstallFdError> {
+        if self.no_descriptor.load(Ordering::Acquire) {
+            return Err(narf_filesystem::InstallFdError::NoDescriptor);
+        }
+        report(41).map_err(narf_filesystem::InstallFdError::Report)?;
+        self.exported.lock().extend(fences);
+        Ok(41)
+    }
+    fn sync_file_fences(&self, fd: i32) -> Option<Vec<Arc<dyn narf_filesystem::DrmFence>>> {
+        (fd == 9).then(|| self.inputs.lock().clone())
     }
     fn nonblocking(&self) -> bool {
         false
@@ -50,6 +77,7 @@ struct Device {
     presents: Arc<AtomicUsize>,
     copies: Arc<AtomicUsize>,
     unsupported: Arc<AtomicBool>,
+    invalid: Arc<AtomicBool>,
 }
 impl Device {
     fn new() -> Self {
@@ -60,10 +88,18 @@ impl Device {
             presents: Arc::new(AtomicUsize::new(0)),
             copies: Arc::new(AtomicUsize::new(0)),
             unsupported: Arc::new(AtomicBool::new(false)),
+            invalid: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 impl Backend for Device {
+    fn valid(&self) -> Result<(), FsError> {
+        if self.invalid.load(Ordering::Acquire) {
+            Err(FsError::NoDevice)
+        } else {
+            Ok(())
+        }
+    }
     fn console_fb(&self) -> narf_graphics_driver::generic::GenericFb {
         narf_graphics_driver::generic::GenericFb::new(0, 64, 32, 256, 32)
     }
@@ -153,7 +189,7 @@ fn disable(flags: u32) -> Request {
 fn intel_kms_signals_follow_latch_and_cancellation_refunds_space() -> TestResult {
     let mode = mode();
     let cpu = Cpu::new();
-    let events = Events::new(Default::default());
+    let events = Events::new(IrqSafeSpinLock::new(Default::default()));
     let out = OutFences::new(Vec::new());
     let mut device = Device::new();
     let ready = device.ready.clone();
@@ -210,7 +246,7 @@ fn intel_kms_failure_and_cancel_publish_no_state_or_success() -> TestResult {
     for failure in [false, true] {
         let mode = mode();
         let cpu = Cpu::new();
-        let events = Events::new(Default::default());
+        let events = Events::new(IrqSafeSpinLock::new(Default::default()));
         let out = OutFences::new(Vec::new());
         let mut device = Device::new();
         let fail = device.fail.clone();
@@ -253,7 +289,7 @@ fn intel_kms_test_only_and_output_fault_do_not_touch_device() -> TestResult {
     for test in [false, true] {
         let mode = mode();
         let cpu = Cpu::new();
-        let events = Events::new(Default::default());
+        let events = Events::new(IrqSafeSpinLock::new(Default::default()));
         let out = OutFences::new(Vec::new());
         let mut device = Device::new();
         let calls = device.calls.clone();
@@ -333,7 +369,7 @@ fn intel_kms_copy_fallback_restores_before_copy_and_waits_real_vblank() -> TestR
     let mode = mode();
     let target = framebuffer(&mode, 7, false).expect("WB framebuffer");
     let cpu = Cpu::new();
-    let events = Events::new(Default::default());
+    let events = Events::new(IrqSafeSpinLock::new(Default::default()));
     let out = OutFences::new(Vec::new());
     let mut device = Device::new();
     let (ready, copies, presents, calls) = (
@@ -381,7 +417,7 @@ fn intel_kms_deferred_close_cannot_publish_removed_framebuffer() -> TestResult {
     let mode = mode();
     let target = framebuffer(&mode, 8, false).expect("foreign framebuffer");
     let cpu = Cpu::new();
-    let events = Events::new(Default::default());
+    let events = Events::new(IrqSafeSpinLock::new(Default::default()));
     let out = OutFences::new(Vec::new());
     let mut device = Device::new();
     let ready = device.ready.clone();
@@ -490,7 +526,7 @@ fn intel_kms_public_wc_primary_flips_reach_direct_backend() -> TestResult {
                 atomic_frame(target, EVENT | NONBLOCK)
             };
             let cpu = Cpu::new();
-            let events = Events::new(Default::default());
+            let events = Events::new(IrqSafeSpinLock::new(Default::default()));
             let out = OutFences::new(Vec::new());
             let mut device = Device::new();
             let (ready, presents, copies) = (
@@ -548,7 +584,7 @@ fn intel_kms_wc_admission_falls_back_only_before_hardware_arm() -> TestResult {
             let target = framebuffer(&mode, 7, true).expect("target");
             mode.lock().crtcs[0].primary_fb = Some(old);
             let cpu = Cpu::new();
-            let events = Events::new(Default::default());
+            let events = Events::new(IrqSafeSpinLock::new(Default::default()));
             let out = OutFences::new(Vec::new());
             let mut device = Device::new();
             device.ready.store(true, Ordering::Release);
@@ -651,7 +687,7 @@ kernel_test_in!(
 fn intel_kms_event_exhaustion_precedes_hardware_or_output_publication() -> TestResult {
     let mode = mode();
     let cpu = Cpu::new();
-    let events = Events::new(Default::default());
+    let events = Events::new(IrqSafeSpinLock::new(Default::default()));
     let out = OutFences::new(Vec::new());
     for cookie in 0..128 {
         FlipEventReservation::reserve(&events)
@@ -691,7 +727,7 @@ kernel_test_in!(
 fn intel_kms_metadata_observation_preserves_initial_console_state() -> TestResult {
     let mode = mode();
     let cpu = Cpu::new();
-    let events = Events::new(Default::default());
+    let events = Events::new(IrqSafeSpinLock::new(Default::default()));
     let out = OutFences::new(Vec::new());
     let mut device = Device::new();
     let ready = device.ready.clone();
@@ -897,3 +933,15 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_kms",
     intel_kms_real_copy_uses_mapped_console_alias_and_preserves_padding
 );
+
+#[path = "intel_gpu_kms_queue_tests.rs"]
+mod nonblock;
+
+#[path = "intel_gpu_color_ioctl_tests.rs"]
+mod color;
+
+#[path = "intel_gpu_cursor_ioctl_tests.rs"]
+mod cursor;
+
+#[path = "intel_gpu_legacy_gamma_tests.rs"]
+mod legacy_gamma;

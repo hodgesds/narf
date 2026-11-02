@@ -101,6 +101,27 @@ impl UserBackend for Native {
     fn device_facts(&self) -> Option<crate::intel_gpu_user::DeviceFacts> {
         Some(self.facts)
     }
+    fn clear_vram(
+        &self,
+        object: Arc<crate::intel_gpu_gem::GemObject>,
+        epoch: u64,
+    ) -> FsFuture<'_, Arc<CompletionFence>> {
+        Box::pin(async move {
+            if self.status().is_none_or(|status| {
+                status.epoch != epoch || status.platform != GtPlatform::Battlemage
+            }) {
+                return Err(FsError::NoDevice);
+            }
+            let mut clear = object.begin_cpu_vram_clear()?;
+            loop {
+                // SAFETY: this native fixture exclusively owns its fake
+                // LMEM RAM aperture, without PCI power transitions.
+                if let Some(fence) = unsafe { clear.clear_next() } {
+                    return Ok(fence);
+                }
+            }
+        })
+    }
     fn submit<'a>(
         &'a self,
         context: Arc<UserContext>,
@@ -171,7 +192,18 @@ fn create_bo(file: &RenderFile, info: &DeviceInfo, user: &Cpu, size: u64, vm: u3
     u32_at(&user.wire.load(64, 56), 28)
 }
 fn create_queue(file: &RenderFile, info: &DeviceInfo, user: &Cpu, vm: u32, class: u16) -> u32 {
-    user.wire.store(512, &[class as u8, 0, 0, 0, 0, 0, 0, 0]);
+    create_queue_instance(file, info, user, vm, class, 0)
+}
+fn create_queue_instance(
+    file: &RenderFile,
+    info: &DeviceInfo,
+    user: &Cpu,
+    vm: u32,
+    class: u16,
+    instance: u16,
+) -> u32 {
+    user.wire
+        .store(512, &[class as u8, 0, instance as u8, 0, 0, 0, 0, 0]);
     let mut wire = [0; 48];
     put32(&mut wire, 8, 0x00010001);
     put32(&mut wire, 12, vm);
@@ -180,6 +212,82 @@ fn create_queue(file: &RenderFile, info: &DeviceInfo, user: &Cpu, vm: u32, class
     assert_eq!(invoke(file, info, user, xe::EXEC_QUEUE_CREATE), Ok(0));
     u32_at(&user.wire.load(64, 48), 20)
 }
+
+fn smoke_xe_copy1_query_and_instance_platform_refusal() -> TestResult {
+    for (platform, ack) in [
+        (GtPlatform::Battlemage, 0xdfc),
+        (GtPlatform::Alchemist, 0x130044),
+        (
+            GtPlatform::Integrated(crate::intel_gpu::Generation::MeteorLake),
+            0xdfc,
+        ),
+    ] {
+        let (w, arena, mut gt) = hardware_model(platform, ack);
+        prime(&mut gt, &w, ack);
+        let (_, info) = setup(&mut gt, &w, platform);
+        let file = RenderFile::new();
+        let user = Cpu::new();
+        let mut wire = [0; 40];
+        user.wire.store(64, &wire);
+        assert_eq!(invoke(&file, &info, &user, xe::DEVICE_QUERY), Ok(0));
+        let size = u32_at(&user.wire.load(64, 40), 12);
+        put32(&mut wire, 12, size);
+        put64(&mut wire, 16, 1024);
+        user.wire.store(64, &wire);
+        assert_eq!(invoke(&file, &info, &user, xe::DEVICE_QUERY), Ok(0));
+        let reply = user.wire.load(1024, size as usize);
+        let mut expected = alloc::vec![(0u16, 0u16), (1, 0)];
+        if platform == GtPlatform::Battlemage {
+            expected.push((1, 1));
+        }
+        if gt
+            .engines()
+            .unwrap()
+            .contains(crate::intel_gpu_engine::Engine::Ccs0)
+        {
+            expected.push((4, 0));
+        }
+        assert_eq!(size as usize, 8 + 32 * expected.len());
+        assert_eq!(u32_at(&reply, 0) as usize, expected.len());
+        assert!(reply[4..8].iter().all(|byte| *byte == 0));
+        for (entry, (class, instance)) in reply[8..].chunks_exact(32).zip(expected) {
+            assert_eq!(&entry[..2], &class.to_le_bytes());
+            assert_eq!(&entry[2..4], &instance.to_le_bytes());
+            assert!(entry[4..].iter().all(|byte| *byte == 0));
+        }
+        let vm = create_vm(&file, &info, &user);
+        for instance in [1u8, 2, 8] {
+            if instance == 1 && platform == GtPlatform::Battlemage {
+                continue;
+            }
+            user.wire.store(512, &[1, 0, instance, 0, 0, 0, 0, 0]);
+            let mut queue = [0; 48];
+            put32(&mut queue, 8, 0x00010001);
+            put32(&mut queue, 12, vm);
+            put64(&mut queue, 24, 512);
+            user.wire.store(64, &queue);
+            assert_eq!(
+                invoke(&file, &info, &user, xe::EXEC_QUEUE_CREATE),
+                Err(FsError::InvalidData)
+            );
+        }
+        let before = arena.live_allocations();
+        if platform != GtPlatform::Battlemage {
+            assert!(gt
+                .submit_ppgtt_probe_on(200, crate::intel_gpu_engine::Engine::Bcs8)
+                .is_err());
+            assert_eq!(arena.live_allocations(), before);
+        }
+        hardware_stop(&mut gt, &w, ack);
+        drop(gt);
+        assert_eq!(arena.live_allocations(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_bcs8",
+    smoke_xe_copy1_query_and_instance_platform_refusal
+);
 fn mapping(object: u32, va: u64, offset: u64, length: u64, pat: u16, flags: u32) -> [u8; 80] {
     let mut wire = [0; 80];
     put32(&mut wire, 8, object);
@@ -271,10 +379,21 @@ fn finish(
     registered: &mut BTreeMap<u32, u32>,
     start: u64,
 ) {
+    finish_policy(gt, w, fence, registered, start, 2);
+}
+
+fn finish_policy(
+    gt: &mut GuCGt<Window, Arena>,
+    w: &Window,
+    fence: &CompletionFence,
+    registered: &mut BTreeMap<u32, u32>,
+    start: u64,
+    priority: u32,
+) {
     for now in start..start + 60 {
         assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
-        // Literal GuC policy KLVs for a normal native Xe queue. Inspect the
-        // actual CT bytes before the independent firmware model consumes them.
+        // Native queues request normal2; trusted probes and direct contexts
+        // use low3. Keep the exact caller-selected policy and KLV checks.
         {
             let memory = ct_memory(w);
             let words = memory.borrow();
@@ -283,7 +402,7 @@ fn finish(
             while head != tail {
                 let length = words[1024 + head as usize] & 255;
                 if words[1024 + ((head + 1) & 1023) as usize] as u16 == 0x100b {
-                    assert_eq!(words[1024 + ((head + 4) & 1023) as usize], 2);
+                    assert_eq!(words[1024 + ((head + 4) & 1023) as usize], priority);
                     assert_eq!(words[1024 + ((head + 6) & 1023) as usize], 1000);
                 }
                 head = (head + length + 1) & 1023;
@@ -312,7 +431,7 @@ fn ready<F: Future + ?Sized>(mut future: core::pin::Pin<&mut F>) -> F::Output {
 
 fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
     // RENDER, then COPY: the same PPGTT batch and user fence on BCS0.
-    for (platform, ack, class) in [
+    for (platform, ack, class, logical) in [
         (GtPlatform::Battlemage, 0xdfc),
         (GtPlatform::Alchemist, 0x130044),
         (
@@ -321,8 +440,12 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
         ),
     ]
     .into_iter()
-    .flat_map(|(platform, ack)| [0u16, 1, 4].map(|class| (platform, ack, class)))
-    {
+    .flat_map(|(platform, ack)| {
+        [(0u16, 0u16), (1, 0), (1, 1), (4, 0)]
+            .into_iter()
+            .filter(move |(_, logical)| *logical == 0 || platform == GtPlatform::Battlemage)
+            .map(move |(class, logical)| (platform, ack, class, logical))
+    }) {
         let (w, arena, mut gt) = hardware_model(platform, ack);
         prime(&mut gt, &w, ack);
         let ccs = gt
@@ -353,7 +476,7 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
                 Err(FsError::InvalidData)
             );
         }
-        let queue = create_queue(&file, &info, &user, vm, class);
+        let queue = create_queue_instance(&file, &info, &user, vm, class, logical);
         let handles = buffers(&file, &info, &user, vm);
         let objects = handles.map(|handle| Arc::downgrade(&file.gem.object(handle).unwrap()));
         let output = file.syncobjs.lock().create(0).unwrap();
@@ -409,13 +532,14 @@ fn smoke_xe_native_exec_user_fence_close_and_retirement() -> TestResult {
         // The batch's MI_STORE_DATA_IMM executed on the selected engine.
         assert_eq!(user.read_u64_acquire(0x4080), Ok(0x4e415246));
         let engine_base = match class {
+            1 if logical == 1 => 0x3ee244,
             1 => 0x22244,
             4 => 0x1a244,
             _ => 0x2244,
         };
-        assert!(registered.values().all(|base| {
-            w.0.borrow().memory[base].borrow()[1024 + 2] == engine_base
-        }));
+        assert!(registered
+            .values()
+            .all(|base| { w.0.borrow().memory[base].borrow()[1024 + 2] == engine_base }));
         assert_eq!(
             fence.result(),
             None,
@@ -615,7 +739,10 @@ fn create_placed(
     put32(&mut wire, 20, flags);
     wire[32..34].copy_from_slice(&caching.to_le_bytes());
     user.wire.store(64, &wire);
-    invoke(file, info, user, xe::GEM_CREATE).map(|_| u32_at(&user.wire.load(64, 56), 28))
+    let mut call = core::pin::pin!(file.dispatch_user(info, xe::GEM_CREATE, 64, user));
+    ready(call.as_mut())
+        .unwrap()
+        .map(|_| u32_at(&user.wire.load(64, 56), 28))
 }
 
 fn smoke_xe_vram_placement_queries_mmap_execution_and_reuse() -> TestResult {
@@ -653,7 +780,11 @@ fn smoke_xe_vram_placement_queries_mmap_execution_and_reuse() -> TestResult {
     assert_eq!(&regions[96..100], &[1, 0, 1, 0]);
     assert_eq!(u32_at(&regions, 100), 4096);
     assert_eq!(
-        [u64_at(&regions, 104), u64_at(&regions, 112), u64_at(&regions, 120)],
+        [
+            u64_at(&regions, 104),
+            u64_at(&regions, 112),
+            u64_at(&regions, 120)
+        ],
         [bytes as u64, 0, bytes as u64]
     );
     assert_eq!(u64_at(&xe_query(&file, &info, &user, 2), 16), 9);
@@ -690,7 +821,10 @@ fn smoke_xe_vram_placement_queries_mmap_execution_and_reuse() -> TestResult {
     let dpa = object.pages().next().unwrap();
     assert_eq!(cpu_view.frames, [base + dpa, base + dpa + 4096]);
     drop(cpu_view);
-    assert_eq!(file.gem.export_object(handle).err(), Some(FsError::NotImplemented));
+    assert_eq!(
+        file.gem.export_object(handle).err(),
+        Some(FsError::NotImplemented)
+    );
     assert_eq!(u64_at(&xe_query(&file, &info, &user, 1), 112), 8192);
     // Execute: the batch's store lands in VRAM through a DM-bit PPGTT leaf.
     let vm = create_vm(&file, &info, &user);
@@ -795,18 +929,21 @@ fn smoke_xe_hung_exec_bans_only_its_queue() -> TestResult {
         let mut wire = [0; 40];
         put32(&mut wire, 8, queue);
         user.wire.store(64, &wire);
-        assert_eq!(invoke(&file, &info, user, xe::EXEC_QUEUE_GET_PROPERTY), Ok(0));
+        assert_eq!(
+            invoke(&file, &info, user, xe::EXEC_QUEUE_GET_PROPERTY),
+            Ok(0)
+        );
         u64_at(&user.wire.load(64, 40), 16)
     };
     assert_eq!(ban(&user, queue), 0);
     // Refusals return from the first poll, before any await.
-    let exec_now = |file: &RenderFile, info: &DeviceInfo, user: &Cpu| {
-        match core::pin::pin!(file.dispatch_user(info, xe::EXEC, 64, user))
-            .poll(&mut Context::from_waker(Waker::noop()))
-        {
-            Poll::Ready(Some(result)) => result,
-            _ => panic!("EXEC refusal parked"),
-        }
+    let exec_now = |file: &RenderFile, info: &DeviceInfo, user: &Cpu| match core::pin::pin!(
+        file.dispatch_user(info, xe::EXEC, 64, user)
+    )
+    .poll(&mut Context::from_waker(Waker::noop()))
+    {
+        Poll::Ready(Some(result)) => result,
+        _ => panic!("EXEC refusal parked"),
     };
     let late = 5_000_000_130;
     assert_eq!(gt.poll(late), Poll::Ready(Ok(GtState::SchedulingReady)));
@@ -996,7 +1133,10 @@ fn smoke_xe_igpu_wc_objects_scanout_noncoherent_binds_and_restore() -> TestResul
     *user.mapping.lock() = None;
     drop(object);
     assert_eq!(close(&file, &info, &user, abi::GEM_CLOSE, wc), Ok(0));
-    assert_eq!(ram_memory_type(narf_memory::PhysAddr::new(pages[0])), wc_type);
+    assert_eq!(
+        ram_memory_type(narf_memory::PhysAddr::new(pages[0])),
+        wc_type
+    );
     assert_eq!(
         close(&file, &info, &user, xe::EXEC_QUEUE_DESTROY, queue),
         Ok(0)
@@ -1123,7 +1263,7 @@ fn smoke_xe_queries_abi_identity_and_clock_facts() -> TestResult {
     );
     assert_eq!(user.wire.load(4096, 2), b"xe");
     assert_eq!(u64_at(&user.wire.load(64, 64), 16), 2);
-    for (query, size) in [(0, 72), (1, 96), (2, 48), (3, 104), (5, 34)] {
+    for (query, size) in [(0, 104), (1, 96), (2, 48), (3, 104), (5, 34)] {
         let mut wire = [0; 40];
         put32(&mut wire, 8, query);
         put64(&mut wire, 16, u64::MAX);
@@ -1143,11 +1283,19 @@ fn smoke_xe_queries_abi_identity_and_clock_facts() -> TestResult {
         let reply = user.wire.load(1024, size as usize);
         match query {
             0 => {
-                // drm_xe_engine: RENDER then COPY, logical instance 0, GT0.
-                assert_eq!(u32_at(&reply, 0), 2);
-                assert!(reply[4..40].iter().all(|b| *b == 0));
-                assert_eq!(&reply[40..42], &[1, 0]);
-                assert!(reply[42..].iter().all(|b| *b == 0));
+                // drm_xe_query_engines: header8 + three drm_xe_engine32.
+                // BMG publishes RENDER0, COPY0 and logical COPY1 (BCS8).
+                assert_eq!(u32_at(&reply, 0), 3);
+                assert!(reply[4..8].iter().all(|byte| *byte == 0));
+                for (entry, (class, instance)) in
+                    reply[8..]
+                        .chunks_exact(32)
+                        .zip([(0u16, 0u16), (1, 0), (1, 1)])
+                {
+                    assert_eq!(&entry[..2], &class.to_le_bytes());
+                    assert_eq!(&entry[2..4], &instance.to_le_bytes());
+                    assert!(entry[4..].iter().all(|byte| *byte == 0));
+                }
             }
             1 => {
                 assert_eq!(u32_at(&reply, 12), 4096);
@@ -1170,10 +1318,21 @@ fn smoke_xe_queries_abi_identity_and_clock_facts() -> TestResult {
             }
         }
     }
-    // Full command encoding and stable Xe profile prevent i915/Xe number
-    // collisions from decoding a malformed Xe request as legacy GETPARAM.
+    // Exact encodings distinguish i915 GETPARAM from Xe QUEUE_CREATE, both
+    // numbered 0x46. Unknown sizes cannot fall through into compatibility.
+    let mut getparam = [0; 16];
+    put32(&mut getparam, 0, 11);
+    put64(&mut getparam, 8, 1024);
+    user.wire.store(64, &getparam);
+    assert_eq!(invoke(&file, &info, &user, abi::GETPARAM), Ok(0));
+    assert_eq!(u32_at(&user.wire.load(1024, 4), 0), 1);
     assert_eq!(
-        invoke(&file, &info, &user, abi::GETPARAM),
+        invoke(
+            &file,
+            &info,
+            &user,
+            crate::drm_uapi::iowr(b'd' as u32, 0x46, 24)
+        ),
         Err(FsError::InvalidData)
     );
     *mailbox.status.lock() = None;
@@ -1292,4 +1451,11 @@ mod timestamps {
 }
 mod waits {
     include!("intel_gpu_xe_wait_tests.rs");
+}
+
+mod multi_ccs {
+    include!("intel_gpu_multi_ccs_tests.rs");
+}
+mod dg2_vram {
+    include!("intel_gpu_dg2_vram_tests.rs");
 }

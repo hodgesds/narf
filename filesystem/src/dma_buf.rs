@@ -74,13 +74,88 @@ pub fn dma_resv_usage_rw(write: bool) -> DmaResvUsage {
     }
 }
 
-/// Linux `struct dma_resv`: the implicit-sync fences attached to one buffer.
-pub struct DmaResv {
-    fences: IrqSafeSpinLock<Vec<(Arc<dyn DrmFence>, DmaResvUsage)>>,
-    /// Bumped under `fences` by every [`DmaResv::add_fence`].
-    generation: core::sync::atomic::AtomicU64,
+/// Immutable fence identity, sampled before entering a driver's admission lock.
+/// Linux dma_fence context/seqno do not change during the fence lifetime.
+#[derive(Clone)]
+pub struct DmaResvFence {
+    fence: Arc<dyn DrmFence>,
+    context: Option<u64>,
+    seqno: u64,
+}
+impl core::fmt::Debug for DmaResvFence {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DmaResvFence")
+            .field("context", &self.context)
+            .field("seqno", &self.seqno)
+            .finish_non_exhaustive()
+    }
+}
+impl DmaResvFence {
+    pub fn new(fence: Arc<dyn DrmFence>) -> Self {
+        Self {
+            context: fence.context(),
+            seqno: fence.seqno(),
+            fence,
+        }
+    }
+    fn same_context(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.fence, &other.fence)
+            || (self.context.is_some() && self.context == other.context)
+    }
 }
 
+#[derive(Clone, Debug)]
+struct ReservationEntry {
+    fence: DmaResvFence,
+    usage: DmaResvUsage,
+}
+
+/// Completed observations and an addition generation from one reservation.
+/// Construct outside all driver admission locks: polling foreign fences may
+/// enter their driver. A completed fence remains terminal forever.
+pub struct DmaResvSnapshot<'a> {
+    owner: &'a DmaResv,
+    generation: u64,
+    entries: Vec<(ReservationEntry, bool)>,
+}
+impl core::fmt::Debug for DmaResvSnapshot<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DmaResvSnapshot")
+            .field("generation", &self.generation)
+            .field("entries", &self.entries.len())
+            .finish_non_exhaustive()
+    }
+}
+impl DmaResvSnapshot<'_> {
+    pub fn has_fences(&self, usage: DmaResvUsage) -> bool {
+        self.entries
+            .iter()
+            .any(|(entry, done)| !done && entry.usage <= usage)
+    }
+    /// Check under the exporter admission lock before CPU access or an
+    /// implicit GPU admission. All exporter mutation paths must share it.
+    pub fn is_current(&self) -> bool {
+        self.owner.generation() == self.generation
+    }
+}
+
+/// Removed references, retained until after the exporter's admission lock is
+/// dropped. Dropping an arbitrary fence can enter another device's driver.
+#[must_use = "drop retired fences only after releasing driver admission locks"]
+#[derive(Debug)]
+pub struct DmaResvRetired(Vec<ReservationEntry>);
+impl Drop for DmaResvRetired {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// Linux `struct dma_resv`: the implicit-sync fences attached to one buffer.
+pub struct DmaResv {
+    fences: IrqSafeSpinLock<Vec<ReservationEntry>>,
+    /// Counts additions, including same-context replacements.
+    generation: core::sync::atomic::AtomicU64,
+}
 impl core::fmt::Debug for DmaResv {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DmaResv")
@@ -88,11 +163,6 @@ impl core::fmt::Debug for DmaResv {
             .finish()
     }
 }
-
-fn same_context(a: &Arc<dyn DrmFence>, b: &Arc<dyn DrmFence>) -> bool {
-    Arc::ptr_eq(a, b) || (a.context().is_some() && a.context() == b.context())
-}
-
 impl Default for DmaResv {
     fn default() -> Self {
         Self {
@@ -101,58 +171,102 @@ impl Default for DmaResv {
         }
     }
 }
-
 impl DmaResv {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Linux `dma_resv_add_fence`: a fence replaces an existing one of the
-    /// same context that it is later than or equal to (when the old usage is
-    /// at least as strong), or any already-signalled fence; otherwise it is
-    /// appended.
-    ///
-    /// Driver fences may take their device's request gate to reap
-    /// completions, so signalled-ness is sampled with the lock dropped;
-    /// signalled entries are pruned rather than reused slot-by-slot, which
-    /// no query can distinguish (every query skips signalled fences).
-    pub fn add_fence(&self, fence: Arc<dyn DrmFence>, usage: DmaResvUsage) {
-        let snapshot: Vec<Arc<dyn DrmFence>> =
-            self.fences.lock().iter().map(|(f, _)| f.clone()).collect();
-        let signalled: Vec<Arc<dyn DrmFence>> =
-            snapshot.into_iter().filter(|f| f.is_signalled()).collect();
-        let mut fences = self.fences.lock();
-        self.generation
-            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-        fences.retain(|(old, _)| !signalled.iter().any(|s| Arc::ptr_eq(s, old)));
-        for slot in fences.iter_mut() {
-            let (old, old_usage) = slot;
-            // dma_fence_is_later_or_same(fence, old).
-            if same_context(old, &fence) && *old_usage >= usage && fence.seqno() >= old.seqno() {
-                *slot = (fence, usage);
-                return;
-            }
+    /// Snapshot under the reservation lock, then invoke foreign callbacks
+    /// only after releasing it. Identity metadata was captured at insertion.
+    pub fn snapshot(&self) -> DmaResvSnapshot<'_> {
+        let (entries, generation) = {
+            let fences = self.fences.lock();
+            (
+                fences.clone(),
+                self.generation.load(core::sync::atomic::Ordering::Acquire),
+            )
+        };
+        DmaResvSnapshot {
+            owner: self,
+            generation,
+            entries: entries
+                .into_iter()
+                .map(|entry| {
+                    let done = entry.fence.fence.is_signalled();
+                    (entry, done)
+                })
+                .collect(),
         }
-        fences.push((fence, usage));
     }
 
-    /// Count of fence additions so far. A caller which observed no
-    /// unsignalled fences can later prove, without allocating or sampling
-    /// driver fences, that none was added since: the generation is unchanged.
+    /// Publish a batch without any fence callback or final foreign reference
+    /// drop under this or the caller's admission lock. Stale snapshots may
+    /// prune only their proven-terminal entries; they never remove later work.
+    /// A conflict decision additionally requires Snapshot::is_current under
+    /// the exporter's common admission lock before calling this operation.
+    pub fn add_prepared(
+        &self,
+        snapshot: &DmaResvSnapshot<'_>,
+        additions: &[(DmaResvFence, DmaResvUsage)],
+    ) -> DmaResvRetired {
+        assert!(
+            core::ptr::eq(self, snapshot.owner),
+            "reservation snapshot owner"
+        );
+        let mut retired = Vec::new();
+        let mut fences = self.fences.lock();
+        if additions.is_empty() {
+            return DmaResvRetired(retired);
+        }
+        let mut index = 0;
+        while index < fences.len() {
+            if snapshot.entries.iter().any(|(old, done)| {
+                *done && Arc::ptr_eq(&old.fence.fence, &fences[index].fence.fence)
+            }) {
+                retired.push(fences.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        for (fence, usage) in additions {
+            let entry = ReservationEntry {
+                fence: fence.clone(),
+                usage: *usage,
+            };
+            if let Some(slot) = fences.iter_mut().find(|old| {
+                old.fence.same_context(fence)
+                    && old.usage >= *usage
+                    && fence.seqno >= old.fence.seqno
+            }) {
+                retired.push(core::mem::replace(slot, entry));
+            } else {
+                fences.push(entry);
+            }
+        }
+        self.generation
+            .fetch_add(additions.len() as u64, core::sync::atomic::Ordering::AcqRel);
+        DmaResvRetired(retired)
+    }
+
+    /// Linux dma_resv_add_fence: same-context later/stronger replacement and
+    /// terminal pruning. All callbacks and retired drops occur without locks.
+    pub fn add_fence(&self, fence: Arc<dyn DrmFence>, usage: DmaResvUsage) {
+        let prepared = DmaResvFence::new(fence);
+        let snapshot = self.snapshot();
+        drop(self.add_prepared(&snapshot, &[(prepared, usage)]));
+    }
     pub fn generation(&self) -> u64 {
         let _fences = self.fences.lock();
         self.generation.load(core::sync::atomic::Ordering::Acquire)
     }
-
-    /// Linux `dma_resv_get_fences(obj, usage)`: the unsignalled fences whose
-    /// usage is at most `usage`, in insertion order.
+    /// Linux dma_resv_get_fences: no foreign callback under the lock.
     pub fn fences(&self, usage: DmaResvUsage) -> Vec<Arc<dyn DrmFence>> {
-        let candidates: Vec<Arc<dyn DrmFence>> = self
+        let candidates: Vec<_> = self
             .fences
             .lock()
             .iter()
-            .filter(|(_, fence_usage)| *fence_usage <= usage)
-            .map(|(fence, _)| fence.clone())
+            .filter(|entry| entry.usage <= usage)
+            .map(|entry| entry.fence.fence.clone())
             .collect();
         candidates
             .into_iter()

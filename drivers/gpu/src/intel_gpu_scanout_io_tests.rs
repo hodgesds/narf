@@ -227,7 +227,7 @@ kernel_test_in!(
 );
 
 fn smoke_scanout_io_revocation_power_loss_and_stolen_delivery_fail_closed() -> TestResult {
-    for case in 0..5 {
+    for case in 0..7 {
         let access = Access::new();
         let io = adapter(access.clone(), Generation::TigerLake);
         let writes = access.0.borrow().writes.len();
@@ -238,7 +238,9 @@ fn smoke_scanout_io_revocation_power_loss_and_stolen_delivery_fail_closed() -> T
                 access.0.borrow_mut().regs.insert(0x44404, !(1 << 3));
             }
             3 => io.write32(0x44404, 0), // Clients cannot unmask delivery.
-            _ => io.write32(0x800000, 1), // Nor touch another GGTT arena.
+            4 => io.write32(0x800000, 1), // Nor touch another GGTT arena.
+            5 => io.write32(0x701a4, 1), // Client viewport arms require DSB.
+            _ => io.write32(0x711a4, 0), // No other pipe's origin is owned.
         }
         assert_eq!(io.read32(0x44408), u32::MAX);
         assert!(!io.invalidate_ggtt());
@@ -262,6 +264,12 @@ fn smoke_scanout_io_restores_owned_bits_and_preserves_new_foreign_changes() -> T
     // enabling IER, restoration must disable IER before unmasking delivery.
     access.0.borrow_mut().regs.insert(0x44404, !(1 << 3));
     let io = adapter(access.clone(), Generation::TigerLake);
+    // The full production KMS fixtures restore a panned primary through this
+    // adapter and Presenter latch. Pin its narrow CPU write permission here
+    // on both arches too: a zero origin, still under current status ownership.
+    access.0.borrow_mut().regs.insert(0x701a4, 0x10003);
+    io.write32(0x701a4, 0);
+    assert_eq!(io.read32(0x701a4), 0);
     {
         let mut hw = access.0.borrow_mut();
         *hw.regs.get_mut(&0x4440c).unwrap() |= 1 << 10;
@@ -291,4 +299,38 @@ fn smoke_scanout_io_restores_owned_bits_and_preserves_new_foreign_changes() -> T
 kernel_test_in!(
     "drivers/gpu/intel_gpu_scanout_io",
     smoke_scanout_io_restores_owned_bits_and_preserves_new_foreign_changes
+);
+
+fn smoke_scanout_io_reset_replacement_preserves_original_status_and_poison() -> TestResult {
+    let access = Access::new();
+    access.0.borrow_mut().regs.insert(IMR, !(1 << 3));
+    let old = adapter(access.clone(), Generation::MeteorLake);
+    let saved = old.saved_status();
+    old.poison();
+    // SAFETY: this fixture owns current power/authority and the entire status
+    // bank. No GEM mapping was created. Reset invalidated only the old view.
+    let replacement = unsafe {
+        PollIo::after_reset(
+            access.clone(),
+            Generation::MeteorLake,
+            Pipe::A,
+            0x1000000,
+            saved,
+        )
+    }
+    .unwrap();
+    assert_eq!(old.read32(FRAME_COUNT + Pipe::A.base()), u32::MAX);
+    // SAFETY: the fixture has no display or GT fetcher and no mappings.
+    assert!(unsafe { replacement.restore_stopped() });
+    assert_eq!(access.read32(IER), 1);
+    assert_eq!(access.read32(IMR), !(1 << 3));
+    let before = access.0.borrow().writes.len();
+    old.write32(LAST_PTE, 1);
+    assert_eq!(old.read32(IER), u32::MAX);
+    assert_eq!(access.0.borrow().writes.len(), before);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_scanout_io",
+    smoke_scanout_io_reset_replacement_preserves_original_status_and_poison
 );
