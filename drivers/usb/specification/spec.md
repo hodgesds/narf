@@ -446,7 +446,11 @@ also consult upstream Linux GPL sources.
 - `find_video_streaming_endpoints(config)` returns each UVC bulk/isochronous IN
   endpoint with its owning interface and alternate setting.
   `select_video_streaming_iso_endpoint(endpoints, payload)` chooses the smallest
-  alternate that satisfies the PROBE-accepted payload, and
+  alternate that satisfies the PROBE-accepted payload; when no isochronous
+  alternate qualifies, activation falls back to
+  `select_video_streaming_bulk_endpoint(endpoints)` (least-bandwidth bulk
+  alternate, no payload gate — bulk transfers reserve no interval
+  bandwidth, so the PROBE figure is not a per-transfer cap there), and
   `negotiate_and_activate_video_stream(xhci, device_index, desired)` runs the
   26-byte SET_CUR(PROBE) / GET_CUR(PROBE) / SET_CUR(COMMIT) sequence, configures
   the accepted endpoint, issues `SET_INTERFACE`, and starts an IRQ-driven
@@ -467,12 +471,13 @@ also consult upstream Linux GPL sources.
   `SET_INTERFACE` to alternate setting 0) before local buffer state is
   reset. The composition (bind, negotiate, activate, deactivate, pump)
   is generic over the narrow `UvcTransport` seam (control in/out,
-  endpoint configuration, isochronous receive); production implements
+  endpoint configuration, isochronous receive, bulk receive); production implements
   it on `Xhci`, and the end-to-end kernel fixture
   (`smoke_uvc_streamon_composition_e2e`) implements it on a modelled
   camera and asserts the transfer conversation through the real V4L2
-  dispatch. The pump receives through the single `UvcTransport::isoch_in`
-  call site, behind which the depth-4 isochronous pipelining work (#808)
+  dispatch. The pump receives through a single receive call site that
+  dispatches on the active endpoint's transport (`isoch_in` /
+  `bulk_in`), behind which the depth-4 isochronous pipelining work (#808)
   slots in without changing the composition.
 - `try_bind_btusb_already_addressed(xhci, slot_id, vendor_id, product_id,
   config)` binds the standard Bluetooth USB interface. For a recognised
@@ -768,10 +773,11 @@ the USB download itself remains a target-silicon gate.
   endpoint and bandwidth metadata; the negotiation path performs version-aware
   PROBE/COMMIT — 26-byte UVC 1.0 for bcdUVC < 0x0110, 34-byte UVC 1.1+
   (VC HEADER device clock + 1.0 payload-version declaration) otherwise —
-  configures the smallest fitting isochronous alternate, and issues
+  configures the smallest fitting isochronous alternate (bulk fallback
+  when none qualifies, #1243), and issues
   SET_INTERFACE. Its capture task reassembles UVC payloads and delivers complete
-  frames to the registered `/dev/video<N>` queue. STREAMOFF/cancellation and
-  bulk-streaming orchestration remain follow-ups.
+  frames to the registered `/dev/video<N>` queue. STREAMOFF/cancellation
+  remain follow-ups.
 - **UAC1 + UAC2** (`uac`, `uac_card`): USB Audio Class descriptor
   decode for both protocol revisions — v1 AC HEADER, INPUT_TERMINAL,
   OUTPUT_TERMINAL, FEATURE_UNIT (per-channel control bitmaps),
