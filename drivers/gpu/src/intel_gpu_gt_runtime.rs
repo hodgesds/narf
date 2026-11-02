@@ -47,6 +47,8 @@ enum Phase {
     Probe,
     Defaults,
     PpgttProbe,
+    /// Source-qualified host-L2 preparation and acknowledged MERT sanitize.
+    Mert,
     /// Fresh GT is ready; display retirement runs outside the GT mutex.
     DisplayRecovery,
     Running,
@@ -260,7 +262,7 @@ impl crate::intel_gpu_user::UserBackend for Backend {
                 .owner
                 .upgrade()
                 .ok_or(narf_filesystem::FsError::NoDevice)?;
-            let _awake = Awake::take(&owner).await?;
+            let mut awake = Some(Awake::take(&owner).await?);
             let mut state = owner.lock_running().await;
             if state.phase != Phase::Running
                 || epoch == 0
@@ -288,6 +290,56 @@ impl crate::intel_gpu_user::UserBackend for Backend {
             }
             if !pool.requires_ccs_clear() {
                 let mut clear = object.begin_cpu_vram_clear()?;
+                // Reserve before any BAR write. Busy callers still own only
+                // untouched private storage and can be cancelled immediately.
+                let reserve_deadline = narf_time::monotonic_ns().saturating_add(100_000_000);
+                let lease = loop {
+                    if owner.user_epoch.load(Ordering::Acquire) != epoch {
+                        return Err(narf_filesystem::FsError::NoDevice);
+                    }
+                    if state.phase != Phase::Running
+                        || owner.suspended.load(Ordering::Acquire)
+                        || narf_bus::pci::power_state(&owner.pending.cap, &owner.pending.device)
+                            != Ok(Some(narf_bus::pci::PciPowerState::D0))
+                        || !state.gt.as_ref().is_some_and(|gt| {
+                            gt.vram_cpu_access(epoch) && gt.vram_layout() == Some(pool.layout)
+                        })
+                    {
+                        owner.close_controls();
+                        owner.user_epoch.store(0, Ordering::Release);
+                        return Err(narf_filesystem::FsError::NoDevice);
+                    }
+                    match state
+                        .gt
+                        .as_mut()
+                        .expect("running GT")
+                        .retain_cpu_vram_clear(object.clone(), epoch, narf_time::monotonic_ns())
+                    {
+                        Ok(lease) => break lease,
+                        Err(GtError::Scheduling(
+                            crate::intel_gpu_guc_sched::SchedulingError::Slpc(
+                                crate::intel_gpu_slpc::SlpcError::Busy,
+                            ),
+                        )) => {}
+                        Err(_) => return Err(narf_filesystem::FsError::NoDevice),
+                    }
+                    if narf_time::monotonic_ns() >= reserve_deadline {
+                        return Err(narf_filesystem::FsError::WouldBlock);
+                    }
+                    drop(state);
+                    narf_scheduler::yield_now().await;
+                    narf_time::SleepUntil::new(narf_time::Deadline::after_us(50).as_instant())
+                        .await;
+                    state = owner.state.lock().await;
+                };
+                if let Some(lease) = &lease {
+                    // This independent task owns the actual PM reference,
+                    // even if the ioctl future is dropped between chunks.
+                    awake
+                        .take()
+                        .expect("CPU clear PM hold")
+                        .until(lease.completion());
+                }
                 loop {
                     // An old caller must not close a recovered backend after
                     // yielding across reset into a different user epoch.
@@ -312,7 +364,67 @@ impl crate::intel_gpu_user::UserBackend for Backend {
                         .invoke(ClearVramChunk(&mut clear))
                         .map_err(|_| narf_filesystem::FsError::NoDevice)?
                     {
-                        return Ok(fence);
+                        let Some(lease) = &lease else {
+                            return Ok(fence);
+                        };
+                        // End CPU writes before permitting the owner to post
+                        // this transaction's fresh invalidation. Cancellation
+                        // during an earlier chunk instead requests abandonment
+                        // through the retained lease's Drop flag.
+                        lease.ready();
+                        let ticket = lease.id();
+                        let deadline = narf_time::monotonic_ns().saturating_add(100_000_000);
+                        loop {
+                            if owner.user_epoch.load(Ordering::Acquire) != epoch {
+                                return Err(narf_filesystem::FsError::NoDevice);
+                            }
+                            if state.phase != Phase::Running
+                                || owner.suspended.load(Ordering::Acquire)
+                                || narf_bus::pci::power_state(
+                                    &owner.pending.cap,
+                                    &owner.pending.device,
+                                ) != Ok(Some(narf_bus::pci::PciPowerState::D0))
+                                || !state.gt.as_ref().is_some_and(|gt| {
+                                    gt.vram_cpu_access(epoch)
+                                        && gt.vram_layout() == Some(pool.layout)
+                                })
+                            {
+                                owner.close_controls();
+                                owner.user_epoch.store(0, Ordering::Release);
+                                return Err(narf_filesystem::FsError::NoDevice);
+                            }
+                            let now = narf_time::monotonic_ns();
+                            let gt = state.gt.as_mut().expect("running GT");
+                            let progress = gt.poll_with_access(now, || {
+                                narf_bus::pci::power_state(
+                                    &owner.pending.cap,
+                                    &owner.pending.device,
+                                ) == Ok(Some(narf_bus::pci::PciPowerState::D0))
+                            });
+                            if !matches!(
+                                progress,
+                                core::task::Poll::Ready(Ok(GtState::SchedulingReady))
+                            ) {
+                                owner.close_controls();
+                                owner.user_epoch.store(0, Ordering::Release);
+                                return Err(narf_filesystem::FsError::NoDevice);
+                            }
+                            match gt.vram_flush_done(epoch, ticket) {
+                                Ok(true) => return Ok(fence),
+                                Ok(false) => {}
+                                Err(_) => return Err(narf_filesystem::FsError::NoDevice),
+                            }
+                            if now >= deadline {
+                                return Err(narf_filesystem::FsError::NoDevice);
+                            }
+                            drop(state);
+                            narf_scheduler::yield_now().await;
+                            narf_time::SleepUntil::new(
+                                narf_time::Deadline::after_us(50).as_instant(),
+                            )
+                            .await;
+                            state = owner.state.lock().await;
+                        }
                     }
                     // Keep the PM hold/private reservation, but let the GT
                     // worker service jobs between bounded CPU chunks. A reset
@@ -879,7 +991,10 @@ impl Owner {
             .as_ref()
             .map_or([0; 32], |firmware| firmware.digest);
         let gt = state.gt.as_mut().ok_or(RuntimeError::State)?;
-        let polled = gt.poll(now);
+        let polled = gt.poll_with_access(now, || {
+            narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
+                == Ok(Some(narf_bus::pci::PciPowerState::D0))
+        });
         if let Some(report) = gt.take_error_report() {
             if let Some(buffer) = state.coredump.take() {
                 gt.capture_coredump(buffer, report, narf_time::monotonic_ns(), digest, || {
@@ -1000,7 +1115,7 @@ impl Owner {
                         .card
                         .publish_gt_vram(gt)
                         .map_err(|_| RuntimeError::State)?;
-                    state.phase = Phase::DisplayRecovery;
+                    state.phase = Phase::Mert;
                     let (major, minor, patch) = gt.submission_version();
                     self.user_version.store(
                         u32::from(major) << 16 | u32::from(minor) << 8 | u32::from(patch),
@@ -1017,6 +1132,17 @@ impl Owner {
                         self.pending.index,
                         "GuC ready; every published engine's defaults, private PPGTT store and retirement verified",
                     );
+                }
+            }
+            (Phase::Mert, GtState::SchedulingReady) => {
+                if gt
+                    .prepare_mert(now, || {
+                        narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
+                            == Ok(Some(narf_bus::pci::PciPowerState::D0))
+                    })
+                    .map_err(RuntimeError::Gt)?
+                {
+                    state.phase = Phase::DisplayRecovery;
                 }
             }
             (Phase::Running, GtState::SchedulingReady) => {
@@ -1399,7 +1525,13 @@ impl Owner {
         state.irq_tried = false;
         let gt = state.gt.as_mut().expect("running GT");
         let stopped = gt.begin_stop(narf_time::monotonic_ns()).is_ok()
-            && gt.wait().await == Ok(GtState::Stopped);
+            && gt
+                .wait_with_access(|| {
+                    narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
+                        == Ok(Some(narf_bus::pci::PciPowerState::D0))
+                })
+                .await
+                == Ok(GtState::Stopped);
         if !stopped {
             // Uncertain hardware: close admission; the worker owns recovery.
             self.user_epoch.store(0, Ordering::Release);
@@ -1520,7 +1652,14 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
                     if !matches!(gt.state(), GtState::Staged | GtState::Stopped) {
                         gt.begin_stop(narf_time::monotonic_ns())
                             .map_err(|_| E::DriverError)?;
-                        if gt.wait().await != Ok(GtState::Stopped) {
+                        if gt
+                            .wait_with_access(|| {
+                                narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
+                                    == Ok(Some(narf_bus::pci::PciPowerState::D0))
+                            })
+                            .await
+                            != Ok(GtState::Stopped)
+                        {
                             return Err(E::DriverError);
                         }
                     }

@@ -527,6 +527,10 @@ impl RegisterInit {
         (self.compute, self.compute_mode)
     }
 
+    pub(crate) fn mert_required(&self) -> bool {
+        self.platform == GtPlatform::Battlemage && self.seed.graphics == 2001
+    }
+
     /// RCS0/BCS0 always, BCS8 on BMG, then the selected physical CCSs. Linux
     /// XE2_GFX_FEATURES includes BCS8; read_copy_fuses does not filter BMG.
     pub(crate) fn engines(&self) -> crate::intel_gpu_engine::EngineSet {

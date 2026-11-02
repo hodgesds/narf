@@ -2,6 +2,9 @@
 //! firmware words never influence the bounded copies. Source contract: MIT
 //! Linux b90c984d xe_devcoredump.c and xe_guc_{log,ct}.c snapshots.
 use super::*;
+mod vm_dump {
+    include!("intel_gpu_vm_dump_tests.rs");
+}
 use crate::{
     intel_gpu_engine::{Engine, EngineSet},
     intel_gpu_gt::GtPlatform,
@@ -127,7 +130,7 @@ fn smoke_coredump_wire_fixed_extents_and_immutable_reads() -> TestResult {
             word(&dump.bytes, 12),
             word(&dump.bytes, 16)
         ),
-        (2, 256, DUMP_BYTES as u32)
+        (3, 256, DUMP_BYTES as u32)
     );
     assert_eq!(word(&dump.bytes, 20), index);
     assert_eq!(word(&dump.bytes, 72), 7);
@@ -526,9 +529,9 @@ fn smoke_coredump_execution_wire_lrc_ring_scratch_and_immutable_reads() -> TestR
         || true,
     );
     let dump = snapshot(index).unwrap();
-    // Version2 retains all v1 section offsets and adds bounded execution slots.
-    assert_eq!(word(&dump.bytes, 8), 2);
-    assert_eq!(dump.bytes.len(), 0x1b4540);
+    // Version3 preserves the earlier report/log/CT/execution offsets.
+    assert_eq!(word(&dump.bytes, 8), 3);
+    assert_eq!(dump.bytes.len(), 0x275380);
     assert_eq!(word(&dump.bytes, 72), 9);
     assert_eq!(word(&dump.bytes, 144), 0x11c100);
     assert_eq!(word(&dump.bytes, 148), 64 + 8 * 0x13080);

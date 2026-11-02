@@ -29,6 +29,34 @@ use crate::{
 
 type Wait<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
+fn x_tiled_profile(
+    io: &impl Platform,
+    geometry: Geometry,
+    timing: crate::intel_gpu_dsb::Timing,
+) -> Result<(), FsError> {
+    if !io.console_access_ok() {
+        return Err(FsError::NoDevice);
+    }
+    crate::intel_gpu_scanout::View {
+        origin: Default::default(),
+        layout: crate::intel_gpu_scanout::Layout::X,
+    }
+    .footprint(geometry)
+    .map_err(scanout_error)?;
+    crate::intel_gpu_display_resources::Profile::capture_timing(io, timing)?;
+    let chicken = io.read32(0x7026c);
+    if chicken == u32::MAX {
+        return Err(FsError::NoDevice);
+    }
+    if chicken & (1 << 19) == 0 {
+        return Err(FsError::Unsupported);
+    }
+    if !io.console_access_ok() {
+        return Err(FsError::NoDevice);
+    }
+    Ok(())
+}
+
 /// The production implementation retains PCI authority and a permanent UC
 /// BAR. Tests implement the same platform boundary with native register models.
 pub(crate) trait Platform:
@@ -39,6 +67,7 @@ pub(crate) trait Platform:
         self.takeover(owned_cursor)
     }
     fn color_restored(&self) {}
+    fn console_published(&self, _geometry: Geometry) {}
     fn pause_console(&self) -> Wait<'_>;
     fn resume_console(&self);
     fn now(&self) -> u64;
@@ -96,6 +125,31 @@ unsafe impl DisplayAccess for Physical {
     }
 }
 impl Platform for Physical {
+    fn console_published(&self, geometry: Geometry) {
+        if let Some(card) = crate::drm_registry::mode_state(self.index) {
+            let mut card = card.lock();
+            card.intel_x_tiled = self.generation == Generation::MeteorLake
+                && card.crtcs.first().and_then(|c| c.mode).is_some_and(|mode| {
+                    if (mode.width, mode.height) != (geometry.width, geometry.height) {
+                        return false;
+                    }
+                    let wire = card.mode_wire(&mode);
+                    x_tiled_profile(
+                        self,
+                        geometry,
+                        crate::intel_gpu_dsb::Timing {
+                            clock: wire.clock,
+                            width: wire.hdisplay,
+                            height: wire.vdisplay,
+                            htotal: wire.htotal,
+                            vtotal: wire.vtotal,
+                            flags: wire.flags,
+                        },
+                    )
+                    .is_ok()
+                });
+        }
+    }
     fn takeover(&self, owned_cursor: bool) -> Result<(), FsError> {
         // Only an execution-tested backend has retired inherited GT owners
         // and established the disjoint >=256-MiB kernel GGTT arena. Untrusted
@@ -271,7 +325,7 @@ struct Joint {
 struct PrimaryTarget {
     object: Arc<GemObject>,
     geometry: Geometry,
-    viewport: crate::intel_gpu_scanout::Viewport,
+    view: crate::intel_gpu_scanout::View,
 }
 
 #[derive(Debug)]
@@ -341,6 +395,7 @@ impl<M: Platform> LegacyGuard<'_, M> {
         }
         self.state.console = console.clone();
         *self.geometry.lock() = scanout_geometry(console);
+        self.platform.console_published(scanout_geometry(console));
         self.state.blocked = false;
     }
 }
@@ -376,7 +431,7 @@ pub(crate) fn install(
     {
         return;
     }
-    displays.push(display);
+    displays.push(display.clone());
     drop(displays);
     if let Some(card) = crate::drm_registry::mode_state(index) {
         let mut card = card.lock();
@@ -391,6 +446,9 @@ pub(crate) fn install(
             }
         }
     }
+    display
+        .platform
+        .console_published(display.console_geometry());
 }
 pub(crate) fn display(index: u32) -> Option<Arc<Display>> {
     DISPLAYS
@@ -626,6 +684,10 @@ impl<M: Platform> Device<M> {
                 (
                     state.console.gtt_offset,
                     scanout_geometry(&state.console),
+                    state
+                        .presenter
+                        .as_ref()
+                        .map_or_else(|| fresh.read32(0x70180), |old| old.console_control()),
                     self.platform.now(),
                 ),
             )
@@ -897,7 +959,7 @@ impl<M: Platform> Guard<'_, M> {
         &mut self,
         object: Arc<GemObject>,
         geometry: Geometry,
-        viewport: crate::intel_gpu_scanout::Viewport,
+        view: crate::intel_gpu_scanout::View,
     ) -> Result<SurfaceId, FsError> {
         if let Some((current, id)) = &self.state.current {
             if Arc::ptr_eq(current, &object)
@@ -906,7 +968,7 @@ impl<M: Platform> Guard<'_, M> {
                     .presenter
                     .as_ref()
                     .expect("presenter")
-                    .matches_view(*id, geometry, viewport)
+                    .matches_view(*id, geometry, view)
             {
                 return Ok(*id);
             }
@@ -915,7 +977,7 @@ impl<M: Platform> Guard<'_, M> {
             .presenter
             .as_mut()
             .expect("presenter")
-            .prepare_view(object, geometry, viewport)
+            .prepare_layout(object, geometry, view)
             .map_err(scanout_error)
     }
     fn rollback_joint_before_arm(&mut self) -> Result<(), FsError> {
@@ -1379,7 +1441,7 @@ impl<M: Platform> Guard<'_, M> {
         &mut self,
         object: Arc<GemObject>,
         geometry: Geometry,
-        viewport: crate::intel_gpu_scanout::Viewport,
+        view: crate::intel_gpu_scanout::View,
         coefficients: Option<[u64; 9]>,
         luts: crate::intel_gpu_color::Luts,
         timing: crate::intel_gpu_dsb::Timing,
@@ -1391,9 +1453,14 @@ impl<M: Platform> Guard<'_, M> {
         if !object.is_wc() || !object.scanout() || object.is_vram() || object.is_userptr() {
             return Err(FsError::Unsupported);
         }
-        let (_, _, extent) = viewport.layout(geometry).map_err(scanout_error)?;
+        let (_, _, extent) = view.footprint(geometry).map_err(scanout_error)?;
         if extent > object.size() {
             return Err(FsError::InvalidData);
+        }
+        if view.layout == crate::intel_gpu_scanout::Layout::X {
+            // Linux's display>=10 X watermark equations equal linear. Reuse
+            // only the actual owned no-SAGV/DBUF/MBUS/DDB/WM reservation.
+            x_tiled_profile(&self.device.platform, geometry, timing)?;
         }
         self.color_transaction(
             coefficients,
@@ -1403,7 +1470,7 @@ impl<M: Platform> Guard<'_, M> {
             Some(PrimaryTarget {
                 object,
                 geometry,
-                viewport,
+                view,
             }),
         )
         .await
@@ -1480,11 +1547,11 @@ impl<M: Platform> Guard<'_, M> {
                 let surface = if let Some(PrimaryTarget {
                     object,
                     geometry,
-                    viewport,
+                    view,
                 }) = &primary
                 {
                     self.start().await?;
-                    let id = self.prepare_surface(object.clone(), *geometry, *viewport)?;
+                    let id = self.prepare_surface(object.clone(), *geometry, *view)?;
                     let ticket = self.ticket()?;
                     self.state.pending = Some((object.clone(), id));
                     self.state.mixed_unpublished = true;

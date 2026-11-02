@@ -3,7 +3,11 @@
 //! Source: MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad,
 //! xe_guc_pc.c, regs/xe_regs.h, abi/guc_actions_slpc_abi.h,
 //! xe_wa_oob.rules, xe_device_wa_oob.rules and intel/pciids.h.
-//! Media GTs and dynamic MERT/L2-flush cap removal are not owned here.
+//! Media GTs remain refused. Qualified BMG MERT promotion requires the
+//! separate retained host-L2 owner and its startup/stop/flush proofs.
+
+#[path = "intel_gpu_slpc_mert.rs"]
+pub(crate) mod mert;
 
 use crate::{
     intel_gpu_aux::MmioWindow,
@@ -108,8 +112,8 @@ impl Limits {
             );
         let min_mhz = if g21 { rpn_mhz.max(1200) } else { rpn_mhz };
         // xe_wa_oob.rules: Wa_22019338487 on graphics 20.01, all steps.
-        // Retain the boot MERT cap for this owner's entire lifetime: raising it
-        // needs the source's separate flush/actual-frequency protocol.
+        // Bootstrap at the MERT cap. Only GuCGt's independently prepared
+        // host-L2/flush owner may lift it after verified execution startup.
         let max_mhz = if ip.version == 2001 {
             rp0_mhz.min(2133)
         } else {
@@ -172,6 +176,7 @@ pub(crate) struct Slpc {
     pending: Option<u16>,
     acked: bool,
     deadline: u64,
+    mert_range: Option<FrequencyRange>,
 }
 
 impl Slpc {
@@ -189,6 +194,7 @@ impl Slpc {
             pending: None,
             acked: false,
             deadline: 0,
+            mert_range: None,
         }
     }
     pub(crate) fn state(&self) -> SlpcState {
@@ -248,6 +254,18 @@ impl Slpc {
         self.target_range = self.range;
         self.target_profile = profile;
         self.commands.push(Command::Profile(profile));
+        Ok(())
+    }
+    /// Only GuCGt's qualified, prepared host-L2 owner may call this. The
+    /// limits remain unpublished until the ordinary ACK/query transaction.
+    pub(crate) fn lift_mert_cap(&mut self, now: u64) -> Result<(), SlpcError> {
+        let range = self.mert_range.ok_or(SlpcError::State)?;
+        self.begin(now)?;
+        self.limits.as_mut().ok_or(SlpcError::State)?.max_mhz =
+            self.limits.ok_or(SlpcError::State)?.rp0_mhz;
+        self.target_profile = self.profile;
+        self.range_commands(range);
+        self.mert_range = None;
         Ok(())
     }
     fn unavailable(&mut self) {
@@ -339,6 +357,13 @@ impl Slpc {
                         return Ok(());
                     };
                     let limits = self.limits.expect("limits");
+                    if limits.max_mhz < limits.rp0_mhz {
+                        let max_mhz = current.max_mhz.clamp(limits.min_mhz, limits.rp0_mhz);
+                        self.mert_range = Some(FrequencyRange {
+                            min_mhz: current.min_mhz.clamp(limits.min_mhz, max_mhz),
+                            max_mhz,
+                        });
+                    }
                     let max_mhz = current.max_mhz.clamp(limits.min_mhz, limits.max_mhz);
                     let range = FrequencyRange {
                         min_mhz: current.min_mhz.clamp(limits.min_mhz, max_mhz),

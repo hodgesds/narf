@@ -20,6 +20,16 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use narf_filesystem::{FsError, IoctlContext};
 use narf_lib::sync::IrqSafeSpinLock;
 
+/// xe_exec_queue_device_get_max_priority: CAP_SYS_NICE in the initial user
+/// namespace admits HIGH. No userspace queue can request GuC KMD_HIGH (0).
+pub(crate) fn max_queue_priority() -> u64 {
+    if narf_filesystem::caller_capable(23) {
+        2
+    } else {
+        1
+    }
+}
+
 #[derive(Debug)]
 struct Queue {
     vm: Arc<Vm>,
@@ -339,7 +349,12 @@ impl XeFile {
             let value = u64_at(&ext, 24);
             match u32_at(&ext, 16) {
                 0 if value <= 1 => priority = if value == 0 { 3 } else { 2 },
-                0 if value == 2 => return Err(FsError::OperationNotPermitted),
+                0 if value == 2 => {
+                    if max_queue_priority() < value {
+                        return Err(FsError::OperationNotPermitted);
+                    }
+                    priority = 1;
+                }
                 0 => return Err(FsError::InvalidData),
                 1 if (1..=100_000).contains(&value) => timeslice = value as u32,
                 1 => return Err(FsError::InvalidData),
@@ -398,6 +413,13 @@ impl XeFile {
             bind: class == 5,
             dead: AtomicBool::new(false),
         });
+        // Revalidate the current creator after all extension copies and VM
+        // preparation, immediately before publishing a name. Like Linux,
+        // the resulting immutable queue retains its configured priority;
+        // EXEC does not reauthorize or silently demote a live queue.
+        if priority == 1 && max_queue_priority() < 2 {
+            return Err(FsError::OperationNotPermitted);
+        }
         put32(&mut wire, 20, id);
         user.write(address, &wire)?;
         names.queues.insert(id, queue);

@@ -339,9 +339,9 @@ fn smoke_coredump_live_gt_capture_stop_and_authority_loss() -> TestResult {
     assert_eq!(arena.live_allocations(), live);
     let dump = coredump::take_for_test(54);
     assert_eq!(&dump[..8], b"NARFCDMP");
-    assert_eq!(u32::from_le_bytes(dump[8..12].try_into().unwrap()), 2);
-    assert_eq!(dump.len(), 0x1b4540);
-    assert_eq!(u32::from_le_bytes(dump[72..76].try_into().unwrap()), 15);
+    assert_eq!(u32::from_le_bytes(dump[8..12].try_into().unwrap()), 3);
+    assert_eq!(dump.len(), 0x275380);
+    assert_eq!(u32::from_le_bytes(dump[72..76].try_into().unwrap()), 31);
     assert_eq!(
         u32::from_le_bytes(dump[144..148].try_into().unwrap()),
         0x11c100
@@ -351,7 +351,10 @@ fn smoke_coredump_live_gt_capture_stop_and_authority_loss() -> TestResult {
     // empty snapshot rather than unavailable execution storage.
     assert!(dump[0x11c118..0x11c124].iter().all(|byte| *byte == 0));
     assert_eq!(u32::from_le_bytes(dump[152..156].try_into().unwrap()), 0);
-    assert!(dump[0x11c140..].iter().all(|byte| *byte == 0));
+    assert!(dump[0x11c140..0x1b4540].iter().all(|byte| *byte == 0));
+    assert_eq!(&dump[0x1b4540..0x1b4548], b"NARFVMEM");
+    assert!(dump[0x1b4558..0x1b4568].iter().all(|byte| *byte == 0));
+    assert!(dump[0x1b4580..].iter().all(|byte| *byte == 0));
     assert_eq!(u64::from_le_bytes(dump[32..40].try_into().unwrap()), epoch);
     assert_eq!(u64::from_le_bytes(dump[40..48].try_into().unwrap()), 1234);
     assert_eq!(u64::from_le_bytes(dump[48..56].try_into().unwrap()), 1235);
@@ -369,18 +372,24 @@ fn smoke_coredump_live_gt_capture_stop_and_authority_loss() -> TestResult {
         );
     }
     let denied = coredump::take_for_test(54);
-    assert_eq!(u32::from_le_bytes(denied[72..76].try_into().unwrap()), 9);
+    assert_eq!(u32::from_le_bytes(denied[72..76].try_into().unwrap()), 25);
     assert!(denied[4352..0x11c100].iter().all(|byte| *byte == 0));
     assert_eq!(&denied[0x11c100..0x11c108], b"NARFEXEC");
-    assert!(denied[0x11c118..0x11c124]
-        .iter()
-        .all(|byte| *byte == 0));
+    assert!(denied[0x11c118..0x11c124].iter().all(|byte| *byte == 0));
     assert_eq!(u32::from_le_bytes(denied[152..156].try_into().unwrap()), 2);
     assert_eq!(
         u32::from_le_bytes(denied[0x11c124..0x11c128].try_into().unwrap()),
         2
     );
-    assert!(denied[0x11c140..].iter().all(|byte| *byte == 0));
+    assert!(denied[0x11c140..0x1b4540].iter().all(|byte| *byte == 0));
+    assert_eq!(&denied[0x1b4540..0x1b4548], b"NARFVMEM");
+    assert!(denied[0x1b4558..0x1b4564].iter().all(|byte| *byte == 0));
+    assert_eq!(u32::from_le_bytes(denied[168..172].try_into().unwrap()), 2);
+    assert_eq!(
+        u32::from_le_bytes(denied[0x1b4564..0x1b4568].try_into().unwrap()),
+        2
+    );
+    assert!(denied[0x1b4580..].iter().all(|byte| *byte == 0));
     hardware_stop(&mut gt, &w, 0xdfc);
     let stopped_allocations = arena.live_allocations();
     assert!(stopped_allocations > 0 && stopped_allocations < live);

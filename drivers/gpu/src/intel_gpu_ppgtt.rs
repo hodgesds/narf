@@ -206,6 +206,12 @@ impl FramePtMemory {
         crate::intel_gpu_gtt::publish_system_pages(self.frames.values())
     }
 
+    /// Host-owned table pages, independent of every device-visible PTE.
+    /// Crash capture must never follow a possibly corrupt table entry.
+    pub(crate) fn diagnostic_tables(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        self.frames.keys().copied()
+    }
+
     /// Raw pointer to entry `index` of the table at `phys`.
     ///
     /// # Safety

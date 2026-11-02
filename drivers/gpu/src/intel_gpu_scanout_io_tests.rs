@@ -271,6 +271,18 @@ fn smoke_scanout_io_restores_owned_bits_and_preserves_new_foreign_changes() -> T
     io.write32(0x701a4, 0);
     assert_eq!(io.read32(0x701a4), 0);
     {
+        let mtl = Access::new();
+        let layout = adapter(mtl.clone(), Generation::MeteorLake);
+        mtl.0.borrow_mut().regs.insert(0x70180, 0x84000400);
+        mtl.0.borrow_mut().regs.insert(0x70188, 1);
+        layout.write32(0x70188, 8);
+        layout.write32(0x70180, 0x84000000);
+        assert_eq!(layout.read32(0x70180), 0x84000000);
+        assert_eq!(layout.read32(0x70188), 8);
+        // SAFETY: this isolated adapter mapped no pages and has no fetcher.
+        assert!(unsafe { layout.restore_stopped() });
+    }
+    {
         let mut hw = access.0.borrow_mut();
         *hw.regs.get_mut(&0x4440c).unwrap() |= 1 << 10;
         *hw.regs.get_mut(&0x44404).unwrap() &= !(1 << 5);

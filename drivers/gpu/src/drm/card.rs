@@ -936,6 +936,9 @@ pub struct Card {
     /// Installed fixed-mode Intel color owner (native CTM, gamma1024/legacy256).
     #[cfg(feature = "intel")]
     pub(crate) intel_ctm: bool,
+    /// Fixed display14 primary with owned no-DPT + linear-equivalent X WMs.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_x_tiled: bool,
     #[cfg(feature = "intel")]
     intel_blob_pins: Vec<(u32, usize)>,
     /// A released master still owns hardware until serialized restoration.
@@ -1213,6 +1216,8 @@ impl Card {
             intel_deferred_owners: Vec::new(),
             #[cfg(feature = "intel")]
             intel_ctm: false,
+            #[cfg(feature = "intel")]
+            intel_x_tiled: false,
             #[cfg(feature = "intel")]
             intel_display: false,
             #[cfg(feature = "intel")]
@@ -1677,7 +1682,7 @@ impl Card {
             return Err(CardError::TooManyFbs);
         }
         let mut id = self.next_property_blob_id.max(1);
-        while self.property_blobs.iter().any(|blob| blob.id == id) {
+        while id == 0x4000_0040 || self.property_blobs.iter().any(|blob| blob.id == id) {
             id = id.wrapping_add(1).max(1);
         }
         self.next_property_blob_id = id.wrapping_add(1).max(1);
@@ -2144,10 +2149,11 @@ impl Card {
 
     /// ADDFB2 naming one of open `owner`'s Intel GEM handles: drm core's
     /// framebuffer_check and Linux intel_framebuffer_init, in their order.
-    /// Only LINEAR is taken (no tiled presentation exists here); plane 0 has
-    /// no offset; the pitch is 64-byte aligned (4 KiB past the plane's
+    /// LINEAR and the qualified display14 no-DPT X profile are taken; plane0
+    /// has no offset. Linear pitch is64-byte aligned (4KiB past the plane's
     /// 128 KiB native limit) and at most 256 KiB; the object holds every
-    /// line. On native Xe (`xe`), an object not created SCANOUT may not be
+    /// line. X is XR24 only, pitch512-aligned, height padded to8 tile rows.
+    /// On native Xe (`xe`), an object not created SCANOUT may not be
     /// VM-bound and becomes SCANOUT (intel_fb_bo_framebuffer_init).
     #[cfg(feature = "intel")]
     pub fn addfb2_intel(
@@ -2159,8 +2165,15 @@ impl Card {
     ) -> Result<u32, CardError> {
         use crate::drm::fb_cmd::{FB_INTERLACED, FB_MODIFIERS};
         // framebuffer_check.
+        let modifier = if cmd.flags & FB_MODIFIERS != 0 {
+            cmd.modifier[0]
+        } else {
+            0
+        };
+        let tiled = modifier == crate::intel_gpu_scanout::X_TILED_MODIFIER && self.intel_x_tiled;
         if cmd.flags & !(FB_INTERLACED | FB_MODIFIERS) != 0
-            || (cmd.flags & FB_MODIFIERS != 0 && cmd.modifier[0] != 0)
+            || (modifier != 0 && !tiled)
+            || (tiled && (cmd.flags & FB_INTERLACED != 0 || cmd.pixel_format != 0x3432_5258))
         {
             return Err(CardError::UnknownFormat);
         }
@@ -2199,11 +2212,26 @@ impl Card {
         let pitch = cmd.pitches[0];
         const MAX_STRIDE: u32 = 256 * 1024; // intel_fb_max_stride, remapped
         const PLANE_STRIDE: u32 = 128 * 1024; // adl_plane_max_stride bytes
-        let alignment = if pitch > PLANE_STRIDE { 4096 } else { 64 };
-        if pitch > MAX_STRIDE || cmd.offsets[0] != 0 || pitch % alignment != 0 {
+        let alignment = if tiled {
+            512
+        } else if pitch > PLANE_STRIDE {
+            4096
+        } else {
+            64
+        };
+        if pitch > (if tiled { PLANE_STRIDE } else { MAX_STRIDE })
+            || cmd.offsets[0] != 0
+            || pitch % alignment != 0
+            || (tiled && (!(4..=5120).contains(&cmd.width) || cmd.height > 4320))
+        {
             return Err(CardError::InvalidDimensions);
         }
-        if u64::from(pitch) * u64::from(cmd.height) > object.size() {
+        let height = if tiled {
+            cmd.height.div_ceil(8) * 8
+        } else {
+            cmd.height
+        };
+        if u64::from(pitch) * u64::from(height) > object.size() {
             return Err(CardError::InvalidDimensions);
         }
         if self.framebuffers.len() >= 4096 {
@@ -2220,7 +2248,7 @@ impl Card {
             gem_handle: cmd.handles[0],
             offsets: [0, 0],
             chroma_pitch: 0,
-            modifier: 0,
+            modifier,
             bo: None,
             intel: Some(IntelFb { object, owner }),
         });
@@ -2523,6 +2551,7 @@ pub mod tests {
             offset: 0,
             length: 4096,
             writable: true,
+            dumpable: false,
             pat: 3,
         }]);
         let mut bound_cmd = cmd(256, 256, 1024);
@@ -2560,6 +2589,7 @@ pub mod tests {
             offset: 0,
             length: 4096,
             writable: true,
+            dumpable: false,
             pat: 3,
         }]);
         if card

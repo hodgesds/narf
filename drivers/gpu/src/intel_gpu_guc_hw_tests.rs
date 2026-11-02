@@ -1295,7 +1295,9 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 }
             }
             0x100b => {
-                assert!(matches!(request[3], 2 | 3));
+                // User HIGH1, KMD_NORMAL2 and NORMAL3; KMD_HIGH0 remains
+                // unavailable to the native userspace queue profile.
+                assert!((1..=3).contains(&request[3]));
                 assert!((1..=100_000).contains(&request[5]));
                 assert_eq!(
                     [request[2], request[4], request[6], request[7]],
@@ -2988,6 +2990,11 @@ kernel_test_in!(
 mod slpc_controls {
     use super::*;
     include!("intel_gpu_slpc_tests.rs");
+}
+
+mod mert {
+    use super::*;
+    include!("intel_gpu_mert_hw_tests.rs");
 }
 
 fn service_slpc(w: &Window, memory: &Words, control_fence: u16, request: &[u32]) {

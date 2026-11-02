@@ -277,6 +277,7 @@ impl ExecRequest {
             tables: Some(tables),
             memory,
             objects: Vec::new(),
+            dumpable: Vec::new(),
         };
         for entry in &self.objects {
             // Compatibility owns a separate private VM and uses one WB host
@@ -331,6 +332,17 @@ pub(crate) struct VmMapping {
     pub length: u64,
     pub writable: bool,
     pub pat: u8,
+    /// DRM_XE_VM_BIND_FLAG_DUMPABLE; copied with every split/replacement.
+    pub dumpable: bool,
+}
+
+pub(crate) struct DiagnosticVm<'a> {
+    pub address: u64,
+    pub length: u64,
+    pub root: u64,
+    pub flags: u32,
+    pub memory: &'a FramePtMemory,
+    pub mappings: &'a [VmMapping],
 }
 
 impl ResidentBatch {
@@ -421,7 +433,15 @@ impl ResidentBatch {
             tables: Some(tables),
             memory,
             objects: Vec::new(),
+            dumpable: Vec::new(),
         };
+        space
+            .dumpable
+            .try_reserve_exact(mappings.iter().filter(|m| m.dumpable).count())
+            .map_err(|_| FsError::OutOfMemory)?;
+        space
+            .dumpable
+            .extend(mappings.iter().filter(|m| m.dumpable).cloned());
         for mapping in mappings {
             if let Some(object) = &mapping.object {
                 if let Some((_, writable)) = space
@@ -591,6 +611,19 @@ impl ResidentBatch {
                 .iter()
                 .all(|(object, _)| object.publish_for_device())
     }
+
+    /// The execution owns this immutable graph even after VM/GEM close.
+    /// No VM mutex, allocation, device read or reservation wait is needed.
+    pub(crate) fn diagnostic_vm(&self) -> DiagnosticVm<'_> {
+        DiagnosticVm {
+            address: self.address,
+            length: self.length,
+            root: self.space.root_phys(),
+            flags: u32::from(self.skip_batch) | u32::from(self.parallel.is_some()) << 1,
+            memory: &self.space.memory,
+            mappings: &self.space.dumpable,
+        }
+    }
 }
 
 /// Read-only ownership of the private kernel probe's code and result. Neither
@@ -705,6 +738,7 @@ pub struct AddressSpace {
     tables: Option<Ppgtt>,
     memory: FramePtMemory,
     objects: Vec<(Arc<GemObject>, bool)>,
+    dumpable: Vec<VmMapping>,
 }
 
 impl AddressSpace {

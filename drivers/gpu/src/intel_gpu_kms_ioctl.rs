@@ -4,7 +4,7 @@
 //! intel_display_irq.c at b90c984d615e8ce2af96f5b1411a962d83fed2ad.
 use super::*;
 use crate::drm::card::{Card, Crtc, FlipEventReservation, FlipStamp, Framebuffer, PixelFormat};
-use crate::intel_gpu_scanout::{Geometry, Viewport};
+use crate::intel_gpu_scanout::{Geometry, Layout, View, Viewport, X_TILED_MODIFIER};
 use alloc::boxed::Box;
 use narf_filesystem::FsFuture;
 
@@ -263,6 +263,7 @@ enum Action {
     SetMaster,
     Color {
         primary: bool,
+        view: View,
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
         degamma: Option<Arc<crate::intel_gpu_color::DegammaLut>>,
@@ -775,8 +776,16 @@ impl Plan {
             && p.next.enabled
             && fb.is_some()
             && route.is_some();
-        color_primary |= panning;
-        if color.is_some() || gamma.is_some() || degamma.is_some() || panning {
+        let tiling = p.next.enabled
+            && fb.is_some()
+            && route.is_some()
+            && [p.previous.primary_fb, fb]
+                .into_iter()
+                .flatten()
+                .any(|id| card.framebuffer(id).is_ok_and(|f| f.modifier != 0));
+        color_primary |= panning || tiling;
+        let mut view = View::from(viewport);
+        if color.is_some() || gamma.is_some() || degamma.is_some() || panning || tiling {
             if !card.intel_color(p.next.id) {
                 return Err(FsError::Unsupported);
             }
@@ -804,7 +813,8 @@ impl Plan {
                 let object = target.intel.as_ref().ok_or(FsError::Unsupported)?;
                 if target.pitch != geometry.pitch
                     || target.format != PixelFormat::Xrgb8888
-                    || target.modifier != 0
+                    || (target.modifier != 0
+                        && (target.modifier != X_TILED_MODIFIER || !card.intel_x_tiled))
                     || target.offsets != [0, 0]
                     || target.chroma_pitch != 0
                     || !object.object.is_wc()
@@ -813,6 +823,9 @@ impl Plan {
                     || object.object.is_userptr()
                 {
                     return Err(FsError::Unsupported);
+                }
+                if target.modifier == X_TILED_MODIFIER {
+                    view.layout = Layout::X;
                 }
                 if viewport
                     .x
@@ -825,9 +838,7 @@ impl Plan {
                 {
                     return Err(FsError::NoSpace);
                 }
-                let (_, _, extent) = viewport
-                    .layout(geometry)
-                    .map_err(|_| FsError::InvalidData)?;
+                let (_, _, extent) = view.footprint(geometry).map_err(|_| FsError::InvalidData)?;
                 if extent > object.object.size() {
                     return Err(FsError::InvalidData);
                 }
@@ -895,6 +906,7 @@ impl Plan {
             };
             p.action = Action::Color {
                 primary: color_primary,
+                view,
                 coefficients,
                 lut,
                 degamma,
@@ -1074,7 +1086,7 @@ trait Backend {
         &mut self,
         _object: Arc<crate::intel_gpu_gem::GemObject>,
         _geometry: Geometry,
-        _viewport: Viewport,
+        _view: View,
         _coefficients: Option<[u64; 9]>,
         _luts: crate::intel_gpu_color::Luts,
         _timing: crate::intel_gpu_dsb::Timing,
@@ -1138,12 +1150,12 @@ impl<M: crate::intel_gpu_kms::Platform> Backend for crate::intel_gpu_kms::Guard<
         &mut self,
         object: Arc<crate::intel_gpu_gem::GemObject>,
         geometry: Geometry,
-        viewport: Viewport,
+        view: View,
         coefficients: Option<[u64; 9]>,
         luts: crate::intel_gpu_color::Luts,
         timing: crate::intel_gpu_dsb::Timing,
     ) -> FsFuture<'_, FlipStamp> {
-        Box::pin(self.present_color(object, geometry, viewport, coefficients, luts, timing))
+        Box::pin(self.present_color(object, geometry, view, coefficients, luts, timing))
     }
     fn cursor(
         &mut self,
@@ -1393,6 +1405,7 @@ async fn execute_plan<B: Backend>(
         }
         Action::Color {
             primary,
+            view,
             coefficients,
             lut,
             degamma,
@@ -1404,10 +1417,7 @@ async fn execute_plan<B: Backend>(
                     .present_color(
                         object,
                         plan.geometry,
-                        Viewport {
-                            x: plan.next.x,
-                            y: plan.next.y,
-                        },
+                        *view,
                         *coefficients,
                         crate::intel_gpu_color::Luts {
                             post: lut.clone(),

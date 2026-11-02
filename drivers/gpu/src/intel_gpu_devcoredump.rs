@@ -3,8 +3,8 @@
 //! MIT Linux b90c984d xe_devcoredump.c::{devcoredump_snapshot,
 //! xe_devcoredump_snapshot_free}, xe_guc_ct.c::xe_guc_ct_snapshot_capture and
 //! xe_guc_log.c::xe_guc_log_snapshot_capture. This bounded NARF format is a
-//! partial device coredump: retained LRC/ring/group scratch is bounded; user
-//! BOs and VM tables are excluded. Raw bytes can disclose addresses, commands
+//! partial device coredump: retained LRC/ring/group scratch, owned VM tables
+//! and dumpable system BO prefixes are bounded. Raw bytes disclose addresses, commands
 //! and execution data and require current CAP_SYSLOG on every descriptor read.
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -30,7 +30,11 @@ const RING_BYTES: usize = 2 * 4096;
 const SCRATCH_BYTES: usize = 4096;
 const EXEC_STRIDE: usize = EXEC_ENTRY_BYTES + IMAGE_BYTES + RING_BYTES + SCRATCH_BYTES;
 const EXEC_BYTES: usize = EXEC_HEADER_BYTES + EXEC_LIMIT * EXEC_STRIDE;
-pub(crate) const DUMP_BYTES: usize = EXEC_OFFSET + EXEC_BYTES;
+const VM_OFFSET: usize = EXEC_OFFSET + EXEC_BYTES;
+#[path = "intel_gpu_vm_dump.rs"]
+mod vm;
+pub(crate) use vm::VmCapture;
+pub(crate) const DUMP_BYTES: usize = VM_OFFSET + vm::BYTES;
 const CAP_SYSLOG: u32 = 34;
 const CAP_SYS_ADMIN: u32 = 21;
 static RETAINED: [AtomicU8; MAX_CARDS] = [const { AtomicU8::new(0) }; MAX_CARDS];
@@ -159,13 +163,28 @@ impl Armed {
         self.capture_with_execution(report, identity, log, ct, |_, _| None, access);
     }
 
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn capture_with_execution(
+        self,
+        report: Report,
+        identity: Option<Identity>,
+        log: Option<&impl GpuBacking>,
+        ct: Option<&impl GpuBacking>,
+        execution: impl FnOnce(&mut ExecutionCapture<'_>, &mut dyn FnMut() -> bool) -> Option<usize>,
+        access: impl FnMut() -> bool,
+    ) {
+        self.capture_with_vm(report, identity, log, ct, execution, |_, _| None, access);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_with_vm(
         mut self,
         mut report: Report,
         identity: Option<Identity>,
         log: Option<&impl GpuBacking>,
         ct: Option<&impl GpuBacking>,
         execution: impl FnOnce(&mut ExecutionCapture<'_>, &mut dyn FnMut() -> bool) -> Option<usize>,
+        vms: impl FnOnce(&mut VmCapture<'_>, &mut dyn FnMut() -> bool) -> Option<usize>,
         mut access: impl FnMut() -> bool,
     ) {
         let dump = Arc::get_mut(&mut self.0).expect("unpublished crash destination");
@@ -177,13 +196,13 @@ impl Armed {
             suppressed: 0,
         }
         .text_into(&mut bytes[REPORT_OFFSET..LOG_OFFSET]);
-        let mut denied = false;
+        let denied = core::cell::Cell::new(false);
         let mut checked_access = || {
-            if denied {
+            if denied.get() {
                 return false;
             }
-            denied = !access();
-            !denied
+            denied.set(!access());
+            !denied.get()
         };
         if let Some(identity) = identity.filter(|identity| {
             identity.incarnation != 0
@@ -223,18 +242,27 @@ impl Armed {
             }
         }
         let mut destination =
-            ExecutionCapture::new(&mut bytes[EXEC_OFFSET..], report.capture.platform);
+            ExecutionCapture::new(&mut bytes[EXEC_OFFSET..VM_OFFSET], report.capture.platform);
         let total = execution(&mut destination, &mut checked_access);
-        if denied {
+        if denied.get() {
             destination.flags |= 2;
         }
         let execution_flags = destination.finish(total);
         if total.is_some() {
             sections |= 8;
         }
+        let mut destination = VmCapture::new(&mut bytes[VM_OFFSET..], report.capture.platform);
+        let total = vms(&mut destination, &mut checked_access);
+        if denied.get() {
+            destination.flags |= 2;
+        }
+        let vm_flags = destination.finish(total);
+        if total.is_some() {
+            sections |= 16;
+        }
         bytes[..8].copy_from_slice(b"NARFCDMP");
         for (offset, value) in [
-            (8, 2),
+            (8, 3),
             (12, HEADER_BYTES as u32),
             (16, DUMP_BYTES as u32),
             (20, dump.permit.0),
@@ -254,6 +282,9 @@ impl Armed {
             (144, EXEC_OFFSET as u32),
             (148, EXEC_BYTES as u32),
             (152, execution_flags),
+            (160, VM_OFFSET as u32),
+            (164, vm::BYTES as u32),
+            (168, vm_flags),
         ] {
             put32(bytes, offset, value);
         }

@@ -77,6 +77,7 @@ pub(crate) fn prepare_vram_clear(object: Arc<GemObject>) -> Result<ResidentBatch
         GtPlatform::Alchemist,
         &[
             VmMapping {
+                dumpable: false,
                 object: Some(code),
                 va: CODE,
                 offset: 0,
@@ -85,6 +86,7 @@ pub(crate) fn prepare_vram_clear(object: Arc<GemObject>) -> Result<ResidentBatch
                 pat: 0,
             },
             VmMapping {
+                dumpable: false,
                 object: Some(zero),
                 va: ZERO,
                 offset: 0,
@@ -93,6 +95,7 @@ pub(crate) fn prepare_vram_clear(object: Arc<GemObject>) -> Result<ResidentBatch
                 pat: 0,
             },
             VmMapping {
+                dumpable: false,
                 object: Some(object),
                 va: TARGET,
                 offset: 0,

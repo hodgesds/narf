@@ -361,7 +361,7 @@ impl<M: DisplayAccess + Clone> Owner<M> {
             !cursor_watermark(r)
                 && !matches!(
                     r,
-                    0x49028 | 0x4a480 | 0x701a4 | 0x7019c | 0x70080 | 0x70088 | 0x70084
+                    0x49028 | 0x4a480 | 0x701a4 | 0x70180 | 0x7019c | 0x70080 | 0x70088 | 0x70084
                 )
         }) {
             main.write(r, v);
@@ -383,6 +383,11 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         // source OFFSET before SURF; it must not escape into the earlier
         // non-arming coefficient prefix when the viewport changes.
         for &(r, v) in registers.iter().filter(|&&(r, _)| r == 0x701a4) {
+            main.write(r, v);
+        }
+        // skl_plane_update_arm: enabled primary CTL immediately precedes
+        // SURF; it must stay in the same evaded arm window as OFFSET.
+        for &(r, v) in registers.iter().filter(|&&(r, _)| r == 0x70180) {
             main.write(r, v);
         }
         for &(r, v) in registers.iter().filter(|&&(r, _)| r == 0x7019c) {

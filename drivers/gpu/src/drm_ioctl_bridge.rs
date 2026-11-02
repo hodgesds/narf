@@ -3307,8 +3307,8 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
     // GETPROPBLOB using the blob id GETCONNECTOR reported as this prop's value.
     let blob_name: Option<&[u8]> = match prop_id {
         EDID_PROP_ID => Some(b"EDID"),
-        #[cfg(feature = "amdgpu")]
-        crate::drm_native_planes::IN_FORMATS_PROP_ID => Some(b"IN_FORMATS"),
+        #[cfg(any(feature = "amdgpu", feature = "intel"))]
+        0x6e => Some(b"IN_FORMATS"),
         #[cfg(feature = "amdgpu")]
         crate::drm_native_planes::IN_FORMATS_ASYNC_PROP_ID => Some(b"IN_FORMATS_ASYNC"),
         _ => None,
@@ -4477,6 +4477,65 @@ fn handle_gamma(
 /// blobs, regenerated from the connector's preferred mode.
 ///
 /// Linux ref: `drivers/gpu/drm/drm_property.c::drm_mode_getblob_ioctl`.
+#[cfg(feature = "intel")]
+const INTEL_PRIMARY_FORMATS_BLOB: u32 = 0x4000_0040;
+#[cfg(feature = "intel")]
+fn intel_modifiers_cap(
+    mode: &Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    cmd: u32,
+    arg: u64,
+    context: &dyn IoctlContext,
+) -> Option<Result<u64, FsError>> {
+    if cmd != drm_uapi::DRM_IOCTL_GET_CAP || !mode.lock().intel_x_tiled {
+        return None;
+    }
+    let result = (|| {
+        let mut request = [0; 16];
+        context.read(arg, &mut request)?;
+        if u64::from_le_bytes(request[..8].try_into().unwrap())
+            != crate::drm::ioctl::drm_cap::ADDFB2_MODIFIERS
+        {
+            return Ok(None);
+        }
+        request[8..].copy_from_slice(&1u64.to_le_bytes());
+        context.write(arg, &request)?;
+        Ok(Some(0))
+    })();
+    match result {
+        Ok(None) => None,
+        Ok(Some(value)) => Some(Ok(value)),
+        Err(error) => Some(Err(error)),
+    }
+}
+/// The same installed display capability on primary and render opens. Other
+/// cards/capabilities retain their existing dispatcher and payload handling.
+#[cfg(feature = "intel")]
+pub(crate) fn intel_get_modifiers_cap(
+    card_index: u32,
+    cmd: u32,
+    arg: u64,
+    context: &dyn IoctlContext,
+) -> Option<Result<u64, FsError>> {
+    let mode = crate::drm_registry::mode_state(card_index)?;
+    intel_modifiers_cap(&mode, cmd, arg, context)
+}
+#[cfg(feature = "intel")]
+fn intel_primary_formats_blob(card: &crate::drm::card::Card, id: u32) -> Option<Vec<u8>> {
+    if id != INTEL_PRIMARY_FORMATS_BLOB || !card.intel_x_tiled {
+        return None;
+    }
+    // create_in_format_blob: XR24 alone, LINEAR and source-qualified X.
+    let mut bytes = Vec::new();
+    for word in [1u32, 0, 1, 24, 2, 32, DRM_FORMAT_XRGB8888, 0] {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    for modifier in [0, crate::intel_gpu_scanout::X_TILED_MODIFIER] {
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&modifier.to_le_bytes());
+    }
+    Some(bytes)
+}
 fn handle_getpropblob(
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     arg: usize,
@@ -4497,6 +4556,8 @@ fn handle_getpropblob(
         let native_blob = crate::drm_native_planes::in_formats_blob(&card, blob_id);
         #[cfg(not(feature = "amdgpu"))]
         let native_blob: Option<Vec<u8>> = None;
+        #[cfg(feature = "intel")]
+        let native_blob = native_blob.or_else(|| intel_primary_formats_blob(&card, blob_id));
         match (card.property_blob(blob_id), native_blob) {
             (Some(data), _) => data.to_vec(),
             (None, Some(data)) => data,
@@ -4593,8 +4654,13 @@ fn handle_obj_getproperties(
                 u64::from(p.crtc_h),
                 (-1i64) as u64,
             ];
-            #[cfg(feature = "amdgpu")]
+            #[cfg(any(feature = "amdgpu", feature = "intel"))]
             let (mut props, mut values) = (props, values);
+            #[cfg(feature = "intel")]
+            if card.intel_x_tiled && obj_id == PLANE_ID_BASE {
+                props.push(0x6e);
+                values.push(u64::from(INTEL_PRIMARY_FORMATS_BLOB));
+            }
             #[cfg(feature = "amdgpu")]
             if let Some((ids, vals)) = crate::drm_native_planes::object_properties(&card, obj_id) {
                 props.extend(ids);

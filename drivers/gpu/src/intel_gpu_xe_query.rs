@@ -78,7 +78,7 @@ fn query_wire(
 ) -> Result<(), FsError> {
     zero(&wire[..8])?;
     zero(&wire[24..40])?;
-    let payload = match u32_at(wire, 8) {
+    let mut payload = match u32_at(wire, 8) {
         0 => {
             // drm_xe_query_engines in xe_hw_engine id order: RCS0, BCS0, CCS0.
             let present = info
@@ -143,7 +143,8 @@ fn query_wire(
             put64(&mut reply, 16, config_flags);
             put64(&mut reply, 24, 4096);
             put64(&mut reply, 32, 48);
-            put64(&mut reply, 40, 1); // highest unprivileged Xe priority: normal
+            // Caller-dependent max priority is sampled only for an exact
+            // payload query, after size negotiation below (xe_query.c).
             reply
         }
         3 => {
@@ -263,6 +264,9 @@ fn query_wire(
     } else if u32_at(wire, 12) as usize != payload.len() {
         Err(FsError::InvalidData)
     } else {
+        if u32_at(wire, 8) == 2 {
+            put64(&mut payload, 40, crate::intel_gpu_xe::max_queue_priority());
+        }
         user.write(u64_at(wire, 16), &payload)
     }
 }

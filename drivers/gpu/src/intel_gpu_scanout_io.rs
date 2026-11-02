@@ -374,9 +374,22 @@ impl<M: DisplayAccess> MmioWindow for PollIo<M> {
         // hardware safe window, never through this register adapter.
         let console_origin =
             offset == Pipe::A.base() + PLANE_PRIMARY_OFFSET + PLANE_OFFSET_OFFSET && value == 0;
+        // Only enabled linear XRGB may be restored by this adapter. Client
+        // tiling/stride changes use DSB. The Presenter retains the exact
+        // original CTL/pitch and later proves the console's SURF latch.
+        let console_layout = self.format == PteFormat::XeLpg
+            && matches!(offset, 0x70180 | 0x70188)
+            && if offset == 0x70180 {
+                let current = self.read32(0x70180);
+                value == current & !(7 << 10)
+                    && value & 0x9f000000 == 0x84000000
+                    && [0, 1 << 10].contains(&(current & (7 << 10)))
+            } else {
+                value != 0 && value <= 0xfff
+            };
         if self.state.get() != State::Active
-            || !(pte || offset == surface || offset == IIR || console_origin)
-            || (console_origin && self.owned_status_ready().is_err())
+            || !(pte || offset == surface || offset == IIR || console_origin || console_layout)
+            || ((console_origin || console_layout) && self.owned_status_ready().is_err())
         {
             self.state.set(State::Lost);
             return;

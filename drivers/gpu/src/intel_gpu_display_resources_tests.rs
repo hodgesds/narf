@@ -109,6 +109,7 @@ impl MmioWindow for Registers {
 }
 fn smoke_mtl_cursor_resources_real_modeset_ack_joined_ddb_and_watermarks() -> TestResult {
     let io = Registers::new();
+    io.values.borrow_mut().insert(0x7026c, 5);
     assert_eq!(io.run(), Ok(Mode::VESA_1024X768_60));
     let profile = Profile::capture(&io, &Mode::VESA_1024X768_60).unwrap();
     assert_eq!(io.read32(0x45230) >> 16, 0xffff);
@@ -132,6 +133,21 @@ fn smoke_mtl_cursor_resources_real_modeset_ack_joined_ddb_and_watermarks() -> Te
     );
     assert!(profile.cursor_start <= 4064);
     assert!(profile.primary.levels[0].enable && profile.cursor.levels[0].enable);
+    // Display14 no-DPT is owned with the plane off, before it can interpret
+    // an X-tiled SURF as a direct GGTT address. Unrelated bits survive RMW.
+    assert_eq!(io.read32(0x7026c), (1 << 19) | 5);
+    assert!(
+        io.writes
+            .borrow()
+            .iter()
+            .position(|&(r, _)| r == 0x7026c)
+            .unwrap()
+            < io.writes
+                .borrow()
+                .iter()
+                .position(|&(r, v)| r == 0x70180 && v & (1 << 31) != 0)
+                .unwrap()
+    );
     assert_eq!(
         io.read32(0x70140),
         0,
@@ -218,7 +234,7 @@ kernel_test_in!(
     smoke_mtl_cursor_resources_prewrite_foreign_and_bad_profiles_refused
 );
 fn smoke_mtl_cursor_resources_partial_failures_keep_pipe_off_then_fresh_retry() -> TestResult {
-    for fault in [0x45230, 0x4438c, 0x7027c] {
+    for fault in [0x7026c, 0x45230, 0x4438c, 0x7027c] {
         let io = Registers::new();
         io.drop_write.set(fault);
         assert_eq!(
@@ -231,10 +247,12 @@ fn smoke_mtl_cursor_resources_partial_failures_keep_pipe_off_then_fresh_retry() 
         io.drop_write.set(u64::MAX);
         assert!(io.run().is_ok());
     }
-    let io = Registers::new();
-    io.lost_read.set(0x45230);
-    assert!(io.run().is_err());
-    assert_eq!(io.read32(0x70008) & 0xc0000000, 0);
+    for fault in [0x7026c, 0x45230] {
+        let io = Registers::new();
+        io.lost_read.set(fault);
+        assert!(io.run().is_err());
+        assert_eq!(io.read32(0x70008) & 0xc0000000, 0);
+    }
     let io = Registers::new();
     io.ack.set(false);
     assert!(io.run().is_err());

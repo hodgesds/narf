@@ -496,6 +496,37 @@ impl<A: BootAllocator> GuCScheduler<A> {
         total
     }
 
+    /// Each retained submission owns one immutable VM, shared by its lanes.
+    /// Count from host ownership even when capture stops on authority loss.
+    pub(crate) fn diagnostic_vms(
+        &self,
+        access: &mut dyn FnMut() -> bool,
+        mut visit: impl FnMut(u16, u32, &ResidentBatch, &mut dyn FnMut() -> bool),
+    ) -> usize {
+        let total = self
+            .resources
+            .contexts
+            .iter()
+            .filter(|context| context.resident.is_some())
+            .count();
+        for guilty in [true, false] {
+            for context in self
+                .resources
+                .contexts
+                .iter()
+                .filter(|context| (context.timed_out || context.reset) == guilty)
+            {
+                if let Some(batch) = &context.resident {
+                    if !access() {
+                        return total;
+                    }
+                    visit(context.id, context.stamp, batch, access);
+                }
+            }
+        }
+        total
+    }
+
     pub(crate) fn take_error_report(&mut self) -> Option<Report> {
         self.pending_error.take()
     }
@@ -558,6 +589,10 @@ impl<A: BootAllocator> GuCScheduler<A> {
 
     pub(crate) fn slpc_status(&self) -> Option<Status> {
         self.slpc.status()
+    }
+
+    pub(crate) fn lift_mert_cap(&mut self, now: u64) -> Result<(), SchedulingError> {
+        self.slpc.lift_mert_cap(now).map_err(SchedulingError::Slpc)
     }
 
     pub(crate) fn slpc_frequency_range(

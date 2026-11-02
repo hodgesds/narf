@@ -383,20 +383,29 @@ pub(crate) fn populate_card(index: u32, node: &Kobject) {
     if crate::drm_registry::card(index).is_none_or(|card| card.vendor_id() != 0x8086) {
         return;
     }
+    populate(node, move || controls(index));
+}
+fn populate(
+    node: &Kobject,
+    resolve: impl Fn() -> Option<Arc<PowerControls>> + Clone + Send + Sync + 'static,
+) {
     for attribute in [
         "gt_min_freq_mhz",
         "gt_max_freq_mhz",
         "slpc_frequency_range",
         "slpc_power_profile",
     ] {
+        let show = resolve.clone();
+        let store = resolve.clone();
         kobject_add_writable_attr(
             node,
             attribute,
-            move || controls(index).map_or_else(String::new, |c| c.show(attribute)),
+            move || show().map_or_else(String::new, |c| c.show(attribute)),
             move |data| {
-                controls(index)
-                    .ok_or(FsError::NoDevice)?
-                    .store(attribute, data)
+                if !narf_filesystem::caller_capable(21) {
+                    return Err(FsError::OperationNotPermitted);
+                }
+                store().ok_or(FsError::NoDevice)?.store(attribute, data)
             },
         );
     }
@@ -406,10 +415,16 @@ pub(crate) fn populate_card(index: u32, node: &Kobject) {
         "gt_RP0_freq_mhz",
         "slpc_status",
     ] {
+        let resolve = resolve.clone();
         kobject_add_attr(node, attribute, move || {
-            controls(index).map_or_else(String::new, |c| c.show(attribute))
+            resolve().map_or_else(String::new, |c| c.show(attribute))
         });
     }
+}
+
+#[cfg(feature = "kernel-test")]
+pub(crate) fn fixture_attributes(node: &Kobject, controls: Arc<PowerControls>) {
+    populate(node, move || Some(controls.clone()));
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

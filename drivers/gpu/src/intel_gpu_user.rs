@@ -321,7 +321,7 @@ impl UserContext {
         self.state.lock().last.clone()
     }
     pub(crate) fn configure_schedule(&self, priority: u32, timeslice: u32) -> Result<(), FsError> {
-        if !matches!(priority, 2 | 3) || !(1..=100_000).contains(&timeslice) {
+        if !(1..=3).contains(&priority) || !(1..=100_000).contains(&timeslice) {
             return Err(FsError::InvalidData);
         }
         let mut state = self.state.lock();

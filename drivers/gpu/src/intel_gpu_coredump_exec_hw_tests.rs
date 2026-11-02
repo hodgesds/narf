@@ -53,10 +53,10 @@ fn smoke_hardware_coredump_execution_timeout_snapshot_survives_full_reset() -> T
         );
         assert_eq!(completion.result(), None);
         let captured = coredump::snapshot_bytes_for_test(index).unwrap();
-        assert_eq!(word(&captured, 8), 2);
+        assert_eq!(word(&captured, 8), 3);
         assert_eq!(word(&captured, 72) & 8, 8);
         let offset = word(&captured, 144) as usize;
-        let exec = &captured[offset..];
+        let exec = &captured[offset..offset + word(&captured, 148) as usize];
         assert_eq!(&exec[..8], b"NARFEXEC");
         assert_eq!((word(exec, 24), word(exec, 28), word(exec, 32)), (1, 1, 1));
         let entry = &exec[64..];
@@ -117,7 +117,8 @@ fn smoke_hardware_coredump_execution_denial_does_not_read_or_release_owned_dma()
     assert_eq!(arena.live_allocations(), allocations);
     assert_eq!(completion.result(), None);
     let captured = coredump::snapshot_bytes_for_test(index).unwrap();
-    let exec = &captured[word(&captured, 144) as usize..];
+    let offset = word(&captured, 144) as usize;
+    let exec = &captured[offset..offset + word(&captured, 148) as usize];
     assert_eq!(
         (
             word(exec, 24),
@@ -128,6 +129,13 @@ fn smoke_hardware_coredump_execution_denial_does_not_read_or_release_owned_dma()
         (1, 0, 0, 3)
     );
     assert!(exec[64..].iter().all(|byte| *byte == 0));
+    let vm = &captured[0x1b4540..];
+    assert_eq!(&vm[..8], b"NARFVMEM");
+    assert_eq!(
+        (word(vm, 24), word(vm, 28), word(vm, 32), word(vm, 36)),
+        (0, 0, 0, 2)
+    );
+    assert!(vm[64..].iter().all(|byte| *byte == 0));
     assert!(coredump::clear_for_test(index));
     hardware_stop(&mut gt, &w, 0xdfc);
     drop(gt);

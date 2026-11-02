@@ -312,6 +312,10 @@ pub(crate) fn initialize(
     }
     wait(io, REQUEST1, ENABLE, 0)?;
     wait(io, INFLIGHT, 1 << 26, 0)?;
+    // intel_dpt_common.c::intel_dpt_configure, display14 no-DPT profile.
+    // Only our primary changes, with every pipe/fetcher proved off above.
+    let chicken = read(io, 0x7026c)?;
+    checked(io, 0x7026c, chicken | (1 << 19))?;
     // Wa_14016740474: display14.00 A0..<C0. STEP_* enumerates four
     // substeps per letter; GMD display stepping is the zero-based offset.
     if gmd & 63 < 8 {

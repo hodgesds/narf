@@ -404,6 +404,63 @@ impl GemObject {
         Ok(())
     }
 
+    /// Privileged, passive crash observation of a retained system-memory
+    /// mapping. Unlike CPU access admission this must not wait on the job's
+    /// own unfinished reservation fence or clean/invalidate caches. The caller
+    /// selects only coherent/WC mappings and renews current D0/wake/authority
+    /// before each page. VRAM needs independent BAR-access proof and is refused.
+    pub(crate) fn diagnostic_read(
+        &self,
+        offset: u64,
+        bytes: &mut [u8],
+        access: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        if self.is_vram()
+            || offset % PAGE != 0
+            || bytes.is_empty()
+            || bytes.len() > 16384
+            || bytes.len() % PAGE as usize != 0
+            || offset
+                .checked_add(bytes.len() as u64)
+                .is_none_or(|end| end > self.size)
+        {
+            return false;
+        }
+        for (index, output) in bytes.chunks_exact_mut(PAGE as usize).enumerate() {
+            if !access() {
+                bytes.fill(0);
+                return false;
+            }
+            let page = (offset / PAGE) as usize + index;
+            if self.is_userptr() {
+                let Some(pin) = self.pins.get(page) else {
+                    bytes.fill(0);
+                    return false;
+                };
+                pin.copy_into(0, output);
+                continue;
+            }
+            let Some(phys) = self.pages().nth(page) else {
+                bytes.fill(0);
+                return false;
+            };
+            let base = narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>();
+            core::sync::atomic::fence(Ordering::Acquire);
+            for (i, byte) in output.iter_mut().enumerate() {
+                // SAFETY: this object owns/pins the selected host frame for
+                // the complete snapshot. Raw volatile reads form no aliased
+                // Rust references to concurrently user/device-mapped data.
+                *byte = unsafe { core::ptr::read_volatile(base.add(i)) };
+            }
+        }
+        if !access() {
+            bytes.fill(0);
+            return false;
+        }
+        core::sync::atomic::fence(Ordering::Acquire);
+        true
+    }
+
     pub fn write(&self, offset: u64, bytes: &[u8]) -> Result<(), FsError> {
         self.range(offset, bytes.len())?;
         let snapshot = self.dma_buf.resv.snapshot();

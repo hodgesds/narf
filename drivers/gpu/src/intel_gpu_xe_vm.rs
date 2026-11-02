@@ -148,6 +148,7 @@ impl Bind {
                 length,
                 op: 0,
                 mapping: Some(VmMapping {
+                    dumpable: flags & 8 != 0,
                     object: None,
                     va: address,
                     offset: 0,
@@ -198,6 +199,7 @@ impl Bind {
             length,
             op,
             mapping: Some(VmMapping {
+                dumpable: flags & 8 != 0,
                 object: object_arc,
                 va: address,
                 offset,
@@ -368,6 +370,7 @@ mod tests {
             active: Vec::new(),
         };
         state.publish(alloc::vec![VmMapping {
+            dumpable: false,
             object: Some(gem.object(handle).unwrap()),
             va: 0x10000,
             offset: 0,
@@ -404,6 +407,7 @@ mod tests {
             length: 8192,
             op: 0,
             mapping: Some(VmMapping {
+                dumpable: false,
                 object: None,
                 va: 0x11000,
                 offset: 0,

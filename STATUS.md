@@ -1632,6 +1632,27 @@ formatting pass. aarch64 QEMU is omitted under the maintainer's iteration
 policy. The ledger now records 36 implemented rows and ten broad open
 workstreams; Intel silicon and Mesa acceptance remain unrun.
 
+The same branch now adds caller-authorized Xe HIGH priority and CONFIG
+discovery, version-three privileged failure bundles with bounded retained VM
+tables and DUMPABLE system/USERPTR BO prefixes, qualified fixed MTL/Arrow
+X-tiled primary presentation, and physical BMG 20.01 MERT cap removal with
+host-L2 coordination. X/linear changes retain both windows through independent
+DSB/primary evidence and exact console restoration. CPU-VRAM clears retain
+their target and PM hold before the first BAR write through their own fresh
+flush; cancellation or execution reset alone cannot release that ownership.
+Failed post-reset cap/flush/L2-disable proof retains the pending allocation.
+Pinned Linux currently gives all supported platform descriptors a zero CGP
+multi-queue class mask, so broader queue protocols await separate qualification.
+
+All 25 new fixtures pass. Selected Intel/DRM/framebuffer/backlight groups pass
+992 unique x86_64 tests, including all 31 shared backlight regressions, with
+zero failures or skips. The production boot and both btrfs postflights pass.
+GPU/fb CI Clippy passes all three contexts on both targets; all four host GPU
+configurations pass all-target Clippy. GPU/fb debug/release builds, formatting,
+diff and source-integrity checks pass. aarch64 QEMU is omitted under the
+maintainer's iteration policy. The ledger records 40 implemented rows and ten
+broad open workstreams; Intel silicon and Mesa acceptance remain unrun.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

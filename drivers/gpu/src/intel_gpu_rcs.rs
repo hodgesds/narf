@@ -1321,6 +1321,9 @@ struct Request<A: GpuAllocator> {
     fence: Arc<CompletionFence>,
 }
 
+// Retain the residency graph inline: boxing it adds a fallible allocation to
+// admission and complicates the manual quarantine lifetime for uncertain DMA.
+#[allow(clippy::large_enum_variant)]
 enum RequestBatch<A: GpuAllocator> {
     Ggtt(BatchBuf<A>),
     // Dropping an engine is not proof that DMA stopped. Deliberately retain

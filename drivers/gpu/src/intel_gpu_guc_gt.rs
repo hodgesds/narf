@@ -54,6 +54,8 @@ pub enum GtState {
     Releasing,
     Stopped,
     Lost,
+    /// Execution DMA is retired; host-L2/wake handoff still needs proof.
+    StoppingMert,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -79,6 +81,7 @@ struct Parts<M: MmioWindow, A: BootAllocator> {
     scheduler: Option<GuCScheduler<A>>,
     topology: Option<Arc<GtTopology>>,
     eu_stall: Option<crate::intel_gpu_eu_stall::Collector<A>>,
+    mert: Option<crate::intel_gpu_slpc::mert::Mert>,
 }
 
 /// The sole owner of the GT kernel-request bit and graphics-GuC mailbox.
@@ -98,6 +101,7 @@ pub struct GuCGt<M: MmioWindow, A: BootAllocator> {
     vram: Option<crate::intel_gpu_vram::VramLayout>,
     log_stream: Option<crate::intel_gpu_guc_log::stream::Actor>,
     log_fence: u16,
+    mert_required: bool,
 }
 
 impl<M: MmioWindow, A: BootAllocator> core::fmt::Debug for GuCGt<M, A> {
@@ -157,6 +161,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 scheduler: None,
                 topology: None,
                 eu_stall: None,
+                mert: None,
             }),
             state: GtState::Staged,
             deadline: 0,
@@ -168,6 +173,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             vram: None,
             log_stream: None,
             log_fence: crate::intel_gpu_guc_log::stream::FIRST_FENCE,
+            mert_required: false,
         }
     }
 
@@ -268,7 +274,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             firmware_version: log.firmware_version,
             firmware_digest,
         });
-        buffer.capture_with_execution(
+        buffer.capture_with_vm(
             report,
             identity,
             log.as_ref().map(|log| log.backing),
@@ -284,6 +290,13 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                             destination.push(info, parent, lane, image, ring, scratch, access);
                         },
                     )
+                })
+            },
+            |destination, access| {
+                self.parts.scheduler.as_ref().map(|scheduler| {
+                    scheduler.diagnostic_vms(access, |id, stamp, batch, access| {
+                        destination.push(id, stamp, batch, access);
+                    })
                 })
             },
             || access() && self.awake().is_ok(),
@@ -311,6 +324,12 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
 
     pub(crate) fn vram_cpu_access(&self, epoch: u64) -> bool {
         self.state == GtState::SchedulingReady
+            && (!self.mert_required
+                || self
+                    .parts
+                    .mert
+                    .as_ref()
+                    .is_some_and(|owner| owner.sanitizing()))
             && self.parts.boot.platform() == GtPlatform::Battlemage
             && epoch != 0
             && self.user_epoch() == Some(epoch)
@@ -828,6 +847,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 | GtState::ResettingEngines
                 | GtState::ReleasingRender
                 | GtState::Releasing
+                | GtState::StoppingMert
         ) {
             return Err(GtError::State);
         }
@@ -835,6 +855,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         self.log_stream.take();
         if let Some(collector) = self.parts.eu_stall.as_mut() {
             collector.invalidate();
+        }
+        if let Some(mert) = &mut self.parts.mert {
+            mert.closing();
         }
         self.state = GtState::Lost;
         self.parts.boot.cancel_reload();
@@ -893,6 +916,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             mode,
         )
         .map_err(GtError::Registers)?;
+        self.mert_required = registers.mert_required();
         let scheduler = self
             .parts
             .boot
@@ -1002,6 +1026,127 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             .flatten()
     }
 
+    /// Post-probe BMG20.01 PF sanitize. Bootstrap limits remain in force
+    /// until actual frequency, host-L2 and initial invalidation are proven.
+    /// Keep polling under the reset/PM owner before publishing user admission.
+    pub(crate) fn prepare_mert(
+        &mut self,
+        now: u64,
+        mut current: impl FnMut() -> bool,
+    ) -> Result<bool, GtError> {
+        use crate::intel_gpu_slpc::{mert, SlpcState};
+        let map = |error| GtError::Scheduling(SchedulingError::Slpc(error));
+        if self.parts.boot.platform() != GtPlatform::Battlemage || self.hardware.is_none() {
+            return Ok(true);
+        }
+        if !current() {
+            return Err(GtError::Unavailable);
+        }
+        self.admit_scheduling()?;
+        let epoch = self.user_epoch().ok_or(GtError::State)?;
+        if self.parts.mert.is_none() {
+            if !mert::qualified(self.parts.boot.window(), &mut current).map_err(map)? {
+                return Ok(true);
+            }
+            self.mert_required = true;
+            match self.slpc() {
+                SlpcState::Off | SlpcState::Unavailable => {
+                    return Err(map(crate::intel_gpu_slpc::SlpcError::Unavailable))
+                }
+                SlpcState::Running => {}
+                _ => return Ok(false),
+            }
+            let limits = self.slpc_status().ok_or(GtError::State)?.limits;
+            self.parts.mert = Some(mert::Mert::new(limits, epoch, now).map_err(map)?);
+        }
+        let parts = &mut *self.parts;
+        let owner = parts.mert.as_mut().expect("MERT owner");
+        match owner.prepare(parts.boot.window(), now, epoch, &mut current) {
+            Poll::Pending => return Ok(false),
+            Poll::Ready(result) => result.map_err(map)?,
+        }
+        if !owner.sanitizing() {
+            let status = parts
+                .scheduler
+                .as_ref()
+                .and_then(|s| s.slpc_status())
+                .ok_or(GtError::State)?;
+            if status.limits.max_mhz < status.limits.rp0_mhz {
+                parts
+                    .scheduler
+                    .as_mut()
+                    .expect("scheduler")
+                    .lift_mert_cap(now)
+                    .map_err(GtError::Scheduling)?;
+            }
+            owner.mark_sanitizing();
+        }
+        Ok(matches!(
+            self.slpc(),
+            SlpcState::Running | SlpcState::Unavailable
+        ))
+    }
+
+    /// Exercise raw flush-ticket ownership without a CPU-clear lease.
+    /// Production CPU clears must retain their target before any BAR write.
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn begin_vram_flush(&mut self, epoch: u64, now: u64) -> Result<u64, GtError> {
+        if epoch == 0 || self.user_epoch() != Some(epoch) {
+            return Err(GtError::State);
+        }
+        let Some(owner) = &mut self.parts.mert else {
+            return if self.mert_required {
+                Err(GtError::State)
+            } else {
+                Ok(0)
+            };
+        };
+        owner
+            .request_flush(epoch, now)
+            .map_err(|error| GtError::Scheduling(SchedulingError::Slpc(error)))
+    }
+
+    /// Reserve the single retained CPU-write transaction before its first
+    /// BAR store. Busy callers have not written and may safely be cancelled.
+    /// The caller transfers its PM hold to the returned completion fence.
+    pub(crate) fn retain_cpu_vram_clear(
+        &mut self,
+        object: Arc<crate::intel_gpu_gem::GemObject>,
+        epoch: u64,
+        now: u64,
+    ) -> Result<Option<crate::intel_gpu_slpc::mert::CpuClearLease>, GtError> {
+        if epoch == 0 || self.user_epoch() != Some(epoch) || !self.vram_cpu_access(epoch) {
+            return Err(GtError::State);
+        }
+        let Some(owner) = &mut self.parts.mert else {
+            return if self.mert_required {
+                Err(GtError::State)
+            } else {
+                Ok(None)
+            };
+        };
+        owner
+            .retain_cpu_clear(object, epoch, now)
+            .map(Some)
+            .map_err(|error| GtError::Scheduling(SchedulingError::Slpc(error)))
+    }
+
+    pub(crate) fn vram_flush_done(&self, epoch: u64, id: u64) -> Result<bool, GtError> {
+        if epoch == 0 || self.user_epoch() != Some(epoch) {
+            return Err(GtError::State);
+        }
+        let Some(owner) = &self.parts.mert else {
+            return if id == 0 && !self.mert_required {
+                Ok(true)
+            } else {
+                Err(GtError::State)
+            };
+        };
+        owner
+            .flush_done(epoch, id)
+            .map_err(|error| GtError::Scheduling(SchedulingError::Slpc(error)))
+    }
+
     /// Begin a bounded update; the owner must keep driving `poll` until SLPC
     /// returns Running or Unavailable. Acceptance is not a firmware ACK.
     pub fn begin_slpc_frequency_range(
@@ -1035,6 +1180,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     /// SchedulingReady with no registered, running or retiring context.
     pub fn idle(&self) -> bool {
         self.state == GtState::SchedulingReady
+            && self
+                .parts
+                .mert
+                .as_ref()
+                .is_none_or(|owner| owner.flush_idle())
             && self.log_stream.is_none()
             && self
                 .parts
@@ -1198,6 +1348,14 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     fn release_wake(&mut self, now: u64) -> Result<(), GtError> {
+        if self
+            .parts
+            .mert
+            .as_ref()
+            .is_some_and(|owner| !owner.stopped())
+        {
+            return Err(GtError::State);
+        }
         if let Some(hw) = &mut self.hardware {
             hw.begin_release(self.parts.boot.window(), now)
                 .map_err(GtError::Hardware)?;
@@ -1217,7 +1375,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     fn after_boot_stop(&mut self, now: u64) -> Result<(), GtError> {
-        if self.parts.scheduler.is_some() {
+        if self.parts.scheduler.is_some() || self.parts.mert.is_some() {
             self.deadline = now.checked_add(5_000_000).ok_or(GtError::State)?;
             self.parts.boot.window().write32(0x941c, 1);
             let _ = self.parts.boot.window().read32(0x941c);
@@ -1229,7 +1387,21 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     pub fn poll(&mut self, now: u64) -> Poll<Result<GtState, GtError>> {
-        let result = self.poll_inner(now);
+        self.poll_with_access(now, || true)
+    }
+
+    /// Physical runtime supplies current PCI D0/authority for every new MERT
+    /// register operation. Generic callers retain the enclosing D0 contract.
+    pub(crate) fn poll_with_access(
+        &mut self,
+        now: u64,
+        mut current: impl FnMut() -> bool,
+    ) -> Poll<Result<GtState, GtError>> {
+        let result = if current() {
+            self.poll_inner(now, &mut current)
+        } else {
+            Poll::Ready(Err(GtError::Unavailable))
+        };
         if matches!(result, Poll::Ready(Err(_))) && self.state != GtState::Staged {
             self.state = GtState::Lost;
             if let Some(actor) = &mut self.log_stream {
@@ -1242,7 +1414,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         result
     }
 
-    fn poll_inner(&mut self, now: u64) -> Poll<Result<GtState, GtError>> {
+    fn poll_inner(
+        &mut self,
+        now: u64,
+        current: &mut impl FnMut() -> bool,
+    ) -> Poll<Result<GtState, GtError>> {
         match self.state {
             GtState::Staged => return Poll::Ready(Err(GtError::State)),
             GtState::Lost => return Poll::Ready(Err(GtError::Poisoned)),
@@ -1390,6 +1566,24 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                     unsafe { scheduler.release_after_reset() };
                 }
                 self.retire_ct();
+                if let Some(mert) = &mut self.parts.mert {
+                    let map = |error| GtError::Scheduling(SchedulingError::Slpc(error));
+                    mert.after_reset(now).map_err(map)?;
+                    self.state = GtState::StoppingMert;
+                    return Poll::Pending;
+                }
+                self.release_wake(now)?;
+                return Poll::Pending;
+            }
+            GtState::StoppingMert => {
+                let parts = &mut *self.parts;
+                let mert = parts.mert.as_mut().expect("stopping host-L2 owner");
+                match mert.finish_stopped(parts.boot.window(), now, &mut *current) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => {
+                        result.map_err(|error| GtError::Scheduling(SchedulingError::Slpc(error)))?
+                    }
+                }
                 self.release_wake(now)?;
                 return Poll::Pending;
             }
@@ -1496,6 +1690,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                     .expect("owned scheduler")
                     .poll(parts.ct.as_mut().expect("owned CT"), now)
                     .map_err(GtError::Scheduling)?;
+                if let Some(mert) = &mut parts.mert {
+                    mert.service_flush(parts.boot.window(), now, &mut *current)
+                        .map_err(|error| GtError::Scheduling(SchedulingError::Slpc(error)))?;
+                }
             }
             _ => return Poll::Ready(Err(GtError::State)),
         }
@@ -1503,8 +1701,17 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     pub async fn wait(&mut self) -> Result<GtState, GtError> {
+        self.wait_with_access(|| true).await
+    }
+
+    pub(crate) async fn wait_with_access(
+        &mut self,
+        mut current: impl FnMut() -> bool,
+    ) -> Result<GtState, GtError> {
         loop {
-            if let Poll::Ready(result) = self.poll(narf_time::monotonic_ns()) {
+            if let Poll::Ready(result) =
+                self.poll_with_access(narf_time::monotonic_ns(), &mut current)
+            {
                 return result;
             }
             // Even if a short timer expires before its first poll, a clock
@@ -1555,6 +1762,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     /// The PCI owner proved a full GT reset stopped all engines and GuC/firmware
     /// DMA, invalidated stale HWS/LRC/GGTT addresses and released/reset both the
     /// render-well and graphics-GT kernel wake requests.
+    /// If MERT host-L2 was exposed, the external owner also proved its manual
+    /// requested/actual cap, fresh GLOBAL_INVAL drain and host-L2 disable before
+    /// releasing those wells.
     /// Neither unreadable registers nor elapsed time supplies that proof.
     pub unsafe fn release_after_gt_reset(mut self) {
         self.released = true;
@@ -1564,8 +1774,13 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             ct,
             scheduler,
             eu_stall,
+            mert,
             ..
         } = unsafe { ManuallyDrop::take(&mut self.parts) };
+        if let Some(mert) = mert {
+            // SAFETY: the external proof also covers host-L2 shutdown.
+            unsafe { mert.release_after_reset() };
+        }
         if let Some(collector) = eu_stall {
             // SAFETY: the caller's full graphics-GT/DMA reset proof covers it.
             unsafe { collector.release_after_reset() };

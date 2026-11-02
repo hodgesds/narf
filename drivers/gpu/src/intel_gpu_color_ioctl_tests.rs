@@ -1469,3 +1469,6 @@ mod viewport;
 mod degamma {
     include!("intel_gpu_degamma_ioctl_tests.rs");
 }
+mod tiled {
+    include!("intel_gpu_tiled_ioctl_tests.rs");
+}

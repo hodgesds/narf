@@ -56,6 +56,7 @@ struct Hardware {
     refuse_ptes: bool,
     refuse_console: bool,
     refuse_status_restore: bool,
+    refuse_layout: u64,
     dsb_pc: [u32; 2],
     dsb_wait: [Option<u32>; 2],
     dsb_delay: [bool; 2],
@@ -109,6 +110,7 @@ impl MockPlatform {
                 refuse_ptes: false,
                 refuse_console: false,
                 refuse_status_restore: false,
+                refuse_layout: u64::MAX,
                 dsb_pc: [0; 2],
                 dsb_wait: [None; 2],
                 dsb_delay: [false; 2],
@@ -212,6 +214,9 @@ impl MockPlatform {
     }
     pub(crate) fn allow_flips(&self, enabled: bool) {
         self.0.lock().flips = enabled;
+    }
+    pub(crate) fn refuse_layout(&self, register: u64) {
+        self.0.lock().refuse_layout = register;
     }
     pub(crate) fn arm_order(&self) -> Vec<u64> {
         self.0
@@ -354,6 +359,9 @@ impl MmioWindow for MockPlatform {
 }
 impl Hardware {
     fn write(&mut self, offset: u64, value: u32) {
+        if offset == self.refuse_layout {
+            return;
+        }
         if (0x4a000..0x4a400).contains(&offset) {
             if self.refuse_palette {
                 return;

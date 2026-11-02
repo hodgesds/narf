@@ -411,6 +411,10 @@ impl RenderFile {
         if crate::drm_registry::driver_name(card) != Some("intel-gpu") {
             return None;
         }
+        if let Some(result) = crate::drm_ioctl_bridge::intel_get_modifiers_cap(card, cmd, arg, user)
+        {
+            return Some(result);
+        }
         let info = match DeviceInfo::for_card(card) {
             Some(info) => info,
             None => return Some(Err(FsError::NoDevice)),
@@ -427,6 +431,10 @@ impl RenderFile {
     ) -> Option<Result<u64, FsError>> {
         if crate::drm_registry::driver_name(card) != Some("intel-gpu") {
             return None;
+        }
+        if let Some(result) = crate::drm_ioctl_bridge::intel_get_modifiers_cap(card, cmd, arg, user)
+        {
+            return Some(result);
         }
         let Some(info) = DeviceInfo::for_card(card) else {
             return Some(Err(FsError::NoDevice));

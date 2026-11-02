@@ -392,8 +392,8 @@ fn finish_policy(
 ) {
     for now in start..start + 60 {
         assert_eq!(gt.poll(now), Poll::Ready(Ok(GtState::SchedulingReady)));
-        // Native queues request normal2; trusted probes and direct contexts
-        // use low3. Keep the exact caller-selected policy and KLV checks.
+        // Native queues retain their selected high1/normal2/low3 policy;
+        // trusted probes use low3. Keep the literal policy and KLV checks.
         {
             let memory = ct_memory(w);
             let words = memory.borrow();
@@ -1304,7 +1304,14 @@ fn smoke_xe_queries_abi_identity_and_clock_facts() -> TestResult {
             2 => {
                 assert_eq!(u64_at(&reply, 8) & 65535, 0xe20b);
                 assert_eq!(u64_at(&reply, 16), 8);
-                assert_eq!(u64_at(&reply, 40), 1);
+                assert_eq!(
+                    u64_at(&reply, 40),
+                    if narf_filesystem::caller_capable(23) {
+                        2
+                    } else {
+                        1
+                    }
+                );
             }
             3 => {
                 assert_eq!(u32_at(&reply, 20), 25_000_000);
