@@ -23,6 +23,23 @@ impl OpenStopEvent {
     pub fn up(&self) -> bool {
         self.snapshot.link_up
     }
+    /// Capture this original event's current UP Ethernet identity outside
+    /// native State/provider locks. The returned fixed weak observation only
+    /// denies after metadata retirement; it supplies no device, RF, wake,
+    /// administrative or cleanup authority and cannot keep a provider alive.
+    pub fn native_identity(&self) -> Option<crate::native_emission::Lifetime> {
+        if !self.up() {
+            return None;
+        }
+        let (identity, registration) = super::native_identity(
+            &self.snapshot.name,
+            self.snapshot.net_ns_id,
+            self.snapshot.ifindex,
+            self.snapshot.ownership_epoch,
+            self.snapshot.mac,
+        )?;
+        (registration == self.snapshot.registration_epoch && identity.current()).then_some(identity)
+    }
     pub fn current(&self) -> bool {
         let guard = IFACES.lock();
         guard.as_ref().is_some_and(|entries| {

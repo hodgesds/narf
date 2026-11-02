@@ -312,6 +312,20 @@ receiver by name. UP additionally requires the original event generation;
 retired DOWN may clean up only the captured old device. This event is no grant.
 Callbacks run after Registry, IFACES and PUBLISH locks are released. Reentrant
 retirement or reversal fences the later packet-socket UP/DOWN notification.
+`OpenStopEvent::native_identity()` may capture a denial-only weak
+`native_emission::Lifetime` outside native State/provider locks. It succeeds
+only for the event's exact original current UP Ethernet registration,
+namespace, ownership epoch, IFINDEX and MAC, and compares the returned
+registration with that original event. DOWN, stale/rebound and non-Ethernet
+events refuse. The token's fixed `current()` does no virtual query or registry
+lookup: real metadata retirement synchronously closes it before a DOWN,
+rebind, MAC/namespace/representation change callback can run; later UP or
+same-name/index/MAC replacement never revives it. It keeps no provider alive
+and supplies no administrative/device/RF/wake/cleanup permission. Actual
+trusted driver binding and current original capabilities remain independent
+requirements at every native operation. A retired DOWN can still clean up
+only the captured original receiver through its own current device authority.
+
 The legacy `fn(name, up)` hook retains its original-device binding precondition;
 a check immediately before that function does not make a fresh name lookup safe
 against concurrent replacement.

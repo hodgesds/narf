@@ -1,6 +1,7 @@
 //! Interleave actual retirement after admission and before pure mutation.
 //! The hooks run outside PUBLISH/Registry/IFACES and never fake a grant.
 use super::*;
+use alloc::vec::Vec;
 use core::sync::atomic::AtomicBool;
 
 fn arm(name: &str, action: fn(&str)) {
@@ -153,4 +154,142 @@ fn delegated_admin_original_callback_is_unlocked_and_cannot_retarget_successor()
 kernel_test_in!(
     "net/stack_identity",
     delegated_admin_original_callback_is_unlocked_and_cannot_retarget_successor
+);
+
+#[derive(Debug)]
+struct IdentityTarget {
+    events: Arc<narf_lib::sync::IrqSafeSpinLock<Vec<crate::iface::OpenStopEvent>>>,
+    previous: Arc<narf_lib::sync::IrqSafeSpinLock<Option<crate::native_emission::Lifetime>>>,
+    down_was_closed: Arc<AtomicBool>,
+}
+impl crate::iface::OpenStopTarget for IdentityTarget {
+    fn transition(&self, event: crate::iface::OpenStopEvent) {
+        // First operation in DOWN: no registry query/driver action is needed
+        // to see synchronous retirement that preceded this callback.
+        if !event.up() {
+            let closed = self
+                .previous
+                .lock()
+                .as_ref()
+                .is_some_and(|old| !old.current());
+            self.down_was_closed.store(closed, Ordering::Release);
+        } else {
+            let identity = event.native_identity();
+            *self.previous.lock() = identity;
+        }
+        self.events.lock().push(event);
+    }
+}
+fn event_native_identity() -> Result<(), &'static str> {
+    let f = Fixture::new(true)?;
+    let events = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(Vec::new()));
+    let previous = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(None));
+    let down = Arc::new(AtomicBool::new(false));
+    let registration =
+        crate::iface::lookup(&f.name).ok_or("original event identity registration")?;
+    if !crate::iface::set_open_stop_target(
+        &registration,
+        Arc::new(IdentityTarget {
+            events: events.clone(),
+            previous,
+            down_was_closed: down.clone(),
+        }),
+    ) {
+        return Err("original identity target installation");
+    }
+    f.admin.set_link(true).map_err(|_| "actual original UP")?;
+    let first = events.lock().last().cloned().ok_or("original UP event")?;
+    let first_identity = first
+        .native_identity()
+        .ok_or("current original UP Ethernet identity")?;
+    if !first_identity.current() {
+        return Err("current original observation absent");
+    }
+    f.admin
+        .set_link(false)
+        .map_err(|_| "actual original DOWN")?;
+    let stopped = events.lock().last().cloned().ok_or("original DOWN event")?;
+    if !down.load(Ordering::Acquire)
+        || first_identity.current()
+        || first.native_identity().is_some()
+        || stopped.native_identity().is_some()
+    {
+        return Err("DOWN native identity was not closed before original callback");
+    }
+    f.admin.set_link(true).map_err(|_| "new original UP")?;
+    let second = events.lock().last().cloned().ok_or("new UP event")?;
+    let second_identity = second.native_identity().ok_or("new current UP identity")?;
+    if first_identity.current() || first.native_identity().is_some() || !second_identity.current() {
+        return Err("DOWN/UP revived original event or weak identity");
+    }
+    f.admin
+        .set_mac([2, 1, 2, 3, 4, 5])
+        .map_err(|_| "actual original MAC change")?;
+    f.admin
+        .set_mac(registration.mac)
+        .map_err(|_| "actual original MAC return")?;
+    if second_identity.current() || second.native_identity().is_some() {
+        return Err("MAC away/back revived an event identity");
+    }
+    f.admin.set_link(false).map_err(|_| "MAC epoch DOWN")?;
+    f.admin.set_link(true).map_err(|_| "MAC epoch UP")?;
+    let third = events
+        .lock()
+        .last()
+        .cloned()
+        .ok_or("namespace original UP event")?;
+    let third_identity = third
+        .native_identity()
+        .ok_or("namespace current identity")?;
+    f.admin
+        .move_to_net_ns(0x7671)
+        .map_err(|_| "actual original namespace transfer")?;
+    f.admin
+        .move_to_net_ns(0)
+        .map_err(|_| "actual original namespace return")?;
+    if third_identity.current() || third.native_identity().is_some() {
+        return Err("namespace away/back revived an event identity");
+    }
+    f.admin.set_link(false).map_err(|_| "representation DOWN")?;
+    crate::iface::set_link_metadata(&f.name, false, None, None);
+    crate::iface::set_link_layer(&f.name, crate::iface::LinkLayer::Ieee80211Radiotap)
+        .map_err(|_| "actual representation change")?;
+    f.admin.set_link(true).map_err(|_| "monitor metadata UP")?;
+    let monitor = events
+        .lock()
+        .last()
+        .cloned()
+        .ok_or("monitor current UP event")?;
+    if !monitor.current() || monitor.native_identity().is_some() {
+        return Err("current non-Ethernet event acquired native Ethernet identity");
+    }
+    f.admin
+        .set_link(false)
+        .map_err(|_| "monitor metadata DOWN")?;
+    crate::iface::set_link_layer(&f.name, crate::iface::LinkLayer::Ethernet)
+        .map_err(|_| "actual representation return")?;
+
+    f.admin.set_link(true).map_err(|_| "namespace epoch UP")?;
+    let fourth = events
+        .lock()
+        .last()
+        .cloned()
+        .ok_or("rebind original UP event")?;
+    let fourth_identity = fourth.native_identity().ok_or("rebind current identity")?;
+    replace_legacy(&f.name);
+    if fourth_identity.current()
+        || fourth.native_identity().is_some()
+        || first.native_identity().is_some()
+        || stopped.native_identity().is_some()
+    {
+        return Err("same-name/index/MAC successor revived original event identity");
+    }
+    Ok(())
+}
+fn delegated_admin_event_native_identity_is_fixed_denial_only_and_never_revives() -> TestResult {
+    event_native_identity().map_or_else(TestResult::Fail, |_| TestResult::Pass)
+}
+kernel_test_in!(
+    "net/stack_identity",
+    delegated_admin_event_native_identity_is_fixed_denial_only_and_never_revives
 );
