@@ -33,12 +33,27 @@ fn advance(h: &Harness, time: u64) -> Result<(), &'static str> {
     h.env
         .now
         .store(time / 1000, core::sync::atomic::Ordering::Release);
+    let previous = h.model.last_rx.get().ok_or("periodic prior RX tail")?;
     let beacon = { h.peer.lock().beacon() };
     h.model
         .inject(&beacon, 0)
         .map_err(|_| "periodic real current-peer beacon after clock advance")?;
-    h.pump();
-    Ok(())
+    // receive() rearms the prior held descriptor only after consuming this
+    // successor. Stop at that actual DMA receipt, after Radio's same-pass
+    // native-idle/calibration service, instead of16 redundant full drains.
+    for _ in 0..16 {
+        h.device.drain();
+        let terminal = {
+            h.device
+                .radio
+                .try_lock()
+                .is_some_and(|radio| radio.terminal())
+        };
+        if terminal || h.model.word(previous + 48).is_ok_and(|word| word & 1 == 0) {
+            return Ok(());
+        }
+    }
+    Err("periodic beacon lacks actual prior-tail rearm or terminal owner")
 }
 fn upload(h: &Harness, body: &[u8]) -> Result<(), &'static str> {
     let frame = udp_ipv4(
@@ -293,6 +308,10 @@ kernel_test_in!(
 fn negative() -> Result<(), &'static str> {
     {
         let (h, cap) = profile(true);
+        // Native DATA timeout is1s. Cross the first periodic deadline while
+        // the actual held ticket is still within its independently owned
+        // native deadline, rather than timing it out at exactly1,000,000us.
+        advance(&h, 999_900)?;
         h.peer.lock().hold_data = true;
         let frame = udp_ipv4(
             AP,

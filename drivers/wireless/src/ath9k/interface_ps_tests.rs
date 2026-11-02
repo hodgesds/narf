@@ -502,6 +502,12 @@ fn smoke_ar9285_station_ps_revoked_source_ignored_wake_shutdown_and_bad_notice_q
                 beacon(&h, 204800, false, false);
             }
             7 => {
+                let prior = { h.model.registers.borrow().get(&0x9874).copied() };
+                if prior.is_none_or(|value| value & 0x3fff_ffff == 0) {
+                    return TestResult::Fail(
+                        "PS physical synth fault had no prior programmed channel",
+                    );
+                }
                 h.model.registers.borrow_mut().insert(0x9874, 0);
             }
             _ => {

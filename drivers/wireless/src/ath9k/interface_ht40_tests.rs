@@ -484,7 +484,11 @@ fn spec(width: Width, gi: u8, protected: bool) -> Spec {
 fn network(owner: &Owner) -> Result<(), &'static str> {
     let device = owner.device();
     let peer = owner.peer();
-    let plan = peer.lock().plan;
+    let (plan, previous_dora) = {
+        let peer = peer.lock();
+        let seen = peer.server.observations();
+        (peer.plan, (seen.discovers, seen.requests))
+    };
     let lease =
         narf_net::dhcp::dhcp_acquire(device.name(), 0).map_err(|_| "wide native kernel DHCP")?;
     let observed = {
@@ -492,7 +496,7 @@ fn network(owner: &Owner) -> Result<(), &'static str> {
         let seen = peer.server.observations();
         (seen.discovers, seen.requests)
     };
-    if !plan.matches_lease(&lease) || observed != (1, 1) {
+    if !plan.matches_lease(&lease) || observed != (previous_dora.0 + 1, previous_dora.1 + 1) {
         return Err("wide real native DORA receipts");
     }
     let bytes = udp_ipv4(
@@ -504,9 +508,22 @@ fn network(owner: &Owner) -> Result<(), &'static str> {
         4802,
         b"actual wide native IP",
     );
+    let before_uplink = { peer.lock().uplink.len() };
     narf_net::iface::send_on(device.name(), &bytes).map_err(|_| "wide netdev enqueue")?;
-    owner.pump();
-    if peer.lock().uplink.last() != Some(&bytes) {
+    let mut uplink_done = false;
+    for _ in 0..24 {
+        device.drain();
+        let original = {
+            let peer = peer.lock();
+            peer.uplink.len() > before_uplink && peer.uplink.last() == Some(&bytes)
+        };
+        let native_done = { device.radio.try_lock().is_some_and(|radio| radio.ready()) };
+        if original && native_done {
+            uplink_done = true;
+            break;
+        }
+    }
+    if !uplink_done || peer.lock().uplink.last() != Some(&bytes) {
         return Err("wide exact native DMA uplink");
     }
     let down = udp_ipv4(
@@ -533,8 +550,19 @@ fn network(owner: &Owner) -> Result<(), &'static str> {
     } else {
         0
     });
+    let previous = model.last_rx.get().ok_or("wide prior RX DMA tail")?;
     model.inject(&wire, 0).map_err(|_| "wide RX DMA")?;
-    owner.pump();
+    let mut received = false;
+    for _ in 0..24 {
+        device.drain();
+        if model.word(previous + 48).is_ok_and(|word| word & 1 == 0) {
+            received = true;
+            break;
+        }
+    }
+    if !received {
+        return Err("wide RX lacks actual prior-tail rearm");
+    }
     let mut ring = device.rx_ring().lock();
     let ring = ring.as_mut().ok_or("wide RX ring absent")?;
     let mut found = false;

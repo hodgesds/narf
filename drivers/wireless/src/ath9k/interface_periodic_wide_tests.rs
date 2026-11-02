@@ -20,12 +20,25 @@ fn advance(owner: &Arc<Owner>, now: u64) -> Result<(), &'static str> {
     let clock = { owner.clocks.lock().last().unwrap().clone() };
     model.now.set(now);
     clock.now.store(now / 1000, Ordering::Release);
+    let previous = model.last_rx.get().ok_or("periodic wide prior RX tail")?;
     let beacon = { owner.peer().lock().beacon() };
     model
         .inject(&beacon, 0)
         .map_err(|_| "periodic wide real current-peer beacon")?;
-    owner.pump();
-    Ok(())
+    let device = owner.device();
+    for _ in 0..24 {
+        device.drain();
+        let terminal = {
+            device
+                .radio
+                .try_lock()
+                .is_some_and(|radio| radio.terminal())
+        };
+        if terminal || model.word(previous + 48).is_ok_and(|word| word & 1 == 0) {
+            return Ok(());
+        }
+    }
+    Err("periodic wide beacon lacks actual prior-tail rearm or terminal owner")
 }
 fn actual_width() -> Result<(), &'static str> {
     for width in [Width::FortyAbove, Width::FortyBelow] {
@@ -206,13 +219,39 @@ fn faults() -> Result<(), &'static str> {
         selected.periodic_low_child = true;
         selected.large = true;
         let owner = Owner::new(selected);
+        // Association can finish before the optional P worker's first idle
+        // bind. Drive that actual native admission boundary; an early public
+        // join return neither proves nor bypasses a P current-child check.
+        let _joined = owner.join();
+        let model = owner.model();
+        for _ in 0..24 {
+            owner.device().drain();
+            if owner
+                .device()
+                .radio
+                .try_lock()
+                .is_some_and(|radio| radio.terminal())
+            {
+                break;
+            }
+        }
+        let (source, attempted, untouched) = {
+            let state = model.periodic.borrow();
+            let source = state.source.clone().unwrap();
+            let attempted = state
+                .bound
+                .as_ref()
+                .is_some_and(|bound| Arc::ptr_eq(bound, &source));
+            (source, attempted, state.trace.is_empty())
+        };
+        let child_current = {
+            let child = model.tx_ba.borrow().clone().unwrap();
+            child.signed_ceiling() == 24 && child.check().is_ok()
+        };
         check!(
-            owner.join().is_err(),
+            attempted && child_current && !owner.device().link_up() && !model.master.get(),
             "P global peak bypassed actually installed child signed ceiling"
         );
-        let model = owner.model();
-        let source = { model.periodic.borrow().source.clone().unwrap() };
-        let untouched = { model.periodic.borrow().trace.is_empty() };
         check!(
             source.check().is_ok() && untouched && !owner.device().link_up() && !model.master.get(),
             "child ceiling rejection used unsigned source or changed calibration hardware"

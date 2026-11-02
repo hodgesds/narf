@@ -44,8 +44,16 @@ pub(in crate::ath9k) fn qualify(model: &Arc<Model>) -> Cap<FirmwareBlob, Read> {
         signer: Some([0x85; 32]),
         cap,
     }
-    .load(base)
+    .load(base.clone())
     .unwrap();
+    // Full reset fixtures already carry the actual programmed synthesizer.
+    // Supply only the missing source-literal channel word for the older
+    // isolated minimal20 fixture; never overwrite an existing physical fact.
+    model
+        .registers
+        .borrow_mut()
+        .entry(0x9874)
+        .or_insert(0x3000_0000 | (u32::from(base.geometry().center()) * 0x10000 / 15));
     *model.ps.borrow_mut() = Some(source);
     model.registers.borrow_mut().insert(0x7044, 2);
     model.registers.borrow_mut().insert(0x704c, 3);

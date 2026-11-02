@@ -69,6 +69,18 @@ impl Model {
             self.ps_failed.set(true);
             return Err(Error::State);
         }
+        // Ordinary Native::access rechecks the actual retained channel
+        // synthesizer after waking. Mirror that physical fence here; the
+        // minimal model H fixture otherwise checked only its static powers
+        // and mode, making a corrupted synth invisible to S1 DATA admission.
+        let base = { self.ht.borrow().clone().ok_or(Error::Access)? };
+        let synth = { self.registers.borrow().get(&0x9874).copied().unwrap_or(0) };
+        if synth & 0x3fff_ffff
+            != (0x3000_0000 | (u32::from(base.geometry().center()) * 0x10000 / 15))
+        {
+            self.ps_failed.set(true);
+            return Err(Error::Descriptor);
+        }
         Ok(())
     }
 }

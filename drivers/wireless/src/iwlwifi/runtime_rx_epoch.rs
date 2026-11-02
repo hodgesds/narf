@@ -147,8 +147,17 @@ impl Hardware {
         self.synchronize_rx(Some(baid)).await
     }
     async fn synchronize_rx(&mut self, baid: Option<u8>) -> Result<Vec<Packet>, &'static str> {
+        // Ordinary Qu station/BAID retirement retains its original MVM
+        // receiver. Only the complete selected API77 AP consumer with its
+        // original current START role uses this common EMPTY/sync1 path.
+        let legacy_ap = baid.is_none()
+            && self.ap_legacy_selected()
+            && self
+                .ap_owner
+                .as_ref()
+                .is_some_and(|owner| owner.check().is_ok());
         if self.failed
-            || self.format == rx_rfh::CompletionFormat::Qu
+            || (self.format == rx_rfh::CompletionFormat::Qu && !legacy_ap)
             || !matches!(self.version(5, 2).map(|v| v.0), None | Some(1 | 99))
         {
             return Err("unsupported/failed native MLD RX epoch contract");

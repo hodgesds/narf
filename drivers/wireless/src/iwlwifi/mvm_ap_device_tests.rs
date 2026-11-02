@@ -393,8 +393,72 @@ impl Fixture {
     fn start(&self, secure: bool) -> Result<(), &'static str> {
         let a = self.authority()?;
         let (c, s) = config(secure);
-        run(self.h.device.start_ap_with_settings_async(&a, c, s))?
-            .map_err(|_| "API77 AP original START/native receipts")
+        let result = run(self.h.device.start_ap_with_settings_async(&a, c, s))?;
+        if result.is_err() {
+            self.diagnose("original START", &result);
+        }
+        result.map_err(|_| "API77 AP original START/native receipts")
+    }
+    #[inline(never)]
+    fn diagnose(&self, label: &str, result: &dyn core::fmt::Debug) {
+        use core::fmt::Write;
+        // Failure-only owned metadata: never run on a healthy poll or add
+        // I/O/callbacks under State. Scopes end before another lock is taken.
+        let state = {
+            self.h.device.state.try_lock().map(|mut state| {
+                let active = state.ap.is_some();
+                let owner = state.owner.as_mut().map(|owner| {
+                    let phase = owner.phase();
+                    let failed = owner.station_failed();
+                    let hw = owner.ap_hardware();
+                    (
+                        phase,
+                        failed,
+                        hw.is_failed(),
+                        model::retained(hw),
+                        hw.ap_command_cursor(),
+                        hw.receive_capture_epoch(),
+                    )
+                });
+                (active, owner)
+            })
+        };
+        let _ = writeln!(narf_console::Writer,
+            "API77 AP failure {label} result={result:?} state(ap,ownerphase/stationfailed/hwfailed/retained/cursor/rxepoch)={state:?} stopped={} cleanup={} terminal={}",
+            self.h.device.ap_stopped.load(Ordering::Acquire),
+            self.h.device.ap_cleanup.load(Ordering::Acquire),
+            self.h.device.terminal.load(Ordering::Acquire));
+        let Some(actor) = self.h.actor.try_lock() else {
+            return;
+        };
+        let held = actor
+            .held
+            .as_ref()
+            .map(|(c, g, s, b)| (*g, *c, *s, b.len()));
+        let native = actor.native_ap.as_ref().map(|m| {
+            (
+                m.started,
+                m.beacon,
+                m.peers.len(),
+                m.queues.iter().filter(|q| q.live).count(),
+                m.keys.len(),
+                m.mcc_flags,
+            )
+        });
+        let _ = writeln!(
+            narf_console::Writer,
+            "API77 AP actor held={held:?} model(started,beacon,peers,queues,keys,mcc)={native:?}"
+        );
+        for (g, c, b) in actor.commands.iter().rev().take(14).rev() {
+            // Public command selectors only; never print key/nonce material.
+            let selectors = matches!((*g, *c), (3, 8) | (3, 9) | (1, 8) | (1, 0x9f) | (1, 0xc8))
+                .then_some((b.get(..4), b.get(4..8), b.get(8..12)));
+            let _ = writeln!(
+                narf_console::Writer,
+                "API77 AP command {g:02x}:{c:02x} len={} selectors={selectors:?}",
+                b.len()
+            );
+        }
     }
     fn key(&self, id: u8, material: [u8; 16]) -> Result<(), &'static str> {
         let a = self.authority()?;
@@ -529,9 +593,62 @@ impl Drop for Platform {
     }
 }
 
+#[inline(never)]
+fn unqualified_common_sync_is_refused(f: &Fixture, baid: bool) -> Result<(), &'static str> {
+    let (refused, unchanged) = {
+        let mut state =
+            f.h.device
+                .state
+                .try_lock()
+                .ok_or("API77 sync probe State busy")?;
+        let owner = state
+            .owner
+            .as_mut()
+            .ok_or("API77 sync probe original owner absent")?;
+        let hw = owner.ap_hardware();
+        require(
+            hw.ap_legacy_selected(),
+            "API77 sync probe lost actual AP ABI/NVM adapter",
+        )?;
+        if !baid {
+            hw.close_receive_epoch()?;
+        }
+        let cursor = hw.ap_command_cursor();
+        let epoch = hw.receive_capture_epoch();
+        let refused = if baid {
+            let mut future = Box::pin(hw.synchronize_rx_baid(3));
+            matches!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(_))
+            )
+        } else {
+            let mut future = Box::pin(hw.synchronize_receive_epoch());
+            matches!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(_))
+            )
+        };
+        (
+            refused,
+            hw.ap_command_cursor() == cursor && hw.receive_capture_epoch() == epoch,
+        )
+    };
+    require(
+        refused && unchanged,
+        "API77 ordinary/ownerless BAID sync published without its actual role consumer",
+    )
+}
+
 fn native() -> Result<(), &'static str> {
     let _platform = Platform::new();
     let f = Fixture::new()?;
+    // A complete adapter and selected AP mode alone are not a current START
+    // owner. Actual native command/DMA cursor must remain untouched here.
+    unqualified_common_sync_is_refused(&f, false)?;
     // Legacy station/probe qualification cannot substitute for this record;
     // production obtains and checks the exact original PCI/RF/NVM/FW/SMBIOS hash.
     let request = run(f.h.device.ap_power_request())??;
@@ -540,6 +657,9 @@ fn native() -> Result<(), &'static str> {
         "API77 AP reused station/probe power name",
     )?;
     f.start(true)?;
+    // This AP implements legacy20, not a fabricated Qu BAID owner. Its
+    // successful EMPTY/sync1 receipt must not authorize a foreign BAID.
+    unqualified_common_sync_is_refused(&f, true)?;
     require(
         f.h.device.link_up() && f.h.actor.lock().native_ap.as_ref().unwrap().beacon,
         "API77 AP carrier before actual beacon receipt",
@@ -870,13 +990,11 @@ fn held_source() -> Result<(), &'static str> {
         );
         let deadline = narf_time::Deadline::after_ms(3000);
         loop {
-            require(
-                start
-                    .as_mut()
-                    .poll(&mut Context::from_waker(Waker::noop()))
-                    .is_pending(),
-                "API77 AP START escaped held power receipt",
-            )?;
+            let result = start.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+            if result.is_ready() {
+                f.diagnose("held power returned early", &result);
+                return Err("API77 AP START escaped held power receipt");
+            }
             f.h.actor.lock().serve()?;
             if f.h.actor.lock().held.is_some() {
                 break;
