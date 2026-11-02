@@ -1143,6 +1143,18 @@ pub trait WirelessNetIface: Interface {
     ) -> Result<(), i32> {
         Err(EOPNOTSUPP)
     }
+    /// Snapshot the actual installed AP transmit PN/IPN under the original
+    /// caller, role, source and key lifetime. Includes consumed unsent PNs;
+    /// it is never a receive replay counter or an inferred firmware value.
+    async fn key_sequence_ap_async(
+        &self,
+        _authority: &ap_control::ApControlAuthority,
+        _index: u8,
+        _pairwise: bool,
+        _peer: Option<[u8; 6]>,
+    ) -> Result<KeySequence, i32> {
+        Err(EOPNOTSUPP)
+    }
     async fn default_key_ap_async(
         &self,
         _authority: &ap_control::ApControlAuthority,
@@ -1271,6 +1283,10 @@ pub trait WirelessNetIface: Interface {
     /// selection only when the actual AP key/control path is complete.
     fn supports_ap_authenticator(&self) -> bool {
         self.supports_ap() && self.supports_external_supplicant()
+    }
+    /// Opt in only with an actual installed-key transmit-sequence owner.
+    fn supports_ap_key_sequence(&self) -> bool {
+        false
     }
     fn supports_control_port_no_preauth(&self) -> bool {
         self.supports_external_supplicant()
@@ -1565,6 +1581,15 @@ pub struct KeyParams {
     /// `NL80211_ATTR_KEY_DEFAULT_MGMT`: this IGTK is the AP's selected
     /// transmit management key. Meaningful only for a non-pairwise IGTK.
     pub default_mgmt: bool,
+}
+
+/// Sequence-only GET_KEY result. No temporal key material is exported.
+/// `seq` is the installed key's actual 48-bit transmit PN/IPN in wire
+/// little-endian order; zero is valid for a freshly installed unused key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeySequence {
+    pub cipher: u32,
+    pub seq: [u8; 6],
 }
 
 /// Opaque owned staging for a native asynchronous key operation. Creation

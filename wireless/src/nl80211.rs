@@ -1150,6 +1150,11 @@ fn wiphy_attrs(
         ]);
     }
     // An external-supplicant driver has `add_key` (CMD(add_key, NEW_KEY)).
+    if iface
+        .is_some_and(|iface| iface.supports_ap_authenticator() && iface.supports_ap_key_sequence())
+    {
+        command_list.push(9); // GET_KEY: installed AP transmit sequence only.
+    }
     if iface.is_some_and(|iface| {
         iface.supports_external_supplicant() || iface.supports_ap_authenticator()
     }) {
@@ -1643,6 +1648,7 @@ pub(crate) const OPERATIONS: &[GenlOperation] = &[
     op(107, DO, UNS), // CHANNEL_SWITCH
     op(142, DO, UNS), // COLOR_CHANGE_REQUEST
     // External-supplicant station commands.
+    op(9, DO, UNS),          // GET_KEY: AP transmit sequence only
     op(10, DO, UNS),         // SET_KEY
     op(11, DO, UNS),         // NEW_KEY
     op(12, DO, UNS),         // DEL_KEY

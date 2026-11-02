@@ -16,6 +16,8 @@ use zeroize::Zeroizing;
 
 #[path = "ap_async.rs"]
 mod ap_async;
+#[path = "ap_key_async.rs"]
+mod ap_key_async;
 #[path = "p2p_async.rs"]
 mod p2p_async;
 #[path = "sched_async.rs"]
@@ -1098,6 +1100,12 @@ fn route(
     context: RequestContext<'_>,
     deferred: Option<&narf_net::netlink_generic::DeferredRequest>,
 ) -> Result<Vec<GenlReply>, i32> {
+    if command == 9 {
+        if dump {
+            return Err(EOPNOTSUPP);
+        }
+        return ap_key_async::handle(bytes, context, deferred);
+    }
     if matches!(command, NEW_INTERFACE | DEL_INTERFACE) {
         return virtual_interface_handle(command, bytes, context, deferred);
     }

@@ -15,6 +15,8 @@ mod dispatch;
 mod emission;
 #[path = "ap_event_tests.rs"]
 mod events;
+#[path = "ap_key_dispatch_tests.rs"]
+mod key_sequence;
 #[path = "sched_dispatch_tests.rs"]
 mod scheduled;
 
@@ -36,6 +38,11 @@ struct Radio {
     mgmt_acked: AtomicBool,
     key_errno: AtomicU32,
     key_installs: AtomicU32,
+    key_sequence_supported: AtomicBool,
+    key_sequence_ready: AtomicBool,
+    key_sequence_polls: AtomicU32,
+    key_sequence_drops: AtomicU32,
+    key_sequence_pn: AtomicU64,
     default_key: AtomicU32,
     station_external: AtomicBool,
     station_sme: AtomicBool,
@@ -73,6 +80,11 @@ impl Radio {
             mgmt_acked: AtomicBool::new(true),
             key_errno: AtomicU32::new(0),
             key_installs: AtomicU32::new(0),
+            key_sequence_supported: AtomicBool::new(false),
+            key_sequence_ready: AtomicBool::new(false),
+            key_sequence_polls: AtomicU32::new(0),
+            key_sequence_drops: AtomicU32::new(0),
+            key_sequence_pn: AtomicU64::new(0),
             default_key: AtomicU32::new(u32::MAX),
             station_external: AtomicBool::new(true),
             station_sme: AtomicBool::new(true),
@@ -298,6 +310,41 @@ impl WirelessNetIface for Radio {
     }
     fn supports_ap_authenticator(&self) -> bool {
         true
+    }
+    fn supports_ap_key_sequence(&self) -> bool {
+        self.key_sequence_supported.load(Ordering::Acquire)
+    }
+    async fn key_sequence_ap_async(
+        &self,
+        authority: &ApControlAuthority,
+        index: u8,
+        pairwise: bool,
+        peer: Option<[u8; 6]>,
+    ) -> Result<crate::KeySequence, i32> {
+        struct Waiter<'a>(&'a AtomicU32);
+        impl Drop for Waiter<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let _waiter = Waiter(&self.key_sequence_drops);
+        core::future::poll_fn(|cx| {
+            authority.check_for(self).map_err(|_| 1)?;
+            self.key_sequence_polls.fetch_add(1, Ordering::AcqRel);
+            if !self.key_sequence_ready.load(Ordering::Acquire) {
+                cx.waker().wake_by_ref();
+                return core::task::Poll::Pending;
+            }
+            if index != 1 || pairwise || peer.is_some() {
+                return core::task::Poll::Ready(Err(2));
+            }
+            let pn = self.key_sequence_pn.load(Ordering::Acquire).to_le_bytes();
+            core::task::Poll::Ready(Ok(crate::KeySequence {
+                cipher: 0x000fac04,
+                seq: pn[..6].try_into().unwrap(),
+            }))
+        })
+        .await
     }
     fn supports_handshake_offload(&self) -> bool {
         self.station_handshake.load(Ordering::Acquire)

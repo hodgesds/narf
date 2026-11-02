@@ -1049,6 +1049,40 @@ successful installation in the same reserved operation; failed installation
 cannot select a transmit key. SET_KEY delegates the actual unicast/multicast/
 management/beacon selection instead of acknowledging a station-only no-op.
 
+Native AP/GO key-sequence queries opt in separately through
+`supports_ap_key_sequence()`. `NL80211_CMD_GET_KEY` is administrative and
+requires an UP netdev in mode3/9, the original `ApControlAuthority` and a
+current native AP generation. Its default-unsupported callback is
+`key_sequence_ap_async(authority, index, pairwise, peer) -> Result<KeySequence,
+i32>`, where `KeySequence { cipher: u32, seq: [u8;6] }` contains only an
+installed key's actual allocated transmit PN/IPN, including consumed unsent
+PNs, in six little-endian octets. A fresh installed unused key can report its
+actual zero; absent/staged keys and unsupported hardware counters must fail,
+never report a fabricated zero or an RX replay counter. The native provider
+retains the exact source/role/key lifetime through the snapshot. Default
+callbacks and capability advertisement remain unsupported.
+
+GET_KEY defaults the index to0; this bounded non-MLO profile admits group
+indices0..5 with no peer (actual GTK/IGTK lookup remains the driver's duty),
+or pairwise index0 with an actual unicast client. A group request with any
+MAC returns ENOENT without an IBSS_RSN peer namespace. BIGTK6/7, MLO link IDs,
+unsupported key types and key-material/nested install attributes are refused.
+Every deferred poll and the final reply recheck the original administrative
+grant, namespace/interface/mode generation and socket source, and publication
+requires the netdev still UP. The Linux-compatible NEW_KEY response includes
+top-level IFINDEX/KEY_IDX/WDEV, optional peer, cipher/sequence and an unflagged KEY
+nest with index/cipher/sequence. It has no KEY_DATA or key bytes.
+The original registry wiphy/wdev identity is captured at admission and retained
+through native callbacks; replies never retarget a freshly resolved receiver.
+Raw GET_WIPHY
+advertises GET_KEY only with the explicit native sequence capability and AP
+authenticator support. This supplies hostapd's GTK RSC query before M3/group
+rekey, not a key installation, selection, controlled-port or RF grant.
+Primary sources: Linux
+[`nl80211_get_key`/`get_key_callback`](https://codebrowser.dev/linux/linux/net/wireless/nl80211.c.html#nl80211_get_key)
+and hostap
+[`wpa_auth_get_seqnum`](https://chromium.googlesource.com/chromiumos/third_party/hostap/+/fb2d4c1a3971302455730191117b0e91ce9b8793/src/ap/wpa_auth.c).
+
 A source-qualified native AP may accept pre-START group keys as zeroizing
 software staging, following Linux's early-AP-key path. That ACK/default-choice
 record is staging metadata only: it grants no installed key, selected native
