@@ -752,10 +752,10 @@ impl MstLink {
         let mut modeset = Modeset::for_pipe(mmio, self.ddi, stream.pipe);
         modeset.set_gen12_family(family);
         if self.streams.len() == 1 {
-            modeset.teardown();
+            modeset.try_teardown()?;
             self.trained = None;
         } else {
-            modeset.teardown_stream();
+            modeset.try_teardown_stream()?;
         }
 
         // Credit the ledger along the stream's path.

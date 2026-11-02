@@ -18,6 +18,7 @@ use crate::intel_gpu_guc_transport::{Mailbox, TransportError, TransportState, Xe
 use crate::intel_gpu_hwconfig::HardwareConfig;
 use crate::intel_gpu_nonpriv::EnginePolicy;
 use crate::intel_gpu_rcs::GpuBacking;
+use crate::intel_gpu_slpc::SlpcState;
 use crate::intel_gpu_topology::{GtTopology, TopologyError};
 use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
@@ -160,6 +161,68 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         Self::from_staged_hardware(
             GuCBoot::stage(mmio, allocator, firmware, config).map_err(GtError::Boot)?,
         )
+    }
+
+    pub(crate) fn stage_hardware_with_huc(
+        mmio: M,
+        allocator: A,
+        firmware: &GuCFirmware,
+        huc: &crate::intel_gpu_huc::Firmware,
+        config: BootConfig,
+    ) -> Result<Self, GtError> {
+        Self::from_staged_hardware(
+            GuCBoot::stage_with_huc(mmio, allocator, firmware, huc, config)
+                .map_err(GtError::Boot)?,
+        )
+    }
+
+    /// Finish HuC through the existing single scheduler/CT owner before public
+    /// epoch admission. Optional PC failure never pretends HuC is available.
+    pub(crate) fn prepare_huc(&mut self, now: u64) -> Result<bool, GtError> {
+        let Some(image) = self.parts.boot.huc_upload() else {
+            return Ok(true);
+        };
+        self.admit_scheduling()?;
+        let scheduler = self.parts.scheduler.as_mut().ok_or(GtError::State)?;
+        if scheduler.huc.started() {
+            return Ok(scheduler.huc.done());
+        }
+        if !scheduler.engines().iter().any(|engine| engine.is_decode()) {
+            scheduler.huc.invalidate();
+            return Ok(true);
+        }
+        match scheduler.slpc() {
+            SlpcState::Running => {
+                scheduler.huc.begin(image, now);
+                Ok(false)
+            }
+            SlpcState::Off | SlpcState::Unavailable => {
+                scheduler.huc.invalidate();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub(crate) fn huc_version(
+        &self,
+        epoch: u64,
+        mut current: impl FnMut() -> bool,
+    ) -> Option<(u8, u8, u8)> {
+        if self.parts.boot.platform() != crate::intel_gpu_huc::PLATFORM
+            || self.state != GtState::SchedulingReady
+            || epoch == 0
+            || self.user_epoch() != Some(epoch)
+            || !current()
+            || self.awake().is_err()
+        {
+            return None;
+        }
+        self.parts
+            .scheduler
+            .as_ref()?
+            .huc
+            .version(self.parts.boot.window())
     }
 
     pub(crate) fn from_staged_hardware(boot: GuCBoot<M, A>) -> Result<Self, GtError> {
@@ -975,6 +1038,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         ) {
             return Err(GtError::State);
         }
+        if let Some(scheduler) = self.parts.scheduler.as_mut() {
+            scheduler.huc.invalidate();
+        }
         // Close admission before any fallible reset/recovery operation.
         self.log_stream.take();
         if let Some(collector) = self.parts.eu_stall.as_mut() {
@@ -1555,6 +1621,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     }
 
     fn engine_stop_complete(&mut self, now: u64) -> Result<(), GtError> {
+        // Full Gen12 engine reset and media ACK release have retired HuC.
+        self.parts.boot.huc_full_reset_complete();
         if let Some(collector) = self.parts.eu_stall.take() {
             // SAFETY: GuC reset/DMA idle and GRDOM_FULL self-clear
             // precede release of all observation GGTT storage.
@@ -1990,6 +2058,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
     /// requested/actual cap, fresh GLOBAL_INVAL drain and host-L2 disable before
     /// releasing those wells.
     /// Neither unreadable registers nor elapsed time supplies that proof.
+    /// Any exposed TGL HuC image additionally requires full media-engine
+    /// reset/idle and retained media-wake release, never GuC-only Stopped.
     pub unsafe fn release_after_gt_reset(mut self) {
         self.released = true;
         // SAFETY: consumed once under the caller's full-reset proof.

@@ -1046,6 +1046,10 @@ pub fn production_suspend() -> Result<(), PmError> {
     if let Some(guard) = ownership.as_mut() {
         guard.suspend();
     }
+    // One bounded stop step; runtime/async prepare owns later progress.
+    // A partial stop returns Busy before any PCI power transition and keeps
+    // the existing KMS block in place after this guard is dropped.
+    crate::intel_gpu::stop_external_sst_locked(&window.0).map_err(|_| PmError::Busy)?;
     let mut core = PM_CORE.lock();
     let result = core.suspend(&window, &BusPciPower, &LockedProductionPlatform);
     if result == Err(PmError::Busy) {
@@ -1064,6 +1068,9 @@ pub fn production_suspend() -> Result<(), PmError> {
 /// The device-PM resume entry (registry-facing).
 pub fn production_resume() -> Result<(), PmError> {
     let window = production_window().ok_or(PmError::NotProbed)?;
+    if !crate::intel_gpu::external_routes_stopped(&window.0) {
+        return Err(PmError::Busy);
+    }
     let display = crate::intel_gpu_kms::display_for_bar(&window.0);
     let mut ownership = match display.as_ref() {
         Some(display) => Some(display.legacy().map_err(|_| PmError::Busy)?),
@@ -1090,6 +1097,9 @@ pub fn production_resume() -> Result<(), PmError> {
 /// unseal, then this reconcile).
 pub fn production_reconcile() -> Result<(), PmError> {
     let window = production_window().ok_or(PmError::NotProbed)?;
+    if !crate::intel_gpu::external_routes_stopped(&window.0) {
+        return Err(PmError::Busy);
+    }
     let display = crate::intel_gpu_kms::display_for_bar(&window.0);
     let mut ownership = match display.as_ref() {
         Some(display) => Some(display.legacy().map_err(|_| PmError::Busy)?),

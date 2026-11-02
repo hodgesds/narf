@@ -396,3 +396,7 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_kms",
     smoke_intel_gen12_primary_resource_loss_and_reset_retain_until_original_console_proof
 );
+
+mod external_stop {
+    include!("intel_gpu_external_stop_kms_tests.rs");
+}

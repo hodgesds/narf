@@ -778,6 +778,8 @@ mod intel_gpu_guc_wa;
 #[cfg(feature = "intel")]
 pub mod intel_gpu_hdmi;
 #[cfg(feature = "intel")]
+mod intel_gpu_huc;
+#[cfg(feature = "intel")]
 pub mod intel_gpu_hwconfig;
 #[cfg(feature = "intel")]
 mod intel_gpu_hwmon;

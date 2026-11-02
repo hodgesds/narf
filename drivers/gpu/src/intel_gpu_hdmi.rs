@@ -807,8 +807,8 @@ pub fn connect<M: MmioWindow + ?Sized>(
 /// Disconnect: silence audio (codec disable + sink clear) and
 /// stop the infoframes before the pipeline comes down — the
 /// DP session's ordering, for the same reason: no consumer
-/// may act on an ELD whose display is already gone. False means the source
-/// family no longer matches; no side effects occur and the session is retained.
+/// may act on an ELD whose display is already gone. False means source
+/// refusal or an unobserved/partial local stop; retain the complete session.
 pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &HdmiConnection) -> bool {
     if mmio.gen12_display_family() != Some(conn.family) {
         return false;
@@ -820,8 +820,7 @@ pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &HdmiConnection) -> bo
     disable_infoframes(mmio, Transcoder::A);
     let mut modeset = Modeset::new(mmio, conn.ddi);
     modeset.set_gen12_family(conn.family);
-    modeset.teardown();
-    true
+    modeset.try_teardown().is_ok()
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

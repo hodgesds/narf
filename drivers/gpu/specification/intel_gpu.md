@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.33** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.34** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -24,7 +24,9 @@
 > Gen12 CTM/cursor/native LUTs, bounded loss-accounted GuC log fanout,
 > joint primary/color and X/integer views, headless LNL/PTL main GT,
 > Gen12 main-GuC media, retained CPU aliases, immutable Xe low-latency hints
-> and exact LNL EU-stall observation — see §20).
+> and exact LNL EU-stall observation; reviewed retained combo-B SST stop,
+> per-object BMG i915 ASYNC and default-off exact-TGL HuC upload/auth/query
+> are implemented with validation pending — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -305,6 +307,8 @@ The external-session gate is separate: combo HPD enable/poll, DP, HDMI,
 MST and USB-C DP Alt Mode remain Gen12-only until their Xe-LPG port
 sequences exist. Unsupported generations return before HPD register
 access; enabling the Xe-LPG internal panel must not enable Gen12 ports.
+The Gen12 gate is necessary but insufficient: physical combo-B HPD/SST also
+requires exact TGL/ADL-P/N GPU and actually observed matching PCH policy.
 
 Intel-only crate builds (`--no-default-features --features intel`) and
 their `kernel-test` fixtures use vendor feature guards throughout shared
@@ -1006,14 +1010,17 @@ Public interface:
   pipeline teardown. `retrain(mmio, conn, fb)` answers an
   IRQ_HPD short pulse: the connection stands if every trained
   lane still reports CR_DONE, else a fresh connect runs.
-- `HpdMonitor` / `poll_hpd_event` — GEN8 DE Port block
-  (ISR 0x44440, IMR 0x44444, IIR 0x44448, IER 0x4444C; combo
-  hotplug bits at `1 << (3 + ddi_index)`). Level rise/fall is
-  Connect/Disconnect; a latched IIR bit on a steady high level
-  is the DP short pulse → `RetrainRequired`. Production glue
-  in `intel_gpu::poll_dp_hpd_events` drains events, allocates
-  the scanout (probe's allocator/lifetime), and publishes
-  through the §7 ACTIVE + observer protocol.
+- `HpdMonitor` / `poll_hpd_event` — observed TGP/ADP south-display
+  SDE registers (ISR0xc4000, IMR0xc4004, IIR0xc4008, IER0xc400c),
+  SHOTPLUG0xc4030 and observed shared filter0xc4038=F8. Physical
+  combo B is qualified only on TGL/ADL-P/N; ADL-S and combo C refuse.
+  Setup masks before IER and establishes fresh owned IIR/SHOT status,
+  preserving foreign W1C state. Later source LONG+low indicates removal;
+  short/unknown/pre-IIR low retains known-connected state. Current GPU
+  authority and unchanged observed PCH facts gate every pass. The runtime
+  services an already-retained SST owner; new-output discovery and live
+  retraining remain separate. Native pipe/surface settling precedes
+  publication and checked local stop precedes serial-matched withdrawal.
 
 Two seams are defined here for named consumers:
 
@@ -1188,11 +1195,12 @@ first, codec enable, then ELD_VALID. The cross-vendor
 display-audio story is tracked in #778 (AMD), referenced
 not closed by this lane.
 
-HPD is the §14 GEN8 DE Port block, shared: HDMI sinks
-answer DDC, DP sinks answer AUX, so the glue
-(`intel_gpu::handle_dp_hpd_event`) tries the DP connect
-first and falls back to HDMI; a fall tears down whichever
-session owns the DDI. Short pulses remain DP-only.
+Physical HPD follows the source-qualified SDE/SHOT contract in §14;
+HDMI sinks answer DDC and DP sinks answer AUX. The legacy connect dispatch
+may try DP then HDMI, but the incremental runtime drain owns only retained
+SST DP. HDMI/MST retain their BAR/graph and return Busy for PM/reset drain
+until their own full source stop protocols are qualified. Short pulses do
+not constitute unplug proof or qualify live retraining.
 
 Invariants:
 
@@ -1547,9 +1555,13 @@ render nodes route these requests before shared DRM/KMS dispatch and acquire
 mmap backing atomically.
 
 Native terminal fences now back the shared per-object dma-buf reservation.
-GuC and Gen12 resident admission check the whole residency list before adding
-READ/WRITE fences; readers can overlap, conflicting writers return busy, and
-kernel CPU copies use the same admission gate. Cache publication follows
+GuC and Gen12 resident admission check synchronous conflicts across the
+whole residency list before adding READ/WRITE fences. Readers can overlap;
+unflagged conflicting work returns busy. Qualified BMG per-object
+EXEC_OBJECT_ASYNC skips only that entry's prior implicit GPU waits; mixed
+unflagged entries still require generation-checked final admission. Every
+entry receives its terminal READ/WRITE fence, including ASYNC, and kernel CPU
+copies use the same admission gate and observe all conflicting reservations. Cache publication follows
 reservation. Failure after reservation releases the graph before signalling;
 uncertain DMA lifetime keeps reservations through timeout/cancel until proven
 full reset. Independent GuC LRCs do not share an ordered dma-fence context.
@@ -1562,7 +1574,12 @@ IMPORT_SYNC_FILE batches serialize with CPU/native reservation admission;
 foreign callbacks and final drops remain outside admission/reservation locks.
 CPU/implicit job conflict decisions validate the observed addition generation
 before copying or publishing, including racing imports. Xe GPU ordering stays
-explicit. Existing mappings still require caller exclusion; Mesa execution
+explicit. GETPARAM HAS_EXEC_ASYNC (43) reports 1 only for current nonzero BMG
+admission with published engines, otherwise 0, without waking the GT. ASYNC is
+bounded to ordinary system WB softpin objects and same-card WB imports; local,
+WC, VM-owned and pinned-user objects and other platforms refuse. Explicit input
+fences and same-context order remain required. CPU mmap stores remain ordered
+by the client; reservations do not freeze or revoke an existing alias. Mesa execution
 acceptance remains separate. Linux references are
 `i915_gem_busy.c`, `i915_gem_wait.c`, `dma-resv.c` and `dma-buf.c` at the pinned
 source revision below. Native smokes exercise alias/PRIME lifetime, independent
@@ -1624,8 +1641,12 @@ profiles. Minimal bootstrap disables scheduling and advertises no engines. The
 physical owner holds forcewake/runtime-PM, serializes resets/DMA and programs
 PAT/MOCS before exposing mappings. All allocations stay above the largest
 admitted WOPCM window and below the GuC GGTT ceiling. A timeout or failed authentication retains every
-potentially live allocation; release requires verified GuC reset plus firmware
-DMA idle, or an explicit unsafe proof from the GT owner. One-shot DMA publication
+potentially live allocation. The original no-HuC bootstrap release requires
+verified GuC reset plus firmware DMA idle, or an explicit unsafe proof from the
+GT owner. Exact-TGL exposed HuC additionally requires the enclosing full Gen12
+engine-reset/media-ACK retirement; lower Staged/Stopped labels and GuC-only
+reset are insufficient. Other profiles preserve their own mapping-retirement
+and wake-release contracts. One-shot DMA publication
 does not make shared CT cursor lines coherent: CT requires an allocator that
 explicitly supplies coherent memory. Physical x86_64 system allocations gain
 that proof after platform cache-policy installation; ARM host-bridge coherency
@@ -2210,6 +2231,9 @@ production feature. Unsupported functionality remains unadvertised.
 | Intel CPU alias lifetime | Whole-BO physical census, pending publication tokens, retained unpublished-fork metadata and permanent mixed-vendor provider dispatch | Implemented; native fixtures pass |
 | Xe low-latency queue hint | Truthful current ABI/epoch discovery, immutable real queue flag, source policy KLV before enable ACK and retained physical/virtual/parallel contexts | Implemented; native fixtures pass |
 | LNL EU-stall observation | Exact headless graphics20.04 profile, retained sampler/cache/media proof and existing bounded privilege/loss/reset lifecycle | Implemented; native fixtures pass |
+| Retained Gen12 external SST stop | Current observed combo-B HPD, fresh status incarnation, checked retained local-stop/publication/PM gate and exact implemented-plane inventory | Implemented; debug native fixtures pass |
+| Per-object i915 ASYNC | Live BMG ordinary WB softpin and same-card WB imports, truthful GETPARAM43, selective prior GPU waits, atomic mixed admission and retained terminal/CPU ordering | Implemented; debug native fixtures pass |
+| Exact-TGL HuC upload/auth/query | Default-off actual firmware/BO/WOPCM, both-pass DMA, typed zero-result CT plus fresh status, current Xe query7/type1 and full-reset reclamation | Implemented; debug native fixtures pass |
 | GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open; mapping revocation and platform PM |
 | Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; primary-source register/firmware contracts |
 
@@ -2929,7 +2953,8 @@ The default-off LNL sampler reuses the existing owner and startup arena. It
 verifies exact GAM MOCS3/PAT2, current media/cache/MMIO authority and physical
 DSS positions before publishing data. It retains uncertain DMA through the
 same independent reset and arena-before-media-release protocol. PTL sampling,
-OA, codec/HuC, media-GT and physical Intel/Mesa acceptance remain separate.
+OA, codecs, HuC on these LNL/PTL profiles, separate media GTs and physical
+Intel/Mesa acceptance remain separate. Exact TGL has the distinct opt-in below.
 All ten new fixtures pass in debug and release native kernels. The combined
 branch passes 1,154 Intel/DRM/framebuffer/backlight tests and 670 shared
 filesystem/graphics/AMD tests in each profile, with no failures or duplicate
@@ -2948,3 +2973,69 @@ production behavior changes. The ledger has 58 implemented checkpoint rows
 and ten broad open workstreams. Intel silicon and Mesa acceptance remain
 unrun. The separate retained external-display draft has cleared static review;
 its executable/native validation remains pending.
+
+### Reviewed next7 scope — release and cross-target checks pending
+
+Three bounded production slices extend the validated v0.33 checkpoint and
+pass debug native validation. The ledger contains 58 fully validated rows
+plus three debug-tested rows (61 total); ten broad workstreams remain open.
+Release/production/btrfs/cross-target gates are pending. Native models do not
+establish physical Intel or Mesa acceptance.
+
+- Retained external display owns one source-qualified Gen12 combo-B SST stop
+  graph. Current capability/D0 and observed PCH identity gate masked SDE/SHOT
+  polling; fresh initialization prevents inherited LONG from converting a
+  short pulse into unplug. Independent plane/pipe/DDI stop witnesses precede
+  serial-matched withdrawal. PM/reset uses the same state outside the GT mutex;
+  cancel/lost authority/failed status retains the graph and stopped/quarantined
+  storage remains reserved. HDMI/MST drain, reconnect/retrain, resource
+  repartition and broader outputs remain separate. Exact TGL7/ADL5 and DG2/BMG5
+  plane inventories correct absent-register probes in existing admission.
+- I915 EXEC_OBJECT_ASYNC bit6 is bounded to current BMG ordinary system WB
+  softpin objects, including same-card WB PRIME. GETPARAM43 reflects only live
+  matching admission. Flagged entries skip prior implicit GPU dependencies;
+  unflagged entries, explicit inputs and same-context order remain mandatory.
+  Alias folding and mixed final admission stay atomic under the common gate;
+  every BO keeps its terminal READ/WRITE fence and CPU-copy/PRIME exclusion.
+  Cancellation, close, cache uncertainty and missing retirement retain state
+  until terminal completion or proven reset. Local/WC/VM-owned/pinned-user
+  objects and other platforms refuse. CPU mmap stores remain client ordered;
+  arbitrary stores are not frozen or revoked. Native Xe ordering is unchanged.
+- Default-off narf.intel.huc=1 applies only to exact physical Tiger Lake.
+  Authorized canonical i915/tgl_huc.bin acquisition precedes WOPCM planning;
+  the real BO/upload/RSA extent survives both HuC-before-GuC DMA passes and
+  reload. Confirmed PC/SLPC Running, typed AUTHENTICATE_HUC with DATA0=0 and a
+  fresh independent c1dc success bit establish readiness. The sole CT owner
+  routes disjoint fences4000..7eff alongside context/log/SLPC traffic. BUSY/
+  RETRY preserve one conservative total1s request bound; status has100ms.
+  Xe query7/type1 returns the running CSS release under current reset/D0/wake
+  authority or ENODEV, without loading/authenticating/waking/resuming. Type0
+  keeps its GuC compatibility ABI. Sticky DMA exposure survives failed reload;
+  lower BootStaged/Stopped cannot free it before upper full Gen12 reset/media
+  retirement. TGL autosuspend remains refused. ADL, MTL/Arrow, DG2/BMG and
+  headless LNL/PTL gain no HuC profile; their existing defaults/owners remain.
+  I915 GETPARAM42, codecs, media-GT, GSC/PXP/protected content remain separate.
+
+All 37 new fixtures pass in the debug native kernel: 21 external-ownership,
+eight ASYNC and eight HuC. The branch passes 1,861 selected debug tests:
+1,191 Intel/DRM/framebuffer/backlight and all 670 shared filesystem/graphics/
+AMD fixtures, with no failures or duplicate names, no Intel skips and one
+existing shared RNG-registration skip. All 1,087 prior Intel names, all 105
+cumulative new names and 31 backlight regressions remain covered. Host Intel
+all-target Clippy, formatting/diff and all 103 frozen source/linker hashes
+pass. Release native, production boot/btrfs and cross-target gates are running
+on the same frozen source; merge readiness is not claimed.
+
+The HuC fixtures do not execute the positive Firmware::open/registry/
+stage_with_huc acquisition chain or actual RuntimeOwner/PCI/system-PM
+coordinator callbacks. The firmware-reset portion exercises full stop and
+fresh GuCGt owners; a separate fixture uses real GGTT/cache allocation and
+staged cleanup. Production acquisition/PM wiring is manually reviewed only.
+Native register/CT/ownership models do not execute Intel firmware or prove
+physical Intel, S3, Mesa interoperability or codec acceptance.
+
+Primary source remains Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad:
+i915_drm.h, i915_gem_execbuffer.c, i915_vma.c and i915_getparam.c for ASYNC;
+xe_pat.c for BMG PAT2; xe_uc.c, xe_huc.c, xe_guc.c, xe_uc_fw.c, xe_wopcm.c,
+xe_guc_ct.c, xe_query.c and the corresponding HuC/GuC register/action headers
+for the exact TGL transaction. Public contracts are in spec.md §3.

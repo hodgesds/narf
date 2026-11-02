@@ -68,6 +68,7 @@ struct Hardware {
     dsb_writes: Vec<(u64, u32)>,
     poison_dsb_read: bool,
     gen12_display: bool,
+    gen12_planes: u64,
     display13: bool,
     pcode_latencies: [u8; 8],
     pcode_block_time: u32,
@@ -138,6 +139,7 @@ impl MockPlatform {
                 dsb_writes: Vec::new(),
                 poison_dsb_read: false,
                 gen12_display: false,
+                gen12_planes: 7,
                 display13: false,
                 pcode_latencies: [6, 8, 10, 12, 14, 16, 0, 0],
                 pcode_block_time: 10,
@@ -171,6 +173,11 @@ impl MockPlatform {
         let mut platform = self.clone();
         platform.3 = Some(family);
         self.0.lock().gen12_display = true;
+        self.0.lock().gen12_planes = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
+            7
+        } else {
+            5
+        };
         self.0.lock().display13 = matches!(
             family,
             crate::intel_gpu_gt::Gen12Platform::AlderLakeP
@@ -214,6 +221,11 @@ impl MockPlatform {
                 | crate::intel_gpu_gt::Gen12Platform::AlderLakeN
         );
         self.0.lock().gen12_display = true;
+        self.0.lock().gen12_planes = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
+            7
+        } else {
+            5
+        };
         let generation = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
             Generation::TigerLake
         } else {
@@ -354,6 +366,11 @@ impl MockPlatform {
     ) -> crate::intel_gpu_dsb::Timing {
         let timing = self.dsb_timing();
         self.0.lock().gen12_display = true;
+        self.0.lock().gen12_planes = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
+            7
+        } else {
+            5
+        };
         self.0.lock().display13 = matches!(
             family,
             crate::intel_gpu_gt::Gen12Platform::AlderLakeP
@@ -388,6 +405,20 @@ impl MockPlatform {
         hw.pcode_latencies = latencies;
         hw.pcode_block_time = block_time;
         hw.pcode_status = status;
+    }
+    pub(crate) fn deny_absent_gen12_planes(&self, family: crate::intel_gpu_gt::Gen12Platform) {
+        let mut hw = self.0.lock();
+        hw.gen12_display = true;
+        hw.gen12_planes = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
+            7
+        } else {
+            5
+        };
+        hw.display13 = matches!(
+            family,
+            crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                | crate::intel_gpu_gt::Gen12Platform::AlderLakeN
+        );
     }
     pub(crate) fn forbidden_display_reads(&self) -> usize {
         self.0.lock().forbidden_display_reads
@@ -553,6 +584,14 @@ impl MmioWindow for MockPlatform {
             self.1.store(true, Ordering::Release);
         }
         if (self.reset_lost() && !self.2) || !hw.allowed || !hw.powered {
+            return u32::MAX;
+        }
+        if hw.gen12_display
+            && hw.gen12_planes == 5
+            && (0x70000..0x74000).contains(&offset)
+            && [0x680, 0x780].contains(&(offset & 0xfff))
+        {
+            hw.forbidden_display_reads += 1;
             return u32::MAX;
         }
         if hw.gen12_display && !hw.display13 && offset == 0x42084 {
@@ -951,10 +990,10 @@ impl Platform for MockPlatform {
         }
         fetchers_with_cursor(
             &fresh,
-            if self.3.is_some() {
-                Generation::TigerLake
-            } else {
-                Generation::MeteorLake
+            match self.3 {
+                Some(crate::intel_gpu_gt::Gen12Platform::TigerLake) => Generation::TigerLake,
+                Some(_) => Generation::AlderLake,
+                None => Generation::MeteorLake,
             },
             owned_dsb,
             owned_cursor,

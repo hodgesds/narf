@@ -1,3 +1,7 @@
+mod huc_native {
+    include!("intel_gpu_huc_hw_tests.rs");
+}
+
 // Native Rust hardware conversations over the real GuCGt/CT/scheduler owners.
 // Reference vectors: MIT Linux xe_guc_submit.c, xe_lrc.c, xe_guc_ads.c,
 // xe_mocs.c at b90c984d615e8ce2af96f5b1411a962d83fed2ad.
@@ -655,8 +659,12 @@ fn gen12_progress(w: &Window) {
         }
     }
     if d.regs.get(&0xc314).is_some_and(|dma| dma & 1 != 0) {
-        d.regs.insert(0xc314, 0x10);
-        d.regs.insert(0xc000, 0x8000f000);
+        if d.regs[&0xc314] & 0x200 != 0 {
+            huc_native::complete_dma(&mut d);
+        } else {
+            d.regs.insert(0xc314, 0x10);
+            d.regs.insert(0xc000, 0x8000f000);
+        }
     }
 }
 fn gen12_until<M: MmioWindow + Clone>(
@@ -1350,7 +1358,7 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
             let control_fence = (words[1024 + head as usize] >> 16) as u16;
             assert_eq!(
                 request[0] >> 28,
-                if matches!(request[0] as u16, 0x40 | 0x302)
+                if matches!(request[0] as u16, 0x40 | 0x302 | 0x4000)
                     || (request[0] as u16 == 0x3003 && request[1] != 2)
                 {
                     0
@@ -1706,6 +1714,7 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 event(&memory, 0x4600, &[request[1] + lane]);
             }
             0x40 | 0x302 | 0x30 => bcs8::stream_hw::service(w, &memory, control_fence, &request),
+            0x4000 => huc_native::service_auth(w, &memory, control_fence, &request),
             0x3003 => service_slpc(w, &memory, control_fence, &request),
             0x3004 => assert_eq!(&request[1..], &[1]), // GUCRC_FIRMWARE_CONTROL
             _ => panic!("unexpected action {action:x}"),
@@ -2882,12 +2891,14 @@ fn smoke_hardware_ppgtt_store_and_retirement() -> TestResult {
                     ExecObject {
                         object: weak[0].upgrade().unwrap(),
                         va: 0x1234_0000_0000,
-                        writable: false
+                        writable: false,
+                        asynchronous: false,
                     },
                     ExecObject {
                         object: weak[1].upgrade().unwrap(),
                         va: 0x2345_0000_0000,
-                        writable: true
+                        writable: true,
+                        asynchronous: false,
                     },
                 ],
             }
@@ -2967,12 +2978,14 @@ fn smoke_hardware_reservation_cache_failure_releases_before_retry() -> TestResul
             ExecObject {
                 object: weak[0].upgrade().unwrap(),
                 va: 0x1234_0000_0000,
-                writable: false
+                writable: false,
+                asynchronous: false,
             },
             ExecObject {
                 object: weak[1].upgrade().unwrap(),
                 va: 0x2345_0000_0000,
-                writable: true
+                writable: true,
+                asynchronous: false,
             },
         ],
     }

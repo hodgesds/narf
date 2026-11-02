@@ -52,6 +52,11 @@ pub struct DeviceFacts {
 
 pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn status(&self) -> Option<UserStatus>;
+    /// Actual HuC release under the retained reset/D0/wake/auth owner. This
+    /// passive query cannot start or authenticate firmware; default refusal.
+    fn huc_version(&self) -> FsFuture<'_, (u8, u8, u8)> {
+        Box::pin(async { Err(FsError::NoDevice) })
+    }
     /// Cached physical BMG/LNL main-GT layout; no read-triggered hardware access.
     fn eu_stall_info(&self) -> Option<crate::intel_gpu_eu_stall::Info> {
         None

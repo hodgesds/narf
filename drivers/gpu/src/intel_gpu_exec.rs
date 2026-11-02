@@ -33,6 +33,9 @@ pub struct ExecObject {
     pub object: Arc<GemObject>,
     pub va: u64,
     pub writable: bool,
+    /// i915 EXEC_OBJECT_ASYNC: skip prior implicit GPU dependencies only.
+    /// The terminal READ/WRITE reservation and mandatory publication remain.
+    pub asynchronous: bool,
 }
 
 #[derive(Debug)]
@@ -46,7 +49,40 @@ pub struct ExecRequest {
     pub objects: Vec<ExecObject>,
 }
 
+/// First qualified object-ASYNC profile: source Xe2 PAT2 is uncompressed,
+/// two-way coherent WB. Other families require independent qualification.
+pub(crate) fn object_async_profile(platform: GtPlatform) -> bool {
+    platform == GtPlatform::Battlemage
+}
+
 impl ExecRequest {
+    pub(crate) fn has_async(&self) -> bool {
+        self.objects.iter().any(|entry| entry.asynchronous)
+    }
+
+    fn validate_storage(&self) -> Result<(), FsError> {
+        let asynchronous = self.has_async();
+        if self.objects.iter().any(|entry| {
+            entry.object.is_vram()
+                || entry.object.is_wc()
+                || entry.object.vm_owner().is_some()
+                || (asynchronous && entry.object.is_userptr())
+        }) {
+            return Err(FsError::InvalidData);
+        }
+        Ok(())
+    }
+
+    /// Check imports and the immutable profile before context finalization,
+    /// dependency waits or any private page-table/reservation publication.
+    pub(crate) fn validate_for_gt(&self, platform: GtPlatform) -> Result<(), FsError> {
+        self.validate_storage()?;
+        if self.has_async() && !object_async_profile(platform) {
+            return Err(FsError::InvalidData);
+        }
+        Ok(())
+    }
+
     pub fn prepare_user(
         &self,
         platform: GtPlatform,
@@ -82,6 +118,10 @@ impl ExecRequest {
         table_pat: u8,
         platform: Option<GtPlatform>,
     ) -> Result<ResidentBatch, FsError> {
+        self.validate_storage()?;
+        if self.has_async() && !platform.is_some_and(object_async_profile) {
+            return Err(FsError::InvalidData);
+        }
         if self.objects.is_empty()
             || self.objects.len() > MAX_OBJECTS
             || self.objects.iter().any(|entry| {
@@ -199,7 +239,10 @@ impl ExecRequest {
             let alignment = u64_at(entry, 16);
             let offset = u64_at(entry, 24);
             let object_flags = u64_at(entry, 32);
-            let allowed = abi::OBJECT_WRITE | abi::OBJECT_SUPPORTS_48B | abi::OBJECT_PINNED;
+            let allowed = abi::OBJECT_WRITE
+                | abi::OBJECT_SUPPORTS_48B
+                | abi::OBJECT_PINNED
+                | abi::OBJECT_ASYNC;
             if !handles.insert(handle)
                 || u32_at(entry, 4) != 0
                 || u64_at(entry, 8) != 0
@@ -226,6 +269,7 @@ impl ExecRequest {
                 object,
                 va,
                 writable: object_flags & abi::OBJECT_WRITE != 0,
+                asynchronous: object_flags & abi::OBJECT_ASYNC != 0,
             });
         }
         // Detect overlap without sorting the original residency order: batch
@@ -273,6 +317,9 @@ impl ExecRequest {
     /// failed build drops all table pages; successful ownership includes all
     /// leaf objects and survives GEM_CLOSE or the submitting fd's destruction.
     pub fn address_space(&self, format: PteFormat, pat_index: u8) -> Result<AddressSpace, FsError> {
+        if self.has_async() {
+            return Err(FsError::InvalidData); // this entry has no qualified GT profile
+        }
         self.address_space_inner(format, pat_index, 0)
     }
 
@@ -282,6 +329,7 @@ impl ExecRequest {
         pat_index: u8,
         table_pat: u8,
     ) -> Result<AddressSpace, FsError> {
+        self.validate_storage()?;
         let mut memory = FramePtMemory::new();
         let tables = Ppgtt::with_root_level(
             &mut memory,
@@ -294,6 +342,7 @@ impl ExecRequest {
             tables: Some(tables),
             memory,
             objects: Vec::new(),
+            asynchronous: Vec::new(),
             dumpable: Vec::new(),
         };
         for entry in &self.objects {
@@ -305,6 +354,7 @@ impl ExecRequest {
                 return Err(FsError::InvalidData);
             }
             space.objects.push((entry.object.clone(), entry.writable));
+            space.asynchronous.push(entry.asynchronous);
             for (i, phys) in entry.object.pages().enumerate() {
                 space
                     .tables
@@ -465,6 +515,7 @@ impl ResidentBatch {
             tables: Some(tables),
             memory,
             objects: Vec::new(),
+            asynchronous: Vec::new(),
             dumpable: Vec::new(),
         };
         space
@@ -627,7 +678,13 @@ impl ResidentBatch {
         &self,
         completion: &Arc<crate::intel_gpu_fence::CompletionFence>,
     ) -> Result<(), FsError> {
-        if self.implicit_sync {
+        if self.implicit_sync && self.space.asynchronous.iter().any(|value| *value) {
+            crate::intel_gpu_gem::reserve_gpu_mixed(
+                &self.space.objects,
+                &self.space.asynchronous,
+                completion,
+            )
+        } else if self.implicit_sync {
             crate::intel_gpu_gem::reserve_gpu(&self.space.objects, completion)
         } else {
             crate::intel_gpu_gem::reserve_gpu_explicit(&self.space.objects, completion);
@@ -710,12 +767,14 @@ impl PpgttProbeResult {
                 ExecObject {
                     object: code.clone(),
                     va: PROBE_CODE,
-                    writable: false
+                    writable: false,
+                    asynchronous: false,
                 },
                 ExecObject {
                     object: data.clone(),
                     va: PROBE_DATA,
-                    writable: true
+                    writable: true,
+                    asynchronous: false,
                 },
             ],
         }
@@ -773,6 +832,9 @@ pub struct AddressSpace {
     tables: Option<Ppgtt>,
     memory: FramePtMemory,
     objects: Vec<(Arc<GemObject>, bool)>,
+    // Aligned with objects for compatibility; native Xe uses its existing
+    // globally explicit path and leaves this empty.
+    asynchronous: Vec<bool>,
     dumpable: Vec<VmMapping>,
 }
 

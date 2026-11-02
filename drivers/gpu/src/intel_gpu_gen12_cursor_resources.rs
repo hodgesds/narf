@@ -32,14 +32,14 @@ fn checked(io: &(impl MmioWindow + ?Sized), r: u64, value: u32) -> Result<(), Fs
         Err(FsError::NoDevice)
     }
 }
-fn idle(io: &(impl MmioWindow + ?Sized)) -> Result<(), FsError> {
+fn idle(io: &(impl MmioWindow + ?Sized), family: Gen12Platform) -> Result<(), FsError> {
     for pipe in 0..4 {
         if read(io, 0x70008 + pipe * 0x1000)? & 0xc0000000 != 0
             || read(io, 0x70080 + pipe * 0x1000)? & 0x27 != 0
         {
             return Err(FsError::Unsupported);
         }
-        for plane in 0..7 {
+        for plane in 0..crate::intel_gpu_pipes::gen12_plane_count(family) {
             if read(io, 0x70180 + pipe * 0x1000 + plane * 0x100)? & (1 << 31) != 0 {
                 return Err(FsError::Unsupported);
             }
@@ -271,7 +271,7 @@ pub(crate) fn setup(
     mode: &Mode,
     family: Gen12Platform,
 ) -> Result<Option<Profile>, FsError> {
-    match idle(io) {
+    match idle(io, family) {
         Ok(()) => {}
         Err(FsError::Unsupported) => return Ok(None),
         Err(error) => return Err(error),

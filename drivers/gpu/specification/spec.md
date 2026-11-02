@@ -91,8 +91,10 @@ and Panther Lake refuse programming with `ModesetError::UnsupportedGeneration`.
 This dispatch does not enable Xe-LPG power management, which remains gated.
 `Generation::external_display_supported` admits only Gen12: external
 DP/HDMI/MST sessions, combo HPD enable/poll and the USB-C DP bridge use
-that gate before register access. Meteor/Arrow Lake internal-panel support
-does not admit the Gen12 external port sequence.
+that gate before register access. This necessary generation gate does not
+qualify every physical port: combo-B HPD/retained SST additionally needs the
+exact source family and observed PCH facts described below. Meteor/Arrow Lake
+internal-panel support does not admit the Gen12 external port sequence.
 
 The framebuffer's historical `phys_addr` field is a page-aligned 32-bit
 GGTT byte offset. Both display paths reject invalid plane dimensions,
@@ -140,6 +142,85 @@ outside the GT mutex; synchronous panel power-off keeps its existing T9
 sequencer. No executor poll calls `block_on`. Gen12 PWM and unsupported panel
 profiles retain their separate admission gates.
 
+### Retained Gen12 external SST stop and combo HPD
+
+The existing Gen12 external SST route retains a single bounded owner containing
+its exact canonical PCI display family, BAR identity, pipe/DDI claim, framebuffer,
+scanout/GGTT allocation, original register image and monotonic session serial.
+A partial activation, dropped waiter, local stop failure, reset or authority loss
+cannot drop/reassign the graph. A newly programmed route is published only after
+pipe-active and native LIVE_SURF identify its retained framebuffer. A 100 ms
+settling bound and absolute stop deadlines refuse uncertain state.
+
+Physical combo-B HPD is available only with a unique actually enumerated Intel
+ISA bridge (full PCI class060100) in the GPU segment on bus0 and the pinned
+TGP/TGL or ADP/ADL-P/N canonical-family pairing. The full observed DID/BDF/config and
+subsystem facts remain policy metadata; the GPU's current capability and D0
+state separately authorize every MMIO operation through ModeWindow. Missing,
+ambiguous or changed PCH facts and an unobserved shared 250 us filter F8 cannot
+select a guessed HPD profile. There is no virtual-PCH or broad-generation
+fallback. Explicit checked stop does not require HPD discovery.
+
+The poll owner enables only combo-B SDE source latches and keeps their interrupt
+mask bits set. It captures and retains the owned port before W1C acknowledgement,
+ACKs SDEIIR before SHOTPLUG status, clears only captured owned status and
+preserves foreign W1C/RW state. SDEIER/SDEIMR all-ones values are valid masks.
+Authority loss after an ACK records uncertainty, not no-event success. Hardware
+latches coalesce pulses; the API does not count every physical pulse. Type-C/TBT
+and display IRQ handling are not included.
+
+The existing runtime actor advances at most one bounded local owner step per
+pass. Plane disable plus retained SURF latch precedes independently observed
+pipe/transcoder off, function deselection, DDI/transport disable, DDI idle and
+clock deselection. Only a complete local proof may withdraw the publication
+with that exact serial. The owner refuses foreign local fetchers/DSB, FBC,
+DSC/joiner or changed routing/timing. Sink D3 is best effort through the existing
+bounded AUX transaction; a NACK never replaces local idle proof. Current
+capability/power is rechecked at each access. No executor block_on bridge is
+introduced.
+
+Async PM/reset drains use the same phase/deadline outside the GT mutex. Sync
+PM takes one checked step and returns Busy before a power transition when
+incomplete; resume/reconcile/relight refuse unretired external state. Cancel and
+reset do not reopen KMS admission, release DMA, or erase native12 inactive LUT
+RAM ownership. TEST_ONLY remains structural and hardware-free; real FIFO jobs
+observe the retained KMS gate and publish terminal error without arm/fence/event
+success. An absent external owner leaves older-platform recovery unchanged.
+
+Stopped and quarantined SST resources remain reserved. No survivor DBUF/DDB/WM
+repartition, shared PLL/power-well release, pipe/GGTT/BO reuse, replacement
+activation or automatic retrain is performed. Runtime HPD service covers an
+already-retained SST route rather than general post-boot connector discovery.
+HDMI/MST remain BAR-bound and Busy for this drain/PM path until their own full
+source protocol is qualified. Modeset::try_teardown/try_teardown_stream and
+PipelineStopUnavailable provide fallible local stop propagation to existing
+DP/HDMI/MST callers; void teardown callers retain their source-compatible API.
+This does not qualify HDMI multipipe, MST master/ACT/removal with survivors,
+Type-C/TBT, MTL external, general timing/resource allocation, or an entire
+software-completion row.
+
+Exact source qualification: combo C remains foreign because the pinned TGL
+source explicitly omits it and ADL-P/N exposes only A/B+TC; ADL-S has A+TC only
+and is refused for this external profile. Poll setup masks and verifies owned
+SDEIMR before enabling IER. Source LONG+low gates removal; low during short,
+unknown or pre-IIR observation preserves known-connected state. A no-write
+route/claim preflight precedes sinkD3 AUX.
+
+Implemented primary/sprite inventories are seven planes on TGL, five on
+ADL-S/P/N (including display12 ADL-S minimization). Stopped internal cursor/
+global-DPT setup and direct/recovery KMS use these exact counts and reject
+live implemented fetchers without reading absent ADL planes6/7. The closed
+DG2/BMG GT-only bootstrap likewise checks its five implemented planes; this
+corrects inventory, admits no Arc display, and adds no LNL/PTL display reads.
+
+Each new HPD monitor establishes a current owned-status baseline before
+publishing any event: install/read-verify IMR first, ACK captured owned IIR
+before SHOT status, clear observed owned status including orphan LONG with
+IIR0, preserve foreign RW/W1C state, then verify the owned latch is clear.
+Failure retains uncertainty. The first poll shares this initialization;
+repeated enable preserves live events. A later short pulse cannot inherit a
+LONG latch from the previous monitor incarnation.
+
 ### Intel render UAPI and address-space admission
 
 `intel_gpu_uapi` and `intel_gpu_xe_uapi` define Linux i915 and native Xe ioctl
@@ -159,8 +240,9 @@ Legacy backends retain their i915 profile. Internal routing remains `intel-gpu`.
 #### Native Xe profile
 
 DEVICE_QUERY implements engines, system-memory regions, configuration, GT
-list, raw HWCONFIG, topology masks, correlated engine cycles and GuC
-submission-interface version.
+list, raw HWCONFIG, topology masks, correlated engine cycles and UC firmware
+versions: GuC submission-interface compatibility and the qualified running
+HuC release described below.
 It uses Xe's size-only/exact-size
 protocol; size-only calls never touch the payload pointer. Engine discovery
 publishes the live `EngineSet` in stable NARF slot order: RCS0, BCS0,
@@ -173,8 +255,15 @@ types return EINVAL. DeviceFacts
 contains the actual PCI revision, validated graphics IP/step and the stable
 RPM_CONFIG0-derived timestamp clock. The GT owner samples it with current
 forcewake after its startup execution probes and publishes it before readiness.
-The firmware query validates its input subtype/reserved fields and reports
-the loaded CSS compatibility tuple; unavailable HuC remains ENODEV.
+DEVICE_QUERY query7 (UC_FW_VERSION) validates subtype/reserved fields and
+uses an exact 32-byte payload. Type0 retains branch0 and the loaded GuC CSS
+submission-interface compatibility tuple, independently of firmware release.
+Type1 returns branch0 and the actually running HuC CSS release only for the
+opted-in exact TGL owner after the upload/auth/status proof below. It returns
+ENODEV before proof, after failure, during reset/power loss and on every other
+profile. Size-only negotiation touches no payload. The retained reset/D0/wake
+owner answers type1 without loading, authenticating, acquiring a wake or
+resuming firmware; unsupported subtypes retain their existing refusal.
 Engine-cycle queries retain their input engine/clock and destination before
 awaiting `UserBackend::engine_cycles(engine, clock)`. As in xe_query.c the
 engine pad is ignored; unadvertised class/instance pairs or GT1 return EINVAL.
@@ -386,8 +475,9 @@ the compatibility profile. A zero-batch execution can still signal a user
 fence. Distinct queues may overlap on the same VM and BOs: Xe clients provide
 explicit GPU ordering. Every job still installs its terminal READ/WRITE fence
 in dma_resv under the shared CPU-admission gate, so kernel CPU copies wait for
-all conflicting GPU users. Compatibility submissions retain implicit conflict
-checks. Same-queue jobs remain ordered through the saved UserContext.
+all conflicting GPU users. Compatibility submissions retain per-object implicit
+conflict checks except for qualified EXEC_OBJECT_ASYNC entries below. Same-queue
+jobs remain ordered through the saved UserContext.
 
 Sync arrays admit at most 1024 binary/timeline/user entries. Inputs retain
 exact fence payloads; outputs retain the core after handle destruction.
@@ -488,9 +578,11 @@ Invalid flags precede fd lookup; bad/non-sync descriptors and copy faults
 publish nothing, and an empty signalled-stub batch changes no reservation.
 Foreign attachments remain unavailable.
 
-Compatibility-profile GuC and legacy Gen12 resident submissions check every leaf's
-reservation, reject conflicting work without partial reservation publication,
-then attach their terminal CompletionFence as READ or WRITE before cache
+Compatibility-profile GuC and legacy Gen12 resident submissions check every
+synchronous leaf's reservation, rejecting conflicting work without partial
+reservation publication. The bounded BMG EXEC_OBJECT_ASYNC contract below
+selectively skips prior implicit GPU waits for flagged entries. All entries
+still attach their terminal CompletionFence as READ or WRITE before cache
 publication. Read-only jobs may overlap. Independent LRCs have no shared ordered
 dma-fence context: completing one cannot elide another's live dependency.
 Resources release before terminal signalling, including failures after
@@ -498,8 +590,10 @@ reservation and verified reset. Unproven stop, timeout and cancelled waiters
 retain reservations. Scheduling acknowledgments are not terminal events.
 Fence status and immutable context/sequence callbacks run before the admission
 gate; removed foreign references are dropped after it. Kernel CPU copies and
-implicit jobs require an unchanged reservation addition generation under that
-gate after their outside-lock conflict observation. A racing import therefore
+the synchronous subset of implicit GPU accesses require an unchanged
+reservation addition generation under that gate after their outside-lock
+conflict observation. ASYNC entries retain terminal fences without importing
+prior GPU waits; a stale snapshot cannot remove a later live fence. A racing import therefore
 refuses access without copying bytes or publishing a partial multi-object job.
 Async PREAD/PWRITE wait and retry individual chunks without replaying a copied
 prefix. Xe GPU execution retains its explicit-sync contract: imported ordinary
@@ -507,6 +601,16 @@ READ/WRITE fences do not create hidden GPU waits, while CPU access and sync-file
 exports still observe them and every native terminal fence.
 Existing raw CPU/user mappings still require the trusted submitter's exclusion
 contract; a reservation cannot revoke an already installed mapping.
+
+#### Per-object i915 implicit synchronization
+
+`EXEC_OBJECT_ASYNC` (object bit6) is accepted on the existing live Battlemage GuC profile for ordinary system WB softpin objects. The request copies each object's flag before awaiting. All listed storage in an ASYNC request must remain ordinary WB: actual local/WC, VM-owned and pinned-user objects return EINVAL, including imported handles, before context finalization or private residency/reservation effects. Other platforms return EINVAL for ASYNC. A qualified platform without a current matching nonzero user epoch and nonempty published engines returns ENODEV. Same-card WB PRIME imports retain the same BO/reservation identity. No relocation support is added.
+
+For an unflagged object, a read waits for previous writers and a write waits for previous readers/writers. A flagged object skips those prior implicit GPU waits in both pre-wait and final GT admission. Every object still receives the accepted job's READ/WRITE terminal fence. Mixed lists do not relax unflagged entries. Repeated internal aliases fold WRITE and required implicit synchronization with OR, then publish at most one strongest fence per BO identity. The whole mixed transaction checks all synchronous conflict decisions and their addition generations before adding any fence, under the existing common reservation gate. Concurrent PRIME imports participate in that gate; callbacks and retired-reference drops occur outside it. A stale ASYNC snapshot cannot remove a later live fence.
+
+Explicit sync-file, binary/timeline syncobj input and previous-job same-context order remain mandatory. Mandatory page-table, leaf, LRC and ring publication is unchanged. BMG's source-qualified uncompressed two-way coherent PAT2=0xf is the initial ASYNC profile; unsupported storage/profile is refused rather than silently reverting to implicit waits. Cache/output failure signals only unpublished error fences. After acceptance, cancellation and context/BO/fd close retain native GPU state and all terminal reservations through normal retirement or proven reset, including missing acknowledgements or access/cache uncertainty. Completing a newer ASYNC job does not remove an older live fence.
+
+Synchronized GEM PREAD/PWRITE/GEM_WAIT and PRIME CPU-sync access continue to observe all conflicting terminal reservations. Existing mmap alias lifetime is unchanged; ASYNC does not freeze or revoke arbitrary CPU stores. The client remains responsible for explicit ordering of potentially overlapping work. This contract does not add migration, MMU invalidation or USERPTR revalidation.
 
 GEM_BUSY reports render-class readers as 0x10000 and a writer as 0x10001.
 GEM_WAIT waits for readers and writers: zero polls with ETIME if busy, negative
@@ -561,6 +665,11 @@ HAS_BLT, HAS_EXECBUF2/NO_RELOC/HANDLE_LUT/SOFTPIN/BATCH_FIRST/CONTEXT_ISOLATION 
 HAS_ALIASING_PPGTT=3 follow live admission. HAS_EXEC_FENCE,
 HAS_EXEC_FENCE_ARRAY, HAS_EXEC_SUBMIT_FENCE and HAS_EXEC_TIMELINE_FENCES,
 plus DRM_CAP_SYNCOBJ and DRM_CAP_SYNCOBJ_TIMELINE, also follow live admission.
+HAS_EXEC_ASYNC (43) returns 1 only for a cached current matching nonzero
+Battlemage user epoch with nonempty published engines, and 0 for unavailable
+state or every other profile. It performs no GT wake or MMIO. The ordinary
+WB/import restrictions in the per-object contract remain mandatory; other
+GETPARAM output bytes and ioctl encodings are unchanged.
 Unsupported engines and their capabilities are never advertised.
 
 The i915 compatibility GETPARAM discovery path reports observed PCI revision
@@ -611,8 +720,10 @@ existing identity across the exact-command ABI dispatcher. An existing
 VM/engine is never changed by admission. The plan's WRITE
 bit selects writable leaves in this restricted path. Async EXECBUFFER2 and its
 WR encoding copy the complete plan once, retain the per-open context, serialize
-same-context callers with an async Mutex, await the prior context fence and
-conflicting BO reservations, then submit to this card's live GT backend. Retry
+same-context callers with an async Mutex and await the prior context fence.
+They wait for conflicting reservations only for entries requiring implicit
+synchronization, then submit to this card's live GT backend with the copied
+per-object policy and generation-checked synchronous final admission. Retry
 after reservation/queue contention reuses the copied request; a queued job is
 never replayed. Dropping a waiter, context handle, GEM handle or fd does not
 cancel hardware ownership. Synchronous kernel dispatch returns WouldBlock for
@@ -663,6 +774,12 @@ context claim and all backing/reservations without queueing work or installing
 a descriptor. No failed output transaction consumes a GuC ID or request stamp.
 Reset completion is terminal for the exported fence; dropping/closing an
 output fd cannot abandon hardware ownership.
+
+`intel_gpu_user::UserBackend::huc_version` adds an object-safe async
+`FsFuture<'_, (u8, u8, u8)>` hook whose default returns NoDevice. The retained
+physical runtime overrides it under the async reset mutex and current epoch,
+D0, forcewake and live authentication checks. Unqualified backends gain no
+positive reply; this hook cannot load, authenticate, wake or resume firmware.
 
 `intel_gpu_user::UserBackend` exposes a live `UserStatus` and async `submit`:
 Err guarantees no job was queued; Ok returns the GT's terminal fence and
@@ -799,8 +916,12 @@ authority firmware image and the actual PCI ID/revision, HuC upload extent and
 already-programmed uncached MOCS index (required for BMG). It validates the
 target, WOPCM fit, GGTT extents above the reserved 8-MiB WOPCM window and
 non-overlapping allocations before MMIO;
-partial allocation failure rolls back. Its three owned allocations contain
-CSS/uCode/RSA, minimal ADS plus firmware-private data, and log storage. Minimal
+partial allocation failure rolls back. The default three owned allocations
+contain GuC CSS/uCode/RSA, minimal ADS plus firmware-private data, and logs.
+Exact-TGL `stage_with_huc` adds a fourth owned HuC upload/RSA buffer, deriving
+the pre-WOPCM reservation from the authorized image before either DMA pass.
+All four participate in rollback, pairwise/protected extents and cache sync.
+Other profiles retain their original three allocations. Minimal
 ADS uses the source-defined 16-class/32-instance layout with invalid mapping
 value 32, zero enabled engines, valid policies and owned private-data pointers.
 The log layout is one state page plus 16-KiB crash, 64-KiB event and 1-MiB
@@ -815,17 +936,23 @@ self-clear **and** MIA-in-reset status, validates prelocked WOPCM or programs
 and verifies its write-once registers, publishes scratch parameters and cache-
 cleaned memory, selects generation-correct GuC TLB invalidation, then starts
 CSS+uCode DMA to WOPCM offset 0x2000 with the RSA GGTT pointer separate. Default
-WOPCM is 4 MiB with 36 KiB hardware-context reservation; a prelocked layout is
-validated against the source's 8-MiB bound. BMG uses MOCS and the DESC1/DESC0
+WOPCM is 2 MiB on Gen12 and qualified headless LNL/PTL, and 4 MiB on
+MTL/Arrow and admitted discrete profiles, with a 36 KiB hardware-context
+reservation. A prelocked layout is validated against the source's 8-MiB bound. BMG uses MOCS and the DESC1/DESC0
 TLB sequence. Reset, DMA and authentication have bounded deadlines; `wait`
 uses timer awaits. DMA completion precedes authentication; only non-reset
 READY plus good hardware authentication establishes `BootState::Ready`.
 Boot-ROM/uKernel errors, unreadable registers, wake loss and timeout stop
 admission and retain all resources. Dropping a waiter cannot release the
-owning buffers. Staged owners reclaim memory on drop; published owners retain
-it until `begin_stop`/`poll` proves GuC reset **and** independent firmware DMA
-idle, or an unsafe full-GT-reset release supplies that proof. GuC reset is
-not a completion/reset proof for RCS jobs.
+owning buffers. Unexposed staged owners reclaim memory on drop. Without HuC
+exposure, the existing GuC bootstrap stop requires GuC reset and independent
+firmware DMA idle. An exposed HuC graph is different: sticky exposure survives
+reload and failed re-begin, so neither BootStaged nor BootStopped permits its
+reclamation. The enclosing full Gen12 engine reset and retained media ACK
+retirement, or an explicit unsafe full HuC/media-stop proof, must complete
+before physical release. GuC-only reset/DMA idle is insufficient for HuC and
+does not prove completion/reset of RCS jobs. Newer profiles keep their existing
+mapping-retirement and wake-release ordering.
 
 `BootAllocator::sync_for_device` is mandatory before DMA. The SharedArena
 adapter cleans every owned CPU cache line through existing architecture
@@ -1894,7 +2021,8 @@ while keeping that master disabled. A final quiet read/rearm handles new or
 lost edges. Inherited enabled masters, unrelated display/media causes, invalid
 identities, deadline or current-route failure refuse or close delivery.
 Existing handler/cookie/vector quarantine and terminal execution proofs apply.
-Media engine reset ownership does not publish media scheduling or HuC support.
+Media engine reset ownership alone does not publish media scheduling or HuC
+support; those require the separately qualified owners described here.
 
 ### Intel Gen12 fixed color and cursor ownership
 
@@ -2058,6 +2186,62 @@ stable per open across contexts; initial choices rotate without a randomness
 or fairness promise. A single VIDEO ignores selector bits, matching source.
 If no VIDEO engine is published, selection refuses before allocation/DMA.
 HuC/codec acceptance is separate.
+
+### Intel exact-TGL HuC upload and authentication
+
+Default-off `narf.intel.huc=1` enables source-qualified HuC upload/authentication
+only on exact physical Gen12Platform::TigerLake. The retained main-GT worker
+acquires the authorized immutable canonical `i915/tgl_huc.bin` before WOPCM
+planning, retains its real upload/RSA backing through both boot passes and full
+shutdown, and uploads HuC before each GuC upload. Unsupported platforms add no
+HuC firmware/DMA or positive query. TGL runtime autosuspend remains refused.
+Existing system-sleep/reset hooks close publication before stop and require a
+fresh source upload/auth/status sequence on restart; no live enable transition
+or hot-installed image adoption is exposed.
+
+Readiness requires confirmed existing PC/SLPC startup, a zero-result typed normal
+GuC CT AUTHENTICATE_HUC response and an independent current c1dc success bit after
+the owned reset/upload sequence. Fences4000..7eff cannot collide with context,
+log or SLPC actors; BUSY/RETRY do not prolong the conservative total1s request
+bound. Linux uses a per-attempt1s wait plus retries; the stricter total bound is
+NARF policy. The independent auth-status wait is100ms. Auth rejection/status
+expiry keeps HuC unavailable; transport/current-authority loss closes normal GT
+admission and retains the graph until verified full reset.
+
+Xe DEVICE_QUERY/UC_FW_VERSION type1 returns branch0 and the actually running HuC
+CSS release tuple under the retained reset/D0/wake owner. Before proof, during
+reset/power loss, after failure and on other profiles it returns ENODEV. Exact32
+size/pad/type validation and payload-free size negotiation apply. GuC type0
+retains its separate compatibility-version meaning. A query performs no firmware
+load, authentication, wake acquisition or resume. i915 GETPARAM42 remains outside
+this first slice.
+
+The lower GuC BootStaged/BootStopped labels are insufficient reclamation proof
+for an exposed HuC allocation. Sticky exposure survives scheduling reload and
+failed re-begin; only the enclosing full Gen12 engine-reset/media-ACK retirement
+or the explicit unsafe full-stop proof permits physical reclamation. HuC also
+joins all cache/sync/protected-allocation intervals. This adds no new generic
+power, frequency, CT, firmware-registry or TCB authority and changes no newer
+platform's mapping-retirement contract.
+
+This implements only exact-TGL HuC upload/auth/query/lifetime software;
+debug native gates pass; release/cross-target gates remain pending. Codec command
+admission, i915 HuC-status error ABI, ADL and newer HuC profiles, separate MTL
+media-GT scheduling, GSC/PXP/protected content and physical Intel/media/S3
+acceptance remain separate. No capability bit or broader engine/performance claim
+follows from these models.
+
+The native fixture coverage does not execute the positive Firmware::open /
+registry / stage_with_huc acquisition chain. It separately exercises the real
+GGTT/cache allocator and staged cleanup; production acquisition wiring is
+manually reviewed. The firmware-reset portion of the system-resume fixture
+uses full stop and fresh GuCGt owners. The actual RuntimeOwner, PCI PM and
+system-PM coordinator callbacks are not executed by these new fixtures. Their
+production wiring was manually reviewed; physical Intel/S3, Mesa and codec
+acceptance are unrun. Debug native model gates pass; release/cross-target checks remain pending.
+The internal interfaces add ExecObject.asynchronous and retained per-object
+policy; trusted constructors initialize false and native Xe retains its existing
+globally explicit GPU-ordering contract.
 
 ### Intel fixed Gen12 views and exact family selection
 

@@ -2947,7 +2947,8 @@ pub mod tests {
             objects: alloc::vec![ExecObject {
                 object,
                 va,
-                writable: false
+                writable: false,
+                asynchronous: false,
             }],
         };
         let batch = request

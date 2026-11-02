@@ -26,16 +26,15 @@
 //!
 //! ## HPD
 //!
-//! Combo-DDI hotplug on Gen11/12 uses the GEN8 DE Port
-//! interrupt block (PRM Vol. 11; i915 `GEN8_DE_PORT_IRQ_REGS`):
-//! ISR 0x44440 / IMR 0x44444 / IIR 0x44448 / IER 0x4444C, with
-//! the per-DDI hotplug bit at `1 << (3 + ddi_index)` for the
-//! combo DDIs A/B/C. The live ISR bit is the connection level;
-//! a latched IIR bit while the level stays high is the DP
-//! short pulse (IRQ_HPD) — the sink is asking the source to
-//! re-check link status, so the session revalidates and
-//! retrains if clock recovery was lost. (The GEN11_DE_HPD block
-//! at 0x44470 is the Type-C/TBT path and is not used here.)
+//! Exact TGL/ADL-P/N combo B uses the TGP/ADP PCH SDE interrupt block and
+//! SHOTPLUG_CTL_DDI after observed ISA-bridge identity qualification. A GPU
+//! generation alone is insufficient. Source latches are enabled but remain
+//! masked: probe/runtime poll owns no display IRQ consumer. The shared 250us
+//! filter must already read F8; this partial owner never rewrites it.
+//! SDEIIR is retained/acknowledged before owned SHOTPLUG W1C status. Foreign
+//! W1C latches and RW fields are preserved. Lost authority/changed identity
+//! after capture makes the retained monitor uncertain instead of no-event.
+//! Latched events coalesce; no per-physical-pulse counting is promised.
 //!
 //! ## Shape
 //!
@@ -45,8 +44,6 @@
 //! [`activate`] runs the modeset at the negotiated plan and
 //! publishes audio. [`connect`] composes the two for callers
 //! (and fixtures) that already hold a framebuffer.
-
-use core::sync::atomic::{compiler_fence, Ordering};
 
 use narf_drivers_sound::display_audio::{
     build_eld, clear_display_audio, publish_display_audio, DisplayConnector, DisplaySinkId,
@@ -64,24 +61,102 @@ use crate::intel_gpu_ddi::Ddi;
 use crate::intel_gpu_modeset::{Framebuffer, LinkPlan, Mode, Modeset, ModesetError};
 use crate::intel_gpu_pipes::Pipe;
 
-/// GEN8 DE Port interrupt status register (live levels).
-pub const GEN8_DE_PORT_ISR: u64 = 0x4_4440;
-/// GEN8 DE Port interrupt mask register.
-pub const GEN8_DE_PORT_IMR: u64 = 0x4_4444;
-/// GEN8 DE Port interrupt identity register (latched edges,
-/// write-1-to-clear).
-pub const GEN8_DE_PORT_IIR: u64 = 0x4_4448;
-/// GEN8 DE Port interrupt enable register.
-pub const GEN8_DE_PORT_IER: u64 = 0x4_444C;
-
-/// Hotplug bit for a combo DDI in the GEN8 DE Port block:
-/// `1 << (3 + index)` for DDI A/B/C. Type-C DDIs (D–H) report
-/// through the GEN11 DE HPD block instead and return `None`.
+/// PCH south-display HPD registers, ICP/TGP/ADP source profile.
+pub const SDE_ISR: u64 = 0xc4000;
+pub const SDE_IMR: u64 = 0xc4004;
+pub const SDE_IIR: u64 = 0xc4008;
+pub const SDE_IER: u64 = 0xc400c;
+const SHOTPLUG: u64 = 0xc4030;
+const FILTER: u64 = 0xc4038;
+const OWNED: u32 = 0x00020000; // source-exposed combo B only; A may be internal
+const ALL_STATUS: u32 = 0x3333;
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HpdProfile {
+    family: crate::intel_gpu_gt::Gen12Platform,
+    device: u16,
+    address: u32,
+    config: u64,
+    subsystem: (u16, u16),
+}
+impl HpdProfile {
+    pub(crate) fn from_identity(
+        family: crate::intel_gpu_gt::Gen12Platform,
+        vendor: u16,
+        device: u16,
+        class: u32,
+    ) -> Option<Self> {
+        use crate::intel_gpu_gt::Gen12Platform::*;
+        if vendor != 0x8086 || class != 0x060100 {
+            return None;
+        }
+        let allowed = matches!(
+            (family, device & 0xff80),
+            (TigerLake, 0xa080 | 0x4380)
+                | (AlderLakeP | AlderLakeN, 0x7a80 | 0x5180 | 0x7a00 | 0x5480)
+        );
+        allowed.then_some(Self {
+            family,
+            device,
+            address: 0,
+            config: 0,
+            subsystem: (0, 0),
+        })
+    }
+    /// Observed PCI policy fact only. GPU MMIO still needs its own current
+    /// capability/D0 check at every access; this grants no PCH config authority.
+    pub(crate) fn from_observed(
+        family: crate::intel_gpu_gt::Gen12Platform,
+        segment: u16,
+        devices: &[narf_bus::BusDevice],
+    ) -> Option<Self> {
+        use narf_bus::{BusAddr, BusKind};
+        let mut found = None;
+        for pch in devices {
+            let BusAddr::Pcie(addr) = pch.addr else {
+                continue;
+            };
+            if addr.segment != segment || addr.bus != 0 || pch.id.class != 0x060100 {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            let profile = Self::from_identity(family, pch.id.vendor, pch.id.device, pch.id.class)
+                .and_then(|mut profile| {
+                    let BusKind::Pcie {
+                        addr: actual,
+                        cfg_phys,
+                    } = pch.kind
+                    else {
+                        return None;
+                    };
+                    if actual != addr {
+                        return None;
+                    }
+                    profile.address = (u32::from(addr.segment) << 16)
+                        | (u32::from(addr.bus) << 8)
+                        | (u32::from(addr.device) << 3)
+                        | u32::from(addr.function);
+                    profile.config = cfg_phys.raw();
+                    profile.subsystem = (pch.id.subsystem_vendor, pch.id.subsystem_id);
+                    Some(profile)
+                });
+            found = Some(profile);
+        }
+        found.flatten()
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn at(mut self, address: u32) -> Self {
+        self.address = address;
+        self
+    }
+}
+/// PCH bank bit positions only. A bit does not prove a platform exposes that
+/// combo port: this monitor owns B only on source-exposed TGL/ADL-P/N.
 pub fn hotplug_bit(ddi: Ddi) -> Option<u32> {
     match ddi {
-        Ddi::A => Some(1 << 3),
-        Ddi::B => Some(1 << 4),
-        Ddi::C => Some(1 << 5),
+        Ddi::B => Some(1 << 17),
+        Ddi::C => Some(1 << 18),
         _ => None,
     }
 }
@@ -100,60 +175,167 @@ pub enum HpdEvent {
 }
 
 /// Combo DDIs the monitor watches, in poll order.
-const COMBO_DDIS: [Ddi; 3] = [Ddi::A, Ddi::B, Ddi::C];
+const COMBO_DDIS: [Ddi; 1] = [Ddi::B];
 
-/// HPD level/edge tracker for the combo DDIs. Poll-driven: the
-/// production caller (`intel_gpu::poll_dp_hpd_events`) runs it
-/// from the probe path today; the interrupt-enable programming
-/// ([`HpdMonitor::enable_interrupts`]) is in place for the IRQ
-/// consumer that follows.
+/// Retained source-exposed combo-B latch monitor. Probe and the existing runtime actor poll it;
+/// owned interrupt sources remain masked until a display IRQ owner exists.
 #[derive(Debug, Default)]
 pub struct HpdMonitor {
-    level: [bool; 3],
+    level: [bool; 1],
+    pending: u32,
+    long: u32,
+    profile: Option<HpdProfile>,
+    uncertain: bool,
+    initialized: bool,
 }
-
 impl HpdMonitor {
     pub const fn new() -> Self {
-        Self { level: [false; 3] }
-    }
-
-    /// Unmask + enable the combo hotplug interrupts (IER set,
-    /// IMR cleared for the three combo bits). Polling works
-    /// with or without this; it exists so an IRQ handler sees
-    /// the same edges the poller does.
-    pub fn enable_interrupts<M: MmioWindow + ?Sized>(&self, mmio: &M) {
-        let mask: u32 = COMBO_DDIS.iter().filter_map(|d| hotplug_bit(*d)).sum();
-        let ier = mmio.read32(GEN8_DE_PORT_IER);
-        mmio.write32(GEN8_DE_PORT_IER, ier | mask);
-        let imr = mmio.read32(GEN8_DE_PORT_IMR);
-        mmio.write32(GEN8_DE_PORT_IMR, imr & !mask);
-        compiler_fence(Ordering::SeqCst);
-    }
-
-    /// Poll once. Returns at most one event per call — callers
-    /// loop until `None` to drain. Consumed IIR edges are
-    /// cleared (write-1-to-clear) so a short pulse is reported
-    /// exactly once.
-    pub fn poll<M: MmioWindow + ?Sized>(&mut self, mmio: &M) -> Option<HpdEvent> {
-        let isr = mmio.read32(GEN8_DE_PORT_ISR);
-        let iir = mmio.read32(GEN8_DE_PORT_IIR);
-        let combo_mask: u32 = COMBO_DDIS.iter().filter_map(|d| hotplug_bit(*d)).sum();
-        if iir & combo_mask != 0 {
-            mmio.write32(GEN8_DE_PORT_IIR, iir & combo_mask);
+        Self {
+            level: [false; 1],
+            pending: 0,
+            long: 0,
+            profile: None,
+            uncertain: false,
+            initialized: false,
         }
-        for (i, ddi) in COMBO_DDIS.iter().enumerate() {
-            let bit = hotplug_bit(*ddi).unwrap_or(0);
-            let now = isr & bit != 0;
-            if now && !self.level[i] {
-                self.level[i] = true;
-                return Some(HpdEvent::Connected(*ddi));
+    }
+    pub fn uncertain(&self) -> bool {
+        self.uncertain
+    }
+    fn qualify<M: MmioWindow + ?Sized>(&mut self, io: &M) -> bool {
+        let Some(profile) = io.gen12_hpd_profile() else {
+            if self.profile.is_some() {
+                self.uncertain = true;
             }
-            if !now && self.level[i] {
-                self.level[i] = false;
-                return Some(HpdEvent::Disconnected(*ddi));
+            return false;
+        };
+        if self.profile.is_some_and(|old| old != profile) || !io.display_access_ok() {
+            self.uncertain = true;
+            return false;
+        }
+        if io.read32(FILTER) != 0xf8 {
+            if self.profile.is_some() {
+                self.uncertain = true;
             }
-            if now && self.level[i] && iir & bit != 0 {
-                return Some(HpdEvent::RetrainRequired(*ddi));
+            return false;
+        } // shared source250us filter; never seize it
+        self.profile = Some(profile);
+        true
+    }
+    pub fn enable_interrupts<M: MmioWindow + ?Sized>(&mut self, io: &M) {
+        if !self.qualify(io) || self.uncertain || self.initialized {
+            return;
+        }
+        let ier = io.read32(SDE_IER);
+        let imr = io.read32(SDE_IMR);
+        if !io.display_access_ok() {
+            self.uncertain = true;
+            return;
+        }
+        // Mask/readback first: inherited IMR may have this source unmasked
+        // while its IER latch was disabled. Never transiently enable an IRQ.
+        io.write32(SDE_IMR, imr | OWNED);
+        let masked = io.read32(SDE_IMR);
+        if !io.display_access_ok() || masked & OWNED != OWNED {
+            self.uncertain = true;
+            return;
+        }
+        io.write32(SDE_IER, ier | OWNED);
+        // Establish the first owned status incarnation. A stale orphan LONG
+        // without IIR must not contaminate the first later SHORT. The source
+        // setup RMW clears observed owned W1C status while enabling detection.
+        // Preserve raw captured IIR before ACK so any partial setup is uncertain.
+        let inherited = io.read32(SDE_IIR);
+        if inherited == u32::MAX || !io.display_access_ok() {
+            self.uncertain = true;
+            return;
+        }
+        let captured = inherited & OWNED;
+        self.pending |= captured;
+        if captured != 0 {
+            io.write32(SDE_IIR, captured);
+        }
+        let ctl = io.read32(SHOTPLUG);
+        if ctl == u32::MAX || !io.display_access_ok() {
+            self.uncertain = true;
+            return;
+        }
+        io.write32(SHOTPLUG, (ctl & !ALL_STATUS) | (ctl & 0x30) | 0x80);
+        let observed_ier = io.read32(SDE_IER);
+        let observed_imr = io.read32(SDE_IMR);
+        let observed_ctl = io.read32(SHOTPLUG);
+        if !io.display_access_ok()
+            || observed_ier & OWNED != OWNED
+            || observed_imr & OWNED != OWNED
+            || observed_ctl == u32::MAX
+            || observed_ctl & 0x80 != 0x80
+            || observed_ctl & 0x30 != 0
+        {
+            self.uncertain = true;
+        } else {
+            self.pending &= !captured;
+            self.long &= !OWNED;
+            self.initialized = true;
+        }
+    }
+    pub fn poll<M: MmioWindow + ?Sized>(&mut self, io: &M) -> Option<HpdEvent> {
+        if !self.qualify(io) || self.uncertain {
+            return None;
+        }
+        if !self.initialized {
+            self.enable_interrupts(io);
+            if !self.initialized || self.uncertain {
+                return None;
+            }
+        }
+        let levels = io.read32(SDE_ISR);
+        let edges = io.read32(SDE_IIR);
+        if levels == u32::MAX || edges == u32::MAX || !io.display_access_ok() {
+            self.uncertain = true;
+            return None;
+        }
+        let captured = edges & OWNED;
+        self.pending |= captured; // retain before the first owned W1C
+        if captured != 0 {
+            io.write32(SDE_IIR, captured); // source ACK order: south IIR before SHOTPLUG
+            let ctl = io.read32(SHOTPLUG);
+            if ctl == u32::MAX || !io.display_access_ok() {
+                self.uncertain = true;
+                return None;
+            }
+            let status = ctl & 0x30;
+            if status & 0x20 != 0 {
+                self.long |= 1 << 17;
+            }
+            // Never carry another owner's read-one status into a W1C write.
+            io.write32(SHOTPLUG, (ctl & !ALL_STATUS) | status);
+            if !io.display_access_ok() {
+                self.uncertain = true;
+                return None;
+            }
+        }
+        for (index, ddi) in COMBO_DDIS.iter().copied().enumerate() {
+            let bit = hotplug_bit(ddi).unwrap();
+            let now = levels & bit != 0;
+            // Live ISR may be low during a legal short pulse. Source long
+            // detection gates removal; no single low sample proves unplug.
+            if now && !self.level[index] {
+                self.level[index] = true;
+                self.pending &= !bit;
+                self.long &= !bit;
+                return Some(HpdEvent::Connected(ddi));
+            }
+            if self.pending & bit != 0 {
+                let long = self.long & bit != 0;
+                self.pending &= !bit;
+                self.long &= !bit;
+                if self.level[index] {
+                    if long && !now {
+                        self.level[index] = false;
+                        return Some(HpdEvent::Disconnected(ddi));
+                    }
+                    return Some(HpdEvent::RetrainRequired(ddi));
+                }
             }
         }
         None
@@ -168,10 +350,12 @@ static HPD_MONITOR: IrqSafeSpinLock<HpdMonitor> = IrqSafeSpinLock::new(HpdMonito
 pub fn poll_hpd_event<M: MmioWindow + ?Sized>(mmio: &M) -> Option<HpdEvent> {
     HPD_MONITOR.lock().poll(mmio)
 }
+pub(crate) fn hpd_uncertain() -> bool {
+    HPD_MONITOR.lock().uncertain()
+}
 
-/// Program the shared monitor's interrupt enables (production
-/// entry point; the session is poll-driven today, this is for
-/// the IRQ consumer that follows).
+/// Enable the shared monitor's source latches while keeping its owned SDE
+/// sources masked. This poll-only owner does not claim an IRQ consumer.
 pub fn enable_hpd_interrupts<M: MmioWindow + ?Sized>(mmio: &M) {
     HPD_MONITOR.lock().enable_interrupts(mmio)
 }
@@ -414,8 +598,8 @@ pub fn connect_on_pipe<M: MmioWindow + ?Sized>(
 
 /// Disconnect: silence audio (codec disable + sink clear)
 /// before the pipeline comes down, so no consumer can act on
-/// an ELD whose display is already gone. False means missing/foreign source
-/// metadata: no side effects occurred and the caller must retain the session.
+/// an ELD whose display is already gone. False means source refusal or an
+/// unobserved/partial local stop; the caller must retain the session graph.
 pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &DpConnection) -> bool {
     if mmio.gen12_display_family() != Some(conn.family) {
         return false;
@@ -426,8 +610,7 @@ pub fn disconnect<M: MmioWindow + ?Sized>(mmio: &M, conn: &DpConnection) -> bool
     }
     let mut modeset = Modeset::for_pipe(mmio, conn.ddi, conn.pipe);
     modeset.set_gen12_family(conn.family);
-    modeset.teardown();
-    true
+    modeset.try_teardown().is_ok()
 }
 
 /// Respond to a short pulse (IRQ_HPD): re-read link status. If
@@ -752,7 +935,7 @@ pub mod tests {
         aux_data: RefCell<[u8; 20]>,
         /// AUX_CTL value reads return once a transaction lands.
         aux_ctl_state: RefCell<u32>,
-        /// GEN8_DE_PORT live levels / latched edges (test-driven).
+        /// PCH SDE live levels / latched edges (test-driven).
         pub hpd_level: RefCell<u32>,
         pub hpd_iir: RefCell<u32>,
     }
@@ -804,7 +987,24 @@ pub mod tests {
         fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
             *self.family.borrow()
         }
+        fn gen12_hpd_profile(&self) -> Option<HpdProfile> {
+            self.gen12_display_family().and_then(|family| {
+                HpdProfile::from_identity(
+                    family,
+                    0x8086,
+                    if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
+                        0xa080
+                    } else {
+                        0x7a80
+                    },
+                    0x060100,
+                )
+            })
+        }
         fn read32(&self, off: u64) -> u32 {
+            if off == FILTER {
+                return 0xf8;
+            }
             if off == self.aux_ctl_off() {
                 return *self.aux_ctl_state.borrow();
             }
@@ -819,10 +1019,10 @@ pub mod tests {
                 }
                 return v;
             }
-            if off == GEN8_DE_PORT_ISR {
+            if off == SDE_ISR {
                 return *self.hpd_level.borrow();
             }
-            if off == GEN8_DE_PORT_IIR {
+            if off == SDE_IIR {
                 return *self.hpd_iir.borrow();
             }
             let v = self.stored(off);
@@ -892,7 +1092,7 @@ pub mod tests {
                     *self.aux_ctl_state.borrow_mut() = 0;
                 }
             }
-            if off == GEN8_DE_PORT_IIR {
+            if off == SDE_IIR {
                 let mut iir = self.hpd_iir.borrow_mut();
                 *iir &= !val;
             }
@@ -1232,6 +1432,8 @@ pub mod tests {
         }
         // HPD: level falls → Disconnected → teardown.
         *mmio.hpd_level.borrow_mut() = 0;
+        *mmio.hpd_iir.borrow_mut() = 0x20000;
+        mmio.regs.borrow_mut().insert(0xc4030, 0x20);
         match monitor.poll(&mmio) {
             Some(HpdEvent::Disconnected(Ddi::B)) => {}
             _ => return TestResult::Fail("level fall must report Disconnected(DDI B)"),

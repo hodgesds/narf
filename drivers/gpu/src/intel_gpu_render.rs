@@ -80,6 +80,13 @@ impl DeviceInfo {
     pub fn submission_ready(&self) -> bool {
         self.user_status().is_some()
     }
+    fn object_async_ready(&self) -> bool {
+        crate::intel_gpu_exec::object_async_profile(self.platform)
+            && self
+                .user_status()
+                .is_some_and(|status| status.engines.bits() != 0)
+    }
+
     pub fn native_xe(&self) -> bool {
         self.platform.guc().is_some()
             && self
@@ -608,6 +615,10 @@ impl RenderFile {
         use crate::intel_gpu_user::{OutputError, UserOutput};
         let (request, sync) =
             crate::intel_gpu_exec::ExecRequest::read_submission(user, arg, &self.gem)?;
+        request.validate_for_gt(info.platform)?;
+        if request.has_async() && !info.object_async_ready() {
+            return Err(FsError::NoDevice);
+        }
         let output = sync.output;
         let input_word = sync.input_word;
         let sync = sync.resolve(&self.syncobjs)?;
@@ -628,11 +639,17 @@ impl RenderFile {
         loop {
             let status = backend
                 .status()
-                .filter(|status| status.platform == info.platform)
+                .filter(|status| {
+                    status.platform == info.platform
+                        && (!request.has_async()
+                            || (status.epoch != 0 && status.engines.bits() != 0))
+                })
                 .ok_or(FsError::NoDevice)?;
             context.check_epoch(status.epoch)?;
             for entry in &request.objects {
-                entry.object.wait_idle(entry.writable, None).await?;
+                if !entry.asynchronous {
+                    entry.object.wait_idle(entry.writable, None).await?;
+                }
             }
             let batch = request.prepare_user(status.platform)?;
             let result = if output {
@@ -1399,6 +1416,7 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
         33 => i32::try_from(observed_topology(info)?.dss_count()).map_err(|_| FsError::NoDevice)?,
         34 => i32::try_from(observed_topology(info)?.eu_count()).map_err(|_| FsError::NoDevice)?,
         40 => 4, // MMAP_OFFSET
+        43 => i32::from(info.object_async_ready()),
         // Only ENABLED: i915 priority configuration, busy stats, semaphore and
         // preemption capability bits require their own implemented contracts.
         41 => i32::from(info.submission_ready()),
@@ -1441,7 +1459,7 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
         | 27..=29
         | 35..=36
         | 38..=39
-        | 42..=43
+        | 42
         | 45
         | 52
         | 54

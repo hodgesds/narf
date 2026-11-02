@@ -72,6 +72,8 @@ pub const OBJECT_WRITE: u64 = 1 << 2;
 pub const OBJECT_SUPPORTS_48B: u64 = 1 << 3;
 pub const OBJECT_PINNED: u64 = 1 << 4;
 pub const OBJECT_PAD_TO_SIZE: u64 = 1 << 5;
+/// Skip only this object's prior implicit GPU dependencies; retain CPU fencing.
+pub const OBJECT_ASYNC: u64 = 1 << 6;
 
 /// Exact wire encodings accepted alongside Xe on a production GuC card.
 /// Number-only routing is ambiguous (for example GETPARAM/QUEUE_CREATE).

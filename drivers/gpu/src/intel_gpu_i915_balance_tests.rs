@@ -915,3 +915,7 @@ kernel_test_in!(
 mod media {
     include!("intel_gpu_i915_media_tests.rs");
 }
+
+mod object_async {
+    include!("intel_gpu_i915_async_tests.rs");
+}

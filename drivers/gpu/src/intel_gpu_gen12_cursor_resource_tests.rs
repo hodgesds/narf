@@ -144,3 +144,37 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_cursor",
     smoke_gen12_no_dpt_global_disable_requires_all_fetchers_stopped_and_readback
 );
+
+fn smoke_gen12_resource_plane_inventory_denies_absent_adl_and_refuses_all_supported_fetchers(
+) -> TestResult {
+    for (family, count) in [
+        (Gen12Platform::TigerLake, 7u64),
+        (Gen12Platform::AlderLakeS, 5),
+        (Gen12Platform::AlderLakeP, 5),
+        (Gen12Platform::AlderLakeN, 5),
+    ] {
+        let io = stopped();
+        io.deny_absent_gen12_planes(family);
+        let owner = setup(&io, &mode(), family).unwrap().unwrap();
+        owner.check(&io, family).unwrap();
+        assert_eq!(io.forbidden_display_reads(), 0);
+        for pipe in 0..4u64 {
+            for plane in 0..count {
+                let foreign = stopped();
+                foreign.deny_absent_gen12_planes(family);
+                foreign.set(0x70180 + pipe * 0x1000 + plane * 0x100, 0x80000000);
+                assert!(setup(&foreign, &mode(), family).unwrap().is_none());
+                assert_eq!(foreign.forbidden_display_reads(), 0);
+                assert!(
+                    foreign.writes().is_empty(),
+                    "live implemented fetcher must precede resource writes"
+                );
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_cursor",
+    smoke_gen12_resource_plane_inventory_denies_absent_adl_and_refuses_all_supported_fetchers
+);

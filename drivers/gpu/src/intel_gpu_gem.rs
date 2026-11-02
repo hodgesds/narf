@@ -501,6 +501,10 @@ fn wc_fence() {
     };
 }
 
+#[path = "intel_gpu_gem_async.rs"]
+mod object_async;
+pub(crate) use object_async::reserve_gpu_mixed;
+
 /// Atomic all-or-nothing conflict check followed by publication of the job's
 /// terminal fence on every leaf. Read-only jobs may overlap; writes are
 /// exclusive. The caller retains the residency graph until signalling it.

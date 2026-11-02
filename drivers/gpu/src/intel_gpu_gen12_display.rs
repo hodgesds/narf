@@ -166,7 +166,13 @@ impl Owner {
         self.check_plane(io)?;
         // These independent DMA consumers cannot be adopted merely because
         // the primary's live SURF happens to match a driver-owned buffer.
-        fetchers_with_cursor(io, Generation::TigerLake, owned_dsb, owned_cursor)?;
+        let generation = match self.family {
+            Gen12Platform::TigerLake => Generation::TigerLake,
+            Gen12Platform::AlderLakeS | Gen12Platform::AlderLakeP | Gen12Platform::AlderLakeN => {
+                Generation::AlderLake
+            }
+        };
+        fetchers_with_cursor(io, generation, owned_dsb, owned_cursor)?;
         for pipe in 1..4 {
             if read(io, 0x70008 + pipe * 0x1000)? & 0xc0000000 != 0 {
                 return Err(FsError::NoDevice);

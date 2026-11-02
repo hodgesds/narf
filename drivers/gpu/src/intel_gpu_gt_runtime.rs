@@ -49,6 +49,7 @@ enum Phase {
     Probe,
     Defaults,
     PpgttProbe,
+    Huc,
     /// Source-qualified host-L2 preparation and acknowledged MERT sanitize.
     Mert,
     /// Fresh GT is ready; display retirement runs outside the GT mutex.
@@ -70,6 +71,7 @@ struct State {
     irq_tried: bool,
     gt: Option<ProductionGt>,
     firmware: Option<GuCFirmware>,
+    huc: Option<crate::intel_gpu_huc::Firmware>,
     probe: Option<Arc<CompletionFence>>,
     probe_result: Option<crate::intel_gpu_exec::PpgttProbeResult>,
     probe_engine: crate::intel_gpu_engine::Engine,
@@ -185,6 +187,29 @@ impl crate::intel_gpu_user::UserBackend for Backend {
                 narf_scheduler::yield_now().await;
                 narf_time::SleepUntil::new(narf_time::Deadline::after_us(50).as_instant()).await;
             }
+        })
+    }
+    fn huc_version(&self) -> narf_filesystem::FsFuture<'_, (u8, u8, u8)> {
+        Box::pin(async move {
+            use narf_filesystem::FsError;
+            let owner = self.owner.upgrade().ok_or(FsError::NoDevice)?;
+            let state = owner.state.lock().await;
+            let epoch = owner.user_epoch.load(Ordering::Acquire);
+            if state.phase != Phase::Running
+                || epoch == 0
+                || owner.suspended.load(Ordering::Acquire)
+            {
+                return Err(FsError::NoDevice);
+            }
+            state
+                .gt
+                .as_ref()
+                .ok_or(FsError::NoDevice)?
+                .huc_version(epoch, || {
+                    narf_bus::pci::power_state(&owner.pending.cap, &owner.pending.device)
+                        == Ok(Some(narf_bus::pci::PciPowerState::D0))
+                })
+                .ok_or(FsError::NoDevice)
         })
     }
     fn ccs_control(&self) -> Option<Arc<crate::intel_gpu_ccs_control::Control>> {
@@ -791,6 +816,7 @@ pub(crate) fn start_pending() {
                 irq_tried: false,
                 gt: None,
                 firmware: None,
+                huc: None,
                 probe: None,
                 probe_result: None,
                 probe_engine: crate::intel_gpu_engine::Engine::Rcs0,
@@ -882,19 +908,10 @@ fn validate_pci(p: &Pending, mmio: &impl MmioWindow) -> Result<u8, RuntimeError>
     if vf == u32::MAX || vf & 1 != 0 || p.bar.len < 16 * 1024 * 1024 {
         return Err(RuntimeError::Device);
     }
-    if GtPlatform::from_pci(p.device.id.vendor, p.device.id.device)
-        .is_some_and(GtPlatform::is_discrete)
+    if let Some(platform) = GtPlatform::from_pci(p.device.id.vendor, p.device.id.device)
+        .filter(|platform| platform.is_discrete())
     {
-        // GT-only Arc binding must not replace GGTT mappings underneath an
-        // inherited firmware scanout. Display takeover remains a separate owner.
-        for pipe in 0..4 {
-            for plane in 0..7 {
-                let ctl = mmio.read32(0x70180 + pipe * 0x1000 + plane * 0x100);
-                if ctl == u32::MAX || ctl & (1 << 31) != 0 {
-                    return Err(RuntimeError::Device);
-                }
-            }
-        }
+        validate_discrete_display_idle(platform, mmio)?;
     }
     if narf_bus::pci::power_state(&p.cap, &p.device).ok().flatten()
         != Some(narf_bus::pci::PciPowerState::D0)
@@ -902,6 +919,27 @@ fn validate_pci(p: &Pending, mmio: &impl MmioWindow) -> Result<u8, RuntimeError>
         return Err(RuntimeError::Device);
     }
     Ok(revision)
+}
+
+/// Source display inventory only; no Arc display activation. Both currently
+/// admitted discrete profiles have display>=13 and four sprites per pipe.
+/// MIT intel_display_device.c:1788-1793, dg2_desc and bmg_desc.
+fn validate_discrete_display_idle(
+    platform: GtPlatform,
+    mmio: &impl MmioWindow,
+) -> Result<(), RuntimeError> {
+    if !matches!(platform, GtPlatform::Alchemist | GtPlatform::Battlemage) {
+        return Err(RuntimeError::Device);
+    }
+    for pipe in 0..4 {
+        for plane in 0..5 {
+            let ctl = mmio.read32(0x70180 + pipe * 0x1000 + plane * 0x100);
+            if ctl == u32::MAX || ctl & (1 << 31) != 0 {
+                return Err(RuntimeError::Device);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn pci_identity(
@@ -1096,18 +1134,31 @@ impl Owner {
                     .map_err(RuntimeError::Firmware)?,
             );
         }
+        let huc_enabled = platform == crate::intel_gpu_huc::PLATFORM
+            && crate::intel_gpu_huc::opted_in(narf_boot::args());
+        if huc_enabled && state.huc.is_none() {
+            let authority = narf_firmware::trusted_loader_authority()
+                .ok_or(RuntimeError::Authority)?
+                .derive()
+                .map_err(|_| RuntimeError::Authority)?;
+            state.huc = Some(
+                crate::intel_gpu_huc::Firmware::open(platform, &authority)
+                    .map_err(RuntimeError::Firmware)?,
+            );
+        }
+        let config = BootConfig {
+            device_id: p.device.id.device,
+            revision,
+            huc_upload_bytes: 0,
+            uncached_mocs: platform.is_xe2().then_some(3),
+        };
+        let firmware = state.firmware.as_ref().expect("prepared image");
         state.gt = Some(
-            GuCGt::stage_hardware(
-                mmio,
-                arena,
-                state.firmware.as_ref().expect("prepared image"),
-                BootConfig {
-                    device_id: p.device.id.device,
-                    revision,
-                    huc_upload_bytes: 0,
-                    uncached_mocs: platform.is_xe2().then_some(3),
-                },
-            )
+            if let Some(huc) = state.huc.as_ref().filter(|_| huc_enabled) {
+                GuCGt::stage_hardware_with_huc(mmio, arena, firmware, huc, config)
+            } else {
+                GuCGt::stage_hardware(mmio, arena, firmware, config)
+            }
             .map_err(RuntimeError::Gt)?,
         );
         state
@@ -1319,7 +1370,7 @@ impl Owner {
                         .card
                         .publish_gt_vram(gt)
                         .map_err(|_| RuntimeError::State)?;
-                    state.phase = Phase::Mert;
+                    state.phase = Phase::Huc;
                     let (major, minor, patch) = gt.submission_version();
                     self.user_version.store(
                         u32::from(major) << 16 | u32::from(minor) << 8 | u32::from(patch),
@@ -1336,6 +1387,11 @@ impl Owner {
                         self.pending.index,
                         "GuC ready; every published engine's defaults, private PPGTT store and retirement verified",
                     );
+                }
+            }
+            (Phase::Huc, GtState::SchedulingReady) => {
+                if gt.prepare_huc(now).map_err(RuntimeError::Gt)? {
+                    state.phase = Phase::Mert;
                 }
             }
             (Phase::Mert, GtState::SchedulingReady) => {
@@ -1416,6 +1472,9 @@ impl Owner {
                         )
                 })
                 .await;
+            if !self.suspended.load(Ordering::Acquire) {
+                crate::intel_gpu::service_external_sst(&self.pending.bar);
+            }
             let mut reconfiguration_power_failed = false;
             // Runtime resume can acquire this same GT mutex. Never request
             // power while holding it, and retain the usage reference across
@@ -1702,13 +1761,17 @@ impl Owner {
     }
 }
 
+pub(crate) fn autosuspend_profile_eligible(platform: Option<GtPlatform>, has_mode: bool) -> bool {
+    platform.is_some_and(GtPlatform::is_discrete) && !has_mode
+}
+
 impl Owner {
     /// Discrete functions without a bound display may autosuspend. An iGPU
     /// scanout keeps its function in D0, as Linux's display wakeref does.
     fn autosuspend_eligible(&self) -> bool {
         let platform =
             GtPlatform::from_pci(self.pending.device.id.vendor, self.pending.device.id.device);
-        platform.is_some_and(GtPlatform::is_discrete) && self.pending.mode.is_none()
+        autosuspend_profile_eligible(platform, self.pending.mode.is_some())
     }
 
     /// Once the first bring-up publishes users: configure autosuspend, allow
@@ -2255,5 +2318,82 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_gt",
         smoke_gt_pci_identity_and_virtualization_admission
+    );
+    fn smoke_gt_discrete_display_inventory_denies_absent_planes_and_refuses_each_live_fetcher(
+    ) -> TestResult {
+        use core::cell::Cell;
+        struct Io {
+            live: Option<u64>,
+            unavailable: Option<u64>,
+            absent: Cell<usize>,
+        }
+        impl MmioWindow for Io {
+            fn read32(&self, r: u64) -> u32 {
+                if (0x70000..0x74000).contains(&r) && [0x680, 0x780].contains(&(r & 0xfff)) {
+                    self.absent.set(self.absent.get() + 1);
+                    return u32::MAX;
+                }
+                if self.unavailable == Some(r) {
+                    return u32::MAX;
+                }
+                if self.live == Some(r) {
+                    1 << 31
+                } else {
+                    0
+                }
+            }
+            fn write32(&self, _: u64, _: u32) {
+                panic!("read-only discrete display admission wrote MMIO")
+            }
+        }
+        for platform in [GtPlatform::Alchemist, GtPlatform::Battlemage] {
+            let io = Io {
+                live: None,
+                unavailable: None,
+                absent: Cell::new(0),
+            };
+            assert_eq!(validate_discrete_display_idle(platform, &io), Ok(()));
+            assert_eq!(io.absent.get(), 0);
+            for pipe in 0..4 {
+                for plane in 0..5 {
+                    let r = 0x70180 + pipe * 0x1000 + plane * 0x100;
+                    for unavailable in [false, true] {
+                        let io = Io {
+                            live: (!unavailable).then_some(r),
+                            unavailable: unavailable.then_some(r),
+                            absent: Cell::new(0),
+                        };
+                        assert_eq!(
+                            validate_discrete_display_idle(platform, &io),
+                            Err(RuntimeError::Device)
+                        );
+                        assert_eq!(io.absent.get(), 0);
+                    }
+                }
+            }
+        }
+        struct NoRead;
+        impl MmioWindow for NoRead {
+            fn read32(&self, _: u64) -> u32 {
+                panic!("non-discrete inventory read forbidden display registers")
+            }
+            fn write32(&self, _: u64, _: u32) {
+                panic!("non-discrete inventory wrote display registers")
+            }
+        }
+        for platform in [
+            GtPlatform::Integrated(crate::intel_gpu::Generation::LunarLake),
+            GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake),
+        ] {
+            assert_eq!(
+                validate_discrete_display_idle(platform, &NoRead),
+                Err(RuntimeError::Device)
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_gt",
+        smoke_gt_discrete_display_inventory_denies_absent_planes_and_refuses_each_live_fetcher
     );
 }

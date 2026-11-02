@@ -24,6 +24,34 @@ pub(crate) async fn query_user(
     user: &dyn IoctlContext,
 ) -> Result<(), FsError> {
     let wire = read(user, address, 40)?;
+    if u32_at(&wire, 8) == 7 && u32_at(&wire, 12) != 0 {
+        zero(&wire[..8])?;
+        zero(&wire[24..40])?;
+        if u32_at(&wire, 12) != 32 {
+            return Err(FsError::InvalidData);
+        }
+        let data = u64_at(&wire, 16);
+        let mut reply = read(user, data, 32)?;
+        zero(&reply[2..4])?;
+        zero(&reply[20..32])?;
+        let kind = u16::from_le_bytes(reply[..2].try_into().unwrap());
+        if kind > 1 {
+            return Err(FsError::InvalidData);
+        }
+        if kind == 1 {
+            let backend = info.backend.as_ref().ok_or(FsError::NoDevice)?;
+            backend
+                .status()
+                .filter(|s| s.platform == info.platform && s.epoch != 0)
+                .ok_or(FsError::NoDevice)?;
+            let (major, minor, patch) = backend.huc_version().await?;
+            put32(&mut reply, 4, 0);
+            put32(&mut reply, 8, u32::from(major));
+            put32(&mut reply, 12, u32::from(minor));
+            put32(&mut reply, 16, u32::from(patch));
+            return user.write(data, &reply);
+        }
+    }
     if u32_at(&wire, 8) != 6 || u32_at(&wire, 12) == 0 {
         return query_wire(info, address, user, &wire);
     }

@@ -404,10 +404,11 @@ fn fetchers_with_cursor(
             return Err(FsError::Unsupported);
         }
     }
-    let count = if generation == Generation::MeteorLake {
-        5
-    } else {
-        7
+    // All admitted ADL-S/P/N source families have four sprites; TGL has
+    // six. ADL-S is display12 with HAS_D12_PLANE_MINIMIZATION.
+    let count = match generation {
+        Generation::MeteorLake | Generation::AlderLake => 5,
+        _ => 7,
     };
     for pipe in 0..4u64 {
         let cursor = mmio.read32(0x70080 + pipe * 0x1000);
@@ -650,6 +651,7 @@ fn quarantine_reset_state<M: Platform>(state: &Mutex<State<M>>, lost: &AtomicBoo
     }
 }
 pub(crate) async fn quiesce_for_legacy(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {
+    crate::intel_gpu::retire_external_sst(bar).await?;
     if let Some(display) = display_for_bar(bar) {
         display.quiesce().await?;
     }
@@ -664,6 +666,7 @@ pub(crate) async fn quiesce_for_legacy(bar: &narf_bus::MmioRegion) -> Result<(),
 }
 
 pub(crate) async fn recover_after_gt_reset(bar: &narf_bus::MmioRegion) -> Result<(), FsError> {
+    crate::intel_gpu::retire_external_sst(bar).await?;
     if let Some(display) = display_for_bar(bar) {
         display.recover().await?;
     }
@@ -949,6 +952,17 @@ impl<M: Platform> Device<M> {
     }
 }
 impl<M: Platform> Device<M> {
+    /// Stop-only external owner keeps all existing presenters/color/DMA in
+    /// place. It cannot arm or adopt them; fresh authority is checked by its IO.
+    pub(crate) fn legacy_drain(&self) -> Result<LegacyGuard<'_, M>, FsError> {
+        let mut state = self.state.try_lock().ok_or(FsError::Busy)?;
+        state.blocked = true;
+        Ok(LegacyGuard {
+            state,
+            platform: &self.platform,
+            geometry: &self.geometry,
+        })
+    }
     pub(crate) fn legacy(&self) -> Result<LegacyGuard<'_, M>, FsError> {
         let state = self.state.try_lock().ok_or(FsError::Busy)?;
         if self.platform.reset_lost()

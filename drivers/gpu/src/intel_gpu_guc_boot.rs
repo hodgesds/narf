@@ -67,6 +67,7 @@ pub enum BootError {
 pub enum BootState {
     Staged,
     Resetting,
+    HucDma,
     Dma,
     Authenticating,
     Ready,
@@ -197,18 +198,28 @@ struct HwconfigDma<B: GpuBacking> {
     bytes: u32,
 }
 
+struct HucDma<B: GpuBacking> {
+    backing: B,
+    upload: u32,
+    version: (u8, u8, u8),
+}
+
 struct Resources<A: BootAllocator> {
     allocator: A,
     image: A::Backing,
     ads: A::Backing,
     logs: A::Backing,
     hwconfig: Option<HwconfigDma<A::Backing>>,
+    huc: Option<HucDma<A::Backing>>,
 }
 impl<A: BootAllocator> Resources<A> {
     fn free(mut self) {
         self.allocator.free(self.image);
         self.allocator.free(self.ads);
         self.allocator.free(self.logs);
+        if let Some(huc) = self.huc {
+            self.allocator.free(huc.backing);
+        }
         if let Some(output) = self.hwconfig {
             self.allocator.free(output.backing);
         }
@@ -220,6 +231,8 @@ pub struct GuCBoot<M: MmioWindow, A: BootAllocator> {
     resources: ManuallyDrop<Resources<A>>,
     platform: GtPlatform,
     config: BootConfig,
+    huc_exposed: bool,
+    huc_dma_done: bool,
     upload: u32,
     state: BootState,
     deadline: u64,
@@ -294,13 +307,53 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         )
     }
 
+    pub(crate) fn stage_with_huc(
+        mmio: M,
+        allocator: A,
+        firmware: &GuCFirmware,
+        huc: &crate::intel_gpu_huc::Firmware,
+        mut config: BootConfig,
+    ) -> Result<Self, BootError> {
+        if firmware.platform() != crate::intel_gpu_huc::PLATFORM {
+            return Err(BootError::Unsupported);
+        }
+        let huc = huc.image();
+        config.huc_upload_bytes =
+            u32::try_from(huc.upload.len()).map_err(|_| BootError::Address)?;
+        Self::stage_images(
+            mmio,
+            allocator,
+            firmware.platform(),
+            firmware.image(),
+            config,
+            Some(huc),
+        )
+    }
+
     fn stage_image(
+        mmio: M,
+        allocator: A,
+        platform: GtPlatform,
+        image: CssImage<'_>,
+        config: BootConfig,
+    ) -> Result<Self, BootError> {
+        Self::stage_images(mmio, allocator, platform, image, config, None)
+    }
+
+    fn stage_images(
         mmio: M,
         mut allocator: A,
         platform: GtPlatform,
         image: CssImage<'_>,
         config: BootConfig,
+        huc: Option<crate::intel_gpu_huc::Image<'_>>,
     ) -> Result<Self, BootError> {
+        if huc.as_ref().is_some_and(|h| {
+            platform != crate::intel_gpu_huc::PLATFORM
+                || usize::try_from(config.huc_upload_bytes).ok() != Some(h.upload.len())
+        }) {
+            return Err(BootError::Unsupported);
+        }
         let profile = platform.guc().ok_or(BootError::Unsupported)?;
         if GtPlatform::from_pci(0x8086, config.device_id) != Some(platform)
             || image.version < profile.minimum_version
@@ -323,9 +376,20 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         let ads_pages = (ADS_PRIVATE + image.private_data_bytes).div_ceil(PAGE);
         let mut allocations: Vec<A::Backing> = Vec::new();
         allocations
-            .try_reserve_exact(3)
+            .try_reserve_exact(3 + usize::from(huc.is_some()))
             .map_err(|_| BootError::Allocation(SubmitError::OutOfMemory))?;
-        for pages in [image_pages, ads_pages, LOG_BYTES / PAGE] {
+        let huc_pages = huc
+            .as_ref()
+            .map(|h| (h.upload.len() + h.signature.len()).div_ceil(PAGE as usize) as u32);
+        for pages in [
+            Some(image_pages),
+            Some(ads_pages),
+            Some(LOG_BYTES / PAGE),
+            huc_pages,
+        ]
+        .into_iter()
+        .flatten()
+        {
             let backing = match allocator.alloc(pages).map_err(BootError::Allocation) {
                 Ok(backing) => backing,
                 Err(error) => {
@@ -356,6 +420,26 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             }
             allocations.push(backing);
         }
+        let huc = huc.map(|h| {
+            let backing = allocations.pop().expect("HuC image");
+            backing.zero_fill();
+            for (i, word) in h
+                .upload
+                .chunks_exact(4)
+                .chain(h.signature.chunks_exact(4))
+                .enumerate()
+            {
+                backing.write32(
+                    i as u64 * 4,
+                    u32::from_le_bytes(word.try_into().expect("HuC dword")),
+                );
+            }
+            HucDma {
+                backing,
+                upload: config.huc_upload_bytes,
+                version: h.version,
+            }
+        });
         let logs = allocations.pop().expect("logs");
         let ads = allocations.pop().expect("ADS");
         let backing = allocations.pop().expect("image");
@@ -393,9 +477,12 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                 ads,
                 logs,
                 hwconfig: None,
+                huc,
             }),
             platform,
             config,
+            huc_exposed: false,
+            huc_dma_done: false,
             upload,
             state: BootState::Staged,
             deadline: 0,
@@ -444,6 +531,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         r.allocator.configure_cache(&mut r.image, policy)?;
         r.allocator.configure_cache(&mut r.ads, policy)?;
         r.allocator.configure_cache(&mut r.logs, policy)?;
+        if let Some(huc) = &mut r.huc {
+            r.allocator.configure_cache(&mut huc.backing, policy)?;
+        }
         Ok(())
     }
 
@@ -523,10 +613,14 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         let backing = r.allocator.alloc(pages).map_err(BootError::Allocation)?;
         let base = backing.ggtt_offset();
         let checked = extent(&backing, pages).and_then(|()| {
-            if [&r.image, &r.ads, &r.logs].iter().any(|old| {
-                (base as u64) < old.ggtt_offset() as u64 + old.size_pages() as u64 * 4096
-                    && (old.ggtt_offset() as u64) < base as u64 + pages as u64 * 4096
-            }) {
+            if [&r.image, &r.ads, &r.logs]
+                .into_iter()
+                .chain(r.huc.as_ref().map(|h| &h.backing))
+                .any(|old| {
+                    (base as u64) < old.ggtt_offset() as u64 + old.size_pages() as u64 * 4096
+                        && (old.ggtt_offset() as u64) < base as u64 + pages as u64 * 4096
+                })
+            {
                 Err(BootError::Address)
             } else {
                 Ok(())
@@ -611,6 +705,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             return Err(BootError::State);
         }
         self.awake()?;
+        self.huc_dma_done = false;
         if self.mmio.read32(GDRST) != 0 || self.mmio.read32(DMA_CTRL) & 1 != 0 {
             return Err(BootError::Busy);
         }
@@ -645,6 +740,12 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
             return Err(BootError::Unavailable);
         }
         if size & 1 != 0 || offset & 1 != 0 {
+            // Conservative ownership requirement for enabled TGL HuC: the
+            // locked partition must select GuC as loading agent. Linux masks
+            // this bit in its inherited-layout path; never rewrite its lock.
+            if self.resources.huc.is_some() && offset & 2 == 0 {
+                return Err(BootError::Wopcm);
+            }
             if size & 1 == 0 || offset & 1 == 0 {
                 return Err(BootError::Wopcm);
             }
@@ -692,6 +793,33 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
     fn upload(&mut self, now: u64) -> Result<(), BootError> {
         let wa_offset = self.wa_offset();
         self.layout()?;
+        if !self.huc_dma_done && self.resources.huc.is_some() {
+            let status = self.mmio.read32(0xc1dc);
+            if status == u32::MAX {
+                return Err(BootError::Unavailable);
+            }
+            if status & 1 != 0 {
+                return Err(BootError::Reset);
+            }
+            let r = &mut *self.resources;
+            let huc = r.huc.as_ref().expect("owned HuC");
+            r.allocator.sync_for_device(&huc.backing)?;
+            invalidate_guc_tlb(&self.mmio, self.platform);
+            self.huc_exposed = true; // sticky before the first hardware address publication
+            self.mmio.write32(0xc300, huc.backing.ggtt_offset());
+            self.mmio.write32(0xc304, 8 << 16);
+            self.mmio.write32(0xc308, 0);
+            self.mmio.write32(0xc30c, 7 << 16);
+            self.mmio.write32(0xc310, huc.upload);
+            self.deadline = now.checked_add(100_000_000).ok_or(BootError::Timeout)?;
+            self.state = BootState::HucDma;
+            // This lower-level boot owner cannot reclaim this graph on
+            // GuC-only Stopped. The enclosing full Gen12 reset retires it.
+            fence(Ordering::SeqCst);
+            self.mmio.write32(DMA_CTRL, 0x02010201);
+            let _ = self.mmio.read32(DMA_CTRL);
+            return Ok(());
+        }
         let power_mask = self.mmio.read32(0xa168);
         if power_mask == u32::MAX {
             return Err(BootError::Unavailable);
@@ -872,16 +1000,19 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                             .try_reserve_exact(engines.iter().count())
                             .map_err(|_| BootError::Allocation(SubmitError::OutOfMemory))?;
                         let protected = [
-                            &self.resources.ads,
-                            &self.resources.image,
-                            &self.resources.logs,
+                            Some(&self.resources.ads),
+                            Some(&self.resources.image),
+                            Some(&self.resources.logs),
+                            self.resources.huc.as_ref().map(|h| &h.backing),
                         ]
                         .map(|backing| {
-                            let start = u64::from(backing.ggtt_offset());
-                            (
-                                start,
-                                start + u64::from(backing.size_pages()) * u64::from(PAGE),
-                            )
+                            backing.map(|backing| {
+                                let start = u64::from(backing.ggtt_offset());
+                                (
+                                    start,
+                                    start + u64::from(backing.size_pages()) * u64::from(PAGE),
+                                )
+                            })
                         });
                         let mut state_ranges = Vec::new();
                         state_ranges
@@ -918,6 +1049,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                                     || end > 0xfee00000
                                     || protected
                                         .iter()
+                                        .flatten()
                                         .chain(state_ranges.iter())
                                         .any(|&(other, limit)| start < limit && other < end)
                                 {
@@ -985,6 +1117,19 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
                 }
                 self.upload(now)?;
             }
+            BootState::HucDma => {
+                let control = self.mmio.read32(DMA_CTRL);
+                if control == u32::MAX {
+                    return Poll::Ready(Err(BootError::Unavailable));
+                }
+                if control & 1 != 0 {
+                    return Poll::Pending;
+                }
+                fence(Ordering::Acquire);
+                self.mmio.write32(DMA_CTRL, 0x02000000);
+                self.huc_dma_done = true;
+                self.upload(now)?;
+            }
             BootState::Dma => {
                 let control = self.mmio.read32(DMA_CTRL);
                 if control == u32::MAX {
@@ -1039,6 +1184,20 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
         self.resources.allocator.retire_ggtt()
     }
 
+    pub(crate) fn huc_upload(&self) -> Option<crate::intel_gpu_huc::Upload> {
+        let h = self.resources.huc.as_ref()?;
+        Some(crate::intel_gpu_huc::Upload {
+            rsa: h.backing.ggtt_offset().checked_add(h.upload)?,
+            version: h.version,
+        })
+    }
+
+    /// Only the enclosing Gen12 owner calls this after full engine reset and
+    /// release of every retained media wake ACK, never GuC-only reset.
+    pub(crate) fn huc_full_reset_complete(&mut self) {
+        self.huc_exposed = false;
+    }
+
     fn free(&mut self) {
         if self.released {
             return;
@@ -1050,6 +1209,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
     }
 
     /// # Safety
+    /// For HuC, the proof additionally covers full Gen12 engine reset and
+    /// media-wake ACK retirement; GuC-only Stopped is insufficient.
     /// The GT owner proved every GuC/firmware-DMA agent stopped and invalidated
     /// stale firmware/ADS/log addresses. A timeout or unreadable BAR is no proof.
     pub unsafe fn release_after_gt_reset(mut self) {
@@ -1059,7 +1220,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
 
 impl<M: MmioWindow, A: BootAllocator> Drop for GuCBoot<M, A> {
     fn drop(&mut self) {
-        if matches!(self.state, BootState::Staged | BootState::Stopped) {
+        if !self.huc_exposed && matches!(self.state, BootState::Staged | BootState::Stopped) {
             self.free();
         }
     }

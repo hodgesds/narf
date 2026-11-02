@@ -42,6 +42,9 @@
 //!   announce, but skip modeset (their display engines are
 //!   #1016's lane).
 
+#[path = "intel_gpu_external_stop.rs"]
+pub(crate) mod external_stop;
+
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use narf_driver_runtime::{
@@ -1428,10 +1431,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // attached at boot. The session connect path re-checks the
     // generation's display support itself.
     with_controller(|gpu| {
-        let window = DpBarWindow(
-            &gpu.gtt_mmadr,
-            crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip),
-        );
+        let window = gpu.mode_window();
         enable_external_hpd(&window, gpu.chip.generation);
     });
     poll_dp_hpd_events();
@@ -1478,6 +1478,9 @@ pub(crate) fn relight_display_locked(
 ) -> Option<ActiveScanout> {
     let display = with_display_info(|display| *display)?;
     if !display.chip.generation.display_supported() {
+        return None;
+    }
+    if !external_routes_stopped(&display.gtt_mmadr) {
         return None;
     }
     let aux_backlight = crate::intel_dpcd_bl::installed(&display.gtt_mmadr);
@@ -1588,13 +1591,13 @@ pub fn register_pci_driver() {
 
 /// Told when the active Intel scanout appears or goes away.
 pub type ScanoutObserver = fn(Option<narf_graphics_driver::generic::GenericFb>);
-static ACTIVE_GENERIC: IrqSafeSpinLock<Option<narf_graphics_driver::generic::GenericFb>> =
-    IrqSafeSpinLock::new(None);
+static ACTIVE_GENERIC: IrqSafeSpinLock<(u64, Option<narf_graphics_driver::generic::GenericFb>)> =
+    IrqSafeSpinLock::new((0, None));
 static SCANOUT_OBSERVER: IrqSafeSpinLock<Option<ScanoutObserver>> = IrqSafeSpinLock::new(None);
 
 /// The Intel scanout currently published to the fb console.
 pub fn active_scanout_generic() -> Option<narf_graphics_driver::generic::GenericFb> {
-    *ACTIVE_GENERIC.lock()
+    ACTIVE_GENERIC.lock().1
 }
 
 /// Install the fb-console observer. Called once during
@@ -1602,7 +1605,7 @@ pub fn active_scanout_generic() -> Option<narf_graphics_driver::generic::Generic
 /// immediately so the edge cannot be missed.
 pub fn register_scanout_observer(observer: ScanoutObserver) {
     *SCANOUT_OBSERVER.lock() = Some(observer);
-    let current = *ACTIVE_GENERIC.lock();
+    let current = ACTIVE_GENERIC.lock().1;
     if current.is_some() {
         observer(current);
     }
@@ -1612,7 +1615,10 @@ pub fn register_scanout_observer(observer: ScanoutObserver) {
 /// before the observer runs, so an observer that reads
 /// `active_scanout_generic` cannot deadlock against this.
 fn publish_scanout(scanout: Option<narf_graphics_driver::generic::GenericFb>) {
-    *ACTIVE_GENERIC.lock() = scanout;
+    publish_scanout_owned(scanout, 0);
+}
+fn publish_scanout_owned(scanout: Option<narf_graphics_driver::generic::GenericFb>, serial: u64) {
+    *ACTIVE_GENERIC.lock() = (serial, scanout);
     let observer = *SCANOUT_OBSERVER.lock();
     if let Some(observer) = observer {
         observer(scanout);
@@ -1646,6 +1652,12 @@ pub(crate) struct DisplayInfo {
     cap: Cap<BusDeviceCap, Write>,
 }
 
+impl DisplayInfo {
+    fn mode_window(&self) -> ModeWindow {
+        ModeWindow::new(self.gtt_mmadr, self.device, self.cap)
+    }
+}
+
 /// Current PCI authority and D0 checked window for owned modesets. Slow
 /// register programming never holds CONTROLLER or uses a prior grant alone.
 #[derive(Debug)]
@@ -1676,6 +1688,17 @@ impl crate::intel_gpu_aux::MmioWindow for ModeWindow {
             Some(crate::intel_gpu_gt::GtPlatform::Gen12(family)) => Some(family),
             _ => None,
         }
+    }
+    fn gen12_hpd_profile(&self) -> Option<crate::intel_gpu_dp::HpdProfile> {
+        use narf_bus::BusAddr;
+        let BusAddr::Pcie(gpu) = self.device.addr else {
+            return None;
+        };
+        let family = crate::intel_gpu_aux::MmioWindow::gen12_display_family(self)?;
+        crate::intel_gpu_dp::HpdProfile::from_observed(family, gpu.segment, &narf_bus::devices())
+    }
+    fn display_access_ok(&self) -> bool {
+        self.powered()
     }
     fn read32(&self, reg: u64) -> u32 {
         if self.powered() {
@@ -1708,8 +1731,8 @@ pub(crate) fn with_display_info<R>(f: impl FnOnce(&DisplayInfo) -> R) -> Option<
 // this glue owns the parts that need the probed controller —
 // the BAR window, the scanout allocation (same allocator and
 // lifetime as probe's own scanout: the GTT allocator has no
-// free path, so a session allocation is retained and reused
-// across reconnects while it fits), and scanout publication
+// free path, so the bounded route/allocation remains retained
+// after stop or partial loss), and serial-specific scanout publication
 // through the same ACTIVE + observer protocol as the takeover
 // path. Since #1017 a session claims its pipe from
 // `intel_gpu_multipipe` and allocates in that pipe's GGTT
@@ -1717,37 +1740,9 @@ pub(crate) fn with_display_info<R>(f: impl FnOnce(&DisplayInfo) -> R) -> Option<
 // concurrently; the fb-console publication slot is still
 // single, so the last HPD event wins it.
 
-/// `MmioWindow` over the controller's BAR0 mapping (same
-/// adapter shape as the DP Alt-Mode bridge).
-struct DpBarWindow<'a>(&'a MmioRegion, Option<crate::intel_gpu_gt::Gen12Platform>);
-
-impl crate::intel_gpu_aux::MmioWindow for DpBarWindow<'_> {
-    fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
-        self.1
-    }
-    fn read32(&self, off: u64) -> u32 {
-        // SAFETY: BAR0 is mapped for the lifetime of `IntelGpu`;
-        // `off` is a display register offset from the DP
-        // session code, and a 32-bit register read has no
-        // unwanted side effect.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { self.0.read32(off) }
-    }
-    fn write32(&self, off: u64, val: u32) {
-        // SAFETY: same BAR ownership as `read32`; `off` is a
-        // programmable display register.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { self.0.write32(off, val) }
-    }
-}
-
-/// Live external-DP session state: the connection, the
-/// framebuffer it scans out, and its retained allocation.
-struct DpSessionState {
-    conn: crate::intel_gpu_dp::DpConnection,
-    fb: crate::intel_gpu_modeset::Framebuffer,
-    alloc: ScanoutAllocation,
-}
+/// Retained route/allocation; failed stop never drops or replaces its graph.
+type DpSessionState = external_stop::Session<ScanoutAllocation>;
+static NEXT_DP_SESSION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 static DP_SESSION: IrqSafeSpinLock<Option<DpSessionState>> = IrqSafeSpinLock::new(None);
 
@@ -1756,6 +1751,7 @@ static DP_SESSION: IrqSafeSpinLock<Option<DpSessionState>> = IrqSafeSpinLock::ne
 /// DP or HDMI at a time — whichever probe answers owns the
 /// DDI's session slot.
 struct HdmiSessionState {
+    bar: u64,
     conn: crate::intel_gpu_hdmi::HdmiConnection,
     fb: crate::intel_gpu_modeset::Framebuffer,
     alloc: ScanoutAllocation,
@@ -1779,10 +1775,7 @@ pub fn poll_dp_hpd_events() {
     };
     loop {
         let event = with_display_info(|gpu| {
-            let window = DpBarWindow(
-                &gpu.gtt_mmadr,
-                crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip),
-            );
+            let window = gpu.mode_window();
             poll_external_hpd(&window, gpu.chip.generation)
         });
         match event {
@@ -1820,6 +1813,9 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
     use crate::intel_gpu_dp::HpdEvent;
     match event {
         HpdEvent::Connected(ddi) => {
+            if DP_SESSION.lock().is_some() {
+                return;
+            }
             // An MST branch device (hub / dock / daisy-chain
             // monitor) gets the MST session (#1017): if the
             // device advertises MST and a stream comes up, the
@@ -1857,16 +1853,19 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
                 // actually scans out).
                 let stored = {
                     let session = DP_SESSION.lock();
-                    session.as_ref().map(|s| (s.alloc, s.fb))
+                    session.as_ref().map(|s| (s.alloc, s.fb, s.serial))
                 };
-                if let Some((alloc, fb)) = stored {
-                    publish_scanout(Some(narf_graphics_driver::generic::GenericFb::new(
-                        alloc.phys_base,
-                        conn.mode.h_active as u32,
-                        conn.mode.v_active as u32,
-                        fb.stride_bytes,
-                        32,
-                    )));
+                if let Some((alloc, fb, serial)) = stored {
+                    publish_scanout_owned(
+                        Some(narf_graphics_driver::generic::GenericFb::new(
+                            alloc.phys_base,
+                            conn.mode.h_active as u32,
+                            conn.mode.v_active as u32,
+                            fb.stride_bytes,
+                            32,
+                        )),
+                        serial,
+                    );
                 }
             } else if let Some(conn) = hdmi_connect(ddi) {
                 // The DP probe did not answer; the HDMI one
@@ -1894,41 +1893,22 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
                 }
                 return;
             }
-            let session = DP_SESSION.lock().take();
-            if let Some(state) = session {
-                if state.conn.ddi == ddi {
-                    let stopped = with_display_info(|gpu| {
-                        let window = DpBarWindow(
-                            &gpu.gtt_mmadr,
-                            crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip),
-                        );
-                        if !crate::intel_gpu_dp::disconnect(&window, &state.conn) {
-                            return false;
-                        }
-                        // Hand the pipe back and re-split the
-                        // DBUF pool across the survivors.
-                        crate::intel_gpu_multipipe::release_pipe(state.conn.pipe, ddi);
-                        crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
-                        true
-                    })
-                    .unwrap_or(false);
-                    if stopped {
-                        publish_scanout(None);
-                    } else {
-                        *DP_SESSION.lock() = Some(state);
-                    }
-                    return;
+            let owns = DP_SESSION
+                .lock()
+                .as_ref()
+                .is_some_and(|state| state.conn.ddi == ddi);
+            if owns {
+                let bar = with_display_info(|gpu| gpu.gtt_mmadr);
+                if let Some(bar) = bar {
+                    let _ = step_external_sst_inner(&bar, true);
                 }
-                *DP_SESSION.lock() = Some(state);
+                return;
             }
             let session = HDMI_SESSION.lock().take();
             if let Some(state) = session {
                 if state.conn.ddi == ddi {
                     let stopped = with_display_info(|gpu| {
-                        let window = DpBarWindow(
-                            &gpu.gtt_mmadr,
-                            crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip),
-                        );
+                        let window = gpu.mode_window();
                         crate::intel_gpu_hdmi::disconnect(&window, &state.conn)
                     })
                     .unwrap_or(false);
@@ -1949,43 +1929,10 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
                 // channel. Drain them (they're also how a sink
                 // disappearing mid-session first surfaces).
                 mst_poll_notifications(ddi);
-                return;
             }
-            // Snapshot under the session lock, retrain against
-            // the controller, then store back — never hold
-            // DP_SESSION across `with_controller` (the connect
-            // path takes the locks in the opposite order).
-            let current = {
-                let session = DP_SESSION.lock();
-                session
-                    .as_ref()
-                    .filter(|state| state.conn.ddi == ddi)
-                    .map(|state| (state.conn.clone(), state.fb))
-            };
-            if let Some((conn, fb)) = current {
-                let updated = with_display_info(|gpu| {
-                    let window = DpBarWindow(
-                        &gpu.gtt_mmadr,
-                        crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip),
-                    );
-                    let out = crate::intel_gpu_dp::retrain(&window, &conn, &fb).ok();
-                    if out.is_some() {
-                        // The retrained modeset wrote the
-                        // single-pipe watermark shape; restore
-                        // the multi-pipe DBUF split.
-                        crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
-                    }
-                    out
-                });
-                if let Some(Some(new_conn)) = updated {
-                    let mut session = DP_SESSION.lock();
-                    if let Some(state) = session.as_mut() {
-                        if state.conn.ddi == ddi {
-                            state.conn = new_conn;
-                        }
-                    }
-                }
-            }
+            // A retrain may change timing/resources. Preserve the already-owned
+            // graph; the bounded next17 owner only retires an explicit loss.
+            // Fresh retrain/activation remains a separate resource transaction.
         }
     }
 }
@@ -1993,20 +1940,28 @@ fn handle_dp_hpd_event(event: crate::intel_gpu_dp::HpdEvent) {
 /// Run one external-DP connect against the probed controller:
 /// probe the sink over AUX, claim a pipe, allocate its scanout
 /// in the pipe's GGTT window, activate on that pipe. On
-/// success the session state is stored for disconnect /
-/// retrain handling. The claim is re-entrant per DDI, so a
-/// repeat connect event for a live session reuses its pipe.
+/// success or partial activation the complete route/allocation is retained.
+/// A second activation cannot replace a live, stopped or quarantined graph.
+/// Native pipe/surface witnesses precede scanout publication.
 fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpConnection> {
+    if DP_SESSION.lock().is_some() {
+        return None;
+    }
+    let serial = NEXT_DP_SESSION
+        .fetch_update(
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+            |n| n.checked_add(1),
+        )
+        .ok()?;
     with_display_info(|gpu| {
         if !gpu.chip.generation.external_display_supported()
             || crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip).is_none()
         {
             return None;
         }
-        let window = DpBarWindow(
-            &gpu.gtt_mmadr,
-            crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip),
-        );
+        let family = crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip)?;
+        let window = gpu.mode_window();
         let probe = crate::intel_gpu_dp::probe_sink(&window, ddi).ok()?;
         let pipe =
             crate::intel_gpu_multipipe::claim_pipe_for(crate::intel_gpu_multipipe::PipeOwner {
@@ -2050,20 +2005,45 @@ fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpC
             stride_bytes,
             format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
         };
-        let conn = match crate::intel_gpu_dp::activate_on_pipe(&window, &probe, &fb, pipe, share) {
-            Ok(conn) => conn,
-            Err(_) => {
-                crate::intel_gpu_multipipe::release_pipe(pipe, ddi);
-                return None;
-            }
+        let activated = crate::intel_gpu_dp::activate_on_pipe(&window, &probe, &fb, pipe, share);
+        let (conn, success) = match activated {
+            Ok(conn) => (conn, true),
+            Err(_) => (
+                crate::intel_gpu_dp::DpConnection {
+                    family,
+                    ddi,
+                    pipe,
+                    mode: probe.mode,
+                    trained: crate::dp_link_training::TrainedLink {
+                        rate: probe.negotiated.rate,
+                        lanes: probe.negotiated.lanes,
+                        vswing_pe: Default::default(),
+                    },
+                    caps: probe.caps,
+                    audio_published: false,
+                },
+                false,
+            ),
         };
-        crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
-        *DP_SESSION.lock() = Some(DpSessionState {
-            conn: conn.clone(),
+        // Once allocation/programming may have happened, failure retains the
+        // exact claimed route and BO. Never release based on best-effort rollback.
+        if success {
+            crate::intel_gpu_multipipe::reprogram_active_dbuf_shares(&window);
+        }
+        let mut state = DpSessionState::adopt(
+            &window,
+            conn.clone(),
             fb,
             alloc,
-        });
-        Some(conn)
+            serial,
+            gpu.gtt_mmadr.phys.raw(),
+        );
+        if !success {
+            state.quarantine();
+        }
+        let qualified = state.live();
+        *DP_SESSION.lock() = Some(state);
+        qualified.then_some(conn)
     })
     .flatten()
 }
@@ -2074,16 +2054,16 @@ fn dp_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_dp::DpC
 /// The HPD handler tries this only after the DP probe did
 /// not answer — an HDMI sink never answers AUX.
 fn hdmi_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_hdmi::HdmiConnection> {
+    if DP_SESSION.lock().is_some() {
+        return None;
+    }
     with_display_info(|gpu| {
         if !gpu.chip.generation.external_display_supported()
             || crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip).is_none()
         {
             return None;
         }
-        let window = DpBarWindow(
-            &gpu.gtt_mmadr,
-            crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip),
-        );
+        let window = gpu.mode_window();
         let probe = crate::intel_gpu_hdmi::probe_sink(&window, ddi).ok()?;
         let width = probe.mode.h_active as u32;
         let height = probe.mode.v_active as u32;
@@ -2104,6 +2084,7 @@ fn hdmi_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_hdmi:
         };
         let conn = crate::intel_gpu_hdmi::activate(&window, &probe, &fb).ok()?;
         *HDMI_SESSION.lock() = Some(HdmiSessionState {
+            bar: gpu.gtt_mmadr.phys.raw(),
             conn: conn.clone(),
             fb,
             alloc,
@@ -2111,6 +2092,207 @@ fn hdmi_connect(ddi: crate::intel_gpu_ddi::Ddi) -> Option<crate::intel_gpu_hdmi:
         Some(conn)
     })
     .flatten()
+}
+
+/// One current-authority bounded local step. No wait or GT mutex is held.
+fn step_external_sst_inner(bar: &MmioRegion, stop: bool) -> Result<bool, narf_filesystem::FsError> {
+    use crate::intel_gpu_aux::MmioWindow;
+    use narf_filesystem::FsError;
+    if DP_SESSION
+        .lock()
+        .as_ref()
+        .is_none_or(|state| state.bar != bar.phys.raw())
+    {
+        return Ok(true);
+    }
+    let Some(info) = with_display_info(|gpu| *gpu).filter(|gpu| gpu.gtt_mmadr.phys == bar.phys)
+    else {
+        return Err(FsError::NoDevice);
+    };
+    let io = info.mode_window();
+    let sink = {
+        let mut slot = DP_SESSION.lock();
+        if let Some(state) = slot.as_mut().filter(|state| stop && state.running()) {
+            if crate::intel_gpu_multipipe::pipe_owner(state.conn.pipe)
+                != Some(crate::intel_gpu_multipipe::PipeOwner {
+                    ddi: state.conn.ddi,
+                    used_for: crate::intel_gpu_multipipe::PipeUse::ExternalSst,
+                })
+            {
+                state.quarantine();
+                return Err(FsError::NoDevice);
+            }
+            state.preflight(&io)?;
+            state.request_stop();
+            Some((state.serial, state.conn.ddi, state.conn.caps.dpcd_rev))
+        } else {
+            None
+        }
+    };
+    if let Some((_serial, ddi, revision)) = sink {
+        if revision >= 0x11 {
+            use crate::dp_aux::AuxChannel;
+            let mut aux = crate::intel_gpu_aux::IntelAux::new(&io, ddi);
+            // An unplugged sink may NACK. Local fetch/port witnesses remain
+            // mandatory; no wait or caller cancellation releases the graph.
+            let _ = aux.dpcd_write(0x600, &[2]);
+        }
+    }
+    let mut slot = DP_SESSION.lock();
+    let Some(state) = slot.as_mut().filter(|state| state.bar == bar.phys.raw()) else {
+        return Ok(true);
+    };
+    if !io.display_access_ok() {
+        state.quarantine();
+        return Err(FsError::NoDevice);
+    }
+    if stop {
+        state.request_stop();
+    }
+    if !state.stopped() {
+        if crate::intel_gpu_multipipe::pipe_owner(state.conn.pipe)
+            != Some(crate::intel_gpu_multipipe::PipeOwner {
+                ddi: state.conn.ddi,
+                used_for: crate::intel_gpu_multipipe::PipeUse::ExternalSst,
+            })
+        {
+            state.quarantine();
+            return Err(FsError::NoDevice);
+        }
+        if !state.running() && state.conn.audio_published {
+            crate::intel_gpu_audio::audio_codec_disable(&io, state.conn.pipe.transcoder());
+            narf_drivers_sound::display_audio::clear_display_audio(
+                crate::intel_gpu_dp::sink_id_for(state.conn.ddi),
+            );
+            state.conn.audio_published = false;
+        }
+    }
+    let was_live = state.live();
+    let done = state.step(&io, narf_time::monotonic_ns())?;
+    let serial = state.serial;
+    let publish = (!was_live && state.live()).then(|| {
+        narf_graphics_driver::generic::GenericFb::new(
+            state.alloc.phys_base,
+            u32::from(state.conn.mode.h_active),
+            u32::from(state.conn.mode.v_active),
+            state.fb.stride_bytes,
+            32,
+        )
+    });
+    drop(slot);
+    if let Some(fb) = publish {
+        publish_scanout_owned(Some(fb), serial);
+    }
+    if done {
+        let withdrew = {
+            let mut active = ACTIVE_GENERIC.lock();
+            external_stop::withdraw(&mut active, serial)
+        };
+        if withdrew {
+            let observer = *SCANOUT_OBSERVER.lock();
+            if let Some(observer) = observer {
+                observer(None);
+            }
+        }
+    }
+    Ok(done)
+}
+fn step_external_sst(bar: &MmioRegion, stop: bool) -> Result<bool, narf_filesystem::FsError> {
+    // Preserve idle/older-platform recovery: an absent external owner must
+    // not set KMS.blocked when Device::recover legitimately has no work.
+    if external_routes_stopped(bar) {
+        return Ok(true);
+    }
+    let display = crate::intel_gpu_kms::display_for_bar(bar);
+    let _guard = match display.as_ref() {
+        Some(display) => Some(display.legacy_drain()?),
+        None => None,
+    };
+    // Existing HDMI/MST owners have no incremental, cancellable idle proof.
+    if unsupported_external_for_bar(bar) {
+        return Err(narf_filesystem::FsError::Busy);
+    }
+    step_external_sst_inner(bar, stop)
+}
+/// Existing runtime actor calls this outside the GT mutex. No executor bridge.
+pub(crate) fn service_external_sst(bar: &MmioRegion) {
+    let active = DP_SESSION
+        .lock()
+        .as_ref()
+        .is_some_and(|state| state.bar == bar.phys.raw() && !state.stopped());
+    if !active {
+        return;
+    }
+    let display = crate::intel_gpu_kms::display_for_bar(bar);
+    let _guard = match display.as_ref() {
+        Some(display) => match display.legacy_drain() {
+            Ok(g) => Some(g),
+            Err(_) => return,
+        },
+        None => None,
+    };
+    let event = with_display_info(|gpu| {
+        let io = gpu.mode_window();
+        poll_external_hpd(&io, gpu.chip.generation)
+    })
+    .flatten();
+    let stop = DP_SESSION.lock().as_ref().is_some_and(|state| {
+        event == Some(crate::intel_gpu_dp::HpdEvent::Disconnected(state.conn.ddi))
+    });
+    if crate::intel_gpu_dp::hpd_uncertain() {
+        if let Some(state) = DP_SESSION.lock().as_mut() {
+            state.quarantine();
+        }
+    }
+    let _ = step_external_sst_inner(bar, stop);
+}
+/// No stop is inferred for unsupported HDMI/MST. Stopped SST leases remain
+/// permanently reserved; this is an admission fact, never permission to reuse.
+fn unsupported_external_for_bar(bar: &MmioRegion) -> bool {
+    HDMI_SESSION
+        .lock()
+        .as_ref()
+        .is_some_and(|state| state.bar == bar.phys.raw())
+        || MST_SESSION
+            .lock()
+            .as_ref()
+            .is_some_and(|state| state.bar == bar.phys.raw())
+}
+pub(crate) fn external_routes_stopped(bar: &MmioRegion) -> bool {
+    !unsupported_external_for_bar(bar)
+        && DP_SESSION
+            .lock()
+            .as_ref()
+            .is_none_or(|state| state.bar != bar.phys.raw() || state.stopped())
+}
+/// Caller holds the same display legacy guard used by physical device PM.
+/// Never waits for another executor task or opens admission after Busy.
+pub(crate) fn stop_external_sst_locked(bar: &MmioRegion) -> Result<(), narf_filesystem::FsError> {
+    if unsupported_external_for_bar(bar) {
+        return Err(narf_filesystem::FsError::Busy);
+    }
+    if step_external_sst_inner(bar, true)? {
+        Ok(())
+    } else {
+        Err(narf_filesystem::FsError::Busy)
+    }
+}
+/// Explicit PM/reset drain. Dropping the future leaves the same retained phase.
+pub(crate) async fn retire_external_sst(bar: &MmioRegion) -> Result<(), narf_filesystem::FsError> {
+    let lock_deadline = narf_time::monotonic_ns().saturating_add(50_000_000);
+    loop {
+        match step_external_sst(bar, true) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(narf_filesystem::FsError::Busy) => {
+                if narf_time::monotonic_ns() >= lock_deadline {
+                    return Err(narf_filesystem::FsError::Busy);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+        narf_time::SleepUntil::new(narf_time::Deadline::after_us(250).as_instant()).await;
+    }
 }
 
 // ── DP MST session (lane Q11, #1017) ─────────────────────────
@@ -2134,6 +2316,7 @@ struct MstStreamGlue {
 
 /// Live MST session state for one DDI.
 struct MstSessionState {
+    bar: u64,
     link: crate::intel_gpu_mst::MstLink,
     streams: alloc::vec::Vec<MstStreamGlue>,
 }
@@ -2158,10 +2341,7 @@ fn mst_connect(ddi: crate::intel_gpu_ddi::Ddi) -> bool {
         {
             return None;
         }
-        let window = DpBarWindow(
-            &gpu.gtt_mmadr,
-            crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip),
-        );
+        let window = gpu.mode_window();
         // Capability gate: DP 1.2+ and MSTM_CAP set. Anything
         // less is an SST device and not this path's business.
         let mut aux = crate::intel_gpu_aux::IntelAux::new(&window, ddi);
@@ -2256,7 +2436,11 @@ fn mst_connect(ddi: crate::intel_gpu_ddi::Ddi) -> bool {
             let _ = link.disconnect(&window, &mut maux);
             return None;
         }
-        Some(MstSessionState { link, streams })
+        Some(MstSessionState {
+            bar: gpu.gtt_mmadr.phys.raw(),
+            link,
+            streams,
+        })
     })
     .flatten();
     match state {
@@ -2283,11 +2467,8 @@ fn mst_disconnect(ddi: crate::intel_gpu_ddi::Ddi) -> bool {
         return false;
     };
     let stopped = with_display_info(|gpu| {
-        let window = DpBarWindow(
-            &gpu.gtt_mmadr,
-            crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip),
-        );
-        if window.1 != state.link.family() {
+        let window = gpu.mode_window();
+        if crate::intel_gpu_aux::MmioWindow::gen12_display_family(&window) != state.link.family() {
             return false;
         }
         let mut maux = crate::intel_gpu_mst::IntelMstAux::new(&window, ddi);
@@ -2329,11 +2510,8 @@ fn mst_poll_notifications(ddi: crate::intel_gpu_ddi::Ddi) {
     };
     let Some(mut state) = state else { return };
     with_display_info(|gpu| {
-        let window = DpBarWindow(
-            &gpu.gtt_mmadr,
-            crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip),
-        );
-        if window.1 != state.link.family() {
+        let window = gpu.mode_window();
+        if crate::intel_gpu_aux::MmioWindow::gen12_display_family(&window) != state.link.family() {
             return;
         }
         let mut maux = crate::intel_gpu_mst::IntelMstAux::new(&window, ddi);

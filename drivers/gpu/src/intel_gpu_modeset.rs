@@ -288,6 +288,8 @@ pub enum ModesetError {
     ColorPipelineUnavailable,
     /// A fixed display resource request or pipe-off repartition failed.
     DisplayResourceUnavailable,
+    /// Local pipe/transcoder/DDI stop was not observed; retain all leases.
+    PipelineStopUnavailable,
 }
 
 /// A negotiated link configuration handed to
@@ -536,6 +538,26 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// modeset.
     pub fn teardown(&mut self) {
         self.disable_pipeline();
+    }
+    /// Fallible migration for retained legacy sessions. Success is a local
+    /// stop proof, never inferred from a write or a GT-reset completion.
+    pub fn try_teardown(&mut self) -> Result<(), ModesetError> {
+        self.check_stop_source()?;
+        self.try_disable_pipe_pipeline()?;
+        self.try_disable_ddi_buffer()
+    }
+    pub fn try_teardown_stream(&mut self) -> Result<(), ModesetError> {
+        self.check_stop_source()?;
+        self.try_disable_pipe_pipeline()
+    }
+    fn check_stop_source(&self) -> Result<(), ModesetError> {
+        if self.gen12_family.is_none() || self.gen12_family != self.mmio.gen12_display_family() {
+            return Err(ModesetError::UnsupportedGeneration);
+        }
+        if !self.mmio.display_access_ok() {
+            return Err(ModesetError::PipelineStopUnavailable);
+        }
+        Ok(())
     }
 
     /// Run the modeset for an HDMI sink (#1019). The HDMI
@@ -954,6 +976,9 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// so an MST stream can be torn down without disturbing the
     /// other streams on its link (#1017).
     fn disable_pipe_pipeline(&mut self) {
+        let _ = self.try_disable_pipe_pipeline();
+    }
+    fn try_disable_pipe_pipeline(&mut self) -> Result<(), ModesetError> {
         use crate::intel_gpu_pipes::{
             PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE, PLANE_CTL_ENABLE, PLANE_CTL_OFFSET,
             PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET,
@@ -962,19 +987,27 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         //    so the next vblank latches "no plane".
         let plane_base = self.pipe.base() + PLANE_PRIMARY_OFFSET;
         let ctl = self.mmio.read32(plane_base + PLANE_CTL_OFFSET);
+        let surf = self.mmio.read32(plane_base + PLANE_SURF_OFFSET);
+        if ctl == u32::MAX || surf == u32::MAX || !self.mmio.display_access_ok() {
+            return Err(ModesetError::PipelineStopUnavailable);
+        }
         self.mmio
             .write32(plane_base + PLANE_CTL_OFFSET, ctl & !PLANE_CTL_ENABLE);
         // Re-write SURF to trigger the latch.
-        let surf = self.mmio.read32(plane_base + PLANE_SURF_OFFSET);
         self.mmio.write32(plane_base + PLANE_SURF_OFFSET, surf);
         compiler_fence(Ordering::SeqCst);
 
         // 2) Pipe: clear ENABLE, wait for state-inactive.
         let pipe_off = self.pipe.base() + PIPECONF_OFFSET;
         let pconf = self.mmio.read32(pipe_off);
+        if pconf == u32::MAX || !self.mmio.display_access_ok() {
+            return Err(ModesetError::PipelineStopUnavailable);
+        }
         self.mmio.write32(pipe_off, pconf & !PIPECONF_ENABLE);
         compiler_fence(Ordering::SeqCst);
-        let _ = wait_bit(self.mmio, pipe_off, PIPECONF_STATE, false, 100_000_000);
+        if !wait_bit(self.mmio, pipe_off, PIPECONF_STATE, false, 100_000_000) {
+            return Err(ModesetError::PipelineStopUnavailable);
+        }
 
         // 3) Transcoder: same pattern as pipe. On Gen12 the
         //    transcoder CONF register is aliased into the pipe
@@ -983,22 +1016,49 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         //    bit are idempotent.
         let trans_off = self.transcoder().conf_base() + PIPECONF_OFFSET;
         let tconf = self.mmio.read32(trans_off);
+        if tconf == u32::MAX || !self.mmio.display_access_ok() {
+            return Err(ModesetError::PipelineStopUnavailable);
+        }
         self.mmio.write32(trans_off, tconf & !PIPECONF_ENABLE);
         compiler_fence(Ordering::SeqCst);
-        let _ = wait_bit(self.mmio, trans_off, PIPECONF_STATE, false, 100_000_000);
+        if !wait_bit(self.mmio, trans_off, PIPECONF_STATE, false, 100_000_000) {
+            return Err(ModesetError::PipelineStopUnavailable);
+        }
+        if self.mmio.read32(plane_base + PLANE_CTL_OFFSET) & PLANE_CTL_ENABLE != 0 {
+            return Err(ModesetError::PipelineStopUnavailable);
+        }
+        Ok(())
     }
 
     /// Step 4 of the disable: this run's DDI buffer off, polling
     /// IDLE_STATUS asserting.
     fn disable_ddi_buffer(&mut self) {
+        let _ = self.try_disable_ddi_buffer();
+    }
+    fn try_disable_ddi_buffer(&mut self) -> Result<(), ModesetError> {
         use crate::intel_gpu_ddi::{
             DDI_BUF_CTL_ENABLE, DDI_BUF_CTL_IDLE_STATUS, DDI_BUF_CTL_OFFSET,
         };
         let ddi_off = self.ddi.base() + DDI_BUF_CTL_OFFSET;
         let dconf = self.mmio.read32(ddi_off);
+        if dconf == u32::MAX || !self.mmio.display_access_ok() {
+            return Err(ModesetError::PipelineStopUnavailable);
+        }
         self.mmio.write32(ddi_off, dconf & !DDI_BUF_CTL_ENABLE);
         compiler_fence(Ordering::SeqCst);
-        let _ = wait_bit(self.mmio, ddi_off, DDI_BUF_CTL_IDLE_STATUS, true, 1_000_000);
+        if !wait_bit(
+            self.mmio,
+            ddi_off,
+            DDI_BUF_CTL_IDLE_STATUS,
+            true,
+            10_000_000,
+        ) {
+            return Err(ModesetError::PipelineStopUnavailable);
+        }
+        if self.mmio.read32(ddi_off) & DDI_BUF_CTL_ENABLE != 0 {
+            return Err(ModesetError::PipelineStopUnavailable);
+        }
+        Ok(())
     }
 
     // ── DPLL ─────────────────────────────────────────────────
@@ -1688,6 +1748,9 @@ fn wait_bit<M: MmioWindow + ?Sized>(
     let start = narf_time::now_cycles();
     loop {
         let v = mmio.read32(off);
+        if v == u32::MAX {
+            return false;
+        }
         let asserted = v & mask != 0;
         if asserted == want_set {
             return true;

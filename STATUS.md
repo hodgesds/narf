@@ -1711,7 +1711,8 @@ The x86 debug relocation reserve grows to 8 MiB for the 6.2 MB table.
 The ledger has 56 implemented checkpoint rows and ten broad open workstreams.
 Release native, production boot/btrfs and cross-target gates remain pending
 for the combined follow-on branch; merge readiness is not claimed. Graphical
-LNL/PTL takeover, separate media GTs/HuC, full display resource transactions,
+LNL/PTL takeover, separate media GTs, HuC outside the exact TGL opt-in,
+full display resource transactions,
 placement migration and invalidate-aware USERPTR remain separate work.
 
 The following Intel slice implements current-epoch native Xe low-latency
@@ -1728,9 +1729,45 @@ targets; all four host GPU configurations pass all-target Clippy. Both-target
 changed-package debug/release builds, formatting, diff and final source hashes
 pass. aarch64 QEMU is omitted because no aarch64-specific production behavior
 changes. The ledger has 58 implemented checkpoint rows and ten broad open
-workstreams; physical Intel/Mesa acceptance remains unrun. The separate
-external-DP teardown draft has cleared static review; its 21 native fixtures
-and executable validation remain pending.
+workstreams; physical Intel/Mesa acceptance remains unrun. The separately reviewed next7 batch adds retained external-DP teardown,
+per-object i915 ASYNC and exact-TGL HuC; all 37 new fixtures pass in debug,
+with release/cross-target validation pending as described below.
+
+The reviewed v0.34 Intel batch implements retained Gen12 combo-B SST stop
+and observed SDE/SHOT HPD, BMG per-object i915 EXEC_OBJECT_ASYNC and default-off
+exact physical TGL HuC upload/auth/query. All 37 new fixtures (21+8+8) pass in
+the debug native kernel. The branch passes 1,861 selected debug tests: 1,191
+Intel/DRM/fb/backlight and all 670 shared filesystem/graphics/AMD fixtures,
+with no failures or duplicate names, no Intel skips and one existing shared
+RNG-registration skip. All 1,087 prior Intel names, all 105 cumulative new
+names and 31 backlight regressions remain covered. Host Intel all-target
+Clippy, formatting/diff and all 103 source/linker hashes pass. The ledger has
+58 fully validated plus three debug-tested rows (61 total) and ten broad
+open workstreams. Release native, production boot/btrfs and cross-target
+gates are running on the same frozen source; merge readiness is not claimed.
+
+SST stop keeps current per-operation authority, observed PCH policy, fresh HPD
+status, serial publication and retained PM/reset ownership; stopped or
+quarantined resources remain reserved. HDMI/MST drain, reconnect and general
+output/resource transactions remain separate. BMG ASYNC permits only ordinary
+WB softpin/same-card WB imports, keeps mixed implicit and explicit dependencies,
+per-context order, terminal tracking and CPU access exclusion, and refuses
+local/WC/VM-owned/pinned-user storage and other platforms. GETPARAM43 reports
+only live admission. Arbitrary CPU mmap stores remain client ordered.
+
+The HuC opt-in narf.intel.huc=1 acquires the actual canonical firmware before
+WOPCM planning, retains real DMA backing through both boot passes and requires
+SLPC Running, zero-result typed GuC authentication and fresh independent status.
+Xe query7/type1 reports only the running release under the current owner;
+unavailable/reset/lost/unsupported cases return ENODEV. Full Gen12 reset/media
+retirement gates exposed backing reclamation; TGL runtime autosuspend remains
+refused. Newer no-HuC profiles, default-off policies and GuC version ABI remain
+unchanged. I915 GETPARAM42, other HuC profiles, media-GT/GSC/PXP and codecs are
+outside this slice. The new HuC fixtures do not execute positive Firmware::open/
+registry/stage_with_huc acquisition or actual RuntimeOwner/PCI/system-PM
+coordinator callbacks. Their firmware-reset coverage uses full stop and fresh
+GuCGt owners; production PM/acquisition wiring is manually reviewed only.
+No physical Intel/S3, Mesa or codec acceptance is claimed.
 
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI

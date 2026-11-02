@@ -295,6 +295,7 @@ pub(crate) struct GuCScheduler<A: BootAllocator> {
     /// A user job ran under `epoch`; its identity can no longer change.
     user_submitted: bool,
     slpc: Slpc,
+    pub(crate) huc: crate::intel_gpu_huc::Auth,
     engines: EngineSet,
     /// Default CCS state commands, captured with the render seed's fuses.
     disable_wmtp: bool,
@@ -384,6 +385,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             pristine: true,
             user_submitted: false,
             slpc: Slpc::new(),
+            huc: crate::intel_gpu_huc::Auth::new(),
             engines,
             disable_wmtp: false,
             pending_error: None,
@@ -1174,6 +1176,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
             self.event(message, now)?;
         }
         self.progress_slpc(ct, now)?;
+        self.huc
+            .progress(ct, now)
+            .map_err(SchedulingError::Transport)?;
         if let Defaults::Seed(engine, _) = self.defaults {
             if self.resources.seed_image.is_some() {
                 let (id, _) = self.submit(now, engine, None, None)?;
@@ -1563,6 +1568,13 @@ impl<A: BootAllocator> GuCScheduler<A> {
     }
 
     fn event(&mut self, message: GuCMessage, now: u64) -> Result<(), SchedulingError> {
+        if self
+            .huc
+            .event(&message, now)
+            .map_err(SchedulingError::Transport)?
+        {
+            return Ok(());
+        }
         // SLPC uses a disjoint fence namespace and fails independently.
         if self.slpc.event(&message) {
             return Ok(());

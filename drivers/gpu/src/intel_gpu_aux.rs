@@ -163,6 +163,15 @@ pub trait MmioWindow {
     fn gen12_display_family(&self) -> Option<crate::intel_gpu_gt::Gen12Platform> {
         None
     }
+    /// Observed native ISA-bridge identity selects this source HPD bank.
+    /// Family metadata alone never synthesizes a south-display controller.
+    fn gen12_hpd_profile(&self) -> Option<crate::intel_gpu_dp::HpdProfile> {
+        None
+    }
+    /// Current authority for mask registers where all-ones is a valid value.
+    fn display_access_ok(&self) -> bool {
+        true
+    }
     /// Read a 32-bit register at byte offset `off` within the
     /// MMIO window.
     fn read32(&self, off: u64) -> u32;
