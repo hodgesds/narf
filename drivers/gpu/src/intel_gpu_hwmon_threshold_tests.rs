@@ -673,3 +673,6 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_hwmon",
     smoke_hwmon_dg2_interval_readback_loss_close_and_no_replay
 );
+
+#[path = "intel_gpu_hwmon_bmg_limits_tests.rs"]
+mod bmg_limits_tests;

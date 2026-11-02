@@ -1407,8 +1407,14 @@ pub fn enable_psr_for_panel(gpu: &crate::intel_gpu::IntelGpu, mode: &Mode) {
 /// composition), then the PPS backlight gate and power target.
 /// For suspend/remove paths; probe never calls it.
 pub fn panel_power_off(gpu: &crate::intel_gpu::IntelGpu) -> Result<(), PpsError> {
-    if let Some(owner) = narf_drivers_backlight::panel_owner() {
-        owner.set_brightness(0);
+    // AUX disable parks the desired level instead of replacing it with zero;
+    // the post-S3 live-panel path replays the latest retained request. A failed
+    // AUX disable still closes the independent PPS gate before dropping power.
+    let aux_owned = crate::intel_dpcd_bl::suspend_for_bar(&gpu.gtt_mmadr).unwrap_or(true);
+    if !aux_owned {
+        if let Some(owner) = narf_drivers_backlight::panel_owner() {
+            owner.set_brightness(0);
+        }
     }
     let window = BarWindow(&gpu.gtt_mmadr);
     let (delays, active) = {
@@ -1430,6 +1436,119 @@ pub fn panel_power_off(gpu: &crate::intel_gpu::IntelGpu) -> Result<(), PpsError>
     // close it explicitly (with its T9 wait) before power drops.
     pps.backlight_off();
     pps.power_off()
+}
+
+/// A PPS operation must not derive writes from inaccessible register values.
+/// This guard latches any lost read, suppresses all later writes, and makes a
+/// partial sequence return failure rather than publishing a recovered panel.
+struct CheckedPps<'a, M: MmioWindow> {
+    io: &'a M,
+    lost: core::cell::Cell<bool>,
+}
+impl<'a, M: MmioWindow> CheckedPps<'a, M> {
+    fn new(io: &'a M) -> Self {
+        Self {
+            io,
+            lost: core::cell::Cell::new(false),
+        }
+    }
+    fn valid(&self) -> bool {
+        !self.lost.get()
+    }
+}
+impl<M: MmioWindow> MmioWindow for CheckedPps<'_, M> {
+    fn read32(&self, reg: u64) -> u32 {
+        if self.lost.get() {
+            return u32::MAX;
+        }
+        let value = self.io.read32(reg);
+        if value == u32::MAX {
+            self.lost.set(true);
+        }
+        value
+    }
+    fn write32(&self, reg: u64, value: u32) {
+        if !self.lost.get() {
+            self.io.write32(reg, value);
+        }
+    }
+}
+fn aux_panel_delays() -> PanelDelays {
+    EDP_RUNTIME
+        .lock()
+        .delays
+        .unwrap_or(PanelDelays::SPEC_DEFAULTS)
+}
+/// Close/post the source gate before system power may disappear. The caller
+/// stamps this returned T9 duration after readback and waits asynchronously.
+/// Linux b90c984d intel_pps.c::intel_pps_backlight_off closes/posts first,
+/// then stamps last_backlight_off and waits edp_wait_backlight_off.
+pub(crate) fn park_aux_backlight(mmio: &impl MmioWindow) -> Result<u64, PpsError> {
+    let checked = CheckedPps::new(mmio);
+    let control = checked.read32(PP_CONTROL);
+    if !checked.valid() {
+        return Err(PpsError::NotPoweredOn);
+    }
+    checked.write32(PP_CONTROL, control & !EDP_BLC_ENABLE);
+    if checked.read32(PP_CONTROL) & EDP_BLC_ENABLE != 0 || !checked.valid() {
+        return Err(PpsError::NotPoweredOn);
+    }
+    Ok(u64::from(aux_panel_delays().t9) * 100_000)
+}
+/// The qualified AUX owner supplies a current-capability/D0 checked window.
+/// Keep the independent PPS gate closed across fresh video and DPCD restore.
+pub(crate) fn prepare_aux_backlight_relight(mmio: &impl MmioWindow) -> Result<u64, PpsError> {
+    let checked = CheckedPps::new(mmio);
+    let mmio = &checked;
+    if mmio.read32(PP_STATUS) == u32::MAX || mmio.read32(PP_CONTROL) == u32::MAX {
+        return Err(PpsError::NotPoweredOn);
+    }
+    let delays = aux_panel_delays();
+    let mut pps = PanelPowerSequencer::with_delays(mmio, delays);
+    pps.init_registers();
+    if mmio.read32(PP_ON_DELAYS) != delays.pp_on_value()
+        || mmio.read32(PP_OFF_DELAYS) != delays.pp_off_value()
+        || mmio.read32(PP_CONTROL) & PP_POWER_CYCLE_DELAY_MASK
+            != delays.cycle_field() << PP_POWER_CYCLE_DELAY_SHIFT
+        || !checked.valid()
+    {
+        return Err(PpsError::NotPoweredOn);
+    }
+    // No power-down follows this gate close, so T9 is not owed here.
+    pps.pp_control_rmw(EDP_BLC_ENABLE, 0);
+    pps.power_on()?;
+    if mmio.read32(PP_STATUS) & IDLE_ON_MASK != IDLE_ON_VALUE
+        || mmio.read32(PP_CONTROL) & EDP_BLC_ENABLE != 0
+        || !checked.valid()
+    {
+        return Err(PpsError::NotPoweredOn);
+    }
+    // The owner stamps its monotonic deadline only after power-on completes,
+    // then waits asynchronously across the real modeset/DPCD restoration.
+    Ok(u64::from(delays.t8) * 100_000)
+}
+pub(crate) fn finish_aux_backlight_relight(
+    mmio: &impl MmioWindow,
+    deadline: u64,
+    now: u64,
+) -> Result<(), PpsError> {
+    if now < deadline {
+        return Err(PpsError::NotPoweredOn);
+    }
+    let checked = CheckedPps::new(mmio);
+    let mmio = &checked;
+    if mmio.read32(PP_STATUS) & IDLE_ON_MASK != IDLE_ON_VALUE || !checked.valid() {
+        return Err(PpsError::NotPoweredOn);
+    }
+    let mut pps = PanelPowerSequencer::with_delays(mmio, aux_panel_delays());
+    // T8 has already elapsed through the owner's async timer. No block_on or
+    // synchronous delay is permitted in the system-PM executor poll.
+    pps.backlight_on()?;
+    let control = mmio.read32(PP_CONTROL);
+    if !checked.valid() || control & EDP_BLC_ENABLE == 0 {
+        return Err(PpsError::NotPoweredOn);
+    }
+    Ok(())
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

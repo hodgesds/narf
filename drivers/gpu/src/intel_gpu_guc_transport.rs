@@ -259,6 +259,16 @@ impl<M: MmioWindow, A: GpuAllocator> XeLpgTransport<M, A> {
         self.state
     }
 
+    /// Exact retained host-owned CT allocation for a protected crash copy.
+    /// This never lends live memory to a descriptor or trusts firmware sizes.
+    pub(crate) fn diagnostic_backing(&self) -> Option<&A::Backing> {
+        if self.released {
+            None
+        } else {
+            Some(&self.resources.blob)
+        }
+    }
+
     /// The enclosing GT owner holds PCI D0 and engine forcewake while polling
     /// its scheduler. Keep live timestamp reads under that same ownership.
     pub(crate) fn window(&self) -> &M {

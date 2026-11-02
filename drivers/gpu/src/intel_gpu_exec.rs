@@ -114,6 +114,7 @@ impl ExecRequest {
             user_fence: None,
             skip_batch: false,
             implicit_sync: true,
+            parallel: None,
         })
     }
 
@@ -313,6 +314,9 @@ pub struct ResidentBatch {
     user_fence: Option<(u64, u64)>,
     skip_batch: bool,
     implicit_sync: bool,
+    /// Width-two batches share this owned immutable VM graph. Lane zero
+    /// retains the ordinary address; lane one is copied before any wait.
+    parallel: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -465,7 +469,34 @@ impl ResidentBatch {
             user_fence,
             skip_batch: address.is_none(),
             implicit_sync: false,
+            parallel: None,
         })
+    }
+
+    pub(crate) fn from_vm_parallel(
+        platform: GtPlatform,
+        mappings: &[VmMapping],
+        addresses: Option<[u64; 2]>,
+        scratch: bool,
+    ) -> Result<Self, FsError> {
+        if let Some(addresses) = addresses {
+            if addresses[1] & 7 != 0
+                || !mappings.iter().any(|m| {
+                    m.object.is_some()
+                        && addresses[1]
+                            .checked_sub(m.va)
+                            .is_some_and(|delta| delta < m.length)
+                })
+            {
+                return Err(FsError::InvalidData);
+            }
+        }
+        let mut batch = Self::from_vm(platform, mappings, addresses.map(|a| a[0]), scratch, None)?;
+        batch.parallel = Some(addresses.map_or(0, |a| a[1]));
+        Ok(batch)
+    }
+    pub(crate) fn parallel(&self) -> Option<u64> {
+        self.parallel
     }
 
     pub(crate) fn user_fence(&self) -> Option<(u64, u64)> {

@@ -1886,6 +1886,10 @@ pub struct DriDir;
 impl DirOps for DriDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         #[cfg(feature = "intel")]
+        if let Some(file) = crate::intel_gpu_error::coredump::lookup(name) {
+            return Some(file);
+        }
+        #[cfg(feature = "intel")]
         if let Some(file) = crate::intel_gpu_guc_log::lookup(name) {
             return Some(file);
         }
@@ -1950,6 +1954,10 @@ impl DirOps for DriDir {
             if crate::intel_gpu_guc_log::visible(idx) {
                 all.push((format!("guc-log{idx}"), FileType::File));
                 all.push((format!("guc-log-lfd{idx}"), FileType::File));
+            }
+            #[cfg(feature = "intel")]
+            if crate::intel_gpu_error::coredump::visible(idx) {
+                all.push((format!("devcoredump{idx}"), FileType::File));
             }
         }
         all.into_iter().skip(cursor).take(max).collect()

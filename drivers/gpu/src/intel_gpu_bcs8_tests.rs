@@ -315,3 +315,71 @@ kernel_test_in!(
     "drivers/gpu/intel_gpu_guc_log",
     smoke_guc_log_live_owner_snapshot_and_reload_incarnation
 );
+
+fn smoke_coredump_live_gt_capture_stop_and_authority_loss() -> TestResult {
+    use crate::intel_gpu_error::{coredump, Reason};
+    let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
+    prime_copy8(&mut gt, &w);
+    let epoch = gt.user_epoch().unwrap();
+    let report = gt.error_report(
+        Reason::Timeout,
+        epoch,
+        1234,
+        || true,
+        |offset| Some(w.read32(offset)),
+    );
+    let live = arena.live_allocations();
+    gt.capture_coredump(
+        coredump::Armed::reserve_for_test(54).unwrap(),
+        report,
+        1235,
+        [0xa5; 32],
+        || true,
+    );
+    assert_eq!(arena.live_allocations(), live);
+    let dump = coredump::take_for_test(54);
+    assert_eq!(&dump[..8], b"NARFCDMP");
+    assert_eq!(u32::from_le_bytes(dump[72..76].try_into().unwrap()), 7);
+    assert_eq!(u64::from_le_bytes(dump[32..40].try_into().unwrap()), epoch);
+    assert_eq!(u64::from_le_bytes(dump[40..48].try_into().unwrap()), 1234);
+    assert_eq!(u64::from_le_bytes(dump[48..56].try_into().unwrap()), 1235);
+    assert_ne!(u64::from_le_bytes(dump[56..64].try_into().unwrap()), 0);
+    assert_eq!(&dump[80..112], &[0xa5; 32]);
+    // Revocation must short-circuit even the wake-proof register reads.
+    {
+        let _no_mmio = w.0.borrow_mut();
+        gt.capture_coredump(
+            coredump::Armed::reserve_for_test(54).unwrap(),
+            report,
+            1236,
+            [0; 32],
+            || false,
+        );
+    }
+    let denied = coredump::take_for_test(54);
+    assert_eq!(u32::from_le_bytes(denied[72..76].try_into().unwrap()), 1);
+    assert!(denied[4352..].iter().all(|byte| *byte == 0));
+    hardware_stop(&mut gt, &w, 0xdfc);
+    let stopped_allocations = arena.live_allocations();
+    assert!(stopped_allocations > 0 && stopped_allocations < live);
+    // Boot storage remains owned until GT drop; stopped boot and released CT
+    // views must be unavailable without borrowing or accessing their backing.
+    gt.capture_coredump(
+        coredump::Armed::reserve_for_test(54).unwrap(),
+        report,
+        1237,
+        [0; 32],
+        || panic!("stopped owner has no live backing"),
+    );
+    let stopped = coredump::take_for_test(54);
+    assert_eq!(u32::from_le_bytes(stopped[72..76].try_into().unwrap()), 1);
+    assert_eq!(arena.live_allocations(), stopped_allocations);
+    drop(gt);
+    assert_eq!(arena.live_allocations(), 0);
+    assert_eq!(&dump[..8], b"NARFCDMP");
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_error",
+    smoke_coredump_live_gt_capture_stop_and_authority_loss
+);

@@ -449,6 +449,13 @@ pub(crate) async fn quiesce_for_legacy(bar: &narf_bus::MmioRegion) -> Result<(),
     if let Some(display) = display_for_bar(bar) {
         display.quiesce().await?;
     }
+    if let Err(error) = crate::intel_dpcd_bl::suspend_complete_for_bar(bar).await {
+        // A failed system-PM prepare hook is not resumed by the coordinator.
+        // Attempt a fully verified replay while the original video is live;
+        // failed replay keeps the AUX owner parked with its intent retained.
+        let _ = crate::intel_dpcd_bl::resume_for_bar(bar);
+        return Err(error);
+    }
     Ok(())
 }
 

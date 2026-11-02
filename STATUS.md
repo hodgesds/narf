@@ -1535,6 +1535,33 @@ because this wave introduces no aarch64-specific production code. The x86_64
 production boot, both btrfs postflights, formatting, diff and final source-
 integrity checks pass.
 
+The seventh Intel checkpoint adds bounded native Xe width-two COPY/COMPUTE
+groups with protected firmware workqueues, separate persistent lane state,
+per-lane watchdogs and all-lane retirement. MTL/Arrow gains qualified full-AUX
+VESA SDR backlight with live-route/authority checks, retained brightness intent,
+shared AUX exclusion and verified asynchronous T8/T9 suspend/relight. BMG gains
+package PL2 and both PL1/PL2 intervals through the retained paired PCODE owner,
+with independent ceilings, sibling checks and exact source readback. Opt-in
+GuC failure bundles capture immutable first-failure status/log/CT before full
+teardown, with privileged reads, generation-matched clear and bounded retained
+buffers. The bundles remain partial coredumps. Broader parallel, VM/memory,
+media, display, diagnostics, power and platform work remains open; the cursor
+and MERT resource/frequency gates stay intact. Intel silicon/Mesa acceptance
+remains unrun.
+
+This checkpoint adds 30 native fixtures. Selected Intel/DRM/framebuffer and
+backlight groups pass 893 unique x86_64 tests, including 31 shared backlight
+regressions, with zero failures/skips. The queued-gang regression fails under
+the original stall logic and passes with the unfinished-engine progress fix.
+GPU/fb production target CI Clippy passes all three contexts on both
+architectures; all four host GPU configurations pass all-target Clippy;
+GPU/fb debug/release builds pass on both targets. Corrected fixtures also pass
+host lint and native reruns. The x86_64 production boot, both btrfs postflights,
+formatting, diff and final source-integrity checks pass. aarch64 QEMU remains
+omitted under the maintainer's policy for this architecture-neutral wave.
+The ledger records 25 implemented checkpoint rows and ten broad open
+workstreams, rather than a completion percentage.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

@@ -18,6 +18,9 @@ use crate::{
     intel_gpu_guc_gt::GtState,
 };
 
+#[path = "intel_gpu_devcoredump.rs"]
+pub(crate) mod coredump;
+
 pub(crate) const MAX_CONTEXTS: usize = 8;
 pub(crate) const MAX_CARDS: usize = 64;
 pub(crate) const MAX_REPORT_BYTES: usize = 4096;
@@ -282,13 +285,9 @@ fn engine_name(engine: Engine) -> &'static str {
     }
 }
 impl Snapshot {
-    pub(crate) fn text(&self) -> String {
+    fn write_text(&self, out: &mut impl Write) {
         let report = &self.report;
         let capture = report.capture;
-        let mut out = Text {
-            data: String::with_capacity(MAX_REPORT_BYTES),
-            full: false,
-        };
         let _ = writeln!(out, "narf-intel-error-v1\ngeneration={}\nreason={:?}\nepoch={}\nmonotonic_ns={}\nplatform={:?}\ngt_state={:?}\nregister_access={:?}\nsuppressed_errors={}",
             report.generation(), capture.reason, capture.epoch, capture.now_ns, capture.platform,
             capture.state, report.access, self.suppressed);
@@ -333,10 +332,50 @@ impl Snapshot {
                 }
             }
         }
+    }
+    pub(crate) fn text(&self) -> String {
+        let mut out = Text {
+            data: String::with_capacity(MAX_REPORT_BYTES),
+            full: false,
+        };
+        self.write_text(&mut out);
         if out.full {
             out.data.push_str("\noutput_truncated=1\n");
         }
         out.data
+    }
+    /// Allocation-free copy into the crash owner's fixed report region.
+    pub(super) fn text_into(&self, output: &mut [u8]) -> usize {
+        struct Fixed<'a> {
+            output: &'a mut [u8],
+            len: usize,
+            full: bool,
+        }
+        impl Write for Fixed<'_> {
+            fn write_str(&mut self, text: &str) -> fmt::Result {
+                if self.full || self.len + text.len() > self.output.len().saturating_sub(32) {
+                    self.full = true;
+                    return Err(fmt::Error);
+                }
+                self.output[self.len..self.len + text.len()].copy_from_slice(text.as_bytes());
+                self.len += text.len();
+                Ok(())
+            }
+        }
+        let mut out = Fixed {
+            output,
+            len: 0,
+            full: false,
+        };
+        self.write_text(&mut out);
+        if out.full {
+            let marker = b"\noutput_truncated=1\n";
+            if out.len + marker.len() <= out.output.len() {
+                out.output[out.len..out.len + marker.len()].copy_from_slice(marker);
+                out.len += marker.len();
+            }
+        }
+        out.len
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn read(&self, offset: u64, output: &mut [u8]) -> usize {

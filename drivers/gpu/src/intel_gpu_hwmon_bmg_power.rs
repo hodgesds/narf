@@ -1,10 +1,13 @@
-//! BMG package PL1 actor. MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad
+//! BMG package PL1/PL2 and interval actor. MIT Linux
+//! b90c984d615e8ce2af96f5b1411a962d83fed2ad
 //! xe_hwmon.c::{xe_hwmon_pcode_read_power_limit,xe_hwmon_pcode_rmw_power_limit,
-//! xe_hwmon_get_preregistration_info,xe_hwmon_power_max_write},
+//! xe_hwmon_get_preregistration_info,xe_hwmon_power_max_write,
+//! xe_hwmon_power_max_interval_show,xe_hwmon_power_max_interval_store},
 //! xe_pcode_api.h and regs/xe_mchbar_regs.h. Firmware-source discovery is
 //! passive; only an explicit administrative request switches to PCODE limits.
 
 use super::{
+    interval,
     pcode::{Client, Command, Fault, Reply},
     INTERVAL_NS, MAX_AGE_NS,
 };
@@ -21,11 +24,57 @@ const VALUE: u32 = 0x7fff;
 const ENABLE: u32 = 1 << 15;
 const MASK: u32 = VALUE | ENABLE;
 const STEP_UW: u64 = 125_000;
+const TIME_SHIFT: u8 = 10; // xe_hwmon.c TIME_UNIT for mailbox power limits
+
+fn enabled(word: u32) -> bool {
+    word & ENABLE != 0 && word & VALUE != 0
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Setting {
+    Limit(u32),
+    Interval(u32),
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Request {
     id: u64,
-    raw: u32,
+    index: usize,
+    setting: Setting,
+}
+impl Request {
+    fn apply(self, mut pair: [u32; 2], boot: [Option<u32>; 2]) -> Option<[u32; 2]> {
+        let max = boot[self.index]?;
+        if !enabled(pair[self.index]) {
+            return None;
+        }
+        // A paired write must not switch an unqualified/increased sibling
+        // limit into the PCODE source. Only a selected limit reduction may
+        // repair a current value above its retained ceiling.
+        for (index, &word) in pair.iter().enumerate() {
+            if word & ENABLE != 0 && word & VALUE == 0 {
+                return None;
+            }
+            if enabled(word)
+                && !(index == self.index && matches!(self.setting, Setting::Limit(_)))
+                && boot[index].is_none_or(|ceiling| word & VALUE > ceiling)
+            {
+                return None;
+            }
+        }
+        let word = &mut pair[self.index];
+        *word = match self.setting {
+            Setting::Limit(raw) if (1..=max).contains(&raw) => (*word & !MASK) | ENABLE | raw,
+            Setting::Interval(bits)
+                if interval::decode(bits, TIME_SHIFT) != 0
+                    && interval::decode(bits, TIME_SHIFT) <= interval::maximum(TIME_SHIFT) =>
+            {
+                (*word & !interval::MASK) | bits
+            }
+            _ => return None,
+        };
+        Some(pair)
+    }
 }
 #[derive(Clone, Copy, Debug)]
 struct Observation {
@@ -75,8 +124,9 @@ enum Outcome {
 struct State {
     epoch: u64,
     next: u64,
-    // First valid enabled firmware-source PL1, retained across all activations.
-    boot: Option<u32>,
+    // First valid enabled firmware-source PL1/PL2 values, retained across
+    // activations independently. Never adopt our lowered PCODE values.
+    boot: [Option<u32>; 2],
     observed: Option<Observation>,
     last_post: Option<u64>,
     queued: Option<Request>,
@@ -97,7 +147,7 @@ impl Power {
             state: IrqSafeSpinLock::new(State {
                 epoch: 0,
                 next: 1,
-                boot: None,
+                boot: [None; 2],
                 observed: None,
                 last_post: None,
                 queued: None,
@@ -206,24 +256,22 @@ impl Power {
             Err(error) => Some(Error::Mailbox(error)),
             Ok(pair) => match phase {
                 Phase::Reading(request, current) => {
-                    if pair[0] & ENABLE == 0 || pair[0] & VALUE == 0 {
+                    if !pair.iter().any(|&word| enabled(word)) {
                         Some(Error::Bounds)
                     } else {
-                        if !current && state.boot.is_none() {
-                            state.boot = Some(pair[0] & VALUE)
+                        if !current {
+                            for (index, &word) in pair.iter().enumerate() {
+                                if enabled(word) && state.boot[index].is_none() {
+                                    state.boot[index] = Some(word & VALUE)
+                                }
+                            }
                         }
                         if let Some(request) = request {
-                            if state
-                                .boot
-                                .is_none_or(|max| request.raw == 0 || request.raw > max)
-                            {
-                                Some(Error::Bounds)
-                            } else {
-                                state.phase = Phase::NeedWrite(
-                                    request,
-                                    [(pair[0] & !MASK) | ENABLE | request.raw, pair[1]],
-                                );
+                            if let Some(wanted) = request.apply(pair, state.boot) {
+                                state.phase = Phase::NeedWrite(request, wanted);
                                 None
+                            } else {
+                                Some(Error::Bounds)
                             }
                         } else {
                             state.observed = Some(Observation {
@@ -276,19 +324,25 @@ impl Power {
         }
     }
     pub(super) fn store(&self, bytes: &[u8], now: u64) -> Result<(), FsError> {
+        self.store_attribute("power2_max", bytes, now)
+    }
+    pub(super) fn store_attribute(
+        &self,
+        attribute: &str,
+        bytes: &[u8],
+        now: u64,
+    ) -> Result<(), FsError> {
         if !narf_filesystem::caller_capable(21) {
             return Err(FsError::OperationNotPermitted);
         }
-        if bytes.len() > 32 {
-            return Err(FsError::InvalidData);
-        }
-        let text = core::str::from_utf8(bytes)
-            .map_err(|_| FsError::InvalidData)?
-            .trim();
-        if text.is_empty() || !text.bytes().all(|c| c.is_ascii_digit()) {
-            return Err(FsError::InvalidData);
-        }
-        let value: u64 = text.parse().map_err(|_| FsError::InvalidData)?;
+        let value = super::decimal(bytes)?;
+        let (index, window) = match attribute {
+            "power2_max" => (0, false),
+            "power2_cap" => (1, false),
+            "power2_max_interval" => (0, true),
+            "power2_cap_interval" => (1, true),
+            _ => return Err(FsError::Unsupported),
+        };
         let mut state = self.state.lock();
         if !self.current(state.epoch) {
             return Err(FsError::NoDevice);
@@ -303,27 +357,32 @@ impl Power {
             .observed
             .filter(|o| now >= o.at && now - o.at <= MAX_AGE_NS)
             .ok_or(FsError::NoDevice)?;
-        if observed.pair[0] & ENABLE == 0 {
+        if !enabled(observed.pair[index]) {
             return Err(FsError::Unsupported);
         }
-        let max = state.boot.ok_or(FsError::Unsupported)?;
-        let raw = value
-            .checked_add(STEP_UW / 2)
-            .map(|v| v / STEP_UW)
-            .and_then(|v| u32::try_from(v).ok())
-            .ok_or(FsError::InvalidData)?;
-        if value < STEP_UW || value > u64::from(max) * STEP_UW || !(1..=max).contains(&raw) {
-            return Err(FsError::InvalidData);
-        }
+        let max = state.boot[index].ok_or(FsError::Unsupported)?;
+        let setting = if window {
+            Setting::Interval(interval::encode(value, TIME_SHIFT)?)
+        } else {
+            let raw = value
+                .checked_add(STEP_UW / 2)
+                .map(|v| v / STEP_UW)
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or(FsError::InvalidData)?;
+            if value < STEP_UW || value > u64::from(max) * STEP_UW || !(1..=max).contains(&raw) {
+                return Err(FsError::InvalidData);
+            }
+            Setting::Limit(raw)
+        };
         let id = state.next;
         state.next = id.checked_add(1).ok_or(FsError::Busy)?;
-        state.queued = Some(Request { id, raw });
+        state.queued = Some(Request { id, index, setting });
         state.outcome = Outcome::Queued(id);
         Ok(())
     }
     pub(super) fn show(&self, attribute: &str, now: u64) -> String {
         let state = self.state.lock();
-        if attribute == "power2_max_status" {
+        if matches!(attribute, "power2_max_status" | "power2_cap_status") {
             return match state.outcome {
                 Outcome::Unavailable => "unavailable\n".into(),
                 Outcome::DefaultOnly => "default-only\n".into(),
@@ -344,11 +403,34 @@ impl Power {
         else {
             return String::new();
         };
-        let raw = match attribute {
-            "power2_max" | "power2_rated_max" if observed.live => Some(observed.pair[0] & VALUE),
-            "power2_max_default" | "power2_max_max" => state.boot,
+        let (index, suffix) = if let Some(suffix) = attribute.strip_prefix("power2_max") {
+            (0, suffix)
+        } else if let Some(suffix) = attribute.strip_prefix("power2_cap") {
+            (1, suffix)
+        } else if attribute == "power2_rated_max" {
+            (0, "")
+        } else {
+            return String::new();
+        };
+        if !enabled(observed.pair[index]) || state.boot[index].is_none() {
+            return String::new();
+        }
+        if suffix.starts_with("_interval") {
+            let value = match suffix {
+                "_interval" if observed.live => {
+                    Some(interval::decode(observed.pair[index], TIME_SHIFT))
+                }
+                "_interval_min" => Some(interval::minimum(TIME_SHIFT)),
+                "_interval_max" => Some(interval::maximum(TIME_SHIFT)),
+                _ => None,
+            };
+            return value.map_or_else(String::new, |value| format!("{value}\n"));
+        }
+        let raw = match suffix {
+            "" if observed.live => Some(observed.pair[index] & VALUE),
+            "_default" | "_max" => state.boot[index],
             // A representable policy floor, not a source-invented SKU fuse.
-            "power2_max_min" => Some(1),
+            "_min" => Some(1),
             _ => None,
         };
         raw.map_or_else(String::new, |v| format!("{}\n", u64::from(v) * STEP_UW))

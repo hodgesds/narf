@@ -168,6 +168,7 @@ pub struct UserContext {
     pub(crate) serial: Mutex<()>,
     engine: crate::intel_gpu_engine::Engine,
     placements: crate::intel_gpu_engine::EngineSet,
+    parallel: Option<[crate::intel_gpu_engine::Engine; 2]>,
     state: IrqSafeSpinLock<State>,
 }
 
@@ -178,7 +179,11 @@ impl UserContext {
 
     /// The engine is immutable: saved state belongs to one class's layout.
     pub fn for_engine(engine: crate::intel_gpu_engine::Engine) -> Arc<Self> {
-        Self::with_placements(engine, crate::intel_gpu_engine::EngineSet::of(&[engine]))
+        Self::with_placements(
+            engine,
+            crate::intel_gpu_engine::EngineSet::of(&[engine]),
+            None,
+        )
     }
 
     /// Width-one GuC virtual context. The representative supplies only the
@@ -193,17 +198,35 @@ impl UserContext {
         {
             return Err(FsError::InvalidData);
         }
-        Ok(Self::with_placements(engine, placements))
+        Ok(Self::with_placements(engine, placements, None))
+    }
+
+    pub(crate) fn for_parallel(
+        lanes: [crate::intel_gpu_engine::Engine; 2],
+    ) -> Result<Arc<Self>, FsError> {
+        if lanes[0] == lanes[1]
+            || lanes[0].xe_class() != lanes[1].xe_class()
+            || !(lanes[0].is_copy() || lanes[0].is_compute())
+        {
+            return Err(FsError::InvalidData);
+        }
+        Ok(Self::with_placements(
+            lanes[0],
+            crate::intel_gpu_engine::EngineSet::of(&lanes),
+            Some(lanes),
+        ))
     }
 
     fn with_placements(
         engine: crate::intel_gpu_engine::Engine,
         placements: crate::intel_gpu_engine::EngineSet,
+        parallel: Option<[crate::intel_gpu_engine::Engine; 2]>,
     ) -> Arc<Self> {
         Arc::new(Self {
             serial: Mutex::new(()),
             engine,
             placements,
+            parallel,
             state: IrqSafeSpinLock::new(State {
                 epoch: 0,
                 busy: false,
@@ -223,6 +246,9 @@ impl UserContext {
     }
     pub(crate) fn placements(&self) -> crate::intel_gpu_engine::EngineSet {
         self.placements
+    }
+    pub(crate) fn parallel(&self) -> Option<[crate::intel_gpu_engine::Engine; 2]> {
+        self.parallel
     }
     pub(crate) fn last(&self) -> Option<Arc<CompletionFence>> {
         self.state.lock().last.clone()
@@ -289,7 +315,8 @@ impl UserContext {
             .checked_sub(1)
             .filter(|n| *n != 0 && *n <= 13)
             .ok_or(FsError::InvalidData)? as usize
-            * 1024;
+            * 1024
+            * if self.parallel.is_some() { 2 } else { 1 };
         if state.image.is_empty() {
             let bytes = words * 4;
             STATE_BYTES
@@ -330,10 +357,25 @@ impl ContextClaim {
     pub(crate) fn placements(&self) -> crate::intel_gpu_engine::EngineSet {
         self.context.placements
     }
+    pub(crate) fn parallel(&self) -> Option<[crate::intel_gpu_engine::Engine; 2]> {
+        self.context.parallel
+    }
     pub(crate) fn restore(&self, image: &impl GpuBacking) {
+        self.restore_lane(image, 0);
+    }
+    pub(crate) fn restore_lane(&self, image: &impl GpuBacking, lane: usize) {
         let state = self.context.state.lock();
         if state.valid {
-            for (i, word) in state.image.iter().enumerate() {
+            let words = state.image.len()
+                / if self.context.parallel.is_some() {
+                    2
+                } else {
+                    1
+                };
+            for (i, word) in state.image[lane * words..(lane + 1) * words]
+                .iter()
+                .enumerate()
+            {
                 image.write32(4096 + i as u64 * 4, *word);
             }
         }
@@ -370,12 +412,34 @@ impl UserJob {
     /// Called only after deregistration, exact-head/breadcrumb proof and the
     /// final TLB ACK, with device writes synchronized for the CPU.
     pub(crate) fn capture(&self, image: &impl GpuBacking, header: u32) -> Result<(), FsError> {
+        self.capture_lanes(&[image], header)
+    }
+    pub(crate) fn capture_lanes<B: GpuBacking>(
+        &self,
+        images: &[&B],
+        header: u32,
+    ) -> Result<(), FsError> {
         let mut state = self.context.state.lock();
-        if state.epoch != self.epoch || !state.busy || image.read32(4100) != header {
+        let count = if self.context.parallel.is_some() {
+            2
+        } else {
+            1
+        };
+        if state.epoch != self.epoch
+            || !state.busy
+            || images.len() != count
+            || images.iter().any(|image| image.read32(4100) != header)
+        {
             return Err(io_error());
         }
-        for (i, word) in state.image.iter_mut().enumerate() {
-            *word = image.read32(4096 + i as u64 * 4);
+        let words = state.image.len() / count;
+        for (lane, image) in images.iter().enumerate() {
+            for (i, word) in state.image[lane * words..(lane + 1) * words]
+                .iter_mut()
+                .enumerate()
+            {
+                *word = image.read32(4096 + i as u64 * 4);
+            }
         }
         state.valid = true;
         Ok(())

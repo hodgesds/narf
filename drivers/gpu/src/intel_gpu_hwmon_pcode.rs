@@ -1,4 +1,4 @@
-//! One BMG PCODE port owner for discovery, package PL1 and I1 transactions.
+//! One BMG PCODE port owner for discovery, paired package limits and I1.
 //! MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad xe_pcode.c,
 //! xe_pcode_api.h and xe_hwmon.c. One bounded post OR poll per service.
 //!

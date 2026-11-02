@@ -4,7 +4,7 @@
 //! xe_hwmon_power_max_interval_store}, regs/xe_mchbar_regs.h. Only DG2 uses
 //! this direct register protocol; BMG's mailbox power-source switch is absent.
 
-use super::{Io, INTERVAL_NS, MAX_AGE_NS};
+use super::{interval, Io, INTERVAL_NS, MAX_AGE_NS};
 use alloc::{format, string::String};
 use core::sync::atomic::{AtomicU64, Ordering};
 use narf_filesystem::FsError;
@@ -16,7 +16,6 @@ const PL1: u64 = 0x1459a0;
 const VALUE: u32 = 0x7fff;
 const ENABLE: u32 = 1 << 15;
 const MASK: u32 = VALUE | ENABLE;
-const TIME: u32 = 0x7f << 17;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Boot {
@@ -62,14 +61,10 @@ impl Observation {
         self.pl1 & ENABLE != 0 && self.pl1 & VALUE != 0
     }
     fn interval(self, bits: u32) -> u64 {
-        let x = (bits >> 22) & 3;
-        let y = (bits >> 17) & 31;
-        (((4 | u64::from(x)) << y) * 1000) >> (self.time_shift + 2)
+        interval::decode(bits, self.time_shift)
     }
     fn interval_max(self) -> u64 {
-        // Pinned xe_hwmon.c uses x=0,y=18: existing dGPU SKU MAX_WIN
-        // is unreliable. 256 seconds applies only to time unit shift10.
-        self.interval(18 << 17)
+        interval::maximum(self.time_shift)
     }
     fn bounds(self, boot: Boot) -> Option<(u32, u32)> {
         let max = self.max.min(boot.ceiling);
@@ -213,7 +208,7 @@ impl Power {
                                 && observed.interval(bits) != 0
                                 && observed.interval(bits) <= observed.interval_max() =>
                         {
-                            Some((observed.pl1 & !TIME) | bits)
+                            Some((observed.pl1 & !interval::MASK) | bits)
                         }
                         _ => None,
                     });
@@ -332,23 +327,7 @@ impl Power {
         observed
             .bounds(state.boot.ok_or(FsError::Unsupported)?)
             .ok_or(FsError::Unsupported)?;
-        if milliseconds == 0 || milliseconds > observed.interval_max() {
-            return Err(FsError::InvalidData);
-        }
-        // Exact pinned Xe algorithm: nearest hardware units plus one, then
-        // the 1.x * 2^y encoding (x has two fractional bits).
-        let units = milliseconds
-            .checked_shl(u32::from(observed.time_shift))
-            .and_then(|v| v.checked_add(500))
-            .map(|v| v / 1000)
-            .and_then(|v| v.checked_add(1))
-            .ok_or(FsError::InvalidData)?;
-        let y = units.ilog2();
-        let x = ((units - (1u64 << y)) << 2) >> y;
-        let bits = (x as u32) << 22 | y << 17;
-        if observed.interval(bits) == 0 || observed.interval(bits) > observed.interval_max() {
-            return Err(FsError::InvalidData);
-        }
+        let bits = interval::encode(milliseconds, observed.time_shift)?;
         let id = state.next;
         state.next = id.checked_add(1).ok_or(FsError::Busy)?;
         state.queued = Some(Request {
@@ -381,7 +360,7 @@ impl Power {
         };
         let value = match attribute {
             "power2_max_interval" => Some(observed.interval(observed.pl1)),
-            "power2_max_interval_min" => Some((1000u64 >> observed.time_shift).max(1)),
+            "power2_max_interval_min" => Some(interval::minimum(observed.time_shift)),
             "power2_max_interval_max" => Some(observed.interval_max()),
             "power2_max" => Some(if observed.enabled() {
                 observed.microwatts((observed.pl1 & VALUE).clamp(observed.min, observed.max))

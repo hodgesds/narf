@@ -923,6 +923,95 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     .insert(request[2], request[10] & !0xfff)
                     .is_none());
             }
+            0x4601 => {
+                // Independent MULTI_LRC wire vector: a contiguous two-ID
+                // group, first-lane logical mask, explicit descriptor+WQ.
+                assert_eq!(request.len(), 15);
+                assert_eq!(request[1], 1);
+                assert!(matches!(request[3], 3 | 4));
+                assert_eq!(request[4].count_ones(), 1);
+                assert_eq!([request[6], request[8], request[12], request[14]], [0; 4]);
+                assert_eq!(
+                    [request[7], request[9], request[10]],
+                    [request[5] + 1024, 1024, 2]
+                );
+                assert_eq!([request[11] & 0xfff, request[13] & 0xfff], [0x119; 2]);
+                let images = [request[11] & !0xfff, request[13] & !0xfff];
+                {
+                    let d = w.0.borrow();
+                    assert!(d.synced.contains(&request[5]));
+                    let scratch = d.memory[&request[5]].borrow();
+                    assert_eq!(&scratch[..4], &[0, 20, 0, 1]);
+                    assert!(scratch[4..256].iter().all(|word| *word == 0));
+                    let ads = d.memory[&0x20001000].borrow();
+                    let first_logical = request[4].trailing_zeros() as usize;
+                    for (lane, base) in images.into_iter().enumerate() {
+                        let image = d.memory[&base].borrow();
+                        let logical = first_logical + lane;
+                        let physical = (ads
+                            [(0x123c + request[3] as usize * 32 + logical / 4 * 4) / 4]
+                            >> (logical % 4 * 8))
+                            & 255;
+                        let bank = if request[3] == 3 {
+                            match physical {
+                                0 => 0x22000,
+                                8 => 0x3ee000,
+                                _ => panic!("COPY physical"),
+                            }
+                        } else {
+                            [0x1a000, 0x1c000, 0x1e000, 0x26000][physical as usize]
+                        };
+                        assert_eq!(image[1026], bank + 0x244);
+                        assert_ne!(image[1024 + 0x33], 0);
+                        assert!(registered.insert(request[2] + lane as u32, base).is_none());
+                    }
+                }
+                assert!(w
+                    .0
+                    .borrow_mut()
+                    .parallel_contexts
+                    .insert(
+                        request[2],
+                        ParallelContext {
+                            images,
+                            scratch: request[5],
+                            enabled: false,
+                        }
+                    )
+                    .is_none());
+            }
+            0x1000 => {
+                assert_eq!(request.len(), 2);
+                let id = request[1];
+                let group = w.0.borrow().parallel_contexts[&id];
+                assert!(group.enabled);
+                let lanes = {
+                    let d = w.0.borrow();
+                    let scratch = d.memory[&group.scratch].borrow();
+                    assert_eq!(&scratch[..4], &[0, 20, 0, 1]);
+                    let parent = d.memory[&group.images[0]].borrow();
+                    let child = d.memory[&group.images[1]].borrow();
+                    assert_eq!(
+                        &scratch[256..261],
+                        &[
+                            0x00040005,
+                            group.images[0] | 0x119,
+                            id | (parent[1024 + 7] / 8) << 18,
+                            0,
+                            child[1024 + 7] / 8,
+                        ]
+                    );
+                    d.parallel_lanes.unwrap_or(3)
+                };
+                w.0.borrow().memory[&group.scratch].borrow_mut()[0] = 20;
+                if execute {
+                    for (lane, base) in group.images.into_iter().enumerate() {
+                        if lanes & (1 << lane) != 0 {
+                            execute_parallel_lane(w, id, base);
+                        }
+                    }
+                }
+            }
             0x100b => {
                 assert!(matches!(request[3], 2 | 3));
                 assert!((1..=100_000).contains(&request[5]));
@@ -935,6 +1024,18 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 let id = request[1];
                 let base = registered[&id];
                 let first = w.0.borrow().memory[&base].borrow()[1024 + 2];
+                let parallel = w.0.borrow().parallel_contexts.contains_key(&id);
+                if parallel {
+                    w.0.borrow_mut()
+                        .parallel_contexts
+                        .get_mut(&id)
+                        .unwrap()
+                        .enabled = request[2] == 1;
+                    // Linux aliases every group ID for scheduler replies.
+                    let reply = id + u32::from(w.0.borrow().parallel_reply_child);
+                    event(&memory, 0x1002, &[reply, request[2]]);
+                    continue;
+                }
                 if request[2] == 1 && execute {
                     execute_virtual_restore(w, base, true);
                 }
@@ -1025,7 +1126,13 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
             0x4503 => {
                 let base = registered.remove(&request[1]).expect("registered identity");
                 w.0.borrow_mut().virtual_contexts.remove(&base);
-                event(&memory, 0x4600, &[request[1]]);
+                let group = w.0.borrow_mut().parallel_contexts.remove(&request[1]);
+                if let Some(group) = group {
+                    assert!(!group.enabled);
+                    assert_eq!(registered.remove(&(request[1] + 1)), Some(group.images[1]));
+                }
+                let child = group.is_some() && w.0.borrow().parallel_reply_child;
+                event(&memory, 0x4600, &[request[1] + u32::from(child)]);
             }
             0x3003 => service_slpc(w, &memory, control_fence, &request),
             0x3004 => assert_eq!(&request[1..], &[1]), // GUCRC_FIRMWARE_CONTROL
@@ -1033,6 +1140,18 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
         }
     }
     actions
+}
+
+// Hardware executes each private lane independently after GuC consumes the
+// shared WQ. Tests may withhold one lane without forging parent completion.
+fn execute_parallel_lane(w: &Window, id: u32, base: u32) {
+    let first = w.0.borrow().memory[&base].borrow()[1026];
+    w.0.borrow_mut().parallel_starts.push((id, base));
+    if matches!(first, 0x22244 | 0x3ee244) {
+        execute_copy(w, base);
+    } else {
+        execute_compute(w, base);
+    }
 }
 
 // Independent GuC choice plus hardware restore execution. The production

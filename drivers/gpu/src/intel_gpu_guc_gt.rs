@@ -234,6 +234,38 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             .and_then(GuCScheduler::take_error_report)
     }
 
+    /// The runtime reset owner calls this after failure detection and before
+    /// full teardown, while all log/CT backing remains retained. Firmware may
+    /// already have reset an engine: the bundle promises no atomic freeze.
+    pub(crate) fn capture_coredump(
+        &self,
+        buffer: crate::intel_gpu_error::coredump::Armed,
+        report: crate::intel_gpu_error::Report,
+        now_ns: u64,
+        firmware_digest: [u8; 32],
+        mut access: impl FnMut() -> bool,
+    ) {
+        let log = self.parts.boot.live_log();
+        let identity = log.as_ref().map(|log| crate::intel_gpu_guc_log::Identity {
+            epoch: self.user_epoch().unwrap_or(0),
+            incarnation: log.incarnation,
+            now_ns,
+            platform: self.parts.boot.platform(),
+            firmware_version: log.firmware_version,
+            firmware_digest,
+        });
+        buffer.capture(
+            report,
+            identity,
+            log.as_ref().map(|log| log.backing),
+            self.parts
+                .ct
+                .as_ref()
+                .and_then(XeLpgTransport::diagnostic_backing),
+            || access() && self.awake().is_ok(),
+        );
+    }
+
     /// Last validated firmware table. It describes hardware capabilities, not
     /// active engine/fuse masks or permission to admit userspace submissions.
     pub fn hwconfig(&self) -> Option<&HardwareConfig> {

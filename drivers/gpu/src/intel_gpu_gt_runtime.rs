@@ -59,6 +59,9 @@ enum Phase {
 }
 
 struct State {
+    coredump: Option<crate::intel_gpu_error::coredump::Armed>,
+    coredump_enabled: bool,
+    coredump_retry_ns: u64,
     irq: Option<crate::intel_gpu_gt_irq::GtIrq>,
     irq_tried: bool,
     gt: Option<ProductionGt>,
@@ -399,11 +402,15 @@ pub(crate) fn start_pending() {
             p.bar.len,
         );
         let ccs_control = crate::intel_gpu_ccs_control::Control::new(p.index);
+        let coredump = crate::intel_gpu_error::coredump::arm(p.index);
         let owner = Arc::new(Owner {
             pending: p,
             pm,
             autosuspend: AtomicBool::new(false),
             state: Mutex::new(State {
+                coredump,
+                coredump_enabled: crate::intel_gpu_error::coredump::enabled(),
+                coredump_retry_ns: 0,
                 irq: None,
                 irq_tried: false,
                 gt: None,
@@ -674,9 +681,23 @@ impl Owner {
             return Ok(());
         }
         let now = narf_time::monotonic_ns();
+        if state.coredump_enabled && state.coredump.is_none() && now >= state.coredump_retry_ns {
+            state.coredump = crate::intel_gpu_error::coredump::arm(self.pending.index);
+            state.coredump_retry_ns = now.saturating_add(1_000_000_000);
+        }
+        let digest = state
+            .firmware
+            .as_ref()
+            .map_or([0; 32], |firmware| firmware.digest);
         let gt = state.gt.as_mut().ok_or(RuntimeError::State)?;
         let polled = gt.poll(now);
         if let Some(report) = gt.take_error_report() {
+            if let Some(buffer) = state.coredump.take() {
+                gt.capture_coredump(buffer, report, narf_time::monotonic_ns(), digest, || {
+                    narf_bus::pci::power_state(&self.pending.cap, &self.pending.device)
+                        == Ok(Some(narf_bus::pci::PciPowerState::D0))
+                });
+            }
             crate::intel_gpu_error::record(self.pending.index, report);
         }
         let current = match polled {
@@ -894,6 +915,7 @@ impl Owner {
                     drop(wait.take());
                     state.irq.take(); // stop delivery before resetting the GT
                     delay_us = 500;
+                    let coredump = state.coredump.take();
                     if let Some(gt) = state.gt.as_ref() {
                         use crate::intel_gpu_error::Reason;
                         let reason = match error {
@@ -940,6 +962,23 @@ impl Owner {
                                 (value != u32::MAX).then_some(value)
                             },
                         );
+                        if let Some(buffer) = coredump {
+                            gt.capture_coredump(
+                                buffer,
+                                report,
+                                narf_time::monotonic_ns(),
+                                state
+                                    .firmware
+                                    .as_ref()
+                                    .map_or([0; 32], |firmware| firmware.digest),
+                                || {
+                                    narf_bus::pci::power_state(
+                                        &self.pending.cap,
+                                        &self.pending.device,
+                                    ) == Ok(Some(narf_bus::pci::PciPowerState::D0))
+                                },
+                            );
+                        }
                         crate::intel_gpu_error::record(self.pending.index, report);
                     }
                     self.close_controls();
@@ -1279,6 +1318,12 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
                     Phase::Failed
                 };
                 self.suspended.store(false, Ordering::Release);
+            }
+            // The failed prepare hook is not resumed by the coordinator.
+            // AUX is panel-global; restore it after releasing the GT mutex.
+            drop(state);
+            if result.is_err() {
+                let _ = crate::intel_dpcd_bl::resume_for_bar(&self.pending.bar);
             }
             result
         })

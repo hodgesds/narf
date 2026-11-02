@@ -98,6 +98,40 @@ panel power alone cannot produce a synthetic active 1024×768 display.
 Native register-model smokes cover these paths; physical scanout and
 suspend/resume acceptance remain separate hardware work.
 
+MTL/Arrow additionally installs the qualified `intel_aux_backlight` Raw
+candidate into the existing arbitrated backlight stack after actual video and
+owned-console publication. It requires a live owned Pipe-A/DDI-A internal
+panel, current PCI capability/D0/PPS, an initially open PPS backlight gate,
+VESA eDP1.2–1.4b full-AUX SDR capabilities and an already-DPCD control mode.
+Mixed PWM/product, dynamic/luminance and proprietary HDR profiles refuse
+without control writes. The PWMGEN bit count defines maximum brightness;
+exact one/two-byte MSB-first levels retain NARF's explicit-width policy (the
+pinned Linux helper writes a second zero byte for an 8-bit panel). Effective
+observed brightness initializes intent: a disabled sink with a stale nonzero
+level remains zero. No initial closed gate or PWM level is inferred.
+
+The elected owner retains capabilities, mode, bit count and nonzero enabled
+AUX-frequency divider, with exact readback before confirming changes. Every
+physical access proves current authority, D0, bounds and the actual live
+internal-panel route. Shared `IntelAux` try-lock exclusion uses a regular
+mutex; foreign SEND_BUSY/all-ones refuse before writes. Source-correct
+status-only NACK/DEFER replies preserve their status. A regular state mutex
+and an owned async worker retain/coalesce brightness intent. Deferred work
+retries on bounded1ms timers; persistent failure retains intent without
+claiming an applied value. Only the elected candidate may write.
+
+Suspend verifies DPCD disable and PPS gate closure, then async KMS quiescence
+waits a retained T9 deadline and revalidates the parked/closed state before
+returning. Relight prepares a closed gate and T8 deadline; fresh successful
+video/console publication must explicitly admit timer-driven DPCD replay and
+readback before the gate reopens. Prepared or failed/cancelled modesets cannot
+authorize a setter or old worker to relight. New prepare/resume invalidates an
+old suspend deadline. A sticky inaccessible-register latch suppresses further
+PPS writes after interior MMIO loss. Failed GT prepare restores the backlight
+outside the GT mutex; synchronous panel power-off keeps its existing T9
+sequencer. No executor poll calls `block_on`. Gen12 PWM and unsupported panel
+profiles retain their separate admission gates.
+
 ### Intel render UAPI and address-space admission
 
 `intel_gpu_uapi` and `intel_gpu_xe_uapi` define Linux i915 and native Xe ioctl
@@ -175,7 +209,22 @@ while any allowed engine is making real progress. Diagnostics report an exact
 observed engine or unavailable, plus the placement set; the template engine
 is never substituted for physical evidence. Disable/deregister/final-TLB and
 full-reset ownership rules retain the whole virtual context and residency.
-Width greater than one and parallel execution remain unsupported. VIDEO classes, and COMPUTE on a GT
+Width-two single-placement parallel COPY/COMPUTE queues additionally retain
+two persistent lane states, a common context serial/epoch, an immutable shared
+VM graph and two copied batch addresses. Both published dense logical engine
+instances must be adjacent and in the same class. A separate coherent protected
+scratch page owns the source's fixed descriptor and single-use five-DWORD
+type5 workqueue item. A contiguous two-ID lease, REGISTER_CONTEXT_MULTI_LRC,
+release-before-tail publication and ENABLE followed by SCHED_CONTEXT dispatch
+the real firmware group. No live workqueue wrap/replay is admitted. Lane
+breadcrumbs, physical attribution, runtime accounting and saved heads remain
+independent; parent completion alone cannot retire child storage or signal
+group syncobj outputs. Shared disable/deregister and final TLB/reset proof
+retain every lane and the VM graph. Replies naming either leased ID resolve
+the same group; a child reset preserves actual lane attribution. Parallel GPU
+user-fence stores remain unsupported until an all-lane GPU join is owned.
+Width greater than two and multi-placement parallel matrices remain refused.
+VIDEO classes, and COMPUTE on a GT
 without a published compute instance, return EINVAL. `UserStatus::engines` carries the GT's
 published `EngineSet`; ENGINES lists exactly that set in xe_hw_engine order
 and engine-cycle queries for an unpublished class return EINVAL after the
@@ -260,7 +309,7 @@ without changing the request or publishing GPU work; the syscall bridge handles
 signal delivery and SA_RESTART. Completed/failed waits never request a park.
 Finite waits retain their original future/deadline instead of restarting a
 relative timeout on each repoll. Kernel callers without the hook await timers.
-Long-running/fault VMs, parallel queues, observation and additional
+Long-running/fault VMs, broader parallel queues, observation and additional
 native Xe query/property families
 remain refused until their ownership and hardware contracts are implemented.
 
@@ -789,8 +838,9 @@ the existing GuC plus full-engine stop, and retains the gate and power through
 fresh bring-up and every selected engine's startup proof. Only verified new
 epoch publication reopens clients. True loss/S3 close retires the prior epoch
 even without pending work; a stale callback cannot publish it again. Ordinary
-idle park retains the same partition/epoch contract. Load balancing and
-parallel queues remain separate work.
+idle park retains the same partition/epoch contract. Width-one load balancing
+and bounded width-two parallel groups use that published partition; wider and
+multi-placement parallel queues remain separate work.
 
 `intel_gpu_nonpriv::EnginePolicy` initializes each admitted engine's twelve
 FORCE_TO_NONPRIV slots while idle under the GT owner's forcewake holds.
@@ -1081,8 +1131,35 @@ discards pending/source ownership without writes or policy replay; a later
 activation starts with passive firmware-source observations again. Errors
 disable the power actor until activation; ambiguous port ownership additionally
 quarantines every mailbox client. Known authority loss clears matching cached
-observations immediately between sampling ticks. PL2/card/time-window controls,
-disabling limits and instantaneous watt telemetry remain open.
+observations immediately between sampling ticks. Disabling limits, card power
+controls and instantaneous watt telemetry remain open.
+
+BMG additionally exposes the source-defined package PL2 `power2_cap` in
+microWatts, PL1 `power2_max_interval` and PL2 `power2_cap_interval` in
+milliseconds. Read-only NARF metadata supplies `power2_cap_default/min/max/status`
+and both interval `*_min/max` attributes. Both status names describe the latest
+shared package request. All four writable attributes share one queue/in-flight
+slot, current CAP_SYS_ADMIN, bounded unsigned input and a fresh current-epoch
+observation. Each first valid enabled firmware-source limit independently
+defines a ceiling retained across close/reset. Unavailable or disabled fields
+remain empty and unsupported, without invented limits.
+
+The actor freshly reads both words before changing only the chosen limit's
+low16 value/enable field or interval bits23:17. An unselected enabled limit
+must already fit its own known retained ceiling, so switching the paired
+source cannot import an increased sibling. A selected power reduction can
+repair an above-ceiling value; an interval update cannot carry that value.
+Every unrelated/time/clamp field and the other word retain their fresh values.
+Source0 whole-pair readback must match exactly before either current limit or
+interval is published; ACK alone is insufficient. Firmware-source discovery
+publishes defaults/bounds only. BMG's source time-unit10 and x0/y18 bound give
+read-only writable interval bounds1..256000ms, using the same checked rounded
+encoding as DG2. Zero/unrepresentable requests refuse; existing larger windows
+can still be reported truthfully. Clamp, changed sibling or readback error
+disables the package actor until activation. Close discards every request and
+source claim without replay, retains both ceilings, and restarts with passive
+firmware-source discovery. Shared PCODE fairness and per-service bounds are
+unchanged; dynamic MERT/L2-flush coordination remains separate work.
 
 User-job timeout accounting follows `xe_lrc_timestamp` and `check_timeout`:
 a trusted per-context restore batch marks the saved CTX_TIMESTAMP active, and
@@ -1091,10 +1168,12 @@ watchdog observations charge only the wrapping GPU timestamp delta, with Linux's
 5% scheduling tolerance. An active context reads its own engine timestamp under
 the GT's wake/authority owner and rereads saved state to handle switch-out.
 Queued and preempted intervals do not consume the runtime budget. A stuck active
-counter still triggers isolated context recovery. An engine making no GPU
-progress for three watchdog intervals requires full GT reset, without blaming
-an unstarted queue. Unavailable clock/MMIO or cache synchronization fails closed;
-kernel jobs and protocol/retirement transitions retain wall-clock bounds.
+counter still triggers isolated context recovery. The global fallback requires
+every engine eligible for an unfinished lane to make no GPU progress for three
+watchdog intervals before full GT reset, without blaming an unstarted queue.
+Completed lanes cannot mask a stalled remaining lane. Unavailable clock/MMIO
+or cache synchronization fails closed. Kernel jobs and protocol/retirement
+transitions retain wall-clock bounds.
 
 `intel_gpu_error` captures the first per-card failure before isolated-job
 disable or full-GT teardown. Reports are fixed-size and allocation-free at
@@ -1164,6 +1243,45 @@ capability revocation. Empty/EOF reads still recheck authority. Reset, partial
 reads, duplication and cancellation retain/release the same snapshot permits
 as raw captures. This adds source-format export, not the CT flush/ack protocol
 required for lossless log streaming.
+
+The independent, default-off `narf.intel.devcoredump=1` option arms automatic
+first-failure GuC diagnostic bundles. The exact single-token policy matches
+the passive log opt-in; `/dev/dri/devcoredumpN` enumerates on registered Intel
+backends. A normal task preallocates a unique bounded destination before GT
+polling. Pending isolated-error reports and fatal runtime errors consume it
+under the actual GT reset mutex before full teardown. Capture does not allocate,
+wake, issue commands or wait. Optional preparation failure leaves recovery and
+the public sanitized report intact; unarmed destinations are retried at most
+once per second. First published failure wins until explicit acknowledgement.
+
+This is a partial device coredump, not complete Linux devcoredump parity.
+`NARFCDMP` version one contains a 256-byte little-endian header, a zero-padded
+4 KiB sanitized report region, the exact 0x115000-byte GuC log allocation and
+the exact six-page CT allocation (total 0x11c100 bytes). Header fields include
+card, nonwrapping bundle generation, error/copy times, epoch, platform, actual
+firmware release/incarnation/digest, fixed section offsets/lengths and an
+availability mask. Report text uses the bundle's generation; this independent
+identity is not the public sysfs report generation. No user BO, VM or LRC body
+is captured. Raw log/CT bytes can disclose addresses and commands and never
+enter the public `error` file. Firmware descriptor contents remain opaque and
+cannot change a copy bound. Coherent backing and current PCI D0/capability/GT
+wake are required before copying and each 4 KiB chunk. Known loss latches for
+the remaining capture, zeros a partial section and leaves it unavailable.
+Sequential observations do not promise a device freeze or pre-engine-reset
+state; report detection and raw-copy times are separate.
+
+Opening and every read, including empty/EOF reads, require current
+initial-user-namespace CAP_SYSLOG and the boot opt-in. Reads never touch live
+hardware; each open retains the same immutable bytes across partial reads,
+clear, reset and shutdown. Stat hides captured size after revocation. Opening
+before a report exists returns WouldBlock. A writable open and exact offset-zero
+`clear\n` acknowledgement additionally require current CAP_SYS_ADMIN. Clearing
+only the opened generation cannot remove a replacement. Old readers retain
+their bytes. Preparation reserves identities before failure detection; stale
+prepared captures cannot resurrect an older acknowledged generation. At most
+two prepared/retained dump buffers per card bound clear/read/rearm lifetimes,
+independently of the passive-log snapshot pool. Full context/job/VM dumps and
+lossless streaming remain open.
 
 Before context registration and after deregistration, a heavy GuC GGTT TLB
 invalidation (0x7000, operation 0x80000003) requires its matching 0x7001 cookie.

@@ -1244,6 +1244,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         );
     }
 
+    // The qualified full-AUX MTL owner is installed only after actual mode,
+    // retained scanout and the internal Pipe-A claim exist. Other profiles
+    // keep their existing backlight mechanism; no MTL PWM gate is widened.
+    crate::intel_dpcd_bl::install_mtl(&dev, device, cap);
+
     // PSR bring-up (#1020): only for an eDP panel that powered
     // on and produced a real mode. Every failure path inside
     // leaves the panel running plain eDP.
@@ -1441,6 +1446,10 @@ pub(crate) fn relight_display_locked(
     if !display.chip.generation.display_supported() {
         return None;
     }
+    let aux_backlight = crate::intel_dpcd_bl::installed(&display.gtt_mmadr);
+    if aux_backlight {
+        crate::intel_dpcd_bl::prepare_relight_for_bar(&display.gtt_mmadr).ok()?;
+    }
     let width = u32::from(mode.h_active);
     let height = u32::from(mode.v_active);
     let stride_bytes = padded_stride_bytes(width);
@@ -1489,6 +1498,9 @@ pub(crate) fn relight_display_locked(
         stride_bytes,
         32,
     )));
+    if aux_backlight {
+        crate::intel_dpcd_bl::resume_for_bar(&display.gtt_mmadr).ok()?;
+    }
     Some(scanout)
 }
 

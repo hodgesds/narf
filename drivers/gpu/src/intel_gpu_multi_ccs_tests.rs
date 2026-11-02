@@ -379,3 +379,7 @@ mod virtual_queues {
 mod i915_balance {
     include!("intel_gpu_i915_balance_tests.rs");
 }
+
+mod parallel_queues {
+    include!("intel_gpu_parallel_queue_tests.rs");
+}

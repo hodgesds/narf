@@ -113,6 +113,13 @@ impl BootAllocator for crate::intel_gpu_rcs::SharedArena {
     }
 
     fn sync_for_cpu(&mut self, backing: &Self::Backing) -> Result<(), BootError> {
+        // This proof covers concurrent CPU/device shared cache lines. Live
+        // scheduler polling needs ordering, not repeated whole-LRC CLFLUSH.
+        // Unconfigured/legacy/ARM mappings still use exclusive invalidation.
+        if backing.coherent_for_device() {
+            fence(Ordering::Acquire);
+            return Ok(());
+        }
         // This destination was cleaned before publication and is CPU-read-only
         // afterwards, so no dirty CPU line can overwrite the device response.
         self.sync_for_device(backing)
@@ -241,7 +248,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCBoot<M, A> {
     }
 
     pub(crate) fn live_log(&self) -> Option<LiveLog<'_, A::Backing>> {
-        (self.state == BootState::Ready && self.incarnation != 0).then_some(LiveLog {
+        if self.released || self.state != BootState::Ready || self.incarnation == 0 {
+            return None;
+        }
+        Some(LiveLog {
             backing: &self.resources.logs,
             firmware_version: self.firmware_version,
             incarnation: self.incarnation,
@@ -912,6 +922,12 @@ mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     type Words = Rc<RefCell<Vec<u32>>>;
+    #[derive(Clone, Copy)]
+    struct ParallelContext {
+        images: [u32; 2],
+        scratch: u32,
+        enabled: bool,
+    }
     #[derive(Default)]
     struct Device {
         regs: BTreeMap<u64, u32>,
@@ -935,6 +951,10 @@ mod tests {
         virtual_contexts: BTreeMap<u32, (u32, u32)>,
         virtual_pick: Option<u32>,
         virtual_restores: Vec<(u32, u32)>,
+        parallel_contexts: BTreeMap<u32, ParallelContext>,
+        parallel_lanes: Option<u8>,
+        parallel_reply_child: bool,
+        parallel_starts: Vec<(u32, u32)>,
     }
     #[derive(Clone)]
     struct Window(Rc<RefCell<Device>>);

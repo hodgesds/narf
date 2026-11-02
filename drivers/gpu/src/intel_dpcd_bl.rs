@@ -36,25 +36,25 @@
 //! against `intel_bl::install` decides which native device owns a
 //! panel that offers both paths — see the remainder note below.
 //!
-//! ## Deliberately NOT in this lane (remainder, follow-up issue)
+//! ## Qualified production owner
 //!
-//! * Mode selection at `0x721` (`BACKLIGHT_MODE`): switching a panel
-//!   into DPCD control mode. The control-mode field encoding could
-//!   not be pinned to a citable source in this lane (the VESA eDP
-//!   spec text is paywalled; every public Linux source consulted
-//!   uses symbolic names, never the numeric field values), and a
-//!   guessed selector could switch a real panel to the wrong control
-//!   source. Panels already in DPCD control mode — the firmware
-//!   state for AUX-only panels — are driven correctly by this lane.
-//! * Capability probe of the `0x700` block (TCON / AUX-enable /
-//!   AUX-set / byte-count caps) and the `0x720` display-control
-//!   enable bit: same grounding gap, same reason.
-//! * Probe-time wiring: no call site installs this device yet. An
-//!   unconditional install would register a DPCD candidate on every
-//!   Intel panel, including PWM panels where it must never promote.
-//!   The follow-up probes the `0x700` caps, installs only on
-//!   full-AUX panels, and installs BEFORE `intel_bl::install` so the
-//!   DPCD device wins the Raw tie on AUX-only panels.
+//! The retained `owner` module is installed by the MTL/Arrow internal-panel
+//! probe after the fixed Pipe-A/DDI-A route and owned console are live. It
+//! source-probes the VESA caps, exact PWM bit count and existing DPCD-only SDR
+//! mode; mixed PWM/product, passthrough/dynamic/luminance/HDR and other routes
+//! remain refused. Its maximum is `(1 << PWMGENbitcount) - 1`, including
+//! sub-16-bit panels carried in a two-byte field. The generic device below
+//! remains the small protocol seam for callers supplying their own profile.
+//!
+//! Production setters retain latest intent and queue the same AUX/MMIO worker
+//! exercised by native fixtures. The shared non-IRQ-masking AUX exclusion and
+//! current PCI capability/D0/route checks gate every transport transaction.
+//! Confirmed state advances only after exact level/mode/enable readback.
+//! Suspend disables AUX, closes/posts PPS and asynchronously observes T9;
+//! relight closes the gate before modeset and requires successful video
+//! publication plus elapsed T8 before replay/open. Cancellation and uncertain
+//! writes retain the owner, parked state and intent instead of electing a
+//! competing control source. No block_on bridge runs in an executor poll.
 //!
 //! ## Sources
 //!
@@ -65,11 +65,11 @@
 //! * Linux `drivers/gpu/drm/i915/display/intel_dp_aux_backlight.c`
 //!   and the extracted `drm_edp_backlight` helpers, as the public
 //!   reference implementation of the VESA backlight protocol, for the
-//!   field-width semantics: max is `0xFFFF` iff the LSB register is
-//!   used, else `0xFF`; get reads MSB-first; set writes
-//!   `1 + lsb_reg_used` bytes. The VESA eDP spec text itself was not
-//!   directly consulted (paywalled); a reviewer holding it should
-//!   eyeball the mode/cap remainder, not this lane's registers.
+//!   field-width semantics; get reads MSB-first and set writes exactly
+//!   `1 + lsb_reg_used` bytes. The production owner also pins numeric caps,
+//!   modes, enable and PWMGEN fields to Linux b90c984d `drm_dp.h` and
+//!   `drm_dp_helper.c::drm_edp_backlight_*`, and PPS gate/T8/T9 sequencing
+//!   to `intel_pps.c`. The VESA eDP spec itself was not consulted.
 //! * The generic PWM panel backlight half of #957 (`pwm_bl`-style
 //!   device on a `narf-pwm` channel) is likewise remainder: it was
 //!   optional scope and is not in this lane.
@@ -82,6 +82,16 @@ use narf_drivers_backlight::{register_backlight, BacklightDevice, BacklightKind,
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::dp_aux::AuxChannel;
+
+// Qualified production full-AUX owner. The compatibility device below keeps
+// the original explicit field-width seam; probe installs only this owner,
+// after current capability, panel route and real DPCD capability checks.
+#[path = "intel_dpcd_bl_owner.rs"]
+mod owner;
+pub(crate) use owner::{
+    install_mtl, installed, prepare_relight_for_bar, resume_for_bar, suspend_complete_for_bar,
+    suspend_for_bar,
+};
 
 /// DPCD address of `BACKLIGHT_BRIGHTNESS_MSB` (issue #957).
 pub const DPCD_BACKLIGHT_BRIGHTNESS_MSB: u32 = 0x722;

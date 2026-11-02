@@ -27,6 +27,8 @@ use core::{
 const TIMEOUT: u64 = 5_000_000_000;
 #[path = "intel_gpu_job_timeout.rs"]
 mod job_timeout;
+#[path = "intel_gpu_parallel.rs"]
+mod parallel;
 const MAX_CONTEXTS: usize = 64;
 pub use crate::intel_gpu_slpc::SlpcState;
 use crate::intel_gpu_slpc::{FrequencyRange, Limits, PowerProfile, Slpc, SlpcError, Status};
@@ -48,9 +50,20 @@ impl Identities {
         }
     }
     fn candidate(&self, live: impl Fn(u32) -> bool) -> Result<(u16, u32), SchedulingError> {
+        self.candidate_width(1, live)
+    }
+    fn candidate_width(
+        &self,
+        width: u16,
+        live: impl Fn(u32) -> bool,
+    ) -> Result<(u16, u32), SchedulingError> {
         let id = (0..64)
             .map(|n| (self.next_id - 1 + n) % 64 + 1)
-            .find(|id| self.used & (1u64 << (id - 1)) == 0)
+            .find(|id| {
+                (1..=2).contains(&width)
+                    && *id + width - 1 <= 64
+                    && (0..width).all(|lane| self.used & (1u64 << (*id + lane - 1)) == 0)
+            })
             .ok_or(SchedulingError::Full)?;
         let mut stamp = self.next_stamp;
         while live(stamp) {
@@ -106,6 +119,7 @@ enum Phase {
     Policy,
     Enable,
     Enabling,
+    Dispatch,
     Running,
     Disable,
     Disabling,
@@ -146,9 +160,42 @@ struct Context<B: GpuBacking> {
     timed_out: bool,
     /// GuC reset the engine under this context (CONTEXT_RESET_NOTIFICATION).
     reset: bool,
+    primary_finished: bool,
+    parallel: Option<parallel::Group<B>>,
 }
 
 impl<B: GpuBacking> Context<B> {
+    fn backings(&self) -> impl Iterator<Item = &B> {
+        [&self.image, &self.ring]
+            .into_iter()
+            .chain(self.parallel.iter().flat_map(|group| group.backings()))
+    }
+    fn all_finished(&self) -> bool {
+        self.image.read32(BREADCRUMB) == self.stamp
+            && self.image.read32(REGS + 5 * 4) & 0x1ffffc == self.tail
+            && self.parallel.as_ref().is_none_or(|group| {
+                group.child.image.read32(BREADCRUMB) == self.stamp
+                    && group.child.image.read32(REGS + 5 * 4) & 0x1ffffc == group.child.tail
+            })
+    }
+    fn child_diagnostic(&self) -> Option<ContextInfo> {
+        let group = self.parallel.as_ref()?;
+        let mut info = self.diagnostic();
+        info.id = self.id + 1;
+        info.engine = Some(group.child.engine);
+        info.placements = EngineSet::of(&[group.child.engine]);
+        info.timed_out = self.timed_out && group.timeout_lanes & 2 != 0;
+        info.reset = self.reset && group.reset_lanes & 2 != 0;
+        info.observed_runtime_ticks = group.child.runtime.diagnostic_ticks();
+        Some(info)
+    }
+    fn owns_engine(&self, engine: Engine) -> bool {
+        self.placements.contains(engine)
+            || self
+                .parallel
+                .as_ref()
+                .is_some_and(|group| group.child.engine == engine)
+    }
     fn diagnostic(&self) -> ContextInfo {
         ContextInfo {
             engine: job_timeout::observed_engine(&self.image, self.stamp, self.placements)
@@ -164,6 +211,7 @@ impl<B: GpuBacking> Context<B> {
                 Phase::Policy => ContextPhase::Policy,
                 Phase::Enable => ContextPhase::Enable,
                 Phase::Enabling => ContextPhase::Enabling,
+                Phase::Dispatch => ContextPhase::Enabling,
                 Phase::Running => ContextPhase::Running,
                 Phase::Disable => ContextPhase::Disable,
                 Phase::Disabling => ContextPhase::Disabling,
@@ -172,8 +220,16 @@ impl<B: GpuBacking> Context<B> {
                 Phase::RetireInvalidate => ContextPhase::RetireInvalidate,
                 Phase::RetireInvalidating => ContextPhase::RetireInvalidating,
             },
-            timed_out: self.timed_out,
-            reset: self.reset,
+            timed_out: self.timed_out
+                && self
+                    .parallel
+                    .as_ref()
+                    .is_none_or(|g| g.timeout_lanes & 1 != 0),
+            reset: self.reset
+                && self
+                    .parallel
+                    .as_ref()
+                    .is_none_or(|g| g.reset_lanes & 1 != 0),
             observed_runtime_ticks: self.runtime.diagnostic_ticks(),
         }
     }
@@ -328,7 +384,13 @@ impl<A: BootAllocator> GuCScheduler<A> {
     }
 
     pub(crate) fn diagnostic_contexts(&self) -> Contexts {
-        let mut contexts = Contexts::new(self.resources.contexts.len());
+        let mut contexts = Contexts::new(
+            self.resources
+                .contexts
+                .iter()
+                .map(|c| 1 + usize::from(c.parallel.is_some()))
+                .sum(),
+        );
         // Guilty/reset contexts precede innocent queued contexts if capped.
         for context in self
             .resources
@@ -344,6 +406,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
             .take(crate::intel_gpu_error::MAX_CONTEXTS)
         {
             contexts.push(context.diagnostic());
+            if let Some(child) = context.child_diagnostic() {
+                contexts.push(child);
+            }
         }
         contexts
     }
@@ -530,6 +595,18 @@ impl<A: BootAllocator> GuCScheduler<A> {
         }
         let engine = context.engine();
         let placements = context.placements();
+        if context.parallel().is_some() != batch.0.parallel().is_some() {
+            return Err(SchedulingError::State);
+        }
+        if let Some(lanes) = context.parallel() {
+            let first = self
+                .engines
+                .logical_instance(lanes[0])
+                .ok_or(SchedulingError::State)?;
+            if first.checked_add(1) != self.engines.logical_instance(lanes[1]) {
+                return Err(SchedulingError::State);
+            }
+        }
         if self.engines.logical_mask(placements).is_none()
             || placements.iter().any(|candidate| {
                 candidate.lrc_pages(self.platform) != engine.lrc_pages(self.platform)
@@ -635,12 +712,25 @@ impl<A: BootAllocator> GuCScheduler<A> {
         if self.resources.contexts.len() == MAX_CONTEXTS {
             return Err(SchedulingError::Full);
         }
-        let placements = user
+        let child = user
             .as_ref()
-            .map_or(EngineSet::of(&[engine]), |claim| claim.placements());
-        let (id, stamp) = self
-            .identities
-            .candidate(|stamp| self.resources.contexts.iter().any(|c| c.stamp == stamp))?;
+            .and_then(|claim| claim.parallel())
+            .map(|lanes| lanes[1]);
+        let placements = user.as_ref().map_or(EngineSet::of(&[engine]), |claim| {
+            if child.is_some() {
+                EngineSet::of(&[engine])
+            } else {
+                claim.placements()
+            }
+        });
+        let (id, stamp) = if child.is_some() {
+            self.identities.candidate_width(2, |stamp| {
+                self.resources.contexts.iter().any(|c| c.stamp == stamp)
+            })?
+        } else {
+            self.identities
+                .candidate(|stamp| self.resources.contexts.iter().any(|c| c.stamp == stamp))?
+        };
         let deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
         let golden_ready = self.golden_ready(engine);
         let r = &mut *self.resources;
@@ -676,11 +766,10 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 .iter()
                 .flat_map(|e| [&e.hwsp, &e.golden])
                 .any(|old| overlap(old, &image) || overlap(old, &ring))
-            || r.contexts.iter().any(|c| {
-                [&c.image, &c.ring]
-                    .into_iter()
-                    .any(|old| overlap(old, &image) || overlap(old, &ring))
-            });
+            || r.contexts
+                .iter()
+                .flat_map(Context::backings)
+                .any(|old| overlap(old, &image) || overlap(old, &ring));
         if invalid {
             r.allocator.free(ring);
             r.allocator.free(image);
@@ -801,9 +890,36 @@ impl<A: BootAllocator> GuCScheduler<A> {
             ring.write32(i as u64 * 4, word);
         }
         image.write32(REGS + 7 * 4, tail);
+        let parallel = if let Some(engine) = child {
+            match parallel::prepare(
+                r,
+                parallel::Spec {
+                    platform: self.platform,
+                    engine,
+                    parent: [&image, &ring],
+                    parent_tail: tail,
+                    id,
+                    stamp,
+                    resident: resident.as_ref().expect("parallel resident"),
+                    user: user.as_ref().expect("parallel user"),
+                },
+            ) {
+                Ok(group) => Some(group),
+                Err(e) => {
+                    r.allocator.free(ring);
+                    r.allocator.free(image);
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
         let completion = Arc::new(CompletionFence::new());
         if let Some(batch) = &resident {
             if let Err(error) = batch.reserve(&completion) {
+                if let Some(group) = parallel {
+                    group.free(&mut r.allocator);
+                }
                 r.allocator.free(ring);
                 r.allocator.free(image);
                 return Err(SchedulingError::Residency(error));
@@ -815,6 +931,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 .as_ref()
                 .is_some_and(|batch| !batch.publish_for_device())
         {
+            if let Some(group) = parallel {
+                group.free(&mut r.allocator);
+            }
             r.allocator.free(ring);
             r.allocator.free(image);
             drop(resident);
@@ -823,6 +942,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
         }
         if let Some(output) = output {
             if let Err(error) = output.install(completion.clone()) {
+                if let Some(group) = parallel {
+                    group.free(&mut r.allocator);
+                }
                 r.allocator.free(ring);
                 r.allocator.free(image);
                 drop(resident);
@@ -846,11 +968,16 @@ impl<A: BootAllocator> GuCScheduler<A> {
             tail,
             timed_out: false,
             reset: false,
+            primary_finished: false,
+            parallel,
         });
         if mutating {
             self.pristine = false;
         }
         self.identities.claim(id, stamp);
+        if child.is_some() {
+            self.identities.claim(id + 1, stamp);
+        }
         Ok((id, completion))
     }
 
@@ -903,15 +1030,23 @@ impl<A: BootAllocator> GuCScheduler<A> {
             }
         }
         let resources = &mut *self.resources;
-        let diagnostic_total = resources.contexts.len();
+        let diagnostic_total = resources
+            .contexts
+            .iter()
+            .map(|c| 1 + usize::from(c.parallel.is_some()))
+            .sum();
         for context in &mut resources.contexts {
             if context.phase == Phase::Running {
+                resources
+                    .allocator
+                    .sync_for_cpu(&context.image)
+                    .map_err(|_| SchedulingError::Cache)?;
                 fence(Ordering::Acquire);
                 let seq = context.image.read32(BREADCRUMB);
                 if seq != 0 && seq != context.stamp {
                     return Err(SchedulingError::Protocol);
                 }
-                if seq != 0 {
+                if seq != 0 && !context.primary_finished {
                     let physical = job_timeout::observed_engine(
                         &context.image,
                         context.stamp,
@@ -924,9 +1059,41 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         .find(|e| e.engine == physical)
                         .expect("scheduler engine")
                         .last_progress = Some(now);
+                    context.primary_finished = true;
+                }
+                if let Some(group) = &mut context.parallel {
+                    resources
+                        .allocator
+                        .sync_for_cpu(&group.child.image)
+                        .map_err(|_| SchedulingError::Cache)?;
+                    resources
+                        .allocator
+                        .sync_for_cpu(&group.scratch)
+                        .map_err(|_| SchedulingError::Cache)?;
+                    fence(Ordering::Acquire);
+                    if !group.valid_wq() {
+                        return Err(SchedulingError::Protocol);
+                    }
+                    let seq = group.child.image.read32(BREADCRUMB);
+                    if seq != 0 && seq != context.stamp {
+                        return Err(SchedulingError::Protocol);
+                    }
+                    if seq != 0 && !group.child.finished {
+                        resources
+                            .engines
+                            .iter_mut()
+                            .find(|e| e.engine == group.child.engine)
+                            .expect("scheduler engine")
+                            .last_progress = Some(now);
+                        group.child.finished = true;
+                    }
+                }
+                if context.primary_finished
+                    && context.parallel.as_ref().is_none_or(|g| g.child.finished)
+                {
                     context.phase = Phase::Disable;
-                    // Retirement gets its own bound: a job finishing just
-                    // inside its deadline must not lose the GT in cleanup.
+                    // Each LRC must finish. A parent breadcrumb never retires
+                    // an outstanding child, its WQ, or shared PPGTT graph.
                     context.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
                 }
             }
@@ -940,11 +1107,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 {
                     return Err(SchedulingError::Timeout);
                 }
-                resources
-                    .allocator
-                    .sync_for_cpu(&context.image)
-                    .map_err(|_| SchedulingError::Cache)?;
-                let (expired, progressed) = if context.placements.iter().count() > 1 {
+                let (mut expired, progressed) = if context.primary_finished {
+                    (false, false)
+                } else if context.placements.iter().count() > 1 {
                     context.runtime.expired_on(
                         &context.image,
                         context.stamp,
@@ -973,6 +1138,31 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         .expect("scheduler engine")
                         .last_progress = Some(now);
                 }
+                if let Some(group) = &mut context.parallel {
+                    if expired {
+                        group.timeout_lanes |= 1;
+                    }
+                    if !group.child.finished {
+                        let (child_expired, child_progressed) = group.child.runtime.expired(
+                            &group.child.image,
+                            context.stamp,
+                            group.child.engine,
+                            ct.window(),
+                        )?;
+                        if child_progressed {
+                            resources
+                                .engines
+                                .iter_mut()
+                                .find(|e| e.engine == group.child.engine)
+                                .expect("scheduler engine")
+                                .last_progress = Some(now);
+                        }
+                        if child_expired {
+                            group.timeout_lanes |= 2;
+                            expired = true;
+                        }
+                    }
+                }
                 context.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
                 if expired {
                     // GuC preempts this context alone or resets its engine
@@ -981,6 +1171,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     if self.pending_error.is_none() {
                         let mut contexts = Contexts::new(diagnostic_total);
                         contexts.push(context.diagnostic());
+                        if let Some(child) = context.child_diagnostic() {
+                            contexts.push(child);
+                        }
                         self.pending_error = Some(Report::capture(
                             Capture {
                                 platform: self.platform,
@@ -1028,30 +1221,59 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     alloc::vec![context.stamp | 0x80000000, 0x80000003],
                     Phase::RetireInvalidating,
                 ),
-                Phase::Register => (
-                    0x4502,
-                    alloc::vec![
-                        1,
-                        id,
-                        context.engine.guc_class(),
-                        self.engines
-                            .logical_mask(context.placements)
-                            .expect("published placements"),
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        context.image.ggtt_offset()
-                            | if context.resident.is_some() {
-                                0x119
-                            } else {
-                                0x19
-                            },
-                        0
-                    ],
-                    Phase::Policy,
-                ),
+                Phase::Register => {
+                    let descriptor = context.image.ggtt_offset()
+                        | if context.resident.is_some() {
+                            0x119
+                        } else {
+                            0x19
+                        };
+                    let mask = self
+                        .engines
+                        .logical_mask(context.placements)
+                        .expect("published placements");
+                    if let Some(group) = &context.parallel {
+                        let scratch = group.scratch.ggtt_offset();
+                        (
+                            0x4601,
+                            alloc::vec![
+                                1,
+                                id,
+                                context.engine.guc_class(),
+                                mask,
+                                scratch,
+                                0,
+                                scratch + 1024,
+                                0,
+                                1024,
+                                2,
+                                descriptor,
+                                0,
+                                group.child.image.ggtt_offset() | 0x119,
+                                0,
+                            ],
+                            Phase::Policy,
+                        )
+                    } else {
+                        (
+                            0x4502,
+                            alloc::vec![
+                                1,
+                                id,
+                                context.engine.guc_class(),
+                                mask,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                descriptor,
+                                0,
+                            ],
+                            Phase::Policy,
+                        )
+                    }
+                }
                 Phase::Policy => (
                     0x100b,
                     {
@@ -1066,12 +1288,29 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     Phase::Enable,
                 ),
                 Phase::Enable => (0x1001, alloc::vec![id, 1], Phase::Enabling),
+                // Parallel queues need the additional SCHED_CONTEXT after
+                // ENABLE; only ENABLE produces a scheduling-mode reply.
+                Phase::Dispatch => (0x1000, alloc::vec![id], Phase::Running),
                 Phase::Disable => (0x1001, alloc::vec![id, 0], Phase::Disabling),
                 Phase::Deregister => (0x4503, alloc::vec![id], Phase::Deregistering),
                 _ => continue,
             };
             match ct.send(context.id, action, 0, &payload, true) {
-                Ok(()) => context.phase = next,
+                Ok(()) => {
+                    context.phase = next;
+                    if next == Phase::Running {
+                        context.fence.mark_submitted();
+                        context.deadline =
+                            now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
+                        if context.user.is_some() {
+                            for engine in &mut resources.engines {
+                                if context.owns_engine(engine.engine) {
+                                    engine.last_progress.get_or_insert(now);
+                                }
+                            }
+                        }
+                    }
+                }
                 Err(TransportError::Ct(crate::intel_gpu_guc::GuCError::Full)) => {}
                 Err(error) => return Err(SchedulingError::Transport(error)),
             }
@@ -1081,23 +1320,31 @@ impl<A: BootAllocator> GuCScheduler<A> {
             .iter()
             .filter(|context| context.user.is_some() && context.phase == Phase::Running)
         {
-            // A missing start marker or all contexts staying switched
-            // out must not leave admission wedged forever. Only reset
-            // when every allowed engine made no GPU progress for three
-            // watchdog intervals; never attribute that stall to a queue.
-            if context
+            // A queued virtual context or gang may wait for an allowed
+            // engine executing other work. Only a lack of GPU progress on
+            // every unfinished lane/placement justifies the global fallback.
+            // Finished lanes cannot mask the remaining lane's stall. Active
+            // per-lane runtime budgets above remain independent.
+            let newest = context
                 .placements
                 .iter()
+                .filter(|_| !context.primary_finished)
+                .chain(
+                    context
+                        .parallel
+                        .iter()
+                        .filter(|g| !g.child.finished)
+                        .map(|g| g.child.engine),
+                )
                 .filter_map(|engine| state_of(&resources.engines, engine).last_progress)
-                .max()
-                .is_some_and(|last| now.saturating_sub(last) >= 3 * TIMEOUT)
-            {
+                .max();
+            if newest.is_some_and(|last| now.saturating_sub(last) >= 3 * TIMEOUT) {
                 return Err(SchedulingError::Timeout);
             }
         }
         for engine in &mut resources.engines {
             if !resources.contexts.iter().any(|context| {
-                context.placements.contains(engine.engine)
+                context.owns_engine(engine.engine)
                     && context.user.is_some()
                     && context.phase == Phase::Running
             }) {
@@ -1136,20 +1383,33 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     c.stamp == cookie & 0x7fffffff
                 } else {
                     u32::from(c.id) == cookie
+                        || (c.parallel.is_some() && u32::from(c.id) + 1 == cookie)
                 }
             })
             .ok_or(SchedulingError::Protocol)?;
         let resources = &mut *self.resources;
-        let diagnostic_total = resources.contexts.len();
+        let diagnostic_total = resources
+            .contexts
+            .iter()
+            .map(|c| 1 + usize::from(c.parallel.is_some()))
+            .sum();
         let c = &mut resources.contexts[index];
+        if action == 0x4600 || (action == 0x7001 && c.phase == Phase::RetireInvalidating) {
+            for backing in c.backings() {
+                resources
+                    .allocator
+                    .sync_for_cpu(backing)
+                    .map_err(|_| SchedulingError::Cache)?;
+            }
+            fence(Ordering::Acquire);
+        }
         match (action, c.phase, message.payload.get(1).copied()) {
             (0x7001, Phase::Invalidating, None) if cookie == c.stamp => c.phase = Phase::Register,
             (0x7001, Phase::RetireInvalidating, None) if cookie == (c.stamp | 0x80000000) => {
                 fence(Ordering::Acquire);
                 let hung = c.timed_out || c.reset;
                 if !hung
-                    && (c.image.read32(BREADCRUMB) != c.stamp
-                        || c.image.read32(REGS + 5 * 4) & 0x1ffffc != c.tail)
+                    && (!c.all_finished() || c.parallel.as_ref().is_some_and(|g| !g.valid_wq()))
                 {
                     return Err(SchedulingError::Protocol);
                 }
@@ -1162,12 +1422,28 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         .map_err(|_| SchedulingError::Cache)?;
                     job_timeout::observed_engine(&c.image, c.stamp, c.placements)?
                         .ok_or(SchedulingError::Protocol)?;
-                    user.capture(&c.image, c.engine.first_lri(self.platform))
+                    if let Some(group) = &c.parallel {
+                        resources
+                            .allocator
+                            .sync_for_cpu(&group.child.image)
+                            .map_err(|_| SchedulingError::Cache)?;
+                        user.capture_lanes(
+                            &[&c.image, &group.child.image],
+                            c.engine.first_lri(self.platform),
+                        )
                         .map_err(SchedulingError::Residency)?;
+                    } else {
+                        user.capture(&c.image, c.engine.first_lri(self.platform))
+                            .map_err(SchedulingError::Residency)?;
+                    }
                 }
                 let c = resources.contexts.remove(index);
                 let r = resources;
                 r.allocator.free(c.ring);
+                if let Some(group) = c.parallel {
+                    group.free(&mut r.allocator);
+                    self.identities.retire(c.id + 1);
+                }
                 if self.defaults == Defaults::Seed(c.engine, c.id) {
                     r.seed_image = Some(c.image);
                     r.seed_id = Some(c.id);
@@ -1193,8 +1469,14 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 }
             }
             (0x1002, Phase::Enabling, Some(1)) => {
-                c.phase = Phase::Running;
-                c.fence.mark_submitted();
+                c.phase = if c.parallel.is_some() {
+                    Phase::Dispatch
+                } else {
+                    Phase::Running
+                };
+                if c.parallel.is_none() {
+                    c.fence.mark_submitted();
+                }
                 // Start the watchdog when GuC may run it. User execution
                 // time itself comes from the ring marker/LRC timestamps.
                 c.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
@@ -1202,7 +1484,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     for engine in resources
                         .engines
                         .iter_mut()
-                        .filter(|engine| c.placements.contains(engine.engine))
+                        .filter(|engine| c.owns_engine(engine.engine))
                     {
                         engine.last_progress.get_or_insert(now);
                     }
@@ -1212,6 +1494,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
             (
                 0x1008,
                 Phase::Running
+                | Phase::Dispatch
                 | Phase::Disable
                 | Phase::Disabling
                 | Phase::Deregister
@@ -1227,9 +1510,15 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     c.deadline = now.checked_add(TIMEOUT).ok_or(SchedulingError::Timeout)?;
                 }
                 c.reset = true;
+                if let Some(group) = &mut c.parallel {
+                    group.reset_lanes |= 1 << (cookie - u32::from(c.id));
+                }
                 if !c.timed_out && self.pending_error.is_none() {
                     let mut contexts = Contexts::new(diagnostic_total);
                     contexts.push(c.diagnostic());
+                    if let Some(child) = c.child_diagnostic() {
+                        contexts.push(child);
+                    }
                     // GuC's notification follows its engine reset. Preserve
                     // software facts, without claiming a pre-reset MMIO image.
                     self.pending_error = Some(Report::capture(
@@ -1245,14 +1534,13 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         |_| None,
                     ));
                 }
-                if c.phase == Phase::Running {
+                if matches!(c.phase, Phase::Running | Phase::Dispatch) {
                     c.phase = Phase::Disable;
                 }
             }
             (0x4600, Phase::Deregistering, None) => {
                 fence(Ordering::Acquire);
-                let finished = c.image.read32(BREADCRUMB) == c.stamp
-                    && c.image.read32(REGS + 5 * 4) & 0x1ffffc == c.tail;
+                let finished = c.all_finished() && c.parallel.as_ref().is_none_or(|g| g.valid_wq());
                 if !finished && !c.timed_out && !c.reset {
                     return Err(SchedulingError::Protocol);
                 }
@@ -1328,6 +1616,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
         for c in r.contexts.drain(..) {
             r.allocator.free(c.ring);
             r.allocator.free(c.image);
+            if let Some(group) = c.parallel {
+                group.free(&mut r.allocator);
+            }
             drop(c.resident);
             if let Some(user) = c.user {
                 user.finish(true);
@@ -1494,6 +1785,59 @@ fn context_image(image: &impl GpuBacking, platform: GtPlatform, ring: u32) {
 mod identity_tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+    fn smoke_parallel_identity_contiguous_blocks_fragmentation_and_reuse() -> TestResult {
+        let mut ids = Identities::new();
+        assert_eq!(ids.candidate_width(2, |_| false), Ok((1, 1)));
+        assert_eq!(ids.candidate_width(2, |_| false), Ok((1, 1)));
+        for expected in (1..64).step_by(2) {
+            let (id, stamp) = ids.candidate_width(2, |_| false).unwrap();
+            assert_eq!(id, expected);
+            ids.claim(id, stamp);
+            ids.claim(id + 1, stamp);
+        }
+        assert_eq!(ids.used, u64::MAX);
+        assert_eq!(
+            ids.candidate_width(2, |_| false),
+            Err(SchedulingError::Full)
+        );
+        // Releasing only the parent never creates a reusable two-ID block.
+        for id in (1..64).step_by(2) {
+            ids.retire(id);
+        }
+        assert_eq!(
+            ids.candidate_width(2, |_| false),
+            Err(SchedulingError::Full)
+        );
+        // The last/first slots are not contiguous in firmware ID space.
+        ids.retire(64);
+        ids.claim(63, 40);
+        assert_eq!(
+            ids.candidate_width(2, |_| false),
+            Err(SchedulingError::Full)
+        );
+        ids.retire(8);
+        assert_eq!(ids.candidate_width(2, |_| false), Ok((7, 41)));
+        let (id, stamp) = ids.candidate_width(2, |_| false).unwrap();
+        ids.claim(id, stamp);
+        ids.claim(id + 1, stamp);
+        assert_eq!(
+            ids.candidate_width(2, |_| false),
+            Err(SchedulingError::Full)
+        );
+        ids.retire(7);
+        ids.retire(8);
+        ids.next_stamp = 0x7fffffff;
+        assert_eq!(
+            ids.candidate_width(2, |s| s == 0x7fffffff || s == 1),
+            Ok((7, 2))
+        );
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_parallel",
+        smoke_parallel_identity_contiguous_blocks_fragmentation_and_reuse
+    );
+
     fn smoke_identity_pool_full_wrap_and_failed_preview() -> TestResult {
         let mut ids = Identities::new();
         assert_eq!(ids.candidate(|_| false), Ok((1, 1)));

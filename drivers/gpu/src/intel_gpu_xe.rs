@@ -279,11 +279,16 @@ impl XeFile {
         let width = u16::from_le_bytes(wire[8..10].try_into().unwrap());
         let count = u16::from_le_bytes(wire[10..12].try_into().unwrap());
         // xe_exec_queue.c bounds the copied placement matrix to nine entries.
-        // Parallel multi-LRC execution remains a separate protocol.
-        if width != 1 || !(1..=9).contains(&count) {
+        // Admit only one two-LRC row; wider/multi-placement parallel groups
+        // require additional firmware workqueue and migration ownership.
+        if !((width == 1 && (1..=9).contains(&count)) || (width == 2 && count == 1)) {
             return Err(FsError::InvalidData);
         }
-        let instances = read(user, u64_at(&wire, 24), usize::from(count) * 8)?;
+        let instances = read(
+            user,
+            u64_at(&wire, 24),
+            usize::from(width) * usize::from(count) * 8,
+        )?;
         let instance = &instances[..8];
         zero(&instance[4..8])?; // GT0 plus MBZ pad, logical instance may be COPY1.
         let class = u16::from_le_bytes(instance[..2].try_into().unwrap());
@@ -294,7 +299,7 @@ impl XeFile {
             .as_ref()
             .and_then(|b| b.status())
             .map_or_else(Default::default, |status| status.engines);
-        if class == 5 && (logical != 0 || count != 1) {
+        if class == 5 && (logical != 0 || count != 1 || width != 1) {
             return Err(FsError::InvalidData);
         }
         let mut placements = crate::intel_gpu_engine::EngineSet::default();
@@ -337,7 +342,22 @@ impl XeFile {
             }
             extensions = u64_at(&ext, 0);
         }
-        let context = if class == 5 {
+        let context = if width == 2 {
+            if !matches!(class, 1 | 4) {
+                return Err(FsError::InvalidData);
+            }
+            let first = present
+                .from_class_instance(class, logical)
+                .ok_or(FsError::InvalidData)?;
+            let second_logical = u16::from_le_bytes(instances[10..12].try_into().unwrap());
+            if logical.checked_add(1) != Some(second_logical) {
+                return Err(FsError::InvalidData);
+            }
+            let second = present
+                .from_class_instance(class, second_logical)
+                .ok_or(FsError::InvalidData)?;
+            UserContext::for_parallel([first, second])?
+        } else if class == 5 {
             UserContext::new()
         } else {
             UserContext::for_placements(placements)?
@@ -475,9 +495,10 @@ impl XeFile {
         zero(&wire[34..56])?;
         let count = u16::from_le_bytes(wire[32..34].try_into().unwrap());
         // xe_exec_ioctl order: queue lookup, VM queue, batch count against
-        // the width-1 queue, then reset status before any sync is parsed.
+        // the queue width, then reset status before any sync is parsed.
         let queue = self.queue(u32_at(&wire, 8))?;
-        if queue.bind || count > 1 {
+        let parallel = queue.context.parallel();
+        if queue.bind || (count != 0 && count != if parallel.is_some() { 2 } else { 1 }) {
             return Err(FsError::InvalidData);
         }
         // A hung or reset queue is banned: -ECANCELED (reset_status).
@@ -492,6 +513,15 @@ impl XeFile {
             return Err(FsError::Canceled);
         }
         let sync = Sync::read(user, u64_at(&wire, 16), u32_at(&wire, 12), table)?;
+        if parallel.is_some() && sync.user_fence.is_some() {
+            return Err(FsError::NotImplemented);
+        }
+        let addresses = if parallel.is_some() && count != 0 {
+            let vector = read(user, u64_at(&wire, 24), 16)?;
+            Some([u64_at(&vector, 0), u64_at(&vector, 8)])
+        } else {
+            None
+        };
         let backend = info.backend.as_ref().ok_or(FsError::NoDevice)?;
         let _order = queue.context.serial.lock().await;
         sync.wait().await;
@@ -509,13 +539,22 @@ impl XeFile {
                 .filter(|s| s.platform == info.platform)
                 .ok_or(FsError::NoDevice)?;
             queue.context.check_epoch(status.epoch).map_err(canceled)?;
-            let resident = ResidentBatch::from_vm(
-                status.platform,
-                &state.mappings,
-                (count == 1).then_some(u64_at(&wire, 24)),
-                queue.vm.scratch,
-                sync.user_fence,
-            )?;
+            let resident = if parallel.is_some() {
+                ResidentBatch::from_vm_parallel(
+                    status.platform,
+                    &state.mappings,
+                    addresses,
+                    queue.vm.scratch,
+                )?
+            } else {
+                ResidentBatch::from_vm(
+                    status.platform,
+                    &state.mappings,
+                    (count == 1).then_some(u64_at(&wire, 24)),
+                    queue.vm.scratch,
+                    sync.user_fence,
+                )?
+            };
             match backend
                 .submit(queue.context.clone(), UserBatch(resident))
                 .await

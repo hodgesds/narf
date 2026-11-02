@@ -1,4 +1,4 @@
-//! Cached dGPU telemetry and bounded DG2/BMG PL1 requests, serviced by the
+//! Cached dGPU telemetry and bounded DG2/BMG power requests, serviced by the
 //! retained GT reset/power owner.
 //!
 //! MIT Linux b90c984d615e8ce2af96f5b1411a962d83fed2ad:
@@ -20,6 +20,8 @@ use crate::{intel_gpu_aux::MmioWindow, intel_gpu_gt::GtPlatform};
 mod bmg_power;
 #[path = "intel_gpu_hwmon_i1.rs"]
 mod i1;
+#[path = "intel_gpu_hwmon_interval.rs"]
+mod interval;
 #[path = "intel_gpu_hwmon_pcode.rs"]
 mod pcode;
 #[path = "intel_gpu_hwmon_pmt.rs"]
@@ -235,7 +237,7 @@ impl Monitor {
 
     /// The caller holds the GT reset/power mutex and checks current PCI D0
     /// and capability authority before *each* operation. All-ones optional
-    /// sensors remain unavailable. Sensors and PL1 observations run at most
+    /// sensors remain unavailable. Sensors and power observations run at most
     /// 1 Hz; a queued DG2 control uses one bounded read/RMW/readback sequence.
     /// BMG discovery advances at most one mailbox step per service poll.
     /// No wait, PM wake, IRQ or sysfs-triggered MMIO is performed here.
@@ -774,6 +776,35 @@ impl Monitor {
                 move |bytes| store.power.store_interval(bytes, narf_time::monotonic_ns()),
             );
         } else {
+            for attribute in [
+                "power2_cap_default",
+                "power2_cap_min",
+                "power2_cap_max",
+                "power2_cap_status",
+                "power2_max_interval_min",
+                "power2_max_interval_max",
+                "power2_cap_interval_min",
+                "power2_cap_interval_max",
+            ] {
+                let monitor = self.clone();
+                kobject_add_attr(&node, attribute, move || {
+                    monitor.show(attribute, narf_time::monotonic_ns())
+                });
+            }
+            for attribute in ["power2_cap", "power2_max_interval", "power2_cap_interval"] {
+                let show = self.clone();
+                let store = self.clone();
+                kobject_add_writable_attr(
+                    &node,
+                    attribute,
+                    move || show.show(attribute, narf_time::monotonic_ns()),
+                    move |bytes| {
+                        store
+                            .bmg_power
+                            .store_attribute(attribute, bytes, narf_time::monotonic_ns())
+                    },
+                );
+            }
             for attribute in [
                 "i1_status",
                 "power1_label",
