@@ -1364,21 +1364,66 @@ fn smoke_brcmf_refused_flow_ops_retire_flow_not_runtime() -> TestResult {
         return TestResult::Fail("TX after a refused create did not retire exactly");
     }
 
-    // A refused delete also retires the flow as Closed — this is the
-    // transition station_transport's flow-cache eviction relies on — and
-    // the runtime keeps working afterwards.
+    // Keep this historic registration: refused creates remain local
+    // outcomes, but a refused DELETE cannot prove native mapping retirement.
+    // Only the separate confirmed-delete case permits reuse after status0.
     owner.close_flow(flow).unwrap();
     if owner.flow_state(flow) != Ok(runtime::FlowState::Deleting) {
         return TestResult::Fail("flow not Deleting before refused delete completion");
     }
+    let (address, original, allocations, dropped) = {
+        let state = s.lock();
+        let control = pointer(&state, RINGS + 8);
+        let create = &state.dma[&control][17 * 40..18 * 40];
+        let address = u64::from_le_bytes(create[32..40].try_into().unwrap());
+        (
+            address,
+            state.dma[&address].clone(),
+            state.allocated,
+            state.dropped,
+        )
+    };
     flow_reply_status(&mut s.lock(), 2, 6, 2, 5);
-    if owner.poll() != Ok(1) || owner.flow_state(flow) != Ok(runtime::FlowState::Closed) {
-        return TestResult::Fail("refused delete did not retire the flow as Closed");
+    if owner.poll() != Err(runtime::Error::Firmware(5))
+        || !owner.is_failed()
+        || owner.is_reclaimable()
+        || owner.flow_state(flow) != Ok(runtime::FlowState::Deleting)
+    {
+        return TestResult::Fail("refused delete fabricated native mapping retirement");
     }
-    let flow = owner.open_flow(source, destination, 3).unwrap();
-    flow_reply(&mut s.lock(), 3, 4, 2);
-    if owner.poll() != Ok(1) || owner.flow_state(flow) != Ok(runtime::FlowState::Open) {
-        return TestResult::Fail("runtime unusable after a refused delete");
+    let doorbells = s.lock().doorbells;
+    if owner.open_flow(source, destination, 3) != Err(runtime::Error::Failed)
+        || owner.send(flow, &frame) != Err(runtime::Error::Failed)
+        || owner.close_flow(flow) != Err(runtime::Error::Failed)
+        || owner.poll() != Err(runtime::Error::Failed)
+    {
+        return TestResult::Fail("refused-delete owner admitted reuse or new native publication");
+    }
+    {
+        let state = s.lock();
+        if state.dma[&address] != original
+            || state.allocated != allocations
+            || state.dropped != dropped
+            || state.dropped_addresses.contains(&address)
+            || state.dma_enable
+            || state.doorbells != doorbells
+        {
+            return TestResult::Fail(
+                "refused DELETE zeroed/reused/freed its original native mapping",
+            );
+        }
+    }
+    drop(owner);
+    let state = s.lock();
+    if state.dma_enable
+        || state.dropped != dropped
+        || state.dropped_addresses.contains(&address)
+        || state.parks < 2
+        || state.unsafe_free != 0
+    {
+        return TestResult::Fail(
+            "failed-delete teardown invented quiescence or released uncertain DMA",
+        );
     }
     TestResult::Pass
 }
