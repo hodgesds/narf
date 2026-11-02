@@ -20,8 +20,10 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr, Kobject};
+use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::controller::ControllerInfo;
 
@@ -36,6 +38,30 @@ pub struct ConnInfo {
     pub is_le: bool,
     /// Link state string, e.g. "connected".
     pub state: &'static str,
+}
+
+/// Controller kobjects by HCI ordinal, so the pump can mirror its
+/// connection table into sysfs without the controller registry having
+/// to carry a `Kobject` (which has no `Debug` impl, so it cannot be
+/// a field of the `#[derive(Debug)]` `Controller`).
+///
+/// Populated by [`register_hci_controller`] on every registration
+/// (overwriting any stale slot, e.g. after a sysfs test reset);
+/// a missing slot means "no controller published at this ordinal"
+/// and the index-keyed helpers below become no-ops.
+static HCI_KOBJS: IrqSafeSpinLock<Vec<Option<Arc<Kobject>>>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Controller kobject for `index`, if one has been published.
+pub fn hci_kobject(index: usize) -> Option<Arc<Kobject>> {
+    HCI_KOBJS.lock().get(index).cloned().flatten()
+}
+
+fn store_hci_kobject(index: usize, kobj: &Arc<Kobject>) {
+    let mut slots = HCI_KOBJS.lock();
+    while slots.len() <= index {
+        slots.push(None);
+    }
+    slots[index] = Some(kobj.clone());
 }
 
 /// Register `/sys/class/bluetooth/hci<index>/` for one controller.
@@ -136,6 +162,11 @@ pub fn register_hci_controller(
 
     // ── per-connection children ──────────────────────────────────────
 
+    // Publish the controller node for the pump's connection mirroring
+    // (and any later per-controller children) before populating the
+    // initial connections below.
+    store_hci_kobject(index, &hci_kobj);
+
     for conn in conns {
         add_connection(&hci_kobj, index, conn);
     }
@@ -146,12 +177,18 @@ pub fn register_hci_controller(
 /// Add a per-connection child kobject `hci<N>:<handle>` under an
 /// existing controller kobject.
 ///
+/// Idempotent per handle: any stale child of the same name is removed
+/// first, so a duplicate complete event cannot stack two same-named
+/// children (`Kobject::new_child` itself never dedups).
+///
 /// Linux ref: `hci_conn_add_sysfs` — `dev_set_name(&conn->dev, "%s:%d", …)`
 ///            (`net/bluetooth/hci_sysfs.c:46`).
 pub fn add_connection(hci_kobj: &Arc<Kobject>, controller_index: usize, conn: &ConnInfo) {
     use narf_filesystem::sysfs::Kobject;
 
     let child_name = format!("hci{}:{}", controller_index, conn.handle);
+    // Idempotency: drop a stale same-named child before creating.
+    hci_kobj.remove_child(&child_name);
     let child = Kobject::new_child(hci_kobj.clone(), child_name);
 
     let addr = conn.bd_addr;
@@ -176,6 +213,32 @@ pub fn add_connection(hci_kobj: &Arc<Kobject>, controller_index: usize, conn: &C
     // `state` — e.g. "connected", "disconnecting".
     let state = conn.state;
     kobject_add_attr(&child, "state", move || format!("{}\n", state));
+}
+
+/// Remove the per-connection child kobject `hci<N>:<handle>` from a
+/// controller kobject. Returns true if a child was removed.
+///
+/// Linux ref: `hci_conn_del_sysfs` (`net/bluetooth/hci_sysfs.c`).
+pub fn remove_connection(hci_kobj: &Arc<Kobject>, controller_index: usize, handle: u16) -> bool {
+    hci_kobj.remove_child(&format!("hci{}:{}", controller_index, handle))
+}
+
+/// Mirror one connection into sysfs for the controller published at
+/// `index`. No-op when no controller kobject is published at that
+/// ordinal (e.g. a pump driven without registration).
+pub fn add_connection_for(index: usize, conn: &ConnInfo) {
+    if let Some(hci_kobj) = hci_kobject(index) {
+        add_connection(&hci_kobj, index, conn);
+    }
+}
+
+/// Drop one connection's sysfs child for the controller published at
+/// `index`. Returns false when nothing was published or removed.
+pub fn remove_connection_for(index: usize, handle: u16) -> bool {
+    match hci_kobject(index) {
+        Some(hci_kobj) => remove_connection(&hci_kobj, index, handle),
+        None => false,
+    }
 }
 
 /// Format a BD_ADDR byte array as "XX:XX:XX:XX:XX:XX" (big-endian display,
@@ -288,4 +351,43 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/sysfs", smoke_sysfs_hci_connection_child);
+
+    // ── smoke: connection child removal ──────────────────────────────
+
+    fn smoke_sysfs_hci_connection_remove() -> TestResult {
+        __reset_for_test();
+        let conn = ConnInfo {
+            handle: 3,
+            bd_addr: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            is_le: true,
+            state: "connected",
+        };
+        let kobj = register_hci_controller(0, make_info(), &[]);
+        add_connection(&kobj, 0, &conn);
+        if kobj.get_child("hci0:3").is_none() {
+            return TestResult::Fail("child missing after add");
+        }
+        // Re-adding the same handle must not stack a second child.
+        add_connection(&kobj, 0, &conn);
+        if kobj
+            .child_names()
+            .iter()
+            .filter(|n| n.as_str() == "hci0:3")
+            .count()
+            != 1
+        {
+            return TestResult::Fail("duplicate add stacked a second child");
+        }
+        if !remove_connection(&kobj, 0, 3) {
+            return TestResult::Fail("remove should report true");
+        }
+        if kobj.get_child("hci0:3").is_some() {
+            return TestResult::Fail("child survived remove");
+        }
+        if remove_connection(&kobj, 0, 3) {
+            return TestResult::Fail("second remove should report false");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/sysfs", smoke_sysfs_hci_connection_remove);
 }

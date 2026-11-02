@@ -180,7 +180,13 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   transport path. Registration is idempotent by transport identity and returns
   the stable `hci<N>` ordinal.
 - `sysfs_bridge::register_hci_controller(index, info, connections)` publishes
-  a ready controller under `/sys/class/bluetooth/hci<N>`.
+  a ready controller under `/sys/class/bluetooth/hci<N>` and records its
+  kobject for the pump's connection mirroring. `sysfs_bridge::add_connection`
+  / `remove_connection` add/drop the `hci<N>:<handle>` per-connection child
+  (Linux `hci_conn_add_sysfs` / `hci_conn_del_sysfs`, child name `%s:%d`);
+  the index-keyed `add_connection_for` / `remove_connection_for` helpers
+  are the pump's entry points and no-op when nothing is published at that
+  ordinal.
 - `pump` — the HCI event/ACL driver task. `pump::notify_controller_ready(index)`
   (called by both registration paths above) registers a per-controller
   `PumpCore`; `pump::enable_spawning()` (Stage::Late `bluetooth-pump`
@@ -192,6 +198,8 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
   per-controller `GattServer`, SMP to a per-connection `smp::Responder`
   driven by the production `pump::NarfSmpCrypto` (narf-crypto P-256 /
   AES-CMAC / hardware RNG), signalling channels answered per §L2CAP.
+  Connection tracking also mirrors into sysfs: connect gains the
+  `hci<N>:<handle>` child, disconnect removes it (issue #891).
   `pump::stop_pump(index)` quiesces a controller's task ahead of detach.
 
 ## Scope
