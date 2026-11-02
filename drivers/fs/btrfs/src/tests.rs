@@ -17,6 +17,7 @@ use crate::chunk::ChunkMap;
 use crate::format::{self, BtrfsKey, Superblock};
 use crate::volume::BtrfsVolume;
 
+mod extent_window;
 mod safety;
 mod snapshots;
 

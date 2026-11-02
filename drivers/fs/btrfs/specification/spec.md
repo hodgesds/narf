@@ -69,6 +69,11 @@ reader retain old bytes as current after the mutation completes. Shrinking
 truncate publishes EOF and revokes mappings under the same operation lock,
 before retiring extents; a failed revoke restores the cached inode there.
 
+File-content reads seek to the extent at or before the requested offset and
+walk only the requested window. A small read must not collect the inode's
+entire extent list. The existing operation lock, checksum verification,
+compressed-extent cache and zero filling of holes still cover these reads.
+
 Last-link unlink and file replacement remove the name and persist `nlink=0`
 with a Linux `ORPHAN_ITEM` in the owning fs tree. Existing handles and private
 or shared mappings retain the original inode, data and xattrs. They remain

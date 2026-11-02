@@ -362,7 +362,7 @@ physical HDMI link or Mesa shader execution on this card.
 | Post-modeset power saving | Latest boot failed on an all-ones RLC override read after partial writes. Its full-word override operand now follows Linux's RMW, with a fresh running-RLC control probe before accepting all-set data; status and other control reads still fail on all ones. Native RX 6000 submission now declares GC access guarded: submission, READ_MMR_REG, TDR and kernel VRAM work acquire a GFXOFF reference and recheck activation/reset epoch under the owner. Other policy prerequisites still apply. Physical power transitions remain unverified. |
 | Recovery, cancellation and device loss | Native RX 6000 tracks guilty hangs, cancelled pending jobs and device loss separately from physical retirement. Shared WAIT_CS and WAIT_FENCES all/any keep the original job/submitter across reset on RX 6000 and RX 9000. Failed jobs wake waiters without releasing unconfirmed memory. Physical mode1 reset remains unverified. |
 | VCN idle and resume | RX 6000 VCN3 idle work releases encode DPG pause after physical completion, stops idle instances after one second and conditionally sends SMU PowerDownVcn. Begin-use restores power/hardware while preserving sessions and logical fences; JPEG remains independent. MM_DPM_PG keeps its existing opt-in. Static/DPG, cancellation and failure paths have model coverage; physical acceptance remains pending. |
-| Optional media and topology | Native VCN degraded and topology returned `Readback`; JPEG verified. The 2026-11-01 Linux comparison below identifies the selector-readback check as invalid on this GPU. Native topology after the fix and VCN decoding remain unverified. |
+| Optional media and topology | Native VCN degraded; JPEG verified. The 2026-11-01 Linux comparison below identified the selector-readback check as invalid on this GPU. Subsequent physical boots completed topology sampling; VCN decoding remains unverified. |
 
 The 2026-11-01 physical boot `9e92160e-b279-479e-b112-fecaa9c90366`
 (kernel revision `9d7387de6`, EFI SHA-256
@@ -392,8 +392,32 @@ therefore discarded a valid selection. The sampler now follows Linux
 `gfx_v10_0_select_se_sh` / `gfx_v10_0_get_cu_info`: write the selector,
 read the harvest data and restore broadcast, including on read failure.
 The zero-readback and identity regressions both fail the original code.
-These findings identify a concrete Mesa initialization blocker; physical
-Plasma startup after correction remains unverified.
+These findings identify a concrete Mesa initialization blocker. Physical
+boots `3890c824-b279-479e-b112-fecaf8c86c73` and
+`90c7a810-b279-479e-b112-feca2ce35c69` with revision `af55606ee`
+completed topology sampling without the earlier Mesa identity rejection.
+Neither reached a visible desktop.
+
+The latter boot's KWin main thread was sampled in the dynamic loader,
+including a 1024-byte library read at 135 seconds. KWin exited before the
+collector could copy its stack; the persistent journal ends before that
+process starts. Separate fd-link and fdinfo samples can observe descriptor
+reuse and do not establish a stable blocked file or the termination cause.
+The preceding boot had a main-thread 4096-byte read, an approximately 8 GiB
+resident footprint and a service startup timeout; the allocation's origin
+and that read's fd target remain unknown.
+
+The read-path audit found that Btrfs `read_file` collected every extent of
+an inode for each small read. Linux `fs/btrfs/inode.c::btrfs_get_extent`
+instead looks up the requested offset and its predecessor. Linux FIEMAP
+on this host reports 713 extents for `libLLVM.so.23.1` and 361 for
+`libgallium-26.2.5-arch3.1.so`. NARF now seeks to the covering predecessor
+and walks only the requested window, retaining the existing operation
+lock, checksums, decompressed cache and hole behavior. A synthetic
+512-extent, 32-leaf regression bounds a 1 KiB middle read to four metadata
+reads; the old whole-inode scan fails it. This establishes read amplification
+and its correction, not the cause of the remaining native desktop failure
+or a measured startup-time improvement.
 
 The earlier native boot also failed in the dynamic loader before Plasma
 startup. The separate VFS/Btrfs fixes and their private-mmap regression must
