@@ -342,6 +342,14 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             && self.awake().is_ok()
     }
 
+    /// Cached identity of this exact live firmware log upload; no MMIO.
+    pub(crate) fn log_incarnation(&self) -> Option<u64> {
+        if self.state != GtState::SchedulingReady {
+            return None;
+        }
+        self.parts.boot.live_log().map(|log| log.incarnation)
+    }
+
     pub(crate) fn attach_log_stream(
         &mut self,
         session: Arc<crate::intel_gpu_guc_log::StreamSession>,
@@ -350,6 +358,10 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         digest: [u8; 32],
     ) -> Result<(), narf_filesystem::FsError> {
         use narf_filesystem::FsError;
+        let session = session.source_owner();
+        if !session.source_open() {
+            return Err(FsError::NoDevice);
+        }
         if self.state != GtState::SchedulingReady || epoch == 0 || self.user_epoch() != Some(epoch)
         {
             return Err(FsError::NoDevice);
@@ -363,6 +375,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         self.awake().map_err(|_| FsError::NoDevice)?;
         let log = self.parts.boot.live_log().ok_or(FsError::NoDevice)?;
+        if !session.matches_incarnation(log.incarnation) {
+            return Err(FsError::NoDevice);
+        }
         if !log.backing.coherent_for_device() {
             return Err(FsError::Unsupported);
         }
@@ -381,6 +396,12 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             firmware_version: log.firmware_version,
             firmware_digest: digest,
         };
+        if !crate::intel_gpu_guc_log::stream::supported(
+            identity.platform,
+            identity.firmware_version,
+        ) {
+            return Err(FsError::Unsupported);
+        }
         self.log_stream = Some(crate::intel_gpu_guc_log::stream::Actor::new(
             session,
             identity,

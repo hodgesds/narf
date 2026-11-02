@@ -1673,6 +1673,30 @@ source-integrity checks pass. aarch64 QEMU is omitted under the maintainer's
 iteration policy. The ledger records 45 implemented rows and ten broad open
 workstreams; Intel silicon and Mesa acceptance remain unrun.
 
+The next Intel checkpoint adds fixed Gen12 CTM, independently qualified
+64x64 hardware cursor, exact display12/13 native LUT profiles and legacy gamma.
+Gen12 pre data uses Q16 while MTL retains Q24. Display12's unreadable fine/coarse
+post-LUT RAM uses complete canonical DSB writes and readable hardware witnesses
+under exclusive bypass ownership; clear/reset restores visible bypass and new
+activation rewrites the full table. Large color blobs have bounded stored and
+concurrent-copy budgets. The legacy Gen12 arena/root paths now enforce DMA39.
+
+GuC log v2 shares one source actor among four retained reader FIFOs, preserves
+partial records and atomically accounts for overwritten host wire records.
+Firmware overflow counters remain observed lower bounds. Actual firmware-log
+incarnation plus nonreused publication serial prevents queued-open replay
+across park, reset and republication; descriptors read host copies under current
+admin/syslog authority. All 39 new native fixtures and four rewritten log
+fixtures pass. Selected Intel/DRM/framebuffer/backlight and runtime-power groups
+pass 1087 unique x86_64 tests, including 31 shared backlight regressions, with
+zero failures or skips. The x86_64 production boot and both btrfs postflights
+pass. GPU/fb target CI Clippy passes all three feature contexts on both
+architectures, all four host GPU feature configurations pass all-target
+Clippy, debug/release builds pass on both targets, and formatting/diff/source
+integrity checks pass. aarch64 QEMU is omitted because no aarch64-specific
+production behavior changes. The ledger has 49 implemented checkpoint rows
+and ten broad open workstreams; Intel silicon and Mesa acceptance are unrun.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

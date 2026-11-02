@@ -283,7 +283,7 @@ pub enum ModesetError {
     /// Invalid plane geometry, pitch or GGTT range. Linear pitch must
     /// be nonzero, 64-byte aligned and cover the active row.
     InvalidFramebuffer,
-    /// Owned Xe-LPG RGB color setup could not prove Pipe A disabled, or
+    /// Owned TGL+ RGB color setup could not prove Pipe A disabled, or
     /// its bypass register writes did not read back. Leave the pipe off.
     ColorPipelineUnavailable,
     /// A fixed display resource request or pipe-off repartition failed.
@@ -357,6 +357,7 @@ pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     /// when more than one pipe is active. `None` keeps the PRM
     /// pre-boot single-pipe programming.
     dbuf_share: Option<(u16, u16)>,
+    gen12_family: Option<crate::intel_gpu_gt::Gen12Platform>,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for Modeset<'a, M> {
@@ -384,7 +385,12 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             ddi,
             pipe,
             dbuf_share: None,
+            gen12_family: None,
         }
+    }
+
+    pub(crate) fn set_gen12_family(&mut self, family: crate::intel_gpu_gt::Gen12Platform) {
+        self.gen12_family = Some(family);
     }
 
     /// The pipe this run programs.
@@ -753,6 +759,17 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.enable_dbuf_slices()?;
         self.program_watermarks(&mode, primary_fb);
 
+        // Establish the shared TGL+ RGB/CSC bypass while the internal pipe
+        // is still stopped. Live adoption never resets inherited color.
+        if ddi_mode == crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST {
+            self.initialize_internal_color()?;
+            if self.pipe == Pipe::A && self.ddi == Ddi::A && self.dbuf_share.is_none() {
+                if let Some(family) = self.gen12_family {
+                    crate::intel_gpu_gen12_cursor_resources::setup(self.mmio, &mode, family)
+                        .map_err(|_| ModesetError::DisplayResourceUnavailable)?;
+                }
+            }
+        }
         // Step 8: program primary plane — framebuffer pointer,
         // stride, format.
         self.program_plane(primary_fb, &mode);
@@ -1119,6 +1136,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.mmio
             .write32(self.pipe.trans_base() + PIPE_SRCSZ_OFFSET, prog.srcsz);
         compiler_fence(Ordering::SeqCst);
+    }
+
+    fn initialize_internal_color(&mut self) -> Result<(), ModesetError> {
+        if self.pipe == Pipe::A && self.ddi == Ddi::A {
+            crate::intel_gpu_color::initialize_rgb_bypass(self.mmio)
+                .map_err(|_| ModesetError::ColorPipelineUnavailable)?;
+        }
+        Ok(())
     }
 
     /// Program the primary plane — surface address, stride, size,
@@ -1711,10 +1736,36 @@ pub(crate) fn modeset_display<M: MmioWindow + ?Sized>(
     fb: &Framebuffer,
     mode: Option<&Mode>,
 ) -> Result<Mode, ModesetError> {
+    modeset_display_family(mmio, generation, None, fb, mode)
+}
+
+pub(crate) fn modeset_display_for_chip<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    chip: crate::intel_gpu::ChipInfo,
+    fb: &Framebuffer,
+    mode: Option<&Mode>,
+) -> Result<Mode, ModesetError> {
+    let family = match crate::intel_gpu_gt::GtPlatform::from_pci(chip.vid, chip.did) {
+        Some(crate::intel_gpu_gt::GtPlatform::Gen12(family)) => Some(family),
+        _ => None,
+    };
+    modeset_display_family(mmio, chip.generation, family, fb, mode)
+}
+
+fn modeset_display_family<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    generation: crate::intel_gpu::Generation,
+    family: Option<crate::intel_gpu_gt::Gen12Platform>,
+    fb: &Framebuffer,
+    mode: Option<&Mode>,
+) -> Result<Mode, ModesetError> {
     use crate::intel_gpu::Generation;
     match generation {
         Generation::TigerLake | Generation::AlderLake => {
             let mut ms = Modeset::new(mmio, Ddi::A);
+            if let Some(family) = family {
+                ms.set_gen12_family(family);
+            }
             match mode {
                 Some(mode) => ms.modeset_fixed(fb, mode),
                 None => ms.modeset(fb, None),
@@ -1789,6 +1840,14 @@ pub mod tests {
 
     impl MmioWindow for FakeMmio {
         fn read32(&self, off: u64) -> u32 {
+            // Model the actual common RGB bypass writes; canned power/PLL
+            // state observations below retain their independent behavior.
+            if matches!(off, 0x70034 | 0x4a480 | 0x49028 | 0x701c8 | 0x701cc) {
+                if let Some((_, value)) = self.writes.borrow().iter().rev().find(|(r, _)| *r == off)
+                {
+                    return *value;
+                }
+            }
             let mut v = 0u32;
             for (o, val) in self.reads.borrow().iter() {
                 if *o == off {
@@ -2247,6 +2306,51 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_modeset",
         smoke_program_pipe_writes_srcsz
+    );
+
+    fn smoke_gen12_internal_rgb_bypass_precedes_primary_and_refuses_live_pipe() -> TestResult {
+        let mmio = FakeMmio::new();
+        let mut ms = Modeset::new(&mmio, Ddi::A);
+        ms.initialize_internal_color().unwrap();
+        assert_eq!(
+            &*mmio.writes.borrow(),
+            &[
+                (0x70034, 0),
+                (0x4a480, 0),
+                (0x49028, 0),
+                (0x701c8, 0),
+                (0x701cc, 1 << 13)
+            ]
+        );
+        ms.program_plane(
+            &Framebuffer {
+                phys_addr: 0x1000000,
+                stride_bytes: 4096,
+                format: PixelFormat::Xrgb8888,
+            },
+            &Mode::VESA_1024X768_60,
+        );
+        assert_eq!(mmio.writes.borrow().last().unwrap().0, 0x7019c);
+        for (r, value) in [(0x70008, 1 << 31), (0x70180, 1 << 31)] {
+            let mmio = FakeMmio::new();
+            mmio.set_read(r, value);
+            let mut ms = Modeset::new(&mmio, Ddi::A);
+            assert_eq!(
+                ms.initialize_internal_color(),
+                Err(ModesetError::ColorPipelineUnavailable)
+            );
+            assert!(mmio.writes.borrow().is_empty());
+        }
+        let mmio = FakeMmio::new();
+        Modeset::for_pipe(&mmio, Ddi::B, Pipe::B)
+            .initialize_internal_color()
+            .unwrap();
+        assert!(mmio.writes.borrow().is_empty());
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_modeset",
+        smoke_gen12_internal_rgb_bypass_precedes_primary_and_refuses_live_pipe
     );
 
     fn smoke_program_plane_arms_surf_last() -> TestResult {
@@ -3142,13 +3246,20 @@ pub mod tests {
 /// the existing framebuffer mapping.
 pub fn takeover_display(gpu: &crate::intel_gpu::IntelGpu) -> Option<Mode> {
     let window = gpu.mode_window();
-    takeover_display_with(&window, gpu.chip.generation)
+    takeover_display_with_chip(&window, gpu.chip.generation, Some(gpu.chip))
 }
 
 /// Take over only an enabled firmware pipe, using its current surface.
 pub(crate) fn takeover_display_with<M: MmioWindow + ?Sized>(
     mmio: &M,
     generation: crate::intel_gpu::Generation,
+) -> Option<Mode> {
+    takeover_display_with_chip(mmio, generation, None)
+}
+fn takeover_display_with_chip<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    generation: crate::intel_gpu::Generation,
+    chip: Option<crate::intel_gpu::ChipInfo>,
 ) -> Option<Mode> {
     use crate::intel_gpu_pipes::{
         Pipe, PIPECONF_ENABLE, PIPECONF_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_STRIDE_OFFSET,
@@ -3169,5 +3280,8 @@ pub(crate) fn takeover_display_with<M: MmioWindow + ?Sized>(
         stride_bytes: stride.checked_mul(64)?,
         format: PixelFormat::Xrgb8888,
     };
-    modeset_display(mmio, generation, &fb, None).ok()
+    match chip {
+        Some(chip) => modeset_display_for_chip(mmio, chip, &fb, None).ok(),
+        None => modeset_display(mmio, generation, &fb, None).ok(),
+    }
 }

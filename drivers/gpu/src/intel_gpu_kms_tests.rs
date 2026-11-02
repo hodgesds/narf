@@ -35,6 +35,9 @@ struct Hardware {
     actions: Vec<Action>,
     palette: [u32; 1024],
     palette_writes: usize,
+    superfine: [u32; 18],
+    superfine_writes: usize,
+    unreadable_prec_reads: usize,
     pre_palette: [u32; 131],
     pre_writes: usize,
     legacy_collisions: bool,
@@ -63,6 +66,12 @@ struct Hardware {
     dsb_stalled: [bool; 2],
     dsb_writes: Vec<(u64, u32)>,
     poison_dsb_read: bool,
+    gen12_display: bool,
+    pcode_latencies: [u8; 8],
+    pcode_block_time: u32,
+    pcode_status: u32,
+    forbidden_display_reads: usize,
+    writes: Vec<(u64, u32)>,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct MockPlatform(
@@ -94,6 +103,9 @@ impl MockPlatform {
                 actions: Vec::new(),
                 palette: core::array::from_fn(|i| i as u32),
                 palette_writes: 0,
+                superfine: [0; 18],
+                superfine_writes: 0,
+                unreadable_prec_reads: 0,
                 pre_palette: core::array::from_fn(|i| i as u32 + 17),
                 pre_writes: 0,
                 legacy_collisions: false,
@@ -122,6 +134,12 @@ impl MockPlatform {
                 dsb_stalled: [false; 2],
                 dsb_writes: Vec::new(),
                 poison_dsb_read: false,
+                gen12_display: false,
+                pcode_latencies: [6, 8, 10, 12, 14, 16, 0, 0],
+                pcode_block_time: 10,
+                pcode_status: 0,
+                forbidden_display_reads: 0,
+                writes: Vec::new(),
             })),
             Arc::new(AtomicBool::new(false)),
             false,
@@ -136,6 +154,7 @@ impl MockPlatform {
     pub(crate) fn gen12(&self, family: crate::intel_gpu_gt::Gen12Platform) -> Device<Self> {
         let mut platform = self.clone();
         platform.3 = Some(family);
+        self.0.lock().gen12_display = true;
         let generation = if family == crate::intel_gpu_gt::Gen12Platform::TigerLake {
             Generation::TigerLake
         } else {
@@ -194,6 +213,21 @@ impl MockPlatform {
     }
     pub(crate) fn palette_writes(&self) -> usize {
         self.0.lock().palette_writes
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn superfine(&self) -> [u32; 18] {
+        self.0.lock().superfine
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn precision(&self) -> [u32; 1024] {
+        self.0.lock().palette
+    }
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn unreadable_prec_reads(&self) -> usize {
+        self.0.lock().unreadable_prec_reads
+    }
+    pub(crate) fn superfine_writes(&self) -> usize {
+        self.0.lock().superfine_writes
     }
     pub(crate) fn pre_writes(&self) -> usize {
         self.0.lock().pre_writes
@@ -254,6 +288,62 @@ impl MockPlatform {
         self.set(0x70008, 3 << 30);
         self.set(0x70180, 0x84000000);
         timing
+    }
+    pub(crate) fn gen12_cursor_resources(
+        &self,
+        family: crate::intel_gpu_gt::Gen12Platform,
+    ) -> crate::intel_gpu_dsb::Timing {
+        let timing = self.dsb_timing();
+        self.0.lock().gen12_display = true;
+        self.set(0x70008, 0);
+        self.set(0x70180, 0);
+        let mode = crate::intel_gpu_modeset::Mode {
+            pixel_clock_khz: timing.clock,
+            h_active: timing.width,
+            h_total: timing.htotal,
+            v_active: timing.height,
+            v_total: timing.vtotal,
+            ..crate::intel_gpu_modeset::Mode::VESA_1024X768_60
+        };
+        crate::intel_gpu_gen12_cursor_resources::setup(self, &mode, family)
+            .unwrap()
+            .unwrap();
+        self.set(0x70008, 3 << 30);
+        self.set(0x70180, 0x84000000);
+        timing
+    }
+    pub(crate) fn pcode_values(&self, latencies: [u8; 8], block_time: u32, status: u32) {
+        let mut hw = self.0.lock();
+        hw.pcode_latencies = latencies;
+        hw.pcode_block_time = block_time;
+        hw.pcode_status = status;
+    }
+    pub(crate) fn forbidden_display_reads(&self) -> usize {
+        self.0.lock().forbidden_display_reads
+    }
+    pub(crate) fn writes(&self) -> Vec<(u64, u32)> {
+        self.0.lock().writes.clone()
+    }
+    pub(crate) fn cursor_mappings(&self) -> Vec<(u64, u32)> {
+        let hw = self.0.lock();
+        // Command and cursor owners share144..160MiB. Observe the real first
+        // HEAD0 write to identify the command BO's two8KiB buffers; the other
+        // present mappings belong to this Device's private32KiB cursor BO.
+        // Write history survives source/leaf shutdown and reset recovery.
+        let Some(command_base) = hw.writes.iter().find_map(|&(r, value)| {
+            (r == 0x70b00 && (144 * 1024 * 1024..160 * 1024 * 1024).contains(&value))
+                .then_some(u64::from(value))
+        }) else {
+            return Vec::new();
+        };
+        let start = GGTT_ARRAY_BASE + 144 * 1024 * 1024 / 4096 * 8;
+        let end = GGTT_ARRAY_BASE + 160 * 1024 * 1024 / 4096 * 8;
+        let command = GGTT_ARRAY_BASE + command_base / 4096 * 8;
+        hw.regs
+            .range(start..end)
+            .filter(|&(&r, _)| !(command..command + 4 * 8).contains(&r))
+            .map(|(&r, &v)| (r, v))
+            .collect()
     }
     pub(crate) fn allow_flips(&self, enabled: bool) {
         self.0.lock().flips = enabled;
@@ -384,6 +474,38 @@ impl MmioWindow for MockPlatform {
         if (self.reset_lost() && !self.2) || !hw.allowed || !hw.powered {
             return u32::MAX;
         }
+        // Gen12 has no MTL display PAT, MMIO latency or PM_DEMAND port.
+        // Reads fail and are counted, even if the caller later falls back.
+        if hw.gen12_display
+            && matches!(
+                offset,
+                0x4804 | 0x45780 | 0x45784 | 0x45788 | 0x45230 | 0x45234
+            )
+        {
+            hw.forbidden_display_reads += 1;
+            return u32::MAX;
+        }
+        if offset == 0x4a40c {
+            let index = hw.regs.get(&0x4a408).copied().unwrap_or(0);
+            let value = hw.superfine[(index & 31) as usize];
+            if index & (1 << 15) != 0 {
+                hw.regs.insert(0x4a408, (1 << 15) | ((index + 1) & 31));
+            }
+            return value;
+        }
+        if offset == 0x4a404
+            && hw.gen12_display
+            && hw
+                .regs
+                .get(&crate::intel_gpu_color::GAMMA)
+                .copied()
+                .unwrap_or(0)
+                & 3
+                == 3
+        {
+            hw.unreadable_prec_reads += 1;
+            return 0xdeadbeef; // real source forbids fine/coarse readback
+        }
         if offset == 0x4a404 {
             return hw.palette[(hw.regs.get(&0x4a400).copied().unwrap_or(0) & 1023) as usize];
         }
@@ -402,6 +524,7 @@ impl MmioWindow for MockPlatform {
 }
 impl Hardware {
     fn write(&mut self, offset: u64, value: u32) {
+        self.writes.push((offset, value));
         if offset == self.refuse_layout {
             return;
         }
@@ -415,6 +538,32 @@ impl Hardware {
                     return;
                 }
             }
+        }
+        if offset == crate::intel_gpu_pcode::PCODE_MAILBOX && value & (1 << 31) != 0 {
+            use crate::intel_gpu_pcode::*;
+            let result = match value & 255 {
+                PCODE_CMD_READ_MEM_LATENCY => {
+                    let set = self.regs.get(&PCODE_DATA0).copied().unwrap_or(0) as usize;
+                    if set > 1 {
+                        self.regs.insert(offset, 3);
+                        return;
+                    }
+                    u32::from_le_bytes(
+                        self.pcode_latencies[set * 4..set * 4 + 4]
+                            .try_into()
+                            .unwrap(),
+                    )
+                }
+                PCODE_CMD_READ_SAGV_BLOCK_TIME_US => self.pcode_block_time,
+                _ => {
+                    self.regs.insert(offset, 1);
+                    return;
+                }
+            };
+            self.regs.insert(PCODE_DATA0, result);
+            self.regs.insert(PCODE_DATA1, 0);
+            self.regs.insert(offset, self.pcode_status);
+            return;
         }
         if offset == 0x45234 {
             self.regs.insert(offset, value & !(1 << 31));
@@ -443,8 +592,13 @@ impl Hardware {
                 self.dsb_writes.push((offset, value));
                 if offset == base + 0x28 {
                     let old = self.regs.get(&offset).copied().unwrap_or(0);
-                    self.regs
-                        .insert(offset, (value & 0xffff0000) | ((old & 0xffff) & !value));
+                    let status = if self.gen12_display {
+                        // Linux intel_dsb.c: nonexistent status bits are RW.
+                        ((old & 0x0f) & !value) | (value & 0xfff0)
+                    } else {
+                        (old & 0xffff) & !value
+                    };
+                    self.regs.insert(offset, (value & 0xffff0000) | status);
                     return;
                 }
                 if offset == base + 8 {
@@ -469,7 +623,16 @@ impl Hardware {
                 return;
             }
         }
-        if offset == 0x4a488 {
+        if offset == 0x4a40c {
+            self.superfine_writes += 1;
+            if !self.refuse_palette {
+                let index = self.regs.get(&0x4a408).copied().unwrap_or(0);
+                self.superfine[(index & 31) as usize] = value;
+                if index & (1 << 15) != 0 {
+                    self.regs.insert(0x4a408, (1 << 15) | ((index + 1) & 31));
+                }
+            }
+        } else if offset == 0x4a488 {
             self.pre_writes += 1;
             if !self.refuse_palette {
                 let index = self.regs.get(&0x4a484).copied().unwrap_or(0);
@@ -524,8 +687,8 @@ impl Hardware {
             return None;
         }
         let pte = GGTT_ARRAY_BASE + u64::from(address) / 4096 * 8;
-        let value =
-            u64::from(*self.regs.get(&pte)?) | (u64::from(*self.regs.get(&(pte + 4))?) << 32);
+        let value = u64::from(*self.regs.get(&pte)?)
+            | (u64::from(self.regs.get(&(pte + 4)).copied().unwrap_or(0)) << 32);
         if value & 1 == 0 {
             return None;
         }

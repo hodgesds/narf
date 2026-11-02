@@ -1454,13 +1454,9 @@ pub(crate) fn relight_display_locked(
         format: crate::intel_gpu_modeset::PixelFormat::Xrgb8888,
     };
     let window = ModeWindow::new(display.gtt_mmadr, display.device, display.cap);
-    let applied = crate::intel_gpu_modeset::modeset_display(
-        &window,
-        display.chip.generation,
-        &fb,
-        Some(mode),
-    )
-    .ok()?;
+    let applied =
+        crate::intel_gpu_modeset::modeset_display_for_chip(&window, display.chip, &fb, Some(mode))
+            .ok()?;
     let scanout = ActiveScanout {
         width: u32::from(applied.h_active),
         height: u32::from(applied.v_active),

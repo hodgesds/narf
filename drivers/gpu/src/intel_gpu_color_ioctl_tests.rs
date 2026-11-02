@@ -1475,3 +1475,10 @@ mod tiled {
 mod gen12 {
     include!("intel_gpu_gen12_ioctl_tests.rs");
 }
+mod gen12_ctm {
+    include!("intel_gpu_gen12_ctm_ioctl_tests.rs");
+}
+
+mod gen12_luts {
+    include!("intel_gpu_gen12_lut_ioctl_tests.rs");
+}

@@ -57,7 +57,7 @@ pub(crate) fn service(w: &Window, memory: &Words, id: u16, request: &[u32]) {
                 let mut words = log.borrow_mut();
                 for i in 0..2 {
                     assert_eq!(words[i * 9 + 2], words[i * 9 + 5]);
-                    assert_eq!(words[i * 9 + 7], 0);
+                    assert_eq!(words[i * 9 + 7] & 1, 0);
                 }
                 assert_eq!(words[72 / 4 + 7], 0x1f, "capture section was acknowledged");
                 if w.0.borrow().stream_overwrite {
@@ -228,7 +228,11 @@ fn smoke_guc_stream_hardware_linear_wrapped_copy_precedes_ack_and_close() -> Tes
         let mut copied = false;
         for now in 501..530 {
             poll(&mut gt, now);
-            let n = session.read_for_test(&mut prefix).unwrap();
+            let n = match session.read_for_test(&mut prefix) {
+                Ok(n) => n,
+                Err(FsError::WouldBlock) => 0,
+                Err(e) => panic!("unexpected stream error {e:?}"),
+            };
             if n != 0 {
                 assert_eq!(n, 8);
                 copied = true;
@@ -257,7 +261,7 @@ fn smoke_guc_stream_hardware_linear_wrapped_copy_precedes_ack_and_close() -> Tes
                 dword(&bytes, 24),
                 dword(&bytes, 28)
             ),
-            (1, 192, 3, session.index())
+            (2, 256, 3, session.index())
         );
         assert_eq!(qword(&bytes, 32), 0);
         assert_eq!(qword(&bytes, 40), epoch);
@@ -289,45 +293,50 @@ kernel_test_in!(
     smoke_guc_stream_hardware_linear_wrapped_copy_precedes_ack_and_close
 );
 
-fn smoke_guc_stream_hardware_two_slots_backpressure_retries_without_early_ack() -> TestResult {
+fn smoke_guc_stream_hardware_fanout_overwrite_preserves_partial_and_ack() -> TestResult {
     let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
     prime_copy8(&mut gt, &w);
-    let first = initialize(&w, false);
+    initialize(&w, false);
     let session = session();
+    let follower = session.subscribe_for_test().unwrap();
     let epoch = gt.user_epoch().unwrap();
     gt.attach_log_stream(session.clone(), epoch, 500, [0; 32])
         .unwrap();
+    assert_eq!(
+        gt.attach_log_stream(follower.clone(), epoch, 500, [0; 32]),
+        Ok(()),
+        "a follower must resolve to the existing firmware actor"
+    );
     w.0.borrow_mut().stream_overwrite = true;
     until_ack(&mut gt, &w, 1, 501);
+    // Preserve a partial record for the slow reader. The follower drains all.
+    let mut prefix = [0; 8];
+    assert_eq!(session.read_for_test(&mut prefix), Ok(8));
+    let first = frame(&follower, Vec::new());
     produce(&w, 0x40);
     until_ack(&mut gt, &w, 2, 540);
+    let second = frame(&follower, Vec::new());
     produce(&w, 0x60);
-    poll(&mut gt, 580);
-    service_now(&w);
-    assert_eq!(w.0.borrow().stream_acks, 2);
+    until_ack(&mut gt, &w, 3, 580);
+    let third = frame(&follower, Vec::new());
     assert_eq!(
-        (
-            logs(&w).borrow()[2],
-            logs(&w).borrow()[5],
-            logs(&w).borrow()[7]
-        ),
-        (20, 24, 1)
+        (qword(&first, 32), qword(&second, 32), qword(&third, 32)),
+        (0, 1, 2)
     );
-    let bytes0 = frame(&session, Vec::new());
-    assert_eq!(
-        sections(&bytes0),
-        [first[0].as_slice(), first[1].as_slice()]
-    );
-    poll(&mut gt, 581);
-    assert_eq!(w.0.borrow().stream_acks, 2);
-    service_now(&w);
-    assert_eq!(w.0.borrow().stream_acks, 3);
-    let bytes1 = frame(&session, Vec::new());
-    let bytes2 = frame(&session, Vec::new());
-    assert_eq!((qword(&bytes1, 32), qword(&bytes2, 32)), (1, 2));
-    assert_eq!(sections(&bytes1), [&[0x40, 0x41, 0x42, 0x43][..]; 2]);
-    assert_eq!(sections(&bytes2), [&[0x60, 0x61, 0x62, 0x63][..]; 2]);
+    assert_eq!(qword(&third, 208), 0, "fast reader lost a frame");
+    let slow0 = frame(&session, prefix.to_vec());
+    let slow2 = frame(&session, Vec::new());
+    assert_eq!((qword(&slow0, 32), qword(&slow2, 32)), (0, 2));
+    assert_eq!(qword(&slow2, 208), 1);
+    assert_eq!(qword(&slow2, 216), second.len() as u64);
+    assert_eq!(sections(&slow2), [&[0x60, 0x61, 0x62, 0x63][..]; 2]);
     close(&mut gt, &w, &session, 590);
+    assert_eq!(follower.read_for_test(&mut [0; 8]), Err(FsError::NoDevice));
+    assert_eq!(
+        w.0.borrow().stream_fences.len(),
+        3,
+        "fanout created a competing control owner"
+    );
     hardware_stop(&mut gt, &w, 0xdfc);
     drop(gt);
     assert_eq!(arena.live_allocations(), 0);
@@ -335,10 +344,10 @@ fn smoke_guc_stream_hardware_two_slots_backpressure_retries_without_early_ack() 
 }
 kernel_test_in!(
     "drivers/gpu/intel_gpu_guc_log",
-    smoke_guc_stream_hardware_two_slots_backpressure_retries_without_early_ack
+    smoke_guc_stream_hardware_fanout_overwrite_preserves_partial_and_ack
 );
 
-fn smoke_guc_stream_hardware_bad_headers_overflow_cursor_and_access_loss() -> TestResult {
+fn smoke_guc_stream_hardware_bad_headers_reserved_flags_cursor_and_access_loss() -> TestResult {
     for failure in 0..5 {
         let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
         prime_copy8(&mut gt, &w);
@@ -386,7 +395,7 @@ fn smoke_guc_stream_hardware_bad_headers_overflow_cursor_and_access_loss() -> Te
             let log = logs(&w);
             match failure {
                 0 => log.borrow_mut()[0] = 0,
-                1 => log.borrow_mut()[7] = 0x11,
+                1 => log.borrow_mut()[7] = 0x21,
                 _ => log.borrow_mut()[2] = 0, // differs from our acknowledged read cursor16
             }
             poll(&mut gt, 540);
@@ -421,10 +430,10 @@ fn smoke_guc_stream_hardware_bad_headers_overflow_cursor_and_access_loss() -> Te
 }
 kernel_test_in!(
     "drivers/gpu/intel_gpu_guc_log",
-    smoke_guc_stream_hardware_bad_headers_overflow_cursor_and_access_loss
+    smoke_guc_stream_hardware_bad_headers_reserved_flags_cursor_and_access_loss
 );
 
-fn smoke_guc_stream_hardware_timeouts_full_fifo_and_malformed_restore_hold_owner() -> TestResult {
+fn smoke_guc_stream_hardware_timeouts_continuous_overflow_and_restore_ownership() -> TestResult {
     for failure in 0..6 {
         let (w, arena, mut gt) = hardware_model(GtPlatform::Battlemage, 0xdfc);
         prime_copy8(&mut gt, &w);
@@ -491,42 +500,19 @@ fn smoke_guc_stream_hardware_timeouts_full_fifo_and_malformed_restore_hold_owner
             if failure == 4 {
                 logs(&w).borrow_mut()[7] = 0x11;
             }
-            poll(&mut gt, 580);
-            service_now(&w);
-            assert_eq!(w.0.borrow().stream_acks, 2);
-            assert_eq!(
-                logs(&w).borrow()[2],
-                20,
-                "full FIFO advanced the source cursor"
-            );
-            if failure == 3 {
-                poll(&mut gt, 500_001_000);
-            }
-            let end = if failure == 3 { 500_001_001 } else { 581 };
-            poll(&mut gt, end);
-            service_now(&w);
-            assert!(!gt.idle());
-            poll(&mut gt, end + 1);
-            assert!(gt.idle());
-            let bytes0 = frame(&session, Vec::new());
+            until_ack(&mut gt, &w, 3, 580);
             let bytes1 = frame(&session, Vec::new());
-            assert_eq!((qword(&bytes0, 32), qword(&bytes1, 32)), (0, 1));
-            assert_eq!(sections(&bytes1), [&[0x40, 0x41, 0x42, 0x43][..]; 2]);
-            let mut buffer = [0; 8];
-            assert_eq!(
-                session.read_for_test(&mut buffer),
-                Err(if failure == 3 {
-                    FsError::NoSpace
-                } else {
-                    FsError::InvalidData
-                })
-            );
-            assert_eq!(
-                w.0.borrow().stream_acks,
-                2,
-                "terminal data loss fabricated a flush ACK"
-            );
-            assert_eq!(logs(&w).borrow()[2], 20);
+            let bytes2 = frame(&session, Vec::new());
+            assert_eq!((qword(&bytes1, 32), qword(&bytes2, 32)), (1, 2));
+            assert_eq!(qword(&bytes2, 208), 1, "host overwrite must be explicit");
+            assert_eq!(qword(&bytes2, 192), if failure == 4 { 8 } else { 0 });
+            if failure == 4 {
+                assert_ne!(dword(&bytes2, 20) & (2 | 4), 0);
+                assert_eq!(sections(&bytes2)[0].len(), 65536);
+            }
+            assert_eq!(session.read_for_test(&mut [0; 8]), Err(FsError::WouldBlock));
+            assert!(!gt.idle(), "continuous stream still owns PM/CT");
+            close(&mut gt, &w, &session, 620);
         }
         assert_eq!(arena.live_allocations(), baseline);
         hardware_stop(&mut gt, &w, 0xdfc);
@@ -537,5 +523,5 @@ fn smoke_guc_stream_hardware_timeouts_full_fifo_and_malformed_restore_hold_owner
 }
 kernel_test_in!(
     "drivers/gpu/intel_gpu_guc_log",
-    smoke_guc_stream_hardware_timeouts_full_fifo_and_malformed_restore_hold_owner
+    smoke_guc_stream_hardware_timeouts_continuous_overflow_and_restore_ownership
 );

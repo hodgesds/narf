@@ -490,6 +490,9 @@ impl Plan {
                 return Ok(p);
             }
             Request::Cursor(bytes, object, hardware) => {
+                if hardware && !card.intel_cursor_supported(p.next.id) {
+                    return Err(FsError::Unsupported);
+                }
                 if !hardware && (p.next.x != 0 || p.next.y != 0) {
                     return Err(FsError::Unsupported);
                 }
@@ -668,7 +671,7 @@ impl Plan {
                         } else if object == p.next.id {
                             match prop {
                                 CRTC_CTM_PROP_ID => {
-                                    if !card.intel_color(p.next.id) {
+                                    if !card.intel_ctm_supported(p.next.id) {
                                         return Err(FsError::Unsupported);
                                     }
                                     let blob = u32_value(value)?;
@@ -688,7 +691,15 @@ impl Plan {
                                     if id != 0 {
                                         let bytes =
                                             card.property_blob(id).ok_or(FsError::NotFound)?;
-                                        if ![256 * 8, 1024 * 8].contains(&bytes.len()) {
+                                        if ![
+                                            256 * 8,
+                                            card.intel_lut_sizes(p.next.id)
+                                                .ok_or(FsError::Unsupported)?
+                                                .0
+                                                * 8,
+                                        ]
+                                        .contains(&bytes.len())
+                                        {
                                             return Err(FsError::InvalidData);
                                         }
                                     }
@@ -700,8 +711,9 @@ impl Plan {
                                     }
                                     let id = u32_value(value)?;
                                     if id != 0 {
-                                        crate::intel_gpu_color::DegammaLut::decode(
+                                        crate::intel_gpu_color::DegammaLut::decode_profile(
                                             card.property_blob(id).ok_or(FsError::NotFound)?,
+                                            card.intel_lut_profile(),
                                         )?;
                                     }
                                     degamma = Some(id);
@@ -788,7 +800,10 @@ impl Plan {
         color_primary |= panning || tiling;
         let mut view = View::from(viewport);
         if color.is_some() || gamma.is_some() || degamma.is_some() || panning || tiling {
-            if !card.intel_color(p.next.id) {
+            if !card.intel_ctm_supported(p.next.id)
+                || (color_primary && !card.intel_ctm)
+                || (!card.intel_color(p.next.id) && (gamma.is_some() || degamma.is_some()))
+            {
                 return Err(FsError::Unsupported);
             }
             if !color_compatible || !p.previous.enabled || p.previous.mode.is_none() {
@@ -863,7 +878,12 @@ impl Plan {
             }
             // MTL's single-buffered LUT and independent color arms require
             // the owned DSB chain for active replacement/combined changes.
-            let needs_dsb = color_primary
+            let needs_dsb = (card.intel_gen12_lut.is_some()
+                && (p.next_gamma != 0
+                    || p.previous_gamma != 0
+                    || p.next_degamma != 0
+                    || p.previous_degamma != 0))
+                || color_primary
                 || ((p.previous_gamma != 0 || p.previous_degamma != 0)
                     && ((p.next_degamma != p.previous_degamma && p.next_degamma != 0)
                         || (p.next_gamma != p.previous_gamma && p.next_gamma != 0)))
@@ -897,16 +917,18 @@ impl Plan {
             let lut = if p.next_gamma == 0 {
                 None
             } else {
-                Some(crate::intel_gpu_color::Lut::decode(
+                Some(crate::intel_gpu_color::Lut::decode_profile(
                     card.property_blob(p.next_gamma).ok_or(FsError::NotFound)?,
+                    card.intel_lut_profile(),
                 )?)
             };
             let degamma = if p.next_degamma == 0 {
                 None
             } else {
-                Some(crate::intel_gpu_color::DegammaLut::decode(
+                Some(crate::intel_gpu_color::DegammaLut::decode_profile(
                     card.property_blob(p.next_degamma)
                         .ok_or(FsError::NotFound)?,
+                    card.intel_lut_profile(),
                 )?)
             };
             p.action = Action::Color {
@@ -1747,7 +1769,11 @@ pub(crate) async fn dispatch(
 ) -> Option<Result<u64, FsError>> {
     if drm_uapi::ioc_nr(cmd) == 0xa4 {
         let mode = crate::drm_registry::mode_state(index)?;
-        if mode.lock().intel_ctm {
+        let has_legacy_gamma = {
+            let card = mode.lock();
+            card.intel_ctm || card.intel_gen12_lut.is_some()
+        };
+        if has_legacy_gamma {
             return Some(get_legacy_gamma(&mode, arg, context));
         }
     }
@@ -1769,8 +1795,11 @@ pub(crate) async fn dispatch(
                 events,
                 geometry,
                 display.epoch(),
-                (crate::drm_registry::mode_state(index).is_some_and(|card| card.lock().intel_ctm))
-                    .then_some(gem),
+                (crate::drm_registry::mode_state(index).is_some_and(|card| {
+                    let card = card.lock();
+                    card.intel_ctm || card.intel_hw_cursor
+                }))
+                .then_some(gem),
             )
             .await
             {

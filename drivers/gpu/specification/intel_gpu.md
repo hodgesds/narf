@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.30** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.31** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -20,7 +20,8 @@
 > fixed hardware cursor, DG2 visible VRAM, flush-coordinated GuC streams,
 > parallel GPU user-fence joins, legacy gamma, BMG PSYS controls, EU-stall sampling,
 > placement matrices, pre-CSC degamma, sampled read thresholds, execution coredumps,
-> Gen12 GuC/fixed primary, Tile4, retained copies and runtime-power controls — see §20).
+> Gen12 GuC/fixed primary, Tile4, retained copies and runtime-power controls,
+> Gen12 CTM/cursor/native LUTs and bounded loss-accounted GuC log fanout — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -2161,7 +2162,7 @@ production feature. Unsupported functionality remains unadvertised.
 | GuC width-two through width-four groups | Single-row adjacent dense logical COPY/COMPUTE lanes, protected scratch/workqueue, contiguous IDs, independent saved/runtime state and all-lane retirement | Implemented; native fixtures pass |
 | Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification |
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; separate GT lifecycle |
-| Diagnostics/performance | Diagnostic coverage beyond bounded retained VM/dumpable BO prefixes, broader loss-accounted log capture, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
+| Diagnostics/performance | Diagnostic coverage beyond bounded retained VM/dumpable BO prefixes and qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; modeset resource transactions |
 | Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; per-platform display profiles |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
@@ -2194,6 +2195,10 @@ production feature. Unsupported functionality remains unadvertised.
 | Fixed Tile4 primary | Qualified MTL/Arrow layout/panning with source watermark equations, retained original/current/pending images and joint DSB/primary/console retirement | Implemented; native fixtures pass |
 | Gen12 GuC execution | Exact firmware families, optional HWCONFIG, source cache/context/restore policy,39-bit DMA, RCS0/BCS0 native execution, owned reset and non-tile MSI | Implemented; native fixtures pass |
 | Gen12 fixed internal primary | Live exclusive GT, unchanged bandwidth/route/resource image, PAT-free bounded mappings and native FIFO/cancel/reset/console proof | Implemented; native fixtures pass |
+| Gen12 fixed CTM | Driver-established internal RGB bypass, retained route/resource/console proofs and native queued CSC latch/restoration | Implemented; native fixtures pass |
+| Gen12 fixed hardware cursor | Source PCODE/DBUF watermark partition, private PAT-free DMA39 slots, generation-specific DSB and independent cursor/console retirement | Implemented; native fixtures pass |
+| Gen12 native and legacy LUTs | Exact display12/13 gamma/degamma profiles, bounded ABI/storage, canonical DSB writes, readable state witnesses and profile-specific original restoration | Implemented; native fixtures pass |
+| GuC loss-accounted log fanout | Four bounded reader FIFOs, transactional host loss accounting, observed firmware-overflow lower bounds and actual publication/incarnation-bound admission | Implemented; native fixtures pass |
 | GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms, media power and writable fan/thermal controls | Open; mapping revocation and platform PM |
 | Additional platforms | Broader Gen12 display, Lunar Lake and Panther Lake profiles and their execution/display probes | Open; primary-source register/firmware contracts |
 
@@ -2791,3 +2796,55 @@ diff and final source-integrity checks pass. aarch64 QEMU is omitted under the
 maintainer's iteration policy because no aarch64-specific production behavior
 changes. The ledger records 45 implemented checkpoint rows and ten broad open
 workstreams; Intel silicon and Mesa acceptance remain unrun.
+
+The next checkpoint extends the source-qualified Gen12 fixed internal display
+without broadening timing, output or plane admission:
+
+- CTM has its own capability and retained route/resource/console-PTE owner,
+  including color-only sessions and partial-arm/reset recovery.
+- A stopped-pipe PCODE-qualified S1/S2 DDB/watermark partition reserves a fixed
+  64x64 cursor. Private PAT-free DMA39 slots and generation-specific DSB status
+  require independent command, cursor and later-frame evidence before reuse.
+  Cursor fault bit11 is checked on Gen12 and the existing MTL path.
+- Native gamma/degamma sizes follow display12 (262145/33) and display13
+  (1024/129); both support legacy256 gamma. Gen12 pre data uses Q16 and MTL
+  retains Q24. Large display12 blobs have an exact 2,097,160-byte ABI bound,
+  with separate 16 MiB stored-payload and concurrent-copy budgets per Card.
+  Display12 fine/coarse post-LUT RAM has no reliable source readout: complete
+  canonical DSB writes, independent retirement, a later frame and readable
+  endpoints/controls prove its qualified owned pipeline. Clear/reset restores
+  the original visible bypass; inactive RAM remains exclusively owned and is
+  completely rewritten before new activation. Display13/MTL preserve their
+  stronger indexed readback/restoration. Joint Gen12 primary/color remains
+  unadvertised pending its separate qualification.
+- GuC NARFGSTR v2 shares one flush/ACK actor among four retained descriptions,
+  each with two fixed FIFO slots. A staging buffer and transactional fanout
+  spare bound total storage to 821,760 bytes per card. Whole unread records
+  may be replaced; partial records stay immutable. Host dropped-frame/wire-byte
+  accounting is exact until explicit saturation; firmware's four-bit overflow
+  counter yields observed lower bounds only. Actual firmware incarnation and
+  a nonreused publication serial prevent queued-open replay across park,
+  reset, reupload or republication. All descriptor operations use host copies
+  and current admin/syslog authority.
+- The legacy Gen12 GGTT arena and PPGTT-root attachment enforce DMA39 before
+  mapping/image writes; qualified DG2 arenas keep DMA46.
+
+This checkpoint adds 39 native fixtures and rewrites four log-stream fixtures.
+All 43 changed fixture names pass. Selected Intel/DRM/framebuffer/backlight and
+runtime-power groups pass 1087 unique x86_64 tests, including all 31 shared
+backlight regressions, with zero failures, skips or duplicate names. The x86_64
+production boot and both btrfs postflights pass. GPU/fb target CI Clippy
+passes all three feature contexts on both architectures; all four host GPU
+configurations pass all-target Clippy. Debug/release builds pass on both
+targets, and formatting, diff and final source-integrity checks pass. The last
+portability corrections only scope fixture declarations and the Intel cursor
+helper to their owning architecture/feature; the tested x86_64 behavior is
+unchanged. aarch64 QEMU is omitted under the maintainer's iteration policy
+because no aarch64-specific production behavior changes. The ledger records
+49 implemented checkpoint rows and ten broad open workstreams. Intel silicon
+and Mesa acceptance remain unrun.
+
+The following integration batch carries required source corrections for
+ADLP/N primary alignment/arbitration slots, Gen12 console-layout restoration
+and common Gen12 nonrender LRC workarounds. Those corrections and their
+qualification continue on this branch alongside the remaining features.

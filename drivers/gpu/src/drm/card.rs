@@ -936,6 +936,17 @@ pub struct Card {
     /// Installed fixed-mode Intel color owner (native CTM, gamma1024/legacy256).
     #[cfg(feature = "intel")]
     pub(crate) intel_ctm: bool,
+    /// Qualified Gen12 fixed CTM only; LUT capability remains separate.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_ctm_only: bool,
+    /// Source-qualified fixed hardware cursor, independent of LUT stages.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_hw_cursor: bool,
+    /// Exact Gen12 native color profile; independent of cursor and joint DSB.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_gen12_lut: Option<crate::intel_gpu_color::Profile>,
+    #[cfg(feature = "intel")]
+    intel_blob_copy_bytes: usize,
     /// Fixed display14 primary with owned no-DPT + linear-equivalent X WMs.
     #[cfg(feature = "intel")]
     pub(crate) intel_x_tiled: bool,
@@ -1219,6 +1230,14 @@ impl Card {
             intel_deferred_owners: Vec::new(),
             #[cfg(feature = "intel")]
             intel_ctm: false,
+            #[cfg(feature = "intel")]
+            intel_ctm_only: false,
+            #[cfg(feature = "intel")]
+            intel_hw_cursor: false,
+            #[cfg(feature = "intel")]
+            intel_gen12_lut: None,
+            #[cfg(feature = "intel")]
+            intel_blob_copy_bytes: 0,
             #[cfg(feature = "intel")]
             intel_x_tiled: false,
             #[cfg(feature = "intel")]
@@ -1678,10 +1697,44 @@ impl Card {
         true
     }
 
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_reserve_blob_copy(&mut self, bytes: usize) -> Result<bool, CardError> {
+        if !self.intel_display {
+            return Ok(false);
+        }
+        let total = self
+            .intel_blob_copy_bytes
+            .checked_add(bytes)
+            .filter(|n| *n <= crate::intel_gpu_color::MAX_COLOR_BLOB_TOTAL)
+            .ok_or(CardError::TooManyFbs)?;
+        self.intel_blob_copy_bytes = total;
+        Ok(true)
+    }
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_release_blob_copy(&mut self, bytes: usize) {
+        self.intel_blob_copy_bytes -= bytes;
+    }
     /// Register a userspace KMS property blob and return its object id.
     pub(crate) fn create_property_blob(&mut self, data: Vec<u8>) -> Result<u32, CardError> {
         if data.is_empty() {
             return Err(CardError::InvalidDimensions);
+        }
+        #[cfg(feature = "intel")]
+        if self.intel_display {
+            if data.len() > crate::intel_gpu_color::MAX_COLOR_BLOB {
+                return Err(CardError::InvalidDimensions);
+            }
+            let used = self
+                .property_blobs
+                .iter()
+                .try_fold(0usize, |n, b| n.checked_add(b.data.len()))
+                .ok_or(CardError::TooManyFbs)?;
+            if used
+                .checked_add(data.len())
+                .is_none_or(|n| n > crate::intel_gpu_color::MAX_COLOR_BLOB_TOTAL)
+            {
+                return Err(CardError::TooManyFbs);
+            }
         }
         if self.property_blobs.len() >= 4096 {
             return Err(CardError::TooManyFbs);
@@ -1744,16 +1797,59 @@ impl Card {
                     .any(|n| n.hdr_output_metadata == Some(id)))
     }
 
-    pub(crate) fn intel_color(&self, crtc: u32) -> bool {
+    /// CTM authority is independent of native/legacy LUT and cursor support.
+    pub(crate) fn intel_ctm_supported(&self, crtc: u32) -> bool {
         #[cfg(feature = "intel")]
         {
-            self.intel_ctm && self.crtc_color(crtc).is_some()
+            (self.intel_ctm || self.intel_ctm_only || self.intel_gen12_lut.is_some())
+                && self.crtc_color(crtc).is_some()
         }
         #[cfg(not(feature = "intel"))]
         {
             let _ = crtc;
             false
         }
+    }
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_cursor_supported(&self, crtc: u32) -> bool {
+        (self.intel_hw_cursor || (self.intel_ctm && self.crtc_color(crtc).is_some()))
+            && self.crtcs.iter().any(|c| c.id == crtc)
+    }
+    pub(crate) fn legacy_gamma_supported(&self, crtc: u32) -> bool {
+        #[cfg(feature = "intel")]
+        if self.intel_ctm_only && !self.intel_ctm && self.intel_gen12_lut.is_none() {
+            return false;
+        }
+        self.crtc_color(crtc).is_some()
+    }
+
+    pub(crate) fn intel_color(&self, crtc: u32) -> bool {
+        #[cfg(feature = "intel")]
+        {
+            (self.intel_ctm || self.intel_gen12_lut.is_some()) && self.crtc_color(crtc).is_some()
+        }
+        #[cfg(not(feature = "intel"))]
+        {
+            let _ = crtc;
+            false
+        }
+    }
+    pub(crate) fn intel_lut_sizes(&self, crtc: u32) -> Option<(usize, usize)> {
+        #[cfg(feature = "intel")]
+        if self.intel_color(crtc) {
+            return Some(
+                self.intel_gen12_lut
+                    .unwrap_or(crate::intel_gpu_color::Profile::Mtl)
+                    .sizes(),
+            );
+        }
+        let _ = crtc;
+        None
+    }
+    #[cfg(feature = "intel")]
+    pub(crate) fn intel_lut_profile(&self) -> crate::intel_gpu_color::Profile {
+        self.intel_gen12_lut
+            .unwrap_or(crate::intel_gpu_color::Profile::Mtl)
     }
     #[cfg(feature = "intel")]
     pub(crate) fn intel_retain_blob(&mut self, id: u32) -> bool {
@@ -1802,7 +1898,7 @@ impl Card {
     }
     #[cfg(feature = "intel")]
     pub(crate) fn intel_clear_ctm(&mut self) {
-        if self.intel_ctm {
+        if self.intel_ctm || self.intel_ctm_only || self.intel_gen12_lut.is_some() {
             for color in &mut self.crtc_color {
                 color.ctm = 0;
                 color.gamma_lut = 0;

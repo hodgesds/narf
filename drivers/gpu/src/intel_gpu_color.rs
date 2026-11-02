@@ -1,4 +1,4 @@
-//! Owned Pipe-A CTM/gamma transaction for MTL/Arrow's TGL+ display color pipeline.
+//! Owned TGL+ Pipe-A CSC/LUT transactions with exact display profiles.
 //! MIT Linux b90c984d615e: intel_color.c::ilk_csc_convert_ctm,
 //! ilk_update_pipe_csc, icl_color_commit_noarm/arm and tgl_color_funcs;
 //! intel_color_regs.h / skl_universal_plane_regs.h. Precision LUT preload
@@ -8,6 +8,9 @@ use crate::{drm::card::FlipStamp, intel_gpu::Generation, intel_gpu_aux::MmioWind
 use alloc::{sync::Arc, vec::Vec};
 use narf_filesystem::FsError;
 
+#[path = "intel_gpu_color_gen12.rs"]
+mod gen12;
+pub(crate) use gen12::{Profile, DISPLAY12_WORDS, MAX_COLOR_BLOB, MAX_COLOR_BLOB_TOTAL};
 pub(crate) const MODE: u64 = 0x49028;
 pub(crate) const GAMMA: u64 = 0x4a480;
 const FRAME: u64 = 0x70040;
@@ -31,7 +34,7 @@ fn pipeline(io: &impl MmioWindow) -> bool {
         && io.read32(0x701c8) == 0
 }
 
-/// Full owned MTL/Arrow modeset baseline, never used by inherited/live KMS
+/// Full owned TGL+ Pipe-A RGB modeset baseline, never used by inherited/live KMS
 /// adoption. Linux glk_plane_color_ctl + icl_color_commit_arm select this
 /// bypass for RGB with no CTM/LUTs. The primary and pipe must already be off.
 /// PIPE_CSC_MODE=0 closes both ICL_CSC_ENABLE and ICL_OUTPUT_CSC_ENABLE;
@@ -140,6 +143,7 @@ const PRE_WORDS: usize = 131;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct DegammaLut {
     entries: Vec<u32>,
+    profile: Profile,
 }
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Luts {
@@ -147,13 +151,17 @@ pub(crate) struct Luts {
     pub(crate) pre: Option<Arc<DegammaLut>>,
 }
 impl DegammaLut {
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Arc<Self>, FsError> {
-        if bytes.len() != DEGAMMA_SIZE * 8 {
+        Self::decode_profile(bytes, Profile::Mtl)
+    }
+    pub(crate) fn decode_profile(bytes: &[u8], profile: Profile) -> Result<Arc<Self>, FsError> {
+        if bytes.len() != profile.sizes().1 * 8 {
             return Err(FsError::InvalidData);
         }
         let mut entries = Vec::new();
         entries
-            .try_reserve_exact(PRE_WORDS)
+            .try_reserve_exact(profile.pre_words())
             .map_err(|_| FsError::OutOfMemory)?;
         let mut previous = 0;
         for bytes in bytes.chunks_exact(8) {
@@ -163,21 +171,31 @@ impl DegammaLut {
                 return Err(FsError::InvalidData);
             }
             previous = green;
-            entries.push(((u64::from(green) * 0xffffff + 32767) / 65535) as u32);
+            entries.push(if profile == Profile::Mtl {
+                ((u64::from(green) * 0xffffff + 32767) / 65535) as u32
+            } else {
+                u32::from(green)
+            });
         }
-        entries.extend([1 << 24; 2]);
-        Ok(Arc::new(Self { entries }))
+        entries.extend(
+            [if profile == Profile::Mtl {
+                1 << 24
+            } else {
+                1 << 16
+            }; 2],
+        );
+        Ok(Arc::new(Self { entries, profile }))
     }
 }
 #[derive(Debug)]
 struct PrePalette(Vec<u32>);
 impl PrePalette {
-    fn capture(io: &impl MmioWindow) -> Result<Self, FsError> {
+    fn capture(io: &impl MmioWindow, words: usize) -> Result<Self, FsError> {
         let mut entries = Vec::new();
         entries
-            .try_reserve_exact(PRE_WORDS)
+            .try_reserve_exact(words)
             .map_err(|_| FsError::OutOfMemory)?;
-        for i in 0..PRE_WORDS {
+        for i in 0..words {
             io.write32(PRE_INDEX, i as u32);
             let value = io.read32(PRE_DATA);
             if value == u32::MAX {
@@ -216,7 +234,14 @@ pub(crate) struct Lut {
     entries: Vec<u32>,
 }
 impl Lut {
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Arc<Self>, FsError> {
+        Self::decode_profile(bytes, Profile::Mtl)
+    }
+    pub(crate) fn decode_profile(bytes: &[u8], profile: Profile) -> Result<Arc<Self>, FsError> {
+        if profile == Profile::Display12 && bytes.len() != LEGACY_LUT_SIZE * 8 {
+            return gen12::decode_display12(bytes);
+        }
         let size = bytes.len() / 8;
         if bytes.len() % 8 != 0 || ![LEGACY_LUT_SIZE, LUT_SIZE].contains(&size) {
             return Err(FsError::InvalidData);
@@ -241,17 +266,26 @@ impl Lut {
         Ok(Arc::new(Self { entries }))
     }
     fn mode(&self) -> u32 {
-        u32::from(self.entries.len() != LEGACY_LUT_SIZE)
+        if self.entries.len() == gen12::DISPLAY12_WORDS {
+            3
+        } else {
+            u32::from(self.entries.len() != LEGACY_LUT_SIZE)
+        }
     }
     fn write(&self, io: &impl MmioWindow) -> Result<(), FsError> {
-        if self.entries.len() == LEGACY_LUT_SIZE {
+        if self.entries.len() == gen12::DISPLAY12_WORDS {
+            // Only a complete retained DSB stream can witness unreadable RAM.
+            Err(FsError::Unsupported)
+        } else if self.entries.len() == LEGACY_LUT_SIZE {
             legacy_write(io, &self.entries)
         } else {
             Palette::write(io, &self.entries, [1 << 16; 6])
         }
     }
     fn matches(&self, io: &impl MmioWindow) -> bool {
-        if self.entries.len() == LEGACY_LUT_SIZE {
+        if self.entries.len() == gen12::DISPLAY12_WORDS {
+            gen12::matches_display12(io, &self.entries)
+        } else if self.entries.len() == LEGACY_LUT_SIZE {
             io.write32(INDEX, 0);
             self.entries
                 .iter()
@@ -412,6 +446,9 @@ struct Pending {
 #[derive(Debug)]
 pub(crate) struct Owner {
     original: Image,
+    /// None admits common CTM only. Gen12 requires a retained internal-pipe
+    /// resource witness before this profile may be qualified.
+    profile: Option<Profile>,
     gamma: u32,
     expected: Image,
     expected_gamma: u32,
@@ -427,7 +464,10 @@ pub(crate) struct Owner {
 }
 impl Owner {
     pub(crate) fn capture(io: &impl MmioWindow, generation: Generation) -> Result<Self, FsError> {
-        if generation != Generation::MeteorLake {
+        if !matches!(
+            generation,
+            Generation::TigerLake | Generation::AlderLake | Generation::MeteorLake
+        ) {
             return Err(FsError::Unsupported);
         }
         let mode = io.read32(MODE);
@@ -445,6 +485,7 @@ impl Owner {
         let original = Image { values, mode };
         Ok(Self {
             original,
+            profile: (generation == Generation::MeteorLake).then_some(Profile::Mtl),
             gamma,
             expected: original,
             expected_gamma: gamma,
@@ -458,6 +499,42 @@ impl Owner {
             external_pending: false,
             failed: false,
         })
+    }
+    pub(crate) fn qualify_gen12(&mut self, profile: Profile) -> Result<(), FsError> {
+        if profile == Profile::Mtl {
+            return Err(FsError::Unsupported);
+        }
+        if self.profile == Some(profile) {
+            return Ok(());
+        }
+        if self.pending() || self.expected_gamma & (POST_ENABLE | PRE_ENABLE) != 0 {
+            return Err(FsError::Unsupported);
+        }
+        self.profile = Some(profile);
+        Ok(())
+    }
+    pub(crate) fn owns_unreadable_ram(&self) -> bool {
+        self.profile == Some(Profile::Display12) && self.palette_dirty
+    }
+    fn check_luts(&self, lut: Option<&Lut>, pre: Option<&DegammaLut>) -> Result<(), FsError> {
+        if lut.is_none() && pre.is_none() {
+            return Ok(());
+        }
+        let profile = self.profile.ok_or(FsError::Unsupported)?;
+        if pre.is_some_and(|p| p.profile != profile)
+            || lut.is_some_and(|p| {
+                p.entries.len() != LEGACY_LUT_SIZE
+                    && p.entries.len()
+                        != if profile == Profile::Display12 {
+                            gen12::DISPLAY12_WORDS
+                        } else {
+                            LUT_SIZE
+                        }
+            })
+        {
+            return Err(FsError::InvalidData);
+        }
+        Ok(())
     }
     pub(crate) fn pending(&self) -> bool {
         self.pending.is_some() || self.external_pending
@@ -495,6 +572,11 @@ impl Owner {
         if self.pending() {
             return Err(FsError::Busy);
         }
+        self.check_luts(lut.as_deref(), degamma.as_deref())?;
+        // Display12 requires a complete DSB stream, even for inactive preload.
+        if self.profile == Some(Profile::Display12) && (lut.is_some() || degamma.is_some()) {
+            return Err(FsError::Unsupported);
+        }
         // Single-buffered LUT: only inactive preload is source-qualified.
         // Same-LUT CTM changes do not touch palette memory at all.
         let changed = self.lut != lut;
@@ -510,7 +592,10 @@ impl Owner {
         }
         if let Some(pre) = degamma.as_ref().filter(|_| changed_pre) {
             if self.original_pre.is_none() {
-                self.original_pre = Some(PrePalette::capture(io)?);
+                self.original_pre = Some(PrePalette::capture(
+                    io,
+                    self.profile.map_or(PRE_WORDS, Profile::pre_words),
+                )?);
             }
             self.failed = true;
             self.pre_dirty = true;
@@ -536,7 +621,8 @@ impl Owner {
             gamma |= PRE_ENABLE;
         }
         let both_off = lut.is_none() && degamma.is_none();
-        let restore_palette = both_off && self.palette_dirty;
+        let restore_palette =
+            both_off && self.palette_dirty && self.profile != Some(Profile::Display12);
         let restore_pre = both_off && self.pre_dirty;
         self.lut = lut;
         self.degamma = degamma;
@@ -549,6 +635,33 @@ impl Owner {
             now,
         )
     }
+    pub(crate) fn needs_inactive_preload(
+        &self,
+        lut: Option<&Lut>,
+        pre: Option<&DegammaLut>,
+    ) -> bool {
+        self.profile == Some(Profile::Display12)
+            && self.expected_gamma & (POST_ENABLE | PRE_ENABLE) == 0
+            && (lut.is_some() || pre.is_some())
+            && (self.lut.as_deref() != lut || self.degamma.as_deref() != pre)
+    }
+    pub(crate) fn prepare_inactive_preload(
+        &mut self,
+        io: &impl MmioWindow,
+        lut: Option<Arc<Lut>>,
+        pre: Option<Arc<DegammaLut>>,
+    ) -> Result<Update, FsError> {
+        if !self.needs_inactive_preload(lut.as_deref(), pre.as_deref()) {
+            return Err(FsError::Unsupported);
+        }
+        let mut update = self.prepare_stages(io, None, lut, pre)?;
+        // Retain current visible bypass/CSC through the full table DMA. The
+        // subsequent transaction arms enable only after this stream is proved.
+        update.image = self.expected;
+        update.gamma = self.expected_gamma;
+        update.registers.clear();
+        Ok(update)
+    }
     pub(crate) fn prepare_stages(
         &mut self,
         io: &impl MmioWindow,
@@ -556,6 +669,11 @@ impl Owner {
         lut: Option<Arc<Lut>>,
         degamma: Option<Arc<DegammaLut>>,
     ) -> Result<Update, FsError> {
+        // Gen12 DSB and native LUT layouts have separate qualification gates.
+        if self.profile.is_none() {
+            return Err(FsError::Unsupported);
+        }
+        self.check_luts(lut.as_deref(), degamma.as_deref())?;
         if self.failed {
             return Err(FsError::NoDevice);
         }
@@ -566,7 +684,10 @@ impl Owner {
             self.failed = true;
             return Err(FsError::NoDevice);
         }
-        if lut.is_some() && self.original_palette.is_none() {
+        if lut.is_some()
+            && self.original_palette.is_none()
+            && self.profile != Some(Profile::Display12)
+        {
             // First use is inactive by capture's strict initial bypass gate.
             if self.expected_gamma & POST_ENABLE != 0 {
                 return Err(FsError::NoDevice);
@@ -577,7 +698,10 @@ impl Owner {
             if self.expected_gamma & PRE_ENABLE != 0 {
                 return Err(FsError::NoDevice);
             }
-            self.original_pre = Some(PrePalette::capture(io)?);
+            self.original_pre = Some(PrePalette::capture(
+                io,
+                self.profile.map_or(PRE_WORDS, Profile::pre_words),
+            )?);
         }
         let image = coefficients.map_or(self.original, Image::ctm);
         let mut gamma = if let Some(lut) = &lut {
@@ -591,7 +715,8 @@ impl Owner {
         let mut registers: Vec<(u64, u32)> = REGISTERS.into_iter().zip(image.values).collect();
         registers.extend([(GAMMA, gamma), (MODE, image.mode)]);
         let both_off = lut.is_none() && degamma.is_none();
-        let restore_palette = both_off && self.palette_dirty;
+        let restore_palette =
+            both_off && self.palette_dirty && self.profile != Some(Profile::Display12);
         self.external_pending = true;
         let write_lut = self.lut != lut;
         let write_degamma = self.degamma != degamma;
@@ -683,7 +808,7 @@ impl Owner {
             io,
             self.original,
             self.gamma,
-            self.palette_dirty,
+            self.palette_dirty && self.profile != Some(Profile::Display12),
             self.pre_dirty,
             now,
         )

@@ -98,7 +98,7 @@ fn smoke_guc_stream_fixed_wire_linear_wrapped_and_source_immutability() -> TestR
     assert_eq!(&b.bytes[..8], b"NARFGSTR");
     assert_eq!(
         (dword(&b.bytes, 8), dword(&b.bytes, 12), dword(&b.bytes, 16)),
-        (1, 192, 204)
+        (2, 256, 268)
     );
     assert_eq!(
         (
@@ -106,7 +106,7 @@ fn smoke_guc_stream_fixed_wire_linear_wrapped_and_source_immutability() -> TestR
             dword(&b.bytes, 24),
             dword(&b.bytes, 28)
         ),
-        (1, 3, 7)
+        (DATA | FW_MODULO_BOUND, 3, 7)
     );
     assert_eq!(
         (
@@ -125,12 +125,12 @@ fn smoke_guc_stream_fixed_wire_linear_wrapped_and_source_immutability() -> TestR
             dword(&b.bytes, 80),
             dword(&b.bytes, 84)
         ),
-        (192, 8, 200, 4)
+        (256, 8, 264, 4)
     );
     assert_eq!(&b.bytes[160..192], &[0xa5; 32]);
-    assert_eq!(&b.bytes[192..204], &[0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3]);
+    assert_eq!(&b.bytes[256..268], &[0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3]);
     m.put(4096, 0xffff_ffff);
-    assert_eq!(&b.bytes[192..196], &[0, 1, 2, 3]);
+    assert_eq!(&b.bytes[256..260], &[0, 1, 2, 3]);
     let m = Memory::new();
     m.put(8, 65532);
     m.put(12, 4);
@@ -147,9 +147,9 @@ fn smoke_guc_stream_fixed_wire_linear_wrapped_and_source_immutability() -> TestR
         &mut || true,
     )
     .unwrap();
-    assert_eq!(b.len, 200);
-    assert_eq!(&b.bytes[192..200], &[252, 253, 254, 255, 0, 1, 2, 3]);
-    assert!(b.bytes[200..].iter().all(|v| *v == 0));
+    assert_eq!(b.len, 264);
+    assert_eq!(&b.bytes[256..264], &[252, 253, 254, 255, 0, 1, 2, 3]);
+    assert!(b.bytes[264..].iter().all(|v| *v == 0));
     TestResult::Pass
 }
 kernel_test_in!(
@@ -165,7 +165,7 @@ fn smoke_guc_stream_invalid_headers_overflow_coherence_and_loss_refuse() -> Test
             0 => m.put(0, 0),
             1 => m.put(16, 65540),
             2 => m.put(8, 65537),
-            3 => m.put(28, 3),
+            3 => m.put(28, 0x21),
             4 => m.put(28, 1 << 31),
             5 => {
                 m.put(8, 65532);
@@ -195,6 +195,8 @@ fn smoke_guc_stream_invalid_headers_overflow_coherence_and_loss_refuse() -> Test
                 FsError::Unsupported
             } else if case == 7 {
                 FsError::NoDevice
+            } else if case == 8 {
+                FsError::WouldBlock
             } else {
                 FsError::InvalidData
             }),
@@ -216,7 +218,7 @@ fn smoke_guc_stream_two_slot_fifo_quota_readiness_and_retained_error() -> TestRe
     assert!(matches!(StreamSession::reserve(61), Err(FsError::Busy)));
     let m = Memory::new();
     for sequence in 0..2 {
-        let mut b = s.take_free().unwrap();
+        let mut b = s.fanout_spare.lock().take().unwrap();
         copy_frame(
             &m,
             &mut b,
@@ -228,14 +230,15 @@ fn smoke_guc_stream_two_slot_fifo_quota_readiness_and_retained_error() -> TestRe
             &mut || true,
         )
         .unwrap();
-        s.publish(b);
+        let spare = s.publish(b);
+        *s.fanout_spare.lock() = Some(spare);
     }
     assert!(s.take_free().is_none());
     assert_eq!(s.ready.mask(), POLL_IN);
     s.fail(FsError::InvalidData);
     assert_eq!(s.ready.mask(), POLL_IN | POLL_ERR | POLL_HUP);
     for sequence in 0..2 {
-        let mut frame = alloc::vec![0;204];
+        let mut frame = alloc::vec![0;268];
         let mut at = 0;
         while at < frame.len() {
             let n = s.read(&mut frame[at..at + 1]).unwrap();
@@ -262,46 +265,13 @@ fn yes() -> bool {
 fn allowed() -> bool {
     ALLOWED.load(Ordering::Acquire)
 }
-#[derive(Debug)]
-struct Backend {
-    calls: AtomicUsize,
-    pending: AtomicBool,
-    revoke: AtomicBool,
-}
-impl UserBackend for Backend {
-    fn status(&self) -> Option<crate::intel_gpu_user::UserStatus> {
-        None
-    }
-    fn submit<'a>(
-        &'a self,
-        _: Arc<crate::intel_gpu_user::UserContext>,
-        _: crate::intel_gpu_user::UserBatch,
-    ) -> FsFuture<'a, Arc<crate::intel_gpu_fence::CompletionFence>> {
-        Box::pin(async { Err(FsError::Unsupported) })
-    }
-    fn guc_log_stream(&self, _: Arc<StreamSession>) -> FsFuture<'_, ()> {
-        Box::pin(async move {
-            if self.pending.load(Ordering::Acquire) {
-                core::future::pending::<()>().await;
-            }
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            if self.revoke.load(Ordering::Acquire) {
-                ALLOWED.store(false, Ordering::Release);
-            }
-            Ok(())
-        })
-    }
-}
-fn smoke_guc_stream_descriptor_live_authority_dup_cancel_and_lazy_attach() -> TestResult {
+fn smoke_guc_stream_descriptor_cached_authority_dup_and_worker_request() -> TestResult {
     ALLOWED.store(true, Ordering::Release);
-    let backend = Arc::new(Backend {
-        calls: AtomicUsize::new(0),
-        pending: AtomicBool::new(false),
-        revoke: AtomicBool::new(false),
-    });
+    let publication = Arc::new(Publication::new());
+    publish(&publication, 42);
+    register_owner(62, identity().platform, &publication);
     let node = Node {
         index: 62,
-        backend: backend.clone(),
         gate: Gate {
             enabled: yes,
             capable: allowed,
@@ -314,20 +284,12 @@ fn smoke_guc_stream_descriptor_live_authority_dup_cancel_and_lazy_attach() -> Te
     let file = node.open_instance_checked(false).unwrap().unwrap();
     let duplicate = file.clone();
     assert_eq!(ready(file.read(0, &mut [])), Ok(0));
-    assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
-    backend.pending.store(true, Ordering::Release);
-    {
-        let mut bytes = [0; 8];
-        let mut waiting = Box::pin(file.read(0, &mut bytes));
-        assert!(waiting
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending());
-    }
-    assert!(ACTIVE[62].load(Ordering::Acquire));
-    assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
-    backend.pending.store(false, Ordering::Release);
-    backend.revoke.store(true, Ordering::Release);
+    assert_eq!(ready(file.read(0, &mut [0; 8])), Err(FsError::WouldBlock));
+    assert_eq!(file.poll_readiness(), 0);
+    // Reads/poll did not claim attachment; the ordinary worker claims once.
+    let request = take_requested(62).expect("queued at open, no backend read");
+    assert!(take_requested(62).is_none());
+    ALLOWED.store(false, Ordering::Release);
     assert_eq!(
         ready(file.read(123, &mut [0; 8])),
         Err(FsError::OperationNotPermitted)
@@ -339,15 +301,19 @@ fn smoke_guc_stream_descriptor_live_authority_dup_cancel_and_lazy_attach() -> Te
     assert_eq!(file.poll_readiness(), POLL_ERR | POLL_HUP);
     assert!(file.readiness().is_none());
     drop(file);
-    assert!(ACTIVE[62].load(Ordering::Acquire));
     drop(duplicate);
+    assert!(
+        ACTIVE[62].load(Ordering::Acquire),
+        "worker request retains source quota"
+    );
+    drop(request);
     assert!(!ACTIVE[62].load(Ordering::Acquire));
     ALLOWED.store(true, Ordering::Release);
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/intel_gpu_guc_log",
-    smoke_guc_stream_descriptor_live_authority_dup_cancel_and_lazy_attach
+    smoke_guc_stream_descriptor_cached_authority_dup_and_worker_request
 );
 
 fn smoke_guc_stream_opt_in_and_bounded_disjoint_ct_demultiplexing() -> TestResult {
@@ -420,4 +386,335 @@ fn smoke_guc_stream_opt_in_and_bounded_disjoint_ct_demultiplexing() -> TestResul
 kernel_test_in!(
     "drivers/gpu/intel_gpu_guc_log",
     smoke_guc_stream_opt_in_and_bounded_disjoint_ct_demultiplexing
+);
+
+fn cached_frame(session: &StreamSession, mut prefix: Vec<u8>) -> Vec<u8> {
+    while prefix.len() < 24 {
+        let mut out = [0; 24];
+        let n = session.read(&mut out[..24 - prefix.len()]).unwrap();
+        assert_ne!(n, 0);
+        prefix.extend_from_slice(&out[..n]);
+    }
+    let len = dword(&prefix, 16) as usize;
+    while prefix.len() < len {
+        let mut out = [0; 4096];
+        let n = session
+            .read(&mut out[..4096.min(len - prefix.len())])
+            .unwrap();
+        assert_ne!(n, 0);
+        prefix.extend_from_slice(&out[..n]);
+    }
+    prefix
+}
+fn relay_frame(root: &Arc<StreamSession>, memory: &Memory, sequence: u64) {
+    let mut buffer = root.take_staging().unwrap();
+    copy_frame(
+        memory,
+        &mut buffer,
+        read_states(memory),
+        identity(),
+        root.index(),
+        sequence,
+        None,
+        &mut || true,
+    )
+    .unwrap();
+    root.relay_publish(buffer);
+}
+fn smoke_guc_stream_v2_reader_overwrite_partial_record_and_retained_quota() -> TestResult {
+    let root = StreamSession::reserve(60).unwrap();
+    let fast = root.subscribe().unwrap();
+    let unused0 = root.subscribe().unwrap();
+    let unused1 = root.subscribe().unwrap();
+    assert!(matches!(root.subscribe(), Err(FsError::Busy)));
+    // Closing/revoking a retained reader does not release its bounded memory
+    // quota or revoke another reader's ability to consume copies.
+    unused0.fail_reader(FsError::OperationNotPermitted);
+    assert!(matches!(root.subscribe(), Err(FsError::Busy)));
+    drop(unused0);
+    let late = root.subscribe().unwrap();
+    let m = Memory::new();
+    relay_frame(&root, &m, 0);
+    let mut prefix = [0; 8];
+    assert_eq!(root.read(&mut prefix), Ok(8));
+    let fast0 = cached_frame(&fast, Vec::new());
+    relay_frame(&root, &m, 1);
+    let fast1 = cached_frame(&fast, Vec::new());
+    relay_frame(&root, &m, 2);
+    let fast2 = cached_frame(&fast, Vec::new());
+    let slow0 = cached_frame(&root, prefix.to_vec());
+    let slow2 = cached_frame(&root, Vec::new());
+    assert_eq!((qword(&slow0, 32), qword(&slow2, 32)), (0, 2));
+    assert_eq!(
+        slow0, fast0,
+        "a partially read record changed after overwrite"
+    );
+    assert_eq!(qword(&slow2, 208), 1);
+    assert_eq!(qword(&slow2, 216), fast1.len() as u64);
+    assert_ne!(dword(&slow2, 20) & HOST_LOSS, 0);
+    assert_eq!(qword(&fast2, 208), 0);
+    assert_eq!(fast.ready.mask(), 0);
+    assert_eq!(fast.read(&mut [0; 8]), Err(FsError::WouldBlock));
+    root.close_reader();
+    assert!(
+        !root.stop.load(Ordering::Acquire),
+        "followers retain the shared source"
+    );
+    fast.close_reader();
+    late.close_reader();
+    unused1.close_reader();
+    assert!(root.stop.load(Ordering::Acquire));
+    root.fail(FsError::NoDevice);
+    assert_eq!(fast.read(&mut [0; 8]), Err(FsError::NoDevice));
+    assert!(matches!(root.subscribe(), Err(FsError::Busy)));
+    drop(fast);
+    drop(late);
+    drop(unused1);
+    drop(root);
+    assert!(!ACTIVE[60].load(Ordering::Acquire));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_log",
+    smoke_guc_stream_v2_reader_overwrite_partial_record_and_retained_quota
+);
+
+fn smoke_guc_stream_v2_firmware_counter_wrap_lower_bound_and_ring_images() -> TestResult {
+    let m = Memory::new();
+    m.put(28, 3); // one observed event overflow, with flush set
+    let mut b = Buffer::new().unwrap();
+    copy_frame_with_loss(
+        &m,
+        &mut b,
+        read_states(&m),
+        identity(),
+        0,
+        10,
+        None,
+        [15, 0],
+        [7, 0],
+        &mut || true,
+    )
+    .unwrap();
+    assert_eq!(dword(&b.bytes, 8), 2);
+    assert_eq!(
+        qword(&b.bytes, 192),
+        2,
+        "15->1 means at least two overflows"
+    );
+    assert_eq!(qword(&b.bytes, 224), 9);
+    assert_eq!(dword(&b.bytes, 76), 65536);
+    assert_eq!(dword(&b.bytes, 84), 4);
+    assert_eq!(
+        dword(&b.bytes, 20) & (FW_LOSS | EVENT_RING_IMAGE | FW_MODULO_BOUND),
+        FW_LOSS | EVENT_RING_IMAGE | FW_MODULO_BOUND
+    );
+    copy_frame_with_loss(
+        &m,
+        &mut b,
+        read_states(&m),
+        identity(),
+        0,
+        11,
+        None,
+        [1, 0],
+        [9, 0],
+        &mut || true,
+    )
+    .unwrap();
+    assert_eq!(qword(&b.bytes, 192), 0);
+    assert_ne!(
+        dword(&b.bytes, 20) & FW_MODULO_BOUND,
+        0,
+        "zero cannot exclude sixteen hidden wraps"
+    );
+    assert_eq!(dword(&b.bytes, 76), 8);
+    assert!(!supported(identity().platform, (71, 0, 0)));
+    assert!(!supported(
+        crate::intel_gpu_gt::GtPlatform::Integrated(crate::intel_gpu::Generation::PantherLake),
+        (70, 54, 1)
+    ));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_log",
+    smoke_guc_stream_v2_firmware_counter_wrap_lower_bound_and_ring_images
+);
+
+struct CountWake(AtomicUsize);
+impl alloc::task::Wake for CountWake {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+fn smoke_guc_stream_cached_readiness_terminal_wakes_every_duplicate() -> TestResult {
+    let root = StreamSession::reserve(59).unwrap();
+    let a = Arc::new(CountWake(AtomicUsize::new(0)));
+    let b = Arc::new(CountWake(AtomicUsize::new(0)));
+    let wa = Waker::from(a.clone());
+    let wb = Waker::from(b.clone());
+    assert!(root
+        .ready
+        .arm_exclusive(1, POLL_IN | POLL_ERR | POLL_HUP, &wa)
+        .is_pending());
+    assert!(root
+        .ready
+        .arm_exclusive(2, POLL_IN | POLL_ERR | POLL_HUP, &wb)
+        .is_pending());
+    relay_frame(&root, &Memory::new(), 0);
+    assert_eq!(
+        (a.0.load(Ordering::Relaxed), b.0.load(Ordering::Relaxed)),
+        (1, 0)
+    );
+    assert_eq!(root.read(&mut [0; 8]), Ok(8));
+    assert_eq!(
+        b.0.load(Ordering::Relaxed),
+        1,
+        "remaining bytes must relay the exclusive wake"
+    );
+    cached_frame(&root, b"NARFGSTR".to_vec());
+    assert!(root
+        .ready
+        .arm_exclusive(1, POLL_IN | POLL_ERR | POLL_HUP, &wa)
+        .is_pending());
+    assert!(root
+        .ready
+        .arm_exclusive(2, POLL_IN | POLL_ERR | POLL_HUP, &wb)
+        .is_pending());
+    let before = (a.0.load(Ordering::Relaxed), b.0.load(Ordering::Relaxed));
+    root.fail(FsError::NoDevice);
+    assert_eq!(
+        (a.0.load(Ordering::Relaxed), b.0.load(Ordering::Relaxed)),
+        (before.0 + 1, before.1 + 1)
+    );
+    root.ready.disarm(1);
+    root.ready.disarm(2);
+    let mut late = root.fanout_spare.lock().take().unwrap();
+    let memory = Memory::new();
+    copy_frame(
+        &memory,
+        &mut late,
+        read_states(&memory),
+        identity(),
+        root.index(),
+        1,
+        None,
+        &mut || true,
+    )
+    .unwrap();
+    let spare = root.publish(late);
+    *root.fanout_spare.lock() = Some(spare);
+    assert_eq!(
+        root.read(&mut [0; 8]),
+        Err(FsError::NoDevice),
+        "fanout cannot publish after terminal wins"
+    );
+    assert_eq!(root.ready.mask(), POLL_ERR | POLL_HUP);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_log",
+    smoke_guc_stream_cached_readiness_terminal_wakes_every_duplicate
+);
+
+fn smoke_guc_stream_fanout_copy_terminal_orders_loss_with_commit() -> TestResult {
+    for terminal_first in [true, false] {
+        let root = StreamSession::reserve(57).unwrap();
+        let memory = Memory::new();
+        relay_frame(&root, &memory, 0);
+        relay_frame(&root, &memory, 1);
+        // The external spare is copied while both reader records remain
+        // intact. Model reset winning immediately before/after the commit.
+        let mut incoming = root.fanout_spare.lock().take().unwrap();
+        copy_frame(
+            &memory,
+            &mut incoming,
+            read_states(&memory),
+            identity(),
+            root.index(),
+            2,
+            None,
+            &mut || true,
+        )
+        .unwrap();
+        if terminal_first {
+            root.fail(FsError::NoDevice);
+        }
+        let spare = root.publish(incoming);
+        *root.fanout_spare.lock() = Some(spare);
+        if !terminal_first {
+            root.fail(FsError::NoDevice);
+        }
+        let first = cached_frame(&root, Vec::new());
+        let second = cached_frame(&root, Vec::new());
+        if terminal_first {
+            assert_eq!((qword(&first, 32), qword(&second, 32)), (0, 1));
+            assert_eq!(qword(&second, 208), 0);
+            assert_eq!(root.queue.lock().lost_frames, 0);
+        } else {
+            assert_eq!((qword(&first, 32), qword(&second, 32)), (1, 2));
+            assert_eq!(qword(&second, 208), 1);
+            assert_eq!(qword(&second, 216), first.len() as u64);
+            assert_ne!(dword(&second, 20) & HOST_LOSS, 0);
+        }
+        assert_eq!(root.read(&mut [0; 8]), Err(FsError::NoDevice));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_log",
+    smoke_guc_stream_fanout_copy_terminal_orders_loss_with_commit
+);
+
+fn smoke_guc_stream_queued_open_cannot_replay_after_park_reset_or_new_upload() -> TestResult {
+    let publication = Arc::new(Publication::new());
+    publish(&publication, 7);
+    register_owner(58, identity().platform, &publication);
+    let node = Node {
+        index: 58,
+        gate: Gate {
+            enabled: yes,
+            capable: yes,
+        },
+    };
+    let old = node.open_instance_checked(false).unwrap().unwrap();
+    let follower = node.open_instance_checked(false).unwrap().unwrap();
+    assert_eq!(ready(old.read(0, &mut [0; 8])), Err(FsError::WouldBlock));
+    // Production park/reset closure: publication zero and queued-root
+    // invalidation serialize with the same actual Node/open insertion.
+    close_publication(58, &publication);
+    assert!(matches!(
+        node.open_instance_checked(false),
+        Err(FsError::NoDevice)
+    ));
+    assert_eq!(old.poll_readiness(), POLL_ERR | POLL_HUP);
+    assert_eq!(ready(follower.read(0, &mut [0; 8])), Err(FsError::NoDevice));
+    // A runtime resume can preserve the exec user_epoch while uploading a
+    // different firmware incarnation. The old open cannot migrate to it.
+    publish(&publication, 9);
+    assert!(take_requested(58).is_none());
+    assert_eq!(ready(old.read(0, &mut [0; 8])), Err(FsError::NoDevice));
+    drop(old);
+    drop(follower);
+    let new = node.open_instance_checked(false).unwrap().unwrap();
+    let request = take_requested(58).unwrap();
+    assert_eq!(request.requested_incarnation(), Some(9));
+    // Even a claimed request is revalidated before the reset-owner attaches.
+    close_publication(58, &publication);
+    publish(&publication, 9); // same upload, fresh publication serial still forbids ABA
+    assert_eq!(request.requested_incarnation(), None);
+    assert!(!request.matches_incarnation(9));
+    publish(&publication, 11);
+    assert_eq!(request.requested_incarnation(), None);
+    assert_eq!(ready(new.read(0, &mut [0; 8])), Err(FsError::NoDevice));
+    drop(new);
+    drop(request);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_guc_log",
+    smoke_guc_stream_queued_open_cannot_replay_after_park_reset_or_new_upload
 );

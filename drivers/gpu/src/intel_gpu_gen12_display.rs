@@ -124,6 +124,14 @@ impl Owner {
         Ok(owner)
     }
     pub(super) fn check(&self, io: &impl Platform) -> Result<(), FsError> {
+        self.check_owned(io, false, false)
+    }
+    pub(super) fn check_owned(
+        &self,
+        io: &impl Platform,
+        owned_dsb: bool,
+        owned_cursor: bool,
+    ) -> Result<(), FsError> {
         if io.gen12_family() != Some(self.family) || !io.internal_primary_claimed() {
             return Err(FsError::NoDevice);
         }
@@ -134,7 +142,7 @@ impl Owner {
         }
         // These independent DMA consumers cannot be adopted merely because
         // the primary's live SURF happens to match a driver-owned buffer.
-        fetchers_with_cursor(io, Generation::TigerLake, false, false)?;
+        fetchers_with_cursor(io, Generation::TigerLake, owned_dsb, owned_cursor)?;
         for pipe in 1..4 {
             if read(io, 0x70008 + pipe * 0x1000)? & 0xc0000000 != 0 {
                 return Err(FsError::NoDevice);

@@ -1382,47 +1382,77 @@ reads, duplication and cancellation retain/release the same snapshot permits
 as raw captures. This adds passive source-format export; the independent streaming endpoint
 below owns the CT flush/ack protocol.
 
-`/dev/dri/guc-log-streamN` is an independent flush-coordinated event/crash
-stream. Exactly one `narf.intel.guc_stream=1` boot token enables it; opening
-and every read (including empty reads) require current CAP_SYSLOG and
-CAP_SYS_ADMIN. The first nonempty read lazily attaches to the already-awake
-Running GT under its reset mutex via `UserBackend::guc_log_stream`; the
-default backend refuses this operation. Reads never resume firmware. One session
-per card owns two preallocated frame buffers; dup shares the FIFO, and a
-retained file or quarantined actor holds its quota. The node is read-only,
-nonseekable and readiness-driven, with EAGAIN while no frame is ready.
+`/dev/dri/guc-log-streamN` exports NARFGSTR version 2 through the existing
+exclusive GuC flush/ACK owner. Exactly one `narf.intel.guc_stream=1` boot token
+enables it. Only actual registered runtime workers for pinned GuC 70 Gen12
+TGL/ADL-P/S/N, DG2, MTL/ARL and BMG advertise service. Other platforms/firmware
+majors and incoherent live backing are refused. Open, read (including
+zero-length), readiness and poll require current CAP_SYSLOG and CAP_SYS_ADMIN;
+DRM master does not substitute for either.
 
-The actor enables source verbose-level0 logging, forces a flush and consumes
-0x8003 notifications. It validates coherent fixed backing, both nine-DWORD
-headers, sampled ranges, prior host cursors and observed overflow state. It
-copies each checked linear/wrapped event/crash range into private storage
-before publishing host read cursors/flush bits and queuing FAST flush ACK.
-Live source write pointers may advance; stable sampled/header fields may not.
-CT backpressure retains the private frame and retries without advancing twice;
-frames become readable only after ACK is queued. A full two-frame FIFO
-withholds consumption/ACK; timeout, observed overflow, mutation or access loss
-becomes an explicit terminal error after already-committed frames drain.
-Each copy chunk checks current D0/capability/wake, and loss is sticky.
+Open queues a request bound to the actual nonzero cached publication serial and
+firmware-log incarnation. A fresh non-reused serial prevents replay even if an
+upload is republished unchanged. It does not wake or touch the GT. The worker
+admits it only while Running/D0, after matching that token to its current GuC
+log upload under the reset mutex. Admission is withdrawn and queued readers
+closed before reset/S3/park; execution-epoch reuse during runtime resume never
+replays a diagnostic request. All descriptor reads and poll use immutable host
+copies and cached readiness only. A live empty description returns
+WouldBlock/EAGAIN; committed copies drain before terminal error. The file is
+read-only, nonseekable and size-zero. Dup shares one FIFO/cursor.
 
-Each little-endian NARFGSTR v1 frame has a 192-byte header and at most 0x14000
-payload bytes: magic0, version8, header-size12, frame-size16, flags20,
-platform24, card28, sequence32, user-epoch40, firmware-incarnation48,
-host-copy-time56, packed firmware release64, event/crash offset+length72..88,
-the two source headers88..160 and actual firmware SHA-256 at160..192.
-Capture-region bytes are excluded. All offsets index fixed host bounds.
-Firmware's four-bit overflow counter and finite buffering prevent an
-unconditional losslessness claim; this contract detects observed loss and
-refuses ambiguous samples rather than silently emitting them.
+At most four retained reader descriptions share one source actor. Each owns two
+preallocated output buffers; one independent actor staging buffer permits source
+progress without reader ACK backpressure. One additional fan-out spare rotates
+through all readers, bounding total buffer storage to ten 82,176-byte buffers
+(821,760 bytes) per active card incarnation. Publication overwrites only whole
+unread records and preserves a partially returned record through its final byte.
+Replacement, loss accounting and terminal ordering commit atomically under the
+reader lock after copying into the external spare. Terminal-first preserves both
+old records; commit-first retains the loss-bearing replacement before terminal
+error. Reader host loss counts are exact cumulative dropped wire frames and
+serialized bytes until explicit saturation. Retained closed/revoked descriptions
+retain their quota until their buffers are freed. IRQ-safe critical sections
+copy at most one page for a read; fan-out copies occur outside queue locks.
 
-Enable/force/restore use distinct bounded CT fences 0x7f00..0x7ffc; the
-unanswered FAST ACK uses 0x7fff, disjoint from scheduler and SLPC replies.
-Fence leases never wrap within a firmware incarnation. Close/cancellation
-restores boot nonverbose policy with an acknowledged control operation before
-detachment. Lost access, an ambiguous restore or an unexpected ACK quarantines
-the actor and inhibits idle teardown until full reset; ordinary optional
-stream failure leaves execution scheduling available. Previously committed
-frames remain immutable across reset. This is separate from passive raw/LFD
-snapshots and automatic first-failure bundles.
+The actor enables source verbose-level0 logging, forces an initial flush and
+consumes 0x8003 notifications. It validates fixed coherent backing and sampled
+headers, copies debug/crash regions, publishes host read cursors/flush bits and
+queues FAST ACK. The state-capture region is excluded. Source ownership, unique
+bounded CT fences, restore/quarantine behavior and GPU DMA/PM/cache retention
+remain with `GuCGt`; cancellation/reader Drop never releases the live log BO.
+Last-reader close restores the boot nonverbose policy through the same actor.
+Reset closes all reader descriptions while leaving committed copied records
+immutable.
+
+Every little-endian v2 frame has a 256-byte header and at most 0x14000 payload
+bytes. Offsets 0..191 retain v1 field positions: magic 0 (`NARFGSTR`), version 8
+(=2), header-size 12 (=256), frame-size 16, flags 20, platform 24, card 28,
+source-sequence 32, user-epoch 40, firmware-incarnation 48, copy-time 56, packed
+release 64, event/crash offsets+lengths 72..87, two raw 36-byte source headers
+88..159 and firmware SHA-256 160..191. Added u64 fields: observed event/crash
+overflow deltas 192/200; cumulative reader dropped-frame/wire-byte counts
+208/216; cumulative observed event/crash overflow lower bounds 224/232; reader's
+first delivered source sequence 240. Offset 248 is reserved zero. A v1-only
+decoder must reject version 2.
+
+Flags at 20: bit 0 data; bit 1 observed firmware overflow in this frame; bits
+2/3 event/crash payload is a complete physical ring image; bit 4 firmware
+counter is only a modulo lower bound (always set); bit 5 first source/reader
+delivery with unknown earlier history; bit 6 reader host loss has occurred; bit
+7 host counters saturated. Ring images are opaque, unordered and non-atomic.
+Ordinary ranges remain checked linear/wrapped sampled ranges. All output extents
+are host-bounded and never allocated from DMA-supplied lengths.
+
+The source firmware counter is only four bits. A zero delta cannot exclude 16 or
+more unseen overflows; neither missing firmware bytes nor losslessness can be
+guaranteed. Reported firmware deltas/totals are observed lower bounds within
+this source session. Source sequence and firmware totals restart with a new
+source actor; first-delivery flags identify unknown prior history. Host loss
+counts describe dropped committed wire records, independently of firmware loss.
+Unknown protocol/header state, repeated unstable sampling, access loss or
+uncertain restore terminates explicitly after committed records, retaining the
+source owner's existing quarantine where required.
 
 The independent, default-off `narf.intel.devcoredump=1` option arms automatic
 first-failure GuC diagnostic bundles. The exact single-token policy matches
@@ -1796,6 +1826,88 @@ lost edges. Inherited enabled masters, unrelated display/media causes, invalid
 identities, deadline or current-route failure refuse or close delivery.
 Existing handler/cookie/vector quarantine and terminal execution proofs apply.
 Media engine reset ownership does not publish media scheduling or HuC support.
+
+### Intel Gen12 fixed color and cursor ownership
+
+Qualified Tiger Lake and Alder/Raptor Lake internal Pipe-A/DDI-A SST profiles
+expose CTM independently from native LUT, cursor and joint-primary/color
+capabilities. CTM contains nine S31.32 sign-magnitude coefficients (72 bytes).
+A stopped-pipe modeset establishes and reads back RGB bypass before plane
+enable. Runtime capture refuses foreign color, route, timing, fetcher,
+DBUF/DDB/WM or console-PTE state, including a color-only session without GEM
+primary ownership. The retained CSC transaction requires same-frame arm,
+a later stable frame and exact readback before Card publication, event or
+out-fence success. Cancel/master loss and uncertain writes retain original
+and unpublished state until verified restoration. Fresh reset recovery
+rechecks the complete resource image and every original console mapping
+before replay and admission. An independent fixed linear primary commit may
+coexist with CTM; joint primary/color transactions require separate admission.
+
+The fixed Gen12 display may advertise legacy CURSOR/CURSOR2 independently
+of color. Cursor support is limited to 64x64 ARGB images, signed positions
+within 32767 and unchanged primary geometry, timing and clocks. An owned
+unjoined S1/S2 primary/cursor DDB partition is established/read back with all
+pipes/fetchers stopped. Serialized PCODE memory/SAGV latencies must qualify
+primary/cursor watermarks. The fixed reservation persists while hidden;
+runtime requests never repartition it. Display13 uses ARB_SLOTS(1).
+
+Cursor workers wait for source writer fences and copy into two private stable
+WC slots. Gen12 uses PAT-free GGTT encoding under the 39-bit DMA mask, with
+all BO addresses checked before the first PTE write. DSB uses PCODE-derived
+DEwake and generation-specific W1C/error masks, excluding MTL PAT/ATS state.
+Publication and slot reuse require independent DSB terminal/disable, a later
+stable frame, CURSURFLIVE and exact cursor/resource readbacks. Cursor faults
+include GEN9_PIPE_CURSOR_FAULT bit11 on Gen12 and MTL. Cancel, close, master
+replacement, reset and failed witnesses retain every exposed cursor/command
+BO, mapping and VA lease. Fresh recovery verifies the retained resource and
+all console PTEs, stops old DSB source before leaf, freshly proves cursor-off,
+then proves the console primary latch before reopening ordinary admission.
+
+The source-qualified fixed Gen12 internal RGB pipeline advertises color by
+exact display profile: display12 TGL/ADL-S/RPL-S has 262145 native post-CSC and 33
+pre-CSC entries; display13 ADL-P/N and mapped RPL-P/U has 1024/129. Both support
+legacy 256 gamma independently of hardware cursor. Gen12/13 pre data is Q16
+with two 1<<16 hardware clamps (35/131 words); MTL retains Q24/1<<24. Pre RGB
+must be equal and nondecreasing; native12 gamma must be nondecreasing per RGB
+channel across the entire ABI array. Native13/legacy gamma use source policy.
+Unqualified joint primary/color changes fail during admission, including
+TEST_ONLY. A new Generation variant cannot inherit this pipeline implicitly.
+
+Native12 CREATEPROPBLOB accepts at most 2,097,160 bytes on a qualified Card;
+other ioctl copies keep the 1 MiB cap. Intel display Cards cap all stored blob
+payloads, including destroyed retained references, at 16 MiB and concurrent
+input/output copy staging at a separate 16 MiB. Reservations precede allocation,
+release on faults/errors, and no Card spinlock spans the user copy. The real
+32-commit FIFO retains blob identity and compact canonical images through
+final completion. Success, events and Card state follow final hardware proof.
+
+Display12 PAL_PREC_DATA fine/coarse readout is explicitly unreliable in the
+source. For the fully owned driver-established RGB-bypass profile, complete
+canonical DSB writes plus independent source/leaf retirement/status, later
+stable frame, enable/CSC readback and readable superfine/maxima/clamps form
+the profile-specific witness. No fine/coarse readback or exact original
+post-LUT RAM restoration is claimed. When both LUT gates are off, a complete
+inactive preload is independently completed before a separate enable arm.
+Active replacement uses the source vblank DSB protocol. MTL/display13 retain
+exact indexed/legacy/maxima comparison and restoration; readable Gen12 pre
+RAM also retains its exact original restoration obligation.
+
+Display12 clear/reset restores and proves the original visible bypass/CSC,
+while inactive post-LUT RAM remains exclusively Device-owned and possibly
+dirty across clear, legacy handoff, quiesce and recovery. Legacy reentry cannot
+adopt that RAM as active data; modeset handoff establishes RGB bypass. Every
+new activation after clear/reset completely rewrites its selected table before
+enable. Failed/cancelled preloads retain their original owner and RAM/DMA
+obligations. Original pipeline/resource owners survive until complete DSB and
+native-frame proof. Cursor and primary ownership remain independent. Fresh
+reset recovery checks exact resources and every console PTE, stops old source
+before leaf, restores the profile's permitted color state, proves cursor-off
+when owned and a fresh console primary before reopening normal admission.
+
+The legacy Gen12 arena also checks its 39-bit physical-address limit before
+writing any GGTT entry. Legacy PPGTT attachment rejects roots outside that
+limit before patching its retained context image. A qualified DG2 arena keeps
+its distinct 46-bit DMA limit; the shared wire codec is not platform proof.
 
 ### Intel copy, runtime policy and additional scanout layouts
 

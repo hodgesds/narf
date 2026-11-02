@@ -37,13 +37,32 @@ pub(crate) struct Owner<M: DisplayAccess + Clone> {
     pending: Option<Target>,
     confirmed: Option<Target>,
     pub(crate) timing: Timing,
+    gen12: bool,
+    visible_control: u32,
+    faults: u32,
 }
 impl<M: DisplayAccess + Clone> Owner<M> {
     pub(crate) fn new(io: M, bar_len: u64, timing: Timing) -> Result<Self, FsError> {
-        if !io.access_ok() || io.read32(0x4804) != 4 {
+        Self::new_profile(io, bar_len, timing, None)
+    }
+    pub(crate) fn new_gen12(
+        io: M,
+        bar_len: u64,
+        timing: Timing,
+        family: crate::intel_gpu_gt::Gen12Platform,
+    ) -> Result<Self, FsError> {
+        Self::new_profile(io, bar_len, timing, Some(family))
+    }
+    fn new_profile(
+        io: M,
+        bar_len: u64,
+        timing: Timing,
+        family: Option<crate::intel_gpu_gt::Gen12Platform>,
+    ) -> Result<Self, FsError> {
+        if !io.access_ok() || (family.is_none() && io.read32(0x4804) != 4) {
             return Err(FsError::NoDevice);
         }
-        if io.read32(0x70080) != 0 {
+        if io.read32(0x70080) != 0 || (family.is_some() && io.read32(0x700a0) != 0) {
             return Err(FsError::Unsupported);
         }
         let key = io.ggtt_key().ok_or(FsError::Unsupported)?;
@@ -69,6 +88,29 @@ impl<M: DisplayAccess + Clone> Owner<M> {
             pending: None,
             confirmed: None,
             timing,
+            gen12: family.is_some(),
+            visible_control: if matches!(
+                family,
+                Some(
+                    crate::intel_gpu_gt::Gen12Platform::AlderLakeP
+                        | crate::intel_gpu_gt::Gen12Platform::AlderLakeN
+                )
+            ) {
+                0x10000027
+            } else {
+                0x27
+            },
+            // intel_display_regs.h: primary7, cursor11, DMC25, underrun31.
+            // ATS primary/DMC status exists only on display14+.
+            faults: (1 << 7)
+                | (1 << 11)
+                | (1 << 25)
+                | (1 << 31)
+                | if family.is_none() {
+                    (1 << 18) | (1 << 24)
+                } else {
+                    0
+                },
         })
     }
     fn read(&self, r: u64) -> Result<u32, FsError> {
@@ -97,6 +139,13 @@ impl<M: DisplayAccess + Clone> Owner<M> {
     pub(crate) fn active(&self) -> bool {
         self.enabled || self.pending.is_some()
     }
+    pub(crate) fn resource_enabled(&self) -> bool {
+        if self.gen12 {
+            self.confirmed.is_some_and(|target| target.visible)
+        } else {
+            self.enabled
+        }
+    }
     pub(crate) fn pending(&self) -> bool {
         self.pending.is_some()
     }
@@ -122,14 +171,24 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         if !object.publish_for_device() {
             return Err(FsError::NoDevice);
         }
+        let format = if self.gen12 {
+            PteFormat::Gen12
+        } else {
+            PteFormat::XeLpg
+        };
+        let pat = if self.gen12 { 0 } else { 1 };
+        let pages: Vec<u64> = object
+            .pages()
+            .map(|phys| {
+                crate::intel_gpu_gtt::encode_display_pte(format, phys, pat)
+                    .map_err(|_| FsError::InvalidData)
+            })
+            .collect::<Result<_, _>>()?;
         // Before first exposure, any failure may drop an empty reservation.
         // Afterward this exact BO/VA is retained forever: no display/cursor
         // translation-cache invalidation or speculative reset is assumed.
         self.installed = true;
-        for (i, phys) in object.pages().enumerate() {
-            let pte = PteFormat::XeLpg
-                .encode_ggtt(phys, 1)
-                .map_err(|_| FsError::InvalidData)?;
+        for (i, pte) in pages.into_iter().enumerate() {
             let r = GGTT_ARRAY_BASE + (lease.start / 4096 + i as u64) * 8;
             let old = self.read(r)?;
             let high = self.read(r + 4)?;
@@ -148,10 +207,24 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         replace: bool,
         position: Option<(i32, i32)>,
     ) -> Result<Vec<(u64, u32)>, FsError> {
+        self.stage_with(
+            |enabled| profile.cursor_registers(enabled),
+            image,
+            replace,
+            position,
+        )
+    }
+    pub(crate) fn stage_with(
+        &mut self,
+        registers: impl FnOnce(bool) -> Vec<(u64, u32)>,
+        image: Option<&Arc<GemObject>>,
+        replace: bool,
+        position: Option<(i32, i32)>,
+    ) -> Result<Vec<(u64, u32)>, FsError> {
         if self.pending.is_some() {
             return Err(FsError::Busy);
         }
-        if self.read(0x44408)? & ((1 << 7) | (1 << 25) | (1 << 31) | (1 << 18) | (1 << 24)) != 0 {
+        if self.read(0x44408)? & self.faults != 0 {
             return Err(FsError::NoDevice);
         }
         let (x, y) = position.unwrap_or((self.x, self.y));
@@ -198,9 +271,14 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         } else {
             0
         };
-        let mut regs = profile.cursor_registers(enabled);
+        // Gen12 WMs follow physical visibility; the fixed DDB reservation and
+        // private image remain retained even when the position clips it out.
+        let mut regs = registers(if self.gen12 { visible } else { enabled });
+        if self.gen12 {
+            regs.push((0x700a0, 0));
+        }
         regs.extend([
-            (0x70080, if visible { 0x27 } else { 0 }),
+            (0x70080, if visible { self.visible_control } else { 0 }),
             (0x70088, pos),
             (0x70084, base),
         ]);
@@ -226,11 +304,19 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         self.pending = None;
     }
     fn verify(&self, target: Target) -> Result<(), FsError> {
-        if self.read(0x44408)? & ((1 << 7) | (1 << 25) | (1 << 31) | (1 << 18) | (1 << 24)) != 0 {
+        if self.read(0x44408)? & self.faults != 0 {
+            return Err(FsError::NoDevice);
+        }
+        if self.gen12 && self.read(0x700a0)? != 0 {
             return Err(FsError::NoDevice);
         }
         let before = self.read(0x70040)?;
-        if self.read(0x70080)? != if target.visible { 0x27 } else { 0 }
+        if self.read(0x70080)?
+            != if target.visible {
+                self.visible_control
+            } else {
+                0
+            }
             || self.read(0x70084)? != target.base
             || self.read(0x70088)? != target.pos
             || self.read(0x700ac)? != target.base

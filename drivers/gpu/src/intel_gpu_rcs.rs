@@ -857,7 +857,14 @@ impl core::fmt::Debug for GgttArena {
 impl GgttArena {
     fn encode_pte(&self, phys: u64) -> Result<u64, crate::intel_gpu_gtt::GttError> {
         match self.policy {
-            None => encode_scanout_pte(phys, PatSlot::Slot0),
+            None => {
+                // The unqualified arena belongs to the legacy Gen12 engine.
+                // Its DMA mask is narrower than the shared GGTT wire format.
+                if phys >> 39 != 0 {
+                    return Err(crate::intel_gpu_gtt::GttError::PhysOutOfRange);
+                }
+                encode_scanout_pte(phys, PatSlot::Slot0)
+            }
             Some(policy) => {
                 if phys >> policy.platform().physical_bits() != 0 {
                     return Err(crate::intel_gpu_gtt::GttError::PhysOutOfRange);
@@ -1817,7 +1824,7 @@ impl<M: MmioWindow, A: GpuAllocator> RcsEngine<M, A> {
     /// behind either root stay owned by their `Ppgtt`.
     pub fn attach_ppgtt(&mut self, id: ContextId, root_phys: u64) -> Result<(), SubmitError> {
         encode_table_entry(root_phys).map_err(|_| SubmitError::InvalidPpgttRoot)?;
-        if root_phys == 0 {
+        if root_phys == 0 || root_phys >> 39 != 0 {
             return Err(SubmitError::InvalidPpgttRoot);
         }
         let slot = self.context(id)?.slot;
@@ -3609,6 +3616,42 @@ pub mod tests {
         smoke_ppgtt_batch_start_encoding
     );
 
+    fn smoke_legacy_arena_gen12_dma39_and_qualified_dg2_dma46() -> TestResult {
+        // The encoder never dereferences this sentinel BAR. Exercise the real
+        // arena admission path without requiring a particular physical allocator.
+        let mut arena = GgttArena::new(narf_bus::bar::MmioRegion {
+            phys: narf_memory::PhysAddr::new(0),
+            virt: 0,
+            len: 0,
+            kind: narf_bus::bar::BarKind::Mmio64 {
+                prefetchable: false,
+            },
+        });
+        let last_gen12_page = (1u64 << 39) - 4096;
+        if arena.encode_pte(last_gen12_page) != Ok(last_gen12_page | 1)
+            || arena.encode_pte(1u64 << 39) != Err(crate::intel_gpu_gtt::GttError::PhysOutOfRange)
+            || arena.encode_pte(4097).is_ok()
+        {
+            return TestResult::Fail("legacy arena did not enforce Gen12 DMA39 before mapping");
+        }
+        arena.policy = Some(crate::intel_gpu_gt_hw::CachePolicy {
+            platform: crate::intel_gpu_gt::GtPlatform::Alchemist,
+            ggtt_pat: 0,
+        });
+        let last_dg2_page = (1u64 << 46) - 4096;
+        if arena.encode_pte(1u64 << 39) != Ok((1u64 << 39) | 1)
+            || arena.encode_pte(last_dg2_page) != Ok(last_dg2_page | 1)
+            || arena.encode_pte(1u64 << 46) != Err(crate::intel_gpu_gtt::GttError::PhysOutOfRange)
+        {
+            return TestResult::Fail("qualified DG2 arena lost its distinct DMA46 encoding");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_rcs",
+        smoke_legacy_arena_gen12_dma39_and_qualified_dg2_dma46
+    );
+
     fn smoke_attach_ppgtt_programs_pdp0() -> TestResult {
         let (mut engine, hw) = match make_engine() {
             Ok(p) => p,
@@ -3642,9 +3685,16 @@ pub mod tests {
             Err(SubmitError::InvalidPpgttRoot) => {}
             _ => return TestResult::Fail("unaligned root must be refused"),
         }
-        match engine.attach_ppgtt(ctx, 1u64 << 46) {
-            Err(SubmitError::InvalidPpgttRoot) => {}
-            _ => return TestResult::Fail(">46-bit root must be refused"),
+        for invalid in [1u64 << 39, 1u64 << 46] {
+            match engine.attach_ppgtt(ctx, invalid) {
+                Err(SubmitError::InvalidPpgttRoot) => {}
+                _ => return TestResult::Fail("root outside Gen12 DMA mask must be refused"),
+            }
+            if engine.ppgtt_root(ctx) != Ok(None)
+                || (0..4).any(|pair| pdp_val(pair, true) != 0 || pdp_val(pair, false) != 0)
+            {
+                return TestResult::Fail("invalid DMA root mutated the retained context image");
+            }
         }
         // Attach: PDP0 carries the raw PML4 root address
         // (raw phys = 0x4000_0000 here); PDP1-3 stay zero.
