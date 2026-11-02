@@ -1561,7 +1561,12 @@ event. The audited command matrix and remaining gaps live in
 `observability/PERF_LINUX_COMPAT_AUDIT.md`.
 
 DRM ioctl handling that creates process descriptors remains in the syscall
-layer even when request validation and submission are driver-owned. VirtIO-GPU
+layer even when request validation and submission are driver-owned.
+PRIME HANDLE_TO_FD exports preserve `DRM_RDWR` as the dma-buf's `O_RDWR`
+access mode independently of `DRM_CLOEXEC`/`FD_CLOEXEC`. Without `DRM_RDWR`
+the exported description is read-only. `F_GETFL`, duplication, and writable
+shared mmap use that description's access mode.
+VirtIO-GPU
 `EXECBUFFER(FENCE_FD_OUT)` reserves a descriptor before submission, installs
 a sync-file description backed by the driver's exact asynchronous submission
 fence with `FD_CLOEXEC`, and then copies the descriptor number to the ioctl

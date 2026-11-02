@@ -1611,8 +1611,19 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 fd::FdEntry {
                     ops: dmabuf,
                     offset: 0,
-                    flags: if prime_flags & DRM_CLOEXEC != 0 { 1 } else { 0 },
-                    status_flags: 0,
+                    flags: if prime_flags & DRM_CLOEXEC != 0 {
+                        crate::fd::FD_CLOEXEC
+                    } else {
+                        0
+                    },
+                    // drm_gem_prime_export passes DRM_RDWR through to the
+                    // dma-buf file's O_ACCMODE. Losing it makes a writable
+                    // shared mmap fail EACCES before reaching the GPU backend.
+                    status_flags: if prime_flags & DRM_RDWR != 0 {
+                        crate::fd::O_RDWR
+                    } else {
+                        crate::fd::O_RDONLY
+                    },
                 },
             );
             match new_fd {
