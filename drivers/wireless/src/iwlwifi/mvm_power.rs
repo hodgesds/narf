@@ -540,6 +540,13 @@ pub(in crate::iwlwifi) struct Fence {
     stop: Option<Arc<AtomicBool>>,
 }
 impl Fence {
+    pub(in crate::iwlwifi) fn radiated_dbm(&self) -> Result<i8, &'static str> {
+        i8::try_from(
+            (self.applied + self.gain).div_euclid(8)
+                + i16::from((self.applied + self.gain).rem_euclid(8) != 0),
+        )
+        .map_err(|_| "MVM actual radiated bound exceeds supported range")
+    }
     pub(in crate::iwlwifi) fn invoke<T>(
         &self,
         domain: &RegulatoryDomain,
@@ -725,7 +732,7 @@ impl Owner {
                 &b"NARF Intel MVM API77 qualified P2P GO9 MAC0 PHY0 OFDM-only legacy20 beacon TIM eight-client four-AC SME host-GTK-CCMP IGTK-CMAC exact-PN native-NoA probe program power v9"[..]
             }
             Emission::P2pClient => {
-                &b"NARF Intel MVM API77 qualified P2P CLIENT8 MAC0 STA7 PHY0 OFDM-only legacy20 protected RSNA peer-NoA CTWindow original-role program power v10"[..]
+                &b"NARF Intel MVM API77 qualified P2P CLIENT8 MAC0 STA7 PHY0 OFDM-only legacy20 protected RSNA peer-NoA CTWindow original-role source-bound public-P2P FRAME native-ACK program power v10-public1"[..]
             }
         });
         if let Emission::Features(bits) = emission {

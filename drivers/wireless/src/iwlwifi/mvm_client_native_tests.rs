@@ -61,10 +61,151 @@ fn send(f: &Fixture, window: u32) -> Result<(), &'static str> {
     )
 }
 #[inline(never)]
+fn public_frame(f: &Fixture, both: bool) -> Result<(), &'static str> {
+    let _ = narf_wireless::nl80211::register();
+    let actual = narf_net::iface::lookup(f.h.device.name()).ok_or("API77 CLIENT public IFINDEX")?;
+    let wiphy = narf_wireless::registry::wiphy_index(f.h.device.wiphy_id())
+        .ok_or("API77 CLIENT public wiphy")?;
+    let frame = p2p::public_frame(OWN, AP);
+    let request = crate::iwlwifi::p2p_go_fixture::management_request(
+        actual.ifindex,
+        wiphy,
+        2412,
+        Some(&frame),
+        both,
+    );
+    let before = f.source.messages.lock().len();
+    let transmitted = f.h.actor.lock().client_public.len();
+    let replies = narf_net::netlink_generic::build_replies_with_endpoint(
+        &request,
+        Default::default(),
+        narf_net::netlink_generic::RequestContext {
+            admin: Some(&f.admin),
+            portid: 77,
+            ..Default::default()
+        },
+        f.source.clone(),
+    )
+    .map_err(|_| "API77 CLIENT public original FRAME parser")?;
+    require(
+        replies.is_empty(),
+        "API77 CLIENT FRAME escaped retained worker",
+    )?;
+    let mut done = false;
+    for _ in 0..4096 {
+        narf_scheduler::poll_one_round();
+        f.h.actor.lock().serve()?;
+        done = {
+            let messages = f.source.messages.lock();
+            crate::iwlwifi::p2p_go_fixture::management_completed(&messages[before..], true)?
+        };
+        if done {
+            break;
+        }
+    }
+    require(
+        done && f.h.actor.lock().client_public.len() == transmitted + 1,
+        "API77 CLIENT public FRAME lost native original ACK/power owner",
+    )
+}
+#[inline(never)]
+fn register(f: &Fixture) -> Result<(), &'static str> {
+    register_kind(f, false)
+}
+#[inline(never)]
+fn register_kind(f: &Fixture, probe: bool) -> Result<(), &'static str> {
+    let _ = narf_wireless::nl80211::register();
+    let actual = narf_net::iface::lookup(f.h.device.name())
+        .ok_or("API77 CLIENT REGISTER original IFINDEX")?;
+    let wiphy = narf_wireless::registry::wiphy_index(f.h.device.wiphy_id())
+        .ok_or("API77 CLIENT REGISTER wiphy")?;
+    let request = if probe {
+        p2p::register_probe_request(actual.ifindex, wiphy, true)
+    } else {
+        p2p::register_request(actual.ifindex, wiphy, true)
+    };
+    let before = f.source.messages.lock().len();
+    let replies = narf_net::netlink_generic::build_replies_with_endpoint(
+        &request,
+        Default::default(),
+        narf_net::netlink_generic::RequestContext {
+            admin: Some(&f.admin),
+            portid: 77,
+            ..Default::default()
+        },
+        f.source.clone(),
+    )
+    .map_err(|_| "API77 CLIENT REGISTER parser/source")?;
+    require(
+        replies.is_empty(),
+        "API77 CLIENT registration escaped original deferred source",
+    )?;
+    let mut done = false;
+    for _ in 0..4096 {
+        narf_scheduler::poll_one_round();
+        f.h.actor.lock().serve()?;
+        done = {
+            let m = f.source.messages.lock();
+            crate::iwlwifi::p2p_go_fixture::management_completed(&m[before..], false)?
+        };
+        if done {
+            break;
+        }
+    }
+    require(
+        done,
+        "API77 CLIENT original metadata registration did not complete",
+    )
+}
+#[inline(never)]
 fn native() -> Result<(), &'static str> {
     let _platform = Platform::new();
     let f = Fixture::new_emission(10)?;
+    register(&f)?;
+    let incoming = p2p::peer_action(OWN, AP);
+    f.h.actor
+        .lock()
+        .inject(0xc1, 0, 0x8000, &envelope(&incoming));
+    let _ = f.h.device.step(None);
+    require(
+        p2p::received(&f.source.messages.lock(), &incoming) == 0,
+        "API77 pre-association metadata invented native RX",
+    )?;
     join(&f)?;
+    f.h.actor
+        .lock()
+        .inject(0xc1, 0, 0x8000, &envelope(&incoming));
+    for _ in 0..4 {
+        f.h.actor.lock().serve()?;
+        let _ = f.h.device.step(None);
+    }
+    require(
+        p2p::received(&f.source.messages.lock(), &incoming) == 1,
+        "API77 original native CLIENT RX absent",
+    )?;
+    register_kind(&f, true)?;
+    for _ in 0..128 {
+        f.h.actor.lock().serve()?;
+        let _ = f.h.device.step(None);
+    }
+    let probe = p2p::probe_request(OWN, AP);
+    f.h.actor.lock().inject(0xc1, 0, 0x8000, &envelope(&probe));
+    for _ in 0..4 {
+        f.h.actor.lock().serve()?;
+        let _ = f.h.device.step(None);
+    }
+    let probe_filter = {
+        let a = f.h.actor.lock();
+        a.commands
+            .iter()
+            .rev()
+            .find(|(g, c, b)| (*g, *c) == (3, 8) && b[8] == 7)
+            .is_some_and(|(_, _, b)| word(b, 20) & 32 != 0 && b[36] == 1)
+    };
+    require(
+        probe_filter && p2p::received(&f.source.messages.lock(), &probe) == 1,
+        "API77 post-association probe RX lacks actual MAC7 filter receipt",
+    )?;
     let native = {
         let mut state =
             f.h.device
@@ -94,6 +235,24 @@ fn native() -> Result<(), &'static str> {
     send(&f, 40)?;
     notice(&f, 3, None, false);
     send(&f, 0)?;
+    for _ in 0..65 {
+        notice(&f, 7, Some(99), true);
+    }
+    notice(&f, 4, Some(0xa8), false);
+    public_frame(&f, false)?;
+    let window = {
+        let a = f.h.actor.lock();
+        a.commands
+            .iter()
+            .rev()
+            .find(|(g, c, b)| (*g, *c) == (3, 8) && b[8] == 7)
+            .map(|(_, _, b)| u32::from_le_bytes(b[48..52].try_into().unwrap()))
+    };
+    require(
+        window == Some(40),
+        "API77 CLIENT FRAME crossed queued NoA without actual CTWindow ACK",
+    )?;
+    public_frame(&f, true)?;
     let mut down = OWN.to_vec();
     down.extend_from_slice(&AP);
     down.extend_from_slice(&[0x88, 0xb5, 7, 8, 9]);

@@ -2,6 +2,60 @@
 use super::*;
 use alloc::sync::Arc;
 impl Hardware {
+    pub(in crate::iwlwifi) fn client_receive_host(
+        &mut self,
+        host: alloc::sync::Arc<super::super::p2p_client_rx::Host>,
+        receiver: super::super::p2p_client_rx::Receiver,
+    ) -> Result<(), &'static str> {
+        self.source_fence()?.invoke(|| Ok(()))?;
+        // Retire the actual already-completed fallback prefix before the new
+        // metadata subscription can observe its first copied notification.
+        for _ in 0..=RX_DEPTH / 64 {
+            if !self.has_pending_rx() {
+                break;
+            }
+            self.poll()?;
+        }
+        if self.has_pending_rx() {
+            return Err("CLIENT registration physical receive prefix kept moving");
+        }
+        self.client_rx = Some(host);
+        self.client_receiver = Some(receiver);
+        Ok(())
+    }
+    pub(in crate::iwlwifi) fn client_refresh_filter(&self) {
+        if let Some(native) = &self.p2p_client {
+            native.request_probes(self.client_rx.as_ref().is_some_and(|h| h.wants_probes()));
+        }
+    }
+    pub(in crate::iwlwifi) fn client_filter_pending(&self) -> bool {
+        self.p2p_client
+            .as_ref()
+            .is_some_and(|native| native.pending())
+    }
+    pub(in crate::iwlwifi) fn client_receive_power(
+        &mut self,
+        power: super::super::p2p_client_rx::MvmPower,
+    ) {
+        self.client_rx_mvm = Some(alloc::sync::Arc::new(power));
+    }
+    pub(in crate::iwlwifi) fn take_client_events(
+        &mut self,
+    ) -> alloc::vec::Vec<super::super::p2p_client_rx::Publication> {
+        core::mem::take(&mut self.client_copies)
+    }
+
+    pub(in crate::iwlwifi) fn client_request(
+        &mut self,
+        request: Option<Arc<super::super::p2p_client_request::Request>>,
+    ) -> Result<(), &'static str> {
+        if let Some(request) = &request {
+            request.check()?;
+        }
+        self.client_request = request;
+        Ok(())
+    }
+
     pub(in crate::iwlwifi) fn p2p_client_native(
         &self,
     ) -> Option<Arc<super::super::p2p_client::Native>> {
@@ -26,6 +80,7 @@ impl Hardware {
             role,
             self.format == rx_rfh::CompletionFormat::Qu,
         )?;
+        native.request_probes(self.client_rx.as_ref().is_some_and(|h| h.wants_probes()));
         self.p2p_client = Some(native.clone());
         Ok(native)
     }
@@ -51,7 +106,7 @@ impl Hardware {
         native.begin_copy()?;
         let window = native.desired();
         self.command(3, 8, &native.mac(1, None, window)?).await?;
-        native.commit_window(window)?;
+        native.commit_window(window, false)?;
         self.command(
             3,
             9,
@@ -104,6 +159,7 @@ impl Hardware {
         Ok(())
     }
     pub(in crate::iwlwifi) fn check_client_tx_publication(&mut self) -> Result<(), &'static str> {
+        self.client_refresh_filter();
         let Some(native) = self.p2p_client.clone() else {
             return Ok(());
         };
@@ -118,7 +174,11 @@ impl Hardware {
         if self.has_pending_rx() {
             return Err("P2P client physical receive prefix kept moving");
         }
-        native.transmission()
+        native.transmission()?;
+        if let Some(request) = &self.client_request {
+            request.transmission()?;
+        }
+        Ok(())
     }
     pub(in crate::iwlwifi) async fn service_p2p_client(&mut self) -> Result<(), &'static str> {
         let Some(native) = self.p2p_client.clone() else {
@@ -132,12 +192,13 @@ impl Hardware {
             }
             let window = native.desired();
             let body = native.update_mac()?;
+            let probe = u32::from_le_bytes(body[20..24].try_into().unwrap()) & 32 != 0;
             let receipt = self.command(3, 8, &body).await?;
             if !receipt.payload.is_empty() {
                 return Err("P2P client CTWindow command lacks native receipt");
             }
             self.source_fence()?
-                .invoke(|| native.commit_window(window))?;
+                .invoke(|| native.commit_window(window, probe))?;
         }
         Err("P2P client NoA kept changing across native receipts")
     }

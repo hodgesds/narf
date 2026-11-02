@@ -108,6 +108,8 @@ mod native_band;
 mod p2p_client;
 #[cfg(feature = "kernel-test")]
 mod p2p_client_fixture;
+mod p2p_client_request;
+mod p2p_client_rx;
 mod p2p_gen2_wire;
 mod p2p_go;
 #[cfg(feature = "kernel-test")]

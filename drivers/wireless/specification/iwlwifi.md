@@ -90,6 +90,15 @@ from physical acceptance of the enabled software profiles.
 
 ## 3. Public interface and stage progression
 
+> Current P2P implementation: §§3.72–3.79 define the complete admitted
+> bounded DEVICE/GO/CLIENT source baseline, including the original public
+> CLIENT FRAME/REGISTER worker. This supersedes older P2P-unimplemented/open
+> descriptions in §3.23 and earlier continuation notes, including §3.77.
+> Source review and coordinated release compilation precede integration;
+> native regression and physical/RF acceptance remain separate pending gates.
+> Unsupported GO CTWindow/OPPPS setters on MAC_CONFIG1/2/3, richer PHY and
+> concurrent data roles remain unadvertised as detailed in §3.79.
+
 **Software acceptance at `6813a24c6`.** The admitted non-MLO EHT (`eht`),
 `width_320`, complete scoped `six_ghz` and ordinary legacy20 `ap`
 continuations pass the checkpoint release/native gates on x86_64 and aarch64.
@@ -4849,6 +4858,149 @@ and TX, terminal restoration and original-copy retirement. Request/security
 replacement, Open/GO-capability confusion, missing measured input and current
 NO_P2P refusal have explicit negative assertions. These source changes await
 coordinated release compilation and native execution. CLIENT's public native
-FRAME/REGISTER_FRAME worker is still a separate continuation; its management
-opt-in stays false. Native GO PS controls retain §3.76's actual producer
+FRAME worker continues in §3.78 and the original receive-only
+REGISTER_FRAME/copy owner in §3.79. Native GO PS controls retain §3.76's actual producer
 limitations. The whole P2P row remains open.
+
+
+### 3.78 Original CLIENT public FRAME terminal owner
+
+The CLIENT8 netdev opts into the existing original-source deferred Radio
+FRAME path, including NO_CCK and IFINDEX-only or matching IFINDEX/WDEV. It
+accepts only bounded on-channel unprotected P2P public/vendor actions and
+probe requests with exact original physical SA/BSSID and local protocol
+DeviceInfo. Authentication/association, robust management and security/key
+frames remain owned by the real station SME. Off-channel FRAME remains on
+the independent native DEVICE owner rather than borrowing a CLIENT queue.
+
+The public waiter reserves the same retained physical control worker as the
+station. It captures its exact original association Arc, role lifetime,
+controlled-port generation and Sc copy epoch before arbitrary source capture,
+then retains the actual firmware/PNVM/PCI caps and callback-free original
+source/admin/netdev guards. A closing borrowed waiter cancels admission but
+never drops the driver's native future, command/packet DMA or original
+reservation. Failed/uncertain native work uses the existing physical stop
+owner with still-current device authority, retaining uncertain DMA.
+
+Each FRAME separately needs actual initiating NVM/MCC and host permission,
+including ACTIVE/non-radar/20MHz, NO_IR/DFS/NO_P2P and the already-applied
+power bound. Sc retains its actual native MCC cell. API77 obtains a real
+correlated MCC response, or the actual non-LAR NVM/IBSS permission, and binds
+its acknowledged signed tag10 power owner. These are fixed concrete policy
+providers, never an arbitrary environment callback disguised as a receipt.
+The source-only command fence permits non-emitting configuration/MCC waits;
+the initiating receipt is checked inside the real native packet publication
+invoke after credit waits and the bounded completed-RFH prefix. Actual peer
+NoA/CTWindow changes require their native MAC7 ACK before FRAME publication.
+
+Real management queue and OFDM rate/encryption flags produce native TX and
+terminal ACK/no-ACK. The fixed original proof is rechecked after final full
+source/interface callbacks, then recorded once on that same original Radio
+authority for the shared final TX_STATUS/cookie/deferred ACK fences. Receipt
+construction excludes callback-capable periodic-scan policy and another AP,
+DEVICE or existing FRAME request. No State/source callback is run inside its
+fixed currentness method. An observed proof loss remains denied on all
+original authority clones even if a provider later becomes permissive.
+
+The exact API77 tag10 program identity now includes the public P2P FRAME
+producer/native terminal contract. Earlier data-only program bindings cannot
+qualify this expanded emitting program. This metadata still creates no
+measurement or grant. Native fixtures strengthen the four existing CLIENT
+cases: raw IFINDEX and matching-WDEV/NO_CCK, exact posted frame/OFDM6/key/queue
+facts, more-than64 completed foreign notifications before current CTWindow,
+held TX ownership, malformed/SME/protected frame refusal, current NO_IR and
+an actual final source callback retiring the original native client. These
+assertions are source-only pending coordinated release compilation/native
+execution. The original REGISTER_FRAME/native receive continuation is in
+§3.79; its complete admitted baseline assessment follows there.
+
+
+### 3.79 CLIENT receive metadata and original native copy ownership
+
+CLIENT8 REGISTER_FRAME uses the actual netdev IFINDEX or matching original
+WDEV, current administrative UP, original delegated/source registration and
+mode generation. Registration may precede association and carries no RF,
+key, station, port or initiating NO_IR permission. Only bounded P2P public
+Action and Probe-Request filters are admitted. Unknown concrete source
+providers refuse rather than fall back to cached authority. Arbitrary source
+pruning/capture callbacks run outside native State and registration locks.
+A bounded real already-completed fallback-RFH prefix is drained before a
+new registration is installed; adding/pruning registrations advances a
+nonwrapping metadata epoch, so earlier copies cannot adopt the successor.
+
+Hardware snapshots the exact original registrations, associated Native Arc,
+firmware/PNVM/PCI source, open physical copy epoch and concrete native port
+generation before RFH copying. The fixed receiver variants contain only the
+original weak Sc or MVM device and atomic state observations, with no virtual
+interface/source callback or State access. API77 additionally retains the
+actual acknowledged signed power/source and controlled-port proof installed
+by the real port admission owner. A receive subscription cannot borrow a
+concurrent FRAME request's socket or initiating grant. Actual raw fallback0,
+link, band where reported, channel, CRC/status, unprotected management class,
+RA and BSSID facts plus the registered body prefix qualify each copy. NoA or
+received protocol addresses never grant native RX, key or RF authority.
+
+Prepared typed Radio delivery runs only after releasing State/control locks.
+Full original source/interface callbacks prepare the message, then the exact
+old native/source/port/copy/registration proof is checked again before the
+fixed RadioReceiveFence delivery. Closure, DOWN/UP, namespace/mode change,
+key/port epoch retirement, source-cap revocation or actual native association
+retirement cannot attach an old frame to a fresh owner. Receive copies are
+bounded64 metadata deliveries; overload drops metadata without advancing a
+key PN or inventing delivery/native authority. Ordinary station parsing and
+security still process their original packets; this path does not consume or
+rewrite EAPOL/CCMP frames.
+
+Linux's actual CLIENT MAC_CONFIG probe-request filter is bit5. It is enabled
+only for a registered probe-request subscription and an actual associated
+MAC7, following `mvm/mld-mac.c` and `mld/iface.c`; an unassociated ADD does not
+set it. A later subscription sets a pending fixed native filter choice.
+The retained ordinary maintenance owner sends the real source-current MAC7
+update, and only its actual ACK commits probe-copy eligibility. This also
+works while idle, without waiting for unrelated DATA. Fixed-only native
+polling/publication refreshes the desired filter from actual current source
+subscriptions; loss of the last subscription drives the same retained MAC7
+clear and real receipt without retiring the unrelated station/data owner.
+No dynamic pruning/provider callback runs in that refresh. Applied filter
+state commits the bit in the actual sent command, independently of a desired
+choice refreshed during its wait. Source loss during a held enable ACK thus
+requires a subsequent real clear command/receipt; it cannot falsely commit a
+clear from an enable ACK. Association receipts use their actual sent bytes
+as well. Action metadata
+needs no extra probe filter. CTWindow and filter updates share the actual MAC7
+receipt without acquiring port/key authority. Their pending states block
+emitting packet publication until the required command receipt completes.
+
+The four retained CLIENT native cases now also cover raw pre-association
+REGISTER_FRAME with both selectors, registration under receive-only NO_IR
+policy without native association, actual Action/probe RFH copies on
+Sc/API89/Bz/API77, associated native probe-filter bytes/receipts, late probe
+registration and idle maintenance, last-source loss with actual native filter
+clear receipt and source loss during a held enable ACK followed by actual
+clear receipt, foreign RA, replacement epoch retirement,
+and a full preparation callback that retires the real original native client
+before delivery. All old association/data/key/NoA assertions and case names
+remain. These added assertions await the coordinated release compile and
+native execution; they are not hardware acceptance or measured RF evidence.
+
+This completes the mandatory software paths of the admitted bounded P2P
+baseline: actual DEVICE ROC6/SESSION2/API77 SESSION1, retained public discovery
+and FRAME/REGISTER, actual GO9 userspace-SME/key/group-sequence/NoA/native
+management/data/retirement, and actual CLIENT8/MAC7 association, real station
+security/data plus public on-channel management/copy/retirement. One actual
+primary data role and the existing bounded control-device ownership remain
+the advertised concurrency; no extra software NIC or concurrent data role is
+invented. Legacy20/OFDM is the admitted GO/CLIENT PHY, with optional widths,
+six-GHz and richer modes unadvertised. DEVICE remains the actual off-channel
+negotiation owner before group formation.
+
+GO CTWindow/OPPPS public setters remain unadvertised because none of the
+admitted MAC_CONFIG1/2/3 producers has GO PS fields. The legacy `mac.h`
+MAC_CONTEXT GO union belongs to a different, unadmitted adapter; it cannot be
+transplanted into MAC_CONFIG. Client CTWindow uses the actual defined client
+field and GO NoA uses the actual firmware notification independently. There
+is no unfinished supported GO PS producer in this admitted baseline. Adding
+legacy MAC_CONTEXT hardware/firmware, optional concurrent roles or richer PHY
+would require new actual adapters/qualification and advertisement. The P2P
+row may be recorded as implemented pending validation after review/compilation
+of this complete graph; full native acceptance remains a separate gate.

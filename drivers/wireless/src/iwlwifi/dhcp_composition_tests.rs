@@ -198,6 +198,9 @@ struct TxModel {
 struct Wire {
     client: bool,
     client_mac: u8,
+    client_public: Vec<Vec<u8>>,
+    hold_client_public: bool,
+    hold_client_filter: bool,
     firmware: model::Firmware,
     trace: TxTrace,
     versions: Vec<u8>,
@@ -702,6 +705,15 @@ impl Wire {
                 if self.client {
                     self.client_mac =
                         crate::iwlwifi::p2p_client_fixture::mac(self.client_mac, body)?;
+                    if self.hold_client_filter
+                        && word(body, 4) == 2
+                        && body[36] == 1
+                        && word(body, 20) & 32 != 0
+                    {
+                        self.hold_client_filter = false;
+                        self.held = Some((cmd, group, sequence));
+                        return Ok(());
+                    }
                 }
             }
             (3, 9) => require(body.len() == 208 && body[16..22] == OWN, "Sc LINK identity")?,
@@ -1063,6 +1075,30 @@ impl Wire {
             "Sc native encryption flag",
         )?;
         let data = frame[0] & 0x0c == 8;
+        if self.client
+            && frame[0] == 0xd0
+            && frame.get(24..30) == Some(&[4, 9, 0x50, 0x6f, 0x9a, 9])
+        {
+            require(
+                self.client_mac == 2
+                    && self.ap.phase() == ApPhase::Authorized
+                    && self.keys != 0
+                    && self
+                        .queues
+                        .iter()
+                        .any(|(id, tid, live)| *id == p.queue && *tid == 15 && *live),
+                "P2P public FRAME lacked actual MAC7/key/port/management queue",
+            )?;
+            crate::iwlwifi::p2p_client_fixture::check_public(&frame, bytes, OWN, AP, false)?;
+            self.client_public.push(frame);
+            if self.hold_client_public {
+                self.hold_client_public = false;
+                self.held_tx = Some((p.queue, p.pointer));
+            } else {
+                self.firmware.tx_complete(p.queue, p.pointer);
+            }
+            return Ok(());
+        }
         if amsdu {
             require(
                 self.tx_model.is_some()
@@ -1778,6 +1814,9 @@ impl Guard {
         let mut wire = Box::new(Wire {
             client: matches!(receive_model, ReceiveModel::Client),
             client_mac: 0,
+            client_public: Vec::new(),
+            hold_client_public: false,
+            hold_client_filter: false,
             firmware,
             trace,
             versions,

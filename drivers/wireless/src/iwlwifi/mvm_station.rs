@@ -263,6 +263,7 @@ impl Owner {
     }
     pub(in crate::iwlwifi) fn station_needs_security(&self) -> bool {
         self.security.needs_service()
+            || self.hardware.client_filter_pending()
             || !self.power.phy.actions.is_empty()
             || self.power.phy.ba.needs_work()
     }
@@ -308,6 +309,10 @@ impl Owner {
         policy: impl FnMut() -> Result<RegulatoryDomain, &'static str>,
     ) -> Result<(), &'static str> {
         let mut policy = policy;
+        if self.hardware.p2p_client_native().is_some() {
+            self.check_link_power(&policy()?)?;
+            self.hardware.service_p2p_client().await?;
+        }
         self.service_ba(&mut policy).await?;
         self.service_phy_actions(&mut policy).await?;
         if let Some(frame) = self.receive_data_inner(&mut policy)? {

@@ -512,9 +512,24 @@ pass; full release/native gates remain at25 completed rows. Counting
 unvalidated implementations,82 remain; physical firmware/board acceptance is
 separate.
 
+**2026-11-02 — admitted native P2P source recount.** The ledger now holds
+**70 `feature`**, **31 `chip`** and **0 `unknown`** rows. Twelve source-complete
+implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. Intel DEVICE/SESSION1/SESSION2,
+bounded GO9/NoA and CLIENT8/MAC7 now compose actual public FRAME/REGISTER,
+association/security/data, original native-copy and terminal lifecycles. The
+probe filter follows current registrations and commits actual sent MAC7 bits
+only after their native receipts; source loss during a held enable requires a
+real successor clear. Unsupported legacy GO PS producer formats remain
+unadvertised. Seventeen native P2P registrations are retained, including four
+strengthened CLIENT cases; their new assertions are unexecuted. Scoped release
+metadata and formatting pass; full release/native gates
+remain at25 completed rows. Counting unvalidated implementations,82 remain;
+physical firmware/board acceptance is separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 3 | MLO, P2P and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; bounded DEVICE/SESSION1/SESSION2, legacy20 GO9/NoA and CLIENT8 association/data are implemented pending validation; the CLIENT management worker and native PS keep the family P2P row open |
+| iwlwifi | 2 | Multiple-active-link MLO and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; admitted DEVICE/SESSION1/SESSION2, bounded GO9/NoA and CLIENT8/MAC7 public management/association/security/data/terminal owners are implemented pending validation; unsupported GO PS producer formats and richer PHY/concurrency stay unadvertised |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 4 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA; hosted loadable packet ABI is software-accepted at `6813a24c6` |
 | ath10k | 7 | Contiguous VHT160, alternate calibration sources, hardware keys, P2P, DFS, credential replay and wake offload; bounded legacy20 AP/U-APSD, host-bus PM, PFC, signed indoor admission and native Beacon hints are implemented pending validation; managed Public Action ROC, streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are software-accepted at `6813a24c6` |

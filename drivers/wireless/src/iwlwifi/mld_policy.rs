@@ -8,13 +8,24 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_wireless::reg::RegulatoryDomain;
 
 #[derive(Clone)]
-pub(super) struct Source(Arc<dyn Fn() -> Option<Arc<RegulatoryDomain>> + Send + Sync>);
+pub(super) struct Source(Provider);
+#[derive(Clone)]
+enum Provider {
+    Native,
+    #[cfg(any(test, feature = "kernel-test"))]
+    Database(Arc<narf_wireless::reg::db::Database>),
+}
 impl Source {
     pub fn native() -> Self {
-        Self(Arc::new(narf_wireless::reg::db::snapshot))
+        Self(Provider::Native)
     }
     pub fn snapshot(&self) -> Result<Arc<RegulatoryDomain>, &'static str> {
-        (self.0)().ok_or("Intel current regulatory policy unavailable")
+        let snapshot = match &self.0 {
+            Provider::Native => narf_wireless::reg::db::snapshot(),
+            #[cfg(any(test, feature = "kernel-test"))]
+            Provider::Database(database) => database.snapshot(),
+        };
+        snapshot.ok_or("Intel current regulatory policy unavailable")
     }
     pub fn transaction(&self, requested: &RegulatoryDomain) -> Result<Transaction, &'static str> {
         let initial = self.snapshot()?;
@@ -38,7 +49,7 @@ impl Source {
     }
     #[cfg(any(test, feature = "kernel-test"))]
     pub fn database(database: Arc<narf_wireless::reg::db::Database>) -> Self {
-        Self(Arc::new(move || database.snapshot()))
+        Self(Provider::Database(database))
     }
 }
 #[derive(Clone)]
@@ -55,6 +66,7 @@ enum MvmPower {
     Ap(Arc<super::mvm_boot::ApPower>),
     Go(Arc<super::mvm_boot::ApPower>),
     P2p(Arc<super::mvm_boot::P2pPower>),
+    Client(Arc<super::mvm_boot::PowerFence>),
 }
 impl MvmPower {
     fn check(&self, domain: &RegulatoryDomain) -> Result<(), &'static str> {
@@ -68,18 +80,23 @@ impl MvmPower {
                 power.check(domain)
             }
             Self::P2p(power) => power.check(domain),
+            Self::Client(power) => power.invoke(domain, || Ok(())),
         }
     }
     fn ready(&self) -> Result<(), &'static str> {
         match self {
             Self::Ap(power) | Self::Go(power) => power.ready(),
             Self::P2p(power) => power.ready(),
+            // This concrete fence can only be constructed from the actual
+            // acknowledged station power owner, never a planned ceiling.
+            Self::Client(_) => Ok(()),
         }
     }
     fn radiated_dbm(&self) -> Result<i8, &'static str> {
         match self {
             Self::Ap(power) | Self::Go(power) => power.radiated_dbm(),
             Self::P2p(power) => power.radiated_dbm(),
+            Self::Client(power) => power.radiated_dbm(),
         }
     }
 }
@@ -336,6 +353,15 @@ impl Program {
         self.client = Some(Arc::new(binding));
         Ok(self)
     }
+    pub fn with_client_management(mut self) -> Result<Self, &'static str> {
+        if self.client.is_none() || self.width != 0 || self.band == super::native_band::Band::Six {
+            return Err("P2P management needs its actual client legacy20 program");
+        }
+        // This is the initiating RF predicate, also used for DEVICE, not
+        // an AP role, beacon, station or key admission object.
+        self.ap = true;
+        Ok(self)
+    }
     pub fn go_binding(&self) -> Option<[u8; 32]> {
         self.go.as_ref().map(|value| **value)
     }
@@ -393,6 +419,27 @@ impl Program {
             ibss,
             validity,
         )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_mvm_client_management(
+        domain: &RegulatoryDomain,
+        firmware: super::mld_regulatory::Mcc,
+        primary: u8,
+        power: Arc<super::mvm_boot::PowerFence>,
+        ibss: bool,
+        binding: [u8; 32],
+    ) -> Result<Self, &'static str> {
+        let mut program = Self::new_mvm_initiator(
+            domain,
+            firmware,
+            primary,
+            MvmPower::Client(power),
+            ibss,
+            Validity::new(),
+        )?;
+        program.client = Some(Arc::new(binding));
+        program.check(domain)?;
+        Ok(program)
     }
     fn new_mvm_initiator(
         domain: &RegulatoryDomain,

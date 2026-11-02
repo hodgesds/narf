@@ -340,10 +340,19 @@ impl Model {
     }
 }
 
-#[derive(Debug)]
 enum Callback {
     NativeLoss,
+    ClientRetire(Arc<crate::iwlwifi::p2p_client::Native>),
     SetUnauthorized(Box<ApControlAuthority>),
+}
+impl core::fmt::Debug for Callback {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NativeLoss => f.write_str("NativeLoss"),
+            Self::ClientRetire(_) => f.write_str("ClientRetire"),
+            Self::SetUnauthorized(_) => f.write_str("SetUnauthorized"),
+        }
+    }
 }
 #[derive(Debug)]
 struct Source {
@@ -370,6 +379,10 @@ impl DeferredReplySink for Source {
             // hook and release its guard before reentering the real owner.
             let device = HARNESS.lock().as_ref().unwrap().0.clone();
             let result = match callback {
+                Callback::ClientRetire(native) => {
+                    native.retire();
+                    Ok(())
+                }
                 Callback::NativeLoss => {
                     inject_loss(3);
                     let _ = device.step(None);

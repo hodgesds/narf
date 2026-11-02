@@ -23,6 +23,7 @@ pub(super) fn error(errno: i32) -> WirelessError {
 }
 
 pub(super) struct Host {
+    pub(super) client_rx: Arc<super::p2p_client_rx::Host>,
     pub(super) role: IrqSafeSpinLock<narf_net::native_emission::ProviderLifetime>,
     pub(super) active: IrqSafeSpinLock<Option<Arc<super::ap_owner::Owner>>>,
     pub(super) registrations: IrqSafeSpinLock<Vec<Arc<Registration>>>,
@@ -33,6 +34,7 @@ pub(super) struct Host {
 impl Host {
     pub(super) fn new() -> Self {
         Self {
+            client_rx: super::p2p_client_rx::Host::new(),
             role: IrqSafeSpinLock::new(narf_net::native_emission::ProviderLifetime::new()),
             active: IrqSafeSpinLock::new(None),
             registrations: IrqSafeSpinLock::new(Vec::new()),

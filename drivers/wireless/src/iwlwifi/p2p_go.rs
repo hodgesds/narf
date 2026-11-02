@@ -88,7 +88,7 @@ pub(super) fn attributes(ies: &[u8]) -> Result<Vec<u8>, &'static str> {
     validate_attributes(&out)?;
     Ok(out)
 }
-fn validate_attributes(mut raw: &[u8]) -> Result<(), &'static str> {
+pub(super) fn validate_attributes(mut raw: &[u8]) -> Result<(), &'static str> {
     while !raw.is_empty() {
         if raw.len() < 3 {
             return Err("truncated GO P2P attribute header");

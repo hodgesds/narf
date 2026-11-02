@@ -637,6 +637,11 @@ pub struct Hardware {
     ap_owner: Option<alloc::sync::Arc<super::ap_owner::Owner>>,
     p2p_go: Option<alloc::sync::Arc<super::p2p_go::Native>>,
     p2p_client: Option<alloc::sync::Arc<super::p2p_client::Native>>,
+    client_request: Option<alloc::sync::Arc<super::p2p_client_request::Request>>,
+    client_rx: Option<alloc::sync::Arc<super::p2p_client_rx::Host>>,
+    client_receiver: Option<super::p2p_client_rx::Receiver>,
+    client_rx_mvm: Option<alloc::sync::Arc<super::p2p_client_rx::MvmPower>>,
+    client_copies: Vec<super::p2p_client_rx::Publication>,
     ap_request: Option<alloc::sync::Arc<super::ap_owner::Request>>,
     p2p: p2p::State,
     ap_gen2: Option<super::ap_gen2_wire::Adapter>,
@@ -762,6 +767,11 @@ impl Hardware {
             ap_owner: None,
             p2p_go: None,
             p2p_client: None,
+            client_request: None,
+            client_rx: None,
+            client_receiver: None,
+            client_rx_mvm: None,
+            client_copies: Vec::new(),
             ap_request: None,
             p2p: p2p::State::new(&parsed.api),
             ap_gen2: None,
@@ -1201,10 +1211,31 @@ impl Hardware {
                 return Err("Wi-Fi hardware radio disabled");
             }
         }
+        // Fixed original source/provider observations only. A closed probe
+        // subscriber must drive a native filter-clear receipt while idle.
+        self.client_refresh_filter();
         let capture = self.rx_epoch.capture();
         let p2p_capture = self.p2p.copy_grant();
         let go_capture = self.p2p_go.clone();
         let client_capture = self.p2p_client.clone();
+        let client_registrations = self
+            .client_rx
+            .as_ref()
+            .map(|host| alloc::sync::Arc::new(host.snapshot()));
+        let client_owner = client_capture.as_ref().and_then(|native| {
+            if native.observation().is_err()
+                || self.format == rx_rfh::CompletionFormat::Qu && self.client_rx_mvm.is_none()
+            {
+                return None;
+            }
+            Some(alloc::sync::Arc::new(super::p2p_client_rx::CopyOwner {
+                native: native.clone(),
+                port: self.client_receiver.as_ref()?.capture()?,
+                source: self.client_receive_source().ok()?,
+                receive: self.receive_publication()?,
+                mvm: self.client_rx_mvm.clone(),
+            }))
+        });
         let mut copied = self.resources.rx.drain(&mut self.mmio)?;
         for queue in &mut self.resources.extra_rx {
             copied.extend(queue.drain(&mut self.mmio)?);
@@ -1234,10 +1265,27 @@ impl Hardware {
                 {
                     if let Some(mpdu) = self.ap_mpdu(&packet.payload) {
                         client.receive(&mpdu, self.band_in_rx_supported())?;
+                        if let (Some(registrations), Some(owner)) =
+                            (&client_registrations, &client_owner)
+                        {
+                            let publications = registrations.copy(
+                                owner,
+                                &packet,
+                                &mpdu,
+                                self.band_in_rx_supported(),
+                            );
+                            let available = 64usize.saturating_sub(self.client_copies.len());
+                            self.client_copies
+                                .extend(publications.into_iter().take(available));
+                        }
                     }
                 }
             }
             if packet.header.group_id == 0 && packet.header.cmd == 0xc9 {
+                if let Some(client) = &self.p2p_client {
+                    client.retire();
+                    return Err("P2P client native MCC changed; reassociation required");
+                }
                 if let Some(policy) = &self.rf_policy {
                     policy.invalidate();
                     return Err("Intel native MCC changed during retained RF policy");
@@ -1496,6 +1544,9 @@ impl Hardware {
 
     pub(super) fn clear_rf_policy(&mut self) {
         self.p2p_go = None;
+        self.client_request = None;
+        self.client_rx_mvm = None;
+        self.client_copies.clear();
         if let Some(client) = self.p2p_client.take() {
             client.retire();
         }
@@ -1742,7 +1793,9 @@ impl Hardware {
             .iter_mut()
             .find(|q| q.id() == Some(id))
             .ok_or("unknown TX queue")?;
-        sources.invoke(|| queue.send_assisted(&mut self.mmio, frame, header_len, rate, assist))?;
+        sources.invoke_packet(|| {
+            queue.send_assisted(&mut self.mmio, frame, header_len, rate, assist)
+        })?;
         self.count_protected(frame);
         Ok(())
     }
@@ -1892,7 +1945,7 @@ impl Hardware {
             .iter_mut()
             .find(|q| q.id() == Some(id))
             .ok_or("unknown TX queue")?;
-        let ssn = sources.invoke(|| match encrypt {
+        let ssn = sources.invoke_packet(|| match encrypt {
             Some(encrypt) => queue.send_ap(&mut self.mmio, frame, header_len, rate, encrypt),
             None => queue.send_assisted(&mut self.mmio, frame, header_len, rate, assist),
         })?;

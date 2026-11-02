@@ -883,6 +883,9 @@ impl Device {
         for publication in outcome.ap {
             publication.publish();
         }
+        for publication in self.client_publications() {
+            publication.publish();
+        }
         outcome.data
     }
 
@@ -1696,10 +1699,10 @@ impl WirelessNetIface for Device {
         self.ap_register(authority, frame_type, prefix)
     }
     fn async_p2p_netdev_management_tx_control(&self) -> bool {
-        self.current_iftype() == 9 && self.go_capable
+        matches!(self.current_iftype(), 8 | 9) && self.go_capable
     }
     fn async_p2p_netdev_management_rx_control(&self) -> bool {
-        self.current_iftype() == 9 && self.go_capable
+        matches!(self.current_iftype(), 8 | 9) && self.go_capable
     }
     async fn mgmt_tx_radio_async(
         &self,
@@ -1707,6 +1710,9 @@ impl WirelessNetIface for Device {
         cookie: u64,
         request: narf_wireless::MgmtTxRequest,
     ) -> Result<bool, WirelessError> {
+        if self.current_iftype() == 8 {
+            return self.client_frame(authority, cookie, request).await;
+        }
         let original = authority.go_ap_control_for(self)?;
         self.mgmt_tx_ap_async(&original, cookie, request).await
     }
@@ -1716,6 +1722,9 @@ impl WirelessNetIface for Device {
         frame_type: u16,
         prefix: &[u8],
     ) -> Result<(), i32> {
+        if self.current_iftype() == 8 {
+            return self.client_register(authority, frame_type, prefix);
+        }
         let original = authority.go_ap_control_for(self).map_err(|_| 1)?;
         self.register_mgmt_frame_ap_async(&original, frame_type, prefix.to_vec())
             .await
@@ -2495,3 +2504,6 @@ mod ap;
 pub(in crate::iwlwifi) mod p2p;
 #[path = "sc_scheduled.rs"]
 mod scheduled;
+
+#[path = "client_device.rs"]
+mod client_control;

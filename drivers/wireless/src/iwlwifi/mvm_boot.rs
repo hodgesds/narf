@@ -299,3 +299,6 @@ pub(in crate::iwlwifi) use station::Credential;
 
 #[path = "mvm_rx_multi.rs"]
 mod rx_multi;
+
+#[path = "mvm_client_control.rs"]
+mod client_control;

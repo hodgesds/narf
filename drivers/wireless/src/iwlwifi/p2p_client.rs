@@ -97,7 +97,7 @@ impl Plan {
     }
     pub fn binding(&self) -> [u8; 32] {
         let mut hash = narf_crypto::sha256::Sha256::new();
-        hash.update(b"NARF physical P2P CLIENT8 nativeSTA7 legacy20 peer-NoA CTWindow original-role program v1");
+        hash.update(b"NARF physical P2P CLIENT8 nativeSTA7 legacy20 peer-NoA CTWindow original-role source-bound public-P2P FRAME native-ACK program v2");
         hash.update(&self.own);
         hash.update(&self.peer);
         hash.update(&self.local_device);
@@ -105,6 +105,50 @@ impl Plan {
         hash.update(&self.channel.frequency().to_le_bytes());
         hash.update(&self.elements);
         hash.finalize()
+    }
+    /// Only on-channel unprotected P2P public/vendor actions and probe
+    /// requests use this independent source-bound userspace management path.
+    /// Association/authentication, robust management and keys stay with SME.
+    pub fn management(
+        &self,
+        request: &narf_wireless::MgmtTxRequest,
+    ) -> Result<Vec<u8>, &'static str> {
+        let f = &request.frame;
+        if request.offchannel_ok
+            || request.duration != 0
+            || request.frequency_mhz != 0 && request.frequency_mhz != self.channel.frequency()
+            || !(24..=2048).contains(&f.len())
+            || f[1] & 0xc7 != 0
+            || f[22] & 15 != 0
+            || f[10..16] != self.own
+            || f[4..10] == [0; 6]
+            || f[16..22] != self.peer && f[16..22] != [255; 6]
+        {
+            return Err("P2P client public FRAME lost actual physical/channel/owner");
+        }
+        let body = &f[24..];
+        let attrs = match f[0] {
+            0x40 => p2p_go::attributes(body)?,
+            0xd0 if body.len() >= 8 && body[..6] == [4, 9, 0x50, 0x6f, 0x9a, 9] => {
+                body[8..].to_vec()
+            }
+            0xd0 if body.len() >= 7 && body[..5] == [127, 0x50, 0x6f, 0x9a, 9] => {
+                body[7..].to_vec()
+            }
+            _ => return Err("P2P client public FRAME cannot replace SME/robust management"),
+        };
+        p2p_go::validate_attributes(&attrs)?;
+        if let Some(info) = p2p_go::unique(&attrs, 13)? {
+            if info.len() < 17 || info[..6] != self.local_device {
+                return Err("P2P client public FRAME changed protocol Device Address");
+            }
+        }
+        if let Some(cap) = p2p_go::unique(&attrs, 2)? {
+            if cap.len() != 2 || cap[1] & 1 != 0 {
+                return Err("P2P client public FRAME claimed another role");
+            }
+        }
+        Ok(f.clone())
     }
     pub fn response(&self, ies: &[u8]) -> Result<(), &'static str> {
         let attrs = p2p_go::attributes(ies)?;
@@ -133,6 +177,8 @@ pub(super) struct Native {
     aid: AtomicU16,
     desired: AtomicU32,
     applied: AtomicU32,
+    probe_desired: AtomicBool,
+    probe_applied: AtomicBool,
     noa: IrqSafeSpinLock<Option<Noa>>,
 }
 impl Native {
@@ -156,6 +202,8 @@ impl Native {
             aid: AtomicU16::new(0),
             desired: AtomicU32::new(window),
             applied: AtomicU32::new(window),
+            probe_desired: AtomicBool::new(false),
+            probe_applied: AtomicBool::new(false),
         }))
     }
     pub fn current(&self) -> Result<(), &'static str> {
@@ -176,8 +224,24 @@ impl Native {
         self.prepared.store(true, Ordering::Release);
         Ok(())
     }
+    pub fn observation(&self) -> Result<(), &'static str> {
+        self.current()?;
+        if !self.prepared.load(Ordering::Acquire) || self.aid.load(Ordering::Acquire) == 0 {
+            return Err("CLIENT receive lacks actual MAC7/link/association receipts");
+        }
+        Ok(())
+    }
     pub fn pending(&self) -> bool {
         self.desired.load(Ordering::Acquire) != self.applied.load(Ordering::Acquire)
+            || self.aid.load(Ordering::Acquire) != 0
+                && self.probe_desired.load(Ordering::Acquire)
+                    != self.probe_applied.load(Ordering::Acquire)
+    }
+    pub fn request_probes(&self, requested: bool) {
+        self.probe_desired.store(requested, Ordering::Release);
+    }
+    pub fn probe_receipt(&self) -> bool {
+        self.probe_applied.load(Ordering::Acquire)
     }
     pub fn transmission(&self) -> Result<(), &'static str> {
         self.current()?;
@@ -239,9 +303,12 @@ impl Native {
     pub fn desired(&self) -> u32 {
         self.desired.load(Ordering::Acquire)
     }
-    pub fn commit_window(&self, value: u32) -> Result<(), &'static str> {
+    pub fn commit_window(&self, value: u32, probe: bool) -> Result<(), &'static str> {
         self.current()?;
         self.applied.store(value, Ordering::Release);
+        // Receipt follows the actual sent bytes, not a desired choice
+        // refreshed by a source retirement while this command was pending.
+        self.probe_applied.store(probe, Ordering::Release);
         Ok(())
     }
     pub fn associated(&self, aid: u16) -> Result<(), &'static str> {
@@ -267,6 +334,17 @@ impl Native {
         if self.gen2 {
             super::boot_context::put32(&mut body, 20, if aid.is_some() { 4 } else { 12 });
         }
+        let filter = u32::from_le_bytes(body[20..24].try_into().unwrap());
+        super::boot_context::put32(
+            &mut body,
+            20,
+            filter
+                | if aid.is_some() && self.probe_desired.load(Ordering::Acquire) {
+                    32
+                } else {
+                    0
+                },
+        ); // MAC_CFG_FILTER_ACCEPT_PROBE_REQ
         super::boot_context::put32(&mut body, 48, window);
         Ok(body)
     }

@@ -1026,7 +1026,10 @@ impl Connection {
         hw.command(3, 8, &mac).await?;
         if let Some(client) = &this.client {
             client.associated(response.aid)?;
-            client.commit_window(u32::from_le_bytes(mac[48..52].try_into().unwrap()))?;
+            client.commit_window(
+                u32::from_le_bytes(mac[48..52].try_into().unwrap()),
+                u32::from_le_bytes(mac[20..24].try_into().unwrap()) & 32 != 0,
+            )?;
         }
         let mut tlc = this.rates.tlc(
             if hw.is_mvm89() {
@@ -2432,6 +2435,36 @@ impl Connection {
         narf_wireless::mfp::protect_outbound(igtk, hdr_24, body).map_err(|_| "BIP protect failed")
     }
 
+    pub(in crate::iwlwifi) async fn p2p_management(
+        &mut self,
+        hw: &mut Hardware,
+        request: &narf_wireless::MgmtTxRequest,
+    ) -> Result<bool, &'static str> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or("P2P client management lacks actual completed role")?;
+        client.current()?;
+        if !self.authorized
+            || !hw
+                .p2p_client_native()
+                .is_some_and(|current| alloc::sync::Arc::ptr_eq(&current, client))
+        {
+            return Err("P2P client management lacks its exact current native port");
+        }
+        let mut frame = client.plan.management(request)?;
+        self.service_power(hw).await?;
+        frame[22..24].copy_from_slice(&((self.sequence & 4095) << 4).to_le_bytes());
+        self.sequence = self.sequence.wrapping_add(1);
+        match hw
+            .transmit(self.management_queue, &frame, 24, self.rate())
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(super::runtime::TX_FAILED) => Ok(false),
+            Err(reason) => Err(reason),
+        }
+    }
     pub async fn disconnect(mut self, hw: &mut Hardware) -> Result<(), &'static str> {
         self.authorized = false;
         hw.close_receive_epoch()?;

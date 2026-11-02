@@ -320,7 +320,10 @@ impl Owner {
         }
         if let Some(client) = &client {
             client.associated(status.aid)?;
-            client.commit_window(u32::from_le_bytes(mac[48..52].try_into().unwrap()))?;
+            client.commit_window(
+                u32::from_le_bytes(mac[48..52].try_into().unwrap()),
+                u32::from_le_bytes(mac[20..24].try_into().unwrap()) & 32 != 0,
+            )?;
         }
         if let Some(he) = he {
             let bytes = he.context(

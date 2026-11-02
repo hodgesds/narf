@@ -152,6 +152,8 @@ fn ht_ies() -> Vec<u8> {
 struct Actor {
     client: bool,
     client_mac: u8,
+    client_public: Vec<Vec<u8>>,
+    hold_client_public: bool,
     native_ap: Option<Box<ap_tests::Model>>,
     native_p2p: Option<Box<p2p_tests::Model>>,
     pno: Option<Box<scheduled_tests::Model>>,
@@ -865,6 +867,33 @@ impl Actor {
             return Err("MVM native interface packet queue/header");
         }
         let frame = &p.bytes[24..];
+        if self.client
+            && p.queue == 23
+            && frame[0] == 0xd0
+            && frame.get(24..30) == Some(&[4, 9, 0x50, 0x6f, 0x9a, 9])
+        {
+            if !(self.client_mac == 2
+                && self.security.ap.phase() == narf_wifi_fixtures::ApPhase::Authorized
+                && self.data_added
+                && self.m1_sent)
+            {
+                return Err("API77 P2P FRAME lacked actual MAC7/key/port/management queue");
+            }
+            crate::iwlwifi::p2p_client_fixture::check_public(frame, &p.bytes, OWN, AP, true)?;
+            self.client_public.push(frame.to_vec());
+            if self.hold_client_public {
+                self.hold_client_public = false;
+                let mut receipt = vec![0; 48];
+                receipt[0] = 1;
+                receipt[36] = 23;
+                receipt[40] = 1;
+                receipt[44..48].copy_from_slice(&u32::from(p.pointer).to_le_bytes());
+                self.held = Some((0x1c, 0, 0x8000, receipt));
+            } else {
+                self.firmware.tx_complete(p.queue, p.pointer);
+            }
+            return Ok(());
+        }
         if p.queue == 23 && matches!(frame[0], 0 | 0xb0) {
             if self.client {
                 crate::iwlwifi::p2p_client_fixture::check_request(frame)?;
@@ -1342,6 +1371,8 @@ impl Harness {
         let mut actor = Actor {
             client: emission == 10,
             client_mac: 0,
+            client_public: Vec::new(),
+            hold_client_public: false,
             native_ap: matches!(emission, 7 | 9).then(|| Box::new(ap_tests::Model::new())),
             native_p2p: (emission == 8).then(|| Box::new(p2p_tests::Model::new())),
             pno: pno.map(Box::new),
