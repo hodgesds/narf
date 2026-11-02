@@ -459,6 +459,29 @@ impl PumpCore {
 // ── Event dispatch ──────────────────────────────────────────────────
 
 impl PumpCore {
+    /// Mirror a new connection into sysfs under this controller's
+    /// `hci<N>` node (Linux `hci_conn_add_sysfs`). No-op when no
+    /// controller kobject is published at this ordinal.
+    fn sysfs_track_connect(&self, handle: u16, le: bool, peer: &[u8; 7]) {
+        let mut bd_addr = [0u8; 6];
+        bd_addr.copy_from_slice(&peer[1..7]);
+        crate::sysfs_bridge::add_connection_for(
+            self.index,
+            &crate::sysfs_bridge::ConnInfo {
+                handle,
+                bd_addr,
+                is_le: le,
+                state: "connected",
+            },
+        );
+    }
+
+    /// Drop a connection's sysfs child on disconnect (Linux
+    /// `hci_conn_del_sysfs`). No-op when nothing is published.
+    fn sysfs_track_disconnect(&self, handle: u16) {
+        let _ = crate::sysfs_bridge::remove_connection_for(self.index, handle);
+    }
+
     /// Handle one HCI event. Socket fan-out happens in `pump_once`;
     /// this is only the host-stack dispatch.
     fn dispatch_event(&mut self, event: &Event) {
@@ -472,6 +495,7 @@ impl PumpCore {
                         self.connections.retain(|c| c.handle != cc.handle);
                         self.connections
                             .push(Connection::new(cc.handle, true, peer));
+                        self.sysfs_track_connect(cc.handle, true, &peer);
                     }
                     return;
                 }
@@ -495,11 +519,13 @@ impl PumpCore {
                     peer[1..7].copy_from_slice(&p[3..9]);
                     self.connections.retain(|c| c.handle != handle);
                     self.connections.push(Connection::new(handle, false, peer));
+                    self.sysfs_track_connect(handle, false, &peer);
                 }
             }
             code if code == EventCode::DisconnectionComplete as u8 => {
                 if let Some(dc) = DisconnectionComplete::parse(event) {
                     self.connections.retain(|c| c.handle != dc.handle);
+                    self.sysfs_track_disconnect(dc.handle);
                 }
             }
             code if code == EventCode::NumberOfCompletedPackets as u8 => {
@@ -1280,6 +1306,78 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_fake_controller_conversation);
+
+    /// #891: the pump mirrors its connection table into sysfs — LE
+    /// connect gains the `hci<N>:<handle>` child, disconnect removes
+    /// it again.
+    fn smoke_pump_sysfs_connection_child_lifecycle() -> TestResult {
+        use narf_filesystem::sysfs::__reset_for_test as sysfs_reset;
+        sysfs_reset();
+        reset_all();
+        let fail = |msg: &'static str| -> TestResult {
+            reset_all();
+            sysfs_reset();
+            TestResult::Fail(msg)
+        };
+
+        let fake = Arc::new(ScriptedTransport::new());
+        let transport: Arc<dyn HciTransport> = fake.clone();
+        crate::transport::register(transport);
+        script_successful_bringup(&fake);
+
+        let cap = crate::bootstrap_bluetooth_authority();
+        let outcomes = crate::controller::bring_up_all(&cap);
+        if outcomes.len() != 1 || outcomes[0].result.is_err() {
+            return fail("bring-up against fake controller failed");
+        }
+
+        // LE connect on handle 0x0040 (decimal 64 in the child name).
+        let handle = 0x0040;
+        fake.enqueue_event(le_connection_complete(
+            handle,
+            [0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5],
+        ));
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            return fail("pump did not track the LE connection");
+        }
+        let hci_kobj = match crate::sysfs_bridge::hci_kobject(0) {
+            Some(k) => k,
+            None => return fail("no controller kobject published for hci0"),
+        };
+        let child = match hci_kobj.get_child("hci0:64") {
+            Some(c) => c,
+            None => return fail("hci0:64 child missing after LE connect"),
+        };
+        match child.attr_show("address") {
+            Some(v) if v.contains("B5:B4:B3:B2:B1:B0") => {}
+            _ => return fail("conn address attr missing or mismatched"),
+        }
+        match child.attr_show("type") {
+            Some(v) if v.contains("LE") => {}
+            _ => return fail("conn type attr should be LE"),
+        }
+
+        // Disconnect removes the child again.
+        fake.enqueue_event(Event {
+            code: EventCode::DisconnectionComplete as u8,
+            params: alloc::vec![0x00, 0x40, 0x00, 0x13],
+        });
+        let _ = pump_once(0);
+        if connection_count(0) != Some(0) {
+            return fail("connection state survived disconnect");
+        }
+        if hci_kobj.get_child("hci0:64").is_some() {
+            return fail("sysfs child survived disconnect");
+        }
+        reset_all();
+        sysfs_reset();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/pump",
+        smoke_pump_sysfs_connection_child_lifecycle
+    );
 
     /// Init failure: the controller NAKs HCI_Reset (status 0x0C,
     /// Command Disallowed). Bring-up must fail closed, no controller
