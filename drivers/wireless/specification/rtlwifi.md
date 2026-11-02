@@ -20,6 +20,16 @@ DMA, unmask device IRQs or report association success.
 
 ## 3. Public interface
 
+**Software acceptance at `6813a24c6`.** The separately qualified RTL8188EE
+`ht40`, `rts_cts_protection`, `rf_gain_tracking` and
+`dynamic_antenna_selection` continuations pass the checkpoint release/native
+gates on x86_64 and aarch64. Other chip runtimes, VHT, Bluetooth coexistence
+and WoWLAN retain their separate remaining rows. This supersedes
+implementation-time statements below that release/native execution or software
+acceptance is pending, only for the named feature scopes. Physical
+measurements, signed board/deployment programs and actual-device
+RF/power/interoperability acceptance remain separate.
+
 `pci::bring_up(device, cap)` first parks inherited PCI DMA through the shared
 Realtek command policy: clear `BUS_MASTER`, enable `MEM_SPACE | INTX_DISABLE`,
 and read back the command register. Any access failure, retained BME or missing

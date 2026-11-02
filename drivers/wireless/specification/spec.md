@@ -406,14 +406,30 @@ cross-architecture native acceptance remains pending. The station NETWORK_SLEEP
 IRQ/readback repair is included in the frozen source graph. Physical board
 measurements and the remaining family profiles retain their own qualification.
 
+**Software acceptance checkpoint 2026-11-01 —25 implementations.** Frozen source
+`6813a24c6` is accepted against retained-case baseline `aa6b98463`: x86_64
+**4524/0/13**, aarch64 **4165/0/7**, preserving every
+baseline case/status and adding exactly155 cases on each architecture.
+Supplementary `bus,modules,verification/wifi-fixtures` execution is
+**x86_64 189/0/1; aarch64 183/0/3**. Four release Clippy contexts per
+architecture, both MT76 standalone module-image builds, formatting, ordinary
+production boots and production btrfs postflights pass. Saved gate and
+retained-case proofs use `target/wifi-validation-evidence/wifi-chunk01-6813a24c6`.
+The exact25 accepted keys leave `research/implemented-pending-validation.tsv`,
+which now contains its header only. The remaining ledger stays at **82 `feature`**,
+**31 `chip`** and **0 `unknown`** rows. Earlier implementation-time pending notes
+are superseded only for these25 scopes. Later idle-FULL_SLEEP, host-bus-PM,
+P2P and other drafts receive no credit. Physical measurements, signed deployment
+programs and per-device RF/power/interoperability qualification remain separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 3 | MLO, P2P and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are implemented pending validation; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated |
+| iwlwifi | 3 | MLO, P2P and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
-| mt76 | 4 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA; hosted loadable packet ABI is implemented pending validation |
-| ath10k | 12 | Contiguous VHT160, PFC, alternate calibration sources, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload; managed Public Action ROC, streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are implemented pending validation |
-| ath9k | 1 | Idle FULL_SLEEP; periodic calibration/ANI and station NETWORK_SLEEP are implemented pending validation, as are admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants; other chips are separate rows |
-| rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are implemented pending validation |
+| mt76 | 4 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA; hosted loadable packet ABI is software-accepted at `6813a24c6` |
+| ath10k | 12 | Contiguous VHT160, PFC, alternate calibration sources, hardware keys, AP/P2P, DFS/indoor/beacon hints, credential replay, host-bus PM and wake offload; managed Public Action ROC, streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are software-accepted at `6813a24c6` |
+| ath9k | 1 | Idle FULL_SLEEP; periodic calibration/ANI, station NETWORK_SLEEP, admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants are software-accepted at `6813a24c6`; other chips are separate rows |
+| rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are software-accepted at `6813a24c6` |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 18 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets |
 | rtw89 | 13 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW, periodic RF tracking/runtime LPS and multiple functions; other AX/BE chips are separate rows |

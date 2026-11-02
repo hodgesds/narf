@@ -45,6 +45,16 @@ Host-bus/system power transitions remain separate profiles.
 
 ## 3. Public interface
 
+**Software acceptance at `6813a24c6`.** The admitted
+`multiple_spatial_streams`, `tx_stbc`, `ht40_2ghz`, `ht2040_coexistence`,
+bounded `vht80p80` and managed Public Action `offchannel_scan` continuations
+pass the checkpoint release/native gates on x86_64 and aarch64. Contiguous160,
+host-bus PM, wake offload and native AP/P2P roles keep their separate
+remaining rows. This supersedes implementation-time statements below that
+release/native execution or software acceptance is pending, only for the named
+feature scopes. Physical measurements, signed board/deployment programs and
+actual-device RF/power/interoperability acceptance remain separate.
+
 - `register()` / `register_pci_driver()` publish exact PCI matches.
 - `pci::probe` disables inherited bus mastering, wakes and identifies the
   chip, retains its metadata and schedules the boot task. Bound-driver

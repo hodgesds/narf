@@ -40,6 +40,16 @@ AR9285-specific writes follow a checked silicon revision.
 
 ## 3. Public interface
 
+**Software acceptance at `6813a24c6`.** The admitted `additional_channels`,
+`channel_retuning`, `ht40`, `sgi40`, `larger_tx_aggregates`,
+`factory_profile_selection`, `station_network_sleep` and
+`periodic_calibration` continuations pass the checkpoint release/native gates
+on x86_64 and aarch64. Idle FULL_SLEEP and other chips receive no acceptance
+here. This supersedes implementation-time statements below that release/native
+execution or software acceptance is pending, only for the named feature
+scopes. Physical measurements, signed board/deployment programs and
+actual-device RF/power/interoperability acceptance remain separate.
+
 - `register()` installs the AR9285 (`ath9k`) and AR2427 (`ath9k-ar2427`)
   PCI matches; `ar9285_silicon()` is the shared exact vendor/device gate.
   Linux `hw.c::ath9k_hw_init` accepts `AR2427_DEVID_PCIE` with the same

@@ -90,6 +90,18 @@ from physical acceptance of the enabled software profiles.
 
 ## 3. Public interface and stage progression
 
+**Software acceptance at `6813a24c6`.** The admitted non-MLO EHT (`eht`),
+`width_320`, complete scoped `six_ghz` and ordinary legacy20 `ap`
+continuations pass the checkpoint release/native gates on x86_64 and aarch64.
+AP includes Sc/Bz/API89 and the original API77 frontend in §§3.68–3.71. The
+bounded single-link non-AP MLD scope in §3.66 also passes its six
+native/Session cases; multiple active MLO links, P2P and WoW remain open, with
+no additional feature-row closure. This supersedes implementation-time
+statements below that release/native execution or software acceptance is
+pending, only for these named feature and bounded partial scopes. Physical
+measurements, signed board/deployment programs and actual-device
+RF/power/interoperability acceptance remain separate.
+
 - **Stage 1**: PCI match table.
 - **Stage 2**: CSR/PRPH mapping + APM init + ucode header parsing.
 - **Stage 3**: Owned Gen3 firmware loading and DMA ALIVE handshake. Gen2

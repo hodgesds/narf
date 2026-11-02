@@ -30,6 +30,15 @@ artifact rather than accepting the shared cached regulatory domain.
 
 ## 3. Public interface
 
+**Software acceptance at `6813a24c6`.** The separately qualified RTL8188EU
+`ht40` continuation passes the checkpoint release/native gates on x86_64 and
+aarch64. Broader PHY, other chips and unrelated role/power continuations
+receive no acceptance here. This supersedes implementation-time statements
+below that release/native execution or software acceptance is pending, only
+for the named feature scopes. Physical measurements, signed board/deployment
+programs and actual-device RF/power/interoperability acceptance remain
+separate.
+
 `rtl8xxxu_probe` retains the handle and `firmware_transport::Owner<UsbControl>`.
 For RTL8188EU it spawns `wait_initialize_registered()` and `interface::wait_attach()`
 after releasing the device registry lock, logging the discovered eFuse calibration

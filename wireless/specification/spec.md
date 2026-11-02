@@ -247,6 +247,13 @@ was negotiated; responses must keep EHT and cannot raise TX NSS or roles.
 Existing constructors retain ordinary station association. The explicit
 single-link MLD opt-in below supplies the separate MLO identity/key contract.
 
+**Software acceptance at `6813a24c6`.** Shared `mlo_station_association`
+passes the checkpoint release/native gates on x86_64 and aarch64, including
+the strict single-link JoinPlan, authenticated per-link key/crypto contract
+and reactive FakeAp fixtures. This supersedes implementation-time pending
+notes only for that shared single-associated-link scope; it grants no
+multiple-active-link native driver, AP/P2P role or physical RF qualification.
+
 **Single-link MLD (`association::mlo`).** `mlo::Local::single_link(own_mld)`
 validates a unicast logical address. `JoinPlan::prepare_mld(bss, own_link,
 ssid, security, phy, options, local)` and `prepare_mld_6ghz` opt into one
