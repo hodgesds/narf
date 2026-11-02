@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-6"
-prompt_hash = "debc499da56b01ce0d0d0d6ade8090d647c6572beb64928210e43d6c02fc9914"
+prompt_hash = "e5c3b9d25e8508b336f97cf5ca3f4076ec8d6427ec96bf65af06b9bee504db7d"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -2097,3 +2097,11 @@ argument = "Scheduler installation retains its live SchedPolicy capability check
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "Instruction exhaustion is only another input to existing safe timer/syscall-exit preemption. It adds no PMI/NMI-driven context switching and preserves no_preempt, preempt-disable, own-stack checks, saved PKRS/TCF and address-space/FPU restoration. The instruction-feature-only NMI accounting guard uses only preallocated per-CPU atomics and an already-probed counter. Stackless futures remain cooperative. The safety argument is not a completed security review; two maintainer reviews including security remain required before merge."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The UNIX-socket latency fix moves existing target-CPU wake-inbox activation to each executor selection boundary inside the scheduler TCB. No domain, capability, mapping, task class, quantum, wake-priority hint, direct handoff or arbitrary-kernel-preemption path is added. Wake publication and task ownership remain unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Pending wake activation runs on the owning CPU before policy and READY locks are acquired, through the existing drain that validates the parked owner token and task id, excludes directly claimed continuations, and pairs policy queue notifications. Policy selection still enforces class, priority, affinity and periodic-budget eligibility. The initial round length bounds dispatch attempts. Core charge/debt accounting and task address-space, TLS, FP/SIMD and saved PKRS/TCF transitions are unchanged. The empty-inbox guard uses the existing acquire publication check; a racing wake retains its inbox reference and is serviced at the next boundary or idle check."

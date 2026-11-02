@@ -5499,6 +5499,11 @@ pub fn poll_one_round() -> usize {
     let mut ready_this_round = 0usize;
 
     for _ in 0..round_len {
+        // A wake during the preceding poll must be visible to this selection,
+        // rather than hidden in parked/inbox ownership for the rest of a round.
+        if wake_list_pending(cpu) {
+            drain_wake_list(cpu);
+        }
         // Policy publication is CPU-local on the hot path. The callback sees
         // a read-only queue projection; the core validates and detaches the
         // returned opaque handle while retaining queue ownership.
@@ -6009,9 +6014,10 @@ pub fn run_until_empty() {
         if MIGRATE_PENDING[cpu].load(Ordering::Relaxed) {
             run_pending_migration(cpu);
         }
-        // Snapshot queue length. We'll visit each task at most once per
-        // round; spawns during the round land at the back and get
-        // visited on the NEXT round.
+        // Bound this round's number of polls by its initial queue length.
+        // Pending wakes are activated before each selection, so policy may
+        // choose newly-ready work within that bound; the remainder waits for
+        // the next round.
         let round_len = {
             let q = READY[cpu].lock();
             q.as_ref()
@@ -6024,6 +6030,9 @@ pub fn run_until_empty() {
         WAKE_PRESSURE[cpu].store(0, Ordering::Release);
 
         for _ in 0..round_len {
+            if wake_list_pending(cpu) {
+                drain_wake_list(cpu);
+            }
             // The pluggable policy sees only a read-only candidate view and
             // returns an opaque handle. Policy publication is CPU-local on
             // this hot path; the core validates and removes the selected slot.

@@ -3941,6 +3941,102 @@ fn smoke_scheduler_urgent_next_buddy_runs_first() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_urgent_next_buddy_runs_first);
 
+/// A wake during a dispatch round must become visible to the next policy
+/// selection. The parked high-priority task used to remain absent from READY
+/// until every task in the old round had run, defeating the class policy.
+fn smoke_scheduler_mid_round_wake_is_visible_to_policy() -> TestResult {
+    use alloc::sync::Arc;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll, Waker};
+    use narf_capabilities::{Cap, Grant};
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    struct State {
+        waker: IrqSafeSpinLock<Option<Waker>>,
+        next: AtomicUsize,
+        order: [AtomicUsize; 3],
+    }
+    impl State {
+        fn record(&self, tag: usize) {
+            let pos = self.next.fetch_add(1, Ordering::Relaxed);
+            if let Some(entry) = self.order.get(pos) {
+                entry.store(tag, Ordering::Relaxed);
+            }
+        }
+    }
+    struct Waiter {
+        state: Arc<State>,
+        armed: bool,
+    }
+    impl Future for Waiter {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if !self.armed {
+                *self.state.waker.lock() = Some(cx.waker().clone());
+                self.armed = true;
+                Poll::Pending
+            } else {
+                self.state.record(2);
+                Poll::Ready(())
+            }
+        }
+    }
+
+    let cap: Cap<crate::SchedPolicy, Grant> = Cap::bootstrap();
+    if crate::install_scheduler(&cap, crate::ClassScheduler).is_err() {
+        return TestResult::Fail("could not install class policy");
+    }
+    // Exercise both dispatch loops, including the one used by nested pumps.
+    for stepped in [true, false] {
+        crate::__reset_queues_for_test();
+        let state = Arc::new(State {
+            waker: IrqSafeSpinLock::new(None),
+            next: AtomicUsize::new(0),
+            order: [const { AtomicUsize::new(0) }; 3],
+        });
+        let mut spec = crate::TaskSpec::unthrottled();
+        spec.priority = crate::Priority::HIGH;
+        crate::spawn_with_spec(
+            Waiter {
+                state: state.clone(),
+                armed: false,
+            },
+            spec,
+        );
+        let waking = state.clone();
+        crate::spawn(async move {
+            waking.record(1);
+            let waker = waking.waker.lock().take();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        });
+        let sentinel = state.clone();
+        crate::spawn(async move {
+            sentinel.record(3);
+        });
+        if stepped {
+            for _ in 0..3 {
+                crate::poll_one_round();
+            }
+        } else {
+            crate::run_until_empty();
+        }
+        let order = core::array::from_fn::<_, 3, _>(|i| state.order[i].load(Ordering::Relaxed));
+        crate::__reset_queues_for_test();
+        if state.next.load(Ordering::Relaxed) != 3 || order != [1, 2, 3] {
+            return TestResult::Fail("mid-round wake was hidden from the next policy selection");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_mid_round_wake_is_visible_to_policy
+);
+
 // An urgent handoff is a core hint, not permission to bypass a pluggable
 // policy. External policies must still observe the queue and the core then
 // validates the requested and urgent candidates in the ordinary scan.

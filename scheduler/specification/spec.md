@@ -102,9 +102,18 @@ pub fn dbg_ready_slots(cpu: usize)
     -> Vec<(u64, bool, u32, u64, bool)>;
 ```
 
-Executor internals are per-CPU queues plus global stealing. The specified
-design requires every task to carry `DomainId` plus architecture-neutral
-`DomainSavedState`, with the executor switching domain before polling. The
+Executor internals are per-CPU queues plus global stealing. The dispatch
+contract folds pending target-CPU wake activations into READY before
+each policy selection in both `poll_one_round` and `run_until_empty`. A wake
+published during the preceding task's execution is therefore visible at the
+next selection rather than waiting for the rest of an executor round. Wakes
+racing the drain remain pending for the following boundary. The round's
+initial queue length still bounds its number of polls; it does not promise a
+distinct task for each poll. Class, priority and budget checks continue to
+determine which activated task runs.
+
+The specified design requires every task to carry `DomainId` plus
+architecture-neutral `DomainSavedState`, with the executor switching domain before polling. The
 current `TaskSlot` carries an opaque architecture-neutral state and switches it
 at cooperative poll boundaries. Common trap entry neutralises domain rights,
 while the private direct-context-transfer path saves and restores the
