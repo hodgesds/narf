@@ -14579,13 +14579,24 @@ fn smoke_nvidia_probe_declines_wrong_vendor() -> TestResult {
     // Pre-fix this returned `BadDevice`, a terminal error that
     // stops the walk, so this smoke fails on the unfixed tree.
     // The decline precedes any device access, so a synthetic
-    // device suffices. (The bound-controller fast path returns
-    // Ok first; on QEMU CI no NVIDIA device is enumerated, so
-    // the controller is never bound before this smoke runs.)
+    // device suffices. The bound-controller fast path returns
+    // Ok first when `CONTROLLER` is already set, so on a machine
+    // that booted with a real NVIDIA card (or after an earlier
+    // smoke bound it) the decline path is unreachable from this
+    // probe entry: the smoke Skips instead of pinning the fast
+    // path, mirroring the accept smoke's Skip-when-none pattern.
+    // Bound state is directly observable via
+    // `nvidia_gpu::is_probed()`, which reads the same
+    // `CONTROLLER` the fast path checks.
     use crate::nvidia_gpu;
     use narf_bus::{BusAddr, BusDevice, BusDeviceCap, BusKind, DeviceId, PcieAddr, ProbeError};
     use narf_capabilities::Cap;
     use narf_memory::PhysAddr;
+    if nvidia_gpu::is_probed() {
+        return TestResult::Skip(
+            "nvidia-gpu controller already bound; decline path not exercisable",
+        );
+    }
     let addr = PcieAddr::new(0, 0, 1, 0);
     let dev = BusDevice {
         addr: BusAddr::Pcie(addr),
