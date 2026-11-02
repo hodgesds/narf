@@ -521,6 +521,18 @@ impl<A: BootAllocator> GuCScheduler<A> {
         total
     }
 
+    /// Source-live policy sampled once before any new raw diagnostic bundle.
+    /// NARF conservatively protects the whole shared bundle if any retained
+    /// compatibility context is protected; no namespace lookup or allocation.
+    pub(crate) fn diagnostic_protected(&self) -> bool {
+        self.resources.contexts.iter().any(|context| {
+            context
+                .user
+                .as_ref()
+                .is_some_and(|user| user.diagnostic_protected())
+        })
+    }
+
     /// Each retained submission owns one immutable VM, shared by its lanes.
     /// Count from host ownership even when capture stops on authority loss.
     pub(crate) fn diagnostic_vms(

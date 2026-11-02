@@ -8,6 +8,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 struct Model {
     range: Range<u64>,
     cpu: u64,
+    extra: Vec<(Range<u64>, u64)>,
+    copies: Vec<(u64, u64, u64)>,
     metadata: Vec<u8>,
     clears: Vec<Range<u64>>,
 }
@@ -17,10 +19,43 @@ pub(crate) fn fixture_seed(base: u64, size: u64, cpu: u64) {
     let old = MODEL.lock().replace(Model {
         range: base..base + size,
         cpu,
+        extra: Vec::new(),
+        copies: Vec::new(),
         metadata: alloc::vec![0xa5; (size / 256) as usize],
         clears: Vec::new(),
     });
     drop(old);
+}
+pub(crate) fn fixture_add_window(base: u64, size: u64, cpu: u64) {
+    assert_eq!((base | size) & 4095, 0);
+    let mut state = MODEL.lock();
+    let state = state.as_mut().expect("owned fixture LMEM");
+    let range = base..base + size;
+    assert!(!(range.start < state.range.end && state.range.start < range.end));
+    assert!(state
+        .extra
+        .iter()
+        .all(|(r, _)| !(range.start < r.end && r.start < range.end)));
+    state.extra.push((range, cpu));
+}
+pub(crate) fn fixture_pointer(dpa: u64) -> Option<u64> {
+    let model = MODEL.lock();
+    let model = model.as_ref()?;
+    if model.range.contains(&dpa) {
+        return Some(model.cpu + dpa - model.range.start);
+    }
+    model
+        .extra
+        .iter()
+        .find_map(|(range, cpu)| range.contains(&dpa).then_some(cpu + dpa - range.start))
+}
+pub(crate) fn fixture_copies() -> Vec<(u64, u64, u64)> {
+    MODEL
+        .lock()
+        .as_ref()
+        .expect("owned fixture LMEM")
+        .copies
+        .clone()
 }
 pub(crate) fn fixture_state() -> (Vec<u8>, Vec<Range<u64>>) {
     let model = MODEL.lock();
@@ -73,10 +108,7 @@ fn pointer(root: u64, va: u64, writable: bool) -> *mut u8 {
         "copy leaf permission/cache policy"
     );
     if device {
-        let model = MODEL.lock();
-        let model = model.as_ref().expect("owned fixture LMEM");
-        assert!(model.range.contains(&physical));
-        (model.cpu + physical - model.range.start) as *mut u8
+        fixture_pointer(physical).expect("DM leaf outside model windows") as *mut u8
     } else {
         narf_memory::PhysAddr::new(physical).kernel_mut_ptr::<u8>()
     }
@@ -122,6 +154,11 @@ pub(crate) fn execute_fixture(root: u64, batch_va: u64) -> bool {
                 )
             };
             assert!(bytes != 0 && bytes <= 8 * 1024 * 1024);
+            if let Some(model) = MODEL.lock().as_mut() {
+                model
+                    .copies
+                    .push((leaf(root, source).0, leaf(root, target).0, bytes));
+            }
             for page in (0..bytes).step_by(4096) {
                 let source = self::pointer(root, source + page, false);
                 let target = self::pointer(root, target + page, true);

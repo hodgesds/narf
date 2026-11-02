@@ -688,3 +688,24 @@ pub(crate) fn lookup(name: &str) -> Option<Arc<dyn FileOps>> {
 #[cfg(any(test, feature = "kernel-test"))]
 #[path = "intel_gpu_devcoredump_tests.rs"]
 mod tests;
+
+/// Exercise the actual immutable descriptor gates with a native captured
+/// bundle; no test callback is reachable from a production node.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn open_for_test(
+    index: u32,
+    enabled: fn() -> bool,
+    capable: fn() -> bool,
+    admin: fn() -> bool,
+    write: bool,
+) -> Result<Option<Arc<dyn FileOps>>, FsError> {
+    Node {
+        index,
+        gate: Gate {
+            enabled,
+            capable,
+            admin,
+        },
+    }
+    .open_instance_checked(write)
+}

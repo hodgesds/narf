@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.35** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.36** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -28,7 +28,9 @@
 > per-object BMG i915 ASYNC and default-off exact-TGL HuC upload/auth/query
 > pass debug and release native model gates; i915 context-frequency intent,
 > private context publication and published-media SSEU defaults
-> pass debug and release native model gates — see §20).
+> pass debug and release native model gates; BMG opt-in GPU-only VRAM,
+> bounded i915 capture/protection and automatic-reset discovery are implemented
+> with native and integration validation pending — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -2180,14 +2182,14 @@ production feature. Unsupported functionality remains unadvertised.
 | Extended dGPU controls/telemetry | Bounded admin-gated DG2 PL1 actor with retained boot ceiling/readback, cached fan RPM and owned BMG thermal discovery | Implemented; native fixtures pass |
 | Compatibility dispatcher | Exact Xe-first wire routing on live GuC cards, shared WB GEM/PRIME/syncobj identity, observed discovery/SSEU and WB-only compatibility cache/mmap/softpin policy | Implemented; native fixtures pass |
 | VM/address mirrors | USERPTR invalidation/MMU notifier, i915 GEM_USERPTR, fault-mode/CPU mirrors and separately qualified nonfault long-running VMs | Open; memory/VM dependency |
-| Local-memory management | Small-BAR/unmapped VRAM; eviction/migration, alias revocation and preserved auxiliary system representations; VRAM PRIME/P2P | Open; retained copy primitive implemented, binding/alias ownership remains |
+| Local-memory management | Nonvisible allocation beyond the exact opted-in BMG headless profile; eviction/migration, alias revocation and preserved auxiliary system representations; VRAM PRIME/P2P | Open; bounded BMG allocation does not close migration/alias ownership |
 | Client-free CCS reconfiguration | Card-lifetime primary/render leases; admin-gated asynchronous reset, all-engine startup proofs and fresh-epoch publication | Implemented; native fixtures pass |
 | GuC width-one load balancing | Same-class placement mask, private per-restore hardware engine receipt, migration-aware watchdog, retained LRC/VM/retirement ownership | Implemented; native fixtures pass |
 | i915 virtual contexts | LOAD_BALANCE proto-map extension through the production GuC backend, copied distinct same-class placements, transactional namespace and migration/retirement ownership | Implemented; native fixtures pass |
 | GuC width-two through width-four groups | Single-row adjacent dense logical COPY/COMPUTE lanes, protected scratch/workqueue, contiguous IDs, independent saved/runtime state and all-lane retirement | Implemented; native fixtures pass |
 | Engine scheduling | Additional platform-qualified queue protocols and protected queues with their firmware/security dependencies; pinned source gives current platforms no CGP class mask | Open; independent capability/firmware qualification |
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; separate GT lifecycle |
-| Diagnostics/performance | Diagnostic coverage beyond bounded retained VM/dumpable BO prefixes and qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
+| Diagnostics/performance | Full coredump/error-sysfs and batch capture beyond bounded native/i915 selected payloads, qualified log fanout, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiling/compression beyond qualified X/Tile4 profiles and additional planes | Open; modeset resource transactions |
 | Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; per-platform display profiles |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
@@ -2237,6 +2239,9 @@ production feature. Unsupported functionality remains unadvertised.
 | Per-object i915 ASYNC | Live BMG ordinary WB softpin and same-card WB imports, truthful GETPARAM43, selective prior GPU waits, atomic mixed admission and retained terminal/CPU ordering | Implemented; native fixtures pass |
 | Exact-TGL HuC upload/auth/query | Default-off actual firmware/BO/WOPCM, both-pass DMA, typed zero-result CT plus fresh status, current Xe query7/type1 and full-reset reclamation | Implemented; native fixtures pass |
 | i915 context frequency hint | Cached exact GETPARAM59 ABI, proto/create-only immutable intent, retained real GuC policy and private nonce-bound context publication | Implemented; native fixtures pass |
+| BMG opt-in GPU-only VRAM | Exact headless small-BAR takeover, immutable hidden backing, trusted GPU zero/copies, retained quota and off-lock exact-VM publication | Implemented; validation pending |
+| i915 selected capture and protection | Actual retained WB/import payload prefixes, cached GETPARAM45 and source-live per-context whole-bundle suppression | Implemented; validation pending |
+| i915 automatic global-reset availability | Cached GETPARAM35 level1 only with a distinct current worker/every-engine qualification witness and retained stop/requalification policy | Implemented; validation pending |
 | GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open; mapping revocation and platform PM |
 | Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; primary-source register/firmware contracts |
 
@@ -3087,3 +3092,61 @@ aarch64 QEMU is omitted because no aarch64-specific production behavior changes.
 The reset fixtures use fresh GuCGt owners, not an actual RuntimeOwner/PCI/S3
 coordinator. No physical Intel, Mesa, codec or frequency/performance result
 is claimed. Local-memory takeover/allocation and OA remain separate work.
+
+### BMG GPU-only VRAM, i915 capture and reset availability — validation pending
+
+This batch adds three bounded checkpoints. The ledger keeps its 62 previously
+validated rows plus three pending rows (65 total), and all ten broad workstreams
+remain open. The local-memory and diagnostics backlog rows describe the remaining
+scope; neither broad workstream is closed by these exceptions.
+
+- Exact physical BMG graphics20.01/20.02 gains default-off pre-`--`
+  `narf.intel.bmg_smallbar=1`, permanently headless/client-free fresh driver-FLR
+  takeover and separate visible/GPU-only pools excluding DSM/GSM/flat-CCS tails.
+  Born GPU-only backing never acquires a CPU alias. Actual trusted COPY0 zero
+  initialization must retire successfully before a handle. Private WB staging,
+  high-DPA/PTE/cache/MERT proofs, retained preterminal count/bytes and off-lock
+  reentrant copyout followed by current owner/exact-VM/token publication retain
+  cancellation/lost-ACK/reset ownership. CPU/mmap/diagnostic/user-fence/PRIME/
+  KMS/i915/ASYNC paths refuse this storage. Ordinary GT reset never repeats the
+  destructive FLR; opted-in runtime/system PM initially refuses. Default BMG
+  and other profiles retain their prior behavior. The existing HuC option also
+  follows the corrected pre-separator boot grammar.
+- I915 object bit7 retains actual selected WB/same-card-import mappings and
+  bounded safe payload prefixes in the existing immutable native-v3 dump.
+  Cached GETPARAM45 follows live matching ABI1 admission. Context parameter4
+  accepts size0/any-nonzero SET even after finalization; one source-live policy
+  spans all engine/map/virtual/lazy-media members and retained jobs after close.
+  Any protected retained i915 context suppresses the entire new raw bundle
+  before backing reads, a deliberate NARF whole-bundle choice. Normal UserJob
+  saved-state/terminal processing, old immutable readers, capabilities, boot
+  opt-in and diagnostic bounds remain. Full Linux dump/sysfs/batch parity and
+  additional storage rights remain outside this subset.
+- Cached GETPARAM35 reports automatic whole-GT reset level1 only with current
+  user admission and a distinct worker/incarnation-bound sealed every-engine
+  execution/terminal qualification witness. Refusal defaults0. Faults and
+  accepted transitions withdraw it; a refused transition which leaves Running
+  intact preserves it. Proved stop precedes permitted Cold recovery; clean park
+  requalifies before adopting its prior user epoch. Cancellation retains uncertain
+  DMA while closing admission. No per-engine level2/value3, manual reset, replay
+  or broader recovery/PM authority is added.
+
+Thirty new fixtures are registered: fifteen small-BAR (including three physical
+path fixtures), nine capture/protection and six reset-availability cases.
+Expected totals are 1,908 selected native tests: 1,238 Intel/DRM/fb/backlight
+plus all 670 shared filesystem/graphics/AMD fixtures, with 152 cumulative new
+names. These counts describe the registered test plan; new debug/release native
+execution, production/btrfs and cross-target gates remain pending. Source review
+and isolated preflight do not constitute native feature acceptance.
+
+The BO fixtures drive actual raw Xe/GT/CT/LRC/PPGTT, cache/MERT, copy, terminal
+and reset ownership; their publication transport substitutes for the physical
+RuntimeOwner PM/reset mutex. Three physical-path fixtures exercise actual
+retained capability/PCI/BAR AuthorizedWindow, driver-FLR/media conversation and
+cache-to-first-PTE code using owned fake config/MMIO RAM. Capture fixtures use
+actual raw i915 selection, retained job payload, live policy and descriptor
+capability paths. Reset fixtures exercise the common recovery coordinator with
+real GT execution models. These are not positive full RuntimeOwner/firmware
+registry/physical PCI power callbacks or S3 executions. Physical Intel, Mesa,
+codec and performance acceptance remain unrun. No silicon or full physical
+owner result is claimed; OA and all ten broad workstreams remain open.

@@ -13,6 +13,7 @@ use crate::{
     intel_gpu_xe_vm::{read, zero, Bind, Vm},
 };
 use alloc::{
+    boxed::Box,
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
@@ -551,7 +552,12 @@ impl XeFile {
             drop(names);
             return Ok(());
         }
-        let pending = match gem.prepare_vram(size, owner, pool) {
+        let pending = match gem.prepare_vram_class(
+            size,
+            owner,
+            pool,
+            flags & 4 != 0 || !pool.smallbar_enabled(),
+        ) {
             Ok(pending) => pending,
             Err(FsError::OutOfMemory) if placement & 1 != 0 => {
                 let names = self.names.lock();
@@ -583,6 +589,39 @@ impl XeFile {
             .is_none_or(|s| s.platform != info.platform || s.epoch != epoch)
         {
             return Err(FsError::NoDevice);
+        }
+        if pool.smallbar_enabled() {
+            let object = pending.object();
+            let mut publication = gem.reserve_smallbar_publication(pending, &fence)?;
+            // Faultable/reentrant output holds no GT/namespace/GEM guard.
+            // The reserved ID is still absent from every public lookup.
+            put32(&mut wire, 28, publication.handle);
+            user.write(address, &wire)?;
+            return backend
+                .publish_vram(
+                    epoch,
+                    pool.clone(),
+                    object,
+                    fence,
+                    Box::new(move |current| {
+                        current()?;
+                        let names = self.names.lock();
+                        if let Some(vm) = &vm {
+                            if names
+                                .vms
+                                .get(&vm_id)
+                                .is_none_or(|live| !Arc::ptr_eq(live, vm))
+                            {
+                                return Err(FsError::NotFound);
+                            }
+                            vm.check()?;
+                        }
+                        publication.commit()?;
+                        drop(names);
+                        Ok(())
+                    }),
+                )
+                .await;
         }
         // Nothing user-visible names this object before successful hardware
         // retirement. VM destruction during the wait cannot publish an orphan.

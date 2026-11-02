@@ -49,6 +49,13 @@ impl CopyRequest {
                 return Err(FsError::InvalidData);
             }
         }
+        if (source.is_gpu_only() || destination.is_gpu_only())
+            && [&source, &destination]
+                .iter()
+                .any(|object| !object.is_gpu_only() && !object.private_staging())
+        {
+            return Err(FsError::Unsupported);
+        }
         if Arc::ptr_eq(&source, &destination)
             && source_offset < destination_offset + length
             && destination_offset < source_offset + length
@@ -76,6 +83,9 @@ impl CopyRequest {
         Ok(())
     }
 
+    pub(crate) fn uses_gpu_only(&self) -> bool {
+        self.source.is_gpu_only() || self.destination.is_gpu_only()
+    }
     pub(crate) fn uses_vram(&self) -> bool {
         self.source.is_vram() || self.destination.is_vram()
     }
@@ -91,7 +101,11 @@ impl CopyRequest {
             return Err(FsError::Unsupported);
         }
         let gem = GemState::new();
-        let code = gem.object(gem.create(PAGE, |_, _| Ok(()))?)?;
+        let code = if self.uses_gpu_only() {
+            GemObject::private_system(PAGE)?
+        } else {
+            gem.object(gem.create(PAGE, |_, _| Ok(()))?)?
+        };
         let pat = if platform == GtPlatform::Battlemage {
             2
         } else {

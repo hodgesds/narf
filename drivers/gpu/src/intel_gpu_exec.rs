@@ -23,7 +23,7 @@ const PAGE: u64 = 4096;
 
 #[path = "intel_gpu_vram_clear.rs"]
 pub(crate) mod vram_clear;
-pub(crate) use vram_clear::prepare_vram_clear;
+pub(crate) use vram_clear::{prepare_smallbar_clear, prepare_vram_clear};
 
 #[path = "intel_gpu_copy.rs"]
 pub mod copy;
@@ -36,6 +36,8 @@ pub struct ExecObject {
     /// i915 EXEC_OBJECT_ASYNC: skip prior implicit GPU dependencies only.
     /// The terminal READ/WRITE reservation and mandatory publication remain.
     pub asynchronous: bool,
+    /// i915 EXEC_OBJECT_CAPTURE: retained diagnostic payload selection only.
+    pub capture: bool,
 }
 
 #[derive(Debug)]
@@ -242,7 +244,8 @@ impl ExecRequest {
             let allowed = abi::OBJECT_WRITE
                 | abi::OBJECT_SUPPORTS_48B
                 | abi::OBJECT_PINNED
-                | abi::OBJECT_ASYNC;
+                | abi::OBJECT_ASYNC
+                | abi::OBJECT_CAPTURE;
             if !handles.insert(handle)
                 || u32_at(entry, 4) != 0
                 || u64_at(entry, 8) != 0
@@ -270,6 +273,7 @@ impl ExecRequest {
                 va,
                 writable: object_flags & abi::OBJECT_WRITE != 0,
                 asynchronous: object_flags & abi::OBJECT_ASYNC != 0,
+                capture: object_flags & abi::OBJECT_CAPTURE != 0,
             });
         }
         // Detect overlap without sorting the original residency order: batch
@@ -345,6 +349,10 @@ impl ExecRequest {
             asynchronous: Vec::new(),
             dumpable: Vec::new(),
         };
+        space
+            .dumpable
+            .try_reserve_exact(self.objects.iter().filter(|entry| entry.capture).count())
+            .map_err(|_| FsError::OutOfMemory)?;
         for entry in &self.objects {
             // Compatibility owns a separate private VM and uses one WB host
             // PAT for every leaf. Shared Xe handles retain explicit native
@@ -355,6 +363,17 @@ impl ExecRequest {
             }
             space.objects.push((entry.object.clone(), entry.writable));
             space.asynchronous.push(entry.asynchronous);
+            if entry.capture {
+                space.dumpable.push(VmMapping {
+                    object: Some(entry.object.clone()),
+                    va: entry.va,
+                    offset: 0,
+                    length: entry.object.size(),
+                    writable: entry.writable,
+                    pat: pat_index,
+                    dumpable: true,
+                });
+            }
             for (i, phys) in entry.object.pages().enumerate() {
                 space
                     .tables
@@ -481,6 +500,11 @@ impl ResidentBatch {
         };
         if let Some((addr, _)) = user_fence {
             if addr & 7 != 0
+                || mappings.iter().any(|m| {
+                    m.object.as_ref().is_some_and(|o| o.is_gpu_only())
+                        && addr >= m.va
+                        && addr < m.va + m.length
+                })
                 || !mappings.iter().any(|m| {
                     m.object.is_some()
                         && m.writable
@@ -769,12 +793,14 @@ impl PpgttProbeResult {
                     va: PROBE_CODE,
                     writable: false,
                     asynchronous: false,
+                    capture: false,
                 },
                 ExecObject {
                     object: data.clone(),
                     va: PROBE_DATA,
                     writable: true,
                     asynchronous: false,
+                    capture: false,
                 },
             ],
         }

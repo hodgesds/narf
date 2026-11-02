@@ -2272,6 +2272,38 @@ impl IntelGpuCard {
         self.lmem_bar.lock().get_or_insert(bar);
     }
 
+    pub(crate) fn local_bar(&self) -> Option<narf_bus::MmioRegion> {
+        *self.lmem_bar.lock()
+    }
+    pub(crate) fn publish_smallbar_vram<M, A>(
+        &self,
+        gt: &crate::intel_gpu_guc_gt::GuCGt<M, A>,
+        grant: Arc<crate::intel_gpu_gt::smallbar::DpaGrant>,
+    ) -> Result<(), FsError>
+    where
+        M: crate::intel_gpu_aux::MmioWindow,
+        A: crate::intel_gpu_guc_boot::BootAllocator,
+    {
+        let layout = gt.vram_layout().ok_or(FsError::NoDevice)?;
+        let bar = self.local_bar().ok_or(FsError::NoDevice)?;
+        if !grant.matches(bar, layout) || gt.vram_needs_ccs_clear() {
+            return Err(FsError::NoDevice);
+        }
+        let mut slot = self.vram.lock();
+        if let Some(pool) = slot.as_ref() {
+            if !pool.matches_smallbar(&grant) {
+                return Err(FsError::NoDevice);
+            }
+        } else {
+            // SAFETY: the grant was derived from this retained fresh full-device
+            // incarnation, source geometry and current physical PF/BAR owner.
+            *slot = Some(
+                unsafe { crate::intel_gpu_vram::Vram::new_smallbar(bar, layout, grant) }
+                    .map_err(|_| FsError::NoDevice)?,
+            );
+        }
+        Ok(())
+    }
     /// Bytes currently allocated from this card's VRAM pool, if published.
     pub(crate) fn intel_vram_used(&self) -> Option<u64> {
         self.vram.lock().as_ref().map(|vram| vram.used())

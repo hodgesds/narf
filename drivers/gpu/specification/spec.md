@@ -394,7 +394,7 @@ invalid-size requests do not sample authority or touch the payload.
 Timeslices are bounded to 1..100000 microseconds; unknown properties, flags,
 instances and malformed reserved fields fail before publication.
 
-Visible local memory: `RegisterInit` captures stable SG_TILE_ADDR_RANGE(0),
+Default visible local memory: `RegisterInit` captures stable SG_TILE_ADDR_RANGE(0),
 platform-specific flat-CCS base and GSMBASE. BMG uses the qualified Xe2 range
 and fuse policy; DG2 requires two matching steered 0x4910 captures, a valid
 flat-CCS tail of at least tile_size/256 and tile0. `VramLayout` excludes CCS
@@ -404,7 +404,7 @@ than total VRAM.
 `IntelGpuCard::publish_gt_vram` installs one card-lifetime WC pool and refuses
 a changed/missing layout or changed clear policy on restart, closing the new
 execution epoch before old local-memory objects can submit again. Raw `Vram::allocate` only reserves
-storage and performs no BAR I/O. `GemState::prepare_vram` keeps it unpublished;
+storage and performs no BAR I/O. `GemState::prepare_vram_class` keeps it unpublished;
 `UserBackend::clear_vram(Arc<GemObject>, epoch)` returns the owned terminal
 fence (unsupported by default); asynchronous creation waits for it.
 `publish_vram` requires completed initialization, a successful terminal fence,
@@ -416,7 +416,7 @@ an immutable system-zero source into indirect flat CCS, and MI_FLUSH_DW_CCS
 orders metadata before completion. The job retains all BOs and private PPGTT
 until terminal retirement or verified reset; cancelled creation cannot free
 in-flight storage. No user handle, CPU mmap or user VM bind precedes success.
-BMG uses a private CPU-clear token under the live GT's PM hold, current D0,
+Default BMG visible storage uses a private CPU-clear token under the live GT's PM hold, current D0,
 wake and BusCap invocation. Each WC-drained chunk is at most 64 KiB; the async
 owner yields the reset mutex between chunks and rechecks epoch/layout/authority
 before further stores. An old operation never closes a newer recovered epoch.
@@ -436,8 +436,61 @@ HAS_VRAM, and GT_LIST reports near VRAM/far system memory. WC mmap uses retained
 BAR frames. DG2 PPGTT uses sixteen contiguous DM|PS64 leaves per 64 KiB group,
 including valid device address zero; bind, split, replace and unmap preserve
 64 KiB boundaries. Translation rejects partial/corrupt groups and retains
-read-only/PAT checks. VRAM PRIME, i915 residency, nonvisible/unmapped memory,
-eviction/migration and dGPU scanout remain unsupported.
+read-only/PAT checks. VRAM PRIME, i915 residency, eviction/migration and dGPU
+scanout remain unsupported. GPU-only storage has the bounded opt-in exception
+below; other nonvisible/unmapped allocation remains unavailable.
+
+#### Opt-in BMG GPU-only small-BAR local memory
+
+Only physical BMG graphics20.01/20.02 admits the default-off canonical boot
+option `narf.intel.bmg_smallbar=1`, before the first `--`. The matching option
+must occur exactly once with value1; bare, malformed or duplicate occurrences
+refuse it. Post-separator init arguments neither enable nor negate it. The
+same pre-separator grammar applies to the existing exact-TGL HuC opt-in.
+Other profiles and default BMG retain their existing visible-only behavior.
+
+The option requires permanently headless, client-free takeover and a fresh
+whole-device driver FLR. Retained PCI/PF/config/BAR0/BAR2 authority, separately
+retired media, main wake, cache/MERT policy and matching live source geometry
+are required before pooling DPA. DSM/GSM/flat-CCS and boot-framebuffer tails
+remain excluded. Separate visible and GPU-only pools share usage accounting;
+GPU-only backing is immutable from allocation and never gains a CPU address.
+An ordinary GT reset cannot repeat the destructive takeover or wipe live BOs.
+
+The new GPU-only path requires successful actual trusted COPY0 MEM_COPY zero
+initialization from a retained immutable system-zero source before any handle.
+The private VM uses source-qualified DMA46/high-DPA translation, PAT/cache and
+MERT proofs; reservations, private backing and initialization jobs survive
+cancelled waiters, lost acknowledgements and uncertain reset retirement.
+CPU copies/mmap/aliases, diagnostic payload reads, user-fence targets, PRIME,
+KMS, i915 residency, ASYNC and compressed/migrating storage refuse GPU-only BOs.
+Trusted copies use private WB staging with the existing terminal/cache proofs;
+no fallback CPU pointer into hidden VRAM is permitted.
+
+Every opted-pool GPU-only or visible allocation carries a private per-file
+count/byte charge before range reservation or clear. Failed local reservation
+drops that charge; a normal SYSTEM fallback follows the ordinary path. The acyclic
+charge follows the actual BO/job graph through cancellation and terminal/reset
+retirement; all shared capacity writers count pending plus published usage.
+Successful output transfers that same charge once into existing published
+handle accounting. Close preserves the prior published-handle budget policy;
+physical ranges still follow retained BO/VM/job ownership.
+
+Output first reserves an invisible exact handle token, then performs faultable,
+reentrant user copyout outside all GT/names/GEM locks. A default-refusing
+`UserBackend::publish_vram` transaction subsequently retains PM and GT ownership,
+revalidates original epoch, actual pool/object/terminal initialization, live
+source geometry, MERT and window authority, and invokes only a synchronous
+metadata callback. That callback checks the same retained live VM under names
+and commits the exact token under GEM handles, without userspace calls, waits
+or `Vm.state`. Failure publishes no handle; graph/token cleanup is outside IRQ
+guards. A stale request cannot close a newer epoch. Source semaphore contention
+is retryable; matching-epoch current-proof loss closes admission and marks the
+opted-in GT lost while retaining uncertain DMA ownership.
+
+Visible/total usage includes private and quarantined ranges. Runtime and system
+power transitions initially refuse the opted profile; this is not S3 preservation,
+D3cold, migration or a full physical RuntimeOwner/firmware-registry validation.
 
 VM_BIND supports vector or inline MAP, UNMAP, UNMAP_ALL and MAP_USERPTR,
 partial-object mappings, overlap replacement and split ranges with retained
@@ -681,6 +734,69 @@ only ENABLED while live, leaving priority/preemption/semaphore/busy-stat
 capability bits clear. Obsolete UMS parameters 1/2/3/14 return ENODEV. Legacy
 slice/subslice masks 46/47 return EINVAL on Xe_HP-and-later profiles, as in
 Linux; callers use full topology queries.
+
+#### i915 selected capture and live diagnostic protection
+
+`EXEC_OBJECT_CAPTURE` (object bit7) snapshots selection during raw execbuffer
+admission and retains the actual selected BO mappings with the job's private
+VM. Selected currently admitted WB system/same-card PRIME ranges contribute
+real safe payload prefixes to the existing native-v3 `NARFVMEM` section.
+Unselected objects do not disclose payload. VRAM, WC, VM-private softpin and
+i915 USERPTR remain outside this profile. WRITE/ASYNC, explicit fences,
+coherence, output rollback and terminal/cancel/full-reset ownership are unchanged;
+existing native Xe DUMPABLE and owned pin-backed diagnostics keep their bounds.
+
+GETPARAM HAS_EXEC_CAPTURE45 passively copies1 only for matching nonzero cached
+live GuC admission, submission ABI major1 and nonempty published engines;
+otherwise it succeeds with0. This bounded NARF availability policy differs from
+Linux's unconditional1. It performs no wake or MMIO. Independent default-off
+raw-coredump boot admission and current reader/clear capabilities still apply.
+
+NO_ERROR_CAPTURE (context parameter4) defaults0. CREATE_EXT and SET accept size0,
+including already-finalized/busy contexts; any nonzero value enables it and0
+clears it. GET performs ordinary context lookup/finalization, ignores input size
+and returns size0/value0or1. One live policy Arc spans every legacy RCS/BCS,
+indexed physical/virtual and lazy Gen12 media member and each retained job after
+namespace/fd destruction. Error capture samples each retained policy once.
+If any retained i915 context is protected, NARF skips the entire NEW raw bundle
+before reading log/CT, parent/child LRC/ring/group scratch, VM tables or BO bytes.
+This conservative whole-bundle rule is a NARF choice because the bundle shares
+global and other-job sources. Existing immutable reports/readers remain unchanged.
+Normal `UserJob::capture_lanes` state saves, generic redacted fault/telemetry
+paths and all terminal/recovery proofs remain active.
+
+The existing two-permit/card, eight execution, four VM, sixteen owned-table,
+eight selected-range and 16KiB/range-prefix limits remain, with explicit omitted,
+truncated, refused and authority-loss data. Selection adds no capture-time flush,
+reservation wait, allocation, CPU alias or storage right. This is a bounded
+payload subset, not Linux full coredump/error-sysfs or implicit all-batch capture.
+
+#### i915 automatic global-reset availability
+
+GETPARAM HAS_GPU_RESET35 passively writes signed32 level1 only when a distinct
+`UserBackend::reset_availability_epoch()` snapshot matches current nonzero GuC
+user admission, platform, ABI major1 and nonempty engines. The callback refuses
+by default. Its sealed one-use qualification binds the live recovery worker,
+hardware incarnation, profile, exact engines and firmware-upload identity;
+a boolean or a stale receipt cannot confer readiness. The actual private PPGTT
+store and successful terminal retirement must be verified on every published
+engine before each incarnation becomes available. Other states succeed with0;
+per-engine level2, value3 and manual reset are not exposed. Querying performs
+no PCI/MMIO/wake, PM resume or asynchronous action.
+
+Observed faults withdraw readiness before owner cleanup. Existing IRQ shutdown,
+bounded diagnostics, admission closure and display quarantine precede actual
+hardware stop. Only verified full GuC/GT reset, firmware-DMA idle and retained
+cache/media/wake handoff permit terminal retirement; only previously live,
+proved-clean recovery may restart Cold. Initial qualification and failed cleanup
+stay closed. There is no job replay or new reset authority. Accepted park/S3/CCS
+transitions withdraw readiness; refusal which preserves Running retains it.
+Clean park keeps its user epoch but reports0 until fresh qualification and
+compatible epoch adoption. Worker cancellation closes user admission/readiness
+while retaining uncertain DMA. This cache describes last observed software
+state; actual register actions still require current authority. Native shared
+coordinator/GT models do not establish full physical Owner/PCI/firmware-registry
+or S3 execution.
 
 #### i915 context frequency hints and creation publication
 

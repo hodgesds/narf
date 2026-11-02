@@ -842,6 +842,7 @@ pub struct GgttArena {
     authority: Option<crate::intel_gpu_gt_hw::AuthorizedWindow>,
     gt_platform: Option<crate::intel_gpu_gt::GtPlatform>,
     lnl_receipt: Option<crate::intel_gpu_gt::lnl::Receipt>,
+    bmg_authority: Option<Arc<crate::intel_gpu_gt::smallbar::Authority>>,
     lnl_device: Option<narf_bus::BusDevice>,
     lnl_pte_count: core::cell::Cell<u8>,
     retired: bool,
@@ -902,6 +903,7 @@ impl GgttArena {
             authority: None,
             gt_platform: None,
             lnl_receipt: None,
+            bmg_authority: None,
             lnl_device: None,
             lnl_pte_count: core::cell::Cell::new(0),
             retired: false,
@@ -920,6 +922,24 @@ impl GgttArena {
         arena.authority = Some(crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap));
         arena.gt_platform = Some(platform);
         arena
+    }
+
+    pub(crate) fn for_smallbar_gt(
+        bar: narf_bus::MmioRegion,
+        mmio: crate::intel_gpu_gt_hw::AuthorizedWindow,
+        authority: Arc<crate::intel_gpu_gt::smallbar::Authority>,
+    ) -> Result<Self, SubmitError> {
+        if !authority.matches_window(&mmio, bar) {
+            return Err(SubmitError::NoEngine);
+        }
+        authority
+            .current(&mmio)
+            .map_err(|_| SubmitError::NoEngine)?;
+        let mut arena = Self::new(bar);
+        arena.authority = Some(mmio);
+        arena.gt_platform = Some(crate::intel_gpu_gt::GtPlatform::Battlemage);
+        arena.bmg_authority = Some(authority);
+        Ok(arena)
     }
 
     pub(crate) fn for_lnl_gt(
@@ -965,6 +985,11 @@ impl GgttArena {
         }
         let pte_byte = GGTT_ARRAY_BASE + (ggtt_off as u64 / GTT_PAGE_SIZE) * 8;
         if let Some(window) = &self.authority {
+            if let Some(authority) = &self.bmg_authority {
+                authority
+                    .current(window)
+                    .map_err(|_| SubmitError::NoEngine)?;
+            }
             let media = if lnl {
                 Some(
                     self.policy
@@ -2949,6 +2974,7 @@ pub mod tests {
                 va,
                 writable: false,
                 asynchronous: false,
+                capture: false,
             }],
         };
         let batch = request

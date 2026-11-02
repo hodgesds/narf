@@ -33,6 +33,10 @@ pub(crate) mod cpu_mapping;
 #[derive(Debug)]
 pub struct GemObject {
     frames: Vec<PhysFrame>,
+    private_staging: bool,
+    /// Opted-in pending allocation quota follows the actual BO/job graph,
+    /// independently of the ioctl waiter and without a back-reference cycle.
+    pending_quota: IrqSafeSpinLock<Option<PendingCharge>>,
     /// USERPTR: retained caller pages instead of owned frames. Such objects
     /// have no handle, mmap offset, CPU copy path or PRIME export.
     pins: Vec<narf_memory::address_space::UserPagePin>,
@@ -89,6 +93,8 @@ impl GemObject {
         charge(size)?;
         let mut object = Self {
             frames: Vec::new(),
+            private_staging: false,
+            pending_quota: IrqSafeSpinLock::new(None),
             pins: Vec::new(),
             vram: None,
             ccs: core::sync::atomic::AtomicU8::new(0),
@@ -119,6 +125,50 @@ impl GemObject {
             object.frames.push(frame);
         }
         Ok(object)
+    }
+
+    pub(crate) fn private_system(size: u64) -> Result<Arc<Self>, FsError> {
+        if size == 0 || size & 4095 != 0 || size > MAX_FILE_BYTES {
+            return Err(FsError::InvalidData);
+        }
+        let mut object = Self::allocate(size, 0)?;
+        object.private_staging = true;
+        Ok(Arc::new(object))
+    }
+    pub(crate) fn private_staging(&self) -> bool {
+        self.private_staging
+    }
+    pub(crate) fn is_gpu_only(&self) -> bool {
+        self.vram
+            .as_ref()
+            .is_some_and(|r| r.cpu_address().is_none())
+    }
+    pub(crate) fn gpu_only_access(
+        &self,
+        m: &impl crate::intel_gpu_aux::MmioWindow,
+    ) -> Result<(), crate::intel_gpu_gt::lnl::Error> {
+        if !self.is_gpu_only() {
+            return Err(crate::intel_gpu_gt::lnl::Error::Unsupported);
+        }
+        self.vram
+            .as_ref()
+            .ok_or(crate::intel_gpu_gt::lnl::Error::State)?
+            .smallbar_access(m)
+    }
+    pub(crate) fn initialization_complete(
+        &self,
+        fence: &crate::intel_gpu_fence::CompletionFence,
+    ) -> bool {
+        self.is_vram() && fence.result() == Some(Ok(())) && self.ccs.load(Ordering::Acquire) == 2
+    }
+    pub(crate) fn begin_gpu_vram_clear(&self) -> Result<(), FsError> {
+        if !self.is_gpu_only() {
+            return Err(FsError::Unsupported);
+        }
+        self.ccs
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| FsError::InvalidData)
     }
 
     /// As `allocate`, in zeroed write-combining pages. A kernel that cannot
@@ -224,7 +274,7 @@ impl GemObject {
     /// Retain a private Xe2-style object for bounded CPU initialization.
     /// DG2 must use the trusted GPU data/flat-CCS clear instead.
     pub(crate) fn begin_cpu_vram_clear(self: &Arc<Self>) -> Result<CpuVramClear, FsError> {
-        if self.vram.as_ref().is_none_or(|v| v.requires_ccs_clear()) {
+        if self.is_gpu_only() || self.vram.as_ref().is_none_or(|v| v.requires_ccs_clear()) {
             return Err(FsError::Unsupported);
         }
         self.ccs
@@ -241,7 +291,7 @@ impl GemObject {
     fn vram_byte(&self, offset: u64) -> Option<*mut u8> {
         self.vram
             .as_ref()
-            .map(|vram| (vram.kernel_virt() + offset) as *mut u8)
+            .and_then(|vram| vram.kernel_virt().map(|base| (base + offset) as *mut u8))
     }
 
     pub fn size(&self) -> u64 {
@@ -360,6 +410,9 @@ impl GemObject {
     /// deliberately uses device-local addresses instead and cannot supply
     /// the CPU alias census. Storage is immutable in this ownership slice.
     fn cpu_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
+        if self.is_gpu_only() || self.private_staging {
+            return Err(FsError::Unsupported);
+        }
         if len == 0 || offset % PAGE != 0 {
             return Err(FsError::InvalidData);
         }
@@ -372,7 +425,8 @@ impl GemObject {
             .map_err(|_| FsError::OutOfMemory)?;
         if let Some(vram) = &self.vram {
             // LMEM BAR frames, write-combining as Linux's VRAM mmap.
-            frames.extend(pages.map(|page| vram.cpu_address() + page as u64 * PAGE));
+            let base = vram.cpu_address().ok_or(FsError::Unsupported)?;
+            frames.extend(pages.map(|page| base + page as u64 * PAGE));
         } else {
             frames.extend(self.pages().skip(pages.start).take(pages.len()));
         }
@@ -380,6 +434,9 @@ impl GemObject {
     }
 
     pub fn read(&self, offset: u64, bytes: &mut [u8]) -> Result<(), FsError> {
+        if self.is_gpu_only() {
+            return Err(FsError::Unsupported);
+        }
         self.range(offset, bytes.len())?;
         let snapshot = self.dma_buf.resv.snapshot();
         let _reservation = RESERVATIONS.lock();
@@ -462,6 +519,9 @@ impl GemObject {
     }
 
     pub fn write(&self, offset: u64, bytes: &[u8]) -> Result<(), FsError> {
+        if self.is_gpu_only() {
+            return Err(FsError::Unsupported);
+        }
         self.range(offset, bytes.len())?;
         let snapshot = self.dma_buf.resv.snapshot();
         let _reservation = RESERVATIONS.lock();
@@ -596,16 +656,53 @@ impl Drop for GemObject {
     }
 }
 
+#[derive(Debug, Default)]
+struct PendingTotals {
+    count: usize,
+    bytes: u64,
+}
+#[derive(Debug)]
+struct PendingBudget {
+    totals: IrqSafeSpinLock<PendingTotals>,
+}
+impl Default for PendingBudget {
+    fn default() -> Self {
+        Self {
+            totals: IrqSafeSpinLock::new(PendingTotals::default()),
+        }
+    }
+}
+#[derive(Debug)]
+struct PendingCharge {
+    budget: Arc<PendingBudget>,
+    size: u64,
+    active: bool,
+}
+impl Drop for PendingCharge {
+    fn drop(&mut self) {
+        if self.active {
+            let mut totals = self.budget.totals.lock();
+            totals.count = totals.count.checked_sub(1).expect("private GEM count");
+            totals.bytes = totals
+                .bytes
+                .checked_sub(self.size)
+                .expect("private GEM bytes");
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Handles {
     next: u32,
     bytes: u64,
     objects: BTreeMap<u32, Arc<GemObject>>,
+    reserved: BTreeMap<u32, u64>,
 }
 
 #[derive(Debug)]
 pub struct GemState {
     handles: IrqSafeSpinLock<Handles>,
+    pending_budget: IrqSafeSpinLock<Option<Arc<PendingBudget>>>,
 }
 
 impl Default for GemState {
@@ -617,12 +714,77 @@ impl Default for GemState {
 impl GemState {
     pub const fn new() -> Self {
         Self {
+            pending_budget: IrqSafeSpinLock::new(None),
             handles: IrqSafeSpinLock::new(Handles {
                 next: HANDLE_BASE,
                 bytes: 0,
                 objects: BTreeMap::new(),
+                reserved: BTreeMap::new(),
             }),
         }
+    }
+
+    /// Called only under handles, so published↔pending transfer and every
+    /// other writer use the same admission order. Object retirement can only
+    /// reduce pending totals, and never takes handles in the inverse order.
+    fn capacity(&self, handles: &Handles, size: u64) -> bool {
+        let slot = self.pending_budget.lock();
+        let (count, bytes) = slot.as_ref().map_or((0, 0), |budget| {
+            let totals = budget.totals.lock();
+            (totals.count, totals.bytes)
+        });
+        handles
+            .objects
+            .len()
+            .checked_add(count)
+            .is_some_and(|n| n < MAX_OBJECTS)
+            && handles
+                .bytes
+                .checked_add(bytes)
+                .and_then(|n| n.checked_add(size))
+                .is_some_and(|n| n <= MAX_FILE_BYTES)
+    }
+    fn charge_pending(&self, size: u64) -> Result<PendingCharge, FsError> {
+        // Allocate prospective metadata before taking any IRQ-safe guard.
+        let prospective = Arc::new(PendingBudget::default());
+        let handles = self.handles.lock();
+        let budget = {
+            let mut slot = self.pending_budget.lock();
+            slot.get_or_insert_with(|| prospective.clone()).clone()
+        };
+        let mut totals = budget.totals.lock();
+        if handles
+            .objects
+            .len()
+            .checked_add(totals.count)
+            .is_none_or(|n| n >= MAX_OBJECTS)
+            || handles
+                .bytes
+                .checked_add(totals.bytes)
+                .and_then(|n| n.checked_add(size))
+                .is_none_or(|n| n > MAX_FILE_BYTES)
+        {
+            return Err(FsError::OutOfMemory);
+        }
+        totals.count += 1;
+        totals.bytes += size;
+        drop(totals);
+        drop(handles);
+        Ok(PendingCharge {
+            budget,
+            size,
+            active: true,
+        })
+    }
+
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn fixture_pending_usage(&self) -> (usize, u64) {
+        let _handles = self.handles.lock();
+        let slot = self.pending_budget.lock();
+        slot.as_ref().map_or((0, 0), |budget| {
+            let totals = budget.totals.lock();
+            (totals.count, totals.bytes)
+        })
     }
 
     /// Report before publishing. EFAULT consumes neither a handle nor pages.
@@ -663,7 +825,7 @@ impl GemState {
             return Err(FsError::InvalidData);
         }
         let mut handles = self.handles.lock();
-        if handles.objects.len() >= MAX_OBJECTS || handles.bytes + size > MAX_FILE_BYTES {
+        if !self.capacity(&handles, size) {
             return Err(FsError::OutOfMemory);
         }
         let next = handles.next.checked_add(1).ok_or(FsError::OutOfMemory)?;
@@ -708,11 +870,21 @@ impl GemState {
     /// Reserve storage without any BAR access or public handle. Cancellation before or
     /// after submission drops only this reference; the scheduler retains its
     /// own target object through clear retirement or proven reset.
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn prepare_vram(
         &self,
         size: u64,
         owner: Option<u64>,
         pool: &Arc<crate::intel_gpu_vram::Vram>,
+    ) -> Result<PendingVram, FsError> {
+        self.prepare_vram_class(size, owner, pool, true)
+    }
+    pub(crate) fn prepare_vram_class(
+        &self,
+        size: u64,
+        owner: Option<u64>,
+        pool: &Arc<crate::intel_gpu_vram::Vram>,
+        visible: bool,
     ) -> Result<PendingVram, FsError> {
         let size = size
             .checked_add(pool.page_size() - 1)
@@ -723,7 +895,7 @@ impl GemState {
         }
         {
             let handles = self.handles.lock();
-            if handles.objects.len() >= MAX_OBJECTS || handles.bytes + size > MAX_FILE_BYTES {
+            if !self.capacity(&handles, size) {
                 return Err(FsError::OutOfMemory);
             }
         }
@@ -734,8 +906,14 @@ impl GemState {
                     .filter(|next| *next < 1 << 63)
             })
             .map_err(|_| FsError::OutOfMemory)?;
-        let allocation = pool.allocate(size)?;
+        let quota = if pool.smallbar_enabled() {
+            Some(self.charge_pending(size)?)
+        } else {
+            None
+        };
+        let allocation = pool.allocate_class(size, visible)?;
         let mut object = GemObject::allocate(0, offset)?;
+        *object.pending_quota.lock() = quota;
         object.vram = Some(allocation);
         object.size = size;
         object.charged = false;
@@ -743,6 +921,46 @@ impl GemState {
         object.ccs.store(1, Ordering::Release);
         Ok(PendingVram {
             object: Arc::new(object),
+        })
+    }
+
+    /// Reserve a private monotonic ID and charge capacity before faultable
+    /// output. The token is invisible to object/close/import/mmap lookup.
+    /// Its drop releases both capacity and the private graph outside IRQ locks.
+    pub(crate) fn reserve_smallbar_publication(
+        &self,
+        pending: PendingVram,
+        fence: &crate::intel_gpu_fence::CompletionFence,
+    ) -> Result<VramPublication<'_>, FsError> {
+        if !pending.object.initialization_complete(fence) {
+            return Err(crate::intel_gpu_user::io_error());
+        }
+        let size = pending.object.size();
+        let handle = {
+            let mut handles = self.handles.lock();
+            let quota = pending.object.pending_quota.lock();
+            let quota = quota.as_ref().ok_or(FsError::InvalidData)?;
+            if !quota.active
+                || quota.size != size
+                || self
+                    .pending_budget
+                    .lock()
+                    .as_ref()
+                    .is_none_or(|b| !Arc::ptr_eq(b, &quota.budget))
+            {
+                return Err(FsError::InvalidData);
+            }
+            let handle = handles.next;
+            handles.next = handle.checked_add(1).ok_or(FsError::OutOfMemory)?;
+            assert!(handles.reserved.insert(handle, size).is_none());
+            handle
+        };
+        Ok(VramPublication {
+            gem: self,
+            handle,
+            size,
+            object: Some(pending.object),
+            settled: None,
         })
     }
 
@@ -757,7 +975,7 @@ impl GemState {
         }
         let mut handles = self.handles.lock();
         let size = pending.object.size();
-        if handles.objects.len() >= MAX_OBJECTS || handles.bytes + size > MAX_FILE_BYTES {
+        if !self.capacity(&handles, size) {
             return Err(FsError::OutOfMemory);
         }
         let next = handles.next.checked_add(1).ok_or(FsError::OutOfMemory)?;
@@ -794,6 +1012,9 @@ impl GemState {
     /// Same-card PRIME import. Reimporting the same object on an open returns
     /// its existing handle. The object retains its own allocation/accounting.
     pub fn import(&self, object: &Arc<GemObject>) -> Result<u32, FsError> {
+        if object.private_staging {
+            return Err(FsError::Unsupported);
+        }
         let mut handles = self.handles.lock();
         if let Some((handle, _)) = handles
             .objects
@@ -802,7 +1023,7 @@ impl GemState {
         {
             return Ok(*handle);
         }
-        if handles.objects.len() >= MAX_OBJECTS || handles.bytes + object.size > MAX_FILE_BYTES {
+        if !self.capacity(&handles, object.size) {
             return Err(FsError::OutOfMemory);
         }
         let handle = handles.next;
@@ -823,7 +1044,11 @@ impl GemState {
     }
 
     pub fn mmap_offset(&self, handle: u32) -> Result<u64, FsError> {
-        Ok(self.object(handle)?.offset)
+        let object = self.object(handle)?;
+        if object.is_gpu_only() || object.private_staging {
+            return Err(FsError::Unsupported);
+        }
+        Ok(object.offset)
     }
 
     pub fn mapping_object(
@@ -883,7 +1108,8 @@ impl CpuVramClear {
             .vram
             .as_ref()
             .expect("CPU VRAM token")
-            .kernel_virt();
+            .kernel_virt()
+            .expect("visible CPU VRAM token");
         for offset in (self.next..end).step_by(8) {
             // SAFETY: the token owns this private reservation; the caller
             // supplies current power/capability authority for the WC BAR.
@@ -905,6 +1131,65 @@ impl CpuVramClear {
         }
     }
 }
+/// Private handle reservation; never inserted before successful copyout and
+/// a second owner/VM identity validation. A nonce cannot be guessed/reused:
+/// IDs are monotonically consumed even on cancellation or failed output.
+#[derive(Debug)]
+pub(crate) struct VramPublication<'a> {
+    gem: &'a GemState,
+    pub(crate) handle: u32,
+    size: u64,
+    object: Option<Arc<GemObject>>,
+    settled: Option<PendingCharge>,
+}
+impl VramPublication<'_> {
+    pub(crate) fn commit(&mut self) -> Result<(), FsError> {
+        let mut handles = self.gem.handles.lock();
+        if handles.reserved.get(&self.handle) != Some(&self.size)
+            || handles.objects.contains_key(&self.handle)
+        {
+            return Err(FsError::InvalidData);
+        }
+        let object = self.object.as_ref().ok_or(FsError::InvalidData)?;
+        let mut quota = object.pending_quota.lock();
+        let charge = quota.as_ref().ok_or(FsError::InvalidData)?;
+        if !charge.active || charge.size != self.size {
+            return Err(FsError::InvalidData);
+        }
+        let mut totals = charge.budget.totals.lock();
+        if totals.count == 0 || totals.bytes < self.size {
+            return Err(FsError::InvalidData);
+        }
+        // One transfer under handles+budget: never double charge, no gap.
+        totals.count -= 1;
+        totals.bytes -= self.size;
+        handles.bytes += self.size;
+        drop(totals);
+        let mut charge = quota.take().expect("verified pending charge");
+        charge.active = false;
+        self.settled = Some(charge); // defer Arc metadata drop until outside names
+        drop(quota);
+        let object = self.object.take().expect("verified private object");
+        object.ccs.store(4, Ordering::Release);
+        handles.reserved.remove(&self.handle);
+        handles.objects.insert(self.handle, object);
+        Ok(())
+    }
+}
+impl Drop for VramPublication<'_> {
+    fn drop(&mut self) {
+        let object = self.object.take();
+        if object.is_some() {
+            let mut handles = self.gem.handles.lock();
+            handles.reserved.remove(&self.handle);
+        }
+        // Pending charge stays with any scheduler/VM reference to the object;
+        // abandoned output cannot reduce quota before actual GPU retirement.
+        drop(object);
+        drop(self.settled.take());
+    }
+}
+
 impl PendingVram {
     pub(crate) fn object(&self) -> Arc<GemObject> {
         self.object.clone()

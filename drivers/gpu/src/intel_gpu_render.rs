@@ -125,7 +125,7 @@ struct Context {
     /// only then is the engine map immutable.
     finalized: bool,
     vm: Arc<Vm>,
-    no_error_capture: bool,
+    no_error_capture: Arc<crate::intel_gpu_user::CapturePolicy>,
     /// Proto/create-only intent, inherited by every retained engine context.
     low_latency: bool,
     bannable: bool,
@@ -136,15 +136,22 @@ struct Context {
 impl Context {
     fn new(vm: Arc<Vm>, finalized: bool) -> Self {
         use crate::intel_gpu_engine::Engine;
+        let no_error_capture = Arc::new(crate::intel_gpu_user::CapturePolicy::default());
         Self {
-            user: crate::intel_gpu_user::UserContext::new(),
-            copy: crate::intel_gpu_user::UserContext::for_engine(Engine::Bcs0),
+            user: crate::intel_gpu_user::UserContext::for_i915_engine(
+                Engine::Rcs0,
+                no_error_capture.clone(),
+            ),
+            copy: crate::intel_gpu_user::UserContext::for_i915_engine(
+                Engine::Bcs0,
+                no_error_capture.clone(),
+            ),
             media: BTreeMap::new(),
             sseu_media: None,
             engines: None,
             finalized,
             vm,
-            no_error_capture: false,
+            no_error_capture,
             low_latency: false,
             bannable: true,
             recoverable: false,
@@ -192,7 +199,10 @@ impl Context {
                     if let Some(user) = self.media.get(&engine) {
                         return Ok(user.clone());
                     }
-                    let user = crate::intel_gpu_user::UserContext::for_engine(engine);
+                    let user = crate::intel_gpu_user::UserContext::for_i915_engine(
+                        engine,
+                        self.no_error_capture.clone(),
+                    );
                     if self.low_latency {
                         user.configure_low_latency()?;
                     }
@@ -440,6 +450,23 @@ impl Namespaces {
         let size = u32_at(bytes, 4);
         let param = u64_at(bytes, 8);
         let value = u64_at(bytes, 16);
+        if param == 4 {
+            self.initialize();
+            let context = self.contexts.get_mut(&id).ok_or(FsError::NotFound)?;
+            if set {
+                if size != 0 {
+                    return Err(FsError::InvalidData);
+                }
+                // Source live SET accepts any nonzero value, including after
+                // finalization/claim. Every retained hardware member sees it.
+                context.no_error_capture.set(value);
+            } else {
+                context.finalized = true;
+                put32(bytes, 4, 0);
+                put64(bytes, 16, u64::from(context.no_error_capture.protected()));
+            }
+            return Ok(());
+        }
         if param == abi::CONTEXT_PARAM_LOW_LATENCY {
             self.initialize();
             let context = self.contexts.get_mut(&id).ok_or(FsError::NotFound)?;
@@ -479,8 +506,10 @@ impl Namespaces {
                 map.into_iter()
                     .map(|slot| {
                         slot.map(|placements| {
-                            let user =
-                                crate::intel_gpu_user::UserContext::for_placements(placements)?;
+                            let user = crate::intel_gpu_user::UserContext::for_i915_placements(
+                                placements,
+                                context.no_error_capture.clone(),
+                            )?;
                             if context.low_latency {
                                 user.configure_low_latency()?;
                             }
@@ -503,9 +532,8 @@ impl Namespaces {
         }
         match (param, set) {
             (3, false) => put64(bytes, 16, 1 << 48),
-            (4 | 5 | 8 | 11, _) => {
+            (5 | 8 | 11, _) => {
                 let target = match param {
-                    4 => &mut context.no_error_capture,
                     5 => &mut context.bannable,
                     8 => &mut context.recoverable,
                     _ => &mut context.persistence,
@@ -1619,8 +1647,28 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
         ),
         33 => i32::try_from(observed_topology(info)?.dss_count()).map_err(|_| FsError::NoDevice)?,
         34 => i32::try_from(observed_topology(info)?.eu_count()).map_err(|_| FsError::NoDevice)?,
+        // Linux i915_getparam.c: full automatic reset is level1, not a
+        // bitmask. A retained physical worker must qualify this exact epoch.
+        35 => i32::from(info.user_status().is_some_and(|status| {
+            info.platform.guc().is_some()
+                && status.submission_version.0 == 1
+                && status.engines.iter().next().is_some()
+                && info
+                    .backend
+                    .as_ref()
+                    .and_then(|backend| backend.reset_availability_epoch())
+                    == Some(status.epoch)
+        })),
         40 => 4, // MMAP_OFFSET
         43 => i32::from(info.object_async_ready()),
+        // Bounded NARF capability: Linux advertises this unconditionally.
+        // Cached callbacks only; raw capture still needs its independent owner.
+        45 => i32::from(
+            info.platform.guc().is_some()
+                && info.user_status().is_some_and(|status| {
+                    status.submission_version.0 == 1 && status.engines.bits() != 0
+                }),
+        ),
         // i915_getparam.c writes value=-EINVAL (not an ioctl error) when
         // GuC submission is unavailable, then uses the common put_user path.
         59 => {
@@ -1670,10 +1718,9 @@ fn getparam(info: &DeviceInfo, param: u32) -> Result<i32, FsError> {
         | 20..=21
         | 23..=24
         | 27..=29
-        | 35..=36
+        | 36
         | 38..=39
         | 42
-        | 45
         | 52
         | 54
         | 56..=58 => 0,
@@ -2511,6 +2558,7 @@ pub(crate) mod tests {
                 .get(&1)
                 .expect("context")
                 .no_error_capture
+                .protected()
             {
                 return Err("context creation extension ignored");
             }

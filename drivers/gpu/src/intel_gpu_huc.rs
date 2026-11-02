@@ -20,10 +20,19 @@ const LAST: u16 = 0x7eff; // log sideband starts at7f00; SLPC at8000
 const STATUS: u64 = 0xc1dc;
 
 pub(crate) fn opted_in(args: narf_boot::args::KernelCmdline<'_>) -> bool {
-    let mut values = args
-        .tokens()
-        .filter_map(|s| s.strip_prefix("narf.intel.huc="));
-    values.next() == Some("1") && values.next().is_none() && !args.has_flag("narf.intel.huc")
+    let mut enabled = false;
+    for token in args.tokens().take_while(|token| *token != "--") {
+        if token == "narf.intel.huc" {
+            return false;
+        }
+        if let Some(value) = token.strip_prefix("narf.intel.huc=") {
+            if enabled || value != "1" {
+                return false;
+            }
+            enabled = true;
+        }
+    }
+    enabled
 }
 
 #[derive(Debug)]

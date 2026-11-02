@@ -7,22 +7,22 @@ use crate::intel_gpu_slpc::{FrequencyRange, SlpcError, SlpcState};
 use core::cell::Cell;
 use narf_filesystem::{sysfs::Kobject, FsError};
 
-struct Registers {
-    armed: bool,
-    held: bool,
-    busy: bool,
-    selector: u32,
+pub(super) struct Registers {
+    pub(super) armed: bool,
+    pub(super) held: bool,
+    pub(super) busy: bool,
+    pub(super) selector: u32,
     host: u32,
     clos: u32,
     actual: u32,
     rp: u32,
     request: u32,
-    flush: bool,
-    finish_flush: bool,
-    follow_manual: bool,
-    reject: Option<u64>,
-    absent: Option<u64>,
-    flushes: usize,
+    pub(super) flush: bool,
+    pub(super) finish_flush: bool,
+    pub(super) follow_manual: bool,
+    pub(super) reject: Option<u64>,
+    pub(super) absent: Option<u64>,
+    pub(super) flushes: usize,
     accesses: Vec<(bool, u64, u32)>,
 }
 impl Default for Registers {
@@ -48,9 +48,9 @@ impl Default for Registers {
     }
 }
 #[derive(Clone)]
-struct Io {
-    inner: Window,
-    regs: Rc<RefCell<Registers>>,
+pub(super) struct Io {
+    pub(super) inner: Window,
+    pub(super) regs: Rc<RefCell<Registers>>,
 }
 impl MmioWindow for Io {
     fn read32(&self, reg: u64) -> u32 {
@@ -153,16 +153,23 @@ impl MmioWindow for Io {
         self.inner.write32(reg, value);
     }
 }
-struct Rig {
-    io: Io,
-    arena: Arena,
-    gt: GuCGt<Io, Arena>,
-    registered: BTreeMap<u32, u32>,
-    now: u64,
-    epoch: u64,
+pub(super) struct Rig {
+    pub(super) io: Io,
+    pub(super) arena: Arena,
+    pub(super) gt: GuCGt<Io, Arena>,
+    pub(super) registered: BTreeMap<u32, u32>,
+    pub(super) now: u64,
+    pub(super) epoch: u64,
 }
 impl Rig {
     fn new(release: u32, mode: u32) -> Self {
+        Self::with_before_stage(release, mode, |_, _| {})
+    }
+    pub(super) fn with_before_stage(
+        release: u32,
+        mode: u32,
+        before_stage: impl FnOnce(&Io, &Arena),
+    ) -> Self {
         let (inner, arena) = model();
         inner.0.borrow_mut().regs.extend([
             (0xdfc, 0),
@@ -185,6 +192,7 @@ impl Rig {
             inner,
             regs: Rc::new(RefCell::new(Registers::default())),
         };
+        before_stage(&io, &arena);
         let boot = GuCBoot::stage_image(
             io.clone(),
             arena.clone(),
@@ -231,7 +239,7 @@ impl Rig {
             epoch,
         }
     }
-    fn tick(&mut self) {
+    pub(super) fn tick(&mut self) {
         service_contexts(&self.io.inner, &mut self.registered, true);
         assert_eq!(
             self.gt.poll_with_access(self.now, || true),
@@ -239,7 +247,7 @@ impl Rig {
         );
         self.now += 10000;
     }
-    fn prepare(&mut self) {
+    pub(super) fn prepare(&mut self) {
         for _ in 0..64 {
             let done = self.gt.prepare_mert(self.now, || true).unwrap();
             self.tick();
@@ -249,9 +257,14 @@ impl Rig {
         }
         panic!("bounded MERT sanitize did not finish");
     }
-    fn reset_to_mert(&mut self) {
-        self.now = self.now.max(2_000_000_000).saturating_add(1_000_000_000);
-        self.gt.begin_stop(self.now).unwrap();
+    pub(super) fn reset_to_mert(&mut self) {
+        if !matches!(
+            self.gt.state(),
+            GtState::Stopping | GtState::ResettingEngines
+        ) {
+            self.now = self.now.max(2_000_000_000).saturating_add(1_000_000_000);
+            self.gt.begin_stop(self.now).unwrap();
+        }
         for offset in 1..=8 {
             if offset > 1 || self.gt.state() == GtState::ResettingEngines {
                 reset_done(&self.io.inner);
@@ -268,8 +281,16 @@ impl Rig {
         }
         panic!("execution reset did not reach postreset handoff");
     }
-    fn stop(mut self) {
-        self.reset_to_mert();
+    pub(super) fn stop(mut self) {
+        if !matches!(
+            self.gt.state(),
+            GtState::StoppingMert
+                | GtState::ReleasingRender
+                | GtState::Releasing
+                | GtState::Stopped
+        ) {
+            self.reset_to_mert();
+        }
         for _ in 0..32 {
             match self.gt.state() {
                 GtState::ReleasingRender => {

@@ -10,7 +10,7 @@ use crate::{
     intel_gpu_rcs::GpuBacking,
 };
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::{future::Future, pin::Pin};
 use narf_filesystem::{FsError, FsFuture, InstallFdError, IoctlContext};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
@@ -50,8 +50,21 @@ pub struct DeviceFacts {
     pub reference_clock: u32,
 }
 
+/// Trusted metadata-only smallbar publication transaction. Faultable output
+/// has already completed without any owner/namespace/GEM lock. The callback
+/// calls `current` immediately before identity-safe VM/handle commit. The owner
+/// retains PM/reset exclusion across the metadata call; no user callback,
+/// Vm.state acquisition, await or executor bridge is permitted here.
+pub type VramPublish<'a> =
+    Box<dyn FnOnce(&mut dyn FnMut() -> Result<(), FsError>) -> Result<(), FsError> + Send + 'a>;
+
 pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn status(&self) -> Option<UserStatus>;
+    /// Cached physical automatic global-reset availability for this live user
+    /// epoch. Default refusal; discovery alone is not a recovery owner. No I/O.
+    fn reset_availability_epoch(&self) -> Option<u64> {
+        None
+    }
     /// Actual HuC release under the retained reset/D0/wake/auth owner. This
     /// passive query cannot start or authenticate firmware; default refusal.
     fn huc_version(&self) -> FsFuture<'_, (u8, u8, u8)> {
@@ -86,6 +99,19 @@ pub trait UserBackend: core::fmt::Debug + Send + Sync {
         _object: Arc<crate::intel_gpu_gem::GemObject>,
         _epoch: u64,
     ) -> FsFuture<'_, Arc<CompletionFence>> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+    /// Revalidate terminal initialization and current whole-DPA ownership at
+    /// actual handle publication. Only opted-in smallbar callers use this;
+    /// unsupported backends cannot publish by returning a cached epoch.
+    fn publish_vram<'a>(
+        &'a self,
+        _epoch: u64,
+        _pool: Arc<crate::intel_gpu_vram::Vram>,
+        _object: Arc<crate::intel_gpu_gem::GemObject>,
+        _fence: Arc<CompletionFence>,
+        _publish: VramPublish<'a>,
+    ) -> FsFuture<'a, ()> {
         Box::pin(async { Err(FsError::Unsupported) })
     }
     /// Submit a trusted retained copy under this card's current GT/PM owner.
@@ -219,6 +245,19 @@ struct ParallelPlacements {
     lanes: Vec<crate::intel_gpu_engine::EngineSet>,
 }
 
+/// One live compatibility policy shared by all hardware members of a logical
+/// i915 context. Jobs retain it after the namespace name is destroyed.
+#[derive(Debug, Default)]
+pub(crate) struct CapturePolicy(AtomicBool);
+impl CapturePolicy {
+    pub(crate) fn set(&self, value: u64) {
+        self.0.store(value != 0, Ordering::Release);
+    }
+    pub(crate) fn protected(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Debug)]
 pub struct UserContext {
     /// Orders callers while allowing GT/timer tasks to run during waits.
@@ -226,6 +265,7 @@ pub struct UserContext {
     engine: crate::intel_gpu_engine::Engine,
     placements: crate::intel_gpu_engine::EngineSet,
     parallel: Option<ParallelPlacements>,
+    capture_policy: Option<Arc<CapturePolicy>>,
     state: IrqSafeSpinLock<State>,
 }
 
@@ -240,6 +280,19 @@ impl UserContext {
             engine,
             crate::intel_gpu_engine::EngineSet::of(&[engine]),
             None,
+            None,
+        )
+    }
+
+    pub(crate) fn for_i915_engine(
+        engine: crate::intel_gpu_engine::Engine,
+        policy: Arc<CapturePolicy>,
+    ) -> Arc<Self> {
+        Self::with_placements(
+            engine,
+            crate::intel_gpu_engine::EngineSet::of(&[engine]),
+            None,
+            Some(policy),
         )
     }
 
@@ -248,6 +301,20 @@ impl UserContext {
     pub(crate) fn for_placements(
         placements: crate::intel_gpu_engine::EngineSet,
     ) -> Result<Arc<Self>, FsError> {
+        Self::placements_with_policy(placements, None)
+    }
+
+    pub(crate) fn for_i915_placements(
+        placements: crate::intel_gpu_engine::EngineSet,
+        policy: Arc<CapturePolicy>,
+    ) -> Result<Arc<Self>, FsError> {
+        Self::placements_with_policy(placements, Some(policy))
+    }
+
+    fn placements_with_policy(
+        placements: crate::intel_gpu_engine::EngineSet,
+        capture_policy: Option<Arc<CapturePolicy>>,
+    ) -> Result<Arc<Self>, FsError> {
         let engine = placements.iter().next().ok_or(FsError::InvalidData)?;
         if placements
             .iter()
@@ -255,7 +322,12 @@ impl UserContext {
         {
             return Err(FsError::InvalidData);
         }
-        Ok(Self::with_placements(engine, placements, None))
+        Ok(Self::with_placements(
+            engine,
+            placements,
+            None,
+            capture_policy,
+        ))
     }
 
     pub(crate) fn for_parallel(
@@ -293,6 +365,7 @@ impl UserContext {
                 engines: owned,
                 lanes,
             }),
+            None,
         ))
     }
 
@@ -300,12 +373,14 @@ impl UserContext {
         engine: crate::intel_gpu_engine::Engine,
         placements: crate::intel_gpu_engine::EngineSet,
         parallel: Option<ParallelPlacements>,
+        capture_policy: Option<Arc<CapturePolicy>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             serial: Mutex::new(()),
             engine,
             placements,
             parallel,
+            capture_policy,
             state: IrqSafeSpinLock::new(State {
                 epoch: 0,
                 busy: false,
@@ -501,6 +576,12 @@ pub(crate) struct UserJob {
     epoch: u64,
 }
 impl UserJob {
+    pub(crate) fn diagnostic_protected(&self) -> bool {
+        self.context
+            .capture_policy
+            .as_ref()
+            .is_some_and(|policy| policy.protected())
+    }
     pub(crate) fn policy(&self) -> (u32, u32, bool) {
         let state = self.context.state.lock();
         (state.policy.0, state.policy.1, state.low_latency)

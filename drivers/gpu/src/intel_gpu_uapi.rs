@@ -75,6 +75,8 @@ pub const OBJECT_PINNED: u64 = 1 << 4;
 pub const OBJECT_PAD_TO_SIZE: u64 = 1 << 5;
 /// Skip only this object's prior implicit GPU dependencies; retain CPU fencing.
 pub const OBJECT_ASYNC: u64 = 1 << 6;
+/// Retain this BO range for bounded error-state payload capture.
+pub const OBJECT_CAPTURE: u64 = 1 << 7;
 
 /// Exact wire encodings accepted alongside Xe on a production GuC card.
 /// Number-only routing is ambiguous (for example GETPARAM/QUEUE_CREATE).

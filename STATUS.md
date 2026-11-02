@@ -1792,6 +1792,39 @@ because no aarch64-specific production behavior changes. The ledger contains
 Mesa/codec and actual RuntimeOwner/PCI/S3 acceptance remain unrun. Small-BAR
 GPU-only allocation and OA are separate isolated work.
 
+The following v0.36 Intel batch adds three bounded features: default-off exact
+BMG20.01/20.02 headless small-BAR GPU-only storage; selected retained i915 WB/
+import capture payload with live per-context NO_ERROR_CAPTURE protection; and
+cached automatic whole-GT reset availability level1 only with a distinct current
+worker/every-engine qualification witness. Hidden backing has no CPU alias;
+actual GPU zero, retained preterminal quota and off-lock copyout/current-owner
+exact-VM publication precede handles. Opted-in PM initially refuses and ordinary
+GT reset never repeats destructive FLR. Capture suppresses the entire new raw
+bundle before reads when any retained i915 policy protects it, preserving normal
+state saves and terminal ownership. Reset discovery adds no level2/3, manual
+reset or replay. The ledger has 62 previously validated rows plus three pending
+rows (65 total), with all ten broad workstreams open.
+
+Thirty new fixtures are registered: fifteen small-BAR (including three physical
+path fixtures), nine capture/protection and six reset-availability cases.
+Expected totals are 1,908 selected native tests: 1,238 Intel/DRM/fb/backlight
+plus all 670 shared filesystem/graphics/AMD fixtures, with 152 cumulative new
+names. These counts describe the registered test plan; new debug/release native
+execution, production/btrfs and cross-target gates remain pending. Source review
+and isolated preflight do not constitute native feature acceptance.
+
+The BO fixtures drive actual raw Xe/GT/CT/LRC/PPGTT, cache/MERT, copy, terminal
+and reset ownership; their publication transport substitutes for the physical
+RuntimeOwner PM/reset mutex. Three physical-path fixtures exercise actual
+retained capability/PCI/BAR AuthorizedWindow, driver-FLR/media conversation and
+cache-to-first-PTE code using owned fake config/MMIO RAM. Capture fixtures use
+actual raw i915 selection, retained job payload, live policy and descriptor
+capability paths. Reset fixtures exercise the common recovery coordinator with
+real GT execution models. These are not positive full RuntimeOwner/firmware
+registry/physical PCI power callbacks or S3 executions. Physical Intel, Mesa,
+codec and performance acceptance remain unrun. No silicon or full physical
+owner result is claimed; OA and all ten broad workstreams remain open.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

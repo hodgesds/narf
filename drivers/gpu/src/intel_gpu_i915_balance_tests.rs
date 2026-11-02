@@ -923,3 +923,7 @@ mod object_async {
 mod low_latency {
     include!("intel_gpu_i915_low_latency_tests.rs");
 }
+
+mod capture {
+    include!("intel_gpu_i915_capture_tests.rs");
+}

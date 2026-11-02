@@ -1243,6 +1243,14 @@ mod tests {
     }
     #[derive(Default)]
     struct Device {
+        // Opt-in independent whole-device model. Old fixture behavior is
+        // unchanged unless a smallbar test explicitly enables these semantics.
+        smallbar: bool,
+        smallbar_flrs: usize,
+        smallbar_guc_retired: bool,
+        smallbar_engines_retired: bool,
+        smallbar_reject: Option<u64>,
+        smallbar_hold_flr: bool,
         slpc_dcc: Vec<(u32, u32)>,
         profile: Option<GtPlatform>,
         regs: BTreeMap<u64, u32>,
@@ -1302,6 +1310,9 @@ mod tests {
         fn write32(&self, offset: u64, value: u32) {
             let mut device = self.0.borrow_mut();
             device.writes.push((offset, value));
+            if device.smallbar && device.smallbar_reject == Some(offset) {
+                return;
+            }
             let media = [
                 0x1c0000u64,
                 0x1c4000,
@@ -1319,6 +1330,48 @@ mod tests {
             .into_iter()
             .find(|base| offset == base + 0x9c || offset == base + 0x29c || offset == base + 0xc4);
             let actual = match offset {
+                0x101018 if device.smallbar => *device.regs.get(&offset).unwrap_or(&0) & !value,
+                0x101010 if device.smallbar && value & 0x80000000 != 0 => {
+                    assert_eq!(device.allocations, 0, "destructive FLR after arena DMA");
+                    assert_eq!(device.regs[&0x101018] & 0x80000000, 0, "stale ACK");
+                    device.smallbar_flrs += 1;
+                    device.smallbar_guc_retired = false;
+                    device.smallbar_engines_retired = false;
+                    device.regs.extend([
+                        (0xa188, 2),
+                        (0xa278, 2),
+                        (0xdfc, 0),
+                        (0xd84, 0),
+                        (0x38a188, 0),
+                        (0x380dfc, 0),
+                        (0x38941c, 0),
+                        (0x38c000, 1),
+                        (0x38c314, 0),
+                    ]);
+                    for reg in (0x4800..0x4880).step_by(4) {
+                        device.regs.insert(reg, 0);
+                    }
+                    if device.smallbar_hold_flr {
+                        value
+                    } else {
+                        device.regs.insert(0x101018, 0x80000000);
+                        value & !0x80000000
+                    }
+                }
+                0x38941c if device.smallbar => {
+                    assert_eq!(device.smallbar_flrs, 1);
+                    assert_eq!(device.regs[&0x38a188] & 1, 1);
+                    assert_eq!(device.regs[&0x380dfc] & 1, 1);
+                    match value {
+                        8 => device.smallbar_guc_retired = true,
+                        1 => {
+                            assert!(device.smallbar_guc_retired);
+                            device.smallbar_engines_retired = true;
+                        }
+                        _ => panic!("unqualified media reset"),
+                    }
+                    0
+                }
                 _ if device.profile.is_some_and(GtPlatform::is_gen12) && media.is_some() => {
                     let base = media.unwrap_or_default();
                     let old = *device.regs.get(&offset).unwrap_or(&0);
@@ -1390,6 +1443,9 @@ mod tests {
                 _ => value,
             };
             device.regs.insert(offset, actual);
+            if device.smallbar && offset == 0x38a188 {
+                device.regs.insert(0x380dfc, actual & 1);
+            }
         }
     }
     struct Backing {
@@ -1429,6 +1485,15 @@ mod tests {
         type Backing = Backing;
         fn alloc(&mut self, pages: u32) -> Result<Backing, SubmitError> {
             let mut device = self.0.borrow_mut();
+            if device.smallbar {
+                assert_eq!(device.smallbar_flrs, 1, "first PTE before fresh FLR");
+                assert!(
+                    device.smallbar_guc_retired && device.smallbar_engines_retired,
+                    "first PTE before independent media retirement"
+                );
+                assert_eq!(device.regs[&0x38a188] & 1, 1);
+                assert_eq!(device.regs[&0x380dfc] & 1, 1);
+            }
             device.allocations += 1;
             if device.fail_at == Some(device.allocations) {
                 return Err(SubmitError::OutOfMemory);

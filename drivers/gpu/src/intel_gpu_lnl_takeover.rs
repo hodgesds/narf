@@ -83,10 +83,31 @@ impl DriverFlr {
         bar: narf_bus::bar::MmioRegion,
         now: u64,
     ) -> Result<Self, Error> {
+        Self::new_profile(device, bar, now, false)
+    }
+    pub(crate) fn new_bmg(
+        device: narf_bus::BusDevice,
+        bar: narf_bus::bar::MmioRegion,
+        now: u64,
+    ) -> Result<Self, Error> {
+        Self::new_profile(device, bar, now, true)
+    }
+    fn new_profile(
+        device: narf_bus::BusDevice,
+        bar: narf_bus::bar::MmioRegion,
+        now: u64,
+        bmg: bool,
+    ) -> Result<Self, Error> {
         if device.id.vendor != 0x8086
             || !matches!(device.addr, narf_bus::BusAddr::Pcie(_))
             || !crate::intel_gpu_gt::GtPlatform::from_pci(device.id.vendor, device.id.device)
-                .is_some_and(|p| p.is_headless_integrated())
+                .is_some_and(|p| {
+                    if bmg {
+                        p == crate::intel_gpu_gt::GtPlatform::Battlemage
+                    } else {
+                        p.is_headless_integrated()
+                    }
+                })
             || bar.phys.raw() == 0
             || bar.phys.raw() & 4095 != 0
             || bar.len < 16 * 1024 * 1024
@@ -209,7 +230,7 @@ impl MediaProof {
         // Wa22019338487: media20.00 all steps; media30.00 A0 only.
         // The immutable GMD was captured under the retained media wake.
         let version = (self.gmd >> 22) * 100 + ((self.gmd >> 14) & 255);
-        if version == 3000 && self.gmd & 63 >= 4 {
+        if version == 1301 || version == 3000 && self.gmd & 63 >= 4 {
             return Ok(());
         }
         let next = count.get() + 1;
@@ -235,6 +256,11 @@ impl MediaQuiesce {
     pub(crate) fn for_platform(platform: crate::intel_gpu_gt::GtPlatform) -> Self {
         let mut state = Self::new();
         state.expected = if platform.is_ptl() { 3000 } else { 2000 };
+        state
+    }
+    pub(crate) fn for_bmg() -> Self {
+        let mut state = Self::new();
+        state.expected = 1301;
         state
     }
     pub(crate) fn new() -> Self {
@@ -359,6 +385,8 @@ fn post_flr_display(m: &impl MmioWindow, device: u16) -> Result<Option<u32>, Err
         3000
     } else if platform.is_lnl() {
         2000
+    } else if platform == crate::intel_gpu_gt::GtPlatform::Battlemage {
+        1401
     } else {
         return Err(Error::Unsupported);
     };
@@ -386,7 +414,12 @@ fn post_flr_display(m: &impl MmioWindow, device: u16) -> Result<Option<u32>, Err
     if read(m, 0x70008)? & 0xc0000000 != 0 {
         return Err(Error::Busy);
     }
-    for id in 0..4 {
+    let fbc_count = if platform == crate::intel_gpu_gt::GtPlatform::Battlemage {
+        2
+    } else {
+        4
+    };
+    for id in 0..fbc_count {
         if read(m, 0x43208 + id * 0x40)? & 0x80000000 != 0 {
             return Err(Error::Busy);
         }

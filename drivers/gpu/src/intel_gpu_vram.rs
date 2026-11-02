@@ -12,7 +12,7 @@
 //! CCS metadata cannot affect any admitted access. DG2 requires 64 KiB
 //! allocations/PTE groups and fresh flat-CCS initialization on every reuse.
 
-use crate::amdgpu_vram::{Pool, Reservation};
+use crate::amdgpu_vram::{Pool, Reservation, UnmappedPool, UnmappedReservation};
 use alloc::sync::Arc;
 use core::ops::Range;
 use narf_bus::MmioRegion;
@@ -147,11 +147,15 @@ pub fn record_boot_framebuffer(fb: narf_graphics_driver::generic::GenericFb) {
     }
 }
 
-/// One card's local memory. Allocations come only from the CPU-visible,
-/// unreserved prefix. Reservations require owned initialization before use.
+/// One card's local memory. The ordinary pool owns only the CPU-visible
+/// prefix; an explicit fresh BMG receipt may add a disjoint unmapped pool.
+/// Reservations require owned initialization before use.
 #[derive(Debug)]
 pub struct Vram {
     pool: Pool,
+    unmapped: Option<UnmappedPool>,
+    grant: Option<Arc<crate::intel_gpu_gt::smallbar::DpaGrant>>,
+    allocation_gate: IrqSafeSpinLock<()>,
     pub layout: VramLayout,
     /// LMEM BAR physical base: device address `d` is CPU address `bar + d`
     /// (xe_vram.c dpa_base 0, io_start + tile offset).
@@ -213,10 +217,79 @@ impl Vram {
             .map_err(|_| VramError::Mapping)?;
         Ok(Arc::new(Self {
             pool,
+            unmapped: None,
+            grant: None,
+            allocation_gate: IrqSafeSpinLock::new(()),
             layout,
             bar: bar.phys.raw(),
             page_size,
         }))
+    }
+
+    /// # Safety
+    /// The derived receipt owns this exact PF's whole ordinary usable DPA
+    /// incarnation, permanently excluding inherited and future boot/CSC actors.
+    pub(crate) unsafe fn new_smallbar(
+        bar: MmioRegion,
+        layout: VramLayout,
+        grant: Arc<crate::intel_gpu_gt::smallbar::DpaGrant>,
+    ) -> Result<Arc<Self>, VramError> {
+        if !grant.matches(bar, layout) || layout.tile_offset != 0 || bar.len >= layout.usable {
+            return Err(VramError::Layout);
+        }
+        // SAFETY: the same receipt includes the existing CPU-visible prefix.
+        let mut vram = unsafe { Self::new_inner(bar, layout, 4096)? };
+        let inner = Arc::get_mut(&mut vram).ok_or(VramError::Mapping)?;
+        let base = inner.pool.size();
+        // SAFETY: this disjoint tail lies strictly before the source CCS/DSM
+        // boundary. No CPU address or MmioRegion is created for it.
+        inner.unmapped = Some(
+            unsafe { UnmappedPool::from_owned(base, layout.usable - base, &[]) }
+                .map_err(|_| VramError::Mapping)?,
+        );
+        inner.grant = Some(grant);
+        Ok(vram)
+    }
+    pub(crate) fn smallbar_enabled(&self) -> bool {
+        self.grant.is_some()
+    }
+    pub(crate) fn matches_smallbar(&self, grant: &crate::intel_gpu_gt::smallbar::DpaGrant) -> bool {
+        self.grant.as_ref().is_some_and(|old| old.same_owner(grant))
+    }
+    pub(crate) fn smallbar_access(
+        &self,
+        m: &impl crate::intel_gpu_aux::MmioWindow,
+    ) -> Result<(), crate::intel_gpu_gt::lnl::Error> {
+        self.grant
+            .as_ref()
+            .ok_or(crate::intel_gpu_gt::lnl::Error::Unsupported)?
+            .current(m)
+    }
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn smallbar_current(&self, m: &impl crate::intel_gpu_aux::MmioWindow) -> bool {
+        self.smallbar_access(m).is_ok()
+    }
+    pub fn usage(&self) -> (u64, u64) {
+        let _gate = self.allocation_gate.lock();
+        let visible = self.pool.size() - self.pool.available();
+        let hidden = self
+            .unmapped
+            .as_ref()
+            .map_or(0, |pool| pool.size() - pool.available());
+        (visible + hidden, visible)
+    }
+
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn fixture_reserve_unmapped(
+        &self,
+        size: u64,
+    ) -> Result<UnmappedReservation, FsError> {
+        let _gate = self.allocation_gate.lock();
+        self.unmapped
+            .as_ref()
+            .ok_or(FsError::Unsupported)?
+            .reserve_aligned(size, self.page_size)
+            .map_err(|_| FsError::OutOfMemory)
     }
 
     pub fn page_size(&self) -> u64 {
@@ -233,7 +306,7 @@ impl Vram {
         self.pool.size()
     }
     pub fn used(&self) -> u64 {
-        self.pool.size() - self.pool.available()
+        self.usage().0
     }
 
     /// Reserve `size` bytes without accessing the BAR. The returned device
@@ -242,10 +315,33 @@ impl Vram {
         if size == 0 || size % self.page_size != 0 {
             return Err(FsError::InvalidData);
         }
-        let reservation = self
-            .pool
-            .reserve_aligned(size, self.page_size)
-            .map_err(|_| FsError::OutOfMemory)?;
+        self.allocate_class(size, true)
+    }
+    pub(crate) fn allocate_class(
+        self: &Arc<Self>,
+        size: u64,
+        visible: bool,
+    ) -> Result<VramAllocation, FsError> {
+        if size == 0 || size % self.page_size != 0 {
+            return Err(FsError::InvalidData);
+        }
+        let _gate = self.allocation_gate.lock();
+        let reservation = if !visible && size <= 128 * 1024 * 1024 {
+            self.unmapped
+                .as_ref()
+                .and_then(|pool| pool.reserve_aligned(size, self.page_size).ok())
+                .map(LocalRange::Unmapped)
+        } else {
+            None
+        };
+        let reservation = match reservation {
+            Some(range) => range,
+            None => LocalRange::Visible(
+                self.pool
+                    .reserve_aligned(size, self.page_size)
+                    .map_err(|_| FsError::OutOfMemory)?,
+            ),
+        };
         Ok(VramAllocation {
             reservation: Some(reservation),
             vram: self.clone(),
@@ -257,11 +353,23 @@ impl Vram {
 /// CPU mapping still references it (they all retain the owning GEM object).
 #[derive(Debug)]
 pub struct VramAllocation {
-    reservation: Option<Reservation>,
+    reservation: Option<LocalRange>,
     vram: Arc<Vram>,
 }
 
+#[derive(Debug)]
+enum LocalRange {
+    Visible(Reservation),
+    Unmapped(UnmappedReservation),
+}
+
 impl VramAllocation {
+    pub(crate) fn smallbar_access(
+        &self,
+        m: &impl crate::intel_gpu_aux::MmioWindow,
+    ) -> Result<(), crate::intel_gpu_gt::lnl::Error> {
+        self.vram.smallbar_access(m)
+    }
     pub(crate) fn pool_is(&self, pool: &Arc<Vram>) -> bool {
         Arc::ptr_eq(&self.vram, pool)
     }
@@ -271,32 +379,49 @@ impl VramAllocation {
     pub(crate) fn requires_ccs_clear(&self) -> bool {
         self.vram.requires_ccs_clear()
     }
-    fn reservation(&self) -> &Reservation {
+    fn reservation(&self) -> &LocalRange {
         self.reservation.as_ref().expect("live VRAM reservation")
     }
     /// Device physical address for PPGTT device-memory PTEs.
     pub fn device_address(&self) -> u64 {
-        self.reservation().address()
+        match self.reservation() {
+            LocalRange::Visible(r) => r.address(),
+            LocalRange::Unmapped(r) => r.address(),
+        }
     }
     pub fn size(&self) -> u64 {
-        self.reservation().size()
+        match self.reservation() {
+            LocalRange::Visible(r) => r.size(),
+            LocalRange::Unmapped(r) => r.size(),
+        }
     }
     /// CPU physical address through the LMEM BAR.
-    pub fn cpu_address(&self) -> u64 {
-        self.vram.bar + self.device_address()
+    pub fn cpu_address(&self) -> Option<u64> {
+        match self.reservation() {
+            LocalRange::Visible(_) => Some(self.vram.bar + self.device_address()),
+            LocalRange::Unmapped(_) => None,
+        }
     }
     /// Kernel WC alias of the allocation.
-    pub(crate) fn kernel_virt(&self) -> u64 {
-        self.reservation().mapping().virt
+    pub(crate) fn kernel_virt(&self) -> Option<u64> {
+        match self.reservation() {
+            LocalRange::Visible(r) => Some(r.mapping().virt),
+            LocalRange::Unmapped(_) => None,
+        }
     }
 }
 
 impl Drop for VramAllocation {
     fn drop(&mut self) {
+        let _gate = self.vram.allocation_gate.lock();
         let mut reservation = self.reservation.take().expect("live VRAM reservation");
-        // SAFETY: the last GEM owner is gone, so every job, VM snapshot and
-        // CPU mapping that could reach this range has been released.
-        unsafe { reservation.stopped() };
+        if let LocalRange::Visible(range) = &mut reservation {
+            // SAFETY: the last GEM owner is gone; every native retirement or
+            // verified full reset has already released its retaining graph.
+            unsafe { range.stopped() };
+        }
+        // UnmappedReservation likewise stays owned until all GPU reaches retire.
+        drop(reservation);
     }
 }
 

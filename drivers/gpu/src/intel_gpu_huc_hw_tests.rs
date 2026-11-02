@@ -415,11 +415,7 @@ fn smoke_tgl_huc_auth_ack_and_status_are_independent() -> TestResult {
             }
         }
         assert!(failed);
-        assert!(!w
-            .0
-            .borrow()
-            .writes
-            .contains(&(0xc314, 0x02010201)));
+        assert!(!w.0.borrow().writes.contains(&(0xc314, 0x02010201)));
         assert_eq!(arena.live_allocations(), 4);
         stop_gt(&mut gt, &w);
         drop(gt);
@@ -495,11 +491,7 @@ fn smoke_tgl_huc_wopcm_preflight_and_locked_agent() -> TestResult {
             .iter()
             .any(|(r, _)| matches!(r, 0xc050 | 0xc340)));
         if agent == 0 {
-            assert!(!w
-                .0
-                .borrow()
-                .writes
-                .contains(&(0xc314, 0x02010201)));
+            assert!(!w.0.borrow().writes.contains(&(0xc314, 0x02010201)));
         }
         stop_gt(&mut gt, &w);
         drop(gt);
@@ -717,11 +709,7 @@ fn smoke_tgl_huc_shared_dma_stall_cancel_and_stop_retains_graph() -> TestResult 
             .is_pending());
     }
     assert_eq!(arena.live_allocations(), held);
-    assert!(!w
-        .0
-        .borrow()
-        .writes
-        .contains(&(0xc314, 0x00110011)));
+    assert!(!w.0.borrow().writes.contains(&(0xc314, 0x00110011)));
     gt.begin_stop(2_000_000).unwrap();
     // GuC reset/DMA idle is only the first owner phase. Retain through full reset/media ACK.
     reset_done(&w);
@@ -1004,12 +992,22 @@ fn smoke_tgl_huc_disabled_unsupported_and_no_video_refuse() -> TestResult {
         "narf.intel.huc=01",
         "narf.intel.huc=1 narf.intel.huc=1",
         "narf.intel.huc=1 narf.intel.huc",
+        "-- narf.intel.huc=1",
+        "quiet -- narf.intel.huc=1 narf.intel.huc",
+        "narf.intel.huc=0 -- narf.intel.huc=1",
     ] {
         assert!(!huc::opted_in(narf_boot::args::KernelCmdline::new(line)));
     }
     assert!(huc::opted_in(narf_boot::args::KernelCmdline::new(
         "quiet narf.intel.huc=1"
     )));
+
+    for line in [
+        "narf.intel.huc=1 -- narf.intel.huc",
+        "narf.intel.huc=1 -- narf.intel.huc=1 narf.intel.huc=0",
+    ] {
+        assert!(huc::opted_in(narf_boot::args::KernelCmdline::new(line)));
+    }
 
     let last = LAST_AUTH.load(Ordering::Relaxed);
     let (w, arena, mut gt) = model_huc(true);
@@ -1030,11 +1028,7 @@ fn smoke_tgl_huc_disabled_unsupported_and_no_video_refuse() -> TestResult {
     assert_eq!(arena.live_allocations(), 0);
     let (w, arena, mut gt) = hardware_model(huc::PLATFORM, 0x130044);
     hardware_discovery(&mut gt, &w, 0x130044);
-    assert!(!w
-        .0
-        .borrow()
-        .writes
-        .contains(&(0xc314, 0x02010201)));
+    assert!(!w.0.borrow().writes.contains(&(0xc314, 0x02010201)));
     stop_gt(&mut gt, &w);
     drop(gt);
     assert_eq!(arena.live_allocations(), 0);

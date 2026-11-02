@@ -14,6 +14,9 @@ pub(crate) mod ownership;
 #[path = "intel_gpu_lnl_takeover.rs"]
 pub(crate) mod lnl;
 
+#[path = "intel_gpu_bmg_smallbar.rs"]
+pub(crate) mod smallbar;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GraphicsError {
     Unsupported,

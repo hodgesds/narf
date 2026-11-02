@@ -130,8 +130,8 @@ impl UserBackend for Native {
         self.mailbox.submit(context, batch)
     }
 }
-fn setup(
-    gt: &mut GuCGt<Window, Arena>,
+fn setup<M: MmioWindow, A: BootAllocator>(
+    gt: &mut GuCGt<M, A>,
     w: &Window,
     platform: GtPlatform,
 ) -> (Arc<Mailbox>, DeviceInfo) {
@@ -389,8 +389,8 @@ fn finish(
     finish_policy(gt, w, fence, registered, start, 2);
 }
 
-fn finish_policy(
-    gt: &mut GuCGt<Window, Arena>,
+fn finish_policy<M: MmioWindow, A: BootAllocator>(
+    gt: &mut GuCGt<M, A>,
     w: &Window,
     fence: &CompletionFence,
     registered: &mut BTreeMap<u32, u32>,
@@ -1905,4 +1905,8 @@ kernel_test_in!(
 
 mod gen12_media {
     include!("intel_gpu_gen12_media_ioctl_tests.rs");
+}
+
+mod bmg_smallbar {
+    include!("intel_gpu_bmg_smallbar_tests.rs");
 }

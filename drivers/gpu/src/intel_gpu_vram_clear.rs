@@ -11,7 +11,8 @@ use super::*;
 mod model;
 #[cfg(feature = "kernel-test")]
 pub(crate) use model::{
-    execute_fixture, fixture_finish, fixture_metadata, fixture_seed, fixture_state,
+    execute_fixture, fixture_add_window, fixture_copies, fixture_finish, fixture_metadata,
+    fixture_pointer, fixture_seed, fixture_state,
 };
 
 const CODE: u64 = 0x1234_0000_0000;
@@ -85,4 +86,71 @@ pub(crate) fn prepare_vram_clear(object: Arc<GemObject>) -> Result<ResidentBatch
         false,
         None,
     )
+}
+
+/// BMG ordinary PAT2 local data is never interpreted through compressed PATs.
+/// Fresh GPU-only ranges are initialized through the existing source MEM_COPY
+/// codec, from private WB zero storage that can never be mmaped or exported.
+pub(crate) fn prepare_smallbar_clear(object: Arc<GemObject>) -> Result<ResidentBatch, FsError> {
+    object.begin_gpu_vram_clear()?;
+    let size = object.size();
+    if size == 0 || size & 4095 != 0 || size > 128 * 1024 * 1024 {
+        return Err(FsError::InvalidData);
+    }
+    let code = GemObject::private_system(PAGE)?;
+    let zero = GemObject::private_system(copy::COPY_CHUNK)?;
+    let mut words = Vec::new();
+    for offset in (0..size).step_by(copy::COPY_CHUNK as usize) {
+        copy::emit_data_copy(
+            &mut words,
+            GtPlatform::Battlemage,
+            ZERO,
+            TARGET + offset,
+            (size - offset).min(copy::COPY_CHUNK),
+        );
+    }
+    copy::finish(&mut words, false);
+    if words.len() > 1024 {
+        return Err(FsError::InvalidData);
+    }
+    for (index, word) in words.iter().enumerate() {
+        code.write(index as u64 * 4, &word.to_le_bytes())?;
+    }
+    let mut batch = ResidentBatch::from_vm(
+        GtPlatform::Battlemage,
+        &[
+            VmMapping {
+                object: Some(code),
+                va: CODE,
+                offset: 0,
+                length: PAGE,
+                writable: false,
+                pat: 2,
+                dumpable: false,
+            },
+            VmMapping {
+                object: Some(zero),
+                va: ZERO,
+                offset: 0,
+                length: copy::COPY_CHUNK,
+                writable: false,
+                pat: 2,
+                dumpable: false,
+            },
+            VmMapping {
+                object: Some(object),
+                va: TARGET,
+                offset: 0,
+                length: size,
+                writable: true,
+                pat: 2,
+                dumpable: false,
+            },
+        ],
+        Some(CODE),
+        false,
+        None,
+    )?;
+    batch.implicit_sync = true;
+    Ok(batch)
 }

@@ -8,6 +8,9 @@ mod huc_native {
 
 mod userspace {
     include!("intel_gpu_user_tests.rs");
+    mod recovery_native {
+        include!("intel_gpu_gt_recovery_hw_tests.rs");
+    }
 }
 
 // Observation-only MCR bank around the unchanged GuC/GT model. All other
@@ -2270,9 +2273,13 @@ fn execute_copy_ppgtt(root: u64, words: &[u32], lnl: bool) {
             assert_eq!(entry & 1, 1);
             page = entry & 0x0000_3fff_ffff_f000;
             if shift == 12 && entry & (1 << 11) != 0 {
-                let base = FIXTURE_VRAM.load(core::sync::atomic::Ordering::Relaxed);
-                assert_ne!(base, 0, "DM leaf without fixture VRAM");
-                page += base;
+                if let Some(pointer) = crate::intel_gpu_exec::vram_clear::fixture_pointer(page) {
+                    page = pointer;
+                } else {
+                    let base = FIXTURE_VRAM.load(core::sync::atomic::Ordering::Relaxed);
+                    assert_ne!(base, 0, "DM leaf without fixture VRAM");
+                    page += base;
+                }
             }
         }
         page | (va & 4095)
@@ -2441,9 +2448,13 @@ fn execute_ppgtt_probe(
             assert_eq!(entry & 2 != 0, shift != 12 || writable);
             page = entry & 0x0000_3fff_ffff_f000;
             if shift == 12 && entry & (1 << 11) != 0 {
-                let base = FIXTURE_VRAM.load(core::sync::atomic::Ordering::Relaxed);
-                assert_ne!(base, 0, "DM leaf without fixture VRAM");
-                page += base;
+                if let Some(pointer) = crate::intel_gpu_exec::vram_clear::fixture_pointer(page) {
+                    page = pointer;
+                } else {
+                    let base = FIXTURE_VRAM.load(core::sync::atomic::Ordering::Relaxed);
+                    assert_ne!(base, 0, "DM leaf without fixture VRAM");
+                    page += base;
+                }
             }
         }
         page | (va & 4095)
@@ -2893,12 +2904,14 @@ fn smoke_hardware_ppgtt_store_and_retirement() -> TestResult {
                         va: 0x1234_0000_0000,
                         writable: false,
                         asynchronous: false,
+                        capture: false,
                     },
                     ExecObject {
                         object: weak[1].upgrade().unwrap(),
                         va: 0x2345_0000_0000,
                         writable: true,
                         asynchronous: false,
+                        capture: false,
                     },
                 ],
             }
@@ -2980,12 +2993,14 @@ fn smoke_hardware_reservation_cache_failure_releases_before_retry() -> TestResul
                 va: 0x1234_0000_0000,
                 writable: false,
                 asynchronous: false,
+                capture: false,
             },
             ExecObject {
                 object: weak[1].upgrade().unwrap(),
                 va: 0x2345_0000_0000,
                 writable: true,
                 asynchronous: false,
+                capture: false,
             },
         ],
     }

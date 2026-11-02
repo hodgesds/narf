@@ -48,10 +48,68 @@ impl AuthorizedWindow {
             headless: Some(alloc::sync::Arc::new(HeadlessAccess {
                 device,
                 pf: core::sync::atomic::AtomicBool::new(false),
+                local: None,
+                flush: true,
             })),
         };
         let _ = this.read32(0x1901f8);
         this
+    }
+    /// Exact opted-in BMG physical view: same per-access PCI/PF proofs,
+    /// including current BAR2. BMG has neither the four-zero read WA nor the
+    /// integrated63-entry GGTT WA. A missing local lease refuses all access.
+    pub(crate) fn for_bmg_device(
+        bar: narf_bus::MmioRegion,
+        cap: Cap<narf_bus::BusDeviceCap, Write>,
+        device: narf_bus::BusDevice,
+        local: Option<narf_bus::MmioRegion>,
+    ) -> Self {
+        let this = Self {
+            bar,
+            cap,
+            headless: Some(alloc::sync::Arc::new(HeadlessAccess {
+                device,
+                pf: core::sync::atomic::AtomicBool::new(false),
+                local,
+                flush: false,
+            })),
+        };
+        let _ = this.read32(VF_CAP);
+        this
+    }
+    /// Match the retained physical function and both exact mapping leases.
+    /// Register lookalikes cannot turn a receipt for another function/BAR into
+    /// this arena's authority; current raw accesses remain checked separately.
+    pub(crate) fn matches_bmg_source(
+        &self,
+        device: narf_bus::BusDevice,
+        bar: narf_bus::MmioRegion,
+        local: narf_bus::MmioRegion,
+    ) -> bool {
+        let same = |a: narf_bus::MmioRegion, b: narf_bus::MmioRegion| {
+            a.phys == b.phys && a.virt == b.virt && a.len == b.len && a.kind == b.kind
+        };
+        same(self.bar, bar)
+            && self.headless.as_ref().is_some_and(|access| {
+                !access.flush
+                    && access.device.addr == device.addr
+                    && access.device.id == device.id
+                    && matches!((access.device.kind, device.kind),
+                        (narf_bus::BusKind::Pcie { cfg_phys: left, .. },
+                         narf_bus::BusKind::Pcie { cfg_phys: right, .. }) if left == right)
+                    && access.local.is_some_and(|retained| same(retained, local))
+            })
+    }
+    pub(crate) fn current(&self) -> bool {
+        self.headless.as_ref().is_some_and(|access| {
+            self.cap
+                .invoke(Current {
+                    access,
+                    bar: self.bar,
+                })
+                .unwrap_or(false)
+                && access.pf.load(core::sync::atomic::Ordering::Acquire)
+        })
     }
     fn raw(&self, offset: u64, write: Option<u32>, bootstrap: bool) -> Option<u32> {
         let result = self
@@ -97,9 +155,18 @@ fn bootstrap_access(offset: u64, write: Option<u32>) -> bool {
     matches!((offset, write), (DUMMY_MMIO, Some(0)) | (VF_CAP, None))
 }
 
+#[cfg(feature = "kernel-test")]
 fn profile_read(
     offset: u64,
     pf: Option<&core::sync::atomic::AtomicBool>,
+    raw: impl FnMut(u64, Option<u32>, bool) -> Option<u32>,
+) -> u32 {
+    profile_read_ordered(offset, pf, true, raw)
+}
+fn profile_read_ordered(
+    offset: u64,
+    pf: Option<&core::sync::atomic::AtomicBool>,
+    flush: bool,
     mut raw: impl FnMut(u64, Option<u32>, bool) -> Option<u32>,
 ) -> u32 {
     use core::sync::atomic::Ordering::{Acquire, Release};
@@ -108,7 +175,7 @@ fn profile_read(
         return u32::MAX;
     }
     let mut failed = false;
-    let value = ordered_read(offset, pf.is_some(), |r, w| {
+    let value = ordered_read(offset, pf.is_some() && flush, |r, w| {
         let result = raw(r, w, bootstrap);
         failed |= result.is_none();
         result
@@ -185,6 +252,21 @@ fn no_inherited_vfs(mut read: impl FnMut(u16) -> Option<u32>) -> bool {
 struct HeadlessAccess {
     device: narf_bus::BusDevice,
     pf: core::sync::atomic::AtomicBool,
+    local: Option<narf_bus::MmioRegion>,
+    flush: bool,
+}
+struct Current<'a> {
+    access: &'a HeadlessAccess,
+    bar: narf_bus::MmioRegion,
+}
+impl CapOp<narf_bus::BusDeviceCap, Write> for Current<'_> {
+    type Output = bool;
+    fn execute(
+        self,
+        cap: &Cap<narf_bus::BusDeviceCap, Write>,
+    ) -> Result<bool, narf_capabilities::CapError> {
+        Ok(self.access.current(cap, self.bar))
+    }
 }
 impl HeadlessAccess {
     fn current(
@@ -224,6 +306,32 @@ impl HeadlessAccess {
         if u64::from(high) << 32 | u64::from(low & !15) != bar.phys.raw() {
             return false;
         }
+        if !self.flush {
+            if crate::intel_gpu_gt::GtPlatform::from_pci(
+                self.device.id.vendor,
+                self.device.id.device,
+            ) != Some(crate::intel_gpu_gt::GtPlatform::Battlemage)
+            {
+                return false;
+            }
+            let Some(local) = self.local else {
+                return false;
+            };
+            let Some(low) = read(0x18) else {
+                return false;
+            };
+            let Some(high) = read(0x1c) else {
+                return false;
+            };
+            if low & 15 != 12
+                || (u64::from(high) << 32 | u64::from(low & !15)) != local.phys.raw()
+                || local.len == 0
+                || local.len & 4095 != 0
+                || !matches!(local.kind, narf_bus::BarKind::Mmio64 { prefetchable: true })
+            {
+                return false;
+            }
+        }
         no_inherited_vfs(read)
     }
 }
@@ -255,7 +363,10 @@ impl CapOp<narf_bus::BusDeviceCap, Write> for Register<'_> {
                 self.offset,
                 self.write,
             );
-            if !allowed || !access.current(cap, self.bar) {
+            if !allowed
+                || self.bootstrap && !access.flush && self.write.is_some()
+                || !access.current(cap, self.bar)
+            {
                 access
                     .pf
                     .store(false, core::sync::atomic::Ordering::Release);
@@ -279,9 +390,12 @@ impl MmioWindow for AuthorizedWindow {
         if offset & 3 != 0 || offset.checked_add(4).is_none_or(|end| end > self.bar.len) {
             return u32::MAX;
         }
-        profile_read(offset, self.headless.as_ref().map(|h| &h.pf), |r, w, b| {
-            self.raw(r, w, b)
-        })
+        profile_read_ordered(
+            offset,
+            self.headless.as_ref().map(|h| &h.pf),
+            self.headless.as_ref().is_some_and(|h| h.flush),
+            |r, w, b| self.raw(r, w, b),
+        )
     }
     fn write32(&self, offset: u64, value: u32) {
         let _ = self.raw(offset, Some(value), false);

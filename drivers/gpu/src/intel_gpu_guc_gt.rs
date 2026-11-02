@@ -119,6 +119,8 @@ pub struct GuCGt<M: MmioWindow, A: BootAllocator> {
     log_stream: Option<crate::intel_gpu_guc_log::stream::Actor>,
     log_fence: u16,
     mert_required: bool,
+    smallbar_grant: Option<Arc<crate::intel_gpu_gt::smallbar::DpaGrant>>,
+    smallbar_busy_deadline: Option<u64>,
     gen12_reset: Option<crate::intel_gpu_gt::gen12::reset::Reset>,
 }
 
@@ -256,6 +258,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             log_stream: None,
             log_fence: crate::intel_gpu_guc_log::stream::FIRST_FENCE,
             mert_required: false,
+            smallbar_grant: None,
+            smallbar_busy_deadline: None,
             gen12_reset: None,
         }
     }
@@ -348,6 +352,17 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         firmware_digest: [u8; 32],
         mut access: impl FnMut() -> bool,
     ) {
+        // Linux samples NO_ERROR_CAPTURE at error capture. Our bundle shares
+        // global log/CT and other jobs, so skip it completely before any raw
+        // source read when a retained compatibility policy is protected.
+        if self
+            .parts
+            .scheduler
+            .as_ref()
+            .is_some_and(|scheduler| scheduler.diagnostic_protected())
+        {
+            return;
+        }
         let log = self.parts.boot.live_log();
         let identity = log.as_ref().map(|log| crate::intel_gpu_guc_log::Identity {
             epoch: self.user_epoch().unwrap_or(0),
@@ -401,22 +416,82 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         self.vram
     }
 
+    pub(crate) fn smallbar_grant(
+        &mut self,
+        authority: &Arc<crate::intel_gpu_gt::smallbar::Authority>,
+    ) -> Result<Arc<crate::intel_gpu_gt::smallbar::DpaGrant>, GtError> {
+        let epoch = self.user_epoch().ok_or(GtError::State)?;
+        self.vram_access(epoch)?;
+        self.admit_scheduling()?;
+        let grant = authority
+            .derive(self.parts.boot.window(), self.vram.ok_or(GtError::State)?)
+            .map_err(Self::smallbar_access_error)?;
+        self.smallbar_grant = Some(grant.clone());
+        Ok(grant)
+    }
+
     pub(crate) fn vram_needs_ccs_clear(&self) -> bool {
         self.parts.boot.platform() == GtPlatform::Alchemist
     }
 
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn vram_cpu_access(&self, epoch: u64) -> bool {
-        self.state == GtState::SchedulingReady
-            && (!self.mert_required
-                || self
+        self.vram_access(epoch).is_ok()
+    }
+    fn smallbar_access_error(error: crate::intel_gpu_gt::lnl::Error) -> GtError {
+        if error == crate::intel_gpu_gt::lnl::Error::Busy {
+            GtError::Busy
+        } else {
+            GtError::Unavailable
+        }
+    }
+    fn current_region(&self) -> Result<(), GtError> {
+        if let Some(grant) = &self.smallbar_grant {
+            grant
+                .current(self.parts.boot.window())
+                .map_err(Self::smallbar_access_error)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn vram_access(&self, epoch: u64) -> Result<(), GtError> {
+        if self.state != GtState::SchedulingReady
+            || (self.mert_required
+                && !self
                     .parts
                     .mert
                     .as_ref()
                     .is_some_and(|owner| owner.sanitizing()))
-            && self.parts.boot.platform() == GtPlatform::Battlemage
-            && epoch != 0
-            && self.user_epoch() == Some(epoch)
-            && self.awake().is_ok()
+            || self.parts.boot.platform() != GtPlatform::Battlemage
+            || epoch == 0
+            || self.user_epoch() != Some(epoch)
+        {
+            return Err(GtError::State);
+        }
+        self.awake()?;
+        self.current_region()
+    }
+
+    /// Cached qualification identity for the physical recovery coordinator.
+    /// A software-only/bare GuCGt cannot qualify a physical reset service.
+    pub(crate) fn recovery_identity(
+        &self,
+    ) -> Option<(GtPlatform, crate::intel_gpu_engine::EngineSet, u64)> {
+        let platform = self.parts.boot.platform();
+        if platform.guc().is_none()
+            || !self.hardware.as_ref().is_some_and(HardwareInit::ready)
+            || !self.context_defaults_ready()
+            || self.user_epoch().is_none_or(|epoch| epoch == 0)
+            || self.submission_version().0 != 1
+        {
+            return None;
+        }
+        let engines = self
+            .engines()
+            .filter(|engines| engines.iter().next().is_some())?;
+        let incarnation = self
+            .log_incarnation()
+            .filter(|incarnation| *incarnation != 0)?;
+        Some((platform, engines, incarnation))
     }
 
     /// Cached identity of this exact live firmware log upload; no MMIO.
@@ -643,15 +718,31 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         object: Arc<crate::intel_gpu_gem::GemObject>,
         epoch: u64,
     ) -> Result<Arc<crate::intel_gpu_fence::CompletionFence>, GtError> {
-        if self.parts.boot.platform() != GtPlatform::Alchemist
-            || epoch == 0
+        let gpu_only = object.is_gpu_only();
+        if gpu_only {
+            self.vram_access(epoch)?;
+            object
+                .gpu_only_access(self.parts.boot.window())
+                .map_err(Self::smallbar_access_error)?;
+        }
+        if epoch == 0
             || self.user_epoch() != Some(epoch)
+            || if gpu_only {
+                self.parts.boot.platform() != GtPlatform::Battlemage
+                    || self.user_epoch() != Some(epoch)
+            } else {
+                self.parts.boot.platform() != GtPlatform::Alchemist
+            }
         {
             return Err(GtError::State);
         }
         self.admit_scheduling()?;
-        let batch = crate::intel_gpu_exec::prepare_vram_clear(object)
-            .map_err(|error| GtError::Scheduling(SchedulingError::Residency(error)))?;
+        let batch = if gpu_only {
+            crate::intel_gpu_exec::prepare_smallbar_clear(object)
+        } else {
+            crate::intel_gpu_exec::prepare_vram_clear(object)
+        }
+        .map_err(|error| GtError::Scheduling(SchedulingError::Residency(error)))?;
         // SAFETY: factory retains all private mappings and zero source, emits
         // only source-qualified BCS0 CCS clear/flush, and excludes user writes.
         let (_, fence) = unsafe {
@@ -682,6 +773,12 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             .map_err(|error| GtError::Scheduling(SchedulingError::Residency(error)))?;
         if request.uses_vram() && pool.is_none_or(|pool| self.vram_layout() != Some(pool.layout)) {
             return Err(GtError::Unavailable);
+        }
+        if request.uses_gpu_only() {
+            self.vram_access(epoch)?;
+            pool.ok_or(GtError::Unavailable)?
+                .smallbar_access(self.parts.boot.window())
+                .map_err(Self::smallbar_access_error)?;
         }
         self.admit_scheduling()?;
         let batch = request
@@ -946,8 +1043,11 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         if self.state != GtState::SchedulingReady {
             return Err(GtError::State);
         }
-        let result = self.awake().and_then(|()| self.verify_register_policy());
-        if result.is_err() {
+        let result = self
+            .awake()
+            .and_then(|()| self.current_region())
+            .and_then(|()| self.verify_register_policy());
+        if result.is_err() && !matches!(result, Err(GtError::Busy)) {
             self.state = GtState::Lost;
         }
         result
@@ -1309,7 +1409,8 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         epoch: u64,
         now: u64,
     ) -> Result<Option<crate::intel_gpu_slpc::mert::CpuClearLease>, GtError> {
-        if epoch == 0 || self.user_epoch() != Some(epoch) || !self.vram_cpu_access(epoch) {
+        self.vram_access(epoch)?;
+        if epoch == 0 || self.user_epoch() != Some(epoch) {
             return Err(GtError::State);
         }
         let Some(owner) = &mut self.parts.mert else {
@@ -1655,7 +1756,27 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         now: u64,
         mut current: impl FnMut() -> bool,
     ) -> Poll<Result<GtState, GtError>> {
-        let result = if current() {
+        let region_current = if self.state == GtState::SchedulingReady {
+            match self.current_region() {
+                Ok(()) => {
+                    self.smallbar_busy_deadline = None;
+                    true
+                }
+                Err(GtError::Busy) => {
+                    let deadline = *self
+                        .smallbar_busy_deadline
+                        .get_or_insert(now.saturating_add(50_000_000));
+                    if now < deadline && current() {
+                        return Poll::Pending;
+                    }
+                    false
+                }
+                Err(_) => false,
+            }
+        } else {
+            true
+        };
+        let result = if current() && region_current {
             self.poll_inner(now, &mut current)
         } else {
             Poll::Ready(Err(GtError::Unavailable))
