@@ -362,7 +362,38 @@ physical HDMI link or Mesa shader execution on this card.
 | Post-modeset power saving | Latest boot failed on an all-ones RLC override read after partial writes. Its full-word override operand now follows Linux's RMW, with a fresh running-RLC control probe before accepting all-set data; status and other control reads still fail on all ones. Native RX 6000 submission now declares GC access guarded: submission, READ_MMR_REG, TDR and kernel VRAM work acquire a GFXOFF reference and recheck activation/reset epoch under the owner. Other policy prerequisites still apply. Physical power transitions remain unverified. |
 | Recovery, cancellation and device loss | Native RX 6000 tracks guilty hangs, cancelled pending jobs and device loss separately from physical retirement. Shared WAIT_CS and WAIT_FENCES all/any keep the original job/submitter across reset on RX 6000 and RX 9000. Failed jobs wake waiters without releasing unconfirmed memory. Physical mode1 reset remains unverified. |
 | VCN idle and resume | RX 6000 VCN3 idle work releases encode DPG pause after physical completion, stops idle instances after one second and conditionally sends SMU PowerDownVcn. Begin-use restores power/hardware while preserving sessions and logical fences; JPEG remains independent. MM_DPM_PG keeps its existing opt-in. Static/DPG, cancellation and failure paths have model coverage; physical acceptance remains pending. |
-| Optional media and topology | Native VCN degraded to `BootFailed(0)` and topology returned `Readback`; JPEG verified. Topology now checks defined GRBM selector fields while ignoring reserved read bits; a stuck real selector still fails. Native topology and VCN decoding remain unverified. |
+| Optional media and topology | Native VCN degraded and topology returned `Readback`; JPEG verified. The 2026-11-01 Linux comparison below identifies the selector-readback check as invalid on this GPU. Native topology after the fix and VCN decoding remain unverified. |
+
+The 2026-11-01 physical boot `9e92160e-b279-479e-b112-fecaa9c90366`
+(kernel revision `9d7387de6`, EFI SHA-256
+`e951a532095dc73bda462e60d91c1e7005ce3da82149f9678f8afd0a6c98d4fa`)
+reached PlasmaLogin on the writable Btrfs root. VT 1 and the greeter's DRM
+ACL were active. Its persistent journal records Mesa rejecting
+`(family_id, chip_external_rev): (143, 0)` at 89 seconds, KWin's service
+startup timeout at 107 seconds, and the compositor's SIGKILL at 113 seconds.
+The wallpaper/greeter Wayland connection failures and wallpaper SIGABRT
+followed the compositor's termination; they do not identify the first failure.
+
+A read-only `AMDGPU_INFO_DEV_INFO` query on the same RX 6750 XT under
+Linux returned chip revision 0, external revision `0x32`, PCI revision
+`0xc0` and family 143. Linux `nv_common_early_init` computes the external
+revision from the NBIO ATI revision strap independently of GC harvesting.
+NARF now samples and publishes that strap before cold boot, preserving a
+known identity if the optional harvest is unavailable, without inventing
+CU/RB masks.
+
+Linux's driver-controlled `amdgpu_regs2` read interface, with its runtime-PM
+reference, GRBM mutex and automatic broadcast restoration, returned zero for
+GRBM_GFX_INDEX at each of SE/SA 0/0, 0/1, 1/0, 1/1 and broadcast. The same
+reads returned GB_ADDR_CONFIG `0x344` and plausible fused harvest data.
+The GC discovery bases were `0x1260`, `0xa000`, `0x1c000`, `0x02402c00`;
+the selector byte offset was `0x30800`. NARF's extra selector-echo check
+therefore discarded a valid selection. The sampler now follows Linux
+`gfx_v10_0_select_se_sh` / `gfx_v10_0_get_cu_info`: write the selector,
+read the harvest data and restore broadcast, including on read failure.
+The zero-readback and identity regressions both fail the original code.
+These findings identify a concrete Mesa initialization blocker; physical
+Plasma startup after correction remains unverified.
 
 The earlier native boot also failed in the dynamic loader before Plasma
 startup. The separate VFS/Btrfs fixes and their private-mmap regression must

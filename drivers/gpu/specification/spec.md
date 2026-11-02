@@ -2058,12 +2058,17 @@ MEMORY. VRAM_USAGE and VIS_VRAM_USAGE report the open's card heap usage (zero
 without a registered heap); GTT_USAGE reports that shared system-memory usage.
 These are byte counts, not per-open allocations; retained PRIME/mmap/job owners
 continue to count after handle closure. Replies retain Linux's short-copy rule.
-`Snapshot::navi22: Published { topology, pci_revision,
+`Snapshot::navi22: Published { topology, chip_revision, pci_revision,
 boot }` carries the inputs, published by `amdgpu_info::publish_navi22_topology`
 (cold-boot `Stage::ReadTopology`, appended after `FenceInterrupts`),
+`publish_rdna2_board` (the NBIO ATI revision strap, sampled independently
+of GC harvesting before cold boot),
 `publish_navi22_pci_revision` (platform prepare) and `publish_navi22_boot`
 (after a successful cold boot, from `ColdBoot::uapi_versions` and the
 report). Unpublished inputs leave the corresponding fields zero.
+`DEV_INFO.chip_rev` and `external_rev` use `chip_revision`, so a failed GC
+harvest cannot erase a successfully read chip identity. Unknown CU/RB/TCC
+harvest data remains zero; no board-specific topology is substituted.
 `amdgpu_info_navi22::SUBMISSION` is the single switch for ACCEL_WORKING,
 `available_rings`, HW_IP_COUNT, GANG_SUBMIT, the DRM minor (3.64.0 vs
 3.0.0) and the render ioctls; it is `Wired`, and still advertises nothing
@@ -2080,9 +2085,14 @@ reports
 selector ownership with RLC booted and GFX powered. It samples the NBIO
 revision strap, GB_ADDR_CONFIG, per-SE/SA fused and user RB/WGP disables and
 the TCC disables, restores SE/SA broadcast within one capability operation,
-and checks selector readback using only GRBM_GFX_INDEX's defined fields;
-reserved read bits cannot invalidate a correct selection. A mismatch in a
-defined selector or broadcast field still fails with `Readback`.
+without requiring GRBM_GFX_INDEX to echo the selector, following Linux's
+`gfx_v10_0_select_se_sh`. The RX 6750 XT returns zero for that register
+under Linux's locked `amdgpu_regs2` API, including after broadcast; that
+readback cannot validate selection. Harvest reads still reject all-ones
+device loss, and broadcast is restored on a failed per-array read.
+`unsafe read_revision(gpu, pci_cap)` reads only the read-only NBIO strap,
+under current capability authority and exclusive permanent BAR ownership;
+it needs neither GRBM selection nor powered GC.
 `derive(Limits, &Sample)` reproduces `gfx_v10_0_setup_rb`,
 `gfx_v10_0_get_cu_info` and `gfx_v10_0_get_tcc_info`. A zero or non-256 B
 interleave GB_ADDR_CONFIG, zero CUs/RBs, or GC dimensions beyond the GFX10

@@ -34,7 +34,6 @@ pub enum Error {
     Invalid,
     Revoked,
     DeviceGone,
-    Readback,
 }
 
 /// `mmGB_ADDR_CONFIG` (BASE_IDX 0).
@@ -52,10 +51,6 @@ const GC_USER_SA_UNIT_DISABLE: Reg = Reg(0, 0x0fea);
 const RCC_DEV0_EPF0_STRAP0: u32 = 0x0011;
 /// SE/SA/instance broadcast, the selector every GRBM user leaves behind.
 const BROADCAST: u32 = 0xe000_0000;
-/// GRBM_GFX_INDEX has five reserved bits between the SE selector and the
-/// broadcast flags. Their read values are not part of the selected instance.
-// linux: GRBM_GFX_INDEX__INSTANCE_INDEX_MASK | GRBM_GFX_INDEX__SA_INDEX_MASK | GRBM_GFX_INDEX__SE_INDEX_MASK | GRBM_GFX_INDEX__SA_BROADCAST_WRITES_MASK | GRBM_GFX_INDEX__INSTANCE_BROADCAST_WRITES_MASK | GRBM_GFX_INDEX__SE_BROADCAST_WRITES_MASK
-const INDEX_FIELDS: u32 = 0xe0ff_ffff;
 /// `AMDGPU_GFX_MAX_SE` x `AMDGPU_GFX_MAX_SH_PER_SE` for GFX10
 /// (`disable_masks[4 * 2]` in `gfx_v10_0_get_cu_info`).
 const MAX_SE: u32 = 4;
@@ -219,6 +214,9 @@ fn checked(v: u32) -> Result<u32, Error> {
         Ok(v)
     }
 }
+fn sample_revision(io: &mut impl Io, layout: &Layout) -> Result<u8, Error> {
+    Ok(((checked(io.read(layout.nbio(RCC_DEV0_EPF0_STRAP0)))? >> 24) & 0xf) as u8)
+}
 fn sample(io: &mut impl Io, layout: &Layout, limits: Limits) -> Result<Sample, Error> {
     let index = layout.reg(GRBM_GFX_INDEX);
     let mut raw = Sample {
@@ -241,9 +239,10 @@ fn sample(io: &mut impl Io, layout: &Layout, limits: Limits) -> Result<Sample, E
                 // gfx_v10_0_select_se_sh(se, sh, 0xffffffff)
                 let selector = (1 << 30) | (se << 16) | (sh << 8);
                 io.write(index, selector);
-                if checked(io.read(index))? & INDEX_FIELDS != selector {
-                    return Err(Error::Readback);
-                }
+                // Like gfx_v10_0_select_se_sh, do not require the selector
+                // to echo writes. The physical RX 6750 XT returns zero here
+                // under Linux's locked amdgpu_regs2 interface, including
+                // after SE/SA/instance broadcast. Validate the harvest data.
                 let (i, j) = (se as usize, sh as usize);
                 raw.rb_disable[i][j] = checked(io.read(layout.reg(CC_RB_BACKEND_DISABLE)))?
                     | checked(io.read(layout.reg(GC_USER_RB_BACKEND_DISABLE)))?;
@@ -256,9 +255,6 @@ fn sample(io: &mut impl Io, layout: &Layout, limits: Limits) -> Result<Sample, E
     // Restore broadcast even after a failed read, inside the same capability
     // operation that owns the selector.
     io.write(index, BROADCAST);
-    if checked(io.read(index))? & INDEX_FIELDS != BROADCAST {
-        return Err(Error::Readback);
-    }
     result?;
     // TCCs are global, not instanced.
     raw.tcc_disable = checked(io.read(layout.reg(CGTS_TCC_DISABLE)))?
@@ -271,6 +267,21 @@ impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
     fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<T, CapError> {
         Ok((self.0)())
     }
+}
+/// Read the NBIO chip revision independently of GC power and harvesting,
+/// as nv_common_early_init does before gfx_v10_0_constants_init.
+///
+/// # Safety
+/// The caller exclusively owns the permanent BAR mapping and PCI device.
+/// The strap is read-only and needs no GRBM selection or powered GC.
+pub unsafe fn read_revision(
+    gpu: &AmdGpu,
+    authority: &Cap<BusDeviceCap, Write>,
+) -> Result<u8, Error> {
+    let layout = Layout::resolve_rdna2(gpu).map_err(|_| Error::Unsupported)?;
+    authority
+        .invoke(Op(|| sample_revision(&mut Mmio(gpu.regs), &layout)))
+        .map_err(|_| Error::Revoked)?
 }
 /// Sample and derive this board's topology.
 ///

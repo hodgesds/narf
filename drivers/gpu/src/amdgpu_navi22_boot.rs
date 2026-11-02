@@ -790,7 +790,8 @@ impl Backend for Hardware {
             }
             Stage::ReadTopology => {
                 // SAFETY: firmware/RLC/power are up; this owner holds GRBM
-                // indexing and GC exclusively and no queue has started.
+                // indexing and GC exclusively; kernel queue tests finished,
+                // and no userspace queue or runtime power transition can run.
                 match unsafe { crate::amdgpu_gfx10_topology::read(&self.gpu, &self.authority) } {
                     Ok(topology) => crate::amdgpu_info::publish_navi22_topology(topology),
                     Err(
@@ -799,7 +800,8 @@ impl Backend for Hardware {
                     ) => return Err(Error::Topology(error)),
                     // Userspace identity only: the kernel queues do not
                     // depend on it, so an implausible sample is reported and
-                    // DEV_INFO keeps its unknown-harvest zeros.
+                    // DEV_INFO keeps its unknown-harvest zeros and the
+                    // independently sampled NBIO chip identity.
                     Err(error) => {
                         use core::fmt::Write;
                         let _ = writeln!(

@@ -159,6 +159,7 @@ static NAVI22: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_info_navi22::Publis
         pcie: None,
         memory_khz: None,
         topology: None,
+        chip_revision: None,
         pci_revision: None,
         boot: None,
         vcn_harvest: None,
@@ -166,11 +167,13 @@ static NAVI22: narf_lib::sync::IrqSafeSpinLock<crate::amdgpu_info_navi22::Publis
     });
 /// Board identity sampled before the cold boot, without unguarded ioctl MMIO.
 pub(crate) fn publish_rdna2_board(
+    chip_revision: Option<u8>,
     module: Option<u8>,
     pcie: Option<(u32, u32)>,
     memory_khz: Option<(u64, u64)>,
 ) {
     let mut info = NAVI22.lock();
+    info.chip_revision = chip_revision;
     info.vram_module = module;
     info.pcie = pcie;
     info.memory_khz = memory_khz;
@@ -1461,6 +1464,9 @@ pub(crate) fn sample_rdna2_board(
     cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     device: &narf_bus::BusDevice,
 ) {
+    // SAFETY: platform prepare holds the exclusive GPU claim and current
+    // PCI authority; the read-only NBIO strap does not need powered GC.
+    let revision = unsafe { crate::amdgpu_gfx10_topology::read_revision(gpu, cap) }.ok();
     use crate::atombios::{header::parse_rom_header, tables::MasterDataTable};
     use narf_capabilities::{Cap, CapError, CapOp, Write};
     struct Scratch<'a>(&'a narf_bus::MmioRegion, u64);
@@ -1528,7 +1534,7 @@ pub(crate) fn sample_rdna2_board(
         }
         None
     })();
-    publish_rdna2_board(module, pcie, memory);
+    publish_rdna2_board(revision, module, pcie, memory);
 }
 
 /// Live RX 6000/9000 statistics serialize with their retained owner. RDNA2
