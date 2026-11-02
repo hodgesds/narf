@@ -69,6 +69,7 @@ mod download_dma;
 mod download_plan;
 mod dpk;
 pub mod efuse;
+mod endpoints;
 mod factory;
 mod factory_b;
 mod fifo;

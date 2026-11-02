@@ -221,7 +221,7 @@ impl<I> Drop for Attempt<'_, I> {
 }
 impl Reset<Native> {
     /// # Safety
-    /// The caller already retains the singleton reservation for this exact
+    /// The caller already retains the exclusive function reservation for this exact
     /// function. No other config/MMIO/IRQ/reset or driver producer may run.
     /// Inherited DMA need not be assumed stopped: only successful FLR below
     /// can produce the temporal fence. Retain this owner before awaiting run.
@@ -480,7 +480,7 @@ async fn wait_ready(io: &mut impl Io, binding: Binding) -> Result<(), Error> {
 
 impl super::startup::Startup {
     /// Consume the only successful reset fence while retaining its exact
-    /// singleton reservation. This does not accept BME-off or a board assertion.
+    /// exclusive function reservation. This does not accept BME-off or a board assertion.
     pub(super) fn claim_reset(
         device: BusDevice,
         authority: Cap<BusDeviceCap, Write>,
@@ -516,7 +516,7 @@ impl super::startup::Startup {
             })
         })?;
         // SAFETY: exact current successful temporal FLR fence consumed above;
-        // caller retains its original singleton reservation throughout handoff.
+        // caller retains its original exclusive function reservation throughout handoff.
         let mut startup = unsafe { Self::claim(device, authority) }?;
         startup.lifecycle = fence.lifecycle;
         Ok(startup)

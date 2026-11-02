@@ -2,6 +2,8 @@
 //! This fixture grants no production full-RF receipt or physical readiness.
 #[path = "station_htc_tests.rs"]
 mod htc_tests;
+#[path = "station_multi_tests.rs"]
+mod multi_tests;
 use crate::rtw89::{interface::Device, station::Environment, station_lifecycle::Lifecycle};
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::{
@@ -132,8 +134,11 @@ impl Peer {
         peer
     }
     pub(super) fn new(protected: bool) -> Self {
+        Self::for_station(protected, OWN)
+    }
+    fn for_station(protected: bool, own: [u8; 6]) -> Self {
         let plan = NetworkPlan {
-            station: OWN,
+            station: own,
             bssid: AP,
             server_ip: [10, 88, 1, 1],
             lease_ip: [10, 88, 1, 42],
@@ -222,7 +227,7 @@ impl Peer {
                 let tid = (u16::from_le_bytes([c0, c1]) >> 2) & 0xf;
                 let capab = 1u16 << 1 | tid << 2 | buf << 6;
                 let mut response = vec![0xd0, 0, 0, 0];
-                response.extend_from_slice(&OWN);
+                response.extend_from_slice(&self.plan.station);
                 response.extend_from_slice(&AP);
                 response.extend_from_slice(&AP);
                 response.extend_from_slice(&[0x20, 0, 3, 1, token]);
@@ -392,7 +397,11 @@ impl crate::rtw89::irq::Regs for IrqModel {
 }
 impl DriverModel {
     fn new() -> Self {
-        let factory = crate::rtw89::station_control::tests::factory(false);
+        Self::for_station(OWN)
+    }
+    fn for_station(own: [u8; 6]) -> Self {
+        let factory =
+            crate::rtw89::station_control::tests::factory_with_mac(1, 0x33, 5, false, own);
         Self {
             controller: crate::rtw89::station_control::Controller::new(&factory).unwrap(),
             control: crate::rtw89::station_control::tests::Model::new(),
@@ -770,6 +779,7 @@ struct Harness {
     peer: Arc<IrqSafeSpinLock<Peer>>,
     env: Arc<Env>,
     plan: NetworkPlan,
+    native_dispatch: bool,
 }
 impl Harness {
     fn new(protected: bool) -> Self {
@@ -883,6 +893,7 @@ impl Harness {
             peer,
             env,
             plan,
+            native_dispatch: false,
         }
     }
     fn request(&self) -> AssociateRequest {
@@ -1030,8 +1041,18 @@ kernel_test_in!(
 );
 impl Drop for Harness {
     fn drop(&mut self) {
-        *ACTIVE_TEST.lock() = None;
-        narf_net::iface::unregister(self.device.name());
+        if self.native_dispatch {
+            crate::rtw89::interface::withdraw(&self.device);
+        } else {
+            narf_net::iface::unregister(self.device.name());
+        }
+        let mut active = ACTIVE_TEST.lock();
+        if active
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(held, &self.device))
+        {
+            *active = None;
+        }
     }
 }
 fn smoke_rtw8852b_wmm_source_peer_commands_native_qos_ccmp_and_ip() -> TestResult {

@@ -22,7 +22,7 @@ Other AX/BE profiles retain their parked diagnostic power/identity path.
 
 ## 3. Public interface
 
-For `10ec:b852`/`10ec:b85b`, `pci::probe` reserves a singleton before parking
+For `10ec:b852`/`10ec:b85b`, `pci::probe` reserves its exact BDF before parking
 and retains the actual reset owner before its first await. Generic binding
 requires an advertised, completed FLR and its consumed temporal fence. A
 repeat same-function probe performs no config access, including during reset
@@ -77,7 +77,7 @@ revocation returns `Authority` before register access or packet allocation.
 
 The bounded initial RTL8852B identity-DMA startup can earn a temporal fence via
 the retained `pci_reset::Reset`. Its unsafe `claim(device, cap)` requires the
-already held exclusive singleton reservation, but makes no assumption that
+already held exclusive function reservation, but makes no assumption that
 inherited DMA stopped. `run().await` checks exact BDF, ECAM, VID/DID, class,
 subsystem identity and capability slot/epoch through current invocation for
 every actual config access. Only an actual endpoint PCIe DEVCAP bit 28 permits
@@ -97,7 +97,7 @@ and leaves BME/IRQ disabled. Unsupported IOMMU reset handling is not simulated.
 Only successful completion creates a private non-Clone `Fence`. Its sole
 consumer, `Startup::claim_reset`, rechecks exact binding, current authority,
 parked controls and restored BARs before transferring into the actual cold
-owner. The original singleton reservation remains retained throughout the
+owner. The original function reservation remains retained throughout the
 reset, cancellation and Startup handoff. A dropped/failed attempt is terminal
 and cannot be replayed or release that reservation. The existing unsafe cold
 claim remains only for a genuinely independently fenced platform power/PERST
@@ -1455,6 +1455,50 @@ ordering, error propagation, lost-wake freedom, vector release/quarantine)
 and `smoke_rtw8852b_irq_driven_worker_services_rearms_and_halts` (armed
 association, RX service/rearm, TX kick, halt teardown).
 
+### Multiple independent RTL8852B functions
+
+Up to four admitted RTL8852B PCI functions can remain live together, matching
+this family's bounded native IRQ and endpoint capacity. Each exact BDF has a
+reservation before any configuration/reset access and an independent retained
+reset, firmware, factory/PHY/power qualification, DMA rings, interrupt line,
+controller, MLME/CCMP key/PN state and netdev generation. An in-progress claim
+cannot admit a second producer; a repeat retained or quarantined BDF is
+observational. Full capacity refuses a new claim before hardware access.
+Pinned DMA quarantines only its original BDF; retirement compares the original
+owner Arc so stale removal cannot release a replacement or another function.
+This is the per-`pci_dev` ownership model of Linux
+[`rtw89_pci_probe`/`rtw89_pci_remove`](https://code.googlesource.com/linux/torvalds/linux/+/c40dd8c4732551605712985bc5b7045094c6458d/drivers/net/wireless/realtek/rtw89/pci.c)
+(`pci_set_drvdata`/`pci_get_drvdata`), with a bounded NARF registry.
+
+The existing network `register_with_context` API now dispatches each netdev
+through a nonwrapping, never-reused boot cookie. A stale send hook cannot
+address a rebound shell. RX drain snapshots every retained endpoint, drops
+its registry lock, and services all of them without short-circuiting. IRQ
+slots/vectors remain separately bound to each function and the original
+stop/reclamation proof still governs their release. A pending terminal,
+source-capability revocation, disconnect or reset on one function grants no
+progress or key/packet authority to another.
+
+Withdrawal closes the original admission and permanently fences old carrier
+metadata. An ingress callback already outside the native owner keeps its
+name and dispatch reservation until callback return; stack callbacks run
+without driver locks held. The last delivery completes withdrawal, and the
+async bootstrap waits for it before releasing the BDF or rebinding its name.
+Old drain workers and repeated removal cannot change a replacement's carrier,
+registries or endpoint. System PM snapshots all retained functions behind a
+new-probe barrier, parks each through the original DMA-stop path, and resumes
+all. A later failure or cancellation withdraws every earlier suspend request
+and releases the barrier. An unpublished reset claim makes preparation busy.
+
+Source and fixture coverage is registered under
+`drivers/wireless/rtw89/multiple`: two actual native controller/packet models
+with distinct MACs and pairwise keys, independent TXBD/RPQ waits and capability
+loss, production context callbacks, ingress-delayed same-name rebind and stale
+worker rejection, bounded BDF claims, suspend failure/cancellation and separate
+MSI delivery/release. These cases await batch validation. The diagnostic
+non-B controller slot and other unimplemented chip profiles retain their
+existing applicability limits; no physical multi-board acceptance is claimed.
+
 ### DMA-stop proof and reclamation (RTL8852B)
 
 `dma_stop.rs` ports the AX stop/idle sequence of Linux v7.2
@@ -1509,8 +1553,8 @@ taken out of the lifecycle and `Owner::retire` stops the station (or the
 private CH12/RX), then `station::Io::retire_dma` runs the DMA-stop proof and
 reclamation (`rtw89_pci_clear_resource`), followed by the XTAL/RF shutdown.
 Only a proven reclamation (or an owner that never left reset) clears
-`OWNER` and the singleton reservation, so a later probe can bind. An
-unproven stop keeps both: the address stays quarantined and a re-probe
+only that BDF entry in `OWNERS`, so a later probe can bind. An
+unproven stop retains its entry: the address stays quarantined and a re-probe
 returns without configuration access. Smokes:
 `smoke_rtw8852b_remove_releases_unpublished_and_quarantines_pinned_owner`
 (wrong function, unpublished release, pinned quarantine, re-probe, repeat
@@ -1638,7 +1682,7 @@ or physical hardware acceptance.
 | RF/BB calibration, regulatory channel/power and coexistence | Initial B actual factory + firmware PHY_CAP, static PHY operating/XTAL, WLAN-only coexistence, NCTL/basic RFK, channel MAC/BB/RF/scheduler/ADC, actual trims/RXAB, IQK/TSSI/DPK and real source power-table composition implemented. Separate signed measured v2 binds all calibration/packet/autonomous-response peaks and actual source recipes; native publication uses current signed/device invocations. Broader AX/BE profiles, host periodic RF tracking/retuning and physical measured qualification remain outside this initial profile |
 | Initial B scan, MLME, WPA2 and Ethernet | Source controller plus shared host MLME/RSNA/CCMP, exact M4/RX-idle admission, kernel DHCP/IP, rekey and terminal disconnect/cancellation are implemented; physical acceptance remains |
 | BE EFUSE/block format and BE transport | Missing |
-| Broader lifecycle | Initial independent reset, terminal ownership, proven-reclamation removal, SER L2-style generation reset/rejoin and no-WoW system suspend implemented; in-place SER L1 recovery, WoW and multiple live functions remain outside this first profile |
+| Broader lifecycle | Initial independent reset, terminal ownership, proven-reclamation removal, SER L2-style generation reset/rejoin and no-WoW system suspend implemented; in-place SER L1 recovery and WoW remain outside this first profile; independent live RTL8852B functions are implemented below |
 
 The per-chip source `rtw_chip_info` inventories are broader than this station:
 8851B declares1TX/1RX and2.4/5GHz;8852A/B declare2TX/2RX and2.4/5GHz;
@@ -1718,7 +1762,6 @@ triage above remains separate from implementation.
 | `wide_channels` | The retained HT/HE profile and descriptor/program identities fix20MHz. HT40/80 and applicable160 need real MAC/BB/RF width/secondary/center programming, full occupied-span power admission and matching host PHY/TX/RX/control-field owners. Shared JoinPlan width encoders already exist. |
 | `fragmentation` | Native packet admission still refuses nonzero fragment numbers/More-Fragments. Host split/reassembly, per-fragment PN and terminal receipt ownership, bounded reassembly lifetimes and matching signed emission programs must be added; the shared fragmentation-threshold control API alone does not implement them. |
 | `monitor_mode` | The retained station facade has no native monitor transition or raw/radiotap publication owner. It needs original MPDUs plus actual PHY-status/PPDU metadata and generation-fenced capture under the shared monitor/AF_PACKET API, with station/key/queue teardown before mode changes. |
-| `multiple_live_functions` | Bootstrap/controller, station publication and IRQ dispatch currently retain a single live function. Multiple functions need independent firmware/DMA/IRQ/PHY/key lifetimes and netdev generations rather than another discovery-table entry. |
 | `rf_power_tracking` | One-shot RF calibration and the completed EDCCA/DIG/CFO tracking do not implement periodic IQK/TSSI/DPK or thermal TX-power adjustment on the retained RF owner. Live RF tracking needs its own source sequence, current policy/queue fences and measured gain/transient envelope. |
 | `runtime_sleep` | The fresh-FLR operating recipe remains continuously awake and never requests LPS/RPWM transitions. Runtime sleep needs firmware power-mode commands, current wake/use-count ownership and exact resumed packet/radio state; system suspend/reset is a different implemented lifecycle. |
 | `six_ghz_operation` | Only RTL8852C/RTL8922A have6GHz applicability; their complete native chip/station owners remain missing. The retained B profile is2.4GHz-only in software. Six-GHz operation additionally needs per-band RF/power qualification, actual HE6GHz context and current LPI/VLP/AFC client admission through the existing shared6GHz APIs. |

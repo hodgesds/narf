@@ -463,6 +463,18 @@ architecture at `42df9b354`; this does not accept the new source extensions.
 Counting unvalidated implementations,82 remain. Real board measurements,
 signed programs and physical acceptance remain separate.
 
+**Source implementation recount 2026-11-02** (independent RTL8852B PCI functions):
+the remaining ledger holds **74 `feature`**, **31 `chip`** and **0 `unknown`**
+rows. Eight source-complete implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. The bounded four-function
+RTL8852B owner retains independent source, reset, firmware, packet/key and IRQ
+lifetimes, generation-specific endpoint dispatch and quiescent name retirement.
+System PM visits every retained function and rolls back failed or cancelled
+preparation. Six new cases are written and unexecuted. Scoped formatting and
+one release metadata check pass; full release/native gates remain at the next
+25-feature checkpoint. Counting unvalidated implementations,82 remain. Physical
+multi-board acceptance and genuine measured qualifications stay separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 3 | MLO, P2P and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; bounded P2P DEVICE/SESSION1/SESSION2 is implemented pending validation; the family P2P row stays open |
@@ -473,7 +485,7 @@ signed programs and physical acceptance remain separate.
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are software-accepted at `6813a24c6` |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 16 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets; qualified non-VO originator BA and C21 RF power tracking are implemented pending validation |
-| rtw89 | 13 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW, periodic RF tracking/runtime LPS and multiple functions; other AX/BE chips are separate rows |
+| rtw89 | 12 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW and periodic RF tracking/runtime LPS; bounded independent live functions are implemented pending validation; other AX/BE chips are separate rows |
 | brcmfmac | 12 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
 | cyw43439 | 12 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
 
@@ -1324,6 +1336,16 @@ native ESS Beacon and exact START/FOREIGN dwell observations. Immutable
 receipts retain original policy Arc, physical-radio lifetime and every occupied
 20MHz constituent through waits and copied publication. Signed host NO_IR,
 DFS, indoor and unknown restrictions stay independent. Family §3.2 is normative.
+
+### 3.7 Independent native PCI functions (validation pending)
+
+Admitted RTL8852B functions each retain their original BDF/source/reset,
+firmware, power, DMA, key and IRQ owner. A bounded four-entry registry and
+never-reused endpoint cookie route each netdev independently. Old ingress
+holds its name through callback return before removal or rebind; system PM
+blocks new probes and visits every original owner with rollback on failed or
+cancelled preparation. Family §3 defines the original reclamation and native
+receipt requirements; the feature grants no new chip or physical qualification.
 
 ## 4. Interaction with `narf-wireless`
 

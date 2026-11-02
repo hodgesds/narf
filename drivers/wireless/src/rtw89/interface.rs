@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! One registered RTL8852B shell and retained owner for control and packet
+//! Per-function RTL8852B shells and retained owners for control and packet
 //! progress. Synchronous stack drains never wait for another executor task.
 use super::{
     station::Io,
@@ -8,7 +8,7 @@ use super::{
     station_lifecycle::Lifecycle,
 };
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
 use narf_wireless::{
@@ -71,6 +71,10 @@ pub(super) struct Device<I: Io> {
     name: String,
     local: [u8; 6],
     published: AtomicBool,
+    retired: AtomicBool,
+    deliveries: AtomicUsize,
+    /// 0 live; 1 remove / 2 keep name; 3 finalizing; 4 withdrawn.
+    withdrawal: AtomicU8,
     activating: AtomicBool,
     admitted: AtomicBool,
     up: AtomicBool,
@@ -207,6 +211,9 @@ impl<I: Io + 'static> Device<I> {
             name: name.into(),
             local,
             published: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            deliveries: AtomicUsize::new(0),
+            withdrawal: AtomicU8::new(0),
             activating: AtomicBool::new(false),
             admitted: AtomicBool::new(false),
             up: AtomicBool::new(false),
@@ -303,7 +310,16 @@ impl<I: Io + 'static> Device<I> {
         Ok(())
     }
     fn link(&self, peer: Option<[u8; 6]>, port: bool) {
+        self.link_inner(peer, port, false);
+    }
+    fn link_inner(&self, peer: Option<[u8; 6]>, port: bool, retire: bool) {
         let _metadata = self.metadata.lock();
+        if self.retired.load(Ordering::Acquire) {
+            return;
+        }
+        if retire {
+            self.retired.store(true, Ordering::Release);
+        }
         let peer = peer.filter(|_| !self.closed());
         let mut packed = [0; 8];
         if let Some(peer) = peer {
@@ -470,16 +486,64 @@ impl<I: Io + 'static> Device<I> {
         // All retained-owner/ring/admission guards have dropped before the
         // stack can synchronously answer ARP/ND through this enqueue callback.
         for mut frame in frames {
-            if self.closed() {
+            let Some(_delivery) = self.begin_delivery() else {
                 break;
-            }
+            };
             narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
         }
         progressed
     }
+    fn begin_delivery(&self) -> Option<Delivery<'_, I>> {
+        let _metadata = self.metadata.lock();
+        if self.retired.load(Ordering::Acquire) || self.closed() {
+            return None;
+        }
+        self.deliveries.fetch_add(1, Ordering::AcqRel);
+        Some(Delivery(self))
+    }
+    fn finish_withdrawal(&self) {
+        if self.deliveries.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let action = self.withdrawal.load(Ordering::Acquire);
+        if !matches!(action, 1 | 2)
+            || self
+                .withdrawal
+                .compare_exchange(action, 3, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        if action != 2 || !narf_net::iface::retire_for_rebind(&self.name) {
+            narf_net::iface::unregister(&self.name);
+        }
+        super::endpoints::remove(self as *const Self as *const ());
+        self.withdrawal.store(4, Ordering::Release);
+        self.line.raise();
+    }
+    /// Old stack delivery holds its name until callback return. Retirement
+    /// never waits with an IRQ lock held, and a same-name generation starts
+    /// only after all old callbacks have left.
+    pub(super) async fn wait_withdrawn(&self) {
+        while matches!(self.withdrawal.load(Ordering::Acquire), 1..=3) {
+            self.environment.pause().await;
+        }
+    }
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn delivery_for_test(&self) -> impl Drop + '_ {
+        self.begin_delivery().expect("live fixture ingress")
+    }
     #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn admit_for_test(&self) {
         self.published.store(true, Ordering::Release);
+    }
+}
+struct Delivery<'a, I: Io + 'static>(&'a Device<I>);
+impl<I: Io + 'static> Drop for Delivery<'_, I> {
+    fn drop(&mut self) {
+        if self.0.deliveries.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.finish_withdrawal();
+        }
     }
 }
 fn offloads(meta: narf_net::TxMeta) -> bool {
@@ -718,11 +782,7 @@ fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
         None => Ok(200),
     }
 }
-trait Endpoint: Send + Sync {
-    fn send(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>;
-    fn drain(&self) -> bool;
-}
-impl<I: Io + 'static> Endpoint for Device<I> {
+impl<I: Io + 'static> super::endpoints::Endpoint for Device<I> {
     fn send(&self, b: &[u8], m: narf_net::TxMeta) -> Result<(), ()> {
         self.enqueue(b, m)
     }
@@ -730,32 +790,32 @@ impl<I: Io + 'static> Endpoint for Device<I> {
         Device::drain(self)
     }
 }
-static ACTIVE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
-static CLAIMED: AtomicBool = AtomicBool::new(false);
-fn send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-    let device = ACTIVE.lock().clone().ok_or(())?;
-    device.send(bytes, meta)
-}
-fn drain() -> bool {
-    let device = ACTIVE.lock().clone();
-    device.is_some_and(|d| d.drain())
-}
 pub(super) fn publish<I: Io + 'static>(device: Arc<Device<I>>) -> Result<(), Error> {
+    if device.retired.load(Ordering::Acquire) || device.published.load(Ordering::Acquire) {
+        return Err(Error::State);
+    }
     let authority = narf_net::trusted_net_authority()
         .and_then(|cap| cap.derive().ok())
         .ok_or(Error::Profile)?;
-    CLAIMED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| Error::State)?;
-    narf_net::registry()
+    let cookie =
+        super::endpoints::insert(&device.name, device.clone()).map_err(|_| Error::State)?;
+    if narf_net::registry()
         .register(&authority, Registered(device.clone()))
-        .map_err(|_| Error::Profile)?;
-    narf_net::iface::register(&device.name, device.local, send);
+        .is_err()
+    {
+        super::endpoints::remove(Arc::as_ptr(&device) as *const ());
+        return Err(Error::Profile);
+    }
+    narf_net::iface::register_with_context(
+        &device.name,
+        device.local,
+        cookie,
+        super::endpoints::send,
+    );
     narf_net::iface::set_driver_info(&device.name, "rtw8852b", None, String::new());
     narf_net::iface::set_offloads(&device.name, narf_net::OffloadCapabilities::default());
     device.link(None, false);
-    *ACTIVE.lock() = Some(device.clone());
-    narf_net::iface::install_rx_drain(drain);
+    narf_net::iface::install_rx_drain(super::endpoints::drain);
     narf_wireless::registry::register(device.clone());
     device.published.store(true, Ordering::Release);
     narf_scheduler::spawn(async move {
@@ -766,8 +826,8 @@ pub(super) fn publish<I: Io + 'static>(device: Arc<Device<I>>) -> Result<(), Err
     Ok(())
 }
 /// Linux `rtw89_core_unregister` for removal: close admission and carrier,
-/// unregister from the wireless/net registries and release the singleton
-/// endpoint claim. Idempotent; the drain worker exits after its pass.
+/// unregister from the wireless/net registries and release this generation's
+/// endpoint. Idempotent; the drain worker exits after its pass.
 pub(super) fn withdraw<I: Io + 'static>(device: &Device<I>) {
     withdraw_inner(device, false);
 }
@@ -779,26 +839,22 @@ pub(super) fn withdraw_keep_name<I: Io + 'static>(device: &Device<I>) -> String 
     device.name.clone()
 }
 fn withdraw_inner<I: Io + 'static>(device: &Device<I>, keep: bool) {
-    device.close();
+    // A late withdrawal of an old shell may share its name with a rebound
+    // generation. Close only its own admission before testing publication.
+    device.admission.close();
     if !device.published.swap(false, Ordering::AcqRel) {
         return;
     }
+    device.link_inner(None, false, true);
     narf_wireless::registry::unregister(&device.name);
     narf_net::registry().unregister(&device.name);
-    // `ieee80211_restart_hw` keeps the net_device: retire it for rebind so
-    // the next generation restores its ifindex, addresses and sockets.
-    if !keep || !narf_net::iface::retire_for_rebind(&device.name) {
-        narf_net::iface::unregister(&device.name);
-    }
-    let endpoint = device as *const Device<I> as *const ();
-    let mut active = ACTIVE.lock();
-    if active
-        .as_ref()
-        .is_some_and(|current| Arc::as_ptr(current) as *const () == endpoint)
-    {
-        *active = None;
-        CLAIMED.store(false, Ordering::Release);
-    }
+    // Preserve the name/dispatch reservation while an old ingress callback
+    // is running. Its final Drop completes removal without holding locks
+    // across the stack or waiting inside this synchronous hook.
+    device
+        .withdrawal
+        .store(if keep { 2 } else { 1 }, Ordering::Release);
+    device.finish_withdrawal();
     device.line.raise();
 }
 /// Whether the shell is still registered.

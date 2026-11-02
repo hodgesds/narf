@@ -242,7 +242,7 @@ impl Future for Wait<'_> {
 
 /// Fixed handler slots: the cookie selects the line without any raw pointer
 /// lifetime across the IRQ boundary.
-const SLOTS: usize = 4;
+const SLOTS: usize = super::endpoints::MAX_FUNCTIONS;
 static LINES: [IrqSafeSpinLock<Option<Arc<Line>>>; SLOTS] =
     [const { IrqSafeSpinLock::new(None) }; SLOTS];
 const HANDLER: &str = "rtw89";

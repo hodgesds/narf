@@ -16,6 +16,7 @@ struct Source {
     cut: u8,
     xtal: u8,
     rfe: u8,
+    own: [u8; 6],
 }
 impl Io for Source {
     fn read8(&mut self, _: u32) -> Result<u8, Error> {
@@ -54,9 +55,9 @@ impl crate::rtw89::factory::Source for Source {
         if start == 0 {
             assert_eq!(bytes.len(), 1216);
             for (index, (offset, pair)) in [
-                (0x400, [2, 4]),
-                (0x402, [6, 8]),
-                (0x404, [10, 12]),
+                (0x400, [self.own[0], self.own[1]]),
+                (0x402, [self.own[2], self.own[3]]),
+                (0x404, [self.own[4], self.own[5]]),
                 (0x2b8, [255, self.xtal]),
                 (0x2ca, [self.rfe, b'U']),
                 (0x2cc, [b'S', 255]),
@@ -85,12 +86,22 @@ pub(in crate::rtw89) fn factory(secure: bool) -> Factory {
     factory_with_profile(1, 0x33, 5, secure)
 }
 pub(in crate::rtw89) fn factory_with_profile(cut: u8, xtal: u8, rfe: u8, secure: bool) -> Factory {
+    factory_with_mac(cut, xtal, rfe, secure, OWN)
+}
+pub(in crate::rtw89) fn factory_with_mac(
+    cut: u8,
+    xtal: u8,
+    rfe: u8,
+    secure: bool,
+    own: [u8; 6],
+) -> Factory {
     let mut factory = Factory::default();
     narf_scheduler::block_on(factory.read(&mut Source {
         secure,
         cut,
         xtal,
         rfe,
+        own,
     }))
     .unwrap();
     factory
