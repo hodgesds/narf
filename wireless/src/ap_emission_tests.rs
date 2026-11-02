@@ -4,6 +4,8 @@ use core::{
     future::Future,
     task::{Context, Poll, Waker},
 };
+#[path = "ap_station_event_tests.rs"]
+mod station_events;
 
 #[derive(Debug)]
 struct NativeSource {
@@ -11,6 +13,7 @@ struct NativeSource {
     callbacks: AtomicU32,
     delivered: AtomicU32,
     delivery_attempts: AtomicU32,
+    messages: IrqSafeSpinLock<Vec<Vec<u8>>>,
 }
 impl NativeSource {
     fn new() -> Self {
@@ -19,6 +22,7 @@ impl NativeSource {
             callbacks: AtomicU32::new(0),
             delivered: AtomicU32::new(0),
             delivery_attempts: AtomicU32::new(0),
+            messages: IrqSafeSpinLock::new(Vec::new()),
         }
     }
 }
@@ -30,12 +34,13 @@ impl DeferredReplySink for NativeSource {
     fn native_source(&self) -> Option<narf_net::native_emission::Lifetime> {
         Some(self.owner.observe())
     }
-    fn deliver(&self, _: Vec<u8>) -> Result<(), i32> {
+    fn deliver(&self, message: Vec<u8>) -> Result<(), i32> {
         self.delivery_attempts.fetch_add(1, Ordering::AcqRel);
         if !self.owner.observe().current() {
             return Err(125);
         }
         self.delivered.fetch_add(1, Ordering::AcqRel);
+        self.messages.lock().push(message);
         Ok(())
     }
 }

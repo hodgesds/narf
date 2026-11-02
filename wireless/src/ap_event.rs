@@ -122,6 +122,50 @@ impl ApEventAuthority {
     ) -> Result<PreparedApEvent, WirelessError> {
         self.prepare(129, self.control_attrs(peer, ethertype, pdu, unencrypted)?)
     }
+    /// Serialize an actual firmware-SME association indication. The generation
+    /// is an observed wire counter, never native peer/key/port authority. After
+    /// preparation, the driver must prove its original source, receive epoch
+    /// and exact AP/peer owner before consuming this token.
+    pub fn prepare_station_associated(
+        &self,
+        peer: [u8; 6],
+        generation: u32,
+        assoc_req_ies: &[u8],
+    ) -> Result<PreparedApEvent, WirelessError> {
+        if assoc_req_ies.is_empty() || assoc_req_ies.len() > 2304 {
+            return Err(WirelessError::InvalidArgs);
+        }
+        let mut rest = assoc_req_ies;
+        while !rest.is_empty() {
+            let length = usize::from(*rest.get(1).ok_or(WirelessError::InvalidArgs)?);
+            rest = rest.get(2 + length..).ok_or(WirelessError::InvalidArgs)?;
+        }
+        let mut attrs = self.station_attrs(peer, generation)?;
+        attr(&mut attrs, 42, assoc_req_ies);
+        self.prepare(19, attrs)
+    }
+    /// Serialize native peer loss after the driver has applied its denial.
+    /// No association IEs, authorization, key state or invented reason follows
+    /// from this notification. Genuine loss delivery needs no DATA port.
+    pub fn prepare_station_lost(
+        &self,
+        peer: [u8; 6],
+        generation: u32,
+    ) -> Result<PreparedApEvent, WirelessError> {
+        self.prepare(20, self.station_attrs(peer, generation)?)
+    }
+    fn station_attrs(&self, peer: [u8; 6], generation: u32) -> Result<Vec<u8>, WirelessError> {
+        if peer == [0; 6] || peer[0] & 1 != 0 {
+            return Err(WirelessError::InvalidArgs);
+        }
+        // nl80211_send_station: actual IFINDEX/WDEV, MAC and generation,
+        // empty nested STA_INFO when no measured station fields are supplied.
+        let mut attrs = self.identity_attrs(false)?;
+        attr(&mut attrs, 6, &peer);
+        attr(&mut attrs, 46, &generation.to_ne_bytes());
+        attr(&mut attrs, 21 | (1 << 15), &[]);
+        Ok(attrs)
+    }
     fn prepare(&self, command: u8, attrs: Vec<u8>) -> Result<PreparedApEvent, WirelessError> {
         let iface = self.guard.iface.upgrade().ok_or(WirelessError::Denied)?;
         let original = self.native_emission_for(iface.as_ref())?;
@@ -135,11 +179,16 @@ impl ApEventAuthority {
         })
     }
     fn base(&self) -> Result<Vec<u8>, WirelessError> {
+        self.identity_attrs(true)
+    }
+    fn identity_attrs(&self, include_wiphy: bool) -> Result<Vec<u8>, WirelessError> {
         self.current()?;
         let iface = self.guard.iface.upgrade().ok_or(WirelessError::Denied)?;
         let wiphy = crate::registry::wiphy_index(iface.wiphy_id()).ok_or(WirelessError::Denied)?;
         let mut attrs = Vec::new();
-        attr(&mut attrs, 1, &wiphy.to_ne_bytes());
+        if include_wiphy {
+            attr(&mut attrs, 1, &wiphy.to_ne_bytes());
+        }
         let ifindex = self.guard.netdev_ifindex()?;
         attr(&mut attrs, 3, &ifindex.to_ne_bytes());
         let wdev = self.guard.target.wdev(wiphy);

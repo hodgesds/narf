@@ -17,6 +17,8 @@ mod emission;
 mod events;
 #[path = "ap_key_dispatch_tests.rs"]
 mod key_sequence;
+#[path = "ap_sme_tests.rs"]
+mod native_sme;
 #[path = "sched_dispatch_tests.rs"]
 mod scheduled;
 
@@ -24,6 +26,8 @@ struct Radio {
     name: String,
     mode: AtomicU32,
     generation: AtomicU64,
+    ap_available: AtomicBool,
+    ap_sme: AtomicU64,
     serial: Arc<ExclusiveControl>,
     start_ready: AtomicBool,
     start_polls: AtomicU32,
@@ -66,6 +70,8 @@ impl Radio {
             name,
             mode: AtomicU32::new(3),
             generation: AtomicU64::new(1),
+            ap_available: AtomicBool::new(true),
+            ap_sme: AtomicU64::new(u64::MAX),
             serial: Arc::new(ExclusiveControl::new()),
             start_ready: AtomicBool::new(false),
             start_polls: AtomicU32::new(0),
@@ -174,7 +180,10 @@ impl WirelessNetIface for Radio {
         self.mode.load(Ordering::Acquire)
     }
     fn supports_ap(&self) -> bool {
-        true
+        self.ap_available.load(Ordering::Acquire)
+    }
+    fn ap_sme_capabilities(&self) -> Option<u32> {
+        self.ap_sme.load(Ordering::Acquire).try_into().ok()
     }
     fn ap_control_generation(&self) -> Option<NonZeroU64> {
         NonZeroU64::new(self.generation.load(Ordering::Acquire))

@@ -38,15 +38,23 @@ impl Drop for Capture {
     }
 }
 fn send(f: &Fixture) -> Result<Vec<Vec<u8>>, &'static str> {
+    send_original(f.ifindex, f.radio.mac(), &f.admin, f.source.clone())
+}
+fn send_original(
+    ifindex: u32,
+    own: [u8; 6],
+    admin: &AdminHandle,
+    source: Arc<dyn DeferredReplySink>,
+) -> Result<Vec<Vec<u8>>, &'static str> {
     let mut attrs = Vec::new();
     let mut frame = alloc::vec![0;26];
     frame[0] = 0xd0;
     frame[4..10].fill(255);
-    frame[10..16].copy_from_slice(&f.radio.mac());
+    frame[10..16].copy_from_slice(&own);
     frame[16..22].fill(255);
     frame[24] = 4;
     for (kind, value) in [
-        (3u16, f.ifindex.to_ne_bytes().to_vec()),
+        (3u16, ifindex.to_ne_bytes().to_vec()),
         (38, 5180u32.to_ne_bytes().to_vec()),
         (51, frame),
         (108, Vec::new()),
@@ -69,11 +77,11 @@ fn send(f: &Fixture) -> Result<Vec<Vec<u8>>, &'static str> {
         &b,
         ReplyOptions::default(),
         RequestContext {
-            admin: Some(&f.admin),
+            admin: Some(admin),
             portid: 91,
             ..RequestContext::default()
         },
-        f.source.clone(),
+        source,
     )
     .map_err(|_| "station FRAME netlink framing")
 }
@@ -234,4 +242,230 @@ fn station_frame_registration_waits_for_native_callback_and_original_source() ->
 kernel_test_in!(
     "wireless/radio_control",
     station_frame_registration_waits_for_native_callback_and_original_source
+);
+
+/// The native terminal proof is independent of a callback's own true result.
+/// Late callbacks may retire the original native owner while keeping the
+/// actual request socket/interface/grant otherwise valid.
+struct CompletionProof(Arc<AtomicBool>);
+impl crate::ap_control::RadioFrameCompletion for CompletionProof {
+    fn current(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+struct LateRadio {
+    radio: Arc<Radio>,
+    live: Arc<AtomicBool>,
+    armed: AtomicBool,
+    boundary: u8,
+    completed: AtomicU32,
+}
+impl Interface for LateRadio {
+    fn name(&self) -> &str {
+        self.radio.name()
+    }
+    fn mac(&self) -> [u8; 6] {
+        self.radio.mac()
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        true
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.radio.rx
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.radio.tx
+    }
+}
+#[async_trait::async_trait]
+impl WirelessNetIface for LateRadio {
+    fn wiphy_id(&self) -> u64 {
+        if self.boundary == 2 && self.armed.load(Ordering::Acquire) {
+            self.live.store(false, Ordering::Release);
+        }
+        self.radio.wiphy_id()
+    }
+    fn get_wireless_info(&self) -> crate::WirelessIfaceInfo {
+        self.radio.get_wireless_info()
+    }
+    async fn scan(&self, _: crate::ScanRequest) -> Result<Vec<crate::BssInfo>, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+    async fn associate(&self, _: crate::AssociateRequest) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+    async fn disassociate(&self) -> Result<(), WirelessError> {
+        Ok(())
+    }
+    async fn set_config(&self, _: crate::WirelessConfig) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+    fn current_iftype(&self) -> u32 {
+        8
+    }
+    fn radio_control_generation(&self) -> Option<NonZeroU64> {
+        NonZeroU64::new(1)
+    }
+    fn reserve_radio_control(
+        &self,
+    ) -> Result<Option<Arc<dyn ApControlReservation>>, WirelessError> {
+        self.radio.serial.try_reserve().map(Some)
+    }
+    fn async_p2p_netdev_management_tx_control(&self) -> bool {
+        true
+    }
+    fn supports_offchannel_mgmt_tx(&self) -> bool {
+        true
+    }
+    async fn mgmt_tx_radio_async(
+        &self,
+        authority: &RadioControlAuthority,
+        cookie: u64,
+        _: crate::MgmtTxRequest,
+    ) -> Result<bool, WirelessError> {
+        authority.check_for(self)?;
+        // This shared-boundary fixture models the terminal native callback;
+        // family fixtures independently prove its real firmware ACK producer.
+        self.completed.fetch_add(1, Ordering::AcqRel);
+        let proof = Arc::new(CompletionProof(self.live.clone()));
+        authority.complete_frame_for(self, cookie, proof.clone())?;
+        if authority.complete_frame_for(self, cookie, proof).is_ok()
+            || authority.frame_completion_current(Some(cookie + 1)).is_ok()
+        {
+            return Err(WirelessError::HardwareError);
+        }
+        if self.boundary == 3 {
+            self.live.store(false, Ordering::Release);
+            if authority.frame_completion_current(Some(cookie)).is_ok() {
+                return Err(WirelessError::HardwareError);
+            }
+            self.live.store(true, Ordering::Release);
+            if authority.clone().current().is_ok() {
+                return Err(WirelessError::HardwareError);
+            }
+            return Err(WirelessError::Denied);
+        }
+        self.armed.store(true, Ordering::Release);
+        Ok(true)
+    }
+}
+struct LateRegistered(Arc<LateRadio>);
+impl Interface for LateRegistered {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn mac(&self) -> [u8; 6] {
+        self.0.mac()
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        true
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        self.0.rx_ring()
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        self.0.tx_ring()
+    }
+}
+struct LateSocket {
+    radio: Arc<LateRadio>,
+    messages: IrqSafeSpinLock<Vec<Vec<u8>>>,
+}
+impl core::fmt::Debug for LateSocket {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LateSocket").finish_non_exhaustive()
+    }
+}
+impl DeferredReplySink for LateSocket {
+    fn current(&self) -> bool {
+        if self.radio.boundary == 1 && self.radio.armed.load(Ordering::Acquire) {
+            self.radio.live.store(false, Ordering::Release);
+        }
+        true
+    }
+    fn deliver(&self, b: Vec<u8>) -> Result<(), i32> {
+        self.messages.lock().push(b);
+        Ok(())
+    }
+}
+fn late_completion() -> Result<(), &'static str> {
+    let _capture = Capture(narf_net::netlink_generic::install_event_sink(event));
+    let _ = crate::nl80211::register();
+    for boundary in 0..4 {
+        let name =
+            narf_net::iface::register("client-frame-final%d", [2, 0, 0, 0, 0x76, 0x40], reject);
+        let _binding = Binding(name.clone());
+        let radio = Arc::new(Radio::new(name));
+        radio.mode.store(8, Ordering::Release);
+        radio.p2p_roles.store(true, Ordering::Release);
+        let late = Arc::new(LateRadio {
+            radio,
+            live: Arc::new(AtomicBool::new(true)),
+            armed: AtomicBool::new(false),
+            boundary,
+            completed: AtomicU32::new(0),
+        });
+        let cap = narf_net::registry()
+            .register(
+                &narf_net::bootstrap_authority(),
+                LateRegistered(late.clone()),
+            )
+            .map_err(|_| "late FRAME registered original iface")?;
+        let daemon = Cap::<narf_net::stack::StackDaemon, Invoke>::bootstrap();
+        let admin = narf_net::stack::control_registered(&narf_net::stack::StackAttach {
+            iface: cap,
+            daemon,
+        })
+        .map_err(|_| "late FRAME original delegated grant")?
+        .admin;
+        let iface: Arc<dyn WirelessNetIface> = late.clone();
+        crate::registry::register(iface);
+        narf_net::iface::set_link_state(late.name(), true);
+        let ifindex = narf_net::iface::lookup(late.name())
+            .ok_or("late FRAME actual ifindex")?
+            .ifindex;
+        let source = Arc::new(LateSocket {
+            radio: late.clone(),
+            messages: IrqSafeSpinLock::new(Vec::new()),
+        });
+        TARGET.store(ifindex, Ordering::Release);
+        EVENTS.lock().clear();
+        if !send_original(ifindex, late.mac(), &admin, source.clone())?.is_empty() {
+            return Err("late FRAME escaped deferred native callback");
+        }
+        for _ in 0..256 {
+            narf_scheduler::poll_one_round();
+            if !source.messages.lock().is_empty() {
+                break;
+            }
+        }
+        if late.completed.load(Ordering::Acquire) != 1 {
+            return Err("late FRAME did not reach exact single native terminal");
+        }
+        let events = EVENTS.lock().len();
+        let messages = source.messages.lock();
+        if boundary == 0 {
+            if events != 1 || !messages.iter().any(|b| b.get(16) == Some(&59)) {
+                return Err("current native FRAME proof lost status/cookie");
+            }
+        } else if events != 0 || messages.iter().any(|b| b.get(16) == Some(&59)) {
+            return Err(
+                "late virtual/source callback retired native owner but FRAME published success",
+            );
+        }
+    }
+    Ok(())
+}
+fn client_frame_completion_receipt_denies_after_late_source_and_virtual_callbacks() -> TestResult {
+    late_completion().map_or_else(TestResult::Fail, |_| TestResult::Pass)
+}
+kernel_test_in!(
+    "wireless/radio_control",
+    client_frame_completion_receipt_denies_after_late_source_and_virtual_callbacks
 );

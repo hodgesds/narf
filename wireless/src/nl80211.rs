@@ -1239,6 +1239,11 @@ fn wiphy_security_attrs(attrs: &mut Vec<u8>, iface: &dyn crate::WirelessNetIface
     push_attr(attrs, NL80211_ATTR_MAX_NUM_PMKIDS, &[0]);
     let sme = iface.supports_userspace_mlme();
     let external = iface.supports_external_supplicant();
+    if let Some(capabilities) = iface.ap_sme_capabilities().filter(|_| iface.supports_ap()) {
+        // DEVICE_AP_SME is a u32 even when no optional capability is set.
+        // Only the currently defined SA_QUERY_OFFLOAD bit is meaningful.
+        push_attr(attrs, 141, &(capabilities & 1).to_ne_bytes());
+    }
     // These two flags promise the explicit native GO settings contract.
     // Raw legacy feature words cannot bypass the role/generation opt-in.
     let mut feature_flags = iface.nl80211_feature_flags() & !((1 << 11) | (1 << 12));

@@ -3,10 +3,38 @@
 use super::*;
 use alloc::{vec, vec::Vec};
 
+/// Denial-only proof retained after a real native FRAME terminal completion.
+/// Implementations must use only the original retained capability invokes,
+/// concrete weak-provider lifetimes, native atomic epochs and concrete policy
+/// snapshots. Never invoke a virtual interface/socket/source callback, take
+/// native State, poll hardware or wait here. This supplies no RF authority.
+pub trait RadioFrameCompletion: Send + Sync {
+    fn current(&self) -> bool;
+}
+struct FrameCompletionSlot {
+    recorded: narf_lib::sync::IrqSafeSpinLock<Option<(u64, Arc<dyn RadioFrameCompletion>)>>,
+    denied: core::sync::atomic::AtomicBool,
+}
+impl Default for FrameCompletionSlot {
+    fn default() -> Self {
+        Self {
+            recorded: narf_lib::sync::IrqSafeSpinLock::new(None),
+            denied: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+impl fmt::Debug for FrameCompletionSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FrameCompletionSlot")
+            .field("recorded", &self.recorded.lock().is_some())
+            .finish()
+    }
+}
 #[derive(Clone, Debug)]
 pub struct RadioControlAuthority {
     pub(super) guard: ApControlAuthority,
     pub(super) terminal: Arc<super::lifecycle::TerminalSlot>,
+    completion: Arc<FrameCompletionSlot>,
 }
 impl RadioControlAuthority {
     /// Native station/client/GO/device controls use the actual delegated
@@ -22,6 +50,7 @@ impl RadioControlAuthority {
         Ok(Self {
             guard: ApControlAuthority::bind_radio(admin, iface, namespace, ifindex, reply)?,
             terminal: Arc::new(super::lifecycle::TerminalSlot::default()),
+            completion: Arc::new(FrameCompletionSlot::default()),
         })
     }
     /// Bind an actual control-only P2P-device registration. There is no
@@ -36,11 +65,60 @@ impl RadioControlAuthority {
         Ok(Self {
             guard: ApControlAuthority::bind_control_wdev(admin, iface, namespace, wdev, reply)?,
             terminal: Arc::new(super::lifecycle::TerminalSlot::default()),
+            completion: Arc::new(FrameCompletionSlot::default()),
         })
     }
     pub fn current(&self) -> Result<(), WirelessError> {
-        self.guard.current()
+        self.guard.current()?;
+        self.frame_completion_current(None)
     }
+    /// Record exactly once on these original authority clones, only after
+    /// actual native terminal ACK/no-ACK and retirement. This optional adjunct
+    /// cannot admit a command, rebind a source or replace normal guard checks.
+    pub fn complete_frame_for<I: WirelessNetIface + ?Sized>(
+        &self,
+        receiver: &I,
+        cookie: u64,
+        proof: Arc<dyn RadioFrameCompletion>,
+    ) -> Result<(), WirelessError> {
+        self.check_for(receiver)?;
+        self.require_link()?;
+        if cookie == 0 || self.guard.mode != 8 || !self.has_reservation() || !proof.current() {
+            return Err(WirelessError::Denied);
+        }
+        {
+            let mut slot = self.completion.recorded.lock();
+            if slot.is_some() {
+                return Err(WirelessError::Denied);
+            }
+            *slot = Some((cookie, proof));
+        }
+        self.frame_completion_current(Some(cookie))
+    }
+    /// Fixed retained proof only. Full virtual/source checks must finish
+    /// first. None preserves existing providers; a recorded failure is final.
+    pub fn frame_completion_current(&self, cookie: Option<u64>) -> Result<(), WirelessError> {
+        use core::sync::atomic::Ordering;
+        if self.completion.denied.load(Ordering::Acquire) {
+            return Err(WirelessError::Denied);
+        }
+        let recorded = { self.completion.recorded.lock().clone() };
+        if let Some((actual, proof)) = recorded {
+            // Refusing a foreign cookie does not retire the real receipt.
+            if cookie.is_some_and(|expected| expected != actual) {
+                return Err(WirelessError::Denied);
+            }
+            if !proof.current() {
+                self.completion.denied.store(true, Ordering::Release);
+            }
+        }
+        if self.completion.denied.load(Ordering::Acquire) {
+            Err(WirelessError::Denied)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Explicitly retain this newly created child's actual current grant on
     /// the exact creating socket. The typed net operation also proves the
     /// registered parent-cap relation inside its parent/daemon/child invokes.
@@ -78,7 +156,8 @@ impl RadioControlAuthority {
         self.current()
     }
     pub fn check_for<I: WirelessNetIface + ?Sized>(&self, iface: &I) -> Result<(), WirelessError> {
-        self.guard.check_for(iface)
+        self.guard.check_for(iface)?;
+        self.frame_completion_current(None)
     }
     /// Require the actual admitted role without exporting its underlying
     /// grant. A current station/AP request cannot start a P2P-device BSS.
@@ -93,6 +172,7 @@ impl RadioControlAuthority {
         Ok(Self {
             guard: self.guard.reserve()?,
             terminal: self.terminal,
+            completion: self.completion,
         })
     }
     pub fn has_reservation(&self) -> bool {
@@ -134,7 +214,7 @@ impl RadioControlAuthority {
         if self.guard.mode != 10 {
             self.guard.require_up()?;
         }
-        Ok(())
+        self.frame_completion_current(None)
     }
     pub fn identity(&self) -> Result<RadioInterfaceIdentity, WirelessError> {
         self.require_link()?;

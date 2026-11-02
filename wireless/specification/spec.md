@@ -2433,6 +2433,57 @@ whose channel, role, key, callback-free emission and native TX/copy receipts
 remain mandatory. NO_CCK and matching IFINDEX/WDEV request forms keep their
 normal strict parser and original-source terminal checks.
 
+
+`RadioControlAuthority::complete_frame_for` optionally records one native
+CLIENT FRAME completion proof on the same original authority clones, after
+actual terminal ACK/no-ACK and packet retirement. The one-shot slot requires
+that original reserved CLIENT8/netdev authority and exact receiver/cookie;
+it cannot rebind a source, admit RF, create a grant or reuse a completion for
+another request. A duplicate record or mismatched cookie refuses that query
+without retiring an otherwise current receipt. An observed false native
+proof latches denial on all original clones; false-to-true provider state
+cannot revive it. Providers without this optional receipt retain their
+existing contract.
+`RadioFrameCompletion::current` is strictly a fixed denial proof: only original
+retained capability invokes, concrete weak-provider lifetimes, native atomic
+epochs and concrete policy snapshots are permitted. It must not call virtual
+interface/socket/source providers, take native State, poll or wait. Full
+normal guard callbacks finish first, then this original proof is rechecked
+by `current`, `check_for` and `require_link`. FRAME additionally checks after
+its final virtual wiphy/selector queries immediately before TX_STATUS and
+cookie publication; the original deferred authority retains that same proof
+for final reply/ACK delivery. Late callbacks cannot turn a retired native
+association, physical source, port/copy epoch or RF policy into success.
+
+`WirelessNetIface::ap_sme_capabilities()` defaults to `None`. A driver may
+return `Some(capabilities)` only for an actual firmware/device AP SME; `Some(0)`
+reports that owner without optional offloads. GET_WIPHY requires actual AP
+support and encodes DEVICE_AP_SME141 as a native-endian u32, preserving only
+known SA_QUERY_OFFLOAD bit0. It is not an empty NLA flag and supplies no WPA
+authenticator, key, peer authorization or RF authority. Existing absent defaults
+and host-SME contracts are unchanged.
+
+`ApEventAuthority::prepare_station_associated(peer, generation, assoc_req_ies)`
+and `prepare_station_lost(peer, generation)` prepare actual native firmware-SME
+NEW_STATION19/DEL_STATION20 notifications on the original START event source.
+They retain the original IFINDEX3/WDEV153 and serialize MAC6, observed u32
+GENERATION46 and empty nested STA_INFO21 when no measured fields are supplied.
+NEW_STATION additionally carries nonempty complete IE42 bytes, bounded2304;
+DEL_STATION invents no IEs, key/port state or reason. Peer identities must be
+unicast and nonzero. The wire generation, IEs and preparation grant no native
+association, authentication, authorization, key, DATA or RF authority.
+
+Preparation performs all dynamic source/interface callbacks and serialization
+outside native State. Before consuming the existing opaque `PreparedApEvent`,
+the concrete driver rechecks its original native source/RX epoch, exact AP/peer
+generation and fixed emission proof. Native loss applies its denial first;
+genuine station events need no DATA-port grant. Final token delivery performs
+only original fixed checks without endpoint lookup, fresh source capture or
+arbitrary current callbacks. Linux7.3-rc4 `nl80211_send_station` and
+`cfg80211_new_sta`/`cfg80211_del_sta_sinfo` define the notification fields;
+FullMAC firmware association indications must not be converted into invented
+raw Authentication/Association management frames.
+
 ## 4. Architecture: SoftMAC vs. FullMAC
 
 NARF supports both through the `WirelessIface` trait:

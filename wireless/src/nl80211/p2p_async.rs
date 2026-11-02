@@ -316,6 +316,11 @@ pub(super) fn defer(
                         // Native ACK and packet retirement are already complete.
                         // Status is MLME multicast using the original netdev
                         // IFINDEX or actual control-only WDEV selected above.
+                        // All virtual/source callbacks above have finished.
+                        // A driver-recorded original native receipt is the
+                        // last denial fence, including late wiphy queries.
+                        call.require_link().map_err(errno)?;
+                        call.frame_completion_current(Some(cookie)).map_err(errno)?;
                         publish_event(
                             NL80211_FAMILY_ID,
                             19,
@@ -326,6 +331,7 @@ pub(super) fn defer(
                             },
                         );
                         call.require_link().map_err(errno)?;
+                        call.frame_completion_current(Some(cookie)).map_err(errno)?;
                         let mut attrs = Vec::new();
                         push_attr(&mut attrs, 88, &cookie.to_ne_bytes());
                         replies.push(GenlReply {

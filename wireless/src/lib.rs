@@ -665,6 +665,13 @@ pub trait WirelessNetIface: Interface {
     fn supports_ap_userspace_mlme(&self) -> bool {
         self.supports_ap() && self.supports_userspace_mlme()
     }
+    /// Actual device/firmware AP SME capabilities (NL80211_ATTR_DEVICE_AP_SME).
+    /// None advertises no device AP SME; Some(0) promises a native AP SME
+    /// without optional offloads.
+    /// This does not offload the WPA authenticator, keys or controlled port.
+    fn ap_sme_capabilities(&self) -> Option<u32> {
+        None
+    }
 
     /// Send an Authentication frame and return the peer's response frame,
     /// delivered to userspace as NL80211_CMD_AUTHENTICATE.
