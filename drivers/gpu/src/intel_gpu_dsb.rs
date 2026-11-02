@@ -281,6 +281,16 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         lut: Option<&[u32]>,
         now: u64,
     ) -> Result<(), FsError> {
+        self.arm_color(timing, registers, lut, None, now)
+    }
+    pub(crate) fn arm_color(
+        &mut self,
+        timing: Timing,
+        registers: &[(u64, u32)],
+        lut: Option<&[u32]>,
+        degamma: Option<&[u32]>,
+        now: u64,
+    ) -> Result<(), FsError> {
         if self.armed {
             return Err(FsError::Busy);
         }
@@ -297,6 +307,9 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         if lut.is_some_and(|lut| ![256, 1024].contains(&lut.len())) {
             return Err(FsError::InvalidData);
         }
+        if degamma.is_some_and(|lut| lut.len() != 131) {
+            return Err(FsError::InvalidData);
+        }
         for id in 0..2 {
             if self.read(reg(id, 8))? & (ENABLE | BUSY) != 0 {
                 return Err(FsError::Unsupported);
@@ -307,8 +320,15 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         self.saved_imr = self.read(IMR)? & PIPE_BITS;
         let lease = self.lease.as_ref().ok_or(FsError::NoDevice)?;
         self.heads = [lease.start as u32, (lease.start + HALF) as u32];
-        self.chain = lut.is_some();
+        self.chain = lut.is_some() || degamma.is_some();
         let mut sub = Commands(Vec::new());
+        if let Some(lut) = degamma {
+            sub.write(0x4a484, 0);
+            sub.write(0x4a484, 1 << 10);
+            sub.emit(lut.len() as u32, (9 << 24) | 0x4a488);
+            sub.0.extend_from_slice(lut);
+            sub.write(0x4a484, 0);
+        }
         if let Some(lut) = lut {
             sub.write(0x4a400, 0);
             if lut.len() == 256 {
@@ -328,6 +348,8 @@ impl<M: DisplayAccess + Clone> Owner<M> {
                     sub.write(r, 1 << 16);
                 }
             }
+        }
+        if self.chain {
             sub.emit(1, 2 << 24); // +1us, mode's delayed-vblank interval is zero
             sub.emit(0, 7 << 24);
             sub.finish();

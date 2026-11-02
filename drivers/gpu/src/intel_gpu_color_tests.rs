@@ -167,6 +167,28 @@ fn lut_bytes(reverse: bool) -> alloc::vec::Vec<u8> {
         .collect()
 }
 fn smoke_intel_gamma_native_size_rounding_channels_and_reserved_word() -> TestResult {
+    let pre: Vec<u8> = (0..129)
+        .flat_map(|i| {
+            let v: u16 = match i {
+                0 => 0,
+                1 => 1,
+                2 => 128,
+                3 => 32768,
+                _ => 65535,
+            };
+            [
+                v.to_le_bytes(),
+                v.to_le_bytes(),
+                v.to_le_bytes(),
+                [0xaa, 0x55],
+            ]
+            .concat()
+        })
+        .collect();
+    let pre = DegammaLut::decode(&pre).unwrap();
+    assert_eq!(&pre.entries[..5], &[0, 0x100, 0x8000, 0x800080, 0xffffff]);
+    assert_eq!(pre.entries.len(), 131);
+    assert_eq!(&pre.entries[129..], &[1 << 24, 1 << 24]);
     let bytes = lut_bytes(false);
     let lut = Lut::decode(&bytes).unwrap();
     assert_eq!(lut.entries[0], 1023 << 10);
@@ -247,6 +269,17 @@ fn smoke_intel_gamma_inactive_preload_disable_replacement_and_original_restore()
     assert_eq!(io.palette_writes(), writes + LUT_SIZE);
     assert_eq!(io.read32(GAMMA), 0);
     assert_eq!(io.read32(MODE), 0);
+    // Retaining the original snapshot is not a pending restoration. Later
+    // CTM-only commits keep this already-restored RAM untouched.
+    let restored_writes = io.palette_writes();
+    owner.arm_color(&io, Some(identity()), None, 113).unwrap();
+    io.set(FRAME, 46);
+    owner.poll(&io, 114).unwrap().unwrap();
+    owner.arm_color(&io, None, None, 115).unwrap();
+    io.set(FRAME, 47);
+    owner.poll(&io, 116).unwrap().unwrap();
+    assert_eq!(io.palette_writes(), restored_writes);
+    assert!(!owner.palette_dirty);
     TestResult::Pass
 }
 kernel_test_in!(
@@ -263,6 +296,7 @@ fn smoke_intel_gamma_failed_preload_retains_original_for_fresh_recovery() -> Tes
         Err(FsError::NoDevice)
     );
     assert!(owner.original_palette.is_some());
+    assert!(owner.palette_dirty);
     assert!(owner.failed);
     assert_eq!(io.read32(GAMMA), 0);
     io.refuse_palette(false);
@@ -272,6 +306,7 @@ fn smoke_intel_gamma_failed_preload_retains_original_for_fresh_recovery() -> Tes
     io.set(FRAME, 41);
     assert!(owner.poll(&io, 103).unwrap().is_some());
     assert_eq!(io.palette_writes(), writes + LUT_SIZE);
+    assert!(!owner.palette_dirty);
     TestResult::Pass
 }
 kernel_test_in!(

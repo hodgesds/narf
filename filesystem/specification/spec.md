@@ -377,7 +377,9 @@ pub trait DirOps {
         gid: u32,
     ) -> FsFuture<'_, Arc<dyn FileOps>>;
 }
+pub struct ReadOptions { pub nonblocking: bool } // Default: false
 pub trait FileOps {
+    fn read_with_options<'a>(&'a self, offset: u64, buf: &'a mut [u8], options: ReadOptions) -> FsFuture<'a, usize>;
     fn ioctl_user(&self, cmd: u32, arg: u64, ctx: &dyn IoctlContext) -> FsFuture<'_, u64>;
     fn has_flush(&self) -> bool;
     fn anon_name(&self) -> Option<&'static str>; // anon_inodefs name, e.g. "[eventfd]"
@@ -496,6 +498,14 @@ pub fn unmap_mapping_range(file: &dyn FileOps, new_len: u64) -> Result<(), FsErr
 mode as one create operation when the backend supports it. The default adapts
 legacy backends by creating first and applying both metadata updates; tmpfs /
 `MemFs` initialises the inode and its quota charge atomically before insertion.
+
+`FileOps::read_with_options` receives a `ReadOptions { nonblocking }` snapshot
+for one invocation. The default delegates to `read`, preserving ordinary files.
+Streams with different blocking thresholds may override it; forwarding wrappers
+must pass the options unchanged. The syscall layer reads current shared
+open-description status immediately before invoking the operation, including
+after descriptor lookup and on subsequent calls. Neither numeric descriptors
+nor the stream object cache this status. Current-TTY forwarding preserves it.
 
 All operations submit through `abi/` rings when crossing the
 kernel↔user boundary; kernel-internal callers invoke directly.

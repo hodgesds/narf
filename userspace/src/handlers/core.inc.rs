@@ -4985,6 +4985,14 @@ impl CopyFdEndpoint {
         self.status_flags & crate::fd::O_NONBLOCK != 0
     }
 
+    fn read_options(&self) -> narf_filesystem::ReadOptions {
+        narf_filesystem::ReadOptions {
+            // Read current shared-description status at the invocation, not
+            // the fd lookup's earlier snapshot. dup/F_SETFL share this atomic.
+            nonblocking: self.description.status_flags() & crate::fd::O_NONBLOCK != 0,
+        }
+    }
+
     fn append(&self) -> bool {
         self.status_flags & crate::fd::O_APPEND != 0
     }
@@ -10197,7 +10205,9 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
             outcome
         } else {
             let mut staging = alloc::vec![0u8; iovec.len];
-            let read = poll_blocking(endpoint.ops.read(off, &mut staging))
+            let read = poll_blocking(endpoint.ops.read_with_options(
+                off, &mut staging, endpoint.read_options(),
+            ))
                 .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
             match read {
                 Ok(n) if n <= staging.len() => {

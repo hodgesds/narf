@@ -1,4 +1,4 @@
-//! Width-two through four, single-placement GuC groups. MIT Linux b90c984d
+//! Width-two through four GuC placement groups. MIT Linux b90c984d
 //! xe_guc_submit.c::{__register_mlrc_exec_queue,wq_item_append,submit_exec_queue}
 //! and xe_guc_submit_types.h. Scratch is a separate owned coherent page,
 //! leaving private PPHWSP breadcrumbs/restore batches undisturbed.
@@ -11,6 +11,7 @@ const JOIN_DONE: u64 = 128;
 
 pub(super) struct Lane<B: GpuBacking> {
     pub engine: Engine,
+    pub placements: EngineSet,
     pub image: B,
     pub ring: B,
     pub tail: u32,
@@ -96,16 +97,19 @@ pub(super) fn prepare<A: BootAllocator>(
     r: &mut Resources<A>,
     mut spec: Spec<'_, A::Backing>,
 ) -> Result<Group<A::Backing>, SchedulingError> {
-    let engines = spec.user.parallel().ok_or(SchedulingError::State)?;
+    let placements = spec
+        .user
+        .parallel_placements()
+        .ok_or(SchedulingError::State)?;
     let addresses = spec.resident.parallel().ok_or(SchedulingError::State)?;
-    if !(2..=crate::intel_gpu_user::MAX_PARALLEL_WIDTH).contains(&engines.len())
-        || addresses.len() + 1 != engines.len()
+    if !(2..=crate::intel_gpu_user::MAX_PARALLEL_WIDTH).contains(&placements.len())
+        || addresses.len() + 1 != placements.len()
     {
         return Err(SchedulingError::State);
     }
     let mut children = Vec::new();
     children
-        .try_reserve_exact(engines.len() - 1)
+        .try_reserve_exact(placements.len() - 1)
         .map_err(|_| SchedulingError::Full)?;
     let scratch = r.allocator.alloc(1).map_err(SchedulingError::Allocation)?;
     // Install the owner before fallible lane allocation. Every partial group
@@ -119,7 +123,8 @@ pub(super) fn prepare<A: BootAllocator>(
         join_deadline: None,
     };
     let result = (|| {
-        for &engine in &engines[1..] {
+        for &placements in &placements[1..] {
+            let engine = placements.iter().next().ok_or(SchedulingError::State)?;
             let image = r
                 .allocator
                 .alloc(engine.lrc_pages(spec.platform))
@@ -133,6 +138,7 @@ pub(super) fn prepare<A: BootAllocator>(
             };
             group.children.push(Lane {
                 engine,
+                placements,
                 image,
                 ring,
                 tail: 0,
@@ -206,7 +212,11 @@ pub(super) fn prepare<A: BootAllocator>(
                     spec.stamp,
                 )
             };
-            job_timeout::setup(image, spec.platform);
+            if lane.placements.iter().count() > 1 {
+                job_timeout::setup_virtual(image, spec.platform);
+            } else {
+                job_timeout::setup(image, spec.platform);
+            }
             job_timeout::prefix(image.ggtt_offset(), spec.stamp, lane.engine, &mut words);
             if words.len() % 2 != 0 {
                 words.push(0);

@@ -1,7 +1,11 @@
 #[allow(unused_imports)]
 use super::*;
 
-fn scatter_to_iovecs(iovecs: &[ImportedRwIovec], mut offset: usize, mut bytes: &[u8]) -> Result<(), u64> {
+fn scatter_to_iovecs(
+    iovecs: &[ImportedRwIovec],
+    mut offset: usize,
+    mut bytes: &[u8],
+) -> Result<(), u64> {
     for iovec in iovecs {
         if offset >= iovec.len {
             offset -= iovec.len;
@@ -108,21 +112,32 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
         return;
     }
     if let Some(pipe) = crate::pipe::Endpoint::from_file(endpoint.ops.as_ref()) {
-        read_pipe_user(ctx, &endpoint, &pipe, count, |mut offset, mut src, mut len| {
-            for iov in &iovecs {
-                if offset >= iov.len { offset -= iov.len; continue; }
-                let n = len.min(iov.len - offset);
-                // SAFETY: retained source fragment and imported destination;
-                // no Rust reference is formed over a mutable user-page pin.
-                unsafe { copy_raw_to_user(iov.base + offset as u64, src, n) }?;
-                len -= n;
-                if len == 0 { return Ok(()); }
-                // SAFETY: n bytes were consumed from this retained fragment.
-                src = unsafe { src.add(n) };
-                offset = 0;
-            }
-            Err(EFAULT as u64)
-        });
+        read_pipe_user(
+            ctx,
+            &endpoint,
+            &pipe,
+            count,
+            |mut offset, mut src, mut len| {
+                for iov in &iovecs {
+                    if offset >= iov.len {
+                        offset -= iov.len;
+                        continue;
+                    }
+                    let n = len.min(iov.len - offset);
+                    // SAFETY: retained source fragment and imported destination;
+                    // no Rust reference is formed over a mutable user-page pin.
+                    unsafe { copy_raw_to_user(iov.base + offset as u64, src, n) }?;
+                    len -= n;
+                    if len == 0 {
+                        return Ok(());
+                    }
+                    // SAFETY: n bytes were consumed from this retained fragment.
+                    src = unsafe { src.add(n) };
+                    offset = 0;
+                }
+                Err(EFAULT as u64)
+            },
+        );
         return;
     }
     // Past `if (!tot_len) goto out;`, a directory reaches
@@ -176,9 +191,7 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
             Err(handler_sys_read::TransactionalReadError::BadFd) => {
                 ctx.set_return(errno_ret(EBADF));
             }
-            Err(handler_sys_read::TransactionalReadError::WouldBlock)
-                if endpoint.nonblocking() || endpoint.ops.nonblock_read_eagain() =>
-            {
+            Err(handler_sys_read::TransactionalReadError::WouldBlock) if endpoint.nonblocking() => {
                 ctx.set_return(errno_ret(EAGAIN));
             }
             Err(handler_sys_read::TransactionalReadError::WouldBlock) => {
@@ -223,8 +236,18 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
     while total < count {
         let want = core::cmp::min(CHUNK, count - total);
         let mut staging = alloc::vec![0u8; want];
-        let outcome = poll_blocking(endpoint.ops.read(offset, &mut staging))
-            .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+        let options = endpoint.read_options();
+        let future = endpoint
+            .ops
+            .read_with_options(offset, &mut staging, options);
+        let outcome = if endpoint.ops.nonblock_read_eagain()
+            || (options.nonblocking && endpoint.ops.is_stream())
+        {
+            poll_once(future)
+        } else {
+            poll_blocking(future)
+        }
+        .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
         let read = match outcome {
             Ok(0) => break,
             Ok(n) if n <= want => n,
@@ -236,7 +259,7 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
                 break;
             }
             Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
-                if endpoint.nonblocking() || endpoint.ops.nonblock_read_eagain() {
+                if options.nonblocking {
                     ctx.set_return(errno_ret(EAGAIN));
                 } else if has_interrupting_signal(task) {
                     ctx.set_return(errno_ret(EINTR));

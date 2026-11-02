@@ -2022,6 +2022,15 @@ impl narf_filesystem::FileOps for CurrentTtyFile {
         self.inner.read(offset, buf)
     }
 
+    fn read_with_options<'a>(
+        &'a self,
+        offset: u64,
+        buf: &'a mut [u8],
+        options: narf_filesystem::ReadOptions,
+    ) -> narf_filesystem::FsFuture<'a, usize> {
+        self.inner.read_with_options(offset, buf, options)
+    }
+
     fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
         self.inner.write(offset, buf)
     }

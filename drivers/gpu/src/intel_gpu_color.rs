@@ -130,6 +130,87 @@ const INDEX: u64 = 0x4a400;
 const DATA: u64 = 0x4a404;
 const POST_ENABLE: u32 = 1 << 30;
 const MAX_REGS: [u64; 6] = [0x4a420, 0x4a424, 0x4a428, 0x4a430, 0x4a434, 0x4a438];
+const PRE_INDEX: u64 = 0x4a484;
+const PRE_DATA: u64 = 0x4a488;
+const PRE_ENABLE: u32 = 1 << 31;
+pub(crate) const DEGAMMA_SIZE: usize = 129;
+const PRE_WORDS: usize = 131;
+/// XE_LPDP_FEATURES: equal RGB and nondecreasing, U0.16 -> U0.24 rounded.
+/// glk_load_degamma_lut clamps its two extended-range entries at 1.0.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DegammaLut {
+    entries: Vec<u32>,
+}
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Luts {
+    pub(crate) post: Option<Arc<Lut>>,
+    pub(crate) pre: Option<Arc<DegammaLut>>,
+}
+impl DegammaLut {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Arc<Self>, FsError> {
+        if bytes.len() != DEGAMMA_SIZE * 8 {
+            return Err(FsError::InvalidData);
+        }
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(PRE_WORDS)
+            .map_err(|_| FsError::OutOfMemory)?;
+        let mut previous = 0;
+        for bytes in bytes.chunks_exact(8) {
+            let channel = |at| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+            let green = channel(2);
+            if channel(0) != green || channel(4) != green || green < previous {
+                return Err(FsError::InvalidData);
+            }
+            previous = green;
+            entries.push(((u64::from(green) * 0xffffff + 32767) / 65535) as u32);
+        }
+        entries.extend([1 << 24; 2]);
+        Ok(Arc::new(Self { entries }))
+    }
+}
+#[derive(Debug)]
+struct PrePalette(Vec<u32>);
+impl PrePalette {
+    fn capture(io: &impl MmioWindow) -> Result<Self, FsError> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(PRE_WORDS)
+            .map_err(|_| FsError::OutOfMemory)?;
+        for i in 0..PRE_WORDS {
+            io.write32(PRE_INDEX, i as u32);
+            let value = io.read32(PRE_DATA);
+            if value == u32::MAX {
+                io.write32(PRE_INDEX, 0);
+                return Err(FsError::NoDevice);
+            }
+            entries.push(value);
+        }
+        io.write32(PRE_INDEX, 0);
+        Ok(Self(entries))
+    }
+    fn matches(io: &impl MmioWindow, entries: &[u32]) -> bool {
+        let mut matches = true;
+        for (i, &value) in entries.iter().enumerate() {
+            io.write32(PRE_INDEX, i as u32);
+            matches &= io.read32(PRE_DATA) == value;
+        }
+        io.write32(PRE_INDEX, 0);
+        matches
+    }
+    fn write(io: &impl MmioWindow, entries: &[u32]) -> Result<(), FsError> {
+        io.write32(PRE_INDEX, 0);
+        io.write32(PRE_INDEX, 1 << 10);
+        for &value in entries {
+            io.write32(PRE_DATA, value);
+        }
+        io.write32(PRE_INDEX, 0);
+        if !Self::matches(io, entries) {
+            return Err(FsError::NoDevice);
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Lut {
     entries: Vec<u32>,
@@ -298,9 +379,18 @@ pub(crate) struct Update {
     lut: Option<Arc<Lut>>,
     restore_palette: bool,
     write_lut: bool,
+    degamma: Option<Arc<DegammaLut>>,
+    write_degamma: bool,
+    restore_pre: bool,
     pub(crate) registers: Vec<(u64, u32)>,
 }
 impl Update {
+    pub(crate) fn degamma(&self) -> Option<&[u32]> {
+        self.degamma
+            .as_ref()
+            .filter(|_| self.write_degamma)
+            .map(|lut| lut.entries.as_slice())
+    }
     pub(crate) fn lut(&self) -> Option<&[u32]> {
         self.lut
             .as_ref()
@@ -313,6 +403,7 @@ struct Pending {
     image: Image,
     gamma: u32,
     restore_palette: bool,
+    restore_pre: bool,
     start: u32,
     deadline: u64,
 }
@@ -325,6 +416,10 @@ pub(crate) struct Owner {
     expected: Image,
     expected_gamma: u32,
     original_palette: Option<Palette>,
+    original_pre: Option<PrePalette>,
+    palette_dirty: bool,
+    pre_dirty: bool,
+    degamma: Option<Arc<DegammaLut>>,
     lut: Option<Arc<Lut>>,
     pending: Option<Pending>,
     external_pending: bool,
@@ -354,6 +449,10 @@ impl Owner {
             expected: original,
             expected_gamma: gamma,
             original_palette: None,
+            original_pre: None,
+            palette_dirty: false,
+            pre_dirty: false,
+            degamma: None,
             lut: None,
             pending: None,
             external_pending: false,
@@ -372,11 +471,22 @@ impl Owner {
     ) -> Result<(), FsError> {
         self.arm_color(io, coefficients, self.lut.clone(), now)
     }
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn arm_color(
         &mut self,
         io: &impl MmioWindow,
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<Lut>>,
+        now: u64,
+    ) -> Result<(), FsError> {
+        self.arm_stages(io, coefficients, lut, self.degamma.clone(), now)
+    }
+    pub(crate) fn arm_stages(
+        &mut self,
+        io: &impl MmioWindow,
+        coefficients: Option<[u64; 9]>,
+        lut: Option<Arc<Lut>>,
+        degamma: Option<Arc<DegammaLut>>,
         now: u64,
     ) -> Result<(), FsError> {
         if self.failed {
@@ -388,12 +498,24 @@ impl Owner {
         // Single-buffered LUT: only inactive preload is source-qualified.
         // Same-LUT CTM changes do not touch palette memory at all.
         let changed = self.lut != lut;
-        if changed && self.expected_gamma & POST_ENABLE != 0 && lut.is_some() {
+        let changed_pre = self.degamma != degamma;
+        if ((changed && lut.is_some()) || (changed_pre && degamma.is_some()))
+            && self.expected_gamma & (POST_ENABLE | PRE_ENABLE) != 0
+        {
             return Err(FsError::Unsupported);
         }
         if !pipeline(io) || !self.expected.matches(io) || io.read32(GAMMA) != self.expected_gamma {
             self.failed = true;
             return Err(FsError::NoDevice);
+        }
+        if let Some(pre) = degamma.as_ref().filter(|_| changed_pre) {
+            if self.original_pre.is_none() {
+                self.original_pre = Some(PrePalette::capture(io)?);
+            }
+            self.failed = true;
+            self.pre_dirty = true;
+            PrePalette::write(io, &pre.entries)?;
+            self.failed = false;
         }
         if let Some(lut) = lut.as_ref().filter(|_| changed) {
             if self.original_palette.is_none() {
@@ -401,29 +523,38 @@ impl Owner {
             }
             // Retain original and uncertain ownership before the first write.
             self.failed = true;
+            self.palette_dirty = true;
             lut.write(io)?;
             self.failed = false;
         }
-        let gamma = if let Some(lut) = &lut {
+        let mut gamma = if let Some(lut) = &lut {
             (self.gamma & !3) | POST_ENABLE | lut.mode()
         } else {
             self.gamma
         };
-        let restore_palette = changed && lut.is_none() && self.original_palette.is_some();
+        if degamma.is_some() {
+            gamma |= PRE_ENABLE;
+        }
+        let both_off = lut.is_none() && degamma.is_none();
+        let restore_palette = both_off && self.palette_dirty;
+        let restore_pre = both_off && self.pre_dirty;
         self.lut = lut;
+        self.degamma = degamma;
         self.write(
             io,
             coefficients.map_or(self.original, Image::ctm),
             gamma,
             restore_palette,
+            restore_pre,
             now,
         )
     }
-    pub(crate) fn prepare_dsb(
+    pub(crate) fn prepare_stages(
         &mut self,
         io: &impl MmioWindow,
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<Lut>>,
+        degamma: Option<Arc<DegammaLut>>,
     ) -> Result<Update, FsError> {
         if self.failed {
             return Err(FsError::NoDevice);
@@ -442,29 +573,50 @@ impl Owner {
             }
             self.original_palette = Some(Palette::capture(io)?);
         }
+        if degamma.is_some() && self.original_pre.is_none() {
+            if self.expected_gamma & PRE_ENABLE != 0 {
+                return Err(FsError::NoDevice);
+            }
+            self.original_pre = Some(PrePalette::capture(io)?);
+        }
         let image = coefficients.map_or(self.original, Image::ctm);
-        let gamma = if let Some(lut) = &lut {
+        let mut gamma = if let Some(lut) = &lut {
             (self.gamma & !3) | POST_ENABLE | lut.mode()
         } else {
             self.gamma
         };
+        if degamma.is_some() {
+            gamma |= PRE_ENABLE;
+        }
         let mut registers: Vec<(u64, u32)> = REGISTERS.into_iter().zip(image.values).collect();
         registers.extend([(GAMMA, gamma), (MODE, image.mode)]);
-        let restore_palette =
-            self.lut.is_some() && lut.is_none() && self.original_palette.is_some();
+        let both_off = lut.is_none() && degamma.is_none();
+        let restore_palette = both_off && self.palette_dirty;
         self.external_pending = true;
         let write_lut = self.lut != lut;
+        let write_degamma = self.degamma != degamma;
+        let restore_pre = both_off && self.pre_dirty;
         Ok(Update {
             image,
             gamma,
             lut,
             restore_palette,
             write_lut,
+            degamma,
+            write_degamma,
+            restore_pre,
             registers,
         })
     }
     pub(crate) fn cancel_dsb_before_arm(&mut self) {
         self.external_pending = false;
+    }
+    /// Called synchronously after an arm that may expose palette commands,
+    /// before yielding the session. A strict pre-write refusal never reaches
+    /// this point. Keep the obligation through cancellation or partial DMA.
+    pub(crate) fn expose_dsb(&mut self, update: &Update) {
+        self.palette_dirty |= update.write_lut && update.lut.is_some();
+        self.pre_dirty |= update.write_degamma && update.degamma.is_some();
     }
     pub(crate) fn complete_dsb(
         &mut self,
@@ -486,10 +638,21 @@ impl Owner {
         if update.restore_palette {
             let original = self.original_palette.as_ref().expect("original palette");
             original.restore(io)?;
+            self.palette_dirty = false;
+        }
+        if let Some(pre) = &update.degamma {
+            if !PrePalette::matches(io, &pre.entries) {
+                return Err(FsError::NoDevice);
+            }
+        }
+        if update.restore_pre {
+            PrePalette::write(io, &self.original_pre.as_ref().expect("original pre").0)?;
+            self.pre_dirty = false;
         }
         self.expected = update.image;
         self.expected_gamma = update.gamma;
         self.lut = update.lut.clone();
+        self.degamma = update.degamma.clone();
         self.external_pending = false;
         self.failed = false;
         Ok(())
@@ -510,11 +673,18 @@ impl Owner {
             return Err(FsError::NoDevice);
         }
         self.lut = None;
+        self.degamma = None;
+        // Fresh recovery revalidates all retained original RAM, including
+        // stages restored before the loss. Ordinary bypassed CTM commits do
+        // not create this recovery-only obligation.
+        self.palette_dirty |= self.original_palette.is_some();
+        self.pre_dirty |= self.original_pre.is_some();
         self.write(
             io,
             self.original,
             self.gamma,
-            self.original_palette.is_some(),
+            self.palette_dirty,
+            self.pre_dirty,
             now,
         )
     }
@@ -524,6 +694,7 @@ impl Owner {
         image: Image,
         gamma: u32,
         restore_palette: bool,
+        restore_pre: bool,
         now: u64,
     ) -> Result<(), FsError> {
         let start = io.read32(FRAME);
@@ -535,6 +706,7 @@ impl Owner {
             image,
             gamma,
             restore_palette,
+            restore_pre,
             start,
             deadline: now.saturating_add(1_000_000_000),
         });
@@ -583,6 +755,13 @@ impl Owner {
                 let original = self.original_palette.as_ref().expect("saved palette");
                 self.failed = true;
                 original.restore(io)?;
+                self.palette_dirty = false;
+                self.failed = false;
+            }
+            if pending.restore_pre {
+                self.failed = true;
+                PrePalette::write(io, &self.original_pre.as_ref().expect("saved pre").0)?;
+                self.pre_dirty = false;
                 self.failed = false;
             }
             self.expected = pending.image;

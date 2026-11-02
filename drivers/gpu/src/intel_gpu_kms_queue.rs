@@ -134,7 +134,7 @@ impl Drop for Job {
 struct Projection {
     owner: u64,
     crtc: Crtc,
-    color: (u32, u32),
+    color: (u32, u32, u32),
     completion: Arc<Completion>,
 }
 struct State {
@@ -259,7 +259,7 @@ impl Queue {
             // Pin both resulting properties, including an unchanged CTM/LUT
             // inherited from a queued predecessor. Users may destroy blobs as
             // soon as admission returns; every pending job owns its own pins.
-            for id in [plan.next_ctm, plan.next_gamma]
+            for id in [plan.next_ctm, plan.next_gamma, plan.next_degamma]
                 .into_iter()
                 .filter(|&id| id != 0)
             {
@@ -327,7 +327,7 @@ impl Queue {
         state.projected = Some(Projection {
             owner: open,
             crtc: plan.next.clone(),
-            color: (plan.next_ctm, plan.next_gamma),
+            color: (plan.next_ctm, plan.next_gamma, plan.next_degamma),
             completion: completion.clone(),
         });
         state.jobs.push_back(Job {

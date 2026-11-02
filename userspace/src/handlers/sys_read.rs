@@ -26,8 +26,10 @@ pub(super) fn park_blocking_read(
                     .store(true, core::sync::atomic::Ordering::Release);
                 // The rewound read is restart-pending, so a signal that
                 // ends the park completes it as -EINTR unless SA_RESTART.
-                uc.syscall_restart_kind
-                    .store(crate::user_task::SYSCALL_RESTART_SYS, core::sync::atomic::Ordering::Release);
+                uc.syscall_restart_kind.store(
+                    crate::user_task::SYSCALL_RESTART_SYS,
+                    core::sync::atomic::Ordering::Release,
+                );
                 uc.syscall_parked_restarting
                     .store(true, core::sync::atomic::Ordering::Release);
                 ctx.save_user_state(uc.state.get() as *mut u8);
@@ -291,9 +293,8 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
             transactional_stream_read(endpoint.ops.as_ref(), want, |bytes| {
                 // SAFETY: read(2) validated the original range; this guarded
                 // copy catches protection changes racing that validation.
-                let result = unsafe {
-                    copy_to_user(user_ptr + total as u64 + copied as u64, bytes)
-                };
+                let result =
+                    unsafe { copy_to_user(user_ptr + total as u64 + copied as u64, bytes) };
                 if result.is_ok() {
                     copied += bytes.len();
                 }
@@ -367,9 +368,12 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
         // O_NONBLOCK description and parks until readable otherwise — Linux
         // `n_tty_read`, `eventfd_read`, `timerfd_read`, `signalfd_read` and
         // `evdev_read` all test `file->f_flags & O_NONBLOCK`.
+        let options = endpoint.read_options();
         let poll_once_only = endpoint.ops.nonblock_read_eagain()
-            || (endpoint.nonblocking() && endpoint.ops.is_stream());
-        let read_fut = endpoint.ops.read(offset, &mut staging);
+            || (options.nonblocking && endpoint.ops.is_stream());
+        let read_fut = endpoint
+            .ops
+            .read_with_options(offset, &mut staging, options);
         let outcome = if poll_once_only {
             poll_once(read_fut).unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
         } else {
@@ -401,7 +405,7 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
                 break;
             }
             Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
-                if endpoint.nonblocking() {
+                if options.nonblocking {
                     ctx.set_return(errno_ret(EAGAIN));
                     return;
                 }

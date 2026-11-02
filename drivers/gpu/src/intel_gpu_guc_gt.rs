@@ -268,7 +268,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             firmware_version: log.firmware_version,
             firmware_digest,
         });
-        buffer.capture(
+        buffer.capture_with_execution(
             report,
             identity,
             log.as_ref().map(|log| log.backing),
@@ -276,6 +276,16 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
                 .ct
                 .as_ref()
                 .and_then(XeLpgTransport::diagnostic_backing),
+            |destination, access| {
+                self.parts.scheduler.as_ref().map(|scheduler| {
+                    scheduler.diagnostic_backings(
+                        access,
+                        |info, parent, lane, image, ring, scratch, access| {
+                            destination.push(info, parent, lane, image, ring, scratch, access);
+                        },
+                    )
+                })
+            },
             || access() && self.awake().is_ok(),
         );
     }

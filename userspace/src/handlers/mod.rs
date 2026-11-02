@@ -55,3 +55,6 @@ pub use remote_vm::proc_mem_open;
 pub(crate) use remote_vm::{process_vm_transfer, ptrace_access_vm};
 
 pub(crate) mod phc;
+
+#[cfg(feature = "kernel-test")]
+mod read_options_tests;

@@ -11,7 +11,8 @@ use core::{
     sync::atomic::{fence, AtomicBool, Ordering},
 };
 use narf_filesystem::{
-    FileOps, FileType, FsError, FsFuture, IoctlContext, Mode, Stat, POLL_ERR, POLL_HUP, POLL_IN,
+    FileOps, FileType, FsError, FsFuture, IoctlContext, Mode, ReadOptions, Stat, POLL_ERR,
+    POLL_HUP, POLL_IN,
 };
 use narf_lib::{readiness::Readiness, sync::IrqSafeSpinLock};
 
@@ -121,6 +122,7 @@ struct Queue {
     head: usize,
     len: usize,
     overflow: bool,
+    pollin: bool,
     terminal: Option<FsError>,
 }
 /// One open description; hardware never writes this bounded host FIFO.
@@ -144,18 +146,19 @@ impl Session {
         if !(1..=7).contains(&config.rate) || config.wait == 0 || config.wait > info.reports() {
             return Err(FsError::InvalidData);
         }
-        if config.wait != 1 {
-            return Err(FsError::Unsupported);
-        }
+        // xe_eu_stall_stream_init bounds wait by all active physical rings.
+        // Reserve enough private host space for the accepted threshold before
+        // exposing any sampler. At 32 DSS this is at most 16 MiB/card.
+        let capacity = HOST_BYTES.max(config.wait as usize * RECORD);
         ACTIVE[info.card as usize]
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| FsError::Busy)?;
         let permit = Permit(info.card);
         let mut bytes = Vec::new();
         bytes
-            .try_reserve_exact(HOST_BYTES)
+            .try_reserve_exact(capacity)
             .map_err(|_| FsError::OutOfMemory)?;
-        bytes.resize(HOST_BYTES, 0);
+        bytes.resize(capacity, 0);
         Ok(Arc::new(Self {
             info,
             config,
@@ -165,6 +168,7 @@ impl Session {
                 head: 0,
                 len: 0,
                 overflow: false,
+                pollin: false,
                 terminal: None,
             }),
             ready: Readiness::new(0),
@@ -173,7 +177,9 @@ impl Session {
         }))
     }
     fn level(&self, q: &Queue) {
-        let mask = if q.len != 0 && (self.enabled.load(Ordering::Acquire) || q.terminal.is_some()) {
+        let mask = if q.len != 0
+            && ((q.pollin && self.enabled.load(Ordering::Acquire)) || q.terminal.is_some())
+        {
             POLL_IN
         } else {
             0
@@ -197,11 +203,11 @@ impl Session {
     }
     fn push(&self, data: &[u8]) -> bool {
         let mut q = self.queue.lock();
-        if data.len() > HOST_BYTES - q.len || q.terminal.is_some() {
+        if data.len() > q.bytes.len() - q.len || q.terminal.is_some() {
             return false;
         }
         for &value in data {
-            let at = (q.head + q.len) % HOST_BYTES;
+            let at = (q.head + q.len) % q.bytes.len();
             q.bytes[at] = value;
             q.len += 1;
         }
@@ -209,37 +215,60 @@ impl Session {
         true
     }
     fn room(&self) -> usize {
-        HOST_BYTES - self.queue.lock().len
+        let q = self.queue.lock();
+        q.bytes.len() - q.len
+    }
+    fn observe(&self, source_reports: u64) {
+        let mut q = self.queue.lock();
+        // The source's pollin is a sampled latch, cleared by read rather than
+        // by falling below the threshold. Count each report once: either in
+        // the acknowledged host FIFO or still behind a hardware read pointer.
+        q.pollin |= q.len as u64 / RECORD as u64 + source_reports >= self.config.wait;
+        self.level(&q);
     }
     fn dropped(&self) {
         let mut q = self.queue.lock();
         q.overflow = true;
         self.level(&q);
     }
-    fn read(&self, out: &mut [u8]) -> Result<usize, FsError> {
+    fn read_with_options(&self, out: &mut [u8], options: ReadOptions) -> Result<usize, FsError> {
         if out.len() < RECORD {
             return Err(FsError::InvalidData);
         }
         let mut q = self.queue.lock();
-        if q.overflow {
-            q.overflow = false;
-            self.level(&q);
-            return Err(crate::intel_gpu_user::io_error());
-        }
         if !self.enabled.load(Ordering::Acquire) && q.terminal.is_none() {
             return Err(FsError::InvalidData);
         }
+        // xe_eu_stall_stream_read: O_NONBLOCK bypasses wait_num_reports;
+        // blocking readers wait for the sampled pollin latch. Known loss and
+        // drop errors remain observable even when the threshold was not met.
+        if !options.nonblocking && !q.pollin && !q.overflow && q.terminal.is_none() {
+            return Err(FsError::WouldBlock);
+        }
+        if q.overflow {
+            q.overflow = false;
+            q.pollin = false;
+            self.level(&q);
+            return Err(crate::intel_gpu_user::io_error());
+        }
         let count = out.len().min(q.len).min(CHUNK) / RECORD * RECORD;
         if count == 0 {
+            q.pollin = false;
+            self.level(&q);
             return Err(q.terminal.unwrap_or(FsError::WouldBlock));
         }
         for byte in &mut out[..count] {
             *byte = q.bytes[q.head];
-            q.head = (q.head + 1) % HOST_BYTES;
+            q.head = (q.head + 1) % q.bytes.len();
             q.len -= 1;
         }
+        q.pollin = false;
         self.level(&q);
         Ok(count)
+    }
+    #[cfg(feature = "kernel-test")]
+    fn read(&self, out: &mut [u8]) -> Result<usize, FsError> {
+        self.read_with_options(out, ReadOptions { nonblocking: true })
     }
     #[cfg(feature = "kernel-test")]
     pub(crate) fn read_for_test(&self, out: &mut [u8]) -> Result<usize, FsError> {
@@ -292,9 +321,6 @@ fn properties(info: Info, mut address: u64, user: &dyn IoctlContext) -> Result<C
     }
     if !found {
         return Err(FsError::InvalidData);
-    }
-    if config.wait != 1 {
-        return Err(FsError::Unsupported);
     }
     Ok(config)
 }
@@ -372,12 +398,20 @@ impl Drop for File {
 }
 impl FileOps for File {
     fn read<'a>(&'a self, _: u64, output: &'a mut [u8]) -> FsFuture<'a, usize> {
+        self.read_with_options(0, output, ReadOptions::default())
+    }
+    fn read_with_options<'a>(
+        &'a self,
+        _: u64,
+        output: &'a mut [u8],
+        options: ReadOptions,
+    ) -> FsFuture<'a, usize> {
         Box::pin(async move {
             if !(self.gate.capable)() {
                 self.session.fail(FsError::OperationNotPermitted);
                 return Err(FsError::OperationNotPermitted);
             }
-            self.session.read(output)
+            self.session.read_with_options(output, options)
         })
     }
     fn write<'a>(&'a self, _: u64, _: &'a [u8]) -> FsFuture<'a, usize> {
@@ -610,6 +644,7 @@ impl<A: BootAllocator> Collector<A> {
                 queue.head = 0;
                 queue.len = 0;
                 queue.overflow = false;
+                queue.pollin = false;
                 session.enabled.store(true, Ordering::Release);
                 session.level(&queue);
                 Ok(())
@@ -719,7 +754,8 @@ impl<A: BootAllocator> Collector<A> {
             .filter(|i| self.info.dss & (1 << i) != 0)
             .map(|i| distance(self.read[i], self.write[i]) as u64 / RECORD as u64)
             .sum();
-        if available < session.config.wait || session.room() < RECORD {
+        session.observe(available);
+        if session.room() < RECORD {
             return Ok(());
         }
         let Some(i) = (0..32)

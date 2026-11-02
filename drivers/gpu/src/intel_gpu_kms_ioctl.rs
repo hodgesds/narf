@@ -265,6 +265,7 @@ enum Action {
         primary: bool,
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        degamma: Option<Arc<crate::intel_gpu_color::DegammaLut>>,
         dsb: Option<crate::intel_gpu_dsb::Timing>,
     },
     Cursor {
@@ -291,6 +292,8 @@ struct Plan {
     next_ctm: u32,
     previous_gamma: u32,
     next_gamma: u32,
+    previous_degamma: u32,
+    next_degamma: u32,
     legacy_store: Option<Vec<u16>>,
 }
 
@@ -357,7 +360,7 @@ impl Plan {
         request: Request,
         geometry: Geometry,
         previous: Option<Crtc>,
-        previous_color: Option<(u32, u32)>,
+        previous_color: Option<(u32, u32, u32)>,
     ) -> Result<Self, FsError> {
         let mut legacy_store = None;
         let request = match request {
@@ -371,9 +374,13 @@ impl Plan {
                     flags: 0,
                     cookie: 0,
                     objects: vec![crtc],
-                    counts: vec![2],
-                    props: vec![CRTC_CTM_PROP_ID, CRTC_GAMMA_LUT_PROP_ID],
-                    values: vec![0, u64::from(blob)],
+                    counts: vec![3],
+                    props: vec![
+                        CRTC_CTM_PROP_ID,
+                        CRTC_GAMMA_LUT_PROP_ID,
+                        CRTC_DEGAMMA_LUT_PROP_ID,
+                    ],
+                    values: vec![0, u64::from(blob), 0],
                 })
             }
             Request::Property {
@@ -408,15 +415,18 @@ impl Plan {
             })
             .ok_or(FsError::NoDevice)?;
         let wire = card.mode_wire(&fixed);
-        let (previous_ctm, previous_gamma) = previous_color.unwrap_or_else(|| {
-            card.crtc_color(previous.id)
-                .map_or((0, 0), |c| (c.ctm, c.gamma_lut))
-        });
+        let (previous_ctm, previous_gamma, previous_degamma) =
+            previous_color.unwrap_or_else(|| {
+                card.crtc_color(previous.id)
+                    .map_or((0, 0, 0), |c| (c.ctm, c.gamma_lut, c.degamma_lut))
+            });
         let mut p = Self {
             previous_ctm,
             next_ctm: previous_ctm,
             previous_gamma,
             next_gamma: previous_gamma,
+            previous_degamma,
+            next_degamma: previous_degamma,
             next: previous.clone(),
             previous,
             framebuffer: None,
@@ -435,6 +445,7 @@ impl Plan {
         let mut primary_changed = false;
         let mut color = None;
         let mut gamma = None;
+        let mut degamma = None;
         let mut color_compatible = true;
         let mut color_primary = false;
         let mut rect = [
@@ -458,6 +469,7 @@ impl Plan {
             Request::DropMaster => {
                 p.next_ctm = 0;
                 p.next_gamma = 0;
+                p.next_degamma = 0;
                 p.action = Action::DropMaster;
                 return Ok(p);
             }
@@ -467,6 +479,7 @@ impl Plan {
                 if p.next.primary_fb == Some(id) {
                     p.next_ctm = 0;
                     p.next_gamma = 0;
+                    p.next_degamma = 0;
                     p.next.primary_fb = None;
                     p.next.enabled = false;
                     p.next.mode = None;
@@ -594,6 +607,7 @@ impl Plan {
                                 prop,
                                 CRTC_CTM_PROP_ID
                                     | CRTC_GAMMA_LUT_PROP_ID
+                                    | CRTC_DEGAMMA_LUT_PROP_ID
                                     | CRTC_OUT_FENCE_PTR_PROP_ID
                             ))
                             || (object == PLANE_ID_BASE
@@ -677,6 +691,18 @@ impl Plan {
                                     }
                                     gamma = Some(id);
                                 }
+                                CRTC_DEGAMMA_LUT_PROP_ID => {
+                                    if !card.intel_color(p.next.id) {
+                                        return Err(FsError::Unsupported);
+                                    }
+                                    let id = u32_value(value)?;
+                                    if id != 0 {
+                                        crate::intel_gpu_color::DegammaLut::decode(
+                                            card.property_blob(id).ok_or(FsError::NotFound)?,
+                                        )?;
+                                    }
+                                    degamma = Some(id);
+                                }
                                 CRTC_ACTIVE_PROP_ID => {
                                     if value > 1 {
                                         return Err(FsError::InvalidData);
@@ -742,13 +768,15 @@ impl Plan {
             x: rect[0] >> 16,
             y: rect[1] >> 16,
         };
-        let panning = (primary_changed || color_primary || (color.is_none() && gamma.is_none()))
+        let panning = (primary_changed
+            || color_primary
+            || (color.is_none() && gamma.is_none() && degamma.is_none()))
             && (viewport != Viewport::default() || p.previous.x != 0 || p.previous.y != 0)
             && p.next.enabled
             && fb.is_some()
             && route.is_some();
         color_primary |= panning;
-        if color.is_some() || gamma.is_some() || panning {
+        if color.is_some() || gamma.is_some() || degamma.is_some() || panning {
             if !card.intel_color(p.next.id) {
                 return Err(FsError::Unsupported);
             }
@@ -814,9 +842,16 @@ impl Plan {
             if let Some(id) = gamma {
                 p.next_gamma = id;
             }
+            if let Some(id) = degamma {
+                p.next_degamma = id;
+            }
             // MTL's single-buffered LUT and independent color arms require
             // the owned DSB chain for active replacement/combined changes.
             let needs_dsb = color_primary
+                || ((p.previous_gamma != 0 || p.previous_degamma != 0)
+                    && ((p.next_degamma != p.previous_degamma && p.next_degamma != 0)
+                        || (p.next_gamma != p.previous_gamma && p.next_gamma != 0)))
+                || ((p.next_ctm != p.previous_ctm) && (p.next_degamma != p.previous_degamma))
                 || (p.next_ctm != p.previous_ctm && p.next_gamma != p.previous_gamma)
                 || (p.previous_gamma != 0 && p.next_gamma != 0 && p.next_gamma != p.previous_gamma);
             let dsb = needs_dsb.then_some(crate::intel_gpu_dsb::Timing {
@@ -850,10 +885,19 @@ impl Plan {
                     card.property_blob(p.next_gamma).ok_or(FsError::NotFound)?,
                 )?)
             };
+            let degamma = if p.next_degamma == 0 {
+                None
+            } else {
+                Some(crate::intel_gpu_color::DegammaLut::decode(
+                    card.property_blob(p.next_degamma)
+                        .ok_or(FsError::NotFound)?,
+                )?)
+            };
             p.action = Action::Color {
                 primary: color_primary,
                 coefficients,
                 lut,
+                degamma,
                 dsb,
             };
             return Ok(p);
@@ -885,6 +929,7 @@ impl Plan {
         } else if !p.next.enabled || fb.is_none() || route.is_none() {
             p.next_ctm = 0;
             p.next_gamma = 0;
+            p.next_degamma = 0;
             p.next.primary_fb = None;
             p.next.enabled = false;
             p.next.mode = None;
@@ -939,8 +984,12 @@ impl Plan {
         }
         if card
             .crtc_color(self.previous.id)
-            .map_or((0, 0), |c| (c.ctm, c.gamma_lut))
-            != (self.previous_ctm, self.previous_gamma)
+            .map_or((0, 0, 0), |c| (c.ctm, c.gamma_lut, c.degamma_lut))
+            != (
+                self.previous_ctm,
+                self.previous_gamma,
+                self.previous_degamma,
+            )
         {
             return false;
         }
@@ -1016,6 +1065,7 @@ trait Backend {
         &mut self,
         _coefficients: Option<[u64; 9]>,
         _lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        _degamma: Option<Arc<crate::intel_gpu_color::DegammaLut>>,
         _dsb: Option<crate::intel_gpu_dsb::Timing>,
     ) -> FsFuture<'_, FlipStamp> {
         Box::pin(async { Err(FsError::Unsupported) })
@@ -1026,7 +1076,7 @@ trait Backend {
         _geometry: Geometry,
         _viewport: Viewport,
         _coefficients: Option<[u64; 9]>,
-        _lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        _luts: crate::intel_gpu_color::Luts,
         _timing: crate::intel_gpu_dsb::Timing,
     ) -> FsFuture<'_, FlipStamp> {
         Box::pin(async { Err(FsError::Unsupported) })
@@ -1079,9 +1129,10 @@ impl<M: crate::intel_gpu_kms::Platform> Backend for crate::intel_gpu_kms::Guard<
         &mut self,
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        degamma: Option<Arc<crate::intel_gpu_color::DegammaLut>>,
         dsb: Option<crate::intel_gpu_dsb::Timing>,
     ) -> FsFuture<'_, FlipStamp> {
-        Box::pin(self.set_color_with_dsb(coefficients, lut, dsb))
+        Box::pin(self.set_color_with_dsb(coefficients, lut, degamma, dsb))
     }
     fn present_color(
         &mut self,
@@ -1089,10 +1140,10 @@ impl<M: crate::intel_gpu_kms::Platform> Backend for crate::intel_gpu_kms::Guard<
         geometry: Geometry,
         viewport: Viewport,
         coefficients: Option<[u64; 9]>,
-        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        luts: crate::intel_gpu_color::Luts,
         timing: crate::intel_gpu_dsb::Timing,
     ) -> FsFuture<'_, FlipStamp> {
-        Box::pin(self.present_color(object, geometry, viewport, coefficients, lut, timing))
+        Box::pin(self.present_color(object, geometry, viewport, coefficients, luts, timing))
     }
     fn cursor(
         &mut self,
@@ -1344,6 +1395,7 @@ async fn execute_plan<B: Backend>(
             primary,
             coefficients,
             lut,
+            degamma,
             dsb,
         } => {
             stamp = Some(if *primary {
@@ -1357,12 +1409,17 @@ async fn execute_plan<B: Backend>(
                             y: plan.next.y,
                         },
                         *coefficients,
-                        lut.clone(),
+                        crate::intel_gpu_color::Luts {
+                            post: lut.clone(),
+                            pre: degamma.clone(),
+                        },
                         dsb.ok_or(FsError::Unsupported)?,
                     )
                     .await?
             } else {
-                backend.color(*coefficients, lut.clone(), *dsb).await?
+                backend
+                    .color(*coefficients, lut.clone(), degamma.clone(), *dsb)
+                    .await?
             });
         }
         Action::Present => {
@@ -1482,6 +1539,7 @@ async fn execute_plan<B: Backend>(
             if let Some(color) = card.crtc_color.iter_mut().find(|c| c.crtc == plan.next.id) {
                 color.ctm = plan.next_ctm;
                 color.gamma_lut = plan.next_gamma;
+                color.degamma_lut = plan.next_degamma;
                 if let Some(store) = &plan.legacy_store {
                     color.gamma_store = store.clone();
                 }

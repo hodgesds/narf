@@ -285,9 +285,8 @@ impl XeFile {
         let width = u16::from_le_bytes(wire[8..10].try_into().unwrap());
         let count = u16::from_le_bytes(wire[10..12].try_into().unwrap());
         // xe_exec_queue.c bounds the copied placement matrix to nine entries.
-        // At most four admitted same-class lanes and one parallel row.
-        // Multiple placement rows require additional migration ownership.
-        if !((width == 1 && (1..=9).contains(&count)) || ((2..=4).contains(&width) && count == 1)) {
+        // At most four same-class lanes and nine copied matrix entries.
+        if !(1..=4).contains(&width) || count == 0 || u32::from(width) * u32::from(count) > 9 {
             return Err(FsError::InvalidData);
         }
         let instances = read(
@@ -352,17 +351,27 @@ impl XeFile {
             if !matches!(class, 1 | 4) {
                 return Err(FsError::InvalidData);
             }
-            let mut lanes = alloc::vec::Vec::new();
-            for (index, instance) in instances.chunks_exact(8).enumerate() {
-                let next = u16::from_le_bytes(instance[2..4].try_into().unwrap());
-                if logical.checked_add(index as u16) != Some(next) {
+            let mut lanes =
+                alloc::vec![crate::intel_gpu_engine::EngineSet::default();usize::from(width)];
+            let mut rows = BTreeSet::new();
+            for row in instances.chunks_exact(usize::from(width) * 8) {
+                let first = u16::from_le_bytes(row[2..4].try_into().unwrap());
+                if !rows.insert(first) {
                     return Err(FsError::InvalidData);
                 }
-                lanes.push(
-                    present
+                for (index, instance) in row.chunks_exact(8).enumerate() {
+                    let next = u16::from_le_bytes(instance[2..4].try_into().unwrap());
+                    if first.checked_add(index as u16) != Some(next) {
+                        return Err(FsError::InvalidData);
+                    }
+                    let engine = present
                         .from_class_instance(class, next)
-                        .ok_or(FsError::InvalidData)?,
-                );
+                        .ok_or(FsError::InvalidData)?;
+                    lanes[index] = crate::intel_gpu_engine::EngineSet::from_bits(
+                        lanes[index].bits()
+                            | crate::intel_gpu_engine::EngineSet::of(&[engine]).bits(),
+                    );
+                }
             }
             UserContext::for_parallel(lanes)?
         } else if class == 5 {

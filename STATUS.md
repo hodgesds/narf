@@ -1611,6 +1611,27 @@ aarch64 QEMU is omitted under the maintainer's iteration policy. The ledger
 records 32 implemented checkpoint rows and ten broad open workstreams;
 hardware and Mesa acceptance remain separate, unrun gates.
 
+After merge #1308, `codex/intel-software-next` continues from `693d03ed9`.
+The next checkpoint adds real GuC placement matrices with per-lane physical
+receipts/migration watchdogs, qualified MTL/Arrow pre-CSC degamma with owned
+DSB/FIFO restoration, full BMG EU-stall thresholds with per-invocation
+blocking status, and bounded retained execution data in privileged version-two
+failure bundles. Shared filesystem/userspace read adapters preserve current
+dup/F_SETFL status and ordinary-file defaults. Physical engine limits remain
+refusals; GuC CGP multi-queue groups are separate unfinished software.
+
+All 22 new fixtures pass. Selected Intel/DRM/framebuffer/backlight groups pass
+967 unique x86_64 tests with zero failures or skips, including all 31 shared
+backlight regressions. The filesystem group passes 628 tests with one existing
+RNG-registration skip; syscall ABI reports 2259 passing executions with four
+existing task-identity/address-discrimination harness skips. Production boot
+and both btrfs postflights pass. Target CI Clippy passes all three feature
+contexts on both architectures, all four host GPU configurations and host
+filesystem/userspace pass all-target Clippy, and debug/release builds and
+formatting pass. aarch64 QEMU is omitted under the maintainer's iteration
+policy. The ledger now records 36 implemented rows and ten broad open
+workstreams; Intel silicon and Mesa acceptance remain unrun.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

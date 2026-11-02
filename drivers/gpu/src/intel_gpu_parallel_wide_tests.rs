@@ -570,3 +570,7 @@ kernel_test_in!(
 mod joins {
     include!("intel_gpu_parallel_join_tests.rs");
 }
+
+mod matrices {
+    include!("intel_gpu_parallel_matrix_tests.rs");
+}

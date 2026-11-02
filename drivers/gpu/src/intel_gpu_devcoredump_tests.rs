@@ -119,7 +119,7 @@ fn smoke_coredump_wire_fixed_extents_and_immutable_reads() -> TestResult {
         || true,
     );
     let dump = snapshot(index).unwrap();
-    assert_eq!(dump.bytes.len(), 0x11c100);
+    assert_eq!(dump.bytes.len(), DUMP_BYTES);
     assert_eq!(&dump.bytes[..8], b"NARFCDMP");
     assert_eq!(
         (
@@ -127,7 +127,7 @@ fn smoke_coredump_wire_fixed_extents_and_immutable_reads() -> TestResult {
             word(&dump.bytes, 12),
             word(&dump.bytes, 16)
         ),
-        (1, 256, 0x11c100)
+        (2, 256, DUMP_BYTES as u32)
     );
     assert_eq!(word(&dump.bytes, 20), index);
     assert_eq!(word(&dump.bytes, 72), 7);
@@ -146,7 +146,7 @@ fn smoke_coredump_wire_fixed_extents_and_immutable_reads() -> TestResult {
     assert_eq!(ct.reads.get(), CT_BYTES / 4);
     assert_eq!(word(&dump.bytes, LOG_OFFSET), u32::MAX);
     assert_eq!(
-        word(&dump.bytes, DUMP_BYTES - 4),
+        word(&dump.bytes, EXEC_OFFSET - 4),
         u32::MAX ^ (CT_BYTES - 4) as u32
     );
     let mut captured_report = report();
@@ -482,4 +482,273 @@ fn smoke_coredump_fixed_report_limits_and_truncation() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_error",
     smoke_coredump_fixed_report_limits_and_truncation
+);
+
+fn execution_info(id: u16) -> ContextInfo {
+    ContextInfo {
+        engine: None,
+        placements: EngineSet::of(&[Engine::Ccs0, Engine::Ccs1]),
+        id,
+        request_stamp: 0x534e4150,
+        phase: ContextPhase::Running,
+        timed_out: true,
+        reset: false,
+        observed_runtime_ticks: Some(u32::MAX),
+    }
+}
+
+fn smoke_coredump_execution_wire_lrc_ring_scratch_and_immutable_reads() -> TestResult {
+    let index = free_slot();
+    let image = Backing::new(3 * 4096);
+    let ring = Backing::new(8192);
+    let scratch = Backing::new(4096);
+    image.seed.set(0x12345678);
+    ring.seed.set(0x89abcdef);
+    scratch.seed.set(0xfaceabcd);
+    Armed::reserve(index).unwrap().capture_with_execution(
+        report(),
+        None,
+        None::<&Backing>,
+        None::<&Backing>,
+        |output, access| {
+            output.push(
+                execution_info(37),
+                37,
+                0,
+                &image,
+                &ring,
+                Some(&scratch),
+                access,
+            );
+            output.push(execution_info(38), 37, 1, &image, &ring, None, access);
+            Some(2)
+        },
+        || true,
+    );
+    let dump = snapshot(index).unwrap();
+    // Version2 retains all v1 section offsets and adds bounded execution slots.
+    assert_eq!(word(&dump.bytes, 8), 2);
+    assert_eq!(dump.bytes.len(), 0x1b4540);
+    assert_eq!(word(&dump.bytes, 72), 9);
+    assert_eq!(word(&dump.bytes, 144), 0x11c100);
+    assert_eq!(word(&dump.bytes, 148), 64 + 8 * 0x13080);
+    assert_eq!(word(&dump.bytes, 152), 0);
+    let execution = &dump.bytes[0x11c100..];
+    assert_eq!(&execution[..8], b"NARFEXEC");
+    assert_eq!(
+        (word(execution, 8), word(execution, 12), word(execution, 16)),
+        (1, 64, 0x13080)
+    );
+    assert_eq!(
+        (
+            word(execution, 20),
+            word(execution, 24),
+            word(execution, 28),
+            word(execution, 32)
+        ),
+        (8, 2, 2, 2)
+    );
+    let first = &execution[64..];
+    assert_eq!(
+        (
+            word(first, 0),
+            word(first, 4),
+            word(first, 8),
+            word(first, 12)
+        ),
+        (37, 37, 0, 6)
+    );
+    assert_eq!(word(first, 16), 0x534e4150);
+    assert_eq!(word(first, 20), 5);
+    assert_eq!(word(first, 24), 0x18);
+    assert_eq!(word(first, 28), u32::MAX);
+    assert_eq!((word(first, 32), word(first, 36)), (u32::MAX, u32::MAX));
+    assert_eq!(word(first, 40), 7);
+    assert_eq!((word(first, 44), word(first, 48)), (0x11c1c0, 0x3000));
+    assert_eq!((word(first, 52), word(first, 56)), (0x12c1c0, 0x2000));
+    assert_eq!((word(first, 60), word(first, 64)), (0x12e1c0, 0x1000));
+    assert_eq!(word(&dump.bytes, 0x11c1c0), 0x12345678);
+    assert_eq!(word(&dump.bytes, 0x12c1c0), 0x89abcdef);
+    assert_eq!(word(&dump.bytes, 0x12e1c0), 0xfaceabcd);
+    assert!(dump.bytes[0x11f1c0..0x12c1c0].iter().all(|v| *v == 0));
+    let second = &execution[64 + 0x13080..];
+    assert_eq!(
+        (
+            word(second, 0),
+            word(second, 4),
+            word(second, 8),
+            word(second, 40)
+        ),
+        (38, 37, 1, 3)
+    );
+    assert_eq!((word(second, 60), word(second, 64)), (0, 0));
+    assert!(execution[64 + 2 * 0x13080..].iter().all(|v| *v == 0));
+    let file = File {
+        dump: dump.clone(),
+        gate: OPEN,
+        writable: false,
+    };
+    image.seed.set(0);
+    ring.seed.set(0);
+    scratch.seed.set(0);
+    let reads = (image.reads.get(), ring.reads.get(), scratch.reads.get());
+    for offset in [
+        EXEC_OFFSET + 60,
+        0x11c1be,
+        0x12c1be,
+        0x12e1be,
+        DUMP_BYTES - 5,
+    ] {
+        let mut output = [0xa5; 17];
+        let count = ready(file.read(offset as u64, &mut output)).unwrap();
+        assert_eq!(&output[..count], &dump.bytes[offset..offset + count]);
+    }
+    assert_eq!(
+        (image.reads.get(), ring.reads.get(), scratch.reads.get()),
+        reads
+    );
+    assert!(clear(index, dump.generation));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_error",
+    smoke_coredump_execution_wire_lrc_ring_scratch_and_immutable_reads
+);
+
+fn smoke_coredump_execution_capacity_and_invalid_backing_never_extend_bounds() -> TestResult {
+    let index = free_slot();
+    let image = Backing::new(3 * 4096);
+    let ring = Backing::new(8192);
+    Armed::reserve(index).unwrap().capture_with_execution(
+        report(),
+        None,
+        None::<&Backing>,
+        None::<&Backing>,
+        |output, access| {
+            for id in 1..=10 {
+                output.push(execution_info(id), id, 0, &image, &ring, None, access);
+            }
+            Some(10)
+        },
+        || true,
+    );
+    let dump = snapshot(index).unwrap();
+    let exec = &dump.bytes[EXEC_OFFSET..];
+    assert_eq!(
+        (
+            word(exec, 24),
+            word(exec, 28),
+            word(exec, 32),
+            word(exec, 36)
+        ),
+        (10, 8, 8, 1)
+    );
+    assert_eq!(image.reads.get(), 8 * 3 * 4096 / 4);
+    assert_eq!(ring.reads.get(), 8 * 8192 / 4);
+    assert!(clear(index, dump.generation));
+    drop(dump);
+    for kind in 0..4 {
+        let mut image = Backing::new(3 * 4096);
+        let mut ring = Backing::new(8192);
+        let mut info = execution_info(10);
+        match kind {
+            0 => image.pages = 17,
+            1 => ring.pages = 3,
+            2 => image.coherent = false,
+            _ => info.placements = EngineSet::of(&[Engine::Rcs0, Engine::Ccs0]),
+        }
+        Armed::reserve(index).unwrap().capture_with_execution(
+            report(),
+            None,
+            None::<&Backing>,
+            None::<&Backing>,
+            |output, access| {
+                output.push(info, 10, 0, &image, &ring, None, access);
+                Some(1)
+            },
+            || true,
+        );
+        let dump = snapshot(index).unwrap();
+        let exec = &dump.bytes[EXEC_OFFSET..];
+        let entry = &exec[64..];
+        assert_eq!(word(exec, 32), 0);
+        assert_ne!(word(exec, 36) & 12, 0);
+        if kind != 1 {
+            assert_eq!(image.reads.get(), 0);
+            assert_eq!(word(entry, 44), 0);
+            assert_eq!(word(entry, 48), 0);
+        }
+        if kind == 1 || kind == 3 {
+            assert_eq!(ring.reads.get(), 0);
+            assert_eq!(word(entry, 52), 0);
+            assert_eq!(word(entry, 56), 0);
+        }
+        assert!(clear(index, dump.generation));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_error",
+    smoke_coredump_execution_capacity_and_invalid_backing_never_extend_bounds
+);
+
+fn smoke_coredump_execution_current_access_loss_zeros_partial_and_stops_later_reads() -> TestResult
+{
+    for deny_after in [0, 1, 3, 4, 5, 7] {
+        let index = free_slot();
+        let image = Backing::new(3 * 4096);
+        let ring = Backing::new(8192);
+        let scratch = Backing::new(4096);
+        let mut calls = 0;
+        Armed::reserve(index).unwrap().capture_with_execution(
+            report(),
+            None,
+            None::<&Backing>,
+            None::<&Backing>,
+            |output, access| {
+                output.push(
+                    execution_info(1),
+                    1,
+                    0,
+                    &image,
+                    &ring,
+                    Some(&scratch),
+                    access,
+                );
+                Some(1)
+            },
+            || {
+                calls += 1;
+                calls != deny_after + 1
+            },
+        );
+        assert_eq!(calls, deny_after + 1);
+        let dump = snapshot(index).unwrap();
+        let exec = &dump.bytes[EXEC_OFFSET..];
+        let entry = &exec[64..];
+        assert_eq!(word(exec, 36) & 2, 2);
+        assert_eq!(word(exec, 32), 0);
+        let available = word(entry, 40);
+        if available & 1 == 0 {
+            assert!(entry[128..128 + IMAGE_BYTES].iter().all(|v| *v == 0));
+        }
+        if available & 2 == 0 {
+            assert!(entry[128 + IMAGE_BYTES..128 + IMAGE_BYTES + RING_BYTES]
+                .iter()
+                .all(|v| *v == 0));
+        }
+        assert!(entry[128 + IMAGE_BYTES + RING_BYTES..EXEC_STRIDE]
+            .iter()
+            .all(|v| *v == 0));
+        assert_eq!(scratch.reads.get(), 0);
+        if deny_after <= 4 {
+            assert_eq!(ring.reads.get(), 0);
+        }
+        assert!(clear(index, dump.generation));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_error",
+    smoke_coredump_execution_current_access_loss_zeros_partial_and_stops_later_reads
 );

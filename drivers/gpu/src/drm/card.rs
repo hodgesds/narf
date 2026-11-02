@@ -441,6 +441,8 @@ pub struct CrtcColor {
     pub crtc: u32,
     pub ctm: u32,
     pub gamma_lut: u32,
+    /// Intel's 129-entry pre-CSC LUT (absent on the AMD profile).
+    pub degamma_lut: u32,
     /// `drm_crtc::gamma_store`: `LEGACY_GAMMA_SIZE` red, then green, then
     /// blue entries, initialised to the identity ramp (`i << 8`).
     pub gamma_store: Vec<u16>,
@@ -452,6 +454,7 @@ impl CrtcColor {
             crtc,
             ctm: 0,
             gamma_lut: 0,
+            degamma_lut: 0,
             gamma_store: ramp.clone().chain(ramp.clone()).chain(ramp).collect(),
         }
     }
@@ -1724,7 +1727,7 @@ impl Card {
             && (self
                 .crtc_color
                 .iter()
-                .any(|c| c.ctm == id || c.gamma_lut == id)
+                .any(|c| c.ctm == id || c.gamma_lut == id || c.degamma_lut == id)
                 || self
                     .native
                     .iter()
@@ -1793,6 +1796,7 @@ impl Card {
             for color in &mut self.crtc_color {
                 color.ctm = 0;
                 color.gamma_lut = 0;
+                color.degamma_lut = 0;
             }
         }
         self.collect_blobs();

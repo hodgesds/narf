@@ -190,8 +190,11 @@ impl<B: GpuBacking> Context<B> {
             group.children.iter().enumerate().map(move |(index, lane)| {
                 let mut info = primary;
                 info.id = self.id + index as u16 + 1;
-                info.engine = Some(lane.engine);
-                info.placements = EngineSet::of(&[lane.engine]);
+                info.engine =
+                    job_timeout::observed_engine(&lane.image, self.stamp, lane.placements)
+                        .ok()
+                        .flatten();
+                info.placements = lane.placements;
                 info.timed_out = self.timed_out && group.timeout_lanes & (1 << (index + 1)) != 0;
                 info.reset = self.reset && group.reset_lanes & (1 << (index + 1)) != 0;
                 info.observed_runtime_ticks = lane.runtime.diagnostic_ticks();
@@ -201,16 +204,23 @@ impl<B: GpuBacking> Context<B> {
     }
     fn owns_engine(&self, engine: Engine) -> bool {
         self.placements.contains(engine)
-            || self
-                .parallel
-                .as_ref()
-                .is_some_and(|group| group.children.iter().any(|lane| lane.engine == engine))
+            || self.parallel.as_ref().is_some_and(|group| {
+                group
+                    .children
+                    .iter()
+                    .any(|lane| lane.placements.contains(engine))
+            })
     }
     fn diagnostic(&self) -> ContextInfo {
+        let mut info = self.software_diagnostic();
+        info.engine = job_timeout::observed_engine(&self.image, self.stamp, self.placements)
+            .ok()
+            .flatten();
+        info
+    }
+    fn software_diagnostic(&self) -> ContextInfo {
         ContextInfo {
-            engine: job_timeout::observed_engine(&self.image, self.stamp, self.placements)
-                .ok()
-                .flatten(),
+            engine: None,
             placements: self.placements,
             id: self.id,
             request_stamp: self.stamp,
@@ -417,6 +427,75 @@ impl<A: BootAllocator> GuCScheduler<A> {
         contexts
     }
 
+    /// Allocation-free owned views; metadata here is host-only and never
+    /// reads a restore receipt. The caller supplies the same sticky current
+    /// authority to each bounded raw copy. Return the full retained lane
+    /// count even if authority ends or the destination truncates the views.
+    pub(crate) fn diagnostic_backings(
+        &self,
+        access: &mut dyn FnMut() -> bool,
+        mut visit: impl FnMut(
+            ContextInfo,
+            u16,
+            u8,
+            &dyn GpuBacking,
+            &dyn GpuBacking,
+            Option<&dyn GpuBacking>,
+            &mut dyn FnMut() -> bool,
+        ),
+    ) -> usize {
+        let total = self.resources.contexts.iter().map(Context::width).sum();
+        for guilty in [true, false] {
+            for context in self
+                .resources
+                .contexts
+                .iter()
+                .filter(|context| (context.timed_out || context.reset) == guilty)
+            {
+                if !access() {
+                    return total;
+                }
+                let primary = context.software_diagnostic();
+                visit(
+                    primary,
+                    context.id,
+                    0,
+                    &context.image,
+                    &context.ring,
+                    context
+                        .parallel
+                        .as_ref()
+                        .map(|group| &group.scratch as &dyn GpuBacking),
+                    access,
+                );
+                if let Some(group) = &context.parallel {
+                    for (index, lane) in group.children.iter().enumerate() {
+                        if !access() {
+                            return total;
+                        }
+                        let mut info = primary;
+                        info.id = context.id + index as u16 + 1;
+                        info.placements = lane.placements;
+                        info.timed_out =
+                            context.timed_out && group.timeout_lanes & (1 << (index + 1)) != 0;
+                        info.reset = context.reset && group.reset_lanes & (1 << (index + 1)) != 0;
+                        info.observed_runtime_ticks = lane.runtime.diagnostic_ticks();
+                        visit(
+                            info,
+                            context.id,
+                            index as u8 + 1,
+                            &lane.image,
+                            &lane.ring,
+                            None,
+                            access,
+                        );
+                    }
+                }
+            }
+        }
+        total
+    }
+
     pub(crate) fn take_error_report(&mut self) -> Option<Report> {
         self.pending_error.take()
     }
@@ -602,13 +681,17 @@ impl<A: BootAllocator> GuCScheduler<A> {
         if context.parallel().map(|lanes| lanes.len() - 1) != batch.0.parallel().map(<[_]>::len) {
             return Err(SchedulingError::State);
         }
-        if let Some(lanes) = context.parallel() {
+        if let Some(lanes) = context.parallel_placements() {
             let first = self
                 .engines
-                .logical_instance(lanes[0])
+                .logical_mask(lanes[0])
                 .ok_or(SchedulingError::State)?;
-            if lanes.iter().enumerate().any(|(index, engine)| {
-                first.checked_add(index as u16) != self.engines.logical_instance(*engine)
+            if lanes.iter().enumerate().any(|(index, lane)| {
+                Some(first << index) != self.engines.logical_mask(*lane)
+                    || lane.iter().any(|candidate| {
+                        candidate.xe_class() != engine.xe_class()
+                            || candidate.lrc_pages(self.platform) != engine.lrc_pages(self.platform)
+                    })
             }) {
                 return Err(SchedulingError::State);
             }
@@ -722,13 +805,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
             .as_ref()
             .and_then(|claim| claim.parallel())
             .map_or(1, <[_]>::len);
-        let placements = user.as_ref().map_or(EngineSet::of(&[engine]), |claim| {
-            if width > 1 {
-                EngineSet::of(&[engine])
-            } else {
-                claim.placements()
-            }
-        });
+        let placements = user
+            .as_ref()
+            .map_or(EngineSet::of(&[engine]), |claim| claim.placements());
         let live = |stamp| self.resources.contexts.iter().any(|c| c.stamp == stamp);
         let (id, stamp) = if width == 1 {
             self.identities.candidate(live)?
@@ -1081,10 +1160,16 @@ impl<A: BootAllocator> GuCScheduler<A> {
                             return Err(SchedulingError::Protocol);
                         }
                         if seq != 0 && !lane.finished {
+                            let physical = job_timeout::observed_engine(
+                                &lane.image,
+                                context.stamp,
+                                lane.placements,
+                            )?
+                            .ok_or(SchedulingError::Protocol)?;
                             resources
                                 .engines
                                 .iter_mut()
-                                .find(|e| e.engine == lane.engine)
+                                .find(|e| e.engine == physical)
                                 .expect("scheduler engine")
                                 .last_progress = Some(now);
                             lane.finished = true;
@@ -1159,17 +1244,23 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         if lane.finished {
                             continue;
                         }
-                        let (child_expired, child_progressed) = lane.runtime.expired(
+                        let (child_expired, child_progressed) = lane.runtime.expired_on(
                             &lane.image,
                             context.stamp,
-                            lane.engine,
+                            lane.placements,
                             ct.window(),
                         )?;
                         if child_progressed {
+                            let physical = job_timeout::observed_engine(
+                                &lane.image,
+                                context.stamp,
+                                lane.placements,
+                            )?
+                            .ok_or(SchedulingError::Protocol)?;
                             resources
                                 .engines
                                 .iter_mut()
-                                .find(|e| e.engine == lane.engine)
+                                .find(|e| e.engine == physical)
                                 .expect("scheduler engine")
                                 .last_progress = Some(now);
                         }
@@ -1349,7 +1440,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         .iter()
                         .flat_map(|g| g.children.iter())
                         .filter(|lane| !lane.finished)
-                        .map(|lane| lane.engine),
+                        .flat_map(|lane| lane.placements.iter()),
                 )
                 .filter_map(|engine| state_of(&resources.engines, engine).last_progress)
                 .max();
@@ -1433,6 +1524,10 @@ impl<A: BootAllocator> GuCScheduler<A> {
                     job_timeout::observed_engine(&c.image, c.stamp, c.placements)?
                         .ok_or(SchedulingError::Protocol)?;
                     if let Some(group) = &c.parallel {
+                        for lane in &group.children {
+                            job_timeout::observed_engine(&lane.image, c.stamp, lane.placements)?
+                                .ok_or(SchedulingError::Protocol)?;
+                        }
                         user.capture_lanes(
                             core::iter::once(&c.image)
                                 .chain(group.children.iter().map(|lane| &lane.image)),

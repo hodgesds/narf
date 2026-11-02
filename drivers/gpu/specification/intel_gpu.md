@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.27** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.28** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -18,7 +18,8 @@
 > additional power thresholds/intervals, GuC LFD export, width-two through
 > width-four groups, full-AUX panel backlight, protected GuC failure bundles,
 > fixed hardware cursor, DG2 visible VRAM, flush-coordinated GuC streams,
-> parallel GPU user-fence joins, legacy gamma, BMG PSYS controls and EU-stall sampling — see §20).
+> parallel GPU user-fence joins, legacy gamma, BMG PSYS controls, EU-stall sampling,
+> placement matrices, pre-CSC degamma, sampled read thresholds and execution coredumps — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -2122,6 +2123,8 @@ The `codex/intel-software-completion` branch starts from main's merge of
 #1279 (`a2e0ec2ce`). Its backlog is every remaining software feature in §19,
 including later platform profiles. Intel silicon, physical link qualification and
 Mesa execution acceptance remain separately recorded evidence gates.
+After merge #1308, `codex/intel-software-next` continues from merged main
+`693d03ed9`; the following ledger includes both branches' checkpoints.
 
 A feature closes only after its production entry point, resource lifetime,
 reset/suspend behavior and refusal paths are implemented, its public contract
@@ -2153,9 +2156,9 @@ production feature. Unsupported functionality remains unadvertised.
 | GuC width-one load balancing | Same-class placement mask, private per-restore hardware engine receipt, migration-aware watchdog, retained LRC/VM/retirement ownership | Implemented; native fixtures pass |
 | i915 virtual contexts | LOAD_BALANCE proto-map extension through the production GuC backend, copied distinct same-class placements, transactional namespace and migration/retirement ownership | Implemented; native fixtures pass |
 | GuC width-two through width-four groups | Single-row adjacent dense logical COPY/COMPUTE lanes, protected scratch/workqueue, contiguous IDs, independent saved/runtime state and all-lane retirement | Implemented; native fixtures pass |
-| Engine scheduling | Multi-placement parallel queues, multi-row and render groups | Open; queue dependencies |
+| Engine scheduling | GuC multi-queue/CGP primary-secondary groups and dynamic multi-queue priority; protected queues with their firmware/security dependencies | Open; separate queue protocols |
 | Media GT | Independent firmware/wake/cache/CT owner, VCS/VECS scheduling and HuC loading/authentication | Open; separate GT lifecycle |
-| Diagnostics/performance | Full devcoredump, broader loss-accounted log capture, OA, broader EU-stall profiles/thresholds and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
+| Diagnostics/performance | Full devcoredump with VM/user-BO bodies, broader loss-accounted log capture, OA, additional sampling platforms and remaining i915 perf/SSEU/parameter interfaces | Open; explicit ownership and disclosure bounds |
 | Atomic display | General watermark/DBUF/CDCLK/pcode transactions, multi-pipe and bigjoiner, DSC and VRR, tiled/compressed buffers and additional planes | Open; modeset resource transactions |
 | Output support | MTL external-display admission, Type-C/Thunderbolt PHY and alt mode, HDMI 2.1, DP UHBR, owned hotplug, qualified PSR2/panel replay | Open; per-platform display profiles |
 | DSB color transactions | Fixed progressive MTL/Arrow Pipe-A active LUT replacement and joint primary/CTM/gamma arms; retained command/primary mappings, dual hardware witnesses, cancellation/restoration markers and independent DMA retirement | Implemented; native fixtures pass |
@@ -2172,9 +2175,13 @@ production feature. Unsupported functionality remains unadvertised.
 | Fixed hardware cursor | Qualified MTL/Arrow Pipe-A 64x64 legacy cursor, owned PM_DEMAND/DBUF/MBUS/watermarks, private permanent slots, FIFO writer waits and independent cursor/DSB retirement | Implemented; native fixtures pass |
 | GuC flush-coordinated streaming | Independent admin/syslog opt-in, two-frame event/crash FIFO, copy-before-cursor/ACK, observed-loss refusal, acknowledged policy restoration and reset quarantine | Implemented; native fixtures pass |
 | Parallel GPU user-fence joins | Parent GGTT waits on every child, one PPGTT qword store, private final marker, independent payload and final-join watchdogs and all-lane retirement | Implemented; native fixtures pass |
-| Legacy Intel gamma | Actual256-entry8-bit palette, copied GET/SET ramps through owned KMS FIFO, duplicate posted DSB writes, hardware-confirmed store and original-palette restoration | Implemented; native fixtures pass |
+| Legacy Intel gamma | Actual 256-entry 8-bit palette, copied GET/SET ramps through owned KMS FIFO, duplicate posted DSB writes, hardware-confirmed store and original-palette restoration | Implemented; native fixtures pass |
 | BMG whole-card PSYS controls | Paired PL1/PL2 and intervals through fair shared PCODE owner, independent retained ceilings, explicit source switch and exact whole-pair readback | Implemented; native fixtures pass |
 | BMG EU-stall sampling | Default-off privileged Xe observation, real sparse-DSS MCR buffers, bounded host FIFO, copy-before-ack, loss reporting and reset-owned DMA lifetime | Implemented; native fixtures pass |
+| GuC placement matrices | Distinct adjacent rows, immutable per-lane masks, every-restore physical receipts, migration watchdogs and all-lane final capture/retirement | Implemented; native fixtures pass |
+| Pipe-A pre-CSC degamma | Exact 129-entry equal-channel monotonic LUT, source 24-bit/131-word programming, triple-blob FIFO/DSB ownership and original-state restoration | Implemented; native fixtures pass |
+| EU-stall read thresholds | Full physical threshold range, bounded preallocated host capacity, sampled readiness latch and current per-invocation blocking/nonblocking status across scalar/vector/positioned reads | Implemented; native fixtures pass |
+| Retained execution coredumps | Preallocated version-two failure bundles with eight bounded LRC/ring/group-scratch slots, host-only lane identity, explicit missing/truncated data and unchanged reset ownership | Implemented; native fixtures pass |
 | GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, dynamic MERT/L2-flush coordination, media power and writable fan/thermal controls | Open; mapping revocation and platform PM |
 | Additional platforms | Gen12 GuC admission, Lunar Lake and Panther Lake profiles and their execution/display probes | Open; primary-source register/firmware contracts |
 
@@ -2614,3 +2621,52 @@ multi-placement/multi-row/render scheduling, broader diagnostics, atomic
 display/outputs/services, power and additional platforms remain open. These
 rows differ substantially in scope and do not form a completion percentage.
 Intel silicon and Mesa acceptance remain separate, unrun gates.
+
+The next branch starts at merged main #1308 and adds four production paths:
+
+- Native Xe parallel COPY/COMPUTE queues accept distinct placement rows with
+  immutable per-lane masks and physical restore receipts. Qualified compute
+  sets permit 2×2, 2×3 and 3×2 matrices; every lane retains independent migration,
+  runtime, progress and final-capture evidence. The parent mask/shift protocol,
+  GPU user-fence join, saved state and all-lane DMA lifetime remain owned.
+  Single-RCS and two-COPY physical limits are truthful refusals. GuC CGP
+  multi-queue groups and dynamic group priority remain separate software work.
+- Fixed MTL/Arrow Pipe-A admits a 129-entry equal-channel, nondecreasing
+  DEGAMMA_LUT. Exact 24-bit conversion plus two extended 1.0 entries drives the
+  real 131-word pre-CSC palette. Triple-blob FIFO projection, DSB pre-before-post
+  programming, unchanged-stage preservation and later-frame original-state
+  restoration cover joint primary/CTM/gamma changes, cancellation and recovery.
+  Legacy gamma resets pre-CSC and CTM through the same owned transaction.
+- EU-stall WAIT_NUM_REPORTS supports the complete physical 1..8192-per-DSS range
+  with fallible preallocation up to 16 MiB of host FIFO before attachment.
+  Each 5 ms sample latches readiness from host plus unread-source records, counted
+  once. Nonblocking reads bypass the threshold; blocking reads require the
+  sampled latch, and every successful read clears it. The defaulted filesystem
+  read-options adapter carries current shared open-description status through
+  scalar/vector/positioned reads and TTY forwarding. Dup/F_SETFL changes are
+  sampled at invocation; blocking readv retains readiness parking.
+- Version-two failure bundles retain bounded LRC, ring and parent-only group
+  scratch copies under the actual reset owner. Eight fixed slots have exact
+  host-owned extents, host-only lane identity, missing/truncated-data flags and
+  sticky per-chunk access loss. Capture does not allocate, issue commands or
+  release original storage. Privileged immutable readers remain independent of
+  later mutation, reset and generation-matched clear. The sanitized public
+  report still excludes raw execution data; VM/user-BO capture remains open.
+
+All 22 new native fixtures pass. Selected Intel/DRM/framebuffer/backlight groups
+pass 967 unique x86_64 tests, including all 31 shared backlight regressions,
+with zero failures or skips. The full filesystem group passes 628 tests with
+one existing RNG-registration skip; the syscall ABI group reports 2259 passing
+executions and four existing `/proc` task-identity/address-discrimination skips.
+The x86_64 production boot and both btrfs postflights pass.
+GPU/fb/filesystem/userspace target CI Clippy passes all three feature contexts
+on both architectures; all four host GPU configurations and host
+filesystem/userspace pass all-target Clippy. Debug/release builds pass on both
+targets. Formatting, diff and source-integrity checks pass. aarch64 QEMU is
+omitted because no aarch64-specific production behavior changes.
+
+The ledger records 36 implemented checkpoint rows and ten broad open workstreams.
+Remaining work includes CGP multi-queue groups and dynamic priority, VM faults
+and address mirrors, local-memory migration, media GTs, broader diagnostics,
+general atomic display/outputs/services, power and additional platforms. Intel silicon and Mesa acceptance
+remain separate, unrun gates.

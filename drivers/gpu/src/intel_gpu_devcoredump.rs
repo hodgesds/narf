@@ -3,15 +3,16 @@
 //! MIT Linux b90c984d xe_devcoredump.c::{devcoredump_snapshot,
 //! xe_devcoredump_snapshot_free}, xe_guc_ct.c::xe_guc_ct_snapshot_capture and
 //! xe_guc_log.c::xe_guc_log_snapshot_capture. This bounded NARF format is a
-//! partial device coredump: no user BO, VM or LRC image is captured. Opaque
-//! firmware/CT bytes can contain addresses and commands and require CAP_SYSLOG.
+//! partial device coredump: retained LRC/ring/group scratch is bounded; user
+//! BOs and VM tables are excluded. Raw bytes can disclose addresses, commands
+//! and execution data and require current CAP_SYSLOG on every descriptor read.
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{fence, AtomicU64, AtomicU8, Ordering};
 use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
-use super::{Report, Snapshot, MAX_CARDS, MAX_REPORT_BYTES};
+use super::{ContextInfo, ContextPhase, Report, Snapshot, MAX_CARDS, MAX_REPORT_BYTES};
 use crate::{intel_gpu_guc_log::Identity, intel_gpu_rcs::GpuBacking};
 
 pub(crate) const HEADER_BYTES: usize = 256;
@@ -20,7 +21,16 @@ pub(crate) const CT_BYTES: usize = 6 * 4096;
 const REPORT_OFFSET: usize = HEADER_BYTES;
 const LOG_OFFSET: usize = REPORT_OFFSET + MAX_REPORT_BYTES;
 const CT_OFFSET: usize = LOG_OFFSET + LOG_BYTES;
-pub(crate) const DUMP_BYTES: usize = CT_OFFSET + CT_BYTES;
+const EXEC_OFFSET: usize = CT_OFFSET + CT_BYTES;
+const EXEC_HEADER_BYTES: usize = 64;
+const EXEC_ENTRY_BYTES: usize = 128;
+const EXEC_LIMIT: usize = 8;
+const IMAGE_BYTES: usize = 16 * 4096;
+const RING_BYTES: usize = 2 * 4096;
+const SCRATCH_BYTES: usize = 4096;
+const EXEC_STRIDE: usize = EXEC_ENTRY_BYTES + IMAGE_BYTES + RING_BYTES + SCRATCH_BYTES;
+const EXEC_BYTES: usize = EXEC_HEADER_BYTES + EXEC_LIMIT * EXEC_STRIDE;
+pub(crate) const DUMP_BYTES: usize = EXEC_OFFSET + EXEC_BYTES;
 const CAP_SYSLOG: u32 = 34;
 const CAP_SYS_ADMIN: u32 = 21;
 static RETAINED: [AtomicU8; MAX_CARDS] = [const { AtomicU8::new(0) }; MAX_CARDS];
@@ -137,12 +147,25 @@ impl Armed {
         })))
     }
 
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn capture(
+        self,
+        report: Report,
+        identity: Option<Identity>,
+        log: Option<&impl GpuBacking>,
+        ct: Option<&impl GpuBacking>,
+        access: impl FnMut() -> bool,
+    ) {
+        self.capture_with_execution(report, identity, log, ct, |_, _| None, access);
+    }
+
+    pub(crate) fn capture_with_execution(
         mut self,
         mut report: Report,
         identity: Option<Identity>,
         log: Option<&impl GpuBacking>,
         ct: Option<&impl GpuBacking>,
+        execution: impl FnOnce(&mut ExecutionCapture<'_>, &mut dyn FnMut() -> bool) -> Option<usize>,
         mut access: impl FnMut() -> bool,
     ) {
         let dump = Arc::get_mut(&mut self.0).expect("unpublished crash destination");
@@ -190,14 +213,28 @@ impl Armed {
                 sections |= 2;
             }
             if ct.is_some_and(|backing| {
-                copy_backing(backing, &mut bytes[CT_OFFSET..], &mut checked_access)
+                copy_backing(
+                    backing,
+                    &mut bytes[CT_OFFSET..EXEC_OFFSET],
+                    &mut checked_access,
+                )
             }) {
                 sections |= 4;
             }
         }
+        let mut destination =
+            ExecutionCapture::new(&mut bytes[EXEC_OFFSET..], report.capture.platform);
+        let total = execution(&mut destination, &mut checked_access);
+        if denied {
+            destination.flags |= 2;
+        }
+        let execution_flags = destination.finish(total);
+        if total.is_some() {
+            sections |= 8;
+        }
         bytes[..8].copy_from_slice(b"NARFCDMP");
         for (offset, value) in [
-            (8, 1),
+            (8, 2),
             (12, HEADER_BYTES as u32),
             (16, DUMP_BYTES as u32),
             (20, dump.permit.0),
@@ -214,6 +251,9 @@ impl Armed {
             (132, CT_BYTES as u32),
             // Sequential passive copy, preallocated, no device-freeze proof.
             (136, 7),
+            (144, EXEC_OFFSET as u32),
+            (148, EXEC_BYTES as u32),
+            (152, execution_flags),
         ] {
             put32(bytes, offset, value);
         }
@@ -221,6 +261,175 @@ impl Armed {
         put64(bytes, 40, report.capture.now_ns);
         put64(bytes, 24, dump.generation);
         publish(self.0);
+    }
+}
+
+/// Fixed slots contain only retained host-owned allocations. GPU addresses and
+/// firmware/user lengths never select a source or extend a copy. This is a
+/// sequential snapshot, not an atomic freeze or a user-BO/VM dump.
+pub(crate) struct ExecutionCapture<'a> {
+    bytes: &'a mut [u8],
+    platform: crate::intel_gpu_gt::GtPlatform,
+    recorded: usize,
+    complete: usize,
+    flags: u32,
+}
+impl<'a> ExecutionCapture<'a> {
+    fn new(bytes: &'a mut [u8], platform: crate::intel_gpu_gt::GtPlatform) -> Self {
+        Self {
+            bytes,
+            platform,
+            recorded: 0,
+            complete: 0,
+            flags: 0,
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push(
+        &mut self,
+        info: ContextInfo,
+        parent: u16,
+        lane: u8,
+        image: &dyn GpuBacking,
+        ring: &dyn GpuBacking,
+        scratch: Option<&dyn GpuBacking>,
+        access: &mut dyn FnMut() -> bool,
+    ) {
+        if self.recorded == EXEC_LIMIT {
+            return;
+        }
+        let slot = EXEC_HEADER_BYTES + self.recorded * EXEC_STRIDE;
+        self.recorded += 1;
+        let phase = match info.phase {
+            ContextPhase::Invalidate => 0,
+            ContextPhase::Invalidating => 1,
+            ContextPhase::Register => 2,
+            ContextPhase::Policy => 3,
+            ContextPhase::Enable => 4,
+            ContextPhase::Enabling => 5,
+            ContextPhase::Running => 6,
+            ContextPhase::Disable => 7,
+            ContextPhase::Disabling => 8,
+            ContextPhase::Deregister => 9,
+            ContextPhase::Deregistering => 10,
+            ContextPhase::RetireInvalidate => 11,
+            ContextPhase::RetireInvalidating => 12,
+        };
+        for (offset, value) in [
+            (0, u32::from(info.id)),
+            (4, u32::from(parent)),
+            (8, u32::from(lane)),
+            (12, phase),
+            (16, info.request_stamp),
+            (
+                20,
+                u32::from(info.timed_out)
+                    | u32::from(info.reset) << 1
+                    | u32::from(info.observed_runtime_ticks.is_some()) << 2,
+            ),
+            (24, u32::from(info.placements.bits())),
+            (28, info.observed_runtime_ticks.unwrap_or(0)),
+            (
+                32,
+                info.engine
+                    .map_or(u32::MAX, |engine| u32::from(engine.xe_class())),
+            ),
+            (
+                36,
+                info.engine
+                    .map_or(u32::MAX, |engine| engine.physical_instance()),
+            ),
+        ] {
+            put32(self.bytes, slot + offset, value);
+        }
+        let first = info.placements.iter().next();
+        let image_pages = first.map(|engine| engine.lrc_pages(self.platform));
+        let same_layout = first.is_some_and(|first| {
+            info.placements.iter().all(|engine| {
+                engine.xe_class() == first.xe_class()
+                    && engine.lrc_pages(self.platform) == first.lrc_pages(self.platform)
+            })
+        });
+        let mut available = 0u32;
+        let targets = [
+            (image, slot + EXEC_ENTRY_BYTES, IMAGE_BYTES, image_pages),
+            (
+                ring,
+                slot + EXEC_ENTRY_BYTES + IMAGE_BYTES,
+                RING_BYTES,
+                Some(2),
+            ),
+        ];
+        for (index, (backing, offset, capacity, expected)) in targets.into_iter().enumerate() {
+            let pages = backing.size_pages();
+            if !same_layout
+                || expected != Some(pages)
+                || pages == 0
+                || pages as usize > capacity / 4096
+            {
+                self.flags |= 4;
+                continue;
+            }
+            let length = pages as usize * 4096;
+            if copy_backing(backing, &mut self.bytes[offset..offset + length], access) {
+                available |= 1 << index;
+                put32(
+                    self.bytes,
+                    slot + 44 + index * 8,
+                    (EXEC_OFFSET + offset) as u32,
+                );
+                put32(self.bytes, slot + 48 + index * 8, length as u32);
+            } else {
+                self.flags |= 8;
+            }
+        }
+        if let Some(scratch) = scratch {
+            let offset = slot + EXEC_ENTRY_BYTES + IMAGE_BYTES + RING_BYTES;
+            if lane != 0 || scratch.size_pages() != 1 {
+                self.flags |= 4;
+            } else if copy_backing(
+                scratch,
+                &mut self.bytes[offset..offset + SCRATCH_BYTES],
+                access,
+            ) {
+                available |= 4;
+                put32(self.bytes, slot + 60, (EXEC_OFFSET + offset) as u32);
+                put32(self.bytes, slot + 64, SCRATCH_BYTES as u32);
+            } else {
+                self.flags |= 8;
+            }
+        }
+        put32(self.bytes, slot + 40, available);
+        if available == if scratch.is_some() { 7 } else { 3 } {
+            self.complete += 1;
+        }
+        // The common closure latches any denial through the remaining log,
+        // CT, image, ring and scratch copies. Never retry a known loss.
+        if !access() {
+            self.flags |= 2;
+        }
+    }
+    fn finish(mut self, total: Option<usize>) -> u32 {
+        let Some(total) = total else {
+            return 0;
+        };
+        if total > self.recorded {
+            self.flags |= 1;
+        }
+        self.bytes[..8].copy_from_slice(b"NARFEXEC");
+        for (offset, value) in [
+            (8, 1),
+            (12, EXEC_HEADER_BYTES as u32),
+            (16, EXEC_STRIDE as u32),
+            (20, EXEC_LIMIT as u32),
+            (24, total as u32),
+            (28, self.recorded as u32),
+            (32, self.complete as u32),
+            (36, self.flags),
+        ] {
+            put32(self.bytes, offset, value);
+        }
+        self.flags
     }
 }
 
@@ -234,9 +443,9 @@ fn put64(bytes: &mut [u8], offset: usize, value: u64) {
 /// and renewed D0/capability/wake proof for every fixed 4KiB chunk. Descriptor
 /// pointers, lengths and cursor values are opaque bytes, never copy bounds.
 fn copy_backing(
-    backing: &impl GpuBacking,
+    backing: &(impl GpuBacking + ?Sized),
     output: &mut [u8],
-    access: &mut impl FnMut() -> bool,
+    access: &mut (impl FnMut() -> bool + ?Sized),
 ) -> bool {
     if !backing.coherent_for_device()
         || u64::from(backing.size_pages()) * 4096 != output.len() as u64
@@ -288,6 +497,14 @@ fn publish(dump: Arc<Dump>) {
     }
     slot.generation = dump.generation;
     slot.dump = Some(dump);
+}
+#[cfg(feature = "kernel-test")]
+pub(crate) fn snapshot_bytes_for_test(index: u32) -> Option<Vec<u8>> {
+    Some(snapshot(index)?.bytes.clone())
+}
+#[cfg(feature = "kernel-test")]
+pub(crate) fn clear_for_test(index: u32) -> bool {
+    snapshot(index).is_some_and(|dump| clear(index, dump.generation))
 }
 fn snapshot(index: u32) -> Option<Arc<Dump>> {
     DUMPS.lock().get(index as usize)?.dump.clone()

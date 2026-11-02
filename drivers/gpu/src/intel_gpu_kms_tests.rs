@@ -35,6 +35,8 @@ struct Hardware {
     actions: Vec<Action>,
     palette: [u32; 1024],
     palette_writes: usize,
+    pre_palette: [u32; 131],
+    pre_writes: usize,
     legacy_collisions: bool,
     legacy_posted: usize,
     refuse_palette: bool,
@@ -86,6 +88,8 @@ impl MockPlatform {
                 actions: Vec::new(),
                 palette: core::array::from_fn(|i| i as u32),
                 palette_writes: 0,
+                pre_palette: core::array::from_fn(|i| i as u32 + 17),
+                pre_writes: 0,
                 legacy_collisions: false,
                 legacy_posted: 0,
                 refuse_palette: false,
@@ -145,6 +149,12 @@ impl MockPlatform {
     }
     pub(crate) fn palette_writes(&self) -> usize {
         self.0.lock().palette_writes
+    }
+    pub(crate) fn pre_writes(&self) -> usize {
+        self.0.lock().pre_writes
+    }
+    pub(crate) fn pre_palette(&self) -> [u32; 131] {
+        self.0.lock().pre_palette
     }
     pub(crate) fn refuse_palette(&self, refuse: bool) {
         self.0.lock().refuse_palette = refuse;
@@ -329,6 +339,9 @@ impl MmioWindow for MockPlatform {
         if offset == 0x4a404 {
             return hw.palette[(hw.regs.get(&0x4a400).copied().unwrap_or(0) & 1023) as usize];
         }
+        if offset == 0x4a488 {
+            return hw.pre_palette[(hw.regs.get(&0x4a484).copied().unwrap_or(0) & 255) as usize];
+        }
         hw.regs.get(&offset).copied().unwrap_or(0)
     }
     fn write32(&self, offset: u64, value: u32) {
@@ -405,7 +418,16 @@ impl Hardware {
                 return;
             }
         }
-        if offset == 0x4a404 {
+        if offset == 0x4a488 {
+            self.pre_writes += 1;
+            if !self.refuse_palette {
+                let index = self.regs.get(&0x4a484).copied().unwrap_or(0);
+                self.pre_palette[(index & 255) as usize] = value;
+                if index & (1 << 10) != 0 {
+                    self.regs.insert(0x4a484, (1 << 10) | ((index + 1) & 255));
+                }
+            }
+        } else if offset == 0x4a404 {
             self.palette_writes += 1;
             if !self.refuse_palette {
                 let index = self.regs.get(&0x4a400).copied().unwrap_or(0);

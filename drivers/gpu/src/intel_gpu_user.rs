@@ -195,12 +195,18 @@ struct State {
 }
 
 #[derive(Debug)]
+struct ParallelPlacements {
+    engines: Vec<crate::intel_gpu_engine::Engine>,
+    lanes: Vec<crate::intel_gpu_engine::EngineSet>,
+}
+
+#[derive(Debug)]
 pub struct UserContext {
     /// Orders callers while allowing GT/timer tasks to run during waits.
     pub(crate) serial: Mutex<()>,
     engine: crate::intel_gpu_engine::Engine,
     placements: crate::intel_gpu_engine::EngineSet,
-    parallel: Option<Vec<crate::intel_gpu_engine::Engine>>,
+    parallel: Option<ParallelPlacements>,
     state: IrqSafeSpinLock<State>,
 }
 
@@ -234,13 +240,19 @@ impl UserContext {
     }
 
     pub(crate) fn for_parallel(
-        lanes: impl AsRef<[crate::intel_gpu_engine::Engine]>,
+        lanes: Vec<crate::intel_gpu_engine::EngineSet>,
     ) -> Result<Arc<Self>, FsError> {
-        let lanes = lanes.as_ref();
+        let first = lanes
+            .first()
+            .and_then(|set| set.iter().next())
+            .ok_or(FsError::InvalidData)?;
         if !(2..=MAX_PARALLEL_WIDTH).contains(&lanes.len())
-            || !(lanes[0].is_copy() || lanes[0].is_compute())
-            || lanes.iter().enumerate().any(|(i, engine)| {
-                engine.xe_class() != lanes[0].xe_class() || lanes[..i].contains(engine)
+            || !(first.is_copy() || first.is_compute())
+            || lanes.iter().any(|set| {
+                set.iter().next().is_none()
+                    || set
+                        .iter()
+                        .any(|engine| engine.xe_class() != first.xe_class())
             })
         {
             return Err(FsError::InvalidData);
@@ -249,18 +261,26 @@ impl UserContext {
         owned
             .try_reserve_exact(lanes.len())
             .map_err(|_| FsError::OutOfMemory)?;
-        owned.extend_from_slice(lanes);
+        owned.extend(
+            lanes
+                .iter()
+                .map(|set| set.iter().next().expect("validated lane")),
+        );
+        let placements = lanes[0];
         Ok(Self::with_placements(
-            lanes[0],
-            crate::intel_gpu_engine::EngineSet::of(lanes),
-            Some(owned),
+            first,
+            placements,
+            Some(ParallelPlacements {
+                engines: owned,
+                lanes,
+            }),
         ))
     }
 
     fn with_placements(
         engine: crate::intel_gpu_engine::Engine,
         placements: crate::intel_gpu_engine::EngineSet,
-        parallel: Option<Vec<crate::intel_gpu_engine::Engine>>,
+        parallel: Option<ParallelPlacements>,
     ) -> Arc<Self> {
         Arc::new(Self {
             serial: Mutex::new(()),
@@ -288,7 +308,14 @@ impl UserContext {
         self.placements
     }
     pub(crate) fn parallel(&self) -> Option<&[crate::intel_gpu_engine::Engine]> {
-        self.parallel.as_deref()
+        self.parallel
+            .as_ref()
+            .map(|parallel| parallel.engines.as_slice())
+    }
+    pub(crate) fn parallel_placements(&self) -> Option<&[crate::intel_gpu_engine::EngineSet]> {
+        self.parallel
+            .as_ref()
+            .map(|parallel| parallel.lanes.as_slice())
     }
     pub(crate) fn last(&self) -> Option<Arc<CompletionFence>> {
         self.state.lock().last.clone()
@@ -399,6 +426,9 @@ impl ContextClaim {
     }
     pub(crate) fn parallel(&self) -> Option<&[crate::intel_gpu_engine::Engine]> {
         self.context.parallel()
+    }
+    pub(crate) fn parallel_placements(&self) -> Option<&[crate::intel_gpu_engine::EngineSet]> {
+        self.context.parallel_placements()
     }
     pub(crate) fn restore(&self, image: &impl GpuBacking) {
         self.restore_lane(image, 0);

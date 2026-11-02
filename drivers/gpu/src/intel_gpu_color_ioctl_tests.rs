@@ -82,8 +82,13 @@ fn submit(queue: &queue::Queue, cpu: &Cpu, events: &Events) -> Arc<queue::Comple
         .as_mut()
         .poll(&mut Context::from_waker(Waker::noop()))
     {
-        Poll::Ready(Ok(Some((completion, _, true)))) => completion,
-        _ => panic!("NONBLOCK foreground admission waited for CSC hardware"),
+        Poll::Ready(Ok(Some((completion, _, nonblock)))) => {
+            assert!(nonblock, "NONBLOCK foreground admission lost its flag");
+            completion
+        }
+        Poll::Ready(Ok(None)) => panic!("NONBLOCK foreground admission became TEST_ONLY"),
+        Poll::Ready(Err(error)) => panic!("NONBLOCK foreground admission refused: {error:?}"),
+        Poll::Pending => panic!("NONBLOCK foreground admission waited for CSC hardware"),
     }
 }
 fn run<F: Future>(future: F) -> F::Output {
@@ -215,9 +220,11 @@ fn smoke_intel_ctm_advertisement_test_only_and_combined_updates_refuse() -> Test
             vec![
                 CRTC_CTM_PROP_ID,
                 CRTC_GAMMA_LUT_PROP_ID,
-                CRTC_GAMMA_LUT_SIZE_PROP_ID
+                CRTC_GAMMA_LUT_SIZE_PROP_ID,
+                CRTC_DEGAMMA_LUT_PROP_ID,
+                CRTC_DEGAMMA_LUT_SIZE_PROP_ID
             ],
-            vec![0, 0, 1024]
+            vec![0, 0, 1024, 0, 129]
         )
     );
     let mut change = CrtcColorChange::default();
@@ -571,7 +578,10 @@ kernel_test_in!(
 
 fn smoke_intel_gamma_native_advertisement_sizes_and_inherited_refusal() -> TestResult {
     let mode = color_mode();
-    assert_eq!(crtc_color_properties(&mode.lock(), 1).1, vec![0, 0, 1024]);
+    assert_eq!(
+        crtc_color_properties(&mode.lock(), 1).1,
+        vec![0, 0, 1024, 0, 129]
+    );
     for entries in [255, 257, 1023, 1025, 4096] {
         let id = mode
             .lock()
@@ -1455,3 +1465,7 @@ mod mixed;
 
 #[path = "intel_gpu_viewport_ioctl_tests.rs"]
 mod viewport;
+
+mod degamma {
+    include!("intel_gpu_degamma_ioctl_tests.rs");
+}

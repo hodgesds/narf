@@ -643,7 +643,6 @@ fn smoke_eu_stall_query_properties_record_bounds_and_malformed_cursors() -> Test
         (2, 2008, FsError::InvalidData),
         (3, 0, FsError::InvalidData),
         (3, layout.reports() + 1, FsError::InvalidData),
-        (3, 2, FsError::Unsupported),
         (4, 0, FsError::InvalidData),
     ] {
         wire.property(128, 160, 1, 0);
@@ -657,10 +656,13 @@ fn smoke_eu_stall_query_properties_record_bounds_and_malformed_cursors() -> Test
     wire.property(128, 0, 1, 0);
     wire.write(140, &1u32.to_le_bytes()).unwrap();
     assert_eq!(properties(layout, 128, &wire), Err(FsError::InvalidData));
-    assert_eq!(
-        Session::new(layout, Config { rate: 4, wait: 2 }).unwrap_err(),
-        FsError::Unsupported
-    );
+    for wait in [1, 2, layout.reports()] {
+        wire.property(128, 160, 1, 0);
+        wire.property(160, 0, 3, wait);
+        assert_eq!(properties(layout, 128, &wire), Ok(Config { rate: 4, wait }));
+        let session = Session::new(layout, Config { rate: 4, wait }).unwrap();
+        assert_eq!(session.room(), HOST_BYTES.max(wait as usize * 64));
+    }
     let (shared, io, mut collector) = fixture(layout);
     let session = Session::new(layout, config()).unwrap();
     collector.attach(session.clone()).unwrap();
@@ -712,11 +714,14 @@ impl Backend {
         })
     }
     fn poll(&self) {
+        self.poll_at(0);
+    }
+    fn poll_at(&self, now: u64) {
         self.collector
             .lock()
             .as_mut()
             .unwrap()
-            .poll(&self.io, 0, || true)
+            .poll(&self.io, now, || true)
             .unwrap();
     }
     fn reset(&self) {
@@ -870,4 +875,302 @@ fn smoke_eu_stall_descriptor_current_authority_install_cancel_and_last_close() -
 kernel_test_in!(
     "drivers/gpu/intel_gpu_eu_stall",
     smoke_eu_stall_descriptor_current_authority_install_cancel_and_last_close
+);
+
+// Pinned xe_eu_stall_stream_read waits on sampled pollin only for blocking
+// readers, allows record-aligned short reads, and clears pollin after reading.
+fn smoke_eu_stall_threshold_descriptor_blocking_nonblocking_and_short_reads() -> TestResult {
+    ALLOWED.store(true, Ordering::Release);
+    let backend = Backend::new();
+    let wire = Wire::new();
+    wire.opening();
+    wire.property(192, 0, 3, 3);
+    assert_eq!(
+        ready(open_with_gate(
+            backend.clone(),
+            32,
+            &wire,
+            Gate { capable: allowed }
+        )),
+        Ok(37)
+    );
+    let file = wire.installed.lock().take().unwrap();
+    ready(file.ioctl_user(ENABLE, 0, &wire)).unwrap();
+    let memory = backend.shared.memory();
+    let records: Vec<_> = (0..7)
+        .map(|i| memory.record(0, i * 64, 16 + i as u8))
+        .collect();
+    backend.shared.pointer(0, 128, false);
+    backend.poll_at(0);
+    assert_eq!(file.poll_readiness(), 0, "two records do not satisfy wait3");
+    assert_eq!(ready(file.read(0, &mut [0; 64])), Err(FsError::WouldBlock));
+    let nonblock = ReadOptions { nonblocking: true };
+    let mut output = [0; 80];
+    assert_eq!(
+        ready(file.read_with_options(0, &mut output, nonblock)),
+        Ok(64)
+    );
+    assert_eq!(&output[..64], &records[0]);
+    assert_eq!(&output[64..], &[0; 16]);
+    backend.shared.pointer(0, 256, false);
+    backend.poll_at(POLL_NS - 1);
+    assert_eq!(
+        file.poll_readiness(),
+        0,
+        "source readiness is sampled at 5ms"
+    );
+    backend.poll_at(POLL_NS);
+    assert_ne!(
+        file.poll_readiness() & POLL_IN,
+        0,
+        "host1 + source2 meet wait3"
+    );
+    assert_eq!(ready(file.read(0, &mut output)), Ok(64));
+    assert_eq!(&output[..64], &records[1]);
+    assert_eq!(file.poll_readiness(), 0, "short read clears source latch");
+    assert_eq!(ready(file.read(0, &mut output)), Err(FsError::WouldBlock));
+    backend.poll_at(2 * POLL_NS);
+    assert_eq!(
+        file.poll_readiness(),
+        0,
+        "two remaining records cannot rearm wait3"
+    );
+    assert_eq!(
+        ready(file.read_with_options(0, &mut output, nonblock)),
+        Ok(64)
+    );
+    assert_eq!(&output[..64], &records[2]);
+    backend.shared.pointer(0, 384, false);
+    backend.poll_at(3 * POLL_NS);
+    assert_ne!(file.poll_readiness() & POLL_IN, 0);
+    assert_eq!(ready(file.read(0, &mut [0; 63])), Err(FsError::InvalidData));
+    assert_ne!(
+        file.poll_readiness() & POLL_IN,
+        0,
+        "invalid count never consumes latch"
+    );
+    let mut output = [0xa5; 208];
+    assert_eq!(ready(file.read(0, &mut output)), Ok(192));
+    for (i, record) in records[3..6].iter().enumerate() {
+        assert_eq!(&output[i * 64..i * 64 + 64], record);
+    }
+    assert_eq!(&output[192..], &[0xa5; 16]);
+    ready(file.ioctl_user(DISABLE, 0, &wire)).unwrap();
+    assert_eq!(
+        ready(file.read_with_options(0, &mut [0; 64], nonblock)),
+        Err(FsError::InvalidData)
+    );
+    drop(file);
+    backend.poll_at(4 * POLL_NS);
+    backend.reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_eu_stall",
+    smoke_eu_stall_threshold_descriptor_blocking_nonblocking_and_short_reads
+);
+
+fn smoke_eu_stall_threshold_sparse_sources_no_copy_double_count() -> TestResult {
+    let layout = info(9, 2);
+    let (shared, io, mut collector) = fixture(layout);
+    let session = Session::new(layout, Config { rate: 4, wait: 100 }).unwrap();
+    collector.attach(session.clone()).unwrap();
+    collector.control(&io, &session, true, || true).unwrap();
+    let memory = shared.memory();
+    for n in 0..64 {
+        memory.record(0, n * 64, 1);
+    }
+    for n in 0..36 {
+        memory.record(3, n * 64, 2);
+    }
+    shared.pointer(0, 4096, false);
+    shared.pointer(3, 2304, false);
+    collector.poll(&io, 0, || true).unwrap();
+    assert_ne!(session.ready.mask() & POLL_IN, 0);
+    assert_eq!(session.queue.lock().len, 4096);
+    assert_eq!(shared.get(3, 0xe52c), 0, "one DSS is copied per tick");
+    assert_eq!(
+        session.read_with_options(&mut [0; 64], ReadOptions::default()),
+        Ok(64)
+    );
+    collector.poll(&io, POLL_NS, || true).unwrap();
+    assert_eq!(session.ready.mask(), 0, "host63 + source36 is 99, not 163");
+    assert_eq!(session.queue.lock().len, 99 * 64);
+    assert_eq!(
+        session.read_with_options(&mut [0; 64], ReadOptions::default()),
+        Err(FsError::WouldBlock)
+    );
+    collector.poll(&io, 2 * POLL_NS, || true).unwrap();
+    assert_eq!(
+        session.ready.mask(),
+        0,
+        "moving source into host does not add reports"
+    );
+    memory.record(3, 2304, 3);
+    shared.pointer(3, 2368, false);
+    collector.poll(&io, 3 * POLL_NS, || true).unwrap();
+    assert_ne!(session.ready.mask() & POLL_IN, 0);
+    assert_eq!(session.queue.lock().len, 100 * 64);
+    assert_eq!(
+        session.read_with_options(&mut [0; 65], ReadOptions::default()),
+        Ok(64)
+    );
+    reset(collector, &shared);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_eu_stall",
+    smoke_eu_stall_threshold_sparse_sources_no_copy_double_count
+);
+
+fn smoke_eu_stall_large_threshold_fifo_capacity_and_unacknowledged_backpressure() -> TestResult {
+    let layout = info(1, 4);
+    let (shared, io, mut collector) = fixture(layout);
+    let session = Session::new(
+        layout,
+        Config {
+            rate: 4,
+            wait: 1025,
+        },
+    )
+    .unwrap();
+    assert_eq!(session.room(), 65600);
+    collector.attach(session.clone()).unwrap();
+    collector.control(&io, &session, true, || true).unwrap();
+    let memory = shared.memory();
+    for n in 0..1026 {
+        memory.record(0, n * 64, (n % 251) as u8);
+    }
+    shared.pointer(0, 65600, false);
+    for tick in 0..17 {
+        collector.poll(&io, tick * POLL_NS, || true).unwrap();
+    }
+    assert_eq!(session.room(), 0);
+    assert_eq!(collector.read[0], 65600);
+    assert_ne!(session.ready.mask() & POLL_IN, 0);
+    shared.pointer(0, 65664, false);
+    let reads = memory.reads.load(Ordering::Relaxed);
+    collector.poll(&io, 17 * POLL_NS, || true).unwrap();
+    assert_eq!(memory.reads.load(Ordering::Relaxed), reads);
+    assert_eq!(
+        collector.read[0], 65600,
+        "host full must retain source ownership"
+    );
+    assert_eq!(
+        session.read_with_options(&mut [0; 64], ReadOptions::default()),
+        Ok(64)
+    );
+    assert_eq!(session.ready.mask(), 0);
+    collector.poll(&io, 18 * POLL_NS, || true).unwrap();
+    assert_eq!(session.room(), 0);
+    assert_eq!(collector.read[0], 65664);
+    assert_ne!(session.ready.mask() & POLL_IN, 0);
+    assert_eq!(
+        session.read_with_options(&mut [0; 64], ReadOptions::default()),
+        Ok(64)
+    );
+    collector.poll(&io, 19 * POLL_NS, || true).unwrap();
+    assert_eq!(
+        session.ready.mask(),
+        0,
+        "1024 retained records are below wait1025"
+    );
+    assert_eq!(
+        session.read_with_options(&mut [0; 64], ReadOptions::default()),
+        Err(FsError::WouldBlock)
+    );
+    assert_eq!(session.read(&mut [0; 64]), Ok(64));
+    reset(collector, &shared);
+    drop(session);
+    // Exact source maximum, including its hard 32-DSS/16MiB host bound.
+    let maximum = info(u32::MAX, 4);
+    let session = Session::new(
+        maximum,
+        Config {
+            rate: 7,
+            wait: 262144,
+        },
+    )
+    .unwrap();
+    assert_eq!(session.room(), 16 * 1024 * 1024);
+    assert_eq!(
+        Session::new(
+            maximum,
+            Config {
+                rate: 7,
+                wait: 262145
+            }
+        )
+        .unwrap_err(),
+        FsError::InvalidData
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_eu_stall",
+    smoke_eu_stall_large_threshold_fifo_capacity_and_unacknowledged_backpressure
+);
+
+fn smoke_eu_stall_threshold_cancel_reset_and_capability_loss() -> TestResult {
+    ALLOWED.store(true, Ordering::Release);
+    let backend = Backend::new();
+    let wire = Wire::new();
+    wire.opening();
+    wire.property(192, 0, 3, 8192);
+    backend.pending_attach.store(true, Ordering::Release);
+    {
+        let mut future = Box::pin(open_with_gate(
+            backend.clone(),
+            32,
+            &wire,
+            Gate { capable: allowed },
+        ));
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    backend.poll_at(0);
+    assert!(!ACTIVE[61].load(Ordering::Acquire));
+    backend.pending_attach.store(false, Ordering::Release);
+    assert_eq!(
+        ready(open_with_gate(
+            backend.clone(),
+            32,
+            &wire,
+            Gate { capable: allowed }
+        )),
+        Ok(37)
+    );
+    let file = wire.installed.lock().take().unwrap();
+    ready(file.ioctl_user(ENABLE, 0, &wire)).unwrap();
+    let record = backend.shared.memory().record(0, 0, 0x27);
+    backend.shared.pointer(0, 64, false);
+    backend.poll_at(0);
+    assert_eq!(ready(file.read(0, &mut [0; 64])), Err(FsError::WouldBlock));
+    backend.reset();
+    assert_ne!(file.poll_readiness() & (POLL_HUP | POLL_ERR), 0);
+    let accesses = backend.shared.state.lock().accesses;
+    let mut bytes = [0; 64];
+    assert_eq!(
+        ready(file.read(0, &mut bytes)),
+        Ok(64),
+        "only immutable host records survive reset"
+    );
+    assert_eq!(bytes, record);
+    assert_eq!(ready(file.read(0, &mut bytes)), Err(FsError::NoDevice));
+    ALLOWED.store(false, Ordering::Release);
+    assert_eq!(
+        ready(file.read_with_options(0, &mut bytes, ReadOptions { nonblocking: true })),
+        Err(FsError::OperationNotPermitted)
+    );
+    assert_eq!(backend.shared.state.lock().accesses, accesses);
+    drop(file);
+    assert!(!ACTIVE[61].load(Ordering::Acquire));
+    ALLOWED.store(true, Ordering::Release);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_eu_stall",
+    smoke_eu_stall_threshold_cancel_reset_and_capability_loss
 );

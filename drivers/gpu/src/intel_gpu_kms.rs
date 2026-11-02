@@ -1360,18 +1360,19 @@ impl<M: Platform> Guard<'_, M> {
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
     ) -> Result<FlipStamp, FsError> {
-        self.set_color_with_dsb(coefficients, lut, None).await
+        self.set_color_with_dsb(coefficients, lut, None, None).await
     }
     pub(crate) async fn set_color_with_dsb(
         &mut self,
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        degamma: Option<Arc<crate::intel_gpu_color::DegammaLut>>,
         dsb_timing: Option<crate::intel_gpu_dsb::Timing>,
     ) -> Result<FlipStamp, FsError> {
         if self.state.mixed_unpublished {
             return Err(FsError::Busy);
         }
-        self.color_transaction(coefficients, lut, dsb_timing, None)
+        self.color_transaction(coefficients, lut, degamma, dsb_timing, None)
             .await
     }
     pub(crate) async fn present_color(
@@ -1380,7 +1381,7 @@ impl<M: Platform> Guard<'_, M> {
         geometry: Geometry,
         viewport: crate::intel_gpu_scanout::Viewport,
         coefficients: Option<[u64; 9]>,
-        lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        luts: crate::intel_gpu_color::Luts,
         timing: crate::intel_gpu_dsb::Timing,
     ) -> Result<FlipStamp, FsError> {
         self.check(geometry)?;
@@ -1396,7 +1397,8 @@ impl<M: Platform> Guard<'_, M> {
         }
         self.color_transaction(
             coefficients,
-            lut,
+            luts.post,
+            luts.pre,
             Some(timing),
             Some(PrimaryTarget {
                 object,
@@ -1410,6 +1412,7 @@ impl<M: Platform> Guard<'_, M> {
         &mut self,
         coefficients: Option<[u64; 9]>,
         lut: Option<Arc<crate::intel_gpu_color::Lut>>,
+        degamma: Option<Arc<crate::intel_gpu_color::DegammaLut>>,
         dsb_timing: Option<crate::intel_gpu_dsb::Timing>,
         primary: Option<PrimaryTarget>,
     ) -> Result<FlipStamp, FsError> {
@@ -1506,26 +1509,41 @@ impl<M: Platform> Guard<'_, M> {
                     .color
                     .as_mut()
                     .expect("color owner")
-                    .prepare_dsb(&self.device.platform, coefficients, lut.clone())?;
+                    .prepare_stages(
+                        &self.device.platform,
+                        coefficients,
+                        lut.clone(),
+                        degamma.clone(),
+                    )?;
                 if let Some(surface) = surface {
                     update.registers.extend(surface);
                 }
                 self.state.dsb_update = Some(update);
                 let state = &mut *self.state;
                 let update = state.dsb_update.as_ref().expect("DSB color image");
-                state.dsb.as_mut().expect("DSB owner").arm(
+                let armed = state.dsb.as_mut().expect("DSB owner").arm_color(
                     timing,
                     &update.registers,
                     update.lut(),
+                    update.degamma(),
                     self.device.platform.now(),
-                )
+                );
+                if armed != Err(FsError::Unsupported) {
+                    state
+                        .color
+                        .as_mut()
+                        .expect("color owner")
+                        .expose_dsb(update);
+                }
+                armed
             }
             .await
         } else {
-            self.state.color.as_mut().expect("color owner").arm_color(
+            self.state.color.as_mut().expect("color owner").arm_stages(
                 &self.device.platform,
                 coefficients,
                 lut.clone(),
+                degamma.clone(),
                 self.device.platform.now(),
             )
         };
@@ -1579,7 +1597,7 @@ impl<M: Platform> Guard<'_, M> {
             return Err(error);
         }
         let stamp = self.finish_color().await?.ok_or(FsError::NoDevice)?;
-        if coefficients.is_none() && lut.is_none() {
+        if coefficients.is_none() && lut.is_none() && degamma.is_none() {
             self.state.color = None;
             self.state.color_owned = false;
             if self.state.presenter.is_none()
@@ -1612,7 +1630,7 @@ impl<M: Platform> Guard<'_, M> {
         if self.state.color.is_some() {
             // Internal full restoration may clear color while keeping the
             // mixed marker until independent primary restoration also ends.
-            self.color_transaction(None, None, None, None).await?;
+            self.color_transaction(None, None, None, None, None).await?;
         }
         self.state.color_unpublished = false;
         Ok(())

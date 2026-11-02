@@ -238,8 +238,18 @@ breadcrumb and saved head, then the existing deregistration/TLB proofs.
 A parent waiting after its own payload is no longer charged payload runtime;
 unfinished children retain independent budgets and the final join has its own
 five-second bound. Groups without a user fence retain their existing ring
-protocol. Multi-row/multi-placement and render groups and width above four
-remain refused.
+protocol. Native Xe also admits distinct placement rows with at most nine
+copied entries total, width two through four, one GT/class and adjacent dense
+logical engines within each row. Each lane retains its immutable allowed set;
+GuC receives the first lane's logical mask and shifts it for each child. Every
+migrating lane has its own protected ENGINE_ID/CS-relative timestamp restore
+batch, observed physical attribution and runtime/watchdog/final-save proof.
+Queued-stall progress considers every unfinished lane's allowed engines;
+completed lanes cannot mask a remaining stall. All placements survive close,
+cancel and reset until existing retirement proofs complete. Qualified physical
+sets permit compute 2×2, 2×3 and 3×2; one RCS0 cannot form a parallel render group,
+and COPY0/1 permits only one distinct two-lane row. Unsupported physical widths
+remain refused. GuC multi-queue/CGP groups are a separate unimplemented protocol.
 VIDEO classes, and COMPUTE on a GT
 without a published compute instance, return EINVAL. `UserStatus::engines` carries the GT's
 published `EngineSet`; ENGINES lists exactly that set in xe_hw_engine order
@@ -361,12 +371,20 @@ is available only after that owner and the execution epoch are published.
 Xe OBSERVATION type 1/open 0 returns a disabled sampling description; current
 CAP_PERFMON or CAP_SYS_ADMIN is required at open and every read/control, including
 after an awaited operation. GT_ID 0 is required. Sample periods use source
-251-cycle multipliers 1..7; WAIT_NUM_REPORTS currently supports only 1. Other
-valid thresholds return Unsupported because the shared read interface cannot
-express Linux's blocking/nonblocking threshold distinction.
+251-cycle multipliers 1..7. WAIT_NUM_REPORTS accepts 1..8192 times the number of
+active DSSs (maximum 262144 reports); zero or larger values return EINVAL.
 
-One description per card owns a bounded 64 KiB host FIFO of opaque 64-byte
-records. Read returns complete records, at most 4096 bytes, or WouldBlock;
+One description per card preallocates a host FIFO of max(64 KiB, wait*64),
+bounded at 16 MiB, before attaching a sampler. It holds opaque 64-byte records.
+Each 5 ms sample latches readiness when checked unread GPU reports plus retained
+host reports meet the threshold, without double-counting copies. Collection
+continues below threshold, at most 4096 bytes from one DSS per service, so a
+nonblocking read can drain any complete copied record. Blocking reads require
+the sampled latch; reads clear it even if records remain and may return a
+short complete-record prefix. Known loss and terminal errors bypass the
+threshold. `ReadOptions` carries each call's current shared `O_NONBLOCK`;
+dup/F_SETFL changes are never cached in the stream. Read returns complete
+records, at most 4096 bytes, or WouldBlock;
 enable/disable use source ioctls 0x6900/0x6901. The retained GT collector owns
 coherent 512 KiB sub-buffers indexed by physical DSS, including fuse holes,
 through checked GGTT/MCR addressing. Current D0/wake authority is checked before
@@ -1377,20 +1395,44 @@ the public sanitized report intact; unarmed destinations are retried at most
 once per second. First published failure wins until explicit acknowledgement.
 
 This is a partial device coredump, not complete Linux devcoredump parity.
-`NARFCDMP` version one contains a 256-byte little-endian header, a zero-padded
+`NARFCDMP` version two contains a 256-byte little-endian header, a zero-padded
 4 KiB sanitized report region, the exact 0x115000-byte GuC log allocation and
-the exact six-page CT allocation (total 0x11c100 bytes). Header fields include
+the exact six-page CT allocation at their original version-one offsets.
+An appended execution region makes total size 0x1b4540 bytes. Header fields include
 card, nonwrapping bundle generation, error/copy times, epoch, platform, actual
 firmware release/incarnation/digest, fixed section offsets/lengths and an
-availability mask. Report text uses the bundle's generation; this independent
-identity is not the public sysfs report generation. No user BO, VM or LRC body
-is captured. Raw log/CT bytes can disclose addresses and commands and never
+availability mask. Bit3 marks an execution directory; header 144/148 give its
+fixed offset/length and 152 its flags. Report text uses the bundle's generation; this independent
+identity is not the public sysfs report generation. No user BO or VM table
+is captured. Raw log/CT/LRC/ring/scratch bytes can disclose addresses,
+commands and execution data and never
 enter the public `error` file. Firmware descriptor contents remain opaque and
 cannot change a copy bound. Coherent backing and current PCI D0/capability/GT
 wake are required before copying and each 4 KiB chunk. Known loss latches for
 the remaining capture, zeros a partial section and leaves it unavailable.
 Sequential observations do not promise a device freeze or pre-engine-reset
 state; report detection and raw-copy times are separate.
+
+The appended `NARFEXEC` version-one section has a 64-byte header and eight fixed
+0x13080-byte slots. Its header records total retained lanes, descriptors
+recorded, fully copied records and flags: bit0 omitted lanes, bit1 current
+authority loss, bit2 invalid extent/layout, bit3 refused backing copy. Retained
+timeout/reset groups precede other groups; parents precede children. Metadata
+is host-only: GuC/parent IDs, lane, request stamp, phase, immutable placement
+mask and last runtime observations. Physical engine attribution remains
+unavailable rather than substituting a template engine.
+
+Each slot begins with 128 bytes of metadata, followed by 64 KiB LRC capacity,
+8 KiB ring and 4 KiB parent-only group scratch. LRC length must equal its retained
+engine-class/platform layout and fit 16 pages; ring and scratch must be exactly
+two and one pages. Entry 40 gives per-field availability bits0/1/2; pairs 44/48,
+52/56 and 60/64 give absolute file offsets and copied lengths. Unavailable and
+unused capacity remains zero. Firmware pointers, GGTT addresses and user lengths
+never select sources or extend bounds. The capture visits retained owners under
+the GT reset mutex without allocating, issuing commands, syncing caches or
+releasing ownership. Sticky per-4 KiB access denial zeros the current partial
+field and suppresses later reads; earlier complete fields remain observations.
+Only existing GuC/DMA/full-GT retirement proofs free the original allocations.
 
 Opening and every read, including empty/EOF reads, require current
 initial-user-namespace CAP_SYSLOG and the boot opt-in. Reads never touch live
@@ -7217,13 +7259,13 @@ stops DSB0/1 then proves cursor-off with a fresh owner; primary latch or GT
 reset alone cannot retire cursor fetch. Failed stop retains all DMA owners.
 
 **Intel fixed-mode color commits.** The MTL/Arrow Pipe-A owner advertises
-`CTM`, `GAMMA_LUT` and immutable `GAMMA_LUT_SIZE=1024`. CTM blobs contain nine
-S31.32 sign-magnitude coefficients (72 bytes). Native gamma blobs contain
-1024 independent RGB `drm_color_lut` entries (8192 bytes); reserved words are
+`CTM`, `GAMMA_LUT`, `DEGAMMA_LUT` and immutable sizes 1024 and 129 respectively.
+CTM blobs contain nine S31.32 sign-magnitude coefficients (72 bytes). Native
+gamma blobs contain 1024 independent RGB `drm_color_lut` entries (8192 bytes); reserved words are
 ignored and nonmonotonic channels remain valid. Qualified Intel GETCRTC reports
 legacy gamma_size 256, and GAMMA_GET/GAMMA_SET use three 256-entry ramps.
-GAMMA_SET copies each ramp once, resets CTM and submits a retained private
-256-entry LUT through the same owned KMS FIFO. Successful hardware latch and
+GAMMA_SET copies each ramp once, resets CTM and DEGAMMA_LUT and submits a
+retained private 256-entry LUT through the same owned KMS FIFO. Successful hardware latch and
 Card publication update the legacy gamma store; failed or cancelled writes
 retain the last confirmed store. Native atomic changes do not rewrite it.
 The actual 8-bit legacy palette mode is distinct from native 10-bit precision;
@@ -7232,8 +7274,24 @@ the source anti-collision sequence. Inactive capture/restoration retains both
 palette views. The synchronous path without an owned Intel display refuses
 SET before copying ramps. AMD's native 4096-entry and legacy 256-entry interfaces
 retain their existing contracts. Admission copies all color data and retains
-both resulting blob identities through queued/projected state and native
+all three resulting blob identities through queued/projected state and native
 completion; destroying blobs cannot substitute data under an admitted job.
+
+The pre-CSC degamma LUT has 129 `drm_color_lut` entries (1032 bytes), equal RGB
+channels and nondecreasing input. Reserved words are ignored. Green is rounded
+from 16 to 24 bits; hardware receives those 129 words plus two 1.0 extended entries
+through PRE_CSC_GAMC_INDEX/DATA 0x4a484/0x4a488, with exact index-reset/auto-increment
+discipline. GAMMA_MODE bit31 independently enables the pre stage. Inactive CPU
+preload requires both pre and post stages off; otherwise the same retained DSB
+leaf programs pre before post and shares the common CTM/gamma/primary arm.
+Unchanged pre state survives unrelated flips/CTM updates without rewriting RAM.
+The owner retains original 131-word state. Cleanup restores it only after a
+later-frame proof that both stages are off, including cancellation, close,
+S3 and reset/console recovery; uncertain state remains owned and unpublished.
+Each stage retains a restoration obligation before its first CPU write or
+potentially exposed DSB arm. Only verified original-RAM restoration clears
+that obligation, so later CTM-only transactions leave restored RAM untouched.
+Cleanup for a disabled stage remains deferred while the other LUT is active.
 
 Visible geometry, route and mode changes mixed with color refuse before MMIO,
 including TEST_ONLY. A primary framebuffer may join a color transaction only
@@ -7241,7 +7299,7 @@ on the fixed progressive MTL/Arrow Pipe-A direct profile: WC SCANOUT system
 pages, linear XRGB8888, zero ADDFB2 byte offsets and exactly the existing
 visible width/height/pitch. The source viewport may be a bounded integer
 rectangle inside a larger framebuffer, as described below.
-The queue retains the framebuffer and both color blobs; mixed requests never
+The queue retains the framebuffer and all color blobs; mixed requests never
 fall back to a CPU copy. The primary target is staged with fresh completion
 status but no CPU SURF write. DSB0 emits the primary SURF arm after the color
 arms in the same hardware safe window. Successful joint completion requires

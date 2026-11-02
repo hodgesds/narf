@@ -1197,7 +1197,7 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 assert_eq!(request.len(), 11 + width * 2);
                 assert_eq!(request[1], 1);
                 assert!(matches!(request[3], 3 | 4));
-                assert_eq!(request[4].count_ones(), 1);
+                assert!(request[4] != 0 && request[4] << (width - 1) < 16);
                 assert_eq!([request[6], request[8]], [0; 2]);
                 assert_eq!([request[7], request[9]], [request[5] + 1024, 1024]);
                 let images: Vec<_> = request[11..]
@@ -1234,6 +1234,15 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                         assert_eq!(image[1026], bank + 0x244);
                         assert_ne!(image[1024 + 0x33], 0);
                         assert!(registered.insert(request[2] + lane as u32, base).is_none());
+                    }
+                }
+                if request[4].count_ones() > 1 {
+                    let mut d = w.0.borrow_mut();
+                    for (lane, base) in images.iter().copied().enumerate() {
+                        assert!(d
+                            .virtual_contexts
+                            .insert(base, (request[3], request[4] << lane))
+                            .is_none());
                     }
                 }
                 assert!(w
@@ -1409,6 +1418,7 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                     assert!(!group.enabled);
                     for (index, base) in group.images.iter().enumerate().skip(1) {
                         assert_eq!(registered.remove(&(request[1] + index as u32)), Some(*base));
+                        w.0.borrow_mut().virtual_contexts.remove(base);
                     }
                 }
                 let d = w.0.borrow();
@@ -1455,6 +1465,7 @@ fn execute_parallel_lane(w: &Window, id: u32, base: u32) {
             image.borrow_mut()[1031] = split as u32 * 4;
         }
         w.0.borrow_mut().parallel_starts.push((id, base));
+        execute_parallel_restore(w, id, base, true);
         if matches!(first, 0x22244 | 0x3ee244) {
             execute_copy(w, base);
         } else {
@@ -1463,6 +1474,20 @@ fn execute_parallel_lane(w: &Window, id: u32, base: u32) {
         image.borrow_mut()[1031] = tail;
     }
     execute_parallel_join(w, id);
+}
+
+fn execute_parallel_restore(w: &Window, id: u32, base: u32, start: bool) {
+    let old = w.0.borrow().virtual_pick;
+    let lane = w.0.borrow().parallel_contexts[&id]
+        .images
+        .iter()
+        .position(|image| *image == base)
+        .unwrap();
+    if let Some(first) = old {
+        w.0.borrow_mut().virtual_pick = Some(first + lane as u32);
+    }
+    execute_virtual_restore(w, base, start);
+    w.0.borrow_mut().virtual_pick = old;
 }
 
 fn execute_parallel_join(w: &Window, id: u32) {
@@ -2971,4 +2996,9 @@ fn service_slpc(w: &Window, memory: &Words, control_fence: u16, request: &[u32])
 
 mod bcs8 {
     include!("intel_gpu_bcs8_tests.rs");
+}
+
+mod coredump_exec {
+    use super::*;
+    include!("intel_gpu_coredump_exec_hw_tests.rs");
 }

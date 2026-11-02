@@ -3054,6 +3054,8 @@ const CRTC_VRR_ENABLED_PROP_ID: u32 = 0x63;
 const CRTC_CTM_PROP_ID: u32 = 0x64;
 const CRTC_GAMMA_LUT_PROP_ID: u32 = 0x65;
 const CRTC_GAMMA_LUT_SIZE_PROP_ID: u32 = 0x66;
+const CRTC_DEGAMMA_LUT_PROP_ID: u32 = 0x82;
+const CRTC_DEGAMMA_LUT_SIZE_PROP_ID: u32 = 0x83;
 /// MAX_COLOR_LUT_ENTRIES, the GAMMA_LUT_SIZE value.
 const GAMMA_LUT_SIZE: u64 = 4096;
 /// `sizeof(struct drm_color_ctm)`: nine S31.32 sign-magnitude u64s.
@@ -3434,6 +3436,12 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
         // 0..UINT_MAX range.
         CRTC_CTM_PROP_ID => Some((b"CTM".as_slice(), DRM_MODE_PROP_BLOB, [0, 0])),
         CRTC_GAMMA_LUT_PROP_ID => Some((b"GAMMA_LUT".as_slice(), DRM_MODE_PROP_BLOB, [0, 0])),
+        CRTC_DEGAMMA_LUT_PROP_ID => Some((b"DEGAMMA_LUT".as_slice(), DRM_MODE_PROP_BLOB, [0, 0])),
+        CRTC_DEGAMMA_LUT_SIZE_PROP_ID => Some((
+            b"DEGAMMA_LUT_SIZE".as_slice(),
+            DRM_MODE_PROP_RANGE | DRM_MODE_PROP_IMMUTABLE,
+            [0, u32::MAX as u64],
+        )),
         CRTC_GAMMA_LUT_SIZE_PROP_ID => Some((
             b"GAMMA_LUT_SIZE".as_slice(),
             DRM_MODE_PROP_RANGE | DRM_MODE_PROP_IMMUTABLE,
@@ -3641,8 +3649,16 @@ fn crtc_color_properties(card: &crate::drm::card::Card, crtc: u32) -> (Vec<u32>,
                 CRTC_CTM_PROP_ID,
                 CRTC_GAMMA_LUT_PROP_ID,
                 CRTC_GAMMA_LUT_SIZE_PROP_ID,
+                CRTC_DEGAMMA_LUT_PROP_ID,
+                CRTC_DEGAMMA_LUT_SIZE_PROP_ID,
             ],
-            vec![u64::from(color.ctm), u64::from(color.gamma_lut), 1024],
+            vec![
+                u64::from(color.ctm),
+                u64::from(color.gamma_lut),
+                1024,
+                u64::from(color.degamma_lut),
+                129,
+            ],
         )
     } else {
         (
@@ -3666,6 +3682,7 @@ fn crtc_color_properties(card: &crate::drm::card::Card, crtc: u32) -> (Vec<u32>,
 struct CrtcColorChange {
     ctm: Option<u32>,
     gamma_lut: Option<u32>,
+    degamma_lut: Option<u32>,
 }
 
 /// Decode one CRTC color property into `change`: EINVAL on a CRTC without
@@ -3679,7 +3696,10 @@ fn crtc_color_property(
     value: u64,
     change: &mut CrtcColorChange,
 ) -> Result<bool, FsError> {
-    if !matches!(prop, CRTC_CTM_PROP_ID | CRTC_GAMMA_LUT_PROP_ID) {
+    if !matches!(
+        prop,
+        CRTC_CTM_PROP_ID | CRTC_GAMMA_LUT_PROP_ID | CRTC_DEGAMMA_LUT_PROP_ID
+    ) {
         return Ok(false);
     }
     if card.crtc_color(crtc).is_none() {
@@ -3687,6 +3707,20 @@ fn crtc_color_property(
     }
     if prop == CRTC_CTM_PROP_ID {
         change.ctm = Some(blob_value(card, value, Some(CTM_BLOB_SIZE), None)?);
+        return Ok(true);
+    }
+    if prop == CRTC_DEGAMMA_LUT_PROP_ID {
+        if !card.intel_color(crtc) {
+            return Err(FsError::InvalidData);
+        }
+        let id = blob_value(card, value, Some(129 * COLOR_LUT_ENTRY_SIZE), None)?;
+        #[cfg(feature = "intel")]
+        if id != 0 {
+            crate::intel_gpu_color::DegammaLut::decode(
+                card.property_blob(id).ok_or(FsError::InvalidData)?,
+            )?;
+        }
+        change.degamma_lut = Some(id);
         return Ok(true);
     }
     let id = blob_value(card, value, None, Some(COLOR_LUT_ENTRY_SIZE))?;
@@ -3724,6 +3758,9 @@ fn apply_crtc_color(
     }
     if let Some(id) = change.gamma_lut {
         color.gamma_lut = id;
+    }
+    if let Some(id) = change.degamma_lut {
+        color.degamma_lut = id;
     }
     let (ctm, gamma_lut) = (color.ctm, color.gamma_lut);
     card.collect_blobs();
@@ -4420,6 +4457,7 @@ fn handle_gamma(
     let change = CrtcColorChange {
         ctm: Some(0),
         gamma_lut: Some(blob),
+        degamma_lut: None,
     };
     let _request = apply_crtc_color(card_index, &mut card, crtc_id, change);
     // drm_property_blob_put: only the committed GAMMA_LUT holds it now.
