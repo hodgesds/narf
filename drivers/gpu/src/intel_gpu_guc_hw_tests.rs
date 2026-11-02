@@ -12,6 +12,7 @@ mod userspace {
 struct EuStallRegisters {
     values: BTreeMap<(usize, u64), u32>,
     lost: bool,
+    lose_media_on_read: Option<u64>,
 }
 #[derive(Clone)]
 struct EuStallWindow {
@@ -24,11 +25,15 @@ impl MmioWindow for EuStallWindow {
             let selector = self.inner.read32(0xfd4);
             let dss = ((selector >> 8) & 15) as usize * 4 + (selector & 15) as usize;
             let bank = self.samplers.borrow();
-            return if bank.lost {
+            let value = if bank.lost {
                 u32::MAX
             } else {
                 *bank.values.get(&(dss, offset)).unwrap_or(&0)
             };
+            if bank.lose_media_on_read == Some(offset) {
+                self.inner.0.borrow_mut().regs.insert(0x380dfc, 0);
+            }
+            return value;
         }
         self.inner.read32(offset)
     }
@@ -1533,10 +1538,12 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                 // unavailable to the native userspace queue profile.
                 assert!((1..=3).contains(&request[3]));
                 assert!((1..=100_000).contains(&request[5]));
+                assert_eq!(request.len(), 10);
                 assert_eq!(
-                    [request[2], request[4], request[6], request[7]],
-                    [0x20030001, 0x20010001, 0x20020001, 500000]
+                    [request[2], request[4], request[6], request[7], request[8]],
+                    [0x20030001, 0x20010001, 0x20020001, 500000, 0x20050001]
                 );
+                assert!(matches!(request[9], 0 | 0x10000000));
             }
             0x1001 => {
                 let id = request[1];
@@ -3490,4 +3497,8 @@ mod gen12 {
 
 mod reset_policy {
     include!("intel_gpu_reset_policy_tests.rs");
+}
+
+mod lnl_eu_stall {
+    include!("intel_gpu_eu_stall_hw_tests.rs");
 }

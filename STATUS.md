@@ -1714,6 +1714,20 @@ for the combined follow-on branch; merge readiness is not claimed. Graphical
 LNL/PTL takeover, separate media GTs/HuC, full display resource transactions,
 placement migration and invalidate-aware USERPTR remain separate work.
 
+The following Intel slice implements current-epoch native Xe low-latency
+queue hints and exact headless LNL EU-stall sampling, preserving the existing
+single GuC/SLPC actor and DMA/reset lifetimes. All ten new fixtures pass in
+the debug native kernel: the combined branch passes 1,154 selected Intel/DRM/
+fb/backlight and 670 shared filesystem/graphics/AMD tests, with no failures or
+duplicate names and one existing shared RNG-registration skip. All 68 new
+fixture names, all 1,087 prior Intel fixture names and 31 backlight regressions
+are covered. Host all-target Clippy, formatting/diff and the 94 source/linker
+hashes pass. The ledger has 58 implemented checkpoint rows and ten broad open
+workstreams. Release native, production boot/btrfs and cross-target gates are
+running on the same frozen source; merge readiness is not claimed. The separate
+external-DP teardown draft has cleared static review; its 21 native fixtures
+and executable validation remain pending.
+
 The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
 leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
 `1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,

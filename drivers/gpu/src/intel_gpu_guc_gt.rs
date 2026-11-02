@@ -23,7 +23,18 @@ use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
 use core::task::Poll;
 
-fn observation_awake(io: &impl MmioWindow) -> bool {
+fn observation_awake(
+    io: &impl MmioWindow,
+    platform: GtPlatform,
+    hardware: Option<&HardwareInit>,
+) -> bool {
+    // The LNL sampler shares the existing GT owner and its held media proof.
+    // Recheck that proof before every MCR read/write and DMA copy. The window
+    // separately invokes current PF/PCI/BAR/D0 authority for each raw access,
+    // including the mandatory four root dummy writes before every MMIO read.
+    if platform.is_lnl() && !hardware.is_some_and(|hw| hw.ready() && hw.awake(io).is_ok()) {
+        return false;
+    }
     [0xa188, 0xdfc, 0xa278, 0xd84].into_iter().all(|reg| {
         let value = io.read32(reg);
         value != u32::MAX && value & 1 != 0
@@ -480,6 +491,19 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             return Err(FsError::Unsupported);
         }
         self.awake().map_err(|_| FsError::NoDevice)?;
+        if self.parts.boot.platform().is_lnl()
+            && (!observation_awake(
+                self.parts.boot.window(),
+                self.parts.boot.platform(),
+                self.hardware.as_ref(),
+            ) || crate::intel_gpu_gt::GraphicsIp::read(
+                self.parts.boot.window(),
+                self.parts.boot.platform(),
+            )
+            .is_err())
+        {
+            return Err(FsError::NoDevice);
+        }
         let info = crate::intel_gpu_eu_stall::Info::from_tables(
             card,
             self.parts.boot.platform(),
@@ -512,7 +536,9 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         self.admit_scheduling()
             .map_err(|_| narf_filesystem::FsError::NoDevice)?;
+        let hardware = self.hardware.as_ref();
         let parts = &mut *self.parts;
+        let platform = parts.boot.platform();
         let collector = parts
             .eu_stall
             .as_mut()
@@ -522,7 +548,7 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
         }
         let window = parts.boot.window();
         collector.control(window, &session, operation == Operation::Enable, || {
-            access() && observation_awake(window)
+            access() && observation_awake(window, platform, hardware)
         })
     }
     pub(crate) fn poll_eu_stall(&mut self, now: u64, mut access: impl FnMut() -> bool) {
@@ -535,10 +561,14 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             }
             return;
         }
+        let hardware = self.hardware.as_ref();
         let parts = &mut *self.parts;
+        let platform = parts.boot.platform();
         if let Some(collector) = parts.eu_stall.as_mut() {
             let window = parts.boot.window();
-            let _ = collector.poll(window, now, || access() && observation_awake(window));
+            let _ = collector.poll(window, now, || {
+                access() && observation_awake(window, platform, hardware)
+            });
         }
     }
 
@@ -1845,10 +1875,14 @@ impl<M: MmioWindow, A: BootAllocator> GuCGt<M, A> {
             }
             GtState::Stopping => {
                 if self.parts.boot.state() != BootState::Stopping {
+                    let hardware = self.hardware.as_ref();
                     let parts = &mut *self.parts;
+                    let platform = parts.boot.platform();
                     if let Some(collector) = parts.eu_stall.as_mut() {
                         let window = parts.boot.window();
-                        match collector.disable(window, || observation_awake(window)) {
+                        match collector
+                            .disable(window, || observation_awake(window, platform, hardware))
+                        {
                             Err(narf_filesystem::FsError::WouldBlock) if now < self.deadline => {
                                 return Poll::Pending;
                             }

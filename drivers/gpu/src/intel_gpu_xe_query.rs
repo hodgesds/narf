@@ -134,6 +134,9 @@ fn query_wire(
                 u64::from(info.device_id) | u64::from(facts.revision) << 16,
             );
             let mut config_flags = 0;
+            if crate::intel_gpu_xe::low_latency_supported(info) {
+                config_flags |= crate::intel_gpu_xe_uapi::QUERY_CONFIG_HAS_LOW_LATENCY;
+            }
             if info.platform.is_xe2() && !info.platform.is_ptl() {
                 config_flags |= 8;
             }

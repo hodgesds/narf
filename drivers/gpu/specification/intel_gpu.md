@@ -1,6 +1,6 @@
 # drivers/gpu/intel_gpu — Specification
 
-> Status: **v0.32** (Stage 1 + Stage 2 codecs landed; lane 1
+> Status: **v0.33** (Stage 1 + Stage 2 codecs landed; lane 1
 > #1010: canonical device table + census, panic-free probe with
 > owned contiguous scanout, Gen12 display gate; Stage 5 RCS0
 > command submission landed — see §8; PPGTT walker + GGTT
@@ -23,7 +23,8 @@
 > Gen12 GuC/fixed primary, Tile4, retained copies and runtime-power controls,
 > Gen12 CTM/cursor/native LUTs, bounded loss-accounted GuC log fanout,
 > joint primary/color and X/integer views, headless LNL/PTL main GT,
-> Gen12 main-GuC media and retained CPU aliases — see §20).
+> Gen12 main-GuC media, retained CPU aliases, immutable Xe low-latency hints
+> and exact LNL EU-stall observation — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -2026,9 +2027,10 @@ zero-copy presentation is now implemented; this estimate still needs revision
 after silicon bring-up and Mesa execution acceptance. A
 read-only audit of upstream Mesa main's Xe backends (anv, iris and their
 shared device code) found no startup blocker in the admitted UAPI. The five
-device queries Mesa treats as fatal are served. PXP, the low-latency hint,
-the state-cache perf fix, purgeable madvise and fault-reporting VMs are used
-only when advertised, which NARF does not do. Scratch-page VMs, queue
+device queries Mesa treats as fatal are served. The create-only low-latency
+hint is now admitted on current qualified GuC hardware queues; software
+VM_BIND refuses it. PXP, the state-cache perf fix, purgeable madvise and
+fault-reporting VMs remain unadvertised. Scratch-page VMs, queue
 priorities, bind queues, the VM_BIND op and flag set and WC
 scanout/uncached buffers are admitted. What remains is execution behaviour,
 which only hardware can show.
@@ -2206,6 +2208,8 @@ production feature. Unsupported functionality remains unadvertised.
 | Gen12 main-GuC media | Fuse-present VCS/VECS defaults, source video commands, retained media wake/reset/ADS/IRQ and actual native Xe queues | Implemented; debug native fixtures pass |
 | Legacy i915 media selection | Live published BSD/VEBOX discovery, dense sparse-engine selectors and retained independent per-context state through real GuC execution | Implemented; debug native fixtures pass |
 | Intel CPU alias lifetime | Whole-BO physical census, pending publication tokens, retained unpublished-fork metadata and permanent mixed-vendor provider dispatch | Implemented; debug native fixtures pass |
+| Xe low-latency queue hint | Truthful current ABI/epoch discovery, immutable real queue flag, source policy KLV before enable ACK and retained physical/virtual/parallel contexts | Implemented; debug native fixtures pass |
+| LNL EU-stall observation | Exact headless graphics20.04 profile, retained sampler/cache/media proof and existing bounded privilege/loss/reset lifecycle | Implemented; debug native fixtures pass |
 | GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open; mapping revocation and platform PM |
 | Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; primary-source register/firmware contracts |
 
@@ -2903,10 +2907,36 @@ The remaining broad workstreams still need production ownership/protocols.
 Two source limits are not missing features of the admitted set: its pinned
 platform descriptors expose no CGP class mask, and Xe hwmon fan/temperature
 attributes are read-only (power/current are the writable controls). The next
-concrete scheduling slice is low-latency queue policy; sampling qualification,
+slices now include the low-latency queue policy and exact LNL sampler below;
 retained placement transitions, separate media GTs and MMU invalidation remain.
 
 The follow-on retained external-display patch is correcting exact-family
 plane inventory in stopped-resource and GT-bootstrap reads, with independent
 absent-register refusal fixtures. Its source review and validation remain
 separate from this native checkpoint.
+
+The next two-feature slice implements immutable native Xe low-latency hints
+and exact LNL EU-stall observation. CONFIG reports the hint only for a live
+matching nonzero epoch/platform, nonempty engine publication and submission
+ABI1. The boot owner independently enforces CSS minima. Real hardware queues
+retain the hint through source key0x2005/value bit28 before ENABLE; ordinary
+queues explicitly send zero. Global acknowledged SLPC limits remain owned by
+the existing actor. Source fast-policy enqueue has no separate ACK and never
+establishes job completion. Queue cancellation, lost acknowledgements and
+close retain all reachable lane/VM/BO state until terminal retirement/reset.
+
+The default-off LNL sampler reuses the existing owner and startup arena. It
+verifies exact GAM MOCS3/PAT2, current media/cache/MMIO authority and physical
+DSS positions before publishing data. It retains uncertain DMA through the
+same independent reset and arena-before-media-release protocol. PTL sampling,
+OA, codec/HuC, media-GT and physical Intel/Mesa acceptance remain separate.
+All ten new fixtures pass in the debug native kernel. The combined branch
+passes 1,154 Intel/DRM/framebuffer/backlight tests and 670 shared filesystem/
+graphics/AMD tests, with no failures or duplicate names and one existing shared
+RNG-registration skip. All 68 new fixture names, all 1,087 prior Intel fixture
+names and all 31 shared backlight regressions are covered. Host GPU/filesystem
+all-target Clippy, workspace formatting, diff and all 94 frozen source/linker
+hashes pass. The ledger has 58 implemented checkpoint rows and ten broad open
+workstreams. Release native, production boot/btrfs and cross-target gates are
+running on this same frozen source; this is a local native-tested checkpoint,
+not a merge-readiness or Intel silicon/Mesa acceptance claim.

@@ -1471,12 +1471,25 @@ impl<A: BootAllocator> GuCScheduler<A> {
                 Phase::Policy => (
                     0x100b,
                     {
-                        let (priority, timeslice) = context
+                        let (priority, timeslice, low_latency) = context
                             .user
                             .as_ref()
-                            .map_or((3, 1000), |user| user.policy());
+                            .map_or((3, 1000, false), |user| user.policy());
+                        // xe_guc_submit.c init_policies + guc_klvs_abi.h:
+                        // SLPM_GT_FREQUENCY key 0x2005, one value, COMPUTE
+                        // strategy bit 28. This fast request is ordered before
+                        // ENABLE's acknowledgement; there is no policy ACK.
+                        // It changes no owner-wide SLPC limit or power profile.
                         alloc::vec![
-                            id, 0x20030001, priority, 0x20010001, timeslice, 0x20020001, 500000
+                            id,
+                            0x20030001,
+                            priority,
+                            0x20010001,
+                            timeslice,
+                            0x20020001,
+                            500000,
+                            0x20050001,
+                            if low_latency { 1 << 28 } else { 0 },
                         ]
                     },
                     Phase::Enable,

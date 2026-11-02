@@ -1,4 +1,4 @@
-//! BMG EU-stall observation, pinned MIT Linux b90c984d xe_eu_stall.c,
+//! BMG and exact LNL EU-stall observation, pinned MIT Linux b90c984d xe_eu_stall.c,
 //! xe_observation.c and regs/xe_eu_stall_regs.h. Fixed host bounds, current
 //! perf authority, MCR ownership and retained DMA are part of the interface.
 use crate::{
@@ -25,16 +25,19 @@ const DISABLE: u32 = 0x6901;
 const POLL_NS: u64 = 5_000_000;
 static ACTIVE: [AtomicBool; 64] = [const { AtomicBool::new(false) }; 64];
 
-/// Cached physical main-GT topology, published only by an admitted BMG PF.
+/// Cached physical main-GT topology, published only by an admitted BMG/LNL PF.
+/// The platform binds a session to its collector; it is not live MMIO authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Info {
     pub card: u32,
+    pub platform: crate::intel_gpu_gt::GtPlatform,
     pub dss: u32,
     pub per_group: u8,
 }
 impl Info {
     pub(crate) fn validate(self) -> Result<Self, FsError> {
-        if self.card >= 64
+        if !supported(self.platform)
+            || self.card >= 64
             || self.dss == 0
             || self.per_group == 0
             || self.per_group > 16
@@ -50,9 +53,7 @@ impl Info {
         topology: &crate::intel_gpu_topology::GtTopology,
         config: &crate::intel_gpu_hwconfig::HardwareConfig,
     ) -> Option<Self> {
-        if platform != crate::intel_gpu_gt::GtPlatform::Battlemage
-            || topology.platform() != platform
-        {
+        if !supported(platform) || topology.platform() != platform {
             return None;
         }
         let slices = config.lookup_u32(1).ok().flatten();
@@ -63,6 +64,7 @@ impl Info {
         };
         let info = Self {
             card,
+            platform,
             dss: (topology.geometry_dss() | topology.compute_dss())
                 .try_into()
                 .ok()?,
@@ -76,6 +78,11 @@ impl Info {
     fn reports(self) -> u64 {
         u64::from(self.dss.count_ones()) * (PER_CORE / RECORD) as u64
     }
+}
+/// Exact admitted observation profiles. PTL is deliberately excluded:
+/// xe_wa.c Wa18041344222 disables EU-stall on affected graphics30.00 layouts.
+pub(crate) const fn supported(platform: crate::intel_gpu_gt::GtPlatform) -> bool {
+    matches!(platform, crate::intel_gpu_gt::GtPlatform::Battlemage) || platform.is_lnl()
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -560,7 +567,18 @@ impl<A: BootAllocator> Collector<A> {
             return Err(FsError::WouldBlock);
         }
         let old = mcr.raw_read(0xfd4)?;
-        let result = operation(&mcr);
+        let result = (|| {
+            if self.info.platform.is_lnl() {
+                // xe_gt_mcr.c xe2lpg_instance0_steering_table: MOCS/PAT are
+                // GAM instance (0,0), independent of fused DSS0. Verify the
+                // retained UC MOCS3 and coherent GGTT PAT2, never reprogram.
+                mcr.select(0, true)?;
+                if mcr.raw_read(0x400c)? != 0x13c || mcr.raw_read(0x4808)? != 0xf {
+                    return Err(FsError::Unsupported);
+                }
+            }
+            operation(&mcr)
+        })();
         if mcr.lost.get() {
             return Err(FsError::NoDevice);
         }
@@ -611,7 +629,7 @@ impl<A: BootAllocator> Collector<A> {
                         0xfffc0000 | (status & 0xfffc),
                         Some((0xfffc, status & 0xfffc)),
                     )?;
-                    // BMG UC MOCS3, source encodes index<<1 in CTRL[9:3].
+                    // LNL/BMG UC MOCS3: source encodes index<<1 in CTRL[9:3].
                     mcr.write(
                         i,
                         0xe53c,

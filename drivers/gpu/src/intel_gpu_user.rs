@@ -52,7 +52,7 @@ pub struct DeviceFacts {
 
 pub trait UserBackend: core::fmt::Debug + Send + Sync {
     fn status(&self) -> Option<UserStatus>;
-    /// Cached physical BMG main-GT layout; no read-triggered hardware access.
+    /// Cached physical BMG/LNL main-GT layout; no read-triggered hardware access.
     fn eu_stall_info(&self) -> Option<crate::intel_gpu_eu_stall::Info> {
         None
     }
@@ -203,6 +203,9 @@ struct State {
     /// Jobs of this context that hung and were removed from their engine.
     guilty: u32,
     policy: (u32, u32),
+    /// Immutable queue-create intent; retained with the private context image
+    /// through repeated registration, cancellation and verified reset.
+    low_latency: bool,
 }
 
 #[derive(Debug)]
@@ -308,6 +311,7 @@ impl UserContext {
                 lost_pending: 0,
                 guilty: 0,
                 policy: (3, 1000),
+                low_latency: false,
             }),
         })
     }
@@ -340,6 +344,16 @@ impl UserContext {
             return Err(FsError::Busy);
         }
         state.policy = (priority, timeslice);
+        Ok(())
+    }
+    /// Configure only before this unpublished context has ever been claimed.
+    /// No runtime ioctl mutates this create-only flag.
+    pub(crate) fn configure_low_latency(&self) -> Result<(), FsError> {
+        let mut state = self.state.lock();
+        if state.epoch != 0 || state.busy {
+            return Err(FsError::Busy);
+        }
+        state.low_latency = true;
         Ok(())
     }
     pub(crate) fn banned(&self) -> bool {
@@ -482,8 +496,9 @@ pub(crate) struct UserJob {
     epoch: u64,
 }
 impl UserJob {
-    pub(crate) fn policy(&self) -> (u32, u32) {
-        self.context.state.lock().policy
+    pub(crate) fn policy(&self) -> (u32, u32, bool) {
+        let state = self.context.state.lock();
+        (state.policy.0, state.policy.1, state.low_latency)
     }
     /// Called only after deregistration, exact-head/breadcrumb proof and the
     /// final TLB ACK, with device writes synchronized for the CPU.

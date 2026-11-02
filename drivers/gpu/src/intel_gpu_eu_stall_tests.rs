@@ -238,6 +238,7 @@ impl BootAllocator for Allocator {
 fn info(dss: u32, per_group: u8) -> Info {
     Info {
         card: 61,
+        platform: crate::intel_gpu_gt::GtPlatform::Battlemage,
         dss,
         per_group,
     }
@@ -1173,4 +1174,116 @@ fn smoke_eu_stall_threshold_cancel_reset_and_capability_loss() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/intel_gpu_eu_stall",
     smoke_eu_stall_threshold_cancel_reset_and_capability_loss
+);
+
+fn smoke_eu_stall_exact_lnl_source_profile_sparse_dss_and_cache_refusal() -> TestResult {
+    use crate::intel_gpu::Generation;
+    use crate::intel_gpu_gt::GtPlatform;
+    struct Fuses;
+    impl MmioWindow for Fuses {
+        fn read32(&self, reg: u64) -> u32 {
+            match reg {
+                0x913c => 0x80000001,
+                0x9144 => 4,
+                0x9134 => 0x81,
+                _ => panic!("unqualified topology read {reg:x}"),
+            }
+        }
+        fn write32(&self, _: u64, _: u32) {
+            panic!("topology wrote MMIO")
+        }
+    }
+    let lnl = GtPlatform::Integrated(Generation::LunarLake);
+    let topology = crate::intel_gpu_topology::GtTopology::read(&Fuses, lnl).unwrap();
+    let config = crate::intel_gpu_hwconfig::HardwareConfig::parse(
+        [1u32, 1, 8, 70, 1, 32]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect(),
+    )
+    .unwrap();
+    for did in [0x6420, 0x64a0, 0x64b0] {
+        assert_eq!(GtPlatform::from_pci(0x8086, did), Some(lnl));
+        let layout = Info::from_tables(61, lnl, &topology, &config).unwrap();
+        assert_eq!(
+            (
+                layout.dss,
+                layout.per_group,
+                layout.last(),
+                layout.reports()
+            ),
+            (0x80000005, 4, 32, 24576)
+        );
+        let bytes = query(layout).unwrap();
+        assert_eq!(
+            &bytes[8..32],
+            &[1u64, 64, 524288]
+                .into_iter()
+                .flat_map(u64::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+    }
+    for platform in [
+        GtPlatform::Integrated(Generation::PantherLake),
+        GtPlatform::Integrated(Generation::MeteorLake),
+        GtPlatform::Alchemist,
+    ] {
+        assert!(!supported(platform));
+        assert!(Info::from_tables(61, platform, &topology, &config).is_none());
+        assert_eq!(
+            query(Info {
+                platform,
+                ..info(1, 4)
+            }),
+            Err(FsError::Unsupported)
+        );
+    }
+    let bmg_topology =
+        crate::intel_gpu_topology::GtTopology::read(&Fuses, GtPlatform::Battlemage).unwrap();
+    assert!(Info::from_tables(61, lnl, &bmg_topology, &config).is_none());
+    for cache in [true, false] {
+        let layout = Info {
+            platform: lnl,
+            ..info(5, 4)
+        };
+        let (shared, io, mut collector) = fixture(layout);
+        shared.put(0, 0x400c, 0x13c); // source UC MOCS3
+        shared.put(0, 0x4808, if cache { 0xf } else { 0xe }); // exact PAT2
+        let session = Session::new(layout, config_for_lnl()).unwrap();
+        collector.attach(session.clone()).unwrap();
+        if cache {
+            collector.control(&io, &session, true, || true).unwrap();
+            assert_eq!(shared.get(0, 0xe53c), 0x34);
+            assert_eq!(shared.get(2, 0xe520), 0x10000012);
+            let record = shared.memory().record(2, 0, 0x79);
+            shared.pointer(2, 64, false);
+            collector.poll(&io, 0, || true).unwrap();
+            let mut output = [0; 64];
+            assert_eq!(session.read_for_test(&mut output), Ok(64));
+            assert_eq!(output, record);
+        } else {
+            assert_eq!(
+                collector.control(&io, &session, true, || true),
+                Err(FsError::Unsupported)
+            );
+            assert!(!shared
+                .state
+                .lock()
+                .writes
+                .iter()
+                .any(|(_, r, _)| *r == 0xe520));
+            assert_eq!(session.read_for_test(&mut [0; 64]), Err(FsError::NoDevice));
+        }
+        shared.restored();
+        assert_eq!(shared.live.load(Ordering::Relaxed), 1);
+        reset(collector, &shared);
+    }
+    TestResult::Pass
+}
+fn config_for_lnl() -> Config {
+    Config { rate: 4, wait: 1 }
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_eu_stall",
+    smoke_eu_stall_exact_lnl_source_profile_sparse_dss_and_cache_refusal
 );

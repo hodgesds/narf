@@ -825,7 +825,7 @@ fn smoke_xe_vram_placement_queries_mmap_execution_and_reuse() -> TestResult {
         ],
         [bytes as u64, 0, bytes as u64]
     );
-    assert_eq!(u64_at(&xe_query(&file, &info, &user, 2), 16), 9);
+    assert_eq!(u64_at(&xe_query(&file, &info, &user, 2), 16), 11);
     let gt_list = xe_query(&file, &info, &user, 3);
     assert_eq!((u64_at(&gt_list, 24), u64_at(&gt_list, 32)), (2, 1));
     // xe_gem_create_ioctl EINVAL classes.
@@ -1341,7 +1341,7 @@ fn smoke_xe_queries_abi_identity_and_clock_facts() -> TestResult {
             }
             2 => {
                 assert_eq!(u64_at(&reply, 8) & 65535, 0xe20b);
-                assert_eq!(u64_at(&reply, 16), 8);
+                assert_eq!(u64_at(&reply, 16), 10);
                 assert_eq!(
                     u64_at(&reply, 40),
                     if narf_filesystem::caller_capable(23) {
@@ -1814,7 +1814,7 @@ fn smoke_ptl_native_xe_all_skus_ips_engines_private_vm_cancel_and_completion() -
             let query_file = RenderFile::new();
             let query_user = Cpu::new();
             let config = xe_query(&query_file, &info, &query_user, 2);
-            assert_eq!(u64_at(&config, 16), 0); // no VRAM/USM/compression hint claim
+            assert_eq!(u64_at(&config, 16), 2); // low latency only; no VRAM/USM/compression
             for flags in [2, 8] {
                 assert_eq!(
                     create_placed(&query_file, &info, &query_user, 4096, 1, flags, 1),

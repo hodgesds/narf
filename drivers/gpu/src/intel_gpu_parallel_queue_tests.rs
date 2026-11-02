@@ -870,3 +870,7 @@ mod wider {
 mod priority {
     include!("intel_gpu_xe_priority_tests.rs");
 }
+
+mod low_latency {
+    include!("intel_gpu_xe_low_latency_tests.rs");
+}

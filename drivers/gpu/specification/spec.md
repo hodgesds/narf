@@ -190,7 +190,40 @@ CLOCK_TAI and unadvertised engines are refused. Size-only queries need no
 payload pointer. Copyout touches only width/cycles/timestamp/delta, preserving
 the input fields even if userspace changes them while waiting. Sync kernel
 dispatch returns EAGAIN for a sample that needs the async owner.
-No low-latency, protected execution or fault-mode capability is advertised.
+Protected execution and fault-mode capability remain unadvertised.
+
+Native Xe EXEC_QUEUE_CREATE accepts LOW_LATENCY_HINT (flags bit 0) for qualified
+hardware execution queues. CONFIG reports HAS_LOW_LATENCY (bit 1) only for a
+current nonzero matching platform/epoch, nonempty published engine set and
+submission ABI major 1. The real boot/scheduler owner already enforces
+authenticated CSS firmware minima (Gen12 70.44.1, MTL/DG2/LNL 70.53.0, BMG/PTL
+70.54.0), submission ABI1 and all-engine execution/retirement proofs before
+publication. UserStatus reports submission ABI1.x, not CSS70.x; existing
+version-query bytes are unchanged. Other flag bits return EINVAL; low-latency
+software VM_BIND returns EOPNOTSUPP because that queue has no hardware context.
+Validation/copyout failures consume no queue name or GPU storage. The flag is
+immutable at creation; there is no dynamic low-latency property.
+
+Each registration retains the queue's context/VM/saved-state ownership and emits
+GuC UPDATE_CONTEXT_POLICIES with SLPM_GT_FREQUENCY key 0x2005, length 1: value
+bit 28 for the hint, zero otherwise. Priority, execution quantum and preemption
+timeout retain their existing meanings. Like pinned Xe, this is a fast request
+ordered before ENABLE, without a separate policy acknowledgement. The normal
+scheduling-mode ACK (plus protected dispatch for a parallel group) gates
+submit-ready; enqueue never proves terminal job success. The hint requests
+firmware's low-latency/compute frequency strategy and may increase power use. It
+does not alter acknowledged owner-wide frequency limits, platform MERT/fused
+bounds or Base/PowerSaving policy and promises no measured latency/frequency
+result. Existing GT/PCI/reset and render/media-wake owners remain the only
+hardware actors.
+
+Repeated registrations and placement migration retain the same hint with the
+context image. Caller cancellation, queue/VM/BO/fd close and missing
+acknowledgements retain all GPU-reachable state and reservations until native
+retirement or verified reset. A reset does not authorize replay of the old
+context; stale epochs remain refused, and a new queue rewrites the complete
+policy before enable. PXP, CGP, user hang-replay state and other new scheduling
+interfaces remain outside this contract.
 Visible VRAM is advertised only after the platform-qualified pool is published. BMG accepts/reports NO_COMPRESSION because every admitted binding
 uses an uncompressed coherent policy.
 
@@ -376,9 +409,10 @@ Long-running/fault VMs, broader parallel queues, OA observation and additional
 native Xe query/property families
 remain refused until their ownership and hardware contracts are implemented.
 
-**BMG EU-stall observation.** The exact boot opt-in
+**BMG and exact LNL EU-stall observation.** The exact boot opt-in
 `narf.intel.eu_stall=1` permits preallocation on qualified physical BMG main
-GTs before scheduling startup's acknowledged heavy GGTT invalidations. Query 10
+GTs and LNL graphics20.04 main GTs (PCI6420/64A0/64B0), before scheduling
+startup's acknowledged heavy GGTT invalidations. Query 10
 is available only after that owner and the execution epoch are published.
 Xe OBSERVATION type 1/open 0 returns a disabled sampling description; current
 CAP_PERFMON or CAP_SYS_ADMIN is required at open and every read/control, including
@@ -410,6 +444,23 @@ stop; full GT reset invalidates old descriptions and releases exposed storage
 only after the existing GuC-reset, DMA-idle and GRDOM_FULL proofs. A busy or
 lost MCR owner cannot prevent escalation to that reset. This profile does not
 advertise OA, media-GT sampling or additional platform support.
+
+`intel_gpu_eu_stall::Info` retains the exact `GtPlatform`, card, physical
+32-bit DSS union and steering divisor. This is immutable source policy;
+current capability, MMIO and wake proof remains necessary. Collectors accept
+only their exact Info. LNL requires the retained serial/headless full-device
+reset, current PF/PCI/BAR/command/D0, main/render wake, held media-quiescence
+proof and coherent owned system backing with PAT2. Every sampler access
+reuses the same GT owner and its four-zero root0x130030 read preamble. Under
+the existing MCR semaphore, each LNL transaction verifies GAM instance(0,0)
+MOCS3=0x13c and PAT2=0xf without rewriting them. Failure closes admission and
+retains exposed DMA until verified GuC/DMA/full-GT reset; the arena is then
+invalidated before media wake release. No separate wake/flush actor or live
+GGTT rebinding is added. Overflow indicates an observed loss lower bound.
+PTL is refused because its source sampler-disable workaround remains active.
+`UserBackend::eu_stall_info` returns only the retained exact BMG/LNL layout
+after epoch publication; its default remains refusal. The Xe wire query
+format and current capability/terminal-ownership rules are unchanged.
 
 #### i915 compatibility profile
 
@@ -1038,8 +1089,10 @@ units and HWCONFIG layout maxima (the source's four-DSS fallback for absent
 maxima); L3 steering selects a live bank. Masked writes preserve unrelated
 bits; non-masked tuning uses steered GPU MI_MATH read/modify/write and clears
 its GPRs and selective-read selector afterward. Wa_14019789679 explicitly
-seeds all fifty SVG commands with zero payloads on every admitted profile to
-prevent omitted restore headers. Xe2 uses DRAWING_RECTANGLE_FAST in place of
+seeds all fifty SVG commands with zero payloads on its source-qualified IP
+range through graphics20.04; PTL graphics30.00/30.01 does not emit those
+commands. Gen12 retains its source zero-SVG layout. Xe2 uses
+DRAWING_RECTANGLE_FAST in place of
 DG2/Xe-LPG's non-pipelined DRAWING_RECTANGLE. This table covers context state,
 not global GT/engine initialization.
 

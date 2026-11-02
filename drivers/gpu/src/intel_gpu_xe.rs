@@ -30,6 +30,25 @@ pub(crate) fn max_queue_priority() -> u64 {
     }
 }
 
+/// Source Xe emits this KLV for all supported IPs. GuCBoot::stage_image
+/// validates each profile's authenticated CSS firmware minimum, and its
+/// scheduler/reload gates submission ABI major 1 before the live owner can
+/// publish engines/epoch. UserStatus carries that 1.x ABI, not CSS 70.x.
+/// The hint changes no owner-wide SLPC min/max or power profile.
+pub(crate) fn low_latency_supported(info: &DeviceInfo) -> bool {
+    info.platform.guc().is_some()
+        && info
+            .backend
+            .as_ref()
+            .and_then(|backend| backend.status())
+            .is_some_and(|status| {
+                status.epoch != 0
+                    && status.platform == info.platform
+                    && status.submission_version.0 == 1
+                    && status.engines.iter().next().is_some()
+            })
+}
+
 #[derive(Debug)]
 struct Queue {
     vm: Arc<Vm>,
@@ -292,7 +311,14 @@ impl XeFile {
             return Err(FsError::NoDevice);
         }
         let mut wire = read(user, address, 48)?;
-        zero(&wire[16..20])?;
+        let flags = u32_at(&wire, 16);
+        if flags & !abi::EXEC_QUEUE_LOW_LATENCY_HINT != 0 {
+            return Err(FsError::InvalidData);
+        }
+        let low_latency = flags & abi::EXEC_QUEUE_LOW_LATENCY_HINT != 0;
+        if low_latency && !low_latency_supported(info) {
+            return Err(FsError::Unsupported);
+        }
         zero(&wire[32..48])?;
         let width = u16::from_le_bytes(wire[8..10].try_into().unwrap());
         let count = u16::from_le_bytes(wire[10..12].try_into().unwrap());
@@ -318,6 +344,12 @@ impl XeFile {
             .map_or_else(Default::default, |status| status.engines);
         if class == 5 && (logical != 0 || count != 1 || width != 1) {
             return Err(FsError::InvalidData);
+        }
+        // Linux's VM_BIND hint reaches a real GuC bind engine. This ABI's
+        // bind queues perform software page-table transactions, so there is
+        // no hardware context on which to publish the requested policy.
+        if class == 5 && low_latency {
+            return Err(FsError::Unsupported);
         }
         let mut placements = crate::intel_gpu_engine::EngineSet::default();
         if class != 5 {
@@ -397,6 +429,9 @@ impl XeFile {
             UserContext::for_placements(placements)?
         };
         context.configure_schedule(priority, timeslice)?;
+        if low_latency {
+            context.configure_low_latency()?;
+        }
         let mut names = self.names.lock();
         let vm = names
             .vms
@@ -421,6 +456,9 @@ impl XeFile {
         // EXEC does not reauthorize or silently demote a live queue.
         if priority == 1 && max_queue_priority() < 2 {
             return Err(FsError::OperationNotPermitted);
+        }
+        if low_latency && !low_latency_supported(info) {
+            return Err(FsError::NoDevice);
         }
         put32(&mut wire, 20, id);
         user.write(address, &wire)?;

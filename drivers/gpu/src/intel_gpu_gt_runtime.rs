@@ -131,12 +131,14 @@ struct Backend {
 
 impl crate::intel_gpu_user::UserBackend for Backend {
     fn eu_stall_info(&self) -> Option<crate::intel_gpu_eu_stall::Info> {
-        if self.platform != GtPlatform::Battlemage || self.epoch.load(Ordering::Acquire) == 0 {
+        if !crate::intel_gpu_eu_stall::supported(self.platform)
+            || self.epoch.load(Ordering::Acquire) == 0
+        {
             return None;
         }
         let owner = self.owner.upgrade()?;
         let info = *owner.eu_info.lock();
-        info
+        info.filter(|info| info.platform == self.platform)
     }
     fn eu_stall_control(
         &self,
