@@ -2,6 +2,8 @@
 use super::*;
 use crate::rtw88::firmware_transport::Error;
 use crate::rtw88::{ht, ht_tests as cases};
+#[path = "ht2_native_tests.rs"]
+mod ht2_native_tests;
 struct Case {
     e: Extended,
     cap: Cap<FirmwareBlob, Read>,

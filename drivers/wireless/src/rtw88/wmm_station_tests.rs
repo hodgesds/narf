@@ -58,7 +58,16 @@ fn setup(
     qualified: bool,
     response: Option<&[u8]>,
 ) -> Result<Extended, &'static str> {
-    let h = Harness::new(protected);
+    setup_paths(protected, wmm, qualified, response, false)
+}
+fn setup_paths(
+    protected: bool,
+    wmm: bool,
+    qualified: bool,
+    response: Option<&[u8]>,
+    ht2: bool,
+) -> Result<Extended, &'static str> {
+    let h = Harness::build_paths(protected, OWN, false, ht2);
     let mut peer = Peer::new(protected);
     peer.ap = peer
         .ap
@@ -172,6 +181,7 @@ fn smoke_rtw8822ce_legacy12_descriptor_rate_order_and_wmm_register_units() -> Te
                 rates: 1 | (1 << index),
                 qos: true,
                 mcs: 0,
+                rx_mcs: 0,
                 sgi: false,
                 ldpc: false,
                 stbc: false,
@@ -209,6 +219,7 @@ fn smoke_rtw8822ce_legacy12_descriptor_rate_order_and_wmm_register_units() -> Te
             rates: (1 << 3) | (1 << 4) | (1 << 5),
             qos: false,
             mcs: 0,
+            rx_mcs: 0,
             sgi: false,
             ldpc: false,
             stbc: false,

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Exact-chip static HT20/1SS qualification and native gain programming.
+//! Exact-chip static HT20 qualification and native gain/path programming.
 //! Sources: rtw88/{rtw8821c,rtw8822c,phy,tx,fw,mac80211}.c. No asset is supplied.
 use super::{
     firmware_transport::{Error, Io},
@@ -8,7 +8,7 @@ use super::{
     station_control::Admission,
     station_profile,
 };
-use alloc::{format, string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use narf_capabilities::{Cap, CapError, CapOp, NoopOp, Read};
 use narf_firmware::FirmwareBlob;
 use narf_wireless::association::phy::{HtGi, HtWidth, LocalHt, LocalPhy};
@@ -16,6 +16,7 @@ use narf_wireless::association::phy::{HtGi, HtWidth, LocalHt, LocalPhy};
 pub(super) struct Facts {
     pub hardware: Features,
     pub maximum: u8,
+    pub maximum_2ss: Option<u8>,
     pub legacy: [u8; 12],
     pub cck: [u8; 2],
 }
@@ -24,6 +25,9 @@ impl Facts {
         self.local()?;
         let mut rx = [0; 10];
         rx[0] = 255;
+        if self.hardware.antennas >= 2 && self.hardware.streams >= 2 && self.maximum_2ss.is_some() {
+            rx[1] = 255;
+        }
         LocalHt::new(
             rx,
             rx,
@@ -38,23 +42,34 @@ impl Facts {
             4,
         )
         .ok()
-        .map(|h| h.capability_body())
+        .map(|ht| ht.capability_body())
     }
     pub(super) fn local(self) -> Option<LocalPhy> {
         // Source chips implement HT; the actual report may only narrow paths.
-        // The initial implementation owns a single stream even on C22 RX-AB.
+        // A board's actual paths and complete factory fields can only narrow
+        // metadata. Association still requires a separately current H grant.
         (self.hardware.antennas != 0 && self.hardware.streams != 0 && self.hardware.protocol == 3)
-            .then(|| local(255, true, 0, 0))
+            .then(|| {
+                let mask = if self.hardware.antennas >= 2
+                    && self.hardware.streams >= 2
+                    && self.maximum_2ss.is_some()
+                {
+                    0xffff
+                } else {
+                    0xff
+                };
+                local(mask, mask, true, 0, 0)
+            })
             .flatten()
     }
 }
 /// `did`/`coding` select the RX/TX coding of `main.c::rtw_init_ht_cap`;
 /// did 0 (beacon observation only) advertises no coding.
-fn local(tx: u8, sgi: bool, did: u16, coding: u8) -> Option<LocalPhy> {
+fn local(tx: u16, rx_mask: u16, sgi: bool, did: u16, coding: u8) -> Option<LocalPhy> {
     let mut rx = [0; 10];
-    rx[0] = 255;
+    rx[..2].copy_from_slice(&rx_mask.to_le_bytes());
     let mut transmit = [0; 10];
-    transmit[0] = tx;
+    transmit[..2].copy_from_slice(&tx.to_le_bytes());
     LocalHt::new(
         rx,
         rx,
@@ -71,10 +86,10 @@ fn local(tx: u8, sgi: bool, did: u16, coding: u8) -> Option<LocalPhy> {
     .map(|h| {
         h.with_ldpc(
             super::coding::rx_ldpc(did),
-            coding & super::coding::LDPC != 0,
+            coding & super::coding::LDPC != 0 && tx & 0xff00 == 0,
         )
         .with_rx_stbc(did != 0)
-        .with_tx_stbc(coding & super::coding::STBC != 0)
+        .with_tx_stbc(coding & super::coding::STBC != 0 && tx & 0xff00 == 0)
     })
     .and_then(|h| h.with_tx_selection(transmit))
     .ok()
@@ -90,11 +105,34 @@ pub(super) fn factory_limit(p: &[u8], factor: i16, max: u8) -> Option<u8> {
     let value = i16::from(base) + (if n & 8 != 0 { n - 16 } else { n }) * factor;
     (value >= 0).then_some(value.min(i16::from(max)) as u8)
 }
+/// Linux phy.c::rtw_phy_get_2g_tx_power_index: HT20's signed 1S
+/// difference plus the additional signed low-nibble 2S difference.
+pub(super) fn factory_limit_2ss(p: &[u8]) -> Option<u8> {
+    let base = *p.get(6)?;
+    let one = *p.get(11)?;
+    let two = *p.get(12)?;
+    if base > 127 || one == 255 || two == 255 {
+        return None;
+    }
+    let signed = |v: u8| {
+        let n = i16::from(v & 15);
+        if n & 8 != 0 {
+            n - 16
+        } else {
+            n
+        }
+    };
+    let value = i16::from(base) + 2 * (signed(one >> 4) + signed(two));
+    (value >= 0).then_some(value.min(127) as u8)
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
     pub identity: [u8; 32],
     pub mac: [u8; 6],
     pub filename: String,
+    /// Optional separately measured RTL8822CE HT20 RX/TX2SS v2 program.
+    /// The legacy v1 proposal remains unchanged and authorizes only1SS.
+    pub two_streams: Option<Box<Request>>,
 }
 pub(super) fn request(base: &station_profile::Grant) -> Result<Request, Error> {
     let f = base
@@ -119,7 +157,7 @@ pub(super) fn request(base: &station_profile::Grant) -> Result<Request, Error> {
     h.update(b"full static raw thermal0..63 supply/antenna/BT envelope; exact source gain writes/readbacks; no tracking or fabricated calibration; transient/response+legacy+8LGI+8SGI measured peaks");
     h.update(b"bound original HT45/61/WMM response; generated localHT20 MCSff RX/TX SGI20 default3839AMSDU; BGN20_1SS3 RA mask12..19 PTdisabled; fixedDATA12..19 USE_RATE DISDATAFB BW0 SGIbit4; BE/TID0 QoS26 before softwareCCMP; originalRAW AMSDU authenticated once; ADDBA status37 nativeCCX; noTXBA");
     let mac = base.own();
-    Ok(Request {
+    let mut proposal = Request {
         identity: h.finalize(),
         mac,
         filename: format!(
@@ -132,7 +170,25 @@ pub(super) fn request(base: &station_profile::Grant) -> Result<Request, Error> {
             mac[4],
             mac[5]
         ),
-    })
+        two_streams: None,
+    };
+    if base.did() == 0xc822 && f.hardware.streams >= 2 && f.hardware.antennas >= 2 {
+        if let Some(maximum) = f.maximum_2ss {
+            let mut h = narf_crypto::sha256::Sha256::new();
+            h.update(b"NARF RTL8822CE exact retained HT20 two-stream v2");
+            h.update(&proposal.identity);
+            h.update(&[f.maximum, maximum]);
+            h.update(b"N22H256v2;MCS16/RXffff;MCS8..15 cumulative signed HT1S+HT2S low nibble minAB;equal references MCS7;signed7bit shared TXAGC 12..27;legacy1SS-A/2SS-AB ANT820=31 TXLGMAP1e2c=0400;source BBreset twice;RX path unchanged AB;TXGI direct not inferred dBm");
+            h.update(b"current original full C/Q/H source and policy before mutation;actual native queue/mailbox/MAC quiet;TXPAUSE+RXDMApark before BB;readback and current grant before resume;no partial restore on error;all2SS LGI/SGI/transient/response/simultaneous-chain measured peaks");
+            proposal.two_streams = Some(Box::new(Request {
+                identity: h.finalize(),
+                mac: proposal.mac,
+                filename: proposal.filename.replace("ht20-v1-", "ht20-2ss-v2-"),
+                two_streams: None,
+            }));
+        }
+    }
+    Ok(proposal)
 }
 pub(super) enum Source {
     Registered,
@@ -149,12 +205,13 @@ pub(super) struct Grant {
     base: Arc<station_profile::Grant>,
     cap: Cap<FirmwareBlob, Read>,
     facts: Facts,
-    indices: [u8; 8],
-    peaks: [i16; 30],
+    indices: [u8; 16],
+    peaks: Vec<i16>,
     antenna: i16,
     ceiling: i16,
-    mcs: u8,
+    mcs: u16,
     sgi: bool,
+    version: u8,
 }
 impl Source {
     pub(super) fn load(self, base: Arc<station_profile::Grant>) -> Result<Arc<Grant>, Error> {
@@ -177,12 +234,33 @@ impl Source {
                 let loader = narf_firmware::trusted_loader_authority()
                     .and_then(|c| c.derive::<Read>().ok())
                     .ok_or(Error::Access)?;
-                let cap = narf_firmware::open(&r.filename, &loader).map_err(Error::Firmware)?;
+                let (cap, r) = if let Some(second) = r.two_streams.clone() {
+                    match narf_firmware::open(&second.filename, &loader) {
+                        Ok(cap) => (cap, *second),
+                        Err(narf_firmware::FirmwareError::NotFound) => (
+                            narf_firmware::open(&r.filename, &loader).map_err(Error::Firmware)?,
+                            r,
+                        ),
+                        Err(error) => return Err(Error::Firmware(error)),
+                    }
+                } else {
+                    (
+                        narf_firmware::open(&r.filename, &loader).map_err(Error::Firmware)?,
+                        r,
+                    )
+                };
                 cap.invoke(Decode { base, request: r })
                     .map_err(|_| Error::Access)??
             }
             #[cfg(any(test, feature = "kernel-test"))]
-            Self::Verified { bytes, signer, cap } => Grant::decode(&bytes, signer, cap, base, r)?,
+            Self::Verified { bytes, signer, cap } => {
+                let r = if bytes.get(4) == Some(&2) {
+                    *r.two_streams.ok_or(Error::Unsupported)?
+                } else {
+                    r
+                };
+                Grant::decode(&bytes, signer, cap, base, r)?
+            }
         };
         g.check()?;
         Ok(Arc::new(g))
@@ -201,39 +279,63 @@ impl Grant {
     ) -> Result<Self, Error> {
         cap.invoke(NoopOp).map_err(|_| Error::Access)?;
         let facts = base.ht_facts().ok_or(Error::Unsupported)?;
+        let v2 = b.get(4) == Some(&2);
+        let length = if v2 { 256 } else { 192 };
         if signer.is_none()
-            || b.len() != 192
+            || b.len() != length
             || b[..4]
                 != *if base.did() == 0xc821 {
                     b"N21H"
                 } else {
                     b"N22H"
                 }
-            || b[4..8] != [1, 0, 192, 0]
-            || b[8..12] != 192u32.to_le_bytes()
+            || b[4..8] != if v2 { [2, 0, 0, 1] } else { [1, 0, 192, 0] }
+            || b[8..12] != (length as u32).to_le_bytes()
             || b[12..14] != [0xec, 0x10]
             || b[14..16] != base.did().to_le_bytes()
             || b[16..48] != request.identity
             || b[48..54] != request.mac
             || b[54..56] != [1, 20]
             || b[64..66] != [0, 63]
-            || b[66] == 0
-            || b[67] & !1 != 0
-            || b[132..] != [0; 60]
+            || if v2 {
+                base.did() != 0xc822
+                    || facts.hardware.streams < 2
+                    || facts.hardware.antennas < 2
+                    || facts.maximum_2ss.is_none()
+                    || b[67] == 0
+                    || b[68] & !1 != 0
+                    || b[69] != 2
+                    || b[174..].iter().any(|&byte| byte != 0)
+            } else {
+                b[66] == 0 || b[67] & !1 != 0 || b[132..].iter().any(|&byte| byte != 0)
+            }
         {
             return Err(Error::Prerequisite);
         }
         let signed = |at| i16::from_le_bytes([b[at], b[at + 1]]);
-        let indices = b[68..76].try_into().map_err(|_| Error::Prerequisite)?;
-        let peaks = core::array::from_fn(|i| {
-            signed(if i < 2 {
-                60 + i * 2
-            } else if i < 18 {
-                76 + (i - 2) * 2
-            } else {
-                108 + (i - 18) * 2
+        let mut indices = [0; 16];
+        if v2 {
+            indices.copy_from_slice(&b[70..86]);
+        } else {
+            indices[..8].copy_from_slice(&b[68..76]);
+        }
+        let peaks = (0..if v2 { 46 } else { 30 })
+            .map(|i| {
+                signed(if i < 2 {
+                    60 + i * 2
+                } else if v2 {
+                    if i < 34 {
+                        86 + (i - 2) * 2
+                    } else {
+                        150 + (i - 34) * 2
+                    }
+                } else if i < 18 {
+                    76 + (i - 2) * 2
+                } else {
+                    108 + (i - 18) * 2
+                })
             })
-        });
+            .collect();
         let g = Self {
             request,
             digest: {
@@ -248,12 +350,21 @@ impl Grant {
             peaks,
             antenna: signed(56),
             ceiling: signed(58),
-            mcs: b[66],
-            sgi: b[67] != 0,
+            mcs: if v2 {
+                u16::from_le_bytes([b[66], b[67]])
+            } else {
+                u16::from(b[66])
+            },
+            sgi: b[if v2 { 68 } else { 67 }] != 0,
+            version: if v2 { 2 } else { 1 },
         };
         if !(0..=128).contains(&g.antenna)
             || !(-512..=256).contains(&g.ceiling)
-            || g.indices.iter().any(|&i| i > facts.maximum)
+            || g.indices[..8].iter().any(|&i| i > facts.maximum)
+            || v2
+                && g.indices[8..]
+                    .iter()
+                    .any(|&i| i > facts.maximum_2ss.unwrap_or(0))
             || g.peaks.iter().any(|&p| !(-512..=256).contains(&p))
             || g.peaks[1..].iter().any(|&p| p > g.peaks[0])
             || g.base.did() == 0xc822
@@ -266,18 +377,30 @@ impl Grant {
         }
         Ok(g)
     }
+    fn two_streams(&self) -> bool {
+        self.version == 2
+    }
+    fn rx_mask(&self) -> u16 {
+        if self.two_streams() {
+            0xffff
+        } else {
+            0xff
+        }
+    }
     pub(super) fn local(&self) -> LocalPhy {
         self.local_coded(0)
     }
     /// Base RX coding plus the separately qualified N2xC TX `coding` flags.
     pub(super) fn local_coded(&self, coding: u8) -> LocalPhy {
-        local(self.mcs, self.sgi, self.base.did(), coding).expect("validated native HT facts")
+        local(self.mcs, self.rx_mask(), self.sgi, self.base.did(), coding)
+            .expect("validated native HT facts")
     }
-    pub(super) fn profile(&self, rates: u16, mcs: u8, sgi: bool) -> Result<DataProfile, Error> {
+    pub(super) fn profile(&self, rates: u16, mcs: u16, sgi: bool) -> Result<DataProfile, Error> {
         let p = DataProfile {
             rates,
             qos: true,
             mcs,
+            rx_mcs: self.rx_mask(),
             sgi,
             ldpc: false,
             stbc: false,
@@ -298,16 +421,23 @@ impl Grant {
             && p.rates & !self.base.rates() == 0
             && p.mcs != 0
             && p.mcs & !self.mcs == 0
+            && p.rx_mcs == self.rx_mask()
             && (!p.sgi || self.sgi)
     }
-    pub(super) fn mcs(&self) -> u8 {
+    pub(super) fn mcs(&self) -> u16 {
         self.mcs
     }
     pub(super) fn sgi(&self) -> bool {
         self.sgi
     }
     pub(super) fn matches(&self, b: &station_profile::Grant) -> bool {
-        request(b).as_ref() == Ok(&self.request)
+        request(b).ok().is_some_and(|proposal| {
+            if self.two_streams() {
+                proposal.two_streams.as_deref() == Some(&self.request)
+            } else {
+                proposal == self.request
+            }
+        })
     }
     pub(super) fn invoke<T>(&self, op: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
         struct Live<'a, F>(&'a Grant, F);
@@ -348,13 +478,15 @@ impl Grant {
             .all(|&p| i32::from(p) + i32::from(self.antenna) <= i32::from(limit))
     }
     pub(super) fn tracking_indices(&self) -> [u8; 8] {
-        self.indices
+        self.indices[..8]
+            .try_into()
+            .expect("one-stream tracking indices")
     }
     fn words(&self) -> [u32; 16] {
         let mut bytes = [0; 64];
         let reference = i16::from(self.indices[7]);
         for (rate, b) in bytes.iter_mut().enumerate() {
-            let index = if (12..20).contains(&rate) {
+            let index = if (12..if self.two_streams() { 28 } else { 20 }).contains(&rate) {
                 i16::from(self.indices[rate - 12])
             } else {
                 0
@@ -372,7 +504,18 @@ impl Grant {
         mut read: impl FnMut(u16) -> Result<u32, Error>,
     ) -> Result<(), Error> {
         if self.base.did() == 0xc821 {
-            return super::radio8821c::operating_readback_ht(read, self.facts.legacy, self.indices);
+            return super::radio8821c::operating_readback_ht(
+                read,
+                self.facts.legacy,
+                self.tracking_indices(),
+            );
+        }
+        if self.two_streams()
+            && (read(0x820)? & 255 != 0x31
+                || read(0x1e2c)? & 0xffff != 0x400
+                || read(0x1a04)? & 0xf0000000 != 0x80000000)
+        {
+            return Err(Error::Prerequisite);
         }
         for (r, v) in [0x18a0, 0x41a0].into_iter().zip(self.facts.cck) {
             if read(r)? >> 16 & 127 != u32::from(v) {
@@ -394,12 +537,73 @@ impl Grant {
         }
         Ok(())
     }
+    fn guarded<I: Io, T>(
+        &self,
+        io: &mut I,
+        admission: &Admission,
+        op: impl FnOnce(&mut I) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.invoke(|| {
+            admission.run(|| {
+                io.station_allowed()?;
+                op(io)
+            })
+        })
+    }
     pub(super) async fn program(
         &self,
         io: &mut impl Io,
         admission: &Admission,
     ) -> Result<(), Error> {
         self.check()?;
+        let parked = if self.two_streams() {
+            Some(self.guarded(io, admission, |io| {
+                if !io.station_ht_program_quiet()? {
+                    return Err(Error::State);
+                }
+                let pause = io.read8(0x522)?;
+                let rx = io.read32(super::dma_stop::RXPKT_NUM)?;
+                if pause != 0 || rx == u32::MAX || rx & super::dma_stop::RW_RELEASE != 0 {
+                    return Err(Error::Prerequisite);
+                }
+                io.write8(0x522, 255)?;
+                io.write32(super::dma_stop::RXPKT_NUM, rx | super::dma_stop::RW_RELEASE)?;
+                if io.read8(0x522)? != 255 {
+                    return Err(Error::Prerequisite);
+                }
+                Ok(pause)
+            })?)
+        } else {
+            None
+        };
+        if parked.is_some() {
+            let mut error = None;
+            let idle = narf_scheduler::responsive_spin_until(
+                || match self.guarded(io, admission, |io| {
+                    let rx = io.read32(super::dma_stop::RXPKT_NUM)?;
+                    if rx == u32::MAX {
+                        return Err(Error::Gone);
+                    }
+                    if rx & super::dma_stop::RW_RELEASE == 0 {
+                        return Err(Error::Prerequisite);
+                    }
+                    Ok(rx & super::dma_stop::RXDMA_IDLE != 0)
+                }) {
+                    Ok(ready) => ready,
+                    Err(e) => {
+                        error = Some(e);
+                        true
+                    }
+                },
+                narf_time::Deadline::after_ms(10),
+            );
+            if let Some(error) = error {
+                return Err(error);
+            }
+            if !idle {
+                return Err(Error::Timeout);
+            }
+        }
         // Call only after the retained gate encloses this NEW complete program.
         // C21's actual fresh RF42 conversion is required, never a factory byte.
         if self.base.did() == 0xc821 {
@@ -421,7 +625,7 @@ impl Grant {
                 }
                 self.base.temperature(((meter >> 10) & 63) as u8)
             })?;
-            for (i, chunk) in self.indices.chunks_exact(4).enumerate() {
+            for (i, chunk) in self.indices[..8].chunks_exact(4).enumerate() {
                 let v = u32::from_le_bytes(chunk.try_into().unwrap());
                 admission.run(|| {
                     io.station_allowed()?;
@@ -431,25 +635,64 @@ impl Grant {
             }
         } else {
             for r in [0x18e8, 0x41e8] {
-                admission.run(|| {
-                    io.station_allowed()?;
+                self.guarded(io, admission, |io| {
                     super::radio::mask(io, 0x1c90, 1 << 15, 0)?;
                     super::radio::mask(io, r, 0x1fc00, u32::from(self.indices[7]))
                 })?;
                 narf_scheduler::yield_now().await;
             }
             for (i, v) in self.words().into_iter().enumerate() {
-                admission.run(|| {
-                    io.station_allowed()?;
+                self.guarded(io, admission, |io| {
                     super::radio::mask(io, 0x1c90, 1 << 15, 0)?;
                     io.write32(0x3a00 + i as u16 * 4, v)
                 })?;
                 narf_scheduler::yield_now().await;
             }
+            if self.two_streams() {
+                self.guarded(io, admission, |io| {
+                    super::radio::mask(io, 0x820, 255, 0x31)?;
+                    super::radio::mask(io, 0x1e2c, 0xffff, 0x400)?;
+                    // rtw8822c_config_ofdm_tx_path + outer config_tx_path.
+                    // Both reset BB_RSTB while preserving all other SYS bits.
+                    for _ in 0..2 {
+                        let sys = io.read16(0x2)?;
+                        if sys == u16::MAX {
+                            return Err(Error::Gone);
+                        }
+                        io.write16(0x2, sys | 1)?;
+                        io.write16(0x2, sys & !1)?;
+                        io.write16(0x2, sys | 1)?;
+                    }
+                    if io.read16(0x2)? & 1 == 0 {
+                        return Err(Error::Prerequisite);
+                    }
+                    Ok(())
+                })?;
+            }
         }
-        admission.run(|| {
-            io.station_allowed()?;
-            self.readback(|r| io.read32(r))
+        self.guarded(io, admission, |io| {
+            self.readback(|r| io.read32(r))?;
+            if let Some(pause) = parked {
+                let rx = io.read32(super::dma_stop::RXPKT_NUM)?;
+                if io.read8(0x522)? != 255
+                    || rx == u32::MAX
+                    || rx & (super::dma_stop::RW_RELEASE | super::dma_stop::RXDMA_IDLE)
+                        != super::dma_stop::RW_RELEASE | super::dma_stop::RXDMA_IDLE
+                {
+                    return Err(Error::Prerequisite);
+                }
+                io.write32(
+                    super::dma_stop::RXPKT_NUM,
+                    rx & !super::dma_stop::RW_RELEASE,
+                )?;
+                io.write8(0x522, pause)?;
+                if io.read8(0x522)? != pause
+                    || io.read32(super::dma_stop::RXPKT_NUM)? & super::dma_stop::RW_RELEASE != 0
+                {
+                    return Err(Error::Prerequisite);
+                }
+            }
+            Ok(())
         })
     }
 }

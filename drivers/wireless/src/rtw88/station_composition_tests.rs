@@ -537,6 +537,9 @@ impl Harness {
         Self::build(protected, OWN, false)
     }
     fn build(protected: bool, own: [u8; 6], native_dispatch: bool) -> Self {
+        Self::build_paths(protected, own, native_dispatch, false)
+    }
+    fn build_paths(protected: bool, own: [u8; 6], native_dispatch: bool, ht2: bool) -> Self {
         if !native_dispatch {
             assert!(ACTIVE_TEST.lock().is_none());
         }
@@ -572,7 +575,7 @@ impl Harness {
         // its first simulated firmware publication and all real packet DMA.
         complete(lifecycle.initialize_bytes(move || Ok(io), super::mac_tests::firmware())).unwrap();
         complete(lifecycle.prepare_mac()).unwrap();
-        let factory = super::power_policy_tests::make_factory_with_mac(0, 60, own);
+        let factory = super::power_policy_tests::make_factory_paths(0, 60, own, ht2);
         complete(lifecycle.prepare_phy_tables(&factory)).unwrap();
         let board = {
             let retained = lifecycle.retained.try_lock().unwrap();

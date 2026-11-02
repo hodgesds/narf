@@ -290,11 +290,20 @@ impl Core {
         &self,
         mut index: impl FnMut(u16) -> Result<u32, Error>,
     ) -> Result<bool, Error> {
-        if self.phase != Phase::Running
-            || self.pending.is_some()
-            || !self.batch_pending.is_empty()
-            || !self.rx_idle
-        {
+        if !self.rx_idle || !self.transmit_quiet(&mut index)? {
+            return Ok(false);
+        }
+        let rx = index(0x3b4)?;
+        let expected = u32::from(self.rx);
+        Ok(rx & 0x0fff0fff == (expected | expected << 16))
+    }
+    /// TX joint completions and actual native ring pointers; RX may contain
+    /// an original pre-association beacon and is parked separately.
+    pub(super) fn transmit_quiet(
+        &self,
+        mut index: impl FnMut(u16) -> Result<u32, Error>,
+    ) -> Result<bool, Error> {
+        if !self.ready() {
             return Ok(false);
         }
         for q in [
@@ -312,9 +321,7 @@ impl Core {
                 return Ok(false);
             }
         }
-        let rx = index(0x3b4)?;
-        let expected = u32::from(self.rx);
-        Ok(rx & 0x0fff0fff == (expected | expected << 16))
+        Ok(true)
     }
     pub(super) fn ready(&self) -> bool {
         self.phase == Phase::Running && self.pending.is_none() && self.batch_pending.is_empty()
@@ -452,7 +459,7 @@ impl Core {
         }
         let descriptor = port.rx_bytes(slot, 0, format::RX_DESC)?;
         if let Ok(descriptor) = <&[u8; format::RX_DESC]>::try_from(descriptor.as_slice()) {
-            if let Ok(metadata) = format::receive_profile(descriptor, self.data_profile.mcs != 0) {
+            if let Ok(metadata) = format::receive_mcs(descriptor, self.data_profile.rx_mcs) {
                 let mut body =
                     port.rx_bytes(slot, metadata.payload.start, metadata.payload.len())?;
                 if body.len() != metadata.payload.len() {

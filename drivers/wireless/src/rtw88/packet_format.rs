@@ -37,7 +37,9 @@ impl Aggregation {
         profile: DataProfile,
         frames: impl ExactSizeIterator<Item = usize>,
     ) -> bool {
-        const NDBPS: [usize; 8] = [26, 52, 78, 104, 156, 208, 234, 260];
+        const NDBPS: [usize; 16] = [
+            26, 52, 78, 104, 156, 208, 234, 260, 52, 104, 156, 208, 312, 416, 468, 520,
+        ];
         if !self.valid()
             || !profile.valid()
             || profile.mcs == 0
@@ -59,7 +61,13 @@ impl Aggregation {
         }
         let symbols = (16 + bytes * 8 + 6).div_ceil(NDBPS[usize::from(profile.rate() - 12)]);
         bytes <= usize::from(self.bytes)
-            && 36 + symbols * 4 + count * 16 <= usize::from(self.airtime)
+            && (if profile.rate() >= 20 || profile.stbc {
+                40
+            } else {
+                36
+            }) + symbols * 4
+                + count * 16
+                <= usize::from(self.airtime)
     }
 }
 
@@ -140,7 +148,9 @@ pub(super) fn classify(frame: &[u8], own: [u8; 6]) -> Result<Queue, Error> {
 pub(super) struct DataProfile {
     pub rates: u16,
     pub qos: bool,
-    pub mcs: u8,
+    pub mcs: u16,
+    /// Locally advertised receive MCS mask, independent of peer TX selection.
+    pub rx_mcs: u16,
     pub sgi: bool,
     /// Source `tx.c::rtw_tx_pkt_info_update`: `si->ldpc_en` (W5 bit7).
     pub ldpc: bool,
@@ -158,6 +168,7 @@ impl DataProfile {
         rates: 1,
         qos: false,
         mcs: 0,
+        rx_mcs: 0,
         sgi: false,
         ldpc: false,
         stbc: false,
@@ -168,7 +179,12 @@ impl DataProfile {
         self.rates != 0
             && self.rates & !0xfff == 0
             && (self.mcs == 0 && !self.sgi || self.mcs != 0 && self.qos)
+            && (self.mcs == 0 && self.rx_mcs == 0
+                || self.mcs != 0
+                    && matches!(self.rx_mcs, 0xff | 0xffff)
+                    && self.mcs & !self.rx_mcs == 0)
             && (self.mcs != 0 || !self.ldpc && !self.stbc)
+            && (!self.stbc || self.mcs & 0xff00 == 0)
             && self.acs & !(ACS_BK | ACS_VI | ACS_VO) == 0
             && (self.acs == 0 || self.qos)
     }
@@ -190,7 +206,12 @@ impl DataProfile {
     }
     pub(super) fn rate_id(self) -> u8 {
         if self.mcs != 0 {
-            return if self.rates & 15 == 0 { 5 } else { 3 };
+            return match (self.rates & 15 == 0, self.mcs & 0xff00 != 0) {
+                (false, false) => 3,
+                (false, true) => 2,
+                (true, false) => 5,
+                (true, true) => 4,
+            };
         }
         if self.rates & 0xff0 == 0 {
             8
@@ -202,7 +223,7 @@ impl DataProfile {
     }
     pub(super) fn rate(self) -> u8 {
         if self.mcs != 0 {
-            return 12 + (7 - self.mcs.leading_zeros() as u8);
+            return 12 + (15 - self.mcs.leading_zeros() as u8);
         }
         const KBPS: [u32; 12] = [
             1000, 2000, 5500, 11000, 6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000,
@@ -215,6 +236,22 @@ impl DataProfile {
     }
     pub(super) fn response_mask(self) -> u32 {
         let rate = self.rate();
+        if rate >= 20 {
+            // A second spatial stream doubles N_DBPS, not the modulation
+            // order. MCS8 is13Mbps: it cannot solicit a24Mbps basic ACK.
+            const DBPS: [u32; 8] = [52, 104, 156, 208, 312, 416, 468, 520];
+            const KBPS: [u32; 12] = [
+                1000, 2000, 5500, 11000, 6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000,
+            ];
+            let kbps = DBPS[usize::from(rate - 20)] * 250;
+            return KBPS.iter().enumerate().fold(0, |mask, (i, basic)| {
+                mask | if (0x15f & (1 << i)) != 0 && *basic <= kbps {
+                    1 << i
+                } else {
+                    0
+                }
+            });
+        }
         let mut order = if rate >= 12 {
             rate - 12
         } else if rate >= 4 {
@@ -457,6 +494,10 @@ pub(super) fn phy_status(descriptor: &[u8; RX_DESC]) -> Option<Range<usize>> {
     Some(start..start + 32)
 }
 pub(super) fn receive_profile(descriptor: &[u8; RX_DESC], ht: bool) -> Result<Receive, Error> {
+    receive_mcs(descriptor, if ht { 0xff } else { 0 })
+}
+pub(super) fn receive_mcs(descriptor: &[u8; RX_DESC], mcs: u16) -> Result<Receive, Error> {
+    let ht = mcs != 0;
     let first = word(descriptor, 0);
     let length = (first & 0x3fff) as usize;
     let info = ((first >> 16) & 15) as usize;
@@ -480,7 +521,8 @@ pub(super) fn receive_profile(descriptor: &[u8; RX_DESC], ht: bool) -> Result<Re
         let software = first & (1 << 27) != 0;
         if !(if ht { 24 } else { 28 }..=if ht { MAX_HT_RX + 4 } else { MAX_MPDU + 4 })
             .contains(&length)
-            || rate >= if ht { 20 } else { 12 }
+            || rate >= 28
+            || rate >= 12 && mcs & (1u16 << (rate - 12)) == 0
             || word(descriptor, 16) & 0x30 != 0
             || encryption != 0 && !(encryption == 4 && software)
         {

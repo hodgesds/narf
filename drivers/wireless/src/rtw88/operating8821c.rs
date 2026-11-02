@@ -161,6 +161,7 @@ impl Envelope {
         Some(super::ht::Facts {
             hardware: self.calibration.hardware(),
             maximum: self.ht_limit?,
+            maximum_2ss: None,
             legacy: self.indices,
             cck: [0; 2],
         })

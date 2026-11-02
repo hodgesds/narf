@@ -148,6 +148,7 @@ fn period(linked: bool) -> Period {
             rates: 0x15f & 0xfff,
             qos: true,
             mcs: 0xff,
+            rx_mcs: 0xff,
             sgi: false,
             ldpc: false,
             stbc: false,

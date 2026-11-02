@@ -89,6 +89,11 @@ impl Board {
                 .map(|(a, b)| super::ht::Facts {
                     hardware,
                     maximum: a.min(b),
+                    maximum_2ss: factory
+                        .power_path(0)
+                        .and_then(super::ht::factory_limit_2ss)
+                        .zip(factory.power_path(1).and_then(super::ht::factory_limit_2ss))
+                        .map(|(a, b)| a.min(b)),
                     legacy: [0; 12],
                     cck: [0; 2],
                 }),

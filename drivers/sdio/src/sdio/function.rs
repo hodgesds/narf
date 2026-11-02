@@ -86,6 +86,22 @@ pub trait SdioFunction {
     /// Enable function `func` by setting bit `func` in CCCR IO_ENABLE.
     fn enable_func(&mut self, func: u8) -> Result<(), SdioError>;
 
+    /// Retire one enabled function. Success requires actual CCCR I/O-enable
+    /// clear and I/O-ready clear; the host denies further CMD53 until a new
+    /// explicit enable. Other functions remain unchanged. Unsupported hosts
+    /// cannot manufacture a confirmed-stop receipt from a local flag.
+    fn disable_func(&mut self, _func: u8) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+
+    /// Retire this exclusive card owner's complete interrupt subscription.
+    /// Success requires actual CCCR master/function and host card status/signal
+    /// disable. Even on failure an implementation retires/quarantines its
+    /// original CPU callback/line, without claiming device quiet or DMA stop.
+    fn disable_card_interrupt(&mut self) -> Result<(), SdioError> {
+        Err(SdioError::Unsupported)
+    }
+
     /// Fixed-address FIFO CMD53 read. Legacy adapters fail explicitly rather
     /// than silently incrementing a FIFO address.
     fn cmd53_read_fixed(

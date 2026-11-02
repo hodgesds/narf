@@ -13,6 +13,9 @@ pub(super) fn make_factory(rfe: u8, base: u8) -> Factory {
     make_factory_with_mac(rfe, base, [2, 4, 6, 8, 10, 12])
 }
 pub(super) fn make_factory_with_mac(rfe: u8, base: u8, own: [u8; 6]) -> Factory {
+    make_factory_paths(rfe, base, own, false)
+}
+pub(super) fn make_factory_paths(rfe: u8, base: u8, own: [u8; 6], ht2: bool) -> Factory {
     let mut raw = [255; 768];
     raw[0x120..0x126].copy_from_slice(&own);
     raw[0xb9] = 0x33;
@@ -24,6 +27,9 @@ pub(super) fn make_factory_with_mac(rfe: u8, base: u8, own: [u8; 6]) -> Factory 
     for at in [0x10, 0x10 + 42] {
         raw[at + 6] = 40;
         raw[at + 11] = 0;
+        if ht2 {
+            raw[at + 12] = 0;
+        }
     }
     Factory::for_test_with_trims(raw, [1; 19]).unwrap()
 }

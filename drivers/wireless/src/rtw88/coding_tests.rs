@@ -225,6 +225,7 @@ fn ht_profile(ldpc: bool, stbc: bool) -> DataProfile {
         rates: 0xff0,
         qos: true,
         mcs: 0xff,
+        rx_mcs: 0xff,
         sgi: true,
         ldpc,
         stbc,

@@ -47,7 +47,9 @@ pub(super) fn bounds(did: u16, p: &[u8; PAYLOAD]) -> Option<u8> {
 
 /// Whether the qualified `flags` permit `p`'s TX coding.
 pub(super) fn permits(flags: u8, p: DataProfile) -> bool {
-    (!p.ldpc || flags & LDPC != 0) && (!p.stbc || flags & STBC != 0)
+    (!(p.ldpc || p.stbc) || p.mcs & 0xff00 == 0)
+        && (!p.ldpc || flags & LDPC != 0)
+        && (!p.stbc || flags & STBC != 0)
 }
 
 /// Locally advertised RX coding: LDPC only with source `rx_ldpc`.
@@ -60,8 +62,9 @@ pub(super) fn rx_ldpc(did: u16) -> bool {
 /// SMPS is not implemented, so STBC is not forced off here.
 pub(super) fn apply(flags: u8, profile: DataProfile, tx_ldpc: bool, tx_stbc: bool) -> DataProfile {
     DataProfile {
-        ldpc: profile.mcs != 0 && flags & LDPC != 0 && tx_ldpc,
-        stbc: profile.mcs != 0 && flags & STBC != 0 && tx_stbc,
+        // Original N2xC measurement explicitly covers one spatial stream.
+        ldpc: profile.mcs != 0 && profile.mcs & 0xff00 == 0 && flags & LDPC != 0 && tx_ldpc,
+        stbc: profile.mcs != 0 && profile.mcs & 0xff00 == 0 && flags & STBC != 0 && tx_stbc,
         ..profile
     }
 }

@@ -66,6 +66,19 @@ this does not configure platform clocks, pin muxes or power GPIOs.
   address. `set_block_size` writes both FBR bytes; `enable_func` preserves
   other enabled functions and waits for IO_READY using CIS timeout.
   Adapters without fixed-read/block-size operations return `Unsupported`.
+- `SdioFunction::disable_func(n)` defaults to `Unsupported`. The actual
+  `Card` first denies further host CMD53 for that function, clears its CCCR
+  IO_ENABLE bit while retaining the other functions, requires exact enable
+  readback and bounded IO_READY clear, then checks command/data engines are
+  inactive. Partial failure grants no stop receipt; a later explicit enable
+  is a separate operation. No power-off or DMA proof is inferred from a bit.
+- `SdioFunction::disable_card_interrupt()` defaults to `Unsupported` and
+  retires the exclusive whole-card subscription. `Card` clears the original
+  Subscriber, disables and reads back SDHCI card-interrupt signal/status,
+  drops the original oneshot CPU line even on failure, and requires actual
+  CCCR master/function interrupt clear. Failed readback remains an error;
+  callback/CPU quarantine alone supplies no device-quiet receipt. No later
+  rearm revives the retired line. Card drop also clears its Subscriber.
 - Card interrupts. `Card::attach_interrupt(Box<dyn InterruptLine>,
   Arc<Subscriber>) -> bool` first asks `Registers::enable_intx` (default
   `false`) to let the function assert INTx; on refusal the line is dropped

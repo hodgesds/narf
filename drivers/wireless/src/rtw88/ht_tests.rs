@@ -242,7 +242,7 @@ pub(super) fn early_m3_control<F: Fixture>() -> Result<(), &'static str> {
     }
     Ok(())
 }
-fn packet(label: u8) -> Vec<u8> {
+pub(super) fn packet(label: u8) -> Vec<u8> {
     narf_wifi_fixtures::udp_ipv4(
         AP,
         OWN,

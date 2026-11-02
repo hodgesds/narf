@@ -918,6 +918,7 @@ impl State {
                                 rates,
                                 qos: self.wmm.is_some(),
                                 mcs: 0,
+                                rx_mcs: 0,
                                 sgi: false,
                                 ldpc: false,
                                 stbc: false,
@@ -938,7 +939,9 @@ impl State {
                                 }
                                 self.data_profile = h.profile(
                                     rates,
-                                    negotiated.ht().tx_mcs()[0],
+                                    u16::from_le_bytes(
+                                        negotiated.ht().tx_mcs()[..2].try_into().unwrap(),
+                                    ),
                                     negotiated.ht().tx_sgi20(),
                                 )?;
                                 if let Some((_, flags)) = &self.coding {

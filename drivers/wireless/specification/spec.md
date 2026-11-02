@@ -607,6 +607,20 @@ and one release metadata context pass. CYW43439 monitor remains open. Full
 release/native gates remain at25 completed rows. Counting unvalidated
 implementations,78 remain; physical firmware/board acceptance is separate.
 
+**2026-11-02 — admitted two-stream HT source recount.** The ledger now holds
+**60 `feature`**, **31 `chip`** and **0 `unknown`** rows. Eighteen source-complete
+implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. RTL8822CE HT20 two-stream operation
+now composes actual per-path factory/gain/antenna programming, native queue retirement and
+RX/TX parking/readbacks, original source/power ownership, independent local
+RX and peer TX selection, and native MCS8..15 through Open/WPA2 and kernel IP.
+Original one-stream record bytes and behavior remain unchanged. Five cases plus
+two separate SDIO-disable prerequisite cases are written and unexecuted; scoped
+formatting and one six-package release metadata context pass. The SDIO helper
+adds no completed feature credit. Full release/native gates remain at25 completed
+rows. Counting unvalidated implementations,78 remain; actual signed deployment
+measurements and physical firmware/board acceptance remain separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 2 | Multiple-active-link MLO and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; admitted DEVICE/SESSION1/SESSION2, bounded GO9/NoA and CLIENT8/MAC7 public management/association/security/data/terminal owners are implemented pending validation; unsupported GO PS producer formats and richer PHY/concurrency stay unadvertised |
@@ -616,7 +630,7 @@ implementations,78 remain; physical firmware/board acceptance is separate.
 | ath9k | 0 | Counted idle FULL_SLEEP/cold wake is implemented pending validation; prior periodic calibration/ANI, station NETWORK_SLEEP, admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants are software-accepted at `6813a24c6`; other chips are separate rows |
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are software-accepted at `6813a24c6` |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
-| rtw88 | 15 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, reset/suspend/removal and retained-map reclamation; genuine N21S/N21L/N22L/other board assets; qualified non-VO originator BA, C21 RF power tracking and bounded independent live functions are implemented pending validation |
+| rtw88 | 14 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, reset/suspend/removal and retained-map reclamation; genuine N21S/N21L/N22L/other board assets; qualified C22 two-stream HT20, non-VO originator BA, C21 RF power tracking and bounded independent live functions are implemented pending validation |
 | rtw89 | 9 | Additional channels/bands/widths, fragmentation, monitor/AP U-APSD/WoW; bounded independent live functions, separately qualified standalone/nested TX A-MSDU, actual periodic DPK RF tracking and admitted clock-gated runtime LPS are implemented pending validation; other firmware and AX/BE chips are separate rows |
 | brcmfmac | 5 | P2P/virtual roles, WoW/rekey and IOMMU quiescence; other chip/CPU/RAM/OTP profiles are separate chip rows; BCM43602 confirmed/dead stop, reset/generation-safe station rejoin and hot/cold resume already have accepted software evidence; bounded primary-bsscfg firmware-SME AP, exclusive flagged-radiotap monitor and shared-v7 descriptor/payload prefixes1..4 are implemented pending validation |
 | cyw43439 | 12 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
@@ -1574,6 +1588,21 @@ need not become globally idle. DOWN/source loss/PM closes old copy/token first;
 uncertain cleanup pins native mappings. Family §3 defines the exclusive20MHz
 receive-only profile; CYW43439 remains default unsupported. Seven new cases are
 written and unexecuted.
+
+### 3.13 Separately qualified two-stream HT20 (validation pending)
+
+The RTL8822CE HT request may expose an optional `two_streams` child only from
+its original actual two-path hardware and complete factory fields. The child
+is a nongrant proposal for the distinct N22H256v2 asset; the original v1 proposal,
+record bytes and fallback remain unchanged. Actual source/backend queue-quiet
+proofs, TX/RX parking and gain/path/reset/readbacks precede current original
+source resume. Local RX16 and negotiated peer TX selection remain independent;
+native RA/TXWD/RXD and timing cover only qualified uncoded MCS0..15. Existing
+one-stream coding records cannot authorize coded two-stream emission. Family
+§3 defines the complete profile and measured envelope; five new cases remain
+unexecuted. The independent default-unsupported SDIO disable helper is specified
+in `drivers/sdio/specification/spec.md` §3 and supplies no standalone Wi-Fi
+stop/reset or feature credit.
 
 ## 4. Interaction with `narf-wireless`
 

@@ -169,6 +169,7 @@ fn profile(acs: u8) -> DataProfile {
         rates: 0xff0,
         qos: true,
         mcs: 0,
+        rx_mcs: 0,
         sgi: false,
         ldpc: false,
         stbc: false,

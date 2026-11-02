@@ -292,6 +292,10 @@ pub(super) unsafe trait Io: Send {
     fn station_bind_ht(&mut self, _: alloc::sync::Arc<super::ht::Grant>) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    /// Actual retained packet/command owner is idle before changing TX paths.
+    fn station_ht_program_quiet(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
     fn station_ht_request(&mut self) -> Result<super::ht::Request, Error> {
         Err(Error::Unsupported)
     }

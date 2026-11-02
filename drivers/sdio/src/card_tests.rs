@@ -11,6 +11,8 @@ struct State {
     left: usize,
     reject_data: bool,
     refuse_commands: bool,
+    hold_disabled_ready: bool,
+    refuse_irq_mask: bool,
 }
 impl State {
     fn set32(&mut self, a: u32, v: u32) {
@@ -60,6 +62,8 @@ impl Model {
             left: 0,
             reject_data: false,
             refuse_commands: false,
+            hold_disabled_ready: false,
+            refuse_irq_mask: false,
         };
         s.set32(CAPABILITIES, (50 << 8) | CAPS_CAN_VDD_330);
         s.registers[HOST_VERSION as usize] = SPEC_300 as u8;
@@ -141,7 +145,7 @@ impl Registers for Model {
                 let addr = ((arg >> 9) & 0x1ffff) as usize;
                 if arg >> 31 != 0 {
                     s.common[addr] = arg as u8;
-                    if addr == CCCR_IO_ENABLE as usize {
+                    if addr == CCCR_IO_ENABLE as usize && !s.hold_disabled_ready {
                         s.common[CCCR_IO_READY as usize] = arg as u8;
                     }
                 }
@@ -169,6 +173,14 @@ impl Registers for Model {
         }
     }
     fn write32(&mut self, a: u32, value: u32) {
+        if matches!(a, SIGNAL_ENABLE | INT_ENABLE) {
+            let mut s = self.0.lock();
+            if s.refuse_irq_mask && value & INT_CARD_INT == 0 {
+                let old = s.get32(a);
+                s.set32(a, value | (old & INT_CARD_INT));
+                return;
+            }
+        }
         let mut s = self.0.lock();
         if a == INT_STATUS {
             let new = s.get32(a) & !value;
@@ -463,4 +475,140 @@ fn smoke_sdio_card_interrupt_claim_enables_cccr_and_sdhci_like_linux() -> TestRe
 kernel_test_in!(
     "drivers/sdio/card",
     smoke_sdio_card_interrupt_claim_enables_cccr_and_sdhci_like_linux
+);
+
+fn smoke_sdio_card_function_disable_requires_native_ready_and_preserves_other_owner() -> TestResult
+{
+    for fault in 0..3 {
+        let model = Model::new();
+        let shared = model.0.clone();
+        let Ok(mut card) = Card::initialize(model, Config::default()) else {
+            return TestResult::Fail("disable fixture native card initialization");
+        };
+        if card.enable_func(1).is_err() || card.enable_func(2).is_err() {
+            return TestResult::Fail("disable fixture actual function enables");
+        }
+        {
+            let mut state = shared.lock();
+            state.hold_disabled_ready = fault == 1;
+            state.refuse_commands = fault == 2;
+        }
+        let result = card.disable_func(2);
+        if (fault == 0) != result.is_ok() || card.enabled & 4 != 0 {
+            return TestResult::Fail("function disable invented native ready/command receipt");
+        }
+        let before = shared.lock().commands.len();
+        let mut bytes = [0; 4];
+        if card.cmd53_read(2, 0, &mut bytes) != Err(SdioError::NotEnabled)
+            || shared.lock().commands.len() != before
+        {
+            return TestResult::Fail("retired function published another CMD53");
+        }
+        if fault == 0 {
+            let state = shared.lock();
+            if state.common[CCCR_IO_ENABLE as usize] != 2
+                || state.common[CCCR_IO_READY as usize] != 2
+            {
+                return TestResult::Fail("F2 disable changed original F1 enable/ready");
+            }
+            drop(state);
+            if card.cmd53_read(1, 0, &mut bytes).is_err()
+                || card.disable_func(0) != Err(SdioError::BadFunction)
+                || card.disable_func(3) != Err(SdioError::BadFunction)
+                || card.enable_func(2).is_err()
+            {
+                return TestResult::Fail(
+                    "function retirement denied unrelated F1 or explicit enable",
+                );
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sdio/card",
+    smoke_sdio_card_function_disable_requires_native_ready_and_preserves_other_owner
+);
+
+fn smoke_sdio_card_interrupt_retire_disables_original_subscription_even_on_failure() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    struct OriginalLine {
+        unmasks: Arc<AtomicU32>,
+        drops: Arc<AtomicU32>,
+    }
+    impl InterruptLine for OriginalLine {
+        fn unmask(&self) {
+            self.unmasks.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    impl Drop for OriginalLine {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    for fault in 0..3 {
+        let model = Model::new();
+        let shared = model.0.clone();
+        let Ok(mut card) = Card::initialize(model, Config::default()) else {
+            return TestResult::Fail("interrupt retirement card initialization");
+        };
+        let unmasks = Arc::new(AtomicU32::new(0));
+        let drops = Arc::new(AtomicU32::new(0));
+        let wakes = Arc::new(AtomicU32::new(0));
+        let subscriber = Arc::new(Subscriber::default());
+        if !card.attach_interrupt(
+            alloc::boxed::Box::new(OriginalLine {
+                unmasks: unmasks.clone(),
+                drops: drops.clone(),
+            }),
+            subscriber.clone(),
+        ) {
+            return TestResult::Fail("interrupt retirement original line attachment");
+        }
+        let notify = wakes.clone();
+        if card.enable_card_interrupt(
+            6,
+            Arc::new(move || {
+                notify.fetch_add(1, Ordering::AcqRel);
+            }),
+        ) != Ok(true)
+        {
+            return TestResult::Fail("interrupt retirement actual native claim");
+        }
+        subscriber.notify();
+        {
+            let mut state = shared.lock();
+            state.refuse_commands = fault == 1;
+            state.refuse_irq_mask = fault == 2;
+        }
+        let result = card.disable_card_interrupt();
+        subscriber.notify();
+        card.rearm_card_interrupt();
+        if result.is_ok() != (fault == 0)
+            || wakes.load(Ordering::Acquire) != 1
+            || drops.load(Ordering::Acquire) != 1
+            || unmasks.load(Ordering::Acquire) != 1
+        {
+            return TestResult::Fail(
+                "interrupt failure revived subscriber/CPU route or invented disable",
+            );
+        }
+        let state = shared.lock();
+        if fault != 2 && (state.get32(INT_ENABLE) | state.get32(SIGNAL_ENABLE)) & INT_CARD_INT != 0
+            || fault == 0 && state.common[CCCR_INT_ENABLE as usize] != 0
+        {
+            return TestResult::Fail("interrupt successful native host/card disable missing");
+        }
+        drop(state);
+        drop(card);
+        subscriber.notify();
+        if wakes.load(Ordering::Acquire) != 1 || drops.load(Ordering::Acquire) != 1 {
+            return TestResult::Fail("late Card drop revived retired callback or line");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/sdio/card",
+    smoke_sdio_card_interrupt_retire_disables_original_subscription_even_on_failure
 );

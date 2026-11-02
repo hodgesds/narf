@@ -1258,6 +1258,42 @@ unsafe impl Registers for Native {
         self.packet_gate = Some(self.packet_gate.as_ref().ok_or(Error::State)?.with_ht(g)?);
         Ok(())
     }
+    fn station_ht_program_quiet(&mut self) -> Result<bool, Error> {
+        self.station_allowed()?;
+        if self.state != State::Packets || self.mailbox_pending || self.command_ring.pending() {
+            return Ok(false);
+        }
+        if !self
+            .with_packet(|core, port| {
+                core.transmit_quiet(|r| super::packet_core::Port::index(port, r))
+            })
+            .map_err(|_| Error::State)?
+        {
+            return Ok(false);
+        }
+        for r in super::dma_stop::TX_INDEX {
+            let v = self.read32(r)?;
+            if v == u32::MAX {
+                return Err(Error::Gone);
+            }
+            if v & 0xfff != (v >> 16) & 0xfff {
+                return Ok(false);
+            }
+        }
+        if self.read16(0x10c)? != 0xc5a0 {
+            return Err(Error::Prerequisite);
+        }
+        for r in [0x230, 0x234, 0x238, 0x23c] {
+            let n = if r == 0x23c { 14 } else { 16 };
+            if self.read16(r)? != n {
+                return Err(Error::Prerequisite);
+            }
+            if self.read16(r + 2)? != n {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
     fn station_ht_request(&mut self) -> Result<super::ht::Request, Error> {
         self.station_allowed()?;
         let gate = self.packet_gate.as_ref().ok_or(Error::State)?;

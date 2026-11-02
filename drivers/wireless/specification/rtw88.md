@@ -929,7 +929,7 @@ signed assets, HT/VHT widths/aggregation, other bands/channels, full AC/TID (now
 dynamic tracking/coexistence, recovery and PM remain explicit gates/work.
 
 
-### C21/C22 separately qualified HT20/one-stream and SGI20 station
+### C21/C22 separately qualified HT20 and SGI20 station
 
 The same retained RTL8821CE and RTL8822CE station owners can now select
 channel1/20MHz HT MCS0..7 with long GI and optionally SGI20. Native source
@@ -971,6 +971,68 @@ The signed little-endian record is exactly192 bytes:
 |92..108|eight SGI20 conducted peaks:i16 quarter-dBm|
 |108..132|twelve retained legacy-rate conducted peaks:i16 quarter-dBm|
 |132..192|reserved zero|
+
+RTL8822CE additionally exposes an optional `HtRequest.two_streams` proposal
+when the original hardware report has at least two streams and antennas,
+and both retained factory paths have complete HT1S/HT2S power fields. The
+original v1 identity and record remain unchanged. The child is named
+`rtw88/rtw8822ce-ht20-2ss-v2-<mac>.bin`; its identity binds the complete v1
+recipe plus both stream ceilings and the exact native two-path program.
+It contains no nested proposal and grants no authority. The registered
+loader prefers this separately authenticated asset; only absence permits
+fallback to the original v1 asset. An invalid present v2 cannot authorize
+v1 or2SS. C21 has one physical transmit path and exposes no2SS proposal.
+
+The additional N22H v2 record is exactly256 little-endian bytes. Bytes0..66
+retain the corresponding v1 field meanings, except header length and total
+length are256 and version is2. Its remaining layout is:
+
+| Offset | Field |
+|---|---|
+|66..68|nonempty u16 TX MCS0..15 mask, including at least one2SS rate|
+|68..70|SGI20 bit0 (other bits zero), literal RX stream count2|
+|70..86|sixteen explicit MCS gain indices|
+|86..118|sixteen long-GI conducted peaks:i16 quarter-dBm|
+|118..150|sixteen SGI20 conducted peaks:i16 quarter-dBm|
+|150..174|twelve retained legacy conducted peaks:i16 quarter-dBm|
+|174..256|reserved zero|
+
+For MCS8..15 the factory ceiling follows Linux7.3-rc4
+`phy.c::rtw_phy_get_2g_tx_power_index`: BW40 group0 base plus both the signed
+HT1S BW20 high nibble of power byte11 and the additional signed HT2S BW20
+low nibble of byte12, multiplied by txgi_factor2, intersected across A/B.
+Erased, negative and unrepresentable values fail closed. The signed v2
+record measures simultaneous-chain combined conducted power, every selected
+LGI/SGI rate, retained legacy/automatic responses and the complete transition
+under all original thermal/supply/antenna/BT bounds. Individual chain gains
+or factory indices never stand in for that measurement.
+
+Before changing paths the original native packet owner proves all joint
+TXBD/CCX completions, every original TX host/device index pair, no pending
+mailbox/H2C ring command, MAC TX-empty and matching reserved/free quotas.
+It pauses all TX and parks RX with actual RW_RELEASE/RXDMA_IDLE receipts.
+Only then does it write/read back the16-rate signed difference table and
+equal MCS7 references, ANT820 low byte0x31 and TXLGMAP1e2c low16bits0x0400,
+with the source OFDM/outer SYS_FUNC_EN BB_RSTB reset sequence. CCK and1SS
+stay on A;2SS uses A/B; existing RX-AB remains intact. Current original
+source and policy, exact gain/path/crypto readbacks and the parked receipt
+must all pass before RX and TX resume. Partial failure or cancellation
+cannot restore publication or free an unproven native owner.
+
+Association under v2 advertises local RX MCS0..15 independently of the
+qualified TX selection. The original AP offer and response may narrow TX
+to one stream without narrowing local RX. RA_INFO uses BGN20_2SS RAID2 or
+GN2SS RAID4 and bits12..27; native fixed-rate TXWD/RXD admit codes12..27,
+BW20 and only the locally authorized receive mask. ACK basic-rate selection
+uses the actual two-stream data rate; MCS8 does not imply a24Mbps ACK.
+The A-MPDU duration bound accounts for the second HT-LTF. Original1SS
+coding continuations cannot widen to coded2SS; two-stream TX stays uncoded.
+Original software CCMP, PN/SN, key/reply epochs, default3839-byte A-MSDU,
+source-bound BA continuations and native DMA ownership remain in force.
+The native cases cover Open/WPA2 MCS8..15, SGI, DHCP/IP, peer1SS TX with
+local RX2SS, original v1, invalid measurements and source/path failure.
+These are source-written cases awaiting the release validation batch;
+physical acceptance still requires the board's actual signed v2 asset.
 
 The complete transition peak must enclose all other peak fields. All peaks
 plus antenna gain must satisfy this record's ceiling, every preceding signed
@@ -1972,7 +2034,7 @@ changes. None is a physical blocker unless stated.
 | `dpk_tracking` | `rtw8822c_dpk_track` needs a DPK result, and no `rtw8822c_do_dpk` calibration is ported (§3 dm section). |
 | `five_ghz_operation` | The same fixed channel1 programs, plus `scan.rs` 2412-only admission. Needs 5 GHz RF/BB/AGC table selection and a measured 5 GHz envelope. |
 | `ht40` | `station.rs` refuses any offered/negotiated width other than `Width::Twenty`, and the radio programs only BW20. Needs `rtw8822c_set_channel_bb` BW40 and DSSS/CCK40 programming, plus SGI40 in the measured HT gate. |
-| `multi_stream_ht` | `ht.rs::local` advertises and transmits MCS0..7 only, and `ht.rs::program` writes one-stream TXAGC words. 2SS TXAGC/RA mask programming and a measured 2SS envelope are missing. |
+| `multi_stream_ht` | Source-complete for actual2T2R RTL8822CE under separate N22H256v2: cumulative per-path factory ceilings, measured combined-chain envelope, native quiet/parked two-path gains/readbacks, original local RX16/peer TX negotiation and actual RA/TXWD/RXD MCS8..15. C21 is1TX-path hardware. Five native cases are written; release/native and physical acceptance remain pending. |
 | `operating_reset` | No `rtw_core_stop`/`rtw_core_start` generation reset over a retained owner. `dma_stop.rs` now proves a stopped owner idle and releases it, and `Lifecycle::remove` tears one down, but the lifecycle is one-shot. Its `started` latch, the `pci_firmware::allocate` cold-power precondition (`power::power_on` card-disable to enable runs only in `pci::bring_up`) and the interface `Admission`, which never reopens after `close`, all forbid re-running power-on, firmware download, MAC/PHY/radio and station start on the same function and shell. Needs a generation counter across `Lifecycle`/`Firmware`/`Sibling`/`interface::Device`, a re-entrant cold-power path and admission reopen, plus re-qualification of every continuation against the new generation (patterns: ath9k `reset_owner`, iwlwifi `Owner::recover`). |
 | `radio_coexistence` | No `coex.c` state machine (BT scoreboard, TDMA tables, `rtw_coex_*` notifications) is ported. |
 | `rf_power_tracking` | Source-complete for admitted C21 type0 RF-A HT20 under distinct N21W: real meter/AGC/txscale/associated IQK, exact H/R/T2/RTS plus C/Q/F/D current source composition, all-rate factory limits and actual native quiet/terminal/restore. Power-only restore retains keys/BA; after periodic IQK source loss requires a fresh owner. Eight native cases are written; release/native and physical acceptance remain pending. C22 retains N22D. |

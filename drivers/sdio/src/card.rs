@@ -87,6 +87,9 @@ impl Subscriber {
     fn set(&self, notify: Notify) {
         *self.0.lock() = Some(notify);
     }
+    fn clear(&self) {
+        self.0.lock().take();
+    }
 }
 impl core::fmt::Debug for Subscriber {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -118,6 +121,9 @@ pub struct Card<R: Registers> {
 }
 impl<R: Registers> Drop for Card<R> {
     fn drop(&mut self) {
+        if let Some(interrupt) = self.interrupt.as_ref() {
+            interrupt.subscriber.clear();
+        }
         let io = self.controller.registers();
         io.write32(SIGNAL_ENABLE, 0);
         io.write32(INT_ENABLE, 0);
@@ -609,6 +615,74 @@ impl<R: Registers> SdioFunction for Card<R> {
             interrupt.line.unmask();
         }
         Ok(true)
+    }
+    fn disable_card_interrupt(&mut self) -> Result<(), SdioError> {
+        // This Card is handed off whole and has exactly one subscriber. Close
+        // that original CPU route even if current MMIO or a later CMD52 fails.
+        let interrupt = self.interrupt.take();
+        if let Some(interrupt) = interrupt.as_ref() {
+            interrupt.subscriber.clear();
+        }
+        let host_disabled = {
+            let io = self.controller.registers();
+            let signal = io.read32(SIGNAL_ENABLE);
+            io.write32(SIGNAL_ENABLE, signal & !INT_CARD_INT);
+            let status = io.read32(INT_ENABLE);
+            io.write32(INT_ENABLE, status & !INT_CARD_INT);
+            io.read32(SIGNAL_ENABLE) & INT_CARD_INT == 0
+                && io.read32(INT_ENABLE) & INT_CARD_INT == 0
+        };
+        // oneshot::Line::drop masks the original CPU line. No rearm or fresh
+        // endpoint lookup can reattach this retired subscription.
+        drop(interrupt);
+        self.direct(true, 0, CCCR_INT_ENABLE, 0)?;
+        let card_disabled = self.direct(false, 0, CCCR_INT_ENABLE, 0)? == 0;
+        if !host_disabled || !card_disabled {
+            return Err(SdioError::HostError);
+        }
+        Ok(())
+    }
+    fn disable_func(&mut self, func: u8) -> Result<(), SdioError> {
+        if func == 0 || func > self.host.func_count {
+            return Err(SdioError::BadFunction);
+        }
+        let bit = 1 << func;
+        // Deny host transfers before any uncertain native transition. CMD52
+        // cleanup remains possible; an explicit new enable is a separate act.
+        self.enabled &= !bit;
+        let before = self.direct(false, 0, CCCR_IO_ENABLE, 0)?;
+        let expected = before & !bit;
+        self.direct(true, 0, CCCR_IO_ENABLE, expected)?;
+        if self.direct(false, 0, CCCR_IO_ENABLE, 0)? != expected {
+            return Err(SdioError::NotEnabled);
+        }
+        let mut error = None;
+        let deadline = Deadline::after_us(
+            u64::from(self.functions[func as usize].enable_timeout_ms.max(1)) * 1000,
+        );
+        let ready = narf_scheduler::responsive_spin_until(
+            || match self.direct(false, 0, CCCR_IO_READY, 0) {
+                Ok(value) => value & bit == 0,
+                Err(e) => {
+                    error = Some(e);
+                    true
+                }
+            },
+            deadline,
+        );
+        if let Some(error) = error {
+            return Err(error);
+        }
+        if !ready {
+            return Err(SdioError::NotEnabled);
+        }
+        // Successful PIO commands own no caller pointer. An asserted current
+        // command/data engine is nevertheless not a transport-stop receipt.
+        let state = self.controller.registers().read32(PRESENT_STATE);
+        if state & (PS_CMD_INHIBIT | PS_DATA_INHIBIT | PS_DOING_READ | PS_DOING_WRITE) != 0 {
+            return Err(SdioError::HostError);
+        }
+        Ok(())
     }
     fn rearm_card_interrupt(&mut self) {
         if let Some(interrupt) = self.interrupt.as_ref() {
