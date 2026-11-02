@@ -88,6 +88,9 @@ pub(in crate::rtw88) struct Peer {
     pub(in crate::rtw88) hold_tx_ba: bool,
     tx_next_sequence: [Option<u16>; 8],
     pub(in crate::rtw88) tx_sequences: Vec<(u8, u16, u64)>,
+    /// Actual authenticated protected originals, including private non-QoS
+    /// EAPOL replies that share the installed pairwise DATA key's PN counter.
+    pub(in crate::rtw88) native_tx_pns: Vec<(u16, u64)>,
     pub(in crate::rtw88) hold_decline: bool,
     pub(in crate::rtw88) ap: FakeAp,
     pub(in crate::rtw88) plan: NetworkPlan,
@@ -142,6 +145,7 @@ impl Peer {
             hold_tx_ba: false,
             tx_next_sequence: [None; 8],
             tx_sequences: Vec::new(),
+            native_tx_pns: Vec::new(),
             hold_decline: false,
             ap,
             plan,
@@ -439,6 +443,23 @@ impl Peer {
         ethernet.extend_from_slice(&body[6..]);
         if self.qos && header == 24 && ethernet.get(12..14) != Some(&[0x88, 0x8e]) {
             return Err("native WMM non-QoS data is not private EAPOL");
+        }
+        if self.ap.protected() {
+            let protocol = ethernet
+                .get(12..14)
+                .ok_or("native AP protected EtherType extent")?;
+            let pn = u64::from_le_bytes([
+                frame[header],
+                frame[header + 1],
+                frame[header + 4],
+                frame[header + 5],
+                frame[header + 6],
+                frame[header + 7],
+                0,
+                0,
+            ]);
+            self.native_tx_pns
+                .push((u16::from_be_bytes([protocol[0], protocol[1]]), pn));
         }
         if header == 26 {
             self.tids.push(frame[24]);

@@ -76,16 +76,26 @@ fn data_descriptors<F: Fixture>(f: &F, start: usize) -> Vec<[u8; 48]> {
 fn monotone<F: Fixture>(f: &F, protected: bool) -> Result<(), &'static str> {
     let log = { f.peer().lock().tx_sequences.clone() };
     let mut sequences = [None; 8];
-    let mut previous_pn = None;
-    for (tid, sequence, pn) in log {
+    for &(tid, sequence, _) in &log {
         if sequences[usize::from(tid)].is_some_and(|old| sequence != ((old + 1) & 4095)) {
             return Err("T2 mixed prefix consumed/reused another TID sequence");
         }
         sequences[usize::from(tid)] = Some(sequence);
-        if protected && previous_pn.is_some_and(|old| pn != old + 1) {
+    }
+    if protected {
+        // Group replies use the existing pairwise key and consume a real
+        // protected non-QoS EAPOL PN. Check every actual wire original,
+        // rather than mistaking that private control frame for an unsent gap.
+        let wire = { f.peer().lock().native_tx_pns.clone() };
+        let data = wire
+            .iter()
+            .filter(|(protocol, _)| *protocol != 0x888e)
+            .map(|(_, pn)| *pn)
+            .collect::<Vec<_>>();
+        let expected = log.iter().map(|(_, _, pn)| *pn).collect::<Vec<_>>();
+        if data != expected || wire.windows(2).any(|w| w[1].1 != w[0].1 + 1) {
             return Err("T2 unsent suffix consumed/reused a native packet-key PN");
         }
-        previous_pn = Some(pn);
     }
     Ok(())
 }
@@ -298,6 +308,19 @@ pub(super) fn timeout_delba_and_key<F: Fixture>() -> Result<(), &'static str> {
     };
     if tokens.windows(2).any(|w| w[0] >= w[1]) || tokens.len() < 4 {
         return Err("T2 key epoch reused a live dialog token");
+    }
+    let (data, wire) = {
+        let p = f.peer().lock();
+        (p.tx_sequences.len(), p.native_tx_pns.clone())
+    };
+    if wire.len() != data + 1
+        || wire
+            .iter()
+            .filter(|(protocol, _)| *protocol == 0x888e)
+            .count()
+            != 1
+    {
+        return Err("T2 key epoch lacks exactly one actual protected private Group Reply PN");
     }
     monotone(&f, true)
 }
