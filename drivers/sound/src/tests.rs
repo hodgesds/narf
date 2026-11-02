@@ -19,7 +19,8 @@ use crate::codec::realtek::{
 use crate::format::{pack_sdfmt, ChannelCount, HwParams, SampleFormat, SampleRate};
 use crate::hda::controller::{
     reset_controller, supported_device, HdaController, GCTL_CRST, HDA_AMD_PHOENIX_DEVICE,
-    HDA_AMD_PHOENIX_VENDOR, HDA_AMD_RENOIR_DEVICE, HDA_AMD_RENOIR_VENDOR, HDA_CLASS_TRIPLE,
+    HDA_AMD_PHOENIX_VENDOR, HDA_AMD_RENOIR_DEVICE, HDA_AMD_RENOIR_GPU_AUDIO_DEVICE,
+    HDA_AMD_RENOIR_VENDOR, HDA_CLASS_TRIPLE,
 };
 use crate::hda::corb::{Verb, CORB_ENTRIES};
 use crate::hda::rirb::{Response, RIRB_ENTRIES};
@@ -51,6 +52,23 @@ fn smoke_pci_id_match_amd_zen2_phoenix() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/sound", smoke_pci_id_match_amd_zen2_phoenix);
+
+// ── #1b: PCI ID match — Renoir/Lucienne GPU HDMI-audio ───────────
+
+fn smoke_pci_id_match_renoir_gpu_hdmi_audio() -> TestResult {
+    if !supported_device(0x1002, HDA_AMD_RENOIR_GPU_AUDIO_DEVICE) {
+        return TestResult::Fail("Renoir GPU HDMI-audio ID rejected");
+    }
+    // Masking-defeating case: the sibling VGA function on the same
+    // physical device (Lucienne 1002:164C, function .0) must NOT bind
+    // as HDA — only the .1 audio function may. This defeats a fix
+    // that matches the whole AMD vendor or the whole 163x range.
+    if supported_device(0x1002, 0x164C) {
+        return TestResult::Fail("Lucienne VGA function accepted as HDA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/sound", smoke_pci_id_match_renoir_gpu_hdmi_audio);
 
 // ── #2: HDA register layout — GCAP decoder ─────────────────────────
 

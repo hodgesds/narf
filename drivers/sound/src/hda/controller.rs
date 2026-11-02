@@ -44,6 +44,14 @@ pub const HDA_AMD_PHOENIX_DEVICE: u16 = 0x15E3;
 /// AMD Radeon iGPU HD Audio (HDMI/DP audio side). Same programming
 /// model.
 pub const HDA_AMD_RADEON_DEVICE: u16 = 0x1640;
+/// AMD Renoir / Lucienne GPU HDMI/DP audio function (1002:1637) —
+/// function .1 of the iGPU device, distinct from the PCH HDA
+/// controller (1022:15E3) at function .6. Confirmed against the
+/// Linux PCI ID table: lspci reports "Renoir Radeon High Definition
+/// Audio Controller [1002:1637]", class 0403, driven on Linux by
+/// snd_hda_intel; the sibling VGA function on the same device is
+/// 1002:164C (Lucienne).
+pub const HDA_AMD_RENOIR_GPU_AUDIO_DEVICE: u16 = 0x1637;
 
 /// Intel vendor ID. Every PCH HDA / iGPU display-audio controller
 /// shares this.
@@ -339,6 +347,7 @@ pub fn supported_device(vendor: u16, device: u16) -> bool {
         (vendor, device),
         (HDA_AMD_RENOIR_VENDOR, HDA_AMD_RENOIR_DEVICE)
             | (0x1002, HDA_AMD_RADEON_DEVICE)
+            | (0x1002, HDA_AMD_RENOIR_GPU_AUDIO_DEVICE)
             | (HDA_INTEL_VENDOR, _)
     )
 }
