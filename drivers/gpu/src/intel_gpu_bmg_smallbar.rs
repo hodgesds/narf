@@ -223,8 +223,11 @@ impl Authority {
     }
     pub(crate) fn matches(&self, bar: narf_bus::MmioRegion, local: narf_bus::MmioRegion) -> bool {
         self.bar.phys == bar.phys
+            && self.bar.virt == bar.virt
             && self.bar.len == bar.len
+            && self.bar.kind == bar.kind
             && self.local.phys == local.phys
+            && self.local.virt == local.virt
             && self.local.len == local.len
             && self.local.kind == local.kind
     }
@@ -233,7 +236,7 @@ impl Authority {
         m: &crate::intel_gpu_gt_hw::AuthorizedWindow,
         bar: narf_bus::MmioRegion,
     ) -> bool {
-        self.matches(bar, self.local) && m.matches_bmg_source(self.device, self.bar, self.local)
+        self.matches(bar, self.local) && m.matches_bmg_source(self.device, bar, self.local)
     }
     pub(crate) fn derive(
         self: &Arc<Self>,
@@ -281,6 +284,7 @@ impl DpaGrant {
     pub(crate) fn matches(&self, local: narf_bus::MmioRegion, layout: VramLayout) -> bool {
         self.layout == layout
             && self.authority.local.phys == local.phys
+            && self.authority.local.virt == local.virt
             && self.authority.local.len == local.len
             && self.authority.local.kind == local.kind
     }

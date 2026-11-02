@@ -644,10 +644,22 @@ fn smoke_i915_capture_prime_async_cancel_and_exact_terminal_ownership() -> TestR
         // These are explicitly foreign dependency fences, never native job
         // completions. Only real GPU/retirement/reset signals the native fence.
         prior_code.signal(Ok(()));
-        assert_eq!(
-            call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Pending
-        );
+        // wait_idle parks on its existing 100us timer, not this foreign
+        // fence's waker. Resume to real admission with a bounded deadline;
+        // an immediate poll need not have crossed that timer yet.
+        let deadline = narf_time::monotonic_ns().saturating_add(10_000_000);
+        while mailbox.pending.lock().is_empty() {
+            assert_eq!(
+                call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            );
+            assert_eq!(prior_data.result(), None);
+            assert!(
+                narf_time::monotonic_ns() < deadline,
+                "normal code dependency did not resume after its timer"
+            );
+            narf_scheduler::sleep_pumps::run();
+        }
         assert_eq!(mailbox.pending.lock().len(), 1);
         // Cancel/drop the ioctl waiter before observing its successful reply.
         mailbox.accept(&mut gt, 500)

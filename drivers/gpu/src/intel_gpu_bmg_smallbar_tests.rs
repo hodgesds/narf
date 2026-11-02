@@ -513,7 +513,34 @@ fn smoke_bmg_smallbar_layout_and_dual_pool_literals() -> TestResult {
         assert!(VramLayout::xe2(bad).is_err());
     }
     for release in [1, 2] {
-        let rig = Rig::new(release, true);
+        let mut rig = Rig::new(release, true);
+        let grant = rig.core.gt.smallbar_grant(&rig.authority).unwrap();
+        assert!(grant.matches(rig.local, grant.layout));
+        // The retained visible mapping is an exact lease, including its CPU
+        // address. A fresh alias cannot borrow this derived DPA incarnation.
+        for wrong in [
+            narf_bus::MmioRegion {
+                phys: narf_memory::PhysAddr::new(rig.local.phys.raw() + PAGE),
+                ..rig.local
+            },
+            narf_bus::MmioRegion {
+                virt: rig.local.virt + PAGE,
+                ..rig.local
+            },
+            narf_bus::MmioRegion {
+                len: rig.local.len - PAGE,
+                ..rig.local
+            },
+            narf_bus::MmioRegion {
+                kind: narf_bus::BarKind::Mmio64 {
+                    prefetchable: false,
+                },
+                ..rig.local
+            },
+        ] {
+            assert!(!grant.matches(wrong, grant.layout));
+        }
+        drop(grant);
         let hidden = rig.pool.allocate_class(BO, false).unwrap();
         let visible = rig.pool.allocate(BO).unwrap();
         assert_eq!(hidden.device_address(), 0x100010000);

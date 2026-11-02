@@ -336,12 +336,58 @@ fn smoke_bmg_smallbar_actual_flr_media_and_first_cache_pte() -> TestResult {
         assert_eq!(p.flrs.get(), 1);
         assert_eq!(p.w1cs.get(), 2);
         assert!(authority.current(&p.window).is_ok());
+        assert!(authority.matches(p.bar, p.local));
         let mut wrong = p.bar;
         wrong.len += 4096;
+        assert!(!authority.matches(wrong, p.local));
         assert!(GgttArena::for_smallbar_gt(wrong, p.window.clone(), authority.clone()).is_err());
         let mut wrong = p.bar;
         wrong.virt += 4096;
+        assert!(!authority.matches(wrong, p.local));
         assert!(GgttArena::for_smallbar_gt(wrong, p.window.clone(), authority.clone()).is_err());
+        for wrong in [
+            narf_bus::MmioRegion {
+                phys: narf_memory::PhysAddr::new(p.bar.phys.raw() + PAGE),
+                ..p.bar
+            },
+            narf_bus::MmioRegion {
+                kind: narf_bus::BarKind::Mmio32 {
+                    prefetchable: false,
+                },
+                ..p.bar
+            },
+        ] {
+            assert!(!authority.matches(wrong, p.local));
+            assert!(
+                GgttArena::for_smallbar_gt(wrong, p.window.clone(), authority.clone()).is_err()
+            );
+        }
+        for wrong in [
+            narf_bus::MmioRegion {
+                phys: narf_memory::PhysAddr::new(p.local.phys.raw() + PAGE),
+                ..p.local
+            },
+            narf_bus::MmioRegion {
+                virt: p.local.virt + PAGE,
+                ..p.local
+            },
+            narf_bus::MmioRegion {
+                len: p.local.len - PAGE,
+                ..p.local
+            },
+            narf_bus::MmioRegion {
+                kind: narf_bus::BarKind::Mmio64 {
+                    prefetchable: false,
+                },
+                ..p.local
+            },
+        ] {
+            assert!(!authority.matches(p.bar, wrong));
+            let window = AuthorizedWindow::for_bmg_device(p.bar, p.cap, p.device, Some(wrong));
+            assert!(!authority.matches_window(&window, p.bar));
+            assert!(GgttArena::for_smallbar_gt(p.bar, window, authority.clone()).is_err());
+        }
+        assert!(p.no_pte());
         let mut arena = SharedArena::new(
             GgttArena::for_smallbar_gt(p.bar, p.window.clone(), authority.clone()).unwrap(),
         );
