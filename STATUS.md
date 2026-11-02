@@ -1802,18 +1802,21 @@ exact-VM publication precede handles. Opted-in PM initially refuses and ordinary
 GT reset never repeats destructive FLR. Capture suppresses the entire new raw
 bundle before reads when any retained i915 policy protects it, preserving normal
 state saves and terminal ownership. Reset discovery adds no level2/3, manual
-reset or replay. The ledger has 62 previously validated rows plus three debug-tested
-rows (65 total), with all ten broad workstreams open.
+reset or replay. The ledger has 65 implemented checkpoint rows, with all ten broad
+workstreams open.
 
-All thirty new fixtures pass in the debug native kernel: fifteen small-BAR,
-nine capture/protection and six reset-availability cases. The profile passes
-1,908 selected tests: 1,238 Intel/DRM/fb/backlight plus all 670 shared
-filesystem/graphics/AMD fixtures. All 1,878 prior selected names, 1,087 original
-Intel names, 152 cumulative new names and 31 backlight regressions remain, with
-no failures or duplicate names, no Intel skips and the one existing shared
-RNG-registration skip. All frozen source/linker hashes match this execution.
-Release native, production/btrfs and cross-target validation remain pending;
-merge readiness is not claimed.
+All thirty new fixtures pass: fifteen small-BAR, nine capture/protection and six
+reset-availability cases. Debug and release each pass 1,908 selected tests:
+1,238 Intel/DRM/fb/backlight plus all 670 shared filesystem/graphics/AMD fixtures.
+All 1,878 prior selected names, 1,087 original Intel names, 152 cumulative new
+names and 31 backlight regressions remain, with no failures or duplicate names,
+no Intel skips and one existing shared RNG-registration skip. Release production
+boot and both btrfs postflights pass. Target CI Clippy passes all three feature
+contexts on both architectures; all four host GPU vendor configurations pass
+all-target Clippy. Changed-package debug/release builds pass on both targets;
+workspace formatting, diff checks and the exact frozen source/linker hashes
+pass. aarch64 QEMU is omitted because no aarch64-specific production behavior
+changes. These results are native models, not the physical acceptance below.
 
 The BO fixtures drive actual raw Xe/GT/CT/LRC/PPGTT, cache/MERT, copy, terminal
 and reset ownership; their publication transport substitutes for the physical

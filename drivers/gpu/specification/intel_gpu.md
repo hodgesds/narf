@@ -30,7 +30,7 @@
 > private context publication and published-media SSEU defaults
 > pass debug and release native model gates; BMG opt-in GPU-only VRAM,
 > bounded i915 capture/protection and automatic-reset discovery
-> pass debug native gates; release/cross-target validation remains pending — see §20).
+> pass debug and release native/integration gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -2239,9 +2239,9 @@ production feature. Unsupported functionality remains unadvertised.
 | Per-object i915 ASYNC | Live BMG ordinary WB softpin and same-card WB imports, truthful GETPARAM43, selective prior GPU waits, atomic mixed admission and retained terminal/CPU ordering | Implemented; native fixtures pass |
 | Exact-TGL HuC upload/auth/query | Default-off actual firmware/BO/WOPCM, both-pass DMA, typed zero-result CT plus fresh status, current Xe query7/type1 and full-reset reclamation | Implemented; native fixtures pass |
 | i915 context frequency hint | Cached exact GETPARAM59 ABI, proto/create-only immutable intent, retained real GuC policy and private nonce-bound context publication | Implemented; native fixtures pass |
-| BMG opt-in GPU-only VRAM | Exact headless small-BAR takeover, immutable hidden backing, trusted GPU zero/copies, retained quota and off-lock exact-VM publication | Implemented; debug native fixtures pass |
-| i915 selected capture and protection | Actual retained WB/import payload prefixes, cached GETPARAM45 and source-live per-context whole-bundle suppression | Implemented; debug native fixtures pass |
-| i915 automatic global-reset availability | Cached GETPARAM35 level1 only with a distinct current worker/every-engine qualification witness and retained stop/requalification policy | Implemented; debug native fixtures pass |
+| BMG opt-in GPU-only VRAM | Exact headless small-BAR takeover, immutable hidden backing, trusted GPU zero/copies, retained quota and off-lock exact-VM publication | Implemented; native fixtures pass |
+| i915 selected capture and protection | Actual retained WB/import payload prefixes, cached GETPARAM45 and source-live per-context whole-bundle suppression | Implemented; native fixtures pass |
+| i915 automatic global-reset availability | Cached GETPARAM35 level1 only with a distinct current worker/every-engine qualification witness and retained stop/requalification policy | Implemented; native fixtures pass |
 | GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open; mapping revocation and platform PM |
 | Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; primary-source register/firmware contracts |
 
@@ -3093,10 +3093,10 @@ The reset fixtures use fresh GuCGt owners, not an actual RuntimeOwner/PCI/S3
 coordinator. No physical Intel, Mesa, codec or frequency/performance result
 is claimed. Local-memory takeover/allocation and OA remain separate work.
 
-### BMG GPU-only VRAM, i915 capture and reset availability — debug native checkpoint
+### BMG GPU-only VRAM, i915 capture and reset availability checkpoint
 
-This batch adds three bounded checkpoints. The ledger keeps its 62 previously
-validated rows plus three debug-tested rows (65 total), and all ten broad workstreams
+This batch adds three bounded checkpoints. The ledger contains 65 implemented
+checkpoint rows, and all ten broad workstreams
 remain open. The local-memory and diagnostics backlog rows describe the remaining
 scope; neither broad workstream is closed by these exceptions.
 
@@ -3131,15 +3131,18 @@ scope; neither broad workstream is closed by these exceptions.
   DMA while closing admission. No per-engine level2/value3, manual reset, replay
   or broader recovery/PM authority is added.
 
-All thirty new fixtures pass in the debug native kernel: fifteen small-BAR,
-nine capture/protection and six reset-availability cases. The profile passes
-1,908 selected tests: 1,238 Intel/DRM/fb/backlight plus all 670 shared
-filesystem/graphics/AMD fixtures. All 1,878 prior selected names, 1,087 original
-Intel names, 152 cumulative new names and 31 backlight regressions remain, with
-no failures or duplicate names, no Intel skips and the one existing shared
-RNG-registration skip. All frozen source/linker hashes match this execution.
-Release native, production/btrfs and cross-target validation remain pending;
-merge readiness is not claimed.
+All thirty new fixtures pass: fifteen small-BAR, nine capture/protection and six
+reset-availability cases. Debug and release each pass 1,908 selected tests:
+1,238 Intel/DRM/fb/backlight plus all 670 shared filesystem/graphics/AMD fixtures.
+All 1,878 prior selected names, 1,087 original Intel names, 152 cumulative new
+names and 31 backlight regressions remain, with no failures or duplicate names,
+no Intel skips and one existing shared RNG-registration skip. Release production
+boot and both btrfs postflights pass. Target CI Clippy passes all three feature
+contexts on both architectures; all four host GPU vendor configurations pass
+all-target Clippy. Changed-package debug/release builds pass on both targets;
+workspace formatting, diff checks and the exact frozen source/linker hashes
+pass. aarch64 QEMU is omitted because no aarch64-specific production behavior
+changes. These results are native models, not the physical acceptance below.
 
 The BO fixtures drive actual raw Xe/GT/CT/LRC/PPGTT, cache/MERT, copy, terminal
 and reset ownership; their publication transport substitutes for the physical
