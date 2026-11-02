@@ -34,15 +34,35 @@
 //! IB contents are not parsed (Linux has no `parse_cs` for these rings);
 //! the VMID's page tables are the boundary. Callers validate that every IB
 //! lies in a mapping of the submitting client's VM.
+use crate::amdgpu_uapi::{AMDGPU_IB_FLAG_EMIT_MEM_SYNC, AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_ID};
 use crate::{
     amdgpu_cp_navi22::{pm4, Error, Hw, Io, Kind, Layout, Queue, FENCE},
     amdgpu_fence_navi22 as fence,
     amdgpu_pm4_defs::{
-        packet3, PACKET3_CONTEXT_CONTROL, PACKET3_FRAME_CONTROL, PACKET3_INDIRECT_BUFFER,
-        PACKET3_PFP_SYNC_ME, PACKET3_WAIT_REG_MEM, PACKET3_WRITE_DATA,
+        packet3, PACKET3_ACQUIRE_MEM, PACKET3_CONTEXT_CONTROL, PACKET3_FRAME_CONTROL,
+        PACKET3_INDIRECT_BUFFER, PACKET3_PFP_SYNC_ME, PACKET3_SET_CONFIG_REG, PACKET3_WAIT_REG_MEM,
+        PACKET3_WRITE_DATA,
     },
 };
 use alloc::vec::Vec;
+
+/// gfx_v10_0_emit_mem_sync: whole-cache acquisition before client IBs.
+const CP_MEM_SYNC_GCR: u32 = {
+    use crate::amdgpu_pm4_defs::*;
+    packet3_acquire_mem_gcr_cntl_gl2_inv(1)
+        | packet3_acquire_mem_gcr_cntl_gl2_wb(1)
+        | packet3_acquire_mem_gcr_cntl_glm_inv(1)
+        | packet3_acquire_mem_gcr_cntl_glm_wb(1)
+        | packet3_acquire_mem_gcr_cntl_gl1_inv(1)
+        | packet3_acquire_mem_gcr_cntl_glv_inv(1)
+        | packet3_acquire_mem_gcr_cntl_glk_inv(1)
+        | packet3_acquire_mem_gcr_cntl_gli_inv(1)
+};
+/// sdma_v5_2_ring_emit_mem_sync omits GLM_WB from the same GCR bit layout.
+const SDMA_MEM_SYNC_GCR: u32 =
+    CP_MEM_SYNC_GCR & !crate::amdgpu_pm4_defs::packet3_acquire_mem_gcr_cntl_glm_wb(1);
+const GDS_COMPUTE_MAX_WAVE_ID: u32 = 0x20e8; // linux: mmGDS_COMPUTE_MAX_WAVE_ID@gc101
+const GDS_MAX_WAVE_ID_MASK: u32 = 0xfff; // linux: GDS_COMPUTE_MAX_WAVE_ID__MAX_WAVE_ID_MASK@gc101
 
 /// `mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32` (GC BASE_IDX 0); HI32 is +1,
 /// `ctx_addr_distance` 2.
@@ -94,10 +114,21 @@ impl Ring {
 }
 
 /// One `AMDGPU_CHUNK_ID_IB`, already checked against the client's VM.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Ib {
     pub va: u64,
     pub dwords: u32,
+    /// Preserve the client's requests through the native queue adapter.
+    pub flags: u32,
+}
+impl From<&crate::amdgpu_cs::Ib> for Ib {
+    fn from(ib: &crate::amdgpu_cs::Ib) -> Self {
+        Self {
+            va: ib.va_start,
+            dwords: ib.length_dw,
+            flags: ib.flags,
+        }
+    }
 }
 
 /// Owned framebuffer-aperture ranges, addressed through kernel VMID0.
@@ -211,10 +242,26 @@ pub struct VmRef {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RingState {
     context: u64,
+    gds_max_wave_id: Option<u32>,
 }
 impl RingState {
     pub const fn new() -> Self {
-        Self { context: 0 }
+        Self {
+            context: 0,
+            gds_max_wave_id: None,
+        }
+    }
+    /// gfx_v10_0_set_gds_init uses discovery maxima, not harvested CUs.
+    pub(crate) fn configure_gds(&mut self, gc: Option<crate::amdgpu_discovery::GcInfo>) {
+        self.gds_max_wave_id = gc
+            .and_then(|gc| {
+                gc.num_se
+                    .checked_mul(gc.num_sa_per_se)?
+                    .checked_mul(gc.num_cu_per_sa)?
+                    .checked_mul(32)?
+                    .checked_sub(1)
+            })
+            .filter(|&id| id <= GDS_MAX_WAVE_ID_MASK);
     }
 }
 
@@ -264,6 +311,7 @@ pub(crate) struct Frame<'a> {
     pub vm_fence: Option<(u64, u32)>,
     pub vmid: u8,
     pub context_switch: bool,
+    pub gds_max_wave_id: Option<u32>,
     pub ibs: &'a [Ib],
     pub fence: u64,
     pub seq: u32,
@@ -325,6 +373,22 @@ pub(crate) fn encode_cp(l: Layout, f: &Frame<'_>) -> Vec<u32> {
     if let Some((address, sequence)) = f.vm_fence {
         w.extend(pm4::release_mem(address, sequence));
     }
+    // amdgpu_ib_schedule inspects the first IB for this job-wide request.
+    if f.ibs
+        .first()
+        .is_some_and(|ib| ib.flags & AMDGPU_IB_FLAG_EMIT_MEM_SYNC != 0)
+    {
+        w.extend([
+            packet3(PACKET3_ACQUIRE_MEM, 6),
+            0,
+            u32::MAX,
+            0x00ff_ffff,
+            0,
+            0,
+            10,
+            CP_MEM_SYNC_GCR,
+        ]);
+    }
     if gfx {
         // gfx_v10_0_ring_emit_cntxcntl: load_enable, plus the context-switch
         // loads (global config/uconfig, CS SH, per-context and gfx SH regs).
@@ -339,6 +403,15 @@ pub(crate) fn encode_cp(l: Layout, f: &Frame<'_>) -> Vec<u32> {
         w.extend([packet3(PACKET3_FRAME_CONTROL, 0), 0]);
     }
     for ib in f.ibs {
+        if !gfx && ib.flags & AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_ID != 0 {
+            // validate at submission admits the request only with a limit
+            // derived by ColdBoot from this GPU's discovery geometry.
+            w.extend([
+                packet3(PACKET3_SET_CONFIG_REG, 1),
+                GDS_COMPUTE_MAX_WAVE_ID,
+                f.gds_max_wave_id.expect("validated compute GDS geometry"),
+            ]);
+        }
         let control = ib.dwords | (u32::from(vmid) << 24) | if gfx { 0 } else { 1 << 23 };
         w.extend([
             packet3(PACKET3_INDIRECT_BUFFER, 2),
@@ -396,6 +469,19 @@ pub(crate) fn encode_sdma(l: Layout, f: &Frame<'_>) -> Vec<u32> {
     if let Some((address, sequence)) = f.vm_fence {
         w.extend(pm4::sdma_fence(address, sequence));
     }
+    if f.ibs
+        .first()
+        .is_some_and(|ib| ib.flags & AMDGPU_IB_FLAG_EMIT_MEM_SYNC != 0)
+    {
+        // SDMA_OP_GCR_REQ, VMID0, full range; navi10_sdma_pkt_open.h.
+        w.extend([
+            17,
+            0,
+            (SDMA_MEM_SYNC_GCR & 0xffff) << 16,
+            (SDMA_MEM_SYNC_GCR >> 16) & 7,
+            0,
+        ]);
+    }
     for ib in f.ibs {
         // sdma_v5_2_ring_emit_ib: NOP so the 6-dword packet ends on 8.
         let at = f.wptr + w.len() as u64;
@@ -444,6 +530,14 @@ pub(crate) fn submit<I: Io>(
     ibs: &[Ib],
 ) -> Result<u32, Error> {
     validate(ring, vm, ibs)?;
+    if ring == Ring::Compute
+        && ibs
+            .iter()
+            .any(|ib| ib.flags & AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_ID != 0)
+        && state.gds_max_wave_id.is_none()
+    {
+        return Err(Error::Invalid);
+    }
     // HW_SUBMISSIONS outstanding jobs per ring: the caller waits (without
     // holding the device) for `throttle_seq` and retries on Busy.
     if !fence::signaled(completed(hw, queue)?, throttle_seq(queue)) {
@@ -467,6 +561,7 @@ pub(crate) fn submit<I: Io>(
             .then_some((queue.address(crate::amdgpu_cp_navi22::VM_FENCE), seq)),
         vmid: vm.vmid,
         context_switch,
+        gds_max_wave_id: state.gds_max_wave_id,
         ibs,
         fence: fence_address,
         seq,

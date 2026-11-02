@@ -467,14 +467,7 @@ pub async fn submit(
     if submission.user_fence.is_some() {
         return Err(FsError::InvalidData);
     }
-    let ibs: Vec<Ib> = submission
-        .ibs
-        .iter()
-        .map(|ib| Ib {
-            va: ib.va_start,
-            dwords: ib.length_dw,
-        })
-        .collect();
+    let ibs: Vec<Ib> = submission.ibs.iter().map(Ib::from).collect();
     if ibs.is_empty() || ibs.len() > crate::amdgpu_navi22_submit::MEDIA_MAX_IBS {
         return Err(FsError::InvalidData);
     }

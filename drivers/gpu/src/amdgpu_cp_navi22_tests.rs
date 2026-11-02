@@ -106,6 +106,8 @@ pub(crate) struct Model {
     pub flushes: Vec<(u32, u8)>,
     /// (ring engine, VMID) per executed client IB.
     pub user_ibs: Vec<(usize, u8)>,
+    pub cache_syncs: Vec<usize>,
+    pub gds_limits: Vec<u32>,
 }
 /// GCVM PTB / invalidation registers used by ring-side VM flushes.
 const PTB_LO: u64 = GC0 + 0x1667 * 4;
@@ -148,6 +150,8 @@ impl Model {
             progress: Arc::new(AtomicU32::new(0)),
             revoke: None,
             vms: BTreeMap::new(),
+            cache_syncs: Vec::new(),
+            gds_limits: Vec::new(),
             flushes: Vec::new(),
             user_ibs: Vec::new(),
         }
@@ -251,6 +255,19 @@ impl Model {
             let body = &words[i + 1..i + 2 + n as usize];
             match op {
                 0x10 => {}
+                0x58 => {
+                    assert!(!ib);
+                    assert_eq!(n, 6);
+                    assert_eq!(body, [0, u32::MAX, 0xffffff, 0, 0, 10, 0xc3b1]);
+                    self.cache_syncs.push(engine);
+                }
+                0x68 => {
+                    assert!(!ib);
+                    assert_eq!(engine, 2);
+                    assert_eq!(n, 1);
+                    assert_eq!(body[0], 0x20e8);
+                    self.gds_limits.push(body[1]);
+                }
                 0x79 => {
                     assert_eq!(n, 1);
                     let reg = 0xc000 + body[0];
@@ -464,6 +481,12 @@ impl Model {
                         "pipeline sync would hang"
                     );
                     6
+                }
+                17 => {
+                    assert!(!ib);
+                    assert_eq!(&words[i..i + 5], [17, 0, 0xc3a1_0000, 0, 0]);
+                    self.cache_syncs.push(3 + instance);
+                    5
                 }
                 op => panic!("unexpected SDMA opcode {op}"),
             };

@@ -9163,6 +9163,21 @@ empty or oversized IB lists, unaligned or zero-length IBs. At most two
 submissions are outstanding per ring; a third returns `Busy` without
 touching the ring.
 
+Native `Ib { va, dwords, flags }` retains the validated client's flags
+through both queue adapters. As `amdgpu_ib_schedule` does, only the first
+IB's `AMDGPU_IB_FLAG_EMIT_MEM_SYNC` requests a job-wide whole-cache sync:
+GC10 ACQUIRE_MEM before context control and the IBs, or SDMA5 GCR_REQ
+before the aligned INDIRECT packets. Each compute IB carrying
+`AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_ID` is preceded by SET_CONFIG_REG of
+GDS_COMPUTE_MAX_WAVE_ID. `ColdBoot::submit` configures `RingState`'s limit
+from discovery maxima (`num_se * num_sa_per_se * num_cu_per_sa * 32 - 1`,
+as `gfx_v10_0_set_gds_init`), independent of harvested CU counts. Missing,
+zero, overflowing or out-of-field geometry refuses that request before
+any ring access; no board-specific limit is guessed. Graphics and SDMA
+ignore the compute-only flag as their Linux emitters do. Existing
+PREEMPT/PREAMBLE behavior remains without hardware preemption; secure
+and CE requests remain rejected by the native adapter.
+
 `amdgpu_navi22_cs::{register, unregister, Submitter, ring_id, ring_index,
 job_done, drm_card}` plug the card into the generic render path: after a cold
 boot or recovery whose queues are verified, `register` borrows the GFXHUB

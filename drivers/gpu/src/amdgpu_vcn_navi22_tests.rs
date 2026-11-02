@@ -1405,6 +1405,7 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
     let ibs = [Ib {
         va: 0x7000_0010_0000,
         dwords: 16,
+        flags: 0,
     }];
     let (base, map, seq0) = {
         let i = e.vcn[0].as_ref().unwrap();
@@ -1481,6 +1482,7 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
     let user = [Ib {
         va: 0x7000_0030_0000,
         dwords: 4,
+        flags: 0,
     }];
     let (jbase, jmap, jfrom) = {
         let j = e.jpeg.as_ref().unwrap();
@@ -1543,6 +1545,7 @@ fn vcn_navi22_client_jobs_frame_flush_and_throttle() -> TestResult {
     let huge = [Ib {
         va: 0x7000_0030_0000,
         dwords: (JPEG_IB_SLOT / 4 + 2) as u32,
+        flags: 0,
     }];
     let big = [alloc::vec![0u32; huge[0].dwords as usize]];
     if e.submit_client(&client, MediaRing::Jpeg, vm(true), &huge, &big) != Err(Error::Invalid)

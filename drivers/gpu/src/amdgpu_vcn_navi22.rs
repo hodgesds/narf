@@ -2379,6 +2379,7 @@ impl<I: Io> Engine<I> {
                 kernel_ibs.push(Ib {
                     va: pool_mc + at,
                     dwords: copy.len() as u32,
+                    flags: 0,
                 });
                 placed.push((pool_map, at, copy));
                 at += copy.len() as u64 * 4;

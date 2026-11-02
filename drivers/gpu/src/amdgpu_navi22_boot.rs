@@ -1921,6 +1921,9 @@ impl ColdBoot {
         if !self.queues_verified() {
             return Err(Error::Busy);
         }
+        if ring == Ring::Compute {
+            state.configure_gds(self.sequence.backend.gpu.gc_info);
+        }
         let queues = self
             .sequence
             .backend

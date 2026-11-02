@@ -449,7 +449,8 @@ argument`, repeated before a Compute-ring timeout at 132.58 (signalled
 sequence 1, emitted 2). Recovery returns `Unsupported`; greeter and
 wallpaper clients subsequently report no outputs. The kernel status panel
 continuing to draw is consistent with the display never accepting a
-client frame: console ownership changes after successful presentation.
+client frame: console ownership changes after the presenter accepts a
+client frame, before the asynchronous copy and hardware flip complete.
 
 The framebuffer rejection has a reproducible entry-path defect:
 `amdgpu_addfb2_bo` admitted only `gfx12_modifiers` cards, although
@@ -469,6 +470,45 @@ does not prove the client job completed, or that a reused VM required a
 new programming fence. The captured approximately 8 GiB KWin RSS also
 remains unexplained. Physical desktop acceptance after the ioctl fix is
 still required.
+
+The subsequent Linux comparison also found the Navi22 native adapter
+discarded IB flags when converting the generic submission. This omitted
+requested `EMIT_MEM_SYNC` on graphics/compute/SDMA and
+`RESET_GDS_MAX_WAVE_ID` on compute. The adapter now retains flags, and the
+emitters follow `amdgpu_ib_schedule`, `gfx_v10_0_emit_mem_sync`,
+`gfx_v10_0_ring_emit_ib_compute`, and `sdma_v5_2_ring_emit_mem_sync`.
+The GDS limit uses discovery maxima, as `gfx_v10_0_set_gds_init` does;
+unknown or invalid geometry refuses the reset request before ring access.
+Packet regressions fail with the omitted emitters. Register-model jobs
+also exercise requested synchronization on each engine through VM
+translation and final fence completion. Whether the stalled native job
+requested these flags is not established by the saved log.
+
+### Linux Navi22 initialization comparison
+
+Reference checkout: `~/git/linux` at `ecd997b0189a`. This is a mapping of
+the active PF boot, queue and presentation paths, with targeted register
+and packet comparisons. It is not an exhaustive equivalence proof of
+Linux AMDGPU, or physical validation of every optional block.
+
+| Phase | Linux reference | NARF mapping and evidence / limit |
+| --- | --- | --- |
+| Discovery and board identity | `amdgpu_discovery.c`, GC 10.3.2 / NV, PSP11, GMC10, GFX10, SDMA5.2 | `amdgpu_rdna2`, `amdgpu_info_navi22`, discovery maxima and separately sampled NBIO revision. Native topology completes; earlier wrong external-revision selection is corrected. |
+| Training and firmware | `psp_v11_0.c`, `amdgpu_psp.c`: training, SOS, PSP ring/TMR, SMC and graphics firmware, RLC autoload | `ColdBoot`'s ResetOnInit through RlcBoot and PowerSetup stages. Native training, firmware versions and RLC boot witnesses succeed. Stage ordering is explicit rather than Linux's IP callback passes. |
+| Translation and interrupts | `amdgpu_device_ip_init`, `gmc_v10_0_hw_init`, IH phase 1 | MemoryHubs/Gart precede IH and engine starts; native VMID0 SDMA and IH round-trip proofs succeed. Client VMIDs are a separate, later path. |
+| GFX constants and queues | `gfx_v10_0_hw_init`, constants/CAM/SH_MEM/GDS VMIDs, RLC resume, `cp_resume` | `amdgpu_cp_navi22`, `amdgpu_kiq_navi22`: direct GFX ring, KIQ and one mapped kernel compute queue. Uses Linux's direct-ring alternative, without MES or hardware preemption. Native ring and IB fences pass. |
+| SDMA | `sdma_v5_2_start`, ring/IB tests | `amdgpu_sdma_navi22_queues`; both native SDMA queues pass. Ring-side user VM flush, IB alignment and cache-rinse packets have model coverage. |
+| Client jobs | `amdgpu_ib_schedule`, `amdgpu_vm_flush`, GMC10/GFX10/SDMA5.2 emitters | PTB/invalidation/PASID writes, pipeline sync, HDP flush and completion fences are present. Missing IB flag requests are corrected here. Physical boot's first client compute job still lacks a completion witness. Boot's VMID0 self-test does not prove shader execution under a client VMID. |
+| DMUB and display | `dm_dmub_hw_init`, DCN30 modeset / atomic update | NARF starts DMUB after queue proofs, whereas Linux starts DM earlier in phase 2. Native DMUB and 4K HDMI setup succeed. NARF supports a linear primary copy presenter rather than Linux's full direct-scanout plane support; the framebuffer ioctl gate is corrected. |
+| Render-to-scanout handoff | implicit dma-resv waits, prepare_fb, atomic commit | NARF resolves and pins native GEM targets, waits for rendering and hidden-VRAM readback outside OWNER, then copies and flips. Models cover lifetime and wait ordering. The failing boot never supplies a working client frame. |
+| Late clock/power gating | `amdgpu_device_ip_late_init`, GFX safe-mode clock gating and SMU GFXOFF | NARF applies admitted policy after queue tests and display setup; client access takes a GFXOFF reference before OWNER. The all-ones RLC override message is diagnostic: an independent enabled-RLC read admits that value, and native boot reports policy applied. Post-idle client execution still needs physical confirmation. |
+| VCN/JPEG | `vcn_v3_0_hw_init`, `jpeg_v3_0_hw_init`, media IB tests | Native MediaIbTests time out; the failed VCN rings are withheld, and only verified JPEG is exposed (`0x8`). This remains an unresolved difference; NARF deliberately continues graphics boot after a media failure. |
+| Hang recovery | `amdgpu_device_gpu_recover` and IP resume | Native attempt returns Unsupported: NARF's recovery admission excludes a retained training owner. Recovery is not equivalent to Linux, and does not explain why the original compute job stalls. Do not remove this guard without implementing training replay and validating reset ownership. |
+
+Remaining hardware questions are the first client compute completion,
+native presentation after these corrections, post-idle power behavior,
+media self-tests, and trained-board recovery. No successful desktop or
+complete Linux equivalence is claimed from the VM boot matrix.
 
 The earlier native boot also failed in the dynamic loader before Plasma
 startup. The separate VFS/Btrfs fixes and their private-mmap regression must

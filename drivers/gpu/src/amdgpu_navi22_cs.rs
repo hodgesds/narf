@@ -355,14 +355,7 @@ impl crate::amdgpu_cs::Submitter for Submitter {
             if vm.geometry() != crate::amdgpu_vm::Geometry::GMC11 {
                 return Err(FsError::InvalidData);
             }
-            let ibs: Vec<Ib> = submission
-                .ibs
-                .iter()
-                .map(|ib| Ib {
-                    va: ib.va_start,
-                    dwords: ib.length_dw,
-                })
-                .collect();
+            let ibs: Vec<Ib> = submission.ibs.iter().map(Ib::from).collect();
             let page_table_base = vm.root_pde().ok_or(FsError::InvalidData)?;
             let pasid = vm.pasid().ok_or(FsError::NoSpace)?;
             let index = ring_index(self.epoch, id);

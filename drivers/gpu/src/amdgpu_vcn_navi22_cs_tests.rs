@@ -386,10 +386,12 @@ fn vcn_navi22_cs_media_frames_follow_linux_emit_order() -> TestResult {
         Ib {
             va: 0x7000_0010_0000,
             dwords: 64,
+            flags: 0,
         },
         Ib {
             va: 0x7000_0020_0040,
             dwords: 16,
+            flags: 0,
         },
     ];
     // Decode: insert_start, flush, insert_start, IBs, fence, insert_end.
@@ -579,6 +581,7 @@ fn vcn_navi22_cs_media_grant_maps_pasid_only_with_a_flush() -> TestResult {
     let ibs = [Ib {
         va: 0x1000,
         dwords: 4,
+        flags: 0,
     }];
     let words = encode_media(&MediaFrame {
         ring: MediaRing::Enc(0),
