@@ -7278,6 +7278,7 @@ enum FixtureXfer {
     ConfigureEndpoints { ep_addr: u8 },
     SetInterface { interface: u16, alt: u16 },
     IsochIn,
+    BulkIn,
     OtherControlOut { request: u8, value: u16 },
     OtherControlIn { request: u8, value: u16 },
 }
@@ -7486,6 +7487,24 @@ impl crate::uvc::UvcTransport for FixtureTransport {
         out[..n].copy_from_slice(&packet[..n]);
         Ok(n)
     }
+
+    async fn bulk_in(
+        &self,
+        _slot_id: u8,
+        _dci: u8,
+        out: &mut [u8],
+    ) -> Result<usize, crate::xhci::XhciError> {
+        // Same parking semantics as isoch_in: a bulk transfer
+        // completes only when the device sources data. One staged
+        // transfer per call, from the same queue the pump drains.
+        PacketStaged { state: &self.state }.await;
+        let mut state = self.state.lock();
+        state.log.push(FixtureXfer::BulkIn);
+        let packet = state.packets.pop_front().unwrap_or_default();
+        let n = packet.len().min(out.len());
+        out[..n].copy_from_slice(&packet[..n]);
+        Ok(n)
+    }
 }
 
 /// The modelled camera currently installed for the fixture stream
@@ -7531,6 +7550,29 @@ fn uvc_fixture_config_blob() -> Vec<u8> {
 /// Modelled camera config blob with a chosen VC HEADER version/clock.
 /// The 1.0 form keeps the original bytes: bcdUVC 1.00, 4.68 MHz clock.
 fn uvc_fixture_config_blob_versioned(bcd_uvc: u16, clock_hz: u32) -> Vec<u8> {
+    // Alt 1 isochronous IN endpoint: attrs 0x01, wMaxPacketSize
+    // 1024, interval 1.
+    uvc_fixture_config_blob_inner(bcd_uvc, clock_hz, 0x01, 0x0400, 1)
+}
+
+/// Bulk-only modelled camera: same descriptors as the isochronous
+/// fixture, but alt 1 carries a bulk IN endpoint (attrs 0x02,
+/// wMaxPacketSize 512, interval 0 — ignored for bulk) instead of
+/// the isochronous one, so no isochronous alternate exists at all.
+/// GET_CUR(PROBE) still answers 1024, above the bulk endpoint's
+/// 512-byte packet size: STREAMON on this camera succeeds only
+/// through the bulk fallback, never through the isochronous gate.
+fn uvc_fixture_config_blob_bulk_only() -> Vec<u8> {
+    uvc_fixture_config_blob_inner(0x0100, 0x0047_9C40, 0x02, 0x0200, 0)
+}
+
+fn uvc_fixture_config_blob_inner(
+    bcd_uvc: u16,
+    clock_hz: u32,
+    ep_attrs: u8,
+    ep_max_packet: u16,
+    ep_interval: u8,
+) -> Vec<u8> {
     let mut cfg = alloc::vec::Vec::new();
     // Configuration header (wTotalLength patched at the end).
     cfg.extend_from_slice(&[9, 2, 0, 0, 2, 1, 0, 0x80, 50]);
@@ -7561,9 +7603,18 @@ fn uvc_fixture_config_blob_versioned(bcd_uvc: u16, clock_hz: u32) -> Vec<u8> {
     cfg.extend_from_slice(&333_333u32.to_le_bytes()); // default interval
     cfg.push(1); // one discrete interval
     cfg.extend_from_slice(&333_333u32.to_le_bytes());
-    // Interface 1 alt 1: VideoStreaming, one isochronous IN endpoint.
+    // Interface 1 alt 1: VideoStreaming, one IN endpoint (isochronous
+    // in the versioned fixture, bulk in the bulk-only fixture).
     cfg.extend_from_slice(&[9, 4, 1, 1, 1, 0x0E, 0x02, 0x00, 0]);
-    cfg.extend_from_slice(&[7, 5, 0x81, 0x01, 0x00, 0x04, 1]);
+    cfg.extend_from_slice(&[
+        7,
+        5,
+        0x81,
+        ep_attrs,
+        (ep_max_packet & 0xff) as u8,
+        (ep_max_packet >> 8) as u8,
+        ep_interval,
+    ]);
     let total = cfg.len() as u16;
     cfg[2..4].copy_from_slice(&total.to_le_bytes());
     cfg
@@ -7976,6 +8027,202 @@ fn smoke_uvc_streamon_composition_e2e() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/uvc", smoke_uvc_streamon_composition_e2e);
+
+/// The bulk fallback's selection rules, pinned without hardware:
+/// the isochronous gate rejects a PROBE figure above its interval
+/// bandwidth, and the bulk selector then takes the least-bandwidth
+/// bulk alternate with no payload gate.
+fn smoke_uvc_bulk_fallback_selection_rules() -> TestResult {
+    use crate::uvc::{UvcStreamingEndpoint, UvcStreamingTransport};
+    let mk = |alt: u8, addr: u8, max: u32, transport: UvcStreamingTransport| UvcStreamingEndpoint {
+        interface_number: 1,
+        alternate_setting: alt,
+        endpoint_address: addr,
+        dci: 3,
+        transport,
+        raw_max_packet: max as u16,
+        max_packet_size: max as u16,
+        transactions_per_interval: 1,
+        max_payload_size: max,
+        interval: 0,
+    };
+    let endpoints = alloc::vec![
+        mk(2, 0x82, 1024, UvcStreamingTransport::Bulk),
+        mk(1, 0x81, 512, UvcStreamingTransport::Bulk),
+        mk(3, 0x83, 2048, UvcStreamingTransport::Isochronous),
+    ];
+    // The isochronous gate rejects a PROBE figure above its interval
+    // bandwidth — the exact condition that must trigger the fallback.
+    if crate::uvc::select_video_streaming_iso_endpoint(&endpoints, 4096).is_some() {
+        return TestResult::Fail("iso selector should reject a payload above its max");
+    }
+    // The bulk selector ignores the payload figure and takes the
+    // least-bandwidth bulk alternate.
+    match crate::uvc::select_video_streaming_bulk_endpoint(&endpoints) {
+        Some(ep) if ep.alternate_setting == 1 && ep.transport == UvcStreamingTransport::Bulk => {}
+        _ => return TestResult::Fail("bulk selector should pick alt 1 (512 bytes)"),
+    }
+    // And the bulk-only blob retains exactly one bulk endpoint and
+    // no isochronous one, so activation on it has no iso candidate.
+    let blob = uvc_fixture_config_blob_bulk_only();
+    let found = crate::uvc::find_video_streaming_endpoints(&blob);
+    if found.len() != 1 || found[0].transport != UvcStreamingTransport::Bulk {
+        return TestResult::Fail("bulk-only blob should retain one bulk endpoint");
+    }
+    if crate::uvc::select_video_streaming_iso_endpoint(&found, 1024).is_some() {
+        return TestResult::Fail("bulk-only blob should offer no iso candidate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_bulk_fallback_selection_rules);
+
+/// Bulk-only camera end to end (#1243): the modelled camera has no
+/// isochronous alternate at all, so STREAMON succeeds only through
+/// the bulk fallback, and the capture pump must read bulk transfers
+/// (never isochronous packets) into the same frame queue.
+fn smoke_uvc_bulk_only_streamon_pump_e2e() -> TestResult {
+    let blob = uvc_fixture_config_blob_bulk_only();
+    let (transport, idx, dev, ctx, events) = match uvc_fixture_bound_with_blob(false, false, &blob)
+    {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // STREAMON must succeed via the bulk fallback: without it,
+    // activation fails NoStreamingEndpoint on this camera.
+    match fixture_streamon(&dev, &events, &ctx) {
+        Ok(0) => {}
+        Ok(_) => return TestResult::Fail("STREAMON should succeed on a bulk-only camera"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    if !dev.lock().streaming {
+        return TestResult::Fail("device should be streaming after STREAMON");
+    }
+    {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        match devices[idx].active_stream {
+            Some(ep)
+                if ep.alternate_setting == 1
+                    && ep.dci == 3
+                    && ep.transport == crate::uvc::UvcStreamingTransport::Bulk => {}
+            _ => return TestResult::Fail("STREAMON should activate bulk alt 1 (DCI 3)"),
+        }
+    }
+    // Drive the capture pump, interleaved with nonblocking DQBUF, until
+    // the modelled frame lands in a queued buffer.
+    let generation = crate::uvc::UVC_DEVICES.lock()[idx].stream_generation;
+    let mut pump = Box::pin(crate::uvc::pump_video_frames_with(
+        idx,
+        &*transport,
+        generation,
+    ));
+    let mut dequeued = false;
+    for _ in 0..10_000 {
+        let _ = fixture_poll(pump.as_mut());
+        ctx.put_u32(4, 1);
+        ctx.put_u32(60, 1);
+        match fixture_ioctl(&dev, &events, &ctx, fixture_ioc(3, 17, 88)) {
+            Ok(0) => {
+                dequeued = true;
+                break;
+            }
+            Ok(r) if r == fixture_eno(11) => continue,
+            Ok(_) => return TestResult::Fail("DQBUF should succeed or EAGAIN"),
+            Err(e) => return TestResult::Fail(e),
+        }
+    }
+    if !dequeued {
+        return TestResult::Fail("DQBUF never returned the modelled frame");
+    }
+    if ctx.get_u32(8) as usize != b"UVC-E2E-FRAME!".len() {
+        return TestResult::Fail("bytesused should equal the modelled frame length");
+    }
+    let bytes_ok = {
+        let g = dev.lock();
+        let f0 = g.buffers[0].frames[0];
+        let p = f0.start_address().kernel_ptr::<u8>();
+        let mut buf = [0u8; 14];
+        // SAFETY: f0 is an allocated frame owned by buffer 0; its
+        // direct-map pointer is valid for the 14 delivered bytes.
+        unsafe { core::ptr::copy_nonoverlapping(p, buf.as_mut_ptr(), 14) };
+        &buf == b"UVC-E2E-FRAME!"
+    };
+    if !bytes_ok {
+        return TestResult::Fail("buffer should contain the modelled frame bytes");
+    }
+    // STREAMOFF reverses the composition.
+    match fixture_streamoff(&dev, &events, &ctx) {
+        Ok(0) => {}
+        Ok(_) => return TestResult::Fail("STREAMOFF should succeed"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    if dev.lock().streaming {
+        return TestResult::Fail("STREAMOFF should clear streaming");
+    }
+    // The pump is parked in `bulk_in` (the modelled device sources
+    // nothing on alt 0), so stage one transfer to wake it — the
+    // frame it completes belongs to the stopped stream: the pump
+    // must drop it at the pre-delivery lifecycle check, not deliver
+    // it into the reset queues, and exit cleanly.
+    transport.stage_packet(alloc::vec![2u8, 0x83, b'W', b'A', b'K', b'E', b'!']);
+    let mut pump_done = None;
+    for _ in 0..10_000 {
+        if let Poll::Ready(r) = fixture_poll(pump.as_mut()) {
+            pump_done = Some(r);
+            break;
+        }
+    }
+    if !matches!(pump_done, Some(Ok(()))) {
+        return TestResult::Fail("pump should exit Ok after STREAMOFF");
+    }
+    {
+        let devices = crate::uvc::UVC_DEVICES.lock();
+        if devices[idx].active_stream.is_some() {
+            return TestResult::Fail("STREAMOFF should clear the active stream");
+        }
+    }
+    // The transfer conversation: probe before commit, commit carries
+    // the device-accepted values, SET_INTERFACE after commit, bulk
+    // only after activation, alt 0 released at teardown — and no
+    // isochronous packet anywhere on a bulk stream.
+    let log = transport.log();
+    if log.iter().any(|x| matches!(x, FixtureXfer::IsochIn)) {
+        return TestResult::Fail("bulk stream should never receive via isoch_in");
+    }
+    let pos = |needle: &FixtureXfer| fixture_log_pos(&log, needle);
+    let positions = [
+        pos(&FixtureXfer::SetConfiguration),
+        log.iter()
+            .position(|x| matches!(x, FixtureXfer::SetCurProbe { .. })),
+        pos(&FixtureXfer::GetCurProbe),
+        log.iter()
+            .position(|x| matches!(x, FixtureXfer::SetCurCommit { .. })),
+        pos(&FixtureXfer::ConfigureEndpoints { ep_addr: 0x81 }),
+        pos(&FixtureXfer::SetInterface {
+            interface: 1,
+            alt: 1,
+        }),
+        pos(&FixtureXfer::BulkIn),
+    ];
+    let mut order = Vec::new();
+    for position in positions {
+        match position {
+            Some(p) => order.push(p),
+            None => return TestResult::Fail("conversation is missing a required transfer"),
+        }
+    }
+    if !order.windows(2).all(|w| w[0] < w[1]) {
+        return TestResult::Fail("transfer conversation is out of order");
+    }
+    let last_set_interface = log.iter().rev().find_map(|x| match x {
+        FixtureXfer::SetInterface { alt, .. } => Some(*alt),
+        _ => None,
+    });
+    if last_set_interface != Some(0) {
+        return TestResult::Fail("teardown should end with SET_INTERFACE alt 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_bulk_only_streamon_pump_e2e);
 
 /// Two modelled cameras bind, the first detaches cleanly (binding
 /// and node both gone, survivor untouched), detach is idempotent

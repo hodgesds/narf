@@ -736,9 +736,10 @@ pub static UVC_DEVICES: IrqSafeSpinLock<Vec<UvcDevice>> = IrqSafeSpinLock::new(V
 /// `crate::tests`) runs the *same* bind / negotiate / activate /
 /// deactivate / pump code against a modelled device implementing this
 /// trait, so the composition is validated without silicon. The seam is
-/// deliberately narrow — four operations, no controller state — so a
+/// deliberately narrow — five operations, no controller state — so a
 /// modelled transport stays a faithful device conversation (control
-/// transfers, endpoint configuration, isochronous packets), not a
+/// transfers, endpoint configuration, isochronous packets, bulk
+/// transfers), not a
 /// re-implementation of the composition itself.
 pub trait UvcTransport {
     /// Host-to-device control transfer with an OUT data stage.
@@ -770,6 +771,18 @@ pub trait UvcTransport {
     /// Receive one isochronous IN packet into `out`; returns the byte
     /// count (0 = no packet this service interval).
     fn isoch_in<'a>(
+        &'a self,
+        slot_id: u8,
+        dci: u8,
+        out: &'a mut [u8],
+    ) -> impl Future<Output = Result<usize, crate::xhci::XhciError>> + Send + 'a;
+    /// Receive one bulk IN transfer into `out`; returns the byte
+    /// count (0 = empty transfer; a short transfer ends at the
+    /// device's packet boundary). Bulk transfers carry the same UVC
+    /// payload header framing as isochronous packets (UVC §2.4.3.3),
+    /// so the capture pump feeds them into the same
+    /// [`UvcFrameReassembler`] path.
+    fn bulk_in<'a>(
         &'a self,
         slot_id: u8,
         dci: u8,
@@ -835,6 +848,15 @@ impl UvcTransport for crate::xhci::Xhci {
         out: &'a mut [u8],
     ) -> impl Future<Output = Result<usize, crate::xhci::XhciError>> + Send + 'a {
         crate::xhci::Xhci::isoch_in(self, slot_id, dci, out)
+    }
+
+    fn bulk_in<'a>(
+        &'a self,
+        slot_id: u8,
+        dci: u8,
+        out: &'a mut [u8],
+    ) -> impl Future<Output = Result<usize, crate::xhci::XhciError>> + Send + 'a {
+        crate::xhci::Xhci::bulk_in(self, slot_id, dci, out)
     }
 }
 
@@ -1091,8 +1113,68 @@ fn select_video_streaming_iso_endpoint_for_interface(
         })
 }
 
-/// Configure and select the isochronous VideoStreaming alternate chosen
-/// for the payload size accepted by UVC PROBE/COMMIT.
+/// Choose the least-bandwidth bulk alternate, with no payload gate.
+///
+/// Bulk transfers reserve no interval bandwidth: the transfer length
+/// is host-chosen (the pump's buffer), and the device returns up to
+/// that many bytes, so the PROBE-accepted `dwMaxPayloadTransferSize`
+/// — an isochronous bandwidth figure — is not a per-transfer cap
+/// for bulk. Gating bulk alternates on it would reject every bulk
+/// endpoint whose `wMaxPacketSize` is smaller than the PROBE figure
+/// even though the transfer would succeed. Activation therefore
+/// tries the isochronous selector first and falls back here.
+pub fn select_video_streaming_bulk_endpoint(
+    endpoints: &[UvcStreamingEndpoint],
+) -> Option<UvcStreamingEndpoint> {
+    select_video_streaming_bulk_endpoint_for_interface(endpoints, None)
+}
+
+fn select_video_streaming_bulk_endpoint_for_interface(
+    endpoints: &[UvcStreamingEndpoint],
+    interface_number: Option<u8>,
+) -> Option<UvcStreamingEndpoint> {
+    endpoints
+        .iter()
+        .copied()
+        .filter(|endpoint| endpoint.transport == UvcStreamingTransport::Bulk)
+        .filter(|endpoint| {
+            interface_number.is_none_or(|number| endpoint.interface_number == number)
+        })
+        .min_by_key(|endpoint| {
+            (
+                endpoint.max_payload_size,
+                endpoint.alternate_setting,
+                endpoint.endpoint_address,
+            )
+        })
+}
+
+/// Isochronous-first streaming endpoint selection for activation:
+/// the least-bandwidth isochronous alternate satisfying PROBE, or —
+/// when no isochronous endpoint qualifies (bulk-only cameras) — the
+/// least-bandwidth bulk alternate. `None` only when the interface
+/// has no usable streaming endpoint of either kind.
+fn select_video_streaming_endpoint_for_activation(
+    endpoints: &[UvcStreamingEndpoint],
+    interface_number: u8,
+    required_payload: u32,
+) -> Option<UvcStreamingEndpoint> {
+    select_video_streaming_iso_endpoint_for_interface(
+        endpoints,
+        Some(interface_number),
+        required_payload,
+    )
+    .or_else(|| {
+        select_video_streaming_bulk_endpoint_for_interface(endpoints, Some(interface_number))
+    })
+}
+
+/// Configure and select the VideoStreaming alternate chosen for the
+/// payload size accepted by UVC PROBE/COMMIT — the least-bandwidth
+/// isochronous alternate satisfying it, or, when no isochronous
+/// endpoint qualifies, the least-bandwidth bulk alternate (bulk
+/// transfers reserve no interval bandwidth, so no payload gate
+/// applies there).
 pub async fn activate_video_stream(
     xhci_dev: &crate::xhci::Xhci,
     idx: usize,
@@ -1112,9 +1194,9 @@ pub async fn activate_video_stream_with<T: UvcTransport>(
         let device = devices.get(idx).ok_or(UvcError::NotVideo)?;
         let vs_iface = device.vs_iface;
         if let Some(active) = device.active_stream {
-            let selected = select_video_streaming_iso_endpoint_for_interface(
+            let selected = select_video_streaming_endpoint_for_activation(
                 &device.streaming_endpoints,
-                Some(vs_iface),
+                vs_iface,
                 required_payload,
             )
             .ok_or(UvcError::NoStreamingEndpoint)?;
@@ -1123,9 +1205,9 @@ pub async fn activate_video_stream_with<T: UvcTransport>(
             }
             return Err(UvcError::AlreadyStreaming);
         }
-        let selected = select_video_streaming_iso_endpoint_for_interface(
+        let selected = select_video_streaming_endpoint_for_activation(
             &device.streaming_endpoints,
-            Some(vs_iface),
+            vs_iface,
             required_payload,
         )
         .ok_or(UvcError::NoStreamingEndpoint)?;
@@ -1135,7 +1217,10 @@ pub async fn activate_video_stream_with<T: UvcTransport>(
     let endpoint_config = crate::xhci::EndpointConfig {
         ep_addr: endpoint.endpoint_address,
         max_packet: endpoint.raw_max_packet,
-        kind: crate::xhci::EndpointKind::IsochIn,
+        kind: match endpoint.transport {
+            UvcStreamingTransport::Isochronous => crate::xhci::EndpointKind::IsochIn,
+            UvcStreamingTransport::Bulk => crate::xhci::EndpointKind::BulkIn,
+        },
         interval: endpoint.interval,
     };
     transport
@@ -1233,7 +1318,8 @@ pub struct UvcNegotiatedStream {
 /// Run the version-aware negotiation sequence (26-byte UVC 1.0,
 /// 34-byte UVC 1.1+ per the device's VC HEADER `bcdUVC`), then configure
 /// and select the least-bandwidth isochronous alternate that satisfies the
-/// device-accepted maximum payload size, and start the capture pump.
+/// device-accepted maximum payload size (bulk fallback when none
+/// qualifies), and start the capture pump.
 pub async fn negotiate_and_activate_video_stream(
     xhci_dev: &crate::xhci::Xhci,
     idx: usize,
@@ -1436,10 +1522,11 @@ fn take_pump_exit_request(idx: usize, generation: u64) -> bool {
 /// Transport-generic core of the capture pump, running under the
 /// stream `generation` it was spawned for.
 ///
-/// #808 seam: packet reception goes through the single
-/// [`UvcTransport::isoch_in`] call site in this loop — one packet
-/// outstanding at a time. The depth-4 `IsocScheduler` pipelining work
-/// slots in behind this seam (a pipelined transport receive) without
+/// #808 seam: the receive call site in this loop — one transfer outstanding
+/// at a time, dispatching on the active endpoint's transport
+/// (`isoch_in` for isochronous streams, `bulk_in` for bulk
+/// streams). The depth-4 `IsocScheduler` pipelining work slots in
+/// behind this seam (a pipelined transport receive) without
 /// changing negotiation, activation, the stop protocol, or frame
 /// delivery; nothing here bakes in a single-shot assumption beyond
 /// that one call.
@@ -1447,10 +1534,10 @@ fn take_pump_exit_request(idx: usize, generation: u64) -> bool {
 /// Lifecycle: the loop exits cleanly with `Ok(())` when
 /// [`take_pump_exit_request`] fires — checked at every loop top, and
 /// again after a frame completes, before it is delivered. The second
-/// check is load-bearing: the pump parks inside `isoch_in` with no
+/// check is load-bearing: the pump parks inside the receive call with no
 /// timeout, so STREAMOFF (and a whole STREAMOFF → STREAMON toggle)
-/// can run while a packet is in flight; a frame that completes from
-/// such a packet belongs to a stream whose buffers were already
+/// can run while a transfer is in flight; a frame that completes from
+/// such a transfer belongs to a stream whose buffers were already
 /// reset, and delivering it would plant a stale frame in the fresh
 /// stream's queue.
 pub async fn pump_video_frames_with<T: UvcTransport>(
@@ -1478,7 +1565,18 @@ pub async fn pump_video_frames_with<T: UvcTransport>(
         if take_pump_exit_request(idx, generation) {
             return Ok(());
         }
-        match transport.isoch_in(slot_id, endpoint.dci, &mut packet).await {
+        // Bulk transfers carry the same UVC payload header framing
+        // as isochronous packets, so both feed the same reassembler
+        // below; only the receive call differs.
+        let transfer = match endpoint.transport {
+            UvcStreamingTransport::Isochronous => {
+                transport.isoch_in(slot_id, endpoint.dci, &mut packet).await
+            }
+            UvcStreamingTransport::Bulk => {
+                transport.bulk_in(slot_id, endpoint.dci, &mut packet).await
+            }
+        };
+        match transfer {
             Ok(received) if received != 0 => {
                 consecutive_errors = 0;
                 if reassembler.push(&packet[..received]) == ReassemblerOutcome::FrameComplete {
@@ -1508,23 +1606,29 @@ pub async fn pump_video_frames_with<T: UvcTransport>(
     }
 }
 
-/// Pull one iso-IN packet (video frame fragment) from the bound
-/// UVC device. Caller feeds it into a [`UvcFrameReassembler`] to
+/// Pull one video transfer from the bound UVC device: one iso-IN
+/// packet on an isochronous stream, one bulk-IN transfer on a bulk
+/// stream. Caller feeds it into a [`UvcFrameReassembler`] to
 /// stitch payloads back into whole frames. Returns the byte count.
 pub fn capture_one_packet(idx: usize, out: &mut [u8]) -> Result<usize, UvcError> {
-    let (slot_id, dci) = {
+    let (slot_id, endpoint) = {
         let g = UVC_DEVICES.lock();
         let dev = g.get(idx).ok_or(UvcError::NotVideo)?;
         let endpoint = dev.active_stream.ok_or(UvcError::NoStreamingEndpoint)?;
-        (dev.slot_id, endpoint.dci)
+        (dev.slot_id, endpoint)
     };
-    // Sync entry-point on the UVC capture path; bridge to async
-    // isoch_in via block_on. Called from non-executor contexts.
+    // Sync entry-point on the UVC capture path; bridge to the async
+    // receive via block_on. Called from non-executor contexts.
     let c = match crate::xhci::controller() {
         Some(c) => c,
         None => return Err(UvcError::SetConfigFailed),
     };
-    let outcome = narf_scheduler::block_on(async { c.isoch_in(slot_id, dci, out).await });
+    let outcome = narf_scheduler::block_on(async {
+        match endpoint.transport {
+            UvcStreamingTransport::Isochronous => c.isoch_in(slot_id, endpoint.dci, out).await,
+            UvcStreamingTransport::Bulk => c.bulk_in(slot_id, endpoint.dci, out).await,
+        }
+    });
     match outcome {
         Ok(n) => Ok(n),
         Err(_) => Err(UvcError::SetConfigFailed),
@@ -1554,7 +1658,7 @@ pub fn __reset_uvc_for_test() {
 /// `take_pump_exit_request` sees the entry gone (or a different
 /// device's generation at the reused index), its next
 /// `get_device(video_node)` finds the unregistered node, and its
-/// `isoch_in` on the disabled slot errors out. Registered as the
+/// `isoch_in`/`bulk_in` on the disabled slot errors out. Registered as the
 /// class-registry unbind hook, so the supervisor's hub-detach path
 /// (`attach::detach_slot` → `dispatch_unbind`) reaches it; see also
 /// [`detach_all_uvc`] for the controller-recovery path.
