@@ -1205,6 +1205,9 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     // panic path — unhandled NMIs should be diagnostic, not fatal.
     // The NMI hardware contract is: edge-only, IF=0 throughout.
     if frame.vector == 2 {
+        #[cfg(feature = "instruction-quantum")]
+        let _nmi_account =
+            narf_scheduler::interrupt_account_enter(narf_scheduler::InterruptKind::Nmi);
         // Stall-watchdog stuck-CPU probe: record where this CPU was interrupted
         // so the reporter can print the spin site of a CPU wedged with IF=0
         // (whose trap-entry LAST_RIP never updates). Cheap; NMI context.

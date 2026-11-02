@@ -63,6 +63,14 @@ work, and `cpu_demand()` publishes read-only observations to the separate power
 governor. Full trap-entry domain neutralisation and aarch64 own-stack EL0 user
 preemption remain open safety gates; see the implementation contract.
 
+The opt-in `instruction-quantum` feature adds `QuantumUnit::Instructions`:
+AMD IRPERF or Intel fixed counter 0 supplies a retired-instruction allowance,
+with `StackfulOptions::instruction_limit` separate from the time ceiling in
+`slice_cycles`. A policy opts in through `Scheduler::quantum_unit()`; installs
+are refused when any participating CPU lacks a prepared counter. Timer checks
+and safe syscall exits enforce it; CPU bandwidth and virtual runtime remain
+time-based. The initial backend supports x86_64; aarch64 refuses this mode.
+
 - Spec: [`specification/spec.md`](./specification/spec.md)
 - Preemption/accounting: [`specification/preemption.md`](./specification/preemption.md)
 - Research: [`research/README.md`](./research/README.md)

@@ -96,6 +96,17 @@ The timer hook evaluates two independent boundaries:
 - periodic budget soft/hard ends published by the core before entering the
   task.
 
+With `instruction-quantum` and a policy declaring `QuantumUnit::Instructions`,
+`StackfulOptions::instruction_limit` adds a separate retired-instruction
+boundary. The TSC `slice_cycles` ceiling is retained: either expiry requests
+the same safe reschedule with runnable competition. AMD IRPERF or Intel fixed
+counter 0 is sampled at continuation entry; measured hard-IRQ/NMI instructions
+are excluded and fixed-counter wraparound is masked to the enumerated width.
+No overflow interrupt or arbitrary kernel-preemption permission is added.
+Hrtick arms the time ceiling, never an instruction count interpreted as time.
+Explicit installs fail before policy publication when any online CPU lacks a
+prepared, advancing counter. See `spec.md` §3.1.1 for hardware and admission.
+
 The decision is:
 
 ```text
@@ -114,6 +125,12 @@ The existing wake-preemption hints are separate: an urgent exact handoff needs
 only a runnable-peer probe, while an ordinary wake invokes the installed
 policy with elapsed runtime. Any voluntary block or yield clears a deferred
 request because that switch already begins a fresh slice.
+
+A core reschedule request is also honored when the timer lands
+inside a user syscall: it becomes the task's sticky deferred request and is
+consumed at the completed syscall boundary. It no longer waits for a later
+user-mode tick or the early fair-share floor. This changes request delivery,
+not the policy's quantum or permission to preempt an arbitrary kernel frame.
 
 This avoids an executor/idle/task round trip when the current task is the only
 useful work. A wake makes an idle borrower preemptible at the next tick. The

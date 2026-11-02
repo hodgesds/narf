@@ -3252,6 +3252,56 @@ fn smoke_scheduler_quantum_unit_default_nanos() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_quantum_unit_default_nanos);
 
+// Unsupported instruction-policy installation must be atomic with respect to
+// both the active unit and policy publication. Runs even without the feature.
+fn smoke_scheduler_instruction_unit_availability() -> TestResult {
+    use crate::{
+        active_quantum_unit, current_scheduler_name, install_scheduler, ClassScheduler, CpuId,
+        QuantumUnit, RunQueue, SchedPolicy, Scheduler, SchedulerError, TaskHandle,
+    };
+    use narf_capabilities::{Cap, Grant};
+
+    struct InstructionsPolicy;
+    impl Scheduler for InstructionsPolicy {
+        fn name(&self) -> &'static str {
+            "instructions-test"
+        }
+        fn quantum_unit(&self) -> QuantumUnit {
+            QuantumUnit::Instructions
+        }
+        fn pick_next(&self, _cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle> {
+            queue.front()
+        }
+    }
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    if install_scheduler(&cap, ClassScheduler).is_err() {
+        return TestResult::Fail("could not install baseline policy");
+    }
+    #[cfg(feature = "instruction-quantum")]
+    let available = crate::instructions::available();
+    #[cfg(not(feature = "instruction-quantum"))]
+    let available = false;
+    let result = install_scheduler(&cap, InstructionsPolicy);
+    let passed = if available {
+        result.is_ok()
+            && active_quantum_unit() == QuantumUnit::Instructions
+            && current_scheduler_name() == Some("instructions-test")
+    } else {
+        result == Err(SchedulerError::InstructionModeUnavailable)
+            && active_quantum_unit() == QuantumUnit::Nanos
+            && current_scheduler_name() == Some("class")
+    };
+    let restored = install_scheduler(&cap, ClassScheduler).is_ok();
+    if !passed || !restored {
+        return TestResult::Fail("instruction mode availability/publication contract");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/instructions",
+    smoke_scheduler_instruction_unit_availability
+);
+
 // A policy declaring `QuantumUnit::Cycles` must be REFUSED at install while PMU
 // cycle scheduling has no backend (no `pmu` feature) — a truthful contract, not
 // a silent downgrade — and the refusal must leave the active unit AND the live
@@ -3890,6 +3940,195 @@ fn smoke_scheduler_urgent_next_buddy_runs_first() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("scheduler", smoke_scheduler_urgent_next_buddy_runs_first);
+
+/// A wake during a dispatch round must become visible to the next policy
+/// selection. The parked high-priority task used to remain absent from READY
+/// until every task in the old round had run, defeating the class policy.
+fn smoke_scheduler_mid_round_wake_is_visible_to_policy() -> TestResult {
+    use alloc::sync::Arc;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll, Waker};
+    use narf_capabilities::{Cap, Grant};
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    struct State {
+        waker: IrqSafeSpinLock<Option<Waker>>,
+        next: AtomicUsize,
+        order: [AtomicUsize; 3],
+    }
+    impl State {
+        fn record(&self, tag: usize) {
+            let pos = self.next.fetch_add(1, Ordering::Relaxed);
+            if let Some(entry) = self.order.get(pos) {
+                entry.store(tag, Ordering::Relaxed);
+            }
+        }
+    }
+    struct Waiter {
+        state: Arc<State>,
+        armed: bool,
+    }
+    impl Future for Waiter {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if !self.armed {
+                *self.state.waker.lock() = Some(cx.waker().clone());
+                self.armed = true;
+                Poll::Pending
+            } else {
+                self.state.record(2);
+                Poll::Ready(())
+            }
+        }
+    }
+
+    let cap: Cap<crate::SchedPolicy, Grant> = Cap::bootstrap();
+    if crate::install_scheduler(&cap, crate::ClassScheduler).is_err() {
+        return TestResult::Fail("could not install class policy");
+    }
+    // Exercise both dispatch loops, including the one used by nested pumps.
+    for stepped in [true, false] {
+        crate::__reset_queues_for_test();
+        let state = Arc::new(State {
+            waker: IrqSafeSpinLock::new(None),
+            next: AtomicUsize::new(0),
+            order: [const { AtomicUsize::new(0) }; 3],
+        });
+        let mut spec = crate::TaskSpec::unthrottled();
+        spec.priority = crate::Priority::HIGH;
+        crate::spawn_with_spec(
+            Waiter {
+                state: state.clone(),
+                armed: false,
+            },
+            spec,
+        );
+        let waking = state.clone();
+        crate::spawn(async move {
+            waking.record(1);
+            let waker = waking.waker.lock().take();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        });
+        let sentinel = state.clone();
+        crate::spawn(async move {
+            sentinel.record(3);
+        });
+        if stepped {
+            for _ in 0..3 {
+                crate::poll_one_round();
+            }
+        } else {
+            crate::run_until_empty();
+        }
+        let order = core::array::from_fn::<_, 3, _>(|i| state.order[i].load(Ordering::Relaxed));
+        crate::__reset_queues_for_test();
+        if state.next.load(Ordering::Relaxed) != 3 || order != [1, 2, 3] {
+            return TestResult::Fail("mid-round wake was hidden from the next policy selection");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_mid_round_wake_is_visible_to_policy
+);
+
+fn smoke_wakeup_hooks_follow_policy_and_core_eligibility() -> TestResult {
+    use crate::policy::{DispatchReason, RunQueue, Scheduler, TaskHandle};
+    use crate::{CpuId, PeriodBudget, ResourceBudget, TaskSpec};
+    use core::sync::atomic::Ordering;
+
+    struct Custom {
+        bad: TaskHandle,
+        fallback: TaskHandle,
+    }
+    impl Scheduler for Custom {
+        fn name(&self) -> &'static str {
+            "wake-validation"
+        }
+        fn pick_next(&self, _: CpuId, _: &RunQueue<'_>) -> Option<TaskHandle> {
+            Some(self.fallback)
+        }
+        fn pick_wakeup(&self, _: CpuId, _: &RunQueue<'_>) -> Option<TaskHandle> {
+            Some(self.bad)
+        }
+    }
+    struct WrappedClass;
+    impl Scheduler for WrappedClass {
+        fn name(&self) -> &'static str {
+            "wrapped-class"
+        }
+        fn on_cpu_attach(&self, cpu: CpuId) {
+            crate::ClassScheduler.on_cpu_attach(cpu);
+        }
+        fn on_task_runtime(&self, cpu: CpuId, runtime: crate::policy::TaskRuntime) {
+            crate::ClassScheduler.on_task_runtime(cpu, runtime);
+        }
+        fn pick_next(&self, cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle> {
+            crate::ClassScheduler.pick_next(cpu, queue)
+        }
+        fn pick_wakeup(&self, cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle> {
+            crate::ClassScheduler.pick_wakeup(cpu, queue)
+        }
+    }
+    crate::__reset_queues_for_test();
+    let cpu = CpuId(narf_lib::percpu::current_cpu() as u32);
+    let mut spec = TaskSpec::unthrottled();
+    spec.budget = ResourceBudget::unthrottled().with_period(PeriodBudget::strict(1, 1 << 40));
+    let bad = crate::spawn_with_spec(async {}, spec);
+    let mut high = TaskSpec::unthrottled();
+    high.priority = crate::Priority::HIGH;
+    let priority_peer = crate::spawn_with_spec(async {}, high);
+    let wakee = crate::spawn(async {});
+    let mut ready = crate::READY[cpu.0 as usize].lock();
+    let queue = ready.as_mut().unwrap();
+    let now = narf_time::now_cycles();
+    let target = queue.iter_mut().find(|s| s.id == bad).unwrap();
+    target.account.prepare(now, &target.spec.budget);
+    target.account.charge_period(1, &target.spec.budget, false);
+    queue
+        .iter()
+        .find(|s| s.id == wakee)
+        .unwrap()
+        .awake
+        .blocking_wake
+        .store(true, Ordering::Release);
+    crate::blocking::mark_possible(cpu.0 as usize);
+    let (_, selected) =
+        crate::policy::pick_next_slot(Some(&crate::FifoScheduler), cpu, queue).unwrap();
+    let unchanged =
+        selected.id == priority_peer && selected.dispatch_reason == DispatchReason::Policy;
+    queue.insert(1, selected);
+    let (_, selected) =
+        crate::policy::pick_next_slot(Some(&crate::ClassScheduler), cpu, queue).unwrap();
+    let priority_wins = selected.id == priority_peer;
+    queue.insert(1, selected);
+    let (_, selected) = crate::policy::pick_next_slot(Some(&WrappedClass), cpu, queue).unwrap();
+    let delegated_priority_wins = selected.id == priority_peer;
+    queue.insert(1, selected);
+    let policy = Custom {
+        bad: TaskHandle::from_id(bad),
+        fallback: TaskHandle::from_id(wakee),
+    };
+    let (_, selected) = crate::policy::pick_next_slot(Some(&policy), cpu, queue).unwrap();
+    let custom_wins = selected.id == wakee && selected.dispatch_reason == DispatchReason::Policy;
+    drop(ready);
+    crate::__reset_queues_for_test();
+    if !unchanged || !priority_wins || !delegated_priority_wins || !custom_wins {
+        return TestResult::Fail(
+            "wake hook bypassed FIFO, class priority, throttle, or custom fallback",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_wakeup_hooks_follow_policy_and_core_eligibility
+);
 
 // An urgent handoff is a core hint, not permission to bypass a pluggable
 // policy. External policies must still observe the queue and the core then
@@ -4960,6 +5199,9 @@ fn smoke_scheduler_policy_observes_cpu_state_edges() -> TestResult {
     static TASK_ENQUEUE: AtomicUsize = AtomicUsize::new(0);
     static TASK_DEQUEUE: AtomicUsize = AtomicUsize::new(0);
     static BAD_TASK_REASON: AtomicUsize = AtomicUsize::new(0);
+    static RUNTIME: AtomicUsize = AtomicUsize::new(0);
+    static EXPECTED_RUNTIME_TASK: AtomicUsize = AtomicUsize::new(0);
+    static BAD_RUNTIME: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Copy, Clone, Debug)]
     struct StateObserver;
@@ -4971,6 +5213,20 @@ fn smoke_scheduler_policy_observes_cpu_state_edges() -> TestResult {
 
         fn pick_next(&self, _cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle> {
             queue.front()
+        }
+
+        fn on_task_runtime(&self, cpu: CpuId, runtime: crate::policy::TaskRuntime) {
+            if cpu != CpuId::BOOT {
+                return;
+            }
+            RUNTIME.fetch_add(1, Ordering::Relaxed);
+            if runtime.task.task_id().raw() as usize
+                != EXPECTED_RUNTIME_TASK.load(Ordering::Relaxed)
+                || runtime.reason != crate::policy::DispatchReason::Policy
+                || crate::READY[cpu.0 as usize].try_lock().is_none()
+            {
+                BAD_RUNTIME.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         fn on_install(&self) {
@@ -5056,6 +5312,8 @@ fn smoke_scheduler_policy_observes_cpu_state_edges() -> TestResult {
     TASK_ENQUEUE.store(0, Ordering::Relaxed);
     TASK_DEQUEUE.store(0, Ordering::Relaxed);
     BAD_TASK_REASON.store(0, Ordering::Relaxed);
+    RUNTIME.store(0, Ordering::Relaxed);
+    BAD_RUNTIME.store(0, Ordering::Relaxed);
     crate::__reset_queues_for_test();
     crate::cpu_lifecycle::__test_reset_online_mask();
 
@@ -5067,7 +5325,8 @@ fn smoke_scheduler_policy_observes_cpu_state_edges() -> TestResult {
     // An empty executor enters Idle exactly once. Dispatching a task produces
     // one Active edge, and completing the now-empty queue enters Idle again.
     crate::run_until_empty();
-    spawn(async {});
+    let task = spawn(async {});
+    EXPECTED_RUNTIME_TASK.store(task.raw() as usize, Ordering::Relaxed);
     crate::run_until_empty();
 
     let lifecycle_cap: Cap<CpuLifecycle, Invoke> = Cap::bootstrap();
@@ -5108,6 +5367,9 @@ fn smoke_scheduler_policy_observes_cpu_state_edges() -> TestResult {
         || BAD_TASK_REASON.load(Ordering::Relaxed) != 0
     {
         return TestResult::Fail("task queue enter/leave callbacks were not balanced");
+    }
+    if RUNTIME.load(Ordering::Relaxed) != 1 || BAD_RUNTIME.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("runtime callback lost task attribution or ran under READY lock");
     }
     if lifecycle_edges != (1, 1, 1) {
         return TestResult::Fail("Starting/Draining/Offline callbacks were not edge-triggered");

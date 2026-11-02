@@ -95,6 +95,9 @@ pub fn forward_progress_count() -> u64;  // fatal-watchdog snapshot
 pub fn note_urgent_wake_preempt(woken: u64);
 /// Consume one exact waiter's waker; preserve ordinary remote placement.
 pub fn wake_preempt_task(waker: core::task::Waker, expected_task: u64);
+/// Alias a native task waker with advisory blocking-I/O wake metadata.
+pub fn blocking_io_waker(waker: &core::task::Waker, expected_task: u64)
+    -> core::task::Waker;
 pub fn dbg_cpu_stall(cpu: usize) -> (usize, usize, bool, bool);
 pub fn dbg_slot_state(task: u64)
     -> Option<(bool, u32, usize, u64, u32, bool)>;
@@ -102,9 +105,18 @@ pub fn dbg_ready_slots(cpu: usize)
     -> Vec<(u64, bool, u32, u64, bool)>;
 ```
 
-Executor internals are per-CPU queues plus global stealing. The specified
-design requires every task to carry `DomainId` plus architecture-neutral
-`DomainSavedState`, with the executor switching domain before polling. The
+Executor internals are per-CPU queues plus global stealing. The dispatch
+contract folds pending target-CPU wake activations into READY before
+each policy selection in both `poll_one_round` and `run_until_empty`. A wake
+published during the preceding task's execution is therefore visible at the
+next selection rather than waiting for the rest of an executor round. Wakes
+racing the drain remain pending for the following boundary. The round's
+initial queue length still bounds its number of polls; it does not promise a
+distinct task for each poll. Class, priority and budget checks continue to
+determine which activated task runs.
+
+The specified design requires every task to carry `DomainId` plus
+architecture-neutral `DomainSavedState`, with the executor switching domain before polling. The
 current `TaskSlot` carries an opaque architecture-neutral state and switches it
 at cooperative poll boundaries. Common trap entry neutralises domain rights,
 while the private direct-context-transfer path saves and restores the
@@ -337,8 +349,12 @@ the public interface below:
 ```rust
 pub trait Scheduler: Any + Send + Sync + 'static {
     fn name(&self) -> &'static str;
+    fn quantum_unit(&self) -> QuantumUnit { QuantumUnit::Nanos }
     fn pick_next(&self, cpu: CpuId, queue: &RunQueue<'_>)
         -> Option<TaskHandle>;
+    fn pick_wakeup(&self, cpu: CpuId, queue: &RunQueue<'_>)
+        -> Option<TaskHandle> { None }
+    fn on_task_runtime(&self, cpu: CpuId, runtime: TaskRuntime) { }
     fn on_install(&self) { }
     fn on_cpu_attach(&self, cpu: CpuId) { }
     fn on_cpu_detach(&self, cpu: CpuId) { }
@@ -348,6 +364,7 @@ pub trait Scheduler: Any + Send + Sync + 'static {
 }
 
 pub struct TaskMeta {
+    pub wake_reason: Option<WakeReason>,
     pub id: TaskId,
     pub work_kind: WorkKind,
     pub class: SchedClass,
@@ -362,7 +379,15 @@ pub struct TaskMeta {
 }
 
 pub enum WorkKind { UserThread, KernelThread, AsyncTask, SoftIrq, Idle }
+pub enum WakeReason { BlockingIo }
+pub enum DispatchReason { Policy, Wakeup }
+pub struct TaskRuntime {
+    pub task: TaskHandle,
+    pub cycles: u64,
+    pub reason: DispatchReason,
+}
 pub enum SchedClass { Idle, Batch, Default, Interactive, Realtime }
+pub enum QuantumUnit { Nanos, Cycles, Instructions }
 pub enum TaskEnqueueReason { Admitted, Requeued, Migrated, PolicyReplacement }
 pub enum TaskDequeueReason { Selected, Migrated, PolicyReplacement }
 pub enum TaskQueueEvent {
@@ -384,6 +409,48 @@ pub struct CpuIdleMeta {
 }
 ```
 
+`QuantumUnit::Instructions` is an opt-in slice allowance under the
+`instruction-quantum` Cargo feature (forwarded by `narf-frame`).
+`StackfulOptions::instruction_limit` configures the work allowance independently
+of `slice_cycles`, which remains the TSC time ceiling. Defaults are 1,000,000
+retired instructions and the existing `DEFAULT_SLICE_CYCLES` time ceiling.
+Either boundary requests rescheduling when runnable competition exists;
+periodic CPU caps and virtual-runtime accounting remain time-based. This is
+instruction execution, not a measure of application-level useful work.
+
+The core samples a dedicated local counter at each continuation entry and
+checks its delta on timer ticks, deferring syscall rescheduling to a safe exit.
+Direct handoffs and nested stackful polls pause the source account before
+entering a peer and resume it without refunding its already-used allowance.
+AMD uses IRPERF
+(`CPUID.80000008H:EBX[1]`, MSR `C000_00E9`, HWCR bit 30), excluding the early
+Zen1 models affected by erratum 1054. Intel uses architectural perfmon v2+
+fixed counter 0 with OS+USR enabled, AnyThread/PMI disabled, and the enumerated
+counter width. Initial setup refuses an already enabled Intel fixed counter 0,
+preserves unrelated control bits, catches unavailable/locked MSRs, and verifies
+that counting advances. The counter remains reserved for the boot; userspace
+perf events continue to use their existing programmable counter allocations.
+The aarch64 backend is unavailable in this initial implementation.
+
+Each physical executor prepares its own counter before dispatch. Explicit
+installation returns `SchedulerError::InstructionModeUnavailable`, before
+publishing a policy, if the feature is absent or any physically started or
+logically online CPU is unprepared or unsupported. Logical CPU bring-up returns
+`HotPlugError::Busy` rather than
+admitting such a CPU while instruction mode is active. The counter is never
+probed remotely or from a timer/NMI. The task captures its instruction-mode
+baseline at entry so a rolling policy replacement cannot reinterpret a stale
+baseline. Migration gets a fresh local baseline; cross-CPU samples are rejected.
+
+Hardware counter deltas use width-masked wrapping subtraction. The existing
+hard-IRQ guards and an instruction-feature-only x86 NMI guard subtract measured
+interrupt work, including nested spans exactly once. Entry/exit instrumentation
+and context-switch boundary overhead remain part of the measured intervals;
+this is not an exact deterministic instruction boundary. Counter sampling uses
+no overflow interrupt and cannot preempt a non-preemptible continuation. Hrtick
+continues to arm only the separate TSC ceiling. `/sys/kernel/debug/sched/quantum_unit`
+reports `instructions` while that unit is active.
+
 `RunQueue` is a read-only, callback-scoped projection. It exposes queue length,
 the first opaque handle, and iteration over `(TaskHandle, TaskMeta)` snapshots;
 it never exposes `TaskSlot`, futures, saved domain state, stacks, queue locks,
@@ -401,6 +468,32 @@ shared `Arc` reference-count write; it touches only the CPU-local policy slot
 and run queue. `pick_next` executes with both local locks held and therefore
 must not allocate, sleep, re-enter the scheduler, or acquire an IRQ-contended
 lock.
+
+`pick_wakeup` is an optional policy decision over per-task provider wake
+metadata. Its default preserves ordinary `pick_next` ordering. The core
+validates any returned handle at the highest eligibility tier and retains
+ClassScheduler's class/priority ordering. The ordinary policy request remains
+observable and supplies the fallback. Wake metadata is advisory, retained
+independently for every task until execution begins; it neither transfers a
+continuation nor changes affinity, budget authority or wake delivery.
+
+`on_task_runtime` receives the core's already-computed charged TSC cycles,
+excluding IRQ and direct-peer execution, after each poll and before the next
+selection. It runs under the CPU policy lock without a READY lock. The current
+policy receives the event even when execution began before replacement; it
+must tolerate unknown task handles and must not allocate or re-enter scheduling.
+`DispatchReason::Wakeup` means the policy granted a preferred dispatch. It is
+charged even when the wakee is first in ordinary order, so repeated
+wake/selection pairs cannot obtain unaccounted preference.
+
+ClassScheduler owns a CPU-local blocking-I/O credit policy: one fair-share
+quantum (a quarter of a default task slice) of credit, charged by actual
+preferred runtime, repaid by ordinary runtime, capped at one fair-share quantum. Overshoot remains debt. Repeated wakes and
+short polls do not refill it. The core owns wake metadata, runtime measurement,
+validation and context transfer; it does not implement this credit decision.
+Other schedulers inherit the no-preference/no-op defaults or implement their
+own behavior through the same hooks. Connected AF_UNIX stream blockers use
+the tagged waker; persistent poll/epoll observers keep their normal wakers.
 
 `on_task_queue_event` is the task-control lifecycle boundary. `Enqueued` means
 the copied task is now in that CPU policy's selectable set; `Dequeued` means it

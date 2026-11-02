@@ -30,11 +30,21 @@ pub struct InterruptAccountGuard {
     cpu: usize,
     kind: InterruptKind,
     outermost: bool,
+    #[cfg(feature = "instruction-quantum")]
+    instruction_start: Option<crate::instructions::Sample>,
+    /// The instruction feature also brackets real NMIs. Remove those spans
+    /// from an outer hard IRQ's time before adding the separate NMI account.
+    #[cfg(feature = "instruction-quantum")]
+    nmi_cycles_at_entry: u64,
     _not_send: PhantomData<*mut ()>,
 }
 
 pub fn interrupt_account_enter(kind: InterruptKind) -> InterruptAccountGuard {
     let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+    #[cfg(feature = "instruction-quantum")]
+    let instruction_start = crate::instructions::irq_enter(cpu);
+    #[cfg(feature = "instruction-quantum")]
+    let nmi_cycles_at_entry = NMI_CYCLES[cpu].load(Ordering::Acquire);
     let (depth, start) = match kind {
         InterruptKind::HardIrq => (&HARDIRQ_DEPTH[cpu], &HARDIRQ_START[cpu]),
         InterruptKind::Nmi => (&NMI_DEPTH[cpu], &NMI_START[cpu]),
@@ -47,12 +57,20 @@ pub fn interrupt_account_enter(kind: InterruptKind) -> InterruptAccountGuard {
         cpu,
         kind,
         outermost,
+        #[cfg(feature = "instruction-quantum")]
+        instruction_start,
+        #[cfg(feature = "instruction-quantum")]
+        nmi_cycles_at_entry,
         _not_send: PhantomData,
     }
 }
 
 impl Drop for InterruptAccountGuard {
     fn drop(&mut self) {
+        #[cfg(feature = "instruction-quantum")]
+        if let Some(start) = self.instruction_start {
+            crate::instructions::irq_exit(start);
+        }
         let (depth, start, cycles) = match self.kind {
             InterruptKind::HardIrq => (
                 &HARDIRQ_DEPTH[self.cpu],
@@ -70,6 +88,16 @@ impl Drop for InterruptAccountGuard {
         if self.outermost {
             debug_assert_eq!(previous, 1);
             let elapsed = narf_time::now_cycles().saturating_sub(start.swap(0, Ordering::AcqRel));
+            #[cfg(feature = "instruction-quantum")]
+            let elapsed = if self.kind == InterruptKind::HardIrq {
+                elapsed.saturating_sub(
+                    NMI_CYCLES[self.cpu]
+                        .load(Ordering::Acquire)
+                        .saturating_sub(self.nmi_cycles_at_entry),
+                )
+            } else {
+                elapsed
+            };
             cycles.fetch_add(elapsed, Ordering::Relaxed);
         }
     }

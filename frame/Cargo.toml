@@ -135,6 +135,8 @@ hrtick = ["narf-scheduler/hrtick"]
 # pmu: enable QuantumUnit::Cycles (APERF work-cycle scheduling) in the
 # scheduler. Forwarded to narf-scheduler. Off by default.
 pmu = ["narf-scheduler/pmu"]
+# Opt-in retired-instruction slice allowance (AMD IRPERF / Intel fixed ctr0).
+instruction-quantum = ["narf-scheduler/instruction-quantum"]
 
 # Linux-shaped syscall surface: epoll, eventfd, timerfd, clone3,
 # mprotect, madvise, and dynamic-linker plumbing.  Forwarded from

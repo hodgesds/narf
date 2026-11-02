@@ -37,6 +37,10 @@ hrtick = []
 # stackful tasks not draining; the "ONION #3" wake-race family). Do not add `pmu`
 # to a ktest job until that latent race is fixed.
 pmu = []
+# Dedicated AMD IRPERF / Intel fixed-counter instruction quanta, sampled at
+# existing safe preemption points with an independent TSC time ceiling.
+# Separate from the experimental APERF `pmu` feature; off by default.
+instruction-quantum = []
 
 # cgroup-v2 cpu + cpuset controller seam: exposes hooks the cgroupfs
 # `cpu` / `cpuset` controllers install at boot to apply per-cgroup
