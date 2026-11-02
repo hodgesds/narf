@@ -118,6 +118,7 @@ fn smoke_ath10k_coexistence_native_peer_restart_and_response_types_six_dialects(
         width80: false,
         center2: None,
         half_dbm: 34,
+        hint: None,
     };
     for (d, restart_id, peer_id) in [
         (Dialect::Main, 0x5004, 0x6004),
@@ -128,7 +129,7 @@ fn smoke_ath10k_coexistence_native_peer_restart_and_response_types_six_dialects(
         (Dialect::Tlv, 0x5004, 0x6004),
     ] {
         let wire = wire::Wire::new(d);
-        let restart = wire.coexistence_restart(permission, 100, 3).unwrap();
+        let restart = wire.coexistence_restart(&permission, 100, 3).unwrap();
         let word = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
         let channel = if d == Dialect::Tlv { 84 } else { 4 };
         let owner = if d == Dialect::Tlv { 8 } else { 28 };

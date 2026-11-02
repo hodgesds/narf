@@ -11,6 +11,7 @@ fn smoke_ath10k_wmi_station_prepare_all_native_dialects() -> TestResult {
         country: *b"US",
         frequency: 2412,
         half_dbm: 34,
+        hint: None,
     };
     for (dialect, rd, power, start, peer) in [
         (Dialect::Main, RD_MAIN, POWER_MAIN, START_MAIN, PEER_MAIN),
@@ -21,9 +22,9 @@ fn smoke_ath10k_wmi_station_prepare_all_native_dialects() -> TestResult {
         (Dialect::Tlv, RD_TLV, POWER_TLV, START_TLV, PEER_TLV),
     ] {
         let w = Wire::new(dialect);
-        if w.domain(p).as_deref() != Ok(rd)
-            || w.power(p).as_deref() != Ok(power)
-            || w.start_station(p, 100, 1).as_deref() != Ok(start)
+        if w.domain(&p).as_deref() != Ok(rd)
+            || w.power(&p).as_deref() != Ok(power)
+            || w.start_station(&p, 100, 1).as_deref() != Ok(start)
             || w.peer([2, 8, 9, 10, 11, 12]).as_deref() != Ok(peer)
         {
             return TestResult::Fail(

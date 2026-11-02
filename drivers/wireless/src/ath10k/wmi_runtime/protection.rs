@@ -41,7 +41,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         {
             return Err(Error::Unsupported);
         }
-        let permission = peer.permission;
+        let permission = peer.permission.clone();
         let source = self.htt.wmi.htc.transport.current_sources();
         let validate = || permission.check(&current()?);
         validate()?;

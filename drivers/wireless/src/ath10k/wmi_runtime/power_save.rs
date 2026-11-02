@@ -22,7 +22,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.failed || self.station_link().is_none() {
             return Err(Error::Failed);
         }
-        let previous = self.peer.as_ref().ok_or(Error::Failed)?.permission;
+        let previous = self.peer.as_ref().ok_or(Error::Failed)?.permission.clone();
         let validate = || previous.check(&current()?);
         validate()?;
         let mut commands = Vec::new();

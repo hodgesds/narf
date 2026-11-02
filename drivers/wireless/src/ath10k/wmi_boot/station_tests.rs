@@ -154,7 +154,14 @@ pub(super) async fn station_send(m: &mut RadioModel, bytes: &[u8]) -> Result<(),
         let at = if dialect == Dialect::Tlv { 12 } else { 4 };
         match phase {
             0 => {
-                for (i, value) in [0x3a, 0x3a, 0x3a, 0x10, 0x10].into_iter().enumerate() {
+                let words = if m.inner.inner.factory == 0x64 {
+                    // Actual World EEPROM pair and NO_CTL for both bands;
+                    // the host beacon receipt does not rewrite factory RD.
+                    [0x64, 0x64, 0x64, 0xff, 0xff]
+                } else {
+                    [0x3a, 0x3a, 0x3a, 0x10, 0x10]
+                };
+                for (i, value) in words.into_iter().enumerate() {
                     u32at(&mut expected, at + i * 4, value);
                 }
             }

@@ -165,7 +165,7 @@ impl Wire {
     /// enabled row); a granted 80 MHz receipt lists all four segment rows.
     pub fn station_ht40_channels(
         &self,
-        permission: crate::ath10k::regulatory::Permission,
+        permission: &crate::ath10k::regulatory::Permission,
         vht: bool,
     ) -> Result<Vec<u8>, Error> {
         let secondary = permission.secondary.ok_or(Error::Unsupported)?;

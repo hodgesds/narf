@@ -61,6 +61,8 @@ pub(super) struct Native {
     packet_gate: Option<super::power_policy::Gate>,
     mailbox_cursor: u8,
     mailbox_pending: bool,
+    tracking_maintenance: bool,
+    tracking_sequence: u16,
 }
 impl core::fmt::Debug for Native {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -163,6 +165,8 @@ impl Native {
             packet_gate: None,
             mailbox_cursor: 0,
             mailbox_pending: false,
+            tracking_maintenance: false,
+            tracking_sequence: 3,
         };
         owner
             .tx
@@ -250,7 +254,13 @@ impl Native {
             return Err(Error::State);
         }
         let active = matches!(self.state, State::Active | State::Commands | State::Packets);
-        let gate = self.packet_gate.clone();
+        let gate = self.packet_gate.clone().map(|g| {
+            if self.tracking_maintenance {
+                g.without_power_tracking()
+            } else {
+                g
+            }
+        });
         let access = || {
             crate::rtw88::pci_park::invoke(&self.cap, || {
                 self.command(active)?;
@@ -660,8 +670,15 @@ unsafe impl Registers for Native {
         result
     }
     fn submit_h2c(&mut self, packet: &[u8; 32]) -> Result<(), Error> {
-        if self.state != State::Commands || self.command_ring.pending() {
+        let mission = self.state == State::Packets && self.tracking_maintenance;
+        if (self.state != State::Commands && !mission)
+            || self.command_ring.pending()
+            || mission && *packet != super::command::iqk8821c_associated(self.tracking_sequence)
+        {
             return Err(Error::State);
+        }
+        if mission {
+            self.tracking_sequence = self.tracking_sequence.checked_add(1).ok_or(Error::State)?;
         }
         let result = (|| {
             let index = self.read32(0x132c)?;
@@ -716,7 +733,10 @@ unsafe impl Registers for Native {
         result
     }
     fn poll_h2c(&mut self) -> Result<bool, Error> {
-        if self.state != State::Commands || !self.command_ring.pending() {
+        if (self.state != State::Commands
+            && !(self.state == State::Packets && self.tracking_maintenance))
+            || !self.command_ring.pending()
+        {
             return Err(Error::State);
         }
         let result = (|| {
@@ -771,7 +791,8 @@ unsafe impl Registers for Native {
         if !matches!(self.state, State::Calibrated | State::Packets) {
             return Err(Error::State);
         }
-        crate::rtw88::pci_park::invoke(&self.cap, || {
+        let cap = self.cap;
+        crate::rtw88::pci_park::invoke(&cap, || {
             self.command(self.state == State::Packets)?;
             self.check_packet_permission()
         })
@@ -827,6 +848,14 @@ unsafe impl Registers for Native {
         gate.invoke(|| self.configure_packet_profile(profile))
     }
     fn station_profile_readback(&mut self) -> Result<(), Error> {
+        if let Some(w) = self
+            .packet_gate
+            .as_ref()
+            .and_then(super::power_policy::Gate::power_tracking)
+        {
+            w.readback(|r| self.read32(r))?;
+            w.temperature(((self.read32(0x2908)? >> 10) & 63) as u8)?;
+        }
         if let Some(g) = self
             .packet_gate
             .as_ref()
@@ -901,6 +930,193 @@ unsafe impl Registers for Native {
                 .ok_or(Error::State)?
                 .with_protection(g)?,
         );
+        Ok(())
+    }
+    fn station_power_tracking_request(
+        &mut self,
+        t: u8,
+        dm: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> Result<super::PowerTrackingRequest, Error> {
+        self.station_allowed()?;
+        let gate = self.packet_gate.clone().ok_or(Error::State)?;
+        if let Some(g) = gate.power_tracking() {
+            return Ok(g.request());
+        }
+        if self.read32(0xc94)? & 0x7e != 0 {
+            return Err(Error::Prerequisite);
+        }
+        let scale = (self.read32(0xc1c)? >> 21) as u16;
+        super::tracking8821c::request(&gate, t, scale, dm.as_ref())
+    }
+    fn station_power_tracking_extension(
+        &mut self,
+        thermal: u8,
+        dm: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> Result<Option<alloc::sync::Arc<super::tracking8821c::Grant>>, Error> {
+        self.station_allowed()?;
+        if self.device.id.device != 0xc821 {
+            return Ok(None);
+        }
+        let gate = self.packet_gate.clone().ok_or(Error::State)?;
+        if gate.ht_grant().is_none() || gate.power_tracking().is_some() {
+            return Ok(None);
+        }
+        if self.read32(0xc94)? & 0x7e != 0 {
+            return Ok(None);
+        }
+        let swing = (self.read32(0xc1c)? >> 21) as u16;
+        // Optional authenticated continuation: absent/unqualified W preserves
+        // the original static profile and performs no emitting mutation.
+        Ok(super::tracking8821c::Source::Registered
+            .load(gate, thermal, swing, dm)
+            .ok())
+    }
+    fn station_bind_power_tracking(
+        &mut self,
+        g: alloc::sync::Arc<super::tracking8821c::Grant>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        g.readback(|r| self.read32(r))?;
+        self.packet_gate = Some(
+            self.packet_gate
+                .as_ref()
+                .ok_or(Error::State)?
+                .with_power_tracking(g)?,
+        );
+        Ok(())
+    }
+    fn station_power_tracking_begin(
+        &mut self,
+        g: &alloc::sync::Arc<super::tracking8821c::Grant>,
+        restore: bool,
+    ) -> Result<bool, Error> {
+        if self.state != State::Packets
+            || self.tracking_maintenance
+            || self.mailbox_pending
+            || self.command_ring.pending()
+            || self
+                .packet_gate
+                .as_ref()
+                .and_then(super::power_policy::Gate::power_tracking)
+                .as_ref()
+                .is_none_or(|w| !alloc::sync::Arc::ptr_eq(w, g))
+        {
+            return Err(Error::State);
+        }
+        // Only this original exclusive owner may inspect/restore a revoked W.
+        // Packet/copy paths keep the unchanged W-aware Gate and cannot use it.
+        self.tracking_maintenance = true;
+        let result = (|| {
+            self.packet_gate
+                .as_ref()
+                .ok_or(Error::State)?
+                .invoke_base(|| Ok(()))?;
+            g.readback(|r| self.read32(r))?;
+            if !self.station_power_tracking_quiet()? {
+                return Ok(false);
+            }
+            if restore {
+                g.begin_restore()?;
+            } else {
+                g.begin()?;
+            }
+            Ok(true)
+        })();
+        if !matches!(result, Ok(true)) {
+            self.tracking_maintenance = false;
+        }
+        result
+    }
+    fn station_power_tracking_quiet(&mut self) -> Result<bool, Error> {
+        if !self.tracking_maintenance || self.mailbox_pending || self.command_ring.pending() {
+            return Err(Error::State);
+        }
+        if !self
+            .with_packet(|core, port| {
+                core.maintenance_quiet(|r| super::packet_core::Port::index(port, r))
+            })
+            .map_err(|_| Error::State)?
+        {
+            return Ok(false);
+        }
+        for r in super::dma_stop::TX_INDEX {
+            let v = self.read32(r)?;
+            if v == u32::MAX {
+                return Err(Error::Gone);
+            }
+            if v & 0xfff != (v >> 16) & 0xfff {
+                return Ok(false);
+            }
+        }
+        if self.read16(0x10c)? != 0xc5a0 {
+            return Err(Error::Prerequisite);
+        }
+        for r in [0x230, 0x234, 0x238, 0x23c] {
+            let n = if r == 0x23c { 14 } else { 16 };
+            if self.read16(r)? != n {
+                return Err(Error::Prerequisite);
+            }
+            if self.read16(r + 2)? != n {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    fn station_power_tracking_iqk(&mut self) -> Result<(), Error> {
+        if !self.tracking_maintenance {
+            return Err(Error::State);
+        }
+        let g = self
+            .packet_gate
+            .as_ref()
+            .and_then(super::power_policy::Gate::power_tracking)
+            .ok_or(Error::State)?;
+        let packet = super::command::iqk8821c_associated(self.tracking_sequence);
+        g.authority(|| self.submit_h2c(&packet))
+    }
+    fn station_power_tracking_finish(
+        &mut self,
+        p: Option<super::tracking8821c::Program>,
+    ) -> Result<(), Error> {
+        if !self.tracking_maintenance
+            || self.command_ring.pending()
+            || !self.station_power_tracking_quiet()?
+            || self.read8(0x522)? != 255
+            || self.read32(super::dma_stop::RXPKT_NUM)?
+                & (super::dma_stop::RXDMA_IDLE | super::dma_stop::RW_RELEASE)
+                != (super::dma_stop::RXDMA_IDLE | super::dma_stop::RW_RELEASE)
+        {
+            return Err(Error::Prerequisite);
+        }
+        let gate = self.packet_gate.clone().ok_or(Error::State)?;
+        let g = gate.power_tracking().ok_or(Error::State)?;
+        let actual = p.unwrap_or_else(|| g.initial_program());
+        super::tracking8821c::Grant::read_program(actual, &mut |r| self.read32(r))?;
+        gate.ht_grant()
+            .ok_or(Error::State)?
+            .readback(|r| self.read32(r))?;
+        if p.is_some() {
+            g.temperature(((self.read32(0x2908)? >> 10) & 63) as u8)?;
+        }
+        let rx = self.read32(super::dma_stop::RXPKT_NUM)?;
+        self.write32(
+            super::dma_stop::RXPKT_NUM,
+            rx & !super::dma_stop::RW_RELEASE,
+        )?;
+        self.write8(0x522, 0)?;
+        if self.read32(super::dma_stop::RXPKT_NUM)? & super::dma_stop::RW_RELEASE != 0
+            || self.read8(0x522)? != 0
+        {
+            return Err(Error::Prerequisite);
+        }
+        match p {
+            Some(p) => g.commit(p)?,
+            None => {
+                g.retire();
+                self.packet_gate = Some(gate.without_power_tracking());
+            }
+        }
+        self.tracking_maintenance = false;
         Ok(())
     }
     fn station_bind_continuation(
@@ -1224,7 +1440,15 @@ impl Native {
         self.published = false;
         Ok(())
     }
-    fn check_packet_permission(&self) -> Result<(), Error> {
+    fn check_packet_permission(&mut self) -> Result<(), Error> {
+        if let Some(g) = self
+            .packet_gate
+            .as_ref()
+            .and_then(super::power_policy::Gate::power_tracking)
+        {
+            g.readback(|r| self.read32(r))?;
+            g.temperature(((self.read32(0x2908)? >> 10) & 63) as u8)?;
+        }
         self.packet_gate
             .as_ref()
             .ok_or(Error::State)?

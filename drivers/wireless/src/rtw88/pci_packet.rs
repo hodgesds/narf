@@ -77,6 +77,7 @@ impl Native {
         if !matches!(self.state, State::Calibrated | State::Packets) {
             return Err(packet::Error::State);
         }
+        self.check_packet_permission().map_err(access_error)?;
         let gate = self.packet_gate.clone().ok_or(packet::Error::Access)?;
         let result = gate
             .invoke(|| {
@@ -117,7 +118,7 @@ impl Native {
             }
         }
     }
-    fn with_packet<T>(
+    pub(super) fn with_packet<T>(
         &mut self,
         operation: impl FnOnce(&mut Core, &mut Self) -> Result<T, packet::Error>,
     ) -> Result<T, packet::Error> {
@@ -498,6 +499,8 @@ fn smoke_rtw8822ce_native_packet_revocation_precedes_cpu_dma_config_and_mmio(
         packet_gate: None,
         mailbox_cursor: 0,
         mailbox_pending: false,
+        tracking_maintenance: false,
+        tracking_sequence: 3,
     };
     cap.revoke();
     // Invalid physical config/BAR and absent allocations are deliberate. The

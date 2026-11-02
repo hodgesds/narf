@@ -84,7 +84,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn retained_station_permission(&self) -> Result<Permission, Error> {
         self.peer
             .as_ref()
-            .map(|p| p.permission)
+            .map(|p| p.permission.clone())
             .ok_or(Error::Failed)
     }
     pub(in crate::ath10k) fn ht_capabilities(&self) -> Option<[u8; 26]> {
@@ -146,6 +146,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let caps = self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?;
         let own = self.ready.ok_or(Error::Failed)?.mac;
         let chains = self.chains.ok_or(Error::Failed)?;
+        let hint = self.beacon_hints.receipt(domain);
         let cached = self
             .scan_cache
             .iter()
@@ -158,9 +159,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 if let (Some(partner), Some(wide)) =
                     (profile.secondary, profile.vht.and_then(|v| v.wide))
                 {
-                    if let Ok(permission) =
-                        Permission::discontiguous(caps, domain, frequency, partner, wide.center2)
-                    {
+                    if let Ok(permission) = Permission::discontiguous_with_hint(
+                        caps,
+                        domain,
+                        frequency,
+                        partner,
+                        wide.center2,
+                        hint.clone(),
+                    ) {
                         if permission.center == profile.center {
                             return Ok((permission, Some(profile)));
                         }
@@ -172,16 +178,30 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // offered only when the whole 80 MHz segment is host-permitted. The
         // occupied receipt then matches the AP's selected 20/40/80 geometry;
         // a VHT offer the AP or policy cannot take falls back to HT40/HT20.
-        if let Some(wide) = pair
-            .filter(|_| ht::vht_supported(caps))
-            .and_then(|s| Permission::occupied_width(caps, domain, frequency, Some(s), true).ok())
-        {
+        if let Some(wide) = pair.filter(|_| ht::vht_supported(caps)).and_then(|s| {
+            Permission::occupied_width_with_hint(
+                caps,
+                domain,
+                frequency,
+                Some(s),
+                true,
+                hint.clone(),
+            )
+            .ok()
+        }) {
             if let Ok(Some(v)) = ht::Profile::offer(caps, cached, own, ht::Phy::Vht, chains) {
                 if let Some(vht) = v.vht {
                     let permission = if vht.eighty {
                         Ok(wide)
                     } else {
-                        Permission::occupied(caps, domain, frequency, v.secondary)
+                        Permission::occupied_width_with_hint(
+                            caps,
+                            domain,
+                            frequency,
+                            v.secondary,
+                            false,
+                            hint.clone(),
+                        )
                     };
                     if let Ok(permission) = permission {
                         if permission.center != v.center
@@ -210,7 +230,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             h.secondary.is_some()
                 && (frequency >= 3000 || self.coexistence_geometry(bssid, frequency, h.secondary))
         }) {
-            if let Ok(permission) = Permission::occupied(caps, domain, frequency, h.secondary) {
+            if let Ok(permission) = Permission::occupied_width_with_hint(
+                caps,
+                domain,
+                frequency,
+                h.secondary,
+                false,
+                hint.clone(),
+            ) {
                 if permission.center != h.center {
                     return Err(Error::Unsupported);
                 }
@@ -222,7 +249,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // because its negotiated offer narrowed to20 would still advertise40
         // without the occupied40 permission whose native owner it promises.
         Ok((
-            Permission::from_domain(caps, domain, frequency)?,
+            Permission::occupied_width_with_hint(caps, domain, frequency, None, false, hint)?,
             ht::Profile::offer(caps, cached, own, ht::Phy::Ht20, chains)?,
         ))
     }
@@ -445,7 +472,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             frequency: peer.permission.frequency,
             center_frequency: peer.permission.center,
             second_center_frequency: peer.permission.center2,
-            bandwidth_mhz: bandwidth(peer.permission),
+            bandwidth_mhz: bandwidth(&peer.permission),
             peer_id: peer.mapped()?,
             maximum_power_dbm: peer.permission.half_dbm / 2,
         })
@@ -498,10 +525,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         let beacon_interval = bss.beacon_interval;
         let (permission, ht) = self.station_profile(domain, bssid, frequency)?;
-        self.bind_coexistence_width(bssid, permission)?;
-        let rd = self.wire.domain(permission)?;
-        let power = self.wire.power(permission)?;
-        let mut start = self.wire.start_station(permission, beacon_interval, dtim)?;
+        self.bind_coexistence_width(bssid, &permission)?;
+        let rd = self.wire.domain(&permission)?;
+        let power = self.wire.power(&permission)?;
+        let mut start = self
+            .wire
+            .start_station(&permission, beacon_interval, dtim)?;
         if let Some(ht) = ht {
             let channel = if self.wire.dialect == Dialect::Tlv {
                 84
@@ -517,14 +546,14 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let inventory = if permission.secondary.is_some() {
             Some(
                 self.wire
-                    .station_ht40_channels(permission, ht.is_some_and(|h| h.vht.is_some()))?,
+                    .station_ht40_channels(&permission, ht.is_some_and(|h| h.vht.is_some()))?,
             )
         } else {
             None
         };
         let create = self.wire.peer(bssid)?;
         self.peer = Some(Peer {
-            permission,
+            permission: permission.clone(),
             bssid,
             ids: [0; 32],
             exchange_stage: 0,
@@ -588,7 +617,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                             frequency,
                             center_frequency: permission.center,
                             second_center_frequency: permission.center2,
-                            bandwidth_mhz: bandwidth(permission),
+                            bandwidth_mhz: bandwidth(&permission),
                             peer_id: id,
                             maximum_power_dbm: permission.half_dbm / 2,
                         });
@@ -612,7 +641,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Err(Error::Failed);
         }
         let peer = self.peer.as_ref().ok_or(Error::Failed)?;
-        let permission = peer.permission;
+        let permission = peer.permission.clone();
         permission.check(domain)?;
         management::validate(frame, self.ready.ok_or(Error::Failed)?.mac, peer.bssid)?;
         if frame[0] == 0 {
@@ -808,6 +837,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.station_event(event)
     }
     pub(super) fn station_event(&mut self, event: htt::Event) -> Result<htt::Event, Error> {
+        self.observe_beacon_hint_event(&event)?;
         self.observe_dwell_scan(&event)?;
         self.observe_roc(&event)?;
         self.capture_roc_management(&event)?;
@@ -864,7 +894,7 @@ fn ht40_pair(frequency: u16) -> Option<u16> {
         _ => return None,
     })
 }
-fn bandwidth(permission: Permission) -> u8 {
+fn bandwidth(permission: &Permission) -> u8 {
     if permission.center2.is_some() {
         160
     } else if permission.width80 {

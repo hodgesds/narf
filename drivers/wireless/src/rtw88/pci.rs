@@ -98,6 +98,19 @@ impl Rtw88Device {
                 .await
         }
     }
+    /// Measurement metadata for the exact bound C21 HT/T/Q power-tracking
+    /// program. No RF permission; the separate N21W asset must be installed
+    /// before a fresh association to enable the runtime continuation.
+    pub async fn rtl8821c_power_tracking_request(
+        &self,
+    ) -> Result<super::PowerTrackingRequest, super::FirmwareError> {
+        self.sibling
+            .as_ref()
+            .ok_or(super::FirmwareError::Unsupported)?
+            .lifecycle()
+            .power_tracking_request()
+            .await
+    }
     /// Distinct exact-H recipient BA emission measurement metadata. No grant.
     pub async fn rx_ba_request(&self) -> Result<super::RxBaRequest, super::FirmwareError> {
         if let Some(s) = &self.sibling {

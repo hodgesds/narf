@@ -116,6 +116,9 @@ impl Source {
     }
 }
 impl Grant {
+    pub(super) fn factory_limits(&self) -> [u8; 2] {
+        self.power.factory_limits()
+    }
     pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
         self.power.ht_facts()
     }

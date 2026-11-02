@@ -53,6 +53,7 @@ pub struct Device {
     channels: Vec<u8>,
     six_channels: Vec<super::native_band::Channel>,
     tx_chains: u32,
+    rx_chains: u32,
     phy: super::ht_vht::Local,
     firmware: Vec<u8>,
     pnvm: Option<Vec<u8>>,
@@ -321,6 +322,7 @@ impl Device {
             channels: nvm.channels,
             six_channels: nvm.six_channels,
             tx_chains: nvm.tx_chains,
+            rx_chains: nvm.rx_chains,
             phy: nvm.phy,
             firmware: firmware.to_vec(),
             pnvm: parsed.api.pnvm.map(|bytes| bytes.to_vec()),
@@ -415,6 +417,7 @@ impl Device {
             .await
             .map_err(|_| WirelessError::HardwareError)?;
         if nvm.tx_chains != self.tx_chains
+            || nvm.rx_chains != self.rx_chains
             || nvm.channels != self.channels
             || nvm.six_channels != self.six_channels
             || nvm.phy != self.phy

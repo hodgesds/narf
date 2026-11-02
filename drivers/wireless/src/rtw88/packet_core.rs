@@ -286,6 +286,36 @@ impl Core {
         self.phase = Phase::Running;
         Ok(())
     }
+    pub(super) fn maintenance_quiet(
+        &self,
+        mut index: impl FnMut(u16) -> Result<u32, Error>,
+    ) -> Result<bool, Error> {
+        if self.phase != Phase::Running
+            || self.pending.is_some()
+            || !self.batch_pending.is_empty()
+            || !self.rx_idle
+        {
+            return Ok(false);
+        }
+        for q in [
+            Queue::Management,
+            Queue::Data,
+            Queue::Background,
+            Queue::Video,
+            Queue::Voice,
+        ] {
+            let slot = queue_slot(q);
+            let expected = u32::from(self.tx_host[slot]);
+            if self.tx_host[slot] != self.tx_device[slot]
+                || index(q.index())? & 0x0fff0fff != (expected | expected << 16)
+            {
+                return Ok(false);
+            }
+        }
+        let rx = index(0x3b4)?;
+        let expected = u32::from(self.rx);
+        Ok(rx & 0x0fff0fff == (expected | expected << 16))
+    }
     pub(super) fn ready(&self) -> bool {
         self.phase == Phase::Running && self.pending.is_none() && self.batch_pending.is_empty()
     }

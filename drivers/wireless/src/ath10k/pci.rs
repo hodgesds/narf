@@ -728,7 +728,7 @@ pub async fn prepare_station(
     let quarantine = owner.quarantine.clone();
     let mut radio = owner.radio.lock().await;
     let permission = radio.station_permission(&domain, bssid, frequency)?;
-    let validate = || current_station(permission, &quarantine);
+    let validate = || current_station(&permission, &quarantine);
     let result = radio
         .prepare_station_checked(&domain, bssid, frequency, &validate)
         .await;
@@ -760,7 +760,7 @@ pub async fn exchange_initial_management(
     let quarantine = owner.quarantine.clone();
     let mut radio = owner.radio.lock().await;
     let permission = radio.retained_station_permission()?;
-    let validate = || current_station(permission, &quarantine);
+    let validate = || current_station(&permission, &quarantine);
     let result = super::wmi_runtime::checked_policy(
         radio.exchange_initial_management(&domain, frame),
         &validate,
@@ -792,7 +792,7 @@ pub async fn associate_station(
     let quarantine = owner.quarantine.clone();
     let mut radio = owner.radio.lock().await;
     let permission = radio.retained_station_permission()?;
-    let validate = || current_station(permission, &quarantine);
+    let validate = || current_station(&permission, &quarantine);
     let result = radio
         .associate_station_checked(&domain, ssid, security, sme_ies, &validate)
         .await;
@@ -838,7 +838,7 @@ pub async fn start_station_data(
     let mut radio = owner.radio.lock().await;
     let permission = radio.retained_station_permission()?;
     let quarantine = owner.quarantine.clone();
-    let validate = || current_station(permission, &quarantine);
+    let validate = || current_station(&permission, &quarantine);
     radio
         .start_data_with_nonce_checked(
             &domain,
@@ -884,7 +884,7 @@ pub async fn transmit_ethernet(bytes: &[u8]) -> Result<u16, super::wmi_runtime::
     let quarantine = owner.quarantine.clone();
     let mut radio = owner.radio.lock().await;
     let permission = radio.retained_station_permission()?;
-    let validate = || current_station(permission, &quarantine);
+    let validate = || current_station(&permission, &quarantine);
     let result =
         super::wmi_runtime::checked_policy(radio.transmit_ethernet(&domain, bytes), &validate)
             .await;
@@ -905,7 +905,7 @@ pub async fn poll_ethernet(
     let quarantine = owner.quarantine.clone();
     let mut radio = owner.radio.lock().await;
     let permission = radio.retained_station_permission()?;
-    let validate = || current_station(permission, &quarantine);
+    let validate = || current_station(&permission, &quarantine);
     let result = super::wmi_runtime::checked_policy(radio.poll_ethernet(&domain), &validate).await;
     if result.is_err() {
         radio.fail_station_data();
@@ -914,7 +914,7 @@ pub async fn poll_ethernet(
 }
 
 fn current_station(
-    permission: super::regulatory::Permission,
+    permission: &super::regulatory::Permission,
     quarantine: &core::sync::atomic::AtomicBool,
 ) -> Result<(), super::wmi_runtime::Error> {
     if quarantine.load(core::sync::atomic::Ordering::Acquire) {

@@ -341,7 +341,7 @@ fn smoke_ath10k_80p80_split_power_gap_and_second_span_current_receipt() -> TestR
         return TestResult::Fail("second80 edge revocation erased by first80 permission");
     }
     for invalid in [Some(5210), Some(5530), Some(5770)] {
-        let mut foreign = receipt;
+        let mut foreign = receipt.clone();
         foreign.center2 = invalid;
         if foreign.check(&domain).is_ok() {
             return TestResult::Fail(

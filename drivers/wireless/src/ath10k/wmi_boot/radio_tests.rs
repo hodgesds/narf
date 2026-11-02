@@ -53,6 +53,17 @@ struct RadioModel {
     chain_stall: Option<u8>,
     coexistence: Option<coexistence_native::Fixture>,
     host_power: HostPowerFixture,
+    beacon_hint: BeaconHintFixture,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BeaconHintFixture {
+    #[default]
+    Off,
+    Beacon,
+    Probe,
+    NoForeign,
+    WrongScope,
+    WrongChannel,
 }
 #[derive(Debug, Default)]
 struct HostPowerFixture {
@@ -186,7 +197,9 @@ fn management(model: &mut RadioModel, bad_ie: bool) {
     if bad_ie {
         frame.push(0xff);
     }
-    if model.active.as_ref().is_some_and(|active| !active.done) {
+    if model.active.as_ref().is_some_and(|active| !active.done)
+        || model.beacon_hint == BeaconHintFixture::Probe
+    {
         // An active scan receives actual probe responses, including the native
         // unicast receiver, through the same management descriptor decoder.
         frame[0] = 0x50;
@@ -569,6 +582,21 @@ impl Hif for RadioModel {
             scan_event(self, 2, 0xa000 | self.scan.saturating_sub(1), 0xa001);
             scan_event(self, 2, 0xa000 | self.scan, 0xa002); // wrong requestor
             scan_event(self, 1, 0xa000 | self.scan, 0xa001);
+            match self.beacon_hint {
+                BeaconHintFixture::Beacon | BeaconHintFixture::Probe => {
+                    scan_event(self, 8, 0xa000 | self.scan, 0xa001);
+                }
+                BeaconHintFixture::WrongScope => {
+                    scan_event(self, 8, 0xa000 | self.scan, 0xa002);
+                }
+                BeaconHintFixture::WrongChannel => {
+                    let frequency = self.frequency;
+                    self.frequency = 5200;
+                    scan_event(self, 8, 0xa000 | self.scan, 0xa001);
+                    self.frequency = frequency;
+                }
+                BeaconHintFixture::Off | BeaconHintFixture::NoForeign => {}
+            }
             management(self, true);
             management(self, false);
             if self.malformed {
@@ -749,6 +777,7 @@ fn radio_boot_source_version(
         associated: None,
         offchannel: None,
         host_power: HostPowerFixture::default(),
+        beacon_hint: BeaconHintFixture::Off,
     };
     let mut htc = Session::new(model, hardware);
     assert_eq!(once(htc.start()), Poll::Ready(Ok(())));

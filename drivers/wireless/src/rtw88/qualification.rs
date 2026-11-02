@@ -109,6 +109,7 @@ pub(super) struct Grant {
     request: Request,
     cap: Cap<FirmwareBlob, Read>,
     payload: [u8; PAYLOAD],
+    digest: [u8; 32],
 }
 
 impl core::fmt::Debug for Grant {
@@ -175,6 +176,22 @@ impl Source {
 }
 
 impl Grant {
+    pub(super) fn source_identity(&self) -> ([u8; 32], [u8; 32]) {
+        (self.request.identity, self.digest)
+    }
+    pub(super) fn invoke_source<T>(
+        &self,
+        op: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        struct Live<F>(F);
+        impl<T, F: FnOnce() -> Result<T, Error>> CapOp<FirmwareBlob, Read> for Live<F> {
+            type Output = Result<T, Error>;
+            fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
+                Ok((self.0)())
+            }
+        }
+        self.cap.invoke(Live(op)).map_err(|_| Error::Access)?
+    }
     fn decode(
         b: &[u8],
         signer: Option<[u8; 32]>,
@@ -215,6 +232,11 @@ impl Grant {
             request,
             cap,
             payload,
+            digest: {
+                let mut h = narf_crypto::sha256::Sha256::new();
+                h.update(b);
+                h.finalize()
+            },
         })
     }
     pub(super) fn tag(&self) -> u8 {

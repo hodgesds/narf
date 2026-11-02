@@ -34,6 +34,11 @@
 > Six new cases are written but unexecuted; coordinated release compilation,
 > native execution and physical firmware/board acceptance remain pending.
 
+> A later native Beacon-hint continuation is source complete for the existing
+> non-DFS 5 GHz World-factory inventory. Six new cases are written and
+> unexecuted; coordinated release/native validation and physical acceptance
+> remain pending. Signed host restrictions remain independent authority.
+
 ## 1. Purpose & scope
 
 PCIe Qualcomm/Atheros QCA988X, QCA9887, QCA6174/6164, QCA9377, QCA99X0,
@@ -649,13 +654,14 @@ actual-device RF/power/interoperability acceptance remain separate.
   legacy/HT20 on channels 1–11 or 5-GHz centres 5180/5200/5220/5240 and
   5745/5765/5785/5805/5825 MHz within firmware hardware limits. 5 GHz requires
   an actual fixed-country factory identity matching the authenticated host
-  country; a world factory identity is never promoted by host policy. Host
+  country, or the original native World-layer Beacon receipt in §3.2;
+  host policy alone never promotes a World factory identity. Host
   occupied-channel power is additionally bounded by 20 dBm on 2 GHz and
   30 dBm on 5 GHz, while immutable factory pair/CTL and firmware calibration
   remain active. These bounds are ceilings, not measured board transmit power.
   Every overlapping host power/bandwidth/DFS restriction applies; 5-GHz
-  indoor-only restrictions without authority, negative power, DFS, 6 GHz and
-  beacon-hint-dependent channels stay closed. Native station/channel/peer
+  indoor-only restrictions without authority, negative power, DFS and 6 GHz
+  stay closed. Native station/channel/peer
   records use 11A for 5 GHz and reject CCK there; 2 GHz retains 11G/11B.
   It programs immutable factory pair/CTL and additional half-dBm power limits,
   waits for a successful correlated VDEV_START_RESPONSE, creates the BSS
@@ -1479,6 +1485,47 @@ a terminal old radio. See [the exact policy and native contract](ath10k-indoor-r
 Source and native cases are written; coordinated release/native acceptance
 remains pending. This adds no country inference or generic nl80211 indoor hint.
 
+### 3.2 Native Beacon hints for the factory World layer
+
+The existing configured non-DFS 5 GHz centers can leave the immutable factory
+World `NO_IR` layer only after this physical radio receives an actual ESS
+Beacon during its original requested scan's matching STARTED and
+FOREIGN_CHANNEL dwell. The decoded WMI requestor, scan, vdev and channel must
+match; the frame must have Beacon subtype, broadcast receiver, nonzero
+interval and coherent BSSID/DS/HT channel fields. Probe responses, public BSS
+records, unrelated dwell events, Country IEs and host policy alone grant
+nothing. Radar/DFS frequencies are never promoted. This follows Linux7.2
+`ath/regd.c::ath_reg_apply_beaconing_flags` and cfg80211
+`reg.c::handle_reg_beacon`, with the stricter native Beacon-only source rule.
+
+Eligible factory identities are the resolver's World pairs 0x60..0x6c,
+including Linux's conservative 0x64 fallback for 0x6b and the existing roaming
+bit/sanitization rules. Fixed-country behavior is unchanged. The profile
+does not add channels 12–14, DFS, 6 GHz or new SERVICE_READY inventory. Hints
+are frequency facts, not BSSID credentials or inferred country authority.
+Every 20 MHz constituent needs its own native observation before 40/80/80+80
+admission; a primary Beacon cannot lend an unobserved occupied span.
+
+`Permission` is cloneable rather than Copy and retains a private immutable
+receipt for exactly its occupied frequencies, original radio life and
+original installed authenticated-policy Arc. Checks use that retained
+receipt through native waits, active probes, station/key/DATA progress,
+off-channel control and final copied-frame delivery. New Beacons can admit
+new plans without widening an old receipt. Policy removal or replacement,
+including equal rule bytes or remove/restore, permanently invalidates old
+receipts; a replacement radio needs fresh observations. Test-only providers
+use an explicit stable `reg::db::Database` snapshot, matching the production
+installed-policy generation instead of manufacturing Arcs per query.
+
+The receipt lifts only the factory World restriction. Every current signed
+host NO_IR/DFS/unknown flag, paired indoor installation fact, overlapping
+bandwidth/power limit and existing factory/hardware limit still applies.
+The firmware receives its real factory pair/CTL plus host power ceiling;
+neither a country nor a firmware/RF receipt is invented. Two ownership/parser
+cases and four native CE/HTT/Open/WPA2/DHCP/IP, false-observation, host/span
+and policy-wait/copied-DATA cases are written; coordinated release/native
+validation and actual-device qualification remain pending.
+
 ## 4. Invariants
 
 - PCI parking is read back before BAR sizing: BME and memory decode off,
@@ -1697,13 +1744,15 @@ pending. This makes no additional per-chip physical RF or power claim.
 
 Across the reached rows, concrete remaining software packages are
 contiguous VHT160 (VHT20/40/80 and the bounded80+80 owner are implemented);
-AP-side U-APSD under the AP owner; DFS/beacon-hint
-qualification; hardware key offload;
+AP-side U-APSD under the AP owner; DFS qualification; hardware key offload;
 AP/P2P roles; wake offload (system suspend and D0 host-bus PM are implemented);
 DT/NVMEM calibration sources (QCA9887 EEPROM and registry files are implemented)
 and automatic credential replay after recovery.
 The signed indoor installation continuation is implemented in §3.1 and awaits
 coordinated release/native acceptance.
+The native World-layer Beacon continuation is implemented in §3.2 and awaits
+coordinated release/native acceptance; host and physical qualification remain
+separate.
 Firmware-owned TX BA, the N-deep HTT pipeline and aggregate retry accounting
 are implemented above, beside the bounded RX BA/reorder and RAW A-MSDU receiver. Unsupported role, width, stream,
 or security capability remains closed; this ledger makes no per-chip RF or

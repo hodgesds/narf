@@ -1649,7 +1649,12 @@ impl Guard {
             authored.extend_from_slice(&(1u32 << 27).to_le_bytes());
             // Actual admitted Sc/Bz TLV resource facts, retained through the
             // same decoder as native startup; no production cache override.
-            for (tag, count) in [(0x100u32, 15u32), (0x101, 4)] {
+            let stations = if api89.is_some_and(gen3_station_tests::Case::cdb) {
+                14u32
+            } else {
+                15
+            };
+            for (tag, count) in [(0x100u32, stations), (0x101, 4)] {
                 authored.extend_from_slice(&tag.to_le_bytes());
                 authored.extend_from_slice(&4u32.to_le_bytes());
                 authored.extend_from_slice(&count.to_le_bytes());
@@ -1792,7 +1797,13 @@ impl Guard {
             mld_m3: None,
             mld_tx: mlo_tests::TxState::default(),
             native_ap: matches!(receive_model, ReceiveModel::Ap).then(ap_native_tests::Model::new),
-            native_p2p: matches!(receive_model, ReceiveModel::P2p).then(p2p_tests::Model::new),
+            native_p2p: matches!(receive_model, ReceiveModel::P2p).then(|| {
+                p2p_tests::Model::profile(
+                    api89.is_some(),
+                    api89.is_some_and(gen3_station_tests::Case::cdb),
+                    parsed.api.has_capability(109),
+                )
+            }),
         });
         let configured = run(Device::configure(&mut hardware, OWN), || wire.service());
         let nvm = match configured {
@@ -1868,6 +1879,7 @@ impl Guard {
             channels: nvm.channels,
             six_channels: nvm.six_channels,
             tx_chains: nvm.tx_chains,
+            rx_chains: nvm.rx_chains,
             phy: nvm.phy,
             firmware: if matches!(receive_model, ReceiveModel::P2p) {
                 authored

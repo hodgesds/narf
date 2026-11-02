@@ -91,6 +91,11 @@ struct Model {
     tx_ba: Option<Arc<crate::rtw88::tx_ba_power::Grant>>,
     protection: Option<Arc<crate::rtw88::protection::Grant>>,
     dm: Vec<Arc<crate::rtw88::qualification::Grant>>,
+    power_tracking: Option<Arc<crate::rtw88::tracking8821c::Grant>>,
+    tracking_maintenance: bool,
+    tracking_sequence: u16,
+    tracking_sample: Option<u8>,
+    tracking_ready: Option<u64>,
     before_publication: Option<Arc<dyn Fn() + Send + Sync>>,
     edca_writes: usize,
     packet_model: crate::rtw88::packet_core::tests::Model,
@@ -211,14 +216,76 @@ impl Port {
         Ok(())
     }
     fn access(&self) -> Result<(), Error> {
-        let mut model = self.0.lock();
-        let at = model.calls;
-        model.calls += 1;
-        if model.fail == Some(at) {
-            Err(Error::Access)
-        } else {
-            Ok(())
+        let (denied, gate, maintenance) = {
+            let mut m = self.0.lock();
+            let at = m.calls;
+            m.calls += 1;
+            (
+                m.fail == Some(at),
+                m.station_gate.clone(),
+                m.tracking_maintenance,
+            )
+        };
+        if denied {
+            return Err(Error::Access);
         }
+        if let Some(gate) = gate.filter(|g| g.power_tracking().is_some()) {
+            if maintenance {
+                gate.invoke_base(|| Ok(()))?;
+            } else {
+                gate.invoke(|| Ok(()))?;
+            }
+        }
+        Ok(())
+    }
+    fn power_tracking_base(&self) -> Result<crate::rtw88::power_policy::Gate, Error> {
+        let m = self.0.lock();
+        let mut g = m.station_gate.clone().ok_or(Error::State)?;
+        if let Some(e) = &m.extension {
+            g = g.with_extension(e.clone())?;
+        }
+        if let Some(h) = &m.ht {
+            g = g.with_ht(h.clone())?;
+        }
+        for x in &m.dm {
+            if !x.is(&crate::rtw88::dm::KIND) {
+                g = g.with_continuation(x.clone())?;
+            }
+        }
+        if let Some(r) = &m.rx_ba {
+            g = g.with_rx_ba(r.clone())?;
+        }
+        if let Some(t) = &m.tx_ba {
+            g = g.with_tx_ba(t.clone())?;
+        }
+        if let Some(x) = &m.protection {
+            g = g.with_protection(x.clone())?;
+        }
+        Ok(g)
+    }
+    fn power_tracking_request(&self) -> Result<crate::rtw88::PowerTrackingRequest, Error> {
+        let g = self.power_tracking_base()?;
+        let (scale, dm) = {
+            let m = self.0.lock();
+            (
+                (word(&m.bytes, 0xc1c) >> 21) as u16,
+                m.dm.iter().find(|g| g.is(&crate::rtw88::dm::KIND)).cloned(),
+            )
+        };
+        crate::rtw88::tracking8821c::request(&g, 25, scale, dm.as_ref())
+    }
+    fn qualify_power_tracking(&self, s: crate::rtw88::tracking8821c::Source) -> Result<(), Error> {
+        let base = self.power_tracking_base()?;
+        let (scale, dm) = {
+            let m = self.0.lock();
+            (
+                (word(&m.bytes, 0xc1c) >> 21) as u16,
+                m.dm.iter().find(|g| g.is(&crate::rtw88::dm::KIND)).cloned(),
+            )
+        };
+        let g = s.load(base, 25, scale, dm)?;
+        self.0.lock().power_tracking = Some(g);
+        Ok(())
     }
     fn packet_with<T>(
         &mut self,
@@ -251,6 +318,9 @@ impl crate::rtw88::dma_stop::Quiesce for Teardown {
     fn read32(&mut self, reg: u16) -> Result<u32, Error> {
         use crate::rtw88::dma_stop::{RW_RELEASE, RXDMA_IDLE, RXPKT_NUM};
         let m = self.0.lock();
+        if reg == 0x132c && m.power_tracking.is_some() {
+            return Ok(m.command_index);
+        }
         if let Some(index) = m.packet_model.raw_index(reg) {
             return Ok(index);
         }
@@ -275,6 +345,202 @@ impl crate::rtw88::dma_stop::Quiesce for Teardown {
 // SAFETY: no physical PCI/DMA. The simulator holds all synthetic device
 // mappings, observes OWN before claiming, and only reads published storage.
 unsafe impl Registers for Port {
+    fn station_power_tracking_request(
+        &mut self,
+        t: u8,
+        dm: Option<Arc<crate::rtw88::qualification::Grant>>,
+    ) -> Result<crate::rtw88::PowerTrackingRequest, Error> {
+        let gate = self.0.lock().station_gate.clone().ok_or(Error::State)?;
+        if let Some(g) = gate.power_tracking() {
+            return Ok(g.request());
+        }
+        let scale = (self.read32(0xc1c)? >> 21) as u16;
+        crate::rtw88::tracking8821c::request(&gate, t, scale, dm.as_ref())
+    }
+    fn station_power_tracking_extension(
+        &mut self,
+        t: u8,
+        _: Option<Arc<crate::rtw88::qualification::Grant>>,
+    ) -> Result<Option<Arc<crate::rtw88::tracking8821c::Grant>>, Error> {
+        self.station_allowed()?;
+        let m = self.0.lock();
+        let Some(g) = m.power_tracking.clone() else {
+            return Ok(None);
+        };
+        if t != 25 || !g.matches(m.station_gate.as_ref().ok_or(Error::State)?) {
+            return Err(Error::Prerequisite);
+        }
+        Ok(Some(g))
+    }
+    fn station_bind_power_tracking(
+        &mut self,
+        g: Arc<crate::rtw88::tracking8821c::Grant>,
+    ) -> Result<(), Error> {
+        self.station_allowed()?;
+        g.readback(|r| self.read32(r))?;
+        let gate = self
+            .0
+            .lock()
+            .station_gate
+            .clone()
+            .ok_or(Error::State)?
+            .with_power_tracking(g)?;
+        let current = gate.clone();
+        let batch = gate.clone();
+        let mut m = self.0.lock();
+        m.packet_model.authority = Some(Arc::new(move || current.current().is_ok()));
+        m.packet_model.batch_authority = Some(Arc::new(move |p| {
+            batch.allows_profile(p) && batch.invoke_batch(p, || Ok(())).is_ok()
+        }));
+        m.station_gate = Some(gate);
+        Ok(())
+    }
+    fn station_power_tracking_begin(
+        &mut self,
+        g: &Arc<crate::rtw88::tracking8821c::Grant>,
+        restore: bool,
+    ) -> Result<bool, Error> {
+        {
+            let mut m = self.0.lock();
+            if m.tracking_maintenance
+                || m.mailbox_pending
+                || m.command_ring.pending()
+                || m.station_gate
+                    .as_ref()
+                    .and_then(crate::rtw88::power_policy::Gate::power_tracking)
+                    .as_ref()
+                    .is_none_or(|w| !Arc::ptr_eq(w, g))
+            {
+                return Err(Error::State);
+            }
+            m.tracking_maintenance = true;
+        }
+        let result = (|| {
+            self.access()?;
+            g.readback(|r| self.read32(r))?;
+            if !self.station_power_tracking_quiet()? {
+                return Ok(false);
+            }
+            if restore {
+                g.begin_restore()?
+            } else {
+                g.begin()?
+            };
+            Ok(true)
+        })();
+        if !matches!(result, Ok(true)) {
+            self.0.lock().tracking_maintenance = false;
+        }
+        result
+    }
+    fn station_power_tracking_quiet(&mut self) -> Result<bool, Error> {
+        if !self.0.lock().tracking_maintenance {
+            return Err(Error::State);
+        }
+        let base = self
+            .0
+            .lock()
+            .station_gate
+            .clone()
+            .ok_or(Error::State)?
+            .without_power_tracking();
+        if !self
+            .packet_with(|core, model| {
+                core.maintenance_quiet(|r| {
+                    base.invoke_base(|| model.raw_index(r).ok_or(Error::State))
+                        .map_err(|_| crate::rtw88::packet_core::Error::Access)
+                })
+            })
+            .map_err(|_| Error::State)?
+        {
+            return Ok(false);
+        }
+        {
+            let m = self.0.lock();
+            if m.mailbox_pending || m.command_ring.pending() {
+                return Err(Error::State);
+            }
+        }
+        for r in crate::rtw88::dma_stop::TX_INDEX {
+            let v = self.read32(r)?;
+            if v & 0xfff != (v >> 16) & 0xfff {
+                return Ok(false);
+            }
+        }
+        if self.read16(0x10c)? != 0xc5a0 {
+            return Err(Error::Prerequisite);
+        }
+        for r in [0x230, 0x234, 0x238, 0x23c] {
+            let n = if r == 0x23c { 14 } else { 16 };
+            if self.read16(r)? != n {
+                return Err(Error::Prerequisite);
+            }
+            if self.read16(r + 2)? != n {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    fn station_power_tracking_iqk(&mut self) -> Result<(), Error> {
+        let packet = {
+            let m = self.0.lock();
+            if !m.tracking_maintenance {
+                return Err(Error::State);
+            }
+            crate::rtw88::command::iqk8821c_associated(m.tracking_sequence)
+        };
+        self.submit_h2c(&packet)
+    }
+    fn station_power_tracking_finish(
+        &mut self,
+        p: Option<crate::rtw88::tracking8821c::Program>,
+    ) -> Result<(), Error> {
+        use crate::rtw88::{
+            dma_stop::{RW_RELEASE, RXDMA_IDLE, RXPKT_NUM},
+            tracking8821c::Grant,
+        };
+        if !self.station_power_tracking_quiet()?
+            || self.read8(0x522)? != 255
+            || self.read32(RXPKT_NUM)? & (RW_RELEASE | RXDMA_IDLE) != (RW_RELEASE | RXDMA_IDLE)
+        {
+            return Err(Error::Prerequisite);
+        }
+        let gate = self.0.lock().station_gate.clone().ok_or(Error::State)?;
+        let g = gate.power_tracking().ok_or(Error::State)?;
+        Grant::read_program(p.unwrap_or_else(|| g.initial_program()), &mut |r| {
+            self.read32(r)
+        })?;
+        gate.ht_grant()
+            .ok_or(Error::State)?
+            .readback(|r| self.read32(r))?;
+        if p.is_some() {
+            g.temperature(((self.read32(0x2908)? >> 10) & 63) as u8)?;
+        }
+        let rx = self.read32(RXPKT_NUM)?;
+        self.write32(RXPKT_NUM, rx & !RW_RELEASE)?;
+        self.write8(0x522, 0)?;
+        if self.read32(RXPKT_NUM)? & RW_RELEASE != 0 || self.read8(0x522)? != 0 {
+            return Err(Error::Prerequisite);
+        }
+        match p {
+            Some(p) => g.commit(p)?,
+            None => {
+                g.retire();
+                let gate = gate.without_power_tracking();
+                let current = gate.clone();
+                let batch = gate.clone();
+                let mut m = self.0.lock();
+                m.packet_model.authority = Some(Arc::new(move || current.current().is_ok()));
+                m.packet_model.batch_authority = Some(Arc::new(move |p| {
+                    batch.allows_profile(p) && batch.invoke_batch(p, || Ok(())).is_ok()
+                }));
+                m.station_gate = Some(gate);
+            }
+        }
+        self.0.lock().tracking_maintenance = false;
+        Ok(())
+    }
+
     fn station_continuation(
         &mut self,
         kind: &'static crate::rtw88::qualification::Kind,
@@ -462,10 +728,9 @@ unsafe impl Registers for Port {
             value |= 1 << 15;
         }
         if matches!(reg, 0x232 | 0x236 | 0x23a | 0x23e)
-            && model
-                .station_gate
-                .as_ref()
-                .is_some_and(|g| g.allows_tx_ba() || g.protection_grant().is_some())
+            && model.station_gate.as_ref().is_some_and(|g| {
+                g.allows_tx_ba() || g.protection_grant().is_some() || g.power_tracking().is_some()
+            })
         {
             if model
                 .packet_model
@@ -491,6 +756,27 @@ unsafe impl Registers for Port {
         self.access()?;
         let mut model = self.0.lock();
         let at = usize::from(reg);
+        if model.tracking_maintenance {
+            if reg == 0x132c {
+                return Ok(model.command_index);
+            }
+            if let Some(v) = model.packet_model.raw_index(reg) {
+                return Ok(v);
+            }
+        }
+        if reg == 0x2908
+            && model
+                .tracking_ready
+                .is_some_and(|t| model.clock.load(Ordering::Acquire) >= t)
+        {
+            if let Some(t) = model.tracking_sample {
+                let old = word(&model.bytes, 0x2908);
+                model.bytes[0x2908..0x290c]
+                    .copy_from_slice(&((old & !0xfc00) | u32::from(t) << 10).to_le_bytes());
+            }
+            model.tracking_ready = None;
+            model.thermal_conversions += 1;
+        }
         if reg == 0x2820 && model.iqk_armed {
             model.iqk_reads += 1;
             if model.iqk_complete && model.iqk_reads >= 2 {
@@ -498,6 +784,12 @@ unsafe impl Registers for Port {
             }
         }
         let mut value = u32::from_le_bytes(model.bytes[at..at + 4].try_into().unwrap());
+        if reg == crate::rtw88::dma_stop::RXPKT_NUM {
+            value &= !crate::rtw88::dma_stop::RXDMA_IDLE;
+            if value & crate::rtw88::dma_stop::RW_RELEASE != 0 && !model.rx_dma_busy {
+                value |= crate::rtw88::dma_stop::RXDMA_IDLE;
+            }
+        }
         if reg == 0x1208 {
             value &= !(1 << 31);
         }
@@ -577,6 +869,14 @@ unsafe impl Registers for Port {
                 }
                 if address == 0x42 && value & 0x30000 == 0x30000 {
                     model.thermal_triggered = true;
+                    if model
+                        .station_gate
+                        .as_ref()
+                        .is_some_and(|g| g.power_tracking().is_some())
+                    {
+                        model.tracking_ready =
+                            Some(model.clock.load(Ordering::Acquire).saturating_add(2000));
+                    }
                 }
             }
             if model.revoke_on_rf {
@@ -687,8 +987,15 @@ unsafe impl Registers for Port {
     fn submit_h2c(&mut self, packet: &[u8; 32]) -> Result<(), Error> {
         self.access()?;
         let mut model = self.0.lock();
-        if model.continuation != 6 {
+        let mission = model.continuation == 12 && model.tracking_maintenance;
+        if model.continuation != 6 && !mission {
             return Err(Error::State);
+        }
+        if mission {
+            if *packet != crate::rtw88::command::iqk8821c_associated(model.tracking_sequence) {
+                return Err(Error::Prerequisite);
+            }
+            model.tracking_sequence = model.tracking_sequence.checked_add(1).ok_or(Error::State)?;
         }
         let index = model.command_index;
         let (_, next) = model.command_ring.reserve(index)?;
@@ -704,8 +1011,9 @@ unsafe impl Registers for Port {
         }
         let index = model.command_index;
         let done = model.command_ring.poll(index)?;
-        if done && model.commands.len() == 3 {
+        if done && (model.commands.len() == 3 || model.tracking_maintenance) {
             model.iqk_armed = true;
+            model.iqk_reads = 0;
         }
         Ok(done)
     }
@@ -1049,6 +1357,11 @@ fn allocated() -> (Backend<Port, Block>, Port, Arc<AtomicUsize>) {
         tx_ba: None,
         protection: None,
         dm: Vec::new(),
+        power_tracking: None,
+        tracking_maintenance: false,
+        tracking_sequence: 3,
+        tracking_sample: None,
+        tracking_ready: None,
         before_publication: None,
         edca_writes: 0,
         packet_model: crate::rtw88::packet_core::tests::Model::new(),

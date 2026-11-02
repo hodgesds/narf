@@ -140,7 +140,7 @@ impl Device {
     pub(in crate::iwlwifi) fn p2p_capable(&self) -> bool {
         self.source.invoke(|| Ok(())).is_ok()
             && super::super::parse_ucode(&self.firmware).is_ok_and(|parsed| {
-                Abi::read(&parsed.api) == Ok(Abi::Roc6)
+                matches!(Abi::read(&parsed.api), Ok(Abi::Roc6 | Abi::Session2))
                     && parsed.api.api_changes[1] & (1 << 27) != 0
                     && matches!(parsed.api.num_stations, Some(2..=16))
                     && matches!(parsed.api.num_links, Some(2..=4))
@@ -254,6 +254,7 @@ impl Device {
                 &self.policy,
                 channel,
                 &self.channels,
+                self.rx_chains,
                 cookie,
                 duration,
                 activity,
@@ -347,6 +348,7 @@ impl Device {
                     &self.policy,
                     channel,
                     &self.channels,
+                    self.rx_chains,
                     cookie,
                     frame.duration,
                     RocActivity::Negotiate,

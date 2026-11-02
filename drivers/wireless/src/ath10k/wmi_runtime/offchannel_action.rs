@@ -74,8 +74,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         {
             return Err(Error::Unsupported);
         }
-        let caps = self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?;
-        let permission = Permission::from_domain(caps, domain, w.receipt.frequency)?;
+        let permission = self.hinted_permission(domain, w.receipt.frequency, None, false)?;
         if !w.plan.permissions.contains(&permission) {
             return Err(Error::Unsupported);
         }
@@ -106,11 +105,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if request.no_cck && frequency < 3000 {
             return Err(Error::Unsupported);
         }
-        Permission::from_domain(
-            self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?,
-            domain,
-            frequency,
-        )?;
+        self.hinted_permission(domain, frequency, None, false)?;
         validate(&request.frame, self.ready.ok_or(Error::Failed)?.mac).map(|_| ())
     }
     pub(in crate::ath10k) async fn begin_private_frame(
@@ -168,7 +163,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Err(Error::Unsupported);
         }
         let caps = self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?;
-        let permission = Permission::from_domain(caps, &current()?, w.receipt.frequency)?;
+        let permission = self.hinted_permission(&current()?, w.receipt.frequency, None, false)?;
         // Never upgrade a receive-only ROC by silently changing its inventory.
         if !w.plan.permissions.contains(&permission) {
             return Err(Error::Unsupported);

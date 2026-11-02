@@ -134,6 +134,7 @@ pub(super) struct Grant {
     base: Base,
     request: Request,
     cap: Cap<FirmwareBlob, Read>,
+    digest: [u8; 32],
     antenna: i16,
     ceiling: i16,
     peaks: [i16; 4],
@@ -176,6 +177,12 @@ impl Source {
     }
 }
 impl Grant {
+    pub(super) fn limit(&self) -> Result<i16, Error> {
+        Ok(self.base.limit()?.min(self.ceiling))
+    }
+    pub(super) fn tracking_identity(&self) -> ([u8; 32], [u8; 32]) {
+        (self.request.identity, self.digest)
+    }
     fn decode(
         b: &[u8],
         signer: Option<[u8; 32]>,
@@ -205,6 +212,11 @@ impl Grant {
             base,
             request,
             cap,
+            digest: {
+                let mut h = narf_crypto::sha256::Sha256::new();
+                h.update(b);
+                h.finalize()
+            },
             antenna: signed(56),
             ceiling: signed(58),
             peaks: core::array::from_fn(|i| signed(60 + i * 2)),

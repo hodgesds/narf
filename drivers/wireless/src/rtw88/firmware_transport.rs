@@ -327,6 +327,45 @@ pub(super) unsafe trait Io: Send {
         Err(Error::Unsupported)
     }
     /// Bind an N2xC/N2xQ continuation into the retained station gate.
+    fn station_power_tracking_request(
+        &mut self,
+        _: u8,
+        _: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> Result<super::PowerTrackingRequest, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_power_tracking_extension(
+        &mut self,
+        _: u8,
+        _: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> Result<Option<alloc::sync::Arc<super::tracking8821c::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_bind_power_tracking(
+        &mut self,
+        _: alloc::sync::Arc<super::tracking8821c::Grant>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_power_tracking_begin(
+        &mut self,
+        _: &alloc::sync::Arc<super::tracking8821c::Grant>,
+        _: bool,
+    ) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_power_tracking_quiet(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_power_tracking_iqk(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_power_tracking_finish(
+        &mut self,
+        _: Option<super::tracking8821c::Program>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     fn station_bind_continuation(
         &mut self,
         _: alloc::sync::Arc<super::qualification::Grant>,
@@ -970,6 +1009,17 @@ impl<I: Io> Owner<I> {
         self.io.station_rts_request()
     }
     /// N2xD dynamic-mechanism measurement metadata. No grant.
+    pub(super) fn power_tracking_request(&mut self) -> Result<super::PowerTrackingRequest, Error> {
+        let facts = self
+            .tracking_facts
+            .filter(|f| f.did == 0xc821 && f.power_track_type == 0 && f.thermal[0] <= 63)
+            .ok_or(Error::Unsupported)?;
+        let dm = self
+            .station
+            .as_deref()
+            .and_then(super::station::State::dm_grant);
+        self.io.station_power_tracking_request(facts.thermal[0], dm)
+    }
     pub(super) fn tracking_request(&mut self) -> Result<super::ContinuationRequest, Error> {
         self.io.station_continuation_request(&super::dm::KIND)
     }

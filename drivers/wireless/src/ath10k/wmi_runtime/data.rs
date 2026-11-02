@@ -385,6 +385,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         Ok(self.ready.ok_or(Error::Failed)?.mac)
     }
     pub fn fail_station_data(&mut self) {
+        self.beacon_hints.retire();
         self.failed = true;
         if let Some(data) = &mut self.data {
             data.fail();
@@ -435,7 +436,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
     pub(in crate::ath10k) fn data_permission(&self) -> Option<Permission> {
         self.station_link()?;
-        Some(self.peer.as_ref()?.permission)
+        Some(self.peer.as_ref()?.permission.clone())
     }
     pub(in crate::ath10k) fn check_data_policy(
         &self,

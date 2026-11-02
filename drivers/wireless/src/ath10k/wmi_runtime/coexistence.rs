@@ -333,7 +333,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(super) fn bind_coexistence_width(
         &mut self,
         bssid: [u8; 6],
-        permission: crate::ath10k::regulatory::Permission,
+        permission: &crate::ath10k::regulatory::Permission,
     ) -> Result<(), Error> {
         if permission.frequency >= 3000 {
             return Ok(());
@@ -419,7 +419,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     }
     async fn narrow_coexistence(&mut self, domain: &RegulatoryDomain) -> Result<(), Error> {
         let peer = self.peer.as_ref().ok_or(Error::Failed)?;
-        let old = peer.permission;
+        let old = peer.permission.clone();
         let bssid = peer.bssid;
         let profile = peer
             .ht
@@ -448,10 +448,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         };
         let restart = self
             .wire
-            .coexistence_restart(permission, cached.beacon_interval, dtim)?;
+            .coexistence_restart(&permission, cached.beacon_interval, dtim)?;
         let parameters = self.wire.coexistence_peer(bssid)?;
-        let inventory = self.wire.coexistence_channels(permission, &self.channels)?;
-        let power = self.wire.power(permission)?;
+        let inventory = self
+            .wire
+            .coexistence_channels(&permission, &self.channels)?;
+        let power = self.wire.power(&permission)?;
         let state = self.coexistence.as_mut().ok_or(Error::Failed)?;
         if state.restart_started || state.narrowed || !state.allow_wide {
             return Err(Error::Failed);
@@ -587,7 +589,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
 impl wire::Wire {
     fn coexistence_restart(
         self,
-        permission: crate::ath10k::regulatory::Permission,
+        permission: &crate::ath10k::regulatory::Permission,
         beacon: u16,
         dtim: u8,
     ) -> Result<Vec<u8>, Error> {
@@ -643,7 +645,7 @@ impl wire::Wire {
     }
     fn coexistence_channels(
         self,
-        permission: crate::ath10k::regulatory::Permission,
+        permission: &crate::ath10k::regulatory::Permission,
         channels: &[u16],
     ) -> Result<Vec<u8>, Error> {
         let mut out = self.channels(channels)?;

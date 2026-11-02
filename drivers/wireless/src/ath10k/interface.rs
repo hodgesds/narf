@@ -617,13 +617,15 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                         #[cfg(any(test, feature = "kernel-test"))]
                         self.receive_point_for_test(ReceivePoint::AfterFrameAllocation);
                         radio.check_data_policy(&self.policy.current()?)?;
-                        if radio.data_permission() != Some(permission) {
+                        if radio.data_permission().as_ref() != Some(&permission) {
                             return Ok(None);
                         }
                         super::firmware_source::invoke(source.as_ref(), || {
+                            permission.check(&self.policy.current()?)?;
                             let _ = state.rx.try_send(frame);
+                            Ok::<_, Error>(())
                         })
-                        .map_err(|_| Error::Failed)?;
+                        .map_err(|_| Error::Failed)??;
                     }
                 }
                 Ok(Some(ReceiveBatch {
@@ -672,7 +674,7 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
                     return Ok(false);
                 };
                 radio.check_data_policy(&self.policy.current()?)?;
-                Ok(radio.data_permission() == Some(batch.permission))
+                Ok(radio.data_permission().as_ref() == Some(&batch.permission))
             })();
             match admission {
                 Ok(true) => {}

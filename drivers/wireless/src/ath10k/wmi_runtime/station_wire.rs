@@ -12,7 +12,7 @@ impl Wire {
             Dialect::TenFour => (0x9006, 0x9008, 0x9015, 0x9022, 0x9004),
         }
     }
-    pub fn domain(self, permission: Permission) -> Result<Vec<u8>, Error> {
+    pub fn domain(self, permission: &Permission) -> Result<Vec<u8>, Error> {
         let f = permission.factory;
         let tlv = self.dialect == Dialect::Tlv;
         let main = self.dialect == Dialect::Main;
@@ -42,7 +42,7 @@ impl Wire {
         }
         Ok(out)
     }
-    pub fn power(self, permission: Permission) -> Result<Vec<u8>, Error> {
+    pub fn power(self, permission: &Permission) -> Result<Vec<u8>, Error> {
         let tlv = self.dialect == Dialect::Tlv;
         let mut out = packet(self.station_ids().1, if tlv { 16 } else { 8 })?;
         let at = if tlv {
@@ -62,7 +62,7 @@ impl Wire {
     }
     pub fn start_station(
         self,
-        permission: Permission,
+        permission: &Permission,
         beacon: u16,
         dtim: u8,
     ) -> Result<Vec<u8>, Error> {

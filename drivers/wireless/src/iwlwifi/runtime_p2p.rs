@@ -1,11 +1,12 @@
-//! Sc/Bz's actual P2P MAC1/link1 and ROCv6/count-qualified AUX/TID16 consumer.
+//! Actual P2P MAC1/link1 ownership: Sc/Bz ROCv6/AUX or API89
+//! PHY1/active-link/BCAST/SESSION2, with count-qualified TID16.
 //! No public role is advertised by this module alone. The parent adapter
 //! must prove an idle native owner and keep the original control child.
 use super::super::{
     native_band::{Band, Channel},
     p2p_host::Request,
     p2p_owner::{Capture, Epoch, Gate, Grant, Publication},
-    p2p_wire::{self, Abi, Activity as RocActivity, Duration},
+    p2p_wire::{self, Abi, Activity as RocActivity, Duration, Target},
 };
 use super::*;
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc};
@@ -23,6 +24,8 @@ pub(super) struct State {
     retired: Vec<Arc<Request>>,
 }
 struct Session {
+    abi: Abi,
+    broadcast_mfp: bool,
     own: [u8; 6],
     start: Arc<Request>,
     epoch: Epoch,
@@ -46,6 +49,9 @@ struct Lease {
     closing: bool,
     policy: Option<super::super::mld_policy::Fence>,
     public: bool,
+    phy_published: bool,
+    link_bound: bool,
+    native_ended: bool,
 }
 pub(in crate::iwlwifi) enum Kind {
     Ready,
@@ -106,12 +112,25 @@ impl State {
             return Ok(false);
         };
         if packet.header.group_id == p2p_wire::GROUP
-            && packet.header.cmd == p2p_wire::ROC_NOTIFICATION
+            && packet.header.cmd
+                == if session.abi == Abi::Roc6 {
+                    p2p_wire::ROC_NOTIFICATION
+                } else {
+                    p2p_wire::SESSION_NOTIFICATION
+                }
         {
             if packet.receive_queue != 0 || packet.header.sequence & 0x8000 == 0 {
                 return Ok(true);
             }
-            let notification = Abi::Roc6.roc_notification(lease.activity, &packet.payload)?;
+            let notification = match session.abi {
+                Abi::Roc6 => Abi::Roc6.roc_notification(lease.activity, &packet.payload)?,
+                Abi::Session2 => Abi::Session2.session_notification(
+                    Target::Link(LINK as u8),
+                    lease.activity,
+                    &packet.payload,
+                )?,
+                _ => return Err("P2P unimplemented native SESSION adapter"),
+            };
             if lease.closing || !lease.grant.capture.current() {
                 return Ok(true);
             }
@@ -142,6 +161,7 @@ impl State {
                 // needs real queue/STA retirement before EXPIRED or reuse.
                 lease.grant.close();
                 lease.closing = true;
+                lease.native_ended = session.abi == Abi::Session2;
             }
             return Ok(true);
         }
@@ -231,6 +251,29 @@ impl Drop for State {
     }
 }
 impl Hardware {
+    /// A credit wait polls only one64-descriptor RFH batch. Consume the
+    /// actual already-completed fallback prefix before native publication,
+    /// including an END beyond that budget. A moving/full prefix remains a
+    /// denial after this bounded attempt. Retain the original Frame gate
+    /// across every poll; an internal lifecycle change cannot replace it.
+    pub(in crate::iwlwifi) fn check_p2p_tx_publication(&mut self) -> Result<(), &'static str> {
+        if !self.p2p_started() {
+            return Ok(());
+        }
+        let gate = self.p2p.gate.clone().ok_or("P2P original TX gate absent")?;
+        gate.transmission()?;
+        for _ in 0..=RX_DEPTH / 64 {
+            if !self.has_pending_rx() {
+                return gate.transmission();
+            }
+            self.poll()?;
+            gate.transmission()?;
+        }
+        if self.has_pending_rx() {
+            return Err("P2P completed RX prefix kept moving before TX publication");
+        }
+        gate.transmission()
+    }
     pub(in crate::iwlwifi) fn p2p_started(&self) -> bool {
         self.p2p.session.is_some()
     }
@@ -244,18 +287,31 @@ impl Hardware {
         &self,
         api: &super::super::firmware_api::FirmwareApi<'_>,
     ) -> bool {
-        self.uses_mld_station_protocol()
-            && self.band_in_rx_supported()
+        let adapter = match Abi::read(api) {
+            Ok(Abi::Roc6) => {
+                self.uses_mld_station_protocol()
+                    && [(3, 8, 3), (3, 9, 8)]
+                        .into_iter()
+                        .all(|(g, c, v)| self.command_version(g, c) == Some(v))
+                    && matches!(self.command_version(3, 0xb), None | Some(1 | 99))
+            }
+            Ok(Abi::Session2) => {
+                self.is_mvm89()
+                    && [(3, 8, 2), (3, 9, 2), (1, 8, 4), (5, 8, 2)]
+                        .into_iter()
+                        .all(|(g, c, v)| self.command_version(g, c) == Some(v))
+            }
+            _ => false,
+        };
+        adapter && self.band_in_rx_supported()
             && matches!(self.command_version(1,0x1c),Some(10|11))
             && self.versions == api.commands
             && self.p2p.counts == (api.num_stations, api.num_links)
             && matches!(api.num_stations, Some(2..=16))
             && matches!(api.num_links, Some(2..=4))
-            && Abi::read(api) == Ok(Abi::Roc6)
-            && [(3,8,3),(3,9,8),(5,0x17,3),(1,0x1e,2)]
+            && [(5,0x17,3),(1,0x1e,2)]
                 .into_iter().all(|(g,c,v)| self.command_version(g,c)==Some(v))
             // Linux sends these fixed structs without inventory lookups.
-            && matches!(self.command_version(3,0xb),None|Some(1|99))
             && matches!(self.command_version(3,0xc),None|Some(1|99))
     }
     pub(in crate::iwlwifi) async fn p2p_start_native(
@@ -268,12 +324,14 @@ impl Hardware {
             || self.failed
             || !self.resources.data.is_empty()
         {
-            return Err("P2P START requires its actual idle Sc/Bz native owner");
+            return Err("P2P START requires its actual idle native adapter");
         }
         request.check()?;
         let own = request.own();
         self.p2p.gate = Some(Gate::new(request.clone(), None, None));
         self.p2p.session = Some(Box::new(Session {
+            abi: Abi::read(api)?,
+            broadcast_mfp: api.has_capability(109),
             own,
             start: request,
             epoch: Epoch::default(),
@@ -305,6 +363,7 @@ impl Hardware {
         policy: &super::super::mld_policy::Source,
         channel: Channel,
         nvm_channels: &[u8],
+        rx_chains: u32,
         cookie: u64,
         duration_ms: u32,
         activity: RocActivity,
@@ -354,6 +413,9 @@ impl Hardware {
             closing: false,
             policy: None,
             public,
+            phy_published: false,
+            link_bound: false,
+            native_ended: false,
         }));
         let domain = policy.snapshot()?;
         if super::super::connection::host_channel_power(&domain, channel.number, true).is_none() {
@@ -386,23 +448,31 @@ impl Hardware {
                 .ok_or("P2P TX power ABI absent")?,
             power,
         )?;
-        // ROCv6's AUX/TID16 has no serving-link power owner. Apply the
-        // actual SET_DEVICE ceiling, not a SET_LINK command for station0.
+        // ROCv6 AUX has no serving-link power owner. SESSION2's separate
+        // PHY1/link1 must also stay below this actual SET_DEVICE ceiling;
+        // neither path may target station0 with a SET_LINK command.
         // The idle-primary restriction makes this conservative across all
         // physical emissions; current host/MCC/SAR remain independent proofs.
         boot_context::put32(&mut body, 0, 1);
         super::super::ap_session::command(self, 1, 0x9f, &body).await?;
-        let mut aux = [0; 16];
-        boot_context::put32(&mut aux, 0, u32::from(aux_station));
-        self.p2p
-            .session
-            .as_mut()
-            .unwrap()
-            .grant
-            .as_mut()
-            .unwrap()
-            .aux_published = true;
-        super::super::ap_session::command(self, 3, 0xb, &aux).await?;
+        let abi = self.p2p.session.as_ref().unwrap().abi;
+        match abi {
+            Abi::Roc6 => {
+                let mut aux = [0; 16];
+                boot_context::put32(&mut aux, 0, u32::from(aux_station));
+                self.p2p
+                    .session
+                    .as_mut()
+                    .unwrap()
+                    .grant
+                    .as_mut()
+                    .unwrap()
+                    .aux_published = true;
+                super::super::ap_session::command(self, 3, 0xb, &aux).await?;
+            }
+            Abi::Session2 => self.p2p_prepare_session2(channel, rx_chains).await?,
+            _ => return Err("P2P unimplemented native SESSION adapter"),
+        }
         self.p2p
             .session
             .as_mut()
@@ -417,11 +487,30 @@ impl Hardware {
         lease.policy = Some(policy.bind(program)?);
         lease.deadline = narf_time::wall::monotonic_ns()
             .saturating_add((u64::from(duration_ms) + 2500) * 1_000_000);
-        let command = Abi::Roc6.roc_add(activity, aux_station, channel, own, duration)?;
         lease.add_published = true;
         // START may be copied while this ACK is held; observe() opens only
         // from that exact native notification, never this command receipt.
-        super::super::ap_session::command(self, 3, p2p_wire::ROC, &command).await
+        match abi {
+            Abi::Roc6 => {
+                super::super::ap_session::command(
+                    self,
+                    3,
+                    p2p_wire::ROC,
+                    &abi.roc_add(activity, aux_station, channel, own, duration)?,
+                )
+                .await
+            }
+            Abi::Session2 => {
+                super::super::ap_session::command(
+                    self,
+                    3,
+                    p2p_wire::SESSION,
+                    &abi.session_add(Target::Link(LINK as u8), activity, duration)?,
+                )
+                .await
+            }
+            _ => Err("P2P unimplemented native SESSION adapter"),
+        }
     }
     pub(in crate::iwlwifi) fn p2p_needs_retirement(&self) -> bool {
         self.p2p.session.as_ref().is_some_and(|s| {
@@ -458,6 +547,8 @@ impl Hardware {
         };
         let capture = session.epoch.advance()?;
         let aux_station = session.aux_station;
+        let abi = session.abi;
+        let own = session.own;
         if let Some(lease) = &mut session.grant {
             lease.grant.close();
             lease.closing = true;
@@ -472,9 +563,28 @@ impl Hardware {
             if lease.queue_published && lease.queue.is_none() {
                 return Err("P2P uncertain native queue allocation requires physical reset");
             }
-            if lease.add_published {
-                let remove = Abi::Roc6.roc_remove(lease.activity)?;
-                super::super::ap_session::command(self, 3, p2p_wire::ROC, &remove).await?;
+            if lease.add_published && !lease.native_ended {
+                match abi {
+                    Abi::Roc6 => {
+                        super::super::ap_session::command(
+                            self,
+                            3,
+                            p2p_wire::ROC,
+                            &abi.roc_remove(lease.activity)?,
+                        )
+                        .await?
+                    }
+                    Abi::Session2 => {
+                        super::super::ap_session::command(
+                            self,
+                            3,
+                            p2p_wire::SESSION,
+                            &abi.session_remove(Target::Link(LINK as u8), lease.activity)?,
+                        )
+                        .await?
+                    }
+                    _ => return Err("P2P unimplemented native SESSION adapter"),
+                }
             }
             // Synchronous REMOVE forbids future notifications of this ROC.
             // All real RFH markers retire the already-captured prefix before
@@ -491,6 +601,18 @@ impl Hardware {
             }
             if aux {
                 self.ap_remove_peer(aux_station).await?;
+            }
+            if abi == Abi::Session2 {
+                let channel = self
+                    .p2p
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .grant
+                    .as_ref()
+                    .unwrap()
+                    .channel;
+                self.p2p_unlink_session2(own, channel).await?;
             }
         }
         let session = self.p2p.session.as_mut().unwrap();
@@ -608,9 +730,8 @@ impl Hardware {
         session.sequence = (session.sequence + 1) & 4095;
         // Linux P2P is no-CCK even in2.4GHz. Actual admitted Sc/Bz ratev3
         // uses OFDM6 legacy index0 +modulationbit8 +actual single TX chain.
-        let result = self
-            .transmit_ap(queue, &frame, 24, Some((antenna << 14) | 0x100), false)
-            .await;
+        let rate = (antenna << 14) | if session.abi == Abi::Roc6 { 0x100 } else { 13 };
+        let result = self.transmit_ap(queue, &frame, 24, Some(rate), false).await;
         if let Some(session) = self.p2p.session.as_ref() {
             self.p2p.gate = Some(Gate::new(
                 session.start.clone(),
@@ -625,3 +746,6 @@ impl Hardware {
         }
     }
 }
+
+#[path = "runtime_p2p_session.rs"]
+mod session;

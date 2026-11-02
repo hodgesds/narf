@@ -174,4 +174,14 @@ impl Gate {
         }
         Ok(())
     }
+    /// Only FRAME carries a received finite native Publication. A live
+    /// START/request alone cannot authorize any actual packet publication.
+    pub fn transmission(&self) -> Result<(), &'static str> {
+        self.check()?;
+        self.grant
+            .as_ref()
+            .filter(|grant| grant.current())
+            .map(|_| ())
+            .ok_or("Intel P2P TX lacks its actual native grant")
+    }
 }

@@ -65,6 +65,8 @@ mod hardware;
 mod ht;
 mod rx_ba;
 mod rx_ba_power;
+mod tracking8821c;
+pub use tracking8821c::Request as PowerTrackingRequest;
 mod tx_ba;
 mod tx_ba_power;
 #[cfg(feature = "kernel-test")]

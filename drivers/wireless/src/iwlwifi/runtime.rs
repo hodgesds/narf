@@ -1704,6 +1704,7 @@ impl Hardware {
         if self.failed {
             return Err("Wi-Fi transport failed");
         }
+        self.check_p2p_tx_publication()?;
         let sources = self.source_fence()?;
         self.check_six_tx_publication()?;
         let queue = self
@@ -1846,6 +1847,7 @@ impl Hardware {
         {
             return Err("MVM station closed before native packet publication");
         }
+        self.check_p2p_tx_publication()?;
         let sources = self.source_fence()?;
         self.check_six_tx_publication()?;
         let queue = self

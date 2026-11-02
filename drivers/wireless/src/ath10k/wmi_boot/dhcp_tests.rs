@@ -8,6 +8,8 @@ use narf_net::Interface;
 use narf_wireless::{AssociateRequest, ScanRequest, SecurityConfig, WirelessError};
 #[path = "associated_scan_conversation_tests.rs"]
 mod associated_scan_conversation_tests;
+#[path = "beacon_hint_conversation_tests.rs"]
+mod beacon_hint_conversation_tests;
 #[path = "chains_conversation_tests.rs"]
 mod chains_conversation_tests;
 #[path = "coding_conversation_tests.rs"]
@@ -210,6 +212,29 @@ impl Harness {
         factory: u32,
         profile: NativeFirmware,
     ) -> Self {
+        Self::new_on_snapshot(
+            version,
+            dialect,
+            secured,
+            active_scan,
+            frequency,
+            factory,
+            (profile, None),
+        )
+    }
+    fn new_on_snapshot(
+        version: u32,
+        dialect: Dialect,
+        secured: bool,
+        active_scan: bool,
+        frequency: u16,
+        factory: u32,
+        source: (
+            NativeFirmware,
+            Option<Arc<narf_wireless::reg::db::Database>>,
+        ),
+    ) -> Self {
+        let (profile, snapshot) = source;
         let hardware = profile.radio.hardware;
         let mut radio = radio_boot_source_version(
             version,
@@ -221,6 +246,10 @@ impl Harness {
             profile.radio,
         );
         radio.htt.wmi.htc.transport.frequency = frequency;
+        if let Some(database) = &snapshot {
+            radio.beacon_policy_for_test(database.clone());
+            radio.htt.wmi.htc.transport.beacon_hint = BeaconHintFixture::Beacon;
+        }
         if active_scan {
             let mut fixture = if frequency < 3000 {
                 super::super::active_scan_tests::Fixture::directed(1)
@@ -273,7 +302,10 @@ impl Harness {
             &name,
             OWN,
             Arc::new(Mutex::new(radio)),
-            move || current.lock().clone(),
+            move || match &snapshot {
+                Some(database) => database.snapshot().map(|policy| policy.as_ref().clone()),
+                None => current.lock().clone(),
+            },
         ));
         narf_net::iface::register_with_context(&name, OWN, device.generation_for_test(), send);
         *ACTIVE_TEST.lock() = Some(device.clone());
@@ -1047,6 +1079,7 @@ fn composition_profile(
 enum TestPhy {
     Legacy,
     Indoor,
+    BeaconHint,
     Wmm,
     Ht,
     Ht40,
@@ -1063,22 +1096,26 @@ fn composition_radio(
     frequency: u16,
     phy: TestPhy,
 ) -> Result<(), &'static str> {
-    let qos = !matches!(phy, TestPhy::Legacy | TestPhy::Indoor);
-    let h = Harness::new_on_ht(
-        version,
-        dialect,
-        secured,
-        active_scan,
-        frequency,
-        if frequency < 3000 { 0x64 } else { 0x8348 },
-        if phy == TestPhy::Sgi40 {
-            Some(0x803)
-        } else if phy == TestPhy::Mimo {
-            Some(0x7b)
-        } else {
-            None
-        },
-    );
+    let qos = !matches!(phy, TestPhy::Legacy | TestPhy::Indoor | TestPhy::BeaconHint);
+    let h = if phy == TestPhy::BeaconHint {
+        beacon_hint_conversation_tests::harness(version, dialect, secured, None)
+    } else {
+        Harness::new_on_ht(
+            version,
+            dialect,
+            secured,
+            active_scan,
+            frequency,
+            if frequency < 3000 { 0x64 } else { 0x8348 },
+            if phy == TestPhy::Sgi40 {
+                Some(0x803)
+            } else if phy == TestPhy::Mimo {
+                Some(0x7b)
+            } else {
+                None
+            },
+        )
+    };
     if phy == TestPhy::Indoor {
         indoor_conversation_tests::install(&h);
     }

@@ -2217,8 +2217,10 @@ describe the remaining native paths.
   Compilation/native acceptance is pending for that slice. The applicable
   Gen2/API77 MVM adapter is still required, so the literal family row stays
   open; P2P GO/discovery remains separately open.
-- **p2p.** There is no native P2P device/client/GO role owner or discovery
-  and action exchange; the existing native interface is one BSS station.
+- **p2p.** §§3.73–3.74 implement a bounded actual control-device discovery
+  and unprotected management exchange for Sc/Bz and API89. The API77 SESSION1
+  adapter, CLIENT/GO native peer/key/data roles, NoA and public CTWindow/OPPPS
+  remain open; this device-only continuation does not close the family row.
 - **wow.** There is no D3 firmware image, `D3_CONFIG_CMD` or WoWLAN key
   material path, although the shared `wowlan_support` exists.
 - **ml_baid** is implemented for source-advertised API77
@@ -4507,6 +4509,12 @@ and floor-TU duration contracts are retained. A correlated command ACK cannot
 open the grant; only the matching successful native START may do so. The
 grant's bounded native interval, original source and actual copied END/stop
 state are checked at final queue publication, including credit waits.
+Both native TX boundaries additionally consume the already-completed fallback
+RFH prefix in a bounded attempt and recheck the original FRAME grant after
+each batch. END beyond one64-descriptor receive budget cannot authorize a
+later TX. A continuously moving prefix refuses publication. Written native
+cases count posted TFH attempts before peer validation, so peer rejection
+cannot hide a host submission after an already-queued END.
 
 REGISTER_FRAME retains its original control source without granting RF.
 Copied management requires fallback0, original band/channel/FW-link1, physical
@@ -4540,3 +4548,51 @@ host NO_IR. This bounded source remains pending coordinated release checking,
 native execution and review. API77/API89 SESSION adapters, CLIENT/GO native
 peer/key/data owners, NoA, CTWindow/OPPPS and remaining whole-family P2P scope
 are still open; this continuation does not close the literal P2P row.
+
+### 3.74 API89 P2P SESSION2 physical adapter
+
+The API89 Ty/So/Ma continuation reuses the exact original registered parent,
+actual DEVICE10 child, retained physical worker and callback-free request/copy
+fences from §3.73. Admission selects the loaded MAC2/LINK2/PHY4/RLC2/TX10,
+SESSION2/notification3 and capability54 contracts, factual station/link counts
+and actual API59 band-in-RFH support. API89 ROCv3 is Linux's hotspot path; it
+is never substituted for a P2P AUX grant. API77 SESSION1 remains unavailable.
+
+START creates actual MAC1/type6 and inactive FW-link1. Before each SESSION2
+ADD, current raw NVM/MCC/host ACTIVE permission, platform SAR and the actual
+acknowledged SET_DEVICE ceiling precede PHY1 publication. Device retains the
+original raw NVM RX antenna bitmap as well as TX antennas and checks both on
+recovery. RLC2 targets that actual PHY1 with its own valid-chain mask and
+active/idle counts; an earlier PHY0 receiver receipt is insufficient. The
+LINK1 command first binds PHY1 while inactive, then acknowledges ACTIVE and
+legacy OFDM rates before the BCAST_MGMT station and TVQM TID16 queue. A possibly
+published inactive binding is retained for cleanup even if its ACK fails the
+final source check. Native station0, MAC0, FW-link0 and PHY0 remain reserved.
+
+The broadcast station uses both all-FF peer addresses, actual FW-link1 and
+only the loaded capability109 MFP flag. Its slot is the last factual station
+(14 slots yields13; 15 yields14), independently of the AUX ABI. The actual
+SESSION2 selector is active firmware-link1 and configuration2 for discovery
+or3 for negotiation; it carries no channel. Native PHY/link receipts supply
+that separate legacy20 geometry. Management TX uses the actual API89 rate-v2
+OFDM6 PLCP13 and one actual TX antenna; Sc/Bz retain their rate-v3 encoding.
+
+Only matching native SESSION START opens the finite grant. Exact native END
+or failed START closes it and retires the session without sending a redundant
+REMOVE; explicit cancellation first acknowledges the original link/config
+REMOVE. Both paths close TX/copy epochs, synchronize every owned RFH prefix,
+flush and remove the exact queue and BCAST station, acknowledge LINK1 inactive
+and unbound, then remove PHY1. STOP subsequently removes LINK1/MAC1. A stale
+copy from an END drain cannot become a later same-configuration grant. Source
+loss and dropped waiters retain this cleanup, and ambiguous native ownership
+uses the existing physical reset/BME-off path without releasing uncertain DMA.
+
+Two new unexecuted fixtures extend the original five unchanged registrations.
+Actual Ty, CDB So and Ma conversations assert separate PHY1/RLC2, binding/active
+ordering, broadcast fields/counts, TID16, SESSION selectors, original-copy RX,
+native TX, explicit STOP and natural END followed by fresh grant reuse. Held
+PHY/RLC/LINK/SESSION receipts cover original source loss and waiter cancellation
+without READY, data publication or copied-event transfer. This continuation
+remains pending coordinated release compilation, native execution and review.
+CLIENT/GO, NoA, CTWindow/OPPPS and API77 are separate unfinished native scope;
+the literal P2P row remains open.

@@ -157,6 +157,7 @@ pub struct Permission {
 /// continuation can supply one to the native packet owner.
 #[derive(Clone)]
 pub struct Gate {
+    tracking: Option<alloc::sync::Arc<super::tracking8821c::Grant>>,
     scope: Scope,
     extension: Option<alloc::sync::Arc<super::station_profile::Grant>>,
     ht: Option<alloc::sync::Arc<super::ht::Grant>>,
@@ -339,6 +340,7 @@ impl Gate {
         own: [u8; 6],
     ) -> Self {
         Self {
+            tracking: None,
             extension: None,
             ht: None,
             rx_ba: None,
@@ -357,6 +359,7 @@ impl Gate {
     pub(super) fn c21(grant: alloc::sync::Arc<super::station_power8821c::Grant>) -> Self {
         Self {
             scope: Scope::C21(grant),
+            tracking: None,
             extension: None,
             ht: None,
             rx_ba: None,
@@ -380,6 +383,9 @@ impl Gate {
         }
     }
     pub(super) fn current(&self) -> Result<(), Error> {
+        if let Some(g) = &self.tracking {
+            g.invoke(|| Ok(())).map_err(|_| Error::Authority)?;
+        }
         if let Some(g) = &self.protection {
             return g.check().map_err(|_| Error::Authority);
         }
@@ -413,6 +419,17 @@ impl Gate {
         }
     }
     pub(super) fn invoke<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
+    ) -> Result<T, super::firmware_transport::Error> {
+        match &self.tracking {
+            Some(g) => g.invoke(|| self.invoke_base(operation)),
+            None => self.invoke_base(operation),
+        }
+    }
+    /// Deliberately never dispatch through N21W: maintenance and retained
+    /// source checks cannot recursively instantiate the full Gate invoker.
+    pub(super) fn invoke_base<T>(
         &self,
         operation: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
     ) -> Result<T, super::firmware_transport::Error> {
@@ -694,6 +711,108 @@ impl Gate {
                 .invoke(self, operation)
         }
     }
+    pub(super) fn power_tracking(&self) -> Option<alloc::sync::Arc<super::tracking8821c::Grant>> {
+        self.tracking.clone()
+    }
+    pub(super) fn without_power_tracking(&self) -> Self {
+        let mut g = self.clone();
+        g.tracking = None;
+        g
+    }
+    pub(super) fn with_power_tracking(
+        &self,
+        g: alloc::sync::Arc<super::tracking8821c::Grant>,
+    ) -> Result<Self, super::firmware_transport::Error> {
+        if self.tracking.is_some() || !g.matches(self) {
+            return Err(super::firmware_transport::Error::State);
+        }
+        g.invoke(|| Ok(()))?;
+        let mut gate = self.clone();
+        gate.tracking = Some(g);
+        Ok(gate)
+    }
+    pub(super) fn tracking_sources(
+        &self,
+    ) -> [Option<alloc::sync::Arc<super::qualification::Grant>>; 3] {
+        [self.coding.clone(), self.qos.clone(), self.fallback.clone()]
+    }
+    pub(super) fn tracking_factory_limits(&self) -> Option<[u8; 3]> {
+        let Scope::C21(g) = &self.scope else {
+            return None;
+        };
+        let [cck, ofdm] = g.factory_limits();
+        Some([cck, ofdm, self.ht_facts()?.maximum])
+    }
+    /// Current ceiling of the exact H/R/T/RTS prefix, without W dispatch.
+    pub(super) fn tracking_limit(&self) -> Result<i16, super::firmware_transport::Error> {
+        if let Some(g) = &self.protection {
+            return g.limit();
+        }
+        if let Some(g) = &self.tx_ba {
+            return g.limit();
+        }
+        if let Some(g) = &self.rx_ba {
+            return g.limit();
+        }
+        self.ht
+            .as_ref()
+            .ok_or(super::firmware_transport::Error::State)?
+            .rx_ba_limit()
+    }
+    pub(super) fn tracking_identity(
+        &self,
+        h: &mut narf_crypto::sha256::Sha256,
+    ) -> Result<(), super::firmware_transport::Error> {
+        let ht = self
+            .ht
+            .as_ref()
+            .ok_or(super::firmware_transport::Error::State)?;
+        let (id, digest, did) = ht.rx_ba_identity();
+        h.update(&did.to_le_bytes());
+        h.update(&id);
+        h.update(&digest);
+        h.update(
+            &self
+                .tracking_factory_limits()
+                .ok_or(super::firmware_transport::Error::State)?,
+        );
+        if let Some(r) = &self.rx_ba {
+            let (i, d) = r.tx_identity();
+            h.update(b"R");
+            h.update(&i);
+            h.update(&d);
+        } else {
+            h.update(b"noR");
+        }
+        if let Some(t) = &self.tx_ba {
+            let (i, d) = t.protection_identity();
+            h.update(b"T");
+            h.update(&i);
+            h.update(&d);
+        } else {
+            h.update(b"noT");
+        }
+        if let Some(x) = &self.protection {
+            let (i, d) = x.tracking_identity();
+            h.update(b"X");
+            h.update(&i);
+            h.update(&d);
+        } else {
+            h.update(b"noX");
+        }
+        for g in &self.tracking_sources() {
+            match g {
+                Some(g) => {
+                    let (i, d) = g.source_identity();
+                    h.update(&[g.tag()]);
+                    h.update(&i);
+                    h.update(&d);
+                }
+                None => h.update(&[0]),
+            }
+        }
+        Ok(())
+    }
     pub(super) fn c21_indices(&self) -> Option<[u8; 12]> {
         match &self.scope {
             Scope::C21(g) => Some(g.indices()),
@@ -705,6 +824,9 @@ impl Gate {
         domain: &narf_wireless::reg::RegulatoryDomain,
         operation: impl FnOnce() -> Result<T, super::firmware_transport::Error>,
     ) -> Result<T, super::firmware_transport::Error> {
+        if let Some(g) = &self.tracking {
+            return g.invoke(|| self.invoke_base(operation));
+        }
         if let Some(g) = &self.protection {
             return g.invoke(operation);
         }

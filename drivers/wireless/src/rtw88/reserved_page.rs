@@ -161,6 +161,45 @@ pub(super) unsafe trait Registers: Send {
         Err(Error::Unsupported)
     }
     /// Bind an N2xC/N2xQ continuation into the retained station gate.
+    fn station_power_tracking_request(
+        &mut self,
+        _: u8,
+        _: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> Result<super::PowerTrackingRequest, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_power_tracking_extension(
+        &mut self,
+        _: u8,
+        _: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> Result<Option<alloc::sync::Arc<super::tracking8821c::Grant>>, Error> {
+        Ok(None)
+    }
+    fn station_bind_power_tracking(
+        &mut self,
+        _: alloc::sync::Arc<super::tracking8821c::Grant>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_power_tracking_begin(
+        &mut self,
+        _: &alloc::sync::Arc<super::tracking8821c::Grant>,
+        _: bool,
+    ) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_power_tracking_quiet(&mut self) -> Result<bool, Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_power_tracking_iqk(&mut self) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+    fn station_power_tracking_finish(
+        &mut self,
+        _: Option<super::tracking8821c::Program>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     fn station_bind_continuation(
         &mut self,
         _: alloc::sync::Arc<super::qualification::Grant>,
@@ -402,6 +441,47 @@ impl<R: Registers, M: Memory> Backend<R, M> {
 // before publication, poisons before mutation and reopens only on a fresh
 // page completion; R's unsafe contract governs all other native queue state.
 unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
+    fn station_power_tracking_request(
+        &mut self,
+        t: u8,
+        d: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> Result<super::PowerTrackingRequest, Error> {
+        self.io.station_power_tracking_request(t, d)
+    }
+
+    fn station_power_tracking_extension(
+        &mut self,
+        thermal: u8,
+        dm: Option<alloc::sync::Arc<super::qualification::Grant>>,
+    ) -> Result<Option<alloc::sync::Arc<super::tracking8821c::Grant>>, Error> {
+        self.io.station_power_tracking_extension(thermal, dm)
+    }
+    fn station_bind_power_tracking(
+        &mut self,
+        g: alloc::sync::Arc<super::tracking8821c::Grant>,
+    ) -> Result<(), Error> {
+        self.io.station_bind_power_tracking(g)
+    }
+    fn station_power_tracking_begin(
+        &mut self,
+        g: &alloc::sync::Arc<super::tracking8821c::Grant>,
+        restore: bool,
+    ) -> Result<bool, Error> {
+        self.io.station_power_tracking_begin(g, restore)
+    }
+    fn station_power_tracking_quiet(&mut self) -> Result<bool, Error> {
+        self.io.station_power_tracking_quiet()
+    }
+    fn station_power_tracking_iqk(&mut self) -> Result<(), Error> {
+        self.io.station_power_tracking_iqk()
+    }
+    fn station_power_tracking_finish(
+        &mut self,
+        p: Option<super::tracking8821c::Program>,
+    ) -> Result<(), Error> {
+        self.io.station_power_tracking_finish(p)
+    }
+
     fn station_tx_ba_extension(
         &mut self,
     ) -> Result<Option<alloc::sync::Arc<super::tx_ba_power::Grant>>, Error> {

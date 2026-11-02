@@ -16,14 +16,16 @@
  */
 //! Immutable EEPROM regulatory identity, following Linux ath/regd.c.
 //! A country hint or CTL identifier alone never grants host transmit rights.
+use super::wmi_runtime::beacon_hints::Receipt;
 use super::wmi_runtime::Error;
 pub use crate::qualcomm_regulatory::{Factory, FactoryError};
+use alloc::sync::Arc;
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests;
 
 /// Bound, additional host power ceiling for the occupied station channel.
 /// station profile. Factory CTL and calibration stay active in firmware.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Permission {
     pub factory: Factory,
     pub country: [u8; 2],
@@ -36,6 +38,9 @@ pub(super) struct Permission {
     /// A separately granted noncontiguous80 segment; never fills the gap.
     pub center2: Option<u16>,
     pub half_dbm: u8,
+    /// Original native World-layer observation and exact policy/radio scope.
+    /// None keeps every existing unhinted constructor conservative.
+    pub(super) hint: Option<Arc<Receipt>>,
 }
 impl Permission {
     pub fn profile_frequency(frequency: u16) -> bool {
@@ -79,9 +84,19 @@ impl Permission {
         secondary: Option<u16>,
         width80: bool,
     ) -> Result<Self, Error> {
-        // Linux's strict initial custom world domain admits 1..11 to
-        // initiate radiation; channels requiring beacon-hint/DFS state
-        // are not promoted by this first station profile.
+        Self::occupied_width_with_hint(caps, domain, frequency, secondary, width80, None)
+    }
+    pub(in crate::ath10k) fn occupied_width_with_hint(
+        caps: &super::wmi_boot::Capabilities,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        frequency: u16,
+        secondary: Option<u16>,
+        width80: bool,
+        hint: Option<Arc<Receipt>>,
+    ) -> Result<Self, Error> {
+        // Keep the existing inventory: channels1..11 and these non-DFS5GHz
+        // centers only. World5GHz additionally needs the original native
+        // Beacon receipt below; a hint never extends the hardware inventory.
         if !Self::profile_frequency(frequency)
             || !domain.country_code.iter().all(u8::is_ascii_uppercase)
         {
@@ -106,7 +121,17 @@ impl Permission {
             return Err(Error::Unsupported);
         }
         let factory = Factory::from_eeprom(caps.eeprom_domain).map_err(|_| Error::Unsupported)?;
-        Self::from_factory_width(factory, domain, frequency, secondary, width80)
+        match hint {
+            Some(hint) => Self::from_factory_width_with_hint(
+                factory,
+                domain,
+                frequency,
+                secondary,
+                width80,
+                Some(hint),
+            ),
+            None => Self::from_factory_width(factory, domain, frequency, secondary, width80),
+        }
     }
     fn from_factory_width(
         factory: Factory,
@@ -115,16 +140,19 @@ impl Permission {
         secondary: Option<u16>,
         width80: bool,
     ) -> Result<Self, Error> {
+        Self::from_factory_width_with_hint(factory, domain, frequency, secondary, width80, None)
+    }
+    fn from_factory_width_with_hint(
+        factory: Factory,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        frequency: u16,
+        secondary: Option<u16>,
+        width80: bool,
+        hint: Option<Arc<Receipt>>,
+    ) -> Result<Self, Error> {
         let two_ghz = frequency < 3000;
         use narf_wireless::reg::RegFlags;
         if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
-            return Err(Error::Unsupported);
-        }
-        // World 5GHz is NO_IR in Linux ath/regd.c. No beacon-hint or DFS
-        // qualification is invented. The wider profile requires a resolved
-        // fixed-country factory identity matching the authenticated host DB;
-        // immutable factory pair/CTL and target calibration remain active.
-        if !two_ghz && (factory.country == 0 || factory.alpha2 != domain.country_code) {
             return Err(Error::Unsupported);
         }
         if secondary.is_some_and(|s| {
@@ -158,6 +186,30 @@ impl Permission {
             40
         } else {
             20
+        };
+        let hint = if !two_ghz && factory.country == 0 {
+            // Only a typed original native observation can lift the factory
+            // World NO_IR layer. No host rule is changed, and a primary
+            // beacon cannot fill an unobserved wider occupied channel.
+            let frequencies = if width80 {
+                [center - 30, center - 10, center + 10, center + 30]
+            } else {
+                [
+                    frequency,
+                    secondary.unwrap_or(frequency),
+                    frequency,
+                    secondary.unwrap_or(frequency),
+                ]
+            };
+            Some(
+                hint.and_then(|h| h.restrict(factory, domain, &frequencies))
+                    .ok_or(Error::Unsupported)?,
+            )
+        } else {
+            if !two_ghz && factory.alpha2 != domain.country_code {
+                return Err(Error::Unsupported);
+            }
+            None
         };
         let low = u32::from(center) - width / 2;
         let high = u32::from(center) + width / 2;
@@ -206,33 +258,37 @@ impl Permission {
             width80,
             center2: None,
             half_dbm,
+            hint,
         })
     }
     /// Recheck the chosen immutable factory/frequency receipt against the
     /// current host policy without querying or inventing hardware facts.
-    pub fn check(self, domain: &narf_wireless::reg::RegulatoryDomain) -> Result<(), Error> {
-        let mut current = Self::from_factory_width(
+    pub fn check(&self, domain: &narf_wireless::reg::RegulatoryDomain) -> Result<(), Error> {
+        let mut current = Self::from_factory_width_with_hint(
             self.factory,
             domain,
             self.frequency,
             self.secondary,
             self.width80,
+            self.hint.clone(),
         )?;
         if let Some(second) = self.center2 {
             if !self.width80 || !matches!(second, 5210 | 5775) || second == self.center {
                 return Err(Error::Unsupported);
             }
-            let other = Self::from_factory_width(
+            let other = Self::from_factory_width_with_hint(
                 self.factory,
                 domain,
                 second - 30,
                 Some(second - 10),
                 true,
+                self.hint.clone(),
             )?;
             current.half_dbm = current.half_dbm.min(other.half_dbm);
             current.center2 = Some(second);
+            current.merge_hint(&other)?;
         }
-        if current != self {
+        if &current != self {
             return Err(Error::Unsupported);
         }
         Ok(())
@@ -244,14 +300,47 @@ impl Permission {
         secondary: u16,
         center2: u16,
     ) -> Result<Self, Error> {
-        let mut first = Self::occupied_width(caps, domain, primary, Some(secondary), true)?;
+        Self::discontiguous_with_hint(caps, domain, primary, secondary, center2, None)
+    }
+    pub(in crate::ath10k) fn discontiguous_with_hint(
+        caps: &super::wmi_boot::Capabilities,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        primary: u16,
+        secondary: u16,
+        center2: u16,
+        hint: Option<Arc<Receipt>>,
+    ) -> Result<Self, Error> {
+        let mut first = Self::occupied_width_with_hint(
+            caps,
+            domain,
+            primary,
+            Some(secondary),
+            true,
+            hint.clone(),
+        )?;
         if !matches!(center2, 5210 | 5775) || center2 == first.center {
             return Err(Error::Unsupported);
         }
-        let other = Self::occupied_width(caps, domain, center2 - 30, Some(center2 - 10), true)?;
+        let other = Self::occupied_width_with_hint(
+            caps,
+            domain,
+            center2 - 30,
+            Some(center2 - 10),
+            true,
+            hint,
+        )?;
         first.center2 = Some(center2);
         first.half_dbm = first.half_dbm.min(other.half_dbm);
+        first.merge_hint(&other)?;
         first.check(domain)?;
         Ok(first)
+    }
+    fn merge_hint(&mut self, other: &Self) -> Result<(), Error> {
+        self.hint = match (&self.hint, &other.hint) {
+            (None, None) => None,
+            (Some(a), Some(b)) => Some(a.union(b).ok_or(Error::Unsupported)?),
+            _ => return Err(Error::Unsupported),
+        };
+        Ok(())
     }
 }

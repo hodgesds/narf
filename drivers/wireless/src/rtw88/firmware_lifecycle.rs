@@ -153,6 +153,16 @@ impl<I: Io> Lifecycle<I> {
             .ok_or(Error::State)?
             .rts_request()
     }
+    pub(super) async fn power_tracking_request(
+        &self,
+    ) -> Result<super::PowerTrackingRequest, Error> {
+        self.retained
+            .lock()
+            .await
+            .as_mut()
+            .ok_or(Error::State)?
+            .power_tracking_request()
+    }
     pub(super) async fn tracking_request(&self) -> Result<super::ContinuationRequest, Error> {
         self.retained
             .lock()

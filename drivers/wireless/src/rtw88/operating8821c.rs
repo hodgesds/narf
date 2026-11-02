@@ -80,6 +80,7 @@ pub(super) struct Envelope {
     peaks: [i16; 14],
     thermal: [u8; 2],
     ht_limit: Option<u8>,
+    factory_limits: [u8; 2],
 }
 fn factory_limits(factory: &Factory8821c) -> Result<[u8; 2], QError> {
     // Original C21 BTG RFE2/4 substitutes pathB's 2G record for physical RF-A.
@@ -153,6 +154,9 @@ impl Source {
     }
 }
 impl Envelope {
+    pub(super) fn factory_limits(&self) -> [u8; 2] {
+        self.factory_limits
+    }
     pub(super) fn ht_facts(&self) -> Option<super::ht::Facts> {
         Some(super::ht::Facts {
             hardware: self.calibration.hardware(),
@@ -229,6 +233,7 @@ impl Envelope {
             peaks,
             thermal,
             ht_limit: None,
+            factory_limits: limits,
         })
     }
     pub(super) fn matches(&self, request: &Request) -> bool {

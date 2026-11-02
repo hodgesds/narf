@@ -162,6 +162,7 @@ pub(super) struct State {
     last_peer: u64,
     last_now: u64,
     tracking: Tracking,
+    power_tracking: Option<Box<super::tracking8821c::Tracker>>,
 }
 /// Separately qualified dynamic-mechanism watchdog (`dm`, tag `D`).
 #[derive(Default)]
@@ -259,11 +260,15 @@ impl State {
             last_peer: 0,
             last_now: 0,
             tracking: Tracking::default(),
+            power_tracking: None,
         }
     }
     /// Exact retained factory/radio facts for the dm watchdog statistics.
     pub(super) fn set_tracking_facts(&mut self, facts: Option<super::dm::Facts>) {
         self.tracking.facts = facts;
+    }
+    pub(super) fn dm_grant(&self) -> Option<Arc<super::qualification::Grant>> {
+        self.tracking.grant.clone()
     }
     pub(super) fn tracking_active(&self) -> bool {
         self.tracking.grant.is_some()
@@ -279,6 +284,30 @@ impl State {
     /// established. Losing the continuation or leaving its measured envelope
     /// restores the base program under the base gate and stops tracking.
     pub(super) async fn watchdog(&mut self, io: &mut impl Io) -> Result<bool, Error> {
+        let mut power_changed = false;
+        if self.power_tracking.is_some() && self.established && self.ready() {
+            let now = self.now()?;
+            let mut tracker = self.power_tracking.take().ok_or(Error::State)?;
+            let mut attempt = Attempt {
+                admission: self.admission.clone(),
+                armed: true,
+            };
+            let result = Box::pin(tracker.tick(io, &self.admission, now, self.data_profile)).await;
+            if tracker.grant().active() {
+                self.power_tracking = Some(tracker);
+            }
+            match result {
+                Ok(changed) => {
+                    power_changed = changed;
+                    attempt.armed = false;
+                }
+                Err(error) => {
+                    self.fail(io);
+                    attempt.armed = false;
+                    return Err(Error::Native(error));
+                }
+            }
+        }
         if self.established && self.ready() {
             let admission = self.admission.clone();
             admission.run(|| {
@@ -294,11 +323,11 @@ impl State {
             }
         }
         if self.tracking.grant.is_none() || !self.established || !self.ready() {
-            return Ok(false);
+            return Ok(power_changed);
         }
         let now = self.now()?;
         if now < self.tracking.next {
-            return Ok(false);
+            return Ok(power_changed);
         }
         self.tracking.next = now.saturating_add(super::dm::PERIOD_MS);
         let grant = self.tracking.grant.clone().ok_or(Error::State)?;
@@ -651,6 +680,9 @@ impl State {
             let step = io.packet_poll()?;
             if let Some(receipt) = step.receipt {
                 self.delivery(receipt)?;
+            }
+            if let (Some(body), Some(t)) = (&step.c2h, self.power_tracking.as_mut()) {
+                t.c2h(body);
             }
             if let (Some(body), Some(t)) = (&step.c2h, self.tracking.tracker.as_mut()) {
                 t.c2h(body);
@@ -1435,6 +1467,23 @@ impl State {
             let gate = io.station_gate()?;
             if super::dm::bounds(gate.did(), g.payload()).is_some() && g.check(&gate).is_ok() {
                 self.tracking.grant = Some(g);
+            }
+        }
+        if let Some(facts) = self
+            .tracking
+            .facts
+            .filter(|f| f.did == 0xc821 && f.power_track_type == 0 && f.thermal[0] <= 63)
+        {
+            if self.ht.is_some() {
+                if let Some(g) = io.station_power_tracking_extension(
+                    facts.thermal[0],
+                    self.tracking.grant.clone(),
+                )? {
+                    self.admission
+                        .run(|| io.station_bind_power_tracking(g.clone()))?;
+                    self.admission.retire_receive()?;
+                    self.power_tracking = Some(Box::new(super::tracking8821c::Tracker::new(g)));
+                }
             }
         }
         station_control::prepare_peer(io, bssid, &self.admission).await?;

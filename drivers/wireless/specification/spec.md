@@ -447,16 +447,32 @@ The previous two power implementations passed72 focused cases on each architectu
 but still await that matrix. Counting unvalidated features,82 remain. Physical
 measurements, signed programs and per-device acceptance remain separate.
 
+**Source implementation recount 2026-11-02** (native thermal tracking and Beacon hints):
+the remaining ledger holds **75 `feature`**, **31 `chip`** and **0 `unknown`**
+rows. Seven source-complete implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. This addition supplies admitted
+RTL8821CE thermal TXAGC/txscale and associated IQK under distinct measured-program
+qualification, and immutable native ath10k Beacon observations lifting only the
+factory World layer. Signed host restrictions and original native publication
+owners remain required. Intel API89 SESSION2 extends the partial P2P DEVICE
+milestone; API77 and CLIENT/GO/power-save roles remain open. Sixteen new cases
+are written and unexecuted. One combined release metadata check and scoped
+formatting pass; full release/native validation remains deferred to the next
+25-feature batch. The known T2/P2P repair selection passes21/0/0 on each
+architecture at `42df9b354`; this does not accept the new source extensions.
+Counting unvalidated implementations,82 remain. Real board measurements,
+signed programs and physical acceptance remain separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
-| iwlwifi | 3 | MLO, P2P and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; bounded P2P DEVICE is implemented pending validation; the family P2P row stays open |
+| iwlwifi | 3 | MLO, P2P and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; bounded P2P DEVICE/SESSION2 is implemented pending validation; the family P2P row stays open |
 | ath11k | 0 | QCN9074/IPQ/WCN6750 platform profiles and composed AHB ownership |
 | mt76 | 4 | P2P; native old-key pipeline retirement; per-domain IOMMU/non-coherent DMA; hosted loadable packet ABI is software-accepted at `6813a24c6` |
-| ath10k | 9 | Contiguous VHT160, alternate calibration sources, hardware keys, AP/P2P, DFS/beacon hints, credential replay and wake offload; host-bus PM, bounded PFC and signed indoor admission are implemented pending validation; managed Public Action ROC, streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are software-accepted at `6813a24c6` |
+| ath10k | 8 | Contiguous VHT160, alternate calibration sources, hardware keys, AP/P2P, DFS, credential replay and wake offload; host-bus PM, bounded PFC, signed indoor admission and native Beacon hints are implemented pending validation; managed Public Action ROC, streams/TX STBC,2.4GHz HT40/coexistence and bounded80+80 are software-accepted at `6813a24c6` |
 | ath9k | 0 | Counted idle FULL_SLEEP/cold wake is implemented pending validation; prior periodic calibration/ANI, station NETWORK_SLEEP, admitted1–13 cold generations, HT40/SGI40, larger TX aggregates and factory scalar variants are software-accepted at `6813a24c6`; other chips are separate rows |
 | rtlwifi | 4 | Other matched chips, VHT, coexistence and WoWLAN; HT40, RTS/CTS, gain tracking and automatic antenna selection are software-accepted at `6813a24c6` |
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
-| rtw88 | 17 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security and thermal tracking, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets; qualified non-VO originator BA is implemented pending validation |
+| rtw88 | 16 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, reset/suspend/removal, multiple devices and retained-map reclamation; genuine N21S/N21L/N22L/other board assets; qualified non-VO originator BA and C21 RF power tracking are implemented pending validation |
 | rtw89 | 13 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW, periodic RF tracking/runtime LPS and multiple functions; other AX/BE chips are separate rows |
 | brcmfmac | 12 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
 | cyw43439 | 12 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
@@ -1284,7 +1300,25 @@ physical queue and terminal remains independently bound. Family §3 is normative
 Intel Sc/Bz exposes a bounded real control DEVICE with no IFINDEX, UP bit or
 fabricated data endpoint. Original parent, Write/Admin/daemon and native owner
 receipts govern its public ROC/management lifecycle. This partial milestone
-does not advertise unimplemented SESSION or CLIENT/GO roles.
+does not advertise unimplemented API77 SESSION1 or CLIENT/GO roles. API89
+Ty/So/Ma additionally uses actual PHY1/RLC/link1/broadcast-TID16 SESSION2
+receipts; an already-completed RFH prefix and the original finite Frame
+Publication are checked after credit waits before actual packet publication.
+
+### 3.6 Native observations and thermal maintenance (validation pending)
+
+Admitted C21 exposes factual `rtl8821c_power_tracking_request()` metadata for
+distinct signed N21W qualification. Actual meter samples, all-rate factory and
+original H/R/T/RTS ceilings, native queue/RX quiet and associated IQK receipts
+govern maintenance; metadata alone grants no RF access. Power-only restore
+retains original key/BA owners; loss after periodic IQK requires a fresh owner.
+The family §3 and `rtw8821ce-power-tracking.md` define the measured contract.
+
+Ath10k lifts only the admitted factory World passive layer using original
+native ESS Beacon and exact START/FOREIGN dwell observations. Immutable
+receipts retain original policy Arc, physical-radio lifetime and every occupied
+20MHz constituent through waits and copied publication. Signed host NO_IR,
+DFS, indoor and unknown restrictions stay independent. Family §3.2 is normative.
 
 ## 4. Interaction with `narf-wireless`
 

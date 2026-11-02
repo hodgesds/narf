@@ -20,6 +20,8 @@ mod dwell_scan;
 pub(in crate::ath10k) use active_scan::checked as checked_policy;
 pub(in crate::ath10k) use associated_scan::receive_permission;
 pub(in crate::ath10k) use dwell_scan::ScanPolicy;
+#[path = "wmi_runtime/beacon_hints.rs"]
+pub(in crate::ath10k) mod beacon_hints;
 mod chains;
 mod coexistence;
 mod data;
@@ -94,6 +96,8 @@ pub struct ScanReady {
 #[derive(Debug)]
 pub(super) struct Radio<T> {
     scan_cache: Vec<ScanBss>,
+    beacon_hints: beacon_hints::Owner,
+    hint_scan: Option<beacon_hints::Scan>,
     management_done: VecDeque<ManagementCompletion>,
     peer: Option<station::Peer>,
     data: Option<data::State>,
@@ -138,6 +142,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             features,
             ready: None,
             scan_cache: Vec::new(),
+            beacon_hints: beacon_hints::Owner::new(),
+            hint_scan: None,
             management_done: VecDeque::new(),
             peer: None,
             data: None,
@@ -299,6 +305,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         self.sequence = sequence;
         self.failed = true;
         self.scan_pending = Some(sequence);
+        self.begin_beacon_hint_scan(sequence, channels);
         self.scan_terminal = None;
         let retained = self.htt.wmi.htc.transport.nonblocking_wmi();
         for packet in setup
@@ -340,6 +347,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 )
                 .await?
             };
+            self.observe_beacon_hint_event(&event)?;
             match event {
                 htt::Event::Wmi(bytes) => {
                     let id = wire::word(&bytes, 0)? & 0xffffff;

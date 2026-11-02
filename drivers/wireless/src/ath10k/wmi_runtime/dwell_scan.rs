@@ -80,7 +80,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let station = self.scan_binding()?.ok_or(Error::Unsupported)?;
         station.check(domain)?;
         associated_scan::receive_permission(domain, channels)?;
-        let restore = self.scan_restore(Some(station))?;
+        let restore = self.scan_restore(Some(&station))?;
         let mut frequencies = Vec::new();
         frequencies
             .try_reserve_exact(channels.len())
@@ -115,7 +115,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let caps = self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?.clone();
         let validate = || plan.validate(&caps, &current()?);
         validate()?;
-        self.check_scan_binding(plan.station)?;
+        self.check_scan_binding(plan.station.as_ref())?;
         let sequence = self
             .sequence
             .checked_add(1)
@@ -139,6 +139,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             .map_err(|_| Error::NoMemory)?;
         self.sequence = sequence;
         self.scan_pending = Some(sequence);
+        self.begin_beacon_hint_scan(sequence, &plan.channels);
         self.scan_terminal = None;
         self.failed = true;
         for packet in plan
@@ -150,7 +151,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             self.send_scan_command(packet, &validate).await?;
         }
         validate()?;
-        self.check_scan_binding(plan.station)?;
+        self.check_scan_binding(plan.station.as_ref())?;
         self.scan_dwell = Some(Work {
             policy: Arc::new(ScanPolicy {
                 plan,
@@ -171,7 +172,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Ok(());
         };
         work.policy.check(domain)?;
-        self.check_scan_binding(work.policy.plan.station)
+        self.check_scan_binding(work.policy.plan.station.as_ref())
     }
 
     pub(in crate::ath10k) fn scan_policy(&self) -> Option<Arc<ScanPolicy>> {
@@ -258,8 +259,8 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             self.send_scan_command(packet, &validate).await?;
         }
         validate()?;
-        self.check_scan_binding(work.policy.plan.station)?;
-        self.cache_scan_results(&work.report, work.policy.plan.station)?;
+        self.check_scan_binding(work.policy.plan.station.as_ref())?;
+        self.cache_scan_results(&work.report, work.policy.plan.station.as_ref())?;
         self.scan_pending = None;
         self.failed = false;
         Ok(work.report)

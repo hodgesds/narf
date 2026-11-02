@@ -261,8 +261,9 @@ reload/thermal/transport errors, missing/malformed/unsigned/foreign assets,
 NO_IR/overlap policy, suspended cancellation/revocation and exact retained DMA.
 These are register/transport model checks; no physical IQK acceptance is recorded.
 
-C21-specific dynamic PHY/power tracking/beamforming/coexistence and additional
-source-required thermal behavior remain broader work. The calibration-only
+C21 beamforming/coexistence and additional source-required profiles remain
+broader work. The separately qualified N21W continuation below implements
+thermal power tracking and periodic associated IQK. The calibration-only
 asset cannot authorize operating RF or station admission; the separate full
 awake grant and retained native chain below are mandatory.
 C21 PHY state has a distinct type and never populates the C22 PHY/power/radio
@@ -826,7 +827,8 @@ late receipt/terminal reinstall and actual descriptor-to-doorbell source/policy
 revocation. These are inert software models. Physical
 RF acceptance, real signed measured assets and qualification over the full
 permitted awake operating/temperature envelope remain external gates; dynamic
-power tracking and thermal compensation are not claimed.
+power tracking and thermal compensation are not claimed by N21S; the distinct
+N21W continuation below is required.
 
 ### RTL8821CE separately qualified legacy12 DATA and WMM BE/TID0
 
@@ -1595,6 +1597,39 @@ an unqualified station staying fixed; unsigned, altered, foreign and
 revoked records refused. A real signed N2xF measurement and over-the-air
 rate behaviour remain external.
 
+### RTL8821CE thermal TXAGC/txscale and associated IQK (`N21W`)
+
+`Rtw88Device::rtl8821c_power_tracking_request()` exposes measurement metadata
+for the exact already-bound C21 HT20 session. The distinct authenticated
+`rtw88/rtw8821ce-power-track-v1-<mac>.bin` asset enables actual type0 RF-A
+tracking on a fresh association. Its N21W identity binds original factory
+facts and initial scale, H plus optional R/T1/T2/RTS and exact C/Q/F/D signed
+sources, all-rate factory headroom and the complete measured thermal/swing/
+AGC/calibration/transient envelope. N21X remains RTS and N21D's accepted
+C21 mechanism mask stays DIG/CCK-PD/RA.
+
+The retained watchdog triggers the real RF42 conversion and consumes a meter
+at least2s later, applies the source EWMA and CCK/OFDM tables, and writes and
+reads back actual global signed TXAGC and TX-scale fields. Factory headroom
+intersects every legacy/automatic-response/HT rate. Fallback table selection
+uses a real native C2H RA report. Threshold8 periodic IQK uses the original
+retained H2C ring/buffer with associated segment1, nonwrapping command
+sequence, actual DMA terminal and a fresh applied RF08/IQKFAIL receipt.
+
+Mutation retains all keys, PN/replay floors, BA state, native DMA and peer
+ownership, but retires old copied receive admission. DATA/copy publication
+stays closed through actual all-QCU/FIFO quiet, RXDMA park, program/IQK,
+readback and RX/TX restore. Missing, revoked, cancelled or ambiguous native
+receipts keep the station closed and allocations pinned. A power-only change
+can restore the exact static program under current original authority.
+After periodic IQK has changed firmware coefficients, source loss requires a
+fresh lifecycle: there is no invented receipt for restoring startup IQK.
+
+The complete192-byte format, source chain, native barriers and physical
+qualification requirements are in [rtw8821ce-power-tracking.md](rtw8821ce-power-tracking.md).
+Eight composed native cases are written; release/native validation and real
+radio/board acceptance remain pending. No measured deployment asset is shipped.
+
 ### PCI DMA-stop proof and reclamation (`dma_stop.rs`)
 
 A stopped owner used to keep every published mapping forever: the seven TX
@@ -1901,7 +1936,7 @@ changes. None is a physical blocker unless stated.
 | `multi_stream_ht` | `ht.rs::local` advertises and transmits MCS0..7 only, and `ht.rs::program` writes one-stream TXAGC words. 2SS TXAGC/RA mask programming and a measured 2SS envelope are missing. |
 | `operating_reset` | No `rtw_core_stop`/`rtw_core_start` generation reset over a retained owner. `dma_stop.rs` now proves a stopped owner idle and releases it, and `Lifecycle::remove` tears one down, but the lifecycle is one-shot. Its `started` latch, the `pci_firmware::allocate` cold-power precondition (`power::power_on` card-disable to enable runs only in `pci::bring_up`) and the interface `Admission`, which never reopens after `close`, all forbid re-running power-on, firmware download, MAC/PHY/radio and station start on the same function and shell. Needs a generation counter across `Lifecycle`/`Firmware`/`Sibling`/`interface::Device`, a re-entrant cold-power path and admission reopen, plus re-qualification of every continuation against the new generation (patterns: ath9k `reset_owner`, iwlwifi `Owner::recover`). |
 | `radio_coexistence` | No `coex.c` state machine (BT scoreboard, TDMA tables, `rtw_coex_*` notifications) is ported. |
-| `rf_power_tracking` | `dm.rs` admits `PWR_TRACK` only on C22 (`C21_MECHANISMS` = DIG/CCK-PD/RA). The `rtw8821c_pwr_track` TXAGC/txscale port is missing. |
+| `rf_power_tracking` | Source-complete for admitted C21 type0 RF-A HT20 under distinct N21W: real meter/AGC/txscale/associated IQK, exact H/R/T2/RTS plus C/Q/F/D current source composition, all-rate factory limits and actual native quiet/terminal/restore. Power-only restore retains keys/BA; after periodic IQK source loss requires a fresh owner. Eight native cases are written; release/native and physical acceptance remain pending. C22 retains N22D. |
 | `rtl8822be` | The firmware loader and every retained stage reject `10ec:b822`. RTL8822B firmware/MAC/PHY/RF tables are not ported. |
 | `runtime_sleep` | No `ps.c` port. LPS needs `H2C_CMD_SET_PWR_MODE` (0x20) in an LPS mode plus the `rtw_leave_lps_core` path; `station_control.rs` only ever sends the ACTIVE/awake form. IPS (`rtw_enter_ips` = `rtw_core_stop` + `rtw_hci_link_ps`, `rtw_leave_ips` = `rtw_ips_pwr_up`) is a full stop/start, so it is blocked on `operating_reset`. |
 | `safe_rejoin` | Rejoin after a terminal disconnect needs a fresh owner generation (§3: one-shot station, closed `Admission`). It is blocked on `operating_reset`; `narf_net::iface::retire_for_rebind`/`rebind_name` now exist for keeping the `wlan` name across generations. |

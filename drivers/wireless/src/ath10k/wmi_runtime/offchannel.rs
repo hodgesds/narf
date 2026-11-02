@@ -94,10 +94,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             return Err(Error::Unsupported);
         }
         let binding = self.scan_binding()?;
-        if let Some(binding) = binding {
+        if let Some(binding) = &binding {
             binding.check(domain)?;
         }
-        self.check_scan_binding(binding)
+        self.check_scan_binding(binding.as_ref())
     }
     pub(in crate::ath10k) fn roc_owner(&self) -> Option<Owner> {
         self.roc.as_ref().map(|w| w.owner.clone())
@@ -108,7 +108,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(in crate::ath10k) fn roc_current(&self, domain: &RegulatoryDomain) -> Result<bool, Error> {
         let Some(w) = &self.roc else { return Ok(false) };
         w.check(domain)?;
-        self.check_scan_binding(w.plan.station)?;
+        self.check_scan_binding(w.plan.station.as_ref())?;
         Ok(!self.failed
             && w.started
             && w.foreign
@@ -151,7 +151,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         let caps = self.htt.wmi.caps.as_ref().ok_or(Error::Failed)?.clone();
         let domain = current()?;
         receive_permission(&domain, &[receipt.frequency])?;
-        let mut plan = if Permission::from_domain(&caps, &domain, receipt.frequency).is_ok() {
+        let mut plan = if self
+            .hinted_permission(&domain, receipt.frequency, None, false)
+            .is_ok()
+        {
             let mut plan =
                 self.prepare_active_scan(&[receipt.frequency], &[Vec::new()], &domain)?;
             // Enable only a policy-qualified TX row; the scan itself remains
@@ -177,7 +180,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if !owner.emission.current() {
             return Err(Error::Failed);
         }
-        self.check_scan_binding(plan.station)?;
+        self.check_scan_binding(plan.station.as_ref())?;
         let sequence = self
             .sequence
             .checked_add(1)
@@ -240,7 +243,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             let plan = &self.roc.as_ref().ok_or(Error::Failed)?.plan;
             // Do not borrow Radio across its mutable command future.
             let permissions = plan.permissions.clone();
-            let station = plan.station;
+            let station = plan.station.clone();
             let frequency = receipt.frequency;
             self.send_scan_command(packet, &|| {
                 if !emission.current() {
@@ -248,12 +251,19 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 }
                 let domain = current()?;
                 receive_permission(&domain, &[frequency])?;
-                if let Some(s) = station {
+                if let Some(s) = &station {
                     s.check(&domain)?;
                 }
                 for p in &permissions {
                     p.check(&domain)?;
-                    let fresh = Permission::from_domain(&caps, &domain, p.frequency)?;
+                    let fresh = Permission::occupied_width_with_hint(
+                        &caps,
+                        &domain,
+                        p.frequency,
+                        None,
+                        false,
+                        p.hint.clone(),
+                    )?;
                     if fresh.half_dbm < p.half_dbm {
                         return Err(Error::Unsupported);
                     }
@@ -274,7 +284,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 return Err(Error::Firmware(1));
             }
             if w.started && w.foreign {
-                self.check_scan_binding(w.plan.station)?;
+                self.check_scan_binding(w.plan.station.as_ref())?;
                 self.failed = false;
                 return Ok(());
             }
@@ -324,6 +334,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
                 w.foreign = false;
                 if w.plan
                     .station
+                    .as_ref()
                     .is_some_and(|p| event.frequency == u32::from(p.permission.frequency))
                 {
                     w.home = true;
@@ -485,7 +496,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         let w = self.roc.as_ref().ok_or(Error::Failed)?;
         w.check(&current()?)?;
-        self.check_scan_binding(w.plan.station)?;
+        self.check_scan_binding(w.plan.station.as_ref())?;
         let notice = w.public.then_some((owner, w.receipt));
         self.management_completed = self.completed_private_action()?;
         self.roc = None;

@@ -347,6 +347,9 @@ impl Grant {
             .iter()
             .all(|&p| i32::from(p) + i32::from(self.antenna) <= i32::from(limit))
     }
+    pub(super) fn tracking_indices(&self) -> [u8; 8] {
+        self.indices
+    }
     fn words(&self) -> [u32; 16] {
         let mut bytes = [0; 64];
         let reference = i16::from(self.indices[7]);

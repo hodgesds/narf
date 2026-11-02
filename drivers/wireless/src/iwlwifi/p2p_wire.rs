@@ -1,8 +1,9 @@
 //! P2P grant wire contracts from Linux7.3-rc7 fw/api/time-event.h.
 //! ABI selection is metadata only. The native owner must separately retain
 //! the actual admitted device/source, MAC/link/STA allocation, current PHY,
-//! NVM/MCC/host power and request authority. SESSION codecs remain test-only
-//! until their actual API77/API89 native adapters are implemented.
+//! NVM/MCC/host power and request authority. The API89 SESSION2 consumer
+//! requires actual PHY/active-link/BCAST receipts; SESSION1's MAC selector
+//! stays test-only until its API77 native adapter is implemented.
 use super::{firmware_api::FirmwareApi, native_band::Channel};
 
 pub(super) const GROUP: u8 = 3;
@@ -29,7 +30,6 @@ impl Activity {
             Self::Negotiate => 3,
         }
     }
-    #[cfg(any(test, feature = "kernel-test"))]
     fn session(self) -> u32 {
         match self {
             Self::Discover => 2,
@@ -40,8 +40,8 @@ impl Activity {
 /// The actual allocated MAC ID for sessionv1 or active FW-link ID for v2.
 /// Neither an observed interface number nor the AP's spec link ID belongs here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(any(test, feature = "kernel-test"))]
 pub(super) enum Target {
+    #[cfg(any(test, feature = "kernel-test"))]
     Mac(u8),
     Link(u8),
 }
@@ -151,18 +151,16 @@ impl Abi {
         put(&mut bytes, 4, activity.roc());
         Ok(bytes)
     }
-    #[cfg(any(test, feature = "kernel-test"))]
     fn target(self, target: Target) -> Result<u32, &'static str> {
         match (self, target) {
-            (Self::Session1, Target::Mac(id)) | (Self::Session2, Target::Link(id)) => {
-                Ok(u32::from(id))
-            }
+            #[cfg(any(test, feature = "kernel-test"))]
+            (Self::Session1, Target::Mac(id)) => Ok(u32::from(id)),
+            (Self::Session2, Target::Link(id)) => Ok(u32::from(id)),
             _ => Err("P2P session MAC/FW-link identity mismatched"),
         }
     }
     /// The session command has no channel field: the actual current
     /// P2P-device MAC/active-link/PHY receipts supply that separate proof.
-    #[cfg(any(test, feature = "kernel-test"))]
     pub fn session_add(
         self,
         target: Target,
@@ -176,7 +174,6 @@ impl Abi {
         put(&mut bytes, 12, duration.0);
         Ok(bytes)
     }
-    #[cfg(any(test, feature = "kernel-test"))]
     pub fn session_remove(
         self,
         target: Target,
@@ -203,7 +200,6 @@ impl Abi {
             started: boolean(word(bytes, 4))?,
         })
     }
-    #[cfg(any(test, feature = "kernel-test"))]
     pub fn session_notification(
         self,
         target: Target,

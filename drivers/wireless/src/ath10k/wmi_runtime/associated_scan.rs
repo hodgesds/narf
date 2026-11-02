@@ -35,7 +35,7 @@ pub(in crate::ath10k) fn receive_permission(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Binding {
     bssid: [u8; 6],
     pub permission: Permission,
@@ -156,7 +156,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         Ok(Some(Binding {
             bssid: peer.bssid,
-            permission: peer.permission,
+            permission: peer.permission.clone(),
             ht: peer.ht.is_some(),
             vht: peer.ht.is_some_and(|ht| ht.vht.is_some()),
         }))
@@ -165,7 +165,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     /// Scan poisoning intentionally keeps public DATA entry points closed
     /// across awaits. Internal station progression may complete a rekey, so
     /// do not require a continuously open controlled port here.
-    pub(super) fn check_scan_binding(&self, expected: Option<Binding>) -> Result<(), Error> {
+    pub(super) fn check_scan_binding(&self, expected: Option<&Binding>) -> Result<(), Error> {
         match (expected, self.peer.as_ref()) {
             (None, None) => Ok(()),
             (Some(expected), Some(peer))
@@ -186,7 +186,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(super) fn scan_inventory(
         &self,
         probes: &[Permission],
-        station: Option<Binding>,
+        station: Option<&Binding>,
     ) -> Result<Vec<u8>, Error> {
         let mut frequencies = Vec::new();
         frequencies
@@ -197,7 +197,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         // or other VHT segment rows already covered by the station's actual
         // occupied permission. Keep those real home rows in the scan table.
         if let Some(station) = station {
-            let p = station.permission;
+            let p = &station.permission;
             let occupied = if p.width80 {
                 let second = p.center2.unwrap_or(p.center);
                 [
@@ -235,11 +235,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             merge_inventory(&mut inventory, &active, tlv)?;
         }
         if let Some(station) = station {
-            let permission = station.permission;
+            let permission = &station.permission;
             let occupied = if permission.secondary.is_some() {
                 self.wire.station_ht40_channels(permission, station.vht)?
             } else {
-                let mut row = self.wire.active_channels(&[permission])?;
+                let mut row = self
+                    .wire
+                    .active_channels(core::slice::from_ref(permission))?;
                 let at = if tlv { 20 } else { 8 };
                 wire::put(
                     &mut row,
@@ -255,12 +257,12 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         Ok(inventory)
     }
 
-    pub(super) fn scan_restore(&self, station: Option<Binding>) -> Result<Vec<Vec<u8>>, Error> {
+    pub(super) fn scan_restore(&self, station: Option<&Binding>) -> Result<Vec<Vec<u8>>, Error> {
         let mut restore = Vec::new();
         restore.try_reserve_exact(3).map_err(|_| Error::NoMemory)?;
         if let Some(station) = station {
-            restore.push(self.wire.domain(station.permission)?);
-            restore.push(self.wire.power(station.permission)?);
+            restore.push(self.wire.domain(&station.permission)?);
+            restore.push(self.wire.power(&station.permission)?);
         }
         restore.push(self.scan_inventory(&[], station)?);
         Ok(restore)
@@ -269,7 +271,7 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
     pub(super) fn cache_scan_results(
         &mut self,
         report: &ScanReport,
-        station: Option<Binding>,
+        station: Option<&Binding>,
     ) -> Result<(), Error> {
         let mut cache = Vec::new();
         cache.try_reserve_exact(64).map_err(|_| Error::NoMemory)?;

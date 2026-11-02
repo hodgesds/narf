@@ -639,3 +639,6 @@ kernel_test_in!(
     "drivers/wireless/rtw88/ht/rtl8821c",
     smoke_rtw8821ce_ht_descriptor_rx_current_policy_publication_fences
 );
+
+#[path = "tracking8821c/native_tests.rs"]
+mod power_tracking_tests;

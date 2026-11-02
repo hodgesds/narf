@@ -96,6 +96,11 @@ pub(super) fn phydm8821c(info: super::phy8821c::Info, sequence: u16) -> Result<[
     packet[11] = 0x11; // source physical TX-A/RX-A antenna fields.
     Ok(packet)
 }
+pub(super) fn iqk8821c_associated(sequence: u16) -> [u8; BYTES] {
+    let mut packet = header(14, 9, sequence);
+    packet[8] = 2;
+    packet
+}
 pub(super) fn iqk8821c(sequence: u16) -> [u8; BYTES] {
     // rtw8821c_do_iqk: clear=0 and segment=0 before association.
     header(14, 9, sequence)
