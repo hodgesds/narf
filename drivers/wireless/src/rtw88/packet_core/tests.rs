@@ -941,7 +941,115 @@ kernel_test_in!(
     smoke_rtw88_tx_ba_native_limits_authority_and_partial_publication
 );
 
+fn originator_controls(tid: u8) -> [Vec<u8>; 3] {
+    let ap = [2, 0, 0, 0, 0, 1];
+    let mut request = vec![0xd0, 0, 0, 0];
+    request.extend_from_slice(&ap);
+    request.extend_from_slice(&OWN);
+    request.extend_from_slice(&ap);
+    request.extend_from_slice(&[0, 0, 3, 0, 7]);
+    request.extend_from_slice(&(0x1002 | u16::from(tid) << 2).to_le_bytes());
+    request.extend_from_slice(&[0, 0, 0x10, 1]);
+    let mut bar = vec![0x84, 0, 0, 0];
+    bar.extend_from_slice(&ap);
+    bar.extend_from_slice(&OWN);
+    bar.extend_from_slice(&(4 | u16::from(tid) << 12).to_le_bytes());
+    bar.extend_from_slice(&[0x10, 1]);
+    let mut delba = request[..24].to_vec();
+    delba.extend_from_slice(&[3, 2]);
+    delba.extend_from_slice(&(0x0800 | u16::from(tid) << 12).to_le_bytes());
+    delba.extend_from_slice(&[39, 0]);
+    [request, bar, delba]
+}
+fn all_tid_control_receipts() -> Result<(), &'static str> {
+    for tid in 0..6 {
+        for frame in originator_controls(tid) {
+            let mut model = Model::new();
+            model.originator_ba = true;
+            model.originator_tids = 0x3f;
+            let mut core = batch_core(&mut model)?;
+            let id = core
+                .submit(&mut model, &frame, true)
+                .map_err(|_| "T2 exact native ADDBA/BAR/DELBA publication")?;
+            let submission = *model
+                .submissions
+                .front()
+                .ok_or("T2 actual management control descriptor")?;
+            let d = model.last_descriptor.ok_or("T2 native control TXD")?;
+            if submission.queue != Queue::Management
+                || model
+                    .actual_body(submission)
+                    .map_err(|_| "T2 actual control DMA")?
+                    != frame
+                || d[5] & 31 != 18
+                || d[16] != 0
+                || model.tx_publications != 1
+                || core.ready()
+            {
+                return Err("T2 control bypassed original management DMA/CCX owner");
+            }
+            model.indices[0] = 1 | (1 << 16);
+            model.report(0, true);
+            let receipt = core
+                .poll(&mut model)
+                .map_err(|_| "T2 actual control native terminal")?
+                .receipt
+                .ok_or("T2 control missing real CCX/consumption receipt")?;
+            if receipt.id != id
+                || receipt.bytes != frame
+                || !receipt.radio_acknowledged
+                || !core.ready()
+            {
+                return Err("T2 control receipt reconstructed/changed original identity");
+            }
+        }
+    }
+    Ok(())
+}
+fn all_tid_control_denials() -> Result<(), &'static str> {
+    for tid in 0..8 {
+        for frame in originator_controls(tid) {
+            let mut model = Model::new();
+            model.originator_ba = tid != 0;
+            model.originator_tids = if tid < 6 { 1 } else { 0x3f };
+            let mut core = batch_core(&mut model)?;
+            let before = (core.next_id, core.reports, core.published);
+            if core.submit(&mut model, &frame, true).is_ok()
+                || model.tx_publications != 0
+                || !model.descriptors.is_empty()
+                || (core.next_id, core.reports, core.published) != before
+                || !core.ready()
+            {
+                return Err(
+                    "T2 parser widened T1/missing/VO control authority or consumed identity",
+                );
+            }
+        }
+    }
+    for mut frame in originator_controls(5) {
+        if frame.len() == 33 {
+            frame[27] |= 1;
+        } else if frame.len() == 20 {
+            frame[16] |= 1;
+        } else {
+            frame[26] |= 1;
+        }
+        let mut model = Model::new();
+        model.originator_ba = true;
+        model.originator_tids = 0x3f;
+        let mut core = batch_core(&mut model)?;
+        if core.submit(&mut model, &frame, true).is_ok()
+            || model.tx_publications != 0
+            || !model.descriptors.is_empty()
+        {
+            return Err("T2 malformed source control reserved flags emitted");
+        }
+    }
+    Ok(())
+}
+
 fn all_tid_ring_receipts() -> Result<(), &'static str> {
+    all_tid_control_receipts()?;
     for tid in 0..6 {
         let mut model = Model::new();
         model.originator_ba = true;
@@ -1036,6 +1144,7 @@ fn all_tid_ring_receipts() -> Result<(), &'static str> {
     Ok(())
 }
 fn all_tid_native_denials() -> Result<(), &'static str> {
+    all_tid_control_denials()?;
     for kind in 0..4 {
         let mut model = Model::new();
         model.originator_ba = true;

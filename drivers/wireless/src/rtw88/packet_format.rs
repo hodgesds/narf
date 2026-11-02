@@ -232,7 +232,7 @@ fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<
     if !profile.valid() {
         return Err(Error::Metadata);
     }
-    if profile.mcs != 0 && native_bar(frame) && frame[10..16] == own && frame[17] >> 4 == 0 {
+    if profile.mcs != 0 && native_bar(frame) && originator_control(frame) && frame[10..16] == own {
         return Ok(Queue::Management);
     }
     if !(24..=MAX_MPDU).contains(&frame.len())
@@ -278,19 +278,31 @@ fn classify_profile(frame: &[u8], own: [u8; 6], profile: DataProfile) -> Result<
     }
 }
 pub(super) fn originator_control(b: &[u8]) -> bool {
+    originator_control_tid(b).is_some()
+}
+/// Literal source control shape only. The native Core separately requires
+/// this exact TID in its actual current T1/T2 owner's admission mask.
+pub(super) fn originator_control_tid(b: &[u8]) -> Option<u8> {
     if native_bar(b) {
-        return b[17] >> 4 == 0;
+        let tid = b[17] >> 4;
+        return (tid < 6).then_some(tid);
     }
     if b.len() < 30 || b[..2] != [0xd0, 0] || b[24] != 3 {
-        return false;
+        return None;
     }
     match (b.len(), b[25]) {
         (33, 0) => {
             let p = u16::from_le_bytes([b[27], b[28]]);
-            p & 0x3f == 2 && (1..=64).contains(&(p >> 6)) && b[31] & 15 == 0
+            let tid = ((p >> 2) & 15) as u8;
+            (p & 3 == 2 && tid < 6 && (1..=64).contains(&(p >> 6)) && b[31] & 15 == 0)
+                .then_some(tid)
         }
-        (30, 2) => b[26..30] == [0, 8, 39, 0],
-        _ => false,
+        (30, 2) => {
+            let p = u16::from_le_bytes([b[26], b[27]]);
+            let tid = (p >> 12) as u8;
+            (p & 0x0fff == 0x0800 && tid < 6 && b[28..30] == [39, 0]).then_some(tid)
+        }
+        _ => None,
     }
 }
 /// Newly emitting recipient control is separately qualified by the retained

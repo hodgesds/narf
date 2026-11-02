@@ -516,6 +516,7 @@ impl Hardware {
             let mut link = super::super::station_api::link(3, own, false, 1, 0, 1);
             boot_context::put32(&mut link, 4, LINK);
             boot_context::put32(&mut link, 8, MAC);
+            boot_context::put32(&mut link, 36, 0); // P2P REMOVE keeps CCK basics absent.
             super::super::ap_session::command(self, 3, 9, &link).await?;
             let mut mac = [0; 52];
             boot_context::put32(&mut mac, 0, MAC);

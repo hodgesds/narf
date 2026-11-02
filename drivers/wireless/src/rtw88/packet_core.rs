@@ -336,7 +336,9 @@ impl Core {
         if format::recipient_control(frame) && !port.recipient_ba_allowed() {
             return Err(Error::Access);
         }
-        if format::originator_control(frame) && !port.originator_ba_allowed() {
+        if format::originator_control_tid(frame)
+            .is_some_and(|tid| port.originator_ba_tids() & (1 << tid) == 0)
+        {
             return Err(Error::Access);
         }
         // A Probe Request from the current random scan address is the only

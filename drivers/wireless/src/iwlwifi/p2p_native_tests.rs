@@ -639,7 +639,16 @@ fn pump(fixture: &Fixture) -> R {
         service()?;
         let _ = fixture.device().step(None);
         let idle = fixture.device().state.try_lock().is_some_and(|state| {
-            !state.hardware.has_pending_rx() && !state.hardware.p2p_needs_retirement()
+            // A successful physical reset/BME-off proof closes this owner.
+            // Its old raw descriptor may remain completed in the stopped
+            // ring; consuming it after that proof would invent RX service.
+            // An uncertain stop remains quarantined with the native P2P
+            // owner retained and cannot satisfy this terminal condition.
+            let stopped = state.stop_completed
+                && state.hardware.is_failed()
+                && !state.hardware.p2p_started()
+                && !fixture.device().quarantined.load(Ordering::Acquire);
+            (!state.hardware.has_pending_rx() || stopped) && !state.hardware.p2p_needs_retirement()
         });
         if idle {
             return Ok(());
@@ -821,6 +830,12 @@ fn smoke_iwl_p2p_command_ack_cannot_replace_actual_start_and_dropped_roc_keeps_c
             !state.hardware.p2p_granted(2437)
                 && (state.hardware.is_failed() || !state.hardware.p2p_started()),
             "P2P dropped waiter lost retained physical cleanup",
+        )?;
+        require(
+            state.stop_completed
+                && !state.hardware.p2p_started()
+                && !f.device().quarantined.load(Ordering::Acquire),
+            "P2P dropped waiter has no actual terminal DMA-stop proof",
         )?;
         Ok(())
     })

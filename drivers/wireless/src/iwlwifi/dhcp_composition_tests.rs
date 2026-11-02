@@ -167,8 +167,10 @@ impl ReceiveModel {
             // additional commands neither invent RX capability nor a role.
             Self::Ap => versions.extend_from_slice(&[0x91, 1, 14, 0, 0x1e, 1, 2, 1]),
             Self::P2p => versions.extend_from_slice(&[
-                0x0e, 3, 6, 0, 0xf8, 3, 99, 1, 0x1e, 1, 2, 1, 0x1c, 1, 11, 9, 0x1c, 0, 11, 9, 0xc1,
-                0, 99, 8,
+                // The actual Sc AP contract is needed to exercise native
+                // parent-AP exclusion, rather than an unsupported role.
+                0x91, 1, 14, 0, 0x0e, 3, 6, 0, 0xf8, 3, 99, 1, 0x1e, 1, 2, 1, 0x1c, 1, 11, 9, 0x1c,
+                0, 11, 9, 0xc1, 0, 99, 8,
             ]),
         }
     }
