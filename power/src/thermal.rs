@@ -96,6 +96,14 @@ pub trait CoolingDevice: Send + Sync + core::fmt::Debug {
     fn name(&self) -> &'static str;
     /// Set the cooling level (0 = off, 255 = max).
     fn set_level(&self, level: u8);
+    /// Reset any cached power state the device holds about
+    /// firmware (e.g. an ACPI fan's cached on/off flag). The
+    /// resume path calls this before re-asserting the level, so
+    /// a device firmware powered off across S3 is driven back on
+    /// by the next `set_level` instead of being skipped as
+    /// already-on (#1223). Default: no-op; devices without
+    /// cached power state need no override.
+    fn reset_cached_power(&self) {}
 }
 
 /// Topic name for thermal events. Reserved-root `power.` namespace
@@ -200,6 +208,21 @@ pub fn set_cooling_level(level: u8) -> Result<(), ThermalError> {
         dev.set_level(level);
     }
     reg.last_level = Some(level);
+    Ok(())
+}
+
+/// Reset cached power state on all registered cooling devices.
+/// The platform suspend/resume lifecycle calls this on resume
+/// before re-asserting the last driven level (#1223): firmware
+/// may have powered a device off across S3 while its driver
+/// still believes it is on, and without the reset the
+/// re-asserted `set_level` would skip the power-on edge.
+pub fn reset_cooling_devices() -> Result<(), ThermalError> {
+    let r = REG.lock();
+    let reg = r.as_ref().ok_or(ThermalError::NotInitialised)?;
+    for dev in &reg.cooling_devices {
+        dev.reset_cached_power();
+    }
     Ok(())
 }
 

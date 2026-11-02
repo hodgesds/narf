@@ -274,6 +274,14 @@ impl CoolingDevice for AcpiFan {
         // Otherwise the fan is binary: `_ON` above is the whole
         // control surface the firmware declared.
     }
+
+    fn reset_cached_power(&self) {
+        // Firmware may have powered the fan off across S3 while
+        // this cache still says on (#1223). Drop the cache so
+        // the next `set_level > 0` re-issues `_ON`; worst case
+        // on firmware that kept the fan on is one redundant `_ON`.
+        self.on.store(false, Ordering::Release);
+    }
 }
 
 /// Walk the AML namespace, find devices with `_HID == "PNP0C0B"`, and

@@ -811,12 +811,17 @@ pub fn register_cooling_device(cap: &Cap<Thermal, Grant>,
 pub fn record_temp(zone: u32, milli_c: i32)
     -> Result<ThermalState, ThermalError>;
 pub fn set_cooling_level(level: u8) -> Result<(), ThermalError>;
+pub fn reset_cooling_devices() -> Result<(), ThermalError>;
+    // (#1223): called on resume before re-asserting the level;
+    // drops each device's cached power state so a device
+    // firmware powered off across S3 is driven back on instead
+    // of skipped as already-on.
 pub fn current_cooling_level() -> Option<u8>;   // last driven level
     // (#916): recorded by the governor on a crossing and by an
     // explicit set_cooling_level call; drivers/platform's
-    // platform-thermal device_pm entry re-asserts it on resume,
-    // since the governor alone would never re-drive a level
-    // asserted before S3.
+    // platform-thermal device_pm entry re-asserts it on resume
+    // (after reset_cooling_devices, #1223), since the governor
+    // alone would never re-drive a level asserted before S3.
 pub fn read_temp(zone: u32) -> Result<i32, ThermalError>;
 pub fn zone_count() -> usize;
 pub fn zones_snapshot() -> Vec<(String, i32, ThermalState)>;
@@ -828,6 +833,7 @@ pub fn install_active_cooling<P: CoolingPolicy>(
 pub trait CoolingDevice: Send + Sync + core::fmt::Debug {
     fn name(&self) -> &'static str;
     fn set_level(&self, level: u8);   // 0 = off, 255 = max
+    fn reset_cached_power(&self) {}   // default no-op; AcpiFan drops its cached on/off flag
 }
 ```
 

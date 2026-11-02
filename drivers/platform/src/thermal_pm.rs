@@ -13,12 +13,18 @@
 //!
 //! - **Suspend is a no-op.** There is nothing to quiesce: the
 //!   `_TMP` poll task is executor-managed and quiesced by the S3
-//!   phase machinery itself, and `AcpiFan`/`PwmFan` hold no
-//!   suspend state — `set_level` is a pure re-evaluation
-//!   (`_FSL` / PWM duty) with no hardware snapshot to save.
-//! - **Resume re-asserts the last driven cooling level** via
-//!   `power::thermal::current_cooling_level`. When no level was
-//!   ever driven it does nothing (no spurious `set_level(0)`).
+//!   phase machinery itself, and no driver holds state suspend
+//!   must save — `AcpiFan`'s cached on/off flag is invalidated
+//!   by resume (#1223), and `set_level` is otherwise a pure
+//!   re-evaluation (`_FSL` / PWM duty) with no hardware
+//!   snapshot to save.
+//! - **Resume resets cached power state, then re-asserts the last
+//!   driven cooling level** via `power::thermal::current_cooling_level`.
+//!   The reset (#1223) drops each device's cached power state
+//!   first, so a fan firmware powered off across S3 is driven back
+//!   on by the re-assert instead of being skipped as already-on.
+//!   When no level was ever driven it does nothing (no spurious
+//!   `set_level(0)`).
 //!
 //! Handler context (see `power::device_pm`): handlers run on the
 //! boot CPU with interrupts gated and must not schedule or sleep
@@ -36,13 +42,6 @@
 //! - **EC**: the EC driver has no re-assertable state — its
 //!   transaction gate is stateless serialisation, not a level —
 //!   so no EC entry is registered.
-//! - **AcpiFan `_ON` cache**: the fan driver caches its on/off
-//!   state and only calls `_ON` on a transition, so if firmware
-//!   powers the fan off across S3 while the driver still believes
-//!   it is on, resume re-asserts speed (`_FSL` is re-evaluated on
-//!   every `set_level > 0`) but not the `_ON` edge. That is a
-//!   fan-driver follow-up, not a lifecycle gap: the level itself
-//!   is re-applied.
 //! - **Resume ordering**: the entry is registered at
 //!   Stage::Subsys, so it resumes early in the forward fan-out.
 //!   That is safe because `_FSL` evaluation needs only the AML
@@ -71,13 +70,18 @@ fn suspend() -> Result<(), DeviceSuspendError> {
     Ok(())
 }
 
-/// Resume handler: re-assert the last driven cooling level so
-/// firmware's S3 amnesia does not leave the fans at the wrong
-/// speed. No level ever driven means nothing to re-assert.
+/// Resume handler: reset cached power state, then re-assert the
+/// last driven cooling level so firmware's S3 amnesia does not
+/// leave the fans at the wrong speed — or powered off (#1223).
+/// No level ever driven means nothing to re-assert.
 fn resume() -> Result<(), DeviceSuspendError> {
     match narf_power::thermal::current_cooling_level() {
         None => Ok(()),
-        Some(level) => narf_power::thermal::set_cooling_level(level)
-            .map_err(|_| DeviceSuspendError::DriverError),
+        Some(level) => {
+            narf_power::thermal::reset_cooling_devices()
+                .map_err(|_| DeviceSuspendError::DriverError)?;
+            narf_power::thermal::set_cooling_level(level)
+                .map_err(|_| DeviceSuspendError::DriverError)
+        }
     }
 }
