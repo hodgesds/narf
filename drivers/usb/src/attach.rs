@@ -605,9 +605,9 @@ pub async fn detach_slot(xhci_dev: &Xhci, slot_id: u8) {
 /// cleared from their own registries (boot + report keyboards,
 /// mouse, touchpad, consumer, generic, ACM, xpad), every bound
 /// MSC device is removed from `MSC_DEVICES` and unpublished via
-/// `msc::unbind_all_msc`, every bound fingerprint reader and
-/// recognised WBDI sensor is removed and unpublished via
-/// `fingerprint::unbind_all_fp` / `wbdi::unbind_all_wbdi`
+/// `msc::unbind_all_msc`, every bound fingerprint reader (including
+/// WBDI-bridged sensors) is removed and unpublished via
+/// `fingerprint::unbind_all_fp`
 /// (#922), and the hub registry is cleared.
 /// Registered class drivers' per-slot unbind hooks are NOT called
 /// on this path, and classes with neither a pumped clear nor a
@@ -637,7 +637,6 @@ pub fn detach_all_bindings() {
     crate::xpad::clear_xpad();
     crate::msc::unbind_all_msc();
     crate::fingerprint::unbind_all_fp();
-    crate::wbdi::unbind_all_wbdi();
     crate::cdc_ncm::detach_all_ncm();
     crate::r8152::detach_all_r8152();
     crate::cdc_ecm::detach_all_ecm();

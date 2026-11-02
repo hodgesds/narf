@@ -405,8 +405,8 @@ fn require_full_transfer(transferred: usize, expected: usize) -> Result<(), FpEr
 
 // ── Global registry ───────────────────────────────────────────────────
 
-/// Global registry of bound fingerprint readers. Append-only for now;
-/// detach / hotplug is a follow-up.
+/// Global registry of bound fingerprint readers, including WBDI-bridged
+/// devices. Per-slot detach and controller recovery remove entries here.
 pub static FP_DEVICES: IrqSafeSpinLock<Vec<Arc<FingerprintDevice>>> =
     IrqSafeSpinLock::new(Vec::new());
 

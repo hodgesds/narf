@@ -4550,8 +4550,8 @@ fn smoke_fp_detach_via_unbind_dispatch() -> TestResult {
     use crate::fingerprint::{__test_make_device, __test_push, attached_fp_count, FpVendor};
     crate::fingerprint::__reset_fp_for_test();
     crate::fingerprint::register_initcalls();
-    crate::wbdi::register_initcalls();
     __test_push(__test_make_device(200, FpVendor::Goodix, false));
+    __test_push(__test_make_device(200, FpVendor::Wbdi, false));
     let _report = crate::class_registry::dispatch_unbind(200);
     if attached_fp_count() != 0 {
         crate::fingerprint::__reset_fp_for_test();
@@ -5078,27 +5078,22 @@ kernel_test_in!(
     smoke_fp_resume_decision_and_rearm
 );
 
-/// Lifecycle (#922): wholesale teardown clears both registries
-/// (the `detach_all_bindings` path on controller recovery).
+/// Lifecycle (#922): wholesale teardown clears vendor-matched and
+/// WBDI-bridged readers and their provider nodes on controller recovery.
 #[cfg(feature = "kernel-test")]
 fn smoke_fp_unbind_all_clears() -> TestResult {
     use crate::fingerprint::{FpVendor, __test_make_device, __test_push};
     crate::fingerprint::__reset_fp_for_test();
-    crate::wbdi::__reset_wbdi_for_test();
     __test_push(__test_make_device(5, FpVendor::Goodix, false));
     __test_push(__test_make_device(7, FpVendor::Synaptics, false));
-    crate::wbdi::WBDI_DEVICES
-        .lock()
-        .push(crate::wbdi::WbdiDevice {
-            slot_id: 5,
-            vendor_iface: 0,
-        });
+    __test_push(__test_make_device(9, FpVendor::Wbdi, false));
     crate::fingerprint::unbind_all_fp();
-    crate::wbdi::unbind_all_wbdi();
-    if crate::fingerprint::attached_fp_count() != 0 || crate::wbdi::attached_wbdi_count() != 0 {
+    if crate::fingerprint::attached_fp_count() != 0
+        || !crate::fingerprint::enumerate_fp().is_empty()
+        || crate::fingerprint::lookup_fp("fp0").is_some()
+    {
         crate::fingerprint::__reset_fp_for_test();
-        crate::wbdi::__reset_wbdi_for_test();
-        return TestResult::Fail("wholesale unbind must clear both registries");
+        return TestResult::Fail("wholesale unbind must remove all readers and provider nodes");
     }
     TestResult::Pass
 }
@@ -5108,36 +5103,37 @@ kernel_test_in!("drivers/usb/fingerprint", smoke_fp_unbind_all_clears);
 /// Lifecycle (#922): WBDI detach removes only the slot's entries
 /// and is idempotent.
 fn smoke_wbdi_detach_removes_slot() -> TestResult {
-    use crate::wbdi::{attached_wbdi_count, detach_wbdi, WbdiDevice, WBDI_DEVICES};
-    crate::wbdi::__reset_wbdi_for_test();
-    WBDI_DEVICES.lock().push(WbdiDevice {
-        slot_id: 5,
-        vendor_iface: 0,
-    });
-    WBDI_DEVICES.lock().push(WbdiDevice {
-        slot_id: 7,
-        vendor_iface: 1,
-    });
-    if detach_wbdi(9) != 0 || attached_wbdi_count() != 2 {
-        crate::wbdi::__reset_wbdi_for_test();
+    use crate::fingerprint::{
+        __reset_fp_for_test, __test_register_device, attached_fp_count, detach_fp, lookup_fp,
+        with_device, FpVendor,
+    };
+    __reset_fp_for_test();
+    __test_register_device(5, FpVendor::Wbdi, 3, 2);
+    __test_register_device(7, FpVendor::Wbdi, 3, 2);
+    if detach_fp(9).removed != 0 || attached_fp_count() != 2 {
+        __reset_fp_for_test();
         return TestResult::Fail("WBDI detach of unknown slot must be a no-op");
     }
-    if detach_wbdi(5) != 1 || attached_wbdi_count() != 1 {
-        crate::wbdi::__reset_wbdi_for_test();
+    if detach_fp(5).removed != 1 || attached_fp_count() != 1 {
+        __reset_fp_for_test();
         return TestResult::Fail("WBDI detach must remove only the slot's entry");
     }
-    let g = WBDI_DEVICES.lock();
-    if g.iter().any(|d| d.slot_id == 5) || !g.iter().any(|d| d.slot_id == 7) {
-        drop(g);
-        crate::wbdi::__reset_wbdi_for_test();
+    if with_device(0, |d| d.slot_id) != Some(7)
+        || lookup_fp("fp0").is_none()
+        || lookup_fp("fp1").is_some()
+    {
+        __reset_fp_for_test();
         return TestResult::Fail("WBDI survivor must keep its slot");
     }
-    drop(g);
-    if detach_wbdi(5) != 0 {
-        crate::wbdi::__reset_wbdi_for_test();
+    if detach_fp(5).removed != 0 || attached_fp_count() != 1 {
+        __reset_fp_for_test();
         return TestResult::Fail("WBDI detach must be idempotent");
     }
-    crate::wbdi::__reset_wbdi_for_test();
+    if detach_fp(7).removed != 1 || lookup_fp("fp0").is_some() {
+        __reset_fp_for_test();
+        return TestResult::Fail("last WBDI detach must unpublish the provider node");
+    }
+    __reset_fp_for_test();
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/fingerprint", smoke_wbdi_detach_removes_slot);
