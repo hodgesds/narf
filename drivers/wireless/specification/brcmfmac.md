@@ -153,8 +153,32 @@ selects Linux `brcmf_ring_itemsize` (24-byte TX status, 40-byte RX complete)
 instead of `brcmf_ring_itemsize_pre_v7` for the D2H rings; the completion
 fields consumed here are unchanged (smokes `drivers/wireless/brcmfmac/station`
 Open/WPA2 DHCP/IP and `drivers/wireless/brcmfmac/wmm` run on shared 5/6/7
-with the firmware model writing v7-stride completions). Nonzero rx_dataoffset descriptor-prefix
-geometries remain gated before any DMA allocation/publication. Optional host DMA-index
+with the firmware model writing v7-stride completions). Shared7 also admits
+`rx_dataoffset`1..4: Linux7.3-rc4 `msgbuf.c::brcmf_msgbuf_process_rx`
+locates messages inside each original item, never by enlarging its stride.
+Admission proves the used control/TX/RX spans20/16/28 fit the unchanged
+24/24/40-byte slots; the control IOCTL's final used field is `cmd`, followed
+by a reserved word. Shared5/6 nonzero prefixes and shared7 prefixes above4
+are refused at both CR4 readiness and runtime attach before DMA allocation.
+Zero-prefix shared5/6/7 validation and published ring geometry are unchanged.
+Each complete original descriptor is copied and released before decoding
+past its prefix, retiring DMA or advancing the original wrapped index.
+Event buffers use the shared payload offset; RX data uses its explicit
+nonzero offset, otherwise the shared offset. These offsets are alternatives,
+never a sum, and each whole payload must fit its original posted buffer.
+Posted identity, transaction/command/interface checks, copy-before-repost,
+current native source, controlled-port/key gates and actual matching TX
+terminal ownership remain mandatory. Unknown or malformed completions close
+the owner and retain uncertain DMA.
+
+Six new cases under `drivers/wireless/brcmfmac/prefix` are written, pending
+execution: preallocation admission, poisoned descriptor prefixes with actual
+control-ring wrap, explicit/shared RX offsets and stale/bad extents, matching
+TX terminal retention, and full Open/WPA2 scan/key/DHCP/IP conversations over
+all four nonzero prefixes. The firmware fixture writes the original physical
+strides and real correlated receipts; it alternates explicit and fallback RX
+offsets. This is a bounded software implementation, with no physical target
+or broader firmware-geometry qualification claim. Optional host DMA-index
 fields are cleared to select the supported TCM fallback. All DMA allocations
 and host addresses are retained before publication and before enabling BME.
 
@@ -829,8 +853,9 @@ created with the first frame's priority as TID, and
 descriptor flags (`BRCMF_MSGBUF_PKT_FLAGS_PRIO_SHIFT`); a priority from a
 different FIFO is a protocol error. Smoke: `drivers/wireless/brcmfmac/wmm`.
 
-Additional software outside that retained profile remains: nonzero descriptor
-prefixes, other CPU/RAM/chip/OTP selectors (including 160 MHz-capable
+Additional software outside that retained profile remains: descriptor
+prefixes exceeding the admitted shared7 slack, other CPU/RAM/chip/OTP selectors
+(including 160 MHz-capable
 chips), HE/EHT profiles, monitor mode (which owns native802.11 RX and its
 metadata), AP, replayed
 recovery/system PM, IOMMU-backed quiescence.

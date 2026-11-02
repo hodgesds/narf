@@ -500,6 +500,18 @@ combined release metadata context pass; full release/native validation remains
 at25 completed feature rows. Counting unvalidated implementations,82 remain.
 Physical firmware/board, RF/power and deployment qualification remain separate.
 
+**Source implementation recount 2026-11-02** (bounded native FullMAC prefixes):
+the remaining ledger holds **71 `feature`**, **31 `chip`** and **0 `unknown`**
+rows. Eleven source-complete implementations await full batch acceptance in
+`research/implemented-pending-validation.tsv`. BCM43602 shared-v7 prefixes1..4
+compose with original fixed control/TX/RX ring strides, checked payload offsets,
+current source/key/port and real terminal ownership. Zero-prefix5/6/7 behavior
+is preserved; broader firmware geometry remains refused. Six native cases are
+written and unexecuted. Scoped formatting and one release metadata context
+pass; full release/native gates remain at25 completed rows. Counting
+unvalidated implementations,82 remain; physical firmware/board acceptance is
+separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 3 | MLO, P2P and WoW; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; bounded DEVICE/SESSION1/SESSION2, legacy20 GO9/NoA and CLIENT8 association/data are implemented pending validation; the CLIENT management worker and native PS keep the family P2P row open |
@@ -511,7 +523,7 @@ Physical firmware/board, RF/power and deployment qualification remain separate.
 | rtl8xxxu | 3 | Bluetooth coexistence, broader bands/VHT; other matched chip runtimes are tracked separately |
 | rtw88 | 15 | RTL8822BE station path; broader C21/C22 channels/PHY, full AC/TID scheduling, roles/security, reset/suspend/removal and retained-map reclamation; genuine N21S/N21L/N22L/other board assets; qualified non-VO originator BA, C21 RF power tracking and bounded independent live functions are implemented pending validation |
 | rtw89 | 12 | Additional channels/bands/widths, TX A-MSDU, fragmentation, monitor/AP U-APSD/WoW and periodic RF tracking/runtime LPS; bounded independent live functions are implemented pending validation; other AX/BE chips are separate rows |
-| brcmfmac | 12 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation |
+| brcmfmac | 11 | Other chip/CPU/RAM/OTP/shared-ring profiles, PHY beyond the scoped43602 VHT80 owner where supported, WPA3/AP and other roles, host-supplicant fallback, reset/system PM, IRQs and DMA reclamation; bounded shared-v7 descriptor/payload prefixes1..4 are implemented pending validation |
 | cyw43439 | 12 | Platform clocks/pins/regulators/reset and gSPI host, further genuinely supported PHY/role/security profiles, reset/reload, system PM and host-bus power transitions |
 
 Ordinary firmware station power save is implemented for CYW43439 and BCM43602
@@ -1407,6 +1419,18 @@ retains native DMA until real receipts, restores NSS/DCF and continues the
 physical worker for a later explicitly admitted BSS. Unsupported protection,
 PHY/security/P2P profiles stay refused before native mutation. Family §3.3 is
 normative; ten native cases are written and unexecuted.
+
+### 3.9 Bounded native FullMAC descriptor prefixes (validation pending)
+
+BCM43602 shared7 admits prefixes1..4 within each original D2H ring item after
+checked geometry at CR4 readiness and runtime attach, before DMA allocation.
+Control/TX/RX retain their24/24/40-byte strides and original wrapped indices;
+owned descriptor copies precede decoding and terminal reclamation. Event
+buffers use the shared offset; DATA uses its explicit nonzero offset or that
+shared fallback, with checked original-buffer bounds. Original firmware/PCI,
+posted identities, transaction correlation, key/port and actual matching
+terminal proofs remain mandatory. Family §3 defines the bounded profile;
+six new native cases are written and unexecuted.
 
 ## 4. Interaction with `narf-wireless`
 

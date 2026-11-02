@@ -308,7 +308,7 @@ impl<B: Bus> Cr4<B> {
         // The runtime handles v5/v6 classic msgbuf and v7's wider D2H
         // completion items (Linux brcmf_ring_itemsize) over TCM indices.
         if !(5..=7).contains(&info.version)
-            || info.rx_dataoffset != 0
+            || super::msgbuf::completion_prefix(info.version, info.rx_dataoffset).is_none()
             || !self.ram.contains(info.ring_info_addr, 58)
             || !self.ram.contains(info.htod_mb_data_addr, 4)
             || !self.ram.contains(info.dtoh_mb_data_addr, 4)

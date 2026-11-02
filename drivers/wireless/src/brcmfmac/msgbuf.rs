@@ -86,6 +86,26 @@ pub const D2H_MSGRING_RX_COMPLETE_ITEMSIZE_PRE_V7: u16 = 32;
 pub const D2H_MSGRING_RX_COMPLETE_ITEMSIZE: u16 = 40;
 pub const H2D_TXFLOWRING_ITEMSIZE: u16 = 48;
 
+/// Check the shared descriptor/payload prefix against the original firmware
+/// ring strides, not against an enlarged host allocation. Linux 7.3-rc4
+/// msgbuf.c consumes control through IOCTL `cmd` (20), TX through `tx_status`
+/// (16), and RX through `rx_status_1` (28); the remaining bytes are reserved.
+/// The classic TX stride has no slack. Shared 7 permits at most four bytes,
+/// bounded by the unchanged 24-byte control ring.
+pub(super) fn completion_prefix(version: u8, offset: u32) -> Option<usize> {
+    if !(5..=7).contains(&version) {
+        return None;
+    }
+    let offset = usize::try_from(offset).ok()?;
+    for (id, used) in [(2, 20), (3, 16), (4, 28)] {
+        let stride = usize::from(ring_layout(id, version < 7)?.item_len);
+        if offset.checked_add(used)? > stride {
+            return None;
+        }
+    }
+    Some(offset)
+}
+
 /// Static layout of a common ring for the per-id queries used at
 /// ring-config time. The `pre_v7` flag picks the smaller item-size
 /// where Broadcom shrunk it post-v7.

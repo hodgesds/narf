@@ -26,6 +26,8 @@ mod mfp_tests;
 mod optional_mfp_tests;
 #[path = "power_save_tests.rs"]
 mod power_save_tests;
+#[path = "prefix_station_tests.rs"]
+mod prefix_station_tests;
 #[path = "scan_ies_tests.rs"]
 mod scan_ies_tests;
 #[path = "vht_tests.rs"]
@@ -59,6 +61,7 @@ struct Configuration {
     phy: Option<(u32, u8)>,
     wide: Option<crate::cyw43439::phy_fixture::Wide>,
     vht: Option<crate::cyw43439::phy_fixture::Vht80>,
+    prefix: u32,
 }
 /// The station shell the harness and the generation publisher build.
 fn shell(name: String, station: Station<TestAdapter>) -> Arc<ModelDevice> {
@@ -189,6 +192,7 @@ impl Harness {
                 phy: features.1,
                 wide: None,
                 vht: None,
+                prefix: 0,
             },
         )
     }
@@ -212,6 +216,7 @@ impl Harness {
                 phy: Some((7, 0)),
                 wide: Some(wide),
                 vht: None,
+                prefix: 0,
             },
         )
     }
@@ -236,6 +241,7 @@ impl Harness {
                 phy: Some((chains, 0)),
                 wide: None,
                 vht: Some(vht),
+                prefix: 0,
             },
         )
     }
@@ -248,7 +254,12 @@ impl Harness {
         database: Option<Arc<narf_wireless::reg::db::Database>>,
         features: Configuration,
     ) -> Result<Self, &'static str> {
-        let (adapter, bus) = if selected {
+        let (adapter, bus) = if features.prefix != 0 {
+            if selected || version != 7 {
+                return Err("prefix fixture requires explicit v7 native geometry");
+            }
+            firmware::create_prefixed(secured, features.prefix)
+        } else if selected {
             let (selection, assets) = crate::brcmfmac::provision::tests::selected_fixture(
                 crate::brcmfmac::provision::Family::Pcie43602,
             )?;

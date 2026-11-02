@@ -246,7 +246,9 @@ impl<B: Bus> Runtime<B> {
         // Shared 7 (BRCMF_PCIE_SHARED_VERSION_7) keeps the v6 ring-info
         // layout and only widens the D2H TX/RX completion items to 24/40
         // bytes (pcie.c brcmf_ring_itemsize vs brcmf_ring_itemsize_pre_v7).
-        if bus.dma_enabled()? || !(5..=7).contains(&shared.version) || shared.rx_dataoffset != 0 {
+        let rx_offset = msgbuf::completion_prefix(shared.version, shared.rx_dataoffset)
+            .ok_or(Error::Protocol)?;
+        if bus.dma_enabled()? {
             return Err(Error::Protocol);
         }
         let mut bytes = [0; RINGINFO_SIZE];
@@ -361,7 +363,7 @@ impl<B: Bus> Runtime<B> {
             pending: None,
             response: None,
             events: VecDeque::new(),
-            rx_offset: shared.rx_dataoffset as usize,
+            rx_offset,
             h2d_write: info.h2d_w_idx_ptr,
             h2d_read: info.h2d_r_idx_ptr,
             max_flows: flows,
@@ -652,10 +654,13 @@ impl<B: Bus> Runtime<B> {
                 // Before a handler can retire a TX DMA allocation, complete
                 // reads of its matching completion descriptor into owned memory.
                 ring.memory.release();
+                // The prefix is inside each original item. Never borrow the
+                // next descriptor or alter the firmware's stride/wrap index.
+                let entry = entry.get(self.rx_offset..).ok_or(Error::Protocol)?;
                 match ring_id {
-                    2 => self.control_completion(&entry)?,
-                    3 => self.tx_completion(&entry)?,
-                    4 => self.rx_completion(&entry)?,
+                    2 => self.control_completion(entry)?,
+                    3 => self.tx_completion(entry)?,
+                    4 => self.rx_completion(entry)?,
                     _ => return Err(Error::Protocol),
                 }
                 let ring = &mut self.resources.as_mut().unwrap().rings[ring_id];
@@ -673,7 +678,9 @@ impl<B: Bus> Runtime<B> {
         Ok(processed)
     }
     fn control_completion(&mut self, entry: &[u8]) -> Result<(), Error> {
-        if entry.len() != 24 || entry[1] != 0 {
+        // IOCTL cmd ends at byte20; the final word of the 24-byte control
+        // slot is reserved. Admission proved the complete used field span.
+        if entry.len() < 20 || entry[1] != 0 {
             return Err(Error::Protocol);
         }
         let kind = entry[0];
@@ -1261,7 +1268,13 @@ impl<B: Bus> Runtime<B> {
             .iter_mut()
             .find(|r| r.posted && r.id == complete.hdr.request_id)
             .ok_or(Error::Protocol)?;
-        let offset = usize::from(complete.data_offset);
+        // Linux's explicit offset overrides the shared prefix; these are
+        // alternatives, never an additive pull.
+        let offset = if complete.data_offset != 0 {
+            usize::from(complete.data_offset)
+        } else {
+            self.rx_offset
+        };
         let length = usize::from(complete.data_len);
         if !(14..=1514).contains(&length)
             || offset.checked_add(length).is_none_or(|end| end > RX_BYTES)

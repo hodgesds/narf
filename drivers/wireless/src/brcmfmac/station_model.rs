@@ -71,6 +71,7 @@ pub(super) struct Firmware {
     rx_posts: VecDeque<(u32, u64)>,
     rx_read: u16,
     rx_write: u16,
+    prefix_rx_fallback: bool,
     tx_write: u16,
     flows: BTreeMap<u16, Flow>,
     completions: VecDeque<(u32, u16)>,
@@ -121,6 +122,7 @@ impl Firmware {
             rx_posts: VecDeque::new(),
             rx_read: 0,
             rx_write: 0,
+            prefix_rx_fallback: false,
             tx_write: 0,
             flows: BTreeMap::new(),
             completions: VecDeque::new(),
@@ -656,7 +658,10 @@ impl Firmware {
         while !self.events.is_empty() && !self.event_posts.is_empty() {
             let event = self.events.pop_front().unwrap();
             let (id, address) = self.event_posts.pop_front().unwrap();
-            state.dma.get_mut(&address).unwrap()[..event.len()].copy_from_slice(&event);
+            let prefix = word(state, SHARED + 36) as usize;
+            let buffer = state.dma.get_mut(&address).unwrap();
+            buffer[..prefix].fill(0xa5);
+            buffer[prefix..prefix + event.len()].copy_from_slice(&event);
             complete(
                 state,
                 usize::from(control.completion_write),
@@ -718,9 +723,9 @@ impl Firmware {
                 } else {
                     16
                 };
-                let at = usize::from(self.tx_write) * size;
-                let entry = &mut state.dma.get_mut(&ring).unwrap()[at..at + size];
-                entry.fill(0);
+                assert_eq!((word(state, RINGS + 3 * 16 + 4) >> 16) as usize, size);
+                assert_ne!(ring, 0);
+                let entry = completion_entry(state, 3, usize::from(self.tx_write));
                 entry[0] = 0x10;
                 entry[4..8].copy_from_slice(&id.to_le_bytes());
                 entry[10..12].copy_from_slice(&flow.to_le_bytes());
@@ -732,7 +737,16 @@ impl Firmware {
         while !self.downlink.is_empty() && !self.rx_posts.is_empty() {
             let bytes = self.downlink.pop_front().unwrap();
             let (id, address) = self.rx_posts.pop_front().unwrap();
-            state.dma.get_mut(&address).unwrap()[256..256 + bytes.len()].copy_from_slice(&bytes);
+            let prefix = word(state, SHARED + 36) as usize;
+            self.prefix_rx_fallback = prefix != 0 && !self.prefix_rx_fallback;
+            let explicit_offset = if self.prefix_rx_fallback { 0 } else { 256 };
+            if prefix != 0 {
+                state.prefixed_rx_offsets[usize::from(explicit_offset != 0)] += 1;
+            }
+            let offset = if explicit_offset == 0 { prefix } else { 256 };
+            let buffer = state.dma.get_mut(&address).unwrap();
+            buffer[..offset].fill(0xa5);
+            buffer[offset..offset + bytes.len()].copy_from_slice(&bytes);
             let ring = pointer(state, RINGS + 4 * 16 + 8);
             // Shared 7 RX completion items are 40 bytes (msgbuf.h).
             let size = if word(state, SHARED) & 0xff >= 7 {
@@ -740,13 +754,13 @@ impl Firmware {
             } else {
                 32
             };
-            let at = usize::from(self.rx_write) * size;
-            let entry = &mut state.dma.get_mut(&ring).unwrap()[at..at + size];
-            entry.fill(0);
+            assert_eq!((word(state, RINGS + 4 * 16 + 4) >> 16) as usize, size);
+            assert_ne!(ring, 0);
+            let entry = completion_entry(state, 4, usize::from(self.rx_write));
             entry[0] = 0x12;
             entry[4..8].copy_from_slice(&id.to_le_bytes());
             entry[14..16].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
-            entry[16..18].copy_from_slice(&256u16.to_le_bytes());
+            entry[16..18].copy_from_slice(&(explicit_offset as u16).to_le_bytes());
             entry[18..20].copy_from_slice(&1u16.to_le_bytes());
             self.rx_write = (self.rx_write + 1) % (word(state, RINGS + 4 * 16 + 4) as u16);
             put(state, D2HW + 8, &self.rx_write.to_le_bytes());
@@ -815,6 +829,10 @@ fn scan_result(
 #[derive(Clone)]
 pub(crate) struct Handle(Rc<IrqSafeSpinLock<State>>);
 impl Handle {
+    pub(crate) fn prefix_observations(&self) -> ([usize; 3], [usize; 2]) {
+        let state = self.0.lock();
+        (state.prefixed_completions, state.prefixed_rx_offsets)
+    }
     fn change(&self, operation: impl FnOnce(&mut Firmware)) {
         let mut state = self.0.lock();
         operation(state.firmware.as_mut().unwrap().station.as_mut().unwrap());
@@ -1051,7 +1069,7 @@ impl Handle {
     }
 }
 pub(crate) fn create(version: u32, secured: bool) -> Result<(TestAdapter, Handle), runtime::Error> {
-    create_inner(version, secured, None)
+    create_inner(version, secured, None, 0)
 }
 pub(crate) fn create_selected(
     version: u32,
@@ -1063,7 +1081,13 @@ pub(crate) fn create_selected(
         .proof
         .validate()
         .map_err(|_| runtime::Error::Access)?;
-    create_inner(version, secured, Some((selection, assets)))
+    create_inner(version, secured, Some((selection, assets)), 0)
+}
+pub(crate) fn create_prefixed(
+    secured: bool,
+    prefix: u32,
+) -> Result<(TestAdapter, Handle), runtime::Error> {
+    create_inner(7, secured, None, prefix)
 }
 fn create_inner(
     version: u32,
@@ -1072,12 +1096,14 @@ fn create_inner(
         &crate::brcmfmac::provision::Selection,
         &crate::brcmfmac::provision::Assets,
     )>,
+    prefix: u32,
 ) -> Result<(TestAdapter, Handle), runtime::Error> {
     assert!(matches!(version, 5..=7));
     let (bus, state) = model();
     {
         let mut s = state.lock();
         put(&mut s, SHARED, &version.to_le_bytes());
+        put(&mut s, SHARED + 36, &prefix.to_le_bytes());
         if version == 5 {
             put(&mut s, INFO + 52, &4u16.to_le_bytes());
         }

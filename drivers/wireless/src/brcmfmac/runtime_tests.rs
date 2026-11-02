@@ -8,6 +8,8 @@ use alloc::{
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 use runtime::Memory;
+#[path = "descriptor_prefix_tests.rs"]
+mod descriptor_prefix_tests;
 const BASE: u32 = 0x180000;
 const SIZE: u32 = 0x40000;
 const ARM: u32 = 0x18002000;
@@ -46,6 +48,8 @@ struct State {
     unreleased_read: bool,
     unsafe_free: usize,
     firmware: Option<Firmware>,
+    prefixed_completions: [usize; 3],
+    prefixed_rx_offsets: [usize; 2],
     /// MSI binding offered by the platform model.
     msi: bool,
     armed: usize,
@@ -569,8 +573,7 @@ fn complete(
     transaction: u16,
     command: u32,
 ) {
-    let at = pointer(s, RINGS + 2 * 16 + 8);
-    let entry = &mut s.dma.get_mut(&at).unwrap()[slot * 24..slot * 24 + 24];
+    let entry = completion_entry(s, 2, slot);
     entry[0] = kind;
     entry[4..8].copy_from_slice(&id.to_le_bytes());
     entry[8..10].copy_from_slice(&result.0.to_le_bytes());
@@ -578,6 +581,21 @@ fn complete(
     entry[14..16].copy_from_slice(&transaction.to_le_bytes());
     entry[16..20].copy_from_slice(&command.to_le_bytes());
     put(s, D2HW, &((slot + 1) as u16).to_le_bytes());
+}
+/// Firmware writes within the actual published stride, with an invalid
+/// message discriminator in every prefix byte. No runtime decoder is reused.
+fn completion_entry(s: &mut State, ring: u32, slot: usize) -> &mut [u8] {
+    let prefix = word(s, SHARED + 36) as usize;
+    if prefix != 0 {
+        s.prefixed_completions[(ring - 2) as usize] += 1;
+    }
+    let descriptor = RINGS + ring * 16;
+    let address = pointer(s, descriptor + 8);
+    let stride = (word(s, descriptor + 4) >> 16) as usize;
+    let entry = &mut s.dma.get_mut(&address).unwrap()[slot * stride..(slot + 1) * stride];
+    entry.fill(0);
+    entry[..prefix].fill(0xa5);
+    &mut entry[prefix..]
 }
 fn smoke_brcmf_cr4_board_policy_and_real_boot_transcript() -> TestResult {
     let (bus, s) = model();
@@ -828,8 +846,8 @@ fn flow_reply(st: &mut State, slot: usize, kind: u8, flow: u16) {
 fn flow_reply_status(st: &mut State, slot: usize, kind: u8, flow: u16, status: i16) {
     complete(st, slot, kind, 0, (status, 0), 0, 0);
     let address = pointer(st, RINGS + 2 * 16 + 8);
-    st.dma.get_mut(&address).unwrap()[slot * 24 + 10..slot * 24 + 12]
-        .copy_from_slice(&flow.to_le_bytes());
+    let start = slot * 24 + word(st, SHARED + 36) as usize;
+    st.dma.get_mut(&address).unwrap()[start + 10..start + 12].copy_from_slice(&flow.to_le_bytes());
 }
 fn smoke_brcmf_actual_flow_tx_lifecycle_and_retirement() -> TestResult {
     let (bus, s) = model();
