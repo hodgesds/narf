@@ -48,6 +48,12 @@ impl Radio {
     pub fn state(&self) -> State {
         self.state
     }
+    pub(super) fn tracking_inputs(&self) -> Option<super::rf_tracking::Inputs> {
+        if self.state != State::Ready || self.tssi.results().is_none() {
+            return None;
+        }
+        super::rf_tracking::Inputs::from_completed(*self.dpk.results()?)
+    }
     /// # Safety
     /// Same actual initial B native factory/corrected-cut/BB/NCTL/basic RFK owner,
     /// full firmware capability permits TX-A/RX-AB, actual physical inputs and

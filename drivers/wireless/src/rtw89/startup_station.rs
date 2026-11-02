@@ -116,6 +116,10 @@ unsafe impl Io for Startup {
             .scan_address(&mut native.station_access(), address, admission)
             .await
     }
+    fn station_rf_tracking(&mut self, admission: &control::Admission) -> Result<(), power::Error> {
+        self.station_allowed()?;
+        self.station_native()?.station_rf_tracking(admission)
+    }
     fn station_track_read(&mut self, address: u32) -> Result<u32, power::Error> {
         self.station_allowed()?;
         self.station_native()?.station_track_read(address)

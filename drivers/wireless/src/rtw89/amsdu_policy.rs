@@ -13,6 +13,7 @@ pub(super) struct AmsduRequest {
 }
 pub(super) struct Amsdu {
     authority: Cap<FirmwareBlob, Read>,
+    digest: [u8; 32],
 }
 fn recipe() -> [u8; 32] {
     let mut hash = narf_crypto::sha256::Sha256::new();
@@ -111,7 +112,15 @@ impl Amsdu {
         if bytes[16..48] != request.binding || bytes[48..54] != base.board.mac {
             return Err(Error::Identity);
         }
-        Ok(Self { authority })
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        hash.update(bytes);
+        Ok(Self {
+            authority,
+            digest: hash.finalize(),
+        })
+    }
+    pub(super) fn digest(&self) -> [u8; 32] {
+        self.digest
     }
     pub(super) fn current(&self) -> Result<(), Error> {
         self.authority.invoke(Current).map_err(|_| Error::Authority)

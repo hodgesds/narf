@@ -19,6 +19,8 @@ const DEVICE_DMA_MASK: u64 = (1u64 << 36) - 1;
 mod phycap;
 #[path = "command_native/radio.rs"]
 mod radio;
+#[path = "command_native/rf_tracking.rs"]
+mod rf_tracking;
 pub(super) use radio::{QualificationRequest, RadioPreflight};
 #[path = "command_native/station.rs"]
 mod station;

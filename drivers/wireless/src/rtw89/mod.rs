@@ -119,6 +119,7 @@ mod radio_table;
 mod radio_tables_b;
 mod radio_trim;
 mod rf_access;
+mod rf_tracking;
 mod rfk;
 mod rfk_regs;
 mod rfk_tables;

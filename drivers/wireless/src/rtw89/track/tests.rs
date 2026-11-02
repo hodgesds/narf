@@ -23,8 +23,13 @@ struct Fake {
     cck_pd: bool,
     profile: Option<Profile>,
     crystal: Vec<u8>,
+    rfk_calls: usize,
 }
 impl Hw for Fake {
+    fn rfk(&mut self) -> Result<(), power::Error> {
+        self.rfk_calls += 1;
+        Ok(())
+    }
     fn read(&mut self, address: u32) -> Result<u32, power::Error> {
         if self.unsupported {
             return Err(power::Error::Unsupported);
@@ -200,6 +205,9 @@ fn smoke_rtw89_track_work_programs_registers_like_linux() -> TestResult {
     if ready(track.run(&mut hw, 0, None, false)).is_err() {
         return TestResult::Fail("first track period failed");
     }
+    if hw.rfk_calls != 1 {
+        return TestResult::Fail("initial source RF tracking callback");
+    }
     // rtw89_core_start half: PPDU status to host, CCX and IFS-CLM init.
     if hw.get(R_AX_PPDU_STAT, u32::MAX) != 0x2b
         || hw.get(R_AX_HW_RPT_FWD, B_AX_FWD_PPDU_STAT_MASK) != 1
@@ -234,11 +242,17 @@ fn smoke_rtw89_track_work_programs_registers_like_linux() -> TestResult {
     {
         return TestResult::Fail("track work ran before its period");
     }
+    if hw.rfk_calls != 1 {
+        return TestResult::Fail("RF tracking ran before its2s period");
+    }
     track.sample(peer, 160);
     if ready(track.run(&mut hw, 2000, peer, true)).is_err()
         || hw.get(R_SEG0R_EDCCA_LVL_V1, 0xff) != 0
     {
         return TestResult::Fail("track work ran while scanning");
+    }
+    if hw.rfk_calls != 1 {
+        return TestResult::Fail("RF tracking ran during scan");
     }
     hw.regs.insert(R_IFSCNT, B_IFSCNT_DONE_MSK);
     hw.regs.insert(R_IFS_CLM_FA, (2969 << 16) | 2969);
@@ -250,6 +264,9 @@ fn smoke_rtw89_track_work_programs_registers_like_linux() -> TestResult {
         || hw.get(R_SEG0R_EDCCA_LVL_V1, 0xff) != 95
     {
         return TestResult::Fail("linked noisy DIG/EDCCA registers differ");
+    }
+    if hw.rfk_calls != 2 {
+        return TestResult::Fail("due2s work omitted retained RF callback");
     }
     // A new peer restarts the RSSI average.
     track.sample(Some([2, 0, 0, 0, 0, 2]), 100);

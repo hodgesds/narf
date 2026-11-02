@@ -11,6 +11,16 @@ pub(super) struct Runtime {
     peer: Option<control::Peer>,
     backlog: VecDeque<rx_packet::Event>,
     started: bool,
+    pub(super) rf_tracking: Option<crate::rtw89::rf_tracking::Tracker>,
+}
+impl Runtime {
+    pub(super) fn started(&self) -> bool {
+        self.started
+    }
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(super) fn model_started(&mut self) {
+        self.started = true;
+    }
 }
 pub(in crate::rtw89) struct Access<'a> {
     native: &'a mut Native,

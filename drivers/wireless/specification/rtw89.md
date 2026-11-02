@@ -1375,6 +1375,78 @@ rtw8852b.c,txrx.h}`, `mac80211/{tx.c,agg-tx.c,ht.c}` and `wireless/util.c`.
 No build, native execution or physical acceptance is implied by this pending
 source contract.
 
+### Periodic RTL8852B DPK power tracking (source complete; validation pending)
+
+The actual admitted B callback is Linux7.3-rc4
+`rtw8852b_rfk_track`→`rtw8852b_dpk_track`. Periodic IQK/TSSI calibration
+reruns are not B callback producers; the existing completed source TSSI
+setup already enables continuous thermal feedback on both paths. The AX
+`rtw89_core_rfk_tssi_record` returns without the BE-only diagnostic history.
+The admitted `rtw8852be` adapter also has no110C/120C PCI thermal-duty quirk;
+its source thermal-protection threshold is0. The8852BT/8922A duty controls
+belong to those other chip adapters, not a missing B board-data prerequisite.
+
+`radio_full::Radio::tracking_inputs` copies slot0 DPK thermal/PWSF only
+from its actual Ready DPK/TSSI completion. Native retains that snapshot
+before installing the ordinary receipt. An optional independently signed
+tracking program enables `rf_tracking::Tracker`; absent input cannot be
+reconstructed from a station flag. The existing retained2s `track_work`
+owner invokes it after DIG and before CFO/EDCCA, skips scans and does not
+run it from the enhanced250ms CFO-only work. The initial worker period can
+initialize the callback; subsequent work uses the same2s deadline. Peer
+changes do not discard the radio's thermal averages.
+
+TSSI-mode thermal comes from actual BB`0x1c10 + path*0x2000` bits29:24,
+with source `DECLARE_EWMA(thermal,4,4)` and zero-sample retention. Both live
+TSSI enable/RFC readbacks are required. `rtw8852b_rfk.c::_dpk_track` then
+uses the retained channel1/2G thermal delta scaled3/2, actual TXAGC_RF/BB/TP,
+signed8-bit initial offset, DPD hardware-offset mode and TXDPD branch to
+update both9-bit PWSF fields in`0x81b4 + path*0x100`. Source signed-byte
+assignment and9-bit wrapping are explicit, including `ini_diff` carry
+between paths when a path has no thermal/RF gain. Global DPK tracking-disable
+or zero RF gain performs no PWSF write. The unused debug-only RF tracking
+index supplies no behavior, so this runtime path does not issue that analog
+read or broaden initial RFK's deliberate CMAC-TX-closed access gate.
+
+Both path calculations and signed measured-window checks precede the first
+PWSF change. Computed values outside the window refuse rather than clamp.
+The native adapter permits only those exact logical BB reads and PWSF writes,
+translates the actual AX base, preserves other bits and verifies readback.
+Every read/RMW/write/readback invokes the original current PCI, base,
+expanded-program capabilities and host power inside the original station
+publication admission. The update is synchronous and has no new await or
+half-update cancellation owner. A returned native/current/readback fault
+retires the tracker and same Native, closes emission and retains existing
+uncertain DMA behind the physical stop proof. A second-path fault never
+silently resumes from the changed first path. Non-emitting terminal cleanup
+uses the existing actual device cleanup path after emission authority dies.
+
+The optional128-byte `N52T` v1 record is
+`rtw89/rtw8852b-rf-track-v1-<actual-mac>.bin`. Its header/vendor/device/MAC
+fields match N52A's offsets;54..58 is`[1,20,1,3]`,58..60/60..62 are the
+permitted low/high9-bit PWSF range, and62..128 is zero. The binding at16..48
+is SHA256 of domain `NARF RTL8852B measured expanded periodic DPK full program v1`,
+full selected board/program identity, actual installed N52B digest and signer,
+a byte0 for absent A-MSDU or byte1 plus the actual installed N52A digest,
+then `rf_tracking_policy::recipe()` digest. It must have the base's actual
+authenticated signer. The signed measurement attests the base worst-case
+peak/antenna/power envelope for the full joint radio/aggregation/tracking
+program across every permitted PWSF value; individual narrower records cannot
+silently authorize the combination. Both original companion caps remain
+current. Only NotFound preserves old behavior; invalid-present records refuse.
+N52B/N52A formats and existing fingerprint inputs remain unchanged.
+
+Four new cases cover stored thermal/TSSI/PWSF/EWMA/sign/wrap vectors and
+register-hole preservation, disabled/zero/TSSI-invalid input, measured-window
+refusal and sticky partial-fault retirement, exact signed joint-program and
+window/cap/power constraints, and actual Native/NativeIo MMIO under current
+original caps/admission with absent-program and missing-input negatives.
+The existing track-work case retains its assertions and adds actual callback
+period/scan assertions. These cases are written, unexecuted; source compile,
+native software gates and physical measured deployment acceptance remain
+pending. Primary pins are Linux7.3-rc4`rtw89/{core.c,core.h,phy.c,reg.h,
+rtw8852b.c,rtw8852be.c,rtw8852b_common.c,rtw8852b_rfk.c}`.
+
 ### Protected management frames and WPA3-SAE
 
 rtw89 sets `IEEE80211_HW_MFP_CAPABLE` (Linux v7.2 `core.c::rtw89_core_register_hw`).
@@ -1778,7 +1850,7 @@ with its distinct BE generation. B now has signed-program HT20, HE20 (with
 firmware GI/LTF selection), all-AC/TID QoS, firmware RA, recipient
 BA/reorder, MSI delivery, live EDCA and active channel-1 scans (section 3);
 HE +HTC and originator TX A-MPDU are now implemented. It still needs wider
-widths, other channels, tracking, runtime sleep/WoW and
+widths, other channels, runtime sleep/WoW and
 in-place SER L1 recovery. A/C/51 need complete chip-specific
 firmware/security, BB/RF/power/packet/station composition;8922A additionally
 needs BE EFUSE/container/descriptor/transport and EHT operation. Source band
@@ -1849,7 +1921,7 @@ triage above remains separate from implementation.
 | `wide_channels` | The retained HT/HE profile and descriptor/program identities fix20MHz. HT40/80 and applicable160 need real MAC/BB/RF width/secondary/center programming, full occupied-span power admission and matching host PHY/TX/RX/control-field owners. Shared JoinPlan width encoders already exist. |
 | `fragmentation` | Native packet admission still refuses nonzero fragment numbers/More-Fragments. Host split/reassembly, per-fragment PN and terminal receipt ownership, bounded reassembly lifetimes and matching signed emission programs must be added; the shared fragmentation-threshold control API alone does not implement them. |
 | `monitor_mode` | The retained station facade has no native monitor transition or raw/radiotap publication owner. It needs original MPDUs plus actual PHY-status/PPDU metadata and generation-fenced capture under the shared monitor/AF_PACKET API, with station/key/queue teardown before mode changes. |
-| `rf_power_tracking` | One-shot RF calibration and the completed EDCCA/DIG/CFO tracking do not implement periodic IQK/TSSI/DPK or thermal TX-power adjustment on the retained RF owner. Live RF tracking needs its own source sequence, current policy/queue fences and measured gain/transient envelope. |
+| `rf_power_tracking` | Source complete for the admitted RTL8852B channel1 HT/HE20 owner: actual periodic thermal EWMA/DPK PWSF producer, same completed Radio input snapshot, native current publication/readback and independent signed full joint-program window are described in §3. Software/native/physical validation remains pending. Periodic IQK/TSSI reruns and non-B thermal-duty quirks are not this adapter’s applicable missing producers. |
 | `runtime_sleep` | The fresh-FLR operating recipe remains continuously awake and never requests LPS/RPWM transitions. Runtime sleep needs firmware power-mode commands, current wake/use-count ownership and exact resumed packet/radio state; system suspend/reset is a different implemented lifecycle. |
 | `six_ghz_operation` | Only RTL8852C/RTL8922A have6GHz applicability; their complete native chip/station owners remain missing. The retained B profile is2.4GHz-only in software. Six-GHz operation additionally needs per-band RF/power qualification, actual HE6GHz context and current LPI/VLP/AFC client admission through the existing shared6GHz APIs. |
 | `uapsd` | Station U-APSD is source-inapplicable (no IEEE80211_VIF_SUPPORTS_UAPSD). This row covers AP-side WIPHY_FLAG_AP_UAPSD only; there is no retained AP peer/queue/beacon/service-period owner. |

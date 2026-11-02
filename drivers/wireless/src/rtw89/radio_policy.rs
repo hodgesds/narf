@@ -7,6 +7,8 @@ use narf_firmware::{FirmwareBlob, FirmwareError};
 const LENGTH: usize = 128;
 #[path = "amsdu_policy.rs"]
 mod amsdu;
+#[path = "rf_tracking_policy.rs"]
+mod rf_tracking;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {
@@ -237,6 +239,7 @@ pub(super) struct Qualification {
     record_digest: [u8; 32],
     record_signer: [u8; 32],
     amsdu: Option<amsdu::Amsdu>,
+    rf_tracking: Option<rf_tracking::Tracking>,
     #[cfg(any(test, feature = "kernel-test"))]
     model_domain: Option<narf_wireless::reg::RegulatoryDomain>,
     #[cfg(any(test, feature = "kernel-test"))]
@@ -268,7 +271,8 @@ impl Qualification {
             narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Policy)?;
         }
         qualification.amsdu = amsdu::Amsdu::optional(&qualification)?;
-        if qualification.amsdu.is_some() {
+        qualification.rf_tracking = rf_tracking::Tracking::optional(&qualification)?;
+        if qualification.amsdu.is_some() || qualification.rf_tracking.is_some() {
             qualification.current()?;
         }
         Ok(qualification)
@@ -317,6 +321,7 @@ impl Qualification {
             record_digest: digest.finalize(),
             record_signer,
             amsdu: None,
+            rf_tracking: None,
             antenna_qdb,
             ceiling_qdbm,
             peaks_qdbm,
@@ -340,14 +345,25 @@ impl Qualification {
         self.current()?;
         Ok(self.amsdu.is_some())
     }
-    fn invoke_amsdu<T>(
+    fn invoke_programs<T>(
         &self,
         operation: impl FnOnce() -> Result<T, super::power::Error>,
     ) -> Result<T, super::power::Error> {
+        let operation = || match &self.rf_tracking {
+            Some(program) => program.invoke(operation),
+            None => operation(),
+        };
         match &self.amsdu {
             Some(program) => program.invoke(operation),
             None => operation(),
         }
+    }
+    pub(super) fn rf_tracking_window(&self) -> Result<Option<super::rf_tracking::Window>, Error> {
+        self.current()?;
+        self.rf_tracking
+            .as_ref()
+            .map(rf_tracking::Tracking::window)
+            .transpose()
     }
     pub(super) fn wmm_allowed(&self) -> Result<bool, Error> {
         self.current()?;
@@ -358,6 +374,9 @@ impl Qualification {
             .invoke(Current)
             .map_err(|_| Error::Authority)?;
         if let Some(program) = &self.amsdu {
+            program.current()?;
+        }
+        if let Some(program) = &self.rf_tracking {
             program.current()?;
         }
         #[cfg(any(test, feature = "kernel-test"))]
@@ -396,7 +415,7 @@ impl Qualification {
                         self.qualification
                             .check(domain)
                             .map_err(|_| super::power::Error::Access)?;
-                        return self.qualification.invoke_amsdu(self.operation);
+                        return self.qualification.invoke_programs(self.operation);
                     }
                     let domain = if self.qualification.wmm {
                         narf_wireless::reg::db::get_domain().ok_or(super::power::Error::Access)?
@@ -407,7 +426,7 @@ impl Qualification {
                     self.qualification
                         .check(&domain)
                         .map_err(|_| super::power::Error::Access)?;
-                    self.qualification.invoke_amsdu(self.operation)
+                    self.qualification.invoke_programs(self.operation)
                 })())
             }
         }

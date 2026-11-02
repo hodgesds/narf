@@ -410,6 +410,14 @@ impl Native {
         }
         let qualification = self.full_qualification.take().ok_or(power::Error::Access)?;
         qualification.current().map_err(denied)?;
+        if qualification
+            .rf_tracking_window()
+            .map_err(denied)?
+            .is_some()
+        {
+            let input = owner.tracking_inputs().ok_or(power::Error::Terminal)?;
+            self.station_runtime.rf_tracking = Some(crate::rtw89::rf_tracking::Tracker::new(input));
+        }
         self.ordinary = Some(OrdinaryGrant { qualification });
         Ok(())
     }

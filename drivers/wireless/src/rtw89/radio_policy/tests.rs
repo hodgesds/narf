@@ -375,6 +375,144 @@ pub(in crate::rtw89) fn revoke_on_publication_model() -> (Qualification, Cap<Fir
     (qualification, cap)
 }
 
+fn expanded_record(base: &Qualification, magic: &[u8; 4], binding: [u8; 32]) -> [u8; 128] {
+    let mut bytes = [0; 128];
+    bytes[..4].copy_from_slice(magic);
+    bytes[4..8].copy_from_slice(&[1, 0, 128, 0]);
+    bytes[8..12].copy_from_slice(&128u32.to_le_bytes());
+    bytes[12..14].copy_from_slice(&0x10ecu16.to_le_bytes());
+    bytes[14..16].copy_from_slice(&base.board.device.to_le_bytes());
+    bytes[16..48].copy_from_slice(&binding);
+    bytes[48..54].copy_from_slice(&base.board.mac);
+    bytes[54..58].copy_from_slice(&[1, 20, 1, 3]);
+    bytes
+}
+/// Explicit inert authenticated-record boundary for native register tests;
+/// no production attach, measured RF envelope or physical receipt is minted.
+pub(in crate::rtw89) fn rf_tracking_model(
+    window: super::super::rf_tracking::Window,
+    aggregate: bool,
+) -> (
+    Qualification,
+    Cap<FirmwareBlob, Read>,
+    Cap<FirmwareBlob, Read>,
+) {
+    let board = board();
+    let flags = Program::Ampdu.flags();
+    let mut bytes = image(board.with_programs(flags));
+    bytes[57] = flags;
+    let base_cap = authority();
+    let mut base = Qualification::from_verified(&bytes, Some([3; 32]), board, base_cap).unwrap();
+    base.model_domain = Some(domain());
+    if aggregate {
+        let request = amsdu::AmsduRequest::new(&base).unwrap();
+        let mut record = expanded_record(&base, b"N52A", request.binding);
+        record[58..60].copy_from_slice(&5000u16.to_le_bytes());
+        record[60] = 8;
+        base.amsdu = Some(
+            amsdu::Amsdu::from_verified(&base, &request, &record, Some([3; 32]), authority())
+                .unwrap(),
+        );
+    }
+    let request = rf_tracking::Request::new(&base).unwrap();
+    let mut record = expanded_record(&base, b"N52T", request.binding);
+    record[58..60].copy_from_slice(&window.low.to_le_bytes());
+    record[60..62].copy_from_slice(&window.high.to_le_bytes());
+    let tracking_cap = authority();
+    base.rf_tracking = Some(
+        rf_tracking::Tracking::from_verified(&base, &request, &record, Some([3; 32]), tracking_cap)
+            .unwrap(),
+    );
+    (base, base_cap, tracking_cap)
+}
+
+fn smoke_rtw8852b_periodic_dpk_signed_joint_program_window_and_current_caps() -> TestResult {
+    use super::super::rf_tracking::Window;
+    let window = Window {
+        low: 100,
+        high: 140,
+    };
+    let (mut base, base_cap, tracking_cap) = rf_tracking_model(window, false);
+    if base.rf_tracking_window() != Ok(Some(window)) || base.with_current(|| Ok(7)) != Ok(7) {
+        return TestResult::Fail("actual signed tracking record/current power window");
+    }
+    let request = rf_tracking::Request::new(&base).unwrap();
+    let candidate_cap = authority();
+    let mut record = expanded_record(&base, b"N52T", request.binding);
+    record[58..60].copy_from_slice(&100u16.to_le_bytes());
+    record[60..62].copy_from_slice(&140u16.to_le_bytes());
+    for signer in [None, Some([4; 32])] {
+        if rf_tracking::Tracking::from_verified(&base, &request, &record, signer, candidate_cap)
+            .is_ok()
+        {
+            return TestResult::Fail("unsigned/different signer periodic RF program");
+        }
+    }
+    for length in 0..128 {
+        if rf_tracking::Tracking::from_verified(
+            &base,
+            &request,
+            &record[..length],
+            Some([3; 32]),
+            candidate_cap,
+        )
+        .is_ok()
+        {
+            return TestResult::Fail("truncated periodic RF program");
+        }
+    }
+    for at in [0, 4, 8, 12, 14, 16, 48, 54, 55, 56, 57, 62, 127] {
+        let mut bad = record;
+        bad[at] ^= 1;
+        if rf_tracking::Tracking::from_verified(&base, &request, &bad, Some([3; 32]), candidate_cap)
+            .is_ok()
+        {
+            return TestResult::Fail("malformed/other identity periodic RF program");
+        }
+    }
+    let mut bad = record;
+    bad[58..60].copy_from_slice(&141u16.to_le_bytes());
+    if rf_tracking::Tracking::from_verified(&base, &request, &bad, Some([3; 32]), candidate_cap)
+        .is_ok()
+    {
+        return TestResult::Fail("inverted measured PWSF window");
+    }
+    let (with_aggregate, _, _) = rf_tracking_model(window, true);
+    let joint = rf_tracking::Request::new(&with_aggregate).unwrap();
+    if joint.binding == request.binding
+        || rf_tracking::Tracking::from_verified(
+            &with_aggregate,
+            &joint,
+            &record,
+            Some([3; 32]),
+            candidate_cap,
+        )
+        .is_ok()
+    {
+        return TestResult::Fail(
+            "tracking-only RF envelope silently admitted joint A-MSDU program",
+        );
+    }
+    base.model_domain.as_mut().unwrap().rules[0].max_power_dbm = 1;
+    if base.with_current(|| Ok(7)).is_ok() {
+        return TestResult::Fail("periodic RF ignored tightened actual host power");
+    }
+    base.model_domain = Some(domain());
+    tracking_cap.revoke();
+    if base.current().is_ok() || base.with_current(|| Ok(7)).is_ok() {
+        return TestResult::Fail("actual tracking cap revocation left native RF authority");
+    }
+    base_cap.revoke();
+    if base.rf_tracking_window().is_ok() {
+        return TestResult::Fail("old base source revived tracking window");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/tracking",
+    smoke_rtw8852b_periodic_dpk_signed_joint_program_window_and_current_caps
+);
+
 fn smoke_rtw89_b_each_calibration_packet_and_response_peak_is_independently_required() -> TestResult
 {
     let board = board();

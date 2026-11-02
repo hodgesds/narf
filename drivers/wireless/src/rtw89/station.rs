@@ -95,6 +95,9 @@ pub(super) unsafe trait Io: Send {
     }
     /// Track-work register read (`track::REGISTERS` only). `Unsupported`
     /// disables tracking, as `disabled_dm_bitmap` does.
+    fn station_rf_tracking(&mut self, _: &Admission) -> Result<(), power::Error> {
+        Ok(())
+    }
     fn station_track_read(&mut self, _: u32) -> Result<u32, power::Error> {
         Err(power::Error::Unsupported)
     }
@@ -641,8 +644,11 @@ impl State {
     }
     /// `rtw89_track_work` (and the enhanced CFO timer) when due (`track.rs`).
     async fn track(&mut self, io: &mut impl Io) -> Result<(), Error> {
-        struct Hw<'a, I>(&'a mut I);
+        struct Hw<'a, I>(&'a mut I, &'a Admission);
         impl<I: Io> super::track::Hw for Hw<'_, I> {
+            fn rfk(&mut self) -> Result<(), power::Error> {
+                self.0.station_rf_tracking(self.1)
+            }
             fn read(&mut self, address: u32) -> Result<u32, power::Error> {
                 self.0.station_track_read(address)
             }
@@ -658,7 +664,11 @@ impl State {
         }
         let now = self.now()?;
         let (peer, scanning) = (self.linked(), self.scanning);
-        match self.track.run(&mut Hw(io), now, peer, scanning).await {
+        match self
+            .track
+            .run(&mut Hw(io, &self.admission), now, peer, scanning)
+            .await
+        {
             Ok(()) => Ok(()),
             Err(power::Error::Unsupported) => {
                 self.track.disable();
