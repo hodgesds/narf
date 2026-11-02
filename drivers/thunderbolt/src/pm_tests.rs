@@ -33,7 +33,7 @@ fn usb4_cm_pm_state_checked_fanout() -> TestResult {
     // Establish a known-empty world: these registries are global
     // and shared with other fixtures in the boot. For the duration
     // of this fixture the device-PM registry holds only the CM.
-    narf_power::device_pm::__reset_for_test();
+    let _pm_registry = narf_power::device_pm::__test_isolate_registry();
     tunnel::__reset_orphaned_for_test();
     tunnel::__reset_pm_for_test();
     tunnel::forget_domain(u32::MAX);

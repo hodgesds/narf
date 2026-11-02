@@ -262,6 +262,27 @@ pub fn __reset_for_test() {
     REGISTRY.lock().clear();
 }
 
+/// Temporarily isolate a synchronous smoke from probe-owned PM registrations.
+/// Restores the original entries, their order and retained operations on every
+/// return path. Fixtures must keep the guard alive for their whole fan-out.
+#[doc(hidden)]
+pub fn __test_isolate_registry() -> TestRegistryGuard {
+    TestRegistryGuard(core::mem::take(&mut *REGISTRY.lock()))
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+#[must_use]
+pub struct TestRegistryGuard(Vec<DevicePmEntry>);
+
+impl Drop for TestRegistryGuard {
+    fn drop(&mut self) {
+        let fixtures = core::mem::replace(&mut *REGISTRY.lock(), core::mem::take(&mut self.0));
+        // Test operations may have a re-entrant Drop, just like real drivers.
+        drop(fixtures);
+    }
+}
+
 fn smoke_device_pm_unregister_drops_outside_registry_lock() -> narf_kernel_test::TestResult {
     use core::sync::atomic::{AtomicBool, Ordering};
     static DROPPED: AtomicBool = AtomicBool::new(false);

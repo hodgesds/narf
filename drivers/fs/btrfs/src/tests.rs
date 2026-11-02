@@ -3499,14 +3499,10 @@ kernel_test_in!(
     smoke_btrfs_mmap_cache_generation_tracks_mutations
 );
 
-/// The rename-replace half of the btrfs generation contract (#742):
-/// when a rename destroys the destination inode, the generation of
-/// the destroyed file must move for a node that still holds it open —
-/// the #718 bump enumeration lists "a rename whose destination is
-/// destroyed" alongside `unlink`, but the main smoke never exercises
-/// it. (The renamed file itself keeps its inode and its generation:
-/// same file, new name.)
-fn smoke_btrfs_mmap_cache_generation_moves_on_rename_replace() -> TestResult {
+/// Rename-over unlinks the destination name while preserving the open
+/// inode and its cached contents. Both handles keep their generations;
+/// subsequent writes invalidate only the inode whose contents changed.
+fn smoke_btrfs_mmap_cache_generation_preserves_replaced_open_inode() -> TestResult {
     use narf_filesystem::FsInstance;
     let vol = match mount_fixture() {
         Ok(v) => v,
@@ -3542,21 +3538,42 @@ fn smoke_btrfs_mmap_cache_generation_moves_on_rename_replace() -> TestResult {
     ) {
         return TestResult::Fail("rename-replace failed");
     }
-    match dst.mmap_cache_generation() {
-        Some(g) if g != dg => {}
-        Some(_) => {
-            return TestResult::Fail("rename-replace did not move the destroyed file's generation")
-        }
-        None => return TestResult::Fail("generation vanished after rename-replace"),
+    if dst.mmap_cache_generation() != Some(dg) || read_all(&dst, 16).as_deref() != Some(b"old") {
+        return TestResult::Fail("rename-replace invalidated the open destination inode");
     }
     if src.mmap_cache_generation() != Some(sg) {
         return TestResult::Fail("the renamed file's generation moved across its own rename");
+    }
+    let published = match poll_once(root.lookup_async("ren-dst.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("replacement name disappeared"),
+    };
+    if published.ino() != src.ino()
+        || published.ino() == dst.ino()
+        || published.mmap_cache_generation() != Some(sg)
+        || read_all(&published, 16).as_deref() != Some(b"new")
+    {
+        return TestResult::Fail("replacement name does not resolve to the source inode");
+    }
+    if !matches!(poll_once(dst.write(0, b"old-open")), Some(Ok(8)))
+        || dst.mmap_cache_generation() == Some(dg)
+        || src.mmap_cache_generation() != Some(sg)
+        || read_all(&published, 16).as_deref() != Some(b"new")
+    {
+        return TestResult::Fail("writing the unlinked destination affected the replacement");
+    }
+    if !matches!(poll_once(src.write(0, b"new-open")), Some(Ok(8)))
+        || src.mmap_cache_generation() == Some(sg)
+        || read_all(&published, 16).as_deref() != Some(b"new-open")
+        || read_all(&dst, 16).as_deref() != Some(b"old-open")
+    {
+        return TestResult::Fail("replacement and unlinked inode lost independent contents");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/fs/btrfs",
-    smoke_btrfs_mmap_cache_generation_moves_on_rename_replace
+    smoke_btrfs_mmap_cache_generation_preserves_replaced_open_inode
 );
 
 fn smoke_btrfs_write_rejections() -> TestResult {

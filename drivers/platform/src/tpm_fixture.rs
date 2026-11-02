@@ -760,14 +760,9 @@ impl FakeTpmDevice {
         }
         st.update_counter += 1;
         drop(st);
-        // Sessions success response: header + parameterSize(4) +
-        // authorization area (empty nonce, attributes 0, empty
-        // HMAC) = 19 bytes.
-        let mut out = alloc::vec![0u8; 19];
-        out[0..2].copy_from_slice(&narf_tpm::tpm2::TPM_ST_SESSIONS.to_be_bytes());
-        out[2..6].copy_from_slice(&19u32.to_be_bytes());
-        out[10..14].copy_from_slice(&5u32.to_be_bytes());
-        out
+        // No response parameters. The five-byte authorization area follows
+        // parameterSize; it is not included in that field (Part 3 §22.2).
+        Self::sessions_ok(None, &[])
     }
 
     /// TPM2_PCR_Read (Part 3 §22.6) over the SHA-256 bank.
@@ -844,9 +839,8 @@ impl FakeTpmDevice {
     /// A sessions success response: header + (optional response
     /// handle) + parameterSize + parameters + the 5-byte
     /// password-session response area (empty nonce, attributes 0,
-    /// empty HMAC). Unlike the PCR_Extend arm — whose parameter
-    /// area is empty — the parameterSize here is the true
-    /// parameter byte count the structured parsers bound by.
+    /// empty HMAC). parameterSize counts only response parameters, including
+    /// zero for PCR_Extend, and never includes the authorization area.
     fn sessions_ok(handle: Option<u32>, params: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&narf_tpm::tpm2::TPM_ST_SESSIONS.to_be_bytes());
@@ -1697,6 +1691,8 @@ impl CrbRegs for FakeTpmDevice {
                             // partially-written one).
                             st.tis_cmd_ready = true;
                             st.tis_rx.clear();
+                            st.tis_tx.clear();
+                            st.tis_tx_pos = 0;
                         }
                         if execute_tis {
                             st.tis_cmd_ready = false;
@@ -3599,9 +3595,15 @@ fn smoke_tpm_userspace_publication_conversation() -> TestResult {
             Ok(n) if n == ext.len() => {}
             _ => return Err("PCR_Extend write through /dev/tpm0 failed"),
         }
-        let mut rsp = [0u8; 16];
+        let mut rsp = [0u8; 19];
         match narf_scheduler::block_on(fd_a.read(0, &mut rsp)) {
-            Ok(10) if rsp[6..10] == [0, 0, 0, 0] => {}
+            // TPM_ST_SESSIONS, size 19, success, parameterSize 0, then
+            // TPMS_AUTH_RESPONSE (empty nonce, attributes, empty HMAC).
+            Ok(19)
+                if rsp
+                    == [
+                        0x80, 0x02, 0, 0, 0, 19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    ] => {}
             _ => return Err("PCR_Extend response through /dev/tpm0 malformed"),
         }
         let want_pcr = pcr_extend_value(&[0u8; 32], &digest);

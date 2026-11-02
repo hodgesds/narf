@@ -215,7 +215,7 @@ fn smoke_power_suspend_phase_progression() -> TestResult {
     use narf_capabilities::{Cap, Invoke};
 
     // Isolate from the boot's real devices: NVMe refuses system suspend.
-    crate::device_pm::__reset_for_test();
+    let _pm_registry = crate::device_pm::__test_isolate_registry();
     suspend::__test_reset();
     let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
 
@@ -493,7 +493,7 @@ fn smoke_s3_suspend_unarmed_walks_phases() -> TestResult {
     use narf_capabilities::{Cap, Invoke};
 
     // Isolate from the boot's real devices: NVMe refuses system suspend.
-    crate::device_pm::__reset_for_test();
+    let _pm_registry = crate::device_pm::__test_isolate_registry();
     suspend::__test_reset();
     let cap: Cap<Power, Invoke> = Cap::bootstrap();
     match suspend::suspend(&cap) {
@@ -533,8 +533,8 @@ fn s2idle_counting_resume() -> Result<(), crate::device_pm::DeviceSuspendError> 
 /// Full isolation for an s2idle fixture: empty device registry with
 /// one counting device, shared phase back at Idle, all s2idle state
 /// (gates, latch, stats, hook) cleared.
-fn s2idle_fixture_reset() {
-    crate::device_pm::__reset_for_test();
+fn s2idle_fixture_reset() -> crate::device_pm::TestRegistryGuard {
+    let registry = crate::device_pm::__test_isolate_registry();
     crate::suspend::__test_reset();
     crate::s2idle::__test_reset();
     S2IDLE_DEV_SUSPENDS.store(0, core::sync::atomic::Ordering::SeqCst);
@@ -547,6 +547,7 @@ fn s2idle_fixture_reset() {
         s2idle_counting_suspend,
         s2idle_counting_resume,
     );
+    registry
 }
 
 /// Park-step hook: latch a wake event on the third park iteration —
@@ -588,7 +589,7 @@ fn smoke_s2idle_unarmed_walks_phases() -> TestResult {
     // suspend + resume (the ping-pong cycle).
     use narf_capabilities::{Cap, Invoke};
 
-    s2idle_fixture_reset();
+    let _pm_registry = s2idle_fixture_reset();
     let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
     match crate::s2idle::suspend_to_idle(&cap) {
         Err(crate::SuspendError::NotImplemented) => {}
@@ -620,7 +621,7 @@ fn smoke_s2idle_wake_event_resumes() -> TestResult {
     // the exit reason here — the wake lands on iteration three.
     use narf_capabilities::{Cap, Invoke};
 
-    s2idle_fixture_reset();
+    let _pm_registry = s2idle_fixture_reset();
     crate::s2idle::__test_arm_s2idle();
     crate::s2idle::__test_set_park_step_hook(Some(s2idle_hook_wake_on_third_step));
     let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
@@ -662,7 +663,7 @@ fn smoke_s2idle_no_wake_stays_parked() -> TestResult {
     // through on its own.
     use narf_capabilities::{Cap, Invoke};
 
-    s2idle_fixture_reset();
+    let _pm_registry = s2idle_fixture_reset();
     crate::s2idle::__test_arm_s2idle();
     crate::s2idle::__test_set_park_step_hook(Some(s2idle_hook_record_phase));
     let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
@@ -695,7 +696,7 @@ fn smoke_s2idle_revoked_cap_refused() -> TestResult {
     // movement, no device fan-out, no park.
     use narf_capabilities::{Cap, Invoke};
 
-    s2idle_fixture_reset();
+    let _pm_registry = s2idle_fixture_reset();
     crate::s2idle::__test_arm_s2idle();
     let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
     cap.revoke();
@@ -723,7 +724,7 @@ fn smoke_s2idle_reentrant_request_refused() -> TestResult {
     // entry and is refused at the claim, before any other gate.
     use narf_capabilities::{Cap, Invoke};
 
-    s2idle_fixture_reset();
+    let _pm_registry = s2idle_fixture_reset();
     crate::s2idle::__test_arm_s2idle();
     crate::s2idle::__test_set_park_step_hook(Some(s2idle_hook_reenter));
     let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
@@ -776,7 +777,7 @@ fn smoke_s2idle_unsupported_on_aarch64() -> TestResult {
     // wake source lands (#868).
     use narf_capabilities::{Cap, Invoke};
 
-    s2idle_fixture_reset();
+    let _pm_registry = s2idle_fixture_reset();
     if crate::s2idle::s2idle_supported() {
         return TestResult::Fail(
             "s2idle must report unsupported on aarch64 until a wake source exists",
@@ -816,7 +817,7 @@ fn smoke_s2idle_allowlist_matches_installed_sci_vector() -> TestResult {
     // install's effect — allocate a vector exactly as `init_sci`
     // does and record it exactly where `init_sci` records it — and
     // pins the allowlist to the record.
-    s2idle_fixture_reset();
+    let _pm_registry = s2idle_fixture_reset();
     let saved = narf_acpi::sci_vector();
     let mut fail: Option<&'static str> = None;
 
@@ -2403,7 +2404,7 @@ fn smoke_device_pm_register_and_fanout_order() -> TestResult {
     use crate::device_pm::{
         __reset_for_test, device_count, register_device_pm, resume_all_devices, suspend_all_devices,
     };
-    __reset_for_test();
+    let _pm_registry = crate::device_pm::__test_isolate_registry();
     PM_SEQ.store(0, TestOrdering::Release);
 
     // Register A first, then B.
@@ -2444,11 +2445,70 @@ fn smoke_device_pm_register_and_fanout_order() -> TestResult {
 }
 kernel_test_in!("power/device_pm", smoke_device_pm_register_and_fanout_order);
 
+/// Isolating a failing fixture must not erase probe-owned callbacks needed
+/// by later hardware tests, including trait-backed registrations.
+fn smoke_device_pm_fixture_restores_on_early_return() -> TestResult {
+    use crate::device_pm::{self, DevicePmOps, DeviceSuspendError};
+    use alloc::sync::Arc;
+
+    let _boot_registry = device_pm::__test_isolate_registry();
+    struct ProbedDevice;
+    impl DevicePmOps for ProbedDevice {
+        fn suspend(&self) -> Result<(), DeviceSuspendError> {
+            smoke_pm_record_b_suspend()
+        }
+        fn resume(&self) -> Result<(), DeviceSuspendError> {
+            smoke_pm_record_b_resume()
+        }
+    }
+    let ops: Arc<dyn DevicePmOps> = Arc::new(ProbedDevice);
+    device_pm::register_device_pm(
+        "probe-a",
+        smoke_pm_record_a_suspend,
+        smoke_pm_record_a_resume,
+    );
+    device_pm::register_device_pm_ops("probe-b", ops.clone());
+    let fail = || -> Result<(), ()> {
+        let _fixture = device_pm::__test_isolate_registry();
+        device_pm::register_device_pm("synthetic", smoke_pm_fail_suspend, smoke_pm_fail_resume);
+        Err(())
+    };
+    let result = fail();
+    let restored = device_pm::registered_devices();
+    if result != Err(())
+        || restored.len() != 2
+        || restored[0].name != "probe-a"
+        || restored[1].name != "probe-b"
+        || !restored[1]
+            .ops
+            .as_ref()
+            .is_some_and(|saved| Arc::ptr_eq(saved, &ops))
+    {
+        return TestResult::Fail("a failing fixture lost the original PM registrations");
+    }
+    PM_SEQ.store(0, TestOrdering::Release);
+    let suspend = device_pm::suspend_all_devices();
+    let resume = device_pm::resume_all_devices();
+    if !suspend.ok()
+        || !resume.ok()
+        || suspend.outcomes[0].name != "probe-b"
+        || resume.outcomes[0].name != "probe-a"
+        || PM_SEQ.load(TestOrdering::Acquire) != 1111
+    {
+        return TestResult::Fail("restored PM callbacks or fan-out order changed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/device_pm",
+    smoke_device_pm_fixture_restores_on_early_return
+);
+
 fn smoke_device_pm_one_failure_doesnt_abort_chain() -> TestResult {
     use crate::device_pm::{
         __reset_for_test, register_device_pm, suspend_all_devices, DeviceSuspendError,
     };
-    __reset_for_test();
+    let _pm_registry = crate::device_pm::__test_isolate_registry();
     PM_SEQ.store(0, TestOrdering::Release);
     PM_FAIL_FLAG.store(0, TestOrdering::Release);
 
@@ -2487,7 +2547,7 @@ fn smoke_device_pm_re_register_replaces() -> TestResult {
     use crate::device_pm::{
         __reset_for_test, device_count, register_device_pm, suspend_all_devices,
     };
-    __reset_for_test();
+    let _pm_registry = crate::device_pm::__test_isolate_registry();
     PM_SEQ.store(0, TestOrdering::Release);
     register_device_pm("dev_a", smoke_pm_record_a_suspend, smoke_pm_record_a_resume);
     // Re-register same name with a different (b) handler.
@@ -2536,7 +2596,7 @@ fn smoke_arm_s3_resume_refuses_without_armed_real_sleep() -> TestResult {
     // the arm check — its failure would surface as Aborted and
     // mask the refusal this smoke pins. Same isolation as
     // smoke_s3_suspend_unarmed_walks_phases.
-    crate::device_pm::__reset_for_test();
+    let _pm_registry = crate::device_pm::__test_isolate_registry();
     __test_reset();
     let cap: Cap<Power, Invoke> = Cap::bootstrap();
     match arm_s3_resume(&cap) {
@@ -2653,7 +2713,7 @@ fn smoke_device_pm_ops_round_trip() -> TestResult {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU32, Ordering};
 
-    __reset_for_test();
+    let _pm_registry = crate::device_pm::__test_isolate_registry();
 
     struct FakeDriver {
         // Bit 0 set after suspend, bit 1 set after resume.
@@ -2716,7 +2776,7 @@ fn smoke_pci_config_save_restore_round_trip_via_ops() -> TestResult {
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use narf_lib::sync::IrqSafeSpinLock;
 
-    __reset_for_test();
+    let _pm_registry = crate::device_pm::__test_isolate_registry();
 
     // Model "live" cfg-space + the saved snapshot. On suspend
     // we copy live into saved; on resume we copy saved back to
@@ -3348,7 +3408,7 @@ kernel_test_in!("power/watchdog", smoke_watchdog_sysfs_bootstatus);
 fn suspend_busy_driver_aborts_and_rolls_back() -> TestResult {
     use crate::device_pm::{__reset_for_test, register_device_pm};
     use crate::suspend::{self, SuspendError, SuspendPhase};
-    __reset_for_test();
+    let _pm_registry = crate::device_pm::__test_isolate_registry();
     suspend::__test_reset();
     PM_SEQ.store(0, TestOrdering::Release);
     PM_FAIL_FLAG.store(0, TestOrdering::Release);

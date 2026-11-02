@@ -347,7 +347,7 @@ fn invoke_park_step_hook() {
 
 /// Reset all s2idle module state. Test-only; pair with
 /// `suspend::__test_reset()` (which owns the shared phase) and
-/// `device_pm::__reset_for_test()`.
+/// a scoped `device_pm::__test_isolate_registry()` guard.
 #[doc(hidden)]
 pub fn __test_reset() {
     S2IDLE_TEST_ARMED.store(false, Ordering::Release);
