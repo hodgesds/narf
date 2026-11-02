@@ -1729,22 +1729,24 @@ targets; all four host GPU configurations pass all-target Clippy. Both-target
 changed-package debug/release builds, formatting, diff and final source hashes
 pass. aarch64 QEMU is omitted because no aarch64-specific production behavior
 changes. The ledger has 58 implemented checkpoint rows and ten broad open
-workstreams; physical Intel/Mesa acceptance remains unrun. The separately reviewed next7 batch adds retained external-DP teardown,
-per-object i915 ASYNC and exact-TGL HuC; all 37 new fixtures pass in debug,
-with release/cross-target validation pending as described below.
+workstreams; physical Intel/Mesa acceptance remains unrun. The subsequent
+v0.34 checkpoint adds retained external-DP teardown,
+per-object i915 ASYNC and exact-TGL HuC, with validation recorded below.
 
 The reviewed v0.34 Intel batch implements retained Gen12 combo-B SST stop
 and observed SDE/SHOT HPD, BMG per-object i915 EXEC_OBJECT_ASYNC and default-off
-exact physical TGL HuC upload/auth/query. All 37 new fixtures (21+8+8) pass in
-the debug native kernel. The branch passes 1,861 selected debug tests: 1,191
-Intel/DRM/fb/backlight and all 670 shared filesystem/graphics/AMD fixtures,
-with no failures or duplicate names, no Intel skips and one existing shared
-RNG-registration skip. All 1,087 prior Intel names, all 105 cumulative new
-names and 31 backlight regressions remain covered. Host Intel all-target
-Clippy, formatting/diff and all 103 source/linker hashes pass. The ledger has
-58 fully validated plus three debug-tested rows (61 total) and ten broad
-open workstreams. Release native, production boot/btrfs and cross-target
-gates are running on the same frozen source; merge readiness is not claimed.
+exact physical TGL HuC upload/auth/query. All 37 new fixtures (21+8+8)
+pass in debug and release native kernels. Each profile passes 1,861 selected
+tests: 1,191 Intel/DRM/fb/backlight and all 670 shared filesystem/graphics/AMD
+fixtures, with no failures or duplicate names, no Intel skips and one existing
+shared RNG-registration skip. All 1,087 prior Intel names, 105 cumulative new
+names and 31 backlight regressions remain covered. Release production boot
+and both btrfs postflights pass. Both-target CI Clippy passes all three feature
+contexts, all four host GPU vendor configurations pass all-target Clippy, and
+both-target changed-package debug/release builds pass. Formatting, diff and
+all 103 frozen source/linker hashes pass. aarch64 QEMU is omitted because no
+aarch64-specific production behavior changes. The ledger contains 61
+implemented checkpoint rows and ten broad open workstreams.
 
 SST stop keeps current per-operation authority, observed PCH policy, fresh HPD
 status, serial publication and retained PM/reset ownership; stopped or

@@ -2225,7 +2225,7 @@ power, frequency, CT, firmware-registry or TCB authority and changes no newer
 platform's mapping-retirement contract.
 
 This implements only exact-TGL HuC upload/auth/query/lifetime software;
-debug native gates pass; release/cross-target gates remain pending. Codec command
+debug and release native model gates pass. Codec command
 admission, i915 HuC-status error ABI, ADL and newer HuC profiles, separate MTL
 media-GT scheduling, GSC/PXP/protected content and physical Intel/media/S3
 acceptance remain separate. No capability bit or broader engine/performance claim
@@ -2238,7 +2238,7 @@ manually reviewed. The firmware-reset portion of the system-resume fixture
 uses full stop and fresh GuCGt owners. The actual RuntimeOwner, PCI PM and
 system-PM coordinator callbacks are not executed by these new fixtures. Their
 production wiring was manually reviewed; physical Intel/S3, Mesa and codec
-acceptance are unrun. Debug native model gates pass; release/cross-target checks remain pending.
+acceptance are unrun. These coverage limits remain after the native model checks.
 The internal interfaces add ExecObject.asynchronous and retained per-object
 policy; trusted constructors initialize false and native Xe retains its existing
 globally explicit GPU-ordering contract.

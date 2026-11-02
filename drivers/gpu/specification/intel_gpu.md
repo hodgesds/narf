@@ -26,7 +26,7 @@
 > Gen12 main-GuC media, retained CPU aliases, immutable Xe low-latency hints
 > and exact LNL EU-stall observation; reviewed retained combo-B SST stop,
 > per-object BMG i915 ASYNC and default-off exact-TGL HuC upload/auth/query
-> are implemented with validation pending — see §20).
+> pass debug and release native model gates — see §20).
 >
 > Display driver for Intel integrated graphics from Tiger Lake through Meteor Lake;
 > render foundations also cover Arc Alchemist and Battlemage.
@@ -2231,9 +2231,9 @@ production feature. Unsupported functionality remains unadvertised.
 | Intel CPU alias lifetime | Whole-BO physical census, pending publication tokens, retained unpublished-fork metadata and permanent mixed-vendor provider dispatch | Implemented; native fixtures pass |
 | Xe low-latency queue hint | Truthful current ABI/epoch discovery, immutable real queue flag, source policy KLV before enable ACK and retained physical/virtual/parallel contexts | Implemented; native fixtures pass |
 | LNL EU-stall observation | Exact headless graphics20.04 profile, retained sampler/cache/media proof and existing bounded privilege/loss/reset lifecycle | Implemented; native fixtures pass |
-| Retained Gen12 external SST stop | Current observed combo-B HPD, fresh status incarnation, checked retained local-stop/publication/PM gate and exact implemented-plane inventory | Implemented; debug native fixtures pass |
-| Per-object i915 ASYNC | Live BMG ordinary WB softpin and same-card WB imports, truthful GETPARAM43, selective prior GPU waits, atomic mixed admission and retained terminal/CPU ordering | Implemented; debug native fixtures pass |
-| Exact-TGL HuC upload/auth/query | Default-off actual firmware/BO/WOPCM, both-pass DMA, typed zero-result CT plus fresh status, current Xe query7/type1 and full-reset reclamation | Implemented; debug native fixtures pass |
+| Retained Gen12 external SST stop | Current observed combo-B HPD, fresh status incarnation, checked retained local-stop/publication/PM gate and exact implemented-plane inventory | Implemented; native fixtures pass |
+| Per-object i915 ASYNC | Live BMG ordinary WB softpin and same-card WB imports, truthful GETPARAM43, selective prior GPU waits, atomic mixed admission and retained terminal/CPU ordering | Implemented; native fixtures pass |
+| Exact-TGL HuC upload/auth/query | Default-off actual firmware/BO/WOPCM, both-pass DMA, typed zero-result CT plus fresh status, current Xe query7/type1 and full-reset reclamation | Implemented; native fixtures pass |
 | GT power/telemetry | D3cold, safe autosuspend with live mappings/panel, additional flush consumers/platforms and media power | Open; mapping revocation and platform PM |
 | Additional platforms | Broader display/platform services beyond the fixed Gen12 and headless LNL/PTL execution profiles | Open; primary-source register/firmware contracts |
 
@@ -2971,16 +2971,14 @@ preserves the compiled x86 test code. aarch64 QEMU is
 omitted under the maintainer's iteration policy because no aarch64-specific
 production behavior changes. The ledger has 58 implemented checkpoint rows
 and ten broad open workstreams. Intel silicon and Mesa acceptance remain
-unrun. The separate retained external-display draft has cleared static review;
-its executable/native validation remains pending.
+unrun. The subsequent three-feature checkpoint is recorded below.
 
-### Reviewed next7 scope — release and cross-target checks pending
+### Retained external SST, i915 ASYNC and exact-TGL HuC checkpoint
 
-Three bounded production slices extend the validated v0.33 checkpoint and
-pass debug native validation. The ledger contains 58 fully validated rows
-plus three debug-tested rows (61 total); ten broad workstreams remain open.
-Release/production/btrfs/cross-target gates are pending. Native models do not
-establish physical Intel or Mesa acceptance.
+Three bounded production slices extend the validated v0.33 checkpoint.
+The ledger contains 61 implemented checkpoint rows and ten broad open
+workstreams. Debug and release native model validation passes; source review
+and native models do not establish physical Intel or Mesa acceptance.
 
 - Retained external display owns one source-qualified Gen12 combo-B SST stop
   graph. Current capability/D0 and observed PCH identity gate masked SDE/SHOT
@@ -3016,15 +3014,19 @@ establish physical Intel or Mesa acceptance.
   headless LNL/PTL gain no HuC profile; their existing defaults/owners remain.
   I915 GETPARAM42, codecs, media-GT, GSC/PXP/protected content remain separate.
 
-All 37 new fixtures pass in the debug native kernel: 21 external-ownership,
-eight ASYNC and eight HuC. The branch passes 1,861 selected debug tests:
-1,191 Intel/DRM/framebuffer/backlight and all 670 shared filesystem/graphics/
-AMD fixtures, with no failures or duplicate names, no Intel skips and one
-existing shared RNG-registration skip. All 1,087 prior Intel names, all 105
-cumulative new names and 31 backlight regressions remain covered. Host Intel
-all-target Clippy, formatting/diff and all 103 frozen source/linker hashes
-pass. Release native, production boot/btrfs and cross-target gates are running
-on the same frozen source; merge readiness is not claimed.
+All 37 new fixtures pass: 21 external-ownership, eight ASYNC and eight HuC.
+Debug and release each pass 1,861 selected tests: 1,191 Intel/DRM/framebuffer/
+backlight plus all 670 shared filesystem/graphics/AMD fixtures. All 1,087
+prior Intel names, all 105 cumulative new names and 31 backlight regressions
+remain covered, with no failures or duplicate names, no Intel skips and one
+existing shared RNG-registration skip. Release production boot and both
+btrfs postflights pass. Target CI Clippy passes all three feature contexts on
+both architectures; all four host GPU vendor configurations pass all-target
+Clippy. Changed-package debug/release builds pass on both targets; workspace
+formatting, diff checks and all 103 frozen source/linker hashes pass.
+aarch64 QEMU is omitted under the maintainer's iteration policy because no
+aarch64-specific production behavior changes. Intel/S3/Mesa/codec acceptance
+remains unrun.
 
 The HuC fixtures do not execute the positive Firmware::open/registry/
 stage_with_huc acquisition chain or actual RuntimeOwner/PCI/system-PM
