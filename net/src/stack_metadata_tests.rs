@@ -187,18 +187,34 @@ fn event_native_identity() -> Result<(), &'static str> {
     let down = Arc::new(AtomicBool::new(false));
     let registration =
         crate::iface::lookup(&f.name).ok_or("original event identity registration")?;
-    if !crate::iface::set_open_stop_target(
-        &registration,
-        Arc::new(IdentityTarget {
-            events: events.clone(),
-            previous,
-            down_was_closed: down.clone(),
-        }),
-    ) {
+    let target = Arc::new(IdentityTarget {
+        events: events.clone(),
+        previous,
+        down_was_closed: down.clone(),
+    });
+    if !crate::iface::set_open_stop_target(&registration, target.clone()) {
         return Err("original identity target installation");
     }
     f.admin.set_link(true).map_err(|_| "actual original UP")?;
     let first = events.lock().last().cloned().ok_or("original UP event")?;
+    let original = first.original_snapshot();
+    if original.name != registration.name
+        || original.ownership_epoch != registration.ownership_epoch
+        || original.ifindex != registration.ifindex
+        || original.mac != registration.mac
+        || !original.link_up
+        || !crate::iface::set_open_stop_target(&original, target.clone())
+    {
+        return Err("event did not retain its original complete transition snapshot");
+    }
+    let mut detached = first.original_snapshot();
+    detached.name.push_str("-detached");
+    detached.mac[5] ^= 1;
+    if first.original_snapshot().name != original.name
+        || first.original_snapshot().mac != original.mac
+    {
+        return Err("snapshot clone changed the sealed original event");
+    }
     let first_identity = first
         .native_identity()
         .ok_or("current original UP Ethernet identity")?;
@@ -263,6 +279,29 @@ fn event_native_identity() -> Result<(), &'static str> {
     if !monitor.current() || monitor.native_identity().is_some() {
         return Err("current non-Ethernet event acquired native Ethernet identity");
     }
+    let monitor_original = monitor.original_snapshot();
+    let token = crate::iface::begin_monitor_rx(&monitor_original)
+        .ok_or("actual original monitor metadata capture")?;
+    if !crate::iface::monitor_rx_current(token) {
+        return Err("unchanged original monitor capture was refused");
+    }
+    f.admin
+        .set_mac([2, 1, 2, 3, 4, 6])
+        .map_err(|_| "monitor actual MAC change")?;
+    f.admin
+        .set_mac(monitor_original.mac)
+        .map_err(|_| "monitor actual MAC return")?;
+    let mut raw = [0; 10];
+    raw[2] = 8;
+    if crate::iface::monitor_rx_current(token)
+        || crate::iface::on_monitor_frame_from(token, &raw)
+        || crate::iface::begin_monitor_rx(&monitor_original).is_some()
+        || monitor.current()
+        || monitor.original_snapshot().mac != monitor_original.mac
+        || monitor.original_snapshot().ownership_epoch != monitor_original.ownership_epoch
+    {
+        return Err("monitor MAC away/back revived original event, token or snapshot");
+    }
     f.admin
         .set_link(false)
         .map_err(|_| "monitor metadata DOWN")?;
@@ -281,6 +320,8 @@ fn event_native_identity() -> Result<(), &'static str> {
         || fourth.native_identity().is_some()
         || first.native_identity().is_some()
         || stopped.native_identity().is_some()
+        || crate::iface::set_open_stop_target(&first.original_snapshot(), target)
+        || first.original_snapshot().ownership_epoch != original.ownership_epoch
     {
         return Err("same-name/index/MAC successor revived original event identity");
     }

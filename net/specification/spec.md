@@ -142,19 +142,20 @@ registrations and link transitions retain their existing behavior.
 
 A retained native driver calls `begin_monitor_rx(expected_snapshot)` only after its
 sniffer/channel receipts. This returns an opaque `MonitorRxToken` containing
-an ifindex, namespace and unique epoch, conditional on current monitor type,
-administrative UP and the same pre-start name/ifindex/namespace/packet
-generation. Its carrier publication is atomic with that identity check;
+the original registration, ownership, MAC, ifindex, namespace and unique epoch,
+conditional on current monitor type, administrative UP and the same pre-start
+name/registration/ownership/MAC/ifindex/namespace/packet generation. Its carrier
+publication is atomic with that identity check;
 reused names cannot accept an old native setup or its carrier update. `monitor_rx_current(token)` also requires carrier.
 `on_monitor_frame_from(token, radiotap_and_mpdu)` verifies that current owner
 and bounded version-0 radiotap extent, then delivers only to AF_PACKET. It
 never invokes Ethernet/IP/XDP ingress or station frame-ring publication.
 The native adapter must validate the original frame and metadata before this
 boundary. `end_monitor_rx(token)` retires only that current generation and withdraws
-its carrier. Monitor DOWN and namespace/rebind transitions also withdraw
+its carrier. Monitor DOWN, MAC ownership changes and namespace/rebind transitions also withdraw
 carrier before another native owner can start.
 
-Mode changes, monitor DOWN, native capture stop, unregister, driver rebind
+Mode changes, monitor DOWN, MAC changes, native capture stop, unregister, driver rebind
 and namespace changes fence capture publication. Bound AF_PACKET hooks must
 be explicitly rebound after ownership/representation retirement; UP alone
 cannot resurrect an old monitor or station binding. A binding records the
@@ -306,8 +307,11 @@ callers, rather than treating a hardware rejection as a missing interface.
 callback receiver. Installation compares the original immutable registration;
 re-registration clears both hook forms. `OpenStopEvent` carries the original
 transition and exposes `name`, `up` and a current-registration/namespace/ownership
-epoch observation. A trusted target captures its original concrete driver and
-uses that driver's actual current device capability; it must not resolve a new
+epoch observation. `original_snapshot()` clones that sealed original transition
+without a registry lookup, currentness check or grant. A stale event still
+returns its original metadata; the clone cannot follow a replacement and does
+not authorize a native operation. A trusted target captures its original
+concrete driver and uses that driver's actual current device capability; it must not resolve a new
 receiver by name. UP additionally requires the original event generation;
 retired DOWN may clean up only the captured old device. This event is no grant.
 Callbacks run after Registry, IFACES and PUBLISH locks are released. Reentrant

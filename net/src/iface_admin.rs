@@ -23,6 +23,11 @@ impl OpenStopEvent {
     pub fn up(&self) -> bool {
         self.snapshot.link_up
     }
+    /// Clone the sealed original transition observation without a lookup.
+    /// This supplies neither currentness nor native operation authority.
+    pub fn original_snapshot(&self) -> NetIfaceSnapshot {
+        self.snapshot.clone()
+    }
     /// Capture this original event's current UP Ethernet identity outside
     /// native State/provider locks. The returned fixed weak observation only
     /// denies after metadata retirement; it supplies no device, RF, wake,
@@ -171,8 +176,16 @@ pub(crate) fn mutate(name: &str, binding: Binding, change: Change) -> Option<Eff
         Change::Mtu(mtu) => entry.mtu = mtu,
         Change::Mac(mac) => {
             if entry.mac != mac {
+                if entry.link_layer == LinkLayer::Ieee80211Radiotap {
+                    effects.retired_capture = Some(snapshot(entry));
+                }
                 effects.native.push(entry.retire_native());
                 entry.ownership_epoch = next_ownership_epoch();
+                if entry.link_layer == LinkLayer::Ieee80211Radiotap {
+                    entry.monitor_epoch = 0;
+                    entry.packet_generation = monitor::next_epoch().unwrap_or(u64::MAX);
+                    monitor::carrier(entry, false);
+                }
             }
             entry.mac = mac;
             entry.addr_assign_type = 3;

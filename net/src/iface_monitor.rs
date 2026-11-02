@@ -31,6 +31,9 @@ pub(super) fn next_epoch() -> Option<u64> {
 pub struct MonitorRxToken {
     ifindex: u32,
     net_ns_id: u64,
+    registration_epoch: u64,
+    ownership_epoch: u64,
+    mac: [u8; 6],
     epoch: u64,
 }
 
@@ -97,6 +100,11 @@ pub fn begin_monitor_rx(expected: &NetIfaceSnapshot) -> Option<MonitorRxToken> {
         entry.name == expected.name
             && entry.ifindex == expected.ifindex
             && entry.net_ns_id == expected.net_ns_id
+            && expected.registration_epoch != 0
+            && entry.registration_epoch == expected.registration_epoch
+            && expected.ownership_epoch != 0
+            && entry.ownership_epoch == expected.ownership_epoch
+            && entry.mac == expected.mac
             && entry.packet_generation == expected.packet_generation
     })?;
     if !entry.link_up
@@ -111,6 +119,9 @@ pub fn begin_monitor_rx(expected: &NetIfaceSnapshot) -> Option<MonitorRxToken> {
     Some(MonitorRxToken {
         ifindex: entry.ifindex,
         net_ns_id: entry.net_ns_id,
+        registration_epoch: entry.registration_epoch,
+        ownership_epoch: entry.ownership_epoch,
+        mac: entry.mac,
         epoch,
     })
 }
@@ -144,6 +155,9 @@ pub fn end_monitor_rx(token: MonitorRxToken) -> bool {
 fn current(entry: &NetIfaceEntry, token: MonitorRxToken) -> bool {
     entry.ifindex == token.ifindex
         && entry.net_ns_id == token.net_ns_id
+        && entry.registration_epoch == token.registration_epoch
+        && entry.ownership_epoch == token.ownership_epoch
+        && entry.mac == token.mac
         && entry.monitor_epoch == token.epoch
         && entry.link_layer == LinkLayer::Ieee80211Radiotap
 }
