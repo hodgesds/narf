@@ -51,6 +51,37 @@ fn errno(error: crate::WirelessError) -> i32 {
         other => mlme_errno(other),
     }
 }
+/// Netdev roles keep their real IFINDEX, UP requirement and captured mode
+/// generation. A driver must explicitly opt each native management direction
+/// in; DEVICE10 keeps its separate control-WDEV path.
+pub(super) fn netdev_management_supported(
+    iface: &dyn crate::WirelessNetIface,
+    transmit: bool,
+) -> bool {
+    match iface.current_iftype() {
+        2 => {
+            if transmit {
+                iface.async_radio_management_tx_control()
+            } else {
+                iface.async_radio_management_rx_control()
+            }
+        }
+        mode @ (8 | 9) => {
+            iface
+                .get_wireless_info()
+                .modes
+                .contains(crate::iface::WirelessModes::P2P)
+                && iface.p2p_interface_types().contains(&mode)
+                && if transmit {
+                    iface.async_p2p_netdev_management_tx_control()
+                } else {
+                    iface.async_p2p_netdev_management_rx_control()
+                }
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn register_frame(
     bytes: &[u8],
     context: RequestContext<'_>,
@@ -60,7 +91,7 @@ pub(super) fn register_frame(
     reject_unknown(&attrs, &[3, 153, 91, 101])?;
     let (iface, index) = interface(&attrs, context.net_ns_id)?;
     let supported = match index {
-        Some(_) => iface.current_iftype() == 2 && iface.async_radio_management_rx_control(),
+        Some(_) => netdev_management_supported(iface.as_ref(), false),
         None => iface.current_iftype() == 10 && iface.async_p2p_management_rx_control(),
     };
     if !supported {
@@ -91,7 +122,7 @@ pub(super) fn frame(
     reject_unknown(&attrs, &[3, 153, 38, 51, 87, 108, 135])?;
     let (iface, index) = interface(&attrs, context.net_ns_id)?;
     let supported = match index {
-        Some(_) => iface.current_iftype() == 2 && iface.async_radio_management_tx_control(),
+        Some(_) => netdev_management_supported(iface.as_ref(), true),
         None => iface.current_iftype() == 10 && iface.async_p2p_management_tx_control(),
     };
     if !supported {

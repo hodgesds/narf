@@ -933,6 +933,16 @@ pub trait WirelessNetIface: Interface {
     fn async_radio_management_rx_control(&self) -> bool {
         false
     }
+    /// Source-bound management TX on an actual P2P CLIENT8/GO9 netdev.
+    /// This is independent of managed2/control10 and grants no role or RF.
+    fn async_p2p_netdev_management_tx_control(&self) -> bool {
+        false
+    }
+    /// Management subscriptions on an implemented actual CLIENT8/GO9
+    /// netdev. Original source, administrative UP and role epochs remain.
+    fn async_p2p_netdev_management_rx_control(&self) -> bool {
+        false
+    }
     async fn mgmt_tx_radio_async(
         &self,
         _authority: &ap_control::RadioControlAuthority,
@@ -1046,6 +1056,22 @@ pub trait WirelessNetIface: Interface {
             return Err(WirelessError::NotSupported);
         }
         self.start_ap_async(authority, config).await
+    }
+    /// Implemented P2P GO CTWindow/OPPPS START and live-update contract.
+    /// Native callbacks must retain actual mode9/source and receipts; the
+    /// default preserves existing drivers' advertisement and behavior.
+    fn supports_p2p_go_power_save(&self) -> bool {
+        false
+    }
+    async fn set_p2p_go_power_save_ap_async(
+        &self,
+        authority: &ap_control::ApControlAuthority,
+        settings: P2pGoPowerSave,
+    ) -> Result<(), WirelessError> {
+        authority.check_for(self)?;
+        authority.require_up()?;
+        settings.validate()?;
+        Err(WirelessError::NotSupported)
     }
     async fn stop_ap_async(
         &self,
@@ -1996,6 +2022,25 @@ pub struct ApStartSettings {
     pub group_cipher: Option<u32>,
     pub akms: Option<Vec<u32>>,
     pub control_port: ControlPort,
+    /// Actual optional P2P GO CTWindow/OPPPS metadata. Ordinary APs and
+    /// drivers without the explicit native contract refuse these fields.
+    pub p2p_go: Option<P2pGoPowerSave>,
+}
+
+/// Bounded P2P GO part of START_AP/SET_BSS. None preserves a live value;
+/// Some(0)/Some(false) is an explicit reset, not an omitted attribute.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct P2pGoPowerSave {
+    pub ctwindow_tu: Option<u8>,
+    pub opportunistic: Option<bool>,
+}
+impl P2pGoPowerSave {
+    pub fn validate(&self) -> Result<(), WirelessError> {
+        if self.ctwindow_tu.is_some_and(|window| window > 127) {
+            return Err(WirelessError::InvalidArgs);
+        }
+        Ok(())
+    }
 }
 
 /// Request-side `NL80211_ATTR_MBSSID_CONFIG`. `index == 0` is the

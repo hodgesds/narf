@@ -6,6 +6,8 @@ struct Subset {
     base: InterfaceStub,
     p2p: bool,
     types: Vec<u32>,
+    power: bool,
+    generation: bool,
 }
 impl Interface for Subset {
     fn name(&self) -> &str {
@@ -29,6 +31,24 @@ impl Interface for Subset {
 }
 #[async_trait::async_trait]
 impl crate::WirelessNetIface for Subset {
+    fn supports_ap(&self) -> bool {
+        true
+    }
+    fn ap_control_generation(&self) -> Option<core::num::NonZeroU64> {
+        if self.generation {
+            core::num::NonZeroU64::new(1)
+        } else {
+            None
+        }
+    }
+    fn supports_p2p_go_power_save(&self) -> bool {
+        self.power
+    }
+    fn nl80211_feature_flags(&self) -> u32 {
+        // A legacy feature word cannot confer the separately implemented
+        // native GO PS contract. The unrelated flag must remain unchanged.
+        (1 << 11) | (1 << 12) | (1 << 17)
+    }
     fn p2p_interface_types(&self) -> Vec<u32> {
         self.types.clone()
     }
@@ -75,6 +95,8 @@ fn smoke_nl80211_p2p_wiphy_subset_preserves_defaults_and_refuses_role_invention(
         },
         p2p: true,
         types: alloc::vec![10],
+        power: false,
+        generation: true,
     };
     let info = iface.get_wireless_info();
     if types(&wiphy_attrs(0, &info, Some(&iface))) != [2, 10] {
@@ -104,4 +126,58 @@ fn smoke_nl80211_p2p_wiphy_subset_preserves_defaults_and_refuses_role_invention(
 kernel_test_in!(
     "wireless/nl80211",
     smoke_nl80211_p2p_wiphy_subset_preserves_defaults_and_refuses_role_invention
+);
+
+fn smoke_nl80211_go_power_advertisement_requires_native_role_and_optin() -> TestResult {
+    let mut iface = Subset {
+        base: InterfaceStub {
+            name: "go-power-types",
+            rx: IrqSafeSpinLock::new(None),
+            tx: IrqSafeSpinLock::new(None),
+        },
+        p2p: true,
+        types: alloc::vec![9],
+        power: false,
+        generation: true,
+    };
+    for variant in 0..5 {
+        iface.power = variant != 0;
+        iface.types = if variant == 2 {
+            alloc::vec![10]
+        } else {
+            alloc::vec![9]
+        };
+        iface.p2p = variant != 3;
+        iface.generation = variant != 4;
+        let mut security = Vec::new();
+        wiphy_security_attrs(&mut security, &iface);
+        let flags = find_attr(&security, 143)
+            .and_then(|raw| <[u8; 4]>::try_from(raw).ok())
+            .map(u32::from_ne_bytes)
+            .unwrap_or(0);
+        let attrs = wiphy_attrs(0, &iface.get_wireless_info(), Some(&iface));
+        let commands = find_attr(&attrs, NL80211_ATTR_SUPPORTED_COMMANDS | NLA_F_NESTED)
+            .map(|raw| {
+                attributes(raw)
+                    .unwrap()
+                    .iter()
+                    .any(|(_, raw)| *raw == 25u32.to_ne_bytes())
+            })
+            .unwrap_or(false);
+        let expected = variant == 1;
+        if (flags & ((1 << 11) | (1 << 12)) == ((1 << 11) | (1 << 12))) != expected
+            || (!expected && flags & ((1 << 11) | (1 << 12)) != 0)
+            || flags & (1 << 17) == 0
+            || commands != expected
+        {
+            return TestResult::Fail(
+                "GO power flags/SET_BSS invented native role, generation or opt-in",
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_go_power_advertisement_requires_native_role_and_optin
 );

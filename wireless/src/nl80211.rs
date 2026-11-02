@@ -693,6 +693,7 @@ fn wiphy_attrs(
     iface: Option<&dyn crate::WirelessNetIface>,
 ) -> Vec<u8> {
     let mut attrs = Vec::new();
+    let p2p_go_power = iface.is_some_and(p2p_go_power_save_supported);
     push_attr(&mut attrs, NL80211_ATTR_WIPHY, &index.to_ne_bytes());
     named_attr(
         &mut attrs,
@@ -1122,10 +1123,25 @@ fn wiphy_attrs(
             127, // EXTERNAL_AUTH
         ]);
     }
-    if iface
-        .is_some_and(|iface| iface.supports_userspace_mlme() || iface.supports_ap_userspace_mlme())
-    {
-        command_list.extend_from_slice(&[58, 59]); // REGISTER_FRAME / FRAME.
+    if let Some(iface) = iface {
+        let legacy = iface.supports_userspace_mlme() || iface.supports_ap_userspace_mlme();
+        let p2p_netdev = info.modes.contains(crate::iface::WirelessModes::P2P)
+            && iface
+                .p2p_interface_types()
+                .iter()
+                .any(|mode| matches!(mode, 8 | 9));
+        if legacy
+            || iface.async_radio_management_rx_control()
+            || p2p_netdev && iface.async_p2p_netdev_management_rx_control()
+        {
+            command_list.push(58); // REGISTER_FRAME.
+        }
+        if legacy
+            || iface.async_radio_management_tx_control()
+            || p2p_netdev && iface.async_p2p_netdev_management_tx_control()
+        {
+            command_list.push(59); // FRAME.
+        }
     }
     if iface.is_some_and(|iface| iface.max_remain_on_channel_duration_ms() != 0) {
         command_list.extend_from_slice(&[
@@ -1167,6 +1183,9 @@ fn wiphy_attrs(
             20, // DEL_STATION
         ]);
     }
+    if p2p_go_power {
+        command_list.push(25);
+    } // bounded P2P GO SET_BSS.
     if iface.is_some_and(|iface| iface.supports_channel_switch()) {
         command_list.push(107); // CHANNEL_SWITCH
     }
@@ -1183,6 +1202,17 @@ fn wiphy_attrs(
         &commands,
     );
     attrs
+}
+
+fn p2p_go_power_save_supported(iface: &dyn crate::WirelessNetIface) -> bool {
+    iface.supports_p2p_go_power_save()
+        && iface.supports_ap()
+        && iface.ap_control_generation().is_some()
+        && iface
+            .get_wireless_info()
+            .modes
+            .contains(crate::iface::WirelessModes::P2P)
+        && iface.p2p_interface_types().contains(&9)
 }
 
 /// A wiphy's ciphers and the features wpa_supplicant keys its driver
@@ -1204,7 +1234,12 @@ fn wiphy_security_attrs(attrs: &mut Vec<u8>, iface: &dyn crate::WirelessNetIface
     push_attr(attrs, NL80211_ATTR_MAX_NUM_PMKIDS, &[0]);
     let sme = iface.supports_userspace_mlme();
     let external = iface.supports_external_supplicant();
-    let mut feature_flags = iface.nl80211_feature_flags();
+    // These two flags promise the explicit native GO settings contract.
+    // Raw legacy feature words cannot bypass the role/generation opt-in.
+    let mut feature_flags = iface.nl80211_feature_flags() & !((1 << 11) | (1 << 12));
+    if p2p_go_power_save_supported(iface) {
+        feature_flags |= (1 << 11) | (1 << 12);
+    }
     if sme && external {
         // NL80211_FEATURE_SAE: SAE over AUTHENTICATE.
         feature_flags |= 1 << 5;
@@ -1604,6 +1639,7 @@ pub(crate) const OPERATIONS: &[GenlOperation] = &[
     op(18, DO, UNS),  // SET_STATION
     op(19, DO, UNS),  // NEW_STATION
     op(20, DO, UNS),  // DEL_STATION
+    op(25, DO, UNS),  // bounded P2P GO SET_BSS
     op(107, DO, UNS), // CHANNEL_SWITCH
     op(142, DO, UNS), // COLOR_CHANGE_REQUEST
     // External-supplicant station commands.

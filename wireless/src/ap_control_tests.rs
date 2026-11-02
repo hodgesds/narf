@@ -29,6 +29,10 @@ struct Radio {
     start_drops: AtomicU32,
     mgmt_cookie: AtomicU64,
     radio_mgmt: AtomicBool,
+    p2p_roles: AtomicBool,
+    p2p_mgmt: AtomicBool,
+    go_power: AtomicBool,
+    go_seen: IrqSafeSpinLock<Option<crate::P2pGoPowerSave>>,
     mgmt_acked: AtomicBool,
     key_errno: AtomicU32,
     key_installs: AtomicU32,
@@ -62,6 +66,10 @@ impl Radio {
             start_drops: AtomicU32::new(0),
             mgmt_cookie: AtomicU64::new(0),
             radio_mgmt: AtomicBool::new(false),
+            p2p_roles: AtomicBool::new(false),
+            p2p_mgmt: AtomicBool::new(false),
+            go_power: AtomicBool::new(false),
+            go_seen: IrqSafeSpinLock::new(None),
             mgmt_acked: AtomicBool::new(true),
             key_errno: AtomicU32::new(0),
             key_installs: AtomicU32::new(0),
@@ -123,7 +131,13 @@ impl WirelessNetIface for Radio {
             base_name: self.name.clone(),
             base_mac: self.mac(),
             bands: Vec::new(),
-            modes: crate::iface::WirelessModes::AP | crate::iface::WirelessModes::STATION,
+            modes: crate::iface::WirelessModes::AP
+                | crate::iface::WirelessModes::STATION
+                | if self.p2p_roles.load(Ordering::Acquire) {
+                    crate::iface::WirelessModes::P2P
+                } else {
+                    crate::iface::WirelessModes::empty()
+                },
             hw_caps: crate::iface::HwCaps {
                 ht_supported: false,
                 vht_supported: false,
@@ -187,6 +201,45 @@ impl WirelessNetIface for Radio {
     }
     fn async_radio_management_rx_control(&self) -> bool {
         self.radio_mgmt.load(Ordering::Acquire)
+    }
+    fn async_p2p_netdev_management_tx_control(&self) -> bool {
+        self.p2p_mgmt.load(Ordering::Acquire)
+    }
+    fn async_p2p_netdev_management_rx_control(&self) -> bool {
+        self.p2p_mgmt.load(Ordering::Acquire)
+    }
+    fn supports_p2p_go_power_save(&self) -> bool {
+        self.go_power.load(Ordering::Acquire)
+    }
+    async fn set_p2p_go_power_save_ap_async(
+        &self,
+        authority: &ApControlAuthority,
+        settings: crate::P2pGoPowerSave,
+    ) -> Result<(), WirelessError> {
+        settings.validate()?;
+        if !self.supports_p2p_go_power_save() || self.current_iftype() != 9 {
+            return Err(WirelessError::NotSupported);
+        }
+        struct Waiter<'a>(&'a AtomicU32);
+        impl Drop for Waiter<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let _waiter = Waiter(&self.start_drops);
+        core::future::poll_fn(|cx| {
+            authority.check_for(self)?;
+            self.start_polls.fetch_add(1, Ordering::AcqRel);
+            if self.start_ready.load(Ordering::Acquire) {
+                *self.go_seen.lock() = Some(settings);
+                self.starts.fetch_add(1, Ordering::AcqRel);
+                core::task::Poll::Ready(Ok(()))
+            } else {
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        })
+        .await
     }
     async fn register_mgmt_frame_radio_async(
         &self,
@@ -256,8 +309,15 @@ impl WirelessNetIface for Radio {
         &self,
         authority: &ApControlAuthority,
         config: crate::ApConfig,
-        settings: crate::ApStartSettings,
+        mut settings: crate::ApStartSettings,
     ) -> Result<(), WirelessError> {
+        let go = settings.p2p_go.take();
+        if let Some(go) = go {
+            go.validate()?;
+            if !self.supports_p2p_go_power_save() || self.current_iftype() != 9 {
+                return Err(WirelessError::NotSupported);
+            }
+        }
         if settings != crate::ApStartSettings::default() {
             if settings.auth_type != Some(0)
                 || settings.wpa_versions != Some(2)
@@ -272,7 +332,11 @@ impl WirelessNetIface for Radio {
             }
             self.settings_seen.store(true, Ordering::Release);
         }
-        self.start_ap_async(authority, config).await
+        self.start_ap_async(authority, config).await?;
+        if let Some(go) = go {
+            *self.go_seen.lock() = Some(go);
+        }
+        Ok(())
     }
     async fn tx_control_port_ap_async(
         &self,

@@ -94,6 +94,7 @@ const STOP_P2P_DEVICE: u8 = 90;
 const SET_BEACON: u8 = 14;
 const START_AP: u8 = 15;
 const STOP_AP: u8 = 16;
+const SET_BSS: u8 = 25;
 const SET_STATION: u8 = 18;
 const NEW_STATION: u8 = 19;
 const DEL_STATION: u8 = 20;
@@ -1162,6 +1163,7 @@ fn route(
         command,
         START_AP
             | STOP_AP
+            | SET_BSS
             | SET_BEACON
             | NEW_STATION
             | SET_STATION
@@ -2976,10 +2978,10 @@ fn mlme_handle(
         })
         .ok_or(ENODEV)?;
     let admin = authority(&context, iface.as_ref())?;
-    if command == FRAME && iface.async_radio_management_tx_control() {
+    if command == FRAME && p2p_async::netdev_management_supported(iface.as_ref(), true) {
         return p2p_async::frame(bytes, context, deferred);
     }
-    if command == REGISTER_FRAME && iface.async_radio_management_rx_control() {
+    if command == REGISTER_FRAME && p2p_async::netdev_management_supported(iface.as_ref(), false) {
         return p2p_async::register_frame(bytes, context, deferred);
     }
     let ns = context.net_ns_id;
@@ -3376,6 +3378,42 @@ fn ap_handle(
     ap_handle_with(command, bytes, context, None)
 }
 
+fn p2p_go_power_save(
+    iface: &dyn crate::WirelessNetIface,
+    attrs: &[(u16, &[u8])],
+) -> Result<Option<crate::P2pGoPowerSave>, i32> {
+    if [162, 163].iter().all(|kind| attr(attrs, *kind).is_none()) {
+        return Ok(None);
+    }
+    if [162, 163]
+        .iter()
+        .any(|kind| attrs.iter().filter(|(id, _)| id == kind).count() > 1)
+    {
+        return Err(EINVAL);
+    }
+    let ctwindow_tu = u8_attr(attrs, 162)?;
+    let opportunistic = u8_attr(attrs, 163)?;
+    if ctwindow_tu.is_some_and(|window| window > 127)
+        || opportunistic.is_some_and(|enabled| enabled > 1)
+        || iface.current_iftype() != 9
+    {
+        return Err(EINVAL);
+    }
+    if !iface.supports_p2p_go_power_save()
+        || iface.ap_control_generation().is_none()
+        || !iface
+            .get_wireless_info()
+            .modes
+            .contains(crate::iface::WirelessModes::P2P)
+        || !iface.p2p_interface_types().contains(&9)
+    {
+        return Err(EOPNOTSUPP);
+    }
+    Ok(Some(crate::P2pGoPowerSave {
+        ctwindow_tu,
+        opportunistic: opportunistic.map(|v| v != 0),
+    }))
+}
 fn ap_handle_with(
     command: u8,
     bytes: &[u8],
@@ -3396,15 +3434,31 @@ fn ap_handle_with(
         return Err(EOPNOTSUPP);
     }
     match command {
+        SET_BSS => {
+            // Only the explicitly implemented P2P GO portion is supported.
+            // Other BSS controls retain their existing unsupported route.
+            reject_unknown(&attrs, &[3, 162, 163])?;
+            let settings = p2p_go_power_save(iface.as_ref(), &attrs)?.ok_or(EOPNOTSUPP)?;
+            station::netdev_up(iface.as_ref())?;
+            ap_async::defer(
+                iface,
+                admin,
+                deferred,
+                context.net_ns_id,
+                index,
+                ap_async::Operation::PowerSave(settings),
+            )
+        }
         START_AP => {
             let mut allowed = alloc::vec![
                 3, 12, 13, 14, 15, 38, 39, 52, 53, 70, 126, 145, 159, 160, 161, 270, 278, 279, 283,
-                294, 295, 306, 307, 325,
+                294, 295, 306, 307, 325, 162, 163,
             ];
             if iface.ap_control_generation().is_some() {
                 allowed.extend_from_slice(&[68, 73, 74, 75, 76, 102, 103, 204, 264, 286]);
             }
             reject_unknown(&attrs, &allowed)?;
+            let p2p_go = p2p_go_power_save(iface.as_ref(), &attrs)?;
             let ssid = attr(&attrs, 52).ok_or(EINVAL)?;
             if ssid.is_empty() || ssid.len() > 32 {
                 return Err(EINVAL);
@@ -3594,6 +3648,7 @@ fn ap_handle_with(
                     group_cipher: u32_attr(&attrs, 74)?,
                     akms: suite_list(76)?,
                     control_port: control_port(&attrs, iface.supports_ap_authenticator())?,
+                    p2p_go,
                 };
                 return ap_async::defer(
                     iface,

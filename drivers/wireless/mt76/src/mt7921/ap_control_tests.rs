@@ -8,6 +8,7 @@ fn settings() -> ApStartSettings {
         pairwise_ciphers: Some(vec![0x000fac04]),
         group_cipher: Some(0x000fac04),
         akms: Some(vec![0x000fac02]),
+        p2p_go: None,
         control_port: ControlPort {
             enabled: true,
             over_nl80211: true,

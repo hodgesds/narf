@@ -1213,6 +1213,37 @@ their own implemented role owners. Interface combinations, actual typed
 registration/source authority, native START/ROC receipts, and per-operation
 RF/key/port admission remain independent requirements.
 
+`async_p2p_netdev_management_tx_control()` and
+`async_p2p_netdev_management_rx_control()` separately opt an implemented
+CLIENT8/GO9 netdev into `FRAME`/`REGISTER_FRAME` through the existing native
+Radio callbacks. Both default to false. The actual current type must be 8/9,
+selected in the family's P2P subset and backed by `WirelessModes::P2P`.
+The managed2 and control-only DEVICE10 opt-ins keep their original scopes.
+This extends the earlier capture-only mode8/9 seam with explicit public
+operations; a marker alone provides no native role, RF or peer authority.
+The original IFINDEX, delegated grant, source socket, administrative UP,
+reservation and mode/ownership generation remain bound through every poll
+and terminal publication. The driver retains native cancellation/cleanup
+when a source or external waiter disappears.
+
+`P2pGoPowerSave { ctwindow_tu: Option<u8>, opportunistic: Option<bool> }`
+is the bounded GO part of START_AP and SET_BSS. CTWindow is 0..127 TUs;
+OPPPS is a u8 wire 0/1. `ApStartSettings::p2p_go` carries explicitly supplied
+initial attributes 162/163. For live SET_BSS (command25), `None` leaves the
+corresponding value unchanged, while `Some(0)`/`Some(false)` resets it.
+The dispatcher rejects duplicates, malformed lengths/values, non-GO roles
+and fields other than IFINDEX/these two settings on this bounded SET_BSS
+route. Both operations require actual current GO9, the implemented P2P
+subset, native AP generation and `supports_p2p_go_power_save()`; that opt-in
+is false by default. Only such a provider advertises SET_BSS and feature
+bits 11/12. `set_p2p_go_power_save_ap_async` runs under the original reserved
+AP authority and returns only after the actual native update receipt.
+No success ACK or setting authority follows queue admission alone. A
+closed source, revoked grant, DOWN/UP or role-generation ABA suppresses
+promotion by the old owner. Existing AP drivers keep their previous
+default fields and callbacks. This interface supplies no Intel firmware
+field, NoA event, additional netdev or P2P feature completion by itself.
+
 `GET_INTERFACE` resolves a control-only target by its exact WDEV/namespace and
 emits no IFINDEX attribute; retired IDs cannot select another object. WDEV-based
 physical-wiphy lookup resolves the same registered control object rather than

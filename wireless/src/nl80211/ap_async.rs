@@ -7,6 +7,7 @@ use narf_net::netlink_generic::DeferredRequest;
 pub(super) enum Operation {
     Start(Box<(crate::ApConfig, crate::ApStartSettings)>),
     Stop,
+    PowerSave(crate::P2pGoPowerSave),
     Beacon(Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>),
     AddStation(crate::StationConfig),
     SetStation(crate::StationConfig),
@@ -74,6 +75,13 @@ pub(super) fn defer(
                             .map_err(errno)
                     }
                     Operation::Stop => iface.stop_ap_async(&call_authority).await.map_err(errno),
+                    Operation::PowerSave(settings) => {
+                        call_authority.require_up().map_err(errno)?;
+                        iface
+                            .set_p2p_go_power_save_ap_async(&call_authority, settings)
+                            .await
+                            .map_err(errno)
+                    }
                     Operation::Beacon(head, tail, probe) => iface
                         .set_beacon_async(&call_authority, head, tail, probe)
                         .await

@@ -1,6 +1,8 @@
 //! Actual nl80211 parse/authority/dispatcher plus an explicitly held
 //! interface callback. Native MT76 MCU and DMA receipts have separate tests.
 use super::*;
+#[path = "p2p_netdev_tests.rs"]
+mod p2p_netdev;
 use narf_net::netlink_generic::{build_replies_with_endpoint, ReplyOptions, RequestContext};
 
 fn attr(out: &mut Vec<u8>, kind: u16, bytes: &[u8]) {
