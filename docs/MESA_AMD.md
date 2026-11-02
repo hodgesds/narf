@@ -441,6 +441,35 @@ complete repaint. Regressions check pixels, redraw counts, palette changes,
 the reserved beacon band and stride padding. Native boot-time improvement
 and visible Plasma remain unverified.
 
+Boot `616ff046-b079-479e-b012-fe4a55b77042`, with the installed
+`fb3f69a38` console correction, ran long enough to reach KWin. The user
+manager starts KWin at approximately 107 seconds and reports it started
+at 115.67. At 129.49 it reports `Failed to create framebuffer: Invalid
+argument`, repeated before a Compute-ring timeout at 132.58 (signalled
+sequence 1, emitted 2). Recovery returns `Unsupported`; greeter and
+wallpaper clients subsequently report no outputs. The kernel status panel
+continuing to draw is consistent with the display never accepting a
+client frame: console ownership changes after successful presentation.
+
+The framebuffer rejection has a reproducible entry-path defect:
+`amdgpu_addfb2_bo` admitted only `gfx12_modifiers` cards, although
+`Card::addfb2_bo` already admitted DCN30's linear native GEM buffers. On
+Navi22 the ioctl therefore skipped the per-open AMDGPU GEM table and fell
+through to the generic card's different handle table. A primary-device
+ioctl regression fails the original code and passes when the entry gate
+admits `linear_gem_card` too. It covers 8888 formats with implicit/explicit
+LINEAR, legacy ADDFB, foreign-handle and tiled-layout rejection, master
+authority, and framebuffer lifetime after GEM_CLOSE and file close.
+This does not enable RDNA4 modifiers or planes.
+
+The compute timeout's cause remains unproven. The timeout path now reports
+the stalled ring's raw VM-programming writeback before recovery withdraws
+the owner. No polling or syscall-path tracing is added. This value alone
+does not prove the client job completed, or that a reused VM required a
+new programming fence. The captured approximately 8 GiB KWin RSS also
+remains unexplained. Physical desktop acceptance after the ioctl fix is
+still required.
+
 The earlier native boot also failed in the dynamic loader before Plasma
 startup. The separate VFS/Btrfs fixes and their private-mmap regression must
 be included in the same production image. Complete software checks and

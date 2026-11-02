@@ -8015,8 +8015,11 @@ pub fn amdgpu_addfb2_bo(
         return None;
     }
     let mode_state = crate::drm_registry::mode_state(card_index)?;
-    if !mode_state.lock().gfx12_modifiers {
-        return None;
+    {
+        let card = mode_state.lock();
+        if !card.gfx12_modifiers && !crate::amdgpu_native_kms::linear_gem_card(&card) {
+            return None;
+        }
     }
     let size = if legacy {
         drm_uapi::SZ_DRM_MODE_FB_CMD

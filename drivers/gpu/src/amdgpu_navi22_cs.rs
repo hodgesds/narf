@@ -82,6 +82,17 @@ pub(crate) fn hung(engine: crate::amdgpu_fence_navi22::Engine) {
     let current = CURRENT.lock().as_ref().and_then(Weak::upgrade);
     if let Some(current) = current {
         let _ = current.progress();
+        // Timeout-only evidence, before recovery withdraws this owner.
+        // This is the raw VM-programming writeback, not a completion proof
+        // for the client job: a job may reuse a VM without a new VM fence.
+        if let Some(slot) = fence_slot(ring) {
+            use core::fmt::Write;
+            let vm = current.reader.vm_completed(slot);
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 ring {engine:?} VM programming writeback {vm:?}"
+            );
+        }
         current.jobs.lock().hang(ring);
     }
     crate::amdgpu_fence_navi22::notify_all();

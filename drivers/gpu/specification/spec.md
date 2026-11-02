@@ -9928,7 +9928,10 @@ geometry, and provides a LINEAR-only `IN_FORMATS` blob. Publication selects
 the same PCI-identified RDNA2 card as the submission backend.
 
 `Card::addfb2_bo` accepts those linear GEM framebuffers on a native atomic
-amdgpu card without GFX12 capabilities. Nonlinear modifiers, DCC and other
+amdgpu card without GFX12 capabilities. The primary file's ADDFB/ADDFB2
+dispatcher admits that same card and looks up its own AMDGPU GEM handle
+table before generic dumb-buffer dispatch. This admission does not require
+GFX12 modifiers. Nonlinear modifiers, DCC and other
 formats are rejected. The async KMS entry resolves synthetic-primary targets
 as well as native-plane targets, prepares their VRAM placement outside the
 KMS lock, and revalidates master and targets before commit. TEST_ONLY prepares
